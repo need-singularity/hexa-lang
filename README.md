@@ -3,67 +3,67 @@
 <!-- ML-NEXT-LEVEL:START -->
 ## ML Next Level Roadmap (`/ml`)
 
-| 명령 | 동작 |
-|------|------|
-| `/ml` | 전체 목록 ASCII 표 |
-| `/ml next` | 최우선 항목 자동 선택 → 구현 |
-| `/ml 5` | #5 SSM/Mamba 구현 시작 |
-| `/ml done 1` | #1 완료 체크 + JSON 갱신 |
-| `/ml add 이름 \| 설명 \| 영향` | 새 항목 추가 |
-| `/ml sync` | roadmap.md + CLAUDE.md 동기화 |
+| Command | Action |
+|---------|--------|
+| `/ml` | List all items in ASCII table |
+| `/ml next` | Pick the top-priority item and start implementing |
+| `/ml 5` | Start implementing #5 (SSM/Mamba) |
+| `/ml done 1` | Mark #1 complete + sync JSON |
+| `/ml add name \| desc \| impact` | Add a new item |
+| `/ml sync` | Sync roadmap.md + CLAUDE.md |
 
-> SSOT: `shared/hexa-lang/ml-next-level.json` — T1/T2 기본 파이프라인 완성 후 다음 단계
+> SSOT: `shared/hexa-lang/ml-next-level.json` — next steps after the baseline T1/T2 pipeline is complete.
 
-| # | 영역 | 설명 | 영향 | 상태 |
-|---|------|------|------|:----:|
-| 1 | Flash Attention | O(N²)→O(N) 메모리, tiling | 추론 2-4x, 긴 문맥 | partial |
-| 2 | PagedAttention | vLLM식 KV-cache 페이징 | 동시 요청 10x+ | todo |
-| 3 | Speculative Decoding | 작은 모델로 드래프트→큰 모델 검증 | 추론 2-3x | **done** |
-| 4 | MoE 아키텍처 | Mixture of Experts (Mixtral식) | 같은 FLOP에 더 큰 모델 | **done** |
-| 5 | SSM/Mamba | State Space Model (선형 시간 추론) | 긴 문맥 혁신 | todo |
-| 6 | Vision Transformer | 이미지 인코더 (CLIP/ViT) | 멀티모달 | todo |
-| 7 | 모델 머징 | TIES/DARE/SLERP 가중치 합성 | 학습 없이 모델 개선 | todo |
-| 8 | 구조화 출력 | JSON mode, grammar-constrained decode | API 안정성 | todo |
-| 9 | Function Calling | 도구 호출 / tool use | 에이전트 | todo |
-| 10 | Knowledge Distillation | 큰 모델→작은 모델 증류 | 배포 효율 | todo |
-| 11 | Pruning | 불필요 가중치 제거 | 모델 축소 | todo |
-| 12 | Hyperparameter Search | 자동 LR/배치/아키텍처 탐색 | 학습 품질 | partial |
-| 13 | 안전장치 | 프롬프트 인젝션 감지, 콘텐츠 필터 | 서빙 보안 | todo |
-| 14 | Semantic Cache | 유사 프롬프트 캐싱 (embedding 기반) | 서빙 비용 절감 | todo |
-| 15 | 벤치마크 스위트 | MMLU/HumanEval/MT-Bench 자동 평가 | 품질 측정 | todo |
+| # | Area | Description | Impact | Status |
+|---|------|-------------|--------|:------:|
+| 1 | Flash Attention | O(N²)→O(N) memory via tiling | 2–4× inference, long context | partial |
+| 2 | PagedAttention | vLLM-style KV-cache paging | 10×+ concurrent requests | todo |
+| 3 | Speculative Decoding | Draft with a small model, verify with the large one | 2–3× inference | **done** |
+| 4 | MoE Architecture | Mixture of Experts (Mixtral-style) | Larger model at same FLOPs | **done** |
+| 5 | SSM/Mamba | State Space Model (linear-time inference) | Long-context breakthrough | todo |
+| 6 | Vision Transformer | Image encoder (CLIP/ViT) | Multimodal | todo |
+| 7 | Model Merging | TIES / DARE / SLERP weight composition | Improve models without training | todo |
+| 8 | Structured Output | JSON mode, grammar-constrained decode | API stability | todo |
+| 9 | Function Calling | Tool use / function calling | Agents | todo |
+| 10 | Knowledge Distillation | Large → small model distillation | Deployment efficiency | todo |
+| 11 | Pruning | Remove unnecessary weights | Model shrink | todo |
+| 12 | Hyperparameter Search | Automatic LR/batch/architecture search | Training quality | partial |
+| 13 | Safety Layer | Prompt-injection detection, content filter | Serving security | todo |
+| 14 | Semantic Cache | Similar-prompt caching (embedding-based) | Serving cost reduction | todo |
+| 15 | Benchmark Suite | MMLU / HumanEval / MT-Bench automation | Quality measurement | todo |
 
 <!-- ML-NEXT-LEVEL:END -->
 
 <!-- ROI:START -->
 ## AI-Native ROI Improvements (`/roi`)
 
-| 명령 | 동작 |
-|------|------|
-| `/roi` | ROI 순 전체 목록 ASCII 표 |
-| `/roi go` | 전부 ROI 순 병렬 발사 (메인) |
-| `/roi next` | ROI 최상위 1개 계획 → 확인 → 구현 |
-| `/roi 3` | #3 구현 시작 |
-| `/roi done 1` | #1 완료 체크 + JSON 갱신 |
-| `/roi add 이름 \| 설명 \| 효과x \| 시간h` | 새 항목 추가 |
-| `/roi scan` | ai_native_pass 스캔 → 새 항목 제안 |
+| Command | Action |
+|---------|--------|
+| `/roi` | Full list in ROI order (ASCII table) |
+| `/roi go` | Launch every item in parallel, ROI order (main) |
+| `/roi next` | Plan the top ROI item → confirm → implement |
+| `/roi 3` | Start implementing #3 |
+| `/roi done 1` | Mark #1 complete + sync JSON |
+| `/roi add name \| desc \| impact×x \| hoursh` | Add a new item |
+| `/roi scan` | Scan ai_native_pass → suggest new items |
 
-> SSOT: `shared/hexa-lang/roi.json` — AI-native 알고리즘 교체·@attr 시맨틱·리라이트 강화
+> SSOT: `shared/hexa-lang/roi.json` — AI-native algorithm swaps, `@attr` semantics, rewrite reinforcement.
 
-| # | 분류 | 항목 | 효과(x) | 시간(h) | ROI | 우선순위 | 상태 |
-|---|------|------|------:|------:|-----:|:------:|:----:|
-| 1 | attr_semantics | @contract — requires/ensures 바운드 제거 | 3.0 | 2 | 1.50 | P0 | todo |
-| 2 | algo_rewrite | 선형탐색 → 이진탐색 AST 리라이트 | 10.0 | 8 | 1.25 | P1 | todo |
+| # | Category | Item | Impact (×) | Hours | ROI | Priority | Status |
+|---|----------|------|-----------:|------:|----:|:--------:|:------:|
+| 1 | attr_semantics | @contract — drop bounds via requires/ensures | 3.0 | 2 | 1.50 | P0 | todo |
+| 2 | algo_rewrite | Linear search → binary search AST rewrite | 10.0 | 8 | 1.25 | P1 | todo |
 | 3 | attr_semantics | @symbolic — x\*2→x+x, shift↔pow2 | 7.5 | 8 | 0.94 | P1 | todo |
-| 7 | rewrite_enhance | @algebraic 등차/등비급수 → 닫힌 형식 | 5.0 | 6 | 0.83 | P2 | todo |
-| 4 | rewrite_enhance | @fuse reduce/fold 체인 융합 | 3.0 | 4 | 0.75 | P2 | todo |
-| 5 | rewrite_enhance | constant folding — string concat+len | 2.0 | 3 | 0.67 | P2 | todo |
-| 13 | rewrite_enhance | strength reduction — x/2→x>>1, x%2→x&1 | 2.0 | 4 | 0.50 | P2 | todo |
-| 8 | rewrite_enhance | DCE 미사용 변수/import 제거 | 1.5 | 4 | 0.38 | P3 | todo |
+| 7 | rewrite_enhance | @algebraic arithmetic/geometric series → closed form | 5.0 | 6 | 0.83 | P2 | todo |
+| 4 | rewrite_enhance | @fuse reduce/fold chain fusion | 3.0 | 4 | 0.75 | P2 | todo |
+| 5 | rewrite_enhance | Constant folding — string concat + len | 2.0 | 3 | 0.67 | P2 | todo |
+| 13 | rewrite_enhance | Strength reduction — x/2→x>>1, x%2→x&1 | 2.0 | 4 | 0.50 | P2 | todo |
+| 8 | rewrite_enhance | DCE — remove unused variables / imports | 1.5 | 4 | 0.38 | P3 | todo |
 | 6 | attr_semantics | @approximate — Newton sqrt, Taylor exp | 2.0 | 6 | 0.33 | P2 | todo |
-| 9 | algo_rewrite | DP 슬라이딩 윈도우 메모리 축소 | 3.0 | 10 | 0.30 | P3 | todo |
-| 10 | algo_rewrite | 행렬곱 → Strassen O(n³)→O(n^2.37) | 5.0 | 20 | 0.25 | P3 | todo |
-| 12 | attr_semantics | @speculative_decode — draft+verify | 3.0 | 12 | 0.25 | P4 | todo |
-| 11 | attr_semantics | @specialize — V8 IC 타입 단상화 | 7.5 | 40 | 0.19 | P3 | todo |
+| 9 | algo_rewrite | DP sliding-window memory reduction | 3.0 | 10 | 0.30 | P3 | todo |
+| 10 | algo_rewrite | Matmul → Strassen O(n³)→O(n^2.37) | 5.0 | 20 | 0.25 | P3 | todo |
+| 12 | attr_semantics | @speculative_decode — draft + verify | 3.0 | 12 | 0.25 | P4 | todo |
+| 11 | attr_semantics | @specialize — V8-style IC type monomorphization | 7.5 | 40 | 0.19 | P3 | todo |
 
 <!-- ROI:END -->
 
@@ -86,7 +86,7 @@
 >
 > **[🧬 AirGenome](https://github.com/need-singularity/airgenome)** — Autonomous OS genome scanner. Extract n=6 genome from every process, real-time system diagnostics, nexus telescope integration
 
-<!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
+<!-- private repos live in the private_repos field of projects.json (do not expose) -->
 <!-- SHARED:PROJECTS:END -->
 
 
@@ -106,6 +106,31 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh)"
+```
+
+Installs both commands into `~/.hx/bin/`:
+
+| Command | Role |
+|---------|------|
+| `hexa`  | Compiler, interpreter, REPL, LSP, formatter |
+| `hx`    | Package manager (brew-style, pure shell, zero deps) |
+
+After install, add `~/.hx/bin` to your `PATH` (the installer appends it to `~/.zshrc` / `~/.bashrc` automatically) and restart your shell, or run:
+
+```bash
+export PATH="$HOME/.hx/bin:$PATH"
+hexa version
+hx search
+```
+
+Env overrides: `HX_HOME=/custom/prefix`, `HEXA_VERSION=v0.2.0`, `HEXA_SKIP_HX=1`, `HEXA_SKIP_HEXA=1`.
+
+### From source
+
 ```bash
 # 100% self-hosted — no Rust toolchain required
 git clone https://github.com/need-singularity/hexa-lang.git
@@ -113,22 +138,19 @@ cd hexa-lang
 ./hexa run examples/hello_min.hexa   # stage1 CLI, go/cargo-style subcommands
 ```
 
-> As of 2026-04-13, CLI는 go/cargo 스타일 서브커맨드로 전환됨.
-> `./hexa` 는 77KB stage1 디스패처이고 인터프리터 본체는
-> `build/hexa_stage0` 에 아카이브된 351KB 바이너리가 담당한다.
-> Rust (`src/`, `target/`, `Cargo.*`) 는 완전 폐기 — 100% 셀프호스트.
+> As of 2026-04-13, the CLI uses go/cargo-style subcommands. `./hexa` is a 77 KB stage1 dispatcher; the interpreter itself is the 351 KB binary archived at `build/hexa_stage0`. Rust (`src/`, `target/`, `Cargo.*`) has been fully retired — 100% self-hosted.
 
 ## Quick Start
 
 ```bash
-./hexa run examples/hello_min.hexa      # Run a .hexa file (interpreter)
-./hexa build examples/hello_min.hexa -o hello   # Compile to native binary
-./hexa status                           # Toolchain status
-./hexa version                          # Version
-./hexa help                             # Full usage
+hexa run examples/hello_min.hexa             # Run a .hexa file (interpreter)
+hexa build examples/hello_min.hexa -o hello  # Compile to native binary
+hexa status                                  # Toolchain status
+hexa version                                 # Version
+hexa help                                    # Full usage
 
-# 호환 모드 (python/node 스타일, 내부적으로 run으로 위임):
-./hexa examples/hello_min.hexa          # 같은 결과
+# Compat mode (python/node style — delegates to `run` internally):
+hexa examples/hello_min.hexa                 # same as `hexa run ...`
 ```
 
 ## Example
@@ -266,13 +288,13 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 | Function | Value | Language Mapping |
 |----------|-------|-----------------|
 | n | 6 | paradigms, pipeline stages |
-| sigma(6) | 12 | stdlib 설계 목표 (현재 6 구현) |
+| sigma(6) | 12 | stdlib design target (6 currently implemented) |
 | tau(6) | 4 | type layers, visibility levels |
 | phi(6) | 2 | compile modes (AOT/JIT) |
 | sopfr(6) | 5 | error classes |
-| J2(6) | 24 | 연산자 설계 기원 (현재 26 구현) |
+| J2(6) | 24 | operator design origin (26 currently implemented) |
 | sigma-tau | 8 | primitive types |
-| -- | 58 | 전체 키워드 (13 그룹 합산) |
+| -- | 58 | total keywords (13 groups combined) |
 
 Other languages choose these numbers arbitrarily. Rust has 51 keywords -- why 51? No mathematical reason. HEXA has 58 keywords in 13 groups, each group size derived from n=6 arithmetic functions.
 
@@ -311,7 +333,7 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 **Memory model** — Egyptian fraction: 1/2 (stack) + 1/3 (heap) + 1/6 (arena) = 1
 
-## Standard Library (6 modules 구현)
+## Standard Library (6 modules implemented)
 
 | Module | Description | Key Functions |
 |--------|-------------|---------------|
@@ -417,7 +439,7 @@ HEXA-LANG and [ANIMA](https://github.com/need-singularity/anima) (consciousness 
 | n=6 | HEXA-LANG | ANIMA |
 |-----|-----------|-------|
 | n=6 | 6 paradigms | 6 Hexad modules (C/D/S/M/W/E) |
-| sigma=12 | 12 factions 대응 | 12 factions |
+| sigma=12 | 12 factions (matched) | 12 factions |
 | phi=2 | 2 compile modes | 2 gradient groups |
 | tau=4 | 4 type layers | 4 phases (P0-P3) |
 | sigma-tau=8 | 8 primitives | 8-cell atom (M1) |
@@ -428,10 +450,10 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 
 ```
 hexa-lang/
-├── self/                     1,113 .hexa files (주 소스)
-│   ├── lexer.hexa            587 LOC -- 58 keywords + 26 operators tokenizer
-│   ├── parser.hexa           3,970 LOC -- recursive descent parser
-│   ├── interpreter.hexa      9,348 LOC -- tree-walk evaluator (270+ builtins)
+├── self/                     1,113 .hexa files (primary source)
+│   ├── lexer.hexa            587 LOC — 58 keywords + 26 operators tokenizer
+│   ├── parser.hexa           3,970 LOC — recursive descent parser
+│   ├── interpreter.hexa      9,348 LOC — tree-walk evaluator (270+ builtins)
 │   ├── ast.hexa              AST node types
 │   ├── type_checker.hexa     Static type checker + Law types
 │   ├── env.hexa              Scoped environment + builtins
@@ -473,7 +495,7 @@ hexa-lang/
 │   ├── alloc/                Egyptian fraction allocator backend
 │   ├── std_*.hexa            stdlib (net/fs/io/time/collections/...)
 │   └── lib.hexa + main.hexa  Library entry + CLI dispatcher
-├── src/                      92 .rs files (마이그레이션 진행중, self/ 로 이전 예정)
+├── src/                      92 .rs files (migration in progress — moving to self/)
 ├── build_hexa.hexa           Cargo-free self-host build pipeline
 │                             (hexa_v2 -> C -> clang -> hexa_v3)
 ├── examples/                 Example programs
