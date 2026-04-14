@@ -42,6 +42,9 @@ fn codegen_c2(ast) {
     _lambda_def_parts = []
     _ic_counter = 0
     _ic_def_parts = []
+    // ComptimeConst const-fold table — must reset per codegen invocation.
+    _comptime_const_names = []
+    _comptime_const_nodes = []
     let mut _gi = 0
     while _gi < len(ast) {
         let _gk = ast[_gi].kind
@@ -98,12 +101,20 @@ fn codegen_c2(ast) {
             fwd_parts = fwd_parts.push(gen2_fn_forward(ast[i]) + "\n")
             fn_parts = fn_parts.push(gen2_fn_decl(ast[i]) + "\n\n")
         } else if k == "ComptimeConst" {
-            // Treat comptime const as global constant
-            global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
-            if type_of(ast[i].left) != "string" {
-                main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+            // Try compile-time const-fold first. On success, register the
+            // folded literal in the lookup table and SKIP global emission —
+            // every Ident reference is inlined at use-site (gen2_expr Ident).
+            // On failure, fall back to runtime evaluation as a global var.
+            let _cc_folded = comptime_eval(ast[i].left)
+            if type_of(_cc_folded) != "string" {
+                _register_comptime_const(ast[i].name, _cc_folded)
             } else {
-                main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
+                if type_of(ast[i].left) != "string" {
+                    main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+                } else {
+                    main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                }
             }
         } else if k == "OptimizeFnStmt" {
             // Optimization hint — skip
@@ -959,8 +970,18 @@ fn gen2_stmt(node, depth) {
         return chunks.join("")
     }
 
-    // ── ComptimeConst → treat as const (compile-time folding not yet implemented) ──
+    // ── ComptimeConst → fold to literal at codegen, or fall back to runtime const ──
+    // When ComptimeConst appears inside a function body (gen2_stmt path), we
+    // still try to fold. On success: register in module-level lookup table
+    // (so any reference inside or after this body inlines the literal) and
+    // emit nothing (the C const is unused — the literal is inlined at call
+    // sites). On failure: emit a local C variable as before.
     if k == "ComptimeConst" {
+        let _cc_local = comptime_eval(node.left)
+        if type_of(_cc_local) != "string" {
+            _register_comptime_const(node.name, _cc_local)
+            return ""
+        }
         return pad + "HexaVal " + node.name + " = " + gen2_expr(node.left) + ";\n"
     }
 
@@ -1082,7 +1103,16 @@ fn gen2_expr(node) {
     }
     // bt-53: mangle reserved runtime names (TAG_INT etc.) so references match
     // the mangled global declarations emitted at LetStmt/FnDecl sites.
-    if k == "Ident" { return _hexa_mangle_ident(node.name) }
+    if k == "Ident" {
+        // ComptimeConst inlining: if name was folded at codegen time, emit
+        // the literal directly rather than referencing a C global. This is
+        // checked BEFORE mangling — comptime const names aren't reserved.
+        let _cc_inline = _lookup_comptime_const(node.name)
+        if type_of(_cc_inline) != "string" {
+            return gen2_expr(_cc_inline)
+        }
+        return _hexa_mangle_ident(node.name)
+    }
 
     if k == "BinOp" {
         let l = gen2_expr(node.left)
@@ -2225,6 +2255,142 @@ let mut _lambda_def_parts = []
 let mut _ic_counter = 0
 let mut _ic_def_parts = []
 
+// ── ComptimeConst const-fold table ───────────────────────
+// `comptime const X = expr` is folded at codegen time to a literal AST node.
+// Both arrays MUST be reset at the start of every codegen invocation
+// (codegen_c2 / codegen_c2_full) — see T0 lesson on _ic_def_parts.
+//
+// _comptime_const_names: parallel array of folded const names (strings)
+// _comptime_const_nodes: parallel array of folded literal nodes
+//
+// On Ident lookup in gen2_expr, if name appears here, the corresponding
+// folded literal is inlined via recursive gen2_expr() — turning
+// `comptime const TAU = 2 * 3.14` followed by `print(TAU + 1)` into
+// `hexa_add(hexa_float(6.28), hexa_int(1))` at codegen time.
+let mut _comptime_const_names = []
+let mut _comptime_const_nodes = []
+
+// Look up a comptime-const folded literal by name.
+// Returns the literal node on hit, or "" (string) on miss.
+fn _lookup_comptime_const(name) {
+    let mut i = 0
+    while i < len(_comptime_const_names) {
+        if _comptime_const_names[i] == name {
+            return _comptime_const_nodes[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Build a literal AST node for the const-fold result. We construct minimal
+// nodes inline (rather than calling parser helpers) to avoid cross-module
+// import dependencies.
+fn _make_int_lit_node(val_str) {
+    return #{
+        "kind": "IntLit", "name": "", "value": val_str, "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn _make_float_lit_node(val_str) {
+    return #{
+        "kind": "FloatLit", "name": "", "value": val_str, "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+// Compile-time evaluator. Returns a literal AST node on success
+// (kind ∈ {IntLit, FloatLit, StringLit, BoolLit}), or "" (string) on failure.
+//
+// Supported folds:
+//   - terminal literals: IntLit, FloatLit, StringLit, BoolLit (returned as-is)
+//   - Ident → looked up in comptime-const table (inlines folded value)
+//   - UnaryOp("-", const) → negation
+//   - BinOp(+, -, *, /, %) on numeric literals → arithmetic (int+int → int,
+//     either side float → float; / and % only int)
+// All other expressions return "" — caller falls back to runtime emission.
+fn comptime_eval(node) {
+    if type_of(node) == "string" { return "" }
+    let k = node.kind
+    if k == "IntLit" { return node }
+    if k == "FloatLit" { return node }
+    if k == "StringLit" { return node }
+    if k == "BoolLit" { return node }
+    if k == "Ident" {
+        return _lookup_comptime_const(node.name)
+    }
+    if k == "UnaryOp" {
+        if node.op != "-" { return "" }
+        let v = comptime_eval(node.left)
+        if type_of(v) == "string" { return "" }
+        if v.kind == "IntLit" {
+            let i = -to_int(v.value)
+            return _make_int_lit_node(to_string(i))
+        }
+        if v.kind == "FloatLit" {
+            let f = -to_float(v.value)
+            return _make_float_lit_node(to_string(f))
+        }
+        return ""
+    }
+    if k == "BinOp" {
+        let l = comptime_eval(node.left)
+        if type_of(l) == "string" { return "" }
+        let r = comptime_eval(node.right)
+        if type_of(r) == "string" { return "" }
+        let op = node.op
+        // Only numeric operands fold here.
+        let lf_kind = l.kind
+        let rf_kind = r.kind
+        if lf_kind != "IntLit" && lf_kind != "FloatLit" { return "" }
+        if rf_kind != "IntLit" && rf_kind != "FloatLit" { return "" }
+        let is_float = lf_kind == "FloatLit" || rf_kind == "FloatLit"
+        if is_float {
+            // Float arithmetic: + - * / supported, % not.
+            let lf = to_float(l.value)
+            let rf = to_float(r.value)
+            if op == "+" { return _make_float_lit_node(to_string(lf + rf)) }
+            if op == "-" { return _make_float_lit_node(to_string(lf - rf)) }
+            if op == "*" { return _make_float_lit_node(to_string(lf * rf)) }
+            if op == "/" {
+                if rf == 0.0 { return "" }
+                return _make_float_lit_node(to_string(lf / rf))
+            }
+            return ""
+        }
+        // Pure int arithmetic.
+        let li = to_int(l.value)
+        let ri = to_int(r.value)
+        if op == "+" { return _make_int_lit_node(to_string(li + ri)) }
+        if op == "-" { return _make_int_lit_node(to_string(li - ri)) }
+        if op == "*" { return _make_int_lit_node(to_string(li * ri)) }
+        if op == "/" {
+            if ri == 0 { return "" }
+            return _make_int_lit_node(to_string(li / ri))
+        }
+        if op == "%" {
+            if ri == 0 { return "" }
+            return _make_int_lit_node(to_string(li % ri))
+        }
+        return ""
+    }
+    return ""
+}
+
+// Register a comptime-const folded literal in the lookup table.
+// `value_node` is the folded literal returned by comptime_eval.
+fn _register_comptime_const(name, value_node) {
+    _comptime_const_names = _comptime_const_names.push(name)
+    _comptime_const_nodes = _comptime_const_nodes.push(value_node)
+}
+
 // ── C3: Closure capture support ──────────────────────────
 // `_known_fn_globals`: names callable as direct C functions (FnDecl, extern,
 //   pure fn, struct constructors). Call-by-name uses direct C call for these.
@@ -2500,6 +2666,10 @@ fn codegen_c2_full(ast) {
     _known_nonlocal_names = []
     _ic_counter = 0
     _ic_def_parts = []
+    // ComptimeConst const-fold table — T0 lesson: must reset in BOTH
+    // codegen_c2 and codegen_c2_full to avoid stale fold from prior call.
+    _comptime_const_names = []
+    _comptime_const_nodes = []
 
     // ── Pass 0: collect known global names for closure free-var analysis ──
     let mut gi = 0
@@ -2553,12 +2723,17 @@ fn codegen_c2_full(ast) {
             fwd_parts = fwd_parts.push(gen2_fn_forward(ast[i]) + "\n")
             fn_parts = fn_parts.push(gen2_fn_decl(ast[i]) + "\n\n")
         } else if k == "ComptimeConst" {
-            // Treat comptime const as global constant
-            global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
-            if type_of(ast[i].left) != "string" {
-                main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+            // Same comptime fold as codegen_c2 (kept in sync — T0 lesson).
+            let _cc_folded2 = comptime_eval(ast[i].left)
+            if type_of(_cc_folded2) != "string" {
+                _register_comptime_const(ast[i].name, _cc_folded2)
             } else {
-                main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                global_parts = global_parts.push("HexaVal " + ast[i].name + ";\n")
+                if type_of(ast[i].left) != "string" {
+                    main_parts = main_parts.push("    " + ast[i].name + " = " + gen2_expr(ast[i].left) + ";\n")
+                } else {
+                    main_parts = main_parts.push("    " + ast[i].name + " = hexa_void();\n")
+                }
             }
         } else if k == "OptimizeFnStmt" {
             // Optimization hint — skip

@@ -415,6 +415,10 @@ HexaVal hexa_void() { return (HexaVal){.tag=TAG_VOID}; }
 static inline double __hx_to_double(HexaVal v) {
     if (v.tag == TAG_FLOAT) return v.f;
     if (v.tag == TAG_INT)   return (double)v.i;
+    // ComptimeConst eval: to_float("3.14") at compile time needs string parsing.
+    // Without this branch, returned 0.0, silently producing wrong constants.
+    // atof handles both ints and floats correctly ("3" → 3.0, "3.14" → 3.14).
+    if (v.tag == TAG_STR && v.s)   return atof(v.s);
     if (v.tag == TAG_VALSTRUCT && v.vs) {
         if (v.vs->tag_i == TAG_FLOAT) return v.vs->float_val;
         if (v.vs->tag_i == TAG_INT)   return (double)v.vs->int_val;
