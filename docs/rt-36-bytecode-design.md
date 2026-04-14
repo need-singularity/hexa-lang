@@ -574,4 +574,52 @@ Related breakthroughs landed in `shared/hexa-lang/state.json`:
 * `BT_T41_BRIDGE_UNBLOCK` (2026-04-14, 90b01a0) — AST→BC bridge MVP 12/12 PASS (recursive fib, while, if/else)
 * `BT_T42_PHASE1_CTRL` (2026-04-14, 79f438c) — Break / Continue / CompoundAssign emit path (3 deferred: Array / Index / MapLit waiting on VM opcodes)
 * `BT_T43_ARENA_DEFAULT_ON` (2026-04-14, 3ae3d7a) — HEXA_VAL_ARENA default flip; T31/T33/T37/T40 all closed
+* `BT_T45_STRUCT_OPCODES` (2026-04-14, e3cb90b) — NEW_STRUCT / LOAD_FIELD / STORE_FIELD + StructInit/FieldAccess/FieldAssignStmt emit. Struct shape `[BC_STRUCT_TAG, type_name, keys[], vals[]]`. struct_mvp 6/6 + nested 7/7 PASS
+* `BT_T46_EXCEPTION_OPCODES` (2026-04-14, af169dc) — TRY / THROW / ENDTRY + 3-parallel try-frame stacks + bc_vm_arr_shrink_last/truncate helpers. TryCatch / ThrowStmt emit. try_mvp 9/9 PASS + uncaught trap surfaced via vm_trap_msg
+* `BT_T47_OPCODE_COMPLETE` (2026-04-14, 04eec21) — POPN/DUP/MOVE/TAILCALL + CLOSURE/NEW_CLOSURE_UPVAL + LOAD/STORE_UPVAL stub. **62/62 opcodes (100%)**. Lambda emit + UPVAL wiring deferred to rt#36-E
+* `BT_T48_COLLECTION_MUT_EMIT` (2026-04-14, 71b1770) — a[i]=v / .push() / m[k]=v emitter 배선. OP_ARR_SET polymorphic (map-shape dispatch). mut_mvp 7/7 PASS
+* `BT_T49_MAIN_AUTOCALL` (2026-04-14, 2112ff7) — fn main() auto-call 3경로 통일 (interpreter + bc_vm + codegen_c2). T23 후속으로 interpret() SSOT mirror 2 파일 + bc_vm_run() 에 find_fn / user_main_idx 트래킹. '<main>' wrapper 없는 케이스도 허용
+
+---
+
+## 18. rt#36-D landing snapshot (2026-04-14 night)
+
+**62 / 62 opcodes — 100% coverage. rt#36-C → rt#36-D 마일스톤 완주.**
+
+| Category | Opcodes | Status |
+|----------|---------|--------|
+| Load/Store | LOADK LOADI LOADF LOADNIL LOADTRUE LOADFALSE LOAD_LOCAL STORE_LOCAL LOAD_GLOBAL STORE_GLOBAL | ✓ |
+| Arithmetic | ADD SUB MUL DIV MOD ADDF SUBF MULF DIVF | ✓ |
+| Comparison | EQ NEQ LT LE GT GE | ✓ |
+| Logic | AND OR NOT | ✓ |
+| Control | JMP JMPF JMPT CALL TAILCALL RETURN RETURN0 | ✓ (TAILCALL MVP=CALL, frame-reuse rt#37 deferred) |
+| Collections | NEW_ARRAY ARR_GET ARR_SET ARR_PUSH ARR_LEN NEW_MAP MAP_GET MAP_SET | ✓ (ARR_SET polymorphic) |
+| Structs | NEW_STRUCT LOAD_FIELD STORE_FIELD | ✓ |
+| Exceptions | TRY THROW ENDTRY | ✓ |
+| Closures | CLOSURE NEW_CLOSURE_UPVAL LOAD_UPVAL STORE_UPVAL | △ (CLOSURE/NEW_CLOSURE_UPVAL dispatch 존재, LOAD/STORE_UPVAL stub — Lambda emit 배선은 rt#36-E) |
+| Misc | POP POPN DUP MOVE NOP HALT ASSERT_INT ASSERT_FLOAT PRINT PROFILE_HOOK | ✓ |
+
+**Emitter 배선 (AST → BC)**:
+- Phase 1 (T41/T42): LetStmt/AssignStmt/ReturnStmt/WhileStmt/BreakStmt/ContinueStmt/CompoundAssign + forward-decl chain
+- Phase 2 (T44): ArrayLit/IndexExpr/MapLit
+- Phase 3 (T45): StructInit/FieldAccess/FieldAssignStmt
+- Phase 4 (T46): TryCatch/ThrowStmt
+- Phase 5 (T48): IndexAssignStmt + method-sugar `.push()`
+
+**영구 regression suite**: `examples/regressions/rt36-d/`
+- struct_mvp.hexa — 6/6 (init/read/assign/mutate)
+- struct_nested.hexa — 7/7 (fn-return struct, struct-of-struct, field arithmetic)
+- try_mvp.hexa — 9/9 (basic, no-throw, nested rethrow, throw-through-call, inner-catch outer-continue, baseline)
+- try_uncaught.hexa — trap 확인
+- mut_mvp.hexa — 7/7 (arr[i]=v, chained push, map m[k]=v polymorphic)
+- main_autocall.hexa / main_only.hexa / main_nouser.hexa — 양 모드
+
+**회귀**: bridge_mvp 12/12 + bridge_arr/map + interpreter regression_stage1 14/14 전부 양 모드 유지.
+
+**rt#36-E 작업 큐 (deferred)**:
+- Lambda emit: free-var 분석 + CLOSURE + N×NEW_CLOSURE_UPVAL
+- CALL-of-closure: sentinel check before proto resolution (closure vs proto_idx)
+- UPVAL binding: per-frame closure-binding 레지스터 (LOAD/STORE_UPVAL wiring)
+- TAILCALL frame-reuse: scope verifier 의존
+- `hexa run --vm` default flip 검토 (전체 stage1 regression + bench)
 
