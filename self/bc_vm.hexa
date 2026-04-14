@@ -85,6 +85,24 @@ let mut vm_trap_msg = ""
 // trap is an unrecoverable VM error. bc_vm_reset clears both.
 let mut vm_halted = false
 
+// T46 try-frame stack (parallel arrays). A try-frame is pushed by
+// OP_TRY and popped by OP_ENDTRY (normal exit) or OP_THROW (which
+// unwinds the operand + frame stacks to the snapshots captured at
+// OP_TRY). Stack depth == len(vm_try_catch_pc).
+//
+//   vm_try_catch_pc[i]     — absolute pc in the try-frame's proto
+//                            where the catch handler begins
+//   vm_try_stack_size[i]   — len(vm_stack) at OP_TRY time; OP_THROW
+//                            truncates back to this before jumping
+//                            to the handler
+//   vm_try_frame_depth[i]  — len(vm_frame_proto) at OP_TRY time;
+//                            OP_THROW truncates back to this, popping
+//                            any nested call frames opened inside the
+//                            try block
+let mut vm_try_catch_pc     = []
+let mut vm_try_stack_size   = []
+let mut vm_try_frame_depth  = []
+
 // Nil sentinel (see header). Using a distinctive string makes
 // type-confusion bugs easy to spot in test output.
 let BC_NIL = "<nil>"
@@ -117,6 +135,40 @@ fn bc_vm_reset() {
     vm_trap = false
     vm_trap_msg = ""
     vm_halted = false
+    vm_try_catch_pc = []
+    vm_try_stack_size = []
+    vm_try_frame_depth = []
+}
+
+// ── Try-frame stack helpers. ────────────────────────────────
+// Stage1 hexa arrays are value-returning on push/pop, so these
+// rebuild-without-tail helpers mirror bc_vm_pop's pattern for the
+// try-frame parallel arrays and for operand-stack truncation on
+// OP_THROW.
+
+fn bc_vm_arr_shrink_last(arr) {
+    let n = len(arr)
+    if n <= 0 { return arr }
+    let mut out = []
+    let mut i = 0
+    while i < n - 1 {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn bc_vm_arr_truncate(arr, keep_n) {
+    let n = len(arr)
+    if keep_n >= n { return arr }
+    if keep_n < 0 { return [] }
+    let mut out = []
+    let mut i = 0
+    while i < keep_n {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
 }
 
 // ── Stack helpers (mutate vm_stack directly). ───────────────
@@ -1124,6 +1176,80 @@ fn bc_vm_run_loop() {
             }
             let sf_out = [BC_STRUCT_TAG, sf_type, sf_new_keys, sf_new_vals]
             bc_vm_push(sf_out)
+        }
+
+        // ──────── EXCEPTION OPCODES (rt#36-D T46) ────────
+        // Structured try/catch mirrors the interpreter's throw_flag /
+        // throw_val semantics but avoids a global flag: instead, OP_THROW
+        // does the unwind directly by truncating the operand + frame
+        // stacks to snapshots captured at OP_TRY time.
+        //
+        // OP_TRY sbx:
+        //   push a try-frame recording (catch_pc, sp_snapshot, fd_snapshot).
+        //   sbx is a signed pc-relative delta from the instruction AFTER
+        //   OP_TRY to the catch handler's first instruction (emitter's
+        //   std forward-jump convention).
+        else if op == BC_OP_TRY {
+            let t_sbx = bc_sbx_of(raw)
+            let t_cur_pc = vm_frame_pc[depth - 1]   // already advanced
+            let t_catch_pc = t_cur_pc + t_sbx
+            vm_try_catch_pc    = vm_try_catch_pc.push(t_catch_pc)
+            vm_try_stack_size  = vm_try_stack_size.push(len(vm_stack))
+            vm_try_frame_depth = vm_try_frame_depth.push(len(vm_frame_proto))
+        }
+        // OP_ENDTRY:
+        //   pop the top try-frame (normal exit path). If somehow the
+        //   try-stack is already empty we silently ignore rather than
+        //   trap — this matches Lua's catch-block tolerance and lets
+        //   nested try/catch emit reorderings stay robust.
+        else if op == BC_OP_ENDTRY {
+            if len(vm_try_catch_pc) > 0 {
+                vm_try_catch_pc    = bc_vm_arr_shrink_last(vm_try_catch_pc)
+                vm_try_stack_size  = bc_vm_arr_shrink_last(vm_try_stack_size)
+                vm_try_frame_depth = bc_vm_arr_shrink_last(vm_try_frame_depth)
+            }
+        }
+        // OP_THROW:
+        //   pop the thrown value; if a try-frame is pending,
+        //   (a) truncate operand stack to snapshot size,
+        //   (b) truncate frame stack to snapshot depth (unwinds any
+        //       nested call frames opened inside the try block),
+        //   (c) push thrown value so the handler's STORE_LOCAL
+        //       captures it into the catch-var slot,
+        //   (d) rewrite the NEW top frame's pc to the catch target.
+        //   If no try-frame exists, trap with an uncaught-throw message —
+        //   the VM driver (bc_vm_run) surfaces it via vm_trap_msg so
+        //   the error matches the interpreter's `error:` diagnostic.
+        else if op == BC_OP_THROW {
+            let th_val = bc_vm_pop()
+            if vm_trap { return last_return }
+            let th_n = len(vm_try_catch_pc)
+            if th_n == 0 {
+                vm_trap = true
+                vm_trap_msg = "uncaught throw: " + to_string(th_val)
+                return last_return
+            }
+            let th_saved_sp = vm_try_stack_size[th_n - 1]
+            let th_saved_fd = vm_try_frame_depth[th_n - 1]
+            let th_catch_pc = vm_try_catch_pc[th_n - 1]
+            vm_try_catch_pc    = bc_vm_arr_shrink_last(vm_try_catch_pc)
+            vm_try_stack_size  = bc_vm_arr_shrink_last(vm_try_stack_size)
+            vm_try_frame_depth = bc_vm_arr_shrink_last(vm_try_frame_depth)
+
+            // Unwind operand + frame stacks to snapshots.
+            vm_stack       = bc_vm_arr_truncate(vm_stack, th_saved_sp)
+            vm_frame_proto = bc_vm_arr_truncate(vm_frame_proto, th_saved_fd)
+            vm_frame_pc    = bc_vm_arr_truncate(vm_frame_pc,    th_saved_fd)
+            vm_frame_fp    = bc_vm_arr_truncate(vm_frame_fp,    th_saved_fd)
+
+            // Push thrown value; handler consumes via STORE_LOCAL.
+            bc_vm_push(th_val)
+
+            // Rewrite current frame pc to catch target.
+            let th_new_d = len(vm_frame_proto)
+            if th_new_d > 0 {
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, th_new_d - 1, th_catch_pc)
+            }
         }
 
         // ──────── UNIMPLEMENTED OPCODES ────────
