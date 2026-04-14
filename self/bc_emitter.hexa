@@ -758,20 +758,29 @@ fn bc_mk_fn_decl(name, n_params, params_start, params_end, body_start, body_end)
     return len(bc_node_pool) - 1
 }
 
-// T51 — Lambda expression BcNode. Mirrors FnDecl layout but anonymous:
-//   left_idx           = single-expr body idx in bc_node_pool, or -1
-//                         for block body (deferred to T52)
+// T51 / T54 — Lambda expression BcNode. Mirrors FnDecl layout but
+// anonymous. Two body forms:
+//   expr-body  — left_idx = bc_node_pool idx of the expression; the
+//                value of that expression is the return value (T51).
+//   block-body — body_start/body_end = slice of bc_stmt_list holding
+//                the block statements; the lambda returns void on
+//                fall-through (T54 — to value-return a block, use an
+//                explicit ReturnStmt).
+// Exactly one of (left_idx >= 0) and (body_start >= 0) should hold;
+// bc_mk_lambda leaves the unused pair as -1 per caller's choice.
+//
 //   params_start/end   = slice of bc_param_list holding param names
 //   n_params           = param count
+//
 // The emit-side (bc_compile_expr Lambda branch) walks the body to
 // extract free vars, registers a new proto via bc_compile_lambda_proto,
 // and emits OP_CLOSURE + N×NEW_CLOSURE_UPVAL in the outer stream.
-fn bc_mk_lambda(n_params, params_start, params_end, expr_body_idx) {
+fn bc_mk_lambda(n_params, params_start, params_end, expr_body_idx, body_start, body_end) {
     let n = BcNode {
         kind: "Lambda", int_val: 0, float_val: 0.0, bool_val: false,
         str_val: "", name: "", op: "",
         left_idx: expr_body_idx, right_idx: -1,
-        body_start: -1, body_end: -1,
+        body_start: body_start, body_end: body_end,
         else_start: -1, else_end: -1,
         args_start: -1, args_end: -1,
         n_params: n_params, params_start: params_start, params_end: params_end
@@ -1248,10 +1257,9 @@ fn bc_compile_expr(idx) {
     //
     //   Stack effect: +1 (the built closure value).
     if k == "Lambda" {
-        let body_idx = node.left_idx
-        // MVP: expr-body only. Block body falls through to produce a
-        // lambda whose body is RETURN0 (captures ignored) — loud failure
-        // via bare nil return, flagged for T52.
+        // T54 — two body forms. Either left_idx (expr-body) or
+        // body_start/body_end (block-body) is set, not both. See
+        // bc_mk_lambda doc.
 
         // Step 1 — scan free vars. "locals" at lambda entry = params.
         let mut params_seen = []
@@ -1262,7 +1270,12 @@ fn bc_compile_expr(idx) {
                 _ip = _ip + 1
             }
         }
-        let free_vars = bc_collect_free_vars_expr(body_idx, params_seen, [])
+        let mut free_vars = []
+        if node.left_idx >= 0 {
+            free_vars = bc_collect_free_vars_expr(node.left_idx, params_seen, [])
+        } else if node.body_start >= 0 {
+            free_vars = bc_collect_free_vars_stmts(node.body_start, node.body_end, params_seen, [])
+        }
 
         // Step 2 — compile body as new proto; save/restore outer state.
         let new_pidx = bc_compile_lambda_proto(node, free_vars)
@@ -2144,13 +2157,27 @@ fn bc_compile_lambda_proto(lam_node, free_vars) {
         }
     }
 
-    // Compile body — expr form MVP.
+    // Compile body — expr form (T51) or block form (T54).
     if lam_node.left_idx >= 0 {
+        // Expr-body — value is the expression; emit RETURN.
         bc_compile_expr(lam_node.left_idx)
         let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
         bc_pop(1)
+    } else if lam_node.body_start >= 0 {
+        // Block-body (T54) — compile each stmt in bc_stmt_list slice.
+        // Fall-through at end emits RETURN0 (void); explicit
+        // `return expr` inside the block emits its own RETURN.
+        let mut lbi = lam_node.body_start
+        while lbi < lam_node.body_end {
+            let sidx = bc_stmt_list[lbi]
+            if sidx >= 0 {
+                bc_compile_stmt(sidx)
+            }
+            lbi = lbi + 1
+        }
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
     } else {
-        // Block body — T52. Emit a bare RETURN0 as loud nil.
+        // Empty lambda body — loud nil return.
         let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
     }
 
@@ -2751,15 +2778,12 @@ fn ast_to_bc_expr(node) {
         return bc_mk_field_access(oi, node.name)
     }
 
-    // T51 (rt#36-E #1) — Lambda expression. Parser shape
+    // T51 / T54 — Lambda expression. Parser shape
     // (hexa_full.hexa L3241-3247 / L3260-3266):
     //   kind = "Lambda"
     //   params = string[] (param names)
-    //   left = body — expr dict (single-expr form) OR array of stmts (block form)
-    //
-    // MVP: expr-body only. Block body → left_idx = -1, which
-    // bc_compile_lambda_proto lowers to a bare RETURN0 (caller sees
-    // nil return — loud failure, flagged for T52 block-body wiring).
+    //   left = body — expr dict (single-expr form, T51) OR array of
+    //                 stmts (block form, T54).
     if k == "Lambda" {
         let raw_params = node.params
         let ps_start = len(bc_param_list)
@@ -2778,13 +2802,21 @@ fn ast_to_bc_expr(node) {
         let ps_end = len(bc_param_list)
 
         let raw_body = node.left
-        let mut body_expr_idx = -1
         if type_of(raw_body) == "map" || type_of(raw_body) == "struct" {
-            body_expr_idx = ast_to_bc_expr(raw_body)
+            // Expr-body (T51).
+            let body_expr_idx = ast_to_bc_expr(raw_body)
+            return bc_mk_lambda(np, ps_start, ps_end, body_expr_idx, -1, -1)
         }
-        // Block-body (raw_body is array) → body_expr_idx stays -1.
-        // bc_compile_lambda_proto handles the -1 case as a RETURN0 stub.
-        return bc_mk_lambda(np, ps_start, ps_end, body_expr_idx)
+        if type_of(raw_body) == "array" {
+            // Block-body (T54) — lower the stmt array into a
+            // bc_stmt_list slice via the same walker the top-level
+            // code path uses, then stash (body_start, body_end) on
+            // the Lambda BcNode.
+            let rng = ast_to_bc_walk_body(raw_body)
+            return bc_mk_lambda(np, ps_start, ps_end, -1, rng[0], rng[1])
+        }
+        // Unknown body shape — produce an empty lambda (RETURN0 stub).
+        return bc_mk_lambda(np, ps_start, ps_end, -1, -1, -1)
     }
 
     // T45 — Struct literal: `Name { f: v, ... }`. Parser shape
