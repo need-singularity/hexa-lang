@@ -1,0 +1,235 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_gqa.hexa — ROI #86 correctness suite
+//
+//  Covers:
+//   1. detect_gqa truth table (MHA / GQA / MQA / non-divisible)
+//   2. group_size arithmetic
+//   3. repeat_kv shape + adjacency replication values
+//   4. naive vs fused numerical equivalence (tol 1e-5)
+//   5. memory footprint documentation (fused shares K/V, no materialise)
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/gqa.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_local(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mat_close(A, B, eps) {
+    let rows = len(A)
+    if len(B) != rows { return false }
+    for i in 0..rows {
+        let cols = len(A[i])
+        if len(B[i]) != cols { return false }
+        for j in 0..cols {
+            if fabs_local(A[i][j] - B[i][j]) > eps { return false }
+        }
+    }
+    return true
+}
+
+fn mat3d_close(A, B, eps) {
+    let H = len(A)
+    if len(B) != H { return false }
+    for h in 0..H {
+        if !mat_close(A[h], B[h], eps) { return false }
+    }
+    return true
+}
+
+// deterministic pseudo-random LCG
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_matrix(rows, cols, seed) {
+    let mut state = seed
+    let mut M = []
+    for _i in 0..rows {
+        let mut row = []
+        for _j in 0..cols {
+            state = lcg_step(state)
+            let r = (state % 1000) * 0.001 - 0.5
+            row = row + [r]
+        }
+        M = M + [row]
+    }
+    return M
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #86 GQA (grouped-query attention) — correctness suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-5
+
+// ── Test A : detect_gqa truth table ──────────────────────────────
+check("detect_gqa(32,8) true  (LLaMA3 GQA)",  detect_gqa(32, 8) == true)
+check("detect_gqa(32,32) false (MHA)",        detect_gqa(32, 32) == false)
+check("detect_gqa(32,1) true  (MQA)",         detect_gqa(32, 1) == true)
+check("detect_gqa(32,7) false (non-divisible)", detect_gqa(32, 7) == false)
+
+// extra edge cases around the 4-test spec
+check("detect_gqa(32,0) false (bad kv)",      detect_gqa(32, 0) == false)
+check("detect_gqa(32,64) false (kv > q)",     detect_gqa(32, 64) == false)
+check("detect_gqa(28,7) true  (Qwen-ish)",    detect_gqa(28, 7) == true)
+
+// ── Test B : group_size arithmetic ───────────────────────────────
+check("group_size(32,8) == 4  (LLaMA3)",   group_size(32, 8) == 4)
+check("group_size(32,1) == 32 (MQA)",      group_size(32, 1) == 32)
+check("group_size(32,32) == 1 (MHA)",      group_size(32, 32) == 1)
+check("group_size(28,7) == 4",             group_size(28, 7) == 4)
+
+// ── Test C : repeat_kv shape + adjacency values ──────────────────
+// Build KV with H_kv=2, S=3, D=4 — fill each head with a head-unique
+// constant so we can check which source ends up in each dst slot.
+let KV = [
+    [
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0],
+        [0.0, 0.0, 0.0, 0.0]
+    ],
+    [
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0],
+        [1.0, 1.0, 1.0, 1.0]
+    ]
+]
+
+let KV_rep4 = repeat_kv(KV, 4)
+check("repeat_kv outer len == 2*4 == 8", len(KV_rep4) == 8)
+check("repeat_kv inner S == 3",         len(KV_rep4[0]) == 3)
+check("repeat_kv inner D == 4",         len(KV_rep4[0][0]) == 4)
+
+// adjacency replication: dst heads 0..3 == src 0 (value 0.0)
+//                        dst heads 4..7 == src 1 (value 1.0)
+let mut adj_ok = true
+for h in 0..4 {
+    if KV_rep4[h][0][0] != 0.0 { adj_ok = false }
+    if KV_rep4[h][2][3] != 0.0 { adj_ok = false }
+}
+for h in 4..8 {
+    if KV_rep4[h][0][0] != 1.0 { adj_ok = false }
+    if KV_rep4[h][2][3] != 1.0 { adj_ok = false }
+}
+check("repeat_kv adjacency 0000 1111", adj_ok)
+
+// n_rep=1 is identity
+let KV_rep1 = repeat_kv(KV, 1)
+check("repeat_kv n_rep=1 outer len == H_kv", len(KV_rep1) == 2)
+check("repeat_kv n_rep=1 preserves src[0]",  KV_rep1[0][0][0] == 0.0)
+check("repeat_kv n_rep=1 preserves src[1]",  KV_rep1[1][0][0] == 1.0)
+
+// MQA path — n_rep=32 from H_kv=1
+let KV_mqa = [ [[0.5, 0.5], [0.5, 0.5]] ]
+let KV_mqa_exp = repeat_kv(KV_mqa, 32)
+check("MQA repeat_kv outer == 32", len(KV_mqa_exp) == 32)
+check("MQA repeat_kv all broadcast to src0", KV_mqa_exp[0][0][0] == 0.5 && KV_mqa_exp[31][1][1] == 0.5)
+
+// ── Test D : naive vs fused numerical equivalence ────────────────
+// Small case from spec: H_q=4, H_kv=2, S=3, D=4  → group_size=2
+let H_q  = 4
+let H_kv = 2
+let S    = 3
+let D    = 4
+
+// Build Q (per H_q) and K/V (per H_kv) with deterministic seeds.
+let mut Q = []
+for h in 0..H_q {
+    Q = Q + [rand_matrix(S, D, 100 + h)]
+}
+let mut K = []
+let mut V = []
+for h in 0..H_kv {
+    K = K + [rand_matrix(S, D, 200 + h)]
+    V = V + [rand_matrix(S, D, 300 + h)]
+}
+
+let O_naive = gqa_attention_naive(Q, K, V, H_q, H_kv)
+let O_fused = gqa_attention_fused(Q, K, V, H_q, H_kv)
+
+check("naive output H_q heads",      len(O_naive) == H_q)
+check("fused output H_q heads",      len(O_fused) == H_q)
+check("naive output S rows (head0)", len(O_naive[0]) == S)
+check("fused output D cols (head0)", len(O_fused[0][0]) == D)
+
+check("naive vs fused head0 close", mat_close(O_naive[0], O_fused[0], eps))
+check("naive vs fused head1 close", mat_close(O_naive[1], O_fused[1], eps))
+check("naive vs fused head2 close", mat_close(O_naive[2], O_fused[2], eps))
+check("naive vs fused head3 close", mat_close(O_naive[3], O_fused[3], eps))
+check("naive vs fused full 3D close", mat3d_close(O_naive, O_fused, eps))
+
+// heads sharing the same KV slot should produce identical output
+// when their Q row is identical — sanity check grouping logic.
+// Set Q[0] == Q[1] (both map to kv_h=0) and confirm O[0] == O[1].
+let mut Qshare = []
+let Qsame = rand_matrix(S, D, 999)
+for _h in 0..H_q {
+    Qshare = Qshare + [Qsame]
+}
+let O_share = gqa_attention_fused(Qshare, K, V, H_q, H_kv)
+check("shared Q heads 0,1 (same kv_h=0) agree", mat_close(O_share[0], O_share[1], eps))
+check("shared Q heads 2,3 (same kv_h=1) agree", mat_close(O_share[2], O_share[3], eps))
+// heads across kv boundary should differ (different K,V)
+let differ = !mat_close(O_share[0], O_share[2], eps)
+check("shared Q heads 1,2 (kv_h differ) diverge", differ)
+
+// ── Test E : MHA degenerate (n_q == n_kv)  ───────────────────────
+// group_size=1 → naive and fused are identical paths numerically.
+let H_mha = 2
+let mut Qm = []
+for h in 0..H_mha {
+    Qm = Qm + [rand_matrix(S, D, 400 + h)]
+}
+let mut Km = []
+let mut Vm = []
+for h in 0..H_mha {
+    Km = Km + [rand_matrix(S, D, 500 + h)]
+    Vm = Vm + [rand_matrix(S, D, 600 + h)]
+}
+let Om_n = gqa_attention_naive(Qm, Km, Vm, H_mha, H_mha)
+let Om_f = gqa_attention_fused(Qm, Km, Vm, H_mha, H_mha)
+check("MHA naive vs fused head0", mat_close(Om_n[0], Om_f[0], eps))
+check("MHA naive vs fused head1", mat_close(Om_n[1], Om_f[1], eps))
+
+// ── Test F : MQA degenerate (n_kv == 1) ──────────────────────────
+// All Q heads share the single K/V slot.
+let H_mq = 4
+let mut Qq = []
+for h in 0..H_mq {
+    Qq = Qq + [rand_matrix(S, D, 700 + h)]
+}
+let Kq = [ rand_matrix(S, D, 800) ]
+let Vq = [ rand_matrix(S, D, 900) ]
+let Oq_n = gqa_attention_naive(Qq, Kq, Vq, H_mq, 1)
+let Oq_f = gqa_attention_fused(Qq, Kq, Vq, H_mq, 1)
+check("MQA full 3D naive vs fused", mat3d_close(Oq_n, Oq_f, eps))
+check("MQA output outer len", len(Oq_f) == H_mq)
+
+// ══════════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

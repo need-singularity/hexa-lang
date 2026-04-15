@@ -1,0 +1,255 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_graph_pattern.hexa — ROI #84 correctness suite
+//
+//  Exercises self/ai_native/graph_pattern.hexa along three axes:
+//
+//    A.  AST pattern detection  — positive + negative expressions
+//    B.  AST rewrite            — structural kind flip + transpose
+//                                 removal + lhs/rhs preservation
+//    C.  Numeric equivalence    — matmul_t ≡ matmul(Q, transpose(K))
+//                                 over 5 shape combinations, tol 1e-5
+//
+//  Tolerance: float64 round-off on D·M·N reductions stays ≪ 1e-10
+//  in practice — we assert 1e-5 defensively.
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/graph_pattern.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_local(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mat_close(A, B, eps) {
+    let rows = len(A)
+    if len(B) != rows { return false }
+    for i in 0..rows {
+        let cols = len(A[i])
+        if len(B[i]) != cols { return false }
+        for j in 0..cols {
+            if fabs_local(A[i][j] - B[i][j]) > eps { return false }
+        }
+    }
+    return true
+}
+
+fn max_abs_diff(A, B) {
+    let rows = len(A)
+    let mut mx = 0.0
+    for i in 0..rows {
+        let cols = len(A[i])
+        for j in 0..cols {
+            let d = fabs_local(A[i][j] - B[i][j])
+            if d > mx { mx = d }
+        }
+    }
+    return mx
+}
+
+// deterministic LCG (same constants as test_gemm_tile)
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_matrix(rows, cols, seed) {
+    let mut state = seed
+    let mut M = []
+    for _i in 0..rows {
+        let mut row = []
+        for _j in 0..cols {
+            state = lcg_step(state)
+            let r = (state % 1000) * 0.001 - 0.5
+            row = row + [r]
+        }
+        M = M + [row]
+    }
+    return M
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #84 graph pattern Q·K^T → matmul_t — correctness")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-5
+
+// ══════════════════════════════════════════════════════════════════
+//  Section A — AST detection
+// ══════════════════════════════════════════════════════════════════
+// Build a library of synthetic trees, distinguishing positive and
+// negative cases.  7 cases minimum per spec.
+
+let Q_leaf = e_var("Q")
+let K_leaf = e_var("K")
+let V_leaf = e_var("V")
+
+// pos 1: canonical shape  matmul(Q, transpose(K))
+let pos1 = e_matmul(Q_leaf, e_transpose(K_leaf))
+check("A1 detect — matmul(Q, transpose(K))", detect_qkt(pos1))
+
+// pos 2: lhs is not a leaf — matmul(scale(Q,s), transpose(K))
+let pos2 = e_matmul(e_scale(Q_leaf, 0.125), e_transpose(K_leaf))
+check("A2 detect — matmul(scale(Q), transpose(K))", detect_qkt(pos2))
+
+// pos 3: rhs transpose wraps a non-leaf — matmul(Q, transpose(add(K,V)))
+let pos3 = e_matmul(Q_leaf, e_transpose(e_add(K_leaf, V_leaf)))
+check("A3 detect — matmul(Q, transpose(K+V))", detect_qkt(pos3))
+
+// neg 1: no transpose on rhs — matmul(Q, K)
+let neg1 = e_matmul(Q_leaf, K_leaf)
+check("A4 reject — matmul(Q, K) no transpose",  !detect_qkt(neg1))
+
+// neg 2: transpose on the *wrong* side — matmul(transpose(Q), K)
+let neg2 = e_matmul(e_transpose(Q_leaf), K_leaf)
+check("A5 reject — matmul(transpose(Q), K)",    !detect_qkt(neg2))
+
+// neg 3: root op is add, not matmul — add(Q, transpose(K))
+let neg3 = e_add(Q_leaf, e_transpose(K_leaf))
+check("A6 reject — add(Q, transpose(K))",       !detect_qkt(neg3))
+
+// neg 4: leaf node — just a variable
+check("A7 reject — leaf Q",                     !detect_qkt(Q_leaf))
+
+// neg 5: softmax at root
+let neg5 = e_softmax(e_matmul(Q_leaf, e_transpose(K_leaf)))
+check("A8 reject — softmax(matmul(Q, transpose(K)))", !detect_qkt(neg5))
+
+// neg 6: already rewritten — matmul_t should not re-match
+let neg6 = e_matmul_t(Q_leaf, K_leaf)
+check("A9 reject — already matmul_t(Q, K)",     !detect_qkt(neg6))
+
+// ══════════════════════════════════════════════════════════════════
+//  Section B — AST rewrite
+// ══════════════════════════════════════════════════════════════════
+// kind flip, transpose removal, sub-tree preservation.
+
+let rw1 = rewrite_qkt(pos1)
+check("B1 rewrite kind: matmul → matmul_t", rw1.kind == "matmul_t")
+let rw1_lhs = rw1.lhs
+check("B1 rewrite preserves Q (lhs.kind == var)", rw1_lhs.kind == "var")
+check("B1 rewrite preserves Q name",               rw1_lhs.lhs == "Q")
+let rw1_rhs = rw1.rhs
+check("B1 rewrite unwraps transpose (rhs.kind == var)", rw1_rhs.kind == "var")
+check("B1 rewrite preserves K name",               rw1_rhs.lhs == "K")
+// rhs must no longer be a transpose node anywhere at the new root
+check("B1 rewrite drops transpose node",           rw1_rhs.kind != "transpose")
+
+// rewrite a non-matching tree is an identity
+let rw_neg1 = rewrite_qkt(neg1)
+check("B2 rewrite identity — non-matching kept matmul", rw_neg1.kind == "matmul")
+let rw_neg2 = rewrite_qkt(neg2)
+check("B3 rewrite identity — wrong-side transpose kept", rw_neg2.kind == "matmul")
+let rw_neg3 = rewrite_qkt(neg3)
+check("B4 rewrite identity — add root kept",             rw_neg3.kind == "add")
+let rw_neg6 = rewrite_qkt(neg6)
+check("B5 rewrite identity — already fused kept",        rw_neg6.kind == "matmul_t")
+
+// sub-tree preservation on pos2 (lhs is a scale node)
+let rw2 = rewrite_qkt(pos2)
+check("B6 rewrite kind on pos2",                 rw2.kind == "matmul_t")
+let rw2_lhs = rw2.lhs
+check("B6 rewrite preserves scale node",         rw2_lhs.kind == "scale")
+let rw2_rhs = rw2.rhs
+check("B6 rewrite unwraps transpose(K) on pos2", rw2_rhs.kind == "var")
+
+// sub-tree preservation on pos3 (transpose wraps add)
+let rw3 = rewrite_qkt(pos3)
+check("B7 rewrite kind on pos3",                 rw3.kind == "matmul_t")
+let rw3_rhs = rw3.rhs
+check("B7 rewrite keeps inner add after unwrap", rw3_rhs.kind == "add")
+
+// ══════════════════════════════════════════════════════════════════
+//  Section C — numeric equivalence  matmul_t  vs  matmul_verbose
+// ══════════════════════════════════════════════════════════════════
+// 5 shape combinations spanning (M, N, D) space.
+
+// C1 — hand-computed 2×2 × 2×2 with D=3
+let Q_c1 = [
+    [1.0, 2.0, 3.0],
+    [4.0, 5.0, 6.0]
+]
+let K_c1 = [
+    [1.0, 0.0, 1.0],
+    [0.0, 1.0, 0.0],
+    [1.0, 1.0, 1.0],
+    [2.0, 0.0, 0.0]
+]
+
+let v_c1 = matmul_verbose(Q_c1, K_c1)
+let f_c1 = matmul_t(Q_c1, K_c1)
+// hand-check: v_c1[0][0] = 1·1+2·0+3·1 = 4
+check("C1 hand-check v[0][0] == 4",        fabs_local(v_c1[0][0] - 4.0) < eps)
+check("C1 hand-check v[1][3] == 8",        fabs_local(v_c1[1][3] - 8.0) < eps)
+check("C1 matmul_t == matmul_verbose",     mat_close(f_c1, v_c1, eps))
+check("C1 shape rows == M (2)",            len(f_c1) == 2)
+check("C1 shape cols == N (4)",            len(f_c1[0]) == 4)
+
+// C2 — square 8×8 × 8×8, D=8
+let Q_c2 = rand_matrix(8, 8, 11)
+let K_c2 = rand_matrix(8, 8, 22)
+let v_c2 = matmul_verbose(Q_c2, K_c2)
+let f_c2 = matmul_t(Q_c2, K_c2)
+check("C2 square 8x8  matmul_t == verbose", mat_close(f_c2, v_c2, eps))
+
+// C3 — tall Q, wide K  (M=16, D=4, N=32)
+let Q_c3 = rand_matrix(16, 4, 33)
+let K_c3 = rand_matrix(32, 4, 44)
+let v_c3 = matmul_verbose(Q_c3, K_c3)
+let f_c3 = matmul_t(Q_c3, K_c3)
+check("C3 16x4 · 32x4  matmul_t == verbose", mat_close(f_c3, v_c3, eps))
+
+// C4 — asymmetric primes (M=7, D=11, N=13)
+let Q_c4 = rand_matrix(7, 11, 55)
+let K_c4 = rand_matrix(13, 11, 66)
+let v_c4 = matmul_verbose(Q_c4, K_c4)
+let f_c4 = matmul_t(Q_c4, K_c4)
+check("C4 7x11 · 13x11 matmul_t == verbose", mat_close(f_c4, v_c4, eps))
+
+// C5 — single-row/single-column edges (M=1, D=5, N=1)
+let Q_c5 = rand_matrix(1, 5, 77)
+let K_c5 = rand_matrix(1, 5, 88)
+let v_c5 = matmul_verbose(Q_c5, K_c5)
+let f_c5 = matmul_t(Q_c5, K_c5)
+check("C5 1x5 · 1x5 matmul_t == verbose",    mat_close(f_c5, v_c5, eps))
+
+let d_c2 = max_abs_diff(f_c2, v_c2)
+println("  C2 max_abs_diff(matmul_t, verbose) = " + to_string(d_c2))
+let d_c4 = max_abs_diff(f_c4, v_c4)
+println("  C4 max_abs_diff(matmul_t, verbose) = " + to_string(d_c4))
+
+// ══════════════════════════════════════════════════════════════════
+//  Section D — flop accounting  (transpose elimination)
+// ══════════════════════════════════════════════════════════════════
+// For a K:[N,D] buffer the transpose pass writes N·D entries that
+// the fused kernel avoids.  Used by downstream fusion planners.
+
+check("D1 saved stores at N=32,D=4  == 128",    qkt_transpose_flops_saved(32, 4) == 128)
+check("D2 saved stores at N=128,D=64 == 8192",  qkt_transpose_flops_saved(128, 64) == 8192)
+check("D3 matmul flops M=8 N=8 D=8 == 1024",    qkt_matmul_flops(8, 8, 8) == 1024)
+check("D4 matmul flops M=7 N=13 D=11 == 2002",  qkt_matmul_flops(7, 13, 11) == 2002)
+
+// ══════════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

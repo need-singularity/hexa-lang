@@ -1,0 +1,378 @@
+// ═══════════════════════════════════════════════════════════
+//  self/ai_native/broadcast_elim.hexa
+//
+//  @broadcast_eliminate — skip broadcast when shapes already align.
+//
+//  Motivation: element-wise binary ops (add/mul/...) on tensors
+//  are frequently invoked with shapes that ALREADY match. The
+//  naive path still runs a full numpy-style broadcast expansion
+//  (shape reconciliation + strided materialization), burning:
+//      * one output allocation sized to broadcast_shape
+//      * two per-element stride computations
+//      * an outer rank-walk even when rank_a == rank_b and every
+//        dim agrees pairwise
+//  When shape_eq(shape_a, shape_b) holds, a plain element-wise
+//  loop over the flat arrays is both sufficient and strictly
+//  cheaper — no index arithmetic, one allocation, one pass.
+//
+//  API (shape = [int] little-endian, last dim innermost):
+//    shape_eq(s1, s2)                -> bool
+//    can_broadcast(s1, s2)           -> bool (numpy rules)
+//    broadcast_shape(s1, s2)         -> [int]   (sentinel [] if impossible)
+//    add_broadcast_naive(a, sa, b, sb) -> (arr, shape)
+//    add_broadcast_smart(a, sa, b, sb) -> (arr, shape)
+//
+//  Smart path:
+//    shape_eq(sa, sb)  → direct element-wise add, no broadcast materialize
+//    else              → broadcast both operands then element-wise add
+//    impossible        → returns ([], []) sentinel
+//
+//  Numerical contract:
+//    add_broadcast_smart(...) == add_broadcast_naive(...)
+//    element-wise, for every case where broadcast is legal.
+//
+//  Accounting (test-facing):
+//    smart_last_took_fast_path : bool  — set per-call
+//    smart_fast_count / smart_slow_count — cumulative counters
+// ═══════════════════════════════════════════════════════════
+
+// ── shape utilities ────────────────────────────────────────
+
+// Element-wise integer equality on two shape arrays.
+// [] == [] is true; differing rank is always false.
+pub fn shape_eq(s1, s2) {
+    let n1 = len(s1)
+    let n2 = len(s2)
+    if n1 != n2 { return false }
+    let mut i = 0
+    while i < n1 {
+        if s1[i] != s2[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Product of a shape's dims (i.e. flat element count).
+// Empty shape ([]) → 1 (scalar convention).
+pub fn shape_numel(s) {
+    let n = len(s)
+    let mut p = 1
+    let mut i = 0
+    while i < n {
+        p = p * s[i]
+        i = i + 1
+    }
+    return p
+}
+
+// Numpy-style broadcast legality:
+//   align shapes to the right; each aligned dim-pair must either
+//   be equal, or one of the two must be 1. Missing (shorter-rank)
+//   dims count as 1.
+pub fn can_broadcast(s1, s2) {
+    let n1 = len(s1)
+    let n2 = len(s2)
+    let mut nmax = n1
+    if n2 > nmax { nmax = n2 }
+    let mut k = 0
+    while k < nmax {
+        // right-aligned index: dim from the tail.
+        let i1 = n1 - 1 - k
+        let i2 = n2 - 1 - k
+        let mut d1 = 1
+        let mut d2 = 1
+        if i1 >= 0 { d1 = s1[i1] }
+        if i2 >= 0 { d2 = s2[i2] }
+        if d1 != d2 {
+            if d1 != 1 {
+                if d2 != 1 {
+                    return false
+                }
+            }
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// Compute broadcast shape. Returns [] sentinel if not broadcastable.
+// Output rank == max(rank_a, rank_b). Output dim_i = max(d1,d2) when
+// one side is 1 or they match.
+pub fn broadcast_shape(s1, s2) {
+    if can_broadcast(s1, s2) == false {
+        return []
+    }
+    let n1 = len(s1)
+    let n2 = len(s2)
+    let mut nmax = n1
+    if n2 > nmax { nmax = n2 }
+    // Build tail-first into `rev`, then reverse-push into `out`.
+    let mut rev = []
+    let mut k = 0
+    while k < nmax {
+        let i1 = n1 - 1 - k
+        let i2 = n2 - 1 - k
+        let mut d1 = 1
+        let mut d2 = 1
+        if i1 >= 0 { d1 = s1[i1] }
+        if i2 >= 0 { d2 = s2[i2] }
+        let mut d = d1
+        if d2 > d { d = d2 }
+        rev = rev.push(d)
+        k = k + 1
+    }
+    // rev is tail-first; flip into head-first order.
+    let mut out = []
+    let mut j = len(rev) - 1
+    while j >= 0 {
+        out = out.push(rev[j])
+        j = j - 1
+    }
+    return out
+}
+
+// ── index / stride helpers ─────────────────────────────────
+
+// Row-major strides for a shape. strides[i] = product of dims[i+1..].
+// Empty shape returns []; scalar-flat is length 1 with stride [].
+fn row_major_strides(shape) {
+    let n = len(shape)
+    if n == 0 { return [] }
+    // First pass: compute values into a tail-first tmp.
+    let mut tmp = []
+    let mut ss = 1
+    let mut kk = n - 1
+    while kk >= 0 {
+        tmp = tmp.push(ss)
+        ss = ss * shape[kk]
+        kk = kk - 1
+    }
+    // tmp is tail-first; reverse into head-first.
+    let mut out = []
+    let mut j = len(tmp) - 1
+    while j >= 0 {
+        out = out.push(tmp[j])
+        j = j - 1
+    }
+    return out
+}
+
+// Flat-index → multi-index, given the output shape.
+// Returns [int] length == len(shape). Uses repeated div/mod.
+fn flat_to_multi(flat, shape) {
+    let n = len(shape)
+    // Compute divisors per axis (row-major): div[i] = prod(shape[i+1..]).
+    let mut tmp = []
+    let mut ss = 1
+    let mut kk = n - 1
+    while kk >= 0 {
+        tmp = tmp.push(ss)
+        ss = ss * shape[kk]
+        kk = kk - 1
+    }
+    let mut divs = []
+    let mut j = len(tmp) - 1
+    while j >= 0 {
+        divs = divs.push(tmp[j])
+        j = j - 1
+    }
+    let mut multi = []
+    let mut i = 0
+    let mut rem = flat
+    while i < n {
+        let d = divs[i]
+        let axis = rem / d
+        rem = rem - axis * d
+        multi = multi.push(axis)
+        i = i + 1
+    }
+    return multi
+}
+
+// Project an output multi-index into the flat index of an input
+// tensor with shape `in_shape`, using broadcast alignment:
+//   - right-align in_shape under out_shape
+//   - if in-dim is 1 and out-dim > 1, that axis index collapses to 0
+//   - if in-shape is shorter (missing leading axes), those axes are
+//     skipped entirely (contribute 0 to the flat index)
+fn broadcast_src_flat(out_multi, out_shape, in_shape) {
+    let rank_out = len(out_shape)
+    let rank_in = len(in_shape)
+    let lead = rank_out - rank_in
+    // row-major strides for in_shape.
+    let strides_in = row_major_strides(in_shape)
+    let mut flat = 0
+    let mut i = 0
+    while i < rank_in {
+        let out_axis = lead + i
+        let out_idx = out_multi[out_axis]
+        let d_in = in_shape[i]
+        let mut idx = out_idx
+        if d_in == 1 { idx = 0 }
+        flat = flat + idx * strides_in[i]
+        i = i + 1
+    }
+    return flat
+}
+
+// Materialize `a` (of shape sa) into broadcast target shape `so`.
+// Returns a fresh flat array of length shape_numel(so).
+fn broadcast_materialize(a, sa, so) {
+    let nout = shape_numel(so)
+    let mut out = []
+    let mut t = 0
+    while t < nout {
+        let multi = flat_to_multi(t, so)
+        let src = broadcast_src_flat(multi, so, sa)
+        out = out.push(a[src])
+        t = t + 1
+    }
+    return out
+}
+
+// ── counters (for test introspection) ──────────────────────
+//
+// We keep one Counters struct inside a 1-element module-level array
+// (reference-shared across the interpreter). State is mutated in
+// place via FIELD assignment — replacing the whole struct via
+// `__BCE_BOX[0] = Counters{...}` triggers an interpreter bug where
+// the BOX binding is lost for subsequent user fn calls, so we
+// carefully avoid full-struct replacement and only touch fields.
+
+pub struct Counters {
+    fast_count: int,
+    slow_count: int,
+    last_fast_path: bool,
+    smart_last_flops: int,
+    naive_last_flops: int
+}
+
+fn make_counter_box() {
+    let mut box = []
+    box = box.push(Counters {
+        fast_count: 0,
+        slow_count: 0,
+        last_fast_path: false,
+        smart_last_flops: 0,
+        naive_last_flops: 0
+    })
+    return box
+}
+
+let __BCE_BOX = make_counter_box()
+
+pub fn reset_counters() {
+    __BCE_BOX[0].fast_count = 0
+    __BCE_BOX[0].slow_count = 0
+    __BCE_BOX[0].last_fast_path = false
+    __BCE_BOX[0].smart_last_flops = 0
+    __BCE_BOX[0].naive_last_flops = 0
+    return 0
+}
+
+pub fn smart_fast_count() {
+    return __BCE_BOX[0].fast_count
+}
+
+pub fn smart_slow_count() {
+    return __BCE_BOX[0].slow_count
+}
+
+pub fn smart_last_took_fast_path() {
+    return __BCE_BOX[0].last_fast_path
+}
+
+pub fn smart_last_flops() {
+    return __BCE_BOX[0].smart_last_flops
+}
+
+pub fn naive_last_flops() {
+    return __BCE_BOX[0].naive_last_flops
+}
+
+fn bump_fast(flops) {
+    __BCE_BOX[0].fast_count = __BCE_BOX[0].fast_count + 1
+    __BCE_BOX[0].last_fast_path = true
+    __BCE_BOX[0].smart_last_flops = flops
+    return 0
+}
+
+fn bump_slow(flops) {
+    __BCE_BOX[0].slow_count = __BCE_BOX[0].slow_count + 1
+    __BCE_BOX[0].last_fast_path = false
+    __BCE_BOX[0].smart_last_flops = flops
+    return 0
+}
+
+fn set_naive_flops(flops) {
+    __BCE_BOX[0].naive_last_flops = flops
+    return 0
+}
+
+// ── add: naive baseline ────────────────────────────────────
+
+// Always materialize both operands into broadcast shape then add.
+// Returns (result, shape) via a 2-element array tuple substitute:
+// we return a struct to dodge hexa's tuple-in-return quirks.
+pub struct BResult {
+    data: any,
+    shape: any
+}
+
+fn bresult(d, s) {
+    return BResult { data: d, shape: s }
+}
+
+// Always run broadcast materialization, even when shapes match.
+pub fn add_broadcast_naive(a, sa, b, sb) {
+    if can_broadcast(sa, sb) == false {
+        return bresult([], [])
+    }
+    let so = broadcast_shape(sa, sb)
+    let ea = broadcast_materialize(a, sa, so)
+    let eb = broadcast_materialize(b, sb, so)
+    let n = len(ea)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ea[i] + eb[i])
+        i = i + 1
+    }
+    set_naive_flops(n)
+    return bresult(out, so)
+}
+
+// ── add: smart path ────────────────────────────────────────
+
+// Skip broadcast entirely when shape_eq; else materialize.
+pub fn add_broadcast_smart(a, sa, b, sb) {
+    if shape_eq(sa, sb) {
+        // fast path — direct flat add
+        let n = len(a)
+        let mut out = []
+        let mut i = 0
+        while i < n {
+            out = out.push(a[i] + b[i])
+            i = i + 1
+        }
+        bump_fast(n)
+        return bresult(out, sa)
+    }
+    // slow path — full broadcast
+    if can_broadcast(sa, sb) == false {
+        bump_slow(0)
+        return bresult([], [])
+    }
+    let so = broadcast_shape(sa, sb)
+    let ea = broadcast_materialize(a, sa, so)
+    let eb = broadcast_materialize(b, sb, so)
+    let n = len(ea)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ea[i] + eb[i])
+        i = i + 1
+    }
+    bump_slow(n)
+    return bresult(out, so)
+}

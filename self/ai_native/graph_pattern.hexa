@@ -1,0 +1,226 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/graph_pattern.hexa — AI-native ROI #84
+//
+//  @graph_pattern — AST-level pattern matcher that recognises the
+//  attention idiom
+//
+//      matmul(Q, transpose(K))
+//
+//  and rewrites it to a single fused primitive
+//
+//      matmul_t(Q, K)
+//
+//  which reads K column-j as row-j directly (no materialised
+//  transpose buffer).  This is the prerequisite of attention fusion
+//  (softmax · matmul_t) and removes one full O(N·D) pass of memory
+//  traffic per layer per step.
+//
+//  Public API
+//  ──────────
+//      e_var(name)              -> Expr          leaf reference
+//      e_transpose(x)           -> Expr          unary transpose(x)
+//      e_matmul(a, b)           -> Expr          binary matmul(a,b)
+//      e_matmul_t(a, b)         -> Expr          fused matmul_t(a,b)
+//      e_add(a, b) / e_softmax(x) / e_scale(x,s)  — decoys for the
+//                               negative set in tests
+//
+//      detect_qkt(e)            -> bool          true iff e matches
+//                               matmul(_, transpose(_))  at the root
+//      rewrite_qkt(e)           -> Expr          rewrites top-level
+//                               matmul(Q, transpose(K)) to
+//                               matmul_t(Q, K); otherwise returns e
+//                               unchanged
+//
+//      matmul_verbose(Q, K)     -> [[float]]     baseline 2-stage
+//                               matmul(Q, transpose(K))
+//      matmul_t(Q, K)           -> [[float]]     direct K^T index
+//                               (no transpose buffer)
+//
+//  Numerical contract
+//  ──────────────────
+//      For all Q[M,D], K[N,D] the output C[M,N] satisfies
+//          C[i,j] = Σ_{d=0}^{D-1} Q[i,d] · K[j,d]
+//      and matmul_verbose ≡ matmul_t to float64 round-off (~1e-13
+//      on 128-element reductions; tests assert 1e-5).
+//
+//  Flop accounting — transpose elimination
+//  ───────────────────────────────────────
+//      verbose : Q·K^T  needs  one transpose pass  N·D stores +
+//                              matmul  2·M·N·D  flops
+//      fused   : matmul_t      matmul  2·M·N·D  flops
+//                              transpose pass removed  → N·D
+//                              eliminated stores and a full
+//                              O(N·D) memory-read stream.
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot      — called per decode step inside attention
+//      @pure     — no side effects
+//      @parallel — outer M-loop of matmul_t independent
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - dict literals {k: v} not parseable → use `struct` + any field
+//      - no enum → kind is a tagged string
+//      - no `and`/`or` → `&&`/`||`
+//      - slice precedence: arr[(i+1)..j] parens required (not used
+//        here but noted for future expansion)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Expr struct — kind-tagged AST node  ────────────────────────────
+// kind ∈ { "var", "transpose", "matmul", "matmul_t",
+//          "add", "softmax", "scale" }
+// For "var"   : lhs is the variable name (string), rhs is ""
+// For unary   : lhs is the child Expr,            rhs is ""  or scale
+// For binary  : lhs and rhs are child Exprs
+struct Expr {
+    kind: string
+    lhs: any
+    rhs: any
+}
+
+// ── constructors  ──────────────────────────────────────────────────
+fn e_var(name) {
+    return Expr{kind: "var", lhs: name, rhs: ""}
+}
+
+fn e_transpose(x) {
+    return Expr{kind: "transpose", lhs: x, rhs: ""}
+}
+
+fn e_matmul(a, b) {
+    return Expr{kind: "matmul", lhs: a, rhs: b}
+}
+
+fn e_matmul_t(a, b) {
+    return Expr{kind: "matmul_t", lhs: a, rhs: b}
+}
+
+fn e_add(a, b) {
+    return Expr{kind: "add", lhs: a, rhs: b}
+}
+
+fn e_softmax(x) {
+    return Expr{kind: "softmax", lhs: x, rhs: ""}
+}
+
+fn e_scale(x, s) {
+    return Expr{kind: "scale", lhs: x, rhs: s}
+}
+
+// ── pattern matcher  ───────────────────────────────────────────────
+// Returns true iff `e` is exactly  matmul(Q, transpose(K))  at its
+// root node. Recursion into sub-trees is intentionally not performed
+// here — this predicate is a *local* shape test that the higher-level
+// pass uses while walking the tree (see rewrite_qkt).
+fn detect_qkt(e) {
+    if e.kind != "matmul" { return false }
+    let rhs = e.rhs
+    // rhs must itself be an Expr node tagged "transpose"
+    // We test for an .kind field; non-Expr values (e.g. numbers,
+    // strings placed where the tree is malformed) would fail the
+    // struct field access, so callers must only pass Expr trees.
+    if rhs.kind != "transpose" { return false }
+    return true
+}
+
+// Top-level rewrite. If the root is  matmul(Q, transpose(K))  it
+// returns  matmul_t(Q, K); otherwise the original expression is
+// returned unchanged.  Rewrite preserves the lhs (Q) sub-tree as-is
+// and unwraps the transpose on the rhs (K).
+fn rewrite_qkt(e) {
+    if detect_qkt(e) {
+        let Q = e.lhs
+        let t_node = e.rhs
+        let K = t_node.lhs
+        return e_matmul_t(Q, K)
+    }
+    return e
+}
+
+// ── numeric kernels — reference + fused  ───────────────────────────
+fn gp84_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// Plain transpose — materialises the [D,N] buffer from [N,D].
+fn gp84_transpose(A) {
+    let rows = len(A)
+    let cols = len(A[0])
+    let mut T = gp84_zeros_2d(cols, rows)
+    for i in 0..rows {
+        for j in 0..cols {
+            T[j][i] = A[i][j]
+        }
+    }
+    return T
+}
+
+// Plain (i,k,j) matmul for row-major inputs.
+fn gp84_matmul(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+    let mut C = gp84_zeros_2d(M, N)
+    for i in 0..M {
+        for k in 0..K {
+            let a = A[i][k]
+            for j in 0..N {
+                C[i][j] = C[i][j] + a * B[k][j]
+            }
+        }
+    }
+    return C
+}
+
+// ── baseline :   matmul(Q, transpose(K))   ─────────────────────────
+// Two passes: (1) materialise K^T[D,N]; (2) matmul Q·K^T
+@pure
+fn matmul_verbose(Q, K) {
+    let KT = gp84_transpose(K)
+    return gp84_matmul(Q, KT)
+}
+
+// ── fused :   matmul_t(Q, K)   — direct K^T indexing  ──────────────
+// Q:[M,D], K:[N,D]  →  C:[M,N]    C[i,j] = Σ_d Q[i,d] · K[j,d]
+// Reads K's row j as K^T's column j; no transpose buffer.
+@hot @parallel @pure
+fn matmul_t(Q, K) {
+    let M = len(Q)
+    let D = len(Q[0])
+    let N = len(K)
+    let mut C = gp84_zeros_2d(M, N)
+    for i in 0..M {
+        for j in 0..N {
+            let mut s = 0.0
+            for d in 0..D {
+                s = s + Q[i][d] * K[j][d]
+            }
+            C[i][j] = s
+        }
+    }
+    return C
+}
+
+// ── flop accounting helpers  ───────────────────────────────────────
+// Numerical count of the transpose stores eliminated by the rewrite.
+// For K:[N,D] the transpose pass performs N·D stores and N·D loads
+// that the fused kernel avoids entirely.
+fn qkt_transpose_flops_saved(N, D) {
+    return N * D
+}
+
+// Total reduction flops are 2·M·N·D for both versions (identical
+// arithmetic, differ only in memory layout pre-pass).  Returned for
+// book-keeping.
+fn qkt_matmul_flops(M, N, D) {
+    return 2 * M * N * D
+}
