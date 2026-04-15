@@ -1,0 +1,240 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_dequant_fuse.hexa — ROI #90 @dequant_fuse coverage
+//
+//  Validates:
+//    1.  quant_weight produces W_int8 in [-127, 127]
+//    2.  quant_weight produces |scales| > 0
+//    3.  dequantize_weight round-trip matches W_fp within int8 tol
+//    4.  scales are per-row (length == M)
+//    5.  fused == naive (B=1,  M=16, K=32)
+//    6.  fused == naive (B=8,  M=32, K=16)
+//    7.  fused == naive (B=16, M=16, K=64)
+//    8.  fused == naive (B=4,  M=64, K=64)   — larger square
+//    9.  fused == naive on all-zero weights (scale=1 guard)
+//   10.  fused == naive on identity-like sparse weights
+//   11.  memory: naive_temp_bytes == M*K*4
+//   12.  memory: fused_resident_bytes < naive_temp_bytes
+//   13.  dequant_fuse_savings ≈ M*K*3 + small const
+// ═══════════════════════════════════════════════════════════════════
+
+use "ai_native/dequant_fuse"
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+    } else {
+        FAIL = FAIL + 1
+        println("  FAIL: " + label)
+    }
+}
+
+fn tf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn tf_max_err(a, b) {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let e = tf_abs(a[i] - b[i])
+        if e > m { m = e }
+        i = i + 1
+    }
+    return m
+}
+
+// deterministic LCG for reproducibility
+let mut _SEED = 271828
+
+fn tf_rand() {
+    _SEED = (_SEED * 1664525 + 1013904223) % 2147483648
+    return _SEED
+}
+
+fn tf_rand_float() {
+    let r = tf_rand()
+    return (to_float(r) / 1073741824.0) - 1.0
+}
+
+fn tf_rand_vec(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [tf_rand_float()]
+        i = i + 1
+    }
+    return v
+}
+
+fn tf_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 1–2: quant_weight range + scale sanity
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 1-2: quant_weight range + scales ---")
+
+let M1 = 4
+let K1 = 8
+let W1 = tf_rand_vec(M1 * K1)
+let packed1 = quant_weight(W1, M1, K1)
+let W1_q = packed1[0]
+let S1   = packed1[1]
+
+let mut in_range = true
+let mut i1 = 0
+while i1 < M1 * K1 {
+    if W1_q[i1] < 0 - 127 { in_range = false }
+    if W1_q[i1] >  127 { in_range = false }
+    i1 = i1 + 1
+}
+check("W_int8 within [-127,127]", in_range)
+
+let mut scales_ok = true
+let mut si = 0
+while si < M1 {
+    if S1[si] <= 0.0 { scales_ok = false }
+    si = si + 1
+}
+check("scales strictly positive", scales_ok && len(S1) == M1)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 3: dequantize_weight round-trip (int8 tol)
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 3: dequant round-trip ---")
+let W1_hat = dequantize_weight(W1_q, S1, M1, K1)
+// per-row scale, so max abs error bounded by max(scale)/2 ≈ absmax/254
+let mut max_scale = 0.0
+let mut ms = 0
+while ms < M1 {
+    if S1[ms] > max_scale { max_scale = S1[ms] }
+    ms = ms + 1
+}
+let rt_err = tf_max_err(W1, W1_hat)
+check("round-trip max err < scale (1.0/127 bound)", rt_err < max_scale * 1.0 + 0.001)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 4: scales length == M
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 4: scales length ---")
+check("scales.len == M", len(S1) == M1)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Shape sweep helper: fused vs naive
+// ═══════════════════════════════════════════════════════════════════
+fn check_fused_eq_naive(label, B, M, K) {
+    let W = tf_rand_vec(M * K)
+    let A = tf_rand_vec(B * K)
+    let pk = quant_weight(W, M, K)
+    let Wq = pk[0]
+    let Sc = pk[1]
+    let C_naive = matmul_dequant_naive(A, Wq, Sc, B, M, K)
+    let C_fused = matmul_dequant_fused(A, Wq, Sc, B, M, K)
+    check(label + " len", len(C_naive) == B * M && len(C_fused) == B * M)
+    let err = tf_max_err(C_naive, C_fused)
+    check(label + " max|fused - naive| < 1e-9", err < 0.000000001)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests 5–8: fused == naive on 4 shapes
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 5: B=1  M=16 K=32 ---")
+check_fused_eq_naive("B1_M16_K32", 1, 16, 32)
+
+println("--- Test 6: B=8  M=32 K=16 ---")
+check_fused_eq_naive("B8_M32_K16", 8, 32, 16)
+
+println("--- Test 7: B=16 M=16 K=64 ---")
+check_fused_eq_naive("B16_M16_K64", 16, 16, 64)
+
+println("--- Test 8: B=4  M=64 K=64 ---")
+check_fused_eq_naive("B4_M64_K64", 4, 64, 64)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 9: all-zero weights — scale guard (scale := 1.0)
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 9: zero weights ---")
+let M9 = 4
+let K9 = 8
+let W9 = tf_zeros(M9 * K9)
+let A9 = tf_rand_vec(1 * K9)
+let pk9 = quant_weight(W9, M9, K9)
+let Wq9 = pk9[0]
+let Sc9 = pk9[1]
+let Cn9 = matmul_dequant_naive(A9, Wq9, Sc9, 1, M9, K9)
+let Cf9 = matmul_dequant_fused(A9, Wq9, Sc9, 1, M9, K9)
+let mut zero_ok = true
+let mut zi = 0
+while zi < len(Cn9) {
+    if tf_abs(Cn9[zi]) > 0.0 { zero_ok = false }
+    if tf_abs(Cf9[zi]) > 0.0 { zero_ok = false }
+    zi = zi + 1
+}
+check("zero W → zero C in both paths", zero_ok)
+check("zero-W fused matches naive", tf_max_err(Cn9, Cf9) < 0.000000001)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 10: diagonal-like sparse weight (m-th row has a spike at k=m)
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 10: sparse diagonal weights ---")
+let M10 = 8
+let K10 = 8
+let mut W10 = tf_zeros(M10 * K10)
+let mut di = 0
+while di < M10 {
+    W10[di * K10 + di] = 1.0 + to_float(di) * 0.125
+    di = di + 1
+}
+let A10 = tf_rand_vec(2 * K10)
+let pk10 = quant_weight(W10, M10, K10)
+let Wq10 = pk10[0]
+let Sc10 = pk10[1]
+let Cn10 = matmul_dequant_naive(A10, Wq10, Sc10, 2, M10, K10)
+let Cf10 = matmul_dequant_fused(A10, Wq10, Sc10, 2, M10, K10)
+check("sparse: fused == naive", tf_max_err(Cn10, Cf10) < 0.000000001)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 11-13: memory accounting
+// ═══════════════════════════════════════════════════════════════════
+println("--- Test 11-13: memory accounting ---")
+let MM = 64
+let KK = 64
+let n_bytes = naive_temp_bytes(MM, KK)
+let f_bytes = fused_resident_bytes(MM, KK)
+let savings = dequant_fuse_savings(MM, KK)
+
+check("naive_temp_bytes == M*K*4", n_bytes == MM * KK * 4)
+check("fused_resident < naive_temp", f_bytes < n_bytes)
+check("savings == naive - fused", savings == n_bytes - f_bytes)
+// expected savings: M*K*4 - (M*K*1 + M*4) = M*K*3 - M*4
+let expected = MM * KK * 3 - MM * 4
+check("savings matches 3/4 reduction formula", savings == expected)
+
+// ═══════════════════════════════════════════════════════════════════
+//  Summary
+// ═══════════════════════════════════════════════════════════════════
+println("")
+println("=====================================")
+println("  dequant_fuse tests: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL))
+println("  naive temp bytes  (M=64,K=64): " + to_string(n_bytes))
+println("  fused resident    (M=64,K=64): " + to_string(f_bytes))
+println("  savings (bytes)              : " + to_string(savings))
+println("=====================================")
+
+if FAIL == 0 {
+    println("ALL TESTS PASSED")
+} else {
+    println("SOME TESTS FAILED")
+}

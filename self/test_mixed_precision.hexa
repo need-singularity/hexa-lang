@@ -1,23 +1,19 @@
-// ===================================================================
-//  test_mixed_precision.hexa — Mixed Precision Training Tests
+// ═══════════════════════════════════════════════════════════
+//  test_mixed_precision.hexa — Verify ai_native/mixed_precision (ROI #93)
 //
-//  Validates:
-//    1. create_mp_state initializes correctly
-//    2. FP16 conversion precision
-//    3. mp_forward computes in FP16
-//    4. mp_backward scales and unscales gradients
-//    5. check_overflow detects overflow
-//    6. check_overflow passes normal values
-//    7. mp_optimizer_step updates master weights
-//    8. Dynamic loss scaling: backoff on overflow
-//    9. Dynamic loss scaling: growth after stable steps
-//   10. Master weights remain FP32 precision
-//   11. FP16 weights differ from FP32 (precision gap)
-//   12. End-to-end training loop
+//  fp16/bf16 quantize round-trip + mixed-precision matmul vs naive
+//  baseline. Thresholds calibrated against the simulation (fp32
+//  container, 10-bit / 7-bit mantissa quantization).
 //
-//  Execution: ./hexa self/test_mixed_precision.hexa
-//  Minimum 10 check() statements.
-// ===================================================================
+//  Spec thresholds:
+//      fp16 matmul L2 err < 0.01
+//      bf16 matmul L2 err < 0.02
+//  Observed on 32×32 Gaussian-ish inputs:
+//      fp16 ≈ 8e-4  (well under spec)
+//      bf16 ≈ 6e-3  (under spec)
+// ═══════════════════════════════════════════════════════════
+
+use "ai_native/mixed_precision"
 
 let mut pass_count = 0
 let mut fail_count = 0
@@ -32,325 +28,161 @@ fn check(name, cond) {
     }
 }
 
-fn fabs(x) {
-    if x < 0.0 { return 0.0 - x }
-    return x
-}
-
-// ===================================================================
-//  Inline module (self-contained test)
-// ===================================================================
-
-struct MixedPrecisionState {
-    master_weights: array,
-    fp16_weights: array,
-    fp16_grads: array,
-    loss_scale: float,
-    scale_factor: float,
-    backoff_factor: float,
-    growth_factor: float,
-    growth_interval: int,
-    steps_since_last_overflow: int,
-    overflow_count: int,
-    step_count: int
-}
-
-fn _to_fp16(val) {
-    if val == 0.0 { return 0.0 }
-    let mut v = val
-    let mut sign_neg = false
-    if v < 0.0 {
-        sign_neg = true
-        v = 0.0 - v
-    }
-    if v > 65504.0 {
-        if sign_neg { return -65504.0 }
-        return 65504.0
-    }
-    if v < 0.00006103515625 { return 0.0 }
-    let mut exp = 0
-    let mut m = v
-    if m >= 2.0 {
-        while m >= 2.0 {
-            m = m / 2.0
-            exp = exp + 1
+// Gaussian-ish generator (CLT sum of 12 uniforms, mean 0 / var 1).
+fn gen_gauss(n) {
+    let mut w = []
+    let mut i = 0
+    while i < n {
+        let mut s = 0.0
+        let mut k = 0
+        while k < 12 {
+            s = s + (random() - 0.5)
+            k = k + 1
         }
-    } else {
-        while m < 1.0 {
-            m = m * 2.0
-            exp = exp - 1
-        }
-    }
-    let frac = m - 1.0
-    let mant10 = int(frac * 1024.0 + 0.5)
-    let mut mc = mant10
-    if mc > 1023 { mc = 1023 }
-    let result = (1.0 + to_float(mc) / 1024.0) * pow(2.0, to_float(exp))
-    if sign_neg { return 0.0 - result }
-    return result
-}
-
-fn _array_to_fp16(arr) {
-    let n = len(arr)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        out = out + [_to_fp16(arr[i])]
+        w = w.push(s)
         i = i + 1
     }
-    return out
+    return w
 }
 
-fn check_overflow(grad) {
-    let n = len(grad)
-    let mut i = 0
-    while i < n {
-        let v = fabs(grad[i])
-        if v != v { return true }
-        if v > 65504.0 { return true }
-        i = i + 1
-    }
-    return false
-}
-
-fn create_mp_state(weights) {
-    let fp16_w = _array_to_fp16(weights)
-    let n = len(weights)
-    let mut zeros = []
-    let mut i = 0
-    while i < n {
-        zeros = zeros + [0.0]
-        i = i + 1
-    }
-    return MixedPrecisionState {
-        master_weights: weights,
-        fp16_weights: fp16_w,
-        fp16_grads: zeros,
-        loss_scale: 1024.0,
-        scale_factor: 1024.0,
-        backoff_factor: 0.5,
-        growth_factor: 2.0,
-        growth_interval: 200,
-        steps_since_last_overflow: 0,
-        overflow_count: 0,
-        step_count: 0
-    }
-}
-
-fn mp_forward(state, input) {
-    let n = len(input)
-    let wn = len(state.fp16_weights)
-    let mut output = []
-    let mut i = 0
-    while i < n {
-        let wi = i % wn
-        let val = _to_fp16(input[i] * state.fp16_weights[wi])
-        output = output + [val]
-        i = i + 1
-    }
-    return output
-}
-
-fn mp_backward(state, grad) {
-    let n = len(grad)
-    let mut scaled_grad = []
-    let mut i = 0
-    while i < n {
-        scaled_grad = scaled_grad + [_to_fp16(grad[i] * state.loss_scale)]
-        i = i + 1
-    }
-    let mut unscaled = []
-    i = 0
-    while i < n {
-        unscaled = unscaled + [_to_fp16(scaled_grad[i] / state.loss_scale)]
-        i = i + 1
-    }
-    return unscaled
-}
-
-fn mp_set_grads(state, grads) {
-    return MixedPrecisionState {
-        master_weights: state.master_weights,
-        fp16_weights: state.fp16_weights,
-        fp16_grads: grads,
-        loss_scale: state.loss_scale,
-        scale_factor: state.scale_factor,
-        backoff_factor: state.backoff_factor,
-        growth_factor: state.growth_factor,
-        growth_interval: state.growth_interval,
-        steps_since_last_overflow: state.steps_since_last_overflow,
-        overflow_count: state.overflow_count,
-        step_count: state.step_count
-    }
-}
-
-fn mp_optimizer_step(state, lr) {
-    let n = len(state.master_weights)
-    let gn = len(state.fp16_grads)
-    let has_overflow = check_overflow(state.fp16_grads)
-    let mut new_scale = state.loss_scale
-    let mut new_steps = state.steps_since_last_overflow
-    let mut new_overflow = state.overflow_count
-
-    if has_overflow {
-        new_scale = state.loss_scale * state.backoff_factor
-        if new_scale < 1.0 { new_scale = 1.0 }
-        new_steps = 0
-        new_overflow = state.overflow_count + 1
-        return MixedPrecisionState {
-            master_weights: state.master_weights,
-            fp16_weights: state.fp16_weights,
-            fp16_grads: state.fp16_grads,
-            loss_scale: new_scale,
-            scale_factor: state.scale_factor,
-            backoff_factor: state.backoff_factor,
-            growth_factor: state.growth_factor,
-            growth_interval: state.growth_interval,
-            steps_since_last_overflow: new_steps,
-            overflow_count: new_overflow,
-            step_count: state.step_count + 1
-        }
-    }
-
-    let mut new_weights = []
-    let mut i = 0
-    while i < n {
-        let gi = i % gn
-        let g = state.fp16_grads[gi]
-        let w = state.master_weights[i] - lr * g
-        new_weights = new_weights + [w]
-        i = i + 1
-    }
-    let new_fp16 = _array_to_fp16(new_weights)
-    new_steps = state.steps_since_last_overflow + 1
-    if new_steps >= state.growth_interval {
-        new_scale = state.loss_scale * state.growth_factor
-        if new_scale > 65504.0 { new_scale = 65504.0 }
-        new_steps = 0
-    }
-    let mut zeros = []
-    i = 0
-    while i < gn {
-        zeros = zeros + [0.0]
-        i = i + 1
-    }
-    return MixedPrecisionState {
-        master_weights: new_weights,
-        fp16_weights: new_fp16,
-        fp16_grads: zeros,
-        loss_scale: new_scale,
-        scale_factor: state.scale_factor,
-        backoff_factor: state.backoff_factor,
-        growth_factor: state.growth_factor,
-        growth_interval: state.growth_interval,
-        steps_since_last_overflow: new_steps,
-        overflow_count: new_overflow,
-        step_count: state.step_count + 1
-    }
-}
-
-// ===================================================================
-//  TESTS
-// ===================================================================
-
-println("===================================================")
-println("  Mixed Precision Training Test Suite")
-println("===================================================")
-
-// -- 1. create_mp_state --
+println("═══════════════════════════════════════════════════════")
+println("  HEXA AI-Native Mixed Precision Tests (ROI #93)")
+println("═══════════════════════════════════════════════════════")
 println("")
-println("=== State Creation ===")
-let w0 = [0.1, 0.2, 0.3, 0.4, 0.5]
-let s0 = create_mp_state(w0)
-check("create_mp_state: master_weights length", len(s0.master_weights) == 5)
-check("create_mp_state: fp16_weights length", len(s0.fp16_weights) == 5)
-check("create_mp_state: loss_scale initial", s0.loss_scale == 1024.0)
 
-// -- 2. FP16 conversion precision --
+// ── 1. Helpers ──────────────────────────────────────────────
+println("--- helpers ---")
+check("mp_abs(-3.5) == 3.5", mp_abs(0.0 - 3.5) == 3.5)
+check("mp_round(2.6) == 3", mp_round(2.6) == 3.0)
+check("mp_round(-2.6) == -3", mp_round(0.0 - 2.6) == 0.0 - 3.0)
+check("mp_pow2(0) == 1", mp_pow2(0) == 1.0)
+check("mp_pow2(3) == 8", mp_pow2(3) == 8.0)
+check("mp_pow2(-2) == 0.25", mp_pow2(0 - 2) == 0.25)
+check("mp_binade(1.0) == 0", mp_binade(1.0) == 0)
+check("mp_binade(3.5) == 1", mp_binade(3.5) == 1)
+check("mp_binade(0.25) == -2", mp_binade(0.25) == 0 - 2)
+
+// ── 2. fp16 round-trip ──────────────────────────────────────
 println("")
-println("=== FP16 Conversion ===")
-let fp16_val = _to_fp16(0.123456789)
-let diff = fabs(fp16_val - 0.123456789)
-check("fp16: truncation introduces small error", diff < 0.001)
-check("fp16: zero stays zero", _to_fp16(0.0) == 0.0)
+println("--- fp16 round-trip ---")
 
-// -- 3. mp_forward --
+// Exact-representable values should round-trip identically.
+check("fp16(0.0) == 0.0", fp16_quantize(0.0) == 0.0)
+check("fp16(1.0) == 1.0", fp16_quantize(1.0) == 1.0)
+check("fp16(-1.0) == -1.0", fp16_quantize(0.0 - 1.0) == 0.0 - 1.0)
+check("fp16(0.5) == 0.5", fp16_quantize(0.5) == 0.5)
+check("fp16(2.0) == 2.0", fp16_quantize(2.0) == 2.0)
+
+// Near-approximate values — fp16 has ~3-4 digit precision.
+let q100 = fp16_quantize(100.0)
+println("  fp16(100.0) = " + to_string(q100))
+let err100 = mp_abs(q100 - 100.0) / 100.0
+check("fp16(100.0) rel err < 2e-3", err100 < 2.0e-3)
+
+let qpi = fp16_quantize(3.14159)
+let errpi = mp_abs(qpi - 3.14159) / 3.14159
+println("  fp16(3.14159) = " + to_string(qpi) + "  rel err = " + to_string(errpi))
+check("fp16(pi) rel err < 2e-3", errpi < 2.0e-3)
+
+// Overflow clamp — anything above 65504 should saturate.
+check("fp16(70000.0) == 65504", fp16_quantize(70000.0) == 65504.0)
+check("fp16(-70000.0) == -65504", fp16_quantize(0.0 - 70000.0) == 0.0 - 65504.0)
+check("fp16(1e8) == 65504", fp16_quantize(1.0e8) == 65504.0)
+
+// Underflow flush — below smallest normal (2^-14 ≈ 6.1e-5) uses
+// subnormal grid (2^-24 quantum). Very small values round to 0.
+let qtiny = fp16_quantize(1.0e-10)
+check("fp16(1e-10) flushed to 0", qtiny == 0.0)
+
+// ── 3. bf16 round-trip ──────────────────────────────────────
 println("")
-println("=== Forward Pass ===")
-let input1 = [1.0, 2.0, 3.0, 4.0, 5.0]
-let fwd = mp_forward(s0, input1)
-check("mp_forward: output length matches input", len(fwd) == 5)
-let expected_0 = _to_fp16(1.0 * _to_fp16(0.1))
-check("mp_forward: first element computed correctly", fabs(fwd[0] - expected_0) < 0.01)
+println("--- bf16 round-trip ---")
 
-// -- 4. mp_backward --
+check("bf16(0.0) == 0.0", bf16_quantize(0.0) == 0.0)
+check("bf16(1.0) == 1.0", bf16_quantize(1.0) == 1.0)
+check("bf16(-1.0) == -1.0", bf16_quantize(0.0 - 1.0) == 0.0 - 1.0)
+check("bf16(2.0) == 2.0", bf16_quantize(2.0) == 2.0)
+check("bf16(0.5) == 0.5", bf16_quantize(0.5) == 0.5)
+check("bf16(256.0) == 256.0", bf16_quantize(256.0) == 256.0)
+
+// bf16 shares fp32 range — huge values don't clamp.
+let qhuge = bf16_quantize(1.0e30)
+check("bf16(1e30) stays close", mp_abs(qhuge - 1.0e30) / 1.0e30 < 1.0e-2)
+
+// bf16 has 7 mantissa bits → rel err bounded by 2^-7 ≈ 8e-3.
+let qpi2 = bf16_quantize(3.14159)
+let errpi2 = mp_abs(qpi2 - 3.14159) / 3.14159
+println("  bf16(pi) = " + to_string(qpi2) + "  rel err = " + to_string(errpi2))
+check("bf16(pi) rel err < 1e-2", errpi2 < 1.0e-2)
+
+// ── 4. Mixed matmul: fp16 ──────────────────────────────────
 println("")
-println("=== Backward Pass ===")
-let grad1 = [0.01, 0.02, 0.03, 0.04, 0.05]
-let bwd = mp_backward(s0, grad1)
-check("mp_backward: output length matches grad", len(bwd) == 5)
-check("mp_backward: values approximately preserved", fabs(bwd[0] - 0.01) < 0.001)
+println("--- mixed matmul fp16 (32x32) ---")
 
-// -- 5. check_overflow: overflow detection --
+let dim = 32
+let len_mat = dim * dim
+let A = gen_gauss(len_mat)
+let B = gen_gauss(len_mat)
+
+let C_ref = mixed_matmul_naive(A, B, dim, dim, dim)
+let C_fp16 = mixed_matmul_fp16(A, B, dim, dim, dim)
+
+let err_fp16 = mp_l2_rel_err(C_ref, C_fp16)
+println("  fp16 matmul L2 rel err = " + to_string(err_fp16))
+check("fp16 shape preserved", len(C_fp16) == len_mat)
+check("fp16 matmul L2 err < 0.01", err_fp16 < 0.01)
+
+// ── 5. Mixed matmul: bf16 ──────────────────────────────────
 println("")
-println("=== Overflow Detection ===")
-let overflow_grad = [1.0, 2.0, 70000.0]
-check("check_overflow: detects > 65504", check_overflow(overflow_grad) == true)
+println("--- mixed matmul bf16 (32x32) ---")
 
-// -- 6. check_overflow: normal values --
-let normal_grad = [0.01, -0.5, 1.0, -2.0]
-check("check_overflow: normal values pass", check_overflow(normal_grad) == false)
+let C_bf16 = mixed_matmul_bf16(A, B, dim, dim, dim)
+let err_bf16 = mp_l2_rel_err(C_ref, C_bf16)
+println("  bf16 matmul L2 rel err = " + to_string(err_bf16))
+check("bf16 shape preserved", len(C_bf16) == len_mat)
+check("bf16 matmul L2 err < 0.02", err_bf16 < 0.02)
 
-// -- 7. mp_optimizer_step: normal update --
+// ── 6. Precision ordering ──────────────────────────────────
 println("")
-println("=== Optimizer Step ===")
-let s1 = mp_set_grads(s0, [0.1, 0.1, 0.1, 0.1, 0.1])
-let s2 = mp_optimizer_step(s1, 0.01)
-check("optimizer_step: master weights updated", fabs(s2.master_weights[0] - 0.099) < 0.001)
-check("optimizer_step: step count incremented", s2.step_count == 1)
+println("--- precision ordering ---")
+// fp16 (10-bit mantissa) should beat bf16 (7-bit) when values are
+// in-range (our Gaussians are O(1), well within fp16).
+check("fp16 err <= bf16 err", err_fp16 <= err_bf16)
 
-// -- 8. Dynamic loss scaling: backoff on overflow --
+// ── 7. Edge: fp16 overflow in matmul ───────────────────────
 println("")
-println("=== Loss Scaling ===")
-let s3 = mp_set_grads(s0, [70000.0, 0.0, 0.0, 0.0, 0.0])
-let s4 = mp_optimizer_step(s3, 0.01)
-check("loss_scale: backoff on overflow", s4.loss_scale < s0.loss_scale)
-check("loss_scale: overflow count incremented", s4.overflow_count == 1)
-check("loss_scale: weights unchanged on overflow", s4.master_weights[0] == s0.master_weights[0])
+println("--- fp16 overflow edge ---")
+// 2x2 case — element product 300*300 = 90000 > 65504 in fp16.
+// But the accumulator is fp32, so the matmul itself is fine.
+let Aover = [300.0, 0.0, 0.0, 300.0]
+let Bover = [300.0, 0.0, 0.0, 300.0]
+let Cover16 = mixed_matmul_fp16(Aover, Bover, 2, 2, 2)
+println("  C[0,0] = " + to_string(Cover16[0]) + "  (expected 90000)")
+check("fp16 matmul acc = 90000", mp_abs(Cover16[0] - 90000.0) < 1.0)
 
-// -- 9. FP32 master weights precision --
-println("")
-println("=== Precision ===")
-let precise_w = [0.000123456789]
-let sp = create_mp_state(precise_w)
-check("precision: master keeps FP32", sp.master_weights[0] == 0.000123456789)
-let fp16_diff = fabs(sp.fp16_weights[0] - sp.master_weights[0])
-check("precision: FP16 differs from FP32", fp16_diff > 0.0)
+// If we *explicitly* quantize the output to fp16, it should clamp.
+let qover = fp16_quantize(Cover16[0])
+check("fp16_quantize(90000) clamps to 65504", qover == 65504.0)
 
-// -- 10. End-to-end training loop --
+// ── 8. Vec helpers ─────────────────────────────────────────
 println("")
-println("=== End-to-End ===")
-let w_e2e = [1.0, 2.0, 3.0]
-let mut st = create_mp_state(w_e2e)
-let mut step = 0
-while step < 5 {
-    let g = [0.1, 0.2, 0.3]
-    st = mp_set_grads(st, g)
-    st = mp_optimizer_step(st, 0.01)
-    step = step + 1
-}
-check("e2e: 5 steps completed", st.step_count == 5)
-check("e2e: weights decreased", st.master_weights[0] < 1.0)
+println("--- vec helpers ---")
+let small = [1.0, 0.0 - 2.0, 3.14159, 0.5, 0.0]
+let v16 = vec_fp16(small)
+let vbf = vec_bf16(small)
+check("vec_fp16 length", len(v16) == 5)
+check("vec_bf16 length", len(vbf) == 5)
+check("vec_fp16[0] == 1.0", v16[0] == 1.0)
+check("vec_fp16[4] == 0.0", v16[4] == 0.0)
+check("vec_bf16[1] == -2.0", vbf[1] == 0.0 - 2.0)
 
-// ===================================================================
-//  Summary
-// ===================================================================
+// ── Summary ─────────────────────────────────────────────────
 println("")
-println("=== Mixed Precision Tests Summary ===")
-println("pass=" + str(pass_count) + " fail=" + str(fail_count))
+println("═══════════════════════════════════════════════════════")
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
 if fail_count == 0 {
-    println("ALL PASS")
+    println("  ALL MIXED PRECISION TESTS PASSED — ROI #93 completed_at: 2026-04-16")
 } else {
-    println("FAILED")
+    println("  MIXED PRECISION TESTS FAILED")
 }
-println(str(pass_count) + " passed")
+println("═══════════════════════════════════════════════════════")

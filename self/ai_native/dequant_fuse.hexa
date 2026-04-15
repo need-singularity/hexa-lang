@@ -1,0 +1,208 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/dequant_fuse.hexa — AI-native ROI #90
+//
+//  @dequant_fuse — fuse int8 weight dequantization into the matmul
+//  inner loop so the compiler/runtime avoids materializing the
+//  full fp32 weight tensor.
+//
+//  Scheme:
+//      W_fp[M,K]  →  W_int8[M,K] (int)  +  scales[M] (fp)
+//      per-row symmetric absmax quantization:
+//          scale[m] = max(|W_fp[m,:]|) / 127
+//          W_int8[m,k] = clamp( round(W_fp[m,k] / scale[m]), -127, 127 )
+//
+//  Naive path (reference):
+//      1. dequantize_weight() allocates a full M*K fp32 tensor
+//      2. run regular fp matmul (A · W_fp^T)
+//
+//  Fused path:
+//      C[b,m] = sum_k A[b,k] * (W_int8[m,k] * scales[m])
+//      scales[m] is loop-invariant along k (hoisted out of inner loop)
+//      only int8 + scales[M] live throughout → M*K int8 = 4× less bytes
+//      than M*K fp32 temporary.
+//
+//  Public API (row-major flat arrays — matches test_amx_int8 style):
+//      quant_weight(W_fp, M, K)                    -> [W_int8, scales]
+//      dequantize_weight(W_int8, scales, M, K)     -> W_fp_hat  (naive aid)
+//      matmul_dequant_naive(A, W_int8, scales, B, M, K)  -> C  (B x M)
+//      matmul_dequant_fused(A, W_int8, scales, B, M, K)  -> C  (B x M)
+//
+//  A:        [B, K]  (B rows of K features)
+//  W_int8:   [M, K]  (M output rows, K features)
+//  scales:   [M]     (per-row scale)
+//  C:        [B, M]  (B batches x M outputs)
+//
+//  AI-native attrs:
+//      @hot           inner loop runs every inference step
+//      @dequant_fuse  semantic marker — combine dequant into matmul
+//      @pure          deterministic, no side effects
+//
+//  Grammar notes (HX3 pitfalls):
+//      - no bit-ops: arithmetic clamp only
+//      - no slice-math without parens
+//      - no `abs` builtin → local df_abs
+//      - avoid `if { Struct{} }` — use if/else with temp
+//      - `and`/`or` → `&&`/`||`
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn df_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn df_clamp_int(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// round-half-away-from-zero — matches self/ai_native/quantize.hexa
+fn df_round(x) {
+    if x >= 0.0 {
+        return floor(x + 0.5)
+    }
+    return 0 - floor((0 - x) + 0.5)
+}
+
+// ── per-row int8 symmetric quantization ────────────────────────────
+//
+// W_fp is laid out row-major as a flat array of length M*K.
+// Returns [W_int8: [int] of length M*K, scales: [float] of length M].
+pub fn quant_weight(W_fp, M, K) {
+    let mut W_int8 = []
+    let mut scales = []
+    let mut m = 0
+    while m < M {
+        // find absmax in row m
+        let mut amax = 0.0
+        let mut k = 0
+        while k < K {
+            let a = df_abs(W_fp[m * K + k])
+            if a > amax { amax = a }
+            k = k + 1
+        }
+        let mut scale = amax / 127.0
+        if scale == 0.0 { scale = 1.0 }
+        scales = scales + [scale]
+        // quantize row m
+        let mut kq = 0
+        while kq < K {
+            let qv = df_round(W_fp[m * K + kq] / scale)
+            let clamped = df_clamp_int(qv, 0 - 127, 127)
+            W_int8 = W_int8 + [clamped]
+            kq = kq + 1
+        }
+        m = m + 1
+    }
+    return [W_int8, scales]
+}
+
+// ── weight dequantization (naive helper) ───────────────────────────
+//
+// Allocates the full M*K fp32 tensor — this is what the fused path
+// avoids. Callable for round-trip tests and as the naive baseline.
+pub fn dequantize_weight(W_int8, scales, M, K) {
+    let mut out = []
+    let mut m = 0
+    while m < M {
+        let s = scales[m]
+        let mut k = 0
+        while k < K {
+            let v = W_int8[m * K + k] * s
+            out = out + [v]
+            k = k + 1
+        }
+        m = m + 1
+    }
+    return out
+}
+
+// ── naive matmul: dequant first, then fp matmul ────────────────────
+//
+// Baseline. Builds a full fp32 W of size M*K before multiplying.
+// Returns C of shape [B, M] where C[b,m] = sum_k A[b,k] * W_fp[m,k].
+pub fn matmul_dequant_naive(A, W_int8, scales, B, M, K) {
+    let W_fp = dequantize_weight(W_int8, scales, M, K)
+    let mut C = []
+    let mut b = 0
+    while b < B {
+        let mut m = 0
+        while m < M {
+            let mut acc = 0.0
+            let mut k = 0
+            while k < K {
+                acc = acc + A[b * K + k] * W_fp[m * K + k]
+                k = k + 1
+            }
+            C = C + [acc]
+            m = m + 1
+        }
+        b = b + 1
+    }
+    return C
+}
+
+// ── fused matmul: dequant inside the inner loop ────────────────────
+//
+// scales[m] is hoisted out of the innermost k loop. Only the int8
+// tensor + M-sized scales vector are traversed — no M*K fp32 temp.
+//
+// C[b,m] = scales[m] * sum_k A[b,k] * W_int8[m,k]
+//        = sum_k A[b,k] * (W_int8[m,k] * scales[m])
+//
+// Mathematically identical (up to fp associativity) to the naive
+// path. Pulling the scale factor outside the inner sum is the
+// "dequant_fuse" transform.
+//
+// Forwarder pattern avoids the `@attr pub fn` parser pitfall (HX3):
+// the hot kernel is a private @hot fn; the pub wrapper delegates.
+@hot
+fn matmul_dequant_fused_kernel(A, W_int8, scales, B, M, K) {
+    let mut C = []
+    let mut b = 0
+    while b < B {
+        let mut m = 0
+        while m < M {
+            let s = scales[m]         // hoisted — loop-invariant vs k
+            let mut acc = 0.0
+            let mut k = 0
+            while k < K {
+                // on-the-fly dequant: W_int8[m,k] * s, never stored
+                acc = acc + A[b * K + k] * (W_int8[m * K + k] * s)
+                k = k + 1
+            }
+            C = C + [acc]
+            m = m + 1
+        }
+        b = b + 1
+    }
+    return C
+}
+
+pub fn matmul_dequant_fused(A, W_int8, scales, B, M, K) {
+    return matmul_dequant_fused_kernel(A, W_int8, scales, B, M, K)
+}
+
+// ── memory accounting helpers (for tests / introspection) ──────────
+//
+// Returns the number of bytes the naive path allocates for its
+// fp32 temporary weight buffer (M*K*4 on 32-bit float, 8 for f64).
+// We report in fp32-equivalent bytes (4 per element) since Hexa's
+// numeric model is f64 but the semantic shape is fp32 matmul.
+pub fn naive_temp_bytes(M, K) {
+    return M * K * 4
+}
+
+// Returns the bytes the fused path keeps resident for the weight
+// (int8 → 1 byte each). scales[M] is negligible (4*M) but
+// included for fidelity.
+pub fn fused_resident_bytes(M, K) {
+    return M * K * 1 + M * 4
+}
+
+// Savings vs naive — positive means fused uses fewer bytes.
+pub fn dequant_fuse_savings(M, K) {
+    return naive_temp_bytes(M, K) - fused_resident_bytes(M, K)
+}

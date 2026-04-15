@@ -1,0 +1,213 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_rope.hexa — ROI #91 correctness suite for self/ai_native/rope.hexa
+//
+//  Coverage:
+//    A. Precompute shape:  seq_len × (head_dim/2) for cos and sin
+//    B. pos=0 identity:    cos=1, sin=0  → rope_apply is the identity
+//    C. fused vs naive:    rope_apply == rope_apply_naive (tol 1e-5)
+//       across multiple (head_dim, pos) combos
+//    D. Rotary inverse:    rope_inverse(rope_apply(x)) ≈ x
+//    E. head_dim sweep:    4 / 8 / 16 / 64
+//    F. cos/sin bounds:    all table entries in [-1, 1]
+//    G. op-count note:     precompute caches amortise sin/cos calls
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/rope.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    let n = len(a)
+    if len(b) != n { return false }
+    for i in 0..n {
+        if fabs_t(a[i] - b[i]) > eps { return false }
+    }
+    return true
+}
+
+// deterministic pseudo-random LCG for reproducible inputs
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_vec(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let r = (state % 2000) * 0.001 - 1.0
+        v = v + [r]
+    }
+    return v
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #91 RoPE (rotary position embedding) — correctness suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-5
+let base = 10000.0
+
+// ── Test A : precompute shape ─────────────────────────────────────
+let seq_len_a = 16
+let head_dim_a = 8
+let cache_a = rope_precompute(seq_len_a, head_dim_a, base)
+
+check("A1 cache has seq_len rows",     rope_cache_seq_len(cache_a) == seq_len_a)
+check("A2 cache has head_dim/2 cols",  rope_cache_half_dim(cache_a) == head_dim_a / 2)
+
+// direct map access sanity check
+let cos_tab_a = cache_a["cos"]
+let sin_tab_a = cache_a["sin"]
+check("A3 cos_tab length",  len(cos_tab_a) == seq_len_a)
+check("A4 sin_tab length",  len(sin_tab_a) == seq_len_a)
+check("A5 cos row0 length", len(cos_tab_a[0]) == head_dim_a / 2)
+check("A6 sin row0 length", len(sin_tab_a[0]) == head_dim_a / 2)
+
+// ── Test B : pos=0 identity ───────────────────────────────────────
+// pos=0 → angle=0 → (cos, sin) = (1, 0) → rope_apply returns x unchanged
+let x_b = rand_vec(8, 42)
+let y_b = rope_apply(x_b, cos_tab_a, sin_tab_a, 0)
+check("B1 pos=0 identity (head_dim=8)", vec_close(x_b, y_b, eps))
+
+// also check cos[0] == [1,1,..,1], sin[0] == [0,0,..,0]
+let mut cos0_ok = true
+let mut sin0_ok = true
+for i in 0..(head_dim_a / 2) {
+    if fabs_t(cos_tab_a[0][i] - 1.0) > eps { cos0_ok = false }
+    if fabs_t(sin_tab_a[0][i] - 0.0) > eps { sin0_ok = false }
+}
+check("B2 cos[0] all 1",    cos0_ok)
+check("B3 sin[0] all 0",    sin0_ok)
+
+// ── Test C : fused vs naive (tol 1e-5) ────────────────────────────
+// multiple (head_dim, pos) — precomputed cache must match per-call path
+let dims_c = [4, 8, 16, 64]
+let seq_len_c = 32
+for di in 0..len(dims_c) {
+    let hd = dims_c[di]
+    let cache_c = rope_precompute(seq_len_c, hd, base)
+    let cos_c = cache_c["cos"]
+    let sin_c = cache_c["sin"]
+    let positions = [0, 1, 7, 15, 31]
+    for pi in 0..len(positions) {
+        let pos = positions[pi]
+        let xv = rand_vec(hd, 1000 + hd * 17 + pos)
+        let y_fused = rope_apply(xv, cos_c, sin_c, pos)
+        let y_naive = rope_apply_naive(xv, pos, hd, base)
+        let name = "C fused==naive  hd=" + to_string(hd) + " pos=" + to_string(pos)
+        check(name, vec_close(y_fused, y_naive, eps))
+    }
+}
+
+// ── Test D : rotary inverse ───────────────────────────────────────
+// rope_inverse(rope_apply(x, cache, pos), cache, pos) ≈ x
+let dims_d = [4, 8, 16, 64]
+let positions_d = [0, 1, 5, 13, 30]
+let seq_len_d = 32
+for di in 0..len(dims_d) {
+    let hd = dims_d[di]
+    let cache_d = rope_precompute(seq_len_d, hd, base)
+    let cos_d = cache_d["cos"]
+    let sin_d = cache_d["sin"]
+    for pi in 0..len(positions_d) {
+        let pos = positions_d[pi]
+        let xv = rand_vec(hd, 5000 + hd * 13 + pos * 3)
+        let y = rope_apply(xv, cos_d, sin_d, pos)
+        let xr = rope_inverse(y, cos_d, sin_d, pos)
+        let name = "D inverse∘apply=id hd=" + to_string(hd) + " pos=" + to_string(pos)
+        check(name, vec_close(xr, xv, eps))
+    }
+}
+
+// ── Test E : head_dim sweep sanity — rotation preserves norm ──────
+// RoPE is unitary: |x| == |rope_apply(x)|. Small float drift allowed.
+let dims_e = [4, 8, 16, 64]
+for di in 0..len(dims_e) {
+    let hd = dims_e[di]
+    let cache_e = rope_precompute(16, hd, base)
+    let cos_e = cache_e["cos"]
+    let sin_e = cache_e["sin"]
+    let xv = rand_vec(hd, 7777 + hd)
+    let mut n_in = 0.0
+    for i in 0..hd { n_in = n_in + xv[i] * xv[i] }
+    let y = rope_apply(xv, cos_e, sin_e, 7)
+    let mut n_out = 0.0
+    for i in 0..hd { n_out = n_out + y[i] * y[i] }
+    let name = "E norm preserved hd=" + to_string(hd)
+    check(name, fabs_t(n_in - n_out) < 1.0e-4 * (n_in + 1.0))
+}
+
+// ── Test F : cos/sin bounded in [-1, 1] ───────────────────────────
+let cache_f = rope_precompute(64, 32, base)
+let cos_f = cache_f["cos"]
+let sin_f = cache_f["sin"]
+let mut f_bounded = true
+for p in 0..64 {
+    for i in 0..16 {
+        if cos_f[p][i] >  1.000001 { f_bounded = false }
+        if cos_f[p][i] < -1.000001 { f_bounded = false }
+        if sin_f[p][i] >  1.000001 { f_bounded = false }
+        if sin_f[p][i] < -1.000001 { f_bounded = false }
+    }
+}
+check("F all cos/sin entries in [-1,1]", f_bounded)
+
+// ── Test G : op-count — cache amortises sin/cos across calls ──────
+// Apply the same cache to M different vectors at the same position:
+// fused path reuses one (cos,sin) row; naive path redoes trig M times.
+// Correctness equivalence suffices as "connection" here; we just
+// reassert M independent vectors get matching results.
+let hd_g = 32
+let cache_g = rope_precompute(8, hd_g, base)
+let cos_g = cache_g["cos"]
+let sin_g = cache_g["sin"]
+let pos_g = 3
+let mut all_match = true
+for k in 0..8 {
+    let xv = rand_vec(hd_g, 900 + k * 31)
+    let yf = rope_apply(xv, cos_g, sin_g, pos_g)
+    let yn = rope_apply_naive(xv, pos_g, hd_g, base)
+    if !vec_close(yf, yn, eps) { all_match = false }
+}
+check("G 8 vectors shared cache agree with naive", all_match)
+
+// op-count bookkeeping (descriptive only — no assertion needed):
+//   naive   : per call  -> head_dim/2 pow + head_dim/2 sin + head_dim/2 cos
+//   fused   : precompute once, per call -> 0 pow + 0 sin + 0 cos
+//   For M calls at the same pos range:
+//     naive trig ops   = M · head_dim/2 · 2
+//     fused trig ops   = seq_len · head_dim/2 · 2  (one-time)
+//   Break-even at M == seq_len; for typical decode M >> seq_len so
+//   fused wins asymptotically.
+println("[INFO] op-count: naive=M*(hd/2)*2 sincos,  fused=seq_len*(hd/2)*2 sincos once")
+
+// ══════════════════════════════════════════════════════════════════
+println("")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("FAILED")
+}
+println(to_string(pass_count) + " passed")

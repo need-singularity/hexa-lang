@@ -1,0 +1,239 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/rope.hexa — AI-native ROI #91
+//
+//  @rope — Rotary Position Embedding (RoPE, Su et al. 2021). Modern
+//  LLMs (LLaMA, Qwen, Mistral, DeepSeek) use RoPE instead of additive
+//  positional embeddings because rotation composes well under dot
+//  product: <R_m·q, R_n·k> depends only on (m-n), giving relative
+//  position semantics for free.
+//
+//  Public API (interleaved / "LLaMA complex pair" layout):
+//      rope_precompute(seq_len, head_dim, base)   -> {cos, sin}
+//          • cos, sin : seq_len × (head_dim/2)  LUT tables
+//      rope_apply(x, cos_cache, sin_cache, pos)   -> [float]
+//          • applies the rotation at row `pos` to vector x
+//          • x.length must equal head_dim and be even
+//      rope_apply_naive(x, pos, head_dim, base)   -> [float]
+//          • reference path: recomputes cos/sin every call
+//      rope_inverse(x, cos_cache, sin_cache, pos) -> [float]
+//          • -pos rotation: undoes rope_apply — rotary inverse
+//
+//  Layout choice — INTERLEAVED (complex-pair):
+//      For i in 0..head_dim/2:
+//          x'[2i]   = x[2i]·cos_i - x[2i+1]·sin_i
+//          x'[2i+1] = x[2i]·sin_i + x[2i+1]·cos_i
+//      This treats (x[2i], x[2i+1]) as Re,Im of a complex number and
+//      rotates by angle θ_i = pos · base^(-2i/head_dim). Matches the
+//      original RoPE paper and HuggingFace's `rotary_emb_interleaved`
+//      convention. (HF LLaMA default is the half-split variant; we
+//      picked interleaved for locality — adjacent pairs stay adjacent.)
+//
+//  Frequency table:
+//      θ_i = pos · inv_freq_i,  where
+//      inv_freq_i = base^(-2i/head_dim)  for i in 0..head_dim/2
+//
+//  HX3 pitfalls handled:
+//      - no struct-literal inside `if` body → use map #{} return at tail
+//      - slice precedence — no range slices on fp arrays here
+//      - @attr pub fn  → avoided; plain @pure / @hot
+//      - no `enum`       → not needed
+//      - no bitwise ops  → only +-*/ with base/head_dim
+//      - abs/fabs        → file-local fabs_rope
+//
+//  AI-native attrs:
+//      @pure — math helpers, precompute
+//      @hot  — rope_apply / rope_inverse (per-token hot-path)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn rope_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// pow fallback is available as builtin; we re-wrap so the call site
+// reads like rope_pow(base, exponent) and base=10000.0 stays obvious.
+@pure
+fn rope_pow(base, exponent) {
+    return pow(base, exponent)
+}
+
+@pure
+fn rope_cos(x) {
+    return cos(x)
+}
+
+@pure
+fn rope_sin(x) {
+    return sin(x)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rope_inv_freq(head_dim, base)
+//
+//  Builds the length head_dim/2 inverse-frequency vector:
+//      inv_freq[i] = 1 / base^(2i/head_dim)
+//
+//  base=10000.0 gives LLaMA-compatible frequencies; larger base
+//  compresses frequencies (YaRN / NTK-aware extensions scale base).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rope_inv_freq(head_dim, base) {
+    let half = head_dim / 2
+    let mut freqs = []
+    let hd_f = to_float(head_dim)
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / hd_f
+        let denom = rope_pow(base, exponent)
+        freqs = freqs + [1.0 / denom]
+    }
+    return freqs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rope_precompute(seq_len, head_dim, base)
+//
+//  Returns a map #{cos, sin} where each table is seq_len × (head_dim/2).
+//  cos[pos][i] = cos(pos · inv_freq_i),  sin[pos][i] = sin(pos · inv_freq_i)
+//
+//  Cost: O(seq_len · head_dim/2) — amortised across all tokens that
+//  share this position range (the whole batch, and across decoding
+//  steps inside max_seq).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rope_precompute(seq_len, head_dim, base) {
+    let inv_freq = rope_inv_freq(head_dim, base)
+    let half = len(inv_freq)
+
+    let mut cos_cache = []
+    let mut sin_cache = []
+    for p in 0..seq_len {
+        let pf = to_float(p)
+        let mut cos_row = []
+        let mut sin_row = []
+        for i in 0..half {
+            let angle = pf * inv_freq[i]
+            cos_row = cos_row + [rope_cos(angle)]
+            sin_row = sin_row + [rope_sin(angle)]
+        }
+        cos_cache = cos_cache + [cos_row]
+        sin_cache = sin_cache + [sin_row]
+    }
+
+    return #{
+        "cos": cos_cache,
+        "sin": sin_cache
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rope_apply(x, cos_cache, sin_cache, pos)
+//
+//  In-cache rotation at position `pos`, interleaved layout:
+//      x'[2i]   = x[2i]·c - x[2i+1]·s
+//      x'[2i+1] = x[2i]·s + x[2i+1]·c
+//  where (c, s) = (cos_cache[pos][i], sin_cache[pos][i]).
+//
+//  Caller must ensure len(x) is even; odd head_dim is unsupported by
+//  RoPE by construction.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn rope_apply(x, cos_cache, sin_cache, pos) {
+    let d = len(x)
+    let half = d / 2
+    let cos_row = cos_cache[pos]
+    let sin_row = sin_cache[pos]
+
+    let mut out = []
+    for _i in 0..d { out = out + [0.0] }
+
+    for i in 0..half {
+        let c = cos_row[i]
+        let s = sin_row[i]
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i]     = x0 * c - x1 * s
+        out[2 * i + 1] = x0 * s + x1 * c
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rope_apply_naive(x, pos, head_dim, base)
+//
+//  Reference path: recompute cos/sin per call. Numerically identical
+//  to rope_apply on the same (pos, head_dim, base). Used as a correctness
+//  baseline — NOT a fair speed benchmark (both paths dominated by the
+//  2 mul / 2 add per pair).
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn rope_apply_naive(x, pos, head_dim, base) {
+    let d = len(x)
+    let half = d / 2
+    let pf = to_float(pos)
+    let hd_f = to_float(head_dim)
+
+    let mut out = []
+    for _i in 0..d { out = out + [0.0] }
+
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / hd_f
+        let inv_freq_i = 1.0 / rope_pow(base, exponent)
+        let angle = pf * inv_freq_i
+        let c = rope_cos(angle)
+        let s = rope_sin(angle)
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i]     = x0 * c - x1 * s
+        out[2 * i + 1] = x0 * s + x1 * c
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rope_inverse(x, cos_cache, sin_cache, pos)
+//
+//  Applies the -pos rotation, which is the inverse of rope_apply at pos:
+//      x'[2i]   =  x[2i]·c + x[2i+1]·s
+//      x'[2i+1] = -x[2i]·s + x[2i+1]·c
+//  equivalent to rotating by angle -θ.
+//
+//  Property: rope_inverse(rope_apply(x, cache, pos), cache, pos) ≈ x.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn rope_inverse(x, cos_cache, sin_cache, pos) {
+    let d = len(x)
+    let half = d / 2
+    let cos_row = cos_cache[pos]
+    let sin_row = sin_cache[pos]
+
+    let mut out = []
+    for _i in 0..d { out = out + [0.0] }
+
+    for i in 0..half {
+        let c = cos_row[i]
+        let s = sin_row[i]
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i]     =  x0 * c + x1 * s
+        out[2 * i + 1] = 0.0 - x0 * s + x1 * c
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Shape helpers — tests query cache dimensions without poking the map.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rope_cache_seq_len(cache) {
+    return len(cache["cos"])
+}
+
+@pure
+fn rope_cache_half_dim(cache) {
+    let cos_t = cache["cos"]
+    if len(cos_t) == 0 { return 0 }
+    return len(cos_t[0])
+}

@@ -1,0 +1,257 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/fuse_activation.hexa — AI-native ROI #89
+//
+//  @fuse_activation — GEMM + pointwise activation fusion.
+//
+//  Motivation:
+//      Transformer FFN blocks evaluate  act(X · W + b)  every forward
+//      step. The unfused schedule writes a full intermediate matrix
+//      C = X·W  to memory, reads it back, applies the activation,
+//      and writes the result — one full N·M tensor round-trip per
+//      activation. With fusion the activation runs inside the GEMM
+//      inner loop on the value already resident in a register, so
+//      the intermediate never materialises. Net win: memory round
+//      trips 1 → 0, intermediate allocation 1 → 0.
+//
+//  Public API (row-major 2D arrays — A, B, C: [[float]]):
+//      gemm_naive(A, B)                  -> C      (baseline)
+//      activate_relu(C)                  -> C'     (baseline)
+//      activate_gelu(C)                  -> C'     (baseline, tanh approx)
+//      activate_silu(C)                  -> C'     (baseline)
+//      gemm_relu_fused(A, B)             -> max(0, A·B)               (fused)
+//      gemm_gelu_fused(A, B)             -> GELU(A·B)                 (fused)
+//      gemm_silu_fused(A, B)             -> SiLU(A·B)                 (fused)
+//      fused_alloc_count()               -> 1      (one C output)
+//      naive_alloc_count()               -> 2      (GEMM out + act out)
+//
+//  Numerical contract:
+//      fused(A, B) == activate(gemm_naive(A, B))   within
+//          1e-5  for ReLU          (exact pointwise identity)
+//          1e-4  for GELU/SiLU     (transcendental floating error)
+//
+//  Allocation contract:
+//      Naive path allocates  GEMM-out  then  activation-out   = 2 mats
+//      Fused path allocates  exactly one output matrix         = 1 mat
+//      (both helpers exported for tests / bench accounting.)
+//
+//  GELU approximation (no libm erf in hexa runtime):
+//      GELU(x) ≈ 0.5·x·(1 + tanh( √(2/π) · (x + 0.044715·x³) ))
+//      Matches the "tanh GELU" used by GPT-2 / LLaMA-style FFNs.
+//      Maximum error vs exact-erf GELU is ~1e-4 on typical input
+//      ranges — comfortably within the 1e-4 tolerance.
+//
+//  SiLU (a.k.a. Swish-1):
+//      SiLU(x) = x · sigmoid(x) = x / (1 + exp(-x))
+//      Sigmoid input is clamped to [-40, 40] so that exp stays finite
+//      in the hexa float interpreter.
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - slice precedence: arr[(i+1)..j] — parens required
+//      - no bit-ops (<<, >>, |) — arithmetic only
+//      - no struct literal in `if` heads
+//      - `and`/`or` → `&&`/`||`
+//      - `@attr pub fn` unsupported → use `@attr fn _impl` + `pub fn` forwarder
+//      - no `enum` — activation kind is picked at call site via fn name
+//      - no `abs` builtin — use local fabs_fa
+//
+//  AI-native attrs:
+//      @hot      — FFN activation GEMMs are in the hot path
+//      @parallel — outer row loop is embarrassingly parallel
+//      @pure     — no side effects beyond returned C
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn fa89_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn fa89_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ── pointwise activations ──────────────────────────────────────────
+
+fn fa89_relu_scalar(x) {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// tanh-GELU (GPT-2 / LLaMA):
+//   0.5 · x · (1 + tanh( sqrt(2/π) · (x + 0.044715 · x³) ))
+// Constant √(2/π) ≈ 0.7978845608028654.
+fn fa89_gelu_scalar(x) {
+    let k = 0.7978845608028654
+    let x3 = x * x * x
+    let inner = k * (x + 0.044715 * x3)
+    return 0.5 * x * (1.0 + tanh(inner))
+}
+
+// Sigmoid, numerically safe — clamp input to [-40, 40].
+fn fa89_sigmoid_scalar(x) {
+    let mut c = x
+    if c >  40.0 { c =  40.0 }
+    if c < -40.0 { c = -40.0 }
+    return 1.0 / (1.0 + exp(0.0 - c))
+}
+
+// SiLU(x) = x · sigmoid(x)
+fn fa89_silu_scalar(x) {
+    return x * fa89_sigmoid_scalar(x)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Baseline — unfused GEMM followed by a map over the output.
+//  Each stage allocates its own matrix. naive_alloc_count = 2.
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn gemm_naive(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = fa89_zeros_2d(M, N)
+
+    for i in 0..M {
+        for k in 0..K {
+            let a = A[i][k]
+            for j in 0..N {
+                C[i][j] = C[i][j] + a * B[k][j]
+            }
+        }
+    }
+    return C
+}
+
+fn activate_relu(C) {
+    let M = len(C)
+    let N = len(C[0])
+    let mut O = fa89_zeros_2d(M, N)
+    for i in 0..M {
+        for j in 0..N {
+            O[i][j] = fa89_relu_scalar(C[i][j])
+        }
+    }
+    return O
+}
+
+fn activate_gelu(C) {
+    let M = len(C)
+    let N = len(C[0])
+    let mut O = fa89_zeros_2d(M, N)
+    for i in 0..M {
+        for j in 0..N {
+            O[i][j] = fa89_gelu_scalar(C[i][j])
+        }
+    }
+    return O
+}
+
+fn activate_silu(C) {
+    let M = len(C)
+    let N = len(C[0])
+    let mut O = fa89_zeros_2d(M, N)
+    for i in 0..M {
+        for j in 0..N {
+            O[i][j] = fa89_silu_scalar(C[i][j])
+        }
+    }
+    return O
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Fused kernels — compute one GEMM cell to completion, apply the
+//  activation to the in-register accumulator, write-once to C[i][j].
+//
+//  Loop order (i, j, k): the (k) reduction is innermost so that the
+//  scalar accumulator `acc` sees the full dot-product before any
+//  activation is applied. This diverges from the (i, k, j) order of
+//  gemm_naive because fusion needs the completed cell, not a running
+//  partial sum streamed across j.
+//
+//  Allocation budget: exactly ONE matrix (the returned C).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn gemm_relu_fused(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = fa89_zeros_2d(M, N)
+
+    for i in 0..M {
+        for j in 0..N {
+            let mut acc = 0.0
+            for k in 0..K {
+                acc = acc + A[i][k] * B[k][j]
+            }
+            C[i][j] = fa89_relu_scalar(acc)
+        }
+    }
+    return C
+}
+
+@hot @parallel
+fn gemm_gelu_fused(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = fa89_zeros_2d(M, N)
+
+    for i in 0..M {
+        for j in 0..N {
+            let mut acc = 0.0
+            for k in 0..K {
+                acc = acc + A[i][k] * B[k][j]
+            }
+            C[i][j] = fa89_gelu_scalar(acc)
+        }
+    }
+    return C
+}
+
+@hot @parallel
+fn gemm_silu_fused(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = fa89_zeros_2d(M, N)
+
+    for i in 0..M {
+        for j in 0..N {
+            let mut acc = 0.0
+            for k in 0..K {
+                acc = acc + A[i][k] * B[k][j]
+            }
+            C[i][j] = fa89_silu_scalar(acc)
+        }
+    }
+    return C
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Allocation accounting (for tests / bench reporting).
+//  naive path:  GEMM out (1)  +  activation out (1)  = 2
+//  fused path:  fused out (1)                        = 1
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn naive_alloc_count() {
+    return 2
+}
+
+pub fn fused_alloc_count() {
+    return 1
+}
