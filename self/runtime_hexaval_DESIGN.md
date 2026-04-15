@@ -118,11 +118,49 @@ below. No global type inference pass exists or is required for this contract.
 
 ### Residual work (not COMP-P3-1)
 
-- RT-P3-1: `hexa_as_num` / `hexa_to_cstring` wrappers to close remaining 20
-  default-flag gcc errors (14 `-Wint-conversion`, 4 `-Wpointer-arith`, 2
-  implicit-fn). The `interpreter.hexa → .c` regeneration path still needs
-  these shims; the live codegen itself is already HexaVal-shaped.
+- RT-P3-1: `hexa_as_num` / `hexa_to_cstring` / `hexa_str_as_ptr` wrappers —
+  **landed 2026-04-15** in `self/runtime.c` (forward decl line ~172, defs
+  after `__hx_to_double`). Codegen wire-in and regen verification pending
+  (see below).
 - SH-P3-1: `build/artifacts/hexa_native.c` baseline source was lost (see
-  `.gitignore:9 build/`). Recovery needs (a) `.gitignore` exception for
-  `build/artifacts/hexa_native*` or (b) committing a snapshot under
-  `self/artifacts_baseline/`. Separate from COMP-P3-1.
+  `.gitignore:9 build/`). Recovery partially addressed — `.gitignore` now
+  carries `!build/artifacts/hexa_native_baseline.c` exception. Actual
+  baseline snapshot not yet committed. Separate from COMP-P3-1.
+
+## RT-P3-1 wrapper shims — landed 2026-04-15
+
+Three non-owning conversion helpers in `self/runtime.c`:
+
+| Shim | Purpose | Error category closed |
+|------|---------|----------------------|
+| `int64_t hexa_as_num(HexaVal)` | coerce scalar/str to int64 | `-Wint-conversion` (long ← HexaVal) |
+| `const char* hexa_to_cstring(HexaVal)` | generic → read-only cstr | `-Wint-conversion` (char* ← long) |
+| `const char* hexa_str_as_ptr(HexaVal)` | strict STR slot | `-Wpointer-arith` (escape literals) |
+
+All three unwrap `TAG_VALSTRUCT` first (mirroring `__hx_to_double`). The
+cstring path uses two separate file-static buffers (top-level vs valstruct
+branches) — thread-unsafe; callers that persist the pointer beyond the next
+scalar-path call MUST copy.
+
+### Wire-in sites (codegen_c2.hexa → interpreter.c)
+
+Deferred to a separate cycle (regen feasibility is currently **avoid** per
+R3 — 40 % SIGSEGV risk from flatten_imports regression + T33 arena bug).
+Site inventory for when regen re-opens:
+
+| Group | Count | Line range (generated .c) | Fix |
+|-------|-------|---------------------------|-----|
+| A — Wint-conversion | 14 | 519, 521, 523-524, 567, 627-720 | wrap arr-push / int_to_str returns with `hexa_str()` / `hexa_to_cstring()` |
+| B — Wpointer-arith | 4 | 750, 753, 756, 759 (escape literals) | StringLit kind emit: wrap `"\n"` etc. in `hexa_str(...)` |
+| C — implicit-fn | 2 | `sleep()` call sites | codegen prelude emit explicit `#include <unistd.h>` |
+
+Codegen edit points (source: `self/codegen_c2.hexa`):
+- 1276 (println no-arg) — `printf("\n")` → dedicated empty wrapper
+- 1374 (format args push) — wrap `gen2_expr` result with `hexa_str()`
+- 1380 (eprintln) — wrap with `hexa_to_cstring()`
+- 1121 / 1756 (map.contains_key) — remove `.s` direct field access
+- ~1850 (StringLit) — auto-wrap escape-bearing literals
+
+Closing all three groups moves default-flag gcc errors **20 → 0** per R2
+measurement against the corrupted hexa_native.c; independent of baseline
+source recovery.

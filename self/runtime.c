@@ -169,6 +169,14 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
 HexaVal hexa_val_snapshot_array(HexaVal v);  // rt#32-N forward decl
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 
+// RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
+// path. Close Wint-conversion / Wpointer-arith categories in the
+// interpreter.hexa → .c baseline. See self/runtime_hexaval_DESIGN.md
+// §Production runtime (live).
+int64_t     hexa_as_num(HexaVal v);
+const char* hexa_to_cstring(HexaVal v);
+const char* hexa_str_as_ptr(HexaVal v);
+
 // rt 32-G Phase 0: flat Val struct forward decls (implementation below).
 // NOTE: parameter-less typedef stays outside so the struct body later in
 // this file keeps using the same name. Function decls reference HexaVal
@@ -424,6 +432,48 @@ static inline double __hx_to_double(HexaVal v) {
         if (v.vs->tag_i == TAG_INT)   return (double)v.vs->int_val;
     }
     return 0.0;
+}
+
+// RT-P3-1 wrapper shims. Non-owning returns; cstring/str_as_ptr use static
+// thread-unsafe buffers for scalar formatting — callers that persist the
+// pointer beyond the next scalar-path call MUST copy.
+int64_t hexa_as_num(HexaVal v) {
+    if (v.tag == TAG_INT)   return v.i;
+    if (v.tag == TAG_FLOAT) return (int64_t)v.f;
+    if (v.tag == TAG_BOOL)  return (int64_t)v.b;
+    if (v.tag == TAG_STR && v.s) return strtoll(v.s, NULL, 10);
+    if (v.tag == TAG_VALSTRUCT && v.vs) {
+        if (v.vs->tag_i == TAG_INT)   return v.vs->int_val;
+        if (v.vs->tag_i == TAG_FLOAT) return (int64_t)v.vs->float_val;
+        if (v.vs->tag_i == TAG_BOOL)  return (int64_t)v.vs->bool_val;
+        if (v.vs->tag_i == TAG_STR && v.vs->str_val.s)
+            return strtoll(v.vs->str_val.s, NULL, 10);
+    }
+    return 0;
+}
+
+const char* hexa_to_cstring(HexaVal v) {
+    if (v.tag == TAG_STR && v.s) return v.s;
+    if (v.tag == TAG_VOID) return "void";
+    if (v.tag == TAG_VALSTRUCT && v.vs) {
+        if (v.vs->tag_i == TAG_STR && v.vs->str_val.s) return v.vs->str_val.s;
+        static char vbuf[64];
+        if (v.vs->tag_i == TAG_INT)   { snprintf(vbuf, 64, "%lld", (long long)v.vs->int_val); return vbuf; }
+        if (v.vs->tag_i == TAG_FLOAT) { snprintf(vbuf, 64, "%g", v.vs->float_val); return vbuf; }
+        if (v.vs->tag_i == TAG_BOOL)  return v.vs->bool_val ? "true" : "false";
+    }
+    static char buf[64];
+    if (v.tag == TAG_INT)   { snprintf(buf, 64, "%lld", (long long)v.i); return buf; }
+    if (v.tag == TAG_FLOAT) { snprintf(buf, 64, "%g", v.f); return buf; }
+    if (v.tag == TAG_BOOL)  return v.b ? "true" : "false";
+    return "<value>";
+}
+
+const char* hexa_str_as_ptr(HexaVal v) {
+    if (v.tag == TAG_STR && v.s) return v.s;
+    if (v.tag == TAG_VALSTRUCT && v.vs && v.vs->tag_i == TAG_STR && v.vs->str_val.s)
+        return v.vs->str_val.s;
+    return NULL;
 }
 
 // Null coalescing: a ?? b — if a is void or empty string, return b
