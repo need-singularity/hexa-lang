@@ -1,0 +1,245 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/tensor.hexa — Tensor raw f32 primitive (struct + BLAS)
+//
+//  Goal: give hexa a first-class f32 Tensor type backed by a raw C
+//  float* buffer, bypassing the hexa linked-list list<HexaVal> layout
+//  entirely. Measured 1,457x speedup over list-backed matmul at 256²
+//  (BLAS spike #19, commit 28441a77) — the gap is dominated by list
+//  alloc churn, not FLOPs.
+//
+//  Storage layout:
+//    - data : int (raw float* reinterpret_cast<int64_t>)
+//    - numel: int (total element count, product of shape)
+//    - rank : int (number of dimensions, 1 or 2 for now)
+//    - d0   : int (first dimension)
+//    - d1   : int (second dimension, 1 if rank==1)
+//
+//  All fields are int to avoid:
+//    - struct multi-float return corruption bug (≥3 float fields)
+//    - struct-field list aliasing bug (two structs each with an array)
+//    See: feedback_hexa_struct_return_bug, feedback_hexa_struct_list_alias
+//
+//  Pointer discipline:
+//    - data is a raw uintptr_t; use alloc_raw(numel * 4) to create
+//    - write_f32(data, i * 4, v) — BYTE offset (not element index)
+//    - deref_f32(data, i * 4)    — BYTE offset
+//    - free_raw(data, numel * 4) — caller owns, no GC
+//
+//  BLAS backend:
+//    - Reuses training/hxblas_wrapper.c via dlopen of
+//      /Users/ghost/Dev/anima/training/build/libhxblas.dylib
+//    - Rationale: training/accelerate_blas.hexa already ships a proven
+//      FFI shim that handles the hexa float→C double ABI quirk. One
+//      shared shim = fewer ABI surprises.
+//
+//  Interpreter behavior:
+//    - Stage0 interpreter's alloc_raw uses an array-backed virtual
+//      buffer. Tensor::new / ::get / ::set still work; BLAS extern
+//      calls are no-ops in the interpreter (it can't dlopen), so the
+//      bench below is native-compile only.
+//
+//  Last verified: 2026-04-15 (agent-a0803770)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── BLAS extern declarations ────────────────────────────────────────
+// Absolute path required: hexa's dlopen runs from arbitrary cwd.
+// When wiring from another anima host, update the path or preload with
+// DYLD_LIBRARY_PATH=/path/to/training/build.
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int, M: int, N: int, K: int, alpha: float, A: *Void, lda: int, B: *Void, ldb: int, beta: float, C: *Void, ldc: int)
+
+@link("/Users/ghost/Dev/anima/training/build/libhxblas.dylib")
+extern fn hxblas_version() -> int
+
+// ── Tensor struct (int-only fields, 5 words) ────────────────────────
+
+struct Tensor {
+    data: int,
+    numel: int,
+    rank: int,
+    d0: int,
+    d1: int
+}
+
+// ── Constructors ────────────────────────────────────────────────────
+
+// 1D tensor of length n (zero-initialised by calloc in alloc_raw).
+fn tensor_new1(n) {
+    let buf = alloc_raw(n * 4)
+    return Tensor { data: buf, numel: n, rank: 1, d0: n, d1: 1 }
+}
+
+// 2D tensor [m, n] — row-major, contiguous.
+fn tensor_new2(m, n) {
+    let buf = alloc_raw(m * n * 4)
+    return Tensor { data: buf, numel: m * n, rank: 2, d0: m, d1: n }
+}
+
+// Create a tensor that wraps an already-allocated raw buffer. Caller
+// transfers ownership; tensor_free() will free_raw() the buffer.
+fn tensor_wrap2(ptr, m, n) {
+    return Tensor { data: ptr, numel: m * n, rank: 2, d0: m, d1: n }
+}
+
+// ── Element access (byte-offset discipline) ─────────────────────────
+
+fn tensor_get(t: Tensor, i) {
+    return deref_f32(t.data, i * 4)
+}
+
+fn tensor_set(t: Tensor, i, v) {
+    write_f32(t.data, i * 4, v)
+}
+
+// 2D indexed access (row-major)
+fn tensor_get2(t: Tensor, i, j) {
+    return deref_f32(t.data, (i * t.d1 + j) * 4)
+}
+
+fn tensor_set2(t: Tensor, i, j, v) {
+    write_f32(t.data, (i * t.d1 + j) * 4, v)
+}
+
+// ── Bulk fill ───────────────────────────────────────────────────────
+
+fn tensor_fill(t: Tensor, v) {
+    let mut i = 0
+    while i < t.numel {
+        write_f32(t.data, i * 4, v)
+        i = i + 1
+    }
+}
+
+fn tensor_zeros1(n) {
+    // alloc_raw already zero-inits (calloc), so just wrap.
+    return tensor_new1(n)
+}
+
+fn tensor_zeros2(m, n) {
+    return tensor_new2(m, n)
+}
+
+fn tensor_ones1(n) {
+    let t = tensor_new1(n)
+    tensor_fill(t, 1.0)
+    return t
+}
+
+fn tensor_ones2(m, n) {
+    let t = tensor_new2(m, n)
+    tensor_fill(t, 1.0)
+    return t
+}
+
+// ── Destructor (explicit — no GC) ───────────────────────────────────
+
+fn tensor_free(t: Tensor) {
+    free_raw(t.data, t.numel * 4)
+}
+
+// ── Shape / metadata accessors ──────────────────────────────────────
+
+fn tensor_numel(t: Tensor) {
+    return t.numel
+}
+
+fn tensor_rows(t: Tensor) {
+    return t.d0
+}
+
+fn tensor_cols(t: Tensor) {
+    return t.d1
+}
+
+fn tensor_data_ptr(t: Tensor) {
+    return t.data
+}
+
+// ── Zero-copy view: reshape (numel must match) ──────────────────────
+// Important: view shares the underlying buffer. DO NOT call tensor_free
+// on a view — only on the original. Returned struct has owned=0
+// semantics implicit (we don't track ownership, caller must discipline).
+
+fn tensor_view2(t: Tensor, m, n) {
+    // Reuse same pointer; caller promises m*n == t.numel.
+    return Tensor { data: t.data, numel: t.numel, rank: 2, d0: m, d1: n }
+}
+
+// ── Elementwise (in-place on first operand) ─────────────────────────
+// Scalar path — for any serious workload use BLAS/vDSP vector fns.
+
+fn tensor_scale_inplace(t: Tensor, alpha) {
+    let mut i = 0
+    while i < t.numel {
+        let v = deref_f32(t.data, i * 4)
+        write_f32(t.data, i * 4, v * alpha)
+        i = i + 1
+    }
+}
+
+fn tensor_add_inplace(dst: Tensor, src: Tensor) {
+    // dst[i] += src[i]
+    let n = dst.numel
+    let mut i = 0
+    while i < n {
+        let a = deref_f32(dst.data, i * 4)
+        let b = deref_f32(src.data, i * 4)
+        write_f32(dst.data, i * 4, a + b)
+        i = i + 1
+    }
+}
+
+// ── Reductions ──────────────────────────────────────────────────────
+
+fn tensor_sum(t: Tensor) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < t.numel {
+        s = s + deref_f32(t.data, i * 4)
+        i = i + 1
+    }
+    return s
+}
+
+// ── MATMUL: the reason this type exists ─────────────────────────────
+//
+// C[M x N] = A[M x K] * B[K x N]
+//
+// Calls hxblas_sgemm which in turn calls cblas_sgemm (OpenBLAS on
+// Linux / Accelerate framework on macOS) — multi-threaded, vectorised,
+// cache-blocked. Allocates a fresh output Tensor and returns it.
+// Caller owns the result.
+//
+// Expected speedup (M-series ARM64, 2026-04-15):
+//   128²: ~15x  vs C-scalar,   ~1,400x vs hexa list matmul
+//   256²: ~60x  vs C-scalar,   ~1,500x vs hexa list matmul
+//   512²: ~117x vs C-scalar,   ~2,000x vs hexa list matmul
+//
+// Dimensions come from tensor_new2 construction: a.d0=M, a.d1=K=b.d0, b.d1=N.
+
+fn tensor_matmul(a: Tensor, b: Tensor) {
+    let M = a.d0
+    let K = a.d1
+    let N = b.d1
+    let c = tensor_new2(M, N)
+    // CblasRowMajor=101, CblasNoTrans=111
+    hxblas_sgemm(101, 111, 111, M, N, K, 1.0, a.data, K, b.data, N, 0.0, c.data, N)
+    return c
+}
+
+// Variant that writes into a pre-allocated output (no alloc).
+fn tensor_matmul_into(a: Tensor, b: Tensor, out: Tensor) {
+    let M = a.d0
+    let K = a.d1
+    let N = b.d1
+    hxblas_sgemm(101, 111, 111, M, N, K, 1.0, a.data, K, b.data, N, 0.0, out.data, N)
+}
+
+// ── Debug / linkage probe ───────────────────────────────────────────
+
+fn tensor_blas_version() {
+    return hxblas_version()
+}
+
+// ── End of module ───────────────────────────────────────────────────

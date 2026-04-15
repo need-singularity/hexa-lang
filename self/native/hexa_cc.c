@@ -7475,7 +7475,10 @@ HexaVal gen2_extern_ret_kind(HexaVal ret_type) {
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Int"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("int")))))) {
         return hexa_str("1");
     }
-    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float")))))) {
+    // FFI float bucket: Float/float/f64 = double, f32 = float — both
+    // use the same 0-arg fallback dispatch kind (2) since hexa_extern_call
+    // marshals through HexaVal.f (double) and the C ABI narrows on return.
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("f64"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("f32")))))) {
         return hexa_str("2");
     }
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Bool"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("bool")))))) {
@@ -7486,8 +7489,16 @@ HexaVal gen2_extern_ret_kind(HexaVal ret_type) {
 }
 
 
+// Map a hexa param type to a C type for the typed FFI typedef.
+// ARM64 AAPCS + x86_64 SysV: C `float` passes in s0/s1/xmm0/xmm1, C `double`
+// in d0/d1/xmm0/xmm1 — same register FAMILY but different calling-convention
+// slot. Calling cblas_sgemm(float alpha) with a `double alpha` typedef silently
+// corrupts the argument. f32 must map to C `float`, f64/Float/float to double.
 HexaVal gen2_ffi_c_type(HexaVal typ) {
-    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(typ, hexa_str("Float"))) || hexa_truthy(hexa_eq(typ, hexa_str("float")))))) {
+    if (hexa_truthy(hexa_eq(typ, hexa_str("f32")))) {
+        return hexa_str("float");
+    }
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(typ, hexa_str("Float"))) || hexa_truthy(hexa_eq(typ, hexa_str("float"))))) || hexa_truthy(hexa_eq(typ, hexa_str("f64")))))) {
         return hexa_str("double");
     }
     return hexa_str("int64_t");
@@ -7499,7 +7510,10 @@ HexaVal gen2_ffi_c_ret_type(HexaVal ret_type) {
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Void"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("void"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("")))))) {
         return hexa_str("void");
     }
-    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float")))))) {
+    if (hexa_truthy(hexa_eq(ret_type, hexa_str("f32")))) {
+        return hexa_str("float");
+    }
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("f64")))))) {
         return hexa_str("double");
     }
     return hexa_str("int64_t");
@@ -7511,7 +7525,9 @@ HexaVal gen2_has_float_param(HexaVal params) {
     HexaVal i = hexa_int(0);
     while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(i); HexaVal __r=(hexa_int(hexa_len(params))); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
         HexaVal t = hexa_map_get_ic(hexa_index_get(params, i), "value", &__hexa_codegen_c2_ic_64);
-        if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(t, hexa_str("Float"))) || hexa_truthy(hexa_eq(t, hexa_str("float")))))) {
+        // f32 and f64 both require typed dispatch — generic path can't
+        // distinguish narrow-to-float vs double.
+        if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(t, hexa_str("Float"))) || hexa_truthy(hexa_eq(t, hexa_str("float"))))) || hexa_truthy(hexa_eq(t, hexa_str("f64"))))) || hexa_truthy(hexa_eq(t, hexa_str("f32")))))) {
             return hexa_int(1);
         }
         i = hexa_add(i, hexa_int(1));
@@ -7521,8 +7537,15 @@ HexaVal gen2_has_float_param(HexaVal params) {
 }
 
 
+// Marshal a HexaVal arg to the correct C type for typed FFI call.
+// HexaVal.f is always `double` at the runtime level; for f32 params we
+// explicitly narrow to `float` at the call site so the C compiler places
+// the arg in s-registers (ARM64) / xmm low lane (x86) per sgemm ABI.
 HexaVal gen2_ffi_marshal_arg(HexaVal param_name, HexaVal param_type) {
-    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(param_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(param_type, hexa_str("float")))))) {
+    if (hexa_truthy(hexa_eq(param_type, hexa_str("f32")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(float)("), param_name), hexa_str(".tag==TAG_FLOAT?")), param_name), hexa_str(".f:(double)")), param_name), hexa_str(".i)"));
+    }
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(param_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(param_type, hexa_str("float"))))) || hexa_truthy(hexa_eq(param_type, hexa_str("f64")))))) {
         return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("("), param_name), hexa_str(".tag==TAG_FLOAT?")), param_name), hexa_str(".f:(double)")), param_name), hexa_str(".i)"));
     }
     return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("("), param_name), hexa_str(".tag==TAG_INT?")), param_name), hexa_str(".i:(int64_t)")), param_name), hexa_str(".f)"));
@@ -7530,11 +7553,17 @@ HexaVal gen2_ffi_marshal_arg(HexaVal param_name, HexaVal param_type) {
 }
 
 
+// Wrap the raw C return value back into HexaVal.
+// For f32 returns, we widen float→double via hexa_float (which takes double);
+// the implicit promotion in the function call is safe and lossless.
 HexaVal gen2_ffi_wrap_ret(HexaVal ret_type, HexaVal var_name) {
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Void"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("void"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("")))))) {
         return hexa_str("hexa_void()");
     }
-    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float")))))) {
+    if (hexa_truthy(hexa_eq(ret_type, hexa_str("f32")))) {
+        return hexa_add(hexa_add(hexa_str("hexa_float((double)"), var_name), hexa_str(")"));
+    }
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("float"))))) || hexa_truthy(hexa_eq(ret_type, hexa_str("f64")))))) {
         return hexa_add(hexa_add(hexa_str("hexa_float("), var_name), hexa_str(")"));
     }
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ret_type, hexa_str("Bool"))) || hexa_truthy(hexa_eq(ret_type, hexa_str("bool")))))) {
