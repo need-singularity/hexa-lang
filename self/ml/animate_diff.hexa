@@ -1,0 +1,720 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/animate_diff.hexa — AnimateDiff (#305)
+//
+//  Guo et al. 2023: Plug-and-play motion module that converts
+//  any image diffusion model into a video generator by inserting
+//  temporal self-attention layers between existing spatial layers.
+//
+//  Key ideas:
+//    1. Base spatial model is FROZEN (pre-trained image diffusion)
+//    2. Motion modules (temporal self-attention across frames)
+//       are inserted after each spatial block
+//    3. Only motion modules are trained
+//    4. Temporal positional encoding gives frame ordering
+//
+//  CPU mini config:
+//    D_model   = feature dimension per frame
+//    n_frames  = number of video frames
+//    n_heads   = attention heads in temporal attention
+//    2 spatial blocks (frozen) + 2 motion modules (trainable)
+//
+//  API:
+//    ad_init(D_model, n_frames, n_heads, seed) -> model
+//    ad_temporal_pe(n_frames, D)                -> [[float]]
+//    ad_temporal_attn(model, frame_features)    -> [[float]]
+//    ad_motion_module(model, spatial_out)        -> [[float]]
+//    ad_spatial_block(model, frame)             -> [float]
+//    ad_forward(model, frames)                  -> [[float]]
+//    ad_loss(model, clean_video, noisy_video, t)-> float
+//    ad_train_step(model, video_batch, lr)      -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward/loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────
+
+fn ad_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ad_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ad_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn ad_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.001 { g = 0.001 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ad_sin(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..10 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn ad_cos(x) {
+    return ad_sin(x + 1.5707963)
+}
+
+// ── Array helpers ─────────────────────────────────────────────
+
+fn ad_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ad_zeros2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [ad_zeros(cols)] }
+    return m
+}
+
+fn ad_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn ad_init_mat(rows, cols, seed, scale) {
+    let mut M = ad_zeros2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            M[i][j] = scale * ad_hash(seed, i, j)
+        }
+    }
+    return M
+}
+
+fn ad_init_vec(n, seed, scale) {
+    let mut v = ad_zeros(n)
+    for i in 0..n {
+        v[i] = scale * ad_hash(seed, i, 999)
+    }
+    return v
+}
+
+// ── Linear layer: y = x @ W + b ──────────────────────────────
+// W: [din][dout], b: [dout], feat: [din] -> [dout]
+fn ad_linear(W, b, feat) {
+    let din = len(W)
+    let dout = len(W[0])
+    let mut out = ad_zeros(dout)
+    for j in 0..dout { out[j] = b[j] }
+    for i in 0..din {
+        for j in 0..dout {
+            out[j] = out[j] + W[i][j] * feat[i]
+        }
+    }
+    return out
+}
+
+// ── ReLU ──────────────────────────────────────────────────────
+fn ad_relu(v) {
+    let n = len(v)
+    let mut out = ad_zeros(n)
+    for i in 0..n {
+        if v[i] > 0.0 { out[i] = v[i] }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Temporal Positional Encoding
+//  Sinusoidal encoding for frame positions: [n_frames][D]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_temporal_pe(n_frames, D) {
+    let mut pe = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        for d in 0..D {
+            let freq = to_float(t) / ad_exp(to_float(d / 2 * 2) * ad_log(10000.0) / to_float(D))
+            if d % 2 == 0 {
+                pe[t][d] = ad_sin(freq)
+            } else {
+                pe[t][d] = ad_cos(freq)
+            }
+        }
+    }
+    return pe
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Model Initialisation
+//
+//  Spatial blocks (FROZEN): 2 blocks, each with W_s, b_s, W_s2, b_s2
+//  Motion modules (TRAINABLE): 2 modules, each with:
+//    W_Q, W_K, W_V, W_O: [D][D] projection matrices
+//    b_Q, b_K, b_V, b_O: [D] biases
+//    W_ff1, b_ff1: [D][D_ff], feedforward layer 1
+//    W_ff2, b_ff2: [D_ff][D], feedforward layer 2
+// ═══════════════════════════════════════════════════════════════
+fn ad_init(D_model, n_frames, n_heads, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+    let D_ff = D_model * 2
+
+    // ── Spatial blocks (frozen base model) ────────────────────
+    let mut spatial_blocks = []
+    for blk in 0..2 {
+        let W_s1 = ad_init_mat(D_model, D_model, s + blk * 1000, 0.3)
+        let b_s1 = ad_zeros(D_model)
+        let W_s2 = ad_init_mat(D_model, D_model, s + blk * 1000 + 100, 0.3)
+        let b_s2 = ad_zeros(D_model)
+        spatial_blocks = spatial_blocks + [#{
+            "W_s1": W_s1, "b_s1": b_s1,
+            "W_s2": W_s2, "b_s2": b_s2
+        }]
+    }
+
+    // ── Motion modules (trainable temporal attention) ─────────
+    let mut motion_modules = []
+    for blk in 0..2 {
+        let base = s + 5000 + blk * 2000
+        let W_Q = ad_init_mat(D_model, D_model, base + 1, 0.3)
+        let W_K = ad_init_mat(D_model, D_model, base + 2, 0.3)
+        let W_V = ad_init_mat(D_model, D_model, base + 3, 0.3)
+        let W_O = ad_init_mat(D_model, D_model, base + 4, 0.3)
+        let b_Q = ad_zeros(D_model)
+        let b_K = ad_zeros(D_model)
+        let b_V = ad_zeros(D_model)
+        let b_O = ad_zeros(D_model)
+        let W_ff1 = ad_init_mat(D_model, D_ff, base + 5, 0.3)
+        let b_ff1 = ad_zeros(D_ff)
+        let W_ff2 = ad_init_mat(D_ff, D_model, base + 6, 0.3)
+        let b_ff2 = ad_zeros(D_model)
+        motion_modules = motion_modules + [#{
+            "W_Q": W_Q, "W_K": W_K, "W_V": W_V, "W_O": W_O,
+            "b_Q": b_Q, "b_K": b_K, "b_V": b_V, "b_O": b_O,
+            "W_ff1": W_ff1, "b_ff1": b_ff1,
+            "W_ff2": W_ff2, "b_ff2": b_ff2
+        }]
+    }
+
+    // ── Temporal positional encoding ──────────────────────────
+    let pe = ad_temporal_pe(n_frames, D_model)
+
+    return #{
+        "D_model": D_model,
+        "n_frames": n_frames,
+        "n_heads": n_heads,
+        "D_ff": D_ff,
+        "spatial_blocks": spatial_blocks,
+        "motion_modules": motion_modules,
+        "pe": pe
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Temporal Self-Attention across frames
+//  frame_features: [n_frames][D] -> attended: [n_frames][D]
+//
+//  Multi-head attention:
+//    Q = X @ W_Q + b_Q
+//    K = X @ W_K + b_K
+//    V = X @ W_V + b_V
+//    Attn = softmax(Q @ K^T / sqrt(d_head)) @ V
+//    Out = Attn @ W_O + b_O
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_temporal_attn(model, frame_features, block_idx) {
+    let D = model["D_model"]
+    let n_frames = len(frame_features)
+    let n_heads = model["n_heads"]
+    let mm = model["motion_modules"][block_idx]
+    let W_Q = mm["W_Q"]
+    let W_K = mm["W_K"]
+    let W_V = mm["W_V"]
+    let W_O = mm["W_O"]
+    let b_Q = mm["b_Q"]
+    let b_K = mm["b_K"]
+    let b_V = mm["b_V"]
+    let b_O = mm["b_O"]
+
+    // Add temporal positional encoding
+    let pe = model["pe"]
+    let mut features = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        for d in 0..D {
+            features[t][d] = frame_features[t][d] + pe[t][d]
+        }
+    }
+
+    // Compute Q, K, V projections
+    let mut Q = ad_zeros2d(n_frames, D)
+    let mut K = ad_zeros2d(n_frames, D)
+    let mut V = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        Q[t] = ad_linear(W_Q, b_Q, features[t])
+        K[t] = ad_linear(W_K, b_K, features[t])
+        V[t] = ad_linear(W_V, b_V, features[t])
+    }
+
+    // Attention scores: [n_frames][n_frames]
+    let d_head = D / n_heads
+    let scale = ad_sqrt(to_float(d_head))
+    if scale < 1.0e-9 { let scale = 1.0 }
+    let mut attn_scores = ad_zeros2d(n_frames, n_frames)
+    for i in 0..n_frames {
+        for j in 0..n_frames {
+            let mut dot = 0.0
+            for d in 0..D {
+                dot = dot + Q[i][d] * K[j][d]
+            }
+            attn_scores[i][j] = dot / scale
+        }
+    }
+
+    // Softmax over keys for each query
+    let mut attn_weights = ad_zeros2d(n_frames, n_frames)
+    for i in 0..n_frames {
+        let mut mx = attn_scores[i][0]
+        for j in 1..n_frames {
+            if attn_scores[i][j] > mx { mx = attn_scores[i][j] }
+        }
+        let mut sum_exp = 0.0
+        for j in 0..n_frames {
+            let e = ad_exp(attn_scores[i][j] - mx)
+            attn_weights[i][j] = e
+            sum_exp = sum_exp + e
+        }
+        if sum_exp < 1.0e-12 { sum_exp = 1.0e-12 }
+        for j in 0..n_frames {
+            attn_weights[i][j] = attn_weights[i][j] / sum_exp
+        }
+    }
+
+    // Weighted sum of values
+    let mut attn_out = ad_zeros2d(n_frames, D)
+    for i in 0..n_frames {
+        for j in 0..n_frames {
+            for d in 0..D {
+                attn_out[i][d] = attn_out[i][d] + attn_weights[i][j] * V[j][d]
+            }
+        }
+    }
+
+    // Output projection
+    let mut out = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        out[t] = ad_linear(W_O, b_O, attn_out[t])
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Motion Module: temporal attention + residual + feedforward
+//  spatial_out: [n_frames][D] -> temporal_out: [n_frames][D]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_motion_module(model, spatial_out, block_idx) {
+    let D = model["D_model"]
+    let n_frames = len(spatial_out)
+    let mm = model["motion_modules"][block_idx]
+
+    // Temporal self-attention
+    let attn_out = ad_temporal_attn(model, spatial_out, block_idx)
+
+    // Residual connection after attention
+    let mut residual = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        for d in 0..D {
+            residual[t][d] = spatial_out[t][d] + attn_out[t][d]
+        }
+    }
+
+    // Feedforward: ReLU(x @ W_ff1 + b_ff1) @ W_ff2 + b_ff2
+    let W_ff1 = mm["W_ff1"]
+    let b_ff1 = mm["b_ff1"]
+    let W_ff2 = mm["W_ff2"]
+    let b_ff2 = mm["b_ff2"]
+
+    let mut out = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        let h = ad_relu(ad_linear(W_ff1, b_ff1, residual[t]))
+        let ff_out = ad_linear(W_ff2, b_ff2, h)
+        // Second residual connection
+        for d in 0..D {
+            out[t][d] = residual[t][d] + ff_out[d]
+        }
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Spatial Block (frozen base model)
+//  Two-layer MLP with ReLU: simulates a frozen image diffusion block
+//  frame: [D] -> features: [D]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_spatial_block(model, frame, block_idx) {
+    let sb = model["spatial_blocks"][block_idx]
+    let W_s1 = sb["W_s1"]
+    let b_s1 = sb["b_s1"]
+    let W_s2 = sb["W_s2"]
+    let b_s2 = sb["b_s2"]
+
+    // Layer 1: ReLU activation
+    let h = ad_relu(ad_linear(W_s1, b_s1, frame))
+    // Layer 2: linear output + residual
+    let out_raw = ad_linear(W_s2, b_s2, h)
+    let D = len(frame)
+    let mut out = ad_zeros(D)
+    for d in 0..D {
+        out[d] = frame[d] + out_raw[d]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Forward pass
+//  frames: [n_frames][D] -> output: [n_frames][D]
+//
+//  For each spatial block:
+//    1. Apply spatial block to each frame independently (frozen)
+//    2. Apply motion module across frames (trainable)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_forward(model, frames) {
+    let n_frames = len(frames)
+    let D = model["D_model"]
+
+    let mut current = ad_zeros2d(n_frames, D)
+    for t in 0..n_frames {
+        for d in 0..D { current[t][d] = frames[t][d] }
+    }
+
+    // Pass through 2 blocks: spatial (frozen) + motion module (trainable)
+    for blk in 0..2 {
+        // Spatial block: per-frame
+        let mut spatial_out = ad_zeros2d(n_frames, D)
+        for t in 0..n_frames {
+            spatial_out[t] = ad_spatial_block(model, current[t], blk)
+        }
+        // Motion module: across frames
+        current = ad_motion_module(model, spatial_out, blk)
+    }
+
+    return current
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Noise schedule helper: simple linear schedule
+//  t in [0, 1] -> alpha_bar (cumulative noise level)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_alpha_bar(t) {
+    // Linear schedule: alpha_bar goes from 1.0 (clean) to ~0.0 (noisy)
+    let beta_start = 0.0001
+    let beta_end = 0.02
+    let beta_t = beta_start + t * (beta_end - beta_start)
+    return 1.0 - beta_t
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Loss: MSE between predicted noise and actual noise
+//  Simplified diffusion training objective:
+//    L = ||model(noisy_video, t) - noise||^2
+//
+//  clean_video: [n_frames][D]   original clean frames
+//  noisy_video: [n_frames][D]   noisy input (clean + noise)
+//  t: float in [0,1]            diffusion timestep
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ad_loss(model, clean_video, noisy_video, t) {
+    let n_frames = len(clean_video)
+    let D = model["D_model"]
+
+    // Forward pass on noisy input
+    let predicted = ad_forward(model, noisy_video)
+
+    // Compute actual noise = noisy - alpha_bar * clean
+    let ab = ad_alpha_bar(t)
+
+    // MSE loss between predicted output and noise target
+    let mut mse = 0.0
+    let mut count = 0
+    for f in 0..n_frames {
+        for d in 0..D {
+            let noise = noisy_video[f][d] - ab * clean_video[f][d]
+            let diff = predicted[f][d] - noise
+            mse = mse + diff * diff
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return mse / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Helper: clone a 2D matrix
+// ═══════════════════════════════════════════════════════════════
+fn ad_clone_mat(M) {
+    let rows = len(M)
+    let cols = len(M[0])
+    let mut C = ad_zeros2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols { C[i][j] = M[i][j] }
+    }
+    return C
+}
+
+fn ad_clone_vec(vec) {
+    let n = len(vec)
+    let mut c = ad_zeros(n)
+    for i in 0..n { c[i] = vec[i] }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Helper: build a perturbed model (fresh dict, no mutation)
+//  Replaces motion_modules[blk][param_name][ri][ci] with val
+// ═══════════════════════════════════════════════════════════════
+fn ad_perturb_mat(model, blk, pname, ri, ci, val) {
+    let mut new_mms = []
+    for b in 0..2 {
+        if b == blk {
+            let mm = model["motion_modules"][b]
+            let mut new_W = ad_clone_mat(mm[pname])
+            new_W[ri][ci] = val
+            new_mms = new_mms + [#{
+                "W_Q": if pname == "W_Q" { new_W } else { mm["W_Q"] },
+                "W_K": if pname == "W_K" { new_W } else { mm["W_K"] },
+                "W_V": if pname == "W_V" { new_W } else { mm["W_V"] },
+                "W_O": if pname == "W_O" { new_W } else { mm["W_O"] },
+                "b_Q": mm["b_Q"], "b_K": mm["b_K"],
+                "b_V": mm["b_V"], "b_O": mm["b_O"],
+                "W_ff1": if pname == "W_ff1" { new_W } else { mm["W_ff1"] },
+                "b_ff1": mm["b_ff1"],
+                "W_ff2": if pname == "W_ff2" { new_W } else { mm["W_ff2"] },
+                "b_ff2": mm["b_ff2"]
+            }]
+        } else {
+            new_mms = new_mms + [model["motion_modules"][b]]
+        }
+    }
+    return #{
+        "D_model": model["D_model"], "n_frames": model["n_frames"],
+        "n_heads": model["n_heads"], "D_ff": model["D_ff"],
+        "spatial_blocks": model["spatial_blocks"],
+        "motion_modules": new_mms, "pe": model["pe"]
+    }
+}
+
+fn ad_perturb_vec(model, blk, pname, idx, val) {
+    let mut new_mms = []
+    for b in 0..2 {
+        if b == blk {
+            let mm = model["motion_modules"][b]
+            let mut new_v = ad_clone_vec(mm[pname])
+            new_v[idx] = val
+            new_mms = new_mms + [#{
+                "W_Q": mm["W_Q"], "W_K": mm["W_K"],
+                "W_V": mm["W_V"], "W_O": mm["W_O"],
+                "b_Q": if pname == "b_Q" { new_v } else { mm["b_Q"] },
+                "b_K": if pname == "b_K" { new_v } else { mm["b_K"] },
+                "b_V": if pname == "b_V" { new_v } else { mm["b_V"] },
+                "b_O": if pname == "b_O" { new_v } else { mm["b_O"] },
+                "W_ff1": mm["W_ff1"],
+                "b_ff1": if pname == "b_ff1" { new_v } else { mm["b_ff1"] },
+                "W_ff2": mm["W_ff2"],
+                "b_ff2": if pname == "b_ff2" { new_v } else { mm["b_ff2"] }
+            }]
+        } else {
+            new_mms = new_mms + [model["motion_modules"][b]]
+        }
+    }
+    return #{
+        "D_model": model["D_model"], "n_frames": model["n_frames"],
+        "n_heads": model["n_heads"], "D_ff": model["D_ff"],
+        "spatial_blocks": model["spatial_blocks"],
+        "motion_modules": new_mms, "pe": model["pe"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Batch loss helper
+// ═══════════════════════════════════════════════════════════════
+fn ad_batch_loss(mdl, video_batch, ts) {
+    let nv = len(video_batch)
+    let mut total = 0.0
+    for vi in 0..nv {
+        total = total + ad_loss(mdl, video_batch[vi]["clean"], video_batch[vi]["noisy"], ts)
+    }
+    return total / to_float(nv)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Numerical gradient for a matrix parameter
+// ═══════════════════════════════════════════════════════════════
+fn ad_grad_mat(model, blk, pname, rows, cols, video_batch, ts, ep) {
+    let mut grad = ad_zeros2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            let orig = model["motion_modules"][blk][pname][i][j]
+            let m_plus = ad_perturb_mat(model, blk, pname, i, j, orig + ep)
+            let m_minus = ad_perturb_mat(model, blk, pname, i, j, orig - ep)
+            let lp = ad_batch_loss(m_plus, video_batch, ts)
+            let lm = ad_batch_loss(m_minus, video_batch, ts)
+            grad[i][j] = (lp - lm) / (2.0 * ep)
+        }
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Numerical gradient for a vector parameter
+// ═══════════════════════════════════════════════════════════════
+fn ad_grad_vec(model, blk, pname, dim, video_batch, ts, ep) {
+    let mut grad = ad_zeros(dim)
+    for j in 0..dim {
+        let orig = model["motion_modules"][blk][pname][j]
+        let m_plus = ad_perturb_vec(model, blk, pname, j, orig + ep)
+        let m_minus = ad_perturb_vec(model, blk, pname, j, orig - ep)
+        let lp = ad_batch_loss(m_plus, video_batch, ts)
+        let lm = ad_batch_loss(m_minus, video_batch, ts)
+        grad[j] = (lp - lm) / (2.0 * ep)
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Training Step — only motion module parameters are updated
+//
+//  Numerical gradient via fresh-model perturbation (no dict mutation).
+//  Spatial blocks remain frozen.
+//  NOTE: @hot removed — known JIT dict-mutation bug (see MEMORY).
+// ═══════════════════════════════════════════════════════════════
+fn ad_train_step(model, video_batch, lr) {
+    let D = model["D_model"]
+    let D_ff = model["D_ff"]
+    let ep = 0.001
+    let ts = 0.5
+
+    let mut out_mms = []
+    for blk in 0..2 {
+        let mm = model["motion_modules"][blk]
+
+        // Gradients for weight matrices
+        let gW_Q = ad_grad_mat(model, blk, "W_Q", D, D, video_batch, ts, ep)
+        let gW_K = ad_grad_mat(model, blk, "W_K", D, D, video_batch, ts, ep)
+        let gW_V = ad_grad_mat(model, blk, "W_V", D, D, video_batch, ts, ep)
+        let gW_O = ad_grad_mat(model, blk, "W_O", D, D, video_batch, ts, ep)
+        let gW_ff1 = ad_grad_mat(model, blk, "W_ff1", D, D_ff, video_batch, ts, ep)
+        let gW_ff2 = ad_grad_mat(model, blk, "W_ff2", D_ff, D, video_batch, ts, ep)
+
+        // Gradients for bias vectors
+        let gb_Q = ad_grad_vec(model, blk, "b_Q", D, video_batch, ts, ep)
+        let gb_K = ad_grad_vec(model, blk, "b_K", D, video_batch, ts, ep)
+        let gb_V = ad_grad_vec(model, blk, "b_V", D, video_batch, ts, ep)
+        let gb_O = ad_grad_vec(model, blk, "b_O", D, video_batch, ts, ep)
+        let gb_ff1 = ad_grad_vec(model, blk, "b_ff1", D_ff, video_batch, ts, ep)
+        let gb_ff2 = ad_grad_vec(model, blk, "b_ff2", D, video_batch, ts, ep)
+
+        // Apply gradient descent: w_new = w - lr * grad
+        let mut uW_Q = ad_zeros2d(D, D)
+        let mut uW_K = ad_zeros2d(D, D)
+        let mut uW_V = ad_zeros2d(D, D)
+        let mut uW_O = ad_zeros2d(D, D)
+        for i in 0..D {
+            for j in 0..D {
+                uW_Q[i][j] = mm["W_Q"][i][j] - lr * gW_Q[i][j]
+                uW_K[i][j] = mm["W_K"][i][j] - lr * gW_K[i][j]
+                uW_V[i][j] = mm["W_V"][i][j] - lr * gW_V[i][j]
+                uW_O[i][j] = mm["W_O"][i][j] - lr * gW_O[i][j]
+            }
+        }
+
+        let mut uW_ff1 = ad_zeros2d(D, D_ff)
+        for i in 0..D {
+            for j in 0..D_ff {
+                uW_ff1[i][j] = mm["W_ff1"][i][j] - lr * gW_ff1[i][j]
+            }
+        }
+
+        let mut uW_ff2 = ad_zeros2d(D_ff, D)
+        for i in 0..D_ff {
+            for j in 0..D {
+                uW_ff2[i][j] = mm["W_ff2"][i][j] - lr * gW_ff2[i][j]
+            }
+        }
+
+        let mut ub_Q = ad_zeros(D)
+        let mut ub_K = ad_zeros(D)
+        let mut ub_V = ad_zeros(D)
+        let mut ub_O = ad_zeros(D)
+        let mut ub_ff2 = ad_zeros(D)
+        for j in 0..D {
+            ub_Q[j] = mm["b_Q"][j] - lr * gb_Q[j]
+            ub_K[j] = mm["b_K"][j] - lr * gb_K[j]
+            ub_V[j] = mm["b_V"][j] - lr * gb_V[j]
+            ub_O[j] = mm["b_O"][j] - lr * gb_O[j]
+            ub_ff2[j] = mm["b_ff2"][j] - lr * gb_ff2[j]
+        }
+
+        let mut ub_ff1 = ad_zeros(D_ff)
+        for j in 0..D_ff {
+            ub_ff1[j] = mm["b_ff1"][j] - lr * gb_ff1[j]
+        }
+
+        out_mms = out_mms + [#{
+            "W_Q": uW_Q, "W_K": uW_K, "W_V": uW_V, "W_O": uW_O,
+            "b_Q": ub_Q, "b_K": ub_K, "b_V": ub_V, "b_O": ub_O,
+            "W_ff1": uW_ff1, "b_ff1": ub_ff1,
+            "W_ff2": uW_ff2, "b_ff2": ub_ff2
+        }]
+    }
+
+    return #{
+        "D_model": model["D_model"],
+        "n_frames": model["n_frames"],
+        "n_heads": model["n_heads"],
+        "D_ff": model["D_ff"],
+        "spatial_blocks": model["spatial_blocks"],
+        "motion_modules": out_mms,
+        "pe": model["pe"]
+    }
+}

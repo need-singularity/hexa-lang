@@ -242,7 +242,7 @@ hexa" 를 증명했다면, 이번 T2 돌파는 "LLM 스케일 학습도 src/ 무
   보여주듯 큰 모델일수록 이득이 선형 이상으로 증가. LoRA + low-rank
   attention 결합으로 바로 채택 가능.
 
-핸드오프 파일 `~/Dev/nexus/shared/hexa_to_anima_20260410.json` 에 5 개
+핸드오프 파일 `$NEXUS/shared/hexa_to_anima_20260410.json` 에 5 개
 actionable finding + code_ref 로 정리됨.
 
 ## 6. 알려진 한계 + 다음 단계
@@ -305,18 +305,18 @@ T2 핵심 4 커밋 (anima 핸드오프 명시):
 
 | 경로 | 설명 |
 |---|---|
-| `/Users/ghost/Dev/hexa-lang/docs/superpowers/specs/2026-04-09-cpu-ai-native-physical-limits-design.md` | 원 설계 문서 (T1/T2 루프 규정) |
-| `/Users/ghost/Dev/hexa-lang/docs/plans/roadmap.md` | Phase 3 T2 진행 기록 |
-| `/Users/ghost/Dev/hexa-lang/self/ml/train_100m.hexa` | v2 최종 학습 루프 (249 줄) |
-| `/Users/ghost/Dev/hexa-lang/self/ml/train_100m_batched.hexa` | BATCH=4 실험 (batch 확장 한계 기록) |
-| `/Users/ghost/Dev/hexa-lang/self/ml/lowrank_mm.hexa` | @lowrank 코어 (137 줄) |
-| `/Users/ghost/Dev/hexa-lang/self/ml/matmul_fused.hexa` | @matmul_fused relu/silu/gelu (113 줄) |
-| `/Users/ghost/Dev/hexa-lang/self/ml/memoize_grad.hexa` | @memoize_grad (102 줄) |
-| `/Users/ghost/Dev/hexa-lang/self/lowrank_sweep.hexa` | 정사각 rank 스위프 (r=8~256) |
-| `/Users/ghost/Dev/hexa-lang/self/lowrank_rect_sweep.hexa` | 직사각 shape 스위프 (7B 최적값 테이블) |
-| `/Users/ghost/Dev/nexus/shared/growth_bus.jsonl` | 돌파 타임라인 (2026-04-09 ~ 04-10) |
-| `/Users/ghost/Dev/nexus/shared/hexa_to_anima_20260410.json` | anima 핸드오프 (5 findings) |
-| `/Users/ghost/Dev/hexa-lang/shared/bench/zeta_compare.jsonl` | bench harness 실측 로그 |
+| `$HEXA_LANG/docs/superpowers/specs/2026-04-09-cpu-ai-native-physical-limits-design.md` | 원 설계 문서 (T1/T2 루프 규정) |
+| `$HEXA_LANG/docs/plans/roadmap.md` | Phase 3 T2 진행 기록 |
+| `$HEXA_LANG/self/ml/train_100m.hexa` | v2 최종 학습 루프 (249 줄) |
+| `$HEXA_LANG/self/ml/train_100m_batched.hexa` | BATCH=4 실험 (batch 확장 한계 기록) |
+| `$HEXA_LANG/self/ml/lowrank_mm.hexa` | @lowrank 코어 (137 줄) |
+| `$HEXA_LANG/self/ml/matmul_fused.hexa` | @matmul_fused relu/silu/gelu (113 줄) |
+| `$HEXA_LANG/self/ml/memoize_grad.hexa` | @memoize_grad (102 줄) |
+| `$HEXA_LANG/self/lowrank_sweep.hexa` | 정사각 rank 스위프 (r=8~256) |
+| `$HEXA_LANG/self/lowrank_rect_sweep.hexa` | 직사각 shape 스위프 (7B 최적값 테이블) |
+| `$NEXUS/shared/growth_bus.jsonl` | 돌파 타임라인 (2026-04-09 ~ 04-10) |
+| `$NEXUS/shared/hexa_to_anima_20260410.json` | anima 핸드오프 (5 findings) |
+| `$HEXA_LANG/shared/bench/zeta_compare.jsonl` | bench harness 실측 로그 |
 
 ### 7.3 growth_bus 돌파 엔트리 (요약)
 

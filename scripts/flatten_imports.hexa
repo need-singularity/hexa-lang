@@ -52,6 +52,16 @@ fn fl_contains(list, needle) {
     return false
 }
 
+fn fl_list_index_of(list, needle) {
+    let n = len(list)
+    let mut i = 0
+    while i < n {
+        if list[i] == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
 // ── `use "name"` 파싱 (한 줄) ───────────────────────────────
 //
 // 빠른 경로: line.trim().starts_with("use \"") 인지 본다.
@@ -106,6 +116,167 @@ fn fl_collect_uses(src) {
         i = i + 1
     }
     return deps
+}
+
+// ── 식별자 헬퍼 ─────────────────────────────────────────────
+//
+// Why: flatten-concat 시 여러 파일에 동명 top-level fn/struct/enum 이 있으면
+// C 레벨 redefinition 으로 링크 실패한다 (B14). 이를 해결하기 위해
+// "collided non-pub 심볼" 만 파일베이스 prefix 로 mangle 한다.
+//
+// 전략: pub 표시 없는 top-level decl 을 스캔 → count>1 이면 collided.
+// collided 심볼만 각 파일 body 안에서 word-boundary replace 로
+// `<filebase>__<name>` 로 rename. pub 또는 충돌 없는 심볼은 그대로.
+
+fn fl_is_ident_char(c) {
+    // 단일 char str → ord() 로 ASCII 범위 체크. hexa 의 `>=`/`<=` 는 str 에
+    // 대해 void 반환하므로 string 비교로 분류 불가.
+    if len(c) == 0 { return false }
+    let o = ord(c)
+    if o >= 97 && o <= 122 { return true }  // a-z
+    if o >= 65 && o <= 90  { return true }  // A-Z
+    if o >= 48 && o <= 57  { return true }  // 0-9
+    if o == 95 { return true }              // _
+    return false
+}
+
+fn fl_read_ident(s, start) {
+    let n = len(s)
+    let mut i = start
+    let mut out = ""
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if !fl_is_ident_char(c) { return out }
+        out = out + c
+        i = i + 1
+    }
+    return out
+}
+
+fn fl_file_base(path) {
+    let base = fl_basename(path)
+    if base.ends_with(".hexa") {
+        return base.substring(0, len(base) - 5)
+    }
+    return base
+}
+
+// mangle prefix. 첫 글자를 대문자화한다 — hexa 파서가 `return <lowercase-ident> {` 를
+// struct-literal 이 아닌 일반 표현식 + 블록으로 해석해 실패하는 quirk 를 우회.
+//
+// interpreter 에 from_char_code 가 없으므로 정적 테이블 인덱싱으로 대문자화.
+fn fl_mangle_prefix(path) {
+    let UP = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let base = fl_file_base(path)
+    let n = len(base)
+    if n == 0 { return "M" }
+    let first = base.substring(0, 1)
+    let rest = base.substring(1, n)
+    let o = ord(first)
+    let mut upper = first
+    if o >= 97 && o <= 122 {
+        let idx = o - 97
+        upper = UP.substring(idx, idx + 1)
+    }
+    return upper + rest
+}
+
+// top-level non-pub decl 이름 수집
+fn fl_scan_private_decls(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut names = []
+    let mut i = 0
+    while i < n {
+        let raw = lines[i]
+        // top-level = 첫 컬럼에서 시작 (공백/탭 들여쓰기 없음)
+        let indent_ok = !raw.starts_with(" ") && !raw.starts_with("\t")
+        if indent_ok {
+            let t = raw.trim()
+            let skip = t.starts_with("//") || t.starts_with("pub ")
+            if !skip {
+                let mut rest = ""
+                if t.starts_with("fn ") {
+                    rest = t.substring(3, len(t))
+                } else if t.starts_with("struct ") {
+                    rest = t.substring(7, len(t))
+                } else if t.starts_with("enum ") {
+                    rest = t.substring(5, len(t))
+                }
+                if rest != "" {
+                    let trimmed = rest.trim()
+                    let name = fl_read_ident(trimmed, 0)
+                    if name != "" {
+                        names = names.push(name)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+// string/line-comment 를 건드리지 않는 word-boundary replace
+fn fl_word_replace(src, oldname, newname) {
+    let n = len(src)
+    let L = len(oldname)
+    if L == 0 { return src }
+    let mut out = ""
+    let mut i = 0
+    let mut in_string = false
+    let mut in_line_comment = false
+    while i < n {
+        let c = src.substring(i, i + 1)
+        if in_line_comment {
+            out = out + c
+            if c == "\n" { in_line_comment = false }
+            i = i + 1
+        } else if in_string {
+            if c == "\\" && i + 1 < n {
+                out = out + src.substring(i, i + 2)
+                i = i + 2
+            } else {
+                if c == "\"" { in_string = false }
+                out = out + c
+                i = i + 1
+            }
+        } else {
+            if c == "\"" {
+                in_string = true
+                out = out + c
+                i = i + 1
+            } else if c == "/" && i + 1 < n && src.substring(i + 1, i + 2) == "/" {
+                in_line_comment = true
+                out = out + "//"
+                i = i + 2
+            } else {
+                let mut matched = false
+                if i + L <= n {
+                    if src.substring(i, i + L) == oldname {
+                        let mut left_ok = true
+                        if i > 0 {
+                            left_ok = !fl_is_ident_char(src.substring(i - 1, i))
+                        }
+                        let mut right_ok = true
+                        if (i + L) < n {
+                            right_ok = !fl_is_ident_char(src.substring(i + L, i + L + 1))
+                        }
+                        if left_ok && right_ok {
+                            out = out + newname
+                            i = i + L
+                            matched = true
+                        }
+                    }
+                }
+                if !matched {
+                    out = out + c
+                    i = i + 1
+                }
+            }
+        }
+    }
+    return out
 }
 
 // ── 재귀 walk: 토포 정렬 (leaves first) ─────────────────────
@@ -174,23 +345,145 @@ if !file_exists(target) {
 g_base_dir = fl_dirname(target)
 fl_walk(target)
 
+// HEXA ARRAY ALIASING WORKAROUND: g_order is a host-array TAG_ARRAY that
+// the interpreter stores in array_store by index. Pushing to g_bodies /
+// g_decls inside a loop that reads g_order can clobber g_order's slot via
+// host-array reuse, dropping its len from 2 to 0 mid-iteration. snap_order
+// is a fresh local that survives the pushes — see also airgenome / VM
+// `@hot var aliasing JIT` known issue (memory: feedback_hot_attr_dict_mutation).
+let mut snap_order = []
+let mut snap_i = 0
+while snap_i < len(g_order) {
+    snap_order = snap_order.push(g_order[snap_i])
+    snap_i = snap_i + 1
+}
+
+// ── 1차 패스: 전 파일의 non-pub top-level decl 수집 + 카운트 ──
+//
+// 동일 이름이 2+ 파일에 있으면 "collided" — mangle 대상.
+// 한 파일에만 있거나 pub 이면 그대로 둔다 (기존 cross-file use 호환).
+
+let m = len(g_order)
+let mut g_bodies = []  // 각 파일 원본 body (사전 로드)
+let mut g_decls  = []  // 각 파일 non-pub decl 이름 리스트 (병렬 배열)
+let mut all_names   = []
+let mut all_counts  = []
+
+// HEXA ARRAY ALIASING WORKAROUND: reading g_order[i] inside a loop that
+// also pushes to g_bodies / g_decls clobbers g_order's array_store slot in
+// the host interpreter. snap_order is a private copy that survives the
+// pushes. Without this the loop crashes with "index 1 out of bounds (len 0)"
+// on iteration 1 because g_order's len gets reset to 0 by the prior push.
+let mut i = 0
+while i < m {
+    let f = snap_order[i]
+    let body = read_file(f)
+    g_bodies = g_bodies.push(body)
+    let decls = fl_scan_private_decls(body)
+    g_decls = g_decls.push(decls)
+    let dn = len(decls)
+    let mut j = 0
+    while j < dn {
+        let nm = decls[j]
+        let idx = fl_list_index_of(all_names, nm)
+        if idx < 0 {
+            all_names = all_names.push(nm)
+            all_counts = all_counts.push(1)
+        } else {
+            // 병렬 배열 in-place 증가가 안전한지 모르므로 재구성
+            let mut new_counts = []
+            let cn = len(all_counts)
+            let mut k = 0
+            while k < cn {
+                if k == idx {
+                    new_counts = new_counts.push(all_counts[k] + 1)
+                } else {
+                    new_counts = new_counts.push(all_counts[k])
+                }
+                k = k + 1
+            }
+            all_counts = new_counts
+        }
+        j = j + 1
+    }
+    i = i + 1
+}
+
+// collided 이름 집합 (count > 1)
+let mut collided = []
+let cn2 = len(all_names)
+let mut ci = 0
+while ci < cn2 {
+    if all_counts[ci] > 1 {
+        collided = collided.push(all_names[ci])
+    }
+    ci = ci + 1
+}
+
+if len(collided) > 0 {
+    println("[flatten_imports] collided non-pub decls mangled: " + collided.join(", "))
+}
+
+// ── 2차 패스: 파일별 mangle + strip_uses + emit ─────────────
+//
+// EMIT ORDER FIX (stage0 rebuild regression unblock):
+//   g_order is leaves-first (DFS post-order). For the C backend that means
+//   `runtime_core.hexa` is concatenated BEFORE `hexa_full.hexa`. The current
+//   hexa_v2 binary does NOT emit forward declarations for struct
+//   constructors (`HexaVal Val(...)` etc.), so any leaf file that uses
+//   `Val { ... }` struct literals before the struct's definition triggers
+//   `error: call to undeclared function 'Val'` and `conflicting types`.
+//
+//   Function call cross-references are unaffected because hexa_v2 DOES
+//   emit `HexaVal name(...);` forward decls at the top of the C file, so
+//   reversing the order is safe for fn-call edges (hexa_full → runtime_core)
+//   while fixing the struct edge (runtime_core → hexa_full's `struct Val`).
+//
+//   We emit in REVERSE topological order: the entry file (target) first,
+//   leaves (deps) last. This keeps struct definitions visible to dependents
+//   without touching codegen_c2 / hexa_v2.
+
 let mut buf = []
 buf = buf.push("// === FLATTENED by scripts/flatten_imports.hexa ===")
 buf = buf.push("// target: " + target)
 buf = buf.push("// files:  " + str(len(g_order)))
+buf = buf.push("// order:  reverse-topo (root-first, leaves-last) — see emit-order note above")
+if len(collided) > 0 {
+    buf = buf.push("// mangled: " + collided.join(", "))
+}
 buf = buf.push("")
 
-let m = len(g_order)
-let mut i = 0
-while i < m {
-    let f = g_order[i]
-    let body = read_file(f)
-    let stripped = fl_strip_uses(body)
+// Forward-index iteration with mapped lookup: idx = (m - 1 - i2) gives
+// reverse-topo order (root first) using only forward iteration. Use
+// snap_order instead of g_order for the same array-aliasing workaround
+// described in pass 1.
+let mut i2 = 0
+while i2 < m {
+    let idx = m - 1 - i2
+    let f = snap_order[idx]
+    let body = g_bodies[idx]
+    let decls = g_decls[idx]
+    let prefix = fl_mangle_prefix(f)
+
+    // 이 파일의 decl 중 collided 인 것만 골라 rename 적용
+    let mut body_mut = body
+    let dn = len(decls)
+    let mut j = 0
+    while j < dn {
+        let nm = decls[j]
+        if fl_contains(collided, nm) {
+            let new_name = prefix + "__" + nm
+            body_mut = fl_word_replace(body_mut, nm, new_name)
+        }
+        j = j + 1
+    }
+
+    let stripped = fl_strip_uses(body_mut)
     buf = buf.push("")
     buf = buf.push("// ----- BEGIN " + fl_basename(f) + " -----")
     buf = buf.push(stripped)
     buf = buf.push("// ----- END " + fl_basename(f) + " -----")
-    i = i + 1
+    i2 = i2 + 1
 }
 
 let flat = buf.join("\n")

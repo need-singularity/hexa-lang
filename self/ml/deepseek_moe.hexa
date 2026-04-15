@@ -1,0 +1,717 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/deepseek_moe.hexa — DeepSeek-V2 MoE (#298)
+//
+//  DeepSeek-V2 (Dai et al., 2024) — Mixture of Experts with
+//  shared experts + fine-grained top-K routing.
+//
+//  Unlike standard MoE (top-2 of N), DeepSeek-V2 uses:
+//    - N_shared "always-on" shared experts
+//    - N_routed fine-grained routed experts
+//    - Top-K gating selects K of the N_routed experts per token
+//
+//  Router:
+//      g = softmax(W_gate * x)          N_routed scores
+//      topK = argtopK(g, K)             select K experts
+//
+//  Forward:
+//      h = sum_{s=0..N_shared-1} E_shared_s(x)
+//        + sum_{i in topK} g_i * E_i(x)
+//
+//  Each expert E_i: x -> ReLU(W1_i * x + b1_i) -> W2_i * h_i + b2_i
+//
+//  Load balancing loss (auxiliary):
+//      L_bal = N_routed * sum_i f_i * P_i
+//      f_i = fraction of tokens routed to expert i
+//      P_i = mean gate probability for expert i
+//
+//  API:
+//    dsmoe_init(D_in, D_hidden, n_experts, n_shared, top_k, seed) -> model
+//    dsmoe_route(model, x) -> [gate_values, selected_indices]
+//    dsmoe_expert_forward(model, expert_id, x) -> output
+//    dsmoe_shared_forward(model, x) -> output
+//    dsmoe_forward(model, x) -> output (combined)
+//    dsmoe_balance_loss(model, gate_history) -> float
+//    dsmoe_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / routing / loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn dsmoe_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn dsmoe_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn dsmoe_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn dsmoe_relu(v) { if v > 0.0 { return v } return 0.0 }
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn dsmoe_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dsmoe_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn dsmoe_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn dsmoe_uniform(state) {
+    let s = dsmoe_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Softmax over a vector ─────────────────────────────────────────
+
+@pure
+fn dsmoe_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut out = dsmoe_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = dsmoe_exp(logits[i] - mx)
+        out[i] = e
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / total }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Init model
+//
+//  Each expert (shared or routed) is a 2-layer FFN:
+//    W1: D_hidden x D_in,  b1: D_hidden
+//    W2: D_in x D_hidden,  b2: D_in       (output same dim as input)
+//
+//  Gate: W_gate: n_experts x D_in
+// ═══════════════════════════════════════════════════════════════════
+
+fn dsmoe_init_expert(D_in, D_hidden, state) {
+    let mut s = state
+    let mut W1 = dsmoe_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = dsmoe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W1[i][j] = u[0] - 0.5
+        }
+    }
+    let b1 = dsmoe_zeros(D_hidden)
+    let mut W2 = dsmoe_zeros_2d(D_in, D_hidden)
+    for i in 0..D_in {
+        for j in 0..D_hidden {
+            let u = dsmoe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W2[i][j] = u[0] - 0.5
+        }
+    }
+    let b2 = dsmoe_zeros(D_in)
+    return [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}, s]
+}
+
+fn dsmoe_init(D_in, D_hidden, n_experts, n_shared, top_k, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+
+    // Init shared experts
+    let mut shared_experts = []
+    for _e in 0..n_shared {
+        let result = dsmoe_init_expert(D_in, D_hidden, s)
+        shared_experts = shared_experts + [result[0]]
+        s = int(result[1])
+        if s <= 0 { s = 1 }
+    }
+
+    // Init routed experts
+    let mut routed_experts = []
+    for _e in 0..n_experts {
+        let result = dsmoe_init_expert(D_in, D_hidden, s)
+        routed_experts = routed_experts + [result[0]]
+        s = int(result[1])
+        if s <= 0 { s = 1 }
+    }
+
+    // Init gate weights: n_experts x D_in
+    let mut W_gate = dsmoe_zeros_2d(n_experts, D_in)
+    for i in 0..n_experts {
+        for j in 0..D_in {
+            let u = dsmoe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W_gate[i][j] = u[0] - 0.5
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "n_experts": n_experts,
+        "n_shared": n_shared,
+        "top_k": top_k,
+        "shared_experts": shared_experts,
+        "routed_experts": routed_experts,
+        "W_gate": W_gate
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Routing: softmax gating + top-K selection
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_route(model, x) {
+    let W_gate = model["W_gate"]
+    let n_experts = model["n_experts"]
+    let D_in = model["D_in"]
+    let top_k = model["top_k"]
+
+    // Compute gate logits
+    let mut logits = dsmoe_zeros(n_experts)
+    for i in 0..n_experts {
+        let mut s = 0.0
+        for j in 0..D_in { s = s + W_gate[i][j] * x[j] }
+        logits[i] = s
+    }
+
+    // Softmax
+    let gate_vals = dsmoe_softmax(logits)
+
+    // Top-K selection: find K largest indices
+    let mut selected = []
+    let mut used = dsmoe_zeros(n_experts)
+    for _k in 0..top_k {
+        let mut best_idx = -1
+        let mut best_val = -1.0e30
+        for i in 0..n_experts {
+            if int(used[i]) == 0 {
+                if gate_vals[i] > best_val {
+                    best_val = gate_vals[i]
+                    best_idx = i
+                }
+            }
+        }
+        if best_idx >= 0 {
+            selected = selected + [best_idx]
+            used[best_idx] = 1.0
+        }
+    }
+
+    // Collect gate values for selected experts
+    let mut sel_gates = []
+    for i in 0..len(selected) {
+        sel_gates = sel_gates + [gate_vals[selected[i]]]
+    }
+
+    return [sel_gates, selected]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Expert forward: 2-layer FFN with ReLU
+//    h = ReLU(W1 * x + b1)
+//    out = W2 * h + b2
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_expert_forward(model, expert_id, x) {
+    let expert = model["routed_experts"][expert_id]
+    let W1 = expert["W1"]
+    let b1 = expert["b1"]
+    let W2 = expert["W2"]
+    let b2 = expert["b2"]
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+
+    // Hidden layer
+    let mut h = dsmoe_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..D_in { s = s + W1[i][j] * x[j] }
+        h[i] = dsmoe_relu(s)
+    }
+
+    // Output layer
+    let mut out = dsmoe_zeros(D_in)
+    for i in 0..D_in {
+        let mut s = b2[i]
+        for j in 0..D_hidden { s = s + W2[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Shared expert forward: sum of all shared experts
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_shared_forward(model, x) {
+    let n_shared = model["n_shared"]
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let mut out = dsmoe_zeros(D_in)
+
+    for e in 0..n_shared {
+        let expert = model["shared_experts"][e]
+        let W1 = expert["W1"]
+        let b1 = expert["b1"]
+        let W2 = expert["W2"]
+        let b2 = expert["b2"]
+
+        // Hidden
+        let mut h = dsmoe_zeros(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b1[i]
+            for j in 0..D_in { s = s + W1[i][j] * x[j] }
+            h[i] = dsmoe_relu(s)
+        }
+
+        // Output: accumulate
+        for i in 0..D_in {
+            let mut s = b2[i]
+            for j in 0..D_hidden { s = s + W2[i][j] * h[j] }
+            out[i] = out[i] + s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Combined forward:
+//    h = E_shared(x) + sum_{i in topK} g_i * E_i(x)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_forward(model, x) {
+    let D_in = model["D_in"]
+
+    // Shared experts (always active)
+    let mut out = dsmoe_shared_forward(model, x)
+
+    // Routed experts with gating
+    let route = dsmoe_route(model, x)
+    let sel_gates = route[0]
+    let selected = route[1]
+
+    // Normalize gate values for selected experts
+    let mut gate_sum = 0.0
+    for i in 0..len(sel_gates) { gate_sum = gate_sum + sel_gates[i] }
+    if gate_sum <= 0.0 { gate_sum = 1.0 }
+
+    for i in 0..len(selected) {
+        let eid = selected[i]
+        let g = sel_gates[i] / gate_sum
+        let expert_out = dsmoe_expert_forward(model, eid, x)
+        for d in 0..D_in {
+            out[d] = out[d] + g * expert_out[d]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Load balancing loss
+//
+//  gate_history: list of [gate_values_full, selected_indices] per token
+//    L_bal = n_experts * sum_i (f_i * P_i)
+//    f_i = fraction of tokens where expert i was selected
+//    P_i = mean gate probability of expert i across all tokens
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_balance_loss(model, gate_history) {
+    let n_experts = model["n_experts"]
+    let N = len(gate_history)
+    if N == 0 { return 0.0 }
+
+    let mut f = dsmoe_zeros(n_experts)
+    let mut P = dsmoe_zeros(n_experts)
+    let inv_N = 1.0 / to_float(N)
+
+    for t in 0..N {
+        let entry = gate_history[t]
+        let gates = entry[0]
+        let selected = entry[1]
+
+        // Accumulate mean gate prob for each expert
+        for i in 0..n_experts {
+            P[i] = P[i] + gates[i] * inv_N
+        }
+
+        // Count selection frequency
+        for i in 0..len(selected) {
+            let idx = selected[i]
+            f[idx] = f[idx] + inv_N
+        }
+    }
+
+    let mut loss = 0.0
+    for i in 0..n_experts {
+        loss = loss + f[i] * P[i]
+    }
+    return to_float(n_experts) * loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full gate values (for balance loss history collection)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn dsmoe_full_gate(model, x) {
+    let W_gate = model["W_gate"]
+    let n_experts = model["n_experts"]
+    let D_in = model["D_in"]
+
+    let mut logits = dsmoe_zeros(n_experts)
+    for i in 0..n_experts {
+        let mut s = 0.0
+        for j in 0..D_in { s = s + W_gate[i][j] * x[j] }
+        logits[i] = s
+    }
+    return dsmoe_softmax(logits)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step (numerical gradient, MSE loss + balance loss)
+//
+//  For each parameter, compute finite-difference gradient:
+//    dL/dp ~= (L(p+eps) - L(p-eps)) / (2*eps)
+//
+//  Loss = MSE(forward(x), y) + alpha * L_bal
+// ═══════════════════════════════════════════════════════════════════
+
+fn dsmoe_mse_loss(model, X, Y) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let mut total = 0.0
+    for i in 0..N {
+        let out = dsmoe_forward(model, X[i])
+        for d in 0..D_in {
+            let diff = out[d] - Y[i][d]
+            total = total + diff * diff
+        }
+    }
+    return total / to_float(N)
+}
+
+fn dsmoe_compute_loss(model, X, Y, alpha) {
+    let mse = dsmoe_mse_loss(model, X, Y)
+
+    // Collect gate history for balance loss
+    let N = len(X)
+    let mut gate_hist = []
+    for i in 0..N {
+        let full_g = dsmoe_full_gate(model, X[i])
+        let route = dsmoe_route(model, X[i])
+        gate_hist = gate_hist + [[full_g, route[1]]]
+    }
+    let bal = dsmoe_balance_loss(model, gate_hist)
+    return mse + alpha * bal
+}
+
+@hot
+fn dsmoe_train_step(model, X, Y, lr) {
+    let eps = 0.001
+    let alpha = 0.01
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let n_experts = model["n_experts"]
+    let n_shared = model["n_shared"]
+    let top_k = model["top_k"]
+
+    let loss0 = dsmoe_compute_loss(model, X, Y, alpha)
+
+    // ── Update gate weights ──────────────────────────────────
+    let mut W_gate_new = dsmoe_zeros_2d(n_experts, D_in)
+    for i in 0..n_experts {
+        for j in 0..D_in {
+            W_gate_new[i][j] = model["W_gate"][i][j]
+        }
+    }
+    for i in 0..n_experts {
+        for j in 0..D_in {
+            let orig = W_gate_new[i][j]
+            W_gate_new[i][j] = orig + eps
+            let m_plus = #{
+                "D_in": D_in, "D_hidden": D_hidden,
+                "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                "shared_experts": model["shared_experts"],
+                "routed_experts": model["routed_experts"],
+                "W_gate": W_gate_new
+            }
+            let l_plus = dsmoe_compute_loss(m_plus, X, Y, alpha)
+            W_gate_new[i][j] = orig - eps
+            let m_minus = #{
+                "D_in": D_in, "D_hidden": D_hidden,
+                "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                "shared_experts": model["shared_experts"],
+                "routed_experts": model["routed_experts"],
+                "W_gate": W_gate_new
+            }
+            let l_minus = dsmoe_compute_loss(m_minus, X, Y, alpha)
+            let grad = (l_plus - l_minus) / (2.0 * eps)
+            W_gate_new[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── Update routed expert weights ─────────────────────────
+    let mut routed_new = []
+    for e in 0..n_experts {
+        let expert = model["routed_experts"][e]
+        let mut W1 = dsmoe_zeros_2d(D_hidden, D_in)
+        for i in 0..D_hidden {
+            for j in 0..D_in { W1[i][j] = expert["W1"][i][j] }
+        }
+        let mut W2 = dsmoe_zeros_2d(D_in, D_hidden)
+        for i in 0..D_in {
+            for j in 0..D_hidden { W2[i][j] = expert["W2"][i][j] }
+        }
+        let mut b1 = dsmoe_zeros(D_hidden)
+        for i in 0..D_hidden { b1[i] = expert["b1"][i] }
+        let mut b2 = dsmoe_zeros(D_in)
+        for i in 0..D_in { b2[i] = expert["b2"][i] }
+
+        // Gradient for W1
+        for i in 0..D_hidden {
+            for j in 0..D_in {
+                let orig = W1[i][j]
+                W1[i][j] = orig + eps
+                let mut re_tmp = []
+                for ee in 0..n_experts {
+                    if ee == e {
+                        re_tmp = re_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        re_tmp = re_tmp + [model["routed_experts"][ee]]
+                    }
+                }
+                let m_p = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": model["shared_experts"],
+                    "routed_experts": re_tmp, "W_gate": W_gate_new
+                }
+                let lp = dsmoe_compute_loss(m_p, X, Y, alpha)
+                W1[i][j] = orig - eps
+                let mut re_tmp2 = []
+                for ee in 0..n_experts {
+                    if ee == e {
+                        re_tmp2 = re_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        re_tmp2 = re_tmp2 + [model["routed_experts"][ee]]
+                    }
+                }
+                let m_m = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": model["shared_experts"],
+                    "routed_experts": re_tmp2, "W_gate": W_gate_new
+                }
+                let lm = dsmoe_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W1[i][j] = orig - lr * grad
+            }
+        }
+
+        // Gradient for W2
+        for i in 0..D_in {
+            for j in 0..D_hidden {
+                let orig = W2[i][j]
+                W2[i][j] = orig + eps
+                let mut re_tmp = []
+                for ee in 0..n_experts {
+                    if ee == e {
+                        re_tmp = re_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        re_tmp = re_tmp + [model["routed_experts"][ee]]
+                    }
+                }
+                let m_p = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": model["shared_experts"],
+                    "routed_experts": re_tmp, "W_gate": W_gate_new
+                }
+                let lp = dsmoe_compute_loss(m_p, X, Y, alpha)
+                W2[i][j] = orig - eps
+                let mut re_tmp2 = []
+                for ee in 0..n_experts {
+                    if ee == e {
+                        re_tmp2 = re_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        re_tmp2 = re_tmp2 + [model["routed_experts"][ee]]
+                    }
+                }
+                let m_m = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": model["shared_experts"],
+                    "routed_experts": re_tmp2, "W_gate": W_gate_new
+                }
+                let lm = dsmoe_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W2[i][j] = orig - lr * grad
+            }
+        }
+
+        routed_new = routed_new + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+    }
+
+    // ── Update shared expert weights ─────────────────────────
+    let mut shared_new = []
+    for e in 0..n_shared {
+        let expert = model["shared_experts"][e]
+        let mut W1 = dsmoe_zeros_2d(D_hidden, D_in)
+        for i in 0..D_hidden {
+            for j in 0..D_in { W1[i][j] = expert["W1"][i][j] }
+        }
+        let mut W2 = dsmoe_zeros_2d(D_in, D_hidden)
+        for i in 0..D_in {
+            for j in 0..D_hidden { W2[i][j] = expert["W2"][i][j] }
+        }
+        let mut b1 = dsmoe_zeros(D_hidden)
+        for i in 0..D_hidden { b1[i] = expert["b1"][i] }
+        let mut b2 = dsmoe_zeros(D_in)
+        for i in 0..D_in { b2[i] = expert["b2"][i] }
+
+        // Gradient for W1
+        for i in 0..D_hidden {
+            for j in 0..D_in {
+                let orig = W1[i][j]
+                W1[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_p = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": se_tmp,
+                    "routed_experts": routed_new, "W_gate": W_gate_new
+                }
+                let lp = dsmoe_compute_loss(m_p, X, Y, alpha)
+                W1[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_m = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": se_tmp2,
+                    "routed_experts": routed_new, "W_gate": W_gate_new
+                }
+                let lm = dsmoe_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W1[i][j] = orig - lr * grad
+            }
+        }
+
+        // Gradient for W2
+        for i in 0..D_in {
+            for j in 0..D_hidden {
+                let orig = W2[i][j]
+                W2[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_p = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": se_tmp,
+                    "routed_experts": routed_new, "W_gate": W_gate_new
+                }
+                let lp = dsmoe_compute_loss(m_p, X, Y, alpha)
+                W2[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_m = #{
+                    "D_in": D_in, "D_hidden": D_hidden,
+                    "n_experts": n_experts, "n_shared": n_shared, "top_k": top_k,
+                    "shared_experts": se_tmp2,
+                    "routed_experts": routed_new, "W_gate": W_gate_new
+                }
+                let lm = dsmoe_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W2[i][j] = orig - lr * grad
+            }
+        }
+
+        shared_new = shared_new + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "n_experts": n_experts,
+        "n_shared": n_shared,
+        "top_k": top_k,
+        "shared_experts": shared_new,
+        "routed_experts": routed_new,
+        "W_gate": W_gate_new
+    }
+}

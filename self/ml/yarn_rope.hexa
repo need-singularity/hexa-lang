@@ -1,0 +1,482 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/yarn_rope.hexa — YaRN RoPE (#335)
+//
+//  Yet another RoPE extensioN: NTK-aware interpolation + attention
+//  scaling for context-length extension (e.g. 4K -> 64K+).
+//
+//  Implements:
+//    1. Base RoPE frequencies       — theta_i = base^(-2i/dim)
+//    2. NTK-aware base adjustment   — base' = base * alpha^(dim/(dim-2))
+//    3. Wavelength computation      — lambda_i = 2*pi / theta_i
+//    4. Per-dim ramp function       — band classification (high/mid/low freq)
+//    5. YaRN frequency blending     — (1-ramp)*ntk + ramp*base per dim
+//    6. Attention scaling factor    — sqrt(1 + 0.1*ln(s))
+//    7. Temperature length scaling  — sqrt(s) for attention logits
+//    8. cos/sin embedding tables    — position-wise rotation angles
+//    9. Rotary application (q,k)   — pair-wise rotation of vectors
+//   10. Full YaRN pipeline          — init -> freqs -> embed -> apply
+//   11. Dynamic YaRN at runtime     — auto-adjust when seq > trained max
+//   12. Multi-scale comparison      — distortion metric across methods
+//
+//  API (all prefixed `yarn_`):
+//    yarn_base_freqs(dim, base)                          -> [dim/2]
+//    yarn_ntk_base(base, dim, scale)                     -> float
+//    yarn_ntk_freqs(dim, base, scale)                    -> [dim/2]
+//    yarn_wavelength(dim, base, i)                       -> float
+//    yarn_ramp_value(wl, beta_fast, beta_slow, orig_ctx) -> float [0,1]
+//    yarn_blend_freqs(dim, base, scale, beta_fast, beta_slow, orig_ctx) -> [dim/2]
+//    yarn_attn_factor(scale)                             -> float
+//    yarn_length_temp(seq_len, max_trained)              -> float
+//    yarn_cos_sin(pos, freqs)                            -> [dim] interleaved
+//    yarn_rotate(x, cos_sin)                             -> [dim]
+//    yarn_apply_qk(q, k, pos, freqs)                    -> [q_rot, k_rot]
+//    yarn_init(dim, base, orig_ctx, target_ctx, beta_fast, beta_slow) -> config dict
+//    yarn_embed(config, pos)                             -> [dim] cos/sin
+//    yarn_forward(config, q, k, pos)                     -> [q_rot, k_rot]
+//    yarn_dynamic(dim, base, orig_ctx, seq_len, beta_fast, beta_slow) -> config dict
+//    yarn_scale_attn_scores(scores, config)              -> [n] scaled scores
+//    yarn_distortion(method_freqs, base_freqs)           -> float MSE
+//    yarn_compare(dim, base, seq_len, max_trained)       -> dict
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects, deterministic
+//    @hot   — called every forward step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── constants ────────────────────────────────────────────────────
+let YARN_PI = 3.141592653589793
+let YARN_TWO_PI = 6.283185307179586
+
+// ── math helpers ─────────────────────────────────────────────────
+
+@pure
+fn yarn_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn yarn_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn yarn_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn yarn_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn yarn_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Trig wrappers — reduce to [-pi, pi] for numerical stability
+@pure
+fn yarn_cos(x) {
+    let mut v = x
+    while v > YARN_PI { v = v - YARN_TWO_PI }
+    while v < 0.0 - YARN_PI { v = v + YARN_TWO_PI }
+    return cos(v)
+}
+
+@pure
+fn yarn_sin(x) {
+    let mut v = x
+    while v > YARN_PI { v = v - YARN_TWO_PI }
+    while v < 0.0 - YARN_PI { v = v + YARN_TWO_PI }
+    return sin(v)
+}
+
+@pure
+fn yarn_sqrt_f(x) {
+    if x <= 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+@pure
+fn yarn_log_f(x) {
+    if x <= 0.0 { return 0.0 - 20.0 }
+    return log(x)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Base RoPE frequencies
+//
+//  theta_i = 1.0 / (base^(2i/dim))  for i in 0..dim/2
+//  These are the standard rotary position embedding frequencies.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_base_freqs(dim, base) {
+    let half = dim / 2
+    let mut freqs = yarn_zeros(half)
+    for i in 0..half {
+        let exponent = 2.0 * to_float(i) / to_float(dim)
+        freqs[i] = 1.0 / pow(base, exponent)
+    }
+    return freqs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. NTK-aware base adjustment
+//
+//  Scale the base frequency instead of scaling positions:
+//    base' = base * scale^(dim / (dim - 2))
+//  This preserves high-frequency components while extending context.
+//  (bloc97, 2023)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_ntk_base(base, dim, scale) {
+    if scale <= 1.0 { return base }
+    let exponent = to_float(dim) / (to_float(dim) - 2.0)
+    return base * pow(scale, exponent)
+}
+
+// NTK-adjusted frequencies
+@pure
+fn yarn_ntk_freqs(dim, base, scale) {
+    let new_base = yarn_ntk_base(base, dim, scale)
+    return yarn_base_freqs(dim, new_base)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Wavelength computation
+//
+//  wavelength_i = 2*pi / theta_i = 2*pi * base^(2i/dim)
+//  Used to classify dimensions into frequency bands.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_wavelength(dim, base, i) {
+    let exponent = 2.0 * to_float(i) / to_float(dim)
+    let theta = 1.0 / pow(base, exponent)
+    if theta < 1.0e-15 { return 1.0e15 }
+    return YARN_TWO_PI / theta
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Per-dimension ramp function (Peng et al. 2023)
+//
+//  Classifies each dimension into three bands by wavelength:
+//    - High freq (short wavelength): ramp = 1 -> keep original
+//    - Medium freq: linear ramp 0..1 -> blend
+//    - Low freq (long wavelength): ramp = 0 -> full NTK interpolation
+//
+//  Band boundaries:
+//    low  = orig_ctx / beta_fast   (high-freq boundary)
+//    high = orig_ctx / beta_slow   (low-freq boundary)
+//
+//  Default beta_fast=32, beta_slow=1 (from YaRN paper)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_ramp_value(wavelength, beta_fast, beta_slow, orig_ctx) {
+    let low = to_float(orig_ctx) / beta_fast
+    let high = to_float(orig_ctx) / beta_slow
+    if high <= low { return 1.0 }
+    let r = (wavelength - low) / (high - low)
+    if r < 0.0 { return 0.0 }
+    if r > 1.0 { return 1.0 }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. YaRN frequency blending — core algorithm
+//
+//  For each dimension i:
+//    wl = wavelength(i)
+//    ramp = ramp_value(wl)
+//    freq_final = (1 - ramp) * freq_ntk[i] + ramp * freq_base[i]
+//
+//  ramp=1 (high freq): use original base frequencies (no interpolation)
+//  ramp=0 (low freq): use NTK-interpolated frequencies (full scaling)
+//  0 < ramp < 1: linear blend between the two
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_blend_freqs(dim, base, scale, beta_fast, beta_slow, orig_ctx) {
+    let base_f = yarn_base_freqs(dim, base)
+    let ntk_f = yarn_ntk_freqs(dim, base, scale)
+    let half = dim / 2
+    let mut freqs = yarn_zeros(half)
+    for i in 0..half {
+        let wl = yarn_wavelength(dim, base, i)
+        let r = yarn_ramp_value(wl, beta_fast, beta_slow, orig_ctx)
+        // ramp=1 -> base, ramp=0 -> ntk
+        freqs[i] = (1.0 - r) * ntk_f[i] + r * base_f[i]
+    }
+    return freqs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Attention scaling factor
+//
+//  YaRN applies sqrt(1 + 0.1 * ln(scale_factor)) to compensate for
+//  the entropy increase from longer contexts.  This scales the
+//  attention logits to maintain proper softmax distribution.
+//
+//  When scale <= 1 (no extension), factor = 1.0 (no change).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_attn_factor(scale) {
+    if scale <= 1.0 { return 1.0 }
+    return yarn_sqrt_f(1.0 + 0.1 * yarn_log_f(scale))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Temperature-based length scaling
+//
+//  Scale attention logits by sqrt(scale_factor) to compensate for
+//  the increased number of attended positions.
+//
+//  temp = sqrt(seq_len / max_trained) when seq_len > max_trained
+//  Divide attention scores by temp to maintain proper distribution.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_length_temp(seq_len, max_trained) {
+    if seq_len <= max_trained { return 1.0 }
+    let ratio = to_float(seq_len) / to_float(max_trained)
+    return yarn_sqrt_f(ratio)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. cos/sin embedding for a given position
+//
+//  For position p and frequency freqs[i]:
+//    angle = p * freqs[i]
+//    out[2i]   = cos(angle)
+//    out[2i+1] = sin(angle)
+//  Returns interleaved [cos_0, sin_0, cos_1, sin_1, ...] of length dim.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_cos_sin(pos, freqs) {
+    let half = len(freqs)
+    let dim = half * 2
+    let mut out = yarn_zeros(dim)
+    let p = to_float(pos)
+    for i in 0..half {
+        let angle = p * freqs[i]
+        out[2 * i] = yarn_cos(angle)
+        out[2 * i + 1] = yarn_sin(angle)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Rotary application — rotate a vector by cos/sin pairs
+//
+//  For each pair (x[2i], x[2i+1]):
+//    out[2i]   = x[2i] * c - x[2i+1] * s
+//    out[2i+1] = x[2i] * s + x[2i+1] * c
+//
+//  This is the standard RoPE rotation kernel.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn yarn_rotate(x, cos_sin) {
+    let half = len(x) / 2
+    let mut out = yarn_zeros(len(x))
+    for i in 0..half {
+        let c = cos_sin[2 * i]
+        let s = cos_sin[2 * i + 1]
+        let x0 = x[2 * i]
+        let x1 = x[2 * i + 1]
+        out[2 * i] = x0 * c - x1 * s
+        out[2 * i + 1] = x0 * s + x1 * c
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Apply rotation to query and key vectors simultaneously
+//
+//  Computes cos/sin for position, then rotates both q and k.
+//  Returns [q_rot, k_rot].
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn yarn_apply_qk(q, k, pos, freqs) {
+    let cs = yarn_cos_sin(pos, freqs)
+    let q_rot = yarn_rotate(q, cs)
+    let k_rot = yarn_rotate(k, cs)
+    return [q_rot, k_rot]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  11. Full YaRN initialization pipeline
+//
+//  Creates a configuration dict with all precomputed values:
+//    - YaRN-blended frequencies
+//    - Attention scaling factor
+//    - Length temperature
+//    - All hyperparameters
+//
+//  Usage:
+//    config = yarn_init(64, 10000.0, 4096, 65536, 32.0, 1.0)
+//    cs = yarn_embed(config, pos)
+//    q_rot = yarn_rotate(q, cs)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_init(dim, base, orig_ctx, target_ctx, beta_fast, beta_slow) {
+    let scale = to_float(target_ctx) / to_float(orig_ctx)
+    let freqs = yarn_blend_freqs(dim, base, scale, beta_fast, beta_slow, orig_ctx)
+    let attn_factor = yarn_attn_factor(scale)
+    let length_temp = yarn_length_temp(target_ctx, orig_ctx)
+    return #{
+        "freqs": freqs,
+        "dim": dim,
+        "base": base,
+        "orig_ctx": orig_ctx,
+        "target_ctx": target_ctx,
+        "scale": scale,
+        "beta_fast": beta_fast,
+        "beta_slow": beta_slow,
+        "attn_factor": attn_factor,
+        "length_temp": length_temp
+    }
+}
+
+// Compute cos/sin embedding from a config dict
+@pure
+fn yarn_embed(config, pos) {
+    return yarn_cos_sin(pos, config["freqs"])
+}
+
+// Full forward: rotate q,k using config
+@pure @hot
+fn yarn_forward(config, q, k, pos) {
+    let cs = yarn_embed(config, pos)
+    let q_rot = yarn_rotate(q, cs)
+    let k_rot = yarn_rotate(k, cs)
+    return [q_rot, k_rot]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  12. Dynamic YaRN — auto-adjust at runtime
+//
+//  When seq_len <= orig_ctx: use standard RoPE (no extension).
+//  When seq_len > orig_ctx: compute scale and apply YaRN.
+//  Returns a config dict identical in shape to yarn_init output.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_dynamic(dim, base, orig_ctx, seq_len, beta_fast, beta_slow) {
+    if seq_len <= orig_ctx {
+        let freqs = yarn_base_freqs(dim, base)
+        return #{
+            "freqs": freqs,
+            "dim": dim,
+            "base": base,
+            "orig_ctx": orig_ctx,
+            "target_ctx": orig_ctx,
+            "scale": 1.0,
+            "beta_fast": beta_fast,
+            "beta_slow": beta_slow,
+            "attn_factor": 1.0,
+            "length_temp": 1.0
+        }
+    }
+    return yarn_init(dim, base, orig_ctx, seq_len, beta_fast, beta_slow)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  13. Scale attention scores using YaRN factors
+//
+//  Applies both the attention scaling factor and length temperature
+//  from the config to a vector of attention scores.
+//
+//  scaled_score = score / (attn_factor * length_temp)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_scale_attn_scores(scores, config) {
+    let factor = config["attn_factor"] * config["length_temp"]
+    if factor < 1.0e-12 { return scores }
+    let n = len(scores)
+    let mut out = yarn_zeros(n)
+    for i in 0..n {
+        out[i] = scores[i] / factor
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  14. Distortion metric — MSE between frequency vectors
+//
+//  Measures how much a method's frequencies deviate from base RoPE.
+//  Lower distortion = less deviation from original.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_distortion(method_freqs, base_freqs) {
+    let n = len(method_freqs)
+    if n == 0 { return 0.0 }
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = method_freqs[i] - base_freqs[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  15. Compare RoPE methods — base vs linear vs NTK vs YaRN
+//
+//  Returns distortion scores for each method at a given config.
+//  Linear interpolation: freq / scale (simple position scaling)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_compare(dim, base, seq_len, max_trained) {
+    let base_f = yarn_base_freqs(dim, base)
+    let scale = to_float(seq_len) / to_float(max_trained)
+    let alpha = yarn_max_f(scale, 1.0)
+    let half = dim / 2
+
+    // Base (reference) — distortion = 0
+    let d_base = 0.0
+
+    // Linear interpolation — freq / scale
+    let mut linear_f = yarn_zeros(half)
+    for i in 0..half {
+        linear_f[i] = base_f[i] / alpha
+    }
+    let d_linear = yarn_distortion(linear_f, base_f)
+
+    // NTK-aware
+    let ntk_f = yarn_ntk_freqs(dim, base, alpha)
+    let d_ntk = yarn_distortion(ntk_f, base_f)
+
+    // YaRN
+    let yarn_f = yarn_blend_freqs(dim, base, alpha, 32.0, 1.0, max_trained)
+    let d_yarn = yarn_distortion(yarn_f, base_f)
+
+    return #{
+        "base": d_base,
+        "linear": d_linear,
+        "ntk": d_ntk,
+        "yarn": d_yarn
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility: dot product
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn yarn_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// Vector norm
+@pure
+fn yarn_norm(v) {
+    return yarn_sqrt_f(yarn_dot(v, v))
+}
+
+println("[yarn_rope] loaded — YaRN RoPE (#335): NTK-aware + attention scaling + temperature + dynamic + comparison")

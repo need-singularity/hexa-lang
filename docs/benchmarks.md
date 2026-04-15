@@ -8,11 +8,13 @@
 ## 실행
 
 ```bash
-./hexa self/bench_suite.hexa                 # 전체
-./hexa self/bench_suite.hexa --only=loop_1m  # 단일
-./hexa self/bench_suite.hexa --tier=vm       # tier 강제
-./hexa self/bench_suite.hexa | tee bench.jsonl
+./hexa run self/bench_suite.hexa                 # 전체 (stage1 CLI)
+./hexa run self/bench_suite.hexa --only=loop_1m  # 단일 (arg 미전달 한계 주의)
+./hexa run self/bench_suite.hexa --tier=vm       # tier 강제
+./hexa run self/bench_suite.hexa | tee bench.jsonl
 ```
+
+> **참고**: stage1 `run` 서브커맨드는 stage0 인터프리터 위임이며, stage0가 script argv 미전달하는 한계가 있음. `--only=X` 같은 스크립트 인자가 필요하면 당분간 `./build/hexa_stage0 self/bench_suite.hexa --only=X` 직접 호출.
 
 ## 기준 하드웨어
 

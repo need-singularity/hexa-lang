@@ -1,0 +1,544 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/xlstm.hexa — xLSTM (Beck et al., 2024) (#310)
+//
+//  Extended LSTM with two variants:
+//
+//  sLSTM: scalar LSTM with exponential gating
+//    f_t = exp(w_f . x_t + b_f)      (exponential forget gate)
+//    i_t = exp(w_i . x_t + b_i)      (exponential input gate)
+//    c_t = f_t * c_{t-1} + i_t * tanh(w_c . x_t + b_c)
+//    n_t = f_t * n_{t-1} + i_t       (normalizer state)
+//    o_t = sigmoid(w_o . x_t + b_o)  (output gate)
+//    h_t = o_t * c_t / max(|n_t|, 1)
+//
+//  mLSTM: matrix LSTM with matrix memory cell C in R^(d x d)
+//    f_t = exp(w_f . x_t + b_f)
+//    i_t = exp(w_i . x_t + b_i)
+//    v_t = W_v . x_t + b_v           (value projection)
+//    k_t = W_k . x_t + b_k           (key projection)
+//    q_t = W_q . x_t + b_q           (query projection)
+//    C_t = f_t * C_{t-1} + i_t * v_t . k_t^T
+//    n_t = f_t * n_{t-1} + i_t * k_t
+//    h_t = C_t . q_t / max(|n_t^T . q_t|, 1)
+//
+//  API:
+//    xl_init(D_in, D_hidden, D_out, mode, seed) -> model
+//    xl_slstm_cell(model, x, state) -> [output, new_state]
+//    xl_mlstm_cell(model, x, state) -> [output, new_state]
+//    xl_forward_seq(model, xs) -> outputs
+//    xl_loss(model, xs, ys) -> float
+//    xl_train_step(model, X_seqs, Y_seqs, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (cell/forward/loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn xl_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn xl_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn xl_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn xl_tanh(v) {
+    let ep = xl_exp(v)
+    let en = xl_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn xl_sigmoid(v) {
+    return 1.0 / (1.0 + xl_exp(0.0 - v))
+}
+
+fn xl_max(a, b) { if a > b { return a } return b }
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn xl_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn xl_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── RNG ───────────────────────────────────────────────────────────
+
+fn xl_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn xl_uniform(state) {
+    let s = xl_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn xl_rand_mat(rows, cols, state_in) {
+    let mut st = state_in
+    let mut m = xl_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            let u = xl_uniform(st)
+            st = int(u[1])
+            if st <= 0 { st = 1 }
+            m[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    return [m, st]
+}
+
+fn xl_rand_vec(n, state_in) {
+    let mut st = state_in
+    let mut v = xl_zeros(n)
+    for i in 0..n {
+        let u = xl_uniform(st)
+        st = int(u[1])
+        if st <= 0 { st = 1 }
+        v[i] = (u[0] - 0.5) * 0.5
+    }
+    return [v, st]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  xl_init — create xLSTM model
+//
+//  mode = "slstm" or "mlstm"
+//
+//  Shared gate weights: W_f, b_f, W_i, b_i (D_hidden x D_in)
+//  sLSTM extra: W_c, b_c, W_o, b_o (cell input + output gate)
+//  mLSTM extra: W_v, b_v, W_k, b_k, W_q, b_q (value/key/query)
+//  Output projection: W_out, b_out (D_out x D_hidden)
+// ═══════════════════════════════════════════════════════════════════
+fn xl_init(D_in, D_hidden, D_out, mode, seed) {
+    let mut st = seed
+    if st <= 0 { st = 1 }
+
+    // Forget gate
+    let r1 = xl_rand_mat(D_hidden, D_in, st)
+    let W_f = r1[0]
+    st = int(r1[1])
+    let r2 = xl_rand_vec(D_hidden, st)
+    let b_f = r2[0]
+    st = int(r2[1])
+
+    // Input gate
+    let r3 = xl_rand_mat(D_hidden, D_in, st)
+    let W_i = r3[0]
+    st = int(r3[1])
+    let r4 = xl_rand_vec(D_hidden, st)
+    let b_i = r4[0]
+    st = int(r4[1])
+
+    let mut model = #{
+        "mode": mode,
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W_f": W_f,
+        "b_f": b_f,
+        "W_i": W_i,
+        "b_i": b_i
+    }
+
+    if mode == "slstm" {
+        // Cell input
+        let r5 = xl_rand_mat(D_hidden, D_in, st)
+        model["W_c"] = r5[0]
+        st = int(r5[1])
+        let r6 = xl_rand_vec(D_hidden, st)
+        model["b_c"] = r6[0]
+        st = int(r6[1])
+        // Output gate
+        let r7 = xl_rand_mat(D_hidden, D_in, st)
+        model["W_o"] = r7[0]
+        st = int(r7[1])
+        let r8 = xl_rand_vec(D_hidden, st)
+        model["b_o"] = r8[0]
+        st = int(r8[1])
+    }
+
+    if mode == "mlstm" {
+        // Value projection
+        let r5 = xl_rand_mat(D_hidden, D_in, st)
+        model["W_v"] = r5[0]
+        st = int(r5[1])
+        let r6 = xl_rand_vec(D_hidden, st)
+        model["b_v"] = r6[0]
+        st = int(r6[1])
+        // Key projection
+        let r7 = xl_rand_mat(D_hidden, D_in, st)
+        model["W_k"] = r7[0]
+        st = int(r7[1])
+        let r8 = xl_rand_vec(D_hidden, st)
+        model["b_k"] = r8[0]
+        st = int(r8[1])
+        // Query projection
+        let r9 = xl_rand_mat(D_hidden, D_in, st)
+        model["W_q"] = r9[0]
+        st = int(r9[1])
+        let r10 = xl_rand_vec(D_hidden, st)
+        model["b_q"] = r10[0]
+        st = int(r10[1])
+    }
+
+    // Output projection: D_out x D_hidden
+    let ro1 = xl_rand_mat(D_out, D_hidden, st)
+    model["W_out"] = ro1[0]
+    st = int(ro1[1])
+    let ro2 = xl_rand_vec(D_out, st)
+    model["b_out"] = ro2[0]
+
+    return model
+}
+
+// ── Linear helpers ────────────────────────────────────────────────
+
+fn xl_matvec(W, x, b) {
+    let rows = len(W)
+    let cols = len(x)
+    let mut out = xl_zeros(rows)
+    for i in 0..rows {
+        let mut s = b[i]
+        for j in 0..cols { s = s + W[i][j] * x[j] }
+        out[i] = s
+    }
+    return out
+}
+
+fn xl_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sLSTM cell — scalar LSTM with exponential gating
+//
+//  state = #{"c": [float], "n": [float]}
+//  Returns [h_out, new_state]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn xl_slstm_cell(model, x, state) {
+    let D_hidden = model["D_hidden"]
+    let W_f = model["W_f"]
+    let b_f = model["b_f"]
+    let W_i = model["W_i"]
+    let b_i = model["b_i"]
+    let W_c = model["W_c"]
+    let b_c = model["b_c"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let D_out = model["D_out"]
+
+    let c_prev = state["c"]
+    let n_prev = state["n"]
+
+    // Gate pre-activations
+    let f_pre = xl_matvec(W_f, x, b_f)
+    let i_pre = xl_matvec(W_i, x, b_i)
+    let c_in = xl_matvec(W_c, x, b_c)
+    let o_pre = xl_matvec(W_o, x, b_o)
+
+    let mut c_new = xl_zeros(D_hidden)
+    let mut n_new = xl_zeros(D_hidden)
+    let mut h = xl_zeros(D_hidden)
+
+    for j in 0..D_hidden {
+        let f_gate = xl_exp(f_pre[j])
+        let i_gate = xl_exp(i_pre[j])
+        let o_gate = xl_sigmoid(o_pre[j])
+        let z = xl_tanh(c_in[j])
+
+        c_new[j] = f_gate * c_prev[j] + i_gate * z
+        n_new[j] = f_gate * n_prev[j] + i_gate
+        let denom = xl_max(xl_abs(n_new[j]), 1.0)
+        h[j] = o_gate * c_new[j] / denom
+    }
+
+    // Output projection
+    let out = xl_matvec(W_out, h, b_out)
+
+    let new_state = #{"c": c_new, "n": n_new}
+    return [out, new_state]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mLSTM cell — matrix LSTM with matrix memory
+//
+//  state = #{"C": [[float]], "n": [float]}
+//  C is D_hidden x D_hidden matrix memory
+//  Returns [h_out, new_state]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn xl_mlstm_cell(model, x, state) {
+    let D_hidden = model["D_hidden"]
+    let W_f = model["W_f"]
+    let b_f = model["b_f"]
+    let W_i = model["W_i"]
+    let b_i = model["b_i"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let W_k = model["W_k"]
+    let b_k = model["b_k"]
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let D_out = model["D_out"]
+
+    let C_prev = state["C"]
+    let n_prev = state["n"]
+
+    // Scalar gates (use mean of per-dim pre-activations for scalar gate)
+    let f_pre = xl_matvec(W_f, x, b_f)
+    let i_pre = xl_matvec(W_i, x, b_i)
+
+    // Scalar forget/input: take mean then exp for stability
+    let mut f_sum = 0.0
+    let mut i_sum = 0.0
+    for j in 0..D_hidden {
+        f_sum = f_sum + f_pre[j]
+        i_sum = i_sum + i_pre[j]
+    }
+    let f_gate = xl_exp(f_sum / to_float(D_hidden))
+    let i_gate = xl_exp(i_sum / to_float(D_hidden))
+
+    // Value, key, query projections
+    let v = xl_matvec(W_v, x, b_v)
+    let k = xl_matvec(W_k, x, b_k)
+    let q = xl_matvec(W_q, x, b_q)
+
+    // C_t = f_t * C_{t-1} + i_t * v_t . k_t^T
+    let mut C_new = xl_zeros_2d(D_hidden, D_hidden)
+    for i in 0..D_hidden {
+        for j in 0..D_hidden {
+            C_new[i][j] = f_gate * C_prev[i][j] + i_gate * v[i] * k[j]
+        }
+    }
+
+    // n_t = f_t * n_{t-1} + i_t * k_t
+    let mut n_new = xl_zeros(D_hidden)
+    for j in 0..D_hidden {
+        n_new[j] = f_gate * n_prev[j] + i_gate * k[j]
+    }
+
+    // h_t = C_t . q_t / max(|n_t^T . q_t|, 1)
+    let mut Cq = xl_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = 0.0
+        for j in 0..D_hidden { s = s + C_new[i][j] * q[j] }
+        Cq[i] = s
+    }
+    let nq = xl_dot(n_new, q)
+    let denom = xl_max(xl_abs(nq), 1.0)
+    let mut h = xl_zeros(D_hidden)
+    for i in 0..D_hidden {
+        h[i] = Cq[i] / denom
+    }
+
+    // Output projection
+    let out = xl_matvec(W_out, h, b_out)
+
+    let new_state = #{"C": C_new, "n": n_new}
+    return [out, new_state]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initial state constructors
+// ═══════════════════════════════════════════════════════════════════
+fn xl_init_slstm_state(D_hidden) {
+    return #{"c": xl_zeros(D_hidden), "n": xl_zeros(D_hidden)}
+}
+
+fn xl_init_mlstm_state(D_hidden) {
+    return #{"C": xl_zeros_2d(D_hidden, D_hidden), "n": xl_zeros(D_hidden)}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  xl_forward_seq — process a sequence of inputs
+//  Returns list of output vectors
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn xl_forward_seq(model, xs) {
+    let mode = model["mode"]
+    let D_hidden = model["D_hidden"]
+    let T = len(xs)
+
+    let mut state = if mode == "mlstm" {
+        xl_init_mlstm_state(D_hidden)
+    } else {
+        xl_init_slstm_state(D_hidden)
+    }
+
+    let mut outputs = []
+    for t in 0..T {
+        let result = if mode == "mlstm" {
+            xl_mlstm_cell(model, xs[t], state)
+        } else {
+            xl_slstm_cell(model, xs[t], state)
+        }
+        outputs = outputs + [result[0]]
+        state = result[1]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  xl_loss — MSE loss over sequence outputs
+//  xs: list of input vectors  (length T)
+//  ys: list of target vectors (length T)
+//  Returns mean squared error
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn xl_loss(model, xs, ys) {
+    let outputs = xl_forward_seq(model, xs)
+    let T = len(outputs)
+    let D_out = model["D_out"]
+    let mut total = 0.0
+    for t in 0..T {
+        for d in 0..D_out {
+            let diff = outputs[t][d] - ys[t][d]
+            total = total + diff * diff
+        }
+    }
+    return total / to_float(T)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  xl_train_step — numerical gradient descent (one step)
+//
+//  X_seqs: list of sequences [[x1,x2,...], ...]
+//  Y_seqs: list of target sequences [[y1,y2,...], ...]
+//  lr: learning rate
+//
+//  Uses finite difference for each parameter.
+// ═══════════════════════════════════════════════════════════════════
+
+fn xl_avg_loss(model, X_seqs, Y_seqs) {
+    let N = len(X_seqs)
+    let mut total = 0.0
+    for i in 0..N {
+        total = total + xl_loss(model, X_seqs[i], Y_seqs[i])
+    }
+    return total / to_float(N)
+}
+
+fn xl_perturb_mat(model, key, i, j, eps) {
+    let W = model[key]
+    let old = W[i][j]
+    model[key][i][j] = old + eps
+    return old
+}
+
+fn xl_restore_mat(model, key, i, j, old) {
+    model[key][i][j] = old
+}
+
+fn xl_perturb_vec(model, key, i, eps) {
+    let v = model[key]
+    let old = v[i]
+    model[key][i] = old + eps
+    return old
+}
+
+fn xl_restore_vec(model, key, i, old) {
+    model[key][i] = old
+}
+
+fn xl_train_step(model, X_seqs, Y_seqs, lr) {
+    let eps = 1.0e-4
+    let mode = model["mode"]
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+
+    let loss0 = xl_avg_loss(model, X_seqs, Y_seqs)
+
+    // Collect all matrix keys and vector keys to update
+    let mut mat_keys = ["W_f", "W_i", "W_out"]
+    let mut vec_keys = ["b_f", "b_i", "b_out"]
+
+    if mode == "slstm" {
+        mat_keys = mat_keys + ["W_c", "W_o"]
+        vec_keys = vec_keys + ["b_c", "b_o"]
+    }
+    if mode == "mlstm" {
+        mat_keys = mat_keys + ["W_v", "W_k", "W_q"]
+        vec_keys = vec_keys + ["b_v", "b_k", "b_q"]
+    }
+
+    // Gradient for matrix parameters (inline perturb to avoid dict-pass-by-value)
+    let n_mat = len(mat_keys)
+    for ki in 0..n_mat {
+        let key = mat_keys[ki]
+        let rows = len(model[key])
+        let cols = len(model[key][0])
+        for i in 0..rows {
+            for j in 0..cols {
+                let old = model[key][i][j]
+                model[key][i][j] = old + eps
+                let loss1 = xl_avg_loss(model, X_seqs, Y_seqs)
+                model[key][i][j] = old
+                let grad = (loss1 - loss0) / eps
+                model[key][i][j] = old - lr * grad
+            }
+        }
+    }
+
+    // Gradient for vector parameters (inline perturb)
+    let n_vec = len(vec_keys)
+    for ki in 0..n_vec {
+        let key = vec_keys[ki]
+        let n = len(model[key])
+        for i in 0..n {
+            let old = model[key][i]
+            model[key][i] = old + eps
+            let loss1 = xl_avg_loss(model, X_seqs, Y_seqs)
+            model[key][i] = old
+            let grad = (loss1 - loss0) / eps
+            model[key][i] = old - lr * grad
+        }
+    }
+
+    return model
+}

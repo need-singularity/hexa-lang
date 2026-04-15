@@ -65,7 +65,7 @@ libc = "0.2"
 
 - [ ] **Step 2: Verify dependencies resolve**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -5`
 Expected: no errors (warnings OK)
 
 - [ ] **Step 3: Commit**
@@ -127,7 +127,7 @@ In the `Display` impl for Value, add:
 
 - [ ] **Step 3: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -5`
 Expected: errors about missing modules (std_sys, std_gpu) — that's correct, we'll create them next.
 
 - [ ] **Step 4: Commit**
@@ -467,7 +467,7 @@ Add after the `std::time` builtins block (around line 3737):
 
 - [ ] **Step 4: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -10`
 Expected: compiles (may warn about unused std_gpu/std_event — that's fine, we create them next)
 
 - [ ] **Step 5: Commit**
@@ -976,7 +976,7 @@ Add after the sys builtins block:
 
 - [ ] **Step 5: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -10`
 Expected: compiles without errors
 
 - [ ] **Step 6: Commit**
@@ -1330,7 +1330,7 @@ pub mod std_event;
 
 - [ ] **Step 5: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -10`
 Expected: compiles without errors
 
 - [ ] **Step 6: Commit**
@@ -1648,7 +1648,7 @@ pub mod std_font;
 
 - [ ] **Step 4: Verify compilation**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo check 2>&1 | tail -10`
+Run: `cd $HEXA_LANG && cargo check 2>&1 | tail -10`
 Expected: compiles
 
 - [ ] **Step 5: Commit**
@@ -1709,12 +1709,12 @@ println("=== All std_sys tests passed ===")
 
 - [ ] **Step 2: Build hexa**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && bash build.sh 2>&1 | tail -5`
+Run: `cd $HEXA_LANG && bash build.sh 2>&1 | tail -5`
 Expected: build succeeds
 
 - [ ] **Step 3: Run the test**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && ./hexa examples/test_void_sys.hexa`
+Run: `cd $HEXA_LANG && ./hexa examples/test_void_sys.hexa`
 Expected: All tests pass, output shows "VOID_TEST_OK"
 
 - [ ] **Step 4: Commit**
@@ -1734,8 +1734,8 @@ git commit -m "test: add PTY system test for VOID terminal"
 - [ ] **Step 1: Create void directory structure**
 
 ```bash
-mkdir -p /Users/ghost/Dev/hexa-lang/void/src/terminal
-mkdir -p /Users/ghost/Dev/hexa-lang/void/src/render
+mkdir -p $HEXA_LANG/void/src/terminal
+mkdir -p $HEXA_LANG/void/src/render
 ```
 
 - [ ] **Step 2: Write void/src/main.hexa — the VOID terminal entry point**
@@ -2049,17 +2049,17 @@ git commit -m "feat: VOID Phase 1 — minimal terminal entry point (hexa)"
 
 - [ ] **Step 1: Build hexa with new modules**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && cargo build --release 2>&1 | tail -20`
+Run: `cd $HEXA_LANG && cargo build --release 2>&1 | tail -20`
 Expected: compiles (may have warnings)
 
 - [ ] **Step 2: Run PTY test**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && ./hexa examples/test_void_sys.hexa`
+Run: `cd $HEXA_LANG && ./hexa examples/test_void_sys.hexa`
 Expected: All PTY tests pass
 
 - [ ] **Step 3: Run VOID terminal**
 
-Run: `cd /Users/ghost/Dev/hexa-lang && ./hexa void/src/main.hexa`
+Run: `cd $HEXA_LANG && ./hexa void/src/main.hexa`
 Expected: Window opens, shell prompt visible, keyboard input works
 
 - [ ] **Step 4: Fix any compilation or runtime errors**

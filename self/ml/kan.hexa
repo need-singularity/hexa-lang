@@ -1,5 +1,5 @@
 // ═══════════════════════════════════════════════════════════════
-//  self/ml/kan.hexa — Kolmogorov-Arnold Network (#194)
+//  self/ml/kan.hexa — Kolmogorov-Arnold Network (#194 + #328)
 //
 //  KAN replaces fixed activation functions (ReLU/GELU) with
 //  learnable B-spline activations on EDGES rather than NODES.
@@ -34,6 +34,8 @@
 //    kan_regularization(network, lambda_l1)
 //    kan_prune_edge(network, layer_idx, in_idx, out_idx)
 //    kan_param_count(network)
+//    kan_grid_extend_layer(layer, new_n_basis, sample_pts)
+//    kan_grid_extend(network, new_n_basis, sample_pts)
 //
 //  AI-NATIVE attrs:
 //    @pure  — no side effects
@@ -539,3 +541,211 @@ fn kan_auto_prune(network, threshold) {
     }
     return new_net
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 15: Grid Extension (progressive resolution increase)
+//
+//  Key idea from KAN paper: start with a coarse grid (few B-spline
+//  basis functions) for fast initial training, then progressively
+//  increase grid resolution by adding more knots/basis functions.
+//
+//  The old spline is evaluated at sample points on the new grid,
+//  then new B-spline coefficients are fitted via least-squares
+//  (normal equations) so the new spline approximates the old one.
+//
+//  This preserves learned behavior while enabling finer resolution.
+//
+//  kan_grid_extend_layer(layer, new_n_basis, sample_pts)
+//    -> new layer with more basis functions
+//  kan_grid_extend(network, new_n_basis, sample_pts)
+//    -> extend all layers in the network
+// ═══════════════════════════════════════════════════════════════
+
+// ── Least-squares solve via normal equations (A^T A x = A^T b) ──
+// Solves for x given matrix A (rows x cols) and vector b (rows).
+// Uses Gaussian elimination with partial pivoting on the normal eq.
+
+@pure
+fn kan_ls_solve(a_mat, b_vec, rows, cols) {
+    // Build A^T A (cols x cols)
+    let mut ata = []
+    for i in 0..cols {
+        let mut row = kan_zeros(cols)
+        for j in 0..cols {
+            let mut s = 0.0
+            for k in 0..rows {
+                s = s + a_mat[k * cols + i] * a_mat[k * cols + j]
+            }
+            row[j] = s
+        }
+        ata = ata + [row]
+    }
+
+    // Build A^T b (cols)
+    let mut atb = kan_zeros(cols)
+    for i in 0..cols {
+        let mut s = 0.0
+        for k in 0..rows {
+            s = s + a_mat[k * cols + i] * b_vec[k]
+        }
+        atb[i] = s
+    }
+
+    // Gaussian elimination with partial pivoting on [ata | atb]
+    for col in 0..cols {
+        // Find pivot
+        let mut best_row = col
+        let mut best_val = kan_abs(ata[col][col])
+        for r in (col + 1)..cols {
+            let v = kan_abs(ata[r][col])
+            if v > best_val {
+                best_val = v
+                best_row = r
+            }
+        }
+
+        // Swap rows if needed
+        if best_row != col {
+            let tmp_row = ata[col]
+            ata[col] = ata[best_row]
+            ata[best_row] = tmp_row
+            let tmp_b = atb[col]
+            atb[col] = atb[best_row]
+            atb[best_row] = tmp_b
+        }
+
+        // Skip if pivot is near zero (singular)
+        if kan_abs(ata[col][col]) < 1.0e-12 {
+            continue
+        }
+
+        // Eliminate below
+        for r in (col + 1)..cols {
+            let factor = ata[r][col] / ata[col][col]
+            for c in col..cols {
+                ata[r][c] = ata[r][c] - factor * ata[col][c]
+            }
+            atb[r] = atb[r] - factor * atb[col]
+        }
+    }
+
+    // Back substitution
+    let mut x = kan_zeros(cols)
+    let mut ci = cols - 1
+    for _step in 0..cols {
+        if kan_abs(ata[ci][ci]) > 1.0e-12 {
+            let mut s = atb[ci]
+            for j in (ci + 1)..cols {
+                s = s - ata[ci][j] * x[j]
+            }
+            x[ci] = s / ata[ci][ci]
+        }
+        if ci == 0 {
+            break
+        }
+        ci = ci - 1
+    }
+
+    return x
+}
+
+// ── Grid extension for a single edge ────────────────────────────
+// Given old coefficients and old knots, produce new coefficients
+// that approximate the old spline on a finer grid.
+//
+// 1. Evaluate old spline at sample_pts positions
+// 2. Build new knot vector with more internal knots
+// 3. Compute new basis matrix at sample points
+// 4. Solve least-squares: new_coeffs = argmin ||B_new @ c - f_old||^2
+
+@pure
+fn kan_refit_edge_coeffs(old_coeffs, old_knots, old_n_knots, old_degree, old_n_basis, new_knots, new_n_knots, new_degree, new_n_basis, sample_pts) {
+    let n_pts = len(sample_pts)
+
+    // Evaluate old spline at each sample point
+    let mut old_vals = kan_zeros(n_pts)
+    for p in 0..n_pts {
+        let x = kan_clamp(sample_pts[p], -1.0, 1.0)
+        old_vals[p] = kan_bspline_eval(x, old_coeffs, old_knots, old_n_knots, old_degree, old_n_basis)
+    }
+
+    // Build new basis matrix (flat, row-major: n_pts x new_n_basis)
+    let mut basis_mat = kan_zeros(n_pts * new_n_basis)
+    for p in 0..n_pts {
+        let x = kan_clamp(sample_pts[p], -1.0, 1.0)
+        for b in 0..new_n_basis {
+            basis_mat[p * new_n_basis + b] = kan_bspline_basis(x, new_knots, new_n_knots, new_degree, b)
+        }
+    }
+
+    // Solve least-squares: basis_mat @ new_coeffs = old_vals
+    let new_coeffs = kan_ls_solve(basis_mat, old_vals, n_pts, new_n_basis)
+    return new_coeffs
+}
+
+// ── Grid extension for a full KAN layer ─────────────────────────
+// Increases the number of basis functions (and internal knots)
+// while preserving learned behavior via least-squares refitting.
+
+fn kan_grid_extend_layer(layer, new_n_basis, sample_pts) {
+    let old_coeffs_flat = layer[0]
+    let old_knots = layer[1]
+    let l_in_dim = to_int(layer[2])
+    let l_out_dim = to_int(layer[3])
+    let old_n_basis = to_int(layer[4])
+    let degree = to_int(layer[5])
+    let old_n_knots = len(old_knots)
+
+    // If new_n_basis <= old, return unchanged
+    if new_n_basis <= old_n_basis {
+        return layer
+    }
+
+    // Build new knot vector
+    let new_n_internal = new_n_basis - degree - 1
+    let safe_new_internal = to_int(kan_max_f(to_float(new_n_internal), 0.0))
+    let new_knots = kan_uniform_knots(-1.0, 1.0, safe_new_internal, degree)
+    let new_n_knots = len(new_knots)
+
+    // Refit each edge
+    let n_edges = l_out_dim * l_in_dim
+    let new_total = n_edges * new_n_basis
+    let mut new_coeffs_flat = kan_zeros(new_total)
+
+    for e in 0..n_edges {
+        // Extract old coefficients for this edge
+        let old_base = e * old_n_basis
+        let mut old_edge_coeffs = kan_zeros(old_n_basis)
+        for k in 0..old_n_basis {
+            old_edge_coeffs[k] = old_coeffs_flat[old_base + k]
+        }
+
+        // Refit to new grid
+        let new_edge_coeffs = kan_refit_edge_coeffs(
+            old_edge_coeffs, old_knots, old_n_knots, degree, old_n_basis,
+            new_knots, new_n_knots, degree, new_n_basis, sample_pts
+        )
+
+        // Store in flat array
+        let new_base = e * new_n_basis
+        for k in 0..new_n_basis {
+            new_coeffs_flat[new_base + k] = new_edge_coeffs[k]
+        }
+    }
+
+    return [new_coeffs_flat, new_knots, l_in_dim, l_out_dim, new_n_basis, degree]
+}
+
+// ── Grid extension for the full network ─────────────────────────
+
+fn kan_grid_extend(network, new_n_basis, sample_pts) {
+    let n_layers = len(network)
+    let mut new_net = []
+    for i in 0..n_layers {
+        let extended = kan_grid_extend_layer(network[i], new_n_basis, sample_pts)
+        new_net = new_net + [extended]
+    }
+    return new_net
+}
+
+println("[kan] loaded — B-spline basis + KAN layer/network + train + prune + grid extension")

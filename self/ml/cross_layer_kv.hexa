@@ -1,0 +1,710 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/cross_layer_kv.hexa — Cross-Layer KV Sharing (#325)
+//
+//  MiniCache (Liu et al., 2024) — share KV cache across adjacent
+//  layers with similar representations, reducing KV memory ~50%.
+//
+//  Core idea:
+//    For layer i and i+1, compute cosine similarity of their KV
+//    states. If sim > threshold, reuse layer i's KV for layer i+1
+//    (or merge via weighted average). Only share between sufficiently
+//    similar layers.
+//
+//  Architecture:
+//    Per-layer linear projection:  K = x · W_k + b_k
+//                                  V = x · W_v + b_v
+//    Attention:  softmax(Q · K^T / sqrt(D_head)) · V
+//
+//  API (clkv_ prefix):
+//    clkv_init(D_model, D_head, n_layers, threshold, seed) -> model
+//    clkv_layer_kv(model, layer, x) -> [keys, values]
+//    clkv_cosine_sim(a, b) -> float
+//    clkv_should_share(kv_a, kv_b, threshold) -> bool
+//    clkv_merge_kv(kv_a, kv_b, alpha) -> merged_kv
+//    clkv_build_cache(model, x) -> cache (with sharing decisions)
+//    clkv_attention(model, layer, query, cache) -> output
+//    clkv_forward(model, x) -> output
+//    clkv_memory_savings(cache) -> float
+//    clkv_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / similarity / cache building)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────
+
+fn clkv_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn clkv_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn clkv_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn clkv_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut x = v / 2.0
+    for _i in 0..20 {
+        x = (x + v / x) / 2.0
+    }
+    return x
+}
+
+fn clkv_tanh(v) {
+    let ep = clkv_exp(v)
+    let en = clkv_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+// ── array helpers ────────────────────────────────────────────────
+
+fn clkv_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn clkv_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn clkv_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn clkv_uniform(state) {
+    let s = clkv_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_init — create model with per-layer K/V projections + output
+//
+//  Model dict:
+//    D_model, D_head, n_layers, threshold
+//    W_k[layer] : D_head x D_model   (key projection)
+//    b_k[layer] : D_head
+//    W_v[layer] : D_head x D_model   (value projection)
+//    b_v[layer] : D_head
+//    W_q        : D_head x D_model   (query projection, shared)
+//    b_q        : D_head
+//    W_o        : D_model x D_head   (output projection)
+//    b_o        : D_model
+// ═══════════════════════════════════════════════════════════════════
+fn clkv_init(D_model, D_head, n_layers, threshold, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let scale = 1.0 / clkv_sqrt(to_float(D_model))
+
+    // per-layer key projections
+    let mut W_k_all = []
+    let mut b_k_all = []
+    for _l in 0..n_layers {
+        let mut Wk = clkv_zeros_2d(D_head, D_model)
+        for i in 0..D_head {
+            for j in 0..D_model {
+                let u = clkv_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                Wk[i][j] = (u[0] - 0.5) * scale
+            }
+        }
+        W_k_all = W_k_all + [Wk]
+        b_k_all = b_k_all + [clkv_zeros(D_head)]
+    }
+
+    // per-layer value projections
+    let mut W_v_all = []
+    let mut b_v_all = []
+    for _l in 0..n_layers {
+        let mut Wv = clkv_zeros_2d(D_head, D_model)
+        for i in 0..D_head {
+            for j in 0..D_model {
+                let u = clkv_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                Wv[i][j] = (u[0] - 0.5) * scale
+            }
+        }
+        W_v_all = W_v_all + [Wv]
+        b_v_all = b_v_all + [clkv_zeros(D_head)]
+    }
+
+    // shared query projection
+    let mut W_q = clkv_zeros_2d(D_head, D_model)
+    for i in 0..D_head {
+        for j in 0..D_model {
+            let u = clkv_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_q = clkv_zeros(D_head)
+
+    // output projection
+    let mut W_o = clkv_zeros_2d(D_model, D_head)
+    for i in 0..D_model {
+        for j in 0..D_head {
+            let u = clkv_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_o = clkv_zeros(D_model)
+
+    return #{
+        "D_model": D_model,
+        "D_head": D_head,
+        "n_layers": n_layers,
+        "threshold": threshold,
+        "W_k": W_k_all,
+        "b_k": b_k_all,
+        "W_v": W_v_all,
+        "b_v": b_v_all,
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_o": W_o,
+        "b_o": b_o
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_layer_kv — compute keys and values for a given layer
+//    Returns [keys, values] where each is a D_head-dim vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_layer_kv(model, layer, x) {
+    let D_model = model["D_model"]
+    let D_head = model["D_head"]
+    let Wk = model["W_k"][layer]
+    let bk = model["b_k"][layer]
+    let Wv = model["W_v"][layer]
+    let bv = model["b_v"][layer]
+
+    let mut keys = clkv_zeros(D_head)
+    for i in 0..D_head {
+        let mut s = bk[i]
+        for j in 0..D_model { s = s + Wk[i][j] * x[j] }
+        keys[i] = s
+    }
+
+    let mut values = clkv_zeros(D_head)
+    for i in 0..D_head {
+        let mut s = bv[i]
+        for j in 0..D_model { s = s + Wv[i][j] * x[j] }
+        values[i] = s
+    }
+
+    return [keys, values]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_cosine_sim — cosine similarity between two vectors
+//    sim(a,b) = dot(a,b) / (||a|| * ||b||)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut norm_a = 0.0
+    let mut norm_b = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        norm_a = norm_a + a[i] * a[i]
+        norm_b = norm_b + b[i] * b[i]
+    }
+    let denom = clkv_sqrt(norm_a) * clkv_sqrt(norm_b)
+    if denom < 1.0e-12 { return 0.0 }
+    return dot / denom
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_should_share — check if two KV pairs are similar enough
+//    kv_a = [keys_a, values_a], kv_b = [keys_b, values_b]
+//    Share if BOTH key sim and value sim exceed threshold
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_should_share(kv_a, kv_b, threshold) {
+    let key_sim = clkv_cosine_sim(kv_a[0], kv_b[0])
+    let val_sim = clkv_cosine_sim(kv_a[1], kv_b[1])
+    let avg_sim = (key_sim + val_sim) / 2.0
+    if avg_sim > threshold { return true }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_merge_kv — weighted average of two KV pairs
+//    merged_k = alpha * kv_a[0] + (1-alpha) * kv_b[0]
+//    merged_v = alpha * kv_a[1] + (1-alpha) * kv_b[1]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_merge_kv(kv_a, kv_b, alpha) {
+    let n = len(kv_a[0])
+    let beta = 1.0 - alpha
+    let mut mk = clkv_zeros(n)
+    let mut mv = clkv_zeros(n)
+    for i in 0..n {
+        mk[i] = alpha * kv_a[0][i] + beta * kv_b[0][i]
+        mv[i] = alpha * kv_a[1][i] + beta * kv_b[1][i]
+    }
+    return [mk, mv]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_build_cache — build KV cache for all layers with sharing
+//
+//  Returns cache dict:
+//    "kv"       : array of [keys, values] per layer (after sharing)
+//    "shared"   : array of bools — true if layer reused previous
+//    "n_layers" : int
+//    "n_shared" : int (count of shared layers)
+//    "sims"     : array of similarity scores between adjacent layers
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_build_cache(model, x) {
+    let n_layers = model["n_layers"]
+    let threshold = model["threshold"]
+
+    // compute raw KV for each layer
+    let mut raw_kv = []
+    for l in 0..n_layers {
+        let kv = clkv_layer_kv(model, l, x)
+        raw_kv = raw_kv + [kv]
+    }
+
+    // decide sharing: compare adjacent layers
+    let mut shared = [false]
+    let mut sims = []
+    for l in 1..n_layers {
+        let key_sim = clkv_cosine_sim(raw_kv[l][0], raw_kv[l - 1][0])
+        let val_sim = clkv_cosine_sim(raw_kv[l][1], raw_kv[l - 1][1])
+        let avg_sim = (key_sim + val_sim) / 2.0
+        sims = sims + [avg_sim]
+        if avg_sim > threshold {
+            shared = shared + [true]
+        } else {
+            shared = shared + [false]
+        }
+    }
+
+    // build final cache: shared layers get merged KV
+    let mut cache_kv = [raw_kv[0]]
+    let mut n_shared = 0
+    for l in 1..n_layers {
+        if shared[l] {
+            // merge with previous layer (alpha=0.5 equal weight)
+            let merged = clkv_merge_kv(raw_kv[l - 1], raw_kv[l], 0.5)
+            cache_kv = cache_kv + [merged]
+            n_shared = n_shared + 1
+        } else {
+            cache_kv = cache_kv + [raw_kv[l]]
+        }
+    }
+
+    return #{
+        "kv": cache_kv,
+        "shared": shared,
+        "n_layers": n_layers,
+        "n_shared": n_shared,
+        "sims": sims
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_attention — single-layer attention using cached KV
+//    query = D_model input, projects to D_head via W_q
+//    attention score = softmax(Q . K / sqrt(D_head))
+//    output = score * V
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_attention(model, layer, query, cache) {
+    let D_model = model["D_model"]
+    let D_head = model["D_head"]
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+
+    // project query
+    let mut q = clkv_zeros(D_head)
+    for i in 0..D_head {
+        let mut s = b_q[i]
+        for j in 0..D_model { s = s + W_q[i][j] * query[j] }
+        q[i] = s
+    }
+
+    // get cached key/value for this layer
+    let kv = cache["kv"][layer]
+    let k = kv[0]
+    let v = kv[1]
+
+    // attention score = dot(q, k) / sqrt(D_head)
+    let inv_sqrt = 1.0 / clkv_sqrt(to_float(D_head))
+    let mut score = 0.0
+    for i in 0..D_head { score = score + q[i] * k[i] }
+    score = score * inv_sqrt
+
+    // single-key attention: sigmoid gate instead of softmax
+    let gate = 1.0 / (1.0 + clkv_exp(0.0 - score))
+
+    // weighted value
+    let mut attn_out = clkv_zeros(D_head)
+    for i in 0..D_head { attn_out[i] = gate * v[i] }
+
+    return attn_out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_forward — full forward pass through all layers
+//    For each layer: attention -> project back -> residual + tanh
+//    Returns D_model output vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_forward(model, x) {
+    let D_model = model["D_model"]
+    let D_head = model["D_head"]
+    let n_layers = model["n_layers"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+
+    // build cache with cross-layer sharing
+    let cache = clkv_build_cache(model, x)
+
+    // run through all layers with residual connections
+    let mut h = clkv_zeros(D_model)
+    for i in 0..D_model { h[i] = x[i] }
+
+    for l in 0..n_layers {
+        let attn_out = clkv_attention(model, l, h, cache)
+
+        // project attention output back to D_model
+        let mut proj = clkv_zeros(D_model)
+        for i in 0..D_model {
+            let mut s = b_o[i]
+            for j in 0..D_head { s = s + W_o[i][j] * attn_out[j] }
+            proj[i] = s
+        }
+
+        // residual connection + tanh activation
+        for i in 0..D_model {
+            h[i] = clkv_tanh(h[i] + proj[i])
+        }
+    }
+
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_memory_savings — fraction of KV memory saved
+//    = n_shared / n_layers  (shared layers reuse previous KV)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_memory_savings(cache) {
+    let n_layers = cache["n_layers"]
+    let n_shared = cache["n_shared"]
+    if n_layers <= 0 { return 0.0 }
+    return to_float(n_shared) / to_float(n_layers)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_mse_loss — mean squared error for regression output
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn clkv_mse_loss(model, x, y) {
+    let out = clkv_forward(model, x)
+    let D = len(y)
+    let mut loss = 0.0
+    for i in 0..D {
+        let diff = out[i] - y[i]
+        loss = loss + diff * diff
+    }
+    return loss / to_float(D)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clkv_train_step — numerical gradient descent
+//
+//  For each parameter, perturb by eps, measure loss delta,
+//  update. Operates on all W_k, b_k, W_v, b_v, W_q, b_q, W_o, b_o.
+//
+//  Mini-batch MSE loss over all (X[i], Y[i]) pairs.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn clkv_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_model = model["D_model"]
+    let D_head = model["D_head"]
+    let n_layers = model["n_layers"]
+    let eps = 0.001
+
+    // compute base loss
+    let mut base_loss = 0.0
+    for i in 0..N {
+        base_loss = base_loss + clkv_mse_loss(model, X[i], Y[i])
+    }
+    base_loss = base_loss / to_float(N)
+
+    // ── Update W_q ───────────────────────────────────────────
+    let mut W_q_new = clkv_zeros_2d(D_head, D_model)
+    for i in 0..D_head {
+        for j in 0..D_model {
+            W_q_new[i][j] = model["W_q"][i][j]
+        }
+    }
+    for i in 0..D_head {
+        for j in 0..D_model {
+            let old_val = W_q_new[i][j]
+            W_q_new[i][j] = old_val + eps
+            let mut m_tmp = #{
+                "D_model": D_model, "D_head": D_head,
+                "n_layers": n_layers, "threshold": model["threshold"],
+                "W_k": model["W_k"], "b_k": model["b_k"],
+                "W_v": model["W_v"], "b_v": model["b_v"],
+                "W_q": W_q_new, "b_q": model["b_q"],
+                "W_o": model["W_o"], "b_o": model["b_o"]
+            }
+            let mut loss_p = 0.0
+            for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / eps
+            W_q_new[i][j] = old_val - lr * grad
+        }
+    }
+
+    // ── Update b_q ───────────────────────────────────────────
+    let mut b_q_new = clkv_zeros(D_head)
+    for i in 0..D_head { b_q_new[i] = model["b_q"][i] }
+    for i in 0..D_head {
+        let old_val = b_q_new[i]
+        b_q_new[i] = old_val + eps
+        let mut m_tmp = #{
+            "D_model": D_model, "D_head": D_head,
+            "n_layers": n_layers, "threshold": model["threshold"],
+            "W_k": model["W_k"], "b_k": model["b_k"],
+            "W_v": model["W_v"], "b_v": model["b_v"],
+            "W_q": W_q_new, "b_q": b_q_new,
+            "W_o": model["W_o"], "b_o": model["b_o"]
+        }
+        let mut loss_p = 0.0
+        for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / eps
+        b_q_new[i] = old_val - lr * grad
+    }
+
+    // ── Update W_o ───────────────────────────────────────────
+    let mut W_o_new = clkv_zeros_2d(D_model, D_head)
+    for i in 0..D_model {
+        for j in 0..D_head { W_o_new[i][j] = model["W_o"][i][j] }
+    }
+    for i in 0..D_model {
+        for j in 0..D_head {
+            let old_val = W_o_new[i][j]
+            W_o_new[i][j] = old_val + eps
+            let mut m_tmp = #{
+                "D_model": D_model, "D_head": D_head,
+                "n_layers": n_layers, "threshold": model["threshold"],
+                "W_k": model["W_k"], "b_k": model["b_k"],
+                "W_v": model["W_v"], "b_v": model["b_v"],
+                "W_q": W_q_new, "b_q": b_q_new,
+                "W_o": W_o_new, "b_o": model["b_o"]
+            }
+            let mut loss_p = 0.0
+            for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / eps
+            W_o_new[i][j] = old_val - lr * grad
+        }
+    }
+
+    // ── Update b_o ───────────────────────────────────────────
+    let mut b_o_new = clkv_zeros(D_model)
+    for i in 0..D_model { b_o_new[i] = model["b_o"][i] }
+    for i in 0..D_model {
+        let old_val = b_o_new[i]
+        b_o_new[i] = old_val + eps
+        let mut m_tmp = #{
+            "D_model": D_model, "D_head": D_head,
+            "n_layers": n_layers, "threshold": model["threshold"],
+            "W_k": model["W_k"], "b_k": model["b_k"],
+            "W_v": model["W_v"], "b_v": model["b_v"],
+            "W_q": W_q_new, "b_q": b_q_new,
+            "W_o": W_o_new, "b_o": b_o_new
+        }
+        let mut loss_p = 0.0
+        for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / eps
+        b_o_new[i] = old_val - lr * grad
+    }
+
+    // ── Update per-layer W_k, b_k, W_v, b_v ─────────────────
+    let mut W_k_new = []
+    let mut b_k_new = []
+    let mut W_v_new = []
+    let mut b_v_new = []
+    for l in 0..n_layers {
+        // copy current weights
+        let mut wk = clkv_zeros_2d(D_head, D_model)
+        for i in 0..D_head {
+            for j in 0..D_model { wk[i][j] = model["W_k"][l][i][j] }
+        }
+        let mut bk = clkv_zeros(D_head)
+        for i in 0..D_head { bk[i] = model["b_k"][l][i] }
+        let mut wv = clkv_zeros_2d(D_head, D_model)
+        for i in 0..D_head {
+            for j in 0..D_model { wv[i][j] = model["W_v"][l][i][j] }
+        }
+        let mut bv = clkv_zeros(D_head)
+        for i in 0..D_head { bv[i] = model["b_v"][l][i] }
+
+        // gradient for W_k[l]
+        for i in 0..D_head {
+            for j in 0..D_model {
+                let old_val = wk[i][j]
+                wk[i][j] = old_val + eps
+                let mut Wk_tmp = []
+                for ll in 0..n_layers {
+                    if ll == l { Wk_tmp = Wk_tmp + [wk] } else { Wk_tmp = Wk_tmp + [model["W_k"][ll]] }
+                }
+                let mut m_tmp = #{
+                    "D_model": D_model, "D_head": D_head,
+                    "n_layers": n_layers, "threshold": model["threshold"],
+                    "W_k": Wk_tmp, "b_k": model["b_k"],
+                    "W_v": model["W_v"], "b_v": model["b_v"],
+                    "W_q": W_q_new, "b_q": b_q_new,
+                    "W_o": W_o_new, "b_o": b_o_new
+                }
+                let mut loss_p = 0.0
+                for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+                loss_p = loss_p / to_float(N)
+                let grad = (loss_p - base_loss) / eps
+                wk[i][j] = old_val - lr * grad
+            }
+        }
+
+        // gradient for b_k[l]
+        for i in 0..D_head {
+            let old_val = bk[i]
+            bk[i] = old_val + eps
+            let mut bk_tmp = []
+            for ll in 0..n_layers {
+                if ll == l { bk_tmp = bk_tmp + [bk] } else { bk_tmp = bk_tmp + [model["b_k"][ll]] }
+            }
+            let mut m_tmp = #{
+                "D_model": D_model, "D_head": D_head,
+                "n_layers": n_layers, "threshold": model["threshold"],
+                "W_k": model["W_k"], "b_k": bk_tmp,
+                "W_v": model["W_v"], "b_v": model["b_v"],
+                "W_q": W_q_new, "b_q": b_q_new,
+                "W_o": W_o_new, "b_o": b_o_new
+            }
+            let mut loss_p = 0.0
+            for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / eps
+            bk[i] = old_val - lr * grad
+        }
+
+        // gradient for W_v[l]
+        for i in 0..D_head {
+            for j in 0..D_model {
+                let old_val = wv[i][j]
+                wv[i][j] = old_val + eps
+                let mut Wv_tmp = []
+                for ll in 0..n_layers {
+                    if ll == l { Wv_tmp = Wv_tmp + [wv] } else { Wv_tmp = Wv_tmp + [model["W_v"][ll]] }
+                }
+                let mut m_tmp = #{
+                    "D_model": D_model, "D_head": D_head,
+                    "n_layers": n_layers, "threshold": model["threshold"],
+                    "W_k": model["W_k"], "b_k": model["b_k"],
+                    "W_v": Wv_tmp, "b_v": model["b_v"],
+                    "W_q": W_q_new, "b_q": b_q_new,
+                    "W_o": W_o_new, "b_o": b_o_new
+                }
+                let mut loss_p = 0.0
+                for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+                loss_p = loss_p / to_float(N)
+                let grad = (loss_p - base_loss) / eps
+                wv[i][j] = old_val - lr * grad
+            }
+        }
+
+        // gradient for b_v[l]
+        for i in 0..D_head {
+            let old_val = bv[i]
+            bv[i] = old_val + eps
+            let mut bv_tmp = []
+            for ll in 0..n_layers {
+                if ll == l { bv_tmp = bv_tmp + [bv] } else { bv_tmp = bv_tmp + [model["b_v"][ll]] }
+            }
+            let mut m_tmp = #{
+                "D_model": D_model, "D_head": D_head,
+                "n_layers": n_layers, "threshold": model["threshold"],
+                "W_k": model["W_k"], "b_k": model["b_k"],
+                "W_v": model["W_v"], "b_v": bv_tmp,
+                "W_q": W_q_new, "b_q": b_q_new,
+                "W_o": W_o_new, "b_o": b_o_new
+            }
+            let mut loss_p = 0.0
+            for s in 0..N { loss_p = loss_p + clkv_mse_loss(m_tmp, X[s], Y[s]) }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / eps
+            bv[i] = old_val - lr * grad
+        }
+
+        W_k_new = W_k_new + [wk]
+        b_k_new = b_k_new + [bk]
+        W_v_new = W_v_new + [wv]
+        b_v_new = b_v_new + [bv]
+    }
+
+    return #{
+        "D_model": D_model,
+        "D_head": D_head,
+        "n_layers": n_layers,
+        "threshold": model["threshold"],
+        "W_k": W_k_new,
+        "b_k": b_k_new,
+        "W_v": W_v_new,
+        "b_v": b_v_new,
+        "W_q": W_q_new,
+        "b_q": b_q_new,
+        "W_o": W_o_new,
+        "b_o": b_o_new
+    }
+}

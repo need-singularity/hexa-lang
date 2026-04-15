@@ -420,6 +420,399 @@ check("grad_neg_for_pos_adv", gsign < 0.0)
 let gclipped = gr_token_grad_log_new(gr_log(1.5), 0.0, gr_log(1.5), 1.0, 0.2, 0.0)
 check("grad_zero_on_clip", approx(gclipped, 0.0, 0.001))
 
+// ══════════════════════��═══════════════════════════════════���════════
+//  Neural-network policy layer tests (grpo_init .. grpo_train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+fn t_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+fn t_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+fn t_lcg(state) { return (state * 1103515245 + 12345) % 2147483648 }
+fn t_uniform(state) {
+    let s = t_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+fn t_tanh(x) {
+    let ep = gr_exp(x)
+    let en = gr_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn t_init(D_in, D_hidden, D_out, group_size, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut W_h = t_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = t_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_h[i][j] = u[0] - 0.5
+        }
+    }
+    let b_h = t_zeros_f(D_hidden)
+    let mut W_o = t_zeros_2d(D_out, D_hidden)
+    for k in 0..D_out {
+        for j in 0..D_hidden {
+            let u = t_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[k][j] = u[0] - 0.5
+        }
+    }
+    let b_o = t_zeros_f(D_out)
+    return #{
+        "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+        "group_size": group_size,
+        "W_h": W_h, "b_h": b_h, "W_o": W_o, "b_o": b_o
+    }
+}
+
+fn t_logits(model, x) {
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+    let mut hidden = t_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_h[i]
+        for j in 0..D_in { s = s + W_h[i][j] * x[j] }
+        hidden[i] = t_tanh(s)
+    }
+    let mut logits = t_zeros_f(D_out)
+    for k in 0..D_out {
+        let mut s = b_o[k]
+        for j in 0..D_hidden { s = s + W_o[k][j] * hidden[j] }
+        logits[k] = s
+    }
+    return logits
+}
+
+fn t_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for k in 1..n { if logits[k] > mx { mx = logits[k] } }
+    let mut out = t_zeros_f(n)
+    let mut sum = 0.0
+    for k in 0..n {
+        let e = gr_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..n { out[k] = out[k] / sum }
+    return out
+}
+
+fn t_sample(model, x, seed) {
+    let logits = t_logits(model, x)
+    let D_out = model["D_out"]
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut best_k = 0
+    let mut best_val = -1.0e30
+    for k in 0..D_out {
+        let u = t_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        let mut uv = u[0]
+        if uv < 1.0e-10 { uv = 1.0e-10 }
+        if uv > 0.9999999 { uv = 0.9999999 }
+        let gumbel = 0.0 - gr_log(0.0 - gr_log(uv))
+        let score = logits[k] + gumbel
+        if score > best_val {
+            best_val = score
+            best_k = k
+        }
+    }
+    return best_k
+}
+
+fn t_sample_group(model, x, G, seed) {
+    let mut actions = []
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for _g in 0..G {
+        let a = t_sample(model, x, state)
+        actions = actions + [a]
+        state = t_lcg(state)
+        if state <= 0 { state = 1 }
+    }
+    return actions
+}
+
+fn t_kl_penalty(model, ref_model, x, action) {
+    let logits = t_logits(model, x)
+    let probs = t_softmax(logits)
+    let ref_logits = t_logits(ref_model, x)
+    let ref_probs = t_softmax(ref_logits)
+    let mut p = probs[action]
+    if p < 1.0e-12 { p = 1.0e-12 }
+    let mut p_ref = ref_probs[action]
+    if p_ref < 1.0e-12 { p_ref = 1.0e-12 }
+    let log_p = gr_log(p)
+    let log_ref = gr_log(p_ref)
+    return gr_kl_k3(log_p, log_ref)
+}
+
+fn t_loss(model, ref_model, x, actions, rewards, beta) {
+    let G = len(actions)
+    if G == 0 { return 0.0 }
+    let advs = gr_advantages(rewards)
+    let logits = t_logits(model, x)
+    let probs = t_softmax(logits)
+    let ref_logits = t_logits(ref_model, x)
+    let ref_probs = t_softmax(ref_logits)
+    let mut pg_sum = 0.0
+    let mut kl_sum = 0.0
+    for i in 0..G {
+        let a = actions[i]
+        let mut p = probs[a]
+        if p < 1.0e-12 { p = 1.0e-12 }
+        let mut p_ref = ref_probs[a]
+        if p_ref < 1.0e-12 { p_ref = 1.0e-12 }
+        pg_sum = pg_sum + advs[i] * gr_log(p)
+        kl_sum = kl_sum + gr_kl_k3(gr_log(p), gr_log(p_ref))
+    }
+    return (0.0 - pg_sum / to_float(G)) + beta * (kl_sum / to_float(G))
+}
+
+fn t_train_step(model, ref_model, X, reward_fn, lr, beta) {
+    let N = len(X)
+    if N == 0 { return model }
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let G = model["group_size"]
+    let W_h = model["W_h"]
+    let b_h = model["b_h"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let mut gW_h = t_zeros_2d(D_hidden, D_in)
+    let mut gb_h = t_zeros_f(D_hidden)
+    let mut gW_o = t_zeros_2d(D_out, D_hidden)
+    let mut gb_o = t_zeros_f(D_out)
+    let mut seed = 12345
+    for n in 0..N {
+        let x = X[n]
+        let actions = t_sample_group(model, x, G, seed)
+        seed = t_lcg(seed)
+        if seed <= 0 { seed = 1 }
+        let mut rew = []
+        for gi in 0..G {
+            let r = reward_fn(x, actions[gi])
+            rew = rew + [r]
+        }
+        let advs = gr_advantages(rew)
+        let mut hidden = t_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b_h[i]
+            for j in 0..D_in { s = s + W_h[i][j] * x[j] }
+            hidden[i] = t_tanh(s)
+        }
+        let mut logits = t_zeros_f(D_out)
+        for k in 0..D_out {
+            let mut s = b_o[k]
+            for j in 0..D_hidden { s = s + W_o[k][j] * hidden[j] }
+            logits[k] = s
+        }
+        let probs = t_softmax(logits)
+        let ref_logits = t_logits(ref_model, x)
+        let ref_probs = t_softmax(ref_logits)
+        let mut d_logits = t_zeros_f(D_out)
+        for gi in 0..G {
+            let a = actions[gi]
+            let mut pa = probs[a]
+            if pa < 1.0e-12 { pa = 1.0e-12 }
+            let mut pa_ref = ref_probs[a]
+            if pa_ref < 1.0e-12 { pa_ref = 1.0e-12 }
+            let r_ref = pa_ref / pa
+            for k in 0..D_out {
+                let mut ind = 0.0
+                if k == a { ind = 1.0 }
+                let pg_g = (0.0 - advs[gi]) * (ind - probs[k]) / to_float(G)
+                let kl_g = beta * (1.0 - r_ref) * (ind - probs[k]) / to_float(G)
+                d_logits[k] = d_logits[k] + pg_g + kl_g
+            }
+        }
+        for k in 0..D_out {
+            gb_o[k] = gb_o[k] + d_logits[k]
+            for j in 0..D_hidden {
+                gW_o[k][j] = gW_o[k][j] + d_logits[k] * hidden[j]
+            }
+        }
+        let mut d_hidden = t_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for k in 0..D_out { s = s + d_logits[k] * W_o[k][j] }
+            d_hidden[j] = s
+        }
+        for j in 0..D_hidden {
+            let dh = d_hidden[j] * (1.0 - hidden[j] * hidden[j])
+            gb_h[j] = gb_h[j] + dh
+            for i in 0..D_in {
+                gW_h[j][i] = gW_h[j][i] + dh * x[i]
+            }
+        }
+    }
+    let inv_n = 1.0 / to_float(N)
+    let mut W_h_new = t_zeros_2d(D_hidden, D_in)
+    let mut b_h_new = t_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        b_h_new[j] = b_h[j] - lr * gb_h[j] * inv_n
+        for i in 0..D_in {
+            W_h_new[j][i] = W_h[j][i] - lr * gW_h[j][i] * inv_n
+        }
+    }
+    let mut W_o_new = t_zeros_2d(D_out, D_hidden)
+    let mut b_o_new = t_zeros_f(D_out)
+    for k in 0..D_out {
+        b_o_new[k] = b_o[k] - lr * gb_o[k] * inv_n
+        for j in 0..D_hidden {
+            W_o_new[k][j] = W_o[k][j] - lr * gW_o[k][j] * inv_n
+        }
+    }
+    return #{
+        "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+        "group_size": G,
+        "W_h": W_h_new, "b_h": b_h_new, "W_o": W_o_new, "b_o": b_o_new
+    }
+}
+
+println("")
+println("=== GRPO Neural Policy Tests ===")
+
+// T22: init model shapes
+let m1 = t_init(3, 8, 4, 5, 42)
+check("T22 W_h shape", len(m1["W_h"]) == 8 && len(m1["W_h"][0]) == 3)
+check("T22 W_o shape", len(m1["W_o"]) == 4 && len(m1["W_o"][0]) == 8)
+check("T22 group_size", m1["group_size"] == 5)
+
+// T23: policy_logits returns D_out values
+let logits23 = t_logits(m1, [0.5, 0.3, 0.8])
+check("T23 logits length", len(logits23) == 4)
+
+// T24: softmax sums to 1
+let sm24 = t_softmax(logits23)
+let mut sum24 = 0.0
+for i in 0..4 { sum24 = sum24 + sm24[i] }
+check("T24 softmax sums to 1", approx(sum24, 1.0, 1.0e-6))
+
+// T25: softmax probabilities in [0,1]
+let mut sm_valid = true
+for i in 0..4 {
+    if sm24[i] < 0.0 { sm_valid = false }
+    if sm24[i] > 1.0 { sm_valid = false }
+}
+check("T25 softmax probs in [0,1]", sm_valid)
+
+// T26: sample returns valid action
+let a26 = t_sample(m1, [0.5, 0.3, 0.8], 77)
+check("T26 sample valid action", a26 >= 0 && a26 < 4)
+
+// T27: sample_group returns G actions, all valid
+let actions27 = t_sample_group(m1, [0.5, 0.3, 0.8], 5, 99)
+check("T27 group size", len(actions27) == 5)
+let mut all_valid27 = true
+for i in 0..5 {
+    if actions27[i] < 0 { all_valid27 = false }
+    if actions27[i] >= 4 { all_valid27 = false }
+}
+check("T27 all actions valid", all_valid27)
+
+// T28: group_advantage zero-mean
+let rew28 = [1.0, 0.0, 0.5, 0.75, 0.25]
+let adv28 = gr_advantages(rew28)
+check("T28 advantage zero-mean", approx(gr_mean(adv28), 0.0, 1.0e-4))
+
+// T29: KL penalty zero for same model
+let kl29 = t_kl_penalty(m1, m1, [0.5, 0.3, 0.8], 0)
+check("T29 KL self = 0", approx(kl29, 0.0, 1.0e-6))
+
+// T30: KL penalty positive for different models
+let m2 = t_init(3, 8, 4, 5, 999)
+let kl30 = t_kl_penalty(m1, m2, [0.5, 0.3, 0.8], 0)
+check("T30 KL diff > 0", kl30 > 0.0)
+
+// T31: loss is finite
+let loss31 = t_loss(m1, m1, [0.5, 0.3, 0.8], [0, 1, 2, 3, 0], [1.0, 0.0, 0.5, 0.75, 0.25], 0.04)
+check("T31 loss finite", loss31 > -100.0 && loss31 < 100.0)
+
+// T32: deterministic init (same seed -> same model)
+let m3a = t_init(3, 4, 2, 3, 7)
+let m3b = t_init(3, 4, 2, 3, 7)
+let l3a = t_logits(m3a, [0.1, 0.2, 0.3])
+let l3b = t_logits(m3b, [0.1, 0.2, 0.3])
+let mut det_ok = true
+for i in 0..2 {
+    if fabs(l3a[i] - l3b[i]) > 1.0e-9 { det_ok = false }
+}
+check("T32 deterministic init", det_ok)
+
+// T33: train_step changes weights
+fn reward_33(x, a) {
+    if a == 0 { return 1.0 }
+    return 0.0
+}
+let train_x33 = [[0.5, 0.3, 0.8], [0.1, 0.9, 0.4], [0.7, 0.2, 0.6]]
+let m_before = t_init(3, 4, 3, 4, 42)
+let m_after = t_train_step(m_before, m_before, train_x33, reward_33, 0.5, 0.04)
+let mut any_changed = false
+for i in 0..4 {
+    for j in 0..3 {
+        if fabs(m_before["W_h"][i][j] - m_after["W_h"][i][j]) > 1.0e-10 {
+            any_changed = true
+        }
+    }
+}
+check("T33 train_step changes weights", any_changed)
+
+// T34: hidden activations bounded (softmax stable on large input)
+let m_big = t_init(3, 16, 4, 5, 123)
+let logits_big = t_logits(m_big, [10.0, 10.0, 10.0])
+check("T34 logits finite", len(logits_big) == 4)
+let sm_big = t_softmax(logits_big)
+let mut sum_big = 0.0
+for i in 0..4 { sum_big = sum_big + sm_big[i] }
+check("T34 softmax stable", approx(sum_big, 1.0, 1.0e-6))
+
+// T35: loss with beta=0 and same ref model has no KL component
+let loss_nk = t_loss(m1, m1, [0.5, 0.3, 0.8], [0, 1], [1.0, 0.0], 0.0)
+check("T35 loss beta=0 finite", loss_nk > -100.0 && loss_nk < 100.0)
+
+// T36: single train step moves output biases away from zero
+// The gradient should shift b_o values (they start at 0.0) based on
+// which actions get higher rewards in the sampled group.
+fn reward_36(x, a) {
+    if a == 0 { return 1.0 }
+    return 0.0
+}
+let train_x36 = [[0.8, 0.2], [0.6, 0.4], [0.7, 0.3]]
+let m36_init = t_init(2, 8, 2, 4, 55)
+let m36_after = t_train_step(m36_init, m36_init, train_x36, reward_36, 1.0, 0.01)
+// After one step, b_o values should have moved from zero
+let bo_change_0 = fabs(m36_after["b_o"][0] - m36_init["b_o"][0])
+let bo_change_1 = fabs(m36_after["b_o"][1] - m36_init["b_o"][1])
+check("T36 b_o[0] moved", bo_change_0 > 0.01)
+check("T36 b_o[1] moved", bo_change_1 > 0.01)
+// The b_o gap should be nonzero (policy differentiates actions)
+let bo_gap = fabs(m36_after["b_o"][0] - m36_after["b_o"][1])
+check("T36 b_o gap nonzero", bo_gap > 0.1)
+
 // ── summary ────────────────────────────────────────────────────────
 println("")
 println("GRPO: " + str(pass_count) + " passed, " + str(fail_count) + " failed")

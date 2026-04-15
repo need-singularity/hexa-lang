@@ -13,27 +13,28 @@ brew install need-singularity/tap/hexa-lang
 # Option B: hx package manager (any platform)
 # (see pkg/hx — no Rust toolchain required)
 
-# Option C: From source (self-host — 2026-04-11 onward)
+# Option C: From source (100% self-host, Rust 폐기 — 2026-04-13~)
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang
-cp hexa /usr/local/bin/    # precompiled self-host binary
-# For rebuild: bootstrap via build_hexa.hexa (hexa_v2 → C → clang → hexa_v3)
+cp hexa /usr/local/bin/    # stage1 CLI dispatcher (77KB, go/cargo style)
+# Rebuild from source: ./hexa build self/main.hexa -o hexa
 ```
 
 Verify the installation:
 
 ```bash
-$ hexa --version
-HEXA-LANG v1.0.0
+$ hexa version
+hexa 0.1.0-stage1
+$ hexa help        # 서브커맨드 목록
 ```
 
 ## The REPL
 
-Start an interactive session:
+> NOTE: stage1 CLI는 아직 `repl` 서브커맨드 미제공. REPL은 `./build/hexa_stage0` 직접 호출로 접근:
 
 ```bash
-$ hexa
-HEXA-LANG v1.0.0 | n=6 | 53 keywords | 24 operators
+$ ./build/hexa_stage0
+HEXA interpreter (stage0) | 53 keywords | 24 operators
 >> println("Hello from the perfect number!")
 Hello from the perfect number!
 >> sigma(6)
@@ -65,7 +66,8 @@ println("12 * 2 = 6 * 4 = 24 --- verified!")
 Run it:
 
 ```bash
-$ hexa hello.hexa
+$ hexa run hello.hexa    # 권장 (go/cargo-style)
+# 또는 호환 모드: hexa hello.hexa  — python/node 스타일로 run 자동 위임
 Hello, HEXA!
 sigma(6) = 12
 phi(6)   = 2

@@ -1,0 +1,186 @@
+// ===============================================================
+//  test_offloading.hexa -- CPU/GPU Offloading tests (#304)
+// ===============================================================
+
+import "ml/offloading.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_(v) { if v < 0.0 { return 0.0 - v } return v }
+fn approx_(a, b, eps) { return fabs_(a - b) < eps }
+
+println("=== CPU/GPU Offloading (#304) ===")
+
+// ── T1 init creates manager with correct fields ────────────
+let mgr1 = ofl_init(4, 3, 2, 42)
+check("T1 n_layers", mgr1["n_layers"] == 4)
+check("T1 D", mgr1["D"] == 3)
+check("T1 max_gpu_layers", mgr1["max_gpu_layers"] == 2)
+check("T1 gpu_resident empty", len(mgr1["gpu_resident"]) == 0)
+
+// ── T2 create_layer adds to manager ────────────────────────
+let mgr2a = ofl_create_layer(mgr1, 0, [])
+let mgr2b = ofl_create_layer(mgr2a, 1, [])
+let layer0 = mgr2b["layers"]["0"]
+check("T2 layer0 exists", len(layer0["weights"]) == 3)
+check("T2 layer0 on cpu", layer0["location"] == "cpu")
+check("T2 cpu_mem > 0", mgr2b["cpu_mem_used"] > 0)
+
+// ── T3 load_to_gpu moves layer ─────────────────────────────
+let mgr3 = ofl_load_to_gpu(mgr2b, 0)
+check("T3 layer0 on gpu", ofl_is_on_gpu(mgr3, 0))
+check("T3 gpu_resident has 1", len(mgr3["gpu_resident"]) == 1)
+check("T3 gpu_mem > 0", mgr3["gpu_mem_used"] > 0)
+
+// ── T4 offload_to_cpu moves back ───────────────────────────
+let mgr4 = ofl_offload_to_cpu(mgr3, 0)
+check("T4 layer0 back on cpu", ofl_is_on_gpu(mgr4, 0) == false)
+check("T4 gpu_resident empty", len(mgr4["gpu_resident"]) == 0)
+
+// ── T5 eviction when GPU full ──────────────────────────────
+// max_gpu_layers = 2, load 3 layers -> should evict oldest
+let mut mgr5 = ofl_create_layer(mgr2b, 2, [])
+mgr5 = ofl_load_to_gpu(mgr5, 0)
+mgr5 = ofl_load_to_gpu(mgr5, 1)
+check("T5 two on gpu", len(mgr5["gpu_resident"]) == 2)
+mgr5 = ofl_load_to_gpu(mgr5, 2)
+check("T5 still max 2", len(mgr5["gpu_resident"]) <= 2)
+check("T5 layer2 on gpu", ofl_is_on_gpu(mgr5, 2))
+check("T5 layer0 evicted", ofl_is_on_gpu(mgr5, 0) == false)
+
+// ── T6 forward_layer produces output of correct size ───────
+let mut mgr6 = ofl_init(2, 3, 2, 7)
+mgr6 = ofl_create_layer(mgr6, 0, [])
+mgr6 = ofl_create_layer(mgr6, 1, [])
+let res6 = ofl_forward_layer(mgr6, 0, [0.5, 0.3, 0.1])
+let mgr6b = res6[0]
+let out6 = res6[1]
+check("T6 output length", len(out6) == 3)
+// tanh output is bounded in [-1, 1]
+let mut t6_bounded = true
+for i in 0..3 {
+    if ofl_abs(out6[i]) > 1.0 { t6_bounded = false }
+}
+check("T6 output bounded [-1,1]", t6_bounded)
+
+// ── T7 forward_layer auto-loads to GPU ─────────────────────
+check("T7 layer0 loaded to gpu", ofl_is_on_gpu(mgr6b, 0))
+
+// ── T8 forward_all pipelines through all layers ────────────
+let mut mgr8 = ofl_init(3, 2, 2, 99)
+mgr8 = ofl_create_layer(mgr8, 0, [])
+mgr8 = ofl_create_layer(mgr8, 1, [])
+mgr8 = ofl_create_layer(mgr8, 2, [])
+let res8 = ofl_forward_all(mgr8, [1.0, 0.5])
+let mgr8b = res8[0]
+let out8 = res8[1]
+check("T8 output length", len(out8) == 2)
+let mut t8_bounded = true
+for i in 0..2 {
+    if ofl_abs(out8[i]) > 1.0 { t8_bounded = false }
+}
+check("T8 output bounded", t8_bounded)
+
+// ── T9 KV cache offloaded to CPU after forward_all ─────────
+let kv9 = mgr8b["kv_cache"]
+let kv0_loc = kv9["0"]["location"]
+let kv1_loc = kv9["1"]["location"]
+let kv2_loc = kv9["2"]["location"]
+check("T9 kv layer0 on cpu", kv0_loc == "cpu")
+check("T9 kv layer1 on cpu", kv1_loc == "cpu")
+check("T9 kv layer2 on cpu", kv2_loc == "cpu")
+
+// ── T10 memory_usage returns correct budget ────────────────
+let mem10 = ofl_memory_usage(mgr8)
+let expected_budget = 2 * (2 * 2 + 2)
+check("T10 budget", mem10["budget"] == expected_budget)
+check("T10 gpu_used >= 0", mem10["gpu_used"] >= 0)
+check("T10 cpu_used >= 0", mem10["cpu_used"] >= 0)
+
+// ── T11 deterministic: same seed same output ───────────────
+let mut mgrA = ofl_init(2, 2, 2, 77)
+mgrA = ofl_create_layer(mgrA, 0, [])
+mgrA = ofl_create_layer(mgrA, 1, [])
+let resA = ofl_forward_all(mgrA, [0.3, 0.7])
+
+let mut mgrB = ofl_init(2, 2, 2, 77)
+mgrB = ofl_create_layer(mgrB, 0, [])
+mgrB = ofl_create_layer(mgrB, 1, [])
+let resB = ofl_forward_all(mgrB, [0.3, 0.7])
+
+let outA = resA[1]
+let outB = resB[1]
+let mut t11_same = true
+for i in 0..2 {
+    if fabs_(outA[i] - outB[i]) > 1.0e-9 { t11_same = false }
+}
+check("T11 deterministic output", t11_same)
+
+// ── T12 custom weights work ────────────────────────────────
+let mut mgr12 = ofl_init(1, 2, 1, 1)
+// identity-ish weights: W = [[1,0],[0,1]], flat = [1,0,0,1]
+mgr12 = ofl_create_layer(mgr12, 0, [1.0, 0.0, 0.0, 1.0])
+let res12 = ofl_forward_layer(mgr12, 0, [0.5, 0.3])
+let out12 = res12[1]
+// tanh(0.5) ~ 0.4621, tanh(0.3) ~ 0.2913
+check("T12 custom W output[0]", approx_(out12[0], 0.4621, 0.01))
+check("T12 custom W output[1]", approx_(out12[1], 0.2913, 0.01))
+
+// ── T13 train_step reduces loss ────────────────────────────
+let mut mgr13 = ofl_init(1, 2, 1, 55)
+mgr13 = ofl_create_layer(mgr13, 0, [])
+let train_X = [[0.5, 0.3], [0.1, 0.9], [0.8, 0.2]]
+let train_Y = [[0.1, 0.2], [0.3, 0.4], [0.5, 0.6]]
+
+// measure loss before
+let mut loss_before = 0.0
+for s in 0..3 {
+    let r = ofl_forward_all(mgr13, train_X[s])
+    let o = r[1]
+    for d in 0..2 {
+        let diff = o[d] - train_Y[s][d]
+        loss_before = loss_before + 0.5 * diff * diff
+    }
+}
+loss_before = loss_before / 3.0
+
+// train
+let mut mgr13t = ofl_train_step(mgr13, train_X, train_Y, 0.5)
+
+// measure loss after
+let mut loss_after = 0.0
+for s in 0..3 {
+    let r = ofl_forward_all(mgr13t, train_X[s])
+    let o = r[1]
+    for d in 0..2 {
+        let diff = o[d] - train_Y[s][d]
+        loss_after = loss_after + 0.5 * diff * diff
+    }
+}
+loss_after = loss_after / 3.0
+check("T13 loss decreases", loss_after < loss_before)
+
+// ── T14 GPU never exceeds budget ───────────────────────────
+let mut mgr14 = ofl_init(5, 2, 2, 11)
+for lid in 0..5 { mgr14 = ofl_create_layer(mgr14, lid, []) }
+let res14 = ofl_forward_all(mgr14, [0.5, 0.5])
+let mgr14b = res14[0]
+let mem14 = ofl_memory_usage(mgr14b)
+check("T14 gpu_used <= budget", mem14["gpu_used"] <= mem14["budget"])
+
+println("")
+println("=== Offloading summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

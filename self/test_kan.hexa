@@ -1,7 +1,7 @@
 // ═══════════════════════════════════════════════════════════════
-//  test_kan.hexa — Kolmogorov-Arnold Network verification (#194)
+//  test_kan.hexa — Kolmogorov-Arnold Network verification (#194 + #328)
 //
-//  Tests (35):
+//  Tests (44):
 //    T1  kan_abs positive
 //    T2  kan_abs negative
 //    T3  kan_zeros length + all zero
@@ -38,6 +38,14 @@
 //    T34 kan_mse_loss >= 0
 //    T35 kan_mse_loss zero on identical
 //    T36 kan_train_step changes params
+//    T37 kan_ls_solve identity system
+//    T38 kan_ls_solve overdetermined system
+//    T39 kan_grid_extend_layer increases n_basis
+//    T40 kan_grid_extend_layer preserves dims
+//    T41 kan_grid_extend_layer approximates old spline
+//    T42 kan_grid_extend whole network structure
+//    T43 kan_grid_extend forward still works
+//    T44 kan_grid_extend no-op when new <= old
 //
 //  Run: ./hexa self/test_kan.hexa
 // ═══════════════════════════════════════════════════════════════
@@ -669,6 +677,239 @@ for i in 0..len(orig_c0) {
     if !approx(orig_c0[i], new_c0[i], 1.0e-12) { changed = true }
 }
 check("T36 kan_train_step changes params", changed)
+
+// ═══════════════════════════════════════════════════════════════
+//  Grid Extension Tests (#328)
+// ═══════════════════════════════════════════════════════════════
+
+// ── Inlined grid extension code ──
+
+@pure
+fn kan_ls_solve(a_mat, b_vec, rows, cols) {
+    let mut ata = []
+    for i in 0..cols {
+        let mut row = kan_zeros(cols)
+        for j in 0..cols {
+            let mut s = 0.0
+            for k in 0..rows {
+                s = s + a_mat[k * cols + i] * a_mat[k * cols + j]
+            }
+            row[j] = s
+        }
+        ata = ata + [row]
+    }
+
+    let mut atb = kan_zeros(cols)
+    for i in 0..cols {
+        let mut s = 0.0
+        for k in 0..rows {
+            s = s + a_mat[k * cols + i] * b_vec[k]
+        }
+        atb[i] = s
+    }
+
+    for col in 0..cols {
+        let mut best_row = col
+        let mut best_val = kan_abs(ata[col][col])
+        for r in (col + 1)..cols {
+            let v = kan_abs(ata[r][col])
+            if v > best_val {
+                best_val = v
+                best_row = r
+            }
+        }
+
+        if best_row != col {
+            let tmp_row = ata[col]
+            ata[col] = ata[best_row]
+            ata[best_row] = tmp_row
+            let tmp_b = atb[col]
+            atb[col] = atb[best_row]
+            atb[best_row] = tmp_b
+        }
+
+        if kan_abs(ata[col][col]) < 1.0e-12 {
+            continue
+        }
+
+        for r in (col + 1)..cols {
+            let factor = ata[r][col] / ata[col][col]
+            for c in col..cols {
+                ata[r][c] = ata[r][c] - factor * ata[col][c]
+            }
+            atb[r] = atb[r] - factor * atb[col]
+        }
+    }
+
+    let mut x = kan_zeros(cols)
+    let mut ci = cols - 1
+    for _step in 0..cols {
+        if kan_abs(ata[ci][ci]) > 1.0e-12 {
+            let mut s = atb[ci]
+            for j in (ci + 1)..cols {
+                s = s - ata[ci][j] * x[j]
+            }
+            x[ci] = s / ata[ci][ci]
+        }
+        if ci == 0 {
+            break
+        }
+        ci = ci - 1
+    }
+
+    return x
+}
+
+@pure
+fn kan_refit_edge_coeffs(old_coeffs, old_knots, old_n_knots, old_degree, old_n_basis, new_knots, new_n_knots, new_degree, new_n_basis, sample_pts) {
+    let n_pts = len(sample_pts)
+
+    let mut old_vals = kan_zeros(n_pts)
+    for p in 0..n_pts {
+        let x = kan_clamp(sample_pts[p], -1.0, 1.0)
+        old_vals[p] = kan_bspline_eval(x, old_coeffs, old_knots, old_n_knots, old_degree, old_n_basis)
+    }
+
+    let mut basis_mat = kan_zeros(n_pts * new_n_basis)
+    for p in 0..n_pts {
+        let x = kan_clamp(sample_pts[p], -1.0, 1.0)
+        for b in 0..new_n_basis {
+            basis_mat[p * new_n_basis + b] = kan_bspline_basis(x, new_knots, new_n_knots, new_degree, b)
+        }
+    }
+
+    let new_coeffs = kan_ls_solve(basis_mat, old_vals, n_pts, new_n_basis)
+    return new_coeffs
+}
+
+fn kan_grid_extend_layer(layer, new_n_basis, sample_pts) {
+    let old_coeffs_flat = layer[0]
+    let old_knots = layer[1]
+    let l_in_dim = to_int(layer[2])
+    let l_out_dim = to_int(layer[3])
+    let old_n_basis = to_int(layer[4])
+    let degree = to_int(layer[5])
+    let old_n_knots = len(old_knots)
+
+    if new_n_basis <= old_n_basis {
+        return layer
+    }
+
+    let new_n_internal = new_n_basis - degree - 1
+    let safe_new_internal = to_int(kan_max_f(to_float(new_n_internal), 0.0))
+    let new_knots = kan_uniform_knots(-1.0, 1.0, safe_new_internal, degree)
+    let new_n_knots = len(new_knots)
+
+    let n_edges = l_out_dim * l_in_dim
+    let new_total = n_edges * new_n_basis
+    let mut new_coeffs_flat = kan_zeros(new_total)
+
+    for e in 0..n_edges {
+        let old_base = e * old_n_basis
+        let mut old_edge_coeffs = kan_zeros(old_n_basis)
+        for k in 0..old_n_basis {
+            old_edge_coeffs[k] = old_coeffs_flat[old_base + k]
+        }
+
+        let new_edge_coeffs = kan_refit_edge_coeffs(
+            old_edge_coeffs, old_knots, old_n_knots, degree, old_n_basis,
+            new_knots, new_n_knots, degree, new_n_basis, sample_pts
+        )
+
+        let new_base = e * new_n_basis
+        for k in 0..new_n_basis {
+            new_coeffs_flat[new_base + k] = new_edge_coeffs[k]
+        }
+    }
+
+    return [new_coeffs_flat, new_knots, l_in_dim, l_out_dim, new_n_basis, degree]
+}
+
+fn kan_grid_extend(network, new_n_basis, sample_pts) {
+    let n_layers = len(network)
+    let mut new_net = []
+    for i in 0..n_layers {
+        let extended = kan_grid_extend_layer(network[i], new_n_basis, sample_pts)
+        new_net = new_net + [extended]
+    }
+    return new_net
+}
+
+// ── Sample points for grid extension tests ──
+let ge_sample_pts = [-0.95, -0.8, -0.6, -0.4, -0.2, 0.0, 0.2, 0.4, 0.6, 0.8, 0.95]
+
+// T37: kan_ls_solve identity system
+// Solve I @ x = b => x = b
+// A = [[1,0],[0,1]] flat = [1,0,0,1], b = [3, 7]
+let ls_a = [1.0, 0.0, 0.0, 1.0]
+let ls_b = [3.0, 7.0]
+let ls_x = kan_ls_solve(ls_a, ls_b, 2, 2)
+check("T37 kan_ls_solve identity", approx(ls_x[0], 3.0, 1.0e-6) && approx(ls_x[1], 7.0, 1.0e-6))
+
+// T38: kan_ls_solve overdetermined system
+// A = [[1,1],[1,2],[1,3]], b = [2,3,4] => best fit x = [1, 1]
+let ls_od_a = [1.0, 1.0, 1.0, 2.0, 1.0, 3.0]
+let ls_od_b = [2.0, 3.0, 4.0]
+let ls_od_x = kan_ls_solve(ls_od_a, ls_od_b, 3, 2)
+check("T38 kan_ls_solve overdetermined", approx(ls_od_x[0], 1.0, 1.0e-4) && approx(ls_od_x[1], 1.0, 1.0e-4))
+
+// T39: kan_grid_extend_layer increases n_basis
+// Create a layer with n_basis=4, extend to 7
+let ge_layer = kan_create_layer(2, 2, 4, 2)
+let ge_ext = kan_grid_extend_layer(ge_layer, 7, ge_sample_pts)
+check("T39 grid_extend_layer n_basis increased", to_int(ge_ext[4]) == 7)
+
+// T40: kan_grid_extend_layer preserves dims
+check("T40 grid_extend_layer preserves dims",
+    to_int(ge_ext[2]) == 2 && to_int(ge_ext[3]) == 2 && to_int(ge_ext[5]) == 2)
+
+// T41: kan_grid_extend_layer approximates old spline
+// Evaluate old and new spline at multiple points and check they match closely
+let old_coeffs_e0 = []
+let ge_old_coeffs = ge_layer[0]
+let ge_old_knots = ge_layer[1]
+let ge_old_n_knots = len(ge_old_knots)
+let ge_old_nb = to_int(ge_layer[4])
+let ge_deg = to_int(ge_layer[5])
+
+let ge_new_coeffs = ge_ext[0]
+let ge_new_knots = ge_ext[1]
+let ge_new_n_knots = len(ge_new_knots)
+let ge_new_nb = to_int(ge_ext[4])
+
+// Check edge 0 approximation at test points
+let mut ge_approx_ok = true
+let ge_test_xs = [-0.7, -0.3, 0.0, 0.3, 0.7]
+for ti in 0..5 {
+    let x_t = ge_test_xs[ti]
+    // Old edge 0: coeffs [0..old_nb)
+    let mut old_ec = kan_zeros(ge_old_nb)
+    for k in 0..ge_old_nb { old_ec[k] = ge_old_coeffs[k] }
+    let old_v = kan_bspline_eval(x_t, old_ec, ge_old_knots, ge_old_n_knots, ge_deg, ge_old_nb)
+
+    // New edge 0: coeffs [0..new_nb)
+    let mut new_ec = kan_zeros(ge_new_nb)
+    for k in 0..ge_new_nb { new_ec[k] = ge_new_coeffs[k] }
+    let new_v = kan_bspline_eval(x_t, new_ec, ge_new_knots, ge_new_n_knots, ge_deg, ge_new_nb)
+
+    if fabs(old_v - new_v) > 0.05 { ge_approx_ok = false }
+}
+check("T41 grid_extend approximates old spline", ge_approx_ok)
+
+// T42: kan_grid_extend whole network structure
+let ge_net = kan_create_network([2, 3, 1], 4, 2)
+let ge_net_ext = kan_grid_extend(ge_net, 7, ge_sample_pts)
+check("T42 grid_extend network structure",
+    len(ge_net_ext) == 2 && to_int(ge_net_ext[0][4]) == 7 && to_int(ge_net_ext[1][4]) == 7)
+
+// T43: kan_grid_extend forward still works
+let ge_in = [0.3, -0.2]
+let ge_out = kan_forward(ge_net_ext, ge_in)
+check("T43 grid_extend forward works", len(ge_out) == 1)
+
+// T44: kan_grid_extend no-op when new <= old
+let ge_noop = kan_grid_extend_layer(ge_layer, 3, ge_sample_pts)
+check("T44 grid_extend no-op when new<=old", to_int(ge_noop[4]) == 4 && len(ge_noop[0]) == len(ge_layer[0]))
 
 // ═══════════════════════════════════════════════════════════════
 println("")

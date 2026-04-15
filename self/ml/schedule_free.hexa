@@ -1,0 +1,414 @@
+// ===================================================================
+//  self/ml/schedule_free.hexa — Schedule-Free Optimizer
+//
+//  Defazio et al. 2024 (Meta Research) — "The Road Less Scheduled"
+//
+//  Schedule-Free Adam eliminates the need for LR schedulers
+//  (cosine, linear decay, etc.) by using primal averaging:
+//
+//    z_t+1 = z_t - lr * adam_update(grads)
+//    y_t+1 = (1 - 1/k) * y_t + (1/k) * z_t+1     (k = interpolation coeff)
+//    x_t   = (1 - beta1) * z_t + beta1 * y_t       (evaluation point)
+//
+//  Key idea:
+//    - y is the "fast" Adam iterate used during training
+//    - z is the "slow" base sequence
+//    - x is the primal average exposed for evaluation
+//    - Only warmup is needed, no cosine/linear decay schedule
+//    - Achieves Pareto-optimal convergence on many tasks
+//
+//  Public API:
+//    sf_create(lr, beta1, beta2, eps, weight_decay, warmup_steps)
+//    sf_create_default()
+//    sf_init_state(dim)
+//    sf_step(opt, grads, state, step)          -> new_state
+//    sf_get_eval_params(state)                 -> x (for evaluation)
+//    sf_get_train_params(state)                -> y (for forward pass)
+//    sf_warmup_factor(step, warmup_steps)      -> float
+//    sf_quadratic_loss(params)                 -> float
+//    sf_quadratic_grad(params)                 -> array
+//    sf_rosenbrock_loss(params)                -> float
+//    sf_rosenbrock_grad(params)                -> array
+//    sf_compare(init_params, n_steps)          -> [sf_loss, adam_loss]
+//    sf_memory_usage(dim, n_params)            -> [sf_bytes, adam_bytes]
+//    sf_clip_global_norm(grads, max_norm)      -> clipped
+//    sf_step_clipped(opt, grads, state, step, max_norm) -> new_state
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — performance-critical path
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn sf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sf_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sf_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Create Schedule-Free optimizer config
+//
+//  Defaults (from paper):
+//    lr             = 1e-3
+//    beta1          = 0.9     (interpolation / momentum)
+//    beta2          = 0.999   (Adam second moment)
+//    eps            = 1e-8
+//    weight_decay   = 0.0
+//    warmup_steps   = 0       (linear warmup only)
+// ===================================================================
+@pure
+fn sf_create(lr, beta1, beta2, eps, weight_decay, warmup_steps) {
+    return #{
+        "lr": lr,
+        "beta1": beta1,
+        "beta2": beta2,
+        "eps": eps,
+        "weight_decay": weight_decay,
+        "warmup_steps": warmup_steps
+    }
+}
+
+@pure
+fn sf_create_default() {
+    return sf_create(0.001, 0.9, 0.999, 1.0e-8, 0.0, 0)
+}
+
+// ===================================================================
+//  Optimizer state:
+//    z  — base (slow) sequence
+//    y  — fast iterate (used for training forward pass)
+//    v  — Adam second moment (EMA of squared gradients)
+//    step — current step count
+//
+//  Note: no first moment m needed — schedule-free uses z/y split
+//  instead of traditional momentum.
+// ===================================================================
+@pure
+fn sf_init_state(dim, init_params) {
+    let mut z = sf_zeros(dim)
+    let mut y = sf_zeros(dim)
+    for i in 0..dim {
+        z[i] = init_params[i]
+        y[i] = init_params[i]
+    }
+    return #{
+        "z": z,
+        "y": y,
+        "v": sf_zeros(dim),
+        "step": 0
+    }
+}
+
+// ===================================================================
+//  Warmup factor: linear ramp from 0 to 1
+//
+//  Returns 1.0 if warmup_steps <= 0 or step >= warmup_steps.
+// ===================================================================
+@pure
+fn sf_warmup_factor(step, warmup_steps) {
+    if warmup_steps <= 0 { return 1.0 }
+    if step >= warmup_steps { return 1.0 }
+    return to_float(step + 1) / to_float(warmup_steps)
+}
+
+// ===================================================================
+//  Schedule-Free Adam step
+//
+//  Algorithm (Defazio et al. 2024):
+//    Given gradient g at point y_t:
+//
+//    1. v_t+1 = beta2 * v_t + (1 - beta2) * g^2        (second moment)
+//    2. v_hat = v_t+1 / (1 - beta2^(t+1))               (bias correction)
+//    3. lr_t  = lr * warmup_factor(t)                    (warmup only)
+//    4. z_t+1 = z_t - lr_t * (g / (sqrt(v_hat) + eps) + wd * z_t)
+//    5. y_t+1 = (1 - 1/(t+2)) * y_t + (1/(t+2)) * z_t+1
+//
+//  The evaluation point x is computed on-demand:
+//    x = (1 - beta1) * z + beta1 * y
+//
+//  Returns new state dict with updated z, y, v, step.
+// ===================================================================
+@hot
+fn sf_step(opt, grads, state, step) {
+    let lr = opt["lr"]
+    let b1 = opt["beta1"]
+    let b2 = opt["beta2"]
+    let eps = opt["eps"]
+    let wd = opt["weight_decay"]
+    let warmup = opt["warmup_steps"]
+
+    let z = state["z"]
+    let y = state["y"]
+    let v = state["v"]
+    let dim = len(z)
+
+    let mut new_z = sf_zeros(dim)
+    let mut new_y = sf_zeros(dim)
+    let mut new_v = sf_zeros(dim)
+
+    // Warmup scaling
+    let wf = sf_warmup_factor(step, warmup)
+    let lr_t = lr * wf
+
+    // Bias correction for second moment
+    let mut b2_pow = 1.0
+    for _i in 0..(step + 1) {
+        b2_pow = b2_pow * b2
+    }
+    let b2_corr = 1.0 - b2_pow
+
+    // Interpolation coefficient for y update: 1/(step+2)
+    let k_inv = 1.0 / to_float(step + 2)
+
+    for i in 0..dim {
+        // Step 1: second moment EMA
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+
+        // Step 2: bias-corrected second moment
+        let v_hat = new_v[i] / b2_corr
+
+        // Step 3: Adam-style update on z (base sequence)
+        let adam_update = grads[i] / (sf_sqrt(v_hat) + eps)
+        new_z[i] = z[i] - lr_t * (adam_update + wd * z[i])
+
+        // Step 4: interpolate y toward z
+        new_y[i] = (1.0 - k_inv) * y[i] + k_inv * new_z[i]
+    }
+
+    return #{
+        "z": new_z,
+        "y": new_y,
+        "v": new_v,
+        "step": step + 1
+    }
+}
+
+// ===================================================================
+//  Get evaluation parameters: x = (1 - beta1) * z + beta1 * y
+//
+//  Use x for loss evaluation, validation, inference.
+//  Use y (train params) for the forward pass during training.
+// ===================================================================
+@pure
+fn sf_get_eval_params(opt, state) {
+    let b1 = opt["beta1"]
+    let z = state["z"]
+    let y = state["y"]
+    let dim = len(z)
+    let mut x = sf_zeros(dim)
+    for i in 0..dim {
+        x[i] = (1.0 - b1) * z[i] + b1 * y[i]
+    }
+    return x
+}
+
+// ===================================================================
+//  Get training parameters: y (used for forward pass)
+// ===================================================================
+@pure
+fn sf_get_train_params(state) {
+    return state["y"]
+}
+
+// ===================================================================
+//  Gradient clipping — global norm
+// ===================================================================
+
+@pure
+fn sf_grad_norm(grads) {
+    let mut norm_sq = 0.0
+    let n = len(grads)
+    for i in 0..n {
+        norm_sq = norm_sq + grads[i] * grads[i]
+    }
+    return sf_sqrt(norm_sq)
+}
+
+@pure
+fn sf_clip_global_norm(grads, max_norm) {
+    let norm = sf_grad_norm(grads)
+    if norm <= max_norm { return grads }
+    let scale = max_norm / norm
+    let n = len(grads)
+    let mut clipped = sf_zeros(n)
+    for i in 0..n {
+        clipped[i] = grads[i] * scale
+    }
+    return clipped
+}
+
+// ===================================================================
+//  Schedule-Free step with gradient clipping
+// ===================================================================
+@hot
+fn sf_step_clipped(opt, grads, state, step, max_norm) {
+    let clipped = sf_clip_global_norm(grads, max_norm)
+    return sf_step(opt, clipped, state, step)
+}
+
+// ===================================================================
+//  Test objectives
+// ===================================================================
+
+@pure
+fn sf_quadratic_loss(params) {
+    let mut loss = 0.0
+    let n = len(params)
+    for i in 0..n {
+        loss = loss + 0.5 * params[i] * params[i]
+    }
+    return loss
+}
+
+@pure
+fn sf_quadratic_grad(params) {
+    let n = len(params)
+    let mut g = sf_zeros(n)
+    for i in 0..n {
+        g[i] = params[i]
+    }
+    return g
+}
+
+// Rosenbrock: f(x) = sum[ 100*(x_{i+1} - x_i^2)^2 + (1 - x_i)^2 ]
+@pure
+fn sf_rosenbrock_loss(params) {
+    let n = len(params)
+    let mut loss = 0.0
+    for i in 0..(n - 1) {
+        let a = params[i + 1] - params[i] * params[i]
+        let b = 1.0 - params[i]
+        loss = loss + 100.0 * a * a + b * b
+    }
+    return loss
+}
+
+@pure
+fn sf_rosenbrock_grad(params) {
+    let n = len(params)
+    let mut g = sf_zeros(n)
+    for i in 0..(n - 1) {
+        let diff = params[i + 1] - params[i] * params[i]
+        g[i] = g[i] + (0.0 - 400.0) * params[i] * diff + 2.0 * (params[i] - 1.0)
+        g[i + 1] = g[i + 1] + 200.0 * diff
+    }
+    return g
+}
+
+// ===================================================================
+//  AdamW step (standard) — for comparison
+// ===================================================================
+@hot
+fn sf_adamw_step(params, grads, m, v, lr, b1, b2, eps, wd, t) {
+    let dim = len(params)
+    let mut new_params = sf_zeros(dim)
+    let mut new_m = sf_zeros(dim)
+    let mut new_v = sf_zeros(dim)
+
+    let mut b1_pow = 1.0
+    let mut b2_pow = 1.0
+    for _i in 0..t {
+        b1_pow = b1_pow * b1
+        b2_pow = b2_pow * b2
+    }
+    let b1_corr = 1.0 - b1_pow
+    let b2_corr = 1.0 - b2_pow
+
+    for i in 0..dim {
+        new_m[i] = b1 * m[i] + (1.0 - b1) * grads[i]
+        new_v[i] = b2 * v[i] + (1.0 - b2) * grads[i] * grads[i]
+        let m_hat = new_m[i] / b1_corr
+        let v_hat = new_v[i] / b2_corr
+        new_params[i] = params[i] - lr * (m_hat / (sf_sqrt(v_hat) + eps) + wd * params[i])
+    }
+
+    return [new_params, new_m, new_v]
+}
+
+// ===================================================================
+//  Comparison: Schedule-Free vs AdamW on quadratic
+//
+//  Returns [sf_final_loss, adamw_final_loss]
+// ===================================================================
+fn sf_compare(init_params, n_steps) {
+    let dim = len(init_params)
+
+    // Schedule-Free setup
+    let sf_opt = sf_create(0.01, 0.9, 0.999, 1.0e-8, 0.0, 0)
+    let mut sf_state = sf_init_state(dim, init_params)
+
+    // AdamW setup
+    let mut a_params = sf_zeros(dim)
+    for i in 0..dim { a_params[i] = init_params[i] }
+    let mut a_m = sf_zeros(dim)
+    let mut a_v = sf_zeros(dim)
+
+    for step in 0..n_steps {
+        // Schedule-Free step (compute grad at y)
+        let y = sf_get_train_params(sf_state)
+        let sf_g = sf_quadratic_grad(y)
+        sf_state = sf_step(sf_opt, sf_g, sf_state, step)
+
+        // AdamW step
+        let a_g = sf_quadratic_grad(a_params)
+        let a_result = sf_adamw_step(
+            a_params, a_g, a_m, a_v,
+            0.01, 0.9, 0.999, 1.0e-8, 0.0, step + 1
+        )
+        a_params = a_result[0]
+        a_m = a_result[1]
+        a_v = a_result[2]
+    }
+
+    let sf_x = sf_get_eval_params(sf_opt, sf_state)
+    let sf_loss = sf_quadratic_loss(sf_x)
+    let a_loss = sf_quadratic_loss(a_params)
+    return [sf_loss, a_loss]
+}
+
+// ===================================================================
+//  Memory usage comparison
+//
+//  Schedule-Free: z + y + v = 3 buffers per param
+//  AdamW:         params + m + v = 3 buffers per param
+//  Same memory footprint, but no LR scheduler state needed.
+// ===================================================================
+@pure
+fn sf_memory_usage(dim, n_params) {
+    let total_dim = dim * n_params
+    let bytes_per_float = 8
+    let sf_bytes = total_dim * bytes_per_float * 3
+    let adam_bytes = total_dim * bytes_per_float * 3
+    return [sf_bytes, adam_bytes]
+}
+
+println("[schedule_free] loaded — primal averaging + Adam base + warmup + grad clip + comparison")

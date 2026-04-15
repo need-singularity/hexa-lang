@@ -1,0 +1,528 @@
+// ═══════════════════════════════════════════════════════════
+//  self/runtime_core.hexa — HEXA interpreter runtime (extracted)
+//
+//  @ai-contract: stage0-runtime-core
+//  @ssot:        self/runtime_core.hexa            role=source
+//  @parent:      self/hexa_full.hexa               extraction_from=line-4445-15252
+//  @mirror:      self/interpreter.hexa             keep-in-sync (P5 SSOT pair)
+//  @status:      PHASE-B — 22 fns extracted (proof=17 + fuse=3 + match=1 + stack=1)
+//  @invariants_inherited:
+//    I1 — pass-by-value (xs = xs.push_nostat(v) canonical pattern)
+//    I2 — Ident.name 식별자 보존 (rt 32 슬롯 reuse 금지)
+//
+//  @migration:
+//    Plan          : docs/plans/runtime_extract/plan.md
+//    Inventory     : docs/plans/runtime_extract/fn_list.json
+//    Deps matrix   : docs/plans/runtime_extract/deps.md
+//
+//  @phase_order:   B(proof+fuse+match+stack)  ← 현재
+//                  C(memo+specialize+extern) → D(stores+singletons) →
+//                  E(env+eval+exec+call+driver)
+//
+//  @safety:
+//    - hexa_full.hexa 의 RT 영역에서 본 파일의 22 fn 이 삭제됨.
+//    - hexa_full.hexa 헤더에 `use "runtime_core"` 추가.
+//    - scripts/build_stage0.sh 에 flatten_imports 단계 삽입.
+//    - 비-Phase-B 카테고리 145 fn 은 여전히 hexa_full.hexa 에 존재.
+//
+//  @regression:
+//    - bash scripts/build_stage0.sh         → smoke 'ok' (if baseline OK)
+//    - ./hexa cc --regen extra              → hexa_cc.c.new byte-identical
+//    - P5 fixpoint                          → hexa_cc.c == hexa_cc.c.new
+// ═══════════════════════════════════════════════════════════
+
+// TODO(T1-phase-c): 다음 대상 (총 36 fn)
+//     19_memo_rt         9 fn   memo_lookup / memo_store / fn_attrs_* / ...
+//     20_specialize_rt   6 fn   specialize_ic_* / has_lazy_attr / ...
+//     21_extern_rt      12 fn   extern_c_symbol / call_extern_fn / callback_* / host_*
+//     24_nodekind_rt     4 fn   node_kind_to_id / op_to_id / nk_cached_id
+//     06_enum_rt         3 fn   enum_decls_register / get_enum_data / ...
+//     02_value_op        2 fn   (partial)
+//
+// TODO(T1-phase-d): 객체 store + Value 카테고리 (58 fn + 9 singletons)
+// TODO(T1-phase-e): 핵심 interpreter (28 fn) + driver (1 fn)
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 9 골화 — Formal proof engine bridge
+//  src/interpreter.rs:11968-12045 대응
+// ═══════════════════════════════════════════════════════════
+//  HEXA Expr → ProofExpr 변환 + execute_proof_block_stmt.
+//  실제 SAT/SMT solver는 src::proof_engine (Rust)에 있으므로
+//  self-host에선 호스트 빌트인 __host_proof_check를 시도하고,
+//  미노출 시 "skipped" 결과를 반환.
+
+// ProofExpr는 hexa에선 [kind, ...payload] 배열로 인코딩.
+//   ["var", name]            ["bool", b]                ["int", n]
+//   ["and", l, r]            ["or", l, r]               ["not", x]
+//   ["eq", l, r]             ["lt", l, r]               ["gt", l, r]
+//   ["le", l, r]             ["ge", l, r]               ["add", l, r]
+//   ["implies", l, r]        ["fn_call", name, args]    ["unknown", desc]
+
+fn proof_var(name) { return ["var", name] }
+fn proof_bool(b) { return ["bool", b] }
+fn proof_int(n) { return ["int", n] }
+fn proof_and(l, r) { return ["and", l, r] }
+fn proof_or(l, r) { return ["or", l, r] }
+fn proof_not(x) { return ["not", x] }
+fn proof_eq(l, r) { return ["eq", l, r] }
+fn proof_lt(l, r) { return ["lt", l, r] }
+fn proof_gt(l, r) { return ["gt", l, r] }
+fn proof_le(l, r) { return ["le", l, r] }
+fn proof_ge(l, r) { return ["ge", l, r] }
+fn proof_add(l, r) { return ["add", l, r] }
+fn proof_implies(l, r) { return ["implies", l, r] }
+fn proof_fn_call(name, args) { return ["fn_call", name, args] }
+fn proof_unknown(desc) { return ["unknown", desc] }
+
+fn expr_to_proof_expr(expr) {
+    if type_of(expr) == "string" { return proof_unknown("string_expr") }
+    let k = expr.kind
+    if k == "Ident" { return proof_var(expr.name) }
+    if k == "BoolLit" { return proof_bool(expr.value) }
+    if k == "IntLit" { return proof_int(expr.value) }
+    if k == "Binary" {
+        let l = expr_to_proof_expr(expr.left)
+        let r = expr_to_proof_expr(expr.right)
+        let op = expr.op
+        if op == "&&" || op == "and" { return proof_and(l, r) }
+        if op == "||" || op == "or" { return proof_or(l, r) }
+        if op == "==" { return proof_eq(l, r) }
+        if op == "<" { return proof_lt(l, r) }
+        if op == ">" { return proof_gt(l, r) }
+        if op == "<=" { return proof_le(l, r) }
+        if op == ">=" { return proof_ge(l, r) }
+        if op == "+" { return proof_add(l, r) }
+        if op == "->" || op == "=>" { return proof_implies(l, r) }
+        return proof_unknown("binop_" + op)
+    }
+    if k == "Unary" && expr.op == "!" {
+        return proof_not(expr_to_proof_expr(expr.operand))
+    }
+    if k == "Call" {
+        // parser AST stores callee in `left` field, not `callee`
+        let callee = expr.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let mut p_args = []
+            for a in expr.args { p_args = p_args.push(expr_to_proof_expr(a)) }
+            return proof_fn_call(callee.name, p_args)
+        }
+        return proof_unknown("unknown_call")
+    }
+    return proof_unknown("expr_" + k)
+}
+
+// execute_proof_block_stmt(stmt) — dispatch a single proof block statement.
+//   Returns ["proved" | "refuted" | "skipped" | "unknown", message]
+fn execute_proof_block_stmt(stmt) {
+    if type_of(stmt) == "string" { return ["skipped", "string_stmt"] }
+    let k = stmt.kind
+    let mut req = val_void()
+    if k == "ForAll" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        let conc_pe = expr_to_proof_expr(stmt.conclusion)
+        req = ["forall", cond_pe, conc_pe]
+    }
+    if k == "Exists" {
+        let cond_pe = expr_to_proof_expr(stmt.condition)
+        req = ["exists", cond_pe]
+    }
+    if k == "Assert" || k == "AssertStmt" {
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "Invariant" {
+        // parser uses .left for the expression (not .expr)
+        let pe = expr_to_proof_expr(stmt.left)
+        req = ["assert", pe]
+    }
+    if k == "CheckLaw" {
+        req = ["check_law", stmt.n]
+    }
+    if type_of(req) != "string" && req.tag == TAG_VOID {
+        return ["skipped", "unknown_proof_stmt_kind"]
+    }
+    // Delegate to host proof engine if available
+    let host = call_builtin("__host_proof_check", [req])
+    if host.tag != TAG_NOT_BUILTIN { return host }
+    return ["skipped", "host runtime does not expose __host_proof_check"]
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Phase 8 골화 — fusion chain optimizer
+//  src/interpreter.rs:11441 try_fuse_chain 대응
+// ═══════════════════════════════════════════════════════════
+//  arr.map(f).filter(g).sum() 같은 인접 체인을 single-pass
+//  루프로 융합. terminal: map/filter/fold/sum/count/any/all/find.
+//  실패/미적용은 sentinel tag="__not_fused__" 반환 → caller fallback.
+
+fn fuse_sentinel() {
+    return Val { tag: TAG_NOT_FUSED, int_val: 0, float_val: 0.0, bool_val: false, str_val: "", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+}
+
+fn is_fuse_terminal(method) {
+    if method == "map" { return true }
+    if method == "filter" { return true }
+    if method == "fold" { return true }
+    if method == "sum" { return true }
+    if method == "count" { return true }
+    if method == "any" { return true }
+    if method == "all" { return true }
+    if method == "find" { return true }
+    return false
+}
+
+fn try_fuse_chain(obj_expr, final_method, final_args) {
+    if !is_fuse_terminal(final_method) { return fuse_sentinel() }
+    // Walk the chain: collect (method, args) pairs, terminating at non-map/filter
+    let mut ops_methods = [final_method]
+    let mut ops_args = [final_args]
+    let mut current = obj_expr
+    let mut walking = true
+    while walking {
+        if type_of(current) == "string" { walking = false } else {
+            // Defensive: parser may emit non-struct stub on syntax error
+            if type_of(current) != "struct" && type_of(current) != "map" { walking = false } else {
+                if current.kind == "Call" {
+                    // parser AST stores callee in `left` field
+                    let callee = current.left
+                    if type_of(callee) != "string" && (callee.kind == "Field" || callee.kind == "OptField") {
+                        let m = callee.name
+                        if m == "map" || m == "filter" {
+                            ops_methods = ops_methods.push(m)
+                            ops_args = ops_args.push(current.args)
+                            current = callee.left
+                        } else { walking = false }
+                    } else { walking = false }
+                } else { walking = false }
+            }
+        }
+    }
+    if len(ops_methods) < 2 { return fuse_sentinel() }
+    // Reverse to execution order (innermost first)
+    let mut rev_methods = []
+    let mut rev_args = []
+    let mut ri = len(ops_methods) - 1
+    while ri >= 0 {
+        rev_methods = rev_methods.push(ops_methods[ri])
+        rev_args = rev_args.push(ops_args[ri])
+        ri = ri - 1
+    }
+    // Evaluate root
+    let root = eval_expr(current)
+    if root.tag != TAG_ARRAY { return fuse_sentinel() }
+    let arr = get_array(root)
+    // Evaluate closures (may be void for sum/count)
+    let mut closures = []
+    let mut ci = 0
+    while ci < len(rev_methods) {
+        let m = rev_methods[ci]
+        if m == "sum" || m == "count" {
+            closures = closures.push(val_void())
+        } else {
+            let aa = rev_args[ci]
+            if len(aa) == 0 { return fuse_sentinel() }
+            closures = closures.push(eval_expr(aa[0]))
+        }
+        ci = ci + 1
+    }
+    let last_method = rev_methods[len(rev_methods) - 1]
+    let chain_len = len(rev_methods)
+    // map/filter terminal → array result
+    if last_method == "map" || last_method == "filter" {
+        let mut result = []
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" {
+                    val = call_fn_val(f, [val])
+                } else {
+                    if m == "filter" {
+                        let test = call_fn_val(f, [val])
+                        if !is_truthy(test) { keep = false }
+                    }
+                }
+                mi = mi + 1
+            }
+            if keep { result = result.push(val) }
+        }
+        return val_array(result)
+    }
+    // fold terminal: needs init + fn (skip last in chain loop, fold separately)
+    if last_method == "fold" {
+        let fold_args_raw = rev_args[chain_len - 1]
+        if len(fold_args_raw) < 2 { return fuse_sentinel() }
+        let mut acc = eval_expr(fold_args_raw[0])
+        let fold_fn = eval_expr(fold_args_raw[1])
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { acc = call_fn_val(fold_fn, [acc, val]) }
+        }
+        return acc
+    }
+    // sum / count
+    if last_method == "sum" {
+        let mut int_sum = 0
+        let mut has_float = false
+        let mut float_sum = 0.0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                if val.tag == TAG_FLOAT { has_float = true; float_sum = float_sum + val.float_val }
+                else { int_sum = int_sum + val.int_val; float_sum = float_sum + val.int_val }
+            }
+        }
+        if has_float { return val_float(float_sum) }
+        return val_int(int_sum)
+    }
+    if last_method == "count" {
+        let mut cnt = 0
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep { cnt = cnt + 1 }
+        }
+        return val_int(cnt)
+    }
+    // any / all / find — predicate is final closure
+    if last_method == "any" || last_method == "all" || last_method == "find" {
+        let pred = closures[chain_len - 1]
+        let is_any = (last_method == "any")
+        let is_find = (last_method == "find")
+        for item in arr {
+            let mut val = item
+            let mut keep = true
+            let mut mi = 0
+            while mi < chain_len - 1 && keep {
+                let m = rev_methods[mi]
+                let f = closures[mi]
+                if m == "map" { val = call_fn_val(f, [val]) }
+                else { if m == "filter" {
+                    let test = call_fn_val(f, [val])
+                    if !is_truthy(test) { keep = false }
+                } }
+                mi = mi + 1
+            }
+            if keep {
+                let test = call_fn_val(pred, [val])
+                if is_truthy(test) {
+                    if is_find { return val }
+                    if is_any { return val_bool(true) }
+                } else {
+                    if !is_any && !is_find { return val_bool(false) }
+                }
+            }
+        }
+        if is_any { return val_bool(false) }
+        if is_find { return val_void() }
+        return val_bool(true)
+    }
+    return fuse_sentinel()
+}
+
+// ── Pattern matching ────────────────────────────────────
+
+fn match_pattern(pattern, value) {
+    let pk = pattern.kind
+    // Wildcard _ matches anything
+    if pk == "Wildcard" { return true }
+    // Integer literal pattern
+    if pk == "IntLit" {
+        if value.tag == TAG_INT { return value.int_val == to_int(pattern.value) }
+        return false
+    }
+    // String literal pattern
+    if pk == "StringLit" {
+        if value.tag == TAG_STR { return value.str_val == pattern.value }
+        return false
+    }
+    // Bool literal pattern
+    if pk == "BoolLit" {
+        if value.tag == TAG_BOOL { return value.bool_val == (pattern.value == "true") }
+        return false
+    }
+    // Float literal pattern
+    if pk == "FloatLit" {
+        if value.tag == TAG_FLOAT { return value.float_val == to_float(pattern.value) }
+        return false
+    }
+    // Negative literal pattern: -1, -3.14 etc.
+    if pk == "UnaryOp" && pattern.op == "-" {
+        let inner = pattern.left
+        if inner.kind == "IntLit" {
+            if value.tag == TAG_INT { return value.int_val == -to_int(inner.value) }
+            return false
+        }
+        if inner.kind == "FloatLit" {
+            if value.tag == TAG_FLOAT { return value.float_val == -to_float(inner.value) }
+            return false
+        }
+        return false
+    }
+    // EnumPath pattern: EnumName::Variant or EnumName::Variant(binding)
+    if pk == "EnumPath" {
+        if value.tag != TAG_ENUM { return false }
+        // Match variant name
+        let expected = pattern.name + "::" + pattern.value
+        if value.struct_name != expected { return false }
+        // If pattern has data binding, bind it
+        let data_pattern = pattern.left
+        let multi_pats = pattern.items
+        if type_of(multi_pats) == "array" && len(multi_pats) > 0 {
+            // Multi-field variant: value data must be array
+            let data_val = get_enum_data(value)
+            if data_val.tag != TAG_ARRAY { return false }
+            let ditems = get_array(data_val)
+            if len(ditems) != len(multi_pats) { return false }
+            let mut mp = 0
+            while mp < len(multi_pats) {
+                let sub = multi_pats[mp]
+                if type_of(sub) != "string" && sub.kind == "Ident" {
+                    env_define(sub.name, ditems[mp])
+                } else {
+                    if !match_pattern(sub, ditems[mp]) { return false }
+                }
+                mp = mp + 1
+            }
+            return true
+        }
+        if type_of(data_pattern) != "string" || data_pattern != "" {
+            let data_val = get_enum_data(value)
+            // If data pattern is an Ident, bind it
+            if data_pattern.kind == "Ident" {
+                env_define(data_pattern.name, data_val)
+            } else {
+                // Literal data pattern — must match
+                return match_pattern(data_pattern, data_val)
+            }
+        }
+        return true
+    }
+    // Call pattern: Some(x), Ok(x), Err(x) — shorthand enum constructors
+    if pk == "Call" {
+        let callee = pattern.left
+        if type_of(callee) != "string" && callee.kind == "Ident" {
+            let ctor = callee.name
+            let mut enum_name = ""
+            let mut variant_name = ""
+            if ctor == "Some" { enum_name = "Option"; variant_name = "Some" }
+            if ctor == "Ok" { enum_name = "Result"; variant_name = "Ok" }
+            if ctor == "Err" { enum_name = "Result"; variant_name = "Err" }
+            if enum_name != "" {
+                // Must be an enum value matching this constructor
+                if value.tag != TAG_ENUM { return false }
+                let expected = enum_name + "::" + variant_name
+                if value.struct_name != expected { return false }
+                // Bind the data argument if present
+                let call_args = pattern.args
+                if type_of(call_args) == "array" && len(call_args) == 1 {
+                    let data_val = get_enum_data(value)
+                    let arg_pat = call_args[0]
+                    if type_of(arg_pat) != "string" && arg_pat.kind == "Ident" {
+                        env_define(arg_pat.name, data_val)
+                        return true
+                    }
+                    // Nested pattern match on data
+                    return match_pattern(arg_pat, data_val)
+                }
+                // No args — match variant with no data
+                if type_of(call_args) != "array" || len(call_args) == 0 {
+                    if get_enum_data(value).tag == TAG_VOID { return true }
+                }
+                return false
+            }
+        }
+        // Not a known constructor — evaluate and compare
+        let pattern_val = eval_expr(pattern)
+        return vals_equal(pattern_val, value)
+    }
+    // Array/tuple pattern: [a, b, c]
+    if pk == "Array" {
+        if value.tag != TAG_ARRAY { return false }
+        let items = get_array(value)
+        let pats = pattern.items
+        if type_of(pats) != "array" { return false }
+        if len(pats) != len(items) { return false }
+        let mut pi = 0
+        while pi < len(pats) {
+            if !match_pattern(pats[pi], items[pi]) { return false }
+            pi = pi + 1
+        }
+        return true
+    }
+    // Identifier pattern: check for known enum constant, otherwise variable binding
+    if pk == "Ident" {
+        let name = pattern.name
+        // Check if it's a known enum constant (e.g., None)
+        // rt 32-E: parallel arrays lookup
+        let mut ei = len(env_var_names) - 1
+        while ei >= 0 {
+            if env_var_names[ei] == name {
+                let existing = env_var_vals[ei]
+                if existing.tag == TAG_ENUM {
+                    // Compare enum values
+                    return vals_equal(existing, value)
+                }
+                // Not an enum — treat as binding below
+                ei = -1
+            } else {
+                ei = ei - 1
+            }
+        }
+        // Bind as variable
+        env_define(name, value)
+        return true
+    }
+    // Fallback: evaluate pattern as expression and compare
+    let pattern_val = eval_expr(pattern)
+    return vals_equal(pattern_val, value)
+}
+
+// ── Stack trace helper ──────────────────────────────────
+fn format_stack_trace() {
+    let mut trace = "Stack trace:"
+    let mut i = len(call_stack) - 1
+    while i >= 0 {
+        trace = trace + "\n  at " + call_stack[i]
+        i = i - 1
+    }
+    return trace
+}

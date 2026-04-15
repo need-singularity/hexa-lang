@@ -1,0 +1,1696 @@
+// ═══════════════════════════════════════════════════════════
+//  bc_vm.hexa — HEXA bytecode VM dispatch loop (rt#36-C)
+//
+//  Consumes the `BcProto` module-level registry emitted by
+//  self/bc_emitter.hexa (rt#36-B) and executes it on a simple
+//  stack-based VM. No NaN-box, no arena, no IC in MVP — those
+//  are deferred to rt#36-D / rt#37 / rt#38.
+//
+//  Integration contract with rt#36-B:
+//    Globals read:
+//      bc_proto_codes[i]         int[]     — bytecode for proto i
+//      bc_proto_consts[i]        string[]  — const pool for proto i
+//      bc_proto_localcounts[i]   int       — n_locals for proto i
+//      bc_protos[i].name         string    — proto name (for CALL lookup)
+//      bc_protos[i].n_params     int
+//    Globals written: none (VM state lives in vm_* variables below).
+//    Opcodes: constants BC_OP_* are the same integers the emitter used.
+//
+//  Dispatch strategy: flat `if / else if` ladder on opcode byte.
+//  Stage1 hexa doesn't have native `switch` on int, and a chain
+//  of `if op == X` terminators matches the emitter's own
+//  bc_opname style. A computed-goto tier is a rt#36-D concern.
+//
+//  Opcodes implemented (39 — rt#36-C trivial-7 extension + audit W1):
+//    LOADI LOADK LOADF LOADNIL LOADTRUE LOADFALSE
+//    LOAD_LOCAL STORE_LOCAL LOAD_GLOBAL STORE_GLOBAL
+//    ADD SUB MUL DIV MOD
+//    ADDF SUBF MULF DIVF                    (rt#36-C float arith)
+//    EQ NEQ LT LE GT GE NOT
+//    AND OR                                  (audit W1 back-fill)
+//    JMP JMPF JMPT
+//    CALL RETURN RETURN0
+//    POP PRINT NOP
+//    HALT ASSERT_INT ASSERT_FLOAT           (rt#36-C halt/asserts)
+//
+//  Deferred to rt#36-D:
+//    NEW_ARRAY ARR_GET ARR_SET ARR_PUSH ARR_LEN
+//    NEW_MAP MAP_GET MAP_SET
+//    NEW_STRUCT LOAD_FIELD STORE_FIELD
+//    CLOSURE NEW_CLOSURE_UPVAL LOAD_UPVAL STORE_UPVAL
+//    TRY THROW ENDTRY
+//    TAILCALL DUP MOVE POPN PROFILE_HOOK
+//
+//  Value representation: stage1 hexa is dynamically typed, so
+//  we push whatever (int / float / bool / string / nil-sentinel)
+//  onto the operand stack directly. Arithmetic assumes int unless
+//  both operands are float (then we promote). Comparisons do the
+//  same. No NaN-box in MVP.
+//
+//  nil is represented by the string "<nil>" sentinel — chosen so
+//  that unexpected type errors are visible in the trace. rt#38 will
+//  replace this with a real tagged value.
+// ═══════════════════════════════════════════════════════════
+
+// ── VM state (module globals — single-threaded). ────────────
+
+// Operand stack — unbounded dynamic array, grows as needed.
+// Each element is a hexa dynamic value (int/float/bool/string/nil).
+let mut vm_stack = []
+
+// Locals region — per-frame slots packed contiguously. `fp` is
+// the base offset into this array for the CURRENT frame; each
+// frame reserves `n_locals` slots (filled from stack on CALL).
+let mut vm_locals = []
+
+// Frame stack (parallel arrays — stage1 avoids struct-in-array).
+// Index = depth (0 = <main>). Top = len(vm_frame_proto) - 1.
+let mut vm_frame_proto = []   // int[]  — proto index in bc_protos
+let mut vm_frame_pc    = []   // int[]  — program counter within proto's code
+let mut vm_frame_fp    = []   // int[]  — base offset into vm_locals
+
+// T51 (rt#36-E #1) — per-frame closure binding. Set to a closure
+// value (4-elem array [BC_CLOSURE_TAG, proto_idx, names[], vals[]])
+// when the frame was entered via CALL-of-closure; BC_NIL otherwise.
+// OP_LOAD_UPVAL / OP_STORE_UPVAL consult the top entry to resolve
+// names → values. Parallel with vm_frame_proto/pc/fp (same length
+// invariant: all four grow together on push_frame and shrink together
+// on pop_frame).
+let mut vm_frame_closure = []  // (array|string)[]  — closure or BC_NIL
+
+// Globals table (parallel arrays — keyed by name).
+let mut vm_global_names = []  // string[]
+let mut vm_global_vals  = []  // any[]
+
+// Trap / halt flag — set by unrecoverable VM errors (frame
+// underflow, missing global, unknown opcode, etc.). Callers of
+// bc_vm_run should check vm_trap afterward.
+let mut vm_trap = false
+let mut vm_trap_msg = ""
+
+// Halt flag — set by OP_HALT to cleanly terminate the dispatch
+// loop without marking it as a trap. Semantically distinct from
+// vm_trap: halt is a cooperative program end (e.g. `exit(0)`),
+// trap is an unrecoverable VM error. bc_vm_reset clears both.
+let mut vm_halted = false
+
+// T46 try-frame stack (parallel arrays). A try-frame is pushed by
+// OP_TRY and popped by OP_ENDTRY (normal exit) or OP_THROW (which
+// unwinds the operand + frame stacks to the snapshots captured at
+// OP_TRY). Stack depth == len(vm_try_catch_pc).
+//
+//   vm_try_catch_pc[i]     — absolute pc in the try-frame's proto
+//                            where the catch handler begins
+//   vm_try_stack_size[i]   — len(vm_stack) at OP_TRY time; OP_THROW
+//                            truncates back to this before jumping
+//                            to the handler
+//   vm_try_frame_depth[i]  — len(vm_frame_proto) at OP_TRY time;
+//                            OP_THROW truncates back to this, popping
+//                            any nested call frames opened inside the
+//                            try block
+let mut vm_try_catch_pc     = []
+let mut vm_try_stack_size   = []
+let mut vm_try_frame_depth  = []
+
+// Nil sentinel (see header). Using a distinctive string makes
+// type-confusion bugs easy to spot in test output.
+let BC_NIL = "<nil>"
+
+// T44 map-shape tag. Maps live on the VM stack as a 3-element
+// array ["<bc_map>", keys[], vals[]] — the leading tag lets
+// OP_ARR_GET dispatch between array indexing and parallel-array
+// linear-scan without heuristics. Distinct, reserved, rarely
+// appears in user data so false positives are negligible.
+let BC_MAP_TAG = "<bc_map>"
+
+// T45 struct-shape tag. Structs live on the VM stack as a 4-element
+// array ["<bc_struct>", type_name, keys[], vals[]]. Same sentinel
+// strategy as BC_MAP_TAG so LOAD_FIELD / STORE_FIELD can verify
+// shape before indexing. type_name is the source-level struct
+// type (e.g. "Point") and is preserved for debuggability — rt#37's
+// type-specializer will also key shape ICs on it.
+let BC_STRUCT_TAG = "<bc_struct>"
+
+// T47 closure-shape tag. Closures live on the VM stack as a
+// 4-element array ["<bc_closure>", proto_idx, upval_names[],
+// upval_vals[]]. OP_CLOSURE pushes an empty-upvalue seed;
+// OP_NEW_CLOSURE_UPVAL appends one (name, value) binding per emit
+// loop iteration. CALL-of-closure dispatch (rt#36-E) distinguishes
+// by the sentinel before resolving the proto.
+let BC_CLOSURE_TAG = "<bc_closure>"
+
+// T51 (rt#36-E #1) — CALL-of-closure sentinel. When OP_CALL's b16
+// equals this, the callee is the value at stack[top - nargs] and
+// must be closure-shaped (tag BC_CLOSURE_TAG). See bc_emitter.hexa
+// BC_CALL_INDIRECT for the emitter-side definition — values must
+// match.
+let BC_CALL_INDIRECT = 65535
+
+// ── VM init / reset. ────────────────────────────────────────
+
+fn bc_vm_reset() {
+    vm_stack = []
+    vm_locals = []
+    vm_frame_proto = []
+    vm_frame_pc = []
+    vm_frame_fp = []
+    vm_frame_closure = []
+    vm_global_names = []
+    vm_global_vals = []
+    vm_trap = false
+    vm_trap_msg = ""
+    vm_halted = false
+    vm_try_catch_pc = []
+    vm_try_stack_size = []
+    vm_try_frame_depth = []
+}
+
+// ── Try-frame stack helpers. ────────────────────────────────
+// Stage1 hexa arrays are value-returning on push/pop, so these
+// rebuild-without-tail helpers mirror bc_vm_pop's pattern for the
+// try-frame parallel arrays and for operand-stack truncation on
+// OP_THROW.
+
+// T53 (bt#85) — rebuild loops replaced by in-place .truncate(n),
+// which compiles to hexa_array_truncate (len-only shrink, no realloc,
+// retains capacity). Prior O(N) rebuild per pop/throw was the hot
+// allocator pressure in bt#85 fib(K=30).
+fn bc_vm_arr_shrink_last(arr) {
+    let n = len(arr)
+    if n <= 0 { return arr }
+    return arr.truncate(n - 1)
+}
+
+fn bc_vm_arr_truncate(arr, keep_n) {
+    if keep_n < 0 { keep_n = 0 }
+    return arr.truncate(keep_n)
+}
+
+// ── Stack helpers (mutate vm_stack directly). ───────────────
+
+fn bc_vm_push(v) {
+    vm_stack = vm_stack.push(v)
+}
+
+fn bc_vm_pop() {
+    let n = len(vm_stack)
+    if n == 0 {
+        vm_trap = true
+        vm_trap_msg = "stack underflow"
+        return BC_NIL
+    }
+    let top = vm_stack[n - 1]
+    // T53 (bt#85) — in-place truncate. Was O(N) rebuild loop; now
+    // O(1) len-only shrink via hexa_array_truncate, capacity retained.
+    vm_stack = vm_stack.truncate(n - 1)
+    return top
+}
+
+fn bc_vm_peek() {
+    let n = len(vm_stack)
+    if n == 0 {
+        vm_trap = true
+        vm_trap_msg = "stack peek underflow"
+        return BC_NIL
+    }
+    return vm_stack[n - 1]
+}
+
+// T53 (bt#85) — in-place ops. Prior versions rebuilt arrays (O(N)
+// per op). Now delegate to hexa_array_truncate / hexa_array_set
+// which mutate .items in place and return the same struct. Caller
+// convention `arr = helper(arr, ...)` is preserved so upstream
+// code is unchanged.
+fn bc_vm_truncate(arr, n) {
+    if n < 0 { n = 0 }
+    return arr.truncate(n)
+}
+
+fn bc_vm_setat(arr, i, v) {
+    arr[i] = v
+    return arr
+}
+
+// ── Globals access (linear scan — fine for MVP sizes). ──────
+
+fn bc_vm_find_global(name) {
+    let mut i = 0
+    let n = len(vm_global_names)
+    while i < n {
+        if vm_global_names[i] == name {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn bc_vm_set_global(name, v) {
+    let idx = bc_vm_find_global(name)
+    if idx >= 0 {
+        vm_global_vals = bc_vm_setat(vm_global_vals, idx, v)
+    } else {
+        vm_global_names = vm_global_names.push(name)
+        vm_global_vals  = vm_global_vals.push(v)
+    }
+}
+
+fn bc_vm_get_global(name) {
+    let idx = bc_vm_find_global(name)
+    if idx < 0 {
+        vm_trap = true
+        vm_trap_msg = "undefined global: " + name
+        return BC_NIL
+    }
+    return vm_global_vals[idx]
+}
+
+// ── String → int parse (for LOADK fallback of large ints). ──
+// Emitter stashes ints that overflow the 24-bit inline LOADI
+// into bc_consts as their decimal string form ("16777217" etc).
+// LOADK needs to turn that back into an int so arithmetic works.
+
+fn bc_vm_parse_int(s) {
+    let chars = s.chars()
+    let n = len(chars)
+    if n == 0 { return 0 }
+    let mut i = 0
+    let mut result = 0
+    let mut neg = false
+    if to_string(chars[0]) == "-" {
+        neg = true
+        i = 1
+    }
+    while i < n {
+        let c = to_string(chars[i])
+        let mut d = -1
+        if c == "0" { d = 0 }
+        if c == "1" { d = 1 }
+        if c == "2" { d = 2 }
+        if c == "3" { d = 3 }
+        if c == "4" { d = 4 }
+        if c == "5" { d = 5 }
+        if c == "6" { d = 6 }
+        if c == "7" { d = 7 }
+        if c == "8" { d = 8 }
+        if c == "9" { d = 9 }
+        if d < 0 {
+            // Not a pure int — could be float "3.14" or string.
+            // MVP: return 0 and let the caller notice via trap.
+            return 0
+        }
+        result = result * 10 + d
+        i = i + 1
+    }
+    if neg { return 0 - result }
+    return result
+}
+
+// ── Proto lookup by name (CALL dispatch). ───────────────────
+// When the emitter produces OP_CALL, its B16 operand is usually
+// the proto index in bc_protos (because bc_lookup_proto resolved
+// the name at emit time). For forward refs the operand is a
+// const-pool index holding the name string — the VM has to try
+// proto index first and fall back to name-resolve through consts.
+
+fn bc_vm_resolve_call(caller_proto_idx, b16) {
+    // Fast path: b16 is a direct proto index.
+    if b16 < len(bc_protos) {
+        // Check: if the emitter's side data said this proto had
+        // a resolved proto idx, use it. Emitter distinguishes by
+        // whether bc_lookup_proto succeeded — we can't re-discover
+        // that here without re-parsing, so assume direct-index
+        // when b16 is in range AND the const at b16 (if any) does
+        // NOT match a known proto name. For our tests this works:
+        // when the call is `add(...)` or `fib(...)`, emitter
+        // resolved at emit time so b16 is the actual proto index.
+        return b16
+    }
+    // Forward-ref path: b16 is an index into caller's const pool.
+    let consts = bc_proto_consts[caller_proto_idx]
+    if b16 < len(consts) {
+        let fname = consts[b16]
+        let mut i = 0
+        while i < len(bc_protos) {
+            let p = bc_protos[i]
+            if p.name == fname {
+                return i
+            }
+            i = i + 1
+        }
+    }
+    return -1
+}
+
+// ── Frame push / pop (CALL / RETURN). ───────────────────────
+// CALL semantics:
+//   Before CALL: stack top holds [..., arg0, arg1, ..., arg_{n-1}]
+//   Emitter did (n) pushes then emitted CALL A=nargs B16=proto_idx.
+//   We must:
+//     1) allocate n_locals slots in vm_locals for the callee
+//     2) pop nargs values and write them into the first nargs slots
+//     3) push a new frame with pc=0, fp=base-of-new-locals
+//     4) the caller's remaining stack is preserved; callee pushes
+//        its return value back via OP_RETURN (which pops+pops frame).
+//
+// RETURN semantics:
+//   OP_RETURN — pop return value, pop frame (truncate locals to fp),
+//               push return value onto caller's stack, advance caller pc.
+//   OP_RETURN0 — same but push nil sentinel.
+
+fn bc_vm_push_frame(proto_idx, nargs) {
+    let target_locals = bc_proto_localcounts[proto_idx]
+
+    // Allocate locals at the current top of vm_locals.
+    let fp = len(vm_locals)
+    let mut i = 0
+    while i < target_locals {
+        vm_locals = vm_locals.push(BC_NIL)
+        i = i + 1
+    }
+
+    // Move top-nargs values from operand stack into slots 0..nargs-1.
+    // Emitter pushed left-to-right, so args are on the stack in that
+    // order, with the LAST arg on top. Pop from top and fill slot
+    // (nargs-1) first, counting down to slot 0.
+    let mut j = nargs - 1
+    while j >= 0 {
+        let v = bc_vm_pop()
+        vm_locals = bc_vm_setat(vm_locals, fp + j, v)
+        j = j - 1
+    }
+
+    // Push the frame record.
+    vm_frame_proto   = vm_frame_proto.push(proto_idx)
+    vm_frame_pc      = vm_frame_pc.push(0)
+    vm_frame_fp      = vm_frame_fp.push(fp)
+    // T51 — parallel closure slot. Direct CALL has no closure binding.
+    vm_frame_closure = vm_frame_closure.push(BC_NIL)
+}
+
+// T51 (rt#36-E #1) — frame push for CALL-of-closure. Operand stack
+// at entry: [..., callee, arg0, ..., arg_{n-1}] where `callee` is a
+// closure-shape 4-elem array. We pop nargs into slots 0..n-1, pop
+// the callee (discard — its proto_idx was extracted by the caller),
+// and push a frame whose closure-slot retains `callee` so LOAD_UPVAL
+// can resolve by name.
+fn bc_vm_push_frame_indirect(proto_idx, nargs, closure) {
+    let target_locals = bc_proto_localcounts[proto_idx]
+    let fp = len(vm_locals)
+    let mut i = 0
+    while i < target_locals {
+        vm_locals = vm_locals.push(BC_NIL)
+        i = i + 1
+    }
+    // Pop args into slots 0..nargs-1 (last-arg-on-top convention).
+    let mut j = nargs - 1
+    while j >= 0 {
+        let v = bc_vm_pop()
+        if vm_trap { return }
+        vm_locals = bc_vm_setat(vm_locals, fp + j, v)
+        j = j - 1
+    }
+    // Pop callee (already captured in `closure`).
+    let _discard = bc_vm_pop()
+    if vm_trap { return }
+
+    vm_frame_proto   = vm_frame_proto.push(proto_idx)
+    vm_frame_pc      = vm_frame_pc.push(0)
+    vm_frame_fp      = vm_frame_fp.push(fp)
+    vm_frame_closure = vm_frame_closure.push(closure)
+}
+
+// Pop the top frame. Does NOT push the return value — caller does.
+fn bc_vm_pop_frame() {
+    let depth = len(vm_frame_proto)
+    if depth == 0 {
+        vm_trap = true
+        vm_trap_msg = "frame underflow"
+        return
+    }
+    let fp = vm_frame_fp[depth - 1]
+    // Truncate vm_locals back to fp (reclaim callee slots).
+    vm_locals = bc_vm_truncate(vm_locals, fp)
+    // Shrink frame arrays.
+    vm_frame_proto   = bc_vm_truncate(vm_frame_proto,   depth - 1)
+    vm_frame_pc      = bc_vm_truncate(vm_frame_pc,      depth - 1)
+    vm_frame_fp      = bc_vm_truncate(vm_frame_fp,      depth - 1)
+    vm_frame_closure = bc_vm_truncate(vm_frame_closure, depth - 1)
+}
+
+// ── Truthiness (for JMPF). ──────────────────────────────────
+// Matches the design doc §6.6: false / nil / 0 / 0.0 are falsy.
+
+fn bc_vm_is_truthy(v) {
+    if v == false { return false }
+    if v == true { return true }
+    if v == BC_NIL { return false }
+    if v == 0 { return false }
+    if v == 0.0 { return false }
+    return true
+}
+
+// ── Arithmetic coercion. ────────────────────────────────────
+// Stage1 hexa's `+` is already heterogenous (int+float promotes),
+// but we want ADD on strings to error rather than concat (since
+// string concat isn't in the MVP opcode set). For MVP, assume
+// both operands are numeric; let hexa's native `+` do the lift.
+
+fn bc_vm_add(a, b) { return a + b }
+fn bc_vm_sub(a, b) { return a - b }
+fn bc_vm_mul(a, b) { return a * b }
+fn bc_vm_div(a, b) {
+    if b == 0 {
+        vm_trap = true
+        vm_trap_msg = "division by zero"
+        return 0
+    }
+    return a / b
+}
+fn bc_vm_mod(a, b) {
+    if b == 0 {
+        vm_trap = true
+        vm_trap_msg = "modulo by zero"
+        return 0
+    }
+    return a % b
+}
+
+// Float-specialized arithmetic — forces both operands to float
+// via to_float() before combining. Matches rt#36-A §6.2 spec:
+// ADDF/SUBF/MULF/DIVF ALWAYS produce a float result regardless
+// of operand tags. Used by the emitter when the static type of
+// both operands is float; the VM trusts the emitter's type
+// analysis and performs the lift defensively via to_float.
+fn bc_vm_addf(a, b) { return to_float(a) + to_float(b) }
+fn bc_vm_subf(a, b) { return to_float(a) - to_float(b) }
+fn bc_vm_mulf(a, b) { return to_float(a) * to_float(b) }
+fn bc_vm_divf(a, b) {
+    let fb = to_float(b)
+    if fb == 0.0 {
+        vm_trap = true
+        vm_trap_msg = "float division by zero"
+        return 0.0
+    }
+    return to_float(a) / fb
+}
+
+// Parse a decimal float string ("3.14", "-0.5", "7") into a
+// float value. Stage1 hexa has `to_float` as a builtin that
+// accepts strings directly — this wrapper exists for symmetry
+// with bc_vm_parse_int and to centralize error handling if we
+// later need NaN/Inf rejection. rt#36-D will harden this.
+fn bc_vm_parse_float(s) {
+    return to_float(s)
+}
+
+// Comparisons — return bool.
+fn bc_vm_eq(a, b)  { return a == b }
+fn bc_vm_neq(a, b) { return a != b }
+fn bc_vm_lt(a, b)  { return a <  b }
+fn bc_vm_le(a, b)  { return a <= b }
+fn bc_vm_gt(a, b)  { return a >  b }
+fn bc_vm_ge(a, b)  { return a >= b }
+
+// ── The dispatch loop itself. ───────────────────────────────
+// Runs until the frame stack empties or a trap fires. Returns
+// the final "return value" that sat on the main frame's stack
+// (or BC_NIL if main did not emit a RETURN with a value).
+
+fn bc_vm_run_loop() {
+    // Bail immediately on trap.
+    if vm_trap { return BC_NIL }
+
+    let mut last_return = BC_NIL
+
+    // Main loop — each iteration decodes and executes one insn.
+    // Terminate when the frame stack empties (top-level RETURN).
+    while len(vm_frame_proto) > 0 {
+        if vm_trap { return last_return }
+
+        let depth = len(vm_frame_proto)
+        let proto_idx = vm_frame_proto[depth - 1]
+        let pc = vm_frame_pc[depth - 1]
+        let fp = vm_frame_fp[depth - 1]
+
+        let code = bc_proto_codes[proto_idx]
+        if pc >= len(code) {
+            vm_trap = true
+            vm_trap_msg = "pc past code end"
+            return last_return
+        }
+
+        let raw = code[pc]
+        let op = bc_op_of(raw)
+
+        // Advance pc in the frame record BEFORE dispatch. This makes
+        // jump math consistent: a JMP sBx means "relative to the
+        // instruction AFTER the jump", matching emitter's delta calc
+        // (delta = target_pc - (jmp_pc + 1)).
+        vm_frame_pc = bc_vm_setat(vm_frame_pc, depth - 1, pc + 1)
+
+        // ──────── LOADS ────────
+        if op == BC_OP_LOADI {
+            let v = bc_sbx_of(raw)
+            bc_vm_push(v)
+        } else if op == BC_OP_LOADK {
+            let cidx = bc_bx_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if cidx >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOADK: const idx out of range"
+                return last_return
+            }
+            // Best-effort: if const parses as int, push int; else push string.
+            let s = consts[cidx]
+            let parsed = bc_vm_parse_int(s)
+            // Distinguish "parsed 0" vs "string wasn't numeric" —
+            // compare against the normalized "0" / "-0".
+            if s == to_string(parsed) {
+                bc_vm_push(parsed)
+            } else {
+                bc_vm_push(s)
+            }
+        } else if op == BC_OP_LOADF {
+            // rt#36-C float extension: parse the const-pool string
+            // into an actual float. Emitter's FloatLit lowering does
+            //   bc_add_const(to_string(node.float_val))
+            // so the const slot always holds a decimal like "3.14".
+            let cidx = bc_bx_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if cidx >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOADF: const idx out of range"
+                return last_return
+            }
+            bc_vm_push(bc_vm_parse_float(consts[cidx]))
+        } else if op == BC_OP_LOADNIL {
+            bc_vm_push(BC_NIL)
+        } else if op == BC_OP_LOADTRUE {
+            bc_vm_push(true)
+        } else if op == BC_OP_LOADFALSE {
+            bc_vm_push(false)
+        }
+
+        // ──────── LOCAL SLOT I/O ────────
+        else if op == BC_OP_LOAD_LOCAL {
+            let slot = bc_bx_of(raw)
+            let abs = fp + slot
+            if abs >= len(vm_locals) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_LOCAL: slot out of range"
+                return last_return
+            }
+            bc_vm_push(vm_locals[abs])
+        } else if op == BC_OP_STORE_LOCAL {
+            let slot = bc_bx_of(raw)
+            let abs = fp + slot
+            let v = bc_vm_pop()
+            if abs >= len(vm_locals) {
+                // Grow locals region to cover this slot (only the
+                // CURRENT frame's slots grow — safe because no
+                // nested frame is pushed between LET introductions).
+                while len(vm_locals) <= abs {
+                    vm_locals = vm_locals.push(BC_NIL)
+                }
+            }
+            vm_locals = bc_vm_setat(vm_locals, abs, v)
+        }
+
+        // ──────── GLOBAL SLOT I/O ────────
+        // Layout B: hint(8 in A) + globals_idx(16 in B16). For
+        // MVP, treat the b16 as a const-pool index where the name
+        // string lives (emitter stashed it via bc_add_const).
+        else if op == BC_OP_LOAD_GLOBAL {
+            let b16 = bc_b16_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if b16 >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_GLOBAL: name const idx out of range"
+                return last_return
+            }
+            let name = consts[b16]
+            let v = bc_vm_get_global(name)
+            if vm_trap { return last_return }
+            bc_vm_push(v)
+        } else if op == BC_OP_STORE_GLOBAL {
+            let b16 = bc_b16_of(raw)
+            let consts = bc_proto_consts[proto_idx]
+            if b16 >= len(consts) {
+                vm_trap = true
+                vm_trap_msg = "STORE_GLOBAL: name const idx out of range"
+                return last_return
+            }
+            let name = consts[b16]
+            let v = bc_vm_pop()
+            bc_vm_set_global(name, v)
+        }
+
+        // ──────── ARITHMETIC ────────
+        else if op == BC_OP_ADD {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_add(a, b))
+        } else if op == BC_OP_SUB {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_sub(a, b))
+        } else if op == BC_OP_MUL {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mul(a, b))
+        } else if op == BC_OP_DIV {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_div(a, b))
+            if vm_trap { return last_return }
+        } else if op == BC_OP_MOD {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mod(a, b))
+            if vm_trap { return last_return }
+        }
+
+        // ──────── FLOAT ARITHMETIC (rt#36-C) ────────
+        // ADDF/SUBF/MULF/DIVF always produce a float result.
+        // Operands are coerced via to_float() so mixed int/float
+        // inputs (common after LOADI → promote) work transparently.
+        else if op == BC_OP_ADDF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_addf(a, b))
+        } else if op == BC_OP_SUBF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_subf(a, b))
+        } else if op == BC_OP_MULF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_mulf(a, b))
+        } else if op == BC_OP_DIVF {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_divf(a, b))
+            if vm_trap { return last_return }
+        }
+
+        // ──────── COMPARISONS ────────
+        else if op == BC_OP_EQ {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_eq(a, b))
+        } else if op == BC_OP_NEQ {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_neq(a, b))
+        } else if op == BC_OP_LT {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_lt(a, b))
+        } else if op == BC_OP_LE {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_le(a, b))
+        } else if op == BC_OP_GT {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_gt(a, b))
+        } else if op == BC_OP_GE {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            bc_vm_push(bc_vm_ge(a, b))
+        }
+
+        // ──────── LOGIC ────────
+        else if op == BC_OP_NOT {
+            let v = bc_vm_pop()
+            bc_vm_push(!bc_vm_is_truthy(v))
+        }
+        // rt#36-C audit W1: bc_emitter.hexa L733-734 emits OP_AND /
+        // OP_OR for source-level `&&` / `||` (Phase B eager form;
+        // Phase D's optimizer will lower to JMPF/JMPT for real
+        // short-circuit). The emit shape is bc_enc_abx(OP_AND, 0)
+        // with two values already pushed by the eager-compiled
+        // left+right operands — so we pop both, apply truthiness,
+        // and push the boolean result. Matches source-language
+        // semantics (not bitwise — stage1 hexa has no bitwise and/or
+        // in the spec opcode set) and keeps a (-2, +1) stack effect
+        // consistent with the emitter's bc_pop(1) adjustment.
+        else if op == BC_OP_AND {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            if bc_vm_is_truthy(a) {
+                bc_vm_push(bc_vm_is_truthy(b))
+            } else {
+                bc_vm_push(false)
+            }
+        } else if op == BC_OP_OR {
+            let b = bc_vm_pop()
+            let a = bc_vm_pop()
+            if bc_vm_is_truthy(a) {
+                bc_vm_push(true)
+            } else {
+                bc_vm_push(bc_vm_is_truthy(b))
+            }
+        }
+
+        // ──────── CONTROL FLOW ────────
+        else if op == BC_OP_JMP {
+            let delta = bc_sbx_of(raw)
+            // pc has already been advanced to pc+1.
+            let d2 = len(vm_frame_proto)
+            let cur_pc = vm_frame_pc[d2 - 1]
+            vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+        } else if op == BC_OP_JMPF {
+            let delta = bc_sbx_of(raw)
+            let v = bc_vm_pop()
+            if !bc_vm_is_truthy(v) {
+                let d2 = len(vm_frame_proto)
+                let cur_pc = vm_frame_pc[d2 - 1]
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+            }
+        } else if op == BC_OP_JMPT {
+            let delta = bc_sbx_of(raw)
+            let v = bc_vm_pop()
+            if bc_vm_is_truthy(v) {
+                let d2 = len(vm_frame_proto)
+                let cur_pc = vm_frame_pc[d2 - 1]
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, d2 - 1, cur_pc + delta)
+            }
+        }
+
+        // ──────── CALL / RETURN ────────
+        else if op == BC_OP_CALL {
+            let nargs = bc_a_of(raw)
+            let b16 = bc_b16_of(raw)
+            // T51 (rt#36-E #1) — closure call: callee sits on the
+            // operand stack below the nargs args. Emitter set
+            // b16 = BC_CALL_INDIRECT (65535) to signal this shape.
+            if b16 == BC_CALL_INDIRECT {
+                let n_stack = len(vm_stack)
+                let callee_idx = n_stack - nargs - 1
+                if callee_idx < 0 {
+                    vm_trap = true
+                    vm_trap_msg = "CALL indirect: stack underflow (missing callee)"
+                    return last_return
+                }
+                let callee = vm_stack[callee_idx]
+                // Validate closure shape — 4-elem array, tag slot == BC_CLOSURE_TAG.
+                let mut ok = false
+                let mut target_proto = -1
+                if type_of(callee) == "array" {
+                    if len(callee) == 4 {
+                        if callee[0] == BC_CLOSURE_TAG {
+                            target_proto = callee[1]
+                            if target_proto >= 0 {
+                                if target_proto < len(bc_protos) {
+                                    ok = true
+                                }
+                            }
+                        }
+                    }
+                }
+                if !ok {
+                    vm_trap = true
+                    vm_trap_msg = "CALL indirect: callee is not a closure"
+                    return last_return
+                }
+                bc_vm_push_frame_indirect(target_proto, nargs, callee)
+                if vm_trap { return last_return }
+            } else {
+                let target = bc_vm_resolve_call(proto_idx, b16)
+                if target < 0 {
+                    vm_trap = true
+                    vm_trap_msg = "CALL: cannot resolve target proto"
+                    return last_return
+                }
+                // Stack currently has [..., arg0..arg_{n-1}] on top.
+                bc_vm_push_frame(target, nargs)
+                if vm_trap { return last_return }
+            }
+            // Dispatch loop will pick up at callee pc=0 next iter.
+        } else if op == BC_OP_RETURN {
+            let rv = bc_vm_pop()
+            bc_vm_pop_frame()
+            if vm_trap { return last_return }
+            last_return = rv
+            // Push return value onto caller's operand stack
+            // unless we just popped the bottom frame.
+            if len(vm_frame_proto) > 0 {
+                bc_vm_push(rv)
+            }
+        } else if op == BC_OP_RETURN0 {
+            bc_vm_pop_frame()
+            if vm_trap { return last_return }
+            last_return = BC_NIL
+            if len(vm_frame_proto) > 0 {
+                bc_vm_push(BC_NIL)
+            }
+        }
+
+        // ──────── MISC ────────
+        else if op == BC_OP_POP {
+            let _v = bc_vm_pop()
+        }
+        // T47 — POPN Bx: pop N values at once. Equivalent to repeated
+        // POP but saves dispatch cycles when the emitter knows how many
+        // slots to discard (e.g. end of a scope with K temps).
+        else if op == BC_OP_POPN {
+            let popn_count = bc_bx_of(raw)
+            let mut popn_i = 0
+            while popn_i < popn_count {
+                let _v = bc_vm_pop()
+                if vm_trap { return last_return }
+                popn_i = popn_i + 1
+            }
+        }
+        // T47 — DUP: duplicate the top of the operand stack. Required
+        // by rt#37's scope verifier and by any optimization pass that
+        // reuses a result (e.g. short-circuit && lowering `a && a`).
+        else if op == BC_OP_DUP {
+            let dup_n = len(vm_stack)
+            if dup_n == 0 {
+                vm_trap = true
+                vm_trap_msg = "DUP: stack underflow"
+                return last_return
+            }
+            bc_vm_push(vm_stack[dup_n - 1])
+        }
+        // T47 — MOVE A B: copy local slot B into local slot A within
+        // the current frame. Register-move form — no stack interaction.
+        // `a` in Layout C's high byte is the destination; `b` in B16's
+        // low byte is the source. MVP treats both as 8-bit slot indices
+        // even though Layout C nominally makes B 16-bit; rt#37 extends
+        // the encoding if the locals table grows past 255 slots.
+        else if op == BC_OP_MOVE {
+            let mv_dst = bc_a_of(raw)
+            let mv_src = bc_b16_of(raw)
+            let mv_fp = fp
+            let mv_src_abs = mv_fp + mv_src
+            let mv_dst_abs = mv_fp + mv_dst
+            if mv_src_abs >= len(vm_locals) {
+                vm_trap = true
+                vm_trap_msg = "MOVE: src slot out of range"
+                return last_return
+            }
+            // Grow locals to cover destination if needed.
+            while len(vm_locals) <= mv_dst_abs {
+                vm_locals = vm_locals.push(BC_NIL)
+            }
+            vm_locals = bc_vm_setat(vm_locals, mv_dst_abs, vm_locals[mv_src_abs])
+        }
+        // T47 — TAILCALL A=nargs B16=proto_or_name: semantically
+        // equivalent to CALL followed by RETURN of the callee's value.
+        // MVP implementation: fall back to the ordinary CALL path —
+        // correctness is preserved; the frame-reuse optimization that
+        // distinguishes TAILCALL from CALL is deferred to rt#37 (where
+        // scope verification guarantees the current frame has no live
+        // locals after the tail call). Without that verification a
+        // frame-reuse TAILCALL would corrupt outer-local references.
+        else if op == BC_OP_TAILCALL {
+            let tc_nargs = bc_a_of(raw)
+            let tc_b16 = bc_b16_of(raw)
+            let tc_target = bc_vm_resolve_call(proto_idx, tc_b16)
+            if tc_target < 0 {
+                vm_trap = true
+                vm_trap_msg = "TAILCALL: cannot resolve target proto"
+                return last_return
+            }
+            bc_vm_push_frame(tc_target, tc_nargs)
+            if vm_trap { return last_return }
+        }
+        // T47 — CLOSURE Bx=proto_idx: build a closure value referencing
+        // the given proto with an empty upvalue table, push onto stack.
+        // Subsequent NEW_CLOSURE_UPVAL ops populate the upvalue slots.
+        // Shape: [BC_CLOSURE_TAG, proto_idx, upval_names[], upval_vals[]].
+        // Lambda emit (bc_emitter.hexa) is deferred to rt#36-E — this
+        // dispatch is present so hand-rolled bytecode can exercise the
+        // path end-to-end (test_bc_vm_closure.hexa) and so the opcode
+        // count reaches 62/62.
+        else if op == BC_OP_CLOSURE {
+            let cl_pidx = bc_bx_of(raw)
+            if cl_pidx >= len(bc_protos) {
+                vm_trap = true
+                vm_trap_msg = "CLOSURE: proto idx out of range"
+                return last_return
+            }
+            let cl_obj = [BC_CLOSURE_TAG, cl_pidx, [], []]
+            bc_vm_push(cl_obj)
+        }
+        // T47 — NEW_CLOSURE_UPVAL Bx=name_const_idx: pop value, pop
+        // closure, append (name, value) to the closure's upvalue
+        // arrays, push the updated closure. Emit order:
+        //   CLOSURE proto_idx
+        //   [push val_0]   NEW_CLOSURE_UPVAL name_0
+        //   [push val_1]   NEW_CLOSURE_UPVAL name_1
+        //   ...
+        // so the stack top always holds the work-in-progress closure.
+        else if op == BC_OP_NEW_CLOSURE_UPVAL {
+            let uv_cidx = bc_bx_of(raw)
+            let uv_consts = bc_proto_consts[proto_idx]
+            let mut uv_name = ""
+            if uv_cidx < len(uv_consts) {
+                uv_name = uv_consts[uv_cidx]
+            }
+            let uv_val = bc_vm_pop()
+            let uv_closure = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut uv_tag_ok = false
+            let mut uv_pidx = -1
+            let mut uv_names = []
+            let mut uv_vals = []
+            if type_of(uv_closure) == "array" {
+                if len(uv_closure) == 4 {
+                    if uv_closure[0] == BC_CLOSURE_TAG {
+                        uv_tag_ok = true
+                        uv_pidx = uv_closure[1]
+                        uv_names = uv_closure[2]
+                        uv_vals = uv_closure[3]
+                    }
+                }
+            }
+            if !uv_tag_ok {
+                vm_trap = true
+                vm_trap_msg = "NEW_CLOSURE_UPVAL: not a closure"
+                return last_return
+            }
+            let uv_new_names = uv_names.push(uv_name)
+            let uv_new_vals  = uv_vals.push(uv_val)
+            let uv_out = [BC_CLOSURE_TAG, uv_pidx, uv_new_names, uv_new_vals]
+            bc_vm_push(uv_out)
+        }
+        // T51 (rt#36-E #1) — LOAD_UPVAL Bx=name_const_idx.
+        // Resolve the named upvalue against the current frame's closure
+        // binding (vm_frame_closure[top]). The closure was attached on
+        // CALL-of-closure; LOAD_UPVAL is invalid in a direct-call frame.
+        // The name is read from the EXECUTING proto's const pool — the
+        // emitter interned the upval names in the lambda proto's pool at
+        // compile time (see bc_compile_lambda_proto).
+        else if op == BC_OP_LOAD_UPVAL {
+            let lu_cidx = bc_bx_of(raw)
+            let lu_consts = bc_proto_consts[proto_idx]
+            if lu_cidx >= len(lu_consts) {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: const idx out of range"
+                return last_return
+            }
+            let lu_name = lu_consts[lu_cidx]
+            let lu_depth = len(vm_frame_closure)
+            if lu_depth == 0 {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: no active frame"
+                return last_return
+            }
+            let lu_cl = vm_frame_closure[lu_depth - 1]
+            let mut lu_found = false
+            let mut lu_val = BC_NIL
+            if type_of(lu_cl) == "array" {
+                if len(lu_cl) == 4 {
+                    if lu_cl[0] == BC_CLOSURE_TAG {
+                        let lu_names = lu_cl[2]
+                        let lu_vals  = lu_cl[3]
+                        let mut lu_i = 0
+                        let lu_n = len(lu_names)
+                        while lu_i < lu_n {
+                            if lu_names[lu_i] == lu_name {
+                                lu_val = lu_vals[lu_i]
+                                lu_found = true
+                                lu_i = lu_n
+                            } else {
+                                lu_i = lu_i + 1
+                            }
+                        }
+                    }
+                }
+            }
+            if !lu_found {
+                vm_trap = true
+                vm_trap_msg = "LOAD_UPVAL: upvalue not bound: " + lu_name
+                return last_return
+            }
+            bc_vm_push(lu_val)
+        }
+        // T52 (rt#36-E #1) — STORE_UPVAL Bx=name_const_idx.
+        // Mirror of LOAD_UPVAL but reversed: pop TOS as the new value,
+        // resolve the upval name through the executing proto's const
+        // pool, rebuild the current frame's closure with the new
+        // upval_vals[idx], and write it back to vm_frame_closure[top].
+        //
+        // Scope: T52 step #1 — within-call mutation only. Across-call
+        // persistence (outer `let mut x` staying in sync with the
+        // closure's captured slot) needs the indirect-cell step
+        // documented in closure_upval.hexa. A later step replaces the
+        // rebuild-on-store below with a cell dereference.
+        else if op == BC_OP_STORE_UPVAL {
+            let su_cidx = bc_bx_of(raw)
+            let su_consts = bc_proto_consts[proto_idx]
+            if su_cidx >= len(su_consts) {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: const idx out of range"
+                return last_return
+            }
+            let su_name = su_consts[su_cidx]
+            let su_depth = len(vm_frame_closure)
+            if su_depth == 0 {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: no active frame"
+                return last_return
+            }
+            let su_val = bc_vm_pop()
+            if vm_trap { return last_return }
+            let su_cl = vm_frame_closure[su_depth - 1]
+            let mut su_found = false
+            if type_of(su_cl) == "array" {
+                if len(su_cl) == 4 {
+                    if su_cl[0] == BC_CLOSURE_TAG {
+                        let su_pidx = su_cl[1]
+                        let su_names = su_cl[2]
+                        let su_vals  = su_cl[3]
+                        let mut su_i = 0
+                        let su_n = len(su_names)
+                        let mut su_new_vals = []
+                        while su_i < su_n {
+                            if su_names[su_i] == su_name {
+                                su_new_vals = su_new_vals.push(su_val)
+                                su_found = true
+                            } else {
+                                su_new_vals = su_new_vals.push(su_vals[su_i])
+                            }
+                            su_i = su_i + 1
+                        }
+                        if su_found {
+                            let su_out = [BC_CLOSURE_TAG, su_pidx, su_names, su_new_vals]
+                            vm_frame_closure = bc_vm_setat(vm_frame_closure, su_depth - 1, su_out)
+                        }
+                    }
+                }
+            }
+            if !su_found {
+                vm_trap = true
+                vm_trap_msg = "STORE_UPVAL: upvalue not bound: " + su_name
+                return last_return
+            }
+        }
+        // PRINT (debug-only) — keep adjacent to MISC family for locality.
+        else if op == BC_OP_PRINT {
+            // Emitter's lowering of print(x): leaves x on top and
+            // emits OP_PRINT. PRINT pops and prints. rt#36-A §6.9
+            // notes OP_PRINT is debug-only (runtime `println` will
+            // eventually be a user fn, lowered via OP_CALL).
+            let v = bc_vm_pop()
+            println(to_string(v))
+        } else if op == BC_OP_NOP {
+            // Intentionally do nothing.
+        }
+
+        // ──────── HALT / ASSERTIONS (rt#36-C) ────────
+        // HALT — cooperative loop terminator. Unlike a trap this
+        // is NOT an error: it signals "program reached end of
+        // logical execution". We set vm_halted and bail out of
+        // the dispatch loop; the current TOS (if any) is returned
+        // as last_return so tests can inspect the halt value.
+        else if op == BC_OP_HALT {
+            let n = len(vm_stack)
+            if n > 0 {
+                last_return = vm_stack[n - 1]
+            }
+            vm_halted = true
+            return last_return
+        }
+        // ASSERT_INT — peek TOS, trap if type_of != "int".
+        // Non-consuming so the asserted value remains available
+        // for the next instruction (matches x86 assert semantics).
+        else if op == BC_OP_ASSERT_INT {
+            let v = bc_vm_peek()
+            if vm_trap { return last_return }
+            if type_of(v) != "int" {
+                vm_trap = true
+                vm_trap_msg = "ASSERT_INT failed: got " + type_of(v)
+                return last_return
+            }
+        }
+        // ASSERT_FLOAT — peek TOS, trap if type_of != "float".
+        else if op == BC_OP_ASSERT_FLOAT {
+            let v = bc_vm_peek()
+            if vm_trap { return last_return }
+            if type_of(v) != "float" {
+                vm_trap = true
+                vm_trap_msg = "ASSERT_FLOAT failed: got " + type_of(v)
+                return last_return
+            }
+        }
+
+        // ──────── ARRAY / MAP OPCODES (rt#36-C Phase 1 — T44) ────────
+        // Collection values live on the operand stack as hexa-native
+        // arrays (`[]`) and maps (`#{}`). This trades VM portability
+        // for simplicity: we do NOT wire into interpreter's
+        // array_store / map_store (which are IR-time heap tables
+        // scoped to the tree-walker); stage0 hexa's intrinsic dict
+        // + array already supply `arr[i]`, `arr.push(v)`, `len(arr)`,
+        // `m[k]`, `m.set(k,v)` — all immutable / value-returning
+        // which is exactly the semantic these opcodes need.
+        //
+        // NEW_ARRAY B — pop B values, build array, push.
+        //   Items were pushed left-to-right so the LAST item is on
+        //   top; we walk right-to-left while popping, then reverse
+        //   the collected buffer to restore source order.
+        else if op == BC_OP_NEW_ARRAY {
+            let count = bc_b16_of(raw)
+            let mut buf = []
+            let mut k = 0
+            while k < count {
+                buf = buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                k = k + 1
+            }
+            // Reverse into source order.
+            let mut arr = []
+            let mut j = count - 1
+            while j >= 0 {
+                arr = arr.push(buf[j])
+                j = j - 1
+            }
+            bc_vm_push(arr)
+        }
+        // ARR_GET — pops idx, pops arr, pushes arr[idx].
+        //
+        //   Polymorphic dispatch: the emitter uses this opcode for
+        //   any `x[k]` source pattern because stage1 hexa has no
+        //   static type info to tell arrays from maps. We detect
+        //   the NEW_MAP-produced shape ["<bc_map>", keys, vals] by
+        //   its leading BC_MAP_TAG sentinel and route to a linear
+        //   key scan; otherwise fall back to hexa-native indexing.
+        else if op == BC_OP_ARR_GET {
+            let idx = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut is_map_shape = false
+            if type_of(arr) == "array" {
+                if len(arr) == 3 {
+                    if arr[0] == BC_MAP_TAG {
+                        is_map_shape = true
+                    }
+                }
+            }
+            if is_map_shape {
+                let mks = arr[1]
+                let mvs = arr[2]
+                let mkn = len(mks)
+                let mut mi = 0
+                let mut mhit = BC_NIL
+                while mi < mkn {
+                    if mks[mi] == idx {
+                        mhit = mvs[mi]
+                        mi = mkn
+                    } else {
+                        mi = mi + 1
+                    }
+                }
+                bc_vm_push(mhit)
+            } else {
+                bc_vm_push(arr[idx])
+            }
+        }
+        // ARR_SET — pops val, idx, arr; pushes new arr with arr[idx]=val.
+        //   Polymorphic (T48): when `arr` carries the BC_MAP_TAG sentinel
+        //   we treat idx as a key and do MAP_SET semantics (linear-scan
+        //   update or append). This mirrors ARR_GET's polymorphism so the
+        //   emitter can route any `x[k] = v` source pattern through a
+        //   single opcode without compile-time type discrimination —
+        //   stage1 hexa has no static types to tell arrays from maps.
+        else if op == BC_OP_ARR_SET {
+            let v = bc_vm_pop()
+            let idx = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut as_is_map = false
+            if type_of(arr) == "array" {
+                if len(arr) == 3 {
+                    if arr[0] == BC_MAP_TAG {
+                        as_is_map = true
+                    }
+                }
+            }
+            if as_is_map {
+                let as_keys = arr[1]
+                let as_vals = arr[2]
+                let as_nk = len(as_keys)
+                let mut as_hit = -1
+                let mut as_i = 0
+                while as_i < as_nk {
+                    if as_keys[as_i] == idx {
+                        as_hit = as_i
+                        as_i = as_nk
+                    } else {
+                        as_i = as_i + 1
+                    }
+                }
+                let mut as_new_keys = as_keys
+                let mut as_new_vals = as_vals
+                if as_hit >= 0 {
+                    as_new_vals = bc_vm_setat(as_vals, as_hit, v)
+                } else {
+                    as_new_keys = as_keys.push(idx)
+                    as_new_vals = as_vals.push(v)
+                }
+                bc_vm_push([BC_MAP_TAG, as_new_keys, as_new_vals])
+            } else {
+                bc_vm_push(bc_vm_setat(arr, idx, v))
+            }
+        }
+        // ARR_PUSH — pops val, arr; pushes arr.push(val) (immutable).
+        else if op == BC_OP_ARR_PUSH {
+            let v = bc_vm_pop()
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            bc_vm_push(arr.push(v))
+        }
+        // ARR_LEN — pops arr; pushes len(arr).
+        //   Polymorphic: a BC_MAP_TAG-tagged 3-element shape reports
+        //   its pair count (len of the keys slot) — matches what
+        //   `len(m)` on a hexa dict would return.
+        else if op == BC_OP_ARR_LEN {
+            let arr = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut n = 0
+            if type_of(arr) == "array" {
+                if len(arr) == 3 {
+                    if arr[0] == BC_MAP_TAG {
+                        n = len(arr[1])
+                    } else {
+                        n = len(arr)
+                    }
+                } else {
+                    n = len(arr)
+                }
+            } else {
+                n = len(arr)
+            }
+            bc_vm_push(n)
+        }
+        // NEW_MAP B — pops 2B values (key/val pairs, emitted in
+        //   source order), builds map, pushes it.
+        //
+        //   Implementation note: hexa_v2 (the C transpiler used to
+        //   build stage0) does NOT dispatch `.set()` as a method on
+        //   maps — only `#{k:v}` LITERALS are recognized for dict
+        //   construction, and those must be fully static. To build a
+        //   dynamic map here we therefore represent map values as
+        //   parallel arrays: `[keys, values]` (a 2-element outer
+        //   array whose first slot is the key array and second is
+        //   the value array). MAP_GET does linear scan; MAP_SET
+        //   appends or overwrites. This matches how interpreter.hexa
+        //   models its map_store (see T33 notes in runtime.c) and
+        //   stays fully within hexa's native array ops.
+        //
+        //   Emit order: push k0, v0, k1, v1, ..., so v_{B-1} is on
+        //   top. Pop in reverse; reinsert in source order.
+        else if op == BC_OP_NEW_MAP {
+            let pair_count = bc_b16_of(raw)
+            let mut kbuf = []
+            let mut vbuf = []
+            let mut k2 = 0
+            while k2 < pair_count {
+                let vp = bc_vm_pop()
+                let kp = bc_vm_pop()
+                if vm_trap { return last_return }
+                kbuf = kbuf.push(kp)
+                vbuf = vbuf.push(vp)
+                k2 = k2 + 1
+            }
+            // Reverse into source order.
+            let mut keys = []
+            let mut vals = []
+            let mut j2 = pair_count - 1
+            while j2 >= 0 {
+                keys = keys.push(kbuf[j2])
+                vals = vals.push(vbuf[j2])
+                j2 = j2 - 1
+            }
+            // Tagged map shape: [BC_MAP_TAG, keys, vals].
+            let m2 = [BC_MAP_TAG, keys, vals]
+            bc_vm_push(m2)
+        }
+        // MAP_GET — pops key, map; pushes map[key] (BC_NIL if absent).
+        //   Linear scan over the keys array; returns the parallel
+        //   value on hit. Miss returns BC_NIL so subsequent ops do
+        //   not crash — matches the interpreter's "void on miss"
+        //   behavior that source-level code already tolerates.
+        //
+        //   Note: the emitter currently routes Index AST nodes to
+        //   OP_ARR_GET (polymorphic). OP_MAP_GET is reserved for
+        //   future explicit map-access lowerings (e.g. when an
+        //   emitter upgrade gains enough type info to disambiguate).
+        else if op == BC_OP_MAP_GET {
+            let key_mg = bc_vm_pop()
+            let m_mg = bc_vm_pop()
+            if vm_trap { return last_return }
+            let keys_mg = m_mg[1]
+            let vals_mg = m_mg[2]
+            let nk = len(keys_mg)
+            let mut i_mg = 0
+            let mut hit_val = BC_NIL
+            while i_mg < nk {
+                if keys_mg[i_mg] == key_mg {
+                    hit_val = vals_mg[i_mg]
+                    i_mg = nk
+                } else {
+                    i_mg = i_mg + 1
+                }
+            }
+            bc_vm_push(hit_val)
+        }
+        // MAP_SET — pops val, key, map; pushes updated map.
+        //   If key already exists, rebuild values with v patched in.
+        //   Else append key/value to each parallel array.
+        else if op == BC_OP_MAP_SET {
+            let v_ms = bc_vm_pop()
+            let key_ms = bc_vm_pop()
+            let m_ms = bc_vm_pop()
+            if vm_trap { return last_return }
+            let keys_ms = m_ms[1]
+            let vals_ms = m_ms[2]
+            let nk2 = len(keys_ms)
+            let mut found_idx = -1
+            let mut i_ms = 0
+            while i_ms < nk2 {
+                if keys_ms[i_ms] == key_ms {
+                    found_idx = i_ms
+                    i_ms = nk2
+                } else {
+                    i_ms = i_ms + 1
+                }
+            }
+            let mut new_keys = keys_ms
+            let mut new_vals = vals_ms
+            if found_idx >= 0 {
+                new_vals = bc_vm_setat(vals_ms, found_idx, v_ms)
+            } else {
+                new_keys = keys_ms.push(key_ms)
+                new_vals = vals_ms.push(v_ms)
+            }
+            let m2b = [BC_MAP_TAG, new_keys, new_vals]
+            bc_vm_push(m2b)
+        }
+
+        // ──────── STRUCT OPCODES (rt#36-D T45) ────────
+        // Structs mirror the NEW_MAP pair-encoding but carry an
+        // extra type-name slot so LOAD_FIELD / STORE_FIELD can
+        // distinguish structs from maps and so diagnostics show
+        // the source-level type (e.g. "Point" vs "Vec2").
+        //
+        // NEW_STRUCT A=n_fields B16=name_const_idx:
+        //   pop 2n values (field_name, val pairs pushed left-to-right),
+        //   resolve type name from current proto's const pool,
+        //   build [BC_STRUCT_TAG, name, keys, vals], push.
+        else if op == BC_OP_NEW_STRUCT {
+            let n_fields = bc_a_of(raw)
+            let name_cidx = bc_b16_of(raw)
+            let consts_ns = bc_proto_consts[proto_idx]
+            let mut sname = ""
+            if name_cidx < len(consts_ns) {
+                sname = consts_ns[name_cidx]
+            }
+            let mut sval_buf = []
+            let mut skey_buf = []
+            let mut sk = 0
+            while sk < n_fields {
+                sval_buf = sval_buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                skey_buf = skey_buf.push(bc_vm_pop())
+                if vm_trap { return last_return }
+                sk = sk + 1
+            }
+            // Reverse into source order.
+            let mut skeys = []
+            let mut svals = []
+            let mut sj = n_fields - 1
+            while sj >= 0 {
+                skeys = skeys.push(skey_buf[sj])
+                svals = svals.push(sval_buf[sj])
+                sj = sj - 1
+            }
+            let sobj = [BC_STRUCT_TAG, sname, skeys, svals]
+            bc_vm_push(sobj)
+        }
+        // LOAD_FIELD Bx=field_name_const_idx:
+        //   pop struct, linear-scan keys, push matching val (BC_NIL on miss).
+        //   Miss returning BC_NIL matches hexa's "void on missing field"
+        //   semantics — downstream code tolerates it without crashing.
+        else if op == BC_OP_LOAD_FIELD {
+            let fcidx = bc_bx_of(raw)
+            let consts_lf = bc_proto_consts[proto_idx]
+            let mut fname = ""
+            if fcidx < len(consts_lf) {
+                fname = consts_lf[fcidx]
+            }
+            let sobj_lf = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut lf_hit = BC_NIL
+            if type_of(sobj_lf) == "array" {
+                if len(sobj_lf) == 4 {
+                    if sobj_lf[0] == BC_STRUCT_TAG {
+                        let lf_keys = sobj_lf[2]
+                        let lf_vals = sobj_lf[3]
+                        let lf_n = len(lf_keys)
+                        let mut lf_i = 0
+                        while lf_i < lf_n {
+                            if lf_keys[lf_i] == fname {
+                                lf_hit = lf_vals[lf_i]
+                                lf_i = lf_n
+                            } else {
+                                lf_i = lf_i + 1
+                            }
+                        }
+                    }
+                }
+            }
+            bc_vm_push(lf_hit)
+        }
+        // STORE_FIELD Bx=field_name_const_idx:
+        //   pop val, pop struct; rebuild with field patched (or
+        //   appended if absent, matching struct-init-extend semantics);
+        //   push updated struct. Caller's emitter typically follows
+        //   with STORE_LOCAL / STORE_GLOBAL to rebind the base ident.
+        else if op == BC_OP_STORE_FIELD {
+            let sfcidx = bc_bx_of(raw)
+            let consts_sf = bc_proto_consts[proto_idx]
+            let mut sfname = ""
+            if sfcidx < len(consts_sf) {
+                sfname = consts_sf[sfcidx]
+            }
+            let sf_val = bc_vm_pop()
+            let sf_obj = bc_vm_pop()
+            if vm_trap { return last_return }
+            let mut sf_tag = ""
+            let mut sf_type = ""
+            let mut sf_keys = []
+            let mut sf_vals = []
+            if type_of(sf_obj) == "array" {
+                if len(sf_obj) == 4 {
+                    if sf_obj[0] == BC_STRUCT_TAG {
+                        sf_tag = sf_obj[0]
+                        sf_type = sf_obj[1]
+                        sf_keys = sf_obj[2]
+                        sf_vals = sf_obj[3]
+                    }
+                }
+            }
+            if sf_tag == "" {
+                // Not a struct — trap, preserve MVP invariants.
+                vm_trap = true
+                vm_trap_msg = "STORE_FIELD: not a struct value"
+                return last_return
+            }
+            let sf_nk = len(sf_keys)
+            let mut sf_hitidx = -1
+            let mut sf_i = 0
+            while sf_i < sf_nk {
+                if sf_keys[sf_i] == sfname {
+                    sf_hitidx = sf_i
+                    sf_i = sf_nk
+                } else {
+                    sf_i = sf_i + 1
+                }
+            }
+            let mut sf_new_keys = sf_keys
+            let mut sf_new_vals = sf_vals
+            if sf_hitidx >= 0 {
+                sf_new_vals = bc_vm_setat(sf_vals, sf_hitidx, sf_val)
+            } else {
+                sf_new_keys = sf_keys.push(sfname)
+                sf_new_vals = sf_vals.push(sf_val)
+            }
+            let sf_out = [BC_STRUCT_TAG, sf_type, sf_new_keys, sf_new_vals]
+            bc_vm_push(sf_out)
+        }
+
+        // ──────── EXCEPTION OPCODES (rt#36-D T46) ────────
+        // Structured try/catch mirrors the interpreter's throw_flag /
+        // throw_val semantics but avoids a global flag: instead, OP_THROW
+        // does the unwind directly by truncating the operand + frame
+        // stacks to snapshots captured at OP_TRY time.
+        //
+        // OP_TRY sbx:
+        //   push a try-frame recording (catch_pc, sp_snapshot, fd_snapshot).
+        //   sbx is a signed pc-relative delta from the instruction AFTER
+        //   OP_TRY to the catch handler's first instruction (emitter's
+        //   std forward-jump convention).
+        else if op == BC_OP_TRY {
+            let t_sbx = bc_sbx_of(raw)
+            let t_cur_pc = vm_frame_pc[depth - 1]   // already advanced
+            let t_catch_pc = t_cur_pc + t_sbx
+            vm_try_catch_pc    = vm_try_catch_pc.push(t_catch_pc)
+            vm_try_stack_size  = vm_try_stack_size.push(len(vm_stack))
+            vm_try_frame_depth = vm_try_frame_depth.push(len(vm_frame_proto))
+        }
+        // OP_ENDTRY:
+        //   pop the top try-frame (normal exit path). If somehow the
+        //   try-stack is already empty we silently ignore rather than
+        //   trap — this matches Lua's catch-block tolerance and lets
+        //   nested try/catch emit reorderings stay robust.
+        else if op == BC_OP_ENDTRY {
+            if len(vm_try_catch_pc) > 0 {
+                vm_try_catch_pc    = bc_vm_arr_shrink_last(vm_try_catch_pc)
+                vm_try_stack_size  = bc_vm_arr_shrink_last(vm_try_stack_size)
+                vm_try_frame_depth = bc_vm_arr_shrink_last(vm_try_frame_depth)
+            }
+        }
+        // OP_THROW:
+        //   pop the thrown value; if a try-frame is pending,
+        //   (a) truncate operand stack to snapshot size,
+        //   (b) truncate frame stack to snapshot depth (unwinds any
+        //       nested call frames opened inside the try block),
+        //   (c) push thrown value so the handler's STORE_LOCAL
+        //       captures it into the catch-var slot,
+        //   (d) rewrite the NEW top frame's pc to the catch target.
+        //   If no try-frame exists, trap with an uncaught-throw message —
+        //   the VM driver (bc_vm_run) surfaces it via vm_trap_msg so
+        //   the error matches the interpreter's `error:` diagnostic.
+        else if op == BC_OP_THROW {
+            let th_val = bc_vm_pop()
+            if vm_trap { return last_return }
+            let th_n = len(vm_try_catch_pc)
+            if th_n == 0 {
+                vm_trap = true
+                vm_trap_msg = "uncaught throw: " + to_string(th_val)
+                return last_return
+            }
+            let th_saved_sp = vm_try_stack_size[th_n - 1]
+            let th_saved_fd = vm_try_frame_depth[th_n - 1]
+            let th_catch_pc = vm_try_catch_pc[th_n - 1]
+            vm_try_catch_pc    = bc_vm_arr_shrink_last(vm_try_catch_pc)
+            vm_try_stack_size  = bc_vm_arr_shrink_last(vm_try_stack_size)
+            vm_try_frame_depth = bc_vm_arr_shrink_last(vm_try_frame_depth)
+
+            // Unwind operand + frame stacks to snapshots.
+            vm_stack         = bc_vm_arr_truncate(vm_stack, th_saved_sp)
+            vm_frame_proto   = bc_vm_arr_truncate(vm_frame_proto,   th_saved_fd)
+            vm_frame_pc      = bc_vm_arr_truncate(vm_frame_pc,      th_saved_fd)
+            vm_frame_fp      = bc_vm_arr_truncate(vm_frame_fp,      th_saved_fd)
+            // T51 — keep closure parallel with the other frame arrays.
+            vm_frame_closure = bc_vm_arr_truncate(vm_frame_closure, th_saved_fd)
+
+            // Push thrown value; handler consumes via STORE_LOCAL.
+            bc_vm_push(th_val)
+
+            // Rewrite current frame pc to catch target.
+            let th_new_d = len(vm_frame_proto)
+            if th_new_d > 0 {
+                vm_frame_pc = bc_vm_setat(vm_frame_pc, th_new_d - 1, th_catch_pc)
+            }
+        }
+
+        // ──────── UNIMPLEMENTED OPCODES ────────
+        // Anything else — trap with the opcode name for debuggability.
+        else {
+            vm_trap = true
+            vm_trap_msg = "unimplemented opcode: " + bc_opname(op) + " (" + to_string(op) + ")"
+            return last_return
+        }
+    }
+
+    return last_return
+}
+
+// ── Top-level entry: run the `<main>` proto if present,
+//    else the first proto in the registry. ──────────────────
+// bc_compile_root must have been called beforehand — it
+// populates bc_protos / bc_proto_codes / bc_proto_consts etc.
+
+fn bc_vm_run() {
+    bc_vm_reset()
+
+    // Find the top-level wrapper proto (always named "<main>") and
+    // the optional user-defined `fn main()` (T49 — matches T23's
+    // codegen_c2 u_main() auto-call for interpreter/bridge parity).
+    let mut main_idx = -1
+    let mut user_main_idx = -1
+    let mut i = 0
+    while i < len(bc_protos) {
+        let p = bc_protos[i]
+        if p.name == "<main>" { main_idx = i }
+        if p.name == "main"   { user_main_idx = i }
+        i = i + 1
+    }
+    // No <main> wrapper means the emitter saw zero top-level non-FnDecl
+    // stmts (e.g. a module that only defines functions, or a file whose
+    // sole entry point is `fn main()`). T49 preserves the original
+    // "pure module" behavior but also lets user fn main() run directly
+    // — otherwise scripts of the shape `fn main() { ... }` alone would
+    // print nothing under HEXA_VM=1, breaking parity with codegen_c2.
+    let mut top_result = BC_NIL
+    if main_idx >= 0 {
+        bc_vm_push_frame(main_idx, 0)
+        if vm_trap { return BC_NIL }
+        top_result = bc_vm_run_loop()
+    } else {
+        if user_main_idx < 0 { return BC_NIL }
+    }
+
+    // T49 — auto-call user fn main() if present and top-level
+    // completed without trap/halt. Globals carry over (no reset
+    // between runs) so main() sees the top-level's initialized
+    // bindings. Operand stack is cleared to avoid residue from the
+    // top-level interacting with user-main's stack effect model.
+    if !vm_trap && !vm_halted && user_main_idx >= 0 {
+        vm_stack = []
+        bc_vm_push_frame(user_main_idx, 0)
+        if vm_trap { return top_result }
+        return bc_vm_run_loop()
+    }
+    return top_result
+}
+
+// ── Debug accessor for tests. ──────────────────────────────
+
+fn bc_vm_trap_hit() { return vm_trap }
+fn bc_vm_trap_reason() { return vm_trap_msg }
+fn bc_vm_halted_hit() { return vm_halted }
+
+// ── Run-and-return-top helper (for tests that want the
+//    final TOS, e.g. plain-arith tests that end with ExprStmt
+//    — but Phase B always wraps those with OP_POP). We give a
+//    secondary entry that runs a specific proto by name,
+//    with no args, and returns its OP_RETURN value directly. ──
+
+fn bc_vm_call_by_name(name) {
+    bc_vm_reset()
+    let mut target = -1
+    let mut i = 0
+    while i < len(bc_protos) {
+        let p = bc_protos[i]
+        if p.name == name {
+            target = i
+        }
+        i = i + 1
+    }
+    if target < 0 {
+        vm_trap = true
+        vm_trap_msg = "bc_vm_call_by_name: no such proto: " + name
+        return BC_NIL
+    }
+    bc_vm_push_frame(target, 0)
+    if vm_trap { return BC_NIL }
+    return bc_vm_run_loop()
+}

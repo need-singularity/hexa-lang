@@ -1,0 +1,650 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/linear_attn_distill.hexa — Linear Attention Distillation (#338)
+//
+//  Distill a trained Quadratic (softmax) Attention model into a
+//  Linear Attention student using kernel feature maps.
+//
+//  Teacher: standard softmax attention  O(N^2)
+//    score = softmax(Q K^T / sqrt(d))
+//    out   = score V
+//
+//  Student: kernel-based linear attention  O(N)
+//    phi(x) = elu(x) + 1  (feature map)
+//    out   = (phi(Q)(phi(K)^T V)) / (phi(Q) sum(phi(K)))
+//
+//  Distillation losses:
+//    L_attn = KL(teacher_attn_pattern || student_attn_pattern)
+//    L_hidden = MSE(teacher_hidden, student_hidden)
+//    L_total = (1-alpha)*L_attn + alpha*L_hidden
+//
+//  Progressive schedule:
+//    alpha ramps from 0 -> target over epochs (start with attn match,
+//    shift to hidden state match)
+//    Temperature anneals from high -> 1.0 (softer early targets)
+//
+//  API:
+//    lad_init_teacher(D, n_heads, seed) -> teacher_model
+//    lad_init_student(D, n_heads, seed) -> student_model
+//    lad_feature_map(x) -> phi(x)           (elu+1 kernel)
+//    lad_teacher_forward(model, X) -> {out, attn_pattern, hidden}
+//    lad_student_forward(model, X) -> {out, attn_pattern, hidden}
+//    lad_kl_div(p, q) -> float
+//    lad_attn_distill_loss(t_attn, s_attn) -> float
+//    lad_hidden_mse_loss(t_hidden, s_hidden) -> float
+//    lad_combined_loss(t_model, s_model, X, alpha) -> float
+//    lad_schedule(epoch, max_epochs, base_alpha) -> {alpha, temp}
+//    lad_train_step(t_model, s_model, X, alpha, lr) -> s_model
+//    lad_distill(t_model, s_model, X_list, epochs, lr) -> s_model
+//    lad_eval_mse(t_model, s_model, X_list) -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects (forward, loss)
+//    @hot   — training step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ────────────────────────────────────────────────
+
+fn lad_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn lad_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn lad_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn lad_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.001 { g = 0.001 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+// ── array helpers ───────────────────────────────────────────────
+
+fn lad_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn lad_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn lad_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn lad_uniform(state) {
+    let s = lad_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn lad_max_f(a, b) { if a > b { return a } return b }
+
+// ═══════════════════════════════════════════════════════════════════
+//  Feature map: phi(x) = elu(x) + 1
+//
+//  elu(x) = x           if x >= 0
+//           exp(x) - 1  if x < 0
+//
+//  phi(x) = elu(x) + 1:
+//    x >= 0 -> x + 1   (always > 0)
+//    x <  0 -> exp(x)  (always > 0)
+//
+//  This ensures non-negative features, required for valid linear attention.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_feature_map(x) {
+    let d = len(x)
+    let mut phi = lad_zeros_1d(d)
+    for i in 0..d {
+        if x[i] >= 0.0 {
+            phi[i] = x[i] + 1.0
+        } else {
+            phi[i] = lad_exp(x[i])
+        }
+    }
+    return phi
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Init weight matrix: [out_dim x in_dim], Xavier-scale
+// ═══════════════════════════════════════════════════════════════════
+fn lad_init_weights(out_dim, in_dim, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let scale = 1.0 / lad_sqrt(to_float(in_dim))
+    let mut W = lad_zeros_2d(out_dim, in_dim)
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let u = lad_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    return W
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Init Teacher Model (softmax attention)
+//
+//  W_Q, W_K, W_V: [D x D]  (single-head for simplicity, D = n_heads * d_head)
+//  W_O: [D x D]
+// ═══════════════════════════════════════════════════════════════════
+fn lad_init_teacher(D, n_heads, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let W_Q = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 1000)
+    let W_K = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 2000)
+    let W_V = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 3000)
+    let W_O = lad_init_weights(D, D, state)
+    return #{
+        "D": D,
+        "n_heads": n_heads,
+        "W_Q": W_Q,
+        "W_K": W_K,
+        "W_V": W_V,
+        "W_O": W_O,
+        "kind": "teacher"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Init Student Model (linear attention with feature map)
+//
+//  Same shape as teacher but uses phi(Q), phi(K) instead of softmax.
+// ═══════════════════════════════════════════════════════════════════
+fn lad_init_student(D, n_heads, seed) {
+    let mut state = seed + 7777
+    if state <= 0 { state = 1 }
+    let W_Q = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 1000)
+    let W_K = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 2000)
+    let W_V = lad_init_weights(D, D, state)
+    state = lad_lcg(state + 3000)
+    let W_O = lad_init_weights(D, D, state)
+    return #{
+        "D": D,
+        "n_heads": n_heads,
+        "W_Q": W_Q,
+        "W_K": W_K,
+        "W_V": W_V,
+        "W_O": W_O,
+        "kind": "student"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Project: X[S, D] @ W[D_out, D_in]^T -> [S, D_out]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_project(X, W) {
+    let S = len(X)
+    let D_out = len(W)
+    let D_in = len(W[0])
+    let mut out = lad_zeros_2d(S, D_out)
+    for s in 0..S {
+        for i in 0..D_out {
+            let mut acc = 0.0
+            for j in 0..D_in {
+                acc = acc + W[i][j] * X[s][j]
+            }
+            out[s][i] = acc
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher forward: standard softmax attention
+//
+//  1. Q = X @ W_Q,  K = X @ W_K,  V = X @ W_V
+//  2. scores[i][j] = Q[i] . K[j] / sqrt(D)
+//  3. attn[i][j] = softmax(scores[i])
+//  4. context[i] = sum_j attn[i][j] * V[j]
+//  5. out = context @ W_O
+//
+//  Returns: [out, attn_pattern (flattened S*S), hidden (context before W_O)]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_teacher_forward(model, X) {
+    let S = len(X)
+    let D = model["D"]
+    let scale = 1.0 / lad_sqrt(to_float(D))
+
+    let Q = lad_project(X, model["W_Q"])
+    let K = lad_project(X, model["W_K"])
+    let V = lad_project(X, model["W_V"])
+
+    // Compute attention scores and patterns
+    let mut attn_pattern = lad_zeros_1d(S * S)
+    let mut context = lad_zeros_2d(S, D)
+
+    for i in 0..S {
+        // Compute scores for row i
+        let mut scores = lad_zeros_1d(S)
+        let mut mx = -1.0e30
+        for j in 0..S {
+            let mut dot = 0.0
+            for d in 0..D { dot = dot + Q[i][d] * K[j][d] }
+            scores[j] = dot * scale
+            if scores[j] > mx { mx = scores[j] }
+        }
+
+        // Softmax
+        let mut sum_e = 0.0
+        let mut weights = lad_zeros_1d(S)
+        for j in 0..S {
+            let e = lad_exp(scores[j] - mx)
+            weights[j] = e
+            sum_e = sum_e + e
+        }
+        if sum_e < 1.0e-12 { sum_e = 1.0e-12 }
+        for j in 0..S {
+            weights[j] = weights[j] / sum_e
+            attn_pattern[i * S + j] = weights[j]
+        }
+
+        // Weighted sum of V
+        for d in 0..D {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + weights[j] * V[j][d]
+            }
+            context[i][d] = acc
+        }
+    }
+
+    // Output projection
+    let out = lad_project(context, model["W_O"])
+
+    // Flatten hidden for loss computation
+    let mut hidden = lad_zeros_1d(S * D)
+    for i in 0..S {
+        for d in 0..D {
+            hidden[i * D + d] = context[i][d]
+        }
+    }
+
+    return [out, attn_pattern, hidden]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Student forward: linear attention via feature map
+//
+//  1. Q = X @ W_Q,  K = X @ W_K,  V = X @ W_V
+//  2. Q_phi[i] = phi(Q[i]),  K_phi[i] = phi(K[i])
+//  3. KV = sum_j K_phi[j]^T V[j]         (D x D accumulator)
+//     Z  = sum_j K_phi[j]                 (D normalizer)
+//  4. context[i] = (Q_phi[i] @ KV) / (Q_phi[i] . Z + eps)
+//  5. out = context @ W_O
+//
+//  For distillation we also produce a pseudo attention pattern:
+//    attn_approx[i][j] = (Q_phi[i] . K_phi[j]) / sum_k(Q_phi[i] . K_phi[k])
+//
+//  Returns: [out, attn_pattern (flattened S*S), hidden]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_student_forward(model, X) {
+    let S = len(X)
+    let D = model["D"]
+    let eps = 1.0e-8
+
+    let Q = lad_project(X, model["W_Q"])
+    let K = lad_project(X, model["W_K"])
+    let V = lad_project(X, model["W_V"])
+
+    // Apply feature maps
+    let mut Q_phi = []
+    let mut K_phi = []
+    for s in 0..S {
+        Q_phi = Q_phi + [lad_feature_map(Q[s])]
+        K_phi = K_phi + [lad_feature_map(K[s])]
+    }
+
+    // Accumulate KV: D x D  and  Z: D
+    let mut KV = lad_zeros_2d(D, D)
+    let mut Z = lad_zeros_1d(D)
+    for s in 0..S {
+        for f in 0..D {
+            Z[f] = Z[f] + K_phi[s][f]
+            for d in 0..D {
+                KV[f][d] = KV[f][d] + K_phi[s][f] * V[s][d]
+            }
+        }
+    }
+
+    // Compute context via linear attention
+    let mut context = lad_zeros_2d(S, D)
+    for i in 0..S {
+        let mut norm = 0.0
+        for f in 0..D { norm = norm + Q_phi[i][f] * Z[f] }
+        if norm < eps { norm = eps }
+        for d in 0..D {
+            let mut acc = 0.0
+            for f in 0..D {
+                acc = acc + Q_phi[i][f] * KV[f][d]
+            }
+            context[i][d] = acc / norm
+        }
+    }
+
+    // Pseudo attention pattern for distillation:
+    // attn[i][j] = (Q_phi[i] . K_phi[j]) / sum_k(Q_phi[i] . K_phi[k])
+    let mut attn_pattern = lad_zeros_1d(S * S)
+    for i in 0..S {
+        let mut row_sum = 0.0
+        let mut row_dots = lad_zeros_1d(S)
+        for j in 0..S {
+            let mut dot = 0.0
+            for f in 0..D { dot = dot + Q_phi[i][f] * K_phi[j][f] }
+            row_dots[j] = dot
+            row_sum = row_sum + dot
+        }
+        if row_sum < eps { row_sum = eps }
+        for j in 0..S {
+            attn_pattern[i * S + j] = row_dots[j] / row_sum
+        }
+    }
+
+    // Output projection
+    let out = lad_project(context, model["W_O"])
+
+    // Flatten hidden
+    let mut hidden = lad_zeros_1d(S * D)
+    for i in 0..S {
+        for d in 0..D {
+            hidden[i * D + d] = context[i][d]
+        }
+    }
+
+    return [out, attn_pattern, hidden]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL Divergence: KL(P || Q) = sum(P * log(P / Q))
+//
+//  Used for attention pattern distillation.
+//  P = teacher attention, Q = student attention
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lad_kl_div(p, q) {
+    let n = len(p)
+    let mut kl = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-10 {
+            let ratio = p[i] / (q[i] + 1.0e-10)
+            kl = kl + p[i] * lad_log(ratio)
+        }
+    }
+    if kl < 0.0 { return 0.0 }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention Distillation Loss
+//
+//  KL divergence between teacher and student attention patterns.
+//  Both are flattened [S*S] vectors representing row-wise distributions.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_attn_distill_loss(t_attn, s_attn) {
+    return lad_kl_div(t_attn, s_attn)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Hidden State MSE Loss
+//
+//  MSE between teacher and student hidden states (flattened).
+//  L = (1/N) sum (t_h[i] - s_h[i])^2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_hidden_mse_loss(t_hidden, s_hidden) {
+    let n = len(t_hidden)
+    if n == 0 { return 0.0 }
+    let mut mse = 0.0
+    for i in 0..n {
+        let diff = t_hidden[i] - s_hidden[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Combined Distillation Loss
+//
+//  L = (1 - alpha) * L_attn + alpha * L_hidden
+//
+//  alpha: weight for hidden state loss (0 = pure attn match, 1 = pure hidden match)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lad_combined_loss(t_model, s_model, X, alpha) {
+    let t_result = lad_teacher_forward(t_model, X)
+    let t_attn = t_result[1]
+    let t_hidden = t_result[2]
+
+    let s_result = lad_student_forward(s_model, X)
+    let s_attn = s_result[1]
+    let s_hidden = s_result[2]
+
+    let attn_loss = lad_attn_distill_loss(t_attn, s_attn)
+    let hidden_loss = lad_hidden_mse_loss(t_hidden, s_hidden)
+
+    return (1.0 - alpha) * attn_loss + alpha * hidden_loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Progressive Distillation Schedule
+//
+//  alpha ramps linearly from 0 -> base_alpha over epochs:
+//    Start: focus on attention pattern matching
+//    End:   shift toward hidden state alignment
+//
+//  temperature anneals from base_temp -> 1.0 (not used directly
+//  in linear attention but controls soft label sharpness if needed)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_schedule(epoch, max_epochs, base_alpha) {
+    let mut alpha = 0.0
+    if max_epochs > 1 {
+        let progress = to_float(epoch) / to_float(max_epochs - 1)
+        alpha = base_alpha * progress
+    } else {
+        alpha = base_alpha
+    }
+    if alpha > 1.0 { alpha = 1.0 }
+    return alpha
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training Step: numerical gradient descent on student
+//
+//  Perturbs each student weight, computes combined loss delta,
+//  updates via SGD.
+//
+//  Only updates W_Q and W_K of student (attention-critical weights).
+//  W_V and W_O are also trained for hidden state alignment.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn lad_train_step(t_model, s_model, X, alpha, lr) {
+    let D = s_model["D"]
+    let eps = 0.001
+    let inv_eps = 1.0 / eps
+
+    let loss0 = lad_combined_loss(t_model, s_model, X, alpha)
+
+    // Gradient + update for W_Q
+    let mut new_WQ = lad_zeros_2d(D, D)
+    for i in 0..D {
+        for j in 0..D {
+            let orig = s_model["W_Q"][i][j]
+            s_model["W_Q"][i][j] = orig + eps
+            let loss_p = lad_combined_loss(t_model, s_model, X, alpha)
+            let grad = (loss_p - loss0) * inv_eps
+            new_WQ[i][j] = orig - lr * grad
+            s_model["W_Q"][i][j] = orig
+        }
+    }
+
+    // Gradient + update for W_K
+    let mut new_WK = lad_zeros_2d(D, D)
+    for i in 0..D {
+        for j in 0..D {
+            let orig = s_model["W_K"][i][j]
+            s_model["W_K"][i][j] = orig + eps
+            let loss_p = lad_combined_loss(t_model, s_model, X, alpha)
+            let grad = (loss_p - loss0) * inv_eps
+            new_WK[i][j] = orig - lr * grad
+            s_model["W_K"][i][j] = orig
+        }
+    }
+
+    // Gradient + update for W_V
+    let mut new_WV = lad_zeros_2d(D, D)
+    for i in 0..D {
+        for j in 0..D {
+            let orig = s_model["W_V"][i][j]
+            s_model["W_V"][i][j] = orig + eps
+            let loss_p = lad_combined_loss(t_model, s_model, X, alpha)
+            let grad = (loss_p - loss0) * inv_eps
+            new_WV[i][j] = orig - lr * grad
+            s_model["W_V"][i][j] = orig
+        }
+    }
+
+    // Gradient + update for W_O
+    let mut new_WO = lad_zeros_2d(D, D)
+    for i in 0..D {
+        for j in 0..D {
+            let orig = s_model["W_O"][i][j]
+            s_model["W_O"][i][j] = orig + eps
+            let loss_p = lad_combined_loss(t_model, s_model, X, alpha)
+            let grad = (loss_p - loss0) * inv_eps
+            new_WO[i][j] = orig - lr * grad
+            s_model["W_O"][i][j] = orig
+        }
+    }
+
+    return #{
+        "D": D,
+        "n_heads": s_model["n_heads"],
+        "W_Q": new_WQ,
+        "W_K": new_WK,
+        "W_V": new_WV,
+        "W_O": new_WO,
+        "kind": "student"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full Distillation Pipeline
+//
+//  Runs progressive distillation over multiple epochs.
+//  Each epoch iterates through all training samples with
+//  a scheduled alpha value.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn lad_distill(t_model, s_model, X_list, epochs, base_alpha, lr) {
+    let n_samples = len(X_list)
+    let mut student = s_model
+
+    for epoch in 0..epochs {
+        let alpha = lad_schedule(epoch, epochs, base_alpha)
+        for idx in 0..n_samples {
+            student = lad_train_step(t_model, student, X_list[idx], alpha, lr)
+        }
+    }
+
+    return student
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Evaluation: average output MSE between teacher and student
+//
+//  For each sample, compute MSE between teacher output and student output.
+//  Returns average MSE across all samples.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_eval_mse(t_model, s_model, X_list) {
+    let n = len(X_list)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for idx in 0..n {
+        let t_res = lad_teacher_forward(t_model, X_list[idx])
+        let s_res = lad_student_forward(s_model, X_list[idx])
+        let t_out = t_res[0]
+        let s_out = s_res[0]
+        let S = len(t_out)
+        let D = len(t_out[0])
+        let mut mse = 0.0
+        for i in 0..S {
+            for d in 0..D {
+                let diff = t_out[i][d] - s_out[i][d]
+                mse = mse + diff * diff
+            }
+        }
+        total = total + mse / to_float(S * D)
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cosine similarity between two flat vectors
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lad_cosine_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+    }
+    let denom = lad_sqrt(na) * lad_sqrt(nb)
+    if denom < 1.0e-10 { return 0.0 }
+    return dot / denom
+}
+
+println("[linear_attn_distill] loaded — teacher softmax + student linear phi(Q)phi(K) + KL attn distill + hidden MSE + progressive schedule")

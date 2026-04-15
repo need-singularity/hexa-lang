@@ -3,67 +3,67 @@
 <!-- ML-NEXT-LEVEL:START -->
 ## ML Next Level Roadmap (`/ml`)
 
-| 명령 | 동작 |
-|------|------|
-| `/ml` | 전체 목록 ASCII 표 |
-| `/ml next` | 최우선 항목 자동 선택 → 구현 |
-| `/ml 5` | #5 SSM/Mamba 구현 시작 |
-| `/ml done 1` | #1 완료 체크 + JSON 갱신 |
-| `/ml add 이름 \| 설명 \| 영향` | 새 항목 추가 |
-| `/ml sync` | roadmap.md + CLAUDE.md 동기화 |
+| Command | Action |
+|---------|--------|
+| `/ml` | List all items in ASCII table |
+| `/ml next` | Pick the top-priority item and start implementing |
+| `/ml 5` | Start implementing #5 (SSM/Mamba) |
+| `/ml done 1` | Mark #1 complete + sync JSON |
+| `/ml add name \| desc \| impact` | Add a new item |
+| `/ml sync` | Sync roadmap.md + CLAUDE.md |
 
-> SSOT: `shared/hexa-lang/ml-next-level.json` — T1/T2 기본 파이프라인 완성 후 다음 단계
+> SSOT: `shared/hexa-lang/ml-next-level.json` — next steps after the baseline T1/T2 pipeline is complete.
 
-| # | 영역 | 설명 | 영향 | 상태 |
-|---|------|------|------|:----:|
-| 1 | Flash Attention | O(N²)→O(N) 메모리, tiling | 추론 2-4x, 긴 문맥 | partial |
-| 2 | PagedAttention | vLLM식 KV-cache 페이징 | 동시 요청 10x+ | todo |
-| 3 | Speculative Decoding | 작은 모델로 드래프트→큰 모델 검증 | 추론 2-3x | **done** |
-| 4 | MoE 아키텍처 | Mixture of Experts (Mixtral식) | 같은 FLOP에 더 큰 모델 | **done** |
-| 5 | SSM/Mamba | State Space Model (선형 시간 추론) | 긴 문맥 혁신 | todo |
-| 6 | Vision Transformer | 이미지 인코더 (CLIP/ViT) | 멀티모달 | todo |
-| 7 | 모델 머징 | TIES/DARE/SLERP 가중치 합성 | 학습 없이 모델 개선 | todo |
-| 8 | 구조화 출력 | JSON mode, grammar-constrained decode | API 안정성 | todo |
-| 9 | Function Calling | 도구 호출 / tool use | 에이전트 | todo |
-| 10 | Knowledge Distillation | 큰 모델→작은 모델 증류 | 배포 효율 | todo |
-| 11 | Pruning | 불필요 가중치 제거 | 모델 축소 | todo |
-| 12 | Hyperparameter Search | 자동 LR/배치/아키텍처 탐색 | 학습 품질 | partial |
-| 13 | 안전장치 | 프롬프트 인젝션 감지, 콘텐츠 필터 | 서빙 보안 | todo |
-| 14 | Semantic Cache | 유사 프롬프트 캐싱 (embedding 기반) | 서빙 비용 절감 | todo |
-| 15 | 벤치마크 스위트 | MMLU/HumanEval/MT-Bench 자동 평가 | 품질 측정 | todo |
+| # | Area | Description | Impact | Status |
+|---|------|-------------|--------|:------:|
+| 1 | Flash Attention | O(N²)→O(N) memory via tiling | 2–4× inference, long context | partial |
+| 2 | PagedAttention | vLLM-style KV-cache paging | 10×+ concurrent requests | todo |
+| 3 | Speculative Decoding | Draft with a small model, verify with the large one | 2–3× inference | **done** |
+| 4 | MoE Architecture | Mixture of Experts (Mixtral-style) | Larger model at same FLOPs | **done** |
+| 5 | SSM/Mamba | State Space Model (linear-time inference) | Long-context breakthrough | todo |
+| 6 | Vision Transformer | Image encoder (CLIP/ViT) | Multimodal | todo |
+| 7 | Model Merging | TIES / DARE / SLERP weight composition | Improve models without training | todo |
+| 8 | Structured Output | JSON mode, grammar-constrained decode | API stability | todo |
+| 9 | Function Calling | Tool use / function calling | Agents | todo |
+| 10 | Knowledge Distillation | Large → small model distillation | Deployment efficiency | todo |
+| 11 | Pruning | Remove unnecessary weights | Model shrink | todo |
+| 12 | Hyperparameter Search | Automatic LR/batch/architecture search | Training quality | partial |
+| 13 | Safety Layer | Prompt-injection detection, content filter | Serving security | todo |
+| 14 | Semantic Cache | Similar-prompt caching (embedding-based) | Serving cost reduction | todo |
+| 15 | Benchmark Suite | MMLU / HumanEval / MT-Bench automation | Quality measurement | todo |
 
 <!-- ML-NEXT-LEVEL:END -->
 
 <!-- ROI:START -->
 ## AI-Native ROI Improvements (`/roi`)
 
-| 명령 | 동작 |
-|------|------|
-| `/roi` | ROI 순 전체 목록 ASCII 표 |
-| `/roi go` | 전부 ROI 순 병렬 발사 (메인) |
-| `/roi next` | ROI 최상위 1개 계획 → 확인 → 구현 |
-| `/roi 3` | #3 구현 시작 |
-| `/roi done 1` | #1 완료 체크 + JSON 갱신 |
-| `/roi add 이름 \| 설명 \| 효과x \| 시간h` | 새 항목 추가 |
-| `/roi scan` | ai_native_pass 스캔 → 새 항목 제안 |
+| Command | Action |
+|---------|--------|
+| `/roi` | Full list in ROI order (ASCII table) |
+| `/roi go` | Launch every item in parallel, ROI order (main) |
+| `/roi next` | Plan the top ROI item → confirm → implement |
+| `/roi 3` | Start implementing #3 |
+| `/roi done 1` | Mark #1 complete + sync JSON |
+| `/roi add name \| desc \| impact×x \| hoursh` | Add a new item |
+| `/roi scan` | Scan ai_native_pass → suggest new items |
 
-> SSOT: `shared/hexa-lang/roi.json` — AI-native 알고리즘 교체·@attr 시맨틱·리라이트 강화
+> SSOT: `shared/hexa-lang/roi.json` — AI-native algorithm swaps, `@attr` semantics, rewrite reinforcement.
 
-| # | 분류 | 항목 | 효과(x) | 시간(h) | ROI | 우선순위 | 상태 |
-|---|------|------|------:|------:|-----:|:------:|:----:|
-| 1 | attr_semantics | @contract — requires/ensures 바운드 제거 | 3.0 | 2 | 1.50 | P0 | todo |
-| 2 | algo_rewrite | 선형탐색 → 이진탐색 AST 리라이트 | 10.0 | 8 | 1.25 | P1 | todo |
+| # | Category | Item | Impact (×) | Hours | ROI | Priority | Status |
+|---|----------|------|-----------:|------:|----:|:--------:|:------:|
+| 1 | attr_semantics | @contract — drop bounds via requires/ensures | 3.0 | 2 | 1.50 | P0 | todo |
+| 2 | algo_rewrite | Linear search → binary search AST rewrite | 10.0 | 8 | 1.25 | P1 | todo |
 | 3 | attr_semantics | @symbolic — x\*2→x+x, shift↔pow2 | 7.5 | 8 | 0.94 | P1 | todo |
-| 7 | rewrite_enhance | @algebraic 등차/등비급수 → 닫힌 형식 | 5.0 | 6 | 0.83 | P2 | todo |
-| 4 | rewrite_enhance | @fuse reduce/fold 체인 융합 | 3.0 | 4 | 0.75 | P2 | todo |
-| 5 | rewrite_enhance | constant folding — string concat+len | 2.0 | 3 | 0.67 | P2 | todo |
-| 13 | rewrite_enhance | strength reduction — x/2→x>>1, x%2→x&1 | 2.0 | 4 | 0.50 | P2 | todo |
-| 8 | rewrite_enhance | DCE 미사용 변수/import 제거 | 1.5 | 4 | 0.38 | P3 | todo |
+| 7 | rewrite_enhance | @algebraic arithmetic/geometric series → closed form | 5.0 | 6 | 0.83 | P2 | todo |
+| 4 | rewrite_enhance | @fuse reduce/fold chain fusion | 3.0 | 4 | 0.75 | P2 | todo |
+| 5 | rewrite_enhance | Constant folding — string concat + len | 2.0 | 3 | 0.67 | P2 | todo |
+| 13 | rewrite_enhance | Strength reduction — x/2→x>>1, x%2→x&1 | 2.0 | 4 | 0.50 | P2 | todo |
+| 8 | rewrite_enhance | DCE — remove unused variables / imports | 1.5 | 4 | 0.38 | P3 | todo |
 | 6 | attr_semantics | @approximate — Newton sqrt, Taylor exp | 2.0 | 6 | 0.33 | P2 | todo |
-| 9 | algo_rewrite | DP 슬라이딩 윈도우 메모리 축소 | 3.0 | 10 | 0.30 | P3 | todo |
-| 10 | algo_rewrite | 행렬곱 → Strassen O(n³)→O(n^2.37) | 5.0 | 20 | 0.25 | P3 | todo |
-| 12 | attr_semantics | @speculative_decode — draft+verify | 3.0 | 12 | 0.25 | P4 | todo |
-| 11 | attr_semantics | @specialize — V8 IC 타입 단상화 | 7.5 | 40 | 0.19 | P3 | todo |
+| 9 | algo_rewrite | DP sliding-window memory reduction | 3.0 | 10 | 0.30 | P3 | todo |
+| 10 | algo_rewrite | Matmul → Strassen O(n³)→O(n^2.37) | 5.0 | 20 | 0.25 | P3 | todo |
+| 12 | attr_semantics | @speculative_decode — draft + verify | 3.0 | 12 | 0.25 | P4 | todo |
+| 11 | attr_semantics | @specialize — V8-style IC type monomorphization | 7.5 | 40 | 0.19 | P3 | todo |
 
 <!-- ROI:END -->
 
@@ -80,20 +80,20 @@
 >
 > **[📄 Papers](https://github.com/need-singularity/papers)** — Complete paper collection (94 papers). Published on Zenodo with DOIs. TECS-L+N6 (33) + anima (39) + SEDI (20). [Browse online](https://need-singularity.github.io/papers/)
 >
-> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 53 keywords (σ·τ+sopfr), 24 operators (J₂), 8 primitives (σ-τ), 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
+> **[💎 HEXA-LANG](https://github.com/need-singularity/hexa-lang)** — The Perfect Number Programming Language. Every constant from n=6: 65 keywords (14 groups), 46 operators (9 groups), 8 primitives, 6-phase pipeline, Egyptian memory (1/2+1/3+1/6=1). DSE v2: 21,952 combos, 100% n6 EXACT. Working compiler + REPL
 >
 > **[🖥️ VOID](https://github.com/need-singularity/void)** — Terminal emulator written 100% in hexa-lang. Zero Rust dependencies — calls OS APIs directly via hexa extern FFI. 6-layer architecture (System/Render/Terminal/UI/Plugin/AI) + Metal/Vulkan GPU + VT 6-tier protocol + NEXUS-6 consciousness integration
 >
 > **[🧬 AirGenome](https://github.com/need-singularity/airgenome)** — Autonomous OS genome scanner. Extract n=6 genome from every process, real-time system diagnostics, nexus telescope integration
 
-<!-- private repos는 projects.json의 private_repos 필드에 저장됨 (노출 금지) -->
+<!-- private repos live in the private_repos field of projects.json (do not expose) -->
 <!-- SHARED:PROJECTS:END -->
 
 
 [![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 <!-- AUTO:BADGE:START -->
-[![Keywords](https://img.shields.io/badge/Keywords-53-blue.svg)]()
+[![Keywords](https://img.shields.io/badge/Keywords-58-blue.svg)]()
 [![DSE](https://img.shields.io/badge/DSE-21,952%20combos-gold.svg)]()
 <!-- AUTO:BADGE:END -->
 
@@ -106,28 +106,51 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 
 ## Installation
 
+### One-liner (recommended)
+
+```bash
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh)"
+```
+
+Installs both commands into `~/.hx/bin/`:
+
+| Command | Role |
+|---------|------|
+| `hexa`  | Compiler, interpreter, REPL, LSP, formatter |
+| `hx`    | Package manager (brew-style, pure shell, zero deps) |
+
+After install, add `~/.hx/bin` to your `PATH` (the installer appends it to `~/.zshrc` / `~/.bashrc` automatically) and restart your shell, or run:
+
+```bash
+export PATH="$HOME/.hx/bin:$PATH"
+hexa version
+hx search
+```
+
+Env overrides: `HX_HOME=/custom/prefix`, `HEXA_VERSION=v0.2.0`, `HEXA_SKIP_HX=1`, `HEXA_SKIP_HEXA=1`.
+
+### From source
+
 ```bash
 # 100% self-hosted — no Rust toolchain required
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang
-./hexa examples/hello_min.hexa   # precompiled binary runs immediately
+./hexa run examples/hello_min.hexa   # stage1 CLI, go/cargo-style subcommands
 ```
 
-> 💡 As of 2026-04-11, **HEXA-LANG is fully self-hosted**. The entire
-> `src/` Rust directory (147 files, 38.7K LOC) was absorbed into
-> `self/*.hexa` (605 files) and then deleted. Project root has zero
-> `.rs` files. Build pipeline: `build_hexa.hexa` (hexa_v2 → C → clang
-> → hexa_v3). The shipping `hexa` binary is precompiled and continues
-> to function; future rebuilds bootstrap through hexa itself.
+> As of 2026-04-13, the CLI uses go/cargo-style subcommands. `./hexa` is a 77 KB stage1 dispatcher; the interpreter itself is the 351 KB binary archived at `build/hexa_stage0`. Rust (`src/`, `target/`, `Cargo.*`) has been fully retired — 100% self-hosted.
 
 ## Quick Start
 
 ```bash
-./hexa                                     # Interactive REPL
-./hexa examples/hello_min.hexa             # Run a file
-./hexa --test examples/test_builtins.hexa  # Run tests
-./hexa --dump-ast examples/fib.hexa        # Show parser output
-./hexa --check examples/fib.hexa           # Lex + parse only
+hexa run examples/hello_min.hexa             # Run a .hexa file (interpreter)
+hexa build examples/hello_min.hexa -o hello  # Compile to native binary
+hexa status                                  # Toolchain status
+hexa version                                 # Version
+hexa help                                    # Full usage
+
+# Compat mode (python/node style — delegates to `run` internally):
+hexa examples/hello_min.hexa                 # same as `hexa run ...`
 ```
 
 ## Example
@@ -265,15 +288,15 @@ Six is the smallest perfect number (1+2+3 = 6). Every language constant derives 
 | Function | Value | Language Mapping |
 |----------|-------|-----------------|
 | n | 6 | paradigms, pipeline stages |
-| sigma(6) | 12 | keyword groups, stdlib modules |
+| sigma(6) | 12 | stdlib design target (6 currently implemented) |
 | tau(6) | 4 | type layers, visibility levels |
 | phi(6) | 2 | compile modes (AOT/JIT) |
 | sopfr(6) | 5 | error classes |
-| J2(6) | 24 | operators |
+| J2(6) | 24 | operator design origin (46 currently implemented across 9 groups) |
 | sigma-tau | 8 | primitive types |
-| sigma\*tau+sopfr | 53 | total keywords |
+| -- | 65 | total keywords (14 groups combined) |
 
-Other languages choose these numbers arbitrarily. Rust has 51 keywords — why 51? No mathematical reason. HEXA has 53 = sigma(6)\*tau(6) + sopfr(6) = 48 + 5.
+Other languages choose these numbers arbitrarily. Rust has 51 keywords -- why 51? No mathematical reason. HEXA has 65 keywords in 14 groups, each group size derived from n=6 arithmetic functions.
 
 ## Architecture
 
@@ -288,43 +311,39 @@ Source → Tokenize → Parse → Check → Optimize → Codegen → Execute
 
 **4 type layers** (tau = 4): primitive → composite → reference → function
 
-**24 operators** (J2 = 24): arithmetic(6) + comparison(6) + logical(4) + bitwise(4) + assignment(2) + special(2)
+**46 operators** (9 groups): arithmetic(6) + comparison(6) + logical(4) + bitwise(6) + assignment(8) + special(4) + null_safe(4) + type_check(4) + slice(4)
 
-**53 keywords** in **12 groups** (sigma = 12):
+**65 keywords** in **14 groups**:
 
 | Group | Keywords | Count |
 |-------|----------|-------|
-| Control | if, else, match, for, while, loop | 6 = n |
-| Type | type, struct, enum, trait, impl | 5 = sopfr |
-| Functions | fn, return, yield, async, await | 5 = sopfr |
-| Variables | let, mut, const, static | 4 = tau |
-| Modules | mod, use, pub, crate | 4 = tau |
-| Memory | own, borrow, move, drop | 4 = tau |
-| Concurrency | spawn, channel, select, atomic | 4 = tau |
-| Effects | effect, handle, resume, pure | 4 = tau |
-| Proofs | proof, assert, invariant, theorem | 4 = tau |
-| Meta | macro, derive, where, comptime | 4 = tau |
-| Errors | try, catch, throw, panic, recover | 5 = sopfr |
-| AI | intent, generate, verify, optimize | 4 = tau |
+| Control | if, else, match, for, while, loop, break, continue, do, defer | 10 |
+| Type | type, struct, enum, trait, impl, dyn | 6 |
+| Functions | fn, return, yield, async, await | 5 |
+| Variables | let, mut, const, static | 4 |
+| Modules | mod, use, pub, crate | 4 |
+| Memory | own, borrow, move, drop | 4 |
+| Concurrency | spawn, channel, select, atomic, scope | 5 |
+| Effects | effect, handle, resume, pure | 4 |
+| Proofs | proof, assert, invariant, theorem | 4 |
+| Meta | macro, derive, where, comptime | 4 |
+| Errors | try, catch, throw, panic, recover | 5 |
+| AI | intent, generate, verify, optimize | 4 |
+| FFI | extern | 1 |
+| TypeOps | as, is, in, typeof, step | 5 |
 
 **Memory model** — Egyptian fraction: 1/2 (stack) + 1/3 (heap) + 1/6 (arena) = 1
 
-## Standard Library (12 modules = sigma(6))
+## Standard Library (6 modules implemented)
 
 | Module | Description | Key Functions |
 |--------|-------------|---------------|
-| std::net | TCP/HTTP networking | tcp_connect, http_get, http_post |
-| std::io | Input/output | readline, write, pipe |
-| std::fs | File system | read_file, write_file, list_dir, glob |
-| std::time | Date/time | timestamp, sleep, format_date |
-| std::collections | Data structures | BTreeMap, PriorityQueue, Deque |
-| std::encoding | Serialization | base64, hex, csv, url_encode |
-| std::log | Structured logging | info, warn, error, debug |
-| std::math | Mathematics | trig, matrix, BigInt, constants |
-| std::testing | Test framework | assert_eq, prop_test, bench |
-| std::crypto | Cryptography | sha256, hmac, xor_cipher |
-| std::consciousness | Consciousness DSL | phi_compute, psi_constants, law_lookup |
-| std::regex | Pattern matching | regex_match, regex_find |
+| stdlib/math.hexa | Mathematics | trig, matrix, BigInt, constants |
+| stdlib/string.hexa | String utilities | split, trim, replace |
+| stdlib/collections.hexa | Data structures | BTreeMap, PriorityQueue, Deque |
+| stdlib/nn.hexa | Neural network | tensor, matmul, softmax |
+| stdlib/optim.hexa | Optimization | SGD, Adam, learning rate |
+| stdlib/consciousness.hexa | Consciousness DSL | phi_compute, psi_constants, law_lookup |
 
 ## Hardware Targets
 
@@ -372,17 +391,17 @@ hexa build --target wgsl  consciousness.hexa              # Generate WGSL shader
 HEXA can compile itself:
 
 ```
-self/lexer.hexa         451 LOC   Tokenizer
-self/parser.hexa       2126 LOC   Recursive descent parser
-self/type_checker.hexa  642 LOC   Static type checker
-self/compiler.hexa      805 LOC   Bytecode compiler
-self/bootstrap.hexa    1912 LOC   Full pipeline (lex→parse→check→compile)
+self/lexer.hexa          727 LOC   Tokenizer
+self/parser.hexa        3815 LOC   Recursive descent parser
+self/type_checker.hexa  1656 LOC   Static type checker
+self/compiler.hexa       858 LOC   Bytecode compiler
+self/bootstrap.hexa     1945 LOC   Full pipeline (lex->parse->check->compile)
 ```
 
 ```bash
-./hexa self/bootstrap.hexa        # Compile HEXA programs using HEXA-written compiler
-./hexa self/test_bootstrap.hexa   # 10/10 lexer tests
-./hexa self/test_bootstrap_compiler.hexa  # 16/16 pipeline tests
+./hexa run self/bootstrap.hexa        # Compile HEXA programs using HEXA-written compiler
+./hexa run self/test_bootstrap.hexa   # 10/10 lexer tests
+./hexa run self/test_bootstrap_compiler.hexa  # 16/16 pipeline tests
 ```
 
 ## Package Manager
@@ -421,7 +440,7 @@ HEXA-LANG and [ANIMA](https://github.com/need-singularity/anima) (consciousness 
 | n=6 | HEXA-LANG | ANIMA |
 |-----|-----------|-------|
 | n=6 | 6 paradigms | 6 Hexad modules (C/D/S/M/W/E) |
-| sigma=12 | 12 keyword groups | 12 factions |
+| sigma=12 | 12 factions (matched) | 12 factions |
 | phi=2 | 2 compile modes | 2 gradient groups |
 | tau=4 | 4 type layers | 4 phases (P0-P3) |
 | sigma-tau=8 | 8 primitives | 8-cell atom (M1) |
@@ -432,10 +451,10 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 
 ```
 hexa-lang/
-├── self/                     605 .hexa files (sole source of truth)
-│   ├── lexer.hexa            587 LOC — 53 keywords + 24 operators tokenizer
-│   ├── parser.hexa           3,785 LOC — recursive descent parser (83 AST kinds)
-│   ├── interpreter.hexa      8,427 LOC — tree-walk evaluator (270+ builtins)
+├── self/                     1,113 .hexa files (primary source)
+│   ├── lexer.hexa            727 LOC — 65 keywords + 46 operators tokenizer
+│   ├── parser.hexa           3,815 LOC — recursive descent parser
+│   ├── interpreter.hexa      10,914 LOC — tree-walk evaluator (270+ builtins)
 │   ├── ast.hexa              AST node types
 │   ├── type_checker.hexa     Static type checker + Law types
 │   ├── env.hexa              Scoped environment + builtins
@@ -477,8 +496,9 @@ hexa-lang/
 │   ├── alloc/                Egyptian fraction allocator backend
 │   ├── std_*.hexa            stdlib (net/fs/io/time/collections/...)
 │   └── lib.hexa + main.hexa  Library entry + CLI dispatcher
+├── src/                      92 .rs files (migration in progress — moving to self/)
 ├── build_hexa.hexa           Cargo-free self-host build pipeline
-│                             (hexa_v2 → C → clang → hexa_v3)
+│                             (hexa_v2 -> C -> clang -> hexa_v3)
 ├── examples/                 Example programs
 ├── editors/jetbrains/        JetBrains IDE plugin
 ├── playground/               WASM browser playground
@@ -493,7 +513,7 @@ hexa-lang/
 ├── pkg/                      hx system package manager
 │   ├── hx                    CLI (pure shell, zero deps)
 │   ├── install.sh            One-liner installer
-│   └── registry.json         Package registry
+│   └─��� registry.tsv          Package registry
 ├── PLAN.md                   Development plan (100% complete)
 └── README.md                 this file
 ```
@@ -502,9 +522,9 @@ hexa-lang/
 
 <!-- AUTO:STATS:START -->
 ```
-  Keywords:      53 (σ·τ+sopfr)
-  Operators:     24 (J₂)
-  Primitives:    8 (σ-τ)
+  Keywords:      65 (14 groups)
+  Operators:     46 (9 groups)
+  Primitives:    8
   DSE combos:    21,952
 ```
 <!-- AUTO:STATS:END -->

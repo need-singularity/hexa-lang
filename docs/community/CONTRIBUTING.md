@@ -23,20 +23,21 @@ No Rust, no cargo, no python required.
 ```bash
 git clone https://github.com/need-singularity/hexa-lang.git
 cd hexa-lang
-./hexa examples/hello_min.hexa        # precompiled binary runs immediately
+./hexa run examples/hello_min.hexa        # go/cargo-style subcommand
+./hexa version                            # 0.1.0-stage1 CLI 확인
 ```
 
 ### Running Tests
 
 ```bash
 # Self-host regression suite (205/205 should PASS)
-./hexa self/test_interp.hexa
-./hexa self/test_interp_e2e.hexa
-./hexa self/test_interp_match.hexa
-./hexa self/test_interp_valuesystem.hexa
+./hexa run self/test_interp.hexa
+./hexa run self/test_interp_e2e.hexa
+./hexa run self/test_interp_match.hexa
+./hexa run self/test_interp_valuesystem.hexa
 
-# Individual example tests
-./hexa --test examples/test_builtins.hexa
+# 호환 모드 (python/node 스타일): ./hexa 와 .hexa 파일만 넘기면 run으로 위임
+./hexa self/test_interp.hexa
 ```
 
 ### Project Structure
@@ -66,8 +67,12 @@ hexa-lang/
   editors/            Editor support (VS Code, JetBrains)
   pkg/hx              Pure-bash package manager (zero deps)
   hexa.toml           Self-host package manifest (replaces Cargo.toml)
-  build_hexa.hexa     hexa_v2 → C → clang → hexa_v3 bootstrap
-  hexa                Precompiled binary (the runtime)
+  hexa                stage1 CLI dispatcher (77KB — go/cargo style)
+  build/
+    hexa_stage0       stage0 인터프리터 (351KB, run 서브커맨드 위임처)
+    artifacts/        빌드 산출물 덤프 (.c 트랜스파일 결과, 네이티브 바이너리)
+  self/main.hexa      CLI 디스패처 SSOT (run/build/cc/status/version/help)
+  self/native/hexa_v2 트랜스파일러 (.hexa → .c)
 ```
 
 ## Coding Style

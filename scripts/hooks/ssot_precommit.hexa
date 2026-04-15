@@ -1,0 +1,211 @@
+// scripts/hooks/ssot_precommit.hexa — bt 74-C
+// ────────────────────────────────────────────────────────────
+// SSOT drift pre-commit warner (NON-BLOCKING). Runs from the
+// shared .git/hooks/pre-commit shim. Detects whether the commit
+// would *increase* the divergent-fn count between the two SSOT
+// interpreter sources (self/interpreter.hexa vs self/hexa_full.hexa)
+// produced by scripts/check_ssot_sync.hexa.
+//
+// Design principles (see bt 74 #c in future_work[]):
+//   1. NEVER invoke `hexa build` from the hook — that path can
+//      transitively rebuild stage0 and, if the pre-commit itself
+//      auto-stages the new binary (see loop-guard), trigger an
+//      infinite commit loop. We only *run* the already-built
+//      /tmp/ssot_sync binary (built once, out-of-band).
+//   2. Non-blocking: a divergence increase emits a stderr warning
+//      but never fails the commit. There are 11+ known divergent
+//      fns today; blocking would brick every commit.
+//   3. Cached baseline: .git/ssot_divergent_count stores the prior
+//      divergent count. We only warn when the new count is *higher*
+//      than the baseline — a regression signal, not absolute count.
+//      When user reconciles and the count drops, we silently
+//      rewrite the baseline downwards so reconciliation sticks.
+//   4. Filter: only runs when a .hexa file in self/ is staged.
+//      Binary-only or docs-only commits skip instantly (0ms cost).
+//   5. Degrade silently when /tmp/ssot_sync is missing — we print
+//      one short notice, do not block, do not try to rebuild.
+//
+// Invariants observed:
+//   I1 hexa lists pass-by-value (we reassign on every push)
+//   I2 Ident uses .name (no Ident access here but kept in mind)
+//   I3 args() == raw[1..] — we read argv[1] defensively; hook
+//      normally passes no args.
+//
+// Exit: always 0 (non-blocking). Warnings go to stderr.
+
+// ── staged-file filter ────────────────────────────────────────
+// Returns true when at least one staged (Added/Copied/Modified/
+// Renamed) file matches self/*.hexa. We use git's own filter so
+// we never have to parse paths ourselves.
+
+fn ssot_repo_root() {
+    let r = exec("git rev-parse --show-toplevel 2>/dev/null").trim()
+    return r
+}
+
+fn ssot_any_ssot_staged(root) {
+    // --diff-filter=ACMR skips deletions (no point running on a
+    // delete-only commit — divergence can't increase from that).
+    let cmd = "git -C " + root + " diff --cached --name-only --diff-filter=ACMR"
+    let listing = exec(cmd)
+    let lines = listing.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let ln = lines[i].trim()
+        // Only trigger on edits to the two SSOT files themselves.
+        // Editing other self/*.hexa files can't change the
+        // interpreter vs hexa_full divergence count, so skipping
+        // them is both correct and an optimisation.
+        if ln == "self/interpreter.hexa" { return true }
+        if ln == "self/hexa_full.hexa" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── baseline cache ────────────────────────────────────────────
+// Stored at .git/ssot_divergent_count (per-repo, not tracked).
+
+fn ssot_cache_path(root) {
+    // rev-parse --git-common-dir resolves to .git OR
+    // .git/worktrees/<name>/ depending on worktree. We want the
+    // common dir so baseline is shared across worktrees — a
+    // reconciliation in one worktree is visible to all.
+    let gd = exec("git -C " + root + " rev-parse --git-common-dir 2>/dev/null").trim()
+    if gd == "" { return root + "/.git/ssot_divergent_count" }
+    // rev-parse may return relative path; make it absolute when
+    // needed. starts_with("/") covers unix; hook only runs on unix.
+    if gd.starts_with("/") { return gd + "/ssot_divergent_count" }
+    return root + "/" + gd + "/ssot_divergent_count"
+}
+
+fn ssot_read_baseline(path) {
+    if !file_exists(path) { return -1 }
+    let raw = read_file(path).trim()
+    if raw == "" { return -1 }
+    // Defensive parse_int — bad content → -1 → treated as "no
+    // baseline", first run semantics.
+    return raw.parse_int()
+}
+
+fn ssot_write_baseline(path, count) {
+    // Best-effort; if write fails (e.g. permission), we just let
+    // the next run re-compute. No exception handling needed.
+    write_file(path, to_string(count) + "\n")
+}
+
+// ── run the detector ──────────────────────────────────────────
+// Calls /tmp/ssot_sync (prebuilt). Parses the "  divergent  = N"
+// summary line out of its stdout. Returns -1 on any failure
+// (missing binary, parse failure) so callers can skip safely.
+
+fn ssot_parse_divergent(out) {
+    let lines = out.split("\n")
+    let n = len(lines)
+    let mut i = 0
+    while i < n {
+        let t = lines[i].trim()
+        if t.starts_with("divergent") {
+            // format: "divergent  = 14"
+            let eq = t.index_of("=")
+            if eq > 0 {
+                let v = t.substring(eq + 1, len(t)).trim()
+                return v.parse_int()
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+fn ssot_run_detector(root) {
+    let bin = "/tmp/ssot_sync"
+    if !file_exists(bin) {
+        eprintln("[ssot-sync] note: /tmp/ssot_sync not built — skipping drift check.")
+        eprintln("[ssot-sync]       build once via: hexa build scripts/check_ssot_sync.hexa -o /tmp/ssot_sync")
+        return -1
+    }
+    let interp = root + "/self/interpreter.hexa"
+    let full = root + "/self/hexa_full.hexa"
+    if !file_exists(interp) { return -1 }
+    if !file_exists(full) { return -1 }
+    // The detector accepts positional args `<interp> <full> [max]`.
+    // Native mode args() returns user args only (no program name),
+    // and the detector's `if len(args) >= 4` test counts full
+    // native argv including argv[0]=program + argv[1..]=user args
+    // — so to satisfy its index [2]/[3] read, we need ≥4 total
+    // positional slots BEFORE the max_report. Empirically the
+    // working invocation is: bin <interp> <full>, which falls
+    // through to the defaults branch and uses paths "self/…"
+    // relative to CWD. We therefore cd into `root` and call with
+    // no args, which is the minimum-surface-area invocation that
+    // the detector handles correctly on both stage0 and native.
+    let cmd = "cd " + root + " && " + bin + " 2>&1"
+    let out = exec(cmd)
+    return ssot_parse_divergent(out)
+}
+
+// ── main ──────────────────────────────────────────────────────
+
+let root = ssot_repo_root()
+if root == "" {
+    // Not in a git repo — nothing to do. Happens when this file
+    // is run directly by a developer, not by the hook.
+    exit(0)
+}
+
+// Trigger filter — binary/docs-only commits skip entirely.
+if !ssot_any_ssot_staged(root) {
+    exit(0)
+}
+
+let cache = ssot_cache_path(root)
+let baseline = ssot_read_baseline(cache)
+let current = ssot_run_detector(root)
+
+if current < 0 {
+    // Detector missing or failed — nothing actionable, already
+    // logged a note above. Exit without updating the cache so the
+    // next run still tries.
+    exit(0)
+}
+
+if baseline < 0 {
+    // First run: seed the baseline, announce once, exit.
+    ssot_write_baseline(cache, current)
+    eprintln("[ssot-sync] baseline recorded: divergent=" + to_string(current))
+    exit(0)
+}
+
+if current > baseline {
+    // REGRESSION — new drift introduced by this commit's edits.
+    // Warn loudly but do NOT block. Then update the baseline so
+    // the next commit doesn't re-warn about the same drift
+    // (sticky-warning would make every subsequent commit noisy
+    // until manual reconcile — user feedback: annoying).
+    eprintln("")
+    eprintln("[ssot-sync] WARNING: SSOT divergence INCREASED")
+    eprintln("[ssot-sync]   baseline = " + to_string(baseline))
+    eprintln("[ssot-sync]   current  = " + to_string(current))
+    eprintln("[ssot-sync]   delta    = +" + to_string(current - baseline))
+    eprintln("[ssot-sync] Edits to self/interpreter.hexa or self/hexa_full.hexa")
+    eprintln("[ssot-sync] look out of sync between the two SSOTs.")
+    eprintln("[ssot-sync] Non-blocking — commit will proceed. To inspect:")
+    eprintln("[ssot-sync]   /tmp/ssot_sync self/interpreter.hexa self/hexa_full.hexa")
+    eprintln("")
+    ssot_write_baseline(cache, current)
+    exit(0)
+}
+
+if current < baseline {
+    // Reconciliation! Rewrite the baseline downward silently so
+    // future commits measure from the improved baseline.
+    ssot_write_baseline(cache, current)
+    eprintln("[ssot-sync] reconciled: divergent " + to_string(baseline) + " -> " + to_string(current))
+    exit(0)
+}
+
+// current == baseline — perfectly normal, no output, no cache
+// write (avoid spurious mtime churn).
+exit(0)

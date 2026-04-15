@@ -1,0 +1,773 @@
+// ===================================================================
+//  self/ml/motion_transfer.hexa -- Motion Transfer (#324)
+//
+//  Decompose video into appearance and motion, then transfer motion
+//  from one video to another's appearance.
+//
+//  Core idea:
+//    - Motion estimation: compute optical flow (displacement field)
+//      between consecutive frames via a learned network.
+//    - Appearance encoding: encode a single frame into a compact
+//      appearance code via a learned encoder.
+//    - Motion application (warping): given an appearance code and a
+//      flow field, produce an output frame.
+//
+//  Architecture:
+//    Motion encoder: two frames -> hidden -> 2D flow field
+//      h = tanh(W_me * [frame1 ++ frame2] + b_me)    2*D_spatial -> D_motion
+//      flow = W_mf * h + b_mf                        D_motion -> D_spatial
+//      (flow has 2 channels: dx, dy per spatial pixel)
+//
+//    Appearance encoder: single frame -> appearance code
+//      h_a = tanh(W_ae * frame + b_ae)                D_spatial -> D_appear
+//      code = tanh(W_ac * h_a + b_ac)                 D_appear -> D_appear
+//
+//    Decoder: appearance code + flow -> output frame
+//      combined = [appearance ++ flow]
+//      h_d = tanh(W_d * combined + b_d)               (D_appear + D_spatial) -> D_motion
+//      out = sigmoid(W_do * h_d + b_do)               D_motion -> D_spatial
+//
+//  API:
+//    mt_init(D_spatial, D_motion, D_appear, seed) -> model
+//    mt_estimate_motion(model, frame1, frame2) -> flow_field
+//    mt_encode_appearance(model, frame) -> appearance_code
+//    mt_warp(frame, flow_field) -> warped_frame
+//    mt_apply_motion(model, appearance, flow_field) -> output_frame
+//    mt_transfer(model, source_frames, target_frame) -> output_frames
+//    mt_loss(model, video_frames) -> float (reconstruction)
+//    mt_train_step(model, videos, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / loss)
+//    @hot   (training step)
+// ===================================================================
+
+// ── Math helpers ──────────────────────────────────────────────
+
+fn mt_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn mt_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mt_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn mt_tanh(x) {
+    let ep = mt_exp(x)
+    let en = mt_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn mt_sigmoid(x) {
+    return 1.0 / (1.0 + mt_exp(0.0 - x))
+}
+
+fn mt_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.001 { g = 0.001 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+// ── Array helpers ─────────────────────────────────────────────
+
+fn mt_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mt_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── RNG ───────────────────────────────────────────────────────
+
+fn mt_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn mt_uniform(state) {
+    let s = mt_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Xavier-ish init for a 2D weight matrix ────────────────────
+
+fn mt_init_weight(rows, cols, state_in) {
+    let mut state = state_in
+    let scale = 1.0 / mt_sqrt(to_float(rows + cols))
+    let mut W = mt_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            let u = mt_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+    return #{"W": W, "state": state}
+}
+
+// ===================================================================
+//  mt_init  --  Create motion transfer model
+//
+//  D_spatial : flattened frame size (e.g. H*W for grayscale)
+//  D_motion  : hidden dimension for motion encoder/decoder
+//  D_appear  : appearance code dimension
+//  seed      : RNG seed for reproducibility
+// ===================================================================
+fn mt_init(D_spatial, D_motion, D_appear, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Motion encoder: [frame1 ++ frame2] -> D_motion -> D_spatial (flow)
+    let r1 = mt_init_weight(D_motion, D_spatial * 2, state)
+    let W_me = r1["W"]
+    state = r1["state"]
+    let b_me = mt_zeros(D_motion)
+
+    let r2 = mt_init_weight(D_spatial, D_motion, state)
+    let W_mf = r2["W"]
+    state = r2["state"]
+    let b_mf = mt_zeros(D_spatial)
+
+    // Appearance encoder: frame -> D_appear (two layers)
+    let r3 = mt_init_weight(D_appear, D_spatial, state)
+    let W_ae = r3["W"]
+    state = r3["state"]
+    let b_ae = mt_zeros(D_appear)
+
+    let r4 = mt_init_weight(D_appear, D_appear, state)
+    let W_ac = r4["W"]
+    state = r4["state"]
+    let b_ac = mt_zeros(D_appear)
+
+    // Decoder: [appearance ++ flow] -> D_motion -> D_spatial
+    let r5 = mt_init_weight(D_motion, D_appear + D_spatial, state)
+    let W_d = r5["W"]
+    state = r5["state"]
+    let b_d = mt_zeros(D_motion)
+
+    let r6 = mt_init_weight(D_spatial, D_motion, state)
+    let W_do = r6["W"]
+    state = r6["state"]
+    let b_do = mt_zeros(D_spatial)
+
+    return #{
+        "D_spatial": D_spatial,
+        "D_motion": D_motion,
+        "D_appear": D_appear,
+        "W_me": W_me, "b_me": b_me,
+        "W_mf": W_mf, "b_mf": b_mf,
+        "W_ae": W_ae, "b_ae": b_ae,
+        "W_ac": W_ac, "b_ac": b_ac,
+        "W_d": W_d, "b_d": b_d,
+        "W_do": W_do, "b_do": b_do
+    }
+}
+
+// ===================================================================
+//  mt_estimate_motion  --  Compute flow field between two frames
+//
+//  Input: frame1, frame2 each [D_spatial]
+//  Output: flow_field [D_spatial] (displacement per element)
+// ===================================================================
+@pure
+fn mt_estimate_motion(model, frame1, frame2) {
+    let D_spatial = model["D_spatial"]
+    let D_motion = model["D_motion"]
+    let W_me = model["W_me"]
+    let b_me = model["b_me"]
+    let W_mf = model["W_mf"]
+    let b_mf = model["b_mf"]
+
+    // Concatenate frames
+    let inp = frame1 + frame2
+
+    // Hidden layer
+    let mut h = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        let mut s = b_me[i]
+        for j in 0..(D_spatial * 2) {
+            s = s + W_me[i][j] * inp[j]
+        }
+        h[i] = mt_tanh(s)
+    }
+
+    // Flow output (no activation -- flow can be positive or negative)
+    let mut flow = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        let mut s = b_mf[i]
+        for j in 0..D_motion {
+            s = s + W_mf[i][j] * h[j]
+        }
+        flow[i] = s
+    }
+    return flow
+}
+
+// ===================================================================
+//  mt_encode_appearance  --  Encode single frame to appearance code
+//
+//  Input: frame [D_spatial]
+//  Output: appearance code [D_appear]
+// ===================================================================
+@pure
+fn mt_encode_appearance(model, frame) {
+    let D_spatial = model["D_spatial"]
+    let D_appear = model["D_appear"]
+    let W_ae = model["W_ae"]
+    let b_ae = model["b_ae"]
+    let W_ac = model["W_ac"]
+    let b_ac = model["b_ac"]
+
+    // First layer
+    let mut h_a = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        let mut s = b_ae[i]
+        for j in 0..D_spatial {
+            s = s + W_ae[i][j] * frame[j]
+        }
+        h_a[i] = mt_tanh(s)
+    }
+
+    // Second layer
+    let mut code = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        let mut s = b_ac[i]
+        for j in 0..D_appear {
+            s = s + W_ac[i][j] * h_a[j]
+        }
+        code[i] = mt_tanh(s)
+    }
+    return code
+}
+
+// ===================================================================
+//  mt_warp  --  Simple warp: frame + flow_field -> warped frame
+//
+//  For a 1D "video" this adds the flow displacement to each pixel.
+//  Clamp result to [0, 1].
+// ===================================================================
+@pure
+fn mt_warp(frame, flow_field) {
+    let n = len(frame)
+    let mut out = mt_zeros(n)
+    for i in 0..n {
+        let mut v = frame[i] + flow_field[i]
+        if v < 0.0 { v = 0.0 }
+        if v > 1.0 { v = 1.0 }
+        out[i] = v
+    }
+    return out
+}
+
+// ===================================================================
+//  mt_apply_motion  --  Decode appearance + flow -> output frame
+//
+//  Concatenates appearance code and flow field, passes through
+//  decoder network.
+// ===================================================================
+@pure
+fn mt_apply_motion(model, appearance, flow_field) {
+    let D_spatial = model["D_spatial"]
+    let D_motion = model["D_motion"]
+    let D_appear = model["D_appear"]
+    let W_d = model["W_d"]
+    let b_d = model["b_d"]
+    let W_do = model["W_do"]
+    let b_do = model["b_do"]
+
+    // Concatenate appearance + flow
+    let combined = appearance + flow_field
+
+    // Hidden layer
+    let mut h = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        let mut s = b_d[i]
+        for j in 0..(D_appear + D_spatial) {
+            s = s + W_d[i][j] * combined[j]
+        }
+        h[i] = mt_tanh(s)
+    }
+
+    // Output (sigmoid to keep in [0,1])
+    let mut out = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        let mut s = b_do[i]
+        for j in 0..D_motion {
+            s = s + W_do[i][j] * h[j]
+        }
+        out[i] = mt_sigmoid(s)
+    }
+    return out
+}
+
+// ===================================================================
+//  mt_transfer  --  Transfer motion from source video to target frame
+//
+//  source_frames: list of frames defining the motion sequence
+//  target_frame:  single frame providing appearance
+//  Returns: list of output frames with target appearance + source motion
+// ===================================================================
+@pure
+fn mt_transfer(model, source_frames, target_frame) {
+    let n = len(source_frames)
+    if n < 2 { return [target_frame] }
+
+    let appearance = mt_encode_appearance(model, target_frame)
+    let mut outputs = [target_frame]
+
+    for i in 1..n {
+        let flow = mt_estimate_motion(model, source_frames[i - 1], source_frames[i])
+        let out = mt_apply_motion(model, appearance, flow)
+        outputs = outputs + [out]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  mt_loss  --  Reconstruction loss over a video sequence
+//
+//  For each consecutive pair (t, t+1):
+//    1. Estimate motion from frame_t -> frame_{t+1}
+//    2. Encode appearance from frame_t
+//    3. Decode: apply_motion(appearance, flow) -> reconstructed frame_{t+1}
+//    4. MSE between reconstruction and ground truth frame_{t+1}
+//
+//  Returns average MSE over all pairs.
+// ===================================================================
+@pure
+fn mt_loss(model, video_frames) {
+    let n = len(video_frames)
+    if n < 2 { return 0.0 }
+    let D_spatial = model["D_spatial"]
+    let mut total = 0.0
+    let pairs = n - 1
+
+    for t in 0..pairs {
+        let frame_t = video_frames[t]
+        let frame_next = video_frames[t + 1]
+
+        let flow = mt_estimate_motion(model, frame_t, frame_next)
+        let appearance = mt_encode_appearance(model, frame_t)
+        let recon = mt_apply_motion(model, appearance, flow)
+
+        let mut mse = 0.0
+        for i in 0..D_spatial {
+            let diff = recon[i] - frame_next[i]
+            mse = mse + diff * diff
+        }
+        total = total + mse / to_float(D_spatial)
+    }
+    return total / to_float(pairs)
+}
+
+// ===================================================================
+//  Forward pass helpers for training (return intermediates)
+// ===================================================================
+
+fn mt_motion_forward(model, frame1, frame2) {
+    let D_spatial = model["D_spatial"]
+    let D_motion = model["D_motion"]
+    let W_me = model["W_me"]
+    let b_me = model["b_me"]
+    let W_mf = model["W_mf"]
+    let b_mf = model["b_mf"]
+
+    let inp = frame1 + frame2
+
+    let mut h = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        let mut s = b_me[i]
+        for j in 0..(D_spatial * 2) {
+            s = s + W_me[i][j] * inp[j]
+        }
+        h[i] = mt_tanh(s)
+    }
+
+    let mut flow = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        let mut s = b_mf[i]
+        for j in 0..D_motion {
+            s = s + W_mf[i][j] * h[j]
+        }
+        flow[i] = s
+    }
+    return #{"inp": inp, "h": h, "flow": flow}
+}
+
+fn mt_appear_forward(model, frame) {
+    let D_spatial = model["D_spatial"]
+    let D_appear = model["D_appear"]
+    let W_ae = model["W_ae"]
+    let b_ae = model["b_ae"]
+    let W_ac = model["W_ac"]
+    let b_ac = model["b_ac"]
+
+    let mut h_a = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        let mut s = b_ae[i]
+        for j in 0..D_spatial {
+            s = s + W_ae[i][j] * frame[j]
+        }
+        h_a[i] = mt_tanh(s)
+    }
+
+    let mut code = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        let mut s = b_ac[i]
+        for j in 0..D_appear {
+            s = s + W_ac[i][j] * h_a[j]
+        }
+        code[i] = mt_tanh(s)
+    }
+    return #{"h_a": h_a, "code": code}
+}
+
+fn mt_decode_forward(model, appearance, flow_field) {
+    let D_spatial = model["D_spatial"]
+    let D_motion = model["D_motion"]
+    let D_appear = model["D_appear"]
+    let W_d = model["W_d"]
+    let b_d = model["b_d"]
+    let W_do = model["W_do"]
+    let b_do = model["b_do"]
+
+    let combined = appearance + flow_field
+
+    let mut h = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        let mut s = b_d[i]
+        for j in 0..(D_appear + D_spatial) {
+            s = s + W_d[i][j] * combined[j]
+        }
+        h[i] = mt_tanh(s)
+    }
+
+    let mut out = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        let mut s = b_do[i]
+        for j in 0..D_motion {
+            s = s + W_do[i][j] * h[j]
+        }
+        out[i] = mt_sigmoid(s)
+    }
+    return #{"combined": combined, "h": h, "out": out}
+}
+
+// ===================================================================
+//  mt_train_step  --  One gradient descent step
+//
+//  videos: list of video clips, each clip is a list of frames
+//  lr: learning rate
+//
+//  Gradient flow (reconstruction loss = MSE):
+//    d_loss/d_out = 2*(out - target) / D_spatial
+//
+//    Decoder:
+//      out_i = sigmoid(z_do_i)  =>  d/dz = out*(1-out)
+//      z_do_i = sum_j W_do[i][j]*h_d[j] + b_do[i]
+//      h_d_j = tanh(z_d_j)     =>  d/dz = 1 - h_d^2
+//      z_d_j = sum_k W_d[j][k]*combined[k] + b_d[j]
+//
+//    Gradients propagate back into both appearance encoder and
+//    motion encoder via the combined = [appearance ++ flow] input.
+//
+//    Motion encoder:
+//      flow_i = z_mf_i = sum_j W_mf[i][j]*h_me[j] + b_mf[i]
+//      h_me_j = tanh(z_me_j)  =>  d/dz = 1 - h_me^2
+//      z_me_j = sum_k W_me[j][k]*inp[k] + b_me[j]
+//
+//    Appearance encoder:
+//      code_i = tanh(z_ac_i)  =>  d/dz = 1 - code^2
+//      z_ac_i = sum_j W_ac[i][j]*h_a[j] + b_ac[j]
+//      h_a_j = tanh(z_ae_j)   =>  d/dz = 1 - h_a^2
+//      z_ae_j = sum_k W_ae[j][k]*frame[k] + b_ae[j]
+// ===================================================================
+@hot
+fn mt_train_step(model, videos, lr) {
+    let D_spatial = model["D_spatial"]
+    let D_motion = model["D_motion"]
+    let D_appear = model["D_appear"]
+
+    // Accumulate gradients
+    let mut gW_me = mt_zeros_2d(D_motion, D_spatial * 2)
+    let mut gb_me = mt_zeros(D_motion)
+    let mut gW_mf = mt_zeros_2d(D_spatial, D_motion)
+    let mut gb_mf = mt_zeros(D_spatial)
+
+    let mut gW_ae = mt_zeros_2d(D_appear, D_spatial)
+    let mut gb_ae = mt_zeros(D_appear)
+    let mut gW_ac = mt_zeros_2d(D_appear, D_appear)
+    let mut gb_ac = mt_zeros(D_appear)
+
+    let mut gW_d = mt_zeros_2d(D_motion, D_appear + D_spatial)
+    let mut gb_d = mt_zeros(D_motion)
+    let mut gW_do = mt_zeros_2d(D_spatial, D_motion)
+    let mut gb_do = mt_zeros(D_spatial)
+
+    let mut total_pairs = 0
+
+    for v in 0..len(videos) {
+        let clip = videos[v]
+        let n_frames = len(clip)
+        if n_frames < 2 { continue }
+
+        for t in 0..(n_frames - 1) {
+            let frame_t = clip[t]
+            let frame_next = clip[t + 1]
+            total_pairs = total_pairs + 1
+
+            // Forward passes with intermediates
+            let mf = mt_motion_forward(model, frame_t, frame_next)
+            let h_me = mf["h"]
+            let flow = mf["flow"]
+            let me_inp = mf["inp"]
+
+            let af = mt_appear_forward(model, frame_t)
+            let h_a = af["h_a"]
+            let code = af["code"]
+
+            let df = mt_decode_forward(model, code, flow)
+            let combined = df["combined"]
+            let h_d = df["h"]
+            let out = df["out"]
+
+            // ── d_loss/d_out = 2*(out - target) / D_spatial ──
+            let inv_d = 1.0 / to_float(D_spatial)
+            let mut d_out = mt_zeros(D_spatial)
+            for i in 0..D_spatial {
+                d_out[i] = 2.0 * (out[i] - frame_next[i]) * inv_d
+            }
+
+            // ── Decoder backward ──
+            // d_out -> d_z_do: d_z_do = d_out * out*(1-out)
+            let mut d_z_do = mt_zeros(D_spatial)
+            for i in 0..D_spatial {
+                d_z_do[i] = d_out[i] * out[i] * (1.0 - out[i])
+            }
+
+            // gW_do, gb_do
+            for i in 0..D_spatial {
+                gb_do[i] = gb_do[i] + d_z_do[i]
+                for j in 0..D_motion {
+                    gW_do[i][j] = gW_do[i][j] + d_z_do[i] * h_d[j]
+                }
+            }
+
+            // d_h_d
+            let mut d_h_d = mt_zeros(D_motion)
+            for j in 0..D_motion {
+                let mut s = 0.0
+                for i in 0..D_spatial {
+                    s = s + d_z_do[i] * model["W_do"][i][j]
+                }
+                d_h_d[j] = s
+            }
+
+            // d_z_d = d_h_d * (1 - h_d^2)
+            let mut d_z_d = mt_zeros(D_motion)
+            for j in 0..D_motion {
+                d_z_d[j] = d_h_d[j] * (1.0 - h_d[j] * h_d[j])
+            }
+
+            // gW_d, gb_d
+            for j in 0..D_motion {
+                gb_d[j] = gb_d[j] + d_z_d[j]
+                for k in 0..(D_appear + D_spatial) {
+                    gW_d[j][k] = gW_d[j][k] + d_z_d[j] * combined[k]
+                }
+            }
+
+            // d_combined: gradient w.r.t. combined = [appearance ++ flow]
+            let mut d_combined = mt_zeros(D_appear + D_spatial)
+            for k in 0..(D_appear + D_spatial) {
+                let mut s = 0.0
+                for j in 0..D_motion {
+                    s = s + d_z_d[j] * model["W_d"][j][k]
+                }
+                d_combined[k] = s
+            }
+
+            // Split d_combined into d_code [0..D_appear] and d_flow [D_appear..D_appear+D_spatial]
+            let mut d_code = mt_zeros(D_appear)
+            for i in 0..D_appear { d_code[i] = d_combined[i] }
+            let mut d_flow = mt_zeros(D_spatial)
+            for i in 0..D_spatial { d_flow[i] = d_combined[D_appear + i] }
+
+            // ── Appearance encoder backward ──
+            // code = tanh(z_ac) => d_z_ac = d_code * (1 - code^2)
+            let mut d_z_ac = mt_zeros(D_appear)
+            for i in 0..D_appear {
+                d_z_ac[i] = d_code[i] * (1.0 - code[i] * code[i])
+            }
+            for i in 0..D_appear {
+                gb_ac[i] = gb_ac[i] + d_z_ac[i]
+                for j in 0..D_appear {
+                    gW_ac[i][j] = gW_ac[i][j] + d_z_ac[i] * h_a[j]
+                }
+            }
+
+            // d_h_a
+            let mut d_h_a = mt_zeros(D_appear)
+            for j in 0..D_appear {
+                let mut s = 0.0
+                for i in 0..D_appear {
+                    s = s + d_z_ac[i] * model["W_ac"][i][j]
+                }
+                d_h_a[j] = s
+            }
+
+            // d_z_ae = d_h_a * (1 - h_a^2)
+            let mut d_z_ae = mt_zeros(D_appear)
+            for j in 0..D_appear {
+                d_z_ae[j] = d_h_a[j] * (1.0 - h_a[j] * h_a[j])
+            }
+            for j in 0..D_appear {
+                gb_ae[j] = gb_ae[j] + d_z_ae[j]
+                for k in 0..D_spatial {
+                    gW_ae[j][k] = gW_ae[j][k] + d_z_ae[j] * frame_t[k]
+                }
+            }
+
+            // ── Motion encoder backward ──
+            // flow = W_mf * h_me + b_mf (linear, no activation)
+            // d_flow already computed above
+            for i in 0..D_spatial {
+                gb_mf[i] = gb_mf[i] + d_flow[i]
+                for j in 0..D_motion {
+                    gW_mf[i][j] = gW_mf[i][j] + d_flow[i] * h_me[j]
+                }
+            }
+
+            // d_h_me
+            let mut d_h_me = mt_zeros(D_motion)
+            for j in 0..D_motion {
+                let mut s = 0.0
+                for i in 0..D_spatial {
+                    s = s + d_flow[i] * model["W_mf"][i][j]
+                }
+                d_h_me[j] = s
+            }
+
+            // d_z_me = d_h_me * (1 - h_me^2)
+            let mut d_z_me = mt_zeros(D_motion)
+            for j in 0..D_motion {
+                d_z_me[j] = d_h_me[j] * (1.0 - h_me[j] * h_me[j])
+            }
+            for j in 0..D_motion {
+                gb_me[j] = gb_me[j] + d_z_me[j]
+                for k in 0..(D_spatial * 2) {
+                    gW_me[j][k] = gW_me[j][k] + d_z_me[j] * me_inp[k]
+                }
+            }
+        }
+    }
+
+    if total_pairs == 0 { return model }
+
+    // ── Apply gradients (averaged over pairs) ──
+    let inv_n = lr / to_float(total_pairs)
+
+    let mut W_me_new = mt_zeros_2d(D_motion, D_spatial * 2)
+    let mut b_me_new = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        b_me_new[i] = model["b_me"][i] - inv_n * gb_me[i]
+        for j in 0..(D_spatial * 2) {
+            W_me_new[i][j] = model["W_me"][i][j] - inv_n * gW_me[i][j]
+        }
+    }
+
+    let mut W_mf_new = mt_zeros_2d(D_spatial, D_motion)
+    let mut b_mf_new = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        b_mf_new[i] = model["b_mf"][i] - inv_n * gb_mf[i]
+        for j in 0..D_motion {
+            W_mf_new[i][j] = model["W_mf"][i][j] - inv_n * gW_mf[i][j]
+        }
+    }
+
+    let mut W_ae_new = mt_zeros_2d(D_appear, D_spatial)
+    let mut b_ae_new = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        b_ae_new[i] = model["b_ae"][i] - inv_n * gb_ae[i]
+        for j in 0..D_spatial {
+            W_ae_new[i][j] = model["W_ae"][i][j] - inv_n * gW_ae[i][j]
+        }
+    }
+
+    let mut W_ac_new = mt_zeros_2d(D_appear, D_appear)
+    let mut b_ac_new = mt_zeros(D_appear)
+    for i in 0..D_appear {
+        b_ac_new[i] = model["b_ac"][i] - inv_n * gb_ac[i]
+        for j in 0..D_appear {
+            W_ac_new[i][j] = model["W_ac"][i][j] - inv_n * gW_ac[i][j]
+        }
+    }
+
+    let mut W_d_new = mt_zeros_2d(D_motion, D_appear + D_spatial)
+    let mut b_d_new = mt_zeros(D_motion)
+    for i in 0..D_motion {
+        b_d_new[i] = model["b_d"][i] - inv_n * gb_d[i]
+        for j in 0..(D_appear + D_spatial) {
+            W_d_new[i][j] = model["W_d"][i][j] - inv_n * gW_d[i][j]
+        }
+    }
+
+    let mut W_do_new = mt_zeros_2d(D_spatial, D_motion)
+    let mut b_do_new = mt_zeros(D_spatial)
+    for i in 0..D_spatial {
+        b_do_new[i] = model["b_do"][i] - inv_n * gb_do[i]
+        for j in 0..D_motion {
+            W_do_new[i][j] = model["W_do"][i][j] - inv_n * gW_do[i][j]
+        }
+    }
+
+    return #{
+        "D_spatial": D_spatial,
+        "D_motion": D_motion,
+        "D_appear": D_appear,
+        "W_me": W_me_new, "b_me": b_me_new,
+        "W_mf": W_mf_new, "b_mf": b_mf_new,
+        "W_ae": W_ae_new, "b_ae": b_ae_new,
+        "W_ac": W_ac_new, "b_ac": b_ac_new,
+        "W_d": W_d_new, "b_d": b_d_new,
+        "W_do": W_do_new, "b_do": b_do_new
+    }
+}

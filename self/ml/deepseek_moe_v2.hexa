@@ -1,0 +1,729 @@
+// ===================================================================
+//  self/ml/deepseek_moe_v2.hexa — DeepSeek MoE (#332)
+//
+//  Fine-grained expert splitting + shared expert separation.
+//  Unlike standard MoE (N experts, top-K), DeepSeek MoE:
+//    - Splits each of N coarse experts into m sub-experts (total N*m)
+//    - Routes top-mK sub-experts per token (finer granularity)
+//    - Shared experts always active (no gating, always contribute)
+//    - Load balancing loss penalizes imbalanced sub-expert usage
+//
+//  Architecture:
+//    Given input x (D_in):
+//      1. Shared: h_shared = sum_{s} FFN_shared_s(x)
+//      2. Gate:   logits = W_gate @ x  (over N*m sub-experts)
+//      3. Route:  top-mK = argtopk(softmax(logits), mK)
+//      4. Routed: h_routed = sum_{i in top-mK} g_i * FFN_sub_i(x)
+//      5. Output: y = h_shared + h_routed
+//
+//  Each sub-expert FFN_sub_i:
+//    h = ReLU(W1_i @ x + b1_i)   (D_hidden_sub x D_in)
+//    y = W2_i @ h + b2_i          (D_in x D_hidden_sub)
+//
+//  Load balancing:
+//    L_bal = (N*m) * sum_i (f_i * P_i)
+//    f_i = fraction of tokens routed to sub-expert i
+//    P_i = mean gate prob for sub-expert i
+//
+//  API:
+//    ds2_init(D_in, D_hidden, n_coarse, m_split, n_shared, top_mk, seed)
+//    ds2_route(model, x) -> [gate_vals, selected_sub_ids]
+//    ds2_sub_expert_forward(model, sub_id, x) -> output
+//    ds2_shared_forward(model, x) -> output
+//    ds2_forward(model, x) -> output
+//    ds2_balance_loss(model, gate_history) -> float
+//    ds2_forward_batch(model, tokens) -> [outputs, gate_history]
+//    ds2_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / routing / loss)
+//    @hot   (training step)
+// ===================================================================
+
+// ── Math helpers ─────────────────────────────────────────────
+
+fn ds2_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn ds2_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ds2_relu(v) { if v > 0.0 { return v } return 0.0 }
+
+// ── Array helpers ────────────────────────────────────────────
+
+fn ds2_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ds2_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ds2_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn ds2_uniform(state) {
+    let s = ds2_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Softmax ──────────────────────────────────────────────────
+
+@pure
+fn ds2_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut out = ds2_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = ds2_exp(logits[i] - mx)
+        out[i] = e
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / total }
+    return out
+}
+
+// ===================================================================
+//  Init: create model with fine-grained sub-experts
+//
+//  n_coarse coarse experts, each split into m_split sub-experts.
+//  Total routed sub-experts = n_coarse * m_split.
+//  Each sub-expert has D_hidden_sub = D_hidden / m_split hidden units
+//  (but output dim stays D_in for each sub-expert).
+//
+//  n_shared shared experts (full-size, D_hidden hidden units each).
+//  Gate: W_gate is (n_coarse * m_split) x D_in.
+// ===================================================================
+
+fn ds2_init_expert(D_in, D_hidden, state) {
+    let mut s = state
+    let mut W1 = ds2_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = ds2_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W1[i][j] = (u[0] - 0.5) * 0.2
+        }
+    }
+    let b1 = ds2_zeros(D_hidden)
+    let mut W2 = ds2_zeros_2d(D_in, D_hidden)
+    for i in 0..D_in {
+        for j in 0..D_hidden {
+            let u = ds2_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W2[i][j] = (u[0] - 0.5) * 0.2
+        }
+    }
+    let b2 = ds2_zeros(D_in)
+    return [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}, s]
+}
+
+fn ds2_init(D_in, D_hidden, n_coarse, m_split, n_shared, top_mk, seed) {
+    let mut s = seed
+    if s <= 0 { s = 1 }
+
+    let n_sub = n_coarse * m_split
+    let D_hidden_sub = D_hidden / m_split
+    if D_hidden_sub < 1 {
+        println("[ds2_init] ERROR: D_hidden must be >= m_split")
+        return #{}
+    }
+
+    // Init shared experts (full-size)
+    let mut shared_experts = []
+    for _e in 0..n_shared {
+        let result = ds2_init_expert(D_in, D_hidden, s)
+        shared_experts = shared_experts + [result[0]]
+        s = int(result[1])
+        if s <= 0 { s = 1 }
+    }
+
+    // Init sub-experts (fine-grained)
+    let mut sub_experts = []
+    for _e in 0..n_sub {
+        let result = ds2_init_expert(D_in, D_hidden_sub, s)
+        sub_experts = sub_experts + [result[0]]
+        s = int(result[1])
+        if s <= 0 { s = 1 }
+    }
+
+    // Gate weights: n_sub x D_in
+    let mut W_gate = ds2_zeros_2d(n_sub, D_in)
+    for i in 0..n_sub {
+        for j in 0..D_in {
+            let u = ds2_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            W_gate[i][j] = (u[0] - 0.5) * 0.2
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_hidden_sub": D_hidden_sub,
+        "n_coarse": n_coarse,
+        "m_split": m_split,
+        "n_sub": n_sub,
+        "n_shared": n_shared,
+        "top_mk": top_mk,
+        "shared_experts": shared_experts,
+        "sub_experts": sub_experts,
+        "W_gate": W_gate
+    }
+}
+
+// ===================================================================
+//  Routing: softmax gating over n_sub sub-experts, top-mK selection
+// ===================================================================
+
+@pure
+fn ds2_route(model, x) {
+    let W_gate = model["W_gate"]
+    let n_sub = model["n_sub"]
+    let D_in = model["D_in"]
+    let top_mk = model["top_mk"]
+
+    // Gate logits over all sub-experts
+    let mut logits = ds2_zeros(n_sub)
+    for i in 0..n_sub {
+        let mut s = 0.0
+        for j in 0..D_in { s = s + W_gate[i][j] * x[j] }
+        logits[i] = s
+    }
+
+    // Softmax
+    let gate_vals = ds2_softmax(logits)
+
+    // Top-mK selection
+    let mut selected = []
+    let mut used = ds2_zeros(n_sub)
+    for _k in 0..top_mk {
+        let mut best_idx = -1
+        let mut best_val = -1.0e30
+        for i in 0..n_sub {
+            if int(used[i]) == 0 {
+                if gate_vals[i] > best_val {
+                    best_val = gate_vals[i]
+                    best_idx = i
+                }
+            }
+        }
+        if best_idx >= 0 {
+            selected = selected + [best_idx]
+            used[best_idx] = 1.0
+        }
+    }
+
+    // Gate values for selected sub-experts
+    let mut sel_gates = []
+    for i in 0..len(selected) {
+        sel_gates = sel_gates + [gate_vals[selected[i]]]
+    }
+
+    return [sel_gates, selected]
+}
+
+// ===================================================================
+//  Full gate values (for balance loss collection)
+// ===================================================================
+
+@pure
+fn ds2_full_gate(model, x) {
+    let W_gate = model["W_gate"]
+    let n_sub = model["n_sub"]
+    let D_in = model["D_in"]
+
+    let mut logits = ds2_zeros(n_sub)
+    for i in 0..n_sub {
+        let mut s = 0.0
+        for j in 0..D_in { s = s + W_gate[i][j] * x[j] }
+        logits[i] = s
+    }
+    return ds2_softmax(logits)
+}
+
+// ===================================================================
+//  Sub-expert forward: 2-layer FFN with ReLU
+//    h = ReLU(W1 @ x + b1)
+//    out = W2 @ h + b2
+// ===================================================================
+
+@pure
+fn ds2_sub_expert_forward(model, sub_id, x) {
+    let expert = model["sub_experts"][sub_id]
+    let W1 = expert["W1"]
+    let b1 = expert["b1"]
+    let W2 = expert["W2"]
+    let b2 = expert["b2"]
+    let D_in = model["D_in"]
+    let D_hidden_sub = model["D_hidden_sub"]
+
+    // Hidden layer
+    let mut h = ds2_zeros(D_hidden_sub)
+    for i in 0..D_hidden_sub {
+        let mut s = b1[i]
+        for j in 0..D_in { s = s + W1[i][j] * x[j] }
+        h[i] = ds2_relu(s)
+    }
+
+    // Output layer
+    let mut out = ds2_zeros(D_in)
+    for i in 0..D_in {
+        let mut s = b2[i]
+        for j in 0..D_hidden_sub { s = s + W2[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ===================================================================
+//  Shared expert forward: sum of all shared experts (always active)
+// ===================================================================
+
+@pure
+fn ds2_shared_forward(model, x) {
+    let n_shared = model["n_shared"]
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let mut out = ds2_zeros(D_in)
+
+    for e in 0..n_shared {
+        let expert = model["shared_experts"][e]
+        let W1 = expert["W1"]
+        let b1 = expert["b1"]
+        let W2 = expert["W2"]
+        let b2 = expert["b2"]
+
+        // Hidden
+        let mut h = ds2_zeros(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b1[i]
+            for j in 0..D_in { s = s + W1[i][j] * x[j] }
+            h[i] = ds2_relu(s)
+        }
+
+        // Output: accumulate
+        for i in 0..D_in {
+            let mut s = b2[i]
+            for j in 0..D_hidden { s = s + W2[i][j] * h[j] }
+            out[i] = out[i] + s
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Combined forward:
+//    y = shared_experts(x) + sum_{i in top-mK} g_i * sub_expert_i(x)
+//
+//  Gate values are renormalized over selected sub-experts.
+// ===================================================================
+
+@pure
+fn ds2_forward(model, x) {
+    let D_in = model["D_in"]
+
+    // Shared experts (always active)
+    let mut out = ds2_shared_forward(model, x)
+
+    // Routed sub-experts with gating
+    let route = ds2_route(model, x)
+    let sel_gates = route[0]
+    let selected = route[1]
+
+    // Normalize gate values
+    let mut gate_sum = 0.0
+    for i in 0..len(sel_gates) { gate_sum = gate_sum + sel_gates[i] }
+    if gate_sum <= 0.0 { gate_sum = 1.0 }
+
+    for i in 0..len(selected) {
+        let sid = selected[i]
+        let g = sel_gates[i] / gate_sum
+        let expert_out = ds2_sub_expert_forward(model, sid, x)
+        for d in 0..D_in {
+            out[d] = out[d] + g * expert_out[d]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  Map sub-expert index back to coarse expert
+// ===================================================================
+
+@pure
+fn ds2_sub_to_coarse(sub_id, m_split) {
+    return sub_id / m_split
+}
+
+@pure
+fn ds2_sub_local_index(sub_id, m_split) {
+    return sub_id % m_split
+}
+
+// ===================================================================
+//  Coarse expert usage: which coarse experts are active for a token
+// ===================================================================
+
+@pure
+fn ds2_active_coarse_experts(selected_subs, m_split) {
+    let mut coarse_set = []
+    for i in 0..len(selected_subs) {
+        let c = ds2_sub_to_coarse(selected_subs[i], m_split)
+        let mut found = false
+        for j in 0..len(coarse_set) {
+            if coarse_set[j] == c { found = true }
+        }
+        if !found {
+            coarse_set = coarse_set + [c]
+        }
+    }
+    return coarse_set
+}
+
+// ===================================================================
+//  Load balancing loss over sub-experts
+//
+//  gate_history: list of [full_gate_values, selected_sub_ids] per token
+//    L_bal = n_sub * sum_i (f_i * P_i)
+//    f_i = fraction of tokens where sub-expert i was selected
+//    P_i = mean gate probability of sub-expert i across all tokens
+// ===================================================================
+
+@pure
+fn ds2_balance_loss(model, gate_history) {
+    let n_sub = model["n_sub"]
+    let N = len(gate_history)
+    if N == 0 { return 0.0 }
+
+    let mut f = ds2_zeros(n_sub)
+    let mut P = ds2_zeros(n_sub)
+    let inv_N = 1.0 / to_float(N)
+
+    for t in 0..N {
+        let entry = gate_history[t]
+        let gates = entry[0]
+        let selected = entry[1]
+
+        // Mean gate prob per sub-expert
+        for i in 0..n_sub {
+            P[i] = P[i] + gates[i] * inv_N
+        }
+
+        // Selection frequency
+        for i in 0..len(selected) {
+            let idx = selected[i]
+            f[idx] = f[idx] + inv_N
+        }
+    }
+
+    let mut loss = 0.0
+    for i in 0..n_sub {
+        loss = loss + f[i] * P[i]
+    }
+    return to_float(n_sub) * loss
+}
+
+// ===================================================================
+//  Batch forward: processes multiple tokens, collects gate history
+// ===================================================================
+
+@pure
+fn ds2_forward_batch(model, tokens) {
+    let N = len(tokens)
+    let mut outputs = []
+    let mut gate_history = []
+
+    for t in 0..N {
+        let out = ds2_forward(model, tokens[t])
+        outputs = outputs + [out]
+
+        let full_g = ds2_full_gate(model, tokens[t])
+        let route = ds2_route(model, tokens[t])
+        gate_history = gate_history + [[full_g, route[1]]]
+    }
+
+    return [outputs, gate_history]
+}
+
+// ===================================================================
+//  MSE loss
+// ===================================================================
+
+fn ds2_mse_loss(model, X, Y) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let mut total = 0.0
+    for i in 0..N {
+        let out = ds2_forward(model, X[i])
+        for d in 0..D_in {
+            let diff = out[d] - Y[i][d]
+            total = total + diff * diff
+        }
+    }
+    return total / to_float(N)
+}
+
+fn ds2_compute_loss(model, X, Y, alpha) {
+    let mse = ds2_mse_loss(model, X, Y)
+
+    let N = len(X)
+    let mut gate_hist = []
+    for i in 0..N {
+        let full_g = ds2_full_gate(model, X[i])
+        let route = ds2_route(model, X[i])
+        gate_hist = gate_hist + [[full_g, route[1]]]
+    }
+    let bal = ds2_balance_loss(model, gate_hist)
+    return mse + alpha * bal
+}
+
+// ===================================================================
+//  Training step (numerical gradient, MSE + balance loss)
+//
+//  Updates gate weights, sub-expert weights, and shared expert weights.
+//  Uses finite-difference gradient: dL/dp = (L(p+eps) - L(p-eps))/(2*eps)
+// ===================================================================
+
+fn ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, shared_experts, sub_experts, W_gate) {
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_hidden_sub": D_hidden_sub,
+        "n_coarse": n_coarse,
+        "m_split": m_split,
+        "n_sub": n_sub,
+        "n_shared": n_shared,
+        "top_mk": top_mk,
+        "shared_experts": shared_experts,
+        "sub_experts": sub_experts,
+        "W_gate": W_gate
+    }
+}
+
+@hot
+fn ds2_train_step(model, X, Y, lr) {
+    let eps = 0.001
+    let alpha = 0.01
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_hidden_sub = model["D_hidden_sub"]
+    let n_coarse = model["n_coarse"]
+    let m_split = model["m_split"]
+    let n_sub = model["n_sub"]
+    let n_shared = model["n_shared"]
+    let top_mk = model["top_mk"]
+
+    // ── Update gate weights ────────────────────────────────
+    let mut W_gate_new = ds2_zeros_2d(n_sub, D_in)
+    for i in 0..n_sub {
+        for j in 0..D_in {
+            W_gate_new[i][j] = model["W_gate"][i][j]
+        }
+    }
+    for i in 0..n_sub {
+        for j in 0..D_in {
+            let orig = W_gate_new[i][j]
+            W_gate_new[i][j] = orig + eps
+            let m_plus = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], model["sub_experts"], W_gate_new)
+            let l_plus = ds2_compute_loss(m_plus, X, Y, alpha)
+            W_gate_new[i][j] = orig - eps
+            let m_minus = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], model["sub_experts"], W_gate_new)
+            let l_minus = ds2_compute_loss(m_minus, X, Y, alpha)
+            let grad = (l_plus - l_minus) / (2.0 * eps)
+            W_gate_new[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── Update sub-expert weights ──────────────────────────
+    let mut sub_new = []
+    for e in 0..n_sub {
+        let expert = model["sub_experts"][e]
+        let mut W1 = ds2_zeros_2d(D_hidden_sub, D_in)
+        for i in 0..D_hidden_sub {
+            for j in 0..D_in { W1[i][j] = expert["W1"][i][j] }
+        }
+        let mut W2 = ds2_zeros_2d(D_in, D_hidden_sub)
+        for i in 0..D_in {
+            for j in 0..D_hidden_sub { W2[i][j] = expert["W2"][i][j] }
+        }
+        let mut b1 = ds2_zeros(D_hidden_sub)
+        for i in 0..D_hidden_sub { b1[i] = expert["b1"][i] }
+        let mut b2 = ds2_zeros(D_in)
+        for i in 0..D_in { b2[i] = expert["b2"][i] }
+
+        // Gradient for W1
+        for i in 0..D_hidden_sub {
+            for j in 0..D_in {
+                let orig = W1[i][j]
+                W1[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_sub {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["sub_experts"][ee]]
+                    }
+                }
+                let m_p = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], se_tmp, W_gate_new)
+                let lp = ds2_compute_loss(m_p, X, Y, alpha)
+                W1[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_sub {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["sub_experts"][ee]]
+                    }
+                }
+                let m_m = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], se_tmp2, W_gate_new)
+                let lm = ds2_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W1[i][j] = orig - lr * grad
+            }
+        }
+
+        // Gradient for W2
+        for i in 0..D_in {
+            for j in 0..D_hidden_sub {
+                let orig = W2[i][j]
+                W2[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_sub {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["sub_experts"][ee]]
+                    }
+                }
+                let m_p = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], se_tmp, W_gate_new)
+                let lp = ds2_compute_loss(m_p, X, Y, alpha)
+                W2[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_sub {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["sub_experts"][ee]]
+                    }
+                }
+                let m_m = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, model["shared_experts"], se_tmp2, W_gate_new)
+                let lm = ds2_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W2[i][j] = orig - lr * grad
+            }
+        }
+
+        sub_new = sub_new + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+    }
+
+    // ── Update shared expert weights ───────────────────────
+    let mut shared_new = []
+    for e in 0..n_shared {
+        let expert = model["shared_experts"][e]
+        let mut W1 = ds2_zeros_2d(D_hidden, D_in)
+        for i in 0..D_hidden {
+            for j in 0..D_in { W1[i][j] = expert["W1"][i][j] }
+        }
+        let mut W2 = ds2_zeros_2d(D_in, D_hidden)
+        for i in 0..D_in {
+            for j in 0..D_hidden { W2[i][j] = expert["W2"][i][j] }
+        }
+        let mut b1 = ds2_zeros(D_hidden)
+        for i in 0..D_hidden { b1[i] = expert["b1"][i] }
+        let mut b2 = ds2_zeros(D_in)
+        for i in 0..D_in { b2[i] = expert["b2"][i] }
+
+        // Gradient for W1
+        for i in 0..D_hidden {
+            for j in 0..D_in {
+                let orig = W1[i][j]
+                W1[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_p = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, se_tmp, sub_new, W_gate_new)
+                let lp = ds2_compute_loss(m_p, X, Y, alpha)
+                W1[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_m = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, se_tmp2, sub_new, W_gate_new)
+                let lm = ds2_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W1[i][j] = orig - lr * grad
+            }
+        }
+
+        // Gradient for W2
+        for i in 0..D_in {
+            for j in 0..D_hidden {
+                let orig = W2[i][j]
+                W2[i][j] = orig + eps
+                let mut se_tmp = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp = se_tmp + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp = se_tmp + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_p = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, se_tmp, sub_new, W_gate_new)
+                let lp = ds2_compute_loss(m_p, X, Y, alpha)
+                W2[i][j] = orig - eps
+                let mut se_tmp2 = []
+                for ee in 0..n_shared {
+                    if ee == e {
+                        se_tmp2 = se_tmp2 + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+                    } else {
+                        se_tmp2 = se_tmp2 + [model["shared_experts"][ee]]
+                    }
+                }
+                let m_m = ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, se_tmp2, sub_new, W_gate_new)
+                let lm = ds2_compute_loss(m_m, X, Y, alpha)
+                let grad = (lp - lm) / (2.0 * eps)
+                W2[i][j] = orig - lr * grad
+            }
+        }
+
+        shared_new = shared_new + [#{"W1": W1, "b1": b1, "W2": W2, "b2": b2}]
+    }
+
+    return ds2_make_model(D_in, D_hidden, D_hidden_sub, n_coarse, m_split, n_sub, n_shared, top_mk, shared_new, sub_new, W_gate_new)
+}

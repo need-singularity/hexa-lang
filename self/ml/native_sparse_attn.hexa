@@ -1,0 +1,769 @@
+// ===================================================================
+//  self/ml/native_sparse_attn.hexa — Native Sparse Attention (#303)
+//
+//  DeepSeek/NSA (2024) — hardware-aligned block-sparse attention.
+//  Instead of full N^2 attention, compute attention only on selected
+//  blocks determined by a lightweight scorer.
+//
+//  Key concepts:
+//    1. Block decomposition  — split sequence into blocks of size B
+//    2. Scoring              — lightweight scorer selects top-K blocks
+//    3. Block-sparse attn    — only compute selected Q-K-V blocks
+//    4. Sliding window       — always attend to local window
+//    5. Global tokens        — first n_global tokens always attended
+//
+//  Architecture:
+//    Q = X * W_q + b_q          (seq_len x D_model)
+//    K = X * W_k + b_k          (seq_len x D_model)
+//    V = X * W_v + b_v          (seq_len x D_model)
+//    W_score : D_model           (block scoring weights)
+//    W_out   : D_model x D_model (output projection)
+//
+//  API:
+//    nsa_init(D_model, block_size, n_global, window_size, top_k, seed) -> model
+//    nsa_block_score(model, q_block, k_blocks) -> scores
+//    nsa_select_blocks(scores, top_k) -> indices
+//    nsa_local_attention(model, Q, K, V, window) -> output
+//    nsa_global_attention(model, Q, K_global, V_global) -> output
+//    nsa_sparse_attention(model, Q, K, V) -> output  (combined)
+//    nsa_forward(model, X) -> output
+//    nsa_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  — forward / inference (no side effects)
+//    @hot   — training inner loop (perf-critical)
+// ===================================================================
+
+// ── math helpers ───────────────────────────────────────────────────
+
+fn nsa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nsa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn nsa_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn nsa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn nsa_min_int(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn nsa_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn nsa_min_f(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn nsa_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ── array helpers ──────────────────────────────────────────────────
+
+fn nsa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn nsa_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn nsa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+// ── PRNG ───────────────────────────────────────────────────────────
+
+fn nsa_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn nsa_uniform(state) {
+    let s = nsa_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ===================================================================
+//  nsa_init — initialise Native Sparse Attention model
+//
+//    W_q, W_k, W_v : D_model x D_model  (projection weights)
+//    b_q, b_k, b_v : D_model             (biases)
+//    W_score        : D_model             (block scoring)
+//    W_out          : D_model x D_model   (output projection)
+//    b_out          : D_model
+// ===================================================================
+fn nsa_init(D_model, block_size, n_global, window_size, top_k, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let scale = 1.0 / nsa_sqrt(to_float(D_model))
+
+    // W_q
+    let mut W_q = nsa_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = nsa_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_q = nsa_zeros(D_model)
+
+    // W_k
+    let mut W_k = nsa_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = nsa_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_k[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_k = nsa_zeros(D_model)
+
+    // W_v
+    let mut W_v = nsa_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = nsa_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_v = nsa_zeros(D_model)
+
+    // W_score: lightweight scorer — one weight per dimension
+    let mut W_score = nsa_zeros(D_model)
+    for j in 0..D_model {
+        let u = nsa_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_score[j] = (u[0] - 0.5) * scale
+    }
+
+    // W_out: output projection
+    let mut W_out = nsa_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = nsa_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_out[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    let b_out = nsa_zeros(D_model)
+
+    return #{
+        "D_model": D_model,
+        "block_size": block_size,
+        "n_global": n_global,
+        "window_size": window_size,
+        "top_k": top_k,
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_k": W_k,
+        "b_k": b_k,
+        "W_v": W_v,
+        "b_v": b_v,
+        "W_score": W_score,
+        "W_out": W_out,
+        "b_out": b_out
+    }
+}
+
+// ===================================================================
+//  Linear projection: out[i] = sum_j W[i][j]*x[j] + b[i]
+// ===================================================================
+@pure
+fn nsa_linear(W, b, x) {
+    let rows = len(W)
+    let cols = len(x)
+    let mut out = nsa_zeros(rows)
+    for i in 0..rows {
+        let mut s = b[i]
+        for j in 0..cols {
+            s = s + W[i][j] * x[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ===================================================================
+//  Project entire sequence: Q, K, V
+//  X is [seq_len][D_model], returns [seq_len][D_model]
+// ===================================================================
+@pure
+fn nsa_project_seq(W, b, X) {
+    let N = len(X)
+    let mut out = []
+    for i in 0..N {
+        out = out + [nsa_linear(W, b, X[i])]
+    }
+    return out
+}
+
+// ===================================================================
+//  nsa_block_score — score each key block against a query block
+//
+//  q_block: [block_size][D_model]  (query block)
+//  k_blocks: list of [block_size][D_model]  (all key blocks)
+//  Uses lightweight dot-product scorer with W_score
+//
+//  For each key block b:
+//    score_b = sum over q in q_block of (sum_d W_score[d] * q[d] * mean_k_b[d])
+// ===================================================================
+@pure
+fn nsa_block_score(model, q_block, k_blocks) {
+    let W_score = model["W_score"]
+    let D = model["D_model"]
+    let n_blocks = len(k_blocks)
+    let B = len(q_block)
+
+    let mut scores = nsa_zeros(n_blocks)
+    let inv_B = 1.0 / to_float(B)
+
+    for bi in 0..n_blocks {
+        let kb = k_blocks[bi]
+        let kb_len = len(kb)
+        // compute mean of key block
+        let mut k_mean = nsa_zeros(D)
+        for t in 0..kb_len {
+            for d in 0..D {
+                k_mean[d] = k_mean[d] + kb[t][d]
+            }
+        }
+        let inv_kb = 1.0 / to_float(kb_len)
+        for d in 0..D {
+            k_mean[d] = k_mean[d] * inv_kb
+        }
+        // score = sum_q sum_d W_score[d] * q[d] * k_mean[d]
+        let mut sc = 0.0
+        for qi in 0..B {
+            for d in 0..D {
+                sc = sc + W_score[d] * q_block[qi][d] * k_mean[d]
+            }
+        }
+        scores[bi] = sc * inv_B
+    }
+    return scores
+}
+
+// ===================================================================
+//  nsa_select_blocks — top-K block indices from scores
+//
+//  Returns list of top_k indices (sorted by score descending).
+//  Uses repeated argmax with masking.
+// ===================================================================
+@pure
+fn nsa_select_blocks(scores, top_k) {
+    let n = len(scores)
+    let k = nsa_min_int(top_k, n)
+    let mut selected = []
+    let mut used = nsa_zeros_int(n)
+
+    for _sel in 0..k {
+        let mut best_idx = -1
+        let mut best_val = -1.0e30
+        for i in 0..n {
+            if used[i] == 0 {
+                if scores[i] > best_val {
+                    best_val = scores[i]
+                    best_idx = i
+                }
+            }
+        }
+        if best_idx >= 0 {
+            selected = selected + [best_idx]
+            used[best_idx] = 1
+        }
+    }
+    return selected
+}
+
+// ===================================================================
+//  Softmax over a vector
+// ===================================================================
+@pure
+fn nsa_softmax(v) {
+    let n = len(v)
+    let mut mx = v[0]
+    for i in 1..n {
+        if v[i] > mx { mx = v[i] }
+    }
+    let mut out = nsa_zeros(n)
+    let mut sum = 0.0
+    for i in 0..n {
+        let e = nsa_exp(v[i] - mx)
+        out[i] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / sum }
+    return out
+}
+
+// ===================================================================
+//  Dot product of two vectors
+// ===================================================================
+@pure
+fn nsa_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ===================================================================
+//  Single-query attention over a set of K,V vectors
+//  q: [D], keys: [[D]], vals: [[D]]
+//  Returns weighted sum: [D]
+// ===================================================================
+@pure
+fn nsa_attention_qkv(q, keys, vals, scale) {
+    let n_kv = len(keys)
+    let D = len(q)
+    if n_kv == 0 { return nsa_zeros(D) }
+
+    // compute scores
+    let mut scores = nsa_zeros(n_kv)
+    for i in 0..n_kv {
+        scores[i] = nsa_dot(q, keys[i]) * scale
+    }
+    let weights = nsa_softmax(scores)
+
+    // weighted sum
+    let mut out = nsa_zeros(D)
+    for i in 0..n_kv {
+        for d in 0..D {
+            out[d] = out[d] + weights[i] * vals[i][d]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  nsa_local_attention — sliding window attention
+//
+//  For each query position t, attend to K[max(0,t-w)..min(N,t+w+1)]
+//  Q, K, V: [seq_len][D_model]
+//  window: half-window size
+//  Returns: [seq_len][D_model]
+// ===================================================================
+@pure
+fn nsa_local_attention(model, Q, K, V, window) {
+    let N = len(Q)
+    let D = model["D_model"]
+    let scale = 1.0 / nsa_sqrt(to_float(D))
+    let mut out = []
+
+    for t in 0..N {
+        let lo = nsa_max_int(0, t - window)
+        let hi = nsa_min_int(N, t + window + 1)
+        let mut local_k = []
+        let mut local_v = []
+        for j in lo..hi {
+            local_k = local_k + [K[j]]
+            local_v = local_v + [V[j]]
+        }
+        out = out + [nsa_attention_qkv(Q[t], local_k, local_v, scale)]
+    }
+    return out
+}
+
+// ===================================================================
+//  nsa_global_attention — attend to first n_global tokens
+//
+//  Q: [seq_len][D_model]
+//  K_global, V_global: [n_global][D_model]  (first n_global of K, V)
+//  Returns: [seq_len][D_model]
+// ===================================================================
+@pure
+fn nsa_global_attention(model, Q, K_global, V_global) {
+    let N = len(Q)
+    let D = model["D_model"]
+    let scale = 1.0 / nsa_sqrt(to_float(D))
+    let mut out = []
+
+    for t in 0..N {
+        out = out + [nsa_attention_qkv(Q[t], K_global, V_global, scale)]
+    }
+    return out
+}
+
+// ===================================================================
+//  nsa_sparse_attention — combined block-sparse + local + global
+//
+//  1. Decompose K,V into blocks of size B
+//  2. For each query block: score all key blocks, select top_k
+//  3. Compute block-sparse attention on selected blocks
+//  4. Add local window attention
+//  5. Add global token attention
+//  6. Average the three branches
+//
+//  Q, K, V: [seq_len][D_model]
+//  Returns: [seq_len][D_model]
+// ===================================================================
+@pure
+fn nsa_sparse_attention(model, Q, K, V) {
+    let N = len(Q)
+    let D = model["D_model"]
+    let B = model["block_size"]
+    let n_global = model["n_global"]
+    let window = model["window_size"]
+    let top_k = model["top_k"]
+    let scale = 1.0 / nsa_sqrt(to_float(D))
+
+    // ── decompose K, V into blocks ─────────────────────────────
+    let n_blocks = N / B
+    let mut k_blocks = []
+    let mut v_blocks = []
+    for bi in 0..n_blocks {
+        let start = bi * B
+        let mut kb = []
+        let mut vb = []
+        for t in 0..B {
+            kb = kb + [K[start + t]]
+            vb = vb + [V[start + t]]
+        }
+        k_blocks = k_blocks + [kb]
+        v_blocks = v_blocks + [vb]
+    }
+    // handle remainder as last partial block
+    let rem = N - n_blocks * B
+    if rem > 0 {
+        let start = n_blocks * B
+        let mut kb = []
+        let mut vb = []
+        for t in 0..rem {
+            kb = kb + [K[start + t]]
+            vb = vb + [V[start + t]]
+        }
+        k_blocks = k_blocks + [kb]
+        v_blocks = v_blocks + [vb]
+    }
+    let total_blocks = len(k_blocks)
+
+    // ── global K, V ────────────────────────────────────────────
+    let g = nsa_min_int(n_global, N)
+    let mut K_global = []
+    let mut V_global = []
+    for t in 0..g {
+        K_global = K_global + [K[t]]
+        V_global = V_global + [V[t]]
+    }
+
+    // ── local attention branch ─────────────────────────────────
+    let local_out = nsa_local_attention(model, Q, K, V, window)
+
+    // ── global attention branch ────────────────────────────────
+    let global_out = nsa_global_attention(model, Q, K_global, V_global)
+
+    // ── block-sparse attention branch ──────────────────────────
+    let mut sparse_out = []
+    let n_q_blocks = N / B
+    for qi in 0..n_q_blocks {
+        let q_start = qi * B
+        let mut q_block = []
+        for t in 0..B {
+            q_block = q_block + [Q[q_start + t]]
+        }
+
+        // score and select top-K key blocks
+        let scores = nsa_block_score(model, q_block, k_blocks)
+        let sel_idx = nsa_select_blocks(scores, top_k)
+        let n_sel = len(sel_idx)
+
+        // gather selected K, V into flat lists
+        let mut sel_k = []
+        let mut sel_v = []
+        for si in 0..n_sel {
+            let bi = sel_idx[si]
+            let kb = k_blocks[bi]
+            let vb = v_blocks[bi]
+            let blen = len(kb)
+            for t in 0..blen {
+                sel_k = sel_k + [kb[t]]
+                sel_v = sel_v + [vb[t]]
+            }
+        }
+
+        // each query in this block attends to selected K,V
+        for t in 0..B {
+            if len(sel_k) > 0 {
+                sparse_out = sparse_out + [nsa_attention_qkv(Q[q_start + t], sel_k, sel_v, scale)]
+            } else {
+                sparse_out = sparse_out + [nsa_zeros(D)]
+            }
+        }
+    }
+    // handle remainder queries (not in a full block)
+    let rem_start = n_q_blocks * B
+    for t in rem_start..N {
+        sparse_out = sparse_out + [nsa_zeros(D)]
+    }
+
+    // ── combine: average of local + global + sparse ────────────
+    let mut combined = nsa_zeros_2d(N, D)
+    let inv3 = 1.0 / 3.0
+    for t in 0..N {
+        for d in 0..D {
+            combined[t][d] = (local_out[t][d] + global_out[t][d] + sparse_out[t][d]) * inv3
+        }
+    }
+    return combined
+}
+
+// ===================================================================
+//  nsa_forward — full forward pass
+//
+//  X: [seq_len][D_model]
+//  1. Project Q, K, V
+//  2. Sparse attention
+//  3. Output projection
+//  Returns: [seq_len][D_model]
+// ===================================================================
+@pure
+fn nsa_forward(model, X) {
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+    let W_k = model["W_k"]
+    let b_k = model["b_k"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+
+    // project
+    let Q = nsa_project_seq(W_q, b_q, X)
+    let K = nsa_project_seq(W_k, b_k, X)
+    let V = nsa_project_seq(W_v, b_v, X)
+
+    // sparse attention
+    let attn_out = nsa_sparse_attention(model, Q, K, V)
+
+    // output projection
+    let N = len(X)
+    let mut out = []
+    for t in 0..N {
+        out = out + [nsa_linear(W_out, b_out, attn_out[t])]
+    }
+    return out
+}
+
+// ===================================================================
+//  MSE loss: (1/N/D) * sum (pred - target)^2
+// ===================================================================
+@pure
+fn nsa_mse_loss(pred, target) {
+    let N = len(pred)
+    let D = len(pred[0])
+    let mut total = 0.0
+    for t in 0..N {
+        for d in 0..D {
+            let diff = pred[t][d] - target[t][d]
+            total = total + diff * diff
+        }
+    }
+    return total / to_float(N) / to_float(D)
+}
+
+// ===================================================================
+//  nsa_train_step — one SGD step with analytical gradients
+//
+//  X: [seq_len][D_model]  input
+//  Y: [seq_len][D_model]  target
+//  lr: learning rate
+//
+//  Forward:
+//    attn_out = sparse_attention(project(X))       [N x D]
+//    out[t]   = W_out * attn_out[t] + b_out        [N x D]
+//    loss     = (1/N/D) * sum (out - Y)^2
+//
+//  Analytical gradients through output projection layer:
+//    dL/dout[t][i]     = 2*(out[t][i] - Y[t][i]) / (N*D)
+//    dL/dW_out[i][j]   = sum_t dL/dout[t][i] * attn_out[t][j]
+//    dL/db_out[i]      = sum_t dL/dout[t][i]
+//
+//  Backprop into attention hidden layer (for W_q, W_k, W_v):
+//    d_attn[t][j]      = sum_i dL/dout[t][i] * W_out[i][j]
+//  Then numerical gradient for W_q/W_k/W_v/W_score with clipping.
+//
+//  Returns updated model.
+// ===================================================================
+@hot
+fn nsa_train_step(model, X, Y, lr) {
+    let D = model["D_model"]
+    let N = len(X)
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+    let W_k = model["W_k"]
+    let b_k = model["b_k"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let W_score = model["W_score"]
+
+    // ── forward pass (cache intermediates) ─────────────────────
+    let Q = nsa_project_seq(W_q, b_q, X)
+    let K = nsa_project_seq(W_k, b_k, X)
+    let V = nsa_project_seq(W_v, b_v, X)
+    let attn_out = nsa_sparse_attention(model, Q, K, V)
+
+    // out[t] = W_out * attn_out[t] + b_out
+    let mut out = []
+    for t in 0..N {
+        out = out + [nsa_linear(W_out, b_out, attn_out[t])]
+    }
+
+    // ── dL/dout: gradient of MSE loss w.r.t. output ────────────
+    let inv_ND = 2.0 / to_float(N) / to_float(D)
+    let mut d_out = nsa_zeros_2d(N, D)
+    for t in 0..N {
+        for d in 0..D {
+            d_out[t][d] = (out[t][d] - Y[t][d]) * inv_ND
+        }
+    }
+
+    // ── analytical grad W_out, b_out ───────────────────────────
+    let mut gW_out = nsa_zeros_2d(D, D)
+    let mut gb_out = nsa_zeros(D)
+    for t in 0..N {
+        for i in 0..D {
+            gb_out[i] = gb_out[i] + d_out[t][i]
+            for j in 0..D {
+                gW_out[i][j] = gW_out[i][j] + d_out[t][i] * attn_out[t][j]
+            }
+        }
+    }
+
+    // ── backprop into attn_out: d_attn[t][j] = sum_i d_out[t][i] * W_out[i][j]
+    let mut d_attn = nsa_zeros_2d(N, D)
+    for t in 0..N {
+        for j in 0..D {
+            let mut s = 0.0
+            for i in 0..D {
+                s = s + d_out[t][i] * W_out[i][j]
+            }
+            d_attn[t][j] = s
+        }
+    }
+
+    // ── numerical gradients for projection weights ─────────────
+    // Use finite-difference on the "attention hidden → attn_out" path
+    // We perturb W_v (most direct impact on V → attn_out)
+    let eps = 0.001
+    let clip = 1.0
+    let mut W_v_new = nsa_zeros_2d(D, D)
+    for i in 0..D {
+        for j in 0..D {
+            W_v_new[i][j] = W_v[i][j]
+        }
+    }
+    for i in 0..D {
+        for j in 0..D {
+            let orig = W_v_new[i][j]
+            W_v_new[i][j] = orig + eps
+            let V_p = nsa_project_seq(W_v_new, b_v, X)
+            let attn_p = nsa_sparse_attention(model, Q, K, V_p)
+            // compute directional derivative via chain rule: sum d_attn * (attn_p - attn_out)/eps
+            let mut grad = 0.0
+            for t in 0..N {
+                for d in 0..D {
+                    grad = grad + d_attn[t][d] * (attn_p[t][d] - attn_out[t][d]) / eps
+                }
+            }
+            // clip gradient
+            if grad > clip { grad = clip }
+            if grad < 0.0 - clip { grad = 0.0 - clip }
+            W_v_new[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── apply output layer updates ─────────────────────────────
+    let mut W_out_new = nsa_zeros_2d(D, D)
+    let mut b_out_new = nsa_zeros(D)
+    for i in 0..D {
+        let mut gb = gb_out[i]
+        if gb > clip { gb = clip }
+        if gb < 0.0 - clip { gb = 0.0 - clip }
+        b_out_new[i] = b_out[i] - lr * gb
+        for j in 0..D {
+            let mut gw = gW_out[i][j]
+            if gw > clip { gw = clip }
+            if gw < 0.0 - clip { gw = 0.0 - clip }
+            W_out_new[i][j] = W_out[i][j] - lr * gw
+        }
+    }
+
+    return #{
+        "D_model": D,
+        "block_size": model["block_size"],
+        "n_global": model["n_global"],
+        "window_size": model["window_size"],
+        "top_k": model["top_k"],
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_k": W_k,
+        "b_k": b_k,
+        "W_v": W_v_new,
+        "b_v": b_v,
+        "W_score": W_score,
+        "W_out": W_out_new,
+        "b_out": b_out_new
+    }
+}

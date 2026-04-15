@@ -1,0 +1,588 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/inference_compiler.hexa — Inference Compiler (#320)
+//
+//  Graph-level optimization pass that fuses operations, eliminates
+//  redundant computation, and reorders for data locality.
+//  Like torch.compile but for HEXA ML graphs.
+//
+//  Graph IR:
+//    nodes = ops (matmul, bias_add, relu, sigmoid, constant, input, ...)
+//    edges = data flow (from_id -> to_id)
+//
+//  Optimization passes:
+//    1. Fusion:           MatMul + BiasAdd + ReLU -> FusedLinearReLU
+//    2. Dead code elim:   remove nodes with no consumers + not output
+//    3. Constant folding: precompute ops on static data
+//    4. Combined:         all passes in optimal order
+//
+//  API (ic_ prefix):
+//    ic_create_graph()                          -> graph
+//    ic_add_node(graph, op, inputs, params)     -> [graph, node_id]
+//    ic_add_edge(graph, from_id, to_id)         -> graph
+//    ic_fuse_linear_relu(graph)                 -> graph  (fusion)
+//    ic_eliminate_dead(graph)                    -> graph  (DCE)
+//    ic_fold_constants(graph)                   -> graph  (const fold)
+//    ic_optimize(graph)                         -> graph  (all passes)
+//    ic_execute(graph, inputs)                  -> outputs
+//    ic_node_count(graph)                       -> int
+//    ic_estimate_flops(graph)                   -> int
+//
+//  AI-NATIVE attrs:
+//    @pure  (analysis / read-only passes)
+//    @hot   (execution)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Op type constants ────────────────────────────────────────────
+@pure fn IC_OP_INPUT()    { return "input" }
+@pure fn IC_OP_CONSTANT() { return "constant" }
+@pure fn IC_OP_MATMUL()   { return "matmul" }
+@pure fn IC_OP_BIAS_ADD() { return "bias_add" }
+@pure fn IC_OP_RELU()     { return "relu" }
+@pure fn IC_OP_SIGMOID()  { return "sigmoid" }
+@pure fn IC_OP_ADD()      { return "add" }
+@pure fn IC_OP_MUL()      { return "mul" }
+@pure fn IC_OP_FUSED_LINEAR_RELU() { return "fused_linear_relu" }
+@pure fn IC_OP_OUTPUT()   { return "output" }
+
+// ── Math helpers ─────────────────────────────────────────────────
+fn ic_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ic_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Graph creation
+//
+//  graph = #{
+//    "nodes":     [#{id, op, inputs, params, alive}],
+//    "edges":     [[from_id, to_id]],
+//    "next_id":   int,
+//    "outputs":   [node_id]          // nodes marked as graph outputs
+//  }
+// ═══════════════════════════════════════════════════════════════════
+fn ic_create_graph() {
+    return #{
+        "nodes": [],
+        "edges": [],
+        "next_id": 0,
+        "outputs": []
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Add node to graph
+//    op:      one of IC_OP_* strings
+//    inputs:  [node_id] — upstream dependencies
+//    params:  #{} — op-specific parameters (weights, values, dims, ...)
+//  Returns [graph, node_id]
+// ═══════════════════════════════════════════════════════════════════
+fn ic_add_node(graph, op, inputs, params) {
+    let nid = graph["next_id"]
+    let node = #{
+        "id": nid,
+        "op": op,
+        "inputs": inputs,
+        "params": params,
+        "alive": true
+    }
+    let mut nodes = graph["nodes"]
+    nodes = nodes + [node]
+    let mut new_graph = #{
+        "nodes": nodes,
+        "edges": graph["edges"],
+        "next_id": nid + 1,
+        "outputs": graph["outputs"]
+    }
+    return [new_graph, nid]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Add explicit data-flow edge
+// ═══════════════════════════════════════════════════════════════════
+fn ic_add_edge(graph, from_id, to_id) {
+    let mut edges = graph["edges"]
+    edges = edges + [[from_id, to_id]]
+    return #{
+        "nodes": graph["nodes"],
+        "edges": edges,
+        "next_id": graph["next_id"],
+        "outputs": graph["outputs"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mark a node as graph output
+// ═══════════════════════════════════════════════════════════════════
+fn ic_mark_output(graph, node_id) {
+    let mut outs = graph["outputs"]
+    outs = outs + [node_id]
+    return #{
+        "nodes": graph["nodes"],
+        "edges": graph["edges"],
+        "next_id": graph["next_id"],
+        "outputs": outs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Node count (alive nodes only)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_node_count(graph) {
+    let nodes = graph["nodes"]
+    let n = len(nodes)
+    let mut count = 0
+    for i in 0..n {
+        if nodes[i]["alive"] { count = count + 1 }
+    }
+    return count
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Find node by id
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_find_node(graph, nid) {
+    let nodes = graph["nodes"]
+    let n = len(nodes)
+    for i in 0..n {
+        if nodes[i]["id"] == nid { return nodes[i] }
+    }
+    return #{"id": -1, "op": "none", "inputs": [], "params": #{}, "alive": false}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Check if a node is consumed by any alive node
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_has_consumers(graph, nid) {
+    let nodes = graph["nodes"]
+    let n = len(nodes)
+    for i in 0..n {
+        let node = nodes[i]
+        if node["alive"] {
+            let inp = node["inputs"]
+            let ni = len(inp)
+            for j in 0..ni {
+                if inp[j] == nid { return true }
+            }
+        }
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Check if node id is in the outputs list
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_is_output(graph, nid) {
+    let outs = graph["outputs"]
+    let n = len(outs)
+    for i in 0..n {
+        if outs[i] == nid { return true }
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Fusion pass: MatMul + BiasAdd + ReLU -> FusedLinearReLU
+//
+//  Pattern match:
+//    relu_node.op == "relu"
+//    relu_node.inputs[0] -> bias_node
+//    bias_node.op == "bias_add"
+//    bias_node.inputs[0] -> matmul_node
+//    matmul_node.op == "matmul"
+//
+//  Fused node inherits matmul's inputs + bias params.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_fuse_linear_relu(graph) {
+    let mut nodes = graph["nodes"]
+    let n = len(nodes)
+    let mut changed = true
+    while changed {
+        changed = false
+        let nn = len(nodes)
+        for i in 0..nn {
+            let relu_n = nodes[i]
+            if relu_n["alive"] && relu_n["op"] == "relu" {
+                let relu_inputs = relu_n["inputs"]
+                if len(relu_inputs) > 0 {
+                    let bias_id = relu_inputs[0]
+                    let bias_n = ic_find_node(#{"nodes": nodes, "edges": graph["edges"], "next_id": graph["next_id"], "outputs": graph["outputs"]}, bias_id)
+                    if bias_n["alive"] && bias_n["op"] == "bias_add" {
+                        let bias_inputs = bias_n["inputs"]
+                        if len(bias_inputs) > 0 {
+                            let mm_id = bias_inputs[0]
+                            let mm_n = ic_find_node(#{"nodes": nodes, "edges": graph["edges"], "next_id": graph["next_id"], "outputs": graph["outputs"]}, mm_id)
+                            if mm_n["alive"] && mm_n["op"] == "matmul" {
+                                // Fuse: replace relu node with fused_linear_relu
+                                // Combine params from matmul and bias
+                                let fused_params = #{
+                                    "weight": mm_n["params"],
+                                    "bias": bias_n["params"]
+                                }
+                                let fused_node = #{
+                                    "id": relu_n["id"],
+                                    "op": "fused_linear_relu",
+                                    "inputs": mm_n["inputs"],
+                                    "params": fused_params,
+                                    "alive": true
+                                }
+                                // Kill matmul and bias nodes
+                                let dead_mm = #{
+                                    "id": mm_n["id"],
+                                    "op": mm_n["op"],
+                                    "inputs": mm_n["inputs"],
+                                    "params": mm_n["params"],
+                                    "alive": false
+                                }
+                                let dead_bias = #{
+                                    "id": bias_n["id"],
+                                    "op": bias_n["op"],
+                                    "inputs": bias_n["inputs"],
+                                    "params": bias_n["params"],
+                                    "alive": false
+                                }
+                                // Update nodes array
+                                let mut updated = []
+                                let un = len(nodes)
+                                for k in 0..un {
+                                    if nodes[k]["id"] == relu_n["id"] {
+                                        updated = updated + [fused_node]
+                                    } else if nodes[k]["id"] == mm_n["id"] {
+                                        updated = updated + [dead_mm]
+                                    } else if nodes[k]["id"] == bias_n["id"] {
+                                        updated = updated + [dead_bias]
+                                    } else {
+                                        updated = updated + [nodes[k]]
+                                    }
+                                }
+                                nodes = updated
+                                changed = true
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return #{
+        "nodes": nodes,
+        "edges": graph["edges"],
+        "next_id": graph["next_id"],
+        "outputs": graph["outputs"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dead Code Elimination (DCE)
+//
+//  Remove alive nodes that:
+//    - are not in outputs list
+//    - are not consumed by any alive node
+//  Iterate until fixpoint.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_eliminate_dead(graph) {
+    let mut nodes = graph["nodes"]
+    let mut changed = true
+    while changed {
+        changed = false
+        let tmp_graph = #{"nodes": nodes, "edges": graph["edges"], "next_id": graph["next_id"], "outputs": graph["outputs"]}
+        let nn = len(nodes)
+        let mut updated = []
+        for i in 0..nn {
+            let node = nodes[i]
+            if node["alive"] {
+                let nid = node["id"]
+                let is_out = ic_is_output(tmp_graph, nid)
+                let has_cons = ic_has_consumers(tmp_graph, nid)
+                if is_out || has_cons {
+                    updated = updated + [node]
+                } else {
+                    // Kill this node
+                    let dead = #{
+                        "id": node["id"],
+                        "op": node["op"],
+                        "inputs": node["inputs"],
+                        "params": node["params"],
+                        "alive": false
+                    }
+                    updated = updated + [dead]
+                    changed = true
+                }
+            } else {
+                updated = updated + [node]
+            }
+        }
+        nodes = updated
+    }
+    return #{
+        "nodes": nodes,
+        "edges": graph["edges"],
+        "next_id": graph["next_id"],
+        "outputs": graph["outputs"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Constant Folding
+//
+//  If an op's inputs are all constants, precompute and replace
+//  with a constant node.
+//
+//  Supported ops for folding: add, mul
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_all_inputs_constant(graph, node) {
+    let inputs = node["inputs"]
+    let ni = len(inputs)
+    if ni == 0 { return false }
+    for i in 0..ni {
+        let dep = ic_find_node(graph, inputs[i])
+        if dep["op"] != "constant" || dep["alive"] == false { return false }
+    }
+    return true
+}
+
+@pure
+fn ic_fold_constants(graph) {
+    let mut nodes = graph["nodes"]
+    let mut changed = true
+    while changed {
+        changed = false
+        let tmp_graph = #{"nodes": nodes, "edges": graph["edges"], "next_id": graph["next_id"], "outputs": graph["outputs"]}
+        let nn = len(nodes)
+        let mut updated = []
+        for i in 0..nn {
+            let node = nodes[i]
+            if node["alive"] && node["op"] != "constant" && node["op"] != "input" && node["op"] != "output" {
+                if ic_all_inputs_constant(tmp_graph, node) {
+                    let op = node["op"]
+                    let inputs = node["inputs"]
+                    // Evaluate the constant operation
+                    if op == "add" && len(inputs) == 2 {
+                        let a_node = ic_find_node(tmp_graph, inputs[0])
+                        let b_node = ic_find_node(tmp_graph, inputs[1])
+                        let a_val = a_node["params"]["value"]
+                        let b_val = b_node["params"]["value"]
+                        let folded = #{
+                            "id": node["id"],
+                            "op": "constant",
+                            "inputs": [],
+                            "params": #{"value": a_val + b_val},
+                            "alive": true
+                        }
+                        updated = updated + [folded]
+                        changed = true
+                    } else if op == "mul" && len(inputs) == 2 {
+                        let a_node = ic_find_node(tmp_graph, inputs[0])
+                        let b_node = ic_find_node(tmp_graph, inputs[1])
+                        let a_val = a_node["params"]["value"]
+                        let b_val = b_node["params"]["value"]
+                        let folded = #{
+                            "id": node["id"],
+                            "op": "constant",
+                            "inputs": [],
+                            "params": #{"value": a_val * b_val},
+                            "alive": true
+                        }
+                        updated = updated + [folded]
+                        changed = true
+                    } else if op == "relu" && len(inputs) == 1 {
+                        let a_node = ic_find_node(tmp_graph, inputs[0])
+                        let a_val = a_node["params"]["value"]
+                        let mut result = a_val
+                        if result < 0.0 { result = 0.0 }
+                        let folded = #{
+                            "id": node["id"],
+                            "op": "constant",
+                            "inputs": [],
+                            "params": #{"value": result},
+                            "alive": true
+                        }
+                        updated = updated + [folded]
+                        changed = true
+                    } else {
+                        updated = updated + [node]
+                    }
+                } else {
+                    updated = updated + [node]
+                }
+            } else {
+                updated = updated + [node]
+            }
+        }
+        nodes = updated
+    }
+    return #{
+        "nodes": nodes,
+        "edges": graph["edges"],
+        "next_id": graph["next_id"],
+        "outputs": graph["outputs"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Combined optimization pass
+//    1. Constant folding  (simplify statics first)
+//    2. Fusion            (merge patterns)
+//    3. Dead code elim    (clean up remnants)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_optimize(graph) {
+    let g1 = ic_fold_constants(graph)
+    let g2 = ic_fuse_linear_relu(g1)
+    let g3 = ic_eliminate_dead(g2)
+    return g3
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Execute graph
+//
+//  Topological evaluation: walk nodes in id order (insertion order).
+//  Each node reads from a value map keyed by node_id.
+//
+//  inputs: #{"node_id": value, ...} — values for input nodes
+//  Returns: #{"node_id": value, ...} — values for output nodes
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ic_execute(graph, inputs) {
+    let nodes = graph["nodes"]
+    let n = len(nodes)
+    // Build value map: node_id -> computed value
+    let mut vals = #{}
+    // Seed input values
+    let input_keys = keys(inputs)
+    let nk = len(input_keys)
+    for i in 0..nk {
+        let k = input_keys[i]
+        vals[k] = inputs[k]
+    }
+    // Evaluate in insertion order
+    for i in 0..n {
+        let node = nodes[i]
+        if node["alive"] == false { continue }
+        let nid = node["id"]
+        let op = node["op"]
+        let node_inputs = node["inputs"]
+        let params = node["params"]
+        if op == "input" {
+            // Already seeded from inputs map
+            if has_key(vals, str(nid)) {
+                vals[str(nid)] = vals[str(nid)]
+            }
+        } else if op == "constant" {
+            vals[str(nid)] = params["value"]
+        } else if op == "add" {
+            let a = vals[str(node_inputs[0])]
+            let b = vals[str(node_inputs[1])]
+            vals[str(nid)] = a + b
+        } else if op == "mul" {
+            let a = vals[str(node_inputs[0])]
+            let b = vals[str(node_inputs[1])]
+            vals[str(nid)] = a * b
+        } else if op == "relu" {
+            let a = vals[str(node_inputs[0])]
+            if a < 0.0 {
+                vals[str(nid)] = 0.0
+            } else {
+                vals[str(nid)] = a
+            }
+        } else if op == "sigmoid" {
+            let a = vals[str(node_inputs[0])]
+            let mut clipped = a
+            if clipped > 20.0 { clipped = 20.0 }
+            if clipped < -20.0 { clipped = -20.0 }
+            let mut e_term = 1.0
+            let mut t = 1.0
+            let neg_a = 0.0 - clipped
+            for k in 1..30 {
+                t = t * neg_a / to_float(k)
+                e_term = e_term + t
+            }
+            if e_term < 0.0 { e_term = 1.0e-12 }
+            vals[str(nid)] = 1.0 / (1.0 + e_term)
+        } else if op == "matmul" {
+            // Simple: scalar multiply (for single-value graph execution)
+            let a = vals[str(node_inputs[0])]
+            let w = params["weight"]
+            vals[str(nid)] = a * w
+        } else if op == "bias_add" {
+            let a = vals[str(node_inputs[0])]
+            let b = params["bias"]
+            vals[str(nid)] = a + b
+        } else if op == "fused_linear_relu" {
+            // FusedLinearReLU: matmul + bias + relu in one step
+            let a = vals[str(node_inputs[0])]
+            let w = params["weight"]["weight"]
+            let b = params["bias"]["bias"]
+            let mut result = a * w + b
+            if result < 0.0 { result = 0.0 }
+            vals[str(nid)] = result
+        } else if op == "output" {
+            if len(node_inputs) > 0 {
+                vals[str(nid)] = vals[str(node_inputs[0])]
+            }
+        }
+    }
+    // Collect output values
+    let outs = graph["outputs"]
+    let no = len(outs)
+    let mut result = #{}
+    for i in 0..no {
+        let oid = outs[i]
+        result[str(oid)] = vals[str(oid)]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FLOP estimation
+//
+//  Approximate cost per op:
+//    matmul:             params.rows * params.cols * 2  (or default 2)
+//    fused_linear_relu:  same as matmul + 1 (bias + relu free)
+//    add / mul / relu / sigmoid / bias_add:  1 each
+//    constant / input / output:  0
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ic_estimate_flops(graph) {
+    let nodes = graph["nodes"]
+    let n = len(nodes)
+    let mut total = 0
+    for i in 0..n {
+        let node = nodes[i]
+        if node["alive"] == false { continue }
+        let op = node["op"]
+        if op == "matmul" {
+            let p = node["params"]
+            if has_key(p, "rows") && has_key(p, "cols") {
+                total = total + p["rows"] * p["cols"] * 2
+            } else {
+                total = total + 2
+            }
+        } else if op == "fused_linear_relu" {
+            let p = node["params"]
+            let wp = p["weight"]
+            if has_key(wp, "rows") && has_key(wp, "cols") {
+                total = total + wp["rows"] * wp["cols"] * 2 + 1
+            } else {
+                total = total + 3
+            }
+        } else if op == "add" || op == "mul" || op == "relu" || op == "sigmoid" || op == "bias_add" {
+            total = total + 1
+        }
+        // constant, input, output = 0 flops
+    }
+    return total
+}
+
+println("[inference_compiler] loaded — graph IR + fusion + DCE + constant folding")

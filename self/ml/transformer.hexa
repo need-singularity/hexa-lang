@@ -37,13 +37,7 @@ struct LlamaModel {
 //  Array helper: create mutable zero-filled array
 // ===================================================================
 fn zeros(n) {
-    let mut arr = []
-    let mut i = 0
-    while i < n {
-        arr = arr + [0.0]
-        i = i + 1
-    }
-    return arr
+    return tensor_zeros(n)
 }
 
 // ===================================================================
@@ -99,7 +93,7 @@ fn load_f32_vec(model, name, numel) {
     let raw = read_file_bytes(model.path, abs_offset, numel * 4)
     // Decode f32 LE bytes to Tensor using pure byte math
     // Each f32 = 4 bytes LE
-    let mut out = []
+    let mut out = tensor_zeros(numel)
     let mut i = 0
     while i < numel {
         let off = i * 4
@@ -119,7 +113,7 @@ fn load_f32_vec(model, name, numel) {
                 if sign == 1 { v = 0.0 - v }
             }
         }
-        out = out + [v]
+        out[i] = v
         i = i + 1
     }
     return out
@@ -141,10 +135,10 @@ fn llama_rms_norm(x, w, dim, eps) {
     }
     let rms = sqrt(ss / to_float(dim) + eps)
     let inv_rms = 1.0 / rms
-    let mut out = []
+    let mut out = tensor_zeros(dim)
     i = 0
     while i < dim {
-        out = out + [x[i] * inv_rms * w[i]]
+        out[i] = x[i] * inv_rms * w[i]
         i = i + 1
     }
     return out
@@ -158,7 +152,7 @@ fn llama_rms_norm(x, w, dim, eps) {
 @hot
 fn apply_rope_vec(vec, pos, head_dim, base) {
     let half = head_dim / 2
-    let mut out = []
+    let mut out = tensor_zeros(head_dim)
     let mut p = 0
     while p < half {
         let freq = 1.0 / pow(base, 2.0 * to_float(p) / to_float(head_dim))
@@ -167,8 +161,8 @@ fn apply_rope_vec(vec, pos, head_dim, base) {
         let sin_a = sin(angle)
         let x0 = vec[2 * p]
         let x1 = vec[2 * p + 1]
-        out = out + [x0 * cos_a - x1 * sin_a]
-        out = out + [x0 * sin_a + x1 * cos_a]
+        out[2 * p] = x0 * cos_a - x1 * sin_a
+        out[2 * p + 1] = x0 * sin_a + x1 * cos_a
         p = p + 1
     }
     return out
@@ -185,23 +179,22 @@ fn vec_softmax(scores, n) {
         if scores[i] > mx { mx = scores[i] }
         i = i + 1
     }
-    let mut out = []
+    let mut out = tensor_zeros(n)
     let mut sum_e = 0.0
     i = 0
     while i < n {
         let e = exp(scores[i] - mx)
-        out = out + [e]
+        out[i] = e
         sum_e = sum_e + e
         i = i + 1
     }
     let inv = 1.0 / sum_e
-    let mut result = []
     i = 0
     while i < n {
-        result = result + [out[i] * inv]
+        out[i] = out[i] * inv
         i = i + 1
     }
-    return result
+    return out
 }
 
 // ===================================================================
@@ -216,10 +209,10 @@ fn silu_scalar(x) {
 //  Convert Tensor to mutable array (for accumulation)
 // ===================================================================
 fn tensor_to_array(t, n) {
-    let mut arr = []
+    let mut arr = tensor_zeros(n)
     let mut i = 0
     while i < n {
-        arr = arr + [t[i]]
+        arr[i] = t[i]
         i = i + 1
     }
     return arr
@@ -267,34 +260,42 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
     let v_vec = q4_0_matvec(wv_bytes, xn, kv_dim, dim)
 
     // -- Apply RoPE to Q (per head) --
-    let mut q_rope = []
+    let mut q_rope = tensor_zeros(n_heads * head_dim)
     let mut h = 0
     while h < n_heads {
         let base_q = h * head_dim
-        let mut q_head = []
+        let mut q_head = tensor_zeros(head_dim)
         let mut d = 0
         while d < head_dim {
-            q_head = q_head + [q_full[base_q + d]]
+            q_head[d] = q_full[base_q + d]
             d = d + 1
         }
         let q_rot = apply_rope_vec(q_head, pos, head_dim, rope_base)
-        q_rope = q_rope + q_rot
+        d = 0
+        while d < head_dim {
+            q_rope[base_q + d] = q_rot[d]
+            d = d + 1
+        }
         h = h + 1
     }
 
     // -- Apply RoPE to K (per kv_head) --
-    let mut k_rope = []
+    let mut k_rope = tensor_zeros(n_kv_heads * head_dim)
     h = 0
     while h < n_kv_heads {
         let base_k = h * head_dim
-        let mut k_head = []
+        let mut k_head = tensor_zeros(head_dim)
         let mut d = 0
         while d < head_dim {
-            k_head = k_head + [k_vec[base_k + d]]
+            k_head[d] = k_vec[base_k + d]
             d = d + 1
         }
         let k_rot = apply_rope_vec(k_head, pos, head_dim, rope_base)
-        k_rope = k_rope + k_rot
+        d = 0
+        while d < head_dim {
+            k_rope[base_k + d] = k_rot[d]
+            d = d + 1
+        }
         h = h + 1
     }
 
@@ -312,15 +313,16 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
     // -- Grouped Query Attention --
     let scale = 1.0 / sqrt(to_float(head_dim))
     let ctx_len = pos + 1
-    let mut attn_out = []
+    let mut attn_out = tensor_zeros(n_heads * head_dim)
 
     h = 0
     while h < n_heads {
         let kv_h = h / gqa_ratio
         let q_base = h * head_dim
+        let out_base = h * head_dim
 
         // Compute scores: Q[h] . K[kv_h, t] for t in 0..ctx_len
-        let mut scores = []
+        let mut scores = tensor_zeros(ctx_len)
         let mut t = 0
         while t < ctx_len {
             let k_base = t * slab + kv_h * head_dim
@@ -330,7 +332,7 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
                 dot = dot + q_rope[q_base + d] * kv_k[k_base + d]
                 d = d + 1
             }
-            scores = scores + [dot * scale]
+            scores[t] = dot * scale
             t = t + 1
         }
 
@@ -347,7 +349,7 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
                 acc = acc + attn_weights[t] * kv_v[v_base + d]
                 t = t + 1
             }
-            attn_out = attn_out + [acc]
+            attn_out[out_base + d] = acc
             d = d + 1
         }
         h = h + 1
@@ -358,10 +360,10 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
     let attn_proj = q4_0_matvec(wo_bytes, attn_out, dim, dim)
 
     // -- Residual connection --
-    let mut x2 = []
+    let mut x2 = tensor_zeros(dim)
     i = 0
     while i < dim {
-        x2 = x2 + [x[i] + attn_proj[i]]
+        x2[i] = x[i] + attn_proj[i]
         i = i + 1
     }
 
@@ -377,10 +379,10 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
     let up = q4_0_matvec(wu_bytes, xn2, hidden_dim, dim)
 
     // SwiGLU: silu(gate) * up
-    let mut ffn_hidden = []
+    let mut ffn_hidden = tensor_zeros(hidden_dim)
     i = 0
     while i < hidden_dim {
-        ffn_hidden = ffn_hidden + [silu_scalar(gate[i]) * up[i]]
+        ffn_hidden[i] = silu_scalar(gate[i]) * up[i]
         i = i + 1
     }
 
@@ -389,10 +391,10 @@ fn transformer_layer(model, layer_idx, x, pos, kv_k, kv_v) {
     let ffn_out = q4_0_matvec(wd_bytes, ffn_hidden, dim, hidden_dim)
 
     // -- Residual connection --
-    let mut out = []
+    let mut out = tensor_zeros(dim)
     i = 0
     while i < dim {
-        out = out + [x2[i] + ffn_out[i]]
+        out[i] = x2[i] + ffn_out[i]
         i = i + 1
     }
 
@@ -453,7 +455,7 @@ fn load_embedding(model, token_id) {
         // F32: each row = dim * 4 bytes
         let row_offset = abs_offset + token_id * dim * 4
         let raw = read_file_bytes(model.path, row_offset, dim * 4)
-        let mut out = []
+        let mut out = tensor_zeros(dim)
         let mut i = 0
         while i < dim {
             let off = i * 4
@@ -473,7 +475,7 @@ fn load_embedding(model, token_id) {
                     if sign == 1 { v = 0.0 - v }
                 }
             }
-            out = out + [v]
+            out[i] = v
             i = i + 1
         }
         return out

@@ -1,0 +1,774 @@
+// =====================================================================
+//  test_loop_fusion.hexa -- ROI #55 Loop Fusion pass verification
+//
+//  Verifies that adjacent for-loops with identical iteration ranges
+//  are fused into a single loop, eliminating redundant memory traversals.
+//
+//  Tests (22):
+//    1-9.   anp_expr_equal structural equality
+//   10-15.  anp_detect_fusion (fusible / reject cases)
+//   16-17.  anp_apply_fusion (merge + substitution)
+//   18-22.  anp_fusion_body (multi-loop chains, intervening, nested)
+//   23-30.  anp_fusion_pass (full AST walk)
+//
+//  Run: ./hexa self/test_loop_fusion.hexa
+// =====================================================================
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_eq(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " -- expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+// ── Inline copy of fusion pass (self-contained test) ────────
+
+let mut m979_fusion_candidates = 0
+let mut m979_fusion_applied = 0
+
+fn t_make_ident(name) {
+    return #{
+        "kind": "Ident", "name": name, "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn anp_expr_equal(a, b) {
+    if type_of(a) == "string" && type_of(b) == "string" { return a == b }
+    if type_of(a) == "string" { return false }
+    if type_of(b) == "string" { return false }
+    if a.kind != b.kind { return false }
+    if a.kind == "Ident" { return a.name == b.name }
+    if a.kind == "IntLit" { return a.value == b.value }
+    if a.kind == "FloatLit" { return a.value == b.value }
+    if a.kind == "StringLit" { return a.value == b.value }
+    if a.kind == "BoolLit" { return a.value == b.value }
+    if a.kind == "BinOp" {
+        if a.op != b.op { return false }
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    if a.kind == "UnaryOp" {
+        if a.op != b.op { return false }
+        return anp_expr_equal(a.left, b.left)
+    }
+    if a.kind == "Index" {
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    if a.kind == "Range" {
+        if a.value != b.value { return false }
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        return anp_expr_equal(a.right, b.right)
+    }
+    if a.kind == "FieldAccess" {
+        if a.name != b.name { return false }
+        return anp_expr_equal(a.left, b.left)
+    }
+    if a.kind == "Call" {
+        if anp_expr_equal(a.left, b.left) == false { return false }
+        if type_of(a.args) != type_of(b.args) { return false }
+        if type_of(a.args) == "array" {
+            if len(a.args) != len(b.args) { return false }
+            let mut ci = 0
+            while ci < len(a.args) {
+                if anp_expr_equal(a.args[ci], b.args[ci]) == false { return false }
+                ci = ci + 1
+            }
+            return true
+        }
+        return true
+    }
+    return false
+}
+
+fn anp_body_writes_name(body, name) {
+    if type_of(body) != "array" { return false }
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            if type_of(stmt.left) == "string" {
+                if stmt.name == name { return true }
+            }
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Ident" && stmt.left.name == name { return true }
+            }
+        }
+        if stmt.kind == "LetMutStmt" {
+            if stmt.name == name { return true }
+        }
+        if stmt.kind == "LetStmt" {
+            if stmt.name == name { return true }
+        }
+        if stmt.kind == "WhileStmt" {
+            if anp_body_writes_name(stmt.body, name) { return true }
+        }
+        if stmt.kind == "ForStmt" {
+            if anp_body_writes_name(stmt.body, name) { return true }
+        }
+        if stmt.kind == "IfStmt" {
+            if type_of(stmt.then_body) == "array" {
+                if anp_body_writes_name(stmt.then_body, name) { return true }
+            }
+            if type_of(stmt.else_body) == "array" {
+                if anp_body_writes_name(stmt.else_body, name) { return true }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn anp_collect_scalar_writes(body) {
+    if type_of(body) != "array" { return [] }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if stmt.kind == "AssignStmt" {
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Ident" {
+                    out = out.push(stmt.left.name)
+                }
+            }
+            if stmt.name != "" {
+                if type_of(stmt.left) == "string" {
+                    out = out.push(stmt.name)
+                }
+                if type_of(stmt.left) != "string" {
+                    if stmt.left.kind != "Index" {
+                        out = out.push(stmt.name)
+                    }
+                }
+            }
+        }
+        if stmt.kind == "LetMutStmt" {
+            out = out.push(stmt.name)
+        }
+        if stmt.kind == "LetStmt" {
+            out = out.push(stmt.name)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_detect_fusion(loop1, loop2) {
+    if loop1.kind != "ForStmt" { return false }
+    if loop2.kind != "ForStmt" { return false }
+    if type_of(loop1.body) != "array" { return false }
+    if type_of(loop2.body) != "array" { return false }
+    if type_of(loop1.iter_expr) == "string" { return false }
+    if type_of(loop2.iter_expr) == "string" { return false }
+    if loop1.iter_expr.kind != "Range" { return false }
+    if loop2.iter_expr.kind != "Range" { return false }
+    if anp_expr_equal(loop1.iter_expr, loop2.iter_expr) == false { return false }
+    if anp_body_writes_name(loop2.body, loop1.name) { return false }
+    if anp_body_writes_name(loop1.body, loop2.name) { return false }
+    let writes1 = anp_collect_scalar_writes(loop1.body)
+    let writes2 = anp_collect_scalar_writes(loop2.body)
+    let mut wi = 0
+    while wi < len(writes1) {
+        let w1 = writes1[wi]
+        let mut wj = 0
+        while wj < len(writes2) {
+            if writes2[wj] == w1 {
+                if w1 != loop1.name && w1 != loop2.name {
+                    return false
+                }
+            }
+            wj = wj + 1
+        }
+        wi = wi + 1
+    }
+    return true
+}
+
+fn anp_subst_ident_expr(expr, old_name, new_name) {
+    if type_of(expr) == "string" { return expr }
+    if expr.kind == "Ident" {
+        if expr.name == old_name {
+            return t_make_ident(new_name)
+        }
+        return expr
+    }
+    if expr.kind == "BinOp" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let nr = anp_subst_ident_expr(expr.right, old_name, new_name)
+        return #{
+            "kind": "BinOp", "name": "", "value": "", "op": expr.op,
+            "left": nl, "right": nr, "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if expr.kind == "UnaryOp" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        return #{
+            "kind": "UnaryOp", "name": "", "value": "", "op": expr.op,
+            "left": nl, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if expr.kind == "Index" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let nr = anp_subst_ident_expr(expr.right, old_name, new_name)
+        return #{
+            "kind": "Index", "name": "", "value": "", "op": "",
+            "left": nl, "right": nr, "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if expr.kind == "Call" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                new_args = new_args.push(anp_subst_ident_expr(expr.args[ai], old_name, new_name))
+                ai = ai + 1
+            }
+        }
+        return #{
+            "kind": "Call", "name": "", "value": "", "op": "",
+            "left": nl, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": new_args, "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if expr.kind == "FieldAccess" {
+        let nl = anp_subst_ident_expr(expr.left, old_name, new_name)
+        return #{
+            "kind": "FieldAccess", "name": expr.name, "value": "", "op": "",
+            "left": nl, "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    return expr
+}
+
+fn anp_subst_ident(stmt, old_name, new_name) {
+    if type_of(stmt) == "string" { return stmt }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        return #{
+            "kind": "AssignStmt", "name": stmt.name, "value": stmt.value, "op": stmt.op,
+            "left": anp_subst_ident_expr(stmt.left, old_name, new_name),
+            "right": anp_subst_ident_expr(stmt.right, old_name, new_name),
+            "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        return #{
+            "kind": k, "name": stmt.name, "value": stmt.value, "op": "",
+            "left": anp_subst_ident_expr(stmt.left, old_name, new_name),
+            "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "ExprStmt" {
+        return #{
+            "kind": "ExprStmt", "name": "", "value": "", "op": "",
+            "left": anp_subst_ident_expr(stmt.left, old_name, new_name),
+            "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "ReturnStmt" {
+        return #{
+            "kind": "ReturnStmt", "name": "", "value": "", "op": "",
+            "left": anp_subst_ident_expr(stmt.left, old_name, new_name),
+            "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "ForStmt" {
+        let new_body = anp_subst_ident_body(stmt.body, old_name, new_name)
+        let new_iter = anp_subst_ident_expr(stmt.iter_expr, old_name, new_name)
+        return #{
+            "kind": "ForStmt", "name": stmt.name, "value": "", "op": "",
+            "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": new_body, "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": new_iter, "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "WhileStmt" {
+        let new_body = anp_subst_ident_body(stmt.body, old_name, new_name)
+        let new_cond = anp_subst_ident_expr(stmt.cond, old_name, new_name)
+        return #{
+            "kind": "WhileStmt", "name": "", "value": "", "op": "",
+            "left": "", "right": "", "cond": new_cond, "then_body": "", "else_body": "",
+            "params": "", "body": new_body, "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    if k == "IfStmt" {
+        let new_cond = anp_subst_ident_expr(stmt.cond, old_name, new_name)
+        let new_then = anp_subst_ident_body(stmt.then_body, old_name, new_name)
+        let new_else = anp_subst_ident_body(stmt.else_body, old_name, new_name)
+        return #{
+            "kind": "IfStmt", "name": "", "value": "", "op": "",
+            "left": "", "right": "", "cond": new_cond, "then_body": new_then, "else_body": new_else,
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    return stmt
+}
+
+fn anp_subst_ident_body(body, old_name, new_name) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        out = out.push(anp_subst_ident(body[i], old_name, new_name))
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_apply_fusion(loop1, loop2) {
+    let mut merged_body = []
+    let mut i = 0
+    while i < len(loop1.body) {
+        merged_body = merged_body.push(loop1.body[i])
+        i = i + 1
+    }
+    let need_subst = loop1.name != loop2.name
+    let mut j = 0
+    while j < len(loop2.body) {
+        if need_subst {
+            merged_body = merged_body.push(anp_subst_ident(loop2.body[j], loop2.name, loop1.name))
+        } else {
+            merged_body = merged_body.push(loop2.body[j])
+        }
+        j = j + 1
+    }
+    return #{
+        "kind": "ForStmt", "name": loop1.name, "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": merged_body, "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": loop1.iter_expr, "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn anp_fusion_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    if n < 2 { return body }
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i + 1 < n {
+            let cur = body[i]
+            let nxt = body[i + 1]
+            if cur.kind == "ForStmt" && nxt.kind == "ForStmt" {
+                if anp_detect_fusion(cur, nxt) {
+                    m979_fusion_candidates = m979_fusion_candidates + 1
+                    let fused = anp_apply_fusion(cur, nxt)
+                    m979_fusion_applied = m979_fusion_applied + 1
+                    out = out.push(fused)
+                    i = i + 2
+                } else {
+                    out = out.push(cur)
+                    i = i + 1
+                }
+            } else {
+                out = out.push(cur)
+                i = i + 1
+            }
+        } else {
+            out = out.push(body[i])
+            i = i + 1
+        }
+    }
+    if len(out) < n {
+        return anp_fusion_body(out)
+    }
+    return out
+}
+
+fn t_rewrite_fn_with_body(fn_node, new_body) {
+    return #{
+        "kind": "FnDecl", "name": fn_node.name, "value": fn_node.value, "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": fn_node.params, "body": new_body, "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": fn_node.ret_type,
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn anp_fusion_pass(ast) {
+    m979_fusion_candidates = 0
+    m979_fusion_applied = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            let before = m979_fusion_applied
+            let new_body = anp_fusion_body(node.body)
+            if m979_fusion_applied > before {
+                out = out.push(t_rewrite_fn_with_body(node, new_body))
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m979_fusion_applied > 0 {
+        println("[ai-native] loop-fusion: " + to_string(m979_fusion_candidates) + " candidate(s), " + to_string(m979_fusion_applied) + " fused")
+    }
+    return out
+}
+
+// ── AST node helpers ────────────────────────────────────────
+
+fn mk_ident(name) {
+    return #{
+        "kind": "Ident", "name": name, "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_int(val) {
+    return #{
+        "kind": "IntLit", "name": "", "value": to_string(val), "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_range(lo, hi) {
+    return #{
+        "kind": "Range", "name": "", "value": "exclusive", "op": "",
+        "left": lo, "right": hi, "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_range_incl(lo, hi) {
+    return #{
+        "kind": "Range", "name": "", "value": "inclusive", "op": "",
+        "left": lo, "right": hi, "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_binop(op, l, r) {
+    return #{
+        "kind": "BinOp", "name": "", "value": "", "op": op,
+        "left": l, "right": r, "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_index(arr, idx) {
+    return #{
+        "kind": "Index", "name": "", "value": "", "op": "",
+        "left": arr, "right": idx, "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_assign(lhs, rhs) {
+    return #{
+        "kind": "AssignStmt", "name": "", "value": "", "op": "=",
+        "left": lhs, "right": rhs, "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_let_mut(name, init) {
+    return #{
+        "kind": "LetMutStmt", "name": name, "value": "", "op": "",
+        "left": init, "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_for(var_name, iter_expr, body) {
+    return #{
+        "kind": "ForStmt", "name": var_name, "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": body, "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": iter_expr, "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_fn(name, body) {
+    return #{
+        "kind": "FnDecl", "name": name, "value": "", "op": "",
+        "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": [], "body": body, "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+fn mk_return(expr) {
+    return #{
+        "kind": "ReturnStmt", "name": "", "value": "", "op": "",
+        "left": expr, "right": "", "cond": "", "then_body": "", "else_body": "",
+        "params": "", "body": "", "args": "", "fields": "", "items": "",
+        "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+        "target": "", "trait_name": "", "methods": ""
+    }
+}
+
+// ── TESTS ───────────────────────────────────────────────────
+
+println("=====================================================")
+println("  Loop Fusion (ROI #55) Tests")
+println("=====================================================")
+println("")
+
+// ── anp_expr_equal tests ────────────────────────────────────
+
+println("--- anp_expr_equal ---")
+
+check("expr_equal: same ident", anp_expr_equal(mk_ident("x"), mk_ident("x")))
+check("expr_equal: diff ident", anp_expr_equal(mk_ident("x"), mk_ident("y")) == false)
+check("expr_equal: same int", anp_expr_equal(mk_int(10), mk_int(10)))
+check("expr_equal: diff int", anp_expr_equal(mk_int(10), mk_int(20)) == false)
+check("expr_equal: same binop", anp_expr_equal(mk_binop("+", mk_ident("n"), mk_int(1)), mk_binop("+", mk_ident("n"), mk_int(1))))
+check("expr_equal: diff binop op", anp_expr_equal(mk_binop("+", mk_ident("n"), mk_int(1)), mk_binop("-", mk_ident("n"), mk_int(1))) == false)
+check("expr_equal: same range", anp_expr_equal(mk_range(mk_int(0), mk_ident("n")), mk_range(mk_int(0), mk_ident("n"))))
+check("expr_equal: diff range end", anp_expr_equal(mk_range(mk_int(0), mk_ident("n")), mk_range(mk_int(0), mk_ident("m"))) == false)
+check("expr_equal: excl vs incl", anp_expr_equal(mk_range(mk_int(0), mk_int(10)), mk_range_incl(mk_int(0), mk_int(10))) == false)
+
+println("")
+println("--- anp_detect_fusion ---")
+
+fn make_arr_assign(arr, idx, rhs_arr, rhs_idx, op_val) {
+    return mk_assign(mk_index(mk_ident(arr), mk_ident(idx)), mk_binop(op_val, mk_index(mk_ident(rhs_arr), mk_ident(rhs_idx)), mk_int(1)))
+}
+
+let range_0_n = mk_range(mk_int(0), mk_ident("n"))
+let loop1_body = [make_arr_assign("a", "i", "b", "i", "+")]
+let loop2_body = [make_arr_assign("c", "i", "a", "i", "*")]
+let lp1 = mk_for("i", range_0_n, loop1_body)
+let lp2 = mk_for("i", range_0_n, loop2_body)
+check("detect_fusion: basic fusible", anp_detect_fusion(lp1, lp2))
+
+let range_0_m = mk_range(mk_int(0), mk_ident("m"))
+let lp3 = mk_for("i", range_0_m, loop2_body)
+check("detect_fusion: diff range rejects", anp_detect_fusion(lp1, lp3) == false)
+
+let range_0_n_incl = mk_range_incl(mk_int(0), mk_ident("n"))
+let lp4 = mk_for("i", range_0_n_incl, loop2_body)
+check("detect_fusion: excl vs incl rejects", anp_detect_fusion(lp1, lp4) == false)
+
+let waw_body1 = [mk_assign(mk_ident("sum"), mk_binop("+", mk_ident("sum"), mk_ident("i")))]
+let waw_body2 = [mk_assign(mk_ident("sum"), mk_binop("*", mk_ident("sum"), mk_int(2)))]
+let lp_waw1 = mk_for("i", range_0_n, waw_body1)
+let lp_waw2 = mk_for("i", range_0_n, waw_body2)
+check("detect_fusion: scalar WAW rejects", anp_detect_fusion(lp_waw1, lp_waw2) == false)
+
+let iter_write_body = [mk_assign(mk_ident("i"), mk_int(0))]
+let lp_iter_write = mk_for("j", range_0_n, iter_write_body)
+check("detect_fusion: iter var write rejects", anp_detect_fusion(lp1, lp_iter_write) == false)
+
+let loop2_body_j = [make_arr_assign("c", "j", "a", "j", "*")]
+let lp_j = mk_for("j", range_0_n, loop2_body_j)
+check("detect_fusion: diff iter var fusible", anp_detect_fusion(lp1, lp_j))
+
+println("")
+println("--- anp_apply_fusion ---")
+
+let fused = anp_apply_fusion(lp1, lp2)
+check("apply_fusion: kind is ForStmt", fused.kind == "ForStmt")
+check("apply_fusion: body len is 2", len(fused.body) == 2)
+check("apply_fusion: iter var is i", fused.name == "i")
+
+let fused_subst = anp_apply_fusion(lp1, lp_j)
+check_eq("apply_fusion: subst body len", len(fused_subst.body), 2)
+let stmt2 = fused_subst.body[1]
+check("apply_fusion: subst iter var in body", stmt2.left.right.kind == "Ident" && stmt2.left.right.name == "i")
+
+println("")
+println("--- anp_fusion_body ---")
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let body_2loops = [lp1, lp2]
+let fused_body = anp_fusion_body(body_2loops)
+check_eq("fusion_body: 2->1 loop", len(fused_body), 1)
+check("fusion_body: result is ForStmt", fused_body[0].kind == "ForStmt")
+check_eq("fusion_body: merged body len", len(fused_body[0].body), 2)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let loop3_body = [make_arr_assign("d", "i", "c", "i", "+")]
+let lp3c = mk_for("i", range_0_n, loop3_body)
+let body_3loops = [lp1, lp2, lp3c]
+let fused_body3 = anp_fusion_body(body_3loops)
+check_eq("fusion_body: 3->1 loop", len(fused_body3), 1)
+check_eq("fusion_body: 3-chain body len", len(fused_body3[0].body), 3)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let intervening = mk_let_mut("tmp", mk_int(0))
+let body_interv = [lp1, intervening, lp2]
+let fused_interv = anp_fusion_body(body_interv)
+check_eq("fusion_body: intervening stmt blocks", len(fused_interv), 3)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let body_single = [lp1]
+let fused_single = anp_fusion_body(body_single)
+check_eq("fusion_body: single loop unchanged", len(fused_single), 1)
+
+println("")
+println("--- anp_fusion_pass (top-level) ---")
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let fn_node = mk_fn("process", [lp1, lp2])
+let ast = [fn_node]
+let result = anp_fusion_pass(ast)
+check_eq("fusion_pass: fn count", len(result), 1)
+check("fusion_pass: rewritten fn", result[0].kind == "FnDecl")
+check_eq("fusion_pass: fused body len", len(result[0].body), 1)
+check("fusion_pass: counter > 0", m979_fusion_applied > 0)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let other_node = mk_let_mut("global", mk_int(42))
+let ast2 = [other_node, fn_node]
+let result2 = anp_fusion_pass(ast2)
+check_eq("fusion_pass: preserves other nodes", len(result2), 2)
+check("fusion_pass: first node kept", result2[0].kind == "LetMutStmt")
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let loop4_body = [make_arr_assign("e", "i", "d", "i", "*")]
+let lp4c = mk_for("i", range_0_n, loop4_body)
+let fn_4chain = mk_fn("chain4", [lp1, lp2, lp3c, lp4c])
+let res4 = anp_fusion_pass([fn_4chain])
+check_eq("fusion_pass: 4-chain body count", len(res4[0].body), 1)
+check_eq("fusion_pass: 4-chain body len", len(res4[0].body[0].body), 4)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let fn_mixed = mk_fn("mixed", [lp1, lp2, intervening, lp3c])
+let res_mixed = anp_fusion_pass([fn_mixed])
+check_eq("fusion_pass: mixed result", len(res_mixed[0].body), 3)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let lp_empty1 = mk_for("i", range_0_n, [])
+let lp_empty2 = mk_for("i", range_0_n, [])
+let fn_empty = mk_fn("empty_pair", [lp_empty1, lp_empty2])
+let res_empty = anp_fusion_pass([fn_empty])
+check_eq("fusion_pass: empty bodies fuse", len(res_empty[0].body), 1)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let complex_range = mk_range(mk_binop("+", mk_ident("n"), mk_int(1)), mk_binop("*", mk_ident("n"), mk_int(2)))
+let lp_cx1 = mk_for("i", complex_range, loop1_body)
+let lp_cx2 = mk_for("i", complex_range, loop2_body)
+let fn_cx = mk_fn("complex_range", [lp_cx1, lp_cx2])
+let res_cx = anp_fusion_pass([fn_cx])
+check_eq("fusion_pass: complex range fuses", len(res_cx[0].body), 1)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let fn_noloop = mk_fn("noloop", [mk_return(mk_int(0))])
+let res_noloop = anp_fusion_pass([fn_noloop])
+check_eq("fusion_pass: no loops unchanged", len(res_noloop[0].body), 1)
+check_eq("fusion_pass: no fusion counter", m979_fusion_applied, 0)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let inner_loop = mk_for("j", mk_range(mk_int(0), mk_ident("m")), [make_arr_assign("x", "j", "y", "j", "+")])
+let outer1 = mk_for("i", range_0_n, [inner_loop])
+let outer2 = mk_for("i", range_0_n, [make_arr_assign("z", "i", "w", "i", "*")])
+let fn_nested = mk_fn("nested", [outer1, outer2])
+let res_nested = anp_fusion_pass([fn_nested])
+check_eq("fusion_pass: nested inner preserved", len(res_nested[0].body), 1)
+check_eq("fusion_pass: nested fused body", len(res_nested[0].body[0].body), 2)
+
+m979_fusion_candidates = 0
+m979_fusion_applied = 0
+let incl_range = mk_range_incl(mk_int(1), mk_ident("n"))
+let lp_incl1 = mk_for("i", incl_range, loop1_body)
+let lp_incl2 = mk_for("i", incl_range, loop2_body)
+let fn_incl = mk_fn("inclusive_fuse", [lp_incl1, lp_incl2])
+let res_incl = anp_fusion_pass([fn_incl])
+check_eq("fusion_pass: inclusive range fuses", len(res_incl[0].body), 1)
+
+println("")
+println("=====================================================")
+println("  Loop Fusion: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+println("=====================================================")
+if fail_count > 0 {
+    println("FAIL")
+} else {
+    println("ALL PASS")
+}

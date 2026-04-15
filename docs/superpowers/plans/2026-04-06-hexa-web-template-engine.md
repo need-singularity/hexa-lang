@@ -80,13 +80,13 @@ pub struct TemplateAttr {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo check 2>&1 | head -20`
+Run: `cd $HEXA_LANG/ready && cargo check 2>&1 | head -20`
 Expected: 컴파일 성공 (TemplateNode은 아직 사용되지 않으므로 dead_code 경고만)
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/ast.rs
 git commit -m "feat(web): add TemplateNode and TemplateAttr AST types"
 ```
@@ -118,13 +118,13 @@ git commit -m "feat(web): add TemplateNode and TemplateAttr AST types"
 
 - [ ] **Step 3: Verify it compiles**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo check 2>&1 | head -20`
+Run: `cd $HEXA_LANG/ready && cargo check 2>&1 | head -20`
 Expected: 컴파일 성공
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/token.rs src/lexer.rs
 git commit -m "feat(web): add Template keyword token and lexer mapping"
 ```
@@ -264,13 +264,13 @@ Token::Template => {
 
 - [ ] **Step 3: Verify it compiles**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo check 2>&1 | head -30`
+Run: `cd $HEXA_LANG/ready && cargo check 2>&1 | head -30`
 Expected: 컴파일 성공 (일부 메서드 미사용 경고는 OK)
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/parser.rs
 git commit -m "feat(web): parse template { } blocks into TemplateNode AST"
 ```
@@ -496,13 +496,13 @@ pub mod std_web_template;
 
 - [ ] **Step 3: Verify it compiles and tests pass**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo test std_web_template 2>&1 | tail -10`
+Run: `cd $HEXA_LANG/ready && cargo test std_web_template 2>&1 | tail -10`
 Expected: 2 tests passed
 
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/std_web_template.rs src/lib.rs
 git commit -m "feat(web): implement template renderer with HTML escape and control flow"
 ```
@@ -527,13 +527,13 @@ Expr::Template(nodes) => {
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo check 2>&1 | head -20`
+Run: `cd $HEXA_LANG/ready && cargo check 2>&1 | head -20`
 Expected: 컴파일 성공
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/interpreter.rs
 git commit -m "feat(web): wire Template expr evaluation to std_web_template renderer"
 ```
@@ -569,13 +569,13 @@ git commit -m "feat(web): wire Template expr evaluation to std_web_template rend
 
 - [ ] **Step 2: Verify it compiles**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo check 2>&1 | head -20`
+Run: `cd $HEXA_LANG/ready && cargo check 2>&1 | head -20`
 Expected: 컴파일 성공
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add src/std_net.rs
 git commit -m "feat(web): auto-detect text/html Content-Type in http_serve"
 ```
@@ -771,7 +771,7 @@ fn test_template_comptime() {
 
 - [ ] **Step 2: Run integration tests**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo test web_template 2>&1 | tail -20`
+Run: `cd $HEXA_LANG/ready && cargo test web_template 2>&1 | tail -20`
 Expected: All tests pass
 
 - [ ] **Step 3: Fix any failures, re-run**
@@ -784,7 +784,7 @@ If tests fail, fix the relevant source file and re-run. Common issues:
 - [ ] **Step 4: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add tests/web_template.rs
 git commit -m "test(web): add 12 integration tests for template engine"
 ```
@@ -846,14 +846,14 @@ http_serve("0.0.0.0:8080", fn(req) {
 
 - [ ] **Step 2: Verify it parses (dry run)**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo run -- --check examples/web_hello.hexa 2>&1 | head -10`
+Run: `cd $HEXA_LANG/ready && cargo run -- --check examples/web_hello.hexa 2>&1 | head -10`
 (또는 파서만 실행하는 방법이 있으면 그걸로)
 Expected: 파싱 성공 (서버 실행은 안 함)
 
 - [ ] **Step 3: Commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add examples/web_hello.hexa
 git commit -m "feat(web): add web_hello.hexa example — template + http_serve"
 ```
@@ -866,7 +866,7 @@ git commit -m "feat(web): add web_hello.hexa example — template + http_serve"
 
 - [ ] **Step 1: Run full test suite**
 
-Run: `cd /Users/ghost/Dev/hexa-lang/ready && cargo test 2>&1 | tail -20`
+Run: `cd $HEXA_LANG/ready && cargo test 2>&1 | tail -20`
 Expected: 기존 테스트 전부 통과 + 새 web_template 테스트 통과
 
 - [ ] **Step 2: Fix any regressions**
@@ -879,7 +879,7 @@ Expected: 기존 테스트 전부 통과 + 새 web_template 테스트 통과
 - [ ] **Step 3: Final commit**
 
 ```bash
-cd /Users/ghost/Dev/hexa-lang/ready
+cd $HEXA_LANG/ready
 git add -A
 git commit -m "feat(web): Hexa Template Engine — Phase 1 complete
 

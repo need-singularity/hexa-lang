@@ -1,0 +1,686 @@
+// ===================================================================
+//  self/ml/hyena_hierarchy.hexa — Hyena Hierarchy (#314)
+//
+//  Hyena (Poli et al., 2023) — sub-quadratic attention replacement
+//  using long convolutions + element-wise gating. Stacks N orders
+//  of (convolution, gating) to approximate attention.
+//
+//  Key math:
+//    x_1  = D_1 * v       (data-controlled gating, D diagonal)
+//    x_{k+1} = h_k * (D_k * x_k)   (h_k = long conv filter)
+//    y    = D_N * x_N
+//    Filters h_k parameterized implicitly via MLP on positions.
+//
+//  API (hy_ prefix):
+//    hy_init(D_model, seq_len, order, seed) -> model
+//    hy_conv1d(filter, x)                   -> output
+//    hy_gate(diag, x)                       -> output
+//    hy_implicit_filter(model, positions)    -> filter
+//    hy_forward(model, x)                   -> output
+//    hy_loss(model, X, Y)                   -> float
+//    hy_train_step(model, X, Y, lr)         -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  — forward/conv (no side effects)
+//    @hot   — training inner loop
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn hy_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn hy_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn hy_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn hy_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn hy_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + hy_exp(0.0 - x))
+}
+
+fn hy_sin(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    for _i in 0..20 {
+        if v > pi { v = v - 2.0 * pi }
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn hy_cos(x) {
+    let pi = 3.141592653589793
+    return hy_sin(x + pi / 2.0)
+}
+
+fn hy_tanh(x) {
+    let ep = hy_exp(x)
+    let en = hy_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+// ===================================================================
+//  Vector / matrix utilities
+// ===================================================================
+
+fn hy_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hy_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn hy_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn hy_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [hy_dot(mat[r], v)] }
+    return out
+}
+
+fn hy_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn hy_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn hy_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+// ===================================================================
+//  RNG
+// ===================================================================
+
+fn hy_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn hy_uniform(state) {
+    let s = hy_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ===================================================================
+//  hy_conv1d — direct 1D convolution (causal)
+//
+//  filter: [K]   convolution kernel
+//  x:      [L]   input signal
+//  output: [L]   convolved signal (causal, no future leakage)
+// ===================================================================
+@pure
+fn hy_conv1d(filter, x) {
+    let L = len(x)
+    let K = len(filter)
+    let mut out = []
+    for t in 0..L {
+        let mut acc = 0.0
+        for k in 0..K {
+            let idx = t - k
+            if idx >= 0 {
+                acc = acc + filter[k] * x[idx]
+            }
+        }
+        out = out + [acc]
+    }
+    return out
+}
+
+// ===================================================================
+//  hy_gate — element-wise gating
+//
+//  diag: [L]   diagonal values (data-controlled)
+//  x:    [L]   input vector
+//  output: diag[i] * x[i]  for each position
+// ===================================================================
+@pure
+fn hy_gate(diag, x) {
+    let n = len(x)
+    let mut out = []
+    for i in 0..n { out = out + [diag[i] * x[i]] }
+    return out
+}
+
+// ===================================================================
+//  hy_implicit_filter — MLP on positions -> filter weights
+//
+//  The implicit filter is parameterized by a small 2-layer MLP:
+//    h(t) = W2 * tanh(W1 * pos(t) + b1) + b2
+//  where pos(t) is a positional feature vector for time t.
+//
+//  positions: [N]  position indices (floats)
+//  Returns:   [order x N]  one filter per order
+// ===================================================================
+@pure
+fn hy_implicit_filter(model, positions) {
+    let N = len(positions)
+    let order = model["order"]
+    let mlp_W1 = model["mlp_W1"]
+    let mlp_b1 = model["mlp_b1"]
+    let mlp_W2 = model["mlp_W2"]
+    let mlp_b2 = model["mlp_b2"]
+    let mlp_hidden = model["mlp_hidden"]
+    let mut filters = []
+    for o in 0..order {
+        let mut filt = []
+        for i in 0..N {
+            // Encode position as sin/cos features
+            let p = positions[i]
+            let feat_sin = hy_sin(p * 0.01)
+            let feat_cos = hy_cos(p * 0.01)
+            let feat_raw = p / to_float(model["seq_len"])
+            // 3-dim positional feature -> MLP hidden
+            let mut h_vals = hy_zeros(mlp_hidden)
+            for j in 0..mlp_hidden {
+                let s = mlp_W1[o][j][0] * feat_raw + mlp_W1[o][j][1] * feat_sin + mlp_W1[o][j][2] * feat_cos + mlp_b1[o][j]
+                h_vals[j] = hy_tanh(s)
+            }
+            // hidden -> scalar filter value
+            let mut val = mlp_b2[o]
+            for j in 0..mlp_hidden {
+                val = val + mlp_W2[o][j] * h_vals[j]
+            }
+            filt = filt + [val]
+        }
+        filters = filters + [filt]
+    }
+    return filters
+}
+
+// ===================================================================
+//  hy_init — create Hyena Hierarchy model
+//
+//  D_model:  model dimension (channels)
+//  seq_len:  sequence length
+//  order:    number of (conv, gate) stages
+//  seed:     RNG seed
+//
+//  Model dict keys:
+//    D_model, seq_len, order
+//    W_v:      [D_model x D_model]   value projection
+//    W_d:      [order x D_model x D_model]  diagonal projections
+//    W_out:    [D_model x D_model]   output projection
+//    b_out:    [D_model]             output bias
+//    mlp_W1:   [order x mlp_hidden x 3]   filter MLP layer 1
+//    mlp_b1:   [order x mlp_hidden]        filter MLP bias 1
+//    mlp_W2:   [order x mlp_hidden]        filter MLP layer 2
+//    mlp_b2:   [order]                     filter MLP bias 2
+//    mlp_hidden: int                       MLP hidden size
+// ===================================================================
+fn hy_init(D_model, seq_len, order, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let scale = 1.0 / hy_sqrt(to_float(D_model))
+    let mlp_hidden = 8
+
+    // W_v: value projection [D_model x D_model]
+    let mut W_v = hy_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = hy_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+
+    // W_d: diagonal projections [order][D_model][D_model]
+    let mut W_d = []
+    for o in 0..order {
+        let mut mat = hy_zeros_2d(D_model, D_model)
+        for i in 0..D_model {
+            for j in 0..D_model {
+                let u = hy_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                mat[i][j] = (u[0] - 0.5) * 2.0 * scale
+            }
+        }
+        W_d = W_d + [mat]
+    }
+
+    // W_out: output projection [D_model x D_model]
+    let mut W_out = hy_zeros_2d(D_model, D_model)
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let u = hy_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_out[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+    let b_out = hy_zeros(D_model)
+
+    // MLP for implicit filter: [order x hidden x 3] weight, [order x hidden] bias
+    let mlp_scale = 1.0 / hy_sqrt(to_float(3))
+    let mut mlp_W1 = []
+    let mut mlp_b1 = []
+    let mut mlp_W2 = []
+    let mut mlp_b2 = []
+    for o in 0..order {
+        let mut w1 = hy_zeros_2d(mlp_hidden, 3)
+        let mut b1 = hy_zeros(mlp_hidden)
+        for j in 0..mlp_hidden {
+            for k in 0..3 {
+                let u = hy_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                w1[j][k] = (u[0] - 0.5) * 2.0 * mlp_scale
+            }
+            let u2 = hy_uniform(state)
+            state = int(u2[1])
+            if state <= 0 { state = 1 }
+            b1[j] = (u2[0] - 0.5) * 0.1
+        }
+        mlp_W1 = mlp_W1 + [w1]
+        mlp_b1 = mlp_b1 + [b1]
+        let mut w2 = hy_zeros(mlp_hidden)
+        for j in 0..mlp_hidden {
+            let u = hy_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            w2[j] = (u[0] - 0.5) * 2.0 / hy_sqrt(to_float(mlp_hidden))
+        }
+        mlp_W2 = mlp_W2 + [w2]
+        let u3 = hy_uniform(state)
+        state = int(u3[1])
+        if state <= 0 { state = 1 }
+        mlp_b2 = mlp_b2 + [(u3[0] - 0.5) * 0.1]
+    }
+
+    return #{
+        "D_model": D_model,
+        "seq_len": seq_len,
+        "order": order,
+        "W_v": W_v,
+        "W_d": W_d,
+        "W_out": W_out,
+        "b_out": b_out,
+        "mlp_W1": mlp_W1,
+        "mlp_b1": mlp_b1,
+        "mlp_W2": mlp_W2,
+        "mlp_b2": mlp_b2,
+        "mlp_hidden": mlp_hidden
+    }
+}
+
+// ===================================================================
+//  hy_forward — full Hyena Hierarchy operator
+//
+//  x: [seq_len x D_model]  input sequence (list of token vectors)
+//
+//  Algorithm:
+//    1. v = W_v * x[t]  for each t        (value projection)
+//    2. D_k[t] = sigmoid(W_d[k] * x[t])   (diagonal gating from input)
+//    3. Generate implicit filters h_k via MLP on positions
+//    4. x_1[t] = D_1[t] * v[t]            (first gating)
+//    5. For k = 1..order-1:
+//         x_{k+1} = h_k conv (D_{k+1} * x_k)
+//    6. y[t] = W_out * x_N[t] + b_out     (output projection)
+//
+//  Returns: [seq_len x D_model]
+// ===================================================================
+@pure
+fn hy_forward(model, x) {
+    let seq_len = len(x)
+    let D_model = model["D_model"]
+    let order = model["order"]
+    let W_v = model["W_v"]
+    let W_d = model["W_d"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+
+    // Step 1: value projection  v[t] = W_v * x[t]
+    let mut v = []
+    for t in 0..seq_len {
+        v = v + [hy_mat_vec(W_v, x[t])]
+    }
+
+    // Step 2: compute diagonal gating vectors D_k[t] = sigmoid(W_d[k] * x[t])
+    let mut D_all = []
+    for k in 0..order {
+        let mut D_k = []
+        for t in 0..seq_len {
+            let proj = hy_mat_vec(W_d[k], x[t])
+            let mut sig = hy_zeros(D_model)
+            for c in 0..D_model { sig[c] = hy_sigmoid(proj[c]) }
+            D_k = D_k + [sig]
+        }
+        D_all = D_all + [D_k]
+    }
+
+    // Step 3: generate implicit filters via MLP
+    let mut positions = []
+    for t in 0..seq_len { positions = positions + [to_float(t)] }
+    let filters = hy_implicit_filter(model, positions)
+
+    // Step 4: first gating  x_1[t] = D_1[t] * v[t]
+    let mut x_cur = []
+    for t in 0..seq_len {
+        x_cur = x_cur + [hy_gate(D_all[0][t], v[t])]
+    }
+
+    // Step 5: for k = 1..order-1:  x_{k+1} = h_k conv (D_{k+1} * x_k)
+    for k in 1..order {
+        // Apply gating D_{k+1} (index k)
+        let mut gated = []
+        for t in 0..seq_len {
+            gated = gated + [hy_gate(D_all[k][t], x_cur[t])]
+        }
+        // Apply convolution per channel using filter k-1
+        let filt_k = filters[k - 1]
+        let mut conv_out = []
+        for _t in 0..seq_len { conv_out = conv_out + [hy_zeros(D_model)] }
+        for c in 0..D_model {
+            // Extract channel c across time
+            let mut ch_in = []
+            for t in 0..seq_len { ch_in = ch_in + [gated[t][c]] }
+            let ch_out = hy_conv1d(filt_k, ch_in)
+            for t in 0..seq_len {
+                conv_out[t][c] = ch_out[t]
+            }
+        }
+        x_cur = conv_out
+    }
+
+    // If order == 1, also apply the filter to x_1
+    if order == 1 {
+        let filt_0 = filters[0]
+        let mut conv_out = []
+        for _t in 0..seq_len { conv_out = conv_out + [hy_zeros(D_model)] }
+        for c in 0..D_model {
+            let mut ch_in = []
+            for t in 0..seq_len { ch_in = ch_in + [x_cur[t][c]] }
+            let ch_out = hy_conv1d(filt_0, ch_in)
+            for t in 0..seq_len {
+                conv_out[t][c] = ch_out[t]
+            }
+        }
+        x_cur = conv_out
+    }
+
+    // Step 6: output projection  y[t] = W_out * x_N[t] + b_out
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = hy_mat_vec(W_out, x_cur[t])
+        output = output + [hy_vec_add(proj, b_out)]
+    }
+    return output
+}
+
+// ===================================================================
+//  hy_loss — MSE loss over sequence
+//
+//  model: Hyena Hierarchy model
+//  X:     [batch x seq_len x D_model]  input sequences
+//  Y:     [batch x seq_len x D_model]  target sequences
+//  Returns: average MSE
+// ===================================================================
+@pure
+fn hy_loss(model, X, Y) {
+    let B = len(X)
+    if B == 0 { return 0.0 }
+    let mut total = 0.0
+    for b in 0..B {
+        let pred = hy_forward(model, X[b])
+        let seq_len = len(pred)
+        let D_model = model["D_model"]
+        for t in 0..seq_len {
+            for c in 0..D_model {
+                let diff = pred[t][c] - Y[b][t][c]
+                total = total + diff * diff
+            }
+        }
+    }
+    let seq_len = len(X[0])
+    let D_model = model["D_model"]
+    return total / to_float(B * seq_len * D_model)
+}
+
+// ===================================================================
+//  hy_train_step — one gradient descent step (numerical gradients)
+//
+//  Uses finite difference for robustness in pure HEXA.
+//  Updates: W_v, W_d, W_out, b_out, mlp_W1, mlp_b1, mlp_W2, mlp_b2
+// ===================================================================
+fn hy_make_model(D_model, seq_len, order, mlp_hidden, W_v, W_d, W_out, b_out, mlp_W1, mlp_b1, mlp_W2, mlp_b2) {
+    return #{
+        "D_model": D_model,
+        "seq_len": seq_len,
+        "order": order,
+        "W_v": W_v,
+        "W_d": W_d,
+        "W_out": W_out,
+        "b_out": b_out,
+        "mlp_W1": mlp_W1,
+        "mlp_b1": mlp_b1,
+        "mlp_W2": mlp_W2,
+        "mlp_b2": mlp_b2,
+        "mlp_hidden": mlp_hidden
+    }
+}
+
+fn hy_train_step(model, X, Y, lr) {
+    let D_model = model["D_model"]
+    let seq_len = model["seq_len"]
+    let order = model["order"]
+    let mlp_hidden = model["mlp_hidden"]
+    let eps = 1.0e-4
+    let base_loss = hy_loss(model, X, Y)
+
+    // --- Update W_v ---
+    let mut W_v_new = hy_zeros_2d(D_model, D_model)
+    let mut W_v = model["W_v"]
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let orig = W_v[i][j]
+            W_v[i][j] = orig + eps
+            let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, W_v, model["W_d"], model["W_out"], model["b_out"], model["mlp_W1"], model["mlp_b1"], model["mlp_W2"], model["mlp_b2"])
+            let loss_p = hy_loss(m2, X, Y)
+            W_v[i][j] = orig
+            let grad = (loss_p - base_loss) / eps
+            W_v_new[i][j] = orig - lr * grad
+        }
+    }
+
+    // --- Update W_d ---
+    let mut W_d_new = []
+    let mut W_d = model["W_d"]
+    for o in 0..order {
+        let mut mat = hy_zeros_2d(D_model, D_model)
+        for i in 0..D_model {
+            for j in 0..D_model {
+                let orig = W_d[o][i][j]
+                W_d[o][i][j] = orig + eps
+                let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], W_d, model["W_out"], model["b_out"], model["mlp_W1"], model["mlp_b1"], model["mlp_W2"], model["mlp_b2"])
+                let loss_p = hy_loss(m2, X, Y)
+                W_d[o][i][j] = orig
+                let grad = (loss_p - base_loss) / eps
+                mat[i][j] = orig - lr * grad
+            }
+        }
+        W_d_new = W_d_new + [mat]
+    }
+
+    // --- Update W_out ---
+    let mut W_out_new = hy_zeros_2d(D_model, D_model)
+    let mut W_out = model["W_out"]
+    for i in 0..D_model {
+        for j in 0..D_model {
+            let orig = W_out[i][j]
+            W_out[i][j] = orig + eps
+            let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], W_out, model["b_out"], model["mlp_W1"], model["mlp_b1"], model["mlp_W2"], model["mlp_b2"])
+            let loss_p = hy_loss(m2, X, Y)
+            W_out[i][j] = orig
+            let grad = (loss_p - base_loss) / eps
+            W_out_new[i][j] = orig - lr * grad
+        }
+    }
+
+    // --- Update b_out ---
+    let mut b_out_new = hy_zeros(D_model)
+    let mut b_out = model["b_out"]
+    for i in 0..D_model {
+        let orig = b_out[i]
+        b_out[i] = orig + eps
+        let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], model["W_out"], b_out, model["mlp_W1"], model["mlp_b1"], model["mlp_W2"], model["mlp_b2"])
+        let loss_p = hy_loss(m2, X, Y)
+        b_out[i] = orig
+        let grad = (loss_p - base_loss) / eps
+        b_out_new[i] = orig - lr * grad
+    }
+
+    // --- Update MLP weights ---
+    let mut mlp_W1_new = []
+    let mut mlp_b1_new = []
+    let mut mlp_W2_new = []
+    let mut mlp_b2_new = []
+    let mut mlp_W1 = model["mlp_W1"]
+    let mut mlp_b1 = model["mlp_b1"]
+    let mut mlp_W2 = model["mlp_W2"]
+    let mut mlp_b2 = model["mlp_b2"]
+
+    for o in 0..order {
+        // mlp_W1[o]: [mlp_hidden x 3]
+        let mut w1 = hy_zeros_2d(mlp_hidden, 3)
+        for j in 0..mlp_hidden {
+            for k in 0..3 {
+                let orig = mlp_W1[o][j][k]
+                mlp_W1[o][j][k] = orig + eps
+                let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], model["W_out"], model["b_out"], mlp_W1, model["mlp_b1"], model["mlp_W2"], model["mlp_b2"])
+                let loss_p = hy_loss(m2, X, Y)
+                mlp_W1[o][j][k] = orig
+                let grad = (loss_p - base_loss) / eps
+                w1[j][k] = orig - lr * grad
+            }
+        }
+        mlp_W1_new = mlp_W1_new + [w1]
+
+        // mlp_b1[o]: [mlp_hidden]
+        let mut b1 = hy_zeros(mlp_hidden)
+        for j in 0..mlp_hidden {
+            let orig = mlp_b1[o][j]
+            mlp_b1[o][j] = orig + eps
+            let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], model["W_out"], model["b_out"], model["mlp_W1"], mlp_b1, model["mlp_W2"], model["mlp_b2"])
+            let loss_p = hy_loss(m2, X, Y)
+            mlp_b1[o][j] = orig
+            let grad = (loss_p - base_loss) / eps
+            b1[j] = orig - lr * grad
+        }
+        mlp_b1_new = mlp_b1_new + [b1]
+
+        // mlp_W2[o]: [mlp_hidden]
+        let mut w2 = hy_zeros(mlp_hidden)
+        for j in 0..mlp_hidden {
+            let orig = mlp_W2[o][j]
+            mlp_W2[o][j] = orig + eps
+            let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], model["W_out"], model["b_out"], model["mlp_W1"], model["mlp_b1"], mlp_W2, model["mlp_b2"])
+            let loss_p = hy_loss(m2, X, Y)
+            mlp_W2[o][j] = orig
+            let grad = (loss_p - base_loss) / eps
+            w2[j] = orig - lr * grad
+        }
+        mlp_W2_new = mlp_W2_new + [w2]
+
+        // mlp_b2[o]: scalar
+        let orig_b2 = mlp_b2[o]
+        mlp_b2[o] = orig_b2 + eps
+        let m2 = hy_make_model(D_model, seq_len, order, mlp_hidden, model["W_v"], model["W_d"], model["W_out"], model["b_out"], model["mlp_W1"], model["mlp_b1"], model["mlp_W2"], mlp_b2)
+        let loss_p_b2 = hy_loss(m2, X, Y)
+        mlp_b2[o] = orig_b2
+        let grad_b2 = (loss_p_b2 - base_loss) / eps
+        mlp_b2_new = mlp_b2_new + [orig_b2 - lr * grad_b2]
+    }
+
+    return #{
+        "D_model": D_model,
+        "seq_len": seq_len,
+        "order": order,
+        "W_v": W_v_new,
+        "W_d": W_d_new,
+        "W_out": W_out_new,
+        "b_out": b_out_new,
+        "mlp_W1": mlp_W1_new,
+        "mlp_b1": mlp_b1_new,
+        "mlp_W2": mlp_W2_new,
+        "mlp_b2": mlp_b2_new,
+        "mlp_hidden": mlp_hidden
+    }
+}
+
+println("[hyena_hierarchy] loaded — Hyena Hierarchy (#314): conv1d + gate + implicit_filter + forward + loss + train_step")

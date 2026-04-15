@@ -1,0 +1,403 @@
+// ═══════════════════════════════════════════════════════════
+//  test_pgo_branch.hexa — @profile_guided PGO branch weight tests
+//  ROI #72: branch probability injection from execution profiles
+//  Tests: anp_pgo_load_profile, anp_pgo_annotate_branch,
+//         anp_pgo_layout, anp_pgo_branch_pass
+//  Canonical impl: self/ai_native_pass.hexa (appended)
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(v) { if v < 0.0 { return 0.0 - v } return v }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ═══════════════════════════════════════════════════════════
+//  Inline PGO functions (mirrored from ai_native_pass.hexa)
+// ═══════════════════════════════════════════════════════════
+
+fn anp_pgo_load_profile(profile_data) {
+    let mut result = #{}
+    if type_of(profile_data) != "array" { return result }
+    let n = len(profile_data)
+    let mut i = 0
+    while i < n {
+        let entry = profile_data[i]
+        let fn_name = entry["fn"]
+        let bid = entry["branch_id"]
+        let taken = entry["taken"]
+        let not_taken = entry["not_taken"]
+        let total = taken + not_taken
+        let mut prob = 0.5
+        if total > 0 {
+            prob = to_float(taken) / to_float(total)
+        }
+        let key = fn_name + ":" + to_string(bid)
+        result[key] = #{"taken": taken, "not_taken": not_taken, "total": total, "prob": prob}
+        i = i + 1
+    }
+    return result
+}
+
+fn anp_pgo_annotate_branch(if_node, profile, fn_name, branch_id) {
+    let key = fn_name + ":" + to_string(branch_id)
+    let mut result = #{"annotated": false, "prob": 0.5, "likely_branch": "unknown", "branch_id": branch_id}
+    if type_of(profile) != "map" { return result }
+    if !has_key(profile, key) { return result }
+    let entry = profile[key]
+    if type_of(entry) != "map" { return result }
+    let prob = entry["prob"]
+    result["annotated"] = true
+    result["prob"] = prob
+    if prob >= 0.8 {
+        result["likely_branch"] = "then"
+    }
+    if prob <= 0.2 {
+        result["likely_branch"] = "else"
+    }
+    return result
+}
+
+fn anp_pgo_collect_branches(body, depth) {
+    if type_of(body) != "array" { return [] }
+    let mut branches = []
+    let mut bid = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "ExprStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                branches = branches.push(#{"branch_id": bid, "kind": "if", "depth": depth})
+                bid = bid + 1
+                let inner_then = anp_pgo_collect_branches(stmt.left.then_body, depth + 1)
+                let mut j = 0
+                while j < len(inner_then) {
+                    let e = inner_then[j]
+                    branches = branches.push(#{"branch_id": bid, "kind": e["kind"], "depth": e["depth"]})
+                    bid = bid + 1
+                    j = j + 1
+                }
+                if type_of(stmt.left.else_body) != "string" {
+                    let inner_else = anp_pgo_collect_branches(stmt.left.else_body, depth + 1)
+                    let mut j2 = 0
+                    while j2 < len(inner_else) {
+                        let e2 = inner_else[j2]
+                        branches = branches.push(#{"branch_id": bid, "kind": e2["kind"], "depth": e2["depth"]})
+                        bid = bid + 1
+                        j2 = j2 + 1
+                    }
+                }
+            }
+        }
+        if k == "ReturnStmt" {
+            if type_of(stmt.left) != "string" && stmt.left.kind == "IfExpr" {
+                branches = branches.push(#{"branch_id": bid, "kind": "return_if", "depth": depth})
+                bid = bid + 1
+            }
+        }
+        if k == "WhileStmt" || k == "ForStmt" {
+            let loop_inner = anp_pgo_collect_branches(stmt.body, depth + 1)
+            let mut j3 = 0
+            while j3 < len(loop_inner) {
+                let e3 = loop_inner[j3]
+                branches = branches.push(#{"branch_id": bid, "kind": e3["kind"], "depth": e3["depth"]})
+                bid = bid + 1
+                j3 = j3 + 1
+            }
+        }
+        i = i + 1
+    }
+    return branches
+}
+
+fn anp_pgo_layout(fn_node, profile) {
+    let fn_name = fn_node.name
+    let branches = anp_pgo_collect_branches(fn_node.body, 0)
+    let n_branches = len(branches)
+    let mut hot_count = 0
+    let mut cold_count = 0
+    let mut neutral_count = 0
+    let mut annotations = []
+    let mut i = 0
+    while i < n_branches {
+        let br = branches[i]
+        let bid = br["branch_id"]
+        let ann = anp_pgo_annotate_branch("", profile, fn_name, bid)
+        annotations = annotations.push(ann)
+        if ann["likely_branch"] == "then" {
+            hot_count = hot_count + 1
+        }
+        if ann["likely_branch"] == "else" {
+            cold_count = cold_count + 1
+        }
+        if ann["likely_branch"] == "unknown" {
+            neutral_count = neutral_count + 1
+        }
+        i = i + 1
+    }
+    return #{"fn_name": fn_name, "total_branches": n_branches, "hot": hot_count, "cold": cold_count, "neutral": neutral_count, "annotations": annotations, "layout_order": "hot_first"}
+}
+
+fn anp_pgo_branch_pass(ast, profile) {
+    let loaded = anp_pgo_load_profile(profile)
+    let mut fns_analyzed = 0
+    let mut total_branches = 0
+    let mut total_hot = 0
+    let mut total_cold = 0
+    let mut total_annotated = 0
+    let mut layouts = []
+    if type_of(ast) != "array" {
+        return #{"fns_analyzed": 0, "total_branches": 0, "hot": 0, "cold": 0, "annotated": 0, "layouts": []}
+    }
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let layout = anp_pgo_layout(node, loaded)
+            fns_analyzed = fns_analyzed + 1
+            total_branches = total_branches + layout["total_branches"]
+            total_hot = total_hot + layout["hot"]
+            total_cold = total_cold + layout["cold"]
+            let anns = layout["annotations"]
+            let mut j = 0
+            while j < len(anns) {
+                if anns[j]["annotated"] == true {
+                    total_annotated = total_annotated + 1
+                }
+                j = j + 1
+            }
+            layouts = layouts.push(layout)
+        }
+        i = i + 1
+    }
+    return #{"fns_analyzed": fns_analyzed, "total_branches": total_branches, "hot": total_hot, "cold": total_cold, "annotated": total_annotated, "layouts": layouts}
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Test helpers
+// ═══════════════════════════════════════════════════════════
+
+fn mk_prof(fn_name, bid, taken, not_taken) {
+    return #{"fn": fn_name, "branch_id": bid, "taken": taken, "not_taken": not_taken}
+}
+
+fn mk_fn(name, body) {
+    return #{"kind": "FnDecl", "name": name, "body": body, "params": [], "ret_type": ""}
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  HEXA PGO Branch Weight Tests (ROI #72)")
+println("═══════════════════════════════════════════════════════")
+println("")
+
+// ════════════════════════════════════════════════════════════
+//  1. anp_pgo_load_profile — basic parsing
+// ════════════════════════════════════════════════════════════
+
+println("--- anp_pgo_load_profile ---")
+
+// T1: empty profile
+let p1 = anp_pgo_load_profile([])
+check("T1 empty profile is dict", type_of(p1) == "map")
+
+// T2: single entry
+let e2 = mk_prof("foo", 0, 90, 10)
+let p2 = anp_pgo_load_profile([e2])
+check("T2 has key foo:0", type_of(p2["foo:0"]) == "map")
+check("T2 taken=90", p2["foo:0"]["taken"] == 90)
+check("T2 not_taken=10", p2["foo:0"]["not_taken"] == 10)
+check("T2 total=100", p2["foo:0"]["total"] == 100)
+check("T2 prob=0.9", approx(p2["foo:0"]["prob"], 0.9, 0.01))
+
+// T3: multiple entries
+let e3a = mk_prof("bar", 0, 100, 0)
+let e3b = mk_prof("bar", 1, 0, 100)
+let e3c = mk_prof("baz", 0, 50, 50)
+let p3 = anp_pgo_load_profile([e3a, e3b, e3c])
+check("T3 bar:0 prob=1.0", approx(p3["bar:0"]["prob"], 1.0, 0.01))
+check("T3 bar:1 prob=0.0", approx(p3["bar:1"]["prob"], 0.0, 0.01))
+check("T3 baz:0 prob=0.5", approx(p3["baz:0"]["prob"], 0.5, 0.01))
+
+// T4: zero-total edge case
+let e4 = mk_prof("zero", 0, 0, 0)
+let p4 = anp_pgo_load_profile([e4])
+check("T4 zero-total prob=0.5", approx(p4["zero:0"]["prob"], 0.5, 0.01))
+
+// T5: non-array input
+let p5 = anp_pgo_load_profile("not_array")
+check("T5 non-array returns empty dict", type_of(p5) == "map")
+
+// ════════════════════════════════════════════════════════════
+//  2. anp_pgo_annotate_branch — probability annotation
+// ════════════════════════════════════════════════════════════
+
+println("")
+println("--- anp_pgo_annotate_branch ---")
+
+let prof_e1 = mk_prof("hot_fn", 0, 95, 5)
+let prof_e2 = mk_prof("hot_fn", 1, 5, 95)
+let prof_e3 = mk_prof("mid_fn", 0, 50, 50)
+let prof = anp_pgo_load_profile([prof_e1, prof_e2, prof_e3])
+
+// T6: hot branch (prob >= 0.8 -> likely_branch="then")
+let a6 = anp_pgo_annotate_branch("", prof, "hot_fn", 0)
+check("T6 annotated=true", a6["annotated"] == true)
+check("T6 likely=then", a6["likely_branch"] == "then")
+check("T6 prob~0.95", approx(a6["prob"], 0.95, 0.01))
+
+// T7: cold branch (prob <= 0.2 -> likely_branch="else")
+let a7 = anp_pgo_annotate_branch("", prof, "hot_fn", 1)
+check("T7 annotated=true", a7["annotated"] == true)
+check("T7 likely=else", a7["likely_branch"] == "else")
+
+// T8: neutral branch (0.2 < prob < 0.8 -> "unknown")
+let a8 = anp_pgo_annotate_branch("", prof, "mid_fn", 0)
+check("T8 annotated=true", a8["annotated"] == true)
+check("T8 likely=unknown", a8["likely_branch"] == "unknown")
+
+// T9: missing fn in profile
+let a9 = anp_pgo_annotate_branch("", prof, "missing_fn", 0)
+check("T9 annotated=false", a9["annotated"] == false)
+check("T9 likely=unknown", a9["likely_branch"] == "unknown")
+
+// T10: non-dict profile
+let a10 = anp_pgo_annotate_branch("", "bad", "hot_fn", 0)
+check("T10 non-dict profile", a10["annotated"] == false)
+
+// T11: boundary prob=0.8 exactly -> "then"
+let eb11 = mk_prof("edge", 0, 80, 20)
+let prof_boundary = anp_pgo_load_profile([eb11])
+let a11 = anp_pgo_annotate_branch("", prof_boundary, "edge", 0)
+check("T11 prob=0.8 -> then", a11["likely_branch"] == "then")
+
+// T12: boundary prob=0.2 exactly -> "else"
+let eb12 = mk_prof("edge2", 0, 20, 80)
+let prof_boundary2 = anp_pgo_load_profile([eb12])
+let a12 = anp_pgo_annotate_branch("", prof_boundary2, "edge2", 0)
+check("T12 prob=0.2 -> else", a12["likely_branch"] == "else")
+
+// ════════════════════════════════════════════════════════════
+//  3. anp_pgo_layout — layout metadata
+// ════════════════════════════════════════════════════════════
+
+println("")
+println("--- anp_pgo_layout ---")
+
+// T13: layout with empty body (no branches)
+let empty_fn = mk_fn("empty", [])
+let layout_prof = anp_pgo_load_profile([])
+let l13 = anp_pgo_layout(empty_fn, layout_prof)
+check("T13 empty fn 0 branches", l13["total_branches"] == 0)
+check("T13 fn_name=empty", l13["fn_name"] == "empty")
+check("T13 layout=hot_first", l13["layout_order"] == "hot_first")
+
+// T14: layout with hot profile data
+let hp_e = mk_prof("classify", 0, 99, 1)
+let hot_prof = anp_pgo_load_profile([hp_e])
+let classify_fn = mk_fn("classify", [])
+let l14 = anp_pgo_layout(classify_fn, hot_prof)
+check("T14 classify layout", l14["fn_name"] == "classify")
+check("T14 hot_first order", l14["layout_order"] == "hot_first")
+
+// ════════════════════════════════════════════════════════════
+//  4. anp_pgo_branch_pass — full pass
+// ════════════════════════════════════════════════════════════
+
+println("")
+println("--- anp_pgo_branch_pass ---")
+
+// T15: empty AST
+let r15 = anp_pgo_branch_pass([], [])
+check("T15 empty ast fns=0", r15["fns_analyzed"] == 0)
+check("T15 empty ast branches=0", r15["total_branches"] == 0)
+
+// T16: non-array AST
+let r16 = anp_pgo_branch_pass("bad", [])
+check("T16 non-array ast fns=0", r16["fns_analyzed"] == 0)
+
+// T17: AST with single fn, no profile
+let fn17 = mk_fn("f1", [])
+let r17 = anp_pgo_branch_pass([fn17], [])
+check("T17 one fn analyzed", r17["fns_analyzed"] == 1)
+check("T17 zero branches", r17["total_branches"] == 0)
+
+// T18: AST with multiple fns
+let fn18a = mk_fn("f1", [])
+let fn18b = mk_fn("f2", [])
+let fn18c = mk_fn("f3", [])
+let r18 = anp_pgo_branch_pass([fn18a, fn18b, fn18c], [])
+check("T18 three fns analyzed", r18["fns_analyzed"] == 3)
+
+// T19: layouts array size matches fns
+check("T19 layouts count=3", len(r18["layouts"]) == 3)
+check("T19 layout[0].fn_name=f1", r18["layouts"][0]["fn_name"] == "f1")
+check("T19 layout[2].fn_name=f3", r18["layouts"][2]["fn_name"] == "f3")
+
+// T20: non-FnDecl nodes skipped
+let let_node = #{"kind": "LetStmt", "name": "x", "body": [], "params": [], "ret_type": ""}
+let fn_node20 = mk_fn("only_fn", [])
+let r20 = anp_pgo_branch_pass([let_node, fn_node20], [])
+check("T20 skip non-FnDecl", r20["fns_analyzed"] == 1)
+
+// T21: hot count in summary
+let hp21 = mk_prof("hf", 0, 99, 1)
+let loaded_hp = anp_pgo_load_profile([hp21])
+check("T21 loaded has hf:0", type_of(loaded_hp["hf:0"]) == "map")
+
+// T22: annotate with loaded profile
+let a22 = anp_pgo_annotate_branch("", loaded_hp, "hf", 0)
+check("T22 annotated hf:0", a22["annotated"] == true)
+check("T22 hf:0 is hot", a22["likely_branch"] == "then")
+
+// T23: profile with large counts
+let big_e = mk_prof("big", 0, 999999, 1)
+let big_prof = anp_pgo_load_profile([big_e])
+check("T23 big total", big_prof["big:0"]["total"] == 1000000)
+check("T23 big prob~1.0", approx(big_prof["big:0"]["prob"], 1.0, 0.001))
+
+// T24: profile with asymmetric data
+let asym_e = mk_prof("asym", 0, 1, 999)
+let asym_prof = anp_pgo_load_profile([asym_e])
+check("T24 asym prob~0.001", asym_prof["asym:0"]["prob"] < 0.01)
+let a24 = anp_pgo_annotate_branch("", asym_prof, "asym", 0)
+check("T24 asym likely=else", a24["likely_branch"] == "else")
+
+// T25: multiple branch IDs same fn
+let me0 = mk_prof("multi", 0, 90, 10)
+let me1 = mk_prof("multi", 1, 10, 90)
+let me2 = mk_prof("multi", 2, 50, 50)
+let multi_prof = anp_pgo_load_profile([me0, me1, me2])
+let am0 = anp_pgo_annotate_branch("", multi_prof, "multi", 0)
+let am1 = anp_pgo_annotate_branch("", multi_prof, "multi", 1)
+let am2 = anp_pgo_annotate_branch("", multi_prof, "multi", 2)
+check("T25 multi:0 hot", am0["likely_branch"] == "then")
+check("T25 multi:1 cold", am1["likely_branch"] == "else")
+check("T25 multi:2 neutral", am2["likely_branch"] == "unknown")
+
+// ════════════════════════════════════════════════════════════
+//  Summary
+// ════════════════════════════════════════════════════════════
+
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  PGO Branch Results: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+println("═══════════════════════════════════════════════════════")
+
+if fail_count > 0 {
+    println("[FAIL] " + to_string(fail_count) + " test(s) failed!")
+} else {
+    println("[ALL PASS] " + to_string(pass_count) + " tests passed!")
+}

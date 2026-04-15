@@ -37,13 +37,13 @@ Self-hosting: writing the HEXA compiler in HEXA itself.
 
 ```bash
 # Run the full compiler pipeline test (12 tests, all pass)
-./hexa self/test_bootstrap_compiler.hexa
+./hexa run self/test_bootstrap_compiler.hexa
 
 # Run the bootstrap lexer test
-./hexa self/test_bootstrap.hexa
+./hexa run self/test_bootstrap.hexa
 
 # Run the integrated bootstrap pipeline (requires char == support in interpreter)
-./hexa self/bootstrap.hexa
+./hexa run self/bootstrap.hexa
 ```
 
 ## Architecture

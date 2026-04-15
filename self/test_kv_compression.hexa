@@ -1,0 +1,187 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_kv_compression.hexa — KV Cache Compression (#309)
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/kv_compression.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx_(a, b, eps) { return fabs_(a - b) < eps }
+
+println("=== KV Cache Compression (#309) ===")
+
+// ── T1 init model shapes ─────────────────────────────────────────
+let m1 = kvc_init(8, 3, 16, 42)
+check("T1 W_down shape", len(m1["W_down"]) == 3 && len(m1["W_down"][0]) == 8)
+check("T1 W_up shape", len(m1["W_up"]) == 8 && len(m1["W_up"][0]) == 3)
+check("T1 n_levels", m1["n_levels"] == 16)
+check("T1 D_model", m1["D_model"] == 8)
+check("T1 D_compressed", m1["D_compressed"] == 3)
+
+// ── T2 compress output dimension ─────────────────────────────────
+let kv2 = [1.0, 0.5, -0.3, 0.7, -0.1, 0.2, 0.4, -0.6]
+let c2 = kvc_compress(m1, kv2)
+check("T2 compressed dim", len(c2) == 3)
+
+// ── T3 decompress output dimension ───────────────────────────────
+let d3 = kvc_decompress(m1, c2)
+check("T3 decompressed dim", len(d3) == 8)
+
+// ── T4 quantize / dequantize roundtrip (exact at boundaries) ─────
+let q4a = kvc_quantize(1.0, 16)
+check("T4 quantize(1.0, 16) = 15", q4a == 15)
+let q4b = kvc_quantize(-1.0, 16)
+check("T4 quantize(-1.0, 16) = 0", q4b == 0)
+let q4c = kvc_quantize(0.0, 16)
+// midpoint: (0+1)/2 * 15 = 7.5 -> round = 8
+check("T4 quantize(0.0, 16) = 7 or 8", q4c == 7 || q4c == 8)
+
+// ── T5 dequantize range ──────────────────────────────────────────
+let dq5a = kvc_dequantize(0, 16)
+check("T5 dequantize(0, 16) = -1", approx_(dq5a, -1.0, 1.0e-9))
+let dq5b = kvc_dequantize(15, 16)
+check("T5 dequantize(15, 16) = 1", approx_(dq5b, 1.0, 1.0e-9))
+
+// ── T6 quantize-dequantize is near identity for boundary values ──
+let v6 = 0.6
+let q6 = kvc_quantize(v6, 256)
+let dq6 = kvc_dequantize(q6, 256)
+check("T6 quant-dequant roundtrip (256 levels)", fabs_(v6 - dq6) < 0.01)
+
+// ── T7 compress-quantize pipeline ────────────────────────────────
+let cq7 = kvc_compress_quantize(m1, kv2)
+check("T7 compact has quantized", len(cq7["quantized"]) == 3)
+check("T7 compact has scale", cq7["scale"] > 0.0)
+
+// ── T8 decompress from quantized compact ─────────────────────────
+let r8 = kvc_decompress_quantized(m1, cq7)
+check("T8 decompressed from quantized dim", len(r8) == 8)
+
+// ── T9 error function ────────────────────────────────────────────
+let err9a = kvc_error([1.0, 2.0, 3.0], [1.0, 2.0, 3.0])
+check("T9 error(identical) = 0", approx_(err9a, 0.0, 1.0e-12))
+let err9b = kvc_error([1.0, 0.0], [0.0, 0.0])
+check("T9 error([1,0],[0,0]) = 0.5", approx_(err9b, 0.5, 1.0e-9))
+
+// ── T10 compression introduces error but preserves shape ─────────
+let orig10 = [0.5, -0.3, 0.7, 0.1, -0.9, 0.2, 0.6, -0.4]
+let c10 = kvc_compress(m1, orig10)
+let r10 = kvc_decompress(m1, c10)
+let err10 = kvc_error(orig10, r10)
+check("T10 reconstruction error > 0 (lossy)", err10 > 0.0)
+check("T10 reconstruction shape", len(r10) == 8)
+
+// ── T11 attention output dimension ───────────────────────────────
+let query11 = [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8]
+let k11a = kvc_compress(m1, [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+let k11b = kvc_compress(m1, [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+let v11a = kvc_compress(m1, [0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5])
+let v11b = kvc_compress(m1, [-0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5, -0.5])
+let attn11 = kvc_attention(m1, query11, [k11a, k11b], [v11a, v11b])
+check("T11 attention output dim", len(attn11) == 8)
+
+// ── T12 attention weights sum to 1 (output is convex combo) ──────
+// With 1 key, output should exactly equal the single decompressed value
+let k12 = kvc_compress(m1, [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0])
+let v12 = kvc_compress(m1, [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3])
+let attn12 = kvc_attention(m1, query11, [k12], [v12])
+let v12_dec = kvc_decompress(m1, v12)
+let mut match12 = true
+for i in 0..8 {
+    if fabs_(attn12[i] - v12_dec[i]) > 1.0e-6 { match12 = false }
+}
+check("T12 single-key attention = value", match12)
+
+// ── T13 training reduces reconstruction error ────────────────────
+let K_batch = [
+    [1.0, 0.5, -0.3, 0.7, -0.1, 0.2, 0.4, -0.6],
+    [0.2, -0.8, 0.5, 0.1, 0.9, -0.3, 0.6, 0.4],
+    [-0.5, 0.3, 0.8, -0.2, 0.4, 0.7, -0.1, 0.5],
+    [0.7, 0.1, -0.6, 0.3, -0.5, 0.8, 0.2, -0.4]
+]
+let V_batch = [
+    [0.3, -0.1, 0.6, -0.4, 0.2, 0.5, -0.7, 0.1],
+    [-0.2, 0.7, -0.3, 0.5, 0.1, -0.6, 0.4, 0.8],
+    [0.6, -0.4, 0.1, 0.8, -0.3, 0.2, 0.5, -0.1],
+    [-0.1, 0.5, 0.4, -0.6, 0.7, -0.2, 0.3, 0.6]
+]
+
+// error before training
+let mut err_before = 0.0
+for i in 0..4 {
+    let ck = kvc_compress(m1, K_batch[i])
+    let rk = kvc_decompress(m1, ck)
+    err_before = err_before + kvc_error(K_batch[i], rk)
+}
+err_before = err_before / 4.0
+
+// train
+let mut model_t = m1
+for _step in 0..100 {
+    model_t = kvc_train_step(model_t, K_batch, V_batch, 0.01)
+}
+
+// error after training
+let mut err_after = 0.0
+for i in 0..4 {
+    let ck = kvc_compress(model_t, K_batch[i])
+    let rk = kvc_decompress(model_t, ck)
+    err_after = err_after + kvc_error(K_batch[i], rk)
+}
+err_after = err_after / 4.0
+
+check("T13 training reduces K error", err_after < err_before)
+
+// ── T14 training also reduces V error ────────────────────────────
+let mut verr_before = 0.0
+for i in 0..4 {
+    let cv = kvc_compress(m1, V_batch[i])
+    let rv = kvc_decompress(m1, cv)
+    verr_before = verr_before + kvc_error(V_batch[i], rv)
+}
+verr_before = verr_before / 4.0
+
+let mut verr_after = 0.0
+for i in 0..4 {
+    let cv = kvc_compress(model_t, V_batch[i])
+    let rv = kvc_decompress(model_t, cv)
+    verr_after = verr_after + kvc_error(V_batch[i], rv)
+}
+verr_after = verr_after / 4.0
+
+check("T14 training reduces V error", verr_after < verr_before)
+
+// ── T15 deterministic init ───────────────────────────────────────
+let ma = kvc_init(4, 2, 8, 77)
+let mb = kvc_init(4, 2, 8, 77)
+let mut det15 = true
+for i in 0..2 {
+    for j in 0..4 {
+        if fabs_(ma["W_down"][i][j] - mb["W_down"][i][j]) > 1.0e-12 { det15 = false }
+    }
+}
+check("T15 deterministic init", det15)
+
+// ── T16 quantize clamps out of range ─────────────────────────────
+let q16a = kvc_quantize(5.0, 16)
+check("T16 quantize(5.0) clamped to max", q16a == 15)
+let q16b = kvc_quantize(-5.0, 16)
+check("T16 quantize(-5.0) clamped to 0", q16b == 0)
+
+println("")
+println("=== KV Compression summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

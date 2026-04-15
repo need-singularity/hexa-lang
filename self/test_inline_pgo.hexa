@@ -1,0 +1,631 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_inline_pgo.hexa — ROI #71 Inline Cost Model + PGO Integration
+//
+//  검증 항목 (27 tests):
+//    1.  cost: string fn_node returns 999
+//    2.  cost: empty body fn returns 0
+//    3.  cost: single stmt fn low cost
+//    4.  cost: multi-stmt fn higher cost
+//    5.  cost: fn with calls gets extra cost
+//    6.  benefit: zero exec_count -> 0.0
+//    7.  benefit: exec_count == hot_threshold -> 1.0
+//    8.  benefit: exec_count >> threshold capped at 10.0
+//    9.  benefit: custom hot_threshold
+//   10.  benefit: zero threshold returns 0.0
+//   11.  decision: cold site rejected
+//   12.  decision: hot site accepted
+//   13.  decision: too_big rejected
+//   14.  decision: inline_always overrides cost
+//   15.  decision: cost_exceeds_benefit case
+//   16.  decision: custom max_inline_cost
+//   17.  decision: custom benefit_threshold
+//   18.  fn_map: collect multiple fns
+//   19.  find_fn: found vs not_found
+//   20.  extract_call_names: empty body
+//   21.  extract_call_names: return stmt with call
+//   22.  pgo_pass: empty ast
+//   23.  pgo_pass: hot fn inlined counter
+//   24.  pgo_pass: cold fn skipped counter
+//   25.  pgo_pass: mixed hot/cold
+//   26.  pgo_pass: total_benefit accumulates
+//   27.  pgo_pass: too_big fn skipped
+//
+//  실행: ./hexa self/test_inline_pgo.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+// ── AstNode struct (21-field) ─────────────────────────────────────
+struct AstNode {
+    kind: string,
+    name: string,
+    value: string,
+    op: string,
+    left: string,
+    right: string,
+    cond: string,
+    then_body: string,
+    else_body: string,
+    params: string,
+    body: string,
+    args: string,
+    fields: string,
+    items: string,
+    variants: string,
+    arms: string,
+    iter_expr: string,
+    ret_type: string,
+    target: string,
+    trait_name: string,
+    methods: string
+}
+
+// ── Milestone counters ────────────────────────────────────────────
+let mut anp_pgo_inlined = 0
+let mut anp_pgo_skipped_cold = 0
+let mut anp_pgo_skipped_big = 0
+let mut anp_pgo_total_benefit = 0.0
+
+// ── anp_inline_cost ───────────────────────────────────────────────
+// Returns cost of inlining a function node.
+// If input is not a struct (string guard), returns 999.
+// Cost = base_cost(len(body)) + node_count/2 + call_count*2
+fn anp_inline_cost(fn_node) {
+    if type_of(fn_node) == "string" {
+        return 999
+    }
+    let body = fn_node.body
+    if type_of(body) != "array" {
+        return 0
+    }
+    let stmt_count = len(body)
+    if stmt_count == 0 {
+        return 0
+    }
+    // base cost = stmt_count
+    let mut cost = stmt_count
+    // count total sub-nodes and calls
+    let mut node_count = 0
+    let mut call_count = 0
+    let mut i = 0
+    while i < stmt_count {
+        let stmt = body[i]
+        node_count = node_count + 1
+        // count calls in left (expr position)
+        if type_of(stmt) != "string" {
+            if stmt.kind == "Call" {
+                call_count = call_count + 1
+            }
+            // check left child for call
+            if type_of(stmt.left) != "string" {
+                node_count = node_count + 1
+                if stmt.left.kind == "Call" {
+                    call_count = call_count + 1
+                }
+                // check callee of that call (left.left)
+                if type_of(stmt.left.left) != "string" {
+                    node_count = node_count + 1
+                }
+            }
+            // check right child
+            if type_of(stmt.right) != "string" {
+                node_count = node_count + 1
+            }
+        }
+        i = i + 1
+    }
+    cost = cost + node_count / 2 + call_count * 2
+    return cost
+}
+
+// ── anp_inline_benefit ────────────────────────────────────────────
+// Returns benefit score based on exec_count / hot_threshold.
+// Capped at 10.0. Returns 0.0 if threshold is 0.
+fn anp_inline_benefit(site, profile) {
+    let threshold = profile["hot_threshold"]
+    if threshold == 0 {
+        return 0.0
+    }
+    let exec = site["exec_count"]
+    if exec == 0 {
+        return 0.0
+    }
+    let ratio = to_float(exec) / to_float(threshold)
+    if ratio > 10.0 {
+        return 10.0
+    }
+    return ratio
+}
+
+// ── anp_inline_decision ───────────────────────────────────────────
+// Returns #{ "inline": bool, "reason": string }
+fn anp_inline_decision(site, fn_node, profile) {
+    // Check inline_always attribute
+    if type_of(fn_node) != "string" {
+        if fn_node.value == "inline_always" {
+            return #{ "inline": true, "reason": "inline_always" }
+        }
+    }
+
+    let threshold = profile["hot_threshold"]
+    let benefit = anp_inline_benefit(site, profile)
+
+    // Check benefit_threshold (default 1.0)
+    let mut benefit_thr = 1.0
+    if has_key(profile, "benefit_threshold") {
+        benefit_thr = profile["benefit_threshold"]
+    }
+    // If benefit is below benefit_threshold, it's cold
+    if benefit < benefit_thr {
+        return #{ "inline": false, "reason": "cold" }
+    }
+
+    let cost = anp_inline_cost(fn_node)
+
+    // Check max_inline_cost (default 50)
+    let mut max_cost = 50
+    if has_key(profile, "max_inline_cost") {
+        max_cost = profile["max_inline_cost"]
+    }
+    if cost > max_cost {
+        return #{ "inline": false, "reason": "too_big" }
+    }
+
+    // Check cost_exceeds_benefit: cost_ratio = cost / benefit
+    if benefit > 0.0 {
+        let cost_ratio = to_float(cost) / benefit
+        if cost_ratio > benefit {
+            return #{ "inline": false, "reason": "cost_exceeds_benefit" }
+        }
+    }
+
+    return #{ "inline": true, "reason": "hot_pgo" }
+}
+
+// ── anp_collect_fn_map ────────────────────────────────────────────
+// Collects FnDecl nodes from an AST array into a map.
+// Returns #{ "names": [...], "nodes": [...] }
+fn anp_collect_fn_map(ast) {
+    let mut names = []
+    let mut nodes = []
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if type_of(node) != "string" {
+            if node.kind == "FnDecl" {
+                names = names.push(node.name)
+                nodes = nodes.push(node)
+            }
+        }
+        i = i + 1
+    }
+    return #{ "names": names, "nodes": nodes }
+}
+
+// ── anp_find_fn ───────────────────────────────────────────────────
+// Finds a function by name in fn_map. Returns node or "not_found".
+fn anp_find_fn(fn_map, name) {
+    let names = fn_map["names"]
+    let nodes = fn_map["nodes"]
+    let mut i = 0
+    while i < len(names) {
+        if names[i] == name {
+            return nodes[i]
+        }
+        i = i + 1
+    }
+    return "not_found"
+}
+
+// ── anp_extract_call_names_body ───────────────────────────────────
+// Extracts call target names from a body (array of stmts).
+fn anp_extract_call_names_body(body) {
+    let mut result = []
+    let mut i = 0
+    while i < len(body) {
+        let stmt = body[i]
+        if type_of(stmt) != "string" {
+            // Check if stmt itself is a Call
+            if stmt.kind == "Call" {
+                if type_of(stmt.left) != "string" {
+                    result = result.push(stmt.left.name)
+                }
+            }
+            // Check left child (e.g. LetStmt with Call as value, or ReturnStmt with Call as expr)
+            if type_of(stmt.left) != "string" {
+                if stmt.left.kind == "Call" {
+                    if type_of(stmt.left.left) != "string" {
+                        result = result.push(stmt.left.left.name)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ── anp_extract_call_names ────────────────────────────────────────
+// Extracts call target names from a function node.
+fn anp_extract_call_names(fn_node) {
+    if type_of(fn_node) == "string" {
+        return []
+    }
+    let body = fn_node.body
+    if type_of(body) != "array" {
+        return []
+    }
+    return anp_extract_call_names_body(body)
+}
+
+// ── anp_inline_pgo_pass ──────────────────────────────────────────
+// Processes an AST with PGO profile, inlining hot call sites.
+// Updates milestone counters. Returns the (possibly modified) AST.
+fn anp_inline_pgo_pass(ast, profile) {
+    // Reset counters
+    anp_pgo_inlined = 0
+    anp_pgo_skipped_cold = 0
+    anp_pgo_skipped_big = 0
+    anp_pgo_total_benefit = 0.0
+
+    if len(ast) == 0 {
+        return []
+    }
+
+    let fn_map = anp_collect_fn_map(ast)
+
+    // Get profile counts (may not exist)
+    let mut counts = #{ "_": 0 }
+    if has_key(profile, "counts") {
+        counts = profile["counts"]
+    }
+
+    // For each function, check its call sites
+    let mut result = []
+    let mut fi = 0
+    while fi < len(ast) {
+        let node = ast[fi]
+        if type_of(node) != "string" {
+            if node.kind == "FnDecl" {
+                // Extract calls from this function body
+                let calls = anp_extract_call_names(node)
+                let mut ci = 0
+                while ci < len(calls) {
+                    let callee_name = calls[ci]
+                    let callee_node = anp_find_fn(fn_map, callee_name)
+                    if callee_node != "not_found" {
+                        // Build call site info
+                        let mut exec_count = 0
+                        if has_key(counts, callee_name) {
+                            exec_count = counts[callee_name]
+                        }
+                        let site = #{ "callee": callee_name, "exec_count": exec_count }
+                        let decision = anp_inline_decision(site, callee_node, profile)
+                        if decision["inline"] == true {
+                            anp_pgo_inlined = anp_pgo_inlined + 1
+                            let b = anp_inline_benefit(site, profile)
+                            anp_pgo_total_benefit = anp_pgo_total_benefit + b
+                        } else {
+                            if decision["reason"] == "cold" {
+                                anp_pgo_skipped_cold = anp_pgo_skipped_cold + 1
+                            }
+                            if decision["reason"] == "too_big" {
+                                anp_pgo_skipped_big = anp_pgo_skipped_big + 1
+                            }
+                        }
+                    }
+                    ci = ci + 1
+                }
+            }
+        }
+        result = result.push(node)
+        fi = fi + 1
+    }
+    return result
+}
+
+// ── Test harness ──────────────────────────────────────────────────
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn approx(a, b, eps) { return fabs(a - b) < eps }
+
+// ── Helper: build AstNode ──────────────────────────────────────────
+
+fn mk_node(kind, name, value, body) {
+    return AstNode {
+        kind: kind, name: name, value: value, op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: body, args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_return(expr) {
+    return AstNode {
+        kind: "ReturnStmt", name: "", value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_let(name, expr) {
+    return AstNode {
+        kind: "LetStmt", name: name, value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_let_mut(name, expr) {
+    return AstNode {
+        kind: "LetMutStmt", name: name, value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_assign(lhs, rhs) {
+    return AstNode {
+        kind: "AssignStmt", name: "", value: "", op: "",
+        left: lhs, right: rhs, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_ident(name) {
+    return AstNode {
+        kind: "Ident", name: name, value: "", op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_int(val) {
+    return AstNode {
+        kind: "IntLit", name: "", value: val, op: "",
+        left: "", right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_call(callee_name, args) {
+    let callee = mk_ident(callee_name)
+    return AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: callee, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: args, fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_binop(op, left, right) {
+    return AstNode {
+        kind: "BinOp", name: "", value: "", op: op,
+        left: left, right: right, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn mk_expr_stmt(expr) {
+    return AstNode {
+        kind: "ExprStmt", name: "", value: "", op: "",
+        left: expr, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// ── 1. anp_inline_cost tests ───────────────────────────────────────
+
+// T1: string fn_node -> 999
+check("T01 cost_string", anp_inline_cost("bad") == 999)
+
+// T2: empty body fn -> 0
+let fn_empty = mk_node("FnDecl", "empty_fn", "", [])
+check("T02 cost_empty", anp_inline_cost(fn_empty) == 0)
+
+// T3: single stmt body (return 42)
+let fn_single = mk_node("FnDecl", "single_fn", "", [mk_return(mk_int("42"))])
+let cost_single = anp_inline_cost(fn_single)
+check("T03 cost_single_low", cost_single > 0 && cost_single < 10)
+
+// T4: multi-stmt body -> higher cost
+let fn_multi = mk_node("FnDecl", "multi_fn", "", [
+    mk_let("a", mk_int("1")),
+    mk_let("b", mk_int("2")),
+    mk_let("c", mk_int("3")),
+    mk_let("d", mk_int("4")),
+    mk_return(mk_ident("d"))
+])
+let cost_multi = anp_inline_cost(fn_multi)
+check("T04 cost_multi_higher", cost_multi > cost_single)
+
+// T5: fn with calls -> extra cost from call_count * 2
+let fn_calls = mk_node("FnDecl", "calls_fn", "", [
+    mk_let("x", mk_call("foo", [mk_int("1")])),
+    mk_let("y", mk_call("bar", [mk_int("2")])),
+    mk_return(mk_ident("y"))
+])
+let cost_calls = anp_inline_cost(fn_calls)
+check("T05 cost_calls_extra", cost_calls > cost_multi)
+
+// ── 2. anp_inline_benefit tests ────────────────────────────────────
+
+// T6: zero exec -> 0.0
+let site_zero = #{"callee": "f", "exec_count": 0}
+let prof_default = #{"hot_threshold": 100}
+check("T06 benefit_zero", approx(anp_inline_benefit(site_zero, prof_default), 0.0, 0.001))
+
+// T7: exec_count == threshold -> 1.0
+let site_eq = #{"callee": "f", "exec_count": 100}
+check("T07 benefit_one", approx(anp_inline_benefit(site_eq, prof_default), 1.0, 0.001))
+
+// T8: exec >> threshold -> capped at 10.0
+let site_huge = #{"callee": "f", "exec_count": 99999}
+check("T08 benefit_cap", approx(anp_inline_benefit(site_huge, prof_default), 10.0, 0.001))
+
+// T9: custom threshold
+let prof_custom = #{"hot_threshold": 50}
+let site_50 = #{"callee": "f", "exec_count": 50}
+check("T09 benefit_custom_thr", approx(anp_inline_benefit(site_50, prof_custom), 1.0, 0.001))
+
+// T10: zero threshold -> 0.0 (guard)
+let prof_zero_thr = #{"hot_threshold": 0}
+check("T10 benefit_zero_thr", approx(anp_inline_benefit(site_50, prof_zero_thr), 0.0, 0.001))
+
+// ── 3. anp_inline_decision tests ───────────────────────────────────
+
+// T11: cold site -> rejected
+let site_cold = #{"callee": "f", "exec_count": 10}
+let prof_strict = #{"hot_threshold": 100, "benefit_threshold": 1.0, "max_inline_cost": 50}
+let dec_cold = anp_inline_decision(site_cold, fn_single, prof_strict)
+check("T11 decision_cold", dec_cold["inline"] == false && dec_cold["reason"] == "cold")
+
+// T12: hot site -> accepted
+let site_hot = #{"callee": "f", "exec_count": 500}
+let dec_hot = anp_inline_decision(site_hot, fn_single, prof_strict)
+check("T12 decision_hot", dec_hot["inline"] == true && dec_hot["reason"] == "hot_pgo")
+
+// T13: too_big -> rejected
+// Build a fn with many stmts
+let mut big_body = []
+let mut bi = 0
+while bi < 30 {
+    big_body = big_body.push(mk_let("v" + to_string(bi), mk_call("compute", [mk_int(to_string(bi))])))
+    bi = bi + 1
+}
+let fn_big = mk_node("FnDecl", "big_fn", "", big_body)
+let dec_big = anp_inline_decision(site_hot, fn_big, #{"hot_threshold": 100, "max_inline_cost": 20})
+check("T13 decision_too_big", dec_big["inline"] == false && dec_big["reason"] == "too_big")
+
+// T14: @inline_always overrides cost
+let fn_always = mk_node("FnDecl", "always_fn", "inline_always", big_body)
+let dec_always = anp_inline_decision(site_cold, fn_always, prof_strict)
+check("T14 decision_inline_always", dec_always["inline"] == true && dec_always["reason"] == "inline_always")
+
+// T15: cost_exceeds_benefit — moderate benefit but high cost
+// fn with ~15 stmts, 10 calls => cost ~45, benefit = 200/100 = 2.0, cost_ratio = 4.5 > 2.0
+let mut medium_body = []
+let mut mi = 0
+while mi < 15 {
+    medium_body = medium_body.push(mk_let("m" + to_string(mi), mk_call("work", [mk_int(to_string(mi))])))
+    mi = mi + 1
+}
+let fn_medium = mk_node("FnDecl", "medium_fn", "", medium_body)
+let site_medium = #{"callee": "f", "exec_count": 200}
+let prof_medium = #{"hot_threshold": 100, "max_inline_cost": 200, "benefit_threshold": 1.0}
+let dec_medium = anp_inline_decision(site_medium, fn_medium, prof_medium)
+// cost ~15 + nodes/2 + calls*2 => ~45+, cost_ratio ~4.5, benefit=2.0 => cost_exceeds_benefit
+check("T15 decision_cost_exceeds", dec_medium["inline"] == false && dec_medium["reason"] == "cost_exceeds_benefit")
+
+// T16: custom max_inline_cost
+let prof_low_max = #{"hot_threshold": 100, "max_inline_cost": 1}
+let dec_low_max = anp_inline_decision(site_hot, fn_multi, prof_low_max)
+check("T16 decision_custom_max", dec_low_max["inline"] == false && dec_low_max["reason"] == "too_big")
+
+// T17: custom benefit_threshold
+let prof_high_bt = #{"hot_threshold": 100, "benefit_threshold": 5.0, "max_inline_cost": 200}
+let site_low_exec = #{"callee": "f", "exec_count": 200}
+let dec_high_bt = anp_inline_decision(site_low_exec, fn_single, prof_high_bt)
+check("T17 decision_custom_bt", dec_high_bt["inline"] == false && dec_high_bt["reason"] == "cold")
+
+// ── 4. anp_collect_fn_map / anp_find_fn tests ─────────────────────
+
+// T18: collect multiple fns
+let ast_multi = [fn_empty, fn_single, fn_multi]
+let fm = anp_collect_fn_map(ast_multi)
+check("T18 fn_map_count", len(fm["names"]) == 3)
+
+// T19: find_fn found vs not_found
+let found = anp_find_fn(fm, "single_fn")
+let not_found = anp_find_fn(fm, "nonexistent")
+check("T19 find_fn_found", type_of(found) != "string")
+check("T19 find_fn_missing", not_found == "not_found")
+
+// ── 5. anp_extract_call_names tests ────────────────────────────────
+
+// T20: empty body -> empty
+let empty_calls = anp_extract_call_names_body([])
+check("T20 extract_empty", len(empty_calls) == 0)
+
+// T21: body with call stmt -> extracts name
+let body_with_call = [mk_return(mk_call("helper", [mk_int("1")]))]
+let extracted = anp_extract_call_names_body(body_with_call)
+check("T21 extract_call_name", len(extracted) == 1 && extracted[0] == "helper")
+
+// ── 6. anp_inline_pgo_pass tests ───────────────────────────────────
+
+// T22: empty ast -> empty result
+let res_empty = anp_inline_pgo_pass([], #{"hot_threshold": 100})
+check("T22 pgo_empty", len(res_empty) == 0 && anp_pgo_inlined == 0)
+
+// T23: hot fn -> inlined counter incremented
+// Create caller that calls callee, callee is small, profile says hot
+let callee_fn = mk_node("FnDecl", "callee", "", [mk_return(mk_int("42"))])
+let caller_body = [mk_let("r", mk_call("callee", []))]
+let caller_fn = mk_node("FnDecl", "caller", "", caller_body)
+let ast_hot = [callee_fn, caller_fn]
+let prof_hot = #{"counts": #{"callee": 500}, "hot_threshold": 100}
+let res_hot = anp_inline_pgo_pass(ast_hot, prof_hot)
+check("T23 pgo_hot_inlined", anp_pgo_inlined >= 1)
+
+// T24: cold fn -> skipped counter
+let prof_cold = #{"counts": #{"callee": 5}, "hot_threshold": 100}
+let res_cold = anp_inline_pgo_pass(ast_hot, prof_cold)
+check("T24 pgo_cold_skipped", anp_pgo_skipped_cold >= 1)
+
+// T25: mixed hot/cold
+let callee2 = mk_node("FnDecl", "callee2", "", [mk_return(mk_int("99"))])
+let caller_mixed_body = [
+    mk_let("a", mk_call("callee", [])),
+    mk_let("b", mk_call("callee2", []))
+]
+let caller_mixed = mk_node("FnDecl", "caller_mixed", "", caller_mixed_body)
+let ast_mixed = [callee_fn, callee2, caller_mixed]
+let prof_mixed = #{"counts": #{"callee": 1000, "callee2": 5}, "hot_threshold": 100}
+let res_mixed = anp_inline_pgo_pass(ast_mixed, prof_mixed)
+check("T25 pgo_mixed", anp_pgo_inlined >= 1 && anp_pgo_skipped_cold >= 1)
+
+// T26: total_benefit accumulates
+check("T26 pgo_benefit_positive", anp_pgo_total_benefit > 0.0)
+
+// T27: too_big fn skipped
+let big_callee = mk_node("FnDecl", "big_callee", "", big_body)
+let caller_big_body = [mk_let("x", mk_call("big_callee", []))]
+let caller_big = mk_node("FnDecl", "caller_big", "", caller_big_body)
+let ast_big = [big_callee, caller_big]
+let prof_big = #{"counts": #{"big_callee": 5000}, "hot_threshold": 100, "max_inline_cost": 10}
+let res_big = anp_inline_pgo_pass(ast_big, prof_big)
+check("T27 pgo_too_big", anp_pgo_skipped_big >= 1)
+
+// ── summary ────────────────────────────────────────────────────────
+println("")
+println("inline_pgo: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")

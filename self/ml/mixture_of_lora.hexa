@@ -1,0 +1,671 @@
+// ═══════════════════════════════════════════════════════════════
+//  mixture_of_lora.hexa — Mixture of LoRA (#342)
+//
+//  MoE-style routing over multiple task/domain-specific LoRA
+//  adapters. Each adapter is a standard LoRA (A, B) pair trained
+//  for a different task or domain. A learned router network
+//  selects top-k adapters per input and produces a weighted
+//  combination of their outputs.
+//
+//  Architecture:
+//    - N LoRA adapters, each with A_i [rank x d_in], B_i [d_out x rank]
+//    - Per-adapter alpha_i scaling factor
+//    - Router W_r [n_adapters x d_in], produces logits per input
+//    - Base weight W_base [d_out x d_in] (frozen)
+//    - Forward:
+//        1. logits = W_r @ x + noise (optional exploration)
+//        2. (indices, weights) = top_k_softmax(logits)
+//        3. delta = sum_k weights[k] * (alpha[k]/rank) * B[k] @ (A[k] @ x)
+//        4. y = W_base @ x + delta
+//
+//  Load-balance loss (Switch Transformer style):
+//    L_aux = n_adapters * sum_e( f_e * P_e )
+//    f_e = fraction of inputs routed to adapter e
+//    P_e = mean router probability for adapter e
+//
+//  Specialization score: measures how concentrated each adapter's
+//  usage is across different input clusters.
+//
+//  References:
+//    - Dou et al. 2024, "Looped Transformers" (MoLoRA concept)
+//    - Fedus et al. 2021, "Switch Transformers" (load-balance loss)
+//    - Hu et al. 2022, "LoRA" (low-rank adaptation)
+//
+//  AI-NATIVE:
+//    @pure    — math kernels / forward / routing / loss
+//    @memoize — scale constants
+//    @hot     — train step inner loop
+//
+//  HX3 pitfalls honored:
+//    - no semicolons, no ternary
+//    - arrays via rebuild (push pattern)
+//    - struct fields via rebuild
+//
+//  L0: src/*.rs untouched. Pure .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Math helpers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn mlora_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn mlora_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mlora_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [mlora_zeros1(cols)] }
+    return r
+}
+
+fn mlora_kaiming(rows, cols, seed) {
+    let mut s = seed
+    let scale = 1.0 / sqrt(to_float(cols))
+    let mut r = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 1000.0 * scale
+            row = row + [v]
+        }
+        r = r + [row]
+    }
+    return r
+}
+
+// matvec: y[m] = W[m,n] @ x[n]
+@pure
+fn mlora_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n { s = s + w[i][j] * x[j] }
+        y = y + [s]
+    }
+    return y
+}
+
+// LoRA scale: alpha / rank
+@memoize
+fn mlora_scale(alpha, rank) {
+    return to_float(alpha) / to_float(rank)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: LoRA Adapter
+//
+//  Each adapter stores: name, A [rank x d_in], B [d_out x rank],
+//  alpha (per-adapter scaling), domain tag.
+//  A: Kaiming init, B: zero init (LoRA convention: start at 0 delta).
+// ═══════════════════════════════════════════════════════════════
+
+struct MixLoraAdapter {
+    name: string,
+    domain: string,
+    a: array,
+    b: array,
+    d_in: int,
+    d_out: int,
+    rank: int,
+    alpha: float
+}
+
+fn mlora_create_adapter(name, domain, d_in, d_out, rank, alpha, seed) {
+    let a = mlora_kaiming(rank, d_in, seed)
+    let b = mlora_zeros2(d_out, rank)
+    return MixLoraAdapter {
+        name: name, domain: domain,
+        a: a, b: b,
+        d_in: d_in, d_out: d_out,
+        rank: rank, alpha: alpha
+    }
+}
+
+// Adapter forward: delta = (alpha/rank) * B @ (A @ x)
+@pure
+fn mlora_adapter_forward(adapter: MixLoraAdapter, x) {
+    let ax = mlora_matvec(adapter.a, x, adapter.rank, adapter.d_in)
+    let bax = mlora_matvec(adapter.b, ax, adapter.d_out, adapter.rank)
+    let s = mlora_scale(adapter.alpha, adapter.rank)
+    let mut out = []
+    for i in 0..adapter.d_out {
+        out = out + [s * bax[i]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Router
+//
+//  Router weights W_r: [n_adapters x d_in]
+//  logits = W_r @ x  => [n_adapters]
+//  Top-k selection with softmax over selected subset.
+// ═══════════════════════════════════════════════════════════════
+
+struct MixLoraRouter {
+    w: array,
+    n_adapters: int,
+    d_in: int
+}
+
+fn mlora_create_router(n_adapters, d_in, seed) {
+    let w = mlora_kaiming(n_adapters, d_in, seed)
+    return MixLoraRouter { w: w, n_adapters: n_adapters, d_in: d_in }
+}
+
+// Raw logits for all adapters
+@pure
+fn mlora_router_logits(router: MixLoraRouter, x) {
+    return mlora_matvec(router.w, x, router.n_adapters, router.d_in)
+}
+
+// Top-k indices from scores
+@pure
+fn mlora_topk_indices(scores, n, k) {
+    let mut used = []
+    for i in 0..n { used = used + [false] }
+    let mut picks = []
+    for r in 0..k {
+        let mut best = 0
+        let mut best_v = -1.0e30
+        let mut found = false
+        for e in 0..n {
+            if !used[e] {
+                if !found {
+                    best = e
+                    best_v = scores[e]
+                    found = true
+                } else {
+                    if scores[e] > best_v {
+                        best_v = scores[e]
+                        best = e
+                    }
+                }
+            }
+        }
+        let mut used2 = []
+        for i in 0..n {
+            if i == best { used2 = used2 + [true] } else { used2 = used2 + [used[i]] }
+        }
+        used = used2
+        picks = picks + [best]
+    }
+    return picks
+}
+
+// Softmax over selected subset indices
+@pure
+fn mlora_softmax_subset(scores, picks, k) {
+    let mut m = scores[picks[0]]
+    for r in 1..k {
+        if scores[picks[r]] > m { m = scores[picks[r]] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for r in 0..k {
+        let v = exp(scores[picks[r]] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for r in 0..k { out = out + [exps[r] / z] }
+    return out
+}
+
+// Full softmax over all adapters (for load-balance loss)
+@pure
+fn mlora_softmax_all(scores, n) {
+    let mut m = scores[0]
+    for i in 1..n { if scores[i] > m { m = scores[i] } }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let v = exp(scores[i] - m)
+        exps = exps + [v]
+        z = z + v
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+// Route: returns [top_k_indices, top_k_weights]
+@pure
+fn mlora_route(router: MixLoraRouter, x, top_k) {
+    let logits = mlora_router_logits(router, x)
+    let picks = mlora_topk_indices(logits, router.n_adapters, top_k)
+    let weights = mlora_softmax_subset(logits, picks, top_k)
+    return [picks, weights]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Mixture of LoRA Model
+// ═══════════════════════════════════════════════════════════════
+
+struct MixLoraModel {
+    adapters: array,
+    router: MixLoraRouter,
+    base_w: array,
+    d_in: int,
+    d_out: int,
+    rank: int,
+    n_adapters: int,
+    top_k: int,
+    frozen: int
+}
+
+fn mlora_create(d_in, d_out, rank, n_adapters, top_k, domains) {
+    let mut adapters = []
+    for i in 0..n_adapters {
+        let name = "adapter_" + to_string(i)
+        let domain = domains[i]
+        let seed = 42 + i * 137
+        let alpha = 1.0
+        let a = mlora_create_adapter(name, domain, d_in, d_out, rank, alpha, seed)
+        adapters = adapters + [a]
+    }
+    let router = mlora_create_router(n_adapters, d_in, 7777)
+    let base_w = mlora_kaiming(d_out, d_in, 9999)
+    return MixLoraModel {
+        adapters: adapters, router: router, base_w: base_w,
+        d_in: d_in, d_out: d_out, rank: rank, n_adapters: n_adapters,
+        top_k: top_k, frozen: 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: Forward
+//
+//  1. base_out = W_base @ x
+//  2. route(x) -> top-k adapter indices + weights
+//  3. delta = sum_k w_k * adapter_k_forward(x)
+//  4. y = base_out + delta
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn mlora_forward(model: MixLoraModel, x) {
+    let base_out = mlora_matvec(model.base_w, x, model.d_out, model.d_in)
+
+    let route_result = mlora_route(model.router, x, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    let mut delta = mlora_zeros1(model.d_out)
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let w_k = weights[k]
+        let adapter = model.adapters[idx]
+        let adapter_out = mlora_adapter_forward(adapter, x)
+        for d in 0..model.d_out {
+            delta[d] = delta[d] + w_k * adapter_out[d]
+        }
+    }
+
+    let mut y = []
+    for d in 0..model.d_out { y = y + [base_out[d] + delta[d]] }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: Load-balance loss
+//
+//  Encourages uniform adapter utilization.
+//    P_e = mean probability for adapter e across inputs
+//    f_e = fraction of inputs where adapter e is in top-k
+//    L_aux = n_adapters * sum_e(f_e * P_e)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn mlora_load_balance_loss(model: MixLoraModel, inputs, n_inputs) {
+    let mut f_counts = mlora_zeros1(model.n_adapters)
+    let mut p_sum = mlora_zeros1(model.n_adapters)
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = mlora_router_logits(model.router, x)
+        let probs = mlora_softmax_all(logits, model.n_adapters)
+        let picks = mlora_topk_indices(logits, model.n_adapters, model.top_k)
+
+        for e in 0..model.n_adapters {
+            p_sum[e] = p_sum[e] + probs[e]
+        }
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            f_counts[idx] = f_counts[idx] + 1.0
+        }
+    }
+
+    let n_f = to_float(n_inputs)
+    let mut loss = 0.0
+    for e in 0..model.n_adapters {
+        let f_e = f_counts[e] / n_f
+        let p_e = p_sum[e] / n_f
+        loss = loss + f_e * p_e
+    }
+    return to_float(model.n_adapters) * loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Adapter utilization
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn mlora_adapter_utilization(model: MixLoraModel, inputs, n_inputs) {
+    let mut counts = mlora_zeros1(model.n_adapters)
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let logits = mlora_router_logits(model.router, x)
+        let picks = mlora_topk_indices(logits, model.n_adapters, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx] = counts[idx] + 1.0
+        }
+    }
+    return counts
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Specialization score
+//
+//  Measures how specialized each adapter is. If an adapter is
+//  only selected for inputs from a single cluster, it is
+//  highly specialized. We compute a concentration metric:
+//    For each adapter, track how many times it is selected
+//    per cluster. The specialization = max_cluster / total.
+//    Range: [1/n_clusters, 1.0]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn mlora_specialization_score(model: MixLoraModel, inputs, labels, n_inputs, n_clusters) {
+    // counts[adapter][cluster] = number of times adapter selected for cluster
+    let mut counts = []
+    for a in 0..model.n_adapters {
+        counts = counts + [mlora_zeros1(n_clusters)]
+    }
+
+    for t in 0..n_inputs {
+        let x = inputs[t]
+        let cluster = labels[t]
+        let logits = mlora_router_logits(model.router, x)
+        let picks = mlora_topk_indices(logits, model.n_adapters, model.top_k)
+        for k in 0..model.top_k {
+            let idx = picks[k]
+            counts[idx][cluster] = counts[idx][cluster] + 1.0
+        }
+    }
+
+    let mut scores = mlora_zeros1(model.n_adapters)
+    for a in 0..model.n_adapters {
+        let mut total = 0.0
+        let mut mx = 0.0
+        for c in 0..n_clusters {
+            total = total + counts[a][c]
+            if counts[a][c] > mx { mx = counts[a][c] }
+        }
+        if total > 0.0 {
+            scores[a] = mx / total
+        } else {
+            scores[a] = 0.0
+        }
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Training
+//
+//  Analytical gradient SGD on adapters (A, B) + router.
+//  Base weights optionally frozen.
+// ═══════════════════════════════════════════════════════════════
+
+fn mlora_mse_loss(y, target, dim) {
+    let mut s = 0.0
+    for i in 0..dim {
+        let d = y[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(dim)
+}
+
+fn mlora_mse_grad(y, target, dim) {
+    let mut g = []
+    let inv = 2.0 / to_float(dim)
+    for i in 0..dim { g = g + [(y[i] - target[i]) * inv] }
+    return g
+}
+
+@hot
+fn mlora_train_step(model: MixLoraModel, x, target, lr) {
+    let d_in = model.d_in
+    let d_out = model.d_out
+    let y = mlora_forward(model, x)
+    let loss = mlora_mse_loss(y, target, d_out)
+    let dy = mlora_mse_grad(y, target, d_out)
+
+    let route_result = mlora_route(model.router, x, model.top_k)
+    let picks = route_result[0]
+    let weights = route_result[1]
+
+    // Update active adapters
+    let mut new_adapters = []
+    for e in 0..model.n_adapters {
+        let adapter = model.adapters[e]
+        let mut is_active = false
+        let mut w_e = 0.0
+        for k in 0..model.top_k {
+            if picks[k] == e {
+                is_active = true
+                w_e = weights[k]
+            }
+        }
+        if is_active {
+            let s = mlora_scale(adapter.alpha, model.rank)
+            let ax = mlora_matvec(adapter.a, x, model.rank, d_in)
+            // dB[i][j] = lr * w_e * s * dy[i] * ax[j]
+            let mut new_b = mlora_zeros2(d_out, model.rank)
+            for i in 0..d_out {
+                for j in 0..model.rank {
+                    new_b[i][j] = adapter.b[i][j] - lr * w_e * s * dy[i] * ax[j]
+                }
+            }
+            // B^T @ dy
+            let mut bdy = mlora_zeros1(model.rank)
+            for j in 0..model.rank {
+                let mut acc = 0.0
+                for i in 0..d_out { acc = acc + adapter.b[i][j] * dy[i] }
+                bdy[j] = acc
+            }
+            // dA[i][j] = lr * w_e * s * bdy[i] * x[j]
+            let mut new_a = mlora_zeros2(model.rank, d_in)
+            for i in 0..model.rank {
+                for j in 0..d_in {
+                    new_a[i][j] = adapter.a[i][j] - lr * w_e * s * bdy[i] * x[j]
+                }
+            }
+            let updated = MixLoraAdapter {
+                name: adapter.name, domain: adapter.domain,
+                a: new_a, b: new_b,
+                d_in: d_in, d_out: d_out,
+                rank: model.rank, alpha: adapter.alpha
+            }
+            new_adapters = new_adapters + [updated]
+        } else {
+            new_adapters = new_adapters + [adapter]
+        }
+    }
+
+    // Update router
+    let rw = model.router.w
+    let mut new_rw = mlora_zeros2(model.n_adapters, d_in)
+    for i in 0..model.n_adapters {
+        for j in 0..d_in { new_rw[i][j] = rw[i][j] }
+    }
+    for k in 0..model.top_k {
+        let idx = picks[k]
+        let adapter_out = mlora_adapter_forward(model.adapters[idx], x)
+        let mut contrib = 0.0
+        for d in 0..d_out { contrib = contrib + dy[d] * adapter_out[d] }
+        for j in 0..d_in {
+            new_rw[idx][j] = new_rw[idx][j] - lr * contrib * x[j]
+        }
+    }
+    let new_router = MixLoraRouter { w: new_rw, n_adapters: model.n_adapters, d_in: d_in }
+
+    // Update base weights if not frozen
+    let mut new_base = model.base_w
+    if model.frozen == 0 {
+        new_base = mlora_zeros2(d_out, d_in)
+        for i in 0..d_out {
+            for j in 0..d_in {
+                new_base[i][j] = model.base_w[i][j] - lr * dy[i] * x[j]
+            }
+        }
+    }
+
+    let new_model = MixLoraModel {
+        adapters: new_adapters, router: new_router, base_w: new_base,
+        d_in: d_in, d_out: d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k,
+        frozen: model.frozen
+    }
+    return [new_model, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: Utility functions
+// ═══════════════════════════════════════════════════════════════
+
+// Freeze base weights
+fn mlora_freeze_base(model: MixLoraModel) {
+    return MixLoraModel {
+        adapters: model.adapters, router: model.router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k, frozen: 1
+    }
+}
+
+// Total trainable params: adapters (A + B each) + router
+@pure
+fn mlora_param_count(model: MixLoraModel) {
+    let mut adapter_params = 0
+    for i in 0..model.n_adapters {
+        let a = model.adapters[i]
+        adapter_params = adapter_params + a.rank * a.d_in + a.d_out * a.rank
+    }
+    let router_params = model.n_adapters * model.d_in
+    return adapter_params + router_params
+}
+
+// Merge all adapter deltas into base weights for deployment
+// (only works when d_in == d_out)
+fn mlora_merge_adapters(model: MixLoraModel) {
+    let d = model.d_out
+    let mut merged = mlora_zeros2(d, model.d_in)
+    for i in 0..d {
+        for j in 0..model.d_in { merged[i][j] = model.base_w[i][j] }
+    }
+    let inv_n = 1.0 / to_float(model.n_adapters)
+    for e in 0..model.n_adapters {
+        let adapter = model.adapters[e]
+        let s = mlora_scale(adapter.alpha, adapter.rank)
+        for i in 0..d {
+            for j in 0..model.d_in {
+                let mut val = 0.0
+                for r in 0..adapter.rank {
+                    val = val + adapter.b[i][r] * adapter.a[r][j]
+                }
+                merged[i][j] = merged[i][j] + inv_n * s * val
+            }
+        }
+    }
+    return merged
+}
+
+// Dynamically add a new adapter
+fn mlora_add_adapter(model: MixLoraModel, name, domain, alpha, seed) {
+    let new_adapter = mlora_create_adapter(
+        name, domain, model.d_in, model.d_out, model.rank, alpha, seed
+    )
+    let new_adapters = model.adapters + [new_adapter]
+    let new_n = model.n_adapters + 1
+
+    let mut new_rw = []
+    for i in 0..model.n_adapters { new_rw = new_rw + [model.router.w[i]] }
+    let new_row_mat = mlora_kaiming(1, model.d_in, seed + 31337)
+    new_rw = new_rw + [new_row_mat[0]]
+    let new_router = MixLoraRouter { w: new_rw, n_adapters: new_n, d_in: model.d_in }
+
+    return MixLoraModel {
+        adapters: new_adapters, router: new_router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: new_n, top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+// Remove an adapter by index
+fn mlora_remove_adapter(model: MixLoraModel, adapter_idx) {
+    let mut new_adapters = []
+    let mut new_rw = []
+    for i in 0..model.n_adapters {
+        if i != adapter_idx {
+            new_adapters = new_adapters + [model.adapters[i]]
+            new_rw = new_rw + [model.router.w[i]]
+        }
+    }
+    let new_n = model.n_adapters - 1
+    let new_router = MixLoraRouter { w: new_rw, n_adapters: new_n, d_in: model.d_in }
+
+    return MixLoraModel {
+        adapters: new_adapters, router: new_router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: new_n, top_k: model.top_k, frozen: model.frozen
+    }
+}
+
+// Measure adapter overlap between two inputs
+// Returns fraction of overlap (0.0 = disjoint, 1.0 = identical)
+@pure
+fn mlora_adapter_overlap(model: MixLoraModel, x1, x2) {
+    let logits1 = mlora_router_logits(model.router, x1)
+    let logits2 = mlora_router_logits(model.router, x2)
+    let picks1 = mlora_topk_indices(logits1, model.n_adapters, model.top_k)
+    let picks2 = mlora_topk_indices(logits2, model.n_adapters, model.top_k)
+
+    let mut overlap = 0
+    for i in 0..model.top_k {
+        for j in 0..model.top_k {
+            if picks1[i] == picks2[j] { overlap = overlap + 1 }
+        }
+    }
+    return to_float(overlap) / to_float(model.top_k)
+}
+
+// Set per-adapter alpha scaling factor
+fn mlora_set_alpha(model: MixLoraModel, adapter_idx, new_alpha) {
+    let mut new_adapters = []
+    for i in 0..model.n_adapters {
+        if i == adapter_idx {
+            let a = model.adapters[i]
+            let updated = MixLoraAdapter {
+                name: a.name, domain: a.domain,
+                a: a.a, b: a.b,
+                d_in: a.d_in, d_out: a.d_out,
+                rank: a.rank, alpha: new_alpha
+            }
+            new_adapters = new_adapters + [updated]
+        } else {
+            new_adapters = new_adapters + [model.adapters[i]]
+        }
+    }
+    return MixLoraModel {
+        adapters: new_adapters, router: model.router, base_w: model.base_w,
+        d_in: model.d_in, d_out: model.d_out, rank: model.rank,
+        n_adapters: model.n_adapters, top_k: model.top_k, frozen: model.frozen
+    }
+}
