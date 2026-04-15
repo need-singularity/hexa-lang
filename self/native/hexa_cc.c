@@ -1085,6 +1085,18 @@ HexaVal p_suppress_struct_lit;
 HexaVal p_errors;
 HexaVal p_max_errors;
 
+/* HX-parse-dedup: suppress consecutive identical "Parse error at L:C: msg"
+ * prints. After a sync-stuck loop the same tok/msg would print up to 50 times.
+ * The p_errors record still captures each entry; only user-facing println
+ * is deduped. Reset in parse() and parse_strict() before each invocation. */
+static HexaVal _p_last_parse_err_key = {.tag = TAG_STR, .s = ""};
+static void p_dedup_and_println(HexaVal line, HexaVal col, HexaVal msg) {
+    HexaVal key = hexa_add(hexa_add(hexa_add(hexa_add(hexa_to_string(line), hexa_str(":")), hexa_to_string(col)), hexa_str(":")), msg);
+    if (hexa_truthy(hexa_eq(key, _p_last_parse_err_key))) return;
+    _p_last_parse_err_key = key;
+    hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(line)), hexa_str(":")), hexa_to_string(col)), hexa_str(": ")), msg));
+}
+
 // dedup: static HexaIC __hexa_codegen_c2_ic_0 = {0};
 static HexaIC __hexa_codegen_c2_ic_1 = {0};
 static HexaIC __hexa_codegen_c2_ic_2 = {0};
@@ -1639,7 +1651,7 @@ HexaVal p_expect(HexaVal expected_kind) {
     /* HX-parse-leak-fix: throw at cap to escape runaway recovery. */
     if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(hexa_int(hexa_len(p_errors))); HexaVal __r=(p_max_errors); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); })))) { hexa_throw(hexa_str("too many parse errors")); }
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_30), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_31), msg);
-    hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_32))), hexa_str(":")), hexa_to_string(hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_33))), hexa_str(": ")), msg));
+    p_dedup_and_println(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_32), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_33), msg);
     return tok;
     return hexa_void();
 }
@@ -1655,7 +1667,7 @@ HexaVal p_expect_ident(void) {
     /* HX-parse-leak-fix: throw at cap to escape runaway recovery. */
     if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(hexa_int(hexa_len(p_errors))); HexaVal __r=(p_max_errors); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); })))) { hexa_throw(hexa_str("too many parse errors")); }
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_38), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_39), msg2);
-    hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_40))), hexa_str(":")), hexa_to_string(hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_41))), hexa_str(": ")), msg2));
+    p_dedup_and_println(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_40), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_41), msg2);
     return hexa_str("");
     return hexa_void();
 }
@@ -1729,6 +1741,7 @@ HexaVal parse(HexaVal tokens) {
     p_pending_contract_ens_text = hexa_str("");
     p_errors = hexa_array_new();
     p_max_errors = hexa_int(50);
+    _p_last_parse_err_key = hexa_str("");
     HexaVal stmts = hexa_array_new();
     p_skip_newlines();
     while (hexa_truthy(hexa_bool(!hexa_truthy(p_at_end())))) {
@@ -3388,7 +3401,7 @@ HexaVal parse_primary(void) {
     }
     HexaVal msg3 = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("unexpected token "), hexa_map_get_ic(tok, "kind", &__hexa_codegen_c2_ic_151)), hexa_str(" ('")), hexa_map_get_ic(tok, "value", &__hexa_codegen_c2_ic_152)), hexa_str("')"));
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_153), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_154), msg3);
-    hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_155))), hexa_str(":")), hexa_to_string(hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_156))), hexa_str(": ")), msg3));
+    p_dedup_and_println(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_155), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_156), msg3);
     p_advance();
     return empty_node();
     return hexa_void();
