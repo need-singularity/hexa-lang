@@ -35,6 +35,11 @@
 //   See hexa_cc.c.hexanoport — this .c is permitted because it is a
 //   native shim (extern FFI boundary), not a compilation target.
 
+#ifndef __linux__
+/* hxblas_linux.c — Linux 전용 (Mac 인덱서/빌드 차단) */
+void hxblas_linux_stub_unused(void) {}
+#else
+
 #include <cblas.h>
 #include <math.h>
 #include <stdint.h>
@@ -306,3 +311,5 @@ int64_t hxblas_version(void) {
     // Matches the Mac wrapper ABI version so hexa callers treat them as one.
     return 2;
 }
+
+#endif /* __linux__ */
