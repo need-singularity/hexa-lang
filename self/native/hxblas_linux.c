@@ -35,10 +35,7 @@
 //   See hexa_cc.c.hexanoport — this .c is permitted because it is a
 //   native shim (extern FFI boundary), not a compilation target.
 
-#ifndef __linux__
-/* hxblas_linux.c — Linux 전용 (Mac 인덱서/빌드 차단) */
-void hxblas_linux_stub_unused(void) {}
-#else
+#ifdef __linux__
 
 #include <cblas.h>
 #include <math.h>
