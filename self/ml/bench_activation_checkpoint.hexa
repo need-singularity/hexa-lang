@@ -1,0 +1,409 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/bench_activation_checkpoint.hexa — C10 Activation Checkpointing bench
+//
+//  Purpose: Quantify the compute-vs-memory tradeoff of the existing
+//  activation checkpointing modules across realistic transformer depths
+//  (8, 16, 24, 32 layers — Llama-1B/3B/7B class).
+//
+//  Measures three policies per depth:
+//    - none    : no checkpointing (baseline memory, single forward)
+//    - sqrt(n) : O(√n) checkpoint stride (theoretical optimum)
+//    - every   : checkpoint every layer (max savings, max recompute)
+//
+//  Per-policy metrics:
+//    - forward_ms   : single forward pass wallclock (scaled dim)
+//    - backward_ms  : single backward pass wallclock (with recomputes)
+//    - mem_units    : peak activation memory (checkpoint + segment)
+//    - mem_savings  : fraction saved vs no-checkpoint baseline
+//    - recomputes   : # layers recomputed during backward
+//    - compute_ovh  : extra compute fraction
+//
+//  Strategy:
+//    - Reuses existing activation_checkpointing.hexa API (inlined here
+//      to avoid module loader flakiness in bench harness).
+//    - Uses a shrunken hidden dim (D=64) so each forward is fast but
+//      the per-policy ordering is still informative.
+//    - Prints one JSON line per (depth, policy) + summary.
+//
+//  Run: ./hexa self/ml/bench_activation_checkpoint.hexa
+// ═══════════════════════════════════════════════════════════════
+
+// ── bench knobs ─────────────────────────────────────────────────
+// depths match Llama-1B (8), Llama-3B (16), Llama-7B (32) class.
+// dim is small (32) because the interpreter's clock() has 1-sec
+// display granularity — we amortize many iters into a >=1s window
+// and derive per-op latency from (total_s / n_iters).
+let BENCH_DIM = 32
+let BENCH_DEPTHS = [8, 16, 24, 32]
+let BENCH_ITERS = 3   // initial probe count before clock re-check
+
+// ── inline AC module (copied from self/ml/activation_checkpointing.hexa) ──
+
+fn ac_sqrt_approx(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn ac_floor_int(x) {
+    return to_int(x)
+}
+
+fn ac_create_layer(id, compute_cost, activation_size) {
+    return [id, compute_cost, activation_size, 0, 0]
+}
+
+fn ac_layer_id(layer) { return layer[0] }
+fn ac_layer_cost(layer) { return layer[1] }
+fn ac_layer_actsize(layer) { return layer[2] }
+fn ac_layer_is_ckpt(layer) { return layer[3] }
+fn ac_layer_is_norecompute(layer) { return layer[4] }
+
+fn ac_create_model(layers) {
+    let stats = [0, 0.0, 0, 0]
+    return [layers, stats]
+}
+
+fn ac_model_layers(model) { return model[0] }
+fn ac_model_stats(model) { return model[1] }
+fn ac_model_num_layers(model) { return len(ac_model_layers(model)) }
+
+fn ac_apply_segment_policy(model, segment_size) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut seg = segment_size
+    if seg < 1 { seg = 1 }
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        let mut is_ckpt = 0
+        if i % seg == 0 { is_ckpt = 1 }
+        if i == n - 1 { is_ckpt = 1 }
+        new_layers = new_layers + [[l[0], l[1], l[2], is_ckpt, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_apply_sqrt_policy(model) {
+    let n = ac_model_num_layers(model)
+    let seg = ac_floor_int(ac_sqrt_approx(to_float(n)))
+    let mut final_seg = seg
+    if final_seg < 1 { final_seg = 1 }
+    return ac_apply_segment_policy(model, final_seg)
+}
+
+fn ac_apply_every_layer_policy(model) {
+    return ac_apply_segment_policy(model, 1)
+}
+
+fn ac_clear_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut new_layers = []
+    for i in 0..n {
+        let l = layers[i]
+        new_layers = new_layers + [[l[0], l[1], l[2], 0, l[4]]]
+    }
+    return [new_layers, ac_model_stats(model)]
+}
+
+fn ac_apply_none_policy(model) {
+    return ac_clear_checkpoints(model)
+}
+
+fn ac_estimate_memory_no_ckpt(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(ac_layer_actsize(layers[i]))
+    }
+    return total
+}
+
+fn ac_estimate_memory(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    if n == 0 { return 0.0 }
+
+    let mut has_ckpt = false
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { has_ckpt = true }
+    }
+    if !has_ckpt { return ac_estimate_memory_no_ckpt(model) }
+
+    let mut ckpt_mem = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            ckpt_mem = ckpt_mem + to_float(ac_layer_actsize(layers[i]))
+        }
+    }
+
+    let mut max_seg = 0.0
+    let mut cur_seg = 0.0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 {
+            if cur_seg > max_seg { max_seg = cur_seg }
+            cur_seg = 0.0
+        } else {
+            if ac_layer_is_norecompute(layers[i]) == 0 {
+                cur_seg = cur_seg + to_float(ac_layer_actsize(layers[i]))
+            }
+        }
+    }
+    if cur_seg > max_seg { max_seg = cur_seg }
+
+    return ckpt_mem + max_seg
+}
+
+fn ac_forward_pass(model, input) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current = input
+    let mut stored = []
+
+    for i in 0..n {
+        let l = layers[i]
+        let cost = to_float(ac_layer_cost(l))
+        let mut next = []
+        let dim = len(current)
+        for d in 0..dim {
+            next = next + [current[d] * (1.0 + cost / 100.0)]
+        }
+        current = next
+        if ac_layer_is_ckpt(l) == 1 {
+            stored = stored + [[i, current]]
+        }
+    }
+    return [current, stored]
+}
+
+fn ac_backward_pass(model, grad) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut current_grad = grad
+    let mut recompute_count = 0
+
+    for idx in 0..n {
+        let i = n - 1 - idx
+        let l = layers[i]
+        if ac_layer_is_ckpt(l) == 0 {
+            if ac_layer_is_norecompute(l) == 0 {
+                recompute_count = recompute_count + 1
+                // simulate recompute work: one extra forward op
+                let cost = to_float(ac_layer_cost(l))
+                let dim = len(current_grad)
+                let mut tmp = []
+                for d in 0..dim {
+                    tmp = tmp + [current_grad[d] * (1.0 + cost / 100.0)]
+                }
+                current_grad = tmp
+            }
+        }
+        let cost2 = to_float(ac_layer_cost(l))
+        let dim2 = len(current_grad)
+        let mut next_grad = []
+        for d in 0..dim2 {
+            next_grad = next_grad + [current_grad[d] * (1.0 + cost2 / 100.0)]
+        }
+        current_grad = next_grad
+    }
+    return [current_grad, recompute_count]
+}
+
+// ── bench helpers ───────────────────────────────────────────────
+
+fn build_uniform_model(n_layers, dim) {
+    let mut layers = []
+    for i in 0..n_layers {
+        // compute_cost ≈ 10 (flat), activation_size ≈ dim
+        layers = layers + [ac_create_layer(i, 10, dim)]
+    }
+    return ac_create_model(layers)
+}
+
+fn make_input(dim) {
+    let mut v = []
+    for i in 0..dim {
+        v = v + [to_float(i % 7) * 0.125 + 0.3]
+    }
+    return v
+}
+
+fn make_grad(dim) {
+    let mut v = []
+    for _i in 0..dim { v = v + [1.0] }
+    return v
+}
+
+fn count_checkpoints(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut c = 0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 1 { c = c + 1 }
+    }
+    return c
+}
+
+fn count_recomputes(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut c = 0
+    for i in 0..n {
+        if ac_layer_is_ckpt(layers[i]) == 0 {
+            if ac_layer_is_norecompute(layers[i]) == 0 { c = c + 1 }
+        }
+    }
+    return c
+}
+
+fn compute_overhead(model) {
+    let layers = ac_model_layers(model)
+    let n = len(layers)
+    let mut total = 0.0
+    let mut extra = 0.0
+    for i in 0..n {
+        let c = to_float(ac_layer_cost(layers[i]))
+        total = total + c
+        if ac_layer_is_ckpt(layers[i]) == 0 {
+            if ac_layer_is_norecompute(layers[i]) == 0 { extra = extra + c }
+        }
+    }
+    if total <= 0.0 { return 0.0 }
+    return extra / total
+}
+
+// ── measurement ─────────────────────────────────────────────────
+// Run a fixed amortized count so total wallclock >= few seconds,
+// then derive per-op latency. `clock()` has whole-second display
+// resolution in the interpreter; scaling to 1000s of iters
+// guarantees we cross several second boundaries.
+
+let FWD_COUNT = 200
+let BWD_COUNT = 100
+
+fn measure_forward(model, input) {
+    // warm-up
+    let _w = ac_forward_pass(model, input)
+    let t0 = clock()
+    let mut n = 0
+    while n < FWD_COUNT {
+        let _out = ac_forward_pass(model, input)
+        n = n + 1
+    }
+    let t1 = clock()
+    let total_s = t1 - t0
+    return total_s / to_float(FWD_COUNT)
+}
+
+fn measure_backward(model, grad) {
+    let _w = ac_backward_pass(model, grad)
+    let t0 = clock()
+    let mut n = 0
+    while n < BWD_COUNT {
+        let _out = ac_backward_pass(model, grad)
+        n = n + 1
+    }
+    let t1 = clock()
+    let total_s = t1 - t0
+    return total_s / to_float(BWD_COUNT)
+}
+
+// ── per-depth bench ─────────────────────────────────────────────
+
+fn bench_depth(depth) {
+    let base = build_uniform_model(depth, BENCH_DIM)
+    let input = make_input(BENCH_DIM)
+    let grad = make_grad(BENCH_DIM)
+    let mem_baseline = ac_estimate_memory_no_ckpt(base)
+
+    let policies = ["none", "sqrt", "every"]
+    let mut pi = 0
+    while pi < 3 {
+        let policy = policies[pi]
+        let mut m = base
+        if policy == "none" { m = ac_apply_none_policy(base) }
+        if policy == "sqrt" { m = ac_apply_sqrt_policy(base) }
+        if policy == "every" { m = ac_apply_every_layer_policy(base) }
+
+        let fwd_s = measure_forward(m, input)
+        let bwd_s = measure_backward(m, grad)
+        let mem = ac_estimate_memory(m)
+        let mut savings = 0.0
+        if mem_baseline > 0.0 { savings = (mem_baseline - mem) / mem_baseline }
+        let n_ckpt = count_checkpoints(m)
+        let n_recomp = count_recomputes(m)
+        let ovh = compute_overhead(m)
+
+        println("{\"bench\":\"C10_activation_checkpoint\",\"depth\":" + str(depth)
+            + ",\"dim\":" + str(BENCH_DIM)
+            + ",\"policy\":\"" + policy + "\""
+            + ",\"forward_ms\":" + str(fwd_s * 1000.0)
+            + ",\"backward_ms\":" + str(bwd_s * 1000.0)
+            + ",\"mem_units\":" + str(mem)
+            + ",\"mem_baseline\":" + str(mem_baseline)
+            + ",\"mem_savings\":" + str(savings)
+            + ",\"checkpoints\":" + str(n_ckpt)
+            + ",\"recomputes\":" + str(n_recomp)
+            + ",\"compute_overhead\":" + str(ovh)
+            + ",\"iters\":" + str(BENCH_ITERS) + "}")
+
+        pi = pi + 1
+    }
+}
+
+// ── main ─────────────────────────────────────────────────────────
+
+println("=== C10 Activation Checkpointing Bench ===")
+println("dim=" + str(BENCH_DIM) + " depths=" + str(BENCH_DEPTHS) + " iters=" + str(BENCH_ITERS))
+println("")
+
+let mut di = 0
+while di < len(BENCH_DEPTHS) {
+    let d = BENCH_DEPTHS[di]
+    println("--- depth=" + str(d) + " ---")
+    bench_depth(d)
+    println("")
+    di = di + 1
+}
+
+// ── 32-layer summary table (Llama-7B style) ─────────────────────
+println("=== summary (depth=32) ===")
+let L = 32
+let b32 = build_uniform_model(L, BENCH_DIM)
+let in32 = make_input(BENCH_DIM)
+let gr32 = make_grad(BENCH_DIM)
+let base_mem = ac_estimate_memory_no_ckpt(b32)
+
+let m_none = ac_apply_none_policy(b32)
+let m_sqrt = ac_apply_sqrt_policy(b32)
+let m_every = ac_apply_every_layer_policy(b32)
+
+let f_none = measure_forward(m_none, in32)
+let f_sqrt = measure_forward(m_sqrt, in32)
+let f_every = measure_forward(m_every, in32)
+let bw_none = measure_backward(m_none, gr32)
+let bw_sqrt = measure_backward(m_sqrt, gr32)
+let bw_every = measure_backward(m_every, gr32)
+
+let mem_none = ac_estimate_memory(m_none)
+let mem_sqrt = ac_estimate_memory(m_sqrt)
+let mem_every = ac_estimate_memory(m_every)
+
+println("policy  forward_ms   backward_ms  mem_units  savings   recomp  ckpts")
+println("none    " + str(f_none * 1000.0) + "  " + str(bw_none * 1000.0)
+    + "  " + str(mem_none) + "  " + str((base_mem - mem_none) / base_mem)
+    + "  " + str(count_recomputes(m_none)) + "  " + str(count_checkpoints(m_none)))
+println("sqrt    " + str(f_sqrt * 1000.0) + "  " + str(bw_sqrt * 1000.0)
+    + "  " + str(mem_sqrt) + "  " + str((base_mem - mem_sqrt) / base_mem)
+    + "  " + str(count_recomputes(m_sqrt)) + "  " + str(count_checkpoints(m_sqrt)))
+println("every   " + str(f_every * 1000.0) + "  " + str(bw_every * 1000.0)
+    + "  " + str(mem_every) + "  " + str((base_mem - mem_every) / base_mem)
+    + "  " + str(count_recomputes(m_every)) + "  " + str(count_checkpoints(m_every)))
+println("")
+println("=== C10 bench DONE ===")
