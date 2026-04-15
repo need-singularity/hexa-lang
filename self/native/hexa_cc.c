@@ -1001,6 +1001,7 @@ HexaVal p_peek(void);
 HexaVal p_at_end(void);
 HexaVal p_advance(void);
 HexaVal parse_stmt(void);
+HexaVal parse_visibility(void);  /* HX-pub-prefix: fwd decl for parse_stmt */
 HexaVal parse_let(void);
 HexaVal parse_const(void);
 HexaVal parse_static(void);
@@ -1804,6 +1805,11 @@ HexaVal parse_stmt(void) {
     HexaVal op_tok = hexa_void();
     HexaVal op_str = hexa_void();
     p_skip_newlines();
+    /* HX-pub-prefix: absorb `pub` visibility marker. Codegen ignores
+     * visibility; just consume so stage0 can load self/parser.hexa cleanly. */
+    if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Pub")))) {
+        parse_visibility();
+    }
     while (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("At")))) {
         p_advance();
         HexaVal next_tok = p_peek();
