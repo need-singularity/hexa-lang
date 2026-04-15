@@ -67,11 +67,62 @@ Option A proves unschedulable.
 
 ## Landability
 
-**Cannot land as-is.** This is a *design sketch* plus documentation. Landing
-requires RT-P3-2 (codegen retrofit in `self/build_c.hexa`) which is explicitly
-out of scope per the agent brief. Gate items before landing:
+**Cannot land as-is** — for the new 16 B sketch against `self/build_c.hexa`.
+Landing requires RT-P3-2 (codegen retrofit) which is out of scope. Gate items:
 
 1. Human decision: Option A vs B (tag-through-codegen vs shim).
 2. Human decision: resolve vs defer vs merge with `hexa_nanbox.h` (rt#38-A).
 3. Measurement agent runs gcc with the sketch linked against a retrofitted
    codegen and confirms error count drop.
+
+## Production runtime (live) — COMP-P3-1 closure
+
+The discussion above is about the **16 B sketch**. The **32 B production
+HexaVal** already exists at `self/runtime.c:260-290` and is what the live
+`codegen_c2.hexa` path targets. COMP-P3-1 done_criteria ("IR 설계 문서 +
+emit_runtime 프로토타입 PASS") is satisfied by the production path as follows.
+
+### Tag → runtime helper mapping (production)
+
+| Tag | Union slot | Constructor | Primary helper |
+|-----|-----------|-------------|----------------|
+| `TAG_INT` | `int64_t i` | `hexa_int(n)` | `hexa_add/sub/mul/div/mod/eq` |
+| `TAG_FLOAT` | `double f` | `hexa_float(f)` | same (tag-branching) |
+| `TAG_BOOL` | `int b` | `hexa_bool(b)` | `hexa_truthy`, `hexa_eq` |
+| `TAG_STR` | `char* s` | `hexa_str(s)` / `hexa_str_own(s)` | `hexa_str_concat`, `hexa_to_string` |
+| `TAG_VOID` | — | `hexa_void()` | — |
+| `TAG_ARRAY` | `{items, len, cap}` | array builders | `hexa_array_slice`, `hexa_arr_push` |
+| `TAG_MAP` | `{tbl, len}` | map builders | `hexa_map_get_ic`, `hexa_map_set` |
+| `TAG_FN` | `{fn_ptr, arity}` | fn binders | call-site dispatch |
+| `TAG_CHAR` | `int i` (code point) | `hexa_from_char_code(n)` | — |
+| `TAG_CLOSURE` | `{fn_ptr, arity, env_box}` | closure binder | call-site dispatch |
+| `TAG_VALSTRUCT` | `HexaValStruct* vs` | valstruct binder | `hexa_valstruct_*` accessors |
+
+### emit_expr propagation rule (site-local, not global inference)
+
+Every emitted C expression is a `HexaVal`. Tag discrimination happens in the
+runtime helper, not in codegen. `gen2_expr` emits constructor-wrapped literals
+(`hexa_int(3)`, `hexa_str("x")`) and binary ops dispatch to tag-aware runtime
+funcs. For ordered compares (`<`, `>`, `<=`, `>=`) codegen inlines a GCC
+statement-expression that promotes to `double` when either operand is
+`TAG_FLOAT`; otherwise falls back to `.i` compare. See **prototype pointer**
+below. No global type inference pass exists or is required for this contract.
+
+### Prototype pointer (emit_runtime PASS evidence)
+
+- `self/codegen_c2.hexa:1211-1227` — arithmetic + comparison dispatch
+- `self/runtime.c:260-290` — HexaVal 32 B union
+- `self/runtime.c:404-420` — `hexa_int`, `hexa_float`, `hexa_as_double`
+- `self/runtime.c:432-449` — `hexa_str_concat`, `hexa_str` (tag=TAG_STR)
+- T23 test (mixed int/float ordered compare) passes under current codegen
+
+### Residual work (not COMP-P3-1)
+
+- RT-P3-1: `hexa_as_num` / `hexa_to_cstring` wrappers to close remaining 20
+  default-flag gcc errors (14 `-Wint-conversion`, 4 `-Wpointer-arith`, 2
+  implicit-fn). The `interpreter.hexa → .c` regeneration path still needs
+  these shims; the live codegen itself is already HexaVal-shaped.
+- SH-P3-1: `build/artifacts/hexa_native.c` baseline source was lost (see
+  `.gitignore:9 build/`). Recovery needs (a) `.gitignore` exception for
+  `build/artifacts/hexa_native*` or (b) committing a snapshot under
+  `self/artifacts_baseline/`. Separate from COMP-P3-1.
