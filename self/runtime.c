@@ -3351,6 +3351,15 @@ HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
 HexaVal hexa_from_char_code(HexaVal n);
 static HexaVal chr = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_from_char_code, .arity = 1}};
 
+// `bit_or(x, y)` — shim kept because `|` as binary op conflicts with lambda
+// param delimiters `|x| x+1`. `&` and `^` are supported by parser directly.
+HexaVal _hx_bit_or(HexaVal a, HexaVal b) {
+    int64_t x = (a.tag == TAG_INT) ? a.i : (int64_t)a.f;
+    int64_t y = (b.tag == TAG_INT) ? b.i : (int64_t)b.f;
+    return hexa_int(x | y);
+}
+static HexaVal bit_or = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)_hx_bit_or, .arity = 2}};
+
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (s.tag != TAG_STR) return hexa_int(0);
