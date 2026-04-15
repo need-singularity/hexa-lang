@@ -1,0 +1,166 @@
+// ═══════════════════════════════════════════════════════════
+//  test_quantize.hexa — Verify ai_native/quantize.hexa (ROI #75)
+//
+//  Generates pseudo-Gaussian fp32 weights, runs int8 and int4
+//  quantize → dequantize, and checks L2 relative error.
+//
+//  Thresholds are MEASURED, not theoretical (see MEMORY
+//  feedback_phantom_constants_audit.md):
+//
+//      int8  : err < 0.01   (matches CLAUDE spec; measured ≈ 0.008)
+//      int4  : err < 0.11   (measured floor at group=32 ≈ 0.097;
+//                            symmetric 15-level quant on Gaussian
+//                            is mathematically bounded away from
+//                            3% — see ai_native/quantize.hexa
+//                            comment block)
+//
+//  Also checks shape preservation, range constraints, and the
+//  round-trip identity on zero tensors.
+// ═══════════════════════════════════════════════════════════
+
+use "ai_native/quantize"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ── Gaussian-ish weight generator ──────────────────────────
+// We approximate a standard Normal by averaging 12 uniforms on
+// [-0.5, 0.5] (classic CLT trick — mean 0, variance 1). Zero
+// external deps, fully deterministic once `random()` is seeded.
+fn gen_gaussian(n) {
+    let mut w = []
+    let mut i = 0
+    while i < n {
+        let mut s = 0.0
+        let mut k = 0
+        while k < 12 {
+            s = s + (random() - 0.5)
+            k = k + 1
+        }
+        w = w.push(s)
+        i = i + 1
+    }
+    return w
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  HEXA AI-Native Quantization Tests (ROI #75)")
+println("═══════════════════════════════════════════════════════")
+println("")
+
+// ── 1. Sanity — helpers ─────────────────────────────────────
+println("--- helpers ---")
+check("q_abs(-3.5) == 3.5", q_abs(0.0 - 3.5) == 3.5)
+check("q_abs(2.0) == 2.0", q_abs(2.0) == 2.0)
+check("q_clamp_int low", q_clamp_int(0 - 200, 0 - 127, 127) == 0 - 127)
+check("q_clamp_int high", q_clamp_int(200, 0 - 127, 127) == 127)
+check("q_clamp_int mid", q_clamp_int(42, 0 - 127, 127) == 42)
+check("q_round(2.6) == 3", q_round(2.6) == 3)
+check("q_round(-2.6) == -3", q_round(0.0 - 2.6) == 0 - 3)
+check("q_absmax empty == 0", q_absmax([]) == 0.0)
+
+// ── 2. int8 round-trip ──────────────────────────────────────
+println("")
+println("--- int8 round-trip ---")
+let n = 1024
+let w = gen_gaussian(n)
+let q8 = quantize_int8(w)
+let w8 = dequantize_int8(q8)
+let err8 = q_l2_rel_err(w, w8)
+println("  int8 L2 rel err = " + to_string(err8))
+check("int8 shape preserved", len(w8) == n)
+check("int8 q-vals count matches", len(q8[0]) == n)
+check("int8 L2 err < 0.01", err8 < 0.01)
+
+// Every q-val must sit in the signed-int8 range.
+let mut in_range8 = true
+let mut qi = 0
+while qi < n {
+    let v = q8[0][qi]
+    if v < 0 - 127 { in_range8 = false }
+    if v > 127 { in_range8 = false }
+    qi = qi + 1
+}
+check("int8 all q in [-127,127]", in_range8)
+
+// ── 3. int4 round-trip ──────────────────────────────────────
+println("")
+println("--- int4 round-trip ---")
+let group_size = 32
+let q4 = quantize_int4(w, group_size)
+let w4 = dequantize_int4(q4)
+let err4 = q_l2_rel_err(w, w4)
+println("  int4 L2 rel err = " + to_string(err4))
+check("int4 shape preserved", len(w4) == n)
+check("int4 q-vals count matches", len(q4[0]) == n)
+let expected_groups = n / group_size
+check("int4 scales count == ceil(n/g)", len(q4[1]) == expected_groups)
+
+let mut in_range4 = true
+let mut qj = 0
+while qj < n {
+    let v = q4[0][qj]
+    if v < 0 - 8 { in_range4 = false }
+    if v > 7 { in_range4 = false }
+    qj = qj + 1
+}
+check("int4 all q in [-8,7]", in_range4)
+// Measured floor for symmetric int4 per-group (group=32) on Gaussian
+// is ~0.097 — cannot beat Lloyd-Max theoretical bound at 15 codes.
+check("int4 L2 err < 0.11", err4 < 0.11)
+
+// ── 4. Cross-check — int8 should be strictly better ─────────
+println("")
+println("--- precision ordering ---")
+check("int8 err <= int4 err", err8 <= err4)
+
+// ── 5. Edge case — zero tensor ──────────────────────────────
+println("")
+println("--- zero tensor ---")
+let mut zeros = []
+let mut zi = 0
+while zi < 64 {
+    zeros = zeros.push(0.0)
+    zi = zi + 1
+}
+let qz8 = quantize_int8(zeros)
+let rz8 = dequantize_int8(qz8)
+let errz8 = q_l2_rel_err(zeros, rz8)
+check("zero tensor int8 err == 0", errz8 == 0.0)
+check("zero tensor int8 shape", len(rz8) == 64)
+
+let qz4 = quantize_int4(zeros, 16)
+let rz4 = dequantize_int4(qz4)
+let errz4 = q_l2_rel_err(zeros, rz4)
+check("zero tensor int4 err == 0", errz4 == 0.0)
+
+// ── 6. Generic dispatcher ───────────────────────────────────
+println("")
+println("--- dequantize() dispatch ---")
+let dq8 = dequantize(q8)
+let dq4 = dequantize(q4)
+check("dispatch int8 matches", len(dq8) == n)
+check("dispatch int4 matches", len(dq4) == n)
+check("dispatch int8 err ok", q_l2_rel_err(w, dq8) < 0.01)
+check("dispatch int4 err ok", q_l2_rel_err(w, dq4) < 0.11)
+
+// ── Summary ─────────────────────────────────────────────────
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
+if fail_count == 0 {
+    println("  ALL QUANTIZE TESTS PASSED — ROI #75 completed_at: 2026-04-16")
+} else {
+    println("  QUANTIZE TESTS FAILED")
+}
+println("═══════════════════════════════════════════════════════")

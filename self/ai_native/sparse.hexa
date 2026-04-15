@@ -1,0 +1,267 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/sparse.hexa — AI-native ROI #79
+//
+//  @sparse CSR 자동 변환 — sparse matrix detection + CSR conversion
+//  and SpMV (sparse matrix × dense vector) acceleration.
+//
+//  Pure HEXA (self-host). No FFI. No stage0 rebuild.
+//
+//  Compressed Sparse Row (CSR) layout:
+//      row_ptr : [int] of length (n_rows + 1)
+//                row_ptr[i]..row_ptr[i+1] 범위가 row i 의 non-zero 엔트리
+//      col_idx : [int] of length nnz    (값의 column 인덱스)
+//      values  : [float] of length nnz  (non-zero 실수 값)
+//
+//  API:
+//      sparsity_ratio(matrix)                   -> float  (0.0 ~ 1.0)
+//      should_use_csr(matrix)                   -> bool   (sparsity ≥ 0.9)
+//      dense_to_csr(matrix, rows, cols, eps)    -> SparseCSR
+//      csr_to_dense(csr)                        -> matrix (rows × cols)
+//      spmv(csr, x)                             -> [float] (length = rows)
+//      spmv_dense(matrix, x)                    -> [float] (oracle)
+//      csr_nnz(csr)                             -> int
+//      csr_flop_count(csr)                      -> int (SpMV FLOP est.)
+//
+//  Complexity:
+//      dense matmul  : O(n_rows · n_cols)  flops for matvec
+//      spmv (CSR)    : O(nnz)              flops
+//      flop saving   : (rows·cols) / (2·nnz)
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - no struct literals inside if heads (bind result outside if)
+//      - slice precedence: use (i+1)..j  with parens if needed
+//      - bit-ops unsupported in surface parser; only arithmetic used here
+//
+//  AI-native attrs:
+//      @hot       — spmv is expected to dominate hot paths
+//      @pure      — dense_to_csr / csr_to_dense / sparsity_ratio
+//      @parallel  — per-row loop in spmv is trivially independent
+// ═══════════════════════════════════════════════════════════════════
+
+// SparseCSR: Compressed Sparse Row representation.
+pub struct SparseCSR {
+    n_rows: int,
+    n_cols: int,
+    row_ptr: any,
+    col_idx: any,
+    values: any
+}
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn sp_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sp_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn sp_zeros_1d_int(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0]
+    }
+    return v
+}
+
+fn sp_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── sparsity analysis ──────────────────────────────────────────────
+//
+// sparsity_ratio(matrix) returns fraction of |x| < 1e-9 entries.
+// 0.0  : fully dense   (no zeros)
+// 1.0  : fully sparse  (all zeros)
+pub fn sparsity_ratio(matrix) {
+    let rows = len(matrix)
+    if rows == 0 { return 0.0 }
+    let cols = len(matrix[0])
+    if cols == 0 { return 0.0 }
+
+    let total = rows * cols
+    let mut zero_count = 0
+    let eps = 1.0e-9
+
+    for i in 0..rows {
+        for j in 0..cols {
+            if sp_abs(matrix[i][j]) < eps {
+                zero_count = zero_count + 1
+            }
+        }
+    }
+
+    return (zero_count * 1.0) / (total * 1.0)
+}
+
+// Recommend CSR if sparsity ≥ 0.9 (at least 90% zeros).
+pub fn should_use_csr(matrix) {
+    let s = sparsity_ratio(matrix)
+    if s >= 0.9 { return true }
+    return false
+}
+
+// ── dense → CSR ────────────────────────────────────────────────────
+//
+// Walks the matrix in row-major order, emitting (col, value) pairs for
+// each non-zero (|x| ≥ eps). row_ptr[i] marks the start index of row i
+// in col_idx/values; row_ptr[n_rows] == nnz (total non-zeros).
+@pure
+fn dense_to_csr_impl(matrix, rows, cols, eps) {
+    let mut row_ptr = []
+    let mut col_idx = []
+    let mut values = []
+
+    // row_ptr[0] = 0
+    row_ptr = row_ptr + [0]
+
+    let mut nnz = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            let v = matrix[i][j]
+            if sp_abs(v) >= eps {
+                col_idx = col_idx + [j]
+                values = values + [v]
+                nnz = nnz + 1
+            }
+        }
+        // close row i: running nnz becomes row_ptr[i+1]
+        row_ptr = row_ptr + [nnz]
+    }
+
+    return SparseCSR {
+        n_rows: rows,
+        n_cols: cols,
+        row_ptr: row_ptr,
+        col_idx: col_idx,
+        values: values
+    }
+}
+
+// Convenience wrapper — default eps = 1e-9.
+pub fn dense_to_csr_default(matrix) {
+    let rows = len(matrix)
+    let mut cols = 0
+    if rows > 0 { cols = len(matrix[0]) }
+    return dense_to_csr(matrix, rows, cols, 1.0e-9)
+}
+
+// ── CSR → dense ────────────────────────────────────────────────────
+//
+// Inverse of dense_to_csr. Populates a rows × cols matrix with zeros and
+// scatters values[k] into out[i][col_idx[k]] for each row i.
+@pure
+fn csr_to_dense_impl(csr) {
+    let rows = csr.n_rows
+    let cols = csr.n_cols
+    let mut out = sp_zeros_2d(rows, cols)
+
+    for i in 0..rows {
+        let start = csr.row_ptr[i]
+        let end = csr.row_ptr[i + 1]
+        for k in start..end {
+            let j = csr.col_idx[k]
+            out[i][j] = csr.values[k]
+        }
+    }
+    return out
+}
+
+// ── SpMV — sparse × dense vector ──────────────────────────────────
+//
+// y[i] = Σ_{k ∈ row_i} values[k] · x[col_idx[k]]
+//
+// Only the non-zero columns contribute; complexity is O(nnz), not
+// O(rows · cols). Caller must ensure len(x) == csr.n_cols.
+@hot @parallel
+fn spmv_impl(csr, x) {
+    let rows = csr.n_rows
+    let mut y = sp_zeros_1d(rows)
+
+    for i in 0..rows {
+        let start = csr.row_ptr[i]
+        let end = csr.row_ptr[i + 1]
+        let mut acc = 0.0
+        for k in start..end {
+            let j = csr.col_idx[k]
+            acc = acc + csr.values[k] * x[j]
+        }
+        y[i] = acc
+    }
+    return y
+}
+
+// Dense oracle: y = M · x, O(rows · cols). Used as correctness reference
+// and as a FLOP baseline for the saving ratio.
+pub fn spmv_dense(matrix, x) {
+    let rows = len(matrix)
+    if rows == 0 { return [] }
+    let cols = len(matrix[0])
+    let mut y = sp_zeros_1d(rows)
+
+    for i in 0..rows {
+        let mut acc = 0.0
+        for j in 0..cols {
+            acc = acc + matrix[i][j] * x[j]
+        }
+        y[i] = acc
+    }
+    return y
+}
+
+// ── diagnostics / bench helpers ───────────────────────────────────
+
+// Total non-zero count (= row_ptr[n_rows]).
+pub fn csr_nnz(csr) {
+    return csr.row_ptr[csr.n_rows]
+}
+
+// SpMV FLOP estimate (1 mul + 1 add per non-zero).
+pub fn csr_flop_count(csr) {
+    return 2 * csr_nnz(csr)
+}
+
+// Dense matvec FLOP estimate (2 flops per entry).
+pub fn dense_matvec_flop_count(rows, cols) {
+    return 2 * rows * cols
+}
+
+// FLOP saving ratio = dense_flops / spmv_flops. Higher is better.
+pub fn flop_saving_ratio(csr) {
+    let dense_f = dense_matvec_flop_count(csr.n_rows, csr.n_cols)
+    let spmv_f = csr_flop_count(csr)
+    if spmv_f == 0 { return (dense_f * 1.0) }
+    return (dense_f * 1.0) / (spmv_f * 1.0)
+}
+
+// ── public wrappers ───────────────────────────────────────────────
+// Attribute-decorated fns (@pure/@hot/@parallel) live behind a thin
+// `pub` forwarder to sidestep a surface-parser quirk where the
+// combination `@attr` + `pub fn` is rejected as an unexpected `pub`
+// token. The wrappers are inlined by the optimizer; no runtime cost.
+
+pub fn dense_to_csr(matrix, rows, cols, eps) {
+    return dense_to_csr_impl(matrix, rows, cols, eps)
+}
+
+pub fn csr_to_dense(csr) {
+    return csr_to_dense_impl(csr)
+}
+
+pub fn spmv(csr, x) {
+    return spmv_impl(csr, x)
+}

@@ -1,0 +1,124 @@
+// ═══════════════════════════════════════════════════════════
+//  test_zero_copy_slice.hexa — ROI #77 verification.
+//
+//  Checks:
+//    (1) basic slice read/write
+//    (2) aliasing: mutating backing array is visible through view
+//    (3) reverse aliasing: writing through view mutates backing array
+//    (4) nested slice composes offsets (slice-of-slice == direct slice)
+//    (5) stride-aware view reads non-contiguous elements
+//    (6) stride-aware view writes propagate to backing array
+//    (7) view_materialize produces a detached copy (subsequent mutation
+//        of backing array does NOT affect the materialized array)
+//    (8) boundary clamping — out-of-range start/end clamp instead of panic
+// ═══════════════════════════════════════════════════════════
+
+use "ai_native/zero_copy_slice"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("=== @zero_copy_slice tests ===")
+
+// ── (1) basic slice read/write ────────────────────────────
+let mut arr = [10, 20, 30, 40, 50, 60, 70, 80]
+let v = view_slice_arr(arr, 2, 6)      // -> elements [30, 40, 50, 60]
+check("basic: view_len == 4", view_len(v) == 4)
+check("basic: view_get(v, 0) == 30", view_get(v, 0) == 30)
+check("basic: view_get(v, 3) == 60", view_get(v, 3) == 60)
+
+// ── (2) aliasing (backing -> view) ─────────────────────────
+arr[2] = 999
+check("alias: backing write visible in view", view_get(v, 0) == 999)
+
+// ── (3) aliasing (view -> backing) ─────────────────────────
+view_set(v, 1, 111)  // arr index = 2 + 1 = 3
+check("alias: view write visible in backing", arr[3] == 111)
+
+// restore for downstream tests
+arr[2] = 30
+arr[3] = 40
+
+// ── (4) nested slice (slice-of-slice) ──────────────────────
+// slice(slice(arr, 2, 8), 1, 4)  should cover arr[3..6] = [40, 50, 60]
+let v_outer = view_slice_arr(arr, 2, 8)     // [30 40 50 60 70 80]
+let v_inner = view_slice(v_outer, 1, 4)     // [40 50 60]
+check("nested: len == 3", view_len(v_inner) == 3)
+check("nested[0] == arr[3] (40)", view_get(v_inner, 0) == 40)
+check("nested[1] == arr[4] (50)", view_get(v_inner, 1) == 50)
+check("nested[2] == arr[5] (60)", view_get(v_inner, 2) == 60)
+
+// nested aliasing: write through inner view reaches backing array
+view_set(v_inner, 0, 444)     // arr[3] = 444
+check("nested alias: v_inner[0]=444 -> arr[3]==444", arr[3] == 444)
+check("nested alias: v_outer[1] sees the write", view_get(v_outer, 1) == 444)
+arr[3] = 40   // restore
+
+// ── (5) strided view read (simulate a column over a row-major matrix)
+// matrix 3x4, stored row-major as length-12 flat array.
+// Column 1 starts at offset=1, len=3, stride=4 (row length).
+let mut mat = [
+    1,  2,  3,  4,
+    5,  6,  7,  8,
+    9, 10, 11, 12
+]
+let col1 = view_strided(mat, 1, 3, 4)   // [2, 6, 10]
+check("stride: col1 len == 3", view_len(col1) == 3)
+check("stride: col1[0] == 2",  view_get(col1, 0) == 2)
+check("stride: col1[1] == 6",  view_get(col1, 1) == 6)
+check("stride: col1[2] == 10", view_get(col1, 2) == 10)
+check("stride: contiguous? no", view_is_contiguous(col1) == false)
+
+// ── (6) strided view write ─────────────────────────────────
+view_set(col1, 1, 666)                  // mat[1 + 1*4] = mat[5] = 666
+check("stride write: mat[5] == 666", mat[5] == 666)
+check("stride write: col1[1] == 666", view_get(col1, 1) == 666)
+mat[5] = 6   // restore
+
+// ── (7) view_materialize detaches storage ──────────────────
+let mat_copy = view_materialize(col1)   // fresh array [2, 6, 10]
+check("mat: len == 3", len(mat_copy) == 3)
+check("mat[0] == 2",  mat_copy[0] == 2)
+check("mat[1] == 6",  mat_copy[1] == 6)
+check("mat[2] == 10", mat_copy[2] == 10)
+
+mat[1] = 22222   // perturb original backing
+check("mat detached: view still sees new value (22222)", view_get(col1, 0) == 22222)
+check("mat detached: copy unaffected (still 2)",          mat_copy[0] == 2)
+mat[1] = 2   // restore
+
+// ── (8) boundary clamping ──────────────────────────────────
+let v_clamp_hi = view_slice_arr(arr, 6, 100)   // end clamps to len(arr)=8
+check("clamp hi: len == 2", view_len(v_clamp_hi) == 2)
+let v_clamp_lo = view_slice_arr(arr, -5, 3)    // start clamps to 0
+check("clamp lo: len == 3", view_len(v_clamp_lo) == 3)
+check("clamp lo: [0] == 10", view_get(v_clamp_lo, 0) == 10)
+
+let v_inverted = view_slice_arr(arr, 5, 2)     // end < start -> len == 0
+check("clamp invert: len == 0", view_len(v_inverted) == 0)
+
+// ── (9) view_make round-trip ───────────────────────────────
+let vfull = view_make(arr)
+check("make: full len", view_len(vfull) == len(arr))
+check("make: stride == 1", view_is_contiguous(vfull))
+check("make: get last == arr[-ish]", view_get(vfull, view_len(vfull) - 1) == arr[len(arr) - 1])
+
+println("")
+println("=== summary ===")
+println("  PASS: " + to_string(pass_count))
+println("  FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("zero_copy_slice: ALL GREEN")
+} else {
+    println("zero_copy_slice: FAILURES detected")
+}

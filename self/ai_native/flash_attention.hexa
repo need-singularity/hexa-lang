@@ -1,0 +1,406 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/flash_attention.hexa — AI-native ROI #74
+//
+//  Flash Attention (Dao 2022) — tile-wise fused attention kernel with
+//  online softmax. Replaces the naive softmax(Q·K^T/sqrt(d))·V path,
+//  which requires an O(S²) score matrix, with a block-tiled loop that
+//  keeps only per-row running max (m_i) and sum (l_i), eliminating the
+//  intermediate S matrix from HBM/cache footprint.
+//
+//  Public API (2D nested arrays — Q/K/V: [S, d]):
+//      naive_attention(Q, K, V)                 -> [S, d]   reference
+//      naive_attention_causal(Q, K, V)          -> [S, d]   reference
+//      flash_attention(Q, K, V, Br, Bc)         -> [S, d]   tiled
+//      flash_attention_causal(Q, K, V, Br, Bc)  -> [S, d]   tiled + mask
+//      flash_attention_mha(Qh, Kh, Vh, Br, Bc)  -> per-head list
+//
+//  Tile sizes:
+//      Br — query row block (default 64, CPU cache friendly)
+//      Bc — key/value column block (default 64)
+//      flash_attention_default(Q, K, V) uses 64/64
+//
+//  Algorithm (per query block B_q of Br rows):
+//      init  O_block = 0 (Br × d), m = -inf (Br), l = 0 (Br)
+//      for each KV block B_kv of Bc cols:
+//          S_ij = Q_block · K_block^T · scale          (Br × Bc)
+//          m_new = max(m, rowmax(S_ij))
+//          alpha = exp(m - m_new)
+//          P_ij  = exp(S_ij - m_new)                   (Br × Bc)
+//          l     = l * alpha + rowsum(P_ij)
+//          O     = O * alpha + P_ij · V_block          (Br × d)
+//          m     = m_new
+//      O_block /= l                                     (final normalize)
+//
+//  Complexity:
+//      naive:  O(S²·d) compute, O(S²) extra memory
+//      flash:  O(S²·d) compute, O(Br·(d + Bc)) extra memory per block
+//              → HBM/cache traffic from O(S²) down to O(S·d + S²·d/Br)
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - slice precedence: arr[(i+1)..j] — parens required
+//      - no struct literals inside if heads
+//      - array building: use fa_zeros_2d helper (no comprehensions here)
+//
+//  AI-native attrs:
+//      @hot      — called every forward step
+//      @parallel — outer query-block loop independent
+//      @pure     — no side effects beyond return value
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn fa74_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn fa74_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn fa74_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn fa74_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn fa74_neg_inf() {
+    return 0.0 - 1.0e30
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reference: naive attention   softmax(Q·K^T/sqrt(d)) · V
+//  Materialises S matrix — O(S²) memory. Used for correctness oracle.
+// ═══════════════════════════════════════════════════════════════════
+fn naive_attention(Q, K, V) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut out = fa74_zeros_2d(S, dv)
+
+    for i in 0..S {
+        // scores[j] = dot(Q[i], K[j]) * scale
+        let mut scores = fa74_zeros_1d(S)
+        for j in 0..S {
+            let mut dot = 0.0
+            for k in 0..d {
+                dot = dot + Q[i][k] * K[j][k]
+            }
+            scores[j] = dot * scale
+        }
+
+        // row-max
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m { m = scores[j] }
+        }
+
+        // softmax numerator + denominator
+        let mut sum_exp = 0.0
+        let mut exps = fa74_zeros_1d(S)
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            exps[j] = e
+            sum_exp = sum_exp + e
+        }
+
+        // attention-weighted V
+        for k in 0..dv {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// Causal variant: masks positions j > i with -inf before softmax.
+fn naive_attention_causal(Q, K, V) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut out = fa74_zeros_2d(S, dv)
+
+    for i in 0..S {
+        let mut scores = fa74_zeros_1d(S)
+        for j in 0..S {
+            if j > i {
+                scores[j] = fa74_neg_inf()
+            } else {
+                let mut dot = 0.0
+                for k in 0..d {
+                    dot = dot + Q[i][k] * K[j][k]
+                }
+                scores[j] = dot * scale
+            }
+        }
+
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m { m = scores[j] }
+        }
+
+        let mut sum_exp = 0.0
+        let mut exps = fa74_zeros_1d(S)
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            exps[j] = e
+            sum_exp = sum_exp + e
+        }
+
+        for k in 0..dv {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flash_attention(Q, K, V, Br, Bc)
+//
+//  Tile-wise fused attention with online softmax.
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel
+fn flash_attention(Q, K, V, Br, Bc) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let nr = (S + Br - 1) / Br
+    let nc = (S + Bc - 1) / Bc
+
+    let mut out = fa74_zeros_2d(S, dv)
+
+    for bq in 0..nr {
+        let q_start = bq * Br
+        let q_end = fa74_min_i(q_start + Br, S)
+        let rows = q_end - q_start
+
+        let mut row_m = fa74_zeros_1d(rows)
+        let mut row_l = fa74_zeros_1d(rows)
+        let mut O_block = fa74_zeros_2d(rows, dv)
+
+        for qi in 0..rows {
+            row_m[qi] = fa74_neg_inf()
+            row_l[qi] = 0.0
+        }
+
+        for bkv in 0..nc {
+            let kv_start = bkv * Bc
+            let kv_end = fa74_min_i(kv_start + Bc, S)
+            let cols = kv_end - kv_start
+
+            // S_tile = Q_block · K_block^T · scale   (rows × cols)
+            let mut S_tile = fa74_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                for kj in 0..cols {
+                    let mut dot = 0.0
+                    for k in 0..d {
+                        dot = dot + Q[q_start + qi][k] * K[kv_start + kj][k]
+                    }
+                    S_tile[qi][kj] = dot * scale
+                }
+            }
+
+            // per-row online update
+            for qi in 0..rows {
+                let mut tile_max = S_tile[qi][0]
+                for kj in 1..cols {
+                    if S_tile[qi][kj] > tile_max { tile_max = S_tile[qi][kj] }
+                }
+
+                let m_old = row_m[qi]
+                let m_new = fa74_max_f(m_old, tile_max)
+                let alpha = exp(m_old - m_new)
+
+                let mut tile_sum = 0.0
+                let mut p_row = fa74_zeros_1d(cols)
+                for kj in 0..cols {
+                    let p = exp(S_tile[qi][kj] - m_new)
+                    p_row[kj] = p
+                    tile_sum = tile_sum + p
+                }
+
+                let l_new = row_l[qi] * alpha + tile_sum
+
+                // rescale prior accumulator
+                for k in 0..dv {
+                    O_block[qi][k] = O_block[qi][k] * alpha
+                }
+                // add P · V_block
+                for kj in 0..cols {
+                    for k in 0..dv {
+                        O_block[qi][k] = O_block[qi][k] + p_row[kj] * V[kv_start + kj][k]
+                    }
+                }
+
+                row_m[qi] = m_new
+                row_l[qi] = l_new
+            }
+        }
+
+        // normalise by running sum
+        for qi in 0..rows {
+            let inv_l = 1.0 / row_l[qi]
+            for k in 0..dv {
+                out[q_start + qi][k] = O_block[qi][k] * inv_l
+            }
+        }
+    }
+    return out
+}
+
+// Convenience default: Br=64, Bc=64 CPU cache-friendly tiles.
+fn flash_attention_default(Q, K, V) {
+    return flash_attention(Q, K, V, 64, 64)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flash_attention_causal(Q, K, V, Br, Bc)
+//
+//  Causal variant: positions (kv > q) are masked to -inf inside the
+//  tile. Entirely-masked rows (upper-right tiles) are skipped so the
+//  online softmax running max remains well-defined.
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel
+fn flash_attention_causal(Q, K, V, Br, Bc) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let nr = (S + Br - 1) / Br
+    let nc = (S + Bc - 1) / Bc
+
+    let mut out = fa74_zeros_2d(S, dv)
+
+    for bq in 0..nr {
+        let q_start = bq * Br
+        let q_end = fa74_min_i(q_start + Br, S)
+        let rows = q_end - q_start
+
+        let mut row_m = fa74_zeros_1d(rows)
+        let mut row_l = fa74_zeros_1d(rows)
+        let mut O_block = fa74_zeros_2d(rows, dv)
+
+        for qi in 0..rows {
+            row_m[qi] = fa74_neg_inf()
+            row_l[qi] = 0.0
+        }
+
+        for bkv in 0..nc {
+            let kv_start = bkv * Bc
+            let kv_end = fa74_min_i(kv_start + Bc, S)
+            let cols = kv_end - kv_start
+
+            // build masked S_tile
+            let mut S_tile = fa74_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                let gq = q_start + qi
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    if gk > gq {
+                        S_tile[qi][kj] = fa74_neg_inf()
+                    } else {
+                        let mut dot = 0.0
+                        for k in 0..d {
+                            dot = dot + Q[gq][k] * K[gk][k]
+                        }
+                        S_tile[qi][kj] = dot * scale
+                    }
+                }
+            }
+
+            for qi in 0..rows {
+                // skip fully-masked rows in this tile
+                let mut all_masked = true
+                for kj in 0..cols {
+                    if S_tile[qi][kj] > (0.0 - 1.0e29) {
+                        all_masked = false
+                    }
+                }
+                if !all_masked {
+                    let mut tile_max = S_tile[qi][0]
+                    for kj in 1..cols {
+                        if S_tile[qi][kj] > tile_max { tile_max = S_tile[qi][kj] }
+                    }
+
+                    let m_old = row_m[qi]
+                    let m_new = fa74_max_f(m_old, tile_max)
+                    let alpha = exp(m_old - m_new)
+
+                    let mut tile_sum = 0.0
+                    let mut p_row = fa74_zeros_1d(cols)
+                    for kj in 0..cols {
+                        let p = exp(S_tile[qi][kj] - m_new)
+                        p_row[kj] = p
+                        tile_sum = tile_sum + p
+                    }
+
+                    let l_new = row_l[qi] * alpha + tile_sum
+                    for k in 0..dv {
+                        O_block[qi][k] = O_block[qi][k] * alpha
+                    }
+                    for kj in 0..cols {
+                        for k in 0..dv {
+                            O_block[qi][k] = O_block[qi][k] + p_row[kj] * V[kv_start + kj][k]
+                        }
+                    }
+
+                    row_m[qi] = m_new
+                    row_l[qi] = l_new
+                }
+            }
+        }
+
+        for qi in 0..rows {
+            let inv_l = 1.0 / row_l[qi]
+            for k in 0..dv {
+                out[q_start + qi][k] = O_block[qi][k] * inv_l
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flash_attention_mha(Qh, Kh, Vh, Br, Bc)
+//
+//  Multi-head wrapper. Qh/Kh/Vh are lists of per-head [S, d] matrices
+//  (outer length = H heads). Returns list of per-head outputs.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn flash_attention_mha(Qh, Kh, Vh, Br, Bc) {
+    let H = len(Qh)
+    let mut outs = []
+    for h in 0..H {
+        outs = outs + [flash_attention(Qh[h], Kh[h], Vh[h], Br, Bc)]
+    }
+    return outs
+}

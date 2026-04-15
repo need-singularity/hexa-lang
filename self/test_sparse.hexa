@@ -1,0 +1,284 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_sparse.hexa — ROI #79 verification.
+//
+//  Covers:
+//    (A) sparsity_ratio — dense, sparse, and 90% example matrices
+//    (B) dense→csr layout — row_ptr/col_idx/values for 3x3 90% example
+//    (C) round-trip identity: csr_to_dense(dense_to_csr(M)) == M
+//    (D) SpMV numerical parity vs dense matvec (tol 1e-6)
+//    (E) empty-row handling — row_ptr monotonic, corresponding y entry = 0
+//    (F) tiny eps threshold — |x|<eps counted as zero
+//    (G) should_use_csr detection boundary
+//    (H) random 100×100 matrix at 95% sparsity — FLOP saving measurement
+// ═══════════════════════════════════════════════════════════════════
+
+use "ai_native/sparse"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_local(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    for i in 0..n {
+        if fabs_local(a[i] - b[i]) > eps { return false }
+    }
+    return true
+}
+
+fn mat_close(A, B, eps) {
+    if len(A) != len(B) { return false }
+    let rows = len(A)
+    for i in 0..rows {
+        if len(A[i]) != len(B[i]) { return false }
+        let cols = len(A[i])
+        for j in 0..cols {
+            if fabs_local(A[i][j] - B[i][j]) > eps { return false }
+        }
+    }
+    return true
+}
+
+// Deterministic LCG for reproducible randomized tests.
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+// Build a rows×cols matrix with target sparsity (fraction of zeros)
+// and values in ~[-1, 1]. Uses a linear congruential generator seeded
+// with `seed` so the test is reproducible.
+fn rand_sparse_matrix(rows, cols, sparsity, seed) {
+    let mut state = seed
+    let mut M = []
+    // threshold scaled to LCG range m=2147483648 ≈ 2.147e9
+    // We use state%1000 / 1000 ∈ [0,1); if < sparsity write 0.
+    for _i in 0..rows {
+        let mut row = []
+        for _j in 0..cols {
+            state = lcg_step(state)
+            let r = (state % 1000) * 0.001
+            if r < sparsity {
+                row = row + [0.0]
+            } else {
+                state = lcg_step(state)
+                let v = (state % 2000) * 0.001 - 1.0
+                row = row + [v]
+            }
+        }
+        M = M + [row]
+    }
+    return M
+}
+
+// Build a dense random vector with LCG values in [-1, 1].
+fn rand_vector(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let x = (state % 2000) * 0.001 - 1.0
+        v = v + [x]
+    }
+    return v
+}
+
+println("═══════════════════════════════════════════════════════════════════")
+println("  ROI #79 — @sparse CSR correctness suite")
+println("═══════════════════════════════════════════════════════════════════")
+
+let eps_num = 1.0e-6
+
+// ── (A) sparsity_ratio ────────────────────────────────────────────
+let M_dense = [
+    [1.0, 2.0, 3.0],
+    [4.0, 5.0, 6.0]
+]
+let sp_dense = sparsity_ratio(M_dense)
+check("A1 dense matrix sparsity == 0.0", fabs_local(sp_dense) < 1.0e-9)
+
+let M_zeros = [
+    [0.0, 0.0, 0.0],
+    [0.0, 0.0, 0.0]
+]
+let sp_zeros = sparsity_ratio(M_zeros)
+check("A2 all-zero matrix sparsity == 1.0", fabs_local(sp_zeros - 1.0) < 1.0e-9)
+
+// 3×3 matrix with 7 zeros / 9 = 0.7777... sparsity, 2 non-zeros
+let M_mixed = [
+    [0.0, 0.0, 5.0],
+    [0.0, 0.0, 0.0],
+    [0.0, 3.0, 0.0]
+]
+let sp_mixed = sparsity_ratio(M_mixed)
+check("A3 mixed sparsity ≈ 7/9", fabs_local(sp_mixed - (7.0 / 9.0)) < 1.0e-9)
+
+// ── (B) 90%-sparsity example — 3×3, only 2 values (22% filled) ────
+//  Values layout:   row 0 has one nnz at col=2 (value 5)
+//                   row 1 has zero nnz (empty row)
+//                   row 2 has one nnz at col=1 (value 3)
+//  Expected CSR:  row_ptr = [0, 1, 1, 2]
+//                 col_idx = [2, 1]
+//                 values  = [5.0, 3.0]
+let csr_mixed = dense_to_csr(M_mixed, 3, 3, 1.0e-9)
+check("B1 n_rows == 3", csr_mixed.n_rows == 3)
+check("B2 n_cols == 3", csr_mixed.n_cols == 3)
+check("B3 nnz == 2", csr_nnz(csr_mixed) == 2)
+check("B4 row_ptr length == 4", len(csr_mixed.row_ptr) == 4)
+check("B5 row_ptr[0] == 0", csr_mixed.row_ptr[0] == 0)
+check("B6 row_ptr[1] == 1", csr_mixed.row_ptr[1] == 1)
+check("B7 row_ptr[2] == 1 (empty row)", csr_mixed.row_ptr[2] == 1)
+check("B8 row_ptr[3] == 2", csr_mixed.row_ptr[3] == 2)
+check("B9 col_idx[0] == 2", csr_mixed.col_idx[0] == 2)
+check("B10 col_idx[1] == 1", csr_mixed.col_idx[1] == 1)
+check("B11 values[0] == 5.0", fabs_local(csr_mixed.values[0] - 5.0) < 1.0e-9)
+check("B12 values[1] == 3.0", fabs_local(csr_mixed.values[1] - 3.0) < 1.0e-9)
+
+// ── (C) round-trip identity ───────────────────────────────────────
+let M_rt1 = csr_to_dense(csr_mixed)
+check("C1 round-trip M_mixed identity", mat_close(M_rt1, M_mixed, 1.0e-9))
+
+// dense matrix round-trip (eps=0 to capture all values)
+let csr_dense = dense_to_csr(M_dense, 2, 3, 1.0e-9)
+let M_rt2 = csr_to_dense(csr_dense)
+check("C2 round-trip dense matrix identity", mat_close(M_rt2, M_dense, 1.0e-9))
+check("C3 dense nnz == 6", csr_nnz(csr_dense) == 6)
+
+// all-zeros round-trip
+let csr_z = dense_to_csr(M_zeros, 2, 3, 1.0e-9)
+let M_rt3 = csr_to_dense(csr_z)
+check("C4 round-trip all-zero identity", mat_close(M_rt3, M_zeros, 1.0e-9))
+check("C5 all-zero nnz == 0", csr_nnz(csr_z) == 0)
+
+// ── (D) SpMV numerical parity ─────────────────────────────────────
+let x_mixed = [1.0, 2.0, 4.0]
+let y_sparse = spmv(csr_mixed, x_mixed)
+let y_dense = spmv_dense(M_mixed, x_mixed)
+// expected:  row0 = 5*4=20; row1 = 0; row2 = 3*2=6
+check("D1 spmv matches dense matvec (M_mixed)", vec_close(y_sparse, y_dense, eps_num))
+check("D2 y[0] == 20", fabs_local(y_sparse[0] - 20.0) < eps_num)
+check("D3 y[1] == 0 (empty row)", fabs_local(y_sparse[1]) < eps_num)
+check("D4 y[2] == 6", fabs_local(y_sparse[2] - 6.0) < eps_num)
+
+// random 20×20 matrix with 80% sparsity
+let M_r = rand_sparse_matrix(20, 20, 0.8, 42)
+let csr_r = dense_to_csr_default(M_r)
+let x_r = rand_vector(20, 7)
+let y_rs = spmv(csr_r, x_r)
+let y_rd = spmv_dense(M_r, x_r)
+check("D5 random 20x20 spmv parity", vec_close(y_rs, y_rd, eps_num))
+
+// dense (0% sparsity) SpMV fallback
+let x_d = [1.0, 2.0, 3.0]
+let y_ds = spmv(csr_dense, x_d)
+let y_dd = spmv_dense(M_dense, x_d)
+check("D6 dense-matrix spmv parity", vec_close(y_ds, y_dd, eps_num))
+
+// ── (E) empty-row handling ────────────────────────────────────────
+// row 1 of M_mixed is all zeros — row_ptr already checked in B7.
+// Monotonicity property: row_ptr[i] <= row_ptr[i+1] for all i.
+let mut monotonic = true
+for i in 0..(csr_mixed.n_rows) {
+    if csr_mixed.row_ptr[i] > csr_mixed.row_ptr[i + 1] { monotonic = false }
+}
+check("E1 row_ptr monotonically non-decreasing", monotonic)
+
+// matrix with empty first + last rows
+let M_edges = [
+    [0.0, 0.0, 0.0],
+    [1.0, 0.0, 2.0],
+    [0.0, 0.0, 0.0]
+]
+let csr_edges = dense_to_csr(M_edges, 3, 3, 1.0e-9)
+check("E2 edges nnz == 2", csr_nnz(csr_edges) == 2)
+check("E3 edges row_ptr[0]==0", csr_edges.row_ptr[0] == 0)
+check("E4 edges row_ptr[1]==0 (empty row 0)", csr_edges.row_ptr[1] == 0)
+check("E5 edges row_ptr[2]==2", csr_edges.row_ptr[2] == 2)
+check("E6 edges row_ptr[3]==2 (empty row 2)", csr_edges.row_ptr[3] == 2)
+let y_edges = spmv(csr_edges, [1.0, 1.0, 1.0])
+check("E7 empty row SpMV y[0]==0", fabs_local(y_edges[0]) < eps_num)
+check("E8 empty row SpMV y[2]==0", fabs_local(y_edges[2]) < eps_num)
+check("E9 middle row SpMV y[1]==3", fabs_local(y_edges[1] - 3.0) < eps_num)
+
+// ── (F) eps threshold ─────────────────────────────────────────────
+// sub-eps values (1e-12) must be treated as zero; slightly-above-eps
+// values must survive.
+let M_eps = [
+    [1.0e-12, 0.5, 1.0e-9]
+]
+// eps = 1e-9 -> 1e-12 filtered, 0.5 kept, 1e-9 kept (>= eps)
+let csr_eps = dense_to_csr(M_eps, 1, 3, 1.0e-9)
+check("F1 eps filter keeps 2 entries", csr_nnz(csr_eps) == 2)
+check("F2 eps col_idx[0] == 1", csr_eps.col_idx[0] == 1)
+check("F3 eps col_idx[1] == 2", csr_eps.col_idx[1] == 2)
+
+// ── (G) should_use_csr detection ──────────────────────────────────
+// dense (0%) -> false ; 90% sparsity (our M_mixed ≈ 77.8%) -> false ; all zeros -> true
+check("G1 dense -> should_use_csr == false", should_use_csr(M_dense) == false)
+check("G2 all-zero -> should_use_csr == true", should_use_csr(M_zeros) == true)
+check("G3 77.8% sparsity -> should_use_csr == false", should_use_csr(M_mixed) == false)
+
+// Build a matrix that is exactly 90% sparse (9 of 10 zeros).
+let M_ninety = [[0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 2.5]]
+check("G4 90% sparsity -> should_use_csr == true", should_use_csr(M_ninety) == true)
+
+// ── (H) 100×100 random matrix at 95% sparsity — FLOP saving ───────
+let N = 100
+let target_sp = 0.95
+let M100 = rand_sparse_matrix(N, N, target_sp, 2026)
+let csr100 = dense_to_csr_default(M100)
+let x100 = rand_vector(N, 99)
+
+// correctness on the large random instance
+let y100_s = spmv(csr100, x100)
+let y100_d = spmv_dense(M100, x100)
+check("H1 100x100 spmv matches dense (tol 1e-6)", vec_close(y100_s, y100_d, eps_num))
+
+let sp100 = sparsity_ratio(M100)
+let nnz100 = csr_nnz(csr100)
+let dense_flops = dense_matvec_flop_count(N, N)
+let spmv_flops = csr_flop_count(csr100)
+let saving = flop_saving_ratio(csr100)
+
+println("")
+println("── 100×100 SpMV FLOP bench (target sparsity = 0.95) ──")
+println("  measured sparsity : " + to_string(sp100))
+println("  nnz               : " + to_string(nnz100))
+println("  dense FLOPs       : " + to_string(dense_flops))
+println("  spmv FLOPs        : " + to_string(spmv_flops))
+println("  saving ratio      : " + to_string(saving) + "x")
+
+// Sanity: expect saving > ~5x (theoretical 20x at 95% sparsity minus
+// randomness). We use a lenient 3x floor to avoid flakiness.
+check("H2 FLOP saving > 3x", saving > 3.0)
+check("H3 measured sparsity > 0.9", sp100 > 0.9)
+check("H4 nnz < 2000 (95% of 10000 → ~500)", nnz100 < 2000)
+
+println("")
+println("═══════════════════════════════════════════════════════════════════")
+println("  summary")
+println("═══════════════════════════════════════════════════════════════════")
+println("  PASS : " + to_string(pass_count))
+println("  FAIL : " + to_string(fail_count))
+if fail_count == 0 {
+    println("sparse: ALL GREEN")
+} else {
+    println("sparse: FAILURES detected")
+}

@@ -1,0 +1,230 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_kv_cache.hexa — correctness test for ROI #78 kv_cache
+//
+//  Verifies:
+//    1. kv_init returns empty cache, seq_len=0
+//    2. 10 kv_append steps → seq_len=10, k_cache / v_cache lengths match
+//    3. For each decode step t in 0..10:
+//         q_t        = queries[t]
+//         incr_out_t = kv_attend(cache_t, q_t) after appending k_t,v_t
+//         full_out_t = batch attention of q_t over K[0..t+1], V[0..t+1]
+//       incr_out_t must equal full_out_t within tolerance 1e-5.
+//    4. kv_append beyond max_seq returns sentinel seq_len == -1.
+//
+//  flop bookkeeping:
+//    full batch at step t costs ~ 2·(t+1)·D (scores) + 2·(t+1)·D (weighted sum)
+//                              = 4·(t+1)·D
+//    incremental per step is identical — the saving comes from skipping
+//    the RECOMPUTATION of the 0..t prefix on EACH step, i.e.
+//      full decode 10 steps:  Σ_{t=0..9} 4·(t+1)·D  = 4·55·D = 220·D
+//      incr decode 10 steps:  10·(one attention) ≤ 220·D (identical)
+//      but full redo per step: 10·Σ_{t=0..9} 4·(t+1)·D  ≈ 2200·D   (20x)
+//    The test prints these three counts as a sanity check.
+// ═══════════════════════════════════════════════════════════════════
+
+use "ai_native/kv_cache"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn abs_f(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn close(a, b) {
+    return abs_f(a - b) < 0.00001
+}
+
+// deterministic pseudo-random vector from (seed, len)
+fn gen_vec(seed, vlen) {
+    let mut v = []
+    let mut s = seed
+    for i in 0..vlen {
+        s = (s * 1103515245 + 12345) % 2147483647
+        let x = to_float(s % 1000) / 500.0 - 1.0
+        v = v + [x]
+    }
+    return v
+}
+
+// reference full-batch attention over explicit K_list / V_list
+fn ref_attend(q, K_list, V_list, head_dim, n_heads) {
+    let n = len(K_list)
+    let d = head_dim
+    let scale = 1.0 / kv_sqrt(to_float(d))
+
+    let mut scores = []
+    for i in 0..n {
+        let s = kv_dot(q, K_list[i]) * scale
+        scores = scores + [s]
+    }
+    let mut mx = 0.0
+    if n > 0 { mx = scores[0] }
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps  = []
+    let mut total = 0.0
+    for i in 0..n {
+        let e = kv_exp(scores[i] - mx)
+        exps  = exps + [e]
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-30 }
+    let vec_len = n_heads * d
+    let mut out = []
+    for _j in 0..vec_len { out = out + [0.0] }
+    for i in 0..n {
+        let w = exps[i] / total
+        let vi = V_list[i]
+        for j in 0..vec_len {
+            out[j] = out[j] + w * vi[j]
+        }
+    }
+    return out
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  ROI #78 — self/ai_native/kv_cache.hexa correctness")
+println("═══════════════════════════════════════════════════════")
+
+let n_heads  = 2
+let head_dim = 4
+let vec_len  = n_heads * head_dim   // 8
+let max_seq  = 10
+let n_steps  = 10
+
+// ── 1. kv_init ────────────────────────────────────────────────────
+
+let cache0 = kv_init(max_seq, n_heads, head_dim)
+check("kv_init seq_len = 0",  cache0.seq_len == 0)
+check("kv_init max_seq",      cache0.max_seq == max_seq)
+check("kv_init n_heads",      cache0.n_heads == n_heads)
+check("kv_init head_dim",     cache0.head_dim == head_dim)
+check("kv_init k_cache empty", len(cache0.k_cache) == 0)
+check("kv_init v_cache empty", len(cache0.v_cache) == 0)
+
+// ── 2. Prepare 10 K / V / Q vectors (deterministic)────────────────
+
+let mut Ks = []
+let mut Vs = []
+let mut Qs = []
+for t in 0..n_steps {
+    Ks = Ks + [gen_vec(100 + t, vec_len)]
+    Vs = Vs + [gen_vec(200 + t, vec_len)]
+    Qs = Qs + [gen_vec(300 + t, vec_len)]
+}
+
+// ── 3. Incremental decode with kv_append / kv_attend ──────────────
+
+let mut cache  = cache0
+let mut incr_outs = []
+for t in 0..n_steps {
+    cache = kv_append(cache, Ks[t], Vs[t])
+    let out_t = kv_attend(cache, Qs[t])
+    incr_outs = incr_outs + [out_t]
+}
+check("incremental seq_len = " + to_string(n_steps), cache.seq_len == n_steps)
+check("incremental k_cache length", len(cache.k_cache) == n_steps)
+check("incremental v_cache length", len(cache.v_cache) == n_steps)
+
+// ── 4. Reference full-batch attention at each step ────────────────
+
+let mut ref_outs = []
+for t in 0..n_steps {
+    let mut K_prefix = []
+    let mut V_prefix = []
+    for i in 0..(t + 1) {
+        K_prefix = K_prefix + [Ks[i]]
+        V_prefix = V_prefix + [Vs[i]]
+    }
+    let ref_t = ref_attend(Qs[t], K_prefix, V_prefix, head_dim, n_heads)
+    ref_outs = ref_outs + [ref_t]
+}
+
+// ── 5. Element-wise equality check (tolerance 1e-5)─────────────────
+
+let mut max_err = 0.0
+let mut total_err = 0.0
+let mut elem_count = 0
+for t in 0..n_steps {
+    let a = incr_outs[t]
+    let b = ref_outs[t]
+    for j in 0..vec_len {
+        let e = abs_f(a[j] - b[j])
+        if e > max_err { max_err = e }
+        total_err = total_err + e
+        elem_count = elem_count + 1
+    }
+}
+let mean_err = total_err / to_float(elem_count)
+
+println("")
+println("numerical diagnostics:")
+println("  steps      = " + to_string(n_steps))
+println("  vec_len    = " + to_string(vec_len))
+println("  elements   = " + to_string(elem_count))
+println("  max |err|  = " + to_string(max_err))
+println("  mean |err| = " + to_string(mean_err))
+
+check("max elem error < 1e-5",  max_err < 0.00001)
+check("mean elem error < 1e-6", mean_err < 0.000001)
+
+// ── 6. flop bookkeeping ───────────────────────────────────────────
+
+let mut flop_incr = 0
+let mut flop_naive_redo = 0
+for t in 0..n_steps {
+    let t1 = t + 1
+    let per_step = 4 * t1 * head_dim
+    flop_incr = flop_incr + per_step
+    // naive "redo from scratch" would reconstruct AND re-attend
+    // over every prior step at each new token: Σ_{s=0..t} per_step(s)
+    let mut redo = 0
+    for s in 0..t1 {
+        redo = redo + 4 * (s + 1) * head_dim
+    }
+    flop_naive_redo = flop_naive_redo + redo
+}
+
+println("")
+println("flop comparison (4·(t+1)·D units):")
+println("  incremental decode total = " + to_string(flop_incr))
+println("  naive full-rebuild total = " + to_string(flop_naive_redo))
+let ratio_x100 = (flop_naive_redo * 100) / flop_incr
+println("  saved factor ≈ " + to_string(ratio_x100) + "/100 (i.e. naive is ~" + to_string(ratio_x100 / 100) + "× incremental)")
+
+check("naive rebuild costs more than incremental",   flop_naive_redo > flop_incr)
+
+// ── 7. max_seq overflow behaviour ─────────────────────────────────
+
+let full_cache = cache                         // already at seq_len = max_seq
+let k_extra = gen_vec(999, vec_len)
+let v_extra = gen_vec(888, vec_len)
+let overflow = kv_append(full_cache, k_extra, v_extra)
+check("overflow sentinel seq_len == -1", overflow.seq_len == -1)
+check("overflow leaves original cache untouched", full_cache.seq_len == max_seq)
+
+// ── summary ───────────────────────────────────────────────────────
+
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  PASS " + to_string(pass_count) + " / FAIL " + to_string(fail_count))
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("ROI #78 kv_cache: ALL GREEN")
+} else {
+    println("ROI #78 kv_cache: FAIL (see above)")
+}

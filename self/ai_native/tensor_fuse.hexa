@@ -1,0 +1,181 @@
+// ═══════════════════════════════════════════════════════════
+//  self/ai_native/tensor_fuse.hexa
+//
+//  @tensor_fuse — element-wise chain fusion.
+//
+//  Motivation: element-wise pipelines like
+//      out = scale(relu(add_const(x, b)))
+//  are commonly expressed as a sequence of `map(...)` calls over
+//  a float tensor. The naive implementation materializes a fresh
+//  array at every stage — O(N · (K+1)) allocation and 2·N·K
+//  memory round-trips for a K-op chain of length N.
+//
+//  Fusion strategy:
+//    Allocate ONE output array of length N and, for each element,
+//    apply the full op chain in a register-local variable before
+//    writing back. Net: 1 allocation, N · K pure ALU ops,
+//    K memory round-trips eliminated.
+//
+//  Op encoding (no enum in hexa — we use a struct with a tag int):
+//    tag 0 = add_const    (x := x + c)
+//    tag 1 = mul_const    (x := x * c)       // aka "scale"
+//    tag 2 = relu         (x := max(x, 0))
+//    tag 3 = gelu_approx  (x := 0.5 · x · (1 + tanh(√(2/π)·(x + 0.044715·x³))))
+//    tag 4 = tanh_approx  (x := tanh(x))
+//    tag 5 = sigmoid_approx (x := 1 / (1 + exp(-x)), clamped)
+//
+//  Numerical contract:
+//    fused_chain(x, ops) == naive_chain(x, ops)  within 1e-5
+//    element-wise for any chain of the above ops, for finite inputs.
+//
+//  Allocation contract:
+//    naive_chain: len(ops) + 1 arrays allocated
+//    fused_chain: 1 array allocated (independent of len(ops))
+// ═══════════════════════════════════════════════════════════
+
+// ── Op struct + constructors ───────────────────────────────
+
+pub struct Op {
+    tag: int,
+    c: float
+}
+
+pub fn op_add_const(c) {
+    return Op { tag: 0, c: c }
+}
+
+pub fn op_mul_const(c) {
+    return Op { tag: 1, c: c }
+}
+
+pub fn op_relu() {
+    return Op { tag: 2, c: 0.0 }
+}
+
+pub fn op_gelu_approx() {
+    return Op { tag: 3, c: 0.0 }
+}
+
+pub fn op_tanh_approx() {
+    return Op { tag: 4, c: 0.0 }
+}
+
+pub fn op_sigmoid_approx() {
+    return Op { tag: 5, c: 0.0 }
+}
+
+// ── pointwise helpers (kept private to the module) ─────────
+
+// GELU (tanh approximation):
+//   0.5 · x · (1 + tanh( sqrt(2/π) · (x + 0.044715 · x³) ))
+// sqrt(2/π) ≈ 0.7978845608028654
+fn gelu_pointwise(x) {
+    let k = 0.7978845608028654
+    let x3 = x * x * x
+    let inner = k * (x + 0.044715 * x3)
+    return 0.5 * x * (1.0 + tanh(inner))
+}
+
+// Sigmoid, numerically safe.
+//   Clamp input to [-40, 40] to keep exp() finite under the
+//   hexa float interpreter (exp(±40) ≈ 4e17 / 4e-18 — both
+//   representable) then compute 1 / (1 + exp(-x)).
+fn sigmoid_pointwise(x) {
+    let mut c = x
+    if c >  40.0 { c =  40.0 }
+    if c < -40.0 { c = -40.0 }
+    return 1.0 / (1.0 + exp(0.0 - c))
+}
+
+// Apply a single op to a scalar value.
+fn apply_op(x, op) {
+    let t = op.tag
+    if t == 0 {
+        return x + op.c
+    } else if t == 1 {
+        return x * op.c
+    } else if t == 2 {
+        if x < 0.0 { return 0.0 }
+        return x
+    } else if t == 3 {
+        return gelu_pointwise(x)
+    } else if t == 4 {
+        return tanh(x)
+    } else if t == 5 {
+        return sigmoid_pointwise(x)
+    }
+    // unknown tag → identity (defensive)
+    return x
+}
+
+// ── fused: single-loop, one allocation ─────────────────────
+
+// Apply every op in `ops` to every element of `x` inside one
+// sweep. Allocates exactly one output array of length len(x).
+pub fn fused_chain(x, ops) {
+    let n = len(x)
+    let k = len(ops)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut v = x[i]
+        let mut j = 0
+        while j < k {
+            v = apply_op(v, ops[j])
+            j = j + 1
+        }
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// ── naive baseline: one array per op ───────────────────────
+
+// Apply a single op across the whole array, producing a fresh
+// array. Used by naive_chain; exported because tests want to
+// verify the 1-op case independently as well.
+pub fn map_op(x, op) {
+    let n = len(x)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(apply_op(x[i], op))
+        i = i + 1
+    }
+    return out
+}
+
+// Reference implementation: one fresh array allocation per op
+// in the chain (plus the initial copy), for a total of
+// len(ops)+1 allocations. Intentionally non-fused.
+pub fn naive_chain(x, ops) {
+    let k = len(ops)
+    // initial copy so we never mutate the caller's array
+    let mut cur = []
+    let mut i0 = 0
+    let n = len(x)
+    while i0 < n {
+        cur = cur.push(x[i0])
+        i0 = i0 + 1
+    }
+    let mut j = 0
+    while j < k {
+        cur = map_op(cur, ops[j])
+        j = j + 1
+    }
+    return cur
+}
+
+// ── allocation accounting (for tests/benches) ──────────────
+
+// Declared allocation count of naive_chain (for len(ops) = k,
+// len(x) > 0): initial copy + one per op = k + 1.
+pub fn naive_alloc_count(ops) {
+    return len(ops) + 1
+}
+
+// Declared allocation count of fused_chain: always exactly 1.
+pub fn fused_alloc_count(ops) {
+    return 1
+}

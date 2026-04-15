@@ -1,0 +1,145 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/gemm_tile.hexa — AI-native ROI #83
+//
+//  @gemm_tile — cache-aware GEMM blocking for the BLAS-less fallback
+//  path. Decomposes C = A · B  (A:[M,K], B:[K,N] → C:[M,N]) into
+//  (mt × nt × kt) tiles so that the innermost triple-nested loop
+//  works on a working set that fits in L1/L2.
+//
+//  Public API (row-major 2D arrays — A/B/C: [[float]]):
+//      gemm_naive(A, B)                       -> C       (reference)
+//      gemm_tiled(A, B, mt, nt, kt)           -> C       (blocked)
+//      gemm_tiled_default(A, B)               -> C       (64/64/64)
+//
+//  Algorithm (k-outer tiling, additive over kt blocks):
+//      C = 0
+//      for ii in 0..M step mt:
+//          for jj in 0..N step nt:
+//              for kk in 0..K step kt:
+//                  mb = min(mt, M-ii); nb = min(nt, N-jj); kb = min(kt, K-kk)
+//                  for i in 0..mb:
+//                      for k in 0..kb:
+//                          a = A[ii+i][kk+k]
+//                          for j in 0..nb:
+//                              C[ii+i][jj+j] += a * B[kk+k][jj+j]
+//
+//  Edge handling: last tile along each axis uses the residual length
+//  (M % mt, N % nt, K % kt). Asymmetric tiles (mt ≠ nt ≠ kt) are
+//  supported — each axis is bounded independently.
+//
+//  Complexity:
+//      naive : O(M·N·K) compute, poor cache reuse for large (M,N,K)
+//      tiled : O(M·N·K) compute, working set  O(mt·kt + kt·nt + mt·nt)
+//              → L1/L2-resident when mt,nt,kt chosen accordingly
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - slice precedence: arr[(i+1)..j] — parens required
+//      - no bit-ops (<<, >>, |) — arithmetic only
+//      - no struct literal in if heads
+//      - array build: zeros_2d helper (no comprehensions)
+//
+//  AI-native attrs:
+//      @hot      — GEMM fallback is called every forward step
+//      @parallel — outer (ii, jj) tile loops are independent
+//      @pure     — no side effects beyond the returned C
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn gt83_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn gt83_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gemm_naive(A, B)  — reference 3-loop GEMM  (row-major)
+//  A: [M, K], B: [K, N]  →  C: [M, N]
+//  Loop order (i, k, j) keeps A[i][k] in a register across the j sweep
+//  and streams B[k] contiguously — already reasonable for small sizes.
+// ═══════════════════════════════════════════════════════════════════
+fn gemm_naive(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = gt83_zeros_2d(M, N)
+
+    for i in 0..M {
+        for k in 0..K {
+            let a = A[i][k]
+            for j in 0..N {
+                C[i][j] = C[i][j] + a * B[k][j]
+            }
+        }
+    }
+    return C
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gemm_tiled(A, B, mt, nt, kt)  — cache-aware blocked GEMM.
+//
+//  Tiles along all three axes. Inner (i, k, j) order matches the
+//  naive kernel so that for each A[ii+i][kk+k] held in a register,
+//  a contiguous stripe of B[kk+k][jj..jj+nb] is streamed into C.
+//
+//  Residual tiles at the tail of each axis are handled via
+//  gt83_min_i(tile, remaining) so that any positive mt/nt/kt is valid
+//  and the three axes may have different tile sizes (asymmetric).
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel
+fn gemm_tiled(A, B, mt, nt, kt) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = gt83_zeros_2d(M, N)
+
+    let mut ii = 0
+    while ii < M {
+        let mb = gt83_min_i(mt, M - ii)
+        let mut jj = 0
+        while jj < N {
+            let nb = gt83_min_i(nt, N - jj)
+            let mut kk = 0
+            while kk < K {
+                let kb = gt83_min_i(kt, K - kk)
+
+                // inner (mb × kb × nb) tile — additive over kk blocks
+                for i in 0..mb {
+                    let ai = ii + i
+                    for k in 0..kb {
+                        let a = A[ai][kk + k]
+                        let bk = kk + k
+                        for j in 0..nb {
+                            let cj = jj + j
+                            C[ai][cj] = C[ai][cj] + a * B[bk][cj]
+                        }
+                    }
+                }
+
+                kk = kk + kt
+            }
+            jj = jj + nt
+        }
+        ii = ii + mt
+    }
+    return C
+}
+
+// Convenience default: mt = nt = kt = 64 — good L1 fit on most CPUs
+// for float64 matrices (64×64 tile ≈ 32 KiB).
+fn gemm_tiled_default(A, B) {
+    return gemm_tiled(A, B, 64, 64, 64)
+}

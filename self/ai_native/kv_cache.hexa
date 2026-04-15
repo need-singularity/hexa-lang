@@ -1,0 +1,184 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/kv_cache.hexa — Single-layer KV-cache for @kv_cache
+//                                 AI-native attribute (ROI #78)
+//
+//  Purpose: provide the minimal serving-path KV cache referenced by
+//  the @kv_cache attribute. Each @kv_cache-annotated attention call
+//  appends one token's K / V to the cache and attends over the
+//  cumulative sequence, so incremental decode tok/s matches the
+//  full-batch attention numerically while doing O(seq_len · d)
+//  rather than O(seq_len² · d) work per step.
+//
+//  Shape:
+//    k_cache : array of per-token key   vectors, each length n_heads·head_dim
+//    v_cache : array of per-token value vectors, each length n_heads·head_dim
+//    seq_len : current filled length (0 ≤ seq_len ≤ max_seq)
+//    max_seq : hard ceiling; exceeding it raises an explicit error —
+//              padding / eviction is the caller's responsibility
+//    n_heads, head_dim : attention geometry (head dim used to scale)
+//
+//  Immutable update pattern:
+//    kv_append returns a NEW KVCache (old + [new_k] / [new_v]) to sidestep
+//    the "struct field list aliasing" pitfall (see feedback memory notes).
+//    Callers must rebind: cache = kv_append(cache, k, v).
+//
+//  Pitfall notes:
+//    • struct-literal inside `if` body is unsupported — we bind a local
+//      first and return it (grammar G5).
+//    • slice precedence: any `a[i+1 .. j]` uses parenthesised addends
+//      (not used here but noted for future extensions).
+//
+//  Related: self/ml/kv_cache.hexa (multi-layer flat-1D variant) —
+//  this file is the narrower serving-path helper the @kv_cache
+//  attribute expands into.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── small numeric helpers (file-local, as_ prefix to avoid collisions)
+
+@pure
+fn kv_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn kv_exp(x) {
+    let mut c = x
+    if c > 20.0  { c =  20.0 }
+    if c < -20.0 { c = -20.0 }
+    let mut result = 1.0
+    let mut term   = 1.0
+    for i in 1..25 {
+        term   = term * c / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { return 1.0e-30 }
+    return result
+}
+
+@pure
+fn kv_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+// ── struct ─────────────────────────────────────────────────────────
+
+struct KVCache {
+    k_cache: array,
+    v_cache: array,
+    seq_len: int,
+    max_seq: int,
+    n_heads: int,
+    head_dim: int
+}
+
+// ── constructor ────────────────────────────────────────────────────
+//  Pre-allocates empty K / V arrays and records shape metadata.
+//  The storage grows by one vector per kv_append; bounded by max_seq.
+
+fn kv_init(max_seq, n_heads, head_dim) {
+    return KVCache {
+        k_cache: [],
+        v_cache: [],
+        seq_len: 0,
+        max_seq: max_seq,
+        n_heads: n_heads,
+        head_dim: head_dim
+    }
+}
+
+// ── append ─────────────────────────────────────────────────────────
+//  Returns a NEW KVCache with new_k / new_v appended and seq_len+1.
+//  Raises a visible error (returns tagged KVCache with seq_len = -1)
+//  when max_seq would be exceeded — pure hexa has no `raise`, but the
+//  interpreter's `panic`-equivalent is `println + return` of an error
+//  sentinel that the caller must branch on. We print and return the
+//  unchanged cache with seq_len set to -1 so callers can detect it.
+
+@hot
+fn kv_append(cache: KVCache, new_k, new_v) {
+    if cache.seq_len >= cache.max_seq {
+        println("[kv_cache] ERROR: max_seq=" + to_string(cache.max_seq) + " exceeded (seq_len=" + to_string(cache.seq_len) + ")")
+        return KVCache {
+            k_cache: cache.k_cache,
+            v_cache: cache.v_cache,
+            seq_len: -1,
+            max_seq: cache.max_seq,
+            n_heads: cache.n_heads,
+            head_dim: cache.head_dim
+        }
+    }
+    let new_k_arr = cache.k_cache + [new_k]
+    let new_v_arr = cache.v_cache + [new_v]
+    return KVCache {
+        k_cache: new_k_arr,
+        v_cache: new_v_arr,
+        seq_len: cache.seq_len + 1,
+        max_seq: cache.max_seq,
+        n_heads: cache.n_heads,
+        head_dim: cache.head_dim
+    }
+}
+
+// ── attend ─────────────────────────────────────────────────────────
+//  q  : single query vector  of length n_heads·head_dim (decode path)
+//  Returns output vector of length n_heads·head_dim:
+//      scores_i = (q · k_i) / sqrt(head_dim)       for i in 0..seq_len
+//      w        = softmax(scores)
+//      out      = Σ_i w_i · v_i
+//  head_dim is used for the scaling; multi-head split is caller-side.
+//  (For the serving-path @kv_cache expansion, the multi-head reshape
+//  happens around this helper — this function treats the K/V vectors
+//  as flattened vectors of length n_heads·head_dim.)
+
+@hot
+fn kv_attend(cache: KVCache, q) {
+    let n = cache.seq_len
+    let d = cache.head_dim
+    let scale = 1.0 / kv_sqrt(to_float(d))
+
+    // scores
+    let mut scores = []
+    for i in 0..n {
+        let s = kv_dot(q, cache.k_cache[i]) * scale
+        scores = scores + [s]
+    }
+
+    // softmax (max-shift for stability)
+    let mut mx = 0.0
+    if n > 0 { mx = scores[0] }
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps  = []
+    let mut total = 0.0
+    for i in 0..n {
+        let e = kv_exp(scores[i] - mx)
+        exps  = exps + [e]
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-30 }
+
+    // weighted sum over value vectors
+    let vec_len = cache.n_heads * d
+    let mut out = []
+    for _j in 0..vec_len { out = out + [0.0] }
+    for i in 0..n {
+        let w = exps[i] / total
+        let vi = cache.v_cache[i]
+        for j in 0..vec_len {
+            out[j] = out[j] + w * vi[j]
+        }
+    }
+    return out
+}
