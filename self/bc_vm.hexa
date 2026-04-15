@@ -139,6 +139,45 @@ let BC_STRUCT_TAG = "<bc_struct>"
 // by the sentinel before resolving the proto.
 let BC_CLOSURE_TAG = "<bc_closure>"
 
+// T56 #2 (rt#36-E) — cell-shape tag. A "cell" is a 2-element array
+// [BC_CELL_TAG, val] used to share a mutable binding between an
+// outer scope and one or more closures. Emitter's HOIST_CELL
+// opcode wraps an outer local slot into a cell and pushes its
+// reference onto the stack; the subsequent NEW_CLOSURE_UPVAL
+// binds THAT reference in the closure's upval table so both
+// views point to the same heap array. LOAD_LOCAL / STORE_LOCAL /
+// LOAD_UPVAL / STORE_UPVAL all auto-deref / auto-write-through
+// on cell-shaped values so normal emitted code sees the latest
+// mutation regardless of which side updated it last.
+let BC_CELL_TAG = "<bc_cell>"
+
+// Cell-shape predicate. A cell is a 2-elem array whose first
+// slot is the BC_CELL_TAG sentinel. Non-array values, len-mismatch
+// arrays and arrays with a different leading tag all return false.
+fn bc_vm_is_cell(v) {
+    if type_of(v) != "array" { return false }
+    if len(v) != 2 { return false }
+    if v[0] != BC_CELL_TAG { return false }
+    return true
+}
+
+// Fetch the payload of a cell-shaped value. Precondition:
+// bc_vm_is_cell(v) == true. Returns v[1] — the inner value the
+// outer/inner scopes are sharing.
+fn bc_vm_cell_deref(v) {
+    return v[1]
+}
+
+// In-place mutation of a cell's payload. Stage1 hexa arrays have
+// an index-assignment operator (`arr[i] = v`) that mutates the
+// underlying .items field directly — the same primitive used by
+// IndexAssignStmt / bc_vm_setat. Returns the same cell so callers
+// can either store it back or rely on the aliasing.
+fn bc_vm_cell_store(cell, new_val) {
+    cell[1] = new_val
+    return cell
+}
+
 // T51 (rt#36-E #1) — CALL-of-closure sentinel. When OP_CALL's b16
 // equals this, the callee is the value at stack[top - nargs] and
 // must be closure-shaped (tag BC_CLOSURE_TAG). See bc_emitter.hexa
@@ -593,6 +632,13 @@ fn bc_vm_run_loop() {
         }
 
         // ──────── LOCAL SLOT I/O ────────
+        // T56 #2 (rt#36-E) — cell-aware paths. If the slot holds a
+        // BC_CELL_TAG-shaped array, LOAD_LOCAL auto-derefs (pushes
+        // cell[1]) and STORE_LOCAL auto-writes-through (mutates
+        // cell[1] in place, preserving the shared cell). This lets
+        // closures that hoisted the slot via HOIST_CELL see outer
+        // mutations and vice-versa without any emitter-level rewrite
+        // of outer reads/writes.
         else if op == BC_OP_LOAD_LOCAL {
             let slot = bc_bx_of(raw)
             let abs = fp + slot
@@ -601,7 +647,12 @@ fn bc_vm_run_loop() {
                 vm_trap_msg = "LOAD_LOCAL: slot out of range"
                 return last_return
             }
-            bc_vm_push(vm_locals[abs])
+            let ll_v = vm_locals[abs]
+            if bc_vm_is_cell(ll_v) {
+                bc_vm_push(bc_vm_cell_deref(ll_v))
+            } else {
+                bc_vm_push(ll_v)
+            }
         } else if op == BC_OP_STORE_LOCAL {
             let slot = bc_bx_of(raw)
             let abs = fp + slot
@@ -614,7 +665,55 @@ fn bc_vm_run_loop() {
                     vm_locals = vm_locals.push(BC_NIL)
                 }
             }
-            vm_locals = bc_vm_setat(vm_locals, abs, v)
+            let sl_cur = vm_locals[abs]
+            if bc_vm_is_cell(sl_cur) {
+                // T56 #2 — in-place cell write. `let cell = vm_locals[abs]`
+                // is a reference to the same underlying array; mutating
+                // cell[1] mutates every other alias (including any
+                // closure upvals that captured the same cell via
+                // HOIST_CELL / NEW_CLOSURE_UPVAL).
+                let _w = bc_vm_cell_store(sl_cur, v)
+            } else {
+                vm_locals = bc_vm_setat(vm_locals, abs, v)
+            }
+        }
+        // T56 #2 (rt#36-E) — HOIST_CELL Bx=local_slot. Wraps the
+        // outer local slot into a BC_CELL_TAG-shaped array in place
+        // (idempotent: if already cell, no-op) and pushes the cell
+        // reference onto the operand stack for the subsequent
+        // NEW_CLOSURE_UPVAL to bind.
+        //
+        // Emitted ONLY by the lambda-creation path in bc_emitter.hexa
+        // for MUTABLE free vars — non-mutable free vars keep the
+        // by-value LOAD_LOCAL snapshot path from T51.
+        //
+        // Stack effect: +1 (push cell ref). Bx is the local slot index
+        // in the CURRENT frame (relative to fp).
+        else if op == BC_OP_HOIST_CELL {
+            let hc_slot = bc_bx_of(raw)
+            let hc_abs = fp + hc_slot
+            if hc_abs >= len(vm_locals) {
+                vm_trap = true
+                vm_trap_msg = "HOIST_CELL: slot out of range"
+                return last_return
+            }
+            let hc_cur = vm_locals[hc_abs]
+            if bc_vm_is_cell(hc_cur) {
+                // Already a cell (e.g. second closure capturing the
+                // same mutable var) — push the existing reference so
+                // every closure sharing this name binds the SAME heap
+                // cell. No re-wrap, no clobber.
+                bc_vm_push(hc_cur)
+            } else {
+                // Fresh hoist — allocate a new cell wrapping the
+                // current value and write it back to the local slot.
+                // Both the outer slot and the TOS now hold the same
+                // reference, so subsequent mutations propagate in
+                // both directions.
+                let hc_new = [BC_CELL_TAG, hc_cur]
+                vm_locals = bc_vm_setat(vm_locals, hc_abs, hc_new)
+                bc_vm_push(hc_new)
+            }
         }
 
         // ──────── GLOBAL SLOT I/O ────────
@@ -1028,7 +1127,13 @@ fn bc_vm_run_loop() {
                 vm_trap_msg = "LOAD_UPVAL: upvalue not bound: " + lu_name
                 return last_return
             }
-            bc_vm_push(lu_val)
+            // T56 #2 — cell deref: if the upval holds a cell, push the
+            // inner value so the consumer sees the latest mutation.
+            if bc_vm_is_cell(lu_val) {
+                bc_vm_push(bc_vm_cell_deref(lu_val))
+            } else {
+                bc_vm_push(lu_val)
+            }
         }
         // T52 (rt#36-E #1) — STORE_UPVAL Bx=name_const_idx.
         // Mirror of LOAD_UPVAL but reversed: pop TOS as the new value,
@@ -1036,11 +1141,9 @@ fn bc_vm_run_loop() {
         // pool, rebuild the current frame's closure with the new
         // upval_vals[idx], and write it back to vm_frame_closure[top].
         //
-        // Scope: T52 step #1 — within-call mutation only. Across-call
-        // persistence (outer `let mut x` staying in sync with the
-        // closure's captured slot) needs the indirect-cell step
-        // documented in closure_upval.hexa. A later step replaces the
-        // rebuild-on-store below with a cell dereference.
+        // T56 #2 — cell-aware: if the upval slot holds a cell (HOIST_CELL
+        // wrapped it), write-through in-place so the outer scope sees
+        // the mutation. Non-cell upvals use the rebuild-on-store path.
         else if op == BC_OP_STORE_UPVAL {
             let su_cidx = bc_bx_of(raw)
             let su_consts = bc_proto_consts[proto_idx]
@@ -1068,19 +1171,31 @@ fn bc_vm_run_loop() {
                         let su_vals  = su_cl[3]
                         let mut su_i = 0
                         let su_n = len(su_names)
-                        let mut su_new_vals = []
                         while su_i < su_n {
                             if su_names[su_i] == su_name {
-                                su_new_vals = su_new_vals.push(su_val)
                                 su_found = true
+                                // T56 #2 — cell write-through: shared heap cell
+                                if bc_vm_is_cell(su_vals[su_i]) {
+                                    bc_vm_cell_store(su_vals[su_i], su_val)
+                                } else {
+                                    // non-cell: rebuild closure array with new value
+                                    let mut su_new_vals = []
+                                    let mut su_j = 0
+                                    while su_j < su_n {
+                                        if su_j == su_i {
+                                            su_new_vals = su_new_vals.push(su_val)
+                                        } else {
+                                            su_new_vals = su_new_vals.push(su_vals[su_j])
+                                        }
+                                        su_j = su_j + 1
+                                    }
+                                    let su_out = [BC_CLOSURE_TAG, su_pidx, su_names, su_new_vals]
+                                    vm_frame_closure = bc_vm_setat(vm_frame_closure, su_depth - 1, su_out)
+                                }
+                                su_i = su_n
                             } else {
-                                su_new_vals = su_new_vals.push(su_vals[su_i])
+                                su_i = su_i + 1
                             }
-                            su_i = su_i + 1
-                        }
-                        if su_found {
-                            let su_out = [BC_CLOSURE_TAG, su_pidx, su_names, su_new_vals]
-                            vm_frame_closure = bc_vm_setat(vm_frame_closure, su_depth - 1, su_out)
                         }
                     }
                 }
@@ -1091,16 +1206,65 @@ fn bc_vm_run_loop() {
                 return last_return
             }
         }
-        // PRINT (debug-only) — keep adjacent to MISC family for locality.
+        // T63 — PRINT/PRINTLN. A operand carries arg count (0..N).
+        // Pops N values from TOS, concats in push order (stack-bottom
+        // first), prints. PRINT omits newline; PRINTLN appends \n.
         else if op == BC_OP_PRINT {
-            // Emitter's lowering of print(x): leaves x on top and
-            // emits OP_PRINT. PRINT pops and prints. rt#36-A §6.9
-            // notes OP_PRINT is debug-only (runtime `println` will
-            // eventually be a user fn, lowered via OP_CALL).
-            let v = bc_vm_pop()
-            println(to_string(v))
+            let pn = bc_a_of(raw)
+            let mut pparts = []
+            let mut pi = 0
+            while pi < pn {
+                pparts = pparts.push(bc_vm_pop())
+                pi = pi + 1
+            }
+            let mut pout = ""
+            let mut pj = pn - 1
+            while pj >= 0 {
+                pout = pout + to_string(pparts[pj])
+                pj = pj - 1
+            }
+            print(pout)
+        }
+        else if op == BC_OP_PRINTLN {
+            let pln = bc_a_of(raw)
+            let mut plparts = []
+            let mut pli = 0
+            while pli < pln {
+                plparts = plparts.push(bc_vm_pop())
+                pli = pli + 1
+            }
+            let mut plout = ""
+            let mut plj = pln - 1
+            while plj >= 0 {
+                plout = plout + to_string(plparts[plj])
+                plj = plj - 1
+            }
+            println(plout)
         } else if op == BC_OP_NOP {
             // Intentionally do nothing.
+        }
+        // T62 — type conversion builtins
+        else if op == BC_OP_TO_STRING {
+            let v = bc_vm_pop()
+            bc_vm_push(to_string(v))
+        }
+        else if op == BC_OP_TO_INT {
+            let v = bc_vm_pop()
+            if type_of(v) == "string" {
+                bc_vm_push(v.parse_int())
+            } else if type_of(v) == "float" {
+                bc_vm_push(to_int(v))
+            } else {
+                bc_vm_push(v)
+            }
+        }
+        else if op == BC_OP_TO_FLOAT {
+            let v = bc_vm_pop()
+            bc_vm_push(to_float(v))
+        }
+        else if op == BC_OP_TYPE_OF {
+            let v = bc_vm_pop()
+            bc_vm_push(type_of(v))
         }
 
         // ──────── HALT / ASSERTIONS (rt#36-C) ────────
@@ -1184,15 +1348,22 @@ fn bc_vm_run_loop() {
             let idx = bc_vm_pop()
             let arr = bc_vm_pop()
             if vm_trap { return last_return }
-            let mut is_map_shape = false
-            if type_of(arr) == "array" {
+            // Polymorphic container dispatch:
+            //   1) BC_MAP_TAG shape → linear key scan
+            //   2) string → char-at-index (returns single-char string)
+            //   3) array (plain) → direct index
+            let mut ag_is_map = false
+            let mut ag_is_str = false
+            if type_of(arr) == "string" {
+                ag_is_str = true
+            } else if type_of(arr) == "array" {
                 if len(arr) == 3 {
                     if arr[0] == BC_MAP_TAG {
-                        is_map_shape = true
+                        ag_is_map = true
                     }
                 }
             }
-            if is_map_shape {
+            if ag_is_map {
                 let mks = arr[1]
                 let mvs = arr[2]
                 let mkn = len(mks)
@@ -1207,6 +1378,10 @@ fn bc_vm_run_loop() {
                     }
                 }
                 bc_vm_push(mhit)
+            } else if ag_is_str {
+                // String indexing: arr[idx] → single character as string
+                let ag_chars = arr.chars()
+                bc_vm_push(to_string(ag_chars[idx]))
             } else {
                 bc_vm_push(arr[idx])
             }
@@ -1223,8 +1398,15 @@ fn bc_vm_run_loop() {
             let idx = bc_vm_pop()
             let arr = bc_vm_pop()
             if vm_trap { return last_return }
+            // Polymorphic container dispatch (mirrors ARR_GET):
+            //   1) BC_MAP_TAG shape → key-based update/append
+            //   2) string → character replacement at index
+            //   3) array (plain) → direct set-at-index
             let mut as_is_map = false
-            if type_of(arr) == "array" {
+            let mut as_is_str = false
+            if type_of(arr) == "string" {
+                as_is_str = true
+            } else if type_of(arr) == "array" {
                 if len(arr) == 3 {
                     if arr[0] == BC_MAP_TAG {
                         as_is_map = true
@@ -1254,6 +1436,21 @@ fn bc_vm_run_loop() {
                     as_new_vals = as_vals.push(v)
                 }
                 bc_vm_push([BC_MAP_TAG, as_new_keys, as_new_vals])
+            } else if as_is_str {
+                // String char replacement: rebuild string with char at idx replaced
+                let as_chars = arr.chars()
+                let as_cn = len(as_chars)
+                let mut as_out = ""
+                let mut as_ci = 0
+                while as_ci < as_cn {
+                    if as_ci == idx {
+                        as_out = as_out + to_string(v)
+                    } else {
+                        as_out = as_out + to_string(as_chars[as_ci])
+                    }
+                    as_ci = as_ci + 1
+                }
+                bc_vm_push(as_out)
             } else {
                 bc_vm_push(bc_vm_setat(arr, idx, v))
             }

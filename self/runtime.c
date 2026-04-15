@@ -1827,18 +1827,21 @@ HexaVal hexa_val_heapify(HexaVal v);
 // We weak-link so this object can also link into translation units that
 // don't include hexa_full.hexa (e.g. the bootstrap_compiler.c stub or
 // standalone test harnesses). At runtime we NULL-check before deref.
-extern HexaVal array_store __attribute__((weak_import, weak));
-extern HexaVal map_store   __attribute__((weak_import, weak));
-__attribute__((weak)) HexaVal array_store __attribute__((common));
-__attribute__((weak)) HexaVal map_store   __attribute__((common));
+extern HexaVal array_store  __attribute__((weak_import, weak));
+extern HexaVal map_store    __attribute__((weak_import, weak));
+extern HexaVal struct_store __attribute__((weak_import, weak));
+__attribute__((weak)) HexaVal array_store  __attribute__((common));
+__attribute__((weak)) HexaVal map_store    __attribute__((common));
+__attribute__((weak)) HexaVal struct_store __attribute__((common));
 
 // Interpreter-level Val.tag constants (see self/interpreter.hexa lines 20-30).
 // Hardcoded here because the hexa-side `let TAG_ARRAY = 5` is emitted as a
 // HexaVal, not a C #define. Mismatch with runtime.c's HexaTag enum is
 // intentional — these are *interpreter Val tags* (vs->tag_i), not the
 // outer HexaVal.tag.
-#define HEXA_INTERP_TAG_ARRAY 5
-#define HEXA_INTERP_TAG_MAP   10
+#define HEXA_INTERP_TAG_ARRAY  5
+#define HEXA_INTERP_TAG_STRUCT 7
+#define HEXA_INTERP_TAG_MAP    10
 
 // Deep-copy an arena-allocated HexaMapTable to malloc'd storage. Recursive
 // over nested values (TAG_MAP and TAG_ARRAY descend; scalars + already-heap
@@ -2005,6 +2008,16 @@ HexaVal hexa_val_heapify(HexaVal v) {
                         // array walks both keys and values transitively.
                         map_store.arr.items[idx] =
                             hexa_val_heapify(map_store.arr.items[idx]);
+                    }
+                }
+            } else if (v.vs->tag_i == HEXA_INTERP_TAG_STRUCT && &struct_store != 0) {
+                // rt 36-D: struct_store[idx] is a TAG_MAP (field map).
+                // Heapify it so closure-captured structs survive scope pop.
+                if (struct_store.tag == TAG_ARRAY && struct_store.arr.items) {
+                    int64_t idx = v.vs->int_val;
+                    if (idx >= 0 && idx < (int64_t)struct_store.arr.len) {
+                        struct_store.arr.items[idx] =
+                            hexa_val_heapify(struct_store.arr.items[idx]);
                     }
                 }
             }

@@ -128,7 +128,28 @@ let BC_OP_ASSERT_INT   = 60      // 0x3C
 let BC_OP_ASSERT_FLOAT = 61      // 0x3D
 let BC_OP_PRINT        = 62      // 0x3E
 
-let BC_OP_COUNT        = 63      // sentinel
+// T56 #2 (rt#36-E) — HOIST_CELL Bx=local_slot.
+// Wraps the outer-scope local slot into a "cell" (a 2-elem array
+// [BC_CELL_TAG, val]) in place so that closures capturing this
+// slot share mutation through the same heap object. Idempotent:
+// if the slot already holds a cell, it is left as-is. Pushes the
+// cell reference onto the operand stack for the subsequent
+// NEW_CLOSURE_UPVAL to bind into the closure's upval table.
+//
+// Stack effect: +1 (pushes the cell ref).
+// Emitted ONLY at lambda-creation in the outer stream, next to
+// CLOSURE / NEW_CLOSURE_UPVAL — one per MUTABLE free var.
+let BC_OP_HOIST_CELL   = 63      // 0x3F
+// T62 — type conversion builtins (pop TOS, push converted value)
+let BC_OP_TO_STRING    = 64      // 0x40
+let BC_OP_TO_INT       = 65      // 0x41
+let BC_OP_TO_FLOAT     = 66      // 0x42
+let BC_OP_TYPE_OF      = 67      // 0x43
+// T63 — println (newline-appending variant). A operand carries
+// the arg count (0..N). OP_PRINT is no-newline; OP_PRINTLN appends \n.
+let BC_OP_PRINTLN      = 68      // 0x44
+
+let BC_OP_COUNT        = 69      // sentinel
 
 // T51 (rt#36-E #1) — CALL-of-closure sentinel. When OP_CALL is
 // emitted with b16 == BC_CALL_INDIRECT, the VM expects the callee
@@ -342,6 +363,13 @@ let mut bc_save_maxsp = []
 let mut bc_upval_names = []
 let mut bc_save_upvals = []
 
+// ── Hoisted-cell tracking (T56 #2). ─────────────────────────
+// Slots that have been HOIST_CELL'd by a prior lambda in the same
+// scope. When a later lambda captures the same variable as read-only,
+// it must still emit HOIST_CELL (not LOAD_LOCAL) so it binds the
+// shared cell ref instead of snapshotting a raw cell array.
+let mut bc_hoisted_slots = []
+
 // ── Loop context stacks (Phase 1: BreakStmt / ContinueStmt). ───
 // One entry per active enclosing loop. WhileStmt pushes on entry
 // and pops + backpatches on exit. BreakStmt appends its own
@@ -391,6 +419,7 @@ fn bc_reset() {
     bc_break_pcs = []
     bc_upval_names = []
     bc_save_upvals = []
+    bc_hoisted_slots = []
 }
 
 // Hard-reset pools only (caller rebuilds AST each compile).
@@ -407,6 +436,19 @@ fn bc_reset_pools() {
 fn bc_mk_int_lit(v) {
     let n = BcNode {
         kind: "IntLit", int_val: v, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_float_lit(v) {
+    let n = BcNode {
+        kind: "FloatLit", int_val: 0, float_val: v, bool_val: false,
         str_val: "", name: "", op: "",
         left_idx: -1, right_idx: -1,
         body_start: -1, body_end: -1, else_start: -1, else_end: -1,
@@ -656,6 +698,41 @@ fn bc_mk_while_stmt(cond_idx, body_start, body_end) {
         kind: "WhileStmt", int_val: 0, float_val: 0.0, bool_val: false,
         str_val: "", name: "", op: "",
         left_idx: cond_idx, right_idx: -1,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T61 — ForRangeStmt: `for i in start..end { body }` desugared to
+// counter-based while loop. No array allocation. Fields:
+//   left_idx = start expr, right_idx = end expr, name = loop var,
+//   bool_val = inclusive (..=), body_start/end = body stmts.
+fn bc_mk_for_range_stmt(start_idx, end_idx, var_name, inclusive, body_start, body_end) {
+    let n = BcNode {
+        kind: "ForRangeStmt", int_val: 0, float_val: 0.0, bool_val: inclusive,
+        str_val: "", name: var_name, op: "",
+        left_idx: start_idx, right_idx: end_idx,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T61 — ForArrayStmt: `for item in arr { body }` — general iteration.
+// Evaluates iterable once, loops with counter + ARR_GET. Fields:
+//   left_idx = iterable expr, name = loop var, body_start/end = body.
+fn bc_mk_for_array_stmt(iter_idx, var_name, body_start, body_end) {
+    let n = BcNode {
+        kind: "ForArrayStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: var_name, op: "",
+        left_idx: iter_idx, right_idx: -1,
         body_start: body_start, body_end: body_end,
         else_start: -1, else_end: -1,
         args_start: -1, args_end: -1,
@@ -1177,20 +1254,18 @@ fn bc_compile_expr(idx) {
             }
         }
 
-        // Lowered builtins (debug-only in Phase B).
+        // T63 — print/println with proper newline split and multi-arg.
+        // A operand of OP_PRINT/OP_PRINTLN carries the arg count. VM
+        // pops exactly that many values, concats in push order, prints.
         if fname == "print" {
-            // OP_PRINT consumes 1 value per call in the spec.
-            // For multi-arg print we'd need a series — MVP only
-            // supports single-arg. Multi-arg is rt#36-C.
-            let _r = bc_emit_raw(bc_enc_abx(BC_OP_PRINT, 0))
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_PRINT, nargs, 0))
             bc_pop(nargs)
-            // OP_PRINT doesn't push; expression form returns nil.
             let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
             bc_push1()
             return
         }
         if fname == "println" {
-            let _r = bc_emit_raw(bc_enc_abx(BC_OP_PRINT, 0))
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_PRINTLN, nargs, 0))
             bc_pop(nargs)
             let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
             bc_push1()
@@ -1204,6 +1279,32 @@ fn bc_compile_expr(idx) {
         // path so downstream error stays loud.
         if fname == "len" && nargs == 1 {
             let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+
+        // T62 — type conversion builtins: to_string, to_int, to_float, type_of
+        if fname == "to_string" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_STRING, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "to_int" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_INT, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "to_float" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_FLOAT, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "type_of" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TYPE_OF, 0))
             bc_pop(nargs)
             bc_push1()
             return
@@ -1283,18 +1384,44 @@ fn bc_compile_expr(idx) {
         // Step 3 — outer-side emit: CLOSURE pidx + NEW_CLOSURE_UPVAL
         // per free var. Each NEW_CLOSURE_UPVAL has net -1 stack effect
         // (pops val + closure, pushes new closure).
+        //
+        // T56 #2 (rt#36-E) — for MUTABLE free vars (any name the
+        // lambda body AssignStmt-writes), emit HOIST_CELL instead of
+        // LOAD_LOCAL. HOIST_CELL wraps the outer slot into a cell and
+        // pushes the cell ref — the NEW_CLOSURE_UPVAL below then binds
+        // THAT cell ref in the closure's upval table, so the inner
+        // STORE_UPVAL / LOAD_UPVAL handlers (cell-aware) and the outer
+        // LOAD_LOCAL / STORE_LOCAL (also cell-aware) all share state
+        // through the same heap object. Immutable upvalues keep the
+        // by-value LOAD_LOCAL snapshot path from T51.
         let _cl = bc_emit_raw(bc_enc_abx(BC_OP_CLOSURE, new_pidx))
         bc_push1()
         let mut fvi = 0
         while fvi < len(free_vars) {
             let fvn = free_vars[fvi]
+            let is_mut = bc_lambda_body_mutates(node, fvn)
             // Resolve the free var in the OUTER emit context.
             let o_slot = bc_resolve_local(fvn)
             if o_slot >= 0 {
-                let _ol = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, o_slot))
-                bc_push1()
+                // T56 #2: use HOIST_CELL if this lambda mutates the
+                // var OR if a prior lambda already hoisted this slot
+                // (so read-only closures bind the shared cell ref).
+                let slot_already_hoisted = bc_name_in(bc_hoisted_slots, fvn)
+                if is_mut || slot_already_hoisted {
+                    let _hc = bc_emit_raw(bc_enc_abx(BC_OP_HOIST_CELL, o_slot))
+                    bc_push1()
+                    if !slot_already_hoisted {
+                        bc_hoisted_slots = bc_hoisted_slots.push(fvn)
+                    }
+                } else {
+                    let _ol = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, o_slot))
+                    bc_push1()
+                }
             } else if bc_name_in(bc_upval_names, fvn) {
                 // Outer is itself a lambda — passthrough via its upval.
+                // (T56: hoist via enclosing upval chain is T57-OOS; we
+                // still emit LOAD_UPVAL which the VM auto-derefs cells,
+                // so immutable-in-nested-closure still works.)
                 let o_cidx = bc_add_const(fvn)
                 let _ou = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_UPVAL, o_cidx))
                 bc_push1()
@@ -1324,6 +1451,10 @@ fn bc_compile_expr(idx) {
         // else_lbl:
         //   [else bytecode]
         // end_lbl:
+        //
+        // T63 — body compilation uses bc_compile_block_as_expr which
+        // inlines the last ExprStmt (no POP), so expr-form bodies
+        // leave their final value on the stack as intended.
         bc_compile_expr(node.left_idx)          // cond
         let jmpf_pc = len(bc_code)
         let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))  // patched
@@ -1332,7 +1463,7 @@ fn bc_compile_expr(idx) {
         // Snapshot stack height before then-branch.
         let sp_before = bc_cur_sp
 
-        bc_compile_stmts(node.body_start, node.body_end)
+        bc_compile_block_as_expr(node.body_start, node.body_end)
 
         let jmp_pc = len(bc_code)
         let has_else = node.else_start >= 0
@@ -1350,13 +1481,123 @@ fn bc_compile_expr(idx) {
             // the verifier (rt#36-D) will check both arms leave
             // the same residual count.
             bc_cur_sp = sp_before
-            bc_compile_stmts(node.else_start, node.else_end)
+            bc_compile_block_as_expr(node.else_start, node.else_end)
 
             // Patch JMP.
             let end_pc = len(bc_code)
             let delta_j = end_pc - (jmp_pc + 1)
             bc_patch_code(jmp_pc, bc_enc_sbx(BC_OP_JMP, delta_j))
         }
+        return
+    }
+
+    // T63 — MatchExpr compile. Lowers to:
+    //   [scrutinee] STORE_LOCAL $m
+    //   for each arm (except wildcard/ident pat):
+    //     LOAD_LOCAL $m ; [pattern] ; EQ ; JMPF -> after_arm
+    //     [arm body: last ExprStmt inlined (no POP)]
+    //     JMP -> end
+    //   end:
+    // Literal patterns (IntLit/StringLit/BoolLit/FloatLit) use EQ.
+    // Wildcard (`Ident` name == "_") or bare Ident matches
+    // unconditionally. Guards + or-patterns deferred.
+    if k == "MatchExpr" {
+        bc_compile_expr(node.left_idx)
+        let me_slot = bc_define_local("$match_" + to_string(len(bc_code)))
+        let _rst = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, me_slot))
+        bc_pop(1)
+
+        let mut me_end_jmps = []
+        let sp_pre_match = bc_cur_sp
+        let mut me_ai = node.args_start
+        while me_ai < node.args_end {
+            let me_arm_idx = bc_arg_list[me_ai]
+            let me_arm = bc_node_pool[me_arm_idx]
+            let me_pat_idx = me_arm.left_idx
+            let mut is_wild = false
+            if me_pat_idx >= 0 {
+                let me_pat = bc_node_pool[me_pat_idx]
+                if me_pat.kind == "Wildcard" { is_wild = true }
+                if me_pat.kind == "Ident" && me_pat.name == "_" { is_wild = true }
+            } else {
+                is_wild = true
+            }
+
+            let mut me_jmpf_pc = -1
+            if !is_wild {
+                let _rll = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, me_slot))
+                bc_push1()
+                bc_compile_expr(me_pat_idx)
+                let _req = bc_emit_raw(bc_enc_abx(BC_OP_EQ, 0))
+                bc_pop(2)
+                bc_push1()
+                me_jmpf_pc = len(bc_code)
+                let _rjf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+                bc_pop(1)
+            }
+
+            // Compile arm body — inline last ExprStmt (no POP) so value
+            // stays on stack. Matches T59's block-body lambda pattern.
+            let me_bs = me_arm.body_start
+            let me_be = me_arm.body_end
+            let me_sp_pre_body = bc_cur_sp
+            let mut me_pushed_value = false
+            if me_bs >= 0 && me_be > me_bs {
+                let me_last_bi = me_be - 1
+                let mut me_bi = me_bs
+                while me_bi < me_be {
+                    let me_sidx = bc_stmt_list[me_bi]
+                    if me_sidx >= 0 {
+                        if me_bi == me_last_bi {
+                            let me_last = bc_node_pool[me_sidx]
+                            if me_last.kind == "ExprStmt" {
+                                bc_compile_expr(me_last.left_idx)
+                                me_pushed_value = true
+                            } else {
+                                bc_compile_stmt(me_sidx)
+                            }
+                        } else {
+                            bc_compile_stmt(me_sidx)
+                        }
+                    }
+                    me_bi = me_bi + 1
+                }
+            }
+            if !me_pushed_value {
+                let _rnv = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                bc_push1()
+            }
+
+            // JMP to end
+            let me_jmp_pc = len(bc_code)
+            let _rje = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))
+            me_end_jmps = me_end_jmps.push(me_jmp_pc)
+
+            // Patch JMPF to after arm
+            if me_jmpf_pc >= 0 {
+                let after_pc = len(bc_code)
+                let delta_af = after_pc - (me_jmpf_pc + 1)
+                bc_patch_code(me_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, delta_af))
+            }
+
+            // Reset sp to pre-match for parallel-branch model
+            bc_cur_sp = sp_pre_match
+            me_ai = me_ai + 1
+        }
+
+        // Fallthrough (no arm matched): push nil
+        let _rnm = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+
+        // Patch end jumps
+        let me_end_pc = len(bc_code)
+        let mut me_ej = 0
+        while me_ej < len(me_end_jmps) {
+            let mj = me_end_jmps[me_ej]
+            let me_de = me_end_pc - (mj + 1)
+            bc_patch_code(mj, bc_enc_sbx(BC_OP_JMP, me_de))
+            me_ej = me_ej + 1
+        }
+        bc_push1()
         return
     }
 
@@ -1665,6 +1906,184 @@ fn bc_compile_stmt(idx) {
         return
     }
 
+    // T61 — ForRangeStmt: `for i in start..end { body }`
+    // Desugared to counter-based while loop at compile time:
+    //   [eval start] STORE_LOCAL $i
+    //   [eval end]   STORE_LOCAL $__end
+    // loop_start:
+    //   LOAD_LOCAL $i ; LOAD_LOCAL $__end ; LT/LE ; JMPF -> loop_end
+    //   [body]
+    //   LOAD_LOCAL $i ; LOADI 1 ; ADD ; STORE_LOCAL $i
+    //   JMP -> loop_start
+    // loop_end:
+    if k == "ForRangeStmt" {
+        // Allocate locals for loop var and end bound
+        let fr_var_slot = bc_define_local(node.name)
+        let fr_end_name = "__for_end_" + node.name
+        let fr_end_slot = bc_define_local(fr_end_name)
+
+        // Emit start → store to loop var
+        bc_compile_expr(node.left_idx)
+        let _fs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_var_slot))
+        bc_pop(1)
+
+        // Emit end → store to end bound
+        bc_compile_expr(node.right_idx)
+        let _fe = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_end_slot))
+        bc_pop(1)
+
+        // Loop start
+        let fr_loop_start = len(bc_code)
+        bc_loop_start_stack = bc_loop_start_stack.push(fr_loop_start)
+        bc_break_pcs = bc_break_pcs.push([])
+
+        // Condition: i < end (or i <= end for inclusive)
+        let _li = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_var_slot))
+        bc_push1()
+        let _le = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_end_slot))
+        bc_push1()
+        let cmp_op = if node.bool_val { BC_OP_LE } else { BC_OP_LT }
+        let _cmp = bc_emit_raw(bc_enc_abx(cmp_op, 0))
+        bc_pop(1)  // 2 popped, 1 pushed → net -1
+
+        let fr_jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+
+        // Body
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // Increment: i = i + 1
+        let _il = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_var_slot))
+        bc_push1()
+        let _one = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 1))
+        bc_push1()
+        let _add = bc_emit_raw(bc_enc_abx(BC_OP_ADD, 0))
+        bc_pop(1)
+        let _is = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_var_slot))
+        bc_pop(1)
+
+        // JMP back to loop_start
+        let fr_jmp_pc = len(bc_code)
+        let fr_back = fr_loop_start - (fr_jmp_pc + 1)
+        let _jb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, fr_back))
+
+        // Patch JMPF
+        let fr_end_pc = len(bc_code)
+        let fr_fwd = fr_end_pc - (fr_jmpf_pc + 1)
+        bc_patch_code(fr_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fr_fwd))
+
+        // Backpatch breaks
+        let _btop = len(bc_break_pcs) - 1
+        let _bpcs = bc_break_pcs[_btop]
+        let mut _bi = 0
+        while _bi < len(_bpcs) {
+            let _bpc = _bpcs[_bi]
+            let _bdelta = fr_end_pc - (_bpc + 1)
+            bc_patch_code(_bpc, bc_enc_sbx(BC_OP_JMP, _bdelta))
+            _bi = _bi + 1
+        }
+        bc_break_pcs = bc_shrink(bc_break_pcs, _btop)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    // T61 — ForArrayStmt: `for item in arr { body }`
+    // General array iteration — eval once, loop with counter + ARR_GET.
+    if k == "ForArrayStmt" {
+        // Allocate hidden locals: __arr, __len, __i, and user loop var
+        let fa_arr_name = "__for_arr_" + node.name
+        let fa_len_name = "__for_len_" + node.name
+        let fa_idx_name = "__for_idx_" + node.name
+        let fa_arr_slot = bc_define_local(fa_arr_name)
+        let fa_len_slot = bc_define_local(fa_len_name)
+        let fa_idx_slot = bc_define_local(fa_idx_name)
+        let fa_var_slot = bc_define_local(node.name)
+
+        // Eval iterable → store
+        bc_compile_expr(node.left_idx)
+        let _as = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_arr_slot))
+        bc_pop(1)
+
+        // ARR_LEN → store
+        let _al = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_arr_slot))
+        bc_push1()
+        let _alen = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+        // ARR_LEN: pop arr, push len → net 0 (already on stack)
+        let _ls = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_len_slot))
+        bc_pop(1)
+
+        // __i = 0
+        let _iz = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 0))
+        bc_push1()
+        let _is = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_idx_slot))
+        bc_pop(1)
+
+        // Loop start
+        let fa_loop_start = len(bc_code)
+        bc_loop_start_stack = bc_loop_start_stack.push(fa_loop_start)
+        bc_break_pcs = bc_break_pcs.push([])
+
+        // Condition: __i < __len
+        let _il = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _ll = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_len_slot))
+        bc_push1()
+        let _lt = bc_emit_raw(bc_enc_abx(BC_OP_LT, 0))
+        bc_pop(1)
+
+        let fa_jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+
+        // item = arr[__i]
+        let _arl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_arr_slot))
+        bc_push1()
+        let _idl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _ag = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+        bc_pop(1)  // pop arr+idx, push val → net -1
+        let _vs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_var_slot))
+        bc_pop(1)
+
+        // Body
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // __i = __i + 1
+        let _i2l = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _one = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 1))
+        bc_push1()
+        let _add = bc_emit_raw(bc_enc_abx(BC_OP_ADD, 0))
+        bc_pop(1)
+        let _i2s = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_idx_slot))
+        bc_pop(1)
+
+        // JMP back
+        let fa_jmp_pc = len(bc_code)
+        let fa_back = fa_loop_start - (fa_jmp_pc + 1)
+        let _jb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, fa_back))
+
+        // Patch JMPF
+        let fa_end_pc = len(bc_code)
+        let fa_fwd = fa_end_pc - (fa_jmpf_pc + 1)
+        bc_patch_code(fa_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fa_fwd))
+
+        // Backpatch breaks
+        let _btop2 = len(bc_break_pcs) - 1
+        let _bpcs2 = bc_break_pcs[_btop2]
+        let mut _bi2 = 0
+        while _bi2 < len(_bpcs2) {
+            let _bpc2 = _bpcs2[_bi2]
+            let _bdelta2 = fa_end_pc - (_bpc2 + 1)
+            bc_patch_code(_bpc2, bc_enc_sbx(BC_OP_JMP, _bdelta2))
+            _bi2 = _bi2 + 1
+        }
+        bc_break_pcs = bc_shrink(bc_break_pcs, _btop2)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
     if k == "BreakStmt" {
         // Emit a JMP placeholder; the enclosing WhileStmt
         // backpatches the delta when loop_end_pc is known.
@@ -1853,6 +2272,47 @@ fn bc_compile_stmts(start, endx) {
 
 // ── Proto compilation (FnDecl → BcProto). ───────────────
 
+// T63 — Compile a stmt-list block as an expression: inline the last
+// ExprStmt so its value stays on the stack (no POP), and forward
+// trailing IfExpr/IfStmt/MatchExpr as expressions too. All preceding
+// stmts compile normally. Guarantees exactly +1 on the stack on exit
+// (pushes nil if the block is empty or has no tail value).
+fn bc_compile_block_as_expr(bs, be) {
+    if bs < 0 || be <= bs {
+        let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+        bc_push1()
+        return
+    }
+    let last_bi = be - 1
+    let mut bi = bs
+    let mut pushed = false
+    while bi < be {
+        let sidx = bc_stmt_list[bi]
+        if sidx >= 0 {
+            if bi == last_bi {
+                let last_node = bc_node_pool[sidx]
+                let lk = last_node.kind
+                if lk == "ExprStmt" {
+                    bc_compile_expr(last_node.left_idx)
+                    pushed = true
+                } else if lk == "IfExpr" || lk == "IfStmt" || lk == "MatchExpr" {
+                    bc_compile_expr(sidx)
+                    pushed = true
+                } else {
+                    bc_compile_stmt(sidx)
+                }
+            } else {
+                bc_compile_stmt(sidx)
+            }
+        }
+        bi = bi + 1
+    }
+    if !pushed {
+        let _rn2 = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+        bc_push1()
+    }
+}
+
 fn bc_compile_proto(fn_decl_idx) {
     let decl = bc_node_pool[fn_decl_idx]
 
@@ -1889,8 +2349,40 @@ fn bc_compile_proto(fn_decl_idx) {
         pi = pi + 1
     }
 
-    // Compile body statements.
-    bc_compile_stmts(decl.body_start, decl.body_end)
+    // T63 — Compile body with implicit return on last value-producing
+    // stmt. Mirrors T59's block-body lambda behavior for named fns.
+    // Last ExprStmt → compile inner expr + RETURN (not POP).
+    // Last IfExpr/IfStmt/MatchExpr → compile as expr + RETURN.
+    // Anything else → compile as stmt; terminating RETURN0 appended.
+    let fp_bs = decl.body_start
+    let fp_be = decl.body_end
+    if fp_bs >= 0 && fp_be > fp_bs {
+        let fp_last_bi = fp_be - 1
+        let mut fp_bi = fp_bs
+        while fp_bi < fp_be {
+            let fp_sidx = bc_stmt_list[fp_bi]
+            if fp_sidx >= 0 {
+                if fp_bi == fp_last_bi {
+                    let fp_last = bc_node_pool[fp_sidx]
+                    let fplk = fp_last.kind
+                    if fplk == "ExprStmt" {
+                        bc_compile_expr(fp_last.left_idx)
+                        let _rfr = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                    } else if fplk == "IfExpr" || fplk == "IfStmt" || fplk == "MatchExpr" {
+                        bc_compile_expr(fp_sidx)
+                        let _rfr2 = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                    } else {
+                        bc_compile_stmt(fp_sidx)
+                    }
+                } else {
+                    bc_compile_stmt(fp_sidx)
+                }
+            }
+            fp_bi = fp_bi + 1
+        }
+    }
 
     // Ensure a terminating RETURN — the verifier insists on it.
     // Only append if the last insn isn't already a RETURN.
@@ -2005,7 +2497,7 @@ fn bc_collect_free_vars_expr(expr_idx, locals, acc) {
         // regression (rt#36-E).
         let mut a = acc
         if n.name != "" {
-            let is_builtin_call = (n.name == "print") || (n.name == "println") || (n.name == "len")
+            let is_builtin_call = (n.name == "print") || (n.name == "println") || (n.name == "len") || (n.name == "to_string") || (n.name == "to_int") || (n.name == "to_float") || (n.name == "type_of")
             let is_known_proto = bc_lookup_proto(n.name) >= 0
             if !is_builtin_call && !is_known_proto {
                 if !bc_name_in(locals, n.name) {
@@ -2108,6 +2600,17 @@ fn bc_collect_free_vars_stmts(start, endx, locals, acc) {
                 out = bc_collect_free_vars_stmts(s.body_start, s.body_end, cur_locals, out)
             } else if sk == "IfExpr" || sk == "IfStmt" {
                 out = bc_collect_free_vars_expr(sidx, cur_locals, out)
+            } else if sk == "ForRangeStmt" {
+                // T61: start/end exprs + body
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                out = bc_collect_free_vars_expr(s.right_idx, cur_locals, out)
+                let fr_locals = cur_locals.push(s.name)
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, fr_locals, out)
+            } else if sk == "ForArrayStmt" {
+                // T61: iterable expr + body
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                let fa_locals = cur_locals.push(s.name)
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, fa_locals, out)
             } else if sk == "CompoundAssign" {
                 if s.name != "" {
                     if !bc_name_in(cur_locals, s.name) {
@@ -2125,6 +2628,129 @@ fn bc_collect_free_vars_stmts(start, endx, locals, acc) {
         i = i + 1
     }
     return out
+}
+
+// T56 #2 (rt#36-E) — scan a lambda body for writes to a named
+// free var. Returns true iff the name appears on the LHS of any
+// AssignStmt or CompoundAssign inside the body slice (recursively
+// through nested WhileStmt/IfExpr bodies). Used by the lambda
+// emit path to decide whether to HOIST_CELL the outer binding
+// (mutable upvalue) or snapshot it by value (immutable upvalue).
+//
+// Scope: stmts-level scan; expr-level Lambda-in-Lambda is OOS for
+// T56 (matches bc_collect_free_vars_expr's `if k == "Lambda"
+// return acc` conservative cut). Nested While/If bodies ARE
+// recursed so that `while running { counter = counter + 1 }`
+// inside a block-body lambda correctly flags `counter` mutable.
+fn bc_free_var_is_mutable_in_stmts(start, endx, name) {
+    if start < 0 { return false }
+    let mut i = start
+    while i < endx {
+        let sidx = bc_stmt_list[i]
+        if sidx >= 0 {
+            let s = bc_node_pool[sidx]
+            let sk = s.kind
+            if sk == "AssignStmt" || sk == "CompoundAssign" {
+                if s.name == name { return true }
+            }
+            if sk == "WhileStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+            }
+            if sk == "IfExpr" || sk == "IfStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+                if s.else_start >= 0 {
+                    if bc_free_var_is_mutable_in_stmts(s.else_start, s.else_end, name) {
+                        return true
+                    }
+                }
+            }
+            // T61: recurse into for-loop bodies
+            if sk == "ForRangeStmt" || sk == "ForArrayStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// T56 #2 — wrapper that also handles expr-body lambdas (T51). An
+// expr body cannot contain stmt-level assigns, so an expr-body
+// lambda has zero mutable upvalues by construction. This helper
+// unifies the call site: pass the Lambda node and the name.
+fn bc_lambda_body_mutates(lam_node, name) {
+    if lam_node.left_idx >= 0 {
+        // Expr-body (T51) — no stmts → no writes. Conservatively false.
+        return false
+    }
+    if lam_node.body_start >= 0 {
+        return bc_free_var_is_mutable_in_stmts(lam_node.body_start, lam_node.body_end, name)
+    }
+    return false
+}
+
+// T58 — pre-scan: walk a stmt range, find all Lambdas, and for each
+// free variable that any lambda mutates, seed bc_hoisted_slots. This
+// makes hoisted-slot tracking order-independent — a read-only closure
+// defined before a mutating closure will still bind the shared cell.
+fn bc_prescan_hoist_set(stmts_start, stmts_end) {
+    if stmts_start < 0 { return }
+    let mut i = stmts_start
+    while i < stmts_end {
+        let sidx = bc_stmt_list[i]
+        if sidx >= 0 {
+            let s = bc_node_pool[sidx]
+            let mut lam_node_idx = -1
+            // Direct Lambda stmt (rare but possible)
+            if s.kind == "Lambda" {
+                lam_node_idx = sidx
+            }
+            // LetStmt / LetMutStmt with Lambda RHS (common: let f = |x| ...)
+            if s.kind == "LetStmt" || s.kind == "LetMutStmt" {
+                if s.left_idx >= 0 {
+                    let rhs = bc_node_pool[s.left_idx]
+                    if rhs.kind == "Lambda" {
+                        lam_node_idx = s.left_idx
+                    }
+                }
+            }
+            if lam_node_idx >= 0 {
+                let lam = bc_node_pool[lam_node_idx]
+                // Collect params to exclude from free-var set
+                let mut params_seen = []
+                let mut pi = lam.params_start
+                if pi >= 0 {
+                    while pi < lam.params_end {
+                        params_seen = params_seen.push(bc_param_list[pi])
+                        pi = pi + 1
+                    }
+                }
+                let mut fvs = []
+                if lam.left_idx >= 0 {
+                    fvs = bc_collect_free_vars_expr(lam.left_idx, params_seen, [])
+                } else if lam.body_start >= 0 {
+                    fvs = bc_collect_free_vars_stmts(lam.body_start, lam.body_end, params_seen, [])
+                }
+                let mut fi = 0
+                while fi < len(fvs) {
+                    let fvn = fvs[fi]
+                    if bc_lambda_body_mutates(lam, fvn) {
+                        if !bc_name_in(bc_hoisted_slots, fvn) {
+                            bc_hoisted_slots = bc_hoisted_slots.push(fvn)
+                        }
+                    }
+                    fi = fi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
 }
 
 // T51 — compile a Lambda body as a new BcProto. Mirrors
@@ -2174,17 +2800,36 @@ fn bc_compile_lambda_proto(lam_node, free_vars) {
         bc_pop(1)
     } else if lam_node.body_start >= 0 {
         // Block-body (T54) — compile each stmt in bc_stmt_list slice.
-        // Fall-through at end emits RETURN0 (void); explicit
-        // `return expr` inside the block emits its own RETURN.
+        // T59: if the LAST stmt is an ExprStmt, compile its inner
+        // expression and RETURN the value (implicit return). Otherwise
+        // fall-through emits RETURN0 (void). Explicit `return expr`
+        // inside the block emits its own RETURN.
+        let last_bi = lam_node.body_end - 1
         let mut lbi = lam_node.body_start
+        let mut emitted_return = false
         while lbi < lam_node.body_end {
             let sidx = bc_stmt_list[lbi]
             if sidx >= 0 {
-                bc_compile_stmt(sidx)
+                if lbi == last_bi {
+                    let last_node = bc_node_pool[sidx]
+                    if last_node.kind == "ExprStmt" {
+                        // T59: last expr-stmt → return its value
+                        bc_compile_expr(last_node.left_idx)
+                        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                        emitted_return = true
+                    } else {
+                        bc_compile_stmt(sidx)
+                    }
+                } else {
+                    bc_compile_stmt(sidx)
+                }
             }
             lbi = lbi + 1
         }
-        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+        if !emitted_return {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+        }
     } else {
         // Empty lambda body — loud nil return.
         let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
@@ -2254,6 +2899,10 @@ fn bc_compile_root(stmts_start, stmts_end) {
         }
         p_i = p_i + 1
     }
+
+    // T58: pre-scan all top-level lambdas to seed bc_hoisted_slots
+    // before any emission — order-independent mutable cell tracking.
+    bc_prescan_hoist_set(stmts_start, stmts_end)
 
     // Treat the root as an implicit proto `<main>` so the same
     // bc_compile_proto machinery applies. First, harvest all
@@ -2451,6 +3100,12 @@ fn bc_opname(op) {
     if op == BC_OP_ASSERT_INT   { return "ASSERT_INT" }
     if op == BC_OP_ASSERT_FLOAT { return "ASSERT_FLOAT" }
     if op == BC_OP_PRINT        { return "PRINT" }
+    if op == BC_OP_HOIST_CELL   { return "HOIST_CELL" }
+    if op == BC_OP_TO_STRING    { return "TO_STRING" }
+    if op == BC_OP_TO_INT       { return "TO_INT" }
+    if op == BC_OP_TO_FLOAT     { return "TO_FLOAT" }
+    if op == BC_OP_TYPE_OF      { return "TYPE_OF" }
+    if op == BC_OP_PRINTLN      { return "PRINTLN" }
     return "UNKNOWN"
 }
 
@@ -2609,10 +3264,8 @@ fn ast_to_bc_expr(node) {
         return bc_mk_int_lit(iv)
     }
     if k == "FloatLit" {
-        // MVP: stash as string const pool entry via the builder's
-        // to_string path — but the builder wants a `float`. We
-        // approximate by parsing to int (fib test doesn't use floats).
-        return bc_mk_int_lit(0)
+        let fv = to_float(node.value)
+        return bc_mk_float_lit(fv)
     }
     if k == "BoolLit" {
         return bc_mk_bool_lit(node.value == "true")
@@ -2625,6 +3278,19 @@ fn ast_to_bc_expr(node) {
     }
     if k == "Ident" {
         return bc_mk_ident(node.name)
+    }
+    if k == "Wildcard" {
+        let wn = BcNode {
+            kind: "Wildcard", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "_", op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(wn)
+        return len(bc_node_pool) - 1
     }
     if k == "BinOp" {
         let li = ast_to_bc_expr(node.left)
@@ -2862,6 +3528,55 @@ fn ast_to_bc_expr(node) {
         return bc_mk_struct_init(node.name, sstart, send)
     }
 
+    // T63 — MatchExpr: lower to BcNode with scrutinee at left_idx and
+    // arms stashed in bc_arg_list. Each arm is itself a BcNode with
+    // kind="MatchArm", left_idx = pattern expr, body_start/end = body
+    // stmts. No or-patterns, no guards (MVP); those fall through to
+    // the arm's literal pattern only.
+    if k == "MatchExpr" {
+        let me_s = ast_to_bc_expr(node.left)
+        let me_arms = node.arms
+        let mut me_arm_idxs = []
+        if type_of(me_arms) == "array" {
+            let mut ma_i = 0
+            while ma_i < len(me_arms) {
+                let ma = me_arms[ma_i]
+                let pat_idx = ast_to_bc_expr(ma.left)
+                let body_bb = ast_to_bc_walk_body(ma.body)
+                let arm_node = BcNode {
+                    kind: "MatchArm", int_val: 0, float_val: 0.0, bool_val: false,
+                    str_val: "", name: "", op: "",
+                    left_idx: pat_idx, right_idx: -1,
+                    body_start: body_bb[0], body_end: body_bb[1],
+                    else_start: -1, else_end: -1,
+                    args_start: -1, args_end: -1,
+                    n_params: 0, params_start: -1, params_end: -1
+                }
+                bc_node_pool = bc_node_pool.push(arm_node)
+                me_arm_idxs = me_arm_idxs.push(len(bc_node_pool) - 1)
+                ma_i = ma_i + 1
+            }
+        }
+        let me_start = len(bc_arg_list)
+        let mut me_k = 0
+        while me_k < len(me_arm_idxs) {
+            bc_arg_list = bc_arg_list.push(me_arm_idxs[me_k])
+            me_k = me_k + 1
+        }
+        let me_end = len(bc_arg_list)
+        let me_node = BcNode {
+            kind: "MatchExpr", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "", op: "",
+            left_idx: me_s, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: me_start, args_end: me_end,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(me_node)
+        return len(bc_node_pool) - 1
+    }
+
     // Unsupported expr — return a harmless IntLit 0 placeholder.
     return bc_mk_int_lit(0)
 }
@@ -3056,6 +3771,39 @@ fn ast_to_bc_stmt(node) {
             }
         }
         return bc_mk_if_expr(ci, ts[0], ts[1], es_start, es_end)
+    }
+
+    // T61 — ForStmt: `for i in expr { body }`. Detect Range iter for
+    // counter-based desugaring; otherwise fall back to array iteration.
+    if k == "ForStmt" || k == "ForElseStmt" {
+        let iter_node = node.iter_expr
+        let var_name = node.name
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        let bs_start = bb[0]
+        let bs_end = bb[1]
+
+        if !ast_is_empty(iter_node) {
+            if iter_node.kind == "Range" {
+                // Range: desugar to ForRangeStmt (no array allocation)
+                let start_idx = ast_to_bc_expr(iter_node.left)
+                let end_idx = ast_to_bc_expr(iter_node.right)
+                let inclusive = false
+                if type_of(iter_node.value) == "string" {
+                    if iter_node.value == "inclusive" { inclusive = true }
+                }
+                return bc_mk_for_range_stmt(start_idx, end_idx, var_name, inclusive, bs_start, bs_end)
+            }
+        }
+        // General iteration
+        let iter_idx = ast_to_bc_expr(iter_node)
+        return bc_mk_for_array_stmt(iter_idx, var_name, bs_start, bs_end)
+    }
+
+    // T62 — UseStmt / ImportStmt: runtime no-op (matches interpreter
+    // val_void() at hexa_full.hexa:7476). Preprocessor already inlined.
+    if k == "UseStmt" || k == "ImportStmt" || k == "Use" {
+        return -1
     }
 
     // ExprStmt: hexa parser wraps bare expressions in ExprStmt nodes
