@@ -155,9 +155,9 @@ landed on 2026-04-14, before this design doc was authored:
 | HEXA_VAL_ARENA risk (T31/T33/T37/T40) | All closed, default ON | 3ae3d7a (BT_T43_ARENA_DEFAULT_ON) |
 | codegen_c2 println/printf 분기 — T32~T46 활성 작업 충돌 | Stale; recent (T58-T63) avoids those branches | 0bea3ce stat — 12 lines, no println/printf hits |
 
-Wire-in is therefore **un-deferred**; next cycle should attempt site
-edits + small-program regen verification before going to interpreter.hexa.
-Site inventory unchanged:
+Wire-in is therefore **un-deferred** at the runtime/blocker layer.
+However, validation infrastructure has its own gates (see "Wire-in
+execution gates" below). Site inventory unchanged:
 
 | Group | Count | Line range (generated .c) | Fix |
 |-------|-------|---------------------------|-----|
@@ -175,3 +175,21 @@ Codegen edit points (source: `self/codegen_c2.hexa`):
 Closing all three groups moves default-flag gcc errors **20 → 0** per R2
 measurement against the corrupted hexa_native.c; independent of baseline
 source recovery.
+
+## Wire-in execution gates (2026-04-15)
+
+Runtime/blocker layer is open. Validation infrastructure is not. RT-P3-1
+needs sub-task split before next attempt:
+
+| Gate | Symptom (measured 2026-04-15) | Fix |
+|------|-------------------------------|-----|
+| (a) `pub` parser in stage0 | `self/test_codegen_c2_extended.hexa` 0/48 PASS — `unexpected token Pub` | stage0 lexer/parser add `pub` keyword |
+| (b) Synthetic stress harness | tiny baseline (let/println/int/str) compiles cleanly via hexa_v2 — does NOT exercise codegen_c2 group A/B/C patterns | one synthetic .hexa per group reproducing the failing pattern |
+| (c) Codegen wire-in (5 sites) | mechanical, blocked on (a)+(b) for verification | apply edits 1276/1374/1380/1121/1756 + StringLit kind |
+| (d) Verify + regression | requires (a)+(b)+(c) | run synthetic harness + existing test suite |
+
+Note: `hexa build` and tiny-test AOT chain go through `self/native/hexa_v2`
+(C standalone), NOT codegen_c2.hexa. Wire-in changes are invisible to that
+path — codegen_c2 is the *future* P4 self-host codegen. Validation must
+exercise the codegen_c2 path explicitly (gate a) or via interpreter.hexa
+regen (do_not list — risky).
