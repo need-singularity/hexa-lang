@@ -2974,23 +2974,9 @@ HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
     return hexa_void();
 }
 
-HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
-    if (p == 0) return hexa_void();
-    float f = (float)__hx_to_double(val);
-    memcpy((uint8_t*)(uintptr_t)p + off, &f, sizeof(float));
-    return hexa_void();
-}
-
-HexaVal hexa_ptr_write_i32(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
-    if (p == 0) return hexa_void();
-    int32_t v = (int32_t)val.i;
-    memcpy((uint8_t*)(uintptr_t)p + off, &v, sizeof(int32_t));
-    return hexa_void();
-}
+/* @hot_kernel f32/f64/i32 ptr read/write — extracted to tensor_kernels.c
+ * (included at end of this file). hexa_ptr_read (untyped 64-bit) kept here
+ * as general-purpose. */
 
 HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
     int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
@@ -2999,33 +2985,6 @@ HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
     int64_t v;
     memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int64_t));
     return hexa_int(v);
-}
-
-HexaVal hexa_ptr_read_f64(HexaVal ptr, HexaVal offset) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
-    if (p == 0) return hexa_float(0.0);
-    double d;
-    memcpy(&d, (uint8_t*)(uintptr_t)p + off, sizeof(double));
-    return hexa_float(d);
-}
-
-HexaVal hexa_ptr_read_f32(HexaVal ptr, HexaVal offset) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
-    if (p == 0) return hexa_float(0.0);
-    float f;
-    memcpy(&f, (uint8_t*)(uintptr_t)p + off, sizeof(float));
-    return hexa_float((double)f);
-}
-
-HexaVal hexa_ptr_read_i32(HexaVal ptr, HexaVal offset) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t off = (offset.tag == TAG_INT) ? offset.i : 0;
-    if (p == 0) return hexa_int(0);
-    int32_t v;
-    memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int32_t));
-    return hexa_int((int64_t)v);
 }
 
 HexaVal hexa_ptr_offset(HexaVal ptr, HexaVal offset) {
@@ -3063,16 +3022,8 @@ HexaVal hexa_struct_pack(HexaVal* args, int nargs) {
     return hexa_int((int64_t)(uintptr_t)buf);
 }
 
-// Pack N f32 values into a newly allocated buffer. Returns pointer as int.
-HexaVal hexa_struct_pack_f32(HexaVal* args, int nargs) {
-    if (nargs <= 0) return hexa_int(0);
-    size_t total = (size_t)nargs * sizeof(float);
-    float* buf = (float*)calloc(1, total);
-    for (int i = 0; i < nargs; i++) {
-        buf[i] = (float)((args[i].tag == TAG_FLOAT) ? args[i].f : (double)args[i].i);
-    }
-    return hexa_int((int64_t)(uintptr_t)buf);
-}
+/* @hot_kernel hexa_struct_pack_f32 / hexa_struct_unpack_f32 extracted to
+ * tensor_kernels.c (see include at end of this file). */
 
 // Read the Nth f64 from a struct pointer.
 HexaVal hexa_struct_unpack(HexaVal ptr, HexaVal index) {
@@ -3081,15 +3032,6 @@ HexaVal hexa_struct_unpack(HexaVal ptr, HexaVal index) {
     if (p == 0) return hexa_float(0.0);
     double* buf = (double*)(uintptr_t)p;
     return hexa_float(buf[idx]);
-}
-
-// Read the Nth f32 from a struct pointer.
-HexaVal hexa_struct_unpack_f32(HexaVal ptr, HexaVal index) {
-    int64_t p = (ptr.tag == TAG_INT) ? ptr.i : 0;
-    int64_t idx = (index.tag == TAG_INT) ? index.i : 0;
-    if (p == 0) return hexa_float(0.0);
-    float* buf = (float*)(uintptr_t)p;
-    return hexa_float((double)buf[idx]);
 }
 
 // Convenience: pack an NSRect (4x f64 = 32 bytes).
@@ -3286,42 +3228,8 @@ HexaVal hexa_callback_get_fn(int slot_id) {
     return __hexa_cb_slots[slot_id].hexa_fn;
 }
 
-// ===== B4: tensor stubs + clock/random =====
-typedef struct { int64_t rows; int64_t cols; float* data; } HexaTensorStub;
-
-HexaVal hexa_tensor_new(HexaVal r, HexaVal c) {
-    int64_t rows = (r.tag==TAG_INT)?r.i:(int64_t)r.f;
-    int64_t cols = (c.tag==TAG_INT)?c.i:(int64_t)c.f;
-    HexaTensorStub* t = (HexaTensorStub*)calloc(1, sizeof(*t));
-    t->rows = rows; t->cols = cols;
-    t->data = (float*)calloc((size_t)(rows*cols), sizeof(float));
-    return hexa_int((int64_t)(uintptr_t)t);
-}
-
-HexaVal hexa_tensor_randn(HexaVal r, HexaVal c) {
-    HexaVal v = hexa_tensor_new(r, c);
-    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)v.i;
-    int64_t n = t->rows * t->cols;
-    for (int64_t i = 0; i < n; i++) {
-        double u = (rand()+1.0)/(RAND_MAX+1.0);
-        double w = (rand()+1.0)/(RAND_MAX+1.0);
-        t->data[i] = (float)(sqrt(-2.0*log(u)) * cos(6.28318530718*w));
-    }
-    return v;
-}
-
-HexaVal hexa_tensor_data_ptr(HexaVal tv) {
-    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)tv.i;
-    return hexa_int((int64_t)(uintptr_t)t->data);
-}
-
-HexaVal hexa_tensor_from_ptr(HexaVal p, HexaVal r, HexaVal c) {
-    HexaTensorStub* t = (HexaTensorStub*)calloc(1, sizeof(*t));
-    t->rows = (r.tag==TAG_INT)?r.i:(int64_t)r.f;
-    t->cols = (c.tag==TAG_INT)?c.i:(int64_t)c.f;
-    t->data = (float*)(uintptr_t)((p.tag==TAG_INT)?p.i:(int64_t)p.f);
-    return hexa_int((int64_t)(uintptr_t)t);
-}
+/* @hot_kernel B4 tensor stubs extracted to tensor_kernels.c (see include
+ * at end of this file). clock/random stay here (OS utility, not hot). */
 
 HexaVal hexa_clock(void) {
     struct timespec ts;
@@ -3748,4 +3656,21 @@ static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); 
 HexaVal timestamp     = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_timestamp_w,     .arity=0}};
 HexaVal base64_encode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_encode_w, .arity=1}};
 HexaVal base64_decode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_decode_w, .arity=1}};
+
+/* ═══════════════════════════════════════════════════════════════════
+ * T3 HOT KERNEL INCLUDE — anima training inner-loop fast path.
+ *
+ * f32/f64/i32 ptr r/w + struct_pack_f32/unpack_f32 + tensor stubs are
+ * extracted into native/tensor_kernels.c so anima maintainers can find
+ * the performance-critical boundary without grep'ing through 3600 LOC.
+ *
+ * @hot_kernel markers inside the file describe each function's role.
+ * Whitelist (external consumers): $NEXUS/shared/hexa/hot-path.jsonl.
+ * Migration policy: docs/hexa-hot-path.md.
+ *
+ * NEVER migrate these to HEXA — per-element HexaVal wrap/dispatch would
+ * multiply training time 10-100x. Any future HEXA reimplementation must
+ * preserve raw C float* access patterns.
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/tensor_kernels.c"
 
