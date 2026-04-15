@@ -7514,9 +7514,10 @@ HexaVal gen2_fn_decl(HexaVal node) {
     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(_ret_type), hexa_str("string")))))) {
         _wants_tail_return = hexa_bool(0);
     }
-    if (hexa_truthy(hexa_eq(_ret_type, hexa_str("")))) {
-        _wants_tail_return = hexa_bool(0);
-    }
+    /* Fix 2026-04-16: removed `_ret_type == ""` guard — untyped fns also need
+       implicit-tail-return (was silently dropping values in _ceil_div,
+       rtc_launch, rtc_launch_1d, etc. caused H100 CLM cuLaunchKernelEx
+       INVALID_VALUE). Skip-list below keeps void trailing exprs safe. */
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(_ret_type, hexa_str("Void"))) || hexa_truthy(hexa_eq(_ret_type, hexa_str("void"))))) || hexa_truthy(hexa_eq(_ret_type, hexa_str("()")))))) {
         _wants_tail_return = hexa_bool(0);
     }
@@ -8712,6 +8713,12 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_str("hexa_tensor_data_ptr("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_344), hexa_int(0)))), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("tensor_from_f32_ptr")))) {
+                /* 2026-04-16 CUDA-compose spike fix: accept both 2-arg (ptr, numel)
+                   and 3-arg (ptr, rows, cols) forms. cuda_ffi.hexa / gpu_train.hexa
+                   use the 2-arg flat-vector form. */
+                if (hexa_len(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_345)) == 2) {
+                    return hexa_add(hexa_add(hexa_add(hexa_str("hexa_tensor_from_ptr("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_345), hexa_int(0)))), hexa_str(", hexa_int(1), ")), hexa_add(gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_346), hexa_int(1))), hexa_str(")")));
+                }
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_tensor_from_ptr("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_345), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_346), hexa_int(1)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_347), hexa_int(2)))), hexa_str(")"));
             }
             arg_strs = hexa_array_new();
