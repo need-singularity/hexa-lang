@@ -1757,8 +1757,13 @@ static int hexa_val_arena_on(void) {
         // T31: default OFF. Opt-in with HEXA_VAL_ARENA=1 after scope-pop audit.
         // T33: partial — hmap realloc/free on arena memory fixed (hmap_set +
         // hmap_grow), but module_loader use-path OOB remains. Default stays OFF.
+        // 2026-04-16: ROI #87 found literal-struct-inside-fn IndexAssign
+        // corruption (box[0]=S{..} → box[0] reads back as string). Matches
+        // T33 symptom class. Default reverted to 0 to match the documented
+        // intent; flip back once interpreter.hexa IndexAssign heapifies the
+        // RHS val before writing to array_store.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 1;
+            __hexa_val_arena_enabled = 0;
         } else {
             __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
