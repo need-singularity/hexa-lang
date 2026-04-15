@@ -7373,12 +7373,79 @@ HexaVal gen2_fn_decl(HexaVal node) {
     if (hexa_truthy(has_stack_alloc)) {
         chunks = hexa_array_push(chunks, hexa_str("    /* @stack_alloc: bounded arrays use alloca */\n"));
     }
+    /* bt 74: implicit tail-return. When a fn has an explicit non-void
+       return type AND its LAST body stmt is an ExprStmt carrying a plain
+       value-producing expression (not IfExpr/MatchExpr — those expand to
+       statements via gen2_stmt — and not Call to a void-returning builtin
+       like println/print/eprintln/exit), emit it as `return <expr>;`
+       instead of `<expr>;`. This restores the idiomatic hexa style
+       `fn f() -> T { T { ... } }` which otherwise silently dropped the
+       struct literal and returned hexa_void(), causing downstream
+       `f().field` to fail with "map key not found". The trailing
+       `return hexa_void();` footer is kept unchanged as a dead-code
+       safety net for all other shapes. */
+    HexaVal __ret_type74 = hexa_map_get(node, "ret_type");
+    int __wants_tail74 = 1;
+    if (!hexa_truthy(hexa_eq(hexa_type_of(__ret_type74), hexa_str("string")))) {
+        __wants_tail74 = 0;
+    } else if (hexa_truthy(hexa_eq(__ret_type74, hexa_str("")))) {
+        __wants_tail74 = 0;
+    } else if (hexa_truthy(hexa_eq(__ret_type74, hexa_str("Void")))) {
+        __wants_tail74 = 0;
+    } else if (hexa_truthy(hexa_eq(__ret_type74, hexa_str("void")))) {
+        __wants_tail74 = 0;
+    } else if (hexa_truthy(hexa_eq(__ret_type74, hexa_str("()")))) {
+        __wants_tail74 = 0;
+    }
+    HexaVal __body74 = hexa_map_get_ic(node, "body", &__hexa_codegen_c2_ic_56);
+    HexaVal __body_len74 = hexa_int(hexa_len(__body74));
     HexaVal bi = hexa_int(0);
-    while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(bi); HexaVal __r=(hexa_int(hexa_len(hexa_map_get_ic(node, "body", &__hexa_codegen_c2_ic_56)))); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
-        if (hexa_truthy(has_stack_alloc)) {
-            chunks = hexa_array_push(chunks, gen2_stmt_stack_alloc(hexa_index_get(hexa_map_get_ic(node, "body", &__hexa_codegen_c2_ic_57), bi), hexa_int(1)));
-        } else {
-            chunks = hexa_array_push(chunks, gen2_stmt(hexa_index_get(hexa_map_get_ic(node, "body", &__hexa_codegen_c2_ic_58), bi), hexa_int(1)));
+    while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(bi); HexaVal __r=(__body_len74); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
+        HexaVal __stmt74 = hexa_index_get(__body74, bi);
+        int __did_emit_return = 0;
+        /* Only rewrite on the last stmt, only when stack_alloc is off,
+           and only when the fn declared a non-void return type. */
+        if (__wants_tail74 && bi.i == __body_len74.i - 1 && !hexa_truthy(has_stack_alloc)) {
+            if (!hexa_truthy(hexa_eq(hexa_type_of(__stmt74), hexa_str("string")))) {
+                HexaVal __skind74 = hexa_map_get(__stmt74, "kind");
+                if (hexa_truthy(hexa_eq(__skind74, hexa_str("ExprStmt")))) {
+                    HexaVal __inner74 = hexa_map_get(__stmt74, "left");
+                    if (!hexa_truthy(hexa_eq(hexa_type_of(__inner74), hexa_str("string")))) {
+                        HexaVal __ikind74 = hexa_map_get(__inner74, "kind");
+                        int __skip74 = 0;
+                        if (hexa_truthy(hexa_eq(__ikind74, hexa_str("IfExpr")))) __skip74 = 1;
+                        if (hexa_truthy(hexa_eq(__ikind74, hexa_str("MatchExpr")))) __skip74 = 1;
+                        /* Skip Call-to-void-builtin cases. */
+                        if (!__skip74 && hexa_truthy(hexa_eq(__ikind74, hexa_str("Call")))) {
+                            HexaVal __callee74 = hexa_map_get(__inner74, "left");
+                            if (!hexa_truthy(hexa_eq(hexa_type_of(__callee74), hexa_str("string")))) {
+                                HexaVal __ckind74 = hexa_map_get(__callee74, "kind");
+                                if (hexa_truthy(hexa_eq(__ckind74, hexa_str("Ident")))) {
+                                    HexaVal __cname74 = hexa_map_get(__callee74, "name");
+                                    if (hexa_truthy(hexa_eq(__cname74, hexa_str("println")))) __skip74 = 1;
+                                    if (hexa_truthy(hexa_eq(__cname74, hexa_str("print")))) __skip74 = 1;
+                                    if (hexa_truthy(hexa_eq(__cname74, hexa_str("eprintln")))) __skip74 = 1;
+                                    if (hexa_truthy(hexa_eq(__cname74, hexa_str("exit")))) __skip74 = 1;
+                                }
+                            }
+                        }
+                        if (!__skip74) {
+                            chunks = hexa_array_push(chunks,
+                                hexa_add(hexa_add(hexa_str("    return "),
+                                                   gen2_expr(__inner74)),
+                                          hexa_str(";\n")));
+                            __did_emit_return = 1;
+                        }
+                    }
+                }
+            }
+        }
+        if (!__did_emit_return) {
+            if (hexa_truthy(has_stack_alloc)) {
+                chunks = hexa_array_push(chunks, gen2_stmt_stack_alloc(__stmt74, hexa_int(1)));
+            } else {
+                chunks = hexa_array_push(chunks, gen2_stmt(__stmt74, hexa_int(1)));
+            }
         }
         bi = hexa_add(bi, hexa_int(1));
     }
