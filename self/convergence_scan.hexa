@@ -1,0 +1,481 @@
+// ═══════════════════════════════════════════════════════════
+//  self/convergence_scan.hexa — source-embedded convergence metadata scanner
+//
+//  목적: shared/convergence/<project>.json 을 소스 내부 주석
+//        (@convergence-start ... @convergence-end) 로 대체. 본 스크립트는
+//        파일을 라인 기반 스캔해서 블록을 수집하고 JSON 으로 덤프한다.
+//
+//  사용:
+//    hexa convergence dump <file>        — 전체 블록 + meta 를 JSON 출력
+//    hexa convergence dump-meta <file>   — @convergence-meta 블록만 출력
+//
+//  블록 형식 (어떤 주석 prefix 든 허용 — #, //, ;, --):
+//    # @convergence-start
+//    # state: ossified
+//    # id: LAUNCHD_PATH_HARDENED
+//    # value: plist EnvironmentVariables.PATH 선두에 ...
+//    # threshold: refresh_via_cli cron 정상화
+//    # rationale: 2026-04-15 재발 사고
+//    # ossified_at: 2026-04-15
+//    # ref_commit: dba4246f
+//    # @convergence-end
+//
+//  meta 블록:
+//    # @convergence-meta-start
+//    # project: cl
+//    # description: Claude Code multi-account launcher
+//    # approval_tag: cl-approved
+//    # @convergence-meta-end
+//
+//  파싱 규칙:
+//    - 라인에 `@convergence-start` 포함 → 본 블록 시작
+//    - 라인에 `@convergence-end`       → 블록 종료
+//    - `@convergence-meta-start`       → meta 블록 시작
+//    - `@convergence-meta-end`         → meta 블록 종료
+//    - 본 블록의 각 내부 라인:
+//        leading `# ` / `// ` / `; ` / `-- ` 제거 → `key: value` 파싱
+//        첫 번째 `:` 만 split, value 에 `:` 포함 가능
+//    - `state` 미지정 시 `evolving` 분류
+//    - `id` 미지정 시 해당 블록 skip + stderr 경고
+//
+//  설계 메모:
+//    - invariant_check.hexa 의 라인 기반 스캔 스타일 답습 (stage0 안전)
+//    - 직접 토큰화 없이 문자열 substring 만 사용
+//    - JSON 은 수작업 문자열 빌드 — stdlib 미의존
+// ═══════════════════════════════════════════════════════════
+
+// ── 라인 유틸 ──────────────────────────────────────────────
+// Trim leading whitespace
+fn cs_lstrip(s) {
+    let cs = s.chars()
+    let total = len(cs)
+    let mut i = 0
+    while i < total {
+        let c = cs[i]
+        if c == ' ' || c == '\t' { i = i + 1 }
+        else { return s.substring(i, len(s)) }
+    }
+    return ""
+}
+
+// Trim trailing whitespace
+fn cs_rstrip(s) {
+    let cs = s.chars()
+    let mut e = len(cs)
+    while e > 0 {
+        let c = cs[e - 1]
+        if c == ' ' || c == '\t' || c == '\r' { e = e - 1 }
+        else { return s.substring(0, e) }
+    }
+    return ""
+}
+
+// Strip both ends
+fn cs_strip(s) {
+    return cs_rstrip(cs_lstrip(s))
+}
+
+// Find first occurrence of char in string; -1 if absent
+fn cs_find_char(s, ch) {
+    let cs = s.chars()
+    let total = len(cs)
+    let mut i = 0
+    while i < total {
+        if cs[i] == ch { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Check substring presence (returns true/false)
+fn cs_contains(haystack, needle) {
+    let hs = haystack.chars()
+    let ns = needle.chars()
+    let hl = len(hs)
+    let nl = len(ns)
+    if nl == 0 { return true }
+    if nl > hl { return false }
+    let mut i = 0
+    let last = hl - nl + 1
+    while i < last {
+        let mut k = 0
+        let mut ok = true
+        while k < nl {
+            if hs[i + k] != ns[k] { ok = false; k = nl }
+            else { k = k + 1 }
+        }
+        if ok { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Strip a single-line comment prefix (#, //, ;, --) + one optional space.
+// Input: a raw line already lstripped.
+// Returns the content after the prefix, or the original line if no prefix matched.
+fn cs_strip_comment_prefix(line) {
+    let t = cs_lstrip(line)
+    let cs = t.chars()
+    let total = len(cs)
+    if total == 0 { return t }
+    // `//` prefix
+    if total >= 2 {
+        if cs[0] == '/' && cs[1] == '/' {
+            let rest = t.substring(2, total)
+            return cs_lstrip(rest)
+        }
+        if cs[0] == '-' && cs[1] == '-' {
+            let rest = t.substring(2, total)
+            return cs_lstrip(rest)
+        }
+    }
+    // single-char `#` or `;`
+    let c0 = cs[0]
+    if c0 == '#' || c0 == ';' {
+        let rest = t.substring(1, total)
+        return cs_lstrip(rest)
+    }
+    return t
+}
+
+// ── 블록 스캔 ──────────────────────────────────────────────
+// Return a list of "normal" blocks as hashmaps. Each block is parsed into
+// a hashmap of key→value strings (without `id` stripped; id field kept).
+// Meta blocks (@convergence-meta-start) are returned separately — see cs_scan_meta.
+fn cs_scan_blocks(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut blocks = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        // A "normal" start must contain @convergence-start but NOT @convergence-meta-start.
+        let is_start = cs_contains(line, "@convergence-start")
+        let is_meta_start = cs_contains(line, "@convergence-meta-start")
+        if is_start && !is_meta_start {
+            let mut body = []
+            let mut j = i + 1
+            let mut closed = false
+            while j < n {
+                let ln = lines[j]
+                if cs_contains(ln, "@convergence-end") && !cs_contains(ln, "@convergence-meta-end") {
+                    closed = true
+                    j = n + 1
+                } else {
+                    body = body.push(ln)
+                    j = j + 1
+                }
+            }
+            if closed {
+                let kv = cs_parse_block_body(body)
+                blocks = blocks.push(kv)
+            } else {
+                eprintln("warn: unclosed @convergence-start at line " + to_string(i + 1))
+            }
+            // advance i past end marker (j overshot n when closed, so use actual j-1 as marker pos)
+            // For simplicity restart scan from after end: find the end marker again.
+            i = cs_find_block_end(lines, i + 1, "@convergence-end", "@convergence-meta-end") + 1
+            if i <= 0 { i = n }
+        } else {
+            i = i + 1
+        }
+    }
+    return blocks
+}
+
+// Find the line index (in `lines`, starting from `from`) whose content contains
+// `end_marker` but NOT `exclude_marker`. Returns -1 if not found.
+fn cs_find_block_end(lines, from, end_marker, exclude_marker) {
+    let n = len(lines)
+    let mut i = from
+    while i < n {
+        let ln = lines[i]
+        if cs_contains(ln, end_marker) && !cs_contains(ln, exclude_marker) {
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Scan meta blocks — returns list of hashmaps (usually 0 or 1).
+fn cs_scan_meta(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        if cs_contains(line, "@convergence-meta-start") {
+            let mut body = []
+            let mut j = i + 1
+            let mut closed = false
+            while j < n {
+                let ln = lines[j]
+                if cs_contains(ln, "@convergence-meta-end") {
+                    closed = true
+                    j = n + 1
+                } else {
+                    body = body.push(ln)
+                    j = j + 1
+                }
+            }
+            if closed {
+                let kv = cs_parse_block_body(body)
+                out = out.push(kv)
+            } else {
+                eprintln("warn: unclosed @convergence-meta-start at line " + to_string(i + 1))
+            }
+            let end_idx = cs_find_block_end(lines, i + 1, "@convergence-meta-end", "__NEVER__")
+            if end_idx < 0 { i = n } else { i = end_idx + 1 }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Parse block body lines (already stripped of start/end markers) into a
+// hashmap of key→value. Lines that fail `key: value` parsing are skipped.
+fn cs_parse_block_body(body_lines) {
+    let mut kv = #{}
+    let mut keys = []
+    let n = len(body_lines)
+    let mut i = 0
+    while i < n {
+        let raw = body_lines[i]
+        let content = cs_strip_comment_prefix(raw)
+        let trimmed = cs_strip(content)
+        if len(trimmed) == 0 {
+            i = i + 1
+        } else {
+            // Skip stray marker residue (defensive)
+            if cs_contains(trimmed, "@convergence-") {
+                i = i + 1
+            } else {
+                let colon = cs_find_char(trimmed, ':')
+                if colon <= 0 {
+                    i = i + 1
+                } else {
+                    let key = cs_strip(trimmed.substring(0, colon))
+                    let value = cs_strip(trimmed.substring(colon + 1, len(trimmed)))
+                    if len(key) > 0 {
+                        kv[key] = value
+                        keys = keys.push(key)
+                    }
+                    i = i + 1
+                }
+            }
+        }
+    }
+    // Attach ordered key list under a reserved name (skip in JSON emit for values).
+    kv["__keys__"] = keys
+    return kv
+}
+
+// ── JSON 빌더 ──────────────────────────────────────────────
+// Escape string for JSON output. Handles \\, \", and control chars \n, \r, \t.
+fn cs_json_escape(s) {
+    let cs = s.chars()
+    let total = len(cs)
+    let mut buf = []
+    let mut i = 0
+    while i < total {
+        let c = cs[i]
+        if c == '\\' { buf = buf.push("\\\\") }
+        else if c == '"' { buf = buf.push("\\\"") }
+        else if c == '\n' { buf = buf.push("\\n") }
+        else if c == '\r' { buf = buf.push("\\r") }
+        else if c == '\t' { buf = buf.push("\\t") }
+        else { buf = buf.push(to_string(c)) }
+        i = i + 1
+    }
+    return buf.join("")
+}
+
+// Wrap string as JSON literal `"..."`.
+fn cs_json_str(s) {
+    return "\"" + cs_json_escape(s) + "\""
+}
+
+// Emit a single entry's inner JSON object. Keys listed in `skip` are omitted
+// (e.g. id, state, __keys__). Preserves original parse order.
+fn cs_emit_entry_object(kv, skip, indent) {
+    let keys = kv["__keys__"]
+    let n = len(keys)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let k = keys[i]
+        if !cs_list_contains(skip, k) {
+            let v = kv[k]
+            let line = indent + cs_json_str(k) + ": " + cs_json_str(v)
+            parts = parts.push(line)
+        }
+        i = i + 1
+    }
+    return parts.join(",\n")
+}
+
+fn cs_list_contains(lst, item) {
+    let n = len(lst)
+    let mut i = 0
+    while i < n {
+        if lst[i] == item { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Group blocks by state → #{ state_name: [block, block, ...] }
+// Blocks with missing state default to "evolving". Blocks with missing id
+// are dropped with stderr warning.
+fn cs_group_by_state(blocks) {
+    let mut groups = #{}
+    let mut order = []  // state names in first-seen order
+    let n = len(blocks)
+    let mut i = 0
+    while i < n {
+        let blk = blocks[i]
+        if !blk.contains_key("id") {
+            eprintln("warn: block #" + to_string(i + 1) + " missing 'id', skipping")
+            i = i + 1
+        } else {
+            let mut state = "evolving"
+            if blk.contains_key("state") {
+                let s = blk["state"]
+                if len(s) > 0 { state = s }
+            }
+            let mut existing = []
+            if groups.contains_key(state) { existing = groups[state] }
+            let updated = existing.push(blk)
+            groups[state] = updated
+            if !cs_list_contains(order, state) { order = order.push(state) }
+            i = i + 1
+        }
+    }
+    return #{"groups": groups, "order": order}
+}
+
+// ── 최상위 dump ────────────────────────────────────────────
+// Emit the complete document: _meta + groups (ossified/stable/evolving/failed).
+fn cs_emit_full_json(meta_block, blocks) {
+    let mut sections = []
+
+    // _meta section
+    if len(meta_block) > 0 {
+        let m = meta_block[0]
+        let meta_inner = cs_emit_entry_object(m, ["__keys__"], "    ")
+        sections = sections.push("  \"_meta\": {\n" + meta_inner + "\n  }")
+    }
+
+    // groups
+    let grouped = cs_group_by_state(blocks)
+    let groups = grouped["groups"]
+    let order = grouped["order"]
+    let preferred = ["ossified", "stable", "evolving", "failed"]
+    let mut emitted = []
+
+    // Emit preferred order first
+    let pn = len(preferred)
+    let mut pi = 0
+    while pi < pn {
+        let st = preferred[pi]
+        if groups.contains_key(st) {
+            let section = cs_emit_group_section(st, groups[st])
+            sections = sections.push(section)
+            emitted = emitted.push(st)
+        }
+        pi = pi + 1
+    }
+    // Emit any extra states (first-seen order)
+    let on = len(order)
+    let mut oi = 0
+    while oi < on {
+        let st2 = order[oi]
+        if !cs_list_contains(emitted, st2) {
+            let section2 = cs_emit_group_section(st2, groups[st2])
+            sections = sections.push(section2)
+            emitted = emitted.push(st2)
+        }
+        oi = oi + 1
+    }
+
+    return "{\n" + sections.join(",\n") + "\n}"
+}
+
+// Emit one group: `"state_name": { "ID1": {...}, "ID2": {...} }`
+fn cs_emit_group_section(state, block_list) {
+    let n = len(block_list)
+    let mut entry_parts = []
+    let mut i = 0
+    while i < n {
+        let blk = block_list[i]
+        let id = blk["id"]
+        let skip = ["id", "state", "__keys__"]
+        let inner = cs_emit_entry_object(blk, skip, "      ")
+        let entry = "    " + cs_json_str(id) + ": {\n" + inner + "\n    }"
+        entry_parts = entry_parts.push(entry)
+        i = i + 1
+    }
+    return "  " + cs_json_str(state) + ": {\n" + entry_parts.join(",\n") + "\n  }"
+}
+
+// Emit meta-only JSON (just the _meta object, top-level).
+fn cs_emit_meta_json(meta_block) {
+    if len(meta_block) == 0 {
+        return "{}"
+    }
+    let m = meta_block[0]
+    let inner = cs_emit_entry_object(m, ["__keys__"], "  ")
+    return "{\n" + inner + "\n}"
+}
+
+// ── CLI 진입점 ────────────────────────────────────────────
+fn cs_main() {
+    let av = args()
+    // dispatch shape: `hexa convergence <subcmd> <file>` → av[3]=subcmd, av[4]=file.
+    // Direct invocation fallback: `convergence_scan.hexa <subcmd> <file>`.
+    let mut subcmd = ""
+    let mut file = ""
+    if len(av) >= 5 {
+        subcmd = av[3]
+        file = av[4]
+    } else if len(av) >= 4 {
+        subcmd = av[2]
+        file = av[3]
+    } else if len(av) >= 3 {
+        subcmd = av[1]
+        file = av[2]
+    }
+    if len(subcmd) == 0 || len(file) == 0 {
+        println("usage: hexa convergence <dump|dump-meta> <file>")
+        exit(2)
+    }
+
+    let exists = exec("test -f '" + file + "' && printf yes || printf no")
+    if exists != "yes" {
+        eprintln("error: file not found: " + file)
+        exit(2)
+    }
+    let src = read_file(file)
+
+    if subcmd == "dump" {
+        let meta_blocks = cs_scan_meta(src)
+        let blocks = cs_scan_blocks(src)
+        let out = cs_emit_full_json(meta_blocks, blocks)
+        println(out)
+        exit(0)
+    } else if subcmd == "dump-meta" {
+        let meta_blocks = cs_scan_meta(src)
+        let out = cs_emit_meta_json(meta_blocks)
+        println(out)
+        exit(0)
+    } else {
+        eprintln("error: unknown subcommand '" + subcmd + "'")
+        eprintln("usage: hexa convergence <dump|dump-meta> <file>")
+        exit(2)
+    }
+}
+
+cs_main()
