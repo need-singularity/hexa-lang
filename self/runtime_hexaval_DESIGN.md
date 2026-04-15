@@ -183,7 +183,8 @@ needs sub-task split before next attempt:
 
 | Gate | Symptom (measured 2026-04-15) | Fix |
 |------|-------------------------------|-----|
-| (a) `pub` parser in stage0 | `self/test_codegen_c2_extended.hexa` 0/48 PASS — `unexpected token Pub` | stage0 lexer/parser add `pub` keyword |
+| (a) ~~`pub` parser in stage0~~ — superseded 2026-04-15 (cycle 2 측정: parser 가 recovery 함, PIPELINE_OK 정상 출력) | — | — |
+| (a') `run_c2()` `pr.contains("PIPELINE_OK")` false-negative | 스탠드얼론 exec contains=true (777-char), `run_c2()` contains=false | stage0 exec 캡처 NUL/인코딩/길이 한계 진단 |
 | (b) Synthetic stress harness | tiny baseline (let/println/int/str) compiles cleanly via hexa_v2 — does NOT exercise codegen_c2 group A/B/C patterns | one synthetic .hexa per group reproducing the failing pattern |
 | (c) Codegen wire-in (5 sites) | mechanical, blocked on (a)+(b) for verification | apply edits 1276/1374/1380/1121/1756 + StringLit kind |
 | (d) Verify + regression | requires (a)+(b)+(c) | run synthetic harness + existing test suite |
