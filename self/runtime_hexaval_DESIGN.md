@@ -144,9 +144,20 @@ scalar-path call MUST copy.
 
 ### Wire-in sites (codegen_c2.hexa → interpreter.c)
 
-Deferred to a separate cycle (regen feasibility is currently **avoid** per
-R3 — 40 % SIGSEGV risk from flatten_imports regression + T33 arena bug).
-Site inventory for when regen re-opens:
+**Re-evaluation 2026-04-15 (post-COMP-P3-2 superseded audit):** the
+"40 % SIGSEGV risk" language below is **stale**. Cited blockers all
+landed on 2026-04-14, before this design doc was authored:
+
+| Cited blocker | Status | Evidence |
+|---------------|--------|----------|
+| T33 arena bug (hexa_val_heapify TAG_VALSTRUCT 재귀 누락) | FIXED | b8b5e97 (BT_T33_FIX4) |
+| flatten_imports regression | FIXED | 7f2b128 + b8b5e97 (BT_STAGE0_UNBLOCK) |
+| HEXA_VAL_ARENA risk (T31/T33/T37/T40) | All closed, default ON | 3ae3d7a (BT_T43_ARENA_DEFAULT_ON) |
+| codegen_c2 println/printf 분기 — T32~T46 활성 작업 충돌 | Stale; recent (T58-T63) avoids those branches | 0bea3ce stat — 12 lines, no println/printf hits |
+
+Wire-in is therefore **un-deferred**; next cycle should attempt site
+edits + small-program regen verification before going to interpreter.hexa.
+Site inventory unchanged:
 
 | Group | Count | Line range (generated .c) | Fix |
 |-------|-------|---------------------------|-----|
