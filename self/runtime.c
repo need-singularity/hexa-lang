@@ -3345,6 +3345,12 @@ HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
     return hexa_int((unsigned char)s.s[i]);
 }
 
+// `chr(n)` — Python/Ruby-style inverse of char_code: int byte → 1-char str.
+// Used by void's sys_pty accumulator (chr(b) reassembles bytes from
+// line_buf int values). Binds the free-fn idiom the way char_code does.
+HexaVal hexa_from_char_code(HexaVal n);
+static HexaVal chr = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_from_char_code, .arity = 1}};
+
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (s.tag != TAG_STR) return hexa_int(0);

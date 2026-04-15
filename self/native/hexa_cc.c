@@ -1636,6 +1636,8 @@ HexaVal p_expect(HexaVal expected_kind) {
     }
     HexaVal tok = p_peek();
     HexaVal msg = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("expected "), expected_kind), hexa_str(", got ")), hexa_map_get_ic(tok, "kind", &__hexa_codegen_c2_ic_28)), hexa_str(" ('")), hexa_map_get_ic(tok, "value", &__hexa_codegen_c2_ic_29)), hexa_str("')"));
+    /* HX-parse-leak-fix: throw at cap to escape runaway recovery. */
+    if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(hexa_int(hexa_len(p_errors))); HexaVal __r=(p_max_errors); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); })))) { hexa_throw(hexa_str("too many parse errors")); }
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_30), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_31), msg);
     hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_32))), hexa_str(":")), hexa_to_string(hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_33))), hexa_str(": ")), msg));
     return tok;
@@ -1650,6 +1652,8 @@ HexaVal p_expect_ident(void) {
         return hexa_map_get_ic(tok, "value", &__hexa_codegen_c2_ic_35);
     }
     HexaVal msg2 = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("expected identifier, got "), hexa_map_get_ic(tok, "kind", &__hexa_codegen_c2_ic_36)), hexa_str(" ('")), hexa_map_get_ic(tok, "value", &__hexa_codegen_c2_ic_37)), hexa_str("')"));
+    /* HX-parse-leak-fix: throw at cap to escape runaway recovery. */
+    if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(hexa_int(hexa_len(p_errors))); HexaVal __r=(p_max_errors); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); })))) { hexa_throw(hexa_str("too many parse errors")); }
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_38), hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_39), msg2);
     hexa_println(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("Parse error at "), hexa_to_string(hexa_map_get_ic(tok, "line", &__hexa_codegen_c2_ic_40))), hexa_str(":")), hexa_to_string(hexa_map_get_ic(tok, "col", &__hexa_codegen_c2_ic_41))), hexa_str(": ")), msg2));
     return hexa_str("");
@@ -1728,6 +1732,10 @@ HexaVal parse(HexaVal tokens) {
     HexaVal stmts = hexa_array_new();
     p_skip_newlines();
     while (hexa_truthy(hexa_bool(!hexa_truthy(p_at_end())))) {
+        /* HX-parse-leak-fix: early bail when p_max_errors reached — else
+         * unrecoverable syntax (e.g. void bundle `[T; N]`) is retried per
+         * loop, each call leaking partial AST maps → 10GB+ RSS. */
+        if (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(hexa_int(hexa_len(p_errors))); HexaVal __r=(p_max_errors); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) >= (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i >= __r.i); })))) { return stmts; }
         HexaVal prev_pos = p_pos;
         HexaVal parse_ok = hexa_bool(1);
         {
@@ -1745,10 +1753,12 @@ HexaVal parse(HexaVal tokens) {
                 parse_ok = hexa_bool(0);
             }
         }
-        if (hexa_truthy(parse_ok)) {
-            if (hexa_truthy(hexa_eq(p_pos, prev_pos))) {
-                p_advance();
-            }
+        /* HX-parse-leak-fix: forward-progress guard applies to BOTH success
+         * and error paths. Previously error path with non-advancing synchronize
+         * looped on same token until max_errors; allocations leaked even
+         * after p_record_error capped. */
+        if (hexa_truthy(hexa_eq(p_pos, prev_pos))) {
+            p_advance();
         }
         p_skip_newlines();
     }
@@ -2433,6 +2443,15 @@ HexaVal parse_type_annotation(void) {
         if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("LBracket")))) {
             p_advance();
             HexaVal inner = parse_type_annotation();
+            /* HX-parse-leak-fix: accept Rust-style [T; N] — consume ';' + size
+             * and emit as dynamic [T]. Avoids runaway recovery on void-style
+             * doc-anchor structs (hexa has no fixed-size array as first-class). */
+            if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Semicolon")))) {
+                p_advance();
+                if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("RBracket")))))) {
+                    p_advance();
+                }
+            }
             p_expect(hexa_str("RBracket"));
             base = hexa_add(hexa_add(hexa_str("["), inner), hexa_str("]"));
         } else {
@@ -7613,7 +7632,9 @@ HexaVal gen2_extern_wrapper(HexaVal node) {
     if (hexa_truthy(hexa_eq(sig_p, hexa_str("")))) {
         sig_p = hexa_str("void");
     }
-    HexaVal forward = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), name), hexa_str("(")), sig_p), hexa_str(");"));
+    /* HX-ffi-static: mark FFI wrapper `static` — prevents name collision
+     * with user-linked C symbols (e.g. widths.o's _hx_is_wide_cjk). */
+    HexaVal forward = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("static HexaVal "), name), hexa_str("(")), sig_p), hexa_str(");"));
     HexaVal has_float = gen2_has_float_param(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_89));
     HexaVal impl_parts = hexa_array_new();
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(has_float, hexa_int(1))) || hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(nargs); HexaVal __r=(hexa_int(0)); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) > (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i > __r.i); })))))) {
@@ -7630,7 +7651,7 @@ HexaVal gen2_extern_wrapper(HexaVal node) {
             td_sig = hexa_str("void");
         }
         impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("typedef "), c_ret), hexa_str(" (*__ffi_ftyp_")), name), hexa_str(")(")), td_sig), hexa_str(");\n")));
-        impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), name), hexa_str("(")), sig_p), hexa_str(") {\n")));
+        impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("static HexaVal "), name), hexa_str("(")), sig_p), hexa_str(") {\n")));
         HexaVal call_args = hexa_array_new();
         HexaVal ci = hexa_int(0);
         while (hexa_truthy(hexa_bool(__extension__ ({ HexaVal __l=(ci); HexaVal __r=(nargs); (__l.tag==TAG_FLOAT||__r.tag==TAG_FLOAT) ? ((__l.tag==TAG_FLOAT?__l.f:(double)__l.i) < (__r.tag==TAG_FLOAT?__r.f:(double)__r.i)) : (__l.i < __r.i); })))) {
@@ -7647,7 +7668,7 @@ HexaVal gen2_extern_wrapper(HexaVal node) {
         }
         impl_parts = hexa_array_push(impl_parts, hexa_str("}\n"));
     } else {
-        impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), name), hexa_str("(")), sig_p), hexa_str(") {\n")));
+        impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("static HexaVal "), name), hexa_str("(")), sig_p), hexa_str(") {\n")));
         impl_parts = hexa_array_push(impl_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    return hexa_extern_call(__ffi_sym_"), name), hexa_str(", NULL, 0, ")), gen2_extern_ret_kind(ret_type)), hexa_str(");\n")));
         impl_parts = hexa_array_push(impl_parts, hexa_str("}\n"));
     }

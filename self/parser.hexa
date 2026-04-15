@@ -282,6 +282,10 @@ fn p_expect(expected_kind) {
     }
     let tok = p_peek()
     let msg = "expected " + expected_kind + ", got " + tok.kind + " ('" + tok.value + "')"
+    // HX-parse-leak-fix: throw at cap to escape runaway recovery. p_record_error
+    // silently caps at p_max_errors; but p_expect used to println+return even past
+    // cap, and the tok return kept parse_stmt nesting deeper → leaks unbounded.
+    if len(p_errors) >= p_max_errors { throw "too many parse errors" }
     p_record_error(tok.line, tok.col, msg)
     println("Parse error at " + to_string(tok.line) + ":" + to_string(tok.col) + ": " + msg)
     return tok
@@ -294,6 +298,8 @@ fn p_expect_ident() {
         return tok.value
     }
     let msg2 = "expected identifier, got " + tok.kind + " ('" + tok.value + "')"
+    // HX-parse-leak-fix: same as p_expect — throw at cap.
+    if len(p_errors) >= p_max_errors { throw "too many parse errors" }
     p_record_error(tok.line, tok.col, msg2)
     println("Parse error at " + to_string(tok.line) + ":" + to_string(tok.col) + ": " + msg2)
     return ""
@@ -358,6 +364,10 @@ fn parse(tokens) {
     let mut stmts = []
     p_skip_newlines()
     while !p_at_end() {
+        // Early bail: p_max_errors 도달 시 즉시 중단. 없으면 불가능 recovery
+        // 를 무한 재시도하며 매 loop 당 부분 AST map 을 leak → void 170KB
+        // bundle 의 `[T; N]` 같은 unsupported syntax 에서 10GB+ RSS 폭주.
+        if len(p_errors) >= p_max_errors { return stmts }
         let prev_pos = p_pos
         let mut parse_ok = true
         try {
@@ -369,12 +379,13 @@ fn parse(tokens) {
             p_synchronize()
             parse_ok = false
         }
-        if parse_ok {
-            // Guard: if pos didn't advance, force-skip to avoid infinite loop
-            if p_pos == prev_pos {
-                p_advance()
-            }
-        }
+        // Forward-progress guard — applies to BOTH success (partial parse)
+        // and error (synchronize failed to advance). Previously only checked
+        // in parse_ok branch, which meant a synchronize that returned without
+        // advancing would re-throw on the same token every iteration until
+        // p_max_errors was filled AND the post-cap iterations (which don't
+        // even record) leaked AST maps indefinitely.
+        if p_pos == prev_pos { p_advance() }
         p_skip_newlines()
     }
     return stmts
@@ -1174,6 +1185,16 @@ fn parse_type_annotation() {
     } else if p_peek_kind() == "LBracket" {
         p_advance() // consume '['
         let inner = parse_type_annotation()
+        // [T; N] — Rust-style fixed-size array. hexa has no fixed-size array
+        // as a first-class type; accept the syntax (common in void-style doc
+        // anchor structs) and emit the same AST as dynamic `[T]`. Swallowing
+        // the `; <size>` prefix avoids the runaway recovery that previously
+        // blew up memory (pre HX-parse-leak-fix).
+        if p_peek_kind() == "Semicolon" {
+            p_advance() // consume ';'
+            // Size expr — typically IntLit or Ident; skip a single token.
+            if p_peek_kind() != "RBracket" { p_advance() }
+        }
         p_expect("RBracket")
         base = "[" + inner + "]"
     } else if p_peek_kind() == "LParen" {
