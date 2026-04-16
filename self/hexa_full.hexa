@@ -29,9 +29,10 @@
 use "runtime_core"
 
 // ── P4 self-host: codegen_c2 AOT compiler ──────────────────────
-// codegen_c2.hexa 를 포함하여 `--compile` CLI 로 .hexa → .c 변환 가능.
-// flatten_imports 가 이 use 디렉티브를 resolve 한다.
-use "codegen_c2"
+// codegen_c2 is loaded at runtime via --compile flag (interpret path).
+// DO NOT include via `use` — it causes init-order issues in stage0
+// (3400+ LOC top-level init overwhelms the C startup sequence).
+// use "codegen_c2"  // DISABLED — breaks stage0 println
 
 // ── rt#36-D bridge: bc_emitter + bc_vm for `hexa run --vm ...` ──
 // flatten_imports.hexa 가 토포 정렬로 self/bc_emitter.hexa + self/bc_vm.hexa
@@ -1019,6 +1020,11 @@ pub let mut p_pending_symbol = ""   // @symbol("name") — pending C symbol alia
 pub let mut p_pending_link = ""     // @link("lib") — pending library name
 // M0: AI-native @attr accumulator — parse_stmt fills this, parse_fn_decl consumes
 pub let mut p_pending_attrs = ""
+// M0+: AI-native typed annotations with raw-arg capture
+// Elements serialized as "kind|raw_arg_tokens". Filled by parse_stmt's
+// @attr loop when attr_name is one of: cli, flag, doc, schema, gate, memo.
+// Consumed by parse_fn_decl / parse_async_fn and written to FnDecl.annotations.
+pub let mut p_pending_annotations = []
 // @contract desugar: pending requires/ensures AST expressions
 // Filled by parse_stmt's @attr loop when attr_name == "contract"
 // Consumed by parse_fn_decl → injected as ContractAssert nodes
@@ -1232,6 +1238,8 @@ fn parse(tokens) {
     p_pos = 0
     p_pending_symbol = ""
     p_pending_link = ""
+    p_pending_attrs = ""
+    p_pending_annotations = []
     p_pending_contract_requires = ""
     p_pending_contract_ensures = ""
     p_pending_contract_req_text = ""
@@ -1273,6 +1281,8 @@ fn parse_strict(tokens) {
     p_pos = 0
     p_pending_symbol = ""
     p_pending_link = ""
+    p_pending_attrs = ""
+    p_pending_annotations = []
     p_errors = []
     let mut stmts = []
     p_skip_newlines()
@@ -1378,6 +1388,41 @@ fn parse_stmt() {
             } else {
                 p_pending_link = attr_arg
             }
+        } else if attr_name == "cli" || attr_name == "flag" || attr_name == "doc" || attr_name == "schema" || attr_name == "gate" || attr_name == "memo" {
+            // M0+: typed AI-native annotations — capture raw arg tokens
+            // StringLit tokens are re-quoted so the serialized form round-trips.
+            let mut raw = ""
+            if p_peek_kind() == "LParen" {
+                p_advance() // consume (
+                let mut depth = 1
+                while depth > 0 && p_peek_kind() != "Eof" {
+                    let pk2 = p_peek_kind()
+                    if pk2 == "LParen" {
+                        depth = depth + 1
+                        let t = p_advance()
+                        if raw != "" { raw = raw + " " }
+                        raw = raw + t.value
+                    } else if pk2 == "RParen" {
+                        depth = depth - 1
+                        if depth == 0 {
+                            p_advance() // consume closing )
+                        } else {
+                            let t = p_advance()
+                            if raw != "" { raw = raw + " " }
+                            raw = raw + t.value
+                        }
+                    } else {
+                        let t = p_advance()
+                        if raw != "" { raw = raw + " " }
+                        if pk2 == "StringLit" {
+                            raw = raw + "\"" + t.value + "\""
+                        } else {
+                            raw = raw + t.value
+                        }
+                    }
+                }
+            }
+            p_pending_annotations = p_pending_annotations.push(attr_name + "|" + raw)
         } else {
             // Generic attribute — skip optional parenthesized content
             if p_peek_kind() == "LParen" {
@@ -1890,6 +1935,17 @@ fn parse_fn_decl() {
     let attrs = p_pending_attrs
     p_pending_attrs = ""
 
+    // M0+: consume typed annotations (@cli/@flag/@doc/@schema/@gate/@memo)
+    // Serialized as "kind|raw;kind|raw" and stored in FnDecl.annotations.
+    let mut annot_str = ""
+    let mut _ai = 0
+    while _ai < len(p_pending_annotations) {
+        if annot_str != "" { annot_str = annot_str + ";" }
+        annot_str = annot_str + p_pending_annotations[_ai]
+        _ai = _ai + 1
+    }
+    p_pending_annotations = []
+
     // ── @contract desugar: inject ContractAssert nodes ──────
     let mut final_body = body
     let req_expr = p_pending_contract_requires
@@ -1931,7 +1987,7 @@ fn parse_fn_decl() {
         "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
         "params": params, "body": final_body, "args": "", "fields": "", "items": tparams,
         "variants": "", "arms": "", "iter_expr": "", "ret_type": ret,
-        "target": "", "trait_name": "", "methods": ""
+        "target": "", "trait_name": "", "methods": "", "annotations": annot_str
     }
 }
 
@@ -2219,7 +2275,7 @@ fn parse_trait_decl() {
                 "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
                 "params": mparams, "body": mbody, "args": "", "fields": "", "items": "",
                 "variants": "", "arms": "", "iter_expr": "", "ret_type": mret,
-                "target": "", "trait_name": "", "methods": ""
+                "target": "", "trait_name": "", "methods": "", "annotations": ""
             })
             p_skip_newlines()
         }
@@ -2269,7 +2325,7 @@ fn parse_impl_block() {
                 "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
                 "params": mparams, "body": mbody, "args": "", "fields": "", "items": "",
                 "variants": "", "arms": "", "iter_expr": "", "ret_type": mret,
-                "target": "", "trait_name": "", "methods": ""
+                "target": "", "trait_name": "", "methods": "", "annotations": ""
             })
             p_skip_newlines()
         }
@@ -3611,12 +3667,21 @@ fn parse_async_fn() {
         ret = parse_type_annotation()
     }
     let body = parse_block()
+    // M0+: consume typed annotations (same channel as parse_fn_decl)
+    let mut annot_str = ""
+    let mut _ai = 0
+    while _ai < len(p_pending_annotations) {
+        if annot_str != "" { annot_str = annot_str + ";" }
+        annot_str = annot_str + p_pending_annotations[_ai]
+        _ai = _ai + 1
+    }
+    p_pending_annotations = []
     return #{
         "kind": "AsyncFnDecl", "name": name, "value": "", "op": "",
         "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
         "params": params, "body": body, "args": "", "fields": "", "items": "",
         "variants": "", "arms": "", "iter_expr": "", "ret_type": ret,
-        "target": "", "trait_name": "", "methods": ""
+        "target": "", "trait_name": "", "methods": "", "annotations": annot_str
     }
 }
 
@@ -15752,17 +15817,26 @@ while _hx_i < len(_hx_av) {
         _hx_vm_flag = true
         _hx_i = _hx_i + 1
     } else if _hx_a == "--compile" || _hx_a == "-c" {
+        // P4 self-host: load codegen_c2 at runtime via interpret,
+        // then call codegen_c2_full through the function table.
         _hx_i = _hx_i + 1
         if _hx_i < len(_hx_av) {
             let _cin = _hx_av[_hx_i]
             _hx_i = _hx_i + 1
             let _cout = if _hx_i < len(_hx_av) { _hx_av[_hx_i] } else { _cin + ".c" }
+            // Load codegen_c2 into interpreter env
+            let _cg = read_file("self/codegen_c2.hexa")
+            let _cgt = tokenize(_cg)
+            let _cga = parse(_cgt)
+            interpret(_cga)
+            // Compile target
             let _cs = read_file(_cin)
             let _ct = tokenize(_cs)
             let _ca = parse(_ct)
-            let _cc = codegen_c2_full(_ca)
-            write_file(_cout, _cc)
-            println("[compile] " + _cin + " -> " + _cout + " (" + to_string(len(_cc)) + " bytes)")
+            let _cc = call_user_fn("codegen_c2_full", [_ca])
+            let _ccs = to_string(_cc)
+            write_file(_cout, _ccs)
+            println("[compile] " + _cin + " -> " + _cout + " (" + to_string(len(_ccs)) + " bytes)")
         }
         _hx_i = len(_hx_av)
     } else {
