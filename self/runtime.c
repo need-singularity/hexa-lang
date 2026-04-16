@@ -353,6 +353,27 @@ typedef struct HexaVal_ {
 #define HX_SET_CLO_ARITY(v, n) ((v).clo_ptr->arity = (n))
 #define HX_SET_CLO_ENV(v, p)   ((v).clo_ptr->env_box = (p))
 
+// ── STRUCTURAL-1 Phase A: scalar + descriptor-pointer writer macros ──
+// Prep for NaN-boxing typedef flip (HexaVal → uint64_t). Once callers route
+// all writes through these macros, the macro bodies swap to encode-into-u64
+// in one place. Struct-initializer literals ({.tag=T, .i=n}) are OUT OF SCOPE
+// here — they need a different rewrite (constructor fns or the flip itself).
+#define HX_SET_TAG(v, t)       ((v).tag = (t))
+#define HX_SET_INT(v, n)       ((v).i = (n))
+#define HX_SET_FLOAT(v, f)     ((v).f = (f))
+#define HX_SET_BOOL(v, b)      ((v).b = (b))
+#define HX_SET_STR(v, p)       ((v).s = (p))
+#define HX_SET_ARR_PTR(v, p)   ((v).arr_ptr = (p))
+#define HX_SET_MAP_PTR(v, p)   ((v).map_ptr = (p))
+#define HX_SET_FN_PTR_D(v, p)  ((v).fn_ptr_d = (p))
+#define HX_SET_CLO_PTR_D(v, p) ((v).clo_ptr = (p))
+#define HX_SET_VS(v, p)        ((v).vs = (p))
+
+// HexaValStruct (inner) field access via v — routes through HX_VS so the
+// typedef flip can adjust the .vs bits in one spot. The inner HexaValStruct
+// remains a plain C struct — HX_VSF is pointer deref + member access.
+#define HX_VSF(v, field)       (HX_VS(v)->field)
+
 #define HX_IS_INT(v)    ((v).tag == TAG_INT)
 #define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
 #define HX_IS_BOOL(v)   ((v).tag == TAG_BOOL)
@@ -405,7 +426,7 @@ typedef struct HexaValStruct {
 // TAG_ARRAY HexaVal; we heap-box it so the closure remains valid after copies.
 static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr) {
     HexaVal v = {.tag=TAG_CLOSURE};
-    v.clo_ptr = (HexaClo*)calloc(1, sizeof(HexaClo));
+    HX_SET_CLO_PTR_D(v, (HexaClo*)calloc(1, sizeof(HexaClo)));
     HX_SET_CLO_PTR(v, fn_ptr);
     HX_SET_CLO_ARITY(v, arity);
     HX_SET_CLO_ENV(v, (HexaVal*)malloc(sizeof(HexaVal)));
@@ -417,7 +438,7 @@ static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr)
 // S1-D3a: allocates HexaFn heap descriptor (was inline .fn={...} struct literal).
 static inline HexaVal hexa_fn_new(void* fn_ptr, int arity) {
     HexaVal v = {.tag=TAG_FN};
-    v.fn_ptr_d = (HexaFn*)calloc(1, sizeof(HexaFn));
+    HX_SET_FN_PTR_D(v, (HexaFn*)calloc(1, sizeof(HexaFn)));
     HX_FN_PTR(v) = fn_ptr;
     HX_FN_ARITY(v) = arity;
     return v;
@@ -506,8 +527,8 @@ static inline double __hx_to_double(HexaVal v) {
     // atof handles both ints and floats correctly ("3" → 3.0, "3.14" → 3.14).
     if (HX_IS_STR(v) && HX_STR(v))   return atof(HX_STR(v));
     if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
-        if (v.vs->tag_i == TAG_FLOAT) return v.vs->float_val;
-        if (v.vs->tag_i == TAG_INT)   return (double)v.vs->int_val;
+        if (HX_VSF(v, tag_i) == TAG_FLOAT) return HX_VSF(v, float_val);
+        if (HX_VSF(v, tag_i) == TAG_INT)   return (double)HX_VSF(v, int_val);
     }
     return 0.0;
 }
@@ -521,11 +542,11 @@ int64_t hexa_as_num(HexaVal v) {
     if (HX_IS_BOOL(v))  return (int64_t)HX_BOOL(v);
     if (HX_IS_STR(v) && HX_STR(v)) return strtoll(HX_STR(v), NULL, 10);
     if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
-        if (v.vs->tag_i == TAG_INT)   return v.vs->int_val;
-        if (v.vs->tag_i == TAG_FLOAT) return (int64_t)v.vs->float_val;
-        if (v.vs->tag_i == TAG_BOOL)  return (int64_t)v.vs->bool_val;
-        if (v.vs->tag_i == TAG_STR && v.vs->str_val.s)
-            return strtoll(v.vs->str_val.s, NULL, 10);
+        if (HX_VSF(v, tag_i) == TAG_INT)   return HX_VSF(v, int_val);
+        if (HX_VSF(v, tag_i) == TAG_FLOAT) return (int64_t)HX_VSF(v, float_val);
+        if (HX_VSF(v, tag_i) == TAG_BOOL)  return (int64_t)HX_VSF(v, bool_val);
+        if (HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val)))
+            return strtoll(HX_STR(HX_VSF(v, str_val)), NULL, 10);
     }
     return 0;
 }
@@ -534,11 +555,11 @@ const char* hexa_to_cstring(HexaVal v) {
     if (HX_IS_STR(v) && HX_STR(v)) return HX_STR(v);
     if (HX_IS_VOID(v)) return "void";
     if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
-        if (HX_VS(v)->tag_i == TAG_STR && HX_VS(v)->str_val.s) return HX_VS(v)->str_val.s;
+        if (HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val))) return HX_STR(HX_VSF(v, str_val));
         static char vbuf[64];
-        if (HX_VS(v)->tag_i == TAG_INT)   { snprintf(vbuf, 64, "%lld", (long long)HX_VS(v)->int_val); return vbuf; }
-        if (HX_VS(v)->tag_i == TAG_FLOAT) { snprintf(vbuf, 64, "%g", HX_VS(v)->float_val); return vbuf; }
-        if (HX_VS(v)->tag_i == TAG_BOOL)  return HX_VS(v)->bool_val ? "true" : "false";
+        if (HX_VSF(v, tag_i) == TAG_INT)   { snprintf(vbuf, 64, "%lld", (long long)HX_VSF(v, int_val)); return vbuf; }
+        if (HX_VSF(v, tag_i) == TAG_FLOAT) { snprintf(vbuf, 64, "%g", HX_VSF(v, float_val)); return vbuf; }
+        if (HX_VSF(v, tag_i) == TAG_BOOL)  return HX_VSF(v, bool_val) ? "true" : "false";
     }
     static char buf[64];
     if (HX_IS_INT(v))   { snprintf(buf, 64, "%lld", (long long)HX_INT(v)); return buf; }
@@ -549,8 +570,8 @@ const char* hexa_to_cstring(HexaVal v) {
 
 const char* hexa_str_as_ptr(HexaVal v) {
     if (HX_IS_STR(v) && HX_STR(v)) return HX_STR(v);
-    if (HX_IS_VALSTRUCT(v) && HX_VS(v) && HX_VS(v)->tag_i == TAG_STR && HX_VS(v)->str_val.s)
-        return HX_VS(v)->str_val.s;
+    if (HX_IS_VALSTRUCT(v) && HX_VS(v) && HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val)))
+        return HX_STR(HX_VSF(v, str_val));
     return NULL;
 }
 
@@ -566,9 +587,9 @@ HexaVal hexa_str(const char* s) {
     // Optimization #11: intern short strings for pointer-equality comparison
     const char* interned = hexa_intern(s);
     if (interned) {
-        v.s = (char*)interned;  // owned by intern table, not caller
+        HX_SET_STR(v, (char*)interned);  // owned by intern table, not caller
     } else {
-        v.s = strdup(s);        // long/unique strings: traditional copy
+        HX_SET_STR(v, strdup(s));        // long/unique strings: traditional copy
     }
     return v;
 }
@@ -763,7 +784,7 @@ static HexaVal* hexa_array_promote_to_heap(HexaVal* arena_items, int len, int ne
 HexaVal hexa_array_new() {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal v = {.tag=TAG_ARRAY};
-    v.arr_ptr = (HexaArr*)calloc(1, sizeof(HexaArr));
+    HX_SET_ARR_PTR(v, (HexaArr*)calloc(1, sizeof(HexaArr)));
     return v;
 }
 
@@ -937,7 +958,7 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal out = {.tag=TAG_ARRAY};
-    out.arr_ptr = (HexaArr*)calloc(1, sizeof(HexaArr));
+    HX_SET_ARR_PTR(out, (HexaArr*)calloc(1, sizeof(HexaArr)));
     if (!HX_IS_ARRAY(arr)) return out;
     int n = HX_ARR_LEN(arr);
     int a = (int)HX_INT(start), b = (int)HX_INT(end);
@@ -1124,7 +1145,7 @@ static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
 HexaVal hexa_map_new() {
     if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
-    v.map_ptr = (HexaMap*)calloc(1, sizeof(HexaMap));
+    HX_SET_MAP_PTR(v, (HexaMap*)calloc(1, sizeof(HexaMap)));
     return v;
 }
 
@@ -1137,7 +1158,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
                              const char* const* keys, const HexaVal* vals) {
     if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
-    v.map_ptr = (HexaMap*)calloc(1, sizeof(HexaMap));
+    HX_SET_MAP_PTR(v, (HexaMap*)calloc(1, sizeof(HexaMap)));
     // Pre-size: (n+1) entries including __type__, target load < HMAP_LOAD_MAX/100.
     // Solve for smallest power-of-2 cap where (n+1)*100/cap < HMAP_LOAD_MAX.
     int need = (n + 1) * 100 / HMAP_LOAD_MAX + 1;
@@ -1175,7 +1196,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             size_t tnl = strlen(type_name);
             char* tdup = (char*)hexa_arena_alloc(tnl + 1);
             memcpy(tdup, type_name, tnl + 1);
-            tv.s = tdup;
+            HX_SET_STR(tv, tdup);
             t->slots[idx].hash = h;
             t->slots[idx].order_idx = t->len;  // ROI-24
             t->vals[idx] = tv;
@@ -1186,7 +1207,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             t->slots[idx].hash = h;
             t->slots[idx].order_idx = t->len;  // ROI-24
             HexaVal tv = {.tag=TAG_STR};
-            tv.s = strdup(type_name);
+            HX_SET_STR(tv, strdup(type_name));
             t->vals[idx] = tv;
             t->order_keys[t->len] = t->slots[idx].key;
             t->order_vals[t->len] = tv;
@@ -1550,60 +1571,60 @@ HexaVal hexa_valstruct_new_v(
     s->struct_name   = struct_name_v;
     s->struct_fields = struct_fields_v;
     HexaVal v = {.tag = TAG_VALSTRUCT};
-    v.vs = s;
+    HX_SET_VS(v, s);
     return v;
 }
 
 // Helper: scalar accessors (tag/int/float/bool) still return primitive Vals.
 HexaVal hexa_valstruct_tag(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_int(0);
-    return hexa_int(HX_VS(v)->tag_i);
+    return hexa_int(HX_VSF(v, tag_i));
 }
 HexaVal hexa_valstruct_int(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_int(0);
-    return hexa_int(HX_VS(v)->int_val);
+    return hexa_int(HX_VSF(v, int_val));
 }
 HexaVal hexa_valstruct_float(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_float(0.0);
-    return hexa_float(HX_VS(v)->float_val);
+    return hexa_float(HX_VSF(v, float_val));
 }
 HexaVal hexa_valstruct_bool(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_bool(0);
-    return hexa_bool(HX_VS(v)->bool_val);
+    return hexa_bool(HX_VSF(v, bool_val));
 }
 // Polymorphic accessors return the stored HexaVal directly (no string
 // re-wrap — the original tag survives so closures work end-to-end).
 HexaVal hexa_valstruct_str(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VS(v)->str_val;
+    return HX_VSF(v, str_val);
 }
 HexaVal hexa_valstruct_char(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VS(v)->char_val;
+    return HX_VSF(v, char_val);
 }
 HexaVal hexa_valstruct_array(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VS(v)->array_val;
+    return HX_VSF(v, array_val);
 }
 HexaVal hexa_valstruct_fn_name(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VS(v)->fn_name;
+    return HX_VSF(v, fn_name);
 }
 HexaVal hexa_valstruct_fn_params(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VS(v)->fn_params;
+    return HX_VSF(v, fn_params);
 }
 HexaVal hexa_valstruct_fn_body(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VS(v)->fn_body;
+    return HX_VSF(v, fn_body);
 }
 HexaVal hexa_valstruct_struct_name(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VS(v)->struct_name;
+    return HX_VSF(v, struct_name);
 }
 HexaVal hexa_valstruct_struct_fields(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VS(v)->struct_fields;
+    return HX_VSF(v, struct_fields);
 }
 
 // Key-string dispatch — branches on key[0] to amortize strcmp.
@@ -1617,30 +1638,30 @@ HexaVal hexa_valstruct_get_by_key(HexaVal v, const char* key) {
     if (!key) return hexa_void();
     switch (key[0]) {
         case 't':
-            if (!strcmp(key, "tag"))           return hexa_int(v.vs->tag_i);
+            if (!strcmp(key, "tag"))           return hexa_int(HX_VSF(v, tag_i));
             break;
         case 'i':
-            if (!strcmp(key, "int_val"))       return hexa_int(v.vs->int_val);
+            if (!strcmp(key, "int_val"))       return hexa_int(HX_VSF(v, int_val));
             break;
         case 'f':
-            if (!strcmp(key, "float_val"))     return hexa_float(v.vs->float_val);
-            if (!strcmp(key, "fn_name"))       return v.vs->fn_name;
-            if (!strcmp(key, "fn_params"))     return v.vs->fn_params;
-            if (!strcmp(key, "fn_body"))       return v.vs->fn_body;
+            if (!strcmp(key, "float_val"))     return hexa_float(HX_VSF(v, float_val));
+            if (!strcmp(key, "fn_name"))       return HX_VSF(v, fn_name);
+            if (!strcmp(key, "fn_params"))     return HX_VSF(v, fn_params);
+            if (!strcmp(key, "fn_body"))       return HX_VSF(v, fn_body);
             break;
         case 'b':
-            if (!strcmp(key, "bool_val"))      return hexa_bool(v.vs->bool_val);
+            if (!strcmp(key, "bool_val"))      return hexa_bool(HX_VSF(v, bool_val));
             break;
         case 's':
-            if (!strcmp(key, "str_val"))       return v.vs->str_val;
-            if (!strcmp(key, "struct_name"))   return v.vs->struct_name;
-            if (!strcmp(key, "struct_fields")) return v.vs->struct_fields;
+            if (!strcmp(key, "str_val"))       return HX_VSF(v, str_val);
+            if (!strcmp(key, "struct_name"))   return HX_VSF(v, struct_name);
+            if (!strcmp(key, "struct_fields")) return HX_VSF(v, struct_fields);
             break;
         case 'c':
-            if (!strcmp(key, "char_val"))      return v.vs->char_val;
+            if (!strcmp(key, "char_val"))      return HX_VSF(v, char_val);
             break;
         case 'a':
-            if (!strcmp(key, "array_val"))     return v.vs->array_val;
+            if (!strcmp(key, "array_val"))     return HX_VSF(v, array_val);
             break;
         case '_':
             if (!strcmp(key, "__type__"))      return hexa_str("Val");
@@ -1660,43 +1681,43 @@ HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val) {
     switch (key[0]) {
         case 't':
             if (!strcmp(key, "tag")) {
-                v.vs->tag_i = HX_IS_INT(val) ? HX_INT(val) : v.vs->tag_i;
+                HX_VSF(v, tag_i) = HX_IS_INT(val) ? HX_INT(val) : HX_VSF(v, tag_i);
                 return v;
             }
             break;
         case 'i':
             if (!strcmp(key, "int_val")) {
-                v.vs->int_val = HX_IS_INT(val) ? HX_INT(val) : v.vs->int_val;
+                HX_VSF(v, int_val) = HX_IS_INT(val) ? HX_INT(val) : HX_VSF(v, int_val);
                 return v;
             }
             break;
         case 'f':
             if (!strcmp(key, "float_val")) {
-                if (HX_IS_FLOAT(val)) v.vs->float_val = HX_FLOAT(val);
-                else if (HX_IS_INT(val)) v.vs->float_val = (double)HX_INT(val);
+                if (HX_IS_FLOAT(val)) HX_VSF(v, float_val) = HX_FLOAT(val);
+                else if (HX_IS_INT(val)) HX_VSF(v, float_val) = (double)HX_INT(val);
                 return v;
             }
-            if (!strcmp(key, "fn_name"))   { v.vs->fn_name   = val; return v; }
-            if (!strcmp(key, "fn_params")) { v.vs->fn_params = val; return v; }
-            if (!strcmp(key, "fn_body"))   { v.vs->fn_body   = val; return v; }
+            if (!strcmp(key, "fn_name"))   { HX_VSF(v, fn_name)   = val; return v; }
+            if (!strcmp(key, "fn_params")) { HX_VSF(v, fn_params) = val; return v; }
+            if (!strcmp(key, "fn_body"))   { HX_VSF(v, fn_body)   = val; return v; }
             break;
         case 'b':
             if (!strcmp(key, "bool_val")) {
-                v.vs->bool_val = HX_IS_BOOL(val) ? HX_BOOL(val) :
-                                 (HX_IS_INT(val) ? (int)HX_INT(val) : v.vs->bool_val);
+                HX_VSF(v, bool_val) = HX_IS_BOOL(val) ? HX_BOOL(val) :
+                                 (HX_IS_INT(val) ? (int)HX_INT(val) : HX_VSF(v, bool_val));
                 return v;
             }
             break;
         case 's':
-            if (!strcmp(key, "str_val"))       { v.vs->str_val       = val; return v; }
-            if (!strcmp(key, "struct_name"))   { v.vs->struct_name   = val; return v; }
-            if (!strcmp(key, "struct_fields")) { v.vs->struct_fields = val; return v; }
+            if (!strcmp(key, "str_val"))       { HX_VSF(v, str_val)       = val; return v; }
+            if (!strcmp(key, "struct_name"))   { HX_VSF(v, struct_name)   = val; return v; }
+            if (!strcmp(key, "struct_fields")) { HX_VSF(v, struct_fields) = val; return v; }
             break;
         case 'c':
-            if (!strcmp(key, "char_val"))  { v.vs->char_val  = val; return v; }
+            if (!strcmp(key, "char_val"))  { HX_VSF(v, char_val)  = val; return v; }
             break;
         case 'a':
-            if (!strcmp(key, "array_val")) { v.vs->array_val = val; return v; }
+            if (!strcmp(key, "array_val")) { HX_VSF(v, array_val) = val; return v; }
             break;
     }
     fprintf(stderr, "valstruct_set: unknown key '%s'\n", key);
@@ -2062,12 +2083,12 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // Conservative: if the arena owns the string (i.e. between any
             // arena block start and frontier), strdup it. Detection via
             // pointer-range check across active blocks.
-            if (!v.s) return v;
+            if (!HX_STR(v)) return v;
             for (HexaArenaBlock* b = __hexa_arena.head; b; b = b->next) {
                 char* base = b->data;
                 char* end = base + b->cap;
-                if (v.s >= base && v.s < end) {
-                    v.s = strdup(v.s);
+                if (HX_STR(v) >= base && HX_STR(v) < end) {
+                    HX_SET_STR(v, strdup(HX_STR(v)));
                     break;
                 }
             }
@@ -2087,35 +2108,35 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // fib hot path) to malloc'd storage. Polymorphic field slots are
             // recursively heapified — closure bodies / param arrays / nested
             // structs all need the same treatment.
-            if (!v.vs) return v;
-            if (v.vs->from_arena) {
+            if (!HX_VS(v)) return v;
+            if (HX_VSF(v, from_arena)) {
                 HexaValStruct* dst = (HexaValStruct*)malloc(sizeof(HexaValStruct));
                 if (!dst) return v;  // OOM — caller will see arena pointer (best-effort)
-                dst->tag_i        = v.vs->tag_i;
-                dst->int_val      = v.vs->int_val;
-                dst->float_val    = v.vs->float_val;
-                dst->bool_val     = v.vs->bool_val;
+                dst->tag_i        = HX_VSF(v, tag_i);
+                dst->int_val      = HX_VSF(v, int_val);
+                dst->float_val    = HX_VSF(v, float_val);
+                dst->bool_val     = HX_VSF(v, bool_val);
                 dst->from_arena   = 0;
-                dst->str_val      = hexa_val_heapify(v.vs->str_val);
-                dst->char_val     = hexa_val_heapify(v.vs->char_val);
-                dst->array_val    = hexa_val_heapify(v.vs->array_val);
-                dst->fn_name      = hexa_val_heapify(v.vs->fn_name);
-                dst->fn_params    = hexa_val_heapify(v.vs->fn_params);
-                dst->fn_body      = hexa_val_heapify(v.vs->fn_body);
-                dst->struct_name  = hexa_val_heapify(v.vs->struct_name);
-                dst->struct_fields= hexa_val_heapify(v.vs->struct_fields);
-                v.vs = dst;
+                dst->str_val      = hexa_val_heapify(HX_VSF(v, str_val));
+                dst->char_val     = hexa_val_heapify(HX_VSF(v, char_val));
+                dst->array_val    = hexa_val_heapify(HX_VSF(v, array_val));
+                dst->fn_name      = hexa_val_heapify(HX_VSF(v, fn_name));
+                dst->fn_params    = hexa_val_heapify(HX_VSF(v, fn_params));
+                dst->fn_body      = hexa_val_heapify(HX_VSF(v, fn_body));
+                dst->struct_name  = hexa_val_heapify(HX_VSF(v, struct_name));
+                dst->struct_fields= hexa_val_heapify(HX_VSF(v, struct_fields));
+                HX_SET_VS(v, dst);
             } else {
                 // Heap valstruct may still hold arena children (e.g. an arena
                 // string was assigned to .str_val). Recurse for safety.
-                v.vs->str_val      = hexa_val_heapify(v.vs->str_val);
-                v.vs->char_val     = hexa_val_heapify(v.vs->char_val);
-                v.vs->array_val    = hexa_val_heapify(v.vs->array_val);
-                v.vs->fn_name      = hexa_val_heapify(v.vs->fn_name);
-                v.vs->fn_params    = hexa_val_heapify(v.vs->fn_params);
-                v.vs->fn_body      = hexa_val_heapify(v.vs->fn_body);
-                v.vs->struct_name  = hexa_val_heapify(v.vs->struct_name);
-                v.vs->struct_fields= hexa_val_heapify(v.vs->struct_fields);
+                HX_VSF(v, str_val)      = hexa_val_heapify(HX_VSF(v, str_val));
+                HX_VSF(v, char_val)     = hexa_val_heapify(HX_VSF(v, char_val));
+                HX_VSF(v, array_val)    = hexa_val_heapify(HX_VSF(v, array_val));
+                HX_VSF(v, fn_name)      = hexa_val_heapify(HX_VSF(v, fn_name));
+                HX_VSF(v, fn_params)    = hexa_val_heapify(HX_VSF(v, fn_params));
+                HX_VSF(v, fn_body)      = hexa_val_heapify(HX_VSF(v, fn_body));
+                HX_VSF(v, struct_name)  = hexa_val_heapify(HX_VSF(v, struct_name));
+                HX_VSF(v, struct_fields)= hexa_val_heapify(HX_VSF(v, struct_fields));
             }
             // T33 Fix 4: when the interpreter Val is a TAG_ARRAY (5) or
             // TAG_MAP (10), its contents live in array_store / map_store
@@ -2126,9 +2147,9 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // (weak_import: &foo == NULL when absent — e.g. bootstrap stub).
             // Bounds-check against the host array length to defend against
             // freed / reused slot indices observed during T33 repro.
-            if (v.vs->tag_i == HEXA_INTERP_TAG_ARRAY && &array_store != 0) {
+            if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_ARRAY && &array_store != 0) {
                 if (HX_IS_ARRAY(array_store) && HX_ARR_ITEMS(array_store)) {
-                    int64_t idx = v.vs->int_val;
+                    int64_t idx = HX_VSF(v, int_val);
                     if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(array_store)) {
                         // The slot itself is a TAG_ARRAY HexaVal (host array
                         // of element Vals). Heapifying it walks each element.
@@ -2136,9 +2157,9 @@ HexaVal hexa_val_heapify(HexaVal v) {
                             hexa_val_heapify(HX_ARR_ITEMS(array_store)[idx]);
                     }
                 }
-            } else if (v.vs->tag_i == HEXA_INTERP_TAG_MAP && &map_store != 0) {
+            } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_MAP && &map_store != 0) {
                 if (HX_IS_ARRAY(map_store) && HX_ARR_ITEMS(map_store)) {
-                    int64_t idx = v.vs->int_val;
+                    int64_t idx = HX_VSF(v, int_val);
                     if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(map_store)) {
                         // map_store[idx] is a TAG_ARRAY of length 2:
                         // [keys_array, values_array]. Heapifying the outer
@@ -2147,11 +2168,11 @@ HexaVal hexa_val_heapify(HexaVal v) {
                             hexa_val_heapify(HX_ARR_ITEMS(map_store)[idx]);
                     }
                 }
-            } else if (v.vs->tag_i == HEXA_INTERP_TAG_STRUCT && &struct_store != 0) {
+            } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_STRUCT && &struct_store != 0) {
                 // rt 36-D: struct_store[idx] is a TAG_MAP (field map).
                 // Heapify it so closure-captured structs survive scope pop.
                 if (HX_IS_ARRAY(struct_store) && HX_ARR_ITEMS(struct_store)) {
-                    int64_t idx = v.vs->int_val;
+                    int64_t idx = HX_VSF(v, int_val);
                     if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(struct_store)) {
                         HX_ARR_ITEMS(struct_store)[idx] =
                             hexa_val_heapify(HX_ARR_ITEMS(struct_store)[idx]);
@@ -2252,48 +2273,48 @@ HexaVal hexa_str_chars(HexaVal s) {
 }
 
 int hexa_str_contains(HexaVal s, HexaVal sub) {
-    return strstr(s.s, sub.s) != NULL;
+    return strstr(HX_STR(s), HX_STR(sub)) != NULL;
 }
 
 int hexa_str_eq(HexaVal a, HexaVal b) {
     if (!HX_IS_STR(a) || !HX_IS_STR(b)) return 0;
     // Optimization #11: interned strings share pointers
-    if (a.s == b.s) return 1;
-    return strcmp(a.s, b.s) == 0;
+    if (HX_STR(a) == HX_STR(b)) return 1;
+    return strcmp(HX_STR(a), HX_STR(b)) == 0;
 }
 
 int hexa_str_starts_with(HexaVal s, HexaVal prefix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(prefix)) return 0;
-    size_t plen = strlen(prefix.s);
-    return strncmp(s.s, prefix.s, plen) == 0;
+    size_t plen = strlen(HX_STR(prefix));
+    return strncmp(HX_STR(s), HX_STR(prefix), plen) == 0;
 }
 
 int hexa_str_ends_with(HexaVal s, HexaVal suffix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(suffix)) return 0;
-    size_t slen = strlen(s.s);
-    size_t sfxlen = strlen(suffix.s);
+    size_t slen = strlen(HX_STR(s));
+    size_t sfxlen = strlen(HX_STR(suffix));
     if (sfxlen > slen) return 0;
-    return strcmp(s.s + slen - sfxlen, suffix.s) == 0;
+    return strcmp(HX_STR(s) + slen - sfxlen, HX_STR(suffix)) == 0;
 }
 
 HexaVal hexa_str_substring(HexaVal s, HexaVal start, HexaVal end) {
     if (!HX_IS_STR(s)) return hexa_str("");
-    int64_t slen = strlen(s.s);
-    int64_t a = start.i, b = end.i;
+    int64_t slen = strlen(HX_STR(s));
+    int64_t a = HX_INT(start), b = HX_INT(end);
     if (a < 0) a = 0;
     if (b > slen) b = slen;
     if (a >= b) return hexa_str("");
     char* buf = (char*)malloc(b - a + 1);
-    memcpy(buf, s.s + a, b - a);
+    memcpy(buf, HX_STR(s) + a, b - a);
     buf[b - a] = '\0';
     return hexa_str_own(buf);
 }
 
 int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
     if (!HX_IS_STR(s) || !HX_IS_STR(sub)) return -1;
-    char* p = strstr(s.s, sub.s);
+    char* p = strstr(HX_STR(s), HX_STR(sub));
     if (!p) return -1;
-    return (int64_t)(p - s.s);
+    return (int64_t)(p - HX_STR(s));
 }
 
 // ── Array operations ─────────────────────────────────
@@ -2329,7 +2350,7 @@ HexaVal hexa_array_sort(HexaVal arr) {
 // ── Exec ────────────────────────────────────────────
 HexaVal hexa_exec(HexaVal cmd) {
     if (!HX_IS_STR(cmd)) return hexa_str("");
-    FILE* fp = popen(cmd.s, "r");
+    FILE* fp = popen(HX_STR(cmd), "r");
     if (!fp) return hexa_str("");
     char buf[4096]; size_t total = 0;
     char* result = (char*)malloc(4096); result[0] = '\0';
@@ -2358,7 +2379,7 @@ HexaVal hexa_exec_replace(HexaVal cmd) {
     char* argv[4];
     argv[0] = (char*)"/bin/sh";
     argv[1] = (char*)"-c";
-    argv[2] = cmd.s;
+    argv[2] = HX_STR(cmd);
     argv[3] = NULL;
     execvp(argv[0], argv);
     // execvp returned → failure; surface errno and fall through.
@@ -2442,7 +2463,7 @@ HexaVal hexa_to_string(HexaVal v) {
         case TAG_VALSTRUCT: {
             if (!HX_VS(v)) return hexa_str("<Val null>");
             snprintf(buf, 64, "Val{tag=%lld,i=%lld}",
-                (long long)HX_VS(v)->tag_i, (long long)HX_VS(v)->int_val);
+                (long long)HX_VSF(v, tag_i), (long long)HX_VSF(v, int_val));
             return hexa_str(buf);
         }
         default: return _cached_str_value;
@@ -2538,7 +2559,7 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
 // ── File I/O ─────────────────────────────────────────────
 
 HexaVal hexa_read_file(HexaVal path) {
-    FILE* f = fopen(path.s, "r");
+    FILE* f = fopen(HX_STR(path), "r");
     if (!f) return hexa_str("");
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -2551,9 +2572,9 @@ HexaVal hexa_read_file(HexaVal path) {
 }
 
 HexaVal hexa_write_file(HexaVal path, HexaVal content) {
-    FILE* f = fopen(path.s, "w");
+    FILE* f = fopen(HX_STR(path), "w");
     if (!f) return hexa_bool(0);
-    fputs(content.s, f);
+    fputs(HX_STR(content), f);
     fclose(f);
     return hexa_bool(1);
 }
@@ -2619,15 +2640,15 @@ HexaVal hexa_abs(HexaVal v) {
 HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
     // Single arg: replace first {} with arg
     if (!HX_IS_STR(fmt)) return fmt;
-    char* pos = strstr(fmt.s, "{}");
+    char* pos = strstr(HX_STR(fmt), "{}");
     if (!pos) return fmt;
     HexaVal sarg = hexa_to_string(arg);
-    int before = pos - fmt.s;
+    int before = pos - HX_STR(fmt);
     int after_len = strlen(pos + 2);
-    char* result = malloc(before + strlen(sarg.s) + after_len + 1);
-    strncpy(result, fmt.s, before);
+    char* result = malloc(before + strlen(HX_STR(sarg)) + after_len + 1);
+    strncpy(result, HX_STR(fmt), before);
     result[before] = 0;
-    strcat(result, sarg.s);
+    strcat(result, HX_STR(sarg));
     strcat(result, pos + 2);
     return hexa_str_own(result);
 }
@@ -2639,7 +2660,7 @@ HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
     char* result = malloc(cap);
     size_t total = 0;
     result[0] = 0;
-    char* src = fmt.s;
+    char* src = HX_STR(fmt);
     int ai = 0;
     while (*src) {
         if (src[0] == '{' && ai < HX_ARR_LEN(args)) {
@@ -2659,10 +2680,10 @@ HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
                 } else if (spec[0] == 0) {
                     // Simple {}
                     HexaVal s = hexa_to_string(arg);
-                    strncpy(buf, s.s, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+                    strncpy(buf, HX_STR(s), sizeof(buf)-1); buf[sizeof(buf)-1]=0;
                 } else {
                     HexaVal s = hexa_to_string(arg);
-                    strncpy(buf, s.s, sizeof(buf)-1); buf[sizeof(buf)-1]=0;
+                    strncpy(buf, HX_STR(s), sizeof(buf)-1); buf[sizeof(buf)-1]=0;
                 }
                 size_t blen = strlen(buf);
                 while (total + blen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
@@ -2691,8 +2712,8 @@ HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
 HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
     HexaVal arr = hexa_array_new();
     if (!HX_IS_STR(s) || !HX_IS_STR(delim)) return arr;
-    char* src = strdup(s.s);
-    char* d = delim.s;
+    char* src = strdup(HX_STR(s));
+    char* d = HX_STR(delim);
     int dlen = strlen(d);
     char* pos = src;
     while (1) {
@@ -2708,7 +2729,7 @@ HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
 
 HexaVal hexa_str_trim(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    char* str = s.s;
+    char* str = HX_STR(s);
     while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
     int len = strlen(str);
     while (len > 0 && (str[len-1] == ' ' || str[len-1] == '\t' || str[len-1] == '\n' || str[len-1] == '\r')) len--;
@@ -2718,15 +2739,15 @@ HexaVal hexa_str_trim(HexaVal s) {
 
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
     if (!HX_IS_STR(s)) return s;
-    size_t cap = strlen(s.s) * 2 + 1;
+    size_t cap = strlen(HX_STR(s)) * 2 + 1;
     char* result = malloc(cap);
     size_t total = 0;
     result[0] = 0;
-    char* pos = s.s;
-    int oldlen = strlen(old.s);
-    size_t newlen = strlen(new_s.s);
+    char* pos = HX_STR(s);
+    int oldlen = strlen(HX_STR(old));
+    size_t newlen = strlen(HX_STR(new_s));
     while (1) {
-        char* found = strstr(pos, old.s);
+        char* found = strstr(pos, HX_STR(old));
         if (!found) {
             size_t rlen = strlen(pos);
             while (total + rlen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
@@ -2739,7 +2760,7 @@ HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
         while (total + seg + newlen + 1 > cap) { cap *= 2; result = realloc(result, cap); }
         memcpy(result + total, pos, seg);
         total += seg;
-        memcpy(result + total, new_s.s, newlen);
+        memcpy(result + total, HX_STR(new_s), newlen);
         total += newlen;
         result[total] = 0;
         pos = found + oldlen;
@@ -2749,14 +2770,14 @@ HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
 
 HexaVal hexa_str_to_upper(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    char* r = strdup(s.s);
+    char* r = strdup(HX_STR(s));
     for (int i = 0; r[i]; i++) if (r[i] >= 'a' && r[i] <= 'z') r[i] -= 32;
     return hexa_str_own(r);
 }
 
 HexaVal hexa_str_to_lower(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    char* r = strdup(s.s);
+    char* r = strdup(HX_STR(s));
     for (int i = 0; r[i]; i++) if (r[i] >= 'A' && r[i] <= 'Z') r[i] += 32;
     return hexa_str_own(r);
 }
@@ -2766,20 +2787,20 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     size_t total_size = 0;
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         HexaVal s = hexa_to_string(HX_ARR_ITEMS(arr)[i]);
-        total_size += strlen(s.s);
+        total_size += strlen(HX_STR(s));
     }
-    size_t seplen = strlen(sep.s);
+    size_t seplen = strlen(HX_STR(sep));
     total_size += (HX_ARR_LEN(arr) - 1) * seplen;
     char* result = malloc(total_size + 1);
     size_t total = 0;
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         if (i > 0) {
-            memcpy(result + total, sep.s, seplen);
+            memcpy(result + total, HX_STR(sep), seplen);
             total += seplen;
         }
         HexaVal s = hexa_to_string(HX_ARR_ITEMS(arr)[i]);
-        size_t slen = strlen(s.s);
-        memcpy(result + total, s.s, slen);
+        size_t slen = strlen(HX_STR(s));
+        memcpy(result + total, HX_STR(s), slen);
         total += slen;
     }
     result[total] = 0;
@@ -2792,14 +2813,14 @@ static int utf8_cpcount(const char* s) {
 }
 HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
-    int w = width.i;
-    int cplen = utf8_cpcount(str.s);
-    int bytelen = strlen(str.s);
+    int w = HX_INT(width);
+    int cplen = utf8_cpcount(HX_STR(str));
+    int bytelen = strlen(HX_STR(str));
     if (cplen >= w) return str;
     int pad = w - cplen;
     char* result = malloc(bytelen + pad + 1);
     memset(result, ' ', pad);
-    strcpy(result + pad, str.s);
+    strcpy(result + pad, HX_STR(str));
     return hexa_str_own(result);
 }
 
@@ -2811,13 +2832,13 @@ static HexaVal join;
 
 HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
-    int w = width.i;
-    int cplen = utf8_cpcount(str.s);
-    int bytelen = strlen(str.s);
+    int w = HX_INT(width);
+    int cplen = utf8_cpcount(HX_STR(str));
+    int bytelen = strlen(HX_STR(str));
     if (cplen >= w) return str;
     int pad = w - cplen;
     char* result = malloc(bytelen + pad + 1);
-    strcpy(result, str.s);
+    strcpy(result, HX_STR(str));
     memset(result + bytelen, ' ', pad);
     result[bytelen + pad] = 0;
     return hexa_str_own(result);
@@ -2876,11 +2897,11 @@ HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
     if (!HX_IS_STR(s)) return s;
     int count = HX_INT(n);
     if (count <= 0) return hexa_str("");
-    size_t slen = strlen(s.s);
+    size_t slen = strlen(HX_STR(s));
     char* result = malloc(slen * (size_t)count + 1);
     size_t total = 0;
     for (int i = 0; i < count; i++) {
-        memcpy(result + total, s.s, slen);
+        memcpy(result + total, HX_STR(s), slen);
         total += slen;
     }
     result[total] = 0;
@@ -2897,7 +2918,7 @@ int hexa_array_contains(HexaVal arr, HexaVal item) {
 
 HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
     double v = __hx_to_double(f);
-    int p = prec.i;
+    int p = HX_INT(prec);
     char buf[64];
     snprintf(buf, 64, "%.*f", p, v);
     return hexa_str(buf);
@@ -2905,7 +2926,7 @@ HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
 
 HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec) {
     double v = __hx_to_double(f);
-    int p = prec.i;
+    int p = HX_INT(prec);
     char buf[64];
     snprintf(buf, 64, "%.*e", p, v);
     return hexa_str(buf);
@@ -3304,7 +3325,7 @@ HexaVal hexa_from_cstring(HexaVal ptr) {
 HexaVal hexa_ptr_null() { return hexa_int(0); }
 
 HexaVal hexa_ptr_addr(HexaVal v) {
-    return hexa_int(v.i);
+    return hexa_int(HX_INT(v));
 }
 
 // ── C2 Step 3: Dynamic FFI host dispatch (interpreter path) ──
@@ -3354,15 +3375,15 @@ HexaVal hexa_host_ffi_sym(HexaVal handle, HexaVal symbol) {
 // marshal switch default and every arg becomes 0.
 static HexaVal hexa_host_ffi_unwrap(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return v;
-    int64_t t = v.vs->tag_i;
+    int64_t t = HX_VSF(v, tag_i);
     // Hexa-level tag values: 0=INT, 1=FLOAT, 2=BOOL, 3=STR, 8=VOID, 13=POINTER
     // See self/interpreter.hexa let TAG_* constants.
-    if (t == 0)  return hexa_int(v.vs->int_val);
-    if (t == 1)  return hexa_float(v.vs->float_val);
-    if (t == 2)  return hexa_bool(v.vs->bool_val);
-    if (t == 3)  return v.vs->str_val;       // already TAG_STR
-    if (t == 13) return hexa_int(v.vs->int_val);  // pointer → int ABI lane
-    return hexa_int(v.vs->int_val);
+    if (t == 0)  return hexa_int(HX_VSF(v, int_val));
+    if (t == 1)  return hexa_float(HX_VSF(v, float_val));
+    if (t == 2)  return hexa_bool(HX_VSF(v, bool_val));
+    if (t == 3)  return HX_VSF(v, str_val);       // already TAG_STR
+    if (t == 13) return hexa_int(HX_VSF(v, int_val));  // pointer → int ABI lane
+    return hexa_int(HX_VSF(v, int_val));
 }
 
 HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask, HexaVal ret_kind) {
@@ -3478,7 +3499,7 @@ HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
         double d = HX_FLOAT(val);
         memcpy(base, &d, sizeof(double));
     } else {
-        int64_t v = val.i;
+        int64_t v = HX_INT(val);
         memcpy(base, &v, sizeof(int64_t));
     }
     return hexa_void();
@@ -3758,9 +3779,9 @@ HexaVal hexa_char_code(HexaVal s, HexaVal idx);
 static HexaVal char_code;
 HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_int(0);
-    int i = idx.i;
-    if (i < 0 || i >= (int)strlen(s.s)) return hexa_int(0);
-    return hexa_int((unsigned char)s.s[i]);
+    int i = HX_INT(idx);
+    if (i < 0 || i >= (int)strlen(HX_STR(s))) return hexa_int(0);
+    return hexa_int((unsigned char)HX_STR(s)[i]);
 }
 
 // `chr(n)` — Python/Ruby-style inverse of char_code: int byte → 1-char str.
@@ -3781,43 +3802,43 @@ static HexaVal bit_or;
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_int(0);
-    return hexa_int((int64_t)strtoll(s.s, NULL, 10));
+    return hexa_int((int64_t)strtoll(HX_STR(s), NULL, 10));
 }
 
 HexaVal hexa_str_parse_float(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_float(0.0);
-    return hexa_float(strtod(s.s, NULL));
+    return hexa_float(strtod(HX_STR(s), NULL));
 }
 
 HexaVal hexa_str_trim_start(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    char* p = s.s;
+    char* p = HX_STR(s);
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     return hexa_str_own(strdup(p));
 }
 
 HexaVal hexa_str_trim_end(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    int len = strlen(s.s);
-    while (len > 0 && (s.s[len-1] == ' ' || s.s[len-1] == '\t' || s.s[len-1] == '\n' || s.s[len-1] == '\r')) len--;
-    return hexa_str_own(strndup(s.s, len));
+    int len = strlen(HX_STR(s));
+    while (len > 0 && (HX_STR(s)[len-1] == ' ' || HX_STR(s)[len-1] == '\t' || HX_STR(s)[len-1] == '\n' || HX_STR(s)[len-1] == '\r')) len--;
+    return hexa_str_own(strndup(HX_STR(s), len));
 }
 
 // Byte-based slice: [start, end) clamped to length
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
     if (!HX_IS_STR(s)) return hexa_str("");
-    int len = (int)strlen(s.s);
-    int a = (int)start.i, b = (int)end.i;
+    int len = (int)strlen(HX_STR(s));
+    int a = (int)HX_INT(start), b = (int)HX_INT(end);
     if (a < 0) a = 0;
     if (b > len) b = len;
     if (a > b) a = b;
-    return hexa_str_own(strndup(s.s + a, b - a));
+    return hexa_str_own(strndup(HX_STR(s) + a, b - a));
 }
 
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
     if (!HX_IS_ARRAY(arr)) return hexa_array_new();
     int n = HX_ARR_LEN(arr);
-    int a = (int)start.i, b = (int)end.i;
+    int a = (int)HX_INT(start), b = (int)HX_INT(end);
     if (a < 0) a = 0;
     if (b > n) b = n;
     if (a > b) a = b;
@@ -3865,7 +3886,7 @@ HexaVal hexa_array_index_of(HexaVal arr, HexaVal item) {
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
-    for (const unsigned char* p = (const unsigned char*)s.s; *p; p++) {
+    for (const unsigned char* p = (const unsigned char*)HX_STR(s); *p; p++) {
         out = hexa_array_push(out, hexa_int((int64_t)*p));
     }
     return out;
@@ -3933,7 +3954,7 @@ HexaVal hexa_math_exp(HexaVal x)  { return hexa_float(exp(_hexa_f(x))); }
 
 HexaVal hexa_input(HexaVal prompt) {
     if (HX_IS_STR(prompt) && HX_STR(prompt) && HX_STR(prompt)[0]) {
-        fputs(prompt.s, stdout);
+        fputs(HX_STR(prompt), stdout);
         fflush(stdout);
     }
     char* buf = NULL;
@@ -3960,7 +3981,7 @@ HexaVal hexa_read_lines(HexaVal path) {
     HexaVal content = hexa_read_file(path);
     if (!HX_IS_STR(content)) return hexa_array_new();
     HexaVal out = hexa_array_new();
-    const char* p = content.s;
+    const char* p = HX_STR(content);
     const char* start = p;
     while (*p) {
         if (*p == '\n') {
@@ -4015,9 +4036,9 @@ HexaVal hexa_env_var(HexaVal name) {
     // env_pop_scope / call_user_fn invoke env("__HEXA_ARENA_*") to drive the C
     // arena without needing a transpiler-level builtin. Returns "0" / "1" so
     // existing callers that ignore the result are unaffected.
-    if (name.s[0] == '_' && name.s[1] == '_' && name.s[2] == 'H' &&
-        strncmp(name.s, "__HEXA_ARENA_", 13) == 0) {
-        const char* op = name.s + 13;
+    if (HX_STR(name)[0] == '_' && HX_STR(name)[1] == '_' && HX_STR(name)[2] == 'H' &&
+        strncmp(HX_STR(name), "__HEXA_ARENA_", 13) == 0) {
+        const char* op = HX_STR(name) + 13;
         if (strcmp(op, "PUSH__") == 0) {
             hexa_val_arena_scope_push();
             return hexa_str("1");
@@ -4040,7 +4061,7 @@ HexaVal hexa_env_var(HexaVal name) {
         }
         // Unknown __HEXA_ARENA_* op — fall through to real getenv (returns "").
     }
-    const char* v = getenv(name.s);
+    const char* v = getenv(HX_STR(name));
     return hexa_str(v ? v : "");
 }
 
@@ -4053,7 +4074,7 @@ HexaVal hexa_delete_file(HexaVal path) {
 HexaVal hexa_append_file(HexaVal path, HexaVal content) {
     if (!HX_IS_STR(path) || !HX_STR(path)) return hexa_void();
     const char* data = (HX_IS_STR(content) && HX_STR(content)) ? HX_STR(content) : "";
-    FILE* f = fopen(path.s, "ab");
+    FILE* f = fopen(HX_STR(path), "ab");
     if (!f) return hexa_void();
     fwrite(data, 1, strlen(data), f);
     fclose(f);
@@ -4090,8 +4111,8 @@ static const char _b64_enc[] =
 
 HexaVal hexa_base64_encode(HexaVal s) {
     if (!HX_IS_STR(s) || !HX_STR(s)) return hexa_str("");
-    const unsigned char* in = (const unsigned char*)s.s;
-    size_t n = strlen(s.s);
+    const unsigned char* in = (const unsigned char*)HX_STR(s);
+    size_t n = strlen(HX_STR(s));
     size_t olen = 4 * ((n + 2) / 3);
     char* out = (char*)malloc(olen + 1);
     size_t i = 0, j = 0;
@@ -4125,8 +4146,8 @@ HexaVal hexa_base64_decode(HexaVal s) {
         for (int i = 0; i < 64; i++) dec[(unsigned char)_b64_enc[i]] = i;
         dec_init = 1;
     }
-    const unsigned char* in = (const unsigned char*)s.s;
-    size_t n = strlen(s.s);
+    const unsigned char* in = (const unsigned char*)HX_STR(s);
+    size_t n = strlen(HX_STR(s));
     char* out = (char*)malloc(n + 1);
     size_t j = 0;
     int bits = 0, vbits = 0;
