@@ -3838,6 +3838,12 @@ HexaVal _hx_bit_or(HexaVal a, HexaVal b) {
 }
 static HexaVal bit_or;
 
+// `parse_float(s)` and `env(name)` — codegen_c2 emits bare identifiers
+// via hexa_call1(). These shims bridge the gap until codegen learns the
+// hexa_str_parse_float / hexa_env_var lowering directly.
+static HexaVal parse_float;
+static HexaVal env;
+
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_int(0);
@@ -4246,6 +4252,9 @@ static void _hexa_init_fn_shims(void) {
     // std::net free-fn shims — bridges transpiler bootstrap gap for
     // net_connect / net_read / net_write until hexa_v2 learns the
     // direct-lowering for these names (see native/net.c comment).
+    // codegen_c2 builtin shims (parse_float, env)
+    parse_float = hexa_fn_new((void*)hexa_str_parse_float, 1);
+    env         = hexa_fn_new((void*)hexa_env_var,         1);
     _hexa_init_net_fn_shims();
     _fn_shims_ready = 1;
 }
