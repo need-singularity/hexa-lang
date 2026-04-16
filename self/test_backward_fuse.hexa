@@ -1,0 +1,366 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_backward_fuse.hexa — ROI #102 correctness suite
+//
+//  Validates self/ai_native/backward_fuse.hexa:
+//      - Op constructors (tags 0..6)
+//      - forward_chain / forward_chain_states on each op
+//      - backward_chain_naive == backward_chain_fused element-wise
+//      - Closed-form identities per op (add, mul, relu, tanh, sigmoid)
+//      - Empty chain → identity (dx = dz)
+//      - Single-element input
+//      - Long mixed chain random-seed parity
+//      - detect_fusable_chain (all defined tags are fusable)
+//      - rewrite_chain (identity)
+//      - naive_bwd_alloc_count / fused_bwd_alloc_count
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/backward_fuse.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut max_abs_diff_global = 0.0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        if fabs_t(a[i] - b[i]) > eps { return false }
+    }
+    return true
+}
+
+fn vec_max_diff(a, b) {
+    let mut mx = 0.0
+    for i in 0..len(a) {
+        let d = fabs_t(a[i] - b[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+fn update_global_max(d) {
+    if d > max_abs_diff_global { max_abs_diff_global = d }
+}
+
+// deterministic LCG
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_vec(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let r = (state % 1000) * 0.004 - 2.0
+        v = v + [r]
+    }
+    return v
+}
+
+fn sigmoid_scalar(x) {
+    let mut c = x
+    if c >  40.0 { c =  40.0 }
+    if c < -40.0 { c = -40.0 }
+    return 1.0 / (1.0 + exp(0.0 - c))
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #102 backward_fuse — chained bwd single kernel")
+println("═══════════════════════════════════════════════════════")
+
+let tol = 1.0e-6
+
+// ── T01  Op constructor tags ─────────────────────────────────────
+check("T01 add_const tag==0",    op_bwd_add_const(1.5).tag == 0)
+check("T01 sub_const tag==1",    op_bwd_sub_const(1.5).tag == 1)
+check("T01 mul_const tag==2",    op_bwd_mul_const(1.5).tag == 2)
+check("T01 relu tag==3",         op_bwd_relu().tag == 3)
+check("T01 tanh tag==4",         op_bwd_tanh().tag == 4)
+check("T01 sigmoid tag==5",      op_bwd_sigmoid().tag == 5)
+check("T01 identity tag==6",     op_bwd_identity().tag == 6)
+
+// ── T02  forward_chain: add_const ────────────────────────────────
+let x2 = [1.0, 2.0, 3.0]
+let ops2 = [op_bwd_add_const(10.0)]
+let fc2 = forward_chain(x2, ops2)
+check("T02 add_const fwd[0]", fabs_t(fc2[0] - 11.0) < tol)
+check("T02 add_const fwd[1]", fabs_t(fc2[1] - 12.0) < tol)
+check("T02 add_const fwd[2]", fabs_t(fc2[2] - 13.0) < tol)
+
+// ── T03  forward_chain: mul_const (scale) ────────────────────────
+let ops3 = [op_bwd_mul_const(3.0)]
+let fc3 = forward_chain(x2, ops3)
+check("T03 mul_const fwd[0]", fabs_t(fc3[0] - 3.0) < tol)
+check("T03 mul_const fwd[1]", fabs_t(fc3[1] - 6.0) < tol)
+check("T03 mul_const fwd[2]", fabs_t(fc3[2] - 9.0) < tol)
+
+// ── T04  forward_chain: relu zeroes negatives ────────────────────
+let x4 = [0.0 - 1.0, 0.5, 0.0 - 3.0, 2.0]
+let ops4 = [op_bwd_relu()]
+let fc4 = forward_chain(x4, ops4)
+check("T04 relu fwd[0]", fabs_t(fc4[0] - 0.0) < tol)
+check("T04 relu fwd[1]", fabs_t(fc4[1] - 0.5) < tol)
+check("T04 relu fwd[2]", fabs_t(fc4[2] - 0.0) < tol)
+check("T04 relu fwd[3]", fabs_t(fc4[3] - 2.0) < tol)
+
+// ── T05  forward_chain_states — length k+1, states[0] == x copy ──
+let x5 = [0.5, 1.0]
+let ops5 = [op_bwd_mul_const(2.0), op_bwd_add_const(1.0)]
+let st5 = forward_chain_states(x5, ops5)
+check("T05 states length == k+1", len(st5) == 3)
+check("T05 states[0] == x copy", vec_close(st5[0], x5, tol))
+// states[1] = mul by 2 → [1.0, 2.0]
+check("T05 states[1][0] == 1.0", fabs_t(st5[1][0] - 1.0) < tol)
+check("T05 states[1][1] == 2.0", fabs_t(st5[1][1] - 2.0) < tol)
+// states[2] = add 1 → [2.0, 3.0]
+check("T05 states[2][0] == 2.0", fabs_t(st5[2][0] - 2.0) < tol)
+check("T05 states[2][1] == 3.0", fabs_t(st5[2][1] - 3.0) < tol)
+
+// ── T06  Empty chain: backward_chain_fused returns dz copy ───────
+let dz6 = [0.7, 0.3, 0.5]
+let x6  = [1.0, 2.0, 3.0]
+let dx6 = backward_chain_fused(dz6, x6, [])
+check("T06 empty chain dx == dz", vec_close(dx6, dz6, tol))
+
+// ── T07  Empty chain: naive also returns dz copy ─────────────────
+let dx7 = backward_chain_naive(dz6, x6, [])
+check("T07 empty chain naive dx == dz", vec_close(dx7, dz6, tol))
+
+// ── T08  add_const backward: d(x+c)/dx = 1 → dx == dz ────────────
+let dz8  = [1.0, 2.0, 3.0]
+let x8   = [0.1, 0.2, 0.3]
+let ops8 = [op_bwd_add_const(99.0)]
+let dx8_n = backward_chain_naive(dz8, x8, ops8)
+let dx8_f = backward_chain_fused(dz8, x8, ops8)
+check("T08 add_const naive dx == dz", vec_close(dx8_n, dz8, tol))
+check("T08 add_const fused dx == dz", vec_close(dx8_f, dz8, tol))
+update_global_max(vec_max_diff(dx8_n, dx8_f))
+
+// ── T09  sub_const backward: d(x-c)/dx = 1 → dx == dz ────────────
+let ops9 = [op_bwd_sub_const(5.0)]
+let dx9_n = backward_chain_naive(dz8, x8, ops9)
+let dx9_f = backward_chain_fused(dz8, x8, ops9)
+check("T09 sub_const naive dx == dz", vec_close(dx9_n, dz8, tol))
+check("T09 sub_const fused dx == dz", vec_close(dx9_f, dz8, tol))
+update_global_max(vec_max_diff(dx9_n, dx9_f))
+
+// ── T10  mul_const backward: d(cx)/dx = c → dx == c·dz ───────────
+let ops10 = [op_bwd_mul_const(4.0)]
+let dx10_n = backward_chain_naive(dz8, x8, ops10)
+let dx10_f = backward_chain_fused(dz8, x8, ops10)
+let mut expect10 = []
+for i in 0..len(dz8) {
+    expect10 = expect10 + [4.0 * dz8[i]]
+}
+check("T10 mul_const naive == 4·dz",  vec_close(dx10_n, expect10, tol))
+check("T10 mul_const fused == 4·dz",  vec_close(dx10_f, expect10, tol))
+update_global_max(vec_max_diff(dx10_n, dx10_f))
+
+// ── T11  relu backward: step at x>0 ──────────────────────────────
+let dz11  = [1.0, 1.0, 1.0, 1.0]
+let x11   = [0.0 - 1.0, 0.5, 0.0 - 0.01, 2.0]
+let ops11 = [op_bwd_relu()]
+let dx11_n = backward_chain_naive(dz11, x11, ops11)
+let dx11_f = backward_chain_fused(dz11, x11, ops11)
+// Expected: [0, 1, 0, 1]
+let expect11 = [0.0, 1.0, 0.0, 1.0]
+check("T11 relu naive step",  vec_close(dx11_n, expect11, tol))
+check("T11 relu fused step",  vec_close(dx11_f, expect11, tol))
+update_global_max(vec_max_diff(dx11_n, dx11_f))
+
+// ── T12  relu boundary at x=0 maps to 0 ──────────────────────────
+let dz12  = [1.0]
+let x12   = [0.0]
+let dx12  = backward_chain_fused(dz12, x12, [op_bwd_relu()])
+check("T12 relu at x=0 → 0", fabs_t(dx12[0] - 0.0) < tol)
+
+// ── T13  tanh backward matches closed form 1-tanh²(x) ────────────
+let dz13 = [1.0, 1.0, 1.0]
+let x13  = [0.0, 0.5, 1.0]
+let ops13 = [op_bwd_tanh()]
+let dx13_n = backward_chain_naive(dz13, x13, ops13)
+let dx13_f = backward_chain_fused(dz13, x13, ops13)
+let mut expect13 = []
+for i in 0..len(x13) {
+    let y = tanh(x13[i])
+    expect13 = expect13 + [1.0 - y * y]
+}
+check("T13 tanh naive matches closed form", vec_close(dx13_n, expect13, tol))
+check("T13 tanh fused matches closed form", vec_close(dx13_f, expect13, tol))
+update_global_max(vec_max_diff(dx13_n, dx13_f))
+
+// ── T14  sigmoid backward matches σ(x)·(1-σ(x)) ──────────────────
+let dz14 = [1.0, 1.0, 1.0]
+let x14  = [0.0 - 1.0, 0.0, 1.0]
+let ops14 = [op_bwd_sigmoid()]
+let dx14_n = backward_chain_naive(dz14, x14, ops14)
+let dx14_f = backward_chain_fused(dz14, x14, ops14)
+let mut expect14 = []
+for i in 0..len(x14) {
+    let s = sigmoid_scalar(x14[i])
+    expect14 = expect14 + [s * (1.0 - s)]
+}
+check("T14 sigmoid naive matches closed form", vec_close(dx14_n, expect14, tol))
+check("T14 sigmoid fused matches closed form", vec_close(dx14_f, expect14, tol))
+update_global_max(vec_max_diff(dx14_n, dx14_f))
+
+// ── T15  identity backward: dx == dz ─────────────────────────────
+let ops15 = [op_bwd_identity()]
+let dx15_n = backward_chain_naive(dz8, x8, ops15)
+let dx15_f = backward_chain_fused(dz8, x8, ops15)
+check("T15 identity naive dx == dz", vec_close(dx15_n, dz8, tol))
+check("T15 identity fused dx == dz", vec_close(dx15_f, dz8, tol))
+
+// ── T16  Two-op chain: mul(2) then mul(3) → dx = 6·dz ────────────
+let ops16 = [op_bwd_mul_const(2.0), op_bwd_mul_const(3.0)]
+let dz16  = [0.5, -0.5, 1.0]
+let x16   = [0.1, 0.2, 0.3]
+let dx16_n = backward_chain_naive(dz16, x16, ops16)
+let dx16_f = backward_chain_fused(dz16, x16, ops16)
+let mut expect16 = []
+for i in 0..len(dz16) {
+    expect16 = expect16 + [6.0 * dz16[i]]
+}
+check("T16 mul·mul naive == 6·dz", vec_close(dx16_n, expect16, tol))
+check("T16 mul·mul fused == 6·dz", vec_close(dx16_f, expect16, tol))
+update_global_max(vec_max_diff(dx16_n, dx16_f))
+
+// ── T17  Three-op chain: add then mul then relu ──────────────────
+// fwd: v0=x, v1=x+1, v2=2(x+1), v3=relu(2(x+1))
+// bwd: dx = 1 · 2 · step(2(x+1)) · dz
+let ops17 = [op_bwd_add_const(1.0), op_bwd_mul_const(2.0), op_bwd_relu()]
+let x17   = [0.0 - 2.0, 0.0 - 0.5, 0.0, 0.5, 2.0]
+let dz17  = [1.0, 1.0, 1.0, 1.0, 1.0]
+let dx17_n = backward_chain_naive(dz17, x17, ops17)
+let dx17_f = backward_chain_fused(dz17, x17, ops17)
+check("T17 add·mul·relu naive == fused", vec_close(dx17_n, dx17_f, tol))
+update_global_max(vec_max_diff(dx17_n, dx17_f))
+
+// ── T18  Single-element input ────────────────────────────────────
+let dz18  = [2.0]
+let x18   = [1.0]
+let ops18 = [op_bwd_mul_const(5.0)]
+let dx18  = backward_chain_fused(dz18, x18, ops18)
+check("T18 single-elem N=1",  len(dx18) == 1)
+check("T18 single-elem value", fabs_t(dx18[0] - 10.0) < tol)
+
+// ── T19  Long mixed chain — random seed parity ───────────────────
+let seeds19 = [7, 13, 23, 41, 61]
+let sizes19 = [4, 8, 16, 32, 64]
+for k in 0..5 {
+    let n  = sizes19[k]
+    let sd = seeds19[k]
+    let x  = rand_vec(n, sd * 3)
+    let dz = rand_vec(n, sd * 5)
+    // Mixed chain of seven ops — one of each kind.
+    let ops = [
+        op_bwd_add_const(0.25),
+        op_bwd_mul_const(0.5),
+        op_bwd_tanh(),
+        op_bwd_sub_const(0.1),
+        op_bwd_relu(),
+        op_bwd_sigmoid(),
+        op_bwd_identity()
+    ]
+    let dxn = backward_chain_naive(dz, x, ops)
+    let dxf = backward_chain_fused(dz, x, ops)
+    let ok  = vec_close(dxn, dxf, tol)
+    update_global_max(vec_max_diff(dxn, dxf))
+    check("T19 mixed chain fused==naive N=" + to_string(n)
+          + " seed=" + to_string(sd), ok)
+}
+
+// ── T20  detect_fusable_chain — all defined tags ─────────────────
+let all_ops = [
+    op_bwd_add_const(1.0),
+    op_bwd_sub_const(1.0),
+    op_bwd_mul_const(1.0),
+    op_bwd_relu(),
+    op_bwd_tanh(),
+    op_bwd_sigmoid(),
+    op_bwd_identity()
+]
+check("T20 all defined ops are fusable", detect_fusable_chain(all_ops))
+
+// ── T21  detect_fusable_chain — empty chain is fusable ───────────
+check("T21 empty chain is fusable", detect_fusable_chain([]))
+
+// ── T22  detect_fusable_chain — invalid tag rejected ─────────────
+let bad = [BwdOp { tag: 42, c: 0.0 }]
+check("T22 invalid tag NEG", !detect_fusable_chain(bad))
+
+// ── T23  detect_fusable_chain — negative tag rejected ────────────
+let bad2 = [BwdOp { tag: 0 - 1, c: 0.0 }]
+check("T23 negative tag NEG", !detect_fusable_chain(bad2))
+
+// ── T24  rewrite_chain — identity (fusable passes through) ───────
+let rw = rewrite_chain(all_ops)
+check("T24 rewrite_chain length preserved", len(rw) == len(all_ops))
+let mut tags_match = true
+for i in 0..len(rw) {
+    if rw[i].tag != all_ops[i].tag { tags_match = false }
+}
+check("T24 rewrite_chain tags preserved", tags_match)
+
+// ── T25  Allocation accounting — naive = len(ops) (or 1 if empty) ─
+check("T25 naive alloc(7-op) == 7",  naive_bwd_alloc_count(all_ops)  == 7)
+check("T25 naive alloc(empty) == 1", naive_bwd_alloc_count([])       == 1)
+check("T25 fused alloc(7-op) == 1",  fused_bwd_alloc_count(all_ops)  == 1)
+check("T25 fused alloc(empty) == 1", fused_bwd_alloc_count([])       == 1)
+
+// ── T26  dz = 0 → dx = 0 for any chain ───────────────────────────
+let dz26 = [0.0, 0.0, 0.0]
+let x26  = [1.0, 2.0, 3.0]
+let dx26 = backward_chain_fused(dz26, x26, all_ops)
+let mut all_zero = true
+for i in 0..len(dx26) {
+    if fabs_t(dx26[i]) > tol { all_zero = false }
+}
+check("T26 dz=0 → dx=0", all_zero)
+
+// ── T27  Deep chain — 10× mul_const(1.0) → dx == dz ──────────────
+let ops27 = [
+    op_bwd_mul_const(1.0), op_bwd_mul_const(1.0),
+    op_bwd_mul_const(1.0), op_bwd_mul_const(1.0),
+    op_bwd_mul_const(1.0), op_bwd_mul_const(1.0),
+    op_bwd_mul_const(1.0), op_bwd_mul_const(1.0),
+    op_bwd_mul_const(1.0), op_bwd_mul_const(1.0)
+]
+let dz27 = [0.7, 0.3, 0.9]
+let x27  = [1.0, 2.0, 3.0]
+let dx27 = backward_chain_fused(dz27, x27, ops27)
+check("T27 deep mul(1)×10 dx == dz", vec_close(dx27, dz27, tol))
+
+// ── T28  Global max_abs_diff across all fused-vs-naive checks ────
+check("T28 global max_abs_diff ≤ 1e-6",
+      max_abs_diff_global <= tol)
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  max_abs_diff = " + to_string(max_abs_diff_global))
+println("  Results: " + to_string(pass_count) + " PASS / "
+        + to_string(fail_count) + " FAIL")
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[ALL PASS] ROI #102 backward_fuse verified")
+}
