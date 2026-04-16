@@ -75,6 +75,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include <stdlib.h>
 #include <string.h>
 
 // ─────────────────────────────────────────────────────────────
@@ -231,7 +232,9 @@ typedef struct hxccl_handle {
     int32_t magic;   /* 0x48584343 'HXCC' */
 } hxccl_handle;
 
-int64_t hxccl_init(int64_t rank, int64_t world_size) {
+// Renamed from hxccl_init → hxccl_init_handle on 2026-04-16 to resolve
+// Linux duplicate-symbol with Family A's stateless hxccl_init.
+int64_t hxccl_init_handle(int64_t rank, int64_t world_size) {
     if (world_size < 1) return -1;
     if (rank < 0 || rank >= world_size) return -1;
 
@@ -334,10 +337,25 @@ typedef struct hxccl_handle_mac {
 
 int64_t hxccl_version(void) { return 1; }
 
-int64_t hxccl_world_size(void) { return 1; }
-int64_t hxccl_rank(void) { return 0; }
+// Mac Family A globals — mirror Linux structure.
+static int64_t g_hxccl_rank_mac       = -1;
+static int64_t g_hxccl_world_size_mac =  0;
 
+int64_t hxccl_world_size(void) { return g_hxccl_world_size_mac; }
+int64_t hxccl_rank(void) { return g_hxccl_rank_mac; }
+
+/* Family A stateless init — returns 0 on success, negative on failure. */
 int64_t hxccl_init(int64_t rank, int64_t world_size) {
+    if (world_size < 1) return -2;
+    if (rank < 0 || rank >= world_size) return -3;
+    if (world_size != 1) return -1;  /* Mac stub: single-rank only */
+    g_hxccl_rank_mac       = rank;
+    g_hxccl_world_size_mac = world_size;
+    return 0;
+}
+
+/* Family B handle init — renamed 2026-04-16 to match Linux ABI. */
+int64_t hxccl_init_handle(int64_t rank, int64_t world_size) {
     if (world_size < 1 || rank < 0 || rank >= world_size) return -1;
     hxccl_handle_mac* h = (hxccl_handle_mac*)calloc(1, sizeof(hxccl_handle_mac));
     if (!h) return -1;
