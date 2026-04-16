@@ -1,432 +1,289 @@
 // ═══════════════════════════════════════════════════════════════
-//  self/ml/paged_attention.hexa — vLLM-style Paged KV-cache Attention
+//  self/ml/paged_attention.hexa — vLLM-style Paged KV-Cache Attention
 //
-//  Implements:
-//    1. Block table    — physical block <-> logical block mapping
-//    2. Page allocator — free list based block alloc/dealloc
-//    3. Copy-on-write  — fork shares blocks + cow flag
-//    4. Paged attention forward — Q attends to KV stored in pages
+//  Pure Hexa, no C/FFI.
 //
-//  Layout:
-//    Each block holds block_size tokens of KV data.
-//    kv_blocks[phys_id] = flat array of length block_size * head_dim * 2
-//      first half  = keys   [block_size * head_dim]
-//      second half = values [block_size * head_dim]
+//  Design:
+//    Page table manages fixed-size pages of KV vectors.
+//    Each sequence owns an ordered list of page_ids.
+//    Within each page: flat arrays of k/v vectors, up to page_size slots.
+//    Allocation uses a free list (stack-based).
 //
 //  API:
-//    create_block_table(num_blocks, block_size)
-//    allocate_block(table)
-//    free_block(table, phys_id)
-//    paged_attention_forward(Q, block_table, kv_blocks, block_size, head_dim)
-//
-//  AI-NATIVE attrs:
-//    @hot      — forward called every decode step
-//    @parallel — query rows independent
-//    @pure     — math kernels
+//    page_table_new(num_pages, page_size, head_dim) -> dict
+//    page_alloc(pt) -> int                  (-1 if full)
+//    page_free(pt, page_id)
+//    kv_cache_append(pt, seq_id, k_vec, v_vec)
+//    paged_attention_score(pt, seq_id, query) -> [float]
+//    paged_attention_output(pt, seq_id, query) -> [float]
 // ═══════════════════════════════════════════════════════════════
 
-// ── helpers ──────────────────────────────────────────────────
-
-fn pa_zeros_1d(n) {
-    let mut v = []
+// ── Page Table Constructor ────────────────────────────────────
+// Returns a dict with:
+//   "num_pages"  : int
+//   "page_size"  : int
+//   "head_dim"   : int
+//   "free_list"  : [int]         — stack of available page ids
+//   "page_keys"  : [float]       — flat: page_id * page_size * head_dim
+//   "page_vals"  : [float]       — same layout
+//   "page_used"  : [int]         — how many slots used per page
+//   "seq_pages"  : dict          — seq_id(string) -> [int] page id list
+fn page_table_new(num_pages, page_size, head_dim) {
+    let total = num_pages * page_size * head_dim
+    let mut keys_flat = []
+    let mut vals_flat = []
     let mut i = 0
-    while i < n {
-        v = v + [0.0]
+    while i < total {
+        keys_flat.push(0.0)
+        vals_flat.push(0.0)
         i = i + 1
     }
-    return v
-}
-
-fn pa_zeros_2d(r, c) {
-    let mut m = []
-    let mut i = 0
-    while i < r {
-        let mut row = []
-        let mut j = 0
-        while j < c {
-            row = row + [0.0]
-            j = j + 1
-        }
-        m = m + [row]
-        i = i + 1
-    }
-    return m
-}
-
-fn pa_max_f(a, b) {
-    if a > b { return a }
-    return b
-}
-
-fn pa_fabs(x) {
-    if x < 0.0 { return 0.0 - x }
-    return x
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  Block Table — maps logical blocks to physical blocks
-//
-//  table.mapping : array of int — mapping[logical_id] = physical_id
-//  table.free_list : array of int — available physical block IDs
-//  table.ref_count : array of int — reference count per physical block
-//  table.cow_flag  : array of int — 1 if block is shared (copy-on-write)
-//  table.num_blocks: int — total physical blocks
-//  table.block_size: int — tokens per block
-// ═══════════════════════════════════════════════════════════════
-
-struct BlockTable {
-    mapping: array,
-    free_list: array,
-    ref_count: array,
-    cow_flag: array,
-    num_blocks: int,
-    block_size: int
-}
-
-fn create_block_table(num_blocks, block_size) {
     let mut free = []
-    let mut refs = []
-    let mut cow = []
-    let mut i = 0
-    while i < num_blocks {
-        free = free + [i]
-        refs = refs + [0]
-        cow = cow + [0]
-        i = i + 1
+    let mut p = num_pages - 1
+    while p >= 0 {
+        free.push(p)
+        p = p - 1
     }
-    return BlockTable {
-        mapping: [],
-        free_list: free,
-        ref_count: refs,
-        cow_flag: cow,
-        num_blocks: num_blocks,
-        block_size: block_size
+    let mut used = []
+    let mut u = 0
+    while u < num_pages {
+        used.push(0)
+        u = u + 1
+    }
+    return #{
+        "num_pages": num_pages,
+        "page_size": page_size,
+        "head_dim": head_dim,
+        "free_list": free,
+        "page_keys": keys_flat,
+        "page_vals": vals_flat,
+        "page_used": used,
+        "seq_pages": #{}
     }
 }
 
-// ── allocate a physical block from free list ─────────────────
-fn allocate_block(table) {
-    let n_free = len(table.free_list)
-    if n_free == 0 {
-        return [table, -1]
+// ── Allocate a page ───────────────────────────────────────────
+fn page_alloc(pt) {
+    let free = pt["free_list"]
+    if len(free) == 0 {
+        return -1
     }
-    let phys_id = table.free_list[n_free - 1]
-    // pop last element from free list
-    let mut new_free = []
-    let mut i = 0
-    while i < n_free - 1 {
-        new_free = new_free + [table.free_list[i]]
-        i = i + 1
+    let pid = free[len(free) - 1]
+    free.pop()
+    return pid
+}
+
+// ── Free a page ───────────────────────────────────────────────
+fn page_free(pt, page_id) {
+    let used = pt["page_used"]
+    used[page_id] = 0
+    let free = pt["free_list"]
+    free.push(page_id)
+}
+
+// ── Append a KV pair to a sequence ────────────────────────────
+// Automatically allocates new page when current page is full.
+fn kv_cache_append(pt, seq_id, k_vec, v_vec) {
+    let page_size = pt["page_size"]
+    let head_dim = pt["head_dim"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+
+    // Ensure sequence has a page list
+    if !has_key(sp, seq_key) {
+        sp[seq_key] = []
     }
-    // update ref count
-    let mut new_refs = []
-    i = 0
-    while i < table.num_blocks {
-        if i == phys_id {
-            new_refs = new_refs + [1]
-        } else {
-            new_refs = new_refs + [table.ref_count[i]]
+    let pages = sp[seq_key]
+
+    // Check if we need a new page
+    let mut need_new = false
+    if len(pages) == 0 {
+        need_new = true
+    } else {
+        let last_pid = pages[len(pages) - 1]
+        let used = pt["page_used"]
+        if used[last_pid] >= page_size {
+            need_new = true
         }
-        i = i + 1
     }
-    // add to mapping
-    let new_mapping = table.mapping + [phys_id]
-    let new_table = BlockTable {
-        mapping: new_mapping,
-        free_list: new_free,
-        ref_count: new_refs,
-        cow_flag: table.cow_flag,
-        num_blocks: table.num_blocks,
-        block_size: table.block_size
-    }
-    return [new_table, phys_id]
-}
 
-// ── free a physical block (decrement ref, return to free list if 0) ──
-fn free_block(table, phys_id) {
-    let mut new_refs = []
-    let mut new_free = table.free_list
-    let mut new_cow = []
-    let mut i = 0
-    while i < table.num_blocks {
-        if i == phys_id {
-            let new_ref = table.ref_count[i] - 1
-            new_refs = new_refs + [new_ref]
-            if new_ref <= 0 {
-                new_free = new_free + [phys_id]
-            }
-            new_cow = new_cow + [0]
-        } else {
-            new_refs = new_refs + [table.ref_count[i]]
-            new_cow = new_cow + [table.cow_flag[i]]
+    if need_new {
+        let new_pid = page_alloc(pt)
+        if new_pid == -1 {
+            println("paged_attention: out of pages")
+            return
         }
-        i = i + 1
+        pages.push(new_pid)
     }
-    return BlockTable {
-        mapping: table.mapping,
-        free_list: new_free,
-        ref_count: new_refs,
-        cow_flag: new_cow,
-        num_blocks: table.num_blocks,
-        block_size: table.block_size
+
+    // Write into the last page's next slot
+    let pid = pages[len(pages) - 1]
+    let used = pt["page_used"]
+    let slot = used[pid]
+    let base = (pid * page_size + slot) * head_dim
+    let keys_flat = pt["page_keys"]
+    let vals_flat = pt["page_vals"]
+
+    let mut d = 0
+    while d < head_dim {
+        keys_flat[base + d] = k_vec[d]
+        vals_flat[base + d] = v_vec[d]
+        d = d + 1
     }
+    used[pid] = slot + 1
 }
 
-// ── free all blocks associated with a table ──────────────────
-fn free_all_blocks(table) {
-    let mut t = table
-    let n = len(t.mapping)
+// ── Compute total cached positions for a sequence ─────────────
+fn seq_total_tokens(pt, seq_id) {
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+    if !has_key(sp, seq_key) {
+        return 0
+    }
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let mut total = 0
     let mut i = 0
-    while i < n {
-        t = free_block(t, t.mapping[i])
+    while i < len(pages) {
+        total = total + used[pages[i]]
         i = i + 1
     }
-    let new_table = BlockTable {
-        mapping: [],
-        free_list: t.free_list,
-        ref_count: t.ref_count,
-        cow_flag: t.cow_flag,
-        num_blocks: t.num_blocks,
-        block_size: t.block_size
-    }
-    return new_table
+    return total
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Copy-on-Write — fork a block table (share blocks, set cow)
-//
-//  All physical blocks from source get ref_count++ and cow_flag=1.
-//  Returns a new BlockTable with same mapping but shared blocks.
-// ═══════════════════════════════════════════════════════════════
-
-fn fork_block_table(table) {
-    let mut new_refs = []
-    let mut new_cow = []
-    let mut i = 0
-    while i < table.num_blocks {
-        new_refs = new_refs + [table.ref_count[i]]
-        new_cow = new_cow + [table.cow_flag[i]]
-        i = i + 1
+// ── Attention scores: Q dot K for each cached position ────────
+fn paged_attention_score(pt, seq_id, query) {
+    let head_dim = pt["head_dim"]
+    let page_size = pt["page_size"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+    if !has_key(sp, seq_key) {
+        return []
     }
-    // increment ref count and set cow for all mapped blocks
-    let n = len(table.mapping)
-    i = 0
-    while i < n {
-        let pid = table.mapping[i]
-        new_refs[pid] = new_refs[pid] + 1
-        new_cow[pid] = 1
-        i = i + 1
-    }
-    let forked = BlockTable {
-        mapping: table.mapping,
-        free_list: table.free_list,
-        ref_count: new_refs,
-        cow_flag: new_cow,
-        num_blocks: table.num_blocks,
-        block_size: table.block_size
-    }
-    return forked
-}
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let keys_flat = pt["page_keys"]
 
-// ── cow_copy: copy block data when writing to a shared block ──
-// Returns [new_table, new_phys_id, new_kv_blocks]
-fn cow_copy_block(table, logical_id, kv_blocks) {
-    let old_phys = table.mapping[logical_id]
-    if table.cow_flag[old_phys] == 0 {
-        // not shared, no copy needed
-        return [table, old_phys, kv_blocks]
-    }
-    // allocate a new physical block
-    let alloc_result = allocate_block(table)
-    let t2 = alloc_result[0]
-    let new_phys = alloc_result[1]
-    if new_phys < 0 {
-        // out of blocks — return as-is
-        return [table, old_phys, kv_blocks]
-    }
-    // copy data from old block to new block
-    let block_data_len = len(kv_blocks[old_phys])
-    let mut new_data = []
-    let mut i = 0
-    while i < block_data_len {
-        new_data = new_data + [kv_blocks[old_phys][i]]
-        i = i + 1
-    }
-    kv_blocks[new_phys] = new_data
-    // update mapping: logical_id -> new_phys
-    let mut new_mapping = []
-    i = 0
-    let n = len(t2.mapping)
-    while i < n {
-        if i == logical_id {
-            new_mapping = new_mapping + [new_phys]
-        } else {
-            new_mapping = new_mapping + [t2.mapping[i]]
-        }
-        i = i + 1
-    }
-    // decrement ref on old block
-    let t3 = free_block(t2, old_phys)
-    let t4 = BlockTable {
-        mapping: new_mapping,
-        free_list: t3.free_list,
-        ref_count: t3.ref_count,
-        cow_flag: t3.cow_flag,
-        num_blocks: t3.num_blocks,
-        block_size: t3.block_size
-    }
-    return [t4, new_phys, kv_blocks]
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  KV Block Storage
-//
-//  kv_blocks : array of arrays
-//    kv_blocks[phys_id] = flat array [block_size * head_dim * 2]
-//    first half = keys, second half = values
-// ═══════════════════════════════════════════════════════════════
-
-fn create_kv_blocks(num_blocks, block_size, head_dim) {
-    let block_data_size = block_size * head_dim * 2
-    let mut blocks = []
-    let mut i = 0
-    while i < num_blocks {
-        blocks = blocks + [pa_zeros_1d(block_data_size)]
-        i = i + 1
-    }
-    return blocks
-}
-
-// ── write a single token's K,V into a block ──────────────────
-// token_pos_in_block : 0..block_size-1
-fn write_kv_to_block(kv_blocks, phys_id, token_pos_in_block, k_vec, v_vec, head_dim) {
-    let block = kv_blocks[phys_id]
-    let bs = len(block) / (head_dim * 2)
-    let k_offset = token_pos_in_block * head_dim
-    let v_offset = bs * head_dim + token_pos_in_block * head_dim
-    let mut i = 0
-    while i < head_dim {
-        block[k_offset + i] = k_vec[i]
-        block[v_offset + i] = v_vec[i]
-        i = i + 1
-    }
-    kv_blocks[phys_id] = block
-    return kv_blocks
-}
-
-// ── read K for a specific token in a block ───────────────────
-fn read_k_from_block(kv_blocks, phys_id, token_pos_in_block, head_dim) {
-    let block = kv_blocks[phys_id]
-    let k_offset = token_pos_in_block * head_dim
-    let mut k_vec = []
-    let mut i = 0
-    while i < head_dim {
-        k_vec = k_vec + [block[k_offset + i]]
-        i = i + 1
-    }
-    return k_vec
-}
-
-fn read_v_from_block(kv_blocks, phys_id, token_pos_in_block, head_dim, block_size) {
-    let block = kv_blocks[phys_id]
-    let v_offset = block_size * head_dim + token_pos_in_block * head_dim
-    let mut v_vec = []
-    let mut i = 0
-    while i < head_dim {
-        v_vec = v_vec + [block[v_offset + i]]
-        i = i + 1
-    }
-    return v_vec
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  Paged Attention Forward
-//
-//  Q : [seq_q, head_dim]  — query vectors (typically seq_q=1 for decode)
-//  block_table : BlockTable with mapping of logical blocks
-//  kv_blocks : array of block data
-//  seq_kv : total number of cached KV tokens
-//  block_size, head_dim : shape params
-//
-//  For each query row, attends to all KV tokens stored across pages.
-//  Returns: [seq_q, head_dim] output
-// ═══════════════════════════════════════════════════════════════
-@hot @parallel
-fn paged_attention_forward(Q, block_table, kv_blocks, seq_kv, block_size, head_dim) {
-    let seq_q = len(Q)
-    let scale = 1.0 / sqrt(head_dim * 1.0)
-    let n_logical = len(block_table.mapping)
-
-    let mut out = pa_zeros_2d(seq_q, head_dim)
-
-    let mut qi = 0
-    while qi < seq_q {
-        // online softmax state
-        let mut m_val = 0.0 - 1.0e30
-        let mut l_val = 0.0
-        let mut acc = pa_zeros_1d(head_dim)
-
-        // iterate over all cached KV tokens via block table
-        let mut t = 0
-        while t < seq_kv {
-            let logical_blk = t / block_size
-            let pos_in_blk = t % block_size
-            if logical_blk < n_logical {
-                let phys_id = block_table.mapping[logical_blk]
-                let k_vec = read_k_from_block(kv_blocks, phys_id, pos_in_blk, head_dim)
-                let v_vec = read_v_from_block(kv_blocks, phys_id, pos_in_blk, head_dim, block_size)
-
-                // dot product Q[qi] . k_vec
-                let mut dot = 0.0
-                let mut d = 0
-                while d < head_dim {
-                    dot = dot + Q[qi][d] * k_vec[d]
-                    d = d + 1
-                }
-                let score = dot * scale
-
-                // online softmax update
-                let m_old = m_val
-                let m_new = pa_max_f(m_old, score)
-                let alpha = exp(m_old - m_new)
-                let p = exp(score - m_new)
-                let l_new = l_val * alpha + p
-
-                d = 0
-                while d < head_dim {
-                    acc[d] = acc[d] * alpha + p * v_vec[d]
-                    d = d + 1
-                }
-                m_val = m_new
-                l_val = l_new
-            }
-            t = t + 1
-        }
-
-        // normalize
-        if l_val > 0.0 {
-            let inv_l = 1.0 / l_val
+    let mut scores = []
+    let mut pi = 0
+    while pi < len(pages) {
+        let pid = pages[pi]
+        let n_slots = used[pid]
+        let mut s = 0
+        while s < n_slots {
+            let base = (pid * page_size + s) * head_dim
+            let mut dot = 0.0
             let mut d = 0
             while d < head_dim {
-                out[qi][d] = acc[d] * inv_l
+                dot = dot + query[d] * keys_flat[base + d]
                 d = d + 1
             }
+            scores.push(dot)
+            s = s + 1
         }
-        qi = qi + 1
+        pi = pi + 1
+    }
+    return scores
+}
+
+// ── Full paged attention: softmax(Q*K^T / sqrt(d)) * V ───────
+fn paged_attention_output(pt, seq_id, query) {
+    let head_dim = pt["head_dim"]
+    let page_size = pt["page_size"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+
+    if !has_key(sp, seq_key) {
+        let mut zeros = []
+        let mut z = 0
+        while z < head_dim {
+            zeros.push(0.0)
+            z = z + 1
+        }
+        return zeros
     }
 
-    return out
-}
+    // Step 1: compute raw scores (Q dot K / sqrt(d))
+    let scale = 1.0 / (to_float(head_dim) ** 0.5)
+    let raw_scores = paged_attention_score(pt, seq_id, query)
+    let n = len(raw_scores)
 
-// ═══════════════════════════════════════════════════════════════
-//  Utility: get number of free blocks
-// ═══════════════════════════════════════════════════════════════
-fn num_free_blocks(table) {
-    return len(table.free_list)
-}
+    if n == 0 {
+        let mut zeros = []
+        let mut z = 0
+        while z < head_dim {
+            zeros.push(0.0)
+            z = z + 1
+        }
+        return zeros
+    }
 
-fn num_used_blocks(table) {
-    return table.num_blocks - len(table.free_list)
-}
+    // Scale scores
+    let mut scaled = []
+    let mut i = 0
+    while i < n {
+        scaled.push(raw_scores[i] * scale)
+        i = i + 1
+    }
 
-println("[paged_attention] module loaded — vLLM-style paged KV-cache")
+    // Step 2: softmax — find max for numerical stability
+    let mut mx = scaled[0]
+    i = 1
+    while i < n {
+        if scaled[i] > mx {
+            mx = scaled[i]
+        }
+        i = i + 1
+    }
+
+    let mut exp_scores = []
+    let mut sum_exp = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scaled[i] - mx)
+        exp_scores.push(e)
+        sum_exp = sum_exp + e
+        i = i + 1
+    }
+
+    // Normalize
+    let mut weights = []
+    i = 0
+    while i < n {
+        weights.push(exp_scores[i] / sum_exp)
+        i = i + 1
+    }
+
+    // Step 3: weighted sum of values
+    let mut output = []
+    let mut d = 0
+    while d < head_dim {
+        output.push(0.0)
+        d = d + 1
+    }
+
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let vals_flat = pt["page_vals"]
+    let mut wi = 0
+    let mut pi = 0
+    while pi < len(pages) {
+        let pid = pages[pi]
+        let n_slots = used[pid]
+        let mut s = 0
+        while s < n_slots {
+            let w = weights[wi]
+            let base = (pid * page_size + s) * head_dim
+            d = 0
+            while d < head_dim {
+                output[d] = output[d] + w * vals_flat[base + d]
+                d = d + 1
+            }
+            wi = wi + 1
+            s = s + 1
+        }
+        pi = pi + 1
+    }
+
+    return output
+}
