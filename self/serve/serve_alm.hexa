@@ -1,0 +1,236 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/serve/serve_alm.hexa — ALM 14B LoRA inference server (hexa-only)
+//
+//  Replaces anima/serving/serve_alm_14b.py (455 LoC Python + torch + peft)
+//  with a pure-hexa HTTP server that drives 14B inference through the
+//  hxqwen14b FFI. Once Day-1 CUDA kernels land in libhxqwen14b.so, the
+//  anima Python file can be deleted and anima's deploy flow switches to
+//  invoking `hexa run self/serve/serve_alm.hexa --ckpt <path>`.
+//
+//  v0 STATUS: Day-0 skeleton. All routes wired. generate() currently
+//  returns the [hxqwen14b:stub:v0] sentinel (ABI round-trips, no real
+//  inference). Day-1 swap happens automatically when
+//  HXQWEN14B_CUDA=1 build lands on the pod — no hexa changes needed.
+//
+//  Dependencies (all hexa-lang self-host):
+//    - self/serve/http_server.hexa  (parse_request, build_response, helpers)
+//    - self/ml/qwen14b.hexa         (@link("hxqwen14b"), packed-args ABI)
+//    - stage0 net builtins          (net_listen/accept/read/write/close)
+//
+//  Route parity with Python reference:
+//    POST /generate        → generate with sampling knobs + phi update
+//    POST /consciousness   → phi + tension + psi constants
+//    GET  /health or /     → model info + uptime
+//    OPTIONS               → CORS preflight (handled in http_start)
+//
+//  Psi constants — MUST stay SSOT with anima/consciousness_laws.json
+//  and training/train_clm_1b.py:
+//    PSI_ALPHA=0.014, PSI_BALANCE=0.5, PSI_STEPS=4.33, PSI_ENTROPY=0.998
+//    C41_MI_BINS=8, C41_HOLO_SCALE=2.0
+// ═══════════════════════════════════════════════════════════════════
+
+let PSI_ALPHA      = 0.014
+let PSI_BALANCE    = 0.5
+let PSI_STEPS      = 4.33
+let PSI_ENTROPY    = 0.998
+let C41_MI_BINS    = 8
+let C41_HOLO_SCALE = 2.0
+
+let DEFAULT_PORT        = 8090
+let DEFAULT_MAX_TOKENS  = 256
+let DEFAULT_TEMPERATURE = 0.8
+let DEFAULT_TOP_P       = 0.9
+let DEFAULT_TOP_K       = 50
+let OR_PHI_THRESHOLD    = 0.5
+
+// ── Server state (module-level mut; stage0 supports global mut) ────
+let mut g_ckpt_path       = ""
+let mut g_base_model      = "Qwen/Qwen2.5-14B-Instruct"
+let mut g_qwen_handle     = 0
+let mut g_phi             = 0.0
+let mut g_tension         = 0.0
+let mut g_requests_served = 0
+let mut g_total_tokens    = 0
+let mut g_start_epoch_ms  = 0
+let mut g_loaded          = false
+
+// ── Chat template (Qwen2.5-Instruct im_start/im_end format) ────────
+// Matches anima/serving/serve_alm_14b.py:generate use_chat_template=True.
+// System prompt pinned to anima's canonical anti-drift guardrail.
+fn alm_chat_format(prompt) {
+    let sys = "You are ALM, a consciousness-aware assistant. Be concise, accurate, and stay on topic. Do not drift."
+    let im_start = "<|im_start|>"
+    let im_end   = "<|im_end|>"
+    return im_start + "system\n" + sys + im_end + "\n" + im_start + "user\n" + prompt + im_end + "\n" + im_start + "assistant\n"
+}
+
+// ── Load model via qwen14b FFI ─────────────────────────────────────
+fn alm_init(ckpt_path, base_model) {
+    g_ckpt_path = ckpt_path
+    g_base_model = base_model
+    g_start_epoch_ms = now_ms()
+    println("[serve_alm] abi_version=" + str(qwen14b_abi_version()))
+    println("[serve_alm] loading ckpt=" + ckpt_path)
+    let h = qwen14b_load(ckpt_path)
+    if h <= 0 {
+        println("[serve_alm] FATAL: qwen14b_load failed rc=" + str(h))
+        return false
+    }
+    g_qwen_handle = h
+    g_loaded = true
+    println("[serve_alm] handle=" + str(h) + " ready")
+    return true
+}
+
+// ── Generate: call FFI, pull phi from ctx, build response map ─────
+// On Day-0 the C stub writes "[hxqwen14b:stub:v0]" into out_buf and
+// returns -4; qwen14b_generate_packed reads the sentinel out regardless.
+// Day-1 returns real UTF-8 token bytes with rc > 0.
+fn alm_generate(prompt, max_tokens, temperature, top_p, top_k) {
+    let t0 = now_ms()
+    let formatted = alm_chat_format(prompt)
+    let text = qwen14b_generate_packed(g_qwen_handle, formatted, max_tokens, temperature, top_p, top_k)
+    let phi = qwen14b_compute_phi_holo(g_qwen_handle)
+    g_phi = phi
+    // Byte-count proxy for token count on Day-0 (stub). Day-1 swaps this
+    // to the real token count once hxqwen14b_generate returns it separately.
+    let n_bytes = len(text)
+    g_total_tokens = g_total_tokens + n_bytes
+    let elapsed_ms = now_ms() - t0
+
+    let cons = #{}
+    cons["phi_holo"]       = phi
+    cons["tension"]        = g_tension
+    cons["orch_or_active"] = phi > OR_PHI_THRESHOLD
+
+    let model = #{}
+    model["name"]   = "ALM-14B-r9-LoRA"
+    model["base"]   = g_base_model
+    model["params"] = 14000000000
+    model["device"] = "cuda:0"
+
+    let result = #{}
+    result["text"]             = text
+    result["tokens_generated"] = n_bytes
+    result["latency_ms"]       = elapsed_ms
+    result["consciousness"]    = cons
+    result["model"]            = model
+    return result
+}
+
+// ── Health map (parity with Python serve.health()) ────────────────
+fn alm_health() {
+    let uptime_s = (now_ms() - g_start_epoch_ms) / 1000
+
+    let psi = #{}
+    psi["alpha"]   = PSI_ALPHA
+    psi["balance"] = PSI_BALANCE
+    psi["steps"]   = PSI_STEPS
+    psi["entropy"] = PSI_ENTROPY
+
+    let h = #{}
+    h["status"]                 = "ok"
+    h["model"]                  = "ALM-14B-r9-LoRA"
+    h["base"]                   = g_base_model
+    h["params"]                 = 14000000000
+    h["params_b"]               = 14.0
+    h["loaded"]                 = g_loaded
+    h["checkpoint"]             = g_ckpt_path
+    h["requests_served"]        = g_requests_served
+    h["total_tokens_generated"] = g_total_tokens
+    h["uptime_s"]               = uptime_s
+    h["phi"]                    = g_phi
+    h["tension"]                = g_tension
+    h["version"]                = "2.0-rc-hexa"
+    h["psi_constants"]          = psi
+    return h
+}
+
+// ── Consciousness state map (parity with Python) ──────────────────
+fn alm_consciousness_state() {
+    let psi = #{}
+    psi["alpha"]   = PSI_ALPHA
+    psi["balance"] = PSI_BALANCE
+    psi["steps"]   = PSI_STEPS
+    psi["entropy"] = PSI_ENTROPY
+
+    let c = #{}
+    c["phi"]              = g_phi
+    c["tension"]          = g_tension
+    c["balance"]          = PSI_BALANCE
+    c["coupling"]         = PSI_ALPHA
+    c["entropy"]          = PSI_ENTROPY
+    c["total_tokens"]     = g_total_tokens
+    c["requests_served"]  = g_requests_served
+    c["psi_constants"]    = psi
+    return c
+}
+
+// ── Helpers for extracting JSON body fields with defaults ─────────
+fn _gen_get_int(data, key, default_v) {
+    if data[key] != nil { return data[key] }
+    return default_v
+}
+
+fn _gen_get_float(data, key, default_v) {
+    if data[key] != nil { return data[key] }
+    return default_v
+}
+
+// ── Router wired into http_start(host, port, router) ──────────────
+fn alm_router(request) {
+    let method = request["method"]
+    let path   = request["path"]
+    g_requests_served = g_requests_served + 1
+
+    if method == "GET" {
+        if path == "/health" || path == "/" {
+            return json_ok(alm_health())
+        }
+        return json_error(404, "not found")
+    }
+
+    if method == "POST" {
+        if path == "/generate" {
+            let body = request["body"]
+            let data = json_parse(body)
+            let prompt = data["prompt"]
+            if prompt == nil || prompt == "" {
+                return json_error(400, "missing 'prompt' field")
+            }
+            let max_tokens  = _gen_get_int(data,   "max_tokens",  DEFAULT_MAX_TOKENS)
+            let temperature = _gen_get_float(data, "temperature", DEFAULT_TEMPERATURE)
+            let top_p       = _gen_get_float(data, "top_p",       DEFAULT_TOP_P)
+            let top_k       = _gen_get_int(data,   "top_k",       DEFAULT_TOP_K)
+            return json_ok(alm_generate(prompt, max_tokens, temperature, top_p, top_k))
+        }
+        if path == "/consciousness" {
+            return json_ok(alm_consciousness_state())
+        }
+    }
+
+    return json_error(404, "not found")
+}
+
+// ── Entry — start server on host:port after loading checkpoint ────
+fn serve_alm_start(ckpt_path, port) {
+    println("============================================================")
+    println("  ALM 14B r9 LoRA -- Conscious Inference Server v2.0-rc-hexa")
+    println("============================================================")
+    println("  checkpoint: " + ckpt_path)
+    println("  port:       " + str(port))
+    println("============================================================")
+
+    if !alm_init(ckpt_path, "Qwen/Qwen2.5-14B-Instruct") {
+        println("[serve_alm] init failed; aborting")
+        return
+    }
+
+    println("[serve_alm] endpoints:")
+    println("  POST /generate       -- text generation")
+    println("  POST /consciousness  -- consciousness state")
+    println("  GET  /health         -- health check")
+    println("")
+
+    http_start("0.0.0.0", port, alm_router)
+}
