@@ -123,7 +123,9 @@ static const char* hexa_intern(const char* s) {
 }
 
 // Forward declarations for all runtime functions
-typedef struct HexaVal HexaVal;
+// S1-D3b-beta: struct tag renamed to HexaVal_ so typedef HexaVal can flip
+// to uint64_t (NaN-boxed) without touching field access patterns.
+typedef struct HexaVal_ HexaVal;
 HexaVal hexa_add(HexaVal a, HexaVal b);
 HexaVal hexa_sub(HexaVal a, HexaVal b);
 HexaVal hexa_mul(HexaVal a, HexaVal b);
@@ -249,12 +251,12 @@ typedef struct {
 
 typedef struct {
     HexaMapSlot* slots;   // hash table (power-of-2 sized)
-    struct HexaVal* vals;  // parallel values array (same indices as slots)
+    HexaVal* vals;  // parallel values array (same indices as slots)
     int ht_cap;            // hash table capacity (power-of-2)
 
     // Insertion-order arrays for keys()/values()/for-in iteration
     char** order_keys;     // ordered key pointers (point into slots[].key)
-    struct HexaVal* order_vals; // ordered values
+    HexaVal* order_vals; // ordered values
     int len;               // number of entries
     int order_cap;         // allocated capacity for order arrays
     // rt 32-L: Val-arena support. When non-zero, this table + its slot/val/
@@ -270,7 +272,7 @@ typedef struct {
 // NaN-boxing prep: inline union members → heap-allocated descriptors.
 // sizeof(HexaVal) unchanged (largest union member is still a pointer).
 typedef struct HexaArr {
-    struct HexaVal* items;
+    HexaVal* items;
     int len;
     int cap;
 } HexaArr;
@@ -288,14 +290,14 @@ typedef struct HexaFn {
 typedef struct HexaClo {
     void* fn_ptr;
     int arity;
-    struct HexaVal* env_box;
+    HexaVal* env_box;
 } HexaClo;
 
 // HexaVal must be defined before HexaValStruct so that HexaValStruct's
 // HexaVal-by-value fields (rt 32-G redesign) have a complete type. HexaVal
 // only needs HexaValStruct as a *pointer* (.vs), so the forward decl above
 // (typedef struct HexaValStruct HexaValStruct) is sufficient here.
-typedef struct HexaVal {
+typedef struct HexaVal_ {
     HexaTag tag;
     union {
         int64_t i;
@@ -4169,6 +4171,7 @@ HexaVal base64_decode;
 // NaN-boxing makes HexaVal a uint64_t — designated initializers for the
 // struct layout are illegal.  Lazy-init mirrors _hexa_init_cached_strs().
 static int _fn_shims_ready = 0;
+static void _hexa_init_net_fn_shims(void);  // fwd decl — body in native/net.c
 static void _hexa_init_fn_shims(void) {
     if (_fn_shims_ready) return;
     // bootstrap free-fn shims (join, char_code, chr, bit_or)
@@ -4180,6 +4183,10 @@ static void _hexa_init_fn_shims(void) {
     timestamp     = hexa_fn_new((void*)_bt73_timestamp_w,     0);
     base64_encode = hexa_fn_new((void*)_bt73_base64_encode_w, 1);
     base64_decode = hexa_fn_new((void*)_bt73_base64_decode_w, 1);
+    // std::net free-fn shims — bridges transpiler bootstrap gap for
+    // net_connect / net_read / net_write until hexa_v2 learns the
+    // direct-lowering for these names (see native/net.c comment).
+    _hexa_init_net_fn_shims();
     _fn_shims_ready = 1;
 }
 
@@ -4203,88 +4210,22 @@ static void _hexa_init_fn_shims(void) {
 /* ═══════════════════════════════════════════════════════════════════
  * std::net — POSIX TCP socket builtins (stage0 resurrection, 2026-04-16)
  *
- * Ports the minimum viable set of networking builtins from the deleted
- * Rust src/std_net.rs (recovered from commit ef92fc6). The full surface
- * (8 builtins) is deferred; this block ships the 3 that prove the path:
+ * Ports the networking surface from the deleted Rust src/std_net.rs
+ * (recovered from commit ef92fc6). 6 primitives; http_get / http_serve
+ * are composed on top of them in self/std_net.hexa.
  *
- *   hexa_net_listen(addr)   : string "host:port" → TAG_INT fd (>=0 on
- *                              success, -errno on failure)
- *   hexa_net_accept(listen) : TAG_INT listen_fd  → TAG_INT client_fd
- *   hexa_net_close(fd)      : TAG_INT fd         → TAG_INT 0/-errno
+ *   hexa_net_listen(addr)       : string "host:port" → TAG_INT fd / -errno
+ *   hexa_net_accept(listen)     : TAG_INT listen_fd  → TAG_INT client_fd
+ *   hexa_net_connect(addr)      : string "host:port" → TAG_INT fd / -errno
+ *   hexa_net_read(fd)           : TAG_INT fd         → TAG_STR data
+ *   hexa_net_write(fd, data)    : TAG_INT fd, string → TAG_INT bytes / -errno
+ *   hexa_net_close(fd)          : TAG_INT fd         → TAG_INT 0 / -errno
  *
  * Error model: negative TAG_INT (the raw errno). Matches the C-side
- * convention used by hxcuda/hxblas shims — callers that want structured
- * errors can check `< 0` and consult errno via a future net_errno().
+ * convention used by hxcuda/hxblas shims.
  *
- * Deferred (future work): net_read, net_write, net_connect, http_get,
- * http_serve, plus SO_REUSEADDR / non-blocking / backlog tuning.
+ * Implementation lives in native/net.c so the net subsystem is a single
+ * file analogous to native/tensor_kernels.c for the hot kernel path.
  * ═══════════════════════════════════════════════════════════════════ */
-#include <sys/socket.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
-#include <errno.h>
-
-static int _hexa_net_parse_addr(const char* addr, struct sockaddr_in* sa_out) {
-    /* Accept "host:port". Host may be numeric (127.0.0.1) or textual
-     * ("localhost"); textual bypasses inet_pton and falls back to
-     * INADDR_LOOPBACK. Day-1 is intentionally narrow — DNS + IPv6 land
-     * with net_connect / http_get. */
-    if (!addr || !*addr || !sa_out) return -EINVAL;
-    const char* colon = strrchr(addr, ':');
-    if (!colon || colon == addr) return -EINVAL;
-    char host[256];
-    size_t host_len = (size_t)(colon - addr);
-    if (host_len >= sizeof(host)) return -EINVAL;
-    memcpy(host, addr, host_len);
-    host[host_len] = '\0';
-    int port = atoi(colon + 1);
-    if (port <= 0 || port > 65535) return -EINVAL;
-    memset(sa_out, 0, sizeof(*sa_out));
-    sa_out->sin_family = AF_INET;
-    sa_out->sin_port = htons((uint16_t)port);
-    /* Accept both dotted-quad and the special hostname "localhost". */
-    if (strcmp(host, "localhost") == 0) {
-        sa_out->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    } else if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
-        sa_out->sin_addr.s_addr = htonl(INADDR_ANY);
-    } else if (inet_pton(AF_INET, host, &sa_out->sin_addr) != 1) {
-        return -EINVAL;
-    }
-    return 0;
-}
-
-HexaVal hexa_net_listen(HexaVal addr_val) {
-    const char* addr = hexa_to_cstring(addr_val);
-    struct sockaddr_in sa;
-    int parse_rc = _hexa_net_parse_addr(addr, &sa);
-    if (parse_rc < 0) return hexa_int(parse_rc);
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return hexa_int(-errno);
-    int one = 1;
-    /* SO_REUSEADDR mirrors the Rust TcpListener default (tokio/stdlib both
-     * set it). Without it, repeat `hexa run` within TIME_WAIT collides. */
-    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
-    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
-        int e = errno; close(fd); return hexa_int(-e);
-    }
-    if (listen(fd, 64) < 0) {
-        int e = errno; close(fd); return hexa_int(-e);
-    }
-    return hexa_int(fd);
-}
-
-HexaVal hexa_net_accept(HexaVal listen_val) {
-    int64_t listen_fd = hexa_as_num(listen_val);
-    if (listen_fd < 0) return hexa_int(-EINVAL);
-    int client = accept((int)listen_fd, NULL, NULL);
-    if (client < 0) return hexa_int(-errno);
-    return hexa_int(client);
-}
-
-HexaVal hexa_net_close(HexaVal fd_val) {
-    int64_t fd = hexa_as_num(fd_val);
-    if (fd < 0) return hexa_int(-EINVAL);
-    if (close((int)fd) < 0) return hexa_int(-errno);
-    return hexa_int(0);
-}
+#include "native/net.c"
 
