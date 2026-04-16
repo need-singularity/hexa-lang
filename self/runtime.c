@@ -2729,12 +2729,15 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
 }
 
 // B-19: Polymorphic arithmetic — T39 routes through __hx_to_double.
+// ROI-47: explicit float+float fast path avoids 2x __hx_to_double tag dispatch.
 HexaVal hexa_sub(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i - b.i);
+    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(a.f - b.f);
     return hexa_float(__hx_to_double(a) - __hx_to_double(b));
 }
 HexaVal hexa_mul(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i * b.i);
+    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(a.f * b.f);
     return hexa_float(__hx_to_double(a) * __hx_to_double(b));
 }
 HexaVal hexa_div(HexaVal a, HexaVal b) {
@@ -2742,6 +2745,7 @@ HexaVal hexa_div(HexaVal a, HexaVal b) {
         if (b.i == 0) return hexa_int(0);
         return hexa_int(a.i / b.i);
     }
+    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(b.f == 0.0 ? 0.0 : a.f / b.f);
     double fb = __hx_to_double(b);
     return hexa_float(__hx_to_double(a) / fb);
 }
