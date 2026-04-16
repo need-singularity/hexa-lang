@@ -1,0 +1,245 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/ce_loss.hexa — Fused Cross-Entropy Loss (CPU, raw f32)
+//
+//  Numerically stable softmax + cross-entropy via log-sum-exp trick.
+//  All tensor data via raw f32 pointers (alloc_raw/deref_f32/write_f32)
+//  to avoid interpreter list-alloc churn at scale.
+//
+//  API:
+//    ce_loss_fwd(logits_ptr, targets_ptr, S, V)   -> float loss
+//    ce_loss_bwd(logits_ptr, targets_ptr, dlogits_ptr, S, V)
+//    ce_loss_fused(logits_ptr, targets_ptr, dlogits_ptr, S, V) -> float loss
+//
+//  Layout:
+//    logits_ptr  : float* [S x V] row-major  (byte offset = (s*V+j)*4)
+//    targets_ptr : int32* [S]                 (byte offset = s*4)
+//    dlogits_ptr : float* [S x V] row-major   (output, same layout as logits)
+//
+//  Pointer discipline:
+//    deref_f32(ptr, byte_offset)  — read f32
+//    write_f32(ptr, byte_offset, val) — write f32
+//    deref_i32(ptr, byte_offset) — read i32 (targets)
+//    write_i32(ptr, byte_offset, val) — write i32
+//    alloc_raw(bytes) — calloc
+//    free_raw(ptr, bytes) — free
+//
+//  AI-native attr:
+//    @simd  — inner V loop is element-independent
+//    @fuse  — fwd+bwd share the same softmax computation
+//    @hot   — called every training step
+//
+//  Last verified: 2026-04-17
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Forward only: returns mean CE loss ──────────────────────────
+// loss = (1/S) * sum_s [ log(sum_j exp(logits[s,j] - max_j)) - (logits[s, target[s]] - max_j) ]
+//      = (1/S) * sum_s [ log_sum_exp(logits[s]) - logits[s, target[s]] ]
+@hot fn ce_loss_fwd(logits_ptr: int, targets_ptr: int, S: int, V: int) -> float {
+    let mut loss_sum = 0.0
+    let mut s = 0
+    while s < S {
+        let row_off = s * V * 4
+        // 1. Find max for numerical stability
+        let mut mx = deref_f32(logits_ptr, row_off)
+        let mut j = 1
+        while j < V {
+            let v = deref_f32(logits_ptr, row_off + j * 4)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        // 2. Compute sum(exp(logits - max))
+        let mut sum_exp = 0.0
+        j = 0
+        while j < V {
+            sum_exp = sum_exp + exp(deref_f32(logits_ptr, row_off + j * 4) - mx)
+            j = j + 1
+        }
+        // 3. log_sum_exp = max + log(sum_exp)
+        let lse = mx + log(sum_exp)
+        // 4. target logit
+        let t = deref_i32(targets_ptr, s * 4)
+        let target_logit = deref_f32(logits_ptr, row_off + t * 4)
+        // 5. CE for this sample = lse - target_logit
+        loss_sum = loss_sum + (lse - target_logit)
+        s = s + 1
+    }
+    return loss_sum / (S * 1.0)
+}
+
+// ── Backward only: writes dlogits = (softmax - one_hot) / S ────
+@hot fn ce_loss_bwd(logits_ptr: int, targets_ptr: int, dlogits_ptr: int, S: int, V: int) {
+    let inv_S = 1.0 / (S * 1.0)
+    let mut s = 0
+    while s < S {
+        let row_off = s * V * 4
+        // 1. Find max
+        let mut mx = deref_f32(logits_ptr, row_off)
+        let mut j = 1
+        while j < V {
+            let v = deref_f32(logits_ptr, row_off + j * 4)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        // 2. Compute softmax denominator
+        let mut sum_exp = 0.0
+        j = 0
+        while j < V {
+            sum_exp = sum_exp + exp(deref_f32(logits_ptr, row_off + j * 4) - mx)
+            j = j + 1
+        }
+        let inv_sum = 1.0 / sum_exp
+        // 3. Write dlogits = softmax(logits) - one_hot(target), scaled by 1/S
+        let t = deref_i32(targets_ptr, s * 4)
+        j = 0
+        while j < V {
+            let sm = exp(deref_f32(logits_ptr, row_off + j * 4) - mx) * inv_sum
+            let one_hot = if j == t { 1.0 } else { 0.0 }
+            write_f32(dlogits_ptr, row_off + j * 4, (sm - one_hot) * inv_S)
+            j = j + 1
+        }
+        s = s + 1
+    }
+}
+
+// ── Fused forward+backward: single pass over logits ─────────────
+// Returns loss while simultaneously computing dlogits.
+// Saves one full softmax recomputation vs calling fwd then bwd.
+@hot @fuse fn ce_loss_fused(logits_ptr: int, targets_ptr: int, dlogits_ptr: int, S: int, V: int) -> float {
+    let inv_S = 1.0 / (S * 1.0)
+    let mut loss_sum = 0.0
+    let mut s = 0
+    while s < S {
+        let row_off = s * V * 4
+        // 1. Find max for numerical stability
+        let mut mx = deref_f32(logits_ptr, row_off)
+        let mut j = 1
+        while j < V {
+            let v = deref_f32(logits_ptr, row_off + j * 4)
+            if v > mx { mx = v }
+            j = j + 1
+        }
+        // 2. Compute sum(exp(logits - max))
+        let mut sum_exp = 0.0
+        j = 0
+        while j < V {
+            sum_exp = sum_exp + exp(deref_f32(logits_ptr, row_off + j * 4) - mx)
+            j = j + 1
+        }
+        let inv_sum = 1.0 / sum_exp
+        let lse = mx + log(sum_exp)
+        // 3. Target index and loss
+        let t = deref_i32(targets_ptr, s * 4)
+        let target_logit = deref_f32(logits_ptr, row_off + t * 4)
+        loss_sum = loss_sum + (lse - target_logit)
+        // 4. Write dlogits = softmax - one_hot, scaled by 1/S
+        j = 0
+        while j < V {
+            let sm = exp(deref_f32(logits_ptr, row_off + j * 4) - mx) * inv_sum
+            let one_hot = if j == t { 1.0 } else { 0.0 }
+            write_f32(dlogits_ptr, row_off + j * 4, (sm - one_hot) * inv_S)
+            j = j + 1
+        }
+        s = s + 1
+    }
+    return loss_sum / (S * 1.0)
+}
+
+// ── Convenience: CE loss on hexa arrays (interpreter-friendly) ──
+// For small-scale testing without raw pointer setup.
+// logits: flat array of S*V floats, targets: array of S ints
+fn ce_loss_array(logits: array, targets: array, S: int, V: int) -> float {
+    let mut loss_sum = 0.0
+    let mut s = 0
+    while s < S {
+        let base = s * V
+        // Find max
+        let mut mx = logits[base]
+        let mut j = 1
+        while j < V {
+            if logits[(base + j)] > mx { mx = logits[(base + j)] }
+            j = j + 1
+        }
+        // sum(exp(x - max))
+        let mut sum_exp = 0.0
+        j = 0
+        while j < V {
+            sum_exp = sum_exp + exp(logits[(base + j)] - mx)
+            j = j + 1
+        }
+        let lse = mx + log(sum_exp)
+        let t = targets[s]
+        loss_sum = loss_sum + (lse - logits[(base + t)])
+        s = s + 1
+    }
+    return loss_sum / (S * 1.0)
+}
+
+// ── Self-test: verify fused == separate and gradient correctness ─
+fn ce_loss_selftest() {
+    let S = 2
+    let V = 4
+    let n = S * V
+    // Allocate logits: [[1.0, 2.0, 3.0, 4.0], [4.0, 3.0, 2.0, 1.0]]
+    let logits_ptr = alloc_raw(n * 4)
+    let vals = [1.0, 2.0, 3.0, 4.0, 4.0, 3.0, 2.0, 1.0]
+    let mut i = 0
+    while i < n {
+        write_f32(logits_ptr, i * 4, vals[i])
+        i = i + 1
+    }
+    // Targets: [3, 0] (correct class for each row)
+    let targets_ptr = alloc_raw(S * 4)
+    write_i32(targets_ptr, 0, 3)
+    write_i32(targets_ptr, 4, 0)
+    // Forward
+    let loss_fwd = ce_loss_fwd(logits_ptr, targets_ptr, S, V)
+    // Fused
+    let dlogits_fused = alloc_raw(n * 4)
+    let loss_fused = ce_loss_fused(logits_ptr, targets_ptr, dlogits_fused, S, V)
+    // Separate backward
+    let dlogits_sep = alloc_raw(n * 4)
+    ce_loss_bwd(logits_ptr, targets_ptr, dlogits_sep, S, V)
+    // Check loss match
+    let diff_loss = loss_fwd - loss_fused
+    let loss_ok = if diff_loss < 0.0 { (0.0 - diff_loss) < 0.0001 } else { diff_loss < 0.0001 }
+    // Check gradient match
+    let mut grad_ok = true
+    i = 0
+    while i < n {
+        let gf = deref_f32(dlogits_fused, i * 4)
+        let gs = deref_f32(dlogits_sep, i * 4)
+        let gd = gf - gs
+        let gd_abs = if gd < 0.0 { 0.0 - gd } else { gd }
+        if gd_abs > 0.0001 { grad_ok = false }
+        i = i + 1
+    }
+    // Check gradient sums to ~0 per row (softmax property)
+    let mut row0_sum = 0.0
+    i = 0
+    while i < V {
+        row0_sum = row0_sum + deref_f32(dlogits_fused, i * 4)
+        i = i + 1
+    }
+    let row0_abs = if row0_sum < 0.0 { 0.0 - row0_sum } else { row0_sum }
+    let sum_ok = row0_abs < 0.001
+    // Expected loss: for [1,2,3,4] target=3: log(sum(exp)) - 4 ≈ 0.4402
+    //                for [4,3,2,1] target=0: log(sum(exp)) - 4 ≈ 0.4402
+    // Mean ≈ 0.4402
+    let expected = 0.4402
+    let exp_diff = loss_fwd - expected
+    let exp_abs = if exp_diff < 0.0 { 0.0 - exp_diff } else { exp_diff }
+    let val_ok = exp_abs < 0.01
+    if loss_ok && grad_ok && sum_ok && val_ok {
+        println("[ce_loss] selftest PASS  loss=" + str(loss_fwd))
+    } else {
+        println("[ce_loss] selftest FAIL  loss=" + str(loss_fwd) + " expected~" + str(expected) + " loss_ok=" + str(loss_ok) + " grad_ok=" + str(grad_ok) + " sum_ok=" + str(sum_ok))
+    }
+    // Cleanup
+    free_raw(logits_ptr, n * 4)
+    free_raw(targets_ptr, S * 4)
+    free_raw(dlogits_fused, n * 4)
+    free_raw(dlogits_sep, n * 4)
+}
+
+// Run selftest when loaded directly
+ce_loss_selftest()

@@ -5,7 +5,11 @@
 //
 // Contains:
 //   hxcuda_matmul_bf16   -- bf16 Tensor Core GEMM via WMMA (16x16x16 tiles)
-//   hxcuda_fused_lmhead_fwd -- fused matmul + softmax (logits + probs + loss)
+//   hxcuda_fused_lmhead_fwd -- fused matmul + softmax + CE loss (forward)
+//   hxcuda_matmul_bf16_bwd  -- GEMM backward (dA = dC@B^T, dB = A^T@dC)
+//   hxcuda_softmax_bwd      -- softmax Jacobian-vector product
+//   hxcuda_ce_loss_bwd      -- CE backward (probs - one_hot)
+//   hxcuda_fused_lmhead_bwd -- fused CE + matmul backward (dx, dW)
 //   hxcuda_version       -- ABI version probe
 //
 // Architecture:
@@ -269,9 +273,9 @@ extern "C" {
 
 // ── Version probe ────────────────────────────────────────────────
 //
-// v1: initial MVP (matmul_bf16 + fused_lmhead_fwd)
+// v2: backward kernels (matmul_bwd + softmax_bwd + ce_loss_bwd + fused_lmhead_bwd)
 int64_t hxcuda_version(void) {
-    return 1;
+    return 2;
 }
 
 // ── hxcuda_matmul_bf16 ──────────────────────────────────────────
@@ -453,6 +457,459 @@ int64_t hxcuda_fused_lmhead_fwd(int64_t args_p) {
     }
 
     cudaFree(row_lse);
+    return 0;
+}
+
+// =========================================================================
+//  Backward Kernels (CLM 7B training)
+// =========================================================================
+
+// ── hxcuda_matmul_bf16_bwd ─────────────────────────────────────
+//
+// For C = A @ B:
+//   dA = dC @ B^T   (M×N @ N×K → M×K)
+//   dB = A^T @ dC   (K×M @ M×N → K×N)
+//
+// Struct-args ABI (8 fields, 64 bytes):
+//   off  0: M      (int64_t)
+//   off  8: K      (int64_t)
+//   off 16: N      (int64_t)
+//   off 24: dC_ptr (int64_t, device float* [M, N])
+//   off 32: A_ptr  (int64_t, device float* [M, K])
+//   off 40: B_ptr  (int64_t, device float* [K, N])
+//   off 48: dA_ptr (int64_t, device float* [M, K]  output)
+//   off 56: dB_ptr (int64_t, device float* [K, N]  output)
+
+typedef struct {
+    int64_t M, K, N;
+    int64_t dC_p, A_p, B_p, dA_p, dB_p;
+} HxCudaMatmulBwdArgs;
+
+// Transpose-matmul kernel: C[M,N] = A[M,K] * B^T[N,K] (B stored row-major [N,K])
+// i.e. C = A @ B^T where B is [N,K] row-major
+__global__ void hxcuda_matmul_bf16_transB_kernel(
+    const float* __restrict__ A,   // [M, K] row-major
+    const float* __restrict__ B,   // [N, K] row-major (transposed access)
+    float*       __restrict__ C,   // [M, N] row-major
+    int M, int N, int K)
+{
+    const int warpM = blockIdx.y * WMMA_M;
+    const int warpN = blockIdx.x * WMMA_N;
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    __shared__ __nv_bfloat16 smem_a[WMMA_M * WMMA_K];
+    __shared__ __nv_bfloat16 smem_b[WMMA_N * WMMA_K];  // stored col-major for B^T
+
+    const int tid = threadIdx.x;
+
+    for (int k_step = 0; k_step < K; k_step += WMMA_K) {
+        // Load A tile [warpM..+16, k_step..+16] row-major
+        for (int i = tid; i < WMMA_M * WMMA_K; i += 32) {
+            int row = i / WMMA_K;
+            int col = i % WMMA_K;
+            int gRow = warpM + row;
+            int gCol = k_step + col;
+            float val = (gRow < M && gCol < K) ? A[gRow * K + gCol] : 0.0f;
+            smem_a[i] = __float2bfloat16(val);
+        }
+        // Load B tile transposed: B[N,K] row-major → col-major fragment
+        // We need B^T[k_step..+16, warpN..+16], i.e. B[warpN..+16, k_step..+16]^T
+        // Store in col-major: smem_b[k * WMMA_N + n]
+        for (int i = tid; i < WMMA_K * WMMA_N; i += 32) {
+            int k = i / WMMA_N;
+            int n = i % WMMA_N;
+            int gK = k_step + k;
+            int gN = warpN + n;
+            // B is [N,K] row-major, so B[gN, gK] = B[gN * K + gK]
+            float val = (gN < N && gK < K) ? B[gN * K + gK] : 0.0f;
+            smem_b[k * WMMA_N + n] = __float2bfloat16(val);
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, smem_a, WMMA_K);
+        wmma::load_matrix_sync(b_frag, smem_b, WMMA_N);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    if (warpM < M && warpN < N) {
+        wmma::store_matrix_sync(C + warpM * N + warpN, c_frag, N, wmma::mem_row_major);
+    }
+}
+
+// Transpose-A matmul: C[K,N] = A^T[K,M] * B[M,N] where A is [M,K] row-major
+__global__ void hxcuda_matmul_bf16_transA_kernel(
+    const float* __restrict__ A,   // [M, K] row-major (transposed access)
+    const float* __restrict__ B,   // [M, N] row-major
+    float*       __restrict__ C,   // [K, N] row-major
+    int K_out, int N, int M)
+{
+    const int warpK = blockIdx.y * WMMA_M;
+    const int warpN = blockIdx.x * WMMA_N;
+
+    wmma::fragment<wmma::matrix_a, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::col_major> a_frag;
+    wmma::fragment<wmma::matrix_b, WMMA_M, WMMA_N, WMMA_K, __nv_bfloat16, wmma::row_major> b_frag;
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> c_frag;
+    wmma::fill_fragment(c_frag, 0.0f);
+
+    __shared__ __nv_bfloat16 smem_a[WMMA_K * WMMA_M];  // col-major for A^T
+    __shared__ __nv_bfloat16 smem_b[WMMA_K * WMMA_N];
+
+    const int tid = threadIdx.x;
+
+    for (int m_step = 0; m_step < M; m_step += WMMA_K) {
+        // Load A^T tile: A^T[warpK..+16, m_step..+16] = A[m_step..+16, warpK..+16]^T
+        // Store col-major: smem_a[m * WMMA_M + k]
+        for (int i = tid; i < WMMA_M * WMMA_K; i += 32) {
+            int k = i % WMMA_M;
+            int m = i / WMMA_M;
+            int gK = warpK + k;
+            int gM = m_step + m;
+            // A is [M,K_out] row-major, A[gM, gK] = A[gM * K_out + gK]
+            float val = (gM < M && gK < K_out) ? A[gM * K_out + gK] : 0.0f;
+            smem_a[m * WMMA_M + k] = __float2bfloat16(val);
+        }
+        // Load B tile [m_step..+16, warpN..+16] row-major
+        for (int i = tid; i < WMMA_K * WMMA_N; i += 32) {
+            int row = i / WMMA_N;
+            int col = i % WMMA_N;
+            int gRow = m_step + row;
+            int gCol = warpN + col;
+            float val = (gRow < M && gCol < N) ? B[gRow * N + gCol] : 0.0f;
+            smem_b[i] = __float2bfloat16(val);
+        }
+        __syncthreads();
+
+        wmma::load_matrix_sync(a_frag, smem_a, WMMA_M);
+        wmma::load_matrix_sync(b_frag, smem_b, WMMA_N);
+        wmma::mma_sync(c_frag, a_frag, b_frag, c_frag);
+
+        __syncthreads();
+    }
+
+    if (warpK < K_out && warpN < N) {
+        wmma::store_matrix_sync(C + warpK * N + warpN, c_frag, N, wmma::mem_row_major);
+    }
+}
+
+int64_t hxcuda_matmul_bf16_bwd(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxCudaMatmulBwdArgs* a = (HxCudaMatmulBwdArgs*)(uintptr_t)args_p;
+
+    int M = (int)a->M;
+    int K = (int)a->K;
+    int N = (int)a->N;
+    const float* dC = (const float*)(uintptr_t)a->dC_p;
+    const float* A  = (const float*)(uintptr_t)a->A_p;
+    const float* B  = (const float*)(uintptr_t)a->B_p;
+    float*       dA = (float*)(uintptr_t)a->dA_p;
+    float*       dB = (float*)(uintptr_t)a->dB_p;
+
+    if (M <= 0 || K <= 0 || N <= 0) return -2;
+
+    cudaError_t err;
+
+    // dA[M,K] = dC[M,N] @ B^T  (B is [K,N], so B^T access pattern)
+    // Use transB kernel: dA = dC @ B^T where B is [K,N] stored row-major
+    // dC is [M,N], B is [K,N] → dA is [M,K]
+    {
+        dim3 grid((K + WMMA_N - 1) / WMMA_N, (M + WMMA_M - 1) / WMMA_M);
+        dim3 block(32);
+        hxcuda_matmul_bf16_transB_kernel<<<grid, block>>>(dC, B, dA, M, K, N);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[hxcuda] matmul_bf16_bwd dA launch: %s\n",
+                    cudaGetErrorString(err));
+            return -3;
+        }
+    }
+
+    // dB[K,N] = A^T @ dC  (A is [M,K], dC is [M,N] → dB is [K,N])
+    // Use transA kernel: dB = A^T @ dC where A is [M,K] stored row-major
+    {
+        dim3 grid((N + WMMA_N - 1) / WMMA_N, (K + WMMA_M - 1) / WMMA_M);
+        dim3 block(32);
+        hxcuda_matmul_bf16_transA_kernel<<<grid, block>>>(A, dC, dB, K, N, M);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[hxcuda] matmul_bf16_bwd dB launch: %s\n",
+                    cudaGetErrorString(err));
+            return -4;
+        }
+    }
+
+    return 0;
+}
+
+// ── hxcuda_softmax_bwd_kernel ──────────────────────────────────
+//
+// dlogits[i] = probs[i] * (dprobs[i] - dot(probs[i,:], dprobs[i,:]))
+//
+// Grid: (R, 1, 1) -- one block per row
+// Block: (min(C, SOFTMAX_BLOCK), 1, 1)
+
+__global__ void hxcuda_softmax_bwd_kernel(
+    const float* __restrict__ probs,    // [R, C]
+    const float* __restrict__ dprobs,   // [R, C]
+    float*       __restrict__ dlogits,  // [R, C]
+    int R, int C)
+{
+    int row = blockIdx.x;
+    if (row >= R) return;
+    int tid = threadIdx.x;
+    int bsize = blockDim.x;
+
+    extern __shared__ float sdata[];
+
+    const float* p_row = probs + row * C;
+    const float* dp_row = dprobs + row * C;
+    float* dl_row = dlogits + row * C;
+
+    // Phase 1: compute dot = sum(probs * dprobs) for this row
+    float local_dot = 0.0f;
+    for (int j = tid; j < C; j += bsize) {
+        local_dot += p_row[j] * dp_row[j];
+    }
+    sdata[tid] = local_dot;
+    __syncthreads();
+
+    for (int s = bsize >> 1; s > 0; s >>= 1) {
+        if (tid < s) sdata[tid] += sdata[tid + s];
+        __syncthreads();
+    }
+    float dot = sdata[0];
+
+    // Phase 2: dlogits[j] = probs[j] * (dprobs[j] - dot)
+    for (int j = tid; j < C; j += bsize) {
+        dl_row[j] = p_row[j] * (dp_row[j] - dot);
+    }
+}
+
+// Host wrapper for softmax backward (struct-args ABI, 5 fields = 40 bytes)
+typedef struct {
+    int64_t R, C;
+    int64_t probs_p, dprobs_p, dlogits_p;
+} HxCudaSoftmaxBwdArgs;
+
+int64_t hxcuda_softmax_bwd(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxCudaSoftmaxBwdArgs* a = (HxCudaSoftmaxBwdArgs*)(uintptr_t)args_p;
+
+    int R = (int)a->R;
+    int C = (int)a->C;
+    const float* probs   = (const float*)(uintptr_t)a->probs_p;
+    const float* dprobs  = (const float*)(uintptr_t)a->dprobs_p;
+    float*       dlogits = (float*)(uintptr_t)a->dlogits_p;
+
+    if (R <= 0 || C <= 0) return -2;
+
+    int threads = C;
+    if (threads > SOFTMAX_BLOCK) threads = SOFTMAX_BLOCK;
+    int t = 1;
+    while (t < threads) t <<= 1;
+    threads = t;
+    if (threads > 1024) threads = 1024;
+
+    dim3 grid(R);
+    dim3 block(threads);
+    int shmem = threads * sizeof(float);
+
+    hxcuda_softmax_bwd_kernel<<<grid, block, shmem>>>(probs, dprobs, dlogits, R, C);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[hxcuda] softmax_bwd launch: %s\n",
+                cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+// ── hxcuda_ce_loss_bwd_kernel ──────────────────────────────────
+//
+// dlogits[i,j] = probs[i,j] - one_hot(targets[i], j)
+// i.e. dlogits = probs, then dlogits[i, targets[i]] -= 1.0
+// Scaled by 1/R for mean reduction.
+//
+// Grid: (R, 1, 1) -- one block per row
+// Block: (min(C, 256), 1, 1)
+
+__global__ void hxcuda_ce_loss_bwd_kernel(
+    const float* __restrict__ probs,    // [R, C]
+    const int*   __restrict__ targets,  // [R]
+    float*       __restrict__ dlogits,  // [R, C]
+    int R, int C)
+{
+    int row = blockIdx.x;
+    if (row >= R) return;
+    int tid = threadIdx.x;
+    int bsize = blockDim.x;
+
+    const float* p_row = probs + row * C;
+    float* dl_row = dlogits + row * C;
+    int target = targets[row];
+    float inv_R = 1.0f / (float)R;
+
+    for (int j = tid; j < C; j += bsize) {
+        float g = p_row[j];
+        if (j == target) g -= 1.0f;
+        dl_row[j] = g * inv_R;
+    }
+}
+
+// Host wrapper for CE backward (struct-args ABI, 5 fields = 40 bytes)
+typedef struct {
+    int64_t R, C;
+    int64_t probs_p, targets_p, dlogits_p;
+} HxCudaCeLossBwdArgs;
+
+int64_t hxcuda_ce_loss_bwd(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxCudaCeLossBwdArgs* a = (HxCudaCeLossBwdArgs*)(uintptr_t)args_p;
+
+    int R = (int)a->R;
+    int C = (int)a->C;
+    const float* probs   = (const float*)(uintptr_t)a->probs_p;
+    const int*   targets = (const int*)(uintptr_t)a->targets_p;
+    float*       dlogits = (float*)(uintptr_t)a->dlogits_p;
+
+    if (R <= 0 || C <= 0) return -2;
+
+    int threads = C;
+    if (threads > 256) threads = 256;
+    int t = 1;
+    while (t < threads) t <<= 1;
+    threads = t;
+    if (threads > 256) threads = 256;
+
+    dim3 grid(R);
+    dim3 block(threads);
+
+    hxcuda_ce_loss_bwd_kernel<<<grid, block>>>(probs, targets, dlogits, R, C);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[hxcuda] ce_loss_bwd launch: %s\n",
+                cudaGetErrorString(err));
+        return -3;
+    }
+    return 0;
+}
+
+// ── hxcuda_fused_lmhead_bwd ────────────────────────────────────
+//
+// Fused backward for LM head: CE backward + matmul backward.
+//   logits = x[S,D] @ W[D,V]   (forward was done already)
+//   loss = mean CE(softmax(logits), targets)
+//
+// Backward:
+//   dlogits[S,V] = probs - one_hot(targets)   (CE grad, /S for mean)
+//   dx[S,D] = dlogits @ W^T                   (matmul bwd for x)
+//   dW[D,V] = x^T @ dlogits                   (matmul bwd for W)
+//
+// Struct-args ABI (10 fields, 80 bytes):
+//   off  0: S          (int64_t)
+//   off  8: D          (int64_t)
+//   off 16: V          (int64_t)
+//   off 24: x_p        (int64_t, device float* [S, D]  -- saved from fwd)
+//   off 32: W_p        (int64_t, device float* [D, V]  -- saved from fwd)
+//   off 40: probs_p    (int64_t, device float* [S, V]  -- saved from fwd)
+//   off 48: targets_p  (int64_t, device int*   [S]     -- saved from fwd)
+//   off 56: dx_p       (int64_t, device float* [S, D]  -- output)
+//   off 64: dW_p       (int64_t, device float* [D, V]  -- output)
+//   off 72: reserved0  (int64_t)
+
+typedef struct {
+    int64_t S, D, V;
+    int64_t x_p, W_p, probs_p, targets_p;
+    int64_t dx_p, dW_p;
+    int64_t reserved0;
+} HxCudaFusedLmheadBwdArgs;
+
+int64_t hxcuda_fused_lmhead_bwd(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxCudaFusedLmheadBwdArgs* a = (HxCudaFusedLmheadBwdArgs*)(uintptr_t)args_p;
+
+    int S = (int)a->S;
+    int D = (int)a->D;
+    int V = (int)a->V;
+    const float* x       = (const float*)(uintptr_t)a->x_p;
+    const float* W       = (const float*)(uintptr_t)a->W_p;
+    const float* probs   = (const float*)(uintptr_t)a->probs_p;
+    const int*   targets = (const int*)(uintptr_t)a->targets_p;
+    float*       dx      = (float*)(uintptr_t)a->dx_p;
+    float*       dW      = (float*)(uintptr_t)a->dW_p;
+
+    if (S <= 0 || D <= 0 || V <= 0) return -2;
+
+    cudaError_t err;
+
+    // --- Phase 1: dlogits[S,V] = (probs - one_hot) / S  (CE backward) ---
+    // Allocate temp dlogits on device
+    float* dlogits = NULL;
+    err = cudaMalloc(&dlogits, (size_t)S * V * sizeof(float));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "[hxcuda] fused_lmhead_bwd dlogits alloc: %s\n",
+                cudaGetErrorString(err));
+        return -3;
+    }
+
+    {
+        int threads = V;
+        if (threads > 256) threads = 256;
+        int t = 1;
+        while (t < threads) t <<= 1;
+        threads = t;
+        if (threads > 256) threads = 256;
+
+        dim3 grid(S);
+        dim3 block(threads);
+        hxcuda_ce_loss_bwd_kernel<<<grid, block>>>(probs, targets, dlogits, S, V);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[hxcuda] fused_lmhead_bwd CE launch: %s\n",
+                    cudaGetErrorString(err));
+            cudaFree(dlogits);
+            return -4;
+        }
+    }
+
+    // --- Phase 2: dx[S,D] = dlogits[S,V] @ W^T[V,D] ---
+    // W is [D,V] row-major. W^T access: use transB kernel with B=[D,V]
+    {
+        dim3 grid((D + WMMA_N - 1) / WMMA_N, (S + WMMA_M - 1) / WMMA_M);
+        dim3 block(32);
+        hxcuda_matmul_bf16_transB_kernel<<<grid, block>>>(dlogits, W, dx, S, D, V);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[hxcuda] fused_lmhead_bwd dx launch: %s\n",
+                    cudaGetErrorString(err));
+            cudaFree(dlogits);
+            return -5;
+        }
+    }
+
+    // --- Phase 3: dW[D,V] = x^T[D,S] @ dlogits[S,V] ---
+    // x is [S,D] row-major. Use transA kernel.
+    {
+        dim3 grid((V + WMMA_N - 1) / WMMA_N, (D + WMMA_M - 1) / WMMA_M);
+        dim3 block(32);
+        hxcuda_matmul_bf16_transA_kernel<<<grid, block>>>(x, dlogits, dW, D, V, S);
+        err = cudaGetLastError();
+        if (err != cudaSuccess) {
+            fprintf(stderr, "[hxcuda] fused_lmhead_bwd dW launch: %s\n",
+                    cudaGetErrorString(err));
+            cudaFree(dlogits);
+            return -6;
+        }
+    }
+
+    cudaFree(dlogits);
     return 0;
 }
 
