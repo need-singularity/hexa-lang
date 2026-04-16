@@ -3187,8 +3187,8 @@ static int64_t hexa_ffi_marshal_arg(HexaVal v) {
     }
 }
 
-// Raw extern call dispatch — supports 0 to 12 arguments.
-// Extended 2026-04-12 from 10 to 12 to support cuLaunchKernel (11 args).
+// Raw extern call dispatch — supports 0 to 14 arguments.
+// Extended 2026-04-16 from 12 to 14 to support cblas_sgemm (14 args).
 // Uses transmute (cast) to call through a function pointer with the right arity.
 static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
     typedef int64_t (*Fn0)(void);
@@ -3204,6 +3204,8 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
     typedef int64_t (*Fn10)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
     typedef int64_t (*Fn11)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
     typedef int64_t (*Fn12)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn13)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
+    typedef int64_t (*Fn14)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t);
 
     switch (nargs) {
         case 0:  return ((Fn0)fn_ptr)();
@@ -3219,8 +3221,10 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
         case 10: return ((Fn10)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9]);
         case 11: return ((Fn11)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10]);
         case 12: return ((Fn12)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10],args[11]);
+        case 13: return ((Fn13)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10],args[11],args[12]);
+        case 14: return ((Fn14)fn_ptr)(args[0],args[1],args[2],args[3],args[4],args[5],args[6],args[7],args[8],args[9],args[10],args[11],args[12],args[13]);
         default:
-            fprintf(stderr, "[hexa-ffi] extern call with %d args not supported (max 12)\n", nargs);
+            fprintf(stderr, "[hexa-ffi] extern call with %d args not supported (max 14)\n", nargs);
             return 0;
     }
 }
@@ -3228,8 +3232,8 @@ static int64_t hexa_call_extern_raw(void* fn_ptr, int64_t* args, int nargs) {
 // High-level extern call: resolve, marshal, call, unmarshal.
 // ret_kind: 0=void, 1=int, 2=float, 3=bool, 4=pointer/string
 HexaVal hexa_extern_call(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind) {
-    int64_t cargs[12];  // was 10; extended for cuLaunchKernel (11 args)
-    for (int i = 0; i < nargs && i < 12; i++) {
+    int64_t cargs[14];  // extended for cblas_sgemm (14 args)
+    for (int i = 0; i < nargs && i < 14; i++) {
         cargs[i] = hexa_ffi_marshal_arg(hargs[i]);
     }
     int64_t ret = hexa_call_extern_raw(fn_ptr, cargs, nargs);
@@ -3246,13 +3250,13 @@ HexaVal hexa_extern_call(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind) 
 // ── G3: Typed extern call with float support ─────────────
 // float_mask is a bitmask: bit i set means arg i is a double (SIMD register).
 // This generates correct ARM64 calling convention for mixed int/float args.
-// Supports up to 8 args (covers all common FFI patterns including NSRect).
+// Supports up to 14 args (covers vDSP_mmul 9-arg, cblas_sgemm 14-arg).
 // The C compiler sees typed args and emits correct register moves.
 HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_kind, int float_mask) {
     // Extract values: doubles from .f, integers from .i
-    double  fv[8]; // float values
-    int64_t iv[8]; // int values
-    for (int i = 0; i < nargs && i < 8; i++) {
+    double  fv[14]; // float values
+    int64_t iv[14]; // int values
+    for (int i = 0; i < nargs && i < 14; i++) {
         if (float_mask & (1 << i)) {
             fv[i] = HX_IS_FLOAT(hargs[i]) ? HX_FLOAT(hargs[i]) : (double)HX_INT(hargs[i]);
         } else {
@@ -3359,9 +3363,49 @@ HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_
             }
             break;
         }
+        case 6: {
+            // 6 args — cblas_saxpy(N, alpha, x, incx, y, incy)
+            if (float_mask == 0) {
+                reti = ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4],iv[5]);
+            } else if (float_mask == 0x02) { // i f i i i i — cblas_saxpy(N,alpha,x,incx,y,incy)
+                ((void(*)(int64_t,double,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],fv[1],iv[2],iv[3],iv[4],iv[5]);
+                reti = 0;
+            } else {
+                reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
+            }
+            break;
+        }
+        case 7: {
+            // 7 args — vDSP_vadd/vmul(A,sA,B,sB,C,sC,N)
+            if (float_mask == 0) {
+                ((void(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4],iv[5],iv[6]);
+                reti = 0;
+            } else {
+                reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
+            }
+            break;
+        }
+        case 8: {
+            // 8 args
+            if (float_mask == 0) {
+                reti = ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4],iv[5],iv[6],iv[7]);
+            } else {
+                reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
+            }
+            break;
+        }
+        case 9: {
+            // 9 args — vDSP_mmul(A,sA,B,sB,C,sC,M,N,K)
+            if (float_mask == 0) {
+                ((void(*)(int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4],iv[5],iv[6],iv[7],iv[8]);
+                reti = 0;
+            } else {
+                reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
+            }
+            break;
+        }
         default: {
-            // For 6+ args: fall back to the codegen approach (typed wrappers).
-            fprintf(stderr, "[hexa-ffi] typed call with %d args: use typed extern fn decl in .hexa\n", nargs);
+            // 10-14 args: fall back to raw int dispatch (handles up to 14).
             reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
             break;
         }
@@ -3490,16 +3534,45 @@ HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask,
     return hexa_extern_call(fp, hargs, nargs, rk);
 }
 
+// Static overflow buffer for >6 arg FFI calls.
+// The interpreter stores overflow args here via magic fn_ptr sentinel
+// values (-1, -2) before the real dispatch call.
+static HexaVal g_ffi_overflow[14];
+
 // hexa_host_ffi_call_6(fn_ptr, nargs, float_mask, ret_kind, a0, a1, a2, a3, a4, a5)
 //   Scalar-fanout variant used by the self-host interpreter which
 //   cannot pass its array_store-backed TAG_VALSTRUCT array through
 //   hexa_array_get. Up to 6 positional args; unused slots are TAG_VOID.
+//
+//   Extended 2026-04-16: overflow protocol for >6 args (vDSP_mmul 9, cblas_sgemm 14).
+//   Magic fn_ptr sentinels:
+//     fn_ptr == -1 : store a0..a5 into g_ffi_overflow[0..5] (args 6-11)
+//     fn_ptr == -2 : store a0..a1 into g_ffi_overflow[6..7] (args 12-13)
+//   When fn_ptr is a real pointer and nargs > 6, read g_ffi_overflow for args 6+.
 HexaVal hexa_host_ffi_call_6(
     HexaVal fn_ptr, HexaVal nargs_v, HexaVal float_mask, HexaVal ret_kind,
     HexaVal a0, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4, HexaVal a5
 ) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
+    int64_t fp_raw = HX_IS_INT(fp_v) ? HX_INT(fp_v) : 0;
+
+    // Magic sentinel: store overflow args
+    if (fp_raw == -1) {
+        g_ffi_overflow[0] = hexa_host_ffi_unwrap(a0);
+        g_ffi_overflow[1] = hexa_host_ffi_unwrap(a1);
+        g_ffi_overflow[2] = hexa_host_ffi_unwrap(a2);
+        g_ffi_overflow[3] = hexa_host_ffi_unwrap(a3);
+        g_ffi_overflow[4] = hexa_host_ffi_unwrap(a4);
+        g_ffi_overflow[5] = hexa_host_ffi_unwrap(a5);
+        return hexa_int(0);
+    }
+    if (fp_raw == -2) {
+        g_ffi_overflow[6] = hexa_host_ffi_unwrap(a0);
+        g_ffi_overflow[7] = hexa_host_ffi_unwrap(a1);
+        return hexa_int(0);
+    }
+
+    void* fp = (fp_raw != 0) ? (void*)(uintptr_t)fp_raw : NULL;
     if (!fp) return hexa_int(0);
     HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
@@ -3508,14 +3581,20 @@ HexaVal hexa_host_ffi_call_6(
     int rk    = HX_IS_INT(rk_v) ? (int)HX_INT(rk_v) : 1;
     int mask  = HX_IS_INT(fm_v) ? (int)HX_INT(fm_v) : 0;
     if (nargs < 0) nargs = 0;
-    if (nargs > 6) nargs = 6;
-    HexaVal hargs[6];
+    if (nargs > 14) nargs = 14;
+
+    // Build hargs: first 6 from direct params, 6+ from overflow buffer
+    HexaVal hargs[14];
     hargs[0] = hexa_host_ffi_unwrap(a0);
     hargs[1] = hexa_host_ffi_unwrap(a1);
     hargs[2] = hexa_host_ffi_unwrap(a2);
     hargs[3] = hexa_host_ffi_unwrap(a3);
     hargs[4] = hexa_host_ffi_unwrap(a4);
     hargs[5] = hexa_host_ffi_unwrap(a5);
+    for (int i = 6; i < nargs; i++) {
+        hargs[i] = g_ffi_overflow[i - 6];
+    }
+
     HexaVal native_ret;
     if (mask) {
         native_ret = hexa_extern_call_typed(fp, hargs, nargs, rk, mask);
@@ -3533,6 +3612,58 @@ HexaVal hexa_host_ffi_call_6(
     if (HX_IS_FLOAT(native_ret)) fv = HX_FLOAT(native_ret);
     if (HX_IS_BOOL(native_ret))  bv = HX_BOOL(native_ret);
     // Hexa-level tag constants: INT=0, FLOAT=1, BOOL=2, VOID=8.
+    int hexa_tag = 0;
+    if (rk == 2) hexa_tag = 1;
+    if (rk == 3) hexa_tag = 2;
+    if (rk == 0) hexa_tag = 8;
+    HexaVal empty_str = hexa_str("");
+    return hexa_valstruct_new_v(
+        hexa_int(hexa_tag), hexa_int(iv), hexa_float(fv), hexa_bool(bv),
+        empty_str, empty_str, empty_str,
+        empty_str, empty_str, empty_str,
+        empty_str, empty_str);
+}
+
+// hexa_host_ffi_call_14(fn_ptr, nargs, float_mask, ret_kind, a0..a13)
+//   Extended variant supporting up to 14 positional args — covers
+//   cblas_sgemm (14 args) and vDSP_mmul (9 args).
+HexaVal hexa_host_ffi_call_14(
+    HexaVal fn_ptr, HexaVal nargs_v, HexaVal float_mask, HexaVal ret_kind,
+    HexaVal a0, HexaVal a1, HexaVal a2,  HexaVal a3,
+    HexaVal a4, HexaVal a5, HexaVal a6,  HexaVal a7,
+    HexaVal a8, HexaVal a9, HexaVal a10, HexaVal a11,
+    HexaVal a12, HexaVal a13
+) {
+    HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
+    if (!fp) return hexa_int(0);
+    HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
+    HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
+    HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
+    int nargs = HX_IS_INT(na_v) ? (int)HX_INT(na_v) : 0;
+    int rk    = HX_IS_INT(rk_v) ? (int)HX_INT(rk_v) : 1;
+    int mask  = HX_IS_INT(fm_v) ? (int)HX_INT(fm_v) : 0;
+    if (nargs < 0) nargs = 0;
+    if (nargs > 14) nargs = 14;
+    HexaVal slots[14];
+    slots[0]  = a0;  slots[1]  = a1;  slots[2]  = a2;  slots[3]  = a3;
+    slots[4]  = a4;  slots[5]  = a5;  slots[6]  = a6;  slots[7]  = a7;
+    slots[8]  = a8;  slots[9]  = a9;  slots[10] = a10; slots[11] = a11;
+    slots[12] = a12; slots[13] = a13;
+    HexaVal hargs[14];
+    for (int i = 0; i < 14; i++) hargs[i] = hexa_host_ffi_unwrap(slots[i]);
+    HexaVal native_ret;
+    if (mask) {
+        native_ret = hexa_extern_call_typed(fp, hargs, nargs, rk, mask);
+    } else {
+        native_ret = hexa_extern_call(fp, hargs, nargs, rk);
+    }
+    int64_t iv = 0;
+    double  fv = 0.0;
+    int bv = 0;
+    if (HX_IS_INT(native_ret))   iv = HX_INT(native_ret);
+    if (HX_IS_FLOAT(native_ret)) fv = HX_FLOAT(native_ret);
+    if (HX_IS_BOOL(native_ret))  bv = HX_BOOL(native_ret);
     int hexa_tag = 0;
     if (rk == 2) hexa_tag = 1;
     if (rk == 3) hexa_tag = 2;
