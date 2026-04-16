@@ -1,0 +1,269 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_grad_checkpoint_ai.hexa — tests for ai_native/grad_checkpoint.hexa
+//  ROI #103 — selective activation checkpointing cost model + AST pass
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn t103_assert(cond, msg) {
+    if cond {
+        pass_count = pass_count + 1
+    } else {
+        fail_count = fail_count + 1
+        println("[FAIL] " + msg)
+    }
+}
+
+fn t103_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn t103_assert_near(a, b, tol, msg) {
+    let diff = t103_fabs(a - b)
+    t103_assert(diff < tol, msg + " (got " + to_string(a) + " vs " + to_string(b) + ")")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 1: Cost model returns expected decisions
+// ═══════════════════════════════════════════════════════════════════
+fn test_cost_model_decisions() {
+    println("  test_cost_model_decisions...")
+
+    // High memory, low compute -> should checkpoint
+    let r1 = gc_cost_model(#{"compute": 1.0, "memory": 5.0})
+    t103_assert(r1["checkpoint"] == true, "high mem/low compute -> checkpoint")
+    t103_assert_near(r1["ratio"], 5.0, 0.001, "ratio = 5.0")
+
+    // Low memory, high compute -> should NOT checkpoint
+    let r2 = gc_cost_model(#{"compute": 10.0, "memory": 3.0})
+    t103_assert(r2["checkpoint"] == false, "low mem/high compute -> no checkpoint")
+    t103_assert_near(r2["ratio"], 0.3, 0.001, "ratio = 0.3")
+
+    // Equal -> should checkpoint (ratio = 1.0, threshold is >=)
+    let r3 = gc_cost_model(#{"compute": 4.0, "memory": 4.0})
+    t103_assert(r3["checkpoint"] == true, "equal mem/compute -> checkpoint")
+    t103_assert_near(r3["ratio"], 1.0, 0.001, "ratio = 1.0")
+
+    // Zero compute -> never checkpoint, ratio = 0
+    let r4 = gc_cost_model(#{"compute": 0.0, "memory": 100.0})
+    t103_assert(r4["checkpoint"] == false, "zero compute -> no checkpoint")
+    t103_assert_near(r4["ratio"], 0.0, 0.001, "zero compute ratio = 0")
+
+    println("  test_cost_model_decisions DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 2: Rewriter correctly marks layers (AST detect + rewrite)
+// ═══════════════════════════════════════════════════════════════════
+fn test_rewriter_marks() {
+    println("  test_rewriter_marks...")
+
+    // Single store_all -> becomes checkpoint_forward
+    let prog1 = [gc_stmt_store_all("i", "activations")]
+    t103_assert(detect_checkpoint_candidate(prog1) == true, "detect single store_all")
+    let rw1 = rewrite_insert_checkpoint(prog1)
+    t103_assert(len(rw1) == 1, "rewritten length = 1")
+    t103_assert(rw1[0].kind == "checkpoint_forward", "rewritten kind = checkpoint_forward")
+    t103_assert(rw1[0].index == "i", "rewritten preserves index")
+    t103_assert(rw1[0].param == "activations", "rewritten preserves param")
+
+    // Mixed program: store_all + other + store_all
+    let prog2 = [
+        gc_stmt_store_all("i", "acts"),
+        gc_stmt_other(),
+        gc_stmt_store_all("j", "grads")
+    ]
+    let rw2 = rewrite_insert_checkpoint(prog2)
+    t103_assert(rw2[0].kind == "checkpoint_forward", "mixed: first rewritten")
+    t103_assert(rw2[1].kind == "other", "mixed: other preserved")
+    t103_assert(rw2[2].kind == "checkpoint_forward", "mixed: second rewritten")
+    t103_assert(rw2[2].index == "j", "mixed: second index preserved")
+
+    // No candidate -> returns unchanged
+    let prog3 = [gc_stmt_other(), gc_stmt_backward("k", "x")]
+    t103_assert(detect_checkpoint_candidate(prog3) == false, "no candidate detected")
+    let rw3 = rewrite_insert_checkpoint(prog3)
+    t103_assert(rw3[0].kind == "other", "no-op rewrite: other")
+    t103_assert(rw3[1].kind == "backward_recompute", "no-op rewrite: backward")
+
+    println("  test_rewriter_marks DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 3: Budget constraint respected
+// ═══════════════════════════════════════════════════════════════════
+fn test_budget_constraint() {
+    println("  test_budget_constraint...")
+
+    let layers = [
+        #{"compute": 1.0, "memory": 10.0},
+        #{"compute": 2.0, "memory": 20.0},
+        #{"compute": 4.0, "memory": 30.0},
+        #{"compute": 3.0, "memory": 15.0}
+    ]
+    // Total memory = 75
+
+    // Budget 75 -> all stored
+    let m75 = gc_mark_layers(layers, 75.0)
+    let stored75 = gc_total_memory(layers, m75)
+    t103_assert_near(stored75, 75.0, 0.001, "budget 75: all stored")
+    let recomp75 = gc_total_recompute(layers, m75)
+    t103_assert_near(recomp75, 0.0, 0.001, "budget 75: zero recompute")
+
+    // Budget 50 -> some recomputed, stored <= 50
+    let m50 = gc_mark_layers(layers, 50.0)
+    let stored50 = gc_total_memory(layers, m50)
+    t103_assert(stored50 <= 50.0, "budget 50: stored <= 50 (got " + to_string(stored50) + ")")
+
+    // Budget 20 -> heavy recompute, stored <= 20
+    let m20 = gc_mark_layers(layers, 20.0)
+    let stored20 = gc_total_memory(layers, m20)
+    t103_assert(stored20 <= 20.0, "budget 20: stored <= 20 (got " + to_string(stored20) + ")")
+
+    // Budget 0 -> all recomputed
+    let m0 = gc_mark_layers(layers, 0.0)
+    let stored0 = gc_total_memory(layers, m0)
+    t103_assert_near(stored0, 0.0, 0.001, "budget 0: nothing stored")
+    let recomp0 = gc_total_recompute(layers, m0)
+    t103_assert_near(recomp0, 10.0, 0.001, "budget 0: all compute recomputed")
+
+    // Budget 100 (>= total) -> all stored
+    let m100 = gc_mark_layers(layers, 100.0)
+    for i in 0..4 {
+        t103_assert(m100[i] == true, "budget 100: layer " + to_string(i) + " stored")
+    }
+
+    println("  test_budget_constraint DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 4: Edge cases — 0 layers, 1 layer
+// ═══════════════════════════════════════════════════════════════════
+fn test_edge_cases() {
+    println("  test_edge_cases...")
+
+    // 0 layers
+    let m_empty = gc_mark_layers([], 10.0)
+    t103_assert(len(m_empty) == 0, "0 layers: empty marks")
+
+    // 1 layer, fits budget
+    let one_layer = [#{"compute": 2.0, "memory": 5.0}]
+    let m1_fit = gc_mark_layers(one_layer, 10.0)
+    t103_assert(len(m1_fit) == 1, "1 layer: length 1")
+    t103_assert(m1_fit[0] == true, "1 layer fits: stored")
+
+    // 1 layer, does not fit budget
+    let m1_no = gc_mark_layers(one_layer, 3.0)
+    t103_assert(m1_no[0] == false, "1 layer no fit: recomputed")
+
+    // Empty program detect
+    t103_assert(detect_checkpoint_candidate([]) == false, "empty prog: no candidate")
+
+    // gc_should_checkpoint edge: negative compute
+    t103_assert(gc_should_checkpoint(-1.0, 5.0) == false, "negative compute: false")
+
+    // gc_memory_savings on empty
+    t103_assert_near(gc_memory_savings([], 10.0), 0.0, 0.001, "savings on empty = 0")
+
+    println("  test_edge_cases DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 5: All-checkpoint vs none-checkpoint extremes
+// ═══════════════════════════════════════════════════════════════════
+fn test_all_vs_none() {
+    println("  test_all_vs_none...")
+
+    // 5 identical layers: compute=1, memory=10 each. Total mem = 50.
+    let mut layers = []
+    for _i in 0..5 {
+        layers.push(#{"compute": 1.0, "memory": 10.0})
+    }
+
+    // All-checkpoint (budget 0): every layer recomputed
+    let marks_all_ckpt = gc_mark_layers(layers, 0.0)
+    let mut all_false = true
+    for i in 0..5 {
+        if marks_all_ckpt[i] != false { all_false = false }
+    }
+    t103_assert(all_false, "budget=0: all layers recomputed")
+    let recomp_all = gc_total_recompute(layers, marks_all_ckpt)
+    t103_assert_near(recomp_all, 5.0, 0.001, "budget=0: total recompute = 5.0")
+
+    // None-checkpoint (budget >= 50): every layer stored
+    let marks_none_ckpt = gc_mark_layers(layers, 50.0)
+    let mut all_true = true
+    for i in 0..5 {
+        if marks_none_ckpt[i] != true { all_true = false }
+    }
+    t103_assert(all_true, "budget=50: all layers stored")
+    let stored_all = gc_total_memory(layers, marks_none_ckpt)
+    t103_assert_near(stored_all, 50.0, 0.001, "budget=50: total stored = 50.0")
+
+    // Partial budget: 25 -> should store ~2-3 layers
+    let marks_partial = gc_mark_layers(layers, 25.0)
+    let stored_partial = gc_total_memory(layers, marks_partial)
+    t103_assert(stored_partial <= 25.0, "budget=25: stored <= 25")
+    // At least some are recomputed
+    let mut some_false = false
+    for i in 0..5 {
+        if marks_partial[i] == false { some_false = true }
+    }
+    t103_assert(some_false, "budget=25: some layers recomputed")
+
+    // Memory savings: budget=25 on total 50 -> ~50% savings
+    let savings = gc_memory_savings(layers, 25.0)
+    t103_assert(savings > 0.4, "savings > 40% with half budget")
+    t103_assert(savings <= 1.0, "savings <= 100%")
+
+    println("  test_all_vs_none DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 6: Greedy ordering — high-ratio layers recomputed first
+// ═══════════════════════════════════════════════════════════════════
+fn test_greedy_ordering() {
+    println("  test_greedy_ordering...")
+
+    // Layer A: compute=10, memory=10 -> ratio 1.0 (cheap to recompute per mem)
+    // Layer B: compute=1,  memory=10 -> ratio 10.0 (expensive to store per compute)
+    // Layer C: compute=5,  memory=10 -> ratio 2.0
+    // Total mem = 30. Budget = 20 -> must drop 10 of memory.
+    // Greedy should drop B first (highest ratio = most memory per recompute cost).
+    let layers = [
+        #{"compute": 10.0, "memory": 10.0},
+        #{"compute": 1.0,  "memory": 10.0},
+        #{"compute": 5.0,  "memory": 10.0}
+    ]
+    let marks = gc_mark_layers(layers, 20.0)
+    // B (index 1) has highest ratio -> should be recomputed first
+    t103_assert(marks[1] == false, "greedy: highest-ratio layer B recomputed")
+    // A and C should remain stored (20 mem fits)
+    t103_assert(marks[0] == true, "greedy: layer A stored")
+    t103_assert(marks[2] == true, "greedy: layer C stored")
+
+    let stored = gc_total_memory(layers, marks)
+    t103_assert(stored <= 20.0, "greedy: stored within budget")
+
+    println("  test_greedy_ordering DONE")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Run all tests
+// ═══════════════════════════════════════════════════════════════════
+println("[test_grad_checkpoint_ai] running...")
+test_cost_model_decisions()
+test_rewriter_marks()
+test_budget_constraint()
+test_edge_cases()
+test_all_vs_none()
+test_greedy_ordering()
+
+println("[test_grad_checkpoint_ai] " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+if fail_count == 0 {
+    println("[test_grad_checkpoint_ai] ALL PASS")
+} else {
+    println("[test_grad_checkpoint_ai] SOME FAILURES")
+}

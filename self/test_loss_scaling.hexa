@@ -1,0 +1,307 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_loss_scaling.hexa — ROI #104 correctness suite
+//
+//  Validates self/ai_native/loss_scaling.hexa:
+//    T1   Normal grads -> scale grows after growth_interval steps
+//    T2   Inf grads -> scale shrinks, skip_step=true
+//    T3   Nan grads -> scale shrinks, skip_step=true
+//    T4   Growth interval respected (no premature growth)
+//    T5   Edge: scale=1.0 identity
+//    T6   Edge: scale very large -> overflow -> backoff
+//    T7   Round-trip: scale up then down recovers
+//    T8   Empty grads -> has_zero=true, no inf/nan
+//    T9   ls_scale_loss exact multiply
+//    T10  AST detect unscaled backward
+//    T11  AST detect already-scaled (no rewrite needed)
+//    T12  AST rewrite wraps backward with scale
+//    T13  All-zero grads -> scale still grows (not skipped)
+//    T14  Multiple inf/nan cycles then recovery
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/loss_scaling.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn close(a, b, eps) {
+    return fabs_t(a - b) < eps
+}
+
+// ── T1: Normal grads -> scale grows ────────────────────────────────
+fn test_normal_grads_scale_grows() {
+    let mut st = ls_init_state(1024.0, 2.0, 0.5, 3)
+    let grads = [0.1, 0.2, 0.3, 0.4]
+
+    // Run 3 clean steps (growth_interval = 3)
+    for _i in 0..3 {
+        let gc = ls_check_grads(grads)
+        st = ls_update_scale(st, gc)
+    }
+    // After 3 clean steps, scale should double
+    check("T1 normal grads scale grows", close(st["scale"], 2048.0, 1.0e-10))
+    check("T1 good_steps reset", st["good_steps"] == 0)
+    check("T1 skip_step false", st["skip_step"] == false)
+}
+
+// ── T2: Inf grads -> scale shrinks, skip ───────────────────────────
+fn test_inf_grads_shrink() {
+    let st = ls_init_state(1024.0, 2.0, 0.5, 2000)
+    // Create inf by overflow: 1e308 * 2 = inf
+    let big = 1.0e308
+    let inf_val = big * 2.0
+    let grads = [1.0, inf_val, 0.5]
+
+    let gc = ls_check_grads(grads)
+    check("T2 has_inf detected", gc["has_inf"] == true)
+
+    let new_st = ls_update_scale(st, gc)
+    check("T2 scale shrinks", close(new_st["scale"], 512.0, 1.0e-10))
+    check("T2 skip_step true", new_st["skip_step"] == true)
+    check("T2 good_steps reset", new_st["good_steps"] == 0)
+}
+
+// ── T3: Nan grads -> scale shrinks, skip ───────────────────────────
+fn test_nan_grads_shrink() {
+    let st = ls_init_state(1024.0, 2.0, 0.5, 2000)
+    // nan = 0.0 / 0.0
+    let nan_val = 0.0 / 0.0
+    let grads = [nan_val, 1.0, 2.0]
+
+    let gc = ls_check_grads(grads)
+    check("T3 has_nan detected", gc["has_nan"] == true)
+
+    let new_st = ls_update_scale(st, gc)
+    check("T3 scale shrinks on nan", close(new_st["scale"], 512.0, 1.0e-10))
+    check("T3 skip_step true", new_st["skip_step"] == true)
+}
+
+// ── T4: Growth interval respected ──────────────────────────────────
+fn test_growth_interval_respected() {
+    let mut st = ls_init_state(100.0, 2.0, 0.5, 5)
+    let grads = [0.1, 0.2]
+
+    // Run 4 clean steps (one short of interval=5)
+    for _i in 0..4 {
+        let gc = ls_check_grads(grads)
+        st = ls_update_scale(st, gc)
+    }
+    check("T4 no premature growth", close(st["scale"], 100.0, 1.0e-10))
+    check("T4 good_steps is 4", st["good_steps"] == 4)
+
+    // One more step triggers growth
+    let gc = ls_check_grads(grads)
+    st = ls_update_scale(st, gc)
+    check("T4 growth at interval", close(st["scale"], 200.0, 1.0e-10))
+    check("T4 good_steps reset after growth", st["good_steps"] == 0)
+}
+
+// ── T5: Edge scale=1.0 identity ────────────────────────────────────
+fn test_scale_one_identity() {
+    let st = ls_init_state(1.0, 2.0, 0.5, 10)
+    let loss = 3.14
+    let scaled = ls_scale_loss(loss, st)
+    check("T5 scale=1 identity", close(scaled, 3.14, 1.0e-15))
+}
+
+// ── T6: Edge scale very large -> overflow -> backoff ───────────────
+fn test_scale_very_large() {
+    let mut st = ls_init_state(1.0e300, 2.0, 0.5, 1)
+
+    // Grow once -> 2e300
+    let clean_gc = #{
+        "has_inf": false,
+        "has_nan": false,
+        "has_zero": false
+    }
+    st = ls_update_scale(st, clean_gc)
+    check("T6 large scale grows", close(st["scale"], 2.0e300, 1.0e290))
+
+    // Simulate overflow grads
+    let bad_gc = #{
+        "has_inf": true,
+        "has_nan": false,
+        "has_zero": false
+    }
+    st = ls_update_scale(st, bad_gc)
+    check("T6 backoff after overflow", close(st["scale"], 1.0e300, 1.0e290))
+    check("T6 skip on overflow", st["skip_step"] == true)
+}
+
+// ── T7: Round-trip: scale up then down recovers ────────────────────
+fn test_round_trip() {
+    let init = 1024.0
+    let gf = 2.0
+    let bf = 0.5
+    let mut st = ls_init_state(init, gf, bf, 1)
+
+    let clean_gc = #{
+        "has_inf": false,
+        "has_nan": false,
+        "has_zero": false
+    }
+    let bad_gc = #{
+        "has_inf": true,
+        "has_nan": false,
+        "has_zero": false
+    }
+
+    // Grow: 1024 -> 2048
+    st = ls_update_scale(st, clean_gc)
+    check("T7 after grow", close(st["scale"], 2048.0, 1.0e-10))
+
+    // Shrink: 2048 -> 1024
+    st = ls_update_scale(st, bad_gc)
+    check("T7 round-trip recovers", close(st["scale"], 1024.0, 1.0e-10))
+}
+
+// ── T8: Empty grads ────────────────────────────────────────────────
+fn test_empty_grads() {
+    let grads = []
+    let gc = ls_check_grads(grads)
+    check("T8 empty has_inf false", gc["has_inf"] == false)
+    check("T8 empty has_nan false", gc["has_nan"] == false)
+    check("T8 empty has_zero true", gc["has_zero"] == true)
+}
+
+// ── T9: ls_scale_loss exact multiply ───────────────────────────────
+fn test_scale_loss_exact() {
+    let st = ls_init_state(65536.0, 2.0, 0.5, 2000)
+    let loss = 0.001
+    let scaled = ls_scale_loss(loss, st)
+    check("T9 exact multiply", close(scaled, 65.536, 1.0e-10))
+}
+
+// ── T10: AST detect unscaled backward ──────────────────────────────
+fn test_ast_detect_unscaled() {
+    let prog = [ls_stmt_other(), ls_stmt_backward(), ls_stmt_other()]
+    check("T10 detect unscaled", detect_unscaled_loss(prog) == true)
+}
+
+// ── T11: AST detect already-scaled ─────────────────────────────────
+fn test_ast_detect_already_scaled() {
+    let prog = [ls_stmt_other(), ls_stmt_scaled_backward()]
+    check("T11 already scaled", detect_unscaled_loss(prog) == false)
+}
+
+// ── T12: AST rewrite wraps backward ───────────────────────────────
+fn test_ast_rewrite() {
+    let prog = [ls_stmt_other(), ls_stmt_backward(), ls_stmt_other()]
+    let rewritten = rewrite_add_loss_scaling(prog)
+    check("T12 len preserved", len(rewritten) == 3)
+    check("T12 first unchanged", rewritten[0].kind == "other")
+    check("T12 backward -> scaled", rewritten[1].kind == "scaled_backward")
+    check("T12 has_scale true", rewritten[1].has_scale == true)
+    check("T12 last unchanged", rewritten[2].kind == "other")
+
+    // Rewrite again should be no-op (already scaled)
+    let rewritten2 = rewrite_add_loss_scaling(rewritten)
+    check("T12 idempotent", rewritten2[1].kind == "scaled_backward")
+}
+
+// ── T13: All-zero grads -> scale still grows ───────────────────────
+fn test_zero_grads_still_grow() {
+    let mut st = ls_init_state(100.0, 2.0, 0.5, 2)
+    let grads = [0.0, 0.0, 0.0]
+
+    // Zero grads have no inf/nan, so scale should grow
+    for _i in 0..2 {
+        let gc = ls_check_grads(grads)
+        st = ls_update_scale(st, gc)
+    }
+    check("T13 zero grads scale grows", close(st["scale"], 200.0, 1.0e-10))
+    check("T13 skip false", st["skip_step"] == false)
+}
+
+// ── T14: Multiple inf/nan cycles then recovery ────────────────────
+fn test_multi_cycle_recovery() {
+    let mut st = ls_init_state(65536.0, 2.0, 0.5, 2)
+
+    let bad_gc = #{
+        "has_inf": true,
+        "has_nan": false,
+        "has_zero": false
+    }
+    let clean_gc = #{
+        "has_inf": false,
+        "has_nan": false,
+        "has_zero": false
+    }
+
+    // 3 consecutive failures: 65536 -> 32768 -> 16384 -> 8192
+    for _i in 0..3 {
+        st = ls_update_scale(st, bad_gc)
+    }
+    check("T14 triple backoff", close(st["scale"], 8192.0, 1.0e-10))
+
+    // 2 clean steps (interval=2) -> grow back: 8192 -> 16384
+    for _i in 0..2 {
+        st = ls_update_scale(st, clean_gc)
+    }
+    check("T14 recovery after failures", close(st["scale"], 16384.0, 1.0e-10))
+
+    // 2 more clean steps -> 32768
+    for _i in 0..2 {
+        st = ls_update_scale(st, clean_gc)
+    }
+    check("T14 continued recovery", close(st["scale"], 32768.0, 1.0e-10))
+}
+
+// ── T15: ls_step full pipeline ─────────────────────────────────────
+fn test_ls_step_pipeline() {
+    let st = ls_init_state(1024.0, 2.0, 0.5, 1)
+    let loss = 0.5
+    let grads = [0.1, 0.2, 0.3]
+
+    let result = ls_step(st, loss, grads)
+    check("T15 scaled_loss correct", close(result["scaled_loss"], 512.0, 1.0e-10))
+    check("T15 skip false", result["skip_step"] == false)
+    // growth_interval=1, so scale should have grown
+    check("T15 scale grew", close(result["new_state"]["scale"], 2048.0, 1.0e-10))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Main
+// ═══════════════════════════════════════════════════════════════════
+test_normal_grads_scale_grows()
+test_inf_grads_shrink()
+test_nan_grads_shrink()
+test_growth_interval_respected()
+test_scale_one_identity()
+test_scale_very_large()
+test_round_trip()
+test_empty_grads()
+test_scale_loss_exact()
+test_ast_detect_unscaled()
+test_ast_detect_already_scaled()
+test_ast_rewrite()
+test_zero_grads_still_grow()
+test_multi_cycle_recovery()
+test_ls_step_pipeline()
+
+println("")
+println("═══════════════════════════════════════")
+println("  loss_scaling ROI #104 test results")
+println("  PASS: " + to_string(pass_count))
+println("  FAIL: " + to_string(fail_count))
+println("═══════════════════════════════════════")
+
+if fail_count > 0 {
+    println("SOME TESTS FAILED")
+    exit(1)
+}
+println("ALL TESTS PASSED")

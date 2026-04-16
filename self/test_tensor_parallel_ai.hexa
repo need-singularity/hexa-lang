@@ -1,0 +1,233 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_tensor_parallel_ai.hexa — Tests for ai_native/tensor_parallel.hexa
+//
+//  Run: ./hexa self/test_tensor_parallel_ai.hexa
+//
+//  ROI #112 — AI-native 1D Tensor Parallelism
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/tensor_parallel.hexa"
+
+let mut TESTS_PASSED = 0
+let mut TESTS_FAILED = 0
+
+fn tp_ai_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn check(name, cond) {
+    if cond {
+        TESTS_PASSED = TESTS_PASSED + 1
+        println("[PASS] " + name)
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name)
+    }
+}
+
+fn check_near(name, got, expected, tol) {
+    let d = tp_ai_abs(got - expected)
+    if d < tol {
+        TESTS_PASSED = TESTS_PASSED + 1
+        println("[PASS] " + name)
+    } else {
+        TESTS_FAILED = TESTS_FAILED + 1
+        println("[FAIL] " + name + " got=" + str(got) + " expected=" + str(expected) + " diff=" + str(d))
+    }
+}
+
+// flat matrix near-equal
+fn mat_near(a, b, n, tol) {
+    for i in 0..n {
+        let d = tp_ai_abs(a[i] - b[i])
+        if d > tol { return false }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 1 — column_split + unsplit = original
+//
+//  W = [[1,2,3,4],[5,6,7,8]]  (2x4), split into 2 parts
+//  Each part is [2x2]. Concat back must equal W.
+// ═══════════════════════════════════════════════════════════════════
+fn test_column_split_roundtrip() {
+    println("[test] 1. column_split + unsplit = original")
+    let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+    let rows = 2
+    let cols = 4
+    let num_parts = 2
+    let shards = tp_column_split(w, rows, cols, num_parts)
+
+    // shard 0 should be [[1,2],[5,6]]
+    check_near("shard0[0]=1", shards[0][0], 1.0, 1e-9)
+    check_near("shard0[1]=2", shards[0][1], 2.0, 1e-9)
+    check_near("shard0[2]=5", shards[0][2], 5.0, 1e-9)
+    check_near("shard0[3]=6", shards[0][3], 6.0, 1e-9)
+
+    // shard 1 should be [[3,4],[7,8]]
+    check_near("shard1[0]=3", shards[1][0], 3.0, 1e-9)
+    check_near("shard1[1]=4", shards[1][1], 4.0, 1e-9)
+    check_near("shard1[2]=7", shards[1][2], 7.0, 1e-9)
+    check_near("shard1[3]=8", shards[1][3], 8.0, 1e-9)
+
+    // Round-trip: unsplit must recover original
+    let cpr = cols / num_parts
+    let recovered = tp_column_unsplit(shards, rows, cpr, num_parts)
+    check("column_split roundtrip", mat_near(w, recovered, rows * cols, 1e-9))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 2 — row_parallel_forward matches sequential matmul
+//
+//  X = [[1,2,3,4]]  (1x4)
+//  W = [[1,0],[0,1],[1,0],[0,1]]  (4x2)
+//  Sequential: X @ W = [[1*1+2*0+3*1+4*0, 1*0+2*1+3*0+4*1]] = [[4, 6]]
+//
+//  2-worker row split:
+//    X_0 = [[1,2]], W_0 = [[1,0],[0,1]]  -> X_0 @ W_0 = [[1, 2]]
+//    X_1 = [[3,4]], W_1 = [[1,0],[0,1]]  -> X_1 @ W_1 = [[3, 4]]
+//    allreduce: [[4, 6]]
+// ═══════════════════════════════════════════════════════════════════
+fn test_row_parallel_forward() {
+    println("[test] 2. row_parallel_forward matches sequential matmul")
+    let x = [1.0, 2.0, 3.0, 4.0]
+    let w = [1.0, 0.0, 0.0, 1.0, 1.0, 0.0, 0.0, 1.0]
+
+    // Split input and weight by rows (contraction dim = 4, split to 2)
+    let x_parts = tp_row_split(x, 1, 4, 2)   // [[1,2], [3,4]] — but these are 1x2 each
+    let w_parts = tp_row_split(w, 4, 2, 2)    // [[[1,0],[0,1]], [[1,0],[0,1]]]
+
+    let result = tp_row_parallel_forward(x_parts, w_parts, 2, 2)
+    check_near("row_parallel Y[0]=4", result[0], 4.0, 1e-9)
+    check_near("row_parallel Y[1]=6", result[1], 6.0, 1e-9)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 3 — memory scales as 1/N
+//
+//  For a 1B param model with 4 workers, each gets 250M.
+// ═══════════════════════════════════════════════════════════════════
+fn test_memory_scaling() {
+    println("[test] 3. memory_per_worker scales as 1/N")
+    let total = 1000000000
+    check("1 worker = total",   tp_memory_per_worker(total, 1) == total)
+    check("2 workers = half",   tp_memory_per_worker(total, 2) == 500000000)
+    check("4 workers = quarter", tp_memory_per_worker(total, 4) == 250000000)
+    check("8 workers = eighth", tp_memory_per_worker(total, 8) == 125000000)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 4 — single worker = no split
+//
+//  With num_parts=1, column_split should return [original].
+// ═══════════════════════════════════════════════════════════════════
+fn test_single_worker_identity() {
+    println("[test] 4. single worker = no split (identity)")
+    let w = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let rows = 2
+    let cols = 3
+    let shards = tp_column_split(w, rows, cols, 1)
+    check("single shard count", len(shards) == 1)
+    check("single shard = original", mat_near(w, shards[0], rows * cols, 1e-9))
+
+    // Row split too
+    let row_shards = tp_row_split(w, rows, cols, 1)
+    check("single row shard count", len(row_shards) == 1)
+    check("single row shard = original", mat_near(w, row_shards[0], rows * cols, 1e-9))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 5 — 2x2 matrix, 2-worker split correctness
+//
+//  W = [[1,2],[3,4]]  (2x2)
+//  Column split into 2 parts of [2x1] each:
+//    shard0 = [[1],[3]], shard1 = [[2],[4]]
+//
+//  X = [[1,0]]  (1x2)
+//  Column parallel forward:
+//    Y_0 = X @ shard0 = [[1*1+0*3]] = [[1]]
+//    Y_1 = X @ shard1 = [[1*2+0*4]] = [[2]]
+//
+//  Full result = [1, 2] which equals X @ W = [[1, 2]].
+// ═══════════════════════════════════════════════════════════════════
+fn test_2x2_split_correctness() {
+    println("[test] 5. 2x2 matrix 2-worker split correctness")
+    let w = [1.0, 2.0, 3.0, 4.0]
+    let rows = 2
+    let cols = 2
+    let shards = tp_column_split(w, rows, cols, 2)
+
+    // Verify shard contents
+    check_near("2x2 shard0[0]=1", shards[0][0], 1.0, 1e-9)
+    check_near("2x2 shard0[1]=3", shards[0][1], 3.0, 1e-9)
+    check_near("2x2 shard1[0]=2", shards[1][0], 2.0, 1e-9)
+    check_near("2x2 shard1[1]=4", shards[1][1], 4.0, 1e-9)
+
+    // Column parallel forward: X = [1, 0] (1x2)
+    let x = [1.0, 0.0]
+    let y_parts = tp_column_parallel_forward(x, shards, rows, 1)
+    check_near("2x2 Y_0[0]=1", y_parts[0][0], 1.0, 1e-9)
+    check_near("2x2 Y_1[0]=2", y_parts[1][0], 2.0, 1e-9)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 6 — allreduce correctness
+// ═══════════════════════════════════════════════════════════════════
+fn test_allreduce() {
+    println("[test] 6. allreduce sum correctness")
+    let p0 = [1.0, 2.0, 3.0]
+    let p1 = [4.0, 5.0, 6.0]
+    let p2 = [7.0, 8.0, 9.0]
+    let result = tp_allreduce([p0, p1, p2])
+    check_near("allreduce[0]=12", result[0], 12.0, 1e-9)
+    check_near("allreduce[1]=15", result[1], 15.0, 1e-9)
+    check_near("allreduce[2]=18", result[2], 18.0, 1e-9)
+
+    // Single partial = identity
+    let single = tp_allreduce([[10.0, 20.0]])
+    check_near("allreduce single[0]=10", single[0], 10.0, 1e-9)
+    check_near("allreduce single[1]=20", single[1], 20.0, 1e-9)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Test 7 — AST detect + rewrite
+// ═══════════════════════════════════════════════════════════════════
+fn test_ast_detect_rewrite() {
+    println("[test] 7. AST detect_large_linear + rewrite_tensor_parallel")
+
+    let small_prog = [tp_stmt_linear(100), tp_stmt_other()]
+    let large_prog = [tp_stmt_linear(100000), tp_stmt_other()]
+
+    check("detect small < 1000 = false", detect_large_linear(small_prog, 1000) == false)
+    check("detect large > 1000 = true",  detect_large_linear(large_prog, 1000) == true)
+
+    // Rewrite: large_linear -> tp_linear with 4 workers
+    let rewritten = rewrite_tensor_parallel(large_prog, 4)
+    check("rewrite[0].kind = tp_linear", rewritten[0].kind == "tp_linear")
+    check("rewrite[0].num_workers = 4",  rewritten[0].num_workers == 4)
+    check("rewrite[0].params preserved", rewritten[0].params == 100000)
+    check("rewrite[1] unchanged",        rewritten[1].kind == "other")
+
+    // Rewrite on empty prog
+    let empty_rewrite = rewrite_tensor_parallel([], 2)
+    check("rewrite empty = empty", len(empty_rewrite) == 0)
+}
+
+// ── run all ────────────────────────────────────────────────────────
+test_column_split_roundtrip()
+test_row_parallel_forward()
+test_memory_scaling()
+test_single_worker_identity()
+test_2x2_split_correctness()
+test_allreduce()
+test_ast_detect_rewrite()
+
+println("")
+println("=== tensor_parallel_ai tests: " + str(TESTS_PASSED) + " passed, " + str(TESTS_FAILED) + " failed ===")
+if TESTS_FAILED > 0 {
+    println("SOME TESTS FAILED")
+} else {
+    println("ALL TESTS PASSED")
+}

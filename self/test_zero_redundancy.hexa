@@ -1,0 +1,267 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_zero_redundancy.hexa — tests for ai_native/zero_redundancy.hexa
+//
+//  5+ tests covering:
+//    T1: partition + gather roundtrip
+//    T2: scatter_reduce correctness
+//    T3: memory estimate monotonically decreases with workers
+//    T4: level 1 vs 2 vs 3 memory comparison
+//    T5: edge — 1 worker = no partitioning
+//    T6: simulate_step produces updated params
+//    T7: AST detect + rewrite
+// ═══════════════════════════════════════════════════════════════════
+
+let mut zr_pass = 0
+let mut zr_fail = 0
+
+fn zr_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn zr_assert(tag, cond) {
+    if cond {
+        zr_pass = zr_pass + 1
+    }
+    if !cond {
+        println("  FAIL: " + tag)
+        zr_fail = zr_fail + 1
+    }
+}
+
+fn zr_assert_eq_f(tag, a, b, tol) {
+    let diff = zr_fabs(a - b)
+    if diff <= tol {
+        zr_pass = zr_pass + 1
+    }
+    if diff > tol {
+        println("  FAIL: " + tag + " got " + str(a) + " expected " + str(b))
+        zr_fail = zr_fail + 1
+    }
+}
+
+// ── T1: partition + gather roundtrip ──────────────────────────────
+
+fn test_partition_gather_roundtrip() {
+    println("[T1] partition + gather roundtrip")
+    let data = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+
+    // 2 workers
+    let parts2 = zero_partition(data, 2)
+    zr_assert("parts2 len", len(parts2) == 2)
+    zr_assert("parts2[0] len", len(parts2[0]) == 4)
+    zr_assert("parts2[1] len", len(parts2[1]) == 4)
+    let rebuilt2 = zero_gather(parts2)
+    zr_assert("rebuilt2 len", len(rebuilt2) == 8)
+    for i in 0..8 {
+        zr_assert_eq_f("roundtrip2[" + str(i) + "]", rebuilt2[i], data[i], 1.0e-12)
+    }
+
+    // 3 workers (uneven split: 8/3 = 2,2,2 + remainder)
+    let parts3 = zero_partition(data, 3)
+    zr_assert("parts3 len", len(parts3) == 3)
+    let rebuilt3 = zero_gather(parts3)
+    zr_assert("rebuilt3 len", len(rebuilt3) == 8)
+    for i in 0..8 {
+        zr_assert_eq_f("roundtrip3[" + str(i) + "]", rebuilt3[i], data[i], 1.0e-12)
+    }
+
+    // 4 workers
+    let parts4 = zero_partition(data, 4)
+    zr_assert("parts4 len", len(parts4) == 4)
+    let rebuilt4 = zero_gather(parts4)
+    for i in 0..8 {
+        zr_assert_eq_f("roundtrip4[" + str(i) + "]", rebuilt4[i], data[i], 1.0e-12)
+    }
+}
+
+// ── T2: scatter_reduce correctness ────────────────────────────────
+
+fn test_scatter_reduce() {
+    println("[T2] scatter_reduce correctness")
+    // 2 workers, each with identical gradients [1,2,3,4]
+    let g1 = [1.0, 2.0, 3.0, 4.0]
+    let g2 = [1.0, 2.0, 3.0, 4.0]
+    let grads = [g1, g2]
+
+    let shards = zero_scatter_reduce(grads, 2)
+    zr_assert("shards len", len(shards) == 2)
+
+    // After summing 2 identical copies: [2,4,6,8]
+    // Partitioned into 2 shards: [2,4] and [6,8]
+    let full = zero_gather(shards)
+    zr_assert("full len", len(full) == 4)
+    zr_assert_eq_f("sum[0]", full[0], 2.0, 1.0e-12)
+    zr_assert_eq_f("sum[1]", full[1], 4.0, 1.0e-12)
+    zr_assert_eq_f("sum[2]", full[2], 6.0, 1.0e-12)
+    zr_assert_eq_f("sum[3]", full[3], 8.0, 1.0e-12)
+
+    // Different gradients
+    let ga = [1.0, 0.0, 3.0, 0.0]
+    let gb = [0.0, 2.0, 0.0, 4.0]
+    let shards2 = zero_scatter_reduce([ga, gb], 2)
+    let full2 = zero_gather(shards2)
+    zr_assert_eq_f("mixed[0]", full2[0], 1.0, 1.0e-12)
+    zr_assert_eq_f("mixed[1]", full2[1], 2.0, 1.0e-12)
+    zr_assert_eq_f("mixed[2]", full2[2], 3.0, 1.0e-12)
+    zr_assert_eq_f("mixed[3]", full2[3], 4.0, 1.0e-12)
+}
+
+// ── T3: memory monotonically decreases with more workers ──────────
+
+fn test_memory_monotonic() {
+    println("[T3] memory monotonically decreases with workers")
+    let p = 1200
+
+    for level in 1..4 {
+        let m2 = zero_memory_per_worker(p, 2, level)
+        let m4 = zero_memory_per_worker(p, 4, level)
+        let m8 = zero_memory_per_worker(p, 8, level)
+        let tag = "L" + str(level)
+        zr_assert(tag + " m2>m4", m2["total"] >= m4["total"])
+        zr_assert(tag + " m4>m8", m4["total"] >= m8["total"])
+    }
+}
+
+// ── T4: level 1 vs 2 vs 3 memory comparison ──────────────────────
+
+fn test_level_comparison() {
+    println("[T4] level 1 vs 2 vs 3 memory comparison")
+    let p = 1200
+    let nw = 4
+
+    let m1 = zero_memory_per_worker(p, nw, 1)
+    let m2 = zero_memory_per_worker(p, nw, 2)
+    let m3 = zero_memory_per_worker(p, nw, 3)
+
+    // Level 1: 2P + 2P/N = 2*1200 + 2*300 = 3000
+    zr_assert("L1 total", m1["total"] == 3000)
+    // Level 2: P + 3P/N = 1200 + 900 = 2100
+    zr_assert("L2 total", m2["total"] == 2100)
+    // Level 3: 4P/N = 4*300 = 1200
+    zr_assert("L3 total", m3["total"] == 1200)
+
+    // Monotonic: L1 >= L2 >= L3
+    zr_assert("L1>=L2", m1["total"] >= m2["total"])
+    zr_assert("L2>=L3", m2["total"] >= m3["total"])
+
+    // L3 is exactly 4P/N
+    zr_assert("L3=4P/N", m3["total"] == 4 * (p / nw))
+
+    // Baseline without ZeRO would be 4P = 4800
+    let baseline = 4 * p
+    zr_assert("L1<baseline", m1["total"] < baseline)
+    zr_assert("L3<L1", m3["total"] < m1["total"])
+}
+
+// ── T5: edge — 1 worker = no partitioning ─────────────────────────
+
+fn test_single_worker() {
+    println("[T5] 1 worker = no partitioning")
+    let data = [10.0, 20.0, 30.0]
+
+    // Partition with 1 worker: single chunk = original
+    let parts = zero_partition(data, 1)
+    zr_assert("1 partition", len(parts) == 1)
+    zr_assert("chunk len", len(parts[0]) == 3)
+    for i in 0..3 {
+        zr_assert_eq_f("1w[" + str(i) + "]", parts[0][i], data[i], 1.0e-12)
+    }
+
+    // Gather is identity
+    let rebuilt = zero_gather(parts)
+    for i in 0..3 {
+        zr_assert_eq_f("1w gather[" + str(i) + "]", rebuilt[i], data[i], 1.0e-12)
+    }
+
+    // allgather == gather
+    let ag = zero_allgather(parts)
+    for i in 0..3 {
+        zr_assert_eq_f("1w allgather[" + str(i) + "]", ag[i], data[i], 1.0e-12)
+    }
+
+    // Memory: 1 worker, level 3 = 4P (no savings)
+    let mem = zero_memory_per_worker(300, 1, 3)
+    zr_assert("1w mem L3", mem["total"] == 1200)
+}
+
+// ── T6: simulate_step produces updated params ─────────────────────
+
+fn test_simulate_step() {
+    println("[T6] simulate_step produces updated params")
+    let params = [1.0, 2.0, 3.0, 4.0]
+    let grads = [0.1, 0.2, 0.3, 0.4]
+
+    for level in 1..4 {
+        let result = zero_simulate_step(params, grads, 2, level)
+        let new_p = result["params"]
+        let tag = "L" + str(level)
+
+        // Params should be updated (different from original)
+        zr_assert(tag + " len", len(new_p) == 4)
+
+        // With positive gradients and positive lr, params should decrease
+        let mut any_changed = false
+        for i in 0..4 {
+            if zr_fabs(new_p[i] - params[i]) > 1.0e-12 {
+                any_changed = true
+            }
+        }
+        zr_assert(tag + " changed", any_changed)
+
+        // Memory info should be present
+        let mem = result["memory_per_worker"]
+        zr_assert(tag + " mem>0", mem["total"] > 0)
+    }
+}
+
+// ── T7: AST detect + rewrite ──────────────────────────────────────
+
+fn test_ast_detect_rewrite() {
+    println("[T7] AST detect + rewrite")
+
+    // Build a program with a replicated optimizer
+    let s1 = zero_stmt_replicated("i", "weights", 4)
+    let s2 = zero_stmt_other()
+    let prog = [s1, s2]
+
+    zr_assert("detect repl", detect_replicated_optimizer(prog))
+
+    // Rewrite to partitioned
+    let rewritten = rewrite_zero(prog, 8, 3)
+    zr_assert("rewritten len", len(rewritten) == 2)
+    zr_assert("rewritten[0] kind", rewritten[0].kind == "partitioned_optimizer")
+    zr_assert("rewritten[0] count", rewritten[0].count == 8)
+    zr_assert("rewritten[1] kind", rewritten[1].kind == "other")
+
+    // No replicated optimizer -> no rewrite
+    let prog2 = [zero_stmt_other()]
+    zr_assert("no detect", !detect_replicated_optimizer(prog2))
+    let rewritten2 = rewrite_zero(prog2, 4, 2)
+    zr_assert("no rewrite len", len(rewritten2) == 1)
+    zr_assert("no rewrite kind", rewritten2[0].kind == "other")
+
+    // Single replica (count=1) should not be detected
+    let s_single = zero_stmt_replicated("i", "w", 1)
+    zr_assert("single not detected", !detect_replicated_optimizer([s_single]))
+}
+
+// ── run all ───────────────────────────────────────────────────────
+
+println("=== test_zero_redundancy ===")
+test_partition_gather_roundtrip()
+test_scatter_reduce()
+test_memory_monotonic()
+test_level_comparison()
+test_single_worker()
+test_simulate_step()
+test_ast_detect_rewrite()
+
+println("")
+println("[zero_redundancy] " + str(zr_pass) + " passed, " + str(zr_fail) + " failed")
+if zr_fail == 0 {
+    println("ALL PASS")
+}
+if zr_fail > 0 {
+    println("SOME TESTS FAILED")
+}

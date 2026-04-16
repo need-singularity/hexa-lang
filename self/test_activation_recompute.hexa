@@ -1,0 +1,183 @@
+// test_activation_recompute.hexa — tests for ROI #110
+//
+// Run: ./hexa self/test_activation_recompute.hexa
+// Covers: ar_layer_cost, ar_optimal_schedule, ar_total_flops,
+//         ar_total_memory, ar_savings_ratio, ar_apply_schedule,
+//         detect_full_activation_store, rewrite_selective_recompute
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " — expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_true(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn ar110_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn check_close(name, actual, expected, tol) {
+    if ar110_fabs(actual - expected) < tol {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " — expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+println("=== Activation Recompute Tests (ROI #110) ===")
+println("")
+
+// ── T1: ar_layer_cost basic ───────────────────────────────────
+println("--- T1: ar_layer_cost ---")
+
+let c1 = ar_layer_cost(1024.0, 512.0, "matmul")
+// flops = 2 * 1024 * 512 = 1048576
+check_close("T1a matmul flops", c1["flops"], 1048576.0, 0.1)
+// memory = 512 * 4 = 2048
+check_close("T1b matmul memory", c1["memory_bytes"], 2048.0, 0.1)
+
+let c2 = ar_layer_cost(256.0, 256.0, "norm")
+// flops = 5 * 256 = 1280
+check_close("T1c norm flops", c2["flops"], 1280.0, 0.1)
+// memory = 256 * 4 = 1024
+check_close("T1d norm memory", c2["memory_bytes"], 1024.0, 0.1)
+
+let c3 = ar_layer_cost(512.0, 512.0, "activation")
+// flops = 1 * 512 = 512
+check_close("T1e activation flops", c3["flops"], 512.0, 0.1)
+
+// ── T2: ar_optimal_schedule — all fits in budget ──────────────
+println("")
+println("--- T2: ar_optimal_schedule ---")
+
+let layers2 = [
+    #{"input_size": 100.0, "output_size": 50.0, "op_type": "matmul"},
+    #{"input_size": 50.0, "output_size": 50.0, "op_type": "activation"}
+]
+// total memory = 50*4 + 50*4 = 400
+let sched2 = ar_optimal_schedule(layers2, 500.0)
+check("T2a all stored (budget > total)", sched2[0], false)
+check("T2b all stored (budget > total)", sched2[1], false)
+
+// ── T3: ar_optimal_schedule — must recompute some ─────────────
+println("")
+println("--- T3: schedule under tight budget ---")
+
+let layers3 = [
+    #{"input_size": 100.0, "output_size": 100.0, "op_type": "matmul"},
+    #{"input_size": 100.0, "output_size": 100.0, "op_type": "activation"},
+    #{"input_size": 100.0, "output_size": 100.0, "op_type": "norm"}
+]
+// Each layer: memory = 100*4 = 400.  Total = 1200.
+// matmul flops = 2*100*100=20000, ratio = 400/20000 = 0.02
+// activation flops = 1*100=100, ratio = 400/100 = 4.0  (best!)
+// norm flops = 5*100=500, ratio = 400/500 = 0.8
+// Budget = 900 -> need to free 300 -> recompute activation first (frees 400)
+let sched3 = ar_optimal_schedule(layers3, 900.0)
+check("T3a matmul stored", sched3[0], false)
+check("T3b activation recomputed", sched3[1], true)
+check("T3c norm stored", sched3[2], false)
+
+// ── T4: ar_total_flops / ar_total_memory / ar_savings_ratio ───
+println("")
+println("--- T4: totals and ratio ---")
+
+let extra_flops = ar_total_flops(layers3, sched3)
+// Only activation layer recomputed: flops = 1*100 = 100
+check_close("T4a extra flops", extra_flops, 100.0, 0.1)
+
+let stored_mem = ar_total_memory(layers3, sched3)
+// matmul + norm stored: 400 + 400 = 800
+check_close("T4b stored memory", stored_mem, 800.0, 0.1)
+
+let ratio = ar_savings_ratio(layers3, sched3)
+// saved = 1200 - 800 = 400, extra flops = 100, ratio = 4.0
+check_close("T4c savings ratio", ratio, 4.0, 0.01)
+
+// ── T5: ar_apply_schedule ─────────────────────────────────────
+println("")
+println("--- T5: ar_apply_schedule ---")
+
+let acts = [10.0, 20.0, 30.0]
+let mask = [false, true, false]
+let applied = ar_apply_schedule(acts, mask)
+check_close("T5a stored kept", applied[0], 10.0, 0.001)
+check_close("T5b recomputed zeroed", applied[1], 0.0, 0.001)
+check_close("T5c stored kept", applied[2], 30.0, 0.001)
+
+// ── T6: detect_full_activation_store ──────────────────────────
+println("")
+println("--- T6: detect_full_activation_store ---")
+
+let prog_full = [
+    ar_stmt_store("layer0", 400.0, 20000.0),
+    ar_stmt_store("layer1", 400.0, 100.0),
+    ar_stmt_store("layer2", 400.0, 500.0)
+]
+check_true("T6a full store detected", detect_full_activation_store(prog_full))
+
+let prog_mixed = [
+    ar_stmt_store("layer0", 400.0, 20000.0),
+    ar_stmt_recompute("layer1", 400.0, 100.0),
+    ar_stmt_store("layer2", 400.0, 500.0)
+]
+check_true("T6b mixed not detected", !detect_full_activation_store(prog_mixed))
+
+let prog_empty = []
+check_true("T6c empty not detected", !detect_full_activation_store(prog_empty))
+
+let prog_other = [ar_stmt_other("x")]
+check_true("T6d other-only not detected", !detect_full_activation_store(prog_other))
+
+// ── T7: rewrite_selective_recompute ───────────────────────────
+println("")
+println("--- T7: rewrite_selective_recompute ---")
+
+// Same 3-layer program, budget 900 -> should recompute layer1 (activation, best ratio)
+let rewritten = rewrite_selective_recompute(prog_full, 900.0)
+check("T7a layer0 stays store", rewritten[0].kind, "store_activation")
+check("T7b layer1 rewritten", rewritten[1].kind, "recompute_activation")
+check("T7c layer2 stays store", rewritten[2].kind, "store_activation")
+
+// Budget large enough: no rewrite
+let rewritten2 = rewrite_selective_recompute(prog_full, 2000.0)
+check("T7d no rewrite needed", rewritten2[0].kind, "store_activation")
+check("T7e no rewrite needed", rewritten2[1].kind, "store_activation")
+check("T7f no rewrite needed", rewritten2[2].kind, "store_activation")
+
+// ── T8: empty layers edge case ────────────────────────────────
+println("")
+println("--- T8: empty layers ---")
+
+let sched_empty = ar_optimal_schedule([], 100.0)
+check("T8a empty schedule", len(sched_empty), 0)
+check_close("T8b empty flops", ar_total_flops([], []), 0.0, 0.001)
+check_close("T8c empty memory", ar_total_memory([], []), 0.0, 0.001)
+
+// ── summary ───────────────────────────────────────────────────
+println("")
+println("=== Results: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed ===")
+if fail_count > 0 {
+    println("SOME TESTS FAILED")
+} else {
+    println("ALL TESTS PASSED")
+}
