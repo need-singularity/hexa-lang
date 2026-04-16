@@ -1,0 +1,122 @@
+// ═══════════════════════════════════════════════════════════════
+//  bench/grad_checkpoint.hexa — Gradient checkpointing memory +
+//  throughput measurement.
+//
+//  Config: d=512, batch=4, layers=12, seg_size=4
+//
+//  Metrics:
+//    plain_peak  = sum of all activation lengths (no ckpt)
+//    ckpt_peak   = sum of stored-boundary activation lengths
+//    plain_ms    = wall-clock for 3 forward+backward steps (no ckpt)
+//    ckpt_ms    = wall-clock for 3 forward+backward steps (seg=4)
+//    savings_pct = 1 - ckpt_peak/plain_peak
+//    overhead_pct= ckpt_ms/plain_ms - 1
+//
+//  Expected: 66%+ memory savings; ~25-30% compute overhead.
+//  Batch-scaling: freed memory enables 2x-3x larger batch.
+// ═══════════════════════════════════════════════════════════════
+
+import "self/ml/grad_checkpoint.hexa"
+
+let D = 512
+let BATCH = 4
+let LAYERS = 12
+let SEG = 4
+let ITERS = 3
+
+fn elapsed_since(s0) {
+    let s1 = clock()
+    return s1 - s0
+}
+
+fn run_plain(model, inputs) {
+    let mut last_out = []
+    let mut sum_peak = 0
+    let mut i = 0
+    while i < len(inputs) {
+        let acts = gc_forward_plain(model, inputs[i])
+        sum_peak = sum_peak + gc_peak_activations_plain(acts)
+        let grad_out = acts[len(acts) - 1]
+        let bw = gc_backward_plain(model, acts, grad_out)
+        last_out = bw[0]
+        i = i + 1
+    }
+    return [last_out, sum_peak]
+}
+
+fn run_ckpt(model, inputs) {
+    let mut last_out = []
+    let mut sum_peak = 0
+    let mut i = 0
+    while i < len(inputs) {
+        let fwd = gc_forward(model, inputs[i])
+        sum_peak = sum_peak + gc_peak_activations(fwd)
+        let bw = gc_backward(model, fwd, fwd.final_out)
+        last_out = bw[0]
+        i = i + 1
+    }
+    return [last_out, sum_peak]
+}
+
+// Build model + inputs
+println("[bench grad_checkpoint] d=" + str(D) + " batch=" + str(BATCH)
+    + " layers=" + str(LAYERS) + " seg=" + str(SEG))
+
+let model_plain = gc_make_random_model(LAYERS, D, LAYERS, 2024) // seg >= layers → 1 seg = plain
+let model_ckpt  = gc_make_random_model(LAYERS, D, SEG, 2024)
+
+let mut inputs = []
+let mut i = 0
+while i < BATCH {
+    inputs = inputs + [gc_make_input(D, 100 + i)]
+    i = i + 1
+}
+
+// ── Memory (one forward, exact) ─────────────────────────────
+let acts = gc_forward_plain(model_plain, inputs[0])
+let fwd  = gc_forward(model_ckpt, inputs[0])
+let peak_plain = gc_peak_activations_plain(acts)
+let peak_ckpt  = gc_peak_activations(fwd)
+let savings = gc_savings_ratio(peak_ckpt, peak_plain)
+println("memory: plain_peak=" + str(peak_plain) + " ckpt_peak=" + str(peak_ckpt)
+    + " savings=" + str(to_int(savings * 100.0)) + "%")
+
+// ── Throughput (warmup + 3 iters) ──────────────────────────
+let _ = run_plain(model_plain, inputs)    // warmup
+let t0_plain = clock()
+let mut iter = 0
+while iter < ITERS {
+    let _ = run_plain(model_plain, inputs)
+    iter = iter + 1
+}
+let plain_ms = elapsed_since(t0_plain)
+
+let _ = run_ckpt(model_ckpt, inputs)      // warmup
+let t0_ckpt = clock()
+iter = 0
+while iter < ITERS {
+    let _ = run_ckpt(model_ckpt, inputs)
+    iter = iter + 1
+}
+let ckpt_ms = elapsed_since(t0_ckpt)
+
+let overhead = ckpt_ms / plain_ms - 1.0
+let overhead_pct = to_int(overhead * 100.0)
+println("throughput (3 iters × batch=" + str(BATCH) + "):")
+println("  plain_ms=" + str(plain_ms) + "  ckpt_ms=" + str(ckpt_ms)
+    + "  overhead=" + str(overhead_pct) + "%")
+
+// ── Batch-scaling (how much larger a batch fits at same memory) ──
+// plain_peak = LAYERS*D + D  = (12+1)*512 = 6656 per sample
+// ckpt_peak  = (LAYERS/SEG+1)*D = (12/4+1)*512 = 2048 per sample
+// batch_scale = plain_peak / ckpt_peak ≈ 3.25x
+let per_sample_plain = peak_plain
+let per_sample_ckpt  = peak_ckpt
+let batch_scale = to_float(per_sample_plain) / to_float(per_sample_ckpt)
+println("batch-scale (same mem budget): " + str(batch_scale) + "x larger batch possible")
+
+let projected_throughput_gain = batch_scale * (1.0 / (1.0 + overhead)) - 1.0
+let gain_pct = to_int(projected_throughput_gain * 100.0)
+println("projected throughput gain @ 2x batch: +"
+    + str(to_int((2.0 * (1.0 / (1.0 + overhead)) - 1.0) * 100.0)) + "%")
+println("projected throughput gain @ scaled batch: +" + str(gain_pct) + "%")

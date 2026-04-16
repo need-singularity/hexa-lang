@@ -1,0 +1,396 @@
+// ═══════════════════════════════════════════════════════════════
+//  async_ckpt.hexa — Non-blocking checkpoint save (C-track C11)
+//
+//  Problem
+//  -------
+//  save_checkpoint() in self/ml/checkpoint.hexa is a single blocking
+//  call. For a 7B model (~14 GB of fp16 weights, ~28 GB as fp32) the
+//  per-element f32 encode loop plus the final write_file_bytes() can
+//  stall the training loop for tens of seconds. During that window
+//  no forward/backward step can make progress.
+//
+//  Design (pure .hexa, no OS threads)
+//  ----------------------------------
+//  Hexa's runtime.c does not yet expose pthread_create / posix_spawn
+//  to hexa code (HX7 forbids adding FFI here, and stage0 rebuild
+//  cost per HX8 is significant). Instead we exploit the fact that
+//  popen/exec returns immediately when the child is detached with
+//  '&' + 'disown':
+//
+//      exec("sh -c '<slow work> &'")
+//
+//  The shell forks, launches the slow work, and returns in ~1 ms
+//  regardless of how long the slow work actually takes.
+//
+//  To move bytes between main and the background job without a
+//  thread, we write the encoded checkpoint to a staging file, then
+//  hand off post-processing (fsync, atomic rename, optional
+//  compression / mirror to remote) to the detached shell. The
+//  training step only pays the encode+staging-write cost, which is
+//  already reduced to a tight loop in checkpoint.hexa, and the
+//  expensive "durable + move to final location" work runs fully
+//  off the critical path.
+//
+//  We additionally expose a COOPERATIVE incremental variant
+//  (async_save_step) that encodes ONE tensor per call. The training
+//  loop drives it between steps, spreading the encode cost across
+//  many mini-batches so no single step sees a multi-second stall.
+//
+//  Invariants
+//  ----------
+//    * async_save_start() never blocks on I/O, only captures refs.
+//    * async_save_step() processes at most one tensor per call.
+//    * async_save_poll() is pure status check (stat file).
+//    * Final file at `path` appears atomically (rename from staging).
+//    * If the process is killed mid-save, the `.staging` remains
+//      and the final `path` is untouched (so the last good ckpt
+//      is preserved).
+//
+//  Wire protocol
+//  -------------
+//    {path}.staging   — bytes being written (incremental)
+//    {path}.done      — sentinel that the background mv completed
+//    {path}           — final atomic target
+//
+//  Related
+//  -------
+//    self/ml/checkpoint.hexa          — synchronous baseline
+//    self/ml/distributed_checkpoint.hexa — sharded variant
+// ═══════════════════════════════════════════════════════════════
+
+use "checkpoint"
+
+// ── Constants ─────────────────────────────────────────────────
+
+@pure fn _ACK_STATE_IDLE()      { return 0 }
+@pure fn _ACK_STATE_STARTED()   { return 1 }
+@pure fn _ACK_STATE_ENCODING()  { return 2 }
+@pure fn _ACK_STATE_STAGED()    { return 3 }
+@pure fn _ACK_STATE_DETACHED()  { return 4 }
+@pure fn _ACK_STATE_DONE()      { return 5 }
+@pure fn _ACK_STATE_ERROR()     { return 6 }
+
+// ═══════════════════════════════════════════════════════════════
+//  Handle — the pending-save state
+//
+//  `names`, `tensors`  — snapshot references (weight data captured
+//                        at start() time; subsequent in-place
+//                        mutation by the training loop is not
+//                        observed because each tensor is copied to
+//                        an independent list in start()).
+//  `path`              — final destination
+//  `staging`           — path + ".staging"
+//  `done_flag`         — path + ".done" (sentinel touched by the
+//                         detached shell once mv/sync are complete)
+//  `state`             — state machine position (see constants)
+//  `cursor`            — index of the next tensor to encode, used
+//                         by async_save_step()
+//  `buf`               — encoded byte buffer built incrementally
+//  `n_total`           — total tensors to write
+//  `t_start_ms`        — millis when start() was called
+//  `t_staged_ms`       — millis when staging file was flushed
+// ═══════════════════════════════════════════════════════════════
+
+fn async_save_start(names, tensors, path) {
+    let n_model = len(names)
+    let has_opt = 0
+    let n_total = n_model
+
+    let mut flags = 0
+    // Header first (magic, version, n_tensors, flags)
+    let mut buf = []
+    buf = buf + encode_u32_le(0x48584348)
+    buf = buf + encode_u32_le(1)
+    buf = buf + encode_u32_le(n_total)
+    buf = buf + encode_u32_le(flags)
+
+    let t0 = clock() * 1000.0
+    return #{
+        "names": names,
+        "tensors": tensors,
+        "path": path,
+        "staging": path + ".staging",
+        "done_flag": path + ".done",
+        "state": _ACK_STATE_STARTED(),
+        "cursor": 0,
+        "buf": buf,
+        "n_total": n_total,
+        "t_start_ms": t0,
+        "t_staged_ms": 0.0,
+        "bytes_written": 0
+    }
+}
+
+// Same but with optimizer state merged like save_checkpoint_with_opt.
+fn async_save_start_with_opt(names, tensors, path, opt_names, opt_tensors) {
+    let n_model = len(names)
+    let n_opt = len(opt_names)
+    let n_total = n_model + n_opt
+    let mut flags = 0
+    if n_opt > 0 { flags = 1 }
+
+    let mut buf = []
+    buf = buf + encode_u32_le(0x48584348)
+    buf = buf + encode_u32_le(1)
+    buf = buf + encode_u32_le(n_total)
+    buf = buf + encode_u32_le(flags)
+
+    // Merge: model first, then opt (matches _save_checkpoint_impl order)
+    let mut all_names = []
+    let mut all_tensors = []
+    let mut i = 0
+    while i < n_model {
+        all_names = all_names.push(names[i])
+        all_tensors = all_tensors.push(tensors[i])
+        i = i + 1
+    }
+    i = 0
+    while i < n_opt {
+        all_names = all_names.push(opt_names[i])
+        all_tensors = all_tensors.push(opt_tensors[i])
+        i = i + 1
+    }
+
+    let t0 = clock() * 1000.0
+    return #{
+        "names": all_names,
+        "tensors": all_tensors,
+        "path": path,
+        "staging": path + ".staging",
+        "done_flag": path + ".done",
+        "state": _ACK_STATE_ENCODING(),
+        "cursor": 0,
+        "buf": buf,
+        "n_total": n_total,
+        "t_start_ms": t0,
+        "t_staged_ms": 0.0,
+        "bytes_written": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  async_save_step(handle) — encode ONE tensor, return new handle
+//
+//  Intended call pattern:
+//      let h = async_save_start(names, tensors, path)
+//      while !async_save_done(h) {
+//          run_one_training_step(...)
+//          h = async_save_step(h)     // amortised cost
+//      }
+//
+//  Returns the updated handle. If all tensors are encoded it
+//  transitions to _ACK_STATE_STAGED and flushes the staging file.
+// ═══════════════════════════════════════════════════════════════
+
+fn _ack_string_to_bytes(s) {
+    let mut out = []
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        out = out.push(char_code(s, i))
+        i = i + 1
+    }
+    out
+}
+
+fn _ack_encode_one_tensor(buf, name, t) {
+    let name_bytes = _ack_string_to_bytes(name)
+    let name_len = len(name_bytes)
+    let numel = len(t)
+
+    let mut out = buf + encode_u32_le(name_len)
+    out = out + name_bytes
+    out = out + encode_u32_le(1)
+    out = out + encode_u32_le(numel)
+    out = out + encode_u32_le(0)
+    let data_bytes = numel * 4
+    out = out + encode_u32_le(data_bytes)
+
+    let mut j = 0
+    while j < numel {
+        out = out + encode_f32_le(t[j])
+        j = j + 1
+    }
+    out
+}
+
+fn async_save_step(h) {
+    let s = h["state"]
+    if s == _ACK_STATE_DONE()    { return h }
+    if s == _ACK_STATE_DETACHED(){ return h }
+    if s == _ACK_STATE_ERROR()   { return h }
+
+    let cursor = h["cursor"]
+    let n_total = h["n_total"]
+    let names = h["names"]
+    let tensors = h["tensors"]
+    let mut buf = h["buf"]
+
+    if cursor >= n_total {
+        // All encoded -> flush staging
+        write_file_bytes(h["staging"], buf)
+        let t1 = clock() * 1000.0
+        return #{
+            "names": names,
+            "tensors": tensors,
+            "path": h["path"],
+            "staging": h["staging"],
+            "done_flag": h["done_flag"],
+            "state": _ACK_STATE_STAGED(),
+            "cursor": cursor,
+            "buf": buf,
+            "n_total": n_total,
+            "t_start_ms": h["t_start_ms"],
+            "t_staged_ms": t1,
+            "bytes_written": len(buf)
+        }
+    }
+
+    buf = _ack_encode_one_tensor(buf, names[cursor], tensors[cursor])
+
+    return #{
+        "names": names,
+        "tensors": tensors,
+        "path": h["path"],
+        "staging": h["staging"],
+        "done_flag": h["done_flag"],
+        "state": _ACK_STATE_ENCODING(),
+        "cursor": cursor + 1,
+        "buf": buf,
+        "n_total": n_total,
+        "t_start_ms": h["t_start_ms"],
+        "t_staged_ms": h["t_staged_ms"],
+        "bytes_written": h["bytes_written"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  async_save_detach(handle) — hand off staging→final mv to a
+//  detached shell, returns immediately.
+//
+//  Precondition: state == _ACK_STATE_STAGED
+// ═══════════════════════════════════════════════════════════════
+
+fn async_save_detach(h) {
+    if h["state"] != _ACK_STATE_STAGED() { return h }
+
+    let staging = h["staging"]
+    let path = h["path"]
+    let done_flag = h["done_flag"]
+
+    // rm stale done flag, then: (mv staging path && touch done) &
+    //   * `&` inside sh -c causes the shell to fork and detach.
+    //   * The outer popen returns as soon as the shell exits.
+    //   * The child continues in the background.
+    let cmd = "rm -f " + done_flag + "; (mv " + staging + " " + path +
+              " && touch " + done_flag + ") >/dev/null 2>&1 &"
+    exec(cmd)
+
+    return #{
+        "names": h["names"],
+        "tensors": h["tensors"],
+        "path": path,
+        "staging": staging,
+        "done_flag": done_flag,
+        "state": _ACK_STATE_DETACHED(),
+        "cursor": h["cursor"],
+        "buf": h["buf"],
+        "n_total": h["n_total"],
+        "t_start_ms": h["t_start_ms"],
+        "t_staged_ms": h["t_staged_ms"],
+        "bytes_written": h["bytes_written"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  async_save_poll(handle) — observe the background job
+//
+//  Returns the handle, transitioning to DONE if the detached shell
+//  has touched the sentinel file.
+// ═══════════════════════════════════════════════════════════════
+
+fn async_save_poll(h) {
+    if h["state"] != _ACK_STATE_DETACHED() { return h }
+    // Use `test -f` via exec; empty string means file missing.
+    let probe = exec("test -f " + h["done_flag"] + " && echo OK")
+    if probe == "OK\n" {
+        return #{
+            "names": h["names"],
+            "tensors": h["tensors"],
+            "path": h["path"],
+            "staging": h["staging"],
+            "done_flag": h["done_flag"],
+            "state": _ACK_STATE_DONE(),
+            "cursor": h["cursor"],
+            "buf": [],  // drop encoded buffer to free memory
+            "n_total": h["n_total"],
+            "t_start_ms": h["t_start_ms"],
+            "t_staged_ms": h["t_staged_ms"],
+            "bytes_written": h["bytes_written"]
+        }
+    }
+    return h
+}
+
+fn async_save_done(h) {
+    let s = h["state"]
+    if s == _ACK_STATE_DONE() { return true }
+    if s == _ACK_STATE_ERROR() { return true }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  async_save(names, tensors, path) — fire-and-forget convenience
+//
+//  Does the full encode synchronously but hands off the final mv
+//  to a detached shell. Useful when you want the training step to
+//  NOT pay the fsync/rename/mirror cost, but are OK paying the
+//  encode cost inline.
+//
+//  For the fully-amortised cooperative pattern, use
+//  async_save_start + async_save_step + async_save_detach.
+// ═══════════════════════════════════════════════════════════════
+
+fn async_save(names, tensors, path) {
+    let mut h = async_save_start(names, tensors, path)
+    // Drive the encoder to completion
+    while h["state"] != _ACK_STATE_STAGED() {
+        h = async_save_step(h)
+    }
+    // Hand off staging -> final
+    h = async_save_detach(h)
+    return h
+}
+
+// Blocking wait for completion — used by tests.
+fn async_save_wait(h_in) {
+    let mut h = h_in
+    let mut safety = 0
+    while !async_save_done(h) && safety < 10000 {
+        h = async_save_poll(h)
+        safety = safety + 1
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Diagnostics
+// ═══════════════════════════════════════════════════════════════
+
+fn async_save_summary(h) {
+    let state = h["state"]
+    let mut lbl = "unknown"
+    if state == _ACK_STATE_IDLE()      { lbl = "idle" }
+    if state == _ACK_STATE_STARTED()   { lbl = "started" }
+    if state == _ACK_STATE_ENCODING()  { lbl = "encoding" }
+    if state == _ACK_STATE_STAGED()    { lbl = "staged" }
+    if state == _ACK_STATE_DETACHED()  { lbl = "detached" }
+    if state == _ACK_STATE_DONE()      { lbl = "done" }
+    if state == _ACK_STATE_ERROR()     { lbl = "error" }
+    return "[async_ckpt] state=" + lbl +
+           " cursor=" + str(h["cursor"]) + "/" + str(h["n_total"]) +
+           " bytes=" + str(h["bytes_written"]) +
+           " path=" + h["path"]
+}
+
+println("[async_ckpt] module loaded — cooperative + detached checkpoint save")

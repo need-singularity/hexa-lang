@@ -1,0 +1,424 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/grad_checkpoint.hexa — Layer-level Gradient Checkpointing
+//
+//  Real activation drop + recompute on backward. Unlike
+//  `activation_checkpointing.hexa` (simulation/estimator) this
+//  module ACTUALLY executes layer forwards with real tensors,
+//  drops intermediate activations between segment boundaries, and
+//  re-runs the segment forward during backward to recover them.
+//
+//  Memory model:
+//    Baseline  : keep N activations (one per layer) → peak ≈ N*d
+//    Checkpoint: keep S boundaries + 1 active segment → peak ≈ (S+1)*d
+//      with S = ceil(N/seg_size) → 50% savings at seg_size=2, more at 4/6
+//
+//  Design:
+//    Each "layer" is [W, b, in_dim, out_dim] — dense Y = X @ W + b
+//    Layers grouped into segments of size `seg_size`.
+//    Forward:
+//       keep = [input_activation_of_segment_0,
+//               input_activation_of_segment_1, ...,
+//               final_output]
+//       mid  = discarded (not retained after segment exits)
+//    Backward:
+//       for each segment (reverse): recompute forward from the
+//       saved boundary → materialize mid activations → apply
+//       per-layer backward → forward through upstream segment.
+//
+//  API:
+//    gc_make_layer(W, b, in_dim, out_dim)
+//    gc_make_model(layers, seg_size)
+//    gc_forward(model, input)            → CheckpointedForward
+//    gc_forward_plain(model, input)      → plain forward (no ckpt)
+//    gc_backward(model, fwd, grad_out)   → [grad_input, grads_per_layer]
+//    gc_backward_plain(model, all_acts, grad_out) → same shape
+//    gc_peak_activations(fwd)            → int (sum of stored tensor lens)
+//    gc_peak_activations_plain(all_acts) → int
+//
+//  AI-native attrs:
+//    @hot   — forward / backward called every step
+//    @pure  — memory accounting helpers
+//
+//  Constraints:
+//    - No list mutation across fn boundaries (pbv leak rule).
+//    - Segment boundary saves are shallow references but we treat
+//      each segment as independent so re-computation does not
+//      corrupt the saved boundary (we only read from it).
+//    - Uses builtins: matmul, mat_add, mat_scale, tensor_zeros, len
+// ═══════════════════════════════════════════════════════════════
+
+// ── Structs ──────────────────────────────────────────────────
+
+struct GCLayer {
+    W: array,          // [in_dim * out_dim] flat
+    b: array,          // [out_dim]
+    in_dim: int,
+    out_dim: int
+}
+
+struct GCModel {
+    layers: array,     // [GCLayer]
+    seg_size: int      // checkpoint every N layers
+}
+
+struct GCForward {
+    boundaries: array, // segment-entry activations (input of each seg)
+    final_out: array,  // output tensor
+    in_dim: int,
+    num_layers: int,
+    num_segments: int
+}
+
+// ── Layer construction ──────────────────────────────────────
+
+fn gc_make_layer(W, b, in_dim, out_dim) {
+    return GCLayer { W: W, b: b, in_dim: in_dim, out_dim: out_dim }
+}
+
+fn gc_make_model(layers, seg_size) {
+    let mut s = seg_size
+    if s < 1 { s = 1 }
+    return GCModel { layers: layers, seg_size: s }
+}
+
+// ── Weight initializer: deterministic tiny values for bench ──
+fn gc_init_weights(in_dim, out_dim, seed) {
+    let n = in_dim * out_dim
+    let mut W = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        // Simple LCG-like deterministic init, tiny range
+        s = (s * 1103515245 + 12345) % 2147483647
+        let v = to_float(s % 1000) / 100000.0 - 0.005
+        W = W + [v]
+        i = i + 1
+    }
+    return W
+}
+
+fn gc_init_bias(out_dim) {
+    let mut b = []
+    let mut i = 0
+    while i < out_dim {
+        b = b + [0.0]
+        i = i + 1
+    }
+    return b
+}
+
+fn gc_make_random_model(num_layers, d, seg_size, seed_base) {
+    let mut layers = []
+    let mut i = 0
+    while i < num_layers {
+        let W = gc_init_weights(d, d, seed_base + i * 7919)
+        let b = gc_init_bias(d)
+        layers = layers + [gc_make_layer(W, b, d, d)]
+        i = i + 1
+    }
+    return gc_make_model(layers, seg_size)
+}
+
+fn gc_make_input(d, seed) {
+    let mut x = []
+    let mut i = 0
+    let mut s = seed
+    while i < d {
+        s = (s * 1103515245 + 12345) % 2147483647
+        x = x + [to_float(s % 1000) / 1000.0]
+        i = i + 1
+    }
+    return x
+}
+
+// ── Dense forward: Y = X @ W + b  (X 1×in, W in×out, b out) ──
+// Pure-list matmul to guarantee exact `len() == out_dim` — needed
+// for clean memory accounting. (BLAS matmul returns oversized
+// output buffers which makes gc_peak_activations inconsistent.)
+@hot
+fn gc_apply_layer(layer, x) {
+    let in_dim = layer.in_dim
+    let out_dim = layer.out_dim
+    let mut y = []
+    let mut j = 0
+    while j < out_dim {
+        let mut s = layer.b[j]
+        let mut i = 0
+        while i < in_dim {
+            s = s + x[i] * layer.W[i * out_dim + j]
+            i = i + 1
+        }
+        y = y + [s]
+        j = j + 1
+    }
+    return y
+}
+
+// ── Plain forward (no checkpointing, stores all activations) ──
+// Returns array of activations: [input, after_L0, after_L1, ..., after_L(N-1)]
+@hot
+fn gc_forward_plain(model, input) {
+    let n = len(model.layers)
+    let mut acts = [input]
+    let mut cur = input
+    let mut i = 0
+    while i < n {
+        cur = gc_apply_layer(model.layers[i], cur)
+        acts = acts + [cur]
+        i = i + 1
+    }
+    return acts
+}
+
+// ── Checkpoint-aware forward ────────────────────────────────
+// Only keeps segment-entry activations + final output.
+// Mid-segment tensors are transient (dropped at segment exit).
+@hot
+fn gc_forward(model, input) {
+    let n = len(model.layers)
+    let seg = model.seg_size
+    let mut boundaries = []
+    let mut cur = input
+
+    // Save segment 0 input
+    boundaries = boundaries + [cur]
+
+    let mut i = 0
+    while i < n {
+        // Enter new segment? (boundary save at segment start, except seg 0)
+        if i > 0 {
+            if i % seg == 0 {
+                boundaries = boundaries + [cur]
+            }
+        }
+        cur = gc_apply_layer(model.layers[i], cur)
+        i = i + 1
+    }
+
+    let mut num_segments = n / seg
+    if n % seg != 0 { num_segments = num_segments + 1 }
+
+    let mut in_dim = 0
+    if n > 0 { in_dim = model.layers[0].in_dim }
+
+    return GCForward {
+        boundaries: boundaries,
+        final_out: cur,
+        in_dim: in_dim,
+        num_layers: n,
+        num_segments: len(boundaries)
+    }
+}
+
+// ── Per-layer backward (dense) ──────────────────────────────
+// Given forward Y = X @ W + b, dY → dX, dW, db.
+//   dW = X^T @ dY  (in×out)
+//   dX = dY @ W^T  (1×in)
+//   db = dY        (1×out)
+// Returns [dX, dW, db]
+fn _gc_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn gc_layer_backward(layer, x, dy) {
+    let in_dim = layer.in_dim
+    let out_dim = layer.out_dim
+    // dW[in×out] = X^T @ dY  → element [i,j] = x[i] * dy[j]
+    let mut dW = []
+    let mut i = 0
+    while i < in_dim {
+        let xi = x[i]
+        let mut j = 0
+        while j < out_dim {
+            dW = dW + [xi * dy[j]]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // dX[in] = dy @ W^T  → element i = sum_j dy[j] * W[i*out+j]
+    let mut dX = []
+    i = 0
+    while i < in_dim {
+        let mut s = 0.0
+        let mut j = 0
+        while j < out_dim {
+            s = s + dy[j] * layer.W[i * out_dim + j]
+            j = j + 1
+        }
+        dX = dX + [s]
+        i = i + 1
+    }
+    // db = dy (copy)
+    let mut db = []
+    i = 0
+    while i < out_dim {
+        db = db + [dy[i]]
+        i = i + 1
+    }
+    return [dX, dW, db]
+}
+
+// ── Recompute a single segment forward from a saved boundary ──
+// seg_idx: which segment (0..num_segments-1)
+// Returns array of activations [boundary, after_L_first, ..., after_L_last]
+// of length (segment_layer_count + 1).
+fn gc_recompute_segment(model, fwd, seg_idx) {
+    let seg = model.seg_size
+    let n = len(model.layers)
+    let first = seg_idx * seg
+    let mut last = first + seg
+    if last > n { last = n }
+
+    let boundary = fwd.boundaries[seg_idx]
+    let mut acts = [boundary]
+    let mut cur = boundary
+    let mut i = first
+    while i < last {
+        cur = gc_apply_layer(model.layers[i], cur)
+        acts = acts + [cur]
+        i = i + 1
+    }
+    return acts
+}
+
+// helper for gc_recompute_segment — avoid struct field lookup inside
+fn _gc_num_layers(model) {
+    return len(model.layers)
+}
+
+// ── Backward through checkpointed model ─────────────────────
+// Input: fwd (GCForward), grad_out (1×out_last)
+// Output: [grad_input, grads_per_layer]
+//   grads_per_layer[i] = [dW_i, db_i]
+// Strategy:
+//   for seg_idx in reverse(0..num_segments):
+//     acts = recompute segment forward  (materialize mid acts)
+//     for layer_idx in reverse(first..last):
+//       [dX, dW, db] = gc_layer_backward(layer, x=acts[local], dy=cur_grad)
+//       grads[layer_idx] = [dW, db]
+//       cur_grad = dX
+//     (acts dropped here — no cross-segment leak)
+@hot
+fn gc_backward(model, fwd, grad_out) {
+    let n = fwd.num_layers
+    let seg = model.seg_size
+
+    // Pre-allocate grads list with placeholders
+    let mut grads = []
+    let mut k = 0
+    while k < n {
+        grads = grads + [[[], []]]
+        k = k + 1
+    }
+
+    let mut cur_grad = grad_out
+    let num_segs = fwd.num_segments
+    let mut s_idx = num_segs - 1
+    while s_idx >= 0 {
+        // Recompute forward through this segment
+        let acts = gc_recompute_segment(model, fwd, s_idx)
+        let first = s_idx * seg
+        let mut last = first + seg
+        if last > n { last = n }
+        let seg_len = last - first
+
+        // Walk layers in reverse within segment
+        let mut li = seg_len - 1
+        while li >= 0 {
+            let layer_idx = first + li
+            let layer = model.layers[layer_idx]
+            // acts[li] is the input to layer_idx; acts[li+1] is its output
+            let x = acts[li]
+            let triple = gc_layer_backward(layer, x, cur_grad)
+            let dX = triple[0]
+            let dW = triple[1]
+            let db = triple[2]
+            grads[layer_idx] = [dW, db]
+            cur_grad = dX
+            li = li - 1
+        }
+        s_idx = s_idx - 1
+    }
+
+    return [cur_grad, grads]
+}
+
+// ── Plain backward (no checkpointing, using stored acts) ────
+// acts = gc_forward_plain(model, input)  → [input, after_L0, ...]
+@hot
+fn gc_backward_plain(model, acts, grad_out) {
+    let n = len(model.layers)
+    let mut grads = []
+    let mut k = 0
+    while k < n {
+        grads = grads + [[[], []]]
+        k = k + 1
+    }
+    let mut cur_grad = grad_out
+    let mut i = n - 1
+    while i >= 0 {
+        let layer = model.layers[i]
+        let x = acts[i]              // input to layer i
+        let triple = gc_layer_backward(layer, x, cur_grad)
+        grads[i] = [triple[1], triple[2]]
+        cur_grad = triple[0]
+        i = i - 1
+    }
+    return [cur_grad, grads]
+}
+
+// ── Memory accounting ───────────────────────────────────────
+// "peak activation memory" ≈ sum of stored tensor lengths.
+// For checkpointed: boundaries + final_out (segments' internal
+// tensors are transient and not persisted).
+// For plain: all activations in the array.
+@pure
+fn gc_peak_activations(fwd) {
+    let mut total = 0
+    let n = len(fwd.boundaries)
+    let mut i = 0
+    while i < n {
+        total = total + len(fwd.boundaries[i])
+        i = i + 1
+    }
+    total = total + len(fwd.final_out)
+    return total
+}
+
+@pure
+fn gc_peak_activations_plain(acts) {
+    let mut total = 0
+    let n = len(acts)
+    let mut i = 0
+    while i < n {
+        total = total + len(acts[i])
+        i = i + 1
+    }
+    return total
+}
+
+// ── Savings ratio (1 - ckpt / plain) ────────────────────────
+@pure
+fn gc_savings_ratio(ckpt_peak, plain_peak) {
+    if plain_peak <= 0 { return 0.0 }
+    let diff = plain_peak - ckpt_peak
+    if diff <= 0 { return 0.0 }
+    return to_float(diff) / to_float(plain_peak)
+}
+
+// ── Convenience: counts ─────────────────────────────────────
+@pure
+fn gc_num_segments(num_layers, seg_size) {
+    if seg_size <= 0 { return num_layers }
+    let mut s = num_layers / seg_size
+    if num_layers % seg_size != 0 { s = s + 1 }
+    return s
+}
+
+println("[grad_checkpoint] loaded — layer-level segment checkpoint (real forward/backward drop/recompute)")

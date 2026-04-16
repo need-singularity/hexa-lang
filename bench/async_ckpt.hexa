@@ -1,0 +1,227 @@
+// ═══════════════════════════════════════════════════════════════
+//  bench/async_ckpt.hexa — Measure blocking vs non-blocking save
+//  during a simulated training loop (C-track C11).
+//
+//  Config
+//  ------
+//    TENSOR_COUNT = 24   (≈ layer count of a tiny transformer)
+//    TENSOR_SIZE  = 512  (per-tensor numel)
+//    TRAIN_STEPS  = 8    (training iterations to simulate)
+//    WORK_SIZE    = 32   (inner loop size that sets 1 step ~10ms)
+//
+//  Metrics
+//  -------
+//    sync_save_ms     wall time of save_checkpoint() from checkpoint.hexa
+//    step_sync_max    max single training-step time while sync save runs
+//                     (in practice, the sync save blocks steps fully)
+//    step_async_max   max single step time under async_save_start
+//                     + interleaved async_save_step
+//    caller_latency   how long async_save(...) blocked the caller
+//    detach_wall      end-to-end wall for detached mv to finish
+//
+//  Expected outcome
+//  ----------------
+//    sync mode: a single training step sees +sync_save_ms overhead
+//    async coop: each step absorbs a tiny slice of encode — NO step
+//                is stalled by more than ~(sync_ms / TENSOR_COUNT)
+// ═══════════════════════════════════════════════════════════════
+
+use "checkpoint"
+use "async_ckpt"
+
+let TENSOR_COUNT = 24
+let TENSOR_SIZE = 512
+let TRAIN_STEPS = 8
+let WORK_SIZE = 32
+
+let PATH_SYNC  = "/tmp/hexa_bench_async_sync.hxck"
+let PATH_ASYNC = "/tmp/hexa_bench_async_async.hxck"
+
+// Simulated "training step": sum of a matmul-like inner loop.
+// Touches the tensor data so the interpreter can't hoist it.
+fn sim_train_step(tensors, t_idx) {
+    let n = len(tensors)
+    let t = tensors[t_idx % n]
+    let m = len(t)
+    let mut acc = 0.0
+    let mut i = 0
+    while i < WORK_SIZE {
+        let mut j = 0
+        while j < WORK_SIZE {
+            acc = acc + t[(i * WORK_SIZE + j) % m]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    acc
+}
+
+// ── Build the model weights ───────────────────────────────────
+fn make_tensors() {
+    let mut out = []
+    let mut names = []
+    let mut k = 0
+    while k < TENSOR_COUNT {
+        let mut data = []
+        let mut j = 0
+        while j < TENSOR_SIZE {
+            data = data.push((k * 7 + j) * 0.01)
+            j = j + 1
+        }
+        out = out.push(tensor(data))
+        names = names.push("layer" + str(k) + ".W")
+        k = k + 1
+    }
+    return [names, out]
+}
+
+println("============================================================")
+println("  bench/async_ckpt.hexa — C11")
+println("  config: tensors=" + str(TENSOR_COUNT) + " size=" + str(TENSOR_SIZE) +
+        " steps=" + str(TRAIN_STEPS) + " work=" + str(WORK_SIZE))
+println("============================================================")
+
+let built = make_tensors()
+let names = built[0]
+let tensors = built[1]
+
+// ── Baseline: pure training, no save ──────────────────────────
+println("")
+println("[baseline] training loop, no save")
+let b0 = clock() * 1000.0
+let mut max_base = 0.0
+let mut i = 0
+while i < TRAIN_STEPS {
+    let s0 = clock() * 1000.0
+    let _ = sim_train_step(tensors, i)
+    let s1 = clock() * 1000.0
+    let dt = s1 - s0
+    if dt > max_base { max_base = dt }
+    i = i + 1
+}
+let b1 = clock() * 1000.0
+println("  total: " + str(b1 - b0) + " ms   max step: " + str(max_base) + " ms")
+
+// ── Scenario 1: blocking save between step 3 and step 4 ───────
+println("")
+println("[scenario A] blocking save_checkpoint at step 3")
+exec("rm -f " + PATH_SYNC)
+let a0 = clock() * 1000.0
+let mut max_sync = 0.0
+let mut step_times_sync = []
+i = 0
+while i < TRAIN_STEPS {
+    let s0 = clock() * 1000.0
+    let _ = sim_train_step(tensors, i)
+    if i == 3 {
+        save_checkpoint(names, tensors, PATH_SYNC)
+    }
+    let s1 = clock() * 1000.0
+    let dt = s1 - s0
+    step_times_sync = step_times_sync.push(dt)
+    if dt > max_sync { max_sync = dt }
+    i = i + 1
+}
+let a1 = clock() * 1000.0
+println("  total: " + str(a1 - a0) + " ms   max step: " + str(max_sync) + " ms")
+let save_blocked_step = step_times_sync[3]
+println("  step#3 (save inline): " + str(save_blocked_step) + " ms")
+
+// ── Scenario 2: async_save (fire-and-forget) at step 3 ────────
+println("")
+println("[scenario B] async_save fire-and-forget at step 3")
+exec("rm -f " + PATH_ASYNC + " " + PATH_ASYNC + ".staging " + PATH_ASYNC + ".done")
+let c0 = clock() * 1000.0
+let mut max_ff = 0.0
+let mut step_times_ff = []
+let mut h_ff = #{"state": 0}
+i = 0
+while i < TRAIN_STEPS {
+    let s0 = clock() * 1000.0
+    let _ = sim_train_step(tensors, i)
+    if i == 3 {
+        h_ff = async_save(names, tensors, PATH_ASYNC)
+    }
+    let s1 = clock() * 1000.0
+    let dt = s1 - s0
+    step_times_ff = step_times_ff.push(dt)
+    if dt > max_ff { max_ff = dt }
+    i = i + 1
+}
+let c1 = clock() * 1000.0
+h_ff = async_save_wait(h_ff)
+let c2 = clock() * 1000.0
+println("  total (train only): " + str(c1 - c0) + " ms   max step: " + str(max_ff) + " ms")
+println("  step#3 (async caller): " + str(step_times_ff[3]) + " ms")
+println("  detach wait after loop: " + str(c2 - c1) + " ms")
+
+// ── Scenario 3: cooperative encode ────────────────────────────
+println("")
+println("[scenario C] cooperative async_save_step interleaved")
+exec("rm -f " + PATH_ASYNC + " " + PATH_ASYNC + ".staging " + PATH_ASYNC + ".done")
+let mut h_co = async_save_start(names, tensors, PATH_ASYNC)
+let d0 = clock() * 1000.0
+let mut max_co = 0.0
+let mut step_times_co = []
+let mut coop_steps_driven = 0
+i = 0
+// Drive one encode step per training step until staged, then
+// continue training while the detach/mv completes in background.
+let mut staged = false
+let mut detached = false
+while i < TRAIN_STEPS {
+    let s0 = clock() * 1000.0
+    let _ = sim_train_step(tensors, i)
+    // advance encoder
+    if !staged {
+        h_co = async_save_step(h_co)
+        coop_steps_driven = coop_steps_driven + 1
+        if h_co["state"] == 3 {
+            staged = true
+            h_co = async_save_detach(h_co)
+            detached = true
+        }
+    } else if detached {
+        h_co = async_save_poll(h_co)
+    }
+    let s1 = clock() * 1000.0
+    let dt = s1 - s0
+    step_times_co = step_times_co.push(dt)
+    if dt > max_co { max_co = dt }
+    i = i + 1
+}
+let d1 = clock() * 1000.0
+// Finish remaining encode (if any) outside the loop
+while h_co["state"] != 5 && h_co["state"] != 6 {
+    if !staged {
+        h_co = async_save_step(h_co)
+        if h_co["state"] == 3 { staged = true; h_co = async_save_detach(h_co); detached = true }
+    } else {
+        h_co = async_save_poll(h_co)
+    }
+}
+let d2 = clock() * 1000.0
+println("  total (train w/ encode): " + str(d1 - d0) + " ms   max step: " + str(max_co) + " ms")
+println("  encode steps driven in-loop: " + str(coop_steps_driven))
+println("  trailing wait: " + str(d2 - d1) + " ms")
+
+// ── Summary table ──────────────────────────────────────────────
+println("")
+println("============================================================")
+println("  SUMMARY  (max step time — the blocking indicator)")
+println("============================================================")
+println("  baseline (no save)           : " + str(max_base) + " ms")
+println("  sync save inline             : " + str(max_sync) + " ms  <- spike")
+println("  async fire-and-forget        : " + str(max_ff) + " ms  <- spike")
+println("  async cooperative step       : " + str(max_co) + " ms  <- flat")
+println("")
+println("  sync step#3 (save inline)    : " + str(save_blocked_step) + " ms")
+println("  async step#3 (caller)        : " + str(step_times_ff[3]) + " ms")
+println("")
+
+let speedup_ff = save_blocked_step / (step_times_ff[3] + 0.001)
+let speedup_co = save_blocked_step / (max_co + 0.001)
+println("  fire-and-forget at step#3    : " + str(speedup_ff) + "x non-blocking")
+println("  cooperative max step         : " + str(speedup_co) + "x non-blocking")
+
+println("============================================================")
