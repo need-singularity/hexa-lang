@@ -20,7 +20,7 @@
 //    # ref_commit: dba4246f
 //    # @convergence-end
 //
-//  ── 형식 B: 단일행 @convergence (신규) ──
+//  ── 형식 B: 단일행 @convergence (comment — .md 등) ──
 //    # @convergence state=ossified id=LAUNCHD_PATH_HARDENED value="plist ..." threshold="refresh_via_cli"
 //
 //    규칙:
@@ -30,6 +30,16 @@
 //      - 허용 상태: ossified | stable | in_flight | pending | completed | completed_gap | failed | blocked
 //      - 선택 키: value, threshold, date, note, evidence, checkpoint, ossified_at, promoted_from, ref_commit, rationale
 //      - 주석 prefix (#, //, ;, --, <!-- -->) 자동 제거
+//
+//  ── 형식 C: hexa attribute @convergence(...) (.hexa 파일) ──
+//    @convergence(state="ossified", id="LAUNCHD_PATH_HARDENED", value="plist ...")
+//
+//    규칙:
+//      - `@convergence(` 감지 → 괄호 내부 key="value" 쌍 (쉼표 구분) 파싱
+//      - value 는 반드시 `"..."` 인용
+//      - 필수 키: state, id (형식 B 와 동일)
+//      - 괄호 닫힘 `)` 에서 파싱 종료
+//      - 주석 행이 아닌 실제 hexa 소스의 속성 표기
 //
 //  meta 블록:
 //    # @convergence-meta-start
@@ -440,6 +450,121 @@ fn cs_scan_single_lines(src) {
     return entries
 }
 
+// ── 형식 C: hexa attr @convergence(...) 파서 ─────────────────
+// Grammar:  @convergence(key="value", key="value", ...)
+// 쉼표 구분, 값은 반드시 "..." 인용.
+fn cs_parse_attr_kv(inner) {
+    let chars = inner.chars()
+    let total = len(chars)
+    let mut kv = #{"__keys__": []}
+    let mut keys = []
+    let mut pos = 0
+
+    while pos < total {
+        // skip whitespace and commas
+        pos = cs_skip_ws_comma(chars, total, pos)
+        if pos >= total { pos = total }
+        else {
+            // read key until '='
+            let key_start = pos
+            let eq_pos = cs_scan_until_eq(chars, total, pos)
+            if eq_pos >= total {
+                pos = total
+            } else {
+                let key = cs_strip(cs_chars_slice(chars, key_start, eq_pos))
+                pos = eq_pos + 1
+                pos = cs_skip_ws_comma(chars, total, pos)
+                if pos >= total {
+                    kv = kv.set(key, "")
+                    keys = keys.push(key)
+                    pos = total
+                } else {
+                    if chars[pos] == '"' {
+                        pos = pos + 1
+                        let val_start = pos
+                        let close = cs_scan_until_quote(chars, total, pos)
+                        let val = cs_chars_slice(chars, val_start, close)
+                        kv = kv.set(key, val)
+                        keys = keys.push(key)
+                        if close < total { pos = close + 1 } else { pos = total }
+                    } else {
+                        // unquoted value: scan until comma or end
+                        let val_start = pos
+                        let val_end = cs_scan_until_comma_or_paren(chars, total, pos)
+                        let val = cs_strip(cs_chars_slice(chars, val_start, val_end))
+                        kv = kv.set(key, val)
+                        keys = keys.push(key)
+                        pos = val_end
+                    }
+                }
+            }
+        }
+    }
+    kv = kv.set("__keys__", keys)
+    return kv
+}
+
+fn cs_skip_ws_comma(chars, total, start) {
+    let mut p = start
+    while p < total {
+        let c = chars[p]
+        if c == ' ' || c == '\t' || c == ',' || c == '\n' || c == '\r' { p = p + 1 }
+        else { return p }
+    }
+    return p
+}
+
+fn cs_scan_until_comma_or_paren(chars, total, start) {
+    let mut p = start
+    while p < total {
+        let c = chars[p]
+        if c == ',' || c == ')' { return p }
+        p = p + 1
+    }
+    return total
+}
+
+// ── 형식 C 스캔 ──────────────────────────────────────────────
+fn cs_scan_attr_lines(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut entries = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        // must contain `@convergence(` but NOT be a comment-prefix marker
+        let attr_anchor = "@convergence("
+        if cs_contains(line, attr_anchor) {
+            // skip if this is inside a block marker or comment-style entry
+            let is_block = cs_contains(line, "@convergence-start")
+            let is_end = cs_contains(line, "@convergence-end")
+            let is_meta = cs_contains(line, "@convergence-meta")
+            let is_single = false
+            if !is_block && !is_end && !is_meta {
+                let trimmed = cs_strip(line)
+                let anchor_pos = cs_find_substr(trimmed, attr_anchor)
+                if anchor_pos >= 0 {
+                    let anchor_len = len(attr_anchor.chars())
+                    let after_paren = trimmed.substring(anchor_pos + anchor_len, len(trimmed))
+                    // find closing paren
+                    let close_pos = cs_find_char(after_paren, ')')
+                    let mut inner = after_paren
+                    if close_pos >= 0 {
+                        inner = after_paren.substring(0, close_pos)
+                    }
+                    let ic = inner.chars()
+                    if len(ic) > 0 {
+                        let kv = cs_parse_attr_kv(inner)
+                        entries = entries.push(kv)
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return entries
+}
+
 // ── JSON 빌더 ──────────────────────────────────────────────
 fn cs_json_escape(s) {
     let cs = s.chars()
@@ -578,10 +703,17 @@ fn cs_emit_meta_json(meta_block) {
     return "{\n" + inner + "\n}"
 }
 
-// ── 엔트리 병합 ──────────────────────────────────────────
+// ── 엔트리 병합 (3-format) ──────────────────────────────────
+// 우선순위: block (A) > single-line comment (B) > attr (C)
+// 동일 id 중복 시 먼저 등장한 형식이 우선
 fn cs_merge_entries(block_entries, single_entries) {
+    return cs_merge_all(block_entries, single_entries, [])
+}
+
+fn cs_merge_all(block_entries, single_entries, attr_entries) {
     let mut seen_ids = []
     let mut merged = []
+    // pass 1: block entries (format A)
     let bn = len(block_entries)
     let mut bi = 0
     while bi < bn {
@@ -592,6 +724,7 @@ fn cs_merge_entries(block_entries, single_entries) {
         merged = merged.push(blk)
         bi = bi + 1
     }
+    // pass 2: single-line comment entries (format B)
     let sn = len(single_entries)
     let mut si = 0
     while si < sn {
@@ -608,6 +741,24 @@ fn cs_merge_entries(block_entries, single_entries) {
             merged = merged.push(entry)
         }
         si = si + 1
+    }
+    // pass 3: attr entries (format C)
+    let an = len(attr_entries)
+    let mut ai = 0
+    while ai < an {
+        let entry = attr_entries[ai]
+        let mut skip = false
+        if entry.contains_key("id") {
+            if cs_list_contains(seen_ids, entry.get("id")) {
+                skip = true
+            } else {
+                seen_ids = seen_ids.push(entry.get("id"))
+            }
+        }
+        if !skip {
+            merged = merged.push(entry)
+        }
+        ai = ai + 1
     }
     return merged
 }
@@ -641,7 +792,8 @@ fn cs_main() {
         let meta_blocks = cs_scan_meta(src)
         let block_entries = cs_scan_blocks(src)
         let single_entries = cs_scan_single_lines(src)
-        let blocks = cs_merge_entries(block_entries, single_entries)
+        let attr_entries = cs_scan_attr_lines(src)
+        let blocks = cs_merge_all(block_entries, single_entries, attr_entries)
         let out = cs_emit_full_json(meta_blocks, blocks)
         println(out)
         exit(0)
