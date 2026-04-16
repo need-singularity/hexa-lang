@@ -8222,7 +8222,7 @@ HexaVal gen2_ffi_marshal_arg(HexaVal param_name, HexaVal param_type) {
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(param_type, hexa_str("Float"))) || hexa_truthy(hexa_eq(param_type, hexa_str("float"))))) || hexa_truthy(hexa_eq(param_type, hexa_str("f64")))))) {
         return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_IS_FLOAT("), param_name), hexa_str(")?")), hexa_str("HX_FLOAT(")), param_name), hexa_str("):(double)HX_INT(")), param_name), hexa_str("))")));
     }
-    return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_IS_INT("), param_name), hexa_str(")?")), hexa_str("HX_INT(")), param_name), hexa_str("):(int64_t)HX_FLOAT(")), param_name), hexa_str("))")));
+    return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_IS_INT("), param_name), hexa_str(")?")), hexa_str("HX_INT_U(")), param_name), hexa_str("):(int64_t)HX_FLOAT(")), param_name), hexa_str("))")));
     return __hexa_fn_arena_return(hexa_void());
 }
 
@@ -9474,6 +9474,9 @@ HexaVal gen2_expr(HexaVal node) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_from_char_code("), a0), hexa_str(")")));
                 }
                 if (hexa_truthy(hexa_eq(name, hexa_str("env_var")))) {
+                    return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_env_var("), a0), hexa_str(")")));
+                }
+                if (hexa_truthy(hexa_eq(name, hexa_str("env")))) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_env_var("), a0), hexa_str(")")));
                 }
                 if (hexa_truthy(hexa_eq(name, hexa_str("delete_file")))) {

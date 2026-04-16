@@ -13,13 +13,6 @@
 #include <time.h>
 #include <unistd.h>
 
-// Force line-buffered stdout even when redirected to file/pipe.
-__attribute__((constructor))
-static void _hexa_init_stdio(void) {
-    setvbuf(stdout, NULL, _IOLBF, 0);
-    setvbuf(stderr, NULL, _IOLBF, 0);
-}
-
 // ═══════════════════════════════════════════════════════════
 //  Optimization #11: String Interning
 //  Hash-set of unique strings. Short strings (< 64 chars)
@@ -130,8 +123,9 @@ static const char* hexa_intern(const char* s) {
 }
 
 // Forward declarations for all runtime functions
-// S1-D3b-gamma: NaN-boxed — HexaVal is uint64_t (8 bytes).
-typedef uint64_t HexaVal;
+// S1-D3b-beta: struct tag renamed to HexaVal_ so typedef HexaVal can flip
+// to uint64_t (NaN-boxed) without touching field access patterns.
+typedef struct HexaVal_ HexaVal;
 HexaVal hexa_add(HexaVal a, HexaVal b);
 HexaVal hexa_sub(HexaVal a, HexaVal b);
 HexaVal hexa_mul(HexaVal a, HexaVal b);
@@ -303,7 +297,21 @@ typedef struct HexaClo {
 // HexaVal-by-value fields (rt 32-G redesign) have a complete type. HexaVal
 // only needs HexaValStruct as a *pointer* (.vs), so the forward decl above
 // (typedef struct HexaValStruct HexaValStruct) is sufficient here.
-// (HexaVal = uint64_t, forward-declared above — no struct needed)
+typedef struct HexaVal_ {
+    HexaTag tag;
+    union {
+        int64_t i;
+        double f;
+        int b;
+        char* s;           // owned string (malloc'd)
+        HexaArr* arr_ptr;  // S1-D3a: heap descriptor (was inline struct)
+        HexaMap* map_ptr;  // S1-D3a: heap descriptor (was inline struct)
+        HexaFn*  fn_ptr_d; // S1-D3a: heap descriptor (was inline struct)
+        HexaClo* clo_ptr;  // S1-D3a: heap descriptor (was inline struct)
+        // rt 32-G: heap-allocated flat struct pointer (TAG_VALSTRUCT).
+        HexaValStruct* vs;
+    };
+} HexaVal;
 
 // ═══════════════════════════════════════════════════════════
 //  STRUCTURAL-1 Phase A: NaN-boxing accessor macros
@@ -312,138 +320,70 @@ typedef struct HexaClo {
 //  All hot-path code MUST use these instead of raw .tag/.i/.f etc.
 // ═══════════════════════════════════════════════════════════
 
-// (Phase A struct macros removed — Phase B NaN-boxing macros below)
+#define HX_TAG(v)       ((v).tag)
+#define HX_INT(v)       ((v).i)
+#define HX_FLOAT(v)     ((v).f)
+#define HX_BOOL(v)      ((v).b)
+#define HX_STR(v)       ((v).s)
 // S1-D3a: compound-type READ macros — dereference heap descriptors.
 // IMPORTANT: caller MUST ensure the tag matches before calling these;
 // they dereference the descriptor pointer unconditionally for performance.
 // The one exception is HX_MAP_TBL which is guarded because the IC
 // fast-path (hexa_map_get_ic) probes it before a tag check, and
 // hexa_map_get probes it on TAG_VALSTRUCT-routed values.
-// ═══════════════════════════════════════════════════════════
-//  NaN-boxing encoding (Phase B)
-// ═══════════════════════════════════════════════════════════
-#define QNAN           0x7FFC000000000000ULL
-#define NB_SIGN_BIT    0x8000000000000000ULL
-#define NB_STAG_SHIFT  47
-#define NB_STAG_MASK   (7ULL << NB_STAG_SHIFT)
-#define NB_PAYLOAD     ((1ULL << 47) - 1)
-#define NB_HEADER_MASK (QNAN | NB_SIGN_BIT | NB_STAG_MASK)
-#define NB_VOID       (QNAN)
-#define NB_BOOL       (QNAN | (1ULL << NB_STAG_SHIFT))
-#define NB_INT        (QNAN | (2ULL << NB_STAG_SHIFT))
-#define NB_CHAR       (QNAN | (3ULL << NB_STAG_SHIFT))
-#define NB_STR        (QNAN | NB_SIGN_BIT)
-#define NB_ARRAY      (QNAN | NB_SIGN_BIT | (1ULL << NB_STAG_SHIFT))
-#define NB_MAP        (QNAN | NB_SIGN_BIT | (2ULL << NB_STAG_SHIFT))
-#define NB_FN         (QNAN | NB_SIGN_BIT | (3ULL << NB_STAG_SHIFT))
-#define NB_CLOSURE    (QNAN | NB_SIGN_BIT | (4ULL << NB_STAG_SHIFT))
-#define NB_VALSTRUCT  (QNAN | NB_SIGN_BIT | (5ULL << NB_STAG_SHIFT))
+#define HX_ARR_LEN(v)   ((v).arr_ptr->len)
+#define HX_ARR_ITEMS(v) ((v).arr_ptr->items)
+#define HX_ARR_CAP(v)   ((v).arr_ptr->cap)
+#define HX_MAP_LEN(v)   ((v).map_ptr->len)
+#define HX_MAP_TBL(v)   (HX_IS_MAP(v) ? (v).map_ptr->tbl : (HexaMapTable*)0)
+#define HX_FN_PTR(v)    ((v).fn_ptr_d->fn_ptr)
+#define HX_FN_ARITY(v)  ((v).fn_ptr_d->arity)
+#define HX_CLO_PTR(v)   ((v).clo_ptr->fn_ptr)
+#define HX_CLO_ARITY(v) ((v).clo_ptr->arity)
+#define HX_CLO_ENV(v)   ((v).clo_ptr->env_box)
+#define HX_VS(v)        ((v).vs)
 
-static inline uint64_t __hx_d2u(double d) {
-    uint64_t u; memcpy(&u, &d, 8);
-    if ((u & QNAN) == QNAN) u = 0x7FF8000000000000ULL;
-    return u;
-}
-static inline double __hx_u2d(uint64_t u) { double d; memcpy(&d, &u, 8); return d; }
-static inline int64_t __hx_sext47(uint64_t x) { uint64_t sb=1ULL<<46; return (int64_t)((x^sb)-sb); }
+// ── S1-D3a: compound-type SET macros (write accessors) — heap descriptor ──
+#define HX_SET_ARR_ITEMS(v, p) ((v).arr_ptr->items = (p))
+#define HX_SET_ARR_LEN(v, n)   ((v).arr_ptr->len = (n))
+#define HX_SET_ARR_CAP(v, n)   ((v).arr_ptr->cap = (n))
+#define HX_SET_MAP_TBL(v, t)   ((v).map_ptr->tbl = (t))
+#define HX_SET_MAP_LEN(v, n)   ((v).map_ptr->len = (n))
+#define HX_SET_CLO_PTR(v, p)   ((v).clo_ptr->fn_ptr = (p))
+#define HX_SET_CLO_ARITY(v, n) ((v).clo_ptr->arity = (n))
+#define HX_SET_CLO_ENV(v, p)   ((v).clo_ptr->env_box = (p))
 
-static const HexaTag __nb_tag_lut[16] = {
-    TAG_VOID, TAG_BOOL, TAG_INT, TAG_CHAR, TAG_VOID, TAG_VOID, TAG_VOID, TAG_VOID,
-    TAG_STR, TAG_ARRAY, TAG_MAP, TAG_FN, TAG_CLOSURE, TAG_VALSTRUCT, TAG_VOID, TAG_VOID
-};
-static inline HexaTag __hx_nb_tag(HexaVal v) {
-    if ((v & QNAN) != QNAN) return TAG_FLOAT;
-    return __nb_tag_lut[(int)(((v>>60)&8)|((v>>NB_STAG_SHIFT)&7))];
-}
+// ── STRUCTURAL-1 Phase A: scalar + descriptor-pointer writer macros ──
+// Prep for NaN-boxing typedef flip (HexaVal → uint64_t). Once callers route
+// all writes through these macros, the macro bodies swap to encode-into-u64
+// in one place. Struct-initializer literals ({.tag=T, .i=n}) are OUT OF SCOPE
+// here — they need a different rewrite (constructor fns or the flip itself).
+#define HX_SET_TAG(v, t)       ((v).tag = (t))
+#define HX_SET_INT(v, n)       ((v).i = (n))
+#define HX_SET_FLOAT(v, f)     ((v).f = (f))
+#define HX_SET_BOOL(v, b)      ((v).b = (b))
+#define HX_SET_STR(v, p)       ((v).s = (p))
+#define HX_SET_ARR_PTR(v, p)   ((v).arr_ptr = (p))
+#define HX_SET_MAP_PTR(v, p)   ((v).map_ptr = (p))
+#define HX_SET_FN_PTR_D(v, p)  ((v).fn_ptr_d = (p))
+#define HX_SET_CLO_PTR_D(v, p) ((v).clo_ptr = (p))
+#define HX_SET_VS(v, p)        ((v).vs = (p))
 
-// ── Accessors ───────────────────────────────────────────────
-#define HX_TAG(v)       __hx_nb_tag(v)
-#define HX_INT(v)       __hx_sext47((v) & NB_PAYLOAD)
-#define HX_INT_U(v)     ((int64_t)((uint64_t)(v) & NB_PAYLOAD))
-#define HX_FLOAT(v)     __hx_u2d(v)
-#define HX_BOOL(v)      ((int)((v) & 1))
-#define HX_STR(v)       ((char*)(uintptr_t)((v) & NB_PAYLOAD))
-#define __HX_PTR(v, T)  ((T*)(uintptr_t)((v) & NB_PAYLOAD))
+// HexaValStruct (inner) field access via v — routes through HX_VS so the
+// typedef flip can adjust the .vs bits in one spot. The inner HexaValStruct
+// remains a plain C struct — HX_VSF is pointer deref + member access.
+#define HX_VSF(v, field)       (HX_VS(v)->field)
 
-#define HX_ARR_LEN(v)   (__HX_PTR(v, HexaArr)->len)
-#define HX_ARR_ITEMS(v) (__HX_PTR(v, HexaArr)->items)
-#define HX_ARR_CAP(v)   (__HX_PTR(v, HexaArr)->cap)
-#define HX_MAP_LEN(v)   (__HX_PTR(v, HexaMap)->len)
-#define HX_MAP_TBL(v)   (HX_IS_MAP(v) ? __HX_PTR(v, HexaMap)->tbl : (HexaMapTable*)0)
-#define HX_FN_PTR(v)    (__HX_PTR(v, HexaFn)->fn_ptr)
-#define HX_FN_ARITY(v)  (__HX_PTR(v, HexaFn)->arity)
-#define HX_CLO_PTR(v)   (__HX_PTR(v, HexaClo)->fn_ptr)
-#define HX_CLO_ARITY(v) (__HX_PTR(v, HexaClo)->arity)
-#define HX_CLO_ENV(v)   (__HX_PTR(v, HexaClo)->env_box)
-#define HX_VS(v)        (__HX_PTR(v, HexaValStruct))
-
-// ── Compound SET ────────────────────────────────────────────
-#define HX_SET_ARR_ITEMS(v, p) (__HX_PTR(v, HexaArr)->items = (p))
-#define HX_SET_ARR_LEN(v, n)   (__HX_PTR(v, HexaArr)->len = (n))
-#define HX_SET_ARR_CAP(v, n)   (__HX_PTR(v, HexaArr)->cap = (n))
-#define HX_SET_MAP_TBL(v, t)   (__HX_PTR(v, HexaMap)->tbl = (t))
-#define HX_SET_MAP_LEN(v, n)   (__HX_PTR(v, HexaMap)->len = (n))
-#define HX_SET_CLO_PTR(v, p)   (__HX_PTR(v, HexaClo)->fn_ptr = (p))
-#define HX_SET_CLO_ARITY(v, n) (__HX_PTR(v, HexaClo)->arity = (n))
-#define HX_SET_CLO_ENV(v, p)   (__HX_PTR(v, HexaClo)->env_box = (p))
-
-// ── Scalar SET (rebuild entire uint64) ──────────────────────
-#define HX_SET_TAG(v, t)       ((v) = __hx_set_tag_keep_payload(v, t))
-#define HX_SET_INT(v, n)       ((v) = HX_MAKE_INT(n))
-#define HX_SET_FLOAT(v, f)     ((v) = HX_MAKE_FLOAT(f))
-#define HX_SET_BOOL(v, b)      ((v) = HX_MAKE_BOOL(b))
-#define HX_SET_STR(v, p)       ((v) = HX_MAKE_STR(p))
-#define HX_SET_ARR_PTR(v, p)   ((v) = (NB_ARRAY | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-#define HX_SET_MAP_PTR(v, p)   ((v) = (NB_MAP | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-#define HX_SET_FN_PTR_D(v, p)  ((v) = (NB_FN | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-#define HX_SET_CLO_PTR_D(v, p) ((v) = (NB_CLOSURE | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-#define HX_SET_VS(v, p)        ((v) = (NB_VALSTRUCT | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-
-static inline HexaVal __hx_set_tag_keep_payload(HexaVal v, HexaTag t) {
-    uint64_t p = v & NB_PAYLOAD;
-    switch (t) {
-        case TAG_VOID: return NB_VOID; case TAG_BOOL: return NB_BOOL|(p&1);
-        case TAG_INT: return NB_INT|p; case TAG_FLOAT: return __hx_d2u(0.0);
-        case TAG_STR: return NB_STR|p; case TAG_ARRAY: return NB_ARRAY|p;
-        case TAG_MAP: return NB_MAP|p; case TAG_FN: return NB_FN|p;
-        case TAG_CHAR: return NB_CHAR|p; case TAG_CLOSURE: return NB_CLOSURE|p;
-        case TAG_VALSTRUCT: return NB_VALSTRUCT|p; default: return NB_VOID;
-    }
-}
-
-// ── Constructors ────────────────────────────────────────────
-// NB_tag_header maps: VOID→NB_VOID, STR→NB_STR, ARRAY→NB_ARRAY, etc.
-static const uint64_t __nb_hdr_lut[] = {
-    NB_INT, 0/*float*/, NB_BOOL, NB_STR, NB_VOID,
-    NB_ARRAY, NB_MAP, NB_FN, NB_CHAR, NB_CLOSURE, NB_VALSTRUCT
-};
-#define HX_MAKE_TAG(t)    ((HexaVal)__nb_hdr_lut[(int)(t)])
-#define HX_MAKE_INT(n)    ((HexaVal)(NB_INT | ((uint64_t)(int64_t)(n) & NB_PAYLOAD)))
-#define HX_MAKE_FLOAT(f)  ((HexaVal)__hx_d2u(f))
-#define HX_MAKE_BOOL(b)   ((HexaVal)(NB_BOOL | (uint64_t)!!(b)))
-#define HX_MAKE_VOID()    ((HexaVal)NB_VOID)
-#define HX_MAKE_STR(p)    ((HexaVal)(NB_STR | ((uint64_t)(uintptr_t)(p) & NB_PAYLOAD)))
-#define HX_MAKE_NIL()     HX_MAKE_VOID()
-#define HX_MAKE_STR_EMPTY() ((HexaVal)NB_STR)
-#define HX_MAKE_ARR_EMPTY() ((HexaVal)NB_ARRAY)
-#define HX_MAKE_MAP_EMPTY() ((HexaVal)NB_MAP)
-#define HX_MAKE_FN_EMPTY()  ((HexaVal)NB_FN)
-#define HX_MAKE_CLO_EMPTY() ((HexaVal)NB_CLOSURE)
-#define HX_MAKE_VS_EMPTY()  ((HexaVal)NB_VALSTRUCT)
-
-#define HX_VSF(v, field) (HX_VS(v)->field)
-
-// ── Type tests ──────────────────────────────────────────────
-#define HX_IS_FLOAT(v)     (((v) & QNAN) != QNAN)
-#define HX_IS_INT(v)       (((v) & NB_HEADER_MASK) == NB_INT)
-#define HX_IS_BOOL(v)      (((v) & NB_HEADER_MASK) == NB_BOOL)
-#define HX_IS_STR(v)       (((v) & NB_HEADER_MASK) == NB_STR)
-#define HX_IS_VOID(v)      (((v) & NB_HEADER_MASK) == NB_VOID)
-#define HX_IS_ARRAY(v)     (((v) & NB_HEADER_MASK) == NB_ARRAY)
-#define HX_IS_MAP(v)       (((v) & NB_HEADER_MASK) == NB_MAP)
-#define HX_IS_FN(v)        (((v) & NB_HEADER_MASK) == NB_FN)
-#define HX_IS_CLOSURE(v)   (((v) & NB_HEADER_MASK) == NB_CLOSURE)
-#define HX_IS_VALSTRUCT(v) (((v) & NB_HEADER_MASK) == NB_VALSTRUCT)
+#define HX_IS_INT(v)    ((v).tag == TAG_INT)
+#define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
+#define HX_IS_BOOL(v)   ((v).tag == TAG_BOOL)
+#define HX_IS_STR(v)    ((v).tag == TAG_STR)
+#define HX_IS_VOID(v)   ((v).tag == TAG_VOID)
+#define HX_IS_ARRAY(v)  ((v).tag == TAG_ARRAY)
+#define HX_IS_MAP(v)    ((v).tag == TAG_MAP)
+#define HX_IS_FN(v)     ((v).tag == TAG_FN)
+#define HX_IS_CLOSURE(v)((v).tag == TAG_CLOSURE)
+#define HX_IS_VALSTRUCT(v) ((v).tag == TAG_VALSTRUCT)
 
 // rt 32-G Phase 0 (redesigned): flat C struct replacement for `Val` map.
 // Fields MUST mirror self/hexa_full.hexa `struct Val` exactly (order + types).
@@ -485,7 +425,7 @@ typedef struct HexaValStruct {
 // Build a closure value. Captured values are provided as an already-built
 // TAG_ARRAY HexaVal; we heap-box it so the closure remains valid after copies.
 static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr) {
-    HexaVal v = HX_MAKE_TAG(TAG_CLOSURE);
+    HexaVal v = {.tag=TAG_CLOSURE};
     HX_SET_CLO_PTR_D(v, (HexaClo*)calloc(1, sizeof(HexaClo)));
     HX_SET_CLO_PTR(v, fn_ptr);
     HX_SET_CLO_ARITY(v, arity);
@@ -497,7 +437,7 @@ static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr)
 // S1-D2: NaN-boxing-safe constructor for TAG_FN values.
 // S1-D3a: allocates HexaFn heap descriptor (was inline .fn={...} struct literal).
 static inline HexaVal hexa_fn_new(void* fn_ptr, int arity) {
-    HexaVal v = HX_MAKE_TAG(TAG_FN);
+    HexaVal v = {.tag=TAG_FN};
     HX_SET_FN_PTR_D(v, (HexaFn*)calloc(1, sizeof(HexaFn)));
     HX_FN_PTR(v) = fn_ptr;
     HX_FN_ARITY(v) = arity;
@@ -568,10 +508,10 @@ static inline HexaVal hexa_call4(HexaVal f, HexaVal a1, HexaVal a2, HexaVal a3, 
 
 // ── Constructors ─────────────────────────────────────────
 
-HexaVal hexa_int(int64_t n) { return HX_MAKE_INT(n); }
-HexaVal hexa_float(double f) { return HX_MAKE_FLOAT(f); }
-HexaVal hexa_bool(int b) { return HX_MAKE_BOOL(b); }
-HexaVal hexa_void() { return HX_MAKE_VOID(); }
+HexaVal hexa_int(int64_t n) { return (HexaVal){.tag=TAG_INT, .i=n}; }
+HexaVal hexa_float(double f) { return (HexaVal){.tag=TAG_FLOAT, .f=f}; }
+HexaVal hexa_bool(int b) { return (HexaVal){.tag=TAG_BOOL, .b=b}; }
+HexaVal hexa_void() { return (HexaVal){.tag=TAG_VOID}; }
 
 // T32: unwrap a HexaVal (possibly VALSTRUCT-wrapped by the interpreter) into
 // a raw C double. The prior inline `v.tag==TAG_FLOAT?v.f:(double)v.i` read
@@ -643,7 +583,7 @@ HexaVal hexa_null_coal(HexaVal a, HexaVal b) {
 }
 
 HexaVal hexa_str(const char* s) {
-    HexaVal v = HX_MAKE_TAG(TAG_STR);
+    HexaVal v = {.tag=TAG_STR};
     // Optimization #11: intern short strings for pointer-equality comparison
     const char* interned = hexa_intern(s);
     if (interned) {
@@ -655,7 +595,7 @@ HexaVal hexa_str(const char* s) {
 }
 
 HexaVal hexa_str_own(char* s) {
-    return HX_MAKE_STR(s);
+    return (HexaVal){.tag=TAG_STR, .s=s};
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -843,7 +783,7 @@ static HexaVal* hexa_array_promote_to_heap(HexaVal* arena_items, int len, int ne
 
 HexaVal hexa_array_new() {
     if (_hx_stats_on()) _hx_stats_array_new++;
-    HexaVal v = HX_MAKE_TAG(TAG_ARRAY);
+    HexaVal v = {.tag=TAG_ARRAY};
     HX_SET_ARR_PTR(v, (HexaArr*)calloc(1, sizeof(HexaArr)));
     return v;
 }
@@ -1017,7 +957,7 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
 // that is not disturbed by subsequent NK_CALL recursion mutating the buffer.
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     if (_hx_stats_on()) _hx_stats_array_new++;
-    HexaVal out = HX_MAKE_TAG(TAG_ARRAY);
+    HexaVal out = {.tag=TAG_ARRAY};
     HX_SET_ARR_PTR(out, (HexaArr*)calloc(1, sizeof(HexaArr)));
     if (!HX_IS_ARRAY(arr)) return out;
     int n = HX_ARR_LEN(arr);
@@ -1204,7 +1144,7 @@ static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
 
 HexaVal hexa_map_new() {
     if (_hx_stats_on()) _hx_stats_map_new++;
-    HexaVal v = HX_MAKE_TAG(TAG_MAP);
+    HexaVal v = {.tag=TAG_MAP};
     HX_SET_MAP_PTR(v, (HexaMap*)calloc(1, sizeof(HexaMap)));
     return v;
 }
@@ -1217,7 +1157,7 @@ HexaVal hexa_map_new() {
 HexaVal hexa_struct_pack_map(const char* type_name, int n,
                              const char* const* keys, const HexaVal* vals) {
     if (_hx_stats_on()) _hx_stats_map_new++;
-    HexaVal v = HX_MAKE_TAG(TAG_MAP);
+    HexaVal v = {.tag=TAG_MAP};
     HX_SET_MAP_PTR(v, (HexaMap*)calloc(1, sizeof(HexaMap)));
     // Pre-size: (n+1) entries including __type__, target load < HMAP_LOAD_MAX/100.
     // Solve for smallest power-of-2 cap where (n+1)*100/cap < HMAP_LOAD_MAX.
@@ -1252,7 +1192,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             char* kdup = (char*)hexa_arena_alloc(strlen("__type__") + 1);
             memcpy(kdup, "__type__", 9);
             t->slots[idx].key = kdup;
-            HexaVal tv = HX_MAKE_TAG(TAG_STR);
+            HexaVal tv = {.tag=TAG_STR};
             size_t tnl = strlen(type_name);
             char* tdup = (char*)hexa_arena_alloc(tnl + 1);
             memcpy(tdup, type_name, tnl + 1);
@@ -1266,7 +1206,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             t->slots[idx].key = strdup("__type__");
             t->slots[idx].hash = h;
             t->slots[idx].order_idx = t->len;  // ROI-24
-            HexaVal tv = HX_MAKE_TAG(TAG_STR);
+            HexaVal tv = {.tag=TAG_STR};
             HX_SET_STR(tv, strdup(type_name));
             t->vals[idx] = tv;
             t->order_keys[t->len] = t->slots[idx].key;
@@ -1368,39 +1308,8 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     if (HX_IS_VALSTRUCT(m)) {
         return hexa_valstruct_get_by_key(m, key);
     }
-    // NaN-boxing compat bridge: transpiled code accesses .int_val / .float_val / .tag
-    // on NaN-boxed scalars that were formerly ValStructs. Return the native value.
-    if (HX_IS_INT(m)) {
-        if (key[0]=='i' && strcmp(key,"int_val")==0) return m;
-        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_INT);
-        if (key[0]=='f' && strcmp(key,"float_val")==0) return hexa_float((double)HX_INT(m));
-        if (key[0]=='b' && strcmp(key,"bool_val")==0) return hexa_bool(HX_INT(m)!=0);
-        if (key[0]=='s' && strcmp(key,"str_val")==0) return hexa_str("");
-        return hexa_void();
-    }
-    if (HX_IS_FLOAT(m)) {
-        if (key[0]=='f' && strcmp(key,"float_val")==0) return m;
-        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_FLOAT);
-        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int((int64_t)HX_FLOAT(m));
-        if (key[0]=='b' && strcmp(key,"bool_val")==0) return hexa_bool(HX_FLOAT(m)!=0.0);
-        if (key[0]=='s' && strcmp(key,"str_val")==0) return hexa_str("");
-        return hexa_void();
-    }
-    if (HX_IS_BOOL(m)) {
-        if (key[0]=='b' && strcmp(key,"bool_val")==0) return m;
-        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_BOOL);
-        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int(HX_INT(m)&1);
-        return hexa_void();
-    }
-    if (HX_IS_STR(m)) {
-        if (key[0]=='s' && strcmp(key,"str_val")==0) return m;
-        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_STR);
-        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int(0);
-        return hexa_void();
-    }
     if (!HX_MAP_TBL(m)) {
-        // Silently return void for non-map/non-scalar types — avoids noisy stderr
-        // during NaN-boxing transition where transpiled code probes fields on any type.
+        fprintf(stderr, "map key '%s' not found\n", key);
         return hexa_void();
     }
     HexaMapTable* t = HX_MAP_TBL(m);
@@ -1661,7 +1570,7 @@ HexaVal hexa_valstruct_new_v(
     s->fn_body       = fn_body_v;
     s->struct_name   = struct_name_v;
     s->struct_fields = struct_fields_v;
-    HexaVal v = HX_MAKE_TAG(TAG_VALSTRUCT);
+    HexaVal v = {.tag = TAG_VALSTRUCT};
     HX_SET_VS(v, s);
     return v;
 }
@@ -2002,13 +1911,12 @@ static int __hexa_val_arena_enabled = -1;  // -1 = lazy probe
 static int hexa_val_arena_on(void) {
     if (__hexa_val_arena_enabled < 0) {
         const char* e = getenv("HEXA_VAL_ARENA");
-        // S7-C: default OFF for NaN-boxing (2026-04-16). Arena scope pop
-        // corrupts __VAL_INT_CACHE (init-time Vals arena-allocated due to
-        // __hexa_fn_arena_enter in __init_val_int_cache). Pending: heapify
-        // cache entries before scope pop, then re-enable.
-        // Opt-in: HEXA_VAL_ARENA=1.
+        // S7-B: default ON (2026-04-16). Phase A wired codegen_c2
+        // __hexa_fn_arena_enter/return; T33 corruption fixed; full 236-example
+        // + 16-case stage1 regression suite passed 0-regression under ARENA=1.
+        // Opt-out: HEXA_VAL_ARENA=0.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 0;
+            __hexa_val_arena_enabled = 1;
         } else {
             __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
@@ -2134,9 +2042,6 @@ static HexaMapTable* hmap_heapify(HexaMapTable* src) {
 // retain their pointer identity (those allocators don't currently use the
 // arena, so heapify is a no-op for them).
 HexaVal hexa_val_heapify(HexaVal v) {
-    // NaN-boxing: TAG_FLOAT/TAG_INT/TAG_BOOL/TAG_VOID are immediate values
-    // (no pointers to arena memory). Short-circuit before the switch.
-    if (HX_IS_FLOAT(v) || HX_IS_INT(v) || HX_IS_BOOL(v) || HX_IS_VOID(v)) return v;
     switch (HX_TAG(v)) {
         case TAG_MAP:
             if (HX_MAP_TBL(v) && HX_MAP_TBL(v)->from_arena) {
@@ -3203,7 +3108,7 @@ static void* hexa_ffi_dlsym(void* handle, const char* symbol) {
 // Marshal a HexaVal to a raw i64 for C ABI passing.
 static int64_t hexa_ffi_marshal_arg(HexaVal v) {
     switch (HX_TAG(v)) {
-        case TAG_INT:   return HX_INT_U(v);  // unsigned: pointer values must not sign-extend
+        case TAG_INT:   return HX_INT(v);
         case TAG_FLOAT: { union { double d; int64_t i; } u; u.d = HX_FLOAT(v); return u.i; }
         case TAG_BOOL:  return (int64_t)HX_BOOL(v);
         case TAG_STR:   return (int64_t)(uintptr_t)HX_STR(v);
@@ -3279,7 +3184,7 @@ HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_
     int64_t iv[8]; // int values
     for (int i = 0; i < nargs && i < 8; i++) {
         if (float_mask & (1 << i)) {
-            fv[i] = HX_IS_FLOAT(hargs[i]) ? HX_FLOAT(hargs[i]) : (double)HX_INT_U(hargs[i]);
+            fv[i] = HX_IS_FLOAT(hargs[i]) ? HX_FLOAT(hargs[i]) : (double)HX_INT(hargs[i]);
         } else {
             iv[i] = hexa_ffi_marshal_arg(hargs[i]);
         }
@@ -3411,13 +3316,8 @@ HexaVal hexa_cstring(HexaVal s) {
     return hexa_int((int64_t)(uintptr_t)HX_STR(s));
 }
 
-// NaN-boxing unsigned int extraction — for raw pointers stored via hexa_int().
-// HX_INT() sign-extends from bit 46, corrupting ARM64 heap pointers
-// (0x6000... has bit 46 set → negative). This macro extracts unsigned.
-#define HX_INT_U(v) ((int64_t)((uint64_t)(v) & NB_PAYLOAD))
-
 HexaVal hexa_from_cstring(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
     if (p == 0) return hexa_str("");
     return hexa_str((const char*)(uintptr_t)p);
 }
@@ -3425,7 +3325,7 @@ HexaVal hexa_from_cstring(HexaVal ptr) {
 HexaVal hexa_ptr_null() { return hexa_int(0); }
 
 HexaVal hexa_ptr_addr(HexaVal v) {
-    return hexa_int(HX_INT_U(v));
+    return hexa_int(HX_INT(v));
 }
 
 // ── C2 Step 3: Dynamic FFI host dispatch (interpreter path) ──
@@ -3478,19 +3378,17 @@ static HexaVal hexa_host_ffi_unwrap(HexaVal v) {
     int64_t t = HX_VSF(v, tag_i);
     // Hexa-level tag values: 0=INT, 1=FLOAT, 2=BOOL, 3=STR, 8=VOID, 13=POINTER
     // See self/interpreter.hexa let TAG_* constants.
-    // int_val may itself be a NaN-boxed HexaVal (from val_int wrapping). If so,
-    // return it directly — it's already a valid HexaVal. Otherwise re-box.
-    if (t == 0)  { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
+    if (t == 0)  return hexa_int(HX_VSF(v, int_val));
     if (t == 1)  return hexa_float(HX_VSF(v, float_val));
     if (t == 2)  return hexa_bool(HX_VSF(v, bool_val));
     if (t == 3)  return HX_VSF(v, str_val);       // already TAG_STR
-    if (t == 13) { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
-    { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
+    if (t == 13) return hexa_int(HX_VSF(v, int_val));  // pointer → int ABI lane
+    return hexa_int(HX_VSF(v, int_val));
 }
 
 HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask, HexaVal ret_kind) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
     HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
@@ -3531,7 +3429,7 @@ HexaVal hexa_host_ffi_call_6(
     HexaVal a0, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4, HexaVal a5
 ) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
@@ -3587,21 +3485,21 @@ HexaVal hexa_ptr_alloc(HexaVal size) {
 }
 
 HexaVal hexa_ptr_free(HexaVal ptr, HexaVal size) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
     if (p != 0) free((void*)(uintptr_t)p);
     return hexa_void();
 }
 
 HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
     if (p == 0) return hexa_void();
     uint8_t* base = (uint8_t*)(uintptr_t)p + off;
     if (HX_IS_FLOAT(val)) {
         double d = HX_FLOAT(val);
         memcpy(base, &d, sizeof(double));
     } else {
-        int64_t v = HX_INT_U(val);
+        int64_t v = HX_INT(val);
         memcpy(base, &v, sizeof(int64_t));
     }
     return hexa_void();
@@ -3612,8 +3510,8 @@ HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
  * as general-purpose. */
 
 HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
     if (p == 0) return hexa_int(0);
     int64_t v;
     memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int64_t));
@@ -3900,27 +3798,6 @@ HexaVal _hx_bit_or(HexaVal a, HexaVal b) {
     return hexa_int(x | y);
 }
 static HexaVal bit_or;
-static HexaVal parse_float;
-static HexaVal env;
-static HexaVal matvec;
-
-HexaVal hexa_matvec(HexaVal W, HexaVal x, HexaVal rv, HexaVal cv) {
-    int64_t rows = HX_IS_INT(rv) ? HX_INT(rv) : (int64_t)HX_FLOAT(rv);
-    int64_t cols = HX_IS_INT(cv) ? HX_INT(cv) : (int64_t)HX_FLOAT(cv);
-    if (rows <= 0 || cols <= 0) return hexa_array_new();
-    HexaVal o = hexa_array_new();
-    for (int64_t r = 0; r < rows; r++) {
-        double a = 0.0;
-        for (int64_t c = 0; c < cols; c++) {
-            HexaVal wv = hexa_index_get(W, hexa_int(r * cols + c));
-            HexaVal xv = hexa_index_get(x, hexa_int(c));
-            a += (HX_IS_FLOAT(wv) ? HX_FLOAT(wv) : (double)HX_INT(wv)) *
-                 (HX_IS_FLOAT(xv) ? HX_FLOAT(xv) : (double)HX_INT(xv));
-        }
-        o = hexa_array_push(o, hexa_float(a));
-    }
-    return o;
-}
 
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
@@ -4330,9 +4207,6 @@ static void _hexa_init_fn_shims(void) {
     // std::net free-fn shims — bridges transpiler bootstrap gap for
     // net_connect / net_read / net_write until hexa_v2 learns the
     // direct-lowering for these names (see native/net.c comment).
-    parse_float = hexa_fn_new((void*)hexa_str_parse_float, 1);
-    env         = hexa_fn_new((void*)hexa_env_var,         1);
-    matvec      = hexa_fn_new((void*)hexa_matvec,          4);
     _hexa_init_net_fn_shims();
     _fn_shims_ready = 1;
 }
