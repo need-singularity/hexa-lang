@@ -339,9 +339,13 @@ struct CallFrame {
 let mut vm_stack = []          // operand stack: array of Val
 let mut vm_stack_top = 0       // ROI-21: index pointer — push/pop are O(1) index bumps
 let mut vm_frames = []         // call frame stack: array of CallFrame
+let mut vm_frame_top = 0       // ROI-26: index pointer — push/pop are O(1) index bumps
 let mut vm_globals = []        // global variables: [[name, val], ...]
 let mut vm_constants = []      // constant pool: array of strings
 let mut vm_functions = []      // compiled functions: array of CompiledFn
+// ROI-27: 64-bucket hash caches for O(1) avg global/fn lookup
+let mut vm_global_cache = []   // 64 buckets; each bucket is [[name, val], ...]
+let mut vm_fn_cache = []       // 64 buckets; each bucket is [CompiledFn, ...]
 let mut vm_halted = false
 let mut vm_error = ""
 let mut vm_array_store = []   // external store for arrays of Val
@@ -352,6 +356,25 @@ let mut vm_break_flag = false
 let mut vm_continue_flag = false
 let mut vm_loop_starts = []   // stack of loop header IP addresses
 let mut vm_loop_ends = []     // stack of loop end IP addresses
+
+// ── ROI-26: Frame stack operations ──────────────────────
+
+fn vm_frame_push(frame) {
+    if vm_frame_top >= len(vm_frames) {
+        let mut _grow_n = len(vm_frames)
+        if _grow_n == 0 { _grow_n = 64 }
+        while _grow_n > 0 {
+            vm_frames = vm_frames.push(CallFrame { fn_name: "", code: "", ip: 0, base_slot: 0, local_count: 0 })
+            _grow_n = _grow_n - 1
+        }
+    }
+    vm_frames[vm_frame_top] = frame
+    vm_frame_top = vm_frame_top + 1
+}
+
+fn vm_frame_pop() {
+    vm_frame_top = vm_frame_top - 1
+}
 
 // ── Stack operations ─────────────────────────────────────
 
@@ -384,13 +407,43 @@ fn vm_peek_at(offset) {
     return vm_stack[vm_stack_top - 1 - offset]
 }
 
-// ── Global variable helpers ──────────────────────────────
+// ── ROI-27: 64-bucket hash helpers ──────────────────────
+
+fn vm_hash64(key) {
+    let mut h = 0
+    let mut ci = 0
+    let n = len(key)
+    while ci < n {
+        h = (h * 31 + char_code(key, ci)) % 64
+        ci = ci + 1
+    }
+    let mut b = h
+    while b < 0 { b = b + 64 }
+    return b % 64
+}
+
+fn vm_init_caches() {
+    let mut gc = []
+    let mut fc = []
+    let mut i = 0
+    while i < 64 {
+        gc = gc.push([])
+        fc = fc.push([])
+        i = i + 1
+    }
+    vm_global_cache = gc
+    vm_fn_cache = fc
+}
+
+// ── Global variable helpers (ROI-27: hash-backed) ───────
 
 fn vm_get_global(name) {
-    let mut i = len(vm_globals) - 1
+    let b = vm_hash64(name)
+    let bucket = vm_global_cache[b]
+    let mut i = len(bucket) - 1
     while i >= 0 {
-        if vm_globals[i][0] == name {
-            return vm_globals[i][1]
+        if bucket[i][0] == name {
+            return bucket[i][1]
         }
         i = i - 1
     }
@@ -399,29 +452,43 @@ fn vm_get_global(name) {
 }
 
 fn vm_set_global(name, val) {
-    // Update existing or append
+    let b = vm_hash64(name)
+    let bucket = vm_global_cache[b]
     let mut i = 0
-    while i < len(vm_globals) {
-        if vm_globals[i][0] == name {
-            vm_globals[i] = [name, val]
+    while i < len(bucket) {
+        if bucket[i][0] == name {
+            bucket[i] = [name, val]
+            vm_global_cache[b] = bucket
             return
         }
         i = i + 1
     }
-    vm_globals = vm_globals.push([name, val])
+    vm_global_cache[b] = bucket.push([name, val])
 }
 
-// ── Function registry lookup ─────────────────────────────
+// ── Function registry lookup (ROI-27: hash-backed) ──────
 
 fn vm_find_fn(name) {
+    let b = vm_hash64(name)
+    let bucket = vm_fn_cache[b]
     let mut i = 0
-    while i < len(vm_functions) {
-        if vm_functions[i].name == name {
-            return vm_functions[i]
+    while i < len(bucket) {
+        if bucket[i].name == name {
+            return bucket[i]
         }
         i = i + 1
     }
     return ""
+}
+
+fn vm_build_fn_cache() {
+    let mut i = 0
+    while i < len(vm_functions) {
+        let f = vm_functions[i]
+        let b = vm_hash64(f.name)
+        vm_fn_cache[b] = vm_fn_cache[b].push(f)
+        i = i + 1
+    }
 }
 
 // ── Local variable access (frame-relative) ───────────────
@@ -485,6 +552,7 @@ fn vm_run(code, constants, functions) {
     vm_stack = []
     vm_stack_top = 0  // ROI-21
     vm_frames = []
+    vm_frame_top = 0  // ROI-26
     vm_globals = []
     vm_constants = constants
     vm_functions = functions
@@ -497,7 +565,11 @@ fn vm_run(code, constants, functions) {
     vm_break_flag = false
     vm_continue_flag = false
 
-    // Top-level frame
+    // ROI-27: init hash caches + build fn cache
+    vm_init_caches()
+    vm_build_fn_cache()
+
+    // Top-level frame — ROI-26: use vm_frame_push
     let top_frame = CallFrame {
         fn_name: "<main>",
         code: code,
@@ -505,7 +577,7 @@ fn vm_run(code, constants, functions) {
         base_slot: 0,
         local_count: 256
     }
-    vm_frames = vm_frames.push(top_frame)
+    vm_frame_push(top_frame)
 
     // Reserve local slots on stack
     let mut i = 0
@@ -697,25 +769,19 @@ fn vm_builtin(spec) {
 }
 
 fn vm_dispatch() {
-    while !vm_halted && vm_error == "" && len(vm_frames) > 0 {
-        let fidx = len(vm_frames) - 1
+    while !vm_halted && vm_error == "" && vm_frame_top > 0 {
+        let fidx = vm_frame_top - 1
         let frame = vm_frames[fidx]
         let code = frame.code
 
         if frame.ip >= len(code) {
             // End of code for this frame
-            if len(vm_frames) <= 1 {
+            if vm_frame_top <= 1 {
                 vm_halted = true
                 return
             }
-            // Implicit void return
-            let mut new_frames = []
-            let mut j = 0
-            while j < len(vm_frames) - 1 {
-                new_frames = new_frames.push(vm_frames[j])
-                j = j + 1
-            }
-            vm_frames = new_frames
+            // Implicit void return — ROI-26: O(1) frame pop
+            vm_frame_pop()
             vm_push(val_void())
             return vm_dispatch()
         }
@@ -965,14 +1031,14 @@ fn vm_dispatch() {
 
         if op == OP_GET_LOCAL {
             let slot = to_int(operand)
-            let cur_frame = vm_frames[len(vm_frames) - 1]
+            let cur_frame = vm_frames[vm_frame_top - 1]
             let val = vm_stack[cur_frame.base_slot + slot]
             vm_push(val)
         }
 
         if op == OP_SET_LOCAL {
             let slot = to_int(operand)
-            let cur_frame = vm_frames[len(vm_frames) - 1]
+            let cur_frame = vm_frames[vm_frame_top - 1]
             let val = vm_peek()
             vm_stack[cur_frame.base_slot + slot] = val
             vm_pop()
@@ -994,8 +1060,8 @@ fn vm_dispatch() {
 
         if op == OP_JUMP {
             let target = to_int(operand)
-            let cur = vm_frames[len(vm_frames) - 1]
-            vm_frames[len(vm_frames) - 1] = CallFrame {
+            let cur = vm_frames[vm_frame_top - 1]
+            vm_frames[vm_frame_top - 1] = CallFrame {
                 fn_name: cur.fn_name,
                 code: cur.code,
                 ip: target,
@@ -1008,8 +1074,8 @@ fn vm_dispatch() {
             let cond = vm_pop()
             if !vm_val_is_truthy(cond) {
                 let target = to_int(operand)
-                let cur = vm_frames[len(vm_frames) - 1]
-                vm_frames[len(vm_frames) - 1] = CallFrame {
+                let cur = vm_frames[vm_frame_top - 1]
+                vm_frames[vm_frame_top - 1] = CallFrame {
                     fn_name: cur.fn_name,
                     code: cur.code,
                     ip: target,
@@ -1092,7 +1158,8 @@ fn vm_dispatch() {
                         vm_stack[new_base + p] = args[argc - 1 - p]
                         p = p + 1
                     }
-                    vm_frames = vm_frames.push(CallFrame {
+                    // ROI-26: O(1) frame push
+                    vm_frame_push(CallFrame {
                         fn_name: fname,
                         code: func.code,
                         ip: 0,
@@ -1107,20 +1174,14 @@ fn vm_dispatch() {
 
         if op == OP_RETURN {
             let ret_val = vm_pop()
-            let cur_frame = vm_frames[len(vm_frames) - 1]
-            // Pop frame
-            let mut new_frames = []
-            let mut fi = 0
-            while fi < len(vm_frames) - 1 {
-                new_frames = new_frames.push(vm_frames[fi])
-                fi = fi + 1
-            }
-            vm_frames = new_frames
+            let cur_frame = vm_frames[vm_frame_top - 1]
+            // ROI-26: O(1) frame pop — index decrement
+            vm_frame_pop()
             // ROI-21: O(1) bulk pop — reset stack top to frame base
             vm_stack_top = cur_frame.base_slot
             // Push return value
             vm_push(ret_val)
-            if len(vm_frames) == 0 {
+            if vm_frame_top == 0 {
                 vm_halted = true
                 return
             }
@@ -1164,23 +1225,15 @@ fn vm_dispatch() {
             }
         }
 
+        // ROI-29: O(1) in-place mutation instead of O(N) copy loop
         if op == OP_INDEX_ASSIGN {
             let idx = vm_pop()
             let obj = vm_pop()
             let val = vm_pop()
             if obj.tag_id == TAG_ARRAY && idx.tag_id == TAG_INT {
                 let items = vm_get_array(obj)
-                let mut new_items = []
-                let mut q = 0
-                while q < len(items) {
-                    if q == idx.int_val {
-                        new_items = new_items.push(val)
-                    } else {
-                        new_items = new_items.push(items[q])
-                    }
-                    q = q + 1
-                }
-                vm_set_array(obj, new_items)
+                items[idx.int_val] = val
+                vm_set_array(obj, items)
             }
         }
 
@@ -1204,25 +1257,27 @@ fn vm_dispatch() {
             }
         }
 
+        // ROI-29: O(1) in-place field mutation instead of O(N) copy loop
         if op == OP_SET_FIELD {
             let obj = vm_pop()
             let val = vm_pop()
             if obj.tag_id == TAG_STRUCT {
                 let fields = vm_get_struct_fields(obj)
-                let mut new_fields = []
                 let mut q = 0
                 let mut found = false
                 while q < len(fields) {
                     if fields[q][0] == operand {
-                        new_fields = new_fields.push([operand, val])
+                        fields[q] = [operand, val]
                         found = true
-                    } else {
-                        new_fields = new_fields.push(fields[q])
+                        q = len(fields)
                     }
                     q = q + 1
                 }
-                if !found { new_fields = new_fields.push([operand, val]) }
-                vm_set_struct_fields(obj, new_fields)
+                if !found {
+                    vm_set_struct_fields(obj, fields.push([operand, val]))
+                } else {
+                    vm_set_struct_fields(obj, fields)
+                }
             }
         }
 
@@ -1480,7 +1535,8 @@ fn vm_dispatch() {
                     vm_stack[new_base + p] = iargs[p]
                     p = p + 1
                 }
-                vm_frames = vm_frames.push(CallFrame {
+                // ROI-26: O(1) frame push
+                vm_frame_push(CallFrame {
                     fn_name: callee.fn_name,
                     code: func.code,
                     ip: 0,
@@ -1516,8 +1572,8 @@ fn vm_dispatch() {
                     ci2 = ci2 + 1
                 }
                 vm_catch_stack = cs
-                let cur = vm_frames[len(vm_frames) - 1]
-                vm_frames[len(vm_frames) - 1] = CallFrame {
+                let cur = vm_frames[vm_frame_top - 1]
+                vm_frames[vm_frame_top - 1] = CallFrame {
                     fn_name: cur.fn_name,
                     code: cur.code,
                     ip: target,
