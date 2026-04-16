@@ -106,6 +106,66 @@ fn cleanup_lock(lock_dir) {
     exec("rm -rf /tmp/hexa_flatten.lock 2>/dev/null")
 }
 
+// ── Sanity check: run a trivial program through the freshly built stage0
+// and verify that output matches exactly what we expect. If it doesn't,
+// roll back from `backup_path` (if it still exists) and exit(1).
+// This catches "compiles but produces garbled output" bugs that slipped past
+// the size guard (e.g. duplicated println, broken int_to_string, corrupt concat).
+//
+// Returns normally on success; calls exit(1) on failure.
+// Side-effect: leaves /tmp/hx_sanity.{hexa,out} for post-mortem inspection.
+fn sanity_check_stage0(out_path, backup_path, uname) {
+    let sanity_hexa = "/tmp/hx_sanity.hexa"
+    let sanity_out = "/tmp/hx_sanity.out"
+    let sanity_src = "println(\"ok\")\nprintln(40+2)\n"
+    write_file(sanity_hexa, sanity_src)
+    exec("rm -f " + sanity_out)
+    // Run subprocess, capture stdout+stderr to file. Timeout defense: 10s.
+    // Use a POSIX-portable bounded wait (perl) since `timeout` is not on
+    // default macOS and `gtimeout` may be absent.
+    let run_cmd = out_path + " " + sanity_hexa + " > " + sanity_out + " 2>&1"
+    // Bounded execution: background the sanity run, kill after 10s if it hangs.
+    // Wrapped in `sh -c '...'` so all the backgrounding lives in a child shell.
+    let guarded = "sh -c '( " + run_cmd + " ) & pid=$!; ( sleep 10 && kill -9 $pid 2>/dev/null ) & watcher=$!; wait $pid 2>/dev/null; rc=$?; kill $watcher 2>/dev/null; wait $watcher 2>/dev/null; exit $rc'"
+    let run_result = exec_with_status(guarded)
+    let rc = run_result[1]
+    let mut got = ""
+    if file_exists(sanity_out) {
+        got = read_file(sanity_out)
+    }
+    // Accept either "ok\n42\n" or "ok\n42" (trailing newline optional).
+    let expected_a = "ok\n42\n"
+    let expected_b = "ok\n42"
+    let pass = rc == 0 && (got == expected_a || got == expected_b)
+    if pass {
+        println("[rebuild_stage0] sanity: OK (ok/42)")
+        return
+    }
+    // FAIL — print diagnostic
+    eprintln("[rebuild_stage0] SANITY FAIL — rebuilt binary produced wrong output")
+    eprintln("  command : " + out_path + " " + sanity_hexa)
+    eprintln("  exit    : " + str(rc))
+    eprintln("  expected: \"ok\\n42\\n\" (or without trailing newline)")
+    eprintln("  got     : [" + got + "]")
+    eprintln("  bytes   : " + str(len(got)))
+    // Roll back
+    if backup_path == "" {
+        eprintln("[rebuild_stage0] sanity: no backup available (first-ever build?) — leaving broken binary in place for debug")
+    } else if !file_exists(backup_path) {
+        eprintln("[rebuild_stage0] sanity: backup " + backup_path + " missing — cannot roll back")
+    } else {
+        exec("cp -f " + backup_path + " " + out_path)
+        if uname == "Darwin" {
+            let cs = exec_with_status("command -v codesign >/dev/null 2>&1")
+            if cs[1] == 0 {
+                exec_with_status("codesign --force --sign - " + out_path + " 2>/dev/null")
+            }
+        }
+        eprintln("[rebuild_stage0] sanity: rolled back to " + backup_path)
+    }
+    exit(1)
+}
+
 // ── Per-file manifest helpers ──────────────────────────────────
 fn write_manifest(manifest_path, file_paths) {
     // Write sorted "hash  path" lines
@@ -454,6 +514,17 @@ if env("FORCE") == "" && file_exists(link_cache_bin) {
     let csize = to_int(exec("wc -c < " + link_cache_bin + " | tr -d ' '").trim())
     if csize >= min_size {
         exec("mkdir -p " + hexa_dir + "/build")
+        // Pre-copy backup so sanity check can roll back if cached bin is bad.
+        let mut cache_backup = ""
+        let cache_out_exists = exec_with_status("test -x " + out)
+        if cache_out_exists[1] == 0 {
+            let cache_old_size = to_int(exec("wc -c < " + out + " | tr -d ' '").trim())
+            if cache_old_size >= min_size {
+                let ch_pid = exec("echo $$").trim()
+                cache_backup = "/tmp/hexa_stage0_backup_" + ch_pid
+                exec("cp -f " + out + " " + cache_backup)
+            }
+        }
         exec("cp -f " + link_cache_bin + " " + out)
         // Darwin: codesign ad-hoc
         if uname == "Darwin" {
@@ -472,6 +543,11 @@ if env("FORCE") == "" && file_exists(link_cache_bin) {
         let meta_json = "{\"flatten_key\":\"" + flatten_key + "\",\"transpile_key\":\"" + transpile_key + "\",\"link_key\":\"" + link_key + "\",\"hit\":{\"flatten\":1,\"transpile\":1,\"link\":1},\"uname\":\"" + uname + "\",\"incremental\":{\"runtime_only\":0,\"changed_files\":\"\",\"changed_count\":0}}"
         write_file(cache_meta_dir + "/last_build.json", meta_json + "\n")
         println("[rebuild_stage0] CACHE HIT (all 3 layers) -> cp " + link_cache_bin + " -> " + out + " (" + str(csize) + " bytes)")
+        // Sanity-check cached binary (might be stale/corrupt from an older broken build)
+        sanity_check_stage0(out, cache_backup, uname)
+        if cache_backup != "" {
+            exec("rm -f " + cache_backup)
+        }
         println("[rebuild_stage0] OK (cache)")
         cleanup_lock(lock_dir)
         exit(0)
@@ -693,11 +769,17 @@ if out_check2[1] == 0 {
         exit(1)
     }
 }
+
+// ── 10b. Sanity check — run a trivial .hexa through the new binary and
+// verify output matches "ok\n42\n" exactly. Rolls back + exits(1) if it
+// doesn't. Runs BEFORE cache save so a bad binary can't poison link cache.
+sanity_check_stage0(out, backup_path, uname)
+
 if backup_path != "" {
     exec("rm -f " + backup_path)
 }
 
-// ── 11. 캐시 저장 — 빌드 성공 후에만 ───────────────────────
+// ── 11. 캐시 저장 — 빌드 성공 + sanity PASS 이후에만 ───────
 if file_exists(src_c) && !file_exists(transpile_cache) {
     exec_with_status("cp -f " + src_c + " " + transpile_cache + " 2>/dev/null")
 }

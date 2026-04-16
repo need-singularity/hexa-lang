@@ -844,6 +844,9 @@ HexaVal gen2_expr(HexaVal node) {
         if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("!")))) {
             return hexa_add(hexa_add(hexa_str("hexa_bool(!hexa_truthy("), gen2_expr(hexa_map_get(node, "left"))), hexa_str("))"));
         }
+        if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("~")))) {
+            return hexa_add(hexa_add(hexa_str("hexa_int(~hexa_as_num("), gen2_expr(hexa_map_get(node, "left"))), hexa_str("))"));
+        }
         return hexa_str("/* unary */");
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("Field")))) {
