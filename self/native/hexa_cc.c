@@ -10560,6 +10560,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     hexa_set_args(argc, argv);
+    _lexer_init(argc, argv);
+    _parser_init(argc, argv);
+    _type_checker_init(argc, argv);
+    _codegen_c2_init(argc, argv);
     HexaVal src = hexa_read_file(hexa_str(argv[1]));
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
