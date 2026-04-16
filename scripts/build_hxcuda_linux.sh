@@ -64,7 +64,19 @@ if ! command -v nvcc >/dev/null 2>&1; then
 fi
 
 NVCC_VER=$(nvcc --version 2>&1 | grep -oP 'release \K[0-9.]+' || echo "unknown")
-echo "[build_hxcuda] nvcc version: $NVCC_VER, target arch: $ARCH"
+
+# Auto-detect GPU arch if not overridden via --arch
+if [ "$ARCH" = "sm_90" ]; then
+    GPU_NAME=$(nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1 || true)
+    case "$GPU_NAME" in
+        *H100*) ARCH="sm_90" ;;
+        *A100*) ARCH="sm_80" ;;
+        *4090*|*4080*) ARCH="sm_89" ;;
+        *3090*|*3080*) ARCH="sm_86" ;;
+        *) ;; # keep default sm_90
+    esac
+fi
+echo "[build_hxcuda] nvcc version: $NVCC_VER, target arch: $ARCH, gpu: ${GPU_NAME:-unknown}"
 
 # ── Syntax-check only ────────────────────────────────────────────
 if [ "$MODE" = "syntax" ]; then
