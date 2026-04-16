@@ -1,0 +1,341 @@
+// ===================================================================
+//  self/ml/activation_steering.hexa
+//  Pure Hexa Activation Steering (Turner et al. 2023 / RepE)
+//
+//  Implements activation/representation engineering for behavior
+//  control via steering vectors — mean difference, projection,
+//  PCA via power iteration, multi-vector steering.
+//
+//  Public API:
+//    compute_steering_vector(positive_acts, negative_acts) -> [float]
+//    apply_steering(hidden, vector, alpha) -> [float]
+//    normalize_vector(v) -> [float]
+//    cosine_similarity(a, b) -> float
+//    project_out(hidden, direction) -> [float]
+//    pca_1d(vectors) -> [float]
+//    multi_steer(hidden, vectors, alphas) -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called during forward pass
+// ===================================================================
+
+// ===================================================================
+//  Internal helpers
+// ===================================================================
+
+fn _as_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v.push(0.0)
+        i = i + 1
+    }
+    return v
+}
+
+fn _as_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _as_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 50 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn _as_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+fn _as_norm(v) {
+    return _as_sqrt(_as_dot(v, v))
+}
+
+// ===================================================================
+//  1. compute_steering_vector
+//
+//  Mean difference: mean(positive_acts) - mean(negative_acts)
+//  Each input is [[float]] — array of activation vectors.
+// ===================================================================
+
+@pure
+pub fn compute_steering_vector(positive_acts, negative_acts) {
+    let n_pos = len(positive_acts)
+    let n_neg = len(negative_acts)
+    if n_pos == 0 { return [] }
+    if n_neg == 0 { return [] }
+    let dim = len(positive_acts[0])
+
+    // Compute mean of positive activations
+    let mut pos_mean = _as_zeros(dim)
+    let mut i = 0
+    while i < n_pos {
+        let mut j = 0
+        while j < dim {
+            pos_mean[j] = pos_mean[j] + positive_acts[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let inv_pos = 1.0 / to_float(n_pos)
+    let mut k = 0
+    while k < dim {
+        pos_mean[k] = pos_mean[k] * inv_pos
+        k = k + 1
+    }
+
+    // Compute mean of negative activations
+    let mut neg_mean = _as_zeros(dim)
+    i = 0
+    while i < n_neg {
+        let mut j = 0
+        while j < dim {
+            neg_mean[j] = neg_mean[j] + negative_acts[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let inv_neg = 1.0 / to_float(n_neg)
+    k = 0
+    while k < dim {
+        neg_mean[k] = neg_mean[k] * inv_neg
+        k = k + 1
+    }
+
+    // Difference: pos_mean - neg_mean
+    let mut result = _as_zeros(dim)
+    k = 0
+    while k < dim {
+        result[k] = pos_mean[k] - neg_mean[k]
+        k = k + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  2. apply_steering
+//
+//  hidden + alpha * vector
+// ===================================================================
+
+@hot
+pub fn apply_steering(hidden, vector, alpha) {
+    let n = len(hidden)
+    let mut out = _as_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = hidden[i] + alpha * vector[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  3. normalize_vector
+//
+//  L2 normalize: v / ||v||
+// ===================================================================
+
+@pure
+pub fn normalize_vector(v) {
+    let n = len(v)
+    let norm = _as_norm(v)
+    if norm < 1.0e-12 { return v }
+    let inv = 1.0 / norm
+    let mut out = _as_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = v[i] * inv
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  4. cosine_similarity
+//
+//  cos(a, b) = dot(a, b) / (||a|| * ||b||)
+// ===================================================================
+
+@pure
+pub fn cosine_similarity(a, b) {
+    let dot = _as_dot(a, b)
+    let na = _as_norm(a)
+    let nb = _as_norm(b)
+    let denom = na * nb
+    if denom < 1.0e-12 { return 0.0 }
+    return dot / denom
+}
+
+// ===================================================================
+//  5. project_out
+//
+//  Remove the component of hidden along direction:
+//    hidden - (hidden . dir / |dir|^2) * dir
+// ===================================================================
+
+@pure
+pub fn project_out(hidden, direction) {
+    let n = len(hidden)
+    let dir_sq = _as_dot(direction, direction)
+    if dir_sq < 1.0e-12 { return hidden }
+    let coeff = _as_dot(hidden, direction) / dir_sq
+    let mut out = _as_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = hidden[i] - coeff * direction[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  6. pca_1d
+//
+//  First principal component via power iteration.
+//  Input: [[float]] — set of vectors (rows).
+//  Returns the dominant eigenvector of the covariance matrix.
+// ===================================================================
+
+@pure
+pub fn pca_1d(vectors) {
+    let nv = len(vectors)
+    if nv == 0 { return [] }
+    let dim = len(vectors[0])
+    if dim == 0 { return [] }
+
+    // Compute mean
+    let mut mean = _as_zeros(dim)
+    let mut i = 0
+    while i < nv {
+        let mut j = 0
+        while j < dim {
+            mean[j] = mean[j] + vectors[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    let inv_nv = 1.0 / to_float(nv)
+    let mut k = 0
+    while k < dim {
+        mean[k] = mean[k] * inv_nv
+        k = k + 1
+    }
+
+    // Center vectors
+    let mut centered = []
+    i = 0
+    while i < nv {
+        let mut row = _as_zeros(dim)
+        let mut j = 0
+        while j < dim {
+            row[j] = vectors[i][j] - mean[j]
+            j = j + 1
+        }
+        centered.push(row)
+        i = i + 1
+    }
+
+    // Power iteration: start with first centered vector (or [1,0,...])
+    let mut v = _as_zeros(dim)
+    v[0] = 1.0
+
+    let max_iter = 200
+    let mut iter = 0
+    while iter < max_iter {
+        // Multiply by covariance: Cv = (1/n) * X^T X v
+        // First compute Xv (nv-length), then X^T (Xv)
+        let mut xv = _as_zeros(nv)
+        i = 0
+        while i < nv {
+            let mut s = 0.0
+            let mut j = 0
+            while j < dim {
+                s = s + centered[i][j] * v[j]
+                j = j + 1
+            }
+            xv[i] = s
+            i = i + 1
+        }
+
+        // X^T (Xv) -> new_v (dim-length)
+        let mut new_v = _as_zeros(dim)
+        i = 0
+        while i < nv {
+            let mut j = 0
+            while j < dim {
+                new_v[j] = new_v[j] + centered[i][j] * xv[i]
+                j = j + 1
+            }
+            i = i + 1
+        }
+
+        // Normalize
+        let norm = _as_norm(new_v)
+        if norm < 1.0e-12 { return v }
+        let inv = 1.0 / norm
+        let mut j = 0
+        while j < dim {
+            new_v[j] = new_v[j] * inv
+            j = j + 1
+        }
+
+        // Check convergence: |dot(v, new_v)| ~ 1
+        let dot = _as_dot(v, new_v)
+        let adot = _as_abs(dot)
+        v = new_v
+        if adot > 0.999999999 {
+            iter = max_iter
+        } else {
+            iter = iter + 1
+        }
+    }
+    return v
+}
+
+// ===================================================================
+//  7. multi_steer
+//
+//  Apply multiple steering vectors simultaneously:
+//    hidden + sum_i(alphas[i] * vectors[i])
+// ===================================================================
+
+@hot
+pub fn multi_steer(hidden, vectors, alphas) {
+    let n = len(hidden)
+    let nv = len(vectors)
+    let mut out = _as_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = hidden[i]
+        i = i + 1
+    }
+
+    let mut vi = 0
+    while vi < nv {
+        let alpha = alphas[vi]
+        let vec = vectors[vi]
+        i = 0
+        while i < n {
+            out[i] = out[i] + alpha * vec[i]
+            i = i + 1
+        }
+        vi = vi + 1
+    }
+    return out
+}

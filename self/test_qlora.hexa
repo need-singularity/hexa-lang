@@ -1,0 +1,218 @@
+// ═══════════════════════════════════════════════════════════
+//  test_qlora.hexa — QLoRA unit tests
+//  Tests: NF4 round-trip, forward dims, backward frozen base
+// ═══════════════════════════════════════════════════════════
+
+import "ml/qlora.hexa"
+
+let mut passed = 0
+let mut failed = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        passed = passed + 1
+    } else {
+        println("[FAIL] " + name)
+        failed = failed + 1
+    }
+}
+
+// ── Test 1: NF4 quantize/dequantize round-trip error < 10% ──
+fn test_roundtrip() {
+    // Generate test weights using LCG
+    let mut weights = []
+    let mut s = 12345
+    for i in 0..256 {
+        s = (s * 1103515245 + 12345) % 2147483647
+        let v = (to_float(s % 20000) - 10000.0) / 10000.0
+        weights.push(v)
+    }
+
+    let qw = quantize_nf4(weights)
+    let restored = dequantize_nf4(qw)
+
+    // Check lengths match
+    check("roundtrip: lengths match", len(restored) == len(weights))
+
+    // Relative error: sqrt(sum((orig-rest)^2) / sum(orig^2))
+    let err = quant_error(weights, restored)
+    println("  NF4 relative error: " + to_string(err))
+    check("roundtrip: error < 10%", err < 0.1)
+
+    // Check block_size is 64
+    check("roundtrip: block_size=64", qw["block_size"] == 64)
+
+    // Check scales count
+    let expected_blocks = (256 + 63) / 64
+    check("roundtrip: scales count", len(qw["scales"]) == expected_blocks)
+}
+
+// ── Test 2: qlora_forward produces correct output dimensions ──
+fn test_forward_dims() {
+    let in_dim = 8
+    let out_dim = 4
+    let rank = 2
+    let layer = qlora_layer_new(in_dim, out_dim, rank)
+
+    // Create input vector
+    let mut input = []
+    for i in 0..in_dim { input.push(1.0) }
+
+    let output = qlora_forward(layer, input)
+    check("forward: output length == out_dim", len(output) == out_dim)
+
+    // Output should be finite (not NaN or huge)
+    let mut all_finite = true
+    for i in 0..out_dim {
+        let v = output[i]
+        if v > 1000000.0 { all_finite = false }
+        if v < -1000000.0 { all_finite = false }
+    }
+    check("forward: output values finite", all_finite)
+}
+
+// ── Test 3: with A=0, LoRA residual is zero ─────────────────
+fn test_lora_zero_init() {
+    let in_dim = 8
+    let out_dim = 4
+    let rank = 2
+    let layer = qlora_layer_new(in_dim, out_dim, rank)
+
+    // A is zero-initialized, so LoRA branch should be zero
+    // Forward with and without LoRA should give same result
+    let mut input = []
+    for i in 0..in_dim { input.push(0.5) }
+
+    let y = qlora_forward(layer, input)
+
+    // Compute base-only output for comparison
+    let base_flat = dequantize_nf4(layer["base_nf4"])
+    let mut base_only = []
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + base_flat[i * in_dim + j] * input[j]
+        }
+        base_only.push(s)
+    }
+
+    // Should be identical since A=0
+    let mut max_diff = 0.0
+    for i in 0..out_dim {
+        let d = y[i] - base_only[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > max_diff { max_diff = ad }
+    }
+    println("  A=0 max_diff: " + to_string(max_diff))
+    check("zero_init: LoRA residual is zero when A=0", max_diff < 0.0001)
+}
+
+// ── Test 4: backward only produces gradients for A and B ────
+fn test_backward_frozen() {
+    let in_dim = 8
+    let out_dim = 4
+    let rank = 2
+    let layer = qlora_layer_new(in_dim, out_dim, rank)
+
+    let mut input = []
+    for i in 0..in_dim { input.push(0.3 + to_float(i) * 0.1) }
+
+    // Fake gradient from upstream
+    let mut grad = []
+    for i in 0..out_dim { grad.push(1.0) }
+
+    let grads = qlora_backward(layer, grad, input)
+
+    // Check grad_a dimensions: [rank, in_dim]
+    check("backward: grad_a rows == rank", len(grads["grad_a"]) == rank)
+    check("backward: grad_a cols == in_dim", len(grads["grad_a"][0]) == in_dim)
+
+    // Check grad_b dimensions: [out_dim, rank]
+    check("backward: grad_b rows == out_dim", len(grads["grad_b"]) == out_dim)
+    check("backward: grad_b cols == rank", len(grads["grad_b"][0]) == rank)
+
+    // No grad for base weights — dict has only grad_a and grad_b
+    let has_base_grad = has_key(grads, "grad_base")
+    check("backward: no grad for base (frozen)", has_base_grad == false)
+}
+
+// ── Test 5: qlora_step updates A/B, base stays frozen ───────
+fn test_step_updates() {
+    let in_dim = 8
+    let out_dim = 4
+    let rank = 2
+    let layer = qlora_layer_new(in_dim, out_dim, rank)
+
+    let mut input = []
+    for i in 0..in_dim { input.push(1.0) }
+
+    // Do a forward/backward/step cycle
+    let y = qlora_forward(layer, input)
+    let mut grad = []
+    for i in 0..out_dim { grad.push(y[i]) }
+
+    let grads = qlora_backward(layer, grad, input)
+    let updated = qlora_step(layer, grads, 0.01)
+
+    // Base NF4 should be identical
+    let orig_q = layer["base_nf4"]["quant"]
+    let new_q = updated["base_nf4"]["quant"]
+    let mut base_same = true
+    for i in 0..len(orig_q) {
+        if orig_q[i] != new_q[i] { base_same = false }
+    }
+    check("step: base NF4 unchanged after update", base_same)
+
+    // A should have changed (grad was non-zero because B is nonzero and input nonzero)
+    // Actually A starts at zero and grad_a depends on B^T @ grad * input
+    // B is random, grad is nonzero, input is nonzero -> grad_a nonzero -> A changes
+    let mut a_changed = false
+    for p in 0..rank {
+        for j in 0..in_dim {
+            if updated["lora_a"][p][j] != layer["lora_a"][p][j] {
+                a_changed = true
+            }
+        }
+    }
+    check("step: lora_a updated", a_changed)
+}
+
+// ── Test 6: quantize edge cases ─────────────────────────────
+fn test_edge_cases() {
+    // All zeros
+    let mut zeros = []
+    for i in 0..128 { zeros.push(0.0) }
+    let qz = quantize_nf4(zeros)
+    let dz = dequantize_nf4(qz)
+    let mut max_z = 0.0
+    for i in 0..128 {
+        let a = if dz[i] < 0.0 { 0.0 - dz[i] } else { dz[i] }
+        if a > max_z { max_z = a }
+    }
+    check("edge: zeros roundtrip near zero", max_z < 0.001)
+
+    // Non-multiple-of-64 length
+    let mut odd = []
+    for i in 0..100 { odd.push(to_float(i) / 100.0) }
+    let qo = quantize_nf4(odd)
+    let do2 = dequantize_nf4(qo)
+    check("edge: non-64-multiple length preserved", len(do2) == 100)
+}
+
+// ── Run all tests ───────────────────────────────────────────
+println("=== QLoRA Tests ===")
+test_roundtrip()
+test_forward_dims()
+test_lora_zero_init()
+test_backward_frozen()
+test_step_updates()
+test_edge_cases()
+
+println("")
+println("Results: " + to_string(passed) + " passed, " + to_string(failed) + " failed")
+if failed > 0 {
+    println("SOME TESTS FAILED")
+} else {
+    println("ALL TESTS PASSED")
+}
