@@ -55,11 +55,23 @@
 
 #ifdef __linux__
 
+#include <cblas.h>
 #include <math.h>
 #include <stdint.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+
+#else /* macOS / Darwin */
+
+#include <Accelerate/Accelerate.h>
+#include <math.h>
+#include <stdint.h>
+#include <stddef.h>
+#include <stdlib.h>
+#include <string.h>
+
+#endif /* platform headers */
 
 // ─────────────────────────────────────────────────────────────
 // Packed argument struct. Field order is ABI; do not reorder.
@@ -90,52 +102,47 @@ int64_t hxlmhead_version(void) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// Naive triple-loop sgemm helpers — to be replaced by libhxblas
-// calls in Day-2. Kept inline + scalar so -O3 can auto-vectorise
-// and so the v0 stub has zero external deps beyond libm.
+// BLAS-accelerated sgemm wrappers (ROI-2: replaces naive triple-loop).
+// Linux: OpenBLAS cblas_sgemm. Mac: Accelerate cblas_sgemm.
+// All use CblasRowMajor matching the [row, col] C-contiguous layout.
 // ─────────────────────────────────────────────────────────────
 
-// C[m,n] = A[m,k] @ B[k,n]   (overwrite)
-static void naive_matmul(const float* A, const float* B, float* C,
-                         int64_t M_, int64_t K_, int64_t N_) {
-    for (int64_t i = 0; i < M_; i++) {
-        for (int64_t j = 0; j < N_; j++) {
-            float s = 0.0f;
-            const float* arow = A + i * K_;
-            for (int64_t k = 0; k < K_; k++) {
-                s += arow[k] * B[k * N_ + j];
-            }
-            C[i * N_ + j] = s;
-        }
-    }
+// C[m,n] = A[m,k] @ B[k,n]   (overwrite, beta=0)
+static void blas_matmul(const float* A, const float* B, float* C,
+                        int64_t M_, int64_t K_, int64_t N_) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                (int)M_, (int)N_, (int)K_,
+                1.0f,
+                A, (int)K_,
+                B, (int)N_,
+                0.0f,
+                C, (int)N_);
 }
 
-// C[m,n] += A[k,m]^T @ B[k,n]   (accumulate, A is transposed in iter)
-static void naive_matmul_TN_acc(const float* A, const float* B, float* C,
-                                int64_t M_, int64_t K_, int64_t N_) {
-    for (int64_t i = 0; i < M_; i++) {
-        for (int64_t j = 0; j < N_; j++) {
-            float s = 0.0f;
-            for (int64_t k = 0; k < K_; k++) {
-                s += A[k * M_ + i] * B[k * N_ + j];
-            }
-            C[i * N_ + j] += s;
-        }
-    }
+// C[m,n] += A^T[m,k] @ B[k,n]   (accumulate, beta=1)
+// A is stored [K,M] row-major; CblasTrans reads columns as rows.
+static void blas_matmul_TN_acc(const float* A, const float* B, float* C,
+                               int64_t M_, int64_t K_, int64_t N_) {
+    cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                (int)M_, (int)N_, (int)K_,
+                1.0f,
+                A, (int)M_,
+                B, (int)N_,
+                1.0f,
+                C, (int)N_);
 }
 
-// C[m,n] = A[m,k] @ B[n,k]^T   (overwrite, B is transposed in iter)
-static void naive_matmul_NT(const float* A, const float* B, float* C,
-                            int64_t M_, int64_t K_, int64_t N_) {
-    for (int64_t i = 0; i < M_; i++) {
-        for (int64_t j = 0; j < N_; j++) {
-            float s = 0.0f;
-            for (int64_t k = 0; k < K_; k++) {
-                s += A[i * K_ + k] * B[j * K_ + k];
-            }
-            C[i * N_ + j] = s;
-        }
-    }
+// C[m,n] = A[m,k] @ B^T[k,n]   (overwrite, beta=0)
+// B is stored [N,K] row-major; CblasTrans reads columns as rows.
+static void blas_matmul_NT(const float* A, const float* B, float* C,
+                           int64_t M_, int64_t K_, int64_t N_) {
+    cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                (int)M_, (int)N_, (int)K_,
+                1.0f,
+                A, (int)K_,
+                B, (int)K_,
+                0.0f,
+                C, (int)N_);
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -176,10 +183,10 @@ int64_t hxlmhead_bwd(int64_t args_p) {
 
     // Forward recompute: mid = x @ Wu
     // (Day-2: skip when reserved0 bit0 set and a->mid_p != 0.)
-    naive_matmul(x, Wu, mid, S, H, M);
+    blas_matmul(x, Wu, mid, S, H, M);
 
     // Forward: logits = mid @ Wv
-    naive_matmul(mid, Wv, logits, S, M, V);
+    blas_matmul(mid, Wv, logits, S, M, V);
 
     // Forward: softmax row-wise (in place) + CE loss aggregation.
     double loss_sum = 0.0;
@@ -214,19 +221,17 @@ int64_t hxlmhead_bwd(int64_t args_p) {
     // (logits now holds dlogits.)
 
     // dWv += mid^T @ dlogits   ([M,V] += [S,M]^T @ [S,V])
-    naive_matmul_TN_acc(mid, logits, dW_v, M, S, V);
+    blas_matmul_TN_acc(mid, logits, dW_v, M, S, V);
 
     // dmid = dlogits @ Wv^T   ([S,M] = [S,V] @ [M,V]^T)
-    naive_matmul_NT(logits, Wv, dmid, S, V, M);
+    blas_matmul_NT(logits, Wv, dmid, S, V, M);
 
     // dWu += x^T @ dmid   ([H,M] += [S,H]^T @ [S,M])
-    naive_matmul_TN_acc(x, dmid, dW_u, H, S, M);
+    blas_matmul_TN_acc(x, dmid, dW_u, H, S, M);
 
     // dx = dmid @ Wu^T   ([S,H] = [S,M] @ [H,M]^T)
-    naive_matmul_NT(dmid, Wu, dL_dx, S, M, H);
+    blas_matmul_NT(dmid, Wu, dL_dx, S, M, H);
 
     free(mid); free(logits); free(dmid);
     return 0;
 }
-
-#endif /* __linux__ */

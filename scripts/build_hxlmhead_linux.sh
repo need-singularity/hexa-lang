@@ -8,10 +8,10 @@
 # contract, so operators don't have to learn a new recipe.
 #
 # Prerequisites (Ubuntu/Debian, runpod/pytorch:2.4.0 image):
-#   apt install gcc libm-dev      # libm ships with glibc; no extra deps
+#   apt install gcc libopenblas-dev   # OpenBLAS for cblas_sgemm
 #
 # Prerequisites (Mac cross-verify mode):
-#   (none — libm is in libSystem)
+#   brew install openblas   # provides cblas.h + libopenblas
 #
 # Usage:
 #   bash scripts/build_hxlmhead_linux.sh                   # normal Linux build
@@ -63,24 +63,20 @@ if [ "$MODE" = "--mac-xverify" ]; then
     XV_DIR="$OUT_DIR/xverify"
     mkdir -p "$XV_DIR"
     CC_X="${CC:-clang}"
-    echo "[xverify] linking hxlmhead_linux.c → libhxlmhead_xverify.dylib"
-    $CC_X -O3 -fPIC -dynamiclib -D__linux__=1 \
+    echo "[xverify] linking hxlmhead_linux.c → libhxlmhead_xverify.dylib (Accelerate)"
+    $CC_X -O3 -fPIC -dynamiclib -DACCELERATE_NEW_LAPACK \
         "$SRC_DIR/hxlmhead_linux.c" \
-        -lm \
+        -framework Accelerate -lm \
         -o "$XV_DIR/libhxlmhead_xverify.dylib"
 
-    if nm -gU "$XV_DIR/libhxlmhead_xverify.dylib" | grep -q '_hxlmhead_bwd'; then
-        echo "  hxlmhead_bwd SYMBOL=PRESENT"
-    else
-        echo "  hxlmhead_bwd SYMBOL=MISSING" >&2
-        exit 4
-    fi
-    if nm -gU "$XV_DIR/libhxlmhead_xverify.dylib" | grep -q '_hxlmhead_version'; then
-        echo "  hxlmhead_version SYMBOL=PRESENT"
-    else
-        echo "  hxlmhead_version SYMBOL=MISSING" >&2
-        exit 5
-    fi
+    for sym in _hxlmhead_bwd _hxlmhead_version; do
+        if nm -gU "$XV_DIR/libhxlmhead_xverify.dylib" | grep -q "$sym"; then
+            echo "  ${sym#_} SYMBOL=PRESENT"
+        else
+            echo "  ${sym#_} SYMBOL=MISSING" >&2
+            exit 4
+        fi
+    done
     echo "── xverify output ──"
     ls -la "$XV_DIR"/libhxlmhead_xverify.dylib
     echo "done — Linux source compiles + links on Mac; ready to push"
@@ -100,27 +96,21 @@ if [ "$MODE" = "--mac-native" ]; then
         exit 2
     fi
     CC_M="${CC:-clang}"
-    echo "[mac-native] building libhxlmhead.dylib"
-    # -D__linux__=1 flips the conditional in hxlmhead_linux.c on —
-    # the kernel only uses <math.h>, <stdint.h>, <stdlib.h>, <string.h>,
-    # all present on Mac's libSystem, so it compiles and links unchanged.
-    $CC_M -O3 -fPIC -dynamiclib -D__linux__=1 \
+    echo "[mac-native] building libhxlmhead.dylib (Accelerate cblas_sgemm)"
+    # Mac #else branch uses <Accelerate/Accelerate.h> for cblas_sgemm.
+    $CC_M -O3 -fPIC -dynamiclib -DACCELERATE_NEW_LAPACK \
         "$SRC_DIR/hxlmhead_linux.c" \
-        -lm \
+        -framework Accelerate -lm \
         -o "$OUT_DIR/libhxlmhead.dylib"
 
-    if nm -gU "$OUT_DIR/libhxlmhead.dylib" | grep -q '_hxlmhead_bwd'; then
-        echo "  hxlmhead_bwd SYMBOL=PRESENT"
-    else
-        echo "  hxlmhead_bwd SYMBOL=MISSING" >&2
-        exit 4
-    fi
-    if nm -gU "$OUT_DIR/libhxlmhead.dylib" | grep -q '_hxlmhead_version'; then
-        echo "  hxlmhead_version SYMBOL=PRESENT"
-    else
-        echo "  hxlmhead_version SYMBOL=MISSING" >&2
-        exit 5
-    fi
+    for sym in _hxlmhead_bwd _hxlmhead_version; do
+        if nm -gU "$OUT_DIR/libhxlmhead.dylib" | grep -q "$sym"; then
+            echo "  ${sym#_} SYMBOL=PRESENT"
+        else
+            echo "  ${sym#_} SYMBOL=MISSING" >&2
+            exit 4
+        fi
+    done
     echo "── mac-native output ──"
     ls -la "$OUT_DIR/libhxlmhead.dylib"
     echo "done — load with DYLD_LIBRARY_PATH=$OUT_DIR"
@@ -144,23 +134,20 @@ if [ "$MODE" = "--debug" ]; then
     CFLAGS_BASE="-O0 -g -fPIC -shared"
 fi
 
-# ── libhxlmhead.so — libm only (scalar O3 auto-vec) ──
+# ── libhxlmhead.so — OpenBLAS + libm (v1 BLAS route) ──
 echo "[1/1] building libhxlmhead.so"
 $CC $CFLAGS_BASE \
     "$SRC_DIR/hxlmhead_linux.c" \
     -o "$OUT_DIR/libhxlmhead.so" \
-    -lm
+    -lopenblas -lm
 
-if nm -D "$OUT_DIR/libhxlmhead.so" 2>/dev/null | grep -q ' hxlmhead_bwd'; then
-    echo "  hxlmhead_bwd SYMBOL=PRESENT"
-else
-    echo "  hxlmhead_bwd SYMBOL=MISSING (nm -D failed; check ldd/readelf)" >&2
-fi
-if nm -D "$OUT_DIR/libhxlmhead.so" 2>/dev/null | grep -q ' hxlmhead_version'; then
-    echo "  hxlmhead_version SYMBOL=PRESENT"
-else
-    echo "  hxlmhead_version SYMBOL=MISSING (nm -D failed; check ldd/readelf)" >&2
-fi
+for sym in hxlmhead_bwd hxlmhead_version; do
+    if nm -D "$OUT_DIR/libhxlmhead.so" 2>/dev/null | grep -q " $sym"; then
+        echo "  $sym SYMBOL=PRESENT"
+    else
+        echo "  $sym SYMBOL=MISSING (nm -D failed; check ldd/readelf)" >&2
+    fi
+done
 
 echo "built:"
 ls -la "$OUT_DIR"/libhxlmhead.so
