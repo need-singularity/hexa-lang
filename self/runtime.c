@@ -138,6 +138,7 @@ HexaVal hexa_sub(HexaVal a, HexaVal b);
 HexaVal hexa_mul(HexaVal a, HexaVal b);
 HexaVal hexa_div(HexaVal a, HexaVal b);
 HexaVal hexa_mod(HexaVal a, HexaVal b);
+HexaVal hexa_fma(HexaVal a, HexaVal b, HexaVal c);
 HexaVal hexa_eq(HexaVal a, HexaVal b);
 HexaVal hexa_cmp_lt(HexaVal a, HexaVal b);
 HexaVal hexa_cmp_gt(HexaVal a, HexaVal b);
@@ -2436,6 +2437,11 @@ void __hexa_try_push(jmp_buf* jb) { if (__hexa_try_top < HEXA_MAX_TRY) __hexa_tr
 void __hexa_try_pop(void) { if (__hexa_try_top > 0) __hexa_try_top--; }
 HexaVal __hexa_last_error(void) { return __hexa_error_val; }
 
+// __hexa_try_cleanup: GCC/Clang `cleanup` attribute helper used by codegen.
+// Restores try-stack depth on scope exit, so an early return / break / longjmp
+// inside a try block can't leak entries onto __hexa_try_stack.
+void __hexa_try_cleanup(int* saved) { if (__hexa_try_top > *saved) __hexa_try_top = *saved; }
+
 void hexa_throw(HexaVal err) {
     __hexa_error_val = err;
     if (__hexa_try_top > 0) {
@@ -2935,6 +2941,14 @@ HexaVal hexa_mul(HexaVal a, HexaVal b) {
     if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(a) * HX_INT(b));
     if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) return hexa_float(HX_FLOAT(a) * HX_FLOAT(b));
     return hexa_float(__hx_to_double(a) * __hx_to_double(b));
+}
+// FMA: fused multiply-add — fma(a,b,c) = a*b + c
+// For floats uses C99 fma() (single rounding, hardware FMA on modern CPUs).
+// For pure ints falls back to a*b+c with int arithmetic.
+HexaVal hexa_fma(HexaVal a, HexaVal b, HexaVal c) {
+    if (HX_IS_INT(a) && HX_IS_INT(b) && HX_IS_INT(c))
+        return hexa_int(HX_INT(a) * HX_INT(b) + HX_INT(c));
+    return hexa_float(fma(__hx_to_double(a), __hx_to_double(b), __hx_to_double(c)));
 }
 HexaVal hexa_div(HexaVal a, HexaVal b) {
     if (HX_IS_INT(a) && HX_IS_INT(b)) {

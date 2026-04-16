@@ -52,6 +52,7 @@ fn _hexa_name_is_reserved(s) {
     if s == "tan" { return true }
     if s == "atan" { return true }
     if s == "atan2" { return true }
+    if s == "fma" { return true }
     // C type keywords that conflict with user-defined hexa names
     if s == "int" { return true }
     if s == "float" { return true }
@@ -1052,9 +1053,18 @@ fn gen2_stmt(node, depth) {
     }
 
     if k == "CompoundAssign" {
+        let op = node.op
+        // FMA for compound assign: x += a * b  →  x = fma(a, b, x)
+        if op == "+=" {
+            if type_of(node.right) != "string" && node.right.kind == "BinaryOp" && node.right.op == "*" {
+                let lhs = gen2_expr(node.left)
+                let fa = gen2_expr(node.right.left)
+                let fb = gen2_expr(node.right.right)
+                return pad + lhs + " = hexa_fma(" + fa + ", " + fb + ", " + lhs + ");\n"
+            }
+        }
         let lhs = gen2_expr(node.left)
         let rhs = gen2_expr(node.right)
-        let op = node.op
         if op == "+=" {
             return pad + lhs + " = hexa_add(" + lhs + ", " + rhs + ");\n"
         }
@@ -1118,7 +1128,11 @@ fn gen2_stmt(node, depth) {
 
     if k == "WhileStmt" {
         let mut chunks = []
-        chunks = chunks.push(pad + "while (hexa_truthy(" + gen2_expr(node.cond) + ")) {\n")
+        // C2 (while-cond specialize): when the condition is a comparison
+        // expression, emit a direct C boolean instead of wrapping through
+        // hexa_truthy(hexa_cmp_*(...)) — saves tag-check + unbox per iteration.
+        let cond_c = _gen2_while_cond(node.cond)
+        chunks = chunks.push(pad + "while (" + cond_c + ") {\n")
         let mut wi = 0
         while wi < len(node.body) {
             chunks = chunks.push(gen2_stmt(node.body[wi], depth + 1))
@@ -1503,6 +1517,7 @@ fn gen2_expr(node) {
             return gen2_expr(_cc_inline)
         }
         if node.name == "nil" { return "hexa_void()" }
+        if node.name == "void" { return "hexa_void()" }
         if node.name == "true" { return "hexa_bool(1)" }
         if node.name == "false" { return "hexa_bool(0)" }
         return _hexa_mangle_ident(node.name)
@@ -1535,6 +1550,23 @@ fn gen2_expr(node) {
                 let l = gen2_expr(node.left)
                 let r = gen2_expr(node.right)
                 return "hexa_int(HX_INT(" + l + ") " + op + " HX_INT(" + r + "))"
+            }
+        }
+        // FMA pattern: (a * b) + c → hexa_fma(a, b, c)
+        //              (a * b) - c → hexa_fma(a, b, hexa_sub(hexa_int(0), c))
+        // Saves one runtime dispatch call; on floats uses hardware fma()
+        // (single rounding). Checks AST structure before gen2_expr to
+        // avoid generating the inner mul twice.
+        if op == "+" || op == "-" {
+            if type_of(node.left) != "string" && node.left.kind == "BinaryOp" && node.left.op == "*" {
+                let fa = gen2_expr(node.left.left)
+                let fb = gen2_expr(node.left.right)
+                let fc = gen2_expr(node.right)
+                if op == "+" {
+                    return "hexa_fma(" + fa + ", " + fb + ", " + fc + ")"
+                }
+                // (a*b) - c  →  fma(a, b, -c)
+                return "hexa_fma(" + fa + ", " + fb + ", hexa_sub(hexa_int(0), " + fc + "))"
             }
         }
         let l = gen2_expr(node.left)
@@ -2035,6 +2067,10 @@ fn gen2_expr(node) {
                 if name == "is_error"       { return "hexa_is_error(" + a0 + ")" }
                 if name == "read_lines"     { return "hexa_read_lines(" + a0 + ")" }
                 if name == "from_char_code" { return "hexa_from_char_code(" + a0 + ")" }
+                if name == "ord"            { return "hexa_char_code(" + a0 + ", hexa_int(0))" }
+                if name == "chr"            { return "hexa_from_char_code(" + a0 + ")" }
+                if name == "keys"           { return "hexa_map_keys(" + a0 + ")" }
+                if name == "values"         { return "hexa_map_values(" + a0 + ")" }
                 if name == "env_var"        { return "hexa_env_var(" + a0 + ")" }
                 if name == "env"            { return "hexa_env_var(" + a0 + ")" }
                 if name == "delete_file"    { return "hexa_delete_file(" + a0 + ")" }
@@ -2059,6 +2095,8 @@ fn gen2_expr(node) {
                 if name == "pow"            { return "hexa_math_pow(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
                 if name == "min"            { return "hexa_math_min(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
                 if name == "max"            { return "hexa_math_max(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
+                if name == "has_key"        { return "hexa_bool(hexa_map_contains_key(" + arg_strs[0] + ", hexa_to_cstring(" + arg_strs[1] + ")))" }
+                if name == "char_code"      { return "hexa_char_code(" + arg_strs[0] + ", " + arg_strs[1] + ")" }
             }
             if len(node.args) == 4 {
                 if name == "matvec"         { return "hexa_matvec(" + arg_strs[0] + ", " + arg_strs[1] + ", " + arg_strs[2] + ", " + arg_strs[3] + ")" }
@@ -3187,6 +3225,13 @@ let mut _known_nonlocal_set = []     // 64 buckets; each bucket is [name, ...]
 // Excludes: mut variables (re-assignable), fn params (caller may pass float).
 let mut _known_int_set = []          // 64 buckets; each bucket is [name, ...]
 
+// ── STRUCTURAL-3: known-float type propagation ──────────────
+// Parallel to known-int: immutable `let` with FloatLit or float-only BinOp
+// initializers. gen2_expr BinOp uses this to emit direct `double` arithmetic
+// via `hexa_float(HX_FLOAT(L) OP HX_FLOAT(R))`, bypassing hexa_add/sub/mul/
+// div runtime tag dispatch. Critical for training loops (99% float ops).
+let mut _known_float_set = []        // 64 buckets; each bucket is [name, ...]
+
 fn _known_hash(key) {
     let mut h = 0
     let mut ci = 0
@@ -3213,6 +3258,8 @@ fn _known_set_init() {
     _known_nonlocal_set = nl
     // STRUCTURAL-2 Phase B: reset known-int set alongside other sets
     _known_int_set_init()
+    // STRUCTURAL-3: reset known-float set alongside other sets
+    _known_float_set_init()
 }
 
 fn _known_fn_globals_add(name) {
@@ -3263,6 +3310,34 @@ fn _known_int_set_init() {
     _known_int_set = ki
 }
 
+// ── STRUCTURAL-3: known-float set helpers (parallel to int set) ──
+fn _known_float_set_init() {
+    let mut kf = []
+    let mut i = 0
+    while i < 64 {
+        kf = kf.push([])
+        i = i + 1
+    }
+    _known_float_set = kf
+}
+
+fn _known_float_add(name) {
+    let b = _known_hash(name)
+    _known_float_set[b] = _known_float_set[b].push(name)
+}
+
+fn _is_known_float_name(name) {
+    if len(_known_float_set) != 64 { return false }
+    let b = _known_hash(name)
+    let bucket = _known_float_set[b]
+    let mut i = 0
+    while i < len(bucket) {
+        if bucket[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
 fn _known_int_add(name) {
     let b = _known_hash(name)
     _known_int_set[b] = _known_int_set[b].push(name)
@@ -3310,6 +3385,72 @@ fn _is_int_init_expr(node) {
         return false
     }
     return false
+}
+
+// C2: Emit a C boolean expression for a while-loop condition.
+// For comparison ops (< > <= >= == !=), avoids hexa_truthy(hexa_cmp_*())
+// double-dispatch.  When both operands are known-int, emits raw C comparison
+// on HX_INT() directly (zero runtime overhead).  For && / || / !, recurses.
+// Falls back to hexa_truthy(gen2_expr(...)) for anything else.
+fn _gen2_while_cond(node) {
+    if type_of(node) == "string" { return "hexa_truthy(" + gen2_expr(node) + ")" }
+    let k = node.kind
+    if k == "BinOp" {
+        let op = node.op
+        // Ordered comparisons
+        if op == "<" || op == ">" || op == "<=" || op == ">=" {
+            let li = _is_known_int(node.left)
+            let ri = _is_known_int(node.right)
+            if li && ri {
+                // Both operands provably TAG_INT — raw C compare, no runtime call
+                let l = gen2_expr(node.left)
+                let r = gen2_expr(node.right)
+                return "(HX_INT(" + l + ") " + op + " HX_INT(" + r + "))"
+            }
+            // General case — hexa_cmp_* returns hexa_bool(); extract .b directly
+            let l = gen2_expr(node.left)
+            let r = gen2_expr(node.right)
+            if op == "<" { return "HX_BOOL(hexa_cmp_lt(" + l + ", " + r + "))" }
+            if op == ">" { return "HX_BOOL(hexa_cmp_gt(" + l + ", " + r + "))" }
+            if op == "<=" { return "HX_BOOL(hexa_cmp_le(" + l + ", " + r + "))" }
+            return "HX_BOOL(hexa_cmp_ge(" + l + ", " + r + "))"
+        }
+        // Equality
+        if op == "==" {
+            let li = _is_known_int(node.left)
+            let ri = _is_known_int(node.right)
+            if li && ri {
+                let l = gen2_expr(node.left)
+                let r = gen2_expr(node.right)
+                return "(HX_INT(" + l + ") == HX_INT(" + r + "))"
+            }
+            return "hexa_truthy(hexa_eq(" + gen2_expr(node.left) + ", " + gen2_expr(node.right) + "))"
+        }
+        if op == "!=" {
+            let li = _is_known_int(node.left)
+            let ri = _is_known_int(node.right)
+            if li && ri {
+                let l = gen2_expr(node.left)
+                let r = gen2_expr(node.right)
+                return "(HX_INT(" + l + ") != HX_INT(" + r + "))"
+            }
+            return "(!hexa_truthy(hexa_eq(" + gen2_expr(node.left) + ", " + gen2_expr(node.right) + ")))"
+        }
+        // Logical connectives — recurse into sub-conditions
+        if op == "&&" {
+            return "(" + _gen2_while_cond(node.left) + " && " + _gen2_while_cond(node.right) + ")"
+        }
+        if op == "||" {
+            return "(" + _gen2_while_cond(node.left) + " || " + _gen2_while_cond(node.right) + ")"
+        }
+    }
+    if k == "UnaryOp" {
+        if node.op == "!" {
+            return "(!" + _gen2_while_cond(node.left) + ")"
+        }
+    }
+    // Fallback: general expression — use hexa_truthy as before
+    return "hexa_truthy(" + gen2_expr(node) + ")"
 }
 
 // Builtin names that are never captured (resolved at codegen in gen2_expr Call).

@@ -24,8 +24,8 @@
 //      num_workers(n) = min(n, 4) for n > 0.
 //
 //  Non-goals for this ROI checkpoint:
-//    - Actual OS thread dispatch — TODO: rt_spawn(partition, body)
-//      once self/runtime.c gains a safe threading hook.
+//    - Actual OS thread dispatch — cooperative rt_spawn implemented;
+//      swap pf_rt_spawn body with pthread/workqueue for real threads.
 //    - Reduction / scan style parallelism — that is ROI #81 and
 //      ROI #82 (fuse + scan), and the APIs here deliberately only
 //      cover the map case where body(i, ctx) writes to ctx.dst[i].
@@ -95,27 +95,33 @@ pub fn partition_size(n, workers, i) {
 // ctx is an opaque payload (typically a struct or an array) that
 // the body uses to read inputs / write outputs.
 //
-// Semantics at this stage: partitions are executed sequentially
-// in partition order. Once a real runtime exists, each partition
-// can be dispatched to a worker thread without changing this API.
+// Semantics: partitions are dispatched via pf_rt_spawn (cooperative
+// spawn — runs immediately). Once a real thread pool exists, swap
+// pf_rt_spawn internals for real dispatch; this API stays unchanged.
 pub fn parallel_for_logical(n, workers, body, ctx) {
     if n <= 0 { return ctx }
     let parts = partition_range(n, workers)
     let np = len(parts)
+    // Phase 1: spawn — each partition dispatched via pf_rt_spawn.
+    // Currently cooperative (runs immediately); when OS threads land
+    // these will execute in parallel on the thread pool.
+    pf_rt_task_results = []
+    pf_rt_task_count   = 0
+    let mut handles = []
     let mut pi = 0
     while pi < np {
         let part  = parts[pi]
         let start = part[0]
         let endv  = part[1]
-        // TODO(runtime): rt_spawn(worker_id=pi, start, endv, body, ctx)
-        //                and join after the outer while.
-        let mut i = start
-        while i < endv {
-            body(i, ctx)
-            i = i + 1
-        }
+        let h = pf_rt_spawn(body, start, endv, ctx)
+        handles = handles.push(h)
         pi = pi + 1
     }
+    // Phase 2: join — barrier; all partitions must complete before
+    // returning ctx. With cooperative spawn this is a no-op (already
+    // done), but the join call makes the contract explicit for the
+    // future real-thread backend.
+    pf_rt_join_all(handles)
     return ctx
 }
 
@@ -180,6 +186,51 @@ pub fn is_indep_loop(markers) {
         wi = wi + 1
     }
     return true
+}
+
+// ── cooperative spawn infrastructure (self-contained) ──────
+// Minimal fork-join runtime for partition dispatch. Each "spawn"
+// runs its closure immediately (cooperative scheduling). When OS
+// threads arrive, only this section needs replacement — all call
+// sites above remain unchanged.
+//
+// API contract (matches self/runtime/spawn_pure.hexa):
+//   pf_rt_spawn(body, start, endv, ctx) -> handle
+//   pf_rt_join(handle) -> result
+//   pf_rt_join_all(handles) -> [result, ...]
+
+let mut pf_rt_task_results = []
+let mut pf_rt_task_count   = 0
+
+fn pf_rt_spawn(body, start, endv, ctx) {
+    // Execute the partition body immediately (cooperative).
+    let mut i = start
+    while i < endv {
+        body(i, ctx)
+        i = i + 1
+    }
+    // Record completion; result is void (body writes to ctx in-place).
+    let h = pf_rt_task_count
+    pf_rt_task_results = pf_rt_task_results.push(0)
+    pf_rt_task_count = pf_rt_task_count + 1
+    return h
+}
+
+fn pf_rt_join(h) {
+    if h < 0 { return 0 }
+    if h >= pf_rt_task_count { return 0 }
+    return pf_rt_task_results[h]
+}
+
+fn pf_rt_join_all(handles) {
+    let n = len(handles)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(pf_rt_join(handles[i]))
+        i = i + 1
+    }
+    return out
 }
 
 // ── tiny string helpers used by is_indep_loop ──────────────

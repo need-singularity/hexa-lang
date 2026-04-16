@@ -1,0 +1,476 @@
+// ===================================================================
+//  self/ai_native/shampoo.hexa — AI-native ROI #113
+//
+//  Shampoo preconditioned optimizer — Kronecker-factored 2nd-order
+//  approximation.
+//
+//  Gupta et al. 2018 — "Shampoo: Preconditioned Stochastic Tensor
+//  Optimization"  + Anil et al. 2020 — "Scalable Second Order
+//  Optimization for Deep Learning"
+//
+//  For a matrix parameter W in R^{m x n} with gradient G:
+//      L = (G @ G^T)^{-1/4}   left preconditioner   (m x m)
+//      R = (G^T @ G)^{-1/4}   right preconditioner  (n x n)
+//      update = L @ G @ R
+//      W -= lr * update
+//
+//  Matrix power M^{-1/4} is computed via coupled Newton-Schulz
+//  iteration (Denman-Beavers variant), which avoids eigendecomposition
+//  and converges cubically for well-conditioned inputs.
+//
+//  All matrices are stored as flat [float] arrays in row-major order.
+//  Index (i, j) in an m-by-n matrix lives at position i*n + j.
+//
+//  Public API (all prefix shp_)
+//  ----------------------------
+//      shp_mat_mul(a, b, m, n, k)                 -> [float]
+//      shp_mat_transpose(a, m, n)                  -> [float]
+//      shp_gram_left(g, m, n)                      -> [float]
+//      shp_gram_right(g, m, n)                     -> [float]
+//      shp_matrix_power_neg_quarter(mat, dim, iters) -> [float]
+//      shp_precondition(g, m, n, lp, rp)           -> [float]
+//      shp_step(params, grads, m, n, state, lr)    -> map #{params, state}
+//      shp_init_state(m, n)                        -> map
+//      detect_adamw_for_shampoo(prog)              -> bool
+//      rewrite_shampoo(prog)                       -> Program
+//
+//  Numerical contract
+//  ------------------
+//      shp_precondition(G, m, n, I_m, I_n) == G
+//      (identity preconditioners are a no-op on the gradient)
+//
+//  Grammar cautions (HX3 pitfalls)
+//  -------------------------------
+//      - no struct-literal head inside `if` -> maps returned at tail
+//      - no `and`/`or` -> `&&` / `||`
+//      - no enum -> string tags
+//      - abs → use abs_pure from math_pure.hexa
+//      - `handle` is reserved keyword -> never use as param name
+//      - P15: `let mut x = 0` for mutable
+//      - Array concat in loops O(n^2) -> use .push(x)
+//
+//  AI-native attrs
+//  ---------------
+//      @hot      — optimizer step called every training iteration
+//      @pure     — returns new state; does not mutate caller arrays
+//      @parallel — inner sweeps are independent across elements
+// ===================================================================
+
+// -- numeric helpers (prefixed to avoid collisions) -----------------
+
+// shp_fabs → abs_pure (math_pure.hexa)
+
+@pure
+fn shp_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn shp_copy(a) {
+    let n = len(a)
+    let mut out = shp_zeros(n)
+    for i in 0..n {
+        out[i] = a[i]
+    }
+    return out
+}
+
+// -- flat matrix identity -------------------------------------------
+@pure
+fn shp_eye(dim) {
+    let mut out = shp_zeros(dim * dim)
+    for i in 0..dim {
+        out[i * dim + i] = 1.0
+    }
+    return out
+}
+
+// ===================================================================
+//  shp_mat_mul — flat (m x n) @ (n x k) = (m x k)
+// ===================================================================
+@hot @parallel @pure
+pub fn shp_mat_mul(a, b, m, n, k) {
+    let mut c = shp_zeros(m * k)
+    for i in 0..m {
+        for j in 0..k {
+            let mut s = 0.0
+            for p in 0..n {
+                s = s + a[i * n + p] * b[p * k + j]
+            }
+            c[i * k + j] = s
+        }
+    }
+    return c
+}
+
+// ===================================================================
+//  shp_mat_transpose — flat (m x n) -> (n x m)
+// ===================================================================
+@pure
+pub fn shp_mat_transpose(a, m, n) {
+    let mut out = shp_zeros(n * m)
+    for i in 0..m {
+        for j in 0..n {
+            out[j * m + i] = a[i * n + j]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  shp_gram_left — G @ G^T  (m x n) @ (n x m) = (m x m)
+// ===================================================================
+@hot @pure
+pub fn shp_gram_left(g, m, n) {
+    let gt = shp_mat_transpose(g, m, n)
+    return shp_mat_mul(g, gt, m, n, m)
+}
+
+// ===================================================================
+//  shp_gram_right — G^T @ G  (n x m) @ (m x n) = (n x n)
+// ===================================================================
+@hot @pure
+pub fn shp_gram_right(g, m, n) {
+    let gt = shp_mat_transpose(g, m, n)
+    return shp_mat_mul(gt, g, n, m, n)
+}
+
+// ===================================================================
+//  shp_mat_add — element-wise a + b (same size)
+// ===================================================================
+@pure
+fn shp_mat_add(a, b, sz) {
+    let mut out = shp_zeros(sz)
+    for i in 0..sz {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+// ===================================================================
+//  shp_mat_scale — scalar * flat matrix
+// ===================================================================
+@pure
+fn shp_mat_scale(a, s, sz) {
+    let mut out = shp_zeros(sz)
+    for i in 0..sz {
+        out[i] = a[i] * s
+    }
+    return out
+}
+
+// ===================================================================
+//  shp_matrix_power_neg_quarter — M^{-1/4} via coupled Newton-Schulz
+//
+//  Coupled iteration (Denman-Beavers for p-th root, specialized to
+//  p = 4):
+//
+//  Given SPD matrix M (dim x dim):
+//    1. Normalize: A = M / ||M||_F  (so spectral radius ~ 1)
+//    2. Initialize:
+//         X_0 = I            (approximation to A^{-1/4})
+//         Y_0 = A            (will converge to I)
+//    3. Iterate (coupled Newton-Schulz):
+//         X_{k+1} = X_k * (5I - Y_k * (10I - Y_k * (10I - 5*Y_k + Y_k^2))) / 4
+//       Simplified to the standard coupled iteration for 4th root:
+//         Z_k = I - Y_k
+//         X_{k+1} = X_k * (I + (1/4)*Z_k + (5/32)*Z_k^2 + (15/128)*Z_k^3)
+//         Y_{k+1} = (I + (1/4)*Z_k + (5/32)*Z_k^2 + (15/128)*Z_k^3)^4 * Y_k
+//
+//  For simplicity and stability we use the Denman-Beavers coupled
+//  iteration for the matrix square root, applied twice:
+//    M^{-1/4} = (M^{-1/2})^{1/2}
+//
+//  Denman-Beavers for M^{-1/2}:
+//    Y_0 = M,  Z_0 = I
+//    Y_{k+1} = (Y_k + Z_k^{-1}) / 2
+//    Z_{k+1} = (Z_k + Y_k^{-1}) / 2
+//    Y_inf -> M^{1/2},  Z_inf -> M^{-1/2}
+//
+//  But matrix inverse is expensive. Instead, we use the simpler
+//  Newton-Schulz iteration for M^{-1/2} (inverse square root):
+//    X_0 = alpha * I   (alpha = 1 / ||M||_F)
+//    X_{k+1} = X_k * (3I - M * X_k * X_k) / 2
+//  Converges when ||I - alpha^2 * M|| < 1.
+//  Then M^{-1/4} = (M^{-1/2})^{1/2}, but we need the positive root.
+//
+//  Even simpler: direct Newton-Schulz for M^{-1/4}.
+//  We use the iterative scheme:
+//    X_0 = I / ||M||_F^{1/4}
+//    repeat:
+//      X4 = X @ X @ X @ X
+//      X = X * (5*I - M * X4) / 4
+//
+//  This converges for ||M|| normalized near 1.
+//  We use `iters` iterations (default 15 is sufficient for dim <= 64).
+// ===================================================================
+@hot @pure
+pub fn shp_matrix_power_neg_quarter(mat, dim, iters) {
+    let sz = dim * dim
+    if sz == 0 { return shp_zeros(0) }
+
+    // Frobenius norm for normalization
+    let mut frob_sq = 0.0
+    for i in 0..sz {
+        frob_sq = frob_sq + mat[i] * mat[i]
+    }
+    let frob = sqrt(frob_sq)
+    if frob < 1.0e-30 { return shp_eye(dim) }
+
+    // Normalize M so spectral radius is near 1
+    let scale = 1.0 / frob
+    let mut a_mat = shp_mat_scale(mat, scale, sz)
+
+    // Newton-Schulz for inverse square root: X -> A^{-1/2}
+    // X_0 = I (since A is normalized to ~unit Frobenius)
+    // X_{k+1} = X_k * (3I - A * X_k^2) / 2
+    let eye = shp_eye(dim)
+    let mut x_inv_sqrt = shp_copy(eye)
+
+    let three_eye = shp_mat_scale(eye, 3.0, sz)
+
+    let half_iters = iters
+    for _it in 0..half_iters {
+        // X^2
+        let x2 = shp_mat_mul(x_inv_sqrt, x_inv_sqrt, dim, dim, dim)
+        // A * X^2
+        let ax2 = shp_mat_mul(a_mat, x2, dim, dim, dim)
+        // 3I - A*X^2
+        let mut diff = shp_zeros(sz)
+        for i in 0..sz {
+            diff[i] = three_eye[i] - ax2[i]
+        }
+        // X * (3I - A*X^2) / 2
+        let prod = shp_mat_mul(x_inv_sqrt, diff, dim, dim, dim)
+        x_inv_sqrt = shp_mat_scale(prod, 0.5, sz)
+    }
+    // x_inv_sqrt ~ A^{-1/2}
+
+    // Now compute (A^{-1/2})^{1/2} = A^{-1/4}
+    // Newton-Schulz for square root of B = A^{-1/2}:
+    //   Use same inverse-sqrt iteration on B, then result is B^{-1/2} = A^{1/4}
+    //   We want B^{1/2} = A^{-1/4} instead.
+    //
+    //   Denman-Beavers for B^{1/2}:
+    //     Y=B, Z=I; Y=(Y+Z^{-1})/2, Z=(Z+Y^{-1})/2; Y->B^{1/2}
+    //   Too expensive.
+    //
+    //   Instead: product form. We have A^{-1/2}.
+    //   A^{-1/4} = (A^{-1/2})^{1/2}
+    //   Use Newton iteration for square root of SPD matrix B:
+    //     X_0 = I
+    //     X_{k+1} = (X_k + B * X_k^{-1}) / 2
+    //   Requires inversion. Approximate with the Babylonian variant:
+    //     Use Newton-Schulz on B to get B^{-1/2}, then B^{1/2} = B * B^{-1/2}
+    let b_mat = shp_copy(x_inv_sqrt)
+
+    // Frobenius norm of B
+    let mut b_frob_sq = 0.0
+    for i in 0..sz {
+        b_frob_sq = b_frob_sq + b_mat[i] * b_mat[i]
+    }
+    let b_frob = sqrt(b_frob_sq)
+    let mut b_norm = shp_copy(b_mat)
+    if b_frob > 1.0e-30 {
+        b_norm = shp_mat_scale(b_mat, 1.0 / b_frob, sz)
+    }
+
+    // Newton-Schulz for B_norm^{-1/2}
+    let mut y_inv_sqrt = shp_copy(eye)
+    for _it in 0..half_iters {
+        let y2 = shp_mat_mul(y_inv_sqrt, y_inv_sqrt, dim, dim, dim)
+        let by2 = shp_mat_mul(b_norm, y2, dim, dim, dim)
+        let mut diff2 = shp_zeros(sz)
+        for i in 0..sz {
+            diff2[i] = three_eye[i] - by2[i]
+        }
+        let prod2 = shp_mat_mul(y_inv_sqrt, diff2, dim, dim, dim)
+        y_inv_sqrt = shp_mat_scale(prod2, 0.5, sz)
+    }
+    // y_inv_sqrt ~ B_norm^{-1/2}
+    // B^{1/2} = B * B^{-1/2} = B * (1/sqrt(b_frob)) * B_norm^{-1/2}
+    //         = (1/sqrt(b_frob)) * B * B_norm^{-1/2}
+    // But B_norm = B / b_frob, so B_norm^{-1/2} operates on normalized.
+    // B^{-1/2} = B_norm^{-1/2} / sqrt(b_frob)
+    // B^{1/2}  = B * B^{-1/2} = B * B_norm^{-1/2} / sqrt(b_frob)
+    let b_inv_sqrt_scale = 1.0 / sqrt(b_frob + 1.0e-30)
+    let b_inv_sqrt = shp_mat_scale(y_inv_sqrt, b_inv_sqrt_scale, sz)
+    let b_sqrt = shp_mat_mul(b_mat, b_inv_sqrt, dim, dim, dim)
+    // b_sqrt ~ A^{-1/4} (on the normalized A)
+
+    // Un-normalize: A = scale * M, so A^{-1/4} = scale^{-1/4} * M^{-1/4}
+    // => M^{-1/4} = scale^{1/4} * A^{-1/4} = (1/frob)^{1/4} ... wait:
+    //    A = M * scale = M / frob
+    //    A^{-1/4} = (M/frob)^{-1/4} = frob^{1/4} * M^{-1/4}
+    //    M^{-1/4} = A^{-1/4} / frob^{1/4} = A^{-1/4} * frob^{-1/4}
+    let frob_neg_quarter = 1.0 / sqrt(sqrt(frob))
+    return shp_mat_scale(b_sqrt, frob_neg_quarter, sz)
+}
+
+// ===================================================================
+//  shp_precondition — L @ G @ R
+//  L: m x m, G: m x n (flat), R: n x n
+//  result: m x n (flat)
+// ===================================================================
+@hot @parallel @pure
+pub fn shp_precondition(g, m, n, lp, rp) {
+    let lg = shp_mat_mul(lp, g, m, m, n)
+    return shp_mat_mul(lg, rp, m, n, n)
+}
+
+// ===================================================================
+//  shp_init_state — identity preconditioners
+//  Returns map with L_acc (m x m identity), R_acc (n x n identity),
+//  step counter.
+// ===================================================================
+@pure
+pub fn shp_init_state(m, n) {
+    return #{
+        "L_acc": shp_eye(m),
+        "R_acc": shp_eye(n),
+        "m": m,
+        "n": n,
+        "step": 0
+    }
+}
+
+// ===================================================================
+//  shp_step — full Shampoo optimizer step
+//
+//  params : flat [float] of length m*n (the parameter matrix)
+//  grads  : flat [float] of length m*n (the gradient)
+//  m, n   : matrix dimensions
+//  state  : map from shp_init_state
+//  lr     : learning rate
+//
+//  Returns map #{params: [float], state: map}
+// ===================================================================
+@hot @pure
+pub fn shp_step(params, grads, m, n, state, lr) {
+    let sz = m * n
+    let l_old = state["L_acc"]
+    let r_old = state["R_acc"]
+
+    // Accumulate Gram matrices: L += G @ G^T, R += G^T @ G
+    let ggt = shp_gram_left(grads, m, n)
+    let gtg = shp_gram_right(grads, m, n)
+
+    let l_new = shp_mat_add(l_old, ggt, m * m)
+    let r_new = shp_mat_add(r_old, gtg, n * n)
+
+    // Compute preconditioners L^{-1/4} and R^{-1/4}
+    let l_inv4 = shp_matrix_power_neg_quarter(l_new, m, 15)
+    let r_inv4 = shp_matrix_power_neg_quarter(r_new, n, 15)
+
+    // Preconditioned gradient: L^{-1/4} @ G @ R^{-1/4}
+    let p_grad = shp_precondition(grads, m, n, l_inv4, r_inv4)
+
+    // Update params: W -= lr * P
+    let mut new_params = shp_copy(params)
+    for i in 0..sz {
+        new_params[i] = new_params[i] - lr * p_grad[i]
+    }
+
+    let new_state = #{
+        "L_acc": l_new,
+        "R_acc": r_new,
+        "m": m,
+        "n": n,
+        "step": state["step"] + 1
+    }
+
+    return #{
+        "params": new_params,
+        "state": new_state
+    }
+}
+
+// ===================================================================
+//  AST side — pattern detect / rewrite
+//
+//  detect_adamw_for_shampoo(prog) -> bool
+//    Returns true iff `prog` is a list containing an AdamW optimizer
+//    loop that can be replaced with Shampoo preconditioning.
+//    The pattern: a "for" node with body kind "adamw_step" operating
+//    on a 2D parameter (has "rows" and "cols" metadata).
+//
+//  rewrite_shampoo(prog) -> Program
+//    Replaces matching "adamw_step" nodes with "shampoo_step" nodes.
+//    Non-matching nodes are preserved unchanged.
+//
+//  Stmt.kind in {
+//      "adamw_step", "shampoo_step", "other"
+//  }
+//  Stmt.index : string   — loop index variable
+//  Stmt.param : string   — parameter name
+//  Stmt.rows  : int      — row dimension (0 if unknown / 1D)
+//  Stmt.cols  : int      — col dimension (0 if unknown / 1D)
+// ===================================================================
+
+struct ShpStmt {
+    kind: string
+    index: string
+    param: string
+    rows: int
+    cols: int
+}
+
+pub fn shp_stmt(kind, index, param, rows, cols) {
+    return ShpStmt{kind: kind, index: index, param: param, rows: rows, cols: cols}
+}
+
+pub fn shp_stmt_adamw(index, param, rows, cols) {
+    return shp_stmt("adamw_step", index, param, rows, cols)
+}
+
+pub fn shp_stmt_shampoo(index, param, rows, cols) {
+    return shp_stmt("shampoo_step", index, param, rows, cols)
+}
+
+pub fn shp_stmt_other() {
+    return shp_stmt("other", "", "", 0, 0)
+}
+
+@pure
+fn detect_adamw_for_shampoo_impl(prog) {
+    if len(prog) == 0 { return false }
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "adamw_step" {
+            // Must have 2D shape (rows > 0 and cols > 0)
+            if s.rows > 0 && s.cols > 0 {
+                return true
+            }
+        }
+    }
+    return false
+}
+
+pub fn detect_adamw_for_shampoo(prog) {
+    return detect_adamw_for_shampoo_impl(prog)
+}
+
+@pure
+fn rewrite_shampoo_impl(prog) {
+    if !detect_adamw_for_shampoo(prog) { return prog }
+    let mut out = []
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "adamw_step" && s.rows > 0 && s.cols > 0 {
+            out.push(shp_stmt_shampoo(s.index, s.param, s.rows, s.cols))
+        } else {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+pub fn rewrite_shampoo(prog) {
+    return rewrite_shampoo_impl(prog)
+}
+
+println("[shampoo_ai_native] loaded — Kronecker-factored L^(-1/4) G R^(-1/4) + Newton-Schulz + AST rewrite")

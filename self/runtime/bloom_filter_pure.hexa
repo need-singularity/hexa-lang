@@ -1,130 +1,229 @@
 // ═══════════════════════════════════════════════════════════════════
-//  self/runtime/bloom_filter_pure.hexa — pure-Hexa probabilistic bloom filter
+//  self/runtime/bloom_filter_pure.hexa — Bloom filter (pure Hexa)
 //
-//  Self-contained dict-based bloom filter using FNV-1a-style hashing
-//  with modular arithmetic (no bitwise XOR needed) and double-hashing
-//  for k independent hash functions.
+//  Probabilistic set membership with zero false negatives.
+//  Uses FNV-1a variant with seed mixing for independent hash functions.
 //
 //  Public API:
-//      bloom_new(size, num_hashes)     — create bloom filter
-//      bloom_add(bf, item)            — add string item to filter
-//      bloom_contains(bf, item)       — probabilistic membership test
-//      bloom_hash(item, seed, size)   — FNV-1a-style hash via modular arith
-//      bloom_count(bf)                — number of set bits
-//      bloom_clear(bf)                — reset all bits to 0
-//      bloom_merge(bf1, bf2)          — union of two same-size filters
-//      bloom_false_positive_rate(bf)  — estimated FP rate based on fill
+//      bloom_create(num_bits, num_hashes)                    -> map
+//      bloom_hash(item, seed, num_bits)                      -> int
+//      bloom_add(filter, item)                               -> map
+//      bloom_contains(filter, item)                          -> bool
+//      bloom_false_positive_rate(num_items, num_bits, num_hashes) -> float
+//      bloom_optimal_hashes(num_bits, expected_items)         -> int
+//
+//  Bonus helpers (pure convenience, not in spec):
+//      bloom_count(filter)          -> int   (number of set bits)
+//      bloom_clear(filter)          -> map   (reset bits, keep shape)
+//      bloom_merge(f1, f2)          -> map   (union two same-size filters)
 //
 //  Properties:
 //      - No false negatives (if added, contains always returns true)
-//      - False positives possible (probability depends on size and k)
+//      - False positives possible (rate depends on size and k)
 //      - Pure Hexa, no C/FFI, no external imports
 //
 //  HX3 pitfalls handled:
 //      P1   no semicolons
 //      P15  let mut for mutable variables
-//      P29  .push() returns new array — must reassign
-//      P28  nil/true/false literals
+//      P30  no unsigned int — emulate via & 0xFFFFFFFF
+//      Array concat in loops O(n^2) — use .push()
 // ═══════════════════════════════════════════════════════════════════
 
-// ── bloom_hash ──────────────────────────────────────────────────
-// FNV-1a-style hash using modular arithmetic.
-// hash = (hash * 16777619 + char_code) % size
-// The seed offsets the initial hash value for independent hashes.
+let MASK32 = 0xFFFFFFFF
+
+// ── FNV-1a 32-bit constants ─────────────────────────────────────
+let FNV_OFFSET = 0x811C9DC5
+let FNV_PRIME  = 0x01000193
+
+// ── 32-bit multiply via 16-bit split (avoid int64 overflow) ─────
 @pure
-pub fn bloom_hash(item, seed, size) {
-    if size <= 0 { return 0 }
-    let n = len(item)
-    // FNV offset basis + seed perturbation, kept positive
-    let mut hash_val = 2166136261 + seed * 16777619
-    if hash_val < 0 { hash_val = 0 - hash_val }
-    hash_val = hash_val % (size * 1000000)
+fn _mul32(a, b) {
+    let a32 = a & MASK32
+    let b32 = b & MASK32
+    let aL = a32 & 0xFFFF
+    let aH = (a32 / 65536) & 0xFFFF
+    let bL = b32 & 0xFFFF
+    let bH = (b32 / 65536) & 0xFFFF
+    let low = aL * bL
+    let mid = aL * bH + aH * bL
+    return (low + mid * 65536) & MASK32
+}
+
+// ── bloom_hash ──────────────────────────────────────────────────
+// FNV-1a with seed mixing. Produces a bit index in [0, num_bits).
+@pure
+pub fn bloom_hash(item, seed, num_bits) {
+    if num_bits <= 0 { return 0 }
+    let s = to_string(item)
+    let n = len(s)
+    // mix seed into FNV offset basis
+    let mut hval = (FNV_OFFSET ^ (seed & MASK32)) & MASK32
     let mut i = 0
     while i < n {
-        let ch = item.substring(i, i + 1)
-        let code = ord(ch)
-        hash_val = (hash_val * 16777619 + code) % (size * 1000000)
-        if hash_val < 0 { hash_val = 0 - hash_val }
+        let byte = char_code(s, i)
+        hval = (hval ^ (byte & 0xFF)) & MASK32
+        hval = _mul32(hval, FNV_PRIME)
         i = i + 1
     }
-    return hash_val % size
+    // second mix with seed for better decorrelation across seeds
+    hval = (hval ^ _mul32(seed, 0x9E3779B9)) & MASK32
+    hval = _mul32(hval, FNV_PRIME)
+    return hval % num_bits
 }
 
-// ── _bloom_positions ────────────────────────────────────────────
-// Compute k bit positions for item using double-hashing:
-// h(i) = (h1 + i * h2) % size
-@pure
-fn _bloom_positions(bf, item) {
-    let size = bf["size"]
-    let k = bf["k"]
-    let h1 = bloom_hash(item, 0, size)
-    let h2 = bloom_hash(item, 1, size)
-    // Ensure h2 is at least 1 so positions vary across k
-    let mut h2_safe = h2
-    if h2_safe == 0 { h2_safe = 1 }
-    let mut positions = []
-    let mut j = 0
-    while j < k {
-        let pos = (h1 + j * h2_safe) % size
-        positions = positions.push(pos)
-        j = j + 1
-    }
-    return positions
-}
-
-// ── bloom_new ───────────────────────────────────────────────────
-// Create a bloom filter with a bit array of given size and k hash
-// functions. Returns #{"bits": [...], "size": size, "k": num_hashes}.
-@pure
-pub fn bloom_new(size, num_hashes) {
+// ── bloom_create ────────────────────────────────────────────────
+// Returns #{bits: [int], num_hashes: int, size: int}
+pub fn bloom_create(num_bits, num_hashes) {
     let mut bits = []
     let mut i = 0
-    while i < size {
-        bits = bits.push(0)
+    while i < num_bits {
+        bits.push(0)
         i = i + 1
     }
-    return #{"bits": bits, "size": size, "k": num_hashes}
+    let mut result = #{}
+    result["bits"] = bits
+    result["num_hashes"] = num_hashes
+    result["size"] = num_bits
+    return result
 }
 
 // ── bloom_add ───────────────────────────────────────────────────
-// Add item to filter. Sets k bit positions to 1.
-// Returns updated bloom filter dict.
-pub fn bloom_add(bf, item) {
-    let positions = _bloom_positions(bf, item)
-    let k = len(positions)
-    let mut bits = bf["bits"]
-    let mut j = 0
-    while j < k {
-        let pos = positions[j]
+// Sets bits for all hash positions. Returns updated filter map.
+pub fn bloom_add(filter, item) {
+    let bits = filter["bits"]
+    let k = filter["num_hashes"]
+    let m = filter["size"]
+    let mut i = 0
+    while i < k {
+        let pos = bloom_hash(item, i, m)
         bits[pos] = 1
-        j = j + 1
+        i = i + 1
     }
-    return #{"bits": bits, "size": bf["size"], "k": bf["k"]}
+    let mut r = #{}
+    r["bits"] = bits
+    r["num_hashes"] = k
+    r["size"] = m
+    return r
 }
 
 // ── bloom_contains ──────────────────────────────────────────────
-// Probabilistic membership test.
-// Returns true if all k bit positions are set (may be false positive).
-// Returns false if any bit is 0 (guaranteed true negative).
+// Checks all hash positions. Returns false if any bit is 0.
 @pure
-pub fn bloom_contains(bf, item) {
-    let positions = _bloom_positions(bf, item)
-    let k = len(positions)
-    let bits = bf["bits"]
-    let mut j = 0
-    while j < k {
-        let pos = positions[j]
+pub fn bloom_contains(filter, item) {
+    let bits = filter["bits"]
+    let k = filter["num_hashes"]
+    let m = filter["size"]
+    let mut i = 0
+    while i < k {
+        let pos = bloom_hash(item, i, m)
         if bits[pos] != 1 { return false }
-        j = j + 1
+        i = i + 1
     }
     return true
 }
 
-// ── bloom_count ─────────────────────────────────────────────────
-// Count number of set bits in the filter.
+// ── _exp_approx (inline, avoids import) ─────────────────────────
+// Taylor series e^x, 30 terms — sufficient for FPR calculation.
 @pure
-pub fn bloom_count(bf) {
-    let bits = bf["bits"]
+fn _exp_approx(x) {
+    let mut sum = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i <= 30 {
+        term = term * x / i
+        sum = sum + term
+        i = i + 1
+    }
+    return sum
+}
+
+// ── _ln_approx (inline) ────────────────────────────────────────
+// ln(x) via range reduction + series.
+@pure
+fn _ln_approx(x) {
+    if x <= 0.0 { return 0.0 - 999999.0 }
+    let mut val = x
+    let mut p = 0
+    while val > 2.0 {
+        val = val / 2.0
+        p = p + 1
+    }
+    while val < 1.0 {
+        val = val * 2.0
+        p = p - 1
+    }
+    let t = (val - 1.0) / (val + 1.0)
+    let t2 = t * t
+    let mut sum = t
+    let mut power = t
+    let mut i = 1
+    while i <= 30 {
+        power = power * t2
+        sum = sum + power / (2 * i + 1)
+        i = i + 1
+    }
+    return 2.0 * sum + p * 0.69314718055994530942
+}
+
+// ── _floor_int (inline) ────────────────────────────────────────
+@pure
+fn _floor_int(x) {
+    if x >= 0.0 {
+        let mut fl = 0
+        let mut acc = 0.0
+        while acc + 1.0 <= x {
+            fl = fl + 1
+            acc = acc + 1.0
+        }
+        return fl
+    }
+    // negative
+    let mut fl = 0
+    let mut acc = 0.0
+    while acc > x {
+        fl = fl - 1
+        acc = acc - 1.0
+    }
+    return fl
+}
+
+// ── bloom_false_positive_rate ───────────────────────────────────
+// Theoretical FPR: (1 - e^(-k*n/m))^k
+// k = num_hashes, n = num_items, m = num_bits
+@pure
+pub fn bloom_false_positive_rate(num_items, num_bits, num_hashes) {
+    let k = num_hashes * 1.0
+    let n = num_items * 1.0
+    let m = num_bits * 1.0
+    if m <= 0.0 { return 1.0 }
+    if n <= 0.0 { return 0.0 }
+    let exponent = (0.0 - k) * n / m
+    // When exponent is very negative, e^exponent ~ 0, inner ~ 1.0, FPR ~ 1.0
+    // Taylor series overflows for |exponent| > ~30, so short-circuit
+    if exponent < (0.0 - 20.0) { return 1.0 }
+    let inner = 1.0 - _exp_approx(exponent)
+    if inner <= 0.0 { return 0.0 }
+    // inner^k = exp(k * ln(inner))
+    return _exp_approx(k * _ln_approx(inner))
+}
+
+// ── bloom_optimal_hashes ────────────────────────────────────────
+// Optimal number of hash functions: round((m/n) * ln(2))
+// Returns at least 1.
+@pure
+pub fn bloom_optimal_hashes(num_bits, expected_items) {
+    if expected_items <= 0 { return 1 }
+    let ratio = (num_bits * 1.0) / (expected_items * 1.0)
+    let raw = ratio * 0.69314718055994530942
+    let result = _floor_int(raw + 0.5)
+    if result < 1 { return 1 }
+    return result
+}
+
+// ── bloom_count (bonus) ─────────────────────────────────────────
+@pure
+pub fn bloom_count(filter) {
+    let bits = filter["bits"]
     let n = len(bits)
     let mut count = 0
     let mut i = 0
@@ -135,49 +234,30 @@ pub fn bloom_count(bf) {
     return count
 }
 
-// ── bloom_clear ─────────────────────────────────────────────────
-// Reset all bits to 0, preserving size and k.
+// ── bloom_clear (bonus) ─────────────────────────────────────────
 @pure
-pub fn bloom_clear(bf) {
-    return bloom_new(bf["size"], bf["k"])
+pub fn bloom_clear(filter) {
+    return bloom_create(filter["size"], filter["num_hashes"])
 }
 
-// ── bloom_merge ─────────────────────────────────────────────────
-// Union of two bloom filters with the same size and k.
-// Result contains all items from both filters.
-pub fn bloom_merge(bf1, bf2) {
-    let size = bf1["size"]
-    let bits1 = bf1["bits"]
-    let bits2 = bf2["bits"]
+// ── bloom_merge (bonus) ─────────────────────────────────────────
+pub fn bloom_merge(f1, f2) {
+    let m = f1["size"]
+    let bits1 = f1["bits"]
+    let bits2 = f2["bits"]
     let mut bits = []
     let mut i = 0
-    while i < size {
+    while i < m {
         if bits1[i] == 1 || bits2[i] == 1 {
-            bits = bits.push(1)
+            bits.push(1)
         } else {
-            bits = bits.push(0)
+            bits.push(0)
         }
         i = i + 1
     }
-    return #{"bits": bits, "size": size, "k": bf1["k"]}
-}
-
-// ── bloom_false_positive_rate ───────────────────────────────────
-// Estimated false positive rate based on current fill ratio.
-// Approximation: (set_bits / total_bits) ^ k
-@pure
-pub fn bloom_false_positive_rate(bf) {
-    let size = bf["size"]
-    let k = bf["k"]
-    if size == 0 { return 1.0 }
-    let set_count = bloom_count(bf)
-    let ratio = (set_count * 1.0) / (size * 1.0)
-    // ratio^k
-    let mut result = 1.0
-    let mut i = 0
-    while i < k {
-        result = result * ratio
-        i = i + 1
-    }
-    return result
+    let mut r = #{}
+    r["bits"] = bits
+    r["num_hashes"] = f1["num_hashes"]
+    r["size"] = m
+    return r
 }

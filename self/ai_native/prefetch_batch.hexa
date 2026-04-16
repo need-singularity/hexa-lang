@@ -49,7 +49,8 @@
 //        "reader" vs "writer" for each tick window.
 //
 //  Non-goals for this checkpoint:
-//    - Actual async thread dispatch — TODO rt_spawn_load(i, buf[i%2]).
+//    - Actual async thread dispatch — cooperative pb_rt_spawn implemented;
+//      swap pb_rt_spawn body with async I/O dispatch for real overlap.
 //    - Triple-buffering / pipeline depth > 2 — ROI #100 material.
 //    - Prefetch distance auto-tuning — the 2-deep pipeline is optimal
 //      when compute ~ load; deeper pipelines only help when load is
@@ -150,11 +151,16 @@ fn prefetch_loop_fused_impl(N, loader, cmp) {
     while i < N {
         let wslot = i - ((i / 2) * 2)             // i & 1
         let rslot = (i - 1) - (((i - 1) / 2) * 2) // (i-1) & 1
-        // ── issue prefetch for batch i into wslot ──
-        buf[wslot] = loader(i)
+        // ── issue prefetch for batch i via rt_spawn ──
+        // Cooperative: runs immediately, but the API contract means
+        // a future async backend can overlap this with the compute
+        // below without changing any call site.
+        let load_h = pb_rt_spawn(loader, i)
         // ── compute the PREVIOUS batch from rslot ──
         let y_prev = cmp(buf[rslot])
         out = out.push(y_prev)
+        // ── join the prefetch and write into wslot ──
+        buf[wslot] = pb_rt_join(load_h)
         i = i + 1
     }
 
@@ -235,9 +241,11 @@ pub fn prefetch_loop_fused_timed(N, loader, cmp, lt, ct) {
         let rslot = (i - 1) - (((i - 1) / 2) * 2)
         // Overlapped tick — both ops in flight, the longer one wins.
         ticks = ticks + pref_max(lt(i), ct(i - 1))
-        buf[wslot] = loader(i)
+        // rt_spawn the prefetch, then compute prev batch, then join.
+        let load_h = pb_rt_spawn(loader, i)
         let y_prev = cmp(buf[rslot])
         out = out.push(y_prev)
+        buf[wslot] = pb_rt_join(load_h)
         i = i + 1
     }
 
@@ -320,7 +328,7 @@ pub fn detect_prefetch_candidate(markers) {
 // the drain.
 //
 // This is a pure data transform — no loop is actually executed. The
-// result is consumed by the real runtime (TODO) to emit rt_spawn calls.
+// result is consumed by the real runtime to emit pb_rt_spawn calls.
 
 pub fn rewrite_to_double_buffer(schedule) {
     let N = schedule["N"]
@@ -353,3 +361,33 @@ pub fn rewrite_to_double_buffer(schedule) {
 // for allocator bench-tests.
 pub fn prefetch_buffer_count_naive() { return 1 }
 pub fn prefetch_buffer_count_fused() { return 2 }
+
+
+// ── cooperative spawn infrastructure (self-contained) ─────────────
+// Minimal spawn/join for prefetch dispatch. Each "spawn" runs its
+// closure immediately (cooperative). When OS threads arrive, only
+// this section needs replacement — the fused loop above stays as-is.
+//
+// API contract (matches self/runtime/spawn_pure.hexa):
+//   pb_rt_spawn(fn, arg)  -> handle   (spawn loader(i))
+//   pb_rt_join(handle)    -> result   (get loaded batch)
+
+let mut pb_rt_task_results = []
+let mut pb_rt_task_count   = 0
+
+fn pb_rt_spawn(f, arg) {
+    // Execute the loader immediately (cooperative scheduling).
+    // With real threads this would enqueue f(arg) to a worker and
+    // return a future handle; the join below would block until done.
+    let result = f(arg)
+    let h = pb_rt_task_count
+    pb_rt_task_results = pb_rt_task_results.push(result)
+    pb_rt_task_count = pb_rt_task_count + 1
+    return h
+}
+
+fn pb_rt_join(h) {
+    if h < 0 { return 0 }
+    if h >= pb_rt_task_count { return 0 }
+    return pb_rt_task_results[h]
+}
