@@ -59,7 +59,7 @@ if [ -f "$HEXA_V2_DEDUP_SRC" ]; then
         echo "[build_stage0] (re)building $HEXA_V2_DEDUP_BIN from $HEXA_V2_DEDUP_SRC"
         mkdir -p "$HEXA_DIR/build"
         # shellcheck disable=SC2086
-        if "$CLANG" $HEXA_V2_CFLAGS "$HEXA_V2_DEDUP_SRC" -o "$HEXA_V2_DEDUP_BIN" 2>/tmp/.hexa_v2_dedup_build.log; then
+        if timeout --kill-after=5 120 "$CLANG" $HEXA_V2_CFLAGS "$HEXA_V2_DEDUP_SRC" -o "$HEXA_V2_DEDUP_BIN" 2>/tmp/.hexa_v2_dedup_build.log; then
             echo "[build_stage0] dedup4 hexa_v2 built OK"
         else
             echo "[build_stage0] WARN: dedup4 hexa_v2 build failed — see /tmp/.hexa_v2_dedup_build.log; falling back to mainline hexa_v2"
@@ -98,19 +98,61 @@ if [ -z "$SKIP_TRANSPILE" ]; then
             echo "error: flatten runner missing (need build/hexa_stage0 or ./hexa)" >&2
             exit 1
         fi
-        echo "[build_stage0] flatten: $FLATTEN_RUNNER scripts/flatten_imports.hexa $SRC_HEXA $FLAT_HEXA"
-        # T33: arena instrumentation (__hexa_fn_arena_enter/return) in regen'd
-        # stage0 causes mutable-variable corruption in the interpreter path.
-        # Force HEXA_VAL_ARENA=0 to disable arena during flatten execution.
-        HEXA_VAL_ARENA=0 "$FLATTEN_RUNNER" "$HEXA_DIR/scripts/flatten_imports.hexa" "$SRC_HEXA" "$FLAT_HEXA"
-        if [ ! -f "$FLAT_HEXA" ]; then
-            echo "error: flatten output missing: $FLAT_HEXA" >&2
-            exit 1
+        # ── Flatten lock (atomic mkdir) — prevents concurrent flatten_imports ──
+        # Race condition fix: two flatten_imports can run simultaneously
+        # (e.g. PIDs 3521 + 5087) writing to the same output file.
+        FLATTEN_LOCK="/tmp/hexa_flatten.lock"
+        FLATTEN_LOCK_TTL=120
+        FLATTEN_GOT_LOCK=0
+        if mkdir "$FLATTEN_LOCK" 2>/dev/null; then
+            echo $$ > "$FLATTEN_LOCK/pid"
+            FLATTEN_GOT_LOCK=1
+        else
+            # Check if lock is stale
+            FL_PID=$(cat "$FLATTEN_LOCK/pid" 2>/dev/null || echo "")
+            FL_TIME=$(stat -f %m "$FLATTEN_LOCK" 2>/dev/null || stat -c %Y "$FLATTEN_LOCK" 2>/dev/null || echo 0)
+            FL_AGE=$(( $(date +%s) - ${FL_TIME:-$(date +%s)} ))
+            if [ -n "$FL_PID" ] && kill -0 "$FL_PID" 2>/dev/null && [ "$FL_AGE" -lt "$FLATTEN_LOCK_TTL" ]; then
+                echo "[build_stage0] flatten: waiting for concurrent flatten (pid=$FL_PID, age=${FL_AGE}s)" >&2
+                # Wait up to 60s for the other process to finish
+                FL_WAIT=0
+                while [ -d "$FLATTEN_LOCK" ] && [ "$FL_WAIT" -lt 60 ]; do
+                    sleep 1
+                    FL_WAIT=$((FL_WAIT + 1))
+                done
+                if [ -d "$FLATTEN_LOCK" ]; then
+                    echo "[build_stage0] flatten: lock wait timeout — reclaiming" >&2
+                    rm -rf "$FLATTEN_LOCK"
+                    mkdir "$FLATTEN_LOCK" && echo $$ > "$FLATTEN_LOCK/pid" && FLATTEN_GOT_LOCK=1
+                fi
+                # If we didn't get the lock but flat output exists, reuse it
+                if [ "$FLATTEN_GOT_LOCK" = "0" ] && [ -f "$FLAT_HEXA" ]; then
+                    echo "[build_stage0] flatten: reusing output from concurrent run"
+                    SRC_FOR_TRANSPILE="$FLAT_HEXA"
+                fi
+            else
+                # Stale lock — reclaim
+                rm -rf "$FLATTEN_LOCK"
+                mkdir "$FLATTEN_LOCK" && echo $$ > "$FLATTEN_LOCK/pid" && FLATTEN_GOT_LOCK=1
+            fi
+        fi
+        if [ "$FLATTEN_GOT_LOCK" = "1" ]; then
+            echo "[build_stage0] flatten: $FLATTEN_RUNNER scripts/flatten_imports.hexa $SRC_HEXA $FLAT_HEXA"
+            # T33: arena instrumentation (__hexa_fn_arena_enter/return) in regen'd
+            # stage0 causes mutable-variable corruption in the interpreter path.
+            # Force HEXA_VAL_ARENA=0 to disable arena during flatten execution.
+            HEXA_VAL_ARENA=0 timeout --kill-after=5 120 "$FLATTEN_RUNNER" "$HEXA_DIR/scripts/flatten_imports.hexa" "$SRC_HEXA" "$FLAT_HEXA" \
+                || { rm -rf "$FLATTEN_LOCK"; false; }
+            rm -rf "$FLATTEN_LOCK"
+            if [ ! -f "$FLAT_HEXA" ]; then
+                echo "error: flatten output missing: $FLAT_HEXA" >&2
+                exit 1
+            fi
         fi
         SRC_FOR_TRANSPILE="$FLAT_HEXA"
     fi
     echo "[build_stage0] transpile: $HEXA_V2 $SRC_FOR_TRANSPILE $SRC_C"
-    "$HEXA_V2" "$SRC_FOR_TRANSPILE" "$SRC_C"
+    timeout --kill-after=5 120 "$HEXA_V2" "$SRC_FOR_TRANSPILE" "$SRC_C"
 fi
 
 if [ ! -f "$SRC_C" ]; then
@@ -156,7 +198,7 @@ echo "[build_stage0] uname=$UNAME"
 echo "[build_stage0] $CLANG $CFLAGS $SRC_C -o $OUT $LDFLAGS"
 
 # shellcheck disable=SC2086
-"$CLANG" $CFLAGS "$SRC_C" -o "$OUT" $LDFLAGS
+timeout --kill-after=5 120 "$CLANG" $CFLAGS "$SRC_C" -o "$OUT" $LDFLAGS
 
 # 3) Darwin codesign (AppleSystemPolicy SIGKILL 방지)
 if [ "$UNAME" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then

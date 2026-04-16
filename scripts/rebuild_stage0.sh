@@ -19,7 +19,7 @@
 #   - 실패 시 lock 자동 해제
 #
 # 사용:
-#   bash scripts/rebuild_stage0.sh               # layered cache guarded
+#   bash scripts/rebuild_stage0.sh               # layered cache + per-file incremental
 #   FORCE=1 bash scripts/rebuild_stage0.sh       # 캐시 무시 강제 rebuild
 #   WITH_SMOKE=1 bash scripts/rebuild_stage0.sh  # smoke test 포함
 #   NO_CACHE=1 bash scripts/rebuild_stage0.sh    # 캐시 read/write 전체 비활성 (legacy 경로)
@@ -36,6 +36,7 @@
 #     <hash>.key
 #   meta/
 #     last_build.json        마지막 빌드의 키 체인 + 통계 (hit/miss)
+#   file_hashes.manifest     per-file sha256 for incremental diff
 #
 # 캐시 key 전략:
 #   flatten_key   = sha256( flatten_imports.hexa ‖ hexa_full.hexa ‖
@@ -43,7 +44,16 @@
 #   transpile_key = sha256( flatten_key ‖ hexa_v2_binary ‖ hexa_v2_dedup_binary? )
 #   link_key      = sha256( transpile_key ‖ runtime.c ‖ CFLAGS ‖ LDFLAGS ‖ uname )
 #
+# Per-file incremental (2026-04-16):
+#   Before: any file change → full-chain invalidation (flatten+transpile+link)
+#   After:  per-file sha256 manifest tracks which files changed:
+#     - 0 files changed   → layered cache hit as before (<0.5s)
+#     - runtime.c only    → skip flatten+transpile, reuse .c, only re-link (~2s)
+#     - any .hexa changed → re-flatten + re-transpile + re-link (full ~5-10s)
+#   Diagnostic output shows exactly which file(s) triggered the rebuild.
+#
 # 예상 속도향상: touch 없으면 ~30s → <0.5s (link cache hit만 복사)
+#               runtime.c only → ~2s (clang link only, skip flatten+hexa_v2)
 #
 # 반환 코드:
 #   0 — rebuilt or cache hit
@@ -87,7 +97,7 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     mkdir "$LOCK_DIR"
 fi
 echo $$ > "$LOCK_DIR/pid"
-cleanup() { rm -rf "$LOCK_DIR"; [ -n "${BACKUP:-}" ] && rm -f "$BACKUP" || :; }
+cleanup() { rm -rf "$LOCK_DIR"; rm -rf /tmp/hexa_flatten.lock 2>/dev/null || :; [ -n "${BACKUP:-}" ] && rm -f "$BACKUP" || :; }
 trap cleanup EXIT INT TERM
 
 # ── 2. Helper: SHA-256 (macOS shasum -a 256 / Linux sha256sum 공통 fallback) ──
@@ -102,9 +112,76 @@ hash_of_files() {
     # Concat files in argv order, pipe to sha256, strip filename
     cat "$@" 2>/dev/null | sha256_cmd | cut -d' ' -f1
 }
+hash_of_file() {
+    # Hash a single file, return just the hash
+    sha256_cmd < "$1" 2>/dev/null | cut -d' ' -f1
+}
 hash_of_strings() {
     # Hash a sequence of strings joined by \n
     printf '%s\n' "$@" | sha256_cmd | cut -d' ' -f1
+}
+
+# ── 2b. Per-file manifest helpers ──────────────────────────────────────
+#    file_hashes.manifest format: "sha256  filepath" per line (sorted by path).
+#    Enables per-file change detection: only the files whose hash differs
+#    from the manifest are considered "dirty". This avoids full-chain
+#    invalidation when only runtime.c (or a single .hexa) changes.
+MANIFEST_FILE="$CACHE_DIR/file_hashes.manifest"
+
+# Write a manifest from an array of file paths.
+# Outputs sorted "hash  path" lines to $MANIFEST_FILE.
+write_manifest() {
+    local -a files=("$@")
+    mkdir -p "$CACHE_DIR"
+    local tmp_manifest
+    tmp_manifest="$(mktemp "${CACHE_DIR}/manifest.tmp.XXXXXX")"
+    local f
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+        local h
+        h=$(hash_of_file "$f")
+        echo "$h  $f"
+    done | sort -k2 > "$tmp_manifest"
+    mv -f "$tmp_manifest" "$MANIFEST_FILE"
+}
+
+# Compare current file hashes against the stored manifest.
+# Sets CHANGED_FILES (array) and CHANGED_CATEGORIES (string: "hexa", "runtime", "tool", or combos).
+# Returns 0 if any file changed, 1 if all match (nothing changed).
+diff_manifest() {
+    local -a files=("$@")
+    CHANGED_FILES=()
+    CHANGED_CATEGORIES=""
+    local any_changed=1  # 1 = no change (shell convention)
+
+    if [ ! -f "$MANIFEST_FILE" ]; then
+        # No manifest = treat everything as changed
+        CHANGED_FILES=("${files[@]}")
+        CHANGED_CATEGORIES="hexa,runtime,tool"
+        return 0
+    fi
+
+    local f
+    for f in "${files[@]}"; do
+        [ -f "$f" ] || continue
+        local cur_hash
+        cur_hash=$(hash_of_file "$f")
+        # Look up stored hash for this file
+        local stored_hash=""
+        stored_hash=$(awk -v path="$f" '$2 == path {print $1; exit}' "$MANIFEST_FILE" 2>/dev/null || echo "")
+        if [ "$cur_hash" != "$stored_hash" ]; then
+            CHANGED_FILES+=("$f")
+            any_changed=0
+            # Categorize the change
+            case "$f" in
+                */runtime.c)           CHANGED_CATEGORIES="${CHANGED_CATEGORIES:+$CHANGED_CATEGORIES,}runtime" ;;
+                */flatten_imports.hexa) CHANGED_CATEGORIES="${CHANGED_CATEGORIES:+$CHANGED_CATEGORIES,}tool" ;;
+                *.hexa)                CHANGED_CATEGORIES="${CHANGED_CATEGORIES:+$CHANGED_CATEGORIES,}hexa" ;;
+                *)                     CHANGED_CATEGORIES="${CHANGED_CATEGORIES:+$CHANGED_CATEGORIES,}other" ;;
+            esac
+        fi
+    done
+    return $any_changed
 }
 
 # ── 3. Discover transitive `use` imports from hexa_full.hexa ────────────
@@ -183,6 +260,47 @@ while IFS= read -r line; do
     [ -n "$line" ] && IMPORTS_SORTED+=("$line")
 done < <(discover_use_imports "$ROOT_HEXA")
 
+# ── 5b. Per-file incremental change detection ─────────────────────────
+#    Compare each input file's sha256 against the stored manifest.
+#    This enables:
+#      (a) Diagnostic output showing exactly which file(s) changed
+#      (b) runtime.c-only changes skip flatten+transpile (only re-link)
+#      (c) Unchanged runs get a fast-path exit before even computing layer keys
+RUNTIME_C="$HEXA_DIR/self/runtime.c"
+ALL_BUILD_INPUTS=("$FLATTEN_SCRIPT" "${IMPORTS_SORTED[@]}" "$RUNTIME_C")
+CHANGED_FILES=()
+CHANGED_CATEGORIES=""
+HEXA_ONLY_CHANGED=0
+RUNTIME_ONLY_CHANGED=0
+TOOL_CHANGED=0
+
+if [ -z "$FORCE" ] && [ -x "$OUT" ]; then
+    if diff_manifest "${ALL_BUILD_INPUTS[@]}"; then
+        # Something changed — report which files
+        echo "[rebuild_stage0] per-file diff: ${#CHANGED_FILES[@]} file(s) changed:"
+        for cf in "${CHANGED_FILES[@]}"; do
+            echo "  * $(basename "$cf")"
+        done
+        # Determine change category for partial-skip optimization
+        case "$CHANGED_CATEGORIES" in
+            runtime)
+                RUNTIME_ONLY_CHANGED=1
+                echo "[rebuild_stage0] OPTIMIZATION: only runtime.c changed → skip flatten+transpile"
+                ;;
+            tool|tool,*)
+                TOOL_CHANGED=1
+                ;;
+            hexa)
+                HEXA_ONLY_CHANGED=1
+                ;;
+        esac
+    else
+        # Nothing changed at all — but the layered cache may have been evicted.
+        # Fall through to the layered cache check (section 8) which handles this.
+        echo "[rebuild_stage0] per-file manifest: 0 files changed"
+    fi
+fi
+
 # FLATTEN key 는 flatten_imports 스크립트 자체 + 전체 .hexa 의존 + flatten 지시자
 FLATTEN_INPUTS=("$FLATTEN_SCRIPT" "${IMPORTS_SORTED[@]}")
 FLATTEN_KEY=$(hash_of_files "${FLATTEN_INPUTS[@]}")
@@ -229,7 +347,7 @@ case "$UNAME" in
         LINK_LDFLAGS="-Wl,-stack_size,0x4000000"
         ;;
 esac
-RUNTIME_C="$HEXA_DIR/self/runtime.c"
+# RUNTIME_C already defined in section 5b
 LINK_KEY_PARTS=("$TRANSPILE_KEY" \
                 "$(hash_of_files "$RUNTIME_C")" \
                 "$LINK_CFLAGS" "$LINK_LDFLAGS" "$UNAME" "$CLANG_VERSION")
@@ -259,8 +377,10 @@ if [ -z "$FORCE" ] && [ -f "$LINK_CACHE_BIN" ]; then
         cat "$ROOT_HEXA" "$RUNTIME_C" 2>/dev/null | sha256_cmd | cut -d' ' -f1 \
             > "$HEXA_DIR/build/.rebuild_hash" || :
         HIT_FLATTEN=1; HIT_TRANSPILE=1; HIT_LINK=1
+        # Update per-file manifest on cache hit too (keeps manifest in sync)
+        write_manifest "${ALL_BUILD_INPUTS[@]}"
         cat > "$CACHE_META_DIR/last_build.json" <<EOF
-{"flatten_key":"$FLATTEN_KEY","transpile_key":"$TRANSPILE_KEY","link_key":"$LINK_KEY","hit":{"flatten":1,"transpile":1,"link":1},"uname":"$UNAME"}
+{"flatten_key":"$FLATTEN_KEY","transpile_key":"$TRANSPILE_KEY","link_key":"$LINK_KEY","hit":{"flatten":1,"transpile":1,"link":1},"uname":"$UNAME","incremental":{"runtime_only":0,"changed_files":"","changed_count":0}}
 EOF
         echo "[rebuild_stage0] CACHE HIT (all 3 layers) → cp $LINK_CACHE_BIN → $OUT ($CSIZE bytes)"
         echo "[rebuild_stage0] OK (cache)"
@@ -272,44 +392,120 @@ fi
 
 # ── 9. Mid path: 부분 hit — flatten/transpile 단계별 재사용 ────────────
 #    이 경로는 stage 단위로 재실행한 뒤 build_stage0.sh 의 SKIP_TRANSPILE 경로를 활용한다.
+#
+#    Per-file incremental optimization (2026-04-16):
+#      When RUNTIME_ONLY_CHANGED=1, the .hexa sources haven't changed, so
+#      flatten and transpile outputs are identical to the last build. We
+#      look up the PREVIOUS transpile cache entry (keyed by the unchanged
+#      flatten_key) and reuse it, skipping both flatten_imports and hexa_v2.
+#      Only clang re-links with the new runtime.c.
 
 FLAT_OUT="${HEXA_STAGE0_FLAT:-/tmp/hexa_full_flat.hexa}"
 FLAT_CACHE="$CACHE_FLATTEN_DIR/$FLATTEN_KEY.hexa"
 SRC_C="${HEXA_STAGE0_C:-/tmp/hexa_full_regen.c}"
 TRANSPILE_CACHE="$CACHE_TRANSPILE_DIR/$TRANSPILE_KEY.c"
 
-# 9a. FLATTEN — cache or re-run
-if [ -z "$FORCE" ] && [ -f "$FLAT_CACHE" ]; then
-    cp -f "$FLAT_CACHE" "$FLAT_OUT"
-    HIT_FLATTEN=1
-    echo "[rebuild_stage0] CACHE HIT flatten → $FLAT_CACHE"
-else
-    # flatten_imports 는 build_stage0.sh 안에서 실행되기 때문에 여기서 미리 돌려서 캐시에 저장.
-    STAGE0_PREV="$HEXA_DIR/build/hexa_stage0"
-    FLATTEN_RUNNER=""
-    if [ -x "$STAGE0_PREV" ]; then FLATTEN_RUNNER="$STAGE0_PREV"
-    elif [ -x "$HEXA_DIR/hexa" ]; then FLATTEN_RUNNER="$HEXA_DIR/hexa"; fi
-    if [ -z "$FLATTEN_RUNNER" ]; then
-        echo "[rebuild_stage0] no flatten runner (build/hexa_stage0 or ./hexa) — falling back" >&2
-        # build_stage0.sh 가 자체 flatten 을 수행하므로 진행
-    else
-        echo "[rebuild_stage0] MISS flatten — running flatten_imports"
-        HEXA_VAL_ARENA=0 "$FLATTEN_RUNNER" "$FLATTEN_SCRIPT" "$ROOT_HEXA" "$FLAT_OUT"
-        if [ -f "$FLAT_OUT" ]; then
-            cp -f "$FLAT_OUT" "$FLAT_CACHE"
+# 9-pre. Runtime-only fast path: reuse previous flatten+transpile artifacts.
+#        The flatten_key and transpile_key are still based on the .hexa content
+#        which hasn't changed. But the transpile_key also incorporates the
+#        hexa_v2 binary hash, which might differ. We look up by flatten_key
+#        in the previous build metadata to find the old transpile cache.
+if [ "$RUNTIME_ONLY_CHANGED" = "1" ] && [ -z "$FORCE" ]; then
+    # Try to find the previous transpile .c from the last build metadata
+    PREV_TRANSPILE_KEY=""
+    if [ -f "$CACHE_META_DIR/last_build.json" ]; then
+        # Extract transpile_key from the JSON (simple sed, no jq dependency)
+        PREV_TRANSPILE_KEY=$(sed -n 's/.*"transpile_key":"\([^"]*\)".*/\1/p' "$CACHE_META_DIR/last_build.json" 2>/dev/null || echo "")
+    fi
+    # Also try current transpile_key (most likely case: hexa_v2 binary unchanged)
+    REUSE_TRANSPILE_C=""
+    if [ -n "$PREV_TRANSPILE_KEY" ] && [ -f "$CACHE_TRANSPILE_DIR/$PREV_TRANSPILE_KEY.c" ]; then
+        REUSE_TRANSPILE_C="$CACHE_TRANSPILE_DIR/$PREV_TRANSPILE_KEY.c"
+    elif [ -f "$TRANSPILE_CACHE" ]; then
+        REUSE_TRANSPILE_C="$TRANSPILE_CACHE"
+    fi
+    if [ -n "$REUSE_TRANSPILE_C" ]; then
+        echo "[rebuild_stage0] INCREMENTAL: runtime.c-only change → reusing transpile from $REUSE_TRANSPILE_C"
+        cp -f "$REUSE_TRANSPILE_C" "$SRC_C"
+        HIT_FLATTEN=1
+        HIT_TRANSPILE=1
+        # Ensure runtime.c sibling is fresh (this is the file that changed)
+        SRC_C_DIR="$(cd "$(dirname "$SRC_C")" && pwd)"
+        if [ "$SRC_C_DIR" != "$HEXA_DIR/self" ]; then
+            cp -f "$RUNTIME_C" "$SRC_C_DIR/runtime.c"
         fi
     fi
 fi
 
-# 9b. TRANSPILE — cache or re-run via hexa_v2
-if [ -z "$FORCE" ] && [ -f "$TRANSPILE_CACHE" ]; then
-    cp -f "$TRANSPILE_CACHE" "$SRC_C"
-    HIT_TRANSPILE=1
-    echo "[rebuild_stage0] CACHE HIT transpile → $TRANSPILE_CACHE"
-    # runtime.c sibling 복사 (build_stage0.sh 가 해주지만, SKIP_TRANSPILE 경로에서도 필요)
-    SRC_C_DIR="$(cd "$(dirname "$SRC_C")" && pwd)"
-    if [ "$SRC_C_DIR" != "$HEXA_DIR/self" ]; then
-        cp -f "$RUNTIME_C" "$SRC_C_DIR/runtime.c"
+# 9a. FLATTEN — cache or re-run (skipped if runtime-only path already set HIT_FLATTEN)
+if [ "$HIT_FLATTEN" = "0" ]; then
+    if [ -z "$FORCE" ] && [ -f "$FLAT_CACHE" ]; then
+        cp -f "$FLAT_CACHE" "$FLAT_OUT"
+        HIT_FLATTEN=1
+        echo "[rebuild_stage0] CACHE HIT flatten → $FLAT_CACHE"
+    else
+        # flatten_imports 는 build_stage0.sh 안에서 실행되기 때문에 여기서 미리 돌려서 캐시에 저장.
+        STAGE0_PREV="$HEXA_DIR/build/hexa_stage0"
+        FLATTEN_RUNNER=""
+        if [ -x "$STAGE0_PREV" ]; then FLATTEN_RUNNER="$STAGE0_PREV"
+        elif [ -x "$HEXA_DIR/hexa" ]; then FLATTEN_RUNNER="$HEXA_DIR/hexa"; fi
+        if [ -z "$FLATTEN_RUNNER" ]; then
+            echo "[rebuild_stage0] no flatten runner (build/hexa_stage0 or ./hexa) — falling back" >&2
+            # build_stage0.sh 가 자체 flatten 을 수행하므로 진행
+        else
+            # ── Flatten lock (atomic mkdir) — prevents concurrent flatten_imports ──
+            FLATTEN_LOCK="/tmp/hexa_flatten.lock"
+            FLATTEN_LOCK_TTL=120
+            FLATTEN_GOT_LOCK=0
+            if mkdir "$FLATTEN_LOCK" 2>/dev/null; then
+                echo $$ > "$FLATTEN_LOCK/pid"
+                FLATTEN_GOT_LOCK=1
+            else
+                FL_PID=$(cat "$FLATTEN_LOCK/pid" 2>/dev/null || echo "")
+                FL_TIME=$(stat -f %m "$FLATTEN_LOCK" 2>/dev/null || stat -c %Y "$FLATTEN_LOCK" 2>/dev/null || echo 0)
+                FL_AGE=$(( $(date +%s) - ${FL_TIME:-$(date +%s)} ))
+                if [ -n "$FL_PID" ] && kill -0 "$FL_PID" 2>/dev/null && [ "$FL_AGE" -lt "$FLATTEN_LOCK_TTL" ]; then
+                    echo "[rebuild_stage0] flatten: waiting for concurrent flatten (pid=$FL_PID)" >&2
+                    FL_WAIT=0
+                    while [ -d "$FLATTEN_LOCK" ] && [ "$FL_WAIT" -lt 60 ]; do
+                        sleep 1; FL_WAIT=$((FL_WAIT + 1))
+                    done
+                    if [ -d "$FLATTEN_LOCK" ]; then
+                        echo "[rebuild_stage0] flatten: lock wait timeout — reclaiming" >&2
+                        rm -rf "$FLATTEN_LOCK"
+                        mkdir "$FLATTEN_LOCK" && echo $$ > "$FLATTEN_LOCK/pid" && FLATTEN_GOT_LOCK=1
+                    fi
+                else
+                    rm -rf "$FLATTEN_LOCK"
+                    mkdir "$FLATTEN_LOCK" && echo $$ > "$FLATTEN_LOCK/pid" && FLATTEN_GOT_LOCK=1
+                fi
+            fi
+            if [ "$FLATTEN_GOT_LOCK" = "1" ]; then
+                echo "[rebuild_stage0] MISS flatten — running flatten_imports"
+                HEXA_VAL_ARENA=0 "$FLATTEN_RUNNER" "$FLATTEN_SCRIPT" "$ROOT_HEXA" "$FLAT_OUT" \
+                    || { rm -rf "$FLATTEN_LOCK"; false; }
+                rm -rf "$FLATTEN_LOCK"
+                if [ -f "$FLAT_OUT" ]; then
+                    cp -f "$FLAT_OUT" "$FLAT_CACHE"
+                fi
+            else
+                echo "[rebuild_stage0] flatten: reusing output from concurrent run" >&2
+            fi
+        fi
+    fi
+fi
+
+# 9b. TRANSPILE — cache or re-run via hexa_v2 (skipped if runtime-only path already set HIT_TRANSPILE)
+if [ "$HIT_TRANSPILE" = "0" ]; then
+    if [ -z "$FORCE" ] && [ -f "$TRANSPILE_CACHE" ]; then
+        cp -f "$TRANSPILE_CACHE" "$SRC_C"
+        HIT_TRANSPILE=1
+        echo "[rebuild_stage0] CACHE HIT transpile → $TRANSPILE_CACHE"
+        # runtime.c sibling 복사 (build_stage0.sh 가 해주지만, SKIP_TRANSPILE 경로에서도 필요)
+        SRC_C_DIR="$(cd "$(dirname "$SRC_C")" && pwd)"
+        if [ "$SRC_C_DIR" != "$HEXA_DIR/self" ]; then
+            cp -f "$RUNTIME_C" "$SRC_C_DIR/runtime.c"
+        fi
     fi
 fi
 
@@ -374,9 +570,19 @@ if [ -x "$OUT" ]; then
     cp -f "$OUT" "$LINK_CACHE_BIN" 2>/dev/null || :
 fi
 
+# ── 11b. Per-file manifest update ─────────────────────────────────────
+#    Store per-file sha256 hashes for the next run's incremental diff.
+#    This enables the per-file change detection in section 5b.
+write_manifest "${ALL_BUILD_INPUTS[@]}"
+echo "[rebuild_stage0] manifest updated: ${#ALL_BUILD_INPUTS[@]} files → $MANIFEST_FILE"
+
 # meta / legacy hash file 갱신
+CHANGED_LIST=""
+if [ "${#CHANGED_FILES[@]}" -gt 0 ]; then
+    CHANGED_LIST=$(printf '%s' "${CHANGED_FILES[@]##*/}" | tr ' ' ',')
+fi
 cat > "$CACHE_META_DIR/last_build.json" <<EOF
-{"flatten_key":"$FLATTEN_KEY","transpile_key":"$TRANSPILE_KEY","link_key":"$LINK_KEY","hit":{"flatten":$HIT_FLATTEN,"transpile":$HIT_TRANSPILE,"link":$HIT_LINK},"uname":"$UNAME"}
+{"flatten_key":"$FLATTEN_KEY","transpile_key":"$TRANSPILE_KEY","link_key":"$LINK_KEY","hit":{"flatten":$HIT_FLATTEN,"transpile":$HIT_TRANSPILE,"link":$HIT_LINK},"uname":"$UNAME","incremental":{"runtime_only":$RUNTIME_ONLY_CHANGED,"changed_files":"$CHANGED_LIST","changed_count":${#CHANGED_FILES[@]}}}
 EOF
 mkdir -p "$HEXA_DIR/build"
 cat "$ROOT_HEXA" "$RUNTIME_C" 2>/dev/null | sha256_cmd | cut -d' ' -f1 \
