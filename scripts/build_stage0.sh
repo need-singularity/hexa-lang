@@ -140,7 +140,11 @@ case "$UNAME" in
         ;;
     Darwin|*)
         CFLAGS="-O2 -std=c11 -Wno-trigraphs -I $HEXA_DIR/self"
-        LDFLAGS=""
+        # T-stack: eval_expr_inner stack frame is ~80KB; recursive interpret
+        # path uses ~150KB per call level. Default 8MB stack only allows
+        # ~50 recursion levels. 64MB allows ~400 levels — sufficient for
+        # ML test suites with deep recursion (fib/tco/hnsw/memo tests).
+        LDFLAGS="-Wl,-stack_size,0x4000000"
         ;;
 esac
 
@@ -170,4 +174,21 @@ if [ -z "$NO_SMOKE" ]; then
     echo "[build_stage0] smoke OK"
 fi
 
-echo "[build_stage0] OK -> $OUT ($(wc -c < "$OUT" | tr -d ' ') bytes)"
+# 5) Size guard — broken transpile이 exit 0으로 넘어오는 경우 방어
+MIN_SIZE="${HEXA_STAGE0_MIN_SIZE:-1000000}"
+ACTUAL_SIZE=$(wc -c < "$OUT" | tr -d ' ')
+if [ "$ACTUAL_SIZE" -lt "$MIN_SIZE" ]; then
+    echo "error: stage0 output too small (${ACTUAL_SIZE} bytes < ${MIN_SIZE}) — broken transpile?" >&2
+    # known_good 백업이 있으면 복원
+    KNOWN_GOOD="$HEXA_DIR/build/hexa_stage0.known_good"
+    if [ -x "$KNOWN_GOOD" ]; then
+        cp -f "$KNOWN_GOOD" "$OUT"
+        if [ "$(uname)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+            codesign --force --sign - "$OUT" 2>/dev/null || true
+        fi
+        echo "[build_stage0] rolled back to known_good ($(wc -c < "$OUT" | tr -d ' ') bytes)" >&2
+    fi
+    exit 1
+fi
+
+echo "[build_stage0] OK -> $OUT ($ACTUAL_SIZE bytes)"

@@ -56,7 +56,8 @@ if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     mkdir "$LOCK_DIR"
 fi
 echo $$ > "$LOCK_DIR/pid"
-trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+cleanup() { rm -rf "$LOCK_DIR"; [ -n "${BACKUP:-}" ] && rm -f "$BACKUP" || :; }
+trap cleanup EXIT INT TERM
 
 # ── 2. content-hash guard (ROI-9: replaces mtime guard) ────
 HASH_FILE="$HEXA_DIR/build/.rebuild_hash"
@@ -82,8 +83,46 @@ if [ -z "$WITH_SMOKE" ]; then
     export NO_SMOKE=1
 fi
 
+# ── 3a. pre-build backup ──────────────────────────────────
+# 깨진 바이너리로 덮어쓰기 방지: 빌드 전에 working 바이너리 백업
+BACKUP=""
+MIN_SIZE="${HEXA_STAGE0_MIN_SIZE:-1000000}"  # 1MB — working binary는 ~3.9MB
+if [ -x "$OUT" ]; then
+    OLD_SIZE=$(wc -c < "$OUT" | tr -d ' ')
+    if [ "$OLD_SIZE" -ge "$MIN_SIZE" ]; then
+        BACKUP="/tmp/hexa_stage0_backup_$$"
+        cp -f "$OUT" "$BACKUP"
+        echo "[rebuild_stage0] backup: $BACKUP (${OLD_SIZE} bytes)"
+    fi
+fi
+
 echo "[rebuild_stage0] invoking build_stage0.sh (pid=$$, lock=$LOCK_DIR)"
-bash "$HEXA_DIR/scripts/build_stage0.sh"
+if ! bash "$HEXA_DIR/scripts/build_stage0.sh"; then
+    echo "[rebuild_stage0] build FAILED" >&2
+    if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
+        cp -f "$BACKUP" "$OUT"
+        echo "[rebuild_stage0] rolled back to backup" >&2
+    fi
+    exit 1
+fi
+
+# ── 3b. size guard — 빌드 성공해도 결과물이 비정상 소형이면 rollback
+if [ -x "$OUT" ]; then
+    NEW_SIZE=$(wc -c < "$OUT" | tr -d ' ')
+    if [ "$NEW_SIZE" -lt "$MIN_SIZE" ]; then
+        echo "[rebuild_stage0] ERROR: output too small (${NEW_SIZE} < ${MIN_SIZE} bytes) — broken transpile?" >&2
+        if [ -n "$BACKUP" ] && [ -f "$BACKUP" ]; then
+            cp -f "$BACKUP" "$OUT"
+            if [ "$(uname)" = "Darwin" ] && command -v codesign >/dev/null 2>&1; then
+                codesign --force --sign - "$OUT" 2>/dev/null || true
+            fi
+            echo "[rebuild_stage0] rolled back to backup ($(wc -c < "$OUT" | tr -d ' ') bytes)" >&2
+        fi
+        rm -f "$BACKUP"
+        exit 1
+    fi
+fi
+rm -f "$BACKUP"
 
 # ── 4. store content hash after successful build ──────────
 mkdir -p "$(dirname "$HASH_FILE")"
