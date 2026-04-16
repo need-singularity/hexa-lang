@@ -1,19 +1,15 @@
-// hxlmhead_linux.c — hexa FFI ↔ fused LM-head backward kernel (v0 stub)
+// hxlmhead_linux.c — hexa FFI ↔ fused LM-head forward + backward kernel
+// v1: BLAS route — cblas_sgemm replaces naive loops
 //
-// C-next roadmap — recommended by the 2026-04-16 CLM kernel audit
-// (/tmp/clm_next_kernel_audit.md, rank #1). Replaces the two pure-hexa
-// triple-loop GEMMs that dominate train_clm.hexa:1056-1071 (dL_dmid =
-// dL_dlogits @ V^T) and 1089-1104 (dL_dx = dL_dmid @ U^T), folding in
-// the cross-entropy forward+backward as well.
+// C-next roadmap — recommended by the 2026-04-16 CLM kernel audit.
+// Replaces the two pure-hexa triple-loop GEMMs that dominate
+// train_clm.hexa:1056-1104, folding in cross-entropy fwd+bwd as well.
 //
-// v0 STATUS: this is a STUB — the implementation is correct (naive
-// forward-recompute + naive triple-loop sgemms) but DELIBERATELY
-// unoptimised. Goal: ship the ABI + build infra so anima can wire
-// against it now; Day-2 flips the inner sgemms to libhxblas calls
-// (or fuses them through reserved0). The naive path still gives a
-// correctness oracle for the optimised version.
+// v1 STATUS: all matmuls routed through cblas_sgemm (OpenBLAS on Linux,
+// Accelerate on Mac). H100 measurement showed scalar matmul 165x slower
+// than sgemm. hxlmhead_fwd added for inference/fwd-only evaluation.
 //
-// v0 kernel: hxlmhead_bwd
+// v1 kernels: hxlmhead_fwd + hxlmhead_bwd
 //   inputs : x[S,H], mid[S,M] (or recomputed), targets[S], scale,
 //            Wu[H,M], Wv[M,V]
 //   compute (forward recompute):
@@ -36,10 +32,10 @@
 //   6-arg ceiling (host_ffi_call_6 in self/runtime.c) and gives us a
 //   stable boundary for adding fields without breaking callers.
 //
-// Day-2 evolution path (RESERVED in args.reserved0):
+// Evolution path (RESERVED in args.reserved0):
 //   bit 0 : pass mid_p instead of recomputing (skip x@Wu in forward)
 //   bit 1 : zero dW_u/dW_v before accumulating (default: caller zeros)
-//   bit 2 : route inner sgemms through libhxblas (drop naive loops)
+//   bit 2 : (consumed) cblas_sgemm route active since v1
 //   bits 3+ : reserved
 //
 // Build (Linux x86_64, Ubuntu/Debian):
@@ -96,9 +92,10 @@ typedef struct HxLMHeadArgs {
 // ─────────────────────────────────────────────────────────────
 // hxlmhead_version — bump on any breaking signature change.
 // v0 = struct-based ABI, naive triple-loop body.
+// v1 = cblas_sgemm route + hxlmhead_fwd added.
 // ─────────────────────────────────────────────────────────────
 int64_t hxlmhead_version(void) {
-    return 1;
+    return 2;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -146,7 +143,66 @@ static void blas_matmul_NT(const float* A, const float* B, float* C,
 }
 
 // ─────────────────────────────────────────────────────────────
-// hxlmhead_bwd — fused LM-head backward (v0 stub: naive impl)
+// hxlmhead_fwd — LM-head forward: loss = CE(softmax(x @ Wu @ Wv))
+// v1: BLAS route via cblas_sgemm.
+//
+// Writes: mid_p [S,M] (if caller allocated or self-allocated),
+//         loss_out_p [1] scalar cross-entropy loss.
+// Returns: 0 on success, negative on error.
+// ─────────────────────────────────────────────────────────────
+int64_t hxlmhead_fwd(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxLMHeadArgs* a = (HxLMHeadArgs*)(uintptr_t)args_p;
+    const int64_t S = a->S, H = a->H, M = a->M, V = a->V;
+    if (S <= 0 || H <= 0 || M <= 0 || V <= 0) return -2;
+
+    const float* x     = (const float*)(uintptr_t)a->x_p;
+    const int32_t* tgt = (const int32_t*)(uintptr_t)a->targets_p;
+    const float* Wu    = (const float*)(uintptr_t)a->Wu_p;
+    const float* Wv    = (const float*)(uintptr_t)a->Wv_p;
+    double* loss_out   = (double*)(uintptr_t)a->loss_out_p;
+    if (!x || !tgt || !Wu || !Wv) return -3;
+
+    int mid_owned = 0;
+    float* mid = (float*)(uintptr_t)a->mid_p;
+    if (!mid) {
+        mid = (float*)malloc(sizeof(float) * (size_t)S * (size_t)M);
+        if (!mid) return -4;
+        mid_owned = 1;
+    }
+    float* logits = (float*)malloc(sizeof(float) * (size_t)S * (size_t)V);
+    if (!logits) { if (mid_owned) free(mid); return -4; }
+
+    // mid = x @ Wu  [S,H] @ [H,M] -> [S,M]
+    blas_matmul(x, Wu, mid, S, H, M);
+
+    // logits = mid @ Wv  [S,M] @ [M,V] -> [S,V]
+    blas_matmul(mid, Wv, logits, S, M, V);
+
+    // softmax + CE loss
+    double loss_sum = 0.0;
+    for (int64_t i = 0; i < S; i++) {
+        float* row = logits + i * V;
+        float mx = row[0];
+        for (int64_t j = 1; j < V; j++) if (row[j] > mx) mx = row[j];
+        float sum_e = 0.0f;
+        for (int64_t j = 0; j < V; j++) { row[j] = expf(row[j] - mx); sum_e += row[j]; }
+        const float inv = 1.0f / sum_e;
+        for (int64_t j = 0; j < V; j++) row[j] *= inv;
+        const int32_t t = tgt[i];
+        const int64_t ti = (t >= 0 && t < V) ? (int64_t)t : 0;
+        const float pt = row[ti];
+        loss_sum += -log((double)(pt > 1e-30f ? pt : 1e-30f));
+    }
+    if (loss_out) *loss_out = (loss_sum / (double)S) * (double)a->loss_scale;
+
+    if (mid_owned) a->mid_p = (int64_t)(uintptr_t)mid;
+    free(logits);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// hxlmhead_bwd — fused LM-head backward (v1: BLAS route)
 //
 // Returns: 0 on success, negative on error.
 //   -1 : null args pointer

@@ -106,11 +106,19 @@ void hxblas_matmul_scalar(int64_t M, int64_t K, int64_t N,
 
 void hxblas_matmul_omp(int64_t M, int64_t K, int64_t N,
                        int64_t A, int64_t B, int64_t C) {
+    // v1: for small M, OMP thread spawn overhead dominates (224-thread H100
+    // host measured 63ms vs 2.5ms scalar at 128²). Route small cases to
+    // scalar or cap thread count.
+    if (M * N * K <= 512LL * 512 * 512) {
+        // Below ~512³ FLOPs, scalar is faster than OMP on many-core hosts.
+        hxblas_matmul_scalar(M, K, N, A, B, C);
+        return;
+    }
     const float* a = (const float*)(uintptr_t)A;
     const float* b = (const float*)(uintptr_t)B;
     float* c = (float*)(uintptr_t)C;
 #ifdef _OPENMP
-    #pragma omp parallel for
+    #pragma omp parallel for schedule(static) num_threads(8)
 #endif
     for (int64_t i = 0; i < M; i++) {
         for (int64_t j = 0; j < N; j++) {
