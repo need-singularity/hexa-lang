@@ -1367,8 +1367,39 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     if (HX_IS_VALSTRUCT(m)) {
         return hexa_valstruct_get_by_key(m, key);
     }
+    // NaN-boxing compat bridge: transpiled code accesses .int_val / .float_val / .tag
+    // on NaN-boxed scalars that were formerly ValStructs. Return the native value.
+    if (HX_IS_INT(m)) {
+        if (key[0]=='i' && strcmp(key,"int_val")==0) return m;
+        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_INT);
+        if (key[0]=='f' && strcmp(key,"float_val")==0) return hexa_float((double)HX_INT(m));
+        if (key[0]=='b' && strcmp(key,"bool_val")==0) return hexa_bool(HX_INT(m)!=0);
+        if (key[0]=='s' && strcmp(key,"str_val")==0) return hexa_str("");
+        return hexa_void();
+    }
+    if (HX_IS_FLOAT(m)) {
+        if (key[0]=='f' && strcmp(key,"float_val")==0) return m;
+        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_FLOAT);
+        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int((int64_t)HX_FLOAT(m));
+        if (key[0]=='b' && strcmp(key,"bool_val")==0) return hexa_bool(HX_FLOAT(m)!=0.0);
+        if (key[0]=='s' && strcmp(key,"str_val")==0) return hexa_str("");
+        return hexa_void();
+    }
+    if (HX_IS_BOOL(m)) {
+        if (key[0]=='b' && strcmp(key,"bool_val")==0) return m;
+        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_BOOL);
+        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int(HX_INT(m)&1);
+        return hexa_void();
+    }
+    if (HX_IS_STR(m)) {
+        if (key[0]=='s' && strcmp(key,"str_val")==0) return m;
+        if (key[0]=='t' && strcmp(key,"tag")==0) return hexa_int(TAG_STR);
+        if (key[0]=='i' && strcmp(key,"int_val")==0) return hexa_int(0);
+        return hexa_void();
+    }
     if (!HX_MAP_TBL(m)) {
-        fprintf(stderr, "map key '%s' not found\n", key);
+        // Silently return void for non-map/non-scalar types — avoids noisy stderr
+        // during NaN-boxing transition where transpiled code probes fields on any type.
         return hexa_void();
     }
     HexaMapTable* t = HX_MAP_TBL(m);
