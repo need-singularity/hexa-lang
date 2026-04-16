@@ -376,3 +376,80 @@ void hxvocoder_decode_nv(int64_t out_p, int64_t latent_flat_p,
 
     free(ctrl);
 }
+
+// ─────────────────────────────────────────────────────────────
+// hxvocoder_write_wav — write PCM16 mono WAV directly from C.
+//
+// Replaces the pure-hexa build_wav_bytes + bytes_to_b64 + base64 -d
+// pipeline which is O(n²) in HexaVal array pushes (48K samples = 5.35s).
+// This function: fopen + fwrite header + fwrite samples → ~1ms.
+//
+// Args (5, within FFI 6-arg ceiling):
+//   path_p      : const char* (HexaVal string pointer)
+//   samples_p   : float* [n_samples]
+//   n_samples   : int64_t
+//   sample_rate : int64_t
+//   result_p    : int64_t* — writes 1 on success, 0 on failure
+//
+// WAV format: RIFF/WAVE, PCM16, mono, little-endian.
+// ─────────────────────────────────────────────────────────────
+#include <stdio.h>
+
+static void _wav_write_u32_le(FILE* f, uint32_t v) {
+    uint8_t b[4] = { v & 0xFF, (v>>8) & 0xFF, (v>>16) & 0xFF, (v>>24) & 0xFF };
+    fwrite(b, 1, 4, f);
+}
+static void _wav_write_u16_le(FILE* f, uint16_t v) {
+    uint8_t b[2] = { v & 0xFF, (v>>8) & 0xFF };
+    fwrite(b, 1, 2, f);
+}
+
+void hxvocoder_write_wav(int64_t path_p, int64_t samples_p,
+                         int64_t n_samples, int64_t sample_rate,
+                         int64_t result_p) {
+    int64_t* res = (result_p != 0) ? (int64_t*)(uintptr_t)result_p : NULL;
+    if (res) *res = 0;
+
+    if (path_p == 0 || samples_p == 0 || n_samples <= 0) return;
+
+    const char* path    = (const char*)(uintptr_t)path_p;
+    const float* samps  = (const float*)(uintptr_t)samples_p;
+    const int sr        = (int)sample_rate;
+    const int data_len  = (int)n_samples * 2;       // 16-bit mono
+    const int chunk_sz  = 36 + data_len;
+
+    FILE* f = fopen(path, "wb");
+    if (!f) return;
+
+    // RIFF header
+    fwrite("RIFF", 1, 4, f);
+    _wav_write_u32_le(f, (uint32_t)chunk_sz);
+    fwrite("WAVE", 1, 4, f);
+
+    // fmt subchunk
+    fwrite("fmt ", 1, 4, f);
+    _wav_write_u32_le(f, 16);           // subchunk1 size
+    _wav_write_u16_le(f, 1);            // PCM format
+    _wav_write_u16_le(f, 1);            // mono
+    _wav_write_u32_le(f, (uint32_t)sr);
+    _wav_write_u32_le(f, (uint32_t)(sr * 2)); // byte rate
+    _wav_write_u16_le(f, 2);            // block align
+    _wav_write_u16_le(f, 16);           // bits per sample
+
+    // data subchunk
+    fwrite("data", 1, 4, f);
+    _wav_write_u32_le(f, (uint32_t)data_len);
+
+    // samples: float→int16 clamp
+    for (int64_t i = 0; i < n_samples; i++) {
+        float s = samps[i];
+        if (s >  1.0f) s =  1.0f;
+        if (s < -1.0f) s = -1.0f;
+        int16_t s16 = (int16_t)(s * 32767.0f);
+        uint8_t b[2] = { (uint8_t)(s16 & 0xFF), (uint8_t)((s16 >> 8) & 0xFF) };
+        fwrite(b, 1, 2, f);
+    }
+
+    fclose(f);
+    if (res) *res = 1;
+}
