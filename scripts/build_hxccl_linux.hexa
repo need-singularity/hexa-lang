@@ -1,0 +1,194 @@
+// build_hxccl_linux.hexa — build libhxccl.so on Linux (NCCL+CUDA backend),
+// OR build a stub libhxccl_stub.dylib on Mac where CUDA/NCCL is absent.
+//
+// C9 roadmap — "ZeRO-3 / FSDP real multi-GPU" Day-1 shim. Companion to
+// scripts/build_hxblas_linux.hexa, scripts/build_hxlayer_linux.hexa, and
+// scripts/build_hxflash_linux.hexa. Same flags, same layout, same
+// --mac-* contract where practical.
+//
+// Prerequisites (Linux — runpod/pytorch:2.4.0 image or equivalent H100 pod):
+//   apt install gcc
+//   ls /usr/local/cuda/lib64/libcudart.so
+//   ls /usr/local/cuda/lib64/libnccl.so
+//
+// Prerequisites (Mac stub mode):
+//   (none — stub uses only libSystem)
+//
+// Usage:
+//   hexa scripts/build_hxccl_linux.hexa                 // Linux Day-1: stub .so
+//   hexa scripts/build_hxccl_linux.hexa --with-nccl     // Linux Day-2: real NCCL
+//   hexa scripts/build_hxccl_linux.hexa --debug         // Linux: -O0 -g
+//   hexa scripts/build_hxccl_linux.hexa --mac-stub      // Mac: stub .dylib
+//   CC=clang hexa scripts/build_hxccl_linux.hexa        // override compiler
+//   CUDA_HOME=/opt/cuda hexa scripts/build_hxccl_linux.hexa --with-nccl
+//   NCCL_HOME=/opt/nccl hexa scripts/build_hxccl_linux.hexa --with-nccl
+//   DEPLOY=/usr/local/lib hexa scripts/build_hxccl_linux.hexa
+//
+// Outputs (Linux mode):
+//   self/native/build/libhxccl.so
+//
+// Outputs (--mac-stub mode):
+//   self/native/build/libhxccl_stub.dylib
+
+fn run(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        exit(1)
+    }
+    result[0]
+}
+
+fn check_symbol(lib_path, sym) {
+    let result = exec_with_status("nm -gU " + lib_path + " | grep -q '" + sym + "'")
+    if result[1] == 0 {
+        println("  " + sym + " SYMBOL=PRESENT")
+        true
+    } else {
+        eprintln("  " + sym + " SYMBOL=MISSING")
+        false
+    }
+}
+
+fn main() {
+    let args = argv()
+    let hexa_dir = exec("cd \"$(dirname '" + args[1] + "')/../\" && pwd").trim()
+    let src_dir = hexa_dir + "/self/native"
+    let out_dir = hexa_dir + "/self/native/build"
+    let cc = if env("CC") != "" { env("CC") } else { "gcc" }
+    let mode = if len(args) > 2 { args[2] } else { "build" }
+
+    exec("mkdir -p " + out_dir)
+
+    // ────────────────────────────────────────────────────────────────
+    // --mac-stub : build a stub libhxccl_stub.dylib on Mac. The same C
+    // source compiles without HXCCL_ENABLE_NCCL defined, taking the stub
+    // branch (init returns a non-null handle; collectives return -1).
+    // Lets Mac CI load the library via dlopen, exercise the call graph,
+    // and catch ABI drift before the Linux deploy.
+    // ────────────────────────────────────────────────────────────────
+    if mode == "--mac-stub" {
+        let uname = exec("uname -s").trim()
+        if uname != "Darwin" {
+            eprintln("--mac-stub requires macOS, got " + uname)
+            exit(2)
+        }
+        let cc_m = if env("CC") != "" { env("CC") } else { "clang" }
+        println("[mac-stub] hxccl stub only on Mac, skipping real NCCL build")
+        println("[mac-stub] building libhxccl_stub.dylib (collectives return -1)")
+        run(cc_m + " -O3 -fPIC -dynamiclib " + src_dir + "/hxccl_linux.c -o " + out_dir + "/libhxccl_stub.dylib")
+
+        // Sanity: every Day-1 symbol must be exported.
+        let syms = ["_hxccl_version", "_hxccl_init", "_hxccl_finalize", "_hxccl_allreduce_float", "_hxccl_broadcast_float"]
+        mut missing = 0
+        for sym in syms {
+            if !check_symbol(out_dir + "/libhxccl_stub.dylib", sym) {
+                missing = 1
+            }
+        }
+        if missing != 0 {
+            exit(4)
+        }
+
+        // @link("hxccl") resolves via lib<name>.dylib (see runtime.c
+        // hexa_ffi_dlopen). Symlink so HXCCL_FFI_LIVE tests don't have to
+        // set the symlink themselves.
+        run("ln -sf libhxccl_stub.dylib " + out_dir + "/libhxccl.dylib")
+
+        println("── mac-stub output ──")
+        println(exec("ls -la " + out_dir + "/libhxccl_stub.dylib " + out_dir + "/libhxccl.dylib").trim())
+        println("done — stub ready. Use DYLD_LIBRARY_PATH=" + out_dir + " for smoke tests.")
+        exit(0)
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Normal build mode — Linux.
+    //
+    // Day-1: stub-only — no -lnccl -lcudart required.
+    // Day-2: pass --with-nccl to flip on -DHXCCL_NCCL=1 and link against
+    //   libnccl + libcudart.
+    // ────────────────────────────────────────────────────────────────
+    let uname = exec("uname -s").trim()
+    if uname != "Linux" {
+        eprintln("build_hxccl_linux: expected Linux for real build, got " + uname)
+        eprintln("  - On Linux:  hexa scripts/build_hxccl_linux.hexa")
+        eprintln("  - On Mac:    hexa scripts/build_hxccl_linux.hexa --mac-stub")
+        exit(2)
+    }
+
+    // Check all args for --with-nccl
+    mut with_nccl = false
+    for arg in args {
+        if arg == "--with-nccl" {
+            with_nccl = true
+        }
+    }
+
+    mut cflags_base = "-O3 -fPIC -shared -march=native"
+    if mode == "--debug" {
+        cflags_base = "-O0 -g -fPIC -shared"
+    }
+
+    if with_nccl {
+        let cuda_home = if env("CUDA_HOME") != "" { env("CUDA_HOME") } else { "/usr/local/cuda" }
+        let nccl_home = if env("NCCL_HOME") != "" { env("NCCL_HOME") } else { cuda_home }
+
+        if !file_exists(cuda_home + "/include/cuda_runtime.h") {
+            eprintln("ERROR: cuda_runtime.h not found at " + cuda_home + "/include")
+            eprintln("       set CUDA_HOME=/path/to/cuda")
+            exit(3)
+        }
+
+        // Search for nccl.h in multiple locations
+        mut nccl_inc = ""
+        let nccl_paths = [nccl_home + "/include/nccl.h", "/usr/include/nccl.h", "/usr/local/include/nccl.h"]
+        for p in nccl_paths {
+            if file_exists(p) {
+                // dirname of p
+                let parts = p.split("/")
+                mut dir_parts = []
+                let limit = len(parts) - 1
+                mut i = 0
+                for part in parts {
+                    if i < limit {
+                        dir_parts.push(part)
+                    }
+                    i = i + 1
+                }
+                nccl_inc = dir_parts.join("/")
+            }
+        }
+        if nccl_inc == "" {
+            eprintln("ERROR: nccl.h not found (searched " + nccl_home + "/include, /usr/include, /usr/local/include)")
+            eprintln("       set NCCL_HOME=/path/to/nccl")
+            exit(3)
+        }
+
+        println("[1/1] building libhxccl.so (Day-2: NCCL + CUDA runtime)")
+        println("  CUDA_HOME=" + cuda_home + "  NCCL_INC=" + nccl_inc)
+        run(cc + " " + cflags_base + " -DHXCCL_NCCL=1 -I" + cuda_home + "/include -I" + nccl_inc + " " + src_dir + "/hxccl_linux.c -o " + out_dir + "/libhxccl.so -L" + cuda_home + "/lib64 -L" + nccl_home + "/lib -lnccl -lcudart")
+    } else {
+        println("[1/1] building libhxccl.so (Day-1: stub, no NCCL/CUDA link)")
+        run(cc + " " + cflags_base + " " + src_dir + "/hxccl_linux.c -o " + out_dir + "/libhxccl.so")
+    }
+
+    println("built:")
+    println(exec("ls -la " + out_dir + "/libhxccl.so").trim())
+
+    // ── Optional: deploy to system lib path ────────────────────────
+    let deploy = env("DEPLOY")
+    if deploy != "" {
+        println("deploying to " + deploy)
+        run("cp " + out_dir + "/libhxccl.so " + deploy + "/")
+        exec_with_status("command -v ldconfig >/dev/null && ldconfig")
+    }
+
+    if with_nccl {
+        let cuda_home = if env("CUDA_HOME") != "" { env("CUDA_HOME") } else { "/usr/local/cuda" }
+        println("done — set LD_LIBRARY_PATH=" + out_dir + ":" + cuda_home + "/lib64 (or DEPLOY=/usr/local/lib)")
+    } else {
+        println("done — set LD_LIBRARY_PATH=" + out_dir + " (Day-1 stub, no CUDA/NCCL needed)")
+    }
+}
+
+main()

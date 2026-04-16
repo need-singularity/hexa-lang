@@ -1,0 +1,274 @@
+// build_stage0.hexa — stage0 인터프리터(`build/hexa_stage0`) 재빌드 스크립트
+//
+// 목적: SSOT self/hexa_full.hexa 를 hexa_v2 로 트랜스파일하고 clang 으로
+//       컴파일하여 build/hexa_stage0 생성. `./hexa run` 이 위임하는 stage0.
+//
+// 사용:
+//   ./hexa scripts/build_stage0.hexa                       # 전체 파이프라인 (transpile+compile)
+//   CLANG=gcc ./hexa scripts/build_stage0.hexa
+//   SKIP_TRANSPILE=1 ./hexa scripts/build_stage0.hexa      # 기존 .c 재사용
+//
+// OS 분기 (build_stage1 과 동일 패턴):
+//   Linux  — glibc POSIX/GNU 확장 노출 필요: -D_GNU_SOURCE -std=gnu11
+//            수학/dl 심볼: -lm -ldl
+//   macOS  — libSystem 자동 처리. codesign ad-hoc 서명 (AppleSystemPolicy).
+//
+// @pipeline (self/hexa_full.hexa 헤더와 동일):
+//   1. hexa_v2  self/hexa_full.hexa  /tmp/hexa_full_regen.c
+//   2. clang    $CFLAGS  /tmp/hexa_full_regen.c  -o build/hexa_stage0  $LDFLAGS
+//   3. codesign --force --sign -  build/hexa_stage0   (Darwin only)
+//   4. verify: echo 'println("ok")' > /tmp/_hx.hexa && build/hexa_stage0 /tmp/_hx.hexa
+
+fn run_cmd(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("command failed (exit " + str(result[1]) + "): " + cmd)
+        exit(1)
+    }
+    result[0]
+}
+
+fn run_cmd_allow_fail(cmd) {
+    let result = exec_with_status(cmd)
+    result
+}
+
+let script_path = argv()[1]
+let hexa_dir = exec("cd \"$(dirname '" + script_path + "')/../\" && pwd").trim()
+let src_hexa = hexa_dir + "/self/hexa_full.hexa"
+let mut src_c = if env("HEXA_STAGE0_C") != "" { env("HEXA_STAGE0_C") } else { "/tmp/hexa_full_regen.c" }
+let out = hexa_dir + "/build/hexa_stage0"
+let mut hexa_v2 = hexa_dir + "/self/native/hexa_v2"
+let clang = if env("CLANG") != "" { env("CLANG") } else { "clang" }
+
+if !file_exists(src_hexa) {
+    eprintln("error: SSOT missing: " + src_hexa)
+    exit(1)
+}
+
+// T33-rebuild: prefer hexa_cc_dedup4.c when available.
+let hexa_v2_dedup_src = hexa_dir + "/self/native/hexa_cc_dedup4.c"
+let mut hexa_v2_dedup_bin = if env("HEXA_V2_DEDUP_BIN") != "" { env("HEXA_V2_DEDUP_BIN") } else { hexa_dir + "/build/hexa_v2_dedup4" }
+
+if file_exists(hexa_v2_dedup_src) {
+    mut need_rebuild = false
+    let dedup_exec_check = exec_with_status("test -x " + hexa_v2_dedup_bin)
+    if dedup_exec_check[1] != 0 {
+        need_rebuild = true
+    } else {
+        let newer_check = exec_with_status("test " + hexa_v2_dedup_src + " -nt " + hexa_v2_dedup_bin)
+        if newer_check[1] == 0 {
+            need_rebuild = true
+        }
+    }
+    if need_rebuild {
+        let uname_tmp = exec("uname 2>/dev/null | tr -d ' \\n\\t'").trim()
+        let hexa_v2_cflags = if uname_tmp == "Linux" {
+            "-O2 -D_GNU_SOURCE -std=gnu11 -I . -I " + hexa_dir + "/self -lm"
+        } else {
+            "-O2 -I . -I " + hexa_dir + "/self"
+        }
+        println("[build_stage0] (re)building " + hexa_v2_dedup_bin + " from " + hexa_v2_dedup_src)
+        exec("mkdir -p " + hexa_dir + "/build")
+        let build_result = exec_with_status("timeout --kill-after=5 120 " + clang + " " + hexa_v2_cflags + " " + hexa_v2_dedup_src + " -o " + hexa_v2_dedup_bin + " 2>/tmp/.hexa_v2_dedup_build.log")
+        if build_result[1] == 0 {
+            println("[build_stage0] dedup4 hexa_v2 built OK")
+        } else {
+            println("[build_stage0] WARN: dedup4 hexa_v2 build failed — see /tmp/.hexa_v2_dedup_build.log; falling back to mainline hexa_v2")
+            hexa_v2_dedup_bin = ""
+        }
+    }
+    if hexa_v2_dedup_bin != "" {
+        let check_exec = exec_with_status("test -x " + hexa_v2_dedup_bin)
+        if check_exec[1] == 0 {
+            hexa_v2 = hexa_v2_dedup_bin
+            println("[build_stage0] using dedup4 hexa_v2 = " + hexa_v2)
+        }
+    }
+}
+
+let v2_exec_check = exec_with_status("test -x " + hexa_v2)
+if v2_exec_check[1] != 0 {
+    eprintln("error: hexa_v2 missing or not executable: " + hexa_v2)
+    eprintln("       Linux 부트스트랩은 먼저 hexa_v2 빌드 필요:")
+    eprintln("       clang -O2 -D_GNU_SOURCE -std=gnu11 -I . -I self self/native/hexa_cc.c -o " + hexa_v2 + " -lm")
+    exit(1)
+}
+
+// 1) Transpile — T1 Phase B: flatten `use "runtime_core"` 가 있으면 선행 병합
+if env("SKIP_TRANSPILE") == "" {
+    mut src_for_transpile = src_hexa
+    let grep_result = exec_with_status("grep -q '^use \"runtime_core\"' " + src_hexa + " 2>/dev/null")
+    if grep_result[1] == 0 {
+        let flat_hexa = if env("HEXA_STAGE0_FLAT") != "" { env("HEXA_STAGE0_FLAT") } else { "/tmp/hexa_full_flat.hexa" }
+        let stage0_prev = hexa_dir + "/build/hexa_stage0"
+        mut flatten_runner = ""
+        let s0_check = exec_with_status("test -x " + stage0_prev)
+        if s0_check[1] == 0 {
+            flatten_runner = stage0_prev
+        } else {
+            let hexa_check = exec_with_status("test -x " + hexa_dir + "/hexa")
+            if hexa_check[1] == 0 {
+                flatten_runner = hexa_dir + "/hexa"
+            }
+        }
+        if flatten_runner == "" {
+            eprintln("error: flatten runner missing (need build/hexa_stage0 or ./hexa)")
+            exit(1)
+        }
+
+        // ── Flatten lock (atomic mkdir) — prevents concurrent flatten_imports ──
+        let flatten_lock = "/tmp/hexa_flatten.lock"
+        let flatten_lock_ttl = 120
+        mut flatten_got_lock = false
+        let lock_result = exec_with_status("mkdir " + flatten_lock + " 2>/dev/null")
+        if lock_result[1] == 0 {
+            exec("echo $$ > " + flatten_lock + "/pid")
+            flatten_got_lock = true
+        } else {
+            // Check if lock is stale
+            let fl_pid = exec("cat " + flatten_lock + "/pid 2>/dev/null || echo ''").trim()
+            let fl_time = exec("stat -f %m " + flatten_lock + " 2>/dev/null || stat -c %Y " + flatten_lock + " 2>/dev/null || echo 0").trim()
+            let now = to_int(exec("date +%s").trim())
+            let fl_time_int = to_int(fl_time)
+            let fl_age = now - fl_time_int
+
+            let alive_check = exec_with_status("kill -0 " + fl_pid + " 2>/dev/null")
+            if fl_pid != "" && alive_check[1] == 0 && fl_age < flatten_lock_ttl {
+                eprintln("[build_stage0] flatten: waiting for concurrent flatten (pid=" + fl_pid + ", age=" + str(fl_age) + "s)")
+                // Wait up to 60s for the other process to finish
+                mut fl_wait = 0
+                while fl_wait < 60 {
+                    let dir_check = exec_with_status("test -d " + flatten_lock)
+                    if dir_check[1] != 0 {
+                        // lock released
+                        fl_wait = 999
+                    } else {
+                        exec("sleep 1")
+                        fl_wait = fl_wait + 1
+                    }
+                }
+                let dir_still = exec_with_status("test -d " + flatten_lock)
+                if dir_still[1] == 0 {
+                    eprintln("[build_stage0] flatten: lock wait timeout — reclaiming")
+                    exec("rm -rf " + flatten_lock)
+                    let reclaim = exec_with_status("mkdir " + flatten_lock)
+                    if reclaim[1] == 0 {
+                        exec("echo $$ > " + flatten_lock + "/pid")
+                        flatten_got_lock = true
+                    }
+                }
+                // If we didn't get the lock but flat output exists, reuse it
+                if !flatten_got_lock && file_exists(flat_hexa) {
+                    println("[build_stage0] flatten: reusing output from concurrent run")
+                    src_for_transpile = flat_hexa
+                }
+            } else {
+                // Stale lock — reclaim
+                exec("rm -rf " + flatten_lock)
+                let reclaim2 = exec_with_status("mkdir " + flatten_lock)
+                if reclaim2[1] == 0 {
+                    exec("echo $$ > " + flatten_lock + "/pid")
+                    flatten_got_lock = true
+                }
+            }
+        }
+        if flatten_got_lock {
+            println("[build_stage0] flatten: " + flatten_runner + " scripts/flatten_imports.hexa " + src_hexa + " " + flat_hexa)
+            // T33: arena instrumentation causes mutable-variable corruption.
+            // Force HEXA_VAL_ARENA=0 to disable arena during flatten execution.
+            let flatten_result = exec_with_status("HEXA_VAL_ARENA=0 timeout --kill-after=5 120 " + flatten_runner + " " + hexa_dir + "/scripts/flatten_imports.hexa " + src_hexa + " " + flat_hexa)
+            if flatten_result[1] != 0 {
+                exec("rm -rf " + flatten_lock)
+                eprintln("error: flatten_imports failed")
+                exit(1)
+            }
+            exec("rm -rf " + flatten_lock)
+            if !file_exists(flat_hexa) {
+                eprintln("error: flatten output missing: " + flat_hexa)
+                exit(1)
+            }
+        }
+        src_for_transpile = flat_hexa
+    }
+    println("[build_stage0] transpile: " + hexa_v2 + " " + src_for_transpile + " " + src_c)
+    run_cmd("timeout --kill-after=5 120 " + hexa_v2 + " " + src_for_transpile + " " + src_c)
+}
+
+if !file_exists(src_c) {
+    eprintln("error: transpiled C missing: " + src_c)
+    exit(1)
+}
+
+// 1.5) Refresh runtime.c sibling next to $SRC_C.
+let src_c_dir = exec("cd \"$(dirname '" + src_c + "')\" && pwd").trim()
+if src_c_dir != hexa_dir + "/self" {
+    exec("cp -f " + hexa_dir + "/self/runtime.c " + src_c_dir + "/runtime.c")
+}
+
+// 2) Compile
+let uname = exec("uname 2>/dev/null | tr -d ' \\n\\t'").trim()
+mut cflags = ""
+mut ldflags = ""
+if uname == "Linux" {
+    cflags = "-O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs -I " + hexa_dir + "/self"
+    ldflags = "-lm -ldl"
+} else {
+    cflags = "-O2 -std=c11 -Wno-trigraphs -I " + hexa_dir + "/self"
+    // T-stack: eval_expr_inner stack frame is ~80KB; recursive interpret
+    // path uses ~150KB per call level. 64MB allows ~400 levels.
+    ldflags = "-Wl,-stack_size,0x4000000"
+}
+
+exec("mkdir -p " + hexa_dir + "/build")
+println("[build_stage0] uname=" + uname)
+println("[build_stage0] " + clang + " " + cflags + " " + src_c + " -o " + out + " " + ldflags)
+
+run_cmd("timeout --kill-after=5 120 " + clang + " " + cflags + " " + src_c + " -o " + out + " " + ldflags)
+
+// 3) Darwin codesign (AppleSystemPolicy SIGKILL 방지)
+if uname == "Darwin" {
+    let cs_check = exec_with_status("command -v codesign >/dev/null 2>&1")
+    if cs_check[1] == 0 {
+        exec_with_status("codesign --force --sign - " + out + " 2>/dev/null")
+    }
+}
+
+// 4) Smoke test (skip 가능: NO_SMOKE=1)
+if env("NO_SMOKE") == "" {
+    let smoke = exec("mktemp -t hexa_stage0_smoke.XXXXXX.hexa").trim()
+    write_file(smoke, "println(\"ok\")\n")
+    let smoke_result = exec_with_status("HEXA_VAL_ARENA=0 " + out + " " + smoke + " 2>&1")
+    exec("rm -f " + smoke)
+    let smoke_output = smoke_result[0].trim()
+    if smoke_output != "ok" {
+        eprintln("error: stage0 smoke test FAIL — expected 'ok', got:")
+        eprintln(smoke_output)
+        exit(1)
+    }
+    println("[build_stage0] smoke OK")
+}
+
+// 5) Size guard — broken transpile이 exit 0으로 넘어오는 경우 방어
+let min_size = if env("HEXA_STAGE0_MIN_SIZE") != "" { to_int(env("HEXA_STAGE0_MIN_SIZE")) } else { 1000000 }
+let actual_size = to_int(exec("wc -c < " + out + " | tr -d ' '").trim())
+if actual_size < min_size {
+    eprintln("error: stage0 output too small (" + str(actual_size) + " bytes < " + str(min_size) + ") — broken transpile?")
+    // known_good 백업이 있으면 복원
+    let known_good = hexa_dir + "/build/hexa_stage0.known_good"
+    let kg_check = exec_with_status("test -x " + known_good)
+    if kg_check[1] == 0 {
+        exec("cp -f " + known_good + " " + out)
+        if uname == "Darwin" {
+            let cs2 = exec_with_status("command -v codesign >/dev/null 2>&1")
+            if cs2[1] == 0 {
+                exec_with_status("codesign --force --sign - " + out + " 2>/dev/null")
+            }
+        }
+        let rolled_size = exec("wc -c < " + out + " | tr -d ' '").trim()
+        eprintln("[build_stage0] rolled back to known_good (" + rolled_size + " bytes)")
+    }
+    exit(1)
+}
+
+println("[build_stage0] OK -> " + out + " (" + str(actual_size) + " bytes)")

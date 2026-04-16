@@ -1,0 +1,179 @@
+// hexa-lang/bin/build.hexa — hx install hook
+//
+// hx install hexa 실행 시 자동 호출.
+//
+// 전략 (우선순위):
+//   1. 플랫폼별 pre-built 바이너리 있으면 복사 (빠름, 안전)
+//      build/hexa-{os}-{arch} 또는 build/hexa_stage0 (플랫폼 일치 시)
+//   2. 없으면 소스 빌드 (scripts/build_stage0.sh 위임)
+//      — 현재 upstream self-host rebuild 가 깨진 상태면 실패
+//
+// Env (hx 가 주입):
+//   HX_PKG_DIR / HX_BIN_DIR / HX_PKG_NAME
+// Override:
+//   HEXA_FORCE_REBUILD=1   소스 빌드 강제
+
+let hx_pkg_dir = env("HX_PKG_DIR")
+let hx_bin_dir = env("HX_BIN_DIR")
+
+if hx_pkg_dir == "" {
+    eprintln("hx 내부 변수 HX_PKG_DIR 필요")
+    exit(1)
+}
+if hx_bin_dir == "" {
+    eprintln("hx 내부 변수 HX_BIN_DIR 필요")
+    exit(1)
+}
+
+let pkg = exec("cd '" + hx_pkg_dir + "' && pwd -P").trim()
+let bin_dir = hx_bin_dir
+
+let uname_s = exec("uname -s 2>/dev/null").trim()
+let uname_m = exec("uname -m 2>/dev/null").trim()
+
+mut os_name = ""
+if uname_s == "Darwin" {
+    os_name = "darwin"
+} else if uname_s == "Linux" {
+    os_name = "linux"
+} else {
+    eprintln("hexa build: unsupported OS: " + uname_s)
+    exit(1)
+}
+
+mut arch = ""
+if uname_m == "arm64" {
+    arch = "arm64"
+} else if uname_m == "aarch64" {
+    arch = "arm64"
+} else if uname_m == "x86_64" {
+    arch = "x86_64"
+} else if uname_m == "amd64" {
+    arch = "x86_64"
+} else {
+    eprintln("hexa build: unsupported arch: " + uname_m)
+    exit(1)
+}
+
+let target = os_name + "-" + arch
+
+// ── 호환 여부 판별 헬퍼 ────────────────────────────────────────
+// `file` 가 있으면 Mach-O/ELF 구분, 없으면 OS 기반 추정 (Linux = ELF).
+fn bin_matches_platform(bin_path) {
+    let check_exec = exec_with_status("test -x '" + bin_path + "'")
+    if check_exec[1] != 0 {
+        return false
+    }
+    let has_file = exec_with_status("command -v file >/dev/null 2>&1")
+    if has_file[1] == 0 {
+        if os_name == "darwin" {
+            let r = exec_with_status("file '" + bin_path + "' 2>/dev/null | grep -q 'Mach-O.*" + arch + "'")
+            return r[1] == 0
+        } else if os_name == "linux" {
+            let r = exec_with_status("file '" + bin_path + "' 2>/dev/null | grep -q 'ELF.*" + arch + "'")
+            return r[1] == 0
+        } else {
+            return false
+        }
+    } else {
+        // file 없으면 exec 테스트: 바이너리가 OS 에 실행 가능한지만 확인
+        let t1 = exec_with_status("'" + bin_path + "' /dev/null >/dev/null 2>&1")
+        let t2 = exec_with_status("'" + bin_path + "' --version >/dev/null 2>&1")
+        return t1[1] == 0 || t2[1] == 0
+    }
+}
+
+fn install_binary(src) {
+    let src_real = exec("readlink -f '" + src + "' 2>/dev/null || python3 -c \"import os,sys; print(os.path.realpath(sys.argv[1]))\" '" + src + "' 2>/dev/null || echo '" + src + "'").trim()
+    exec("mkdir -p '" + bin_dir + "/build'")
+
+    let outs = [bin_dir + "/hexa", bin_dir + "/build/hexa_stage0"]
+    for out in outs {
+        mut dst_real = ""
+        if file_exists(out) {
+            dst_real = exec("readlink -f '" + out + "' 2>/dev/null || python3 -c \"import os,sys; print(os.path.realpath(sys.argv[1]))\" '" + out + "' 2>/dev/null || echo '" + out + "'").trim()
+        }
+        if src_real == dst_real {
+            // 동일 파일 — skip (symlink 유지)
+            continue
+        }
+        exec("rm -f '" + out + "'")
+        exec("cp '" + src + "' '" + out + "'")
+        exec("chmod 0755 '" + out + "'")
+    }
+    // Darwin codesign (AppleSystemPolicy SIGKILL 방지)
+    if os_name == "darwin" {
+        let has_codesign = exec_with_status("command -v codesign >/dev/null 2>&1")
+        if has_codesign[1] == 0 {
+            exec_with_status("codesign --force --sign - '" + bin_dir + "/hexa' 2>/dev/null")
+            exec_with_status("codesign --force --sign - '" + bin_dir + "/build/hexa_stage0' 2>/dev/null")
+        }
+    }
+}
+
+fn smoke_test(hx) {
+    let t = exec("mktemp -t hexa_smoke.XXXXXX").trim()
+    write_file(t, "println(\"ok\")\n")
+    let result = exec_with_status("'" + hx + "' '" + t + "' 2>&1")
+    exec("rm -f '" + t + "'")
+    return result[0].trim() == "ok"
+}
+
+// ── 1) 우선: pre-built 바이너리 탐색 ───────────────────────────
+let force_rebuild = env("HEXA_FORCE_REBUILD")
+if force_rebuild != "1" {
+    // 후보 1: build/hexa-{target}  (미래 release naming)
+    // 후보 2: build/hexa_stage0    (현재 repo 의 기본)
+    // 후보 3: ./hexa               (root 의 pre-built)
+    let candidates = [pkg + "/build/hexa-" + target, pkg + "/build/hexa_stage0", pkg + "/hexa"]
+    for cand in candidates {
+        let is_exec = exec_with_status("test -x '" + cand + "'")
+        if is_exec[1] == 0 {
+            if bin_matches_platform(cand) {
+                println("[hexa build] pre-built found: " + cand + " (target=" + target + ")")
+                install_binary(cand)
+                if smoke_test(bin_dir + "/hexa") {
+                    let sz = exec("wc -c < '" + bin_dir + "/hexa' | tr -d ' '").trim()
+                    println("[hexa build] OK → " + bin_dir + "/hexa  (" + sz + " bytes, prebuilt)")
+                    exit(0)
+                } else {
+                    eprintln("[hexa build] pre-built smoke test failed — attempting source build...")
+                }
+            }
+        }
+    }
+}
+
+// ── 2) 소스 빌드 (scripts/build_stage0.sh 재사용) ──────────────
+println("[hexa build] no matching pre-built — trying source build (scripts/build_stage0.sh)")
+let build_script = pkg + "/scripts/build_stage0.sh"
+
+let script_exists = exec_with_status("test -f '" + build_script + "'")
+if script_exists[1] == 0 {
+    let is_exec = exec_with_status("test -x '" + build_script + "'")
+    if is_exec[1] != 0 {
+        exec_with_status("chmod +x '" + build_script + "'")
+    }
+}
+
+let can_exec = exec_with_status("test -x '" + build_script + "'")
+if can_exec[1] == 0 {
+    let build_result = exec_with_status("bash '" + build_script + "'")
+    if build_result[1] == 0 {
+        // build_stage0.sh 가 $PKG/build/hexa_stage0 를 생성
+        let stage0_exists = exec_with_status("test -x '" + pkg + "/build/hexa_stage0'")
+        if stage0_exists[1] == 0 {
+            install_binary(pkg + "/build/hexa_stage0")
+            if smoke_test(bin_dir + "/hexa") {
+                println("[hexa build] OK → " + bin_dir + "/hexa  (source-built)")
+                exit(0)
+            }
+        }
+    }
+    eprintln("[hexa build] source build failed")
+    exit(1)
+}
+
+eprintln("[hexa build] no pre-built binary for " + target + " and no build script available")
+eprintln("  tried: " + pkg + "/build/hexa-" + target + ", " + pkg + "/build/hexa_stage0, " + pkg + "/hexa")
+exit(1)
