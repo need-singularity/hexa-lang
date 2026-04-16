@@ -1,0 +1,428 @@
+// self/codegen_native.hexa — Zero-tool ARM64 Mach-O binary emitter
+// Proves HEXA can produce native executables without clang, as, or ld.
+//
+// Emits a fully runnable MH_EXECUTE Mach-O binary for Apple Silicon.
+// No external tools in the compilation pipeline — pure Hexa to native.
+//
+// Layout (single-page __TEXT + __LINKEDIT for codesign):
+//   [0x0000]  mach_header_64         32 bytes
+//   [0x0020]  LC_SEGMENT_64 __PAGEZERO  72 bytes
+//   [0x0068]  LC_SEGMENT_64 __TEXT      152 bytes (incl. section __text)
+//   [0x0100]  LC_SEGMENT_64 __LINKEDIT  72 bytes
+//   [0x0148]  LC_MAIN                   24 bytes
+//   [0x0160]  LC_BUILD_VERSION          24 bytes
+//   [0x0178]  LC_CODE_SIGNATURE         16 bytes
+//   [0x0188]  __text code section     (code_size bytes, 4-byte aligned)
+//   [padding] zeros to 0x4000
+//   [0x4000]  __LINKEDIT start        (empty — codesign fills it)
+//
+// ARM64 macOS syscalls (svc #0x80):
+//   SYS_exit  = 1  (x0=code, x16=1)
+//   SYS_write = 4  (x0=fd, x1=buf, x2=len, x16=4)
+
+// ═══════════════════════════════════════════════════════════
+//  1. Binary output — xxd workaround for null-byte safety
+// ═══════════════════════════════════════════════════════════
+
+fn hex_digit(n) {
+    if n < 10 { return to_string(n) }
+    if n == 10 { return "a" }
+    if n == 11 { return "b" }
+    if n == 12 { return "c" }
+    if n == 13 { return "d" }
+    if n == 14 { return "e" }
+    return "f"
+}
+
+fn write_binary(path, bytes) {
+    // fputs/write_file truncates at null bytes.
+    // Workaround: hex-encode + xxd -r -p to emit exact bytes.
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts = parts.push(hex_digit(bytes[i] / 16) + hex_digit(bytes[i] % 16))
+        i = i + 1
+    }
+    let hex_str = parts.join("")
+    exec("printf '%s' '" + hex_str + "' | xxd -r -p > " + path)
+    exec("chmod +x " + path)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  2. Byte array helpers — little-endian encoding
+// ═══════════════════════════════════════════════════════════
+
+fn push_u32_le(buf, val) {
+    let b0 = val % 256
+    let b1 = (val / 256) % 256
+    let b2 = (val / 65536) % 256
+    let b3 = (val / 16777216) % 256
+    return buf.push(b0).push(b1).push(b2).push(b3)
+}
+
+fn push_u64_le(buf, val) {
+    let mut b = push_u32_le(buf, val % 4294967296)
+    return push_u32_le(b, val / 4294967296)
+}
+
+fn push_zeros(buf, count) {
+    let mut b = buf
+    let mut i = 0
+    while i < count {
+        b = b.push(0)
+        i = i + 1
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+//  3. ARM64 instruction encoders
+// ═══════════════════════════════════════════════════════════
+
+fn emit32(code, instr) {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+// MOVZ Xd, #imm16  ->  0xD2800000 | (imm16 << 5) | Rd
+fn enc_movz_x(rd, imm16) {
+    return 3535798272 + (imm16 * 32) + rd
+}
+
+// MOVZ Wd, #imm16  ->  0x52800000 | (imm16 << 5) | Rd
+fn enc_movz_w(rd, imm16) {
+    return 1384120320 + (imm16 * 32) + rd
+}
+
+// SUB Xd, Xn, #imm12  ->  0xD1000000 | (imm12 << 10) | (Xn << 5) | Xd
+fn enc_sub_imm(rd, rn, imm12) {
+    return 3510779904 + (imm12 * 1024) + (rn * 32) + rd
+}
+
+// ADD Xd, Xn, #imm12  ->  0x91000000 | (imm12 << 10) | (Xn << 5) | Xd
+fn enc_add_imm(rd, rn, imm12) {
+    return 2432696320 + (imm12 * 1024) + (rn * 32) + rd
+}
+
+// STRB Wt, [Xn, #off]  ->  0x39000000 | (off << 10) | (Xn << 5) | Rt
+fn enc_strb(rt, rn, off) {
+    return 956301312 + (off * 1024) + (rn * 32) + rt
+}
+
+// STP X29, X30, [SP, #-16]!  ->  0xA9BF7BFD
+fn enc_stp_pre() { return 2847670269 }
+
+// LDP X29, X30, [SP], #16  ->  0xA8C17BFD
+fn enc_ldp_post() { return 2832890877 }
+
+// MOV X29, SP  ->  0x910003FD
+fn enc_mov_fp_sp() { return 2432696317 }
+
+// RET  ->  0xD65F03C0
+fn enc_ret() { return 3596809152 }
+
+// SVC #0x80  ->  0xD4001001
+fn enc_svc_80() { return 3556769793 }
+
+// MOV Xd, Xn  (ORR Xd, XZR, Xn)  ->  0xAA0003E0 | (Xn << 16) | Xd
+fn enc_mov_reg(rd, rn) {
+    return 2852127712 + (rn * 65536) + rd
+}
+
+// ═══════════════════════════════════════════════════════════
+//  4. Code generation — "print 42 and exit"
+// ═══════════════════════════════════════════════════════════
+
+fn gen_print42_code() {
+    // ARM64 machine code:
+    //   1. Store "42\n" on stack via strb
+    //   2. SYS_write(stdout, sp, 3)
+    //   3. SYS_exit(0)
+
+    let mut code = []
+
+    // -- Prologue --
+    // stp x29, x30, [sp, #-16]!
+    code = emit32(code, enc_stp_pre())
+    // mov x29, sp
+    code = emit32(code, enc_mov_fp_sp())
+
+    // -- Allocate 16 bytes on stack --
+    // sub sp, sp, #16
+    code = emit32(code, enc_sub_imm(31, 31, 16))
+
+    // -- Store "42\n" on stack --
+    // movz w8, #52  ('4')
+    code = emit32(code, enc_movz_w(8, 52))
+    // strb w8, [sp, #0]
+    code = emit32(code, enc_strb(8, 31, 0))
+
+    // movz w8, #50  ('2')
+    code = emit32(code, enc_movz_w(8, 50))
+    // strb w8, [sp, #1]
+    code = emit32(code, enc_strb(8, 31, 1))
+
+    // movz w8, #10  ('\n')
+    code = emit32(code, enc_movz_w(8, 10))
+    // strb w8, [sp, #2]
+    code = emit32(code, enc_strb(8, 31, 2))
+
+    // -- SYS_write(1, sp, 3) --
+    // x0 = fd = 1 (stdout)
+    code = emit32(code, enc_movz_x(0, 1))
+    // x1 = buf = sp
+    code = emit32(code, enc_mov_reg(1, 31))
+    // x2 = len = 3
+    code = emit32(code, enc_movz_x(2, 3))
+    // x16 = SYS_write = 4
+    code = emit32(code, enc_movz_x(16, 4))
+    // svc #0x80
+    code = emit32(code, enc_svc_80())
+
+    // -- SYS_exit(0) --
+    // x0 = 0
+    code = emit32(code, enc_movz_x(0, 0))
+    // x16 = SYS_exit = 1
+    code = emit32(code, enc_movz_x(16, 1))
+    // svc #0x80
+    code = emit32(code, enc_svc_80())
+
+    return code
+}
+
+// ═══════════════════════════════════════════════════════════
+//  5. Mach-O MH_EXECUTE builder
+// ═══════════════════════════════════════════════════════════
+
+fn build_macho_exe(machine_code) {
+    let mut bin = []
+    let code_size = len(machine_code)
+
+    // -- Constants (decimal) --
+    let MH_MAGIC_64   = 4277009103   // 0xFEEDFACF
+    let CPU_ARM64     = 16777228     // 0x0100000C
+    let CPU_SUB_ALL   = 0
+    let MH_EXECUTE    = 2
+    let MH_PIE        = 2097152      // 0x200000
+    let LC_SEGMENT    = 25           // 0x19
+    let LC_MAIN_CMD   = 2147483688   // 0x80000028
+    let LC_BUILD_VER  = 50           // 0x32
+    let LC_CODE_SIG   = 29           // 0x1D
+
+    // Apple Silicon page = 16384 = 0x4000
+    let PAGE = 16384
+    // Virtual base
+    let VM_BASE = 4294967296         // 0x100000000
+
+    // -- Command sizes --
+    let pagezero_cmd  = 72
+    let text_cmd      = 152          // 72 + 80 (1 section)
+    let linkedit_cmd  = 72
+    let main_cmd      = 24
+    let build_cmd     = 24
+    let codesig_cmd   = 16
+
+    let ncmds = 6
+    let sizeofcmds = pagezero_cmd + text_cmd + linkedit_cmd + main_cmd + build_cmd + codesig_cmd
+    // sizeofcmds = 72 + 152 + 72 + 24 + 24 + 16 = 360
+
+    // Code starts right after header + commands, 4-byte aligned
+    let header_size = 32
+    let cmds_end = header_size + sizeofcmds  // 32 + 360 = 392
+    let code_off = ((cmds_end + 3) / 4) * 4  // 392 (already aligned)
+
+    // __TEXT = one page: [0, PAGE). Code fits inside this page.
+    let text_vmsize = PAGE
+    let text_filesize = PAGE
+
+    // __LINKEDIT at page boundary (codesign fills this)
+    let linkedit_off = PAGE
+    let linkedit_vmaddr = VM_BASE + PAGE
+    // Section flags: S_ATTR_PURE_INSTRUCTIONS | S_ATTR_SOME_INSTRUCTIONS
+    let sect_flags = 2147484672      // 0x80000400
+
+    // ══════════════════════════════════
+    //  mach_header_64 (32 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, MH_MAGIC_64)
+    bin = push_u32_le(bin, CPU_ARM64)
+    bin = push_u32_le(bin, CPU_SUB_ALL)
+    bin = push_u32_le(bin, MH_EXECUTE)
+    bin = push_u32_le(bin, ncmds)
+    bin = push_u32_le(bin, sizeofcmds)
+    bin = push_u32_le(bin, MH_PIE)
+    bin = push_u32_le(bin, 0)
+
+    // ══════════════════════════════════
+    //  LC_SEGMENT_64: __PAGEZERO (72 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_SEGMENT)
+    bin = push_u32_le(bin, pagezero_cmd)
+    // segname "__PAGEZERO" (16 bytes)
+    bin = bin.push(95).push(95).push(80).push(65).push(71).push(69)
+    bin = bin.push(90).push(69).push(82).push(79)
+    bin = push_zeros(bin, 6)
+    bin = push_u64_le(bin, 0)            // vmaddr
+    bin = push_u64_le(bin, VM_BASE)      // vmsize
+    bin = push_u64_le(bin, 0)            // fileoff
+    bin = push_u64_le(bin, 0)            // filesize
+    bin = push_u32_le(bin, 0)            // maxprot
+    bin = push_u32_le(bin, 0)            // initprot
+    bin = push_u32_le(bin, 0)            // nsects
+    bin = push_u32_le(bin, 0)            // flags
+
+    // ══════════════════════════════════
+    //  LC_SEGMENT_64: __TEXT (152 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_SEGMENT)
+    bin = push_u32_le(bin, text_cmd)
+    // segname "__TEXT" (16 bytes)
+    bin = bin.push(95).push(95).push(84).push(69).push(88).push(84)
+    bin = push_zeros(bin, 10)
+    bin = push_u64_le(bin, VM_BASE)      // vmaddr
+    bin = push_u64_le(bin, text_vmsize)  // vmsize = PAGE
+    bin = push_u64_le(bin, 0)            // fileoff
+    bin = push_u64_le(bin, text_filesize) // filesize = PAGE
+    bin = push_u32_le(bin, 5)            // maxprot  = r-x
+    bin = push_u32_le(bin, 5)            // initprot = r-x
+    bin = push_u32_le(bin, 1)            // nsects
+    bin = push_u32_le(bin, 0)            // flags
+
+    // -- section __text (80 bytes) --
+    // sectname "__text" (16 bytes)
+    bin = bin.push(95).push(95).push(116).push(101).push(120).push(116)
+    bin = push_zeros(bin, 10)
+    // segname "__TEXT" (16 bytes)
+    bin = bin.push(95).push(95).push(84).push(69).push(88).push(84)
+    bin = push_zeros(bin, 10)
+    bin = push_u64_le(bin, VM_BASE + code_off) // addr
+    bin = push_u64_le(bin, code_size)    // size
+    bin = push_u32_le(bin, code_off)     // offset
+    bin = push_u32_le(bin, 2)            // align = 2^2
+    bin = push_u32_le(bin, 0)            // reloff
+    bin = push_u32_le(bin, 0)            // nreloc
+    bin = push_u32_le(bin, sect_flags)   // flags
+    bin = push_u32_le(bin, 0)            // reserved1
+    bin = push_u32_le(bin, 0)            // reserved2
+    bin = push_u32_le(bin, 0)            // reserved3 (pad)
+
+    // ══════════════════════════════════
+    //  LC_SEGMENT_64: __LINKEDIT (72 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_SEGMENT)
+    bin = push_u32_le(bin, linkedit_cmd)
+    // segname "__LINKEDIT" (16 bytes)
+    // _ _ L I N K E D I T \0 ...
+    bin = bin.push(95).push(95).push(76).push(73).push(78).push(75)
+    bin = bin.push(69).push(68).push(73).push(84)
+    bin = push_zeros(bin, 6)
+    bin = push_u64_le(bin, linkedit_vmaddr) // vmaddr
+    bin = push_u64_le(bin, PAGE)         // vmsize = 1 page
+    bin = push_u64_le(bin, linkedit_off) // fileoff = PAGE
+    bin = push_u64_le(bin, 0)            // filesize = 0 (codesign fills)
+    bin = push_u32_le(bin, 1)            // maxprot  = r--
+    bin = push_u32_le(bin, 1)            // initprot = r--
+    bin = push_u32_le(bin, 0)            // nsects
+    bin = push_u32_le(bin, 0)            // flags
+
+    // ══════════════════════════════════
+    //  LC_MAIN (24 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_MAIN_CMD)
+    bin = push_u32_le(bin, main_cmd)
+    bin = push_u64_le(bin, code_off)     // entryoff
+    bin = push_u64_le(bin, 0)            // stacksize
+
+    // ══════════════════════════════════
+    //  LC_BUILD_VERSION (24 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_BUILD_VER)
+    bin = push_u32_le(bin, build_cmd)
+    bin = push_u32_le(bin, 1)            // platform = MACOS
+    bin = push_u32_le(bin, 917504)       // minos = 14.0
+    bin = push_u32_le(bin, 917504)       // sdk = 14.0
+    bin = push_u32_le(bin, 0)            // ntools
+
+    // ══════════════════════════════════
+    //  LC_CODE_SIGNATURE (16 bytes)
+    // ══════════════════════════════════
+    bin = push_u32_le(bin, LC_CODE_SIG)
+    bin = push_u32_le(bin, codesig_cmd)
+    bin = push_u32_le(bin, linkedit_off) // dataoff = start of LINKEDIT
+    bin = push_u32_le(bin, 0)            // datasize = 0 (codesign fills)
+
+    // ══════════════════════════════════
+    //  Code section (at code_off)
+    // ══════════════════════════════════
+    // Pad from current position to code_off
+    while len(bin) < code_off {
+        bin = bin.push(0)
+    }
+
+    // Emit machine code
+    let mut k = 0
+    while k < code_size {
+        bin = bin.push(machine_code[k])
+        k = k + 1
+    }
+
+    // Pad to end of __TEXT page
+    while len(bin) < PAGE {
+        bin = bin.push(0)
+    }
+
+    return bin
+}
+
+// ═══════════════════════════════════════════════════════════
+//  6. Main — emit, codesign, test
+// ═══════════════════════════════════════════════════════════
+
+println("=== HEXA zero-tool ARM64 Mach-O binary emitter ===")
+println("")
+
+// Step 1: Generate ARM64 machine code
+println("[1/5] Generating ARM64 machine code for 'print 42 + exit'...")
+let code = gen_print42_code()
+println("  code size: " + to_string(len(code)) + " bytes (" + to_string(len(code) / 4) + " instructions)")
+
+// Step 2: Wrap in Mach-O MH_EXECUTE
+println("[2/5] Building Mach-O MH_EXECUTE binary...")
+let binary = build_macho_exe(code)
+println("  binary size: " + to_string(len(binary)) + " bytes")
+
+// Step 3: Write to disk
+let output_path = "/tmp/hexa_native_42"
+println("[3/5] Writing " + output_path + "...")
+write_binary(output_path, binary)
+println("  written + chmod +x")
+
+// Step 4: Ad-hoc codesign (required on Apple Silicon)
+println("[4/5] Codesigning (ad-hoc)...")
+let sign_result = exec("codesign -s - " + output_path + " 2>&1")
+if len(sign_result) > 0 {
+    println("  codesign: " + sign_result)
+} else {
+    println("  codesign: OK")
+}
+
+// Step 5: Execute and verify
+println("[5/5] Running " + output_path + "...")
+let output = exec(output_path + " 2>&1")
+println("  output: '" + output + "'")
+
+// Verify — exec() may strip trailing newline
+let mut pass = false
+if output == "42" { pass = true }
+if output == "42\n" { pass = true }
+
+println("")
+if pass {
+    println("PASS -- zero-tool native binary emitted and verified")
+    println("  No clang. No as. No ld. Pure HEXA -> ARM64 Mach-O.")
+} else {
+    println("FAIL -- expected '42', got '" + output + "'")
+}
