@@ -463,33 +463,61 @@ fn op_cached_id(op) {
 // fn_attrs: maps function name -> comma-separated attr string
 pub let mut fn_attrs = []      // [[name, attrs_str], ...]
 // ── Optimization #5: pre-parsed attribute flags ─────────
-// Avoids O(m*n) substring matching on every call. Each entry:
-// [name, is_memo (bool), is_pure (bool)]
-// Populated by fn_attrs_set; queried by fn_attr_flag_memo.
-pub let mut fn_attr_flags = []  // [[name, is_memo, is_pure], ...]
+// ROI-15: 64-bucket hash cache for O(1) avg attribute lookup.
+// Each bucket is [[name, bitmask], ...] where bitmask bits:
+//   bit 0 (1): memo/memoize/cache
+//   bit 1 (2): lazy
+//   bit 2 (4): specialize
+//   bit 3 (8): pure
+// Populated by fn_attrs_set; queried by fn_attr_bitmask.
+pub let mut fn_attr_cache = []  // 64 buckets; each [[name, bitmask], ...]
+pub let mut fn_attr_flags = []  // legacy flat array (kept for compat)
 // ── Optimization #6: hash-bucketed memo cache ───────────
 // 64 buckets, each a list of [key, result_val] pairs.
 // Same pattern as env_cache. Replaces linear memo_cache scan.
 pub let mut memo_cache = []    // 64 buckets; each bucket is [[key, val], ...]
 
+fn fn_attr_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    fn_attr_cache = buckets
+}
+
 fn fn_attrs_set(name, attrs) {
     fn_attrs = fn_attrs.push([name, attrs])
-    // ── Opt #5: parse attribute flags once at define time ──
-    let mut is_memo = false
-    let mut is_pure = false
+    // ── ROI-11+15: parse ALL attribute flags once at define time ──
+    // Compute bitmask: bit0=memo, bit1=lazy, bit2=specialize, bit3=pure
+    let mut bitmask = 0
     if attrs != "" {
         if attrs == "memoize" || attrs == "memo" || attrs == "cache" {
-            is_memo = true
+            bitmask = bitmask + 1
         } else {
-            if contains(attrs, "memoize") { is_memo = true }
-            if contains(attrs, "memo") { is_memo = true }
-            if contains(attrs, "cache") { is_memo = true }
+            if contains(attrs, "memoize") { bitmask = bitmask + 1 }
+            if bitmask == 0 && contains(attrs, "memo") { bitmask = bitmask + 1 }
+            if bitmask == 0 && contains(attrs, "cache") { bitmask = bitmask + 1 }
+        }
+        if attrs == "lazy" || contains(attrs, "lazy") {
+            bitmask = bitmask + 2
+        }
+        if attrs == "specialize" || contains(attrs, "specialize") {
+            bitmask = bitmask + 4
         }
         if attrs == "pure" || contains(attrs, "pure") {
-            is_pure = true
+            bitmask = bitmask + 8
         }
     }
+    // Legacy flat array (kept for backward compat)
+    let is_memo = (bitmask % 2) == 1
+    let is_pure = (bitmask / 8) % 2 == 1
     fn_attr_flags = fn_attr_flags.push([name, is_memo, is_pure])
+    // ROI-15: hash-bucketed cache insert
+    if len(fn_attr_cache) != 64 { fn_attr_cache_init() }
+    let b = env_hash(name)
+    fn_attr_cache[b] = fn_attr_cache[b].push([name, bitmask])
 }
 
 fn fn_attrs_get(name) {
@@ -501,18 +529,27 @@ fn fn_attrs_get(name) {
     return ""
 }
 
-// ── Opt #5: O(1) flag check replaces substring matching ──
-fn fn_attr_flag_memo(name) {
-    let mut i = len(fn_attr_flags) - 1
-    while i >= 0 {
-        if fn_attr_flags[i][0] == name { return fn_attr_flags[i][1] }
-        i = i - 1
+// ── ROI-15: O(1) avg bitmask lookup via 64-bucket hash ──
+fn fn_attr_bitmask(name) {
+    if len(fn_attr_cache) == 64 {
+        let b = env_hash(name)
+        let bucket = fn_attr_cache[b]
+        let mut j = len(bucket) - 1
+        while j >= 0 {
+            if bucket[j][0] == name { return bucket[j][1] }
+            j = j - 1
+        }
     }
-    return false
+    return 0
+}
+
+// ── Opt #5 legacy: O(1) flag check replaces substring matching ──
+fn fn_attr_flag_memo(name) {
+    return (fn_attr_bitmask(name) % 2) == 1
 }
 
 fn has_memo_attr(name) {
-    return fn_attr_flag_memo(name)
+    return (fn_attr_bitmask(name) % 2) == 1
 }
 
 fn memo_key_for_args(name, args) {
@@ -574,24 +611,38 @@ fn memo_store(key, result) {
 }
 
 // ── @specialize inline cache (V8-style IC) ─────────────
-// Per call-site type feedback: [[fn_name, [type_tag, hit_count], ...], ...]
-// When a @specialize fn is called, we record the tag of arg[0].
-// If a single type dominates (>= 80%), we fast-path with type assertion.
-pub let mut specialize_ic = []
+// ROI-12: 64-bucket hash replaces flat-array full rebuild.
+// Each bucket is [[fn_name, [[type_tag, hit_count], ...]], ...].
+// Mutate only the target bucket entry — no full-array copy.
+pub let mut specialize_ic = []      // legacy (unused, kept for reset compat)
+pub let mut specialize_ic_cache = []  // 64 buckets
+
+fn specialize_ic_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    specialize_ic_cache = buckets
+}
 
 fn specialize_ic_record(fn_name, arg_tag) {
-    // Find existing entry
+    if len(specialize_ic_cache) != 64 { specialize_ic_cache_init() }
+    let b = env_hash(fn_name)
+    let bucket = specialize_ic_cache[b]
+    // Find existing entry in bucket
     let mut fi = 0
-    let mut found = false
-    while fi < len(specialize_ic) {
-        if specialize_ic[fi][0] == fn_name {
-            found = true
-            let mut entries = specialize_ic[fi][1]
-            // Find tag entry
+    let blen = len(bucket)
+    while fi < blen {
+        if bucket[fi][0] == fn_name {
+            let mut entries = bucket[fi][1]
+            // Find tag entry and update count
             let mut ti = 0
             let mut tag_found = false
             while ti < len(entries) {
                 if entries[ti][0] == arg_tag {
+                    // In-place count bump: rebuild only this tag's entries array
                     let mut new_entries = []
                     let mut ui = 0
                     while ui < len(entries) {
@@ -610,31 +661,34 @@ fn specialize_ic_record(fn_name, arg_tag) {
             if !tag_found {
                 entries = entries.push([arg_tag, 1])
             }
-            // Update in-place
-            let mut new_ic = []
+            // Update only this bucket entry (not full IC array)
+            let mut new_bucket = []
             let mut ri = 0
-            while ri < len(specialize_ic) {
+            while ri < blen {
                 if ri == fi {
-                    new_ic = new_ic.push([fn_name, entries])
+                    new_bucket = new_bucket.push([fn_name, entries])
                 } else {
-                    new_ic = new_ic.push(specialize_ic[ri])
+                    new_bucket = new_bucket.push(bucket[ri])
                 }
                 ri = ri + 1
             }
-            specialize_ic = new_ic
+            specialize_ic_cache[b] = new_bucket
+            return 0
         }
         fi = fi + 1
     }
-    if !found {
-        specialize_ic = specialize_ic.push([fn_name, [[arg_tag, 1]]])
-    }
+    // New fn_name: append to bucket
+    specialize_ic_cache[b] = bucket.push([fn_name, [[arg_tag, 1]]])
 }
 
 fn specialize_ic_dominant_type(fn_name) {
+    if len(specialize_ic_cache) != 64 { return "" }
+    let b = env_hash(fn_name)
+    let bucket = specialize_ic_cache[b]
     let mut fi = 0
-    while fi < len(specialize_ic) {
-        if specialize_ic[fi][0] == fn_name {
-            let entries = specialize_ic[fi][1]
+    while fi < len(bucket) {
+        if bucket[fi][0] == fn_name {
+            let entries = bucket[fi][1]
             let mut total = 0
             let mut max_tag = ""
             let mut max_count = 0
@@ -663,11 +717,8 @@ fn specialize_ic_dominant_type(fn_name) {
 pub let mut lazy_cache = []
 
 fn has_lazy_attr(name) {
-    let attrs = fn_attrs_get(name)
-    if attrs == "" { return false }
-    if attrs == "lazy" { return true }
-    if contains(attrs, "lazy") { return true }
-    return false
+    // ROI-11: single bitmask probe replaces fn_attrs_get + 3 string checks
+    return (fn_attr_bitmask(name) / 2) % 2 == 1
 }
 
 fn lazy_lookup(name) {
@@ -680,11 +731,8 @@ fn lazy_lookup(name) {
 }
 
 fn has_specialize_attr(name) {
-    let attrs = fn_attrs_get(name)
-    if attrs == "" { return false }
-    if attrs == "specialize" { return true }
-    if contains(attrs, "specialize") { return true }
-    return false
+    // ROI-11: single bitmask probe replaces fn_attrs_get + 3 string checks
+    return (fn_attr_bitmask(name) / 4) % 2 == 1
 }
 fn lazy_store(name, result) {
     lazy_cache = lazy_cache.push([name, result])
@@ -3907,12 +3955,14 @@ fn call_user_fn(name, args) {
         return val_void()
     }
 
-    // ── @specialize: record type feedback in inline cache (V8-style IC) ──
-    if has_specialize_attr(name) && len(args) > 0 {
+    // ── ROI-11: single bitmask probe replaces 3 separate O(N) scans ──
+    let attr_bits = fn_attr_bitmask(name)
+    // bit 2 (4): @specialize — record type feedback in inline cache
+    if (attr_bits / 4) % 2 == 1 && len(args) > 0 {
         specialize_ic_record(name, args[0].tag)
     }
-    // ── @lazy: check thunk cache before execution ──
-    let is_lazy = has_lazy_attr(name)
+    // bit 1 (2): @lazy — check thunk cache before execution
+    let is_lazy = (attr_bits / 2) % 2 == 1
     if is_lazy {
         let lazy_hit = lazy_lookup(name)
         if lazy_hit != "" {
@@ -3920,8 +3970,8 @@ fn call_user_fn(name, args) {
         }
     }
 
-    // ── @memo/@memoize/@cache: check cache before execution ──
-    let is_memo = has_memo_attr(name)
+    // bit 0 (1): @memo/@memoize/@cache — check cache before execution
+    let is_memo = attr_bits % 2 == 1
     let mut memo_key = ""
     if is_memo {
         memo_key = memo_key_for_args(name, args)
@@ -11057,6 +11107,8 @@ fn interpret(ast) {
     call_stack = []
     fn_attrs = []
     fn_attr_flags = []
+    fn_attr_cache = []
+    specialize_ic_cache = []
     memo_cache_init()
     // ─── T33 Val arena fix: eager small-int cache populate ───
     // Populate __VAL_INT_CACHE here at top-level (mark_top == 0) so the 256
