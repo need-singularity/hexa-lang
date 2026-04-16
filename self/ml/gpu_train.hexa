@@ -49,6 +49,7 @@
 use "cuda_ffi"
 use "cuda_rtc"
 use "cuda_kernels"
+use "ml/hxflash"
 
 // ═══════════════════════════════════════════════════════════════
 //  Config
@@ -62,7 +63,9 @@ struct GpuClmConfig {
     SEQ:        int,
     RANK:       int,
     EPS:        float,
-    INIT_SCALE: float
+    INIT_SCALE: float,
+    NH:         int,     // number of Q heads (0 = legacy single-head path)
+    NKV:        int      // number of KV heads (GQA; 0 = same as NH)
 }
 
 // Service-grade defaults (H100 target)
@@ -75,7 +78,9 @@ fn gpu_clm_config_default() -> GpuClmConfig {
         SEQ:        512,
         RANK:       64,
         EPS:        0.00001,
-        INIT_SCALE: 0.02
+        INIT_SCALE: 0.02,
+        NH:         0,
+        NKV:        0
     }
 }
 
@@ -84,6 +89,8 @@ fn gpu_clm_config_default() -> GpuClmConfig {
 // Low-rank LM head with RANK=128 saves 32000×4096→32000×128+128×4096
 // = 4.6M vs 131M params (28.5× reduction, <0.1% quality loss).
 // SEQ=1024 for initial training; scale to 2048/4096 via hxflash.
+// NH=32 Q heads, NKV=32 KV heads (MHA, no GQA for base 7B).
+// head_dim = D/NH = 128.
 fn gpu_clm_config_7b() -> GpuClmConfig {
     return GpuClmConfig {
         D:          4096,
@@ -93,7 +100,9 @@ fn gpu_clm_config_7b() -> GpuClmConfig {
         SEQ:        1024,
         RANK:       128,
         EPS:        0.00001,
-        INIT_SCALE: 0.006
+        INIT_SCALE: 0.006,
+        NH:         32,
+        NKV:        32
     }
 }
 
@@ -109,7 +118,9 @@ fn gpu_clm_config_7b_mini() -> GpuClmConfig {
         SEQ:        512,
         RANK:       128,
         EPS:        0.00001,
-        INIT_SCALE: 0.008
+        INIT_SCALE: 0.008,
+        NH:         32,
+        NKV:        32
     }
 }
 
@@ -124,7 +135,9 @@ fn gpu_clm_config_smoke() -> GpuClmConfig {
         SEQ:        16,
         RANK:       4,
         EPS:        0.00001,
-        INIT_SCALE: 0.1
+        INIT_SCALE: 0.1,
+        NH:         0,
+        NKV:        0
     }
 }
 
@@ -171,7 +184,8 @@ struct GpuLayerActs {
     ffn_out:  int,   // [N, D]   act @ Wff2
     y:        int,   // [N, D]   mid + ffn_out
     rstd1:    int,   // [N]      1/rms saved by rms_norm_fwd #1
-    rstd2:    int    // [N]      1/rms saved by rms_norm_fwd #2
+    rstd2:    int,   // [N]      1/rms saved by rms_norm_fwd #2
+    o_saved:  int    // [NH, S, HD] hxflash fwd output saved for bwd (0 when unused)
 }
 
 // Activations across the whole forward chain for one micro-step.
@@ -332,7 +346,8 @@ fn alloc_layer_acts(cfg: GpuClmConfig, N: int) -> GpuLayerActs {
         ffn_out:  gpu_zeros(N * D),
         y:        gpu_zeros(N * D),
         rstd1:    gpu_zeros(N),
-        rstd2:    gpu_zeros(N)
+        rstd2:    gpu_zeros(N),
+        o_saved:  0
     }
 }
 
@@ -343,6 +358,7 @@ fn free_layer_acts(a: GpuLayerActs) {
     cuda_free(a.mid); cuda_free(a.norm2)
     cuda_free(a.up); cuda_free(a.act); cuda_free(a.ffn_out)
     cuda_free(a.y); cuda_free(a.rstd1); cuda_free(a.rstd2)
+    if a.o_saved != 0 { cuda_free(a.o_saved) }
     0
 }
 
@@ -850,6 +866,114 @@ fn gpu_backward_full_with_embed(logits_dev, targets_dev, toks_dev, acts: GpuFwdA
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  hxflash attention helpers — CPU-side FlashAttention via FFI
+//
+//  When cfg.NH > 0, the attention block uses hxflash instead of
+//  materializing the full O(S^2) score matrix. This enables
+//  long-sequence training (SEQ=2048+) without quadratic memory.
+//
+//  Data path: D2H(Q,K,V) -> hxflash_attn_fwd_packed -> H2D(ctx)
+//  The D2H/H2D cost is amortized by avoiding SEQ^2 GEMM+softmax.
+//
+//  For bf16 mixed-precision: Q/K/V are stored as f32 on device.
+//  If a bf16 device path is needed in the future, convert at the
+//  boundary (hxblas_bf16_to_f32) before calling the f32 hxflash
+//  kernel — the C kernel accumulates in f32 for numerical safety.
+// ═══════════════════════════════════════════════════════════════
+
+// hxflash forward: Q/K/V on GPU -> ctx on GPU via CPU hxflash kernel.
+// Q,K,V are [SEQ, D] device pointers (multi-head packed as [NH, SEQ, HD]).
+// Returns: ctx device pointer [SEQ, D] written into ctx_dev.
+// Saves O into o_saved_dev for backward pass.
+fn gpu_hxflash_attn_fwd(q_dev, k_dev, v_dev, ctx_dev, o_saved_dev,
+                        SEQ, D, NH, NKV) {
+    let HD = D / NH
+    let q_bytes  = NH  * SEQ * HD * 4
+    let kv_bytes = NKV * SEQ * HD * 4
+    let o_bytes  = NH  * SEQ * HD * 4
+
+    // D2H: copy Q/K/V from device to host
+    let q_host = alloc_raw(q_bytes)
+    let k_host = alloc_raw(kv_bytes)
+    let v_host = alloc_raw(kv_bytes)
+    let o_host = alloc_raw(o_bytes)
+    let _ = cuda_memcpy_d2h(q_host, q_dev, q_bytes)
+    let _ = cuda_memcpy_d2h(k_host, k_dev, kv_bytes)
+    let _ = cuda_memcpy_d2h(v_host, v_dev, kv_bytes)
+
+    // CPU hxflash kernel — single dispatch, tiled online-softmax
+    let scale = 1.0 / sqrt(HD * 1.0)
+    let Br = 64
+    let Bc = 64
+    let _ = flash_attn_fwd_packed(SEQ, HD, NH, NKV, Br, Bc, 1,
+                                  q_host, k_host, v_host, o_host, scale)
+
+    // H2D: copy O back to device as ctx
+    let _ = cuda_memcpy_h2d(ctx_dev, o_host, o_bytes)
+
+    // Save O for backward pass (hxflash bwd needs recomputed fwd output)
+    if o_saved_dev != 0 {
+        let _ = cuda_memcpy_h2d(o_saved_dev, o_host, o_bytes)
+    }
+
+    free_raw(q_host, q_bytes)
+    free_raw(k_host, kv_bytes)
+    free_raw(v_host, kv_bytes)
+    free_raw(o_host, o_bytes)
+    return 0
+}
+
+// hxflash backward: compute dQ/dK/dV via CPU hxflash kernel.
+// All device pointers: q,k,v,o_saved [NH,SEQ,HD], dO [NH,SEQ,HD].
+// Writes dQ/dK/dV device pointers.
+fn gpu_hxflash_attn_bwd(q_dev, k_dev, v_dev, o_saved_dev, dO_dev,
+                        dQ_dev, dK_dev, dV_dev,
+                        SEQ, D, NH, NKV) {
+    let HD = D / NH
+    let q_bytes  = NH  * SEQ * HD * 4
+    let kv_bytes = NKV * SEQ * HD * 4
+
+    // D2H all inputs
+    let q_host  = alloc_raw(q_bytes)
+    let k_host  = alloc_raw(kv_bytes)
+    let v_host  = alloc_raw(kv_bytes)
+    let o_host  = alloc_raw(q_bytes)
+    let dO_host = alloc_raw(q_bytes)
+    let dQ_host = alloc_raw(q_bytes)
+    let dK_host = alloc_raw(kv_bytes)
+    let dV_host = alloc_raw(kv_bytes)
+
+    let _ = cuda_memcpy_d2h(q_host,  q_dev,       q_bytes)
+    let _ = cuda_memcpy_d2h(k_host,  k_dev,       kv_bytes)
+    let _ = cuda_memcpy_d2h(v_host,  v_dev,       kv_bytes)
+    let _ = cuda_memcpy_d2h(o_host,  o_saved_dev, q_bytes)
+    let _ = cuda_memcpy_d2h(dO_host, dO_dev,      q_bytes)
+
+    // CPU hxflash backward kernel
+    let scale = 1.0 / sqrt(HD * 1.0)
+    let Br = 64
+    let Bc = 64
+    let _ = flash_attn_bwd_packed(SEQ, HD, NH, NKV, Br, Bc, 1,
+                                  q_host, k_host, v_host, o_host, dO_host,
+                                  dQ_host, dK_host, dV_host, scale)
+
+    // H2D grad outputs
+    let _ = cuda_memcpy_h2d(dQ_dev, dQ_host, q_bytes)
+    let _ = cuda_memcpy_h2d(dK_dev, dK_host, kv_bytes)
+    let _ = cuda_memcpy_h2d(dV_dev, dV_host, kv_bytes)
+
+    free_raw(q_host,  q_bytes)
+    free_raw(k_host,  kv_bytes)
+    free_raw(v_host,  kv_bytes)
+    free_raw(o_host,  q_bytes)
+    free_raw(dO_host, q_bytes)
+    free_raw(dQ_host, q_bytes)
+    free_raw(dK_host, kv_bytes)
+    free_raw(dV_host, kv_bytes)
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  Fused layer forward (#20)
 //
 //  Replaces gpu_layer_fwd with fused kernels that eliminate
@@ -862,6 +986,9 @@ fn gpu_backward_full_with_embed(logits_dev, targets_dev, toks_dev, acts: GpuFwdA
 //
 //  The same activation struct (GpuLayerActs) is reused so the
 //  fused path is a drop-in replacement with identical numerics.
+//
+//  When cfg.NH > 0, attention steps 3-5 are replaced by a single
+//  hxflash dispatch (no O(S^2) score matrix materialisation).
 // ═══════════════════════════════════════════════════════════════
 
 fn gpu_layer_fwd_fused(x_dev, layer: GpuLayer, acts: GpuLayerActs, cfg: GpuClmConfig) {
@@ -880,15 +1007,35 @@ fn gpu_layer_fwd_fused(x_dev, layer: GpuLayer, acts: GpuLayerActs, cfg: GpuClmCo
     let _ = gpu_sgemm(acts.norm1, layer.Wk, acts.k, SEQ, D, D)
     let _ = gpu_sgemm(acts.norm1, layer.Wv, acts.v, SEQ, D, D)
 
-    // 3. scores = q @ k^T -> [SEQ, SEQ]
-    let _ = gpu_sgemm_nt(acts.q, acts.k, acts.probs, SEQ, SEQ, D)
+    let NH  = cfg.NH
+    let NKV = cfg.NKV
+    if NH > 0 {
+        // ── hxflash path: O(S·D) memory, no S^2 materialisation ──
+        // Q/K/V are [SEQ, D] on device; hxflash treats them as
+        // [NH, SEQ, HD] in head-major order (same flat layout when
+        // Wq is [D, D] and HD = D/NH).
+        let HD = D / NH
+        let o_bytes = NH * SEQ * HD * 4
 
-    // 4. fused_attn_post_fwd: scale by 1/sqrt(D) + causal softmax in ONE kernel
-    //    Replaces: gpu_sscal + gpu_softmax_rows_fwd (2 launches -> 1)
-    let _ = gpu_fused_attn_post_fwd(acts.probs, acts.probs, SEQ, SEQ, inv_sqrt_d)
+        // Allocate o_saved for backward if not yet allocated
+        if acts.o_saved == 0 {
+            acts.o_saved = gpu_zeros(SEQ * D)
+        }
 
-    // 5. ctx = probs @ v -> [SEQ, D]
-    let _ = gpu_sgemm(acts.probs, acts.v, acts.ctx, SEQ, D, SEQ)
+        let _ = gpu_hxflash_attn_fwd(acts.q, acts.k, acts.v, acts.ctx,
+                                      acts.o_saved, SEQ, D, NH, NKV)
+    } else {
+        // ── Legacy single-head path: materialises [SEQ, SEQ] scores ──
+        // 3. scores = q @ k^T -> [SEQ, SEQ]
+        let _ = gpu_sgemm_nt(acts.q, acts.k, acts.probs, SEQ, SEQ, D)
+
+        // 4. fused_attn_post_fwd: scale by 1/sqrt(D) + causal softmax in ONE kernel
+        //    Replaces: gpu_sscal + gpu_softmax_rows_fwd (2 launches -> 1)
+        let _ = gpu_fused_attn_post_fwd(acts.probs, acts.probs, SEQ, SEQ, inv_sqrt_d)
+
+        // 5. ctx = probs @ v -> [SEQ, D]
+        let _ = gpu_sgemm(acts.probs, acts.v, acts.ctx, SEQ, D, SEQ)
+    }
 
     // 6. attn_out = ctx @ Wo -> [SEQ, D]
     let _ = gpu_sgemm(acts.ctx, layer.Wo, acts.attn_out, SEQ, D, D)
@@ -984,25 +1131,44 @@ fn gpu_layer_bwd_fused(x_dev, layer: GpuLayer, acts: GpuLayerActs, dy_dev, grad:
     let dctx = gpu_zeros(SEQ * D)
     let _ = gpu_sgemm_nt(dattn_out, layer.Wo, dctx, SEQ, D, D)
 
-    // ── Attention backward: probs @ V = ctx
-    let dv_buf = gpu_zeros(SEQ * D)
-    let _ = gpu_sgemm_tn(acts.probs, dctx, dv_buf, SEQ, D, SEQ)
-    let dprobs = gpu_zeros(SEQ * SEQ)
-    let _ = gpu_sgemm_nt(dctx, acts.v, dprobs, SEQ, SEQ, D)
-    cuda_free(dctx)
+    // ── Attention backward: two paths based on cfg.NH
+    let NH  = cfg.NH
+    let NKV = cfg.NKV
+    let mut dq_buf = 0
+    let mut dk_buf = 0
+    let mut dv_buf = 0
 
-    // ── fused_attn_post_bwd: softmax_bwd + scale by inv_sqrt_d in ONE kernel
-    //    Replaces: gpu_softmax_rows_bwd + gpu_sscal (2 launches -> 1)
-    let dscores = gpu_zeros(SEQ * SEQ)
-    let _ = gpu_fused_attn_post_bwd(acts.probs, dprobs, dscores, SEQ, SEQ, inv_sqrt_d)
-    cuda_free(dprobs)
+    if NH > 0 {
+        // ── hxflash backward: single dispatch, O(S·D) memory ──
+        // dctx is dO for the attention block. hxflash computes dQ/dK/dV
+        // from saved Q,K,V,O and dO without materialising S^2 scores.
+        dq_buf = gpu_zeros(SEQ * D)
+        dk_buf = gpu_zeros(SEQ * D)
+        dv_buf = gpu_zeros(SEQ * D)
+        let _ = gpu_hxflash_attn_bwd(acts.q, acts.k, acts.v, acts.o_saved, dctx,
+                                      dq_buf, dk_buf, dv_buf,
+                                      SEQ, D, NH, NKV)
+        cuda_free(dctx)
+    } else {
+        // ── Legacy single-head backward: materialises [SEQ, SEQ] ──
+        dv_buf = gpu_zeros(SEQ * D)
+        let _ = gpu_sgemm_tn(acts.probs, dctx, dv_buf, SEQ, D, SEQ)
+        let dprobs = gpu_zeros(SEQ * SEQ)
+        let _ = gpu_sgemm_nt(dctx, acts.v, dprobs, SEQ, SEQ, D)
+        cuda_free(dctx)
 
-    // ── Q/K backward from dscores
-    let dq_buf = gpu_zeros(SEQ * D)
-    let dk_buf = gpu_zeros(SEQ * D)
-    let _ = gpu_sgemm(dscores, acts.k, dq_buf, SEQ, D, SEQ)
-    let _ = gpu_sgemm_tn(dscores, acts.q, dk_buf, SEQ, D, SEQ)
-    cuda_free(dscores)
+        // fused_attn_post_bwd: softmax_bwd + scale by inv_sqrt_d
+        let dscores = gpu_zeros(SEQ * SEQ)
+        let _ = gpu_fused_attn_post_bwd(acts.probs, dprobs, dscores, SEQ, SEQ, inv_sqrt_d)
+        cuda_free(dprobs)
+
+        // Q/K backward from dscores
+        dq_buf = gpu_zeros(SEQ * D)
+        dk_buf = gpu_zeros(SEQ * D)
+        let _ = gpu_sgemm(dscores, acts.k, dq_buf, SEQ, D, SEQ)
+        let _ = gpu_sgemm_tn(dscores, acts.q, dk_buf, SEQ, D, SEQ)
+        cuda_free(dscores)
+    }
 
     // ── Wq/Wk/Wv backward
     let dWq_tmp = gpu_zeros(D * D)
@@ -1463,7 +1629,8 @@ fn gpu_batch_backward_and_loss_fused(logits_dev, targets_dev, toks_dev, acts: Gp
                 ffn_out:  ptr_from_int(ptr_addr(la.ffn_out)  + off_d),
                 y:        ptr_from_int(ptr_addr(la.y)        + off_d),
                 rstd1:    ptr_from_int(ptr_addr(la.rstd1)    + off_r),
-                rstd2:    ptr_from_int(ptr_addr(la.rstd2)    + off_r)
+                rstd2:    ptr_from_int(ptr_addr(la.rstd2)    + off_r),
+                o_saved:  0
             }
 
             let dx_new = gpu_layer_bwd_fused(layer_input_bi, weights.layers[li], la_bi, dh, grad.layers[li], cfg)

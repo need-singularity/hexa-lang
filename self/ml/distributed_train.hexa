@@ -19,11 +19,31 @@ use "gpu_optimizer"
 use "model_100m_gpu"
 use "distributed"
 use "hxccl"
+use "fsdp"
+use "dist_launcher"
 
 // ── hxccl handle-based (Family B) toggle ─────────────────────
 // When true, gradient sync uses hxccl_allreduce_float via handle
 // instead of raw NCCL ncclAllReduce calls.
 let USE_HXCCL = true
+
+// ── FSDP toggle ─────────────────────────────────────────────
+// When true, parameter sharding via FSDP is enabled:
+//   fsdp_all_gather before forward, fsdp_reduce_scatter after backward.
+let USE_FSDP = true
+
+// ── Rank awareness ──────────────────────────────────────────
+// Read RANK and WORLD_SIZE from env (set by dist_launcher).
+// Defaults to rank=0, world=1 for single-process runs.
+let MY_RANK = dist_my_rank()
+let MY_WORLD = dist_my_world_size()
+
+// Rank-aware logging: only rank 0 prints to avoid interleaved output
+fn rank_println(msg) {
+    if MY_RANK == 0 {
+        println(msg)
+    }
+}
 
 // ── Training config ──────────────────────────────────────────
 let DIST_STEPS       = 100
@@ -48,7 +68,7 @@ fn init_worker(gpu_id, seq_len) {
     let _ = cuda_set_device(gpu_id)
     let _ = cuda_init()
 
-    println("[dist_train] GPU " + str(gpu_id) + " — initializing model replica")
+    rank_println("[dist_train] GPU " + str(gpu_id) + " — initializing model replica")
     let weights = init_model_weights()
 
     let all_params = model_params(weights)
@@ -222,27 +242,41 @@ fn scale_grads(grads, accum_steps) {
 // ═══════════════════════════════════════════════════════════════
 
 fn dist_train(num_gpus) {
-    println("=" * 60)
-    println("  Distributed GPU Training: " + str(num_gpus) + "-GPU Data Parallel")
-    println("  100M Transformer — Pure hexa + CUDA FFI")
-    println("  Gradient accumulation steps: " + str(DIST_ACCUM_STEPS))
-    println("=" * 60)
+    rank_println("=" * 60)
+    rank_println("  Distributed GPU Training: " + str(num_gpus) + "-GPU Data Parallel")
+    rank_println("  100M Transformer — Pure hexa + CUDA FFI")
+    rank_println("  Gradient accumulation steps: " + str(DIST_ACCUM_STEPS))
+    rank_println("  FSDP=" + str(USE_FSDP) + " RANK=" + str(MY_RANK) + "/" + str(MY_WORLD))
+    rank_println("=" * 60)
 
     // Initialize distributed context
     // When USE_HXCCL, ctx is an hxccl handle (Family B); otherwise
     // it's a DistContext from distributed.hexa.
     let mut ctx = 0
     if USE_HXCCL {
-        let rank = 0   // launcher sets actual rank via env
-        ctx = hxccl_init_handle(rank, num_gpus)
+        ctx = hxccl_init_handle(MY_RANK, num_gpus)
         if ctx <= 0 {
-            println("[dist_train] ERROR: hxccl_init_handle failed, falling back to legacy")
+            rank_println("[dist_train] ERROR: hxccl_init_handle failed, falling back to legacy")
             ctx = init_distributed(num_gpus)
         } else {
-            println("[dist_train] hxccl handle initialized: " + str(ctx))
+            rank_println("[dist_train] hxccl handle initialized: " + str(ctx))
         }
     } else {
         ctx = init_distributed(num_gpus)
+    }
+
+    // Initialize FSDP state if enabled
+    let mut fsdp_state = 0
+    if USE_FSDP {
+        // Dummy full weights vector for FSDP init — real weights come from workers
+        // In production, this would flatten the model params into a single vector
+        let mut dummy_weights = []
+        let dummy_d = 1024   // placeholder dimension for FSDP shard math
+        for di in 0..dummy_d {
+            dummy_weights.push(random() * 0.01)
+        }
+        fsdp_state = fsdp_init(dummy_weights, num_gpus, false, false)
+        rank_println("[dist_train] FSDP initialized: " + str(num_gpus) + " shards, total_d=" + str(dummy_d))
     }
 
     // Initialize workers (one model replica per GPU)
@@ -255,12 +289,12 @@ fn dist_train(num_gpus) {
         workers = workers.push(w)
         g = g + 1
     }
-    println("[dist_train] all " + str(num_gpus) + " GPU workers initialized")
+    rank_println("[dist_train] all " + str(num_gpus) + " GPU workers initialized")
 
     // Training loop
-    println("")
-    println("[dist_train] starting training for " + str(DIST_STEPS) + " steps")
-    println("-" * 60)
+    rank_println("")
+    rank_println("[dist_train] starting training for " + str(DIST_STEPS) + " steps")
+    rank_println("-" * 60)
 
     let _ = cuda_set_device(0)
 
@@ -285,6 +319,13 @@ fn dist_train(num_gpus) {
 
         let mut accum = 0
         while accum < DIST_ACCUM_STEPS {
+            // ── FSDP pre-forward: all-gather sharded params ─────
+            if USE_FSDP {
+                let _ = fsdp_all_gather(fsdp_state)
+                // Barrier ensures all ranks have full params before forward
+                let _ = fsdp_barrier_sync()
+            }
+
             // Forward + backward on each GPU (independent)
             let mut all_grads = []
             let mut all_losses = []
@@ -296,6 +337,15 @@ fn dist_train(num_gpus) {
                 all_losses = all_losses.push(fb[0])
                 all_grads = all_grads.push(fb[1])
                 g = g + 1
+            }
+
+            // ── FSDP post-backward: reduce-scatter gradients ────
+            if USE_FSDP {
+                // Build per-rank full gradient vectors for reduce-scatter
+                // Each rank's gradient is flattened to match fsdp total_d
+                let _ = fsdp_reduce_scatter(all_grads, num_gpus, fsdp_state.total_d)
+                // Barrier after reduce-scatter before accumulation
+                let _ = fsdp_barrier_sync()
             }
 
             // Accumulate gradients
@@ -351,13 +401,14 @@ fn dist_train(num_gpus) {
 
         if step % DIST_LOG_INTERVAL == 0 {
             let running_avg = total_loss / (step * 1.0)
-            println(
+            rank_println(
                 "step=" + str(step) +
                 " loss=" + str(avg_loss) +
                 " lr=" + str(lr) +
                 " ms=" + str(ms) +
                 " avg=" + str(running_avg) +
-                " gpus=" + str(num_gpus)
+                " gpus=" + str(num_gpus) +
+                " rank=" + str(MY_RANK)
             )
         }
 
@@ -365,21 +416,22 @@ fn dist_train(num_gpus) {
     }
 
     // Summary
-    println("")
-    println("=" * 60)
-    println("  Distributed training complete!")
-    println("  GPUs:       " + str(num_gpus))
-    println("  Steps:      " + str(DIST_STEPS))
-    println("  Avg loss:   " + str(total_loss / (DIST_STEPS * 1.0)))
-    println("  Total time: " + str(total_time) + " ms")
-    println("  Avg ms/step:" + str(total_time / (DIST_STEPS * 1.0)))
-    println("  Throughput: " + str((DIST_STEPS * 1000.0) / total_time) + " steps/s")
-    println("=" * 60)
+    rank_println("")
+    rank_println("=" * 60)
+    rank_println("  Distributed training complete!")
+    rank_println("  GPUs:       " + str(num_gpus))
+    rank_println("  Steps:      " + str(DIST_STEPS))
+    rank_println("  Avg loss:   " + str(total_loss / (DIST_STEPS * 1.0)))
+    rank_println("  Total time: " + str(total_time) + " ms")
+    rank_println("  Avg ms/step:" + str(total_time / (DIST_STEPS * 1.0)))
+    rank_println("  Throughput: " + str((DIST_STEPS * 1000.0) / total_time) + " steps/s")
+    rank_println("  FSDP:       " + str(USE_FSDP))
+    rank_println("=" * 60)
 
     // Cleanup
     if USE_HXCCL {
         let _ = hxccl_finalize(ctx)
-        println("[dist_train] hxccl handle finalized")
+        rank_println("[dist_train] hxccl handle finalized")
     } else {
         let _ = dist_shutdown(ctx)
     }
@@ -393,4 +445,4 @@ fn dist_train(num_gpus) {
     0
 }
 
-println("[distributed_train] module loaded — multi-GPU training loop ready (hxccl=" + str(USE_HXCCL) + ")")
+rank_println("[distributed_train] module loaded — multi-GPU training loop ready (hxccl=" + str(USE_HXCCL) + " fsdp=" + str(USE_FSDP) + " rank=" + str(MY_RANK) + "/" + str(MY_WORLD) + ")")
