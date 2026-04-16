@@ -31,6 +31,7 @@ SRC_DIR="$HEXA_DIR/self/native"
 OUT_DIR="$HEXA_DIR/self/native/build"
 SRC="$SRC_DIR/hxcuda_fused.cu"
 SRC_STFT="$SRC_DIR/hxcuda_stft.cu"
+SRC_CONV1D="$SRC_DIR/hxcuda_conv1d.cu"
 
 mkdir -p "$OUT_DIR"
 
@@ -81,23 +82,26 @@ echo "[build_hxcuda] nvcc version: $NVCC_VER, target arch: $ARCH, gpu: ${GPU_NAM
 
 # ── Syntax-check only ────────────────────────────────────────────
 if [ "$MODE" = "syntax" ]; then
-    echo "[build_hxcuda] syntax check: $SRC + $SRC_STFT"
+    echo "[build_hxcuda] syntax check: $SRC + $SRC_STFT + $SRC_CONV1D"
     nvcc -arch="$ARCH" $OPT --ptx \
         "$SRC" \
         -o /dev/null 2>&1
     nvcc -arch="$ARCH" $OPT --ptx \
         "$SRC_STFT" \
         -o /dev/null 2>&1
+    nvcc -arch="$ARCH" $OPT --ptx \
+        "$SRC_CONV1D" \
+        -o /dev/null 2>&1
     echo "[build_hxcuda] syntax check PASSED"
     exit 0
 fi
 
 # ── Build libhxcuda.so ───────────────────────────────────────────
-echo "[build_hxcuda] compiling $SRC + $SRC_STFT -> libhxcuda.so (arch=$ARCH)"
+echo "[build_hxcuda] compiling $SRC + $SRC_STFT + $SRC_CONV1D -> libhxcuda.so (arch=$ARCH)"
 
 nvcc -arch="$ARCH" $OPT \
     --shared -Xcompiler -fPIC \
-    "$SRC" "$SRC_STFT" \
+    "$SRC" "$SRC_STFT" "$SRC_CONV1D" \
     -lcufft \
     -o "$OUT_DIR/libhxcuda.so"
 
@@ -107,7 +111,7 @@ ls -la "$OUT_DIR/libhxcuda.so"
 # ── Symbol verification ──────────────────────────────────────────
 echo "[build_hxcuda] symbol check:"
 
-EXPECTED_SYMS="hxcuda_version hxcuda_matmul_bf16 hxcuda_matmul_bf16_pos hxcuda_fused_lmhead_fwd hxcuda_device_info hxcuda_sync hxcuda_stft_bf16 hxcuda_istft_bf16 hxcuda_stft_version"
+EXPECTED_SYMS="hxcuda_version hxcuda_matmul_bf16 hxcuda_matmul_bf16_pos hxcuda_fused_lmhead_fwd hxcuda_device_info hxcuda_sync hxcuda_stft_bf16 hxcuda_istft_bf16 hxcuda_stft_version hxcuda_conv1d_bf16 hxcuda_conv1d_version hxcuda_conv1d_selftest"
 ALL_OK=1
 for sym in $EXPECTED_SYMS; do
     if nm -D "$OUT_DIR/libhxcuda.so" 2>/dev/null | grep -q " T $sym\|_$sym"; then
