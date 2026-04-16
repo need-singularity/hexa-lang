@@ -1,0 +1,318 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_lora_adapter.hexa — ROI #100 correctness suite
+//
+//  Validates self/ai_native/lora_adapter.hexa:
+//      - shape contracts at r ∈ {4, 8, 16}
+//      - identity collapses: A=0, B=0, scale=0
+//      - merge_lora_weights(·) ≡ unmerged forward (fwd parity)
+//      - param ratio ≤ 0.1 at r=4, in=out=128
+//      - lora_grad_freeze_W produces zero-tensor
+//      - detect / inject AST rewrite happy + negative cases
+//      - full closed-form forward cross-check vs hand-computed y
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/lora_adapter.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut max_abs_diff_all = 0.0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn record_diff(d) {
+    if d > max_abs_diff_all { max_abs_diff_all = d }
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        let d = fabs_t(a[i] - b[i])
+        record_diff(d)
+        if d > eps { return false }
+    }
+    return true
+}
+
+fn vec_max_diff(a, b) {
+    let mut mx = 0.0
+    for i in 0..len(a) {
+        let d = fabs_t(a[i] - b[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+// deterministic LCG (matches layernorm_fuse test style)
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_vec(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let r = (state % 1000) * 0.004 - 2.0
+        v = v + [r]
+    }
+    return v
+}
+
+fn rand_mat(r, c, seed) {
+    let mut state = seed
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            state = lcg_step(state)
+            let r2 = (state % 1000) * 0.002 - 1.0
+            row = row + [r2]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// Plain row-vector matvec: out = x · M   x:[R], M:[R,C]
+fn ref_row_matvec(x, M) {
+    let R = len(x)
+    let C = len(M[0])
+    let mut out = zeros_1d(C)
+    for i in 0..R {
+        let xi = x[i]
+        for j in 0..C {
+            out[j] = out[j] + xi * M[i][j]
+        }
+    }
+    return out
+}
+
+// Sum of abs entries of a 2D tensor.
+fn abs_sum_2d(T) {
+    let R = len(T)
+    if R == 0 { return 0.0 }
+    let C = len(T[0])
+    let mut s = 0.0
+    for i in 0..R {
+        for j in 0..C {
+            s = s + fabs_t(T[i][j])
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #100 LoRA Adapter — correctness suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-5
+
+// ── Test 1-3 : shape contract  r ∈ {4, 8, 16} ──────────────────────
+// in=64, out=48, verify len(y)==out for each rank.
+let IN1 = 64
+let OUT1 = 48
+let ranks = [4, 8, 16]
+for ti in 0..3 {
+    let r = ranks[ti]
+    let x = rand_vec(IN1, 101 + ti * 7)
+    let W = rand_mat(IN1, OUT1, 200 + ti)
+    let A = rand_mat(IN1, r, 300 + ti)
+    let B = rand_mat(r, OUT1, 400 + ti)
+    let y = lora_linear_forward(x, W, A, B, 1.0)
+    check("shape y=[out] r=" + to_string(r), len(y) == OUT1)
+}
+
+// ── Test 4 : A = 0 → y ≡ x·W (residual zero) ─────────────────────
+let INa = 32
+let OUTa = 24
+let ra = 8
+let xa = rand_vec(INa, 1001)
+let Wa = rand_mat(INa, OUTa, 1002)
+let A_zero = zeros_2d(INa, ra)
+let Ba = rand_mat(ra, OUTa, 1003)
+let ya_lora = lora_linear_forward(xa, Wa, A_zero, Ba, 1.0)
+let ya_base = ref_row_matvec(xa, Wa)
+check("A=0 → y == x·W", vec_close(ya_lora, ya_base, eps))
+
+// ── Test 5 : B = 0 → y ≡ x·W (residual zero) ─────────────────────
+let Aa = rand_mat(INa, ra, 1004)
+let B_zero = zeros_2d(ra, OUTa)
+let yb_lora = lora_linear_forward(xa, Wa, Aa, B_zero, 1.0)
+check("B=0 → y == x·W", vec_close(yb_lora, ya_base, eps))
+
+// ── Test 6 : scale = 0 → y ≡ x·W (adapter inert) ─────────────────
+let ys_lora = lora_linear_forward(xa, Wa, Aa, Ba, 0.0)
+check("scale=0 → y == x·W", vec_close(ys_lora, ya_base, eps))
+
+// ── Test 7-9 : merge_lora_weights ≡ unmerged forward, r ∈ {4,8,16}─
+let INm = 48
+let OUTm = 32
+for ti in 0..3 {
+    let r = ranks[ti]
+    let xm = rand_vec(INm, 2001 + ti)
+    let Wm = rand_mat(INm, OUTm, 2100 + ti)
+    let Am = rand_mat(INm, r, 2200 + ti)
+    let Bm = rand_mat(r, OUTm, 2300 + ti)
+    let scale_m = 0.5 + to_float(ti) * 0.25   // 0.5, 0.75, 1.0
+    let y_unmerged = lora_linear_forward(xm, Wm, Am, Bm, scale_m)
+    let W_merged = merge_lora_weights(Wm, Am, Bm, scale_m)
+    let y_merged = ref_row_matvec(xm, W_merged)
+    let name = "merge_weights forward parity r=" + to_string(r)
+    check(name, vec_close(y_unmerged, y_merged, eps))
+}
+
+// ── Test 10 : merge_lora_weights shape preserved ──────────────────
+let Wm_shape = merge_lora_weights(Wa, Aa, Ba, 1.0)
+check("merge shape rows == in", len(Wm_shape) == INa)
+check("merge shape cols == out", len(Wm_shape[0]) == OUTa)
+
+// ── Test 12 : (A+B)/W param ratio ≤ 0.1 at r=4, in=out=128 ──────
+let ratio_128_4 = lora_param_ratio(128, 128, 4)
+check("param ratio ≤ 0.1 at r=4, N=128", ratio_128_4 <= 0.1)
+// Concrete check: 2·r·N / (N·N) = 2·4/128 = 0.0625
+check("param ratio == 2·r/N formula", fabs_t(ratio_128_4 - 0.0625) < 1.0e-9)
+
+// ── Test 13 : param ratio at r=16 stays reasonable ───────────────
+let ratio_256_16 = lora_param_ratio(256, 256, 16)
+// 2·16/256 = 0.125
+check("param ratio r=16 N=256 = 0.125", fabs_t(ratio_256_16 - 0.125) < 1.0e-9)
+
+// ── Test 14 : lora_grad_freeze_W returns all-zero tensor ─────────
+let grad_W_fake = rand_mat(INa, OUTa, 9001)
+let grad_W_frozen = lora_grad_freeze_W(grad_W_fake)
+check("freeze grad rows preserved", len(grad_W_frozen) == INa)
+check("freeze grad cols preserved", len(grad_W_frozen[0]) == OUTa)
+check("freeze grad all zeros", abs_sum_2d(grad_W_frozen) == 0.0)
+
+// ── Test 17 : dW always 0 after backward sim (SGD step is no-op) ─
+// Simulate an SGD update on W with the frozen gradient: W_new = W - lr·0
+// should equal W exactly across every element.
+let lr = 0.01
+let mut W_after = zeros_2d(INa, OUTa)
+for i in 0..INa {
+    for j in 0..OUTa {
+        W_after[i][j] = Wa[i][j] - lr * grad_W_frozen[i][j]
+    }
+}
+let mut sgd_ok = true
+for i in 0..INa {
+    for j in 0..OUTa {
+        if fabs_t(W_after[i][j] - Wa[i][j]) > 1.0e-12 { sgd_ok = false }
+    }
+}
+check("SGD step on frozen W is no-op", sgd_ok)
+
+// ── Test 18 : detect_lora_candidate — frozen + no adapter ────────
+let Wd = rand_mat(16, 12, 5001)
+let node_frozen = make_linear_frozen(Wd)
+let node_trainable = make_linear_trainable(Wd)
+let Ad = zeros_2d(16, 4)
+let Bd = rand_mat(4, 12, 5002)
+let node_already = make_lora_linear(Wd, Ad, Bd, 1.0)
+check("detect: frozen+unadapted → true", detect_lora_candidate(node_frozen) == true)
+check("detect: trainable → false", detect_lora_candidate(node_trainable) == false)
+check("detect: already adapted → false", detect_lora_candidate(node_already) == false)
+
+// ── Test 21 : inject_lora_adapter rewrites candidate ─────────────
+let injected = inject_lora_adapter(node_frozen, 4, 1.0)
+check("inject: kind becomes lora_linear", injected.kind == "lora_linear")
+check("inject: has_adapter == true", injected.has_adapter == true)
+check("inject: A shape rows == in", len(injected.A) == 16)
+check("inject: A shape cols == r", len(injected.A[0]) == 4)
+check("inject: B shape rows == r", len(injected.B) == 4)
+check("inject: B shape cols == out", len(injected.B[0]) == 12)
+// A must be all-zero at init so residual = 0 at step 0.
+check("inject: A all-zero at init (residual=0)", abs_sum_2d(injected.A) == 0.0)
+
+// Forward through injected node must equal plain x·W at step 0.
+let xd = rand_vec(16, 5100)
+let y_at_init = lora_linear_forward(xd, injected.W, injected.A, injected.B, injected.scale)
+let y_base_d = ref_row_matvec(xd, Wd)
+check("inject: step-0 forward ≡ x·W", vec_close(y_at_init, y_base_d, eps))
+
+// ── Test 27 : inject is a no-op on non-candidate ─────────────────
+let injected_train = inject_lora_adapter(node_trainable, 4, 1.0)
+check("inject no-op: trainable kind stays linear", injected_train.kind == "linear")
+check("inject no-op: trainable has_adapter stays false", injected_train.has_adapter == false)
+
+let injected_already = inject_lora_adapter(node_already, 8, 1.0)
+check("inject no-op: already-adapted kind stays lora_linear", injected_already.kind == "lora_linear")
+
+// ── Test 30 : adapter_param_count formula correctness ────────────
+let apc = adapter_param_count(64, 48, 4)
+// (64 + 48) * 4 = 448
+check("adapter_param_count(64,48,4) == 448", apc == 448)
+let bpc = base_param_count(64, 48)
+check("base_param_count(64,48) == 3072", bpc == 3072)
+// ratio 448 / 3072 ≈ 0.1458
+let ratio_concrete = to_float(apc) / to_float(bpc)
+check("adapter/base ratio matches lora_param_ratio", fabs_t(ratio_concrete - lora_param_ratio(64, 48, 4)) < 1.0e-9)
+
+// ── Test 33 : closed-form — compare to hand-computed y ────────────
+// Small case that's easy to audit: in=2, out=2, r=1, identity-ish.
+// x = [1, 2], W = [[1,0],[0,1]], A = [[1],[0]], B = [[1, 2]], scale = 1
+// base = x·W = [1, 2]
+// u    = x·A = 1·1 + 2·0 = [1]
+// v    = u·B = [1, 2]
+// y    = base + v = [2, 4]
+let x_cf = [1.0, 2.0]
+let W_cf = [[1.0, 0.0], [0.0, 1.0]]
+let A_cf = [[1.0], [0.0]]
+let B_cf = [[1.0, 2.0]]
+let y_cf = lora_linear_forward(x_cf, W_cf, A_cf, B_cf, 1.0)
+check("closed-form y[0] == 2", fabs_t(y_cf[0] - 2.0) < eps)
+check("closed-form y[1] == 4", fabs_t(y_cf[1] - 4.0) < eps)
+
+// scale=2 version — residual doubles → y = [1+2, 2+4] = [3, 6]
+let y_cf2 = lora_linear_forward(x_cf, W_cf, A_cf, B_cf, 2.0)
+check("closed-form scale=2 y[0] == 3", fabs_t(y_cf2[0] - 3.0) < eps)
+check("closed-form scale=2 y[1] == 6", fabs_t(y_cf2[1] - 6.0) < eps)
+
+// merge + forward matches
+let Wm_cf = merge_lora_weights(W_cf, A_cf, B_cf, 1.0)
+let y_cf_merged = ref_row_matvec(x_cf, Wm_cf)
+check("closed-form merge parity y[0]", fabs_t(y_cf_merged[0] - 2.0) < eps)
+check("closed-form merge parity y[1]", fabs_t(y_cf_merged[1] - 4.0) < eps)
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
+println("  max_abs_diff across fwd-parity tests: " + to_string(max_abs_diff_all))
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[ALL PASS] ROI #100 lora_adapter verified")
+}

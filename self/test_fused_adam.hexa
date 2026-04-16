@@ -1,0 +1,325 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_fused_adam.hexa — ROI #94 correctness suite
+//
+//  Validates self/ai_native/fused_adam.hexa:
+//    T1   bias_correction(b,1) = 1 − b
+//    T2   bias_correction(b,0) = 1  (identity / pre-first-step)
+//    T3   bias_correction(1.0, t) = 0  (β=1 freeze)
+//    T4   lr=0 is the identity on p
+//    T5   lr=0 still updates m and v
+//    T6   t=0 keeps mhat=m (no-op rescale)
+//    T7   ε > 0 guards sqrt(0)
+//    T8   N=0 empty input → empty output
+//    T9   fused == naive, seed=1, N=8
+//    T10  fused == naive, seed=2, N=16
+//    T11  fused == naive, seed=3, N=32
+//    T12  fused == naive, seed=4, N=64
+//    T13  fused == naive, seed=5, N=128
+//    T14  β1=0 → m = g (no memory)
+//    T15  β2=0 → v = g²
+//    T16  β1=β2=1 (frozen state) — m,v unchanged
+//    T17  AST detect three loops POS
+//    T18  AST detect different-index NEG
+//    T19  AST detect wrong-order NEG
+//    T20  AST rewrite collapses to fused_adam_loop
+//    T21  pass-count accounting 3 vs 1
+//    T22  convergence on quadratic loss N=100 steps
+//    T23  max_abs_diff across all random seeds ≤ 1e-7
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/fused_adam.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut max_abs_diff_global = 0.0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        if fabs_t(a[i] - b[i]) > eps { return false }
+    }
+    return true
+}
+
+fn vec_max_diff(a, b) {
+    let mut mx = 0.0
+    for i in 0..len(a) {
+        let d = fabs_t(a[i] - b[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+fn update_global_max(d) {
+    if d > max_abs_diff_global { max_abs_diff_global = d }
+}
+
+// deterministic LCG
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_vec(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let r = (state % 1000) * 0.004 - 2.0
+        v = v + [r]
+    }
+    return v
+}
+
+fn zeros_vec(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn copy_vec(a) {
+    let mut out = []
+    for i in 0..len(a) {
+        out = out + [a[i]]
+    }
+    return out
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #94 AdamW 3-pass → 1-pass Fusion — correctness")
+println("═══════════════════════════════════════════════════════")
+
+let tol = 1.0e-7
+
+// ── T1  bias_correction(b,1) = 1 − b ─────────────────────────────
+let bc_1_b09 = bias_correction(0.9, 1)
+check("T1 bias_correction(0.9,1) == 0.1",
+      fabs_t(bc_1_b09 - 0.1) < tol)
+
+// ── T2  bias_correction(b,0) = 1 ─────────────────────────────────
+let bc_0 = bias_correction(0.9, 0)
+check("T2 bias_correction(0.9,0) == 1.0",
+      fabs_t(bc_0 - 1.0) < tol)
+
+// ── T3  bias_correction(1.0, t) = 0 (β=1 freeze) ─────────────────
+let bc_one = bias_correction(1.0, 5)
+check("T3 bias_correction(1.0,5) == 0.0",
+      fabs_t(bc_one - 0.0) < tol)
+
+// ── T4  lr=0 is the identity on p ────────────────────────────────
+let p4 = rand_vec(10, 101)
+let g4 = rand_vec(10, 102)
+let m4 = zeros_vec(10)
+let v4 = zeros_vec(10)
+let p4_copy = copy_vec(p4)
+let res4 = adam_step_fused(p4, g4, m4, v4, 1, 0.0, 0.9, 0.999, 1.0e-8)
+check("T4 lr=0 → p unchanged", vec_close(res4["p"], p4_copy, tol))
+
+// ── T5  lr=0 still updates m and v ───────────────────────────────
+// With m=v=0 prior and b1=0.9, b2=0.999:
+//   m'[i] = 0.1 · g[i]
+//   v'[i] = 0.001 · g[i]²
+let mut expect_m5 = []
+let mut expect_v5 = []
+for i in 0..10 {
+    expect_m5 = expect_m5 + [0.1 * g4[i]]
+    expect_v5 = expect_v5 + [0.001 * g4[i] * g4[i]]
+}
+check("T5 lr=0 → m updated", vec_close(res4["m"], expect_m5, tol))
+check("T5 lr=0 → v updated", vec_close(res4["v"], expect_v5, tol))
+
+// ── T6  t=0 → mhat=m (bias_correction denom = 1) ─────────────────
+// With t=0, bias_correction returns 1, so mhat=m and vhat=v.
+// Using m=v=0 input, one step of g=1 gives:
+//   m' = 0.1, v' = 0.001
+//   mhat = 0.1 / 1 = 0.1
+//   vhat = 0.001 / 1 = 0.001
+//   p' = p - 0.01 · 0.1 / (√0.001 + 1e-8)
+let p6 = [0.5]
+let g6 = [1.0]
+let m6 = [0.0]
+let v6 = [0.0]
+let res6 = adam_step_fused(p6, g6, m6, v6, 0, 0.01, 0.9, 0.999, 1.0e-8)
+let expect6_p0 = 0.5 - 0.01 * 0.1 / (sqrt(0.001) + 1.0e-8)
+check("T6 t=0 mhat=m path matches closed form",
+      fabs_t(res6["p"][0] - expect6_p0) < tol)
+check("T6 t=0 m updated to 0.1", fabs_t(res6["m"][0] - 0.1) < tol)
+check("T6 t=0 v updated to 0.001", fabs_t(res6["v"][0] - 0.001) < tol)
+
+// ── T7  ε > 0 guards divide-by-zero when vhat = 0 ────────────────
+// If g=0 and v_prev=0 then vhat=0 and sqrt(0)=0; eps keeps denom>0.
+let p7 = [1.0]
+let g7 = [0.0]
+let m7 = [0.0]
+let v7 = [0.0]
+let res7 = adam_step_fused(p7, g7, m7, v7, 1, 0.01, 0.9, 0.999, 1.0e-8)
+check("T7 eps guards 0/0 (p finite)", fabs_t(res7["p"][0] - 1.0) < tol)
+
+// ── T8  N=0 empty input → empty output ───────────────────────────
+let empty = []
+let res8 = adam_step_fused(empty, empty, empty, empty, 5, 0.01, 0.9, 0.999, 1.0e-8)
+check("T8 N=0 p length 0",  len(res8["p"]) == 0)
+check("T8 N=0 m length 0",  len(res8["m"]) == 0)
+check("T8 N=0 v length 0",  len(res8["v"]) == 0)
+
+// ── T9..T13  fused == naive × 5 seeds / varying N ─────────────────
+let seeds = [1, 2, 3, 4, 5]
+let sizes = [8, 16, 32, 64, 128]
+let tc_names = ["T9 ", "T10", "T11", "T12", "T13"]
+for k in 0..5 {
+    let n = sizes[k]
+    let seed = seeds[k]
+    let p = rand_vec(n, seed * 11)
+    let g = rand_vec(n, seed * 13)
+    let m = rand_vec(n, seed * 17)
+    let v = rand_vec(n, seed * 19)
+    // v must be non-negative (it is an EMA of g²).  Square it here
+    // to keep the test physically plausible; the code still handles
+    // negative v formally, but sqrt would go imaginary.
+    let mut v_pos = []
+    for i in 0..n {
+        v_pos = v_pos + [v[i] * v[i]]
+    }
+    let ref_out = adam_step_naive(p, g, m, v_pos, seed, 0.01, 0.9, 0.999, 1.0e-8)
+    let fus_out = adam_step_fused(p, g, m, v_pos, seed, 0.01, 0.9, 0.999, 1.0e-8)
+    let dp = vec_max_diff(ref_out["p"], fus_out["p"])
+    let dm = vec_max_diff(ref_out["m"], fus_out["m"])
+    let dv = vec_max_diff(ref_out["v"], fus_out["v"])
+    update_global_max(dp)
+    update_global_max(dm)
+    update_global_max(dv)
+    let ok_p = dp <= tol
+    let ok_m = dm <= tol
+    let ok_v = dv <= tol
+    let name = tc_names[k] + " fused==naive N=" + to_string(n) + " seed=" + to_string(seed)
+    check(name, ok_p && ok_m && ok_v)
+}
+
+// ── T14  β1=0 → m = g (no first-moment memory) ───────────────────
+let pA = [1.0, 2.0, 3.0]
+let gA = [0.5, -0.5, 1.5]
+let mA = [0.0, 0.0, 0.0]
+let vA = [0.0, 0.0, 0.0]
+let resA = adam_step_fused(pA, gA, mA, vA, 1, 0.01, 0.0, 0.999, 1.0e-8)
+check("T14 β1=0 → m == g", vec_close(resA["m"], gA, tol))
+
+// ── T15  β2=0 → v = g² ────────────────────────────────────────────
+let resB = adam_step_fused(pA, gA, mA, vA, 1, 0.01, 0.9, 0.0, 1.0e-8)
+let mut g_sq = []
+for i in 0..len(gA) {
+    g_sq = g_sq + [gA[i] * gA[i]]
+}
+check("T15 β2=0 → v == g²", vec_close(resB["v"], g_sq, tol))
+
+// ── T16  β1=β2=1 (frozen) — m and v unchanged ────────────────────
+// (1-b) factor is 0, so m_new = b·m = m, v_new = v.
+let mInit = [0.2, 0.3]
+let vInit = [0.01, 0.02]
+let resC = adam_step_fused([0.0, 0.0], [1.0, -1.0], mInit, vInit,
+                           3, 0.01, 1.0, 1.0, 1.0e-8)
+check("T16 β1=1 freezes m", vec_close(resC["m"], mInit, tol))
+check("T16 β2=1 freezes v", vec_close(resC["v"], vInit, tol))
+
+// ── T17  AST detect: positive three-loop match ────────────────────
+let prog_ok = [
+    adam_stmt_for_m("i", "theta"),
+    adam_stmt_for_v("i", "theta"),
+    adam_stmt_for_param("i", "theta")
+]
+check("T17 AST detect three-loop POS", detect_adam_three_loops(prog_ok))
+
+// ── T18  AST detect: different index → NEG ───────────────────────
+let prog_bad_idx = [
+    adam_stmt_for_m("i", "theta"),
+    adam_stmt_for_v("j", "theta"),
+    adam_stmt_for_param("i", "theta")
+]
+check("T18 AST detect different-index NEG",
+      !detect_adam_three_loops(prog_bad_idx))
+
+// ── T19  AST detect: wrong order → NEG ────────────────────────────
+let prog_wrong_order = [
+    adam_stmt_for_param("i", "theta"),
+    adam_stmt_for_m("i", "theta"),
+    adam_stmt_for_v("i", "theta")
+]
+check("T19 AST detect wrong-order NEG",
+      !detect_adam_three_loops(prog_wrong_order))
+
+// ── T20  AST rewrite collapses three loops to one fused node ─────
+let prog_rw = rewrite_fuse_adam(prog_ok)
+let ok20 = len(prog_rw) == 1 && prog_rw[0].kind == "fused_adam_loop"
+check("T20 rewrite → [fused_adam_loop]", ok20)
+
+// Also: rewrite is identity on non-matching programs.
+let prog_rw_neg = rewrite_fuse_adam(prog_wrong_order)
+let ok20b = len(prog_rw_neg) == 3
+check("T20b rewrite identity on NEG", ok20b)
+
+// ── T21  pass-count accounting ───────────────────────────────────
+check("T21 naive_pass_count == 3", naive_pass_count() == 3)
+check("T21 fused_pass_count == 1", fused_pass_count() == 1)
+
+// ── T22  convergence on quadratic loss N=100 steps ───────────────
+// Loss  f(p) = Σ_i p_i²   → gradient g_i = 2 p_i
+// Adam should drive p toward 0. Start from p = rand in [-2, 2].
+let pN = 8
+let mut p22 = rand_vec(pN, 12345)
+let mut m22 = zeros_vec(pN)
+let mut v22 = zeros_vec(pN)
+let lr22 = 0.05
+let mut loss_start = 0.0
+for i in 0..pN {
+    loss_start = loss_start + p22[i] * p22[i]
+}
+for t in 1..101 {
+    let mut g22 = []
+    for i in 0..pN {
+        g22 = g22 + [2.0 * p22[i]]
+    }
+    let step = adam_step_fused(p22, g22, m22, v22, t, lr22, 0.9, 0.999, 1.0e-8)
+    p22 = step["p"]
+    m22 = step["m"]
+    v22 = step["v"]
+}
+let mut loss_end = 0.0
+for i in 0..pN {
+    loss_end = loss_end + p22[i] * p22[i]
+}
+check("T22 quadratic loss decreases (100 steps)",
+      loss_end < loss_start * 0.1)
+
+// ── T23  global max_abs_diff across all random seeds ≤ 1e-7 ──────
+check("T23 global max_abs_diff ≤ 1e-7",
+      max_abs_diff_global <= tol)
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  max_abs_diff = " + to_string(max_abs_diff_global))
+println("  Results: " + to_string(pass_count) + " PASS / "
+        + to_string(fail_count) + " FAIL")
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[ALL PASS] ROI #94 fused_adam verified")
+}

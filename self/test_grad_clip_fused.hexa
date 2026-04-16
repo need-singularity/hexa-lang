@@ -1,0 +1,291 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_grad_clip_fused.hexa — ROI #97 correctness suite
+//
+//  Validates self/ai_native/grad_clip_fused.hexa across the full
+//  clip spec surface:
+//      - ||g|| < max_norm            → identity passthrough
+//      - ||g|| == max_norm           → factor == 1.0 boundary
+//      - ||g|| > max_norm            → scaled to exactly max_norm
+//      - all-zero tensor             → no division-by-zero; passthrough
+//      - single element              → scalar case
+//      - empty tensor                → empty copy, norm = 0
+//      - max_norm ≤ 0                → defensive no-op
+//      - fused ≡ naive               → tol 1e-6 over 5 random seeds
+//      - tree-reduce associativity   → (a+b)+c ≈ a+(b+c) tol 1e-6
+//      - multi-tensor list clip      → global norm across all tensors
+//      - AST marker detect/rewrite   → conservative predicate
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/grad_clip_fused.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut max_abs_diff = 0.0
+let mut l2_diff_accum = 0.0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn vec_close(a, b, eps) {
+    if len(a) != len(b) { return false }
+    for i in 0..len(a) {
+        if fabs_t(a[i] - b[i]) > eps { return false }
+    }
+    return true
+}
+
+fn vec_max_diff(a, b) {
+    let mut mx = 0.0
+    for i in 0..len(a) {
+        let d = fabs_t(a[i] - b[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+fn vec_l2_diff(a, b) {
+    let mut s = 0.0
+    for i in 0..len(a) {
+        let d = a[i] - b[i]
+        s = s + d * d
+    }
+    return sqrt(s)
+}
+
+fn vec_l2(a) {
+    let mut s = 0.0
+    for i in 0..len(a) {
+        s = s + a[i] * a[i]
+    }
+    return sqrt(s)
+}
+
+fn track_diff(a, b) {
+    let md = vec_max_diff(a, b)
+    if md > max_abs_diff { max_abs_diff = md }
+    l2_diff_accum = l2_diff_accum + vec_l2_diff(a, b)
+}
+
+// deterministic LCG (matches reference style in test_layernorm_fuse)
+fn lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    return (state * a + c) % m
+}
+
+fn rand_vec(n, seed) {
+    let mut state = seed
+    let mut v = []
+    for _i in 0..n {
+        state = lcg_step(state)
+        let r = (state % 1000) * 0.004 - 2.0
+        v = v + [r]
+    }
+    return v
+}
+
+fn zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #97 Gradient-Clip Fusion — correctness suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-6
+
+// ── Test 1 : ||g|| < max — identity passthrough ───────────────────
+let g1 = [0.1, 0.1, 0.1, 0.1]          // ||g|| = 0.2
+let c1_naive = clip_naive(g1, 10.0)    // max way above norm
+let c1_fused = clip_fused(g1, 10.0)
+check("T01 ||g||<max naive identity", vec_close(c1_naive, g1, eps))
+check("T02 ||g||<max fused identity", vec_close(c1_fused, g1, eps))
+check("T03 ||g||<max fused==naive",   vec_close(c1_naive, c1_fused, eps))
+track_diff(c1_naive, c1_fused)
+
+// ── Test 2 : ||g|| == max boundary — factor exactly 1.0 ───────────
+// Construct g with exact unit L2 norm: [1,0,0,0] has ||g||=1.
+let g2 = [1.0, 0.0, 0.0, 0.0]
+let c2_naive = clip_naive(g2, 1.0)
+let c2_fused = clip_fused(g2, 1.0)
+check("T04 boundary ||g||=max naive identity",  vec_close(c2_naive, g2, eps))
+check("T05 boundary ||g||=max fused identity",  vec_close(c2_fused, g2, eps))
+check("T06 boundary fused==naive",              vec_close(c2_naive, c2_fused, eps))
+track_diff(c2_naive, c2_fused)
+
+// ── Test 3 : ||g|| > max — scale to exactly max_norm ──────────────
+// g = [3, 4] → ||g|| = 5. With max=1 → factor=0.2 → [0.6, 0.8], ||·|| = 1.
+let g3 = [3.0, 4.0]
+let c3_naive = clip_naive(g3, 1.0)
+let c3_fused = clip_fused(g3, 1.0)
+let n3n = vec_l2(c3_naive)
+let n3f = vec_l2(c3_fused)
+check("T07 scale naive ||out||≈max", fabs_t(n3n - 1.0) < eps)
+check("T08 scale fused ||out||≈max", fabs_t(n3f - 1.0) < eps)
+check("T09 scale closed-form 0.6",   fabs_t(c3_fused[0] - 0.6) < eps)
+check("T10 scale closed-form 0.8",   fabs_t(c3_fused[1] - 0.8) < eps)
+track_diff(c3_naive, c3_fused)
+
+// ── Test 4 : all zeros — no division-by-zero ──────────────────────
+let g4 = [0.0, 0.0, 0.0, 0.0, 0.0]
+let c4_naive = clip_naive(g4, 1.0)
+let c4_fused = clip_fused(g4, 1.0)
+check("T11 all-zeros naive passthrough", vec_close(c4_naive, g4, eps))
+check("T12 all-zeros fused passthrough", vec_close(c4_fused, g4, eps))
+track_diff(c4_naive, c4_fused)
+
+// ── Test 5 : single element ───────────────────────────────────────
+let g5a = [2.5]
+let c5a_naive = clip_naive(g5a, 1.0)
+let c5a_fused = clip_fused(g5a, 1.0)
+// ||g||=2.5, factor=0.4 → [1.0]
+check("T13 single-elem naive scales",   fabs_t(c5a_naive[0] - 1.0) < eps)
+check("T14 single-elem fused scales",   fabs_t(c5a_fused[0] - 1.0) < eps)
+
+let g5b = [0.3]       // below threshold
+let c5b_fused = clip_fused(g5b, 1.0)
+check("T15 single-elem <max identity",  fabs_t(c5b_fused[0] - 0.3) < eps)
+
+// ── Test 6 : empty tensor ─────────────────────────────────────────
+let g6 = []
+let c6_naive = clip_naive(g6, 1.0)
+let c6_fused = clip_fused(g6, 1.0)
+check("T16 empty naive len==0", len(c6_naive) == 0)
+check("T17 empty fused len==0", len(c6_fused) == 0)
+check("T18 empty global_norm==0", global_norm(g6) < eps)
+
+// ── Test 7 : max_norm ≤ 0 defensive no-op ─────────────────────────
+let g7 = [1.0, 2.0, 3.0]
+let c7_zero = clip_fused(g7, 0.0)
+let c7_neg  = clip_fused(g7, -5.0)
+check("T19 max=0 fused no-op",  vec_close(c7_zero, g7, eps))
+check("T20 max<0 fused no-op",  vec_close(c7_neg,  g7, eps))
+
+// ── Test 8 : fused ≡ naive over 5 random seeds, varying shapes ────
+let seeds = [7, 19, 53, 97, 131]
+let shapes = [8, 32, 64, 128, 257]        // include odd prime length
+let mut all_rand_ok = true
+for t in 0..5 {
+    let n = shapes[t]
+    let g = rand_vec(n, seeds[t])
+    // Choose max to exercise both clip branches across seeds.
+    let mx = 1.0 + (t * 1.0) * 0.3
+    let ref_out = clip_naive(g, mx)
+    let fus_out = clip_fused(g, mx)
+    let ok = vec_close(ref_out, fus_out, eps)
+    if !ok { all_rand_ok = false }
+    track_diff(ref_out, fus_out)
+    // Verify the output norm does not exceed max_norm (within fp eps).
+    let nout = vec_l2(fus_out)
+    let under_cap = nout <= mx + 1.0e-5
+    let name = "T2" + to_string(1 + t) + " rand seed " + to_string(seeds[t]) + " fused==naive"
+    check(name, ok)
+    let name2 = "T2" + to_string(6 + t) + " rand seed " + to_string(seeds[t]) + " ||out||≤max"
+    check(name2, under_cap)
+}
+
+// ── Test 9 : tree-reduce associativity (three-way pairwise vs left) ─
+// Compare gc97_tree_sum_sq via global_norm_sq_tree vs global_norm_sq
+// (linear) across random vectors — both must agree to tol 1e-6.
+let mut assoc_ok = true
+for t in 0..5 {
+    let g = rand_vec(shapes[t], seeds[t] * 3 + 11)
+    let s_lin  = global_norm_sq(g)
+    let s_tree = global_norm_sq_tree(g)
+    if fabs_t(s_lin - s_tree) > (fabs_t(s_lin) + 1.0) * 1.0e-6 {
+        assoc_ok = false
+    }
+}
+check("T31 tree-reduce ≈ linear-reduce (5 seeds)", assoc_ok)
+
+// ── Test 10 : multi-tensor list clip ─────────────────────────────
+// Global norm across three tensors.  [ [3], [4], [0] ] → ||·|| = 5.
+// With max=1, every tensor scales by 0.2.
+let t0 = [3.0]
+let t1 = [4.0]
+let t2 = [0.0]
+let tl = [t0, t1, t2]
+let gn_list = global_norm_list(tl)
+check("T32 global_norm_list = 5", fabs_t(gn_list - 5.0) < eps)
+
+let cl_naive = clip_naive_list(tl, 1.0)
+let cl_fused = clip_fused_list(tl, 1.0)
+check("T33 list clip naive len",  len(cl_naive) == 3)
+check("T34 list clip fused len",  len(cl_fused) == 3)
+check("T35 list clip t0 scaled",  fabs_t(cl_fused[0][0] - 0.6) < eps)
+check("T36 list clip t1 scaled",  fabs_t(cl_fused[1][0] - 0.8) < eps)
+check("T37 list clip t2 zero",    fabs_t(cl_fused[2][0] - 0.0) < eps)
+
+// list fused ≡ list naive across random shapes
+let t_r0 = rand_vec(16, 911)
+let t_r1 = rand_vec(24, 912)
+let t_r2 = rand_vec( 8, 913)
+let tlr  = [t_r0, t_r1, t_r2]
+let mx_lr = 0.8
+let nr = clip_naive_list(tlr, mx_lr)
+let fr = clip_fused_list(tlr, mx_lr)
+let mut list_ok = true
+for k in 0..3 {
+    if !vec_close(nr[k], fr[k], eps) { list_ok = false }
+    track_diff(nr[k], fr[k])
+}
+check("T38 list fused==naive (3 random tensors)", list_ok)
+// Verify clipped list norm ≤ max (joint cap).
+let mut ss_out = 0.0
+for k in 0..3 {
+    for i in 0..len(fr[k]) {
+        ss_out = ss_out + fr[k][i] * fr[k][i]
+    }
+}
+let out_norm = sqrt(ss_out)
+check("T39 list ||clip||≤max (global cap)", out_norm <= mx_lr + 1.0e-5)
+
+// ── Test 11 : AST marker detect/rewrite ──────────────────────────
+let m_full    = ["loop:sum_sq", "call:sqrt", "loop:scale"]
+let m_partial = ["loop:sum_sq", "loop:scale"]
+let m_vetoed  = ["loop:sum_sq", "call:sqrt", "loop:scale", "veto:noclip"]
+let m_extra   = ["loop:sum_sq", "call:sqrt", "loop:scale", "call:other"]
+check("T40 detect canonical",        detect_clip_pattern(m_full) == true)
+check("T41 detect missing sqrt",     detect_clip_pattern(m_partial) == false)
+check("T42 detect veto rejected",    detect_clip_pattern(m_vetoed) == false)
+check("T43 detect tolerates extras", detect_clip_pattern(m_extra) == true)
+check("T44 rewrite match",           rewrite_to_fused(m_full) == "clip_fused")
+check("T45 rewrite no-match",        rewrite_to_fused(m_partial) == "clip_naive")
+
+// ── Test 12 : pass accounting markers ────────────────────────────
+check("T46 naive pass count == 2",   naive_pass_count() == 2)
+check("T47 fused pass count == 1",   fused_pass_count() == 1)
+
+// ── Test 13 : global_norm matches manual sqrt(Σg²) ───────────────
+let gN = [1.0, 2.0, 2.0]        // ||g|| = 3
+check("T48 global_norm closed-form 3.0", fabs_t(global_norm(gN) - 3.0) < eps)
+check("T49 global_norm_sq closed-form 9.0", fabs_t(global_norm_sq(gN) - 9.0) < eps)
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
+println("  max_abs_diff = " + to_string(max_abs_diff))
+println("  l2_diff_accum = " + to_string(l2_diff_accum))
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[ALL PASS] ROI #97 grad_clip_fused verified")
+}

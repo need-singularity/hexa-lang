@@ -1,0 +1,248 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_grad_accumulate.hexa — ROI #95 verification.
+//
+//  Exercises the AI-native @grad_accumulate pass:
+//    (1)  reset_grads produces a zero vector of the requested length
+//    (2)  N=1 identity: finalize_grads(accumulate_step(0,g), 1) == g
+//    (3)  N=4 invariant: mean of four micro-grads == single large-batch
+//         gradient within tol 1e-6 (linear-functional check)
+//    (4)  should_step triggers at N-1, 2N-1, ...
+//    (5)  zero-reset: after finalize you must rebind the buffer
+//    (6)  partial accumulator (t < N-1): no step fires
+//    (7)  gradient-overwrite guard: accumulate_step is functional (no
+//         in-place mutation of the caller's buffer)
+//    (8)  numerical stability on small and large magnitudes
+//    (9)  AST detect_accum_pattern accepts backward+step, vetoes noaccum
+//   (10)  rewrite_accum returns the effective N and body count
+//   (11)  effective_batch / memory_saved_ratio sanity
+//   (12)  accumulate_sequence produces the same mean in one call
+// ═══════════════════════════════════════════════════════════════════
+
+use "ai_native/grad_accumulate"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn ga95_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn approx_eq_vec(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if ga95_abs(a[i] - b[i]) > tol { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn all_zero(v) {
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        if v[i] != 0.0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Linear-functional gradient simulator: grad_of(batch) = Σ samples · k
+// with k = [1.0, 2.0, 3.0] a fixed feature vector. For our invariant
+// check: mean of N per-micro-batch gradients == gradient of the
+// concatenated batch divided by N — i.e. exactly the sample mean × k.
+fn sim_grad(batch, k) {
+    let P = len(k)
+    let n = len(batch)
+    let mut out = []
+    for _i in 0..P { out = out + [0.0] }
+    for i in 0..n {
+        for p in 0..P {
+            out[p] = out[p] + batch[i] * k[p]
+        }
+    }
+    return out
+}
+
+// ── helpers for constructing test fixtures ─────────────────
+
+fn vec3(a, b, c) {
+    return [a, b, c]
+}
+
+println("=== @grad_accumulate tests ===")
+
+// ── (1) reset_grads produces a zero vector ─────────────────
+let z4 = reset_grads(4)
+check("reset: len == 4", len(z4) == 4)
+check("reset: all zero", all_zero(z4))
+let z0 = reset_grads(0)
+check("reset(0): len == 0", len(z0) == 0)
+
+// ── (2) N=1 identity: finalize(accum(0, g), 1) == g ────────
+let g1 = vec3(0.3, 0.5, 0.7)
+let buf0 = reset_grads(3)
+let acc1 = accumulate_step(buf0, g1)
+let fin1 = finalize_grads(acc1, 1)
+check("N=1 identity: finalize(accum)==g", approx_eq_vec(fin1, g1, 1.0e-6))
+check("N=1 single_step is copy",          approx_eq_vec(single_step(g1), g1, 1.0e-6))
+
+// ── (3) N=4 invariant: accumulate over 4 micro-batches ─────
+// Micro-batches split a fixed large batch of 12 samples into 4×3.
+let big_batch = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+let k3        = vec3(1.0, 2.0, 3.0)
+
+// single large-batch gradient, then / N to compare to the mean form
+let g_big = sim_grad(big_batch, k3)
+let mut g_big_mean = []
+for p in 0..len(g_big) { g_big_mean = g_big_mean + [g_big[p] / 4.0] }
+
+// accumulate the 4 micro-batches manually
+let mb0 = [big_batch[0], big_batch[1], big_batch[2]]
+let mb1 = [big_batch[3], big_batch[4], big_batch[5]]
+let mb2 = [big_batch[6], big_batch[7], big_batch[8]]
+let mb3 = [big_batch[9], big_batch[10], big_batch[11]]
+
+let gm0 = sim_grad(mb0, k3)
+let gm1 = sim_grad(mb1, k3)
+let gm2 = sim_grad(mb2, k3)
+let gm3 = sim_grad(mb3, k3)
+
+let mut bufA = reset_grads(3)
+bufA = accumulate_step(bufA, gm0)
+bufA = accumulate_step(bufA, gm1)
+bufA = accumulate_step(bufA, gm2)
+bufA = accumulate_step(bufA, gm3)
+let finA = finalize_grads(bufA, 4)
+
+check("N=4 invariant: mean(micro) == big/N within 1e-6",
+      approx_eq_vec(finA, g_big_mean, 1.0e-6))
+
+// sanity spot-check of one coord
+let expected_p0 = (1.0 + 2.0 + 3.0 + 4.0 + 5.0 + 6.0 + 7.0 + 8.0 + 9.0 + 10.0 + 11.0 + 12.0) * 1.0 / 4.0
+check("N=4 spot-check coord0", ga95_abs(finA[0] - expected_p0) < 1.0e-6)
+
+// ── (4) should_step trigger pattern ────────────────────────
+check("should_step(0,4) == false", should_step(0, 4) == false)
+check("should_step(1,4) == false", should_step(1, 4) == false)
+check("should_step(2,4) == false", should_step(2, 4) == false)
+check("should_step(3,4) == true",  should_step(3, 4) == true)
+check("should_step(7,4) == true",  should_step(7, 4) == true)
+check("should_step(0,1) == true",  should_step(0, 1) == true)
+check("should_step(5,0) == false", should_step(5, 0) == false)
+
+// ── (5) zero-reset after finalize ──────────────────────────
+// finalize must not mutate its input buffer; the caller then
+// rebinds buf = reset_grads(P) to drain.
+let mut bufR = reset_grads(3)
+bufR = accumulate_step(bufR, gm0)
+bufR = accumulate_step(bufR, gm1)
+let finR = finalize_grads(bufR, 2)
+// bufR should still hold the sum of gm0+gm1, NOT zero
+let sum01 = [gm0[0]+gm1[0], gm0[1]+gm1[1], gm0[2]+gm1[2]]
+check("zero-reset: buffer intact after finalize", approx_eq_vec(bufR, sum01, 1.0e-6))
+// caller now drains
+bufR = reset_grads(3)
+check("zero-reset: drained to zero", all_zero(bufR))
+
+// ── (6) partial accumulator: no step at t < N-1 ────────────
+let mut any_step = false
+let N_part = 4
+for t in 0..3 {
+    if should_step(t, N_part) { any_step = true }
+}
+check("partial: no step for t in 0..N-1", any_step == false)
+check("partial: step only at t == N-1", should_step(3, N_part))
+
+// ── (7) gradient overwrite guard: accumulate is functional ─
+let orig = vec3(0.1, 0.2, 0.3)
+let mut buf7 = reset_grads(3)
+buf7[0] = orig[0]
+buf7[1] = orig[1]
+buf7[2] = orig[2]
+// keep a separate snapshot
+let snap = vec3(buf7[0], buf7[1], buf7[2])
+let g7 = vec3(1.0, 1.0, 1.0)
+let res7 = accumulate_step(buf7, g7)
+check("functional: result is buf+g",     approx_eq_vec(res7, vec3(1.1, 1.2, 1.3), 1.0e-6))
+check("functional: original buf7 intact", approx_eq_vec(buf7, snap, 1.0e-6))
+
+// ── (8) numerical stability: small + large magnitudes ──────
+let small = vec3(1.0e-8, 2.0e-8, 3.0e-8)
+let large = vec3(1.0e+6, 2.0e+6, 3.0e+6)
+let mut bufS = reset_grads(3)
+for _r in 0..4 { bufS = accumulate_step(bufS, small) }
+let finS = finalize_grads(bufS, 4)
+check("stability: small mean matches", approx_eq_vec(finS, small, 1.0e-12))
+
+let mut bufL = reset_grads(3)
+for _r in 0..4 { bufL = accumulate_step(bufL, large) }
+let finL = finalize_grads(bufL, 4)
+check("stability: large mean matches", approx_eq_vec(finL, large, 1.0e-3))
+
+// ── (9) AST detect_accum_pattern ───────────────────────────
+let ok_markers  = ["call:backward", "call:step", "read:grads", "write:params"]
+let bad1        = ["call:backward", "read:grads"]                        // no step
+let bad2        = ["call:step", "read:grads"]                            // no backward
+let vetoed      = ["call:backward", "call:step", "noaccum"]
+check("AST: accept backward+step",       detect_accum_pattern(ok_markers))
+check("AST: reject missing step",        detect_accum_pattern(bad1) == false)
+check("AST: reject missing backward",    detect_accum_pattern(bad2) == false)
+check("AST: noaccum vetoes",             detect_accum_pattern(vetoed) == false)
+
+// ── (10) rewrite_accum ─────────────────────────────────────
+let tight = ["call:backward", "call:step", "memory:tight"]
+let rw1 = rewrite_accum(ok_markers, 4)
+check("rewrite ok=true",          rw1[0] == true)
+check("rewrite N_used==4",        rw1[1] == 4)
+check("rewrite body_count==2",    rw1[2] == 2)
+
+let rw2 = rewrite_accum(tight, 4)
+check("rewrite memory:tight upgrades N", rw2[1] == 8)
+
+let rw3 = rewrite_accum(vetoed, 4)
+check("rewrite ok=false under veto", rw3[0] == false)
+
+// ── (11) effective_batch / memory_saved_ratio ──────────────
+check("eff_batch(4,8)==32",   effective_batch(4, 8) == 32)
+check("eff_batch(0,8)==0",    effective_batch(0, 8) == 0)
+check("eff_batch(4,0)==0",    effective_batch(4, 0) == 0)
+check("memsave(1,B)==0",      ga95_abs(memory_saved_ratio(1, 8)) < 1.0e-9)
+check("memsave(4,B)==0.75",   ga95_abs(memory_saved_ratio(4, 8) - 0.75) < 1.0e-9)
+check("memsave(0,B)==0",      ga95_abs(memory_saved_ratio(0, 8)) < 1.0e-9)
+
+// ── (12) accumulate_sequence convenience ───────────────────
+let seq_mean = accumulate_sequence([gm0, gm1, gm2, gm3], 4)
+check("seq: one-shot mean matches manual loop",
+      approx_eq_vec(seq_mean, finA, 1.0e-6))
+
+// suggest_N hint
+check("suggest_N default 4 == 4",        suggest_N(ok_markers, 4) == 4)
+check("suggest_N tight 4 doubles to 8",  suggest_N(tight, 4) == 8)
+check("suggest_N negative -> 1",         suggest_N(ok_markers, 0) == 1)
+
+// finalize negative N is pass-through copy
+let pass_through = finalize_grads(vec3(1.0, 2.0, 3.0), 0)
+check("finalize N<=0 copy", approx_eq_vec(pass_through, vec3(1.0, 2.0, 3.0), 1.0e-9))
+
+println("")
+println("=== summary ===")
+println("  PASS: " + to_string(pass_count))
+println("  FAIL: " + to_string(fail_count))
+if fail_count == 0 {
+    println("[ALL PASS] ROI #95 grad_accumulate verified")
+} else {
+    println("[FAIL] grad_accumulate failures detected")
+}

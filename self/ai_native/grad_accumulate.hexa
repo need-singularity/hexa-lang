@@ -1,0 +1,397 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/grad_accumulate.hexa — AI-native ROI #95
+//
+//  @grad_accumulate — micro-batch gradient accumulation for training.
+//
+//  Motivation
+//  ──────────
+//  Training loops on memory-constrained devices can only fit a small
+//  per-step batch B, but the convergence curve the model actually
+//  needs was calibrated for a much larger effective batch K·B. A
+//  gradient-accumulation pass rewrites the trivial loop
+//
+//      for batch in dataset:
+//          loss = forward(model, batch)
+//          grads = backward(loss)
+//          step(optimizer, grads)
+//
+//  into
+//
+//      acc = zeros_like(params)
+//      for (t, batch) in enumerate(dataset):
+//          loss  = forward(model, batch)
+//          grads = backward(loss)
+//          acc   = acc + grads
+//          if should_step(t, N):
+//              final = acc / N
+//              step(optimizer, final)
+//              acc = zeros_like(params)
+//
+//  so the optimizer sees a once-per-N update whose value is the mean
+//  of N micro-batch gradients. Because gradient is a linear functional
+//  in the loss, and loss is a sum over samples,
+//
+//      (1/N) · Σ_{k=1..N} grad_{B_k}(θ)  ≡  grad_{concat(B_1..B_N)}(θ)
+//
+//  to round-off — the numerical invariant the test-suite pins.
+//
+//  This module is the AI-native pass: an AST-level pattern detector
+//  plus the kernel helpers the rewriter emits. It deliberately does
+//  not collide with the self/ml/gradient_accumulation.hexa reference
+//  (whose `ga_*` prefix remains the stable public API inside training
+//  scripts); here every symbol is `grad_acc_*` or `gradacc_ast_*`.
+//
+//  Public API
+//  ──────────
+//      reset_grads(n)                        -> [float]   zeros, length n
+//      accumulate_step(buffer, grads)        -> [float]   buffer += grads
+//      should_step(t, N)                     -> bool      t % N == N-1
+//      finalize_grads(buffer, N)             -> [float]   buffer / N
+//      single_step(param_grads)              -> [float]   identity (N=1 path)
+//
+//      detect_accum_pattern(markers)         -> bool      AST heuristic
+//      rewrite_accum(loop_markers, N)        -> rewrite   {ok, N, body...}
+//
+//      effective_batch(N, B)                 -> int       N · B
+//      memory_saved_ratio(N, B)              -> float     (N-1)/N  approx
+//
+//  Numerical contract
+//  ──────────────────
+//      For any linear gradient functional (the LHS we inherit from
+//      autograd),
+//          finalize_grads( accumulate_step^N(zero, g_1..g_N), N )
+//              ≡  mean(g_1..g_N)
+//      which in turn equals the gradient of the concatenated batch
+//      up to the usual float round-off. The test-suite asserts this
+//      to tol 1e-6 element-wise.
+//
+//  AST detection heuristic
+//  ───────────────────────
+//  The rewriter is driven by a list of string markers describing the
+//  shape of the inner training loop (the same marker protocol used
+//  by parallel_for.is_indep_loop). Recognised markers:
+//
+//      "call:backward"   — autograd produced fresh per-sample grads
+//      "call:step"       — optimizer.step() follows backward in-loop
+//      "read:grads"      — per-iter grads vector is consumed
+//      "write:params"    — params are overwritten by the step
+//      "memory:tight"    — caller declared the device is memory-bound
+//      "nocrossdep"      — body has no cross-iteration dependency
+//
+//  The pattern is accepted iff BOTH "call:backward" and "call:step"
+//  occur AND no marker is the sentinel "noaccum" (a caller can veto
+//  the rewrite by emitting "noaccum"). The memory:tight marker is
+//  advisory — it upgrades the suggested N but never flips the bool.
+//
+//  Pitfalls respected (HX3)
+//  ────────────────────────
+//      * no struct literals inside `if` heads — we assign first
+//      * no `and`/`or` — use `&&` / `||`
+//      * slice `[(i+1)..j]` would need parens — not used here
+//      * `let mut x = 0` typed-as-int pitfall — always seed floats
+//        with 0.0
+//      * bit-ops fine but unused
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ── tiny local helpers ─────────────────────────────────────────────
+
+@pure
+fn gradacc_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+@pure
+fn gradacc_len_eq(a, b) {
+    if len(a) != len(b) { return false }
+    return true
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  reset_grads(n) — produce a fresh zero accumulator of length n.
+//
+//  Returns a brand-new array; the caller is expected to treat the
+//  accumulator as value-typed (grads = reset_grads(P) rebinds the
+//  local slot). That matches the self/ml/gradient_accumulation.hexa
+//  convention and sidesteps the hexa in-place mutation quirks
+//  (feedback_module_box_struct_replace).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn reset_grads_impl(n) {
+    return gradacc_zeros_1d(n)
+}
+
+pub fn reset_grads(n) {
+    return reset_grads_impl(n)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  accumulate_step(buffer, grads) — buffer[i] += grads[i]  (functional)
+//
+//  Shapes: buffer:[P], grads:[P].
+//  Returns a fresh [P] array; buffer is left untouched so callers
+//  can reuse the functional style `buf = accumulate_step(buf, g)`.
+//  Mismatched lengths fall back to the buffer unchanged (defensive —
+//  a caller bug in release, still observable in tests).
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure @grad_accumulate
+fn accumulate_step_impl(buffer, grads) {
+    if gradacc_len_eq(buffer, grads) == false {
+        // shape mismatch — return a copy of buffer without corrupting
+        let n0 = len(buffer)
+        let mut safe = gradacc_zeros_1d(n0)
+        for i in 0..n0 { safe[i] = buffer[i] }
+        return safe
+    }
+    let n = len(buffer)
+    let mut out = gradacc_zeros_1d(n)
+    for i in 0..n {
+        out[i] = buffer[i] + grads[i]
+    }
+    return out
+}
+
+pub fn accumulate_step(buffer, grads) {
+    return accumulate_step_impl(buffer, grads)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  should_step(t, N) — true on micro-steps t = N-1, 2N-1, 3N-1, ...
+//
+//  Matches torch-lightning's `(batch_idx + 1) % accumulate_grad == 0`.
+//  N ≤ 0 is a degenerate config; we treat it as "never step" so the
+//  caller's buffer never drains — safer than silently returning true
+//  on every call.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn should_step_impl(t, N) {
+    if N <= 0 { return false }
+    // t % N == N-1, expressed without %.
+    let q = t / N
+    let rem = t - q * N
+    return rem == N - 1
+}
+
+pub fn should_step(t, N) {
+    return should_step_impl(t, N)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  finalize_grads(buffer, N) — divide accumulator by N before step().
+//
+//  Closed-form; N=1 returns a copy (identity semantics), N≤0 returns
+//  a copy unchanged so a misconfigured caller cannot explode on /0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn finalize_grads_impl(buffer, N) {
+    let n = len(buffer)
+    if N <= 0 {
+        let mut id = gradacc_zeros_1d(n)
+        for i in 0..n { id[i] = buffer[i] }
+        return id
+    }
+    if N == 1 {
+        let mut id = gradacc_zeros_1d(n)
+        for i in 0..n { id[i] = buffer[i] }
+        return id
+    }
+    let scale = 1.0 / (N * 1.0)
+    let mut out = gradacc_zeros_1d(n)
+    for i in 0..n {
+        out[i] = buffer[i] * scale
+    }
+    return out
+}
+
+pub fn finalize_grads(buffer, N) {
+    return finalize_grads_impl(buffer, N)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  single_step(param_grads) — degenerate N=1 case.
+//
+//  Returns a copy of the input. Exposed so the rewriter can emit the
+//  same symbol regardless of N, and the tests can assert the identity.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn single_step_impl(param_grads) {
+    let n = len(param_grads)
+    let mut out = gradacc_zeros_1d(n)
+    for i in 0..n { out[i] = param_grads[i] }
+    return out
+}
+
+pub fn single_step(param_grads) {
+    return single_step_impl(param_grads)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  effective_batch(N, B) — virtual batch the optimizer effectively sees.
+//
+//  effective = N · B. Negative / zero inputs collapse to 0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn effective_batch_impl(N, B) {
+    if N <= 0 { return 0 }
+    if B <= 0 { return 0 }
+    return N * B
+}
+
+pub fn effective_batch(N, B) {
+    return effective_batch_impl(N, B)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  memory_saved_ratio(N, B) — fraction of activation memory avoided.
+//
+//  The naive path would need N·B activations alive concurrently; the
+//  accumulator path needs B activations at a time. Ratio reported is
+//      1 - B / (N·B)  =  1 - 1/N  =  (N-1)/N.
+//  For N=1 the ratio is 0.0 (no savings); for N→∞ it tends to 1.0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn memory_saved_ratio_impl(N, B) {
+    if N <= 0 { return 0.0 }
+    if B <= 0 { return 0.0 }
+    if N == 1 { return 0.0 }
+    let nf = N * 1.0
+    return (nf - 1.0) / nf
+}
+
+pub fn memory_saved_ratio(N, B) {
+    return memory_saved_ratio_impl(N, B)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  accumulate_sequence(grads_list, N) — batch helper: apply
+//  accumulate_step over every entry of grads_list in order and then
+//  finalize. Used by the test-suite to cross-check the invariant
+//      accumulate_sequence(g_1..g_N, N)  ≡  mean(g_1..g_N)
+//  and also by the rewriter when it can fully lift the inner loop
+//  (the unrolled dispatch case).
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+fn accumulate_sequence_impl(grads_list, N) {
+    let k = len(grads_list)
+    if k == 0 { return [] }
+    let P = len(grads_list[0])
+    let mut buf = reset_grads(P)
+    for i in 0..k {
+        buf = accumulate_step(buf, grads_list[i])
+    }
+    return finalize_grads(buf, N)
+}
+
+pub fn accumulate_sequence(grads_list, N) {
+    return accumulate_sequence_impl(grads_list, N)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST-pass detect_accum_pattern(markers) — rewrite-eligibility test.
+//
+//  The marker protocol mirrors parallel_for.is_indep_loop — a list of
+//  strings describing syntactic facts about the training loop body.
+//  The rewriter runs this predicate before injecting the @attr and
+//  is intentionally conservative: both "call:backward" AND "call:step"
+//  must be present, and no "noaccum" veto may appear.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn detect_accum_pattern_impl(markers) {
+    let n = len(markers)
+    let mut has_backward = false
+    let mut has_step = false
+    let mut vetoed = false
+    let mut i = 0
+    while i < n {
+        let m = markers[i]
+        if m == "noaccum" { vetoed = true }
+        if m == "call:backward" { has_backward = true }
+        if m == "call:step" { has_step = true }
+        i = i + 1
+    }
+    if vetoed { return false }
+    if has_backward == false { return false }
+    if has_step == false { return false }
+    return true
+}
+
+pub fn detect_accum_pattern(markers) {
+    return detect_accum_pattern_impl(markers)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  suggest_N(markers, default_N) — pick a sensible accumulation factor.
+//
+//  If the caller emitted "memory:tight" we propose 2·default; otherwise
+//  the default is returned unchanged. The optimizer pass uses this
+//  as a hint — the user-level `@grad_accumulate(N=...)` override
+//  always wins.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn suggest_N_impl(markers, default_N) {
+    let n = len(markers)
+    let mut tight = false
+    let mut i = 0
+    while i < n {
+        if markers[i] == "memory:tight" { tight = true }
+        i = i + 1
+    }
+    if tight {
+        if default_N <= 0 { return 1 }
+        return default_N + default_N
+    }
+    if default_N <= 0 { return 1 }
+    return default_N
+}
+
+pub fn suggest_N(markers, default_N) {
+    return suggest_N_impl(markers, default_N)
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  rewrite_accum(markers, N) — produce a rewrite descriptor.
+//
+//  Returns a map-like array of pairs:
+//      [ok(bool), N_used(int), body_count(int)]
+//  where ok=true iff detect_accum_pattern accepted the loop and
+//  N_used is the effective accumulation factor (post suggest_N).
+//  body_count reports how many "call:*" markers the body carried
+//  (useful for an emitter that wants to preserve original call order).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rewrite_accum_impl(markers, N) {
+    let ok = detect_accum_pattern(markers)
+    let N_used = suggest_N(markers, N)
+    let n = len(markers)
+    let mut body_count = 0
+    let mut i = 0
+    while i < n {
+        let m = markers[i]
+        // count markers beginning with "call:"
+        if len(m) >= 5 {
+            let head = m.substring(0, 5)
+            if head == "call:" { body_count = body_count + 1 }
+        }
+        i = i + 1
+    }
+    return [ok, N_used, body_count]
+}
+
+pub fn rewrite_accum(markers, N) {
+    return rewrite_accum_impl(markers, N)
+}

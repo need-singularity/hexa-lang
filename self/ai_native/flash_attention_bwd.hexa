@@ -1,0 +1,614 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/flash_attention_bwd.hexa — AI-native ROI #101
+//
+//  Flash Attention BACKWARD pass (Dao 2022) — tile-wise gradient kernel
+//  paired with the forward path in self/ai_native/flash_attention.hexa.
+//
+//  Forward (recap):
+//      S = Q·K^T · scale      (S²   score matrix)
+//      P = softmax(S)         (S²   attention weights)
+//      O = P · V              (S·dv output)
+//  Backward inputs: Q, K, V, dO.
+//  Backward outputs: dQ, dK, dV — with P never persisted (HBM savings);
+//  it is RECOMPUTED inside each (q_block, kv_block) tile from Q, K and
+//  the per-row statistics (m_i, l_i) collected in a short pre-pass.
+//
+//  Gradient formulae (per row i):
+//      D_i    = <dO_i, O_i>             (scalar reduction)
+//      dP_ij  = <dO_i, V_j>             (the "score-grad" of P_ij)
+//      dS_ij  = P_ij · (dP_ij − D_i)    (softmax Jacobian shortcut)
+//      dQ_i   = sum_j dS_ij · K_j · scale
+//      dK_j   = sum_i dS_ij · Q_i · scale
+//      dV_j   = sum_i P_ij · dO_i
+//
+//  Why D_i is the right correction:
+//      ∂L/∂S_ij = P_ij · (dP_ij − ∑_k P_ik·dP_ik)
+//               = P_ij · (dP_ij − ∑_k P_ik·<dO_i, V_k>)
+//               = P_ij · (dP_ij − <dO_i, O_i>)      // since O_i = ∑_k P_ik V_k
+//      hence D_i = <dO_i, O_i>, a cheap O(dv) per-row stat.
+//
+//  Public API (2D nested arrays — Q/K/V/dO: [S, d]/[S, dv]):
+//      attention_naive_bwd(Q, K, V, dO)             -> (dQ, dK, dV)
+//      attention_naive_bwd_causal(Q, K, V, dO)      -> (dQ, dK, dV)
+//      flash_bwd_tiled(Q, K, V, dO, Br, Bc)         -> (dQ, dK, dV)
+//      flash_bwd_tiled_causal(Q, K, V, dO, Br, Bc)  -> (dQ, dK, dV)
+//      flash_bwd_default(Q, K, V, dO)               -> (dQ, dK, dV)
+//
+//  Return is a 3-element list [dQ, dK, dV] (Hexa has no tuple literal
+//  in this grammar subset — lists stand in per HX3 pitfalls).
+//
+//  Tiled recompute strategy:
+//      per query block (Br rows):
+//          fwd_stats : one sweep over KV blocks → (m_i, l_i, O_i, D_i)
+//          bwd_sweep : second sweep over KV blocks →
+//                         S_tile   = Q·K^T · scale
+//                         P_tile   = exp(S_tile − m_i) / l_i
+//                         dP_tile  = dO · V^T
+//                         dS_tile  = P_tile · (dP_tile − D_i)
+//                         dQ_i    += dS_tile · K_block · scale
+//                         dK_j    += dS_tile^T · Q_block · scale
+//                         dV_j    += P_tile^T · dO_block
+//      m_i, l_i are scalar per row — only O(S) ancillary memory
+//      across the whole pass; no S² matrix ever materialised.
+//
+//  Invariant (tests):
+//      flash_bwd_tiled(Q,K,V,dO) ≡ attention_naive_bwd(Q,K,V,dO)
+//      elementwise within tol 1e-4 (fp32).
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - slice precedence: no slicing needed here; explicit index arithmetic
+//      - no struct literals in `if` heads
+//      - no tuple return; lists are returned then destructured by index
+//      - `let mut x = 0` after string-typed let → avoid (P15)
+//
+//  AI-native attrs:
+//      @hot       — invoked every training step
+//      @parallel  — outer query-block loop independent across bq
+//      @pure      — no side effects beyond return value
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn fa101_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn fa101_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn fa101_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn fa101_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn fa101_neg_inf() {
+    return 0.0 - 1.0e30
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reference: attention_naive_bwd(Q, K, V, dO) — materialises S, P.
+//
+//  Used as the correctness oracle for flash_bwd_tiled.
+//  Math:
+//      P_i  = softmax(Q_i · K^T · scale)
+//      D_i  = <dO_i, O_i>  where  O_i = ∑_j P_ij V_j
+//      dV_j  += P_ij · dO_i
+//      dP_ij  = <dO_i, V_j>
+//      dS_ij  = P_ij · (dP_ij − D_i)
+//      dQ_i  += ∑_j dS_ij · K_j · scale
+//      dK_j  += ∑_i dS_ij · Q_i · scale
+// ═══════════════════════════════════════════════════════════════════
+fn attention_naive_bwd(Q, K, V, dO) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut dQ = fa101_zeros_2d(S, d)
+    let mut dK = fa101_zeros_2d(S, d)
+    let mut dV = fa101_zeros_2d(S, dv)
+
+    for i in 0..S {
+        // row scores
+        let mut scores = fa101_zeros_1d(S)
+        for j in 0..S {
+            let mut dot = 0.0
+            for k in 0..d {
+                dot = dot + Q[i][k] * K[j][k]
+            }
+            scores[j] = dot * scale
+        }
+
+        // softmax row
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m { m = scores[j] }
+        }
+        let mut P = fa101_zeros_1d(S)
+        let mut sum_exp = 0.0
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            P[j] = e
+            sum_exp = sum_exp + e
+        }
+        for j in 0..S {
+            P[j] = P[j] / sum_exp
+        }
+
+        // O_i = ∑_j P_ij V_j
+        let mut O_i = fa101_zeros_1d(dv)
+        for j in 0..S {
+            for k in 0..dv {
+                O_i[k] = O_i[k] + P[j] * V[j][k]
+            }
+        }
+
+        // D_i = <dO_i, O_i>
+        let mut D_i = 0.0
+        for k in 0..dv {
+            D_i = D_i + dO[i][k] * O_i[k]
+        }
+
+        // dV_j += P_ij · dO_i
+        for j in 0..S {
+            for k in 0..dv {
+                dV[j][k] = dV[j][k] + P[j] * dO[i][k]
+            }
+        }
+
+        // dP_ij, dS_ij, dQ, dK
+        for j in 0..S {
+            let mut dP_ij = 0.0
+            for k in 0..dv {
+                dP_ij = dP_ij + dO[i][k] * V[j][k]
+            }
+            let dS_ij = P[j] * (dP_ij - D_i)
+            for k in 0..d {
+                dQ[i][k] = dQ[i][k] + dS_ij * K[j][k] * scale
+                dK[j][k] = dK[j][k] + dS_ij * Q[i][k] * scale
+            }
+        }
+    }
+
+    return [dQ, dK, dV]
+}
+
+// Causal naive backward: positions j > i are masked (zero weight).
+fn attention_naive_bwd_causal(Q, K, V, dO) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut dQ = fa101_zeros_2d(S, d)
+    let mut dK = fa101_zeros_2d(S, d)
+    let mut dV = fa101_zeros_2d(S, dv)
+
+    for i in 0..S {
+        let mut scores = fa101_zeros_1d(S)
+        for j in 0..S {
+            if j > i {
+                scores[j] = fa101_neg_inf()
+            } else {
+                let mut dot = 0.0
+                for k in 0..d {
+                    dot = dot + Q[i][k] * K[j][k]
+                }
+                scores[j] = dot * scale
+            }
+        }
+
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m { m = scores[j] }
+        }
+        let mut P = fa101_zeros_1d(S)
+        let mut sum_exp = 0.0
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            P[j] = e
+            sum_exp = sum_exp + e
+        }
+        for j in 0..S {
+            P[j] = P[j] / sum_exp
+        }
+
+        let mut O_i = fa101_zeros_1d(dv)
+        for j in 0..S {
+            for k in 0..dv {
+                O_i[k] = O_i[k] + P[j] * V[j][k]
+            }
+        }
+
+        let mut D_i = 0.0
+        for k in 0..dv {
+            D_i = D_i + dO[i][k] * O_i[k]
+        }
+
+        for j in 0..S {
+            if j <= i {
+                for k in 0..dv {
+                    dV[j][k] = dV[j][k] + P[j] * dO[i][k]
+                }
+            }
+        }
+
+        for j in 0..S {
+            if j <= i {
+                let mut dP_ij = 0.0
+                for k in 0..dv {
+                    dP_ij = dP_ij + dO[i][k] * V[j][k]
+                }
+                let dS_ij = P[j] * (dP_ij - D_i)
+                for k in 0..d {
+                    dQ[i][k] = dQ[i][k] + dS_ij * K[j][k] * scale
+                    dK[j][k] = dK[j][k] + dS_ij * Q[i][k] * scale
+                }
+            }
+        }
+    }
+
+    return [dQ, dK, dV]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  fwd_stats_block(Q, K, V, bq, Br, Bc)
+//
+//  First pass per query block: tile-wise online softmax to collect
+//      row_m[qi] = running max over the full row
+//      row_l[qi] = denominator of the softmax
+//      O_block[qi][k] = the forward output (needed for D_i)
+//  Returned as [row_m, row_l, O_block] — index 0/1/2 by caller.
+//
+//  This duplicates the arithmetic in flash_attention forward; it lives
+//  here so the backward file does not need to reach into the forward
+//  one's private state (and so the forward kernel stays unchanged).
+// ═══════════════════════════════════════════════════════════════════
+fn fa101_fwd_stats_block(Q, K, V, q_start, rows, S, d, dv, scale, Bc, causal) {
+    let nc = (S + Bc - 1) / Bc
+
+    let mut row_m = fa101_zeros_1d(rows)
+    let mut row_l = fa101_zeros_1d(rows)
+    let mut O_block = fa101_zeros_2d(rows, dv)
+
+    for qi in 0..rows {
+        row_m[qi] = fa101_neg_inf()
+        row_l[qi] = 0.0
+    }
+
+    for bkv in 0..nc {
+        let kv_start = bkv * Bc
+        let kv_end = fa101_min_i(kv_start + Bc, S)
+        let cols = kv_end - kv_start
+
+        // build S_tile (masked if causal)
+        let mut S_tile = fa101_zeros_2d(rows, cols)
+        for qi in 0..rows {
+            let gq = q_start + qi
+            for kj in 0..cols {
+                let gk = kv_start + kj
+                if causal == 1 && gk > gq {
+                    S_tile[qi][kj] = fa101_neg_inf()
+                } else {
+                    let mut dot = 0.0
+                    for k in 0..d {
+                        dot = dot + Q[gq][k] * K[gk][k]
+                    }
+                    S_tile[qi][kj] = dot * scale
+                }
+            }
+        }
+
+        for qi in 0..rows {
+            // skip fully-masked rows in this tile (causal corner)
+            let mut all_masked = true
+            for kj in 0..cols {
+                if S_tile[qi][kj] > (0.0 - 1.0e29) {
+                    all_masked = false
+                }
+            }
+            if !all_masked {
+                let mut tile_max = S_tile[qi][0]
+                for kj in 1..cols {
+                    if S_tile[qi][kj] > tile_max { tile_max = S_tile[qi][kj] }
+                }
+
+                let m_old = row_m[qi]
+                let m_new = fa101_max_f(m_old, tile_max)
+                let alpha = exp(m_old - m_new)
+
+                let mut tile_sum = 0.0
+                let mut p_row = fa101_zeros_1d(cols)
+                for kj in 0..cols {
+                    let p = exp(S_tile[qi][kj] - m_new)
+                    p_row[kj] = p
+                    tile_sum = tile_sum + p
+                }
+
+                let l_new = row_l[qi] * alpha + tile_sum
+
+                for k in 0..dv {
+                    O_block[qi][k] = O_block[qi][k] * alpha
+                }
+                for kj in 0..cols {
+                    for k in 0..dv {
+                        O_block[qi][k] = O_block[qi][k] + p_row[kj] * V[kv_start + kj][k]
+                    }
+                }
+
+                row_m[qi] = m_new
+                row_l[qi] = l_new
+            }
+        }
+    }
+
+    // normalise by l to turn O_block from un-normalized sum into actual output
+    for qi in 0..rows {
+        let inv_l = 1.0 / row_l[qi]
+        for k in 0..dv {
+            O_block[qi][k] = O_block[qi][k] * inv_l
+        }
+    }
+
+    return [row_m, row_l, O_block]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flash_bwd_tiled(Q, K, V, dO, Br, Bc) — tiled backward.
+//
+//  Two-sweep scheme per query block:
+//      Sweep 1 : fa101_fwd_stats_block → (m, l, O)
+//      Sweep 2 : recompute P on the fly, accumulate dQ/dK/dV.
+//
+//  dQ accumulates inside the query block (owned by this outer loop
+//  iteration). dK, dV accumulate into shared [S,d] / [S,dv] buffers
+//  across all query blocks — sequential loop means no data race.
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn flash_bwd_tiled(Q, K, V, dO, Br, Bc) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let nr = (S + Br - 1) / Br
+    let nc = (S + Bc - 1) / Bc
+
+    let mut dQ = fa101_zeros_2d(S, d)
+    let mut dK = fa101_zeros_2d(S, d)
+    let mut dV = fa101_zeros_2d(S, dv)
+
+    for bq in 0..nr {
+        let q_start = bq * Br
+        let q_end = fa101_min_i(q_start + Br, S)
+        let rows = q_end - q_start
+
+        // sweep 1 : forward statistics + recomputed O
+        let stats = fa101_fwd_stats_block(Q, K, V, q_start, rows, S, d, dv, scale, Bc, 0)
+        let row_m = stats[0]
+        let row_l = stats[1]
+        let O_block = stats[2]
+
+        // D_i = <dO_i, O_i>
+        let mut row_D = fa101_zeros_1d(rows)
+        for qi in 0..rows {
+            let mut s = 0.0
+            for k in 0..dv {
+                s = s + dO[q_start + qi][k] * O_block[qi][k]
+            }
+            row_D[qi] = s
+        }
+
+        // sweep 2 : recompute P per tile; update dQ/dK/dV
+        for bkv in 0..nc {
+            let kv_start = bkv * Bc
+            let kv_end = fa101_min_i(kv_start + Bc, S)
+            let cols = kv_end - kv_start
+
+            // P_tile[qi][kj] = exp(Q·K^T · scale − m_i) / l_i
+            let mut P_tile = fa101_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                let gq = q_start + qi
+                let inv_l = 1.0 / row_l[qi]
+                let m_i = row_m[qi]
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let mut dot = 0.0
+                    for k in 0..d {
+                        dot = dot + Q[gq][k] * K[gk][k]
+                    }
+                    let s_ij = dot * scale
+                    P_tile[qi][kj] = exp(s_ij - m_i) * inv_l
+                }
+            }
+
+            // dV_j += ∑_i P_ij · dO_i
+            for qi in 0..rows {
+                let gq = q_start + qi
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let p = P_tile[qi][kj]
+                    for k in 0..dv {
+                        dV[gk][k] = dV[gk][k] + p * dO[gq][k]
+                    }
+                }
+            }
+
+            // dP_tile[qi][kj] = <dO_i, V_j>
+            let mut dP_tile = fa101_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                let gq = q_start + qi
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let mut s = 0.0
+                    for k in 0..dv {
+                        s = s + dO[gq][k] * V[gk][k]
+                    }
+                    dP_tile[qi][kj] = s
+                }
+            }
+
+            // dS_tile = P_tile · (dP_tile − D_i)
+            // and update dQ_i += ∑_j dS_ij · K_j · scale
+            //            dK_j += ∑_i dS_ij · Q_i · scale
+            for qi in 0..rows {
+                let gq = q_start + qi
+                let D_i = row_D[qi]
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let dS_ij = P_tile[qi][kj] * (dP_tile[qi][kj] - D_i)
+                    let w = dS_ij * scale
+                    for k in 0..d {
+                        dQ[gq][k] = dQ[gq][k] + w * K[gk][k]
+                        dK[gk][k] = dK[gk][k] + w * Q[gq][k]
+                    }
+                }
+            }
+        }
+    }
+
+    return [dQ, dK, dV]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  flash_bwd_tiled_causal(Q, K, V, dO, Br, Bc) — causal variant.
+//
+//  Masks kv > q in both sweeps: in sweep 1 (via fa101_fwd_stats_block
+//  causal=1) and in sweep 2 by zeroing P_tile entries where gk > gq.
+//  Because the masked P_tile[qi][kj] = 0, all downstream updates
+//  (dV, dP, dS) remain numerically correct without extra branches in
+//  the hot loops.
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn flash_bwd_tiled_causal(Q, K, V, dO, Br, Bc) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let nr = (S + Br - 1) / Br
+    let nc = (S + Bc - 1) / Bc
+
+    let mut dQ = fa101_zeros_2d(S, d)
+    let mut dK = fa101_zeros_2d(S, d)
+    let mut dV = fa101_zeros_2d(S, dv)
+
+    for bq in 0..nr {
+        let q_start = bq * Br
+        let q_end = fa101_min_i(q_start + Br, S)
+        let rows = q_end - q_start
+
+        let stats = fa101_fwd_stats_block(Q, K, V, q_start, rows, S, d, dv, scale, Bc, 1)
+        let row_m = stats[0]
+        let row_l = stats[1]
+        let O_block = stats[2]
+
+        let mut row_D = fa101_zeros_1d(rows)
+        for qi in 0..rows {
+            let mut s = 0.0
+            for k in 0..dv {
+                s = s + dO[q_start + qi][k] * O_block[qi][k]
+            }
+            row_D[qi] = s
+        }
+
+        for bkv in 0..nc {
+            let kv_start = bkv * Bc
+            let kv_end = fa101_min_i(kv_start + Bc, S)
+            let cols = kv_end - kv_start
+
+            // P_tile with causal mask
+            let mut P_tile = fa101_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                let gq = q_start + qi
+                // rows where l_i stayed at 0 are degenerate (fully-masked);
+                // emit all-zero P for them to keep arithmetic finite.
+                let l_i = row_l[qi]
+                if l_i > 0.0 {
+                    let inv_l = 1.0 / l_i
+                    let m_i = row_m[qi]
+                    for kj in 0..cols {
+                        let gk = kv_start + kj
+                        if gk <= gq {
+                            let mut dot = 0.0
+                            for k in 0..d {
+                                dot = dot + Q[gq][k] * K[gk][k]
+                            }
+                            let s_ij = dot * scale
+                            P_tile[qi][kj] = exp(s_ij - m_i) * inv_l
+                        }
+                    }
+                }
+            }
+
+            for qi in 0..rows {
+                let gq = q_start + qi
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let p = P_tile[qi][kj]
+                    if p > 0.0 || p < 0.0 {
+                        for k in 0..dv {
+                            dV[gk][k] = dV[gk][k] + p * dO[gq][k]
+                        }
+                    }
+                }
+            }
+
+            let mut dP_tile = fa101_zeros_2d(rows, cols)
+            for qi in 0..rows {
+                let gq = q_start + qi
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    if gk <= gq {
+                        let mut s = 0.0
+                        for k in 0..dv {
+                            s = s + dO[gq][k] * V[gk][k]
+                        }
+                        dP_tile[qi][kj] = s
+                    }
+                }
+            }
+
+            for qi in 0..rows {
+                let gq = q_start + qi
+                let D_i = row_D[qi]
+                for kj in 0..cols {
+                    let gk = kv_start + kj
+                    let p = P_tile[qi][kj]
+                    // p == 0 for masked entries → dS_ij == 0 already
+                    let dS_ij = p * (dP_tile[qi][kj] - D_i)
+                    let w = dS_ij * scale
+                    for k in 0..d {
+                        dQ[gq][k] = dQ[gq][k] + w * K[gk][k]
+                        dK[gk][k] = dK[gk][k] + w * Q[gq][k]
+                    }
+                }
+            }
+        }
+    }
+
+    return [dQ, dK, dV]
+}
+
+// Convenience default: Br=64, Bc=64 CPU cache-friendly tiles.
+fn flash_bwd_default(Q, K, V, dO) {
+    return flash_bwd_tiled(Q, K, V, dO, 64, 64)
+}

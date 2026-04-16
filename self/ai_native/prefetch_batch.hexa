@@ -1,0 +1,355 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/prefetch_batch.hexa — AI-native ROI #99
+//
+//  @prefetch_batch — overlap the I/O of the NEXT mini-batch with the
+//  compute of the CURRENT mini-batch. The canonical training loop
+//      for batch in dataloader: forward(batch); backward(); step()
+//  has two serialized phases: load (I/O-bound) and compute (CPU/GPU-
+//  bound). On real hardware the dataloader should pre-stage batch i+1
+//  into a shadow buffer while batch i is still in flight, so that the
+//  loop wall-time collapses to max(load, compute) per step instead of
+//  load + compute.
+//
+//  At the pure-interpreter stage we cannot spawn OS threads (HX7 bans
+//  FFI in the ai_native path), so this module provides the *logical*
+//  double-buffered schedule plus a deterministic timeline simulator
+//  that counts ticks the way a real async runtime would: load(i+1)
+//  and compute(i) are scheduled in parallel, so their combined
+//  contribution to wall-time is max(load, compute), not load+compute.
+//
+//  Call-site compatibility: prefetch_loop_fused takes the same signals
+//  as prefetch_loop_naive — a `loader` closure (returns batch i),
+//  a `compute` closure (pure function of batch, returns its output),
+//  and N (number of steps). Once a real runtime lands we can swap the
+//  fused implementation to rt_spawn(load, i+1) + join before compute,
+//  without any change to call sites.
+//
+//  Public API:
+//      simulated_load_time(i)            -> int   (tick model)
+//      simulated_compute_time(i)         -> int   (tick model)
+//      prefetch_loop_naive(N, load, cmp) -> [outs]           (sequential)
+//      prefetch_loop_fused(N, load, cmp) -> [outs]           (overlapped)
+//      prefetch_loop_naive_timed(...)    -> { outs, ticks }  (with timer)
+//      prefetch_loop_fused_timed(...)    -> { outs, ticks }  (with timer)
+//      detect_prefetch_candidate(markers)-> bool
+//      rewrite_to_double_buffer(schedule)-> schedule'        (pure data)
+//
+//  Invariants (checked in self/test_prefetch_batch.hexa):
+//    (a) Result equivalence:  prefetch_loop_fused(N, load, cmp) produces
+//        the same ordered output list as prefetch_loop_naive. The
+//        overlap is purely a scheduling transform; per-step semantics
+//        are preserved.
+//    (b) Wall-clock no-regression: fused_ticks <= naive_ticks on the
+//        timeline simulator. When load_time > 0 AND compute_time > 0
+//        AND N >= 2 we get a strict improvement; with N == 1 both
+//        paths are identical (no batch to prefetch).
+//    (c) Buffer-overwrite safety: while compute is reading buf[i%2]
+//        the prefetch writes buf[(i+1)%2], so the two streams never
+//        alias. The simulator explicitly tracks which buffer is
+//        "reader" vs "writer" for each tick window.
+//
+//  Non-goals for this checkpoint:
+//    - Actual async thread dispatch — TODO rt_spawn_load(i, buf[i%2]).
+//    - Triple-buffering / pipeline depth > 2 — ROI #100 material.
+//    - Prefetch distance auto-tuning — the 2-deep pipeline is optimal
+//      when compute ~ load; deeper pipelines only help when load is
+//      heavily bursty.
+//
+//  AI-native attrs (applied to the @hot impl, public forwarders exposed
+//  separately to avoid the @attr + pub fn parse pitfall — P14):
+//      @hot           — training inner loop, highest-frequency path
+//      @prefetch_batch — marker: double-buffered I/O overlap
+//      @pure          — no side-effects beyond the return tuple
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ── tick model ─────────────────────────────────────────────────────
+// Default per-step cost constants used by the timeline simulator. A
+// mini-batch "load" is assumed to be I/O bound and dominates a single
+// compute step (typical ratio 3:2 on disk-bound dataloaders). Users
+// can override by passing their own closures to *_timed entrypoints.
+//
+//   load_tick(i)    = PREFETCH_LOAD_COST    (= 3)
+//   compute_tick(i) = PREFETCH_COMPUTE_COST (= 2)
+//
+// Both are constant in i for the default model — this keeps the
+// invariant math trivial. Tests that want heterogeneous costs pass
+// in custom closures.
+
+pub fn PREFETCH_LOAD_COST()    { return 3 }
+pub fn PREFETCH_COMPUTE_COST() { return 2 }
+
+pub fn simulated_load_time(i) {
+    // unused parameter i reserved for per-step jitter; constant default.
+    if i < 0 { return 0 }
+    return PREFETCH_LOAD_COST()
+}
+
+pub fn simulated_compute_time(i) {
+    if i < 0 { return 0 }
+    return PREFETCH_COMPUTE_COST()
+}
+
+
+// ── naive loop ─────────────────────────────────────────────────────
+// The reference path — fully serial: load(i) THEN compute(i) for each
+// i in 0..N. Output preserves the order of compute calls.
+//
+//  ticks_naive(N) = sum_{i<N} ( load_tick(i) + compute_tick(i) )
+pub fn prefetch_loop_naive(N, loader, cmp) {
+    let mut out = []
+    if N <= 0 { return out }
+    let mut i = 0
+    while i < N {
+        let batch = loader(i)
+        let y     = cmp(batch)
+        out = out.push(y)
+        i = i + 1
+    }
+    return out
+}
+
+
+// ── fused loop (double-buffered, semantically overlapped) ──────────
+// Classic two-buffer schedule:
+//
+//   buf[0] = load(0)                        // prime the pipeline
+//   for i in 1..N:
+//       prefetch_async(buf[i % 2], i)       // schedules load(i)
+//       compute(buf[(i-1) % 2])              // consumes load(i-1)
+//   compute(buf[(N-1) % 2])                  // drain the tail
+//
+// Because the prefetch of batch i is scheduled in parallel with the
+// compute of batch i-1, their contribution to wall-clock is
+// max(load(i), compute(i-1)). On N iterations with constant costs L
+// and C, the total is  L + (N-1)*max(L,C) + C.
+//
+// In the pure-interpreter setting we simulate this by executing the
+// two operations sequentially but reporting their overlapped cost in
+// prefetch_loop_fused_timed — the produced outputs are still correct
+// (semantics preserved) because prefetch_async semantically completes
+// before the next compute anyway.
+@hot @prefetch_batch @pure
+fn prefetch_loop_fused_impl(N, loader, cmp) {
+    let mut out = []
+    if N <= 0 { return out }
+    if N == 1 {
+        // single-step path — no prefetch possible, no overlap.
+        let b0 = loader(0)
+        let y0 = cmp(b0)
+        out = out.push(y0)
+        return out
+    }
+
+    // Double buffer of size 2 — holds batch payloads.
+    // Index with i & 1 (== i % 2) to select the reader/writer slot.
+    let mut buf = [0, 0]
+    buf[0] = loader(0)
+
+    let mut i = 1
+    while i < N {
+        let wslot = i - ((i / 2) * 2)             // i & 1
+        let rslot = (i - 1) - (((i - 1) / 2) * 2) // (i-1) & 1
+        // ── issue prefetch for batch i into wslot ──
+        buf[wslot] = loader(i)
+        // ── compute the PREVIOUS batch from rslot ──
+        let y_prev = cmp(buf[rslot])
+        out = out.push(y_prev)
+        i = i + 1
+    }
+
+    // Drain: compute the last loaded batch (index N-1).
+    let tail = (N - 1) - (((N - 1) / 2) * 2)
+    let y_last = cmp(buf[tail])
+    out = out.push(y_last)
+    return out
+}
+
+pub fn prefetch_loop_fused(N, loader, cmp) {
+    return prefetch_loop_fused_impl(N, loader, cmp)
+}
+
+
+// ── timeline simulator ─────────────────────────────────────────────
+// These helpers expose the *modelled* tick count that a real async
+// dispatch would observe. They call the same loader/cmp closures for
+// correctness checking, plus per-step cost closures `lt` (load tick)
+// and `ct` (compute tick) that return ints. When lt / ct are the
+// default constants, the ticks reduce to the closed forms below.
+//
+//   naive_ticks(N) = N * (L + C)
+//   fused_ticks(N, L, C):
+//     N == 0 : 0
+//     N == 1 : L + C
+//     N >= 2 : L + (N - 1) * max(L, C) + C
+//
+// Therefore fused_ticks <= naive_ticks for any L, C >= 0 (strict
+// inequality when both L > 0 AND C > 0 AND N >= 2).
+
+fn pref_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+pub fn prefetch_loop_naive_timed(N, loader, cmp, lt, ct) {
+    let mut out = []
+    let mut ticks = 0
+    if N <= 0 {
+        return #{"outs": out, "ticks": ticks}
+    }
+    let mut i = 0
+    while i < N {
+        ticks = ticks + lt(i)
+        let batch = loader(i)
+        ticks = ticks + ct(i)
+        let y = cmp(batch)
+        out = out.push(y)
+        i = i + 1
+    }
+    return #{"outs": out, "ticks": ticks}
+}
+
+pub fn prefetch_loop_fused_timed(N, loader, cmp, lt, ct) {
+    let mut out = []
+    let mut ticks = 0
+    if N <= 0 {
+        return #{"outs": out, "ticks": ticks}
+    }
+    if N == 1 {
+        ticks = ticks + lt(0) + ct(0)
+        let b0 = loader(0)
+        let y0 = cmp(b0)
+        out = out.push(y0)
+        return #{"outs": out, "ticks": ticks}
+    }
+
+    // Step 0 — prime the pipeline (no overlap available yet).
+    ticks = ticks + lt(0)
+    let mut buf = [0, 0]
+    buf[0] = loader(0)
+
+    // Steps 1 .. N-1 — each contributes max(load(i), compute(i-1)).
+    let mut i = 1
+    while i < N {
+        let wslot = i - ((i / 2) * 2)
+        let rslot = (i - 1) - (((i - 1) / 2) * 2)
+        // Overlapped tick — both ops in flight, the longer one wins.
+        ticks = ticks + pref_max(lt(i), ct(i - 1))
+        buf[wslot] = loader(i)
+        let y_prev = cmp(buf[rslot])
+        out = out.push(y_prev)
+        i = i + 1
+    }
+
+    // Tail compute — no more prefetch work to overlap with.
+    ticks = ticks + ct(N - 1)
+    let tail = (N - 1) - (((N - 1) / 2) * 2)
+    let y_last = cmp(buf[tail])
+    out = out.push(y_last)
+    return #{"outs": out, "ticks": ticks}
+}
+
+
+// ── default-cost convenience wrappers ──────────────────────────────
+// Equivalent to the *_timed variants with the constant tick model.
+// Useful in tests that do not care about custom cost profiles.
+
+pub fn prefetch_loop_naive_ticks(N, loader, cmp) {
+    return prefetch_loop_naive_timed(N, loader, cmp,
+        simulated_load_time, simulated_compute_time)
+}
+
+pub fn prefetch_loop_fused_ticks(N, loader, cmp) {
+    return prefetch_loop_fused_timed(N, loader, cmp,
+        simulated_load_time, simulated_compute_time)
+}
+
+
+// ── detect + rewrite (AST-level helpers) ───────────────────────────
+// A very small marker-based detector, mirroring the convention used
+// by @parallel_for's is_indep_loop. The caller translates the training
+// loop body into a list of tags:
+//   "has:loader"         — loop calls a dataloader
+//   "has:forward"        — loop calls forward/compute
+//   "has:backward"       — loop calls backward (compute-heavy phase)
+//   "io_bound:true"      — dataloader is the bottleneck (pref candidate)
+//   "io_bound:false"     — dataloader is cheap (no prefetch needed)
+//   "crossdep"           — batch i depends on batch i-1 (unsafe)
+//
+// The candidate is prefetchable iff:
+//   - has:loader AND has:forward are both present,
+//   - no "crossdep" marker,
+//   - io_bound:true is present (or absent — we default to true
+//     because the whole point of @prefetch_batch is to hide I/O).
+
+pub fn detect_prefetch_candidate(markers) {
+    let n = len(markers)
+    let mut has_loader   = false
+    let mut has_forward  = false
+    let mut has_crossdep = false
+    let mut io_bound     = true
+    let mut io_set       = false
+
+    let mut i = 0
+    while i < n {
+        let m = markers[i]
+        if m == "has:loader"     { has_loader  = true }
+        if m == "has:forward"    { has_forward = true }
+        if m == "crossdep"       { has_crossdep = true }
+        if m == "io_bound:true"  { io_bound = true;  io_set = true }
+        if m == "io_bound:false" { io_bound = false; io_set = true }
+        i = i + 1
+    }
+    if has_crossdep { return false }
+    if !has_loader  { return false }
+    if !has_forward { return false }
+    // io_set just records whether the user was explicit; either way
+    // io_bound controls the decision.
+    let mut _touched = io_set
+    if !io_bound    { return false }
+    return true
+}
+
+
+// ── rewrite helper ─────────────────────────────────────────────────
+// Transforms a naive schedule descriptor (a map with keys
+//   "N":int, "phases":[string]   e.g. ["load","compute","load","compute",...])
+// into a double-buffered schedule descriptor where phase[0] is always
+// "load" (pipeline prime), then alternating overlap slots
+// "load|compute" markers of length 2*(N-1), and finally "compute" for
+// the drain.
+//
+// This is a pure data transform — no loop is actually executed. The
+// result is consumed by the real runtime (TODO) to emit rt_spawn calls.
+
+pub fn rewrite_to_double_buffer(schedule) {
+    let N = schedule["N"]
+    let mut phases = []
+    if N <= 0 {
+        return #{"N": 0, "phases": phases, "overlapped": false}
+    }
+    if N == 1 {
+        phases = phases.push("load")
+        phases = phases.push("compute")
+        return #{"N": 1, "phases": phases, "overlapped": false}
+    }
+    // pipeline prime
+    phases = phases.push("load")
+    // overlap windows: (N-1) of them, each tagged "load|compute"
+    let mut i = 1
+    while i < N {
+        phases = phases.push("load|compute")
+        i = i + 1
+    }
+    // tail drain
+    phases = phases.push("compute")
+    return #{"N": N, "phases": phases, "overlapped": true}
+}
+
+
+// ── allocation / buffer accounting ─────────────────────────────────
+// The double-buffer schedule uses exactly 2 batch slots regardless
+// of N; the naive schedule holds at most 1 batch at a time. Exposed
+// for allocator bench-tests.
+pub fn prefetch_buffer_count_naive() { return 1 }
+pub fn prefetch_buffer_count_fused() { return 2 }

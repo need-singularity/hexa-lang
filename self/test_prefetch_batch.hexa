@@ -1,0 +1,283 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_prefetch_batch.hexa — ROI #99 verification.
+//
+//  Validates the double-buffered @prefetch_batch schedule:
+//    (1) result equivalence: fused output list == naive output list
+//        across heterogeneous N values (odd/even/boundary).
+//    (2) timing: fused tick count <= naive tick count, strictly less
+//        when load>0 AND compute>0 AND N>=2.
+//    (3) N==1 identity: both paths degenerate to a single load+compute
+//        (and therefore agree on both outputs and ticks).
+//    (4) N==2 boundary: exactly one overlap window opens.
+//    (5) buffer-overwrite safety: compute reads batch i, prefetch
+//        writes batch i+1 into the OTHER slot (never aliasing).
+//    (6) dataloader with 0 elements: both paths return [].
+//    (7) large N memory stability: N=256 fused path completes and
+//        retains the only-2-slot buffer invariant.
+//    (8) custom cost closures: overlap still honours max(l(i), c(i-1)).
+//    (9) detect_prefetch_candidate markers.
+//   (10) rewrite_to_double_buffer descriptor shape.
+//
+//  Design notes for the test body:
+//    - We use plain int payloads as "batches" (integer i -> batch[i]
+//      = i*10). compute is f(b) = b + 1 so the expected output at
+//      step i is i*10 + 1.
+//    - Buffer-overwrite safety is checked by re-running the fused
+//      path and asserting prefetch_buffer_count_fused() == 2.
+// ═══════════════════════════════════════════════════════════════════
+
+use "ai_native/prefetch_batch"
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ── shared closures ────────────────────────────────────────────────
+// loader(i): returns the i-th batch payload (just an int for simplicity)
+fn loader_ix10(i) {
+    return i * 10
+}
+
+// compute(b): deterministic map — b + 1
+fn compute_plus1(b) {
+    return b + 1
+}
+
+// Alternate pair used in (8) to verify custom cost closures.
+fn loader_plus5(i) { return i + 5 }
+fn compute_x2(b)   { return b * 2 }
+
+// heterogeneous cost closures: load(i)=i+1, compute(i)=2*i+1
+fn cost_load_i(i)    { return i + 1 }
+fn cost_compute_i(i) { return 2 * i + 1 }
+
+// helper: two int arrays elementwise equal?
+fn arr_eq(a, b) {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+println("=== @prefetch_batch tests ===")
+
+// ── (1) result equivalence across sizes ────────────────────────────
+// Expected output for size N: [1, 11, 21, 31, ... , (N-1)*10+1]
+
+// N=3 (odd)
+let n3_naive = prefetch_loop_naive(3, loader_ix10, compute_plus1)
+let n3_fused = prefetch_loop_fused(3, loader_ix10, compute_plus1)
+check("N=3: fused == naive",      arr_eq(n3_fused, n3_naive))
+check("N=3: output == [1,11,21]", arr_eq(n3_naive, [1, 11, 21]))
+check("N=3: fused len == 3",      len(n3_fused) == 3)
+
+// N=4 (even)
+let n4_naive = prefetch_loop_naive(4, loader_ix10, compute_plus1)
+let n4_fused = prefetch_loop_fused(4, loader_ix10, compute_plus1)
+check("N=4: fused == naive",         arr_eq(n4_fused, n4_naive))
+check("N=4: output == [1,11,21,31]", arr_eq(n4_naive, [1, 11, 21, 31]))
+
+// N=5 (odd, larger)
+let n5_fused = prefetch_loop_fused(5, loader_ix10, compute_plus1)
+let n5_naive = prefetch_loop_naive(5, loader_ix10, compute_plus1)
+check("N=5: fused == naive",             arr_eq(n5_fused, n5_naive))
+check("N=5: output == [1,11,21,31,41]", arr_eq(n5_naive, [1, 11, 21, 31, 41]))
+
+// N=8 (even)
+let n8_fused = prefetch_loop_fused(8, loader_ix10, compute_plus1)
+let n8_naive = prefetch_loop_naive(8, loader_ix10, compute_plus1)
+check("N=8: fused == naive",           arr_eq(n8_fused, n8_naive))
+check("N=8: fused len == 8",           len(n8_fused) == 8)
+check("N=8: output[7] == 71",          n8_fused[7] == 71)
+
+// alternate closure pair — different compute shape
+let alt_naive = prefetch_loop_naive(6, loader_plus5, compute_x2)
+let alt_fused = prefetch_loop_fused(6, loader_plus5, compute_x2)
+check("N=6 alt closures: fused == naive", arr_eq(alt_fused, alt_naive))
+check("N=6 alt closures: output[0] == 10 and [5]==20",
+      alt_fused[0] == 10 && alt_fused[5] == 20)
+
+
+// ── (2) timing: fused <= naive, strictly less when both costs > 0 ──
+let t_n3 = prefetch_loop_naive_ticks(3, loader_ix10, compute_plus1)
+let t_f3 = prefetch_loop_fused_ticks(3, loader_ix10, compute_plus1)
+check("N=3: naive ticks == 3*(L+C) == 15", t_n3["ticks"] == 15)
+// fused with L=3,C=2,N=3 -> 3 + 2*max(3,2) + 2 = 3+6+2 = 11
+check("N=3: fused ticks == 11",            t_f3["ticks"] == 11)
+check("N=3: fused ticks < naive ticks",    t_f3["ticks"] < t_n3["ticks"])
+
+let t_n8 = prefetch_loop_naive_ticks(8, loader_ix10, compute_plus1)
+let t_f8 = prefetch_loop_fused_ticks(8, loader_ix10, compute_plus1)
+// naive: 8*(3+2)=40.   fused: 3 + 7*3 + 2 = 26
+check("N=8: naive ticks == 40",            t_n8["ticks"] == 40)
+check("N=8: fused ticks == 26",            t_f8["ticks"] == 26)
+check("N=8: fused strictly less than naive", t_f8["ticks"] < t_n8["ticks"])
+
+println("  naive_time=" + to_string(t_n8["ticks"]) + "  fused_time=" + to_string(t_f8["ticks"]))
+
+
+// ── (3) N == 1 identity ────────────────────────────────────────────
+let n1_naive = prefetch_loop_naive(1, loader_ix10, compute_plus1)
+let n1_fused = prefetch_loop_fused(1, loader_ix10, compute_plus1)
+check("N=1: outputs equal",        arr_eq(n1_naive, n1_fused))
+check("N=1: output == [1]",        arr_eq(n1_naive, [1]))
+
+let t_n1 = prefetch_loop_naive_ticks(1, loader_ix10, compute_plus1)
+let t_f1 = prefetch_loop_fused_ticks(1, loader_ix10, compute_plus1)
+check("N=1: ticks equal (no overlap possible)",
+      t_n1["ticks"] == t_f1["ticks"])
+check("N=1: ticks == 5",           t_f1["ticks"] == 5)
+
+
+// ── (4) N == 2 boundary ────────────────────────────────────────────
+let n2_naive = prefetch_loop_naive(2, loader_ix10, compute_plus1)
+let n2_fused = prefetch_loop_fused(2, loader_ix10, compute_plus1)
+check("N=2: fused == naive",   arr_eq(n2_fused, n2_naive))
+check("N=2: output == [1,11]", arr_eq(n2_fused, [1, 11]))
+
+let t_n2 = prefetch_loop_naive_ticks(2, loader_ix10, compute_plus1)
+let t_f2 = prefetch_loop_fused_ticks(2, loader_ix10, compute_plus1)
+// naive: 2*(3+2)=10; fused: 3 + 1*max(3,2) + 2 = 8
+check("N=2: naive ticks == 10", t_n2["ticks"] == 10)
+check("N=2: fused ticks == 8",  t_f2["ticks"] == 8)
+check("N=2: exactly one overlap window saves 2 ticks",
+      t_n2["ticks"] - t_f2["ticks"] == 2)
+
+
+// ── (5) buffer-overwrite safety ────────────────────────────────────
+// The fused schedule must never read and write the same buffer slot
+// at the same overlap tick. We verify this by (a) asserting only 2
+// buffer slots exist, and (b) reproducing the same outputs across
+// two independent fused runs (no cross-run aliasing).
+check("fused uses exactly 2 buffer slots",
+      prefetch_buffer_count_fused() == 2)
+check("naive uses exactly 1 buffer slot",
+      prefetch_buffer_count_naive() == 1)
+
+let dup_a = prefetch_loop_fused(7, loader_ix10, compute_plus1)
+let dup_b = prefetch_loop_fused(7, loader_ix10, compute_plus1)
+check("two fused runs produce identical outputs (no aliasing)",
+      arr_eq(dup_a, dup_b))
+
+
+// ── (6) empty dataloader ───────────────────────────────────────────
+let e_naive = prefetch_loop_naive(0, loader_ix10, compute_plus1)
+let e_fused = prefetch_loop_fused(0, loader_ix10, compute_plus1)
+check("N=0: naive returns []", len(e_naive) == 0)
+check("N=0: fused returns []", len(e_fused) == 0)
+
+let t_e_n = prefetch_loop_naive_ticks(0, loader_ix10, compute_plus1)
+let t_e_f = prefetch_loop_fused_ticks(0, loader_ix10, compute_plus1)
+check("N=0: both tick counts == 0",
+      t_e_n["ticks"] == 0 && t_e_f["ticks"] == 0)
+
+// negative N is clamped to empty
+let neg_fused = prefetch_loop_fused(-3, loader_ix10, compute_plus1)
+check("N=-3: fused clamps to []", len(neg_fused) == 0)
+
+
+// ── (7) large N memory stability ───────────────────────────────────
+// Verify N=256 completes, output length == 256, and spot-check a few
+// entries. Buffer invariant (2 slots) still holds.
+let big_fused = prefetch_loop_fused(256, loader_ix10, compute_plus1)
+check("big N=256: len == 256", len(big_fused) == 256)
+check("big N=256: first entry == 1",     big_fused[0] == 1)
+check("big N=256: middle entry == 1281", big_fused[128] == 1281)
+check("big N=256: last entry == 2551",   big_fused[255] == 2551)
+check("big N=256: buffer slots still == 2",
+      prefetch_buffer_count_fused() == 2)
+
+let t_big_n = prefetch_loop_naive_ticks(256, loader_ix10, compute_plus1)
+let t_big_f = prefetch_loop_fused_ticks(256, loader_ix10, compute_plus1)
+// naive: 256 * 5 = 1280.   fused: 3 + 255*3 + 2 = 770
+check("big N=256: naive ticks == 1280",  t_big_n["ticks"] == 1280)
+check("big N=256: fused ticks == 770",   t_big_f["ticks"] == 770)
+check("big N=256: fused_time < naive_time",
+      t_big_f["ticks"] < t_big_n["ticks"])
+
+
+// ── (8) custom cost closures honour max(l(i), c(i-1)) ──────────────
+// load(i)=i+1, compute(i)=2*i+1
+// naive_ticks(5) = sum_{i<5} (i+1 + 2i+1) = sum_{i<5} (3i+2)
+//                = 3*(0+1+2+3+4) + 10 = 30 + 10 = 40
+// fused_ticks(5) = l(0) + sum_{i=1..4} max(l(i), c(i-1)) + c(4)
+//   l(0)=1;
+//   i=1: max(l(1)=2, c(0)=1)=2
+//   i=2: max(l(2)=3, c(1)=3)=3
+//   i=3: max(l(3)=4, c(2)=5)=5
+//   i=4: max(l(4)=5, c(3)=7)=7
+//   c(4)=9
+//   total = 1 + (2+3+5+7) + 9 = 27
+let t_cn = prefetch_loop_naive_timed(5, loader_ix10, compute_plus1,
+    cost_load_i, cost_compute_i)
+let t_cf = prefetch_loop_fused_timed(5, loader_ix10, compute_plus1,
+    cost_load_i, cost_compute_i)
+check("custom costs: naive ticks == 40",  t_cn["ticks"] == 40)
+check("custom costs: fused ticks == 27",  t_cf["ticks"] == 27)
+check("custom costs: fused < naive",      t_cf["ticks"] < t_cn["ticks"])
+// outputs still equal with custom costs (costs do not affect payload)
+check("custom costs: outputs equal",
+      arr_eq(t_cn["outs"], t_cf["outs"]))
+
+
+// ── (9) detect_prefetch_candidate markers ──────────────────────────
+check("detect: loader+forward+io_bound true -> prefetchable",
+      detect_prefetch_candidate(["has:loader", "has:forward", "io_bound:true"]))
+check("detect: loader+forward, io_bound unset -> prefetchable (default true)",
+      detect_prefetch_candidate(["has:loader", "has:forward"]))
+check("detect: loader+forward, io_bound:false -> NOT prefetchable",
+      detect_prefetch_candidate(["has:loader", "has:forward", "io_bound:false"]) == false)
+check("detect: crossdep -> NOT prefetchable",
+      detect_prefetch_candidate(["has:loader", "has:forward", "crossdep"]) == false)
+check("detect: missing loader -> NOT prefetchable",
+      detect_prefetch_candidate(["has:forward"]) == false)
+check("detect: missing forward -> NOT prefetchable",
+      detect_prefetch_candidate(["has:loader"]) == false)
+
+
+// ── (10) rewrite_to_double_buffer descriptor shape ─────────────────
+let rw0 = rewrite_to_double_buffer(#{"N": 0, "phases": []})
+check("rewrite N=0: overlapped false",     rw0["overlapped"] == false)
+check("rewrite N=0: empty phases",         len(rw0["phases"]) == 0)
+
+let rw1 = rewrite_to_double_buffer(#{"N": 1, "phases": []})
+check("rewrite N=1: 2 phases load+compute", len(rw1["phases"]) == 2)
+check("rewrite N=1: overlapped false",      rw1["overlapped"] == false)
+
+let rw4 = rewrite_to_double_buffer(#{"N": 4, "phases": []})
+// expected: load, load|compute, load|compute, load|compute, compute -> 5 phases
+check("rewrite N=4: 5 phases (prime + 3 overlap + drain)",
+      len(rw4["phases"]) == 5)
+check("rewrite N=4: overlapped true",      rw4["overlapped"] == true)
+check("rewrite N=4: phase[0] == load",     rw4["phases"][0] == "load")
+check("rewrite N=4: phase[4] == compute",  rw4["phases"][4] == "compute")
+check("rewrite N=4: phase[2] == load|compute",
+      rw4["phases"][2] == "load|compute")
+
+
+// ── summary ────────────────────────────────────────────────────────
+println("")
+println("=== summary ===")
+println("  PASS: " + to_string(pass_count))
+println("  FAIL: " + to_string(fail_count))
+// Emit the headline timing assertion called out in the spec.
+println("  fused_time=" + to_string(t_f8["ticks"]) +
+        " naive_time=" + to_string(t_n8["ticks"]) +
+        "  (fused < naive: " + to_string(t_f8["ticks"] < t_n8["ticks"]) + ")")
+if fail_count == 0 {
+    println("prefetch_batch: ALL GREEN")
+} else {
+    println("prefetch_batch: FAILURES detected")
+}

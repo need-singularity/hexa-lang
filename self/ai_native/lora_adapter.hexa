@@ -1,0 +1,394 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/lora_adapter.hexa — AI-native ROI #100
+//
+//  @lora_adapter — Low-Rank Adapter (LoRA) auto-injection pass.
+//
+//  LoRA fine-tuning replaces full matrix updates with a rank-r
+//  residual branch so fine-tuning a 14B→32B scale model only touches
+//  a tiny fraction of parameters. For a frozen linear layer
+//
+//      y = x · W                   x:[in], W:[in,out]
+//
+//  LoRA augments it with a trainable rank-r residual
+//
+//      y = x · W + scale · x · A · B     A:[in,r], B:[r,out]
+//
+//  with r << min(in, out) (typical r = 4…64). Only A and B receive
+//  gradients — W stays frozen. At inference time A·B can be folded
+//  back into W (merge_lora_weights) to keep the deployed model shape
+//  identical to the non-adapted base.
+//
+//  AI-native graph pass
+//  ────────────────────
+//  The pass walks the AST, finds every Linear(W) node that carries a
+//  `frozen` flag and has no attached adapter, and rewrites the node
+//  to LoraLinear(W, A=0, B~small) initialised so the residual branch
+//  evaluates to zero at step 0 (x·A·B ≡ 0 because A = 0). From that
+//  point forward training updates only A and B — the contract
+//  ∂L/∂W = 0 is enforced by lora_grad_freeze_W.
+//
+//  Public API
+//  ──────────
+//      lora_linear_forward(x, W, A, B, scale)  -> [float]
+//          Row-vector forward:    x·W + scale · (x·A) · B
+//          Shapes:
+//              x : [in]
+//              W : [in, out]
+//              A : [in, r]
+//              B : [r, out]
+//              ret: [out]
+//
+//      lora_grad_freeze_W(grad_W)              -> [[float]]
+//          Returns a tensor shaped like grad_W but filled with 0.0 —
+//          any caller passing this through an optimiser step leaves W
+//          exactly unchanged. Invariant ∂L/∂W ≡ 0.
+//
+//      merge_lora_weights(W, A, B, scale)      -> [[float]]
+//          Produces W_merged[i][j] = W[i][j] + scale · Σ_p A[i][p]·B[p][j].
+//          After merging, a plain linear forward with W_merged is
+//          numerically identical (within float round-off) to
+//          lora_linear_forward on the unmerged triplet.
+//
+//      detect_lora_candidate(linear)           -> bool
+//          AST predicate. A Linear node is a candidate iff
+//              linear.frozen == true  &&  linear.has_adapter == false
+//
+//      inject_lora_adapter(linear, r, scale)   -> LoraLinear
+//          Rewrites a candidate Linear into a LoraLinear with
+//              A : [in, r]  zeros      (residual starts at 0)
+//              B : [r, out] tiny seed  (will be trained)
+//          If the node is not a candidate the input is returned
+//          unchanged (safe no-op).
+//
+//      lora_param_ratio(in_dim, out_dim, r)    -> float
+//          (in_dim·r + r·out_dim) / (in_dim·out_dim) — the fractional
+//          parameter overhead the adapter adds on top of W.
+//
+//  Numerical contract
+//  ──────────────────
+//      lora_linear_forward(x, W, A, B, s)
+//        ≡ matvec(W_merged, x) where W_merged = merge_lora_weights(W,A,B,s)
+//      Within float round-off (tests assert ≤ 1e-5 for in,out ≤ 256,
+//      r ≤ 64).
+//
+//      Special cases
+//        · scale = 0            → output ≡ x·W     (adapter inert)
+//        · A = 0                → output ≡ x·W     (residual zero)
+//        · B = 0                → output ≡ x·W     (residual zero)
+//        · merge then forward   ≡ unmerged forward (numerically)
+//
+//      Gradient invariant
+//        lora_grad_freeze_W(any_grad) = zeros(shape(any_grad))
+//        so any SGD/Adam step on W with this frozen grad is a no-op.
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ───────────────────────────────
+//      - no bit-ops here; pure float arithmetic
+//      - no `and`/`or` → `&&`/`||`
+//      - no struct literals in `if` heads
+//      - no enum — kind is a tagged string on the AST struct
+//      - `@attr pub fn` split into `@attr fn _impl` + `pub fn`
+//        forwarder (HX3 P14 for safety even though fixed 2026-04-16)
+//      - `len(W)` is rows, `len(W[0])` is cols — empty-guarded
+//
+//  Relationship to self/ml/lora.hexa (READ-ONLY reference)
+//  ───────────────────────────────────────────────────────
+//  self/ml/lora.hexa uses the column-vector convention
+//      y = W·x + (α/r)·B·(A·x)  with  A:[r,in], B:[out,r].
+//  This ai_native pass uses the row-vector convention from the ROI
+//  spec: y = x·W + scale·(x·A)·B with A:[in,r], B:[r,out]. The two
+//  are mathematically equivalent under a transpose of W, A, B; we
+//  deliberately implement the row-vector form here so the ai_native
+//  lowering matches the PyTorch-style Linear(x → x·W^T) consumer and
+//  so tests stay independent of self/ml/lora.hexa (not modified).
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot            — per-step residual path in fine-tune loop
+//      @lora_adapter   — pass marker
+//      @pure           — no side effects beyond the return value
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn la100_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn la100_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn la100_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// deterministic small-value init for adapter B (so A=0, B≠0 still
+// produces a zero residual through (x·A)·B because x·A = 0). This is
+// the standard LoRA init: A zero-init, B small non-zero (or vice
+// versa). Either way the residual at step 0 is zero.
+fn la100_small_init_2d(r, c, seed) {
+    let mut s = seed
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 1000) - 500.0) * 0.0001
+            row = row + [v]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Numeric kernels — row-vector convention
+// ═══════════════════════════════════════════════════════════════════
+
+// row_matvec(x, M) — returns x·M  where x:[R], M:[R,C]
+// Output length = C.
+fn la100_row_matvec(x, M) {
+    let R = len(x)
+    if R == 0 { return [] }
+    let C = len(M[0])
+    let mut out = la100_zeros_1d(C)
+    for i in 0..R {
+        let xi = x[i]
+        for j in 0..C {
+            out[j] = out[j] + xi * M[i][j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lora_linear_forward(x, W, A, B, scale)
+//
+//     y = x·W + scale · ((x·A) · B)
+//
+//  x:[in]  W:[in,out]  A:[in,r]  B:[r,out]  → [out]
+//
+//  Compute plan:
+//      base = x · W                     (len out)
+//      u    = x · A                     (len r — low-rank projection)
+//      v    = u · B                     (len out)
+//      y_j  = base_j + scale · v_j
+// ═══════════════════════════════════════════════════════════════════
+@hot @lora_adapter @pure
+fn lora_linear_forward_impl(x, W, A, B, scale) {
+    let IN = len(x)
+    if IN == 0 { return [] }
+    let OUT = len(W[0])
+    // base branch — frozen W
+    let base = la100_row_matvec(x, W)
+    // low-rank residual branch
+    let u = la100_row_matvec(x, A)     // length r
+    let v = la100_row_matvec(u, B)     // length out
+    let mut y = la100_zeros_1d(OUT)
+    for j in 0..OUT {
+        y[j] = base[j] + scale * v[j]
+    }
+    return y
+}
+
+pub fn lora_linear_forward(x, W, A, B, scale) {
+    return lora_linear_forward_impl(x, W, A, B, scale)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lora_grad_freeze_W(grad_W) — zero-out gradient on frozen W
+//
+//  Contract: Σ |out[i][j]| = 0  and  shape(out) == shape(grad_W).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn lora_grad_freeze_W(grad_W) {
+    let R = len(grad_W)
+    if R == 0 { return [] }
+    let C = len(grad_W[0])
+    return la100_zeros_2d(R, C)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  merge_lora_weights(W, A, B, scale) -> W_merged
+//
+//     W_merged[i][j] = W[i][j] + scale · Σ_p A[i][p] · B[p][j]
+//
+//  Computes A·B once and fuses into W. After merge, plain forward
+//  matvec(W_merged, x) equals the unmerged lora_linear_forward(·).
+// ═══════════════════════════════════════════════════════════════════
+@lora_adapter @pure
+fn merge_lora_weights_impl(W, A, B, scale) {
+    let IN = len(W)
+    if IN == 0 { return [] }
+    let OUT = len(W[0])
+    let r_in_A = len(A)
+    // A must be shaped [in, r]; if in mismatch we still best-effort.
+    let R = if r_in_A == 0 { 0 } else { len(A[0]) }
+
+    // Step 1 — AB[i][j] = Σ_p A[i][p] · B[p][j]    AB : [in, out]
+    let mut AB = la100_zeros_2d(IN, OUT)
+    if R > 0 {
+        for i in 0..IN {
+            for p in 0..R {
+                let a_ip = A[i][p]
+                for j in 0..OUT {
+                    AB[i][j] = AB[i][j] + a_ip * B[p][j]
+                }
+            }
+        }
+    }
+
+    // Step 2 — W_merged[i][j] = W[i][j] + scale · AB[i][j]
+    let mut Wm = la100_zeros_2d(IN, OUT)
+    for i in 0..IN {
+        for j in 0..OUT {
+            Wm[i][j] = W[i][j] + scale * AB[i][j]
+        }
+    }
+    return Wm
+}
+
+pub fn merge_lora_weights(W, A, B, scale) {
+    return merge_lora_weights_impl(W, A, B, scale)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST node — Linear / LoraLinear
+//
+//  kind ∈ { "linear", "lora_linear" }
+//  For "linear"      : W = weight matrix [in,out], frozen bool,
+//                      has_adapter bool
+//  For "lora_linear" : W, A, B, scale set; frozen=true; has_adapter=true
+// ═══════════════════════════════════════════════════════════════════
+struct LinearNode {
+    kind: string
+    W: any
+    A: any
+    B: any
+    scale: any
+    frozen: bool
+    has_adapter: bool
+}
+
+// constructor: plain frozen linear (no adapter yet)
+pub fn make_linear_frozen(W) {
+    return LinearNode{
+        kind: "linear",
+        W: W,
+        A: 0.0,
+        B: 0.0,
+        scale: 0.0,
+        frozen: true,
+        has_adapter: false
+    }
+}
+
+// constructor: trainable linear (neither frozen nor adapted)
+pub fn make_linear_trainable(W) {
+    return LinearNode{
+        kind: "linear",
+        W: W,
+        A: 0.0,
+        B: 0.0,
+        scale: 0.0,
+        frozen: false,
+        has_adapter: false
+    }
+}
+
+// constructor: already-adapted lora linear
+pub fn make_lora_linear(W, A, B, scale) {
+    return LinearNode{
+        kind: "lora_linear",
+        W: W,
+        A: A,
+        B: B,
+        scale: scale,
+        frozen: true,
+        has_adapter: true
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  detect_lora_candidate(node) — AST predicate
+//
+//  Returns true iff node is a plain "linear" that is frozen AND has
+//  no adapter attached yet. Non-frozen (fully trainable) linears and
+//  already-adapted lora_linears are rejected.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn detect_lora_candidate(node) {
+    if node.kind != "linear" { return false }
+    if node.frozen == false { return false }
+    if node.has_adapter == true { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  inject_lora_adapter(node, r, scale) — AST rewrite
+//
+//  If `node` is a candidate, produces a new LoraLinear with
+//      A = zeros(in, r)         (residual starts at 0 by design)
+//      B = small-seeded(r, out) (will be trained)
+//  Otherwise returns the node unchanged (safe no-op).
+// ═══════════════════════════════════════════════════════════════════
+@lora_adapter @pure
+fn inject_lora_adapter_impl(node, r, scale) {
+    if detect_lora_candidate(node) == false { return node }
+    let W = node.W
+    let IN = len(W)
+    if IN == 0 { return node }
+    let OUT = len(W[0])
+    let A0 = la100_zeros_2d(IN, r)
+    let B0 = la100_small_init_2d(r, OUT, 1024 * r + OUT)
+    return make_lora_linear(W, A0, B0, scale)
+}
+
+pub fn inject_lora_adapter(node, r, scale) {
+    return inject_lora_adapter_impl(node, r, scale)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lora_param_ratio(in_dim, out_dim, r)
+//
+//      (in·r + r·out) / (in·out)
+//
+//  Useful for sanity-checking adapter budget. For in=out=N,
+//      ratio = 2·r / N  (goes to 0 as N grows for fixed r)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn lora_param_ratio(in_dim, out_dim, r) {
+    if in_dim <= 0 { return 0.0 }
+    if out_dim <= 0 { return 0.0 }
+    let num = to_float(in_dim * r + r * out_dim)
+    let den = to_float(in_dim * out_dim)
+    return num / den
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Allocation / pass-impact accounting (exposed for tests)
+// ═══════════════════════════════════════════════════════════════════
+
+// A linear weight W:[in,out] has in·out params.
+pub fn base_param_count(in_dim, out_dim) {
+    return in_dim * out_dim
+}
+
+// LoRA adapter A:[in,r] + B:[r,out] adds (in + out)·r params.
+pub fn adapter_param_count(in_dim, out_dim, r) {
+    return (in_dim + out_dim) * r
+}
