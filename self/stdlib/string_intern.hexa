@@ -1,0 +1,192 @@
+// ═══════════════════════════════════════════════════════════
+//  self/stdlib/string_intern.hexa — Pure HEXA String Interning
+//
+//  Port of runtime.c Optimization #11 (string interning hash table)
+//  to pure HEXA. No C/FFI dependency.
+//
+//  Architecture:
+//    - Open-addressing hash table with linear probing
+//    - DJB2 hash function (h = h*33 + c, mod prime)
+//    - Parallel arrays: keys[], ids[], hashes[]
+//    - Reverse lookup: id -> string via _si_rev[]
+//    - Auto-grow at 75% load factor (power-of-2 doubling)
+//
+//  API:
+//    intern(s)         → int unique id (same string => same id)
+//    intern_lookup(id) → string (reverse lookup)
+//    intern_count()    → int (number of unique interned strings)
+//    intern_has(s)     → bool (check without inserting)
+//
+//  P15 workaround:
+//    All mutable state is in module-level globals initialized to 0/[].
+//    Hash computation uses tail recursion (parameters only, no let mut
+//    with non-zero literals) to avoid the val_int(0) cache aliasing bug.
+//
+//  Perf note:
+//    - char_code(s, i) is used instead of ord(substring(..)) for compat
+//      with both the tree-walking interpreter and C codegen paths.
+//    - DJB2 (h*33+c) was chosen over FNV-1a because it needs no XOR or
+//      bitwise AND — the hexa surface parser has issues with `&`/`^`/`|`
+//      in the codegen path (parse errors, G40/G42 constraints).
+//    - Modular arithmetic (% prime) replaces bitwise masking (& (cap-1))
+//      for the same reason. Uses % cap for slot indexing.
+//
+//  See: runtime.c lines 23-130 (C original)
+//       shared/hexa-lang/grammar.jsonl P15 (let-mut contamination)
+// ═══════════════════════════════════════════════════════════
+
+// ── Constants ──
+let SI_HASH_MOD = 1000000007   // large prime for hash modulo
+let SI_INIT_CAP = 64           // initial table capacity (must be > 0)
+let SI_LOAD_MAX = 75           // grow when load% exceeds this
+
+// ── Global table state ──
+// All initialized to zero/empty to avoid P15 let-mut contamination.
+// Occupancy is determined by _si_ids[slot] > 0, NOT by _si_keys[slot] == "".
+// This allows interning the empty string "" correctly.
+let mut _si_keys = []          // string keys
+let mut _si_ids = []           // unique int id per slot (0 = unoccupied)
+let mut _si_hashes = []        // cached hash per slot
+let mut _si_cap = 0            // current capacity
+let mut _si_count = 0          // number of occupied slots
+let mut _si_next_id = 0        // next id to assign
+let mut _si_rev = []           // reverse: _si_rev[id] = string
+
+// ── DJB2 hash function (recursive, P15-safe) ──
+// Uses char_code(s, i) which works in both interpreter and C codegen.
+fn _si_hash_loop(s, n, h, i) {
+    if i >= n { return h }
+    let c = char_code(s, i)
+    let nh = (h * 33 + c) % SI_HASH_MOD
+    return _si_hash_loop(s, n, nh, i + 1)
+}
+
+pub fn si_hash(s) {
+    let h = _si_hash_loop(s, len(s), 5381, 0)
+    // Ensure non-negative (defensive, DJB2 + mod should always be positive)
+    if h < 0 { return h + SI_HASH_MOD }
+    return h
+}
+
+// ── Array builder (recursive, P15-safe) ──
+fn _si_fill_arr(arr, size, val, i) {
+    if i >= size { return arr }
+    arr.push(val)
+    return _si_fill_arr(arr, size, val, i + 1)
+}
+
+// ── Initialize the table ──
+fn _si_init() {
+    _si_cap = SI_INIT_CAP
+    _si_count = 0
+    _si_next_id = 1
+    _si_keys = _si_fill_arr([], SI_INIT_CAP, "", 0)
+    _si_ids = _si_fill_arr([], SI_INIT_CAP, 0, 0)
+    _si_hashes = _si_fill_arr([], SI_INIT_CAP, 0, 0)
+    _si_rev = [""]  // id 0 is unused (reserved), placeholder
+}
+
+// ── Linear probe: find existing entry or empty slot ──
+// Returns positive id if found, or negative (-(idx+1)) if not found.
+// Occupancy check uses _si_ids[idx] > 0 (not _si_keys == "") so that
+// the empty string "" can be interned correctly.
+fn _si_probe(h, s, idx, start, wrapped) {
+    // Safety: if we've wrapped around completely, slot not found
+    if wrapped > 0 {
+        if idx == start { return 0 - idx - 1 }
+    }
+    if _si_ids[idx] == 0 { return 0 - idx - 1 }
+    if _si_hashes[idx] == h {
+        if _si_keys[idx] == s { return _si_ids[idx] }
+    }
+    let next = (idx + 1) % _si_cap
+    return _si_probe(h, s, next, start, 1)
+}
+
+// ── Find an empty slot (recursive, for insertion) ──
+fn _si_find_empty(idx) {
+    if _si_ids[idx] == 0 { return idx }
+    return _si_find_empty((idx + 1) % _si_cap)
+}
+
+// ── Rehash: reinsert old entries into new table ──
+fn _si_reinsert(ok, oi, oh, oc, j) {
+    if j >= oc { return 0 }
+    if oi[j] > 0 {
+        let idx = _si_find_empty(oh[j] % _si_cap)
+        _si_keys[idx] = ok[j]
+        _si_ids[idx] = oi[j]
+        _si_hashes[idx] = oh[j]
+    }
+    return _si_reinsert(ok, oi, oh, oc, j + 1)
+}
+
+// ── Grow the table (double capacity, rehash all entries) ──
+fn _si_grow() {
+    let oc = _si_cap
+    let ok = _si_keys
+    let oi = _si_ids
+    let oh = _si_hashes
+    let nc = oc * 2
+    _si_cap = nc
+    _si_keys = _si_fill_arr([], nc, "", 0)
+    _si_ids = _si_fill_arr([], nc, 0, 0)
+    _si_hashes = _si_fill_arr([], nc, 0, 0)
+    _si_reinsert(ok, oi, oh, oc, 0)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  PUBLIC API
+// ═══════════════════════════════════════════════════════════
+
+// Intern a string: returns a unique integer id.
+// Same string always returns the same id (deduplication).
+// Empty strings are interned like any other string.
+pub fn intern(s) {
+    if _si_cap == 0 { _si_init() }
+
+    let h = si_hash(s)
+    let start_idx = h % _si_cap
+    let probe_result = _si_probe(h, s, start_idx, start_idx, 0)
+
+    // Positive result = found, return existing id
+    if probe_result > 0 { return probe_result }
+
+    // Check load factor before inserting
+    if _si_count * 100 / _si_cap >= SI_LOAD_MAX {
+        _si_grow()
+    }
+
+    // Find empty slot (may have changed after grow)
+    let idx = _si_find_empty(h % _si_cap)
+    let id = _si_next_id
+    _si_next_id = _si_next_id + 1
+    _si_keys[idx] = s
+    _si_ids[idx] = id
+    _si_hashes[idx] = h
+    _si_rev.push(s)
+    _si_count = _si_count + 1
+    return id
+}
+
+// Look up a string by its intern id.
+// Returns "" for invalid ids.
+pub fn intern_lookup(id) {
+    if id <= 0 { return "" }
+    if id >= len(_si_rev) { return "" }
+    return _si_rev[id]
+}
+
+// Number of unique strings currently interned.
+pub fn intern_count() {
+    return _si_count
+}
+
+// Check if a string is already interned (without inserting).
+pub fn intern_has(s) {
+    if _si_cap == 0 { return false }
+    let h = si_hash(s)
+    let start_idx = h % _si_cap
+    let probe_result = _si_probe(h, s, start_idx, start_idx, 0)
+    return probe_result > 0
+}
