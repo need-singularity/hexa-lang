@@ -1,6 +1,31 @@
 // self/codegen/mod.hexa — ported from src/codegen/mod.rs
 // Native Code Generation — phi=2 targets (ARM64 + x86-64).
 // No LLVM. No Cranelift. Direct machine code emission.
+//
+// Data flow (wired pipeline):
+//
+//   IrModule (from lowering.hexa)
+//       │
+//       ▼
+//   ┌─ flatten_ir_instrs() ──┐   Extract [result, op_vid...] per instr
+//   │                        │
+//   ▼                        ▼
+//   compute_live_intervals()     Build LiveInterval per ValueId
+//       │
+//       ▼
+//   allocate_function_linear()   Linear-scan → FuncAlloc (reg/stack per VID)
+//       │
+//       ▼
+//   emit_function_arm64() / emit_function_x86()
+//       │                        Walk IR instrs, resolve regs, emit bytes
+//       ▼
+//   run_peephole()               ARM64 peephole optimizer (12 rules)
+//       │
+//       ▼
+//   macho_wrap() / elf_wrap()    Object format envelope
+//       │
+//       ▼
+//   CodegenResult { code, target, format }
 
 // Target architecture
 // 0 = Arm64, 1 = X86_64
@@ -27,28 +52,539 @@ fn host_target() -> [int] {
     return [target_arm64(), objformat_macho()]
 }
 
-// Generate native code from an IR module (conceptual).
-// In the self-hosted port, this dispatches to arm64/x86_64 emitters
-// and wraps output in macho/elf format.
-fn generate(module: string, target: int, format: int) -> CodegenResult {
-    // 1. Register allocation
-    // let alloc_result = regalloc_allocate(module, target)
-    // 2. Generate machine code per target
-    // 3. Wrap in object format
+// ═══════════════════════════════════════════════════════════════
+//  ADAPTER: IR data → flat instruction arrays for regalloc
+// ═══════════════════════════════════════════════════════════════
+// regalloc expects [[result_vid, operand_vid, ...], ...] per block.
+// IR instructions store Operands with kind tags; we extract only
+// "value" operands (the ones that reference SSA ValueIds).
+
+// Extract value-operand VIDs from an Instruction's operand list.
+fn extract_value_vids(instr) -> [int] {
+    let mut vids = []
+    let mut i = 0
+    while i < len(instr.operands) {
+        let op = instr.operands[i]
+        if op.kind == "value" {
+            vids = vids.push(op.a)
+        }
+        i = i + 1
+    }
+    return vids
+}
+
+// Flatten a function's instructions into [[result, op_vids...], ...]
+// for regalloc use-def analysis. Also returns the flat instruction
+// list for live-interval computation.
+fn flatten_ir_instrs(func) -> [[int]] {
+    let mut flat = []
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        let bb = func.blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let instr = bb.instructions[ii]
+            let vids = extract_value_vids(instr)
+            let mut row = [instr.result]
+            let mut vi = 0
+            while vi < len(vids) {
+                row = row.push(vids[vi])
+                vi = vi + 1
+            }
+            flat = flat.push(row)
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    return flat
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ADAPTER: Compute live intervals from flat instruction list
+// ═══════════════════════════════════════════════════════════════
+// Each instruction gets a global index. For each ValueId we track
+// the first def (start) and last use (end_pos).
+
+fn compute_live_intervals(flat_instrs: [[int]]) -> [LiveInterval] {
+    // first_def[vid] = global instruction index of def
+    // last_use[vid] = global instruction index of last use
+    let mut first_def = []
+    let mut last_use = []
+    let mut max_vid = 0
+
+    let mut idx = 0
+    while idx < len(flat_instrs) {
+        let row = flat_instrs[idx]
+        let result = row[0]
+
+        // Grow arrays to cover result vid
+        while len(first_def) <= result {
+            first_def = first_def.push(-1)
+            last_use = last_use.push(-1)
+        }
+        if result > max_vid { max_vid = result }
+
+        // Record def point
+        if first_def[result] == -1 {
+            first_def[result] = idx
+        }
+        last_use[result] = idx
+
+        // Record uses
+        let mut j = 1
+        while j < len(row) {
+            let op_vid = row[j]
+            while len(first_def) <= op_vid {
+                first_def = first_def.push(-1)
+                last_use = last_use.push(-1)
+            }
+            if op_vid > max_vid { max_vid = op_vid }
+            if first_def[op_vid] == -1 {
+                first_def[op_vid] = idx
+            }
+            last_use[op_vid] = idx
+            j = j + 1
+        }
+
+        idx = idx + 1
+    }
+
+    // Build LiveInterval array sorted by start (they are already
+    // in definition order since we walk instructions linearly).
+    let mut intervals = []
+    let mut v = 0
+    while v <= max_vid {
+        if first_def[v] >= 0 {
+            intervals = intervals.push(
+                live_interval_new(v, first_def[v], last_use[v], -1)
+            )
+        }
+        v = v + 1
+    }
+    return intervals
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ADAPTER: Resolve a ValueId to a physical register index
+// ═══════════════════════════════════════════════════════════════
+// Given FuncAlloc, return the physical register for a vid, or
+// arm64_tmp1()/0 as fallback if the value was spilled to stack.
+
+fn resolve_reg_arm64(alloc: FuncAlloc, vid: int) -> int {
+    if vid < len(alloc.locations_tag) {
+        if alloc.locations_tag[vid] == 0 {
+            // LOC_REG — value is the physical register index
+            return alloc.locations_val[vid]
+        }
+        // LOC_STACK — spilled; use tmp1 as scratch (caller must
+        // emit load from stack before use)
+        return arm64_tmp1()
+    }
+    return arm64_tmp1()
+}
+
+fn resolve_reg_x86(alloc: FuncAlloc, vid: int) -> int {
+    if vid < len(alloc.locations_tag) {
+        if alloc.locations_tag[vid] == 0 {
+            return alloc.locations_val[vid]
+        }
+    }
+    return 0  // rax fallback
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ARM64 FUNCTION EMITTER
+// ═══════════════════════════════════════════════════════════════
+// Walks IR instructions and emits ARM64 machine code using the
+// register assignment from FuncAlloc.
+//
+// Supported IR opcodes:
+//   load (imm_i64, imm_f64, value, param)
+//   add, sub, mul, div, mod
+//   ret
+//   call    (simplified: args in x0..x7, bl offset placeholder)
+//   branch  (cbnz + b placeholder, needs patching)
+//   jump    (b placeholder, needs patching)
+//   alloc   (sub sp)
+//   store   (str to stack)
+
+fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
+    let mut code = []
+
+    // --- Prologue ---
+    code = emit_prologue(code, alloc.stack_size)
+
+    // --- Track block byte-offsets for branch patching ---
+    // We do a two-pass approach: first emit, then patch branches.
+    // For simplicity, collect branch fixups as [code_offset, target_block].
+    let mut fixups_offset = []
+    let mut fixups_target = []
+    let mut block_starts = []     // block_starts[block_idx] = byte offset
+
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        // Record start of this block
+        block_starts = block_starts.push(len(code))
+        let bb = func.blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let instr = bb.instructions[ii]
+            let rd = resolve_reg_arm64(alloc, instr.result)
+            let op = instr.op
+
+            if op == "load" {
+                // Dispatch on operand kind
+                if len(instr.operands) > 0 {
+                    let first_op = instr.operands[0]
+                    if first_op.kind == "imm_i64" {
+                        // MOVZ/MOVK immediate
+                        code = emit_mov_imm(code, rd, first_op.a)
+                    } else {
+                        if first_op.kind == "imm_f64" {
+                            // Float literal — load 0 placeholder
+                            code = emit_mov_imm(code, rd, first_op.a)
+                        } else {
+                            if first_op.kind == "param" {
+                                // Parameters arrive in x0..x7 on ARM64
+                                let param_reg = first_op.a
+                                if param_reg != rd {
+                                    code = emit32(code, encode_mov(rd, param_reg))
+                                }
+                            } else {
+                                if first_op.kind == "value" {
+                                    // Load from another SSA value (copy)
+                                    let src = resolve_reg_arm64(alloc, first_op.a)
+                                    if src != rd {
+                                        code = emit32(code, encode_mov(rd, src))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+            } else {
+                if op == "add" {
+                    let rn = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_arm64(alloc, instr.operands[1].a)
+                    // ADD Xd, Xn, Xm  — base = 0x8b000000
+                    code = emit32(code, encode_rrr(0x8b000000, rd, rn, rm))
+
+                } else {
+                if op == "sub" {
+                    let rn = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_arm64(alloc, instr.operands[1].a)
+                    // SUB Xd, Xn, Xm  — base = 0xcb000000
+                    code = emit32(code, encode_rrr(0xcb000000, rd, rn, rm))
+
+                } else {
+                if op == "mul" {
+                    let rn = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_arm64(alloc, instr.operands[1].a)
+                    code = emit32(code, encode_mul(rd, rn, rm))
+
+                } else {
+                if op == "div" {
+                    let rn = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_arm64(alloc, instr.operands[1].a)
+                    code = emit32(code, encode_div(rd, rn, rm))
+
+                } else {
+                if op == "mod" {
+                    // mod = a - (a/b)*b  → SDIV tmp, Xn, Xm; MSUB Xd, tmp, Xm, Xn
+                    let rn = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_arm64(alloc, instr.operands[1].a)
+                    let tmp = arm64_tmp2()
+                    code = emit32(code, encode_div(tmp, rn, rm))
+                    code = emit32(code, encode_msub(rd, tmp, rm, rn))
+
+                } else {
+                if op == "ret" {
+                    // Move return value to x0 if needed
+                    if len(instr.operands) > 0 {
+                        let src = resolve_reg_arm64(alloc, instr.operands[0].a)
+                        if src != 0 {
+                            code = emit32(code, encode_mov(0, src))
+                        }
+                    }
+                    // Epilogue emitted after all blocks
+
+                } else {
+                if op == "call" {
+                    // Move args to x0..x7, emit BL placeholder
+                    let mut ai = 1  // skip operands[0] which is func ref
+                    while ai < len(instr.operands) {
+                        let arg_vid = instr.operands[ai].a
+                        let src = resolve_reg_arm64(alloc, arg_vid)
+                        let dst_param = ai - 1  // x0, x1, x2, ...
+                        if src != dst_param {
+                            code = emit32(code, encode_mov(dst_param, src))
+                        }
+                        ai = ai + 1
+                    }
+                    // BL <offset> — placeholder 0, needs link-time fixup
+                    code = emit32(code, 0x94000000)
+                    // Move result from x0 to rd
+                    if rd != 0 {
+                        code = emit32(code, encode_mov(rd, 0))
+                    }
+
+                } else {
+                if op == "branch" {
+                    // operands: [cond_value, then_block, else_block]
+                    let cond_reg = resolve_reg_arm64(alloc, instr.operands[0].a)
+                    let then_bb = instr.operands[1].a
+                    let else_bb = instr.operands[2].a
+                    // CBNZ cond_reg, then_block  (patched later)
+                    fixups_offset = fixups_offset.push(len(code))
+                    fixups_target = fixups_target.push(then_bb)
+                    code = emit32(code, 0xB5000000 + cond_reg)
+                    // B else_block (unconditional fallthrough to else)
+                    fixups_offset = fixups_offset.push(len(code))
+                    fixups_target = fixups_target.push(else_bb)
+                    code = emit32(code, 0x14000000)
+
+                } else {
+                if op == "jump" {
+                    // operands: [target_block]
+                    let target_bb = instr.operands[0].a
+                    fixups_offset = fixups_offset.push(len(code))
+                    fixups_target = fixups_target.push(target_bb)
+                    code = emit32(code, 0x14000000)
+
+                } else {
+                if op == "alloc" {
+                    // Stack slot allocation — already accounted for in prologue
+                    // rd holds the pointer (FP-relative); no-op in code
+
+                } else {
+                if op == "store" {
+                    // STR src, [target_addr] — simplified: no-op placeholder
+                    // Full impl would emit STR to FP-relative offset
+
+                } else {
+                    // Unsupported opcode — emit NOP as placeholder
+                    code = emit32(code, 0xd503201f)
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+                }
+            }
+
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+
+    // --- Epilogue ---
+    code = emit_epilogue(code, alloc.stack_size)
+
+    // --- Patch branch fixups ---
+    // Each fixup references a target block id. We find the block's
+    // index in func.blocks, then compute the relative offset.
+    let mut fi = 0
+    while fi < len(fixups_offset) {
+        let patch_at = fixups_offset[fi]
+        let target_bid = fixups_target[fi]
+        // Find block index for target_bid
+        let mut target_idx = -1
+        let mut si = 0
+        while si < len(func.blocks) {
+            if func.blocks[si].id == target_bid {
+                target_idx = si
+            }
+            si = si + 1
+        }
+        if target_idx >= 0 {
+            let target_byte = block_starts[target_idx]
+            // ARM64 branch offset is in units of 4-byte instructions
+            let rel = (target_byte - patch_at) / 4
+            code = patch_branch(code, patch_at, rel)
+        }
+        fi = fi + 1
+    }
+
+    return code
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  x86-64 FUNCTION EMITTER
+// ═══════════════════════════════════════════════════════════════
+// Simplified x86-64 emitter for the same IR instruction set.
+
+fn emit_function_x86(func, alloc: FuncAlloc) -> [int] {
+    let mut code = []
+    code = x86_emit_prologue(code, alloc.stack_size)
+
+    let mut bi = 0
+    while bi < len(func.blocks) {
+        let bb = func.blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let instr = bb.instructions[ii]
+            let rd = resolve_reg_x86(alloc, instr.result)
+            let op = instr.op
+
+            if op == "load" {
+                if len(instr.operands) > 0 {
+                    let first_op = instr.operands[0]
+                    if first_op.kind == "imm_i64" {
+                        code = x86_emit_mov_imm64(code, rd, first_op.a)
+                    } else {
+                        if first_op.kind == "value" {
+                            let src = resolve_reg_x86(alloc, first_op.a)
+                            code = x86_emit_mov_rr(code, rd, src)
+                        }
+                    }
+                }
+            } else {
+                if op == "add" {
+                    let rn = resolve_reg_x86(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_x86(alloc, instr.operands[1].a)
+                    code = x86_emit_mov_rr(code, rd, rn)
+                    code = x86_emit_alu_rr(code, 0x01, rd, rm)
+                } else {
+                if op == "sub" {
+                    let rn = resolve_reg_x86(alloc, instr.operands[0].a)
+                    let rm = resolve_reg_x86(alloc, instr.operands[1].a)
+                    code = x86_emit_mov_rr(code, rd, rn)
+                    code = x86_emit_alu_rr(code, 0x29, rd, rm)
+                } else {
+                if op == "ret" {
+                    // Move return value to rax (reg 0) if needed
+                    if len(instr.operands) > 0 {
+                        let src = resolve_reg_x86(alloc, instr.operands[0].a)
+                        code = x86_emit_mov_rr(code, 0, src)
+                    }
+                } else {
+                    // Other opcodes: NOP placeholder for x86-64
+                    code = code.push(0x90)
+                }
+                }
+                }
+            }
+
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+
+    code = x86_emit_epilogue(code)
+    return code
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PIPELINE: generate() — the main entry point
+// ═══════════════════════════════════════════════════════════════
+// Accepts an IrModule, runs the full pipeline per function, and
+// concatenates the output into a single code buffer wrapped in
+// the appropriate object format.
+
+fn generate(module, target: int, format: int) -> CodegenResult {
+    let mut all_code = []
+    let mut main_offset = 0
+
+    // Select physical register set based on target
+    let regs = []
+    if target == target_arm64() {
+        regs = gp_regs_arm64()
+    } else {
+        regs = gp_regs_x86()
+    }
+
+    // --- Per-function pipeline ---
+    let mut fi = 0
+    while fi < len(module.functions) {
+        let func = module.functions[fi]
+
+        // Track offset of the first function (entry point)
+        if fi == 0 {
+            main_offset = len(all_code)
+        }
+
+        // Step 1: Flatten IR instructions for regalloc
+        let flat = flatten_ir_instrs(func)
+
+        // Step 2: Compute live intervals from flattened instruction stream
+        let intervals = compute_live_intervals(flat)
+
+        // Step 3: Linear-scan register allocation
+        let alloc = allocate_function_linear(intervals, regs)
+
+        // Step 4: Emit machine code for this function
+        let mut func_code = []
+        if target == target_arm64() {
+            func_code = emit_function_arm64(func, alloc)
+        } else {
+            func_code = emit_function_x86(func, alloc)
+        }
+
+        // Step 5: Peephole optimization (ARM64 only)
+        if target == target_arm64() {
+            let peep = run_peephole(func_code)
+            func_code = peep.code
+        }
+
+        // Append this function's code to the output buffer
+        let mut ci = 0
+        while ci < len(func_code) {
+            all_code = all_code.push(func_code[ci])
+            ci = ci + 1
+        }
+
+        fi = fi + 1
+    }
+
+    // Step 6: Wrap in object format
+    let mut wrapped = all_code
+    if format == objformat_macho() {
+        wrapped = macho_wrap(all_code, main_offset)
+    } else {
+        if format == objformat_elf() {
+            wrapped = elf_wrap(all_code)
+        }
+    }
+
     return CodegenResult {
-        code: [],
+        code: wrapped,
         target: target,
         format: format
     }
 }
 
-// Compile an IR module to a native executable (conceptual).
-fn compile_to_binary(module: string, output_path: string) -> string {
+// ═══════════════════════════════════════════════════════════════
+//  compile_to_binary() — full compile-and-write pipeline
+// ═══════════════════════════════════════════════════════════════
+// Accepts an IrModule and output path. Calls generate(), writes
+// the resulting object bytes to disk, returns "" on success or
+// an error description string on failure.
+
+fn compile_to_binary(module, output_path: string) -> string {
     let host = host_target()
     let target = host[0]
     let format = host[1]
+
     let result = generate(module, target, format)
-    // Write object file, C wrapper, link with system linker
-    // Returns "" on success, error string on failure
+
+    // Validate we got actual code
+    if len(result.code) == 0 {
+        return "codegen: empty output — no functions in module"
+    }
+
+    // Write object file bytes to disk
+    // write_file is a Hexa builtin that writes a byte array to a path.
+    // Returns true on success.
+    let ok = write_file(output_path, result.code)
+    if !ok {
+        return "codegen: failed to write " + output_path
+    }
+
     return ""
 }
