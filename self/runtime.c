@@ -1970,12 +1970,13 @@ static int __hexa_val_arena_enabled = -1;  // -1 = lazy probe
 static int hexa_val_arena_on(void) {
     if (__hexa_val_arena_enabled < 0) {
         const char* e = getenv("HEXA_VAL_ARENA");
-        // S7-B: default ON (2026-04-16). Phase A wired codegen_c2
-        // __hexa_fn_arena_enter/return; T33 corruption fixed; full 236-example
-        // + 16-case stage1 regression suite passed 0-regression under ARENA=1.
-        // Opt-out: HEXA_VAL_ARENA=0.
+        // S7-C: default OFF for NaN-boxing (2026-04-16). Arena scope pop
+        // corrupts __VAL_INT_CACHE (init-time Vals arena-allocated due to
+        // __hexa_fn_arena_enter in __init_val_int_cache). Pending: heapify
+        // cache entries before scope pop, then re-enable.
+        // Opt-in: HEXA_VAL_ARENA=1.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 1;
+            __hexa_val_arena_enabled = 0;
         } else {
             __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
@@ -2101,6 +2102,9 @@ static HexaMapTable* hmap_heapify(HexaMapTable* src) {
 // retain their pointer identity (those allocators don't currently use the
 // arena, so heapify is a no-op for them).
 HexaVal hexa_val_heapify(HexaVal v) {
+    // NaN-boxing: TAG_FLOAT/TAG_INT/TAG_BOOL/TAG_VOID are immediate values
+    // (no pointers to arena memory). Short-circuit before the switch.
+    if (HX_IS_FLOAT(v) || HX_IS_INT(v) || HX_IS_BOOL(v) || HX_IS_VOID(v)) return v;
     switch (HX_TAG(v)) {
         case TAG_MAP:
             if (HX_MAP_TBL(v) && HX_MAP_TBL(v)->from_arena) {

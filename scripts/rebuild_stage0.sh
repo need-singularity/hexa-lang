@@ -100,6 +100,29 @@ echo $$ > "$LOCK_DIR/pid"
 cleanup() { rm -rf "$LOCK_DIR"; rm -rf /tmp/hexa_flatten.lock 2>/dev/null || :; [ -n "${BACKUP:-}" ] && rm -f "$BACKUP" || :; }
 trap cleanup EXIT INT TERM
 
+# ── 1b. Dirty-guard: 미커밋 self/ 변경 보호 ─────────────────
+# 편집 소실 방지 (2026-04-16): bg agent가 rebuild 중 git 조작으로
+# uncommitted edits를 덮어쓰는 사고 차단. 미커밋 변경 있으면 stash.
+DIRTY_FILES=""
+if command -v git >/dev/null 2>&1 && git -C "$HEXA_DIR" rev-parse --git-dir >/dev/null 2>&1; then
+    DIRTY_FILES=$(git -C "$HEXA_DIR" diff --name-only -- self/runtime.c self/codegen_c2.hexa self/interpreter.hexa 2>/dev/null || echo "")
+fi
+STASHED=""
+if [ -n "$DIRTY_FILES" ]; then
+    echo "[rebuild_stage0] DIRTY-GUARD: uncommitted changes in: $DIRTY_FILES" >&2
+    echo "[rebuild_stage0] auto-stash to protect edits" >&2
+    git -C "$HEXA_DIR" stash push -q -m "rebuild_stage0 dirty-guard $(date +%Y%m%d_%H%M%S)" -- self/runtime.c self/codegen_c2.hexa self/interpreter.hexa 2>/dev/null && STASHED=1 || STASHED=""
+fi
+# restore stash on exit (prepend to cleanup)
+_orig_cleanup=$(type cleanup 2>/dev/null | tail -n +2)
+cleanup() {
+    if [ -n "${STASHED:-}" ]; then
+        echo "[rebuild_stage0] DIRTY-GUARD: restoring stashed edits" >&2
+        git -C "$HEXA_DIR" stash pop -q 2>/dev/null || echo "[rebuild_stage0] WARNING: stash pop failed — run 'git stash list' manually" >&2
+    fi
+    rm -rf "$LOCK_DIR"; rm -rf /tmp/hexa_flatten.lock 2>/dev/null || :; [ -n "${BACKUP:-}" ] && rm -f "$BACKUP" || :;
+}
+
 # ── 2. Helper: SHA-256 (macOS shasum -a 256 / Linux sha256sum 공통 fallback) ──
 sha256_cmd() {
     if command -v shasum >/dev/null 2>&1; then
