@@ -573,11 +573,12 @@ static int64_t _hx_stats_str_concat     = 0;
 static int64_t _hx_stats_array_reserve  = 0;
 static int64_t _hx_stats_map_new        = 0;
 static int64_t _hx_stats_map_set        = 0;
-// P4 self-host: codegen_c2 emits __hexa_fn_arena_enter/return for
-// per-function arena scoping. Currently no-op stubs — full arena GC
-// is a future optimization (rt 32-L scope narrowing).
-static inline void __hexa_fn_arena_enter(void) { /* no-op */ }
-static inline HexaVal __hexa_fn_arena_return(HexaVal v) { return v; }
+// STRUCTURAL-7 Phase A: codegen_c2 emits __hexa_fn_arena_enter/return for
+// per-function arena scoping. Forward declarations here; real implementations
+// below after all arena dependencies (hexa_val_arena_on, hexa_val_heapify,
+// hexa_val_arena_scope_push/pop) are defined.
+void __hexa_fn_arena_enter(void);
+HexaVal __hexa_fn_arena_return(HexaVal v);
 
 // rt 32-D: arena allocator stats (str_concat hot-path)
 static int64_t _hx_stats_arena_alloc    = 0;   // total arena bump allocations
@@ -2114,6 +2115,24 @@ static void hexa_val_arena_heapify_return(void) {
     if (&return_val) {
         return_val = hexa_val_heapify(return_val);
     }
+}
+
+// ── STRUCTURAL-7 Phase A: codegen fn-boundary arena enter/return ──
+// Implementations for the forward declarations near line 579. When the arena
+// is OFF (HEXA_VAL_ARENA != 1, the default), both are no-ops. When ON,
+// enter() pushes an arena scope mark and return() heapifies the return value
+// (promoting any arena-allocated memory to the heap) then pops the scope.
+void __hexa_fn_arena_enter(void) {
+    if (!hexa_val_arena_on()) return;
+    hexa_val_arena_scope_push();
+}
+
+HexaVal __hexa_fn_arena_return(HexaVal ret) {
+    if (!hexa_val_arena_on()) return ret;
+    if (__hexa_val_mark_top <= 0) return ret;  // no matching push — defensive
+    ret = hexa_val_heapify(ret);
+    hexa_val_arena_scope_pop();
+    return ret;
 }
 
 // ── String operations ────────────────────────────────────
