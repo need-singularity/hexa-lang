@@ -328,6 +328,16 @@ typedef struct HexaVal {
 #define HX_ARR_CAP(v)   ((v).arr.cap)
 #define HX_VS(v)        ((v).vs)
 
+// ── S1-D: compound-type SET macros (write accessors) ────
+#define HX_SET_ARR_ITEMS(v, p) ((v).arr.items = (p))
+#define HX_SET_ARR_LEN(v, n)   ((v).arr.len = (n))
+#define HX_SET_ARR_CAP(v, n)   ((v).arr.cap = (n))
+#define HX_SET_MAP_TBL(v, t)   ((v).map.tbl = (t))
+#define HX_SET_MAP_LEN(v, n)   ((v).map.len = (n))
+#define HX_SET_CLO_PTR(v, p)   ((v).clo.fn_ptr = (p))
+#define HX_SET_CLO_ARITY(v, n) ((v).clo.arity = (n))
+#define HX_SET_CLO_ENV(v, p)   ((v).clo.env_box = (p))
+
 #define HX_IS_INT(v)    ((v).tag == TAG_INT)
 #define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
 #define HX_IS_BOOL(v)   ((v).tag == TAG_BOOL)
@@ -380,10 +390,10 @@ typedef struct HexaValStruct {
 // TAG_ARRAY HexaVal; we heap-box it so the closure remains valid after copies.
 static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr) {
     HexaVal v = {.tag=TAG_CLOSURE};
-    v.clo.fn_ptr = fn_ptr;
-    v.clo.arity = arity;
-    v.clo.env_box = (HexaVal*)malloc(sizeof(HexaVal));
-    *v.clo.env_box = env_arr;
+    HX_SET_CLO_PTR(v, fn_ptr);
+    HX_SET_CLO_ARITY(v, arity);
+    HX_SET_CLO_ENV(v, (HexaVal*)malloc(sizeof(HexaVal)));
+    *HX_CLO_ENV(v) = env_arr;
     return v;
 }
 
@@ -725,7 +735,7 @@ static HexaVal* hexa_array_promote_to_heap(HexaVal* arena_items, int len, int ne
 HexaVal hexa_array_new() {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal v = {.tag=TAG_ARRAY};
-    v.arr.items = NULL; v.arr.len = 0; v.arr.cap = 0;
+    HX_SET_ARR_ITEMS(v, NULL); HX_SET_ARR_LEN(v, 0); HX_SET_ARR_CAP(v, 0);
     return v;
 }
 
@@ -743,14 +753,14 @@ HexaVal hexa_array_new() {
 // the malloc heap at capture time.
 HexaVal hexa_val_snapshot_array(HexaVal v) {
     if (!HX_IS_ARRAY(v)) return v;
-    if (v.arr.cap >= 0) return v;  // heap-backed — no aliasing with arena rewind
+    if (HX_ARR_CAP(v) >= 0) return v;  // heap-backed — no aliasing with arena rewind
     // cap < 0: arena-backed — promote to heap.
     if (_hx_stats_on()) _hx_stats_array_arena_heapify++;
-    int real_cap = -v.arr.cap;
-    HexaVal* heap = hexa_array_promote_to_heap(v.arr.items, v.arr.len, real_cap);
+    int real_cap = -HX_ARR_CAP(v);
+    HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(v), HX_ARR_LEN(v), real_cap);
     if (!heap) return v;  // OOM — best-effort, caller may see stale pointer
-    v.arr.items = heap;
-    v.arr.cap = real_cap;  // positive → heap
+    HX_SET_ARR_ITEMS(v, heap);
+    HX_SET_ARR_CAP(v, real_cap);  // positive → heap
     return v;
 }
 
@@ -771,20 +781,20 @@ static int hexa_array_push_arena_on(void) {
 // Optimization #12: reserve capacity up front when size is known.
 // rt 32-M: respect arena-backed items (cap<0) — promote to heap on grow.
 HexaVal hexa_array_reserve(HexaVal arr, int n) {
-    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
+    int real_cap = HX_ARR_CAP(arr) < 0 ? -HX_ARR_CAP(arr) : HX_ARR_CAP(arr);
     if (n <= real_cap) return arr;
     if (_hx_stats_on()) _hx_stats_array_reserve++;
-    if (arr.arr.cap < 0) {
+    if (HX_ARR_CAP(arr) < 0) {
         if (_hx_stats_on()) _hx_stats_array_arena_promote++;
-        HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, n);
+        HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(arr), HX_ARR_LEN(arr), n);
         if (!heap) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
-        arr.arr.items = heap;
-        arr.arr.cap = n;
+        HX_SET_ARR_ITEMS(arr, heap);
+        HX_SET_ARR_CAP(arr, n);
     } else {
-        HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)n);
+        HexaVal* new_items = realloc(HX_ARR_ITEMS(arr), sizeof(HexaVal) * (size_t)n);
         if (!new_items) { fprintf(stderr, "OOM in array_reserve\n"); exit(1); }
-        arr.arr.items = new_items;
-        arr.arr.cap = n;
+        HX_SET_ARR_ITEMS(arr, new_items);
+        HX_SET_ARR_CAP(arr, n);
     }
     return arr;
 }
@@ -797,11 +807,11 @@ HexaVal hexa_array_reserve(HexaVal arr, int n) {
 // `cap` encodes from_arena; abs(cap) is the real capacity.
 HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
     if (_hx_stats_on()) _hx_stats_array_push++;
-    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
-    if (arr.arr.len >= real_cap) {
+    int real_cap = HX_ARR_CAP(arr) < 0 ? -HX_ARR_CAP(arr) : HX_ARR_CAP(arr);
+    if (HX_ARR_LEN(arr) >= real_cap) {
         if (_hx_stats_on()) _hx_stats_array_grow++;
         int new_cap = real_cap < 8 ? 8 : real_cap * 2;
-        if (arr.arr.cap < 0) {
+        if (HX_ARR_CAP(arr) < 0) {
             // Arena-backed buffer: cannot realloc. Allocate a NEW arena slab
             // if still inside a live mark and there's room; else promote to
             // malloc heap. Keeping it arena-resident preserves the RSS win
@@ -811,18 +821,18 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
                 next_items = hexa_array_arena_alloc_items(new_cap);
             }
             if (next_items) {
-                if (arr.arr.len > 0) {
-                    memcpy(next_items, arr.arr.items, sizeof(HexaVal) * (size_t)arr.arr.len);
+                if (HX_ARR_LEN(arr) > 0) {
+                    memcpy(next_items, HX_ARR_ITEMS(arr), sizeof(HexaVal) * (size_t)HX_ARR_LEN(arr));
                 }
-                arr.arr.items = next_items;
-                arr.arr.cap = -new_cap;
+                HX_SET_ARR_ITEMS(arr, next_items);
+                HX_SET_ARR_CAP(arr, -new_cap);
             } else {
                 // Promote to heap.
                 if (_hx_stats_on()) _hx_stats_array_arena_promote++;
-                HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, new_cap);
+                HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(arr), HX_ARR_LEN(arr), new_cap);
                 if (!heap) { fprintf(stderr, "OOM in array_push (arena promote)\n"); exit(1); }
-                arr.arr.items = heap;
-                arr.arr.cap = new_cap;  // positive → heap
+                HX_SET_ARR_ITEMS(arr, heap);
+                HX_SET_ARR_CAP(arr, new_cap);  // positive → heap
             }
         } else {
             // rt#32-N: push-arena path (cap=0 first-push or existing heap
@@ -848,18 +858,18 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
                 }
             }
             if (use_arena) {
-                arr.arr.items = next_items;
-                arr.arr.cap = -new_cap;  // negative → from_arena sentinel
+                HX_SET_ARR_ITEMS(arr, next_items);
+                HX_SET_ARR_CAP(arr, -new_cap);  // negative → from_arena sentinel
             } else {
-                HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
+                HexaVal* new_items = realloc(HX_ARR_ITEMS(arr), sizeof(HexaVal) * (size_t)new_cap);
                 if (!new_items) { fprintf(stderr, "OOM in array_push\n"); exit(1); }
-                arr.arr.items = new_items;
-                arr.arr.cap = new_cap;
+                HX_SET_ARR_ITEMS(arr, new_items);
+                HX_SET_ARR_CAP(arr, new_cap);
             }
         }
     }
-    arr.arr.items[arr.arr.len] = item;
-    arr.arr.len++;
+    HX_ARR_ITEMS(arr)[HX_ARR_LEN(arr)] = item;
+    HX_SET_ARR_LEN(arr, HX_ARR_LEN(arr) + 1);
     return arr;
 }
 
@@ -872,23 +882,23 @@ HexaVal hexa_array_push(HexaVal arr, HexaVal item) {
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
     // rt 32-M: stays on heap (call_arg_buf is long-lived — arena rewind would
     // invalidate it). If an arena buffer somehow lands here, promote to heap.
-    int real_cap = arr.arr.cap < 0 ? -arr.arr.cap : arr.arr.cap;
-    if (arr.arr.len >= real_cap) {
+    int real_cap = HX_ARR_CAP(arr) < 0 ? -HX_ARR_CAP(arr) : HX_ARR_CAP(arr);
+    if (HX_ARR_LEN(arr) >= real_cap) {
         int new_cap = real_cap < 8 ? 8 : real_cap * 2;
-        if (arr.arr.cap < 0) {
-            HexaVal* heap = hexa_array_promote_to_heap(arr.arr.items, arr.arr.len, new_cap);
+        if (HX_ARR_CAP(arr) < 0) {
+            HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(arr), HX_ARR_LEN(arr), new_cap);
             if (!heap) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
-            arr.arr.items = heap;
-            arr.arr.cap = new_cap;
+            HX_SET_ARR_ITEMS(arr, heap);
+            HX_SET_ARR_CAP(arr, new_cap);
         } else {
-            HexaVal* new_items = realloc(arr.arr.items, sizeof(HexaVal) * (size_t)new_cap);
+            HexaVal* new_items = realloc(HX_ARR_ITEMS(arr), sizeof(HexaVal) * (size_t)new_cap);
             if (!new_items) { fprintf(stderr, "OOM in array_push_nostat\n"); exit(1); }
-            arr.arr.items = new_items;
-            arr.arr.cap = new_cap;
+            HX_SET_ARR_ITEMS(arr, new_items);
+            HX_SET_ARR_CAP(arr, new_cap);
         }
     }
-    arr.arr.items[arr.arr.len] = item;
-    arr.arr.len++;
+    HX_ARR_ITEMS(arr)[HX_ARR_LEN(arr)] = item;
+    HX_SET_ARR_LEN(arr, HX_ARR_LEN(arr) + 1);
     return arr;
 }
 
@@ -899,7 +909,7 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal out = {.tag=TAG_ARRAY};
-    out.arr.items = NULL; out.arr.len = 0; out.arr.cap = 0;
+    HX_SET_ARR_ITEMS(out, NULL); HX_SET_ARR_LEN(out, 0); HX_SET_ARR_CAP(out, 0);
     if (!HX_IS_ARRAY(arr)) return out;
     int n = HX_ARR_LEN(arr);
     int a = (int)HX_INT(start), b = (int)HX_INT(end);
@@ -934,10 +944,10 @@ HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
         items = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)m);
         if (!items) { fprintf(stderr, "OOM in array_slice_fast\n"); exit(1); }
     }
-    memcpy(items, arr.arr.items + a, sizeof(HexaVal) * (size_t)m);
-    out.arr.items = items;
-    out.arr.len = m;
-    out.arr.cap = use_arena ? -m : m;
+    memcpy(items, HX_ARR_ITEMS(arr) + a, sizeof(HexaVal) * (size_t)m);
+    HX_SET_ARR_ITEMS(out, items);
+    HX_SET_ARR_LEN(out, m);
+    HX_SET_ARR_CAP(out, use_arena ? -m : m);
     return out;
 }
 
@@ -978,8 +988,8 @@ HexaVal hexa_array_truncate(HexaVal arr, HexaVal new_len_v) {
     if (!HX_IS_ARRAY(arr)) return arr;
     int64_t new_len = HX_IS_INT(new_len_v) ? HX_INT(new_len_v) : (int64_t)HX_INT(new_len_v);
     if (new_len < 0) new_len = 0;
-    if (new_len > arr.arr.len) new_len = arr.arr.len;
-    arr.arr.len = (int)new_len;
+    if (new_len > HX_ARR_LEN(arr)) new_len = HX_ARR_LEN(arr);
+    HX_SET_ARR_LEN(arr, (int)new_len);
     return arr;
 }
 
@@ -1086,8 +1096,8 @@ static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
 HexaVal hexa_map_new() {
     if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
-    v.map.tbl = NULL;
-    v.map.len = 0;
+    HX_SET_MAP_TBL(v, NULL);
+    HX_SET_MAP_LEN(v, 0);
     return v;
 }
 
@@ -1115,7 +1125,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
     int from_arena = (type_name && type_name[0]) ?
                      (hexa_val_arena_on() && __hexa_val_mark_top > 0) : 0;
     HexaMapTable* t = hmap_alloc_ex(cap, from_arena);
-    v.map.tbl = t;
+    HX_SET_MAP_TBL(v, t);
     uint32_t mask = (uint32_t)(cap - 1);
     // Insert __type__ first (skip for anonymous map literals where
     // type_name is "" — they don't carry a __type__ field).
@@ -1175,7 +1185,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
         t->order_vals[t->len] = vals[i];
         t->len++;
     }
-    v.map.len = t->len;
+    HX_SET_MAP_LEN(v, t->len);
     return v;
 }
 
@@ -1186,10 +1196,10 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
     }
     if (_hx_stats_on()) _hx_stats_map_set++;
     // Lazy-alloc table on first insert
-    if (!m.map.tbl) {
-        m.map.tbl = hmap_alloc(HMAP_INIT_CAP);
+    if (!HX_MAP_TBL(m)) {
+        HX_SET_MAP_TBL(m, hmap_alloc(HMAP_INIT_CAP));
     }
-    HexaMapTable* t = m.map.tbl;
+    HexaMapTable* t = HX_MAP_TBL(m);
     uint32_t h = hexa_fnv1a_str(key);
 
     // Check if key exists (O(1) average)
@@ -1240,7 +1250,7 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
     t->order_keys[t->len] = t->slots[idx].key;  // shared pointer, not a copy
     t->order_vals[t->len] = val;
     t->len++;
-    m.map.len = t->len;
+    HX_SET_MAP_LEN(m, t->len);
     return m;
 }
 
@@ -1249,11 +1259,11 @@ HexaVal hexa_map_get(HexaVal m, const char* key) {
     if (HX_IS_VALSTRUCT(m)) {
         return hexa_valstruct_get_by_key(m, key);
     }
-    if (!m.map.tbl) {
+    if (!HX_MAP_TBL(m)) {
         fprintf(stderr, "map key '%s' not found\n", key);
         return hexa_void();
     }
-    HexaMapTable* t = m.map.tbl;
+    HexaMapTable* t = HX_MAP_TBL(m);
     uint32_t h = hexa_fnv1a_str(key);
     int si = hmap_find(t, key, h);
     if (si >= 0) return t->vals[si];
@@ -1336,20 +1346,20 @@ static HexaVal hexa_map_get_ic_slow(HexaVal m, const char* key, HexaIC* ic) {
 // rt#32-N build-fix: m.map.{keys,vals} -> m.map.tbl->{order_keys,order_vals}
 #define hexa_map_get_ic(M, KEY, IC) \
     ({ HexaVal __ic_m = (M); HexaIC* __ic = (IC); \
-       (__ic_m.map.tbl \
-        && (void*)__ic_m.map.tbl->order_keys == __ic->keys_ptr \
-        && __ic_m.map.tbl->len == __ic->len \
+       (HX_MAP_TBL(__ic_m) \
+        && (void*)HX_MAP_TBL(__ic_m)->order_keys == __ic->keys_ptr \
+        && HX_MAP_TBL(__ic_m)->len == __ic->len \
         && __ic->idx < __ic->len) \
            ? (g_hexa_ic_stats_enabled > 0 \
-              ? (__ic->hits++, g_hexa_ic_hits++, __ic_m.map.tbl->order_vals[__ic->idx]) \
-              : __ic_m.map.tbl->order_vals[__ic->idx]) \
+              ? (__ic->hits++, g_hexa_ic_hits++, HX_MAP_TBL(__ic_m)->order_vals[__ic->idx]) \
+              : HX_MAP_TBL(__ic_m)->order_vals[__ic->idx]) \
            : hexa_map_get_ic_slow(__ic_m, (KEY), __ic); })
 
 
 HexaVal hexa_map_keys(HexaVal m) {
     HexaVal arr = hexa_array_new();
-    if (!m.map.tbl) return arr;
-    HexaMapTable* t = m.map.tbl;
+    if (!HX_MAP_TBL(m)) return arr;
+    HexaMapTable* t = HX_MAP_TBL(m);
     arr = hexa_array_reserve(arr, t->len);
     for (int i = 0; i < t->len; i++) {
         arr = hexa_array_push(arr, hexa_str(t->order_keys[i]));
@@ -1359,8 +1369,8 @@ HexaVal hexa_map_keys(HexaVal m) {
 
 HexaVal hexa_map_values(HexaVal m) {
     HexaVal arr = hexa_array_new();
-    if (!m.map.tbl) return arr;
-    HexaMapTable* t = m.map.tbl;
+    if (!HX_MAP_TBL(m)) return arr;
+    HexaMapTable* t = HX_MAP_TBL(m);
     arr = hexa_array_reserve(arr, t->len);
     for (int i = 0; i < t->len; i++) {
         arr = hexa_array_push(arr, t->order_vals[i]);
@@ -1369,14 +1379,14 @@ HexaVal hexa_map_values(HexaVal m) {
 }
 
 int hexa_map_contains_key(HexaVal m, const char* key) {
-    if (!m.map.tbl) return 0;
+    if (!HX_MAP_TBL(m)) return 0;
     uint32_t h = hexa_fnv1a_str(key);
-    return hmap_find(m.map.tbl, key, h) >= 0;
+    return hmap_find(HX_MAP_TBL(m), key, h) >= 0;
 }
 
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
-    if (!m.map.tbl) return m;
-    HexaMapTable* t = m.map.tbl;
+    if (!HX_MAP_TBL(m)) return m;
+    HexaMapTable* t = HX_MAP_TBL(m);
     uint32_t h = hexa_fnv1a_str(key);
     int si = hmap_find(t, key, h);
     if (si < 0) return m;
@@ -1415,7 +1425,7 @@ HexaVal hexa_map_remove(HexaVal m, const char* key) {
     }
 
     t->len--;
-    m.map.len = t->len;
+    HX_SET_MAP_LEN(m, t->len);
     return m;
 }
 
@@ -1985,18 +1995,18 @@ static HexaMapTable* hmap_heapify(HexaMapTable* src) {
 HexaVal hexa_val_heapify(HexaVal v) {
     switch (HX_TAG(v)) {
         case TAG_MAP:
-            if (v.map.tbl && v.map.tbl->from_arena) {
-                HexaMapTable* heap_tbl = hmap_heapify(v.map.tbl);
-                v.map.tbl = heap_tbl;
-                v.map.len = heap_tbl ? heap_tbl->len : 0;
-            } else if (v.map.tbl) {
+            if (HX_MAP_TBL(v) && HX_MAP_TBL(v)->from_arena) {
+                HexaMapTable* heap_tbl = hmap_heapify(HX_MAP_TBL(v));
+                HX_SET_MAP_TBL(v, heap_tbl);
+                HX_SET_MAP_LEN(v, heap_tbl ? heap_tbl->len : 0);
+            } else if (HX_MAP_TBL(v)) {
                 // Heap table — but its values may include arena maps. Walk.
-                for (int i = 0; i < v.map.tbl->len; i++) {
-                    v.map.tbl->order_vals[i] = hexa_val_heapify(v.map.tbl->order_vals[i]);
+                for (int i = 0; i < HX_MAP_TBL(v)->len; i++) {
+                    HX_MAP_TBL(v)->order_vals[i] = hexa_val_heapify(HX_MAP_TBL(v)->order_vals[i]);
                     // Also fix the hash slot's mirror so later lookups see the heap copy.
-                    int si = hmap_find(v.map.tbl, v.map.tbl->order_keys[i],
-                                       hexa_fnv1a_str(v.map.tbl->order_keys[i]));
-                    if (si >= 0) v.map.tbl->vals[si] = v.map.tbl->order_vals[i];
+                    int si = hmap_find(HX_MAP_TBL(v), HX_MAP_TBL(v)->order_keys[i],
+                                       hexa_fnv1a_str(HX_MAP_TBL(v)->order_keys[i]));
+                    if (si >= 0) HX_MAP_TBL(v)->vals[si] = HX_MAP_TBL(v)->order_vals[i];
                 }
             }
             return v;
@@ -2004,19 +2014,19 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // rt 32-M: if cap<0, items buffer is arena-backed — deep-copy to
             // malloc before the rewind. Then heapify nested elements (rt 32-L
             // handles nested arena maps / valstructs / strings).
-            if (v.arr.cap < 0 && v.arr.items) {
+            if (HX_ARR_CAP(v) < 0 && HX_ARR_ITEMS(v)) {
                 if (_hx_stats_on()) _hx_stats_array_arena_heapify++;
-                int real_cap = -v.arr.cap;
-                HexaVal* heap = hexa_array_promote_to_heap(v.arr.items, v.arr.len, real_cap);
+                int real_cap = -HX_ARR_CAP(v);
+                HexaVal* heap = hexa_array_promote_to_heap(HX_ARR_ITEMS(v), HX_ARR_LEN(v), real_cap);
                 if (heap) {
-                    v.arr.items = heap;
-                    v.arr.cap = real_cap;  // positive → heap
+                    HX_SET_ARR_ITEMS(v, heap);
+                    HX_SET_ARR_CAP(v, real_cap);  // positive → heap
                 }
                 // On OOM we leave the arena pointer; caller may see invalid
                 // memory after rewind — best-effort semantics match Val arena.
             }
-            for (int i = 0; i < v.arr.len; i++) {
-                v.arr.items[i] = hexa_val_heapify(v.arr.items[i]);
+            for (int i = 0; i < HX_ARR_LEN(v); i++) {
+                HX_ARR_ITEMS(v)[i] = hexa_val_heapify(HX_ARR_ITEMS(v)[i]);
             }
             return v;
         }
@@ -2039,8 +2049,8 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // env_box itself is malloc'd in hexa_closure_new — never arena.
             // But the captured array stored inside it may transitively contain
             // arena maps (params/body/captures). Recurse into env_box's value.
-            if (v.clo.env_box) {
-                *v.clo.env_box = hexa_val_heapify(*v.clo.env_box);
+            if (HX_CLO_ENV(v)) {
+                *HX_CLO_ENV(v) = hexa_val_heapify(*HX_CLO_ENV(v));
             }
             return v;
         }
@@ -2282,9 +2292,9 @@ static int hexa_sort_cmp(const void* a, const void* b) {
 HexaVal hexa_array_sort(HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return arr;
     HexaVal result = arr;
-    result.arr.items = (HexaVal*)malloc(sizeof(HexaVal) * arr.arr.len);
-    memcpy(result.arr.items, arr.arr.items, sizeof(HexaVal) * arr.arr.len);
-    qsort(result.arr.items, result.arr.len, sizeof(HexaVal), hexa_sort_cmp);
+    HX_SET_ARR_ITEMS(result, (HexaVal*)malloc(sizeof(HexaVal) * HX_ARR_LEN(arr)));
+    memcpy(HX_ARR_ITEMS(result), HX_ARR_ITEMS(arr), sizeof(HexaVal) * HX_ARR_LEN(arr));
+    qsort(HX_ARR_ITEMS(result), HX_ARR_LEN(result), sizeof(HexaVal), hexa_sort_cmp);
     return result;
 }
 
@@ -2557,13 +2567,7 @@ HexaVal hexa_sqrt(HexaVal v) {
 }
 
 HexaVal hexa_pow(HexaVal base, HexaVal exp) {
-    double r = pow(__hx_to_double(base), __hx_to_double(exp));
-    // When both args are int and result fits int64, return int to match
-    // interpreter semantics (val_int wraps the result).
-    if (HX_IS_INT(base) && HX_IS_INT(exp) && r == (double)(int64_t)r) {
-        return hexa_int((int64_t)r);
-    }
-    return hexa_float(r);
+    return hexa_float(pow(__hx_to_double(base), __hx_to_double(exp)));
 }
 
 HexaVal hexa_floor(HexaVal v) {
@@ -3782,21 +3786,21 @@ HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
 
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
     if (!HX_IS_ARRAY(arr)) return hexa_array_new();
-    int n = arr.arr.len;
+    int n = HX_ARR_LEN(arr);
     int a = (int)start.i, b = (int)end.i;
     if (a < 0) a = 0;
     if (b > n) b = n;
     if (a > b) a = b;
     HexaVal out = hexa_array_new();
-    for (int i = a; i < b; i++) out = hexa_array_push(out, arr.arr.items[i]);
+    for (int i = a; i < b; i++) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
     return out;
 }
 
 HexaVal hexa_array_map(HexaVal arr, HexaVal fn) {
     if (!HX_IS_ARRAY(arr)) return hexa_array_new();
     HexaVal out = hexa_array_new();
-    for (int i = 0; i < arr.arr.len; i++) {
-        out = hexa_array_push(out, hexa_call1(fn, arr.arr.items[i]));
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        out = hexa_array_push(out, hexa_call1(fn, HX_ARR_ITEMS(arr)[i]));
     }
     return out;
 }
@@ -3804,9 +3808,9 @@ HexaVal hexa_array_map(HexaVal arr, HexaVal fn) {
 HexaVal hexa_array_filter(HexaVal arr, HexaVal fn) {
     if (!HX_IS_ARRAY(arr)) return hexa_array_new();
     HexaVal out = hexa_array_new();
-    for (int i = 0; i < arr.arr.len; i++) {
-        HexaVal keep = hexa_call1(fn, arr.arr.items[i]);
-        if (hexa_truthy(keep)) out = hexa_array_push(out, arr.arr.items[i]);
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal keep = hexa_call1(fn, HX_ARR_ITEMS(arr)[i]);
+        if (hexa_truthy(keep)) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
     }
     return out;
 }
@@ -3814,16 +3818,16 @@ HexaVal hexa_array_filter(HexaVal arr, HexaVal fn) {
 HexaVal hexa_array_fold(HexaVal arr, HexaVal init, HexaVal fn) {
     if (!HX_IS_ARRAY(arr)) return init;
     HexaVal acc = init;
-    for (int i = 0; i < arr.arr.len; i++) {
-        acc = hexa_call2(fn, acc, arr.arr.items[i]);
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        acc = hexa_call2(fn, acc, HX_ARR_ITEMS(arr)[i]);
     }
     return acc;
 }
 
 HexaVal hexa_array_index_of(HexaVal arr, HexaVal item) {
     if (!HX_IS_ARRAY(arr)) return hexa_int(-1);
-    for (int i = 0; i < arr.arr.len; i++) {
-        if (hexa_truthy(hexa_eq(arr.arr.items[i], item))) return hexa_int(i);
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        if (hexa_truthy(hexa_eq(HX_ARR_ITEMS(arr)[i], item))) return hexa_int(i);
     }
     return hexa_int(-1);
 }
