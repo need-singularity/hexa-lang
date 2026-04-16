@@ -27,7 +27,7 @@ static void _hexa_init_stdio(void) {
 //  Lazily initialized on first hexa_intern() call.
 // ═══════════════════════════════════════════════════════════
 
-#define INTERN_INIT_CAP   256
+#define INTERN_INIT_CAP   1024
 #define INTERN_MAX_LEN    64
 #define INTERN_LOAD_MAX   75   // percent
 
@@ -153,6 +153,7 @@ HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
 HexaVal hexa_read_file(HexaVal path);
 HexaVal hexa_write_file(HexaVal path, HexaVal content);
 HexaVal hexa_write_bytes(HexaVal path, HexaVal arr);
+HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr);
 HexaVal hexa_read_file_bytes(HexaVal path);
 HexaVal hexa_str_split(HexaVal s, HexaVal delim);
 HexaVal hexa_str_trim(HexaVal s);
@@ -716,10 +717,12 @@ static int64_t _hx_stats_str_concat_arena = 0; // str_concat calls that hit aren
 static int64_t _hx_stats_array_arena_alloc   = 0; // push that went arena (initial slot buf)
 static int64_t _hx_stats_array_arena_promote = 0; // arena→heap promotions on grow
 static int64_t _hx_stats_array_arena_heapify = 0; // heapify copies of arena item buffers
+// M4: string arena heapify stats
+static int64_t _hx_stats_str_arena_heapify   = 0; // arena→heap string promotions
 static int _hx_stats_enabled = -1;             // lazy probe of env
 
 static void _hx_stats_dump(void) {
-    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld arr_arena_alloc=%lld arr_arena_promote=%lld arr_arena_heapify=%lld\n",
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld arr_arena_alloc=%lld arr_arena_promote=%lld arr_arena_heapify=%lld str_arena_heapify=%lld\n",
         (long long)_hx_stats_array_new,
         (long long)_hx_stats_array_push,
         (long long)_hx_stats_array_grow,
@@ -733,7 +736,8 @@ static void _hx_stats_dump(void) {
         (long long)_hx_stats_str_concat_arena,
         (long long)_hx_stats_array_arena_alloc,
         (long long)_hx_stats_array_arena_promote,
-        (long long)_hx_stats_array_arena_heapify);
+        (long long)_hx_stats_array_arena_heapify,
+        (long long)_hx_stats_str_arena_heapify);
 }
 
 static int _hx_stats_on(void) {
@@ -1767,14 +1771,10 @@ HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val) {
 // a future FFI binding) can dispose an entire scope's worth of string
 // temporaries in one pointer reset.
 //
-// Opt-in via HEXA_STR_ARENA=1. Default OFF for safety: strings returned by
-// hexa_str_concat can escape the caller's scope through closures, return
-// values, or map inserts, and without real escape analysis we cannot prove
-// the lifetime matches the surrounding scope. Enabling the arena in
-// short-lived bench processes (d64 200 step micro) is safe in practice
-// because the process exit frees everything anyway; longer-running programs
-// should adopt mark/rewind discipline on scope transitions before turning
-// this on.
+// M4 16GB optimization: HEXA_STR_ARENA=1 by default (was OFF). The fn-arena
+// scoping (STRUCTURAL-7: __hexa_fn_arena_enter/return) now handles escape
+// analysis for return values, and hexa_val_heapify handles arena strings in
+// maps/arrays/closures. Set HEXA_STR_ARENA=0 to disable if regressions appear.
 //
 // P2 scope (accepted partial): mark/rewind API + opt-in gate only. Hexa-level
 // wiring into env_push_scope/env_pop_scope is a follow-up (requires
@@ -1806,7 +1806,8 @@ static int __hexa_arena_enabled = -1;     // lazy env probe
 static int hexa_arena_on(void) {
     if (__hexa_arena_enabled < 0) {
         const char* e = getenv("HEXA_STR_ARENA");
-        __hexa_arena_enabled = (e && e[0] && e[0] != '0') ? 1 : 0;
+        // M4: default ON (was OFF). Env var HEXA_STR_ARENA=0 disables.
+        __hexa_arena_enabled = (e && e[0] == '0') ? 0 : 1;
     }
     return __hexa_arena_enabled;
 }
@@ -2120,6 +2121,7 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 char* end = base + b->cap;
                 if (HX_STR(v) >= base && HX_STR(v) < end) {
                     HX_SET_STR(v, strdup(HX_STR(v)));
+                    if (_hx_stats_on()) _hx_stats_str_arena_heapify++;
                     break;
                 }
             }
@@ -2139,7 +2141,13 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // fib hot path) to malloc'd storage. Polymorphic field slots are
             // recursively heapified — closure bodies / param arrays / nested
             // structs all need the same treatment.
-            if (!HX_VS(v)) return v;
+            // 2026-04-17 guard: codegen_c2_extended driver repro produced
+            // v.vs = 0x0E (sub-page garbage pointer) reaching this case.
+            // Previously caused SIGSEGV at HX_VSF deref. Skip heapify when
+            // pointer is obviously invalid — best-effort, same intent as the
+            // NULL check above. Sub-page guard (< 0x1000) catches small-int
+            // bleed-through without blocking real arena/heap pointers.
+            if (!HX_VS(v) || (uintptr_t)HX_VS(v) < 0x1000) return v;
             if (HX_VSF(v, from_arena)) {
                 HexaValStruct* dst = (HexaValStruct*)malloc(sizeof(HexaValStruct));
                 if (!dst) return v;  // OOM — caller will see arena pointer (best-effort)
@@ -2630,6 +2638,44 @@ HexaVal hexa_write_bytes(HexaVal path, HexaVal arr) {
         HexaVal* items = HX_ARR_ITEMS(arr);
         for (int i = 0; i < len; i++) {
             int64_t v = HX_IS_INT(items[i]) ? HX_INT(items[i]) : (int64_t)HX_FLOAT(items[i]);
+            buf[i] = (unsigned char)(v & 0xFF);
+        }
+        fwrite(buf, 1, len, f);
+        free(buf);
+    }
+    fclose(f);
+    return hexa_bool(1);
+}
+
+// hexa_write_bytes_v: variant called from the interpreter dispatch where each
+// array item is a TAG_VALSTRUCT (Val) rather than a raw HexaVal int. Reads
+// the inner `int_val` field from each Val and writes the low byte. Without
+// this, write_bytes from interpreted user code silently no-ops (HX_IS_INT
+// fails on TAG_VALSTRUCT items) or — with the historical fputs path — UTF-8
+// encodes each byte > 0x7F to two bytes. (2026-04-17)
+HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
+    int len = HX_ARR_LEN(arr);
+    FILE* f = fopen(HX_STR(path), "wb");
+    if (!f) return hexa_bool(0);
+    if (len > 0) {
+        unsigned char* buf = (unsigned char*)malloc(len);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (int i = 0; i < len; i++) {
+            HexaVal item = items[i];
+            int64_t v = 0;
+            if (HX_IS_INT(item)) {
+                v = HX_INT(item);
+            } else if (HX_TAG(item) == TAG_FLOAT) {
+                v = (int64_t)HX_FLOAT(item);
+            } else if (HX_TAG(item) == TAG_VALSTRUCT) {
+                HexaVal iv = hexa_valstruct_int(item);
+                if (HX_IS_INT(iv)) {
+                    v = HX_INT(iv);
+                } else if (HX_TAG(iv) == TAG_FLOAT) {
+                    v = (int64_t)HX_FLOAT(iv);
+                }
+            }
             buf[i] = (unsigned char)(v & 0xFF);
         }
         fwrite(buf, 1, len, f);

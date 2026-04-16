@@ -4828,6 +4828,10 @@ let TAG_BIGINT = 17
 let TAG_NOT_BUILTIN = 18
 let TAG_NOT_FUSED = 19
 
+// ── O(n²) string concat detection ───────────────────────
+let mut __str_concat_count = 0
+let mut __str_concat_warned = 0
+
 fn tag_name(t) {
     if t == TAG_INT { return "int" }
     if t == TAG_FLOAT { return "float" }
@@ -7368,10 +7372,20 @@ fn eval_binop(op, a, b) {
     }
     // String concatenation (str + anything)
     if a.tag == TAG_STR && oid == OP_ADD {
+        __str_concat_count = __str_concat_count + 1
+        if __str_concat_count > 100 && __str_concat_warned == 0 {
+            eprintln("PERF: " + to_string(__str_concat_count) + " string concatenations detected — likely O(n^2) loop. Use parts.push() + .join() instead.")
+            __str_concat_warned = 1
+        }
         return val_str(a.str_val + val_to_string(b))
     }
     // Char + String / Char + Char concatenation
     if a.tag == TAG_CHAR && oid == OP_ADD {
+        __str_concat_count = __str_concat_count + 1
+        if __str_concat_count > 100 && __str_concat_warned == 0 {
+            eprintln("PERF: " + to_string(__str_concat_count) + " string concatenations detected — likely O(n^2) loop. Use parts.push() + .join() instead.")
+            __str_concat_warned = 1
+        }
         return val_str(a.str_val + val_to_string(b))
     }
     // Float arithmetic (with int-to-float coercion)
@@ -9083,8 +9097,9 @@ fn call_builtin(name, args) {
     let not_builtin = Val { tag: TAG_NOT_BUILTIN, int_val: 0, float_val: 0.0, bool_val: false, str_val: __E, char_val: __E, array_val: __E, fn_name: __E, fn_params: __E, fn_body: __E, struct_name: __E, struct_fields: __E }
 
     if name == "println" {
-        let mut out = ""
-        for a in args { out = out + val_to_string(a) }
+        let mut parts = []
+        for a in args { parts = parts.push(val_to_string(a)) }
+        let out = parts.join("")
         // R19: BrokenPipe(파이프 조기 종료) 감지 → graceful exit(0).
         // | head, | tail 등으로 consumer 종료 시 silent exit 1 방지.
         try {
@@ -9100,8 +9115,9 @@ fn call_builtin(name, args) {
         return val_void()
     }
     if name == "eprintln" {
-        let mut out = ""
-        for a in args { out = out + val_to_string(a) }
+        let mut parts = []
+        for a in args { parts = parts.push(val_to_string(a)) }
+        let out = parts.join("")
         try {
             eprintln(out)
         } catch e {
@@ -9116,8 +9132,9 @@ fn call_builtin(name, args) {
         return val_void()
     }
     if name == "print" {
-        let mut out = ""
-        for a in args { out = out + val_to_string(a) }
+        let mut parts = []
+        for a in args { parts = parts.push(val_to_string(a)) }
+        let out = parts.join("")
         try {
             print(out)
         } catch e {
@@ -9145,6 +9162,15 @@ fn call_builtin(name, args) {
     }
     if name == "exec_with_status" {
         if len(args) == 0 { return val_array([val_str(""), val_int(0)]) }
+        // KNOWN BUG (2026-04-17): exit code is always 0 because popen-based
+        // hexa_exec discards pclose status. Build scripts that rely on
+        // exec_with_status[1] to detect failure see fake success. Sentinel
+        // wrapper attempt was reverted because the interpreter's `Ident OP
+        // IntLit` regression (Val field access via known-int unboxing)
+        // breaks the parsing logic. Real fix needs hexa_exec_with_status C
+        // function that returns [stdout, exit_code] from a single popen
+        // call — wire it via codegen builtin lowering once interpreter regs
+        // are stable.
         try {
             let result = exec(args[0].str_val)
             return val_array([val_str(result), val_int(0)])
@@ -9197,16 +9223,15 @@ fn call_builtin(name, args) {
         let sep = if len(args) > 1 { args[1].str_val } else { "" }
         if arr.tag != TAG_ARRAY { return val_str("") }
         let items = get_array(arr)
-        let mut out = ""
+        let mut parts = []
         let mut _ji = 0
         while _ji < len(items) {
-            if _ji > 0 { out = out + sep }
             let item = items[_ji]
-            if item.tag == TAG_STR { out = out + item.str_val }
-            else { out = out + val_to_string(item) }
+            if item.tag == TAG_STR { parts = parts.push(item.str_val) }
+            else { parts = parts.push(val_to_string(item)) }
             _ji = _ji + 1
         }
-        return val_str(out)
+        return val_str(parts.join(sep))
     }
     if name == "args" || name == "argv" {
         let a = host_args()
@@ -11378,16 +11403,21 @@ fn call_builtin(name, args) {
     }
     if name == "read_file_bytes" {
         if len(args) == 0 { return val_array([]) }
-        let s = read_file(args[0].str_val)
+        let raw = read_file_bytes(args[0].str_val)
         let mut out = []
-        let cs = s.chars()
-        for c in cs { out = out.push(val_int(char_code(to_string(c), 0))) }
+        for b in raw { out = out.push(val_int(b)) }
         return val_array(out)
     }
     if name == "write_file_bytes" || name == "write_bytes" {
         if len(args) < 2 { return val_void() }
-        println("[DEBUG-WB-MARKER]")
-        write_bytes(args[0].str_val, args[1])
+        // Interpreter args are Val-wrapped — args[1] is TAG_VALSTRUCT around
+        // the user's array. Unwrap to the raw TAG_ARRAY (array_store entry)
+        // and call write_bytes_v which reads each item's `int_val` from the
+        // Val struct rather than treating each item as a raw HexaVal int.
+        // Without this, write_bytes either silently no-ops (NEW pipeline) or
+        // UTF-8-encodes each byte > 0x7F to two bytes (legacy fputs path).
+        let raw_arr = get_array(args[1])
+        write_bytes_v(args[0].str_val, raw_arr)
         return val_void()
     }
 
@@ -12956,13 +12986,13 @@ fn call_builtin(name, args) {
         if len(args) >= 2 && args[0].tag == TAG_STR {
             let s = args[0].str_val
             let n = args[1].int_val
-            let mut out = ""
+            let mut parts = []
             let mut ri = 0
             while ri < n {
-                out = out + s
+                parts = parts.push(s)
                 ri = ri + 1
             }
-            return val_str(out)
+            return val_str(parts.join(""))
         }
         return val_str("")
     }
@@ -16381,6 +16411,8 @@ fn interpret(ast) {
     __VAL_INT_CACHE = []
     __VAL_INT_CACHE_LEN = 0
     __init_val_int_cache()
+    __str_concat_count = 0
+    __str_concat_warned = 0
 
     // ─── FIX-9-1: Top-level FnDecl pre-registration pass ───
     // Rust interpreter.rs:run() 와 동일 패턴. 본 실행 루프 전에 모든 FnDecl 을
