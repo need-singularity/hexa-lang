@@ -26,8 +26,16 @@ set -u
 ROOT="${HEXA_LANG:-/Users/ghost/Dev/hexa-lang}"
 cd "$ROOT"
 
+# ── Duplicate run prevention (mkdir-based, macOS-safe) ──
+LOCKDIR="/tmp/hexa_stability_c3.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    echo "already running (lock: $LOCKDIR)" >&2; exit 1
+fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+
 BIN="${BIN:-$ROOT/build/hexa_stage0}"
 SCRIPT="$ROOT/scripts/stability_c3_pbv.hexa"
+: "${STABILITY_WALL_SEC:=300}"
 
 if [ ! -x "$BIN" ]; then
     echo "FATAL: $BIN not executable" >&2
@@ -54,7 +62,7 @@ T_START=$(perl -MTime::HiRes=time -e 'printf "%.3f", time()' 2>/dev/null || date
 STABILITY_ITERS="$ITERS" \
 STABILITY_SAMPLE="$SAMPLE" \
 STABILITY_LOG_CAP="$LOG_CAP" \
-"$BIN" "$SCRIPT" 2>&1 | tee "$LOG"
+timeout --kill-after=5 "$STABILITY_WALL_SEC" "$BIN" "$SCRIPT" 2>&1 | tee "$LOG"
 RC="${PIPESTATUS[0]}"
 
 T_END=$(perl -MTime::HiRes=time -e 'printf "%.3f", time()' 2>/dev/null || date +%s)

@@ -21,6 +21,13 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# ── Duplicate run prevention (mkdir-based, macOS-safe — no flock) ──
+LOCKDIR="/tmp/hexa_test_suite.lock"
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+    echo "already running (lock: $LOCKDIR)" >&2; exit 1
+fi
+trap 'rmdir "$LOCKDIR" 2>/dev/null || true' EXIT INT TERM
+
 # ── Isolation defaults ──
 : "${CPU_SEC:=30}"
 : "${RAM_MB:=2048}"
