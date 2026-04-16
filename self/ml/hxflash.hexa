@@ -1,0 +1,153 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/hxflash.hexa — Flash Attention FFI bindings (C8 Day-1 MVP)
+//
+//  Binds to self/native/hxflash_linux.c (libhxflash.so/.dylib).
+//  Exposes the forward-only tile-wise attention kernel:
+//
+//    hxflash_attn_fwd(S, D, n_heads, n_kv_heads, Br, Bc, causal,
+//                     Q, K, V, O, scale)
+//      O = softmax(Q·K^T·scale) · V    (non-causal when causal=0)
+//      O(S²·d) compute, O(Br·(d + Bc)) extra memory per tile.
+//
+//  Measurable gain vs pure-hexa flash_attention (self/ai_native/...):
+//    1) zero Hexa interpreter overhead in the inner loop
+//    2) contiguous float32 arithmetic, compiler-autovec
+//    3) single FFI dispatch per attention layer (not per tile)
+//
+//  The hexa caller packs Q/K/V into contiguous [n_heads, S, D] f32
+//  buffers (head-major), passes the raw Pointer, and reads O back.
+//  This mirrors self/ml/hxlayer.hexa :: fused_rmsnorm_silu.
+//
+//  Platform resolution (@link("hxflash")):
+//    Mac   : DYLD_LIBRARY_PATH → libhxflash.dylib (built with --mac-native)
+//    Linux : LD_LIBRARY_PATH   → libhxflash.so
+//    Same source, same symbol set. See scripts/build_hxflash_linux.sh.
+//
+//  Pure-hexa reference: self/ai_native/flash_attention.hexa :: flash_attention
+//  — used by test_flash_attention.hexa T8 to diff against this FFI path.
+// ═══════════════════════════════════════════════════════════════
+
+// ── ABI bindings ────────────────────────────────────────────────
+// Pointers are passed as *Void (hexa Pointer == u64) — the runtime
+// marshalls them as int64 to the C side, matching the uintptr_t cast
+// in hxflash_linux.c. `scale` is float (f64) on hexa, cast to f32 inside.
+
+@link("hxflash")
+extern fn hxflash_attn_fwd(S: int, D: int, n_heads: int, n_kv_heads: int,
+                           Br: int, Bc: int, causal: int,
+                           Q: *Void, K: *Void, V: *Void, O: *Void,
+                           scale: float)
+
+@link("hxflash")
+extern fn hxflash_version() -> int
+
+// ── helper: 2D [S][D] matrix → flat [n_heads=1] raw f32 buffer ──
+// Day-1 single-head pack; multi-head variants replicate the matrix
+// layout per head in head-major order (h*S*D + i*D + k).
+fn hxflash_pack_2d(M, buf, head_idx, S, D) {
+    let base = head_idx * S * D
+    for i in 0..S {
+        for k in 0..D {
+            write_f32(buf, (base + i * D + k) * 4, M[i][k])
+        }
+    }
+    return 0
+}
+
+fn hxflash_unpack_2d(buf, head_idx, S, D) {
+    let base = head_idx * S * D
+    let mut M = []
+    for i in 0..S {
+        let mut row = []
+        for k in 0..D {
+            row = row + [deref_f32(buf, (base + i * D + k) * 4)]
+        }
+        M = M + [row]
+    }
+    return M
+}
+
+// ── High-level wrapper (single-head, non-causal default) ────────
+// Allocates 4 raw f32 buffers, calls the fused kernel, reads back
+// into a hexa [S][D] matrix. Copies are deliberate — Day-1 proves
+// the FFI path works end-to-end. A zero-copy Tensor-in/Tensor-out
+// variant will land in Day-2 alongside a batched signature.
+//
+// Q, K, V : [S][D] 2D nested arrays of float
+// Returns : O [S][D]
+pub fn fused_flash_attention(Q, K, V, S, D, n_heads, n_kv_heads, Br, Bc, causal) {
+    // Day-1 assumes the caller packs n_heads/n_kv_heads copies already
+    // if n_heads > 1. For the typical single-head smoke path we treat
+    // Q/K/V as [S][D] (head 0) and emit O same shape.
+    //
+    // For the FFI contract the buffers must hold the full multi-head
+    // layout; when n_heads == 1, this collapses to [S][D].
+    let q_bytes  = n_heads    * S * D * 4
+    let kv_bytes = n_kv_heads * S * D * 4
+    let o_bytes  = n_heads    * S * D * 4
+
+    let q_buf = alloc_raw(q_bytes)
+    let k_buf = alloc_raw(kv_bytes)
+    let v_buf = alloc_raw(kv_bytes)
+    let o_buf = alloc_raw(o_bytes)
+
+    // Pack head 0 only — caller supplies [S][D] for the common single-head
+    // test path. For multi-head use fused_flash_attention_mha below.
+    hxflash_pack_2d(Q, q_buf, 0, S, D)
+    hxflash_pack_2d(K, k_buf, 0, S, D)
+    hxflash_pack_2d(V, v_buf, 0, S, D)
+
+    let scale = 1.0 / sqrt(D * 1.0)
+
+    // Single fused dispatch (S²·d + online softmax → 1 FFI call).
+    hxflash_attn_fwd(S, D, n_heads, n_kv_heads, Br, Bc, causal,
+                     q_buf, k_buf, v_buf, o_buf, scale)
+
+    let O = hxflash_unpack_2d(o_buf, 0, S, D)
+
+    free_raw(q_buf, q_bytes)
+    free_raw(k_buf, kv_bytes)
+    free_raw(v_buf, kv_bytes)
+    free_raw(o_buf, o_bytes)
+
+    return O
+}
+
+// ── Multi-head variant ──────────────────────────────────────────
+// Qh, Kh, Vh : lists of per-head [S][D] matrices (outer len = n_heads
+// for Q, n_kv_heads for K/V). Returns list of per-head [S][D] outputs.
+// Single FFI dispatch covers all heads — the kernel loops over h
+// internally, respecting the GQA mapping.
+pub fn fused_flash_attention_mha(Qh, Kh, Vh, S, D, n_heads, n_kv_heads, Br, Bc, causal) {
+    let q_bytes  = n_heads    * S * D * 4
+    let kv_bytes = n_kv_heads * S * D * 4
+
+    let q_buf = alloc_raw(q_bytes)
+    let k_buf = alloc_raw(kv_bytes)
+    let v_buf = alloc_raw(kv_bytes)
+    let o_buf = alloc_raw(q_bytes)
+
+    for h in 0..n_heads {
+        hxflash_pack_2d(Qh[h], q_buf, h, S, D)
+    }
+    for h in 0..n_kv_heads {
+        hxflash_pack_2d(Kh[h], k_buf, h, S, D)
+        hxflash_pack_2d(Vh[h], v_buf, h, S, D)
+    }
+
+    let scale = 1.0 / sqrt(D * 1.0)
+    hxflash_attn_fwd(S, D, n_heads, n_kv_heads, Br, Bc, causal,
+                     q_buf, k_buf, v_buf, o_buf, scale)
+
+    let mut outs = []
+    for h in 0..n_heads {
+        outs = outs + [hxflash_unpack_2d(o_buf, h, S, D)]
+    }
+
+    free_raw(q_buf, q_bytes)
+    free_raw(k_buf, kv_bytes)
+    free_raw(v_buf, kv_bytes)
+    free_raw(o_buf, q_bytes)
+
+    return outs
+}
