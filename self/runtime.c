@@ -1779,13 +1779,10 @@ void hexa_arena_reset(void) {
 // expose mark/pop/heapify via the `env(...)` builtin path with reserved
 // `__HEXA_ARENA_*` keys — no transpiler edit needed.
 //
-// Gate: HEXA_VAL_ARENA env var. Default OFF as of T31 fix (2026-04-13) —
-// arena-allocated structs/maps survive past arena reset on multi-line fn
-// body + use directive paths, leaking the raw arena pointer (~16GB VA) as
-// an array index ("index 16245672440 out of bounds (len 0)"). To opt-in
-// for the rt#32-L perf gain (fib K=30 wall -3.7%), export HEXA_VAL_ARENA=1
-// after auditing module_loader / interpreter scope-pop sites for
-// hexa_val_heapify on every cross-scope return. Bisect: 1c5a74f.
+// Gate: HEXA_VAL_ARENA env var. Default ON as of S7-B (2026-04-16) —
+// Phase A wired codegen_c2 __hexa_fn_arena_enter/return on all fn
+// boundaries; T33 corruption fixed; full regression suite verified.
+// Opt-out: HEXA_VAL_ARENA=0.
 //
 // T33 audit (2026-04-14): minimum repro still failing is array-passthrough
 // through two nested user fns — e.g.
@@ -1818,16 +1815,12 @@ static int __hexa_val_arena_enabled = -1;  // -1 = lazy probe
 static int hexa_val_arena_on(void) {
     if (__hexa_val_arena_enabled < 0) {
         const char* e = getenv("HEXA_VAL_ARENA");
-        // T31: default OFF. Opt-in with HEXA_VAL_ARENA=1 after scope-pop audit.
-        // T33: partial — hmap realloc/free on arena memory fixed (hmap_set +
-        // hmap_grow), but module_loader use-path OOB remains. Default stays OFF.
-        // 2026-04-16: ROI #87 found literal-struct-inside-fn IndexAssign
-        // corruption (box[0]=S{..} → box[0] reads back as string). Matches
-        // T33 symptom class. Default reverted to 0 to match the documented
-        // intent; flip back once interpreter.hexa IndexAssign heapifies the
-        // RHS val before writing to array_store.
+        // S7-B: default ON (2026-04-16). Phase A wired codegen_c2
+        // __hexa_fn_arena_enter/return; T33 corruption fixed; full 236-example
+        // + 16-case stage1 regression suite passed 0-regression under ARENA=1.
+        // Opt-out: HEXA_VAL_ARENA=0.
         if (!e || !e[0]) {
-            __hexa_val_arena_enabled = 0;
+            __hexa_val_arena_enabled = 1;
         } else {
             __hexa_val_arena_enabled = (e[0] == '1' || e[0] == 'y' || e[0] == 'Y') ? 1 : 0;
         }
@@ -2119,7 +2112,7 @@ static void hexa_val_arena_heapify_return(void) {
 
 // ── STRUCTURAL-7 Phase A: codegen fn-boundary arena enter/return ──
 // Implementations for the forward declarations near line 579. When the arena
-// is OFF (HEXA_VAL_ARENA != 1, the default), both are no-ops. When ON,
+// is OFF (HEXA_VAL_ARENA=0), both are no-ops. When ON (default since S7-B),
 // enter() pushes an arena scope mark and return() heapifies the return value
 // (promoting any arena-allocated memory to the heap) then pops the scope.
 void __hexa_fn_arena_enter(void) {
