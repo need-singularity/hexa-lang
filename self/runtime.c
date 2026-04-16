@@ -359,6 +359,7 @@ static inline HexaTag __hx_nb_tag(HexaVal v) {
 // ── Accessors ───────────────────────────────────────────────
 #define HX_TAG(v)       __hx_nb_tag(v)
 #define HX_INT(v)       __hx_sext47((v) & NB_PAYLOAD)
+#define HX_INT_U(v)     ((int64_t)((uint64_t)(v) & NB_PAYLOAD))
 #define HX_FLOAT(v)     __hx_u2d(v)
 #define HX_BOOL(v)      ((int)((v) & 1))
 #define HX_STR(v)       ((char*)(uintptr_t)((v) & NB_PAYLOAD))
@@ -3202,7 +3203,7 @@ static void* hexa_ffi_dlsym(void* handle, const char* symbol) {
 // Marshal a HexaVal to a raw i64 for C ABI passing.
 static int64_t hexa_ffi_marshal_arg(HexaVal v) {
     switch (HX_TAG(v)) {
-        case TAG_INT:   return HX_INT(v);
+        case TAG_INT:   return HX_INT_U(v);  // unsigned: pointer values must not sign-extend
         case TAG_FLOAT: { union { double d; int64_t i; } u; u.d = HX_FLOAT(v); return u.i; }
         case TAG_BOOL:  return (int64_t)HX_BOOL(v);
         case TAG_STR:   return (int64_t)(uintptr_t)HX_STR(v);
@@ -3278,7 +3279,7 @@ HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_
     int64_t iv[8]; // int values
     for (int i = 0; i < nargs && i < 8; i++) {
         if (float_mask & (1 << i)) {
-            fv[i] = HX_IS_FLOAT(hargs[i]) ? HX_FLOAT(hargs[i]) : (double)HX_INT(hargs[i]);
+            fv[i] = HX_IS_FLOAT(hargs[i]) ? HX_FLOAT(hargs[i]) : (double)HX_INT_U(hargs[i]);
         } else {
             iv[i] = hexa_ffi_marshal_arg(hargs[i]);
         }
@@ -3416,7 +3417,7 @@ HexaVal hexa_cstring(HexaVal s) {
 #define HX_INT_U(v) ((int64_t)((uint64_t)(v) & NB_PAYLOAD))
 
 HexaVal hexa_from_cstring(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p == 0) return hexa_str("");
     return hexa_str((const char*)(uintptr_t)p);
 }
@@ -3424,7 +3425,7 @@ HexaVal hexa_from_cstring(HexaVal ptr) {
 HexaVal hexa_ptr_null() { return hexa_int(0); }
 
 HexaVal hexa_ptr_addr(HexaVal v) {
-    return hexa_int(HX_INT(v));
+    return hexa_int(HX_INT_U(v));
 }
 
 // ── C2 Step 3: Dynamic FFI host dispatch (interpreter path) ──
@@ -3477,17 +3478,19 @@ static HexaVal hexa_host_ffi_unwrap(HexaVal v) {
     int64_t t = HX_VSF(v, tag_i);
     // Hexa-level tag values: 0=INT, 1=FLOAT, 2=BOOL, 3=STR, 8=VOID, 13=POINTER
     // See self/interpreter.hexa let TAG_* constants.
-    if (t == 0)  return hexa_int(HX_VSF(v, int_val));
+    // int_val may itself be a NaN-boxed HexaVal (from val_int wrapping). If so,
+    // return it directly — it's already a valid HexaVal. Otherwise re-box.
+    if (t == 0)  { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
     if (t == 1)  return hexa_float(HX_VSF(v, float_val));
     if (t == 2)  return hexa_bool(HX_VSF(v, bool_val));
     if (t == 3)  return HX_VSF(v, str_val);       // already TAG_STR
-    if (t == 13) return hexa_int(HX_VSF(v, int_val));  // pointer → int ABI lane
-    return hexa_int(HX_VSF(v, int_val));
+    if (t == 13) { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
+    { HexaVal iv = HX_VSF(v, int_val); return HX_IS_INT(iv) ? iv : hexa_int(iv); }
 }
 
 HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask, HexaVal ret_kind) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
     HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
@@ -3528,7 +3531,7 @@ HexaVal hexa_host_ffi_call_6(
     HexaVal a0, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4, HexaVal a5
 ) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
@@ -3584,21 +3587,21 @@ HexaVal hexa_ptr_alloc(HexaVal size) {
 }
 
 HexaVal hexa_ptr_free(HexaVal ptr, HexaVal size) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p != 0) free((void*)(uintptr_t)p);
     return hexa_void();
 }
 
 HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_void();
     uint8_t* base = (uint8_t*)(uintptr_t)p + off;
     if (HX_IS_FLOAT(val)) {
         double d = HX_FLOAT(val);
         memcpy(base, &d, sizeof(double));
     } else {
-        int64_t v = HX_INT(val);
+        int64_t v = HX_INT_U(val);
         memcpy(base, &v, sizeof(int64_t));
     }
     return hexa_void();
@@ -3609,8 +3612,8 @@ HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
  * as general-purpose. */
 
 HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_int(0);
     int64_t v;
     memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int64_t));

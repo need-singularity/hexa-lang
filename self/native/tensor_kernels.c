@@ -28,12 +28,15 @@
 #define HX_INT(v)       ((v).i)
 #define HX_FLOAT(v)     ((v).f)
 #endif
+#ifndef HX_INT_U
+#define HX_INT_U(v)     HX_INT(v)
+#endif
 
 /* @hot_kernel: f32/f64/i32 pointer read/write — direct memcpy ------ */
 
 HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_void();
     float f = (float)__hx_to_double(val);
     memcpy((uint8_t*)(uintptr_t)p + off, &f, sizeof(float));
@@ -41,8 +44,8 @@ HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
 }
 
 HexaVal hexa_ptr_write_i32(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_void();
     int32_t v = (int32_t)HX_INT(val);
     memcpy((uint8_t*)(uintptr_t)p + off, &v, sizeof(int32_t));
@@ -50,8 +53,8 @@ HexaVal hexa_ptr_write_i32(HexaVal ptr, HexaVal offset, HexaVal val) {
 }
 
 HexaVal hexa_ptr_read_f64(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_float(0.0);
     double d;
     memcpy(&d, (uint8_t*)(uintptr_t)p + off, sizeof(double));
@@ -59,8 +62,8 @@ HexaVal hexa_ptr_read_f64(HexaVal ptr, HexaVal offset) {
 }
 
 HexaVal hexa_ptr_read_f32(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_float(0.0);
     float f;
     memcpy(&f, (uint8_t*)(uintptr_t)p + off, sizeof(float));
@@ -68,8 +71,8 @@ HexaVal hexa_ptr_read_f32(HexaVal ptr, HexaVal offset) {
 }
 
 HexaVal hexa_ptr_read_i32(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
-    int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
+    int64_t off = HX_IS_INT(offset) ? HX_INT_U(offset) : 0;
     if (p == 0) return hexa_int(0);
     int32_t v;
     memcpy(&v, (uint8_t*)(uintptr_t)p + off, sizeof(int32_t));
@@ -89,7 +92,7 @@ HexaVal hexa_struct_pack_f32(HexaVal* args, int nargs) {
 }
 
 HexaVal hexa_struct_unpack_f32(HexaVal ptr, HexaVal index) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    int64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     int64_t idx = HX_IS_INT(index) ? HX_INT(index) : 0;
     if (p == 0) return hexa_float(0.0);
     float* buf = (float*)(uintptr_t)p;
@@ -111,7 +114,7 @@ HexaVal hexa_tensor_new(HexaVal r, HexaVal c) {
 
 HexaVal hexa_tensor_randn(HexaVal r, HexaVal c) {
     HexaVal v = hexa_tensor_new(r, c);
-    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)HX_INT(v);
+    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)HX_INT_U(v);
     int64_t n = t->rows * t->cols;
     for (int64_t i = 0; i < n; i++) {
         double u = (rand()+1.0)/(RAND_MAX+1.0);
@@ -122,7 +125,7 @@ HexaVal hexa_tensor_randn(HexaVal r, HexaVal c) {
 }
 
 HexaVal hexa_tensor_data_ptr(HexaVal tv) {
-    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)HX_INT(tv);
+    HexaTensorStub* t = (HexaTensorStub*)(uintptr_t)HX_INT_U(tv);
     return hexa_int((int64_t)(uintptr_t)t->data);
 }
 
@@ -130,6 +133,6 @@ HexaVal hexa_tensor_from_ptr(HexaVal p, HexaVal r, HexaVal c) {
     HexaTensorStub* t = (HexaTensorStub*)calloc(1, sizeof(*t));
     t->rows = HX_IS_INT(r)?HX_INT(r):(int64_t)HX_FLOAT(r);
     t->cols = HX_IS_INT(c)?HX_INT(c):(int64_t)HX_FLOAT(c);
-    t->data = (float*)(uintptr_t)(HX_IS_INT(p)?HX_INT(p):(int64_t)HX_FLOAT(p));
+    t->data = (float*)(uintptr_t)(HX_IS_INT(p)?HX_INT_U(p):(int64_t)HX_FLOAT(p));
     return hexa_int((int64_t)(uintptr_t)t);
 }
