@@ -1,0 +1,456 @@
+// =====================================================================
+//  test_hxcuda.hexa -- C4 CUDA fused mega-kernel verification
+//
+//  Tests self/ml/hxcuda.hexa :: cuda_matmul_bf16, cuda_fused_lmhead_fwd
+//  against pure-hexa CPU references at small dims.
+//
+//  Structure:
+//    T1  hxcuda_version() == 1                    (gated HXCUDA_FFI_LIVE=1)
+//    T2  matmul bf16 correctness (M=32 K=32 N=32) (gated HXCUDA_FFI_LIVE=1)
+//    T3  fused lmhead fwd correctness             (gated HXCUDA_FFI_LIVE=1)
+//         S=4 D=32 V=64  -- logits + probs + loss vs CPU ref
+//
+//  Run defaults (Mac, no CUDA):
+//    ./hexa run self/test_hxcuda.hexa
+//    -> T1 SKIP, T2 SKIP, T3 SKIP (CUDA unavailable)
+//
+//  Full FFI live path (H100 pod):
+//    bash scripts/build_hxcuda_linux.sh
+//    HXCUDA_FFI_LIVE=1 LD_LIBRARY_PATH=self/native/build \
+//      ./hexa run self/test_hxcuda.hexa
+//    -> T1 PASS, T2 PASS, T3 PASS
+//
+//  bf16 precision note: WMMA bf16 has 8-bit mantissa (vs fp32 24-bit),
+//  so matmul results may differ from fp32 reference by up to ~1e-2 at
+//  these small dims. The epsilon is set accordingly (0.05 for matmul,
+//  0.1 for fused lmhead due to softmax amplification).
+// =====================================================================
+
+let mut PASS = 0
+let mut FAIL = 0
+let mut SKIP = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + label)
+    }
+}
+
+fn skip(label, reason) {
+    SKIP = SKIP + 1
+    println("[SKIP] " + label + " -- " + reason)
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+// -- deterministic init --
+fn det_val(seed, i, j) {
+    let m = (seed * 9301 + i * 49297 + j * 233280 + 17) % 233280
+    return (m * 1.0) / 233280.0 - 0.5
+}
+
+fn make_mat(rows, cols, seed) {
+    let mut M = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [det_val(seed, i, j) * 0.1] }
+        M = M + [row]
+    }
+    return M
+}
+
+fn make_targets(n, V_) {
+    let mut t = []
+    for i in 0..n { t = t + [(i * 7 + 3) % V_] }
+    return t
+}
+
+// -- CPU reference implementations (inlined for self-containment) --
+
+fn cpu_matmul(A, B, M, K, N) {
+    let mut C = []
+    for i in 0..M {
+        let mut row = []
+        for j in 0..N {
+            let mut s = 0.0
+            for p in 0..K { s = s + A[i][p] * B[p][j] }
+            row = row + [s]
+        }
+        C = C + [row]
+    }
+    return C
+}
+
+fn cpu_softmax(logits, R, C) {
+    let mut probs = []
+    for i in 0..R {
+        let mut mx = logits[i][0]
+        for j in 1..C { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut row = []
+        let mut sum_e = 0.0
+        for j in 0..C {
+            let e = exp(logits[i][j] - mx)
+            row = row + [e]
+            sum_e = sum_e + e
+        }
+        let mut prow = []
+        for j in 0..C { prow = prow + [row[j] / sum_e] }
+        probs = probs + [prow]
+    }
+    return probs
+}
+
+fn cpu_ce_loss(logits, targets, R, C) {
+    let mut loss_sum = 0.0
+    for i in 0..R {
+        let mut mx = logits[i][0]
+        for j in 1..C { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut sum_e = 0.0
+        for j in 0..C { sum_e = sum_e + exp(logits[i][j] - mx) }
+        let lse = mx + log(sum_e)
+        let t = targets[i]
+        loss_sum = loss_sum + (lse - logits[i][t])
+    }
+    return loss_sum / (R * 1.0)
+}
+
+fn max_abs_diff_2d(A, B) {
+    let mut m = 0.0
+    for i in 0..len(A) {
+        for j in 0..len(A[0]) {
+            let e = fabs(A[i][j] - B[i][j])
+            if e > m { m = e }
+        }
+    }
+    return m
+}
+
+// -- Extern FFI declarations --
+// These must be at module scope even when calls are gated by env var.
+
+@link("hxcuda")
+extern fn hxcuda_version() -> int
+
+@link("hxcuda")
+extern fn hxcuda_matmul_bf16(args_p: *Void) -> int
+
+@link("hxcuda")
+extern fn hxcuda_fused_lmhead_fwd(args_p: *Void) -> int
+
+@link("hxcuda")
+extern fn hxcuda_device_info() -> int
+
+@link("hxcuda")
+extern fn hxcuda_sync() -> int
+
+// -- CUDA FFI helpers (from cuda_ffi.hexa, inlined for self-containment) --
+
+@link("cudart")
+extern fn cudaMalloc(ptr_ptr: *Void, size: int) -> int
+
+@link("cudart")
+extern fn cudaFree(dev_ptr: *Void) -> int
+
+@link("cudart")
+extern fn cudaMemcpy(dst: *Void, src: *Void, count: int, kind: int) -> int
+
+@link("cudart")
+extern fn cudaMemset(dev_ptr: *Void, value: int, count: int) -> int
+
+@link("cudart")
+extern fn cudaDeviceSynchronize() -> int
+
+let MEMCPY_H2D = 1
+let MEMCPY_D2H = 2
+
+fn test_cuda_malloc(nbytes) {
+    let ptr_buf = alloc_raw(8)
+    write_i64(ptr_buf, 0, 0)
+    let err = cudaMalloc(ptr_buf, nbytes)
+    if err != 0 {
+        println("[test_hxcuda] cuda_malloc(" + to_string(nbytes) + ") failed: " + to_string(err))
+        free_raw(ptr_buf, 8)
+        return ptr_null()
+    }
+    let dev = ptr_from_int(deref(ptr_buf))
+    free_raw(ptr_buf, 8)
+    dev
+}
+
+fn test_cuda_free(dev_ptr) {
+    let _ = cudaFree(dev_ptr)
+    0
+}
+
+fn test_cuda_memcpy_h2d(dev_dst, host_src, nbytes) {
+    cudaMemcpy(dev_dst, host_src, nbytes, MEMCPY_H2D)
+}
+
+fn test_cuda_memcpy_d2h(host_dst, dev_src, nbytes) {
+    cudaMemcpy(host_dst, dev_src, nbytes, MEMCPY_D2H)
+}
+
+// -- T1: version check --
+fn t1_version() {
+    let gate = env_var("HXCUDA_FFI_LIVE")
+    if gate != "1" {
+        skip("T1 hxcuda_version", "set HXCUDA_FFI_LIVE=1 to load libhxcuda")
+        return 0
+    }
+    let v = hxcuda_version()
+    println("  T1 hxcuda_version() = " + to_string(v))
+    check("T1 hxcuda_version() >= 1", v >= 1)
+
+    let cc = hxcuda_device_info()
+    println("  T1 compute capability = " + to_string(cc))
+    return 0
+}
+
+// -- T2: matmul bf16 correctness --
+fn t2_matmul() {
+    let gate = env_var("HXCUDA_FFI_LIVE")
+    if gate != "1" {
+        skip("T2 matmul bf16", "set HXCUDA_FFI_LIVE=1")
+        return 0
+    }
+
+    let M = 32
+    let K = 32
+    let N = 32
+
+    let A = make_mat(M, K, 42)
+    let B = make_mat(K, N, 137)
+
+    // CPU reference
+    let C_ref = cpu_matmul(A, B, M, K, N)
+
+    // Pack A, B into flat f32 host buffers
+    let a_bytes = M * K * 4
+    let b_bytes = K * N * 4
+    let c_bytes = M * N * 4
+
+    let a_host = alloc_raw(a_bytes)
+    let b_host = alloc_raw(b_bytes)
+
+    for i in 0..M {
+        for j in 0..K {
+            write_f32(a_host, (i * K + j) * 4, A[i][j])
+        }
+    }
+    for i in 0..K {
+        for j in 0..N {
+            write_f32(b_host, (i * N + j) * 4, B[i][j])
+        }
+    }
+
+    // Allocate device buffers
+    let a_dev = test_cuda_malloc(a_bytes)
+    let b_dev = test_cuda_malloc(b_bytes)
+    let c_dev = test_cuda_malloc(c_bytes)
+
+    // H2D upload
+    let _ = test_cuda_memcpy_h2d(a_dev, a_host, a_bytes)
+    let _ = test_cuda_memcpy_h2d(b_dev, b_host, b_bytes)
+    let _ = cudaMemset(c_dev, 0, c_bytes)
+
+    // Pack struct args (48 bytes)
+    let args = alloc_raw(48)
+    ptr_write(args, 0,  M)
+    ptr_write(args, 8,  K)
+    ptr_write(args, 16, N)
+    ptr_write(args, 24, a_dev)
+    ptr_write(args, 32, b_dev)
+    ptr_write(args, 40, c_dev)
+
+    let rc = hxcuda_matmul_bf16(args)
+    let _ = cudaDeviceSynchronize()
+
+    // D2H download
+    let c_host = alloc_raw(c_bytes)
+    let _ = test_cuda_memcpy_d2h(c_host, c_dev, c_bytes)
+
+    // Unpack C into 2D array
+    let mut C_gpu = []
+    for i in 0..M {
+        let mut row = []
+        for j in 0..N {
+            row = row + [deref_f32(c_host, (i * N + j) * 4)]
+        }
+        C_gpu = C_gpu + [row]
+    }
+
+    let max_diff = max_abs_diff_2d(C_gpu, C_ref)
+    println("  T2 rc=" + to_string(rc) + " max|gpu-ref|=" + to_string(max_diff))
+
+    // bf16 epsilon: 8-bit mantissa -> ~1/128 relative error per multiply
+    // Accumulated over K=32 -> max ~0.05 absolute at these scales
+    let eps = 0.05
+    let ok = (rc == 0) && (max_diff < eps)
+    check("T2 matmul bf16 (32x32x32) max|gpu-ref| < " + to_string(eps), ok)
+
+    // Cleanup
+    free_raw(args, 48)
+    free_raw(a_host, a_bytes)
+    free_raw(b_host, b_bytes)
+    free_raw(c_host, c_bytes)
+    test_cuda_free(a_dev)
+    test_cuda_free(b_dev)
+    test_cuda_free(c_dev)
+
+    return 0
+}
+
+// -- T3: fused lmhead fwd correctness --
+fn t3_fused_lmhead() {
+    let gate = env_var("HXCUDA_FFI_LIVE")
+    if gate != "1" {
+        skip("T3 fused lmhead fwd", "set HXCUDA_FFI_LIVE=1")
+        return 0
+    }
+
+    let S = 4
+    let D = 32
+    let V = 64
+
+    let x = make_mat(S, D, 11)
+    let W = make_mat(D, V, 23)
+    let tg = make_targets(S, V)
+
+    // CPU reference: logits -> softmax -> CE loss
+    let logits_ref = cpu_matmul(x, W, S, D, V)
+    let probs_ref = cpu_softmax(logits_ref, S, V)
+    let loss_ref = cpu_ce_loss(logits_ref, tg, S, V)
+
+    // Pack host buffers
+    let x_bytes       = S * D * 4
+    let w_bytes       = D * V * 4
+    let logits_bytes  = S * V * 4
+    let probs_bytes   = S * V * 4
+    let targets_bytes = S * 4
+    let loss_bytes    = 4
+
+    let x_host = alloc_raw(x_bytes)
+    let w_host = alloc_raw(w_bytes)
+    let t_host = alloc_raw(targets_bytes)
+
+    for i in 0..S {
+        for j in 0..D {
+            write_f32(x_host, (i * D + j) * 4, x[i][j])
+        }
+    }
+    for i in 0..D {
+        for j in 0..V {
+            write_f32(w_host, (i * V + j) * 4, W[i][j])
+        }
+    }
+    for i in 0..S {
+        write_i32(t_host, i * 4, tg[i])
+    }
+
+    // Allocate device buffers
+    let x_dev       = test_cuda_malloc(x_bytes)
+    let w_dev       = test_cuda_malloc(w_bytes)
+    let logits_dev  = test_cuda_malloc(logits_bytes)
+    let probs_dev   = test_cuda_malloc(probs_bytes)
+    let targets_dev = test_cuda_malloc(targets_bytes)
+    let loss_dev    = test_cuda_malloc(loss_bytes)
+
+    // H2D upload
+    let _ = test_cuda_memcpy_h2d(x_dev, x_host, x_bytes)
+    let _ = test_cuda_memcpy_h2d(w_dev, w_host, w_bytes)
+    let _ = test_cuda_memcpy_h2d(targets_dev, t_host, targets_bytes)
+    let _ = cudaMemset(logits_dev, 0, logits_bytes)
+    let _ = cudaMemset(probs_dev, 0, probs_bytes)
+    let _ = cudaMemset(loss_dev, 0, loss_bytes)
+
+    // Pack struct args (80 bytes)
+    let args = alloc_raw(80)
+    ptr_write(args, 0,  S)
+    ptr_write(args, 8,  D)
+    ptr_write(args, 16, V)
+    ptr_write(args, 24, x_dev)
+    ptr_write(args, 32, w_dev)
+    ptr_write(args, 40, logits_dev)
+    ptr_write(args, 48, probs_dev)
+    ptr_write(args, 56, targets_dev)
+    ptr_write(args, 64, loss_dev)
+    ptr_write(args, 72, 0)
+
+    let rc = hxcuda_fused_lmhead_fwd(args)
+    let _ = cudaDeviceSynchronize()
+
+    // D2H download logits, probs, loss
+    let logits_host = alloc_raw(logits_bytes)
+    let probs_host  = alloc_raw(probs_bytes)
+    let loss_host   = alloc_raw(loss_bytes)
+
+    let _ = test_cuda_memcpy_d2h(logits_host, logits_dev, logits_bytes)
+    let _ = test_cuda_memcpy_d2h(probs_host, probs_dev, probs_bytes)
+    let _ = test_cuda_memcpy_d2h(loss_host, loss_dev, loss_bytes)
+
+    // Unpack logits, probs
+    let mut logits_gpu = []
+    let mut probs_gpu = []
+    for i in 0..S {
+        let mut lrow = []
+        let mut prow = []
+        for j in 0..V {
+            lrow = lrow + [deref_f32(logits_host, (i * V + j) * 4)]
+            prow = prow + [deref_f32(probs_host, (i * V + j) * 4)]
+        }
+        logits_gpu = logits_gpu + [lrow]
+        probs_gpu = probs_gpu + [prow]
+    }
+    let loss_gpu = deref_f32(loss_host, 0)
+
+    // Diffs
+    let dlogits = max_abs_diff_2d(logits_gpu, logits_ref)
+    let dprobs  = max_abs_diff_2d(probs_gpu, probs_ref)
+    let dloss   = fabs(loss_gpu - loss_ref)
+
+    println("  T3 rc=" + to_string(rc))
+    println("  T3 max|logits_diff|=" + to_string(dlogits))
+    println("  T3 max|probs_diff|=" + to_string(dprobs))
+    println("  T3 |loss_diff|=" + to_string(dloss) + " (gpu=" + to_string(loss_gpu) + " ref=" + to_string(loss_ref) + ")")
+
+    // bf16 matmul + softmax amplification -> loose epsilon
+    let eps_logits = 0.05
+    let eps_probs  = 0.1
+    let eps_loss   = 0.5
+
+    let ok = (rc == 0)
+          && (dlogits < eps_logits)
+          && (dprobs < eps_probs)
+          && (dloss < eps_loss)
+    check("T3 fused lmhead fwd (S=4 D=32 V=64) logits/probs/loss vs ref", ok)
+
+    // Cleanup
+    free_raw(args, 80)
+    free_raw(x_host, x_bytes)
+    free_raw(w_host, w_bytes)
+    free_raw(t_host, targets_bytes)
+    free_raw(logits_host, logits_bytes)
+    free_raw(probs_host, probs_bytes)
+    free_raw(loss_host, loss_bytes)
+    test_cuda_free(x_dev)
+    test_cuda_free(w_dev)
+    test_cuda_free(logits_dev)
+    test_cuda_free(probs_dev)
+    test_cuda_free(targets_dev)
+    test_cuda_free(loss_dev)
+
+    return 0
+}
+
+// -- main --
+fn main() {
+    println("=== test_hxcuda (C4 CUDA fused mega-kernel MVP) ===")
+    t1_version()
+    t2_matmul()
+    t3_fused_lmhead()
+    println("---- test_hxcuda: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL) + " SKIP=" + to_string(SKIP) + " ----")
+}

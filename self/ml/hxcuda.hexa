@@ -1,0 +1,199 @@
+// =====================================================================
+//  self/ml/hxcuda.hexa -- CUDA fused mega-kernel FFI bindings (C4 MVP)
+//
+//  Binds to self/native/hxcuda_fused.cu (libhxcuda.so).
+//  Exposes bf16 Tensor Core GEMM and fused LM head forward:
+//
+//    hxcuda_matmul_bf16(args_p)      -- C = A @ B via WMMA bf16
+//    hxcuda_fused_lmhead_fwd(args_p) -- logits + softmax + CE loss
+//    hxcuda_version()                -- ABI version probe (returns 1)
+//    hxcuda_device_info()            -- compute capability * 10
+//    hxcuda_sync()                   -- device synchronize
+//
+//  Uses struct-args ABI (single pointer) for kernels, matching the
+//  hexa interpreter's host_ffi_call_6 ceiling. See hxflash.hexa and
+//  hxlmhead.hexa for the same pattern.
+//
+//  Platform resolution (@link("hxcuda")):
+//    Linux: LD_LIBRARY_PATH -> libhxcuda.so  (built with nvcc)
+//    Mac:   not supported (no CUDA on macOS)
+//
+//  Fallback: when CUDA is unavailable, the hexa caller should fall back
+//  to cpu_matmul / cpu_lmhead_fwd (hxblas_linux.c path). This module
+//  only provides the GPU path.
+//
+//  Build: bash scripts/build_hxcuda_linux.sh
+// =====================================================================
+
+// -- ABI bindings --
+
+@link("hxcuda")
+extern fn hxcuda_version() -> int
+
+@link("hxcuda")
+extern fn hxcuda_matmul_bf16(args_p: *Void) -> int
+
+@link("hxcuda")
+extern fn hxcuda_matmul_bf16_pos(M: int, K: int, N: int,
+                                  A: *Void, B: *Void, C: *Void) -> int
+
+@link("hxcuda")
+extern fn hxcuda_fused_lmhead_fwd(args_p: *Void) -> int
+
+@link("hxcuda")
+extern fn hxcuda_device_info() -> int
+
+@link("hxcuda")
+extern fn hxcuda_sync() -> int
+
+// -- Struct field offsets (bytes) for hxcuda_matmul_bf16 --
+//
+//  off  0: M         (int64)
+//  off  8: K         (int64)
+//  off 16: N         (int64)
+//  off 24: A_ptr     (int64, device float*)
+//  off 32: B_ptr     (int64, device float*)
+//  off 40: C_ptr     (int64, device float*)
+//  total = 48 bytes
+
+let HXCUDA_MM_OFF_M = 0
+let HXCUDA_MM_OFF_K = 8
+let HXCUDA_MM_OFF_N = 16
+let HXCUDA_MM_OFF_A = 24
+let HXCUDA_MM_OFF_B = 32
+let HXCUDA_MM_OFF_C = 40
+let HXCUDA_MM_STRUCT_BYTES = 48
+
+// -- Struct field offsets (bytes) for hxcuda_fused_lmhead_fwd --
+//
+//  off  0: S         (int64)
+//  off  8: D         (int64)
+//  off 16: V         (int64)
+//  off 24: x_ptr     (int64, device float* [S,D])
+//  off 32: W_ptr     (int64, device float* [D,V])
+//  off 40: logits_ptr(int64, device float* [S,V])
+//  off 48: probs_ptr (int64, device float* [S,V])
+//  off 56: targets_ptr(int64, device int*  [S])
+//  off 64: loss_ptr  (int64, device float* scalar)
+//  off 72: reserved0 (int64)
+//  total = 80 bytes
+
+let HXCUDA_LM_OFF_S       = 0
+let HXCUDA_LM_OFF_D       = 8
+let HXCUDA_LM_OFF_V       = 16
+let HXCUDA_LM_OFF_X       = 24
+let HXCUDA_LM_OFF_W       = 32
+let HXCUDA_LM_OFF_LOGITS  = 40
+let HXCUDA_LM_OFF_PROBS   = 48
+let HXCUDA_LM_OFF_TARGETS = 56
+let HXCUDA_LM_OFF_LOSS    = 64
+let HXCUDA_LM_OFF_RESERVED = 72
+let HXCUDA_LM_STRUCT_BYTES = 80
+
+// -- Helper: matmul via struct-args ABI --
+//
+// All pointers are DEVICE pointers (int64 addresses from cuda_malloc).
+// Caller owns lifetime of A, B, C device buffers.
+// Returns: 0 on success, negative on error.
+pub fn cuda_matmul_bf16(M, K, N, A_dev, B_dev, C_dev) {
+    let args = alloc_raw(HXCUDA_MM_STRUCT_BYTES)
+
+    ptr_write(args, HXCUDA_MM_OFF_M, M)
+    ptr_write(args, HXCUDA_MM_OFF_K, K)
+    ptr_write(args, HXCUDA_MM_OFF_N, N)
+    ptr_write(args, HXCUDA_MM_OFF_A, A_dev)
+    ptr_write(args, HXCUDA_MM_OFF_B, B_dev)
+    ptr_write(args, HXCUDA_MM_OFF_C, C_dev)
+
+    let rc = hxcuda_matmul_bf16(args)
+
+    free_raw(args, HXCUDA_MM_STRUCT_BYTES)
+    return rc
+}
+
+// -- Helper: fused LM head forward --
+//
+// x_dev:       device float* [S, D]   (input activations)
+// W_dev:       device float* [D, V]   (LM head weight)
+// logits_dev:  device float* [S, V]   (output, preallocated)
+// probs_dev:   device float* [S, V]   (output, preallocated)
+// targets_dev: device int*   [S]      (target token indices)
+// loss_dev:    device float* (1)      (output, preallocated)
+//
+// Returns: 0 on success, negative on error.
+pub fn cuda_fused_lmhead_fwd(S, D, V, x_dev, W_dev,
+                              logits_dev, probs_dev,
+                              targets_dev, loss_dev) {
+    let args = alloc_raw(HXCUDA_LM_STRUCT_BYTES)
+
+    ptr_write(args, HXCUDA_LM_OFF_S,        S)
+    ptr_write(args, HXCUDA_LM_OFF_D,        D)
+    ptr_write(args, HXCUDA_LM_OFF_V,        V)
+    ptr_write(args, HXCUDA_LM_OFF_X,        x_dev)
+    ptr_write(args, HXCUDA_LM_OFF_W,        W_dev)
+    ptr_write(args, HXCUDA_LM_OFF_LOGITS,   logits_dev)
+    ptr_write(args, HXCUDA_LM_OFF_PROBS,    probs_dev)
+    ptr_write(args, HXCUDA_LM_OFF_TARGETS,  targets_dev)
+    ptr_write(args, HXCUDA_LM_OFF_LOSS,     loss_dev)
+    ptr_write(args, HXCUDA_LM_OFF_RESERVED, 0)
+
+    let rc = hxcuda_fused_lmhead_fwd(args)
+
+    free_raw(args, HXCUDA_LM_STRUCT_BYTES)
+    return rc
+}
+
+// -- CPU fallback helpers --
+//
+// When CUDA is unavailable, these functions provide the same API
+// using pure-hexa math. Useful for correctness checking on Mac.
+
+// cpu_matmul_ref: C[M,N] = A[M,K] * B[K,N]  (2D nested arrays)
+pub fn cpu_matmul_ref(A, B, M, K, N) {
+    let mut C = []
+    for i in 0..M {
+        let mut row = []
+        for j in 0..N {
+            let mut s = 0.0
+            for p in 0..K { s = s + A[i][p] * B[p][j] }
+            row = row + [s]
+        }
+        C = C + [row]
+    }
+    return C
+}
+
+// cpu_softmax_ref: per-row softmax of 2D matrix
+pub fn cpu_softmax_ref(logits, R, C) {
+    let mut probs = []
+    for i in 0..R {
+        let mut mx = logits[i][0]
+        for j in 1..C { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut row = []
+        let mut sum_e = 0.0
+        for j in 0..C {
+            let e = exp(logits[i][j] - mx)
+            row = row + [e]
+            sum_e = sum_e + e
+        }
+        let mut prow = []
+        for j in 0..C { prow = prow + [row[j] / sum_e] }
+        probs = probs + [prow]
+    }
+    return probs
+}
+
+// cpu_ce_loss_ref: cross-entropy loss from logits + targets
+pub fn cpu_ce_loss_ref(logits, targets, R, C) {
+    let mut loss_sum = 0.0
+    for i in 0..R {
+        let mut mx = logits[i][0]
+        for j in 1..C { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut sum_e = 0.0
+        for j in 0..C { sum_e = sum_e + exp(logits[i][j] - mx) }
+        let lse = mx + log(sum_e)
+        let t = targets[i]
+        loss_sum = loss_sum + (lse - logits[i][t])
+    }
+    return loss_sum / (R * 1.0)
+}
