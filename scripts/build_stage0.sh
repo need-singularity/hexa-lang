@@ -99,7 +99,10 @@ if [ -z "$SKIP_TRANSPILE" ]; then
             exit 1
         fi
         echo "[build_stage0] flatten: $FLATTEN_RUNNER scripts/flatten_imports.hexa $SRC_HEXA $FLAT_HEXA"
-        "$FLATTEN_RUNNER" "$HEXA_DIR/scripts/flatten_imports.hexa" "$SRC_HEXA" "$FLAT_HEXA"
+        # T33: arena instrumentation (__hexa_fn_arena_enter/return) in regen'd
+        # stage0 causes mutable-variable corruption in the interpreter path.
+        # Force HEXA_VAL_ARENA=0 to disable arena during flatten execution.
+        HEXA_VAL_ARENA=0 "$FLATTEN_RUNNER" "$HEXA_DIR/scripts/flatten_imports.hexa" "$SRC_HEXA" "$FLAT_HEXA"
         if [ ! -f "$FLAT_HEXA" ]; then
             echo "error: flatten output missing: $FLAT_HEXA" >&2
             exit 1
@@ -164,7 +167,7 @@ fi
 if [ -z "$NO_SMOKE" ]; then
     SMOKE="$(mktemp -t hexa_stage0_smoke.XXXXXX.hexa)"
     echo 'println("ok")' > "$SMOKE"
-    RESULT="$("$OUT" "$SMOKE" 2>&1 || true)"
+    RESULT="$(HEXA_VAL_ARENA=0 "$OUT" "$SMOKE" 2>&1 || true)"
     rm -f "$SMOKE"
     if [ "$RESULT" != "ok" ]; then
         echo "error: stage0 smoke test FAIL — expected 'ok', got:" >&2
