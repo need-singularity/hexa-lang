@@ -92,18 +92,15 @@ NATIVE_DIR="$HEXA_DIR/self/native"
 mkdir -p "$BUILD_DIR/native"
 mkdir -p "$(dirname "$OUTPUT")"
 
-# Stage runtime files from git HEAD (not working tree) to avoid
-# in-progress NaN-boxing or other experimental typedef changes that
-# may break tensor_kernels.c struct field access.
-if git -C "$HEXA_DIR" rev-parse HEAD >/dev/null 2>&1; then
-    git -C "$HEXA_DIR" show HEAD:self/runtime.c            > "$BUILD_DIR/runtime.c"
-    git -C "$HEXA_DIR" show HEAD:self/native/tensor_kernels.c > "$BUILD_DIR/native/tensor_kernels.c"
-    git -C "$HEXA_DIR" show HEAD:self/native/net.c         > "$BUILD_DIR/native/net.c"
-else
-    # fallback: no git, use working tree
-    cp -f "$RUNTIME_C"                    "$BUILD_DIR/runtime.c"
-    cp -f "$NATIVE_DIR/tensor_kernels.c"  "$BUILD_DIR/native/tensor_kernels.c"
-    cp -f "$NATIVE_DIR/net.c"             "$BUILD_DIR/native/net.c"
+# Stage runtime files from working tree. The hexa_v2 compiler emits
+# calls to arena/shim functions that must match the runtime version.
+# Using git HEAD can desync when codegen evolves ahead of committed runtime.
+cp -f "$RUNTIME_C"                    "$BUILD_DIR/runtime.c"
+cp -f "$NATIVE_DIR/tensor_kernels.c"  "$BUILD_DIR/native/tensor_kernels.c"
+if [ -f "$NATIVE_DIR/net.c" ]; then
+    cp -f "$NATIVE_DIR/net.c"         "$BUILD_DIR/native/net.c"
+elif git -C "$HEXA_DIR" rev-parse HEAD >/dev/null 2>&1; then
+    git -C "$HEXA_DIR" show HEAD:self/native/net.c > "$BUILD_DIR/native/net.c"
 fi
 
 # ── step 1: hexa_v2 transpile ────────────────────────────────
