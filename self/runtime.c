@@ -3370,19 +3370,15 @@ HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_
 }
 
 // Convenience: cstring <-> HexaVal
-// NaN-boxing fix: hexa_int() sign-extends from bit 46, corrupting ARM64
-// pointers (0x6000... range). Return the original STR-tagged NaN-boxed
-// value instead — the FFI dispatch needs a matching fix to extract the
-// pointer unsigned via NB_PAYLOAD mask rather than HX_INT sign-extended.
 HexaVal hexa_cstring(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_int(0);
-    // Pack as INT but with UNSIGNED extraction: use raw payload bits
-    // directly (no sign extension). This creates a HexaVal where
-    // HX_INT() gives a wrong (negative) value, but the FFI dispatch
-    // extracts via HX_IS_INT ? ... which sees the raw positive uint.
-    uint64_t ptr_bits = (uint64_t)(uintptr_t)HX_STR(s);
-    return (HexaVal)(NB_INT | (ptr_bits & NB_PAYLOAD));
+    return hexa_int((int64_t)(uintptr_t)HX_STR(s));
 }
+
+// NaN-boxing unsigned int extraction — for raw pointers stored via hexa_int().
+// HX_INT() sign-extends from bit 46, corrupting ARM64 heap pointers
+// (0x6000... has bit 46 set → negative). This macro extracts unsigned.
+#define HX_INT_U(v) ((int64_t)((uint64_t)(v) & NB_PAYLOAD))
 
 HexaVal hexa_from_cstring(HexaVal ptr) {
     int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
