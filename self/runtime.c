@@ -560,13 +560,23 @@ int64_t hexa_as_num(HexaVal v) {
     if (HX_IS_INT(v))   return HX_INT(v);
     if (HX_IS_FLOAT(v)) return (int64_t)HX_FLOAT(v);
     if (HX_IS_BOOL(v))  return (int64_t)HX_BOOL(v);
-    if (HX_IS_STR(v) && HX_STR(v)) return strtoll(HX_STR(v), NULL, 10);
+    // P39 fix: auto-detect 0x/0X prefix in string coercion
+    if (HX_IS_STR(v) && HX_STR(v)) {
+        const char* cs = HX_STR(v); const char* p = cs;
+        if (*p == '+' || *p == '-') p++;
+        int base = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ? 16 : 10;
+        return strtoll(cs, NULL, base);
+    }
     if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
         if (HX_VSF(v, tag_i) == TAG_INT)   return HX_VSF(v, int_val);
         if (HX_VSF(v, tag_i) == TAG_FLOAT) return (int64_t)HX_VSF(v, float_val);
         if (HX_VSF(v, tag_i) == TAG_BOOL)  return (int64_t)HX_VSF(v, bool_val);
-        if (HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val)))
-            return strtoll(HX_STR(HX_VSF(v, str_val)), NULL, 10);
+        if (HX_VSF(v, tag_i) == TAG_STR && HX_STR(HX_VSF(v, str_val))) {
+            const char* cs = HX_STR(HX_VSF(v, str_val)); const char* p = cs;
+            if (*p == '+' || *p == '-') p++;
+            int base = (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) ? 16 : 10;
+            return strtoll(cs, NULL, base);
+        }
     }
     return 0;
 }
@@ -4003,7 +4013,14 @@ static HexaVal bit_or;
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_int(0);
-    return hexa_int((int64_t)strtoll(HX_STR(s), NULL, 10));
+    const char* cs = HX_STR(s);
+    // P39 fix: auto-detect hex prefix (0x/0X) while preserving decimal
+    // semantics for leading-zero inputs ("0777" -> 777, not octal 511).
+    const char* p = cs;
+    if (*p == '+' || *p == '-') p++;
+    int base = 10;
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) base = 16;
+    return hexa_int((int64_t)strtoll(cs, NULL, base));
 }
 
 HexaVal hexa_str_parse_float(HexaVal s) {
