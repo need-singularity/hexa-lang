@@ -318,3 +318,306 @@ int64_t hxblas_version(void) {
 }
 
 #endif /* __linux__ */
+
+// ═════════════════════════════════════════════════════════════════════
+// BF16 NEON KERNELS — ARM64 native bf16 matmul/matvec with f32 accum
+//
+// bf16 format: 1 sign + 8 exponent + 7 mantissa (upper 16 bits of f32)
+// Memory bandwidth halved vs f32 → theoretical 2x throughput for
+// bandwidth-bound ops (inference matvec, weight loading).
+//
+// On ARM64 (Apple M4 / ARMv9): uses NEON 128-bit SIMD.
+//   8 × bf16 per register, accumulate in f32 (4 per register).
+//   vfmaq_f32 = fused multiply-add, no intermediate rounding.
+//
+// On non-ARM: scalar fallback (same semantics, no SIMD).
+//
+// Build (macOS ARM64):
+//   clang -O3 -fPIC -dynamiclib -arch arm64 hxblas_linux.c \
+//         -o build/libhxblas.dylib -lm
+//
+// Build (Linux aarch64):
+//   gcc -O3 -fPIC -shared -march=armv8.2-a+bf16 hxblas_linux.c \
+//       -o build/libhxblas.so -lm
+// ═════════════════════════════════════════════════════════════════════
+
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+
+#ifdef __aarch64__
+#include <arm_neon.h>
+#endif
+
+// ── bf16 ↔ f32 scalar conversion ─────────────────────────────────
+
+static inline float bf16_to_f32(uint16_t x) {
+    // bf16 is the upper 16 bits of IEEE 754 f32.
+    // Shift left 16 to reconstruct the f32 bit pattern.
+    uint32_t bits = (uint32_t)x << 16;
+    float f;
+    memcpy(&f, &bits, 4);
+    return f;
+}
+
+static inline uint16_t f32_to_bf16(float x) {
+    // Truncate: take upper 16 bits of f32.
+    // Round-to-nearest-even: add rounding bias before truncation.
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    // Round to nearest even: add 0x7FFF + lsb(bit16) for tie-break
+    uint32_t lsb = (bits >> 16) & 1;
+    bits += 0x7FFFu + lsb;
+    return (uint16_t)(bits >> 16);
+}
+
+// ── bf16 pack/unpack (f32 ↔ bf16 bulk conversion) ────────────────
+
+void hxblas_f32_to_bf16(int64_t n, int64_t src_f32, int64_t dst_bf16) {
+    const float* src = (const float*)(uintptr_t)src_f32;
+    uint16_t* dst = (uint16_t*)(uintptr_t)dst_bf16;
+#ifdef __aarch64__
+    int64_t i = 0;
+    // Process 4 floats at a time using NEON
+    for (; i + 3 < n; i += 4) {
+        float32x4_t v = vld1q_f32(src + i);
+        // Extract upper 16 bits: reinterpret as u32, shift right 16
+        // But we want round-to-nearest, so do scalar for correctness
+        dst[i + 0] = f32_to_bf16(src[i + 0]);
+        dst[i + 1] = f32_to_bf16(src[i + 1]);
+        dst[i + 2] = f32_to_bf16(src[i + 2]);
+        dst[i + 3] = f32_to_bf16(src[i + 3]);
+    }
+    for (; i < n; i++) {
+        dst[i] = f32_to_bf16(src[i]);
+    }
+#else
+    for (int64_t i = 0; i < n; i++) {
+        dst[i] = f32_to_bf16(src[i]);
+    }
+#endif
+}
+
+void hxblas_bf16_to_f32(int64_t n, int64_t src_bf16, int64_t dst_f32) {
+    const uint16_t* src = (const uint16_t*)(uintptr_t)src_bf16;
+    float* dst = (float*)(uintptr_t)dst_f32;
+#ifdef __aarch64__
+    int64_t i = 0;
+    // Process 8 bf16 values at a time → 2 × float32x4_t
+    for (; i + 7 < n; i += 8) {
+        uint16x8_t bv = vld1q_u16(src + i);
+        // Low 4: extend to u32 and shift left 16
+        uint16x4_t lo4 = vget_low_u16(bv);
+        uint16x4_t hi4 = vget_high_u16(bv);
+        uint32x4_t lo32 = vshll_n_u16(lo4, 16);
+        uint32x4_t hi32 = vshll_n_u16(hi4, 16);
+        float32x4_t flo = vreinterpretq_f32_u32(lo32);
+        float32x4_t fhi = vreinterpretq_f32_u32(hi32);
+        vst1q_f32(dst + i, flo);
+        vst1q_f32(dst + i + 4, fhi);
+    }
+    for (; i < n; i++) {
+        dst[i] = bf16_to_f32(src[i]);
+    }
+#else
+    for (int64_t i = 0; i < n; i++) {
+        dst[i] = bf16_to_f32(src[i]);
+    }
+#endif
+}
+
+// ── NEON bf16 GEMM: A[M×K] bf16 × B[K×N] bf16 → C[M×N] f32 ─────
+//
+// Micro-kernel strategy:
+//   - 4×4 tile: accumulate 4 rows × 4 cols in 4 f32x4 accumulators
+//   - Inner loop: load 8 bf16 from A row, 8 bf16 from B col,
+//     widen to f32, FMA
+//   - K dimension processed in chunks of 8 (NEON register width for bf16)
+//
+// For M4 (ARMv9): 32 NEON registers, 4×4 tile uses 4 accum + 2 load = 6 regs
+
+void hxblas_bgemm(int64_t M, int64_t K, int64_t N,
+                  int64_t A_ptr, int64_t B_ptr, int64_t C_ptr) {
+    const uint16_t* A = (const uint16_t*)(uintptr_t)A_ptr;
+    const uint16_t* B = (const uint16_t*)(uintptr_t)B_ptr;
+    float* C = (float*)(uintptr_t)C_ptr;
+
+#ifdef __aarch64__
+    // Zero output
+    memset(C, 0, (size_t)(M * N) * sizeof(float));
+
+    // 4×4 tiled micro-kernel with f32 accumulation
+    int64_t mi, ni, ki;
+
+    for (mi = 0; mi + 3 < M; mi += 4) {
+        for (ni = 0; ni + 3 < N; ni += 4) {
+            // 4×4 f32 accumulators (4 rows × 4 cols)
+            float32x4_t c00 = vdupq_n_f32(0.0f);
+            float32x4_t c10 = vdupq_n_f32(0.0f);
+            float32x4_t c20 = vdupq_n_f32(0.0f);
+            float32x4_t c30 = vdupq_n_f32(0.0f);
+
+            // Process K in chunks of 4 (half a NEON u16x8 register)
+            for (ki = 0; ki + 3 < K; ki += 4) {
+                // Load 4 bf16 values from each of 4 A rows → widen to f32
+                // A[row][ki..ki+3]
+                uint16x4_t a0_16 = vld1_u16(&A[(mi + 0) * K + ki]);
+                uint16x4_t a1_16 = vld1_u16(&A[(mi + 1) * K + ki]);
+                uint16x4_t a2_16 = vld1_u16(&A[(mi + 2) * K + ki]);
+                uint16x4_t a3_16 = vld1_u16(&A[(mi + 3) * K + ki]);
+
+                // Widen bf16 → f32: shift left 16 bits
+                float32x4_t a0 = vreinterpretq_f32_u32(vshll_n_u16(a0_16, 16));
+                float32x4_t a1 = vreinterpretq_f32_u32(vshll_n_u16(a1_16, 16));
+                float32x4_t a2 = vreinterpretq_f32_u32(vshll_n_u16(a2_16, 16));
+                float32x4_t a3 = vreinterpretq_f32_u32(vshll_n_u16(a3_16, 16));
+
+                // Load 4 bf16 from each of 4 B columns
+                // B is row-major: B[ki+p][ni..ni+3]
+                for (int p = 0; p < 4; p++) {
+                    uint16x4_t b_16 = vld1_u16(&B[(ki + p) * N + ni]);
+                    float32x4_t bv = vreinterpretq_f32_u32(vshll_n_u16(b_16, 16));
+
+                    // FMA: c[row][col] += a[row][ki+p] * b[ki+p][col]
+                    c00 = vfmaq_laneq_f32(c00, bv, a0, p);
+                    c10 = vfmaq_laneq_f32(c10, bv, a1, p);
+                    c20 = vfmaq_laneq_f32(c20, bv, a2, p);
+                    c30 = vfmaq_laneq_f32(c30, bv, a3, p);
+                }
+            }
+
+            // Store 4×4 tile to C
+            vst1q_f32(&C[(mi + 0) * N + ni], vaddq_f32(vld1q_f32(&C[(mi + 0) * N + ni]), c00));
+            vst1q_f32(&C[(mi + 1) * N + ni], vaddq_f32(vld1q_f32(&C[(mi + 1) * N + ni]), c10));
+            vst1q_f32(&C[(mi + 2) * N + ni], vaddq_f32(vld1q_f32(&C[(mi + 2) * N + ni]), c20));
+            vst1q_f32(&C[(mi + 3) * N + ni], vaddq_f32(vld1q_f32(&C[(mi + 3) * N + ni]), c30));
+
+            // Handle remaining K elements (scalar)
+            for (int64_t kk = ki; kk < K; kk++) {
+                float b0 = bf16_to_f32(B[kk * N + ni + 0]);
+                float b1 = bf16_to_f32(B[kk * N + ni + 1]);
+                float b2 = bf16_to_f32(B[kk * N + ni + 2]);
+                float b3 = bf16_to_f32(B[kk * N + ni + 3]);
+                for (int r = 0; r < 4; r++) {
+                    float av = bf16_to_f32(A[(mi + r) * K + kk]);
+                    C[(mi + r) * N + ni + 0] += av * b0;
+                    C[(mi + r) * N + ni + 1] += av * b1;
+                    C[(mi + r) * N + ni + 2] += av * b2;
+                    C[(mi + r) * N + ni + 3] += av * b3;
+                }
+            }
+        }
+
+        // Handle remaining N columns (scalar)
+        for (int64_t nj = ni; nj < N; nj++) {
+            for (int r = 0; r < 4; r++) {
+                float sum = 0.0f;
+                for (int64_t kk = 0; kk < K; kk++) {
+                    sum += bf16_to_f32(A[(mi + r) * K + kk]) * bf16_to_f32(B[kk * N + nj]);
+                }
+                C[(mi + r) * N + nj] = sum;
+            }
+        }
+    }
+
+    // Handle remaining M rows (scalar)
+    for (int64_t mj = mi; mj < M; mj++) {
+        for (int64_t nj = 0; nj < N; nj++) {
+            float sum = 0.0f;
+            for (int64_t kk = 0; kk < K; kk++) {
+                sum += bf16_to_f32(A[mj * K + kk]) * bf16_to_f32(B[kk * N + nj]);
+            }
+            C[mj * N + nj] = sum;
+        }
+    }
+
+#else
+    // Scalar fallback for non-ARM targets
+    for (int64_t i = 0; i < M; i++) {
+        for (int64_t j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; k++) {
+                sum += bf16_to_f32(A[i * K + k]) * bf16_to_f32(B[k * N + j]);
+            }
+            C[i * N + j] = sum;
+        }
+    }
+#endif
+}
+
+// ── NEON bf16 GEMV: A[M×K] bf16 × x[K] f32 → y[M] f32 ──────────
+//
+// Critical path for inference: weight (bf16) × activation (f32).
+// Weights stay in bf16 (half memory), activations in f32 (full precision).
+// Inner loop: widen bf16 weight to f32, FMA with f32 activation.
+
+void hxblas_bgemv(int64_t M, int64_t K,
+                  int64_t A_ptr, int64_t x_ptr, int64_t y_ptr) {
+    const uint16_t* A = (const uint16_t*)(uintptr_t)A_ptr;
+    const float* x = (const float*)(uintptr_t)x_ptr;
+    float* y = (float*)(uintptr_t)y_ptr;
+
+#ifdef __aarch64__
+    for (int64_t i = 0; i < M; i++) {
+        const uint16_t* row = A + i * K;
+        float32x4_t acc0 = vdupq_n_f32(0.0f);
+        float32x4_t acc1 = vdupq_n_f32(0.0f);
+
+        int64_t k = 0;
+        // Process 8 elements per iteration (two f32x4 accumulators)
+        for (; k + 7 < K; k += 8) {
+            // Load 8 bf16 weights
+            uint16x8_t w16 = vld1q_u16(row + k);
+            // Widen lower 4 and upper 4 to f32
+            uint16x4_t wlo = vget_low_u16(w16);
+            uint16x4_t whi = vget_high_u16(w16);
+            float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(wlo, 16));
+            float32x4_t w1 = vreinterpretq_f32_u32(vshll_n_u16(whi, 16));
+
+            // Load 8 f32 activations
+            float32x4_t x0 = vld1q_f32(x + k);
+            float32x4_t x1 = vld1q_f32(x + k + 4);
+
+            // FMA
+            acc0 = vfmaq_f32(acc0, w0, x0);
+            acc1 = vfmaq_f32(acc1, w1, x1);
+        }
+
+        // Process remaining 4 elements
+        for (; k + 3 < K; k += 4) {
+            uint16x4_t w16 = vld1_u16(row + k);
+            float32x4_t w0 = vreinterpretq_f32_u32(vshll_n_u16(w16, 16));
+            float32x4_t x0 = vld1q_f32(x + k);
+            acc0 = vfmaq_f32(acc0, w0, x0);
+        }
+
+        // Horizontal sum
+        float32x4_t sum4 = vaddq_f32(acc0, acc1);
+        float sum = vaddvq_f32(sum4);
+
+        // Scalar tail
+        for (; k < K; k++) {
+            sum += bf16_to_f32(row[k]) * x[k];
+        }
+
+        y[i] = sum;
+    }
+
+#else
+    // Scalar fallback
+    for (int64_t i = 0; i < M; i++) {
+        float sum = 0.0f;
+        for (int64_t k = 0; k < K; k++) {
+            sum += bf16_to_f32(A[i * K + k]) * x[k];
+        }
+        y[i] = sum;
+    }
+#endif
+}
+
+// ── bf16 ABI version ─────────────────────────────────────────────
+
+int64_t hxblas_bf16_version(void) {
+    // Version 1: initial bf16 NEON kernels (bgemm, bgemv, pack/unpack)
+    return 1;
+}
