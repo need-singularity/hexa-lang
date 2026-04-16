@@ -1,0 +1,417 @@
+// self/codegen_native_elf.hexa — Zero-tool ELF64 (Linux x86_64) binary emitter
+// Companion to self/codegen_native.hexa (ARM64 Mach-O). Pair covers the two
+// major HEXA deploy targets: Apple Silicon dev box + H100/RunPod x86_64 Linux.
+//
+// Emits a fully runnable ET_EXEC ELF64 binary for x86_64 Linux.
+// No external tools in the compilation pipeline — pure Hexa to native.
+//
+// Delegates the heavy lifting to self/codegen/elf.hexa (the shared ELF64
+// envelope + x86_64 syscall helpers). Those functions are inlined here so the
+// script is standalone — matching the codegen_native.hexa pattern. When an
+// `include`-style import lands we will simply re-export those helpers instead
+// of duplicating the bodies.
+//
+// Layout (produced by elf_print_int_binary / elf_wrap_with_data):
+//   [0x0000]  ELF64 header             (64 bytes)
+//   [0x0040]  Program header 1 (RX)    (56 bytes) — code segment @ 0x400000
+//   [0x0078]  Program header 2 (R)     (56 bytes) — rodata segment @ 0x600000
+//   [pad...]
+//   [0x1000]  .text: write(1,...) + exit(0)   (49 bytes of x86_64 machine code)
+//   [0x1031]  .rodata: "42\n"                 (3 bytes)
+//
+// x86_64 Linux syscall ABI used:
+//   write: rax=1,  rdi=fd, rsi=buf_vaddr, rdx=len
+//   exit:  rax=60, rdi=code
+
+// ═══════════════════════════════════════════════════════════
+//  1. Binary output — xxd workaround for null-byte safety
+//     (shared with codegen_native.hexa — fputs/write_file
+//      truncate at null bytes; ELF64 output is ~4 KB of mostly
+//      zero padding so we MUST use the hex-encoded xxd path.)
+// ═══════════════════════════════════════════════════════════
+
+fn hex_digit(n) {
+    if n < 10 { return to_string(n) }
+    if n == 10 { return "a" }
+    if n == 11 { return "b" }
+    if n == 12 { return "c" }
+    if n == 13 { return "d" }
+    if n == 14 { return "e" }
+    return "f"
+}
+
+fn write_binary(path, bytes) {
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts = parts.push(hex_digit(bytes[i] / 16) + hex_digit(bytes[i] % 16))
+        i = i + 1
+    }
+    let hex_str = parts.join("")
+    exec("printf '%s' '" + hex_str + "' | xxd -r -p > " + path)
+    exec("chmod +x " + path)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  2. ELF64 byte helpers — mirror self/codegen/elf.hexa
+// ═══════════════════════════════════════════════════════════
+
+fn elf_magic() -> [int] { return [127, 69, 76, 70] }  // 0x7f 'E' 'L' 'F'
+fn et_exec() -> int { return 2 }
+fn em_x86_64() -> int { return 62 }
+fn pt_load() -> int { return 1 }
+fn pf_r() -> int { return 4 }
+fn pf_w() -> int { return 2 }
+fn pf_x() -> int { return 1 }
+
+fn elf_push_u16_le(buf: [int], val: int) -> [int] {
+    return buf.push(val % 256).push((val / 256) % 256)
+}
+
+fn elf_push_u32_le(buf: [int], val: int) -> [int] {
+    return buf.push(val % 256).push((val / 256) % 256).push((val / 65536) % 256).push((val / 16777216) % 256)
+}
+
+fn elf_push_u64_le(buf: [int], val: int) -> [int] {
+    let mut b = elf_push_u32_le(buf, val % 4294967296)
+    return elf_push_u32_le(b, val / 4294967296)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  3. ELF64 header + program header emission
+// ═══════════════════════════════════════════════════════════
+
+fn elf_emit_header(machine: int, entry: int, phoff: int, phnum: int) -> [int] {
+    let mut out = []
+    let magic = elf_magic()
+    let mut i = 0
+    while i < len(magic) { out = out.push(magic[i]); i = i + 1 }
+    out = out.push(2)   // EI_CLASS: ELFCLASS64
+    out = out.push(1)   // EI_DATA:  ELFDATA2LSB
+    out = out.push(1)   // EI_VERSION
+    out = out.push(0)   // EI_OSABI: ELFOSABI_NONE
+    let mut j = 0
+    while j < 8 { out = out.push(0); j = j + 1 }
+    out = elf_push_u16_le(out, et_exec())
+    out = elf_push_u16_le(out, machine)
+    out = elf_push_u32_le(out, 1)            // e_version
+    out = elf_push_u64_le(out, entry)
+    out = elf_push_u64_le(out, phoff)
+    out = elf_push_u64_le(out, 0)            // e_shoff
+    out = elf_push_u32_le(out, 0)            // e_flags
+    out = elf_push_u16_le(out, 64)           // e_ehsize
+    out = elf_push_u16_le(out, 56)           // e_phentsize
+    out = elf_push_u16_le(out, phnum)
+    out = elf_push_u16_le(out, 0)            // e_shentsize
+    out = elf_push_u16_le(out, 0)            // e_shnum
+    out = elf_push_u16_le(out, 0)            // e_shstrndx
+    return out
+}
+
+fn elf_emit_phdr(p_type: int, p_flags: int, p_offset: int, p_vaddr: int, p_paddr: int, p_filesz: int, p_memsz: int, p_align: int) -> [int] {
+    let mut out = []
+    out = elf_push_u32_le(out, p_type)
+    out = elf_push_u32_le(out, p_flags)
+    out = elf_push_u64_le(out, p_offset)
+    out = elf_push_u64_le(out, p_vaddr)
+    out = elf_push_u64_le(out, p_paddr)
+    out = elf_push_u64_le(out, p_filesz)
+    out = elf_push_u64_le(out, p_memsz)
+    out = elf_push_u64_le(out, p_align)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  4. elf_wrap_with_data — code (RX) + rodata (R)
+// ═══════════════════════════════════════════════════════════
+
+fn elf_wrap_with_data(code: [int], rodata: [int]) -> [int] {
+    // NOTE: hexa stage0 interpreter parses hex literals (`0x...`) as 0.
+    // All constants are in decimal — pair with comments for clarity.
+    let code_offset = 4096        // 0x1000 — page boundary where .text lives
+    let load_addr   = 4194304     // 0x400000 — classical ELF base for static exe
+    let entry = load_addr + code_offset
+    let code_seg_size = code_offset + len(code)
+
+    let data_load_addr = 6291456  // 0x600000 — rodata segment base
+    let data_seg_size = len(rodata)
+
+    // Header w/ 2 program headers
+    let mut out = elf_emit_header(em_x86_64(), entry, 64, 2)
+
+    // PT_LOAD #1 : code (RX)
+    let phdr1 = elf_emit_phdr(pt_load(), pf_r() + pf_x(), 0, load_addr, load_addr, code_seg_size, code_seg_size, 4096)
+    let mut p1i = 0
+    while p1i < len(phdr1) {
+        out = out.push(phdr1[p1i])
+        p1i = p1i + 1
+    }
+
+    // PT_LOAD #2 : rodata (R)
+    let data_file_offset = code_seg_size
+    let phdr2 = elf_emit_phdr(pt_load(), pf_r(), data_file_offset, data_load_addr, data_load_addr, data_seg_size, data_seg_size, 4096)
+    let mut p2i = 0
+    while p2i < len(phdr2) {
+        out = out.push(phdr2[p2i])
+        p2i = p2i + 1
+    }
+
+    // Pad to code_offset
+    while len(out) < code_offset { out = out.push(0) }
+
+    // Append code
+    let mut ci = 0
+    while ci < len(code) {
+        out = out.push(code[ci])
+        ci = ci + 1
+    }
+
+    // Append rodata immediately after code
+    let mut di = 0
+    while di < len(rodata) {
+        out = out.push(rodata[di])
+        di = di + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  5. x86_64 Linux syscall encoders — mirror elf.hexa
+// ═══════════════════════════════════════════════════════════
+
+fn linux_sys_write() -> int { return 1 }
+fn linux_sys_exit() -> int { return 60 }
+
+// x86_64 opcode bytes — decimal to sidestep the stage0 hex-literal bug:
+//   0x48 = 72   (REX.W prefix)
+//   0xc7 = 199  ("mov r/m64, imm32" group)
+//   0xc0 = 192  (ModRM for rax)
+//   0xc7 in ModRM slot = 199 (ModRM for rdi)
+//   0xc2 = 194  (ModRM for rdx)
+//   0xbe = 190  ("mov rsi, imm64" opcode w/ REX.W)
+//   0x0f = 15, 0x05 = 5  (syscall instruction)
+
+fn x86_mov_rax_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(72).push(199).push(192)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+fn x86_mov_rdi_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(72).push(199).push(199)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+fn x86_mov_rsi_imm64(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(72).push(190)
+    let mut v = val
+    let mut i = 0
+    while i < 8 {
+        c = c.push(v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return c
+}
+
+fn x86_mov_rdx_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(72).push(199).push(194)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+fn x86_syscall(buf: [int]) -> [int] { return buf.push(15).push(5) }
+
+fn rt_exit_x86(exit_code: int) -> [int] {
+    let mut c = []
+    c = x86_mov_rdi_imm32(c, exit_code)
+    c = x86_mov_rax_imm32(c, linux_sys_exit())
+    c = x86_syscall(c)
+    return c
+}
+
+fn rt_write_x86(fd: int, buf_vaddr: int, length: int) -> [int] {
+    let mut c = []
+    c = x86_mov_rdi_imm32(c, fd)
+    c = x86_mov_rsi_imm64(c, buf_vaddr)
+    c = x86_mov_rdx_imm32(c, length)
+    c = x86_mov_rax_imm32(c, linux_sys_write())
+    c = x86_syscall(c)
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════
+//  6. High-level builders: "print 42\n and exit(0)" as ELF64
+// ═══════════════════════════════════════════════════════════
+
+fn int_to_ascii_bytes(val: int) -> [int] {
+    if val == 0 { return [48, 10] }
+    let mut digits = []
+    let mut v = val
+    let mut is_neg = false
+    if v < 0 { is_neg = true; v = 0 - v }
+    while v > 0 {
+        digits = digits.push(48 + (v % 10))
+        v = v / 10
+    }
+    let mut result = []
+    if is_neg { result = result.push(45) }
+    let mut ri = len(digits) - 1
+    while ri >= 0 {
+        result = result.push(digits[ri])
+        ri = ri - 1
+    }
+    result = result.push(10)
+    return result
+}
+
+fn elf_hello_binary(msg: [int]) -> [int] {
+    let data_vaddr = 6291456  // 0x600000 — must match data_load_addr in elf_wrap_with_data
+    let mut code = rt_write_x86(1, data_vaddr, len(msg))
+    let exit_code_bytes = rt_exit_x86(0)
+    let mut ei = 0
+    while ei < len(exit_code_bytes) {
+        code = code.push(exit_code_bytes[ei])
+        ei = ei + 1
+    }
+    return elf_wrap_with_data(code, msg)
+}
+
+fn elf_print_int(val: int) -> [int] {
+    return elf_hello_binary(int_to_ascii_bytes(val))
+}
+
+// ═══════════════════════════════════════════════════════════
+//  7. Main — emit, inspect, optionally execute
+// ═══════════════════════════════════════════════════════════
+
+fn host_is_linux() -> bool {
+    return exec("uname 2>/dev/null | tr -d ' \\n\\t'") == "Linux"
+}
+
+fn hex2(n) { return hex_digit(n / 16) + hex_digit(n % 16) }
+
+fn dump_range(label, bytes, lo, hi) {
+    let mut parts = []
+    let mut i = lo
+    while i < hi {
+        parts = parts.push(hex2(bytes[i]))
+        i = i + 1
+    }
+    println("  " + label + ": " + parts.join(" "))
+}
+
+println("=== HEXA zero-tool ELF64 (Linux x86_64) binary emitter ===")
+println("")
+
+// Step 1: Build the ELF64 "print 42" binary
+println("[1/5] Building ELF64 binary for 'print 42 + exit(0)'...")
+let binary = elf_print_int(42)
+let sz = len(binary)
+println("  binary size: " + to_string(sz) + " bytes")
+
+// Step 2: Sanity check — ELF magic + ET_EXEC + EM_X86_64
+// NB: hexa stage0 interpreter parses `0x7f` as 0 (P-series pitfall —
+// hex literals unsupported in int-context). Use decimal 127 to avoid it.
+let magic_ok = binary[0] == 127 && binary[1] == 69 && binary[2] == 76 && binary[3] == 70
+let et_ok = binary[16] == 2 && binary[17] == 0                     // e_type == ET_EXEC
+let em_ok = binary[18] == 62 && binary[19] == 0                    // e_machine == EM_X86_64
+let class_ok = binary[4] == 2                                       // ELFCLASS64
+let data_ok = binary[5] == 1                                        // ELFDATA2LSB
+
+println("[2/5] Validating ELF64 structure...")
+if magic_ok { println("  magic    : 7f 45 4c 46  OK") } else { println("  magic    : BAD") }
+if class_ok { println("  EI_CLASS : 2 (ELF64) OK") } else { println("  EI_CLASS : BAD") }
+if data_ok  { println("  EI_DATA  : 1 (LSB)   OK") } else { println("  EI_DATA  : BAD") }
+if et_ok    { println("  e_type   : 2 (ET_EXEC) OK") } else { println("  e_type   : BAD") }
+if em_ok    { println("  e_machine: 62 (EM_X86_64) OK") } else { println("  e_machine: BAD") }
+
+// Step 3: Write to disk
+let output_path = "/tmp/hexa_native_42_elf"
+println("[3/5] Writing " + output_path + "...")
+write_binary(output_path, binary)
+println("  written + chmod +x")
+
+// First/last 16 bytes for eyeballing
+dump_range("first 16 ", binary, 0, 16)
+dump_range("last  16 ", binary, sz - 16, sz)
+
+// Step 4: file(1) check — should identify as ELF 64-bit LSB executable
+println("[4/5] file(1) check...")
+let file_out = exec("file " + output_path + " 2>&1")
+println("  " + file_out)
+
+// Substring check: look for "ELF 64-bit" in file(1)'s output.
+// On hexa stage0 interpreter, indexing a string returns a 1-char string
+// (not an int), so we compare char-by-char using string slices.
+let needle = "ELF 64-bit"
+let needle_len = len(needle)
+let f_len = len(file_out)
+let mut saw_elf64 = false
+let mut fi = 0
+while fi + needle_len <= f_len {
+    let mut matched = true
+    let mut k = 0
+    while k < needle_len {
+        if file_out[fi + k] != needle[k] { matched = false }
+        k = k + 1
+    }
+    if matched { saw_elf64 = true }
+    fi = fi + 1
+}
+if saw_elf64 {
+    println("  file(1): contains 'ELF 64-bit' -- OK")
+} else {
+    println("  file(1): 'ELF 64-bit' substring NOT found")
+}
+
+// Step 5: Optional execution — Linux only
+println("[5/5] Execution...")
+let mut exec_pass = true  // default pass on non-Linux (skip)
+let mut exec_note = "[skip exec -- not Linux]"
+if host_is_linux() {
+    let out_raw = exec(output_path + " 2>&1")
+    let mut matched = false
+    if out_raw == "42" { matched = true }
+    if out_raw == "42\n" { matched = true }
+    exec_pass = matched
+    if matched {
+        exec_note = "exec on Linux -> '42' verified"
+    } else {
+        exec_note = "exec on Linux -> unexpected output: '" + out_raw + "'"
+    }
+}
+println("  " + exec_note)
+
+// ═══════════════════════════════════════════════════════════
+//  8. Final verdict
+// ═══════════════════════════════════════════════════════════
+
+println("")
+let structure_ok = magic_ok && class_ok && data_ok && et_ok && em_ok && saw_elf64
+if structure_ok && exec_pass {
+    println("PASS -- ELF64 binary emitted")
+    println("  No clang. No as. No ld. Pure HEXA -> x86_64 Linux ELF64.")
+    println("  Paired with self/codegen_native.hexa (ARM64 Mach-O) -> both deploy targets covered.")
+} else {
+    let mut why = ""
+    if !magic_ok { why = why + " magic" }
+    if !class_ok { why = why + " class" }
+    if !data_ok { why = why + " data" }
+    if !et_ok { why = why + " et_type" }
+    if !em_ok { why = why + " e_machine" }
+    if !saw_elf64 { why = why + " file(1)-not-elf64" }
+    if !exec_pass { why = why + " exec" }
+    println("FAIL --" + why)
+}
