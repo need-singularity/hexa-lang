@@ -323,6 +323,29 @@ HexaVal tokenize(HexaVal source) {
                                     }
                                 }
                             }
+                            // Scientific notation: e/E [+-]? digits (1e10, 1.5e-3)
+                            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((pos).i < (total).i)) && hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_index_get(chars, pos), hexa_str("e"))) || hexa_truthy(hexa_eq(hexa_index_get(chars, pos), hexa_str("E")))))))) {
+                                HexaVal ep = hexa_add(pos, hexa_int(1));
+                                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((ep).i < (total).i)) && hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_index_get(chars, ep), hexa_str("+"))) || hexa_truthy(hexa_eq(hexa_index_get(chars, ep), hexa_str("-")))))))) {
+                                    ep = hexa_add(ep, hexa_int(1));
+                                }
+                                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((ep).i < (total).i)) && hexa_truthy(hexa_bool((hexa_index_get(chars, ep).tag==TAG_STR && hexa_index_get(chars, ep).s && isdigit((unsigned char)hexa_index_get(chars, ep).s[0])) || (hexa_index_get(chars, ep).tag==TAG_CHAR && isdigit((unsigned char)hexa_index_get(chars, ep).i))))))) {
+                                    is_float = hexa_bool(1);
+                                    num_str = hexa_add(num_str, hexa_to_string(hexa_index_get(chars, pos)));
+                                    pos = hexa_add(pos, hexa_int(1));
+                                    col = hexa_add(col, hexa_int(1));
+                                    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((pos).i < (total).i)) && hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_index_get(chars, pos), hexa_str("+"))) || hexa_truthy(hexa_eq(hexa_index_get(chars, pos), hexa_str("-")))))))) {
+                                        num_str = hexa_add(num_str, hexa_to_string(hexa_index_get(chars, pos)));
+                                        pos = hexa_add(pos, hexa_int(1));
+                                        col = hexa_add(col, hexa_int(1));
+                                    }
+                                    while (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((pos).i < (total).i)) && hexa_truthy(hexa_bool((hexa_index_get(chars, pos).tag==TAG_STR && hexa_index_get(chars, pos).s && isdigit((unsigned char)hexa_index_get(chars, pos).s[0])) || (hexa_index_get(chars, pos).tag==TAG_CHAR && isdigit((unsigned char)hexa_index_get(chars, pos).i))))))) {
+                                        num_str = hexa_add(num_str, hexa_to_string(hexa_index_get(chars, pos)));
+                                        pos = hexa_add(pos, hexa_int(1));
+                                        col = hexa_add(col, hexa_int(1));
+                                    }
+                                }
+                            }
                             if (hexa_truthy(is_float)) {
                                 tokens = hexa_array_push(tokens, Token(hexa_str("FloatLit"), num_str, line, start_col));
                             } else {

@@ -1922,6 +1922,10 @@ HexaVal parse_stmt(void) {
         }
         p_skip_newlines();
     }
+    /* G39: after @attr collection, absorb `pub` if present — allows `@pure pub fn` */
+    if (hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Pub")))) {
+        parse_visibility();
+    }
     HexaVal kind = p_peek_kind();
     if (hexa_truthy(hexa_eq(kind, hexa_str("Let")))) {
         return parse_let();
