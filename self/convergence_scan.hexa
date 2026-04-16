@@ -9,7 +9,7 @@
 //    hexa convergence dump <file>        — 전체 블록 + meta 를 JSON 출력
 //    hexa convergence dump-meta <file>   — @convergence-meta 블록만 출력
 //
-//  블록 형식 (어떤 주석 prefix 든 허용 — #, //, ;, --):
+//  ── 형식 A: 멀티라인 블록 (레거시, 역호환) ──
 //    # @convergence-start
 //    # state: ossified
 //    # id: LAUNCHD_PATH_HARDENED
@@ -19,6 +19,17 @@
 //    # ossified_at: 2026-04-15
 //    # ref_commit: dba4246f
 //    # @convergence-end
+//
+//  ── 형식 B: 단일행 @convergence (신규) ──
+//    # @convergence state=ossified id=LAUNCHD_PATH_HARDENED value="plist ..." threshold="refresh_via_cli"
+//
+//    규칙:
+//      - `@convergence ` (뒤 공백 필수) 감지 → key=value 쌍 파싱
+//      - value 에 공백/쉼표 포함 시 `"..."` 인용
+//      - 필수 키: state, id
+//      - 허용 상태: ossified | stable | in_flight | pending | completed | completed_gap | failed | blocked
+//      - 선택 키: value, threshold, date, note, evidence, checkpoint, ossified_at, promoted_from, ref_commit, rationale
+//      - 주석 prefix (#, //, ;, --, <!-- -->) 자동 제거
 //
 //  meta 블록:
 //    # @convergence-meta-start
@@ -32,6 +43,7 @@
 //    - 라인에 `@convergence-end`       → 블록 종료
 //    - `@convergence-meta-start`       → meta 블록 시작
 //    - `@convergence-meta-end`         → meta 블록 종료
+//    - 라인에 `@convergence ` 포함 (뒤 공백) + `-start/-end/-meta` 아님 → 단일행 엔트리
 //    - 본 블록의 각 내부 라인:
 //        leading `# ` / `// ` / `; ` / `-- ` 제거 → `key: value` 파싱
 //        첫 번째 `:` 만 split, value 에 `:` 포함 가능
@@ -42,6 +54,8 @@
 //    - invariant_check.hexa 의 라인 기반 스캔 스타일 답습 (stage0 안전)
 //    - 직접 토큰화 없이 문자열 substring 만 사용
 //    - JSON 은 수작업 문자열 빌드 — stdlib 미의존
+//    - hashmap API: .set(k,v) 반환값 재할당, .get(k) 읽기, .contains_key(k) 존재확인
+//      (kv[k]=v index-assign 는 현재 바이너리 미지원 — map_set COW 패턴 사용)
 // ═══════════════════════════════════════════════════════════
 
 // ── 라인 유틸 ──────────────────────────────────────────────
@@ -110,7 +124,45 @@ fn cs_contains(haystack, needle) {
     return false
 }
 
-// Strip a single-line comment prefix (#, //, ;, --) + one optional space.
+// Check if string starts with a given prefix
+fn cs_starts_with(s, prefix) {
+    let sc = s.chars()
+    let pc = prefix.chars()
+    let sn = len(sc)
+    let pn = len(pc)
+    if pn > sn { return false }
+    let mut i = 0
+    while i < pn {
+        if sc[i] != pc[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// Find position of `needle` substring in `haystack`. Returns -1 if not found.
+fn cs_find_substr(haystack, needle) {
+    let hs = haystack.chars()
+    let ns = needle.chars()
+    let hl = len(hs)
+    let nl = len(ns)
+    if nl == 0 { return 0 }
+    if nl > hl { return -1 }
+    let mut i = 0
+    let last = hl - nl + 1
+    while i < last {
+        let mut k = 0
+        let mut ok = true
+        while k < nl {
+            if hs[i + k] != ns[k] { ok = false; k = nl }
+            else { k = k + 1 }
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Strip a single-line comment prefix (#, //, ;, --, <!-- -->) + one optional space.
 // Input: a raw line already lstripped.
 // Returns the content after the prefix, or the original line if no prefix matched.
 fn cs_strip_comment_prefix(line) {
@@ -118,6 +170,22 @@ fn cs_strip_comment_prefix(line) {
     let cs = t.chars()
     let total = len(cs)
     if total == 0 { return t }
+    // HTML comment `<!--` prefix — strip `<!--` and optional trailing `-->`
+    if total >= 4 {
+        if cs[0] == '<' && cs[1] == '!' && cs[2] == '-' && cs[3] == '-' {
+            let mut rest = t.substring(4, total)
+            rest = cs_lstrip(rest)
+            // If line also ends with `-->`, strip that too
+            let rc = rest.chars()
+            let rl = len(rc)
+            if rl >= 3 {
+                if rc[rl - 3] == '-' && rc[rl - 2] == '-' && rc[rl - 1] == '>' {
+                    rest = cs_rstrip(rest.substring(0, rl - 3))
+                }
+            }
+            return rest
+        }
+    }
     // `//` prefix
     if total >= 2 {
         if cs[0] == '/' && cs[1] == '/' {
@@ -238,7 +306,7 @@ fn cs_scan_meta(src) {
 // Parse block body lines (already stripped of start/end markers) into a
 // hashmap of key→value. Lines that fail `key: value` parsing are skipped.
 fn cs_parse_block_body(body_lines) {
-    let mut kv = #{}
+    let mut kv = #{"__keys__": []}
     let mut keys = []
     let n = len(body_lines)
     let mut i = 0
@@ -260,7 +328,7 @@ fn cs_parse_block_body(body_lines) {
                     let key = cs_strip(trimmed.substring(0, colon))
                     let value = cs_strip(trimmed.substring(colon + 1, len(trimmed)))
                     if len(key) > 0 {
-                        kv[key] = value
+                        kv = kv.set(key, value)
                         keys = keys.push(key)
                     }
                     i = i + 1
@@ -269,8 +337,164 @@ fn cs_parse_block_body(body_lines) {
         }
     }
     // Attach ordered key list under a reserved name (skip in JSON emit for values).
-    kv["__keys__"] = keys
+    kv = kv.set("__keys__", keys)
     return kv
+}
+
+// ── 단일행 @convergence 파서 ──────────────────────────────
+// Parse key=value pairs from the tail of an @convergence single-line.
+// Input chars + length AFTER "@convergence " (e.g. "state=ossified id=FOO ...").
+// Returns a hashmap identical in shape to cs_parse_block_body output (with __keys__).
+//
+// Grammar:
+//   pairs  = pair (' '+ pair)*
+//   pair   = key '=' value
+//   key    = [^ =]+
+//   value  = '"' [^"]* '"'    (quoted — permits spaces/commas/colons inside)
+//          | [^ ]*            (unquoted — runs until next space or end)
+//
+// Uses helper functions (cs_skip_ws, cs_scan_until_eq, etc.) instead of `break`
+// to keep the main loop a simple while with index arithmetic.
+fn cs_parse_kv_loop(chars, total) {
+    let mut kv = #{"__keys__": []}
+    let mut keys = []
+    let mut pos = 0
+
+    while pos < total {
+        // skip spaces
+        pos = cs_skip_ws(chars, total, pos)
+        if pos >= total { pos = total }
+        else {
+            // ── parse key: scan until '=' or end ──
+            let key_start = pos
+            let eq_pos = cs_scan_until_eq(chars, total, pos)
+            if eq_pos >= total {
+                // no '=' found — malformed tail, stop
+                pos = total
+            } else {
+                let key = cs_chars_slice(chars, key_start, eq_pos)
+                pos = eq_pos + 1   // skip '='
+
+                if pos >= total {
+                    // key= at end — empty value
+                    kv = kv.set(key, "")
+                    keys = keys.push(key)
+                    pos = total
+                } else {
+                    // ── parse value ──
+                    if chars[pos] == '"' {
+                        // quoted value: scan to closing '"'
+                        pos = pos + 1
+                        let val_start = pos
+                        let close = cs_scan_until_quote(chars, total, pos)
+                        let val = cs_chars_slice(chars, val_start, close)
+                        kv = kv.set(key, val)
+                        keys = keys.push(key)
+                        if close < total { pos = close + 1 } else { pos = total }
+                    } else {
+                        // unquoted value: scan to next space or end
+                        let val_start = pos
+                        let val_end = cs_scan_until_space(chars, total, pos)
+                        let val = cs_chars_slice(chars, val_start, val_end)
+                        kv = kv.set(key, val)
+                        keys = keys.push(key)
+                        pos = val_end
+                    }
+                }
+            }
+        }
+    }
+    kv = kv.set("__keys__", keys)
+    return kv
+}
+
+// Skip whitespace chars starting at `pos`. Returns new position.
+fn cs_skip_ws(chars, total, start) {
+    let mut p = start
+    while p < total {
+        let c = chars[p]
+        if c == ' ' || c == '\t' { p = p + 1 }
+        else { return p }
+    }
+    return p
+}
+
+// Scan forward from `start` until '=' found. Returns index of '=', or `total` if absent.
+fn cs_scan_until_eq(chars, total, start) {
+    let mut p = start
+    while p < total {
+        if chars[p] == '=' { return p }
+        p = p + 1
+    }
+    return total
+}
+
+// Scan forward from `start` until closing '"'. Returns index of '"', or `total` if absent.
+fn cs_scan_until_quote(chars, total, start) {
+    let mut p = start
+    while p < total {
+        if chars[p] == '"' { return p }
+        p = p + 1
+    }
+    return total
+}
+
+// Scan forward from `start` until space/tab. Returns index, or `total` if absent.
+fn cs_scan_until_space(chars, total, start) {
+    let mut p = start
+    while p < total {
+        let c = chars[p]
+        if c == ' ' || c == '\t' { return p }
+        p = p + 1
+    }
+    return total
+}
+
+// Build a string from chars[a..b).
+fn cs_chars_slice(chars, a, b) {
+    let mut parts = []
+    let mut i = a
+    while i < b {
+        parts = parts.push(to_string(chars[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ── 단일행 스캔 ──────────────────────────────────────────────
+// Scan source for lines containing `@convergence ` (trailing space) that are NOT
+// block start/end/meta markers. Returns list of kv hashmaps (same shape as cs_scan_blocks).
+fn cs_scan_single_lines(src) {
+    let lines = src.split("\n")
+    let n = len(lines)
+    let mut entries = []
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        // Must contain @convergence but NOT the block/meta markers
+        if cs_contains(line, "@convergence ") {
+            let is_block = cs_contains(line, "@convergence-start")
+            let is_end = cs_contains(line, "@convergence-end")
+            let is_meta = cs_contains(line, "@convergence-meta")
+            if !is_block && !is_end && !is_meta {
+                // Strip comment prefix first
+                let stripped = cs_strip_comment_prefix(line)
+                let trimmed = cs_strip(stripped)
+                // Find `@convergence ` anchor in the stripped content
+                let anchor = "@convergence "
+                let anchor_pos = cs_find_substr(trimmed, anchor)
+                if anchor_pos >= 0 {
+                    let anchor_len = len(anchor.chars())
+                    let tail = trimmed.substring(anchor_pos + anchor_len, len(trimmed))
+                    let tc = tail.chars()
+                    let kv = cs_parse_kv_loop(tc, len(tc))
+                    entries = entries.push(kv)
+                }
+            }
+        }
+        i = i + 1
+    }
+    return entries
 }
 
 // ── JSON 빌더 ──────────────────────────────────────────────
@@ -301,14 +525,14 @@ fn cs_json_str(s) {
 // Emit a single entry's inner JSON object. Keys listed in `skip` are omitted
 // (e.g. id, state, __keys__). Preserves original parse order.
 fn cs_emit_entry_object(kv, skip, indent) {
-    let keys = kv["__keys__"]
+    let keys = kv.get("__keys__")
     let n = len(keys)
     let mut parts = []
     let mut i = 0
     while i < n {
         let k = keys[i]
         if !cs_list_contains(skip, k) {
-            let v = kv[k]
+            let v = kv.get(k)
             let line = indent + cs_json_str(k) + ": " + cs_json_str(v)
             parts = parts.push(line)
         }
@@ -331,7 +555,7 @@ fn cs_list_contains(lst, item) {
 // Blocks with missing state default to "evolving". Blocks with missing id
 // are dropped with stderr warning.
 fn cs_group_by_state(blocks) {
-    let mut groups = #{}
+    let mut groups = #{"__order__": []}
     let mut order = []  // state names in first-seen order
     let n = len(blocks)
     let mut i = 0
@@ -343,18 +567,19 @@ fn cs_group_by_state(blocks) {
         } else {
             let mut state = "evolving"
             if blk.contains_key("state") {
-                let s = blk["state"]
+                let s = blk.get("state")
                 if len(s) > 0 { state = s }
             }
             let mut existing = []
-            if groups.contains_key(state) { existing = groups[state] }
+            if groups.contains_key(state) { existing = groups.get(state) }
             let updated = existing.push(blk)
-            groups[state] = updated
+            groups = groups.set(state, updated)
             if !cs_list_contains(order, state) { order = order.push(state) }
             i = i + 1
         }
     }
-    return #{"groups": groups, "order": order}
+    groups = groups.set("__order__", order)
+    return groups
 }
 
 // ── 최상위 dump ────────────────────────────────────────────
@@ -370,10 +595,9 @@ fn cs_emit_full_json(meta_block, blocks) {
     }
 
     // groups
-    let grouped = cs_group_by_state(blocks)
-    let groups = grouped["groups"]
-    let order = grouped["order"]
-    let preferred = ["ossified", "stable", "evolving", "failed"]
+    let groups = cs_group_by_state(blocks)
+    let order = groups.get("__order__")
+    let preferred = ["ossified", "stable", "completed", "completed_gap", "in_flight", "pending", "evolving", "blocked", "failed"]
     let mut emitted = []
 
     // Emit preferred order first
@@ -382,7 +606,7 @@ fn cs_emit_full_json(meta_block, blocks) {
     while pi < pn {
         let st = preferred[pi]
         if groups.contains_key(st) {
-            let section = cs_emit_group_section(st, groups[st])
+            let section = cs_emit_group_section(st, groups.get(st))
             sections = sections.push(section)
             emitted = emitted.push(st)
         }
@@ -394,7 +618,7 @@ fn cs_emit_full_json(meta_block, blocks) {
     while oi < on {
         let st2 = order[oi]
         if !cs_list_contains(emitted, st2) {
-            let section2 = cs_emit_group_section(st2, groups[st2])
+            let section2 = cs_emit_group_section(st2, groups.get(st2))
             sections = sections.push(section2)
             emitted = emitted.push(st2)
         }
@@ -411,7 +635,7 @@ fn cs_emit_group_section(state, block_list) {
     let mut i = 0
     while i < n {
         let blk = block_list[i]
-        let id = blk["id"]
+        let id = blk.get("id")
         let skip = ["id", "state", "__keys__"]
         let inner = cs_emit_entry_object(blk, skip, "      ")
         let entry = "    " + cs_json_str(id) + ": {\n" + inner + "\n    }"
@@ -429,6 +653,48 @@ fn cs_emit_meta_json(meta_block) {
     let m = meta_block[0]
     let inner = cs_emit_entry_object(m, ["__keys__"], "  ")
     return "{\n" + inner + "\n}"
+}
+
+// ── 엔트리 병합 ──────────────────────────────────────────
+// Merge block_entries and single_entries into one list.
+// If both formats define the same id, the block entry wins (first seen).
+// This ensures backward compatibility: old multi-line blocks take precedence
+// during the transition period.
+fn cs_merge_entries(block_entries, single_entries) {
+    let mut seen_ids = []
+    let mut merged = []
+
+    // Block entries first (legacy takes priority)
+    let bn = len(block_entries)
+    let mut bi = 0
+    while bi < bn {
+        let blk = block_entries[bi]
+        if blk.contains_key("id") {
+            seen_ids = seen_ids.push(blk.get("id"))
+        }
+        merged = merged.push(blk)
+        bi = bi + 1
+    }
+
+    // Single-line entries: skip if id already seen
+    let sn = len(single_entries)
+    let mut si = 0
+    while si < sn {
+        let entry = single_entries[si]
+        let mut skip = false
+        if entry.contains_key("id") {
+            if cs_list_contains(seen_ids, entry.get("id")) {
+                skip = true
+            } else {
+                seen_ids = seen_ids.push(entry.get("id"))
+            }
+        }
+        if !skip {
+            merged = merged.push(entry)
+        }
+        si = si + 1
+    }
+    return merged
 }
 
 // ── CLI 진입점 ────────────────────────────────────────────
@@ -462,7 +728,10 @@ fn cs_main() {
 
     if subcmd == "dump" {
         let meta_blocks = cs_scan_meta(src)
-        let blocks = cs_scan_blocks(src)
+        let block_entries = cs_scan_blocks(src)
+        let single_entries = cs_scan_single_lines(src)
+        // Merge: block entries first, then single-line entries (dedup by id)
+        let blocks = cs_merge_entries(block_entries, single_entries)
         let out = cs_emit_full_json(meta_blocks, blocks)
         println(out)
         exit(0)
