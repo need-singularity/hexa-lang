@@ -4200,3 +4200,91 @@ static void _hexa_init_fn_shims(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 #include "native/tensor_kernels.c"
 
+/* ═══════════════════════════════════════════════════════════════════
+ * std::net — POSIX TCP socket builtins (stage0 resurrection, 2026-04-16)
+ *
+ * Ports the minimum viable set of networking builtins from the deleted
+ * Rust src/std_net.rs (recovered from commit ef92fc6). The full surface
+ * (8 builtins) is deferred; this block ships the 3 that prove the path:
+ *
+ *   hexa_net_listen(addr)   : string "host:port" → TAG_INT fd (>=0 on
+ *                              success, -errno on failure)
+ *   hexa_net_accept(listen) : TAG_INT listen_fd  → TAG_INT client_fd
+ *   hexa_net_close(fd)      : TAG_INT fd         → TAG_INT 0/-errno
+ *
+ * Error model: negative TAG_INT (the raw errno). Matches the C-side
+ * convention used by hxcuda/hxblas shims — callers that want structured
+ * errors can check `< 0` and consult errno via a future net_errno().
+ *
+ * Deferred (future work): net_read, net_write, net_connect, http_get,
+ * http_serve, plus SO_REUSEADDR / non-blocking / backlog tuning.
+ * ═══════════════════════════════════════════════════════════════════ */
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <errno.h>
+
+static int _hexa_net_parse_addr(const char* addr, struct sockaddr_in* sa_out) {
+    /* Accept "host:port". Host may be numeric (127.0.0.1) or textual
+     * ("localhost"); textual bypasses inet_pton and falls back to
+     * INADDR_LOOPBACK. Day-1 is intentionally narrow — DNS + IPv6 land
+     * with net_connect / http_get. */
+    if (!addr || !*addr || !sa_out) return -EINVAL;
+    const char* colon = strrchr(addr, ':');
+    if (!colon || colon == addr) return -EINVAL;
+    char host[256];
+    size_t host_len = (size_t)(colon - addr);
+    if (host_len >= sizeof(host)) return -EINVAL;
+    memcpy(host, addr, host_len);
+    host[host_len] = '\0';
+    int port = atoi(colon + 1);
+    if (port <= 0 || port > 65535) return -EINVAL;
+    memset(sa_out, 0, sizeof(*sa_out));
+    sa_out->sin_family = AF_INET;
+    sa_out->sin_port = htons((uint16_t)port);
+    /* Accept both dotted-quad and the special hostname "localhost". */
+    if (strcmp(host, "localhost") == 0) {
+        sa_out->sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    } else if (strcmp(host, "0.0.0.0") == 0 || strcmp(host, "*") == 0) {
+        sa_out->sin_addr.s_addr = htonl(INADDR_ANY);
+    } else if (inet_pton(AF_INET, host, &sa_out->sin_addr) != 1) {
+        return -EINVAL;
+    }
+    return 0;
+}
+
+HexaVal hexa_net_listen(HexaVal addr_val) {
+    const char* addr = hexa_to_cstring(addr_val);
+    struct sockaddr_in sa;
+    int parse_rc = _hexa_net_parse_addr(addr, &sa);
+    if (parse_rc < 0) return hexa_int(parse_rc);
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return hexa_int(-errno);
+    int one = 1;
+    /* SO_REUSEADDR mirrors the Rust TcpListener default (tokio/stdlib both
+     * set it). Without it, repeat `hexa run` within TIME_WAIT collides. */
+    (void)setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    if (bind(fd, (struct sockaddr*)&sa, sizeof(sa)) < 0) {
+        int e = errno; close(fd); return hexa_int(-e);
+    }
+    if (listen(fd, 64) < 0) {
+        int e = errno; close(fd); return hexa_int(-e);
+    }
+    return hexa_int(fd);
+}
+
+HexaVal hexa_net_accept(HexaVal listen_val) {
+    int64_t listen_fd = hexa_as_num(listen_val);
+    if (listen_fd < 0) return hexa_int(-EINVAL);
+    int client = accept((int)listen_fd, NULL, NULL);
+    if (client < 0) return hexa_int(-errno);
+    return hexa_int(client);
+}
+
+HexaVal hexa_net_close(HexaVal fd_val) {
+    int64_t fd = hexa_as_num(fd_val);
+    if (fd < 0) return hexa_int(-EINVAL);
+    if (close((int)fd) < 0) return hexa_int(-errno);
+    return hexa_int(0);
+}
+
