@@ -13,6 +13,13 @@
 #include <time.h>
 #include <unistd.h>
 
+// Force line-buffered stdout when redirected to file/pipe.
+__attribute__((constructor))
+static void _hexa_init_stdio(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
+    setvbuf(stderr, NULL, _IOLBF, 0);
+}
+
 // ═══════════════════════════════════════════════════════════
 //  Optimization #11: String Interning
 //  Hash-set of unique strings. Short strings (< 64 chars)

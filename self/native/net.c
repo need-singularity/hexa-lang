@@ -158,11 +158,17 @@ HexaVal hexa_net_write(HexaVal fd_val, HexaVal data_val) {
  * teaches the transpiler the direct-lowering. After that, these shims are
  * harmless — codegen will emit `hexa_net_connect(...)` directly and the
  * globals simply remain unused. */
+HexaVal net_listen;
+HexaVal net_accept;
+HexaVal net_close;
 HexaVal net_connect;
 HexaVal net_read;
 HexaVal net_write;
 
 static void _hexa_init_net_fn_shims(void) {
+    net_listen  = hexa_fn_new((void*)hexa_net_listen,  1);
+    net_accept  = hexa_fn_new((void*)hexa_net_accept,  1);
+    net_close   = hexa_fn_new((void*)hexa_net_close,   1);
     net_connect = hexa_fn_new((void*)hexa_net_connect, 1);
     net_read    = hexa_fn_new((void*)hexa_net_read,    1);
     net_write   = hexa_fn_new((void*)hexa_net_write,   2);
