@@ -1,0 +1,220 @@
+// ═══════════════════════════════════════════════════════════
+//  self/opt/ai_hints.hexa — AI Hint Model for σ=12 Optimization
+//
+//  BT (gap #7 from n6 implementation gaps): "AI 힌트 IR 반영" —
+//  the HEXA-IR spec expects AST attributes (@hot, @pure, @inline,
+//  @cold, @noinline, @memoize, @stack_alloc, @specialize, @restrict,
+//  @inline_always) to be propagated into the IR layer so optimizer
+//  passes can bias decisions by developer intent.
+//
+//  Before this file:
+//    - parser.hexa     collected @attrs into FnDecl.value (comma list)
+//    - codegen_c2.hexa read a FEW attrs (inline_always, specialize,
+//                      stack_alloc, restrict) at the C-emit stage
+//    - opt/p05_inlining.hexa used ONLY an instruction-count heuristic
+//      and IGNORED all AI hints → could not honor @inline / @cold / @hot
+//
+//  This module closes the gap with a standalone, interpreter-runnable
+//  policy layer that the σ=12 inliner (P5) can adopt with a one-liner
+//  guard on its snapshot filter. No σ=12 schema change.
+//
+//  Exports:
+//    1. 10 canonical AI hint tags (ai_hint_hot() … ai_hint_restrict())
+//    2. ai_hint_bucket(tag) — partition into 5+3+2 Egyptian buckets
+//    3. fn_attrs_has(s, t)  — membership predicate (padded-contains)
+//    4. inline_policy(s)    — returns "never" / "always" / "prefer" /
+//                             "normal"
+//    5. effective_threshold(s, base) — size threshold after hint bias
+//    6. should_inline(s, instr_count, base) — end-to-end decision
+//
+//  This file is STANDALONE — it does NOT import opt/mod.hexa or
+//  alter the σ=12 schema. pass_inlining_run (p05_inlining.hexa) can
+//  adopt these helpers by replacing
+//        if func.name != "main" && func_instr_count(func) <= INLINE_THRESHOLD
+//  with
+//        if func.name != "main"
+//           && should_inline(func.attrs, func_instr_count(func), INLINE_THRESHOLD)
+//  once `attrs` is plumbed through IrFunction (orthogonal follow-up).
+// ═══════════════════════════════════════════════════════════
+
+// ── Canonical AI hint tags (10 total) ──────────────────────
+// Names match the strings produced by parser.hexa when a user
+// writes `@hot fn foo()`, `@pure fn bar()` etc.
+fn ai_hint_hot()           { return "hot" }
+fn ai_hint_cold()          { return "cold" }
+fn ai_hint_pure()          { return "pure" }
+fn ai_hint_inline()        { return "inline" }
+fn ai_hint_inline_always() { return "inline_always" }
+fn ai_hint_noinline()      { return "noinline" }
+fn ai_hint_memoize()       { return "memoize" }
+fn ai_hint_stack_alloc()   { return "stack_alloc" }
+fn ai_hint_specialize()    { return "specialize" }
+fn ai_hint_restrict()      { return "restrict" }
+
+// Total count — lines up with the 10-row DSL the parser recognizes.
+fn ai_hint_count() { return 10 }
+
+// ── Egyptian bucket classification ─────────────────────────
+// Split 10 hints by semantic domain:
+//   inlining (5)     : hot, cold, inline, inline_always, noinline
+//   performance (3)  : pure, memoize, specialize
+//   memory/aliasing (2): stack_alloc, restrict
+// 5 + 3 + 2 = 10 — echoes the Egyptian 1/2 + 1/3 + 1/6 split on J₂=24
+// (12 + 8 + 4 = 24) applied at the hint layer with n=10.
+fn ai_hint_bucket(tag) {
+    if tag == "hot"           { return "inlining" }
+    if tag == "cold"          { return "inlining" }
+    if tag == "inline"        { return "inlining" }
+    if tag == "inline_always" { return "inlining" }
+    if tag == "noinline"      { return "inlining" }
+    if tag == "pure"          { return "performance" }
+    if tag == "memoize"       { return "performance" }
+    if tag == "specialize"    { return "performance" }
+    if tag == "stack_alloc"   { return "memory" }
+    if tag == "restrict"      { return "memory" }
+    return "unknown"
+}
+
+// ── Attribute membership (padded-contains) ─────────────────
+// parser.hexa emits a comma-separated string like "pure,inline,hot".
+// The padded-contains technique avoids chars()/indexing quirks in the
+// stage0 interpreter:
+//   To test whether `tag` is in `attrs`, pad both sides with ","
+//   and look for ",tag," — this rules out prefix/suffix matches on
+//   adjacent names (e.g. "pure" should not match "purely").
+fn fn_attrs_has(attrs_str, tag) {
+    if type_of(attrs_str) != "string" { return false }
+    if attrs_str == "" { return false }
+    let padded = "," + attrs_str + ","
+    let needle = "," + tag + ","
+    return padded.contains(needle)
+}
+
+// ── Inline policy derivation ───────────────────────────────
+// Priority order (first match wins):
+//   @noinline / @cold      → "never"  (hard veto)
+//   @inline_always         → "always" (unbounded)
+//   @inline                → "always" (user explicit)
+//   @hot or @pure          → "prefer" (expanded threshold)
+//   (none)                 → "normal"
+//
+// Matches Rust/LLVM attribute convention.
+fn inline_policy(attrs_str) {
+    if fn_attrs_has(attrs_str, "noinline") { return "never" }
+    if fn_attrs_has(attrs_str, "cold")     { return "never" }
+    if fn_attrs_has(attrs_str, "inline_always") { return "always" }
+    if fn_attrs_has(attrs_str, "inline")   { return "always" }
+    if fn_attrs_has(attrs_str, "hot")      { return "prefer" }
+    if fn_attrs_has(attrs_str, "pure")     { return "prefer" }
+    return "normal"
+}
+
+// Threshold after hint bias. `base` is the default INLINE_THRESHOLD
+// (currently 8 = σ - τ in p05_inlining.hexa).
+//   "always" → 2^30 (effectively unbounded)
+//   "prefer" → 3 * base (hot/pure — encourage inlining)
+//   "normal" → base
+//   "never"  → 0  (will never pass size check)
+fn effective_threshold(attrs_str, base) {
+    let p = inline_policy(attrs_str)
+    if p == "always" { return 1073741824 }
+    if p == "prefer" { return base * 3 }
+    if p == "never"  { return 0 }
+    return base
+}
+
+// High-level decision: should the inliner attempt this callee?
+// Takes the callee's attrs AND its IR instruction count.
+// The σ=12 caller additionally considers recursion, call-site count,
+// and the per-function MAX_INLINES cap.
+fn should_inline(attrs_str, instr_count, base_threshold) {
+    let p = inline_policy(attrs_str)
+    if p == "never"  { return false }
+    if p == "always" { return true  }
+    let limit = effective_threshold(attrs_str, base_threshold)
+    return instr_count <= limit
+}
+
+// ── Self-tests ─────────────────────────────────────────────
+// Use module-level counters to avoid closure-capture quirks.
+pub let mut ai_hint_pass_n = 0
+pub let mut ai_hint_fail_n = 0
+
+fn _ai_hint_report(name, ok) {
+    if ok {
+        println("  PASS " + name)
+        ai_hint_pass_n = ai_hint_pass_n + 1
+    } else {
+        println("  FAIL " + name)
+        ai_hint_fail_n = ai_hint_fail_n + 1
+    }
+}
+
+fn ai_hints_run_tests() {
+    println("=== ai_hints self-tests (AI hint model for σ=12 inliner) ===")
+    ai_hint_pass_n = 0
+    ai_hint_fail_n = 0
+
+    // T1 — membership, basic cases.
+    _ai_hint_report("has-pure", fn_attrs_has("pure,inline", "pure"))
+    _ai_hint_report("has-hot-neg", fn_attrs_has("pure,inline", "hot") == false)
+    _ai_hint_report("has-single", fn_attrs_has("pure", "pure"))
+    _ai_hint_report("has-empty", fn_attrs_has("", "pure") == false)
+
+    // T2 — prefix/suffix must NOT match (padded-contains correctness).
+    _ai_hint_report("no-partial-prefix", fn_attrs_has("pureabc,inline", "pure") == false)
+    _ai_hint_report("no-partial-suffix", fn_attrs_has("xpure,inline", "pure") == false)
+
+    // T3 — policy priorities.
+    _ai_hint_report("policy-noinline=never",
+        inline_policy("noinline,hot,pure,inline") == "never")
+    _ai_hint_report("policy-cold=never", inline_policy("cold") == "never")
+    _ai_hint_report("policy-inline_always=always",
+        inline_policy("hot,inline_always") == "always")
+    _ai_hint_report("policy-inline=always", inline_policy("inline") == "always")
+    _ai_hint_report("policy-hot=prefer", inline_policy("hot") == "prefer")
+    _ai_hint_report("policy-pure=prefer", inline_policy("pure") == "prefer")
+    _ai_hint_report("policy-none=normal", inline_policy("") == "normal")
+
+    // T4 — threshold math.
+    _ai_hint_report("threshold-hot-3x8=24", effective_threshold("hot", 8) == 24)
+    _ai_hint_report("threshold-always=1G",
+        effective_threshold("inline_always", 8) == 1073741824)
+    _ai_hint_report("threshold-never=0", effective_threshold("cold", 8) == 0)
+    _ai_hint_report("threshold-normal=base", effective_threshold("memoize", 8) == 8)
+
+    // T5 — should_inline end-to-end.
+    _ai_hint_report("should_inline(cold,1)=false",
+        should_inline("cold", 1, 8) == false)
+    _ai_hint_report("should_inline(hot,20)=true",
+        should_inline("hot", 20, 8))
+    _ai_hint_report("should_inline(hot,30)=false",
+        should_inline("hot", 30, 8) == false)
+    _ai_hint_report("should_inline(none,7)=true", should_inline("", 7, 8))
+    _ai_hint_report("should_inline(none,9)=false",
+        should_inline("", 9, 8) == false)
+    _ai_hint_report("should_inline(inline_always,9999)=true",
+        should_inline("inline_always", 9999, 8))
+
+    // T6 — Egyptian bucket partition (5 inlining + 3 perf + 2 mem = 10).
+    let mut n_inl = 0
+    let mut n_perf = 0
+    let mut n_mem = 0
+    if ai_hint_bucket("hot") == "inlining"    { n_inl = n_inl + 1 }
+    if ai_hint_bucket("cold") == "inlining"   { n_inl = n_inl + 1 }
+    if ai_hint_bucket("inline") == "inlining" { n_inl = n_inl + 1 }
+    if ai_hint_bucket("inline_always") == "inlining" { n_inl = n_inl + 1 }
+    if ai_hint_bucket("noinline") == "inlining" { n_inl = n_inl + 1 }
+    if ai_hint_bucket("pure") == "performance" { n_perf = n_perf + 1 }
+    if ai_hint_bucket("memoize") == "performance" { n_perf = n_perf + 1 }
+    if ai_hint_bucket("specialize") == "performance" { n_perf = n_perf + 1 }
+    if ai_hint_bucket("stack_alloc") == "memory" { n_mem = n_mem + 1 }
+    if ai_hint_bucket("restrict") == "memory" { n_mem = n_mem + 1 }
+    _ai_hint_report("egyptian-5+3+2=10",
+        (n_inl == 5) && (n_perf == 3) && (n_mem == 2))
+
+    println("=== summary: PASS=" + to_string(ai_hint_pass_n) +
+            " FAIL=" + to_string(ai_hint_fail_n) + " ===")
+}
+
+ai_hints_run_tests()
