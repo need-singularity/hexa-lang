@@ -1,0 +1,263 @@
+// =====================================================================
+//  self/ml/run_7b_h100.hexa — Top-level 7B training entry point for H100
+//
+//  Auto-detects GPU count and routes to the appropriate training path:
+//    1 GPU  -> train_7b_gpu.hexa (single-GPU fused CUDA path)
+//    2+ GPU -> launch_multigpu.hexa (FSDP + hxccl distributed)
+//
+//  Before training, ensures all native libs are built via build_session_b.
+//
+//  Usage:
+//    hexa self/ml/run_7b_h100.hexa                     # auto-detect GPUs
+//    NUM_GPUS=8 hexa self/ml/run_7b_h100.hexa          # force 8 GPUs
+//    DIST_DATA_PATH=/data/train.bin hexa self/ml/run_7b_h100.hexa
+//
+//  Env vars:
+//    NUM_GPUS        Override GPU count (default: auto from nvidia-smi)
+//    DIST_DATA_PATH  Path to training data (default: synthetic)
+//    SKIP_BUILD      Set to "1" to skip native lib build check
+//    USE_FSDP        Enable FSDP sharding (default: "1" for multi-GPU)
+//    MASTER_ADDR     Master node address (default: 127.0.0.1)
+//    MASTER_PORT     Master port (default: 29500)
+//
+//  Grammar notes (HX3):
+//    - .push() not arr+[x] in loops
+//    - parens in slice index arithmetic: arr[(i+1)..j]
+//    - avoid `handle` as param name (reserved)
+// =====================================================================
+
+// ── Detect GPU count ────────────────────────────────────────────
+fn detect_gpu_count() {
+    // Check env override first
+    let env_gpus = env("NUM_GPUS")
+    if env_gpus != "" {
+        let n = to_int(env_gpus)
+        if n > 0 { return n }
+    }
+
+    // Try nvidia-smi
+    let result = exec_with_status("nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | wc -l")
+    if result[1] == 0 {
+        let n = to_int(result[0].trim())
+        if n > 0 { return n }
+    }
+
+    // Fallback: check CUDA_VISIBLE_DEVICES
+    let cvd = env("CUDA_VISIBLE_DEVICES")
+    if cvd != "" {
+        // Count comma-separated entries
+        let mut count = 1
+        let mut i = 0
+        while i < len(cvd) {
+            if cvd[i] == "," { count = count + 1 }
+            i = i + 1
+        }
+        return count
+    }
+
+    // Default: 1
+    return 1
+}
+
+// ── Check native libs exist ─────────────────────────────────────
+fn check_native_libs() {
+    let build_dir = "self/native/build"
+    let required = ["libhxblas.so", "libhxflash.so", "libhxccl.so"]
+    let mut missing = []
+    let mut i = 0
+    while i < len(required) {
+        let path = build_dir + "/" + required[i]
+        if !file_exists(path) {
+            missing.push(required[i])
+        }
+        i = i + 1
+    }
+
+    // libhxcuda.so is required for GPU training but warn-only
+    let cuda_lib = build_dir + "/libhxcuda.so"
+    let has_cuda = file_exists(cuda_lib)
+
+    return [missing, has_cuda]
+}
+
+// ── Build native libs if missing ────────────────────────────────
+fn ensure_native_libs() {
+    let skip = env("SKIP_BUILD")
+    if skip == "1" {
+        println("[build] SKIP_BUILD=1 — skipping native lib check")
+        return true
+    }
+
+    let check = check_native_libs()
+    let missing = check[0]
+    let has_cuda = check[1]
+
+    if len(missing) == 0 && has_cuda {
+        println("[build] all native libs present")
+        return true
+    }
+
+    if len(missing) > 0 {
+        println("[build] missing libs: " + str(missing))
+    }
+    if !has_cuda {
+        println("[build] libhxcuda.so missing — will attempt build")
+    }
+
+    println("[build] running build_session_b.hexa --linux ...")
+    let result = exec_with_status("hexa scripts/build_session_b.hexa --linux")
+    if result[1] != 0 {
+        println("[build] ERROR: build_session_b failed")
+        println(result[0])
+        return false
+    }
+    println("[build] native libs built successfully")
+    return true
+}
+
+// ── MFU estimator ───────────────────────────────────────────────
+//  H100 SXM: 989.5 TFLOPS bf16, ~495 TFLOPS f32
+//  Per-step FLOPs ~ 6 * params * seq_len (fwd + bwd)
+fn estimate_mfu(params, seq_len, step_ms, num_gpus) {
+    let peak_tflops_per_gpu = 495.0
+    let total_peak = peak_tflops_per_gpu * num_gpus
+    let flops_per_step = 6.0 * params * seq_len
+    let step_sec = step_ms / 1000.0
+    if step_sec <= 0.0 { return 0.0 }
+    let achieved_tflops = flops_per_step / step_sec / 1000000000000.0
+    let mfu = achieved_tflops / total_peak * 100.0
+    return mfu
+}
+
+// ── 7B parameter count (matches train_7b_integrated.hexa) ───────
+fn param_count_7b() {
+    let D = 4096
+    let N_LAYERS = 32
+    let N_KV = 8
+    let HEAD_DIM = 128
+    let FF_DIM = 11008
+    let VOCAB = 32000
+    let KV_DIM = N_KV * HEAD_DIM
+    let per_layer = D * D + D * KV_DIM + D * KV_DIM + D * D + D * FF_DIM + D * FF_DIM + FF_DIM * D + D + D
+    let embed = VOCAB * D
+    let lm_head = D * VOCAB
+    return per_layer * N_LAYERS + embed + lm_head
+}
+
+// ── Main ────────────────────────────────────────────────────────
+fn main() {
+    println("=" * 64)
+    println("  7B H100 Training Entry Point")
+    println("  Auto-detect GPUs -> route to single/multi-GPU path")
+    println("=" * 64)
+    println("")
+
+    // 1. Detect GPUs
+    let num_gpus = detect_gpu_count()
+    println("[detect] GPU count: " + str(num_gpus))
+
+    // 2. Show data path
+    let data_path = env("DIST_DATA_PATH")
+    if data_path != "" {
+        println("[data] DIST_DATA_PATH=" + data_path)
+    } else {
+        println("[data] DIST_DATA_PATH not set — using synthetic data")
+    }
+
+    // 3. Ensure native libs
+    println("")
+    let build_ok = ensure_native_libs()
+    if !build_ok {
+        println("[FATAL] native lib build failed — cannot proceed")
+        exit(1)
+    }
+
+    // 4. Set LD_LIBRARY_PATH if not already set
+    let ld_path = env("LD_LIBRARY_PATH")
+    let build_dir = "self/native/build"
+    if !ld_path.contains(build_dir) {
+        let new_ld = build_dir + ":/usr/local/cuda/lib64"
+        if ld_path != "" {
+            let _ = exec("export LD_LIBRARY_PATH=" + new_ld + ":" + ld_path)
+        } else {
+            let _ = exec("export LD_LIBRARY_PATH=" + new_ld)
+        }
+        println("[env] LD_LIBRARY_PATH includes " + build_dir)
+    }
+
+    // 5. Parameter count + MFU info
+    let params = param_count_7b()
+    let params_b = params / 1000000000
+    let params_m = (params % 1000000000) / 1000000
+    println("")
+    println("[model] 7B CLM — params=" + str(params_b) + "." + str(params_m) + "B")
+    println("[model] d=4096 layers=32 heads=32 kv=8 seq=2048 vocab=32000")
+    println("[model] H100 peak (f32): " + str(495.0 * num_gpus) + " TFLOPS (" + str(num_gpus) + " GPU)")
+    println("")
+
+    // 6. Route to appropriate training path
+    let t0 = time_ms()
+
+    if num_gpus == 1 {
+        // ── Single-GPU path ─────────────────────────────────────
+        println("[route] single GPU -> train_7b_gpu.hexa (CUDA fused kernels)")
+        println("[route] launching...")
+        println("")
+
+        let ld_prefix = "LD_LIBRARY_PATH=" + build_dir + ":/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+        let hexa_bin = env("HEXA_BIN")
+        let bin = if hexa_bin != "" { hexa_bin } else { "hexa" }
+
+        let cmd = ld_prefix + " " + bin + " self/ml/train_7b_gpu.hexa"
+        let rc = exec(cmd)
+        if rc != 0 {
+            println("[FAIL] train_7b_gpu.hexa exited with " + str(rc))
+            exit(1)
+        }
+    } else {
+        // ── Multi-GPU path ──────────────────────────────────────
+        println("[route] " + str(num_gpus) + " GPUs -> launch_multigpu.hexa (FSDP + hxccl)")
+        println("[route] launching...")
+        println("")
+
+        let ld_prefix = "LD_LIBRARY_PATH=" + build_dir + ":/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-}"
+        let hexa_bin = env("HEXA_BIN")
+        let bin = if hexa_bin != "" { hexa_bin } else { "hexa" }
+
+        // Set NUM_GPUS for the launcher
+        let cmd = "NUM_GPUS=" + str(num_gpus) + " " +
+                  "DIST_DATA_PATH=" + data_path + " " +
+                  "USE_FSDP=1 " +
+                  ld_prefix + " " +
+                  bin + " self/ml/launch_multigpu.hexa"
+        let rc = exec(cmd)
+        if rc != 0 {
+            println("[FAIL] launch_multigpu.hexa exited with " + str(rc))
+            exit(1)
+        }
+    }
+
+    let elapsed_s = (time_ms() - t0) / 1000.0
+
+    // 7. Completion report
+    println("")
+    println("=" * 64)
+    println("  7B Training Session Complete")
+    println("  GPUs:         " + str(num_gpus))
+    println("  Total time:   " + str(elapsed_s) + " s")
+
+    // Estimate MFU from total time
+    // Assume 3 steps for demo (matching train_7b_integrated default)
+    // Real step count comes from the sub-process output
+    let demo_steps = 3
+    if elapsed_s > 0.0 {
+        let ms_per_step = (elapsed_s * 1000.0) / (demo_steps * 1.0)
+        let mfu = estimate_mfu(params * 1.0, 2048.0, ms_per_step, num_gpus)
+        println("  Est MFU:      " + str(mfu) + "% (approx, " + str(demo_steps) + " steps)")
+    }
+
+    println("  Data:         " + if data_path != "" { data_path } else { "synthetic" })
+    println("=" * 64)
+}
+
+main()
