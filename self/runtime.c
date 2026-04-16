@@ -774,6 +774,7 @@ static int _hx_stats_on(void) {
 // out: "Array .items lives on heap — hexa_array_push uses realloc"). This
 // change addresses that gap.
 extern int __hexa_val_mark_top;  // shared with rt 32-L Val arena
+extern int __hexa_val_force_heap; // T33-fix-2: force heap in valstruct_new_v
 static int hexa_val_arena_on(void);
 static void* hexa_val_arena_calloc(size_t n);
 void* hexa_arena_alloc(size_t n);  // rt 32-D bump allocator (shared block chain)
@@ -1109,6 +1110,7 @@ void* hexa_arena_alloc(size_t n);  // defined below; forward decl for hmap_alloc
 static int hexa_val_arena_on(void);
 static void* hexa_val_arena_calloc(size_t n);
 extern int __hexa_val_mark_top;  // defined later; gate guard for module-init Vals.
+extern int __hexa_val_force_heap; // T33-fix-2
 
 // Allocate a new HexaMapTable with given hash-table capacity.
 // rt 32-L: when from_arena=1, use bump-arena instead of malloc/calloc. Caller
@@ -1754,56 +1756,73 @@ HexaVal hexa_valstruct_get_by_key(HexaVal v, const char* key) {
 }
 
 // Setter accepts any HexaVal payload — no TAG_STR gating, mirrors getter.
+// 2026-04-17: COW — __VAL_INT_CACHE/float/bool singletons share ValStruct
+// pointers. In-place mutation corrupts ALL users of that cache slot.
+// Always shallow-copy before writing; old ValStruct leaked (no refcounting).
 HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) {
         fprintf(stderr, "valstruct_set: not a TAG_VALSTRUCT\n");
         return v;
     }
     if (!key) return v;
+    // COW: allocate a fresh copy
+    HexaValStruct* orig = HX_VS(v);
+    int use_arena = hexa_val_arena_on() && __hexa_val_mark_top > 0;
+    HexaValStruct* cow;
+    if (use_arena) {
+        cow = (HexaValStruct*)hexa_val_arena_calloc(sizeof(HexaValStruct));
+    } else {
+        cow = (HexaValStruct*)malloc(sizeof(HexaValStruct));
+        if (!cow) { fprintf(stderr, "OOM in valstruct COW\n"); exit(1); }
+    }
+    *cow = *orig;
+    cow->from_arena = use_arena;
+    HexaVal out = v;
+    HX_SET_VS(out, cow);
     switch (key[0]) {
         case 't':
             if (!strcmp(key, "tag")) {
-                HX_VSF(v, tag_i) = HX_IS_INT(val) ? HX_INT(val) : HX_VSF(v, tag_i);
-                return v;
+                cow->tag_i = HX_IS_INT(val) ? HX_INT(val) : cow->tag_i;
+                return out;
             }
             break;
         case 'i':
             if (!strcmp(key, "int_val")) {
-                HX_VSF(v, int_val) = HX_IS_INT(val) ? HX_INT(val) : HX_VSF(v, int_val);
-                return v;
+                cow->int_val = HX_IS_INT(val) ? HX_INT(val) : cow->int_val;
+                return out;
             }
             break;
         case 'f':
             if (!strcmp(key, "float_val")) {
-                if (HX_IS_FLOAT(val)) HX_VSF(v, float_val) = HX_FLOAT(val);
-                else if (HX_IS_INT(val)) HX_VSF(v, float_val) = (double)HX_INT(val);
-                return v;
+                if (HX_IS_FLOAT(val)) cow->float_val = HX_FLOAT(val);
+                else if (HX_IS_INT(val)) cow->float_val = (double)HX_INT(val);
+                return out;
             }
-            if (!strcmp(key, "fn_name"))   { HX_VSF(v, fn_name)   = val; return v; }
-            if (!strcmp(key, "fn_params")) { HX_VSF(v, fn_params) = val; return v; }
-            if (!strcmp(key, "fn_body"))   { HX_VSF(v, fn_body)   = val; return v; }
+            if (!strcmp(key, "fn_name"))   { cow->fn_name   = val; return out; }
+            if (!strcmp(key, "fn_params")) { cow->fn_params = val; return out; }
+            if (!strcmp(key, "fn_body"))   { cow->fn_body   = val; return out; }
             break;
         case 'b':
             if (!strcmp(key, "bool_val")) {
-                HX_VSF(v, bool_val) = HX_IS_BOOL(val) ? HX_BOOL(val) :
-                                 (HX_IS_INT(val) ? (int)HX_INT(val) : HX_VSF(v, bool_val));
-                return v;
+                cow->bool_val = HX_IS_BOOL(val) ? HX_BOOL(val) :
+                                 (HX_IS_INT(val) ? (int)HX_INT(val) : cow->bool_val);
+                return out;
             }
             break;
         case 's':
-            if (!strcmp(key, "str_val"))       { HX_VSF(v, str_val)       = val; return v; }
-            if (!strcmp(key, "struct_name"))   { HX_VSF(v, struct_name)   = val; return v; }
-            if (!strcmp(key, "struct_fields")) { HX_VSF(v, struct_fields) = val; return v; }
+            if (!strcmp(key, "str_val"))       { cow->str_val       = val; return out; }
+            if (!strcmp(key, "struct_name"))   { cow->struct_name   = val; return out; }
+            if (!strcmp(key, "struct_fields")) { cow->struct_fields = val; return out; }
             break;
         case 'c':
-            if (!strcmp(key, "char_val"))  { HX_VSF(v, char_val)  = val; return v; }
+            if (!strcmp(key, "char_val"))  { cow->char_val  = val; return out; }
             break;
         case 'a':
-            if (!strcmp(key, "array_val")) { HX_VSF(v, array_val) = val; return v; }
+            if (!strcmp(key, "array_val")) { cow->array_val = val; return out; }
             break;
     }
     fprintf(stderr, "valstruct_set: unknown key '%s'\n", key);
-    return v;
+    return out;
 }
 
 // ── rt 32-D: scope-local arena allocator ─────────────────
@@ -1985,6 +2004,7 @@ typedef struct {
 
 static HexaValMark __hexa_val_marks[HEXA_VAL_MARK_STACK_CAP];
 int __hexa_val_mark_top = 0;            // count of pushed marks (extern-visible)
+int __hexa_val_force_heap = 0;          // when set, valstruct_new_v uses heap (codegen refs this)
 static int __hexa_val_arena_enabled = -1;  // -1 = lazy probe
 
 static int hexa_val_arena_on(void) {
@@ -2304,6 +2324,17 @@ static void hexa_val_arena_heapify_return(void) {
 void __hexa_fn_arena_enter(void) {
     if (!hexa_val_arena_on()) return;
     hexa_val_arena_scope_push();
+}
+
+// T33-fix-2: callable from generated code to force heap allocation
+// around cache initialization (e.g. __init_val_int_cache).
+HexaVal hexa_force_heap_begin(void) {
+    __hexa_val_force_heap = 1;
+    return hexa_void();
+}
+HexaVal hexa_force_heap_end(void) {
+    __hexa_val_force_heap = 0;
+    return hexa_void();
 }
 
 HexaVal __hexa_fn_arena_return(HexaVal ret) {
