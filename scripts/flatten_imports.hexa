@@ -371,38 +371,102 @@ fn fl_word_replace(src, oldname, newname) {
 
 // ── 재귀 walk: 토포 정렬 (leaves first) ─────────────────────
 
-let mut g_order = []      // emitted abs paths, leaves first
-// ROI-48: g_visited / g_onstack are 64-bucket hash sets instead of linear arrays
-let mut g_visited = fl_hset_new()
-let mut g_onstack = fl_hset_new()
+// ── iterative DFS walk: topological sort (leaves first) ────
+//
+// WHY ITERATIVE: The interpreter's array_store slot-reclamation (rt 32 freelist)
+// causes cross-variable aliasing corruption when multiple global mutable arrays
+// (g_order, g_visited, g_onstack) are reassigned inside recursive fn calls.
+// Each `g_X = g_X.push(...)` decrefs the old array, freeing its slot; the next
+// `val_array()` call reuses that slot for a DIFFERENT variable's backing data.
+// After the recursive call returns, the parent's cached Val for g_order still
+// points to the now-reused slot, reading garbage (a string or wrong-length
+// array). This is the same class of bug as T33 / feedback_hot_attr_dict_mutation.
+//
+// The fix: use a SINGLE mutable array (`stack`) as the only global that gets
+// mutated inside the loop. `visited_str` is a "|"-delimited string used as a
+// set — string concat has no array_store interaction, so no aliasing risk.
+// `g_order` is only pushed to once per file after all other mutations are done,
+// and is never read inside the same iteration that pushes to it.
+
+// g_order_str: pipe-delimited string of file paths in topo order (leaves first).
+// Using a STRING instead of an array avoids array_store slot aliasing corruption
+// entirely — string concat has zero interaction with array_store/freelist.
+// Split into an array only once after the walk is complete.
+let mut g_order_str = ""
+let mut g_order_count = 0
 let mut g_base_dir = "."
 
-fn fl_walk(file_abs) {
-    if fl_hset_has(g_visited, file_abs) { return 0 }
-    if fl_hset_has(g_onstack, file_abs) {
-        println("[flatten_imports] FATAL cycle at: " + file_abs)
-        exit(1)
-    }
-    g_onstack = fl_hset_add(g_onstack, file_abs)
+fn fl_str_set_has(set_str, key) {
+    // Check if "|key|" appears in set_str. set_str format: "|a|b|c|"
+    let needle = "|" + key + "|"
+    return set_str.index_of(needle) >= 0
+}
 
-    let src = read_file(file_abs)
-    let deps = fl_collect_uses(src)
-    let dn = len(deps)
-    let mut i = 0
-    while i < dn {
-        let dep_path = g_base_dir + "/" + deps[i] + ".hexa"
-        if file_exists(dep_path) {
-            fl_walk(dep_path)
+fn fl_iterative_walk(start_file) {
+    // Iterative DFS using an explicit stack (single mutable array).
+    // All other state is string-based to avoid array_store aliasing.
+    //
+    // Two-phase approach per file:
+    //   Phase 1 (DISCOVER): push deps that haven't been visited yet
+    //   Phase 2 (EMIT): all deps visited, emit this file
+    //
+    // We use a "frame" approach: push a MARKER then the file. When we pop
+    // a MARKER, the next pop is the file to emit.
+
+    let MARKER = "<<EMIT>>"
+    let mut stack = []
+    let mut visited_str = "|"
+
+    stack = stack.push(start_file)
+
+    while len(stack) > 0 {
+        let top_idx = len(stack) - 1
+        let top = stack[top_idx]
+        stack = stack.truncate(top_idx)
+
+        if top == MARKER {
+            // Next item on stack is the file to emit
+            let em_idx = len(stack) - 1
+            let emit_file = stack[em_idx]
+            stack = stack.truncate(em_idx)
+            if !fl_str_set_has(visited_str, emit_file) {
+                visited_str = visited_str + emit_file + "|"
+                // Append to string-based order (no array_store interaction)
+                if g_order_count == 0 {
+                    g_order_str = emit_file
+                } else {
+                    g_order_str = g_order_str + "|" + emit_file
+                }
+                g_order_count = g_order_count + 1
+            }
         } else {
-            println("[flatten_imports] WARN dep not found: " + deps[i] + " (" + dep_path + ")")
-        }
-        i = i + 1
-    }
+            // DISCOVER phase
+            if fl_str_set_has(visited_str, top) {
+                // already emitted, skip
+            } else {
+                // Push emit frame: MARKER then file (file goes first, popped second)
+                stack = stack.push(top)
+                stack = stack.push(MARKER)
 
-    g_visited = fl_hset_add(g_visited, file_abs)
-    g_order = g_order.push(file_abs)
-    g_onstack = fl_hset_remove(g_onstack, file_abs)
-    return 0
+                // Read file, collect deps, push unvisited deps (reverse order for DFS)
+                let src = read_file(top)
+                let deps = fl_collect_uses(src)
+                let dn = len(deps)
+                let mut di = dn - 1
+                while di >= 0 {
+                    let dep_path = g_base_dir + "/" + deps[di] + ".hexa"
+                    if file_exists(dep_path) {
+                        if !fl_str_set_has(visited_str, dep_path) {
+                            stack = stack.push(dep_path)
+                        }
+                    } else {
+                        println("[flatten_imports] WARN dep not found: " + deps[di] + " (" + dep_path + ")")
+                    }
+                    di = di - 1
+                }
+            }
+        }
+    }
 }
 
 // ── 메인 ────────────────────────────────────────────────────
@@ -424,149 +488,107 @@ if !file_exists(target) {
 }
 
 g_base_dir = fl_dirname(target)
-fl_walk(target)
+fl_iterative_walk(target)
 
-// HEXA ARRAY ALIASING WORKAROUND: g_order is a host-array TAG_ARRAY that
-// the interpreter stores in array_store by index. Pushing to g_bodies /
-// g_decls inside a loop that reads g_order can clobber g_order's slot via
-// host-array reuse, dropping its len from 2 to 0 mid-iteration. snap_order
-// is a fresh local that survives the pushes — see also airgenome / VM
-// `@hot var aliasing JIT` known issue (memory: feedback_hot_attr_dict_mutation).
-let mut snap_order = []
-let mut snap_i = 0
-while snap_i < len(g_order) {
-    snap_order = snap_order.push(g_order[snap_i])
-    snap_i = snap_i + 1
-}
+// ── Split g_order_str into an array (one-time, after walk is complete) ──
+// g_order_str is "|"-delimited: "file1|file2|file3" — leaves first.
+let order_files = if g_order_count > 0 { g_order_str.split("|") } else { [] }
+let m = len(order_files)
 
-// ── 1차 패스: 전 파일의 non-pub top-level decl 수집 + 카운트 ──
+// ── COLLISION DETECTION (string-only, no parallel arrays) ──────
 //
-// 동일 이름이 2+ 파일에 있으면 "collided" — mangle 대상.
-// 한 파일에만 있거나 pub 이면 그대로 둔다 (기존 cross-file use 호환).
+// WHY STRING-ONLY: The interpreter's array_store freelist (rt 32) causes
+// cross-variable aliasing corruption when multiple mutable arrays are pushed
+// to in the same scope. Each `arr = arr.push(x)` decrefs the old backing
+// slot, freeing it to the freelist; the next `val_array()` reuses that slot
+// for a DIFFERENT variable. This is the T33 / feedback_hot_attr_dict_mutation
+// class of bug. To avoid it, we track collision state as pipe-delimited
+// strings instead of parallel arrays.
+//
+// Strategy: scan all files' non-pub decls, build a "|name|" string for seen
+// names and a separate "|name|" string for collided names (appeared 2+ times).
 
-let m = len(g_order)
-let mut g_bodies = []  // 각 파일 원본 body (사전 로드)
-let mut g_decls  = []  // 각 파일 non-pub decl 이름 리스트 (병렬 배열)
-let mut all_names   = []
-let mut all_counts  = []
-
-// HEXA ARRAY ALIASING WORKAROUND: reading g_order[i] inside a loop that
-// also pushes to g_bodies / g_decls clobbers g_order's array_store slot in
-// the host interpreter. snap_order is a private copy that survives the
-// pushes. Without this the loop crashes with "index 1 out of bounds (len 0)"
-// on iteration 1 because g_order's len gets reset to 0 by the prior push.
-let mut i = 0
-while i < m {
-    let f = snap_order[i]
-    let body = read_file(f)
-    g_bodies = g_bodies.push(body)
-    let decls = fl_scan_private_decls(body)
-    g_decls = g_decls.push(decls)
+let mut seen_decls_str = "|"       // "|name1|name2|" format
+let mut collided_str = "|"         // "|collided_name|" format
+let mut fi = 0
+while fi < m {
+    let f = order_files[fi]
+    let src = read_file(f)
+    let decls = fl_scan_private_decls(src)
     let dn = len(decls)
-    let mut j = 0
-    while j < dn {
-        let nm = decls[j]
-        let idx = fl_list_index_of(all_names, nm)
-        if idx < 0 {
-            all_names = all_names.push(nm)
-            all_counts = all_counts.push(1)
-        } else {
-            // 병렬 배열 in-place 증가가 안전한지 모르므로 재구성
-            let mut new_counts = []
-            let cn = len(all_counts)
-            let mut k = 0
-            while k < cn {
-                if k == idx {
-                    new_counts = new_counts.push(all_counts[k] + 1)
-                } else {
-                    new_counts = new_counts.push(all_counts[k])
-                }
-                k = k + 1
+    let mut di = 0
+    while di < dn {
+        let nm = decls[di]
+        let needle = "|" + nm + "|"
+        if seen_decls_str.index_of(needle) >= 0 {
+            // Seen before — mark as collided (if not already)
+            if collided_str.index_of(needle) < 0 {
+                collided_str = collided_str + nm + "|"
             }
-            all_counts = new_counts
+        } else {
+            seen_decls_str = seen_decls_str + nm + "|"
         }
-        j = j + 1
+        di = di + 1
     }
-    i = i + 1
+    fi = fi + 1
 }
 
-// collided 이름 집합 (count > 1)
-let mut collided = []
-let cn2 = len(all_names)
-let mut ci = 0
-while ci < cn2 {
-    if all_counts[ci] > 1 {
-        collided = collided.push(all_names[ci])
-    }
-    ci = ci + 1
+if len(collided_str) > 1 {
+    // Strip leading/trailing "|" for display
+    let display = collided_str.substring(1, len(collided_str) - 1)
+    println("[flatten_imports] collided non-pub decls mangled: " + display)
 }
 
-if len(collided) > 0 {
-    println("[flatten_imports] collided non-pub decls mangled: " + collided.join(", "))
-}
-
-// ── 2차 패스: 파일별 mangle + strip_uses + emit ─────────────
+// ── EMIT: reverse-topo order (root-first, leaves-last) ──────────
 //
-// EMIT ORDER FIX (stage0 rebuild regression unblock):
-//   g_order is leaves-first (DFS post-order). For the C backend that means
-//   `runtime_core.hexa` is concatenated BEFORE `hexa_full.hexa`. The current
-//   hexa_v2 binary does NOT emit forward declarations for struct
-//   constructors (`HexaVal Val(...)` etc.), so any leaf file that uses
-//   `Val { ... }` struct literals before the struct's definition triggers
-//   `error: call to undeclared function 'Val'` and `conflicting types`.
+// order_files is leaves-first (DFS post-order). We emit in reverse so the
+// entry file (which defines structs like Val) comes before leaf files that
+// reference those structs. This avoids C-level "undeclared function" errors
+// from hexa_v2 which doesn't emit struct constructor forward decls.
 //
-//   Function call cross-references are unaffected because hexa_v2 DOES
-//   emit `HexaVal name(...);` forward decls at the top of the C file, so
-//   reversing the order is safe for fn-call edges (hexa_full → runtime_core)
-//   while fixing the struct edge (runtime_core → hexa_full's `struct Val`).
-//
-//   We emit in REVERSE topological order: the entry file (target) first,
-//   leaves (deps) last. This keeps struct definitions visible to dependents
-//   without touching codegen_c2 / hexa_v2.
+// SINGLE-ARRAY PATTERN: only `flat_str` (a string) accumulates output.
+// Each file is processed in isolation: read → scan decls → mangle collided
+// → strip uses → append to flat_str. No parallel arrays.
 
-let mut buf = []
-buf = buf.push("// === FLATTENED by scripts/flatten_imports.hexa ===")
-buf = buf.push("// target: " + target)
-buf = buf.push("// files:  " + str(len(g_order)))
-buf = buf.push("// order:  reverse-topo (root-first, leaves-last) — see emit-order note above")
-if len(collided) > 0 {
-    buf = buf.push("// mangled: " + collided.join(", "))
+let mut flat_str = "// === FLATTENED by scripts/flatten_imports.hexa ===\n"
+flat_str = flat_str + "// target: " + target + "\n"
+flat_str = flat_str + "// files:  " + str(m) + "\n"
+flat_str = flat_str + "// order:  reverse-topo (root-first, leaves-last)\n"
+if len(collided_str) > 1 {
+    flat_str = flat_str + "// mangled: " + collided_str.substring(1, len(collided_str) - 1) + "\n"
 }
-buf = buf.push("")
+flat_str = flat_str + "\n"
 
-// Forward-index iteration with mapped lookup: idx = (m - 1 - i2) gives
-// reverse-topo order (root first) using only forward iteration. Use
-// snap_order instead of g_order for the same array-aliasing workaround
-// described in pass 1.
-let mut i2 = 0
-while i2 < m {
-    let idx = m - 1 - i2
-    let f = snap_order[idx]
-    let body = g_bodies[idx]
-    let decls = g_decls[idx]
-    let prefix = fl_mangle_prefix(f)
+let mut ei = 0
+while ei < m {
+    let idx = m - 1 - ei
+    let f = order_files[idx]
+    let body = read_file(f)
 
-    // 이 파일의 decl 중 collided 인 것만 골라 rename 적용
+    // Mangle collided private decls with file-prefix
     let mut body_mut = body
-    let dn = len(decls)
-    let mut j = 0
-    while j < dn {
-        let nm = decls[j]
-        if fl_contains(collided, nm) {
-            let new_name = prefix + "__" + nm
-            body_mut = fl_word_replace(body_mut, nm, new_name)
+    if len(collided_str) > 1 {
+        let decls = fl_scan_private_decls(body)
+        let prefix = fl_mangle_prefix(f)
+        let dn = len(decls)
+        let mut di = 0
+        while di < dn {
+            let nm = decls[di]
+            let needle = "|" + nm + "|"
+            if collided_str.index_of(needle) >= 0 {
+                let new_name = prefix + "__" + nm
+                body_mut = fl_word_replace(body_mut, nm, new_name)
+            }
+            di = di + 1
         }
-        j = j + 1
     }
 
     let stripped = fl_strip_uses(body_mut)
-    buf = buf.push("")
-    buf = buf.push("// ----- BEGIN " + fl_basename(f) + " -----")
-    buf = buf.push(stripped)
-    buf = buf.push("// ----- END " + fl_basename(f) + " -----")
-    i2 = i2 + 1
+    flat_str = flat_str + "\n// ----- BEGIN " + fl_basename(f) + " -----\n"
+    flat_str = flat_str + stripped
+    flat_str = flat_str + "\n// ----- END " + fl_basename(f) + " -----\n"
+    ei = ei + 1
 }
 
-let flat = buf.join("\n")
-write_file(output, flat)
-println("[flatten_imports] wrote " + output + " (" + str(len(g_order)) + " files)")
+write_file(output, flat_str)
+println("[flatten_imports] wrote " + output + " (" + str(m) + " files)")
