@@ -186,6 +186,12 @@ fn codegen_c2(ast) {
             // bt-53: mangle `TAG_INT`/`main`/… global names to avoid collision
             // with runtime.c's enum constants at link time.
             let _user_name = _hexa_mangle_ident(ast[i].name)
+            // STRUCTURAL-2 Phase B: register global immutable let with int init
+            if k == "LetStmt" && type_of(ast[i].left) != "string" {
+                if _is_int_init_expr(ast[i].left) {
+                    _known_int_add(ast[i].name)
+                }
+            }
             // ROI #43: @thread_local → _Thread_local C storage class
             let _tls_val = ast[i].value
             let _is_tls = false
@@ -935,6 +941,14 @@ fn gen2_stmt(node, depth) {
         if type_of(node.left) != "string" {
             init = gen2_expr(node.left)
         }
+        // STRUCTURAL-2 Phase B: register immutable let with int initializer
+        // as known-int for downstream BinOp .i unboxing. Only LetStmt
+        // (immutable) — LetMutStmt excluded because reassignment may change type.
+        if k == "LetStmt" && type_of(node.left) != "string" {
+            if _is_int_init_expr(node.left) {
+                _known_int_add(node.name)
+            }
+        }
         // M975: register promotion — if value == "__reg_promote__", emit `register`
         if k == "LetMutStmt" && node.value == "__reg_promote__" {
             return pad + "register HexaVal " + node.name + " = " + init + "; /* reg-promoted */\n"
@@ -1396,6 +1410,20 @@ fn gen2_expr(node) {
                 let _lv = node.left.value
                 let _rv = node.right.value
                 return "hexa_int((" + _lv + ") " + op + " (" + _rv + "))"
+            }
+        }
+        // STRUCTURAL-2 Phase B: known-int propagation — when BOTH operands
+        // are provably TAG_INT (IntLit or immutable let bound to int), emit
+        // `hexa_int((L).i OP (R).i)` to bypass hexa_add/sub/mul/div/mod
+        // runtime dispatch. Safe because _known_int_set only tracks immutable
+        // `let` with int-only initializers (no mut, no fn params).
+        let _li = _is_known_int(node.left)
+        let _ri = _is_known_int(node.right)
+        if _li && _ri {
+            if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+                let l = gen2_expr(node.left)
+                let r = gen2_expr(node.right)
+                return "hexa_int((" + l + ").i " + op + " (" + r + ").i)"
             }
         }
         let l = gen2_expr(node.left)
@@ -2987,6 +3015,13 @@ let mut _known_nonlocal_names = []
 let mut _known_fn_globals_set = []   // 64 buckets; each bucket is [name, ...]
 let mut _known_nonlocal_set = []     // 64 buckets; each bucket is [name, ...]
 
+// ── STRUCTURAL-2 Phase B: known-int type propagation ────────
+// Immutable `let` variables whose initializer is IntLit or int-only BinOp
+// are tracked here. gen2_expr BinOp uses this to bypass hexa_add/sub/mul/
+// div/mod boxing and emit direct `.i` arithmetic.
+// Excludes: mut variables (re-assignable), fn params (caller may pass float).
+let mut _known_int_set = []          // 64 buckets; each bucket is [name, ...]
+
 fn _known_hash(key) {
     let mut h = 0
     let mut ci = 0
@@ -3011,6 +3046,8 @@ fn _known_set_init() {
     }
     _known_fn_globals_set = fg
     _known_nonlocal_set = nl
+    // STRUCTURAL-2 Phase B: reset known-int set alongside other sets
+    _known_int_set_init()
 }
 
 fn _known_fn_globals_add(name) {
@@ -3049,6 +3086,66 @@ fn _is_known_nonlocal(name) {
 
 // Back-compat alias used below in free-var analysis.
 fn _is_known_global(name) { return _is_known_nonlocal(name) }
+
+// ── STRUCTURAL-2 Phase B: known-int set helpers ─────────────
+fn _known_int_set_init() {
+    let mut ki = []
+    let mut i = 0
+    while i < 64 {
+        ki = ki.push([])
+        i = i + 1
+    }
+    _known_int_set = ki
+}
+
+fn _known_int_add(name) {
+    let b = _known_hash(name)
+    _known_int_set[b] = _known_int_set[b].push(name)
+}
+
+fn _is_known_int_name(name) {
+    if len(_known_int_set) != 64 { return false }
+    let b = _known_hash(name)
+    let bucket = _known_int_set[b]
+    let mut i = 0
+    while i < len(bucket) {
+        if bucket[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Check if an AST node is provably TAG_INT at codegen time:
+//   - IntLit → always int
+//   - Ident in _known_int_set → immutable let with int initializer
+fn _is_known_int(node) {
+    if type_of(node) == "string" { return false }
+    if node.kind == "IntLit" { return true }
+    if node.kind == "Ident" { return _is_known_int_name(node.name) }
+    return false
+}
+
+// Check if an initializer expression is int-only (for LetStmt registration).
+// Covers: IntLit, int BinOp (recursive), Ident that is already known-int,
+// UnaryOp - on int.
+fn _is_int_init_expr(node) {
+    if type_of(node) == "string" { return false }
+    let k = node.kind
+    if k == "IntLit" { return true }
+    if k == "Ident" { return _is_known_int_name(node.name) }
+    if k == "BinOp" {
+        let op = node.op
+        if op == "+" || op == "-" || op == "*" || op == "/" || op == "%" {
+            return _is_int_init_expr(node.left) && _is_int_init_expr(node.right)
+        }
+        return false
+    }
+    if k == "UnaryOp" {
+        if node.op == "-" { return _is_int_init_expr(node.left) }
+        return false
+    }
+    return false
+}
 
 // Builtin names that are never captured (resolved at codegen in gen2_expr Call).
 fn _is_builtin_name(name) {
@@ -3393,6 +3490,12 @@ fn codegen_c2_full(ast) {
         } else if k == "LetMutStmt" || k == "LetStmt" {
             // bt-53: mangle reserved runtime names (TAG_INT etc.)
             let _user_name2 = _hexa_mangle_ident(ast[i].name)
+            // STRUCTURAL-2 Phase B: register global immutable let with int init
+            if k == "LetStmt" && type_of(ast[i].left) != "string" {
+                if _is_int_init_expr(ast[i].left) {
+                    _known_int_add(ast[i].name)
+                }
+            }
             // ROI #43: @thread_local → _Thread_local C storage class
             let _tls_val2 = ast[i].value
             let _is_tls2 = false
