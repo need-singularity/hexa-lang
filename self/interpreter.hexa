@@ -653,6 +653,11 @@ pub let mut extern_fns = []
 // Avoids O(n) linear scan on every FFI call; O(1) avg via env_hash.
 pub let mut extern_fn_cache = []
 
+// ── ROI-4: one-shot FFI real-pointer mode flag ──────────
+// Cached result of HXLAYER_FFI_LIVE env-var check. Set once at interpret()
+// init; eliminates per-call env_var overhead in alloc_raw / free_raw.
+pub let mut ffi_real_pointer_mode = false
+
 fn extern_fn_cache_init() {
     let mut buckets = []
     let mut i = 0
@@ -6032,17 +6037,18 @@ fn call_builtin(name, args) {
     // ── Phase 16 골화 — FFI memory + JSON + utility ──
     // alloc_raw(size) — return Pointer to managed buffer.
     //
-    // C2 Step 3 (2026-04-16): when HXLAYER_FFI_LIVE=1 the interpreter
-    // routes alloc_raw/free_raw/write_f32/deref_f32 to the real-pointer
-    // builtins (ptr_alloc / ptr_write_f32 / ptr_read_f32 / ptr_free) so
-    // that addresses can be passed to @link extern fns. Default path
-    // keeps the legacy atomic_store registry for pure-hexa callers that
-    // don't need C ABI addresses.
+    // C2 Step 3 (2026-04-16): when ffi_real_pointer_mode is true the
+    // interpreter routes alloc_raw/free_raw/write_f32/deref_f32 to the
+    // real-pointer builtins (ptr_alloc / ptr_write_f32 / ptr_read_f32 /
+    // ptr_free) so that addresses can be passed to @link extern fns.
+    // ROI-4: mode is set once at interpret() init via env_var cache +
+    // dlopen auto-detect. Default path keeps the legacy atomic_store
+    // registry for pure-hexa callers that don't need C ABI addresses.
     if name == "alloc_raw" {
         if len(args) == 0 { return val_int(0) }
         let size = args[0].int_val
         if size <= 0 { return val_int(0) }
-        if env_var("HXLAYER_FFI_LIVE") == "1" {
+        if ffi_real_pointer_mode {
             // Real malloc path — return TAG_INT so codegen/marshal read
             // the address via .i (not .f). Matches native-path semantics
             // where alloc_raw → hexa_ptr_alloc → hexa_int(addr).
@@ -6058,7 +6064,7 @@ fn call_builtin(name, args) {
         return val_pointer(id + 1000000)  // managed-registry tag stays TAG_POINTER
     }
     if name == "free_raw" {
-        if env_var("HXLAYER_FFI_LIVE") == "1" {
+        if ffi_real_pointer_mode {
             if len(args) >= 1 {
                 let p = args[0]
                 // Real-malloc branch: raw TAG_INT address with no registry tag.
@@ -9016,13 +9022,13 @@ fn call_builtin(name, args) {
         let call_args = get_array(val_arr_v)
         let nargs = len(call_args)
         // Pre-flight: reject TAG_POINTER args. alloc_raw without
-        // HXLAYER_FFI_LIVE=1 returns a registry index (TAG_POINTER),
+        // ffi_real_pointer_mode returns a registry index (TAG_POINTER),
         // whose int_val is not a real C address — passing it to a
         // native extern segfaults on first deref. Clear error instead.
         let mut pp = 0
         while pp < nargs {
             if call_args[pp].tag == TAG_POINTER {
-                return Val { tag: TAG_ERROR, int_val: 0, float_val: 0.0, bool_val: false, str_val: "extern '" + c_sym + "' arg " + to_string(pp) + " is TAG_POINTER (registry index). Set HXLAYER_FFI_LIVE=1 so alloc_raw returns real pointers.", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+                return Val { tag: TAG_ERROR, int_val: 0, float_val: 0.0, bool_val: false, str_val: "extern '" + c_sym + "' arg " + to_string(pp) + " is TAG_POINTER (registry index). Set HXLAYER_FFI_LIVE=1 or ensure libhxlayer is loadable so alloc_raw returns real pointers.", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
             }
             pp = pp + 1
         }
@@ -11031,9 +11037,33 @@ fn interpret(ast) {
                         fn_attrs_set(_pn.name, _pn.value)
                     }
                 }
+                // ─── ROI-3: ExternFnDecl hoist ───
+                // Pre-register extern fn declarations so FFI calls
+                // before the decl site resolve correctly (like FnDecl).
+                if _pk == "ExternFnDecl" {
+                    let _ec = _pn.value
+                    if _ec == "" { _ec = _pn.name }
+                    let _el = _pn.op
+                    extern_fns = extern_fns.push([_pn.name, _ec, _pn.ret_type, _el])
+                    extern_fn_cache_add(_pn.name, len(extern_fns) - 1)
+                    env_define(_pn.name, val_str("__extern_" + _pn.name))
+                }
             }
         }
         _pr = _pr + 1
+    }
+
+    // ─── ROI-4: one-shot FFI real-pointer mode init ───
+    // Cache env_var("HXLAYER_FFI_LIVE") once so alloc_raw/free_raw skip
+    // per-call env_var overhead. Also auto-detect: if any libhx*.dylib
+    // is loadable, enable real-pointer mode automatically.
+    ffi_real_pointer_mode = false
+    if env_var("HXLAYER_FFI_LIVE") == "1" {
+        ffi_real_pointer_mode = true
+    } else {
+        // Auto-detect: probe for loadable hxlayer library
+        let _probe = host_ffi_open("hxlayer")
+        if _probe != 0 { ffi_real_pointer_mode = true }
     }
 
     let mut result = val_void()
