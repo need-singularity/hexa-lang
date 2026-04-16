@@ -1027,7 +1027,7 @@ HexaVal gen2_expr(HexaVal node) {
                 HexaVal arg = hexa_index_get(hexa_map_get(node, "args"), hexa_int(0));
                 if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(arg), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get(arg, "kind"), hexa_str("Ident")))))) {
                     HexaVal fn_name = hexa_map_get(arg, "name");
-                    return hexa_add(hexa_add(hexa_str("hexa_callback_create((HexaVal){.tag=TAG_FN, .fn={.fn_ptr=(void*)"), fn_name), hexa_str(", .arity=0}})"));
+                    return hexa_add(hexa_add(hexa_str("hexa_callback_create(hexa_fn_new((void*)"), fn_name), hexa_str(", 0))"));
                 }
                 return hexa_add(hexa_add(hexa_str("hexa_callback_create("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")"));
             }

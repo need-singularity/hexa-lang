@@ -7125,6 +7125,139 @@ HexaVal _hexa_name_is_reserved(HexaVal s) {
     if (hexa_truthy(hexa_eq(s, hexa_str("main")))) {
         return hexa_bool(1);
     }
+    // C2 Step 2 (2026-04-16): C stdlib math names that collide with user-
+    // defined wrappers. `fn fabs(x)` in .hexa source would emit
+    // `HexaVal fabs(HexaVal x)` at file scope, conflicting with math.h's
+    // `double fabs(double)` once runtime.c's `#include <math.h>` pulls in
+    // the libc prototype.
+    if (hexa_truthy(hexa_eq(s, hexa_str("fabs")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("fabsf")))) {
+        return hexa_bool(1);
+    }
+    // stdlib.h: div_t div(int, int)
+    if (hexa_truthy(hexa_eq(s, hexa_str("div")))) {
+        return hexa_bool(1);
+    }
+    // math.h Bessel functions: double y0(double), y1(double), j0(double), j1(double)
+    if (hexa_truthy(hexa_eq(s, hexa_str("y0")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("y1")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("j0")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("j1")))) {
+        return hexa_bool(1);
+    }
+    // math.h functions that conflict with user-defined hexa names
+    if (hexa_truthy(hexa_eq(s, hexa_str("log")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("log2")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("log10")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("exp")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("exp2")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("sqrt")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("pow")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("ceil")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("floor")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("round")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("abs")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("sin")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("cos")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("tan")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("atan")))) { return hexa_bool(1); }
+    if (hexa_truthy(hexa_eq(s, hexa_str("atan2")))) { return hexa_bool(1); }
+    // C type keywords that conflict with user-defined hexa names
+    if (hexa_truthy(hexa_eq(s, hexa_str("int")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("float")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("double")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("char")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("void")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("long")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("short")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("static")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("struct")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("enum")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("union")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("const")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("extern")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("return")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("if")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("else")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("while")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("for")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("break")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("continue")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("switch")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("case")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("default")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("sizeof")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("typedef")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("register")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("volatile")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("auto")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("goto")))) {
+        return hexa_bool(1);
+    }
     return hexa_bool(0);
     return hexa_void();
 }
@@ -7991,9 +8124,18 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("AssignStmt")))) {
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_137)), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get_ic(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_138), "kind", &__hexa_codegen_c2_ic_139), hexa_str("Index")))))) {
-            HexaVal container = gen2_expr(hexa_map_get_ic(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_140), "left", &__hexa_codegen_c2_ic_141));
             HexaVal idx = gen2_expr(hexa_map_get_ic(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_142), "right", &__hexa_codegen_c2_ic_143));
             val = gen2_expr(hexa_map_get_ic(node, "right", &__hexa_codegen_c2_ic_144));
+            // Nested index: arr[i][j] = val → arr = hexa_index_set(arr, i, hexa_index_set(hexa_index_get(arr, i), j, val))
+            HexaVal inner_left = hexa_map_get_ic(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_140), "left", &__hexa_codegen_c2_ic_141);
+            if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(inner_left), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get_ic(inner_left, "kind", &__hexa_codegen_c2_ic_139), hexa_str("Index")))))) {
+                HexaVal outer_container = gen2_expr(hexa_map_get_ic(inner_left, "left", &__hexa_codegen_c2_ic_141));
+                HexaVal outer_idx = gen2_expr(hexa_map_get_ic(inner_left, "right", &__hexa_codegen_c2_ic_143));
+                HexaVal inner_get = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_index_get("), outer_container), hexa_str(", ")), outer_idx), hexa_str(")"));
+                HexaVal inner_set = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_index_set("), inner_get), hexa_str(", ")), idx), hexa_str(", ")), val), hexa_str(")"));
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, outer_container), hexa_str(" = hexa_index_set(")), outer_container), hexa_str(", ")), outer_idx), hexa_str(", ")), inner_set), hexa_str(");\n"));
+            }
+            HexaVal container = gen2_expr(inner_left);
             return hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(pad, container), hexa_str(" = hexa_index_set(")), container), hexa_str(", ")), idx), hexa_str(", ")), val), hexa_str(");\n"));
         }
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_145)), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get_ic(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_146), "kind", &__hexa_codegen_c2_ic_147), hexa_str("Field")))))) {
@@ -8281,6 +8423,9 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
         return hexa_add(hexa_add(hexa_str("hexa_map_values("), obj_expr), hexa_str(")"));
     }
     if (hexa_truthy(hexa_eq(method, hexa_str("contains_key")))) {
+        return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_map_contains_key("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(".s))"));
+    }
+    if (hexa_truthy(hexa_eq(method, hexa_str("has_key")))) {
         return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_map_contains_key("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(".s))"));
     }
     if (hexa_truthy(hexa_eq(method, hexa_str("remove")))) {
@@ -8632,7 +8777,7 @@ HexaVal gen2_expr(HexaVal node) {
                 HexaVal arg = hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_276), hexa_int(0));
                 if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(arg), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get_ic(arg, "kind", &__hexa_codegen_c2_ic_277), hexa_str("Ident")))))) {
                     HexaVal fn_name = hexa_map_get_ic(arg, "name", &__hexa_codegen_c2_ic_278);
-                    return hexa_add(hexa_add(hexa_str("hexa_callback_create((HexaVal){.tag=TAG_FN, .fn={.fn_ptr=(void*)"), fn_name), hexa_str(", .arity=0}})"));
+                    return hexa_add(hexa_add(hexa_str("hexa_callback_create(hexa_fn_new((void*)"), fn_name), hexa_str(", 0))"));
                 }
                 return hexa_add(hexa_add(hexa_str("hexa_callback_create("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_279), hexa_int(0)))), hexa_str(")"));
             }
@@ -8973,6 +9118,9 @@ HexaVal gen2_expr(HexaVal node) {
                 return hexa_add(hexa_add(hexa_str("hexa_map_values("), obj), hexa_str(")"));
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("contains_key")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_map_contains_key("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_380), hexa_int(0)))), hexa_str(".s))"));
+            }
+            if (hexa_truthy(hexa_eq(method, hexa_str("has_key")))) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_bool(hexa_map_contains_key("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_380), hexa_int(0)))), hexa_str(".s))"));
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("remove")))) {
@@ -10554,6 +10702,95 @@ int _codegen_c2_init(int argc, char** argv) {
 }
 
 
+// resolve_imports: inline ImportStmt nodes by reading, tokenizing, parsing
+// the imported file and splicing its AST nodes in place of the import.
+// Search paths (in order): same dir as input, self/, self/ml/, .
+// Tracks already-imported paths to avoid duplicates.
+static HexaVal _imported_paths; // array of already-imported path strings
+
+HexaVal resolve_imports(HexaVal ast, HexaVal input_dir) {
+    HexaVal result = hexa_array_new();
+    int n = hexa_len(ast);
+    for (int i = 0; i < n; i++) {
+        HexaVal node = hexa_index_get(ast, hexa_int(i));
+        // AST nodes use inline-cache map_get; use the low-level API
+        HexaVal k = (node.tag == TAG_MAP) ? hexa_map_get(node, "kind") : hexa_str("");
+        if (hexa_truthy(hexa_eq(k, hexa_str("ImportStmt"))) || hexa_truthy(hexa_eq(k, hexa_str("UseStmt")))) {
+            HexaVal import_name = hexa_map_get(node, "name");
+            // Check if already imported
+            int already = 0;
+            for (int j = 0; j < hexa_len(_imported_paths); j++) {
+                if (hexa_truthy(hexa_eq(hexa_index_get(_imported_paths, hexa_int(j)), import_name))) {
+                    already = 1;
+                    break;
+                }
+            }
+            if (already) continue;
+            _imported_paths = hexa_array_push(_imported_paths, import_name);
+
+            // Try to resolve the file path
+            // Search order: self/<import>, self/ml/<import>, <input_dir>/<import>, ./<import>
+            const char *name_cstr = hexa_to_cstring(import_name);
+            char path_buf[4096];
+            HexaVal resolved = hexa_str("");
+            // Try self/<import>
+            snprintf(path_buf, sizeof(path_buf), "self/%s", name_cstr);
+            FILE *fp = fopen(path_buf, "r");
+            if (fp) { fclose(fp); resolved = hexa_str(path_buf); }
+            // Try self/ml/<import> if import doesn't start with "ml/"
+            if (!(resolved.tag == TAG_STR && resolved.s && resolved.s[0] != '\0')) {
+                snprintf(path_buf, sizeof(path_buf), "self/ml/%s", name_cstr);
+                fp = fopen(path_buf, "r");
+                if (fp) { fclose(fp); resolved = hexa_str(path_buf); }
+            }
+            // Try <input_dir>/<import>
+            if (!(resolved.tag == TAG_STR && resolved.s && resolved.s[0] != '\0')) {
+                const char *dir_cstr = hexa_to_cstring(input_dir);
+                snprintf(path_buf, sizeof(path_buf), "%s/%s", dir_cstr, name_cstr);
+                fp = fopen(path_buf, "r");
+                if (fp) { fclose(fp); resolved = hexa_str(path_buf); }
+            }
+            // Try ./<import>
+            if (!(resolved.tag == TAG_STR && resolved.s && resolved.s[0] != '\0')) {
+                fp = fopen(name_cstr, "r");
+                if (fp) { fclose(fp); resolved = hexa_str(name_cstr); }
+            }
+
+            if (resolved.tag == TAG_STR && resolved.s && resolved.s[0] != '\0') {
+                HexaVal mod_src = hexa_read_file(resolved);
+                HexaVal mod_tokens = tokenize(mod_src);
+                HexaVal mod_ast = parse(mod_tokens);
+                // Recursively resolve imports in the module
+                mod_ast = resolve_imports(mod_ast, input_dir);
+                // Splice all nodes from module into result
+                for (int mi = 0; mi < hexa_len(mod_ast); mi++) {
+                    result = hexa_array_push(result, hexa_index_get(mod_ast, hexa_int(mi)));
+                }
+            } else {
+                fprintf(stderr, "[codegen_c2] WARNING: import/use not fully resolved: %s\n", name_cstr);
+                // Keep original import node as comment
+                result = hexa_array_push(result, node);
+            }
+        } else {
+            result = hexa_array_push(result, node);
+        }
+    }
+    return result;
+}
+
+// Extract directory from file path
+HexaVal path_dirname(HexaVal path) {
+    const char *s = hexa_to_cstring(path);
+    const char *last_slash = strrchr(s, '/');
+    if (!last_slash) return hexa_str(".");
+    char buf[4096];
+    int len = (int)(last_slash - s);
+    if (len >= (int)sizeof(buf)) len = sizeof(buf) - 1;
+    memcpy(buf, s, len);
+    buf[len] = '\0';
+    return hexa_str(buf);
+}
+
 int main(int argc, char** argv) {
     if (argc < 3) {
         printf("hexa-cc: HEXA self-hosted compiler\nUsage: hexa-cc <input.hexa> <output.c>\n");
@@ -10563,6 +10800,10 @@ int main(int argc, char** argv) {
     HexaVal src = hexa_read_file(hexa_str(argv[1]));
     HexaVal tokens = tokenize(src);
     HexaVal ast = parse(tokens);
+    // Resolve import statements by inlining module contents
+    _imported_paths = hexa_array_new();
+    HexaVal input_dir = path_dirname(hexa_str(argv[1]));
+    ast = resolve_imports(ast, input_dir);
     HexaVal c_code = codegen_c2_full(ast);
     hexa_write_file(hexa_str(argv[2]), c_code);
     printf("OK: %s\n", argv[2]);

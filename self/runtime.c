@@ -266,6 +266,31 @@ typedef struct {
     int from_arena;
 } HexaMapTable;
 
+// ── S1-D3a: Heap descriptor structs for compound types ───
+// NaN-boxing prep: inline union members → heap-allocated descriptors.
+// sizeof(HexaVal) unchanged (largest union member is still a pointer).
+typedef struct HexaArr {
+    struct HexaVal* items;
+    int len;
+    int cap;
+} HexaArr;
+
+typedef struct HexaMap {
+    HexaMapTable* tbl;
+    int len;
+} HexaMap;
+
+typedef struct HexaFn {
+    void* fn_ptr;
+    int arity;
+} HexaFn;
+
+typedef struct HexaClo {
+    void* fn_ptr;
+    int arity;
+    struct HexaVal* env_box;
+} HexaClo;
+
 // HexaVal must be defined before HexaValStruct so that HexaValStruct's
 // HexaVal-by-value fields (rt 32-G redesign) have a complete type. HexaVal
 // only needs HexaValStruct as a *pointer* (.vs), so the forward decl above
@@ -276,27 +301,11 @@ typedef struct HexaVal {
         int64_t i;
         double f;
         int b;
-        char* s;         // owned string (malloc'd)
-        struct {
-            struct HexaVal* items;
-            int len;
-            int cap;
-        } arr;
-        struct {
-            HexaMapTable* tbl;   // heap-allocated hash table
-            int len;             // cached count (== tbl->len when tbl != NULL)
-        } map;
-        struct {
-            void* fn_ptr;
-            int arity;
-        } fn;
-        // C3 closure: function pointer that takes (HexaVal env, ...args)
-        // env is a boxed TAG_ARRAY HexaVal (heap-allocated so it survives copies).
-        struct {
-            void* fn_ptr;           // signature: HexaVal (*)(HexaVal env, ...N args)
-            int arity;              // number of user params (excluding env)
-            struct HexaVal* env_box;// heap box holding a single TAG_ARRAY HexaVal
-        } clo;
+        char* s;           // owned string (malloc'd)
+        HexaArr* arr_ptr;  // S1-D3a: heap descriptor (was inline struct)
+        HexaMap* map_ptr;  // S1-D3a: heap descriptor (was inline struct)
+        HexaFn*  fn_ptr_d; // S1-D3a: heap descriptor (was inline struct)
+        HexaClo* clo_ptr;  // S1-D3a: heap descriptor (was inline struct)
         // rt 32-G: heap-allocated flat struct pointer (TAG_VALSTRUCT).
         HexaValStruct* vs;
     };
@@ -314,29 +323,33 @@ typedef struct HexaVal {
 #define HX_FLOAT(v)     ((v).f)
 #define HX_BOOL(v)      ((v).b)
 #define HX_STR(v)       ((v).s)
-#define HX_ARR(v)       ((v).arr)
-#define HX_ARR_LEN(v)   ((v).arr.len)
-#define HX_ARR_ITEMS(v) ((v).arr.items)
-#define HX_MAP(v)       ((v).map)
-#define HX_MAP_LEN(v)   ((v).map.len)
-#define HX_FN_PTR(v)    ((v).fn.fn_ptr)
-#define HX_FN_ARITY(v)  ((v).fn.arity)
-#define HX_CLO_PTR(v)   ((v).clo.fn_ptr)
-#define HX_CLO_ARITY(v) ((v).clo.arity)
-#define HX_CLO_ENV(v)   ((v).clo.env_box)
-#define HX_MAP_TBL(v)   ((v).map.tbl)
-#define HX_ARR_CAP(v)   ((v).arr.cap)
+// S1-D3a: compound-type READ macros — dereference heap descriptors.
+// IMPORTANT: caller MUST ensure the tag matches before calling these;
+// they dereference the descriptor pointer unconditionally for performance.
+// The one exception is HX_MAP_TBL which is guarded because the IC
+// fast-path (hexa_map_get_ic) probes it before a tag check, and
+// hexa_map_get probes it on TAG_VALSTRUCT-routed values.
+#define HX_ARR_LEN(v)   ((v).arr_ptr->len)
+#define HX_ARR_ITEMS(v) ((v).arr_ptr->items)
+#define HX_ARR_CAP(v)   ((v).arr_ptr->cap)
+#define HX_MAP_LEN(v)   ((v).map_ptr->len)
+#define HX_MAP_TBL(v)   (HX_IS_MAP(v) ? (v).map_ptr->tbl : (HexaMapTable*)0)
+#define HX_FN_PTR(v)    ((v).fn_ptr_d->fn_ptr)
+#define HX_FN_ARITY(v)  ((v).fn_ptr_d->arity)
+#define HX_CLO_PTR(v)   ((v).clo_ptr->fn_ptr)
+#define HX_CLO_ARITY(v) ((v).clo_ptr->arity)
+#define HX_CLO_ENV(v)   ((v).clo_ptr->env_box)
 #define HX_VS(v)        ((v).vs)
 
-// ── S1-D: compound-type SET macros (write accessors) ────
-#define HX_SET_ARR_ITEMS(v, p) ((v).arr.items = (p))
-#define HX_SET_ARR_LEN(v, n)   ((v).arr.len = (n))
-#define HX_SET_ARR_CAP(v, n)   ((v).arr.cap = (n))
-#define HX_SET_MAP_TBL(v, t)   ((v).map.tbl = (t))
-#define HX_SET_MAP_LEN(v, n)   ((v).map.len = (n))
-#define HX_SET_CLO_PTR(v, p)   ((v).clo.fn_ptr = (p))
-#define HX_SET_CLO_ARITY(v, n) ((v).clo.arity = (n))
-#define HX_SET_CLO_ENV(v, p)   ((v).clo.env_box = (p))
+// ── S1-D3a: compound-type SET macros (write accessors) — heap descriptor ──
+#define HX_SET_ARR_ITEMS(v, p) ((v).arr_ptr->items = (p))
+#define HX_SET_ARR_LEN(v, n)   ((v).arr_ptr->len = (n))
+#define HX_SET_ARR_CAP(v, n)   ((v).arr_ptr->cap = (n))
+#define HX_SET_MAP_TBL(v, t)   ((v).map_ptr->tbl = (t))
+#define HX_SET_MAP_LEN(v, n)   ((v).map_ptr->len = (n))
+#define HX_SET_CLO_PTR(v, p)   ((v).clo_ptr->fn_ptr = (p))
+#define HX_SET_CLO_ARITY(v, n) ((v).clo_ptr->arity = (n))
+#define HX_SET_CLO_ENV(v, p)   ((v).clo_ptr->env_box = (p))
 
 #define HX_IS_INT(v)    ((v).tag == TAG_INT)
 #define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
@@ -390,6 +403,7 @@ typedef struct HexaValStruct {
 // TAG_ARRAY HexaVal; we heap-box it so the closure remains valid after copies.
 static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr) {
     HexaVal v = {.tag=TAG_CLOSURE};
+    v.clo_ptr = (HexaClo*)calloc(1, sizeof(HexaClo));
     HX_SET_CLO_PTR(v, fn_ptr);
     HX_SET_CLO_ARITY(v, arity);
     HX_SET_CLO_ENV(v, (HexaVal*)malloc(sizeof(HexaVal)));
@@ -398,9 +412,12 @@ static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr)
 }
 
 // S1-D2: NaN-boxing-safe constructor for TAG_FN values.
-// Replaces C struct-literal `(HexaVal){.tag=TAG_FN, .fn={...}}` in codegen.
+// S1-D3a: allocates HexaFn heap descriptor (was inline .fn={...} struct literal).
 static inline HexaVal hexa_fn_new(void* fn_ptr, int arity) {
-    HexaVal v = {.tag=TAG_FN, .fn={.fn_ptr=fn_ptr, .arity=arity}};
+    HexaVal v = {.tag=TAG_FN};
+    v.fn_ptr_d = (HexaFn*)calloc(1, sizeof(HexaFn));
+    HX_FN_PTR(v) = fn_ptr;
+    HX_FN_ARITY(v) = arity;
     return v;
 }
 
@@ -744,7 +761,7 @@ static HexaVal* hexa_array_promote_to_heap(HexaVal* arena_items, int len, int ne
 HexaVal hexa_array_new() {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal v = {.tag=TAG_ARRAY};
-    HX_SET_ARR_ITEMS(v, NULL); HX_SET_ARR_LEN(v, 0); HX_SET_ARR_CAP(v, 0);
+    v.arr_ptr = (HexaArr*)calloc(1, sizeof(HexaArr));
     return v;
 }
 
@@ -918,7 +935,7 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item) {
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     if (_hx_stats_on()) _hx_stats_array_new++;
     HexaVal out = {.tag=TAG_ARRAY};
-    HX_SET_ARR_ITEMS(out, NULL); HX_SET_ARR_LEN(out, 0); HX_SET_ARR_CAP(out, 0);
+    out.arr_ptr = (HexaArr*)calloc(1, sizeof(HexaArr));
     if (!HX_IS_ARRAY(arr)) return out;
     int n = HX_ARR_LEN(arr);
     int a = (int)HX_INT(start), b = (int)HX_INT(end);
@@ -1105,8 +1122,7 @@ static int hmap_find(HexaMapTable* t, const char* key, uint32_t h) {
 HexaVal hexa_map_new() {
     if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
-    HX_SET_MAP_TBL(v, NULL);
-    HX_SET_MAP_LEN(v, 0);
+    v.map_ptr = (HexaMap*)calloc(1, sizeof(HexaMap));
     return v;
 }
 
@@ -1119,6 +1135,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
                              const char* const* keys, const HexaVal* vals) {
     if (_hx_stats_on()) _hx_stats_map_new++;
     HexaVal v = {.tag=TAG_MAP};
+    v.map_ptr = (HexaMap*)calloc(1, sizeof(HexaMap));
     // Pre-size: (n+1) entries including __type__, target load < HMAP_LOAD_MAX/100.
     // Solve for smallest power-of-2 cap where (n+1)*100/cap < HMAP_LOAD_MAX.
     int need = (n + 1) * 100 / HMAP_LOAD_MAX + 1;
