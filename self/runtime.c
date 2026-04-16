@@ -302,6 +302,38 @@ typedef struct HexaVal {
     };
 } HexaVal;
 
+// ═══════════════════════════════════════════════════════════
+//  STRUCTURAL-1 Phase A: NaN-boxing accessor macros
+//  Current: identity-map to tagged union fields (zero-cost).
+//  Phase B: macro bodies swap to NaN-boxed 8B representation.
+//  All hot-path code MUST use these instead of raw .tag/.i/.f etc.
+// ═══════════════════════════════════════════════════════════
+
+#define HX_TAG(v)       ((v).tag)
+#define HX_INT(v)       ((v).i)
+#define HX_FLOAT(v)     ((v).f)
+#define HX_BOOL(v)      ((v).b)
+#define HX_STR(v)       ((v).s)
+#define HX_ARR(v)       ((v).arr)
+#define HX_ARR_LEN(v)   ((v).arr.len)
+#define HX_ARR_ITEMS(v) ((v).arr.items)
+#define HX_MAP(v)       ((v).map)
+#define HX_MAP_LEN(v)   ((v).map.len)
+#define HX_FN_PTR(v)    ((v).fn.fn_ptr)
+#define HX_FN_ARITY(v)  ((v).fn.arity)
+#define HX_VS(v)        ((v).vs)
+
+#define HX_IS_INT(v)    ((v).tag == TAG_INT)
+#define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
+#define HX_IS_BOOL(v)   ((v).tag == TAG_BOOL)
+#define HX_IS_STR(v)    ((v).tag == TAG_STR)
+#define HX_IS_VOID(v)   ((v).tag == TAG_VOID)
+#define HX_IS_ARRAY(v)  ((v).tag == TAG_ARRAY)
+#define HX_IS_MAP(v)    ((v).tag == TAG_MAP)
+#define HX_IS_FN(v)     ((v).tag == TAG_FN)
+#define HX_IS_CLOSURE(v)((v).tag == TAG_CLOSURE)
+#define HX_IS_VALSTRUCT(v) ((v).tag == TAG_VALSTRUCT)
+
 // rt 32-G Phase 0 (redesigned): flat C struct replacement for `Val` map.
 // Fields MUST mirror self/hexa_full.hexa `struct Val` exactly (order + types).
 // Heap-allocated once per Val construction, shared by value via pointer copy
@@ -2293,10 +2325,10 @@ HexaVal hexa_exec_replace(HexaVal cmd) {
 
 // ── Stderr ──────────────────────────────────────────
 void hexa_eprint_val(HexaVal v) {
-    if (v.tag == TAG_STR) fprintf(stderr, "%s", v.s);
-    else if (v.tag == TAG_INT) fprintf(stderr, "%lld", (long long)v.i);
-    else if (v.tag == TAG_FLOAT) fprintf(stderr, "%g", v.f);
-    else if (v.tag == TAG_BOOL) fprintf(stderr, v.b ? "true" : "false");
+    if (HX_IS_STR(v)) fprintf(stderr, "%s", HX_STR(v));
+    else if (HX_IS_INT(v)) fprintf(stderr, "%lld", (long long)HX_INT(v));
+    else if (HX_IS_FLOAT(v)) fprintf(stderr, "%g", HX_FLOAT(v));
+    else if (HX_IS_BOOL(v)) fprintf(stderr, HX_BOOL(v) ? "true" : "false");
 }
 
 // ── Try/catch (setjmp based) ────────────────────────
@@ -2323,17 +2355,17 @@ void hexa_throw(HexaVal err) {
 // ── Printing ─────────────────────────────────────────────
 
 void hexa_print_val(HexaVal v) {
-    switch (v.tag) {
-        case TAG_INT: printf("%lld", (long long)v.i); break;
-        case TAG_FLOAT: printf("%g", v.f); break;
-        case TAG_BOOL: printf("%s", v.b ? "true" : "false"); break;
-        case TAG_STR: printf("%s", v.s); break;
+    switch (HX_TAG(v)) {
+        case TAG_INT: printf("%lld", (long long)HX_INT(v)); break;
+        case TAG_FLOAT: printf("%g", HX_FLOAT(v)); break;
+        case TAG_BOOL: printf("%s", HX_BOOL(v) ? "true" : "false"); break;
+        case TAG_STR: printf("%s", HX_STR(v)); break;
         case TAG_VOID: printf("void"); break;
         case TAG_ARRAY:
             printf("[");
-            for (int i = 0; i < v.arr.len; i++) {
+            for (int i = 0; i < HX_ARR_LEN(v); i++) {
                 if (i > 0) printf(", ");
-                hexa_print_val(v.arr.items[i]);
+                hexa_print_val(HX_ARR_ITEMS(v)[i]);
             }
             printf("]");
             break;
@@ -2348,26 +2380,26 @@ void hexa_println(HexaVal v) { hexa_print_val(v); printf("\n"); }
 HexaVal hexa_to_string(HexaVal v) {
     if (!_cached_strs_ready) _hexa_init_cached_strs();
     char buf[64];
-    switch (v.tag) {
+    switch (HX_TAG(v)) {
         case TAG_INT: {
             // ROI-33: small-int cache hit — skip snprintf+intern entirely
-            if (v.i >= SMALL_INT_CACHE_MIN && v.i <= SMALL_INT_CACHE_MAX) {
+            if (HX_INT(v) >= SMALL_INT_CACHE_MIN && HX_INT(v) <= SMALL_INT_CACHE_MAX) {
                 if (!_cached_small_ints_ready) _hexa_init_small_int_cache();
-                return _cached_small_ints[v.i - SMALL_INT_CACHE_MIN];
+                return _cached_small_ints[HX_INT(v) - SMALL_INT_CACHE_MIN];
             }
-            snprintf(buf, 64, "%lld", (long long)v.i);
+            snprintf(buf, 64, "%lld", (long long)HX_INT(v));
             return hexa_str(buf);
         }
-        case TAG_FLOAT: snprintf(buf, 64, "%g", v.f); return hexa_str(buf);
-        case TAG_BOOL: return v.b ? _cached_str_true : _cached_str_false;
+        case TAG_FLOAT: snprintf(buf, 64, "%g", HX_FLOAT(v)); return hexa_str(buf);
+        case TAG_BOOL: return HX_BOOL(v) ? _cached_str_true : _cached_str_false;
         case TAG_STR: return v;
         case TAG_VOID: return _cached_str_void;
         // rt 32-G: minimal fallback repr — interpreter has its own
         // val_to_string for the full form.
         case TAG_VALSTRUCT: {
-            if (!v.vs) return hexa_str("<Val null>");
+            if (!HX_VS(v)) return hexa_str("<Val null>");
             snprintf(buf, 64, "Val{tag=%lld,i=%lld}",
-                (long long)v.vs->tag_i, (long long)v.vs->int_val);
+                (long long)HX_VS(v)->tag_i, (long long)HX_VS(v)->int_val);
             return hexa_str(buf);
         }
         default: return _cached_str_value;
@@ -2377,13 +2409,13 @@ HexaVal hexa_to_string(HexaVal v) {
 // ── Truthy check ─────────────────────────────────────────
 
 int hexa_truthy(HexaVal v) {
-    switch (v.tag) {
-        case TAG_BOOL: return v.b;
-        case TAG_INT: return v.i != 0;
-        case TAG_STR: return v.s[0] != 0;
+    switch (HX_TAG(v)) {
+        case TAG_BOOL: return HX_BOOL(v);
+        case TAG_INT: return HX_INT(v) != 0;
+        case TAG_STR: return HX_STR(v)[0] != 0;
         case TAG_VOID: return 0;
         // rt 32-G: TAG_VALSTRUCT truthy iff .vs pointer non-null.
-        case TAG_VALSTRUCT: return v.vs != NULL;
+        case TAG_VALSTRUCT: return HX_VS(v) != NULL;
         default: return 1;
     }
 }
@@ -2392,7 +2424,7 @@ int hexa_truthy(HexaVal v) {
 
 HexaVal hexa_type_of(HexaVal v) {
     if (!_cached_strs_ready) _hexa_init_cached_strs();
-    switch (v.tag) {
+    switch (HX_TAG(v)) {
         case TAG_INT: return _cached_str_int;
         case TAG_FLOAT: return _cached_str_float;
         case TAG_BOOL: return _cached_str_bool;
@@ -2411,8 +2443,8 @@ HexaVal hexa_type_of(HexaVal v) {
 // ROI-37: rename impl to _slow so the macro below can inline the int+int
 // fast path without function-call ABI overhead.
 static HexaVal hexa_add_slow(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
-    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
+    if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(a) + HX_INT(b));
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b)) {
         // T39: unwrap via __hx_to_double so TAG_VALSTRUCT wrappers don't
         // cast the vs pointer to double (same root as T32 to_float bug).
         double fa = __hx_to_double(a);
@@ -2423,10 +2455,10 @@ static HexaVal hexa_add_slow(HexaVal a, HexaVal b) {
     // codegen emits bare hexa_add(l,r) — without this branch, two arrays
     // fall through to to_string+str_concat → TAG_STR, then later arr[i]
     // reads .arr.len from a TAG_STR union slot (stack residue → random OOB).
-    if (a.tag == TAG_ARRAY && b.tag == TAG_ARRAY) {
+    if (HX_IS_ARRAY(a) && HX_IS_ARRAY(b)) {
         HexaVal out = hexa_array_new();
-        for (int i = 0; i < a.arr.len; i++) out = hexa_array_push(out, a.arr.items[i]);
-        for (int i = 0; i < b.arr.len; i++) out = hexa_array_push(out, b.arr.items[i]);
+        for (int i = 0; i < HX_ARR_LEN(a); i++) out = hexa_array_push(out, HX_ARR_ITEMS(a)[i]);
+        for (int i = 0; i < HX_ARR_LEN(b); i++) out = hexa_array_push(out, HX_ARR_ITEMS(b)[i]);
         return out;
     }
     HexaVal sa = hexa_to_string(a);
@@ -2438,24 +2470,24 @@ static HexaVal hexa_add_slow(HexaVal a, HexaVal b) {
 // Evaluates each operand exactly once via temporaries.
 #define hexa_add(A, B) \
     ({ HexaVal __ha = (A), __hb = (B); \
-       (__ha.tag == TAG_INT && __hb.tag == TAG_INT) \
-           ? hexa_int(__ha.i + __hb.i) \
+       (HX_IS_INT(__ha) && HX_IS_INT(__hb)) \
+           ? hexa_int(HX_INT(__ha) + HX_INT(__hb)) \
            : hexa_add_slow(__ha, __hb); })
 
 // ── Polymorphic equality ─────────────────────────────────
 
 HexaVal hexa_eq(HexaVal a, HexaVal b) {
-    if (a.tag != b.tag) return hexa_bool(0);
-    switch (a.tag) {
-        case TAG_INT: return hexa_bool(a.i == b.i);
-        case TAG_FLOAT: return hexa_bool(a.f == b.f);
-        case TAG_BOOL: return hexa_bool(a.b == b.b);
-        case TAG_STR: return hexa_bool(a.s == b.s || strcmp(a.s, b.s) == 0);
+    if (HX_TAG(a) != HX_TAG(b)) return hexa_bool(0);
+    switch (HX_TAG(a)) {
+        case TAG_INT: return hexa_bool(HX_INT(a) == HX_INT(b));
+        case TAG_FLOAT: return hexa_bool(HX_FLOAT(a) == HX_FLOAT(b));
+        case TAG_BOOL: return hexa_bool(HX_BOOL(a) == HX_BOOL(b));
+        case TAG_STR: return hexa_bool(HX_STR(a) == HX_STR(b) || strcmp(HX_STR(a), HX_STR(b)) == 0);
         case TAG_VOID: return hexa_bool(1);
         // rt 32-G: Val identity is pointer-equality of heap struct (matches
         // TAG_MAP semantics — two separately constructed maps never compare
         // equal by value).
-        case TAG_VALSTRUCT: return hexa_bool(a.vs == b.vs);
+        case TAG_VALSTRUCT: return hexa_bool(HX_VS(a) == HX_VS(b));
         default: return hexa_bool(0);
     }
 }
@@ -2749,55 +2781,55 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
 // B-19: Polymorphic arithmetic — T39 routes through __hx_to_double.
 // ROI-47: explicit float+float fast path avoids 2x __hx_to_double tag dispatch.
 HexaVal hexa_sub(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i - b.i);
-    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(a.f - b.f);
+    if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(a) - HX_INT(b));
+    if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) return hexa_float(HX_FLOAT(a) - HX_FLOAT(b));
     return hexa_float(__hx_to_double(a) - __hx_to_double(b));
 }
 HexaVal hexa_mul(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i * b.i);
-    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(a.f * b.f);
+    if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(a) * HX_INT(b));
+    if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) return hexa_float(HX_FLOAT(a) * HX_FLOAT(b));
     return hexa_float(__hx_to_double(a) * __hx_to_double(b));
 }
 HexaVal hexa_div(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_INT && b.tag == TAG_INT) {
-        if (b.i == 0) return hexa_int(0);
-        return hexa_int(a.i / b.i);
+    if (HX_IS_INT(a) && HX_IS_INT(b)) {
+        if (HX_INT(b) == 0) return hexa_int(0);
+        return hexa_int(HX_INT(a) / HX_INT(b));
     }
-    if (a.tag == TAG_FLOAT && b.tag == TAG_FLOAT) return hexa_float(b.f == 0.0 ? 0.0 : a.f / b.f);
+    if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) return hexa_float(HX_FLOAT(b) == 0.0 ? 0.0 : HX_FLOAT(a) / HX_FLOAT(b));
     double fb = __hx_to_double(b);
     return hexa_float(__hx_to_double(a) / fb);
 }
 HexaVal hexa_mod(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(b.i ? a.i % b.i : 0);
+    if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(b) ? HX_INT(a) % HX_INT(b) : 0);
     return hexa_int(0);
 }
 
 // ROI-44: comparison runtime helpers — replace inline GCC stmt-expr in codegen.
 // Semantics: TAG_FLOAT promotes to double compare; TAG_INT uses int64 compare.
 HexaVal hexa_cmp_lt(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
         return hexa_bool(__hx_to_double(a) < __hx_to_double(b));
-    return hexa_bool(a.i < b.i);
+    return hexa_bool(HX_INT(a) < HX_INT(b));
 }
 HexaVal hexa_cmp_gt(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
         return hexa_bool(__hx_to_double(a) > __hx_to_double(b));
-    return hexa_bool(a.i > b.i);
+    return hexa_bool(HX_INT(a) > HX_INT(b));
 }
 HexaVal hexa_cmp_le(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
         return hexa_bool(__hx_to_double(a) <= __hx_to_double(b));
-    return hexa_bool(a.i <= b.i);
+    return hexa_bool(HX_INT(a) <= HX_INT(b));
 }
 HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
-    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
         return hexa_bool(__hx_to_double(a) >= __hx_to_double(b));
-    return hexa_bool(a.i >= b.i);
+    return hexa_bool(HX_INT(a) >= HX_INT(b));
 }
 
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
-    if (s.tag != TAG_STR) return s;
-    int count = n.i;
+    if (!HX_IS_STR(s)) return s;
+    int count = HX_INT(n);
     if (count <= 0) return hexa_str("");
     size_t slen = strlen(s.s);
     char* result = malloc(slen * (size_t)count + 1);
