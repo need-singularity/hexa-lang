@@ -1,0 +1,279 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/swa.hexa — AI-native ROI #109
+//
+//  @swa — Stochastic Weight Averaging.  Periodically snapshot model
+//  weights during training and maintain a running average.  Averaging
+//  multiple points in weight-space found late in the SGD trajectory
+//  yields flatter minima and better generalization (Izmailov et al.,
+//  2018).
+//
+//  The implementation is O(N) per snapshot (one sweep to update the
+//  running mean) and O(1) in snapshot count (constant memory — only
+//  the running average is kept, not all historical snapshots).
+//
+//  Public API
+//  ──────────
+//      swa_init(params)                              -> map #{avg, count}
+//          • Initialize with the first weight snapshot.
+//          • avg = copy of params, count = 1.
+//
+//      swa_update(state, params)                     -> map #{avg, count}
+//          • Fold a new snapshot into the running average.
+//          • avg[i] = (avg[i] * count + params[i]) / (count + 1)
+//          • count += 1
+//
+//      swa_get_weights(state)                        -> [float]
+//          • Return the current averaged weight vector.
+//
+//      swa_should_snapshot(step, start_step, period) -> bool
+//          • true iff step >= start_step AND
+//            (step - start_step) % period == 0
+//          • Typical usage: call after each optimizer step to decide
+//            whether to invoke swa_update.
+//
+//      swa_bn_update(avg_weights, data_batches)      -> [float]
+//          • Simulate BatchNorm statistics re-estimation over the
+//            averaged weights.  Computes a simple running mean of each
+//            feature across all batches (sufficient for the common
+//            "forward-pass BN update" post-SWA procedure).
+//
+//      detect_no_swa(prog)                           -> bool
+//          • AST predicate: returns true iff `prog` contains no
+//            "swa_update" node (i.e. the training loop does not use
+//            stochastic weight averaging).
+//
+//      rewrite_add_swa(prog, start_step, period)     -> Program
+//          • If detect_no_swa(prog) is true, inserts an "swa_snapshot"
+//            node after the first "optimizer_step" node.
+//            Otherwise returns `prog` unchanged.
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - P15: `let mut x = 0` for mutable. Plain `let` is immutable.
+//      - no struct-literal head inside `if` → maps returned at tail
+//      - no `and`/`or` → `&&` / `||`
+//      - `handle` is reserved keyword — never use as param name
+//      - Array concat in loops O(n^2) → use `.push(x)`
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot       — snapshot step called every N training iterations
+//      @swa       — marker: stochastic weight averaging
+//      @pure      — returns new state; does not mutate caller arrays
+//      @parallel  — the inner sweep is independent across i
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn swa109_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn swa109_copy_1d(a) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n {
+        out.push(a[i])
+    }
+    return out
+}
+
+@pure
+fn swa109_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  swa_init(params) — create initial SWA state from first snapshot.
+//  Returns map #{avg: [float], count: int}.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn swa_init_impl(params) {
+    let avg = swa109_copy_1d(params)
+    return #{
+        "avg": avg,
+        "count": 1
+    }
+}
+
+pub fn swa_init(params) {
+    return swa_init_impl(params)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  swa_update(state, params) — fold new snapshot into running average.
+//
+//  avg_new[i] = (avg[i] * count + params[i]) / (count + 1)
+//
+//  This is the online mean formula: numerically stable, O(N) per call,
+//  O(1) in the number of snapshots (no history kept).
+// ═══════════════════════════════════════════════════════════════════
+@hot @swa @parallel @pure
+fn swa_update_impl(state, params) {
+    let old_avg = state["avg"]
+    let old_count = state["count"]
+    let n = len(old_avg)
+    let new_count = old_count + 1
+    let mut new_avg = swa109_zeros_1d(n)
+    for i in 0..n {
+        new_avg[i] = (old_avg[i] * old_count + params[i]) / new_count
+    }
+    return #{
+        "avg": new_avg,
+        "count": new_count
+    }
+}
+
+pub fn swa_update(state, params) {
+    return swa_update_impl(state, params)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  swa_get_weights(state) — extract averaged weight vector.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn swa_get_weights_impl(state) {
+    return swa109_copy_1d(state["avg"])
+}
+
+pub fn swa_get_weights(state) {
+    return swa_get_weights_impl(state)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  swa_should_snapshot(step, start_step, period) — timing predicate.
+//
+//  Returns true iff:
+//    1. step >= start_step   (SWA has begun)
+//    2. (step - start_step) % period == 0   (on-cycle)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn swa_should_snapshot_impl(step, start_step, period) {
+    if step < start_step { return false }
+    if period <= 0 { return false }
+    let offset = step - start_step
+    return (offset % period) == 0
+}
+
+pub fn swa_should_snapshot(step, start_step, period) {
+    return swa_should_snapshot_impl(step, start_step, period)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  swa_bn_update(avg_weights, data_batches) — BN stats re-estimation.
+//
+//  After SWA produces averaged weights, BatchNorm running statistics
+//  must be recomputed by a forward pass over training data.  This
+//  function simulates that by computing a running mean of each
+//  feature dimension across all provided data batches.
+//
+//  avg_weights : [float]  — the SWA-averaged parameters (unused in
+//                           the real BN stat collection, but kept in
+//                           the API for completeness; a full impl
+//                           would run inference with these weights).
+//  data_batches: [[float]] — list of batches, each a [float] of the
+//                            same length as avg_weights.
+//
+//  Returns: [float] — per-feature running mean across batches.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn swa_bn_update_impl(avg_weights, data_batches) {
+    let dim = len(avg_weights)
+    if dim == 0 { return [] }
+    let nb = len(data_batches)
+    if nb == 0 { return swa109_zeros_1d(dim) }
+    let mut running_mean = swa109_zeros_1d(dim)
+    for b in 0..nb {
+        let batch = data_batches[b]
+        for i in 0..dim {
+            running_mean[i] = running_mean[i] + batch[i]
+        }
+    }
+    for i in 0..dim {
+        running_mean[i] = running_mean[i] / nb
+    }
+    return running_mean
+}
+
+pub fn swa_bn_update(avg_weights, data_batches) {
+    return swa_bn_update_impl(avg_weights, data_batches)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  Stmt.kind values used here:
+//      "optimizer_step"   — an existing optimizer step node
+//      "swa_update"       — an SWA snapshot-and-update node
+//      "swa_snapshot"     — the node the rewriter inserts
+//      "other"            — anything else
+//
+//  Stmt.start_step : int — SWA start step  (only for swa_snapshot)
+//  Stmt.period     : int — SWA period      (only for swa_snapshot)
+// ═══════════════════════════════════════════════════════════════════
+struct SwaStmt {
+    kind: string
+    start_step: int
+    period: int
+}
+
+pub fn swa_stmt(kind, start_step, period) {
+    return SwaStmt{kind: kind, start_step: start_step, period: period}
+}
+
+pub fn swa_stmt_optimizer_step() { return swa_stmt("optimizer_step", 0, 0) }
+pub fn swa_stmt_swa_update()     { return swa_stmt("swa_update", 0, 0) }
+pub fn swa_stmt_snapshot(start_step, period) {
+    return swa_stmt("swa_snapshot", start_step, period)
+}
+pub fn swa_stmt_other()          { return swa_stmt("other", 0, 0) }
+
+// ═══════════════════════════════════════════════════════════════════
+//  detect_no_swa(prog) — returns true iff no SWA node is present.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn detect_no_swa_impl(prog) {
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "swa_update" { return false }
+        if s.kind == "swa_snapshot" { return false }
+    }
+    return true
+}
+
+pub fn detect_no_swa(prog) {
+    return detect_no_swa_impl(prog)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rewrite_add_swa(prog, start_step, period) — insert SWA snapshot
+//  node after the first optimizer_step node.  If the program already
+//  contains SWA or has no optimizer_step, return unchanged.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rewrite_add_swa_impl(prog, start_step, period) {
+    if !detect_no_swa(prog) { return prog }
+    let mut out = []
+    let mut inserted = false
+    for i in 0..len(prog) {
+        let s = prog[i]
+        out.push(s)
+        if s.kind == "optimizer_step" && !inserted {
+            out.push(swa_stmt_snapshot(start_step, period))
+            inserted = true
+        }
+    }
+    if !inserted { return prog }
+    return out
+}
+
+pub fn rewrite_add_swa(prog, start_step, period) {
+    return rewrite_add_swa_impl(prog, start_step, period)
+}

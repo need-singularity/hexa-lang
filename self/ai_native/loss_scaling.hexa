@@ -1,0 +1,274 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/loss_scaling.hexa — AI-native ROI #104
+//
+//  @loss_scaling — dynamic loss scaling for fp16 / mixed-precision
+//  training. When gradients underflow (become zero in fp16), scale
+//  the loss upward; when they overflow (inf/nan), scale downward.
+//
+//  Without loss scaling, fp16 training frequently diverges because
+//  small gradients clip to zero. The naive fix (manually picking a
+//  fixed scale) is fragile; the AI-native approach auto-adjusts the
+//  scale every step based on gradient health.
+//
+//  Public API  (ls_ prefix)
+//  ────────────────────────
+//      ls_init_state(init_scale, growth_factor, backoff_factor,
+//                    growth_interval) -> map
+//          • init_scale      : float > 0   (e.g. 65536.0)
+//          • growth_factor   : float > 1   (e.g. 2.0)
+//          • backoff_factor  : float in (0,1) (e.g. 0.5)
+//          • growth_interval : int >= 1    (e.g. 2000)
+//          • returns #{scale, growth_factor, backoff_factor,
+//                      growth_interval, good_steps}
+//
+//      ls_scale_loss(loss, state) -> float
+//          • returns loss * state["scale"]
+//
+//      ls_check_grads(grads) -> map #{has_inf, has_nan, has_zero}
+//          • scans gradient array for inf / nan / all-zero
+//
+//      ls_update_scale(state, grad_check) -> map
+//          • if inf or nan: scale *= backoff_factor, good_steps=0,
+//            skip_step = true
+//          • else: good_steps += 1; if good_steps >= growth_interval
+//            then scale *= growth_factor, good_steps = 0
+//          • returns new state map (same keys + skip_step)
+//
+//      ls_step(state, loss, grads) -> map #{scaled_loss, new_state,
+//                                           skip_step}
+//          • convenience: full pipeline in one call
+//
+//      detect_unscaled_loss(prog) -> bool
+//          • AST predicate: returns true iff prog contains a
+//            "backward" node with no "loss_scale" annotation.
+//
+//      rewrite_add_loss_scaling(prog) -> Program
+//          • If detect_unscaled_loss(prog), wraps the backward node
+//            in a "scaled_backward" node. Otherwise returns unchanged.
+//
+//  Numerical contract
+//  ──────────────────
+//      For every (loss, grads, state) with state["scale"] > 0:
+//          ls_scale_loss(loss, state) == loss * state["scale"]
+//      exactly (one multiply, no rounding beyond IEEE-754 float64).
+//
+//      After N consecutive clean steps (no inf/nan):
+//          final_scale == init_scale * growth_factor^(N / interval)
+//      within tol 1e-10.
+//
+//  Edge cases
+//  ──────────
+//      • empty grads []      -> has_inf=false, has_nan=false,
+//                               has_zero=true (vacuously all zero)
+//      • scale = 1.0         -> scaling is identity
+//      • scale very large    -> overflow likely, backoff triggers
+//      • all grads zero      -> has_zero=true but no inf/nan,
+//                               scale still grows (zero grads may be
+//                               legitimate in sparse models)
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no semicolons
+//      - no and/or -> && / ||
+//      - no enum -> string tags
+//      - abs/fabs not builtin -> file-local ls104_fabs
+//      - let mut x = 0 for mutable variables (P15)
+//      - range .. binds tighter than + -> parenthesize
+//      - handle is reserved keyword -> never use as param name
+//      - string/array concat in loops -> .push() + .join("")
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot           — loss scaling runs every training step
+//      @loss_scaling  — marker: unscaled -> scaled backward pass
+//      @pure          — returns new state; no mutation of inputs
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn ls104_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// IEEE-754 inf check: a finite float satisfies x - x == 0.
+// For inf, inf - inf = nan, so x - x != 0.
+@pure
+fn ls104_is_inf(x) {
+    if x == 0.0 { return false }
+    let d = x - x
+    // nan != nan is true, so d != 0.0 catches both inf->nan and nan
+    // We distinguish inf from nan: inf * 0 = nan, finite * 0 = 0.
+    // But simpler: inf == inf is true, nan == nan is false.
+    // If d != 0.0 and x == x, then x was inf.
+    if d != 0.0 {
+        if x == x { return true }
+    }
+    return false
+}
+
+// IEEE-754 nan check: nan != nan
+@pure
+fn ls104_is_nan(x) {
+    if x != x { return true }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ls_init_state — create initial scaler state
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn ls_init_state(init_scale, growth_factor, backoff_factor, growth_interval) {
+    return #{
+        "scale": init_scale,
+        "growth_factor": growth_factor,
+        "backoff_factor": backoff_factor,
+        "growth_interval": growth_interval,
+        "good_steps": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ls_scale_loss — multiply loss by current scale
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn ls_scale_loss(loss, state) {
+    return loss * state["scale"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ls_check_grads — scan gradient array for inf / nan / all-zero
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn ls_check_grads(grads) {
+    let n = len(grads)
+    let mut found_inf = false
+    let mut found_nan = false
+    let mut all_zero = true
+    for i in 0..n {
+        let g = grads[i]
+        if ls104_is_nan(g) { found_nan = true }
+        if ls104_is_inf(g) { found_inf = true }
+        if ls104_fabs(g) > 0.0 { all_zero = false }
+    }
+    // empty array is vacuously all-zero
+    return #{
+        "has_inf": found_inf,
+        "has_nan": found_nan,
+        "has_zero": all_zero
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ls_update_scale — adjust scale based on gradient health
+// ═══════════════════════════════════════════════════════════════════
+@hot @loss_scaling @pure
+pub fn ls_update_scale(state, grad_check) {
+    let scale = state["scale"]
+    let gf = state["growth_factor"]
+    let bf = state["backoff_factor"]
+    let gi = state["growth_interval"]
+    let mut good = state["good_steps"]
+
+    // Bad grads: scale down, reset counter, skip this step
+    if grad_check["has_inf"] || grad_check["has_nan"] {
+        let new_scale = scale * bf
+        return #{
+            "scale": new_scale,
+            "growth_factor": gf,
+            "backoff_factor": bf,
+            "growth_interval": gi,
+            "good_steps": 0,
+            "skip_step": true
+        }
+    }
+
+    // Good grads: increment counter, possibly grow
+    good = good + 1
+    let mut new_scale = scale
+    if good >= gi {
+        new_scale = scale * gf
+        good = 0
+    }
+
+    return #{
+        "scale": new_scale,
+        "growth_factor": gf,
+        "backoff_factor": bf,
+        "growth_interval": gi,
+        "good_steps": good,
+        "skip_step": false
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ls_step — full pipeline: scale loss, check grads, update state
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+pub fn ls_step(state, loss, grads) {
+    let scaled = ls_scale_loss(loss, state)
+    let gc = ls_check_grads(grads)
+    let new_state = ls_update_scale(state, gc)
+    return #{
+        "scaled_loss": scaled,
+        "new_state": new_state,
+        "skip_step": new_state["skip_step"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  A Program is a list of LsStmt. Each stmt has a kind tag.
+//  Stmt.kind in {
+//      "backward", "scaled_backward", "other"
+//  }
+//  Stmt.has_scale : bool — whether loss_scale annotation is present
+// ═══════════════════════════════════════════════════════════════════
+struct LsStmt {
+    kind: string
+    has_scale: bool
+}
+
+pub fn ls_stmt(kind, has_scale) {
+    return LsStmt{kind: kind, has_scale: has_scale}
+}
+
+pub fn ls_stmt_backward()        { return ls_stmt("backward", false) }
+pub fn ls_stmt_scaled_backward() { return ls_stmt("scaled_backward", true) }
+pub fn ls_stmt_other()           { return ls_stmt("other", false) }
+
+@pure
+fn detect_unscaled_loss_impl(prog) {
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "backward" {
+            if !s.has_scale { return true }
+        }
+    }
+    return false
+}
+
+pub fn detect_unscaled_loss(prog) {
+    return detect_unscaled_loss_impl(prog)
+}
+
+@pure
+fn rewrite_add_loss_scaling_impl(prog) {
+    if !detect_unscaled_loss(prog) { return prog }
+    let mut out = []
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "backward" && !s.has_scale {
+            out.push(ls_stmt_scaled_backward())
+        } else {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+pub fn rewrite_add_loss_scaling(prog) {
+    return rewrite_add_loss_scaling_impl(prog)
+}

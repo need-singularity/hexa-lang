@@ -1,0 +1,494 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/pipeline_parallel.hexa — AI-native ROI #111
+//
+//  Micro-batch pipeline parallelism: GPipe and 1F1B (one-forward-
+//  one-backward) scheduling for multi-stage model training.
+//
+//  The naive approach runs a full-model forward then backward for
+//  each micro-batch sequentially — all stages except the active one
+//  sit idle, yielding bubble fraction (P-1)/P.  GPipe fills the
+//  pipeline by running all forward micro-batches before any backward,
+//  reducing idle slots but keeping a large bubble at the F/B boundary.
+//  1F1B interleaves forward and backward in steady-state, shrinking
+//  the bubble to (P-1)/(P+M-1) and halving peak activation memory.
+//
+//  Public API
+//  ──────────
+//      pp_split_microbatches(batch, num_micro) -> [[float]]
+//          Split a flat batch into num_micro equal-sized slices.
+//
+//      pp_gpipe_schedule(num_stages, num_micro) -> [[map]]
+//          GPipe schedule: stage x time grid of {type, micro_id}.
+//
+//      pp_1f1b_schedule(num_stages, num_micro) -> [[map]]
+//          1F1B schedule: same grid, better bubble ratio.
+//
+//      pp_bubble_ratio(schedule, num_stages, num_micro) -> float
+//          Fraction of idle slots in the schedule grid.
+//
+//      pp_simulate_pipeline(stages, microbatches, schedule) -> map
+//          #{outputs, bubble_ratio} — simulate execution.
+//
+//      pp_stage_memory(total_layers, num_stages) -> [int]
+//          Layers assigned to each stage.
+//
+//      detect_sequential_model(prog) -> bool
+//          AST predicate: is prog a list of sequential layer nodes?
+//
+//      rewrite_pipeline(prog, num_stages) -> Program
+//          AST rewriter: partition sequential layers into stages.
+//
+//  AI-native rationale
+//  ───────────────────
+//  GPipe bubble ratio = (P-1) * (2*M-1) / (2*P*M)    ~ 50% for P=M
+//  1F1B  bubble ratio = (P-1) / (P+M-1)               ~ 0  for M>>P
+//  Switching from GPipe to 1F1B cuts idle GPU time by up to 2x for
+//  typical M/P ratios (M=8, P=4 → GPipe 37.5% vs 1F1B 27.3%).
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if` → maps returned at tail
+//      - no `and`/`or` → `&&` / `||`
+//      - no enum → string tags
+//      - P15: `let mut x = 0` for mutable; plain `let` is immutable
+//      - `handle` is reserved keyword — never use as param name
+//      - array concat in loops O(n^2) — use `.push(x)`
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot        — schedule generation is called every training step
+//      @pure       — returns new state; does not mutate caller data
+//      @parallel   — stage computations are independent across stages
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+@pure
+fn pp111_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn pp111_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn pp111_copy(a) {
+    let mut out = []
+    for i in 0..len(a) {
+        out.push(a[i])
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_split_microbatches(batch, num_micro) -> [[float]]
+//
+//  Splits a flat batch into num_micro equal-size slices.
+//  If len(batch) is not divisible by num_micro, the last slice
+//  absorbs the remainder.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_split_microbatches_impl(batch, num_micro) {
+    let n = len(batch)
+    if num_micro <= 0 { return [batch] }
+    if num_micro == 1 { return [batch] }
+    let chunk = n / num_micro
+    let mut result = []
+    for m in 0..num_micro {
+        let start = m * chunk
+        let mut end = start + chunk
+        if m == num_micro - 1 { end = n }
+        let mut slice = []
+        for i in start..end {
+            slice.push(batch[i])
+        }
+        result.push(slice)
+    }
+    return result
+}
+
+pub fn pp_split_microbatches(batch, num_micro) {
+    return pp_split_microbatches_impl(batch, num_micro)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_gpipe_schedule(num_stages, num_micro) -> [[map]]
+//
+//  GPipe schedule: all forwards first, then all backwards.
+//  Returns a 2D grid [stage][time_slot] where each cell is a map
+//  #{type, micro_id} or #{type: "idle", micro_id: -1}.
+//
+//  Total time slots = 2 * (num_stages + num_micro - 1):
+//    forward  phase: num_stages + num_micro - 1 slots
+//    backward phase: num_stages + num_micro - 1 slots
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_gpipe_schedule_impl(num_stages, num_micro) {
+    let fwd_slots = num_stages + num_micro - 1
+    let total_slots = 2 * fwd_slots
+    let idle = #{"type": "idle", "micro_id": -1}
+
+    // Build empty grid
+    let mut grid = []
+    for _s in 0..num_stages {
+        let mut row = []
+        for _t in 0..total_slots {
+            row.push(idle)
+        }
+        grid.push(row)
+    }
+
+    // Forward phase: micro m enters stage s at time slot s + m
+    for m in 0..num_micro {
+        for s in 0..num_stages {
+            let t = s + m
+            grid[s][t] = #{"type": "fwd", "micro_id": m}
+        }
+    }
+
+    // Backward phase: mirror of forward.
+    // micro m leaves stage s (backward) at time fwd_slots + (num_stages - 1 - s) + m
+    for m in 0..num_micro {
+        for s in 0..num_stages {
+            let t = fwd_slots + (num_stages - 1 - s) + m
+            grid[s][t] = #{"type": "bwd", "micro_id": m}
+        }
+    }
+
+    return grid
+}
+
+pub fn pp_gpipe_schedule(num_stages, num_micro) {
+    return pp_gpipe_schedule_impl(num_stages, num_micro)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_1f1b_schedule(num_stages, num_micro) -> [[map]]
+//
+//  1F1B (PipeDream) schedule. Each stage has a warmup phase of
+//  (num_stages - 1 - stage_id) forward-only steps, then alternates
+//  1 backward + 1 forward in steady-state, then drains remaining
+//  backwards in cooldown.
+//
+//  Total time slots = 2 * num_micro + num_stages - 1
+//  (forward warmup fills P-1 extra slots; steady + cooldown = 2*M)
+//  Actually for 1F1B: total = num_micro + num_micro + num_stages - 1
+//  = 2*num_micro + num_stages - 1
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_1f1b_schedule_impl(num_stages, num_micro) {
+    // Total time slots for 1F1B
+    let total_slots = 2 * num_micro + num_stages - 1
+    let idle = #{"type": "idle", "micro_id": -1}
+
+    // Build empty grid
+    let mut grid = []
+    for _s in 0..num_stages {
+        let mut row = []
+        for _t in 0..total_slots {
+            row.push(idle)
+        }
+        grid.push(row)
+    }
+
+    // Per-stage scheduling
+    for s in 0..num_stages {
+        let warmup_count = num_stages - 1 - s
+        let mut t = s  // stage s starts receiving at time s
+        let mut fwd_id = 0
+        let mut bwd_id = 0
+
+        // Warmup: forward only
+        for _w in 0..warmup_count {
+            if fwd_id < num_micro {
+                if t < total_slots {
+                    grid[s][t] = #{"type": "fwd", "micro_id": fwd_id}
+                    fwd_id = fwd_id + 1
+                    t = t + 1
+                }
+            }
+        }
+
+        // Steady state: 1 forward + 1 backward alternating
+        // (actually 1B then 1F per step, but the first steady slot is fwd
+        //  for stages that haven't started bwd yet)
+        let mut doing_steady = true
+        while doing_steady {
+            if fwd_id >= num_micro && bwd_id >= num_micro {
+                doing_steady = false
+            } else {
+                // Try forward first in steady if we still have fwd work
+                if fwd_id < num_micro {
+                    if t < total_slots {
+                        grid[s][t] = #{"type": "fwd", "micro_id": fwd_id}
+                        fwd_id = fwd_id + 1
+                        t = t + 1
+                    }
+                }
+                // Then backward
+                if bwd_id < num_micro {
+                    if t < total_slots {
+                        grid[s][t] = #{"type": "bwd", "micro_id": bwd_id}
+                        bwd_id = bwd_id + 1
+                        t = t + 1
+                    }
+                }
+            }
+        }
+    }
+
+    return grid
+}
+
+pub fn pp_1f1b_schedule(num_stages, num_micro) {
+    return pp_1f1b_schedule_impl(num_stages, num_micro)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_bubble_ratio(schedule, num_stages, num_micro) -> float
+//
+//  Count idle slots in the schedule grid and return the fraction
+//  of total slots that are idle.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_bubble_ratio_impl(schedule, num_stages, num_micro) {
+    let num_rows = len(schedule)
+    if num_rows == 0 { return 0.0 }
+    let num_cols = len(schedule[0])
+    let total = num_rows * num_cols
+    if total == 0 { return 0.0 }
+
+    let mut idle_count = 0
+    for s in 0..num_rows {
+        for t in 0..num_cols {
+            let cell = schedule[s][t]
+            if cell["type"] == "idle" {
+                idle_count = idle_count + 1
+            }
+        }
+    }
+
+    return to_float(idle_count) / to_float(total)
+}
+
+pub fn pp_bubble_ratio(schedule, num_stages, num_micro) {
+    return pp_bubble_ratio_impl(schedule, num_stages, num_micro)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_simulate_pipeline(stages, microbatches, schedule) -> map
+//
+//  Simulates pipeline execution.
+//  `stages` is a list of functions (represented as weight arrays).
+//  Each stage does: output[i] = input[i] + sum(weights).
+//  `microbatches` is [[float]] from pp_split_microbatches.
+//  `schedule` is the grid from gpipe or 1f1b schedule.
+//
+//  Returns #{outputs, bubble_ratio}
+//    outputs: [float] — final output per micro-batch
+//    bubble_ratio: float — idle fraction
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_simulate_pipeline_impl(stages, microbatches, schedule) {
+    let num_stages = len(stages)
+    let num_micro = len(microbatches)
+    let num_cols = len(schedule[0])
+
+    // activations[stage][micro] = intermediate result after that stage
+    let mut activations = []
+    for _s in 0..num_stages {
+        let mut row = []
+        for _m in 0..num_micro {
+            row.push(0.0)
+        }
+        activations.push(row)
+    }
+
+    // Process time slots left to right
+    for t in 0..num_cols {
+        for s in 0..num_stages {
+            let cell = schedule[s][t]
+            if cell["type"] == "fwd" {
+                let mid = cell["micro_id"]
+                // Get input: for stage 0, use microbatch mean; else previous stage output
+                let mut inp = 0.0
+                if s == 0 {
+                    // Sum of microbatch elements as input
+                    let mb = microbatches[mid]
+                    for i in 0..len(mb) {
+                        inp = inp + mb[i]
+                    }
+                } else {
+                    inp = activations[s - 1][mid]
+                }
+                // Apply stage: add sum of stage weights
+                let weights = stages[s]
+                let mut out = inp
+                for i in 0..len(weights) {
+                    out = out + weights[i]
+                }
+                activations[s][mid] = out
+            }
+        }
+    }
+
+    // Collect final outputs (last stage activations)
+    let mut outputs = []
+    for m in 0..num_micro {
+        outputs.push(activations[num_stages - 1][m])
+    }
+
+    let bubble = pp_bubble_ratio(schedule, num_stages, num_micro)
+    return #{
+        "outputs": outputs,
+        "bubble_ratio": bubble
+    }
+}
+
+pub fn pp_simulate_pipeline(stages, microbatches, schedule) {
+    return pp_simulate_pipeline_impl(stages, microbatches, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  pp_stage_memory(total_layers, num_stages) -> [int]
+//
+//  Returns the number of layers assigned to each stage.
+//  Distributes as evenly as possible; earlier stages get the extra.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn pp_stage_memory_impl(total_layers, num_stages) {
+    let base = total_layers / num_stages
+    let remainder = total_layers - base * num_stages
+    let mut result = []
+    for s in 0..num_stages {
+        if s < remainder {
+            result.push(base + 1)
+        } else {
+            result.push(base)
+        }
+    }
+    return result
+}
+
+pub fn pp_stage_memory(total_layers, num_stages) {
+    return pp_stage_memory_impl(total_layers, num_stages)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  Stmt.kind in {
+//      "sequential_layer", "pipeline_stage", "other"
+//  }
+//  Stmt.layer_id : int — index of the layer in the model
+//  Stmt.stage_id : int — assigned stage (set by rewrite)
+// ═══════════════════════════════════════════════════════════════════
+struct PPStmt {
+    kind: string
+    layer_id: int
+    stage_id: int
+}
+
+pub fn pp_stmt(kind, layer_id, stage_id) {
+    return PPStmt{kind: kind, layer_id: layer_id, stage_id: stage_id}
+}
+
+pub fn pp_stmt_layer(layer_id)             { return pp_stmt("sequential_layer", layer_id, -1) }
+pub fn pp_stmt_stage(layer_id, stage_id)   { return pp_stmt("pipeline_stage", layer_id, stage_id) }
+pub fn pp_stmt_other()                     { return pp_stmt("other", -1, -1) }
+
+// ═══════════════════════════════════════════════════════════════════
+//  detect_sequential_model(prog) -> bool
+//
+//  Returns true iff prog is a non-empty list of sequential_layer
+//  nodes with strictly increasing layer_ids starting from 0.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn detect_sequential_model_impl(prog) {
+    let n = len(prog)
+    if n == 0 { return false }
+    for i in 0..n {
+        let stmt = prog[i]
+        if stmt.kind != "sequential_layer" { return false }
+        if stmt.layer_id != i { return false }
+    }
+    return true
+}
+
+pub fn detect_sequential_model(prog) {
+    return detect_sequential_model_impl(prog)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rewrite_pipeline(prog, num_stages) -> Program
+//
+//  If detect_sequential_model(prog) is true, partitions the layers
+//  into num_stages pipeline stages using the same distribution as
+//  pp_stage_memory. Each sequential_layer node is replaced with a
+//  pipeline_stage node carrying the assigned stage_id.
+//  Otherwise returns prog unchanged.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rewrite_pipeline_impl(prog, num_stages) {
+    if !detect_sequential_model(prog) { return prog }
+    let n = len(prog)
+    let mem = pp_stage_memory(n, num_stages)
+
+    // Build stage assignment: layer i -> stage s
+    let mut out = []
+    let mut s = 0
+    let mut count_in_stage = 0
+    for i in 0..n {
+        out.push(pp_stmt_stage(i, s))
+        count_in_stage = count_in_stage + 1
+        if count_in_stage >= mem[s] {
+            if s < num_stages - 1 {
+                s = s + 1
+                count_in_stage = 0
+            }
+        }
+    }
+    return out
+}
+
+pub fn rewrite_pipeline(prog, num_stages) {
+    return rewrite_pipeline_impl(prog, num_stages)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Theoretical bubble ratios (exposed for tests / benches)
+//
+//  GPipe:  bubble = (P-1) * (2M-1) / (2*P*M)  (approximate)
+//          exact idle slots = P*(P-1) in fwd + P*(P-1) in bwd phase
+//          total slots = P * 2*(P+M-1)
+//          ratio = 2*P*(P-1) / (2*P*(P+M-1)) = (P-1)/(P+M-1)
+//
+//  1F1B:   bubble = (P-1) / (2*M + P - 1)
+//          total slots = P * (2*M + P - 1)
+//          idle = P*(P-1)
+//          ratio = P*(P-1) / (P*(2*M+P-1)) = (P-1)/(2*M+P-1)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn pp_gpipe_bubble_theoretical(num_stages, num_micro) {
+    let p = to_float(num_stages)
+    let m = to_float(num_micro)
+    let den = p + m - 1.0
+    if den <= 0.0 { return 0.0 }
+    return (p - 1.0) / den
+}
+
+@pure
+pub fn pp_1f1b_bubble_theoretical(num_stages, num_micro) {
+    let p = to_float(num_stages)
+    let m = to_float(num_micro)
+    let den = 2.0 * m + p - 1.0
+    if den <= 0.0 { return 0.0 }
+    return (p - 1.0) / den
+}

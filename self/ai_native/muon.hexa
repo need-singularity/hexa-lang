@@ -1,0 +1,259 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/muon.hexa — AI-native ROI #107
+//
+//  Muon optimizer (K. Jordan 2024) — Newton-Schulz iteration for
+//  approximate matrix orthogonalization applied to the gradient,
+//  achieving ~2x AdamW convergence speed.
+//
+//  For a gradient matrix G (rows x cols, stored row-major flat):
+//      G_norm = G / frobenius_norm(G)
+//      G_orth = newton_schulz(G_norm, rows, cols, iters)
+//      params -= lr * G_orth
+//
+//  Newton-Schulz iteration:
+//      X_{k+1} = X_k @ (a*I + b*(X_k^T @ X_k) + c*(X_k^T @ X_k)^2)
+//  with coefficients a=3.4445, b=-4.7750, c=2.0315 for fast quintic
+//  convergence toward orthogonal matrices.
+//
+//  All matrices are stored as flat [float] in row-major order.
+//  An m x n matrix A has A[i*n + j] = element at row i, col j.
+//
+//  Public API (muon_ prefix)
+//  ─────────────────────────
+//      muon_mat_mul(a, b, m, n, k)           -> [float]
+//      muon_mat_transpose(a, m, n)           -> [float]
+//      muon_newton_schulz(g, rows, cols, iters) -> [float]
+//      muon_step(params, grads, rows, cols, lr, ns_iters) -> [float]
+//      muon_frobenius_norm(a)                -> float
+//      muon_normalize(g, rows, cols)         -> [float]
+//      detect_adamw_step(prog)               -> bool
+//      rewrite_muon(prog)                    -> Program
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - P15: let mut x = 0 for mutable
+//      - no struct-literal head inside if
+//      - no and/or -> && / ||
+//      - no enum -> string tags
+//      - handle is reserved keyword
+//      - arr+[x] in loop = O(n^2) -> .push()
+//      - range .. binds tighter than +
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot       — optimizer step is called every training iteration
+//      @pure      — returns new state; does not mutate caller arrays
+//      @parallel  — inner sweeps are independent across i
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn mu107_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn mu107_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn mu107_copy(a) {
+    let n = len(a)
+    let mut out = mu107_zeros(n)
+    for i in 0..n {
+        out[i] = a[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_frobenius_norm(a) — sqrt(sum of squares)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn muon_frobenius_norm(a) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * a[i]
+    }
+    return sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_mat_mul(a, b, m, n, k) — (m x n) @ (n x k) -> (m x k)
+//  a is row-major m x n, b is row-major n x k, result is m x k.
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+pub fn muon_mat_mul(a, b, m, n, k) {
+    let mut out = mu107_zeros(m * k)
+    for i in 0..m {
+        for j in 0..k {
+            let mut s = 0.0
+            for p in 0..n {
+                s = s + a[i * n + p] * b[p * k + j]
+            }
+            out[i * k + j] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_mat_transpose(a, m, n) — transpose m x n -> n x m
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn muon_mat_transpose(a, m, n) {
+    let mut out = mu107_zeros(n * m)
+    for i in 0..m {
+        for j in 0..n {
+            out[j * m + i] = a[i * n + j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_normalize(g, rows, cols) — scale to unit Frobenius norm
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn muon_normalize(g, rows, cols) {
+    let n = rows * cols
+    let norm = muon_frobenius_norm(g)
+    if norm < 1.0e-30 { return mu107_copy(g) }
+    let inv = 1.0 / norm
+    let mut out = mu107_zeros(n)
+    for i in 0..n {
+        out[i] = g[i] * inv
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_newton_schulz(g, rows, cols, iters)
+//
+//  Newton-Schulz iteration to approximately orthogonalize g.
+//  g is rows x cols (rows >= cols typically for gradient matrices).
+//
+//  Algorithm:
+//      X_0 = g / frobenius_norm(g)         (unit-norm seed)
+//      for each iteration:
+//          S = X^T @ X                      (cols x cols)
+//          P = a*I + b*S + c*S^2            (cols x cols)
+//          X = X @ P                        (rows x cols)
+//
+//  Coefficients from the Muon paper for quintic convergence:
+//      a = 3.4445, b = -4.7750, c = 2.0315
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+pub fn muon_newton_schulz(g, rows, cols, iters) {
+    let n = rows * cols
+
+    // Start from unit-norm matrix
+    let mut x = muon_normalize(g, rows, cols)
+
+    // Newton-Schulz coefficients (quintic convergence)
+    let ns_a = 3.4445
+    let ns_b = 0.0 - 4.7750
+    let ns_c = 2.0315
+
+    for _iter in 0..iters {
+        // X^T: cols x rows
+        let xt = muon_mat_transpose(x, rows, cols)
+
+        // S = X^T @ X: (cols x rows) @ (rows x cols) = cols x cols
+        let s = muon_mat_mul(xt, x, cols, rows, cols)
+
+        // S^2 = S @ S: cols x cols
+        let s2 = muon_mat_mul(s, s, cols, cols, cols)
+
+        // P = a*I + b*S + c*S^2: cols x cols
+        let cc = cols * cols
+        let mut p = mu107_zeros(cc)
+        for i in 0..cols {
+            for j in 0..cols {
+                let idx = i * cols + j
+                let mut val = ns_b * s[idx] + ns_c * s2[idx]
+                if i == j {
+                    val = val + ns_a
+                }
+                p[idx] = val
+            }
+        }
+
+        // X_new = X @ P: (rows x cols) @ (cols x cols) = rows x cols
+        x = muon_mat_mul(x, p, rows, cols, cols)
+    }
+
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  muon_step(params, grads, rows, cols, lr, ns_iters)
+//
+//  One Muon optimizer update:
+//      g_orth = newton_schulz(grads, rows, cols, ns_iters)
+//      params_new[i] = params[i] - lr * g_orth[i]
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+pub fn muon_step(params, grads, rows, cols, lr, ns_iters) {
+    let g_orth = muon_newton_schulz(grads, rows, cols, ns_iters)
+    let n = rows * cols
+    let mut out = mu107_zeros(n)
+    for i in 0..n {
+        out[i] = params[i] - lr * g_orth[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  Detects an AdamW-style parameter update pattern and rewrites it
+//  into a Muon orthogonal-gradient step.
+//
+//  Stmt.kind values:
+//      "adamw_step"    — standard AdamW param update
+//      "muon_step"     — Muon orthogonal update (rewrite target)
+//      "other"         — unrelated statement
+// ═══════════════════════════════════════════════════════════════════
+
+struct MuonStmt {
+    kind: string
+    index: string
+    param: string
+}
+
+pub fn muon_stmt(kind, index, param) {
+    return MuonStmt{kind: kind, index: index, param: param}
+}
+
+pub fn muon_stmt_adamw(index, param)  { return muon_stmt("adamw_step", index, param) }
+pub fn muon_stmt_muon(index, param)   { return muon_stmt("muon_step",  index, param) }
+pub fn muon_stmt_other()              { return muon_stmt("other", "", "") }
+
+@pure
+pub fn detect_adamw_step(prog) {
+    if len(prog) < 1 { return false }
+    let s0 = prog[0]
+    if s0.kind == "adamw_step" { return true }
+    return false
+}
+
+@pure
+pub fn rewrite_muon(prog) {
+    if !detect_adamw_step(prog) { return prog }
+    let s0 = prog[0]
+    let rewritten = muon_stmt_muon(s0.index, s0.param)
+    let mut out = [rewritten]
+    for i in 1..len(prog) {
+        out.push(prog[i])
+    }
+    return out
+}

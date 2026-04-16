@@ -1,0 +1,463 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/zero_redundancy.hexa — AI-native ROI #108
+//
+//  @zero_redundancy — ZeRO (Zero Redundancy Optimizer) partitions
+//  optimizer states, gradients, and parameters across N simulated
+//  workers to reduce per-worker memory.
+//
+//  DeepSpeed ZeRO stages:
+//    Level 1: optimizer state (Adam m, v) partitioned across workers
+//    Level 2: + gradient partitioning (reduce-scatter per shard)
+//    Level 3: + parameter partitioning (all-gather on demand)
+//
+//  The naive replicated optimizer stores 4P floats per worker
+//  (params + grads + Adam m + Adam v). ZeRO-1 reduces optimizer
+//  state to 2P/N per worker; ZeRO-2 also shards gradients; ZeRO-3
+//  shards everything so each worker holds only 4P/N.
+//
+//  Public API
+//  ──────────
+//      zero_partition(data, num_workers) -> [[float]]
+//          Split a flat array into N contiguous chunks.
+//
+//      zero_gather(partitions) -> [float]
+//          Reconstruct full array from partitions.
+//
+//      zero_scatter_reduce(grads, num_workers) -> [[float]]
+//          Reduce-scatter: sum gradient copies, partition result.
+//
+//      zero_allgather(partitions) -> [float]
+//          All-gather: reconstruct full array (alias for gather).
+//
+//      zero_memory_per_worker(total_params, num_workers, level) -> map
+//          Memory estimate (in param units) for ZeRO level 1/2/3.
+//          Returns #{params, grads, optim, total}.
+//
+//      zero_simulate_step(params, grads, num_workers, level) -> map
+//          Simulate one ZeRO training step.
+//          Returns #{params: [float], memory_per_worker: map}.
+//
+//      detect_replicated_optimizer(prog) -> bool
+//          AST predicate: true iff prog contains N identical
+//          optimizer loops over the same parameter (replicated).
+//
+//      rewrite_zero(prog, num_workers, level) -> Program
+//          AST rewriter: replaces replicated optimizer with a
+//          single partitioned optimizer + collective stubs.
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if` -> maps returned at tail
+//      - no `and`/`or` -> `&&` / `||`
+//      - no enum -> string tags
+//      - `let mut x = 0` for mutable (P15)
+//      - `handle` is reserved keyword
+//      - array concat in loops -> use .push(x)
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot        — optimizer step called every training iteration
+//      @pure       — returns new state; does not mutate caller arrays
+//      @parallel   — partitioning is independent across workers
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn zr108_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn zr108_zeros(n) {
+    let mut out = []
+    for _i in 0..n {
+        out.push(0.0)
+    }
+    return out
+}
+
+@pure
+fn zr108_copy(a) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n {
+        out.push(a[i])
+    }
+    return out
+}
+
+@pure
+fn zr108_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    for _i in 0..20 {
+        y = 0.5 * (y + x / y)
+    }
+    return y
+}
+
+@pure
+fn zr108_ipow(b, t) {
+    if t <= 0 { return 1.0 }
+    let mut r = 1.0
+    for _i in 0..t {
+        r = r * b
+    }
+    return r
+}
+
+// ── shard boundary helpers ─────────────────────────────────────────
+
+@pure
+fn zr108_shard_begin(total, nw, rank) {
+    return (total * rank) / nw
+}
+
+@pure
+fn zr108_shard_end(total, nw, rank) {
+    return (total * (rank + 1)) / nw
+}
+
+@pure
+fn zr108_shard_size(total, nw, rank) {
+    return zr108_shard_end(total, nw, rank) - zr108_shard_begin(total, nw, rank)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_partition(data, num_workers) -> [[float]]
+//
+//  Splits a flat array into num_workers contiguous chunks using
+//  the same boundary formula as DeepSpeed's partitioner.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn zero_partition_impl(data, num_workers) {
+    let total = len(data)
+    let mut parts = []
+    for r in 0..num_workers {
+        let b = zr108_shard_begin(total, num_workers, r)
+        let e = zr108_shard_end(total, num_workers, r)
+        let mut chunk = []
+        for i in b..e {
+            chunk.push(data[i])
+        }
+        parts.push(chunk)
+    }
+    return parts
+}
+
+pub fn zero_partition(data, num_workers) {
+    return zero_partition_impl(data, num_workers)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_gather(partitions) -> [float]
+//
+//  Concatenate partitions back into a single flat array.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn zero_gather_impl(partitions) {
+    let nparts = len(partitions)
+    let mut out = []
+    for r in 0..nparts {
+        let shard = partitions[r]
+        let sz = len(shard)
+        for i in 0..sz {
+            out.push(shard[i])
+        }
+    }
+    return out
+}
+
+pub fn zero_gather(partitions) {
+    return zero_gather_impl(partitions)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_scatter_reduce(grads, num_workers) -> [[float]]
+//
+//  Simulates the reduce-scatter collective:
+//    1. Sum all gradient copies element-wise (all-reduce)
+//    2. Partition the summed result across workers
+//  Input: grads is a list of num_workers gradient arrays, each of
+//  length P. Output: list of num_workers shards.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn zero_scatter_reduce_impl(grads, num_workers) {
+    let p = len(grads[0])
+    // 1) element-wise sum across all workers
+    let mut summed = zr108_zeros(p)
+    for r in 0..num_workers {
+        let g = grads[r]
+        for i in 0..p {
+            summed[i] = summed[i] + g[i]
+        }
+    }
+    // 2) partition the summed gradient
+    return zero_partition(summed, num_workers)
+}
+
+pub fn zero_scatter_reduce(grads, num_workers) {
+    return zero_scatter_reduce_impl(grads, num_workers)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_allgather(partitions) -> [float]
+//
+//  All-gather: every worker reconstructs the full array from shards.
+//  Semantically identical to zero_gather; named separately to match
+//  the MPI / DeepSpeed collective vocabulary.
+// ═══════════════════════════════════════════════════════════════════
+pub fn zero_allgather(partitions) {
+    return zero_gather(partitions)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_memory_per_worker(total_params, num_workers, level) -> map
+//
+//  Returns per-worker memory in float-element units:
+//    #{params, grads, optim, total}
+//
+//  DeepSpeed paper formulas:
+//    Level 1: params=P, grads=P, optim=2P/N       -> total = 2P + 2P/N
+//    Level 2: params=P, grads=P/N, optim=2P/N     -> total = P + 3P/N
+//    Level 3: params=P/N, grads=P/N, optim=2P/N   -> total = 4P/N
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn zero_memory_per_worker_impl(total_params, num_workers, level) {
+    let p = total_params
+    let n = num_workers
+    let shard = p / n
+
+    if level == 1 {
+        let params_mem = p
+        let grads_mem = p
+        let optim_mem = 2 * shard
+        let total_mem = params_mem + grads_mem + optim_mem
+        return #{
+            "params": params_mem,
+            "grads": grads_mem,
+            "optim": optim_mem,
+            "total": total_mem
+        }
+    }
+    if level == 2 {
+        let params_mem = p
+        let grads_mem = shard
+        let optim_mem = 2 * shard
+        let total_mem = params_mem + grads_mem + optim_mem
+        return #{
+            "params": params_mem,
+            "grads": grads_mem,
+            "optim": optim_mem,
+            "total": total_mem
+        }
+    }
+    // level 3
+    let params_mem = shard
+    let grads_mem = shard
+    let optim_mem = 2 * shard
+    let total_mem = params_mem + grads_mem + optim_mem
+    return #{
+        "params": params_mem,
+        "grads": grads_mem,
+        "optim": optim_mem,
+        "total": total_mem
+    }
+}
+
+pub fn zero_memory_per_worker(total_params, num_workers, level) {
+    return zero_memory_per_worker_impl(total_params, num_workers, level)
+}
+
+// ── per-shard Adam update ──────────────────────────────────────────
+
+@hot @pure
+fn zr108_adam_shard(param_slice, grad_slice, m_in, v_in, lr, t) {
+    let sz = len(grad_slice)
+    let mut p = zr108_copy(param_slice)
+    let mut m = zr108_copy(m_in)
+    let mut v = zr108_copy(v_in)
+
+    let b1 = 0.9
+    let b2 = 0.999
+    let eps = 1.0e-8
+    let bc1 = 1.0 - zr108_ipow(b1, t)
+    let bc2 = 1.0 - zr108_ipow(b2, t)
+
+    for i in 0..sz {
+        let g = grad_slice[i]
+        let mnew = b1 * m[i] + (1.0 - b1) * g
+        let vnew = b2 * v[i] + (1.0 - b2) * g * g
+        m[i] = mnew
+        v[i] = vnew
+        let m_hat = mnew / bc1
+        let v_hat = vnew / bc2
+        let step = lr * m_hat / (zr108_sqrt(v_hat) + eps)
+        p[i] = p[i] - step
+    }
+    return [p, m, v]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_simulate_step(params, grads, num_workers, level) -> map
+//
+//  Simulates one ZeRO training step:
+//    1. Partition optimizer states
+//    2. Reduce-scatter gradients (level >= 2)
+//    3. Per-shard Adam update
+//    4. All-gather parameters
+//  Returns #{params: [float], memory_per_worker: map}
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+fn zero_simulate_step_impl(params, grads, num_workers, level) {
+    let p_count = len(params)
+    let lr = 0.001
+    let t_step = 1
+
+    // Initialize per-shard Adam moments to zero
+    let mut m_shards = []
+    let mut v_shards = []
+    for r in 0..num_workers {
+        let sz = zr108_shard_size(p_count, num_workers, r)
+        m_shards.push(zr108_zeros(sz))
+        v_shards.push(zr108_zeros(sz))
+    }
+
+    // Get gradient shards
+    let mut g_shards = []
+    if level >= 2 {
+        // reduce-scatter: replicate grads across workers, then scatter
+        let mut per_rank = []
+        for _r in 0..num_workers {
+            per_rank.push(zr108_copy(grads))
+        }
+        let scattered = zero_scatter_reduce(per_rank, num_workers)
+        // Scale by 1/N since we summed N identical copies
+        for r in 0..num_workers {
+            let sh = scattered[r]
+            let sz = len(sh)
+            let mut scaled = []
+            for i in 0..sz {
+                scaled.push(sh[i] / (num_workers * 1.0))
+            }
+            g_shards.push(scaled)
+        }
+    }
+    if level < 2 {
+        // level 1: each worker has full gradient, slice locally
+        g_shards = zero_partition(grads, num_workers)
+    }
+
+    // Per-shard Adam update
+    let param_parts = zero_partition(params, num_workers)
+    let mut new_param_shards = []
+    for r in 0..num_workers {
+        let res = zr108_adam_shard(param_parts[r], g_shards[r],
+            m_shards[r], v_shards[r], lr, t_step)
+        new_param_shards.push(res[0])
+    }
+
+    // All-gather to reconstruct full params
+    let new_params = zero_allgather(new_param_shards)
+    let mem = zero_memory_per_worker(p_count, num_workers, level)
+
+    return #{
+        "params": new_params,
+        "memory_per_worker": mem
+    }
+}
+
+pub fn zero_simulate_step(params, grads, num_workers, level) {
+    return zero_simulate_step_impl(params, grads, num_workers, level)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  A Program is a list of ZeroStmt. Each stmt has a kind tag:
+//    "replicated_optimizer" — N identical optimizer loops
+//    "partitioned_optimizer" — single sharded optimizer + collectives
+//    "other"
+//
+//  ZeroStmt.kind  : string
+//  ZeroStmt.idx   : string — loop index variable
+//  ZeroStmt.param : string — parameter vector name
+//  ZeroStmt.count : int    — number of replicated copies (N)
+// ═══════════════════════════════════════════════════════════════════
+struct ZeroStmt {
+    kind: string
+    idx: string
+    param: string
+    count: int
+}
+
+pub fn zero_stmt(kind, idx, param, cnt) {
+    return ZeroStmt{kind: kind, idx: idx, param: param, count: cnt}
+}
+
+pub fn zero_stmt_replicated(idx, param, cnt) {
+    return zero_stmt("replicated_optimizer", idx, param, cnt)
+}
+
+pub fn zero_stmt_partitioned(idx, param, cnt) {
+    return zero_stmt("partitioned_optimizer", idx, param, cnt)
+}
+
+pub fn zero_stmt_other() {
+    return zero_stmt("other", "", "", 0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  detect_replicated_optimizer(prog) -> bool
+//
+//  Returns true iff `prog` contains at least one stmt with kind
+//  "replicated_optimizer" and count > 1. This means the program has
+//  N identical optimizer copies that can be sharded.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn detect_replicated_optimizer_impl(prog) {
+    let n = len(prog)
+    for i in 0..n {
+        let s = prog[i]
+        if s.kind == "replicated_optimizer" {
+            if s.count > 1 { return true }
+        }
+    }
+    return false
+}
+
+pub fn detect_replicated_optimizer(prog) {
+    return detect_replicated_optimizer_impl(prog)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rewrite_zero(prog, num_workers, level) -> Program
+//
+//  Replaces every "replicated_optimizer" node with a
+//  "partitioned_optimizer" node carrying the specified worker count
+//  and ZeRO level. Non-optimizer stmts pass through unchanged.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rewrite_zero_impl(prog, num_workers, level) {
+    if !detect_replicated_optimizer(prog) { return prog }
+    let n = len(prog)
+    let mut out = []
+    for i in 0..n {
+        let s = prog[i]
+        if s.kind == "replicated_optimizer" {
+            out.push(zero_stmt_partitioned(s.idx, s.param, num_workers))
+        }
+        if s.kind != "replicated_optimizer" {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+pub fn rewrite_zero(prog, num_workers, level) {
+    return rewrite_zero_impl(prog, num_workers, level)
+}
+
+println("[zero_redundancy] loaded — ZeRO-1/2/3 partitioning (AI-native ROI #108)")

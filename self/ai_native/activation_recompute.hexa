@@ -1,0 +1,477 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/activation_recompute.hexa — AI-native ROI #110
+//
+//  Selective activation recomputation — FLOPS-vs-memory cost model
+//  that decides per-layer whether to store activations or recompute
+//  them during the backward pass.  Complements grad_accumulate (#101)
+//  and fused_adam (#94).
+//
+//  During training, the forward pass stores intermediate activations
+//  so the backward pass can compute gradients.  For memory-constrained
+//  setups (large batch, long sequence, deep networks) a subset of
+//  activations can be discarded and recomputed on-the-fly during
+//  backward, trading extra FLOPS for reduced peak memory.
+//
+//  The cost model assigns each layer a (flops, memory_bytes) pair.
+//  A greedy scheduler picks layers to recompute in order of best
+//  memory/flops ratio until the memory budget is satisfied.
+//
+//  Public API  (`ar_` prefix)
+//  ──────────
+//      ar_layer_cost(input_size, output_size, op_type)
+//          -> map #{flops, memory_bytes}
+//          Cost estimate for a single layer.  op_type is one of
+//          "matmul", "conv", "norm", "activation", "other".
+//
+//      ar_optimal_schedule(layers, memory_budget)
+//          -> [bool]
+//          Per-layer decision: true = recompute, false = store.
+//          Greedy: recompute layers with best memory/flops ratio
+//          until cumulative stored memory <= budget.
+//
+//      ar_total_flops(layers, schedule) -> float
+//          Extra recompute FLOPS incurred by the schedule.
+//
+//      ar_total_memory(layers, schedule) -> float
+//          Peak activation memory after recomputation savings.
+//
+//      ar_savings_ratio(layers, schedule) -> float
+//          memory_saved / extra_flops.  Higher = more efficient.
+//          Returns 0.0 when extra flops is 0.
+//
+//      ar_apply_schedule(activations, schedule) -> [float]
+//          Simulate: zero out entries whose layer is recomputed.
+//
+//      detect_full_activation_store(prog) -> bool
+//          AST predicate: true iff prog is a list of "store_activation"
+//          nodes with no "recompute" nodes.
+//
+//      rewrite_selective_recompute(prog, budget) -> Program
+//          AST rewriter: given a full-store program and a memory budget,
+//          replaces selected "store_activation" nodes with
+//          "recompute_activation" nodes according to the cost model.
+//
+//  Op-type FLOPS multipliers (per element)
+//  ────────────────────────────────────────
+//      matmul      2 * input * output   (standard GEMM)
+//      conv        2 * input * output   (approximate)
+//      norm        5 * input            (mean + var + normalize)
+//      activation  1 * input            (pointwise)
+//      other       2 * input            (conservative default)
+//
+//  Memory model
+//  ────────────
+//      Stored activation bytes = output_size * 4  (float32)
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if` -> maps/structs at tail
+//      - no `and`/`or` -> `&&` / `||`
+//      - no enum -> string tags
+//      - `handle` is reserved keyword, never used as param name
+//      - let mut x = 0 for mutable variables
+//      - arr.push(x) in loops, not arr + [x]
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot        — schedule computation is called per training step
+//      @pure       — returns new data; does not mutate caller arrays
+//      @parallel   — per-layer cost is independent across layers
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn ar110_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn ar110_copy_1d(a) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n {
+        out.push(a[i])
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_layer_cost(input_size, output_size, op_type)
+//
+//  Returns #{flops, memory_bytes} for a single layer.
+//  FLOPS = recompute cost if this layer's activation is discarded.
+//  memory_bytes = storage cost if this layer's activation is kept.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn ar_layer_cost_impl(input_size, output_size, op_type) {
+    let mut flops = 0.0
+    if op_type == "matmul" {
+        flops = 2.0 * input_size * output_size
+    } else if op_type == "conv" {
+        flops = 2.0 * input_size * output_size
+    } else if op_type == "norm" {
+        flops = 5.0 * input_size
+    } else if op_type == "activation" {
+        flops = 1.0 * input_size
+    } else {
+        flops = 2.0 * input_size
+    }
+    // Memory: storing the output activation in float32 (4 bytes)
+    let mem = output_size * 4.0
+    return #{
+        "flops": flops,
+        "memory_bytes": mem
+    }
+}
+
+pub fn ar_layer_cost(input_size, output_size, op_type) {
+    return ar_layer_cost_impl(input_size, output_size, op_type)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_optimal_schedule(layers, memory_budget)
+//
+//  layers: list of #{input_size, output_size, op_type}
+//  memory_budget: float, max allowed stored activation bytes
+//
+//  Returns [bool] of length len(layers).
+//  true = recompute (discard activation), false = store.
+//
+//  Algorithm:
+//  1. Compute cost for every layer.
+//  2. Total stored memory if all are stored.
+//  3. If total <= budget, store everything (all false).
+//  4. Otherwise, greedily recompute layers with the best
+//     memory_bytes/flops ratio (highest ratio first) until
+//     the remaining stored memory fits within budget.
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+fn ar_optimal_schedule_impl(layers, memory_budget) {
+    let n = len(layers)
+    if n == 0 { return [] }
+
+    // Compute per-layer costs
+    let mut costs = []
+    let mut total_mem = 0.0
+    for i in 0..n {
+        let layer = layers[i]
+        let c = ar_layer_cost(layer["input_size"], layer["output_size"], layer["op_type"])
+        costs.push(c)
+        total_mem = total_mem + c["memory_bytes"]
+    }
+
+    // If everything fits, store all
+    if total_mem <= memory_budget {
+        let mut sched = []
+        for _i in 0..n {
+            sched.push(false)
+        }
+        return sched
+    }
+
+    // Compute ratio = memory_bytes / flops for each layer
+    // Higher ratio = more memory saved per flop spent -> recompute first
+    let mut ratios = []
+    for i in 0..n {
+        let f = costs[i]["flops"]
+        let m = costs[i]["memory_bytes"]
+        if f < 1.0e-30 {
+            // Zero-flop layer: infinite ratio, always recompute first
+            ratios.push(1.0e30)
+        } else {
+            ratios.push(m / f)
+        }
+    }
+
+    // Build index array and sort by ratio descending (selection sort)
+    let mut indices = []
+    for i in 0..n {
+        indices.push(i)
+    }
+    for i in 0..(n - 1) {
+        let mut best = i
+        for j in (i + 1)..n {
+            if ratios[indices[j]] > ratios[indices[best]] {
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+
+    // Greedily mark layers for recomputation
+    let mut schedule = []
+    for _i in 0..n {
+        schedule.push(false)
+    }
+    let mut current_mem = total_mem
+    for k in 0..n {
+        if current_mem <= memory_budget { break }
+        let idx = indices[k]
+        schedule[idx] = true
+        current_mem = current_mem - costs[idx]["memory_bytes"]
+    }
+
+    return schedule
+}
+
+pub fn ar_optimal_schedule(layers, memory_budget) {
+    return ar_optimal_schedule_impl(layers, memory_budget)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_total_flops(layers, schedule) -> float
+//
+//  Sum of recompute FLOPS for layers marked true in schedule.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ar_total_flops_impl(layers, schedule) {
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        if schedule[i] {
+            let layer = layers[i]
+            let c = ar_layer_cost(layer["input_size"], layer["output_size"], layer["op_type"])
+            total = total + c["flops"]
+        }
+    }
+    return total
+}
+
+pub fn ar_total_flops(layers, schedule) {
+    return ar_total_flops_impl(layers, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_total_memory(layers, schedule) -> float
+//
+//  Sum of memory for layers that are stored (schedule[i] == false).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ar_total_memory_impl(layers, schedule) {
+    let n = len(layers)
+    let mut total = 0.0
+    for i in 0..n {
+        if !schedule[i] {
+            let layer = layers[i]
+            let c = ar_layer_cost(layer["input_size"], layer["output_size"], layer["op_type"])
+            total = total + c["memory_bytes"]
+        }
+    }
+    return total
+}
+
+pub fn ar_total_memory(layers, schedule) {
+    return ar_total_memory_impl(layers, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_savings_ratio(layers, schedule) -> float
+//
+//  memory_saved / extra_flops.  Returns 0.0 when no extra flops.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ar_savings_ratio_impl(layers, schedule) {
+    let n = len(layers)
+    let mut all_mem = 0.0
+    for i in 0..n {
+        let layer = layers[i]
+        let c = ar_layer_cost(layer["input_size"], layer["output_size"], layer["op_type"])
+        all_mem = all_mem + c["memory_bytes"]
+    }
+    let stored_mem = ar_total_memory(layers, schedule)
+    let saved = all_mem - stored_mem
+    let extra_flops = ar_total_flops(layers, schedule)
+    if extra_flops < 1.0e-30 { return 0.0 }
+    return saved / extra_flops
+}
+
+pub fn ar_savings_ratio(layers, schedule) {
+    return ar_savings_ratio_impl(layers, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ar_apply_schedule(activations, schedule) -> [float]
+//
+//  Simulate: return a copy of activations where entries whose layer
+//  is marked for recomputation are zeroed out.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ar_apply_schedule_impl(activations, schedule) {
+    let n = len(activations)
+    let mut out = []
+    for i in 0..n {
+        if schedule[i] {
+            out.push(0.0)
+        } else {
+            out.push(activations[i])
+        }
+    }
+    return out
+}
+
+pub fn ar_apply_schedule(activations, schedule) {
+    return ar_apply_schedule_impl(activations, schedule)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  Representation: tagged-kind struct (same approach as fused_adam).
+//  An ActivationStmt has:
+//      kind  : "store_activation" | "recompute_activation" | "other"
+//      layer : string — layer identifier
+//      mem   : float  — memory cost in bytes
+//      flops : float  — recompute cost in FLOPS
+// ═══════════════════════════════════════════════════════════════════
+struct ActivationStmt {
+    kind: string
+    layer: string
+    mem: float
+    flops: float
+}
+
+pub fn ar_stmt(kind, layer, mem, flops) {
+    return ActivationStmt{kind: kind, layer: layer, mem: mem, flops: flops}
+}
+
+pub fn ar_stmt_store(layer, mem, flops) {
+    return ar_stmt("store_activation", layer, mem, flops)
+}
+
+pub fn ar_stmt_recompute(layer, mem, flops) {
+    return ar_stmt("recompute_activation", layer, mem, flops)
+}
+
+pub fn ar_stmt_other(layer) {
+    return ar_stmt("other", layer, 0.0, 0.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  detect_full_activation_store(prog) -> bool
+//
+//  Returns true iff prog is a non-empty list of ActivationStmt where
+//  every non-"other" node has kind == "store_activation" (i.e., no
+//  recompute nodes present — the naive full-store pattern).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn detect_full_activation_store_impl(prog) {
+    let n = len(prog)
+    if n == 0 { return false }
+    let mut has_store = false
+    for i in 0..n {
+        let s = prog[i]
+        if s.kind == "recompute_activation" { return false }
+        if s.kind == "store_activation" {
+            has_store = true
+        }
+    }
+    return has_store
+}
+
+pub fn detect_full_activation_store(prog) {
+    return detect_full_activation_store_impl(prog)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rewrite_selective_recompute(prog, budget) -> Program
+//
+//  Given a full-store program and a memory budget, replaces selected
+//  "store_activation" nodes with "recompute_activation" nodes.
+//  Uses the same greedy ratio-based selection as ar_optimal_schedule.
+//  Non-store nodes are left unchanged.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rewrite_selective_recompute_impl(prog, budget) {
+    if !detect_full_activation_store(prog) { return prog }
+
+    let n = len(prog)
+
+    // Collect store-node indices and their costs
+    let mut store_indices = []
+    let mut total_mem = 0.0
+    for i in 0..n {
+        let s = prog[i]
+        if s.kind == "store_activation" {
+            store_indices.push(i)
+            total_mem = total_mem + s.mem
+        }
+    }
+
+    // If already within budget, return unchanged
+    if total_mem <= budget { return prog }
+
+    // Compute ratio for each store node, sort descending
+    let sn = len(store_indices)
+    let mut ratios = []
+    for k in 0..sn {
+        let idx = store_indices[k]
+        let s = prog[idx]
+        if s.flops < 1.0e-30 {
+            ratios.push(1.0e30)
+        } else {
+            ratios.push(s.mem / s.flops)
+        }
+    }
+
+    // Sort store_indices by ratio descending (selection sort)
+    let mut sorted = []
+    for k in 0..sn {
+        sorted.push(k)
+    }
+    for i in 0..(sn - 1) {
+        let mut best = i
+        for j in (i + 1)..sn {
+            if ratios[sorted[j]] > ratios[sorted[best]] {
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = sorted[i]
+            sorted[i] = sorted[best]
+            sorted[best] = tmp
+        }
+    }
+
+    // Mark which store nodes to recompute
+    let mut recompute_set = []
+    for _k in 0..sn {
+        recompute_set.push(false)
+    }
+    let mut current_mem = total_mem
+    for k in 0..sn {
+        if current_mem <= budget { break }
+        let si = sorted[k]
+        recompute_set[si] = true
+        let idx = store_indices[si]
+        current_mem = current_mem - prog[idx].mem
+    }
+
+    // Build rewritten program
+    let mut out = []
+    let mut store_counter = 0
+    for i in 0..n {
+        let s = prog[i]
+        if s.kind == "store_activation" {
+            if recompute_set[store_counter] {
+                out.push(ar_stmt_recompute(s.layer, s.mem, s.flops))
+            } else {
+                out.push(s)
+            }
+            store_counter = store_counter + 1
+        } else {
+            out.push(s)
+        }
+    }
+
+    return out
+}
+
+pub fn rewrite_selective_recompute(prog, budget) {
+    return rewrite_selective_recompute_impl(prog, budget)
+}
