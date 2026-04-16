@@ -397,6 +397,13 @@ static inline HexaVal hexa_closure_new(void* fn_ptr, int arity, HexaVal env_arr)
     return v;
 }
 
+// S1-D2: NaN-boxing-safe constructor for TAG_FN values.
+// Replaces C struct-literal `(HexaVal){.tag=TAG_FN, .fn={...}}` in codegen.
+static inline HexaVal hexa_fn_new(void* fn_ptr, int arity) {
+    HexaVal v = {.tag=TAG_FN, .fn={.fn_ptr=fn_ptr, .arity=arity}};
+    return v;
+}
+
 static inline HexaVal hexa_closure_env(HexaVal c) {
     if (!HX_IS_CLOSURE(c) || !HX_CLO_ENV(c)) return hexa_array_new();
     return *HX_CLO_ENV(c);
@@ -572,6 +579,8 @@ static HexaVal _cached_str_struct;
 static HexaVal _cached_str_unknown;
 static HexaVal _cached_str_value;  // "<value>" fallback
 static int     _cached_strs_ready = 0;
+// S1-D2 Blocker C: forward decl — defined after bt73 wrappers near EOF.
+static void _hexa_init_fn_shims(void);
 
 static void _hexa_init_cached_strs(void) {
     if (_cached_strs_ready) return;
@@ -2536,6 +2545,8 @@ static int _hexa_argc = 0;
 static char** _hexa_argv = NULL;
 
 void hexa_set_args(int argc, char** argv) {
+    // S1-D2: init TAG_FN shim globals before user code touches them.
+    _hexa_init_fn_shims();
     // argv[0]을 2번 삽입하여 인터프리터 모드와 동일한 인덱스 유지
     // 인터프리터: ["hexa", "script.hexa", arg1, arg2, ...]
     // 네이티브:   ["binary", "binary",    arg1, arg2, ...]
@@ -2777,7 +2788,7 @@ HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
 // Bootstrap shim: hexa-level `join(arr, sep)` free-fn idiom in SSOT modules
 // emits `hexa_call2(join, arr, sep)` via TAG_FN lookup. Once hexa_v2 is rebuilt
 // from codegen_c2.hexa's join-builtin dispatch, this becomes unused.
-static HexaVal join = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_str_join, .arity = 2}};
+static HexaVal join;
 
 HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
@@ -3725,7 +3736,7 @@ HexaVal hexa_char_code(HexaVal s, HexaVal idx);
 // Bootstrap shim (same rationale as `join` above): SSOT modules use
 // `char_code(s, i)` free-fn idiom which old hexa_v2 emits as
 // `hexa_call2(char_code, ...)`. Shim binds the bare identifier to TAG_FN.
-static HexaVal char_code = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_char_code, .arity = 2}};
+static HexaVal char_code;
 HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_int(0);
     int i = idx.i;
@@ -3737,7 +3748,7 @@ HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
 // Used by void's sys_pty accumulator (chr(b) reassembles bytes from
 // line_buf int values). Binds the free-fn idiom the way char_code does.
 HexaVal hexa_from_char_code(HexaVal n);
-static HexaVal chr = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)hexa_from_char_code, .arity = 1}};
+static HexaVal chr;
 
 // `bit_or(x, y)` — shim kept because `|` as binary op conflicts with lambda
 // param delimiters `|x| x+1`. `&` and `^` are supported by parser directly.
@@ -3746,7 +3757,7 @@ HexaVal _hx_bit_or(HexaVal a, HexaVal b) {
     int64_t y = HX_IS_INT(b) ? HX_INT(b) : (int64_t)HX_FLOAT(b);
     return hexa_int(x | y);
 }
-static HexaVal bit_or = {.tag = TAG_FN, .fn = {.fn_ptr = (void*)_hx_bit_or, .arity = 2}};
+static HexaVal bit_or;
 
 // ── Added: method-dispatch helpers (bt 34) ────────────────────
 HexaVal hexa_str_parse_int(HexaVal s) {
@@ -4133,9 +4144,27 @@ static HexaVal _bt73_timestamp_w(void) { return hexa_timestamp(); }
 static HexaVal _bt73_base64_encode_w(HexaVal s) { return hexa_base64_encode(s); }
 static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); }
 
-HexaVal timestamp     = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_timestamp_w,     .arity=0}};
-HexaVal base64_encode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_encode_w, .arity=1}};
-HexaVal base64_decode = {.tag=TAG_FN, .fn={.fn_ptr=(void*)_bt73_base64_decode_w, .arity=1}};
+HexaVal timestamp;
+HexaVal base64_encode;
+HexaVal base64_decode;
+
+// S1-D2 Blocker C: runtime init for TAG_FN shim variables.
+// NaN-boxing makes HexaVal a uint64_t — designated initializers for the
+// struct layout are illegal.  Lazy-init mirrors _hexa_init_cached_strs().
+static int _fn_shims_ready = 0;
+static void _hexa_init_fn_shims(void) {
+    if (_fn_shims_ready) return;
+    // bootstrap free-fn shims (join, char_code, chr, bit_or)
+    join       = hexa_fn_new((void*)hexa_str_join,        2);
+    char_code  = hexa_fn_new((void*)hexa_char_code,       2);
+    chr        = hexa_fn_new((void*)hexa_from_char_code,   1);
+    bit_or     = hexa_fn_new((void*)_hx_bit_or,           2);
+    // bt73 free-fn shims (timestamp, base64_encode, base64_decode)
+    timestamp     = hexa_fn_new((void*)_bt73_timestamp_w,     0);
+    base64_encode = hexa_fn_new((void*)_bt73_base64_encode_w, 1);
+    base64_decode = hexa_fn_new((void*)_bt73_base64_decode_w, 1);
+    _fn_shims_ready = 1;
+}
 
 /* ═══════════════════════════════════════════════════════════════════
  * T3 HOT KERNEL INCLUDE — anima training inner-loop fast path.
