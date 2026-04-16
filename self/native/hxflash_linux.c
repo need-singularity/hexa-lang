@@ -283,13 +283,297 @@ int64_t hxflash_attn_fwd_packed(int64_t args_p) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// hxflash_attn_bwd — tiled backward pass (Dao 2022)
+//
+// Gradient formulae per row i:
+//   D_i    = <dO_i, O_i>
+//   P_ij   = exp(Q_i·K_j·scale − m_i) / l_i   (recomputed)
+//   dS_ij  = P_ij · (<dO_i, V_j> − D_i)
+//   dQ_i  += sum_j dS_ij · K_j · scale
+//   dK_j  += sum_i dS_ij · Q_i · scale
+//   dV_j  += sum_i P_ij  · dO_i
+//
+// Two sweeps per query block:
+//   Sweep 1: forward stats (m, l, O) via online softmax
+//   Sweep 2: recompute P, accumulate dQ/dK/dV
+//
+// Memory: O(Br*Bc + Br*D) scratch — no S^2 materialisation.
+// ─────────────────────────────────────────────────────────────
+
+typedef struct HxFlashBwdArgs {
+    int64_t S, D;
+    int64_t n_heads, n_kv_heads;
+    int64_t Br, Bc;
+    int64_t causal;
+    int64_t q_p, k_p, v_p, o_p;   // saved fwd output O
+    int64_t dO_p;                   // grad of output
+    int64_t dQ_p, dK_p, dV_p;      // output grad buffers
+    double  scale;
+    int64_t reserved0;
+} HxFlashBwdArgs;
+
+// HxFlashBwdArgs field offsets (bytes) — must match hexa side:
+//   0:S  8:D  16:n_heads  24:n_kv_heads  32:Br  40:Bc  48:causal
+//  56:q_p  64:k_p  72:v_p  80:o_p  88:dO_p
+//  96:dQ_p  104:dK_p  112:dV_p  120:scale  128:reserved0
+// total = 136 bytes
+
+static void hxflash_attn_bwd(int64_t S, int64_t D,
+                              int64_t n_heads, int64_t n_kv_heads,
+                              int64_t Br, int64_t Bc, int64_t causal,
+                              const float* Qp, const float* Kp,
+                              const float* Vp, const float* Op,
+                              const float* dOp,
+                              float* dQp, float* dKp, float* dVp,
+                              float scale_f) {
+    const float NEG_INF = -1.0e30f;
+
+    if (S <= 0 || D <= 0 || n_heads <= 0 || n_kv_heads <= 0) return;
+    if (Br <= 0) Br = 64;
+    if (Bc <= 0) Bc = 64;
+    if (Br > S)  Br = S;
+    if (Bc > S)  Bc = S;
+
+    const int64_t group = n_heads / n_kv_heads;
+    const int64_t q_head_stride  = S * D;
+    const int64_t kv_head_stride = S * D;
+
+    const int64_t nr = (S + Br - 1) / Br;
+    const int64_t nc = (S + Bc - 1) / Bc;
+
+    // Scratch per query block:
+    //   S_tile[Br*Bc] + row_m[Br] + row_l[Br] + O_block[Br*D]
+    //   + p_row[Bc] + row_D[Br] + dQ_block[Br*D]
+    size_t scratch_sz = (size_t)Br * (size_t)Bc   // S_tile
+                      + (size_t)Br                  // row_m
+                      + (size_t)Br                  // row_l
+                      + (size_t)Br * (size_t)D      // O_block
+                      + (size_t)Bc                  // p_row
+                      + (size_t)Br                  // row_D
+                      + (size_t)Br * (size_t)D;     // dQ_block
+    float* scratch = (float*)malloc(sizeof(float) * scratch_sz);
+    if (!scratch) return;
+
+    float* S_tile   = scratch;
+    float* row_m    = S_tile   + (size_t)Br * (size_t)Bc;
+    float* row_l    = row_m    + (size_t)Br;
+    float* O_block  = row_l    + (size_t)Br;
+    float* p_row    = O_block  + (size_t)Br * (size_t)D;
+    float* row_D    = p_row    + (size_t)Bc;
+    float* dQ_block = row_D    + (size_t)Br;
+
+    // Zero output grads (caller may not have zeroed them)
+    memset(dQp, 0, (size_t)n_heads    * (size_t)S * (size_t)D * sizeof(float));
+    memset(dKp, 0, (size_t)n_kv_heads * (size_t)S * (size_t)D * sizeof(float));
+    memset(dVp, 0, (size_t)n_kv_heads * (size_t)S * (size_t)D * sizeof(float));
+
+    for (int64_t h = 0; h < n_heads; h++) {
+        const int64_t kv_h    = (group > 0) ? (h / group) : h;
+        const int64_t base_q  = h    * q_head_stride;
+        const int64_t base_kv = kv_h * kv_head_stride;
+
+        for (int64_t bq = 0; bq < nr; bq++) {
+            const int64_t q_start = bq * Br;
+            const int64_t q_end   = hxf_mini(q_start + Br, S);
+            const int64_t rows    = q_end - q_start;
+
+            // ── Sweep 1: forward stats (m, l, O) via online softmax ──
+            for (int64_t qi = 0; qi < rows; qi++) {
+                row_m[qi] = NEG_INF;
+                row_l[qi] = 0.0f;
+            }
+            memset(O_block, 0, (size_t)rows * (size_t)D * sizeof(float));
+
+            for (int64_t bkv = 0; bkv < nc; bkv++) {
+                const int64_t kv_start = bkv * Bc;
+                const int64_t kv_end   = hxf_mini(kv_start + Bc, S);
+                const int64_t cols     = kv_end - kv_start;
+
+                for (int64_t qi = 0; qi < rows; qi++) {
+                    const int64_t gq = q_start + qi;
+                    const float* qrow = Qp + base_q + gq * D;
+                    for (int64_t kj = 0; kj < cols; kj++) {
+                        const int64_t gk = kv_start + kj;
+                        if (causal && gk > gq) {
+                            S_tile[qi * Bc + kj] = NEG_INF;
+                        } else {
+                            const float* krow = Kp + base_kv + gk * D;
+                            float dot = 0.0f;
+                            for (int64_t k = 0; k < D; k++)
+                                dot += qrow[k] * krow[k];
+                            S_tile[qi * Bc + kj] = dot * scale_f;
+                        }
+                    }
+                }
+
+                for (int64_t qi = 0; qi < rows; qi++) {
+                    if (causal) {
+                        int all_masked = 1;
+                        for (int64_t kj = 0; kj < cols; kj++) {
+                            if (S_tile[qi * Bc + kj] > -1.0e29f) {
+                                all_masked = 0; break;
+                            }
+                        }
+                        if (all_masked) continue;
+                    }
+
+                    float tile_max = S_tile[qi * Bc];
+                    for (int64_t kj = 1; kj < cols; kj++) {
+                        float v = S_tile[qi * Bc + kj];
+                        if (v > tile_max) tile_max = v;
+                    }
+
+                    const float m_old = row_m[qi];
+                    const float m_new = hxf_maxf(m_old, tile_max);
+                    const float alpha = expf(m_old - m_new);
+
+                    float tile_sum = 0.0f;
+                    for (int64_t kj = 0; kj < cols; kj++) {
+                        float p = expf(S_tile[qi * Bc + kj] - m_new);
+                        p_row[kj] = p;
+                        tile_sum += p;
+                    }
+
+                    const float l_new = row_l[qi] * alpha + tile_sum;
+                    float* obrow = O_block + (size_t)qi * (size_t)D;
+                    for (int64_t k = 0; k < D; k++) obrow[k] *= alpha;
+
+                    for (int64_t kj = 0; kj < cols; kj++) {
+                        const int64_t gk = kv_start + kj;
+                        const float p = p_row[kj];
+                        const float* vrow = Vp + base_kv + gk * D;
+                        for (int64_t k = 0; k < D; k++)
+                            obrow[k] += p * vrow[k];
+                    }
+                    row_m[qi] = m_new;
+                    row_l[qi] = l_new;
+                }
+            }
+
+            // Normalise O_block
+            for (int64_t qi = 0; qi < rows; qi++) {
+                const float inv_l = (row_l[qi] > 0.0f) ? (1.0f / row_l[qi]) : 0.0f;
+                float* obrow = O_block + (size_t)qi * (size_t)D;
+                for (int64_t k = 0; k < D; k++)
+                    obrow[k] *= inv_l;
+            }
+
+            // ── D_i = <dO_i, O_i> ──
+            for (int64_t qi = 0; qi < rows; qi++) {
+                const int64_t gq = q_start + qi;
+                const float* do_row = dOp + base_q + gq * D;
+                const float* ob_row = O_block + (size_t)qi * (size_t)D;
+                float s = 0.0f;
+                for (int64_t k = 0; k < D; k++)
+                    s += do_row[k] * ob_row[k];
+                row_D[qi] = s;
+            }
+
+            // ── Sweep 2: recompute P per tile, accumulate dQ/dK/dV ──
+            memset(dQ_block, 0, (size_t)rows * (size_t)D * sizeof(float));
+
+            for (int64_t bkv = 0; bkv < nc; bkv++) {
+                const int64_t kv_start = bkv * Bc;
+                const int64_t kv_end   = hxf_mini(kv_start + Bc, S);
+                const int64_t cols     = kv_end - kv_start;
+
+                for (int64_t qi = 0; qi < rows; qi++) {
+                    const int64_t gq = q_start + qi;
+                    const float* qrow = Qp + base_q + gq * D;
+                    const float inv_l = (row_l[qi] > 0.0f) ? (1.0f / row_l[qi]) : 0.0f;
+                    const float m_i = row_m[qi];
+                    const float D_i = row_D[qi];
+                    const float* do_row = dOp + base_q + gq * D;
+                    float* dq_row = dQ_block + (size_t)qi * (size_t)D;
+
+                    for (int64_t kj = 0; kj < cols; kj++) {
+                        const int64_t gk = kv_start + kj;
+
+                        // Recompute P_ij
+                        float P_ij;
+                        if (causal && gk > gq) {
+                            P_ij = 0.0f;
+                        } else {
+                            const float* krow = Kp + base_kv + gk * D;
+                            float dot = 0.0f;
+                            for (int64_t k = 0; k < D; k++)
+                                dot += qrow[k] * krow[k];
+                            P_ij = expf(dot * scale_f - m_i) * inv_l;
+                        }
+
+                        if (P_ij == 0.0f) continue;
+
+                        // dP_ij = <dO_i, V_j>
+                        const float* vrow = Vp + base_kv + gk * D;
+                        float dP_ij = 0.0f;
+                        for (int64_t k = 0; k < D; k++)
+                            dP_ij += do_row[k] * vrow[k];
+
+                        // dS_ij = P_ij * (dP_ij - D_i)
+                        const float dS_ij = P_ij * (dP_ij - D_i);
+                        const float w = dS_ij * scale_f;
+
+                        // dQ_i += w * K_j
+                        const float* krow2 = Kp + base_kv + gk * D;
+                        for (int64_t k = 0; k < D; k++)
+                            dq_row[k] += w * krow2[k];
+
+                        // dK_j += w * Q_i  (accumulate into shared dK buffer)
+                        float* dk_row = dKp + base_kv + gk * D;
+                        for (int64_t k = 0; k < D; k++)
+                            dk_row[k] += w * qrow[k];
+
+                        // dV_j += P_ij * dO_i
+                        float* dv_row = dVp + base_kv + gk * D;
+                        for (int64_t k = 0; k < D; k++)
+                            dv_row[k] += P_ij * do_row[k];
+                    }
+                }
+            }
+
+            // Write dQ_block back to dQ
+            for (int64_t qi = 0; qi < rows; qi++) {
+                const int64_t gq = q_start + qi;
+                float* dq_out = dQp + base_q + gq * D;
+                const float* dq_src = dQ_block + (size_t)qi * (size_t)D;
+                for (int64_t k = 0; k < D; k++)
+                    dq_out[k] += dq_src[k];
+            }
+        }
+    }
+
+    free(scratch);
+}
+
+// Struct-args packed entry point for backward.
+// Returns: 0 on success, -1 on null args.
+int64_t hxflash_attn_bwd_packed(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxFlashBwdArgs* a = (HxFlashBwdArgs*)(uintptr_t)args_p;
+    hxflash_attn_bwd(a->S, a->D,
+                     a->n_heads, a->n_kv_heads,
+                     a->Br, a->Bc, a->causal,
+                     (const float*)(uintptr_t)a->q_p,
+                     (const float*)(uintptr_t)a->k_p,
+                     (const float*)(uintptr_t)a->v_p,
+                     (const float*)(uintptr_t)a->o_p,
+                     (const float*)(uintptr_t)a->dO_p,
+                     (float*)(uintptr_t)a->dQ_p,
+                     (float*)(uintptr_t)a->dK_p,
+                     (float*)(uintptr_t)a->dV_p,
+                     (float)a->scale);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
 // ABI version probe — matches hxblas_version / hxvdsp_version /
 // hxlayer_version style. Start at 1; bump on any breaking signature
 // change (e.g. Day-2 causal fast path, backward pass, dtype fan-out).
 // v2 adds hxflash_attn_fwd_packed (struct-args ABI).
+// v3 adds hxflash_attn_bwd_packed (backward pass).
 // ─────────────────────────────────────────────────────────────
 int64_t hxflash_version(void) {
-    return 2;
+    return 3;
 }
 
 #endif /* __linux__ */

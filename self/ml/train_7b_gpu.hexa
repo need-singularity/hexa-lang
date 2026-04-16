@@ -1,0 +1,271 @@
+// ═══════════════════════════════════════════════════════════════
+//  train_7b_gpu.hexa — 7B CLM training on H100 via fused kernels
+//
+//  Target: CLM MFU 0.02% → 10%+, step time 1000ms → 5ms
+//
+//  Pipeline (all GPU-resident, no CPU roundtrip during step):
+//    1. init: CUDA + NVRTC kernels + fused AdamW
+//    2. init: 7B weights on GPU (GpuWeights)
+//    3. init: AdamW m1/m2 state on GPU
+//    4. optional: CUDA graph capture for fixed-shape replay
+//    5. loop:
+//       a. synthetic tokens → GPU (H2D, SEQ ints only)
+//       b. gpu_forward_full_fused (embed → NL×fused_layer → lm_head)
+//       c. gpu_backward_full_with_embed_fused (CE loss → full backprop)
+//       d. gpu_adamw_step (fused CUDA kernel, one pass per tensor)
+//       e. D2H: loss scalar only
+//       f. log every N steps
+//
+//  Memory budget (H100 80GB, f32):
+//    Weights:    7B × 4B = 28GB
+//    Grads:      7B × 4B = 28GB
+//    AdamW m+v:  7B × 8B = 56GB  ← exceeds 80GB!
+//    → Use 7b_mini (3.5B, NL=16) for single GPU
+//    → Full 7B requires FSDP (session B, hxccl)
+//
+//  For full 7B single-GPU: grad checkpointing (C10) + bf16 weights
+//  halves the budget to ~42GB. Session B will enable this.
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "cuda_rtc"
+use "cuda_kernels"
+use "gpu_train"
+
+// ── Training hyperparameters ─────────────────────────────────
+let LR_PEAK       = 3.0e-4
+let LR_MIN        = 3.0e-5
+let WARMUP_STEPS  = 200
+let TRAIN_STEPS   = 5000
+let LOG_INTERVAL  = 10
+let CKPT_INTERVAL = 500
+let BETA1         = 0.9
+let BETA2         = 0.999
+let EPS           = 0.00000001
+let WD            = 0.01
+
+// ── Cosine LR schedule ──────────────────────────────────────
+fn lr_schedule(step: int) -> float {
+    if step < WARMUP_STEPS {
+        return LR_PEAK * (step * 1.0 / (WARMUP_STEPS * 1.0))
+    }
+    let progress = ((step - WARMUP_STEPS) * 1.0) / ((TRAIN_STEPS - WARMUP_STEPS) * 1.0)
+    let cosine = 0.5 * (1.0 + cos(progress * 3.14159265))
+    return LR_MIN + (LR_PEAK - LR_MIN) * cosine
+}
+
+// ── Synthetic data generator ─────────────────────────────────
+// Generates random token IDs for training. Real data loading
+// will be added when hexa-native data pipeline replaces Python.
+fn make_train_batch(seq: int, vocab: int) {
+    let mut toks = []
+    let mut tgts = []
+    let mut i = 0
+    while i < seq {
+        let tok = int(random() * vocab) % vocab
+        toks = toks.push(tok)
+        i = i + 1
+    }
+    // Next-token prediction targets (shifted by 1)
+    i = 0
+    while i < seq {
+        if i < seq - 1 {
+            tgts = tgts.push(toks[(i + 1)])
+        } else {
+            tgts = tgts.push(int(random() * vocab) % vocab)
+        }
+        i = i + 1
+    }
+    [toks, tgts]
+}
+
+// ── Upload token arrays to GPU ───────────────────────────────
+fn upload_tokens(toks, n: int) {
+    let host_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_i32(host_buf, i * 4, toks[i])
+        i = i + 1
+    }
+    let dev = gpu_zeros(n)
+    let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+// ── Memory estimation ────────────────────────────────────────
+fn estimate_memory_gb(cfg: GpuClmConfig) -> float {
+    let D  = cfg.D
+    let FF = cfg.FF
+    let NL = cfg.NL
+    let V  = cfg.VOCAB
+    let R  = cfg.RANK
+    let S  = cfg.SEQ
+
+    // Weights: embed + NL×(4×D² + 2×D×FF + 2×D) + lmh_U + lmh_V
+    let w_embed = V * D
+    let w_layer = 4 * D * D + 2 * D * FF + 2 * D
+    let w_lmh   = D * R + R * V
+    let w_total = w_embed + NL * w_layer + w_lmh
+
+    // Grads: same as weights
+    let g_total = w_total
+
+    // AdamW: 2× weights (m1 + m2)
+    let a_total = 2 * w_total
+
+    // Activations per layer: norm1[S×D] + q/k/v[S×D] + probs[S×S] +
+    //   ctx/attn_out/mid/norm2[S×D] + up/act[S×FF] + ffn_out/y[S×D] + rstd[S×2]
+    let act_layer = 10 * S * D + S * S + 2 * S * FF + 2 * S
+    let act_total = NL * act_layer + S * D + S * R + S * V
+
+    let total_f32 = w_total + g_total + a_total + act_total
+    let gb = (total_f32 * 4.0) / (1024.0 * 1024.0 * 1024.0)
+    gb
+}
+
+// ── Main training function ───────────────────────────────────
+fn train_7b() {
+    println("=" * 60)
+    println("  7B CLM Training — Pure Hexa + CUDA Fused Kernels")
+    println("  Target: H100 80GB, MFU 10%+")
+    println("=" * 60)
+
+    // 1. Pick config based on available memory
+    //    Default: 7b_mini (fits single H100)
+    //    Override: set USE_FULL_7B=1 for FSDP multi-GPU
+    let cfg = gpu_clm_config_7b_mini()
+    let mem_gb = estimate_memory_gb(cfg)
+    println("[train] config: D=" + str(cfg.D) + " FF=" + str(cfg.FF) + " NL=" + str(cfg.NL) + " VOCAB=" + str(cfg.VOCAB) + " SEQ=" + str(cfg.SEQ) + " RANK=" + str(cfg.RANK))
+    println("[train] estimated memory: " + str(mem_gb) + " GB")
+
+    if mem_gb > 76.0 {
+        println("[FATAL] estimated " + str(mem_gb) + " GB exceeds H100 80GB budget")
+        println("[HINT] use gpu_clm_config_7b_mini() or enable FSDP (hxccl)")
+        return -1
+    }
+
+    // 2. Initialize CUDA + NVRTC kernels
+    let cuda_err = cuda_init()
+    if cuda_err != 0 {
+        println("[FATAL] CUDA init failed: " + str(cuda_err))
+        return -1
+    }
+    let _ = cuda_mem_info()
+
+    let kern_err = gpu_init_kernels()
+    if kern_err != 0 {
+        println("[FATAL] NVRTC kernel compile failed: " + str(kern_err))
+        return -1
+    }
+
+    let adamw_err = gpu_adamw_init_kernel()
+    if adamw_err != 0 {
+        println("[FATAL] AdamW kernel compile failed: " + str(adamw_err))
+        return -1
+    }
+
+    // 3. Initialize weights
+    println("[train] initializing weights...")
+    let weights = init_gpu_weights(cfg, 42)
+    let _ = cuda_mem_info()
+
+    // 4. Allocate forward/backward buffers
+    println("[train] allocating activation buffers...")
+    let acts = alloc_fwd_buffers(cfg, cfg.SEQ)
+    let grad = alloc_grad_buffers(cfg)
+    println("[train] allocating AdamW state...")
+    let adamw = alloc_adamw_state(cfg)
+    let _ = cuda_mem_info()
+
+    // 5. MFU calculation constants
+    //    H100 SXM: 989.5 TFLOPS bf16 (we're f32 → 495 TFLOPS peak)
+    //    Per step FLOPs ≈ 6 × params × seq (fwd+bwd)
+    let param_count = cfg.VOCAB * cfg.D + cfg.NL * (4 * cfg.D * cfg.D + 2 * cfg.D * cfg.FF) + cfg.D * cfg.RANK + cfg.RANK * cfg.VOCAB
+    let flops_per_step = 6.0 * param_count * cfg.SEQ
+    let peak_tflops = 495.0
+    println("[train] params=" + str(param_count) + " flops/step=" + str(flops_per_step))
+
+    // 6. Training loop — fused path
+    println("")
+    println("[train] starting " + str(TRAIN_STEPS) + " steps")
+    println("-" * 60)
+
+    let mut total_ms = 0.0
+    let mut total_loss = 0.0
+    let mut best_loss = 999.0
+    let mut step = 1
+
+    while step <= TRAIN_STEPS {
+        let t0 = clock()
+
+        // a. Generate and upload batch
+        let batch = make_train_batch(cfg.SEQ, cfg.VOCAB)
+        let toks_dev = upload_tokens(batch[0], cfg.SEQ)
+        let tgts_dev = upload_tokens(batch[1], cfg.SEQ)
+
+        // b. Zero gradients
+        let _ = gpu_zero_grad(grad, cfg)
+
+        // c. Forward (fused)
+        let logits = gpu_forward_full_fused(toks_dev, weights, acts, cfg)
+
+        // d. Backward (fused, with embed grad) — returns scalar loss
+        let loss = gpu_backward_full_with_embed_fused(logits, tgts_dev, toks_dev, acts, weights, grad, cfg)
+        let _ = cuda_sync()
+
+        // e. AdamW step (fused CUDA kernel)
+        let lr = lr_schedule(step)
+        let _ = gpu_adamw_step(weights, grad, adamw, step, lr, BETA1, BETA2, EPS, WD)
+        let _ = cuda_sync()
+
+        let t1 = clock()
+        let ms = (t1 - t0) * 1000.0
+        total_ms = total_ms + ms
+        total_loss = total_loss + loss
+
+        if loss < best_loss { best_loss = loss }
+
+        // g. Log
+        if step % LOG_INTERVAL == 0 {
+            let avg_ms = total_ms / (step * 1.0)
+            let mfu = (flops_per_step / (avg_ms / 1000.0)) / (peak_tflops * 1000000000000.0) * 100.0
+            println("step=" + str(step) + " loss=" + str(loss) + " lr=" + str(lr) + " ms=" + str(ms) + " avg_ms=" + str(avg_ms) + " mfu=" + str(mfu) + "%")
+        }
+
+        // h. Checkpoint
+        if step % CKPT_INTERVAL == 0 {
+            let ckpt_path = "checkpoints/7b_step_" + str(step) + ".hexackpt"
+            println("[train] saving checkpoint: " + ckpt_path)
+            let _ = save_checkpoint_gpu(weights, cfg, ckpt_path)
+        }
+
+        // i. Free batch device memory
+        cuda_free(toks_dev)
+        cuda_free(tgts_dev)
+
+        step = step + 1
+    }
+
+    // 7. Summary
+    println("")
+    println("=" * 60)
+    println("  7B Training Complete")
+    println("  Steps:       " + str(TRAIN_STEPS))
+    println("  Total time:  " + str(total_ms / 1000.0) + " s")
+    println("  Avg ms/step: " + str(total_ms / (TRAIN_STEPS * 1.0)))
+    println("  Best loss:   " + str(best_loss))
+    println("  Params:      " + str(param_count))
+    let final_mfu = (flops_per_step / ((total_ms / (TRAIN_STEPS * 1.0)) / 1000.0)) / (peak_tflops * 1000000000000.0) * 100.0
+    println("  MFU:         " + str(final_mfu) + "%")
+    println("=" * 60)
+
+    // 8. Cleanup
+    let _ = free_gpu_weights(weights)
+    let _ = free_adamw_state(adamw)
+    let _ = cuda_shutdown()
+    0
+}
+
+// ── Entry point ──────────────────────────────────────────────
+let _ = train_7b()

@@ -1,0 +1,193 @@
+// ═══════════════════════════════════════════════════════════════
+//  bench/grad_checkpoint_7b.hexa — 7B transformer shape gradient
+//  checkpointing benchmark.
+//
+//  Config: d=4096, 32 layers, FFN 4x expansion (d→4d→d)
+//  Segment sweep: [1, 2, 4, 8, 16, 32]
+//  Measures: peak activation memory, forward time, backward time,
+//            memory savings %, optimal segment size
+//  batch_size=1 (CPU-friendly for verification)
+//
+//  Uses GCLayer (dense d→d) as proxy for transformer block weights.
+//  For real 7B shapes the activation cost per layer is dominated by
+//  the activation tensor (1×d), not the weights themselves.
+//
+//  Memory model:
+//    Plain:  (N+1) * d activations stored
+//    Ckpt:   (ceil(N/seg) + 1) * d activations stored
+//    Savings = 1 - ckpt/plain
+//
+//  For N=32, d=4096:
+//    seg=1:  33*4096 = 135168 (boundaries = layers, no savings)
+//    seg=2:  (16+1)*4096 = 69632  → 48.5% savings
+//    seg=4:  (8+1)*4096  = 36864  → 72.7%
+//    seg=8:  (4+1)*4096  = 20480  → 84.8%
+//    seg=16: (2+1)*4096  = 12288  → 90.9%
+//    seg=32: (1+1)*4096  = 8192   → 93.9%
+// ═══════════════════════════════════════════════════════════════
+
+import "self/ml/grad_checkpoint.hexa"
+
+let D = 4096
+let LAYERS = 32
+let BATCH = 1
+let SEED = 7777
+
+// Segment sizes to sweep
+let SEGS = [1, 2, 4, 8, 16, 32]
+
+fn elapsed_since(s0) {
+    let s1 = clock()
+    return s1 - s0
+}
+
+fn abs_float(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ── Build shared model weights (one set, different seg_size) ──
+println("=== grad_checkpoint 7B-shape benchmark ===")
+println("d=" + str(D) + " layers=" + str(LAYERS) + " batch=" + str(BATCH))
+println("")
+
+// Pre-generate weights once (expensive at d=4096)
+println("[1/4] Generating weights d=" + str(D) + " x " + str(LAYERS) + " layers ...")
+let t_init = clock()
+
+let mut layer_weights = []
+let mut li = 0
+while li < LAYERS {
+    let W = gc_init_weights(D, D, SEED + li * 7919)
+    let b = gc_init_bias(D)
+    layer_weights.push([W, b])
+    li = li + 1
+}
+
+let input = gc_make_input(D, 42)
+let init_ms = elapsed_since(t_init)
+println("  init time: " + str(init_ms) + " s")
+println("")
+
+// ── Build model with given seg_size using shared weights ─────
+fn build_model(layer_ws, seg_size, d) {
+    let mut layers = []
+    let mut i = 0
+    let n = len(layer_ws)
+    while i < n {
+        let lw = layer_ws[i]
+        layers.push(gc_make_layer(lw[0], lw[1], d, d))
+        i = i + 1
+    }
+    return gc_make_model(layers, seg_size)
+}
+
+// ── Plain baseline ──────────────────────────────────────────
+println("[2/4] Plain forward baseline ...")
+let model_plain = build_model(layer_weights, LAYERS, D)  // seg >= layers = no ckpt
+let t_fwd_plain = clock()
+let acts_plain = gc_forward_plain(model_plain, input)
+let fwd_plain_s = elapsed_since(t_fwd_plain)
+let peak_plain = gc_peak_activations_plain(acts_plain)
+
+println("  plain forward: " + str(fwd_plain_s) + " s")
+println("  plain peak activations: " + str(peak_plain) + " floats (" + str(peak_plain * 8 / 1024 / 1024) + " MB @ f64)")
+println("")
+
+// ── Plain backward ──────────────────────────────────────────
+println("[3/4] Plain backward baseline ...")
+let grad_out_plain = gc_make_input(D, 999)
+let t_bw_plain = clock()
+let bw_plain = gc_backward_plain(model_plain, acts_plain, grad_out_plain)
+let bw_plain_s = elapsed_since(t_bw_plain)
+println("  plain backward: " + str(bw_plain_s) + " s")
+println("")
+
+// ── Segment sweep ───────────────────────────────────────────
+println("[4/4] Segment sweep ...")
+println("")
+println("seg  | peak_acts    | savings%  | fwd_s      | bw_s       | total_s    | overhead%")
+println("---- | ------------ | --------- | ---------- | ---------- | ---------- | ---------")
+
+let mut best_seg = 1
+let mut best_score = 0.0   // score = savings% / (1 + overhead%)
+let plain_total = fwd_plain_s + bw_plain_s
+
+let mut si = 0
+while si < len(SEGS) {
+    let seg = SEGS[si]
+
+    let model_ckpt = build_model(layer_weights, seg, D)
+
+    // Forward (checkpointed)
+    let t_fwd = clock()
+    let fwd_ckpt = gc_forward(model_ckpt, input)
+    let fwd_s = elapsed_since(t_fwd)
+
+    let peak_ckpt = gc_peak_activations(fwd_ckpt)
+    let savings = gc_savings_ratio(peak_ckpt, peak_plain)
+    let savings_pct = to_int(savings * 1000.0) / 10  // one decimal via int
+
+    // Backward (checkpointed)
+    let grad_out_ckpt = gc_make_input(D, 999)
+    let t_bw = clock()
+    let bw_ckpt = gc_backward(model_ckpt, fwd_ckpt, grad_out_ckpt)
+    let bw_s = elapsed_since(t_bw)
+
+    let total_s = fwd_s + bw_s
+    let mut overhead_pct = 0
+    if plain_total > 0.0 {
+        overhead_pct = to_int((total_s / plain_total - 1.0) * 100.0)
+    }
+
+    // Verify output matches plain
+    let mut max_diff = 0.0
+    let mut di = 0
+    while di < D {
+        let d_val = abs_float(fwd_ckpt.final_out[di] - acts_plain[len(acts_plain) - 1][di])
+        if d_val > max_diff { max_diff = d_val }
+        di = di + 1
+    }
+
+    let match_str = " (match: " + str(max_diff < 0.000001) + ")"
+
+    println(str(seg) + "    | " + str(peak_ckpt) + " | " + str(savings_pct)
+        + "% | " + str(fwd_s) + " | " + str(bw_s) + " | " + str(total_s)
+        + " | " + str(overhead_pct) + "%" + match_str)
+
+    // Score = savings / (1 + overhead_fraction) — higher is better
+    let overhead_frac = total_s / plain_total - 1.0
+    let mut score = savings / (1.0 + overhead_frac)
+    if score < 0.0 { score = 0.0 }
+    if score > best_score {
+        best_score = score
+        best_seg = seg
+    }
+
+    si = si + 1
+}
+
+println("")
+println("=== Optimal segment size: " + str(best_seg) + " (score=" + str(best_score) + ") ===")
+println("")
+
+// ── Memory budget analysis ──────────────────────────────────
+println("Memory budget analysis (7B proxy, d=" + str(D) + ", " + str(LAYERS) + " layers):")
+let plain_mb = to_float(peak_plain * 8) / (1024.0 * 1024.0)
+println("  Plain:  " + str(peak_plain) + " floats = " + str(plain_mb) + " MB @ f64")
+
+let mut si2 = 0
+while si2 < len(SEGS) {
+    let seg = SEGS[si2]
+    let num_segs = gc_num_segments(LAYERS, seg)
+    let ckpt_acts = (num_segs + 1) * D
+    let ckpt_mb = to_float(ckpt_acts * 8) / (1024.0 * 1024.0)
+    let sav = gc_savings_ratio(ckpt_acts, peak_plain)
+    let batch_scale = to_float(peak_plain) / to_float(ckpt_acts)
+    println("  seg=" + str(seg) + ": " + str(ckpt_acts) + " floats = " + str(ckpt_mb)
+        + " MB, savings=" + str(to_int(sav * 100.0)) + "%, batch_scale=" + str(batch_scale) + "x")
+    si2 = si2 + 1
+}
+
+println("")
+println("[bench grad_checkpoint_7b] done")

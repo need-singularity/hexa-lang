@@ -1052,6 +1052,10 @@ HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
 }
 
 HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
+    if (!HX_IS_ARRAY(arr)) {
+        fprintf(stderr, "array_set[%lld]: container is not an array (tag=%d)\n", (long long)idx, (int)HX_TAG(arr));
+        exit(1);
+    }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
         fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
@@ -1551,7 +1555,17 @@ HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
     if (HX_IS_MAP(container) && HX_IS_STR(key)) {
         return hexa_map_set(container, HX_STR(key), val);
     }
-    return hexa_array_set(container, HX_INT(key), val);
+    // 2026-04-17: unwrap VALSTRUCT same as hexa_index_get — without this,
+    // HX_INT reads raw .vs pointer as index → "index 105553... out of bounds"
+    int64_t idx;
+    if (HX_IS_VALSTRUCT(key) && HX_VS(key)) {
+        idx = (HX_VSF(key, tag_i) == TAG_INT)
+            ? HX_VSF(key, int_val)
+            : (int64_t)__hx_to_double(key);
+    } else {
+        idx = HX_INT(key);
+    }
+    return hexa_array_set(container, idx, val);
 }
 
 // Silent type check for struct method dispatch (codegen_c2 ImplBlock support).
@@ -2419,6 +2433,46 @@ HexaVal hexa_exec(HexaVal cmd) {
     }
     pclose(fp);
     return hexa_str_own(result);
+}
+
+// hexa_exec_with_status: like hexa_exec but returns [stdout_str, exit_code].
+// 2026-04-17: needed because the interpreter's exec_with_status dispatch in
+// hexa_full.hexa silently always returns exit=0 (popen output without
+// pclose status), letting build scripts roll forward stale binaries through
+// failed clang/cargo invocations. Codegen + dispatch wiring TBD — this
+// function is the C-runtime backstop ready when the interpreter learns to
+// call it via codegen lowering of `exec_with_status(cmd)`.
+HexaVal hexa_exec_with_status(HexaVal cmd) {
+    HexaVal arr = hexa_array_new();
+    if (!HX_IS_STR(cmd)) {
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    FILE* fp = popen(HX_STR(cmd), "r");
+    if (!fp) {
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    char buf[4096]; size_t total = 0;
+    char* result = (char*)malloc(4096); result[0] = '\0';
+    size_t cap = 4096;
+    while (fgets(buf, sizeof(buf), fp)) {
+        size_t len = strlen(buf);
+        while (total + len + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
+        memcpy(result + total, buf, len);
+        total += len;
+        result[total] = '\0';
+    }
+    int rc = pclose(fp);
+    int exit_code;
+    if (WIFEXITED(rc))      exit_code = WEXITSTATUS(rc);
+    else if (WIFSIGNALED(rc)) exit_code = 128 + WTERMSIG(rc);
+    else                     exit_code = -1;
+    arr = hexa_array_push(arr, hexa_str_own(result));
+    arr = hexa_array_push(arr, hexa_int(exit_code));
+    return arr;
 }
 
 // exec_replace — replace current process via execvp("/bin/sh", "-c", cmd).

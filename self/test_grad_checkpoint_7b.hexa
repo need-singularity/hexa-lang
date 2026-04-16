@@ -1,0 +1,320 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_grad_checkpoint_7b.hexa — 7B-shape correctness tests for
+//  gradient checkpointing.
+//
+//  Uses d=256 (scaled-down 7B proxy) with 32 layers for fast
+//  verification. Tests both dense GCLayer and GCTransformerBlock.
+//
+//  T1: 32-layer d=256 forward match (seg=1 vs plain)
+//  T2: Memory savings at 32 layers (seg=4 gives ~75% savings)
+//  T3: Numerical backward match at d=256, 32 layers
+//  T4: Segment sweep correctness (all outputs identical)
+//  T5: Attention-like quadratic layer (GCTransformerBlock)
+//  T6: Combined with gradient accumulation (micro-batches)
+// ═══════════════════════════════════════════════════════════════
+
+import "ml/grad_checkpoint.hexa"
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("  [PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("  [FAIL] " + label)
+    }
+}
+
+fn abs_float(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_abs_diff(a, b, n) {
+    let mut mx = 0.0
+    let mut i = 0
+    while i < n {
+        let d = abs_float(a[i] - b[i])
+        if d > mx { mx = d }
+        i = i + 1
+    }
+    return mx
+}
+
+fn vec_add(a, b, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] + b[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn vec_scale(a, s, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] * s)
+        i = i + 1
+    }
+    return out
+}
+
+// ── Config ──────────────────────────────────────────────────
+let D = 256
+let LAYERS = 32
+let SEED = 2024
+
+println("=== test_grad_checkpoint_7b (d=" + str(D) + ", layers=" + str(LAYERS) + ") ===")
+println("")
+
+// ── T1: 32-layer forward match (seg=1 vs plain) ────────────
+println("T1: 32-layer d=256 forward match (seg=1 vs plain)")
+let model_plain = gc_make_random_model(LAYERS, D, LAYERS, SEED)
+let model_seg1 = gc_make_random_model(LAYERS, D, 1, SEED)
+let input1 = gc_make_input(D, 42)
+
+let acts_plain = gc_forward_plain(model_plain, input1)
+let fwd_seg1 = gc_forward(model_seg1, input1)
+
+let out_plain = acts_plain[len(acts_plain) - 1]
+let out_seg1 = fwd_seg1.final_out
+let diff_t1 = max_abs_diff(out_plain, out_seg1, D)
+check("T1a forward output match (max diff < 1e-6): diff=" + str(diff_t1), diff_t1 < 0.000001)
+check("T1b output length correct", len(out_seg1) == D)
+check("T1c seg=1 boundaries == 32 (one per layer)", len(fwd_seg1.boundaries) == LAYERS)
+
+// ── T2: Memory savings at 32 layers (seg=4) ────────────────
+println("")
+println("T2: Memory savings at 32 layers (seg=4)")
+let model_seg4 = gc_make_random_model(LAYERS, D, 4, SEED)
+let fwd_seg4 = gc_forward(model_seg4, input1)
+let peak_plain = gc_peak_activations_plain(acts_plain)
+let peak_seg4 = gc_peak_activations(fwd_seg4)
+let savings_seg4 = gc_savings_ratio(peak_seg4, peak_plain)
+
+println("  plain_peak=" + str(peak_plain) + " ckpt_peak=" + str(peak_seg4)
+    + " savings=" + str(to_int(savings_seg4 * 100.0)) + "%")
+
+// plain = (32+1)*256 = 8448
+// seg=4: boundaries = ceil(32/4)+1 = 9 boundaries, peak = 9*256 + 256 = 2560
+// Expected savings: 1 - 2560/8448 ≈ 69.7% (boundaries include input + 7 seg starts)
+// Actually: boundaries = [input, seg1_start, seg2_start, ...seg7_start] = 8, plus final_out
+// gc_peak = sum(boundaries) + len(final_out) = 8*256 + 256 = 2304
+// savings = 1 - 2304/8448 ≈ 72.7%
+check("T2a ckpt_peak < plain_peak", peak_seg4 < peak_plain)
+check("T2b savings >= 70%", savings_seg4 >= 0.70)
+check("T2c savings >= 60% (conservative)", savings_seg4 >= 0.60)
+
+// Also check seg=8 for higher savings
+let model_seg8 = gc_make_random_model(LAYERS, D, 8, SEED)
+let fwd_seg8 = gc_forward(model_seg8, input1)
+let peak_seg8 = gc_peak_activations(fwd_seg8)
+let savings_seg8 = gc_savings_ratio(peak_seg8, peak_plain)
+println("  seg=8: peak=" + str(peak_seg8) + " savings=" + str(to_int(savings_seg8 * 100.0)) + "%")
+check("T2d seg=8 savings >= 80%", savings_seg8 >= 0.80)
+
+// ── T3: Numerical backward match at d=256, 32 layers ───────
+println("")
+println("T3: Backward match (ckpt vs plain, d=256, 32 layers)")
+let grad_out3 = gc_make_input(D, 999)
+
+let bw_plain = gc_backward_plain(model_plain, acts_plain, grad_out3)
+let bw_ckpt = gc_backward(model_seg4, fwd_seg4, grad_out3)
+
+let gi_plain = bw_plain[0]
+let gi_ckpt = bw_ckpt[0]
+let diff_gi = max_abs_diff(gi_plain, gi_ckpt, D)
+println("  grad_input max diff: " + str(diff_gi))
+check("T3a grad_input match (< 1e-4)", diff_gi < 0.0001)
+check("T3b grad_input length", len(gi_ckpt) == D)
+
+// Compare first layer dW
+let gp_dw0 = bw_plain[1][0][0]
+let gc_dw0 = bw_ckpt[1][0][0]
+let diff_dw0 = max_abs_diff(gp_dw0, gc_dw0, len(gp_dw0))
+println("  dW[0] max diff: " + str(diff_dw0))
+check("T3c dW[0] match (< 1e-4)", diff_dw0 < 0.0001)
+
+// Compare last layer db
+let last_idx = LAYERS - 1
+let gp_db_last = bw_plain[1][last_idx][1]
+let gc_db_last = bw_ckpt[1][last_idx][1]
+let diff_db_last = max_abs_diff(gp_db_last, gc_db_last, len(gp_db_last))
+println("  db[last] max diff: " + str(diff_db_last))
+check("T3d db[last] match (< 1e-4)", diff_db_last < 0.0001)
+
+// ── T4: Segment sweep — all outputs identical ───────────────
+println("")
+println("T4: Segment sweep correctness (seg in [1,2,4,8,16,32])")
+let seg_sizes = [1, 2, 4, 8, 16, 32]
+let reference_out = out_plain
+
+let mut si = 0
+let mut all_match = true
+while si < len(seg_sizes) {
+    let seg = seg_sizes[si]
+    let model_s = gc_make_random_model(LAYERS, D, seg, SEED)
+    let fwd_s = gc_forward(model_s, input1)
+    let diff_s = max_abs_diff(reference_out, fwd_s.final_out, D)
+    if diff_s >= 0.000001 {
+        println("  [FAIL] seg=" + str(seg) + " diff=" + str(diff_s))
+        all_match = false
+    }
+    si = si + 1
+}
+check("T4a all 6 segment sizes produce identical output", all_match)
+
+// Verify monotone savings increase
+let mut prev_savings = 0.0
+let mut monotone = true
+si = 0
+while si < len(seg_sizes) {
+    let seg = seg_sizes[si]
+    let model_s = gc_make_random_model(LAYERS, D, seg, SEED)
+    let fwd_s = gc_forward(model_s, input1)
+    let peak_s = gc_peak_activations(fwd_s)
+    let sav_s = gc_savings_ratio(peak_s, peak_plain)
+    if si > 0 {
+        if sav_s < prev_savings {
+            monotone = false
+            println("  [WARN] savings not monotone at seg=" + str(seg))
+        }
+    }
+    prev_savings = sav_s
+    si = si + 1
+}
+check("T4b savings monotone increasing with seg_size", monotone)
+
+// ── T5: Attention-like quadratic layer (GCTransformerBlock) ──
+println("")
+println("T5: GCTransformerBlock forward (d=32, 4 blocks)")
+let D5 = 32
+let N5 = 4
+let model_tf = gc_make_transformer_model(N5, D5, 2, 5555)
+let input5 = gc_make_input(D5, 77)
+
+// Plain vs checkpointed transformer forward
+let acts_tf_plain = gc_transformer_forward_plain(model_tf, input5)
+let fwd_tf_ckpt = gc_transformer_forward(model_tf, input5)
+
+let out_tf_plain = acts_tf_plain[len(acts_tf_plain) - 1]
+let out_tf_ckpt = fwd_tf_ckpt.final_out
+let diff_tf = max_abs_diff(out_tf_plain, out_tf_ckpt, D5)
+println("  transformer forward diff: " + str(diff_tf))
+check("T5a transformer forward match (< 1e-6)", diff_tf < 0.000001)
+check("T5b transformer output length", len(out_tf_ckpt) == D5)
+
+// Memory savings for transformer
+let peak_tf_plain = gc_transformer_peak_activations_plain(acts_tf_plain)
+let peak_tf_ckpt = gc_transformer_peak_activations(fwd_tf_ckpt)
+let savings_tf = gc_savings_ratio(peak_tf_ckpt, peak_tf_plain)
+println("  transformer peak: plain=" + str(peak_tf_plain) + " ckpt=" + str(peak_tf_ckpt)
+    + " savings=" + str(to_int(savings_tf * 100.0)) + "%")
+check("T5c transformer ckpt_peak < plain_peak", peak_tf_ckpt < peak_tf_plain)
+
+// Transformer backward match (plain vs ckpt)
+let grad_out_tf = gc_make_input(D5, 123)
+let bw_tf_plain = gc_transformer_backward_plain(model_tf, acts_tf_plain, grad_out_tf)
+let bw_tf_ckpt = gc_transformer_backward(model_tf, fwd_tf_ckpt, grad_out_tf)
+let diff_tf_bw = max_abs_diff(bw_tf_plain, bw_tf_ckpt, D5)
+println("  transformer backward grad_input diff: " + str(diff_tf_bw))
+check("T5d transformer backward match (< 1e-3)", diff_tf_bw < 0.001)
+
+// Different seg sizes all produce same output
+let fwd_tf_seg1 = gc_transformer_forward(gc_make_transformer_model(N5, D5, 1, 5555), input5)
+let fwd_tf_seg4 = gc_transformer_forward(gc_make_transformer_model(N5, D5, 4, 5555), input5)
+let diff_tf_segs = max_abs_diff(fwd_tf_seg1.final_out, fwd_tf_seg4.final_out, D5)
+check("T5e transformer seg=1 vs seg=4 identical", diff_tf_segs < 0.000001)
+
+// ── T6: Gradient accumulation (multiple micro-batches) ──────
+println("")
+println("T6: Gradient accumulation with 4 micro-batches")
+let D6 = 64
+let N6 = 8
+let model6 = gc_make_random_model(N6, D6, 4, 3333)
+let model6_plain = gc_make_random_model(N6, D6, N6, 3333)
+
+// 4 micro-batch inputs
+let mb0 = gc_make_input(D6, 100)
+let mb1 = gc_make_input(D6, 200)
+let mb2 = gc_make_input(D6, 300)
+let mb3 = gc_make_input(D6, 400)
+let micro_batches = [mb0, mb1, mb2, mb3]
+
+// Accumulate gradients (checkpointed)
+let mut accum_grad_ckpt = []
+let mut ai = 0
+while ai < D6 {
+    accum_grad_ckpt.push(0.0)
+    ai = ai + 1
+}
+
+let mut accum_dw0_ckpt = []
+ai = 0
+while ai < D6 * D6 {
+    accum_dw0_ckpt.push(0.0)
+    ai = ai + 1
+}
+
+let mut mi = 0
+while mi < 4 {
+    let mb = micro_batches[mi]
+    let fwd_mb = gc_forward(model6, mb)
+    let grad_mb = gc_make_input(D6, 500 + mi)
+    let bw_mb = gc_backward(model6, fwd_mb, grad_mb)
+    accum_grad_ckpt = vec_add(accum_grad_ckpt, bw_mb[0], D6)
+    accum_dw0_ckpt = vec_add(accum_dw0_ckpt, bw_mb[1][0][0], D6 * D6)
+    mi = mi + 1
+}
+
+// Accumulate gradients (plain)
+let mut accum_grad_plain = []
+ai = 0
+while ai < D6 {
+    accum_grad_plain.push(0.0)
+    ai = ai + 1
+}
+
+let mut accum_dw0_plain = []
+ai = 0
+while ai < D6 * D6 {
+    accum_dw0_plain.push(0.0)
+    ai = ai + 1
+}
+
+mi = 0
+while mi < 4 {
+    let mb = micro_batches[mi]
+    let acts_mb = gc_forward_plain(model6_plain, mb)
+    let grad_mb = gc_make_input(D6, 500 + mi)
+    let bw_mb = gc_backward_plain(model6_plain, acts_mb, grad_mb)
+    accum_grad_plain = vec_add(accum_grad_plain, bw_mb[0], D6)
+    accum_dw0_plain = vec_add(accum_dw0_plain, bw_mb[1][0][0], D6 * D6)
+    mi = mi + 1
+}
+
+let diff_accum_gi = max_abs_diff(accum_grad_ckpt, accum_grad_plain, D6)
+let diff_accum_dw = max_abs_diff(accum_dw0_ckpt, accum_dw0_plain, D6 * D6)
+println("  accumulated grad_input diff: " + str(diff_accum_gi))
+println("  accumulated dW[0] diff: " + str(diff_accum_dw))
+check("T6a accumulated grad_input match (< 1e-4)", diff_accum_gi < 0.0001)
+check("T6b accumulated dW[0] match (< 1e-4)", diff_accum_dw < 0.0001)
+
+// Verify 4x micro-batch accumulation == scaled single batch
+let avg_ckpt = vec_scale(accum_grad_ckpt, 0.25, D6)
+let single_fwd = gc_forward(model6, mb0)
+let single_bw = gc_backward(model6, single_fwd, gc_make_input(D6, 500))
+let single_gi = single_bw[0]
+// avg of 4 micro-batches should differ from single (different inputs)
+let diff_avg_single = max_abs_diff(avg_ckpt, single_gi, D6)
+check("T6c avg(4 micro-batches) != single batch (different inputs)", diff_avg_single > 0.0001)
+check("T6d accumulated grads are nonzero", abs_float(accum_grad_ckpt[0]) > 0.0)
+
+println("")
+println("---- test_grad_checkpoint_7b: PASS=" + str(PASS) + " FAIL=" + str(FAIL) + " ----")
+if FAIL > 0 { exit(1) }

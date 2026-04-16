@@ -1,6 +1,11 @@
 // ═══════════════════════════════════════════════════════════════════
 //  self/ml/fsdp.hexa — Fully Sharded Data Parallel (FSDP)
 //
+//  hxccl integration (2026-04-17):
+//    When USE_CCL = true, all_gather and reduce_scatter route through
+//    the hxccl C shim (self/native/hxccl_linux.c) via Family A API.
+//    Pure-hexa simulation is retained as fallback (USE_CCL = false).
+//
 //  Paper: "ZeRO: Memory Optimizations Toward Training Trillion
 //          Parameter Models", Rajbhandari et al. 2019
 //         "PyTorch FSDP: Experiences on Scaling Fully Sharded
@@ -69,6 +74,12 @@
 //    @pure  — no side effects
 //    @hot   — called every training step
 // ═══════════════════════════════════════════════════════════════════
+
+use "hxccl"
+
+// ── CCL toggle ─────────────────────────────────────────────────────
+// Set to false to fall back to pure-hexa simulation (single-process).
+let USE_CCL = true
 
 // ── Device constants ───────────────────────────────────────────────
 let FSDP_DEV_GPU = 0
@@ -226,11 +237,44 @@ fn fsdp_init(full_weights, num_ranks, cpu_offload, mixed_precision) {
 @hot
 fn fsdp_all_gather(state) {
     let n = state.num_ranks
+
+    // ── CCL path: use hxccl Family A all_gather ──────────────
+    if USE_CCL {
+        let my_rank = ccl_rank()
+        let shard = state.rank_shards[my_rank]
+        let shard_n = len(shard)
+        let total_n = shard_n * n
+
+        // Pack local shard into send buffer
+        let send_buf = alloc_raw(shard_n * 4)
+        for i in 0..shard_n {
+            write_f32(send_buf, i * 4, shard[i])
+        }
+
+        // Recv buffer holds world_size * shard_n floats
+        let recv_buf = alloc_raw(total_n * 4)
+        let _ = ccl_all_gather_f32(send_buf, recv_buf, shard_n)
+
+        // Barrier to ensure all ranks have finished
+        let _ = ccl_barrier()
+
+        // Unpack recv buffer into hexa list
+        let mut full = []
+        for i in 0..total_n {
+            full.push(deref_f32(recv_buf, i * 4))
+        }
+
+        free_raw(send_buf, shard_n * 4)
+        free_raw(recv_buf, total_n * 4)
+        return full
+    }
+
+    // ── Pure-hexa fallback (single-process simulation) ───────
     let mut full = []
     for k in 0..n {
         let shard = state.rank_shards[k]
         let sz = len(shard)
-        for j in 0..sz { full = full + [shard[j]] }
+        for j in 0..sz { full.push(shard[j]) }
     }
     return full
 }
@@ -252,6 +296,46 @@ fn fsdp_all_gather_fp16(state) {
 
 @hot
 fn fsdp_reduce_scatter(full_grads_per_rank, num_ranks, total_d) {
+    // ── CCL path: use hxccl Family A reduce_scatter ──────────
+    if USE_CCL {
+        let my_rank = ccl_rank()
+        let my_grads = full_grads_per_rank[my_rank]
+        let shard_n = fsdp_shard_size(total_d, num_ranks, my_rank)
+
+        // Pack this rank's full gradient into send buffer
+        let send_buf = alloc_raw(total_d * 4)
+        for i in 0..total_d {
+            write_f32(send_buf, i * 4, my_grads[i])
+        }
+
+        // Recv buffer: shard_n floats (reduced + scattered)
+        let recv_buf = alloc_raw(shard_n * 4)
+        let _ = ccl_reduce_scatter_f32(send_buf, recv_buf, shard_n)
+
+        // Barrier after reduce-scatter
+        let _ = ccl_barrier()
+
+        // Unpack into per-rank shard list (only this rank's shard is real;
+        // other ranks' shards are empty — each rank calls this independently)
+        let mut out = []
+        for k in 0..num_ranks {
+            if k == my_rank {
+                let mut local = []
+                for i in 0..shard_n {
+                    local.push(deref_f32(recv_buf, i * 4))
+                }
+                out.push(local)
+            } else {
+                out.push([])
+            }
+        }
+
+        free_raw(send_buf, total_d * 4)
+        free_raw(recv_buf, shard_n * 4)
+        return out
+    }
+
+    // ── Pure-hexa fallback (single-process simulation) ───────
     let mut out = []
     for k in 0..num_ranks {
         let beg = fsdp_shard_begin(total_d, num_ranks, k)
@@ -263,9 +347,9 @@ fn fsdp_reduce_scatter(full_grads_per_rank, num_ranks, total_d) {
                 let grad_r = full_grads_per_rank[r]
                 acc = acc + grad_r[i]
             }
-            local = local + [acc]
+            local.push(acc)
         }
-        out = out + [local]
+        out.push(local)
     }
     return out
 }
@@ -277,6 +361,8 @@ fn fsdp_reduce_scatter(full_grads_per_rank, num_ranks, total_d) {
 @hot
 fn fsdp_forward(state, input) {
     let full_w = fsdp_all_gather(state)
+    // Barrier after all-gather ensures all ranks see consistent weights
+    if USE_CCL { let _ = ccl_barrier() }
     let n = len(full_w)
     let m = len(input)
     let sz = if n < m { n } else { m }
@@ -331,6 +417,8 @@ fn fsdp_backward(state, input, grad_output) {
     }
 
     let shard_grads = fsdp_reduce_scatter(full_grads_per_rank, n, d)
+    // Barrier after reduce-scatter before optimizer step
+    if USE_CCL { let _ = ccl_barrier() }
     return shard_grads
 }
 
@@ -751,4 +839,4 @@ fn fsdp_flatten_shards(state) {
     return out
 }
 
-println("[fsdp] loaded — Fully Sharded Data Parallel (shard/all-gather/reduce-scatter/cpu-offload/mixed-precision/checkpoint/state-dict/reshard-policy/memory-estimator)")
+println("[fsdp] loaded — FSDP (hxccl=" + str(USE_CCL) + ") shard/all-gather/reduce-scatter/cpu-offload/mixed-precision/checkpoint/state-dict/reshard-policy/memory-estimator")

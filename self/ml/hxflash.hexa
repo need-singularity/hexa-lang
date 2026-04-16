@@ -63,6 +63,30 @@ extern fn hxflash_attn_fwd(S: int, D: int, n_heads: int, n_kv_heads: int,
 @link("hxflash")
 extern fn hxflash_attn_fwd_packed(args_p: *Void) -> int
 
+// Struct-args ABI for backward pass (v3).
+// HxFlashBwdArgs field layout (must match hxflash_linux.c):
+//   off  field         bytes
+//     0  S             8
+//     8  D             8
+//    16  n_heads       8
+//    24  n_kv_heads    8
+//    32  Br            8
+//    40  Bc            8
+//    48  causal        8
+//    56  q_p           8
+//    64  k_p           8
+//    72  v_p           8
+//    80  o_p           8   (saved forward output)
+//    88  dO_p          8   (grad of output)
+//    96  dQ_p          8   (output: grad Q)
+//   104  dK_p          8   (output: grad K)
+//   112  dV_p          8   (output: grad V)
+//   120  scale         8   (f64)
+//   128  reserved0     8
+//   --- total = 136 bytes
+@link("hxflash")
+extern fn hxflash_attn_bwd_packed(args_p: *Void) -> int
+
 @link("hxflash")
 extern fn hxflash_version() -> int
 
@@ -182,6 +206,159 @@ pub fn fused_flash_attention(Q, K, V, S, D, n_heads, n_kv_heads, Br, Bc, causal)
     free_raw(o_buf, o_bytes)
 
     return O
+}
+
+// ── HxFlashBwdArgs struct field offsets (bytes) ─────────────────
+let HXFLASH_BWD_OFF_S          = 0
+let HXFLASH_BWD_OFF_D          = 8
+let HXFLASH_BWD_OFF_NH         = 16
+let HXFLASH_BWD_OFF_NKV        = 24
+let HXFLASH_BWD_OFF_BR         = 32
+let HXFLASH_BWD_OFF_BC         = 40
+let HXFLASH_BWD_OFF_CAUSAL     = 48
+let HXFLASH_BWD_OFF_Q          = 56
+let HXFLASH_BWD_OFF_K          = 64
+let HXFLASH_BWD_OFF_V          = 72
+let HXFLASH_BWD_OFF_O          = 80
+let HXFLASH_BWD_OFF_DO         = 88
+let HXFLASH_BWD_OFF_DQ         = 96
+let HXFLASH_BWD_OFF_DK         = 104
+let HXFLASH_BWD_OFF_DV         = 112
+let HXFLASH_BWD_OFF_SCALE      = 120
+let HXFLASH_BWD_OFF_RESERVED0  = 128
+let HXFLASH_BWD_STRUCT_BYTES   = 136
+
+// ── flash_attn_bwd_packed — pack args + dispatch backward ───────
+// All pointer args are raw int64 addresses (output of alloc_raw).
+// dQ_p, dK_p, dV_p are OUTPUT buffers — kernel zeroes and fills them.
+// Returns: 0 on success, negative FFI error code on failure.
+pub fn flash_attn_bwd_packed(S, D, nh, nkv, Br, Bc, causal,
+                             q_p, k_p, v_p, o_p, dO_p,
+                             dQ_p, dK_p, dV_p, scale) {
+    let args = alloc_raw(HXFLASH_BWD_STRUCT_BYTES)
+
+    ptr_write(args, HXFLASH_BWD_OFF_S,         S)
+    ptr_write(args, HXFLASH_BWD_OFF_D,         D)
+    ptr_write(args, HXFLASH_BWD_OFF_NH,        nh)
+    ptr_write(args, HXFLASH_BWD_OFF_NKV,       nkv)
+    ptr_write(args, HXFLASH_BWD_OFF_BR,        Br)
+    ptr_write(args, HXFLASH_BWD_OFF_BC,        Bc)
+    ptr_write(args, HXFLASH_BWD_OFF_CAUSAL,    causal)
+    ptr_write(args, HXFLASH_BWD_OFF_Q,         q_p)
+    ptr_write(args, HXFLASH_BWD_OFF_K,         k_p)
+    ptr_write(args, HXFLASH_BWD_OFF_V,         v_p)
+    ptr_write(args, HXFLASH_BWD_OFF_O,         o_p)
+    ptr_write(args, HXFLASH_BWD_OFF_DO,        dO_p)
+    ptr_write(args, HXFLASH_BWD_OFF_DQ,        dQ_p)
+    ptr_write(args, HXFLASH_BWD_OFF_DK,        dK_p)
+    ptr_write(args, HXFLASH_BWD_OFF_DV,        dV_p)
+    ptr_write(args, HXFLASH_BWD_OFF_SCALE,     scale * 1.0)
+    ptr_write(args, HXFLASH_BWD_OFF_RESERVED0, 0)
+
+    let rc = hxflash_attn_bwd_packed(args)
+
+    free_raw(args, HXFLASH_BWD_STRUCT_BYTES)
+    return rc
+}
+
+// ── High-level backward wrapper (single-head) ──────────────────
+// Q, K, V, O, dO : [S][D] 2D nested arrays.
+// O is the saved forward output (needed for D_i computation).
+// Returns: [dQ, dK, dV] as [S][D] nested arrays.
+pub fn fused_flash_attention_bwd(Q, K, V, O, dO, S, D, n_heads, n_kv_heads, Br, Bc, causal) {
+    let q_bytes  = n_heads    * S * D * 4
+    let kv_bytes = n_kv_heads * S * D * 4
+
+    let q_buf  = alloc_raw(q_bytes)
+    let k_buf  = alloc_raw(kv_bytes)
+    let v_buf  = alloc_raw(kv_bytes)
+    let o_buf  = alloc_raw(q_bytes)
+    let dO_buf = alloc_raw(q_bytes)
+    let dQ_buf = alloc_raw(q_bytes)
+    let dK_buf = alloc_raw(kv_bytes)
+    let dV_buf = alloc_raw(kv_bytes)
+
+    hxflash_pack_2d(Q,  q_buf,  0, S, D)
+    hxflash_pack_2d(K,  k_buf,  0, S, D)
+    hxflash_pack_2d(V,  v_buf,  0, S, D)
+    hxflash_pack_2d(O,  o_buf,  0, S, D)
+    hxflash_pack_2d(dO, dO_buf, 0, S, D)
+
+    let scale = 1.0 / sqrt(D * 1.0)
+
+    flash_attn_bwd_packed(S, D, n_heads, n_kv_heads, Br, Bc, causal,
+                          q_buf, k_buf, v_buf, o_buf, dO_buf,
+                          dQ_buf, dK_buf, dV_buf, scale)
+
+    let dQ = hxflash_unpack_2d(dQ_buf, 0, S, D)
+    let dK = hxflash_unpack_2d(dK_buf, 0, S, D)
+    let dV = hxflash_unpack_2d(dV_buf, 0, S, D)
+
+    free_raw(q_buf,  q_bytes)
+    free_raw(k_buf,  kv_bytes)
+    free_raw(v_buf,  kv_bytes)
+    free_raw(o_buf,  q_bytes)
+    free_raw(dO_buf, q_bytes)
+    free_raw(dQ_buf, q_bytes)
+    free_raw(dK_buf, kv_bytes)
+    free_raw(dV_buf, kv_bytes)
+
+    return [dQ, dK, dV]
+}
+
+// ── Multi-head backward variant ─────────────────────────────────
+// Qh, Kh, Vh, Oh, dOh : lists of per-head [S][D] matrices.
+// Returns: [dQh, dKh, dVh] where each is a list of per-head [S][D].
+pub fn fused_flash_attention_bwd_mha(Qh, Kh, Vh, Oh, dOh,
+                                     S, D, n_heads, n_kv_heads, Br, Bc, causal) {
+    let q_bytes  = n_heads    * S * D * 4
+    let kv_bytes = n_kv_heads * S * D * 4
+
+    let q_buf  = alloc_raw(q_bytes)
+    let k_buf  = alloc_raw(kv_bytes)
+    let v_buf  = alloc_raw(kv_bytes)
+    let o_buf  = alloc_raw(q_bytes)
+    let dO_buf = alloc_raw(q_bytes)
+    let dQ_buf = alloc_raw(q_bytes)
+    let dK_buf = alloc_raw(kv_bytes)
+    let dV_buf = alloc_raw(kv_bytes)
+
+    for h in 0..n_heads {
+        hxflash_pack_2d(Qh[h],  q_buf,  h, S, D)
+        hxflash_pack_2d(Oh[h],  o_buf,  h, S, D)
+        hxflash_pack_2d(dOh[h], dO_buf, h, S, D)
+    }
+    for h in 0..n_kv_heads {
+        hxflash_pack_2d(Kh[h], k_buf, h, S, D)
+        hxflash_pack_2d(Vh[h], v_buf, h, S, D)
+    }
+
+    let scale = 1.0 / sqrt(D * 1.0)
+    flash_attn_bwd_packed(S, D, n_heads, n_kv_heads, Br, Bc, causal,
+                          q_buf, k_buf, v_buf, o_buf, dO_buf,
+                          dQ_buf, dK_buf, dV_buf, scale)
+
+    let mut dQh = []
+    let mut dKh = []
+    let mut dVh = []
+    for h in 0..n_heads {
+        dQh.push(hxflash_unpack_2d(dQ_buf, h, S, D))
+    }
+    for h in 0..n_kv_heads {
+        dKh.push(hxflash_unpack_2d(dK_buf, h, S, D))
+        dVh.push(hxflash_unpack_2d(dV_buf, h, S, D))
+    }
+
+    free_raw(q_buf,  q_bytes)
+    free_raw(k_buf,  kv_bytes)
+    free_raw(v_buf,  kv_bytes)
+    free_raw(o_buf,  q_bytes)
+    free_raw(dO_buf, q_bytes)
+    free_raw(dQ_buf, q_bytes)
+    free_raw(dK_buf, kv_bytes)
+    free_raw(dV_buf, kv_bytes)
+
+    return [dQh, dKh, dVh]
 }
 
 // ── Multi-head variant ──────────────────────────────────────────

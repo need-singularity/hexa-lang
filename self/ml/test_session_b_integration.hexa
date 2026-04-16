@@ -1,0 +1,347 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_session_b_integration.hexa — End-to-end integration test
+//
+//  Verifies all 3 Session B components work together:
+//    1. hxflash forward (FlashAttention FFI)
+//    2. grad checkpoint (layer-level activation drop/recompute)
+//    3. hxccl (collective communication — stub mode on single rank)
+//
+//  This is a CORRECTNESS test, not a benchmark. Uses small shapes
+//  (d=64, 4 layers, seq=8) so it runs in seconds on CPU.
+//
+//  Usage:
+//    DYLD_LIBRARY_PATH=self/native/build hexa self/ml/test_session_b_integration.hexa
+//
+//  Expected: PASS=N FAIL=0
+// ═══════════════════════════════════════════════════════════════
+
+use "self/ml/hxflash.hexa"
+use "self/ml/hxblas_bf16.hexa"
+use "self/ml/hxccl.hexa"
+use "self/ml/grad_checkpoint.hexa"
+
+let PASS_COUNT = [0]
+let FAIL_COUNT = [0]
+let TEST_NAME = [""]
+
+fn assert_true(cond, msg) {
+    if cond {
+        PASS_COUNT[0] = PASS_COUNT[0] + 1
+    } else {
+        FAIL_COUNT[0] = FAIL_COUNT[0] + 1
+        eprintln("  FAIL [" + TEST_NAME[0] + "]: " + msg)
+    }
+}
+
+fn assert_close(a, b, tol, msg) {
+    let diff = if a > b { a - b } else { b - a }
+    assert_true(diff < tol, msg + " (got " + to_string(a) + " vs " + to_string(b) + ", diff=" + to_string(diff) + ")")
+}
+
+fn test_begin(name) {
+    TEST_NAME[0] = name
+    println("  T: " + name)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T1: hxflash FFI version probe
+// ═══════════════════════════════════════════════════════════════
+
+fn test_hxflash_version() {
+    test_begin("hxflash_version")
+    let v = hxflash_version()
+    assert_true(v >= 2, "hxflash version >= 2 (struct-args ABI)")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T2: hxccl init + version (single rank stub)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_hxccl_single_rank() {
+    test_begin("hxccl_single_rank")
+    let v = ccl_version()
+    assert_true(v >= 1, "hxccl version >= 1")
+
+    let rc = ccl_init(0, 1)
+    assert_true(rc == 0, "ccl_init(0, 1) == 0")
+
+    let rank = ccl_rank()
+    assert_true(rank == 0, "ccl_rank == 0")
+
+    let ws = ccl_world_size()
+    assert_true(ws == 1, "ccl_world_size == 1")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T3: hxccl allreduce (single rank = identity)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_hxccl_allreduce_identity() {
+    test_begin("hxccl_allreduce_identity")
+    let h = hxccl_init_handle(0, 1)
+    assert_true(h >= 0, "hxccl_init_handle returned valid handle")
+
+    let n = 16
+    let buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, to_float(i) * 1.5)
+        i = i + 1
+    }
+
+    let rc = hxccl_allreduce_float(h, buf, n, 0)  // op=SUM
+    assert_true(rc == 0, "allreduce_float(SUM) rc=0")
+
+    // single rank: output should equal input
+    i = 0
+    let mut all_match = true
+    while i < n {
+        let v = deref_f32(buf, i * 4)
+        let expected = to_float(i) * 1.5
+        let diff = if v > expected { v - expected } else { expected - v }
+        if diff > 0.001 { all_match = false }
+        i = i + 1
+    }
+    assert_true(all_match, "allreduce preserves values on single rank")
+
+    let _ = hxccl_finalize(h)
+    free_raw(buf, n * 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T4: grad checkpoint forward match (seg=1 == plain)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_gc_forward_identity() {
+    test_begin("gc_forward_seg1_eq_plain")
+    let d = 16
+    let n_layers = 4
+
+    // Create random layers
+    let mut layers = []
+    let mut li = 0
+    while li < n_layers {
+        let mut W = []
+        let mut j = 0
+        while j < d * d {
+            W.push(random() * 0.1 - 0.05)
+            j = j + 1
+        }
+        let mut b = []
+        j = 0
+        while j < d {
+            b.push(random() * 0.01)
+            j = j + 1
+        }
+        layers.push(gc_make_layer(W, b, d, d))
+        li = li + 1
+    }
+
+    // Random input
+    let mut input = []
+    let mut k = 0
+    while k < d {
+        input.push(random() * 2.0 - 1.0)
+        k = k + 1
+    }
+
+    // Compare seg=1 with plain
+    let model_1 = gc_make_model(layers, 1)
+    let fwd_1 = gc_forward(model_1, input)
+    let fwd_plain = gc_forward_plain(model_1, input)
+
+    let out_1 = fwd_1.final_out
+    let out_p = fwd_plain[len(fwd_plain) - 1]
+
+    let mut match_ok = true
+    let mut mi = 0
+    while mi < d {
+        let diff = if out_1[mi] > out_p[mi] { out_1[mi] - out_p[mi] } else { out_p[mi] - out_1[mi] }
+        if diff > 0.0001 { match_ok = false }
+        mi = mi + 1
+    }
+    assert_true(match_ok, "gc_forward(seg=1) == gc_forward_plain")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T5: grad checkpoint memory savings (seg=2 at 4 layers)
+// ═══════════════════════════════════════════════════════════════
+
+fn test_gc_memory_savings() {
+    test_begin("gc_memory_savings")
+    let d = 32
+    let n_layers = 8
+    let seg = 2
+
+    let mut layers = []
+    let mut li = 0
+    while li < n_layers {
+        let mut W = []
+        let mut j = 0
+        while j < d * d {
+            W.push(random() * 0.1)
+            j = j + 1
+        }
+        let mut b = []
+        j = 0
+        while j < d { b.push(0.0); j = j + 1 }
+        layers.push(gc_make_layer(W, b, d, d))
+        li = li + 1
+    }
+
+    let mut input = []
+    let mut k = 0
+    while k < d { input.push(random()); k = k + 1 }
+
+    let model = gc_make_model(layers, seg)
+    let fwd_ckpt = gc_forward(model, input)
+    let fwd_plain = gc_forward_plain(model, input)
+
+    let peak_ckpt = gc_peak_activations(fwd_ckpt)
+    let peak_plain = gc_peak_activations_plain(fwd_plain)
+
+    let savings = 1.0 - to_float(peak_ckpt) / to_float(peak_plain)
+    println("    peak_plain=" + to_string(peak_plain) + " peak_ckpt=" + to_string(peak_ckpt) + " savings=" + to_string(savings * 100.0) + "%")
+    assert_true(savings > 0.3, "memory savings > 30%")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T6: hxblas bf16 version probe
+// ═══════════════════════════════════════════════════════════════
+
+fn test_hxblas_bf16_version() {
+    test_begin("hxblas_bf16_version")
+    let v = hxblas_bf16_version()
+    assert_true(v >= 1, "hxblas bf16 version >= 1")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T7: bf16 pack/unpack roundtrip
+// ═══════════════════════════════════════════════════════════════
+
+fn test_bf16_roundtrip() {
+    test_begin("bf16_roundtrip")
+    let n = 64
+    let f32_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_f32(f32_buf, i * 4, to_float(i) * 0.1 - 3.0)
+        i = i + 1
+    }
+
+    let bf16_buf = bf16_pack(f32_buf, n)
+    let f32_out = bf16_unpack(bf16_buf, n)
+
+    let mut max_err = 0.0
+    i = 0
+    while i < n {
+        let orig = deref_f32(f32_buf, i * 4)
+        let rt = deref_f32(f32_out, i * 4)
+        let err = if orig > rt { orig - rt } else { rt - orig }
+        if err > max_err { max_err = err }
+        i = i + 1
+    }
+    println("    bf16 roundtrip max_err=" + to_string(max_err))
+    assert_true(max_err < 0.05, "bf16 roundtrip error < 0.05")
+
+    free_raw(f32_buf, n * 4)
+    bf16_free(bf16_buf, n)
+    free_raw(f32_out, n * 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  T8: combined — gc forward + hxccl allreduce on gradients
+// ═══════════════════════════════════════════════════════════════
+
+fn test_combined_gc_ccl() {
+    test_begin("combined_gc_ccl")
+    let d = 16
+    let n_layers = 4
+    let seg = 2
+
+    // Build model
+    let mut layers = []
+    let mut li = 0
+    while li < n_layers {
+        let mut W = []
+        let mut j = 0
+        while j < d * d { W.push(random() * 0.1); j = j + 1 }
+        let mut b = []
+        j = 0
+        while j < d { b.push(0.0); j = j + 1 }
+        layers.push(gc_make_layer(W, b, d, d))
+        li = li + 1
+    }
+
+    let mut input = []
+    let mut k = 0
+    while k < d { input.push(random()); k = k + 1 }
+
+    let model = gc_make_model(layers, seg)
+
+    // Forward with checkpointing
+    let fwd = gc_forward(model, input)
+    assert_true(len(fwd.final_out) == d, "gc_forward output dim matches")
+
+    // Simulate gradient (all 1s)
+    let mut grad_out = []
+    k = 0
+    while k < d { grad_out.push(1.0); k = k + 1 }
+
+    // Backward with recomputation
+    let bwd_result = gc_backward(model, fwd, grad_out)
+    let grad_input = bwd_result[0]
+    assert_true(len(grad_input) == d, "gc_backward grad_input dim matches")
+
+    // Simulate gradient sync via hxccl (single rank identity)
+    let h = hxccl_init_handle(0, 1)
+    let grad_buf = alloc_raw(d * 4)
+    let mut gi = 0
+    while gi < d {
+        write_f32(grad_buf, gi * 4, grad_input[gi])
+        gi = gi + 1
+    }
+    let rc = hxccl_allreduce_float(h, grad_buf, d, 1)  // op=AVG
+    assert_true(rc == 0, "allreduce on gc gradients ok")
+
+    // Verify values preserved (single rank)
+    let mut all_ok = true
+    gi = 0
+    while gi < d {
+        let v = deref_f32(grad_buf, gi * 4)
+        let expected = grad_input[gi]
+        let diff = if v > expected { v - expected } else { expected - v }
+        if diff > 0.001 { all_ok = false }
+        gi = gi + 1
+    }
+    assert_true(all_ok, "allreduce preserves gc gradients")
+
+    let _ = hxccl_finalize(h)
+    free_raw(grad_buf, d * 4)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Main
+// ═══════════════════════════════════════════════════════════════
+
+fn main() {
+    println("═══ Session B Integration Test ═══")
+    println("")
+
+    test_hxflash_version()
+    test_hxccl_single_rank()
+    test_hxccl_allreduce_identity()
+    test_gc_forward_identity()
+    test_gc_memory_savings()
+    test_hxblas_bf16_version()
+    test_bf16_roundtrip()
+    test_combined_gc_ccl()
+
+    println("")
+    println("═══ Results ═══")
+    println("PASS=" + to_string(PASS_COUNT[0]) + " FAIL=" + to_string(FAIL_COUNT[0]))
+
+    if FAIL_COUNT[0] > 0 { exit(1) }
+}
+
+main()

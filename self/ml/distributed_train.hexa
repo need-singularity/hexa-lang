@@ -18,6 +18,12 @@ use "gpu_grad_engine"
 use "gpu_optimizer"
 use "model_100m_gpu"
 use "distributed"
+use "hxccl"
+
+// ── hxccl handle-based (Family B) toggle ─────────────────────
+// When true, gradient sync uses hxccl_allreduce_float via handle
+// instead of raw NCCL ncclAllReduce calls.
+let USE_HXCCL = true
 
 // ── Training config ──────────────────────────────────────────
 let DIST_STEPS       = 100
@@ -118,21 +124,41 @@ fn worker_forward_backward(worker: GpuWorker, tokens, targets) {
 
 // ── AllReduce gradient synchronization ───────────────────────
 // Collects same-index gradient tensors from all workers,
-// performs allreduce_mean, then each worker has the averaged grad
-fn sync_gradients(ctx: DistContext, all_grads, num_gpus) {
-    // all_grads[g] = array of GpuTensors (one per param) for GPU g
+// performs allreduce_mean, then each worker has the averaged grad.
+//
+// Two paths:
+//   USE_HXCCL=true  → hxccl Family B handle-based allreduce (AVG)
+//   USE_HXCCL=false → legacy raw NCCL via distributed.hexa
+fn sync_gradients(ctx, all_grads, num_gpus) {
     let n_params = len(all_grads[0])
 
+    if USE_HXCCL {
+        // hxccl path: allreduce each param's gradient buffer in-place
+        // ctx here is the hxccl handle (int) when USE_HXCCL=true
+        let mut p = 0
+        while p < n_params {
+            let mut g = 0
+            while g < num_gpus {
+                let grad_t = all_grads[g][p]
+                let count = gt_numel(grad_t)
+                let buf = gt_ptr(grad_t)
+                let _ = hxccl_allreduce_float(ctx, buf, count, HXCCL_OP_AVG)
+                g = g + 1
+            }
+            p = p + 1
+        }
+        return 0
+    }
+
+    // Legacy path: raw NCCL allreduce via distributed.hexa
     let mut p = 0
     while p < n_params {
-        // Collect the p-th gradient from each GPU
         let mut grad_set = []
         let mut g = 0
         while g < num_gpus {
             grad_set = grad_set.push(all_grads[g][p])
             g = g + 1
         }
-        // In-place mean across GPUs
         let _ = allreduce_mean(ctx, grad_set)
         p = p + 1
     }
@@ -203,7 +229,21 @@ fn dist_train(num_gpus) {
     println("=" * 60)
 
     // Initialize distributed context
-    let ctx = init_distributed(num_gpus)
+    // When USE_HXCCL, ctx is an hxccl handle (Family B); otherwise
+    // it's a DistContext from distributed.hexa.
+    let mut ctx = 0
+    if USE_HXCCL {
+        let rank = 0   // launcher sets actual rank via env
+        ctx = hxccl_init_handle(rank, num_gpus)
+        if ctx <= 0 {
+            println("[dist_train] ERROR: hxccl_init_handle failed, falling back to legacy")
+            ctx = init_distributed(num_gpus)
+        } else {
+            println("[dist_train] hxccl handle initialized: " + str(ctx))
+        }
+    } else {
+        ctx = init_distributed(num_gpus)
+    }
 
     // Initialize workers (one model replica per GPU)
     let seq = GPU_SEQ
@@ -337,7 +377,12 @@ fn dist_train(num_gpus) {
     println("=" * 60)
 
     // Cleanup
-    let _ = dist_shutdown(ctx)
+    if USE_HXCCL {
+        let _ = hxccl_finalize(ctx)
+        println("[dist_train] hxccl handle finalized")
+    } else {
+        let _ = dist_shutdown(ctx)
+    }
     g = 0
     while g < num_gpus {
         let _ = cuda_set_device(workers[g].gpu_id)
@@ -348,4 +393,4 @@ fn dist_train(num_gpus) {
     0
 }
 
-println("[distributed_train] module loaded — multi-GPU training loop ready")
+println("[distributed_train] module loaded — multi-GPU training loop ready (hxccl=" + str(USE_HXCCL) + ")")
