@@ -2704,6 +2704,12 @@ HexaVal hexa_sqrt(HexaVal v) {
 }
 
 HexaVal hexa_pow(HexaVal base, HexaVal exp) {
+    // Integer fast-path: int^int with non-negative exponent stays int
+    if (HX_IS_INT(base) && HX_IS_INT(exp) && HX_INT(exp) >= 0) {
+        int64_t b = HX_INT(base), e = HX_INT(exp), r = 1;
+        while (e > 0) { if (e & 1) r *= b; b *= b; e >>= 1; }
+        return hexa_int(r);
+    }
     return hexa_float(pow(__hx_to_double(base), __hx_to_double(exp)));
 }
 
@@ -2961,7 +2967,9 @@ HexaVal hexa_div(HexaVal a, HexaVal b) {
 }
 HexaVal hexa_mod(HexaVal a, HexaVal b) {
     if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(b) ? HX_INT(a) % HX_INT(b) : 0);
-    return hexa_int(0);
+    double fb = __hx_to_double(b);
+    if (fb == 0.0) return hexa_float(0.0);
+    return hexa_float(fmod(__hx_to_double(a), fb));
 }
 
 // ROI-44: comparison runtime helpers — replace inline GCC stmt-expr in codegen.
