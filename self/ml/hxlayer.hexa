@@ -1,0 +1,91 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/hxlayer.hexa — layer-level fused FFI bindings (C2 Step 1)
+//
+//  Binds to self/native/hxlayer_linux.c (libhxlayer.so/.dylib).
+//  Exposes a single fused kernel in Step 1:
+//
+//    hxlayer_rmsnorm_silu(N, out, x, gamma, eps)
+//      y = silu(rmsnorm(x, gamma, eps))
+//      2 ops fused → 1 dispatch + 0 intermediate buffer
+//
+//  Measurable gain vs the non-fused path through hxblas:
+//    1) dispatch count 2 → 1
+//    2) intermediate rmsnorm buffer elided (tmp carried in register)
+//
+//  The hexa caller extracts the Pointer (int64 address) out of its
+//  Tensor / [float] container and passes it straight to the C ABI.
+//  This mirrors self/ml/tensor.hexa's hxblas_sgemm call convention.
+//
+//  Platform resolution (@link("hxlayer")):
+//    Mac   : DYLD_LIBRARY_PATH → libhxlayer.dylib (built with --mac-xverify)
+//    Linux : LD_LIBRARY_PATH   → libhxlayer.so
+//    Same source, same symbol set. See scripts/build_hxlayer_linux.sh.
+// ═══════════════════════════════════════════════════════════════
+
+// ── ABI bindings ────────────────────────────────────────────────
+// Pointers are passed as *Void (hexa Pointer == u64) — the runtime
+// marshalls them as int64 to the C side, matching the uintptr_t cast
+// in hxlayer_linux.c. `eps` is float (f64) on hexa, cast to f32 inside.
+
+@link("hxlayer")
+extern fn hxlayer_rmsnorm_silu(N: int, out: *Void, x: *Void, gamma: *Void, eps: float)
+
+@link("hxlayer")
+extern fn hxlayer_version() -> int
+
+// ── Pure-hexa reference implementation for diff testing ─────────
+// Used by test_hxlayer.hexa to verify the C kernel numerically.
+// Not called on the hot path — exists so a unit test can assert
+// |ref(i) - fused(i)| < 1e-5 without touching the C code.
+@pure
+pub fn ref_rmsnorm_silu(x, gamma, eps) {
+    let n = len(x)
+    // rmsnorm
+    let mut ms = 0.0
+    for p in 0..n { ms = ms + x[p] * x[p] }
+    ms = ms / (n * 1.0)
+    let inv_r = 1.0 / sqrt(ms + eps)
+    // silu(rmsnorm(x) * gamma)
+    let mut out = []
+    for p in 0..n {
+        let t = x[p] * inv_r * gamma[p]
+        let s = 1.0 / (1.0 + exp(0.0 - t))
+        out = out + [t * s]
+    }
+    return out
+}
+
+// ── High-level wrapper — allocates a raw buffer, calls the fused
+//    kernel, reads back into a hexa [float]. Copies are deliberate
+//    here: Step 1 proves the FFI path works end-to-end. A zero-copy
+//    Tensor-in/Tensor-out variant will land in Step 2 alongside the
+//    full hxlayer_llama_forward signature.
+pub fn fused_rmsnorm_silu(x, gamma, eps) {
+    let n = len(x)
+
+    // Allocate 3 raw f32 buffers (stride = 4 bytes per element).
+    let x_buf = alloc_raw(n * 4)
+    let g_buf = alloc_raw(n * 4)
+    let o_buf = alloc_raw(n * 4)
+
+    // Pack hexa [float] → raw f32 buffers.
+    for p in 0..n {
+        write_f32(x_buf, p * 4, x[p])
+        write_f32(g_buf, p * 4, gamma[p])
+    }
+
+    // Single fused dispatch (2 ops → 1 call, zero intermediate).
+    hxlayer_rmsnorm_silu(n, o_buf, x_buf, g_buf, eps)
+
+    // Unpack raw f32 buffer → hexa [float].
+    let mut out = []
+    for p in 0..n {
+        out = out + [deref_f32(o_buf, p * 4)]
+    }
+
+    free_raw(x_buf, n * 4)
+    free_raw(g_buf, n * 4)
+    free_raw(o_buf, n * 4)
+
+    return out
+}

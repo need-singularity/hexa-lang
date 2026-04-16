@@ -2712,6 +2712,43 @@ HexaVal hexa_format_float_sci(HexaVal f, HexaVal prec) {
 
 // Resolve a library path for dlopen.
 // If lib_name is NULL or empty, use RTLD_DEFAULT (search default symbols).
+// Helper: extract the basename (without "lib" prefix and without
+// ".dylib"/".so" suffix) from a possibly-absolute library path. Used so
+// `@link("/abs/path/libhxblas.dylib")` can fall back to a Linux
+// `libhxblas.so` (or vice-versa) without source changes — see the
+// hxblas-linux port (2026-04-16, c6_hxblas_linux_port_20260416.json).
+//
+// Returns 1 on success and writes the extracted name into out_name (max
+// out_cap bytes). Returns 0 if the input doesn't look like an
+// absolute lib path.
+static int hexa_ffi_extract_libname(const char* path, char* out_name, size_t out_cap) {
+    if (!path || !out_name || out_cap == 0) return 0;
+    // Find the basename (after the last '/')
+    const char* base = strrchr(path, '/');
+    base = base ? base + 1 : path;
+    // Must start with "lib"
+    if (strncmp(base, "lib", 3) != 0) return 0;
+    base += 3;
+    // Must end in .dylib or .so or .so.N
+    size_t blen = strlen(base);
+    const char* end = NULL;
+    if (blen > 6 && strcmp(base + blen - 6, ".dylib") == 0) {
+        end = base + blen - 6;
+    } else if (blen > 3 && strcmp(base + blen - 3, ".so") == 0) {
+        end = base + blen - 3;
+    } else {
+        // .so.N case — find ".so." substring
+        const char* p = strstr(base, ".so.");
+        if (p) end = p;
+    }
+    if (!end) return 0;
+    size_t nlen = (size_t)(end - base);
+    if (nlen == 0 || nlen >= out_cap) return 0;
+    memcpy(out_name, base, nlen);
+    out_name[nlen] = '\0';
+    return 1;
+}
+
 static void* hexa_ffi_dlopen(const char* lib_name) {
     if (!lib_name || lib_name[0] == '\0') {
         return dlopen(NULL, RTLD_LAZY);
@@ -2728,6 +2765,44 @@ static void* hexa_ffi_dlopen(const char* lib_name) {
     snprintf(dylib, sizeof(dylib), "/usr/lib/lib%s.dylib", lib_name);
     h = dlopen(dylib, RTLD_LAZY);
     if (h) return h;
+    // ── New (2026-04-16): also try `lib<name>.dylib` so a bare
+    //    @link("hxblas") + DYLD_LIBRARY_PATH=<dir> works on Mac
+    //    just like `lib<name>.so` + LD_LIBRARY_PATH does on Linux. ──
+    char dylib_bare[512];
+    snprintf(dylib_bare, sizeof(dylib_bare), "lib%s.dylib", lib_name);
+    h = dlopen(dylib_bare, RTLD_LAZY);
+    if (h) return h;
+    // ── C2 Step 3 (2026-04-16): macOS SIP strips DYLD_LIBRARY_PATH
+    //    when crossing any system-signed binary (/bin/sh, etc). So
+    //    `./hexa run` → popen → sh -c → stage0 loses DYLD. Work around
+    //    by searching a few known repo-relative install dirs for the
+    //    hexa-lang native build output before giving up. ──
+    {
+        const char* search_prefixes[8];
+        int sp_n = 0;
+        const char* hl = getenv("HEXA_LANG");
+        if (hl && hl[0]) search_prefixes[sp_n++] = hl;
+        const char* nld = getenv("HEXA_NATIVE_LIB_DIR");
+        if (nld && nld[0]) search_prefixes[sp_n++] = nld;
+        search_prefixes[sp_n++] = ".";
+        search_prefixes[sp_n++] = "/Users/ghost/Dev/hexa-lang";
+        search_prefixes[sp_n++] = "/Users/ghost/dev/hexa-lang";
+        // Try <prefix>/self/native/build/lib<name>.dylib for each prefix.
+        const char* rel_patterns[] = {
+            "%s/self/native/build/lib%s.dylib",
+            "%s/build/lib%s.dylib",
+            "%s/lib%s.dylib",
+            NULL
+        };
+        for (int i = 0; i < sp_n; i++) {
+            for (int j = 0; rel_patterns[j]; j++) {
+                char p[512];
+                snprintf(p, sizeof(p), rel_patterns[j], search_prefixes[i], lib_name);
+                void* hr = dlopen(p, RTLD_LAZY);
+                if (hr) return hr;
+            }
+        }
+    }
 #endif
     // Try as-is (Linux .so or absolute path)
     char sopath[512];
@@ -2757,6 +2832,42 @@ static void* hexa_ffi_dlopen(const char* lib_name) {
         }
     }
 #endif
+    // ── New (2026-04-16, hxblas linux port): when the user passes
+    //    an absolute Mac/Linux library path that doesn't resolve
+    //    on this host (e.g. @link("/Users/.../libhxblas.dylib") on a
+    //    Linux pod), strip the dirname + lib prefix + .{dylib,so}
+    //    suffix and retry the search with just the base name. This
+    //    lets the same hexa source resolve `libhxblas.so` on Linux
+    //    via LD_LIBRARY_PATH and `libhxblas.dylib` on Mac via
+    //    DYLD_LIBRARY_PATH without #ifdef in the hexa file. ──
+    if (lib_name[0] == '/') {
+        char base[256];
+        if (hexa_ffi_extract_libname(lib_name, base, sizeof(base))) {
+#ifdef __APPLE__
+            char p[512];
+            snprintf(p, sizeof(p), "lib%s.dylib", base);
+            void* hb = dlopen(p, RTLD_LAZY);
+            if (hb) return hb;
+#else
+            char p[512];
+            snprintf(p, sizeof(p), "lib%s.so", base);
+            void* hb = dlopen(p, RTLD_LAZY);
+            if (hb) return hb;
+#endif
+            // Also honour HEXA_NATIVE_LIB_DIR explicit search prefix
+            const char* dir = getenv("HEXA_NATIVE_LIB_DIR");
+            if (dir && dir[0]) {
+                char p2[512];
+#ifdef __APPLE__
+                snprintf(p2, sizeof(p2), "%s/lib%s.dylib", dir, base);
+#else
+                snprintf(p2, sizeof(p2), "%s/lib%s.so", dir, base);
+#endif
+                void* hb2 = dlopen(p2, RTLD_LAZY);
+                if (hb2) return hb2;
+            }
+        }
+    }
     // Final attempt: bare name
     return dlopen(lib_name, RTLD_LAZY);
 }
@@ -2908,10 +3019,54 @@ HexaVal hexa_extern_call_typed(void* fn_ptr, HexaVal* hargs, int nargs, int ret_
             }
             break;
         }
+        case 3: {
+            // 3 args — dispatch 2^3 = 8 patterns for int/float lane mapping.
+            int p = (IS_F(0)?4:0) | (IS_F(1)?2:0) | (IS_F(2)?1:0);
+            switch (p) {
+                case 0: if (ret_is_float) retf = ((double(*)(int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2]); else reti = ((int64_t(*)(int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2]); break;
+                case 1: if (ret_is_float) retf = ((double(*)(int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],fv[2]); else reti = ((int64_t(*)(int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],fv[2]); break;
+                case 2: if (ret_is_float) retf = ((double(*)(int64_t,double,int64_t))fn_ptr)(iv[0],fv[1],iv[2]); else reti = ((int64_t(*)(int64_t,double,int64_t))fn_ptr)(iv[0],fv[1],iv[2]); break;
+                case 3: if (ret_is_float) retf = ((double(*)(int64_t,double,double))fn_ptr)(iv[0],fv[1],fv[2]); else reti = ((int64_t(*)(int64_t,double,double))fn_ptr)(iv[0],fv[1],fv[2]); break;
+                case 4: if (ret_is_float) retf = ((double(*)(double,int64_t,int64_t))fn_ptr)(fv[0],iv[1],iv[2]); else reti = ((int64_t(*)(double,int64_t,int64_t))fn_ptr)(fv[0],iv[1],iv[2]); break;
+                case 5: if (ret_is_float) retf = ((double(*)(double,int64_t,double))fn_ptr)(fv[0],iv[1],fv[2]); else reti = ((int64_t(*)(double,int64_t,double))fn_ptr)(fv[0],iv[1],fv[2]); break;
+                case 6: if (ret_is_float) retf = ((double(*)(double,double,int64_t))fn_ptr)(fv[0],fv[1],iv[2]); else reti = ((int64_t(*)(double,double,int64_t))fn_ptr)(fv[0],fv[1],iv[2]); break;
+                case 7: if (ret_is_float) retf = ((double(*)(double,double,double))fn_ptr)(fv[0],fv[1],fv[2]); else reti = ((int64_t(*)(double,double,double))fn_ptr)(fv[0],fv[1],fv[2]); break;
+            }
+            break;
+        }
+        case 4: {
+            // 4 args — only handle common trailing-float patterns explicitly.
+            int p = (IS_F(0)?8:0) | (IS_F(1)?4:0) | (IS_F(2)?2:0) | (IS_F(3)?1:0);
+            if (p == 0) {
+                if (ret_is_float) retf = ((double(*)(int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3]);
+                else reti = ((int64_t(*)(int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3]);
+            } else if (p == 1) { // iiif
+                if (ret_is_float) retf = ((double(*)(int64_t,int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],iv[2],fv[3]);
+                else reti = ((int64_t(*)(int64_t,int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],iv[2],fv[3]);
+            } else {
+                fprintf(stderr, "[hexa-ffi] unsupported 4-arg float pattern p=%d\n", p);
+                reti = 0;
+            }
+            break;
+        }
+        case 5: {
+            // 5 args — hxlayer_rmsnorm_silu(N:int, out:*, x:*, g:*, eps:f32)
+            // is the driving case: (int,int,int,int,float) = p==1.
+            int p = (IS_F(0)?16:0) | (IS_F(1)?8:0) | (IS_F(2)?4:0) | (IS_F(3)?2:0) | (IS_F(4)?1:0);
+            if (p == 0) {
+                if (ret_is_float) retf = ((double(*)(int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4]);
+                else reti = ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,int64_t))fn_ptr)(iv[0],iv[1],iv[2],iv[3],iv[4]);
+            } else if (p == 1) { // iiiif
+                if (ret_is_float) retf = ((double(*)(int64_t,int64_t,int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],iv[2],iv[3],fv[4]);
+                else reti = ((int64_t(*)(int64_t,int64_t,int64_t,int64_t,double))fn_ptr)(iv[0],iv[1],iv[2],iv[3],fv[4]);
+            } else {
+                fprintf(stderr, "[hexa-ffi] unsupported 5-arg float pattern p=%d\n", p);
+                reti = 0;
+            }
+            break;
+        }
         default: {
-            // For 3+ args: fall back to the codegen approach (typed wrappers).
-            // This runtime path handles the most common 0-2 arg float cases.
-            // For higher arities, codegen_c2 generates typed C wrapper functions.
+            // For 6+ args: fall back to the codegen approach (typed wrappers).
             fprintf(stderr, "[hexa-ffi] typed call with %d args: use typed extern fn decl in .hexa\n", nargs);
             reti = hexa_call_extern_raw(fn_ptr, iv, nargs);
             break;
@@ -2947,6 +3102,153 @@ HexaVal hexa_ptr_null() { return hexa_int(0); }
 
 HexaVal hexa_ptr_addr(HexaVal v) {
     return hexa_int(v.i);
+}
+
+// ── C2 Step 3: Dynamic FFI host dispatch (interpreter path) ──
+//
+// Purpose: expose dlopen+dlsym+extern_call as HexaVal builtins so the
+// self-host interpreter (self/interpreter.hexa) can dispatch @link externs
+// at runtime without going through codegen_c2.hexa's static __ffi_sym_*
+// registration. The native (compile-to-native) path already works via
+// codegen; this reopens the same pipeline for `./hexa run`.
+//
+// Forward declaration — defined alongside hexa_host_ffi_call below.
+static HexaVal hexa_host_ffi_unwrap(HexaVal v);
+
+// hexa_host_ffi_open(lib_name: str) -> ptr(int)
+//   0 on failure (e.g. library not found under any search strategy).
+HexaVal hexa_host_ffi_open(HexaVal lib_name) {
+    HexaVal uv = hexa_host_ffi_unwrap(lib_name);
+    const char* name = (uv.tag == TAG_STR && uv.s) ? uv.s : "";
+    void* h = hexa_ffi_dlopen(name);
+    return hexa_int((int64_t)(uintptr_t)h);
+}
+
+// hexa_host_ffi_sym(handle: int, symbol: str) -> ptr(int)
+//   0 on failure.
+HexaVal hexa_host_ffi_sym(HexaVal handle, HexaVal symbol) {
+    HexaVal uh = hexa_host_ffi_unwrap(handle);
+    HexaVal us = hexa_host_ffi_unwrap(symbol);
+    void* h = (uh.tag == TAG_INT) ? (void*)(uintptr_t)uh.i : NULL;
+    const char* sym = (us.tag == TAG_STR && us.s) ? us.s : "";
+    if (!h || !sym || !*sym) return hexa_int(0);
+    void* fn = dlsym(h, sym);
+    if (!fn) {
+        fprintf(stderr, "[hexa-ffi] dlsym failed for '%s': %s\n", sym, dlerror());
+        return hexa_int(0);
+    }
+    return hexa_int((int64_t)(uintptr_t)fn);
+}
+
+// hexa_host_ffi_call(fn_ptr: int, args_arr: array, float_mask: int, ret_kind: int) -> int|float
+//   ret_kind: 0=void, 1=int, 2=float, 3=bool, 4=pointer
+//   float_mask: bit i set => arg i is double
+//
+// Unwraps any HexaValStruct-wrapped args (the interpreter's native Val
+// representation) down to the corresponding primitive HexaVal so that
+// hexa_ffi_marshal_arg / hexa_extern_call_typed read the right lane.
+// Without this the interpreter-produced TAG_VALSTRUCT falls through the
+// marshal switch default and every arg becomes 0.
+static HexaVal hexa_host_ffi_unwrap(HexaVal v) {
+    if (v.tag != TAG_VALSTRUCT || !v.vs) return v;
+    int64_t t = v.vs->tag_i;
+    // Hexa-level tag values: 0=INT, 1=FLOAT, 2=BOOL, 3=STR, 8=VOID, 13=POINTER
+    // See self/interpreter.hexa let TAG_* constants.
+    if (t == 0)  return hexa_int(v.vs->int_val);
+    if (t == 1)  return hexa_float(v.vs->float_val);
+    if (t == 2)  return hexa_bool(v.vs->bool_val);
+    if (t == 3)  return v.vs->str_val;       // already TAG_STR
+    if (t == 13) return hexa_int(v.vs->int_val);  // pointer → int ABI lane
+    return hexa_int(v.vs->int_val);
+}
+
+HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask, HexaVal ret_kind) {
+    HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
+    void* fp = (fp_v.tag == TAG_INT) ? (void*)(uintptr_t)fp_v.i : NULL;
+    if (!fp) return hexa_int(0);
+    HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
+    HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
+    int rk   = (rk_v.tag == TAG_INT) ? (int)rk_v.i : 1;
+    int mask = (fm_v.tag == TAG_INT) ? (int)fm_v.i : 0;
+    // args_arr may be (a) a TAG_ARRAY built by the native-compiled hexa
+    // runtime (hexa_array_new — direct member access works) OR
+    // (b) a TAG_VALSTRUCT whose tag_i == TAG_ARRAY (hexa level 5) — the
+    // form used by the self-host interpreter's val_array(). In case (b)
+    // the real data lives behind the hexa-level array_store, which this
+    // native wrapper cannot reach. So we require native-array input and
+    // error out otherwise.
+    if (args_arr.tag != TAG_ARRAY) {
+        fprintf(stderr,
+            "[hexa-ffi] host_ffi_call: expected native array (tag=%d), got tag=%d. "
+            "Self-host interpreter must marshal through hexa_host_ffi_call_6 instead.\n",
+            (int)TAG_ARRAY, (int)args_arr.tag);
+        return hexa_int(0);
+    }
+    int nargs = hexa_len(args_arr);
+    if (nargs > 12) nargs = 12;
+    HexaVal hargs[12];
+    for (int i = 0; i < nargs; i++) {
+        hargs[i] = hexa_host_ffi_unwrap(hexa_array_get(args_arr, i));
+    }
+    if (mask) {
+        return hexa_extern_call_typed(fp, hargs, nargs, rk, mask);
+    }
+    return hexa_extern_call(fp, hargs, nargs, rk);
+}
+
+// hexa_host_ffi_call_6(fn_ptr, nargs, float_mask, ret_kind, a0, a1, a2, a3, a4, a5)
+//   Scalar-fanout variant used by the self-host interpreter which
+//   cannot pass its array_store-backed TAG_VALSTRUCT array through
+//   hexa_array_get. Up to 6 positional args; unused slots are TAG_VOID.
+HexaVal hexa_host_ffi_call_6(
+    HexaVal fn_ptr, HexaVal nargs_v, HexaVal float_mask, HexaVal ret_kind,
+    HexaVal a0, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4, HexaVal a5
+) {
+    HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
+    void* fp = (fp_v.tag == TAG_INT) ? (void*)(uintptr_t)fp_v.i : NULL;
+    if (!fp) return hexa_int(0);
+    HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
+    HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
+    HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
+    int nargs = (na_v.tag == TAG_INT) ? (int)na_v.i : 0;
+    int rk    = (rk_v.tag == TAG_INT) ? (int)rk_v.i : 1;
+    int mask  = (fm_v.tag == TAG_INT) ? (int)fm_v.i : 0;
+    if (nargs < 0) nargs = 0;
+    if (nargs > 6) nargs = 6;
+    HexaVal hargs[6];
+    hargs[0] = hexa_host_ffi_unwrap(a0);
+    hargs[1] = hexa_host_ffi_unwrap(a1);
+    hargs[2] = hexa_host_ffi_unwrap(a2);
+    hargs[3] = hexa_host_ffi_unwrap(a3);
+    hargs[4] = hexa_host_ffi_unwrap(a4);
+    hargs[5] = hexa_host_ffi_unwrap(a5);
+    HexaVal native_ret;
+    if (mask) {
+        native_ret = hexa_extern_call_typed(fp, hargs, nargs, rk, mask);
+    } else {
+        native_ret = hexa_extern_call(fp, hargs, nargs, rk);
+    }
+    // Wrap the native HexaVal (tag=TAG_INT / TAG_FLOAT / TAG_VOID / TAG_BOOL)
+    // into a hexa-level Val so the self-host interpreter can .tag/.int_val
+    // through it. Without this the interpreter reads garbage from the
+    // HexaVal-as-map fallback in hexa_map_get.
+    int64_t iv = 0;
+    double  fv = 0.0;
+    int bv = 0;
+    if (native_ret.tag == TAG_INT)   iv = native_ret.i;
+    if (native_ret.tag == TAG_FLOAT) fv = native_ret.f;
+    if (native_ret.tag == TAG_BOOL)  bv = native_ret.b;
+    // Hexa-level tag constants: INT=0, FLOAT=1, BOOL=2, VOID=8.
+    int hexa_tag = 0;
+    if (rk == 2) hexa_tag = 1;
+    if (rk == 3) hexa_tag = 2;
+    if (rk == 0) hexa_tag = 8;
+    HexaVal empty_str = hexa_str("");
+    return hexa_valstruct_new_v(
+        hexa_int(hexa_tag), hexa_int(iv), hexa_float(fv), hexa_bool(bv),
+        empty_str, empty_str, empty_str,
+        empty_str, empty_str, empty_str,
+        empty_str, empty_str);
 }
 
 // ── G5: Pointer arithmetic builtins ─────────────────────

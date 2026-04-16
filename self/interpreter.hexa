@@ -836,9 +836,9 @@ fn c_ret_to_value(raw, ret_type) {
 //   1. Extract fn_name
 //   2. Look up declared ret_type
 //   3. Resolve C symbol via @symbol alias (extern_c_symbol)
-//   4. Convert args to i64
-//   5. Delegate to host builtin __host_extern_call(c_symbol, link_lib, [c_args])
-//   6. Convert result via c_ret_to_value
+//   4. Pass Vals through directly — __host_extern_call inspects tags for
+//      int/float ABI lane assignment (C2 Step 3, 2026-04-16).
+//   5. Convert result via c_ret_to_value
 fn call_extern_fn(builtin_name, args) {
     let fn_name = builtin_name.substring(9, len(builtin_name))   // strip "__extern_"
     let c_sym = extern_c_symbol(fn_name)
@@ -853,11 +853,9 @@ fn call_extern_fn(builtin_name, args) {
             i = i - 1
         }
     }
-    let mut c_args = []
-    for a in args { c_args = c_args.push(value_to_c_arg(a)) }
-    // Delegate to host runtime via builtin. If host doesn't expose it,
-    // not_builtin sentinel propagates → fall through to error.
-    let host_result = call_builtin("__host_extern_call", [val_str(c_sym), val_str(lib), val_array_simple(c_args)])
+    // Wrap args directly so the host sees original tags (float in xmm,
+    // int in gpr). hexa_extern_call_typed handles the mixed ABI.
+    let host_result = call_builtin("__host_extern_call", [val_str(c_sym), val_str(lib), val_array(args), val_str(ret_type)])
     if host_result.tag == TAG_NOT_BUILTIN {
         return Val { tag: TAG_ERROR, int_val: 0, float_val: 0.0, bool_val: false, str_val: "extern '" + fn_name + "': host runtime does not expose __host_extern_call", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
     }
@@ -3801,6 +3799,16 @@ fn call_user_fn(name, args) {
         if fn_val.tag == TAG_FN {
             return call_fn_val(fn_val, args)
         }
+        // C2 Step 3: ExternFnDecl dispatches via env-stored sentinel.
+        // ExternFnDecl handler binds name -> val_str("__extern_<name>");
+        // when the bare name is called, route to call_extern_fn which
+        // delegates to host builtin __host_extern_call.
+        if fn_val.tag == TAG_STR {
+            let sentinel = fn_val.str_val
+            if len(sentinel) > 9 && sentinel.substring(0, 9) == "__extern_" {
+                return call_extern_fn(sentinel, args)
+            }
+        }
         println("Runtime error: undefined function: " + name)
         return val_void()
     }
@@ -5980,21 +5988,45 @@ fn call_builtin(name, args) {
     }
 
     // ── Phase 16 골화 — FFI memory + JSON + utility ──
-    // alloc_raw(size) — return Pointer to managed buffer (registry-backed)
+    // alloc_raw(size) — return Pointer to managed buffer.
+    //
+    // C2 Step 3 (2026-04-16): when HXLAYER_FFI_LIVE=1 the interpreter
+    // routes alloc_raw/free_raw/write_f32/deref_f32 to the real-pointer
+    // builtins (ptr_alloc / ptr_write_f32 / ptr_read_f32 / ptr_free) so
+    // that addresses can be passed to @link extern fns. Default path
+    // keeps the legacy atomic_store registry for pure-hexa callers that
+    // don't need C ABI addresses.
     if name == "alloc_raw" {
-        if len(args) == 0 { return val_pointer(0) }
+        if len(args) == 0 { return val_int(0) }
         let size = args[0].int_val
-        if size <= 0 { return val_pointer(0) }
+        if size <= 0 { return val_int(0) }
+        if env_var("HXLAYER_FFI_LIVE") == "1" {
+            // Real malloc path — return TAG_INT so codegen/marshal read
+            // the address via .i (not .f). Matches native-path semantics
+            // where alloc_raw → hexa_ptr_alloc → hexa_int(addr).
+            let p = ptr_alloc(size)
+            return val_int(ptr_addr(p))
+        }
         // Use atomic_store as a buffer registry: alloc one cell of zeros
         let mut buf = []
         let mut i = 0
         while i < size { buf = buf.push(val_int(0)); i = i + 1 }
         let id = len(atomic_store)
         atomic_store = atomic_store.push(val_array(buf))
-        return val_pointer(id + 1000000)  // mark as managed
+        return val_pointer(id + 1000000)  // managed-registry tag stays TAG_POINTER
     }
     if name == "free_raw" {
-        // No-op in self-host (storage GC'd elsewhere)
+        if env_var("HXLAYER_FFI_LIVE") == "1" {
+            if len(args) >= 1 {
+                let p = args[0]
+                // Real-malloc branch: raw TAG_INT address with no registry tag.
+                if p.tag == TAG_INT {
+                    let size = if len(args) >= 2 { args[1].int_val } else { 0 }
+                    ptr_free(p.int_val, size)
+                }
+            }
+        }
+        // Default: No-op in self-host (storage GC'd elsewhere)
         return val_void()
     }
     if name == "arena_reset" {
@@ -6064,30 +6096,45 @@ fn call_builtin(name, args) {
         return val_void()
     }
     if name == "deref_f32" || name == "deref_i32" {
-        // Read from pointer (managed alloc registry)
+        // Read from pointer. TAG_INT = real malloc address (C2 Step 3
+        // live-FFI path). TAG_POINTER = legacy atomic_store registry id.
         if len(args) == 0 { return val_int(0) }
         let p = args[0]
+        let offset = if len(args) > 1 { args[1].int_val } else { 0 }
+        if p.tag == TAG_INT {
+            if name == "deref_f32" {
+                return val_float(ptr_read_f32(p.int_val, offset))
+            }
+            return val_int(ptr_read_i32(p.int_val, offset))
+        }
         if p.tag != TAG_POINTER { return val_int(0) }
         let id = p.int_val - 1000000
         if id < 0 || id >= len(atomic_store) { return val_int(0) }
         let buf_val = atomic_store[id]
         if buf_val.tag != TAG_ARRAY { return val_int(0) }
         let buf = get_array(buf_val)
-        let offset = if len(args) > 1 { args[1].int_val } else { 0 }
         if offset < 0 || offset >= len(buf) { return val_int(0) }
         return buf[offset]
     }
     if name == "write_f32" || name == "write_i32" || name == "write_i64" {
-        // write(ptr, offset, value)
+        // write(ptr, offset, value) — TAG_INT = real address, TAG_POINTER = registry.
         if len(args) < 3 { return val_void() }
         let p = args[0]
+        let offset = args[1].int_val
+        if p.tag == TAG_INT {
+            if name == "write_f32" {
+                ptr_write_f32(p.int_val, offset, to_float_val(args[2]))
+            } else {
+                ptr_write_i32(p.int_val, offset, args[2].int_val)
+            }
+            return val_void()
+        }
         if p.tag != TAG_POINTER { return val_void() }
         let id = p.int_val - 1000000
         if id < 0 || id >= len(atomic_store) { return val_void() }
         let buf_val = atomic_store[id]
         if buf_val.tag != TAG_ARRAY { return val_void() }
         let mut buf = get_array(buf_val)
-        let offset = args[1].int_val
         if offset >= 0 && offset < len(buf) {
             buf[offset] = args[2]
             atomic_store[id] = val_array(buf)
@@ -8898,6 +8945,62 @@ fn call_builtin(name, args) {
             hi = hi + 1
         }
         return val_tensor([n_kv * n_rep * head_dim], out)
+    }
+
+    // ── C2 Step 3: __host_extern_call(c_sym, link_lib, val_arr, ret_type) ──
+    //
+    // Dispatches an @link extern fn through dlopen/dlsym + scalar-fanout
+    // host_ffi_call_6. args[2] is a hexa-level Val array (array_store-
+    // backed); we cannot pass it directly through host_ffi_call, so we
+    // unwrap up to 6 positional args and feed them as individual Vals.
+    if name == "__host_extern_call" {
+        if len(args) < 3 {
+            return not_builtin
+        }
+        let c_sym = args[0].str_val
+        let lib = args[1].str_val
+        let val_arr_v = args[2]
+        let ret_type = if len(args) >= 4 { args[3].str_val } else { "" }
+        // NOTE: `handle` is a reserved word (effects group), so use lib_h.
+        let lib_h = host_ffi_open(lib)
+        if lib_h == 0 {
+            return Val { tag: TAG_ERROR, int_val: 0, float_val: 0.0, bool_val: false, str_val: "host_ffi_open failed for '" + lib + "'", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+        }
+        let fn_ptr = host_ffi_sym(lib_h, c_sym)
+        if fn_ptr == 0 {
+            return Val { tag: TAG_ERROR, int_val: 0, float_val: 0.0, bool_val: false, str_val: "host_ffi_sym failed for '" + c_sym + "'", char_val: "", array_val: "", fn_name: "", fn_params: "", fn_body: "", struct_name: "", struct_fields: "" }
+        }
+        // Unwrap the Val array into positional slots (up to 6).
+        let call_args = get_array(val_arr_v)
+        let nargs = len(call_args)
+        let void_v = val_void()
+        let a0 = if nargs > 0 { call_args[0] } else { void_v }
+        let a1 = if nargs > 1 { call_args[1] } else { void_v }
+        let a2 = if nargs > 2 { call_args[2] } else { void_v }
+        let a3 = if nargs > 3 { call_args[3] } else { void_v }
+        let a4 = if nargs > 4 { call_args[4] } else { void_v }
+        let a5 = if nargs > 5 { call_args[5] } else { void_v }
+        // Build float_mask via int doubling (no native <<).
+        let mut float_mask = 0
+        let mut k = 0
+        while k < nargs && k < 6 {
+            if call_args[k].tag == TAG_FLOAT {
+                let mut bit = 1
+                let mut bi = 0
+                while bi < k { bit = bit * 2; bi = bi + 1 }
+                float_mask = float_mask + bit
+            }
+            k = k + 1
+        }
+        // Determine ret_kind: 0=void, 1=int, 2=float, 3=bool, 4=pointer.
+        let mut ret_kind = 1
+        if ret_type == "float" || ret_type == "f64" || ret_type == "f32" || ret_type == "double" { ret_kind = 2 }
+        if ret_type == "bool" { ret_kind = 3 }
+        if ret_type == "ptr" || ret_type == "void*" || ret_type == "*mut" { ret_kind = 4 }
+        if ret_type == "void" || ret_type == "Void" || ret_type == "" { ret_kind = 0 }
+        // host_ffi_call_6 already wraps its native HexaVal result into a
+        // hexa-level Val struct (see runtime.c::hexa_host_ffi_call_6).
+        return host_ffi_call_6(fn_ptr, nargs, float_mask, ret_kind, a0, a1, a2, a3, a4, a5)
     }
 
     return not_builtin
