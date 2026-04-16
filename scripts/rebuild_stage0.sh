@@ -10,12 +10,12 @@
 #
 # 이 wrapper 가 해결:
 #   - mkdir lock (atomic, macOS-safe) → 동시 재빌드 차단
-#   - mtime guard → self/*.hexa 최신이 output 보다 오래되면 skip
+#   - content-hash guard → sha256(hexa_full.hexa + runtime.c) vs stored hash
 #   - NO_SMOKE 기본 on → smoke 스폰 제거 (호출측이 필요하면 본인 테스트 1회)
 #   - 실패 시 lock 자동 해제
 #
 # 사용:
-#   bash scripts/rebuild_stage0.sh               # mtime-guarded
+#   bash scripts/rebuild_stage0.sh               # content-hash guarded
 #   FORCE=1 bash scripts/rebuild_stage0.sh       # 강제 rebuild
 #   WITH_SMOKE=1 bash scripts/rebuild_stage0.sh  # smoke test 포함
 #
@@ -58,21 +58,23 @@ fi
 echo $$ > "$LOCK_DIR/pid"
 trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
 
-# ── 2. mtime guard ─────────────────────────────────────────
-if [ -z "$FORCE" ] && [ -x "$OUT" ]; then
-    NEED=0
-    for f in "$HEXA_DIR/self"/*.hexa "$HEXA_DIR/self/runtime.c" "$HEXA_DIR/self/native/hexa_v2"; do
-        [ -e "$f" ] || continue
-        if [ "$f" -nt "$OUT" ]; then
-            NEED=1
-            echo "[rebuild_stage0] trigger: $f newer than stage0" >&2
-            break
-        fi
-    done
-    if [ "$NEED" = "0" ]; then
-        echo "[rebuild_stage0] up-to-date, skip"
+# ── 2. content-hash guard (ROI-9: replaces mtime guard) ────
+HASH_FILE="$HEXA_DIR/build/.rebuild_hash"
+
+compute_source_hash() {
+    # Hash the two primary inputs; sort for determinism
+    cat "$HEXA_DIR/self/hexa_full.hexa" "$HEXA_DIR/self/runtime.c" 2>/dev/null \
+        | shasum -a 256 | cut -d' ' -f1
+}
+
+if [ -z "$FORCE" ] && [ -x "$OUT" ] && [ -f "$HASH_FILE" ]; then
+    CURRENT_HASH=$(compute_source_hash)
+    STORED_HASH=$(cat "$HASH_FILE" 2>/dev/null || echo "")
+    if [ "$CURRENT_HASH" = "$STORED_HASH" ]; then
+        echo "[rebuild_stage0] content-hash unchanged ($CURRENT_HASH), skip"
         exit 0
     fi
+    echo "[rebuild_stage0] content-hash changed, rebuilding" >&2
 fi
 
 # ── 3. 빌드 위임 (smoke 기본 off) ──────────────────────────
@@ -82,5 +84,10 @@ fi
 
 echo "[rebuild_stage0] invoking build_stage0.sh (pid=$$, lock=$LOCK_DIR)"
 bash "$HEXA_DIR/scripts/build_stage0.sh"
+
+# ── 4. store content hash after successful build ──────────
+mkdir -p "$(dirname "$HASH_FILE")"
+compute_source_hash > "$HASH_FILE"
+echo "[rebuild_stage0] hash stored → $(cat "$HASH_FILE")"
 
 echo "[rebuild_stage0] OK"
