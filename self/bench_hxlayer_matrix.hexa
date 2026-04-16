@@ -1,0 +1,152 @@
+// ═══════════════════════════════════════════════════════════════
+//  bench_hxlayer_matrix.hexa — C2 Step 3+ FFI speedup curve sweep
+//
+//  Sweeps DIM in {64, 128, 256, 512, 1024, 2048, 4096} and reports
+//  per-DIM (ref_us/call, ffi_us/call, ratio) to locate the crossover
+//  point where FFI dispatch overhead becomes negligible vs SIMD compute.
+//
+//  Baseline reference:
+//    self/bench_hxlayer.hexa @ DIM=128 iters=10000 measured 285x
+//
+//  Run:
+//    DYLD_LIBRARY_PATH=self/native/build HXLAYER_FFI_LIVE=1 \
+//      ./hexa run self/bench_hxlayer_matrix.hexa
+//
+//  HXLAYER_FFI_LIVE=1 is required — without the gate the interpreter's
+//  FFI dispatch path returns uninitialised state and segfaults on entry.
+// ═══════════════════════════════════════════════════════════════
+
+@link("hxlayer")
+extern fn hxlayer_rmsnorm_silu(N: int, out: *Void, x: *Void, gamma: *Void, eps: float)
+
+fn fabs_b(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn ref_rmsnorm_silu(x, gamma, eps) {
+    let n = len(x)
+    let mut ms = 0.0
+    for p in 0..n { ms = ms + x[p] * x[p] }
+    ms = ms / (n * 1.0)
+    let inv_r = 1.0 / sqrt(ms + eps)
+    let mut out = []
+    for p in 0..n {
+        let t = x[p] * inv_r * gamma[p]
+        let s = 1.0 / (1.0 + exp(0.0 - t))
+        out = out + [t * s]
+    }
+    return out
+}
+
+fn make_monotone(n) {
+    let mut v = []
+    for i in 0..n { v = v + [(i + 1) * 1.0 / (n * 1.0)] }
+    return v
+}
+
+fn make_ones(n) {
+    let mut v = []
+    for _ in 0..n { v = v + [1.0] }
+    return v
+}
+
+// Pad a decimal string to width `w` for column alignment.
+fn pad_right(s, w) {
+    let mut out = s
+    let mut n = len(s)
+    while n < w { out = out + " "; n = n + 1 }
+    return out
+}
+
+// Stringify a float — full precision (no truncation; interpreter
+// slice [0..N] on a short string can hit bound issues).
+fn fmt_f(x) { return to_string(x) }
+
+// Sweep a single DIM; returns nothing — prints one table row.
+fn sweep_dim(DIM, ITERS) {
+    let EPS = 0.00001
+    let x = make_monotone(DIM)
+    let g = make_ones(DIM)
+
+    // Warmup pure-hexa (amortize interpreter caches)
+    let _w0 = ref_rmsnorm_silu(x, g, EPS)
+
+    // ── pure-hexa timing ─────────────────────────────────────
+    let t0_ref = clock()
+    let mut i = 0
+    let mut acc_ref = 0.0
+    while i < ITERS {
+        let y = ref_rmsnorm_silu(x, g, EPS)
+        acc_ref = acc_ref + y[0]
+        i = i + 1
+    }
+    let t1_ref = clock()
+    let ref_ms = (t1_ref - t0_ref) * 1000.0
+    let ref_per_us = ref_ms * 1000.0 / (ITERS * 1.0)
+
+    // ── fused FFI timing ─────────────────────────────────────
+    let x_buf = alloc_raw(DIM * 4)
+    let g_buf = alloc_raw(DIM * 4)
+    let o_buf = alloc_raw(DIM * 4)
+    for p in 0..DIM {
+        write_f32(x_buf, p * 4, x[p])
+        write_f32(g_buf, p * 4, g[p])
+    }
+
+    // Warmup FFI (resolves dlsym lazily)
+    hxlayer_rmsnorm_silu(DIM, o_buf, x_buf, g_buf, EPS)
+
+    let t0_ffi = clock()
+    let mut j = 0
+    let mut acc_ffi = 0.0
+    while j < ITERS {
+        hxlayer_rmsnorm_silu(DIM, o_buf, x_buf, g_buf, EPS)
+        acc_ffi = acc_ffi + deref_f32(o_buf, 0)
+        j = j + 1
+    }
+    let t1_ffi = clock()
+    let ffi_ms = (t1_ffi - t0_ffi) * 1000.0
+    let ffi_per_us = ffi_ms * 1000.0 / (ITERS * 1.0)
+
+    free_raw(x_buf, DIM * 4)
+    free_raw(g_buf, DIM * 4)
+    free_raw(o_buf, DIM * 4)
+
+    let mut ratio = 0.0
+    if ffi_ms > 0.001 { ratio = ref_ms / ffi_ms }
+
+    // Touch accumulators so DCE can't drop loops.
+    let delta = fabs_b(acc_ref - acc_ffi)
+    let mut agree = "ok"
+    if delta > 1000000.0 { agree = "DIVERGE" }
+
+    // Row: DIM | iters | ref_us/call | ffi_us/call | ratio | agree
+    let row = pad_right(to_string(DIM), 6)
+            + pad_right(to_string(ITERS), 8)
+            + pad_right(fmt_f(ref_per_us), 14)
+            + pad_right(fmt_f(ffi_per_us), 14)
+            + pad_right(fmt_f(ratio) + "x", 12)
+            + agree
+    println(row)
+}
+
+fn main() {
+    println("=== bench_hxlayer_matrix — FFI speedup curve ===")
+    let header = pad_right("DIM", 6)
+               + pad_right("iters", 8)
+               + pad_right("ref_us/call", 14)
+               + pad_right("ffi_us/call", 14)
+               + pad_right("ratio", 12)
+               + "agree"
+    println(header)
+    println("------------------------------------------------------------")
+
+    // DIM capped at 1024: pure-hexa ref path's `out = out + [t*s]`
+    // is O(n²) per call (interpreter list realloc), so DIM=2048+ blows
+    // RSS past 8GB. Larger-DIM FFI scaling belongs in the standalone
+    // C driver in hxlayer_linux.c, not the interpreter comparison.
+    let dims  = [64, 128, 256, 512, 1024]
+    let iters = [20000, 10000, 3000, 800, 200]
+    for k in 0..len(dims) {
+        sweep_dim(dims[k], iters[k])
+    }
+    println("=== done ===")
+}
