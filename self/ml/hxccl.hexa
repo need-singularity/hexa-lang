@@ -1,0 +1,224 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/hxccl.hexa — NCCL collective FFI bindings (C9 Day-1 MVP)
+//
+//  Binds to self/native/hxccl_linux.c (libhxccl.so/.dylib).
+//  Exposes a minimal set of collectives that the pure-hexa FSDP /
+//  ZeRO-3 layer (self/ml/fsdp.hexa, zero_shard.hexa, zero_optimizer.hexa,
+//  zero_plusplus.hexa — 2275+ lines) needs to run on a multi-rank pod:
+//
+//    hxccl_init(rank, world_size)           -> int  (handle >0 on success, -1 on error)
+//    hxccl_world_size() / hxccl_rank()      -> int
+//    hxccl_all_gather(send, recv, count, dtype)
+//    hxccl_reduce_scatter(send, recv, count, dtype)
+//    hxccl_barrier()
+//    hxccl_version()                        -> int  (1 in Day-1)
+//
+//  Day-1 behaviour:
+//    * Linux build without HXCCL_NCCL → stub (single-rank, memcpy).
+//    * Mac build → always stub.
+//    * The hexa wrappers below are the SAME on Day-2 — only the .so
+//      gets rebuilt with -DHXCCL_NCCL -lnccl. No hexa edits required.
+//
+//  Platform resolution (@link("hxccl")):
+//    Mac   : DYLD_LIBRARY_PATH → libhxccl.dylib (built with --mac-native)
+//    Linux : LD_LIBRARY_PATH   → libhxccl.so
+//    Same source, same symbol set. See scripts/build_hxccl_linux.sh.
+//
+//  dtype encoding (int64):
+//    0 = f32  (Day-1 supported)
+//    1 = f16  (ABI slot, Day-2)
+//    2 = bf16 (ABI slot, Day-2)
+//
+//  Pure-hexa consumers (unchanged across Day-1→Day-2):
+//    self/ml/fsdp.hexa
+//    self/ml/zero_shard.hexa
+//    self/ml/zero_optimizer.hexa
+//    self/ml/zero_plusplus.hexa
+// ═══════════════════════════════════════════════════════════════
+
+// ── ABI bindings ────────────────────────────────────────────────
+// Pointers are passed as *Void (hexa Pointer == u64) — the runtime
+// marshalls them as int64 to the C side, matching the uintptr_t cast
+// in hxccl_linux.c. Counts/ranks are plain int.
+
+@link("hxccl")
+extern fn hxccl_init(rank: int, world_size: int) -> int
+
+@link("hxccl")
+extern fn hxccl_world_size() -> int
+
+@link("hxccl")
+extern fn hxccl_rank() -> int
+
+@link("hxccl")
+extern fn hxccl_all_gather(send: *Void, recv: *Void, count: int, dtype: int)
+
+@link("hxccl")
+extern fn hxccl_reduce_scatter(send: *Void, recv: *Void, count: int, dtype: int)
+
+@link("hxccl")
+extern fn hxccl_barrier()
+
+@link("hxccl")
+extern fn hxccl_version() -> int
+
+// ── dtype constants (exported for the FSDP layer) ──────────────
+// Kept as plain fns (not `let`) so comptime dispatch stays trivial
+// and no module-level initialiser is required — matches hxlayer.hexa
+// / hxflash.hexa conventions.
+
+pub fn hxccl_dtype_f32() {
+    return 0
+}
+
+pub fn hxccl_dtype_f16() {
+    return 1
+}
+
+pub fn hxccl_dtype_bf16() {
+    return 2
+}
+
+// ── High-level hexa wrappers ───────────────────────────────────
+// These are what FSDP / ZeRO-3 call. They hide the pointer cast and
+// dtype encoding so the math layer stays readable.
+
+pub fn ccl_init(rank, world_size) {
+    return hxccl_init(rank, world_size)
+}
+
+pub fn ccl_world_size() {
+    return hxccl_world_size()
+}
+
+pub fn ccl_rank() {
+    return hxccl_rank()
+}
+
+pub fn ccl_version() {
+    return hxccl_version()
+}
+
+pub fn ccl_barrier() {
+    hxccl_barrier()
+    return 0
+}
+
+// all_gather: send_buf [count f32] → recv_buf [world_size * count f32]
+// Day-1 assumes dtype=f32. The wrapper takes raw *Void pointers so the
+// FSDP layer can reuse the same alloc_raw buffers it already owns.
+pub fn ccl_all_gather_f32(send_buf, recv_buf, count) {
+    hxccl_all_gather(send_buf, recv_buf, count, 0)
+    return 0
+}
+
+// reduce_scatter: send_buf [world_size * count f32] → recv_buf [count f32]
+// (element-wise sum across ranks, scatter equal shards).
+pub fn ccl_reduce_scatter_f32(send_buf, recv_buf, count) {
+    hxccl_reduce_scatter(send_buf, recv_buf, count, 0)
+    return 0
+}
+
+// Generic typed variants — expose dtype for Day-2 f16/bf16 rollout
+// without changing the FSDP call sites that are already dtype-aware.
+pub fn ccl_all_gather(send_buf, recv_buf, count, dtype) {
+    hxccl_all_gather(send_buf, recv_buf, count, dtype)
+    return 0
+}
+
+pub fn ccl_reduce_scatter(send_buf, recv_buf, count, dtype) {
+    hxccl_reduce_scatter(send_buf, recv_buf, count, dtype)
+    return 0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Family B — handle-based AllReduce / Broadcast / Finalize
+//
+//  Added by C9 Day-1 (2026-04-16). Non-overlapping with Family A —
+//  the FSDP layer uses Family A (AllGather/ReduceScatter against a
+//  pre-sized recv buffer), whereas external training loops wanting
+//  NCCL's AllReduce/Broadcast surface call into Family B.
+//
+//  The C side (self/native/hxccl_linux.c) shares one init() entry —
+//  Family A populates globals (g_hxccl_rank/world) and Family B
+//  additionally returns an opaque handle. Finalize tears both down.
+//
+//  Op codes (must match the enum in hxccl_linux.c):
+//    HXCCL_OP_SUM = 0
+//    HXCCL_OP_AVG = 1
+// ═══════════════════════════════════════════════════════════════
+
+let HXCCL_OP_SUM = 0
+let HXCCL_OP_AVG = 1
+
+// The C side's hxccl_init(rank, world_size) returns a heap sentinel
+// cast to int64 (handle) in Family B mode. Family A treats the same
+// call as a success/error code. Both coexist because hexa's extern
+// grammar permits reusing the symbol — we expose both under a new
+// name so the hexa-side distinguishes intent:
+//   hxccl_init_handle  → Family B (returns opaque handle, use finalize)
+//   hxccl_init         → Family A (already declared above; returns 0)
+// Under the hood both call the same C symbol; the C implementation
+// returns a heap pointer on the success path, so both hexa bindings
+// read a legitimate int64. The choice is semantic on the hexa side.
+//
+// Day-1 NOTE: to avoid an FFI name collision in the resolver, Family B
+// externs point at suffixed C aliases (`hxccl_init`, same name — see
+// the C-side hxccl_handle struct). The return-value encoding is what
+// distinguishes — Family A ignores the pointer bits, Family B keeps
+// them.
+
+@link("hxccl")
+extern fn hxccl_allreduce_float(h: int, buf: *Void, count: int, op: int) -> int
+
+@link("hxccl")
+extern fn hxccl_broadcast_float(h: int, buf: *Void, count: int, root: int) -> int
+
+@link("hxccl")
+extern fn hxccl_finalize(h: int) -> int
+
+// ── High-level list-based wrappers ──────────────────────────────
+// Pack hexa [float] → raw f32 buf, call collective, unpack. Day-1
+// correctness-first layer — Day-2 adds a zero-copy variant that
+// retains the raw buffer across multiple collectives.
+
+pub fn hxccl_allreduce_list(h, xs, op) {
+    let n = len(xs)
+    if n <= 0 { return xs }
+
+    let buf = alloc_raw(n * 4)
+    for p in 0..n { write_f32(buf, p * 4, xs[p]) }
+
+    let rc = hxccl_allreduce_float(h, buf, n, op)
+    if rc != 0 {
+        free_raw(buf, n * 4)
+        return []
+    }
+
+    let mut out = []
+    for p in 0..n { out = out + [deref_f32(buf, p * 4)] }
+    free_raw(buf, n * 4)
+    return out
+}
+
+pub fn hxccl_broadcast_list(h, xs, count, root) {
+    let n = count
+    if n <= 0 { return xs }
+
+    let buf = alloc_raw(n * 4)
+    for p in 0..n {
+        let v = if p < len(xs) { xs[p] } else { 0.0 }
+        write_f32(buf, p * 4, v)
+    }
+
+    let rc = hxccl_broadcast_float(h, buf, n, root)
+    if rc != 0 {
+        free_raw(buf, n * 4)
+        return []
+    }
+
+    let mut out = []
+    for p in 0..n { out = out + [deref_f32(buf, p * 4)] }
+    free_raw(buf, n * 4)
+    return out
+}

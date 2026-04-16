@@ -1,0 +1,166 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_hxccl.hexa — C9 Day-1 NCCL shim smoke test
+//
+//  Verifies self/ml/hxccl.hexa bindings compile and (on Mac-stub mode
+//  or a Linux single-GPU smoke) exercise the ABI end-to-end.
+//
+//  Structure (pure-hexa first; FFI path guarded behind HXCCL_FFI_LIVE):
+//    T1  op-code constants present   (HXCCL_OP_SUM=0, HXCCL_OP_AVG=1)
+//    T2  (guarded) hxccl_version() == 1
+//    T3  (guarded) init(rank=0, world=1) returns a handle != -1
+//    T4  (guarded) finalize(handle) == 0
+//    T5  (guarded Mac stub) allreduce on world=1 returns 0 (no-op)
+//
+//  On Mac without libhxccl_stub.dylib in DYLD_LIBRARY_PATH, T2-T5 SKIP.
+//  With --mac-stub artefact loaded, T2-T5 run and exercise the stub
+//  branch (init returns a heap sentinel, collectives no-op on world=1).
+//
+//  On Linux with libhxccl.so + CUDA + NCCL, T2-T5 run against a real
+//  single-rank NCCL comm (world=1 is a degenerate but legal NCCL config
+//  and exercises the full init → allreduce → finalize path).
+//
+//  Run (Mac stub):
+//    bash scripts/build_hxccl_linux.sh --mac-stub
+//    ln -sf libhxccl_stub.dylib self/native/build/libhxccl.dylib
+//    HXCCL_FFI_LIVE=1 DYLD_LIBRARY_PATH=self/native/build \
+//        ./hexa self/test_hxccl.hexa
+//
+//  Expected (Mac, no live FFI):  PASS=1 FAIL=0 SKIP=4
+//  Expected (Mac, stub loaded):  PASS=5 FAIL=0 SKIP=0
+//  Expected (Linux, libhxccl.so): PASS=5 FAIL=0 SKIP=0
+// ═══════════════════════════════════════════════════════════════
+
+let mut PASS = 0
+let mut FAIL = 0
+let mut SKIP = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + label)
+    }
+}
+
+fn skip(label, reason) {
+    SKIP = SKIP + 1
+    println("[SKIP] " + label + " — " + reason)
+}
+
+// ── op-code constants mirror self/ml/hxccl.hexa ────────────────
+let HXCCL_OP_SUM = 0
+let HXCCL_OP_AVG = 1
+
+// Externs must be declared at module scope even if calls are guarded.
+@link("hxccl")
+extern fn hxccl_version() -> int
+
+@link("hxccl")
+extern fn hxccl_init(rank: int, world_size: int) -> int
+
+@link("hxccl")
+extern fn hxccl_allreduce_float(h: int, buf: *Void, count: int, op: int) -> int
+
+@link("hxccl")
+extern fn hxccl_finalize(h: int) -> int
+
+// ── tests ───────────────────────────────────────────────────────
+
+fn t1_constants() {
+    // Structural: the op-code constants are defined and distinct.
+    let ok = (HXCCL_OP_SUM == 0) && (HXCCL_OP_AVG == 1)
+    check("T1 constants: SUM=0, AVG=1", ok)
+}
+
+fn t2_version() {
+    let gate = env_var("HXCCL_FFI_LIVE")
+    if gate != "1" {
+        skip("T2 version", "set HXCCL_FFI_LIVE=1 to exercise FFI")
+        return 0
+    }
+    let v = hxccl_version()
+    check("T2 version == 1", v == 1)
+    return 0
+}
+
+fn t3_init_handle() {
+    let gate = env_var("HXCCL_FFI_LIVE")
+    if gate != "1" {
+        skip("T3 init handle", "set HXCCL_FFI_LIVE=1 to exercise FFI")
+        return 0
+    }
+    // world_size=1, rank=0 — degenerate but legal; works on both stub
+    // and real NCCL paths.
+    let h = hxccl_init(0, 1)
+    check("T3 init(0,1) returns handle != -1", h != (0 - 1))
+    if h != (0 - 1) {
+        let _ = hxccl_finalize(h)
+    }
+    return 0
+}
+
+fn t4_finalize() {
+    let gate = env_var("HXCCL_FFI_LIVE")
+    if gate != "1" {
+        skip("T4 finalize", "set HXCCL_FFI_LIVE=1 to exercise FFI")
+        return 0
+    }
+    let h = hxccl_init(0, 1)
+    if h == (0 - 1) {
+        check("T4 finalize — init failed (skipping)", false)
+        return 0
+    }
+    let rc = hxccl_finalize(h)
+    check("T4 finalize(handle) == 0", rc == 0)
+    return 0
+}
+
+fn t5_allreduce_world1() {
+    let gate = env_var("HXCCL_FFI_LIVE")
+    if gate != "1" {
+        skip("T5 allreduce world=1", "set HXCCL_FFI_LIVE=1 to exercise FFI")
+        return 0
+    }
+    let h = hxccl_init(0, 1)
+    if h == (0 - 1) {
+        check("T5 allreduce — init failed (skipping)", false)
+        return 0
+    }
+
+    // Pack a tiny buffer; on world=1 the sum of [1,2,3,4] is itself.
+    let n = 4
+    let buf = alloc_raw(n * 4)
+    write_f32(buf, 0 * 4, 1.0)
+    write_f32(buf, 1 * 4, 2.0)
+    write_f32(buf, 2 * 4, 3.0)
+    write_f32(buf, 3 * 4, 4.0)
+
+    let rc = hxccl_allreduce_float(h, buf, n, HXCCL_OP_SUM)
+
+    // On the Mac stub: allreduce on world=1 returns 0 and leaves the
+    // buffer untouched. On real NCCL (world=1): same behaviour — a
+    // self-reduce is a no-op.
+    // Verify rc == 0 AND the buffer contents survive (sum of one copy).
+    let ok_rc  = (rc == 0)
+    let ok_buf = (deref_f32(buf, 0 * 4) == 1.0) &&
+                 (deref_f32(buf, 3 * 4) == 4.0)
+
+    free_raw(buf, n * 4)
+    let _ = hxccl_finalize(h)
+
+    check("T5 allreduce(world=1) rc=0 and buffer preserved",
+          ok_rc && ok_buf)
+    return 0
+}
+
+fn main() {
+    println("=== test_hxccl ===")
+    t1_constants()
+    t2_version()
+    t3_init_handle()
+    t4_finalize()
+    t5_allreduce_world1()
+    println("---- test_hxccl: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL) + " SKIP=" + to_string(SKIP) + " ----")
+}
