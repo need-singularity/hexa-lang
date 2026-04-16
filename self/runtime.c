@@ -573,6 +573,12 @@ static int64_t _hx_stats_str_concat     = 0;
 static int64_t _hx_stats_array_reserve  = 0;
 static int64_t _hx_stats_map_new        = 0;
 static int64_t _hx_stats_map_set        = 0;
+// P4 self-host: codegen_c2 emits __hexa_fn_arena_enter/return for
+// per-function arena scoping. Currently no-op stubs — full arena GC
+// is a future optimization (rt 32-L scope narrowing).
+static inline void __hexa_fn_arena_enter(void) { /* no-op */ }
+static inline HexaVal __hexa_fn_arena_return(HexaVal v) { return v; }
+
 // rt 32-D: arena allocator stats (str_concat hot-path)
 static int64_t _hx_stats_arena_alloc    = 0;   // total arena bump allocations
 static int64_t _hx_stats_arena_blocks   = 0;   // blocks created
