@@ -130,6 +130,10 @@ HexaVal hexa_mul(HexaVal a, HexaVal b);
 HexaVal hexa_div(HexaVal a, HexaVal b);
 HexaVal hexa_mod(HexaVal a, HexaVal b);
 HexaVal hexa_eq(HexaVal a, HexaVal b);
+HexaVal hexa_cmp_lt(HexaVal a, HexaVal b);
+HexaVal hexa_cmp_gt(HexaVal a, HexaVal b);
+HexaVal hexa_cmp_le(HexaVal a, HexaVal b);
+HexaVal hexa_cmp_ge(HexaVal a, HexaVal b);
 HexaVal hexa_to_string(HexaVal v);
 HexaVal hexa_str_concat(HexaVal a, HexaVal b);
 HexaVal hexa_abs(HexaVal v);
@@ -1264,13 +1268,15 @@ static HexaVal hexa_map_get_ic_slow(HexaVal m, const char* key, HexaIC* ic) {
     if (hexa_ic_stats_on()) { ic->misses++; g_hexa_ic_misses++; }
     if (m.tag == TAG_MAP && m.map.tbl) {
         HexaMapTable* t = m.map.tbl;
-        for (int i = 0; i < t->len; i++) {
-            if (strcmp(t->order_keys[i], key) == 0) {
-                ic->keys_ptr = (void*)t->order_keys;
-                ic->len      = t->len;
-                ic->idx      = i;
-                return t->order_vals[i];
-            }
+        // ROI-43: O(1) avg via hmap_find instead of O(n) linear scan.
+        uint32_t h = hexa_fnv1a_str(key);
+        int si = hmap_find(t, key, h);
+        if (si >= 0) {
+            int oi = t->slots[si].order_idx;  // ROI-24 cached order index
+            ic->keys_ptr = (void*)t->order_keys;
+            ic->len      = t->len;
+            ic->idx      = oi;
+            return t->order_vals[oi];
         }
     }
     return hexa_map_get(m, key);
@@ -2119,6 +2125,9 @@ HexaVal hexa_str_concat(HexaVal a, HexaVal b) {
     char* sb = b.tag == TAG_STR ? b.s : "";
     size_t la = strlen(sa);
     size_t lb = strlen(sb);
+    // ROI-36: empty-string elision — skip alloc+memcpy when one side is "".
+    if (la == 0) return b.tag == TAG_STR ? b : hexa_str(sb);
+    if (lb == 0) return a.tag == TAG_STR ? a : hexa_str(sa);
     size_t total = la + lb + 1;
     char* result;
     if (hexa_arena_on()) {
@@ -2381,7 +2390,9 @@ HexaVal hexa_type_of(HexaVal v) {
 
 // ── Polymorphic add (int + or string concat) ─────────────
 
-HexaVal hexa_add(HexaVal a, HexaVal b) {
+// ROI-37: rename impl to _slow so the macro below can inline the int+int
+// fast path without function-call ABI overhead.
+static HexaVal hexa_add_slow(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(a.i + b.i);
     if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT) {
         // T39: unwrap via __hx_to_double so TAG_VALSTRUCT wrappers don't
@@ -2404,6 +2415,14 @@ HexaVal hexa_add(HexaVal a, HexaVal b) {
     HexaVal sb = hexa_to_string(b);
     return hexa_str_concat(sa, sb);
 }
+
+// ROI-37: inline macro — int+int hot path avoids 32-byte HexaVal call ABI.
+// Evaluates each operand exactly once via temporaries.
+#define hexa_add(A, B) \
+    ({ HexaVal __ha = (A), __hb = (B); \
+       (__ha.tag == TAG_INT && __hb.tag == TAG_INT) \
+           ? hexa_int(__ha.i + __hb.i) \
+           : hexa_add_slow(__ha, __hb); })
 
 // ── Polymorphic equality ─────────────────────────────────
 
@@ -2730,6 +2749,30 @@ HexaVal hexa_mod(HexaVal a, HexaVal b) {
     if (a.tag == TAG_INT && b.tag == TAG_INT) return hexa_int(b.i ? a.i % b.i : 0);
     return hexa_int(0);
 }
+
+// ROI-44: comparison runtime helpers — replace inline GCC stmt-expr in codegen.
+// Semantics: TAG_FLOAT promotes to double compare; TAG_INT uses int64 compare.
+HexaVal hexa_cmp_lt(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+        return hexa_bool(__hx_to_double(a) < __hx_to_double(b));
+    return hexa_bool(a.i < b.i);
+}
+HexaVal hexa_cmp_gt(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+        return hexa_bool(__hx_to_double(a) > __hx_to_double(b));
+    return hexa_bool(a.i > b.i);
+}
+HexaVal hexa_cmp_le(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+        return hexa_bool(__hx_to_double(a) <= __hx_to_double(b));
+    return hexa_bool(a.i <= b.i);
+}
+HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
+    if (a.tag == TAG_FLOAT || b.tag == TAG_FLOAT)
+        return hexa_bool(__hx_to_double(a) >= __hx_to_double(b));
+    return hexa_bool(a.i >= b.i);
+}
+
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
     if (s.tag != TAG_STR) return s;
     int count = n.i;
