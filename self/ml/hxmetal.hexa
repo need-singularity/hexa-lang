@@ -1,0 +1,173 @@
+// ===============================================================
+//  self/ml/hxmetal.hexa -- Metal compute FFI bindings (M4 GPU)
+//
+//  Binds to self/native/hxmetal_macos.m (libhxmetal.dylib).
+//  Exposes GPU GEMM (MPS), fused FFN forward, and buffer management
+//  for M4's 10-core GPU (3.6 TFLOPS idle -> utilized).
+//
+//  Platform: macOS only (Metal). Linux builds have no hxmetal --
+//  they use hxblas (OpenBLAS) and hxcuda instead.
+//
+//  ABI: same int64_t pointer casting as hxblas/hxflash -- pointers
+//  passed as *Void (hexa Pointer == u64), cast to (T*)(uintptr_t)
+//  on the C side. <=6 args per FFI call (interpreter ceiling).
+//
+//  Resolution: @link("hxmetal") -> DYLD_LIBRARY_PATH -> libhxmetal.dylib
+//  Build: hexa scripts/build_hxmetal.hexa
+// ===============================================================
+
+// -- ABI bindings ------------------------------------------------
+
+@link("hxmetal")
+extern fn hxmetal_init() -> int
+
+@link("hxmetal")
+extern fn hxmetal_version() -> int
+
+// matmul: C[M,N] = A[M,K] * B[K,N]  (6 args -- fits ffi_call_6)
+@link("hxmetal")
+extern fn hxmetal_matmul(M: int, K: int, N: int, A: *Void, B: *Void, C: *Void) -> int
+
+// Buffer management
+@link("hxmetal")
+extern fn hxmetal_buf_create(size: int) -> int
+
+@link("hxmetal")
+extern fn hxmetal_buf_write(handle_val: int, src: *Void, size: int) -> int
+
+@link("hxmetal")
+extern fn hxmetal_buf_read(handle_val: int, dst: *Void, size: int) -> int
+
+@link("hxmetal")
+extern fn hxmetal_buf_free(handle_val: int) -> int
+
+@link("hxmetal")
+extern fn hxmetal_sync() -> int
+
+// -- FFN forward: >6 args -> struct-pack ABI ----------------------
+// hxmetal_ffn_fwd(d_model, d_ff, batch, W1, W2, X, Y) = 7 args
+// exceeds ffi_call_6 ceiling. Pack into struct, pass single pointer.
+//
+// HxMetalFFNArgs layout (must match hxmetal_macos.m):
+//   off  field       bytes
+//     0  d_model     8
+//     8  d_ff        8
+//    16  batch       8
+//    24  W1          8  (float* as int64)
+//    32  W2          8
+//    40  X           8
+//    48  Y           8
+//   --- total = 56 bytes
+
+// Direct 7-arg binding (only works via native codegen, NOT interpreter)
+@link("hxmetal")
+extern fn hxmetal_ffn_fwd(d_model: int, d_ff: int, batch: int,
+                          W1: *Void, W2: *Void, X: *Void, Y: *Void) -> int
+
+let HXMETAL_FFN_OFF_DMODEL = 0
+let HXMETAL_FFN_OFF_DFF    = 8
+let HXMETAL_FFN_OFF_BATCH  = 16
+let HXMETAL_FFN_OFF_W1     = 24
+let HXMETAL_FFN_OFF_W2     = 32
+let HXMETAL_FFN_OFF_X      = 40
+let HXMETAL_FFN_OFF_Y      = 48
+let HXMETAL_FFN_STRUCT_BYTES = 56
+
+// -- High-level wrappers ------------------------------------------
+
+// Initialize Metal and verify ABI version.
+// Returns: 0 on success, negative on error.
+pub fn metal_init() {
+    let rc = hxmetal_init()
+    if rc != 0 {
+        eprintln("hxmetal: init failed, error=" + str(rc))
+        return rc
+    }
+    let ver = hxmetal_version()
+    if ver < 1 {
+        eprintln("hxmetal: ABI version mismatch, got " + str(ver) + " want >=1")
+        return -99
+    }
+    return 0
+}
+
+// GPU matmul: C = A * B (row-major float32)
+// A: [M, K], B: [K, N], C: [M, N]
+// A_buf, B_buf, C_buf are raw f32 pointers (from alloc_raw).
+pub fn metal_matmul(M, K, N, A_buf, B_buf, C_buf) {
+    let rc = hxmetal_matmul(M, K, N, A_buf, B_buf, C_buf)
+    if rc != 0 {
+        eprintln("hxmetal: matmul failed, error=" + str(rc))
+    }
+    return rc
+}
+
+// GPU FFN forward: Y = GELU(X * W1) * W2
+// X: [batch, d_model], W1: [d_model, d_ff], W2: [d_ff, d_model], Y: [batch, d_model]
+// All pointers are raw f32 buffers.
+pub fn metal_ffn_fwd(d_model, d_ff, batch, W1_buf, W2_buf, X_buf, Y_buf) {
+    // 7 args exceeds ffi_call_6 -- use direct call (native codegen path).
+    // If running under interpreter, this will need struct-pack like hxflash.
+    let rc = hxmetal_ffn_fwd(d_model, d_ff, batch, W1_buf, W2_buf, X_buf, Y_buf)
+    if rc != 0 {
+        eprintln("hxmetal: ffn_fwd failed, error=" + str(rc))
+    }
+    return rc
+}
+
+// -- 2D matrix helpers (matching hxflash.hexa pattern) ------------
+
+// Pack a 2D hexa array [[float]] into a raw f32 buffer.
+// buf must be pre-allocated with rows*cols*4 bytes.
+pub fn metal_pack_2d(M, buf, rows, cols) {
+    for i in 0..rows {
+        for j in 0..cols {
+            write_f32(buf, (i * cols + j) * 4, M[i][j])
+        }
+    }
+    return 0
+}
+
+// Unpack a raw f32 buffer into a 2D hexa array.
+pub fn metal_unpack_2d(buf, rows, cols) {
+    let mut M = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols {
+            row.push(deref_f32(buf, (i * cols + j) * 4))
+        }
+        M.push(row)
+    }
+    return M
+}
+
+// High-level matmul: takes 2D hexa arrays, returns 2D hexa array.
+// A: [M][K], B: [K][N] -> C: [M][N]
+pub fn metal_matmul_2d(A, B, M, K, N) {
+    let a_bytes = M * K * 4
+    let b_bytes = K * N * 4
+    let c_bytes = M * N * 4
+
+    let a_buf = alloc_raw(a_bytes)
+    let b_buf = alloc_raw(b_bytes)
+    let c_buf = alloc_raw(c_bytes)
+
+    metal_pack_2d(A, a_buf, M, K)
+    metal_pack_2d(B, b_buf, K, N)
+
+    let rc = metal_matmul(M, K, N, a_buf, b_buf, c_buf)
+    if rc != 0 {
+        free_raw(a_buf, a_bytes)
+        free_raw(b_buf, b_bytes)
+        free_raw(c_buf, c_bytes)
+        return []
+    }
+
+    let C = metal_unpack_2d(c_buf, M, N)
+
+    free_raw(a_buf, a_bytes)
+    free_raw(b_buf, b_bytes)
+    free_raw(c_buf, c_bytes)
+
+    return C
+}
