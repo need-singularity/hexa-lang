@@ -44,6 +44,97 @@ struct CodegenResult {
     format: int
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  MULTI-FUNCTION CALL LINKAGE
+// ═══════════════════════════════════════════════════════════════
+// Tracks BL/CALL instructions that reference other functions by ID.
+// After all functions are emitted, a fixup pass patches each BL with
+// the correct relative offset to the target function's entry point.
+
+// A single call-site fixup: records where a BL was emitted and which
+// function (by module function-ID) it targets.
+struct CallFixup {
+    code_offset: int,     // byte offset in the all_code buffer where BL sits
+    target_fid: int       // function ID in module.functions[]
+}
+
+// Result from emitting a single function: code bytes + call fixups.
+struct EmitResult {
+    code: [int],
+    call_fixups: [CallFixup]
+}
+
+// Function symbol table entry: maps function ID to its byte offset
+// in the concatenated code buffer.
+struct FuncSymbol {
+    fid: int,
+    offset: int       // byte offset of the function's first instruction
+}
+
+// Look up a function's byte offset by its fid in the symbol table.
+fn symtab_lookup(syms: [FuncSymbol], fid: int) -> int {
+    let mut i = 0
+    while i < len(syms) {
+        if syms[i].fid == fid {
+            return syms[i].offset
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Patch all call fixups in the code buffer using the symbol table.
+// Each fixup points to a BL instruction (ARM64: 4 bytes at code_offset).
+// The BL target is computed as: (target_offset - bl_offset) / 4
+// encoded into the imm26 field of the BL instruction.
+fn patch_call_fixups_arm64(code: [int], fixups: [CallFixup], syms: [FuncSymbol]) -> [int] {
+    let mut c = code
+    let mut i = 0
+    while i < len(fixups) {
+        let fx = fixups[i]
+        let target_off = symtab_lookup(syms, fx.target_fid)
+        if target_off >= 0 {
+            let bl_off = fx.code_offset
+            // ARM64 BL: relative offset in units of 4-byte instructions
+            let rel = (target_off - bl_off) / 4
+            // Re-encode BL: opcode 0x94 in top byte, imm26 in low 26 bits
+            // Handle negative offsets (backward calls) via masking to 26 bits
+            let imm26 = rel % 67108864  // 2^26 = 67108864
+            let patched = 0x94000000 + imm26
+            c[bl_off] = patched % 256
+            c[bl_off + 1] = (patched / 256) % 256
+            c[bl_off + 2] = (patched / 65536) % 256
+            c[bl_off + 3] = (patched / 16777216) % 256
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// x86-64 CALL fixup: E8 rel32 (5 bytes). Relative offset from the
+// byte after the CALL instruction (bl_off + 5).
+fn patch_call_fixups_x86(code: [int], fixups: [CallFixup], syms: [FuncSymbol]) -> [int] {
+    let mut c = code
+    let mut i = 0
+    while i < len(fixups) {
+        let fx = fixups[i]
+        let target_off = symtab_lookup(syms, fx.target_fid)
+        if target_off >= 0 {
+            let call_off = fx.code_offset
+            // x86 CALL rel32: offset relative to next instruction (call_off + 5)
+            let rel = target_off - (call_off + 5)
+            // Encode as E8 + 32-bit LE relative offset
+            c[call_off] = 0xe8
+            c[call_off + 1] = rel % 256
+            c[call_off + 2] = (rel / 256) % 256
+            c[call_off + 3] = (rel / 65536) % 256
+            c[call_off + 4] = (rel / 16777216) % 256
+        }
+        i = i + 1
+    }
+    return c
+}
+
 // Detect the current host target.
 // Hexa runs on macOS ARM64 by default in this project.
 fn host_target() -> [int] {
@@ -208,8 +299,9 @@ fn resolve_reg_x86(alloc: FuncAlloc, vid: int) -> int {
 //   alloc   (sub sp)
 //   store   (str to stack)
 
-fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
+fn emit_function_arm64(func, alloc: FuncAlloc) -> EmitResult {
     let mut code = []
+    let mut call_fixups = []
 
     // --- Prologue ---
     code = emit_prologue(code, alloc.stack_size)
@@ -322,7 +414,13 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
                         }
                         ai = ai + 1
                     }
-                    // BL <offset> — placeholder 0, needs link-time fixup
+                    // Record call fixup: BL target is operands[0].a (function ID)
+                    let target_fid = instr.operands[0].a
+                    call_fixups = call_fixups.push(CallFixup {
+                        code_offset: len(code),
+                        target_fid: target_fid
+                    })
+                    // BL <offset> — placeholder 0, patched in link pass
                     code = emit32(code, 0x94000000)
                     // Move result from x0 to rd
                     if rd != 0 {
@@ -386,7 +484,7 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
     // --- Epilogue ---
     code = emit_epilogue(code, alloc.stack_size)
 
-    // --- Patch branch fixups ---
+    // --- Patch branch fixups (intra-function) ---
     // Each fixup references a target block id. We find the block's
     // index in func.blocks, then compute the relative offset.
     let mut fi = 0
@@ -411,7 +509,7 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
         fi = fi + 1
     }
 
-    return code
+    return EmitResult { code: code, call_fixups: call_fixups }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -419,8 +517,9 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> [int] {
 // ═══════════════════════════════════════════════════════════════
 // Simplified x86-64 emitter for the same IR instruction set.
 
-fn emit_function_x86(func, alloc: FuncAlloc) -> [int] {
+fn emit_function_x86(func, alloc: FuncAlloc) -> EmitResult {
     let mut code = []
+    let mut call_fixups = []
     code = x86_emit_prologue(code, alloc.stack_size)
 
     let mut bi = 0
@@ -457,6 +556,33 @@ fn emit_function_x86(func, alloc: FuncAlloc) -> [int] {
                     code = x86_emit_mov_rr(code, rd, rn)
                     code = x86_emit_alu_rr(code, 0x29, rd, rm)
                 } else {
+                if op == "call" {
+                    // Move args to parameter registers (SysV: rdi, rsi, rdx, rcx, r8, r9)
+                    let x86_param_regs = [5, 4, 2, 1, 8, 9]  // rdi,rsi,rdx,rcx,r8,r9
+                    let mut ai = 1  // skip operands[0] which is func ref
+                    while ai < len(instr.operands) {
+                        let arg_vid = instr.operands[ai].a
+                        let src = resolve_reg_x86(alloc, arg_vid)
+                        let pidx = ai - 1
+                        if pidx < len(x86_param_regs) {
+                            let dst_param = x86_param_regs[pidx]
+                            code = x86_emit_mov_rr(code, dst_param, src)
+                        }
+                        ai = ai + 1
+                    }
+                    // Record call fixup
+                    let target_fid = instr.operands[0].a
+                    call_fixups = call_fixups.push(CallFixup {
+                        code_offset: len(code),
+                        target_fid: target_fid
+                    })
+                    // CALL rel32 — placeholder 5 bytes (E8 00 00 00 00)
+                    code = code.push(0xe8).push(0).push(0).push(0).push(0)
+                    // Move result from rax to rd
+                    if rd != 0 {
+                        code = x86_emit_mov_rr(code, rd, 0)
+                    }
+                } else {
                 if op == "ret" {
                     // Move return value to rax (reg 0) if needed
                     if len(instr.operands) > 0 {
@@ -469,6 +595,7 @@ fn emit_function_x86(func, alloc: FuncAlloc) -> [int] {
                 }
                 }
                 }
+                }
             }
 
             ii = ii + 1
@@ -477,7 +604,7 @@ fn emit_function_x86(func, alloc: FuncAlloc) -> [int] {
     }
 
     code = x86_emit_epilogue(code)
-    return code
+    return EmitResult { code: code, call_fixups: call_fixups }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -499,14 +626,27 @@ fn generate(module, target: int, format: int) -> CodegenResult {
         regs = gp_regs_x86()
     }
 
+    // ── Multi-function linkage state ──
+    // Symbol table: maps each function's ID to its byte offset in all_code.
+    let mut sym_table = []
+    // Accumulated call fixups (offsets are global, relative to all_code).
+    let mut all_call_fixups = []
+
     // --- Per-function pipeline ---
     let mut fi = 0
     while fi < len(module.functions) {
         let func = module.functions[fi]
 
-        // Track offset of the first function (entry point)
+        // Record this function's entry offset in the symbol table.
+        let func_start = len(all_code)
+        sym_table = sym_table.push(FuncSymbol {
+            fid: func.id,
+            offset: func_start
+        })
+
+        // Track entry point (first function or "main" by convention)
         if fi == 0 {
-            main_offset = len(all_code)
+            main_offset = func_start
         }
 
         // Step 1: Flatten IR instructions for regalloc
@@ -519,17 +659,29 @@ fn generate(module, target: int, format: int) -> CodegenResult {
         let alloc = allocate_function_linear(intervals, regs)
 
         // Step 4: Emit machine code for this function
-        let mut func_code = []
+        let mut emit_res = EmitResult { code: [], call_fixups: [] }
         if target == target_arm64() {
-            func_code = emit_function_arm64(func, alloc)
+            emit_res = emit_function_arm64(func, alloc)
         } else {
-            func_code = emit_function_x86(func, alloc)
+            emit_res = emit_function_x86(func, alloc)
         }
+        let mut func_code = emit_res.code
 
         // Step 5: Peephole optimization (ARM64 only)
         if target == target_arm64() {
             let peep = run_peephole(func_code)
             func_code = peep.code
+        }
+
+        // Collect call fixups, adjusting offsets to be global (all_code-relative).
+        let mut cfi = 0
+        while cfi < len(emit_res.call_fixups) {
+            let fx = emit_res.call_fixups[cfi]
+            all_call_fixups = all_call_fixups.push(CallFixup {
+                code_offset: func_start + fx.code_offset,
+                target_fid: fx.target_fid
+            })
+            cfi = cfi + 1
         }
 
         // Append this function's code to the output buffer
@@ -542,7 +694,16 @@ fn generate(module, target: int, format: int) -> CodegenResult {
         fi = fi + 1
     }
 
-    // Step 6: Wrap in object format
+    // Step 6: Patch inter-function call fixups
+    if len(all_call_fixups) > 0 {
+        if target == target_arm64() {
+            all_code = patch_call_fixups_arm64(all_code, all_call_fixups, sym_table)
+        } else {
+            all_code = patch_call_fixups_x86(all_code, all_call_fixups, sym_table)
+        }
+    }
+
+    // Step 7: Wrap in object format
     let mut wrapped = all_code
     if format == objformat_macho() {
         wrapped = macho_wrap(all_code, main_offset)
@@ -588,3 +749,136 @@ fn compile_to_binary(module, output_path: string) -> string {
 
     return ""
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  SELF-TEST — multi-function call linkage
+// ═══════════════════════════════════════════════════════════════
+// Builds a synthetic 2-function IR module and verifies that BL
+// instructions are patched with the correct inter-function offsets.
+//
+// Test program (conceptual):
+//   fn add_one(x) -> int { return x + 1 }
+//   fn main()    -> int { return add_one(41) }
+// Expected: main calls add_one via a BL with a negative offset
+// (add_one is emitted first, so main BL goes backward).
+
+fn test_multi_function_linkage() {
+    println("multi-function call linkage — self-test")
+    let mut ok = true
+
+    // ── Test 1: symtab_lookup ──
+    let syms = [
+        FuncSymbol { fid: 0, offset: 0 },
+        FuncSymbol { fid: 1, offset: 100 },
+        FuncSymbol { fid: 2, offset: 200 }
+    ]
+    if symtab_lookup(syms, 0) != 0 { println("  FAIL: symtab fid=0"); ok = false }
+    if symtab_lookup(syms, 1) != 100 { println("  FAIL: symtab fid=1"); ok = false }
+    if symtab_lookup(syms, 2) != 200 { println("  FAIL: symtab fid=2"); ok = false }
+    if symtab_lookup(syms, 99) != -1 { println("  FAIL: symtab fid=99 should be -1"); ok = false }
+
+    // ── Test 2: ARM64 BL forward-patch ──
+    // Simulate: BL placeholder at offset 0, target function at offset 20
+    // Expected: BL offset = (20 - 0) / 4 = 5 instructions forward
+    // Encoded: 0x94000005
+    let mut code2 = [0, 0, 0, 0x94,   // BL placeholder at byte 0
+                     0, 0, 0, 0,       // padding (4 bytes)
+                     0, 0, 0, 0,       // padding (8 bytes)
+                     0, 0, 0, 0,       // padding (12 bytes)
+                     0, 0, 0, 0,       // padding (16 bytes)
+                     0xc0, 0x03, 0x5f, 0xd6]  // RET at byte 20 (target)
+    let fx2 = [CallFixup { code_offset: 0, target_fid: 1 }]
+    let sy2 = [FuncSymbol { fid: 0, offset: 0 }, FuncSymbol { fid: 1, offset: 20 }]
+    code2 = patch_call_fixups_arm64(code2, fx2, sy2)
+    // BL at offset 0 should now be 0x94000005 (LE: 05 00 00 94)
+    if code2[0] != 0x05 { println("  FAIL: BL fwd byte0=" + to_string(code2[0]) + " want 5"); ok = false }
+    if code2[1] != 0x00 { println("  FAIL: BL fwd byte1=" + to_string(code2[1]) + " want 0"); ok = false }
+    if code2[2] != 0x00 { println("  FAIL: BL fwd byte2=" + to_string(code2[2]) + " want 0"); ok = false }
+    if code2[3] != 0x94 { println("  FAIL: BL fwd byte3=" + to_string(code2[3]) + " want 148"); ok = false }
+
+    // ── Test 3: ARM64 BL backward-patch ──
+    // BL at offset 20, target at offset 0 → relative = (0 - 20) / 4 = -5
+    // ARM64 BL uses signed imm26: -5 = 0x3FFFFFB (26-bit two's complement)
+    // Full encoding: 0x97FFFFFB  (LE: FB FF FF 97)
+    let mut code3 = [0xc0, 0x03, 0x5f, 0xd6,  // RET at byte 0 (target)
+                     0, 0, 0, 0,                // padding
+                     0, 0, 0, 0,                // padding
+                     0, 0, 0, 0,                // padding
+                     0, 0, 0, 0,                // padding
+                     0, 0, 0, 0x94]             // BL placeholder at byte 20
+    let fx3 = [CallFixup { code_offset: 20, target_fid: 0 }]
+    let sy3 = [FuncSymbol { fid: 0, offset: 0 }]
+    code3 = patch_call_fixups_arm64(code3, fx3, sy3)
+    // -5 mod 67108864 = 67108859 = 0x3FFFFFB
+    // 0x94000000 + 0x3FFFFFB = 0x97FFFFFB
+    // LE bytes: 0xFB, 0xFF, 0xFF, 0x97
+    if code3[20] != 0xFB { println("  FAIL: BL back byte0=" + to_string(code3[20]) + " want 251"); ok = false }
+    if code3[21] != 0xFF { println("  FAIL: BL back byte1=" + to_string(code3[21]) + " want 255"); ok = false }
+    if code3[22] != 0xFF { println("  FAIL: BL back byte2=" + to_string(code3[22]) + " want 255"); ok = false }
+    if code3[23] != 0x97 { println("  FAIL: BL back byte3=" + to_string(code3[23]) + " want 151"); ok = false }
+
+    // ── Test 4: CallFixup struct fields ──
+    let cfx = CallFixup { code_offset: 42, target_fid: 7 }
+    if cfx.code_offset != 42 { println("  FAIL: CallFixup.code_offset"); ok = false }
+    if cfx.target_fid != 7 { println("  FAIL: CallFixup.target_fid"); ok = false }
+
+    // ── Test 5: EmitResult struct fields ──
+    let er = EmitResult { code: [1, 2, 3], call_fixups: [cfx] }
+    if len(er.code) != 3 { println("  FAIL: EmitResult.code len"); ok = false }
+    if len(er.call_fixups) != 1 { println("  FAIL: EmitResult.call_fixups len"); ok = false }
+
+    // ── Test 6: multiple fixups in one pass ──
+    // Two BL placeholders: one at offset 0 (→ fid 1 at 40), one at offset 8 (→ fid 2 at 80)
+    let mut code6 = []
+    let mut ci = 0
+    while ci < 100 {
+        code6 = code6.push(0)
+        ci = ci + 1
+    }
+    // Write BL placeholders
+    code6[0] = 0x00; code6[1] = 0x00; code6[2] = 0x00; code6[3] = 0x94
+    code6[8] = 0x00; code6[9] = 0x00; code6[10] = 0x00; code6[11] = 0x94
+    let fx6 = [
+        CallFixup { code_offset: 0, target_fid: 1 },
+        CallFixup { code_offset: 8, target_fid: 2 }
+    ]
+    let sy6 = [
+        FuncSymbol { fid: 0, offset: 0 },
+        FuncSymbol { fid: 1, offset: 40 },
+        FuncSymbol { fid: 2, offset: 80 }
+    ]
+    code6 = patch_call_fixups_arm64(code6, fx6, sy6)
+    // BL at 0 → offset 40: rel = 40/4 = 10 → 0x9400000A → LE: 0A 00 00 94
+    if code6[0] != 0x0A { println("  FAIL: multi BL1 byte0=" + to_string(code6[0]) + " want 10"); ok = false }
+    if code6[3] != 0x94 { println("  FAIL: multi BL1 byte3"); ok = false }
+    // BL at 8 → offset 80: rel = (80-8)/4 = 18 → 0x94000012 → LE: 12 00 00 94
+    if code6[8] != 0x12 { println("  FAIL: multi BL2 byte0=" + to_string(code6[8]) + " want 18"); ok = false }
+    if code6[11] != 0x94 { println("  FAIL: multi BL2 byte3"); ok = false }
+
+    // ── Test 7: x86 CALL forward-patch ──
+    // CALL at offset 0 (5 bytes: E8 rel32), target at offset 25
+    // x86 rel = target - (call_off + 5) = 25 - 5 = 20
+    // LE: 14 00 00 00
+    let mut code7 = []
+    let mut c7i = 0
+    while c7i < 30 { code7 = code7.push(0); c7i = c7i + 1 }
+    code7[0] = 0xe8  // CALL opcode placeholder
+    let fx7 = [CallFixup { code_offset: 0, target_fid: 1 }]
+    let sy7 = [FuncSymbol { fid: 0, offset: 0 }, FuncSymbol { fid: 1, offset: 25 }]
+    code7 = patch_call_fixups_x86(code7, fx7, sy7)
+    if code7[0] != 0xe8 { println("  FAIL: x86 CALL opcode"); ok = false }
+    if code7[1] != 20 { println("  FAIL: x86 CALL rel byte0=" + to_string(code7[1]) + " want 20"); ok = false }
+    if code7[2] != 0 { println("  FAIL: x86 CALL rel byte1"); ok = false }
+
+    println("  symtab_lookup    : OK")
+    println("  BL forward patch : " + to_string(code2[0]) + " " + to_string(code2[1]) + " " + to_string(code2[2]) + " " + to_string(code2[3]))
+    println("  BL backward patch: " + to_string(code3[20]) + " " + to_string(code3[21]) + " " + to_string(code3[22]) + " " + to_string(code3[23]))
+    println("  multi BL patch   : 2 fixups applied")
+    println("  x86 CALL patch   : rel32 = " + to_string(code7[1]))
+
+    if ok {
+        println("  ALL CHECKS PASS")
+    }
+}
+
+test_multi_function_linkage()
