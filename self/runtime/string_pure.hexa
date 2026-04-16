@@ -1,0 +1,227 @@
+// self/runtime/string_pure.hexa — Phase 2.1 runtime port (starter pack)
+//
+// Pure-Hexa equivalents of a subset of the "Portable" helpers from
+// self/runtime.c (see docs/runtime_port_plan.md §P2.1). This file is
+// ADDITIVE — it does not remove any C function yet. The compiled codegen
+// path (codegen_c2.hexa) still emits direct calls to hexa_is_error /
+// hexa_bin / hexa_hex / hexa_str_trim / hexa_str_to_upper / … in runtime.c.
+//
+// Why additive (and why we start with a small seam)?
+//   Every "Portable" C function is referenced from transpiled user output
+//   (codegen_c2.hexa rewrites is_error / bin / hex / base64_encode /
+//   from_char_code / env_var / str_to_upper / str_to_lower / str_chars /
+//   str_repeat / array_pop / array_reverse / …  into bare hexa_<name>(…)
+//   C calls — removing the C body would cause unresolved-symbol link
+//   failures in every user build).
+//
+//   Full P2.1 C removal requires a codegen interpose pass first:
+//     (a) Hexa stdlib definitions (this file) register into a name→fn
+//         registry the interpreter consults before falling through.
+//     (b) codegen_c2 emits `call_builtin("is_error", [v])` OR imports the
+//         .hexa implementation inline instead of hexa_is_error(v).
+//     (c) Once every call-site is rewired, runtime.c entries can drop.
+//   Until then, this file provides Hexa-level call sites for programs
+//   that `import "self/runtime/string_pure.hexa"` explicitly, and serves
+//   as the reference implementation for the codegen interpose work.
+//
+// Constraints honored (CLAUDE.md + port plan §5 Risks):
+//   - No NaN-boxing / tag layout touched (pure string/int logic).
+//   - No syscalls.
+//   - No coupling to arena lifetime.
+//   - Pitfalls observed:
+//       P1  no semicolons
+//       P15 let mut everywhere
+//       P28 nil/true/false literals lower correctly (365ae50) — safe here
+//   - Design note on stage0 quirks (observed 2026-04-16 via /tmp/test_port.hexa):
+//       * `char_code(param_string, i)` always returns position 0's code,
+//         regardless of i — a stage0 codegen bug for string parameters.
+//         Workaround: pull the single char out first with char_at (which
+//         indexes correctly), and use lookup tables ("ABCDEFGHIJ...") for
+//         arithmetic-free char transformations. This also sidesteps the
+//         stage0-interpreter-only bug where `from_char_code(72)` returns
+//         the decimal string "72" rather than the character "H".
+//         (Compiled code via codegen_c2 → runtime.c paths are unaffected.)
+
+// ── is_error_pure ─────────────────────────────────────────────────
+// Mirrors hexa_is_error (runtime.c:4210). The C impl checks for the
+// "ERR:" sentinel prefix. For the interpreter path (where Val has a
+// real TAG_ERROR), call_builtin("is_error") already handles it.
+//
+// Pure-Hexa version covers the compiled-code sentinel form: inspects
+// first four characters. Returns bool.
+pub fn is_error_pure(v) {
+    if type_of(v) != "string" { return false }
+    if len(v) < 4 { return false }
+    if char_at(v, 0) != "E" { return false }
+    if char_at(v, 1) != "R" { return false }
+    if char_at(v, 2) != "R" { return false }
+    if char_at(v, 3) != ":" { return false }
+    true
+}
+
+// ── int_to_hex_pure ───────────────────────────────────────────────
+// Mirrors hexa_hex (runtime.c:4333). For non-negative inputs, walks
+// nibbles LSB→MSB via successive `% 16`, prepending each digit. For
+// negative inputs we defer to the host `hex(n)` builtin so the
+// two's-complement bit pattern (u64 view) matches the C snprintf
+// "%llx" semantics (C casts i64→u64 silently). Attempting this in
+// pure Hexa without u64 is error-prone; keep the tiny FFI dependency.
+pub fn int_to_hex_pure(n) {
+    if n == 0 { return "0" }
+    if n < 0 { return hex(n) }
+    let mut v = n
+    let mut out = ""
+    let digits = "0123456789abcdef"
+    while v > 0 {
+        let d = v % 16
+        out = char_at(digits, d) + out
+        v = v / 16
+    }
+    out
+}
+
+// ── int_to_bin_pure ───────────────────────────────────────────────
+// Mirrors hexa_bin (runtime.c:4322). Non-negative loop; negative
+// delegates to host bin() for the same u64-view reason as hex above.
+pub fn int_to_bin_pure(n) {
+    if n == 0 { return "0" }
+    if n < 0 { return bin(n) }
+    let mut v = n
+    let mut out = ""
+    while v > 0 {
+        let bit = v % 2
+        if bit == 0 { out = "0" + out } else { out = "1" + out }
+        v = v / 2
+    }
+    out
+}
+
+// ── str_to_upper_ascii / str_to_lower_ascii ───────────────────────
+// Mirrors hexa_str_to_upper / _to_lower (runtime.c:2841 / 2848) for
+// the ASCII path. The C side is ASCII-only too — it walks bytes and
+// flips bit 5. For bytes > 0x7F it preserves them, which means UTF-8
+// continuation bytes pass through unchanged (a string like "café"
+// upper-cases to "CAFé", matching the C behavior).
+//
+// Stage0 note: uses lookup tables rather than char_code arithmetic
+// because `char_code(param_string, i)` always returns index 0's value
+// under stage0's current codegen. char_at indexing is correct, so we
+// use two parallel alphabet strings to translate.
+pub fn str_to_upper_ascii(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    let lowers = "abcdefghijklmnopqrstuvwxyz"
+    let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    while i < n {
+        let ch = char_at(s, i)
+        // Find ch in `lowers`; if present, emit the matching upper.
+        let mut j = 0
+        let mut found = false
+        while j < 26 && found == false {
+            if char_at(lowers, j) == ch {
+                out = out + char_at(uppers, j)
+                found = true
+            }
+            j = j + 1
+        }
+        if found == false { out = out + ch }
+        i = i + 1
+    }
+    out
+}
+
+pub fn str_to_lower_ascii(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    let mut out = ""
+    let mut i = 0
+    let lowers = "abcdefghijklmnopqrstuvwxyz"
+    let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    while i < n {
+        let ch = char_at(s, i)
+        let mut j = 0
+        let mut found = false
+        while j < 26 && found == false {
+            if char_at(uppers, j) == ch {
+                out = out + char_at(lowers, j)
+                found = true
+            }
+            j = j + 1
+        }
+        if found == false { out = out + ch }
+        i = i + 1
+    }
+    out
+}
+
+// ── str_trim_pure ─────────────────────────────────────────────────
+// Mirrors hexa_str_trim (runtime.c:2800). Scans for leading/trailing
+// whitespace and returns a substring. Hexa `substring(a, b)` end is
+// exclusive (matches the C impl at runtime.c:2320).
+pub fn str_trim_pure(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    if n == 0 { return s }
+    let mut start = 0
+    let mut done_start = false
+    while start < n && done_start == false {
+        let ch = char_at(s, start)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            done_start = true
+        }
+    }
+    if done_start == false { return "" }
+    let mut end = n - 1
+    let mut done_end = false
+    while end >= start && done_end == false {
+        let ch = char_at(s, end)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            end = end - 1
+        } else {
+            done_end = true
+        }
+    }
+    if end < start { return "" }
+    s.substring(start, end + 1)
+}
+
+// ── utf8_cpcount_pure ─────────────────────────────────────────────
+// Mirrors utf8_cpcount (runtime.c:2879). Counts code points by
+// skipping UTF-8 continuation bytes (0x80..0xBF = top bits 10xxxxxx).
+// Uses the char_at(s,i)→char_code(ch,0) workaround because stage0's
+// `char_code(param_string, i)` is buggy (see header note).
+pub fn utf8_cpcount_pure(s) {
+    if type_of(s) != "string" { return 0 }
+    let mut count = 0
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let ch = char_at(s, i)
+        let cc = char_code(ch, 0)
+        // Continuation byte: 0x80..0xBF. Advance cp count on non-cont.
+        if cc < 128 || cc >= 192 { count = count + 1 }
+        i = i + 1
+    }
+    count
+}
+
+// ── str_repeat_pure ───────────────────────────────────────────────
+// Mirrors hexa_str_repeat (runtime.c:2966). Already present as
+// stdlib/string.hexa::repeat, but replicate here so this file is
+// self-contained alongside the other pure helpers and serves as the
+// single reference implementation for the upcoming codegen interpose.
+pub fn str_repeat_pure(s, n) {
+    if type_of(s) != "string" { return "" }
+    if n <= 0 { return "" }
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        out = out + s
+        i = i + 1
+    }
+    out
+}
