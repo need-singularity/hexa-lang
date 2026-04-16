@@ -6718,6 +6718,10 @@ static HexaIC __hexa_codegen_c2_ic_269 = {0};
 static HexaIC __hexa_codegen_c2_ic_270 = {0};
 static HexaIC __hexa_codegen_c2_ic_271 = {0};
 static HexaIC __hexa_codegen_c2_ic_272 = {0};
+/* Binary file I/O IC slots — write_bytes / read_file_bytes (2026-04-16). */
+static HexaIC __hexa_codegen_c2_ic_800 = {0};
+static HexaIC __hexa_codegen_c2_ic_801 = {0};
+static HexaIC __hexa_codegen_c2_ic_802 = {0};
 static HexaIC __hexa_codegen_c2_ic_273 = {0};
 static HexaIC __hexa_codegen_c2_ic_274 = {0};
 static HexaIC __hexa_codegen_c2_ic_275 = {0};
@@ -8579,6 +8583,15 @@ HexaVal gen2_expr(HexaVal node) {
             if (hexa_truthy(hexa_eq(name, hexa_str("write_file")))) {
                 return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_write_file("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_271), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_272), hexa_int(1)))), hexa_str(")"));
             }
+            /* Binary file I/O: write_bytes / read_file_bytes — C2 step (2026-04-16).
+             * Mirrors self/codegen_c2.hexa:1741-1746. Runtime signatures in
+             * self/runtime.c: hexa_write_bytes(path, arr), hexa_read_file_bytes(path). */
+            if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes")))) {
+                return hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_write_bytes("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_800), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_801), hexa_int(1)))), hexa_str(")"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("read_file_bytes")))) {
+                return hexa_add(hexa_add(hexa_str("hexa_read_file_bytes("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_802), hexa_int(0)))), hexa_str(")"));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("cstring")))) {
                 return hexa_add(hexa_add(hexa_str("hexa_cstring("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_273), hexa_int(0)))), hexa_str(")"));
             }
@@ -10051,6 +10064,12 @@ HexaVal _is_builtin_name(HexaVal name) {
         return hexa_bool(1);
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("write_file")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes")))) {
+        return hexa_bool(1);
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("read_file_bytes")))) {
         return hexa_bool(1);
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("file_exists")))) {
