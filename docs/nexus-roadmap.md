@@ -73,7 +73,7 @@ git commit → pre-commit hook
   → anomaly 있으면 커밋 차단 + CDO 기록
 ```
 
-**산출물:** `.git/hooks/pre-commit` + `scripts/n6_verify.sh`
+**산출물:** `.git/hooks/pre-commit` + `scripts/n6_verify.hexa`
 
 ---
 

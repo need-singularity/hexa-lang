@@ -23,7 +23,7 @@
 **Modify:**
 - `src/opt/mod.rs` — `PassResult`에 `elapsed_ns` 추가, `run_pipeline_with_policy` 추가
 - `src/main.rs:750` — `run_pipeline` → `run_pipeline_with_policy` (ESO 모드 flag)
-- `scripts/bench_hexa_ir.sh` — ESO ON/OFF 비교 섹션
+- `scripts/bench_hexa_ir.hexa` — ESO ON/OFF 비교 섹션
 
 ---
 
@@ -1006,15 +1006,15 @@ git commit -m "test(eso): 10-round convergence integration test"
 ### Task 11: Bench script ESO ON/OFF comparison section
 
 **Files:**
-- Modify: `scripts/bench_hexa_ir.sh`
+- Modify: `scripts/bench_hexa_ir.hexa`
 
 - [ ] **Step 1: Read current script tail**
 
-Run: `wc -l scripts/bench_hexa_ir.sh && tail -40 scripts/bench_hexa_ir.sh`
+Run: `wc -l scripts/bench_hexa_ir.hexa && tail -40 scripts/bench_hexa_ir.hexa`
 
 - [ ] **Step 2: Append ESO section**
 
-Append to `scripts/bench_hexa_ir.sh`:
+Append to `scripts/bench_hexa_ir.hexa`:
 
 ```bash
 
@@ -1041,13 +1041,13 @@ fi
 
 - [ ] **Step 3: Run the script**
 
-Run: `bash scripts/bench_hexa_ir.sh 2>&1 | tail -30`
+Run: `hexa scripts/bench_hexa_ir.hexa 2>&1 | tail -30`
 Expected: "ESO ON/OFF Comparison" section present, all outputs include `8422360000`
 
 - [ ] **Step 4: Commit**
 
 ```bash
-git add scripts/bench_hexa_ir.sh
+git add scripts/bench_hexa_ir.hexa
 git commit -m "bench(eso): add ESO ON/OFF + auto-tune sections"
 ```
 

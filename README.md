@@ -512,7 +512,7 @@ hexa-lang/
 │   └── publish-checklist.md  crates.io publishing guide
 ├── pkg/                      hx system package manager
 │   ├── hx                    CLI (pure shell, zero deps)
-│   ├── install.sh            One-liner installer
+│   ├── install.hexa          One-liner installer
 │   └─��� registry.tsv          Package registry
 ├── PLAN.md                   Development plan (100% complete)
 └── README.md                 this file

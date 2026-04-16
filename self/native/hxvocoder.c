@@ -75,11 +75,11 @@
 //     a single fused entry, and for non-Hexa C consumers.
 //
 // Build (Linux x86_64):
-//   bash scripts/build_hxvocoder_linux.sh
+//   hexa scripts/build_hxvocoder_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxvocoder_linux.sh --mac-xverify
+//   hexa scripts/build_hxvocoder_linux.hexa --mac-xverify
 // Mac-native live FFI:
-//   bash scripts/build_hxvocoder_linux.sh --mac-native
+//   hexa scripts/build_hxvocoder_linux.hexa --mac-native
 //
 // .hexanoport marker convention:
 //   This .c is a native shim (extern FFI boundary), not a compilation

@@ -15,11 +15,11 @@
 // the online-softmax recurrence (m, l) and per-tile rescale.
 //
 // Build (Linux x86_64, Ubuntu/Debian):
-//   bash scripts/build_hxflash_linux.sh
+//   hexa scripts/build_hxflash_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxflash_linux.sh --mac-xverify
+//   hexa scripts/build_hxflash_linux.hexa --mac-xverify
 // Mac-native live FFI:
-//   bash scripts/build_hxflash_linux.sh --mac-native
+//   hexa scripts/build_hxflash_linux.hexa --mac-native
 //
 // ABI convention (matches hxblas_linux.c / hxlayer_linux.c bit-for-bit):
 //   * pointers are passed as int64_t (Hexa Pointer == uint64_t opaque)

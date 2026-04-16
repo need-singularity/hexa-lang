@@ -59,7 +59,7 @@ parser → typeck → lower → IR → opt(p01..p12) → codegen
 - 공식: `ED = (창발 패턴 수 × 벤치 가속비) / 사이클 수`
 - 저장: `config/eso_metrics.json` (SSOT)
 
-### 2-5. 벤치 러너 통합 (`scripts/bench_hexa_ir.sh` 확장)
+### 2-5. 벤치 러너 통합 (`scripts/bench_hexa_ir.hexa` 확장)
 - 기존 벤치 + ESO ON/OFF 비교 섹션
 - `docs/hexa-ir-benchmark.md`에 grade 컬럼 추가
 

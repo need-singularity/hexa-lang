@@ -46,11 +46,11 @@
 // once the H100 pod has >1 rank.
 //
 // Build (Linux x86_64, Ubuntu/Debian):
-//   bash scripts/build_hxccl_linux.sh
+//   hexa scripts/build_hxccl_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxccl_linux.sh --mac-xverify
+//   hexa scripts/build_hxccl_linux.hexa --mac-xverify
 // Mac-native live FFI:
-//   bash scripts/build_hxccl_linux.sh --mac-native
+//   hexa scripts/build_hxccl_linux.hexa --mac-native
 //
 // ABI convention (matches hxblas_linux.c / hxlayer_linux.c / hxflash_linux.c
 // bit-for-bit):

@@ -89,7 +89,7 @@ Combined: ~4h for all three with option (b) on try_mvp.
 ## Landing requirements
 
 **CRITICAL — stage0 rebuild**: `build/hexa_stage0` is a pre-compiled Mach-O
-that bundles `.hexa` sources at build time (`scripts/build_stage0.sh`). Source
+that bundles `.hexa` sources at build time (`scripts/build_stage0.hexa`). Source
 edits have NO runtime effect without rebuild. Any fix session must include
 the rebuild, and the rebuild must not break other regressions (see
 hexalang_vb1_fix_2026-04-14 `do_not_actions` for the baseline-binary

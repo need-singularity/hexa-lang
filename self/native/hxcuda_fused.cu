@@ -22,7 +22,7 @@
 // Compile:
 //   nvcc -arch=sm_90 -O2 --shared -Xcompiler -fPIC \
 //        self/native/hxcuda_fused.cu -o self/native/build/libhxcuda.so
-//   See scripts/build_hxcuda_linux.sh for the canonical builder.
+//   See scripts/build_hxcuda_linux.hexa for the canonical builder.
 //
 // .hexanoport marker convention:
 //   This .cu is a native shim (extern FFI boundary), not a compilation

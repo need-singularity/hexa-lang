@@ -372,12 +372,12 @@ hexa-lang 핵심 규칙:
   HX5: AI-native 알고리즘 교체 의무 — docs/ai-native.md 24종 벡터
   HX6: 돌파 시 nexus blowup 연동 + growth_bus 기록
   HX7: SELF-HOST 경로 전용 — self/codegen_c2.hexa + self/runtime.c + self/interpreter.hexa + self/native/hexa_v2, 프리젠 C는 .hexanoport 마커로만
-  HX8: stage0 재빌드는 반드시 `scripts/rebuild_stage0.sh` 경유 (2026-04-15 xpcproxy 폭주 사고 후 도입)
+  HX8: stage0 재빌드는 반드시 `scripts/rebuild_stage0.hexa` 경유 (2026-04-15 xpcproxy 폭주 사고 후 도입)
        - 직접 호출 금지: flatten_imports.hexa → hexa_v2 → clang 체인을 수동으로 엮지 말 것
        - 이유: 재빌드 1회당 자식 6-8개(flatten+hexa_v2+clang+cc1+linker) × 5-10초 반복 시 macOS xpcproxy 폭주 → load 24→112
        - wrapper 기능: mkdir lock(동시 빌드 차단) + mtime guard(변경 없으면 skip) + NO_SMOKE 기본 on
-       - 변경 여러 개 모아 1회 빌드: VM 테스트 중 .hexa 다수 수정 → 마지막에 1번만 rebuild_stage0.sh
-       - 긴급/강제: `FORCE=1 bash scripts/rebuild_stage0.sh`
+       - 변경 여러 개 모아 1회 빌드: VM 테스트 중 .hexa 다수 수정 → 마지막에 1번만 rebuild_stage0.hexa
+       - 긴급/강제: `FORCE=1 hexa scripts/rebuild_stage0.hexa`
 
 ref:
   rules     shared/rules/common.json             R0~R27

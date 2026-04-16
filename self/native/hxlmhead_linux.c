@@ -39,11 +39,11 @@
 //   bits 3+ : reserved
 //
 // Build (Linux x86_64, Ubuntu/Debian):
-//   bash scripts/build_hxlmhead_linux.sh
+//   hexa scripts/build_hxlmhead_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxlmhead_linux.sh --mac-xverify
+//   hexa scripts/build_hxlmhead_linux.hexa --mac-xverify
 // Mac-native live FFI:
-//   bash scripts/build_hxlmhead_linux.sh --mac-native
+//   hexa scripts/build_hxlmhead_linux.hexa --mac-native
 //
 // .hexanoport marker convention:
 //   This .c is a native shim (extern FFI boundary), not a compilation

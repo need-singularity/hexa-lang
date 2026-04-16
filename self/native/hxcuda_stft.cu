@@ -18,7 +18,7 @@
 //   * struct-args ABI for >6 arg functions
 //   * extern "C" symbols: hxcuda_stft_bf16, hxcuda_istft_bf16
 //
-// Compile: see scripts/build_hxcuda_linux.sh (link -lcufft)
+// Compile: see scripts/build_hxcuda_linux.hexa (link -lcufft)
 
 #include <cuda_runtime.h>
 #include <cufft.h>

@@ -15,7 +15,7 @@
 //   gcc -O3 -march=native -fPIC -shared self/native/hxvdsp_linux.c \
 //       -o self/native/build/libhxvdsp.so -lm
 //
-//   See scripts/build_hxblas_linux.sh (does both libraries).
+//   See scripts/build_hxblas_linux.hexa (does both libraries).
 //
 // Why scalar+O3 is fine on Linux:
 //   * Apple vDSP is a black-box NEON/AMX kernel; on x86_64 there's no

@@ -45,11 +45,11 @@
 //   int64_t hxqwen14b_version(void)            — ABI version (bump on break)
 //
 // Build (Linux x86_64, Ubuntu/Debian on hetzner H100 pod):
-//   bash scripts/build_hxqwen14b_linux.sh
+//   hexa scripts/build_hxqwen14b_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxqwen14b_linux.sh --mac-xverify
+//   hexa scripts/build_hxqwen14b_linux.hexa --mac-xverify
 // Mac-native live FFI (stub-only since no CUDA on Mac):
-//   bash scripts/build_hxqwen14b_linux.sh --mac-native
+//   hexa scripts/build_hxqwen14b_linux.hexa --mac-native
 //
 // .hexanoport marker convention:
 //   This .c is a native shim (extern FFI boundary), not a compilation

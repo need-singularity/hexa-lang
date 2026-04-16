@@ -10,7 +10,7 @@
 //   gcc -O3 -fPIC -shared -fopenmp self/native/hxblas_linux.c \
 //       -o self/native/build/libhxblas.so -lopenblas -lgomp -lm
 //
-//   See scripts/build_hxblas_linux.sh for the canonical builder.
+//   See scripts/build_hxblas_linux.hexa for the canonical builder.
 //
 // Deployment on H100 pod:
 //   cp self/native/build/libhxblas.so /usr/local/lib/libhxblas.so

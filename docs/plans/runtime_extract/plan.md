@@ -27,7 +27,7 @@
 ### 2.1 SSOT 파일
 
 - `self/hexa_full.hexa` (15,263 LOC, 277 fns) — **stage0 SSOT**
-  - `scripts/build_stage0.sh` 에서 `hexa_v2 self/hexa_full.hexa /tmp/hexa_full_regen.c` → `clang -o build/hexa_stage0`
+  - `scripts/build_stage0.hexa` 에서 `hexa_v2 self/hexa_full.hexa /tmp/hexa_full_regen.c` → `clang -o build/hexa_stage0`
   - **단일 파일 transpile**, 의존성 분리 없음
   - 같은 코드가 `self/interpreter.hexa` (10,742 LOC, 168 fns) 에 거울 복사되어 있음 (자체 byte-identical 보장)
 
@@ -41,7 +41,7 @@
 
 1. **`use "name"` 디렉티브** + `scripts/flatten_imports.hexa`
    - `cmd_build` (hexa build) 에서 자동 flatten 후 transpile
-   - `scripts/build_stage0.sh` 는 사용 안함
+   - `scripts/build_stage0.hexa` 는 사용 안함
    - hexa_v2 transpiler 자체는 `use` 를 silent-drop
 
 2. **`import "path"` / `use "path"`** + `self/module_loader.hexa`
@@ -52,7 +52,7 @@
    - hexa_cc.c 빌드 전용. 4개 .c 산출물을 awk 로 합침.
    - hexa_full.hexa 와 무관.
 
-함의: **`runtime_core.hexa` 는 (1) `use "runtime_core"` 디렉티브로 hexa_full.hexa 가 참조, (2) `build_stage0.sh` 에 flatten 단계 추가** 가 가장 자연스러운 경로.
+함의: **`runtime_core.hexa` 는 (1) `use "runtime_core"` 디렉티브로 hexa_full.hexa 가 참조, (2) `build_stage0.hexa` 에 flatten 단계 추가** 가 가장 자연스러운 경로.
 
 ## 3. 싱글톤 처리 전략
 
@@ -85,7 +85,7 @@
 - [x] `docs/plans/runtime_extract/deps.md` (의존성 매트릭스)
 - [x] `docs/plans/runtime_extract/plan.md` (이 문서)
 - [ ] `./hexa cc --regen extra` smoke (shell 이 빈 파일이라 영향 없어야 함)
-- [ ] `bash scripts/build_stage0.sh` smoke (hexa_full.hexa 무수정 → 동일 binary)
+- [ ] `bash scripts/build_stage0.hexa` smoke (hexa_full.hexa 무수정 → 동일 binary)
 
 **산출**: 추출 청사진 + 빈 골격 + 회귀 없음.
 
@@ -101,9 +101,9 @@
 위험도: **낮음**. 전역 변수 의존 0 또는 매우 적음.
 
 검증: phase 종료 시
-- `bash scripts/build_stage0.sh` 통과
+- `bash scripts/build_stage0.hexa` 통과
 - `./hexa cc --regen extra` 후 `diff hexa_cc.c hexa_cc.c.new` 0 byte
-- P5 fixpoint (`make fixpoint` 또는 `scripts/fixpoint.sh`) IDENTICAL
+- P5 fixpoint (`make fixpoint` 또는 `scripts/fixpoint.hexa`) IDENTICAL
 
 ### Phase C — 보조 카테고리 이동 (0.5-1일)
 
@@ -149,7 +149,7 @@
 ### 5.1 Build smoke
 
 ```bash
-bash scripts/build_stage0.sh                   # → build/hexa_stage0 생성 + smoke 'ok'
+bash scripts/build_stage0.hexa                   # → build/hexa_stage0 생성 + smoke 'ok'
 ./hexa cc --regen extra                        # → hexa_cc.c.new 생성, diff 0
 diff -q build/hexa_stage0 build/hexa_stage0_prev  # 가능하면 byte-identical
 ```
@@ -158,7 +158,7 @@ diff -q build/hexa_stage0 build/hexa_stage0_prev  # 가능하면 byte-identical
 
 ```bash
 # P5 (self/native/hexa_v2 가 자기 자신을 컴파일 → 동일 출력)
-bash scripts/fixpoint.sh   # 또는 동등 검증
+bash scripts/fixpoint.hexa   # 또는 동등 검증
 # 기대: iter2 == iter3 IDENTICAL (현재 baseline)
 ```
 

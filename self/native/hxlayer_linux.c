@@ -19,9 +19,9 @@
 // tmp is carried in a register (scalar) across the inner combined pass.
 //
 // Build (Linux x86_64, Ubuntu/Debian):
-//   bash scripts/build_hxlayer_linux.sh
+//   hexa scripts/build_hxlayer_linux.hexa
 // Cross-verify (Mac):
-//   bash scripts/build_hxlayer_linux.sh --mac-xverify
+//   hexa scripts/build_hxlayer_linux.hexa --mac-xverify
 //
 // Deployment on H100 pod:
 //   cp self/native/build/libhxlayer.so /usr/local/lib/libhxlayer.so
