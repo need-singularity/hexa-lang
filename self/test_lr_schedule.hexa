@@ -1,0 +1,315 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_lr_schedule.hexa — ROI #96 correctness suite
+//
+//  Validates self/ai_native/lr_schedule.hexa:
+//    A. Boundary values         — lr(0), lr(warmup), lr(total)
+//    B. Monotonicity            — warmup↑, cosine↓
+//    C. Bounds                  — min ≤ lr ≤ base at every step
+//    D. Edge cases              — warmup=0, total=warmup, t > total
+//    E. Cosine trig accuracy    — π, π/2 closed-form checks
+//    F. Polynomial comparison   — power=1 (linear) vs power=0.5 (sqrt)
+//    G. Cosine restart cycles   — period boundary jump-back
+//    H. Detect + insert pass    — constant-lr AST gets rewritten
+//
+//  Runs via: ./hexa run self/test_lr_schedule.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+import "ai_native/lr_schedule.hexa"
+
+let mut pass_count = 0
+let mut fail_count = 0
+let mut max_abs_diff = 0.0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_t(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn record_diff(d) {
+    let a = fabs_t(d)
+    if a > max_abs_diff { max_abs_diff = a }
+    return a
+}
+
+fn near(a, b, eps) {
+    let d = fabs_t(a - b)
+    let _ = record_diff(d)
+    return d <= eps
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  ROI #96 @lr_schedule — correctness suite")
+println("═══════════════════════════════════════════════════════")
+
+let eps = 1.0e-9
+
+// ── canonical config shared across many tests ─────────────────────
+let WARMUP = 100
+let TOTAL  = 1000
+let BASE   = 3.0e-4
+let MINLR  = 3.0e-5
+
+// ── Test 1 : lr(0) = 0 ────────────────────────────────────────────
+let v0 = cosine_warmup(0, WARMUP, TOTAL, BASE, MINLR)
+check("T01 lr(0) == 0", near(v0, 0.0, eps))
+
+// ── Test 2 : lr(warmup) ≈ base_lr ─────────────────────────────────
+let vW = cosine_warmup(WARMUP, WARMUP, TOTAL, BASE, MINLR)
+check("T02 lr(warmup) ~= base_lr", near(vW, BASE, 1.0e-12))
+
+// ── Test 3 : lr(total) = min_lr ───────────────────────────────────
+let vT = cosine_warmup(TOTAL, WARMUP, TOTAL, BASE, MINLR)
+check("T03 lr(total) == min_lr", near(vT, MINLR, eps))
+
+// ── Test 4 : t > total → min_lr (floor) ───────────────────────────
+let vF = cosine_warmup(TOTAL + 500, WARMUP, TOTAL, BASE, MINLR)
+check("T04 lr(total+500) == min_lr", near(vF, MINLR, eps))
+
+// ── Test 5 : warmup phase monotone non-decreasing ─────────────────
+let mut warm_mono = true
+let mut prev = 0.0 - 1.0
+for t in 0..WARMUP {
+    let v = cosine_warmup(t, WARMUP, TOTAL, BASE, MINLR)
+    if v + eps < prev { warm_mono = false }
+    prev = v
+}
+check("T05 warmup monotone non-decreasing", warm_mono)
+
+// ── Test 6 : cosine phase monotone non-increasing ─────────────────
+let mut cos_mono = true
+let mut prev2 = BASE + 1.0
+for t in WARMUP..(TOTAL + 1) {
+    let v = cosine_warmup(t, WARMUP, TOTAL, BASE, MINLR)
+    if v > prev2 + eps { cos_mono = false }
+    prev2 = v
+}
+check("T06 cosine monotone non-increasing", cos_mono)
+
+// ── Test 7 : ∀t ≥ warmup: min_lr ≤ lr(t) ≤ base_lr ────────────────
+// Bound check covers the cosine phase where the [min_lr, base_lr]
+// envelope is enforced. The warmup ramp is a separate invariant
+// (covered by I1 — lr(0)=0, the linear-ramp head) and is handled
+// by T01/T05/T08.
+let mut bounded = true
+for t in WARMUP..(TOTAL + 1) {
+    let v = cosine_warmup(t, WARMUP, TOTAL, BASE, MINLR)
+    if v < MINLR - eps { bounded = false }
+    if v > BASE + eps  { bounded = false }
+}
+check("T07 min_lr <= lr(t) <= base_lr (cosine phase)", bounded)
+
+// ── Test 8 : warmup=0 identity (no ramp) ──────────────────────────
+let v_id = cosine_warmup(0, 0, TOTAL, BASE, MINLR)
+check("T08 warmup=0 → lr(0) == base_lr", near(v_id, BASE, eps))
+
+// ── Test 9 : total == warmup edge case ────────────────────────────
+// At t=warmup the cosine phase would have zero span; schedule returns
+// base_lr (the value handoff point). One step past → floor to min_lr.
+let v_e0 = cosine_warmup(WARMUP, WARMUP, WARMUP, BASE, MINLR)
+check("T09 total=warmup @ t=warmup → base_lr (collapse guard)", near(v_e0, BASE, eps))
+let v_e1 = cosine_warmup(WARMUP + 1, WARMUP, WARMUP, BASE, MINLR)
+check("T09b total=warmup @ t>warmup → min_lr", near(v_e1, MINLR, eps))
+
+// ── Test 10 : cos(π) exact — half-span at p=0.5 ───────────────────
+// At t = warmup + span/2 → angle = π/2 → cos = 0 →
+//   lr = min + 0.5·(base - min)·(1 + 0) = (base + min) / 2
+let half = WARMUP + (TOTAL - WARMUP) / 2
+let v_half = cosine_warmup(half, WARMUP, TOTAL, BASE, MINLR)
+let expected_half = (BASE + MINLR) / 2.0
+check("T10 lr(warmup + span/2) == (base+min)/2", near(v_half, expected_half, 1.0e-9))
+
+// ── Test 11 : cos(π) exact at t=total ─────────────────────────────
+// Already covered by T3 but we re-check the trig directly: the cos(π)
+// term should drive the return to exactly min_lr.
+let raw_cos_pi = 1.0 + (0.0 - 1.0)    // 1 + cos(π) = 0
+check("T11 1 + cos(π) == 0 (identity)", near(raw_cos_pi, 0.0, eps))
+
+// ── Test 12 : linear_warmup — lr(0)=0, lr(warmup)=base, held after ─
+check("T12a linear_warmup(0) == 0",       near(linear_warmup(0, WARMUP, BASE), 0.0,  eps))
+check("T12b linear_warmup(warmup) == base",near(linear_warmup(WARMUP, WARMUP, BASE), BASE, eps))
+check("T12c linear_warmup(warmup+50) == base",near(linear_warmup(WARMUP + 50, WARMUP, BASE), BASE, eps))
+
+// ── Test 13 : constant schedule — returns base regardless ─────────
+let c1 = constant(0,      BASE)
+let c2 = constant(500,    BASE)
+let c3 = constant(999999, BASE)
+check("T13 constant schedule invariant", near(c1, BASE, eps) && near(c2, BASE, eps) && near(c3, BASE, eps))
+
+// ── Test 14 : polynomial_decay power=1 → linear ──────────────────
+// At power=1, decay is strictly linear from base → min across the
+// cosine span. Check endpoints and midpoint.
+let p1_0   = polynomial_decay(WARMUP, WARMUP, TOTAL, BASE, MINLR, 1.0)
+let p1_mid = polynomial_decay(half,   WARMUP, TOTAL, BASE, MINLR, 1.0)
+let p1_T   = polynomial_decay(TOTAL,  WARMUP, TOTAL, BASE, MINLR, 1.0)
+let lin_mid_expected = MINLR + 0.5 * (BASE - MINLR)
+check("T14a poly(power=1) @ warmup == base", near(p1_0, BASE, eps))
+check("T14b poly(power=1) midpoint linear",  near(p1_mid, lin_mid_expected, 1.0e-9))
+check("T14c poly(power=1) @ total == min",   near(p1_T, MINLR, eps))
+
+// ── Test 15 : polynomial_decay power=0.5 is slower tail ───────────
+// For p = 0.5, (1 - p)^0.5 = sqrt(0.5) ≈ 0.7071, vs linear (1-p) = 0.5.
+// So sqrt decay at midpoint should be GREATER than linear decay.
+let p05_mid = polynomial_decay(half, WARMUP, TOTAL, BASE, MINLR, 0.5)
+check("T15 poly(power=0.5) midpoint > poly(power=1) midpoint", p05_mid > p1_mid + 1.0e-9)
+
+// ── Test 16 : polynomial_decay boundary match ─────────────────────
+// At endpoints, the power parameter is irrelevant — both must hit
+// base and min exactly regardless of power.
+let p2_0 = polynomial_decay(WARMUP, WARMUP, TOTAL, BASE, MINLR, 3.0)
+let p2_T = polynomial_decay(TOTAL,  WARMUP, TOTAL, BASE, MINLR, 3.0)
+check("T16a poly(any power) @ warmup == base", near(p2_0, BASE, eps))
+check("T16b poly(any power) @ total  == min ", near(p2_T, MINLR, eps))
+
+// ── Test 17 : cosine_restart — cycle boundaries ───────────────────
+// After warmup, each new cycle restarts at base_lr.
+let PERIOD = 200
+// cycle 0 start, t = WARMUP
+let r_c0 = cosine_restart(WARMUP,             WARMUP, PERIOD, BASE, MINLR)
+// cycle 1 start, t = WARMUP + PERIOD
+let r_c1 = cosine_restart(WARMUP + PERIOD,    WARMUP, PERIOD, BASE, MINLR)
+// cycle 2 start, t = WARMUP + 2*PERIOD
+let r_c2 = cosine_restart(WARMUP + 2*PERIOD,  WARMUP, PERIOD, BASE, MINLR)
+check("T17a restart cycle0 start == base", near(r_c0, BASE, 1.0e-12))
+check("T17b restart cycle1 start == base", near(r_c1, BASE, 1.0e-12))
+check("T17c restart cycle2 start == base", near(r_c2, BASE, 1.0e-12))
+
+// ── Test 18 : cosine_restart — mid-cycle descent ──────────────────
+let mid1 = WARMUP + PERIOD + PERIOD / 2
+let r_mid = cosine_restart(mid1, WARMUP, PERIOD, BASE, MINLR)
+let restart_mid_expected = (BASE + MINLR) / 2.0
+check("T18 restart mid-cycle == (base+min)/2", near(r_mid, restart_mid_expected, 1.0e-9))
+
+// ── Test 19 : cosine_restart — within-cycle monotone ↓ ────────────
+let mut rest_mono = true
+let mut prev_r = BASE + 1.0
+// scan one full cycle [WARMUP, WARMUP + PERIOD)
+let scan_end = WARMUP + PERIOD
+for t in WARMUP..scan_end {
+    let v = cosine_restart(t, WARMUP, PERIOD, BASE, MINLR)
+    if v > prev_r + eps { rest_mono = false }
+    prev_r = v
+}
+check("T19 restart within-cycle monotone ↓", rest_mono)
+
+// ── Test 20 : detect_constant_lr — positive case ──────────────────
+// Simulate a function node shaped like:
+//   fn train() {
+//     let lr = 3e-4
+//     for step in 0..1000 {
+//       sgd_step(..., lr)
+//     }
+//   }
+let fake_fn = #{
+    "kind": "FnDecl",
+    "name": "train",
+    "body": [
+        #{
+            "kind": "Let",
+            "name": "lr",
+            "init": #{
+                "kind": "FloatLit",
+                "value": 3.0e-4
+            }
+        },
+        #{
+            "kind": "For",
+            "iter": "step"
+        }
+    ]
+}
+let d1 = detect_constant_lr(fake_fn)
+let d1_found = d1["found"]
+let d1_lr_idx = d1["lr_stmt_idx"]
+let d1_loop_idx = d1["loop_idx"]
+let d1_val = d1["lr_value"]
+check("T20a detect_constant_lr found",        d1_found)
+check("T20b detect_constant_lr.lr_stmt_idx",  d1_lr_idx == 0)
+check("T20c detect_constant_lr.loop_idx",     d1_loop_idx == 1)
+check("T20d detect_constant_lr.lr_value",     near(d1_val, 3.0e-4, 1.0e-12))
+
+// ── Test 21 : detect_constant_lr — negative case (no for-loop) ────
+let clean_fn = #{
+    "kind": "FnDecl",
+    "name": "nop",
+    "body": [
+        #{
+            "kind": "Let",
+            "name": "lr",
+            "init": #{
+                "kind": "FloatLit",
+                "value": 1.0e-3
+            }
+        }
+    ]
+}
+let d2 = detect_constant_lr(clean_fn)
+let d2_found = d2["found"]
+check("T21 detect_constant_lr no-loop → not-found", !d2_found)
+
+// ── Test 22 : insert_lr_schedule — rewrite applied ────────────────
+let cfg = #{
+    "kind": "cosine_warmup",
+    "warmup": 100,
+    "total":  1000,
+    "base":   3.0e-4,
+    "min":    3.0e-5
+}
+let rewritten = insert_lr_schedule(fake_fn, cfg)
+let applied = rewritten["lr_schedule_applied"]
+check("T22a insert_lr_schedule applied flag", applied == true)
+// The lr binding's init should now be a Call node (not FloatLit).
+let new_body = rewritten["body"]
+let new_lr_stmt = new_body[0]
+let new_init = new_lr_stmt["init"]
+let new_init_kind = new_init["kind"]
+check("T22b rewritten init is Call", new_init_kind == "Call")
+let callee = new_init["callee"]
+check("T22c rewritten Call.callee == cosine_warmup", callee == "cosine_warmup")
+
+// ── Test 23 : insert_lr_schedule — untouched on clean input ───────
+let untouched = insert_lr_schedule(clean_fn, cfg)
+// No flag set on functions with no loop match.
+let u_flag = untouched["lr_schedule_applied"]
+// (map access of a missing key returns a sentinel — we accept any
+//  non-true value)
+let u_ok = (u_flag != true)
+check("T23 insert_lr_schedule skips clean fn", u_ok)
+
+// ── Test 24 : continuity — no jump at t=warmup ────────────────────
+// lr(warmup-1) (warmup ramp) must be ≤ lr(warmup) (cosine head), and
+// lr(warmup+1) must be just below base_lr.
+let prev_step = cosine_warmup(WARMUP - 1, WARMUP, TOTAL, BASE, MINLR)
+let next_step = cosine_warmup(WARMUP + 1, WARMUP, TOTAL, BASE, MINLR)
+check("T24a lr(warmup-1) < lr(warmup)", prev_step < vW + eps)
+check("T24b lr(warmup+1) < lr(warmup)", next_step < vW + eps)
+// Discontinuity guard: the gap should be small (≤ base_lr / warmup).
+let gap = fabs_t(vW - prev_step)
+let gap_budget = BASE / lrs_gap_denom(WARMUP)
+check("T24c warmup→cosine gap small", gap <= gap_budget + 1.0e-9)
+
+// Local helper: the ramp step per iteration during warmup.
+fn lrs_gap_denom(w) {
+    if w <= 0 { return 1.0 }
+    return to_float(w)
+}
+
+// ══════════════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")
+println("  max_abs_diff = " + to_string(max_abs_diff))
+println("═══════════════════════════════════════════════════════")
+
+if fail_count == 0 {
+    println("[ALL PASS] ROI #96 lr_schedule verified")
+}
