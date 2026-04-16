@@ -112,6 +112,21 @@ info "transpile: $HEXA_V2 $(basename "$INPUT") -> gen.c"
 GEN_SIZE=$(wc -c < "$GEN_C" | tr -d ' ')
 info "generated C: $(human_size "$GEN_SIZE")"
 
+# ── step 1b: NaN-boxing FFI pointer fix ──────────────────────
+# Until hexa_v2 is rebuilt with the HX_INT_U codegen change,
+# post-process generated C to use unsigned pointer extraction
+# in FFI dispatch lines. Fixes ARM64 cstring() corruption.
+if grep -q 'HX_INT_U' "$BUILD_DIR/runtime.c" 2>/dev/null; then
+    awk '{
+      if (/__ffi_ftyp/) {
+        gsub(/HX_INT\(/, "HX_INT_U(")
+        gsub(/HX_IS_INT_U/, "HX_IS_INT")
+      }
+      print
+    }' "$GEN_C" > "$GEN_C.tmp" && mv "$GEN_C.tmp" "$GEN_C"
+    info "applied HX_INT_U FFI pointer fix"
+fi
+
 # ── step 2: clang compile ────────────────────────────────────
 DEFAULT_CFLAGS="-O3"
 case "$UNAME" in
