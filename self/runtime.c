@@ -12,6 +12,9 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <execinfo.h>
+#endif
 
 // Force line-buffered stdout when redirected to file/pipe.
 __attribute__((constructor))
@@ -1045,7 +1048,12 @@ HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
+        fprintf(stderr, "index %lld out of bounds (len %d) [caller=array_get]\n", (long long)idx, HX_ARR_LEN(arr));
+        // diagnostic: dump backtrace on OOB
+        #if defined(__APPLE__)
+        void *bt[16]; int n = backtrace(bt, 16);
+        backtrace_symbols_fd(bt, n, 2);
+        #endif
         exit(1);
     }
     return HX_ARR_ITEMS(arr)[idx];
@@ -1058,7 +1066,11 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
+        fprintf(stderr, "index %lld out of bounds (len %d) [caller=array_set]\n", (long long)idx, HX_ARR_LEN(arr));
+        #if defined(__APPLE__)
+        void *bt[16]; int n = backtrace(bt, 16);
+        backtrace_symbols_fd(bt, n, 2);
+        #endif
         exit(1);
     }
     // In-place mutate (no copy — caller reassigns)
@@ -1564,6 +1576,15 @@ HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
             : (int64_t)__hx_to_double(key);
     } else {
         idx = HX_INT(key);
+        // DEBUG: detect pointer-as-index
+        if (idx > 100000000LL || idx < -100000000LL) {
+            fprintf(stderr, "[DIAG] hexa_index_set: idx=%lld tag=%d is_vs=%d is_int=%d\n",
+                    (long long)idx, (int)HX_TAG(key), HX_IS_VALSTRUCT(key), HX_IS_INT(key));
+            #if defined(__APPLE__)
+            void *bt[16]; int n = backtrace(bt, 16);
+            backtrace_symbols_fd(bt, n, 2);
+            #endif
+        }
     }
     return hexa_array_set(container, idx, val);
 }
