@@ -151,6 +151,8 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width);
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
 HexaVal hexa_read_file(HexaVal path);
 HexaVal hexa_write_file(HexaVal path, HexaVal content);
+HexaVal hexa_write_bytes(HexaVal path, HexaVal arr);
+HexaVal hexa_read_file_bytes(HexaVal path);
 HexaVal hexa_str_split(HexaVal s, HexaVal delim);
 HexaVal hexa_str_trim(HexaVal s);
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s);
@@ -181,6 +183,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
 HexaVal hexa_val_snapshot_array(HexaVal v);  // rt#32-N forward decl
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
+HexaVal __hexa_range_array(HexaVal start, HexaVal end, int inclusive);
 
 // RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
 // path. Close Wint-conversion / Wpointer-arith categories in the
@@ -329,6 +332,7 @@ typedef struct HexaVal_ {
 
 #define HX_TAG(v)       ((v).tag)
 #define HX_INT(v)       ((v).i)
+#define HX_INT_U(v)     ((uint64_t)(v).i)   // unsigned read — safe for NaN-boxed pointers
 #define HX_FLOAT(v)     ((v).f)
 #define HX_BOOL(v)      ((v).b)
 #define HX_STR(v)       ((v).s)
@@ -2566,7 +2570,7 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
 // ── File I/O ─────────────────────────────────────────────
 
 HexaVal hexa_read_file(HexaVal path) {
-    FILE* f = fopen(HX_STR(path), "r");
+    FILE* f = fopen(HX_STR(path), "rb");
     if (!f) return hexa_str("");
     fseek(f, 0, SEEK_END);
     long len = ftell(f);
@@ -2579,11 +2583,61 @@ HexaVal hexa_read_file(HexaVal path) {
 }
 
 HexaVal hexa_write_file(HexaVal path, HexaVal content) {
-    FILE* f = fopen(HX_STR(path), "w");
+    FILE* f = fopen(HX_STR(path), "wb");
     if (!f) return hexa_bool(0);
-    fputs(HX_STR(content), f);
+    const char* s = HX_STR(content);
+    size_t len = s ? strlen(s) : 0;
+    fwrite(s, 1, len, f);
     fclose(f);
     return hexa_bool(1);
+}
+
+// ── Binary file I/O — write_bytes / read_file_bytes ─────
+// write_bytes: takes a path and a TAG_ARRAY of integers (0-255),
+// writes raw bytes. Null bytes survive — true binary I/O.
+HexaVal hexa_write_bytes(HexaVal path, HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
+    int len = HX_ARR_LEN(arr);
+    FILE* f = fopen(HX_STR(path), "wb");
+    if (!f) return hexa_bool(0);
+    if (len > 0) {
+        unsigned char* buf = (unsigned char*)malloc(len);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (int i = 0; i < len; i++) {
+            int64_t v = HX_IS_INT(items[i]) ? HX_INT(items[i]) : (int64_t)HX_FLOAT(items[i]);
+            buf[i] = (unsigned char)(v & 0xFF);
+        }
+        fwrite(buf, 1, len, f);
+        free(buf);
+    }
+    fclose(f);
+    return hexa_bool(1);
+}
+
+// read_file_bytes: reads a file in binary mode and returns
+// a TAG_ARRAY of integers (0-255), one per byte.
+HexaVal hexa_read_file_bytes(HexaVal path) {
+    FILE* f = fopen(HX_STR(path), "rb");
+    if (!f) return hexa_array_new();
+    fseek(f, 0, SEEK_END);
+    long len = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    unsigned char* buf = (unsigned char*)malloc(len);
+    fread(buf, 1, len, f);
+    fclose(f);
+    // Pre-allocate array with exact capacity
+    HexaVal arr = hexa_array_new();
+    if (len > 0) {
+        HX_SET_ARR_ITEMS(arr, (HexaVal*)malloc(sizeof(HexaVal) * len));
+        HX_SET_ARR_CAP(arr, (int)len);
+        HX_SET_ARR_LEN(arr, (int)len);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (long i = 0; i < len; i++) {
+            items[i] = hexa_int((int64_t)buf[i]);
+        }
+    }
+    free(buf);
+    return arr;
 }
 
 // ── Command line arguments ───────────────────────────
@@ -3324,7 +3378,7 @@ HexaVal hexa_cstring(HexaVal s) {
 }
 
 HexaVal hexa_from_cstring(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p == 0) return hexa_str("");
     return hexa_str((const char*)(uintptr_t)p);
 }
@@ -3332,7 +3386,7 @@ HexaVal hexa_from_cstring(HexaVal ptr) {
 HexaVal hexa_ptr_null() { return hexa_int(0); }
 
 HexaVal hexa_ptr_addr(HexaVal v) {
-    return hexa_int(HX_INT(v));
+    return hexa_int((int64_t)HX_INT_U(v));
 }
 
 // ── C2 Step 3: Dynamic FFI host dispatch (interpreter path) ──
@@ -3360,7 +3414,7 @@ HexaVal hexa_host_ffi_open(HexaVal lib_name) {
 HexaVal hexa_host_ffi_sym(HexaVal handle, HexaVal symbol) {
     HexaVal uh = hexa_host_ffi_unwrap(handle);
     HexaVal us = hexa_host_ffi_unwrap(symbol);
-    void* h = HX_IS_INT(uh) ? (void*)(uintptr_t)HX_INT(uh) : NULL;
+    void* h = HX_IS_INT(uh) ? (void*)(uintptr_t)HX_INT_U(uh) : NULL;
     const char* sym = (HX_IS_STR(us) && HX_STR(us)) ? HX_STR(us) : "";
     if (!h || !sym || !*sym) return hexa_int(0);
     void* fn = dlsym(h, sym);
@@ -3395,7 +3449,7 @@ static HexaVal hexa_host_ffi_unwrap(HexaVal v) {
 
 HexaVal hexa_host_ffi_call(HexaVal fn_ptr, HexaVal args_arr, HexaVal float_mask, HexaVal ret_kind) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
     HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
@@ -3436,7 +3490,7 @@ HexaVal hexa_host_ffi_call_6(
     HexaVal a0, HexaVal a1, HexaVal a2, HexaVal a3, HexaVal a4, HexaVal a5
 ) {
     HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
+    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT_U(fp_v) : NULL;
     if (!fp) return hexa_int(0);
     HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
     HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
@@ -3492,13 +3546,13 @@ HexaVal hexa_ptr_alloc(HexaVal size) {
 }
 
 HexaVal hexa_ptr_free(HexaVal ptr, HexaVal size) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p != 0) free((void*)(uintptr_t)p);
     return hexa_void();
 }
 
 HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
     if (p == 0) return hexa_void();
     uint8_t* base = (uint8_t*)(uintptr_t)p + off;
@@ -3517,7 +3571,7 @@ HexaVal hexa_ptr_write(HexaVal ptr, HexaVal offset, HexaVal val) {
  * as general-purpose. */
 
 HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
     if (p == 0) return hexa_int(0);
     int64_t v;
@@ -3526,13 +3580,13 @@ HexaVal hexa_ptr_read(HexaVal ptr, HexaVal offset) {
 }
 
 HexaVal hexa_ptr_offset(HexaVal ptr, HexaVal offset) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     int64_t off = HX_IS_INT(offset) ? HX_INT(offset) : 0;
-    return hexa_int(p + off);
+    return hexa_int((int64_t)(p + (uint64_t)off));
 }
 
 HexaVal hexa_deref(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p == 0) return hexa_int(0);
     int64_t v;
     memcpy(&v, (void*)(uintptr_t)p, sizeof(int64_t));
@@ -3565,7 +3619,7 @@ HexaVal hexa_struct_pack(HexaVal* args, int nargs) {
 
 // Read the Nth f64 from a struct pointer.
 HexaVal hexa_struct_unpack(HexaVal ptr, HexaVal index) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     int64_t idx = HX_IS_INT(index) ? HX_INT(index) : 0;
     if (p == 0) return hexa_float(0.0);
     double* buf = (double*)(uintptr_t)p;
@@ -3600,7 +3654,7 @@ HexaVal hexa_struct_size_pack(HexaVal w, HexaVal h) {
 
 // Free a struct pointer (allocated by struct_pack/struct_rect/etc).
 HexaVal hexa_struct_free(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     if (p != 0) free((void*)(uintptr_t)p);
     return hexa_void();
 }
@@ -3735,9 +3789,9 @@ HexaVal hexa_callback_create(HexaVal fn_val) {
 // callback_free(ptr) -> void
 // Frees the trampoline slot associated with the given C function pointer.
 HexaVal hexa_callback_free(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
-        if ((int64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
+        if ((uint64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
             __hexa_cb_slots[i].in_use = 0;
             __hexa_cb_slots[i].hexa_fn = hexa_void();
             return hexa_void();
@@ -3749,9 +3803,9 @@ HexaVal hexa_callback_free(HexaVal ptr) {
 // callback_slot_id(ptr) -> int
 // Returns the slot index for a given trampoline pointer (-1 if not found).
 HexaVal hexa_callback_slot_id(HexaVal ptr) {
-    int64_t p = HX_IS_INT(ptr) ? HX_INT(ptr) : 0;
+    uint64_t p = HX_IS_INT(ptr) ? HX_INT_U(ptr) : 0;
     for (int i = 0; i < HEXA_TRAMPOLINE_POOL_SIZE; i++) {
-        if ((int64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
+        if ((uint64_t)(uintptr_t)__hexa_cb_slots[i].fn_ptr == p) {
             return hexa_int(i);
         }
     }
@@ -3851,6 +3905,17 @@ HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
     if (a > b) a = b;
     HexaVal out = hexa_array_new();
     for (int i = a; i < b; i++) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
+    return out;
+}
+
+HexaVal __hexa_range_array(HexaVal start, HexaVal end, int inclusive) {
+    HexaVal out = hexa_array_new();
+    int64_t s = HX_INT(start), e = HX_INT(end);
+    if (inclusive) {
+        for (int64_t i = s; i <= e; i++) out = hexa_array_push(out, hexa_int(i));
+    } else {
+        for (int64_t i = s; i < e; i++) out = hexa_array_push(out, hexa_int(i));
+    }
     return out;
 }
 
@@ -3958,6 +4023,32 @@ HexaVal hexa_math_atan(HexaVal x) { return hexa_float(atan(_hexa_f(x))); }
 HexaVal hexa_math_atan2(HexaVal y, HexaVal x) { return hexa_float(atan2(_hexa_f(y), _hexa_f(x))); }
 HexaVal hexa_math_log(HexaVal x)  { return hexa_float(log(_hexa_f(x))); }
 HexaVal hexa_math_exp(HexaVal x)  { return hexa_float(exp(_hexa_f(x))); }
+HexaVal hexa_math_abs(HexaVal x)  { return hexa_float(fabs(_hexa_f(x))); }
+HexaVal hexa_math_sqrt(HexaVal x) { return hexa_float(sqrt(_hexa_f(x))); }
+HexaVal hexa_math_floor(HexaVal x){ return hexa_float(floor(_hexa_f(x))); }
+HexaVal hexa_math_ceil(HexaVal x) { return hexa_float(ceil(_hexa_f(x))); }
+HexaVal hexa_math_round(HexaVal x){ return hexa_float(round(_hexa_f(x))); }
+HexaVal hexa_math_pow(HexaVal b, HexaVal e) { return hexa_float(pow(_hexa_f(b), _hexa_f(e))); }
+HexaVal hexa_math_min(HexaVal a, HexaVal b) { return hexa_float(fmin(_hexa_f(a), _hexa_f(b))); }
+HexaVal hexa_math_max(HexaVal a, HexaVal b) { return hexa_float(fmax(_hexa_f(a), _hexa_f(b))); }
+
+// ── ML builtins: matvec, dot ─────────────────────────────────
+HexaVal hexa_matvec(HexaVal w, HexaVal x, HexaVal rows_v, HexaVal cols_v) {
+    int64_t rows = HX_IS_INT(rows_v) ? HX_INT(rows_v) : 0;
+    int64_t cols = HX_IS_INT(cols_v) ? HX_INT(cols_v) : 0;
+    if (rows <= 0 || cols <= 0) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    for (int64_t r = 0; r < rows; r++) {
+        double acc = 0.0;
+        for (int64_t c = 0; c < cols; c++) {
+            HexaVal wv = hexa_index_get(w, hexa_int(r * cols + c));
+            HexaVal xv = hexa_index_get(x, hexa_int(c));
+            acc += _hexa_f(wv) * _hexa_f(xv);
+        }
+        out = hexa_array_push(out, hexa_float(acc));
+    }
+    return out;
+}
 
 HexaVal hexa_input(HexaVal prompt) {
     if (HX_IS_STR(prompt) && HX_STR(prompt) && HX_STR(prompt)[0]) {
