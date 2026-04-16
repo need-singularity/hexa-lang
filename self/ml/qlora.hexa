@@ -1,22 +1,25 @@
 // ═══════════════════════════════════════════════════════════
-//  qlora.hexa — 4bit Quantized LoRA (Phase 1 시뮬레이션)
+//  qlora.hexa — QLoRA: Quantized Low-Rank Adaptation
+//  (Dettmers et al. 2023)
 //
-//  base W : nf4 근사 16-level 코드북 + per-row scale  (저장: int 인덱스)
-//  adapter: LoRA rank-r float (A: [r,n], B: [m,r])
+//  Pure Hexa, no C/FFI.
 //
-//  y = dequant(W_q, scale) @ x + (alpha/r) * B @ (A @ x)
+//  NF4 (Normal Float 4-bit) quantization with per-block absmax
+//  scaling (block_size=64) + trainable LoRA A,B float matrices.
+//
+//  y = dequant(base_nf4) @ input + scale * (B @ A @ input)
+//
+//  Only A and B receive gradients — base weights stay frozen
+//  in 4-bit quantized form.
 //
 //  AI-NATIVE:
-//    @memoize dequant_row → 반복 forward 시 per-row float 복원 캐시
-//    @symbolic lora_scale → alpha/r 상수 fold
-//    @pure     수학 커널
-//
-//  제약: 배열 인덱싱으로 4bit 시뮬 (저수준 비트 트위들 금지)
-//  참고: self/ml/lora.hexa 수정 금지 — 여기서는 독립 재구현
+//    @pure math kernels
+//    @memoize codebook + scale constants
 // ═══════════════════════════════════════════════════════════
 
-// ── nf4 근사 코드북 (16 레벨, [-1, 1] 비선형 분포) ────────
-//    정확한 NF4는 정규분포 quantile; 여기는 근사치 (AI-native 시뮬)
+// ── NF4 codebook: 16 levels from normal distribution quantiles ──
+// These are the exact NF4 quantile levels for a standard normal
+// distribution, symmetric around zero.
 fn nf4_codebook() {
     return [
         -1.0, -0.6962, -0.5251, -0.3949,
@@ -26,22 +29,9 @@ fn nf4_codebook() {
     ]
 }
 
-// ── 절댓값 최댓값 (per-row scale) ───────────────────────
+// ── nearest codebook index ──────────────────────────────────
 @pure
-fn row_absmax(row, n) {
-    let mut m = 0.0
-    for j in 0..n {
-        let v = row[j]
-        let a = if v < 0.0 { 0.0 - v } else { v }
-        if a > m { m = a }
-    }
-    if m < 0.000001 { m = 0.000001 }
-    return m
-}
-
-// ── 최근접 코드북 인덱스 찾기 (0..16) ─────────────────
-@pure
-fn nearest_code(x, book) {
+fn nearest_nf4(x, book) {
     let mut best = 0
     let mut bestd = 1000000.0
     for k in 0..16 {
@@ -55,47 +45,73 @@ fn nearest_code(x, book) {
     return best
 }
 
-// ── 4bit Quantize: W_float → (W_idx int[][], scale float[]) ─
-//    반환: [w_idx, scales]
-fn quantize_4bit(w, m, n) {
-    let book = nf4_codebook()
-    let mut w_idx = []
-    let mut scales = []
-    for i in 0..m {
-        let s = row_absmax(w[i], n)
-        scales = scales + [s]
-        let mut row = []
-        for j in 0..n {
-            let norm = w[i][j] / s   // [-1, 1] 범위
-            let k = nearest_code(norm, book)
-            row = row + [k]
-        }
-        w_idx = w_idx + [row]
+// ── absmax of a slice ───────────────────────────────────────
+@pure
+fn block_absmax(arr, start, count) {
+    let mut m = 0.0
+    for i in 0..count {
+        let v = arr[start + i]
+        let a = if v < 0.0 { 0.0 - v } else { v }
+        if a > m { m = a }
     }
-    return [w_idx, scales]
+    if m < 0.000001 { m = 0.000001 }
+    return m
 }
 
-// ── Dequantize per row (@memoize: 동일 (row, scale) 반복 호출 캐시) ─
-@memoize
-fn dequant_row(idx_row, scale, n) {
+// ═══════════════════════════════════════════════════════════
+//  1. quantize_nf4(weights) -> dict
+//     Block-wise NF4 quantization with block_size=64
+//     Returns: {"quant": [int], "scales": [float], "block_size": 64}
+// ═══════════════════════════════════════════════════════════
+fn quantize_nf4(weights) {
     let book = nf4_codebook()
+    let n = len(weights)
+    let bs = 64
+    let num_blocks = (n + bs - 1) / bs
+
+    let mut quant = []
+    let mut scales = []
+
+    for blk in 0..num_blocks {
+        let start = blk * bs
+        let mut count = bs
+        if start + count > n { count = n - start }
+
+        let scale = block_absmax(weights, start, count)
+        scales.push(scale)
+
+        for i in 0..count {
+            let norm = weights[start + i] / scale
+            let idx = nearest_nf4(norm, book)
+            quant.push(idx)
+        }
+    }
+
+    return #{"quant": quant, "scales": scales, "block_size": bs}
+}
+
+// ═══════════════════════════════════════════════════════════
+//  2. dequantize_nf4(qw) -> [float]
+//     Restore approximate float weights from NF4 dict
+// ═══════════════════════════════════════════════════════════
+fn dequantize_nf4(qw) {
+    let book = nf4_codebook()
+    let quant = qw["quant"]
+    let scales = qw["scales"]
+    let bs = qw["block_size"]
+    let n = len(quant)
+
     let mut out = []
-    for j in 0..n {
-        out = out + [book[idx_row[j]] * scale]
+    for i in 0..n {
+        let blk = i / bs
+        let scale = scales[blk]
+        let val = book[quant[i]] * scale
+        out.push(val)
     }
     return out
 }
 
-// ── Dequantize 전체 행렬 ────────────────────────────────
-fn dequantize_4bit(w_idx, scales, m, n) {
-    let mut w = []
-    for i in 0..m {
-        w = w + [dequant_row(w_idx[i], scales[i], n)]
-    }
-    return w
-}
-
-// ── matvec: y[m] = W[m,n] @ x[n] ────────────────────────
+// ── helper: matvec y[m] = W[m][n] @ x[n] ───────────────────
 @pure
 fn q_matvec(w, x, m, n) {
     let mut y = []
@@ -104,118 +120,220 @@ fn q_matvec(w, x, m, n) {
         for j in 0..n {
             s = s + w[i][j] * x[j]
         }
-        y = y + [s]
+        y.push(s)
     }
     return y
 }
 
-// ── Quantized matvec: dequant_row 캐시를 활용한 직접 내적 ─
-@pure
-fn qmatvec_4bit(w_idx, scales, x, m, n) {
-    let mut y = []
+// ── helper: zeros 1D ────────────────────────────────────────
+fn zeros1(n) {
+    let mut v = []
+    for i in 0..n { v.push(0.0) }
+    return v
+}
+
+// ── helper: zeros 2D ────────────────────────────────────────
+fn zeros2(m, n) {
+    let mut r = []
+    for i in 0..m { r.push(zeros1(n)) }
+    return r
+}
+
+// ── helper: small random init via LCG ───────────────────────
+fn lcg_init(m, n, seed) {
+    let mut s = seed
+    let mut r = []
     for i in 0..m {
-        let row = dequant_row(w_idx[i], scales[i], n)
-        let mut s = 0.0
+        let mut row = []
         for j in 0..n {
-            s = s + row[j] * x[j]
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row.push(v)
         }
-        y = y + [s]
+        r.push(row)
     }
-    return y
+    return r
 }
 
-// ── LoRA scale: alpha/r — @symbolic 상수 fold ────────────
-@symbolic
-@memoize
-fn qlora_scale(alpha, r) {
-    return to_float(alpha) / to_float(r)
-}
-
-// ── QLoRA forward ───────────────────────────────────────
-//    y = dequant(W_q) @ x + (alpha/r) * B @ (A @ x)
-@pure
-fn qlora_forward(w_idx, scales, a, b, x, m, n, r, alpha) {
-    let base = qmatvec_4bit(w_idx, scales, x, m, n)
-    let ax   = q_matvec(a, x, r, n)
-    let bax  = q_matvec(b, ax, m, r)
-    let s    = qlora_scale(alpha, r)
-    let mut y = []
-    for i in 0..m {
-        y = y + [base[i] + s * bax[i]]
-    }
-    return y
-}
-
-// ── MSE ─────────────────────────────────────────────────
-@pure
-fn q_mse(y, t, m) {
-    let mut s = 0.0
-    for i in 0..m {
-        let d = y[i] - t[i]
-        s = s + d * d
-    }
-    return s / to_float(m)
-}
-
-@pure
-fn q_mse_grad(y, t, m) {
-    let mut g = []
-    let inv = 2.0 / to_float(m)
-    for i in 0..m {
-        g = g + [(y[i] - t[i]) * inv]
-    }
-    return g
-}
-
-// ── LoRA backward (W frozen) ────────────────────────────
-//    dL/dB = s * dy ⊗ (A @ x)
-//    dL/dA = s * (B^T @ dy) ⊗ x
-@pure
-fn qlora_backward(a, b, x, dy, m, n, r, alpha) {
-    let s = qlora_scale(alpha, r)
-    let ax = q_matvec(a, x, r, n)
-    let mut btdy = []
-    for p in 0..r {
-        let mut acc = 0.0
-        for i in 0..m { acc = acc + b[i][p] * dy[i] }
-        btdy = btdy + [acc]
-    }
-    let mut db = []
-    for i in 0..m {
-        let mut row = []
-        for p in 0..r { row = row + [s * dy[i] * ax[p]] }
-        db = db + [row]
-    }
-    let mut da = []
-    for p in 0..r {
-        let mut row = []
-        for j in 0..n { row = row + [s * btdy[p] * x[j]] }
-        da = da + [row]
-    }
-    return [da, db]
-}
-
-// ── SGD update 2D ───────────────────────────────────────
-@pure
-fn q_sgd2(w, g, lr, m, n) {
+// ── helper: flatten 2D matrix row-major ─────────────────────
+fn mat_to_flat(w, m, n) {
     let mut out = []
     for i in 0..m {
-        let mut row = []
-        for j in 0..n { row = row + [w[i][j] - lr * g[i][j]] }
-        out = out + [row]
+        for j in 0..n {
+            out.push(w[i][j])
+        }
     }
     return out
 }
 
-// ── MSE(quant, orig) per element 평균 ───────────────────
-@pure
-fn quant_mse(w_orig, w_deq, m, n) {
-    let mut s = 0.0
+// ── helper: unflatten to 2D matrix ──────────────────────────
+fn flat_to_mat(flat, m, n) {
+    let mut out = []
     for i in 0..m {
+        let mut row = []
         for j in 0..n {
-            let d = w_orig[i][j] - w_deq[i][j]
-            s = s + d * d
+            row.push(flat[i * n + j])
         }
+        out.push(row)
     }
-    return s / to_float(m * n)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  3. qlora_layer_new(in_dim, out_dim, rank) -> dict
+//     Frozen NF4 base weights + trainable LoRA A, B
+// ═══════════════════════════════════════════════════════════
+fn qlora_layer_new(in_dim, out_dim, rank) {
+    // Generate random base weights then quantize to NF4
+    let w_float = lcg_init(out_dim, in_dim, 42)
+    let w_flat = mat_to_flat(w_float, out_dim, in_dim)
+    let base_nf4 = quantize_nf4(w_flat)
+
+    // LoRA A: [rank, in_dim] — zero init (residual starts at 0)
+    let lora_a = zeros2(rank, in_dim)
+    // LoRA B: [out_dim, rank] — small random init
+    let lora_b = lcg_init(out_dim, rank, 7777)
+    // scale = alpha / rank (alpha = rank by default so scale = 1.0)
+    let alpha = to_float(rank)
+    let scale = alpha / to_float(rank)
+
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "base_nf4": base_nf4,
+        "lora_a": lora_a,
+        "lora_b": lora_b,
+        "scale": scale,
+        "alpha": alpha
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  4. qlora_forward(layer, input) -> [float]
+//     output = dequant(base) @ input + scale * (B @ (A @ input))
+// ═══════════════════════════════════════════════════════════
+fn qlora_forward(layer, input) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let rank = layer["rank"]
+    let scale = layer["scale"]
+
+    // Dequantize base weights and reshape to [out_dim, in_dim]
+    let base_flat = dequantize_nf4(layer["base_nf4"])
+    let base_w = flat_to_mat(base_flat, out_dim, in_dim)
+
+    // base_out = base_w @ input
+    let base_out = q_matvec(base_w, input, out_dim, in_dim)
+
+    // LoRA path: A @ input -> [rank], then B @ that -> [out_dim]
+    let ax = q_matvec(layer["lora_a"], input, rank, in_dim)
+    let bax = q_matvec(layer["lora_b"], ax, out_dim, rank)
+
+    // Combine: base + scale * lora
+    let mut y = []
+    for i in 0..out_dim {
+        y.push(base_out[i] + scale * bax[i])
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════
+//  5. qlora_backward(layer, grad, input) -> dict
+//     Only compute gradients for A and B (base is frozen)
+//     grad_B[i][p] = scale * grad[i] * (A @ input)[p]
+//     grad_A[p][j] = scale * (B^T @ grad)[p] * input[j]
+//     Returns: {"grad_a": [[float]], "grad_b": [[float]]}
+// ═══════════════════════════════════════════════════════════
+fn qlora_backward(layer, grad, input) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let rank = layer["rank"]
+    let scale = layer["scale"]
+    let lora_a = layer["lora_a"]
+    let lora_b = layer["lora_b"]
+
+    // A @ input -> [rank]
+    let ax = q_matvec(lora_a, input, rank, in_dim)
+
+    // B^T @ grad -> [rank]
+    let mut bt_grad = []
+    for p in 0..rank {
+        let mut acc = 0.0
+        for i in 0..out_dim {
+            acc = acc + lora_b[i][p] * grad[i]
+        }
+        bt_grad.push(acc)
+    }
+
+    // grad_B[i][p] = scale * grad[i] * ax[p]
+    let mut grad_b = []
+    for i in 0..out_dim {
+        let mut row = []
+        for p in 0..rank {
+            row.push(scale * grad[i] * ax[p])
+        }
+        grad_b.push(row)
+    }
+
+    // grad_A[p][j] = scale * bt_grad[p] * input[j]
+    let mut grad_a = []
+    for p in 0..rank {
+        let mut row = []
+        for j in 0..in_dim {
+            row.push(scale * bt_grad[p] * input[j])
+        }
+        grad_a.push(row)
+    }
+
+    return #{"grad_a": grad_a, "grad_b": grad_b}
+}
+
+// ── SGD update for 2D matrix ────────────────────────────────
+@pure
+fn sgd_update_2d(w, g, lr, m, n) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            row.push(w[i][j] - lr * g[i][j])
+        }
+        out.push(row)
+    }
+    return out
+}
+
+// ── qlora_step: apply gradients to A and B only ─────────────
+fn qlora_step(layer, grads, lr) {
+    let rank = layer["rank"]
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+
+    let new_a = sgd_update_2d(layer["lora_a"], grads["grad_a"], lr, rank, in_dim)
+    let new_b = sgd_update_2d(layer["lora_b"], grads["grad_b"], lr, out_dim, rank)
+
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "base_nf4": layer["base_nf4"],
+        "lora_a": new_a,
+        "lora_b": new_b,
+        "scale": layer["scale"],
+        "alpha": layer["alpha"]
+    }
+}
+
+// ── quantization error metric ───────────────────────────────
+fn quant_error(original, restored) {
+    let n = len(original)
+    let mut sum_sq_err = 0.0
+    let mut sum_sq_orig = 0.0
+    for i in 0..n {
+        let d = original[i] - restored[i]
+        sum_sq_err = sum_sq_err + d * d
+        sum_sq_orig = sum_sq_orig + original[i] * original[i]
+    }
+    if sum_sq_orig < 0.000001 { return 0.0 }
+    return sqrt(sum_sq_err / sum_sq_orig)
 }
