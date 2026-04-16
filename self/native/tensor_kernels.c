@@ -20,6 +20,15 @@
 //  TAG_FLOAT, hexa_int/hexa_float/hexa_void) + __hx_to_double helper.
 // ═══════════════════════════════════════════════════════════
 
+// Compatibility: HX_* accessor macros may not be defined yet if runtime.c
+// is pre-Phase-A (struct fields only). Define them as identity-map stubs.
+#ifndef HX_IS_INT
+#define HX_IS_INT(v)    ((v).tag == TAG_INT)
+#define HX_IS_FLOAT(v)  ((v).tag == TAG_FLOAT)
+#define HX_INT(v)       ((v).i)
+#define HX_FLOAT(v)     ((v).f)
+#endif
+
 /* @hot_kernel: f32/f64/i32 pointer read/write — direct memcpy ------ */
 
 HexaVal hexa_ptr_write_f32(HexaVal ptr, HexaVal offset, HexaVal val) {
