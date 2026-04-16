@@ -6653,11 +6653,30 @@ fn eval_expr_inner(node) {
         let idx = eval_expr(node.right)
         if arr.tag == TAG_ARRAY {
             let items = get_array(arr)
-            return items[idx.int_val]
+            let _aidx = idx.int_val
+            if _aidx < 0 || _aidx >= len(items) {
+                println("runtime error: index " + to_string(_aidx) + " out of bounds (len " + to_string(len(items)) + ")")
+                return val_void()
+            }
+            return items[_aidx]
+        }
+        if arr.tag == TAG_TENSOR {
+            let items = tensor_data(arr)
+            let _tidx = idx.int_val
+            if _tidx < 0 || _tidx >= len(items) {
+                println("runtime error: index " + to_string(_tidx) + " out of bounds (len " + to_string(len(items)) + ")")
+                return val_void()
+            }
+            return val_float(if type_of(items[_tidx]) == "float" { items[_tidx] } else { to_float_val(items[_tidx]) })
         }
         if arr.tag == TAG_STR {
             let chars = arr.str_val.chars()
-            return val_str(to_string(chars[idx.int_val]))
+            let _sidx = idx.int_val
+            if _sidx < 0 || _sidx >= len(chars) {
+                println("runtime error: index " + to_string(_sidx) + " out of bounds (len " + to_string(len(chars)) + ")")
+                return val_str("")
+            }
+            return val_str(to_string(chars[_sidx]))
         }
         if arr.tag == TAG_MAP {
             // hexa-only Mac menubar 부활: dict indexing 지원 (2026-04-14, airgenome T4)
@@ -11934,6 +11953,8 @@ fn call_builtin(name, args) {
             let a = args[0]
             if a.tag == TAG_STR { return val_int(len(a.str_val)) }
             if a.tag == TAG_ARRAY { return val_int(len(get_array(a))) }
+            if a.tag == TAG_TENSOR { return val_int(len(tensor_data(a))) }
+            if a.tag == TAG_MAP { return val_int(len(get_map_keys(a))) }
         }
         return val_int(0)
     }
@@ -13454,37 +13475,50 @@ fn call_builtin(name, args) {
     }
 
     // ── BLAS kernels (Phase 3) ──
-    // matmul_into(out, a, b, m, n, k) — out[m,n] = a[m,k] · b[k,n]
+    // matmul_into — out[m,n] = a[m,k] . b[k,n]
+    // Convention A: matmul_into(out, a, b, m, n, k) — out first
+    // Convention B: matmul_into(a, b, m, n, k, out) — out last
     if name == "matmul_into" {
-        let out_t = args[0]
-        let a = if args[1].tag == TAG_TENSOR { tensor_data(args[1]) } else { get_array(args[1]) }
-        let b = if args[2].tag == TAG_TENSOR { tensor_data(args[2]) } else { get_array(args[2]) }
-        let m = args[3].int_val
-        let n = args[4].int_val
-        let k = args[5].int_val
+        // Detect convention: if last arg is tensor/array, it is the output buffer
+        let mut out_t = args[0]
+        let mut a_t = args[1]
+        let mut b_t = args[2]
+        let mut m_v = args[3].int_val
+        let mut n_v = args[4].int_val
+        let mut k_v = args[5].int_val
+        if args[5].tag == TAG_TENSOR || args[5].tag == TAG_ARRAY {
+            // Convention B: (a, b, m, n, k, out)
+            a_t = args[0]
+            b_t = args[1]
+            m_v = args[2].int_val
+            n_v = args[3].int_val
+            k_v = args[4].int_val
+            out_t = args[5]
+        }
+        let a = if a_t.tag == TAG_TENSOR { tensor_data(a_t) } else { get_array(a_t) }
+        let b = if b_t.tag == TAG_TENSOR { tensor_data(b_t) } else { get_array(b_t) }
         let mut out = if out_t.tag == TAG_TENSOR { tensor_data(out_t) } else { [] }
-        if len(out) < m * n {
-            // grow
+        if len(out) < m_v * n_v {
             let mut z = 0
-            while len(out) < m * n { out = out.push(0.0); z = z + 1 }
+            while len(out) < m_v * n_v { out = out.push(0.0); z = z + 1 }
         }
         let mut mi = 0
-        while mi < m {
+        while mi < m_v {
             let mut nj = 0
-            while nj < n {
+            while nj < n_v {
                 let mut acc = 0.0
                 let mut kk = 0
-                while kk < k {
-                    acc = acc + a[mi * k + kk] * b[kk * n + nj]
+                while kk < k_v {
+                    acc = acc + a[mi * k_v + kk] * b[kk * n_v + nj]
                     kk = kk + 1
                 }
-                out[mi * n + nj] = acc
+                out[mi * n_v + nj] = acc
                 nj = nj + 1
             }
             mi = mi + 1
         }
         if out_t.tag == TAG_TENSOR { tensor_set_data(out_t, out); return out_t }
-        return val_tensor([m, n], out)
+        return val_tensor([m_v, n_v], out)
     }
     // matmul_into_accumulate(out, a, b, m, n, k) — out += a · b
     if name == "matmul_into_accumulate" {
@@ -13570,21 +13604,39 @@ fn call_builtin(name, args) {
         if out_t.tag == TAG_TENSOR { tensor_set_data(out_t, out); return out_t }
         return val_tensor([m, n], out)
     }
-    // axpy(out, a, x, y) — out = a*x + y (BLAS-1)
+    // axpy — BLAS-1 y = alpha*x + y
+    // 4-arg: axpy(out, alpha, x, y) — write into out
+    // 3-arg: axpy(x, y, alpha)      — return new tensor
     if name == "axpy" {
-        let out_t = args[0]
-        let alpha = to_float_val(args[1])
-        let x = if args[2].tag == TAG_TENSOR { tensor_data(args[2]) } else { get_array(args[2]) }
-        let y = if args[3].tag == TAG_TENSOR { tensor_data(args[3]) } else { get_array(args[3]) }
-        let n_axpy = if len(x) < len(y) { len(x) } else { len(y) }
-        let mut out = []
-        let mut ai = 0
-        while ai < n_axpy {
-            out = out.push(alpha * x[ai] + y[ai])
-            ai = ai + 1
+        if len(args) >= 4 {
+            let out_t = args[0]
+            let alpha = to_float_val(args[1])
+            let x = if args[2].tag == TAG_TENSOR { tensor_data(args[2]) } else { get_array(args[2]) }
+            let y = if args[3].tag == TAG_TENSOR { tensor_data(args[3]) } else { get_array(args[3]) }
+            let n_axpy = if len(x) < len(y) { len(x) } else { len(y) }
+            let mut out = []
+            let mut ai = 0
+            while ai < n_axpy {
+                out = out.push(alpha * x[ai] + y[ai])
+                ai = ai + 1
+            }
+            if out_t.tag == TAG_TENSOR { tensor_set_data(out_t, out); return out_t }
+            return val_tensor([n_axpy], out)
         }
-        if out_t.tag == TAG_TENSOR { tensor_set_data(out_t, out); return out_t }
-        return val_tensor([n_axpy], out)
+        if len(args) >= 3 {
+            let x = if args[0].tag == TAG_TENSOR { tensor_data(args[0]) } else { get_array(args[0]) }
+            let y = if args[1].tag == TAG_TENSOR { tensor_data(args[1]) } else { get_array(args[1]) }
+            let alpha = to_float_val(args[2])
+            let n_axpy = if len(x) < len(y) { len(x) } else { len(y) }
+            let mut out = []
+            let mut ai = 0
+            while ai < n_axpy {
+                out = out.push(alpha * x[ai] + y[ai])
+                ai = ai + 1
+            }
+            return val_tensor([n_axpy], out)
+        }
+        return val_void()
     }
     // mat_add(a, b) — element-wise addition
     if name == "mat_add" {
@@ -13703,8 +13755,64 @@ fn call_builtin(name, args) {
         if out_t.tag == TAG_TENSOR { tensor_set_data(out_t, out); return out_t }
         return val_tensor([n_h * head_dim], out)
     }
-    // qkv_fused_into(q_out, k_out, v_out, w_qkv, x, n_q, n_k, n_v, dim) — fused proj
+    // qkv_fused_into — fused QKV projection
+    // 9-arg: qkv_fused_into(q_out, k_out, v_out, w_qkv, x, n_q, n_k, n_v, dim)
+    // 8-arg: qkv_fused_into(X, Uqkv, M, K, R, out_q, out_k, out_v)
+    //        X[M,K] * Uqkv[K, 3R] => Q[M,R], K[M,R], V[M,R]
+    //        Returns [Q_tensor, K_tensor, V_tensor]
     if name == "qkv_fused_into" {
+        if len(args) == 8 {
+            // Convention B: (X, Uqkv, M, K, R, out_q, out_k, out_v)
+            let x_data = if args[0].tag == TAG_TENSOR { tensor_data(args[0]) } else { get_array(args[0]) }
+            let w_data = if args[1].tag == TAG_TENSOR { tensor_data(args[1]) } else { get_array(args[1]) }
+            let m_v = args[2].int_val
+            let k_v = args[3].int_val
+            let r_v = args[4].int_val
+            let q_out = args[5]
+            let k_out = args[6]
+            let v_out = args[7]
+            let cols3 = 3 * r_v
+            // Fused matmul: result[M, 3R] = X[M,K] * Uqkv[K, 3R]
+            let mut q_data = []
+            let mut k_data = []
+            let mut v_data = []
+            let mut ri = 0
+            while ri < m_v {
+                let mut cj = 0
+                while cj < r_v {
+                    let mut acc = 0.0
+                    let mut di = 0
+                    while di < k_v { acc = acc + x_data[ri * k_v + di] * w_data[di * cols3 + cj]; di = di + 1 }
+                    q_data = q_data.push(acc)
+                    cj = cj + 1
+                }
+                cj = 0
+                while cj < r_v {
+                    let mut acc = 0.0
+                    let mut di = 0
+                    while di < k_v { acc = acc + x_data[ri * k_v + di] * w_data[di * cols3 + r_v + cj]; di = di + 1 }
+                    k_data = k_data.push(acc)
+                    cj = cj + 1
+                }
+                cj = 0
+                while cj < r_v {
+                    let mut acc = 0.0
+                    let mut di = 0
+                    while di < k_v { acc = acc + x_data[ri * k_v + di] * w_data[di * cols3 + 2 * r_v + cj]; di = di + 1 }
+                    v_data = v_data.push(acc)
+                    cj = cj + 1
+                }
+                ri = ri + 1
+            }
+            if q_out.tag == TAG_TENSOR { tensor_set_data(q_out, q_data) }
+            if k_out.tag == TAG_TENSOR { tensor_set_data(k_out, k_data) }
+            if v_out.tag == TAG_TENSOR { tensor_set_data(v_out, v_data) }
+            let qt = if q_out.tag == TAG_TENSOR { q_out } else { val_tensor([m_v, r_v], q_data) }
+            let kt = if k_out.tag == TAG_TENSOR { k_out } else { val_tensor([m_v, r_v], k_data) }
+            let vt = if v_out.tag == TAG_TENSOR { v_out } else { val_tensor([m_v, r_v], v_data) }
+            return val_array([qt, kt, vt])
+        }
+        // 9-arg convention: (q_out, k_out, v_out, w_qkv, x, n_q, n_k, n_v, dim)
         let q_out = args[0]
         let k_out = args[1]
         let v_out = args[2]
@@ -13734,7 +13842,7 @@ fn call_builtin(name, args) {
         if q_out.tag == TAG_TENSOR { tensor_set_data(q_out, q_data) }
         if k_out.tag == TAG_TENSOR { tensor_set_data(k_out, k_data) }
         if v_out.tag == TAG_TENSOR { tensor_set_data(v_out, v_data) }
-        return val_void()
+        return val_array([val_tensor([n_q], q_data), val_tensor([n_k], k_data), val_tensor([n_v], v_data)])
     }
     // repeat_kv(kv, n_repeat, n_kv_head, head_dim) — broadcast each KV head n_repeat times
     if name == "repeat_kv" {
@@ -16300,22 +16408,33 @@ if _hx_file != "" {
         let mut _hx_tp = 0
         let mut _hx_tf = 0
         let mut _hx_ts = 0
+        let mut _hx_seen = []
         let mut _hx_ti = 0
         while _hx_ti < len(fn_attrs) {
             let _hx_tn = fn_attrs[_hx_ti][0]
             let _hx_ta = fn_attrs[_hx_ti][1]
             if _hx_ta.contains("test") {
-                if _hx_ta.contains("skip") {
-                    println("  SKIP  " + _hx_tn)
-                    _hx_ts = _hx_ts + 1
-                } else {
-                    try {
-                        call_user_fn(_hx_tn, [])
-                        println("  PASS  " + _hx_tn)
-                        _hx_tp = _hx_tp + 1
-                    } catch _hx_te {
-                        println("  FAIL  " + _hx_tn + " — " + to_string(_hx_te))
-                        _hx_tf = _hx_tf + 1
+                // deduplicate: fn_attrs has entries from both pre-reg and exec
+                let mut _hx_dup = false
+                let mut _hx_si = 0
+                while _hx_si < len(_hx_seen) {
+                    if _hx_seen[_hx_si] == _hx_tn { _hx_dup = true }
+                    _hx_si = _hx_si + 1
+                }
+                if !_hx_dup {
+                    _hx_seen = _hx_seen.push(_hx_tn)
+                    if _hx_ta.contains("skip") {
+                        println("  SKIP  " + _hx_tn)
+                        _hx_ts = _hx_ts + 1
+                    } else {
+                        try {
+                            call_user_fn(_hx_tn, [])
+                            println("  PASS  " + _hx_tn)
+                            _hx_tp = _hx_tp + 1
+                        } catch _hx_te {
+                            println("  FAIL  " + _hx_tn + " — " + to_string(_hx_te))
+                            _hx_tf = _hx_tf + 1
+                        }
                     }
                 }
             }
@@ -16330,31 +16449,42 @@ if _hx_file != "" {
         // @bench runner: interpret to populate fn_attrs, then bench @bench fns
         interpret(_hx_ast)
         let mut _hx_bs = 0
+        let mut _hx_bseen = []
         let mut _hx_bi = 0
         while _hx_bi < len(fn_attrs) {
             let _hx_bn = fn_attrs[_hx_bi][0]
             let _hx_ba = fn_attrs[_hx_bi][1]
             if _hx_ba.contains("bench") {
-                if _hx_ba.contains("skip") {
-                    println("  SKIP  " + _hx_bn)
-                    _hx_bs = _hx_bs + 1
-                } else {
-                    let _hx_iters = 100
-                    let _hx_bt0 = clock()
-                    let mut _hx_bmin = 999999.0
-                    let mut _hx_bj = 0
-                    while _hx_bj < _hx_iters {
-                        let _hx_iter_t0 = clock()
-                        call_user_fn(_hx_bn, [])
-                        let _hx_iter_dt = (clock() - _hx_iter_t0) * 1000.0
-                        if _hx_iter_dt < _hx_bmin {
-                            _hx_bmin = _hx_iter_dt
+                // deduplicate
+                let mut _hx_bdup = false
+                let mut _hx_bsi = 0
+                while _hx_bsi < len(_hx_bseen) {
+                    if _hx_bseen[_hx_bsi] == _hx_bn { _hx_bdup = true }
+                    _hx_bsi = _hx_bsi + 1
+                }
+                if !_hx_bdup {
+                    _hx_bseen = _hx_bseen.push(_hx_bn)
+                    if _hx_ba.contains("skip") {
+                        println("  SKIP  " + _hx_bn)
+                        _hx_bs = _hx_bs + 1
+                    } else {
+                        let _hx_iters = 100
+                        let _hx_bt0 = clock()
+                        let mut _hx_bmin = 999999.0
+                        let mut _hx_bj = 0
+                        while _hx_bj < _hx_iters {
+                            let _hx_iter_t0 = clock()
+                            call_user_fn(_hx_bn, [])
+                            let _hx_iter_dt = (clock() - _hx_iter_t0) * 1000.0
+                            if _hx_iter_dt < _hx_bmin {
+                                _hx_bmin = _hx_iter_dt
+                            }
+                            _hx_bj = _hx_bj + 1
                         }
-                        _hx_bj = _hx_bj + 1
+                        let _hx_btotal = (clock() - _hx_bt0) * 1000.0
+                        let _hx_bmean = _hx_btotal / _hx_iters
+                        println("  BENCH " + _hx_bn + "  total=" + to_string(_hx_btotal) + "ms  mean=" + to_string(_hx_bmean) + "ms  min=" + to_string(_hx_bmin) + "ms  (n=" + to_string(_hx_iters) + ")")
                     }
-                    let _hx_btotal = (clock() - _hx_bt0) * 1000.0
-                    let _hx_bmean = _hx_btotal / _hx_iters
-                    println("  BENCH " + _hx_bn + "  total=" + to_string(_hx_btotal) + "ms  mean=" + to_string(_hx_bmean) + "ms  min=" + to_string(_hx_bmin) + "ms  (n=" + to_string(_hx_iters) + ")")
                 }
             }
             _hx_bi = _hx_bi + 1
