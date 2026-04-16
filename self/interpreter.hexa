@@ -713,9 +713,19 @@ fn specialize_ic_dominant_type(fn_name) {
     return ""
 }
 // ── @lazy thunk runtime support ─────────────────────────
-// lazy_cache: [[fn_name, result_val, computed_flag], ...]
-// A @lazy fn is evaluated at most once; the result is cached here.
+// ROI-16: lazy_cache upgraded from flat list to 64-bucket hash.
+// Each bucket is [[fn_name, result_val], ...]. O(1) avg lookup.
 pub let mut lazy_cache = []
+
+fn lazy_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    lazy_cache = buckets
+}
 
 fn has_lazy_attr(name) {
     // ROI-11: single bitmask probe replaces fn_attrs_get + 3 string checks
@@ -723,10 +733,15 @@ fn has_lazy_attr(name) {
 }
 
 fn lazy_lookup(name) {
-    let mut i = 0
-    while i < len(lazy_cache) {
-        if lazy_cache[i][0] == name { return lazy_cache[i] }
-        i = i + 1
+    // ROI-16: 64-bucket hash probe, fallback empty string
+    if len(lazy_cache) == 64 {
+        let b = env_hash(name)
+        let bucket = lazy_cache[b]
+        let mut j = len(bucket) - 1
+        while j >= 0 {
+            if bucket[j][0] == name { return bucket[j] }
+            j = j - 1
+        }
     }
     return ""
 }
@@ -736,7 +751,10 @@ fn has_specialize_attr(name) {
     return (fn_attr_bitmask(name) / 4) % 2 == 1
 }
 fn lazy_store(name, result) {
-    lazy_cache = lazy_cache.push([name, result])
+    // ROI-16: insert into 64-bucket hash
+    if len(lazy_cache) != 64 { lazy_cache_init() }
+    let b = env_hash(name)
+    lazy_cache[b] = lazy_cache[b].push([name, result])
 }
 
 // ── Extern FFI storage ──────────────────────────────────
@@ -823,6 +841,43 @@ fn extern_link_lib(hexa_name) {
 // Each entry: [target_name, methods_array]
 // methods_array: each is a FnDecl node with .name, .params, .body
 pub let mut impl_store = []
+
+// ── ROI-17: impl_cache — 64-bucket hash for O(1) method dispatch ──
+// Key: "StructName::method" → [impl_store_idx, method_idx]
+// Eliminates O(N*M) double linear scan in call_method hot path.
+pub let mut impl_cache = []
+
+fn impl_cache_init() {
+    let mut buckets = []
+    let mut i = 0
+    while i < 64 {
+        buckets = buckets.push([])
+        i = i + 1
+    }
+    impl_cache = buckets
+}
+
+fn impl_cache_add(sname, mname, is_idx, m_idx) {
+    if len(impl_cache) != 64 { impl_cache_init() }
+    let key = sname + "::" + mname
+    let b = env_hash(key)
+    impl_cache[b] = impl_cache[b].push([key, is_idx, m_idx])
+}
+
+fn impl_cache_lookup(sname, mname) {
+    // Returns [is_idx, m_idx] or "" on miss
+    if len(impl_cache) == 64 {
+        let key = sname + "::" + mname
+        let b = env_hash(key)
+        let bucket = impl_cache[b]
+        let mut j = len(bucket) - 1
+        while j >= 0 {
+            if bucket[j][0] == key { return [bucket[j][1], bucket[j][2]] }
+            j = j - 1
+        }
+    }
+    return ""
+}
 
 // ── Closure environment storage ─────────────────────────
 // Closures capture a snapshot of [env_vars, env_cache] at creation time.
@@ -3293,11 +3348,14 @@ fn exec_stmt_at(stmts, idx) {
         // Store impl block methods for struct method dispatch
         let target = node.target
         let methods = node.methods
+        let is_idx = len(impl_store)
         impl_store = impl_store.push([target, methods])
-        // Also register methods as functions with mangled names: Type__method
+        // ROI-17: populate impl_cache for O(1) method dispatch
         let mut mi = 0
         while mi < len(methods) {
             let m = methods[mi]
+            impl_cache_add(target, m.name, is_idx, mi)
+            // Also register methods as functions with mangled names: Type__method
             let mangled = target + "__" + m.name
             env_fns = env_fns.push([mangled, m.params, m.body])
             fn_cache_add(mangled, len(env_fns) - 1)
@@ -9999,7 +10057,73 @@ fn call_method(obj, method, args) {
     // Struct method dispatch via impl blocks
     if obj.tag == TAG_STRUCT {
         let sname = obj.struct_name
-        // Look for impl block method
+        // ROI-17: probe 64-bucket impl_cache first for O(1) dispatch
+        let ic_hit = impl_cache_lookup(sname, method)
+        if ic_hit != "" {
+            let m = impl_store[ic_hit[0]][1][ic_hit[1]]
+            let mparams = m.params
+            let mbody = m.body
+            env_push_scope()
+            let _arena_push = env_var("__HEXA_ARENA_PUSH__")
+            env_define("self", obj)
+            let mut pi = 0
+            let mut ai = 0
+            while pi < len(mparams) {
+                let mut pname = ""
+                if type_of(mparams[pi]) == "string" {
+                    pname = mparams[pi]
+                } else {
+                    pname = mparams[pi].name
+                }
+                if pname == "self" {
+                    // skip — already bound
+                } else {
+                    if ai < len(args) {
+                        env_define(pname, args[ai])
+                        ai = ai + 1
+                    } else {
+                        let mut mp_found = false
+                        let mut mni = 0
+                        while mni < len(pending_named_args) {
+                            if pending_named_args[mni][0] == pname {
+                                env_define(pname, pending_named_args[mni][1])
+                                mp_found = true
+                                mni = len(pending_named_args)
+                            }
+                            mni = mni + 1
+                        }
+                        if !mp_found {
+                            let mp = mparams[pi]
+                            if type_of(mp) != "string" && mp.left != "" {
+                                env_define(pname, eval_expr(mp.left))
+                            } else {
+                                env_define(pname, val_void())
+                            }
+                        }
+                    }
+                }
+                pi = pi + 1
+            }
+            let saved_flag = return_flag
+            return_flag = false
+            let mut bi = 0
+            while bi < len(mbody) {
+                if return_flag { bi = len(mbody) } else {
+                    exec_stmt_at(mbody, bi)
+                    bi = bi + 1
+                }
+            }
+            let mut result = return_val
+            return_flag = saved_flag
+            return_val = result
+            let _arena_heap = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+            result = return_val
+            return_val = val_void()
+            env_pop_scope()
+            let _arena_pop = env_var("__HEXA_ARENA_POP__")
+            return result
+        }
+        // Fallback: linear scan (should not reach here after cache populated)
         let mut ii = 0
         while ii < len(impl_store) {
             if impl_store[ii][0] == sname {
@@ -11113,6 +11237,8 @@ fn interpret(ast) {
     struct_store = []
     struct_refcounts = []
     impl_store = []
+    impl_cache = []
+    lazy_cache = []
     closure_store = []
     extern_fns = []
     extern_fn_cache = []
