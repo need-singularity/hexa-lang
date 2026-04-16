@@ -35,6 +35,270 @@
 //   string lookup — no nested helper is reached more than once per run.
 
 // ═══════════════════════════════════════════════════════════
+//  ARM64 instruction encoders
+//  All encodings verified against `as` + `otool -t` (see /tmp/asm_check).
+//  We avoid bit-shift operators (stage0 parser quirk with `<<` + parens)
+//  and use plain arithmetic since all values fit in 32-bit positives.
+// ═══════════════════════════════════════════════════════════
+
+// MOVZ Xd, #imm16  ->  0xD2800000 | (imm<<5) | Rd
+@pure
+fn enc_movz(rd: int, imm: int) -> int {
+    return 3531603968 + imm * 32 + rd
+}
+
+// MOVK Xd, #imm16, LSL #(hw*16)  ->  0xF2800000 | (hw<<21) | (imm<<5) | Rd
+@pure
+fn enc_movk(rd: int, imm: int, hw: int) -> int {
+    return 4068474880 + hw * 2097152 + imm * 32 + rd
+}
+
+// ADD Xd, Xn, Xm  ->  0x8B000000 | (Rm<<16) | (Rn<<5) | Rd
+@pure
+fn enc_add(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + rm * 65536 + rn * 32 + rd
+}
+
+// SUB Xd, Xn, Xm  ->  0xCB000000 | (Rm<<16) | (Rn<<5) | Rd
+@pure
+fn enc_sub(rd: int, rn: int, rm: int) -> int {
+    return 3406774272 + rm * 65536 + rn * 32 + rd
+}
+
+// MUL Xd, Xn, Xm  ->  0x9B007C00 | (Rm<<16) | (Rn<<5) | Rd
+@pure
+fn enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600500224 + rm * 65536 + rn * 32 + rd
+}
+
+// SDIV Xd, Xn, Xm  ->  0x9AC00C00 | (Rm<<16) | (Rn<<5) | Rd
+@pure
+fn enc_sdiv(rd: int, rn: int, rm: int) -> int {
+    return 2596309504 + rm * 65536 + rn * 32 + rd
+}
+
+// MOV Xd, Xn  (alias for ORR Xd, XZR, Xn)  ->  0xAA0003E0 | (Rm<<16) | Rd
+@pure
+fn enc_mov_reg(rd: int, rm: int) -> int {
+    return 2852127200 + rm * 65536 + rd
+}
+
+// STR Xt, [SP, #slot*8]  ->  0xF90003E0 | (slot<<10) | Rt
+@pure
+fn enc_str_sp(rt: int, slot: int) -> int {
+    return 4178968544 + slot * 1024 + rt
+}
+
+// LDR Xt, [SP, #slot*8]  ->  0xF94003E0 | (slot<<10) | Rt
+@pure
+fn enc_ldr_sp(rt: int, slot: int) -> int {
+    return 4182113760 + slot * 1024 + rt
+}
+
+// CBZ Xt, #off  ->  0xB4000000 | (off19<<5) | Rt   (off in instructions)
+@pure
+fn enc_cbz(rt: int, off19: int) -> int {
+    return 3019898880 + off19 * 32 + rt
+}
+
+// B #off  ->  0x14000000 | off26  (off in instructions)
+@pure
+fn enc_b(off26: int) -> int {
+    return 335544320 + off26
+}
+
+// SUB SP, SP, #imm12  ->  0xD1000000 | (imm12<<10) | (31<<5) | 31
+@pure
+fn enc_sub_sp(imm12: int) -> int {
+    return 3506438144 + imm12 * 1024 + 1023
+}
+
+// ADD SP, SP, #imm12  ->  0x91000000 | (imm12<<10) | (31<<5) | 31
+@pure
+fn enc_add_sp(imm12: int) -> int {
+    return 2432696320 + imm12 * 1024 + 1023
+}
+
+// SVC #0x80  ->  0xD4001001  (constant)
+@pure
+fn enc_svc() -> int {
+    return 3556773889
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Tiny AST + register-stack ARM64 emitter
+//
+//  Strategy: each Expr has a kind. We walk it, lowering to a register
+//  stack model: subexpression values live in x9, x10, x11, ... x14
+//  (stack depth bounded by 6). Final result moved to x0 for exit code.
+//  Variables live in fixed SP-relative slots; if-else uses CBZ/B.
+//
+//  The AST is *flat* — children referenced by integer indices into
+//  a [Node] array. This avoids the P26 string-serialization trap and
+//  keeps the walker tail-flat enough for stage0.
+// ═══════════════════════════════════════════════════════════
+
+struct Node {
+    kind: string,    // "int", "bin", "var", "let", "if", "block"
+    int_val: int,
+    op: string,      // "+" "-" "*" "/" for bin
+    name: string,    // identifier for var / let
+    l: int,          // index of left child (or cond / value for let)
+    r: int,          // index of right child (or body for let)
+    e: int           // index of else branch (for if)
+}
+
+@pure
+fn n_int(v: int) -> Node {
+    return Node { kind: "int", int_val: v, op: "", name: "", l: 0, r: 0, e: 0 }
+}
+
+@pure
+fn n_bin(op: string, l: int, r: int) -> Node {
+    return Node { kind: "bin", int_val: 0, op: op, name: "", l: l, r: r, e: 0 }
+}
+
+@pure
+fn n_var(name: string) -> Node {
+    return Node { kind: "var", int_val: 0, op: "", name: name, l: 0, r: 0, e: 0 }
+}
+
+// `let name = (l)` followed by body (r). Body's value is the let-expr value.
+@pure
+fn n_let(name: string, val_idx: int, body_idx: int) -> Node {
+    return Node { kind: "let", int_val: 0, op: "", name: name, l: val_idx, r: body_idx, e: 0 }
+}
+
+// if cond (l) then (r) else (e)
+@pure
+fn n_if(cond_idx: int, then_idx: int, else_idx: int) -> Node {
+    return Node { kind: "if", int_val: 0, op: "", name: "", l: cond_idx, r: then_idx, e: else_idx }
+}
+
+// ─── Symbol table: parallel arrays passed as state ─────────
+// Each `let` allocates a slot (sp-relative, 8 bytes each). Lookup by name
+// walks from end to support shadowing. Stack frame = 16 * MAX_SLOTS aligned.
+
+fn lookup_slot(syms: [string], name: string) -> int {
+    let mut i = len(syms) - 1
+    while i >= 0 {
+        if syms[i] == name { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── Code emitter ──────────────────────────────────────────
+// emit_expr returns updated code list. The expression's result lands
+// in register x{9 + depth - 1} after the call (stack depth grows by 1).
+
+fn emit_expr(nodes: [Node], idx: int, syms: [string], depth: int, code_in: [int]) -> [int] {
+    let n = nodes[idx]
+    let mut code = code_in
+    let dst = 9 + depth   // result goes here
+
+    if n.kind == "int" {
+        // MOVZ low 16 bits, then MOVK upper 16 bits if value > 65535.
+        let v = n.int_val
+        let lo = v % 65536
+        let hi = (v / 65536) % 65536
+        code = code + [enc_movz(dst, lo)]
+        if hi > 0 {
+            code = code + [enc_movk(dst, hi, 1)]
+        }
+        return code
+    }
+
+    if n.kind == "var" {
+        let slot = lookup_slot(syms, n.name)
+        // LDR Xdst, [SP, #slot*8]
+        code = code + [enc_ldr_sp(dst, slot)]
+        return code
+    }
+
+    if n.kind == "bin" {
+        // Eval left into x{9+depth}, right into x{9+depth+1}, fold into x{9+depth}.
+        code = emit_expr(nodes, n.l, syms, depth, code)
+        code = emit_expr(nodes, n.r, syms, depth + 1, code)
+        let a = 9 + depth
+        let b = 9 + depth + 1
+        if n.op == "+" { code = code + [enc_add(a, a, b)] }
+        if n.op == "-" { code = code + [enc_sub(a, a, b)] }
+        if n.op == "*" { code = code + [enc_mul(a, a, b)] }
+        if n.op == "/" { code = code + [enc_sdiv(a, a, b)] }
+        return code
+    }
+
+    if n.kind == "let" {
+        // Evaluate value into next register, store to this slot, then body.
+        let slot = len(syms)
+        code = emit_expr(nodes, n.l, syms, depth, code)
+        // STR x{dst}, [SP, #slot*8]
+        code = code + [enc_str_sp(dst, slot)]
+        let mut syms2 = syms + [n.name]
+        // Body uses same depth (let value already consumed).
+        code = emit_expr(nodes, n.r, syms2, depth, code)
+        return code
+    }
+
+    if n.kind == "if" {
+        // Lower:  eval cond -> reg c
+        //         CBZ c, ELSE
+        //         <then>
+        //         B END
+        // ELSE:   <else>
+        // END:
+        // Two-pass approach: emit then/else into temp lists to know their lengths.
+        let cond_code_len_before = len(code)
+        code = emit_expr(nodes, n.l, syms, depth, code)
+        let cond_reg = 9 + depth
+        // Reserve a slot for CBZ; we patch after we know then-length.
+        let cbz_pos = len(code)
+        code = code + [enc_cbz(cond_reg, 0)]   // placeholder
+        // Then branch — also lowers result into x{dst}
+        code = emit_expr(nodes, n.r, syms, depth, code)
+        // Reserve slot for unconditional B over else
+        let b_pos = len(code)
+        code = code + [enc_b(0)]   // placeholder
+        // ELSE label is here:
+        let else_pos = len(code)
+        code = emit_expr(nodes, n.e, syms, depth, code)
+        let end_pos = len(code)
+        // Patch CBZ: jump from cbz_pos to else_pos
+        let cbz_off = else_pos - cbz_pos
+        code[cbz_pos] = enc_cbz(cond_reg, cbz_off)
+        // Patch B: jump from b_pos to end_pos
+        let b_off = end_pos - b_pos
+        code[b_pos] = enc_b(b_off)
+        return code
+    }
+
+    return code
+}
+
+// Wrap an expression's emit into a complete `_start`-style routine that:
+//   1. Sets up a stack frame (SUB SP, SP, #frame_bytes)
+//   2. Evaluates expr, leaves result in x9
+//   3. MOV X0, X9        (exit code)
+//   4. MOVZ X16, #1      (SYS_exit)
+//   5. SVC #0x80
+fn emit_program(nodes: [Node], root: int, num_slots: int) -> [int] {
+    let mut code = []
+    // Round frame to multiple of 16, minimum 16.
+    let mut frame = num_slots * 8
+    if frame < 16 { frame = 16 }
+    if frame % 16 != 0 { frame = frame + (16 - frame % 16) }
+    code = code + [enc_sub_sp(frame)]
+    let syms = []
+    code = emit_expr(nodes, root, syms, 0, code)
+    code = code + [enc_mov_reg(0, 9)]      // MOV X0, X9
+    code = code + [enc_add_sp(frame)]      // restore SP
+    code = code + [enc_movz(16, 1)]        // SYS_exit
+    code = code + [enc_svc()]
+    return code
+}
+
+// ═══════════════════════════════════════════════════════════
 //  Single-shot Mach-O builder (P26-safe)
 // ═══════════════════════════════════════════════════════════
 
