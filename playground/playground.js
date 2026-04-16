@@ -439,7 +439,7 @@ function setStatus(cls, text) {
 
 function runCode() {
     if (!wasmModule) {
-        output.innerHTML = '<span class="error-line">WASM module not loaded. Run playground/build.sh first.</span>';
+        output.innerHTML = '<span class="error-line">WASM module not loaded. Run playground/build.hexa first.</span>';
         return;
     }
 

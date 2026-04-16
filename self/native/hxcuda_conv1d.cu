@@ -5,7 +5,7 @@
 // T_out = (T + 2*padding - dilation*(K-1) - 1) / stride + 1
 //
 // ABI: struct-args, pointers as int64_t (matches hxcuda_fused/stft).
-// Compile: link into libhxcuda.so via build_hxcuda_linux.sh
+// Compile: link into libhxcuda.so via build_hxcuda_linux.hexa
 
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>

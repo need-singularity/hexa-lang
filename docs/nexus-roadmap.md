@@ -68,7 +68,7 @@ nexus verify 12   # keyword groups = sigma?
 **파이프라인:**
 ```
 git commit → pre-commit hook
-  → extract_counts.sh (grep token.rs, ast.rs, types.rs)
+  → extract_counts.hexa (grep token.rs, ast.rs, types.rs)
   → nexus verify <각 카운트>
   → anomaly 있으면 커밋 차단 + CDO 기록
 ```
@@ -265,7 +265,7 @@ P6      통합 런타임             6주       P5 완료
 
 #### P8-2: growth-registry 양방향 (anima: 생태계 참여)
 - **출처**: anima만 활성(score=0.6), 나머지 리포 성장=0
-- **hexa 적용**: `.growth/scan.py` → nexus shared/growth_bus에 hexa 상태 업로드
+- **hexa 적용**: `.growth/scan.hexa` → nexus shared/growth_bus에 hexa 상태 업로드
 - **구체적으로**:
   - growth daemon이 health score, BT 수, test 수를 growth_bus에 write
   - nexus가 hexa-lang 성장 데이터를 모니터링

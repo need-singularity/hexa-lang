@@ -109,7 +109,7 @@ sigma(n) * phi(n) = n * tau(n)    holds for n >= 2    if and only if n = 6
 ### One-liner (recommended)
 
 ```bash
-/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.sh)"
+hexa <(curl -fsSL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.hexa)
 ```
 
 Installs both commands into `~/.hx/bin/`:
@@ -412,7 +412,7 @@ Install and run HEXA ecosystem packages with a single command. No brew, no cargo
 
 ```bash
 # Install hx (one-liner)
-curl -sL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/pkg/install.sh | bash
+hexa <(curl -sL https://raw.githubusercontent.com/need-singularity/hexa-lang/main/install.hexa)
 
 # Use
 hx search                         # List available packages

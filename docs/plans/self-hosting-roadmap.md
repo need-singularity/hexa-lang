@@ -233,7 +233,7 @@
 > ```
 >
 > #### P5-5: Rust 제거 + CI 확립
-> - Rust src/ 의존 완전 제거 — `build.sh`를 hexa_v2 기반으로 교체
+> - Rust src/ 의존 완전 제거 — `build.hexa`를 hexa_v2 기반으로 교체
 > - CI 파이프라인: `hexa_v2 → compile self → hexa_v3 → diff → PASS`
 > - 부트스트랩 바이너리(hexa_v2) git에 체크인 또는 릴리즈 아티팩트 관리
 >

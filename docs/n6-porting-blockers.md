@@ -79,7 +79,7 @@ CompoundAssign(+= -= *= /= %=), BreakStmt/ContinueStmt, StructDecl 도 추가.
 ### B-7: 외부 명령 호출
 - **동작**: `exec("echo hello")` → stdout 캡처
 - **미확인**: 종료코드 반환, stderr 캡처, 환경변수, pipe
-- **영향**: L1 .sh 포팅 (복잡한 파이프라인)
+- **영향**: L1 .sh 포팅 -- DONE (2026-04-16, 19 scripts ported)
 
 ### B-9: JSON 파싱
 - **동작**: `json_parse('{"key":"val"}')` 기본 동작
@@ -91,7 +91,7 @@ CompoundAssign(+= -= *= /= %=), BreakStmt/ContinueStmt, StructDecl 도 추가.
 ### B-8: 파일시스템 디렉토리 순회
 - **동작**: read_file, write_file
 - **미지원**: `read_dir`, glob, exists, mkdir_p
-- **영향**: L1 .sh 포팅 (find + glob 패턴)
+- **영향**: L1 .sh 포팅 -- DONE (2026-04-16)
 
 ### B-10: ML 수치 스택
 - numpy/torch/scipy/matplotlib 상응 0
@@ -146,7 +146,7 @@ CompoundAssign(+= -= *= /= %=), BreakStmt/ContinueStmt, StructDecl 도 추가.
 |------|-----------|-----------|
 | L2 나머지 19개 커밋 | gate 바이너리 재빌드 | 코드 생성 완료, 커밋 대기 |
 | L2 G3 byte-perfect | B-3b 정수 폭 (math 해소됨, ready 226e337) | 부분 해소 |
-| L1 .sh sweep | B-8 read_dir/glob | OPEN |
+| L1 .sh sweep | B-8 read_dir/glob | DONE (2026-04-16) |
 | L3/L4 .py sweep | B-10 ML 스택 | 별도 결정 필요 |
 
 ## 포팅 통계
