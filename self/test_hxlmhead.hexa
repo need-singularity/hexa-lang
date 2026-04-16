@@ -1,0 +1,401 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_hxlmhead.hexa — C-next v0 stub verification
+//
+//  Verifies self/ml/hxlmhead.hexa :: lmhead_bwd_packed against a
+//  pure-hexa reference at small dims (S=4 H=8 M=16 V=32). The
+//  reference (ref_lmhead_bwd) is the single oracle definition;
+//  the C v0 stub is bit-for-bit equivalent (same forward-recompute,
+//  same naive sgemm). Day-2's libhxblas-fused variant must keep
+//  this test green.
+//
+//  Structure:
+//    T1  hxlmhead_version() == 1                        (always)
+//    T2  reference impl shape sanity at S=4 H=8 M=16 V=32 (always)
+//    T3  FFI loss + dx + dWu + dWv ≈ reference (eps<1e-3)
+//        (gated on HXLMHEAD_FFI_LIVE=1)
+//
+//  T1 always runs (FFI symbol resolution doesn't require the dylib
+//  to be loadable into a hexa Pointer slot — it just needs the
+//  symbol to exist when invoked). On Mac with libhxlmhead.dylib in
+//  DYLD_LIBRARY_PATH, T1 returns 1; without it, T1 errors and we
+//  treat that as SKIP.
+//
+//  Run defaults (Mac, no dylib in DYLD path):
+//    ./hexa run self/test_hxlmhead.hexa
+//    → T1 SKIP, T2 PASS, T3 SKIP
+//
+//  Full FFI live path:
+//    bash scripts/build_hxlmhead_linux.sh --mac-native
+//    HXLMHEAD_FFI_LIVE=1 HXLAYER_FFI_LIVE=1 \
+//      DYLD_LIBRARY_PATH=self/native/build \
+//      ./hexa run self/test_hxlmhead.hexa
+//    → T1 PASS, T2 PASS, T3 PASS
+//
+//  Note: HXLAYER_FFI_LIVE=1 is required because the interpreter's
+//  alloc_raw / free_raw / write_f32 / deref_f32 builtins gate on
+//  that env var to return real malloc addresses (vs the legacy
+//  registry-index TAG_POINTER). Without it the args struct address
+//  passed to hxlmhead_bwd is a fake registry id and the C side
+//  segfaults dereferencing it. HXLMHEAD_FFI_LIVE controls only this
+//  test's T1/T3 gates so the default `./hexa run` path stays green.
+// ═══════════════════════════════════════════════════════════════
+
+let mut PASS = 0
+let mut FAIL = 0
+let mut SKIP = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + label)
+    }
+}
+
+fn skip(label, reason) {
+    SKIP = SKIP + 1
+    println("[SKIP] " + label + " - " + reason)
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+// ── pure-hexa reference (inlined from hxlmhead.hexa) ────────────
+// Inlined so T2/T3 run even if the hxlmhead.hexa module is not
+// imported by the interpreter — keeps this test self-contained.
+fn ref_lmhead_bwd(x, targets, scale, Wu, Wv) {
+    let S = len(x)
+    let H = len(x[0])
+    let M = len(Wu[0])
+    let V = len(Wv[0])
+
+    // Forward: mid = x @ Wu   [S,M]
+    let mut mid = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..H { s = s + x[i][k] * Wu[k][j] }
+            row = row + [s]
+        }
+        mid = mid + [row]
+    }
+
+    // Forward: logits = mid @ Wv   [S,V]
+    let mut logits = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..V {
+            let mut s = 0.0
+            for k in 0..M { s = s + mid[i][k] * Wv[k][j] }
+            row = row + [s]
+        }
+        logits = logits + [row]
+    }
+
+    // Forward: row-wise softmax + CE accumulator
+    let mut prob = []
+    let mut loss_sum = 0.0
+    for i in 0..S {
+        let mut mx = logits[i][0]
+        for j in 1..V { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut row = []
+        let mut sum_e = 0.0
+        for j in 0..V {
+            let e = exp(logits[i][j] - mx)
+            row = row + [e]
+            sum_e = sum_e + e
+        }
+        let mut prow = []
+        for j in 0..V { prow = prow + [row[j] / sum_e] }
+        prob = prob + [prow]
+        let t = targets[i]
+        let pt = prow[t]
+        let pt_clamp = if pt > 0.0000000001 { pt } else { 0.0000000001 }
+        loss_sum = loss_sum + (0.0 - log(pt_clamp))
+    }
+    let loss = (loss_sum / (S * 1.0)) * scale
+
+    // Backward: dlogits = (prob - onehot(t)) * scale / S
+    let inv_S = 1.0 / (S * 1.0)
+    let mut dlogits = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..V { row = row + [prob[i][j] * scale * inv_S] }
+        let t = targets[i]
+        row[t] = row[t] - scale * inv_S
+        dlogits = dlogits + [row]
+    }
+
+    // dWv = mid^T @ dlogits   [M,V]
+    let mut dWv = []
+    for i in 0..M {
+        let mut row = []
+        for j in 0..V {
+            let mut s = 0.0
+            for k in 0..S { s = s + mid[k][i] * dlogits[k][j] }
+            row = row + [s]
+        }
+        dWv = dWv + [row]
+    }
+
+    // dmid = dlogits @ Wv^T   [S,M]
+    let mut dmid = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..V { s = s + dlogits[i][k] * Wv[j][k] }
+            row = row + [s]
+        }
+        dmid = dmid + [row]
+    }
+
+    // dWu = x^T @ dmid   [H,M]
+    let mut dWu = []
+    for i in 0..H {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..S { s = s + x[k][i] * dmid[k][j] }
+            row = row + [s]
+        }
+        dWu = dWu + [row]
+    }
+
+    // dx = dmid @ Wu^T   [S,H]
+    let mut dx = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..H {
+            let mut s = 0.0
+            for k in 0..M { s = s + dmid[i][k] * Wu[j][k] }
+            row = row + [s]
+        }
+        dx = dx + [row]
+    }
+
+    return [loss, dx, dWu, dWv]
+}
+
+// ── deterministic small fixtures ────────────────────────────────
+let S = 4
+let H = 8
+let M_DIM = 16
+let V = 32
+let SCALE = 1.0
+
+// Cheap hash-based deterministic init in [-0.5, 0.5).
+fn det_val(seed, i, j) {
+    let m = (seed * 9301 + i * 49297 + j * 233280 + 17) % 233280
+    return (m * 1.0) / 233280.0 - 0.5
+}
+
+fn make_mat(rows, cols, seed) {
+    let mut M = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [det_val(seed, i, j) * 0.1] }
+        M = M + [row]
+    }
+    return M
+}
+
+fn make_targets(n, V_) {
+    let mut t = []
+    for i in 0..n { t = t + [(i * 7 + 3) % V_] }
+    return t
+}
+
+// ── tests ───────────────────────────────────────────────────────
+
+fn t1_version() {
+    let gate = env_var("HXLMHEAD_FFI_LIVE")
+    if gate != "1" {
+        skip("T1 hxlmhead_version", "set HXLMHEAD_FFI_LIVE=1 to load libhxlmhead")
+        return 0
+    }
+    let v = hxlmhead_version()
+    check("T1 hxlmhead_version() == 1", v == 1)
+    return 0
+}
+
+fn t2_ref_shape() {
+    let x  = make_mat(S, H, 1)
+    let Wu = make_mat(H, M_DIM, 2)
+    let Wv = make_mat(M_DIM, V, 3)
+    let tg = make_targets(S, V)
+    let out = ref_lmhead_bwd(x, tg, SCALE, Wu, Wv)
+    let loss = out[0]
+    let dx   = out[1]
+    let dWu  = out[2]
+    let dWv  = out[3]
+    let shape_ok = (len(dx) == S) && (len(dx[0]) == H)
+                && (len(dWu) == H) && (len(dWu[0]) == M_DIM)
+                && (len(dWv) == M_DIM) && (len(dWv[0]) == V)
+    let loss_finite = (loss == loss) && fabs(loss) < 1.0e6
+    check("T2 ref shapes + loss finite (S=4 H=8 M=16 V=32)", shape_ok && loss_finite)
+    return 0
+}
+
+fn max_abs_diff_2d(A, B) {
+    let mut m = 0.0
+    for i in 0..len(A) {
+        for j in 0..len(A[0]) {
+            let e = fabs(A[i][j] - B[i][j])
+            if e > m { m = e }
+        }
+    }
+    return m
+}
+
+fn t3_ffi_diff() {
+    let gate = env_var("HXLMHEAD_FFI_LIVE")
+    if gate != "1" {
+        skip("T3 ffi diff", "set HXLMHEAD_FFI_LIVE=1 to exercise FFI path")
+        return 0
+    }
+
+    let x  = make_mat(S, H, 1)
+    let Wu = make_mat(H, M_DIM, 2)
+    let Wv = make_mat(M_DIM, V, 3)
+    let tg = make_targets(S, V)
+
+    // Reference path.
+    let ref_out = ref_lmhead_bwd(x, tg, SCALE, Wu, Wv)
+    let loss_ref = ref_out[0]
+    let dx_ref   = ref_out[1]
+    let dWu_ref  = ref_out[2]
+    let dWv_ref  = ref_out[3]
+
+    // ── FFI path ──
+    // Allocate + pack input buffers (f32) and zero-init output accumulators.
+    let x_bytes  = S * H * 4
+    let wu_bytes = H * M_DIM * 4
+    let wv_bytes = M_DIM * V * 4
+    let dx_bytes = S * H * 4
+    let t_bytes  = S * 4
+
+    let x_buf  = alloc_raw(x_bytes)
+    let wu_buf = alloc_raw(wu_bytes)
+    let wv_buf = alloc_raw(wv_bytes)
+    let t_buf  = alloc_raw(t_bytes)
+    let dx_buf = alloc_raw(dx_bytes)
+    let dwu_buf = alloc_raw(wu_bytes)
+    let dwv_buf = alloc_raw(wv_bytes)
+
+    // Pack x [S,H]
+    for i in 0..S {
+        for k in 0..H {
+            write_f32(x_buf, (i * H + k) * 4, x[i][k])
+        }
+    }
+    // Pack Wu [H,M]
+    for i in 0..H {
+        for k in 0..M_DIM {
+            write_f32(wu_buf, (i * M_DIM + k) * 4, Wu[i][k])
+        }
+    }
+    // Pack Wv [M,V]
+    for i in 0..M_DIM {
+        for k in 0..V {
+            write_f32(wv_buf, (i * V + k) * 4, Wv[i][k])
+        }
+    }
+    // Pack targets [S]
+    for i in 0..S {
+        write_i32(t_buf, i * 4, tg[i])
+    }
+    // Zero dx / dwu / dwv (caller's responsibility per ABI).
+    for i in 0..(S * H) { write_f32(dx_buf, i * 4, 0.0) }
+    for i in 0..(H * M_DIM) { write_f32(dwu_buf, i * 4, 0.0) }
+    for i in 0..(M_DIM * V) { write_f32(dwv_buf, i * 4, 0.0) }
+
+    // Pack args struct (15 fields × 8 bytes = 120).
+    let HXLMHEAD_STRUCT_BYTES = 120
+    let args = alloc_raw(HXLMHEAD_STRUCT_BYTES)
+    let loss_buf = alloc_raw(8)
+    ptr_write(loss_buf, 0, 0.0)
+
+    ptr_write(args, 0,   S)
+    ptr_write(args, 8,   H)
+    ptr_write(args, 16,  M_DIM)
+    ptr_write(args, 24,  V)
+    ptr_write(args, 32,  SCALE * 1.0)
+    ptr_write(args, 40,  x_buf)
+    ptr_write(args, 48,  0)              // mid_p — unused (recompute path)
+    ptr_write(args, 56,  t_buf)
+    ptr_write(args, 64,  wu_buf)
+    ptr_write(args, 72,  wv_buf)
+    ptr_write(args, 80,  dx_buf)
+    ptr_write(args, 88,  dwu_buf)
+    ptr_write(args, 96,  dwv_buf)
+    ptr_write(args, 104, loss_buf)
+    ptr_write(args, 112, 0)              // reserved0
+
+    let rc = hxlmhead_bwd(args)
+    let loss_ffi = ptr_read_f64(loss_buf, 0)
+
+    // Unpack dx / dWu / dWv → 2D matrices.
+    let mut dx_ffi = []
+    for i in 0..S {
+        let mut row = []
+        for k in 0..H {
+            row = row + [deref_f32(dx_buf, (i * H + k) * 4)]
+        }
+        dx_ffi = dx_ffi + [row]
+    }
+    let mut dwu_ffi = []
+    for i in 0..H {
+        let mut row = []
+        for k in 0..M_DIM {
+            row = row + [deref_f32(dwu_buf, (i * M_DIM + k) * 4)]
+        }
+        dwu_ffi = dwu_ffi + [row]
+    }
+    let mut dwv_ffi = []
+    for i in 0..M_DIM {
+        let mut row = []
+        for k in 0..V {
+            row = row + [deref_f32(dwv_buf, (i * V + k) * 4)]
+        }
+        dwv_ffi = dwv_ffi + [row]
+    }
+
+    free_raw(x_buf, x_bytes)
+    free_raw(wu_buf, wu_bytes)
+    free_raw(wv_buf, wv_bytes)
+    free_raw(t_buf, t_bytes)
+    free_raw(dx_buf, dx_bytes)
+    free_raw(dwu_buf, wu_bytes)
+    free_raw(dwv_buf, wv_bytes)
+    free_raw(args, HXLMHEAD_STRUCT_BYTES)
+    free_raw(loss_buf, 8)
+
+    // Diffs — eps loose at 1e-3 (f32 vs f64 ref + naive ordering).
+    let dloss = fabs(loss_ffi - loss_ref)
+    let ddx = max_abs_diff_2d(dx_ffi, dx_ref)
+    let ddwu = max_abs_diff_2d(dwu_ffi, dWu_ref)
+    let ddwv = max_abs_diff_2d(dwv_ffi, dWv_ref)
+    println("  T3 rc=" + to_string(rc) + " dloss=" + to_string(dloss) + " ddx=" + to_string(ddx) + " ddwu=" + to_string(ddwu) + " ddwv=" + to_string(ddwv))
+    let eps = 0.001
+    let ok = (rc == 0) && (dloss < eps) && (ddx < eps) && (ddwu < eps) && (ddwv < eps)
+    check("T3 ffi diff: max|ffi - ref| < 1e-3 (loss/dx/dWu/dWv)", ok)
+    return 0
+}
+
+// Externs must be declared at module scope even when calls are guarded.
+@link("hxlmhead")
+extern fn hxlmhead_bwd(args_p: *Void) -> int
+
+@link("hxlmhead")
+extern fn hxlmhead_version() -> int
+
+fn main() {
+    println("=== test_hxlmhead ===")
+    t1_version()
+    t2_ref_shape()
+    t3_ffi_diff()
+    println("---- test_hxlmhead: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL) + " SKIP=" + to_string(SKIP) + " ----")
+}

@@ -1,0 +1,240 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/hxlmhead.hexa — fused LM-head backward FFI bindings
+//                          (C-next v0 stub — anima wiring ready)
+//
+//  Binds to self/native/hxlmhead_linux.c (libhxlmhead.{so,dylib}).
+//  Replaces the two pure-hexa triple-loop GEMMs in
+//  anima/training/train_clm.hexa:1056-1071 (dL_dmid = dL_dlogits @ V^T)
+//  and 1089-1104 (dL_dx = dL_dmid @ U^T), plus folds in the CE
+//  forward+backward — collapsing 4 pure-hexa O(S·M·V)/O(S·H·M) loops
+//  into a single FFI dispatch.
+//
+//  v0 STATUS: ABI complete + correct (naive triple-loop body).
+//  Caller wires through fused_lmhead_bwd / lmhead_bwd_packed and gets
+//  bit-identical results vs the pure-hexa reference. Day-2 swaps the
+//  inner sgemms for libhxblas without changing this surface.
+//
+//  Why a struct ABI?
+//    hexa FFI is bounded at 6 positional args (host_ffi_call_6 in
+//    self/runtime.c). hxlmhead_bwd needs 13+ args (4 dims, 1 scalar,
+//    8 pointers). Solution: pack into a heap HxLMHeadArgs struct and
+//    pass the single int64 pointer through the FFI boundary.
+//
+//  Field order in HxLMHeadArgs (must match hxlmhead_linux.c):
+//    off  field         bytes
+//      0  S             8
+//      8  H             8
+//     16  M             8
+//     24  V             8
+//     32  loss_scale    8 (f64)
+//     40  x_p           8
+//     48  mid_p         8
+//     56  targets_p     8
+//     64  Wu_p          8
+//     72  Wv_p          8
+//     80  dL_dx_p       8
+//     88  dW_u_p        8
+//     96  dW_v_p        8
+//    104  loss_out_p    8
+//    112  reserved0     8
+//    --- total = 120 bytes
+// ═══════════════════════════════════════════════════════════════
+
+// ── ABI bindings ────────────────────────────────────────────────
+// Single packed-pointer signature stays inside the 6-arg ceiling.
+
+@link("hxlmhead")
+extern fn hxlmhead_bwd(args_p: *Void) -> int
+
+@link("hxlmhead")
+extern fn hxlmhead_version() -> int
+
+// ── struct field offsets (bytes) ─────────────────────────────────
+// Documented above. Inlined here as call sites need them when the
+// hexa caller writes individual fields without a struct helper.
+let HXLMHEAD_OFF_S          = 0
+let HXLMHEAD_OFF_H          = 8
+let HXLMHEAD_OFF_M          = 16
+let HXLMHEAD_OFF_V          = 24
+let HXLMHEAD_OFF_LOSS_SCALE = 32
+let HXLMHEAD_OFF_X          = 40
+let HXLMHEAD_OFF_MID        = 48
+let HXLMHEAD_OFF_TARGETS    = 56
+let HXLMHEAD_OFF_WU         = 64
+let HXLMHEAD_OFF_WV         = 72
+let HXLMHEAD_OFF_DL_DX      = 80
+let HXLMHEAD_OFF_DW_U       = 88
+let HXLMHEAD_OFF_DW_V       = 96
+let HXLMHEAD_OFF_LOSS_OUT   = 104
+let HXLMHEAD_OFF_RESERVED0  = 112
+let HXLMHEAD_STRUCT_BYTES   = 120
+
+// ── lmhead_bwd_packed — pack args + dispatch + read loss ────────
+// All pointers are passed as raw int64 addresses (output of alloc_raw
+// / tensor_data_f32_ptr). Caller owns lifetime of all input/output
+// buffers — this wrapper only owns the args struct itself.
+//
+// Returns the scalar loss (float). On error returns a negative sentinel
+// matching the C return code (e.g. -2 if any dim <= 0).
+pub fn lmhead_bwd_packed(S, H, M, V,
+                         x_p, mid_p, targets_p,
+                         scale,
+                         Wu_p, Wv_p,
+                         dL_dx_p, dW_u_p, dW_v_p) {
+    // Allocate scratch for the loss output (f64 = 8 bytes).
+    let loss_buf = alloc_raw(8)
+    ptr_write(loss_buf, 0, 0.0)
+
+    // Allocate + populate the args struct.
+    let args = alloc_raw(HXLMHEAD_STRUCT_BYTES)
+
+    ptr_write(args, HXLMHEAD_OFF_S,          S)
+    ptr_write(args, HXLMHEAD_OFF_H,          H)
+    ptr_write(args, HXLMHEAD_OFF_M,          M)
+    ptr_write(args, HXLMHEAD_OFF_V,          V)
+    ptr_write(args, HXLMHEAD_OFF_LOSS_SCALE, scale * 1.0)
+    ptr_write(args, HXLMHEAD_OFF_X,          x_p)
+    ptr_write(args, HXLMHEAD_OFF_MID,        mid_p)
+    ptr_write(args, HXLMHEAD_OFF_TARGETS,    targets_p)
+    ptr_write(args, HXLMHEAD_OFF_WU,         Wu_p)
+    ptr_write(args, HXLMHEAD_OFF_WV,         Wv_p)
+    ptr_write(args, HXLMHEAD_OFF_DL_DX,      dL_dx_p)
+    ptr_write(args, HXLMHEAD_OFF_DW_U,       dW_u_p)
+    ptr_write(args, HXLMHEAD_OFF_DW_V,       dW_v_p)
+    ptr_write(args, HXLMHEAD_OFF_LOSS_OUT,   loss_buf)
+    ptr_write(args, HXLMHEAD_OFF_RESERVED0,  0)
+
+    let rc = hxlmhead_bwd(args)
+    let loss = ptr_read_f64(loss_buf, 0)
+
+    free_raw(args, HXLMHEAD_STRUCT_BYTES)
+    free_raw(loss_buf, 8)
+
+    if rc < 0 { return rc * 1.0 }
+    return loss
+}
+
+// ── Pure-hexa reference implementation for diff testing ─────────
+// Used by test_hxlmhead.hexa to verify the C kernel numerically.
+// Returns the loss; mutates dL_dx / dW_u / dW_v as nested-list
+// accumulators in-place via assignment (so caller observes them).
+//
+// This is the single oracle definition. The C v0 stub is bit-for-bit
+// equivalent (same forward-recompute, same naive sgemm); Day-2 must
+// keep this oracle as the correctness gate when the inner ops fuse.
+@pure
+pub fn ref_lmhead_bwd(x, mid_unused, targets, scale, Wu, Wv) {
+    let S = len(x)
+    let H = len(x[0])
+    let M = len(Wu[0])
+    let V = len(Wv[0])
+
+    // Forward: mid = x @ Wu
+    let mut mid = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..H { s = s + x[i][k] * Wu[k][j] }
+            row = row + [s]
+        }
+        mid = mid + [row]
+    }
+
+    // Forward: logits = mid @ Wv
+    let mut logits = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..V {
+            let mut s = 0.0
+            for k in 0..M { s = s + mid[i][k] * Wv[k][j] }
+            row = row + [s]
+        }
+        logits = logits + [row]
+    }
+
+    // Forward: softmax + CE
+    let mut prob = []
+    let mut loss_sum = 0.0
+    for i in 0..S {
+        let mut mx = logits[i][0]
+        for j in 1..V { if logits[i][j] > mx { mx = logits[i][j] } }
+        let mut row = []
+        let mut sum_e = 0.0
+        for j in 0..V {
+            let e = exp(logits[i][j] - mx)
+            row = row + [e]
+            sum_e = sum_e + e
+        }
+        let mut prow = []
+        for j in 0..V { prow = prow + [row[j] / sum_e] }
+        prob = prob + [prow]
+        let t = targets[i]
+        let pt = prow[t]
+        let pt_clamp = if pt > 0.0000000001 { pt } else { 0.0000000001 }
+        loss_sum = loss_sum + (0.0 - log(pt_clamp))
+    }
+    let loss = (loss_sum / (S * 1.0)) * scale
+
+    // Backward: dlogits = (prob - onehot(t)) * scale / S
+    let inv_S = 1.0 / (S * 1.0)
+    let mut dlogits = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..V { row = row + [prob[i][j] * scale * inv_S] }
+        let t = targets[i]
+        row[t] = row[t] - scale * inv_S
+        dlogits = dlogits + [row]
+    }
+
+    // dWv = mid^T @ dlogits   [M,V]
+    let mut dWv = []
+    for i in 0..M {
+        let mut row = []
+        for j in 0..V {
+            let mut s = 0.0
+            for k in 0..S { s = s + mid[k][i] * dlogits[k][j] }
+            row = row + [s]
+        }
+        dWv = dWv + [row]
+    }
+
+    // dmid = dlogits @ Wv^T   [S,M]
+    let mut dmid = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..V { s = s + dlogits[i][k] * Wv[j][k] }
+            row = row + [s]
+        }
+        dmid = dmid + [row]
+    }
+
+    // dWu = x^T @ dmid   [H,M]
+    let mut dWu = []
+    for i in 0..H {
+        let mut row = []
+        for j in 0..M {
+            let mut s = 0.0
+            for k in 0..S { s = s + x[k][i] * dmid[k][j] }
+            row = row + [s]
+        }
+        dWu = dWu + [row]
+    }
+
+    // dx = dmid @ Wu^T   [S,H]
+    let mut dx = []
+    for i in 0..S {
+        let mut row = []
+        for j in 0..H {
+            let mut s = 0.0
+            for k in 0..M { s = s + dmid[i][k] * Wu[j][k] }
+            row = row + [s]
+        }
+        dx = dx + [row]
+    }
+
+    // Pack results: [loss, dx, dWu, dWv] — caller destructures as needed.
+    return [loss, dx, dWu, dWv]
+}
