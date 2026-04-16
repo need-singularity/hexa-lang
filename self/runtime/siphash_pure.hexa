@@ -1,0 +1,257 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/siphash_pure.hexa — SipHash-2-4 keyed PRF
+//
+//  DoS-resistant hashmap foundation (ROI #115).
+//  Pure Hexa — no C dependencies.
+//
+//  Hexa numbers are float64 (53-bit mantissa), so 64-bit hash state
+//  is split into hi32/lo32 pairs. All 64-bit ops are emulated using
+//  32-bit arithmetic via bit_pure helpers.
+//
+//  Public API:
+//      siphash_2_4_pure(data, key0, key1)
+//          data  : string (bytes to hash)
+//          key0  : lo 64 bits of key as [hi32, lo32]
+//          key1  : hi 64 bits of key as [hi32, lo32]
+//          returns: [hi32, lo32] — the 64-bit SipHash result
+//
+//      siphash_2_4_simple(data, k0_lo, k1_lo)
+//          Convenience: keys as single 32-bit values (hi=0).
+//          Returns a single number (lo32 of result).
+//
+//  SipHash init constants:
+//      0x736F6D65  0x646F7261  0x6C796765  0x74656462
+//
+//  Pitfalls:
+//      P15  let mut for reassigned locals
+//      P30  no unsigned int — emulate via & 0xFFFFFFFF
+//      Range `..` binds tighter than `+` inside slices
+// ═══════════════════════════════════════════════════════════════════
+
+import "runtime/bit_pure.hexa"
+
+// ── 64-bit pair helpers ─────────────────────────────────────────
+// A 64-bit value is represented as [hi32, lo32].
+// All intermediate 32-bit values are masked to 0xFFFFFFFF.
+
+let MASK32 = 0xFFFFFFFF
+
+@pure
+fn pair(hi, lo) {
+    return [hi & MASK32, lo & MASK32]
+}
+
+@pure
+fn p_hi(p) { return p[0] }
+
+@pure
+fn p_lo(p) { return p[1] }
+
+// 64-bit XOR on pairs
+@pure
+pub fn p_xor(a, b) {
+    return pair(bit_xor_pure(a[0], b[0]), bit_xor_pure(a[1], b[1]))
+}
+
+// 64-bit ADD on pairs (with carry propagation)
+@pure
+pub fn p_add(a, b) {
+    let lo_sum = a[1] + b[1]
+    let lo = lo_sum & MASK32
+    let carry = bit_shr_pure(lo_sum, 32) & 1
+    let hi = (a[0] + b[0] + carry) & MASK32
+    return pair(hi, lo)
+}
+
+// 64-bit rotate left on a pair
+@pure
+pub fn p_rotl(v, n) {
+    if n == 0 { return v }
+    if n < 32 {
+        // hi = (v.hi << n) | (v.lo >> (32-n))
+        // lo = (v.lo << n) | (v.hi >> (32-n))
+        let hi_a = bit_shl_pure(v[0], n) & MASK32
+        let hi_b = bit_shr_pure(v[1], 32 - n) & MASK32
+        let lo_a = bit_shl_pure(v[1], n) & MASK32
+        let lo_b = bit_shr_pure(v[0], 32 - n) & MASK32
+        return pair(bit_or_pure(hi_a, hi_b), bit_or_pure(lo_a, lo_b))
+    }
+    if n == 32 {
+        return pair(v[1], v[0])
+    }
+    // n > 32: swap then rotate by (n-32)
+    let swapped = pair(v[1], v[0])
+    return p_rotl(swapped, n - 32)
+}
+
+// ── SipHash round ──────────────────────────────────────────────
+// One SipHash round mutates v0..v3 in-place (returned as array of 4 pairs)
+@pure
+fn sip_round(v0, v1, v2, v3) {
+    // v0 += v1; v1 = rotl(v1,13); v1 ^= v0; v0 = rotl(v0,32)
+    let mut s0 = p_add(v0, v1)
+    let mut s1 = p_rotl(v1, 13)
+    s1 = p_xor(s1, s0)
+    s0 = p_rotl(s0, 32)
+
+    // v2 += v3; v3 = rotl(v3,16); v3 ^= v2
+    let mut s2 = p_add(v2, v3)
+    let mut s3 = p_rotl(v3, 16)
+    s3 = p_xor(s3, s2)
+
+    // v2 += v1; v1 = rotl(v1,17); v1 ^= v2; v2 = rotl(v2,32)
+    s2 = p_add(s2, s1)
+    s1 = p_rotl(s1, 17)
+    s1 = p_xor(s1, s2)
+    s2 = p_rotl(s2, 32)
+
+    // v0 += v3; v3 = rotl(v3,21); v3 ^= v0
+    s0 = p_add(s0, s3)
+    s3 = p_rotl(s3, 21)
+    s3 = p_xor(s3, s0)
+
+    return [s0, s1, s2, s3]
+}
+
+// ── Read a little-endian 64-bit word from string bytes ──────────
+@pure
+fn read_le64(data, offset) {
+    // Read up to 8 bytes at offset, little-endian, into [hi32, lo32]
+    let mut lo = 0
+    let mut hi = 0
+    let mut i = 0
+    while i < 8 {
+        let pos = offset + i
+        if pos < len(data) {
+            let b = ord(data.substring(pos, pos + 1))
+            if i < 4 {
+                lo = bit_or_pure(lo, bit_shl_pure(b, i * 8))
+            } else {
+                hi = bit_or_pure(hi, bit_shl_pure(b, (i - 4) * 8))
+            }
+        }
+        i = i + 1
+    }
+    return pair(hi, lo)
+}
+
+// ── Read partial last word (< 8 bytes) with length in high byte ─
+@pure
+fn read_last_word(data, offset, data_len) {
+    let left = data_len - offset
+    let mut lo = 0
+    let mut hi = 0
+
+    // Place (data_len & 0xFF) in the highest byte (byte 7 = hi bits 24..31)
+    hi = bit_or_pure(hi, bit_shl_pure(data_len & 0xFF, 24))
+
+    // Read remaining bytes
+    let mut i = 0
+    while i < left {
+        let pos = offset + i
+        let b = ord(data.substring(pos, pos + 1))
+        if i < 4 {
+            lo = bit_or_pure(lo, bit_shl_pure(b, i * 8))
+        } else {
+            hi = bit_or_pure(hi, bit_shl_pure(b, (i - 4) * 8))
+        }
+        i = i + 1
+    }
+    return pair(hi, lo)
+}
+
+// ── SipHash-2-4 main entry ─────────────────────────────────────
+// key0, key1 are [hi32, lo32] pairs representing the 128-bit key.
+// Returns [hi32, lo32] pair — the 64-bit hash.
+@pure
+pub fn siphash_2_4_pure(data, key0, key1) {
+    // Init constants
+    // Full 64-bit magic constants (hi32, lo32):
+    //   0x736f6d6570736575  0x646f72616e646f6d
+    //   0x6c7967656e657261  0x7465646279746573
+    let c0 = pair(0x736F6D65, 0x70736575)
+    let c1 = pair(0x646F7261, 0x6E646F6D)
+    let c2 = pair(0x6C796765, 0x6E657261)
+    let c3 = pair(0x74656462, 0x79746573)
+
+    // v0 = key0 ^ c0, v1 = key1 ^ c1, v2 = key0 ^ c2, v3 = key1 ^ c3
+    let mut v0 = p_xor(key0, c0)
+    let mut v1 = p_xor(key1, c1)
+    let mut v2 = p_xor(key0, c2)
+    let mut v3 = p_xor(key1, c3)
+
+    let data_len = len(data)
+    let num_words = data_len / 8
+    let mut w = 0
+
+    // Process full 8-byte words
+    while w < num_words {
+        let m = read_le64(data, w * 8)
+        v3 = p_xor(v3, m)
+        // 2 compression rounds
+        let r1 = sip_round(v0, v1, v2, v3)
+        v0 = r1[0]
+        v1 = r1[1]
+        v2 = r1[2]
+        v3 = r1[3]
+        let r2 = sip_round(v0, v1, v2, v3)
+        v0 = r2[0]
+        v1 = r2[1]
+        v2 = r2[2]
+        v3 = r2[3]
+        v0 = p_xor(v0, m)
+        w = w + 1
+    }
+
+    // Process last partial word (includes length byte)
+    let last = read_last_word(data, num_words * 8, data_len)
+    v3 = p_xor(v3, last)
+    let r3 = sip_round(v0, v1, v2, v3)
+    v0 = r3[0]
+    v1 = r3[1]
+    v2 = r3[2]
+    v3 = r3[3]
+    let r4 = sip_round(v0, v1, v2, v3)
+    v0 = r4[0]
+    v1 = r4[1]
+    v2 = r4[2]
+    v3 = r4[3]
+    v0 = p_xor(v0, last)
+
+    // Finalization: v2 ^= 0xFF
+    v2 = p_xor(v2, pair(0, 0xFF))
+
+    // 4 finalization rounds
+    let f1 = sip_round(v0, v1, v2, v3)
+    v0 = f1[0]
+    v1 = f1[1]
+    v2 = f1[2]
+    v3 = f1[3]
+    let f2 = sip_round(v0, v1, v2, v3)
+    v0 = f2[0]
+    v1 = f2[1]
+    v2 = f2[2]
+    v3 = f2[3]
+    let f3 = sip_round(v0, v1, v2, v3)
+    v0 = f3[0]
+    v1 = f3[1]
+    v2 = f3[2]
+    v3 = f3[3]
+    let f4 = sip_round(v0, v1, v2, v3)
+    v0 = f4[0]
+    v1 = f4[1]
+    v2 = f4[2]
+    v3 = f4[3]
+
+    // result = v0 ^ v1 ^ v2 ^ v3
+    let result = p_xor(p_xor(v0, v1), p_xor(v2, v3))
+    return result
+}
+
+// ── Convenience wrapper ────────────────────────────────────────
+// Keys as simple 32-bit numbers, returns lo32 of the hash.
+@pure
+pub fn siphash_2_4_simple(data, k0_lo, k1_lo) {
+    let result = siphash_2_4_pure(data, pair(0, k0_lo), pair(0, k1_lo))
+    return result[1]
+}
