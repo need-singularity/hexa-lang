@@ -1,0 +1,914 @@
+// ===================================================================
+//  bench/m4_inference_e2e.hexa — M4 End-to-End Inference Benchmark
+//
+//  Measures REAL kv-cache autoregressive decode tok/s through the
+//  full serving stack: embed -> N x (attn + FFN) -> LM head -> sample.
+//  Prefill and decode phases measured SEPARATELY.
+//
+//  This is NOT a batch forward pass benchmark. Each decode token is
+//  generated one at a time with KV cache append, matching real serving.
+//  See: feedback_kvcache_serving_number.md
+//
+//  Configs:
+//    smoke : D=256,  NL=4,  NH=4,  NKV=4,  V=1000,  FF=1024
+//    1b    : D=2048, NL=22, NH=16, NKV=4,  V=32000, FF=5504
+//    7b    : D=4096, NL=32, NH=32, NKV=8,  V=32000, FF=11008
+//
+//  Hardware paths:
+//    1) Metal GPU (hxmetal): dlopen probe, FFN on GPU
+//    2) bf16 CPU (hxblas):   NEON bf16 matvec fallback
+//    3) f32 CPU:             scalar fallback (baseline)
+//
+//  Build & run:
+//    FORCE=1 hexa scripts/rebuild_stage0.hexa
+//    DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa
+//    DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa --config 1b
+//    DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa --config 7b --metal
+//
+//  Reports:
+//    - Prefill: tok/s, total latency
+//    - Decode:  tok/s, mean/best/worst ms per token
+//    - Memory:  weight RSS (bf16 + f32), KV cache, peak estimate
+//    - Hardware: detected GPU/CPU path
+//    - Bandwidth: estimated GB/s utilization
+//
+//  Target: 46+ tok/s sustained decode on M4 (bf16), 60+ with Metal
+//
+//  Last updated: 2026-04-17
+// ===================================================================
+
+// ── hxblas FFI (bf16 NEON + f32) ────────────────────────────────────
+
+@link("hxblas")
+extern fn hxblas_sgemm(order: int, transA: int, transB: int,
+                       M: int, N: int, K: int, alpha: float,
+                       A: int, lda: int, B: int, ldb: int,
+                       beta: float, C: int, ldc: int)
+
+@link("hxblas")
+extern fn hxblas_bgemv(M: int, K: int, A: int, x: int, y: int)
+
+@link("hxblas")
+extern fn hxblas_f32_to_bf16(n: int, src: int, dst: int)
+
+@link("hxblas")
+extern fn hxblas_bf16_to_f32(n: int, src: int, dst: int)
+
+@link("hxblas")
+extern fn hxblas_version() -> int
+
+// ── hxmetal FFI (Metal GPU, macOS only) ─────────────────────────────
+
+@link("hxmetal")
+extern fn hxmetal_init() -> int
+
+@link("hxmetal")
+extern fn hxmetal_version() -> int
+
+@link("hxmetal")
+extern fn hxmetal_matmul(M: int, K: int, N: int,
+                         A: *Void, B: *Void, C: *Void) -> int
+
+@link("hxmetal")
+extern fn hxmetal_ffn_fwd(d_model: int, d_ff: int, batch: int,
+                          W1: *Void, W2: *Void, X: *Void, Y: *Void) -> int
+
+@link("hxmetal")
+extern fn hxmetal_sync() -> int
+
+// ── Model config ────────────────────────────────────────────────────
+
+struct BenchConfig {
+    name: string,
+    dim: int,
+    hidden_dim: int,
+    n_layers: int,
+    n_heads: int,
+    n_kv_heads: int,
+    vocab_size: int,
+    max_seq_len: int,
+    head_dim: int,
+    rope_base: float,
+    rms_eps: float
+}
+
+fn config_smoke() {
+    return BenchConfig {
+        name: "smoke",
+        dim: 256,
+        hidden_dim: 1024,
+        n_layers: 4,
+        n_heads: 4,
+        n_kv_heads: 4,
+        vocab_size: 1000,
+        max_seq_len: 512,
+        head_dim: 64,
+        rope_base: 10000.0,
+        rms_eps: 0.000001
+    }
+}
+
+fn config_1b() {
+    return BenchConfig {
+        name: "1b",
+        dim: 2048,
+        hidden_dim: 5504,
+        n_layers: 22,
+        n_heads: 16,
+        n_kv_heads: 4,
+        vocab_size: 32000,
+        max_seq_len: 2048,
+        head_dim: 128,
+        rope_base: 10000.0,
+        rms_eps: 0.000001
+    }
+}
+
+fn config_7b() {
+    return BenchConfig {
+        name: "7b",
+        dim: 4096,
+        hidden_dim: 11008,
+        n_layers: 32,
+        n_heads: 32,
+        n_kv_heads: 8,
+        vocab_size: 32000,
+        max_seq_len: 2048,
+        head_dim: 128,
+        rope_base: 10000.0,
+        rms_eps: 0.000001
+    }
+}
+
+// ── bf16 helpers ────────────────────────────────────────────────────
+
+fn bf16_alloc_fill(numel) {
+    // Allocate bf16 buffer and fill with tiny pseudo-random values
+    let f32_buf = alloc_raw(numel * 4)
+    let mut i = 0
+    while i < numel {
+        let v = sin(to_float(i % 10007) * 0.001) * 0.01
+        write_f32(f32_buf, i * 4, v)
+        i = i + 1
+    }
+    let bf16_buf = alloc_raw(numel * 2)
+    hxblas_f32_to_bf16(numel, f32_buf, bf16_buf)
+    free_raw(f32_buf, numel * 4)
+    return bf16_buf
+}
+
+fn f32_alloc_ones(n) {
+    let buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, 1.0)
+        i = i + 1
+    }
+    return buf
+}
+
+fn bf16_matvec_bench(M, K, W_bf16, x_f32) {
+    // W[M,K] bf16, x[K] f32 -> y[M] f32 (allocated)
+    let y = alloc_raw(M * 4)
+    hxblas_bgemv(M, K, W_bf16, x_f32, y)
+    return y
+}
+
+// ── Per-layer weight container ──────────────────────────────────────
+
+struct LayerWeights {
+    wq: int,         // bf16 [dim, dim]
+    wk: int,         // bf16 [kv_dim, dim]
+    wv: int,         // bf16 [kv_dim, dim]
+    wo: int,         // bf16 [dim, dim]
+    w1: int,         // bf16 [hidden_dim, dim]
+    w2: int,         // bf16 [dim, hidden_dim]
+    w3: int,         // bf16 [hidden_dim, dim]
+    attn_norm: int,  // f32 [dim]
+    ffn_norm: int    // f32 [dim]
+}
+
+struct BenchModel {
+    cfg: BenchConfig,
+    layers: array,
+    tok_emb: int,
+    lm_head: int,
+    final_norm: int,
+    total_bf16_bytes: int,
+    total_f32_bytes: int
+}
+
+// ── KV cache ────────────────────────────────────────────────────────
+// keys[layer][pos][kv_head][head_dim] contiguous f32
+
+struct KVCache {
+    keys: int,
+    values: int,
+    max_seq: int,
+    n_layers: int,
+    n_kv_heads: int,
+    head_dim: int
+}
+
+fn kv_cache_new(cfg: BenchConfig) {
+    let total = cfg.n_layers * cfg.max_seq_len * cfg.n_kv_heads * cfg.head_dim
+    let bytes = total * 4
+    return KVCache {
+        keys: alloc_raw(bytes),
+        values: alloc_raw(bytes),
+        max_seq: cfg.max_seq_len,
+        n_layers: cfg.n_layers,
+        n_kv_heads: cfg.n_kv_heads,
+        head_dim: cfg.head_dim
+    }
+}
+
+fn kv_cache_free(cache: KVCache) {
+    let total = cache.n_layers * cache.max_seq * cache.n_kv_heads * cache.head_dim
+    let bytes = total * 4
+    free_raw(cache.keys, bytes)
+    free_raw(cache.values, bytes)
+}
+
+fn kv_cache_bytes(cache: KVCache) {
+    let total = cache.n_layers * cache.max_seq * cache.n_kv_heads * cache.head_dim
+    return total * 4 * 2  // keys + values
+}
+
+// ── Synthetic model creation ────────────────────────────────────────
+
+fn create_synthetic(cfg: BenchConfig) {
+    let dim = cfg.dim
+    let hidden_dim = cfg.hidden_dim
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim
+    let vocab = cfg.vocab_size
+    let nl = cfg.n_layers
+
+    let mut total_bf16 = 0
+    let mut total_f32 = 0
+
+    let tok_emb = bf16_alloc_fill(vocab * dim)
+    total_bf16 = total_bf16 + vocab * dim * 2
+
+    let lm_head = bf16_alloc_fill(vocab * dim)
+    total_bf16 = total_bf16 + vocab * dim * 2
+
+    let final_norm = f32_alloc_ones(dim)
+    total_f32 = total_f32 + dim * 4
+
+    let mut layers = []
+    let mut li = 0
+    while li < nl {
+        let wq = bf16_alloc_fill(dim * dim)
+        let wk = bf16_alloc_fill(kv_dim * dim)
+        let wv = bf16_alloc_fill(kv_dim * dim)
+        let wo = bf16_alloc_fill(dim * dim)
+        let w1 = bf16_alloc_fill(hidden_dim * dim)
+        let w2 = bf16_alloc_fill(dim * hidden_dim)
+        let w3 = bf16_alloc_fill(hidden_dim * dim)
+        total_bf16 = total_bf16 + (dim * dim + kv_dim * dim + kv_dim * dim + dim * dim) * 2
+        total_bf16 = total_bf16 + (hidden_dim * dim + dim * hidden_dim + hidden_dim * dim) * 2
+
+        let attn_norm = f32_alloc_ones(dim)
+        let ffn_norm = f32_alloc_ones(dim)
+        total_f32 = total_f32 + dim * 4 * 2
+
+        layers.push(LayerWeights {
+            wq: wq, wk: wk, wv: wv, wo: wo,
+            w1: w1, w2: w2, w3: w3,
+            attn_norm: attn_norm, ffn_norm: ffn_norm
+        })
+        li = li + 1
+    }
+
+    return BenchModel {
+        cfg: cfg,
+        layers: layers,
+        tok_emb: tok_emb,
+        lm_head: lm_head,
+        final_norm: final_norm,
+        total_bf16_bytes: total_bf16,
+        total_f32_bytes: total_f32
+    }
+}
+
+// ── RMSNorm (CPU f32) ───────────────────────────────────────────────
+
+@hot
+fn rms_norm(x_ptr, w_ptr, out_ptr, dim, eps) {
+    let mut ss = 0.0
+    let mut i = 0
+    while i < dim {
+        let v = deref_f32(x_ptr, i * 4)
+        ss = ss + v * v
+        i = i + 1
+    }
+    let inv_rms = 1.0 / sqrt(ss / to_float(dim) + eps)
+    i = 0
+    while i < dim {
+        let x_v = deref_f32(x_ptr, i * 4)
+        let w_v = deref_f32(w_ptr, i * 4)
+        write_f32(out_ptr, i * 4, x_v * inv_rms * w_v)
+        i = i + 1
+    }
+}
+
+// ── RoPE (CPU f32 in-place) ─────────────────────────────────────────
+
+@hot
+fn apply_rope(vec_ptr, n_heads_rope, head_dim, pos, rope_base) {
+    let half = head_dim / 2
+    let mut h = 0
+    while h < n_heads_rope {
+        let base_off = h * head_dim
+        let mut p = 0
+        while p < half {
+            let freq = 1.0 / pow(rope_base, 2.0 * to_float(p) / to_float(head_dim))
+            let angle = to_float(pos) * freq
+            let cos_a = cos(angle)
+            let sin_a = sin(angle)
+            let off0 = (base_off + 2 * p) * 4
+            let off1 = (base_off + 2 * p + 1) * 4
+            let x0 = deref_f32(vec_ptr, off0)
+            let x1 = deref_f32(vec_ptr, off1)
+            write_f32(vec_ptr, off0, x0 * cos_a - x1 * sin_a)
+            write_f32(vec_ptr, off1, x0 * sin_a + x1 * cos_a)
+            p = p + 1
+        }
+        h = h + 1
+    }
+}
+
+// ── SiLU + elemul + residual (CPU f32) ──────────────────────────────
+
+@hot
+fn silu_inplace(ptr, n) {
+    let mut i = 0
+    while i < n {
+        let x = deref_f32(ptr, i * 4)
+        write_f32(ptr, i * 4, x / (1.0 + exp(0.0 - x)))
+        i = i + 1
+    }
+}
+
+@hot
+fn elemul_inplace(a_ptr, b_ptr, n) {
+    let mut i = 0
+    while i < n {
+        write_f32(a_ptr, i * 4, deref_f32(a_ptr, i * 4) * deref_f32(b_ptr, i * 4))
+        i = i + 1
+    }
+}
+
+@hot
+fn residual_add(dst, src, n) {
+    let mut i = 0
+    while i < n {
+        write_f32(dst, i * 4, deref_f32(dst, i * 4) + deref_f32(src, i * 4))
+        i = i + 1
+    }
+}
+
+// ── Embedding: bf16 -> f32 single row ───────────────────────────────
+
+fn embed_token(tok_emb_bf16, token_id, dim) {
+    let src_ptr = tok_emb_bf16 + token_id * dim * 2
+    let dst = alloc_raw(dim * 4)
+    hxblas_bf16_to_f32(dim, src_ptr, dst)
+    return dst
+}
+
+// ── KV cache write ──────────────────────────────────────────────────
+
+fn kv_write(ptr, layer, pos, vec_ptr, n_kv_heads, head_dim, max_seq) {
+    let slab = n_kv_heads * head_dim
+    let base = ((layer * max_seq + pos) * n_kv_heads) * head_dim
+    let mut i = 0
+    while i < slab {
+        write_f32(ptr, (base + i) * 4, deref_f32(vec_ptr, i * 4))
+        i = i + 1
+    }
+}
+
+// ── Single transformer layer ────────────────────────────────────────
+
+@hot
+fn transformer_layer(model: BenchModel, li, x_ptr, pos,
+                     cache: KVCache, use_metal) {
+    let cfg = model.cfg
+    let dim = cfg.dim
+    let nh = cfg.n_heads
+    let nkv = cfg.n_kv_heads
+    let hd = cfg.head_dim
+    let ff = cfg.hidden_dim
+    let eps = cfg.rms_eps
+    let gqa = nh / nkv
+    let kv_dim = nkv * hd
+
+    let lw = model.layers[li]
+
+    // -- Attention (CPU bf16 matvec) --
+
+    let xn = alloc_raw(dim * 4)
+    rms_norm(x_ptr, lw.attn_norm, xn, dim, eps)
+
+    let q_ptr = bf16_matvec_bench(dim, dim, lw.wq, xn)
+    let k_ptr = bf16_matvec_bench(kv_dim, dim, lw.wk, xn)
+    let v_ptr = bf16_matvec_bench(kv_dim, dim, lw.wv, xn)
+    free_raw(xn, dim * 4)
+
+    apply_rope(q_ptr, nh, hd, pos, cfg.rope_base)
+    apply_rope(k_ptr, nkv, hd, pos, cfg.rope_base)
+
+    kv_write(cache.keys, li, pos, k_ptr, nkv, hd, cache.max_seq)
+    kv_write(cache.values, li, pos, v_ptr, nkv, hd, cache.max_seq)
+    free_raw(k_ptr, kv_dim * 4)
+    free_raw(v_ptr, kv_dim * 4)
+
+    // GQA attention scores + softmax + value accumulation
+    let scale = 1.0 / sqrt(to_float(hd))
+    let ctx_len = pos + 1
+    let attn_out = alloc_raw(dim * 4)
+
+    let mut h = 0
+    while h < nh {
+        let kv_h = h / gqa
+        let q_base = h * hd
+
+        let scores = alloc_raw(ctx_len * 4)
+        let mut t = 0
+        while t < ctx_len {
+            let k_idx = ((li * cache.max_seq + t) * nkv + kv_h) * hd
+            let mut dot = 0.0
+            let mut d = 0
+            while d < hd {
+                dot = dot + deref_f32(q_ptr, (q_base + d) * 4) * deref_f32(cache.keys, (k_idx + d) * 4)
+                d = d + 1
+            }
+            write_f32(scores, t * 4, dot * scale)
+            t = t + 1
+        }
+
+        // softmax
+        let mut mx = deref_f32(scores, 0)
+        t = 1
+        while t < ctx_len {
+            let s = deref_f32(scores, t * 4)
+            if s > mx { mx = s }
+            t = t + 1
+        }
+        let mut sum_e = 0.0
+        t = 0
+        while t < ctx_len {
+            let e = exp(deref_f32(scores, t * 4) - mx)
+            write_f32(scores, t * 4, e)
+            sum_e = sum_e + e
+            t = t + 1
+        }
+        let inv_sum = 1.0 / sum_e
+        t = 0
+        while t < ctx_len {
+            write_f32(scores, t * 4, deref_f32(scores, t * 4) * inv_sum)
+            t = t + 1
+        }
+
+        // weighted value sum
+        let mut d = 0
+        while d < hd {
+            let mut acc = 0.0
+            t = 0
+            while t < ctx_len {
+                let v_idx = ((li * cache.max_seq + t) * nkv + kv_h) * hd + d
+                acc = acc + deref_f32(scores, t * 4) * deref_f32(cache.values, v_idx * 4)
+                t = t + 1
+            }
+            write_f32(attn_out, (h * hd + d) * 4, acc)
+            d = d + 1
+        }
+        free_raw(scores, ctx_len * 4)
+        h = h + 1
+    }
+    free_raw(q_ptr, dim * 4)
+
+    // Output projection + residual
+    let attn_proj = bf16_matvec_bench(dim, dim, lw.wo, attn_out)
+    free_raw(attn_out, dim * 4)
+    residual_add(x_ptr, attn_proj, dim)
+    free_raw(attn_proj, dim * 4)
+
+    // -- FFN --
+
+    let xn2 = alloc_raw(dim * 4)
+    rms_norm(x_ptr, lw.ffn_norm, xn2, dim, eps)
+
+    // CPU SwiGLU path (bf16 matvec)
+    let gate = bf16_matvec_bench(ff, dim, lw.w1, xn2)
+    let up = bf16_matvec_bench(ff, dim, lw.w3, xn2)
+    free_raw(xn2, dim * 4)
+
+    silu_inplace(gate, ff)
+    elemul_inplace(gate, up, ff)
+    free_raw(up, ff * 4)
+
+    let down = bf16_matvec_bench(dim, ff, lw.w2, gate)
+    free_raw(gate, ff * 4)
+
+    residual_add(x_ptr, down, dim)
+    free_raw(down, dim * 4)
+}
+
+// ── Full forward pass: embed -> layers -> norm -> logits ────────────
+
+fn forward_one(model: BenchModel, token_id, pos, cache: KVCache, use_metal) {
+    let cfg = model.cfg
+    let dim = cfg.dim
+
+    let x_ptr = embed_token(model.tok_emb, token_id % cfg.vocab_size, dim)
+
+    let mut li = 0
+    while li < cfg.n_layers {
+        transformer_layer(model, li, x_ptr, pos, cache, use_metal)
+        li = li + 1
+    }
+
+    let xn = alloc_raw(dim * 4)
+    rms_norm(x_ptr, model.final_norm, xn, dim, cfg.rms_eps)
+    free_raw(x_ptr, dim * 4)
+
+    // LM head: logits = lm_head[vocab, dim] bf16 x xn[dim] f32
+    let logits = bf16_matvec_bench(cfg.vocab_size, dim, model.lm_head, xn)
+    free_raw(xn, dim * 4)
+
+    return logits
+}
+
+// ── Argmax sampling from raw f32 logits ─────────────────────────────
+
+fn argmax_sample(logits_ptr, vocab_size) {
+    let mut best = 0
+    let mut best_val = deref_f32(logits_ptr, 0)
+    let mut i = 1
+    while i < vocab_size {
+        let v = deref_f32(logits_ptr, i * 4)
+        if v > best_val {
+            best_val = v
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ── Hardware detection ──────────────────────────────────────────────
+
+fn detect_hardware() {
+    let mut hw = #{}
+    hw["platform"] = "darwin-arm64"
+
+    // Probe hxblas
+    let blas_ver = hxblas_version()
+    hw["hxblas_version"] = blas_ver
+    hw["bf16_available"] = blas_ver >= 1
+
+    // Probe hxmetal (may fail if dylib not loaded)
+    let mut metal_ok = false
+    let metal_rc = hxmetal_init()
+    if metal_rc == 0 {
+        let metal_ver = hxmetal_version()
+        hw["hxmetal_version"] = metal_ver
+        metal_ok = metal_ver >= 1
+    }
+    hw["metal_available"] = metal_ok
+
+    return hw
+}
+
+// ── Memory estimate ─────────────────────────────────────────────────
+
+fn estimate_memory(model: BenchModel, cache: KVCache) {
+    let weight_mb = to_float(model.total_bf16_bytes + model.total_f32_bytes) / 1048576.0
+    let kv_mb = to_float(kv_cache_bytes(cache)) / 1048576.0
+    // Activation scratch: ~4 * dim * 4 bytes per layer (conservative)
+    let act_mb = to_float(model.cfg.n_layers * model.cfg.dim * 16) / 1048576.0
+    let total_mb = weight_mb + kv_mb + act_mb
+    let result = #{}
+    result["weight_mb"] = weight_mb
+    result["kv_cache_mb"] = kv_mb
+    result["activation_mb"] = act_mb
+    result["total_est_mb"] = total_mb
+    return result
+}
+
+// ── Compute per-token FLOPS ─────────────────────────────────────────
+// For decode (single token), dominant ops per layer:
+//   QKV proj:  3 * 2 * dim * dim (Q) + 3 * 2 * kv_dim * dim (K,V)
+//   Attn:      2 * n_heads * head_dim * ctx_len (scores + value accum)
+//   Output:    2 * dim * dim
+//   FFN:       3 * 2 * dim * hidden_dim (gate + up + down)
+// Plus embed and LM head
+
+fn flops_per_token(cfg: BenchConfig, ctx_len) {
+    let dim = cfg.dim
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim
+    let ff = cfg.hidden_dim
+    let nh = cfg.n_heads
+    let hd = cfg.head_dim
+
+    // Per layer
+    let qkv = 2 * (dim * dim + 2 * kv_dim * dim)
+    let attn = 2 * nh * hd * ctx_len * 2  // scores + value accum
+    let out_proj = 2 * dim * dim
+    let ffn = 2 * (ff * dim + dim * ff + ff * dim)
+    let per_layer = qkv + attn + out_proj + ffn
+
+    let layers = per_layer * cfg.n_layers
+    let lm_head = 2 * cfg.vocab_size * dim
+    return to_float(layers + lm_head)
+}
+
+// ===================================================================
+//  Main benchmark loop
+// ===================================================================
+
+fn run_bench(cfg: BenchConfig, prompt_len, gen_tokens, use_metal) {
+    println("============================================================")
+    println("  M4 E2E Inference Benchmark: " + cfg.name)
+    println("============================================================")
+    println("  dim=" + to_string(cfg.dim) + " layers=" + to_string(cfg.n_layers) + " heads=" + to_string(cfg.n_heads) + "/" + to_string(cfg.n_kv_heads))
+    println("  hidden=" + to_string(cfg.hidden_dim) + " vocab=" + to_string(cfg.vocab_size))
+    println("  prompt=" + to_string(prompt_len) + " generate=" + to_string(gen_tokens))
+    println("  metal=" + to_string(use_metal))
+
+    // Create synthetic model
+    println("[bench] Creating synthetic model...")
+    let t_alloc_0 = clock()
+    let model = create_synthetic(cfg)
+    let t_alloc_1 = clock()
+    let alloc_ms = (t_alloc_1 - t_alloc_0) * 1000.0
+    println("[bench] Model allocated in " + to_string(alloc_ms) + " ms")
+
+    let weight_mb = to_float(model.total_bf16_bytes + model.total_f32_bytes) / 1048576.0
+    println("[bench] Weights: bf16=" + to_string(model.total_bf16_bytes / 1048576) + "MB f32=" + to_string(model.total_f32_bytes / 1048576) + "MB total=" + to_string(weight_mb) + "MB")
+
+    // KV cache
+    let cache = kv_cache_new(cfg)
+    let mem = estimate_memory(model, cache)
+    println("[bench] KV cache: " + to_string(mem["kv_cache_mb"]) + " MB")
+    println("[bench] Total est. RSS: " + to_string(mem["total_est_mb"]) + " MB")
+
+    // Synthetic prompt tokens
+    let mut prompt_tokens = []
+    let mut i = 0
+    while i < prompt_len {
+        prompt_tokens.push((i * 7 + 13) % cfg.vocab_size)
+        i = i + 1
+    }
+
+    // ── PREFILL PHASE ───────────────────────────────────────────────
+    println("")
+    println("--- Prefill Phase ---")
+    let t_pre_0 = clock()
+    let mut pos = 0
+    let mut last_logits = 0
+    while pos < prompt_len {
+        let logits = forward_one(model, prompt_tokens[pos], pos, cache, use_metal)
+        if last_logits != 0 {
+            free_raw(last_logits, cfg.vocab_size * 4)
+        }
+        last_logits = logits
+        pos = pos + 1
+    }
+    let t_pre_1 = clock()
+    let prefill_sec = t_pre_1 - t_pre_0
+    let prefill_ms = prefill_sec * 1000.0
+    let prefill_tok_s = if prefill_sec > 0.0 { to_float(prompt_len) / prefill_sec } else { 0.0 }
+
+    println("[bench] Prefill: " + to_string(prompt_len) + " tokens in " + to_string(prefill_ms) + " ms")
+    println("[bench] Prefill tok/s: " + to_string(prefill_tok_s))
+
+    // ── DECODE PHASE (kv-cache autoregressive) ──────────────────────
+    println("")
+    println("--- Decode Phase (autoregressive with KV cache) ---")
+
+    // Sample first token from prefill logits
+    let mut cur_tok = argmax_sample(last_logits, cfg.vocab_size)
+    free_raw(last_logits, cfg.vocab_size * 4)
+
+    let mut tok_times = []
+    let mut generated = 0
+
+    let t_dec_0 = clock()
+    while generated < gen_tokens {
+        let t0 = clock()
+        let logits = forward_one(model, cur_tok, pos, cache, use_metal)
+        let next_tok = argmax_sample(logits, cfg.vocab_size)
+        free_raw(logits, cfg.vocab_size * 4)
+        let t1 = clock()
+
+        let ms = (t1 - t0) * 1000.0
+        tok_times.push(ms)
+
+        cur_tok = next_tok
+        pos = pos + 1
+        generated = generated + 1
+    }
+    let t_dec_1 = clock()
+    let decode_sec = t_dec_1 - t_dec_0
+    let decode_ms = decode_sec * 1000.0
+    let n_gen = len(tok_times)
+
+    // ── Statistics ──────────────────────────────────────────────────
+    let mut sum_ms = 0.0
+    let mut best_ms = tok_times[0]
+    let mut worst_ms = tok_times[0]
+    i = 0
+    while i < n_gen {
+        sum_ms = sum_ms + tok_times[i]
+        if tok_times[i] < best_ms { best_ms = tok_times[i] }
+        if tok_times[i] > worst_ms { worst_ms = tok_times[i] }
+        i = i + 1
+    }
+    let avg_ms = sum_ms / to_float(n_gen)
+    let decode_tok_s = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 }
+
+    // p50 / p99 (simple sort)
+    let mut sorted = []
+    i = 0
+    while i < n_gen {
+        sorted.push(tok_times[i])
+        i = i + 1
+    }
+    // Bubble sort (simple, fine for N <= ~256)
+    let mut si = 0
+    while si < n_gen {
+        let mut sj = si + 1
+        while sj < n_gen {
+            if sorted[sj] < sorted[si] {
+                let tmp = sorted[si]
+                sorted[si] = sorted[sj]
+                sorted[sj] = tmp
+            }
+            sj = sj + 1
+        }
+        si = si + 1
+    }
+    let p50_idx = n_gen / 2
+    let p99_idx = n_gen * 99 / 100
+    let p50_ms = sorted[p50_idx]
+    let p99_ms = sorted[p99_idx]
+
+    // Bandwidth: weight_bytes / avg_decode_sec
+    let weight_bytes = to_float(model.total_bf16_bytes + model.total_f32_bytes)
+    let bw_gbs = if avg_ms > 0.0 { weight_bytes / (avg_ms / 1000.0) / 1000000000.0 } else { 0.0 }
+
+    // FLOPS at midpoint context
+    let mid_ctx = prompt_len + gen_tokens / 2
+    let flops = flops_per_token(cfg, mid_ctx)
+    let tflops = if avg_ms > 0.0 { flops / (avg_ms / 1000.0) / 1000000000000.0 } else { 0.0 }
+
+    // ── Report ──────────────────────────────────────────────────────
+    println("")
+    println("============================================================")
+    println("  RESULTS: " + cfg.name)
+    println("============================================================")
+    println("  Prefill:")
+    println("    tokens:    " + to_string(prompt_len))
+    println("    latency:   " + to_string(prefill_ms) + " ms")
+    println("    tok/s:     " + to_string(prefill_tok_s))
+    println("")
+    println("  Decode (autoregressive KV-cache):")
+    println("    tokens:    " + to_string(n_gen))
+    println("    total:     " + to_string(decode_ms) + " ms")
+    println("    avg:       " + to_string(avg_ms) + " ms/tok")
+    println("    tok/s:     " + to_string(decode_tok_s))
+    println("    best:      " + to_string(best_ms) + " ms/tok")
+    println("    worst:     " + to_string(worst_ms) + " ms/tok")
+    println("    p50:       " + to_string(p50_ms) + " ms/tok")
+    println("    p99:       " + to_string(p99_ms) + " ms/tok")
+    println("")
+    println("  Memory:")
+    println("    weights:   " + to_string(weight_mb) + " MB")
+    println("    kv_cache:  " + to_string(mem["kv_cache_mb"]) + " MB")
+    println("    est_total: " + to_string(mem["total_est_mb"]) + " MB")
+    println("")
+    println("  Compute:")
+    println("    est_bw:    " + to_string(bw_gbs) + " GB/s")
+    println("    est_tflops:" + to_string(tflops))
+    println("")
+
+    // ── JSON summary (machine-readable) ─────────────────────────────
+    let mut j = "{\"bench\":\"m4_inference_e2e\""
+    j = j + ",\"config\":\"" + cfg.name + "\""
+    j = j + ",\"metal\":" + to_string(use_metal)
+    j = j + ",\"prefill_tokens\":" + to_string(prompt_len)
+    j = j + ",\"prefill_ms\":" + to_string(prefill_ms)
+    j = j + ",\"prefill_tok_s\":" + to_string(prefill_tok_s)
+    j = j + ",\"decode_tokens\":" + to_string(n_gen)
+    j = j + ",\"decode_ms\":" + to_string(decode_ms)
+    j = j + ",\"decode_tok_s\":" + to_string(decode_tok_s)
+    j = j + ",\"decode_avg_ms\":" + to_string(avg_ms)
+    j = j + ",\"decode_best_ms\":" + to_string(best_ms)
+    j = j + ",\"decode_worst_ms\":" + to_string(worst_ms)
+    j = j + ",\"decode_p50_ms\":" + to_string(p50_ms)
+    j = j + ",\"decode_p99_ms\":" + to_string(p99_ms)
+    j = j + ",\"weight_mb\":" + to_string(weight_mb)
+    j = j + ",\"kv_cache_mb\":" + to_string(mem["kv_cache_mb"])
+    j = j + ",\"est_bw_gbs\":" + to_string(bw_gbs)
+    j = j + ",\"est_tflops\":" + to_string(tflops)
+    j = j + "}"
+    println(j)
+
+    // Cleanup
+    kv_cache_free(cache)
+
+    // Pass/fail against target
+    println("")
+    if decode_tok_s >= 46.0 {
+        println("[bench] PASS: decode " + to_string(decode_tok_s) + " tok/s >= 46 target")
+    } else {
+        println("[bench] BELOW TARGET: decode " + to_string(decode_tok_s) + " tok/s < 46 target")
+    }
+    if decode_tok_s >= 60.0 {
+        println("[bench] EXCELLENT: decode " + to_string(decode_tok_s) + " tok/s >= 60 (Metal-tier)")
+    }
+
+    return decode_tok_s
+}
+
+// ===================================================================
+//  CLI
+// ===================================================================
+
+fn _cli_flag(av, n, key, default_v) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key {
+            if (i + 1) < n { return av[i + 1] }
+        }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _cli_has(av, n, key) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+let av = argv()
+let n_av = len(av)
+
+if _cli_has(av, n_av, "--help") {
+    println("M4 E2E Inference Benchmark")
+    println("")
+    println("Usage:")
+    println("  hexa bench/m4_inference_e2e.hexa [options]")
+    println("")
+    println("Options:")
+    println("  --config <name>   smoke | 1b | 7b (default: smoke)")
+    println("  --prompt <N>      Prompt length in tokens (default: 4)")
+    println("  --tokens <N>      Tokens to generate (default: 32)")
+    println("  --metal           Enable Metal GPU for FFN")
+    println("  --help            Show this help")
+    println("")
+    println("Examples:")
+    println("  DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa")
+    println("  DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa --config 1b --tokens 64")
+    println("  DYLD_LIBRARY_PATH=self/native/build ./hexa bench/m4_inference_e2e.hexa --config 7b --metal --tokens 32")
+} else {
+    let config_name = _cli_flag(av, n_av, "--config", "smoke")
+    let prompt_len = to_int(_cli_flag(av, n_av, "--prompt", "4"))
+    let gen_tokens = to_int(_cli_flag(av, n_av, "--tokens", "32"))
+    let use_metal = _cli_has(av, n_av, "--metal")
+
+    // Hardware detection
+    let hw = detect_hardware()
+    println("[hw] hxblas version: " + to_string(hw["hxblas_version"]))
+    println("[hw] bf16 available: " + to_string(hw["bf16_available"]))
+    println("[hw] metal available: " + to_string(hw["metal_available"]))
+
+    if use_metal {
+        if hw["metal_available"] == false {
+            println("[hw] WARNING: --metal requested but hxmetal not available, using CPU")
+        } else {
+            println("[hw] Metal GPU enabled")
+        }
+    }
+    println("")
+
+    let cfg = if config_name == "7b" {
+        config_7b()
+    } else {
+        if config_name == "1b" {
+            config_1b()
+        } else {
+            config_smoke()
+        }
+    }
+
+    run_bench(cfg, prompt_len, gen_tokens, use_metal)
+}

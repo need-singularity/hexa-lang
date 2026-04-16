@@ -1,0 +1,590 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/tokenizer_bpe.hexa — Byte-level BPE tokenizer (GPT-2 style)
+//
+//  Pure hexa implementation. Replaces Python tiktoken / HF tokenizers.
+//  Loads merges.txt + vocab.json, performs byte-level BPE encoding
+//  and decoding.
+//
+//  Public API:
+//    bpe_load(merges_path, vocab_path)   -> BPETokenizer
+//    bpe_encode(tok, text)               -> [int]
+//    bpe_decode(tok, ids)                -> str
+//    bpe_encode_batch(tok, texts)        -> [[int]]
+//    bpe_vocab_size(tok)                 -> int
+//    bpe_token_to_id(tok, token)         -> int
+//    bpe_id_to_token(tok, id)            -> str
+//
+//  Builtins used: read_file, split, trim, len, json_parse,
+//                 char_code, chr
+// ═══════════════════════════════════════════════════════════════
+
+// ── BPE Tokenizer state ──────────────────────────────────────
+struct BPETokenizer {
+    merges:       array,     // array of [str, str] merge pairs (priority order)
+    vocab:        array,     // array of [token_str, id] pairs
+    token_to_id:  array,     // same as vocab for lookup
+    id_to_token:  array,     // array indexed by id -> token_str (sparse)
+    vocab_size:   int,
+    merge_ranks:  array      // array of [pair_key, rank] for O(1) lookup
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Byte-to-unicode mapping (GPT-2 style)
+//
+//  GPT-2 BPE maps bytes 0-255 to unicode chars to avoid control
+//  chars. Printable ASCII stays as-is. Others get shifted to
+//  unicode range 256+.
+// ═══════════════════════════════════════════════════════════════
+
+// Build the byte-to-char mapping table
+// Returns array of 256 strings, one per byte value
+fn build_byte_to_char() {
+    let mut table = []
+    let mut i = 0
+    while i < 256 {
+        // Printable ASCII range: 33..126, 161..172, 174..255
+        if (i >= 33 && i <= 126) || (i >= 161 && i <= 172) || (i >= 174 && i <= 255) {
+            table.push(chr(i))
+        } else {
+            // Non-printable bytes get mapped to 256+ range
+            table.push(chr(256 + i))
+        }
+        i = i + 1
+    }
+    return table
+}
+
+// Build inverse: char -> byte value
+// Returns array of [char_str, byte_val] pairs
+fn build_char_to_byte(byte_to_char) {
+    let mut table = []
+    let mut i = 0
+    while i < 256 {
+        table.push([byte_to_char[i], i])
+        i = i + 1
+    }
+    return table
+}
+
+// Convert a text string to array of byte-level BPE chars
+fn text_to_bpe_chars(text, byte_to_char) {
+    let mut result = []
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let byte_val = char_code(text, i)
+        if byte_val >= 0 && byte_val < 256 {
+            result.push(byte_to_char[byte_val])
+        } else {
+            // Multi-byte UTF-8: encode each byte separately
+            // For ASCII-range text this path is rarely hit
+            result.push(byte_to_char[byte_val % 256])
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Load merges.txt
+//
+//  Format: first line is "#version: 0.2" (skip), then one merge
+//  per line as "token_a token_b".
+// ═══════════════════════════════════════════════════════════════
+fn load_merges(path) {
+    let raw = read_file(path)
+    let lines = split(raw, "\n")
+    let mut merges = []
+    let mut i = 0
+    while i < len(lines) {
+        let line = trim(lines[i])
+        // Skip empty lines and version header
+        if len(line) > 0 {
+            if i == 0 && len(line) > 0 {
+                // Check if first line is version header
+                let first_char = line.slice(0, 1)
+                if first_char == "#" {
+                    i = i + 1
+                    // skip
+                    if i < len(lines) {
+                        let line2 = trim(lines[i])
+                        if len(line2) > 0 {
+                            let parts = split(line2, " ")
+                            if len(parts) >= 2 {
+                                merges.push([parts[0], parts[1]])
+                            }
+                        }
+                    }
+                    i = i + 1
+                    // continue with rest below
+                    while i < len(lines) {
+                        let ln = trim(lines[i])
+                        if len(ln) > 0 {
+                            let ps = split(ln, " ")
+                            if len(ps) >= 2 {
+                                merges.push([ps[0], ps[1]])
+                            }
+                        }
+                        i = i + 1
+                    }
+                    return merges
+                }
+            }
+            let parts = split(line, " ")
+            if len(parts) >= 2 {
+                merges.push([parts[0], parts[1]])
+            }
+        }
+        i = i + 1
+    }
+    return merges
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Load vocab.json
+//
+//  Format: JSON object {"token": id, ...}
+//  Returns array of [token_str, id] pairs + inverse lookup.
+// ═══════════════════════════════════════════════════════════════
+fn load_vocab(path) {
+    let raw = read_file(path)
+    let parsed = json_parse(raw)
+    // json_parse returns a dict; iterate keys
+    let keys = dict_keys(parsed)
+    let n = len(keys)
+    let mut pairs = []
+    let mut max_id = 0
+    let mut i = 0
+    while i < n {
+        let key = keys[i]
+        let id = parsed[key]
+        pairs.push([key, id])
+        if id > max_id {
+            max_id = id
+        }
+        i = i + 1
+    }
+
+    // Build id->token reverse array (sparse, fill gaps with "")
+    let mut id_to_token = []
+    i = 0
+    while i <= max_id {
+        id_to_token.push("")
+        i = i + 1
+    }
+    i = 0
+    while i < len(pairs) {
+        let id = pairs[i][1]
+        id_to_token[id] = pairs[i][0]
+        i = i + 1
+    }
+
+    return [pairs, id_to_token, max_id + 1]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Build merge rank lookup
+//  Returns array of ["a b", rank] pairs for fast priority lookup.
+// ═══════════════════════════════════════════════════════════════
+fn build_merge_ranks(merges) {
+    let mut ranks = []
+    let mut i = 0
+    while i < len(merges) {
+        let key = merges[i][0] + " " + merges[i][1]
+        ranks.push([key, i])
+        i = i + 1
+    }
+    return ranks
+}
+
+// Look up merge rank for a pair. Returns -1 if not found.
+fn get_merge_rank(merge_ranks, a, b) {
+    let key = a + " " + b
+    let mut i = 0
+    let n = len(merge_ranks)
+    while i < n {
+        if merge_ranks[i][0] == key {
+            return merge_ranks[i][1]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_load — load merges + vocab, build tokenizer
+// ═══════════════════════════════════════════════════════════════
+fn bpe_load(merges_path, vocab_path) {
+    let t0 = clock()
+
+    let merges = load_merges(merges_path)
+    let vocab_result = load_vocab(vocab_path)
+    let vocab = vocab_result[0]
+    let id_to_token = vocab_result[1]
+    let vocab_size = vocab_result[2]
+    let merge_ranks = build_merge_ranks(merges)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+
+    println("[tokenizer_bpe] loaded " + str(len(merges)) + " merges, " + str(vocab_size) + " vocab in " + str(ms) + " ms")
+
+    let tok = BPETokenizer {
+        merges: merges,
+        vocab: vocab,
+        token_to_id: vocab,
+        id_to_token: id_to_token,
+        vocab_size: vocab_size,
+        merge_ranks: merge_ranks
+    }
+    return tok
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_load_from_dict — build tokenizer from in-memory dict
+//  For testing without files.
+// ═══════════════════════════════════════════════════════════════
+fn bpe_load_from_dict(merges_list, vocab_dict) {
+    let keys = dict_keys(vocab_dict)
+    let n = len(keys)
+    let mut pairs = []
+    let mut max_id = 0
+    let mut i = 0
+    while i < n {
+        let key = keys[i]
+        let id = vocab_dict[key]
+        pairs.push([key, id])
+        if id > max_id { max_id = id }
+        i = i + 1
+    }
+
+    let mut id_to_token = []
+    i = 0
+    while i <= max_id {
+        id_to_token.push("")
+        i = i + 1
+    }
+    i = 0
+    while i < len(pairs) {
+        id_to_token[pairs[i][1]] = pairs[i][0]
+        i = i + 1
+    }
+
+    let merge_ranks = build_merge_ranks(merges_list)
+
+    let tok = BPETokenizer {
+        merges: merges_list,
+        vocab: pairs,
+        token_to_id: pairs,
+        id_to_token: id_to_token,
+        vocab_size: max_id + 1,
+        merge_ranks: merge_ranks
+    }
+    return tok
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  BPE core: apply merges to a word (list of tokens)
+//
+//  Iteratively find the highest-priority (lowest rank) merge pair
+//  and apply it until no more merges apply.
+// ═══════════════════════════════════════════════════════════════
+fn bpe_merge_word(word, merge_ranks) {
+    // word is array of strings (individual BPE tokens)
+    let mut tokens = word
+
+    while len(tokens) > 1 {
+        // Find the pair with lowest merge rank
+        let mut best_rank = 999999999
+        let mut best_idx = -1
+        let mut i = 0
+        while i < len(tokens) - 1 {
+            let rank = get_merge_rank(merge_ranks, tokens[i], tokens[i + 1])
+            if rank >= 0 && rank < best_rank {
+                best_rank = rank
+                best_idx = i
+            }
+            i = i + 1
+        }
+
+        // No more merges apply
+        if best_idx < 0 {
+            return tokens
+        }
+
+        // Apply the merge at best_idx: combine tokens[i] + tokens[i+1]
+        let merged = tokens[best_idx] + tokens[best_idx + 1]
+        let mut new_tokens = []
+        i = 0
+        while i < len(tokens) {
+            if i == best_idx {
+                new_tokens.push(merged)
+                i = i + 2  // skip the merged pair
+            } else {
+                new_tokens.push(tokens[i])
+                i = i + 1
+            }
+        }
+        tokens = new_tokens
+    }
+
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Simple word boundary splitter (GPT-2 style)
+//
+//  GPT-2 uses a regex to split on word boundaries:
+//    'token      -> space + word boundaries
+//  Simplified version: split on spaces, keeping leading space
+//  as part of the next word (GPT-2 convention: " word").
+// ═══════════════════════════════════════════════════════════════
+fn split_into_words(text) {
+    let mut words = []
+    let mut current = ""
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        let c = text.slice(i, i + 1)
+        if c == " " {
+            if len(current) > 0 {
+                words.push(current)
+            }
+            // Start new word with the space prefix (GPT-2 convention)
+            current = c
+        } else {
+            current = current + c
+        }
+        i = i + 1
+    }
+    if len(current) > 0 {
+        words.push(current)
+    }
+    return words
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_encode — encode text to token IDs
+//
+//  Steps:
+//    1. Split text into words
+//    2. For each word, convert to byte-level chars
+//    3. Apply BPE merges
+//    4. Look up each resulting token in vocab -> ID
+// ═══════════════════════════════════════════════════════════════
+fn bpe_encode(tok, text) {
+    let byte_to_char = build_byte_to_char()
+    let words = split_into_words(text)
+    let mut all_ids = []
+
+    let mut w = 0
+    while w < len(words) {
+        let word = words[w]
+        // Convert to byte-level chars
+        let chars = text_to_bpe_chars(word, byte_to_char)
+        // Apply BPE merges
+        let merged = bpe_merge_word(chars, tok.merge_ranks)
+        // Look up each token in vocab
+        let mut t = 0
+        while t < len(merged) {
+            let token_str = merged[t]
+            let id = bpe_token_lookup(tok, token_str)
+            all_ids.push(id)
+            t = t + 1
+        }
+        w = w + 1
+    }
+
+    return all_ids
+}
+
+// Look up a token string in vocab. Returns 0 (UNK) if not found.
+fn bpe_token_lookup(tok, token_str) {
+    let mut i = 0
+    let n = len(tok.vocab)
+    while i < n {
+        if tok.vocab[i][0] == token_str {
+            return tok.vocab[i][1]
+        }
+        i = i + 1
+    }
+    return 0  // UNK
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_decode — decode token IDs back to text
+//
+//  Steps:
+//    1. Look up each ID -> token string
+//    2. Convert byte-level chars back to bytes
+//    3. Concatenate
+// ═══════════════════════════════════════════════════════════════
+fn bpe_decode(tok, ids) {
+    let char_to_byte = build_char_to_byte(build_byte_to_char())
+    let mut text = ""
+
+    let mut i = 0
+    while i < len(ids) {
+        let id = ids[i]
+        let mut token_str = ""
+        if id >= 0 && id < len(tok.id_to_token) {
+            token_str = tok.id_to_token[id]
+        }
+
+        // Convert BPE chars back to raw bytes
+        let mut j = 0
+        while j < len(token_str) {
+            let c = token_str.slice(j, j + 1)
+            let byte_val = bpe_char_to_byte(char_to_byte, c)
+            if byte_val >= 0 {
+                text = text + chr(byte_val)
+            } else {
+                text = text + c
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return text
+}
+
+// Convert a BPE char back to byte value. Returns -1 if not found.
+fn bpe_char_to_byte(char_to_byte, c) {
+    let mut i = 0
+    let n = len(char_to_byte)
+    while i < n {
+        if char_to_byte[i][0] == c {
+            return char_to_byte[i][1]
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_encode_batch — encode multiple texts
+// ═══════════════════════════════════════════════════════════════
+fn bpe_encode_batch(tok, texts) {
+    let mut result = []
+    let mut i = 0
+    while i < len(texts) {
+        result.push(bpe_encode(tok, texts[i]))
+        i = i + 1
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_vocab_size — return vocabulary size
+// ═══════════════════════════════════════════════════════════════
+fn bpe_vocab_size(tok) {
+    return tok.vocab_size
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_token_to_id — look up single token string -> ID
+// ═══════════════════════════════════════════════════════════════
+fn bpe_token_to_id(tok, token) {
+    return bpe_token_lookup(tok, token)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  bpe_id_to_token — look up single ID -> token string
+// ═══════════════════════════════════════════════════════════════
+fn bpe_id_to_token(tok, id) {
+    if id >= 0 && id < len(tok.id_to_token) {
+        return tok.id_to_token[id]
+    }
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Convenience: tokenize a text file and write HXTD binary
+//
+//  Reads a text file, tokenizes with BPE, writes packed binary.
+//  Returns number of tokens.
+// ═══════════════════════════════════════════════════════════════
+fn bpe_tokenize_file(tok, input_path, output_path) {
+    let t0 = clock()
+
+    let raw = read_file(input_path)
+    let ids = bpe_encode(tok, raw)
+    let n = len(ids)
+
+    // Write as HXTD binary using data_loader's pack function
+    // (imported separately; or inline the pack logic)
+    let mut bytes = []
+
+    // Header
+    let magic_b = [0x44, 0x54, 0x58, 0x48]  // "HXTD" LE
+    let mut i = 0
+    while i < 4 {
+        bytes.push(magic_b[i])
+        i = i + 1
+    }
+    // Version = 1
+    bytes.push(1)
+    bytes.push(0)
+    bytes.push(0)
+    bytes.push(0)
+    // total_tokens
+    bytes.push(n % 256)
+    bytes.push((n / 256) % 256)
+    bytes.push((n / 65536) % 256)
+    bytes.push((n / 16777216) % 256)
+    // vocab_size
+    let vs = tok.vocab_size
+    bytes.push(vs % 256)
+    bytes.push((vs / 256) % 256)
+    bytes.push((vs / 65536) % 256)
+    bytes.push((vs / 16777216) % 256)
+
+    // Payload
+    i = 0
+    while i < n {
+        let v = ids[i]
+        bytes.push(v % 256)
+        bytes.push((v / 256) % 256)
+        bytes.push((v / 65536) % 256)
+        bytes.push((v / 16777216) % 256)
+        i = i + 1
+    }
+
+    let _ = write_bytes(output_path, bytes)
+
+    let t1 = clock()
+    let ms = (t1 - t0) * 1000.0
+    println("[tokenizer_bpe] tokenized " + str(n) + " tokens from " + input_path + " in " + str(ms) + " ms")
+
+    return n
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Simple byte-level tokenizer (no BPE merges)
+//
+//  For cases where you want raw byte tokenization without
+//  loading merges/vocab. Each byte maps to its value (0-255).
+// ═══════════════════════════════════════════════════════════════
+fn byte_tokenize(text) {
+    let mut tokens = []
+    let n = len(text)
+    let mut i = 0
+    while i < n {
+        tokens.push(char_code(text, i))
+        i = i + 1
+    }
+    return tokens
+}
+
+fn byte_detokenize(ids) {
+    let mut text = ""
+    let mut i = 0
+    while i < len(ids) {
+        text = text + chr(ids[i])
+        i = i + 1
+    }
+    return text
+}
+
+println("[tokenizer_bpe] module loaded — byte-level BPE tokenizer ready")

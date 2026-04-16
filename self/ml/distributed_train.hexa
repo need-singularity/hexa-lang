@@ -21,6 +21,7 @@ use "distributed"
 use "hxccl"
 use "fsdp"
 use "dist_launcher"
+use "data_loader"
 
 // ── hxccl handle-based (Family B) toggle ─────────────────────
 // When true, gradient sync uses hxccl_allreduce_float via handle
@@ -89,7 +90,18 @@ fn init_worker(gpu_id, seq_len) {
     w
 }
 
-// ── Synthetic batch generator ────────────────────────────────
+// ── Data loader integration ─────────────────────────────────
+// When DIST_DATA_PATH is set to a valid HXTD binary file path,
+// the training loop reads real data via data_loader.hexa instead
+// of generating synthetic batches. Set to "" for synthetic mode.
+let DIST_DATA_PATH = ""
+let DIST_PREFETCH_N = 4   // prefetch buffer depth
+
+// Module-level data loader handle (initialized in dist_train)
+let mut g_data_loader = nil
+let mut g_use_real_data = false
+
+// Synthetic batch generator (fallback when no data file)
 fn make_dist_batch(seq_len, vocab_size) {
     let mut tokens = []
     let mut targets = []
@@ -110,6 +122,35 @@ fn make_dist_batch(seq_len, vocab_size) {
     }
     let batch = [tokens, targets]
     return batch
+}
+
+// Get next batch: real data or synthetic
+fn get_next_batch(seq_len, vocab_size, num_gpus) {
+    if g_use_real_data {
+        // Prefetch ahead
+        let _ = dl_prefetch(g_data_loader, DIST_PREFETCH_N)
+        let batch = dl_next_batch(g_data_loader)
+        if batch == nil {
+            // Epoch exhausted — reset and get first batch of new epoch
+            let _ = dl_reset_epoch(g_data_loader)
+            let _ = dl_prefetch(g_data_loader, DIST_PREFETCH_N)
+            return dl_next_batch(g_data_loader)
+        }
+        return batch
+    }
+    // Synthetic fallback
+    let full_batch = make_dist_batch(seq_len, vocab_size)
+    return full_batch
+}
+
+// Scatter a batch for multi-GPU: returns array of [sub_tokens, sub_targets]
+fn scatter_from_batch(batch, num_gpus) {
+    if g_use_real_data {
+        let seq = g_data_loader.seq_len
+        return scatter_batch_for_dist(batch, num_gpus, seq)
+    }
+    // Legacy path: use distributed.hexa scatter
+    return scatter_batch_tokens(batch[0], batch[1], num_gpus)
 }
 
 // ── Cosine LR schedule ──────────────────────────────────────
@@ -241,11 +282,34 @@ fn scale_grads(grads, accum_steps) {
 //  Main distributed training entry point
 // ═══════════════════════════════════════════════════════════════
 
+// dist_train with data_path override: loads real data from HXTD file
+fn dist_train_with_data(num_gpus, data_path) {
+    g_use_real_data = true
+    let batch_size = num_gpus  // 1 sequence per GPU per micro-batch
+    g_data_loader = dl_open(data_path, batch_size, GPU_SEQ, 42)
+    if g_data_loader.total_tokens == 0 {
+        rank_println("[dist_train] ERROR: no tokens loaded, falling back to synthetic")
+        g_use_real_data = false
+    } else {
+        rank_println("[dist_train] real data: " + str(g_data_loader.total_tokens) + " tokens, " + str(g_data_loader.batches_per_epoch) + " batches/epoch")
+        // Pre-fill prefetch buffer
+        let _ = dl_prefetch(g_data_loader, DIST_PREFETCH_N)
+    }
+    return dist_train(num_gpus)
+}
+
 fn dist_train(num_gpus) {
+    // Auto-detect data path from DIST_DATA_PATH or env
+    if g_use_real_data == false && len(DIST_DATA_PATH) > 0 {
+        return dist_train_with_data(num_gpus, DIST_DATA_PATH)
+    }
+
+    let data_mode = if g_use_real_data { "real-data" } else { "synthetic" }
     rank_println("=" * 60)
     rank_println("  Distributed GPU Training: " + str(num_gpus) + "-GPU Data Parallel")
     rank_println("  100M Transformer — Pure hexa + CUDA FFI")
     rank_println("  Gradient accumulation steps: " + str(DIST_ACCUM_STEPS))
+    rank_println("  Data mode: " + data_mode)
     rank_println("  FSDP=" + str(USE_FSDP) + " RANK=" + str(MY_RANK) + "/" + str(MY_WORLD))
     rank_println("=" * 60)
 
@@ -305,9 +369,9 @@ fn dist_train(num_gpus) {
     while step <= DIST_STEPS {
         let t0 = clock()
 
-        // Generate full batch and scatter across GPUs
-        let full_batch = make_dist_batch(seq, GPU_VOCAB)
-        let scattered = scatter_batch_tokens(full_batch[0], full_batch[1], num_gpus)
+        // Get batch (real data or synthetic) and scatter across GPUs
+        let full_batch = get_next_batch(seq, GPU_VOCAB, num_gpus)
+        let scattered = scatter_from_batch(full_batch, num_gpus)
 
         // Gradient accumulation loop
         let mut accum_grads_per_gpu = []
@@ -382,9 +446,9 @@ fn dist_train(num_gpus) {
         let t1 = clock()
         let ms = (t1 - t0) * 1000.0
 
-        // Compute average loss across GPUs (from last micro-batch)
-        let full_batch2 = make_dist_batch(seq, GPU_VOCAB)
-        let scattered2 = scatter_batch_tokens(full_batch2[0], full_batch2[1], num_gpus)
+        // Compute average loss across GPUs (from next batch or synthetic eval batch)
+        let full_batch2 = get_next_batch(seq, GPU_VOCAB, num_gpus)
+        let scattered2 = scatter_from_batch(full_batch2, num_gpus)
         let mut losses = []
         g = 0
         while g < num_gpus {
@@ -426,6 +490,12 @@ fn dist_train(num_gpus) {
     rank_println("  Avg ms/step:" + str(total_time / (DIST_STEPS * 1.0)))
     rank_println("  Throughput: " + str((DIST_STEPS * 1000.0) / total_time) + " steps/s")
     rank_println("  FSDP:       " + str(USE_FSDP))
+    if g_use_real_data {
+        rank_println("  Data:       real (" + str(g_data_loader.total_tokens) + " tokens, epoch " + str(dl_epoch(g_data_loader)) + ")")
+        rank_println("  Data path:  " + g_data_loader.path)
+    } else {
+        rank_println("  Data:       synthetic")
+    }
     rank_println("=" * 60)
 
     // Cleanup
@@ -445,4 +515,4 @@ fn dist_train(num_gpus) {
     0
 }
 
-rank_println("[distributed_train] module loaded — multi-GPU training loop ready (hxccl=" + str(USE_HXCCL) + " fsdp=" + str(USE_FSDP) + " rank=" + str(MY_RANK) + "/" + str(MY_WORLD) + ")")
+rank_println("[distributed_train] module loaded — multi-GPU training loop ready (hxccl=" + str(USE_HXCCL) + " fsdp=" + str(USE_FSDP) + " data_loader=true rank=" + str(MY_RANK) + "/" + str(MY_WORLD) + ")")

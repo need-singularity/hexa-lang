@@ -1,0 +1,541 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/data_loader.hexa — Production data loading pipeline
+//
+//  Pure hexa data loader for H100 ALM training. Replaces Python
+//  data pipeline + GIL bottleneck with zero-copy binary reads.
+//
+//  Architecture:
+//    1. Binary file reader: read pre-tokenized int32 packed data
+//    2. Batch construction: [batch_size, seq_len] from flat stream
+//    3. Fisher-Yates shuffle on sequence boundaries (deterministic)
+//    4. Prefetch ring buffer: N batches ahead of training step
+//    5. Epoch management with automatic re-shuffle
+//
+//  Data format (on disk):
+//    - Header: 16 bytes
+//        bytes  0..3:  magic 0x48585444 ("HXTD")
+//        bytes  4..7:  version (1)
+//        bytes  8..11: total_tokens (int32)
+//        bytes 12..15: vocab_size   (int32)
+//    - Payload: total_tokens * 4 bytes (int32 little-endian token IDs)
+//
+//  Public API:
+//    dl_open(path, batch_size, seq_len, seed)  -> DataLoader
+//    dl_next_batch(dl)                         -> [inputs, targets] or nil
+//    dl_reset_epoch(dl)                        -> DataLoader (re-shuffle)
+//    dl_epoch(dl)                              -> int
+//    dl_progress(dl)                           -> float [0,1]
+//    dl_info(dl)                               -> #{...}
+//    dl_prefetch(dl, n)                        -> DataLoader (fill buffer)
+//    pack_tokens_to_file(token_ids, vocab_size, path) -> int (bytes)
+//
+//  Builtins used: read_file_bytes, write_bytes, len, floor, random,
+//                 shuffle, clock
+// ═══════════════════════════════════════════════════════════════
+
+// ── Magic and version ────────────────────────────────────────
+let HXTD_MAGIC   = 0x48585444
+let HXTD_VERSION = 1
+let HEADER_BYTES = 16
+
+// ── DataLoader state ─────────────────────────────────────────
+struct DataLoader {
+    path:         str,
+    batch_size:   int,
+    seq_len:      int,
+    seed:         int,
+    total_tokens: int,
+    vocab_size:   int,
+    raw_tokens:   array,     // flat int array of all token IDs
+    seq_offsets:  array,     // shuffled sequence start indices
+    n_sequences:  int,       // total sequences that fit
+    batches_per_epoch: int,
+    cursor:       int,       // current batch index in epoch
+    epoch:        int,
+    prefetch_buf: array,     // ring buffer of pre-built batches
+    prefetch_head: int,      // next slot to consume
+    prefetch_tail: int,      // next slot to fill
+    prefetch_cap:  int,      // ring buffer capacity
+    load_time_ms: float
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Binary I/O: int32 little-endian pack/unpack
+// ═══════════════════════════════════════════════════════════════
+
+// Read a 4-byte little-endian int32 from byte array at offset
+fn read_int32_le(bytes, offset) {
+    let b0 = bytes[offset]
+    let b1 = bytes[offset + 1]
+    let b2 = bytes[offset + 2]
+    let b3 = bytes[offset + 3]
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
+}
+
+// Write a 4-byte little-endian int32 into byte array
+fn int32_to_bytes_le(val) {
+    let b0 = val % 256
+    let b1 = (val / 256) % 256
+    let b2 = (val / 65536) % 256
+    let b3 = (val / 16777216) % 256
+    return [b0, b1, b2, b3]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  pack_tokens_to_file — write token IDs to binary HXTD format
+//
+//  Used to pre-tokenize a corpus once, then load fast via dl_open.
+//  Returns number of bytes written.
+// ═══════════════════════════════════════════════════════════════
+fn pack_tokens_to_file(token_ids, vocab_size, path) {
+    let n = len(token_ids)
+    let mut bytes = []
+
+    // Header: magic
+    let magic_bytes = int32_to_bytes_le(HXTD_MAGIC)
+    let mut i = 0
+    while i < 4 {
+        bytes.push(magic_bytes[i])
+        i = i + 1
+    }
+
+    // Header: version
+    let ver_bytes = int32_to_bytes_le(HXTD_VERSION)
+    i = 0
+    while i < 4 {
+        bytes.push(ver_bytes[i])
+        i = i + 1
+    }
+
+    // Header: total_tokens
+    let tok_bytes = int32_to_bytes_le(n)
+    i = 0
+    while i < 4 {
+        bytes.push(tok_bytes[i])
+        i = i + 1
+    }
+
+    // Header: vocab_size
+    let voc_bytes = int32_to_bytes_le(vocab_size)
+    i = 0
+    while i < 4 {
+        bytes.push(voc_bytes[i])
+        i = i + 1
+    }
+
+    // Payload: each token as int32 LE
+    i = 0
+    while i < n {
+        let tb = int32_to_bytes_le(token_ids[i])
+        bytes.push(tb[0])
+        bytes.push(tb[1])
+        bytes.push(tb[2])
+        bytes.push(tb[3])
+        i = i + 1
+    }
+
+    let _ = write_bytes(path, bytes)
+    return len(bytes)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  load_raw_tokens — read HXTD file, return [tokens, vocab_size]
+// ═══════════════════════════════════════════════════════════════
+fn load_raw_tokens(path) {
+    let bytes = read_file_bytes(path)
+    let n_bytes = len(bytes)
+    if n_bytes < HEADER_BYTES {
+        println("[data_loader] ERROR: file too small: " + str(n_bytes) + " bytes")
+        return [[], 0]
+    }
+
+    // Validate magic
+    let magic = read_int32_le(bytes, 0)
+    if magic != HXTD_MAGIC {
+        println("[data_loader] ERROR: bad magic 0x" + str(magic) + " (expected HXTD)")
+        return [[], 0]
+    }
+
+    let version = read_int32_le(bytes, 4)
+    if version != HXTD_VERSION {
+        println("[data_loader] WARNING: version " + str(version) + " (expected " + str(HXTD_VERSION) + ")")
+    }
+
+    let total_tokens = read_int32_le(bytes, 8)
+    let vocab_size = read_int32_le(bytes, 12)
+
+    // Validate payload size
+    let expected_bytes = HEADER_BYTES + total_tokens * 4
+    if n_bytes < expected_bytes {
+        println("[data_loader] ERROR: truncated file — expected " + str(expected_bytes) + " bytes, got " + str(n_bytes))
+        return [[], 0]
+    }
+
+    // Decode token IDs from payload
+    let mut tokens = []
+    let mut i = 0
+    while i < total_tokens {
+        let offset = HEADER_BYTES + i * 4
+        let tok = read_int32_le(bytes, offset)
+        tokens.push(tok)
+        i = i + 1
+    }
+
+    return [tokens, vocab_size]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  load_raw_tokens_text — fallback: load from plain text file
+//  Each line is a space-separated list of integer token IDs.
+//  Returns [tokens, 0] (vocab_size unknown from text format).
+// ═══════════════════════════════════════════════════════════════
+fn load_raw_tokens_text(path) {
+    let raw = read_file(path)
+    let lines = split(raw, "\n")
+    let mut tokens = []
+    let mut i = 0
+    while i < len(lines) {
+        let line = trim(lines[i])
+        if len(line) > 0 {
+            let parts = split(line, " ")
+            let mut j = 0
+            while j < len(parts) {
+                let part = trim(parts[j])
+                if len(part) > 0 {
+                    tokens.push(to_int(part))
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return [tokens, 0]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  build_sequence_offsets — compute start indices for sequences
+//  Each sequence is seq_len+1 tokens (input + 1 shifted target).
+//  Returns array of start offsets.
+// ═══════════════════════════════════════════════════════════════
+fn build_sequence_offsets(total_tokens, seq_len) {
+    let stride = seq_len + 1
+    let n_seq = floor(total_tokens / stride)
+    let mut offsets = []
+    let mut i = 0
+    while i < n_seq {
+        offsets.push(i * stride)
+        i = i + 1
+    }
+    return offsets
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  shuffle_offsets — Fisher-Yates on sequence boundary offsets
+//  Deterministic via seed. Shuffles at sequence granularity,
+//  not individual tokens, preserving causal structure.
+// ═══════════════════════════════════════════════════════════════
+fn shuffle_offsets(offsets, seed) {
+    return shuffle(offsets, seed)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  build_batch — extract one batch from shuffled offsets
+//
+//  batch_idx: which batch (0-based)
+//  Returns [inputs, targets] where each is flat array of
+//  batch_size * seq_len ints (row-major).
+// ═══════════════════════════════════════════════════════════════
+fn build_batch(raw_tokens, seq_offsets, batch_idx, batch_size, seq_len) {
+    let mut inputs = []
+    let mut targets = []
+    let base = batch_idx * batch_size
+    let mut s = 0
+    while s < batch_size {
+        let seq_idx = base + s
+        let offset = seq_offsets[seq_idx]
+        let mut j = 0
+        while j < seq_len {
+            inputs.push(raw_tokens[offset + j])
+            targets.push(raw_tokens[offset + j + 1])
+            j = j + 1
+        }
+        s = s + 1
+    }
+    return [inputs, targets]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_open — open a pre-tokenized data file and init DataLoader
+//
+//  path:       HXTD binary file or plain text token file
+//  batch_size: sequences per batch
+//  seq_len:    tokens per sequence (input length)
+//  seed:       RNG seed for shuffle (epoch 0)
+// ═══════════════════════════════════════════════════════════════
+fn dl_open(path, batch_size, seq_len, seed) {
+    let t0 = clock()
+
+    // Try binary HXTD first, fall back to text
+    let result = load_raw_tokens(path)
+    let mut raw_tokens = result[0]
+    let mut vocab_size = result[1]
+
+    if len(raw_tokens) == 0 {
+        // Fallback: try text format
+        let text_result = load_raw_tokens_text(path)
+        raw_tokens = text_result[0]
+        vocab_size = text_result[1]
+    }
+
+    let total_tokens = len(raw_tokens)
+    if total_tokens == 0 {
+        println("[data_loader] ERROR: no tokens loaded from " + path)
+    }
+
+    // Build sequence offsets and shuffle
+    let offsets = build_sequence_offsets(total_tokens, seq_len)
+    let n_seq = len(offsets)
+    let shuffled = shuffle_offsets(offsets, seed)
+
+    // How many complete batches per epoch
+    let batches_per_epoch = floor(n_seq / batch_size)
+
+    let t1 = clock()
+    let load_ms = (t1 - t0) * 1000.0
+
+    println("[data_loader] loaded " + str(total_tokens) + " tokens from " + path)
+    println("[data_loader] " + str(n_seq) + " sequences, " + str(batches_per_epoch) + " batches/epoch")
+    println("[data_loader] batch_size=" + str(batch_size) + " seq_len=" + str(seq_len) + " vocab=" + str(vocab_size))
+    println("[data_loader] load time: " + str(load_ms) + " ms")
+
+    let dl = DataLoader {
+        path: path,
+        batch_size: batch_size,
+        seq_len: seq_len,
+        seed: seed,
+        total_tokens: total_tokens,
+        vocab_size: vocab_size,
+        raw_tokens: raw_tokens,
+        seq_offsets: shuffled,
+        n_sequences: n_seq,
+        batches_per_epoch: batches_per_epoch,
+        cursor: 0,
+        epoch: 0,
+        prefetch_buf: [],
+        prefetch_head: 0,
+        prefetch_tail: 0,
+        prefetch_cap: 0,
+        load_time_ms: load_ms
+    }
+    return dl
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_open_synthetic — create DataLoader from synthetic tokens
+//  For testing / smoke runs without a file on disk.
+// ═══════════════════════════════════════════════════════════════
+fn dl_open_synthetic(total_tokens, vocab_size, batch_size, seq_len, seed) {
+    let t0 = clock()
+
+    let mut raw_tokens = []
+    let mut i = 0
+    while i < total_tokens {
+        raw_tokens.push(int(random() * vocab_size) % vocab_size)
+        i = i + 1
+    }
+
+    let offsets = build_sequence_offsets(total_tokens, seq_len)
+    let n_seq = len(offsets)
+    let shuffled = shuffle_offsets(offsets, seed)
+    let batches_per_epoch = floor(n_seq / batch_size)
+
+    let t1 = clock()
+    let load_ms = (t1 - t0) * 1000.0
+
+    println("[data_loader] synthetic " + str(total_tokens) + " tokens, vocab=" + str(vocab_size))
+    println("[data_loader] " + str(n_seq) + " sequences, " + str(batches_per_epoch) + " batches/epoch")
+
+    let dl = DataLoader {
+        path: "<synthetic>",
+        batch_size: batch_size,
+        seq_len: seq_len,
+        seed: seed,
+        total_tokens: total_tokens,
+        vocab_size: vocab_size,
+        raw_tokens: raw_tokens,
+        seq_offsets: shuffled,
+        n_sequences: n_seq,
+        batches_per_epoch: batches_per_epoch,
+        cursor: 0,
+        epoch: 0,
+        prefetch_buf: [],
+        prefetch_head: 0,
+        prefetch_tail: 0,
+        prefetch_cap: 0,
+        load_time_ms: load_ms
+    }
+    return dl
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_next_batch — get next [inputs, targets] batch
+//
+//  If prefetch buffer has data, pop from it. Otherwise build
+//  on-demand. Returns nil when epoch is exhausted.
+//  Auto-advances cursor.
+// ═══════════════════════════════════════════════════════════════
+fn dl_next_batch(dl) {
+    // Check prefetch buffer first
+    if dl.prefetch_cap > 0 {
+        if dl.prefetch_head != dl.prefetch_tail {
+            let batch = dl.prefetch_buf[dl.prefetch_head % dl.prefetch_cap]
+            dl.prefetch_head = dl.prefetch_head + 1
+            dl.cursor = dl.cursor + 1
+            return batch
+        }
+    }
+
+    // On-demand batch construction
+    if dl.cursor >= dl.batches_per_epoch {
+        return nil
+    }
+
+    let batch = build_batch(dl.raw_tokens, dl.seq_offsets, dl.cursor, dl.batch_size, dl.seq_len)
+    dl.cursor = dl.cursor + 1
+    return batch
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_prefetch — fill the prefetch ring buffer with N batches
+//
+//  Call this before the training loop or between steps to keep
+//  the buffer warm. Builds batches ahead of the cursor so the
+//  next dl_next_batch call is instant.
+// ═══════════════════════════════════════════════════════════════
+fn dl_prefetch(dl, n) {
+    if dl.prefetch_cap == 0 {
+        // Initialize ring buffer
+        dl.prefetch_cap = n
+        dl.prefetch_buf = []
+        let mut i = 0
+        while i < n {
+            dl.prefetch_buf.push(nil)
+            i = i + 1
+        }
+        dl.prefetch_head = 0
+        dl.prefetch_tail = 0
+    }
+
+    // Fill up to capacity
+    let mut filled = dl.prefetch_tail - dl.prefetch_head
+    let prefetch_cursor = dl.cursor + filled
+    while filled < dl.prefetch_cap {
+        let batch_idx = prefetch_cursor + (filled - (dl.prefetch_tail - dl.prefetch_head))
+        if batch_idx >= dl.batches_per_epoch {
+            return dl
+        }
+        let batch = build_batch(dl.raw_tokens, dl.seq_offsets, batch_idx, dl.batch_size, dl.seq_len)
+        dl.prefetch_buf[dl.prefetch_tail % dl.prefetch_cap] = batch
+        dl.prefetch_tail = dl.prefetch_tail + 1
+        filled = filled + 1
+    }
+    return dl
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_reset_epoch — advance to next epoch, re-shuffle, reset cursor
+// ═══════════════════════════════════════════════════════════════
+fn dl_reset_epoch(dl) {
+    dl.epoch = dl.epoch + 1
+    dl.cursor = 0
+    // Re-shuffle with epoch-dependent seed for different ordering
+    let new_seed = dl.seed + dl.epoch * 7919
+    dl.seq_offsets = shuffle_offsets(
+        build_sequence_offsets(dl.total_tokens, dl.seq_len),
+        new_seed
+    )
+    // Reset prefetch
+    dl.prefetch_head = 0
+    dl.prefetch_tail = 0
+    println("[data_loader] epoch " + str(dl.epoch) + " — re-shuffled with seed " + str(new_seed))
+    return dl
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_has_next — check if more batches remain in current epoch
+// ═══════════════════════════════════════════════════════════════
+fn dl_has_next(dl) {
+    return dl.cursor < dl.batches_per_epoch
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_epoch — current epoch number (0-based)
+// ═══════════════════════════════════════════════════════════════
+fn dl_epoch(dl) {
+    return dl.epoch
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_progress — fraction of current epoch consumed [0.0, 1.0]
+// ═══════════════════════════════════════════════════════════════
+fn dl_progress(dl) {
+    if dl.batches_per_epoch == 0 { return 1.0 }
+    return (dl.cursor * 1.0) / (dl.batches_per_epoch * 1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  dl_info — diagnostic info map
+// ═══════════════════════════════════════════════════════════════
+fn dl_info(dl) {
+    let info = #{}
+    info["path"] = dl.path
+    info["total_tokens"] = dl.total_tokens
+    info["vocab_size"] = dl.vocab_size
+    info["batch_size"] = dl.batch_size
+    info["seq_len"] = dl.seq_len
+    info["n_sequences"] = dl.n_sequences
+    info["batches_per_epoch"] = dl.batches_per_epoch
+    info["cursor"] = dl.cursor
+    info["epoch"] = dl.epoch
+    info["progress"] = dl_progress(dl)
+    info["load_time_ms"] = dl.load_time_ms
+    info["prefetch_cap"] = dl.prefetch_cap
+    info["prefetch_pending"] = dl.prefetch_tail - dl.prefetch_head
+    return info
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  scatter_batch_for_dist — split a batch across N GPUs
+//
+//  Takes [inputs, targets] (flat, batch_size * seq_len each)
+//  and returns array of N sub-batches, each containing
+//  (batch_size/N) * seq_len tokens.
+//
+//  Matches the interface expected by distributed_train.hexa.
+// ═══════════════════════════════════════════════════════════════
+fn scatter_batch_for_dist(batch, num_gpus, seq_len) {
+    let inputs = batch[0]
+    let targets = batch[1]
+    let total = len(inputs)
+    let per_gpu = total / num_gpus
+
+    let mut result = []
+    let mut g = 0
+    while g < num_gpus {
+        let start = g * per_gpu
+        let end_idx = if g == num_gpus - 1 { total } else { (g + 1) * per_gpu }
+        let mut sub_in = []
+        let mut sub_tgt = []
+        let mut i = start
+        while i < end_idx {
+            sub_in.push(inputs[i])
+            sub_tgt.push(targets[i])
+            i = i + 1
+        }
+        result.push([sub_in, sub_tgt])
+        g = g + 1
+    }
+    return result
+}
+
+println("[data_loader] module loaded — production binary data pipeline ready")
