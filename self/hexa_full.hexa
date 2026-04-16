@@ -5341,6 +5341,9 @@ fn op_cached_id(op) {
 // ── @memo/@memoize/@cache runtime support ───────────────
 // fn_attrs: maps function name -> comma-separated attr string
 pub let mut fn_attrs = []      // [[name, attrs_str], ...]
+// ── @stable/@track/@deprecated evolution tracking ────────
+pub let mut stable_fns = []        // names of @stable-declared functions
+pub let mut deprecated_warned = [] // names already warned for @deprecated
 // ── Optimization #5: pre-parsed attribute flags ─────────
 // ROI-15: 64-bucket hash cache for O(1) avg attribute lookup.
 // Each bucket is [[name, bitmask], ...] where bitmask bits:
@@ -5348,6 +5351,9 @@ pub let mut fn_attrs = []      // [[name, attrs_str], ...]
 //   bit 1 (2): lazy
 //   bit 2 (4): specialize
 //   bit 3 (8): pure
+//   bit 4 (16): stable
+//   bit 5 (32): track
+//   bit 6 (64): deprecated
 // Populated by fn_attrs_set; queried by fn_attr_bitmask.
 pub let mut fn_attr_cache = []  // 64 buckets; each [[name, bitmask], ...]
 pub let mut fn_attr_flags = []  // legacy flat array (kept for compat)
@@ -5369,7 +5375,9 @@ fn fn_attr_cache_init() {
 fn fn_attrs_set(name, attrs) {
     fn_attrs = fn_attrs.push([name, attrs])
     // ── ROI-11+15: parse ALL attribute flags once at define time ──
-    // Compute bitmask: bit0=memo, bit1=lazy, bit2=specialize, bit3=pure
+    // Compute bitmask: bit0=memo, bit1=lazy, bit2=specialize, bit3=pure,
+    // bit4=stable, bit5=track, bit6=deprecated, bit7=close, bit8=limit,
+    // bit9=retry, bit10=fallback, bit11=guard
     let mut bitmask = 0
     if attrs != "" {
         if attrs == "memoize" || attrs == "memo" || attrs == "cache" {
@@ -5387,6 +5395,50 @@ fn fn_attrs_set(name, attrs) {
         }
         if attrs == "pure" || contains(attrs, "pure") {
             bitmask = bitmask + 8
+        }
+        if attrs == "stable" || contains(attrs, "stable") {
+            bitmask = bitmask + 16
+        }
+        if attrs == "track" || contains(attrs, "track") {
+            bitmask = bitmask + 32
+        }
+        if attrs == "deprecated" || contains(attrs, "deprecated") {
+            bitmask = bitmask + 64
+        }
+        if attrs == "close" || contains(attrs, "close") {
+            bitmask = bitmask + 128
+        }
+        if attrs == "limit" || contains(attrs, "limit") {
+            bitmask = bitmask + 256
+        }
+        if attrs == "retry" || contains(attrs, "retry") {
+            bitmask = bitmask + 512
+        }
+        if attrs == "fallback" || contains(attrs, "fallback") {
+            bitmask = bitmask + 1024
+        }
+        if attrs == "guard" || contains(attrs, "guard") {
+            bitmask = bitmask + 2048
+        }
+    }
+    // ── @stable: redefinition guard ──
+    // If this function was previously declared @stable, warn or error
+    if (bitmask / 16) % 2 == 1 {
+        // Check if already in stable_fns (redefinition)
+        let mut _si = 0
+        let mut _was_stable = false
+        while _si < len(stable_fns) {
+            if stable_fns[_si] == name { _was_stable = true }
+            _si = _si + 1
+        }
+        if _was_stable {
+            if env_var("HEXA_STRICT_STABLE") == "1" {
+                println("ERROR: @stable function '" + name + "' redefined (HEXA_STRICT_STABLE=1)")
+            } else {
+                eprintln("[stable] WARNING: @stable function '" + name + "' redefined")
+            }
+        } else {
+            stable_fns = stable_fns.push(name)
         }
     }
     // Legacy flat array (kept for backward compat)
@@ -8449,6 +8501,33 @@ fn call_user_fn(name, args) {
         }
     }
 
+    // bit 5 (32): @track — log function call to stderr
+    if (attr_bits / 32) % 2 == 1 {
+        if env_var("HEXA_TRACK") == "1" {
+            let _ts = timestamp()
+            eprintln("{\"event\":\"call\",\"fn\":\"" + name + "\",\"ts\":" + to_string(_ts) + "}")
+        } else {
+            eprintln("[track] " + name + " called")
+        }
+    }
+    // bit 6 (64): @deprecated — warn once per function
+    if (attr_bits / 64) % 2 == 1 {
+        let mut _already_warned = false
+        let mut _di = 0
+        while _di < len(deprecated_warned) {
+            if deprecated_warned[_di] == name { _already_warned = true }
+            _di = _di + 1
+        }
+        if !_already_warned {
+            deprecated_warned = deprecated_warned.push(name)
+            if env_var("HEXA_STRICT_DEPRECATED") == "1" {
+                println("ERROR: " + name + "() is deprecated (HEXA_STRICT_DEPRECATED=1)")
+            } else {
+                eprintln("[deprecated] " + name + "() is deprecated")
+            }
+        }
+    }
+
     // bit 0 (1): @memo/@memoize/@cache — check cache before execution
     let is_memo = attr_bits % 2 == 1
     let mut memo_key = ""
@@ -8547,6 +8626,17 @@ fn call_user_fn(name, args) {
         }
     }
 
+    // bit 9 (512): @retry — retry on failure up to N times (default 3)
+    let is_retry_fn = (attr_bits / 512) % 2 == 1
+    // bit 10 (1024): @fallback — catch errors, return void on failure
+    let is_fallback_fn = (attr_bits / 1024) % 2 == 1
+    // bit 11 (2048): @guard — monitor + detect + resolve (timing + fallback)
+    let is_guard_fn = (attr_bits / 2048) % 2 == 1
+    let mut guard_start_ms = 0
+    if is_guard_fn {
+        guard_start_ms = timestamp()
+    }
+
     let saved_flag = return_flag
     return_flag = false
     let saved_defer_stack = defer_stack
@@ -8575,6 +8665,67 @@ fn call_user_fn(name, args) {
                 exec_stmt_at(body, _cbi)
             }
             _cbi = _cbi + 1
+        }
+    }
+    // ── @retry (bit 9): re-execute body on throw, up to 3 attempts ──
+    if is_retry_fn && throw_flag {
+        let retry_max = 3
+        let mut retry_attempt = 1
+        let saved_throw_err = throw_val
+        while throw_flag && retry_attempt < retry_max {
+            retry_attempt = retry_attempt + 1
+            eprintln("[retry] " + name + " attempt " + to_string(retry_attempt) + "/" + to_string(retry_max))
+            throw_flag = false
+            throw_val = val_void()
+            return_flag = false
+            return_val = val_void()
+            last_expr_val = val_void()
+            _cbi = 0
+            while _cbi < len(body) {
+                if return_flag || throw_flag { _cbi = len(body) } else {
+                    let rstmt = body[_cbi]
+                    if type_of(rstmt) != "string" && type_of(rstmt) == "struct" || type_of(rstmt) == "map" {
+                        if rstmt.kind == "ExprStmt" {
+                            last_expr_val = eval_expr(rstmt.left)
+                        } else {
+                            exec_stmt_at(body, _cbi)
+                        }
+                    } else {
+                        exec_stmt_at(body, _cbi)
+                    }
+                    _cbi = _cbi + 1
+                }
+            }
+        }
+        // If still throwing after all retries, restore original error
+        if throw_flag {
+            throw_val = saved_throw_err
+        }
+    }
+    // ── @fallback (bit 10): catch errors, return void on failure ──
+    if is_fallback_fn && throw_flag {
+        eprintln("[fallback] " + name + " failed, using fallback")
+        throw_flag = false
+        throw_val = val_void()
+        return_flag = true
+        return_val = val_void()
+    }
+    // ── @guard (bit 11): timing + error reporting ──
+    if is_guard_fn {
+        let guard_elapsed = timestamp() - guard_start_ms
+        if throw_flag {
+            if throw_val.tag == TAG_STR {
+                eprintln("[guard] " + name + " FAILED after " + to_string(guard_elapsed) + "ms: " + throw_val.str_val)
+            } else {
+                eprintln("[guard] " + name + " FAILED after " + to_string(guard_elapsed) + "ms")
+            }
+            // @guard includes fallback behavior: swallow the error
+            throw_flag = false
+            throw_val = val_void()
+            return_flag = true
+            return_val = val_void()
+        } else {
+            eprintln("[guard] " + name + " completed in " + to_string(guard_elapsed) + "ms")
         }
     }
     let mut result = return_val
@@ -13669,6 +13820,267 @@ fn call_builtin(name, args) {
         return host_ffi_call_6(fn_ptr, nargs, float_mask, ret_kind, a0, a1, a2, a3, a4, a5)
     }
 
+    // ── stdlib/array free-standing helpers ──────────────────
+    if name == "array_reverse" {
+        let items = get_array(args[0])
+        let n = len(items)
+        let mut out = []
+        let mut i = n - 1
+        while i >= 0 { out = out.push(items[i]); i = i - 1 }
+        return val_array(out)
+    }
+    if name == "array_contains" {
+        let items = get_array(args[0])
+        let needle = args[1]
+        let mut i = 0
+        while i < len(items) {
+            if val_eq(items[i], needle) { return val_bool(true) }
+            i = i + 1
+        }
+        return val_bool(false)
+    }
+    if name == "array_index_of" {
+        let items = get_array(args[0])
+        let needle = args[1]
+        let mut i = 0
+        while i < len(items) {
+            if val_eq(items[i], needle) { return val_int(i) }
+            i = i + 1
+        }
+        return val_int(-1)
+    }
+    if name == "array_sum" {
+        let items = get_array(args[0])
+        let mut total = 0
+        let mut i = 0
+        while i < len(items) {
+            if items[i].tag == TAG_FLOAT { total = total + items[i].float_val }
+            else { total = total + items[i].int_val }
+            i = i + 1
+        }
+        return val_int(total)
+    }
+    if name == "array_product" {
+        let items = get_array(args[0])
+        let n = len(items)
+        if n == 0 { return val_int(1) }
+        let mut total = 1
+        let mut i = 0
+        while i < n {
+            if items[i].tag == TAG_FLOAT { total = total * items[i].float_val }
+            else { total = total * items[i].int_val }
+            i = i + 1
+        }
+        return val_int(total)
+    }
+    if name == "array_min" {
+        let items = get_array(args[0])
+        let n = len(items)
+        if n == 0 { return val_void() }
+        let mut best = items[0].int_val
+        let mut i = 1
+        while i < n {
+            let v = items[i].int_val
+            if v < best { best = v }
+            i = i + 1
+        }
+        return val_int(best)
+    }
+    if name == "array_max" {
+        let items = get_array(args[0])
+        let n = len(items)
+        if n == 0 { return val_void() }
+        let mut best = items[0].int_val
+        let mut i = 1
+        while i < n {
+            let v = items[i].int_val
+            if v > best { best = v }
+            i = i + 1
+        }
+        return val_int(best)
+    }
+    if name == "array_concat" {
+        let a = get_array(args[0])
+        let b = get_array(args[1])
+        let mut out = []
+        let mut i = 0
+        while i < len(a) { out = out.push(a[i]); i = i + 1 }
+        i = 0
+        while i < len(b) { out = out.push(b[i]); i = i + 1 }
+        return val_array(out)
+    }
+    if name == "array_take" {
+        let items = get_array(args[0])
+        let n = args[1].int_val
+        let sz = len(items)
+        let take_n = if n < sz { n } else { sz }
+        let mut out = []
+        let mut i = 0
+        while i < take_n { out = out.push(items[i]); i = i + 1 }
+        return val_array(out)
+    }
+    if name == "array_drop" {
+        let items = get_array(args[0])
+        let n = args[1].int_val
+        let sz = len(items)
+        let start = if n < sz { n } else { sz }
+        let mut out = []
+        let mut i = start
+        while i < sz { out = out.push(items[i]); i = i + 1 }
+        return val_array(out)
+    }
+    if name == "array_count" {
+        let items = get_array(args[0])
+        let needle = args[1]
+        let mut cnt = 0
+        let mut i = 0
+        while i < len(items) {
+            if val_eq(items[i], needle) { cnt = cnt + 1 }
+            i = i + 1
+        }
+        return val_int(cnt)
+    }
+
+    // ── stdlib/map free-standing helpers ─────────────────────
+    if name == "map_size" {
+        let ks = get_map_keys(args[0])
+        return val_int(len(ks))
+    }
+    if name == "map_contains_key" {
+        let ks = get_map_keys(args[0])
+        let key = args[1]
+        let mut i = 0
+        while i < len(ks) {
+            if val_eq(ks[i], key) { return val_bool(true) }
+            i = i + 1
+        }
+        return val_bool(false)
+    }
+    if name == "map_get_or" {
+        let ks = get_map_keys(args[0])
+        let vs = get_map_values(args[0])
+        let key = args[1]
+        let fallback = args[2]
+        let mut i = 0
+        while i < len(ks) {
+            if val_eq(ks[i], key) { return vs[i] }
+            i = i + 1
+        }
+        return fallback
+    }
+    if name == "map_keys" {
+        let ks = get_map_keys(args[0])
+        return val_array(ks)
+    }
+    if name == "map_values" {
+        let vs = get_map_values(args[0])
+        return val_array(vs)
+    }
+    if name == "map_entries" {
+        let ks = get_map_keys(args[0])
+        let vs = get_map_values(args[0])
+        let mut out = []
+        let mut i = 0
+        while i < len(ks) {
+            let pair = val_array([ks[i], vs[i]])
+            out = out.push(pair)
+            i = i + 1
+        }
+        return val_array(out)
+    }
+    if name == "map_is_empty" {
+        let ks = get_map_keys(args[0])
+        return val_bool(len(ks) == 0)
+    }
+    if name == "map_sum_values" {
+        let vs = get_map_values(args[0])
+        let mut total = 0
+        let mut i = 0
+        while i < len(vs) {
+            if vs[i].tag == TAG_FLOAT { total = total + vs[i].float_val }
+            else { total = total + vs[i].int_val }
+            i = i + 1
+        }
+        return val_int(total)
+    }
+    if name == "map_count_values" {
+        let vs = get_map_values(args[0])
+        let needle = args[1]
+        let mut cnt = 0
+        let mut i = 0
+        while i < len(vs) {
+            if val_eq(vs[i], needle) { cnt = cnt + 1 }
+            i = i + 1
+        }
+        return val_int(cnt)
+    }
+
+    // ── has_key(map, key) — free-function alias for map.contains_key ──
+    if name == "has_key" {
+        if len(args) >= 2 && args[0].tag == TAG_MAP {
+            return val_bool(map_contains_key(args[0], args[1]))
+        }
+        return val_bool(false)
+    }
+
+    // ── keys(map) — free-function alias for map.keys() ──
+    if name == "keys" {
+        if len(args) >= 1 && args[0].tag == TAG_MAP {
+            let ks = get_map_keys(args[0])
+            return val_array(ks)
+        }
+        return val_array([])
+    }
+
+    // ── rand_2d(rows, cols, seed_ref) — 2D array of pseudo-random floats ──
+    if name == "rand_2d" {
+        if len(args) < 2 { return val_array([]) }
+        let rows = args[0].int_val
+        let cols = args[1].int_val
+        // seed_ref is a 1-element array used as mutable PRNG state
+        let mut seed = 42
+        if len(args) >= 3 {
+            let sr = get_array(args[2])
+            if len(sr) > 0 { seed = sr[0].int_val }
+        }
+        let mut result = []
+        let mut ri = 0
+        while ri < rows {
+            let mut row = []
+            let mut ci = 0
+            while ci < cols {
+                // LCG PRNG: same algorithm as conscious_lm.hexa rand_float
+                seed = (seed * 1103515245 + 12345) % 2147483647
+                let f = (seed % 20000) - 10000
+                row = row.push(val_float(f / 100000.0))
+                ci = ci + 1
+            }
+            result = result.push(val_array(row))
+            ri = ri + 1
+        }
+        // Write back updated seed
+        if len(args) >= 3 && args[2].tag == TAG_ARRAY {
+            let sr = get_array(args[2])
+            if len(sr) > 0 {
+                sr[0] = val_int(seed)
+            }
+        }
+        return val_array(result)
+    }
+
+    // ── gc_num_segments(num_layers, seg_size) — ceiling division ──
+    if name == "gc_num_segments" {
+        if len(args) >= 2 {
+            let num_layers = args[0].int_val
+            let seg_size = args[1].int_val
+            if seg_size <= 0 { return val_int(num_layers) }
+            let mut s = num_layers / seg_size
+            if num_layers % seg_size != 0 { s = s + 1 }
+            return val_int(s)
+        }
+        return val_int(0)
+    }
+
     return not_builtin
 }
 
@@ -15852,9 +16264,16 @@ let _hx_av = args()
 let mut _hx_i = 2
 let mut _hx_file = ""
 let mut _hx_vm_flag = false
+let mut _hx_mode = "run"
 while _hx_i < len(_hx_av) {
     let _hx_a = _hx_av[_hx_i]
     if _hx_a == "run" {
+        _hx_i = _hx_i + 1
+    } else if _hx_a == "test" {
+        _hx_mode = "test"
+        _hx_i = _hx_i + 1
+    } else if _hx_a == "bench" {
+        _hx_mode = "bench"
         _hx_i = _hx_i + 1
     } else if _hx_a == "--vm" {
         _hx_vm_flag = true
@@ -15875,11 +16294,78 @@ if _hx_file != "" {
     let _hx_tokens = tokenize(_hx_src)
     _hx_ast = parse(_hx_tokens)
     _hx_has_script = true
-    // Classic path: run the tree-walking interpreter inline ONLY if
-    // we are not in VM mode. In VM mode, bc_emitter.hexa's tail block
-    // picks this up via the (_hx_has_script, _hx_ast) globals.
-    let _hx_env_vm = env_var("HEXA_VM") == "1"
-    if !_hx_vm_flag && !_hx_env_vm {
+    if _hx_mode == "test" {
+        // @test runner: interpret to populate fn_attrs, then run @test fns
         interpret(_hx_ast)
+        let mut _hx_tp = 0
+        let mut _hx_tf = 0
+        let mut _hx_ts = 0
+        let mut _hx_ti = 0
+        while _hx_ti < len(fn_attrs) {
+            let _hx_tn = fn_attrs[_hx_ti][0]
+            let _hx_ta = fn_attrs[_hx_ti][1]
+            if _hx_ta.contains("test") {
+                if _hx_ta.contains("skip") {
+                    println("  SKIP  " + _hx_tn)
+                    _hx_ts = _hx_ts + 1
+                } else {
+                    try {
+                        call_user_fn(_hx_tn, [])
+                        println("  PASS  " + _hx_tn)
+                        _hx_tp = _hx_tp + 1
+                    } catch _hx_te {
+                        println("  FAIL  " + _hx_tn + " — " + to_string(_hx_te))
+                        _hx_tf = _hx_tf + 1
+                    }
+                }
+            }
+            _hx_ti = _hx_ti + 1
+        }
+        println("")
+        println("" + to_string(_hx_tp) + " pass, " + to_string(_hx_tf) + " fail, " + to_string(_hx_ts) + " skip")
+        if _hx_tf > 0 {
+            exit(1)
+        }
+    } else if _hx_mode == "bench" {
+        // @bench runner: interpret to populate fn_attrs, then bench @bench fns
+        interpret(_hx_ast)
+        let mut _hx_bs = 0
+        let mut _hx_bi = 0
+        while _hx_bi < len(fn_attrs) {
+            let _hx_bn = fn_attrs[_hx_bi][0]
+            let _hx_ba = fn_attrs[_hx_bi][1]
+            if _hx_ba.contains("bench") {
+                if _hx_ba.contains("skip") {
+                    println("  SKIP  " + _hx_bn)
+                    _hx_bs = _hx_bs + 1
+                } else {
+                    let _hx_iters = 100
+                    let _hx_bt0 = clock()
+                    let mut _hx_bmin = 999999.0
+                    let mut _hx_bj = 0
+                    while _hx_bj < _hx_iters {
+                        let _hx_iter_t0 = clock()
+                        call_user_fn(_hx_bn, [])
+                        let _hx_iter_dt = (clock() - _hx_iter_t0) * 1000.0
+                        if _hx_iter_dt < _hx_bmin {
+                            _hx_bmin = _hx_iter_dt
+                        }
+                        _hx_bj = _hx_bj + 1
+                    }
+                    let _hx_btotal = (clock() - _hx_bt0) * 1000.0
+                    let _hx_bmean = _hx_btotal / _hx_iters
+                    println("  BENCH " + _hx_bn + "  total=" + to_string(_hx_btotal) + "ms  mean=" + to_string(_hx_bmean) + "ms  min=" + to_string(_hx_bmin) + "ms  (n=" + to_string(_hx_iters) + ")")
+                }
+            }
+            _hx_bi = _hx_bi + 1
+        }
+    } else {
+        // Classic path: run the tree-walking interpreter inline ONLY if
+        // we are not in VM mode. In VM mode, bc_emitter.hexa's tail block
+        // picks this up via the (_hx_has_script, _hx_ast) globals.
+        let _hx_env_vm = env_var("HEXA_VM") == "1"
+        if !_hx_vm_flag && !_hx_env_vm {
+            interpret(_hx_ast)
+        }
     }
 }

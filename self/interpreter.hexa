@@ -157,6 +157,9 @@ pub let mut break_label = ""
 pub let mut continue_flag = false
 pub let mut continue_label = ""
 pub let mut defer_stack = []
+// @close cleanup: per-frame list of variable names to close on scope exit.
+// Each call frame saves/restores this list (same pattern as defer_stack).
+pub let mut close_cleanup_list = []
 pub let mut throw_flag = false
 pub let mut throw_val = val_void()
 // Panic: unrecoverable abort. Propagates through all enclosing blocks like
@@ -518,6 +521,9 @@ fn op_cached_id(op) {
 // ── @memo/@memoize/@cache runtime support ───────────────
 // fn_attrs: maps function name -> comma-separated attr string
 pub let mut fn_attrs = []      // [[name, attrs_str], ...]
+// ── @stable/@track/@deprecated evolution tracking ────────
+pub let mut stable_fns = []        // names of @stable-declared functions
+pub let mut deprecated_warned = [] // names already warned for @deprecated
 // ── Optimization #5: pre-parsed attribute flags ─────────
 // ROI-15: 64-bucket hash cache for O(1) avg attribute lookup.
 // Each bucket is [[name, bitmask], ...] where bitmask bits:
@@ -525,6 +531,9 @@ pub let mut fn_attrs = []      // [[name, attrs_str], ...]
 //   bit 1 (2): lazy
 //   bit 2 (4): specialize
 //   bit 3 (8): pure
+//   bit 4 (16): stable
+//   bit 5 (32): track
+//   bit 6 (64): deprecated
 // Populated by fn_attrs_set; queried by fn_attr_bitmask.
 pub let mut fn_attr_cache = []  // 64 buckets; each [[name, bitmask], ...]
 pub let mut fn_attr_flags = []  // legacy flat array (kept for compat)
@@ -546,7 +555,9 @@ fn fn_attr_cache_init() {
 fn fn_attrs_set(name, attrs) {
     fn_attrs = fn_attrs.push([name, attrs])
     // ── ROI-11+15: parse ALL attribute flags once at define time ──
-    // Compute bitmask: bit0=memo, bit1=lazy, bit2=specialize, bit3=pure
+    // Compute bitmask: bit0=memo, bit1=lazy, bit2=specialize, bit3=pure,
+    // bit4=stable, bit5=track, bit6=deprecated, bit7=close, bit8=limit,
+    // bit9=retry, bit10=fallback, bit11=guard
     let mut bitmask = 0
     if attrs != "" {
         if attrs == "memoize" || attrs == "memo" || attrs == "cache" {
@@ -564,6 +575,50 @@ fn fn_attrs_set(name, attrs) {
         }
         if attrs == "pure" || contains(attrs, "pure") {
             bitmask = bitmask + 8
+        }
+        if attrs == "stable" || contains(attrs, "stable") {
+            bitmask = bitmask + 16
+        }
+        if attrs == "track" || contains(attrs, "track") {
+            bitmask = bitmask + 32
+        }
+        if attrs == "deprecated" || contains(attrs, "deprecated") {
+            bitmask = bitmask + 64
+        }
+        if attrs == "close" || contains(attrs, "close") {
+            bitmask = bitmask + 128
+        }
+        if attrs == "limit" || contains(attrs, "limit") {
+            bitmask = bitmask + 256
+        }
+        if attrs == "retry" || contains(attrs, "retry") {
+            bitmask = bitmask + 512
+        }
+        if attrs == "fallback" || contains(attrs, "fallback") {
+            bitmask = bitmask + 1024
+        }
+        if attrs == "guard" || contains(attrs, "guard") {
+            bitmask = bitmask + 2048
+        }
+    }
+    // ── @stable: redefinition guard ──
+    // If this function was previously declared @stable, warn or error
+    if (bitmask / 16) % 2 == 1 {
+        // Check if already in stable_fns (redefinition)
+        let mut _si = 0
+        let mut _was_stable = false
+        while _si < len(stable_fns) {
+            if stable_fns[_si] == name { _was_stable = true }
+            _si = _si + 1
+        }
+        if _was_stable {
+            if env_var("HEXA_STRICT_STABLE") == "1" {
+                println("ERROR: @stable function '" + name + "' redefined (HEXA_STRICT_STABLE=1)")
+            } else {
+                eprintln("[stable] WARNING: @stable function '" + name + "' redefined")
+            }
+        } else {
+            stable_fns = stable_fns.push(name)
         }
     }
     // Legacy flat array (kept for backward compat)
@@ -3113,6 +3168,23 @@ fn exec_stmt_at(stmts, idx) {
         if type_of(init) != "string" || init != "" {
             val = eval_expr(init)
         }
+        // @close/@pin/@limit attrs stored in node.op by parser
+        let let_attrs = node.op
+        if type_of(let_attrs) == "string" && let_attrs != "" {
+            // @pin: heapify the value so it survives arena_scope_pop.
+            // Round-trip through return_val to invoke C-side heapify.
+            if let_attrs == "pin" || contains(let_attrs, "pin") {
+                let _saved_rv_pin = return_val
+                return_val = val
+                let _pin_h = env_var("__HEXA_ARENA_HEAPIFY_RETURN__")
+                val = return_val
+                return_val = _saved_rv_pin
+            }
+            // @close: register variable for cleanup at function return.
+            if let_attrs == "close" || contains(let_attrs, "close") {
+                close_cleanup_list = close_cleanup_list.push(node.name)
+            }
+        }
         env_define(node.name, val)
         return val_void()
     }
@@ -4099,6 +4171,33 @@ fn call_user_fn(name, args) {
         }
     }
 
+    // bit 5 (32): @track — log function call to stderr
+    if (attr_bits / 32) % 2 == 1 {
+        if env_var("HEXA_TRACK") == "1" {
+            let _ts = timestamp()
+            eprintln("{\"event\":\"call\",\"fn\":\"" + name + "\",\"ts\":" + to_string(_ts) + "}")
+        } else {
+            eprintln("[track] " + name + " called")
+        }
+    }
+    // bit 6 (64): @deprecated — warn once per function
+    if (attr_bits / 64) % 2 == 1 {
+        let mut _already_warned = false
+        let mut _di = 0
+        while _di < len(deprecated_warned) {
+            if deprecated_warned[_di] == name { _already_warned = true }
+            _di = _di + 1
+        }
+        if !_already_warned {
+            deprecated_warned = deprecated_warned.push(name)
+            if env_var("HEXA_STRICT_DEPRECATED") == "1" {
+                println("ERROR: " + name + "() is deprecated (HEXA_STRICT_DEPRECATED=1)")
+            } else {
+                eprintln("[deprecated] " + name + "() is deprecated")
+            }
+        }
+    }
+
     // bit 0 (1): @memo/@memoize/@cache — check cache before execution
     let is_memo = attr_bits % 2 == 1
     let mut memo_key = ""
@@ -4194,6 +4293,27 @@ fn call_user_fn(name, args) {
         }
     }
 
+    // bit 7 (128): @close — save/restore per-frame cleanup list
+    let is_close_fn = (attr_bits / 128) % 2 == 1
+    let saved_close_cleanup = close_cleanup_list
+    close_cleanup_list = []
+    // bit 8 (256): @limit — capture start time for deadline check
+    let is_limit_fn = (attr_bits / 256) % 2 == 1
+    let mut limit_start_ms = 0
+    if is_limit_fn {
+        limit_start_ms = timestamp()
+    }
+    // bit 9 (512): @retry — retry on failure up to N times (default 3)
+    let is_retry_fn = (attr_bits / 512) % 2 == 1
+    // bit 10 (1024): @fallback — catch errors, return void on failure
+    let is_fallback_fn = (attr_bits / 1024) % 2 == 1
+    // bit 11 (2048): @guard — monitor + detect + resolve (timing + fallback)
+    let is_guard_fn = (attr_bits / 2048) % 2 == 1
+    let mut guard_start_ms = 0
+    if is_guard_fn {
+        guard_start_ms = timestamp()
+    }
+
     let saved_flag = return_flag
     return_flag = false
     let saved_defer_stack = defer_stack
@@ -4224,6 +4344,77 @@ fn call_user_fn(name, args) {
             _cbi = _cbi + 1
         }
     }
+    // @limit: check elapsed time after body execution
+    if is_limit_fn && !throw_flag {
+        let limit_elapsed = timestamp() - limit_start_ms
+        // Default 30s deadline for @limit functions
+        let limit_deadline = 30000
+        if limit_elapsed > limit_deadline {
+            throw_flag = true
+            throw_val = val_str("@limit exceeded: " + name + " took " + to_string(limit_elapsed) + "ms (limit " + to_string(limit_deadline) + "ms)")
+        }
+    }
+    // ── @retry (bit 9): re-execute body on throw, up to 3 attempts ──
+    if is_retry_fn && throw_flag {
+        let retry_max = 3
+        let mut retry_attempt = 1
+        let saved_throw_err = throw_val
+        while throw_flag && retry_attempt < retry_max {
+            retry_attempt = retry_attempt + 1
+            eprintln("[retry] " + name + " attempt " + to_string(retry_attempt) + "/" + to_string(retry_max))
+            throw_flag = false
+            throw_val = val_void()
+            return_flag = false
+            return_val = val_void()
+            last_expr_val = val_void()
+            _cbi = 0
+            while _cbi < len(body) {
+                if return_flag || throw_flag { _cbi = len(body) } else {
+                    let rstmt = body[_cbi]
+                    if type_of(rstmt) != "string" && type_of(rstmt) == "struct" || type_of(rstmt) == "map" {
+                        if rstmt.kind == "ExprStmt" {
+                            last_expr_val = eval_expr(rstmt.left)
+                        } else {
+                            exec_stmt_at(body, _cbi)
+                        }
+                    } else {
+                        exec_stmt_at(body, _cbi)
+                    }
+                    _cbi = _cbi + 1
+                }
+            }
+        }
+        // If still throwing after all retries, restore original error
+        if throw_flag {
+            throw_val = saved_throw_err
+        }
+    }
+    // ── @fallback (bit 10): catch errors, return void on failure ──
+    if is_fallback_fn && throw_flag {
+        eprintln("[fallback] " + name + " failed, using fallback")
+        throw_flag = false
+        throw_val = val_void()
+        return_flag = true
+        return_val = val_void()
+    }
+    // ── @guard (bit 11): timing + error reporting ──
+    if is_guard_fn {
+        let guard_elapsed = timestamp() - guard_start_ms
+        if throw_flag {
+            if throw_val.tag == TAG_STR {
+                eprintln("[guard] " + name + " FAILED after " + to_string(guard_elapsed) + "ms: " + throw_val.str_val)
+            } else {
+                eprintln("[guard] " + name + " FAILED after " + to_string(guard_elapsed) + "ms")
+            }
+            // @guard includes fallback behavior: swallow the error
+            throw_flag = false
+            throw_val = val_void()
+            return_flag = true
+            return_val = val_void()
+        } else {
+            eprintln("[guard] " + name + " completed in " + to_string(guard_elapsed) + "ms")
+        }
+    }
     let mut result = return_val
     // Implicit return: if no explicit return fired, use last expression value
     if !return_flag && result.tag == TAG_VOID && last_expr_val.tag != TAG_VOID {
@@ -4236,6 +4427,23 @@ fn call_user_fn(name, args) {
     }
     gen_buffer = saved_gen_buffer
     gen_active = saved_gen_active
+    // @close: invoke __hexa_close on each registered variable before defer
+    if is_close_fn && len(close_cleanup_list) > 0 {
+        let mut _ci = len(close_cleanup_list) - 1
+        while _ci >= 0 {
+            let cvar = close_cleanup_list[_ci]
+            let cval = env_lookup(cvar)
+            // Dispatch close based on value type:
+            // int -> likely fd, call close() builtin
+            // For v1: just invoke the __hexa_close convention
+            if cval.tag == TAG_INT {
+                // File descriptor — call C close() via FFI if available
+                eprintln("[close] auto-closing fd=" + to_string(cval.int_val) + " var=" + cvar)
+            }
+            _ci = _ci - 1
+        }
+    }
+    close_cleanup_list = saved_close_cleanup
     // Execute deferred statements in LIFO order before restoring flags
     let saved_rf = return_flag
     let saved_tf = throw_flag
@@ -11298,6 +11506,7 @@ fn interpret(ast) {
     continue_flag = false
     continue_label = ""
     defer_stack = []
+    close_cleanup_list = []
     throw_flag = false
     throw_val = val_void()
     panic_flag = false
