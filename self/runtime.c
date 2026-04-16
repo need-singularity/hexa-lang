@@ -184,6 +184,15 @@ HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
 HexaVal hexa_val_snapshot_array(HexaVal v);  // rt#32-N forward decl
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 HexaVal __hexa_range_array(HexaVal start, HexaVal end, int inclusive);
+HexaVal hexa_matvec(HexaVal w, HexaVal x, HexaVal rows_v, HexaVal cols_v);
+HexaVal hexa_math_abs(HexaVal x);
+HexaVal hexa_math_sqrt(HexaVal x);
+HexaVal hexa_math_floor(HexaVal x);
+HexaVal hexa_math_ceil(HexaVal x);
+HexaVal hexa_math_round(HexaVal x);
+HexaVal hexa_math_pow(HexaVal b, HexaVal e);
+HexaVal hexa_math_min(HexaVal a, HexaVal b);
+HexaVal hexa_math_max(HexaVal a, HexaVal b);
 
 // RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
 // path. Close Wint-conversion / Wpointer-arith categories in the
