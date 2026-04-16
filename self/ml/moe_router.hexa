@@ -1,0 +1,341 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/moe_router.hexa — pure-Hexa Mixture of Experts routing
+//
+//  Mixtral-style top-k MoE routing: gate network selects top-k
+//  experts per token, weighted combination of expert outputs.
+//
+//  API:
+//    moe_router_new(num_experts, hidden_dim, top_k) -> router dict
+//    moe_route(router, input) -> {expert_ids: [int], weights: [float]}
+//    moe_forward(router, experts, input) -> [float]
+//    moe_load_balance_loss(router, expert_counts) -> float
+//    softmax(logits) -> [float]
+//    topk_indices(arr, k) -> [int]
+//    expert_new(in_dim, out_dim) -> expert dict
+//    expert_forward(expert, input) -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  (softmax, routing, forward, loss)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn moe_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn moe_relu(v) {
+    if v > 0.0 { return v }
+    return 0.0
+}
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn moe_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn moe_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn moe_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn moe_uniform(state) {
+    let s = moe_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut out = moe_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = moe_exp(logits[i] - mx)
+        out[i] = e
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-12 }
+    for i in 0..n {
+        out[i] = out[i] / total
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Top-k indices — returns indices of k largest elements
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn topk_indices(arr, k) {
+    let n = len(arr)
+    let mut actual_k = k
+    if actual_k > n { actual_k = n }
+
+    // build index array
+    let mut indices = []
+    for i in 0..n { indices = indices + [i] }
+
+    // partial selection sort: find top-k by swapping largest to front
+    for i in 0..actual_k {
+        let mut best_idx = i
+        let mut best_val = arr[indices[i]]
+        for j in (i + 1)..n {
+            if arr[indices[j]] > best_val {
+                best_val = arr[indices[j]]
+                best_idx = j
+            }
+        }
+        if best_idx != i {
+            let tmp = indices[i]
+            indices[i] = indices[best_idx]
+            indices[best_idx] = tmp
+        }
+    }
+
+    // return first k indices
+    let mut result = []
+    for i in 0..actual_k {
+        result = result + [indices[i]]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Router creation
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn moe_router_new(num_experts, hidden_dim, top_k) {
+    // gate_weights: [num_experts][hidden_dim] random init
+    let mut gate_weights = moe_zeros_2d(num_experts, hidden_dim)
+    let mut s = 42
+    let scale = 1.0 / to_float(hidden_dim)
+    for i in 0..num_experts {
+        for j in 0..hidden_dim {
+            let u = moe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            gate_weights[i][j] = (u[0] - 0.5) * scale
+        }
+    }
+    return #{
+        "num_experts": num_experts,
+        "hidden_dim": hidden_dim,
+        "top_k": top_k,
+        "gate_weights": gate_weights
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Routing — compute gating scores, select top-k experts
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_route(router, input) {
+    let num_experts = router["num_experts"]
+    let top_k = router["top_k"]
+    let gate_weights = router["gate_weights"]
+    let hidden_dim = router["hidden_dim"]
+
+    // logits = gate_weights @ input  (matmul: [num_experts x hidden_dim] * [hidden_dim])
+    let mut logits = moe_zeros(num_experts)
+    for i in 0..num_experts {
+        let mut s = 0.0
+        for j in 0..hidden_dim {
+            s = s + gate_weights[i][j] * input[j]
+        }
+        logits[i] = s
+    }
+
+    // softmax over all experts
+    let probs = softmax(logits)
+
+    // select top-k
+    let expert_ids = topk_indices(probs, top_k)
+
+    // normalize weights of selected experts
+    let mut raw_weights = []
+    let mut weight_sum = 0.0
+    for i in 0..len(expert_ids) {
+        let w = probs[expert_ids[i]]
+        raw_weights.push(w)
+        weight_sum = weight_sum + w
+    }
+    if weight_sum <= 0.0 { weight_sum = 1.0e-12 }
+
+    let mut weights = []
+    for i in 0..len(raw_weights) {
+        weights.push(raw_weights[i] / weight_sum)
+    }
+
+    return #{
+        "expert_ids": expert_ids,
+        "weights": weights,
+        "all_probs": probs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Expert FFN: simple 2-layer with ReLU
+//    input -> W1 * input + bias -> ReLU -> W2 * hidden -> output
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn expert_new(in_dim, out_dim) {
+    let mut s = 7919
+    let scale1 = 1.0 / to_float(in_dim)
+    let scale2 = 1.0 / to_float(out_dim)
+
+    // W1: [out_dim x in_dim]
+    let mut w1 = moe_zeros_2d(out_dim, in_dim)
+    for i in 0..out_dim {
+        for j in 0..in_dim {
+            let u = moe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            w1[i][j] = (u[0] - 0.5) * scale1
+        }
+    }
+
+    // bias: [out_dim]
+    let bias = moe_zeros(out_dim)
+
+    // W2: [in_dim x out_dim]
+    let mut w2 = moe_zeros_2d(in_dim, out_dim)
+    for i in 0..in_dim {
+        for j in 0..out_dim {
+            let u = moe_uniform(s)
+            s = int(u[1])
+            if s <= 0 { s = 1 }
+            w2[i][j] = (u[0] - 0.5) * scale2
+        }
+    }
+
+    return #{
+        "w1": w1,
+        "w2": w2,
+        "bias": bias,
+        "in_dim": in_dim,
+        "out_dim": out_dim
+    }
+}
+
+@pure
+pub fn expert_forward(expert, input) {
+    let w1 = expert["w1"]
+    let w2 = expert["w2"]
+    let bias = expert["bias"]
+    let out_dim = expert["out_dim"]
+    let in_dim = expert["in_dim"]
+
+    // hidden = ReLU(W1 @ input + bias)
+    let mut hidden = moe_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = bias[i]
+        for j in 0..in_dim {
+            s = s + w1[i][j] * input[j]
+        }
+        hidden[i] = moe_relu(s)
+    }
+
+    // output = W2 @ hidden
+    let mut output = moe_zeros(in_dim)
+    for i in 0..in_dim {
+        let mut s = 0.0
+        for j in 0..out_dim {
+            s = s + w2[i][j] * hidden[j]
+        }
+        output[i] = s
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MoE Forward — route input, weighted sum of expert outputs
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_forward(router, experts, input) {
+    let route_result = moe_route(router, input)
+    let expert_ids = route_result["expert_ids"]
+    let weights = route_result["weights"]
+    let in_dim = len(input)
+
+    let mut output = moe_zeros(in_dim)
+
+    for idx in 0..len(expert_ids) {
+        let eid = expert_ids[idx]
+        let w = weights[idx]
+        let expert_out = expert_forward(experts[eid], input)
+        for j in 0..in_dim {
+            output[j] = output[j] + w * expert_out[j]
+        }
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Load balance loss — auxiliary loss to prevent expert collapse
+//
+//  L_bal = num_experts * sum_i (f_i * p_i)
+//  f_i = expert_counts[i] / total_tokens
+//  p_i = mean gate probability for expert i (approximated from counts)
+//
+//  Ideal: uniform distribution -> each f_i = 1/num_experts
+//  Loss is minimized when load is balanced across experts
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_load_balance_loss(router, expert_counts) {
+    let num_experts = router["num_experts"]
+    let n = len(expert_counts)
+
+    // total tokens routed
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + to_float(expert_counts[i])
+    }
+    if total <= 0.0 { return 0.0 }
+
+    // f_i = fraction of tokens routed to expert i
+    // p_i ~ f_i (approximate: gate probs correlate with routing frequency)
+    let mut loss = 0.0
+    for i in 0..n {
+        let f_i = to_float(expert_counts[i]) / total
+        let p_i = f_i
+        loss = loss + f_i * p_i
+    }
+
+    return to_float(num_experts) * loss
+}
