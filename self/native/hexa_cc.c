@@ -7642,6 +7642,16 @@ HexaVal _hexa_name_is_reserved(HexaVal s) {
     if (hexa_truthy(hexa_eq(s, hexa_str("goto")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
+    // runtime fn-shim variables that clash with user-defined functions
+    if (hexa_truthy(hexa_eq(s, hexa_str("matvec")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("parse_float")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(s, hexa_str("env")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
     return __hexa_fn_arena_return(hexa_bool(0));
     return __hexa_fn_arena_return(hexa_void());
 }
