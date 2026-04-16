@@ -7,27 +7,25 @@
 //   - Backing store is a hexa array (auto-grows, GC-managed) instead of
 //     malloc'd linked blocks. Each "block" is an array of slots.
 //   - Indices (ints) replace raw pointers. An "allocation" returns a
-//     {block_idx, offset, size} record — callers index into the arena
+//     [block_idx, offset, size] array — callers index into the arena
 //     to read/write slots rather than dereferencing C pointers.
 //   - No alignment concern — hexa arrays are value-typed, not byte buffers.
 //   - Scope push/pop uses a marks array instead of a fixed C stack.
+//
+// Record layout (array-based — avoids dict-return global contamination bug):
+//   allocation: [block_idx, offset, size]  — alloc[0], alloc[1], alloc[2]
+//   mark:       [block, used]              — mark[0], mark[1]
 //
 // Pitfalls honored:
 //   P1   no semicolons
 //   P15  let mut contamination — separate declarations, never chain
 //   P28  nil/true/false literals
+//   G5   dict return contaminates globals — use array records instead
 
 // ── Constants ────────────────────────────────────────────────────────
 let ARENA_BLOCK_SIZE = 4096
 
 // ── Arena state ──────────────────────────────────────────────────────
-// blocks: array of arrays — each sub-array is a flat slot buffer
-// block_used: parallel array tracking how many slots are consumed per block
-// cur_block: index of the current bump block
-// marks: array of {block, used} snapshots for mark/rewind
-// scope_marks: array of {block, used} snapshots for push_scope/pop_scope
-// total_allocs: cumulative allocation count (for stats/testing)
-
 let mut arena_blocks = []
 let mut arena_block_used = []
 let mut arena_cur_block = -1
@@ -42,7 +40,6 @@ fn arena_new_block(min_cap) {
     if cap < ARENA_BLOCK_SIZE {
         cap = ARENA_BLOCK_SIZE
     }
-    // Build a zero-filled array of `cap` slots
     let mut blk = []
     let mut i = 0
     while i < cap {
@@ -68,13 +65,11 @@ pub fn arena_init() {
 }
 
 // ── arena_alloc: bump-allocate `n` slots, return allocation record ───
-// Returns {block_idx, offset, size} or nil on failure.
-// The caller uses arena_read/arena_write to access slots.
+// Returns [block_idx, offset, size] or nil on failure.
 pub fn arena_alloc(n) {
     if n <= 0 { n = 1 }
     if arena_enabled == false { return nil }
 
-    // Ensure we have at least one block
     if arena_cur_block < 0 {
         arena_new_block(n)
     }
@@ -84,13 +79,11 @@ pub fn arena_alloc(n) {
     let cap = len(arena_blocks[cur])
 
     if used + n <= cap {
-        // Fast path: fits in current block
         arena_block_used[cur] = used + n
         arena_total_allocs = arena_total_allocs + 1
-        return {block_idx: cur, offset: used, size: n}
+        return [cur, used, n]
     }
 
-    // Current block full — try to find/reuse a later block with enough space
     let num_blocks = len(arena_blocks)
     let mut search = cur + 1
     while search < num_blocks {
@@ -99,54 +92,50 @@ pub fn arena_alloc(n) {
             arena_block_used[search] = n
             arena_cur_block = search
             arena_total_allocs = arena_total_allocs + 1
-            return {block_idx: search, offset: 0, size: n}
+            return [search, 0, n]
         }
         search = search + 1
     }
 
-    // No reusable block — allocate a new one
     let new_idx = arena_new_block(n)
     arena_block_used[new_idx] = n
     arena_total_allocs = arena_total_allocs + 1
-    return {block_idx: new_idx, offset: 0, size: n}
+    return [new_idx, 0, n]
 }
 
 // ── arena_read: read a value from an allocation ──────────────────────
 pub fn arena_read(alloc, idx) {
     if alloc == nil { return nil }
-    if idx < 0 || idx >= alloc.size { return nil }
-    return arena_blocks[alloc.block_idx][alloc.offset + idx]
+    if idx < 0 || idx >= alloc[2] { return nil }
+    return arena_blocks[alloc[0]][(alloc[1] + idx)]
 }
 
 // ── arena_write: write a value into an allocation ────────────────────
 pub fn arena_write(alloc, idx, val) {
     if alloc == nil { return nil }
-    if idx < 0 || idx >= alloc.size { return nil }
-    arena_blocks[alloc.block_idx][alloc.offset + idx] = val
+    if idx < 0 || idx >= alloc[2] { return nil }
+    arena_blocks[alloc[0]][(alloc[1] + idx)] = val
     return val
 }
 
 // ── arena_mark: save current allocation frontier ─────────────────────
-// Returns a mark record. Pair with arena_rewind.
+// Returns [block, used] mark record. Pair with arena_rewind.
 pub fn arena_mark() {
     let cur = arena_cur_block
     let used = 0
     if cur >= 0 {
         used = arena_block_used[cur]
     }
-    let m = {block: cur, used: used}
+    let m = [cur, used]
     arena_marks = arena_marks.push(m)
     return m
 }
 
 // ── arena_rewind: restore arena to a previously captured mark ────────
-// O(1) logical free. Blocks after the mark block are zeroed-used but
-// remain allocated for reuse (matching C behavior).
 pub fn arena_rewind(m) {
     if m == nil { return nil }
 
-    if m.block < 0 {
-        // Mark predates any allocation — full reset
+    if m[0] < 0 {
         let num = len(arena_block_used)
         let mut i = 0
         while i < num {
@@ -159,16 +148,14 @@ pub fn arena_rewind(m) {
         return nil
     }
 
-    // Restore the marked block's used count
-    arena_block_used[m.block] = m.used
-    // Zero all blocks after the mark block
+    arena_block_used[m[0]] = m[1]
     let num = len(arena_block_used)
-    let mut i = m.block + 1
+    let mut i = m[0] + 1
     while i < num {
         arena_block_used[i] = 0
         i = i + 1
     }
-    arena_cur_block = m.block
+    arena_cur_block = m[0]
     return nil
 }
 
@@ -188,24 +175,21 @@ pub fn arena_reset() {
 }
 
 // ── arena_push_scope: push current frontier as scope mark ────────────
-// Used for function call frames. Pair with arena_pop_scope.
 pub fn arena_push_scope() {
     let cur = arena_cur_block
     let used = 0
     if cur >= 0 {
         used = arena_block_used[cur]
     }
-    arena_scope_marks = arena_scope_marks.push({block: cur, used: used})
+    arena_scope_marks = arena_scope_marks.push([cur, used])
 }
 
 // ── arena_pop_scope: pop scope mark and rewind arena ─────────────────
-// Callers must have copied any escaping values BEFORE popping.
 pub fn arena_pop_scope() {
     let depth = len(arena_scope_marks)
     if depth <= 0 { return nil }
 
     let m = arena_scope_marks[depth - 1]
-    // Remove last element by rebuilding without it
     let mut new_marks = []
     let mut i = 0
     while i < depth - 1 {
@@ -214,8 +198,7 @@ pub fn arena_pop_scope() {
     }
     arena_scope_marks = new_marks
 
-    if m.block < 0 {
-        // Scope predates any allocation — full reset
+    if m[0] < 0 {
         let num = len(arena_block_used)
         let mut j = 0
         while j < num {
@@ -228,14 +211,14 @@ pub fn arena_pop_scope() {
         return nil
     }
 
-    arena_block_used[m.block] = m.used
+    arena_block_used[m[0]] = m[1]
     let num = len(arena_block_used)
-    let mut j = m.block + 1
+    let mut j = m[0] + 1
     while j < num {
         arena_block_used[j] = 0
         j = j + 1
     }
-    arena_cur_block = m.block
+    arena_cur_block = m[0]
     return nil
 }
 
