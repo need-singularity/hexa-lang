@@ -1518,7 +1518,19 @@ HexaVal hexa_index_get(HexaVal container, HexaVal key) {
     if (HX_IS_MAP(container) && HX_IS_STR(key)) {
         return hexa_map_get(container, HX_STR(key));
     }
-    return hexa_array_get(container, HX_INT(key));
+    // 2026-04-17: unwrap interpreter Val wrapper (TAG_VALSTRUCT) so HX_INT
+    // doesn't read .vs as a pointer-as-int garbage index. Same root as the
+    // hexa_cmp_* fix — without this, val_int's `__VAL_INT_CACHE[n]` lookup
+    // OOB-aborted when n was a wrapped Val.
+    int64_t idx;
+    if (HX_IS_VALSTRUCT(key) && HX_VS(key)) {
+        idx = (HX_VSF(key, tag_i) == TAG_INT)
+            ? HX_VSF(key, int_val)
+            : (int64_t)__hx_to_double(key);
+    } else {
+        idx = HX_INT(key);
+    }
+    return hexa_array_get(container, idx);
 }
 
 // For-in dispatch: array -> element, map -> key as string.
@@ -2073,6 +2085,16 @@ static HexaMapTable* hmap_heapify(HexaMapTable* src) {
 // (INT/FLOAT/BOOL/VOID) are returned as-is. TAG_FN / TAG_VALSTRUCT / TAG_CLOSURE
 // retain their pointer identity (those allocators don't currently use the
 // arena, so heapify is a no-op for them).
+// Valid heap/arena pointers on macOS/Linux live well above the NULL page.
+// Any pointer under 0x1000 is a sign of corrupted Val slot (small-int bleed
+// through the union, uninitialized stack, or freed memory with zeroed bits).
+// Treat as no-op rather than dereferencing garbage.
+// 2026-04-17: codegen_c2_extended driver repro produced recursive heapify
+// calls with v.arr_ptr / v.vs / v.map_ptr = 0x0E causing SIGSEGV at offset
+// +504 of hexa_val_heapify. Root cause is upstream Val corruption but the
+// fault mode (sub-page deref) is easy to guard here.
+#define HX_PTR_OK(p) ((uintptr_t)(p) >= 0x1000)
+
 HexaVal hexa_val_heapify(HexaVal v) {
     switch (HX_TAG(v)) {
         case TAG_MAP:
@@ -2141,13 +2163,7 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // fib hot path) to malloc'd storage. Polymorphic field slots are
             // recursively heapified — closure bodies / param arrays / nested
             // structs all need the same treatment.
-            // 2026-04-17 guard: codegen_c2_extended driver repro produced
-            // v.vs = 0x0E (sub-page garbage pointer) reaching this case.
-            // Previously caused SIGSEGV at HX_VSF deref. Skip heapify when
-            // pointer is obviously invalid — best-effort, same intent as the
-            // NULL check above. Sub-page guard (< 0x1000) catches small-int
-            // bleed-through without blocking real arena/heap pointers.
-            if (!HX_VS(v) || (uintptr_t)HX_VS(v) < 0x1000) return v;
+            if (!HX_PTR_OK(HX_VS(v))) return v;
             if (HX_VSF(v, from_arena)) {
                 HexaValStruct* dst = (HexaValStruct*)malloc(sizeof(HexaValStruct));
                 if (!dst) return v;  // OOM — caller will see arena pointer (best-effort)
@@ -3020,23 +3036,29 @@ HexaVal hexa_mod(HexaVal a, HexaVal b) {
 
 // ROI-44: comparison runtime helpers — replace inline GCC stmt-expr in codegen.
 // Semantics: TAG_FLOAT promotes to double compare; TAG_INT uses int64 compare.
+// 2026-04-17: TAG_VALSTRUCT (interpreter Val wrapper) routes through
+// __hx_to_double so wrapped ints compare on the inner value rather than
+// HX_INT(v) reading the .vs pointer as garbage. Symptom before fix:
+// `let x = 5; let z = 1 + x` returned 0xA00000005 because val_int's cache
+// range check `n < __VAL_INT_CACHE_LEN` mis-evaluated when one side was
+// a wrapped Val from the cached singleton table.
 HexaVal hexa_cmp_lt(HexaVal a, HexaVal b) {
-    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) < __hx_to_double(b));
     return hexa_bool(HX_INT(a) < HX_INT(b));
 }
 HexaVal hexa_cmp_gt(HexaVal a, HexaVal b) {
-    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) > __hx_to_double(b));
     return hexa_bool(HX_INT(a) > HX_INT(b));
 }
 HexaVal hexa_cmp_le(HexaVal a, HexaVal b) {
-    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) <= __hx_to_double(b));
     return hexa_bool(HX_INT(a) <= HX_INT(b));
 }
 HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
-    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b))
+    if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) >= __hx_to_double(b));
     return hexa_bool(HX_INT(a) >= HX_INT(b));
 }

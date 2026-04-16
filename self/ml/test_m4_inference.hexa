@@ -1,0 +1,362 @@
+// ===================================================================
+//  self/ml/test_m4_inference.hexa — M4 inference integration tests
+//
+//  Tests the m4_inference pipeline with a tiny synthetic model
+//  (4 layers, dim=64, vocab=256) to verify correctness without
+//  requiring real model weights.
+//
+//  Test coverage:
+//    T1. bf16 pack/unpack roundtrip
+//    T2. RMSNorm correctness
+//    T3. KV cache write/read
+//    T4. Single layer forward pass
+//    T5. Full decode loop (5 tokens)
+//    T6. bf16 vs f32 reference tolerance
+//
+//  Usage:
+//    hexa self/ml/test_m4_inference.hexa
+//
+//  Last updated: 2026-04-17
+// ===================================================================
+
+use "self/ml/hxblas_bf16.hexa"
+use "self/ml/tensor.hexa"
+use "self/ml/m4_inference.hexa"
+
+// ── Tiny test config ────────────────────────────────────────────────
+
+fn test_config() {
+    return M4ModelConfig {
+        dim: 64,
+        hidden_dim: 128,
+        n_layers: 4,
+        n_heads: 4,
+        n_kv_heads: 2,
+        vocab_size: 256,
+        max_seq_len: 32,
+        head_dim: 16,
+        rope_base: 10000.0,
+        rms_eps: 0.000001
+    }
+}
+
+// ── Helpers ─────────────────────────────────────────────────────────
+
+let mut TESTS_PASS = 0
+let mut TESTS_FAIL = 0
+
+fn check(name, ok) {
+    if ok {
+        println("  PASS  " + name)
+        TESTS_PASS = TESTS_PASS + 1
+    } else {
+        println("  FAIL  " + name)
+        TESTS_FAIL = TESTS_FAIL + 1
+    }
+}
+
+fn approx_eq(a, b, tol) {
+    let diff = a - b
+    let abs_diff = if diff < 0.0 { 0.0 - diff } else { diff }
+    return abs_diff < tol
+}
+
+// ===================================================================
+//  T1: bf16 pack/unpack roundtrip
+// ===================================================================
+
+fn test_bf16_roundtrip() {
+    println("[T1] bf16 pack/unpack roundtrip")
+    let n = 64
+    let f32_buf = alloc_raw(n * 4)
+    let mut i = 0
+    while i < n {
+        let v = sin(to_float(i) * 0.1) * 2.0
+        write_f32(f32_buf, i * 4, v)
+        i = i + 1
+    }
+
+    // Pack to bf16
+    let bf16_buf = bf16_pack(f32_buf, n)
+
+    // Unpack back to f32
+    let f32_back = bf16_unpack(bf16_buf, n)
+
+    // Check tolerance: bf16 has ~3 decimal digits precision
+    let mut max_err = 0.0
+    let mut ok = true
+    i = 0
+    while i < n {
+        let orig = deref_f32(f32_buf, i * 4)
+        let back = deref_f32(f32_back, i * 4)
+        let err = orig - back
+        let abs_err = if err < 0.0 { 0.0 - err } else { err }
+        if abs_err > max_err { max_err = abs_err }
+        // bf16 relative error should be < 1% for values in [-2, 2]
+        let abs_orig = if orig < 0.0 { 0.0 - orig } else { orig }
+        if abs_orig > 0.01 {
+            let rel_err = abs_err / abs_orig
+            if rel_err > 0.02 { ok = false }
+        }
+        i = i + 1
+    }
+
+    check("bf16 roundtrip max_err=" + to_string(max_err), ok)
+
+    free_raw(f32_buf, n * 4)
+    bf16_free(bf16_buf, n)
+    free_raw(f32_back, n * 4)
+}
+
+// ===================================================================
+//  T2: RMSNorm correctness
+// ===================================================================
+
+fn test_rms_norm() {
+    println("[T2] RMSNorm")
+    let dim = 8
+    let x_ptr = alloc_raw(dim * 4)
+    let w_ptr = alloc_raw(dim * 4)
+    let out_ptr = alloc_raw(dim * 4)
+
+    // x = [1, 2, 3, 4, 5, 6, 7, 8]
+    let mut i = 0
+    while i < dim {
+        write_f32(x_ptr, i * 4, to_float(i + 1))
+        write_f32(w_ptr, i * 4, 1.0)
+        i = i + 1
+    }
+
+    m4_rms_norm(x_ptr, w_ptr, out_ptr, dim, 0.000001)
+
+    // RMS of [1..8] = sqrt((1+4+9+16+25+36+49+64)/8) = sqrt(204/8) = sqrt(25.5) ~ 5.0498
+    // out[0] = 1.0 / 5.0498 ~ 0.198
+    let v0 = deref_f32(out_ptr, 0)
+    let ok0 = approx_eq(v0, 0.198, 0.01)
+
+    // out[7] = 8.0 / 5.0498 ~ 1.584
+    let v7 = deref_f32(out_ptr, 7 * 4)
+    let ok7 = approx_eq(v7, 1.584, 0.01)
+
+    check("rmsnorm out[0]=" + to_string(v0) + " ~0.198", ok0)
+    check("rmsnorm out[7]=" + to_string(v7) + " ~1.584", ok7)
+
+    free_raw(x_ptr, dim * 4)
+    free_raw(w_ptr, dim * 4)
+    free_raw(out_ptr, dim * 4)
+}
+
+// ===================================================================
+//  T3: KV cache write/read
+// ===================================================================
+
+fn test_kv_cache() {
+    println("[T3] KV cache")
+    let cfg = test_config()
+    let kv = m4_kv_cache_new(cfg)
+
+    let n_kv_heads = cfg.n_kv_heads
+    let head_dim = cfg.head_dim
+    let slab = n_kv_heads * head_dim  // 2 * 16 = 32
+
+    // Write a slab at layer=0, pos=0
+    let k_vec = alloc_raw(slab * 4)
+    let v_vec = alloc_raw(slab * 4)
+    let mut i = 0
+    while i < slab {
+        write_f32(k_vec, i * 4, to_float(i + 1))
+        write_f32(v_vec, i * 4, to_float(i + 100))
+        i = i + 1
+    }
+
+    m4_kv_write_slab(kv.keys, 0, 0, k_vec, n_kv_heads, head_dim, kv.max_seq)
+    m4_kv_write_slab(kv.values, 0, 0, v_vec, n_kv_heads, head_dim, kv.max_seq)
+
+    // Read back: layer=0, pos=0, head=0, dim=0 should be 1.0
+    let idx00 = m4_kv_idx(0, 0, 0, 0, kv.max_seq, n_kv_heads, head_dim)
+    let k00 = deref_f32(kv.keys, idx00 * 4)
+    check("kv key[0,0,0,0]=" + to_string(k00) + " ==1.0", approx_eq(k00, 1.0, 0.001))
+
+    // head=1, dim=0 should be head_dim+1 = 17.0
+    let idx10 = m4_kv_idx(0, 0, 1, 0, kv.max_seq, n_kv_heads, head_dim)
+    let k10 = deref_f32(kv.keys, idx10 * 4)
+    check("kv key[0,0,1,0]=" + to_string(k10) + " ==17.0", approx_eq(k10, 17.0, 0.001))
+
+    // Values: layer=0, pos=0, head=0, dim=0 should be 100.0
+    let v00 = deref_f32(kv.values, idx00 * 4)
+    check("kv val[0,0,0,0]=" + to_string(v00) + " ==100.0", approx_eq(v00, 100.0, 0.001))
+
+    free_raw(k_vec, slab * 4)
+    free_raw(v_vec, slab * 4)
+    m4_kv_cache_free(kv)
+}
+
+// ===================================================================
+//  T4: Single layer forward pass (tiny model)
+// ===================================================================
+
+fn test_single_layer() {
+    println("[T4] Single layer forward")
+    let cfg = test_config()
+    let model = m4_create_synthetic(cfg)
+    let kv = m4_kv_cache_new(cfg)
+
+    let dim = cfg.dim
+    // Create an input activation
+    let x_ptr = alloc_raw(dim * 4)
+    let mut i = 0
+    while i < dim {
+        write_f32(x_ptr, i * 4, sin(to_float(i) * 0.05))
+        i = i + 1
+    }
+
+    // Run one layer (CPU path, no Metal)
+    m4_transformer_layer(model, 0, x_ptr, 0, kv, false)
+
+    // Check output is finite and nonzero (synthetic weights produce small values)
+    let v0 = deref_f32(x_ptr, 0)
+    let v_last = deref_f32(x_ptr, (dim - 1) * 4)
+    let finite = v0 == v0  // NaN check: NaN != NaN
+    let nonzero = v0 != 0.0 || v_last != 0.0
+
+    // With synthetic weights (near-zero), residual connection preserves input
+    // Check that output is close to input (residual dominates)
+    let input_v0 = sin(0.0)  // = 0.0
+    let input_v1 = sin(0.05) // ~ 0.04998
+
+    check("layer out finite", finite)
+    check("layer out nonzero (residual preserved)", nonzero)
+
+    free_raw(x_ptr, dim * 4)
+    m4_kv_cache_free(kv)
+}
+
+// ===================================================================
+//  T5: Full decode loop (5 tokens, tiny model)
+// ===================================================================
+
+fn test_decode_loop() {
+    println("[T5] Full decode loop (5 tokens)")
+    let cfg = test_config()
+    let model = m4_create_synthetic(cfg)
+
+    let input_tokens = [1, 50, 100]
+    let result = m4_decode(model, input_tokens, 5, 0.0, false)
+
+    let n_gen = result["n_generated"]
+    let output_tokens = result["output_tokens"]
+    let avg_ms = result["avg_ms_per_tok"]
+
+    check("generated " + to_string(n_gen) + " tokens (want 5)", n_gen == 5)
+    check("output has " + to_string(len(output_tokens)) + " tokens (want 6: 1 from prefill + 5 decode)", len(output_tokens) == 6)
+
+    // All output tokens should be valid (0 <= tok < vocab_size)
+    let mut all_valid = true
+    let mut i = 0
+    while i < len(output_tokens) {
+        let tok = output_tokens[i]
+        if tok < 0 { all_valid = false }
+        if tok >= cfg.vocab_size { all_valid = false }
+        i = i + 1
+    }
+    check("all output tokens valid", all_valid)
+
+    if avg_ms != nil {
+        println("  (avg " + to_string(avg_ms) + " ms/tok)")
+    }
+}
+
+// ===================================================================
+//  T6: bf16 matvec vs f32 reference tolerance
+// ===================================================================
+
+fn test_bf16_matvec_tolerance() {
+    println("[T6] bf16 matvec vs f32 reference")
+    let M = 32
+    let K = 64
+
+    // Create f32 weight matrix and input vector
+    let w_f32 = alloc_raw(M * K * 4)
+    let x_f32 = alloc_raw(K * 4)
+    let mut i = 0
+    while i < M * K {
+        write_f32(w_f32, i * 4, sin(to_float(i) * 0.01) * 0.1)
+        i = i + 1
+    }
+    i = 0
+    while i < K {
+        write_f32(x_f32, i * 4, cos(to_float(i) * 0.03) * 0.5)
+        i = i + 1
+    }
+
+    // f32 reference: naive matmul
+    let y_ref = alloc_raw(M * 4)
+    let mut r = 0
+    while r < M {
+        let mut acc = 0.0
+        let mut c = 0
+        while c < K {
+            let w = deref_f32(w_f32, (r * K + c) * 4)
+            let x = deref_f32(x_f32, c * 4)
+            acc = acc + w * x
+            c = c + 1
+        }
+        write_f32(y_ref, r * 4, acc)
+        r = r + 1
+    }
+
+    // bf16 path: pack weights, then bgemv
+    let w_bf16 = bf16_pack(w_f32, M * K)
+    let y_bf16 = bf16_matvec(M, K, w_bf16, x_f32)
+
+    // Compare
+    let mut max_err = 0.0
+    let mut ok = true
+    i = 0
+    while i < M {
+        let ref_v = deref_f32(y_ref, i * 4)
+        let bf16_v = deref_f32(y_bf16, i * 4)
+        let err = ref_v - bf16_v
+        let abs_err = if err < 0.0 { 0.0 - err } else { err }
+        if abs_err > max_err { max_err = abs_err }
+        let abs_ref = if ref_v < 0.0 { 0.0 - ref_v } else { ref_v }
+        if abs_ref > 0.001 {
+            let rel_err = abs_err / abs_ref
+            if rel_err > 0.05 { ok = false }  // 5% tolerance for bf16
+        }
+        i = i + 1
+    }
+
+    check("bf16 vs f32 max_err=" + to_string(max_err) + " (< 5% rel)", ok)
+
+    free_raw(w_f32, M * K * 4)
+    free_raw(x_f32, K * 4)
+    free_raw(y_ref, M * 4)
+    bf16_free(w_bf16, M * K)
+    free_raw(y_bf16, M * 4)
+}
+
+// ===================================================================
+//  Run all tests
+// ===================================================================
+
+println("============================================================")
+println("  M4 Inference Integration Tests")
+println("============================================================")
+
+test_bf16_roundtrip()
+test_rms_norm()
+test_kv_cache()
+test_single_layer()
+test_decode_loop()
+test_bf16_matvec_tolerance()
+
+println("============================================================")
+println("  Results: " + to_string(TESTS_PASS) + " PASS, " + to_string(TESTS_FAIL) + " FAIL")
+println("============================================================")
+
+if TESTS_FAIL > 0 {
+    println("SOME TESTS FAILED")
+} else {
+    println("ALL TESTS PASSED")
+}

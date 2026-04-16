@@ -1,0 +1,372 @@
+// ===============================================================
+//  self/ml/test_hxmetal.hexa -- hxmetal smoke tests
+//
+//  Verifies: version probe, matmul correctness, FFN forward,
+//  buffer create/write/read/free cycle.
+//
+//  Run (concatenate bindings + test for interpreter compatibility):
+//    cat self/ml/hxmetal.hexa self/ml/test_hxmetal.hexa > /tmp/hxmetal_combined.hexa
+//    DYLD_LIBRARY_PATH=self/native/build hexa run /tmp/hxmetal_combined.hexa
+//
+//  Build libhxmetal.dylib first:
+//    hexa scripts/build_hxmetal.hexa
+// ===============================================================
+
+// NOTE: requires hxmetal.hexa to be concatenated before this file,
+// or run via native codegen path. The interpreter does not resolve
+// `import "ml/hxmetal.hexa"` at runtime.
+
+fn abs_f(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn assert_close(name, got, want, tol) {
+    if abs_f(got - want) > tol {
+        eprintln("FAIL " + name + ": got=" + str(got) + " want=" + str(want) + " diff=" + str(abs_f(got - want)))
+        return false
+    }
+    return true
+}
+
+// -- T1: Version check -------------------------------------------
+fn test_version() {
+    println("T1: version check")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available (rc=" + str(rc) + ")")
+        return true
+    }
+    let ver = hxmetal_version()
+    if ver < 1 {
+        eprintln("  FAIL -- version=" + str(ver) + " want >=1")
+        return false
+    }
+    println("  PASS version=" + str(ver))
+    return true
+}
+
+// -- T2: Small matmul (4x4) correctness --------------------------
+fn test_matmul_4x4() {
+    println("T2: matmul 4x4 correctness")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available")
+        return true
+    }
+
+    // A = [[1,2,3,4],[5,6,7,8],[9,10,11,12],[13,14,15,16]]
+    // B = identity 4x4
+    // C should equal A
+    let M = 4
+    let K = 4
+    let N = 4
+
+    let a_bytes = M * K * 4
+    let b_bytes = K * N * 4
+    let c_bytes = M * N * 4
+
+    let a_buf = alloc_raw(a_bytes)
+    let b_buf = alloc_raw(b_bytes)
+    let c_buf = alloc_raw(c_bytes)
+
+    // Fill A: row-major 1..16
+    let mut val = 1.0
+    for i in 0..M {
+        for j in 0..K {
+            write_f32(a_buf, (i * K + j) * 4, val)
+            val = val + 1.0
+        }
+    }
+
+    // Fill B: identity
+    for i in 0..K {
+        for j in 0..N {
+            if i == j {
+                write_f32(b_buf, (i * N + j) * 4, 1.0)
+            } else {
+                write_f32(b_buf, (i * N + j) * 4, 0.0)
+            }
+        }
+    }
+
+    let matmul_rc = hxmetal_matmul(M, K, N, a_buf, b_buf, c_buf)
+    if matmul_rc != 0 {
+        eprintln("  FAIL -- matmul returned " + str(matmul_rc))
+        free_raw(a_buf, a_bytes)
+        free_raw(b_buf, b_bytes)
+        free_raw(c_buf, c_bytes)
+        return false
+    }
+
+    // Verify C == A (since B is identity)
+    let mut ok = true
+    let mut check_val = 1.0
+    for i in 0..M {
+        for j in 0..N {
+            let got = deref_f32(c_buf, (i * N + j) * 4)
+            if !assert_close("C[" + str(i) + "," + str(j) + "]", got, check_val, 0.01) {
+                ok = false
+            }
+            check_val = check_val + 1.0
+        }
+    }
+
+    free_raw(a_buf, a_bytes)
+    free_raw(b_buf, b_bytes)
+    free_raw(c_buf, c_bytes)
+
+    if ok {
+        println("  PASS")
+    }
+    return ok
+}
+
+// -- T3: Non-trivial matmul [[1,2],[3,4]] * [[5,6],[7,8]] --------
+fn test_matmul_2x2() {
+    println("T3: matmul 2x2 non-trivial")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available")
+        return true
+    }
+
+    // A = [[1,2],[3,4]], B = [[5,6],[7,8]]
+    // C = [[1*5+2*7, 1*6+2*8], [3*5+4*7, 3*6+4*8]]
+    //   = [[19, 22], [43, 50]]
+    let M = 2
+    let K = 2
+    let N = 2
+    let bytes = M * K * 4
+
+    let a_buf = alloc_raw(bytes)
+    let b_buf = alloc_raw(bytes)
+    let c_buf = alloc_raw(bytes)
+
+    write_f32(a_buf, 0,  1.0)
+    write_f32(a_buf, 4,  2.0)
+    write_f32(a_buf, 8,  3.0)
+    write_f32(a_buf, 12, 4.0)
+
+    write_f32(b_buf, 0,  5.0)
+    write_f32(b_buf, 4,  6.0)
+    write_f32(b_buf, 8,  7.0)
+    write_f32(b_buf, 12, 8.0)
+
+    hxmetal_matmul(M, K, N, a_buf, b_buf, c_buf)
+
+    let mut ok = true
+    ok = assert_close("C[0,0]", deref_f32(c_buf, 0),  19.0, 0.1) && ok
+    ok = assert_close("C[0,1]", deref_f32(c_buf, 4),  22.0, 0.1) && ok
+    ok = assert_close("C[1,0]", deref_f32(c_buf, 8),  43.0, 0.1) && ok
+    ok = assert_close("C[1,1]", deref_f32(c_buf, 12), 50.0, 0.1) && ok
+
+    free_raw(a_buf, bytes)
+    free_raw(b_buf, bytes)
+    free_raw(c_buf, bytes)
+
+    if ok {
+        println("  PASS")
+    }
+    return ok
+}
+
+// -- T4: Buffer create/write/read/free cycle ----------------------
+fn test_buffer_cycle() {
+    println("T4: buffer create/write/read/free")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available")
+        return true
+    }
+
+    let size = 256
+    let handle_val = hxmetal_buf_create(size)
+    if handle_val == 0 {
+        eprintln("  FAIL -- buf_create returned 0")
+        return false
+    }
+
+    // Write pattern to buffer
+    let src = alloc_raw(size)
+    for i in 0..64 {
+        write_f32(src, i * 4, (i * 1.0) + 0.5)
+    }
+    let wrc = hxmetal_buf_write(handle_val, src, size)
+    if wrc != 0 {
+        eprintln("  FAIL -- buf_write returned " + str(wrc))
+        free_raw(src, size)
+        return false
+    }
+
+    // Read back
+    let dst = alloc_raw(size)
+    let rrc = hxmetal_buf_read(handle_val, dst, size)
+    if rrc != 0 {
+        eprintln("  FAIL -- buf_read returned " + str(rrc))
+        free_raw(src, size)
+        free_raw(dst, size)
+        return false
+    }
+
+    // Verify
+    let mut ok = true
+    for i in 0..64 {
+        let want = (i * 1.0) + 0.5
+        let got = deref_f32(dst, i * 4)
+        if !assert_close("buf[" + str(i) + "]", got, want, 0.001) {
+            ok = false
+        }
+    }
+
+    let frc = hxmetal_buf_free(handle_val)
+    if frc != 0 {
+        eprintln("  FAIL -- buf_free returned " + str(frc))
+        ok = false
+    }
+
+    free_raw(src, size)
+    free_raw(dst, size)
+
+    if ok {
+        println("  PASS")
+    }
+    return ok
+}
+
+// -- T5: FFN forward smoke ----------------------------------------
+fn test_ffn_fwd() {
+    println("T5: FFN forward smoke")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available")
+        return true
+    }
+
+    // Small dims: batch=2, d_model=4, d_ff=8
+    let batch = 2
+    let d_model = 4
+    let d_ff = 8
+
+    let x_bytes  = batch * d_model * 4
+    let w1_bytes = d_model * d_ff * 4
+    let w2_bytes = d_ff * d_model * 4
+    let y_bytes  = batch * d_model * 4
+
+    let x_buf  = alloc_raw(x_bytes)
+    let w1_buf = alloc_raw(w1_bytes)
+    let w2_buf = alloc_raw(w2_bytes)
+    let y_buf  = alloc_raw(y_bytes)
+
+    // Fill X with 0.1
+    for i in 0..(batch * d_model) {
+        write_f32(x_buf, i * 4, 0.1)
+    }
+
+    // Fill W1 with small values
+    for i in 0..(d_model * d_ff) {
+        write_f32(w1_buf, i * 4, 0.01)
+    }
+
+    // Fill W2 with small values
+    for i in 0..(d_ff * d_model) {
+        write_f32(w2_buf, i * 4, 0.01)
+    }
+
+    let frc = hxmetal_ffn_fwd(d_model, d_ff, batch, w1_buf, w2_buf, x_buf, y_buf)
+    if frc != 0 {
+        eprintln("  FAIL -- ffn_fwd returned " + str(frc))
+        free_raw(x_buf, x_bytes)
+        free_raw(w1_buf, w1_bytes)
+        free_raw(w2_buf, w2_bytes)
+        free_raw(y_buf, y_bytes)
+        return false
+    }
+
+    // Just verify output is finite and non-zero (smoke only)
+    let mut ok = true
+    let mut any_nonzero = false
+    for i in 0..(batch * d_model) {
+        let v = deref_f32(y_buf, i * 4)
+        if v != v {
+            // NaN check
+            eprintln("  FAIL -- Y[" + str(i) + "] is NaN")
+            ok = false
+        }
+        if abs_f(v) > 0.0000001 {
+            any_nonzero = true
+        }
+    }
+
+    // With small positive inputs and GELU, output should be small but non-zero
+    // (GELU(0.004) ~ 0.002, then *W2 gives ~tiny values)
+    // Accept zero or tiny as valid for this smoke
+
+    free_raw(x_buf, x_bytes)
+    free_raw(w1_buf, w1_bytes)
+    free_raw(w2_buf, w2_bytes)
+    free_raw(y_buf, y_bytes)
+
+    if ok {
+        println("  PASS (output finite" + (if any_nonzero { ", non-zero" } else { ", near-zero" }) + ")")
+    }
+    return ok
+}
+
+// -- T6: high-level metal_matmul_2d ------------------------------
+fn test_matmul_2d_api() {
+    println("T6: metal_matmul_2d high-level API")
+    let rc = metal_init()
+    if rc != 0 {
+        println("  SKIP -- Metal not available")
+        return true
+    }
+
+    let A = [[1.0, 2.0], [3.0, 4.0]]
+    let B = [[5.0, 6.0], [7.0, 8.0]]
+    let C = metal_matmul_2d(A, B, 2, 2, 2)
+
+    if len(C) == 0 {
+        eprintln("  FAIL -- empty result")
+        return false
+    }
+
+    let mut ok = true
+    ok = assert_close("C[0][0]", C[0][0], 19.0, 0.1) && ok
+    ok = assert_close("C[0][1]", C[0][1], 22.0, 0.1) && ok
+    ok = assert_close("C[1][0]", C[1][0], 43.0, 0.1) && ok
+    ok = assert_close("C[1][1]", C[1][1], 50.0, 0.1) && ok
+
+    if ok {
+        println("  PASS")
+    }
+    return ok
+}
+
+// -- main ---------------------------------------------------------
+fn main() {
+    println("== hxmetal smoke tests ==")
+    let mut pass = 0
+    let mut fail = 0
+    let mut skip = 0
+
+    let tests = [test_version, test_matmul_4x4, test_matmul_2x2,
+                 test_buffer_cycle, test_ffn_fwd, test_matmul_2d_api]
+
+    for t in tests {
+        let ok = t()
+        if ok {
+            pass = pass + 1
+        } else {
+            fail = fail + 1
+        }
+    }
+
+    println("")
+    println("== " + str(pass) + " PASS, " + str(fail) + " FAIL ==")
+    if fail > 0 {
+        exit(1)
+    }
+}
+
+main()

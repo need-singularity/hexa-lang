@@ -126,7 +126,14 @@ int64_t hxmetal_init(void) {
     // Compile shader library
     NSString *source = hxmetal_shader_source();
     MTLCompileOptions *opts = [[MTLCompileOptions alloc] init];
-    opts.fastMathEnabled = YES;
+    if (@available(macOS 15.0, *)) {
+        opts.mathMode = MTLMathModeFast;
+    } else {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        opts.fastMathEnabled = YES;
+#pragma clang diagnostic pop
+    }
     NSError *err = nil;
     g_library = [g_device newLibraryWithSource:source options:opts error:&err];
     if (!g_library) {

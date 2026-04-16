@@ -312,12 +312,41 @@ void hxblas_embed_scatter(int64_t S, int64_t D, int64_t dembed_p, int64_t dh_p, 
     }
 }
 
+#endif /* __linux__ */
+
+// ─────────────────────────────────────────────────────────────
+// Platform-independent includes + functions (no BLAS dependency)
+// ─────────────────────────────────────────────────────────────
+#ifndef __linux__
+#include <stdint.h>
+#include <stddef.h>
+#include <string.h>
+#include <stdlib.h>
+#include <math.h>
+#endif
+
 int64_t hxblas_version(void) {
-    // Matches the Mac wrapper ABI version so hexa callers treat them as one.
     return 2;
 }
 
-#endif /* __linux__ */
+#ifndef __linux__
+// Mac/other: scalar reference kernel for benchmarking
+void hxblas_matmul_scalar(int64_t M, int64_t K, int64_t N,
+                          int64_t A, int64_t B, int64_t C) {
+    const float* a = (const float*)(uintptr_t)A;
+    const float* b = (const float*)(uintptr_t)B;
+    float* c = (float*)(uintptr_t)C;
+    for (int64_t i = 0; i < M; i++) {
+        for (int64_t j = 0; j < N; j++) {
+            float sum = 0.0f;
+            for (int64_t k = 0; k < K; k++) {
+                sum += a[i * K + k] * b[k * N + j];
+            }
+            c[i * N + j] = sum;
+        }
+    }
+}
+#endif
 
 // ═════════════════════════════════════════════════════════════════════
 // BF16 NEON KERNELS — ARM64 native bf16 matmul/matvec with f32 accum
@@ -472,17 +501,37 @@ void hxblas_bgemm(int64_t M, int64_t K, int64_t N,
                 float32x4_t a2 = vreinterpretq_f32_u32(vshll_n_u16(a2_16, 16));
                 float32x4_t a3 = vreinterpretq_f32_u32(vshll_n_u16(a3_16, 16));
 
-                // Load 4 bf16 from each of 4 B columns
+                // Load 4 bf16 from each of 4 B rows, FMA with constant lane index
                 // B is row-major: B[ki+p][ni..ni+3]
-                for (int p = 0; p < 4; p++) {
-                    uint16x4_t b_16 = vld1_u16(&B[(ki + p) * N + ni]);
-                    float32x4_t bv = vreinterpretq_f32_u32(vshll_n_u16(b_16, 16));
+                // Lane index MUST be compile-time constant — manually unrolled
+                {
+                    uint16x4_t b0_16 = vld1_u16(&B[(ki + 0) * N + ni]);
+                    float32x4_t bv0 = vreinterpretq_f32_u32(vshll_n_u16(b0_16, 16));
+                    c00 = vfmaq_laneq_f32(c00, bv0, a0, 0);
+                    c10 = vfmaq_laneq_f32(c10, bv0, a1, 0);
+                    c20 = vfmaq_laneq_f32(c20, bv0, a2, 0);
+                    c30 = vfmaq_laneq_f32(c30, bv0, a3, 0);
 
-                    // FMA: c[row][col] += a[row][ki+p] * b[ki+p][col]
-                    c00 = vfmaq_laneq_f32(c00, bv, a0, p);
-                    c10 = vfmaq_laneq_f32(c10, bv, a1, p);
-                    c20 = vfmaq_laneq_f32(c20, bv, a2, p);
-                    c30 = vfmaq_laneq_f32(c30, bv, a3, p);
+                    uint16x4_t b1_16 = vld1_u16(&B[(ki + 1) * N + ni]);
+                    float32x4_t bv1 = vreinterpretq_f32_u32(vshll_n_u16(b1_16, 16));
+                    c00 = vfmaq_laneq_f32(c00, bv1, a0, 1);
+                    c10 = vfmaq_laneq_f32(c10, bv1, a1, 1);
+                    c20 = vfmaq_laneq_f32(c20, bv1, a2, 1);
+                    c30 = vfmaq_laneq_f32(c30, bv1, a3, 1);
+
+                    uint16x4_t b2_16 = vld1_u16(&B[(ki + 2) * N + ni]);
+                    float32x4_t bv2 = vreinterpretq_f32_u32(vshll_n_u16(b2_16, 16));
+                    c00 = vfmaq_laneq_f32(c00, bv2, a0, 2);
+                    c10 = vfmaq_laneq_f32(c10, bv2, a1, 2);
+                    c20 = vfmaq_laneq_f32(c20, bv2, a2, 2);
+                    c30 = vfmaq_laneq_f32(c30, bv2, a3, 2);
+
+                    uint16x4_t b3_16 = vld1_u16(&B[(ki + 3) * N + ni]);
+                    float32x4_t bv3 = vreinterpretq_f32_u32(vshll_n_u16(b3_16, 16));
+                    c00 = vfmaq_laneq_f32(c00, bv3, a0, 3);
+                    c10 = vfmaq_laneq_f32(c10, bv3, a1, 3);
+                    c20 = vfmaq_laneq_f32(c20, bv3, a2, 3);
+                    c30 = vfmaq_laneq_f32(c30, bv3, a3, 3);
                 }
             }
 
