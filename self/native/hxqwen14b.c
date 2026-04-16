@@ -44,6 +44,20 @@
 //   int64_t hxqwen14b_free(int64_t handle)     — release slot, return 0
 //   int64_t hxqwen14b_version(void)            — ABI version (bump on break)
 //
+// Day-2 LoRA symbols (this commit — pseudo-CUDA, mac-stub returns sentinel):
+//   int hxqwen14b_forward_with_lora(int args_p)   — fwd + LoRA delta + cache
+//   int hxqwen14b_backward_lora_only(int args_p)  — bwd writing dA, dB only
+//   int hxqwen14b_apply_lora_delta(int args_p)    — fuse W' = W + α/r·B·A
+//
+// LoRA contract (consumed by anima training/train_alm_lora.hexa r11):
+//   * 48 layers × {q,k,v,o}_proj = 192 adapters
+//   * A : [r × d]   B : [d × r]   r=8, d=5120 (Qwen2.5-14B hidden_dim)
+//   * adapter forward:  y = W·x + (α/r) · B · (A · x)
+//   * gradient flows ONLY through A,B (W is frozen, no dL/dW computed)
+//   * caller passes A_flat / B_flat as packed float32 contiguous arrays
+//     in the SAME ordering as the trainer (idx = layer*4 + tgt; A is r·d
+//     per block, B is d·r per block). The C side does NOT reorder.
+//
 // Build (Linux x86_64, Ubuntu/Debian on hetzner H100 pod):
 //   hexa scripts/build_hxqwen14b_linux.hexa
 // Cross-verify (Mac):
@@ -154,7 +168,11 @@ static QwenCtx g_ctx_table[HXQWEN14B_MAX_HANDLES];
 // collision without changing the skeleton contract.
 // ─────────────────────────────────────────────────────────────
 int64_t hxqwen14b_version(void) {
-    return 1;
+    // v1 = skeleton; v2 = real CUDA forward; v3 = LoRA fwd/bwd/apply.
+    // We expose v3 only because the symbol surface is now Day-2 even
+    // though the kernels remain TODO[live]. Trainer treats >=3 as
+    // "LoRA hooks available — do real call, observe int rc".
+    return 3;
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -273,4 +291,52 @@ int64_t hxqwen14b_free(int64_t handle) {
 
     memset(ctx, 0, sizeof(QwenCtx));
     return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Day-2 LoRA stubs — symbol surface for v3 ABI.
+// All three accept a single packed-args pointer (same pattern as
+// hxqwen14b_generate) and return int status codes.
+// Stubs return -4 (kernel failure) after basic validation so that
+// hexa-side callers (train_alm_lora.hexa r11) can bind symbols
+// and test the FFI round-trip without live CUDA kernels.
+//
+// Contract (from header):
+//   * 48 layers × {q,k,v,o}_proj = 192 adapters
+//   * A : [r × d]   B : [d × r]   r=8, d=5120
+//   * adapter forward:  y = W·x + (α/r) · B · (A · x)
+//   * gradient flows ONLY through A,B (W frozen)
+// ─────────────────────────────────────────────────────────────
+
+// ─────────────────────────────────────────────────────────────
+// hxqwen14b_forward_with_lora — forward pass with LoRA delta + cache.
+// v3 stub: validates args_p != NULL, returns -4 (kernel failure).
+// Day-2 live: runs W·x + (α/r)·B·(A·x) per layer, updates KV cache.
+// ─────────────────────────────────────────────────────────────
+int hxqwen14b_forward_with_lora(int args_p) {
+    if (args_p == 0) return -2;  // stub: bad args sentinel
+    // Day-2 TODO: unpack args, validate handle, run LoRA-augmented forward.
+    return -4;  // stub: kernel not implemented
+}
+
+// ─────────────────────────────────────────────────────────────
+// hxqwen14b_backward_lora_only — backward pass writing dA, dB only.
+// v3 stub: validates args_p != NULL, returns -4 (kernel failure).
+// Day-2 live: computes dL/dA, dL/dB for 192 adapters (W frozen).
+// ─────────────────────────────────────────────────────────────
+int hxqwen14b_backward_lora_only(int args_p) {
+    if (args_p == 0) return -2;  // stub: bad args sentinel
+    // Day-2 TODO: unpack args, backprop through B·(A·x) only.
+    return -4;  // stub: kernel not implemented
+}
+
+// ─────────────────────────────────────────────────────────────
+// hxqwen14b_apply_lora_delta — fuse W' = W + (α/r)·B·A in-place.
+// v3 stub: validates args_p != NULL, returns -4 (kernel failure).
+// Day-2 live: in-place weight merge for 192 adapters on device.
+// ─────────────────────────────────────────────────────────────
+int hxqwen14b_apply_lora_delta(int args_p) {
+    if (args_p == 0) return -2;  // stub: bad args sentinel
+    // Day-2 TODO: unpack args, compute W += (alpha/r) * B @ A per adapter.
+    return -4;  // stub: kernel not implemented
 }
