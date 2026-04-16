@@ -1,17 +1,20 @@
 // ═══════════════════════════════════════════════════════════════
-//  deploy_h100.hexa — H100 서버에 hexa 배포
+//  deploy_h100.hexa — H100 서버에 hexa + native FFI shims 배포
 //
 //  사용법:
 //    hexa scripts/deploy_h100.hexa <user@host> [remote_dir]
 //    hexa scripts/deploy_h100.hexa root@h100.example.com /opt/hexa
 //
-//  수행:
-//    1. Linux x86_64 릴리스 빌드 (--no-default-features)
-//    2. hexa 바이너리 + ML 파일 scp
-//    3. 원격에서 gpu_smoke_test 실행
+//  수행 (5-stage):
+//    1. Linux x86_64 hexa 바이너리 locate (build/hexa-linux-x86_64)
+//    2. 원격 디렉토리 scaffold (self/ml + self/serve + self/native + bench + scripts)
+//    3. 파일 업로드 (ml/.hexa + native/.c + scripts/.sh + bench/.hexa + test)
+//    4. Stage 1.5: 원격 native build — apt install + build_hxblas + build_hxlayer
+//    5. Smoke test — gpu_smoke_test.hexa + test_hxlayer.hexa (HXLAYER_FFI_LIVE=1)
 //
-//  요구: 로컬에 x86_64-unknown-linux-gnu 타겟
-//        원격에 CUDA toolkit (/usr/local/cuda)
+//  요구: 로컬 build/hexa-linux-x86_64 (ELF x86-64, 2026-04-15 기준 8.8MB)
+//        원격 CUDA toolkit (/usr/local/cuda)
+//        원격 apt (ubuntu/debian runpod/pytorch:2.4.0)
 // ═══════════════════════════════════════════════════════════════
 
 let args = argv()
@@ -24,43 +27,55 @@ if len(args) < 2 {
 let HOST = args[1]
 let REMOTE_DIR = if len(args) >= 3 { args[2] } else { "/opt/hexa" }
 
-println("═══ hexa H100 Deploy ═══")
+println("═══ hexa H100 Deploy (5-stage) ═══")
 println("Target: " + HOST + ":" + REMOTE_DIR)
 
-// ── 1. Cross-compile (self-host) ───────────────────────────
+// ── 1. Locate Linux binary ─────────────────────────────────
 // 2026-04-11: src/ deleted, cargo removed. Cross-compilation via
 // self-host codegen is not yet implemented for x86_64-linux-gnu.
 // For H100 deploy, either:
-//   (a) use a precompiled Linux hexa binary (bin/hexa-linux-x86_64)
+//   (a) use a precompiled Linux hexa binary (build/hexa-linux-x86_64)
 //   (b) run build_hexa.hexa on the target Linux machine natively
 //   (c) bootstrap via stage1 (hexa→C) + remote clang
-println("[1/4] Locating Linux hexa binary...")
-let binary = "bin/hexa-linux-x86_64"
+println("[1/5] Locating Linux hexa binary...")
+let binary = "build/hexa-linux-x86_64"
 if !file_exists(binary) {
     println("[ERROR] Linux binary not found: " + binary)
     println("  Pending: self-host cross-compile to x86_64-linux-gnu")
     println("  Workaround: ssh to H100 and run build_hexa.hexa there")
     exit(1)
 }
-println("[OK] Binary built: " + binary)
+println("[OK] Binary located: " + binary)
 
-// ── 2. Create remote directory ──────────────────────────────
-println("[2/4] Creating remote directory...")
-let _ = exec("ssh " + HOST + " 'mkdir -p " + REMOTE_DIR + "/self/ml " + REMOTE_DIR + "/self/serve'")
+// ── 2. Create remote directory scaffold ────────────────────
+println("[2/5] Creating remote directory scaffold...")
+let mkdir_cmd = "ssh " + HOST + " 'mkdir -p " +
+    REMOTE_DIR + "/self/ml " +
+    REMOTE_DIR + "/self/serve " +
+    REMOTE_DIR + "/self/native " +
+    REMOTE_DIR + "/self/native/build " +
+    REMOTE_DIR + "/bench " +
+    REMOTE_DIR + "/scripts'"
+let _ = exec(mkdir_cmd)
 
 // ── 3. Upload files ─────────────────────────────────────────
-println("[3/4] Uploading files...")
+println("[3/5] Uploading files...")
 
-// Binary
+// 3a. hexa binary
 let _ = exec("scp " + binary + " " + HOST + ":" + REMOTE_DIR + "/hexa")
 let _ = exec("ssh " + HOST + " 'chmod +x " + REMOTE_DIR + "/hexa'")
 
-// GPU ML files
+// 3b. GPU ML files (CUDA RTC + kernels + memory + batch)
 let gpu_files = [
-    "cuda_ffi", "gpu_tensor", "gpu_grad_engine", "gpu_optimizer",
+    "cuda_ffi", "cuda_rtc", "cuda_kernels",
+    "gpu_tensor", "gpu_grad_engine", "gpu_optimizer",
     "gpu_inference", "gpu_generate", "gpu_sampler", "gpu_kv_cache",
+    "gpu_memory_manager", "gpu_continuous_batch",
+    "gpu_train",
     "model_100m_gpu", "train_gpu", "t2_gpu_bench", "gpu_smoke_test"
 ]
+
+// 3c. CPU support + layer FFI + grad-ckpt + async-ckpt
 let cpu_support = [
     "sampler", "kv_cache", "transformer", "generate", "device",
     "offload", "checkpoint", "quantize", "distributed",
@@ -71,26 +86,137 @@ let cpu_support = [
     "data_pipeline", "tokenizer", "finetune", "dpo",
     "rlhf", "batch_inference", "streaming", "pipeline",
     "gguf_loader", "gguf_writer", "onnx_writer", "visualize",
-    "reward_model"
+    "reward_model",
+    // C2/C6/C10: layer-level fused FFI + gradient checkpointing
+    "hxlayer", "grad_checkpoint", "async_ckpt", "async_ckpt_test"
 ]
 
-let all_files = gpu_files + cpu_support
+let all_ml = gpu_files + cpu_support
 let mut i = 0
-while i < len(all_files) {
-    let f = all_files[i]
+let mut ml_uploaded = 0
+while i < len(all_ml) {
+    let f = all_ml[i]
     let src = "self/ml/" + f + ".hexa"
     if file_exists(src) {
         let _ = exec("scp " + src + " " + HOST + ":" + REMOTE_DIR + "/self/ml/")
+        ml_uploaded = ml_uploaded + 1
     }
     i = i + 1
 }
 
-println("[OK] " + str(len(all_files)) + " files uploaded")
+// 3d. Native C shims (Linux port of Mac Accelerate/vDSP)
+let native_files = [
+    "hxblas_linux.c",
+    "hxvdsp_linux.c",
+    "hxlayer_linux.c"
+]
+let mut j = 0
+let mut native_uploaded = 0
+while j < len(native_files) {
+    let nf = native_files[j]
+    let nsrc = "self/native/" + nf
+    if file_exists(nsrc) {
+        let _ = exec("scp " + nsrc + " " + HOST + ":" + REMOTE_DIR + "/self/native/")
+        native_uploaded = native_uploaded + 1
+    }
+    j = j + 1
+}
 
-// ── 4. Run smoke test ───────────────────────────────────────
-println("[4/4] Running GPU smoke test...")
-let smoke_cmd = "ssh " + HOST + " 'cd " + REMOTE_DIR + " && LD_LIBRARY_PATH=/usr/local/cuda/lib64:${LD_LIBRARY_PATH:-} ./hexa self/ml/gpu_smoke_test.hexa'"
-let smoke_rc = exec(smoke_cmd)
+// 3e. Build scripts (native FFI builders)
+let build_files = [
+    "build_hxblas_linux.sh",
+    "build_hxlayer_linux.sh"
+]
+let mut k = 0
+let mut build_uploaded = 0
+while k < len(build_files) {
+    let bf = build_files[k]
+    let bsrc = "scripts/" + bf
+    if file_exists(bsrc) {
+        let _ = exec("scp " + bsrc + " " + HOST + ":" + REMOTE_DIR + "/scripts/")
+        let _ = exec("ssh " + HOST + " 'chmod +x " + REMOTE_DIR + "/scripts/" + bf + "'")
+        build_uploaded = build_uploaded + 1
+    }
+    k = k + 1
+}
+
+// 3f. Bench + test files (optional but useful on pod)
+let test_files = [
+    "self/test_hxlayer.hexa",
+    "self/bench_hxlayer.hexa",
+    "bench/hxblas_linux.hexa",
+    "bench/grad_checkpoint.hexa",
+    "bench/async_ckpt.hexa",
+    "bench/native_int_specialize.hexa",
+    "bench/matmul_256.hexa"
+]
+let mut t = 0
+let mut test_uploaded = 0
+while t < len(test_files) {
+    let tf = test_files[t]
+    if file_exists(tf) {
+        // mirror remote path: bench/*.hexa → $REMOTE/bench/ ; self/*.hexa → $REMOTE/self/
+        let _ = exec("scp " + tf + " " + HOST + ":" + REMOTE_DIR + "/" + tf)
+        test_uploaded = test_uploaded + 1
+    }
+    t = t + 1
+}
+
+println("[OK] uploaded: ml=" + str(ml_uploaded) +
+    " native=" + str(native_uploaded) +
+    " build_scripts=" + str(build_uploaded) +
+    " tests=" + str(test_uploaded))
+
+// ── 4. Stage 1.5 — Remote native build (apt + libhxblas + libhxlayer) ──
+println("[4/5] Building native FFI shims on remote (apt + libhxblas + libhxlayer + libhxvdsp)...")
+
+// 4a. apt install (idempotent — apt-get -y install is a no-op if present)
+let apt_cmd = "ssh " + HOST + " 'DEBIAN_FRONTEND=noninteractive apt-get update -qq && " +
+    "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq gcc libopenblas-dev libgomp1'"
+let apt_rc = exec(apt_cmd)
+if apt_rc != 0 {
+    println("[WARN] apt install returned " + str(apt_rc) + " — may already be installed; continuing")
+}
+
+// 4b. build libhxblas.so + libhxvdsp.so
+let blas_cmd = "ssh " + HOST + " 'cd " + REMOTE_DIR + " && bash scripts/build_hxblas_linux.sh'"
+let blas_rc = exec(blas_cmd)
+if blas_rc != 0 {
+    println("[ERROR] build_hxblas_linux.sh failed rc=" + str(blas_rc))
+    println("  Check remote: " + REMOTE_DIR + "/self/native/build/ for libhxblas.so / libhxvdsp.so")
+    exit(1)
+}
+
+// 4c. build libhxlayer.so
+let layer_cmd = "ssh " + HOST + " 'cd " + REMOTE_DIR + " && bash scripts/build_hxlayer_linux.sh'"
+let layer_rc = exec(layer_cmd)
+if layer_rc != 0 {
+    println("[ERROR] build_hxlayer_linux.sh failed rc=" + str(layer_rc))
+    println("  Check remote: " + REMOTE_DIR + "/self/native/build/libhxlayer.so")
+    exit(1)
+}
+
+// 4d. verify .so artifacts
+let verify_cmd = "ssh " + HOST + " 'ls -la " + REMOTE_DIR + "/self/native/build/'"
+let _ = exec(verify_cmd)
+println("[OK] native FFI libs built at " + REMOTE_DIR + "/self/native/build/")
+
+// ── 5. Smoke test (GPU + layer FFI) ─────────────────────────
+println("[5/5] Running smoke tests (GPU cudart + hxlayer FFI)...")
+
+let LD_PATH = REMOTE_DIR + "/self/native/build:/usr/local/cuda/lib64"
+
+// 5a. GPU smoke test (cudart + cublas 4x4 sgemm)
+let gpu_smoke_cmd = "ssh " + HOST + " 'cd " + REMOTE_DIR +
+    " && LD_LIBRARY_PATH=" + LD_PATH + ":${LD_LIBRARY_PATH:-} " +
+    "./hexa run self/ml/gpu_smoke_test.hexa'"
+let gpu_rc = exec(gpu_smoke_cmd)
+
+// 5b. hxlayer FFI live test (C2 Step 3 — fused layer FFI)
+let hxlayer_smoke_cmd = "ssh " + HOST + " 'cd " + REMOTE_DIR +
+    " && HXLAYER_FFI_LIVE=1 LD_LIBRARY_PATH=" + LD_PATH + ":${LD_LIBRARY_PATH:-} " +
+    "./hexa run self/test_hxlayer.hexa'"
+let layer_test_rc = exec(hxlayer_smoke_cmd)
 
 println("")
 println("═══ Deploy Complete ═══")
@@ -98,14 +224,21 @@ println("")
 println("사용법 (원격):")
 println("  ssh " + HOST)
 println("  cd " + REMOTE_DIR)
-println("  export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH")
+println("  export LD_LIBRARY_PATH=" + LD_PATH + ":$LD_LIBRARY_PATH")
 println("")
-println("  ./hexa self/ml/gpu_smoke_test.hexa    # 스모크 테스트")
-println("  ./hexa self/ml/t2_gpu_bench.hexa      # TFLOPS 벤치")
-println("  ./hexa self/ml/train_gpu.hexa          # GPU 학습 103M")
-println("  ./hexa self/ml/gpu_generate.hexa       # GPU 추론")
+println("  ./hexa run self/ml/gpu_smoke_test.hexa    # GPU 스모크 (cudart+cublas)")
+println("  ./hexa run self/ml/t2_gpu_bench.hexa      # TFLOPS 벤치")
+println("  ./hexa run self/ml/gpu_train.hexa         # GPU 학습")
+println("  ./hexa run self/ml/gpu_generate.hexa      # GPU 추론")
+println("  HXLAYER_FFI_LIVE=1 ./hexa run self/test_hxlayer.hexa  # layer FFI live")
+println("  ./hexa run self/bench_hxlayer.hexa        # layer FFI bench")
+println("  ./hexa run bench/hxblas_linux.hexa        # hxblas Linux bench")
 
-if smoke_rc == 0 {
+if gpu_rc == 0 && layer_test_rc == 0 {
     println("")
-    println("STATUS: READY — H100 ML 워크로드 실행 가능")
+    println("STATUS: READY — H100 ML + native FFI 워크로드 실행 가능")
+} else {
+    println("")
+    println("STATUS: PARTIAL — gpu_rc=" + str(gpu_rc) + " layer_rc=" + str(layer_test_rc))
+    println("  재시도: ssh " + HOST + " && cd " + REMOTE_DIR + " && <smoke command>")
 }
