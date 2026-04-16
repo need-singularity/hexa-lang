@@ -95,8 +95,14 @@ if [ "$MODE" = "--mac-stub" ]; then
     done
     if [ $MISSING -ne 0 ]; then exit 4; fi
 
+    # @link("hxccl") resolves via lib<name>.dylib (see runtime.c
+    # hexa_ffi_dlopen). Symlink so HXCCL_FFI_LIVE tests don't have to
+    # set the symlink themselves — discovered while debugging
+    # test_hxccl missing-symlink intermittent FAIL on 2026-04-16.
+    ln -sf libhxccl_stub.dylib "$OUT_DIR/libhxccl.dylib"
+
     echo "── mac-stub output ──"
-    ls -la "$OUT_DIR/libhxccl_stub.dylib"
+    ls -la "$OUT_DIR/libhxccl_stub.dylib" "$OUT_DIR/libhxccl.dylib"
     echo "done — stub ready. Use DYLD_LIBRARY_PATH=$OUT_DIR for smoke tests."
     exit 0
 fi
