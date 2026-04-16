@@ -6761,6 +6761,8 @@ HexaVal _known_float_set_init(void);
 HexaVal _known_int_add(HexaVal name);
 HexaVal _is_known_int(HexaVal node);
 HexaVal _is_int_init_expr(HexaVal node);
+HexaVal _is_float_init_expr(HexaVal node);
+HexaVal _gen2_while_cond(HexaVal node);
 HexaVal gen2_lambda_expr(HexaVal node);
 
 HexaVal _gen2_indent_cache;
@@ -8830,7 +8832,7 @@ HexaVal gen2_stmt(HexaVal node, HexaVal depth) {
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("WhileStmt")))) {
         chunks = hexa_array_new();
-        HexaVal cond_c = hexa_call1(_gen2_while_cond, hexa_map_get_ic(node, "cond", &__hexa_codegen_c2_ic_214));
+        HexaVal cond_c = _gen2_while_cond(hexa_map_get_ic(node, "cond", &__hexa_codegen_c2_ic_214));
         chunks = hexa_array_push(chunks, hexa_add(hexa_add(hexa_add(pad, hexa_str("while (")), cond_c), hexa_str(") {\n")));
         HexaVal wi = hexa_int(0);
         while (hexa_truthy(hexa_cmp_lt(wi, hexa_int(hexa_len(hexa_map_get_ic(node, "body", &__hexa_codegen_c2_ic_215)))))) {
@@ -11133,6 +11135,110 @@ HexaVal _is_int_init_expr(HexaVal node) {
     return __hexa_fn_arena_return(hexa_void());
 }
 
+
+// Manual bootstrap: _is_float_init_expr (added 2026-04-17)
+HexaVal _is_float_init_expr(HexaVal node) {
+    __hexa_fn_arena_enter();
+    if (hexa_truthy(hexa_eq(hexa_type_of(node), hexa_str("string")))) {
+        return __hexa_fn_arena_return(hexa_bool(0));
+    }
+    HexaVal k = hexa_map_get(node, "kind");
+    if (hexa_truthy(hexa_eq(k, hexa_str("FloatLit")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(k, hexa_str("Ident")))) {
+        return __hexa_fn_arena_return(_is_known_float_name(hexa_map_get(node, "name")));
+    }
+    if (hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) {
+        HexaVal op = hexa_map_get(node, "op");
+        if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("+"))) || hexa_truthy(hexa_eq(op, hexa_str("-"))))) || hexa_truthy(hexa_eq(op, hexa_str("*"))))) || hexa_truthy(hexa_eq(op, hexa_str("/"))))) || hexa_truthy(hexa_eq(op, hexa_str("%")))))) {
+            HexaVal lf = _is_float_init_expr(hexa_map_get(node, "left"));
+            HexaVal rf = _is_float_init_expr(hexa_map_get(node, "right"));
+            if (hexa_truthy(hexa_bool(hexa_truthy(lf) && hexa_truthy(rf)))) {
+                return __hexa_fn_arena_return(hexa_bool(1));
+            }
+            if (hexa_truthy(hexa_bool(hexa_truthy(lf) && hexa_truthy(_is_int_init_expr(hexa_map_get(node, "right")))))) {
+                return __hexa_fn_arena_return(hexa_bool(1));
+            }
+            if (hexa_truthy(hexa_bool(hexa_truthy(rf) && hexa_truthy(_is_int_init_expr(hexa_map_get(node, "left")))))) {
+                return __hexa_fn_arena_return(hexa_bool(1));
+            }
+        }
+        return __hexa_fn_arena_return(hexa_bool(0));
+    }
+    if (hexa_truthy(hexa_eq(k, hexa_str("UnaryOp")))) {
+        if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("-")))) {
+            return __hexa_fn_arena_return(_is_float_init_expr(hexa_map_get(node, "left")));
+        }
+        return __hexa_fn_arena_return(hexa_bool(0));
+    }
+    return __hexa_fn_arena_return(hexa_bool(0));
+}
+
+// Manual bootstrap: _gen2_while_cond (added 2026-04-17)
+HexaVal _gen2_while_cond(HexaVal node) {
+    __hexa_fn_arena_enter();
+    if (hexa_truthy(hexa_eq(hexa_type_of(node), hexa_str("string")))) {
+        return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_truthy("), gen2_expr(node)), hexa_str(")")));
+    }
+    HexaVal k = hexa_map_get(node, "kind");
+    if (hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) {
+        HexaVal op = hexa_map_get(node, "op");
+        if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(op, hexa_str("<"))) || hexa_truthy(hexa_eq(op, hexa_str(">"))))) || hexa_truthy(hexa_eq(op, hexa_str("<="))))) || hexa_truthy(hexa_eq(op, hexa_str(">=")))))) {
+            HexaVal li = _is_known_int(hexa_map_get(node, "left"));
+            HexaVal ri = _is_known_int(hexa_map_get(node, "right"));
+            if (hexa_truthy(hexa_bool(hexa_truthy(li) && hexa_truthy(ri)))) {
+                HexaVal l = gen2_expr(hexa_map_get(node, "left"));
+                HexaVal r = gen2_expr(hexa_map_get(node, "right"));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_INT("), l), hexa_add(hexa_add(hexa_str(") "), op), hexa_str(" HX_INT("))), r), hexa_str("))")));
+            }
+            HexaVal l = gen2_expr(hexa_map_get(node, "left"));
+            HexaVal r = gen2_expr(hexa_map_get(node, "right"));
+            if (hexa_truthy(hexa_eq(op, hexa_str("<")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_str("HX_BOOL(hexa_cmp_lt("), l), hexa_add(hexa_str(", "), r)), hexa_str("))")));
+            }
+            if (hexa_truthy(hexa_eq(op, hexa_str(">")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_str("HX_BOOL(hexa_cmp_gt("), l), hexa_add(hexa_str(", "), r)), hexa_str("))")));
+            }
+            if (hexa_truthy(hexa_eq(op, hexa_str("<=")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_str("HX_BOOL(hexa_cmp_le("), l), hexa_add(hexa_str(", "), r)), hexa_str("))")));
+            }
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_str("HX_BOOL(hexa_cmp_ge("), l), hexa_add(hexa_str(", "), r)), hexa_str("))")));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("==")))) {
+            HexaVal li = _is_known_int(hexa_map_get(node, "left"));
+            HexaVal ri = _is_known_int(hexa_map_get(node, "right"));
+            if (hexa_truthy(hexa_bool(hexa_truthy(li) && hexa_truthy(ri)))) {
+                HexaVal l = gen2_expr(hexa_map_get(node, "left"));
+                HexaVal r = gen2_expr(hexa_map_get(node, "right"));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_INT("), l), hexa_str(") == HX_INT(")), r), hexa_str("))")));
+            }
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_truthy(hexa_eq("), gen2_expr(hexa_map_get(node, "left"))), hexa_str(", ")), gen2_expr(hexa_map_get(node, "right"))), hexa_str("))")));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("!=")))) {
+            HexaVal li = _is_known_int(hexa_map_get(node, "left"));
+            HexaVal ri = _is_known_int(hexa_map_get(node, "right"));
+            if (hexa_truthy(hexa_bool(hexa_truthy(li) && hexa_truthy(ri)))) {
+                HexaVal l = gen2_expr(hexa_map_get(node, "left"));
+                HexaVal r = gen2_expr(hexa_map_get(node, "right"));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(HX_INT("), l), hexa_str(") != HX_INT(")), r), hexa_str("))")));
+            }
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("(!hexa_truthy(hexa_eq("), gen2_expr(hexa_map_get(node, "left"))), hexa_str(", ")), gen2_expr(hexa_map_get(node, "right"))), hexa_str(")))")));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("&&")))) {
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("("), _gen2_while_cond(hexa_map_get(node, "left"))), hexa_str(" && ")), _gen2_while_cond(hexa_map_get(node, "right"))), hexa_str(")")));
+        }
+        if (hexa_truthy(hexa_eq(op, hexa_str("||")))) {
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("("), _gen2_while_cond(hexa_map_get(node, "left"))), hexa_str(" || ")), _gen2_while_cond(hexa_map_get(node, "right"))), hexa_str(")")));
+        }
+    }
+    if (hexa_truthy(hexa_eq(k, hexa_str("UnaryOp")))) {
+        if (hexa_truthy(hexa_eq(hexa_map_get(node, "op"), hexa_str("!")))) {
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("(!"), _gen2_while_cond(hexa_map_get(node, "left"))), hexa_str(")")));
+        }
+    }
+    return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_truthy("), gen2_expr(node)), hexa_str(")")));
+}
 
 HexaVal _is_builtin_name(HexaVal name) {
     __hexa_fn_arena_enter();
