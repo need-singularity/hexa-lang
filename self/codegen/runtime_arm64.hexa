@@ -994,6 +994,316 @@ fn test_neon_string_ops() {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════
+// Arena bump allocator (HX5: AI-native algorithm replacement)
+// ═══════════════════════════════════════════════════════════════
+// AI-native vector — arena bump allocator (docs/ai-native.md).
+//
+// Motivation: ML workloads allocate many tensors then free all at once.
+// libc malloc pays 10-50x overhead per call (free-list walk, coalesce,
+// metadata, fragmentation). A bump allocator trades per-object free
+// for O(1) alloc and bulk reset, which is exactly the shape of tensor
+// allocation in a forward/backward pass.
+//
+// Layout:
+//   arena_state (24 bytes, shared across the 4 fns below):
+//     [ 0] base : pointer to mmap'd region (set by init, cleared by release)
+//     [ 8] ptr  : next free byte (bump pointer; reset() sets ptr = base)
+//     [16] end  : base + size (mmap'd limit)
+//
+// State access convention (stage0 NaN-boxing limitation):
+//   Each fn emits `adr x9, #0` as a placeholder — the codegen patches
+//   the PC-relative offset so x9 points to the shared arena_state blob
+//   that the linker/embedder places once per binary. This keeps each
+//   fn self-contained for byte-count testing (same convention as
+//   rt_exit/rt_alloc) while allowing all 4 fns to share one state
+//   region. All `adr x9, #0` placeholders are marked in comments.
+//
+// macOS ARM64 syscall ABI:
+//   SYS_mmap  = 197  (x0=addr, x1=len, x2=prot, x3=flags, x4=fd, x5=off)
+//   SYS_munmap = 73  (x0=addr, x1=len)
+//   All syscalls use svc #0x80, return value in x0.
+
+// ── rt_arena_init ────────────────────────────────────────────
+// arena_init(x0=size_mb) — mmap(size_mb << 20) anonymous RW region.
+// Stores base/ptr/end into the shared arena_state.
+// 17 instructions, 68 bytes.
+
+fn rt_arena_init() {
+    let mut c = []
+    // stp x29, x30, [sp, #-16]!     0xA9BF7BFD
+    c = c.push(253)
+    c = c.push(123)
+    c = c.push(191)
+    c = c.push(169)
+    // mov x29, sp                    0x910003FD
+    c = c.push(253)
+    c = c.push(3)
+    c = c.push(0)
+    c = c.push(145)
+    // lsl x1, x0, #20  (MB -> bytes) 0xD36CAC01
+    c = c.push(1)
+    c = c.push(172)
+    c = c.push(108)
+    c = c.push(211)
+    // mov x0, #0  (addr=NULL)        0xD2800000
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(210)
+    // mov x2, #3  (PROT_RW)          0xD2800062
+    c = c.push(98)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(210)
+    // mov x3, #0x1002 (MAP_ANON|PRIV)0xD2820043
+    c = c.push(67)
+    c = c.push(0)
+    c = c.push(130)
+    c = c.push(210)
+    // movn x4, #0 (fd=-1)            0x92800004
+    c = c.push(4)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(146)
+    // mov x5, #0  (offset=0)         0xD2800005
+    c = c.push(5)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(210)
+    // mov x16, #197 (SYS_mmap)       0xD28018B0
+    c = c.push(176)
+    c = c.push(24)
+    c = c.push(128)
+    c = c.push(210)
+    // svc #0x80                      0xD4001001
+    c = c.push(1)
+    c = c.push(16)
+    c = c.push(0)
+    c = c.push(212)
+    // adr x9, #0  (arena_state; codegen patches)    0x10000009
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(16)
+    // str x0, [x9]       (state.base = x0)          0xF9000120
+    c = c.push(32)
+    c = c.push(1)
+    c = c.push(0)
+    c = c.push(249)
+    // str x0, [x9, #8]   (state.ptr  = x0)          0xF9000520
+    c = c.push(32)
+    c = c.push(5)
+    c = c.push(0)
+    c = c.push(249)
+    // add x10, x0, x1    (x10 = base + size)        0x8B01000A
+    c = c.push(10)
+    c = c.push(0)
+    c = c.push(1)
+    c = c.push(139)
+    // str x10, [x9, #16] (state.end = base+size)    0xF900092A
+    c = c.push(42)
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(249)
+    // ldp x29, x30, [sp], #16        0xA8C17BFD
+    c = c.push(253)
+    c = c.push(123)
+    c = c.push(193)
+    c = c.push(168)
+    // ret                            0xD65F03C0
+    c = c.push(192)
+    c = c.push(3)
+    c = c.push(95)
+    c = c.push(214)
+    return c
+}
+
+// ── rt_arena_alloc ───────────────────────────────────────────
+// arena_alloc(x0=size) — bump ptr by size, return OLD ptr.
+// Returns 0 (NULL) on overflow (new_ptr > state.end).
+// Leaf function: no prologue (saves 2 instructions vs rt_alloc).
+//
+// Hot-path cost (overflow-free):
+//   2 loads + 1 add + 1 cmp + 1 branch + 1 store + 1 mov + ret = 7 ops
+//
+// 11 instructions, 44 bytes (< 64, meets spec).
+
+fn rt_arena_alloc() {
+    let mut c = []
+    // adr x9, #0  (arena_state; codegen patches)    0x10000009
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(16)
+    // ldr x1, [x9, #8]   (x1 = state.ptr = old)     0xF9400521
+    c = c.push(33)
+    c = c.push(5)
+    c = c.push(64)
+    c = c.push(249)
+    // add x2, x1, x0     (x2 = new_ptr)             0x8B000022
+    c = c.push(34)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(139)
+    // ldr x3, [x9, #16]  (x3 = state.end)           0xF9400923
+    c = c.push(35)
+    c = c.push(9)
+    c = c.push(64)
+    c = c.push(249)
+    // cmp x2, x3                                     0xEB03005F
+    c = c.push(95)
+    c = c.push(0)
+    c = c.push(3)
+    c = c.push(235)
+    // b.hi +2 (to oom)                               0x54000088
+    c = c.push(136)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(84)
+    // str x2, [x9, #8]   (state.ptr = new_ptr)      0xF9000522
+    c = c.push(34)
+    c = c.push(5)
+    c = c.push(0)
+    c = c.push(249)
+    // mov x0, x1         (return old_ptr)           0xAA0103E0
+    c = c.push(224)
+    c = c.push(3)
+    c = c.push(1)
+    c = c.push(170)
+    // ret                                            0xD65F03C0
+    c = c.push(192)
+    c = c.push(3)
+    c = c.push(95)
+    c = c.push(214)
+    // oom: mov x0, #0  (return NULL on overflow)    0xD2800000
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(210)
+    // ret                                            0xD65F03C0
+    c = c.push(192)
+    c = c.push(3)
+    c = c.push(95)
+    c = c.push(214)
+    return c
+}
+
+// ── rt_arena_reset ───────────────────────────────────────────
+// arena_reset() — state.ptr = state.base (bulk free).
+// The mmap'd region is kept for subsequent allocations.
+// 4 instructions, 16 bytes.
+
+fn rt_arena_reset() {
+    let mut c = []
+    // adr x9, #0  (arena_state; codegen patches)    0x10000009
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(16)
+    // ldr x0, [x9]       (x0 = state.base)          0xF9400120
+    c = c.push(32)
+    c = c.push(1)
+    c = c.push(64)
+    c = c.push(249)
+    // str x0, [x9, #8]   (state.ptr = base)         0xF9000520
+    c = c.push(32)
+    c = c.push(5)
+    c = c.push(0)
+    c = c.push(249)
+    // ret                                            0xD65F03C0
+    c = c.push(192)
+    c = c.push(3)
+    c = c.push(95)
+    c = c.push(214)
+    return c
+}
+
+// ── rt_arena_release ─────────────────────────────────────────
+// arena_release() — munmap(base, end-base); zero state.
+// Called at process teardown or when shrinking memory pressure.
+// 15 instructions, 60 bytes.
+
+fn rt_arena_release() {
+    let mut c = []
+    // stp x29, x30, [sp, #-16]!     0xA9BF7BFD
+    c = c.push(253)
+    c = c.push(123)
+    c = c.push(191)
+    c = c.push(169)
+    // mov x29, sp                    0x910003FD
+    c = c.push(253)
+    c = c.push(3)
+    c = c.push(0)
+    c = c.push(145)
+    // adr x9, #0  (arena_state; codegen patches)    0x10000009
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(16)
+    // ldr x0, [x9]       (x0 = state.base)          0xF9400120
+    c = c.push(32)
+    c = c.push(1)
+    c = c.push(64)
+    c = c.push(249)
+    // ldr x1, [x9, #16]  (x1 = state.end)           0xF9400921
+    c = c.push(33)
+    c = c.push(9)
+    c = c.push(64)
+    c = c.push(249)
+    // sub x1, x1, x0     (x1 = size = end-base)     0xCB000021
+    c = c.push(33)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(203)
+    // mov x16, #73 (SYS_munmap)                     0xD2800930
+    c = c.push(48)
+    c = c.push(9)
+    c = c.push(128)
+    c = c.push(210)
+    // svc #0x80                                      0xD4001001
+    c = c.push(1)
+    c = c.push(16)
+    c = c.push(0)
+    c = c.push(212)
+    // adr x9, #0  (arena_state; codegen patches)    0x10000009
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(0)
+    c = c.push(16)
+    // mov x10, #0                                    0xD280000A
+    c = c.push(10)
+    c = c.push(0)
+    c = c.push(128)
+    c = c.push(210)
+    // str x10, [x9]      (state.base = 0)           0xF900012A
+    c = c.push(42)
+    c = c.push(1)
+    c = c.push(0)
+    c = c.push(249)
+    // str x10, [x9, #8]  (state.ptr = 0)            0xF900052A
+    c = c.push(42)
+    c = c.push(5)
+    c = c.push(0)
+    c = c.push(249)
+    // str x10, [x9, #16] (state.end = 0)            0xF900092A
+    c = c.push(42)
+    c = c.push(9)
+    c = c.push(0)
+    c = c.push(249)
+    // ldp x29, x30, [sp], #16        0xA8C17BFD
+    c = c.push(253)
+    c = c.push(123)
+    c = c.push(193)
+    c = c.push(168)
+    // ret                            0xD65F03C0
+    c = c.push(192)
+    c = c.push(3)
+    c = c.push(95)
+    c = c.push(214)
+    return c
+}
+
 // ── self-test ────────────────────────────────────────────────
 
 fn test_runtime_arm64() {
@@ -1003,14 +1313,22 @@ fn test_runtime_arm64() {
     let pint = rt_print_int()
     let alloc_bytes = rt_alloc()
     let slen = rt_str_len()
+    let ainit = rt_arena_init()
+    let aalloc = rt_arena_alloc()
+    let areset = rt_arena_reset()
+    let arel = rt_arena_release()
 
     println("runtime_arm64 — ARM64 machine code byte arrays")
-    println("  rt_exit      : " + to_string(len(exit_bytes)) + " bytes")
-    println("  rt_print_str : " + to_string(len(pstr)) + " bytes")
-    println("  rt_println   : " + to_string(len(pln)) + " bytes")
-    println("  rt_print_int : " + to_string(len(pint)) + " bytes")
-    println("  rt_alloc     : " + to_string(len(alloc_bytes)) + " bytes")
-    println("  rt_str_len   : " + to_string(len(slen)) + " bytes")
+    println("  rt_exit          : " + to_string(len(exit_bytes)) + " bytes")
+    println("  rt_print_str     : " + to_string(len(pstr)) + " bytes")
+    println("  rt_println       : " + to_string(len(pln)) + " bytes")
+    println("  rt_print_int     : " + to_string(len(pint)) + " bytes")
+    println("  rt_alloc         : " + to_string(len(alloc_bytes)) + " bytes")
+    println("  rt_str_len       : " + to_string(len(slen)) + " bytes")
+    println("  rt_arena_init    : " + to_string(len(ainit)) + " bytes")
+    println("  rt_arena_alloc   : " + to_string(len(aalloc)) + " bytes")
+    println("  rt_arena_reset   : " + to_string(len(areset)) + " bytes")
+    println("  rt_arena_release : " + to_string(len(arel)) + " bytes")
 
     // Verify sizes match expected instruction counts * 4
     let mut ok = true
@@ -1020,6 +1338,13 @@ fn test_runtime_arm64() {
     if len(pint) != 184 { println("  FAIL: rt_print_int expected 184, got " + to_string(len(pint))); ok = false }
     if len(alloc_bytes) != 48 { println("  FAIL: rt_alloc expected 48, got " + to_string(len(alloc_bytes))); ok = false }
     if len(slen) != 44 { println("  FAIL: rt_str_len expected 44, got " + to_string(len(slen))); ok = false }
+    if len(ainit) != 68 { println("  FAIL: rt_arena_init expected 68, got " + to_string(len(ainit))); ok = false }
+    if len(aalloc) != 44 { println("  FAIL: rt_arena_alloc expected 44, got " + to_string(len(aalloc))); ok = false }
+    if len(areset) != 16 { println("  FAIL: rt_arena_reset expected 16, got " + to_string(len(areset))); ok = false }
+    if len(arel) != 60 { println("  FAIL: rt_arena_release expected 60, got " + to_string(len(arel))); ok = false }
+
+    // Spec constraint: rt_arena_alloc must be < 64 bytes (hot path)
+    if len(aalloc) >= 64 { println("  FAIL: rt_arena_alloc must be < 64 bytes"); ok = false }
 
     // Verify all sizes are multiples of 4 (ARM64 fixed-width)
     if len(exit_bytes) % 4 != 0 { println("  FAIL: rt_exit not aligned"); ok = false }
@@ -1028,6 +1353,10 @@ fn test_runtime_arm64() {
     if len(pint) % 4 != 0 { println("  FAIL: rt_print_int not aligned"); ok = false }
     if len(alloc_bytes) % 4 != 0 { println("  FAIL: rt_alloc not aligned"); ok = false }
     if len(slen) % 4 != 0 { println("  FAIL: rt_str_len not aligned"); ok = false }
+    if len(ainit) % 4 != 0 { println("  FAIL: rt_arena_init not aligned"); ok = false }
+    if len(aalloc) % 4 != 0 { println("  FAIL: rt_arena_alloc not aligned"); ok = false }
+    if len(areset) % 4 != 0 { println("  FAIL: rt_arena_reset not aligned"); ok = false }
+    if len(arel) % 4 != 0 { println("  FAIL: rt_arena_release not aligned"); ok = false }
 
     // Verify RET trailer: last 4 bytes = 192, 3, 95, 214 (0xD65F03C0)
     // (except rt_exit which ends with svc)
@@ -1041,10 +1370,71 @@ fn test_runtime_arm64() {
     if alloc_bytes[n4 - 4] != 192 { println("  FAIL: rt_alloc no RET"); ok = false }
     let n5 = len(slen)
     if slen[n5 - 4] != 192 { println("  FAIL: rt_str_len no RET"); ok = false }
+    let na1 = len(ainit)
+    if ainit[na1 - 4] != 192 { println("  FAIL: rt_arena_init no RET"); ok = false }
+    let na2 = len(aalloc)
+    if aalloc[na2 - 4] != 192 { println("  FAIL: rt_arena_alloc no RET"); ok = false }
+    let na3 = len(areset)
+    if areset[na3 - 4] != 192 { println("  FAIL: rt_arena_reset no RET"); ok = false }
+    let na4 = len(arel)
+    if arel[na4 - 4] != 192 { println("  FAIL: rt_arena_release no RET"); ok = false }
 
     // Verify SVC trailer on rt_exit: last 4 bytes = 1, 16, 0, 212 (0xD4001001)
     let ne = len(exit_bytes)
     if exit_bytes[ne - 4] != 1 { println("  FAIL: rt_exit no SVC"); ok = false }
+
+    // Verify rt_arena_init contains mov x16, #197 (SYS_mmap)
+    //   encoded as 0xD28018B0 → little-endian bytes 176, 24, 128, 210.
+    let mut found_mmap = false
+    let mut i = 0
+    while i + 3 < len(ainit) {
+        if ainit[i] == 176 {
+            if ainit[i + 1] == 24 {
+                if ainit[i + 2] == 128 {
+                    if ainit[i + 3] == 210 {
+                        found_mmap = true
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    if !found_mmap { println("  FAIL: rt_arena_init missing mov x16, #197 (SYS_mmap)"); ok = false }
+
+    // Verify rt_arena_init contains svc #0x80 (bytes 1, 16, 0, 212)
+    let mut found_svc = false
+    let mut j = 0
+    while j + 3 < len(ainit) {
+        if ainit[j] == 1 {
+            if ainit[j + 1] == 16 {
+                if ainit[j + 2] == 0 {
+                    if ainit[j + 3] == 212 {
+                        found_svc = true
+                    }
+                }
+            }
+        }
+        j = j + 1
+    }
+    if !found_svc { println("  FAIL: rt_arena_init missing svc #0x80"); ok = false }
+
+    // Verify rt_arena_release contains mov x16, #73 (SYS_munmap)
+    //   encoded as 0xD2800930 → little-endian bytes 48, 9, 128, 210.
+    let mut found_munmap = false
+    let mut k = 0
+    while k + 3 < len(arel) {
+        if arel[k] == 48 {
+            if arel[k + 1] == 9 {
+                if arel[k + 2] == 128 {
+                    if arel[k + 3] == 210 {
+                        found_munmap = true
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    if !found_munmap { println("  FAIL: rt_arena_release missing mov x16, #73 (SYS_munmap)"); ok = false }
 
     if ok {
         println("  ALL CHECKS PASS")
