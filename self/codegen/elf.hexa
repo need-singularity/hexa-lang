@@ -1,37 +1,70 @@
-// self/codegen/elf.hexa — ported from src/codegen/elf.rs
-// ELF binary format wrapper — Linux executables.
-// Wraps raw machine code in ELF64 format.
+// self/codegen/elf.hexa — ELF64 binary format emitter
+// Wraps raw machine code in ELF64 standalone executable format.
+// Target: Linux x86_64 (H100 pod deployment) + Linux aarch64.
+// Zero external tools — direct byte emission, no linker needed.
+//
+// Layout:
+//   [0x000000] ELF Header        (64 bytes)
+//   [0x000040] Program Header    (56 bytes) — PT_LOAD, RX
+//   [0x000078] Program Header 2  (56 bytes) — PT_LOAD, RW  (data segment, if present)
+//   [pad ...0x001000]
+//   [0x001000] .text section     (code bytes)
+//   [code_end] .rodata           (read-only string data, if present)
+//
+// Linux x86_64 syscall ABI:
+//   rax = syscall number, rdi = arg1, rsi = arg2, rdx = arg3
+//   exit:  rax=60
+//   write: rax=1, rdi=fd, rsi=buf, rdx=len
 
-fn elf_magic() -> [int] { return [0x7f, 69, 76, 70] }  // 0x7f, 'E', 'L', 'F'
+fn elf_magic() -> [int] { return [127, 69, 76, 70] }  // 0x7f, 'E', 'L', 'F'
 fn et_exec() -> int { return 2 }
+fn et_rel() -> int { return 1 }
 fn em_x86_64() -> int { return 62 }
 fn em_aarch64() -> int { return 183 }
+fn pt_load() -> int { return 1 }
+fn pf_r() -> int { return 4 }
+fn pf_w() -> int { return 2 }
+fn pf_x() -> int { return 1 }
 
 // Helper: push a 16-bit LE value
-fn push_u16_le(buf: [int], val: int) -> [int] {
+fn elf_push_u16_le(buf: [int], val: int) -> [int] {
     return buf.push(val % 256).push((val / 256) % 256)
 }
 
 // Helper: push a 32-bit LE value
-fn push_u32_le(buf: [int], val: int) -> [int] {
+fn elf_push_u32_le(buf: [int], val: int) -> [int] {
     return buf.push(val % 256).push((val / 256) % 256).push((val / 65536) % 256).push((val / 16777216) % 256)
 }
 
 // Helper: push a 64-bit LE value
-fn push_u64_le(buf: [int], val: int) -> [int] {
-    let mut b = push_u32_le(buf, val % 0x100000000)
-    return push_u32_le(b, val / 0x100000000)
+fn elf_push_u64_le(buf: [int], val: int) -> [int] {
+    let mut b = elf_push_u32_le(buf, val % 4294967296)
+    return elf_push_u32_le(b, val / 4294967296)
 }
 
-// Wrap machine code in ELF64 format.
-fn elf_wrap(code: [int]) -> [int] {
+// Helper: read a 16-bit LE value from byte array at offset
+fn elf_read_u16_le(buf: [int], off: int) -> int {
+    return buf[off] + buf[off + 1] * 256
+}
+
+// Helper: read a 32-bit LE value from byte array at offset
+fn elf_read_u32_le(buf: [int], off: int) -> int {
+    return buf[off] + buf[off + 1] * 256 + buf[off + 2] * 65536 + buf[off + 3] * 16777216
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ELF64 HEADER EMISSION
+// ═══════════════════════════════════════════════════════════════
+
+// Emit a complete ELF64 header (64 bytes).
+// machine: em_x86_64() or em_aarch64()
+// entry: virtual address of entry point
+// phoff: offset to program header table (typically 64)
+// phnum: number of program headers
+fn elf_emit_header(machine: int, entry: int, phoff: int, phnum: int) -> [int] {
     let mut out = []
 
-    let code_offset = 0x1000
-    let load_addr = 0x400000
-    let entry = load_addr + code_offset
-
-    // ELF Header (64 bytes)
+    // e_ident[0..4]: magic
     let magic = elf_magic()
     let mut i = 0
     while i < len(magic) {
@@ -39,44 +72,83 @@ fn elf_wrap(code: [int]) -> [int] {
         i = i + 1
     }
     out = out.push(2)   // EI_CLASS: ELFCLASS64
-    out = out.push(1)   // EI_DATA: ELFDATA2LSB
-    out = out.push(1)   // EI_VERSION
-    out = out.push(0)   // EI_OSABI
-    // 8 bytes padding
+    out = out.push(1)   // EI_DATA: ELFDATA2LSB (little-endian)
+    out = out.push(1)   // EI_VERSION: EV_CURRENT
+    out = out.push(0)   // EI_OSABI: ELFOSABI_NONE (System V)
+    // EI_ABIVERSION + 7 bytes padding = 8 zero bytes
     let mut j = 0
     while j < 8 { out = out.push(0); j = j + 1 }
 
-    out = push_u16_le(out, et_exec())
-    out = push_u16_le(out, em_aarch64())
-    out = push_u32_le(out, 1)           // e_version
-    out = push_u64_le(out, entry)       // e_entry
-    out = push_u64_le(out, 64)          // e_phoff
-    out = push_u64_le(out, 0)           // e_shoff
-    out = push_u32_le(out, 0)           // e_flags
-    out = push_u16_le(out, 64)          // e_ehsize
-    out = push_u16_le(out, 56)          // e_phentsize
-    out = push_u16_le(out, 1)           // e_phnum
-    out = push_u16_le(out, 0)           // e_shentsize
-    out = push_u16_le(out, 0)           // e_shnum
-    out = push_u16_le(out, 0)           // e_shstrndx
+    out = elf_push_u16_le(out, et_exec())    // e_type: ET_EXEC
+    out = elf_push_u16_le(out, machine)      // e_machine
+    out = elf_push_u32_le(out, 1)            // e_version: EV_CURRENT
+    out = elf_push_u64_le(out, entry)        // e_entry
+    out = elf_push_u64_le(out, phoff)        // e_phoff
+    out = elf_push_u64_le(out, 0)            // e_shoff (no section headers)
+    out = elf_push_u32_le(out, 0)            // e_flags
+    out = elf_push_u16_le(out, 64)           // e_ehsize
+    out = elf_push_u16_le(out, 56)           // e_phentsize
+    out = elf_push_u16_le(out, phnum)        // e_phnum
+    out = elf_push_u16_le(out, 0)            // e_shentsize
+    out = elf_push_u16_le(out, 0)            // e_shnum
+    out = elf_push_u16_le(out, 0)            // e_shstrndx (SHN_UNDEF)
 
-    // Program Header (56 bytes)
-    out = push_u32_le(out, 1)           // p_type = PT_LOAD
-    out = push_u32_le(out, 5)           // p_flags = PF_R | PF_X
-    out = push_u64_le(out, 0)           // p_offset
-    out = push_u64_le(out, load_addr)   // p_vaddr
-    out = push_u64_le(out, load_addr)   // p_paddr
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  PROGRAM HEADER EMISSION
+// ═══════════════════════════════════════════════════════════════
+
+// Emit a single ELF64 program header (56 bytes).
+fn elf_emit_phdr(p_type: int, p_flags: int, p_offset: int, p_vaddr: int, p_paddr: int, p_filesz: int, p_memsz: int, p_align: int) -> [int] {
+    let mut out = []
+    out = elf_push_u32_le(out, p_type)
+    out = elf_push_u32_le(out, p_flags)
+    out = elf_push_u64_le(out, p_offset)
+    out = elf_push_u64_le(out, p_vaddr)
+    out = elf_push_u64_le(out, p_paddr)
+    out = elf_push_u64_le(out, p_filesz)
+    out = elf_push_u64_le(out, p_memsz)
+    out = elf_push_u64_le(out, p_align)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  elf_wrap — STANDALONE EXECUTABLE (backward compatible)
+// ═══════════════════════════════════════════════════════════════
+// Wraps raw x86_64 machine code in a minimal static ELF64 executable.
+// Single PT_LOAD segment: the entire file mapped RX at 0x400000.
+// Entry point at load_addr + code_offset.
+
+fn elf_wrap(code: [int]) -> [int] {
+    return elf_wrap_machine(code, em_x86_64())
+}
+
+// Wrap code with explicit machine type selection.
+fn elf_wrap_machine(code: [int], machine: int) -> [int] {
+    let code_offset = 0x1000
+    let load_addr = 0x400000
+    let entry = load_addr + code_offset
     let file_size = code_offset + len(code)
-    out = push_u64_le(out, file_size)   // p_filesz
-    out = push_u64_le(out, file_size)   // p_memsz
-    out = push_u64_le(out, 0x1000)      // p_align
 
-    // Pad to code_offset
+    // ELF Header (64 bytes)
+    let mut out = elf_emit_header(machine, entry, 64, 1)
+
+    // Single PT_LOAD program header (56 bytes)
+    let phdr = elf_emit_phdr(pt_load(), pf_r() + pf_x(), 0, load_addr, load_addr, file_size, file_size, 0x1000)
+    let mut pi = 0
+    while pi < len(phdr) {
+        out = out.push(phdr[pi])
+        pi = pi + 1
+    }
+
+    // Pad to code_offset (0x1000)
     while len(out) < code_offset {
         out = out.push(0)
     }
 
-    // Append code
+    // Append code at file offset 0x1000 = vaddr 0x401000
     let mut k = 0
     while k < len(code) {
         out = out.push(code[k])
@@ -85,3 +157,405 @@ fn elf_wrap(code: [int]) -> [int] {
 
     return out
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  elf_wrap_with_data — EXECUTABLE WITH .text + .rodata
+// ═══════════════════════════════════════════════════════════════
+// Two PT_LOAD segments:
+//   1. RX segment: headers + code  (0x400000)
+//   2. R  segment: rodata          (0x600000)
+// Code can reference rodata via absolute addresses starting at 0x600000 + data_offset.
+
+fn elf_wrap_with_data(code: [int], rodata: [int]) -> [int] {
+    let code_offset = 0x1000
+    let load_addr = 0x400000
+    let entry = load_addr + code_offset
+    let code_seg_size = code_offset + len(code)
+
+    let data_load_addr = 0x600000
+    let data_offset = 0x0
+    let data_seg_size = len(rodata)
+
+    // ELF Header: 2 program headers
+    let mut out = elf_emit_header(em_x86_64(), entry, 64, 2)
+
+    // PT_LOAD #1: code (RX)
+    let phdr1 = elf_emit_phdr(pt_load(), pf_r() + pf_x(), 0, load_addr, load_addr, code_seg_size, code_seg_size, 0x1000)
+    let mut p1i = 0
+    while p1i < len(phdr1) {
+        out = out.push(phdr1[p1i])
+        p1i = p1i + 1
+    }
+
+    // PT_LOAD #2: rodata (R)
+    let data_file_offset = code_seg_size
+    let phdr2 = elf_emit_phdr(pt_load(), pf_r(), data_file_offset, data_load_addr, data_load_addr, data_seg_size, data_seg_size, 0x1000)
+    let mut p2i = 0
+    while p2i < len(phdr2) {
+        out = out.push(phdr2[p2i])
+        p2i = p2i + 1
+    }
+
+    // Pad to code_offset
+    while len(out) < code_offset {
+        out = out.push(0)
+    }
+
+    // Append code
+    let mut ci = 0
+    while ci < len(code) {
+        out = out.push(code[ci])
+        ci = ci + 1
+    }
+
+    // Append rodata immediately after code
+    let mut di = 0
+    while di < len(rodata) {
+        out = out.push(rodata[di])
+        di = di + 1
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  x86_64 LINUX SYSCALL HELPERS — raw machine code
+// ═══════════════════════════════════════════════════════════════
+// These produce byte arrays of x86_64 machine code for Linux syscalls.
+// Used by the native codegen backend when targeting Linux.
+//
+// Linux x86_64 syscall convention:
+//   rax = syscall number
+//   rdi = arg1, rsi = arg2, rdx = arg3, r10 = arg4, r8 = arg5, r9 = arg6
+//   Return value in rax. rcx and r11 are clobbered.
+//   Instruction: syscall (0x0f 0x05)
+
+// SYS_write = 1, SYS_exit = 60, SYS_mmap = 9
+fn linux_sys_write() -> int { return 1 }
+fn linux_sys_exit() -> int { return 60 }
+fn linux_sys_mmap() -> int { return 9 }
+
+// x86_64 helper: push bytes for "mov rax, imm32" (48 c7 c0 + imm32)
+fn x86_mov_rax_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(0x48).push(0xc7).push(0xc0)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+// x86_64 helper: push bytes for "mov rdi, imm32" (48 c7 c7 + imm32)
+fn x86_mov_rdi_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(0x48).push(0xc7).push(0xc7)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+// x86_64 helper: push bytes for "mov rsi, imm64" (48 be + 8 byte imm)
+fn x86_mov_rsi_imm64(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(0x48).push(0xbe)
+    let mut v = val
+    let mut i = 0
+    while i < 8 {
+        c = c.push(v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return c
+}
+
+// x86_64 helper: push bytes for "mov rdx, imm32" (48 c7 c2 + imm32)
+fn x86_mov_rdx_imm32(buf: [int], val: int) -> [int] {
+    let mut c = buf.push(0x48).push(0xc7).push(0xc2)
+    c = c.push(val % 256)
+    c = c.push((val / 256) % 256)
+    c = c.push((val / 65536) % 256)
+    c = c.push((val / 16777216) % 256)
+    return c
+}
+
+// syscall instruction: 0f 05
+fn x86_syscall(buf: [int]) -> [int] {
+    return buf.push(0x0f).push(0x05)
+}
+
+// ── Linux rt_exit_x86 ────────────────────────────────────────
+// exit(rdi)
+// mov rax, 60; syscall
+fn rt_exit_x86(exit_code: int) -> [int] {
+    let mut c = []
+    c = x86_mov_rdi_imm32(c, exit_code)  // mov rdi, exit_code
+    c = x86_mov_rax_imm32(c, linux_sys_exit())  // mov rax, 60
+    c = x86_syscall(c)                    // syscall
+    return c
+}
+
+// ── Linux rt_write_x86 ──────────────────────────────────────
+// write(fd, buf_vaddr, length)
+// Caller provides absolute virtual address of the buffer.
+fn rt_write_x86(fd: int, buf_vaddr: int, length: int) -> [int] {
+    let mut c = []
+    c = x86_mov_rdi_imm32(c, fd)           // mov rdi, fd
+    c = x86_mov_rsi_imm64(c, buf_vaddr)    // mov rsi, buf_vaddr (64-bit)
+    c = x86_mov_rdx_imm32(c, length)       // mov rdx, length
+    c = x86_mov_rax_imm32(c, linux_sys_write())  // mov rax, 1
+    c = x86_syscall(c)                      // syscall
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CONVENIENCE: build a "print string and exit" ELF binary
+// ═══════════════════════════════════════════════════════════════
+// Generates a complete standalone ELF64 x86_64 executable that:
+//   1. Writes a string to stdout
+//   2. Exits with code 0
+// The string is embedded in a .rodata segment at 0x600000.
+
+fn elf_hello_binary(msg: [int]) -> [int] {
+    let data_vaddr = 0x600000
+    // Code: write(1, data_vaddr, len(msg)) then exit(0)
+    let mut code = rt_write_x86(1, data_vaddr, len(msg))
+    let exit_code_bytes = rt_exit_x86(0)
+    let mut ei = 0
+    while ei < len(exit_code_bytes) {
+        code = code.push(exit_code_bytes[ei])
+        ei = ei + 1
+    }
+    return elf_wrap_with_data(code, msg)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  CONVENIENCE: build a "print int and exit" ELF binary
+// ═══════════════════════════════════════════════════════════════
+// Generates ELF64 that prints a decimal integer to stdout then exits.
+// The integer is converted to ASCII digits at compile time and
+// embedded as rodata.
+
+fn int_to_ascii_bytes(val: int) -> [int] {
+    if val == 0 {
+        return [48, 10]  // "0\n"
+    }
+    let mut digits = []
+    let mut v = val
+    let mut is_neg = false
+    if v < 0 {
+        is_neg = true
+        v = 0 - v
+    }
+    while v > 0 {
+        digits = digits.push(48 + (v % 10))
+        v = v / 10
+    }
+    // Reverse digits
+    let mut result = []
+    if is_neg {
+        result = result.push(45)  // '-'
+    }
+    let mut ri = len(digits) - 1
+    while ri >= 0 {
+        result = result.push(digits[ri])
+        ri = ri - 1
+    }
+    result = result.push(10)  // '\n'
+    return result
+}
+
+fn elf_print_int_binary(val: int) -> [int] {
+    let ascii = int_to_ascii_bytes(val)
+    return elf_hello_binary(ascii)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  SELF-TEST — validate ELF64 byte-level correctness
+// ═══════════════════════════════════════════════════════════════
+
+fn test_elf64() {
+    println("elf64 — ELF64 emitter self-test")
+
+    let mut ok = true
+
+    // ── Test 1: ELF header structure ──
+    let code = [0x90]  // single NOP
+    let elf = elf_wrap(code)
+
+    // Check magic bytes
+    if elf[0] != 0x7f { println("  FAIL: magic[0]"); ok = false }
+    if elf[1] != 69 { println("  FAIL: magic[1] E"); ok = false }   // 'E'
+    if elf[2] != 76 { println("  FAIL: magic[2] L"); ok = false }   // 'L'
+    if elf[3] != 70 { println("  FAIL: magic[3] F"); ok = false }   // 'F'
+
+    // EI_CLASS = 2 (64-bit)
+    if elf[4] != 2 { println("  FAIL: EI_CLASS"); ok = false }
+    // EI_DATA = 1 (little-endian)
+    if elf[5] != 1 { println("  FAIL: EI_DATA"); ok = false }
+    // EI_VERSION = 1
+    if elf[6] != 1 { println("  FAIL: EI_VERSION"); ok = false }
+
+    // e_type = 2 (ET_EXEC) at offset 16
+    let e_type = elf_read_u16_le(elf, 16)
+    if e_type != 2 { println("  FAIL: e_type=" + to_string(e_type) + " want 2"); ok = false }
+
+    // e_machine = 62 (EM_X86_64) at offset 18
+    let e_machine = elf_read_u16_le(elf, 18)
+    if e_machine != 62 { println("  FAIL: e_machine=" + to_string(e_machine) + " want 62"); ok = false }
+
+    // e_ehsize = 64 at offset 52
+    let e_ehsize = elf_read_u16_le(elf, 52)
+    if e_ehsize != 64 { println("  FAIL: e_ehsize=" + to_string(e_ehsize) + " want 64"); ok = false }
+
+    // e_phentsize = 56 at offset 54
+    let e_phentsize = elf_read_u16_le(elf, 54)
+    if e_phentsize != 56 { println("  FAIL: e_phentsize=" + to_string(e_phentsize) + " want 56"); ok = false }
+
+    // e_phnum = 1 at offset 56
+    let e_phnum = elf_read_u16_le(elf, 56)
+    if e_phnum != 1 { println("  FAIL: e_phnum=" + to_string(e_phnum) + " want 1"); ok = false }
+
+    // e_entry = 0x401000 at offset 24 (load_addr 0x400000 + code_offset 0x1000)
+    let e_entry_lo = elf_read_u32_le(elf, 24)
+    if e_entry_lo != 0x401000 { println("  FAIL: e_entry=" + to_string(e_entry_lo) + " want 4198400"); ok = false }
+
+    // ── Test 2: Program header ──
+    // p_type at offset 64 = PT_LOAD = 1
+    let p_type = elf_read_u32_le(elf, 64)
+    if p_type != 1 { println("  FAIL: p_type=" + to_string(p_type) + " want 1"); ok = false }
+
+    // p_flags at offset 68 = PF_R|PF_X = 5
+    let p_flags = elf_read_u32_le(elf, 68)
+    if p_flags != 5 { println("  FAIL: p_flags=" + to_string(p_flags) + " want 5"); ok = false }
+
+    // ── Test 3: Code at correct offset ──
+    // Code should be at file offset 0x1000
+    if elf[0x1000] != 0x90 { println("  FAIL: code not at 0x1000"); ok = false }
+
+    // Total size should be 0x1000 + 1
+    if len(elf) != 0x1001 { println("  FAIL: total size=" + to_string(len(elf)) + " want 4097"); ok = false }
+
+    // ── Test 4: Header is exactly 64 bytes before phdr ──
+    // Verify padding between phdr end (64+56=120) and code_offset (4096) is zeroed
+    let mut pad_ok = true
+    let mut pi = 120
+    while pi < 0x1000 {
+        if elf[pi] != 0 { pad_ok = false }
+        pi = pi + 1
+    }
+    if !pad_ok { println("  FAIL: non-zero padding"); ok = false }
+
+    // ── Test 5: elf_wrap_machine with aarch64 ──
+    let elf_arm = elf_wrap_machine([0x00], em_aarch64())
+    let arm_machine = elf_read_u16_le(elf_arm, 18)
+    if arm_machine != 183 { println("  FAIL: aarch64 e_machine=" + to_string(arm_machine)); ok = false }
+
+    // ── Test 6: elf_wrap_with_data — two segments ──
+    let code2 = [0xcc, 0xcc]  // two INT3
+    let data2 = [72, 101, 108, 108, 111]  // "Hello"
+    let elf2 = elf_wrap_with_data(code2, data2)
+
+    // Should have 2 program headers
+    let elf2_phnum = elf_read_u16_le(elf2, 56)
+    if elf2_phnum != 2 { println("  FAIL: elf_with_data phnum=" + to_string(elf2_phnum) + " want 2"); ok = false }
+
+    // Code at 0x1000
+    if elf2[0x1000] != 0xcc { println("  FAIL: elf_with_data code[0]"); ok = false }
+    if elf2[0x1001] != 0xcc { println("  FAIL: elf_with_data code[1]"); ok = false }
+
+    // Rodata immediately after code
+    let data_start = 0x1000 + 2
+    if elf2[data_start] != 72 { println("  FAIL: elf_with_data rodata[0] H"); ok = false }
+    if elf2[data_start + 4] != 111 { println("  FAIL: elf_with_data rodata[4] o"); ok = false }
+
+    // ── Test 7: rt_exit_x86 byte pattern ──
+    let exit_bytes = rt_exit_x86(42)
+    // mov rdi, 42: 48 c7 c7 2a 00 00 00
+    if exit_bytes[0] != 0x48 { println("  FAIL: exit REX.W"); ok = false }
+    if exit_bytes[1] != 0xc7 { println("  FAIL: exit mov opcode"); ok = false }
+    if exit_bytes[2] != 0xc7 { println("  FAIL: exit modrm rdi"); ok = false }
+    if exit_bytes[3] != 42 { println("  FAIL: exit imm=42"); ok = false }
+    // mov rax, 60: 48 c7 c0 3c 00 00 00
+    if exit_bytes[7] != 0x48 { println("  FAIL: exit rax REX.W"); ok = false }
+    if exit_bytes[10] != 60 { println("  FAIL: exit syscall num"); ok = false }
+    // syscall: 0f 05
+    if exit_bytes[14] != 0x0f { println("  FAIL: exit syscall[0]"); ok = false }
+    if exit_bytes[15] != 0x05 { println("  FAIL: exit syscall[1]"); ok = false }
+    if len(exit_bytes) != 16 { println("  FAIL: exit size=" + to_string(len(exit_bytes)) + " want 16"); ok = false }
+
+    // ── Test 8: rt_write_x86 byte pattern ──
+    let write_bytes = rt_write_x86(1, 0x600000, 5)
+    // mov rdi, 1: 48 c7 c7 01 00 00 00
+    if write_bytes[3] != 1 { println("  FAIL: write fd=1"); ok = false }
+    // mov rsi, 0x600000: 48 be 00 00 60 00 00 00 00 00
+    if write_bytes[7] != 0x48 { println("  FAIL: write rsi REX"); ok = false }
+    if write_bytes[8] != 0xbe { println("  FAIL: write rsi opcode"); ok = false }
+    if write_bytes[9] != 0x00 { println("  FAIL: write rsi imm[0]"); ok = false }
+    if write_bytes[11] != 0x60 { println("  FAIL: write rsi imm[2]=0x60"); ok = false }
+    // mov rdx, 5: 48 c7 c2 05 00 00 00
+    if write_bytes[20] != 5 { println("  FAIL: write rdx=5"); ok = false }
+    // mov rax, 1: 48 c7 c0 01 00 00 00
+    if write_bytes[27] != 1 { println("  FAIL: write syscall=1"); ok = false }
+    // syscall at end
+    let wlen = len(write_bytes)
+    if write_bytes[wlen - 2] != 0x0f { println("  FAIL: write syscall[0]"); ok = false }
+    if write_bytes[wlen - 1] != 0x05 { println("  FAIL: write syscall[1]"); ok = false }
+
+    // ── Test 9: int_to_ascii_bytes ──
+    let ascii42 = int_to_ascii_bytes(42)
+    if ascii42[0] != 52 { println("  FAIL: ascii42[0]='4' want 52 got " + to_string(ascii42[0])); ok = false }
+    if ascii42[1] != 50 { println("  FAIL: ascii42[1]='2' want 50 got " + to_string(ascii42[1])); ok = false }
+    if ascii42[2] != 10 { println("  FAIL: ascii42[2]='\\n'"); ok = false }
+    if len(ascii42) != 3 { println("  FAIL: ascii42 len=" + to_string(len(ascii42))); ok = false }
+
+    let ascii0 = int_to_ascii_bytes(0)
+    if ascii0[0] != 48 { println("  FAIL: ascii0[0]='0'"); ok = false }
+    if ascii0[1] != 10 { println("  FAIL: ascii0[1]='\\n'"); ok = false }
+
+    let ascii_neg = int_to_ascii_bytes(0 - 7)
+    if ascii_neg[0] != 45 { println("  FAIL: ascii_neg[0]='-'"); ok = false }
+    if ascii_neg[1] != 55 { println("  FAIL: ascii_neg[1]='7'"); ok = false }
+
+    // ── Test 10: elf_print_int_binary — full "print 42" ELF ──
+    let elf42 = elf_print_int_binary(42)
+
+    // Verify it is a valid ELF
+    if elf42[0] != 0x7f { println("  FAIL: elf42 magic[0]"); ok = false }
+    if elf42[1] != 69 { println("  FAIL: elf42 magic[1]"); ok = false }
+    let elf42_type = elf_read_u16_le(elf42, 16)
+    if elf42_type != 2 { println("  FAIL: elf42 e_type"); ok = false }
+    let elf42_machine = elf_read_u16_le(elf42, 18)
+    if elf42_machine != 62 { println("  FAIL: elf42 e_machine"); ok = false }
+
+    // Should have 2 program headers (code + rodata)
+    let elf42_phnum = elf_read_u16_le(elf42, 56)
+    if elf42_phnum != 2 { println("  FAIL: elf42 phnum=" + to_string(elf42_phnum) + " want 2"); ok = false }
+
+    // Code segment starts at 0x1000, should contain syscall instructions
+    // The code starts with mov rdi,1 for write(1, ...)
+    if elf42[0x1000] != 0x48 { println("  FAIL: elf42 code[0] REX"); ok = false }
+
+    // Rodata after code should contain "42\n"
+    // Code size = write (33 bytes) + exit (16 bytes) = 49 bytes
+    // rodata at 0x1000 + 49
+    let rodata_off = 0x1000 + 49
+    if elf42[rodata_off] != 52 { println("  FAIL: elf42 rodata '4' got " + to_string(elf42[rodata_off])); ok = false }
+    if elf42[rodata_off + 1] != 50 { println("  FAIL: elf42 rodata '2'"); ok = false }
+    if elf42[rodata_off + 2] != 10 { println("  FAIL: elf42 rodata '\\n'"); ok = false }
+
+    // Total binary size should be reasonable (< 8KB for this trivial program)
+    if len(elf42) > 8192 { println("  FAIL: elf42 too large: " + to_string(len(elf42))); ok = false }
+    if len(elf42) < 4096 { println("  FAIL: elf42 too small: " + to_string(len(elf42))); ok = false }
+
+    println("  elf_wrap         : " + to_string(len(elf)) + " bytes (1 NOP)")
+    println("  elf_wrap_with_data: " + to_string(len(elf2)) + " bytes (2 INT3 + 5B rodata)")
+    println("  elf_print_int(42): " + to_string(len(elf42)) + " bytes (complete executable)")
+    println("  rt_exit_x86(42) : " + to_string(len(exit_bytes)) + " bytes")
+    println("  rt_write_x86    : " + to_string(len(write_bytes)) + " bytes")
+
+    if ok {
+        println("  ALL CHECKS PASS")
+    }
+}
+
+test_elf64()
