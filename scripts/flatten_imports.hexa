@@ -174,6 +174,9 @@ fn fl_parse_use(line) {
 // O(N) 누적도 안전. 각 라인의 trim/starts_with 는 builtin 으로 처리된다.
 
 fn fl_strip_uses(src) {
+    // index_of 점프로 `use "` 행만 찾아 교체. split+push 16K회 제거.
+    let marker = "\nuse \""
+    if src.index_of(marker) < 0 && !src.starts_with("use \"") { return src }
     let lines = src.split("\n")
     let n = len(lines)
     let mut out = []
@@ -307,66 +310,48 @@ fn fl_scan_private_decls(src) {
     return names
 }
 
-// string/line-comment 를 건드리지 않는 word-boundary replace
+// word-boundary replace — .split(oldname) 1회 방식.
+// runtime.c 에 string GC 없음 → 모든 substring/split 결과가 영구 malloc.
+// 이전 index_of 점프: `src.substring(pos, n)` 반복 → 500KB 복사본 200개 = 11.7GB RSS.
+// 신규: .split(oldname) 1회로 모든 occurrence 세그먼트 획득 → 거대 substring 0개.
 fn fl_word_replace(src, oldname, newname) {
     let n = len(src)
     let L = len(oldname)
     if L == 0 { return src }
-    let mut out = ""
+    if src.index_of(oldname) < 0 { return src }
+    let segments = src.split(oldname)
+    let n_seg = len(segments)
+    if n_seg <= 1 { return src }
+    let mut parts = []
+    let mut pos = 0
     let mut i = 0
-    let mut in_string = false
-    let mut in_line_comment = false
-    while i < n {
-        let c = src.substring(i, i + 1)
-        if in_line_comment {
-            out = out + c
-            if c == "\n" { in_line_comment = false }
-            i = i + 1
-        } else if in_string {
-            if c == "\\" && i + 1 < n {
-                out = out + src.substring(i, i + 2)
-                i = i + 2
-            } else {
-                if c == "\"" { in_string = false }
-                out = out + c
-                i = i + 1
-            }
+    while i < n_seg {
+        let seg = segments[i]
+        let seg_len = len(seg)
+        if i == 0 {
+            parts = parts.push(seg)
+            pos = seg_len
         } else {
-            if c == "\"" {
-                in_string = true
-                out = out + c
-                i = i + 1
-            } else if c == "/" && i + 1 < n && src.substring(i + 1, i + 2) == "/" {
-                in_line_comment = true
-                out = out + "//"
-                i = i + 2
-            } else {
-                let mut matched = false
-                if i + L <= n {
-                    if src.substring(i, i + L) == oldname {
-                        let mut left_ok = true
-                        if i > 0 {
-                            left_ok = !fl_is_ident_char(src.substring(i - 1, i))
-                        }
-                        let mut right_ok = true
-                        if (i + L) < n {
-                            right_ok = !fl_is_ident_char(src.substring(i + L, i + L + 1))
-                        }
-                        if left_ok && right_ok {
-                            out = out + newname
-                            i = i + L
-                            matched = true
-                        }
-                    }
-                }
-                if !matched {
-                    out = out + c
-                    i = i + 1
-                }
+            // oldname 이 src[pos] 에서 시작. word boundary 체크.
+            let match_pos = pos
+            let mut is_word = true
+            if match_pos > 0 {
+                is_word = !fl_is_ident_char(src.substring((match_pos - 1), match_pos))
             }
+            if is_word && (match_pos + L) < n {
+                is_word = !fl_is_ident_char(src.substring((match_pos + L), (match_pos + L + 1)))
+            }
+            if is_word {
+                parts = parts.push(newname)
+            } else {
+                parts = parts.push(oldname)
+            }
+            parts = parts.push(seg)
+            pos = match_pos + L + seg_len
         }
+        i = i + 1
     }
-    return out
+    return parts.join("")
 }
 
 // ── 재귀 walk: 토포 정렬 (leaves first) ─────────────────────
@@ -550,14 +535,17 @@ if len(collided_str) > 1 {
 // Each file is processed in isolation: read → scan decls → mangle collided
 // → strip uses → append to flat_str. No parallel arrays.
 
-let mut flat_str = "// === FLATTENED by scripts/flatten_imports.hexa ===\n"
-flat_str = flat_str + "// target: " + target + "\n"
-flat_str = flat_str + "// files:  " + str(m) + "\n"
-flat_str = flat_str + "// order:  reverse-topo (root-first, leaves-last)\n"
+// O(n) 출력: parts 배열에 모아 최종 1회 join.
+// 이전 `flat_str = flat_str + big_chunk` 반복은 O(total²) — 메모리 폭주 원인 #2.
+let mut flat_parts = []
+flat_parts = flat_parts.push("// === FLATTENED by scripts/flatten_imports.hexa ===\n")
+flat_parts = flat_parts.push("// target: " + target + "\n")
+flat_parts = flat_parts.push("// files:  " + str(m) + "\n")
+flat_parts = flat_parts.push("// order:  reverse-topo (root-first, leaves-last)\n")
 if len(collided_str) > 1 {
-    flat_str = flat_str + "// mangled: " + collided_str.substring(1, len(collided_str) - 1) + "\n"
+    flat_parts = flat_parts.push("// mangled: " + collided_str.substring(1, len(collided_str) - 1) + "\n")
 }
-flat_str = flat_str + "\n"
+flat_parts = flat_parts.push("\n")
 
 let mut ei = 0
 while ei < m {
@@ -584,11 +572,12 @@ while ei < m {
     }
 
     let stripped = fl_strip_uses(body_mut)
-    flat_str = flat_str + "\n// ----- BEGIN " + fl_basename(f) + " -----\n"
-    flat_str = flat_str + stripped
-    flat_str = flat_str + "\n// ----- END " + fl_basename(f) + " -----\n"
+    flat_parts = flat_parts.push("\n// ----- BEGIN " + fl_basename(f) + " -----\n")
+    flat_parts = flat_parts.push(stripped)
+    flat_parts = flat_parts.push("\n// ----- END " + fl_basename(f) + " -----\n")
     ei = ei + 1
 }
+let flat_str = flat_parts.join("")
 
 // Atomic write: write to a temp file, then mv to final output.
 // This prevents race conditions where two concurrent flatten_imports
