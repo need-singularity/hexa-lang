@@ -6722,6 +6722,8 @@ static HexaIC __hexa_codegen_c2_ic_272 = {0};
 static HexaIC __hexa_codegen_c2_ic_800 = {0};
 static HexaIC __hexa_codegen_c2_ic_801 = {0};
 static HexaIC __hexa_codegen_c2_ic_802 = {0};
+static HexaIC __hexa_codegen_c2_ic_803 = {0};
+static HexaIC __hexa_codegen_c2_ic_804 = {0};
 static HexaIC __hexa_codegen_c2_ic_273 = {0};
 static HexaIC __hexa_codegen_c2_ic_274 = {0};
 static HexaIC __hexa_codegen_c2_ic_275 = {0};
@@ -8435,6 +8437,9 @@ HexaVal gen2_expr(HexaVal node) {
         }
         if (hexa_truthy(hexa_eq(hexa_map_get_ic(node, "op", &__hexa_codegen_c2_ic_222), hexa_str("!")))) {
             return hexa_add(hexa_add(hexa_str("hexa_bool(!hexa_truthy("), gen2_expr(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_223))), hexa_str("))"));
+        }
+        if (hexa_truthy(hexa_eq(hexa_map_get_ic(node, "op", &__hexa_codegen_c2_ic_803), hexa_str("~")))) {
+            return hexa_add(hexa_add(hexa_str("hexa_int(~hexa_as_num("), gen2_expr(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_804))), hexa_str("))"));
         }
         (hexa_eprint_val(hexa_add(hexa_str("[codegen_c2] ERROR: unhandled unary operator: "), hexa_map_get_ic(node, "op", &__hexa_codegen_c2_ic_224))), fprintf(stderr, "\n"), hexa_void());
         return hexa_add(hexa_add(hexa_str("(fprintf(stderr, \"CODEGEN ERROR: unhandled unary op: "), hexa_map_get_ic(node, "op", &__hexa_codegen_c2_ic_225)), hexa_str("\\n\"), exit(1), hexa_void())"));
