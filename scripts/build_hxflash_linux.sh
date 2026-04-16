@@ -84,6 +84,12 @@ if [ "$MODE" = "--mac-xverify" ]; then
         echo "  hxflash_version SYMBOL=MISSING" >&2
         exit 5
     fi
+    if nm -gU "$XV_DIR/libhxflash_xverify.dylib" | grep -q '_hxflash_attn_fwd_packed'; then
+        echo "  hxflash_attn_fwd_packed SYMBOL=PRESENT"
+    else
+        echo "  hxflash_attn_fwd_packed SYMBOL=MISSING" >&2
+        exit 6
+    fi
     echo "── xverify output ──"
     ls -la "$XV_DIR"/libhxflash_xverify.dylib
     echo "done — Linux source compiles + links on Mac; ready to push"
@@ -121,6 +127,12 @@ if [ "$MODE" = "--mac-native" ]; then
     else
         echo "  hxflash_attn_fwd SYMBOL=MISSING" >&2
         exit 4
+    fi
+    if nm -gU "$OUT_DIR/libhxflash.dylib" | grep -q '_hxflash_attn_fwd_packed'; then
+        echo "  hxflash_attn_fwd_packed SYMBOL=PRESENT"
+    else
+        echo "  hxflash_attn_fwd_packed SYMBOL=MISSING" >&2
+        exit 5
     fi
     echo "── mac-native output ──"
     ls -la "$OUT_DIR/libhxflash.dylib"

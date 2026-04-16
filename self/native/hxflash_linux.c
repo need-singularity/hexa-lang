@@ -245,12 +245,51 @@ void hxflash_attn_fwd(int64_t S, int64_t D,
 }
 
 // ─────────────────────────────────────────────────────────────
+// Struct-args ABI (2026-04-16 C8 fix)
+//
+// The 12-positional-arg hxflash_attn_fwd above exceeds the Hexa
+// interpreter's host_ffi_call_6 6-slot ceiling (see self/runtime.c
+// hexa_host_ffi_call_6 — args 7+ arrive uninitialised). The fix
+// mirrors the hxlmhead_bwd pattern: pack all 12 args into a heap
+// HxFlashArgs struct and pass a single int64 pointer through FFI.
+//
+// Field order is ABI; do not reorder. New fields go BEFORE reserved0
+// OR consume reserved bits. All pointers stored as int64_t for
+// binary-clean hexa marshalling (ptr_write writes int as 8 bytes).
+// ─────────────────────────────────────────────────────────────
+typedef struct HxFlashArgs {
+    int64_t S, D;                  // seq_len, head_dim
+    int64_t n_heads, n_kv_heads;   // GQA dims
+    int64_t Br, Bc;                // block tiling sizes
+    int64_t causal;                // bool flag (0/1)
+    int64_t q_p, k_p, v_p, o_p;    // float32* buffers
+    double  scale;                 // attention scale (1/sqrt(D))
+    int64_t reserved0;             // future flags
+} HxFlashArgs;
+
+// hxflash_attn_fwd_packed — single-pointer entry point for Hexa FFI.
+// Unpacks HxFlashArgs and delegates to the existing 12-arg kernel.
+// Returns: 0 on success, negative on error.
+//   -1 : null args pointer
+int64_t hxflash_attn_fwd_packed(int64_t args_p) {
+    if (args_p == 0) return -1;
+    HxFlashArgs* a = (HxFlashArgs*)(uintptr_t)args_p;
+    hxflash_attn_fwd(a->S, a->D,
+                     a->n_heads, a->n_kv_heads,
+                     a->Br, a->Bc, a->causal,
+                     a->q_p, a->k_p, a->v_p, a->o_p,
+                     a->scale);
+    return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
 // ABI version probe — matches hxblas_version / hxvdsp_version /
 // hxlayer_version style. Start at 1; bump on any breaking signature
 // change (e.g. Day-2 causal fast path, backward pass, dtype fan-out).
+// v2 adds hxflash_attn_fwd_packed (struct-args ABI).
 // ─────────────────────────────────────────────────────────────
 int64_t hxflash_version(void) {
-    return 1;
+    return 2;
 }
 
 #endif /* __linux__ */
