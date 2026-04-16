@@ -240,6 +240,7 @@ typedef enum {
 typedef struct {
     char*  key;       // owned string (strdup'd) -- NULL means empty slot
     uint32_t hash;    // cached FNV-1a of key
+    int order_idx;    // ROI-24: index into order_keys/order_vals arrays — O(1) update
 } HexaMapSlot;
 
 typedef struct {
@@ -1033,12 +1034,14 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             memcpy(tdup, type_name, tnl + 1);
             tv.s = tdup;
             t->slots[idx].hash = h;
+            t->slots[idx].order_idx = t->len;  // ROI-24
             t->vals[idx] = tv;
             t->order_keys[t->len] = t->slots[idx].key;
             t->order_vals[t->len] = tv;
         } else {
             t->slots[idx].key = strdup("__type__");
             t->slots[idx].hash = h;
+            t->slots[idx].order_idx = t->len;  // ROI-24
             HexaVal tv = {.tag=TAG_STR};
             tv.s = strdup(type_name);
             t->vals[idx] = tv;
@@ -1061,6 +1064,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             t->slots[idx].key = strdup(k);
         }
         t->slots[idx].hash = h;
+        t->slots[idx].order_idx = t->len;  // ROI-24
         t->vals[idx] = vals[i];
         t->order_keys[t->len] = t->slots[idx].key;
         t->order_vals[t->len] = vals[i];
@@ -1087,13 +1091,8 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
     int si = hmap_find(t, key, h);
     if (si >= 0) {
         t->vals[si] = val;
-        // Also update in the order array
-        for (int i = 0; i < t->len; i++) {
-            if (t->order_keys[i] == t->slots[si].key) {
-                t->order_vals[i] = val;
-                break;
-            }
-        }
+        // ROI-24: O(1) order-array update via cached order_idx
+        t->order_vals[t->slots[si].order_idx] = val;
         return m;
     }
 
@@ -1108,6 +1107,7 @@ HexaVal hexa_map_set(HexaVal m, const char* key, HexaVal val) {
     while (t->slots[idx].key) idx = (idx + 1) & mask;
     t->slots[idx].key  = strdup(key);
     t->slots[idx].hash = h;
+    t->slots[idx].order_idx = t->len;  // ROI-24: record order position
     t->vals[idx] = val;
 
     // Append to insertion-order arrays
@@ -1274,15 +1274,16 @@ HexaVal hexa_map_remove(HexaVal m, const char* key) {
     int si = hmap_find(t, key, h);
     if (si < 0) return m;
 
-    // Remove from insertion-order arrays
-    char* removed_key = t->slots[si].key;
-    for (int i = 0; i < t->len; i++) {
-        if (t->order_keys[i] == removed_key) {
-            for (int j = i; j < t->len - 1; j++) {
-                t->order_keys[j] = t->order_keys[j+1];
-                t->order_vals[j] = t->order_vals[j+1];
-            }
-            break;
+    // ROI-24: O(1) locate in order array via cached order_idx, then shift
+    int oi = t->slots[si].order_idx;
+    for (int j = oi; j < t->len - 1; j++) {
+        t->order_keys[j] = t->order_keys[j+1];
+        t->order_vals[j] = t->order_vals[j+1];
+    }
+    // Fix order_idx for all hash-table slots whose order position shifted
+    for (int j = 0; j < t->ht_cap; j++) {
+        if (t->slots[j].key && t->slots[j].order_idx > oi) {
+            t->slots[j].order_idx--;
         }
     }
 
@@ -1301,15 +1302,8 @@ HexaVal hexa_map_remove(HexaVal m, const char* key) {
         t->slots[ci].hash = 0;
         uint32_t ri = saved_slot.hash & mask;
         while (t->slots[ri].key) ri = (ri + 1) & mask;
-        t->slots[ri] = saved_slot;
+        t->slots[ri] = saved_slot;  // ROI-24: order_idx carried in struct copy
         t->vals[ri] = saved_val;
-        // Update order_keys pointer if it moved
-        for (int k = 0; k < t->len; k++) {
-            if (t->order_keys[k] == saved_slot.key) {
-                // pointer unchanged, just slot index moved -- no action needed
-                break;
-            }
-        }
         ci = (ci + 1) & mask;
     }
 
@@ -1873,8 +1867,8 @@ static HexaMapTable* hmap_heapify(HexaMapTable* src) {
         while (dst->slots[idx].key) idx = (idx + 1) & mask;
         dst->slots[idx].key = strdup(k);
         dst->slots[idx].hash = h;
+        dst->slots[idx].order_idx = dst->len;  // ROI-24
         HexaVal nv = hexa_val_heapify(src->order_vals[i]);
-        dst->slots[idx].key = dst->slots[idx].key;
         dst->vals[idx] = nv;
         dst->order_keys[dst->len] = dst->slots[idx].key;
         dst->order_vals[dst->len] = nv;
