@@ -500,6 +500,63 @@ HexaVal hexa_str_own(char* s) {
     return (HexaVal){.tag=TAG_STR, .s=s};
 }
 
+// ═══════════════════════════════════════════════════════════
+//  ROI-33: Pre-interned string cache
+//  "true","false","void" (+ type_of strings) are used on every
+//  hexa_to_string / hexa_type_of call.  Cache them as static
+//  HexaVal so we skip strlen+hash+probe entirely.
+//  Lazy-init on first access (no constructor needed).
+// ═══════════════════════════════════════════════════════════
+
+static HexaVal _cached_str_true;
+static HexaVal _cached_str_false;
+static HexaVal _cached_str_void;
+static HexaVal _cached_str_int;
+static HexaVal _cached_str_float;
+static HexaVal _cached_str_bool;
+static HexaVal _cached_str_string;
+static HexaVal _cached_str_array;
+static HexaVal _cached_str_map;
+static HexaVal _cached_str_struct;
+static HexaVal _cached_str_unknown;
+static HexaVal _cached_str_value;  // "<value>" fallback
+static int     _cached_strs_ready = 0;
+
+static void _hexa_init_cached_strs(void) {
+    if (_cached_strs_ready) return;
+    _cached_str_true    = hexa_str("true");
+    _cached_str_false   = hexa_str("false");
+    _cached_str_void    = hexa_str("void");
+    _cached_str_int     = hexa_str("int");
+    _cached_str_float   = hexa_str("float");
+    _cached_str_bool    = hexa_str("bool");
+    _cached_str_string  = hexa_str("string");
+    _cached_str_array   = hexa_str("array");
+    _cached_str_map     = hexa_str("map");
+    _cached_str_struct  = hexa_str("struct");
+    _cached_str_unknown = hexa_str("unknown");
+    _cached_str_value   = hexa_str("<value>");
+    _cached_strs_ready  = 1;
+}
+
+// Small-int to_string cache: [-1, 0..255] covers >90% of int-to-string
+#define SMALL_INT_CACHE_MIN  (-1)
+#define SMALL_INT_CACHE_MAX  255
+#define SMALL_INT_CACHE_SIZE (SMALL_INT_CACHE_MAX - SMALL_INT_CACHE_MIN + 1)
+static HexaVal _cached_small_ints[SMALL_INT_CACHE_SIZE];
+static int     _cached_small_ints_ready = 0;
+
+static void _hexa_init_small_int_cache(void) {
+    if (_cached_small_ints_ready) return;
+    char buf[16];
+    for (int i = 0; i < SMALL_INT_CACHE_SIZE; i++) {
+        int64_t n = (int64_t)(i + SMALL_INT_CACHE_MIN);
+        snprintf(buf, 16, "%lld", (long long)n);
+        _cached_small_ints[i] = hexa_str(buf);
+    }
+    _cached_small_ints_ready = 1;
+}
+
 // ── Array operations ─────────────────────────────────────
 
 // rt 32: alloc/COW stats (HEXA_ALLOC_STATS=1 env enables atexit dump).
@@ -2262,13 +2319,22 @@ void hexa_println(HexaVal v) { hexa_print_val(v); printf("\n"); }
 // ── to_string ────────────────────────────────────────────
 
 HexaVal hexa_to_string(HexaVal v) {
+    if (!_cached_strs_ready) _hexa_init_cached_strs();
     char buf[64];
     switch (v.tag) {
-        case TAG_INT: snprintf(buf, 64, "%lld", (long long)v.i); return hexa_str(buf);
+        case TAG_INT: {
+            // ROI-33: small-int cache hit — skip snprintf+intern entirely
+            if (v.i >= SMALL_INT_CACHE_MIN && v.i <= SMALL_INT_CACHE_MAX) {
+                if (!_cached_small_ints_ready) _hexa_init_small_int_cache();
+                return _cached_small_ints[v.i - SMALL_INT_CACHE_MIN];
+            }
+            snprintf(buf, 64, "%lld", (long long)v.i);
+            return hexa_str(buf);
+        }
         case TAG_FLOAT: snprintf(buf, 64, "%g", v.f); return hexa_str(buf);
-        case TAG_BOOL: return hexa_str(v.b ? "true" : "false");
+        case TAG_BOOL: return v.b ? _cached_str_true : _cached_str_false;
         case TAG_STR: return v;
-        case TAG_VOID: return hexa_str("void");
+        case TAG_VOID: return _cached_str_void;
         // rt 32-G: minimal fallback repr — interpreter has its own
         // val_to_string for the full form.
         case TAG_VALSTRUCT: {
@@ -2277,7 +2343,7 @@ HexaVal hexa_to_string(HexaVal v) {
                 (long long)v.vs->tag_i, (long long)v.vs->int_val);
             return hexa_str(buf);
         }
-        default: return hexa_str("<value>");
+        default: return _cached_str_value;
     }
 }
 
@@ -2298,17 +2364,18 @@ int hexa_truthy(HexaVal v) {
 // ── Type checking ────────────────────────────────────────
 
 HexaVal hexa_type_of(HexaVal v) {
+    if (!_cached_strs_ready) _hexa_init_cached_strs();
     switch (v.tag) {
-        case TAG_INT: return hexa_str("int");
-        case TAG_FLOAT: return hexa_str("float");
-        case TAG_BOOL: return hexa_str("bool");
-        case TAG_STR: return hexa_str("string");
-        case TAG_VOID: return hexa_str("void");
-        case TAG_ARRAY: return hexa_str("array");
-        case TAG_MAP: return hexa_str("map");
+        case TAG_INT: return _cached_str_int;
+        case TAG_FLOAT: return _cached_str_float;
+        case TAG_BOOL: return _cached_str_bool;
+        case TAG_STR: return _cached_str_string;
+        case TAG_VOID: return _cached_str_void;
+        case TAG_ARRAY: return _cached_str_array;
+        case TAG_MAP: return _cached_str_map;
         // rt 32-G: Val is a struct at the Hexa level; surface "struct".
-        case TAG_VALSTRUCT: return hexa_str("struct");
-        default: return hexa_str("unknown");
+        case TAG_VALSTRUCT: return _cached_str_struct;
+        default: return _cached_str_unknown;
     }
 }
 
