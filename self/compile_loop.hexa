@@ -1,0 +1,477 @@
+// self/compile_loop.hexa — P7-8 backward-branch loop native Mach-O emitter.
+//
+// Companion to compile_add / compile_sub / compile_mul / compile_if /
+// compile_factorial. This is the first of the family whose sole purpose is
+// to exercise a BACKWARD B.cond (negative imm19) plus an ADD-immediate
+// for the loop counter — factorial already walked the terrain for
+// SUB-immediate + B.GT, so here we stress ADD-immediate + B.NE (the
+// inverse pair) and add a named B.LT cond helper for symmetry.
+//
+// source (conceptual):
+//   fn main() -> Int {
+//       let mut sum = 0
+//       let mut i   = 1
+//       while i != 11 { sum = sum + i; i = i + 1 }
+//       return sum           // = 1+2+...+10 = 55
+//   }
+//
+// emitted .text layout:
+//   offset  instr                          mnemonic
+//   ──────  ─────                          ────────
+//     0     MOVZ  x0, #0                    ; sum = 0
+//     4     MOVZ  x1, #1                    ; i = 1
+//     8     ADD   x0, x0, x1                ; loop: sum += i
+//    12     ADD   x1, x1, #1                ; i += 1
+//    16     CMP   x1, #11                   ; flags from (i - 11)
+//    20     B.NE  loop   (disp = 8-20 = -12); backward imm19 = -3
+//    24     MOVZ  x16, #0x0001
+//    28     MOVK  x16, #0x0200, LSL #16     ; x16 = 0x2000001 (SYS_exit)
+//    32     SVC   #0x80                     ; exit(sum) — x0 holds it
+//
+// ARM64 encodings newly introduced here:
+//   ADD (register) Xd, Xn, Xm      (shift=0)
+//     0x8B000000 | (Rm << 16) | (Rn << 5) | Rd
+//   ADD (immediate) Xd, Xn, #imm12 (shift=0)
+//     0x91000000 | (imm12 << 10) | (Rn << 5) | Rd
+//   B.NE cond = 0x1
+//   B.LT cond = 0xB   (helper named, so callers don't have to remember the nibble)
+//
+// Output: /tmp/hexa_loop_native — runs, exits 55, zero clang / as / ld.
+
+// ═══════════════════════════════════════════════════════════
+//  Inline ARM64 encoders — mirrors compile_if / compile_factorial so
+//  the file is standalone under hexa_stage0.
+// ═══════════════════════════════════════════════════════════
+
+fn emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+// MOVZ Xd, #imm16, LSL #0
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 0xd2800000 + (imm16 * 32) + rd
+}
+
+// MOVK Xd, #imm16, LSL #hw*16
+fn enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 0xf2800000 + (hw * 2097152) + (imm16 * 32) + rd
+}
+
+// SVC #imm16
+fn enc_svc(imm16: int) -> int {
+    return 0xd4000001 + (imm16 * 32)
+}
+
+// ADD (shifted register) Xd, Xn, Xm   (shift=0)
+//   0x8B000000 | (Rm << 16) | (Rn << 5) | Rd
+fn enc_add_reg(rd: int, rn: int, rm: int) -> int {
+    return 0x8b000000 + (rm * 65536) + (rn * 32) + rd
+}
+
+// ADD (immediate) Xd, Xn, #imm12   (shift=0)
+//   0x91000000 | (imm12 << 10) | (Rn << 5) | Rd
+fn enc_add_imm(rd: int, rn: int, imm12: int) -> int {
+    return 0x91000000 + (imm12 * 1024) + (rn * 32) + rd
+}
+
+// CMP (immediate) Xn, #imm12  == SUBS XZR, Xn, #imm12
+//   0xF1000000 | (imm12 << 10) | (Rn << 5) | 31
+fn enc_cmp_imm(rn: int, imm12: int) -> int {
+    return 0xf1000000 + (imm12 * 1024) + (rn * 32) + 31
+}
+
+// B.cond <label>
+//   0x54000000 | ((imm19 & 0x7FFFF) << 5) | cond4
+//   disp_bytes is target_byte - current_byte (can be negative).
+fn enc_bcond(cond: int, disp_bytes: int) -> int {
+    let mut imm19 = disp_bytes / 4
+    if imm19 < 0 { imm19 = imm19 + 524288 }  // sign-extend into 19-bit field
+    return 0x54000000 + ((imm19 % 524288) * 32) + (cond % 16)
+}
+
+fn cond_ne() -> int { return 1 }    // B.NE  = 0b0001
+fn cond_lt() -> int { return 11 }   // B.LT  = 0b1011
+
+// ═══════════════════════════════════════════════════════════
+//  Build the .text for sum(1..10):
+//    0:  MOVZ x0, #0          sum = 0
+//    4:  MOVZ x1, #1          i   = 1
+//    8:  ADD  x0, x0, x1      <- loop: sum += i
+//   12:  ADD  x1, x1, #1      i += 1
+//   16:  CMP  x1, #11         flags from (i - 11)
+//   20:  B.NE loop            disp = 8 - 20 = -12
+//   24:  MOVZ x16, #0x0001
+//   28:  MOVK x16, #0x0200, LSL #16
+//   32:  SVC  #0x80
+//  (36 bytes total)
+// ═══════════════════════════════════════════════════════════
+
+fn build_text_section() -> [int] {
+    let loop_off   = 8
+    let branch_off = 20
+    let disp = loop_off - branch_off   // -12
+
+    let mut insts = []
+    insts = insts.push(enc_movz(0, 0))              // 0:  sum = 0
+    insts = insts.push(enc_movz(1, 1))              // 4:  i = 1
+    insts = insts.push(enc_add_reg(0, 0, 1))        // 8:  loop: sum += i
+    insts = insts.push(enc_add_imm(1, 1, 1))        // 12: i += 1
+    insts = insts.push(enc_cmp_imm(1, 11))          // 16: cmp i, #11
+    insts = insts.push(enc_bcond(cond_ne(), disp))  // 20: b.ne loop (-12 → imm19=-3)
+    insts = insts.push(enc_movz(16, 1))             // 24: movz x16, #1
+    insts = insts.push(enc_movk(16, 0x200, 1))      // 28: movk x16, #0x200, LSL #16
+    insts = insts.push(enc_svc(0x80))               // 32: svc #0x80  (exit with x0)
+
+    let mut bytes = []
+    let mut i = 0
+    while i < len(insts) {
+        bytes = emit32_le(bytes, insts[i])
+        i = i + 1
+    }
+
+    while len(bytes) % 4 != 0 {
+        bytes = bytes.push(0)
+    }
+    return bytes
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mach-O MH_EXECUTE wrapper — identical structure to compile_if /
+//  compile_factorial so this file stays self-contained.
+// ═══════════════════════════════════════════════════════════
+
+fn u32_to_hex(v: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[(v % 256) / 16])
+    parts.push(h[(v % 256) % 16])
+    parts.push(h[((v / 256) % 256) / 16])
+    parts.push(h[((v / 256) % 256) % 16])
+    parts.push(h[((v / 65536) % 256) / 16])
+    parts.push(h[((v / 65536) % 256) % 16])
+    parts.push(h[((v / 16777216) % 256) / 16])
+    parts.push(h[((v / 16777216) % 256) % 16])
+    return parts.join("")
+}
+
+fn u64_to_hex(v: int, h: string) -> string {
+    let lo = v % 4294967296
+    let hi = v / 4294967296
+    return u32_to_hex(lo, h) + u32_to_hex(hi, h)
+}
+
+fn byte_to_hex(b: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[b / 16])
+    parts.push(h[b % 16])
+    return parts.join("")
+}
+
+fn build_macho_hex(text_bytes: [int]) -> string {
+    let HEX = "0123456789abcdef"
+    let MH_MAGIC_64 = 4277009103
+    let CPU_ARM64   = 16777228
+    let MH_EXECUTE  = 2
+    let HDR_FLAGS   = 2097285
+    let NCMDS       = 11
+    let SIZEOFCMDS  = 576
+    let PAGE        = 16384
+    let CODE_OFF    = 768
+
+    let code_bytes = len(text_bytes)
+    let mut text_size_aligned = code_bytes
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    let mut parts = []
+    let hdr_u32 = [MH_MAGIC_64, CPU_ARM64, 0, MH_EXECUTE, NCMDS, SIZEOFCMDS, HDR_FLAGS, 0]
+    let mut hi = 0
+    while hi < len(hdr_u32) {
+        parts.push(u32_to_hex(hdr_u32[hi], HEX))
+        hi = hi + 1
+    }
+
+    // LC_SEGMENT_64 __PAGEZERO
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f504147455a45524f0000000000" + "00")
+    parts.push("0000000000000000")
+    parts.push("0000000001000000")
+    parts.push("0000000000000000")
+    parts.push("0000000000000000")
+    parts.push("00000000" + "00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __TEXT
+    parts.push("19000000" + "98000000")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push("0000000001000000")
+    parts.push("0040000000000000")
+    parts.push("0000000000000000")
+    parts.push("0040000000000000")
+    parts.push("05000000")
+    parts.push("05000000")
+    parts.push("01000000")
+    parts.push("00000000")
+
+    // section __text
+    parts.push("5f5f74657874000000000000000000" + "00")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push(u64_to_hex(4294967296 + CODE_OFF, HEX))
+    parts.push(u64_to_hex(text_size_aligned, HEX))
+    parts.push(u32_to_hex(CODE_OFF, HEX))
+    parts.push("02000000")
+    parts.push("00000000" + "00000000")
+    parts.push("00040080")
+    parts.push("00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __LINKEDIT
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f4c494e4b45444954000000000000")
+    parts.push("0040000001000000")
+    parts.push("0040000000000000")
+    parts.push("0040000000000000")
+    parts.push("3100000000000000")
+    parts.push("01000000" + "01000000")
+    parts.push("00000000" + "00000000")
+
+    // LC_DYLD_CHAINED_FIXUPS
+    parts.push("34000080" + "10000000" + "00400000" + "30000000")
+
+    // LC_SYMTAB
+    parts.push("02000000" + "18000000")
+    parts.push("30400000")
+    parts.push("00000000")
+    parts.push("30400000")
+    parts.push("01000000")
+
+    // LC_DYSYMTAB
+    parts.push("0b000000" + "50000000")
+    let mut dyz_parts = []
+    let mut dyz = 0
+    while dyz < 72 {
+        dyz_parts.push("00")
+        dyz = dyz + 1
+    }
+    parts.push(dyz_parts.join(""))
+
+    // LC_LOAD_DYLINKER
+    parts.push("0e000000" + "20000000" + "0c000000")
+    parts.push("2f7573722f6c69622f64796c6400")
+    parts.push("000000000000")
+
+    // LC_UUID
+    parts.push("1b000000" + "18000000")
+    parts.push("48455841414243444546303132333435")
+
+    // LC_BUILD_VERSION
+    parts.push("32000000" + "18000000")
+    parts.push("01000000")
+    parts.push("00000e00")
+    parts.push("00000e00")
+    parts.push("00000000")
+
+    // LC_MAIN
+    parts.push("28000080" + "18000000")
+    parts.push(u64_to_hex(CODE_OFF, HEX))
+    parts.push("0000000000000000")
+
+    // LC_LOAD_DYLIB libSystem
+    parts.push("0c000000" + "38000000")
+    parts.push("18000000")
+    parts.push("02000000")
+    parts.push("00000100")
+    parts.push("00000100")
+    parts.push("2f7573722f6c69622f6c69625379737465")
+    parts.push("6d2e422e64796c696200000000000000")
+
+    let mut s = parts.join("")
+
+    while (len(s) / 2) < CODE_OFF {
+        s = s + "00"
+    }
+
+    let mut bi = 0
+    while bi < len(text_bytes) {
+        s = s + byte_to_hex(text_bytes[bi], HEX)
+        bi = bi + 1
+    }
+
+    while (len(s) / 2) < PAGE {
+        s = s + "00"
+    }
+
+    s = s + "00000000"
+    s = s + "20000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "01000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "03000000"
+    s = s + "00000000" + "00000000" + "00000000"
+    s = s + "00"
+
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Driver
+// ═══════════════════════════════════════════════════════════
+
+fn sum_ref() -> int {
+    let mut s = 0
+    let mut i = 1
+    while i <= 10 { s = s + i; i = i + 1 }
+    return s
+}
+
+println("=== P7-8 compile_loop: backward-branch native Mach-O ===")
+println("")
+println("source (conceptual):")
+println("  fn main() -> Int {")
+println("    let mut sum = 0; let mut i = 1")
+println("    while i != 11 { sum = sum + i; i = i + 1 }")
+println("    return sum   // 1+2+...+10 = 55")
+println("  }")
+println("")
+
+// Step 1: emit .text with backward B.NE.
+println("[1] emit .text with ADD-reg / ADD-imm / CMP-imm / backward B.NE...")
+let text = build_text_section()
+println("  text bytes: " + to_string(len(text)))
+
+// Verify ADD x0, x0, x1 at offset 8:
+//   0x8B010000 | 0 | 0  = 0x8B010000 (LE: 00 00 01 8b)
+let a0 = text[8]
+let a1 = text[9]
+let a2 = text[10]
+let a3 = text[11]
+println("  ADD-reg @8:   " + to_string(a0) + " " + to_string(a1) + " " + to_string(a2) + " " + to_string(a3))
+let add_reg_ok = a0 == 0 && a1 == 0 && a2 == 1 && a3 == 139
+if add_reg_ok {
+    println("  [PASS] ADD x0, x0, x1 = 0x8B010000")
+} else {
+    println("  [FAIL] ADD-reg encoding wrong — expected 00 00 01 8b")
+}
+
+// Verify ADD x1, x1, #1 at offset 12:
+//   0x91000000 | (1<<10) | (1<<5) | 1  = 0x91000421 (LE: 21 04 00 91)
+let ai0 = text[12]
+let ai1 = text[13]
+let ai2 = text[14]
+let ai3 = text[15]
+println("  ADD-imm @12:  " + to_string(ai0) + " " + to_string(ai1) + " " + to_string(ai2) + " " + to_string(ai3))
+let add_imm_ok = ai0 == 33 && ai1 == 4 && ai2 == 0 && ai3 == 145
+if add_imm_ok {
+    println("  [PASS] ADD x1, x1, #1 = 0x91000421")
+} else {
+    println("  [FAIL] ADD-imm encoding wrong — expected 21 04 00 91")
+}
+
+// Verify CMP x1, #11 at offset 16:
+//   0xF1000000 | (11<<10) | (1<<5) | 31  = 0xF1002C3F (LE: 3f 2c 00 f1)
+let ci0 = text[16]
+let ci1 = text[17]
+let ci2 = text[18]
+let ci3 = text[19]
+println("  CMP-imm @16:  " + to_string(ci0) + " " + to_string(ci1) + " " + to_string(ci2) + " " + to_string(ci3))
+let cmp_ok = ci0 == 63 && ci1 == 44 && ci2 == 0 && ci3 == 241
+if cmp_ok {
+    println("  [PASS] CMP x1, #11 = 0xF1002C3F")
+} else {
+    println("  [FAIL] CMP-imm encoding wrong — expected 3f 2c 00 f1")
+}
+
+// Verify B.NE backward at offset 20:
+//   disp = -12 bytes → imm19 = -3 → sign-extended 19 bits = 0x7FFFD
+//   instr = 0x54000000 | (0x7FFFD << 5) | 0x1 = 0x54FFFFA1 (LE: a1 ff ff 54)
+let bn0 = text[20]
+let bn1 = text[21]
+let bn2 = text[22]
+let bn3 = text[23]
+println("  B.NE @20:     " + to_string(bn0) + " " + to_string(bn1) + " " + to_string(bn2) + " " + to_string(bn3))
+let bne_ok = bn0 == 161 && bn1 == 255 && bn2 == 255 && bn3 == 84
+if bne_ok {
+    println("  [PASS] B.NE -12 = 0x54FFFFA1  (imm19 = -3, sign-extended)")
+} else {
+    println("  [FAIL] B.NE encoding wrong — expected a1 ff ff 54")
+}
+
+// Step 2: wrap in Mach-O MH_EXECUTE.
+println("[2] wrap in Mach-O MH_EXECUTE...")
+let hex_data = build_macho_hex(text)
+let macho_size = len(hex_data) / 2
+println("  macho bytes: " + to_string(macho_size))
+
+// Step 3: write /tmp/hexa_loop_native.
+println("[3] write /tmp/hexa_loop_native...")
+let out_path = "/tmp/hexa_loop_native"
+exec("printf '%s' '" + hex_data + "' | xxd -r -p > " + out_path)
+
+// Step 4: chmod +x.
+println("[4] chmod +x...")
+exec("chmod +x " + out_path)
+
+// Step 5: codesign ad-hoc.
+println("[5] codesign (ad-hoc)...")
+let cs = exec_with_status("codesign --force --sign - " + out_path + " 2>&1")
+if cs[1] != 0 {
+    println("  WARN codesign rc=" + to_string(cs[1]) + ": " + cs[0].trim())
+}
+
+// Step 6: run and capture exit code.
+println("[6] run " + out_path + "...")
+let r = exec_with_status(out_path + " 2>&1")
+let exit_code = r[1]
+println("  exit code = " + to_string(exit_code))
+
+println("")
+println("=== doc-assert ===")
+let want_rc = sum_ref()   // = 55
+let pass_rc = exit_code == want_rc
+
+if add_reg_ok {
+    println("  [PASS] ADD-reg encoding correct")
+} else {
+    println("  [FAIL] ADD-reg encoding incorrect")
+}
+if add_imm_ok {
+    println("  [PASS] ADD-imm encoding correct")
+} else {
+    println("  [FAIL] ADD-imm encoding incorrect")
+}
+if cmp_ok {
+    println("  [PASS] CMP-imm encoding correct")
+} else {
+    println("  [FAIL] CMP-imm encoding incorrect")
+}
+if bne_ok {
+    println("  [PASS] B.NE backward encoding correct")
+} else {
+    println("  [FAIL] B.NE backward encoding incorrect")
+}
+if pass_rc {
+    println("  [PASS] exit == " + to_string(want_rc) + "  (sum 1..10)")
+} else {
+    println("  [FAIL] exit mismatch: got " + to_string(exit_code) + " want " + to_string(want_rc))
+}
+
+if add_reg_ok {
+    if add_imm_ok {
+        if cmp_ok {
+            if bne_ok {
+                if pass_rc {
+                    println("")
+                    println("PASS — backward-branch loop native Mach-O emitted by pure Hexa.")
+                    println("Exercises ADD-reg (0x8B), ADD-imm (0x91), CMP-imm (0xF1), B.NE backward (0x54 + negative imm19).")
+                    println("  artifact: " + out_path)
+                    println("  size:     " + to_string(macho_size) + " bytes")
+                }
+            }
+        }
+    }
+}
