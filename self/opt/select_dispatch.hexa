@@ -1,0 +1,178 @@
+// self/opt/select_dispatch — S-2d @select annotation helper (pure-hexa)
+//
+// Why this file (decision log, 5 lines):
+//   1. self/parser.hexa (7550ae7) serializes @select(family, cond -> algo, ..., else -> algo)
+//      into FnDecl.annotations as "select|FAMILY@@COND_RAW~>ALGO@@...@@else~>DEFAULT".
+//   2. Codegen wiring in self/codegen_c2.hexa requires a stage0 rebuild (HX8, macOS only)
+//      to observe FnDecl.annotations — this host is arm64-Mach-O-incompatible Linux.
+//   3. Landing a pure-hexa parser for the serialized string here decouples string-parse
+//      correctness from codegen emission — when codegen ships it just calls select_parse
+//      and renders the (cond_raw, algo) arms + default into an if/else prologue.
+//   4. Unit coverage lives in tests/t_select_dispatch_parse.hexa (stage0-runnable).
+//   5. No touching self/parser.hexa / self/hexa_full.hexa / self/opt/algorithm_swap.hexa.
+
+// ── public shape ────────────────────────────────────────────
+// select_parse(annotations_field: string) -> SelectSpec
+//   SelectSpec :: { ok: bool, family: string, arms: [Arm], default_algo: string, err: string }
+//   Arm        :: { cond_raw: string, algo: string }
+//
+// select_emit_c_prologue(spec, ret_type_c, param_names) -> string
+//   Renders the if/elif prologue. Each arm becomes:
+//       if ((cond_raw)) { return <algo>(params...); }
+//   Default arm (else -> algo) is emitted as the *last* elif when present;
+//   when absent, control falls through to the annotated fn's own body.
+//
+// Both operate on the exact schema emitted by self/parser.hexa S-2c. Keep in
+// sync with the `serialized = "select|" + family + "@@" + arms_joined` site.
+
+fn _sd_split(s, delim) {
+    // Fallback split — string.split(delim) exists on the runtime but we keep
+    // this local helper for hermeticity in case the test fixture is invoked
+    // under a reduced builtins set.
+    if len(delim) == 0 { return [s] }
+    let mut out = []
+    let mut cur = ""
+    let n = len(s)
+    let dn = len(delim)
+    let mut i = 0
+    while i < n {
+        if i + dn <= n && s.substring(i, i + dn) == delim {
+            out = out.push(cur)
+            cur = ""
+            i = i + dn
+        } else {
+            cur = cur + s.substring(i, i + 1)
+            i = i + 1
+        }
+    }
+    out = out.push(cur)
+    return out
+}
+
+fn _sd_trim(s) {
+    let n = len(s)
+    let mut a = 0
+    let mut b = n
+    while a < b {
+        let c = s.substring(a, a + 1)
+        if c == " " || c == "\t" { a = a + 1 } else { break }
+    }
+    while b > a {
+        let c = s.substring(b - 1, b)
+        if c == " " || c == "\t" { b = b - 1 } else { break }
+    }
+    return s.substring(a, b)
+}
+
+// Return a failed spec with a short diagnostic. Downstream consumers can
+// treat ok=false as "fall back to undecorated fn body" — never throw.
+fn _sd_fail(msg) {
+    return #{
+        "ok": false,
+        "family": "",
+        "arms": [],
+        "default_algo": "",
+        "err": msg
+    }
+}
+
+// Parse one `"select|..."` record. The `annotations` field on FnDecl may
+// contain multiple `kind|raw` records separated by ';'. Callers that want
+// to scan all records should use select_find_in_annotations() below.
+fn select_parse_one(record) {
+    if type_of(record) != "string" { return _sd_fail("non-string record") }
+    if len(record) < 7 { return _sd_fail("record too short") }
+    if record.substring(0, 7) != "select|" { return _sd_fail("missing select| prefix") }
+    let payload = record.substring(7, len(record))
+    // Payload format: FAMILY@@ARM1@@ARM2@@...@@ARMn
+    let parts = _sd_split(payload, "@@")
+    if len(parts) < 2 { return _sd_fail("need family + >=1 arm") }
+    let family = _sd_trim(parts[0])
+    let mut arms = []
+    let mut default_algo = ""
+    let mut i = 1
+    while i < len(parts) {
+        let arm_raw = parts[i]
+        // Arm format: COND_RAW~>ALGO, with COND_RAW == "else" signalling default.
+        let arrow_idx = arm_raw.index_of("~>")
+        if arrow_idx < 0 {
+            return _sd_fail("arm missing ~> separator: " + arm_raw)
+        }
+        let cond_raw = _sd_trim(arm_raw.substring(0, arrow_idx))
+        let algo = _sd_trim(arm_raw.substring(arrow_idx + 2, len(arm_raw)))
+        if algo == "" {
+            return _sd_fail("arm missing algo name: " + arm_raw)
+        }
+        if cond_raw == "else" {
+            // Last-writer-wins on default; parser permits `else` anywhere but
+            // codegen-emitted semantics treat it as the fallthrough branch.
+            default_algo = algo
+        } else {
+            arms = arms.push(#{
+                "cond_raw": cond_raw,
+                "algo": algo
+            })
+        }
+        i = i + 1
+    }
+    return #{
+        "ok": true,
+        "family": family,
+        "arms": arms,
+        "default_algo": default_algo,
+        "err": ""
+    }
+}
+
+// Scan an FnDecl.annotations field for the first `select|...` record.
+// Returns a failed spec (ok=false, err="not found") when absent — this is
+// NOT an error from codegen's perspective, just "no dispatch emitted".
+fn select_find_in_annotations(annotations_field) {
+    if type_of(annotations_field) != "string" { return _sd_fail("not found") }
+    if annotations_field == "" { return _sd_fail("not found") }
+    // Records are separated by ';' per self/parser.hexa:1224.
+    let records = _sd_split(annotations_field, ";")
+    let mut i = 0
+    while i < len(records) {
+        let r = _sd_trim(records[i])
+        if len(r) >= 7 && r.substring(0, 7) == "select|" {
+            return select_parse_one(r)
+        }
+        i = i + 1
+    }
+    return _sd_fail("not found")
+}
+
+// Render the C prologue for codegen_c2. param_names is the array of
+// mangled C identifiers already decided by the caller (so this helper
+// stays ABI-neutral). ret_type_c is unused today but reserved so future
+// non-HexaVal returns (e.g. @specialize int fast-path) can switch the
+// cast format without breaking call sites.
+fn select_emit_c_prologue(spec, ret_type_c, param_names) {
+    if type_of(spec) != "map" { return "" }
+    if !spec.ok { return "" }
+    if len(spec.arms) == 0 && spec.default_algo == "" { return "" }
+    let mut args = ""
+    let mut pi = 0
+    while pi < len(param_names) {
+        if pi > 0 { args = args + ", " }
+        args = args + param_names[pi]
+        pi = pi + 1
+    }
+    let mut out = ""
+    out = out + "    /* @select('" + spec.family + "') dispatch prologue — S-2d */\n"
+    let mut ai = 0
+    while ai < len(spec.arms) {
+        let arm = spec.arms[ai]
+        out = out + "    if ((" + arm.cond_raw + ")) {\n"
+        out = out + "        return " + arm.algo + "(" + args + ");\n"
+        out = out + "    }\n"
+        ai = ai + 1
+    }
+    if spec.default_algo != "" {
+        out = out + "    /* @select default — explicit `else -> " + spec.default_algo + "` */\n"
+        out = out + "    return " + spec.default_algo + "(" + args + ");\n"
+    }
+    // If no default, control falls through to the annotated fn's own body.
+    return out
+}
