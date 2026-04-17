@@ -18,7 +18,242 @@
 //  Run: ./hexa self/test_model_soup.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/model_soup.hexa"
+// -- inlined from self/ml/model_soup.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/model_soup.hexa — Model Soup (#269)
+//
+//  Ref: Wortsman et al. 2022 — "Model soups: averaging weights of
+//       multiple fine-tuned models improves accuracy without
+//       increasing inference time"
+//
+//  Idea: take M independently fine-tuned model weights and combine
+//        them into a single model by weight averaging.
+//
+//  Two recipes:
+//    (a) Uniform soup:  w_avg = (1/M) * sum_i w_i
+//    (b) Greedy soup:   sort models by validation accuracy desc,
+//                       add w_i to the soup only if including it
+//                       (uniform-averaged so far) does not decrease
+//                       validation accuracy.
+//
+//  For the demo we treat each model as a simple linear regressor
+//  y = w.x + b and use MSE on a held-out validation set as the
+//  "accuracy" signal (lower MSE = better).
+//
+//  AI-NATIVE attrs:
+//    @pure  — averaging and forward are stateless
+// ═══════════════════════════════════════════════════════════════
+
+fn ms_abs(v) {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn ms_zeros(n) {
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    return r
+}
+
+// ── Simple hash-based RNG in [-0.5, 0.5] ──────────────────────
+fn ms_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Model representation: dict with "w" (array) and "b" (scalar)
+// ═══════════════════════════════════════════════════════════════
+fn ms_make_model(w, b) {
+    return #{ "w": w, "b": b }
+}
+
+@pure
+fn ms_forward(model, feat) {
+    let w = model["w"]
+    let b = model["b"]
+    let d = len(w)
+    let mut y = b
+    for i in 0..d {
+        y = y + w[i] * feat[i]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Validation MSE on a list of (feat, target) examples
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ms_val_mse(model, feats, targets) {
+    let n = len(feats)
+    let mut s = 0.0
+    for i in 0..n {
+        let y = ms_forward(model, feats[i])
+        let e = y - targets[i]
+        s = s + e * e
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Generate a synthetic model: start from a true w*, add per-seed
+//  Gaussian-ish noise. Used to mimic independent fine-tune runs.
+// ═══════════════════════════════════════════════════════════════
+fn ms_make_noisy_model(w_true, b_true, noise_scale, seed) {
+    let d = len(w_true)
+    let mut w = []
+    for i in 0..d {
+        let noise = noise_scale * ms_hash(seed, i, 0)
+        w = w + [w_true[i] + noise]
+    }
+    let b_noise = noise_scale * ms_hash(seed, 0, 99)
+    let b = b_true + b_noise
+    return ms_make_model(w, b)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Uniform soup: simple weight average
+//     w_avg[i] = (1/M) * sum_m w_m[i]
+//     b_avg    = (1/M) * sum_m b_m
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ms_uniform_soup(models) {
+    let M = len(models)
+    let d = len(models[0]["w"])
+    let mut w_avg = ms_zeros(d)
+    let mut b_avg = 0.0
+    for m in 0..M {
+        let w_m = models[m]["w"]
+        b_avg = b_avg + models[m]["b"]
+        for i in 0..d {
+            w_avg[i] = w_avg[i] + w_m[i]
+        }
+    }
+    let inv = 1.0 / to_float(M)
+    let mut w_out = []
+    for i in 0..d { w_out = w_out + [w_avg[i] * inv] }
+    return ms_make_model(w_out, b_avg * inv)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Weighted soup given per-model count (for greedy incremental)
+//     Soup with k members all equal weight = mean of k models.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ms_mean_of_indices(models, indices) {
+    let k = len(indices)
+    let d = len(models[0]["w"])
+    let mut w_sum = ms_zeros(d)
+    let mut b_sum = 0.0
+    for t in 0..k {
+        let idx = indices[t]
+        let w_m = models[idx]["w"]
+        b_sum = b_sum + models[idx]["b"]
+        for i in 0..d {
+            w_sum[i] = w_sum[i] + w_m[i]
+        }
+    }
+    let inv = 1.0 / to_float(k)
+    let mut w_out = []
+    for i in 0..d { w_out = w_out + [w_sum[i] * inv] }
+    return ms_make_model(w_out, b_sum * inv)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Sort model indices by validation MSE ascending (best first).
+//  Simple bubble sort since M is small.
+// ═══════════════════════════════════════════════════════════════
+fn ms_sorted_by_val(models, feats, targets) {
+    let M = len(models)
+    let mut scores = []
+    for m in 0..M {
+        scores = scores + [ms_val_mse(models[m], feats, targets)]
+    }
+    let mut order = []
+    for m in 0..M { order = order + [m] }
+    // bubble sort ascending
+    for i in 0..M {
+        for j in 0..(M - 1) {
+            if scores[j] > scores[j + 1] {
+                let tmp_s = scores[j]
+                let tmp_o = order[j]
+                let mut new_s = []
+                let mut new_o = []
+                for k in 0..M {
+                    if k == j {
+                        new_s = new_s + [scores[j + 1]]
+                        new_o = new_o + [order[j + 1]]
+                    } else {
+                        if k == j + 1 {
+                            new_s = new_s + [tmp_s]
+                            new_o = new_o + [tmp_o]
+                        } else {
+                            new_s = new_s + [scores[k]]
+                            new_o = new_o + [order[k]]
+                        }
+                    }
+                }
+                scores = new_s
+                order = new_o
+            }
+        }
+    }
+    return order
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Greedy soup (Wortsman et al. Algorithm 1)
+//    1. Sort models by val accuracy descending (== MSE ascending).
+//    2. Initialize soup = [best_model_idx].
+//    3. For each remaining model m (in sorted order):
+//         candidate = mean(soup + [m])
+//         if val_mse(candidate) < val_mse(mean(soup)):
+//             soup = soup + [m]
+//    4. Return mean(soup).
+// ═══════════════════════════════════════════════════════════════
+fn ms_greedy_soup(models, feats, targets) {
+    let order = ms_sorted_by_val(models, feats, targets)
+    let M = len(order)
+    let mut soup_idx = [order[0]]
+    let mut cur_mse = ms_val_mse(models[order[0]], feats, targets)
+    for t in 1..M {
+        let cand = soup_idx + [order[t]]
+        let cand_model = ms_mean_of_indices(models, cand)
+        let cand_mse = ms_val_mse(cand_model, feats, targets)
+        if cand_mse < cur_mse {
+            soup_idx = cand
+            cur_mse = cand_mse
+        }
+    }
+    return ms_mean_of_indices(models, soup_idx)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Convenience: get indices selected by greedy (for introspection)
+// ═══════════════════════════════════════════════════════════════
+fn ms_greedy_soup_indices(models, feats, targets) {
+    let order = ms_sorted_by_val(models, feats, targets)
+    let M = len(order)
+    let mut soup_idx = [order[0]]
+    let mut cur_mse = ms_val_mse(models[order[0]], feats, targets)
+    for t in 1..M {
+        let cand = soup_idx + [order[t]]
+        let cand_model = ms_mean_of_indices(models, cand)
+        let cand_mse = ms_val_mse(cand_model, feats, targets)
+        if cand_mse < cur_mse {
+            soup_idx = cand
+            cur_mse = cand_mse
+        }
+    }
+    return soup_idx
+}
+
+println("[model_soup] loaded — uniform + greedy soup over linear-regression models")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

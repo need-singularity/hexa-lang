@@ -9,7 +9,224 @@
 //      - alloc accounting: naive=2, fused=1
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/layernorm_fuse.hexa"
+// -- inlined from self/ai_native/layernorm_fuse.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/layernorm_fuse.hexa — AI-native ROI #92
+//
+//  @layernorm_fuse — fuse LayerNorm's input-normalization step into the
+//  downstream GEMM consumer. Transformer blocks repeat the pattern
+//      y = LayerNorm(x)
+//      z = y · W + B
+//  thousands of times per forward pass. The naive staging materializes
+//  `y` as a full [float] array before GEMM reads it — one extra array
+//  allocation and one extra write+read round-trip per position.
+//
+//  The fused kernel computes the scalar reductions once (mean, invstd)
+//  and then, inside the GEMM loop body, reconstructs each normalized
+//  element on the fly via
+//      y_i = gamma_i * (x_i - mean) * invstd + beta_i
+//  with NO intermediate [float] allocation. The outer gemv contributes
+//  the only output buffer.
+//
+//  Public API:
+//      layernorm(x, gamma, beta, eps)            -> [float]
+//      layernorm_default(x, gamma, beta)         -> [float]  (eps=1e-5)
+//      layernorm_gemm_naive(x, gamma, beta, W, B) -> [float]
+//      layernorm_gemm_fused(x, gamma, beta, W, B) -> [float]
+//
+//  Shapes (row-major):
+//      x, gamma, beta     : [D]           (D = input dim)
+//      W                  : [D, M]        (M = output dim)
+//      B                  : [M]
+//      returns            : [M]           (z = LN(x) · W + B)
+//
+//  Memory accounting (temp arrays produced by each path):
+//      naive : 2 — ln_out [D] + output [M]
+//      fused : 1 — output [M] only; LN values are scalar-local
+//
+//  Numerical contract:
+//      layernorm_gemm_fused(x, γ, β, W, B)
+//        ≡ layernorm_gemm_naive(x, γ, β, W, B)
+//      element-wise within tol 1e-5 for any finite input, W, B.
+//      With γ = 1, β = 0: mean(LN(x)) = 0, var(LN(x)) = 1 (tol 1e-5).
+//
+//  Edge cases:
+//      D = 1        → variance is 0; eps guards the sqrt → y = beta (γ=1).
+//      empty W/M=0  → returns an empty array; B also must be length 0.
+//
+//  sqrt is a hexa builtin (see self/ai_native/flash_attention.hexa:94).
+//  No FFI, no Rust, no stage0 rebuild.
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - no bit-ops; all arithmetic with +, -, *, /
+//      - `and`/`or` not used (would need &&/||)
+//      - no struct literals in `if` heads
+//      - no enum; tags are plain ints where used
+//      - abs → use abs_pure from math_pure.hexa
+//
+//  AI-native attrs:
+//      @hot            — LN+GEMM is a per-layer hot path
+//      @layernorm_fuse — marker: LN materialisation removed
+//      @pure           — no side-effects beyond the return value
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+// ln92_fabs → abs_pure (math_pure.hexa)
+
+fn ln92_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  layernorm(x, gamma, beta, eps) — reference LayerNorm.
+//
+//  mean  = (∑ x_i) / D
+//  var   = (∑ (x_i − mean)²) / D
+//  out_i = gamma_i · (x_i − mean) / sqrt(var + eps) + beta_i
+// ═══════════════════════════════════════════════════════════════════
+pub fn layernorm(x, gamma, beta, eps) {
+    let n = len(x)
+    if n == 0 { return [] }
+
+    let fn_ = n * 1.0
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + x[i]
+    }
+    let mean = s / fn_
+
+    let mut ss = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        ss = ss + d * d
+    }
+    let var = ss / fn_
+    let invstd = 1.0 / sqrt(var + eps)
+
+    let mut out = ln92_zeros_1d(n)
+    for i in 0..n {
+        out[i] = gamma[i] * (x[i] - mean) * invstd + beta[i]
+    }
+    return out
+}
+
+pub fn layernorm_default(x, gamma, beta) {
+    return layernorm(x, gamma, beta, 1.0e-5)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  layernorm_gemm_naive(x, gamma, beta, W, B) — staged reference.
+//
+//  Allocates the full LN output as a [float] of length D, then runs a
+//  plain gemv over (W:[D,M], B:[M]) to produce the length-M output.
+//  This is the path fusion eliminates one array from.
+// ═══════════════════════════════════════════════════════════════════
+pub fn layernorm_gemm_naive(x, gamma, beta, W, B) {
+    let D = len(x)
+    // Defensive: if W is empty, return a copy of B (or []).
+    if D == 0 {
+        let M0 = len(B)
+        let mut b0 = ln92_zeros_1d(M0)
+        for j in 0..M0 { b0[j] = B[j] }
+        return b0
+    }
+    let M = len(W[0])
+
+    // Stage 1 — full LN materialization.
+    let y = layernorm_default(x, gamma, beta)
+
+    // Stage 2 — plain gemv.
+    let mut out = ln92_zeros_1d(M)
+    for j in 0..M {
+        out[j] = B[j]
+    }
+    for i in 0..D {
+        let a = y[i]
+        for j in 0..M {
+            out[j] = out[j] + a * W[i][j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  layernorm_gemm_fused(x, gamma, beta, W, B) — one-pass fused kernel.
+//
+//  Step 1 : compute mean, invstd with two scalar reductions.
+//  Step 2 : seed out[] with B[].
+//  Step 3 : single sweep over i in 0..D —
+//              y_i = gamma_i · (x_i − mean) · invstd + beta_i
+//              for j in 0..M: out[j] += y_i · W[i][j]
+//           y_i stays scalar-local; no [float] LN array ever allocated.
+// ═══════════════════════════════════════════════════════════════════
+// Inner implementation — carries the @attrs. A public forwarder below
+// exposes the symbol while avoiding the `@attr pub fn` parse pitfall
+// (HX3 grammar: the two modifiers cannot co-occur on the same fn head).
+@hot @layernorm_fuse @pure
+fn layernorm_gemm_fused_impl(x, gamma, beta, W, B) {
+    let D = len(x)
+    if D == 0 {
+        let M0 = len(B)
+        let mut b0 = ln92_zeros_1d(M0)
+        for j in 0..M0 { b0[j] = B[j] }
+        return b0
+    }
+    let M = len(W[0])
+    let eps = 1.0e-5
+
+    // Step 1 — scalar reductions (done exactly once).
+    let fn_ = D * 1.0
+    let mut s = 0.0
+    for i in 0..D {
+        s = s + x[i]
+    }
+    let mean = s / fn_
+
+    let mut ss = 0.0
+    for i in 0..D {
+        let d = x[i] - mean
+        ss = ss + d * d
+    }
+    let var = ss / fn_
+    let invstd = 1.0 / sqrt(var + eps)
+
+    // Step 2 — seed with B (rank-1 bias).
+    let mut out = ln92_zeros_1d(M)
+    for j in 0..M {
+        out[j] = B[j]
+    }
+
+    // Step 3 — fused single sweep. y_i is a scalar register across j.
+    for i in 0..D {
+        let y_i = gamma[i] * (x[i] - mean) * invstd + beta[i]
+        for j in 0..M {
+            out[j] = out[j] + y_i * W[i][j]
+        }
+    }
+    return out
+}
+
+pub fn layernorm_gemm_fused(x, gamma, beta, W, B) {
+    return layernorm_gemm_fused_impl(x, gamma, beta, W, B)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Allocation accounting (exposed for tests / benches).
+//      naive path produces 2 arrays (LN temp + output).
+//      fused path produces 1 array (output only).
+// ═══════════════════════════════════════════════════════════════════
+pub fn naive_alloc_count() { return 2 }
+pub fn fused_alloc_count() { return 1 }
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

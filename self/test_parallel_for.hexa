@@ -15,7 +15,283 @@
 //        or read-write aliasing is unsafe
 // ═══════════════════════════════════════════════════════════
 
-use "ai_native/parallel_for"
+// -- inlined from self/ai_native/parallel_for.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  self/ai_native/parallel_for.hexa — ROI #80
+//
+//  @parallel_for — logical parallelization of embarrassingly-parallel
+//  loops (OMP/pthread analogue in pure hexa, no FFI).
+//
+//  Background: during T1/T2 physical-ceiling work we found that many
+//  AI-native hot paths are pure map-style loops
+//      for i in 0..n:  y[i] = f(x[i])
+//  whose iterations are independent. On real hardware these should
+//  be dispatched to an OS thread pool (OpenMP parallel for / pthread
+//  fork-join). At the pure-interpreter stage we cannot call OS threads
+//  (FFI is banned by HX7), so this module provides the *logical*
+//  decomposition — range partitioning + sequential per-partition
+//  execution — with an API shaped so a future runtime can wire real
+//  threads behind `parallel_for_logical` without changing call sites.
+//
+//  Invariants (checked in self/test_parallel_for.hexa):
+//    - partition_range(n, w) produces a list of (start, end) whose
+//      union is exactly [0, n) with no overlap and no gap.
+//    - parallel_for_logical yields byte-identical output to the
+//      sequential baseline for independent body functions.
+//    - worker count clamps: num_workers(0)=0, num_workers(1)=1,
+//      num_workers(n) = min(n, 4) for n > 0.
+//
+//  Non-goals for this ROI checkpoint:
+//    - Actual OS thread dispatch — cooperative rt_spawn implemented;
+//      swap pf_rt_spawn body with pthread/workqueue for real threads.
+//    - Reduction / scan style parallelism — that is ROI #81 and
+//      ROI #82 (fuse + scan), and the APIs here deliberately only
+//      cover the map case where body(i, ctx) writes to ctx.dst[i].
+// ═══════════════════════════════════════════════════════════
+
+// ── worker count heuristic ─────────────────────────────────
+// Assume a typical 4-core CPU as the default upper bound; never
+// spawn more workers than iterations (each worker must have >=1
+// item of work — empty partitions waste a thread slot).
+pub fn num_workers(n) {
+    if n <= 0 { return 0 }
+    if n < 4 { return n }
+    return 4
+}
+
+// ── range partitioning ─────────────────────────────────────
+// Split [0, n) into `workers` contiguous chunks. Chunks are as
+// even as possible; the first `rem = n % workers` chunks carry
+// one extra element so that sum(chunk_len) == n exactly.
+//
+// Returns: list of 2-element arrays [start, end). When `workers <= 0`
+// the result is empty; when `n == 0` the result is empty.
+//
+// Examples:
+//   partition_range(100, 4) -> [[0,25],[25,50],[50,75],[75,100]]
+//   partition_range(10,  3) -> [[0,4],[4,7],[7,10]]   // 4+3+3
+//   partition_range(0,   4) -> []
+//   partition_range(3,   8) -> [[0,1],[1,2],[2,3]]    // workers > n
+pub fn partition_range(n, workers) {
+    let mut out = []
+    if n <= 0 { return out }
+    if workers <= 0 { return out }
+
+    // clamp workers down to n so we never emit an empty partition.
+    let mut w = workers
+    if w > n { w = n }
+
+    let base = n / w
+    let rem  = n - base * w       // remainder without using %
+
+    let mut cursor = 0
+    let mut i = 0
+    while i < w {
+        let mut chunk = base
+        if i < rem { chunk = chunk + 1 }
+        let start = cursor
+        let endv  = cursor + chunk
+        out = out.push([start, endv])
+        cursor = endv
+        i = i + 1
+    }
+    return out
+}
+
+// Partition size for iteration `i` if the caller wants scalar access.
+// Thin convenience wrapper around partition_range().
+pub fn partition_size(n, workers, i) {
+    let parts = partition_range(n, workers)
+    if i < 0 { return 0 }
+    if i >= len(parts) { return 0 }
+    let p = parts[i]
+    return p[1] - p[0]
+}
+
+// ── parallel_for: map-style over (start, end) partitions ───
+// body(i, ctx) must be independent across distinct i values;
+// ctx is an opaque payload (typically a struct or an array) that
+// the body uses to read inputs / write outputs.
+//
+// Semantics: partitions are dispatched via pf_rt_spawn (cooperative
+// spawn — runs immediately). Once a real thread pool exists, swap
+// pf_rt_spawn internals for real dispatch; this API stays unchanged.
+pub fn parallel_for_logical(n, workers, body, ctx) {
+    if n <= 0 { return ctx }
+    let parts = partition_range(n, workers)
+    let np = len(parts)
+    // Phase 1: spawn — each partition dispatched via pf_rt_spawn.
+    // Currently cooperative (runs immediately); when OS threads land
+    // these will execute in parallel on the thread pool.
+    pf_rt_task_results = []
+    pf_rt_task_count   = 0
+    let mut handles = []
+    let mut pi = 0
+    while pi < np {
+        let part  = parts[pi]
+        let start = part[0]
+        let endv  = part[1]
+        let h = pf_rt_spawn(body, start, endv, ctx)
+        handles = handles.push(h)
+        pi = pi + 1
+    }
+    // Phase 2: join — barrier; all partitions must complete before
+    // returning ctx. With cooperative spawn this is a no-op (already
+    // done), but the join call makes the contract explicit for the
+    // future real-thread backend.
+    pf_rt_join_all(handles)
+    return ctx
+}
+
+// ── sequential baseline for equivalence testing ────────────
+// Runs the same body over [0, n) in a single loop — used by the
+// test suite to assert parallel_for_logical produces the same
+// result as straight-line iteration.
+pub fn sequential_for(n, body, ctx) {
+    let mut i = 0
+    while i < n {
+        body(i, ctx)
+        i = i + 1
+    }
+    return ctx
+}
+
+// ── AST shape helper: is_indep_loop ────────────────────────
+// Very small, string-ish heuristic that accepts a list of body
+// "markers" and decides whether the loop is safe to parallelize.
+// A marker is one of:
+//     "read:<name>"   — body reads variable <name>
+//     "write:<name>"  — body writes variable <name>
+//     "crossdep"      — body reads a cross-iteration dependency
+//                       (e.g. y[i] = y[i-1] + ...)  -> NOT safe
+// The loop is parallelizable iff no marker is "crossdep" and every
+// write target is disjoint from every read target (we approximate
+// this by requiring that no name appears as both read and write —
+// the common map case `y[i]=f(x[i])` reads `x` and writes `y`).
+//
+// This mirrors what an AST pass would check; once we wire this to
+// the real AST, the caller will translate BinOp/Index nodes into
+// these markers.
+pub fn is_indep_loop(markers) {
+    let n = len(markers)
+    let mut reads  = []
+    let mut writes = []
+    let mut i = 0
+    while i < n {
+        let m = markers[i]
+        if m == "crossdep" { return false }
+        // marker format: "kind:name"
+        let colon = str_index_of(m, ":")
+        if colon > 0 {
+            let kind = str_slice(m, 0, colon)
+            let name = str_slice(m, colon + 1, len(m))
+            if kind == "read"  { reads  = reads.push(name) }
+            if kind == "write" { writes = writes.push(name) }
+        }
+        i = i + 1
+    }
+    // reject if any name is in both reads and writes
+    let nw = len(writes)
+    let mut wi = 0
+    while wi < nw {
+        let wn = writes[wi]
+        let nr = len(reads)
+        let mut ri = 0
+        while ri < nr {
+            if reads[ri] == wn { return false }
+            ri = ri + 1
+        }
+        wi = wi + 1
+    }
+    return true
+}
+
+// ── cooperative spawn infrastructure (self-contained) ──────
+// Minimal fork-join runtime for partition dispatch. Each "spawn"
+// runs its closure immediately (cooperative scheduling). When OS
+// threads arrive, only this section needs replacement — all call
+// sites above remain unchanged.
+//
+// API contract (matches self/runtime/spawn_pure.hexa):
+//   pf_rt_spawn(body, start, endv, ctx) -> handle
+//   pf_rt_join(handle) -> result
+//   pf_rt_join_all(handles) -> [result, ...]
+
+let mut pf_rt_task_results = []
+let mut pf_rt_task_count   = 0
+
+fn pf_rt_spawn(body, start, endv, ctx) {
+    // Execute the partition body immediately (cooperative).
+    let mut i = start
+    while i < endv {
+        body(i, ctx)
+        i = i + 1
+    }
+    // Record completion; result is void (body writes to ctx in-place).
+    let h = pf_rt_task_count
+    pf_rt_task_results = pf_rt_task_results.push(0)
+    pf_rt_task_count = pf_rt_task_count + 1
+    return h
+}
+
+fn pf_rt_join(h) {
+    if h < 0 { return 0 }
+    if h >= pf_rt_task_count { return 0 }
+    return pf_rt_task_results[h]
+}
+
+fn pf_rt_join_all(handles) {
+    let n = len(handles)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(pf_rt_join(handles[i]))
+        i = i + 1
+    }
+    return out
+}
+
+// ── tiny string helpers used by is_indep_loop ──────────────
+// Kept local so parallel_for.hexa has no extra module imports;
+// stdlib/string.hexa is T4 material but we want this module to
+// be usable in isolation during bootstrap paths.
+fn str_index_of(s, sub) {
+    let n  = len(s)
+    let m  = len(sub)
+    if m == 0 { return 0 }
+    if m > n { return -1 }
+    let last = n - m
+    let mut i = 0
+    while i <= last {
+        let mut j = 0
+        let mut ok = true
+        while j < m {
+            // char-wise equality using slice of length 1
+            let a = str_slice(s,   i + j, i + j + 1)
+            let b = str_slice(sub, j,     j + 1)
+            if a != b { ok = false; j = m } else { j = j + 1 }
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn str_slice(s, a, b) {
+    // wrap around to builtin substring with clamped bounds
+    let n = len(s)
+    let mut aa = a
+    let mut bb = b
+    if aa < 0 { aa = 0 }
+    if bb > n { bb = n }
+    if bb < aa { bb = aa }
+    return s.substring(aa, bb)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

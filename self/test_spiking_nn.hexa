@@ -18,7 +18,251 @@
 //  Run: ./hexa self/test_spiking_nn.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/spiking_nn.hexa"
+// -- inlined from self/ml/spiking_nn.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/spiking_nn.hexa — Spiking Neural Network (#254)
+//
+//  Leaky Integrate-and-Fire (LIF) neurons with surrogate gradient.
+//
+//  LIF dynamics (discrete time):
+//    v[t+1] = beta * v[t] + I[t]
+//    s[t+1] = 1 if v[t+1] > v_thresh else 0
+//    v[t+1] ← v_reset if s[t+1] = 1   (hard reset) or v -= v_thresh (soft)
+//
+//  Surrogate gradient for (v > thresh):
+//    ds/dv = sigmoid'(alpha*(v - thresh)) * alpha
+//          = alpha * sigmoid(alpha*(v-thresh))*(1 - sigmoid(alpha*(v-thresh)))
+//
+//  Implements:
+//    1. LIF step (forward, with hard reset)
+//    2. Surrogate gradient (spike gradient surrogate)
+//    3. Layer: input linear + LIF neurons
+//    4. Multi-step BPTT-style forward returning spikes+states
+//    5. Output decoding: rate-based (count spikes over time)
+//    6. Firing-rate loss + surrogate gradient descent (FD)
+//
+//  AI-NATIVE attrs:
+//    @pure  — stateless step and surrogate
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ───────────────────────────────────────────────────
+fn snn_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn snn_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn snn_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m { w = w + [snn_zeros(n)] }
+    return w
+}
+
+fn snn_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+@pure
+fn snn_sigmoid(x) {
+    let mut z = x
+    if z > 30.0 { z = 30.0 }
+    if z < (0.0 - 30.0) { z = 0.0 - 30.0 }
+    return 1.0 / (1.0 + exp(0.0 - z))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Spike function (step)
+//  Returns 1.0 if v > v_thresh else 0.0
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn snn_spike(v, v_thresh) {
+    if v > v_thresh { return 1.0 }
+    return 0.0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Surrogate gradient
+//  d/dv[sigmoid(alpha*(v-thresh))] = alpha*sigmoid*(1-sigmoid)
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn snn_surrogate_grad(v, v_thresh, alpha) {
+    let s = snn_sigmoid(alpha * (v - v_thresh))
+    return alpha * s * (1.0 - s)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) LIF single-step update
+//  input I, prev voltage v, leak beta, threshold v_thresh, reset v_reset
+//  Returns [new_v, spike]
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn snn_lif_step(v_prev, I, beta, v_thresh, v_reset) {
+    let v_new = beta * v_prev + I
+    let s = snn_spike(v_new, v_thresh)
+    // hard reset if spike
+    let mut v_out = v_new
+    if s > 0.5 {
+        v_out = v_reset
+    }
+    let result = [v_out, s]
+    return result
+}
+
+// Soft reset variant: v -= thresh
+@pure
+fn snn_lif_step_soft(v_prev, I, beta, v_thresh) {
+    let v_new = beta * v_prev + I
+    let s = snn_spike(v_new, v_thresh)
+    let mut v_out = v_new
+    if s > 0.5 {
+        v_out = v_new - v_thresh
+    }
+    return [v_out, s]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Multi-neuron LIF layer
+//  params:
+//    W       : [n_out x n_in] input weights
+//    b       : [n_out]
+//    beta    : scalar leak
+//    v_thresh: scalar
+//    v_reset : scalar
+//
+//  state: v[n_out]
+// ═══════════════════════════════════════════════════════════════
+fn snn_init_layer(n_in, n_out, seed) {
+    let mut W = snn_zeros2d(n_out, n_in)
+    let mut b = snn_zeros(n_out)
+    for i in 0..n_out {
+        for j in 0..n_in {
+            W[i][j] = 0.5 * snn_hash(seed, i, j)
+        }
+        b[i] = 0.1 * snn_hash(seed + 7, i, 0)
+    }
+    let layer = #{
+        "W": W,
+        "b": b,
+        "n_in": n_in,
+        "n_out": n_out,
+        "beta": 0.9,
+        "v_thresh": 1.0,
+        "v_reset": 0.0
+    }
+    return layer
+}
+
+// Forward one time-step: input x (size n_in), prev voltages v (size n_out)
+// returns dict {v_new, spikes}
+fn snn_layer_step(layer, v_prev, x) {
+    let n_in = layer["n_in"]
+    let n_out = layer["n_out"]
+    let W = layer["W"]
+    let b = layer["b"]
+    let beta = layer["beta"]
+    let v_thresh = layer["v_thresh"]
+    let v_reset = layer["v_reset"]
+
+    let mut v_new = snn_zeros(n_out)
+    let mut spikes = snn_zeros(n_out)
+    for i in 0..n_out {
+        // current input I_i = W[i] . x + b[i]
+        let mut I_i = b[i]
+        for j in 0..n_in {
+            I_i = I_i + W[i][j] * x[j]
+        }
+        let res = snn_lif_step(v_prev[i], I_i, beta, v_thresh, v_reset)
+        v_new[i] = res[0]
+        spikes[i] = res[1]
+    }
+    let out = #{
+        "v": v_new,
+        "spikes": spikes
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Forward through a sequence of input steps
+//  inputs: [T x n_in]
+//  Returns dict with:
+//    "spike_history": [T x n_out]
+//    "v_final": [n_out]
+//    "spike_counts": [n_out]
+// ═══════════════════════════════════════════════════════════════
+fn snn_forward_sequence(layer, inputs) {
+    let T = len(inputs)
+    let n_out = layer["n_out"]
+    let mut v = snn_zeros(n_out)
+    let mut history = []
+    let mut counts = snn_zeros(n_out)
+
+    for t in 0..T {
+        let step = snn_layer_step(layer, v, inputs[t])
+        v = step["v"]
+        let sp = step["spikes"]
+        history = history + [sp]
+        for i in 0..n_out {
+            counts[i] = counts[i] + sp[i]
+        }
+    }
+
+    let result = #{
+        "spike_history": history,
+        "v_final": v,
+        "spike_counts": counts,
+        "T": T
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (6) Rate-based loss + FD surrogate gradient step
+//  target_rates: [n_out] desired avg firing rate (0..1)
+//  loss = sum((count_i / T - target_i)^2)
+// ═══════════════════════════════════════════════════════════════
+fn snn_rate_loss(layer, inputs, targets) {
+    let out = snn_forward_sequence(layer, inputs)
+    let counts = out["spike_counts"]
+    let T = out["T"]
+    let n_out = layer["n_out"]
+    let mut loss = 0.0
+    for i in 0..n_out {
+        let rate = counts[i] / to_float(T)
+        let err = rate - targets[i]
+        loss = loss + err * err
+    }
+    return loss
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (7) Population coding: predicted class = argmax of spike counts
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn snn_argmax(arr) {
+    let n = len(arr)
+    if n == 0 { return -1 }
+    let mut best = 0
+    let mut best_val = arr[0]
+    for i in 1..n {
+        if arr[i] > best_val {
+            best_val = arr[i]
+            best = i
+        }
+    }
+    return best
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

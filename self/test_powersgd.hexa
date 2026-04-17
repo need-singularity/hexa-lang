@@ -4,7 +4,291 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_powersgd.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/powersgd.hexa"
+// -- inlined from self/ml/powersgd.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/powersgd.hexa — PowerSGD Compression (#275)
+//
+//  PowerSGD (Vogels et al. 2019): compress a gradient matrix
+//  G ∈ R^{m×n} using a single power-iteration pass to obtain a
+//  rank-r approximation.
+//
+//      P  = G · Q₀        (m × r)
+//      P̂  = QR(P).Q       (orthonormal columns)
+//      Q  = Gᵀ · P̂         (n × r)
+//      Ĝ  = P̂ · Qᵀ        (m × n)
+//
+//  Error feedback: error ← G - Ĝ, next step uses (G_next + error).
+//
+//  API:
+//    ps_zeros_mat(m, n)                              -> [[float]]
+//    ps_transpose(M)                                 -> [[float]]
+//    ps_matmul(A, B)                                 -> [[float]]
+//    ps_frobenius(M)                                 -> float
+//    ps_init_Q(n, r, seed)                           -> [[float]]
+//    ps_qr(M)                                        -> [[float]]
+//    ps_compress(G, Q0)                              -> #{"P","Q"}
+//    ps_reconstruct(P, Q)                            -> [[float]]
+//    ps_apply(G, Q0)                                 -> #{"approx","P","Q"}
+//    ps_error_feedback(G, error, Q0)                 -> #{"approx","P","Q","new_error"}
+//    ps_compression_ratio(m, n, r)                   -> float
+// ═══════════════════════════════════════════════════════════════════
+
+fn ps_abs(inp) {
+    if inp < 0.0 { return 0.0 - inp }
+    return inp
+}
+
+fn ps_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut g = inp / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 { g = (g + inp / g) / 2.0 }
+    return g
+}
+
+fn ps_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn ps_zeros_mat(m, n) {
+    let mut M = []
+    for _i in 0..m {
+        M = M + [ps_zeros(n)]
+    }
+    return M
+}
+
+fn ps_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn ps_rand(seed, idx) {
+    let h = ps_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Transpose
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_transpose(M) {
+    let m = len(M)
+    if m == 0 { return [] }
+    let n = len(M[0])
+    let mut T = ps_zeros_mat(n, m)
+    for i in 0..m {
+        for j in 0..n {
+            T[j][i] = M[i][j]
+        }
+    }
+    return T
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Dense matmul — A(m×k) · B(k×n) → C(m×n)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_matmul(A, B) {
+    let m = len(A)
+    let k = len(A[0])
+    let n = len(B[0])
+    let mut C = ps_zeros_mat(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            let mut s = 0.0
+            for p in 0..k {
+                s = s + A[i][p] * B[p][j]
+            }
+            C[i][j] = s
+        }
+    }
+    return C
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Frobenius norm
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_frobenius(M) {
+    let m = len(M)
+    if m == 0 { return 0.0 }
+    let n = len(M[0])
+    let mut s = 0.0
+    for i in 0..m {
+        for j in 0..n {
+            s = s + M[i][j] * M[i][j]
+        }
+    }
+    return ps_sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Random init for Q₀ (n × r)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_init_Q(n, r, seed) {
+    let mut Q = ps_zeros_mat(n, r)
+    for i in 0..n {
+        for j in 0..r {
+            Q[i][j] = ps_rand(seed, i * r + j)
+        }
+    }
+    return Q
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. QR decomposition — modified Gram-Schmidt
+//
+//  Returns orthonormal columns of M (no R matrix, only Q factor).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_qr(M) {
+    let m = len(M)
+    let r = len(M[0])
+    let mut Q = ps_zeros_mat(m, r)
+    // Copy M into Q then orthogonalise columns in place.
+    for i in 0..m {
+        for j in 0..r {
+            Q[i][j] = M[i][j]
+        }
+    }
+    for j in 0..r {
+        // Subtract projections of previous columns
+        for k in 0..j {
+            let mut dot = 0.0
+            for i in 0..m {
+                dot = dot + Q[i][k] * Q[i][j]
+            }
+            for i in 0..m {
+                Q[i][j] = Q[i][j] - dot * Q[i][k]
+            }
+        }
+        // Normalise column j
+        let mut nrm = 0.0
+        for i in 0..m {
+            nrm = nrm + Q[i][j] * Q[i][j]
+        }
+        nrm = ps_sqrt(nrm)
+        if nrm < 1.0e-12 {
+            // Fallback: unit vector along i=j (mod m)
+            for i in 0..m { Q[i][j] = 0.0 }
+            Q[j % m][j] = 1.0
+        } else {
+            for i in 0..m { Q[i][j] = Q[i][j] / nrm }
+        }
+    }
+    return Q
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Compress — one power-iteration pass
+//
+//  G(m×n) · Q₀(n×r) -> P(m×r)
+//  Orthogonalise P via QR.
+//  Gᵀ(n×m) · P(m×r) -> Q(n×r)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_compress(G, Q0) {
+    let P_raw = ps_matmul(G, Q0)
+    let P = ps_qr(P_raw)
+    let Gt = ps_transpose(G)
+    let Q = ps_matmul(Gt, P)
+    return #{
+        "P": P,
+        "Q": Q
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Reconstruct — Ĝ = P · Qᵀ
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_reconstruct(P, Q) {
+    let Qt = ps_transpose(Q)
+    return ps_matmul(P, Qt)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Apply — compress + reconstruct
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_apply(G, Q0) {
+    let c = ps_compress(G, Q0)
+    let approx = ps_reconstruct(c["P"], c["Q"])
+    return #{
+        "approx": approx,
+        "P": c["P"],
+        "Q": c["Q"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Error feedback step
+//
+//  Input:  current gradient G, previous error e, init Q₀
+//  Steps:  G' = G + e
+//          apply PowerSGD to G'  -> approx
+//          new_error = G' - approx
+//  Returns approx transmitted + new_error to keep locally.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_error_feedback(G, error, Q0) {
+    let m = len(G)
+    let n = len(G[0])
+    let mut Gp = ps_zeros_mat(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            Gp[i][j] = G[i][j] + error[i][j]
+        }
+    }
+    let r = ps_apply(Gp, Q0)
+    let approx = r["approx"]
+    let mut new_err = ps_zeros_mat(m, n)
+    for i in 0..m {
+        for j in 0..n {
+            new_err[i][j] = Gp[i][j] - approx[i][j]
+        }
+    }
+    return #{
+        "approx": approx,
+        "P": r["P"],
+        "Q": r["Q"],
+        "new_error": new_err
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Compression ratio — #floats transmitted / #floats original
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ps_compression_ratio(m, n, r) {
+    let orig = to_float(m * n)
+    let comp = to_float((m * r) + (n * r))
+    return comp / orig
+}
+
+println("[powersgd] loaded — low-rank gradient compression + error feedback")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -14,7 +14,208 @@
 //        the linear left-fold.
 // ═══════════════════════════════════════════════════════════
 
-use "ai_native/reduce_tree"
+// -- inlined from self/ai_native/reduce_tree.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  self/ai_native/reduce_tree.hexa — ROI #85
+//
+//  @reduce_tree — binary tree-reduce for associative folds over
+//  contiguous arrays (sum / product / max / min).
+//
+//  Motivation:
+//    Linear left-fold
+//        acc = init
+//        for x in arr: acc = op(acc, x)
+//    computes the reduction in O(n) time but with O(n) dependency
+//    depth — every step depends on the previous one. This blocks
+//    two things AI-native workloads care about:
+//      (1) Parallelization — a tree reduction has O(log n) depth,
+//          so pairs at each level can be evaluated concurrently
+//          (matches @parallel_for ROI #80). Linear fold cannot be
+//          parallelized without restructuring.
+//      (2) Floating-point stability — for fp addition, pairwise
+//          summation has error O(log n · eps) vs naive summation's
+//          O(n · eps). Mixing magnitudes (large + many small) is the
+//          canonical case where tree-sum is visibly more accurate.
+//
+//  API:
+//    reduce_linear(arr, op, init) -> scalar   // left fold
+//    reduce_tree  (arr, op, init) -> scalar   // pairwise tree
+//    tree_add  (arr) -> sum        (init = 0)
+//    tree_mul  (arr) -> product    (init = 1)
+//    tree_max  (arr) -> max         (init = arr[0] | -inf surrogate)
+//    tree_min  (arr) -> min         (init = arr[0] | +inf surrogate)
+//    is_associative(op, a, b, c, tol) -> bool    // small audit helper
+//
+//  Semantics:
+//    - Empty array:   reduce_*(arr=[], op, init) == init
+//    - Single elem:   reduce_*([x], op, init) == op(init, x)
+//    - Odd length:    last element carries unpaired to the next level
+//    - Depth:         ceil(log2(len(arr))) levels for n >= 2
+//
+//  Associativity:
+//    max/min are strictly associative on any totally ordered domain
+//    (int or float) — linear and tree results are bit-identical.
+//    Integer add/mul are strictly associative within the int range.
+//    Float add/mul are only *approximately* associative; we ship an
+//    `is_associative` auditor that compares the two groupings under a
+//    user-supplied tolerance — callers use it for documentation, not
+//    as a gate (the implementation never rejects an op at runtime).
+//
+//  Non-goals:
+//    - Actual multi-threaded dispatch — logical only; the pairing
+//      layout is parallel-friendly so a future runtime (see ROI #80)
+//      can fan out each level to workers without touching this API.
+//    - Kahan / Neumaier compensated summation — pairwise already
+//      delivers the stability win we need for the #85 checkpoint.
+// ═══════════════════════════════════════════════════════════
+
+// ── op dispatch (string-tag to avoid first-class fn indirection) ──
+// Centralized so reduce_linear and reduce_tree use the exact same
+// operator — any drift here would make the linear/tree comparison
+// meaningless.
+fn apply_op(op, a, b) {
+    if op == "add" { return a + b }
+    if op == "mul" { return a * b }
+    if op == "max" {
+        if a >= b { return a }
+        return b
+    }
+    if op == "min" {
+        if a <= b { return a }
+        return b
+    }
+    // Unknown op: degrade to `a` so tests surface the mismatch rather
+    // than silently accumulating garbage.
+    return a
+}
+
+// ── linear (left-fold) baseline ───────────────────────────────
+// Classic O(n) / depth-n fold. Used as the oracle in tests and as
+// the comparison point when quantifying float error improvements.
+fn reduce_linear_impl(arr, op, init) {
+    let n = len(arr)
+    if n == 0 { return init }
+    let mut acc = init
+    let mut i = 0
+    while i < n {
+        acc = apply_op(op, acc, arr[i])
+        i = i + 1
+    }
+    return acc
+}
+pub fn reduce_linear(arr, op, init) { return reduce_linear_impl(arr, op, init) }
+
+// ── tree (pairwise) reduction ─────────────────────────────────
+// Level 0:  [x0 x1 x2 x3 x4 x5 x6]
+// Level 1:  [op(x0,x1) op(x2,x3) op(x4,x5) x6]     // odd carry
+// Level 2:  [op(.,.)   op(.,x6)]
+// Level 3:  [op(.,.)]                              -> final
+//
+// Depth = ceil(log2(n)) for n >= 2. The odd-length handling carries
+// the unpaired tail element as-is into the next level (no phantom
+// identity injected, which would change fp rounding).
+fn reduce_tree_impl(arr, op, init) {
+    let n = len(arr)
+    if n == 0 { return init }
+    if n == 1 { return apply_op(op, init, arr[0]) }
+
+    // Working buffer: start as a shallow copy (never mutate the input).
+    let mut level = []
+    let mut k = 0
+    while k < n {
+        level = level.push(arr[k])
+        k = k + 1
+    }
+
+    while len(level) > 1 {
+        let ln = len(level)
+        let pairs = ln / 2
+        let rem = ln - pairs * 2            // 0 or 1 (no % operator)
+        let mut nxt = []
+        let mut i = 0
+        while i < pairs {
+            let a = level[i * 2]
+            let b = level[i * 2 + 1]
+            nxt = nxt.push(apply_op(op, a, b))
+            i = i + 1
+        }
+        if rem == 1 {
+            // carry the unpaired tail element untouched
+            nxt = nxt.push(level[ln - 1])
+        }
+        level = nxt
+    }
+    // Fold init in at the very end so init + tree_result == full reduction.
+    return apply_op(op, init, level[0])
+}
+pub fn reduce_tree(arr, op, init) { return reduce_tree_impl(arr, op, init) }
+
+// ── tree depth (informational / test invariant) ──────────────
+// Returns 0 for n<=1, otherwise ceil(log2(n)). Implemented by repeated
+// halving since we have no log2 builtin and bit-ops are restricted.
+pub fn tree_depth(n) {
+    if n <= 1 { return 0 }
+    let mut d = 0
+    let mut v = 1
+    while v < n {
+        v = v * 2
+        d = d + 1
+    }
+    return d
+}
+
+// ── wrappers for the four common cases ───────────────────────
+pub fn tree_add(arr) { return reduce_tree(arr, "add", 0) }
+pub fn tree_mul(arr) { return reduce_tree(arr, "mul", 1) }
+
+// For max/min the identity element depends on the domain (int vs
+// float, finite range). We sidestep the identity problem by seeding
+// with arr[0] and reducing the tail — mathematically equivalent to
+// op(init, arr[0]) with init = the neutral element.
+pub fn tree_max(arr) {
+    let n = len(arr)
+    if n == 0 { return 0 }       // caller's responsibility on empty
+    if n == 1 { return arr[0] }
+    // slice arr[1..n] then seed init with arr[0]
+    let mut tail = []
+    let mut i = 1
+    while i < n {
+        tail = tail.push(arr[i])
+        i = i + 1
+    }
+    return reduce_tree(tail, "max", arr[0])
+}
+
+pub fn tree_min(arr) {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    if n == 1 { return arr[0] }
+    let mut tail = []
+    let mut i = 1
+    while i < n {
+        tail = tail.push(arr[i])
+        i = i + 1
+    }
+    return reduce_tree(tail, "min", arr[0])
+}
+
+// ── associativity auditor (small, documentation-grade) ────────
+// Returns true iff op((a,b),c) and op(a,(b,c)) agree within tol.
+// For int add/mul/max/min and float max/min this is exact; for
+// float add/mul it is a near-equality within tol.
+// fabs_local → abs_pure (math_pure.hexa)
+
+pub fn is_associative(op, a, b, c, tol) {
+    let left  = apply_op(op, apply_op(op, a, b), c)
+    let right = apply_op(op, a, apply_op(op, b, c))
+    let d = left - right
+    return abs_pure(d) <= tol
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

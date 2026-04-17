@@ -22,7 +22,297 @@
 //  Run: ./hexa self/test_length_generalization.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/length_generalization.hexa"
+// -- inlined from self/ml/length_generalization.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/length_generalization.hexa — Length Generalization
+//
+//  Position extrapolation beyond training length — interpolation and
+//  extrapolation methods for RoPE-based position encoding.
+//
+//  Implements:
+//    1. Position Interpolation (PI): scale positions by L_train / L_test
+//    2. YaRN: NTK-aware interpolation with temperature scaling
+//    3. Attention scaling: log-ratio attention logit adjustment
+//    4. Frequency-based: separate high/low frequency RoPE dims
+//    5. Dynamic scaling: adapt scale factor by actual seq length
+//
+//  API (pure):
+//    lg_sin(x), lg_cos(x)                           -> float
+//    lg_rope_embed(pos, dim, base)                   -> [float]
+//    lg_pi_scale(pos, train_len, test_len)           -> float
+//    lg_pi_rope(pos, dim, base, train_len, test_len) -> [float]
+//    lg_yarn_scale(pos, dim, base, train_len, test_len, alpha, beta)
+//                                                    -> [float]
+//    lg_attention_scale(seq_len, train_len)           -> float
+//    lg_freq_separate(dim, base, threshold)           -> [[float]]
+//    lg_dynamic_scale(actual_len, train_len)          -> float
+//    lg_dynamic_rope(pos, dim, base, actual_len, train_len) -> [float]
+//    lg_dot_product(a, b)                            -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-dimension computation is independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ─────────────────────────────────────────────────
+
+fn lg_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn lg_exp(x) {
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < -20.0 { cx = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = term * cx / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-10 { return 1.0e-10 }
+    return result
+}
+
+fn lg_log(x) {
+    let mut cx = x
+    if cx < 1.0e-10 { cx = 1.0e-10 }
+    let y = (cx - 1.0) / (cx + 1.0)
+    let mut result = 0.0
+    let mut power = y
+    for k in 0..15 {
+        let denom = to_float(2 * k + 1)
+        result = result + power / denom
+        power = power * y * y
+    }
+    return 2.0 * result
+}
+
+fn lg_pow(base, exponent) {
+    // base^exp = exp(exp * ln(base))
+    if base <= 0.0 { return 0.0 }
+    return lg_exp(exponent * lg_log(base))
+}
+
+// sin via Taylor: sin(x) = x - x^3/3! + x^5/5! - ...
+fn lg_sin(x) {
+    // Reduce x to [-pi, pi]
+    let pi = 3.14159265358979
+    let two_pi = 6.28318530717959
+    let mut rx = x
+    while rx > pi { rx = rx - two_pi }
+    while rx < 0.0 - pi { rx = rx + two_pi }
+    let mut result = 0.0
+    let mut term = rx
+    for i in 0..10 {
+        let n = 2 * i + 1
+        result = result + term
+        term = 0.0 - term * rx * rx / to_float((n + 1) * (n + 2))
+    }
+    return result
+}
+
+// cos via Taylor: cos(x) = 1 - x^2/2! + x^4/4! - ...
+fn lg_cos(x) {
+    let pi = 3.14159265358979
+    let two_pi = 6.28318530717959
+    let mut rx = x
+    while rx > pi { rx = rx - two_pi }
+    while rx < 0.0 - pi { rx = rx + two_pi }
+    let mut result = 0.0
+    let mut term = 1.0
+    for i in 0..10 {
+        let n = 2 * i
+        result = result + term
+        term = 0.0 - term * rx * rx / to_float((n + 1) * (n + 2))
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Standard RoPE Embedding
+//
+//  For each dimension pair (2i, 2i+1):
+//    theta_i = base^(-2i/dim)
+//    embed[2i]   = sin(pos * theta_i)
+//    embed[2i+1] = cos(pos * theta_i)
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn lg_rope_embed(pos, dim, base) {
+    let mut embed = []
+    let half = dim / 2
+    for i in 0..half {
+        let theta = lg_pow(base, 0.0 - 2.0 * to_float(i) / to_float(dim))
+        let angle = to_float(pos) * theta
+        embed = embed + [lg_sin(angle)]
+        embed = embed + [lg_cos(angle)]
+    }
+    return embed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Position Interpolation (PI)
+//
+//  Scale position by L_train / L_test so that positions beyond
+//  training length map back into the trained range.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lg_pi_scale(pos, train_len, test_len) {
+    if test_len <= train_len { return to_float(pos) }
+    return to_float(pos) * to_float(train_len) / to_float(test_len)
+}
+
+@pure @parallel
+fn lg_pi_rope(pos, dim, base, train_len, test_len) {
+    let scaled_pos = lg_pi_scale(pos, train_len, test_len)
+    let mut embed = []
+    let half = dim / 2
+    for i in 0..half {
+        let theta = lg_pow(base, 0.0 - 2.0 * to_float(i) / to_float(dim))
+        let angle = scaled_pos * theta
+        embed = embed + [lg_sin(angle)]
+        embed = embed + [lg_cos(angle)]
+    }
+    return embed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  YaRN — NTK-Aware Interpolation
+//
+//  Combines position interpolation with frequency-dependent scaling.
+//  High-frequency dimensions are interpolated more aggressively;
+//  low-frequency dimensions are left mostly unchanged.
+//
+//  scale_factor = (test_len / train_len)
+//  For each dim i:
+//    freq = base^(-2i/dim)
+//    wavelength = 2*pi / freq
+//    if wavelength > beta * train_len: no interpolation (low freq)
+//    elif wavelength < alpha * train_len: full interpolation (high freq)
+//    else: linear blend
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn lg_yarn_scale(pos, dim, base, train_len, test_len, alpha, beta) {
+    let pi = 3.14159265358979
+    let scale = to_float(test_len) / to_float(train_len)
+    let half = dim / 2
+    let mut embed = []
+
+    for i in 0..half {
+        let freq = lg_pow(base, 0.0 - 2.0 * to_float(i) / to_float(dim))
+        let wavelength = 2.0 * pi / freq
+        let train_f = to_float(train_len)
+
+        // Compute interpolation factor for this dimension
+        let mut interp = 1.0
+        if wavelength > beta * train_f {
+            // Low frequency: no interpolation
+            interp = 1.0
+        } else {
+            if wavelength < alpha * train_f {
+                // High frequency: full interpolation
+                interp = 1.0 / scale
+            } else {
+                // Blend zone: linear interpolation
+                let range = beta * train_f - alpha * train_f
+                let frac = (wavelength - alpha * train_f) / range
+                interp = (1.0 - frac) * (1.0 / scale) + frac * 1.0
+            }
+        }
+
+        let angle = to_float(pos) * freq * interp
+        // Temperature scaling (sqrt of scale factor)
+        let temp = lg_pow(scale, 0.5)
+        embed = embed + [lg_sin(angle) / temp]
+        embed = embed + [lg_cos(angle) / temp]
+    }
+    return embed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention Scaling
+//
+//  Scale attention logits by log(seq_len) / log(train_len) to
+//  maintain stable softmax distributions at longer sequences.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lg_attention_scale(seq_len, train_len) {
+    if seq_len <= train_len { return 1.0 }
+    let num = lg_log(to_float(seq_len))
+    let den = lg_log(to_float(train_len))
+    if lg_abs(den) < 1.0e-10 { return 1.0 }
+    return num / den
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Frequency Separation
+//
+//  Classify each dimension pair as high-freq or low-freq based on
+//  whether its base frequency exceeds a threshold.
+//  Returns [[high_indices], [low_indices]].
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lg_freq_separate(dim, base, threshold) {
+    let half = dim / 2
+    let mut high = []
+    let mut low = []
+    for i in 0..half {
+        let freq = lg_pow(base, 0.0 - 2.0 * to_float(i) / to_float(dim))
+        if freq >= threshold {
+            high = high + [i]
+        } else {
+            low = low + [i]
+        }
+    }
+    return [high, low]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dynamic Scaling
+//
+//  Adapts the scale factor based on actual sequence length at
+//  inference time. Only scales when actual_len > train_len.
+//  scale = actual_len / train_len (clamped to >= 1.0)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lg_dynamic_scale(actual_len, train_len) {
+    if actual_len <= train_len { return 1.0 }
+    return to_float(actual_len) / to_float(train_len)
+}
+
+@pure @parallel
+fn lg_dynamic_rope(pos, dim, base, actual_len, train_len) {
+    let scale = lg_dynamic_scale(actual_len, train_len)
+    let scaled_pos = to_float(pos) / scale
+    let half = dim / 2
+    let mut embed = []
+    for i in 0..half {
+        let theta = lg_pow(base, 0.0 - 2.0 * to_float(i) / to_float(dim))
+        let angle = scaled_pos * theta
+        embed = embed + [lg_sin(angle)]
+        embed = embed + [lg_cos(angle)]
+    }
+    return embed
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dot Product — for attention score computation
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lg_dot_product(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

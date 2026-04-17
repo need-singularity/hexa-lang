@@ -4,7 +4,273 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_dsir_data_selection.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/dsir_data_selection.hexa"
+// -- inlined from self/ml/dsir_data_selection.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dsir_data_selection.hexa — DSIR Data Selection (#256)
+//
+//  Data Selection with Importance Resampling (DSIR).
+//    1. Build a hashed bag-of-n-grams feature (k-hot vector length B).
+//    2. Estimate p_target(x) and p_source(x) as empirical bag dist.
+//    3. Importance weight w_i = p_target(x_i) / p_source(x_i).
+//    4. Top-k weighted sampling (highest weight = most in-domain).
+//
+//  Pure arithmetic — no RNG needed for the top-k path; the optional
+//  probabilistic resampling uses a seeded LCG.
+//
+//  API:
+//    dsir_hash_token(token, B)                   -> int in [0,B)
+//    dsir_ngrams(tokens, n)                      -> [[int]]
+//    dsir_bag(tokens, n, B)                      -> [int]  length B
+//    dsir_bag_dist(bag)                          -> [float] length B
+//    dsir_merge_dist(docs, n, B)                 -> [float]
+//    dsir_importance(src_dist, tgt_dist, x_bag)  -> float
+//    dsir_score_corpus(src_docs, tgt_docs, n, B) -> [float]
+//    dsir_select_topk(src_docs, tgt_docs, n, B, k) -> [int]
+//    dsir_sample_weighted(weights, k, seed)      -> [int]
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — corpus-scoring loop
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn dsir_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dsir_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn dsir_zeros_i(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+fn dsir_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dsir_sort_desc_idx(weights) {
+    let n = len(weights)
+    let mut idx = []
+    for i in 0..n { idx = idx + [i] }
+    // insertion sort descending by weights[idx[i]]
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if weights[idx[j]] > weights[idx[i]] {
+                let tmp = idx[i]
+                idx[i] = idx[j]
+                idx[j] = tmp
+            }
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Token hash  — deterministic integer hash into [0, B)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dsir_hash_token(token, B) {
+    // token is expected to be an int id.  Multiplicative Knuth hash.
+    let h = (token * 2654435761 + 1) % B
+    if h < 0 { return h + B }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) N-grams — produce list of n-grams represented as int hashes
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dsir_ngrams(tokens, n) {
+    let L = len(tokens)
+    let mut out = []
+    if L < n { return out }
+    for i in 0..(L - n + 1) {
+        let mut gram = []
+        for k in 0..n { gram = gram + [tokens[i + k]] }
+        out = out + [gram]
+    }
+    return out
+}
+
+// Combine an n-gram into a single int hash (Knuth-style chain).
+fn dsir_gram_hash(gram, B) {
+    let mut h = 2166136261
+    for k in 0..len(gram) {
+        h = (h * 16777619 + gram[k]) % B
+        if h < 0 { h = h + B }
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Bag of hashed n-grams  -> count vector of length B
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dsir_bag(tokens, n, B) {
+    let grams = dsir_ngrams(tokens, n)
+    let mut bag = dsir_zeros_i(B)
+    for i in 0..len(grams) {
+        let h = dsir_gram_hash(grams[i], B)
+        bag[h] = bag[h] + 1
+    }
+    return bag
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Normalized probability distribution
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dsir_bag_dist(bag) {
+    let B = len(bag)
+    let mut total = 0
+    for j in 0..B { total = total + bag[j] }
+    let mut dist = dsir_zeros_f(B)
+    if total == 0 { return dist }
+    let tf = to_float(total)
+    for j in 0..B {
+        dist[j] = to_float(bag[j]) / tf
+    }
+    return dist
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Merge many docs into one estimated distribution
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dsir_merge_dist(docs, n, B) {
+    let mut total_bag = dsir_zeros_i(B)
+    for d in 0..len(docs) {
+        let b = dsir_bag(docs[d], n, B)
+        for j in 0..B { total_bag[j] = total_bag[j] + b[j] }
+    }
+    return dsir_bag_dist(total_bag)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Importance weight of a single doc's bag
+//
+//      w = product_j (p_target[j] / p_source[j])^x_j
+//
+//  implemented in log-space and smoothed to avoid zero / infinity.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn dsir_importance(src_dist, tgt_dist, x_bag) {
+    let B = len(src_dist)
+    let eps = 1.0e-8
+    let mut log_w = 0.0
+    for j in 0..B {
+        if x_bag[j] > 0 {
+            let ps = src_dist[j] + eps
+            let pt = tgt_dist[j] + eps
+            let ratio = pt / ps
+            log_w = log_w + to_float(x_bag[j]) * dsir_log(ratio)
+        }
+    }
+    return log_w
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Score a whole source corpus vs a target corpus
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn dsir_score_corpus(src_docs, tgt_docs, n, B) {
+    let src_dist = dsir_merge_dist(src_docs, n, B)
+    let tgt_dist = dsir_merge_dist(tgt_docs, n, B)
+    let mut weights = []
+    for d in 0..len(src_docs) {
+        let bag = dsir_bag(src_docs[d], n, B)
+        weights = weights + [dsir_importance(src_dist, tgt_dist, bag)]
+    }
+    return weights
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Deterministic top-k selection
+// ═══════════════════════════════════════════════════════════════════
+fn dsir_select_topk(src_docs, tgt_docs, n, B, k) {
+    let weights = dsir_score_corpus(src_docs, tgt_docs, n, B)
+    let idx = dsir_sort_desc_idx(weights)
+    let mut out = []
+    let take = if k < len(idx) { k } else { len(idx) }
+    for i in 0..take { out = out + [idx[i]] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Weighted sampling (with replacement) using a seeded LCG
+// ═══════════════════════════════════════════════════════════════════
+fn dsir_lcg(state) {
+    // 32-bit LCG (glibc parameters)
+    let s = (state * 1103515245 + 12345) % 2147483648
+    return s
+}
+
+fn dsir_sample_weighted(weights, k, seed) {
+    // shift so all weights >= 0 and turn into a cumulative distribution
+    let n = len(weights)
+    if n == 0 { return [] }
+    let mut min_w = weights[0]
+    for i in 1..n {
+        if weights[i] < min_w { min_w = weights[i] }
+    }
+    let shift = if min_w < 0.0 { 0.0 - min_w + 1.0e-6 } else { 0.0 }
+    let mut cum = dsir_zeros_f(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let w = weights[i] + shift
+        total = total + w
+        cum[i] = total
+    }
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut out = []
+    let mut c = 0
+    while c < k {
+        state = dsir_lcg(state)
+        let u = (to_float(state) / 2147483648.0) * total
+        let mut pick = n - 1
+        let mut found = false
+        let mut i = 0
+        while i < n {
+            if !found {
+                if cum[i] >= u {
+                    pick = i
+                    found = true
+                }
+            }
+            i = i + 1
+        }
+        out = out + [pick]
+        c = c + 1
+    }
+    return out
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

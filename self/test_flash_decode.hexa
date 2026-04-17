@@ -13,7 +13,306 @@
 //  Run: ./hexa self/test_flash_decode.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/flash_decode.hexa"
+// -- inlined from self/ml/flash_decode.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/flash_decode.hexa — Flash Decoding (single-query attention)
+//
+//  Decoder-side specialization of Flash Attention for the autoregressive
+//  decode step. During decode we attend a SINGLE new query (Bq=1) over
+//  a very long KV cache (context thousands of tokens long). Standard
+//  FlashAttention parallelizes over query blocks, so with Bq=1 the work
+//  is serialized over KV. Flash Decoding splits the KV axis into chunks
+//  and runs partial (m, l, O) softmax per chunk in parallel, then
+//  reduces them with the log-sum-exp trick into a single output.
+//
+//  Reference: Tri Dao, "Flash-Decoding for long-context inference" (2023).
+//
+//  Algorithm (H100-friendly):
+//    split KV of length Lk into n_split chunks of size chunk_size
+//    for each chunk c:                                 (parallel)
+//        S_c[j]   = q · K[offset+j] * scale            j in 0..Lc
+//        m_c      = max_j S_c[j]
+//        P_c[j]   = exp(S_c[j] - m_c)
+//        l_c      = sum_j P_c[j]
+//        O_c[k]   = sum_j P_c[j] * V[offset+j][k]      (unnormalized)
+//    reduce:                                           (single pass)
+//        m_g      = max_c m_c
+//        alpha_c  = exp(m_c - m_g)
+//        l_g      = sum_c alpha_c * l_c
+//        O[k]     = (sum_c alpha_c * O_c[k]) / l_g
+//
+//  API:
+//    flash_decode_single(q, K, V, chunk_size)         -> [d]
+//    flash_decode_batch(Qs, K, V, chunk_size)         -> [B, d]
+//    flash_decode_kv_cache(q, cache, layer, h, chunk) -> [head_dim]
+//
+//  Shape convention:
+//    q       : [d]        — single query vector (current decode step)
+//    K,V     : [Lk, d]    — cached keys/values (context so far)
+//    Qs      : [B, d]     — batch of single-query decode heads
+//    out     : [d]        — attention output for this decode step
+//
+//  AI-NATIVE attrs:
+//    @hot      — called every decode step
+//    @parallel — chunk loop independent (maps to H100 SMs)
+//    @fuse     — inner dot+exp+accum fused
+//    @pure     — no hidden state mutation
+// ═══════════════════════════════════════════════════════════════
+
+// ── numeric helpers (prefixed to avoid collision) ────────────
+
+fn fd_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn fd_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn fd_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn fd_min(a, b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn fd_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Naive single-query decode — reference implementation
+//  O(Lk * d) compute, straightforward softmax over the whole KV.
+//  Used for correctness checks against flash_decode_single.
+// ═══════════════════════════════════════════════════════════════
+fn naive_decode_single(q, K, V) {
+    let Lk = len(K)
+    let d  = len(q)
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    // scores = q · K[j] * scale
+    let mut scores = fd_zeros_1d(Lk)
+    for j in 0..Lk {
+        let mut dot = 0.0
+        for k in 0..d {
+            dot = dot + q[k] * K[j][k]
+        }
+        scores[j] = dot * scale
+    }
+
+    // softmax (numerically stable)
+    let mut m = scores[0]
+    for j in 1..Lk {
+        if scores[j] > m {
+            m = scores[j]
+        }
+    }
+    let mut sum_exp = 0.0
+    let mut exps = fd_zeros_1d(Lk)
+    for j in 0..Lk {
+        let e = exp(scores[j] - m)
+        exps[j] = e
+        sum_exp = sum_exp + e
+    }
+
+    // weighted sum of V
+    let mut out = fd_zeros_1d(d)
+    for k in 0..d {
+        let mut acc = 0.0
+        for j in 0..Lk {
+            acc = acc + exps[j] * V[j][k]
+        }
+        out[k] = acc / sum_exp
+    }
+
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Partial chunk softmax — computes (m_c, l_c, O_c) for one KV slice
+//
+//    O_c is returned UN-normalized: callers finish normalization after
+//    the cross-chunk reduce. This is the flash-decoding invariant.
+// ═══════════════════════════════════════════════════════════════
+@hot @fuse
+fn flash_decode_chunk(q, K, V, kv_start, kv_end, scale) {
+    let d = len(q)
+    let Lc = kv_end - kv_start
+
+    // scores within this chunk
+    let mut scores = fd_zeros_1d(Lc)
+    for j in 0..Lc {
+        let mut dot = 0.0
+        for k in 0..d {
+            dot = dot + q[k] * K[kv_start + j][k]
+        }
+        scores[j] = dot * scale
+    }
+
+    // local max
+    let mut m_c = scores[0]
+    for j in 1..Lc {
+        if scores[j] > m_c {
+            m_c = scores[j]
+        }
+    }
+
+    // exp(score - m_c), accumulate l_c and unnormalized O_c
+    let mut l_c = 0.0
+    let mut O_c = fd_zeros_1d(d)
+    for j in 0..Lc {
+        let p = exp(scores[j] - m_c)
+        l_c = l_c + p
+        for k in 0..d {
+            O_c[k] = O_c[k] + p * V[kv_start + j][k]
+        }
+    }
+
+    // return as triple-like list: [m_c, l_c, O_c]  (homogeneous array nest)
+    return [m_c, l_c, O_c]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Flash Decode — single query over full KV with chunked reduce
+//
+//  Single decode step entry point. Splits KV into ceil(Lk/chunk_size)
+//  pieces, computes per-chunk (m_c, l_c, O_c) via flash_decode_chunk,
+//  then performs the log-sum-exp reduce to get the normalized output.
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn flash_decode_single(q, K, V, chunk_size) {
+    let Lk = len(K)
+    let d  = len(q)
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    // clamp chunk_size into a legal range
+    let mut cs = chunk_size
+    if cs < 1 { cs = 1 }
+    if cs > Lk { cs = Lk }
+    let n_split = (Lk + cs - 1) / cs
+
+    // gather per-chunk partials
+    let mut ms = fd_zeros_1d(n_split)
+    let mut ls = fd_zeros_1d(n_split)
+    let mut Os = fd_zeros_2d(n_split, d)
+
+    for c in 0..n_split {
+        let kv_start = c * cs
+        let kv_end   = fd_min(kv_start + cs, Lk)
+        let triple   = flash_decode_chunk(q, K, V, kv_start, kv_end, scale)
+        let m_c = triple[0]
+        let l_c = triple[1]
+        let O_c = triple[2]
+        ms[c] = m_c
+        ls[c] = l_c
+        for k in 0..d {
+            Os[c][k] = O_c[k]
+        }
+    }
+
+    // cross-chunk reduce via log-sum-exp
+    let mut m_g = ms[0]
+    for c in 1..n_split {
+        if ms[c] > m_g {
+            m_g = ms[c]
+        }
+    }
+
+    let mut l_g = 0.0
+    let mut O_g = fd_zeros_1d(d)
+    for c in 0..n_split {
+        let alpha = exp(ms[c] - m_g)
+        l_g = l_g + alpha * ls[c]
+        for k in 0..d {
+            O_g[k] = O_g[k] + alpha * Os[c][k]
+        }
+    }
+
+    let inv_l = 1.0 / l_g
+    let mut out = fd_zeros_1d(d)
+    for k in 0..d {
+        out[k] = O_g[k] * inv_l
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Flash Decode — batch of independent single-query decodes
+//
+//  Each row Qs[b] is an independent decode head sharing the same KV
+//  context. Useful for multi-head attention where heads are iterated
+//  outside and also for GQA heads that share (K,V).
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel
+fn flash_decode_batch(Qs, K, V, chunk_size) {
+    let B = len(Qs)
+    let d = len(Qs[0])
+    let mut out = fd_zeros_2d(B, d)
+    for b in 0..B {
+        let ob = flash_decode_single(Qs[b], K, V, chunk_size)
+        for k in 0..d {
+            out[b][k] = ob[k]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Flash Decode — KV-cache variant
+//
+//  Pulls K/V slices out of a flat KVCache (self/ml/kv_cache.hexa)
+//  for a given (layer, head) and runs flash_decode_single over the
+//  active prefix (cache.seq_len). Returns a [head_dim] vector.
+//
+//  Note: KVCache is imported via test driver; this function uses
+//  only field access + helpers so it can be consumed with any cache
+//  shape satisfying the same interface.
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn flash_decode_kv_cache(q, cache, layer, h, chunk_size) {
+    let Lk = cache.seq_len
+    let d  = cache.head_dim
+
+    // materialize K[0..Lk], V[0..Lk] for this (layer,h) slice
+    let mut K = fd_zeros_2d(Lk, d)
+    let mut V = fd_zeros_2d(Lk, d)
+    for p in 0..Lk {
+        for k in 0..d {
+            let kv = kv_cache_get_key(cache, layer, p, h, k)
+            let vv = kv_cache_get_val(cache, layer, p, h, k)
+            K[p][k] = kv
+            V[p][k] = vv
+        }
+    }
+    return flash_decode_single(q, K, V, chunk_size)
+}
+
+
+// -- end inlined --
 import "ml/kv_cache.hexa"
 
 let mut pass_count = 0

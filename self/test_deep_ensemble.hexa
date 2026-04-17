@@ -20,7 +20,292 @@
 //  Run: ./hexa self/test_deep_ensemble.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/deep_ensemble.hexa"
+// -- inlined from self/ml/deep_ensemble.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/deep_ensemble.hexa — Deep Ensemble (#273)
+//
+//  Ref: Lakshminarayanan et al. 2017 — "Simple and Scalable
+//       Predictive Uncertainty Estimation using Deep Ensembles"
+//
+//  Idea: train M neural networks with independent random init
+//        on the same data, then at inference time average
+//        their predictions. The variance across members gives
+//        an uncertainty estimate "for free".
+//
+//  Classification:
+//    p_bar(y|x) = (1/M) * sum_m p_m(y|x)   (averaged probs)
+//    prediction = argmax_y p_bar(y|x)
+//    uncertainty = H(p_bar)                (entropy)
+//    epistemic   = mean_m H(p_m) − H(p_bar) (disagreement)
+//
+//  Regression / scalar output:
+//    mu(x) = (1/M) * sum_m f_m(x)
+//    var(x)= (1/M) * sum_m (f_m(x) - mu(x))^2
+//
+//  Demo architecture: 2-layer MLP with tanh hidden, linear head.
+//  Each member has an independent seed so weight inits differ.
+//
+//  AI-NATIVE:
+//    @pure  — forward + aggregation
+// ═══════════════════════════════════════════════════════════════
+
+fn de_abs(v) {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn de_zeros(n) {
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    return r
+}
+
+fn de_zeros2d(m, n) {
+    let mut r = []
+    for _i in 0..m { r = r + [de_zeros(n)] }
+    return r
+}
+
+fn de_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+@pure
+fn de_tanh(v) {
+    let mut u = v
+    if u > 20.0 { u = 20.0 }
+    if u < (0.0 - 20.0) { u = 0.0 - 20.0 }
+    let e2 = exp(2.0 * u)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+// numerically stable softmax
+@pure
+fn de_softmax(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut sum = 0.0
+    let mut exps = []
+    for i in 0..n {
+        let e = exp(logits[i] - m)
+        exps = exps + [e]
+        sum = sum + e
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / sum] }
+    return out
+}
+
+@pure
+fn de_log(v) {
+    let mut u = v
+    if u < 1.0e-12 { u = 1.0e-12 }
+    return log(u)
+}
+
+// Shannon entropy H(p) = -sum p_i log p_i
+@pure
+fn de_entropy(p) {
+    let n = len(p)
+    let mut s = 0.0
+    for i in 0..n {
+        if p[i] > 1.0e-12 {
+            s = s - p[i] * de_log(p[i])
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Single-member 2-layer MLP (classification head = softmax)
+//
+//    params: dict with W1[h x d], b1[h], W2[c x h], b2[c]
+// ═══════════════════════════════════════════════════════════════
+fn de_init_member(in_dim, hidden, out_dim, seed) {
+    let mut W1 = de_zeros2d(hidden, in_dim)
+    let mut b1 = de_zeros(hidden)
+    let mut W2 = de_zeros2d(out_dim, hidden)
+    let mut b2 = de_zeros(out_dim)
+    for i in 0..hidden {
+        for j in 0..in_dim {
+            W1[i][j] = 0.5 * de_hash(seed, i, j)
+        }
+        b1[i] = 0.1 * de_hash(seed + 17, i, 0)
+    }
+    for i in 0..out_dim {
+        for j in 0..hidden {
+            W2[i][j] = 0.5 * de_hash(seed + 31, i, j)
+        }
+        b2[i] = 0.1 * de_hash(seed + 47, i, 0)
+    }
+    return #{
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "in_dim": in_dim,
+        "hidden": hidden,
+        "out_dim": out_dim
+    }
+}
+
+@pure
+fn de_forward_logits(member, feat) {
+    let in_dim = member["in_dim"]
+    let hidden = member["hidden"]
+    let out_dim = member["out_dim"]
+    let W1 = member["W1"]
+    let b1 = member["b1"]
+    let W2 = member["W2"]
+    let b2 = member["b2"]
+    // hidden = tanh(W1 @ feat + b1)
+    let mut h = de_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + W1[i][j] * feat[j]
+        }
+        h[i] = de_tanh(s)
+    }
+    // logits = W2 @ h + b2
+    let mut logits = de_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden {
+            s = s + W2[i][j] * h[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+@pure
+fn de_forward_probs(member, feat) {
+    let lg = de_forward_logits(member, feat)
+    return de_softmax(lg)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Ensemble builder: M members with distinct seeds
+// ═══════════════════════════════════════════════════════════════
+fn de_make_ensemble(M, in_dim, hidden, out_dim, base_seed) {
+    let mut members = []
+    for m in 0..M {
+        let s = base_seed + m * 101
+        members = members + [de_init_member(in_dim, hidden, out_dim, s)]
+    }
+    return members
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) Ensemble inference
+//
+//  Averaged probabilities + class prediction + entropy.
+// ═══════════════════════════════════════════════════════════════
+fn de_ensemble_probs(members, feat) {
+    let M = len(members)
+    let out_dim = members[0]["out_dim"]
+    let mut avg = de_zeros(out_dim)
+    for m in 0..M {
+        let p = de_forward_probs(members[m], feat)
+        for i in 0..out_dim {
+            avg[i] = avg[i] + p[i]
+        }
+    }
+    let inv = 1.0 / to_float(M)
+    let mut out = []
+    for i in 0..out_dim { out = out + [avg[i] * inv] }
+    return out
+}
+
+fn de_argmax(p) {
+    let n = len(p)
+    let mut best = 0
+    let mut bv = p[0]
+    for i in 1..n {
+        if p[i] > bv { bv = p[i]; best = i }
+    }
+    return best
+}
+
+fn de_predict(members, feat) {
+    let p = de_ensemble_probs(members, feat)
+    return de_argmax(p)
+}
+
+// Predictive entropy of the averaged distribution
+fn de_predictive_entropy(members, feat) {
+    let p = de_ensemble_probs(members, feat)
+    return de_entropy(p)
+}
+
+// Mutual information / epistemic term:
+//   MI = H[E_m p_m] − E_m H[p_m]
+fn de_mutual_information(members, feat) {
+    let M = len(members)
+    let p_bar = de_ensemble_probs(members, feat)
+    let h_bar = de_entropy(p_bar)
+    let mut avg_h = 0.0
+    for m in 0..M {
+        avg_h = avg_h + de_entropy(de_forward_probs(members[m], feat))
+    }
+    avg_h = avg_h / to_float(M)
+    return h_bar - avg_h
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Scalar regression variant — variance across members
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn de_regression_value(member, feat) {
+    // use logits[0] as the scalar output (out_dim must be 1)
+    let lg = de_forward_logits(member, feat)
+    return lg[0]
+}
+
+fn de_reg_mean_var(members, feat) {
+    let M = len(members)
+    let mut vals = []
+    let mut sum = 0.0
+    for m in 0..M {
+        let v = de_regression_value(members[m], feat)
+        vals = vals + [v]
+        sum = sum + v
+    }
+    let mean = sum / to_float(M)
+    let mut ss = 0.0
+    for m in 0..M {
+        let d = vals[m] - mean
+        ss = ss + d * d
+    }
+    let varv = ss / to_float(M)
+    return #{ "mean": mean, "var": varv }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Training step on one member (cross-entropy SGD)
+// ═══════════════════════════════════════════════════════════════
+fn de_ce_loss(member, feats, labels) {
+    let n = len(feats)
+    let mut s = 0.0
+    for k in 0..n {
+        let p = de_forward_probs(member, feats[k])
+        let y = labels[k]
+        s = s - de_log(p[y])
+    }
+    return s / to_float(n)
+}
+
+println("[deep_ensemble] loaded — independent MLP members + averaged softmax + variance uncertainty")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

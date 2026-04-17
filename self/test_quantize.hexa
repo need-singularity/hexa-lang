@@ -18,7 +18,203 @@
 //  round-trip identity on zero tensors.
 // ═══════════════════════════════════════════════════════════
 
-use "ai_native/quantize"
+// -- inlined from self/ai_native/quantize.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  self/ai_native/quantize.hexa — HEXA-native weight quantization
+//
+//  AI-native ROI item #75 — automatic int8 / int4 weight quantization.
+//  Symmetric quantization (zero_point = 0), per-channel (int8) or
+//  per-group (int4). Pure .hexa, no FFI, no Rust.
+//
+//  Usage:
+//      use "ai_native/quantize"
+//      let q = quantize_int8(weights)    // returns [q_vals, scales]
+//      let w = dequantize(q)             // restores fp32 tensor
+//
+//  Quantization scheme:
+//      scale    = max(|w|) / 127    (int8,  256 codes, range [-127, 127])
+//      scale    = max(|w|) / 7.5    (int4,  16 codes,  range [-8, 7])
+//      q        = round(w / scale)
+//      dequant  = q * scale
+//
+//  Measured accuracy on standard Gaussian weights (n=1024):
+//      int8 per-channel       : L2 rel err ≈ 0.008
+//      int4 per-group (g=32)  : L2 rel err ≈ 0.097
+//
+//  int4 hits the Lloyd-Max bound for uniform symmetric 4-bit
+//  quantizers on Gaussian inputs (~6–10% L2). To drop below 3%,
+//  switch to asymmetric quant, GPTQ error-compensation, or use
+//  5+ bits — all beyond the scope of this ROI item.
+//
+//  See: docs/ai-native.md, CLAUDE.md HX5
+// ═══════════════════════════════════════════════════════════
+
+// ── Helpers ────────────────────────────────────────────────
+
+// Clamp an integer value into [lo, hi].
+pub fn q_clamp_int(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+// Absolute value (robust for int and float).
+pub fn q_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+// Round-half-away-from-zero — HEXA `round` builtin rounds to nearest,
+// but we provide an explicit helper so the quantizer is deterministic
+// regardless of host rounding mode.
+pub fn q_round(x) {
+    if x >= 0.0 {
+        return floor(x + 0.5)
+    }
+    return 0 - floor((0 - x) + 0.5)
+}
+
+// Scan array, return max(|w|). Guards against zero-length input.
+pub fn q_absmax(arr) {
+    let n = len(arr)
+    if n == 0 { return 0.0 }
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let a = q_abs(arr[i])
+        if a > m { m = a }
+        i = i + 1
+    }
+    return m
+}
+
+// ── int8 per-channel symmetric quantization ────────────────
+//
+// A "channel" in this minimal API is the whole 1-D tensor passed in.
+// For higher-rank tensors the caller slices along the channel axis
+// and calls quantize_int8 per row. Returns:
+//     [ q_vals : [int],  scale : float ]
+
+pub fn quantize_int8(weights) {
+    let n = len(weights)
+    let amax = q_absmax(weights)
+    let mut scale = amax / 127.0
+    if scale == 0.0 { scale = 1.0 }
+    let mut q = []
+    let mut i = 0
+    while i < n {
+        let qv = q_round(weights[i] / scale)
+        let clamped = q_clamp_int(qv, 0 - 127, 127)
+        q = q.push(clamped)
+        i = i + 1
+    }
+    return [q, scale]
+}
+
+// ── int4 per-group symmetric quantization ──────────────────
+//
+// Splits the 1-D tensor into groups of `group_size` elements; each
+// group carries its own scale. We use the full signed 4-bit range
+// [-8, 7] (16 levels) for maximum resolution. Returns:
+//     [ q_vals : [int],  scales : [float],  group_size : int ]
+// The dequantizer reconstructs via q[i] * scales[i / group_size].
+
+pub fn quantize_int4(weights, group_size) {
+    let n = len(weights)
+    let mut q = []
+    let mut scales = []
+    let mut g_start = 0
+    while g_start < n {
+        let mut g_end = g_start + group_size
+        if g_end > n { g_end = n }
+        // Find max(|w|) in this group.
+        let mut amax = 0.0
+        let mut j = g_start
+        while j < g_end {
+            let a = q_abs(weights[j])
+            if a > amax { amax = a }
+            j = j + 1
+        }
+        // Full signed int4 range [-8, 7]: denominator = 7.5 keeps
+        // symmetric quantization while exploiting all 16 codes.
+        let mut scale = amax / 7.5
+        if scale == 0.0 { scale = 1.0 }
+        scales = scales.push(scale)
+        // Quantize each element in the group.
+        let mut k = g_start
+        while k < g_end {
+            let qv = q_round(weights[k] / scale)
+            let clamped = q_clamp_int(qv, 0 - 8, 7)
+            q = q.push(clamped)
+            k = k + 1
+        }
+        g_start = g_end
+    }
+    return [q, scales, group_size]
+}
+
+// ── Dequantization ─────────────────────────────────────────
+//
+// Accepts the 2-tuple returned by quantize_int8 or the 3-tuple
+// returned by quantize_int4 and restores an fp32 tensor.
+
+pub fn dequantize_int8(packed) {
+    let q = packed[0]
+    let scale = packed[1]
+    let n = len(q)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let v = q[i] * scale
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+pub fn dequantize_int4(packed) {
+    let q = packed[0]
+    let scales = packed[1]
+    let group_size = packed[2]
+    let n = len(q)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let g = i / group_size
+        let v = q[i] * scales[g]
+        out = out.push(v)
+        i = i + 1
+    }
+    return out
+}
+
+// Generic dispatcher — looks at the tuple arity to decide.
+pub fn dequantize(packed) {
+    if len(packed) == 2 { return dequantize_int8(packed) }
+    return dequantize_int4(packed)
+}
+
+// ── L2 relative error — used by tests and callers for validation.
+// Returns ||w - w_hat||_2 / ||w||_2.
+pub fn q_l2_rel_err(w, w_hat) {
+    let n = len(w)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut i = 0
+    while i < n {
+        let d = w[i] - w_hat[i]
+        num = num + d * d
+        den = den + w[i] * w[i]
+        i = i + 1
+    }
+    if den == 0.0 { return 0.0 }
+    return sqrt(num) / sqrt(den)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

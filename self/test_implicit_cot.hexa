@@ -21,7 +21,286 @@
 //  Run: ./hexa self/test_implicit_cot.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/implicit_cot.hexa"
+// -- inlined from self/ml/implicit_cot.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/implicit_cot.hexa — Implicit Chain-of-Thought
+//
+//  Hidden reasoning without explicit tokens — compress chain-of-thought
+//  into hidden states so the student model reasons internally.
+//
+//  Implements:
+//    1. Teacher: standard CoT model with explicit reasoning tokens
+//    2. Student: predict answer directly with enriched hidden states
+//    3. Internalization loss: KL divergence between hidden states
+//    4. Progressive compression: reduce explicit tokens over training
+//    5. Inference: single forward pass (no CoT tokens)
+//
+//  API (pure):
+//    icot_abs(x)                                    -> float
+//    icot_teacher_forward(input, weights_t, n_steps) -> (hidden_states, output)
+//    icot_student_forward(input, weights_s)          -> (hidden_states, output)
+//    icot_kl_divergence(p, q)                        -> float
+//    icot_internalization_loss(t_hidden, s_hidden)    -> float
+//    icot_compression_ratio(step, total)             -> float
+//    icot_compress_cot(cot_tokens, ratio)            -> [int]
+//    icot_train_step(input, weights_t, weights_s, cot_len, step, total, lr)
+//                                                    -> [[float]]
+//    icot_inference(input, weights_s)                -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-dimension operations are independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn icot_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn icot_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn icot_copy_2d(w) {
+    let rows = len(w)
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..len(w[i]) { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn icot_exp(x) {
+    // Taylor series exp for small values, clamped
+    let mut cx = x
+    if cx > 20.0 { cx = 20.0 }
+    if cx < -20.0 { cx = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..20 {
+        term = term * cx / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-10 { return 1.0e-10 }
+    return result
+}
+
+fn icot_log(x) {
+    // Natural log approximation using series: ln(x) = 2 * sum( ((x-1)/(x+1))^(2k+1) / (2k+1) )
+    let mut cx = x
+    if cx < 1.0e-10 { cx = 1.0e-10 }
+    let y = (cx - 1.0) / (cx + 1.0)
+    let mut result = 0.0
+    let mut power = y
+    for k in 0..15 {
+        let denom = to_float(2 * k + 1)
+        result = result + power / denom
+        power = power * y * y
+    }
+    return 2.0 * result
+}
+
+// ── Softmax over a vector ────────────────────────────────────────
+fn icot_softmax(v) {
+    let n = len(v)
+    // Find max for numerical stability
+    let mut mx = v[0]
+    for i in 1..n {
+        if v[i] > mx { mx = v[i] }
+    }
+    let mut exps = []
+    let mut sm = 0.0
+    for i in 0..n {
+        let e = icot_exp(v[i] - mx)
+        exps = exps + [e]
+        sm = sm + e
+    }
+    let mut out = []
+    for i in 0..n {
+        out = out + [exps[i] / sm]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher Forward — multi-step reasoning with explicit CoT
+//
+//  Simulates a teacher that produces intermediate hidden states
+//  through n_steps reasoning steps. Each step transforms the hidden
+//  state via weights (matmul + tanh-like activation).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_teacher_forward(input, weights_t, n_steps) {
+    let dim = len(input)
+    let mut hidden = icot_zeros(dim)
+    // Initialize hidden state from input
+    for i in 0..dim { hidden[i] = input[i] }
+
+    // Collect hidden states at each reasoning step
+    let mut all_hidden = []
+
+    for _s in 0..n_steps {
+        // Transform: h = tanh(W @ h)
+        let mut new_h = icot_zeros(dim)
+        for i in 0..dim {
+            let mut s = 0.0
+            for j in 0..dim {
+                s = s + weights_t[i][j] * hidden[j]
+            }
+            // tanh approximation via exp
+            let e_pos = icot_exp(2.0 * s)
+            new_h[i] = (e_pos - 1.0) / (e_pos + 1.0)
+        }
+        hidden = new_h
+        all_hidden = all_hidden + [hidden]
+    }
+
+    // Output: softmax of final hidden state
+    let output = icot_softmax(hidden)
+    return [all_hidden, output]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Student Forward — single-step prediction with enriched hidden
+//
+//  Student uses a single forward pass, producing one hidden state
+//  that should internalize the teacher's multi-step reasoning.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_student_forward(input, weights_s) {
+    let dim = len(input)
+    // Single transformation
+    let mut hidden = icot_zeros(dim)
+    for i in 0..dim {
+        let mut s = 0.0
+        for j in 0..dim {
+            s = s + weights_s[i][j] * input[j]
+        }
+        let e_pos = icot_exp(2.0 * s)
+        hidden[i] = (e_pos - 1.0) / (e_pos + 1.0)
+    }
+    let output = icot_softmax(hidden)
+    return [hidden, output]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  KL Divergence — D_KL(p || q) = sum(p[i] * log(p[i] / q[i]))
+//
+//  Applied to softmax distributions of hidden states.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_kl_divergence(p, q) {
+    let n = len(p)
+    let p_soft = icot_softmax(p)
+    let q_soft = icot_softmax(q)
+    let mut kl = 0.0
+    for i in 0..n {
+        let pi = p_soft[i]
+        let qi = q_soft[i]
+        if pi > 1.0e-10 {
+            kl = kl + pi * icot_log(pi / qi)
+        }
+    }
+    if kl < 0.0 { return 0.0 }
+    return kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Internalization Loss
+//
+//  KL divergence between the teacher's final hidden state and the
+//  student's single hidden state. Lower = better internalization.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_internalization_loss(t_hidden, s_hidden) {
+    return icot_kl_divergence(t_hidden, s_hidden)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Progressive Compression Ratio
+//
+//  Linearly reduces the fraction of explicit CoT tokens kept.
+//  At step=0: ratio=1.0 (keep all). At step=total: ratio=0.0 (keep none).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_compression_ratio(step, total) {
+    if step >= total { return 0.0 }
+    if step <= 0 { return 1.0 }
+    return 1.0 - to_float(step) / to_float(total)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compress CoT — keep only top `ratio` fraction of tokens
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_compress_cot(cot_tokens, ratio) {
+    let n = len(cot_tokens)
+    let keep = int(to_float(n) * ratio)
+    if keep <= 0 { return [] }
+    if keep >= n { return cot_tokens }
+    let mut out = []
+    for i in 0..keep {
+        out = out + [cot_tokens[i]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training Step
+//
+//  1. Teacher forward with n_steps reasoning
+//  2. Student forward (single pass)
+//  3. Compute internalization loss (KL between hidden states)
+//  4. Update student weights via gradient descent
+//  Returns updated student weights.
+// ═══════════════════════════════════════════════════════════════════
+fn icot_train_step(input, weights_t, weights_s, cot_len, step, total, lr) {
+    let dim = len(input)
+
+    // Teacher forward
+    let t_result = icot_teacher_forward(input, weights_t, cot_len)
+    let t_all_hidden = t_result[0]
+    let t_output = t_result[1]
+    // Use final hidden state from teacher
+    let t_hidden = t_all_hidden[len(t_all_hidden) - 1]
+
+    // Student forward
+    let s_result = icot_student_forward(input, weights_s)
+    let s_hidden = s_result[0]
+    let s_output = s_result[1]
+
+    // Internalization loss gradient: approximate dL/dW_s
+    // Simplified: nudge student hidden toward teacher hidden
+    let mut new_ws = icot_copy_2d(weights_s)
+    for i in 0..dim {
+        let delta = t_hidden[i] - s_hidden[i]
+        for j in 0..dim {
+            // Gradient: delta * input[j] (chain rule approximation)
+            new_ws[i][j] = new_ws[i][j] + lr * delta * input[j]
+        }
+    }
+    return new_ws
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inference — single forward pass through student (no CoT tokens)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn icot_inference(input, weights_s) {
+    let result = icot_student_forward(input, weights_s)
+    return result[1]
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

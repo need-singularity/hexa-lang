@@ -18,7 +18,204 @@
 //  Run: ./hexa self/test_stochastic_weight_averaging.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/stochastic_weight_averaging.hexa"
+// -- inlined from self/ml/stochastic_weight_averaging.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/stochastic_weight_averaging.hexa — SWA (#271)
+//
+//  Ref: Izmailov et al. 2018 — "Averaging Weights Leads to Wider
+//       Optima and Better Generalization"
+//
+//  Idea: at the tail of SGD training, snapshot the current weights
+//        every k steps and accumulate a running mean. The averaged
+//        point lies in a flatter, wider region of the loss surface
+//        and generalizes better than the final SGD iterate.
+//
+//  Running-mean recurrence for the n-th snapshot:
+//    SWA_{n} = ((n - 1) * SWA_{n-1} + w_current) / n
+//            = SWA_{n-1} + (w_current - SWA_{n-1}) / n
+//
+//  Cyclic constant-or-linear LR schedule (Izmailov et al.):
+//    alpha1, alpha2, cycle c
+//    t_i = ((i mod c) + 1) / c
+//    lr(i) = (1 - t_i) * alpha1 + t_i * alpha2
+//
+//  For this demo we run SGD on a linear-regression MSE, start SWA
+//  after `swa_start` steps, and snapshot every `swa_every` steps.
+//
+//  AI-NATIVE:
+//    @pure  — averaging / schedule helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn swa_abs(v) {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn swa_zeros(n) {
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    return r
+}
+
+fn swa_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Running-mean update
+//    new_avg[i] = old_avg[i] + (w[i] - old_avg[i]) / n
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn swa_update_running(old_avg, w, n) {
+    let d = len(w)
+    let mut out = []
+    let denom = to_float(n)
+    for i in 0..d {
+        let delta = (w[i] - old_avg[i]) / denom
+        out = out + [old_avg[i] + delta]
+    }
+    return out
+}
+
+// Same for scalar bias
+@pure
+fn swa_update_running_scalar(old_avg, w, n) {
+    let denom = to_float(n)
+    return old_avg + (w - old_avg) / denom
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Cyclic linear LR schedule
+//    Given cycle length c, step i, alpha1, alpha2:
+//    t = (((i mod c) + 1) / c)
+//    lr = (1 - t) * alpha1 + t * alpha2
+//  Starts at alpha1 at beginning of cycle, ends at alpha2.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn swa_cyclic_lr(step, cycle, alpha1, alpha2) {
+    let pos = step % cycle
+    let t = (to_float(pos) + 1.0) / to_float(cycle)
+    return (1.0 - t) * alpha1 + t * alpha2
+}
+
+// Constant LR (Izmailov variant)
+@pure
+fn swa_const_lr(alpha) {
+    return alpha
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) Simple SGD step on MSE for linear regression
+//    y = w.f + b
+//    loss = (1/N) sum (y - t)^2
+//    grad_w[i] = (2/N) sum (y - t) * f[i]
+//    grad_b    = (2/N) sum (y - t)
+// ═══════════════════════════════════════════════════════════════
+fn swa_forward(w, b, feat) {
+    let d = len(w)
+    let mut y = b
+    for i in 0..d {
+        y = y + w[i] * feat[i]
+    }
+    return y
+}
+
+fn swa_mse(w, b, feats, targets) {
+    let n = len(feats)
+    let mut s = 0.0
+    for i in 0..n {
+        let y = swa_forward(w, b, feats[i])
+        let e = y - targets[i]
+        s = s + e * e
+    }
+    return s / to_float(n)
+}
+
+fn swa_sgd_step(w, b, feats, targets, lr) {
+    let n = len(feats)
+    let d = len(w)
+    let mut grad_w = swa_zeros(d)
+    let mut grad_b = 0.0
+    for k in 0..n {
+        let y = swa_forward(w, b, feats[k])
+        let e = y - targets[k]
+        grad_b = grad_b + 2.0 * e
+        for i in 0..d {
+            grad_w[i] = grad_w[i] + 2.0 * e * feats[k][i]
+        }
+    }
+    let inv = 1.0 / to_float(n)
+    let mut new_w = []
+    for i in 0..d {
+        new_w = new_w + [w[i] - lr * grad_w[i] * inv]
+    }
+    let new_b = b - lr * grad_b * inv
+    return #{ "w": new_w, "b": new_b }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Full SWA training loop
+//    Training state is a dict:
+//      "w", "b"           — current SGD iterate
+//      "swa_w", "swa_b"   — running SWA average
+//      "n_avg"            — number of snapshots accumulated so far
+// ═══════════════════════════════════════════════════════════════
+fn swa_make_state(w_init, b_init) {
+    return #{
+        "w": w_init,
+        "b": b_init,
+        "swa_w": w_init,
+        "swa_b": b_init,
+        "n_avg": 0
+    }
+}
+
+fn swa_train(state, feats, targets, total_steps, swa_start, swa_every, cycle, alpha1, alpha2) {
+    let mut w = state["w"]
+    let mut b = state["b"]
+    let mut swa_w = state["swa_w"]
+    let mut swa_b = state["swa_b"]
+    let mut n_avg = state["n_avg"]
+    for step in 0..total_steps {
+        let lr = swa_cyclic_lr(step, cycle, alpha1, alpha2)
+        let upd = swa_sgd_step(w, b, feats, targets, lr)
+        w = upd["w"]
+        b = upd["b"]
+        // snapshot after swa_start, every swa_every steps
+        if step >= swa_start {
+            let since = step - swa_start
+            if since % swa_every == 0 {
+                n_avg = n_avg + 1
+                swa_w = swa_update_running(swa_w, w, n_avg)
+                swa_b = swa_update_running_scalar(swa_b, b, n_avg)
+            }
+        }
+    }
+    return #{
+        "w": w,
+        "b": b,
+        "swa_w": swa_w,
+        "swa_b": swa_b,
+        "n_avg": n_avg
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Convenience: evaluate SWA and SGD on a data set
+// ═══════════════════════════════════════════════════════════════
+fn swa_eval_both(state, feats, targets) {
+    let mse_sgd = swa_mse(state["w"], state["b"], feats, targets)
+    let mse_swa = swa_mse(state["swa_w"], state["swa_b"], feats, targets)
+    return #{ "sgd": mse_sgd, "swa": mse_swa }
+}
+
+println("[swa] loaded — cyclic LR + running mean weight averaging")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

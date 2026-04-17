@@ -4,7 +4,267 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_lottery_ticket_snip.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/lottery_ticket_snip.hexa"
+// -- inlined from self/ml/lottery_ticket_snip.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/lottery_ticket_snip.hexa — Lottery Ticket / SNIP (#262)
+//
+//  SNIP score: saliency based on gradient * weight at initialization.
+//      s_ij = | ∂L/∂w_ij · w_ij |
+//  After computing scores we keep the top (1 - sparsity) fraction of
+//  weights — the mask is fixed for the rest of training.  Initial
+//  (un-pruned) weights are preserved exactly, matching the original
+//  "Lottery Ticket Hypothesis" workflow.
+//
+//  Loss used for gradients: linear MSE  L = 1/2 || Wx - y ||²
+//      ∂L/∂w_ij = (y_hat_i - y_i) * x_j
+//
+//  API:
+//    lts_linear_grad(W, X, Y)                     -> [[float]]
+//    lts_snip_score(W, X, Y)                      -> [[float]]
+//    lts_select_mask(scores, sparsity)            -> [[bool]]
+//    lts_apply_mask(W, mask)                      -> [[float]]
+//    lts_sparsity(mask)                           -> float
+//    lts_lottery_ticket(W_init, X, Y, sparsity)   -> #{W, mask, scores}
+//    lts_train_step_masked(W, X, Y, mask, lr)     -> [[float]]
+//    lts_loss_mse(W, X, Y)                        -> float
+//
+//  AI-NATIVE attrs:
+//    @pure
+//    @hot — per-step grad & mask apply
+// ═══════════════════════════════════════════════════════════════════
+
+fn lts_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn lts_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn lts_copy_2d(w) {
+    let rows = len(w)
+    let cols = len(w[0])
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..cols { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn lts_sort_asc(a) {
+    let n = len(a)
+    let mut s = []
+    for i in 0..n { s = s + [a[i]] }
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if s[j] < s[i] {
+                let tmp = s[i]
+                s[i] = s[j]
+                s[j] = tmp
+            }
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Batch linear gradient dL/dW for MSE
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lts_linear_grad(W, X, Y) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let B = len(X)
+    let mut grad = lts_zeros_2d(rows, cols)
+    if B == 0 { return grad }
+    for b in 0..B {
+        // forward
+        let mut y_hat = []
+        for i in 0..rows {
+            let mut s = 0.0
+            for j in 0..cols { s = s + W[i][j] * X[b][j] }
+            y_hat = y_hat + [s]
+        }
+        for i in 0..rows {
+            let err = y_hat[i] - Y[b][i]
+            for j in 0..cols {
+                grad[i][j] = grad[i][j] + err * X[b][j]
+            }
+        }
+    }
+    let bf = to_float(B)
+    for i in 0..rows {
+        for j in 0..cols {
+            grad[i][j] = grad[i][j] / bf
+        }
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) SNIP saliency score  |g ⊙ w|
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lts_snip_score(W, X, Y) {
+    let g = lts_linear_grad(W, X, Y)
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut s = lts_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            s[i][j] = lts_abs(g[i][j] * W[i][j])
+        }
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Select boolean mask keeping top (1-sparsity) entries globally
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lts_select_mask(scores, sparsity) {
+    let rows = len(scores)
+    let cols = len(scores[0])
+    let total = rows * cols
+    let num_prune_f = to_float(total) * sparsity
+    let mut num_prune = int(num_prune_f)
+    if num_prune < 0 { num_prune = 0 }
+    if num_prune > total { num_prune = total }
+
+    let mut flat = []
+    for i in 0..rows {
+        for j in 0..cols { flat = flat + [scores[i][j]] }
+    }
+    let sorted = lts_sort_asc(flat)
+
+    let mut mask = []
+    for _i in 0..rows {
+        let mut mrow = []
+        for _j in 0..cols { mrow = mrow + [true] }
+        mask = mask + [mrow]
+    }
+    if num_prune <= 0 { return mask }
+    let thr = sorted[num_prune - 1]
+    let mut pruned = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if scores[i][j] <= thr {
+                if pruned < num_prune {
+                    mask[i][j] = false
+                    pruned = pruned + 1
+                }
+            }
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Apply a boolean mask — zero pruned weights
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn lts_apply_mask(W, mask) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut out = lts_copy_2d(W)
+    for i in 0..rows {
+        for j in 0..cols {
+            if !mask[i][j] { out[i][j] = 0.0 }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Sparsity of a mask  (fraction of false)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lts_sparsity(mask) {
+    let rows = len(mask)
+    let cols = len(mask[0])
+    let total = rows * cols
+    if total == 0 { return 0.0 }
+    let mut zeros = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if !mask[i][j] { zeros = zeros + 1 }
+        }
+    }
+    return to_float(zeros) / to_float(total)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Lottery-ticket discovery at initialization
+//
+//    1. Compute SNIP score from INIT weights
+//    2. Pick global mask keeping top (1 - sparsity) entries
+//    3. Apply mask to INIT weights (the "winning ticket")
+//    4. Return { W, mask, scores }
+// ═══════════════════════════════════════════════════════════════════
+fn lts_lottery_ticket(W_init, X, Y, sparsity) {
+    let scores = lts_snip_score(W_init, X, Y)
+    let mask = lts_select_mask(scores, sparsity)
+    let W_pruned = lts_apply_mask(W_init, mask)
+    return #{
+        "W": W_pruned,
+        "mask": mask,
+        "scores": scores
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Masked SGD step — updates only weights where mask==true
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn lts_train_step_masked(W, X, Y, mask, lr) {
+    let g = lts_linear_grad(W, X, Y)
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut out = lts_copy_2d(W)
+    for i in 0..rows {
+        for j in 0..cols {
+            if mask[i][j] {
+                out[i][j] = out[i][j] - lr * g[i][j]
+            } else {
+                out[i][j] = 0.0
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) MSE loss helper
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lts_loss_mse(W, X, Y) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let B = len(X)
+    let mut total = 0.0
+    for b in 0..B {
+        let mut ss = 0.0
+        for i in 0..rows {
+            let mut yhat = 0.0
+            for j in 0..cols { yhat = yhat + W[i][j] * X[b][j] }
+            let d = yhat - Y[b][i]
+            ss = ss + d * d
+        }
+        total = total + 0.5 * ss
+    }
+    return total / to_float(B)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

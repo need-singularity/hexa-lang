@@ -9,7 +9,241 @@
 //   5. memory footprint documentation (fused shares K/V, no materialise)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/gqa.hexa"
+// -- inlined from self/ai_native/gqa.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/gqa.hexa — AI-native ROI #86
+//
+//  Grouped-Query Attention (GQA) auto-detection + broadcast
+//  optimisation. Modern LLMs (LLaMA 3, Qwen, Mistral) use fewer K/V
+//  heads than Q heads to shrink KV cache by a factor of group_size.
+//
+//  Taxonomy:
+//      n_q == n_kv               → MHA (Multi-Head Attention)
+//      n_kv == 1                 → MQA (Multi-Query Attention)
+//      1 < n_kv < n_q            → GQA, group_size = n_q / n_kv
+//      n_q % n_kv != 0           → invalid (not a GQA pattern)
+//
+//  Public API:
+//      detect_gqa(n_q, n_kv)                 -> bool
+//      group_size(n_q, n_kv)                 -> int        (n_q / n_kv)
+//      repeat_kv(KV, n_rep)                  -> expanded    [H_q, S, D]
+//      gqa_attention_naive(Q, K, V, nq, nkv) -> [H_q, S, D] materialise K/V
+//      gqa_attention_fused(Q, K, V, nq, nkv) -> [H_q, S, D] share K/V
+//
+//  Memory saving (naive vs fused):
+//      naive  K/V footprint : H_q · S · D      (after expand)
+//      fused  K/V footprint : H_kv · S · D     (alias only)
+//      Saving factor = group_size              (e.g. 4x for LLaMA 3 70B)
+//
+//  Tensor layout:
+//      Q  : [H_q,  S, D]  — per-head query matrix list
+//      K  : [H_kv, S, D]  — reduced key head count
+//      V  : [H_kv, S, D]  — reduced value head count
+//      O  : [H_q,  S, D]  — per-Q-head attention output
+//
+//  repeat_kv adjacency pattern (group_size=4):
+//      src head 0 → dst heads 0,1,2,3
+//      src head 1 → dst heads 4,5,6,7
+//      src head 2 → dst heads 8,9,10,11
+//      ...
+//      dst_head h → src_head h / group_size
+//
+//  HX3 pitfalls handled here:
+//      - no struct literals inside `if` body
+//      - `and`/`or` → `&&`/`||`
+//      - slice precedence (not used here but noted)
+//      - 3D array built via nested append, not comprehension
+//
+//  AI-native attrs:
+//      @pure     — detection / arithmetic
+//      @hot      — attention kernels
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+@pure
+fn gqa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+@pure
+fn gqa_exp(x) {
+    let mut c = x
+    if c > 20.0  { c =  20.0 }
+    if c < -20.0 { c = -20.0 }
+    let mut result = 1.0
+    let mut term   = 1.0
+    for i in 1..25 {
+        term   = term * c / to_float(i)
+        result = result + term
+    }
+    if result < 1.0e-30 { return 1.0e-30 }
+    return result
+}
+
+fn gqa_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Detection + arithmetic
+// ═══════════════════════════════════════════════════════════════════
+
+// detect_gqa — returns true iff (n_kv < n_q) && (n_q % n_kv == 0)
+// MHA (n_q == n_kv) → false;  non-divisible → false;  n_kv=0 → false
+@pure
+fn detect_gqa(n_q_heads, n_kv_heads) {
+    if n_kv_heads <= 0 { return false }
+    if n_kv_heads >= n_q_heads { return false }
+    let r = n_q_heads % n_kv_heads
+    if r != 0 { return false }
+    return true
+}
+
+// group_size — n_q / n_kv. Defined whenever n_kv divides n_q; returns
+// 1 when MHA (n_q == n_kv). Caller should sanity-check via detect_gqa.
+@pure
+fn group_size(n_q_heads, n_kv_heads) {
+    if n_kv_heads <= 0 { return 0 }
+    return n_q_heads / n_kv_heads
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  repeat_kv(KV, n_rep) — adjacency broadcast
+//
+//  Input :  KV  : [H_kv, S, D]
+//  Output:   KV' : [H_kv * n_rep, S, D]
+//  Rule  :  dst_head h → src_head h / n_rep   (adjacency replication)
+//
+//  Example (H_kv=2, n_rep=4):
+//      src[0] → dst[0..4),  src[1] → dst[4..8)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn repeat_kv(KV, n_rep) {
+    let H_kv = len(KV)
+    let mut out = []
+    for h in 0..H_kv {
+        let src = KV[h]
+        for _rep in 0..n_rep {
+            out = out + [src]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  single_head_attention — softmax(Q·K^T/sqrt(d)) · V  for one head
+//
+//  Q : [S, D]   K : [S, D]   V : [S, D]
+//  out : [S, D]
+//
+//  File-local to avoid clobbering flash_attention.hexa's copy.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn gqa_single_head(Q, K, V) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let dv = len(V[0])
+    let scale = 1.0 / gqa_sqrt(d * 1.0)
+    let mut out = gqa_zeros_2d(S, dv)
+
+    for i in 0..S {
+        // scores[j] = dot(Q[i], K[j]) * scale
+        let mut scores = []
+        for j in 0..S {
+            let mut dot = 0.0
+            for k in 0..d {
+                dot = dot + Q[i][k] * K[j][k]
+            }
+            scores = scores + [dot * scale]
+        }
+
+        // row-max
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m { m = scores[j] }
+        }
+
+        // softmax
+        let mut sum_exp = 0.0
+        let mut exps = []
+        for j in 0..S {
+            let e = gqa_exp(scores[j] - m)
+            exps = exps + [e]
+            sum_exp = sum_exp + e
+        }
+
+        for k in 0..dv {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gqa_attention_naive(Q, K, V, n_q, n_kv)
+//
+//  Materialise path — K/V are expanded to H_q heads via repeat_kv then
+//  regular MHA runs. Extra memory: (H_q - H_kv) · S · D.
+//
+//  Fallback for MHA (n_q == n_kv): repeat_kv is a no-op (n_rep=1).
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn gqa_attention_naive(Q, K, V, n_q_heads, n_kv_heads) {
+    let n_rep = group_size(n_q_heads, n_kv_heads)
+    let K_exp = repeat_kv(K, n_rep)
+    let V_exp = repeat_kv(V, n_rep)
+
+    let mut outs = []
+    for h in 0..n_q_heads {
+        outs = outs + [gqa_single_head(Q[h], K_exp[h], V_exp[h])]
+    }
+    return outs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gqa_attention_fused(Q, K, V, n_q, n_kv)
+//
+//  Index-share path — K[kv_h] and V[kv_h] are reused directly for all
+//  group_size query heads mapped to kv_h. No copy, no expand. K/V
+//  memory stays at H_kv · S · D.
+//
+//  Numerically identical to the naive path (same scale, same softmax,
+//  same V weighting) because repeat_kv is an in-memory alias map.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn gqa_attention_fused(Q, K, V, n_q_heads, n_kv_heads) {
+    let gs = group_size(n_q_heads, n_kv_heads)
+    let mut outs = []
+    for h in 0..n_q_heads {
+        let kv_h = h / gs
+        outs = outs + [gqa_single_head(Q[h], K[kv_h], V[kv_h])]
+    }
+    return outs
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

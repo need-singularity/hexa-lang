@@ -7,7 +7,270 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_mech_interp_circuits.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/mech_interp_circuits.hexa"
+// -- inlined from self/ml/mech_interp_circuits.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mech_interp_circuits.hexa — Mech Interp Circuits (#263)
+//
+//  Automated circuit discovery via path patching.  We model a tiny
+//  "micro-transformer" as a graph of edges (nodes = head outputs or
+//  MLP outputs, edges = residual-stream connections).  For each edge
+//  we:
+//
+//    1. Run the model on a CLEAN input, cache every activation.
+//    2. Run the model on a CORRUPT input, cache every activation.
+//    3. For each candidate edge, replace its CLEAN-side activation
+//       with the CORRUPT one and re-run downstream.
+//    4. Measure ΔLogit between corrupted and clean forward passes;
+//       edges with the largest drop are the "important" circuit.
+//
+//  The micro-model is intentionally simple — a directed acyclic
+//  computation graph with 3 node kinds:
+//      - "input"  : x
+//      - "head"   : out = W · src_vec   (linear projection)
+//      - "sum"    : out = Σ src_vec     (residual)
+//  Every node stores its value in a "cache" dictionary keyed by id.
+//
+//  API:
+//    mi_build_model(layer_defs)                      -> #{nodes, order}
+//    mi_forward(model, input)                        -> cache dict
+//    mi_logit(cache, target_id, class_idx)           -> float
+//    mi_patch_edge(model, clean_x, corrupt_x,
+//                  patch_src, target_id, class_idx)  -> float  (delta)
+//    mi_rank_edges(model, clean_x, corrupt_x,
+//                  target_id, class_idx)             -> [#{edge, delta}]
+//    mi_top_k_circuit(ranked, k)                     -> [string]
+//
+//  AI-NATIVE attrs:
+//    @pure — cache-only forward
+//    @hot  — patching loop
+// ═══════════════════════════════════════════════════════════════════
+
+fn mi_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn mi_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Build a model from layer definitions.
+//
+//  Each layer def is a dict of:
+//      #{
+//         "id":    "h0",
+//         "kind":  "input" | "head" | "sum",
+//         "srcs":  ["id1", "id2"],      // input ids (for head/sum)
+//         "W":     [[..]]               // only for "head"
+//      }
+//
+//  Returns a model dict with an order array preserving topo order
+//  (we assume the caller writes defs in topological order).
+// ═══════════════════════════════════════════════════════════════════
+fn mi_build_model(layer_defs) {
+    let mut nodes = #{}
+    let mut order = []
+    for i in 0..len(layer_defs) {
+        let d = layer_defs[i]
+        let nid = d["id"]
+        nodes[nid] = d
+        order = order + [nid]
+    }
+    return #{
+        "nodes": nodes,
+        "order": order
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Forward pass producing a cache of every node's output
+//
+//  input is a dict   #{"x0": [..vec..], "x1": [..vec..], ...}
+//  head nodes with srcs=[a] do  out = W · cache[a]
+//  head nodes with srcs=[a,b,..] concatenate cache[a]+cache[b]+..
+//  sum nodes just sum their src vectors elementwise.
+// ═══════════════════════════════════════════════════════════════════
+fn mi_vec_add(a, b) {
+    let n = len(a)
+    let mut out = mi_zeros_f(n)
+    for i in 0..n { out[i] = a[i] + b[i] }
+    return out
+}
+
+fn mi_matvec(W, x) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut out = mi_zeros_f(rows)
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols { s = s + W[i][j] * x[j] }
+        out[i] = s
+    }
+    return out
+}
+
+fn mi_concat(a, b) {
+    let mut out = []
+    for i in 0..len(a) { out = out + [a[i]] }
+    for i in 0..len(b) { out = out + [b[i]] }
+    return out
+}
+
+fn mi_forward(model, input) {
+    let nodes = model["nodes"]
+    let order = model["order"]
+    let mut cache = #{}
+    for i in 0..len(order) {
+        let nid = order[i]
+        let d = nodes[nid]
+        let kind = d["kind"]
+        if kind == "input" {
+            cache[nid] = input[nid]
+        } else {
+            if kind == "head" {
+                let srcs = d["srcs"]
+                let mut fused = cache[srcs[0]]
+                let mut k = 1
+                while k < len(srcs) {
+                    fused = mi_concat(fused, cache[srcs[k]])
+                    k = k + 1
+                }
+                let W = d["W"]
+                cache[nid] = mi_matvec(W, fused)
+            } else {
+                // sum
+                let srcs = d["srcs"]
+                let mut acc = cache[srcs[0]]
+                let mut k = 1
+                while k < len(srcs) {
+                    acc = mi_vec_add(acc, cache[srcs[k]])
+                    k = k + 1
+                }
+                cache[nid] = acc
+            }
+        }
+    }
+    return cache
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Logit of a particular class index at a particular node
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mi_logit(cache, target_id, class_idx) {
+    let v = cache[target_id]
+    return v[class_idx]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Forward with one edge patched
+//
+//  We recompute downstream nodes after substituting cache[patch_src]
+//  with corrupt_cache[patch_src].  Returns Δlogit = clean - patched.
+// ═══════════════════════════════════════════════════════════════════
+fn mi_forward_patched(model, clean_x, corrupt_cache, patch_src) {
+    let nodes = model["nodes"]
+    let order = model["order"]
+    let mut cache = #{}
+    for i in 0..len(order) {
+        let nid = order[i]
+        let d = nodes[nid]
+        let kind = d["kind"]
+        if kind == "input" {
+            cache[nid] = clean_x[nid]
+        } else {
+            if kind == "head" {
+                let srcs = d["srcs"]
+                let mut src0 = cache[srcs[0]]
+                if srcs[0] == patch_src { src0 = corrupt_cache[patch_src] }
+                let mut fused = src0
+                let mut k = 1
+                while k < len(srcs) {
+                    let sk = srcs[k]
+                    let mut vk = cache[sk]
+                    if sk == patch_src { vk = corrupt_cache[patch_src] }
+                    fused = mi_concat(fused, vk)
+                    k = k + 1
+                }
+                let W = d["W"]
+                cache[nid] = mi_matvec(W, fused)
+            } else {
+                let srcs = d["srcs"]
+                let mut s0 = cache[srcs[0]]
+                if srcs[0] == patch_src { s0 = corrupt_cache[patch_src] }
+                let mut acc = s0
+                let mut k = 1
+                while k < len(srcs) {
+                    let sk = srcs[k]
+                    let mut vk = cache[sk]
+                    if sk == patch_src { vk = corrupt_cache[patch_src] }
+                    acc = mi_vec_add(acc, vk)
+                    k = k + 1
+                }
+                cache[nid] = acc
+            }
+        }
+    }
+    return cache
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Patch effect of a single edge
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn mi_patch_edge(model, clean_x, corrupt_x, patch_src, target_id, class_idx) {
+    let clean_cache = mi_forward(model, clean_x)
+    let corrupt_cache = mi_forward(model, corrupt_x)
+    let patched = mi_forward_patched(model, clean_x, corrupt_cache, patch_src)
+    let clean_logit = mi_logit(clean_cache, target_id, class_idx)
+    let patched_logit = mi_logit(patched, target_id, class_idx)
+    return clean_logit - patched_logit
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Rank every node by patch effect (largest |Δ| first)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn mi_rank_edges(model, clean_x, corrupt_x, target_id, class_idx) {
+    let order = model["order"]
+    let mut results = []
+    for i in 0..len(order) {
+        let nid = order[i]
+        // Skip patching the target itself — identity delta.
+        if nid != target_id {
+            let delta = mi_patch_edge(model, clean_x, corrupt_x, nid, target_id, class_idx)
+            results = results + [#{ "edge": nid, "delta": delta, "abs": mi_abs(delta) }]
+        }
+    }
+    // Sort by abs delta descending
+    let n = len(results)
+    for i in 0..n {
+        for j in (i + 1)..n {
+            if results[j]["abs"] > results[i]["abs"] {
+                let tmp = results[i]
+                results[i] = results[j]
+                results[j] = tmp
+            }
+        }
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Top-K circuit edges
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mi_top_k_circuit(ranked, k) {
+    let mut out = []
+    let take = if k < len(ranked) { k } else { len(ranked) }
+    for i in 0..take { out = out + [ranked[i]["edge"]] }
+    return out
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

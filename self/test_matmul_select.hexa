@@ -8,7 +8,193 @@
 //      - threshold boundary ±500 flops splits backends correctly
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/matmul_select.hexa"
+// -- inlined from self/ai_native/matmul_select.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/matmul_select.hexa — AI-native ROI #88
+//
+//  @matmul_select — shape-driven auto dispatch between naive and tiled
+//  matmul. Small matmuls pay disproportionate overhead for blocking
+//  (loop-guard bookkeeping, residual arithmetic, tile-bound mins) and
+//  benefit from a tight naive kernel. Large matmuls lose cache on the
+//  naive path and gain from tiling. The dispatcher picks a backend
+//  from the shape alone — no runtime probing, no heuristic tuning.
+//
+//  Public API (row-major 2D arrays — A/B/C: [[float]]):
+//      matmul_naive(A, B)              -> C
+//      matmul_tiled(A, B, tile)        -> C
+//      matmul_tiled_default(A, B)      -> C      (tile = 64)
+//      matmul_select(A, B)             -> C      (auto backend)
+//      matmul_select_debug(A, B)       -> [C, backend_name]
+//      matmul_pick_backend(M, N, K)    -> "naive" | "tiled"
+//
+//  Selection rule:
+//      total_flops  = M * N * K
+//      threshold    = 100_000          (≈ 46.4^3 cube-equiv)
+//      flops ≥ threshold  → "tiled"
+//      flops <  threshold  → "naive"
+//
+//  The threshold was picked so that common 64×64 · 64×64 shapes
+//  (M·N·K = 262_144) land on the tiled path while 32³ (32_768) and
+//  4×4 · 4×4 (64) stay naive. Edge shapes (1×1, 1×N, M×1) always pick
+//  naive — total_flops collapses to max(N, M) which is far below the
+//  threshold.
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - slice precedence: arr[(i+1)..j] — parens required
+//      - no bit-ops (<<, >>, |) — arithmetic only
+//      - no struct literal in if heads
+//      - no `enum` — backend name returned as plain string
+//      - @attr pub fn — use attrs sparingly; parser accepts @hot alone
+//
+//  AI-native attrs:
+//      @hot        — called every forward step in fallback BLAS path
+//      @pure       — no side effects beyond returned C
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn ms88_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ms88_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  matmul_naive(A, B)  — reference 3-loop matmul (i, k, j) order.
+//  A: [M, K], B: [K, N] → C: [M, N].  Keeps A[i][k] resident while
+//  sweeping a contiguous row of B, which is optimal for small sizes.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn matmul_naive(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = ms88_zeros_2d(M, N)
+
+    for i in 0..M {
+        for k in 0..K {
+            let a = A[i][k]
+            for j in 0..N {
+                C[i][j] = C[i][j] + a * B[k][j]
+            }
+        }
+    }
+    return C
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  matmul_tiled(A, B, tile)  — single-parameter cache-aware blocking.
+//  Uses a symmetric tile along all three axes, which is the common
+//  case for square-ish matmuls. For asymmetric tuning, reach for the
+//  full gemm_tile (ROI #83) kernel directly.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn matmul_tiled(A, B, tile) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+
+    let mut C = ms88_zeros_2d(M, N)
+
+    let mut ii = 0
+    while ii < M {
+        let mb = ms88_min_i(tile, M - ii)
+        let mut jj = 0
+        while jj < N {
+            let nb = ms88_min_i(tile, N - jj)
+            let mut kk = 0
+            while kk < K {
+                let kb = ms88_min_i(tile, K - kk)
+
+                for i in 0..mb {
+                    let ai = ii + i
+                    for k in 0..kb {
+                        let a = A[ai][kk + k]
+                        let bk = kk + k
+                        for j in 0..nb {
+                            let cj = jj + j
+                            C[ai][cj] = C[ai][cj] + a * B[bk][cj]
+                        }
+                    }
+                }
+
+                kk = kk + tile
+            }
+            jj = jj + tile
+        }
+        ii = ii + tile
+    }
+    return C
+}
+
+fn matmul_tiled_default(A, B) {
+    return matmul_tiled(A, B, 64)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  matmul_pick_backend(M, N, K)  — pure shape → backend name.
+//  Exposed so callers (and tests) can query the dispatch decision
+//  without executing the matmul.
+// ═══════════════════════════════════════════════════════════════════
+fn matmul_pick_backend(M, N, K) {
+    let total_flops = M * N * K
+    let threshold = 100000
+    if total_flops >= threshold {
+        return "tiled"
+    }
+    return "naive"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  matmul_select(A, B)  — dispatch to the cheapest backend.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn matmul_select(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+    let backend = matmul_pick_backend(M, N, K)
+    if backend == "tiled" {
+        return matmul_tiled_default(A, B)
+    }
+    return matmul_naive(A, B)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  matmul_select_debug(A, B)  — same dispatch, plus the chosen
+//  backend name. Returned as a 2-element array [C, backend_string].
+//  Tuple-style packing stays within Hexa grammar (no struct literal).
+// ═══════════════════════════════════════════════════════════════════
+fn matmul_select_debug(A, B) {
+    let M = len(A)
+    let K = len(A[0])
+    let N = len(B[0])
+    let backend = matmul_pick_backend(M, N, K)
+    let mut C = []
+    if backend == "tiled" {
+        C = matmul_tiled_default(A, B)
+    } else {
+        C = matmul_naive(A, B)
+    }
+    return [C, backend]
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

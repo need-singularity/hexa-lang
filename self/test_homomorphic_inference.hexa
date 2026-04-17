@@ -2,7 +2,299 @@
 //  test_homomorphic_inference.hexa — Homomorphic Inference (#284)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/homomorphic_inference.hexa"
+// -- inlined from self/ml/homomorphic_inference.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/homomorphic_inference.hexa — Homomorphic Inference (#284)
+//
+//  Forward-pass on encrypted inputs using a polynomial network.
+//  CKKS and related FHE schemes natively support add / multiply on
+//  packed real vectors but NOT non-polynomial ops like ReLU.  We
+//  therefore replace activation with a quadratic approximation:
+//
+//      ReLU(z) ≈ 0.125 z² + 0.5 z + 0.25        (CryptoNets-style)
+//      σ(z)    ≈ 0.5 + 0.197 z − 0.004 z³       (optional sigmoid)
+//
+//  Encryption is simulated as a (shift, scale, nonce) triple so we
+//  can verify enc/dec round-trips and demonstrate homomorphic
+//  add/mul invariants.  The network forward pass is identical on
+//  plaintext and ciphertext vectors.
+//
+//  API:
+//    hom_encrypt(vec, shift, scale, seed) -> CT
+//    hom_decrypt(ct)                      -> [float]
+//    hom_add(a, b)                        -> CT
+//    hom_scale(ct, c)                     -> CT
+//    hom_mul(a, b)                        -> CT
+//    hom_poly_relu(ct)                    -> CT
+//    hom_poly_sigmoid(ct)                 -> CT
+//    hom_linear(W, b, vec)                -> [float]
+//    hom_forward(W1, b1, W2, b2, vec)     -> [float]
+//    hom_ct_linear(W, b, ct)              -> CT
+//    hom_ct_forward(W1, b1, W2, b2, ct)   -> CT
+//    hom_round_trip_error(vec, shift, scale, seed) -> float
+//
+//  AI-NATIVE attrs:
+//    @pure
+// ═══════════════════════════════════════════════════════════════════
+
+fn hom_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn hom_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn hom_max0(inp) { if inp < 0.0 { return 0.0 } return inp }
+
+fn hom_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ciphertext representation:
+//    #{ "data": [float] (blinded), "shift": float, "scale": float, "nonce": int }
+//
+//  enc:  d_i = (x_i + shift) * scale + small_nonce_noise
+//  dec:  x_i = d_i / scale - shift  (nonce cancels under add/mul because
+//                                    we track shift/scale explicitly)
+// ═══════════════════════════════════════════════════════════════════
+fn hom_encrypt(vec, shift, scale, seed) {
+    let n = len(vec)
+    let mut data = hom_zeros_f(n)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for i in 0..n {
+        state = hom_lcg(state)
+        if state <= 0 { state = 1 }
+        let noise = (to_float(state) / 2147483648.0 - 0.5) * 1.0e-9
+        data[i] = (vec[i] + shift) * scale + noise
+    }
+    return #{
+        "data": data,
+        "shift": shift,
+        "scale": scale,
+        "nonce": state
+    }
+}
+
+fn hom_decrypt(ct) {
+    let data = ct["data"]
+    let shift = ct["shift"]
+    let scale = ct["scale"]
+    let n = len(data)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n { out[i] = data[i] / scale - shift }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Homomorphic add: only valid when scale is aligned.  If shifts
+//  differ we rebalance.  We keep the simpler invariant scale_a == scale_b.
+// ═══════════════════════════════════════════════════════════════════
+fn hom_add(a, b) {
+    let da = a["data"]
+    let db = b["data"]
+    let n = len(da)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n { out[i] = da[i] + db[i] }
+    return #{
+        "data": out,
+        "shift": a["shift"] + b["shift"],
+        "scale": a["scale"],
+        "nonce": a["nonce"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Scalar multiply  c * ct  (shift absorbed linearly)
+// ═══════════════════════════════════════════════════════════════════
+fn hom_scale(ct, c) {
+    let d = ct["data"]
+    let n = len(d)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n { out[i] = d[i] * c }
+    return #{
+        "data": out,
+        "shift": ct["shift"] * c,
+        "scale": ct["scale"],
+        "nonce": ct["nonce"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Add a plaintext scalar bias s to every slot
+// ═══════════════════════════════════════════════════════════════════
+fn hom_add_plain(ct, s) {
+    let d = ct["data"]
+    let scale = ct["scale"]
+    let n = len(d)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n { out[i] = d[i] + s * scale }
+    return #{
+        "data": out,
+        "shift": ct["shift"],
+        "scale": scale,
+        "nonce": ct["nonce"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ciphertext × ciphertext (element-wise) — rescaled to match inputs
+//  (CKKS "rescale after mult" so scale stays bounded)
+// ═══════════════════════════════════════════════════════════════════
+fn hom_mul(a, b) {
+    let da = a["data"]
+    let db = b["data"]
+    let sa = a["scale"]
+    let sb = b["scale"]
+    let sha = a["shift"]
+    let shb = b["shift"]
+    let n = len(da)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n {
+        let va = da[i] / sa - sha
+        let vb = db[i] / sb - shb
+        // Product plaintext then re-encode at scale sa (canonical scale)
+        out[i] = va * vb * sa
+    }
+    return #{
+        "data": out,
+        "shift": 0.0,
+        "scale": sa,
+        "nonce": a["nonce"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Polynomial ReLU approximation (CryptoNets)
+//      f(z) = 0.125 z² + 0.5 z + 0.25
+//  Implementable with only add/mul.
+// ═══════════════════════════════════════════════════════════════════
+fn hom_poly_relu(ct) {
+    let sq = hom_mul(ct, ct)
+    let term1 = hom_scale(sq, 0.125)
+    let term2 = hom_scale(ct, 0.5)
+    let sum12 = hom_add(term1, term2)
+    return hom_add_plain(sum12, 0.25)
+}
+
+// Plain version for comparison
+@pure
+fn hom_poly_relu_plain(vec) {
+    let n = len(vec)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n {
+        let z = vec[i]
+        out[i] = 0.125 * z * z + 0.5 * z + 0.25
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Polynomial sigmoid   σ(z) ≈ 0.5 + 0.197·z - 0.004·z³
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hom_poly_sigmoid_plain(vec) {
+    let n = len(vec)
+    let mut out = hom_zeros_f(n)
+    for i in 0..n {
+        let z = vec[i]
+        let z3 = z * z * z
+        out[i] = 0.5 + 0.197 * z - 0.004 * z3
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Plaintext linear layer  y = W x + b
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hom_linear(W, b, vec) {
+    let K = len(W)
+    let D = len(vec)
+    let mut out = hom_zeros_f(K)
+    for k in 0..K {
+        let mut s = b[k]
+        for j in 0..D { s = s + W[k][j] * vec[j] }
+        out[k] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Plaintext two-layer forward (polynomial activation)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hom_forward(W1, b1, W2, b2, vec) {
+    let h = hom_linear(W1, b1, vec)
+    let h_act = hom_poly_relu_plain(h)
+    return hom_linear(W2, b2, h_act)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ciphertext linear layer.  W and b are plaintext weights.
+//    y_k = Σ_j W[k,j] · x_j + b_k
+//  Packed ct holds one slot per feature; we "rotate" by materialising
+//  scalar contributions.  For simplicity we return an unpacked
+//  vector-ct (one slot per output).
+// ═══════════════════════════════════════════════════════════════════
+fn hom_ct_linear(W, b, ct) {
+    let K = len(W)
+    let D = len(W[0])
+    let scale = ct["scale"]
+    let data = ct["data"]
+    let shift = ct["shift"]
+    let mut out = hom_zeros_f(K)
+    for k in 0..K {
+        let mut s = 0.0
+        for j in 0..D {
+            // contribution: W[k,j] * (data_j / scale - shift) scaled back by 'scale'
+            s = s + W[k][j] * data[j]
+        }
+        // s is in "scaled" space; add bias (b_k) * scale; remove shift term
+        out[k] = s - scale * shift * 0.0 + b[k] * scale
+        // subtract shift contribution if W row has non-zero sum
+        let mut row_sum = 0.0
+        for j in 0..D { row_sum = row_sum + W[k][j] }
+        out[k] = out[k] - row_sum * shift * scale
+    }
+    return #{
+        "data": out,
+        "shift": 0.0,
+        "scale": scale,
+        "nonce": ct["nonce"]
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ciphertext forward pass
+// ═══════════════════════════════════════════════════════════════════
+fn hom_ct_forward(W1, b1, W2, b2, ct) {
+    let h = hom_ct_linear(W1, b1, ct)
+    let h_act = hom_poly_relu(h)
+    return hom_ct_linear(W2, b2, h_act)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Encryption round-trip error (L2)
+// ═══════════════════════════════════════════════════════════════════
+fn hom_round_trip_error(vec, shift, scale, seed) {
+    let ct = hom_encrypt(vec, shift, scale, seed)
+    let dec = hom_decrypt(ct)
+    let n = len(vec)
+    let mut err = 0.0
+    for i in 0..n {
+        let d = dec[i] - vec[i]
+        err = err + d * d
+    }
+    return err
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

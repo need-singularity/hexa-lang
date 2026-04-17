@@ -10,7 +10,269 @@
 //      - pass-count reduction: naive=2 passes, fused=1 pass (marker)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/mask_fuse.hexa"
+// -- inlined from self/ai_native/mask_fuse.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/mask_fuse.hexa — AI-native ROI #82
+//
+//  Masked softmax fusion — collapses the standard 2-pass chain
+//      1. scores' = where(mask == 1, scores, -inf)
+//      2. softmax(scores')
+//  into a single pass that computes max-tracking, exp-accumulation,
+//  and normalisation in one traversal of the scores array.
+//
+//  Public API:
+//      masked_softmax_naive(scores, mask) -> [float]
+//          2-pass reference. mask[i]==0 → position i is blocked.
+//
+//      masked_softmax_fused(scores, mask) -> [float]
+//          single-pass fused kernel. Numerically stable via running
+//          max & per-element rescale (online softmax).
+//
+//      causal_mask(seq_len) -> [[int]]
+//          lower-triangular mask. mask[i][j] = 1 if j <= i else 0.
+//
+//      apply_causal_softmax_fused(scores_2d, seq_len) -> [[float]]
+//          applies fused masked softmax per row using causal mask.
+//
+//  Algorithm (online / single-pass):
+//      m = -inf      ; running max of kept scores
+//      l = 0         ; running denominator ∑ exp(s - m)
+//      out[i] = 0
+//      for each i:
+//          if mask[i] == 0: out[i] = 0 ; continue  // blocked slot
+//          s   = scores[i]
+//          m_new = max(m, s)
+//          alpha = exp(m - m_new)    // 1.0 when m_new==m, else <1
+//          l   = l * alpha + exp(s - m_new)
+//          out[i] = exp(s - m_new)   // staged: rescaled later
+//          rescale earlier out[j] by alpha
+//          m = m_new
+//      finally: if l == 0 (all-masked) → uniform 0, else out /= l
+//
+//  Why online works without a second pass:
+//      Each time we widen the running max, earlier `out` entries were
+//      computed against the old max and need × alpha to re-anchor.
+//      That rescale is a constant-time update, so total work stays
+//      O(n) — genuinely single-pass over mask+score tuples, with only
+//      a bounded number of multiplications triggered by max widens.
+//
+//  Numerical stability:
+//      Max-subtraction trick (standard) ensures exp() args ≤ 0 → no
+//      overflow even for scores like 1000.0.
+//
+//  Grammar cautions (HX3):
+//      - no bit-ops (<<, >>, |) — only arithmetic / comparisons
+//      - slice parens: arr[(i+1)..j] (not used here, 1D indexing only)
+//      - no struct-literals inside `if` heads
+//
+//  AI-native attrs:
+//      @hot        — attention inner loop, called per layer per step
+//      @mask_fuse  — marker: mask+softmax chain fused
+//      @pure       — pure function of inputs
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+fn mf82_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn mf82_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mf82_zeros_2d_int(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mf82_neg_inf() {
+    return 0.0 - 1.0e30
+}
+
+fn mf82_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  masked_softmax_naive — 2-pass reference
+//  Pass 1: fold mask into scores (set -inf where mask==0), find max.
+//  Pass 2: subtract max, exp, accumulate, normalise.
+// ═══════════════════════════════════════════════════════════════════
+fn masked_softmax_naive(scores, mask) {
+    let n = len(scores)
+    if n == 0 { return [] }
+
+    // Pass 1: masked scores + max over kept positions only.
+    let mut masked = mf82_zeros_1d(n)
+    let mut m = mf82_neg_inf()
+    let mut any_kept = false
+    for i in 0..n {
+        if mask[i] == 0 {
+            masked[i] = mf82_neg_inf()
+        } else {
+            masked[i] = scores[i]
+            if !any_kept {
+                m = scores[i]
+                any_kept = true
+            } else {
+                if scores[i] > m { m = scores[i] }
+            }
+        }
+    }
+
+    // All-masked case: explicit uniform 0 (no valid probability mass).
+    if !any_kept {
+        return mf82_zeros_1d(n)
+    }
+
+    // Pass 2: exp(s - max), sum, normalise.
+    let mut out = mf82_zeros_1d(n)
+    let mut sum_exp = 0.0
+    for i in 0..n {
+        if mask[i] == 0 {
+            out[i] = 0.0
+        } else {
+            let e = exp(masked[i] - m)
+            out[i] = e
+            sum_exp = sum_exp + e
+        }
+    }
+
+    if sum_exp == 0.0 {
+        return mf82_zeros_1d(n)
+    }
+    for i in 0..n {
+        out[i] = out[i] / sum_exp
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  masked_softmax_fused — single-pass online softmax with mask
+//
+//  State: m (running max of kept scores), l (running denominator),
+//         out[0..i] stages exp(s_j - m) values against *current* m.
+//  When m widens to m_new, earlier stages get ×alpha = exp(m - m_new).
+//  Final sweep divides out by l (no second pass over scores).
+// ═══════════════════════════════════════════════════════════════════
+@hot @mask_fuse @pure
+fn masked_softmax_fused(scores, mask) {
+    let n = len(scores)
+    if n == 0 { return [] }
+
+    let mut out = mf82_zeros_1d(n)
+    let mut m = mf82_neg_inf()
+    let mut l = 0.0
+    let mut any_kept = false
+
+    for i in 0..n {
+        if mask[i] == 0 {
+            // Blocked slot: stays 0, contributes nothing to m or l.
+            out[i] = 0.0
+        } else {
+            let s = scores[i]
+            if !any_kept {
+                m = s
+                l = 1.0
+                out[i] = 1.0   // exp(s - m) == exp(0) == 1
+                any_kept = true
+            } else {
+                let m_new = mf82_max_f(m, s)
+                // Rescale factor for previously staged entries.
+                let alpha = exp(m - m_new)
+                if alpha != 1.0 {
+                    // Fold prior stages into new anchor (bounded work
+                    // only when m strictly widens).
+                    for j in 0..i {
+                        if mask[j] != 0 {
+                            out[j] = out[j] * alpha
+                        }
+                    }
+                    l = l * alpha
+                }
+                let e = exp(s - m_new)
+                out[i] = e
+                l = l + e
+                m = m_new
+            }
+        }
+    }
+
+    // All-masked: explicit uniform 0.
+    if !any_kept {
+        return mf82_zeros_1d(n)
+    }
+    if l == 0.0 {
+        return mf82_zeros_1d(n)
+    }
+
+    // Final normalise — single division per kept slot.
+    for i in 0..n {
+        if mask[i] != 0 {
+            out[i] = out[i] / l
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  causal_mask(seq_len) — lower-triangular int mask
+//      mask[i][j] = 1 if j <= i else 0
+// ═══════════════════════════════════════════════════════════════════
+fn causal_mask(seq_len) {
+    let mut M = mf82_zeros_2d_int(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j <= i {
+                M[i][j] = 1
+            } else {
+                M[i][j] = 0
+            }
+        }
+    }
+    return M
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  apply_causal_softmax_fused(scores_2d, seq_len) -> [[float]]
+//      each row: fused masked softmax with causal mask.
+//      scores_2d shape: [seq_len, seq_len]
+// ═══════════════════════════════════════════════════════════════════
+@hot @mask_fuse
+fn apply_causal_softmax_fused(scores_2d, seq_len) {
+    let M = causal_mask(seq_len)
+    let mut out = mf82_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        out[i] = masked_softmax_fused(scores_2d[i], M[i])
+    }
+    return out
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

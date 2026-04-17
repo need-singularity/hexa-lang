@@ -2,7 +2,301 @@
 //  self/test_paged_attention.hexa — Tests for paged KV-cache attention
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/paged_attention.hexa"
+// -- inlined from self/ml/paged_attention.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/paged_attention.hexa — vLLM-style Paged KV-Cache Attention
+//
+//  Pure Hexa, no C/FFI.
+//
+//  Design:
+//    Page table manages fixed-size pages of KV vectors.
+//    Each sequence owns an ordered list of page_ids.
+//    Within each page: flat arrays of k/v vectors, up to page_size slots.
+//    Allocation uses a free list (stack-based).
+//
+//  API:
+//    page_table_new(num_pages, page_size, head_dim) -> dict
+//    page_alloc(pt) -> int                  (-1 if full)
+//    page_free(pt, page_id)
+//    kv_cache_append(pt, seq_id, k_vec, v_vec)
+//    paged_attention_score(pt, seq_id, query) -> [float]
+//    paged_attention_output(pt, seq_id, query) -> [float]
+// ═══════════════════════════════════════════════════════════════
+
+// ── Page Table Constructor ────────────────────────────────────
+// Returns a dict with:
+//   "num_pages"  : int
+//   "page_size"  : int
+//   "head_dim"   : int
+//   "free_list"  : [int]         — stack of available page ids
+//   "page_keys"  : [float]       — flat: page_id * page_size * head_dim
+//   "page_vals"  : [float]       — same layout
+//   "page_used"  : [int]         — how many slots used per page
+//   "seq_pages"  : dict          — seq_id(string) -> [int] page id list
+fn page_table_new(num_pages, page_size, head_dim) {
+    let total = num_pages * page_size * head_dim
+    let mut keys_flat = []
+    let mut vals_flat = []
+    let mut i = 0
+    while i < total {
+        keys_flat.push(0.0)
+        vals_flat.push(0.0)
+        i = i + 1
+    }
+    let mut free = []
+    let mut p = num_pages - 1
+    while p >= 0 {
+        free.push(p)
+        p = p - 1
+    }
+    let mut used = []
+    let mut u = 0
+    while u < num_pages {
+        used.push(0)
+        u = u + 1
+    }
+    return #{
+        "num_pages": num_pages,
+        "page_size": page_size,
+        "head_dim": head_dim,
+        "free_list": free,
+        "page_keys": keys_flat,
+        "page_vals": vals_flat,
+        "page_used": used,
+        "seq_pages": #{}
+    }
+}
+
+// ── Allocate a page ───────────────────────────────────────────
+fn page_alloc(pt) {
+    let free = pt["free_list"]
+    if len(free) == 0 {
+        return -1
+    }
+    let pid = free[len(free) - 1]
+    free.pop()
+    return pid
+}
+
+// ── Free a page ───────────────────────────────────────────────
+fn page_free(pt, page_id) {
+    let used = pt["page_used"]
+    used[page_id] = 0
+    let free = pt["free_list"]
+    free.push(page_id)
+}
+
+// ── Append a KV pair to a sequence ────────────────────────────
+// Automatically allocates new page when current page is full.
+fn kv_cache_append(pt, seq_id, k_vec, v_vec) {
+    let page_size = pt["page_size"]
+    let head_dim = pt["head_dim"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+
+    // Ensure sequence has a page list
+    if !has_key(sp, seq_key) {
+        sp[seq_key] = []
+    }
+    let pages = sp[seq_key]
+
+    // Check if we need a new page
+    let mut need_new = false
+    if len(pages) == 0 {
+        need_new = true
+    } else {
+        let last_pid = pages[len(pages) - 1]
+        let used = pt["page_used"]
+        if used[last_pid] >= page_size {
+            need_new = true
+        }
+    }
+
+    if need_new {
+        let new_pid = page_alloc(pt)
+        if new_pid == -1 {
+            println("paged_attention: out of pages")
+            return
+        }
+        pages.push(new_pid)
+    }
+
+    // Write into the last page's next slot
+    let pid = pages[len(pages) - 1]
+    let used = pt["page_used"]
+    let slot = used[pid]
+    let base = (pid * page_size + slot) * head_dim
+    let keys_flat = pt["page_keys"]
+    let vals_flat = pt["page_vals"]
+
+    let mut d = 0
+    while d < head_dim {
+        keys_flat[base + d] = k_vec[d]
+        vals_flat[base + d] = v_vec[d]
+        d = d + 1
+    }
+    used[pid] = slot + 1
+}
+
+// ── Compute total cached positions for a sequence ─────────────
+fn seq_total_tokens(pt, seq_id) {
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+    if !has_key(sp, seq_key) {
+        return 0
+    }
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let mut total = 0
+    let mut i = 0
+    while i < len(pages) {
+        total = total + used[pages[i]]
+        i = i + 1
+    }
+    return total
+}
+
+// ── Attention scores: Q dot K for each cached position ────────
+fn paged_attention_score(pt, seq_id, query) {
+    let head_dim = pt["head_dim"]
+    let page_size = pt["page_size"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+    if !has_key(sp, seq_key) {
+        return []
+    }
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let keys_flat = pt["page_keys"]
+
+    let mut scores = []
+    let mut pi = 0
+    while pi < len(pages) {
+        let pid = pages[pi]
+        let n_slots = used[pid]
+        let mut s = 0
+        while s < n_slots {
+            let base = (pid * page_size + s) * head_dim
+            let mut dot = 0.0
+            let mut d = 0
+            while d < head_dim {
+                dot = dot + query[d] * keys_flat[base + d]
+                d = d + 1
+            }
+            scores.push(dot)
+            s = s + 1
+        }
+        pi = pi + 1
+    }
+    return scores
+}
+
+// ── Full paged attention: softmax(Q*K^T / sqrt(d)) * V ───────
+fn paged_attention_output(pt, seq_id, query) {
+    let head_dim = pt["head_dim"]
+    let page_size = pt["page_size"]
+    let seq_key = to_string(seq_id)
+    let sp = pt["seq_pages"]
+
+    if !has_key(sp, seq_key) {
+        let mut zeros = []
+        let mut z = 0
+        while z < head_dim {
+            zeros.push(0.0)
+            z = z + 1
+        }
+        return zeros
+    }
+
+    // Step 1: compute raw scores (Q dot K / sqrt(d))
+    let scale = 1.0 / (to_float(head_dim) ** 0.5)
+    let raw_scores = paged_attention_score(pt, seq_id, query)
+    let n = len(raw_scores)
+
+    if n == 0 {
+        let mut zeros = []
+        let mut z = 0
+        while z < head_dim {
+            zeros.push(0.0)
+            z = z + 1
+        }
+        return zeros
+    }
+
+    // Scale scores
+    let mut scaled = []
+    let mut i = 0
+    while i < n {
+        scaled.push(raw_scores[i] * scale)
+        i = i + 1
+    }
+
+    // Step 2: softmax — find max for numerical stability
+    let mut mx = scaled[0]
+    i = 1
+    while i < n {
+        if scaled[i] > mx {
+            mx = scaled[i]
+        }
+        i = i + 1
+    }
+
+    let mut exp_scores = []
+    let mut sum_exp = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scaled[i] - mx)
+        exp_scores.push(e)
+        sum_exp = sum_exp + e
+        i = i + 1
+    }
+
+    // Normalize
+    let mut weights = []
+    i = 0
+    while i < n {
+        weights.push(exp_scores[i] / sum_exp)
+        i = i + 1
+    }
+
+    // Step 3: weighted sum of values
+    let mut output = []
+    let mut d = 0
+    while d < head_dim {
+        output.push(0.0)
+        d = d + 1
+    }
+
+    let pages = sp[seq_key]
+    let used = pt["page_used"]
+    let vals_flat = pt["page_vals"]
+    let mut wi = 0
+    let mut pi = 0
+    while pi < len(pages) {
+        let pid = pages[pi]
+        let n_slots = used[pid]
+        let mut s = 0
+        while s < n_slots {
+            let w = weights[wi]
+            let base = (pid * page_size + s) * head_dim
+            d = 0
+            while d < head_dim {
+                output[d] = output[d] + w * vals_flat[base + d]
+                d = d + 1
+            }
+            wi = wi + 1
+            s = s + 1
+        }
+        pi = pi + 1
+    }
+
+    return output
+}
+
+
+// -- end inlined --
 
 fn test_page_table_creation() {
     println("--- test_page_table_creation ---")

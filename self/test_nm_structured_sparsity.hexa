@@ -22,7 +22,251 @@
 //  Run: ./hexa self/test_nm_structured_sparsity.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/nm_structured_sparsity.hexa"
+// -- inlined from self/ml/nm_structured_sparsity.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/nm_structured_sparsity.hexa — N:M Structured Sparsity
+//
+//  2:4 and 4:8 structured sparsity runtime — magnitude-based pruning
+//  with structured masks for hardware-accelerated sparse inference.
+//
+//  Implements:
+//    1. Mask generation: top-N-by-magnitude per M-group
+//    2. Supported patterns: 2:4, 4:8
+//    3. Sparse matmul: apply mask during forward pass
+//    4. Gradual pruning: cubic sparsity schedule
+//    5. Weight regrowth: periodic mask update by gradient magnitude
+//
+//  API (pure):
+//    nm_abs(x)                                   -> float
+//    nm_generate_mask(weights, n, m)              -> [[int]]
+//    nm_apply_mask(weights, mask)                 -> [[float]]
+//    nm_sparse_matmul(weights, mask, input)       -> [float]
+//    nm_cubic_schedule(step, total, s_i, s_f)     -> float
+//    nm_gradual_prune(weights, step, total, n, m) -> [[float]]
+//    nm_gradient_regrowth(weights, grads, n, m)   -> [[int]]
+//    nm_validate_mask(mask, n, m)                 -> bool
+//    nm_compute_sparsity(mask)                    -> float
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-group mask generation is independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn nm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn nm_copy_1d(v) {
+    let mut out = []
+    for i in 0..len(v) { out = out + [v[i]] }
+    return out
+}
+
+fn nm_copy_2d(w) {
+    let rows = len(w)
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..len(w[i]) { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn nm_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn nm_zeros_2d_int(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mask Generation
+//
+//  For each contiguous group of M elements in a row, keep the top N
+//  by absolute magnitude. Mask is 1 (keep) or 0 (prune).
+//  If row length is not a multiple of M, the tail group is left dense.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn nm_generate_mask(weights, n, m) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let mut mask = nm_zeros_2d_int(rows, cols)
+
+    for i in 0..rows {
+        let num_groups = cols / m
+        // Process full groups
+        for g in 0..num_groups {
+            let base = g * m
+            // Collect magnitudes with indices within group
+            let mut mags = []
+            for k in 0..m {
+                mags = mags + [nm_abs(weights[i][base + k])]
+            }
+            // Find top-N indices by magnitude (selection sort descending, pick first N)
+            let mut indices = []
+            for k in 0..m { indices = indices + [k] }
+            for a in 0..m {
+                for b in (a + 1)..m {
+                    if mags[indices[b]] > mags[indices[a]] {
+                        let tmp = indices[a]
+                        indices[a] = indices[b]
+                        indices[b] = tmp
+                    }
+                }
+            }
+            // Set top-N positions to 1
+            for k in 0..n {
+                mask[i][base + indices[k]] = 1
+            }
+        }
+        // Tail elements (not a full group) — keep dense
+        let tail_start = num_groups * m
+        for j in tail_start..cols {
+            mask[i][j] = 1
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Apply Mask — element-wise multiply weights by mask (0/1)
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn nm_apply_mask(weights, mask) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let mut out = nm_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            out[i][j] = weights[i][j] * to_float(mask[i][j])
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sparse MatMul — y = (W * mask) @ x
+//  Applies mask during forward pass to skip pruned weights.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn nm_sparse_matmul(weights, mask, input) {
+    let rows = len(weights)
+    let cols = len(weights[0])
+    let mut y = []
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols {
+            if mask[i][j] == 1 {
+                s = s + weights[i][j] * input[j]
+            }
+        }
+        y = y + [s]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cubic Sparsity Schedule
+//
+//  s(t) = s_f + (s_i - s_f) * (1 - t/T)^3
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nm_cubic_schedule(step, total_steps, initial, final_s) {
+    if step >= total_steps { return final_s }
+    if step <= 0 { return initial }
+    let ratio = 1.0 - to_float(step) / to_float(total_steps)
+    let cube = ratio * ratio * ratio
+    return final_s + (initial - final_s) * cube
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradual Pruning — apply N:M mask at current schedule step
+//
+//  At each training step, compute the cubic schedule fraction,
+//  then generate and apply the N:M mask. Early steps keep more
+//  weights; later steps enforce strict N:M.
+// ═══════════════════════════════════════════════════════════════════
+fn nm_gradual_prune(weights, step, total_steps, n, m) {
+    let frac = nm_cubic_schedule(step, total_steps, 1.0, to_float(n) / to_float(m))
+    // When frac >= 1.0 (early training), keep all weights
+    if frac >= 1.0 { return nm_copy_2d(weights) }
+    // Otherwise apply N:M structured mask
+    let mask = nm_generate_mask(weights, n, m)
+    return nm_apply_mask(weights, mask)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient-Based Regrowth
+//
+//  Re-generate the N:M mask using gradient magnitudes instead of
+//  weight magnitudes. Positions with largest |grad| are unmasked,
+//  allowing pruned weights to regrow if gradients indicate importance.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn nm_gradient_regrowth(weights, grads, n, m) {
+    // Use gradient magnitude for mask selection
+    return nm_generate_mask(grads, n, m)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Validate Mask — check that every M-group has exactly N ones
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nm_validate_mask(mask, n, m) {
+    let rows = len(mask)
+    let cols = len(mask[0])
+    for i in 0..rows {
+        let num_groups = cols / m
+        for g in 0..num_groups {
+            let base = g * m
+            let mut count = 0
+            for k in 0..m {
+                if mask[i][base + k] == 1 { count = count + 1 }
+            }
+            if count != n { return false }
+        }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compute Sparsity from Mask — fraction of zeros
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nm_compute_sparsity(mask) {
+    let rows = len(mask)
+    let cols = len(mask[0])
+    let total = rows * cols
+    let mut zeros = 0
+    for i in 0..rows {
+        for j in 0..cols {
+            if mask[i][j] == 0 { zeros = zeros + 1 }
+        }
+    }
+    return to_float(zeros) / to_float(total)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0
