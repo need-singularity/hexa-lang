@@ -1,0 +1,198 @@
+// self/runtime/dispatch_pure.hexa — Phase 7 MEDIUM-tier port
+//
+// Polymorphic container dispatch + array length trim + silent type check.
+// These touch state (containers) but do not require syscalls or FFI —
+// second-round candidates after the EASY char classification set in
+// self/runtime/char_pure.hexa landed (40/40 green, 2026-04-17).
+//
+// Ported functions (5):
+//   array_truncate_pure(arr, n)       — self/runtime.c:1079 (hexa_array_truncate)
+//   index_get_pure(container, key)    — self/runtime.c:1526 (hexa_index_get)
+//   iter_get_pure(v, idx)             — self/runtime.c:1547 (hexa_iter_get)
+//   index_set_pure(container, k, v)   — self/runtime.c:1559 (hexa_index_set)
+//   is_type_pure(v, type_name)        — self/runtime.c:1580 (hexa_is_type)
+//
+// ADDITIVE — does not remove any C function. Every caller in
+// codegen_c2 still emits hexa_index_get / hexa_iter_get calls against
+// runtime.c; this file is the reference implementation for the codegen
+// interpose pass (see string_pure.hexa header for the full rationale).
+//
+// Constraints honored (CLAUDE.md + port plan §5 Risks):
+//   - No NaN-boxing / tag layout access.
+//   - No syscalls, no FFI, no libm.
+//   - No allocator touches (pure surface-builtin composition).
+// Pitfalls observed (grammar.jsonl):
+//   P1  no semicolons
+//   P15 let mut everywhere
+//   P29 .push() returns NEW array — rebind is mandatory
+//
+// Semantic notes (C vs pure):
+//   - C hexa_array_truncate mutates arr in place (HX_SET_ARR_LEN); the
+//     pure version returns a NEW shorter array, matching the established
+//     pure-Hexa convention (see array_pure.hexa's array_reverse_pure /
+//     array_slice_pure). Callers that relied on the in-place alias must
+//     rebind — annotated in the port plan §5.
+//   - iter_get for maps in C returns the key at insertion-order index,
+//     delegating to an internal order_keys array. Pure version uses
+//     `keys(m)[idx]` which surfaces the same insertion order (validated
+//     on stage0 2026-04-17).
+//   - is_type silent check: C special-cases HX_IS_VALSTRUCT as "Val".
+//     Pure version mirrors via type_of() == "valstruct" path; also
+//     mirrors the __type__ field convention for plain maps that carry
+//     struct annotation.
+
+// ── array_truncate_pure ──────────────────────────────────────────
+// Returns a new array containing the first `n` elements of `arr`.
+// C semantics (runtime.c:1079):
+//   - n < 0              -> empty
+//   - n > len(arr)       -> original array (clamp)
+//   - non-array input    -> returned unchanged
+// Pure impl uses parts.push + manual copy — no slice builtin needed so
+// it stays self-contained (array_slice_pure would pull array_pure.hexa
+// in as a dep, which we avoid for a leaf file).
+pub fn array_truncate_pure(arr, n) {
+    if type_of(arr) != "array" { return arr }
+    let arr_len = len(arr)
+    let mut new_len = n
+    if type_of(new_len) != "int" { return arr }
+    if new_len < 0 { new_len = 0 }
+    if new_len > arr_len { new_len = arr_len }
+    let mut out = []
+    let mut i = 0
+    while i < new_len {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    out
+}
+
+// ── index_get_pure ───────────────────────────────────────────────
+// Polymorphic container access: array[int] or map[string].
+// C semantics (runtime.c:1526):
+//   - map + string key   -> map_get(container, key)
+//   - array + int key    -> array_get(container, idx)
+//   - out-of-bounds      -> void / nil (matches hexa_array_get)
+// Pure version uses the surface `[]` indexing operator which the
+// stage0 codegen routes through hexa_index_get on the native path and
+// through the interpreter's getIndex on the interpreter path — so this
+// is NOT a circular definition: it is a typed wrapper that reports
+// "void" for misuse instead of crashing on misaligned key types.
+pub fn index_get_pure(container, key) {
+    let ct = type_of(container)
+    let kt = type_of(key)
+    if ct == "map" {
+        if kt != "string" { return nil }
+        if has_key(container, key) == false { return nil }
+        return container[key]
+    }
+    if ct == "array" {
+        if kt != "int" { return nil }
+        if key < 0 { return nil }
+        if key >= len(container) { return nil }
+        return container[key]
+    }
+    nil
+}
+
+// ── iter_get_pure ────────────────────────────────────────────────
+// For-in iteration dispatch. Array yields elements by index; map
+// yields keys by insertion order.
+// C semantics (runtime.c:1547):
+//   - map + idx          -> order_keys[idx] (insertion order)
+//   - array + idx        -> elements[idx]
+//   - out-of-bounds map  -> aborts in C. Pure version returns nil
+//     (softer — lets upper loops terminate instead of crashing).
+pub fn iter_get_pure(v, idx) {
+    let t = type_of(v)
+    if type_of(idx) != "int" { return nil }
+    if idx < 0 { return nil }
+    if t == "map" {
+        let ks = keys(v)
+        if idx >= len(ks) { return nil }
+        return ks[idx]
+    }
+    if t == "array" {
+        if idx >= len(v) { return nil }
+        return v[idx]
+    }
+    nil
+}
+
+// ── index_set_pure ───────────────────────────────────────────────
+// Polymorphic container set — array[int] = val or map[string] = val.
+// C semantics (runtime.c:1559):
+//   - map + string key   -> map_set(container, key, val)
+//   - array + int key    -> array_set(container, idx, val)
+// Pure version returns a NEW container with the element replaced
+// (surface Hexa has no in-place set through a Val handle — maps
+// rebind on [k] = v, arrays rebind on [i] = v). For maps we build a
+// fresh literal by copying entries; for arrays we copy with the swap.
+pub fn index_set_pure(container, key, val) {
+    let ct = type_of(container)
+    let kt = type_of(key)
+    if ct == "map" {
+        if kt != "string" { return container }
+        let mut out = #{}
+        let ks = keys(container)
+        let n = len(ks)
+        let mut i = 0
+        while i < n {
+            let k = ks[i]
+            if k == key {
+                out[k] = val
+            } else {
+                out[k] = container[k]
+            }
+            i = i + 1
+        }
+        if has_key(out, key) == false {
+            out[key] = val
+        }
+        return out
+    }
+    if ct == "array" {
+        if kt != "int" { return container }
+        if key < 0 { return container }
+        let arr_len = len(container)
+        if key >= arr_len { return container }
+        let mut out = []
+        let mut i = 0
+        while i < arr_len {
+            if i == key {
+                out = out.push(val)
+            } else {
+                out = out.push(container[i])
+            }
+            i = i + 1
+        }
+        return out
+    }
+    container
+}
+
+// ── is_type_pure ─────────────────────────────────────────────────
+// Silent type check for struct method dispatch (ImplBlock support).
+// C semantics (runtime.c:1580):
+//   - TAG_VALSTRUCT      -> type_name == "Val"
+//   - MAP with __type__  -> type_name == map["__type__"]
+//   - anything else      -> 0 (false)
+// Pure version uses type_of() for the primitive typecheck and looks up
+// __type__ on maps. The "Val" fast-path corresponds to VALSTRUCT
+// (type_of returns "valstruct" on stage0).
+pub fn is_type_pure(v, type_name) {
+    if type_of(type_name) != "string" { return false }
+    let t = type_of(v)
+    if t == "valstruct" {
+        return type_name == "Val"
+    }
+    if t == "map" {
+        if has_key(v, "__type__") == false { return false }
+        let stored = v["__type__"]
+        if type_of(stored) != "string" { return false }
+        return stored == type_name
+    }
+    // Primitive type_of match — lets is_type_pure(42, "int") be true,
+    // which is a strict superset of the C behaviour (C returned 0 for
+    // non-map non-valstruct). Matches grammar-stated type_of semantics.
+    t == type_name
+}
