@@ -1,0 +1,243 @@
+// ai_native_hotpath — static hot-path suggester (S-1 safe track, no hexa_full.hexa touch)
+//
+// Walks .hexa source, identifies function definitions, and scores each by
+// heuristics that predict hot-path status without runtime profiling:
+//
+//   +3 for every nested (while|for) inside another (while|for)
+//   +2 for every matmul/matvec/gemm/axpy builtin call
+//   +2 for recursive self-call
+//   +1 for every while/for/loop
+//   +1 for every call (proxy for dispatch cost)
+//
+// Emits suggestions:
+//   score >= 8 → @hot candidate
+//   score >= 4 AND fn small (< 30 LOC) → @inline candidate
+//   pure + same-args repeat pattern (TODO runtime) → @memoize candidate (S-1b)
+//
+// Usage:
+//   hexa scripts/ai_native_hotpath.hexa <file.hexa> [file2.hexa ...]
+//   hexa scripts/ai_native_hotpath.hexa --top=10 <file.hexa>    (rank top K)
+
+fn is_digit(c) { let k = char_code(c, 0); return k >= 48 && k <= 57 }
+fn is_alpha(c) { let k = char_code(c, 0); return (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95 }
+fn is_alnum(c) { return is_digit(c) || is_alpha(c) }
+
+// Word-boundary match: does `src` contain `word` at position `i`, not preceded/followed by alnum?
+fn match_word(src, i, word) {
+    let n = len(src)
+    let wn = len(word)
+    if i + wn > n { return false }
+    if src.substring(i, i + wn) != word { return false }
+    if i > 0 && is_alnum(src[i - 1]) { return false }
+    if i + wn < n && is_alnum(src[i + wn]) { return false }
+    return true
+}
+
+// Scan forward from `body_start` to matching close brace; return close idx and stats.
+// Returns [close_idx, stats_map_items]
+//   stats_map_items = [["while_count", N], ["for_count", N], ["nested_loops", N],
+//                       ["matmul_calls", N], ["recursive_calls", N], ["total_calls", N],
+//                       ["loc", N]]
+fn scan_body(src, body_start, fn_name) {
+    let n = len(src)
+    let mut i = body_start
+    let mut depth = 1
+    let mut loop_stack = []  // list of brace-depths where loops start
+    let mut while_count = 0
+    let mut for_count = 0
+    let mut nested_loops = 0
+    let mut matmul_calls = 0
+    let mut recursive_calls = 0
+    let mut total_calls = 0
+    let mut loc = 0
+
+    // matmul-like builtin names
+    let matmul_names = ["matmul", "matvec", "gemm", "cblas_dgemm", "axpy", "qkv_fused_into", "ffn_fused_into", "block_forward_fused", "mat_add_inplace", "mat_scale_inplace"]
+
+    while i < n && depth > 0 {
+        let c = src[i]
+        if c == "\n" { loc = loc + 1; i = i + 1; continue }
+        if c == "{" { depth = depth + 1; i = i + 1; continue }
+        if c == "}" {
+            depth = depth - 1
+            // pop any loops that opened at this depth
+            if len(loop_stack) > 0 && loop_stack[len(loop_stack) - 1] == depth + 1 {
+                let mut ls = []
+                let mut _k = 0
+                while _k < len(loop_stack) - 1 { ls = ls.push(loop_stack[_k]); _k = _k + 1 }
+                loop_stack = ls
+            }
+            i = i + 1
+            continue
+        }
+        // Skip string literals so their contents don't fool us
+        if c == "\"" {
+            i = i + 1
+            while i < n && src[i] != "\"" {
+                if src[i] == "\\" && i + 1 < n { i = i + 1 }
+                i = i + 1
+            }
+            if i < n { i = i + 1 }
+            continue
+        }
+        // Skip // comments
+        if c == "/" && i + 1 < n && src[i + 1] == "/" {
+            while i < n && src[i] != "\n" { i = i + 1 }
+            continue
+        }
+        // Skip /* */ comments
+        if c == "/" && i + 1 < n && src[i + 1] == "*" {
+            i = i + 2
+            while i + 1 < n && !(src[i] == "*" && src[i + 1] == "/") { i = i + 1 }
+            if i + 1 < n { i = i + 2 }
+            continue
+        }
+
+        // word-boundary keyword detection
+        if is_alpha(c) && (i == 0 || !is_alnum(src[i - 1])) {
+            if match_word(src, i, "while") {
+                while_count = while_count + 1
+                if len(loop_stack) > 0 { nested_loops = nested_loops + 1 }
+                loop_stack = loop_stack.push(depth + 1)
+                i = i + 5
+                continue
+            }
+            if match_word(src, i, "for") {
+                for_count = for_count + 1
+                if len(loop_stack) > 0 { nested_loops = nested_loops + 1 }
+                loop_stack = loop_stack.push(depth + 1)
+                i = i + 3
+                continue
+            }
+            // Ident + `(` = call
+            let mut k = i
+            while k < n && is_alnum(src[k]) { k = k + 1 }
+            let word = src.substring(i, k)
+            // peek past whitespace
+            let mut p = k
+            while p < n && (src[p] == " " || src[p] == "\t") { p = p + 1 }
+            if p < n && src[p] == "(" {
+                total_calls = total_calls + 1
+                if word == fn_name { recursive_calls = recursive_calls + 1 }
+                // matmul-like check
+                let mut mi = 0
+                while mi < len(matmul_names) {
+                    if word == matmul_names[mi] { matmul_calls = matmul_calls + 1 }
+                    mi = mi + 1
+                }
+            }
+            i = k
+            continue
+        }
+        i = i + 1
+    }
+    return [i, while_count, for_count, nested_loops, matmul_calls, recursive_calls, total_calls, loc]
+}
+
+fn compute_score(stats) {
+    // stats = [close_idx, while_count, for_count, nested_loops, matmul_calls, recursive_calls, total_calls, loc]
+    let nested = stats[3]
+    let matmul = stats[4]
+    let recursive = stats[5]
+    let loops = stats[1] + stats[2]
+    let calls = stats[6]
+    return nested * 3 + matmul * 2 + recursive * 2 + loops + calls
+}
+
+// Find all `fn name(` definitions and compute their stats.
+// Returns [[fn_name, start_line, score, stats...]]
+fn find_fns(src) {
+    let n = len(src)
+    let mut i = 0
+    let mut line = 1
+    let mut out = []
+    while i < n {
+        if src[i] == "\n" { line = line + 1; i = i + 1; continue }
+        // match `fn ` at word boundary
+        if match_word(src, i, "fn") {
+            // find fn name
+            let mut k = i + 2
+            while k < n && src[k] == " " { k = k + 1 }
+            let name_start = k
+            while k < n && is_alnum(src[k]) { k = k + 1 }
+            let fn_name = src.substring(name_start, k)
+            if len(fn_name) == 0 { i = i + 2; continue }
+            // find opening `{` of body
+            let mut b = k
+            while b < n && src[b] != "{" && src[b] != "\n" { b = b + 1 }
+            if b >= n || src[b] != "{" {
+                // allow brace on next line
+                while b < n && src[b] != "{" { if src[b] == "\n" { line = line + 1 }; b = b + 1 }
+            }
+            if b >= n { break }
+            let stats = scan_body(src, b + 1, fn_name)
+            let score = compute_score(stats)
+            out = out.push([fn_name, line, score, stats[1], stats[2], stats[3], stats[4], stats[5], stats[6], stats[7]])
+            i = stats[0]
+            continue
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn score_to_suggestion(fn_info) {
+    let score = fn_info[2]
+    let loc = fn_info[9]
+    let recursive = fn_info[7]
+    if score >= 8 { return "@hot candidate" }
+    if score >= 4 && loc < 30 { return "@inline candidate" }
+    if recursive >= 1 && loc < 50 { return "@memoize candidate (pending @pure check)" }
+    return ""
+}
+
+fn analyze_file(path) {
+    let src = read_file(path)
+    let fns = find_fns(src)
+    println("═══ " + path + " ═══")
+    println("fn" + pad(" name", 32) + pad(" line", 7) + pad(" score", 8) + pad(" while", 7) + pad(" for", 5) + pad(" nest", 6) + pad(" matmul", 8) + pad(" rec", 5) + pad(" calls", 7) + pad(" loc", 5) + " suggestion")
+    let mut i = 0
+    let mut suggestions = 0
+    while i < len(fns) {
+        let f = fns[i]
+        let sugg = score_to_suggestion(f)
+        if sugg != "" { suggestions = suggestions + 1 }
+        println("fn" + pad(" " + f[0], 32) + pad(" " + to_string(f[1]), 7) + pad(" " + to_string(f[2]), 8) + pad(" " + to_string(f[3]), 7) + pad(" " + to_string(f[4]), 5) + pad(" " + to_string(f[5]), 6) + pad(" " + to_string(f[6]), 8) + pad(" " + to_string(f[7]), 5) + pad(" " + to_string(f[8]), 7) + pad(" " + to_string(f[9]), 5) + " " + sugg)
+        i = i + 1
+    }
+    return suggestions
+}
+
+fn pad(s, w) {
+    let mut r = s
+    while len(r) < w { r = r + " " }
+    return r
+}
+
+fn main() {
+    let argv = args()
+    let mut files = []
+    let mut i = 2
+    while i < len(argv) {
+        files = files.push(argv[i])
+        i = i + 1
+    }
+    if len(files) == 0 {
+        println("usage: ai_native_hotpath.hexa <file.hexa> [file2.hexa ...]")
+        return
+    }
+    let mut total = 0
+    let mut k = 0
+    while k < len(files) {
+        try {
+            total = total + analyze_file(files[k])
+        } catch e {
+            println(files[k] + ": [error] " + e)
+        }
+        k = k + 1
+    }
+    println("")
+    println("ai-native-hotpath: " + to_string(total) + " suggestions across " + to_string(len(files)) + " files")
+}
+
+main()
