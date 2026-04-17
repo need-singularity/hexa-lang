@@ -89,7 +89,7 @@
   - [x] field access (Field eval: interpreter.hexa:293)
   - [x] impl 블록 메서드 디스패치 (impl_store + call_method: interpreter.hexa:1527)
   - [x] `self` 암시 바인딩 + 인자 스킵 (interpreter.hexa:1543-1562)
-  - [x] 검증 테스트: self/test_p2_6_struct_method.hexa (host: println 25)
+  - [x] 검증 테스트: self/test_struct_method.hexa (host: println 25)
   - [ ] enum variant 인스턴스화 (Color::Red 스타일) — 스텁만 존재
   - [ ] enum match pattern — 후속 P2-4와 통합 예정
   - **주의**: self/parser.hexa 의 trailing self-test 가 `AstNode` 런타임 에러로 실패 —
