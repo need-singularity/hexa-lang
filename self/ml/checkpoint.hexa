@@ -1,344 +1,369 @@
-// ═══════════════════════════════════════════════════════════════
-//  checkpoint.hexa — Save/Load model weight checkpoints
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/checkpoint.hexa — Binary checkpoint save/load for 7B
+//  training pipeline with raw f32 buffer I/O.
 //
-//  Binary format (.hxck):
-//    Header:
-//      magic     : u32 LE  0x48584348 ("HXCH")
-//      version   : u32 LE  (== 1)
-//      n_tensors : u32 LE
-//      flags     : u32 LE  (bit0: has_optimizer_state)
-//    Per tensor entry:
-//      name_len  : u32 LE
-//      name      : utf8 bytes (name_len)
-//      n_dims    : u32 LE
-//      shape[i]  : u32 LE * n_dims
-//      dtype     : u32 LE  (0=f32)
-//      data_len  : u32 LE  (byte count)
-//      data      : f32 LE * numel
+//  Binary format (.hxck v2):
+//    Header (28 bytes):
+//      magic       : u32  0x48584B43 ("HXKC")
+//      version     : u32  (== 2)
+//      step        : u32  current training step
+//      epoch       : u32  current epoch
+//      lr_f32      : f32  current learning rate
+//      loss_f32    : f32  last loss value
+//      num_tensors : u32  total tensor count
+//    Per tensor:
+//      name_len    : u32
+//      name        : bytes (name_len)
+//      n_elems     : u32
+//      data        : f32 * n_elems
 //
-//  Uses builtins: write_file_bytes, read_file_bytes, file_size
-// ═══════════════════════════════════════════════════════════════
-
-// ── Constants ─────────────────────────────────────────────────
-@pure fn ckpt_magic()   { return 0x48584348 }
-@pure fn ckpt_version() { return 1 }
-@pure fn dtype_f32()    { return 0 }
-
-// ── Little-endian encoding helpers ────────────────────────────
-
-// u32 → 4 bytes LE
-@pure
-fn encode_u32_le(v) {
-    let b0 = v % 256
-    let b1 = (v / 256) % 256
-    let b2 = (v / 65536) % 256
-    let b3 = (v / 16777216) % 256
-    let __ret = [b0, b1, b2, b3]
-    return __ret
-}
-
-// 4 bytes LE → u32
-@pure
-fn decode_u32_le(bytes, off) {
-    let b0 = bytes[off]
-    let b1 = bytes[off + 1]
-    let b2 = bytes[off + 2]
-    let b3 = bytes[off + 3]
-    b0 + b1 * 256 + b2 * 65536 + b3 * 16777216
-}
-
-// ── IEEE 754 f32 encode (float → 4 bytes LE) ─────────────────
-// Encodes a hexa float (f64) as f32 LE bytes.
-// Handles: zero, normal, large→inf, denormals (flush to zero).
-@pure
-pub fn encode_f32_le(val) {
-    // Handle zero
-    if val == 0.0 { return [0, 0, 0, 0] }
-
-    let mut v = val
-    let mut sign = 0
-    if v < 0.0 {
-        sign = 1
-        v = 0.0 - v
-    }
-
-    // Find exponent: v = m * 2^exp, 1.0 <= m < 2.0
-    let mut exp = 0
-    let mut m = v
-    if m >= 2.0 {
-        while m >= 2.0 {
-            m = m / 2.0
-            exp = exp + 1
-        }
-    } else {
-        while m < 1.0 {
-            m = m * 2.0
-            exp = exp - 1
-        }
-    }
-    // m is now in [1.0, 2.0), exp is unbiased
-
-    let biased = exp + 127
-    if biased >= 255 {
-        // Overflow → infinity
-        let bits = sign * 2147483648 + 255 * 8388608
-        return encode_u32_le(bits)
-    }
-    if biased <= 0 {
-        // Denormal or underflow → flush to zero for simplicity
-        if sign == 1 { return [0, 0, 0, 128] }
-        return [0, 0, 0, 0]
-    }
-
-    // Mantissa: fractional part * 2^23
-    let frac = m - 1.0
-    let mant = to_int(frac * 8388608.0 + 0.5)
-    let mut mant_clamped = mant
-    if mant_clamped > 8388607 { mant_clamped = 8388607 }
-
-    let bits = sign * 2147483648 + biased * 8388608 + mant_clamped
-    encode_u32_le(bits)
-}
-
-// ── IEEE 754 f32 decode (4 bytes LE → float) ─────────────────
-@pure
-pub fn decode_f32_le(bytes, off) {
-    let bits = decode_u32_le(bytes, off)
-    let sign = (bits / 2147483648) % 2
-    let exp = (bits / 8388608) % 256
-    let mant = bits % 8388608
-    if exp == 0 {
-        if mant == 0 { return 0.0 }
-        let m = mant / 8388608.0
-        let v = m * pow(2.0, -126.0)
-        if sign == 1 { return 0.0 - v }
-        return v
-    }
-    if exp == 255 {
-        if sign == 1 { return -1.0e38 }
-        return 1.0e38
-    }
-    let m = 1.0 + mant / 8388608.0
-    let v = m * pow(2.0, to_float(exp - 127))
-    if sign == 1 { return 0.0 - v }
-    v
-}
-
-// ── String → bytes helper ─────────────────────────────────────
-fn string_to_bytes(s) {
-    let mut out = []
-    let n = s.len()
-    let mut i = 0
-    while i < n {
-        out = out.push(char_code(s, i))
-        i = i + 1
-    }
-    out
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  save_checkpoint(names, tensors, path)
+//  Tensors: per-layer weights (9), AdamW m1/m2 (9 each) = 27/layer
+//           + embed (w, m1, m2) + lm_head (w, m1, m2)
+//           Total: 32*27 + 6 = 870 tensors
 //
-//  names   : [string]  — tensor names
-//  tensors : [tensor]  — weight tensors (flat f64 data)
-//  path    : string    — output file path
+//  Uses raw buffer I/O (alloc_raw, write_f32, deref_f32, write_bytes,
+//  read_file_bytes) for fast serialization of multi-GB checkpoints.
 //
-//  Optional: save_checkpoint(names, tensors, path, opt_names, opt_tensors)
-//            for optimizer state (momentum, etc.)
-// ═══════════════════════════════════════════════════════════════
-pub fn save_checkpoint(names, tensors, path) {
-    _save_checkpoint_impl(names, tensors, path, [], [])
+//  Grammar notes (HX3):
+//    - .push() not arr+[x] in loops
+//    - parens in slice index arithmetic: arr[(i+1)..j]
+//    - avoid `handle` as param name (reserved)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Constants ──────────────────────────────────────────────────
+let CKPT_MAGIC   = 0x48584B43
+let CKPT_VERSION = 2
+let KEEP_N       = 3
+
+// ── 7B shape constants (must match train_7b_integrated.hexa) ──
+let CK_D       = 4096
+let CK_LAYERS  = 32
+let CK_NKV     = 8
+let CK_HDIM    = 128
+let CK_FF      = 11008
+let CK_VOCAB   = 32000
+let CK_KVD     = CK_NKV * CK_HDIM
+
+let CK_SZ_WQ    = CK_D * CK_D
+let CK_SZ_WK    = CK_D * CK_KVD
+let CK_SZ_WV    = CK_D * CK_KVD
+let CK_SZ_WO    = CK_D * CK_D
+let CK_SZ_WGATE = CK_D * CK_FF
+let CK_SZ_WUP   = CK_D * CK_FF
+let CK_SZ_WDOWN = CK_FF * CK_D
+let CK_SZ_RMS   = CK_D
+let CK_SZ_EMBED = CK_VOCAB * CK_D
+let CK_SZ_LMH   = CK_D * CK_VOCAB
+
+let CK_LSIZES = [CK_SZ_WQ, CK_SZ_WK, CK_SZ_WV, CK_SZ_WO,
+                  CK_SZ_WGATE, CK_SZ_WUP, CK_SZ_WDOWN,
+                  CK_SZ_RMS, CK_SZ_RMS]
+
+let CK_LNAMES = ["wq", "wk", "wv", "wo",
+                  "wgate", "wup", "wdown",
+                  "rms_a", "rms_f"]
+
+// ═══════════════════════════════════════════════════════════════════
+//  Internal: pack helpers (write into raw byte buffer)
+// ═══════════════════════════════════════════════════════════════════
+
+fn ck_pack_i32(buf, off, val) {
+    write_i32(buf, off, val)
+    return off + 4
 }
 
-pub fn save_checkpoint_with_opt(names, tensors, path, opt_names, opt_tensors) {
-    _save_checkpoint_impl(names, tensors, path, opt_names, opt_tensors)
+fn ck_pack_f32_buf(dst, dst_off, src, n) {
+    for i in 0..n {
+        let v = deref_f32(src, i * 4)
+        write_f32(dst, dst_off + i * 4, v)
+    }
+    return dst_off + n * 4
 }
 
-fn _save_checkpoint_impl(names, tensors, path, opt_names, opt_tensors) {
-    let n_model = len(names)
-    let n_opt = len(opt_names)
-    let n_total = n_model + n_opt
-    let has_opt = 0
-    if n_opt > 0 { let has_opt = 1 }
+fn ck_pack_string(buf, off, s) {
+    let slen = len(s)
+    let mut pos = ck_pack_i32(buf, off, slen)
+    for i in 0..slen {
+        write_u8(buf, pos, char_code(s, i))
+        pos = pos + 1
+    }
+    return pos
+}
 
-    let mut buf = []
-    // Header: magic, version, n_tensors, flags
-    buf = buf + encode_u32_le(ckpt_magic())
-    buf = buf + encode_u32_le(ckpt_version())
-    buf = buf + encode_u32_le(n_total)
-    let mut flags = 0
-    if n_opt > 0 { flags = 1 }
-    buf = buf + encode_u32_le(flags)
+// Pack one named tensor: name + n_elems + raw f32 data
+fn ck_pack_tensor(buf, off, name, src, n_elems) {
+    let mut pos = ck_pack_string(buf, off, name)
+    pos = ck_pack_i32(buf, pos, n_elems)
+    pos = ck_pack_f32_buf(buf, pos, src, n_elems)
+    return pos
+}
 
-    // Write model tensors
-    let mut i = 0
-    while i < n_model {
-        buf = _encode_tensor_entry(buf, names[i], tensors[i])
-        i = i + 1
+// ═══════════════════════════════════════════════════════════════════
+//  compute_ckpt_bytes — total bytes for a full 7B checkpoint
+// ═══════════════════════════════════════════════════════════════════
+fn compute_ckpt_bytes() {
+    let mut total = 28   // header
+
+    // Per-layer: 27 tensors (9 w + 9 m1 + 9 m2)
+    for layer in 0..CK_LAYERS {
+        for idx in 0..9 {
+            let base = "L" + str(layer) + "." + CK_LNAMES[idx]
+            let sz = CK_LSIZES[idx]
+            let suffixes = [".w", ".m1", ".m2"]
+            for si in 0..3 {
+                let name = base + suffixes[si]
+                // name_len(4) + name(len) + n_elems(4) + data(sz*4)
+                total = total + 4 + len(name) + 4 + sz * 4
+            }
+        }
     }
 
-    // Write optimizer tensors (if any)
-    i = 0
-    while i < n_opt {
-        buf = _encode_tensor_entry(buf, opt_names[i], opt_tensors[i])
-        i = i + 1
+    // Embed: 3 tensors
+    let e_names = ["embed.w", "embed.m1", "embed.m2"]
+    for i in 0..3 {
+        total = total + 4 + len(e_names[i]) + 4 + CK_SZ_EMBED * 4
     }
 
-    // Flush to disk
-    write_file_bytes(path, buf)
-    println("[checkpoint] saved " + str(n_total) + " tensors to " + path + " (" + str(len(buf)) + " bytes)")
-    len(buf)
-}
-
-fn _encode_tensor_entry(buf, name, t) {
-    let name_bytes = string_to_bytes(name)
-    let name_len = len(name_bytes)
-    let numel = len(t)
-
-    // name_len (u32) + name bytes
-    let mut out = buf + encode_u32_le(name_len)
-    out = out + name_bytes
-
-    // n_dims = 1 (flat storage), shape[0] = numel
-    out = out + encode_u32_le(1)
-    out = out + encode_u32_le(numel)
-
-    // dtype = f32
-    out = out + encode_u32_le(dtype_f32())
-
-    // data_len in bytes
-    let data_bytes = numel * 4
-    out = out + encode_u32_le(data_bytes)
-
-    // Encode each float as f32 LE
-    let mut j = 0
-    while j < numel {
-        out = out + encode_f32_le(t[j])
-        j = j + 1
+    // LM head: 3 tensors
+    let h_names = ["lm_head.w", "lm_head.m1", "lm_head.m2"]
+    for i in 0..3 {
+        total = total + 4 + len(h_names[i]) + 4 + CK_SZ_LMH * 4
     }
 
-    out
+    return total
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  load_checkpoint(path) → [names_array, tensors_array]
+// ═══════════════════════════════════════════════════════════════════
+//  save_checkpoint — write full training state to binary file
 //
-//  Returns a pair of arrays: names and corresponding tensors.
-//  Use weight_dict(names, tensors) for O(1) lookup if desired.
-// ═══════════════════════════════════════════════════════════════
-pub fn load_checkpoint(path) {
-    let fsize = file_size(path)
-    let bytes = read_file_bytes(path, 0, fsize)
-    let mut off = 0
+//  Serializes all weights + AdamW moments into a single raw buffer,
+//  then flushes to disk with write_bytes. For 7B this is ~50GB.
+// ═══════════════════════════════════════════════════════════════════
+pub fn save_checkpoint(path, step, epoch, lr, loss,
+                       all_weights, all_m1, all_m2,
+                       embed_w, embed_m1, embed_m2,
+                       lm_head_w, lmh_m1, lmh_m2) {
+    let t0 = time_ms()
+    let total_bytes = compute_ckpt_bytes()
+    let buf = alloc_raw(total_bytes)
 
-    // Parse header
-    let magic = decode_u32_le(bytes, off)
-    off = off + 4
-    if magic != ckpt_magic() {
-        println("[checkpoint] ERROR: bad magic " + str(magic) + " (expected " + str(ckpt_magic()) + ")")
-        return [[], []]
+    let num_tensors = CK_LAYERS * 27 + 6
+
+    // ── Header ─────────────────────────────────────────────────
+    let mut pos = 0
+    pos = ck_pack_i32(buf, pos, CKPT_MAGIC)
+    pos = ck_pack_i32(buf, pos, CKPT_VERSION)
+    pos = ck_pack_i32(buf, pos, step)
+    pos = ck_pack_i32(buf, pos, epoch)
+    write_f32(buf, pos, lr)
+    pos = pos + 4
+    write_f32(buf, pos, loss)
+    pos = pos + 4
+    pos = ck_pack_i32(buf, pos, num_tensors)
+
+    // ── Per-layer tensors ──────────────────────────────────────
+    for layer in 0..CK_LAYERS {
+        for idx in 0..9 {
+            let base = "L" + str(layer) + "." + CK_LNAMES[idx]
+            let sz = CK_LSIZES[idx]
+            pos = ck_pack_tensor(buf, pos, base + ".w", all_weights[layer][idx], sz)
+            pos = ck_pack_tensor(buf, pos, base + ".m1", all_m1[layer][idx], sz)
+            pos = ck_pack_tensor(buf, pos, base + ".m2", all_m2[layer][idx], sz)
+        }
     }
 
-    let version = decode_u32_le(bytes, off)
-    off = off + 4
-    if version != ckpt_version() {
-        println("[checkpoint] WARN: version " + str(version) + " (expected " + str(ckpt_version()) + ")")
-    }
+    // ── Embed ──────────────────────────────────────────────────
+    pos = ck_pack_tensor(buf, pos, "embed.w", embed_w, CK_SZ_EMBED)
+    pos = ck_pack_tensor(buf, pos, "embed.m1", embed_m1, CK_SZ_EMBED)
+    pos = ck_pack_tensor(buf, pos, "embed.m2", embed_m2, CK_SZ_EMBED)
 
-    let n_tensors = decode_u32_le(bytes, off)
-    off = off + 4
+    // ── LM head ────────────────────────────────────────────────
+    pos = ck_pack_tensor(buf, pos, "lm_head.w", lm_head_w, CK_SZ_LMH)
+    pos = ck_pack_tensor(buf, pos, "lm_head.m1", lmh_m1, CK_SZ_LMH)
+    pos = ck_pack_tensor(buf, pos, "lm_head.m2", lmh_m2, CK_SZ_LMH)
 
-    let flags = decode_u32_le(bytes, off)
-    off = off + 4
+    // ── Flush to disk ──────────────────────────────────────────
+    write_bytes(path, buf, total_bytes)
+    free_raw(buf, total_bytes)
 
-    println("[checkpoint] loading " + str(n_tensors) + " tensors from " + path)
-
-    let mut names = []
-    let mut tensors = []
-
-    let mut i = 0
-    while i < n_tensors {
-        // name_len + name
-        let name_len = decode_u32_le(bytes, off)
-        off = off + 4
-        let mut name = ""
-        let mut c = 0
-        while c < name_len {
-            name = name + chr(to_int(bytes[off + c]))
-            c = c + 1
-        }
-        off = off + name_len
-
-        // n_dims + shape
-        let n_dims = decode_u32_le(bytes, off)
-        off = off + 4
-        let mut shape = []
-        let mut d = 0
-        while d < n_dims {
-            shape = shape.push(decode_u32_le(bytes, off))
-            off = off + 4
-            d = d + 1
-        }
-
-        // dtype
-        let dtype = decode_u32_le(bytes, off)
-        off = off + 4
-
-        // data_len
-        let data_len = decode_u32_le(bytes, off)
-        off = off + 4
-
-        // Decode f32 data
-        let numel = data_len / 4
-        let mut data = []
-        let mut j = 0
-        while j < numel {
-            data = data.push(decode_f32_le(bytes, off + j * 4))
-            j = j + 1
-        }
-        off = off + data_len
-
-        names = names.push(name)
-        tensors = tensors.push(tensor(data))
-        i = i + 1
-    }
-
-    println("[checkpoint] loaded " + str(n_tensors) + " tensors (" + str(fsize) + " bytes)")
-    let __ret = [names, tensors]
-    return __ret
+    let elapsed = time_ms() - t0
+    let mb = total_bytes / (1024 * 1024)
+    println("[checkpoint] saved step=" + str(step) + " epoch=" + str(epoch)
+            + " -> " + path + " (" + str(mb) + "MB, " + str(elapsed) + "ms)")
+    return 0
 }
 
-// ═══════════════════════════════════════════════════════════════
-//  Convenience: split loaded checkpoint into model + optimizer
-//  load_checkpoint_split(path) → [model_names, model_tensors, opt_names, opt_tensors]
+// ═══════════════════════════════════════════════════════════════════
+//  load_checkpoint — restore training state from binary file
 //
-//  Convention: optimizer tensor names start with "opt."
-// ═══════════════════════════════════════════════════════════════
-pub fn load_checkpoint_split(path) {
-    let result = load_checkpoint(path)
-    let all_names = result[0]
-    let all_tensors = result[1]
-    let n = len(all_names)
+//  Reads file into raw buffer, then copies tensor data directly
+//  into the caller's pre-allocated weight/moment buffers.
+//  Returns: [step, epoch, lr, loss]  (-1 step on error)
+// ═══════════════════════════════════════════════════════════════════
+pub fn load_checkpoint(path,
+                       all_weights, all_m1, all_m2,
+                       embed_w, embed_m1, embed_m2,
+                       lm_head_w, lmh_m1, lmh_m2) {
+    let t0 = time_ms()
+    let buf = read_file_bytes(path)
+    let n_bytes = byte_len(buf)
 
-    let mut m_names = []
-    let mut m_tensors = []
-    let mut o_names = []
-    let mut o_tensors = []
-
-    let mut i = 0
-    while i < n {
-        let name = all_names[i]
-        // Check if name starts with "opt."
-        if name.starts_with("opt.") {
-            o_names = o_names.push(name)
-            o_tensors = o_tensors.push(all_tensors[i])
-        } else {
-            m_names = m_names.push(name)
-            m_tensors = m_tensors.push(all_tensors[i])
-        }
-        i = i + 1
+    if n_bytes < 28 {
+        println("[checkpoint] ERROR: file too small: " + str(n_bytes))
+        return [-1, 0, 0.0, 0.0]
     }
 
-    let __ret = [m_names, m_tensors, o_names, o_tensors]
-    return __ret
+    // ── Header ─────────────────────────────────────────────────
+    let magic = deref_i32(buf, 0)
+    if magic != CKPT_MAGIC {
+        println("[checkpoint] ERROR: bad magic 0x" + str(magic))
+        return [-1, 0, 0.0, 0.0]
+    }
+    let version = deref_i32(buf, 4)
+    if version != CKPT_VERSION {
+        println("[checkpoint] WARNING: version " + str(version)
+                + " (expected " + str(CKPT_VERSION) + ")")
+    }
+    let step       = deref_i32(buf, 8)
+    let epoch      = deref_i32(buf, 12)
+    let lr         = deref_f32(buf, 16)
+    let loss       = deref_f32(buf, 20)
+    let num_tensors = deref_i32(buf, 24)
+
+    println("[checkpoint] loading step=" + str(step) + " epoch=" + str(epoch)
+            + " lr=" + str(lr) + " loss=" + str(loss)
+            + " tensors=" + str(num_tensors))
+
+    // ── Read tensors in save order ─────────────────────────────
+    let mut pos = 28
+
+    // Helper: skip name, read n_elems, copy into target buffer
+    // Per-layer: w, m1, m2 for each of 9 sub-weights
+    for layer in 0..CK_LAYERS {
+        for idx in 0..9 {
+            let sz = CK_LSIZES[idx]
+            let targets = [all_weights[layer][idx],
+                           all_m1[layer][idx],
+                           all_m2[layer][idx]]
+            for ti in 0..3 {
+                let nlen = deref_i32(buf, pos)
+                pos = pos + 4 + nlen
+                let n = deref_i32(buf, pos)
+                pos = pos + 4
+                let dst = targets[ti]
+                for i in 0..n {
+                    write_f32(dst, i * 4, deref_f32(buf, pos + i * 4))
+                }
+                pos = pos + n * 4
+            }
+        }
+    }
+
+    // Embed: w, m1, m2
+    let embed_targets = [embed_w, embed_m1, embed_m2]
+    for ti in 0..3 {
+        let nlen = deref_i32(buf, pos)
+        pos = pos + 4 + nlen
+        let n = deref_i32(buf, pos)
+        pos = pos + 4
+        let dst = embed_targets[ti]
+        for i in 0..n {
+            write_f32(dst, i * 4, deref_f32(buf, pos + i * 4))
+        }
+        pos = pos + n * 4
+    }
+
+    // LM head: w, m1, m2
+    let lmh_targets = [lm_head_w, lmh_m1, lmh_m2]
+    for ti in 0..3 {
+        let nlen = deref_i32(buf, pos)
+        pos = pos + 4 + nlen
+        let n = deref_i32(buf, pos)
+        pos = pos + 4
+        let dst = lmh_targets[ti]
+        for i in 0..n {
+            write_f32(dst, i * 4, deref_f32(buf, pos + i * 4))
+        }
+        pos = pos + n * 4
+    }
+
+    let elapsed = time_ms() - t0
+    let mb = n_bytes / (1024 * 1024)
+    println("[checkpoint] loaded " + str(mb) + "MB in " + str(elapsed) + "ms")
+
+    return [step, epoch, lr, loss]
 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  auto_checkpoint — called each step; saves if step % interval == 0
+//
+//  Maintains a rolling window of KEEP_N checkpoints. Older files
+//  are deleted to conserve disk space on multi-hour H100 runs.
+//
+//  recent_paths: mutable list owned by caller (pass [] initially)
+//  Returns: updated recent_paths list
+// ═══════════════════════════════════════════════════════════════════
+pub fn auto_checkpoint(step, interval, path_prefix, recent_paths,
+                       epoch, lr, loss,
+                       all_weights, all_m1, all_m2,
+                       embed_w, embed_m1, embed_m2,
+                       lm_head_w, lmh_m1, lmh_m2) {
+    if interval <= 0 { return recent_paths }
+    if step % interval != 0 { return recent_paths }
+
+    let path = path_prefix + "_step_" + str(step) + ".hxck"
+
+    save_checkpoint(path, step, epoch, lr, loss,
+                    all_weights, all_m1, all_m2,
+                    embed_w, embed_m1, embed_m2,
+                    lm_head_w, lmh_m1, lmh_m2)
+
+    recent_paths.push(path)
+
+    // Rotate: delete oldest checkpoints beyond KEEP_N
+    while len(recent_paths) > KEEP_N {
+        let old_path = recent_paths[0]
+        delete_file(old_path)
+        println("[checkpoint] rotated out: " + old_path)
+        let mut trimmed = []
+        for i in 1..len(recent_paths) {
+            trimmed.push(recent_paths[i])
+        }
+        recent_paths = trimmed
+    }
+
+    return recent_paths
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  checkpoint_exists — quick probe for valid checkpoint at path
+// ═══════════════════════════════════════════════════════════════════
+pub fn checkpoint_exists(path) {
+    let buf = read_file_bytes(path)
+    if byte_len(buf) >= 28 {
+        return deref_i32(buf, 0) == CKPT_MAGIC
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  find_latest_checkpoint — scan for most recent checkpoint file
+//
+//  Probes path_prefix + "_step_N.hxck" from max_step downward.
+//  Returns path string, or "" if none found.
+// ═══════════════════════════════════════════════════════════════════
+pub fn find_latest_checkpoint(path_prefix, max_step, interval) {
+    if interval <= 0 { return "" }
+    let mut s = (max_step / interval) * interval
+    while s > 0 {
+        let p = path_prefix + "_step_" + str(s) + ".hxck"
+        if checkpoint_exists(p) {
+            println("[checkpoint] found latest: " + p)
+            return p
+        }
+        s = s - interval
+    }
+    return ""
+}
+
+println("[checkpoint] module loaded — binary v2 save/load (raw f32 buffers)")

@@ -1,0 +1,379 @@
+// =====================================================================
+//  self/ml/train_logger.hexa — structured training metrics logger
+//
+//  Pure hexa, no Python/wandb dependency.
+//  Accumulates per-step metrics: loss, lr, tok/s, grad_norm, memory.
+//  Exports CSV/JSONL. Detects anomalies (loss spikes, grad explosion,
+//  NaN/Inf, throughput drops).
+//
+//  Grammar notes (HX3):
+//    - .push() not arr+[x] in loops
+//    - no semicolons
+//    - let mut for mutable bindings
+// =====================================================================
+
+// ── Anomaly thresholds ──────────────────────────────────────────
+let LOSS_SPIKE_FACTOR   = 3.0     // > 3x moving average = spike
+let GRAD_EXPLODE_THRESH = 100.0   // gradient norm > 100 = explosion
+let GRAD_VANISH_THRESH  = 1.0e-7  // gradient norm < 1e-7 = vanishing
+let THROUGHPUT_DROP_PCT  = 0.5    // > 50% below average = drop
+let MOVING_AVG_WINDOW   = 50      // steps for moving average
+
+// =====================================================================
+//  MetricEntry — single step record
+// =====================================================================
+fn make_entry(step, loss, lr, tok_s, samples_s, mfu, grad_norm, mem_mb, elapsed_ms) {
+    return {
+        "step": step,
+        "loss": loss,
+        "lr": lr,
+        "tok_s": tok_s,
+        "samples_s": samples_s,
+        "mfu": mfu,
+        "grad_norm": grad_norm,
+        "mem_mb": mem_mb,
+        "elapsed_ms": elapsed_ms
+    }
+}
+
+// =====================================================================
+//  TrainLogger — create a new logger instance
+// =====================================================================
+fn create_logger(model_name, n_params, seq_len) {
+    return {
+        "model_name": model_name,
+        "n_params": n_params,
+        "seq_len": seq_len,
+        "entries": [],
+        "anomalies": [],
+        "total_tokens": 0,
+        "start_time_ms": time_ms()
+    }
+}
+
+// =====================================================================
+//  is_nan_or_inf — check for NaN or Inf in a float value
+//  NaN: x != x.  Inf: abs(x) > 1e30
+// =====================================================================
+fn is_nan_or_inf(x) {
+    if x != x { return true }
+    if x > 1.0e30 { return true }
+    if x < -1.0e30 { return true }
+    return false
+}
+
+// =====================================================================
+//  compute_moving_avg — average of last N values from a list of entries
+//  field: "loss", "tok_s", "grad_norm"
+// =====================================================================
+fn compute_moving_avg(entries, field, window) {
+    let n = len(entries)
+    if n == 0 { return 0.0 }
+    let start = if n > window { n - window } else { 0 }
+    let mut total = 0.0
+    let mut count = 0
+    let mut i = start
+    while i < n {
+        let val = entries[i][field]
+        if is_nan_or_inf(val) == false {
+            total = total + val
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / (count * 1.0)
+}
+
+// =====================================================================
+//  log_step — record one training step's metrics
+//
+//  metrics_dict keys: "loss", "lr", "grad_norm", "mem_mb", "elapsed_ms"
+//  tok_s / samples_s / mfu are computed automatically
+// =====================================================================
+fn log_step(logger, step, metrics) {
+    let loss      = metrics["loss"]
+    let lr        = metrics["lr"]
+    let grad_norm = metrics["grad_norm"]
+    let mem_mb    = if metrics["mem_mb"] != nil { metrics["mem_mb"] } else { 0.0 }
+    let elapsed   = metrics["elapsed_ms"]
+    let seq       = logger["seq_len"]
+
+    // Throughput
+    let tok_s = if elapsed > 0.0 { (seq * 1000.0) / elapsed } else { 0.0 }
+    let samples_s = if elapsed > 0.0 { 1000.0 / elapsed } else { 0.0 }
+
+    // MFU estimate: (2 * n_params * tok_s) / peak_flops
+    // Assume H100 peak = 990e12 flops (bf16 tensor core)
+    let peak_flops = 990.0e12
+    let mfu = if tok_s > 0.0 {
+        (2.0 * logger["n_params"] * tok_s) / peak_flops * 100.0
+    } else { 0.0 }
+
+    let entry = make_entry(step, loss, lr, tok_s, samples_s, mfu, grad_norm, mem_mb, elapsed)
+    logger["entries"].push(entry)
+    logger["total_tokens"] = logger["total_tokens"] + seq
+
+    // Run anomaly detection on this step
+    detect_step_anomalies(logger, entry)
+
+    return entry
+}
+
+// =====================================================================
+//  detect_step_anomalies — check single step for anomalies
+// =====================================================================
+fn detect_step_anomalies(logger, entry) {
+    let entries = logger["entries"]
+    let step = entry["step"]
+
+    // 1. NaN/Inf check on all numeric fields
+    let fields = ["loss", "grad_norm", "tok_s", "mem_mb"]
+    for f in fields {
+        if is_nan_or_inf(entry[f]) {
+            let msg = "[ANOMALY step=" + str(step) + "] " + f + "=" + str(entry[f]) + " (NaN/Inf detected)"
+            logger["anomalies"].push(msg)
+            println(msg)
+        }
+    }
+
+    // Need at least a few entries for moving-average checks
+    if len(entries) < 3 { return 0 }
+
+    // 2. Loss spike: current loss > 3x moving average
+    let avg_loss = compute_moving_avg(entries, "loss", MOVING_AVG_WINDOW)
+    if avg_loss > 0.0 {
+        if entry["loss"] > avg_loss * LOSS_SPIKE_FACTOR {
+            let msg = "[ANOMALY step=" + str(step) + "] loss spike: " + str(entry["loss"]) + " > " + str(LOSS_SPIKE_FACTOR) + "x avg(" + str(avg_loss) + ")"
+            logger["anomalies"].push(msg)
+            println(msg)
+        }
+    }
+
+    // 3. Gradient explosion / vanishing
+    let gn = entry["grad_norm"]
+    if is_nan_or_inf(gn) == false {
+        if gn > GRAD_EXPLODE_THRESH {
+            let msg = "[ANOMALY step=" + str(step) + "] grad explosion: norm=" + str(gn) + " > " + str(GRAD_EXPLODE_THRESH)
+            logger["anomalies"].push(msg)
+            println(msg)
+        }
+        if gn < GRAD_VANISH_THRESH {
+            if gn >= 0.0 {
+                let msg = "[ANOMALY step=" + str(step) + "] grad vanishing: norm=" + str(gn) + " < " + str(GRAD_VANISH_THRESH)
+                logger["anomalies"].push(msg)
+                println(msg)
+            }
+        }
+    }
+
+    // 4. Throughput drop: > 50% below moving average
+    let avg_tps = compute_moving_avg(entries, "tok_s", MOVING_AVG_WINDOW)
+    if avg_tps > 0.0 {
+        if entry["tok_s"] < avg_tps * THROUGHPUT_DROP_PCT {
+            let msg = "[ANOMALY step=" + str(step) + "] throughput drop: " + str(entry["tok_s"]) + " tok/s < 50% of avg(" + str(avg_tps) + ")"
+            logger["anomalies"].push(msg)
+            println(msg)
+        }
+    }
+
+    return 0
+}
+
+// =====================================================================
+//  detect_anomalies — run full anomaly scan over all recorded entries
+//  Returns list of anomaly messages
+// =====================================================================
+fn detect_anomalies(logger) {
+    let entries = logger["entries"]
+    let n = len(entries)
+    if n == 0 { return [] }
+
+    let mut results = []
+
+    // Check for monotonic loss increase (last 10 steps all increasing)
+    if n >= 10 {
+        let mut all_increasing = true
+        let mut i = n - 9
+        while i < n {
+            if entries[i]["loss"] <= entries[(i - 1)]["loss"] {
+                all_increasing = false
+            }
+            i = i + 1
+        }
+        if all_increasing {
+            let msg = "[ANOMALY] loss monotonically increasing for last 10 steps — possible divergence"
+            results.push(msg)
+        }
+    }
+
+    // Return accumulated anomalies + new scan results
+    for a in logger["anomalies"] {
+        results.push(a)
+    }
+    return results
+}
+
+// =====================================================================
+//  log_summary — print formatted summary every N steps
+//
+//  Covers the last `interval` steps:
+//    - Loss: avg / min / max
+//    - Throughput: tok/s, samples/s, MFU%
+//    - Learning rate (current)
+//    - Gradient norm: avg / max
+//    - GPU memory: current / peak
+//    - Anomaly count
+// =====================================================================
+fn log_summary(logger, interval) {
+    let entries = logger["entries"]
+    let n = len(entries)
+    if n == 0 { return 0 }
+
+    let start = if n > interval { n - interval } else { 0 }
+    let end_step = entries[(n - 1)]["step"]
+
+    // Aggregate over window
+    let mut sum_loss = 0.0
+    let mut min_loss = 1.0e30
+    let mut max_loss = -1.0e30
+    let mut sum_tps = 0.0
+    let mut sum_sps = 0.0
+    let mut sum_mfu = 0.0
+    let mut sum_gn = 0.0
+    let mut max_gn = 0.0
+    let mut max_mem = 0.0
+    let mut count = 0
+
+    let mut i = start
+    while i < n {
+        let e = entries[i]
+        let loss = e["loss"]
+        if is_nan_or_inf(loss) == false {
+            sum_loss = sum_loss + loss
+            if loss < min_loss { min_loss = loss }
+            if loss > max_loss { max_loss = loss }
+        }
+        sum_tps = sum_tps + e["tok_s"]
+        sum_sps = sum_sps + e["samples_s"]
+        sum_mfu = sum_mfu + e["mfu"]
+        let gn = e["grad_norm"]
+        if is_nan_or_inf(gn) == false {
+            sum_gn = sum_gn + gn
+            if gn > max_gn { max_gn = gn }
+        }
+        if e["mem_mb"] > max_mem { max_mem = e["mem_mb"] }
+        count = count + 1
+        i = i + 1
+    }
+
+    if count == 0 { return 0 }
+    let c = count * 1.0
+    let avg_loss = sum_loss / c
+    let avg_tps = sum_tps / c
+    let avg_sps = sum_sps / c
+    let avg_mfu = sum_mfu / c
+    let avg_gn = sum_gn / c
+    let cur_lr = entries[(n - 1)]["lr"]
+    let cur_mem = entries[(n - 1)]["mem_mb"]
+    let total_tok = logger["total_tokens"]
+    let elapsed_total = time_ms() - logger["start_time_ms"]
+
+    println("")
+    println("=" * 64)
+    println("  [summary] steps " + str(entries[start]["step"]) + ".." + str(end_step) + " (" + str(count) + " steps)")
+    println("-" * 64)
+    println("  loss      avg=" + str(avg_loss) + "  min=" + str(min_loss) + "  max=" + str(max_loss))
+    println("  throughput tok/s=" + str(avg_tps) + "  samples/s=" + str(avg_sps) + "  MFU=" + str(avg_mfu) + "%")
+    println("  lr        " + str(cur_lr))
+    println("  grad_norm avg=" + str(avg_gn) + "  max=" + str(max_gn))
+    println("  memory    current=" + str(cur_mem) + "MB  peak=" + str(max_mem) + "MB")
+    println("  total     tokens=" + str(total_tok) + "  wall=" + str(elapsed_total) + "ms")
+    println("  anomalies " + str(len(logger["anomalies"])))
+    println("=" * 64)
+    println("")
+
+    return 0
+}
+
+// =====================================================================
+//  save_csv — export all metrics to CSV file
+// =====================================================================
+fn save_csv(logger, path) {
+    let entries = logger["entries"]
+    let mut parts = []
+    parts.push("step,loss,lr,tok_s,samples_s,mfu_pct,grad_norm,mem_mb,elapsed_ms")
+
+    for e in entries {
+        let line = str(e["step"]) + "," + str(e["loss"]) + "," + str(e["lr"]) + "," + str(e["tok_s"]) + "," + str(e["samples_s"]) + "," + str(e["mfu"]) + "," + str(e["grad_norm"]) + "," + str(e["mem_mb"]) + "," + str(e["elapsed_ms"])
+        parts.push(line)
+    }
+
+    let content = parts.join("\n")
+    write_file(path, content)
+    println("[logger] saved CSV: " + path + " (" + str(len(entries)) + " rows)")
+    return 0
+}
+
+// =====================================================================
+//  save_jsonl — export all metrics as JSONL (one JSON object per line)
+// =====================================================================
+fn save_jsonl(logger, path) {
+    let entries = logger["entries"]
+    let mut parts = []
+
+    for e in entries {
+        let line = "{\"step\":" + str(e["step"]) + ",\"loss\":" + str(e["loss"]) + ",\"lr\":" + str(e["lr"]) + ",\"tok_s\":" + str(e["tok_s"]) + ",\"samples_s\":" + str(e["samples_s"]) + ",\"mfu\":" + str(e["mfu"]) + ",\"grad_norm\":" + str(e["grad_norm"]) + ",\"mem_mb\":" + str(e["mem_mb"]) + ",\"elapsed_ms\":" + str(e["elapsed_ms"]) + "}"
+        parts.push(line)
+    }
+
+    let content = parts.join("\n")
+    write_file(path, content)
+    println("[logger] saved JSONL: " + path + " (" + str(len(entries)) + " lines)")
+    return 0
+}
+
+// =====================================================================
+//  format_step — one-line formatted output for a single step
+//  Used inline during training for concise per-step logging
+// =====================================================================
+fn format_step(entry) {
+    return "[step " + str(entry["step"]) + "]" + " loss=" + str(entry["loss"]) + " lr=" + str(entry["lr"]) + " tok/s=" + str(entry["tok_s"]) + " gnorm=" + str(entry["grad_norm"]) + " mem=" + str(entry["mem_mb"]) + "MB" + " MFU=" + str(entry["mfu"]) + "%" + " t=" + str(entry["elapsed_ms"]) + "ms"
+}
+
+// =====================================================================
+//  print_final_report — end-of-training summary
+// =====================================================================
+fn print_final_report(logger) {
+    let entries = logger["entries"]
+    let n = len(entries)
+    if n == 0 {
+        println("[logger] no entries recorded")
+        return 0
+    }
+
+    let elapsed_total = time_ms() - logger["start_time_ms"]
+    let avg_loss = compute_moving_avg(entries, "loss", n)
+    let avg_tps = compute_moving_avg(entries, "tok_s", n)
+    let first_loss = entries[0]["loss"]
+    let last_loss = entries[(n - 1)]["loss"]
+
+    println("")
+    println("=" * 64)
+    println("  TRAINING REPORT — " + logger["model_name"])
+    println("=" * 64)
+    println("  steps        " + str(n))
+    println("  total tokens " + str(logger["total_tokens"]))
+    println("  wall time    " + str(elapsed_total) + "ms")
+    println("  loss         first=" + str(first_loss) + "  last=" + str(last_loss) + "  avg=" + str(avg_loss))
+    println("  throughput   avg=" + str(avg_tps) + " tok/s")
+    println("  anomalies    " + str(len(logger["anomalies"])))
+    if len(logger["anomalies"]) > 0 {
+        println("  --- anomaly log ---")
+        for a in logger["anomalies"] {
+            println("    " + a)
+        }
+    }
+    println("=" * 64)
+    return 0
+}
