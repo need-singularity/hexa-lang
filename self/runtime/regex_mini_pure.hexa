@@ -1,0 +1,376 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/regex_mini_pure.hexa — Pike-style mini regex (pure Hexa)
+//
+//  Net-new. runtime.c has no hexa_regex_* / hexa_match_* helpers today
+//  (verified 2026-04-17 via grep). Pragmatic subset tuned for common
+//  text-munging: anchors, dot, star, question, simple char classes,
+//  and backslash-escape. Full NFA / alternation / groups / ranges are
+//  explicitly out of scope — use KMP (kmp_pure.hexa) when you only
+//  need literal substring.
+//
+//  Supported meta
+//  ──────────────
+//      .        any single char
+//      *        greedy zero-or-more of the preceding single token
+//      ?        zero-or-one of the preceding single token
+//      ^        anchor at start of text (only meaningful at pat[0])
+//      $        anchor at end of text  (only meaningful at pat[-1])
+//      [abc]    simple class, literal chars only — no ranges
+//      \\x      literal x (escapes meta characters)
+//
+//  NOT supported (deliberate)
+//      +  {n,m}  |  (…)  \1  [a-z]  look-around  (?…)
+//
+//  Public API (5 net-new)
+//  ──────────────────────
+//      regex_match_pure(pattern, text)                -> bool
+//          full-string match — pattern must consume ALL of text
+//          (as if always anchored with implicit ^ and $)
+//      regex_search_pure(pattern, text)               -> bool
+//          true iff pattern matches at some position in text
+//          (honours explicit ^ / $ in the pattern)
+//      regex_find_pure(pattern, text)                 -> int
+//          first match start index, or -1 if none
+//      regex_find_all_pure(pattern, text)             -> [int]
+//          all non-overlapping match start indices
+//      regex_replace_first_pure(pattern, text, repl)  -> string
+//          replace first match span with `repl` (returns text if miss)
+//
+//  Algorithmic notes
+//  ─────────────────
+//  * Classical Pike `re.c` recursion — matchhere / matchstar.
+//  * "Preceding single token" semantics: for `a*` the repeated atom
+//    is one char `a`; for `.*` it's "any char"; for `[abc]*` it's the
+//    whole class; for `\\.*` the repeated atom is a literal `.`.
+//  * Greedy star implemented iteratively: advance as far as possible,
+//    then backtrack one char at a time until the tail matches.
+//  * All char access goes through `substring(i, i+1)` to keep the
+//    stage0 interpreter / native backend happy (P16 single-char read).
+//
+//  Pitfalls honoured
+//  ─────────────────
+//      P15  let mut for every reassigned local
+//      P16  substring(i, i+1) for single-char reads
+//      P50  no `<<` / `>>` anywhere in this module
+//      let mut = 0 contamination — all counter inits stand alone
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ── internal: char at index, or "" if out of range ────────────────
+@pure
+fn rx_char_at(s, i) {
+    if i < 0 { return "" }
+    if i >= len(s) { return "" }
+    return s.substring(i, i + 1)
+}
+
+// ── internal: is ch a meta character that needs escaping? ─────────
+@pure
+fn rx_is_meta(ch) {
+    if ch == "." { return true }
+    if ch == "*" { return true }
+    if ch == "?" { return true }
+    if ch == "^" { return true }
+    if ch == "$" { return true }
+    if ch == "[" { return true }
+    if ch == "]" { return true }
+    if ch == "\\" { return true }
+    return false
+}
+
+// ── internal: atom_len — length of the next "single token" ────────
+//
+//  Starting at pattern[pi], how many pattern chars make up one
+//  match-unit (before any * / ? suffix)?
+//      \\x         -> 2     (backslash + literal)
+//      [abc]       -> k+2   (whole class incl. brackets)
+//      any other   -> 1
+//  Returns -1 on malformed class.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rx_atom_len(pattern, pi) {
+    let plen = len(pattern)
+    if pi >= plen { return 0 }
+    let c = rx_char_at(pattern, pi)
+    if c == "\\" {
+        if pi + 1 >= plen { return -1 }
+        return 2
+    }
+    if c == "[" {
+        let mut j = pi + 1
+        while j < plen {
+            let cj = rx_char_at(pattern, j)
+            if cj == "]" {
+                return (j - pi) + 1
+            }
+            j = j + 1
+        }
+        return -1
+    }
+    return 1
+}
+
+// ── internal: atom_matches_char — does the atom at pattern[pi..pi+L]
+//  match text[ti]? ──────────────────────────────────────────────────
+//
+//  ti must be a valid index into text (caller checks ti < len(text)).
+//  Works for literal, ".", escaped-literal, and simple "[abc]" class.
+//  Anchors ^ and $ are NOT atoms — they are handled by the caller.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rx_atom_matches(pattern, pi, atom_len, text, ti) {
+    let tc = rx_char_at(text, ti)
+    if tc == "" { return false }
+    let head = rx_char_at(pattern, pi)
+
+    if head == "\\" {
+        let esc = rx_char_at(pattern, pi + 1)
+        return tc == esc
+    }
+    if head == "." {
+        return true
+    }
+    if head == "[" {
+        // class body is pattern[pi+1 .. pi+atom_len-1]  (exclusive of ']')
+        let mut j = pi + 1
+        let last = pi + atom_len - 1
+        while j < last {
+            let cj = rx_char_at(pattern, j)
+            if cj == "\\" {
+                let ej = rx_char_at(pattern, j + 1)
+                if tc == ej { return true }
+                j = j + 2
+            } else {
+                if tc == cj { return true }
+                j = j + 1
+            }
+        }
+        return false
+    }
+    // plain literal
+    return tc == head
+}
+
+// ── internal: matchhere — recursive engine ────────────────────────
+//
+//  Attempts to match pattern starting at pi against text starting at
+//  ti. Returns the end-index-in-text on success, or -1 on failure.
+//  Returning the end index (instead of bool) lets the outer search /
+//  find-all / replace routines know how far the match consumed.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rx_matchhere(pattern, pi, text, ti) {
+    let plen = len(pattern)
+    let tlen = len(text)
+
+    // Pattern exhausted — successful match ending at ti
+    if pi >= plen { return ti }
+
+    let head = rx_char_at(pattern, pi)
+
+    // End anchor: only succeeds if text is also exhausted
+    if head == "$" {
+        if pi + 1 == plen {
+            if ti == tlen { return ti }
+            return -1
+        }
+        // `$` not at end — treat as literal dollar
+    }
+
+    let a_len = rx_atom_len(pattern, pi)
+    if a_len < 0 { return -1 }
+    let next_pi = pi + a_len
+    let suffix = rx_char_at(pattern, next_pi)
+
+    if suffix == "*" {
+        return rx_matchstar(pattern, pi, a_len, next_pi + 1, text, ti)
+    }
+    if suffix == "?" {
+        return rx_matchques(pattern, pi, a_len, next_pi + 1, text, ti)
+    }
+
+    // Single obligatory atom
+    if ti < tlen {
+        if rx_atom_matches(pattern, pi, a_len, text, ti) {
+            return rx_matchhere(pattern, next_pi, text, ti + 1)
+        }
+    }
+    return -1
+}
+
+// ── internal: matchstar — greedy * ─────────────────────────────────
+//
+//  Consume as many matching chars as possible, then backtrack one at
+//  a time looking for a tail-match. Returns end index or -1.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rx_matchstar(pattern, atom_pi, atom_len, rest_pi, text, ti) {
+    let tlen = len(text)
+    // Walk hi forward while the atom keeps matching
+    let mut hi = ti
+    let mut stop = false
+    while hi < tlen {
+        if stop { break }
+        if rx_atom_matches(pattern, atom_pi, atom_len, text, hi) {
+            hi = hi + 1
+        } else {
+            stop = true
+        }
+    }
+    // Backtrack from hi down to ti trying the rest of the pattern
+    let mut cur = hi
+    while cur >= ti {
+        let r = rx_matchhere(pattern, rest_pi, text, cur)
+        if r >= 0 { return r }
+        cur = cur - 1
+    }
+    return -1
+}
+
+// ── internal: matchques — zero-or-one ? ────────────────────────────
+@pure
+fn rx_matchques(pattern, atom_pi, atom_len, rest_pi, text, ti) {
+    let tlen = len(text)
+    // Try "one" first (greedy-ish), then "zero"
+    if ti < tlen {
+        if rx_atom_matches(pattern, atom_pi, atom_len, text, ti) {
+            let r1 = rx_matchhere(pattern, rest_pi, text, ti + 1)
+            if r1 >= 0 { return r1 }
+        }
+    }
+    return rx_matchhere(pattern, rest_pi, text, ti)
+}
+
+// ── internal: search entry point — honours ^ anchor ────────────────
+//
+//  Returns [start, end) of the first match, or nil if none.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn rx_search_span(pattern, text) {
+    let plen = len(pattern)
+    let tlen = len(text)
+
+    if plen == 0 { return [0, 0] }
+
+    if rx_char_at(pattern, 0) == "^" {
+        let r = rx_matchhere(pattern, 1, text, 0)
+        if r >= 0 { return [0, r] }
+        return nil
+    }
+
+    let mut i = 0
+    while i <= tlen {
+        let r = rx_matchhere(pattern, 0, text, i)
+        if r >= 0 { return [i, r] }
+        i = i + 1
+    }
+    return nil
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  PUBLIC API
+// ═══════════════════════════════════════════════════════════════════
+
+// ── regex_match_pure — full anchored match ────────────────────────
+//
+//  Equivalent to "^" + pattern + "$" (after stripping any explicit
+//  anchors the caller already wrote).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn regex_match_pure(pattern, text) {
+    let plen = len(pattern)
+    let tlen = len(text)
+
+    // Strip optional explicit anchors — we're always anchored here
+    let mut start = 0
+    let mut end = plen
+    if plen > 0 {
+        if rx_char_at(pattern, 0) == "^" { start = 1 }
+    }
+    if end > start {
+        if rx_char_at(pattern, end - 1) == "$" {
+            // Ensure the trailing `$` isn't escaped as \$
+            if end - 2 >= start {
+                let before = rx_char_at(pattern, end - 2)
+                if before != "\\" { end = end - 1 }
+            } else {
+                end = end - 1
+            }
+        }
+    }
+
+    // Build an effective pattern window — we call matchhere with an
+    // index-offset by using substring on pattern.
+    let core = pattern.substring(start, end)
+
+    let r = rx_matchhere(core, 0, text, 0)
+    if r == tlen { return true }
+    return false
+}
+
+// ── regex_search_pure — anywhere-match bool ───────────────────────
+@pure
+pub fn regex_search_pure(pattern, text) {
+    let span = rx_search_span(pattern, text)
+    if type_of(span) == "void" { return false }
+    return true
+}
+
+// ── regex_find_pure — first match start, or -1 ────────────────────
+@pure
+pub fn regex_find_pure(pattern, text) {
+    let span = rx_search_span(pattern, text)
+    if type_of(span) == "void" { return -1 }
+    return span[0]
+}
+
+// ── regex_find_all_pure — all non-overlapping starts ──────────────
+//
+//  A zero-width match (e.g. pattern "" or ".*" against "") still
+//  advances the cursor by one to guarantee termination.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn regex_find_all_pure(pattern, text) {
+    let tlen = len(text)
+    let plen = len(pattern)
+    let mut out = []
+
+    if plen == 0 { return out }
+
+    // If pattern starts with ^, only one possible match — at 0
+    if rx_char_at(pattern, 0) == "^" {
+        let r = rx_matchhere(pattern, 1, text, 0)
+        if r >= 0 { out.push(0) }
+        return out
+    }
+
+    let mut i = 0
+    while i <= tlen {
+        let r = rx_matchhere(pattern, 0, text, i)
+        if r >= 0 {
+            out.push(i)
+            if r > i {
+                i = r
+            } else {
+                i = i + 1
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ── regex_replace_first_pure — replace first match span ───────────
+@pure
+pub fn regex_replace_first_pure(pattern, text, replacement) {
+    let span = rx_search_span(pattern, text)
+    if type_of(span) == "void" { return text }
+    let s = span[0]
+    let e = span[1]
+    let tlen = len(text)
+    let head = text.substring(0, s)
+    let tail = text.substring(e, tlen)
+    return head + replacement + tail
+}
