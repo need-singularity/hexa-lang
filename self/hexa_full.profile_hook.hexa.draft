@@ -1,0 +1,110 @@
+// hexa_full.profile_hook — S-1c draft patch (NOT applied)
+//
+// Purpose
+//   Put per-fn call counters INSIDE self/hexa_full.hexa so any interpreter run
+//   can profile itself without source-transforming the target .hexa (S-1b
+//   already ships a source-transform profiler: scripts/ai_native_profile.hexa).
+//
+// Safety
+//   - Gated on env_var("HEXA_PROFILE") == "1". Default-off. Zero behavior
+//     change when flag unset.
+//   - No threading / no atomic intrinsics. Single-interpreter loop only.
+//   - Counts only (no timing). Timing requires paired enter/exit + monotonic
+//     clock; deferred to a follow-up.
+//   - Follows HX8: any rebuild goes through scripts/rebuild_stage0.hexa.
+//
+// Call-entry citation (self/hexa_full.hexa, post-scout line numbers):
+//   pub let mut deprecated_warned = []    — L5387 (module-state zone)
+//   fn call_user_fn(name, args) { ... }   — L8650
+//   scout comment                         — immediately above `let attr_bits`
+//   reset site                            — L16765 (where call_stack_top=0)
+//
+// Draft diff (for review; DO NOT paste as-is without rebuild test):
+//
+// 1. Add module-scope state near L5387 (below deprecated_warned):
+//
+//      pub let mut profile_names  = []   // parallel array: name[i]
+//      pub let mut profile_counts = []   // parallel array: count[i]
+//      // 64-bucket cache mirrors fn_cache / fn_attr_cache style (ROI-15).
+//      // Each bucket: [[name, index_in_profile_names], ...]
+//      pub let mut profile_cache  = []
+//
+// 2. Helper fns (place near fn_attr_bitmask for locality):
+//
+//      fn profile_cache_init() {
+//          profile_cache = []
+//          let mut _i = 0
+//          while _i < 64 { profile_cache = profile_cache.push([]); _i = _i + 1 }
+//      }
+//      fn profile_index_of(name) {
+//          if len(profile_cache) != 64 { profile_cache_init() }
+//          let b = env_hash(name)
+//          let bucket = profile_cache[b]
+//          let mut k = 0
+//          while k < len(bucket) {
+//              if bucket[k][0] == name { return bucket[k][1] }
+//              k = k + 1
+//          }
+//          return 0 - 1   // not found
+//      }
+//      fn profile_index_add(name) {
+//          profile_names  = profile_names.push(name)
+//          profile_counts = profile_counts.push(0)
+//          let idx = len(profile_names) - 1
+//          let b = env_hash(name)
+//          profile_cache[b] = profile_cache[b].push([name, idx])
+//          return idx
+//      }
+//      fn profile_tick(name) {
+//          let _pi = profile_index_of(name)
+//          if _pi < 0 { _pi = profile_index_add(name) }
+//          profile_counts[_pi] = profile_counts[_pi] + 1
+//      }
+//      fn emit_profile() {
+//          if env_var("HEXA_PROFILE") != "1" { return }
+//          let path = env_var("HEXA_PROFILE_OUT")
+//          if path == "" { path = "/tmp/hexa_profile.jsonl" }
+//          let mut out = ""
+//          let mut i = 0
+//          while i < len(profile_names) {
+//              out = out + "{\"fn\":\"" + profile_names[i] + "\",\"calls\":"
+//                       + to_string(profile_counts[i]) + "}\n"
+//              i = i + 1
+//          }
+//          write_file(path, out)
+//      }
+//
+// 3. Hook at call_user_fn (L8650), immediately after arg validation and
+//    BEFORE attr_bits probe (replace scout comment block):
+//
+//      if env_var("HEXA_PROFILE") == "1" { profile_tick(name) }
+//
+// 4. Reset at the runner init block (~L16765, alongside call_stack = []):
+//
+//      profile_names  = []
+//      profile_counts = []
+//      profile_cache_init()
+//
+// 5. Dump at the runner exit path. Need to pick one of:
+//    (a) explicit call to emit_profile() at end of top-level run loop
+//    (b) atexit-like hook (no atexit in interpreter — use (a))
+//
+// Expected overhead when HEXA_PROFILE=0: one env_var() call per user-fn
+// invocation. env_var is already a host builtin with internal cache (see
+// fn env_var(name) body). Measured cost: negligible vs existing @track /
+// @deprecated branches in the same prelude.
+//
+// Smoke plan (once applied):
+//   FORCE=1 hexa scripts/rebuild_stage0.hexa
+//   HEXA_PROFILE=1 HEXA_PROFILE_OUT=/tmp/hp.jsonl hexa <some .hexa with fib(10)>
+//   cat /tmp/hp.jsonl | head  # expect {"fn":"fib","calls":177}
+//
+// Open questions for next session:
+//   - Should we share the 64-bucket cache with fn_cache? Same keyspace but
+//     different payload. Separate keeps invariants clean; share saves 64*8B.
+//   - Dump on Ctrl-C — interpreter does not catch SIGINT today. Accept as
+//     limitation; flush to file on each tick is too slow.
+//   - Rewrite profile_counts[_pi] = x + 1 works in the interpreter but must
+//     survive codegen_c2 lowering. Verify before shipping.
+//
+// Owner: S-1c. Do not apply without HEXA_PROFILE quiesce window + rebuild.
