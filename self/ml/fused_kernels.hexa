@@ -1,0 +1,166 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/fused_kernels.hexa — Fused SwiGLU + RMSNorm kernels
+//
+//  Pure-hexa fused kernels for 7B training pipeline. Each function
+//  merges multiple elementwise ops into a single pass, cutting
+//  memory traffic by 2-3x vs the unfused versions in
+//  train_7b_integrated.hexa.
+//
+//  All buffers are raw *Void (f32 layout, byte-addressed via
+//  deref_f32 / write_f32). Dimensions:
+//      n   — total element count (rows * cols for 2-D)
+//      dim — inner dimension (hidden size D)
+//
+//  @hot on every inner loop signals the JIT / native codegen
+//  to unroll + vectorize these paths.
+// ═══════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────────
+//  1. fused_swiglu_fwd — gate * silu(up) in one pass
+//     silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+//     out[i] = gate[i] * silu(up[i])
+// ─────────────────────────────────────────────────────────────────
+@pure @hot
+pub fn fused_swiglu_fwd(gate_buf, up_buf, out_buf, n) {
+    for i in 0..n {
+        let g = deref_f32(gate_buf, i * 4)
+        let u = deref_f32(up_buf, i * 4)
+        let sig_u = 1.0 / (1.0 + exp(0.0 - u))
+        let silu_u = u * sig_u
+        write_f32(out_buf, i * 4, g * silu_u)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  2. fused_swiglu_bwd — backward through SwiGLU in one pass
+//     Given d_out, gate, up:
+//       silu(u) = u * sig(u)
+//       d_gate[i] = d_out[i] * silu(up[i])
+//       d_up[i]   = d_out[i] * gate[i] * silu'(up[i])
+//     where silu'(x) = sig(x) * (1 + x * (1 - sig(x)))
+// ─────────────────────────────────────────────────────────────────
+@pure @hot
+pub fn fused_swiglu_bwd(d_out, gate_buf, up_buf, d_gate, d_up, n) {
+    for i in 0..n {
+        let da = deref_f32(d_out, i * 4)
+        let g = deref_f32(gate_buf, i * 4)
+        let u = deref_f32(up_buf, i * 4)
+        let sig_u = 1.0 / (1.0 + exp(0.0 - u))
+        let silu_u = u * sig_u
+        // d_gate = d_out * silu(up)
+        write_f32(d_gate, i * 4, da * silu_u)
+        // d_up = d_out * gate * silu'(up)
+        let dsilu = sig_u * (1.0 + u * (1.0 - sig_u))
+        write_f32(d_up, i * 4, da * g * dsilu)
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  3. fused_rmsnorm_fwd — RMSNorm + scale in one pass
+//     For each row i (n rows, dim cols):
+//       rstd[i] = 1 / sqrt(mean(x[i,:]^2) + eps)
+//       out[i,j] = x[i,j] * rstd[i] * gamma[j]
+// ─────────────────────────────────────────────────────────────────
+@pure @hot
+pub fn fused_rmsnorm_fwd(x, gamma, out, rstd, n, dim, eps) {
+    for i in 0..n {
+        let base = i * dim
+        // Pass 1: sum of squares
+        let mut sum_sq = 0.0
+        @hot
+        for j in 0..dim {
+            let v = deref_f32(x, (base + j) * 4)
+            sum_sq = sum_sq + v * v
+        }
+        let inv_rms = 1.0 / sqrt(sum_sq / (dim * 1.0) + eps)
+        write_f32(rstd, i * 4, inv_rms)
+        // Pass 2: normalize + scale
+        @hot
+        for j in 0..dim {
+            let v = deref_f32(x, (base + j) * 4)
+            let g = deref_f32(gamma, j * 4)
+            write_f32(out, (base + j) * 4, v * inv_rms * g)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  4. fused_rmsnorm_bwd — backward through RMSNorm
+//     d_x[i,j] = (d_out[i,j]*gamma[j] - x[i,j] * dot * rstd^2 / D) * rstd
+//     d_gamma[j] += d_out[i,j] * x[i,j] * rstd[i]
+//     where dot = sum_k(d_out[i,k] * gamma[k] * x[i,k])
+// ─────────────────────────────────────────────────────────────────
+@hot
+pub fn fused_rmsnorm_bwd(d_out, x, gamma, rstd, d_x, d_gamma, n, dim) {
+    for i in 0..n {
+        let base = i * dim
+        let rs = deref_f32(rstd, i * 4)
+        // Pass 1: dot product for the correction term
+        let mut dot = 0.0
+        @hot
+        for j in 0..dim {
+            let dy = deref_f32(d_out, (base + j) * 4)
+            let g = deref_f32(gamma, j * 4)
+            let xv = deref_f32(x, (base + j) * 4)
+            dot = dot + dy * g * xv
+        }
+        let coeff = dot * rs * rs / (dim * 1.0)
+        // Pass 2: compute d_x and accumulate d_gamma
+        @hot
+        for j in 0..dim {
+            let dy = deref_f32(d_out, (base + j) * 4)
+            let g = deref_f32(gamma, j * 4)
+            let xv = deref_f32(x, (base + j) * 4)
+            write_f32(d_x, (base + j) * 4, (dy * g - xv * coeff) * rs)
+            let dg = deref_f32(d_gamma, j * 4)
+            write_f32(d_gamma, j * 4, dg + dy * xv * rs)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  5. fused_residual_rmsnorm — residual add + RMSNorm in one pass
+//     Fuses the common pattern:
+//       x[i,j] += residual[i,j]          (in-place residual add)
+//       out[i,j] = x[i,j] * rstd * gamma[j]  (RMSNorm)
+//     Saves one full read+write pass over the hidden state.
+// ─────────────────────────────────────────────────────────────────
+@hot
+pub fn fused_residual_rmsnorm(x, residual, gamma, out, rstd, n, dim, eps) {
+    for i in 0..n {
+        let base = i * dim
+        // Pass 1: add residual in-place + accumulate sum_sq
+        let mut sum_sq = 0.0
+        @hot
+        for j in 0..dim {
+            let off = (base + j) * 4
+            let v = deref_f32(x, off) + deref_f32(residual, off)
+            write_f32(x, off, v)
+            sum_sq = sum_sq + v * v
+        }
+        let inv_rms = 1.0 / sqrt(sum_sq / (dim * 1.0) + eps)
+        write_f32(rstd, i * 4, inv_rms)
+        // Pass 2: normalize + scale
+        @hot
+        for j in 0..dim {
+            let off = (base + j) * 4
+            let v = deref_f32(x, off)
+            let g = deref_f32(gamma, j * 4)
+            write_f32(out, off, v * inv_rms * g)
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+//  6. fused_residual_rmsnorm_bwd — backward for residual + RMSNorm
+//     d_residual[i,j] = d_x[i,j]  (identity grad through addition)
+//     d_x through RMSNorm as in fused_rmsnorm_bwd
+//     d_gamma accumulates as usual
+// ─────────────────────────────────────────────────────────────────
+@hot
+pub fn fused_residual_rmsnorm_bwd(d_out, x, gamma, rstd, d_x, d_gamma, n, dim) {
+    // x here is the post-residual value (already added).
+    // d_x receives the gradient w.r.t. both x_orig and residual
+    // (caller splits by assigning d_residual = d_x, d_x_orig = d_x).
+    fused_rmsnorm_bwd(d_out, x, gamma, rstd, d_x, d_gamma, n, dim)
+}
