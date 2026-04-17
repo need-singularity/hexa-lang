@@ -1,0 +1,300 @@
+// ═══════════════════════════════════════════════════════════════
+//  cross_compile_linux.hexa — cross-compile a .hexa file to
+//  x86_64-linux-gnu ELF binary from macOS (or native on Linux).
+//
+//  Pipeline: flatten -> transpile C -> clang --target=x86_64-linux-gnu -> ELF
+//
+//  Usage:
+//    hexa scripts/cross_compile_linux.hexa <source.hexa>
+//    hexa scripts/cross_compile_linux.hexa <source.hexa> -o build/my_bin
+//    hexa scripts/cross_compile_linux.hexa <source.hexa> --deploy root@h100:/opt/hexa/bin/
+//
+//  Env: CLANG, LINUX_SYSROOT, CFLAGS_EXTRA, FORCE=1
+//
+//  macOS cross-link needs a Linux sysroot (clang compiles but can't link).
+//  Setup: docker create --name lsys ubuntu:22.04 && docker cp lsys:/usr/include
+//    /opt/linux-sysroot/usr/include && docker cp lsys:/usr/lib/x86_64-linux-gnu
+//    /opt/linux-sysroot/usr/lib/x86_64-linux-gnu && docker rm lsys
+//  Or: CLANG="zig cc" (has built-in Linux sysroot)
+//  Without sysroot: falls back to .o compile + remote link via --deploy.
+// ═══════════════════════════════════════════════════════════════
+
+fn run(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        if result[0] != "" {
+            eprintln(result[0])
+        }
+        exit(1)
+    }
+    result[0]
+}
+
+fn usage() {
+    println("Usage: hexa scripts/cross_compile_linux.hexa <source.hexa> [options]")
+    println("")
+    println("Options:")
+    println("  -o <output>                  output binary path (default: build/<name>-linux-x86_64)")
+    println("  --deploy <user@host:/path>   scp the binary to remote after build")
+    println("  --compile-only               emit .o only (no link — no sysroot needed)")
+    println("")
+    println("Environment:")
+    println("  LINUX_SYSROOT=/opt/linux-sysroot   Linux sysroot for cross-link")
+    println("  CLANG=clang-18                     override clang binary")
+    println("  CFLAGS_EXTRA=...                   extra C flags")
+    println("  FORCE=1                            skip cache")
+    exit(1)
+}
+
+fn main() {
+    let args = argv()
+    if len(args) < 2 {
+        usage()
+    }
+
+    let hexa_dir = exec("cd \"$(dirname '" + args[1] + "')/../\" && pwd").trim()
+    let uname = exec("uname -s").trim()
+
+    // ── Parse args ────────────────────────────────────────────
+    let mut source = ""
+    let mut out_path = ""
+    let mut deploy_target = ""
+    let mut compile_only = false
+
+    let mut ai = 2
+    while ai < len(args) {
+        let a = args[ai]
+        if a == "-o" && (ai + 1) < len(args) {
+            ai = ai + 1
+            out_path = args[ai]
+        } else if a == "--deploy" && (ai + 1) < len(args) {
+            ai = ai + 1
+            deploy_target = args[ai]
+        } else if a == "--compile-only" {
+            compile_only = true
+        } else if a == "--help" || a == "-h" {
+            usage()
+        } else if source == "" {
+            source = a
+        } else {
+            eprintln("unknown argument: " + a)
+            usage()
+        }
+        ai = ai + 1
+    }
+
+    if source == "" {
+        eprintln("error: no source .hexa file specified")
+        usage()
+    }
+    if !file_exists(source) {
+        eprintln("error: source file not found: " + source)
+        exit(1)
+    }
+
+    // Derive output name from source basename
+    let base_name = exec("basename '" + source + "' .hexa").trim()
+    if out_path == "" {
+        out_path = hexa_dir + "/build/" + base_name + "-linux-x86_64"
+    }
+
+    let clang = if env("CLANG") != "" { env("CLANG") } else { "clang" }
+    let sysroot = env("LINUX_SYSROOT")
+    let cflags_extra = env("CFLAGS_EXTRA")
+
+    println("═══ hexa cross-compile (x86_64-linux-gnu) ═══")
+    println("  source : " + source)
+    println("  output : " + out_path)
+    println("  clang  : " + clang)
+    if sysroot != "" {
+        println("  sysroot: " + sysroot)
+    }
+
+    // ── 1. Flatten imports ────────────────────────────────────
+    println("[1/4] Flattening imports...")
+    let flat_out = "/tmp/hexa_cross_flat_" + base_name + ".hexa"
+    let flatten_script = hexa_dir + "/scripts/flatten_imports.hexa"
+
+    // Find a runner for flatten_imports
+    let mut flatten_runner = ""
+    let stage0 = hexa_dir + "/build/hexa_stage0"
+    let s0_check = exec_with_status("test -x " + stage0)
+    if s0_check[1] == 0 {
+        flatten_runner = stage0
+    } else {
+        let hexa_check = exec_with_status("test -x " + hexa_dir + "/hexa")
+        if hexa_check[1] == 0 {
+            flatten_runner = hexa_dir + "/hexa"
+        }
+    }
+
+    if flatten_runner == "" {
+        eprintln("error: no hexa runner found (need build/hexa_stage0 or ./hexa)")
+        exit(1)
+    }
+
+    let flatten_result = exec_with_status(flatten_runner + " " + flatten_script + " " + source + " " + flat_out)
+    if flatten_result[1] != 0 {
+        eprintln("error: flatten_imports failed")
+        exit(1)
+    }
+    if !file_exists(flat_out) {
+        eprintln("error: flatten output missing: " + flat_out)
+        exit(1)
+    }
+    println("[OK] flattened -> " + flat_out)
+
+    // ── 2. Transpile to C ─────────────────────────────────────
+    println("[2/4] Transpiling to C...")
+    let src_c = "/tmp/hexa_cross_" + base_name + ".c"
+
+    // Find hexa_v2 transpiler
+    let mut hexa_v2 = hexa_dir + "/self/native/hexa_v2"
+    let dedup = hexa_dir + "/build/hexa_v2_dedup4"
+    let dedup_check = exec_with_status("test -x " + dedup)
+    if dedup_check[1] == 0 {
+        hexa_v2 = dedup
+    }
+    let v2_check = exec_with_status("test -x " + hexa_v2)
+    if v2_check[1] != 0 {
+        eprintln("error: hexa_v2 transpiler not found: " + hexa_v2)
+        eprintln("  build it: clang -O2 -std=c11 self/native/hexa_cc.c -o self/native/hexa_v2 -lm")
+        exit(1)
+    }
+
+    let transpile_result = exec_with_status(hexa_v2 + " " + flat_out + " " + src_c)
+    if transpile_result[1] != 0 {
+        eprintln("error: transpile failed")
+        if transpile_result[0] != "" {
+            eprintln(transpile_result[0])
+        }
+        exit(1)
+    }
+    if !file_exists(src_c) {
+        eprintln("error: transpiled C missing: " + src_c)
+        exit(1)
+    }
+
+    // Copy runtime.c sibling next to generated .c
+    let runtime_c = hexa_dir + "/self/runtime.c"
+    let src_c_dir = exec("dirname '" + src_c + "'").trim()
+    exec("cp -f " + runtime_c + " " + src_c_dir + "/runtime.c")
+    println("[OK] transpiled -> " + src_c)
+
+    // ── 3. Cross-compile ──────────────────────────────────────
+    println("[3/4] Cross-compiling to x86_64-linux-gnu...")
+
+    let mut target_flag = ""
+    let mut sysroot_flag = ""
+    let mut link_flags = "-lm -ldl"
+    let cflags = "-O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs -I " + hexa_dir + "/self"
+
+    // On Linux x86_64 we can compile natively — no cross flags needed
+    if uname == "Linux" {
+        println("  (native Linux build — no cross-compilation needed)")
+    } else {
+        target_flag = "--target=x86_64-linux-gnu"
+        if sysroot != "" {
+            sysroot_flag = "--sysroot=" + sysroot
+        }
+    }
+
+    exec("mkdir -p " + exec("dirname '" + out_path + "'").trim())
+
+    // Try full link first; fall back to compile-only if no sysroot
+    if compile_only {
+        let obj_path = out_path + ".o"
+        let cmd = clang + " " + target_flag + " " + sysroot_flag + " " + cflags + " " + cflags_extra + " -c " + src_c + " -o " + obj_path
+        println("  " + cmd)
+        run(cmd)
+        println("[OK] object -> " + obj_path)
+        println("")
+        println("Link on target Linux machine:")
+        println("  gcc -O2 " + obj_path + " -o " + base_name + " -lm -ldl")
+        exit(0)
+    }
+
+    if uname != "Linux" && sysroot == "" {
+        // Try linking anyway — might work with zig cc or custom clang
+        let try_cmd = clang + " " + target_flag + " " + cflags + " " + cflags_extra + " " + src_c + " -o " + out_path + " " + link_flags + " 2>/tmp/hexa_cross_link.log"
+        let try_result = exec_with_status(try_cmd)
+        if try_result[1] != 0 {
+            // Link failed — fall back to compile-only + remote link
+            println("[WARN] cross-link failed (no Linux sysroot). Falling back to compile + remote link.")
+            let obj_path = out_path + ".o"
+            let obj_cmd = clang + " " + target_flag + " " + cflags + " " + cflags_extra + " -c " + src_c + " -o " + obj_path
+            run(obj_cmd)
+            println("[OK] object -> " + obj_path)
+
+            if deploy_target != "" {
+                // Upload .o + runtime.c and link on remote
+                println("")
+                println("[3b] Remote link via SSH...")
+                let remote_parts = deploy_target.split(":")
+                let remote_host = remote_parts[0]
+                let remote_dir = if len(remote_parts) > 1 { remote_parts[1] } else { "/tmp" }
+
+                exec("ssh " + remote_host + " 'mkdir -p " + remote_dir + "'")
+                run("scp " + obj_path + " " + runtime_c + " " + remote_host + ":" + remote_dir + "/")
+                let remote_obj = remote_dir + "/" + exec("basename " + obj_path).trim()
+                let remote_bin = remote_dir + "/" + base_name
+                let link_cmd = "ssh " + remote_host + " 'gcc -O2 " + remote_obj + " -o " + remote_bin + " -lm -ldl'"
+                run(link_cmd)
+                println("[OK] remote binary -> " + remote_host + ":" + remote_bin)
+                // Clean up remote .o
+                exec("ssh " + remote_host + " 'rm -f " + remote_obj + " " + remote_dir + "/runtime.c'")
+                exit(0)
+            }
+
+            println("")
+            println("To get a full ELF binary, either:")
+            println("  1. Set LINUX_SYSROOT:  LINUX_SYSROOT=/opt/linux-sysroot hexa scripts/cross_compile_linux.hexa " + source)
+            println("  2. Use zig cc:         CLANG='zig cc' hexa scripts/cross_compile_linux.hexa " + source)
+            println("  3. Use --deploy:       hexa scripts/cross_compile_linux.hexa " + source + " --deploy user@host:/path")
+            println("  4. Link on target:     scp " + obj_path + " target: && ssh target 'gcc -O2 " + exec("basename " + obj_path).trim() + " -o " + base_name + " -lm -ldl'")
+            println("")
+            println("Sysroot setup (Docker method):")
+            println("  docker create --name lsys ubuntu:22.04")
+            println("  docker cp lsys:/usr/include /opt/linux-sysroot/usr/include")
+            println("  docker cp lsys:/usr/lib/x86_64-linux-gnu /opt/linux-sysroot/usr/lib/x86_64-linux-gnu")
+            println("  docker rm lsys")
+            exit(0)
+        }
+    } else {
+        // Native Linux or sysroot available — full link
+        let cmd = clang + " " + target_flag + " " + sysroot_flag + " " + cflags + " " + cflags_extra + " " + src_c + " -o " + out_path + " " + link_flags
+        println("  " + cmd)
+        run(cmd)
+    }
+
+    // Verify ELF
+    let file_result = exec("file " + out_path + " 2>/dev/null").trim()
+    println("  " + file_result)
+    if !file_result.contains("x86") && !file_result.contains("X86") && !file_result.contains("ELF") {
+        println("[WARN] output may not be a valid x86_64 ELF binary")
+    }
+    let size = exec("wc -c < '" + out_path + "' | tr -d ' '").trim()
+    println("[OK] built: " + out_path + " (" + size + " bytes)")
+
+    // ── 4. Deploy (optional) ──────────────────────────────────
+    if deploy_target != "" {
+        println("[4/4] Deploying to " + deploy_target + "...")
+        let remote_parts = deploy_target.split(":")
+        let remote_host = remote_parts[0]
+        let remote_dir = if len(remote_parts) > 1 { remote_parts[1] } else { "/tmp" }
+
+        exec("ssh " + remote_host + " 'mkdir -p " + remote_dir + "'")
+        run("scp " + out_path + " " + remote_host + ":" + remote_dir + "/")
+        let remote_bin = remote_dir + "/" + exec("basename " + out_path).trim()
+        exec("ssh " + remote_host + " 'chmod +x " + remote_bin + "'")
+        println("[OK] deployed -> " + remote_host + ":" + remote_bin)
+    } else {
+        println("[4/4] No --deploy flag, skipping upload.")
+    }
+
+    println("")
+    println("═══ Cross-compile complete ═══")
+}
+
+main()
