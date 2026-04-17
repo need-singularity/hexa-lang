@@ -391,8 +391,8 @@ hexa build --target wgsl  consciousness.hexa              # Generate WGSL shader
 HEXA can compile itself:
 
 ```
-self/lexer.hexa          727 LOC   Tokenizer
-self/parser.hexa        3815 LOC   Recursive descent parser
+self/lexer.hexa          753 LOC   Tokenizer
+self/parser.hexa        4007 LOC   Recursive descent parser
 self/type_checker.hexa  1656 LOC   Static type checker
 self/compiler.hexa       858 LOC   Bytecode compiler
 self/bootstrap.hexa     1945 LOC   Full pipeline (lex->parse->check->compile)
@@ -452,9 +452,9 @@ Live bridge: `./hexa --anima-bridge ws://localhost:8765 file.hexa` routes `inten
 ```
 hexa-lang/
 ├── self/                     1,113 .hexa files (primary source)
-│   ├── lexer.hexa            727 LOC — 65 keywords + 46 operators tokenizer
-│   ├── parser.hexa           3,815 LOC — recursive descent parser
-│   ├── interpreter.hexa      10,914 LOC — tree-walk evaluator (270+ builtins)
+│   ├── lexer.hexa            753 LOC — 65 keywords + 46 operators tokenizer
+│   ├── parser.hexa           4,007 LOC — recursive descent parser
+│   ├── interpreter.hexa      7 LOC — flatten stub (logic merged into codegen_c2/hexa_full)
 │   ├── ast.hexa              AST node types
 │   ├── type_checker.hexa     Static type checker + Law types
 │   ├── env.hexa              Scoped environment + builtins
