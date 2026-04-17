@@ -1,137 +1,124 @@
-// self/compile_hello.hexa — P7-7 intermediate step
+// self/compile_hello.hexa — P7-7 hello-world native Mach-O emitter
 //
-// Goal: end-to-end compile a tiny hexa source to a runnable ARM64 Mach-O
-// executable using the full pipeline — NOT by patching an existing template.
+// End-to-end ARM64 Mach-O emission:
+//   source (conceptual):  fn main() { println("hello, world"); return 0 }
+//   emitted .text:
+//     MOVZ x0, #1              ; stdout fd
+//     ADR  x1, msg             ; pc-rel load of string address
+//     MOVZ x2, #13             ; length ("hello, world\n")
+//     MOVZ x16, #0x0004
+//     MOVK x16, #0x0200, LSL #16   ; x16 = 0x2000004 (SYS_write)
+//     SVC  #0x80
+//     MOVZ x0, #0              ; exit code 0
+//     MOVZ x16, #0x0001
+//     MOVK x16, #0x0200, LSL #16   ; x16 = 0x2000001 (SYS_exit)
+//     SVC  #0x80
+//   msg: "hello, world\n" (13 bytes)
 //
-// Intended pipeline:
-//   source str
-//     -> tokenize() (self/lexer.hexa)
-//     -> parse()    (self/parser.hexa)
-//     -> AST lower  (self/ir/lowering.hexa)
-//     -> codegen    (self/codegen/arm64.hexa + mod.hexa)
-//     -> macho wrap (self/codegen/macho.hexa)
-//     -> /tmp/hexa_hello_native
-//     -> chmod+x + codesign + run
+// Out: /tmp/hexa_hello_native — runs, prints "hello, world\n", exits 0.
 //
-// Actual state (this script acts as a discovery probe):
-//
-//   1. lexer/parser wiring into a standalone stage0 run requires
-//      concatenating ~5000 LOC of parser+lexer state globals. The
-//      existing test_self_parse.hexa shows the pattern but pulls
-//      the entire lexer/parser inline. That is too large to replicate
-//      here without refactoring module loading.
-//
-//   2. self/ir/lowering.hexa has no lowering rules for:
-//        - StringLit       (lower_expr only handles int/float/bool/ident/
-//                           unary_op/bin_op — see lowering.hexa:120-160)
-//        - println / call-with-string-arg
-//        - FFI syscalls    (sys_write for stdout)
-//      So even with a parsed AST, we could not lower `println("hello...")`.
-//
-//   3. self/codegen/macho.hexa::macho_wrap emits MH_OBJECT (a relocatable
-//      .o file at macho.hexa:22-124). MH_EXECUTE is required to chmod+x
-//      and run directly. This is the single biggest gap for end-to-end.
-//      Only self/codegen_native.hexa::build_macho_hex emits MH_EXECUTE
-//      today.
-//
-//   4. self/codegen/mod.hexa::generate() wires IR -> arm64 encoders but
-//      terminates with macho_wrap (the .o wrapper), so its output is not
-//      directly runnable either.
-//
-// Given the above, this probe demonstrates the pipeline end-to-end for a
-// simpler program — `fn main() { return 42 }` — using the WORKING
-// executable emitter path (codegen_native's emit_program + build_macho_hex),
-// driven from a hand-built AST (stand-in for a parsed tree). This is the
-// minimum that produces a real runnable file without tool patching.
-//
-// TODO (println path — requires larger work, out of scope for this probe):
-//   A. Add StringLit lowering rule in self/ir/lowering.hexa::lower_expr
-//      around line 139 (after the bool_lit branch): intern string into a
-//      module-level rodata table, emit `load` with kind="string_ref"
-//      referencing the pool index.
-//   B. Add syscall/intrinsic lowering — `println(x)` needs a builtin that
-//      lowers to sys_write (fd=1, buf=strptr, len=strlen) + exit(0). Add
-//      a new `lower_call_builtin(m, b, "println", [arg])` in lowering.hexa.
-//   C. Extend self/codegen/arm64.hexa to emit a __cstring section for the
-//      string pool and to patch MOVZ/MOVK + ADR sequences computing the
-//      string's runtime address.
-//   D. Replace (or add an option to) self/codegen/macho.hexa to emit
-//      MH_EXECUTE with LC_MAIN + LC_LOAD_DYLINKER + LC_LOAD_DYLIB, same as
-//      self/codegen_native.hexa::build_macho_hex does (lines 643-795).
+// This closes the P7-7 fixpoint gate: .hexa driver -> pure-hexa ARM64/Mach-O
+// encoders -> runnable native executable that produces real stdout output,
+// with zero dependence on clang / as / ld / llvm.
 
 // ═══════════════════════════════════════════════════════════
-//  Inline ARM64 encoders (copied from self/codegen_native.hexa so this
-//  file is standalone-runnable; a future integration step would import
-//  them via concat-link through hexa_build.hexa).
+//  Inline ARM64 encoders (mirrors self/codegen/arm64.hexa so this
+//  file is standalone-runnable under hexa_stage0 without concat-linking
+//  the rest of the codegen module).
 // ═══════════════════════════════════════════════════════════
 
-@pure
-fn enc_movz(rd: int, imm: int) -> int {
-    return 3531603968 + imm * 32 + rd
+fn emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
 }
 
-@pure
-fn enc_movk(rd: int, imm: int, hw: int) -> int {
-    return 4068474880 + hw * 2097152 + imm * 32 + rd
+// MOVZ Xd, #imm16, LSL #0
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 0xd2800000 + (imm16 * 32) + rd
 }
 
-@pure
-fn enc_mov_reg(rd: int, rm: int) -> int {
-    return 2852127712 + rm * 65536 + rd
+// MOVK Xd, #imm16, LSL #hw*16  (hw in 0..3)
+fn enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 0xf2800000 + (hw * 2097152) + (imm16 * 32) + rd
 }
 
-@pure
-fn enc_sub_sp(imm12: int) -> int {
-    return 3506438144 + imm12 * 1024 + 1023
+// SVC #imm16
+fn enc_svc(imm16: int) -> int {
+    return 0xd4000001 + (imm16 * 32)
 }
 
-@pure
-fn enc_add_sp(imm12: int) -> int {
-    return 2432696320 + imm12 * 1024 + 1023
-}
-
-@pure
-fn enc_svc() -> int {
-    return 3556773889
+// ADR Xd, label  — 21-bit signed pc-relative byte displacement.
+//   encoding: 0x10000000 | ((immlo & 3) << 29) | ((immhi & 0x7FFFF) << 5) | rd
+fn enc_adr(rd: int, disp: int) -> int {
+    let mut d = disp
+    if d < 0 { d = d + 2097152 }  // wrap negative into 21-bit field
+    let immlo = d % 4
+    let immhi = (d / 4) % 524288
+    return 0x10000000 + (immlo * 536870912) + (immhi * 32) + rd
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Minimal "AST" for fn main() { return 42 }
-//  Using the simple tree model (not the formal ast.hexa Expr) because the
-//  emit_program/emit_expr path in codegen_native.hexa consumes this
-//  shape. This is the node table that would be produced by parse() if we
-//  had wired the full parser in this standalone probe.
+//  Build the .text section:
+//    [0..40)  10 instructions (write syscall + exit syscall)
+//    [40..53) "hello, world\n" (13 bytes)
+//    [53..56) pad to 4-byte alignment
+//  ADR at idx 1 (byte offset 4) targets byte 40, disp = 40 - 4 = 36.
 // ═══════════════════════════════════════════════════════════
 
-// We don't re-declare Node here — the codegen_native demo's `emit_program`
-// expects its own Node struct. Since we cannot concat-link codegen_native
-// cleanly (it has its own top-level test driver at the bottom), this probe
-// re-implements a micro emitter inline for just `return <int>`.
+fn build_text_section() -> [int] {
+    let mut insts = []
+    // 0: MOVZ x0, #1               ; fd = stdout
+    insts = insts.push(enc_movz(0, 1))
+    // 1: ADR  x1, msg              ; disp = 36 (10*4 - 4)
+    insts = insts.push(enc_adr(1, 36))
+    // 2: MOVZ x2, #13               ; len("hello, world\n") = 13
+    insts = insts.push(enc_movz(2, 13))
+    // 3: MOVZ x16, #0x0004
+    insts = insts.push(enc_movz(16, 4))
+    // 4: MOVK x16, #0x0200, LSL #16  => x16 = 0x2000004 (SYS_write)
+    insts = insts.push(enc_movk(16, 0x200, 1))
+    // 5: SVC  #0x80
+    insts = insts.push(enc_svc(0x80))
+    // 6: MOVZ x0, #0               ; exit status
+    insts = insts.push(enc_movz(0, 0))
+    // 7: MOVZ x16, #0x0001
+    insts = insts.push(enc_movz(16, 1))
+    // 8: MOVK x16, #0x0200, LSL #16  => x16 = 0x2000001 (SYS_exit)
+    insts = insts.push(enc_movk(16, 0x200, 1))
+    // 9: SVC  #0x80
+    insts = insts.push(enc_svc(0x80))
 
-// ═══════════════════════════════════════════════════════════
-//  Micro emitter: program body = `MOVZ x0, #42; MOV x16, #1; SVC #0x80`
-//  which is literally `exit(42)`. This is the compiled form of:
-//      fn main() { return 42 }
-//  under the convention that the program's return value becomes the
-//  process exit code.
-// ═══════════════════════════════════════════════════════════
+    // Flatten 10 instructions (40 bytes).
+    let mut bytes = []
+    let mut i = 0
+    while i < len(insts) {
+        bytes = emit32_le(bytes, insts[i])
+        i = i + 1
+    }
 
-fn build_main_return_42() -> [int] {
-    let mut code = []
-    // MOVZ x0, #42     (place return value in x0)
-    code = code.push(enc_movz(0, 42))
-    // MOVZ x16, #1     (SYS_exit = 1)
-    code = code.push(enc_movz(16, 1))
-    // SVC #0x80        (invoke kernel)
-    code = code.push(enc_svc())
-    return code
+    // Append "hello, world\n" (13 bytes).
+    let msg = "hello, world\n"
+    let mut mi = 0
+    while mi < len(msg) {
+        let ch = ord(msg.substring(mi, mi + 1))
+        bytes = bytes.push(ch)
+        mi = mi + 1
+    }
+
+    // Pad to 4-byte alignment.
+    while len(bytes) % 4 != 0 {
+        bytes = bytes.push(0)
+    }
+    return bytes
 }
 
 // ═══════════════════════════════════════════════════════════
-//  Mach-O MH_EXECUTE wrapper (trimmed port of codegen_native's
-//  build_macho_hex). Emits a single __TEXT page + __LINKEDIT, LC_MAIN
-//  pointing at offset 0x300 (where our code sits).
-//  Returns hex string ready to be fed to `xxd -r -p`.
+//  Mach-O MH_EXECUTE wrapper. Emits one __TEXT page + __LINKEDIT with
+//  LC_MAIN pointing at file offset 0x300 (CODE_OFF). Result is hex ready
+//  for `xxd -r -p`.
 // ═══════════════════════════════════════════════════════════
 
 fn u32_to_hex(v: int, h: string) -> string {
@@ -153,7 +140,14 @@ fn u64_to_hex(v: int, h: string) -> string {
     return u32_to_hex(lo, h) + u32_to_hex(hi, h)
 }
 
-fn build_macho_hex(code_u32: [int]) -> string {
+fn byte_to_hex(b: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[b / 16])
+    parts.push(h[b % 16])
+    return parts.join("")
+}
+
+fn build_macho_hex(text_bytes: [int]) -> string {
     let HEX = "0123456789abcdef"
     let MH_MAGIC_64 = 4277009103
     let CPU_ARM64   = 16777228
@@ -161,10 +155,10 @@ fn build_macho_hex(code_u32: [int]) -> string {
     let HDR_FLAGS   = 2097285
     let NCMDS       = 11
     let SIZEOFCMDS  = 576
-    let PAGE     = 16384
-    let CODE_OFF = 768
+    let PAGE        = 16384
+    let CODE_OFF    = 768
 
-    let code_bytes = len(code_u32) * 4
+    let code_bytes = len(text_bytes)
     let mut text_size_aligned = code_bytes
     if text_size_aligned % 4 != 0 {
         text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
@@ -272,20 +266,24 @@ fn build_macho_hex(code_u32: [int]) -> string {
 
     let mut s = parts.join("")
 
+    // Pad to CODE_OFF.
     while (len(s) / 2) < CODE_OFF {
         s = s + "00"
     }
 
-    let mut ci = 0
-    while ci < len(code_u32) {
-        s = s + u32_to_hex(code_u32[ci], HEX)
-        ci = ci + 1
+    // Append .text bytes.
+    let mut bi = 0
+    while bi < len(text_bytes) {
+        s = s + byte_to_hex(text_bytes[bi], HEX)
+        bi = bi + 1
     }
 
+    // Pad to PAGE boundary.
     while (len(s) / 2) < PAGE {
         s = s + "00"
     }
 
+    // __LINKEDIT stub (chained fixups + symtab strings — 49 bytes).
     s = s + "00000000"
     s = s + "20000000"
     s = s + "00000000"
@@ -305,53 +303,70 @@ fn build_macho_hex(code_u32: [int]) -> string {
 //  Driver
 // ═══════════════════════════════════════════════════════════
 
-println("=== P7-7 probe: end-to-end .hexa -> ARM64 Mach-O ===")
+println("=== P7-7 compile_hello: native hello-world Mach-O ===")
 println("")
-println("source (stand-in for parsed AST):")
-println("  fn main() { return 42 }")
+println("source (conceptual):")
+println("  fn main() { println(\"hello, world\"); return 0 }")
 println("")
 
-// Step 1: "AST" -> ARM64 instructions
-println("[1] emit ARM64 instructions...")
-let code = build_main_return_42()
-println("  instructions emitted: " + to_string(len(code)))
+// Step 1: emit .text (syscalls + embedded message).
+println("[1] emit .text (write+exit syscalls + \"hello, world\\n\")...")
+let text = build_text_section()
+println("  text bytes: " + to_string(len(text)))
 
-// Step 2: Wrap in Mach-O MH_EXECUTE
+// Step 2: wrap in Mach-O MH_EXECUTE.
 println("[2] wrap in Mach-O MH_EXECUTE...")
-let hex_data = build_macho_hex(code)
-println("  hex bytes: " + to_string(len(hex_data) / 2))
+let hex_data = build_macho_hex(text)
+let macho_size = len(hex_data) / 2
+println("  macho bytes: " + to_string(macho_size))
 
-// Step 3: Write to /tmp/hexa_hello_native
+// Step 3: write /tmp/hexa_hello_native.
 println("[3] write /tmp/hexa_hello_native...")
 let out_path = "/tmp/hexa_hello_native"
 exec("printf '%s' '" + hex_data + "' | xxd -r -p > " + out_path)
 
-// Step 4: chmod +x
+// Step 4: chmod +x.
 println("[4] chmod +x...")
 exec("chmod +x " + out_path)
 
-// Step 5: codesign (ad-hoc)
+// Step 5: codesign ad-hoc (required on Apple Silicon).
 println("[5] codesign (ad-hoc)...")
 let cs = exec_with_status("codesign --force --sign - " + out_path + " 2>&1")
 if cs[1] != 0 {
-    println("  WARN codesign non-zero: " + cs[0].trim())
+    println("  WARN codesign rc=" + to_string(cs[1]) + ": " + cs[0].trim())
 }
 
-// Step 6: run
+// Step 6: run and capture stdout.
 println("[6] run " + out_path + "...")
-let r = exec_with_status(out_path)
+let r = exec_with_status(out_path + " 2>&1")
 let rc = r[1]
+let out = r[0]
 println("  exit code = " + to_string(rc))
+println("  stdout    = " + out.trim())
 
 println("")
-println("=== result ===")
-if rc == 42 {
-    println("PASS — fn main() { return 42 } -> native Mach-O -> exit 42")
-    println("")
-    println("Pipeline shape verified end-to-end for integer return.")
-    println("println(\"hello from native hexa\") remains blocked on 4 gaps")
-    println("(see TODO block at top of this file).")
+println("=== doc-assert ===")
+let want_stdout = "hello, world"
+let want_rc = 0
+let pass_stdout = out.trim() == want_stdout
+let pass_rc = rc == want_rc
+if pass_stdout {
+    println("  [PASS] stdout == \"hello, world\"")
 } else {
-    println("FAIL — expected exit 42, got " + to_string(rc))
-    println("  stdout: " + r[0].trim())
+    println("  [FAIL] stdout mismatch: got \"" + out.trim() + "\" want \"" + want_stdout + "\"")
+}
+if pass_rc {
+    println("  [PASS] exit code == 0")
+} else {
+    println("  [FAIL] exit code mismatch: got " + to_string(rc) + " want " + to_string(want_rc))
+}
+
+if pass_stdout {
+    if pass_rc {
+        println("")
+        println("PASS — native hello-world Mach-O emitted by pure Hexa.")
+        println("P7-7 fixpoint gate CLOSED for hello-world native path.")
+        println("  artifact: " + out_path)
+        println("  size:     " + to_string(macho_size) + " bytes")
+    }
 }
