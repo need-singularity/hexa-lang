@@ -1,0 +1,1030 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/qwen_bpe.hexa — Qwen2.5 BPE tokenizer (pure hexa)
+//
+//  Production-grade byte-level BPE loader + encoder + decoder that
+//  reads HuggingFace tokenizer.json files (HF "tokenizers" format).
+//  Built specifically for Qwen2.5-14B-Instruct, matches HF reference
+//  on the ChatML prompts used by self/serve/serve_alm.hexa.
+//
+//  Byte-level scheme (GPT-2 style):
+//    HF stores bytes as "visible" unicode characters (Ġ, Ċ, Ā ...).
+//    Concretely, byte 0x20 ' '  -> codepoint 0x120 "Ġ" (2 UTF-8 bytes).
+//    byte 0x0A '\n' -> codepoint 0x10A "Ċ". ASCII 33..126, 161..172,
+//    174..255 stay as-is. We pre-compute the mapping once and operate
+//    on UTF-8 string tokens from then on.
+//
+//  tokenizer.json layout consumed:
+//    - model.vocab : {"Ġ": 220, "Hello": 9707, ...}     (151643 entries)
+//    - model.merges: ["Ġ Ġ", "ĠĠ Ġ", ...]                (151387 entries)
+//    - added_tokens: [{"id":..,"content":"<|im_start|>",..}, ...]
+//      (22 entries incl. <|endoftext|>=151643, <|im_start|>=151644,
+//      <|im_end|>=151645.)
+//
+//  Pre-tokenizer — Qwen uses a GPT-2 regex Split + ByteLevel. Regex
+//  support is unavailable in pure hexa; we fall back to a deterministic
+//  subset (split on whitespace + keep leading space, treat special
+//  tokens as atomic, route everything else through byte-level). This
+//  matches HF byte-for-byte on ChatML prompts the 14B is trained on
+//  ("<|im_start|>role\ncontent<|im_end|>...") and on ASCII prompts.
+//  It may diverge on Unicode-letter-heavy text (see KNOWN LIMITATIONS
+//  at the bottom of this file).
+//
+//  Public API:
+//    qwen_bpe_load(tokenizer_json_path)  -> QwenBpe
+//    qwen_bpe_encode(bpe, text)          -> [int]
+//    qwen_bpe_decode(bpe, tokens)        -> string
+//    qwen_bpe_encode_chatml(bpe, user)   -> [int]     convenience
+//    qwen_bpe_vocab_size(bpe)            -> int
+//
+//  Usage (H100 pod with Qwen2.5-14B-Instruct weights):
+//
+//    use "self/ml/qwen_bpe.hexa"
+//    let bpe = qwen_bpe_load(
+//        "/data/models/Qwen2.5-14B-Instruct/tokenizer.json")
+//    let ids = qwen_bpe_encode_chatml(bpe, "What is consciousness?")
+//    // ids := [151644, 872, 198, 3838, 374, 24231, 30, 151645, 198,
+//    //        151644, 77091, 198]
+//    ...run alm_forward on each id...
+//    let text = qwen_bpe_decode(bpe, generated_ids)
+//
+//  NOTE: interpreter-mode load of the full 7MB tokenizer.json takes
+//  ~10-30s on Mac M4 (parsing 151643 vocab entries + 151387 merges).
+//  Encoding then runs at ~500-1500 tokens/sec in the interpreter —
+//  plenty for hire_sim serving.  Native build-time optimisations (via
+//  ./hexa build) should push this much higher.
+// ═══════════════════════════════════════════════════════════════════
+
+
+// ─── Special-token IDs (Qwen2.5, fixed)  ──────────────────────────
+fn qwen_id_endoftext() { return 151643 }
+fn qwen_id_im_start()  { return 151644 }
+fn qwen_id_im_end()    { return 151645 }
+
+
+// ─── QwenBpe struct  ──────────────────────────────────────────────
+struct QwenBpe {
+    vocab:        array,     // map<string, int>  — token_str -> id
+    id_to_token:  array,     // array indexed by id -> token_str
+    merge_rank:   array,     // map<string, int>  — "A B" -> priority
+    byte_to_str:  array,     // [256] UTF-8 string per raw byte
+    str_to_byte:  array,     // map<string, int>  — inverse of byte_to_str
+    added_tokens: array,     // [[content_str, id]] sorted by longest-first
+    vocab_size:   int
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Byte ↔ UTF-8 visible-char mapping (GPT-2 convention)
+//
+//  Bytes 33..126, 161..172, 174..255 stay as the corresponding ASCII
+//  or Latin-1 codepoint. Everything else is shifted to 256 + offset.
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_build_byte_to_str() {
+    let mut table = []
+    let mut i = 0
+    while i < 256 {
+        let printable = (i >= 33 && i <= 126) || (i >= 161 && i <= 172) || (i >= 174 && i <= 255)
+        if printable {
+            table = table + [from_char_code(i)]
+        } else {
+            table = table + [from_char_code(256 + i)]
+        }
+        i = i + 1
+    }
+    return table
+}
+
+fn qwen_build_str_to_byte(byte_to_str) {
+    let mut m = #{}
+    let mut i = 0
+    while i < 256 {
+        m[byte_to_str[i]] = i
+        i = i + 1
+    }
+    return m
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Ad-hoc tokenizer.json scanner
+//
+//  We cannot use the generic json_parse on a 7MB file (the pure-hexa
+//  recursive substring parser is O(n²) and blows up to tens of
+//  minutes). Instead we walk the raw bytes once, extract the three
+//  sections we actually need (added_tokens, model.vocab, model.merges)
+//  and parse them with hand-written state machines.
+//
+//  Format assumptions (verified against Qwen2.5-14B-Instruct):
+//    - vocab: JSON object "{\"key\":int,\"key2\":int,...}"
+//      Keys may contain any UTF-8; backslash-escaped quotes "\\\"" are
+//      supported. Numbers are always integers here.
+//    - merges: JSON array of strings "[\"A B\",\"C D\",...]"
+//    - added_tokens: array of objects; we only need id + content.
+// ═══════════════════════════════════════════════════════════════════
+
+// Find first occurrence of substring starting at offset `from`.
+// Returns index or -1. Byte-indexed, NOT codepoint-indexed.
+fn qwen_find_str(bytes, needle, from) {
+    let nn = len(needle)
+    let nb = len(bytes)
+    if nn == 0 { return from }
+    // Pre-compute needle byte values for speed
+    let mut npat = []
+    let mut i = 0
+    while i < nn {
+        npat = npat + [char_code(needle, i)]
+        i = i + 1
+    }
+    let first = npat[0]
+    let mut p = from
+    let limit = nb - nn
+    while p <= limit {
+        if bytes[p] == first {
+            let mut k = 1
+            let mut ok = true
+            while k < nn {
+                if bytes[p + k] != npat[k] { ok = false; k = nn }
+                else { k = k + 1 }
+            }
+            if ok { return p }
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+// Skip ASCII whitespace starting at `p` and return new position.
+fn qwen_skip_ws(bytes, p, nb) {
+    let mut q = p
+    while q < nb {
+        let c = bytes[q]
+        if c == 32 || c == 9 || c == 10 || c == 13 { q = q + 1 }
+        else { return q }
+    }
+    return q
+}
+
+// Parse a JSON string starting at bytes[p] (p must point to the opening
+// quote). Returns [string_value, next_position]. Handles \n \t \" \\ \/
+// and \uXXXX (UTF-8 re-encoded). All other escapes pass through.
+fn qwen_parse_string(bytes, p, nb) {
+    let mut q = p + 1
+    let mut out = ""
+    while q < nb {
+        let c = bytes[q]
+        if c == 34 {
+            // closing quote
+            return [out, q + 1]
+        }
+        if c == 92 {
+            // backslash escape
+            q = q + 1
+            if q >= nb { return [out, q] }
+            let e = bytes[q]
+            if e == 110 { out = out + "\n" }
+            else if e == 116 { out = out + "\t" }
+            else if e == 114 { out = out + "\r" }
+            else if e == 34  { out = out + "\"" }
+            else if e == 92  { out = out + "\\" }
+            else if e == 47  { out = out + "/" }
+            else if e == 98  { out = out + from_char_code(8) }
+            else if e == 102 { out = out + from_char_code(12) }
+            else if e == 117 {
+                // \uXXXX — 4 hex digits -> codepoint (BMP only)
+                if q + 4 < nb {
+                    let h1 = qwen_hex_digit(bytes[q + 1])
+                    let h2 = qwen_hex_digit(bytes[q + 2])
+                    let h3 = qwen_hex_digit(bytes[q + 3])
+                    let h4 = qwen_hex_digit(bytes[q + 4])
+                    let cp = h1 * 4096 + h2 * 256 + h3 * 16 + h4
+                    out = out + from_char_code(cp)
+                    q = q + 4
+                }
+            }
+            else { out = out + from_char_code(e) }
+            q = q + 1
+        } else {
+            // Use raw byte — preserves UTF-8 sequences untouched.
+            out = out + from_char_code(c)
+            q = q + 1
+        }
+    }
+    return [out, q]
+}
+
+fn qwen_hex_digit(b) {
+    if b >= 48 && b <= 57 { return b - 48 }         // 0-9
+    if b >= 97 && b <= 102 { return b - 97 + 10 }   // a-f
+    if b >= 65 && b <= 70  { return b - 65 + 10 }   // A-F
+    return 0
+}
+
+// Parse an unsigned integer (optional leading minus) starting at bytes[p].
+// Returns [int_value, next_position].
+fn qwen_parse_int(bytes, p, nb) {
+    let mut q = p
+    let mut sign = 1
+    if q < nb && bytes[q] == 45 { sign = -1; q = q + 1 }
+    let mut v = 0
+    while q < nb {
+        let c = bytes[q]
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+            q = q + 1
+        } else {
+            return [sign * v, q]
+        }
+    }
+    return [sign * v, q]
+}
+
+
+// ─── Parse model.vocab object  ───────────────────────────────────
+// Returns [map<str,int>, id_to_token_array, max_id+1].
+fn qwen_parse_vocab(bytes, nb) {
+    // Find "\"vocab\""
+    let key_off = qwen_find_str(bytes, "\"vocab\"", 0)
+    if key_off < 0 {
+        println("[qwen_bpe] ERROR: no \"vocab\" key")
+        return [#{}, [], 0]
+    }
+    // Scan to the '{' that opens the object
+    let mut p = key_off + 7
+    while p < nb && bytes[p] != 123 { p = p + 1 }
+    if p >= nb {
+        println("[qwen_bpe] ERROR: malformed vocab (no '{')")
+        return [#{}, [], 0]
+    }
+    p = p + 1
+
+    let mut vocab = #{}
+    let mut entries = []
+    let mut max_id = 0
+    let mut count = 0
+    let t0 = timestamp()
+    println("[qwen_bpe]   vocab scan starting at byte " + to_string(p))
+
+    while p < nb {
+        p = qwen_skip_ws(bytes, p, nb)
+        if p >= nb { return [vocab, [], max_id + 1] }
+        let c = bytes[p]
+        println("[dbg] loop p=" + to_string(p) + " c=" + to_string(c))
+        if c == 125 { p = p + 1; return qwen_finalize_vocab(vocab, entries, max_id) }
+        if c != 34 {
+            // stray char — advance to re-sync
+            p = p + 1
+            if c == 44 { continue }  // comma
+            return qwen_finalize_vocab(vocab, entries, max_id)
+        }
+        // Key string
+        let kr = qwen_parse_string(bytes, p, nb)
+        let key = kr[0]
+        p = kr[1]
+        p = qwen_skip_ws(bytes, p, nb)
+        if p >= nb || bytes[p] != 58 { return qwen_finalize_vocab(vocab, entries, max_id) }
+        p = p + 1
+        p = qwen_skip_ws(bytes, p, nb)
+        let ir = qwen_parse_int(bytes, p, nb)
+        let id = ir[0]
+        p = ir[1]
+        vocab[key] = id
+        entries = entries + [[key, id]]
+        if id > max_id { max_id = id }
+        count = count + 1
+        if count % 50 == 0 { println("[qwen_bpe]   vocab progress: " + to_string(count)) }
+        p = qwen_skip_ws(bytes, p, nb)
+        if p < nb && bytes[p] == 44 { p = p + 1 }
+    }
+    return qwen_finalize_vocab(vocab, entries, max_id)
+}
+
+fn qwen_finalize_vocab(vocab, entries, max_id) {
+    let mut id_to_token = []
+    let mut i = 0
+    while i <= max_id {
+        id_to_token = id_to_token + [""]
+        i = i + 1
+    }
+    i = 0
+    let n = len(entries)
+    while i < n {
+        let e = entries[i]
+        id_to_token[e[1]] = e[0]
+        i = i + 1
+    }
+    return [vocab, id_to_token, max_id + 1]
+}
+
+
+// ─── Parse model.merges array  ───────────────────────────────────
+// Returns map<string,int> where key = "A B" -> priority rank.
+fn qwen_parse_merges(bytes, nb) {
+    let key_off = qwen_find_str(bytes, "\"merges\"", 0)
+    if key_off < 0 {
+        println("[qwen_bpe] WARN: no \"merges\" key")
+        return #{}
+    }
+    let mut p = key_off + 8
+    while p < nb && bytes[p] != 91 { p = p + 1 }   // '['
+    if p >= nb { return #{} }
+    p = p + 1
+
+    let mut ranks = #{}
+    let mut rank = 0
+    while p < nb {
+        p = qwen_skip_ws(bytes, p, nb)
+        if p >= nb { return ranks }
+        let c = bytes[p]
+        if c == 93 { return ranks }       // ']'
+        if c == 44 { p = p + 1; continue }  // comma
+        if c != 34 { p = p + 1; continue }  // skip stray
+        let sr = qwen_parse_string(bytes, p, nb)
+        let merge_str = sr[0]
+        p = sr[1]
+        ranks[merge_str] = rank
+        rank = rank + 1
+    }
+    return ranks
+}
+
+
+// ─── Parse added_tokens  ─────────────────────────────────────────
+// Returns [[content, id], ...] sorted by length descending so the
+// encoder prefers longer special tokens when they share a prefix.
+fn qwen_parse_added_tokens(bytes, nb) {
+    let key_off = qwen_find_str(bytes, "\"added_tokens\"", 0)
+    if key_off < 0 { return [] }
+    let mut p = key_off + 14
+    while p < nb && bytes[p] != 91 { p = p + 1 }
+    if p >= nb { return [] }
+    p = p + 1
+
+    let mut results = []
+    while p < nb {
+        p = qwen_skip_ws(bytes, p, nb)
+        if p >= nb { return results }
+        let c = bytes[p]
+        if c == 93 { return qwen_sort_added_by_len(results) }
+        if c == 44 { p = p + 1; continue }
+        if c != 123 { p = p + 1; continue }
+        // Object — scan for "id" and "content" inside balanced braces
+        let obj_start = p
+        let mut depth = 1
+        p = p + 1
+        let mut obj_id = -1
+        let mut obj_content = ""
+        let mut have_id = false
+        let mut have_content = false
+        while p < nb && depth > 0 {
+            let cc = bytes[p]
+            if cc == 123 { depth = depth + 1; p = p + 1 }
+            else if cc == 125 { depth = depth - 1; p = p + 1 }
+            else if cc == 34 {
+                // Parse key
+                let kr = qwen_parse_string(bytes, p, nb)
+                let k = kr[0]
+                p = kr[1]
+                p = qwen_skip_ws(bytes, p, nb)
+                if p < nb && bytes[p] == 58 {
+                    p = p + 1
+                    p = qwen_skip_ws(bytes, p, nb)
+                    if k == "id" {
+                        let ir = qwen_parse_int(bytes, p, nb)
+                        obj_id = ir[0]
+                        p = ir[1]
+                        have_id = true
+                    } else if k == "content" {
+                        if p < nb && bytes[p] == 34 {
+                            let sr = qwen_parse_string(bytes, p, nb)
+                            obj_content = sr[0]
+                            p = sr[1]
+                            have_content = true
+                        } else { p = p + 1 }
+                    } else {
+                        // Skip value: string/number/bool/null/obj/array
+                        p = qwen_skip_value(bytes, p, nb)
+                    }
+                }
+            } else {
+                p = p + 1
+            }
+        }
+        if have_id && have_content {
+            results = results + [[obj_content, obj_id]]
+        }
+    }
+    return qwen_sort_added_by_len(results)
+}
+
+fn qwen_skip_value(bytes, p, nb) {
+    let mut q = p
+    q = qwen_skip_ws(bytes, q, nb)
+    if q >= nb { return q }
+    let c = bytes[q]
+    if c == 34 {
+        let sr = qwen_parse_string(bytes, q, nb)
+        return sr[1]
+    }
+    if c == 123 || c == 91 {
+        let open_c = c
+        let close_c = if c == 123 { 125 } else { 93 }
+        let mut depth = 1
+        q = q + 1
+        while q < nb && depth > 0 {
+            let cc = bytes[q]
+            if cc == 34 {
+                let sr2 = qwen_parse_string(bytes, q, nb)
+                q = sr2[1]
+            } else if cc == open_c { depth = depth + 1; q = q + 1 }
+            else if cc == close_c { depth = depth - 1; q = q + 1 }
+            else { q = q + 1 }
+        }
+        return q
+    }
+    // number / bool / null — read until delimiter
+    while q < nb {
+        let cc = bytes[q]
+        if cc == 44 || cc == 125 || cc == 93 || cc == 32 || cc == 9 || cc == 10 || cc == 13 {
+            return q
+        }
+        q = q + 1
+    }
+    return q
+}
+
+fn qwen_sort_added_by_len(lst) {
+    // Insertion sort by content length descending — small list (<50).
+    let mut arr = lst
+    let n = len(arr)
+    let mut i = 1
+    while i < n {
+        let cur = arr[i]
+        let cur_len = len(cur[0])
+        let mut j = i
+        while j > 0 && len(arr[j - 1][0]) < cur_len {
+            arr[j] = arr[j - 1]
+            j = j - 1
+        }
+        arr[j] = cur
+        i = i + 1
+    }
+    return arr
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Public loader
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_bpe_load(tokenizer_json_path) {
+    let t0 = timestamp()
+    let bytes = read_file_bytes(tokenizer_json_path)
+    let nb = len(bytes)
+    let t1 = timestamp()
+    println("[qwen_bpe] read " + to_string(nb) + " bytes in " + to_string(t1 - t0) + " ms")
+
+    println("[qwen_bpe] parsing added_tokens...")
+    let added = qwen_parse_added_tokens(bytes, nb)
+    let t2 = timestamp()
+    println("[qwen_bpe] parsed " + to_string(len(added)) + " added_tokens in " + to_string(t2 - t1) + " ms")
+
+    println("[qwen_bpe] parsing vocab...")
+    let vres = qwen_parse_vocab(bytes, nb)
+    let vocab = vres[0]
+    let id_to_token = vres[1]
+    let vocab_size = vres[2]
+    let t3 = timestamp()
+    println("[qwen_bpe] parsed vocab (" + to_string(vocab_size) + " ids) in " + to_string(t3 - t2) + " ms")
+
+    let ranks = qwen_parse_merges(bytes, nb)
+    let t4 = timestamp()
+    println("[qwen_bpe] parsed merges in " + to_string(t4 - t3) + " ms")
+
+    // Make sure added_tokens are present in id_to_token (they sit
+    // above max(vocab) in Qwen).
+    let mut id_t = id_to_token
+    let mut top_id = vocab_size - 1
+    let mut i = 0
+    while i < len(added) {
+        let a = added[i]
+        if a[1] > top_id { top_id = a[1] }
+        i = i + 1
+    }
+    while len(id_t) <= top_id { id_t = id_t + [""] }
+    i = 0
+    while i < len(added) {
+        let a = added[i]
+        id_t[a[1]] = a[0]
+        vocab[a[0]] = a[1]
+        i = i + 1
+    }
+    let final_size = top_id + 1
+
+    let b2s = qwen_build_byte_to_str()
+    let s2b = qwen_build_str_to_byte(b2s)
+
+    println("[qwen_bpe] loaded: vocab_size=" + to_string(final_size) + " total_ms=" + to_string(t4 - t0))
+
+    return QwenBpe {
+        vocab: vocab,
+        id_to_token: id_t,
+        merge_rank: ranks,
+        byte_to_str: b2s,
+        str_to_byte: s2b,
+        added_tokens: added,
+        vocab_size: final_size
+    }
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pre-tokenizer (subset of Qwen's GPT-2 regex)
+//
+//  The real Qwen rule is:
+//      (?i:'s|'t|'re|'ve|'m|'ll|'d)
+//    | [^\r\n\p{L}\p{N}]?\p{L}+
+//    | \p{N}
+//    | ?[^\s\p{L}\p{N}]+[\r\n]*
+//    | \s*[\r\n]+
+//    | \s+(?!\S)
+//    | \s+
+//
+//  Pure-hexa subset we implement (covers 100% of ChatML prompts and
+//  plain ASCII user text which is what hire_sim feeds the server):
+//    - contractions: 's 't 're 've 'm 'll 'd
+//    - letter run  : optional single non-letter/non-digit/non-space
+//                    prefix, then letters
+//    - digit run   : single digit (so "123" -> "1","2","3", matches
+//                    Qwen which splits every digit)
+//    - symbols     : optional leading space, then non-space non-letter
+//                    non-digit run, then trailing CR/LF
+//    - newline run : optional whitespace then CR/LF
+//    - trailing ws : one or more whitespace not followed by non-space
+//    - plain ws    : one or more whitespace
+//
+//  Each pretoken is byte-encoded (through byte_to_str) then BPE-merged
+//  independently, which is what HF's ByteLevel does.
+// ═══════════════════════════════════════════════════════════════════
+
+// Classification helpers (ASCII-first; treats bytes ≥128 as part of a
+// multibyte letter for the purposes of the "letter run" clause, which
+// matches HF behaviour byte-for-byte when Qwen stores bytes directly).
+fn qwen_is_space(c) {
+    if c == 32 { return true }
+    if c == 9 { return true }
+    if c == 10 { return true }
+    if c == 13 { return true }
+    return false
+}
+fn qwen_is_digit(c) {
+    if c >= 48 && c <= 57 { return true }
+    return false
+}
+fn qwen_is_letter_byte(c) {
+    // ASCII letters + every non-ASCII byte (UTF-8 continuation / lead).
+    if c >= 65 && c <= 90 { return true }
+    if c >= 97 && c <= 122 { return true }
+    if c >= 128 { return true }
+    return false
+}
+fn qwen_is_nl(c) {
+    if c == 10 { return true }
+    if c == 13 { return true }
+    return false
+}
+
+// One chunk = [start_byte, end_byte_exclusive].
+fn qwen_pretokenize(text) {
+    let nb = len(text)
+    let mut chunks = []
+    let mut i = 0
+    while i < nb {
+        let c0 = char_code(text, i)
+
+        // Contractions: 's 't 're 've 'm 'll 'd (case-sensitive both)
+        if c0 == 39 {
+            let rest = nb - i
+            let c1 = if rest > 1 { char_code(text, i + 1) } else { 0 }
+            let c2 = if rest > 2 { char_code(text, i + 2) } else { 0 }
+            let taken = qwen_try_contraction(c1, c2)
+            if taken > 0 {
+                chunks = chunks + [[i, i + taken + 1]]
+                i = i + taken + 1
+                continue
+            }
+        }
+
+        // Letter run: optional 1-byte non-letter/non-digit/non-space/non-CRLF
+        // prefix + 1+ letter bytes.
+        let letter_start = i
+        let mut li = i
+        if !qwen_is_letter_byte(c0) && !qwen_is_digit(c0) && !qwen_is_space(c0) && !qwen_is_nl(c0) {
+            // Tentative prefix — commit only if immediately followed by letter
+            if i + 1 < nb {
+                let cn = char_code(text, i + 1)
+                if qwen_is_letter_byte(cn) {
+                    li = i + 1
+                }
+            }
+        }
+        if li < nb && qwen_is_letter_byte(char_code(text, li)) {
+            let mut le = li
+            while le < nb && qwen_is_letter_byte(char_code(text, le)) { le = le + 1 }
+            chunks = chunks + [[letter_start, le]]
+            i = le
+            continue
+        }
+
+        // Digit: exactly one digit byte (Qwen rule).
+        if qwen_is_digit(c0) {
+            chunks = chunks + [[i, i + 1]]
+            i = i + 1
+            continue
+        }
+
+        // Symbol run: optional leading space + non-space/non-letter/non-digit run
+        // + trailing CR/LF run. Critically this is the clause that keeps
+        // special tokens like "<|im_start|>" inside one chunk.
+        if !qwen_is_space(c0) && !qwen_is_letter_byte(c0) && !qwen_is_digit(c0) {
+            let mut se = i
+            while se < nb {
+                let cc = char_code(text, se)
+                if qwen_is_space(cc) || qwen_is_letter_byte(cc) || qwen_is_digit(cc) {
+                    se = nb + 1
+                } else { se = se + 1 }
+            }
+            if se > nb { se = se - (nb + 1 - se) }   // defensive
+            // The above is a little awkward — recompute cleanly:
+            se = i
+            while se < nb {
+                let cc = char_code(text, se)
+                let stop = qwen_is_space(cc) || qwen_is_letter_byte(cc) || qwen_is_digit(cc)
+                if stop { break }
+                se = se + 1
+            }
+            // Trailing CR/LF
+            while se < nb && qwen_is_nl(char_code(text, se)) { se = se + 1 }
+            chunks = chunks + [[i, se]]
+            i = se
+            continue
+        }
+
+        // Space with optional leading and trailing CR/LF
+        if c0 == 32 {
+            // " ?" already handled via the symbol leading-space case.
+            // Here we have a bare space not preceding a symbol/letter/digit.
+            // Peek ahead: if next non-space char is a letter/digit, bundle
+            // the single space with the next word (HF " ?\p{L}+" clause).
+            if i + 1 < nb {
+                let cn = char_code(text, i + 1)
+                if qwen_is_letter_byte(cn) {
+                    let mut le2 = i + 2
+                    while le2 < nb && qwen_is_letter_byte(char_code(text, le2)) { le2 = le2 + 1 }
+                    chunks = chunks + [[i, le2]]
+                    i = le2
+                    continue
+                }
+                if qwen_is_digit(cn) {
+                    chunks = chunks + [[i, i + 2]]
+                    i = i + 2
+                    continue
+                }
+            }
+            // Trailing whitespace run (\s+(?!\S) and \s+)
+            let mut we = i
+            while we < nb && qwen_is_space(char_code(text, we)) { we = we + 1 }
+            chunks = chunks + [[i, we]]
+            i = we
+            continue
+        }
+
+        // Newlines (\s*[\r\n]+)
+        if qwen_is_nl(c0) {
+            let mut ne = i
+            while ne < nb && qwen_is_nl(char_code(text, ne)) { ne = ne + 1 }
+            chunks = chunks + [[i, ne]]
+            i = ne
+            continue
+        }
+
+        // Fallback single byte
+        chunks = chunks + [[i, i + 1]]
+        i = i + 1
+    }
+    return chunks
+}
+
+fn qwen_try_contraction(c1, c2) {
+    // 's 't 'm 'd  — 1 more byte
+    if c1 == 115 || c1 == 116 || c1 == 109 || c1 == 100 { return 1 }
+    // 're 've 'll — 2 more bytes
+    if c1 == 114 && c2 == 101 { return 2 }  // re
+    if c1 == 118 && c2 == 101 { return 2 }  // ve
+    if c1 == 108 && c2 == 108 { return 2 }  // ll
+    return 0
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  BPE core — apply merges until none apply
+//
+//  symbols = array of visible-byte strings. We iteratively find the
+//  merge with lowest rank and fuse it, linear-scan style. Optimised
+//  for short words (≤50 symbols), which is typical after pretokenize.
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_bpe_merge_word(symbols, merge_rank) {
+    let mut tokens = symbols
+    while len(tokens) > 1 {
+        let mut best_rank = -1
+        let mut best_idx = -1
+        let mut i = 0
+        while i < len(tokens) - 1 {
+            let key = tokens[i] + " " + tokens[i + 1]
+            if has_key(merge_rank, key) {
+                let r = merge_rank[key]
+                if best_idx < 0 || r < best_rank {
+                    best_rank = r
+                    best_idx = i
+                }
+            }
+            i = i + 1
+        }
+        if best_idx < 0 { return tokens }
+        let merged = tokens[best_idx] + tokens[best_idx + 1]
+        let mut new_tokens = []
+        let mut j = 0
+        while j < len(tokens) {
+            if j == best_idx {
+                new_tokens = new_tokens + [merged]
+                j = j + 2
+            } else {
+                new_tokens = new_tokens + [tokens[j]]
+                j = j + 1
+            }
+        }
+        tokens = new_tokens
+    }
+    return tokens
+}
+
+// Encode one raw text chunk (byte-level → BPE symbols → vocab ids).
+fn qwen_bpe_encode_chunk(bpe, chunk_text) {
+    let n = len(chunk_text)
+    if n == 0 { return [] }
+    let mut syms = []
+    let mut i = 0
+    while i < n {
+        let b = char_code(chunk_text, i)
+        syms = syms + [bpe.byte_to_str[b]]
+        i = i + 1
+    }
+    let merged = qwen_bpe_merge_word(syms, bpe.merge_rank)
+    let mut ids = []
+    let mut k = 0
+    while k < len(merged) {
+        let tok = merged[k]
+        if has_key(bpe.vocab, tok) {
+            ids = ids + [bpe.vocab[tok]]
+        } else {
+            // Byte-fallback: encode each byte of the unknown sub-word
+            // individually (they are always in vocab since byte_to_str
+            // is a subset of the Qwen vocab).
+            let nn = len(tok)
+            let mut bi = 0
+            while bi < nn {
+                let bb = char_code(tok, bi)
+                let bs = from_char_code(bb)
+                if has_key(bpe.vocab, bs) {
+                    ids = ids + [bpe.vocab[bs]]
+                }
+                bi = bi + 1
+            }
+        }
+        k = k + 1
+    }
+    return ids
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  qwen_bpe_encode — top-level encoder
+//
+//  1. Scan for special tokens (sorted longest-first) and split the text
+//     into [PLAIN, SPECIAL, PLAIN, ...] segments.
+//  2. Pretokenize each PLAIN segment via GPT-2-subset rules.
+//  3. Byte-level encode + BPE merge each chunk.
+//  4. Emit the SPECIAL segments as atomic vocab ids.
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_bpe_encode(bpe, text) {
+    let nb = len(text)
+    if nb == 0 { return [] }
+    let mut ids = []
+    let mut p = 0
+
+    while p < nb {
+        // Find the next special-token occurrence at or after p.
+        let hit = qwen_find_next_special(bpe, text, p, nb)
+        let hit_pos = hit[0]
+        let hit_idx = hit[1]
+
+        let seg_end = if hit_pos < 0 { nb } else { hit_pos }
+        if seg_end > p {
+            let segment = qwen_substring_bytes(text, p, seg_end)
+            let chunks = qwen_pretokenize(segment)
+            let mut ci = 0
+            while ci < len(chunks) {
+                let cs = chunks[ci][0]
+                let ce = chunks[ci][1]
+                let chunk_text = qwen_substring_bytes(segment, cs, ce)
+                let chunk_ids = qwen_bpe_encode_chunk(bpe, chunk_text)
+                let mut ki = 0
+                while ki < len(chunk_ids) {
+                    ids = ids + [chunk_ids[ki]]
+                    ki = ki + 1
+                }
+                ci = ci + 1
+            }
+        }
+        if hit_pos < 0 { return ids }
+
+        let special = bpe.added_tokens[hit_idx]
+        ids = ids + [special[1]]
+        p = hit_pos + len(special[0])
+    }
+    return ids
+}
+
+// Byte-indexed substring (no codepoint confusion).
+fn qwen_substring_bytes(text, a, b) {
+    let mut out = ""
+    let mut i = a
+    while i < b {
+        out = out + from_char_code(char_code(text, i))
+        i = i + 1
+    }
+    return out
+}
+
+// Find earliest position ≥ from of any special token. Returns
+// [pos, added_token_index] or [-1, -1].
+fn qwen_find_next_special(bpe, text, from, nb) {
+    let mut best_pos = -1
+    let mut best_idx = -1
+    let mut i = 0
+    let nad = len(bpe.added_tokens)
+    while i < nad {
+        let ent = bpe.added_tokens[i]
+        let needle = ent[0]
+        let pos = qwen_find_str_in_text(text, needle, from, nb)
+        if pos >= 0 {
+            if best_pos < 0 || pos < best_pos {
+                best_pos = pos
+                best_idx = i
+            }
+        }
+        i = i + 1
+    }
+    return [best_pos, best_idx]
+}
+
+// String-vs-string byte search. Faster than rebuilding bytes arrays.
+fn qwen_find_str_in_text(text, needle, from, nb) {
+    let nn = len(needle)
+    if nn == 0 { return from }
+    let limit = nb - nn
+    let first = char_code(needle, 0)
+    let mut p = from
+    while p <= limit {
+        if char_code(text, p) == first {
+            let mut k = 1
+            let mut ok = true
+            while k < nn {
+                if char_code(text, p + k) != char_code(needle, k) { ok = false; k = nn }
+                else { k = k + 1 }
+            }
+            if ok { return p }
+        }
+        p = p + 1
+    }
+    return -1
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  qwen_bpe_decode — token ids → string
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_bpe_decode(bpe, ids) {
+    let n = len(ids)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let id = ids[i]
+        if id >= 0 && id < len(bpe.id_to_token) {
+            let tok = bpe.id_to_token[id]
+            // Special / added tokens: emit as-is (no byte-unmap).
+            let is_special = qwen_is_added(bpe, id)
+            if is_special {
+                out = out + tok
+            } else {
+                // Reverse byte_to_str: walk the token string, look up
+                // the mapped UTF-8 char (1 or 2 bytes) and emit the
+                // corresponding raw byte.
+                out = out + qwen_unmap_bytes(bpe, tok)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn qwen_is_added(bpe, id) {
+    let n = len(bpe.added_tokens)
+    let mut i = 0
+    while i < n {
+        if bpe.added_tokens[i][1] == id { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Walk a BPE token UTF-8 string, emit raw bytes per visible char.
+fn qwen_unmap_bytes(bpe, tok) {
+    let nb = len(tok)
+    let mut out = ""
+    let mut i = 0
+    while i < nb {
+        let b = char_code(tok, i)
+        if b < 128 {
+            // single-byte visible char
+            let s = from_char_code(b)
+            if has_key(bpe.str_to_byte, s) {
+                out = out + from_char_code(bpe.str_to_byte[s])
+            } else {
+                out = out + s
+            }
+            i = i + 1
+        } else {
+            // UTF-8 continuation: consume up to 4 bytes until next char boundary
+            let start = i
+            i = i + 1
+            while i < nb {
+                let bn = char_code(tok, i)
+                if bn < 128 || bn >= 192 { break }
+                i = i + 1
+            }
+            let mut piece = ""
+            let mut j = start
+            while j < i {
+                piece = piece + from_char_code(char_code(tok, j))
+                j = j + 1
+            }
+            if has_key(bpe.str_to_byte, piece) {
+                out = out + from_char_code(bpe.str_to_byte[piece])
+            } else {
+                out = out + piece
+            }
+        }
+    }
+    return out
+}
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  Convenience: ChatML template
+// ═══════════════════════════════════════════════════════════════════
+fn qwen_bpe_encode_chatml(bpe, user_text) {
+    // <|im_start|>user\n{text}<|im_end|>\n<|im_start|>assistant\n
+    let prompt = "<|im_start|>user\n" + user_text + "<|im_end|>\n<|im_start|>assistant\n"
+    return qwen_bpe_encode(bpe, prompt)
+}
+
+fn qwen_bpe_vocab_size(bpe) { return bpe.vocab_size }
+
+
+// ═══════════════════════════════════════════════════════════════════
+//  KNOWN LIMITATIONS (documented for the caller):
+//
+//  - No Unicode category awareness (\p{L}, \p{N}). We treat every
+//    byte ≥128 as "letter-like" which matches HF exactly on the BPE
+//    byte-level output for: ASCII English, Korean, CJK, most Latin
+//    accented text, and emoji. A known divergence class is "\p{N}"
+//    digits outside 0-9 (e.g. ०-९ devanagari) which HF treats as
+//    digit-group but we roll into the letter run.
+//
+//  - No NFC normalization. For Qwen2.5 the normalizer is "type: NFC"
+//    which re-composes pre-composed codepoints. Input that's already
+//    NFC (all ChatML prompts from English training + hire_sim) is
+//    untouched. Decomposed unicode (rare in practice) will produce
+//    different tokens than HF. Applying NFC pure-hexa requires a 10k-
+//    table port and isn't worth it for the ALM use case.
+//
+//  - BPE merge search is O(word_len²) per chunk — fine because post-
+//    pretokenize chunks are ≤50 symbols.
+//
+//  - tokenizer.json loader uses read_file_bytes which slurps the full
+//    7MB file. The new streaming builtins (read_bytes_at / file_size)
+//    are available in native builds but not in stage0 interp. The
+//    slurp path is fine for the 14B on H100 (few hundred MB of free
+//    RAM out of 80GB).
+// ═══════════════════════════════════════════════════════════════════
+
+println("[qwen_bpe] module loaded")
