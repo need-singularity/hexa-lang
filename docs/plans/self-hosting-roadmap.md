@@ -271,10 +271,12 @@
 ## 알려진 이슈
 
 1. ~~**parser.hexa 셀프컴파일**: O(n²) 문자열 결합~~ → ✅ codegen_c2는 push+join 패턴으로 해결됨
-2. **`#{}` Map 리터럴 → C codegen**: codegen_c2가 Map 리터럴/Map 필드 접근을 C로 변환하지 못함 — **Phase 5 최대 블로커 (G1/G2)**
+2. ~~**`#{}` Map 리터럴 → C codegen**~~ → ✅ hexa_map_new/set으로 해결됨
 3. **-Wno-return-type**: type_checker의 일부 함수가 모든 경로에서 반환하지 않음.
-4. **for..in 배열 순회**: codegen_c2가 range만 지원, 배열 for-in 미지원 — **Phase 5 블로커 (G4)**
-5. **struct 중복 선언**: concat 빌드 시 Token/AstNode 등이 여러 파일에서 재선언됨
+4. ~~**for..in 배열 순회**~~ → ✅ codegen_c2가 배열 for-in 지원 (hexa_iter_get)
+5. ~~**struct 중복 선언**~~ → ✅ flatten_imports.hexa로 단일 파일 병합
+6. ~~**exec_with_status exit=0 고정**~~ → ✅ 2026-04-17 수정 (sentinel + pclose)
+7. ~~**ValStruct arena corruption (T33)**~~ → ✅ 2026-04-17 from_arena=0으로 근본 수정
 
 ## 핵심 원칙
 
@@ -293,8 +295,13 @@
 | P2 (인터프리터) | ~8,000 | ~2,217 | ✅ 100% |
 | P3 (VM) | ~1,500 | ~1,261 | ✅ 100% |
 | P4 (C 백엔드) | ~3,000 | ~1,834 | ✅ 초기 완료 |
-| P5 (셀프컴파일) | ~1,000 | 0 | ⏳ 설계 완료, 구현 0% |
+| P5 (셀프컴파일) | ~1,000 | ✅ | ✅ fixpoint 달성 (2026-04-10) v2==v3 IDENTICAL |
 | P6 (생태계) | ~10,000 | 0 | 0% |
 
 > 최종 목표: ~36K LOC Hexa (현재 99K Rust 대비 63% 축소)
 > Rust의 보일러플레이트(Result, lifetime, borrow checker) 제거 효과
+>
+> **2026-04-17 빌드 파이프라인 신뢰성 확보:**
+> - exec_with_status() — 실제 exit code 반환 (interpreter: sentinel 방식, native: pclose)
+> - T33-fix-2 — ValStruct arena corruption 근본 수정 (from_arena=0)
+> - rebuild_stage0.hexa — clang/flatten 실패를 정확히 감지+롤백

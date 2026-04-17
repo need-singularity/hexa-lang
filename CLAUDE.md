@@ -49,6 +49,10 @@ hexa-lang 핵심 규칙:
        - wrapper 기능: mkdir lock(동시 빌드 차단) + mtime guard(변경 없으면 skip) + NO_SMOKE 기본 on
        - 변경 여러 개 모아 1회 빌드: VM 테스트 중 .hexa 다수 수정 → 마지막에 1번만 rebuild_stage0.hexa
        - 긴급/강제: `FORCE=1 hexa scripts/rebuild_stage0.hexa`
+  HX9: 빌드 파이프라인 신뢰성 (2026-04-17 확보)
+       - exec_with_status() — 실제 exit code 반환. interpreter: sentinel($?), native: pclose(WEXITSTATUS)
+       - T33-fix-2 — ValStruct arena corruption 근본 수정 (from_arena=0). HEXA_VAL_ARENA=0 불필요
+       - rebuild_stage0/build_stage0 — clang/flatten 실패 시 정확히 감지+롤백+exit(1)
 
 ref:
   rules     shared/rules/common.json             R0~R27
