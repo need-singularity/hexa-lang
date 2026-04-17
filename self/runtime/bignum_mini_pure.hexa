@@ -1,0 +1,224 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/bignum_mini_pure.hexa — pure-Hexa arbitrary-precision ints
+//
+//  Net-new domain for pure-Hexa. runtime.c has NO hexa_big_* / hexa_bignum_*
+//  counterparts — grepping self/runtime.c confirms zero references. These
+//  helpers unlock >int64 arithmetic (factorials, cryptographic sizes,
+//  exact-rational numerators) entirely in the stage0 interpreter with no
+//  FFI, no libgmp, no C runtime.
+//
+//  Representation
+//  ──────────────
+//  A bignum is an array of non-negative "limbs" in radix 10 — each limb
+//  is a single decimal digit stored little-endian (least-significant
+//  digit first). Canonical form: no leading zeros (i.e. no trailing
+//  zero limbs), except zero itself which is exactly the empty array []
+//  or the single-element [0]; we normalise to [0].
+//
+//      123      -> [3, 2, 1]
+//      1000     -> [0, 0, 0, 1]
+//      0        -> [0]
+//      9801     -> [1, 0, 8, 9]
+//
+//  Radix-10 trades memory for simplicity: human-readable in the debugger,
+//  no overflow risk in mul_int (9 * 9 + 9 carry = 90 < int64), and
+//  to_string / from_string are trivial reversals. A radix-10^9 variant
+//  would be 9x denser but needs careful carry arithmetic — out of scope
+//  for the "mini" port.
+//
+//  Public API (5 net-new)
+//  ──────────────────────
+//      bignum_from_int_pure(n)       -> [int]       int -> limbs  (n >= 0)
+//      bignum_to_string_pure(limbs)  -> string      limbs -> decimal str
+//      bignum_add_pure(a, b)         -> [int]       a + b, carry-propagate
+//      bignum_sub_pure(a, b)         -> [int]|nil   a - b, nil if a < b
+//      bignum_mul_int_pure(lmb, n)   -> [int]       lmb * n, n small int >= 0
+//
+//  SEMANTIC NOTES
+//  ──────────────
+//  * All inputs are assumed non-negative. Negative bignums would need a
+//    sign field; out of scope for mini. `bignum_from_int_pure(-5)`
+//    returns nil.
+//  * `bignum_sub_pure` returns nil on underflow rather than producing
+//    a two's-complement result. Callers should cmp first if they care.
+//  * All results are in canonical form (no trailing-zero limbs; 0 is [0]).
+//  * P50 compliant: zero use of `<<` / `>>`. All arithmetic via * / % + -.
+//
+//  PITFALL: `borrow` is a reserved keyword in Hexa (ownership DSL). The
+//  subtraction loop uses `br` as the carry-out accumulator — do not
+//  rename it back to `borrow` without re-running the tests.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── _bn_trim ────────────────────────────────────────────────────────
+// Strip trailing zero limbs (most-significant side). Canonicalises 0 to [0].
+@pure
+fn _bn_trim(limbs) {
+    let mut n = len(limbs)
+    while n > 1 {
+        if limbs[n - 1] != 0 { return limbs.slice(0, n) }
+        n = n - 1
+    }
+    // n <= 1: either [x] for x in 0..9 or empty -> [0]
+    if n == 0 { return [0] }
+    return limbs.slice(0, 1)
+}
+
+// ── bignum_is_zero_pure ─────────────────────────────────────────────
+// True iff canonical representation of zero.
+@pure
+pub fn bignum_is_zero_pure(limbs) {
+    let n = len(limbs)
+    if n == 0 { return true }
+    let mut i = 0
+    while i < n {
+        if limbs[i] != 0 { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ── bignum_cmp_pure ─────────────────────────────────────────────────
+// Returns -1 if a < b, 0 if a == b, 1 if a > b. Assumes canonical form;
+// for safety we scan from the high end explicitly.
+@pure
+pub fn bignum_cmp_pure(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    // Compare actual magnitudes ignoring any leading zeros.
+    let mut ha = la
+    while ha > 0 {
+        if a[ha - 1] != 0 { break }
+        ha = ha - 1
+    }
+    let mut hb = lb
+    while hb > 0 {
+        if b[hb - 1] != 0 { break }
+        hb = hb - 1
+    }
+    if ha < hb { return -1 }
+    if ha > hb { return 1 }
+    let mut i = ha
+    while i > 0 {
+        let ai = a[i - 1]
+        let bi = b[i - 1]
+        if ai < bi { return -1 }
+        if ai > bi { return 1 }
+        i = i - 1
+    }
+    return 0
+}
+
+// ── bignum_from_int_pure ────────────────────────────────────────────
+// Convert non-negative int -> little-endian radix-10 limb array.
+// Returns [0] for 0 and nil for negatives.
+@pure
+pub fn bignum_from_int_pure(n) {
+    if n < 0 { return nil }
+    if n == 0 { return [0] }
+    let mut out = []
+    let mut x = n
+    while x > 0 {
+        out = out.push(x % 10)
+        x = x / 10
+    }
+    return out
+}
+
+// ── bignum_to_string_pure ───────────────────────────────────────────
+// Render limb array as decimal string. Reverses limb order (LSD -> MSD)
+// and concatenates digit characters.
+@pure
+pub fn bignum_to_string_pure(limbs) {
+    let trimmed = _bn_trim(limbs)
+    let n = len(trimmed)
+    if n == 0 { return "0" }
+    let mut parts = []
+    let mut i = n
+    while i > 0 {
+        let d = trimmed[i - 1]
+        // digit 0..9 -> char: ord('0') = 48
+        parts = parts.push(chr(48 + d))
+        i = i - 1
+    }
+    return parts.join("")
+}
+
+// ── bignum_add_pure ─────────────────────────────────────────────────
+// Schoolbook addition with carry. Output is canonical.
+@pure
+pub fn bignum_add_pure(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let n = if la > lb { la } else { lb }
+    let mut out = []
+    let mut carry = 0
+    let mut i = 0
+    while i < n {
+        let ai = if i < la { a[i] } else { 0 }
+        let bi = if i < lb { b[i] } else { 0 }
+        let s = ai + bi + carry
+        out = out.push(s % 10)
+        carry = s / 10
+        i = i + 1
+    }
+    while carry > 0 {
+        out = out.push(carry % 10)
+        carry = carry / 10
+    }
+    return _bn_trim(out)
+}
+
+// ── bignum_sub_pure ─────────────────────────────────────────────────
+// a - b with borrow. Returns nil if a < b (we don't represent negatives).
+@pure
+pub fn bignum_sub_pure(a, b) {
+    let cmp = bignum_cmp_pure(a, b)
+    if cmp < 0 { return nil }
+    if cmp == 0 { return [0] }
+    let la = len(a)
+    let lb = len(b)
+    let mut out = []
+    let mut br = 0
+    let mut i = 0
+    while i < la {
+        let ai = a[i]
+        let bi = if i < lb { b[i] } else { 0 }
+        let raw = ai - bi - br
+        if raw < 0 {
+            out = out.push(raw + 10)
+            br = 1
+        } else {
+            out = out.push(raw)
+            br = 0
+        }
+        i = i + 1
+    }
+    // br must be 0 here since a >= b
+    return _bn_trim(out)
+}
+
+// ── bignum_mul_int_pure ─────────────────────────────────────────────
+// Multiply bignum by small non-negative int `m`. Caller is responsible
+// for keeping m small enough that (9 * m + carry) fits in int64; for
+// m <= 10^17 this is comfortable.
+@pure
+pub fn bignum_mul_int_pure(limbs, m) {
+    if m < 0 { return nil }
+    if m == 0 { return [0] }
+    if bignum_is_zero_pure(limbs) { return [0] }
+    let n = len(limbs)
+    let mut out = []
+    let mut carry = 0
+    let mut i = 0
+    while i < n {
+        let prod = limbs[i] * m + carry
+        out = out.push(prod % 10)
+        carry = prod / 10
+        i = i + 1
+    }
+    while carry > 0 {
+        out = out.push(carry % 10)
+        carry = carry / 10
+    }
+    return _bn_trim(out)
+}
