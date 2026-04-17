@@ -1,0 +1,440 @@
+// ═══════════════════════════════════════════════════════════
+//  self/codegen/ir_to_arm64.hexa — IR → ARM64 pipeline bridge (P7-7)
+//
+//  Walks HEXA-IR basic blocks in layout order and emits ARM64 bytes
+//  via the encoders in self/codegen/arm64.hexa / codegen_native.hexa.
+//
+//  Entry point:
+//      fn lower_ir_to_arm64(blocks, regalloc_map) -> Array<u8>
+//
+//  IR shape expected (parallel to self/ir/instr.hexa, but flattened for
+//  this bridge to stay independent of module-wide state):
+//      block = BB { id: int, instructions: array of IRInstr }
+//      IRInstr = {
+//          result: int,        // ValueId produced (or -1)
+//          op: string,         // "load" | "add" | "sub" | "mul" | "branch" |
+//                              // "jump" | "ret" | "call" | "phi" | "store" |
+//                              // "alloc" | "label"
+//          ty: string,         // type tag ("i64" | "bool" | ...)
+//          a: int, b: int, c: int,
+//          imm: int,           // immediate (for load imm_i64, cmp code, jump targets)
+//          is_imm: bool,       // true if this is a "load imm" form
+//          cmp: string         // non-empty when op=="sub" encodes a comparison
+//                              // ("eq"/"ne"/"lt"/"le"/"gt"/"ge")
+//      }
+//
+//  Register allocation policy (linear v# → x#):
+//      regalloc_map[vid] = physical x-register index.
+//      A trivial caller-side map is: regalloc_linear(n_values) — returns
+//      [0, 1, 2, ..., n-1]; spills at v8+ are flagged (x31 sentinel) and
+//      this bridge errors with a "spill unsupported" MOVZ x0, #0xDEAD
+//      sentinel — callers can assert they stayed within 8 SSA values.
+//
+//  Opcodes covered (J2 subset sufficient for fib, if-return, loops, calls):
+//      IntLit            (load imm_i64)    → MOVZ [+MOVK]
+//      BoolLit           (load imm_bool)   → MOVZ
+//      BinOp Add/Sub/Mul                   → ADD / SUB / MUL
+//      Cmp+Branch        (sub+cmp, branch) → CMP / B.cond
+//      Jump              (jump BB)         → B #off
+//      Return            (ret [val])       → MOV x0, Rv; RET
+//      Assign / Store    (store slot, val) → MOV dst, src
+//      Call              (call fid, args…) → BL #0 (stub; patched later)
+//
+//  PHI is emitted as a conservative MOV from the incoming value on the
+//  taken edge (last predecessor's value), because this bridge does not
+//  yet schedule parallel copies.
+// ═══════════════════════════════════════════════════════════
+
+// ── ARM64 instruction encoders (mirror self/codegen/arm64.hexa so this
+//    bridge runs standalone under hexa_stage0 without concat-linking).
+
+fn ira_emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+// MOVZ Xd, #imm16, LSL #0   (0xd2800000 = 3531603968)
+fn ira_enc_movz(rd: int, imm16: int) -> int {
+    return 3531603968 + (imm16 * 32) + rd
+}
+
+// MOVK Xd, #imm16, LSL #hw*16   (0xf2800000 = 4068474880)
+fn ira_enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 4068474880 + (hw * 2097152) + (imm16 * 32) + rd
+}
+
+// ADD Xd, Xn, Xm   (0x8b000000 = 2332033024)
+fn ira_enc_add(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + (rm * 65536) + (rn * 32) + rd
+}
+
+// SUB Xd, Xn, Xm   (0xcb000000 = 3405774848)
+fn ira_enc_sub(rd: int, rn: int, rm: int) -> int {
+    return 3405774848 + (rm * 65536) + (rn * 32) + rd
+}
+
+// MUL Xd, Xn, Xm   (0x9b007c00 = 2600500224)
+fn ira_enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600500224 + (rm * 65536) + (rn * 32) + rd
+}
+
+// MOV Xd, Xn — encoded as ORR Xd, XZR, Xn (0xaa0003e0 = 2852127712)
+fn ira_enc_mov_reg(rd: int, rm: int) -> int {
+    return 2852127712 + (rm * 65536) + rd
+}
+
+// CMP Xn, Xm → SUBS XZR, Xn, Xm   (0xeb00001f = 3942645791)
+fn ira_enc_cmp(rn: int, rm: int) -> int {
+    return 3942645791 + (rm * 65536) + (rn * 32)
+}
+
+// CSET Xd, cond (CSINC Xd, XZR, XZR, inv(cond))   (0x9a9f07e0 = 2594113504)
+//   cond codes (AArch64): EQ=0 NE=1 CS=2 CC=3 MI=4 PL=5 VS=6 VC=7
+//                         HI=8 LS=9 GE=10 LT=11 GT=12 LE=13 AL=14 NV=15
+fn ira_enc_cset(rd: int, cond_code: int) -> int {
+    if cond_code == 0 { return 2594113504 + 1 * 4096 + rd }
+    if cond_code == 1 { return 2594113504 + 0 * 4096 + rd }
+    if cond_code == 10 { return 2594113504 + 11 * 4096 + rd }
+    if cond_code == 11 { return 2594113504 + 10 * 4096 + rd }
+    if cond_code == 12 { return 2594113504 + 13 * 4096 + rd }
+    if cond_code == 13 { return 2594113504 + 12 * 4096 + rd }
+    return 2594113504 + rd
+}
+
+// B #off   (0x14000000 = 335544320) — 26-bit signed offset (instructions, not bytes)
+fn ira_enc_b(off26: int) -> int {
+    if off26 >= 0 {
+        return 335544320 + (off26 % 67108864)
+    }
+    return 335544320 + ((off26 + 67108864) % 67108864)
+}
+
+// B.cond #off   (0x54000000) — 19-bit signed offset, cond in bits [3:0]
+fn ira_enc_b_cond(off19: int, cond_code: int) -> int {
+    let off = off19
+    if off < 0 { off = off + 524288 }
+    return 1409286144 + (off * 32) + cond_code
+}
+
+// BL #off   (0x94000000 = 2483027968) — 26-bit signed offset
+fn ira_enc_bl(off26: int) -> int {
+    if off26 >= 0 {
+        return 2483027968 + (off26 % 67108864)
+    }
+    return 2483027968 + ((off26 + 67108864) % 67108864)
+}
+
+// RET   (0xd65f03c0 = 3596551104)
+fn ira_enc_ret() -> int {
+    return 3596551104
+}
+
+// ── Register allocation helper (linear v# → x#) ─────────────
+//
+// Public entry point: build a linear v# → x# map for `n_values`.
+// Values 0..7 map to x0..x7. Values >= 8 are tagged as 31 (XZR / spill
+// sentinel); the bridge emits a spill-sentinel MOVZ x0, #0xDEAD so test
+// suites can detect overflow.
+
+fn regalloc_linear_simple(n_values: int) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < n_values {
+        if i < 8 {
+            out = out.push(i)
+        } else {
+            out = out.push(31)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn regalloc_reg_for(regalloc_map: [int], vid: int) -> int {
+    if vid < 0 { return 0 }
+    if vid >= len(regalloc_map) { return 31 }
+    return regalloc_map[vid]
+}
+
+fn regalloc_is_spill(regalloc_map: [int], vid: int) -> bool {
+    let r = regalloc_reg_for(regalloc_map, vid)
+    return r == 31
+}
+
+// ── Block scan helpers ──────────────────────────────────────
+//
+// We operate on a flat representation where each "block" is a struct
+// with `id` and `instructions`. Blocks appear in layout order; branch/
+// jump targets are block ids which we resolve to an instruction index
+// via a two-pass approach:
+//   Pass 1: walk blocks, record each block's starting instruction index
+//           (in the final instruction stream), size each op would emit.
+//   Pass 2: re-walk and emit bytes, resolving jump/branch offsets now
+//           that pass-1 sizes are known.
+
+// Compute the instruction-count footprint of a single IR op under this
+// bridge's encoding. Matches emit_one() below.
+fn ira_ops_size(op: string, is_imm: bool, imm: int, has_cmp: bool) -> int {
+    if op == "load" {
+        if is_imm {
+            // MOVZ [+MOVK for values > 65535]
+            let v = imm
+            if v < 0 { v = 0 - v }
+            if v > 65535 { return 2 }
+            return 1
+        }
+        // load reg — not a real emit; modeled as MOV reg,reg (1 instr)
+        return 1
+    }
+    if op == "add" { return 1 }
+    if op == "mul" { return 1 }
+    if op == "sub" {
+        if has_cmp { return 2 }  // CMP + CSET
+        return 1
+    }
+    if op == "branch" {
+        // CMP Rcond, XZR ; B.EQ fallthrough-or-target ; B fallthrough-or-target
+        // Encoded here as: CMP Rcond, XZR (1) + B.cond (1) + B (1) = 3
+        return 3
+    }
+    if op == "jump" { return 1 }
+    if op == "ret" { return 2 }       // MOV x0,Rv + RET
+    if op == "call" { return 1 }      // BL stub
+    if op == "store" { return 1 }     // MOV dst,src (slot-folded)
+    if op == "alloc" { return 0 }     // SSA ghost (slot-folded, no emit)
+    if op == "phi" { return 1 }       // MOV dst, src (conservative)
+    if op == "label" { return 0 }
+    return 0
+}
+
+// Translate a cmp kind string → ARM64 condition code.
+fn ira_cmp_code(cmp: string) -> int {
+    if cmp == "eq" { return 0 }
+    if cmp == "ne" { return 1 }
+    if cmp == "ge" { return 10 }
+    if cmp == "lt" { return 11 }
+    if cmp == "gt" { return 12 }
+    if cmp == "le" { return 13 }
+    return 14  // AL — fallback
+}
+
+// Emit bytes for a single IR instruction. `cur_instr_idx` is the current
+// instruction index (pass-2), `block_starts` maps block-id → first
+// instruction index in the final stream (pass-1 result).
+fn ira_emit_one(bytes_in: [int], instr, regalloc_map: [int], block_starts: [int], cur_instr_idx: int) -> [int] {
+    let mut bytes = bytes_in
+
+    if instr.op == "load" {
+        if instr.is_imm {
+            let rd = regalloc_reg_for(regalloc_map, instr.result)
+            let v = instr.imm
+            if v < 0 {
+                // Spill sentinel if we hit XZR
+                if rd == 31 {
+                    bytes = ira_emit32_le(bytes, ira_enc_movz(0, 0xDEAD))
+                    return bytes
+                }
+                // For negative, emit MOVZ of low 16 of abs; caller-side NEG
+                // out-of-scope for P7-7 — we just encode the 64-bit value's
+                // low 16 bits verbatim (test uses positive ints).
+                let abs_v = 0 - v
+                bytes = ira_emit32_le(bytes, ira_enc_movz(rd, abs_v % 65536))
+                if abs_v > 65535 {
+                    bytes = ira_emit32_le(bytes, ira_enc_movk(rd, (abs_v / 65536) % 65536, 1))
+                }
+                return bytes
+            }
+            if rd == 31 {
+                bytes = ira_emit32_le(bytes, ira_enc_movz(0, 0xDEAD))
+                return bytes
+            }
+            let lo = v % 65536
+            bytes = ira_emit32_le(bytes, ira_enc_movz(rd, lo))
+            if v > 65535 {
+                bytes = ira_emit32_le(bytes, ira_enc_movk(rd, (v / 65536) % 65536, 1))
+            }
+            return bytes
+        }
+        // Non-immediate "load" (ident / field / index) — we treat as a
+        // register move from source register `a` to result register.
+        let rd = regalloc_reg_for(regalloc_map, instr.result)
+        let rs = regalloc_reg_for(regalloc_map, instr.a)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+
+    if instr.op == "add" {
+        let rd = regalloc_reg_for(regalloc_map, instr.result)
+        let rn = regalloc_reg_for(regalloc_map, instr.a)
+        let rm = regalloc_reg_for(regalloc_map, instr.b)
+        bytes = ira_emit32_le(bytes, ira_enc_add(rd, rn, rm))
+        return bytes
+    }
+
+    if instr.op == "mul" {
+        let rd = regalloc_reg_for(regalloc_map, instr.result)
+        let rn = regalloc_reg_for(regalloc_map, instr.a)
+        let rm = regalloc_reg_for(regalloc_map, instr.b)
+        bytes = ira_emit32_le(bytes, ira_enc_mul(rd, rn, rm))
+        return bytes
+    }
+
+    if instr.op == "sub" {
+        let rn = regalloc_reg_for(regalloc_map, instr.a)
+        let rm = regalloc_reg_for(regalloc_map, instr.b)
+        let rd = regalloc_reg_for(regalloc_map, instr.result)
+        if instr.cmp != "" {
+            // Comparison: CMP Rn, Rm ; CSET Rd, cc
+            bytes = ira_emit32_le(bytes, ira_enc_cmp(rn, rm))
+            bytes = ira_emit32_le(bytes, ira_enc_cset(rd, ira_cmp_code(instr.cmp)))
+            return bytes
+        }
+        bytes = ira_emit32_le(bytes, ira_enc_sub(rd, rn, rm))
+        return bytes
+    }
+
+    if instr.op == "branch" {
+        // a = cond reg (ValueId), b = then block id, c = else block id
+        let cond_reg = regalloc_reg_for(regalloc_map, instr.a)
+        // Emit: CMP cond_reg, XZR (reg 31)
+        bytes = ira_emit32_le(bytes, ira_enc_cmp(cond_reg, 31))
+        // B.NE → then_target (taken when cond != 0)
+        let then_bb = instr.b
+        let else_bb = instr.c
+        let mut then_abs = cur_instr_idx + 3
+        if then_bb >= 0 {
+            if then_bb < len(block_starts) {
+                then_abs = block_starts[then_bb]
+            }
+        }
+        let mut else_abs = cur_instr_idx + 3
+        if else_bb >= 0 {
+            if else_bb < len(block_starts) {
+                else_abs = block_starts[else_bb]
+            }
+        }
+        // B.NE goes to then (cur+1 is this b.cond instr).
+        let b_cond_off = then_abs - (cur_instr_idx + 1)
+        bytes = ira_emit32_le(bytes, ira_enc_b_cond(b_cond_off, 1))  // NE
+        // Fallthrough B goes to else.
+        let b_off = else_abs - (cur_instr_idx + 2)
+        bytes = ira_emit32_le(bytes, ira_enc_b(b_off))
+        return bytes
+    }
+
+    if instr.op == "jump" {
+        let tgt_bb = instr.a
+        let mut tgt_abs = cur_instr_idx + 1
+        if tgt_bb >= 0 {
+            if tgt_bb < len(block_starts) {
+                tgt_abs = block_starts[tgt_bb]
+            }
+        }
+        let off = tgt_abs - cur_instr_idx
+        bytes = ira_emit32_le(bytes, ira_enc_b(off))
+        return bytes
+    }
+
+    if instr.op == "ret" {
+        // a = value vid (or -1 for void)
+        if instr.a >= 0 {
+            let rs = regalloc_reg_for(regalloc_map, instr.a)
+            bytes = ira_emit32_le(bytes, ira_enc_mov_reg(0, rs))
+        } else {
+            // void ret — still emit MOV x0,XZR for shape consistency
+            bytes = ira_emit32_le(bytes, ira_enc_mov_reg(0, 31))
+        }
+        bytes = ira_emit32_le(bytes, ira_enc_ret())
+        return bytes
+    }
+
+    if instr.op == "call" {
+        // BL stub (offset 0) — a real linker/patcher resolves later.
+        bytes = ira_emit32_le(bytes, ira_enc_bl(0))
+        return bytes
+    }
+
+    if instr.op == "store" {
+        // Slot-folded: emit MOV slot_reg, src_reg. a = slot vid, b = src vid.
+        let rd = regalloc_reg_for(regalloc_map, instr.a)
+        let rs = regalloc_reg_for(regalloc_map, instr.b)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+
+    if instr.op == "alloc" {
+        // SSA ghost — no bytes emitted, slot handled by regalloc.
+        return bytes
+    }
+
+    if instr.op == "phi" {
+        // Conservative MOV from the "then" incoming value (a) into the
+        // phi result register. Proper PHI scheduling is the next step.
+        let rd = regalloc_reg_for(regalloc_map, instr.result)
+        let rs = regalloc_reg_for(regalloc_map, instr.a)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+
+    if instr.op == "label" {
+        return bytes
+    }
+
+    // Unknown op — emit spill/bug sentinel so callers notice.
+    bytes = ira_emit32_le(bytes, ira_enc_movz(0, 0xBADF))
+    return bytes
+}
+
+// ── Entry point ────────────────────────────────────────────
+//
+// blocks: array of { id:int, instructions:[IRInstr] }
+// regalloc_map: array of int (x-register per ValueId)
+// Returns array<int> of bytes (u8 values 0..255).
+
+fn lower_ir_to_arm64(blocks, regalloc_map: [int]) -> [int] {
+    // ─── Pass 1: compute block_starts (instruction indices) ────
+    let mut block_starts = []
+    let mut cursor = 0
+    let mut bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let bb_id = bb.id
+        // Grow block_starts to cover this id.
+        while len(block_starts) <= bb_id {
+            block_starts = block_starts.push(0)
+        }
+        block_starts[bb_id] = cursor
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            cursor = cursor + ira_ops_size(inst.op, inst.is_imm, inst.imm, has_cmp)
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+
+    // ─── Pass 2: emit bytes ──────────────────────────────────
+    let mut bytes = []
+    let mut instr_idx = 0
+    bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            let sz = ira_ops_size(inst.op, inst.is_imm, inst.imm, has_cmp)
+            bytes = ira_emit_one(bytes, inst, regalloc_map, block_starts, instr_idx)
+            instr_idx = instr_idx + sz
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    return bytes
+}

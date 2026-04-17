@@ -1,0 +1,723 @@
+// ═══════════════════════════════════════════════════════════
+//  self/test_ir_to_arm64.hexa — P7-7 IR→ARM64 bridge tests
+//
+//  Standalone self-test: builds IR by hand, lowers to ARM64 bytes
+//  via lower_ir_to_arm64(blocks, regalloc_map), and asserts on
+//  specific instruction byte patterns (MOVZ/ADD/CMP/RET/BL/etc.).
+//
+//  Tests:
+//    T1  test_return_const      — return 42 → MOVZ x0,#42 + MOV+RET
+//    T2  test_add_const         — 3 + 4 → MOVZ+MOVZ+ADD+MOV+RET
+//    T3  test_if_branch         — if cond { return 1 } → CMP+B.cond+MOVZ+RET
+//    T4  test_loop_3_iters      — for i in 0..3 { x += i } → CMP+B.cond+ADD
+//    T5  test_call_stub         — fn f() { g() } → BL present
+//    T6  test_fib_equivalent    — fib-like loop → MOVZ+ADD+CMP patterns
+//
+//  Expected result line: "ALL PASS" (all sub-assertions passed).
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check_true(name: string, cond: bool) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_int_eq(name: string, got: int, expected: int) {
+    if got == expected {
+        println("[PASS] " + name + " = " + to_string(got))
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " expected " + to_string(expected) + ", got " + to_string(got))
+        fail_count = fail_count + 1
+    }
+}
+
+// ── IRInstr / BB shapes ────────────────────────────────────
+struct IRInstr {
+    result: int,
+    op: string,
+    ty: string,
+    a: int,
+    b: int,
+    c: int,
+    imm: int,
+    is_imm: bool,
+    cmp: string
+}
+
+struct BB {
+    id: int,
+    instructions: array
+}
+
+fn mk_bb(id: int) -> BB {
+    return BB { id: id, instructions: [] }
+}
+
+fn bb_push(bb: BB, inst: IRInstr) -> BB {
+    return BB { id: bb.id, instructions: bb.instructions.push(inst) }
+}
+
+// Constructors.
+fn ir_load_imm(result: int, imm: int) -> IRInstr {
+    return IRInstr { result: result, op: "load", ty: "i64",
+        a: 0, b: 0, c: 0, imm: imm, is_imm: true, cmp: "" }
+}
+
+fn ir_load_reg(result: int, src: int) -> IRInstr {
+    return IRInstr { result: result, op: "load", ty: "i64",
+        a: src, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_add(result: int, a: int, b: int) -> IRInstr {
+    return IRInstr { result: result, op: "add", ty: "i64",
+        a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_sub(result: int, a: int, b: int) -> IRInstr {
+    return IRInstr { result: result, op: "sub", ty: "i64",
+        a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_mul(result: int, a: int, b: int) -> IRInstr {
+    return IRInstr { result: result, op: "mul", ty: "i64",
+        a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_cmp(result: int, a: int, b: int, kind: string) -> IRInstr {
+    return IRInstr { result: result, op: "sub", ty: "bool",
+        a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: kind }
+}
+
+fn ir_branch(cond: int, then_bb: int, else_bb: int) -> IRInstr {
+    return IRInstr { result: -1, op: "branch", ty: "void",
+        a: cond, b: then_bb, c: else_bb, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_jump(target_bb: int) -> IRInstr {
+    return IRInstr { result: -1, op: "jump", ty: "void",
+        a: target_bb, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_ret(val: int) -> IRInstr {
+    return IRInstr { result: -1, op: "ret", ty: "void",
+        a: val, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_call(result: int) -> IRInstr {
+    return IRInstr { result: result, op: "call", ty: "i64",
+        a: 0, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn ir_store(slot: int, src: int) -> IRInstr {
+    return IRInstr { result: -1, op: "store", ty: "void",
+        a: slot, b: src, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Inlined bridge: mirrors self/codegen/ir_to_arm64.hexa so the
+//  test runs standalone under hexa_stage0 without concat-link.
+// ═══════════════════════════════════════════════════════════
+
+fn ira_emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+fn ira_enc_movz(rd: int, imm16: int) -> int {
+    return 3531603968 + (imm16 * 32) + rd
+}
+fn ira_enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 4068474880 + (hw * 2097152) + (imm16 * 32) + rd
+}
+fn ira_enc_add(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + (rm * 65536) + (rn * 32) + rd
+}
+fn ira_enc_sub(rd: int, rn: int, rm: int) -> int {
+    return 3405774848 + (rm * 65536) + (rn * 32) + rd
+}
+fn ira_enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600500224 + (rm * 65536) + (rn * 32) + rd
+}
+fn ira_enc_mov_reg(rd: int, rm: int) -> int {
+    return 2852127712 + (rm * 65536) + rd
+}
+fn ira_enc_cmp(rn: int, rm: int) -> int {
+    return 3942645791 + (rm * 65536) + (rn * 32)
+}
+fn ira_enc_cset(rd: int, cond_code: int) -> int {
+    if cond_code == 0 { return 2594113504 + 1 * 4096 + rd }
+    if cond_code == 1 { return 2594113504 + 0 * 4096 + rd }
+    if cond_code == 10 { return 2594113504 + 11 * 4096 + rd }
+    if cond_code == 11 { return 2594113504 + 10 * 4096 + rd }
+    if cond_code == 12 { return 2594113504 + 13 * 4096 + rd }
+    if cond_code == 13 { return 2594113504 + 12 * 4096 + rd }
+    return 2594113504 + rd
+}
+fn ira_enc_b(off26: int) -> int {
+    if off26 >= 0 {
+        return 335544320 + (off26 % 67108864)
+    }
+    return 335544320 + ((off26 + 67108864) % 67108864)
+}
+fn ira_enc_b_cond(off19: int, cond_code: int) -> int {
+    let mut off = off19
+    if off < 0 { off = off + 524288 }
+    return 1409286144 + (off * 32) + cond_code
+}
+fn ira_enc_bl(off26: int) -> int {
+    if off26 >= 0 {
+        return 2483027968 + (off26 % 67108864)
+    }
+    return 2483027968 + ((off26 + 67108864) % 67108864)
+}
+fn ira_enc_ret() -> int {
+    return 3596551104
+}
+
+fn regalloc_linear_simple(n_values: int) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < n_values {
+        if i < 8 {
+            out = out.push(i)
+        } else {
+            out = out.push(31)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn regalloc_reg_for(regalloc_map: [int], vid: int) -> int {
+    if vid < 0 { return 0 }
+    if vid >= len(regalloc_map) { return 31 }
+    return regalloc_map[vid]
+}
+
+fn ira_cmp_code(cmp: string) -> int {
+    if cmp == "eq" { return 0 }
+    if cmp == "ne" { return 1 }
+    if cmp == "ge" { return 10 }
+    if cmp == "lt" { return 11 }
+    if cmp == "gt" { return 12 }
+    if cmp == "le" { return 13 }
+    return 14
+}
+
+fn ira_ops_size(op: string, is_imm: bool, imm: int, has_cmp: bool) -> int {
+    if op == "load" {
+        if is_imm {
+            let mut v = imm
+            if v < 0 { v = 0 - v }
+            if v > 65535 { return 2 }
+            return 1
+        }
+        return 1
+    }
+    if op == "add" { return 1 }
+    if op == "mul" { return 1 }
+    if op == "sub" {
+        if has_cmp { return 2 }
+        return 1
+    }
+    if op == "branch" { return 3 }
+    if op == "jump" { return 1 }
+    if op == "ret" { return 2 }
+    if op == "call" { return 1 }
+    if op == "store" { return 1 }
+    if op == "alloc" { return 0 }
+    if op == "phi" { return 1 }
+    if op == "label" { return 0 }
+    return 0
+}
+
+fn ira_emit_one(bytes_in: [int], inst: IRInstr, regalloc_map: [int], block_starts: [int], cur_instr_idx: int) -> [int] {
+    let mut bytes = bytes_in
+    if inst.op == "load" {
+        if inst.is_imm {
+            let rd = regalloc_reg_for(regalloc_map, inst.result)
+            let v = inst.imm
+            if rd == 31 {
+                bytes = ira_emit32_le(bytes, ira_enc_movz(0, 0xDEAD))
+                return bytes
+            }
+            if v < 0 {
+                let abs_v = 0 - v
+                bytes = ira_emit32_le(bytes, ira_enc_movz(rd, abs_v % 65536))
+                if abs_v > 65535 {
+                    bytes = ira_emit32_le(bytes, ira_enc_movk(rd, (abs_v / 65536) % 65536, 1))
+                }
+                return bytes
+            }
+            bytes = ira_emit32_le(bytes, ira_enc_movz(rd, v % 65536))
+            if v > 65535 {
+                bytes = ira_emit32_le(bytes, ira_enc_movk(rd, (v / 65536) % 65536, 1))
+            }
+            return bytes
+        }
+        let rd = regalloc_reg_for(regalloc_map, inst.result)
+        let rs = regalloc_reg_for(regalloc_map, inst.a)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+    if inst.op == "add" {
+        let rd = regalloc_reg_for(regalloc_map, inst.result)
+        let rn = regalloc_reg_for(regalloc_map, inst.a)
+        let rm = regalloc_reg_for(regalloc_map, inst.b)
+        bytes = ira_emit32_le(bytes, ira_enc_add(rd, rn, rm))
+        return bytes
+    }
+    if inst.op == "mul" {
+        let rd = regalloc_reg_for(regalloc_map, inst.result)
+        let rn = regalloc_reg_for(regalloc_map, inst.a)
+        let rm = regalloc_reg_for(regalloc_map, inst.b)
+        bytes = ira_emit32_le(bytes, ira_enc_mul(rd, rn, rm))
+        return bytes
+    }
+    if inst.op == "sub" {
+        let rn = regalloc_reg_for(regalloc_map, inst.a)
+        let rm = regalloc_reg_for(regalloc_map, inst.b)
+        let rd = regalloc_reg_for(regalloc_map, inst.result)
+        if inst.cmp != "" {
+            bytes = ira_emit32_le(bytes, ira_enc_cmp(rn, rm))
+            bytes = ira_emit32_le(bytes, ira_enc_cset(rd, ira_cmp_code(inst.cmp)))
+            return bytes
+        }
+        bytes = ira_emit32_le(bytes, ira_enc_sub(rd, rn, rm))
+        return bytes
+    }
+    if inst.op == "branch" {
+        let cond_reg = regalloc_reg_for(regalloc_map, inst.a)
+        bytes = ira_emit32_le(bytes, ira_enc_cmp(cond_reg, 31))
+        let then_bb = inst.b
+        let else_bb = inst.c
+        let mut then_abs = cur_instr_idx + 3
+        if then_bb >= 0 {
+            if then_bb < len(block_starts) {
+                then_abs = block_starts[then_bb]
+            }
+        }
+        let mut else_abs = cur_instr_idx + 3
+        if else_bb >= 0 {
+            if else_bb < len(block_starts) {
+                else_abs = block_starts[else_bb]
+            }
+        }
+        let b_cond_off = then_abs - (cur_instr_idx + 1)
+        bytes = ira_emit32_le(bytes, ira_enc_b_cond(b_cond_off, 1))
+        let b_off = else_abs - (cur_instr_idx + 2)
+        bytes = ira_emit32_le(bytes, ira_enc_b(b_off))
+        return bytes
+    }
+    if inst.op == "jump" {
+        let tgt_bb = inst.a
+        let mut tgt_abs = cur_instr_idx + 1
+        if tgt_bb >= 0 {
+            if tgt_bb < len(block_starts) {
+                tgt_abs = block_starts[tgt_bb]
+            }
+        }
+        let off = tgt_abs - cur_instr_idx
+        bytes = ira_emit32_le(bytes, ira_enc_b(off))
+        return bytes
+    }
+    if inst.op == "ret" {
+        if inst.a >= 0 {
+            let rs = regalloc_reg_for(regalloc_map, inst.a)
+            bytes = ira_emit32_le(bytes, ira_enc_mov_reg(0, rs))
+        } else {
+            bytes = ira_emit32_le(bytes, ira_enc_mov_reg(0, 31))
+        }
+        bytes = ira_emit32_le(bytes, ira_enc_ret())
+        return bytes
+    }
+    if inst.op == "call" {
+        bytes = ira_emit32_le(bytes, ira_enc_bl(0))
+        return bytes
+    }
+    if inst.op == "store" {
+        let rd = regalloc_reg_for(regalloc_map, inst.a)
+        let rs = regalloc_reg_for(regalloc_map, inst.b)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+    if inst.op == "alloc" { return bytes }
+    if inst.op == "phi" {
+        let rd = regalloc_reg_for(regalloc_map, inst.result)
+        let rs = regalloc_reg_for(regalloc_map, inst.a)
+        bytes = ira_emit32_le(bytes, ira_enc_mov_reg(rd, rs))
+        return bytes
+    }
+    if inst.op == "label" { return bytes }
+    bytes = ira_emit32_le(bytes, ira_enc_movz(0, 0xBADF))
+    return bytes
+}
+
+fn lower_ir_to_arm64(blocks, regalloc_map: [int]) -> [int] {
+    let mut block_starts = []
+    let mut cursor = 0
+    let mut bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let bb_id = bb.id
+        while len(block_starts) <= bb_id {
+            block_starts = block_starts.push(0)
+        }
+        block_starts[bb_id] = cursor
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let mut has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            cursor = cursor + ira_ops_size(inst.op, inst.is_imm, inst.imm, has_cmp)
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+
+    let mut bytes = []
+    let mut instr_idx = 0
+    bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let mut has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            let sz = ira_ops_size(inst.op, inst.is_imm, inst.imm, has_cmp)
+            bytes = ira_emit_one(bytes, inst, regalloc_map, block_starts, instr_idx)
+            instr_idx = instr_idx + sz
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    return bytes
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Byte search helpers
+// ═══════════════════════════════════════════════════════════
+
+// Does the byte array `bytes` contain the 4-byte little-endian encoding
+// of `instr` at any 4-byte aligned position?
+fn contains_instr(bytes: [int], instr: int) -> bool {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    let mut i = 0
+    while (i + 4) <= len(bytes) {
+        if bytes[i] == b0 {
+            if bytes[i + 1] == b1 {
+                if bytes[i + 2] == b2 {
+                    if bytes[i + 3] == b3 {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 4
+    }
+    return false
+}
+
+// Does `bytes` contain ANY BL instruction? (top 6 bits = 0x94 / 37 << 2)
+fn contains_bl(bytes: [int]) -> bool {
+    let mut i = 0
+    while (i + 4) <= len(bytes) {
+        // BL: bits [31:26] = 100101 → byte[3] & 0xFC == 0x94
+        let hi = bytes[i + 3]
+        if (hi / 4) * 4 == 148 {   // 0x94 = 148; keep top 6 bits
+            return true
+        }
+        i = i + 4
+    }
+    return false
+}
+
+// Does `bytes` contain ANY B.cond instruction? (top 8 bits = 0x54)
+fn contains_bcond(bytes: [int]) -> bool {
+    let mut i = 0
+    while (i + 4) <= len(bytes) {
+        if bytes[i + 3] == 84 {   // 0x54
+            return true
+        }
+        i = i + 4
+    }
+    return false
+}
+
+// Does `bytes` contain ANY CMP instruction? (SUBS XZR,Xn,Xm base 0xEB00001F)
+//
+// Layout (AArch64 shifted-register, 64-bit):
+//   [31:24] = 0xEB         → byte[3] == 0xEB
+//   [23:22] = shift = 00   → top 2 bits of byte[2] == 0
+//   [21]    = 0            → bit 5 of byte[2] == 0
+//   [20:16] = Rm
+//   [15:10] = imm6 shift   → top 6 bits of byte[1] == 0  (bit 0/1 is rn[4:3])
+//   [9:5]   = Rn
+//   [4:0]   = Rd = 31 (XZR) → low 5 bits of byte[0] == 0x1F
+fn contains_cmp(bytes: [int]) -> bool {
+    let mut i = 0
+    while (i + 4) <= len(bytes) {
+        if bytes[i + 3] == 235 {                  // 0xEB
+            // top 2 bits of byte[2] (bits 22,23 of instr) must be 0
+            if (bytes[i + 2] / 64) == 0 {
+                // bit 21 of instr (bit 5 of byte[2]) must be 0
+                if (bytes[i + 2] / 32) % 2 == 0 {
+                    // Rd low 5 bits of byte[0] == 31 (XZR)
+                    if (bytes[i] % 32) == 31 {
+                        return true
+                    }
+                }
+            }
+        }
+        i = i + 4
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════
+
+println("═══════════════════════════════════════════════════════")
+println("  IR → ARM64 bridge — P7-7 self-test")
+println("═══════════════════════════════════════════════════════")
+
+// ── T1: return 42 ─────────────────────────────────────────────
+// IR:  %0 = load imm 42 ; ret %0
+fn build_return_const() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_load_imm(0, 42))
+    bb0 = bb_push(bb0, ir_ret(0))
+    return [bb0]
+}
+
+let t1_blocks = build_return_const()
+let t1_regs = regalloc_linear_simple(1)
+let t1_bytes = lower_ir_to_arm64(t1_blocks, t1_regs)
+// Expect: MOVZ x0,#42 (=0xd2800540 = 3531605312)
+//         MOV  x0,x0  (ORR x0,xzr,x0 = 0xaa0003e0 = 2852127712)
+//         RET         (0xd65f03c0 = 3596551104)
+check_int_eq("T1 byte count (3 instrs)", len(t1_bytes), 12)
+check_true("T1 MOVZ x0,#42 present", contains_instr(t1_bytes, 3531603968 + 42 * 32 + 0))
+check_true("T1 RET present", contains_instr(t1_bytes, 3596551104))
+
+// ── T2: 3 + 4 ─────────────────────────────────────────────────
+fn build_add_const() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_load_imm(0, 3))
+    bb0 = bb_push(bb0, ir_load_imm(1, 4))
+    bb0 = bb_push(bb0, ir_add(2, 0, 1))
+    bb0 = bb_push(bb0, ir_ret(2))
+    return [bb0]
+}
+
+let t2_blocks = build_add_const()
+let t2_regs = regalloc_linear_simple(3)
+let t2_bytes = lower_ir_to_arm64(t2_blocks, t2_regs)
+// Expect: MOVZ x0,#3 ; MOVZ x1,#4 ; ADD x2,x0,x1 ; MOV x0,x2 ; RET
+check_int_eq("T2 byte count (5 instrs)", len(t2_bytes), 20)
+check_true("T2 MOVZ x0,#3",  contains_instr(t2_bytes, 3531603968 + 3 * 32 + 0))
+check_true("T2 MOVZ x1,#4",  contains_instr(t2_bytes, 3531603968 + 4 * 32 + 1))
+check_true("T2 ADD x2,x0,x1", contains_instr(t2_bytes, 2332033024 + 1 * 65536 + 0 * 32 + 2))
+check_true("T2 RET present", contains_instr(t2_bytes, 3596551104))
+
+// ── T3: if cond { return 1 } else { return 2 } ───────────────
+// Build:
+//   bb0: %0 = load imm 1       (cond — truthy constant)
+//        branch %0, bb1, bb2
+//   bb1: %1 = load imm 1
+//        ret %1
+//   bb2: %2 = load imm 2
+//        ret %2
+fn build_if_branch() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_load_imm(0, 1))
+    bb0 = bb_push(bb0, ir_branch(0, 1, 2))
+
+    let mut bb1 = mk_bb(1)
+    bb1 = bb_push(bb1, ir_load_imm(1, 1))
+    bb1 = bb_push(bb1, ir_ret(1))
+
+    let mut bb2 = mk_bb(2)
+    bb2 = bb_push(bb2, ir_load_imm(2, 2))
+    bb2 = bb_push(bb2, ir_ret(2))
+
+    return [bb0, bb1, bb2]
+}
+
+let t3_blocks = build_if_branch()
+let t3_regs = regalloc_linear_simple(3)
+let t3_bytes = lower_ir_to_arm64(t3_blocks, t3_regs)
+check_true("T3 contains CMP",   contains_cmp(t3_bytes))
+check_true("T3 contains B.cond", contains_bcond(t3_bytes))
+check_true("T3 contains MOVZ x1,#1", contains_instr(t3_bytes, 3531603968 + 1 * 32 + 1))
+check_true("T3 contains MOVZ x2,#2", contains_instr(t3_bytes, 3531603968 + 2 * 32 + 2))
+check_true("T3 contains RET",    contains_instr(t3_bytes, 3596551104))
+
+// ── T4: for i in 0..3 { x += i } ─────────────────────────────
+// IR (loosely — we model the inner shape to prove CMP+B.cond+ADD emerge):
+//   bb0 entry:
+//       %0 = load imm 0              (i = 0)
+//       %1 = load imm 0              (x = 0)
+//       jump bb1
+//   bb1 header:
+//       %2 = load imm 3              (limit)
+//       %3 = cmp lt %0, %2
+//       branch %3, bb2, bb3
+//   bb2 body:
+//       %4 = add %1, %0              (x = x + i)
+//       %5 = load imm 1
+//       %6 = add %0, %5              (i = i + 1)
+//       jump bb1
+//   bb3 exit:
+//       ret %4
+//
+// NOTE: we pre-size the regalloc map for 7 ValueIds. This keeps the
+// vid<8 linear-allocation invariant.
+fn build_loop_3_iters() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_load_imm(0, 0))
+    bb0 = bb_push(bb0, ir_load_imm(1, 0))
+    bb0 = bb_push(bb0, ir_jump(1))
+
+    let mut bb1 = mk_bb(1)
+    bb1 = bb_push(bb1, ir_load_imm(2, 3))
+    bb1 = bb_push(bb1, ir_cmp(3, 0, 2, "lt"))
+    bb1 = bb_push(bb1, ir_branch(3, 2, 3))
+
+    let mut bb2 = mk_bb(2)
+    bb2 = bb_push(bb2, ir_add(4, 1, 0))
+    bb2 = bb_push(bb2, ir_load_imm(5, 1))
+    bb2 = bb_push(bb2, ir_add(6, 0, 5))
+    bb2 = bb_push(bb2, ir_jump(1))
+
+    let mut bb3 = mk_bb(3)
+    bb3 = bb_push(bb3, ir_ret(4))
+
+    return [bb0, bb1, bb2, bb3]
+}
+
+let t4_blocks = build_loop_3_iters()
+let t4_regs = regalloc_linear_simple(7)
+let t4_bytes = lower_ir_to_arm64(t4_blocks, t4_regs)
+check_true("T4 contains CMP",    contains_cmp(t4_bytes))
+check_true("T4 contains B.cond", contains_bcond(t4_bytes))
+// ADD x4, x1, x0 (x = x + i) — rd=4, rn=1, rm=0
+check_true("T4 contains ADD x4,x1,x0",
+    contains_instr(t4_bytes, 2332033024 + 0 * 65536 + 1 * 32 + 4))
+// ADD x6, x0, x5 (i = i + 1) — rd=6, rn=0, rm=5
+check_true("T4 contains ADD x6,x0,x5",
+    contains_instr(t4_bytes, 2332033024 + 5 * 65536 + 0 * 32 + 6))
+check_true("T4 contains RET", contains_instr(t4_bytes, 3596551104))
+
+// ── T5: call stub — fn f() { g() } ────────────────────────────
+fn build_call_stub() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_call(0))
+    bb0 = bb_push(bb0, ir_ret(0))
+    return [bb0]
+}
+
+let t5_blocks = build_call_stub()
+let t5_regs = regalloc_linear_simple(1)
+let t5_bytes = lower_ir_to_arm64(t5_blocks, t5_regs)
+check_true("T5 contains BL", contains_bl(t5_bytes))
+check_true("T5 contains RET", contains_instr(t5_bytes, 3596551104))
+// BL with offset=0 should be exactly 0x94000000 = 2483027968
+check_true("T5 BL #0 literal",
+    contains_instr(t5_bytes, 2483027968))
+
+// ── T6: fib-equivalent loop — naïve shape check ──────────────
+// pseudocode:
+//   a = 0 ; b = 1 ; i = 0
+//   while i < 5 {
+//       t = a + b
+//       a = b
+//       b = t
+//       i = i + 1
+//   }
+//   return a
+//
+// IR (uses 8 ValueIds, packs into x0..x7):
+//   bb0 entry:
+//     %0 = 0 ; %1 = 1 ; %2 = 0 ; jump bb1
+//   bb1 header:
+//     %3 = 5
+//     %4 = cmp lt %2, %3
+//     branch %4, bb2, bb3
+//   bb2 body:
+//     %5 = add %0, %1     ; t
+//     %6 = load reg %1    ; a' = b (MOV)
+//     %7 = load reg %5    ; b' = t (MOV)
+//     %8 = load imm 1
+//     (i = i + 1) — modelled as a store-like MOV to %2's slot
+//     jump bb1
+//   bb3 exit:
+//     ret %0
+//
+// We only have 8 slots (0..7) for linear regalloc, so we ELIDE the
+// two reg-moves (%6/%7) and the increment to keep this test's ValueIds
+// at ≤ 7. Shape check is sufficient for P7-7.
+fn build_fib() -> array {
+    let mut bb0 = mk_bb(0)
+    bb0 = bb_push(bb0, ir_load_imm(0, 0))
+    bb0 = bb_push(bb0, ir_load_imm(1, 1))
+    bb0 = bb_push(bb0, ir_load_imm(2, 0))
+    bb0 = bb_push(bb0, ir_jump(1))
+
+    let mut bb1 = mk_bb(1)
+    bb1 = bb_push(bb1, ir_load_imm(3, 5))
+    bb1 = bb_push(bb1, ir_cmp(4, 2, 3, "lt"))
+    bb1 = bb_push(bb1, ir_branch(4, 2, 3))
+
+    let mut bb2 = mk_bb(2)
+    bb2 = bb_push(bb2, ir_add(5, 0, 1))       // t = a + b
+    bb2 = bb_push(bb2, ir_store(0, 1))         // a = b  (slot MOV)
+    bb2 = bb_push(bb2, ir_store(1, 5))         // b = t  (slot MOV)
+    bb2 = bb_push(bb2, ir_load_imm(6, 1))
+    bb2 = bb_push(bb2, ir_add(7, 2, 6))        // i + 1
+    bb2 = bb_push(bb2, ir_store(2, 7))         // i = i+1
+    bb2 = bb_push(bb2, ir_jump(1))
+
+    let mut bb3 = mk_bb(3)
+    bb3 = bb_push(bb3, ir_ret(0))
+
+    return [bb0, bb1, bb2, bb3]
+}
+
+let t6_blocks = build_fib()
+let t6_regs = regalloc_linear_simple(8)
+let t6_bytes = lower_ir_to_arm64(t6_blocks, t6_regs)
+check_true("T6 contains MOVZ x0,#0", contains_instr(t6_bytes, 3531603968 + 0 * 32 + 0))
+check_true("T6 contains MOVZ x1,#1", contains_instr(t6_bytes, 3531603968 + 1 * 32 + 1))
+check_true("T6 contains ADD x5,x0,x1",
+    contains_instr(t6_bytes, 2332033024 + 1 * 65536 + 0 * 32 + 5))
+check_true("T6 contains CMP",    contains_cmp(t6_bytes))
+check_true("T6 contains B.cond", contains_bcond(t6_bytes))
+check_true("T6 contains RET",    contains_instr(t6_bytes, 3596551104))
+
+// ── Summary ─────────────────────────────────────────────────
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  ir_to_arm64 tests: " + to_string(pass_count) + " pass, " + to_string(fail_count) + " fail")
+println("═══════════════════════════════════════════════════════")
+if fail_count > 0 {
+    println("FAIL")
+} else {
+    println("ALL PASS")
+}
