@@ -33,7 +33,7 @@
 let x = 0.0 / 0.0   // Runtime error: division by zero
 ```
 - 영향: `texas_verifier.hexa` (sentinel 1e99로 우회)
-- **해결**: `self/lib/nan_sentinel.hexa` — sentinel 기반 NaN/Inf 표현
+- **해결**: `self/stdlib/nan_sentinel.hexa` — sentinel 기반 NaN/Inf 표현
 - 검증: lib import 후 `is_nan(x)` / `is_inf(x)` 사용 가능
 
 ### B2. 블록 내부 세미콜론 ✅
@@ -58,7 +58,7 @@ let data = [
 
 ### B4. `split("")` char 분할 ✅
 - 영향: `consciousness_bridge`
-- **해결**: `self/lib/str_utils.hexa` — `chars(s)`, `char_at(s, i)` helper
+- **해결**: `self/stdlib/str_utils.hexa` — `chars(s)`, `char_at(s, i)` helper
 
 ### B5. return 내부 silent exit ✅
 - 영향: `oeis_search` — 포팅 완전 포기 → **해결됨**
@@ -98,11 +98,11 @@ let data = [
 
 ### I9. sigma/phi/tau sieve ✅
 - N=10000 스캔 ~10초+ 문제
-- **해결**: `self/lib/sieve.hexa` — `sigma_sieve(N)` / `phi_sieve(N)` / `tau_sieve(N)` 빌트인
+- **해결**: `self/stdlib/sieve.hexa` — `sigma_sieve(N)` / `phi_sieve(N)` / `tau_sieve(N)` 빌트인
 
 ### I10. Set 타입 ✅
 - 영향: `r_chain_dynamics`, `task1_*`
-- **해결**: `self/lib/set_emu.hexa` — Set emulation lib
+- **해결**: `self/stdlib/set_emu.hexa` — Set emulation lib
 
 ## 🟢 편의성
 
@@ -115,7 +115,7 @@ let data = [
   → `1`, `3` ✅
 
 ### I12. String slicing ✅
-- **해결**: `self/lib/str_utils.hexa` — `slice(s, start, end)` helper
+- **해결**: `self/stdlib/str_utils.hexa` — `slice(s, start, end)` helper
 
 ### I13. stdout flush ✅
 - HEXA-GATE stdout 버퍼링 → 출력 손실 문제
@@ -126,7 +126,7 @@ let data = [
 
 ### I15. Rational/Fraction ✅
 - 영향: `r_spectrum`, `task1_*`, `dirichlet_triple_selfinv`
-- **해결**: `self/lib/fraction.hexa`
+- **해결**: `self/stdlib/fraction.hexa`
 
 ## 최종 검증 (main HEAD)
 

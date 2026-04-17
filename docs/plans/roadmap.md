@@ -25,7 +25,7 @@
 L/P 병렬 에이전트 사이클. 환영 수치 정정 + 3 FAIL 근본원인 특정 + n6_guard 데몬 이슈 확정 + SSOT 잔존 정리 + self/formatter.hexa 포팅.
 
 ### 검증 정정
-- [x] **HEXA-IR "111/116 PASS" 환영 수치 → 실제 23/23** — `self/verify_ir_phase1.hexa` 하드코딩 상수였음. src/ir 실측 23/23 PASS. L 에이전트 정정 완료.
+- [x] **HEXA-IR "111/116 PASS" 환영 수치 → 실제 23/23** — `self/verify_ir.hexa` 하드코딩 상수였음. src/ir 실측 23/23 PASS. L 에이전트 정정 완료.
 - [x] **n6 마이그레이션 `ready` 파일 재검증** — 숫자 출처 모두 self/ 하드코딩 또는 stale 리포트로 판명
 
 ### 3 FAIL 근본원인 특정 — ✅ 전부 수정됨 (1975 PASS)
