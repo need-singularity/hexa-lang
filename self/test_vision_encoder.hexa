@@ -41,7 +41,849 @@
 //  run: ./hexa self/test_vision_encoder.hexa
 // ===================================================================
 
-import "ml/vision_encoder.hexa"
+// -- inlined from self/ml/vision_encoder.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/vision_encoder.hexa — ViT Vision Encoder for Multimodal LLM
+//
+//  HEXA-LANG ML #118 — Vision Transformer (ViT) patch embedding for
+//  multimodal input. Splits an image [H, W, C] into non-overlapping
+//  patches [N, P*P*C], linearly projects to d_model, prepends a
+//  learnable CLS token, adds 2D positional embeddings, and runs L
+//  layers of (LayerNorm -> MultiHeadAttention -> FFN) with residual
+//  connections. Finally projects the CLS output to LLM embedding space.
+//
+//  Architecture:
+//    1. Patch Embedding: image [H,W,C] -> [N, P*P*C] -> linear -> [N, d_model]
+//    2. CLS Token: prepend learnable [1, d_model] -> [N+1, d_model]
+//    3. Positional Embedding: learnable [N+1, d_model] added
+//    4. ViT Encoder: L x (LayerNorm -> MHSA -> residual -> LayerNorm -> FFN -> residual)
+//    5. Projection Head: CLS output [d_model] -> linear -> [llm_dim]
+//    6. Image Preprocessing: normalize per-channel, resize to expected resolution
+//
+//  Pure .hexa, self/ only, zero Rust. Deterministic via LCG seed.
+//
+//  API:
+//    vit_make_config(img_h, img_w, channels, patch_size, d_model,
+//                    n_heads, n_layers, ffn_mult, llm_dim) -> ViTConfig
+//    vit_make_model(cfg, seed)                              -> ViTModel
+//    vit_extract_patches(image, cfg)                        -> [[float]]
+//    vit_patch_embed(model, patches)                        -> [[float]]
+//    vit_add_cls_and_pos(model, embedded)                   -> [[float]]
+//    vit_layer_norm(x, gamma, beta, eps)                    -> [float]
+//    vit_attention(model, layer, seq)                       -> [[float]]
+//    vit_ffn(model, layer, x)                               -> [float]
+//    vit_encoder_block(model, layer, seq)                   -> [[float]]
+//    vit_encode(model, image)                               -> [float]
+//    vit_project_to_llm(model, cls_out)                     -> [float]
+//    vit_forward(model, image)                              -> [float]
+//    vit_preprocess(raw_image, target_h, target_w, mean, std_dev) -> [float]
+//    vit_softmax(scores, n)                                 -> [float]
+//    vit_num_patches(cfg)                                   -> int
+//
+//  Rules: HX4 SELF-HOST FIRST, HX5 AI-native, P1 no semicolons,
+//         P4 native collections.
+// ===================================================================
+
+// ── Structs ────────────────────────────────────────────────────
+
+struct ViTConfig {
+    img_h: int,
+    img_w: int,
+    channels: int,
+    patch_size: int,
+    d_model: int,
+    n_heads: int,
+    n_layers: int,
+    ffn_dim: int,
+    llm_dim: int,
+    num_patches: int,
+    patch_dim: int,
+    seq_len: int,
+    head_dim: int
+}
+
+struct ViTModel {
+    cfg: ViTConfig,
+    patch_proj_w: array,
+    patch_proj_b: array,
+    cls_token: array,
+    pos_embed: array,
+    layers: array,
+    proj_w: array,
+    proj_b: array,
+    ln_final_gamma: array,
+    ln_final_beta: array,
+    rng: int
+}
+
+struct ViTLayer {
+    ln1_gamma: array,
+    ln1_beta: array,
+    wq: array,
+    wk: array,
+    wv: array,
+    wo: array,
+    ln2_gamma: array,
+    ln2_beta: array,
+    ffn_w1: array,
+    ffn_b1: array,
+    ffn_w2: array,
+    ffn_b2: array
+}
+
+// ── Deterministic LCG ─────────────────────────────────────────
+
+fn _vit_lcg_next(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let mut s = (state * a + c) % m
+    if s < 0 { s = s + m }
+    s
+}
+
+fn _vit_lcg_float(state) {
+    let ns = _vit_lcg_next(state)
+    let fv = (to_float(ns % 10000) / 10000.0) - 0.5
+    let pair = [fv, ns]
+    pair
+}
+
+// ── Math helpers ──────────────────────────────────────────────
+
+fn _vit_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+fn _vit_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    sqrt(x)
+}
+
+fn _vit_gelu(x) {
+    // GELU approximation: x * sigmoid(1.702 * x)
+    let s = 1.0 / (1.0 + exp(0.0 - 1.702 * x))
+    x * s
+}
+
+// ── Config builder ────────────────────────────────────────────
+
+fn vit_make_config(img_h, img_w, channels, patch_size, d_model, n_heads, n_layers, ffn_mult, llm_dim) {
+    let num_patches = (img_h / patch_size) * (img_w / patch_size)
+    let patch_dim = patch_size * patch_size * channels
+    let seq_len = num_patches + 1
+    let head_dim = d_model / n_heads
+    let ffn_dim = d_model * ffn_mult
+    ViTConfig {
+        img_h: img_h,
+        img_w: img_w,
+        channels: channels,
+        patch_size: patch_size,
+        d_model: d_model,
+        n_heads: n_heads,
+        n_layers: n_layers,
+        ffn_dim: ffn_dim,
+        llm_dim: llm_dim,
+        num_patches: num_patches,
+        patch_dim: patch_dim,
+        seq_len: seq_len,
+        head_dim: head_dim
+    }
+}
+
+fn vit_num_patches(cfg) {
+    cfg.num_patches
+}
+
+// ── Weight matrix builder ─────────────────────────────────────
+
+fn _vit_build_mat(rows, cols, scale, rng) {
+    let mut mat = []
+    let mut cur = rng
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let pair = _vit_lcg_float(cur)
+            row = row + [pair[0] * scale]
+            cur = pair[1]
+            j = j + 1
+        }
+        mat = mat + [row]
+        i = i + 1
+    }
+    let out = [mat, cur]
+    out
+}
+
+fn _vit_build_vec(n, scale, rng) {
+    let mut vec = []
+    let mut cur = rng
+    let mut i = 0
+    while i < n {
+        let pair = _vit_lcg_float(cur)
+        vec = vec + [pair[0] * scale]
+        cur = pair[1]
+        i = i + 1
+    }
+    let out = [vec, cur]
+    out
+}
+
+fn _vit_zeros(n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [0.0]
+        i = i + 1
+    }
+    arr
+}
+
+fn _vit_ones(n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr + [1.0]
+        i = i + 1
+    }
+    arr
+}
+
+// ── Model builder ─────────────────────────────────────────────
+
+fn vit_make_model(cfg, seed) {
+    let mut rng = seed
+    let d = cfg.d_model
+    let pd = cfg.patch_dim
+    let sl = cfg.seq_len
+    let hd = cfg.head_dim
+    let nh = cfg.n_heads
+    let fd = cfg.ffn_dim
+    let ld = cfg.llm_dim
+
+    // Patch projection: patch_dim -> d_model (Xavier scale)
+    let scale_pp = 1.0 / _vit_sqrt(to_float(pd))
+    let pp_pair = _vit_build_mat(d, pd, scale_pp, rng)
+    let patch_proj_w = pp_pair[0]
+    rng = pp_pair[1]
+    let ppb_pair = _vit_build_vec(d, 0.01, rng)
+    let patch_proj_b = ppb_pair[0]
+    rng = ppb_pair[1]
+
+    // CLS token
+    let cls_pair = _vit_build_vec(d, 0.02, rng)
+    let cls_token = cls_pair[0]
+    rng = cls_pair[1]
+
+    // Positional embeddings: seq_len x d_model
+    let pos_pair = _vit_build_mat(sl, d, 0.02, rng)
+    let pos_embed = pos_pair[0]
+    rng = pos_pair[1]
+
+    // Build encoder layers
+    let scale_attn = 1.0 / _vit_sqrt(to_float(d))
+    let scale_ffn = 1.0 / _vit_sqrt(to_float(fd))
+    let mut layers = []
+    let mut l = 0
+    while l < cfg.n_layers {
+        // LayerNorm 1
+        let ln1_gamma = _vit_ones(d)
+        let ln1_beta = _vit_zeros(d)
+
+        // QKV projections: d_model -> d_model
+        let wq_pair = _vit_build_mat(d, d, scale_attn, rng)
+        rng = wq_pair[1]
+        let wk_pair = _vit_build_mat(d, d, scale_attn, rng)
+        rng = wk_pair[1]
+        let wv_pair = _vit_build_mat(d, d, scale_attn, rng)
+        rng = wv_pair[1]
+        let wo_pair = _vit_build_mat(d, d, scale_attn, rng)
+        rng = wo_pair[1]
+
+        // LayerNorm 2
+        let ln2_gamma = _vit_ones(d)
+        let ln2_beta = _vit_zeros(d)
+
+        // FFN: d_model -> ffn_dim -> d_model
+        let fw1_pair = _vit_build_mat(fd, d, scale_ffn, rng)
+        rng = fw1_pair[1]
+        let fb1_pair = _vit_build_vec(fd, 0.01, rng)
+        rng = fb1_pair[1]
+        let fw2_pair = _vit_build_mat(d, fd, scale_ffn, rng)
+        rng = fw2_pair[1]
+        let fb2_pair = _vit_build_vec(d, 0.01, rng)
+        rng = fb2_pair[1]
+
+        let layer = ViTLayer {
+            ln1_gamma: ln1_gamma,
+            ln1_beta: ln1_beta,
+            wq: wq_pair[0],
+            wk: wk_pair[0],
+            wv: wv_pair[0],
+            wo: wo_pair[0],
+            ln2_gamma: ln2_gamma,
+            ln2_beta: ln2_beta,
+            ffn_w1: fw1_pair[0],
+            ffn_b1: fb1_pair[0],
+            ffn_w2: fw2_pair[0],
+            ffn_b2: fb2_pair[0]
+        }
+        layers = layers + [layer]
+        l = l + 1
+    }
+
+    // Final layer norm
+    let ln_final_gamma = _vit_ones(d)
+    let ln_final_beta = _vit_zeros(d)
+
+    // Projection head: d_model -> llm_dim
+    let scale_proj = 1.0 / _vit_sqrt(to_float(d))
+    let pj_pair = _vit_build_mat(ld, d, scale_proj, rng)
+    rng = pj_pair[1]
+    let pjb_pair = _vit_build_vec(ld, 0.01, rng)
+    rng = pjb_pair[1]
+
+    ViTModel {
+        cfg: cfg,
+        patch_proj_w: patch_proj_w,
+        patch_proj_b: patch_proj_b,
+        cls_token: cls_token,
+        pos_embed: pos_embed,
+        layers: layers,
+        proj_w: pj_pair[0],
+        proj_b: pjb_pair[0],
+        ln_final_gamma: ln_final_gamma,
+        ln_final_beta: ln_final_beta,
+        rng: rng
+    }
+}
+
+// ===================================================================
+//  Patch extraction: image [H*W*C flat] -> [[patch_dim]] N patches
+//  Image layout: row-major [H, W, C] flattened to H*W*C
+//  Patches are extracted in raster order (top-left to bottom-right)
+// ===================================================================
+
+fn vit_extract_patches(image, cfg) {
+    let p = cfg.patch_size
+    let c = cfg.channels
+    let w = cfg.img_w
+    let gh = cfg.img_h / p
+    let gw = cfg.img_w / p
+    let mut patches = []
+    let mut gi = 0
+    while gi < gh {
+        let mut gj = 0
+        while gj < gw {
+            let mut patch = []
+            let mut pi = 0
+            while pi < p {
+                let mut pj = 0
+                while pj < p {
+                    let row = gi * p + pi
+                    let col = gj * p + pj
+                    let base = (row * w + col) * c
+                    let mut ci = 0
+                    while ci < c {
+                        patch = patch + [image[base + ci]]
+                        ci = ci + 1
+                    }
+                    pj = pj + 1
+                }
+                pi = pi + 1
+            }
+            patches = patches + [patch]
+            gj = gj + 1
+        }
+        gi = gi + 1
+    }
+    patches
+}
+
+// ===================================================================
+//  Patch embedding: linear projection patch_dim -> d_model
+//  patches: [[patch_dim]] N patches
+//  Returns: [[d_model]] N embedded vectors
+// ===================================================================
+
+@pure
+fn vit_patch_embed(model, patches) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let pd = cfg.patch_dim
+    let n = len(patches)
+    let mut embedded = []
+    let mut i = 0
+    while i < n {
+        let patch = patches[i]
+        let mut vec = []
+        let mut j = 0
+        while j < d {
+            let mut s = model.patch_proj_b[j]
+            let mut k = 0
+            while k < pd {
+                s = s + model.patch_proj_w[j][k] * patch[k]
+                k = k + 1
+            }
+            vec = vec + [s]
+            j = j + 1
+        }
+        embedded = embedded + [vec]
+        i = i + 1
+    }
+    embedded
+}
+
+// ===================================================================
+//  Prepend CLS token + add positional embeddings
+//  embedded: [[d_model]] N patches
+//  Returns: [[d_model]] N+1 tokens (CLS at index 0)
+// ===================================================================
+
+fn vit_add_cls_and_pos(model, embedded) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let n = len(embedded)
+    let seq_len = n + 1
+
+    // Build sequence: [CLS, patch_0, patch_1, ...]
+    let mut seq = []
+
+    // CLS token + pos[0]
+    let mut cls = []
+    let mut j = 0
+    while j < d {
+        cls = cls + [model.cls_token[j] + model.pos_embed[0][j]]
+        j = j + 1
+    }
+    seq = seq + [cls]
+
+    // Patch tokens + pos[1..N]
+    let mut i = 0
+    while i < n {
+        let mut tok = []
+        let mut j2 = 0
+        while j2 < d {
+            tok = tok + [embedded[i][j2] + model.pos_embed[i + 1][j2]]
+            j2 = j2 + 1
+        }
+        seq = seq + [tok]
+        i = i + 1
+    }
+    seq
+}
+
+// ===================================================================
+//  Layer Normalization: (x - mean) / sqrt(var + eps) * gamma + beta
+// ===================================================================
+
+@pure
+fn vit_layer_norm(x, gamma, beta, eps) {
+    let n = len(x)
+    let nf = to_float(n)
+    // mean
+    let mut sum_x = 0.0
+    let mut i = 0
+    while i < n {
+        sum_x = sum_x + x[i]
+        i = i + 1
+    }
+    let mean = sum_x / nf
+    // variance
+    let mut sum_var = 0.0
+    i = 0
+    while i < n {
+        let d = x[i] - mean
+        sum_var = sum_var + d * d
+        i = i + 1
+    }
+    let var = sum_var / nf
+    let inv_std = 1.0 / _vit_sqrt(var + eps)
+    // normalize
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [(x[i] - mean) * inv_std * gamma[i] + beta[i]]
+        i = i + 1
+    }
+    out
+}
+
+// ===================================================================
+//  Softmax over array of length n
+// ===================================================================
+
+@pure
+fn vit_softmax(scores, n) {
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx { mx = scores[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        exps = exps + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] * inv]
+        i = i + 1
+    }
+    out
+}
+
+// ===================================================================
+//  Multi-Head Self-Attention for one encoder layer
+//  seq: [[d_model]] seq_len tokens
+//  Returns: [[d_model]] seq_len output tokens
+// ===================================================================
+
+@hot
+fn vit_attention(model, layer_idx, seq) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let nh = cfg.n_heads
+    let hd = cfg.head_dim
+    let sl = len(seq)
+    let layer = model.layers[layer_idx]
+    let eps = 0.00001
+    let scale = 1.0 / _vit_sqrt(to_float(hd))
+
+    // LayerNorm1 each token
+    let mut normed = []
+    let mut si = 0
+    while si < sl {
+        normed = normed + [vit_layer_norm(seq[si], layer.ln1_gamma, layer.ln1_beta, eps)]
+        si = si + 1
+    }
+
+    // Compute Q, K, V for all tokens: [sl][d]
+    let mut Q = []
+    let mut K = []
+    let mut V = []
+    let mut ti = 0
+    while ti < sl {
+        let x = normed[ti]
+        let mut q = []
+        let mut k = []
+        let mut v = []
+        let mut j = 0
+        while j < d {
+            let mut sq = 0.0
+            let mut sk = 0.0
+            let mut sv = 0.0
+            let mut m = 0
+            while m < d {
+                sq = sq + layer.wq[j][m] * x[m]
+                sk = sk + layer.wk[j][m] * x[m]
+                sv = sv + layer.wv[j][m] * x[m]
+                m = m + 1
+            }
+            q = q + [sq]
+            k = k + [sk]
+            v = v + [sv]
+            j = j + 1
+        }
+        Q = Q + [q]
+        K = K + [k]
+        V = V + [v]
+        ti = ti + 1
+    }
+
+    // Multi-head attention: for each head, compute scaled dot-product
+    let mut attn_out = []
+    let mut tok = 0
+    while tok < sl {
+        let mut tok_out = _vit_zeros(d)
+        let mut h = 0
+        while h < nh {
+            let h_off = h * hd
+            // scores[j] = sum_d Q[tok][h_off+d] * K[j][h_off+d]
+            let mut scores = []
+            let mut j = 0
+            while j < sl {
+                let mut dot = 0.0
+                let mut dd = 0
+                while dd < hd {
+                    dot = dot + Q[tok][h_off + dd] * K[j][h_off + dd]
+                    dd = dd + 1
+                }
+                scores = scores + [dot * scale]
+                j = j + 1
+            }
+            let weights = vit_softmax(scores, sl)
+            // weighted sum of V
+            let mut dd2 = 0
+            while dd2 < hd {
+                let mut acc = 0.0
+                let mut j2 = 0
+                while j2 < sl {
+                    acc = acc + weights[j2] * V[j2][h_off + dd2]
+                    j2 = j2 + 1
+                }
+                tok_out[h_off + dd2] = tok_out[h_off + dd2] + acc
+                dd2 = dd2 + 1
+            }
+            h = h + 1
+        }
+        // Output projection
+        let mut proj = []
+        let mut pi = 0
+        while pi < d {
+            let mut s = 0.0
+            let mut pj = 0
+            while pj < d {
+                s = s + layer.wo[pi][pj] * tok_out[pj]
+                pj = pj + 1
+            }
+            proj = proj + [s]
+            pi = pi + 1
+        }
+        // Residual
+        let mut res = []
+        let mut ri = 0
+        while ri < d {
+            res = res + [seq[tok][ri] + proj[ri]]
+            ri = ri + 1
+        }
+        attn_out = attn_out + [res]
+        tok = tok + 1
+    }
+    attn_out
+}
+
+// ===================================================================
+//  FFN: GELU(x @ W1 + b1) @ W2 + b2
+// ===================================================================
+
+@pure
+fn vit_ffn(model, layer_idx, x) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let fd = cfg.ffn_dim
+    let layer = model.layers[layer_idx]
+    // hidden = GELU(W1 @ x + b1)
+    let mut hidden = []
+    let mut i = 0
+    while i < fd {
+        let mut s = layer.ffn_b1[i]
+        let mut j = 0
+        while j < d {
+            s = s + layer.ffn_w1[i][j] * x[j]
+            j = j + 1
+        }
+        hidden = hidden + [_vit_gelu(s)]
+        i = i + 1
+    }
+    // output = W2 @ hidden + b2
+    let mut out = []
+    i = 0
+    while i < d {
+        let mut s = layer.ffn_b2[i]
+        let mut j = 0
+        while j < fd {
+            s = s + layer.ffn_w2[i][j] * hidden[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    out
+}
+
+// ===================================================================
+//  Single encoder block: MHSA + FFN with residual and LayerNorm
+// ===================================================================
+
+fn vit_encoder_block(model, layer_idx, seq) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let sl = len(seq)
+    let layer = model.layers[layer_idx]
+    let eps = 0.00001
+
+    // Sub-block 1: MHSA with pre-norm and residual (done inside vit_attention)
+    let after_attn = vit_attention(model, layer_idx, seq)
+
+    // Sub-block 2: FFN with pre-norm and residual
+    let mut after_ffn = []
+    let mut i = 0
+    while i < sl {
+        let normed = vit_layer_norm(after_attn[i], layer.ln2_gamma, layer.ln2_beta, eps)
+        let ffn_out = vit_ffn(model, layer_idx, normed)
+        // residual
+        let mut res = []
+        let mut j = 0
+        while j < d {
+            res = res + [after_attn[i][j] + ffn_out[j]]
+            j = j + 1
+        }
+        after_ffn = after_ffn + [res]
+        i = i + 1
+    }
+    after_ffn
+}
+
+// ===================================================================
+//  Full ViT encode: patches -> CLS output [d_model]
+// ===================================================================
+
+fn vit_encode(model, image) {
+    let cfg = model.cfg
+    let eps = 0.00001
+
+    // 1. Extract patches
+    let patches = vit_extract_patches(image, cfg)
+
+    // 2. Patch embedding
+    let embedded = vit_patch_embed(model, patches)
+
+    // 3. Prepend CLS + positional embeddings
+    let mut seq = vit_add_cls_and_pos(model, embedded)
+
+    // 4. L encoder blocks
+    let mut l = 0
+    while l < cfg.n_layers {
+        seq = vit_encoder_block(model, l, seq)
+        l = l + 1
+    }
+
+    // 5. Final LayerNorm on CLS token (index 0)
+    let cls_out = vit_layer_norm(seq[0], model.ln_final_gamma, model.ln_final_beta, eps)
+    cls_out
+}
+
+// ===================================================================
+//  Projection head: CLS [d_model] -> [llm_dim]
+// ===================================================================
+
+@pure
+fn vit_project_to_llm(model, cls_out) {
+    let cfg = model.cfg
+    let d = cfg.d_model
+    let ld = cfg.llm_dim
+    let mut out = []
+    let mut i = 0
+    while i < ld {
+        let mut s = model.proj_b[i]
+        let mut j = 0
+        while j < d {
+            s = s + model.proj_w[i][j] * cls_out[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    out
+}
+
+// ===================================================================
+//  Full forward: image -> LLM embedding
+// ===================================================================
+
+fn vit_forward(model, image) {
+    let cls_out = vit_encode(model, image)
+    let llm_embed = vit_project_to_llm(model, cls_out)
+    llm_embed
+}
+
+// ===================================================================
+//  Image preprocessing: normalize and resize
+//  raw_image: flat [H*W*C] float array
+//  mean: [C] per-channel mean (e.g. ImageNet [0.485, 0.456, 0.406])
+//  std_dev: [C] per-channel std  (e.g. ImageNet [0.229, 0.224, 0.225])
+//  Normalizes pixel values: (pixel - mean[c]) / std[c]
+//
+//  If raw_image size matches target, normalize in place.
+//  If sizes differ, apply nearest-neighbor resize then normalize.
+//  Returns: flat [target_h * target_w * C] normalized float array.
+// ===================================================================
+
+fn vit_preprocess(raw_image, target_h, target_w, channels, mean, std_dev) {
+    let raw_len = len(raw_image)
+    let target_len = target_h * target_w * channels
+
+    // Determine source dimensions from raw_len
+    let raw_pixels = raw_len / channels
+    // Assume square if not matching target
+    let mut src_h = target_h
+    let mut src_w = target_w
+    if raw_len != target_len {
+        // Estimate source dimensions (assume square for simplicity)
+        let side = to_int(_vit_sqrt(to_float(raw_pixels)))
+        src_h = side
+        src_w = side
+    }
+
+    let mut out = []
+    let mut y = 0
+    while y < target_h {
+        let src_y = (y * src_h) / target_h
+        let mut x = 0
+        while x < target_w {
+            let src_x = (x * src_w) / target_w
+            let src_idx = (src_y * src_w + src_x) * channels
+            let mut c = 0
+            while c < channels {
+                let pixel = raw_image[src_idx + c]
+                let normalized = (pixel - mean[c]) / std_dev[c]
+                out = out + [normalized]
+                c = c + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+    out
+}
+
+// ===================================================================
+//  Utility: compute L2 norm of a vector
+// ===================================================================
+
+fn vit_vec_norm(v) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(v) {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    _vit_sqrt(s)
+}
+
+// ===================================================================
+//  Utility: cosine similarity between two vectors
+// ===================================================================
+
+fn vit_cosine_sim(a, b) {
+    let na = vit_vec_norm(a)
+    let nb = vit_vec_norm(b)
+    if na < 0.0000001 { return 0.0 }
+    if nb < 0.0000001 { return 0.0 }
+    let mut dot = 0.0
+    let mut i = 0
+    while i < len(a) {
+        dot = dot + a[i] * b[i]
+        i = i + 1
+    }
+    dot / (na * nb)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -36,7 +36,745 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/interpreter.hexa self/test_striped_hyena.hexa
 // ===================================================================
 
-import "ml/striped_hyena.hexa"
+// -- inlined from self/ml/striped_hyena.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/striped_hyena.hexa -- Striped Hyena (#334)
+//
+//  Striped Hyena (Together AI, 2023) -- evolution of the Hyena
+//  operator that interleaves gated convolution layers with standard
+//  multi-head attention layers in an alternating (striped) pattern.
+//
+//  Key ideas:
+//    1. Hyena convolution layer -- long implicit conv filter with
+//       input-dependent gating (sub-quadratic in sequence length).
+//    2. Standard multi-head attention layer -- captures global
+//       pairwise interactions at sparse intervals.
+//    3. Alternating stack -- even layers use Hyena conv, odd layers
+//       use attention (configurable ratio).
+//    4. Rotary positional encoding (RoPE) applied to attention.
+//
+//  Components:
+//    sh_create_config      -- build config dict
+//    sh_init               -- initialise full model
+//    sh_hyena_filter       -- implicit parameterised conv filter
+//    sh_hyena_gate         -- input-dependent sigmoid gate
+//    sh_hyena_layer_fwd    -- one Hyena convolution layer forward
+//    sh_attn_layer_fwd     -- one multi-head attention layer forward
+//    sh_layer_norm_fwd     -- pre-norm layer normalisation
+//    sh_ffn_fwd            -- feed-forward network (GELU)
+//    sh_block_fwd          -- one block: (hyena|attn) + FFN + residual
+//    sh_forward            -- full stack forward pass
+//    sh_loss               -- cross-entropy loss
+//    sh_train_step         -- finite-difference gradient descent
+//
+//  AI-NATIVE attrs:
+//    @pure  -- no side effects (forward, loss)
+//    @hot   -- inner-loop kernels (conv, gate, train)
+// ===================================================================
+
+// ===================================================================
+//  Math helpers (sh_ prefix to avoid collisions)
+// ===================================================================
+
+fn sh_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sh_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sh_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sh_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn sh_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + sh_exp(0.0 - x))
+}
+
+fn sh_gelu(x) {
+    return x * sh_sigmoid(1.702 * x)
+}
+
+fn sh_sin(x) {
+    let pi = 3.141592653589793
+    let mut v = x
+    for _i in 0..20 {
+        if v > pi { v = v - 2.0 * pi }
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    let mut result = 0.0
+    let mut term = v
+    for i in 0..15 {
+        result = result + term
+        term = 0.0 - term * v * v / to_float((2 * i + 2) * (2 * i + 3))
+    }
+    return result
+}
+
+fn sh_cos(x) {
+    let pi = 3.141592653589793
+    return sh_sin(x + pi / 2.0)
+}
+
+fn sh_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sh_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ===================================================================
+//  Vector / matrix utilities
+// ===================================================================
+
+fn sh_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sh_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn sh_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [sh_zeros(cols)] }
+    return m
+}
+
+fn sh_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn sh_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn sh_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn sh_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn sh_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn sh_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows {
+        let mut s = 0.0
+        let cols = len(mat[r])
+        for c in 0..cols { s = s + mat[r][c] * v[c] }
+        out = out + [s]
+    }
+    return out
+}
+
+// Deterministic pseudo-random init
+fn sh_hash_float(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 2246822519) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn sh_init_weight(rows, cols, seed) {
+    let scale = 1.0 / sh_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            row = row + [sh_hash_float(seed, r, c) * 2.0 * scale]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn sh_init_vec(dim, seed) {
+    let scale = 1.0 / sh_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  Layer Norm
+// ===================================================================
+
+@pure
+fn sh_layer_norm_fwd(x, gamma, beta, eps) {
+    let n = len(x)
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / sh_sqrt(var + eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [gamma[i] * normed + beta[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  Softmax
+// ===================================================================
+
+@pure
+fn sh_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..n {
+        let e = sh_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    if z < 1.0e-12 { z = 1.0e-12 }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / z] }
+    return out
+}
+
+// ===================================================================
+//  1. Hyena Convolution Filter (implicit parameterisation)
+//
+//  h(t, c) = exp(-alpha_c * t) * beta_c * sin(omega_c * t + phi_c)
+//  Each channel c has its own decay/amplitude/frequency/phase.
+// ===================================================================
+
+@pure
+fn sh_materialize_filter(alpha, beta, omega, phi, filter_len, c) {
+    let mut h = []
+    for t in 0..filter_len {
+        let tf = to_float(t)
+        let decay = sh_exp(0.0 - alpha[c] * tf)
+        let osc = sh_sin(omega[c] * tf + phi[c])
+        h = h + [beta[c] * decay * osc]
+    }
+    return h
+}
+
+// ===================================================================
+//  2. Causal 1-D convolution (direct, O(N*K))
+//
+//  For small filter_len this is fine and avoids FFT overhead.
+//  seq_c: [seq_len] values for one channel
+//  filt:  [filter_len] filter weights
+// ===================================================================
+
+@hot
+fn sh_causal_conv1d(seq_c, filt, filter_len) {
+    let slen = len(seq_c)
+    let mut out = []
+    for t in 0..slen {
+        let mut acc = 0.0
+        for k in 0..filter_len {
+            let idx = t - k
+            if idx >= 0 {
+                acc = acc + filt[k] * seq_c[idx]
+            }
+        }
+        out = out + [acc]
+    }
+    return out
+}
+
+// ===================================================================
+//  3. Input-dependent gate
+//
+//  gate(x, v) = sigmoid(Wg * x + bg) * v
+//  Wg: [dim x dim], bg: [dim]
+// ===================================================================
+
+@pure @hot
+fn sh_gate_apply(v, gate_vals) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [sh_sigmoid(gate_vals[i]) * v[i]] }
+    return out
+}
+
+// ===================================================================
+//  4. Hyena layer forward
+//
+//  For each token:
+//    1. Project x -> (v, x1) via W_proj [2*dim x dim]
+//    2. Apply causal conv filter to v per channel
+//    3. Gate: output = gate(conv(v), x1)
+//    4. Output projection W_out [dim x dim]
+// ===================================================================
+
+@pure
+fn sh_hyena_layer_fwd(xs, params) {
+    let seq_len = len(xs)
+    let dim = params["dim"]
+    let filter_len = params["filter_len"]
+    let W_proj = params["W_proj"]
+    let W_out = params["W_out"]
+    let W_gate = params["W_gate"]
+    let b_gate = params["b_gate"]
+    let alpha = params["alpha"]
+    let beta = params["beta"]
+    let omega = params["omega"]
+    let phi = params["phi"]
+
+    // Project input into v and x1 streams
+    let mut v_seq = []
+    let mut x1_seq = []
+    for t in 0..seq_len {
+        let projected = sh_mat_vec(W_proj, xs[t])
+        let mut v_tok = []
+        let mut x1_tok = []
+        for c in 0..dim {
+            v_tok = v_tok + [projected[c]]
+            x1_tok = x1_tok + [projected[dim + c]]
+        }
+        v_seq = v_seq + [v_tok]
+        x1_seq = x1_seq + [x1_tok]
+    }
+
+    // Per-channel causal convolution on v
+    let mut conv_channels = []
+    for c in 0..dim {
+        let filt = sh_materialize_filter(alpha, beta, omega, phi, filter_len, c)
+        let mut ch = []
+        for t in 0..seq_len { ch = ch + [v_seq[t][c]] }
+        let conv_ch = sh_causal_conv1d(ch, filt, filter_len)
+        conv_channels = conv_channels + [conv_ch]
+    }
+
+    // Reconstruct conv output and apply gating
+    let mut output = []
+    for t in 0..seq_len {
+        let mut conv_tok = []
+        for c in 0..dim { conv_tok = conv_tok + [conv_channels[c][t]] }
+        // Compute gate values: Wg * xs[t] + bg
+        let gate_raw = sh_vec_add(sh_mat_vec(W_gate, xs[t]), b_gate)
+        let gated = sh_gate_apply(conv_tok, gate_raw)
+        // Elementwise multiply with x1 stream
+        let mixed = sh_vec_mul(gated, x1_seq[t])
+        // Output projection
+        output = output + [sh_mat_vec(W_out, mixed)]
+    }
+    return output
+}
+
+// ===================================================================
+//  5. Attention layer forward (single-head for simplicity)
+//
+//  Standard scaled dot-product attention.
+//  Q = Wq * x, K = Wk * x, V = Wv * x
+//  Attn = softmax(Q * K^T / sqrt(dim)) * V
+//  Out = Wo * Attn
+// ===================================================================
+
+@pure
+fn sh_attn_layer_fwd(xs, params) {
+    let seq_len = len(xs)
+    let dim = params["dim"]
+    let W_q = params["W_q"]
+    let W_k = params["W_k"]
+    let W_v = params["W_v"]
+    let W_o = params["W_o"]
+    let scale = 1.0 / sh_sqrt(to_float(dim))
+
+    // Project all positions
+    let mut Qs = []
+    let mut Ks = []
+    let mut Vs = []
+    for t in 0..seq_len {
+        Qs = Qs + [sh_mat_vec(W_q, xs[t])]
+        Ks = Ks + [sh_mat_vec(W_k, xs[t])]
+        Vs = Vs + [sh_mat_vec(W_v, xs[t])]
+    }
+
+    let mut output = []
+    for t in 0..seq_len {
+        // Compute scores
+        let mut scores = []
+        for s in 0..seq_len {
+            scores = scores + [sh_dot(Qs[t], Ks[s]) * scale]
+        }
+        let probs = sh_softmax(scores)
+        // Weighted sum of values
+        let mut ctx = sh_zeros(dim)
+        for s in 0..seq_len {
+            for i in 0..dim {
+                ctx[i] = ctx[i] + probs[s] * Vs[s][i]
+            }
+        }
+        output = output + [sh_mat_vec(W_o, ctx)]
+    }
+    return output
+}
+
+// ===================================================================
+//  6. FFN (GELU activation)
+//
+//  h = GELU(W1 * x + b1)
+//  y = W2 * h + b2
+// ===================================================================
+
+@pure
+fn sh_ffn_fwd(x, W1, b1, W2, b2) {
+    let h_raw = sh_vec_add(sh_mat_vec(W1, x), b1)
+    let ff_dim = len(h_raw)
+    let mut h = []
+    for i in 0..ff_dim { h = h + [sh_gelu(h_raw[i])] }
+    return sh_vec_add(sh_mat_vec(W2, h), b2)
+}
+
+// ===================================================================
+//  7. Single block forward (hyena or attention) + FFN + residual
+//
+//  x -> LayerNorm -> (Hyena | Attn) -> + residual
+//    -> LayerNorm -> FFN -> + residual
+// ===================================================================
+
+@pure
+fn sh_block_fwd(xs, block_params, layer_type) {
+    let seq_len = len(xs)
+    let ln1_gamma = block_params["ln1_gamma"]
+    let ln1_beta = block_params["ln1_beta"]
+    let ln2_gamma = block_params["ln2_gamma"]
+    let ln2_beta = block_params["ln2_beta"]
+    let eps = 1.0e-5
+
+    // Pre-norm
+    let mut normed1 = []
+    for t in 0..seq_len {
+        normed1 = normed1 + [sh_layer_norm_fwd(xs[t], ln1_gamma, ln1_beta, eps)]
+    }
+
+    // Mixer: hyena or attention
+    let mut mixer_out = []
+    if layer_type == "hyena" {
+        mixer_out = sh_hyena_layer_fwd(normed1, block_params)
+    }
+    if layer_type == "attn" {
+        mixer_out = sh_attn_layer_fwd(normed1, block_params)
+    }
+
+    // Residual
+    let mut h = []
+    for t in 0..seq_len {
+        h = h + [sh_vec_add(xs[t], mixer_out[t])]
+    }
+
+    // Pre-norm + FFN + residual
+    let W1 = block_params["W1"]
+    let b1 = block_params["b1"]
+    let W2 = block_params["W2"]
+    let b2 = block_params["b2"]
+    let mut output = []
+    for t in 0..seq_len {
+        let normed2 = sh_layer_norm_fwd(h[t], ln2_gamma, ln2_beta, eps)
+        let ffn_out = sh_ffn_fwd(normed2, W1, b1, W2, b2)
+        output = output + [sh_vec_add(h[t], ffn_out)]
+    }
+    return output
+}
+
+// ===================================================================
+//  8. Config and model initialisation
+//
+//  The striped pattern: layer i uses hyena if i%2==0, attn if i%2==1.
+//  This is the canonical "striped" alternation.
+// ===================================================================
+
+fn sh_create_config(n_layers, d_model, ff_dim, filter_len) {
+    let cfg = #{}
+    cfg["n_layers"] = n_layers
+    cfg["d_model"] = d_model
+    cfg["ff_dim"] = ff_dim
+    cfg["filter_len"] = filter_len
+    return cfg
+}
+
+fn sh_layer_type(layer_idx) {
+    if layer_idx % 2 == 0 { return "hyena" }
+    return "attn"
+}
+
+fn sh_build_layer_plan(n_layers) {
+    let mut plan = []
+    for l in 0..n_layers {
+        plan = plan + [sh_layer_type(l)]
+    }
+    return plan
+}
+
+fn sh_init_block_params(dim, ff_dim, filter_len, layer_type, seed) {
+    let p = #{}
+    p["dim"] = dim
+    p["filter_len"] = filter_len
+
+    // LayerNorm params
+    p["ln1_gamma"] = sh_ones(dim)
+    p["ln1_beta"] = sh_zeros(dim)
+    p["ln2_gamma"] = sh_ones(dim)
+    p["ln2_beta"] = sh_zeros(dim)
+
+    // FFN params
+    p["W1"] = sh_init_weight(ff_dim, dim, seed + 1)
+    p["b1"] = sh_zeros(ff_dim)
+    p["W2"] = sh_init_weight(dim, ff_dim, seed + 2)
+    p["b2"] = sh_zeros(dim)
+
+    if layer_type == "hyena" {
+        // Hyena-specific: projection, gate, conv filter params
+        p["W_proj"] = sh_init_weight(dim * 2, dim, seed + 10)
+        p["W_out"] = sh_init_weight(dim, dim, seed + 11)
+        p["W_gate"] = sh_init_weight(dim, dim, seed + 12)
+        p["b_gate"] = sh_zeros(dim)
+        // Implicit conv filter parameters per channel
+        let mut alpha = []
+        let mut beta = []
+        let mut omega = []
+        let mut phi = []
+        for c in 0..dim {
+            let h1 = (c * 251 + seed * 113 + 1) % 10007
+            let h2 = (c * 317 + seed * 211 + 2) % 10007
+            let h3 = (c * 419 + seed * 307 + 3) % 10007
+            let h4 = (c * 521 + seed * 401 + 4) % 10007
+            alpha = alpha + [0.01 + to_float(h1) / 10007.0 * 0.49]
+            beta = beta + [0.5 + to_float(h2) / 10007.0]
+            omega = omega + [0.1 + to_float(h3) / 10007.0 * 2.9]
+            phi = phi + [to_float(h4) / 10007.0 * 6.283]
+        }
+        p["alpha"] = alpha
+        p["beta"] = beta
+        p["omega"] = omega
+        p["phi"] = phi
+    }
+    if layer_type == "attn" {
+        // Attention-specific: Q/K/V/O projections
+        p["W_q"] = sh_init_weight(dim, dim, seed + 20)
+        p["W_k"] = sh_init_weight(dim, dim, seed + 21)
+        p["W_v"] = sh_init_weight(dim, dim, seed + 22)
+        p["W_o"] = sh_init_weight(dim, dim, seed + 23)
+    }
+
+    return p
+}
+
+fn sh_init(cfg, seed) {
+    let n_layers = cfg["n_layers"]
+    let dim = cfg["d_model"]
+    let ff_dim = cfg["ff_dim"]
+    let filter_len = cfg["filter_len"]
+    let plan = sh_build_layer_plan(n_layers)
+
+    let mut blocks = []
+    for l in 0..n_layers {
+        let bp = sh_init_block_params(dim, ff_dim, filter_len, plan[l], seed + l * 1000)
+        blocks = blocks + [bp]
+    }
+
+    let model = #{}
+    model["config"] = cfg
+    model["blocks"] = blocks
+    model["plan"] = plan
+    model["ln_out_gamma"] = sh_ones(dim)
+    model["ln_out_beta"] = sh_zeros(dim)
+    return model
+}
+
+// ===================================================================
+//  9. Full forward pass
+//
+//  xs: [seq_len x d_model]
+//  Returns: [seq_len x d_model]
+// ===================================================================
+
+@pure
+fn sh_forward(model, xs) {
+    let config = model["config"]
+    let n_layers = config["n_layers"]
+    let blocks = model["blocks"]
+    let plan = model["plan"]
+
+    let mut h = xs
+    for l in 0..n_layers {
+        h = sh_block_fwd(h, blocks[l], plan[l])
+    }
+
+    // Final layer norm
+    let gamma = model["ln_out_gamma"]
+    let beta = model["ln_out_beta"]
+    let seq_len = len(h)
+    let mut output = []
+    for t in 0..seq_len {
+        output = output + [sh_layer_norm_fwd(h[t], gamma, beta, 1.0e-5)]
+    }
+    return output
+}
+
+// ===================================================================
+//  10. Loss (cross-entropy with output head)
+//
+//  W_head: [n_classes x d_model]
+//  ys: [batch][seq_len] integer labels
+// ===================================================================
+
+@pure
+fn sh_loss(model, W_head, xs_batch, ys_batch) {
+    let n = len(xs_batch)
+    let mut total = 0.0
+    let mut count = 0
+    for b in 0..n {
+        let out = sh_forward(model, xs_batch[b])
+        let T = len(out)
+        for t in 0..T {
+            let logits = sh_mat_vec(W_head, out[t])
+            let probs = sh_softmax(logits)
+            let y = ys_batch[b][t]
+            let mut py = probs[y]
+            if py < 1.0e-12 { py = 1.0e-12 }
+            total = total + (0.0 - sh_log(py))
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// ===================================================================
+//  11. Training step (finite-difference gradient descent on W_head)
+//
+//  For simplicity, only updates the classification head W_head.
+//  Full model training would extend this to all block params.
+// ===================================================================
+
+@hot
+fn sh_train_step(model, W_head, xs_batch, ys_batch, lr) {
+    let eps = 0.001
+    let base_loss = sh_loss(model, W_head, xs_batch, ys_batch)
+    let n_classes = len(W_head)
+    let dim = len(W_head[0])
+
+    let mut new_W = sh_zeros_2d(n_classes, dim)
+    for i in 0..n_classes {
+        for j in 0..dim {
+            let orig = W_head[i][j]
+            W_head[i][j] = orig + eps
+            let g = (sh_loss(model, W_head, xs_batch, ys_batch) - base_loss) / eps
+            W_head[i][j] = orig
+            new_W[i][j] = orig - lr * g
+        }
+    }
+    return new_W
+}
+
+// ===================================================================
+//  12. Parameter count estimate
+// ===================================================================
+
+fn sh_param_count(model) {
+    let config = model["config"]
+    let n_layers = config["n_layers"]
+    let d = config["d_model"]
+    let ff = config["ff_dim"]
+    let plan = model["plan"]
+
+    let mut total = 0
+    for l in 0..n_layers {
+        // LayerNorm: 2 x 2 x d (two norms, gamma+beta each)
+        total = total + 4 * d
+        // FFN: ff*d + ff + d*ff + d
+        total = total + ff * d + ff + d * ff + d
+        if plan[l] == "hyena" {
+            // W_proj: 2d*d, W_out: d*d, W_gate: d*d + d, filter: 4*d
+            total = total + 2 * d * d + d * d + d * d + d + 4 * d
+        }
+        if plan[l] == "attn" {
+            // Wq, Wk, Wv, Wo: 4 * d*d
+            total = total + 4 * d * d
+        }
+    }
+    // Final layer norm: 2*d
+    total = total + 2 * d
+    return total
+}
+
+println("[striped_hyena] loaded -- gated conv + attn alternating layers + sub-quadratic sequence processing")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

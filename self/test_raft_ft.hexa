@@ -2,7 +2,719 @@
 //  test_raft_ft.hexa — RAFT Fine-Tuning (#302)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/raft_ft.hexa"
+// -- inlined from self/ml/raft_ft.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/raft_ft.hexa — RAFT Fine-Tuning (#302)
+//
+//  RAFT (Retrieval-Augmented Fine-Tuning, Zhang et al., 2024)
+//  Train the model to ignore distractor documents and extract
+//  answers only from relevant (oracle) documents.
+//
+//  Training protocol:
+//    Given question Q, oracle document D*, distractors D1..Dk
+//    - P% of time: include D* among distractors
+//      -> model learns to locate & cite the oracle doc
+//    - (1-P)% of time: only distractors (no oracle)
+//      -> model learns to rely on parametric knowledge
+//    - Chain-of-thought: reasoning cites the oracle document
+//
+//  Architecture:
+//    doc_encoder:   W_doc  D_in -> D_hidden  (tanh)
+//    query_encoder: W_q    D_in -> D_hidden  (tanh)
+//    relevance:     dot(query_emb, doc_emb) -> score
+//    answer_head:   W_ans  (D_hidden * n_docs) -> D_out (softmax)
+//
+//  API:
+//    raft_init(D_in, D_hidden, D_out, n_docs, seed) -> model
+//    raft_encode_doc(model, doc) -> [float]
+//    raft_encode_query(model, query) -> [float]
+//    raft_relevance_score(model, query_emb, doc_emb) -> float
+//    raft_extract_answer(model, query, docs) -> answer
+//    raft_make_training_batch(queries, oracle_docs, distractors, p_oracle, seed) -> batch
+//    raft_loss(model, query, docs, answer, oracle_idx) -> float
+//    raft_train_step(model, batch, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / scoring)
+//    @hot   (training)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn raft_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn raft_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn raft_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn raft_tanh(x) {
+    let ep = raft_exp(x)
+    let en = raft_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn raft_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn raft_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn raft_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn raft_uniform(state) {
+    let s = raft_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Softmax ───────────────────────────────────────────────────────
+
+fn raft_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n { if logits[i] > mx { mx = logits[i] } }
+    let mut out = raft_zeros(n)
+    let mut sum = 0.0
+    for i in 0..n {
+        let e = raft_exp(logits[i] - mx)
+        out[i] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  raft_init — initialise RAFT model
+//
+//    W_doc : D_hidden x D_in   (document encoder)
+//    b_doc : D_hidden
+//    W_q   : D_hidden x D_in   (query encoder)
+//    b_q   : D_hidden
+//    W_ans : D_out x (D_hidden * n_docs)  (answer extraction head)
+//    b_ans : D_out
+// ═══════════════════════════════════════════════════════════════════
+fn raft_init(D_in, D_hidden, D_out, n_docs, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Document encoder weights
+    let mut W_doc = raft_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = raft_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_doc[i][j] = u[0] - 0.5
+        }
+    }
+    let b_doc = raft_zeros(D_hidden)
+
+    // Query encoder weights
+    let mut W_q = raft_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = raft_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = u[0] - 0.5
+        }
+    }
+    let b_q = raft_zeros(D_hidden)
+
+    // Answer head: input is concatenated doc embeddings (D_hidden * n_docs)
+    let ans_in = D_hidden * n_docs
+    let mut W_ans = raft_zeros_2d(D_out, ans_in)
+    for i in 0..D_out {
+        for j in 0..ans_in {
+            let u = raft_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_ans[i][j] = u[0] - 0.5
+        }
+    }
+    let b_ans = raft_zeros(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_docs": n_docs,
+        "W_doc": W_doc,
+        "b_doc": b_doc,
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_ans": W_ans,
+        "b_ans": b_ans
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Encoders
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn raft_encode_doc(model, doc) {
+    let W = model["W_doc"]
+    let b = model["b_doc"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut emb = raft_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b[i]
+        for j in 0..D_in { s = s + W[i][j] * doc[j] }
+        emb[i] = raft_tanh(s)
+    }
+    return emb
+}
+
+@pure
+fn raft_encode_query(model, query) {
+    let W = model["W_q"]
+    let b = model["b_q"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut emb = raft_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b[i]
+        for j in 0..D_in { s = s + W[i][j] * query[j] }
+        emb[i] = raft_tanh(s)
+    }
+    return emb
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Relevance scoring: dot product between query and doc embeddings
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn raft_relevance_score(model, query_emb, doc_emb) {
+    let D_hidden = model["D_hidden"]
+    let mut score = 0.0
+    for i in 0..D_hidden {
+        score = score + query_emb[i] * doc_emb[i]
+    }
+    return score
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Answer extraction
+//
+//  Encode query and all docs, concatenate doc embeddings,
+//  pass through answer head with softmax.
+//  Returns index of the predicted answer class.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn raft_extract_answer(model, query, docs) {
+    let n_docs = model["n_docs"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_ans = model["W_ans"]
+    let b_ans = model["b_ans"]
+
+    // Encode query to get attention weights over docs
+    let q_emb = raft_encode_query(model, query)
+
+    // Encode each doc and compute relevance
+    let mut doc_embs = []
+    let mut rel_scores = []
+    let n = len(docs)
+    for i in 0..n {
+        let d_emb = raft_encode_doc(model, docs[i])
+        doc_embs = doc_embs + [d_emb]
+        let sc = raft_relevance_score(model, q_emb, d_emb)
+        rel_scores = rel_scores + [sc]
+    }
+
+    // Softmax over relevance scores to weight docs
+    let weights = raft_softmax(rel_scores)
+
+    // Build concatenated representation: for each doc slot,
+    // weighted sum of doc embeddings
+    let ans_in = D_hidden * n_docs
+    let mut concat = raft_zeros(ans_in)
+    for d in 0..n {
+        let w = weights[d]
+        for j in 0..D_hidden {
+            // Accumulate into slot based on doc's rank by relevance
+            let idx = d * D_hidden + j
+            if idx < ans_in {
+                concat[idx] = concat[idx] + w * doc_embs[d][j]
+            }
+        }
+    }
+
+    // Answer head: linear + softmax
+    let mut logits = raft_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_ans[i]
+        for j in 0..ans_in { s = s + W_ans[i][j] * concat[j] }
+        logits[i] = s
+    }
+
+    // Return argmax class
+    let mut best = logits[0]
+    let mut best_idx = 0
+    for i in 1..D_out {
+        if logits[i] > best {
+            best = logits[i]
+            best_idx = i
+        }
+    }
+    return best_idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training batch construction
+//
+//  For each query:
+//    - With probability p_oracle: include oracle doc among the docs
+//    - With probability (1 - p_oracle): only distractors
+//
+//  Returns list of #{query, docs, answer, oracle_idx} entries.
+//  oracle_idx = -1 when oracle is excluded.
+// ═══════════════════════════════════════════════════════════════════
+
+fn raft_make_training_batch(queries, oracle_docs, distractors, p_oracle, seed) {
+    let n_q = len(queries)
+    let n_dist = len(distractors)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut batch = []
+
+    for i in 0..n_q {
+        let u = raft_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        let coin = u[0]
+
+        let mut docs = []
+        let mut oracle_idx = -1
+
+        if coin < p_oracle {
+            // Include oracle doc at a random position
+            let u2 = raft_uniform(state)
+            state = int(u2[1])
+            if state <= 0 { state = 1 }
+
+            // Pick position for oracle (among n_dist + 1 slots)
+            let pos = int(u2[0] * to_float(n_dist + 1)) % (n_dist + 1)
+
+            let mut di = 0
+            for slot in 0..(n_dist + 1) {
+                if slot == pos {
+                    docs = docs + [oracle_docs[i]]
+                    oracle_idx = slot
+                } else {
+                    if di < n_dist {
+                        docs = docs + [distractors[di]]
+                        di = di + 1
+                    }
+                }
+            }
+        } else {
+            // Only distractors
+            for di in 0..n_dist {
+                docs = docs + [distractors[di]]
+            }
+            // Pad to n_dist + 1 with first distractor if needed
+            docs = docs + [distractors[0]]
+            oracle_idx = -1
+        }
+
+        batch = batch + [#{
+            "query": queries[i],
+            "docs": docs,
+            "answer": i % 2,
+            "oracle_idx": oracle_idx
+        }]
+    }
+
+    return batch
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Loss computation
+//
+//  Combined loss:
+//    L = L_answer + L_relevance
+//
+//    L_answer:    cross-entropy on answer head output
+//    L_relevance: if oracle_idx >= 0, cross-entropy that the
+//                 oracle doc gets the highest relevance score
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn raft_loss(model, query, docs, answer, oracle_idx) {
+    let n_docs_model = model["n_docs"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_ans = model["W_ans"]
+    let b_ans = model["b_ans"]
+
+    let q_emb = raft_encode_query(model, query)
+
+    // Encode docs and relevance scores
+    let mut doc_embs = []
+    let mut rel_scores = []
+    let n = len(docs)
+    for i in 0..n {
+        let d_emb = raft_encode_doc(model, docs[i])
+        doc_embs = doc_embs + [d_emb]
+        let sc = raft_relevance_score(model, q_emb, d_emb)
+        rel_scores = rel_scores + [sc]
+    }
+
+    // Relevance loss: cross-entropy that oracle doc is selected
+    let mut loss_rel = 0.0
+    if oracle_idx >= 0 {
+        let rel_probs = raft_softmax(rel_scores)
+        let mut p_oracle_doc = rel_probs[oracle_idx]
+        if p_oracle_doc < 1.0e-12 { p_oracle_doc = 1.0e-12 }
+        loss_rel = 0.0 - raft_log(p_oracle_doc)
+    }
+
+    // Build concat representation (same as extract_answer)
+    let weights = raft_softmax(rel_scores)
+    let ans_in = D_hidden * n_docs_model
+    let mut concat = raft_zeros(ans_in)
+    for d in 0..n {
+        let w = weights[d]
+        for j in 0..D_hidden {
+            let idx = d * D_hidden + j
+            if idx < ans_in {
+                concat[idx] = concat[idx] + w * doc_embs[d][j]
+            }
+        }
+    }
+
+    // Answer head logits
+    let mut logits = raft_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_ans[i]
+        for j in 0..ans_in { s = s + W_ans[i][j] * concat[j] }
+        logits[i] = s
+    }
+
+    // Cross-entropy on answer
+    let probs = raft_softmax(logits)
+    let mut pa = probs[answer]
+    if pa < 1.0e-12 { pa = 1.0e-12 }
+    let loss_ans = 0.0 - raft_log(pa)
+
+    return loss_ans + loss_rel
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step
+//
+//  Numerical gradient descent over one batch.
+//  Updates W_doc, b_doc, W_q, b_q, W_ans, b_ans.
+//
+//  Gradient is computed via finite differences (eps = 1e-4).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn raft_train_step(model, batch, lr) {
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let n_docs = model["n_docs"]
+    let eps = 1.0e-4
+    let inv_eps2 = 1.0 / (2.0 * eps)
+    let N = len(batch)
+    let inv_n = 1.0 / to_float(N)
+
+    // Helper: compute average loss over batch
+    // We inline the batch loss here to avoid function reference issues
+
+    // ── Update W_doc ──────────────────────────────────────────
+    let mut W_doc = model["W_doc"]
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let orig = W_doc[i][j]
+
+            W_doc[i][j] = orig + eps
+            let mut m_plus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": model["b_doc"],
+                "W_q": model["W_q"], "b_q": model["b_q"],
+                "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+            }
+            let mut lp = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            W_doc[i][j] = orig - eps
+            let mut m_minus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": model["b_doc"],
+                "W_q": model["W_q"], "b_q": model["b_q"],
+                "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+            }
+            let mut lm = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            let grad = (lp - lm) * inv_eps2 * inv_n
+            W_doc[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── Update b_doc ──────────────────────────────────────────
+    let mut b_doc = model["b_doc"]
+    for i in 0..D_hidden {
+        let orig = b_doc[i]
+
+        b_doc[i] = orig + eps
+        let mut m_plus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": model["W_q"], "b_q": model["b_q"],
+            "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+        }
+        let mut lp = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        b_doc[i] = orig - eps
+        let mut m_minus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": model["W_q"], "b_q": model["b_q"],
+            "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+        }
+        let mut lm = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        let grad = (lp - lm) * inv_eps2 * inv_n
+        b_doc[i] = orig - lr * grad
+    }
+
+    // ── Update W_q ────────────────────────────────────────────
+    let mut W_q = model["W_q"]
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let orig = W_q[i][j]
+
+            W_q[i][j] = orig + eps
+            let mut m_plus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": b_doc,
+                "W_q": W_q, "b_q": model["b_q"],
+                "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+            }
+            let mut lp = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            W_q[i][j] = orig - eps
+            let mut m_minus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": b_doc,
+                "W_q": W_q, "b_q": model["b_q"],
+                "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+            }
+            let mut lm = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            let grad = (lp - lm) * inv_eps2 * inv_n
+            W_q[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── Update b_q ────────────────────────────────────────────
+    let mut b_q = model["b_q"]
+    for i in 0..D_hidden {
+        let orig = b_q[i]
+
+        b_q[i] = orig + eps
+        let mut m_plus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": W_q, "b_q": b_q,
+            "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+        }
+        let mut lp = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        b_q[i] = orig - eps
+        let mut m_minus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": W_q, "b_q": b_q,
+            "W_ans": model["W_ans"], "b_ans": model["b_ans"]
+        }
+        let mut lm = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        let grad = (lp - lm) * inv_eps2 * inv_n
+        b_q[i] = orig - lr * grad
+    }
+
+    // ── Update W_ans ──────────────────────────────────────────
+    let ans_in = D_hidden * n_docs
+    let mut W_ans = model["W_ans"]
+    for i in 0..D_out {
+        for j in 0..ans_in {
+            let orig = W_ans[i][j]
+
+            W_ans[i][j] = orig + eps
+            let mut m_plus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": b_doc,
+                "W_q": W_q, "b_q": b_q,
+                "W_ans": W_ans, "b_ans": model["b_ans"]
+            }
+            let mut lp = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            W_ans[i][j] = orig - eps
+            let mut m_minus = #{
+                "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+                "n_docs": n_docs,
+                "W_doc": W_doc, "b_doc": b_doc,
+                "W_q": W_q, "b_q": b_q,
+                "W_ans": W_ans, "b_ans": model["b_ans"]
+            }
+            let mut lm = 0.0
+            for bi in 0..N {
+                let e = batch[bi]
+                lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+            }
+
+            let grad = (lp - lm) * inv_eps2 * inv_n
+            W_ans[i][j] = orig - lr * grad
+        }
+    }
+
+    // ── Update b_ans ──────────────────────────────────────────
+    let mut b_ans = model["b_ans"]
+    for i in 0..D_out {
+        let orig = b_ans[i]
+
+        b_ans[i] = orig + eps
+        let mut m_plus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": W_q, "b_q": b_q,
+            "W_ans": W_ans, "b_ans": b_ans
+        }
+        let mut lp = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lp = lp + raft_loss(m_plus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        b_ans[i] = orig - eps
+        let mut m_minus = #{
+            "D_in": D_in, "D_hidden": D_hidden, "D_out": D_out,
+            "n_docs": n_docs,
+            "W_doc": W_doc, "b_doc": b_doc,
+            "W_q": W_q, "b_q": b_q,
+            "W_ans": W_ans, "b_ans": b_ans
+        }
+        let mut lm = 0.0
+        for bi in 0..N {
+            let e = batch[bi]
+            lm = lm + raft_loss(m_minus, e["query"], e["docs"], e["answer"], e["oracle_idx"])
+        }
+
+        let grad = (lp - lm) * inv_eps2 * inv_n
+        b_ans[i] = orig - lr * grad
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_docs": n_docs,
+        "W_doc": W_doc,
+        "b_doc": b_doc,
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_ans": W_ans,
+        "b_ans": b_ans
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -16,7 +16,592 @@
 //  Run: ./hexa self/test_ring_attention.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/ring_attention.hexa"
+// -- inlined from self/ml/ring_attention.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/ring_attention.hexa — Ring Attention (distributed
+//  sequence-parallel attention)
+//
+//  Implements the Ring Attention algorithm (Liu et al. 2023):
+//    1. Ring topology     — ranks form a logical ring, each holds
+//                           a local Q chunk and rotating KV chunks
+//    2. KV chunk rotation — each step, send KV to next rank,
+//                           receive KV from prev rank
+//    3. Online softmax    — partial softmax accumulation across
+//                           chunks with running max/sum (numerically
+//                           stable, O(1) extra memory per query row)
+//    4. Final reduce      — normalize accumulated output by total
+//                           sum-exp after all KV chunks are seen
+//
+//  CPU simulation: "ranks" are array indices, no real network.
+//  Communication is modeled by array rotation.
+//
+//  API:
+//    ring_attention_forward(Q, K, V, world_size)
+//      Q, K, V : [S, d] nested 2D arrays (S divisible by world_size)
+//      Returns : [S, d] — matches ra_naive_attention(Q, K, V)
+//
+//    ring_attention_causal(Q, K, V, world_size)
+//      Same but with causal masking (global_kj > global_qi => -inf)
+//
+//    ring_partial_attention(Q_chunk, K_chunk, V_chunk)
+//      Returns [O_partial, row_max, row_sum] for one Q-KV pair
+//
+//    ring_merge_partials(O1, m1, l1, O2, m2, l2)
+//      Online softmax merge of two partial results
+//
+//    ring_topology_info(rank, world_size, seq_len)
+//      Returns [rank, world_size, next, prev, chunk_size]
+//
+//    ring_comm_bytes(seq_len, d, world_size)
+//      Estimated communication bytes
+//
+//  Shape convention (2D nested arrays, same as flash_attention.hexa):
+//    Q : [S, d]   — query matrix (nested)
+//    K : [S, d]   — key matrix (nested)
+//    V : [S, d]   — value matrix (nested)
+//    out: [S, d]  — output (nested)
+//
+//  AI-NATIVE attrs:
+//    @parallel — each rank's local computation is independent
+//    @fuse     — online softmax fused with KV rotation
+//    @hot      — called every forward step in long-context models
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn ra_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ra_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn ra_abs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn ra_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn ra_min_i(a, b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring Topology
+//
+//  world_size ranks form a logical ring:
+//    rank 0 -> rank 1 -> ... -> rank (W-1) -> rank 0
+// ═══════════════════════════════════════════════════════════════
+
+fn ring_next(rank, world_size) {
+    (rank + 1) % world_size
+}
+
+fn ring_prev(rank, world_size) {
+    (rank - 1 + world_size) % world_size
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Sequence chunking — split/reassemble [S, d] along row dim
+// ═══════════════════════════════════════════════════════════════
+
+fn ra_chunk_seq(mat, world_size) {
+    let S = len(mat)
+    let chunk_size = S / world_size
+    let mut chunks = []
+    for r in 0..world_size {
+        let start = r * chunk_size
+        let mut chunk = []
+        for i in 0..chunk_size {
+            chunk = chunk + [mat[start + i]]
+        }
+        chunks = chunks + [chunk]
+    }
+    return chunks
+}
+
+fn ra_unchunk_seq(chunks, world_size) {
+    let mut out = []
+    for r in 0..world_size {
+        let chunk = chunks[r]
+        let n = len(chunk)
+        for i in 0..n {
+            out = out + [chunk[i]]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  KV Chunk Rotation (simulated)
+//
+//  rotate: new_chunks[r] = old_chunks[prev(r)]
+//  After one rotation, rank r holds what was on rank r-1.
+// ═══════════════════════════════════════════════════════════════
+
+fn ra_rotate_chunks(chunks, world_size) {
+    let mut new_chunks = []
+    for r in 0..world_size {
+        let src = ring_prev(r, world_size)
+        new_chunks = new_chunks + [chunks[src]]
+    }
+    return new_chunks
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Naive attention — reference for correctness (non-causal)
+// ═══════════════════════════════════════════════════════════════
+
+fn ra_naive_attention(Q, K, V) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+    let mut out = ra_zeros_2d(S, d)
+
+    for i in 0..S {
+        let mut scores = ra_zeros_1d(S)
+        for j in 0..S {
+            let mut dot = 0.0
+            for k in 0..d {
+                dot = dot + Q[i][k] * K[j][k]
+            }
+            scores[j] = dot * scale
+        }
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m {
+                m = scores[j]
+            }
+        }
+        let mut sum_exp = 0.0
+        let mut exps = ra_zeros_1d(S)
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            exps[j] = e
+            sum_exp = sum_exp + e
+        }
+        for k in 0..d {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// Naive causal attention reference
+fn ra_naive_attention_causal(Q, K, V) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+    let mut out = ra_zeros_2d(S, d)
+
+    for i in 0..S {
+        let mut scores = ra_zeros_1d(S)
+        for j in 0..S {
+            if j > i {
+                scores[j] = 0.0 - 1.0e30
+            } else {
+                let mut dot = 0.0
+                for k in 0..d {
+                    dot = dot + Q[i][k] * K[j][k]
+                }
+                scores[j] = dot * scale
+            }
+        }
+        let mut m = scores[0]
+        for j in 1..S {
+            if scores[j] > m {
+                m = scores[j]
+            }
+        }
+        let mut sum_exp = 0.0
+        let mut exps = ra_zeros_1d(S)
+        for j in 0..S {
+            let e = exp(scores[j] - m)
+            exps[j] = e
+            sum_exp = sum_exp + e
+        }
+        for k in 0..d {
+            let mut acc = 0.0
+            for j in 0..S {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring Attention Forward — non-causal
+//
+//  Algorithm:
+//    1. Split Q, K, V into world_size chunks along seq dim
+//    2. Each rank r holds Q_r (fixed), rotating K_cur, V_cur
+//    3. For step = 0 .. world_size-1:
+//       a. Compute scores: Q_r @ K_cur^T * scale
+//       b. Online softmax accumulation with running max/sum
+//       c. Rotate K, V to next rank
+//    4. Normalize: O = O / l
+//    5. Reassemble chunks into [S, d]
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel @fuse
+fn ring_attention_forward(Q, K, V, world_size) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+    let chunk_size = S / world_size
+
+    let Q_chunks = ra_chunk_seq(Q, world_size)
+    let mut K_chunks = ra_chunk_seq(K, world_size)
+    let mut V_chunks = ra_chunk_seq(V, world_size)
+
+    // Per-rank accumulators
+    let mut O_chunks = []
+    let mut row_m_all = []
+    let mut row_l_all = []
+    for r in 0..world_size {
+        O_chunks = O_chunks + [ra_zeros_2d(chunk_size, d)]
+        let mut rm = ra_zeros_1d(chunk_size)
+        let mut rl = ra_zeros_1d(chunk_size)
+        for qi in 0..chunk_size {
+            rm[qi] = 0.0 - 1.0e30
+            rl[qi] = 0.0
+        }
+        row_m_all = row_m_all + [rm]
+        row_l_all = row_l_all + [rl]
+    }
+
+    // Ring rotation: world_size steps
+    for _step in 0..world_size {
+        for r in 0..world_size {
+            let Q_local = Q_chunks[r]
+            let K_cur = K_chunks[r]
+            let V_cur = V_chunks[r]
+            let kv_len = len(K_cur)
+
+            for qi in 0..chunk_size {
+                // Compute scores and find tile max
+                let mut tile_max = 0.0 - 1.0e30
+                let mut scores = ra_zeros_1d(kv_len)
+                for kj in 0..kv_len {
+                    let mut dot = 0.0
+                    for k in 0..d {
+                        dot = dot + Q_local[qi][k] * K_cur[kj][k]
+                    }
+                    let s = dot * scale
+                    scores[kj] = s
+                    if s > tile_max {
+                        tile_max = s
+                    }
+                }
+
+                // Online softmax update
+                let m_old = row_m_all[r][qi]
+                let m_new = ra_max_f(m_old, tile_max)
+                let alpha = exp(m_old - m_new)
+
+                let mut tile_sum = 0.0
+                let mut p_row = ra_zeros_1d(kv_len)
+                for kj in 0..kv_len {
+                    let p = exp(scores[kj] - m_new)
+                    p_row[kj] = p
+                    tile_sum = tile_sum + p
+                }
+
+                let l_new = row_l_all[r][qi] * alpha + tile_sum
+                for k in 0..d {
+                    O_chunks[r][qi][k] = O_chunks[r][qi][k] * alpha
+                }
+                for kj in 0..kv_len {
+                    for k in 0..d {
+                        O_chunks[r][qi][k] = O_chunks[r][qi][k] + p_row[kj] * V_cur[kj][k]
+                    }
+                }
+
+                row_m_all[r][qi] = m_new
+                row_l_all[r][qi] = l_new
+            }
+        }
+
+        K_chunks = ra_rotate_chunks(K_chunks, world_size)
+        V_chunks = ra_rotate_chunks(V_chunks, world_size)
+    }
+
+    // Final normalization
+    for r in 0..world_size {
+        for qi in 0..chunk_size {
+            let inv_l = 1.0 / row_l_all[r][qi]
+            for k in 0..d {
+                O_chunks[r][qi][k] = O_chunks[r][qi][k] * inv_l
+            }
+        }
+    }
+
+    return ra_unchunk_seq(O_chunks, world_size)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring Attention Causal — with causal masking
+//
+//  Global positions:
+//    query row i on rank r_q:    global_qi = r_q * chunk_size + qi
+//    key col j from source rank: global_kj = src * chunk_size + kj
+//    where src = (r - step + W) % W
+//
+//  Causal: global_kj <= global_qi, else -inf
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel @fuse
+fn ring_attention_causal(Q, K, V, world_size) {
+    let S = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+    let chunk_size = S / world_size
+
+    let Q_chunks = ra_chunk_seq(Q, world_size)
+    let mut K_chunks = ra_chunk_seq(K, world_size)
+    let mut V_chunks = ra_chunk_seq(V, world_size)
+
+    let mut O_chunks = []
+    let mut row_m_all = []
+    let mut row_l_all = []
+    for r in 0..world_size {
+        O_chunks = O_chunks + [ra_zeros_2d(chunk_size, d)]
+        let mut rm = ra_zeros_1d(chunk_size)
+        let mut rl = ra_zeros_1d(chunk_size)
+        for qi in 0..chunk_size {
+            rm[qi] = 0.0 - 1.0e30
+            rl[qi] = 0.0
+        }
+        row_m_all = row_m_all + [rm]
+        row_l_all = row_l_all + [rl]
+    }
+
+    for step in 0..world_size {
+        for r in 0..world_size {
+            let Q_local = Q_chunks[r]
+            let K_cur = K_chunks[r]
+            let V_cur = V_chunks[r]
+            let kv_len = len(K_cur)
+
+            // Source rank of the KV chunk currently at rank r
+            let src_rank = (r - step + world_size * 100) % world_size
+
+            for qi in 0..chunk_size {
+                let global_qi = r * chunk_size + qi
+
+                let mut tile_max = 0.0 - 1.0e30
+                let mut scores = ra_zeros_1d(kv_len)
+                let mut all_masked = true
+
+                for kj in 0..kv_len {
+                    let global_kj = src_rank * chunk_size + kj
+                    if global_kj > global_qi {
+                        scores[kj] = 0.0 - 1.0e30
+                    } else {
+                        let mut dot = 0.0
+                        for k in 0..d {
+                            dot = dot + Q_local[qi][k] * K_cur[kj][k]
+                        }
+                        let s = dot * scale
+                        scores[kj] = s
+                        if s > tile_max {
+                            tile_max = s
+                        }
+                        all_masked = false
+                    }
+                }
+
+                if !all_masked {
+                    let m_old = row_m_all[r][qi]
+                    let m_new = ra_max_f(m_old, tile_max)
+                    let alpha = exp(m_old - m_new)
+
+                    let mut tile_sum = 0.0
+                    let mut p_row = ra_zeros_1d(kv_len)
+                    for kj in 0..kv_len {
+                        let p = exp(scores[kj] - m_new)
+                        p_row[kj] = p
+                        tile_sum = tile_sum + p
+                    }
+
+                    let l_new = row_l_all[r][qi] * alpha + tile_sum
+                    for k in 0..d {
+                        O_chunks[r][qi][k] = O_chunks[r][qi][k] * alpha
+                    }
+                    for kj in 0..kv_len {
+                        for k in 0..d {
+                            O_chunks[r][qi][k] = O_chunks[r][qi][k] + p_row[kj] * V_cur[kj][k]
+                        }
+                    }
+
+                    row_m_all[r][qi] = m_new
+                    row_l_all[r][qi] = l_new
+                }
+            }
+        }
+
+        K_chunks = ra_rotate_chunks(K_chunks, world_size)
+        V_chunks = ra_rotate_chunks(V_chunks, world_size)
+    }
+
+    // Final normalization
+    for r in 0..world_size {
+        for qi in 0..chunk_size {
+            let inv_l = 1.0 / row_l_all[r][qi]
+            for k in 0..d {
+                O_chunks[r][qi][k] = O_chunks[r][qi][k] * inv_l
+            }
+        }
+    }
+
+    return ra_unchunk_seq(O_chunks, world_size)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring topology info
+//  Returns [rank, world_size, next, prev, chunk_size]
+// ═══════════════════════════════════════════════════════════════
+
+fn ring_topology_info(rank, world_size, seq_len) {
+    let next = ring_next(rank, world_size)
+    let prev = ring_prev(rank, world_size)
+    let cs = seq_len / world_size
+    return [rank, world_size, next, prev, cs]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Communication cost model
+//  Returns estimated total bytes transferred across all steps.
+// ═══════════════════════════════════════════════════════════════
+
+fn ring_comm_bytes(seq_len, d, world_size) {
+    let chunk_size = seq_len / world_size
+    let per_step = 2 * chunk_size * d * 4
+    let total = per_step * world_size
+    return total
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Partial attention — compute partial online softmax output for
+//  a single Q chunk against a single KV chunk. Returns
+//  [O_partial, row_max, row_sum] for external accumulation.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ring_partial_attention(Q_chunk, K_chunk, V_chunk) {
+    let qlen = len(Q_chunk)
+    let kvlen = len(K_chunk)
+    let d = len(Q_chunk[0])
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut O = ra_zeros_2d(qlen, d)
+    let mut row_max = ra_zeros_1d(qlen)
+    let mut row_sum = ra_zeros_1d(qlen)
+
+    for qi in 0..qlen {
+        let mut tile_max = 0.0 - 1.0e30
+        let mut scores = ra_zeros_1d(kvlen)
+        for kj in 0..kvlen {
+            let mut dot = 0.0
+            for k in 0..d {
+                dot = dot + Q_chunk[qi][k] * K_chunk[kj][k]
+            }
+            let s = dot * scale
+            scores[kj] = s
+            if s > tile_max {
+                tile_max = s
+            }
+        }
+
+        let mut tile_sum = 0.0
+        let mut p_row = ra_zeros_1d(kvlen)
+        for kj in 0..kvlen {
+            let p = exp(scores[kj] - tile_max)
+            p_row[kj] = p
+            tile_sum = tile_sum + p
+        }
+
+        for kj in 0..kvlen {
+            for k in 0..d {
+                O[qi][k] = O[qi][k] + p_row[kj] * V_chunk[kj][k]
+            }
+        }
+
+        row_max[qi] = tile_max
+        row_sum[qi] = tile_sum
+    }
+
+    return [O, row_max, row_sum]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Online softmax merge — combine two partial results
+//
+//  Given (O1, m1, l1) and (O2, m2, l2), produce merged (O, m, l):
+//    m = max(m1, m2)
+//    alpha1 = exp(m1 - m), alpha2 = exp(m2 - m)
+//    l = l1 * alpha1 + l2 * alpha2
+//    O = O1 * alpha1 + O2 * alpha2
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn ring_merge_partials(O1, m1, l1, O2, m2, l2) {
+    let qlen = len(O1)
+    let d = len(O1[0])
+
+    let mut O_merged = ra_zeros_2d(qlen, d)
+    let mut m_merged = ra_zeros_1d(qlen)
+    let mut l_merged = ra_zeros_1d(qlen)
+
+    for qi in 0..qlen {
+        let m = ra_max_f(m1[qi], m2[qi])
+        let a1 = exp(m1[qi] - m)
+        let a2 = exp(m2[qi] - m)
+        let l = l1[qi] * a1 + l2[qi] * a2
+
+        for k in 0..d {
+            O_merged[qi][k] = O1[qi][k] * a1 + O2[qi][k] * a2
+        }
+
+        m_merged[qi] = m
+        l_merged[qi] = l
+    }
+
+    return [O_merged, m_merged, l_merged]
+}
+
+println("[ring_attention] module loaded — distributed sequence-parallel attention ready")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

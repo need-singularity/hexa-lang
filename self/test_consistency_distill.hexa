@@ -2,7 +2,839 @@
 //  test_consistency_distill.hexa — Consistency Distillation (#344)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/consistency_distill.hexa"
+// -- inlined from self/ml/consistency_distill.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/consistency_distill.hexa — Consistency Distillation (#344)
+//
+//  Distill a diffusion model into a consistency model that generates
+//  in 1-2 steps instead of 50-1000 DDPM steps.
+//
+//  Core idea (Song et al., 2023):
+//    - Consistency function: f(x_t, t) -> x_0 for any noise level t
+//    - Self-consistency: f(x_t, t) = f(x_t', t') on same ODE trajectory
+//    - Distillation loss: ||f_theta(x_{t_{n+1}}) - f_{theta^-}(x_{t_n})||^2
+//    - EMA teacher: theta^- = stopgrad(EMA of theta)
+//    - Boundary condition: f(x, eps) = x
+//
+//  Difference from consistency_model.hexa (#289):
+//    - Uses a pretrained diffusion teacher for ODE-step denoising
+//    - EMA teacher (theta^-) for stable distillation targets
+//    - Karras noise schedule with rho-based spacing
+//    - Huber loss for robustness
+//
+//  API:
+//    cd_init(dim, hidden, sigma_data, eps, seed)              -> model
+//    cd_teacher_init(dim, hidden, seed)                       -> teacher
+//    cd_ema_init(model)                                       -> ema_model
+//    cd_ema_update(ema, model, decay)                         -> ema_model
+//    cd_skip_coeff(sigma_data, eps, t)                        -> float
+//    cd_out_coeff(sigma_data, eps, t)                         -> float
+//    cd_denoise(model, x_t, t)                                -> [float]
+//    cd_teacher_denoise(teacher, x_t, t)                      -> [float]
+//    cd_ode_step(teacher, x_t, t_n, t_n1)                    -> [float]
+//    cd_karras_schedule(sigma_min, sigma_max, n_steps, rho)   -> [float]
+//    cd_distill_loss(student, ema_model, teacher, x_0, noise,
+//                    t_n, t_n1)                               -> float
+//    cd_huber_loss(a, b, delta)                               -> float
+//    cd_distill_loss_huber(student, ema_model, teacher, x_0,
+//                          noise, t_n, t_n1, delta)           -> float
+//    cd_train_step(student, ema_model, teacher, batch_x0,
+//                  batch_noise, batch_tn, batch_tn1, lr,
+//                  ema_decay)                                 -> [student, ema]
+//    cd_sample_1step(model, z)                                -> [float]
+//    cd_sample_2step(model, z, t_mid)                         -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / coefficients / loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn cd_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn cd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    for _i in 0..30 {
+        g = 0.5 * (g + x / g)
+    }
+    return g
+}
+
+fn cd_tanh(x) {
+    let ep = cd_exp(x)
+    let en = cd_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn cd_pow(base, exponent) {
+    if base <= 0.0 { return 0.0 }
+    return cd_exp(exponent * cd_log(base))
+}
+
+fn cd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cd_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn cd_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn cd_uniform(state) {
+    let s = cd_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Skip and output coefficients (Karras parameterisation)
+//
+//    c_skip(t) = sigma_data^2 / ((t - eps)^2 + sigma_data^2)
+//    c_out(t)  = sigma_data * (t - eps) / sqrt(sigma_data^2 + t^2)
+//
+//  Boundary: c_skip(eps) = 1, c_out(eps) = 0  =>  f(x, eps) = x
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_skip_coeff(sigma_data, eps, t) {
+    let sd2 = sigma_data * sigma_data
+    let diff = t - eps
+    return sd2 / (diff * diff + sd2)
+}
+
+@pure
+fn cd_out_coeff(sigma_data, eps, t) {
+    let sd2 = sigma_data * sigma_data
+    let diff = t - eps
+    return sigma_data * diff / cd_sqrt(sd2 + t * t)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Student model init — two-layer MLP with time embedding
+//
+//    h = tanh(W1 * x + b1 + W_t * t)
+//    out = W2 * h + b2
+// ═══════════════════════════════════════════════════════════════════
+
+fn cd_init(dim, hidden, sigma_data, eps, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let scale_1 = 1.0 / cd_sqrt(to_float(dim))
+    let scale_2 = 1.0 / cd_sqrt(to_float(hidden))
+
+    let mut W1 = cd_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = (u[0] - 0.5) * scale_1
+        }
+    }
+    let b1 = cd_zeros(hidden)
+
+    let mut W_t = cd_zeros(hidden)
+    for i in 0..hidden {
+        let u = cd_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_t[i] = (u[0] - 0.5) * 0.1
+    }
+
+    let mut W2 = cd_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W2[i][j] = (u[0] - 0.5) * scale_2
+        }
+    }
+    let b2 = cd_zeros(dim)
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": sigma_data,
+        "eps": eps,
+        "W1": W1,
+        "b1": b1,
+        "W_t": W_t,
+        "W2": W2,
+        "b2": b2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher model — pretrained diffusion model (simulated)
+//
+//  Two-layer MLP that approximates the score function.
+//  In real usage this would be loaded from a checkpoint.
+// ═══════════════════════════════════════════════════════════════════
+
+fn cd_teacher_init(dim, hidden, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let scale_1 = 1.0 / cd_sqrt(to_float(dim))
+    let scale_2 = 1.0 / cd_sqrt(to_float(hidden))
+
+    let mut W1 = cd_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = (u[0] - 0.5) * scale_1
+        }
+    }
+    let b1 = cd_zeros(hidden)
+
+    let mut W_t = cd_zeros(hidden)
+    for i in 0..hidden {
+        let u = cd_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_t[i] = (u[0] - 0.5) * 0.1
+    }
+
+    let mut W2 = cd_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W2[i][j] = (u[0] - 0.5) * scale_2
+        }
+    }
+    let b2 = cd_zeros(dim)
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "W1": W1,
+        "b1": b1,
+        "W_t": W_t,
+        "W2": W2,
+        "b2": b2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Raw neural network forward  F_theta(x, t)
+//
+//    h = tanh(W1 * x + b1 + W_t * t)
+//    out = W2 * h + b2
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_f_theta(model, x, t) {
+    let dim = model["dim"]
+    let hidden = model["hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W_t = model["W_t"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+
+    let mut h = cd_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i] + W_t[i] * t
+        for j in 0..dim { s = s + W1[i][j] * x[j] }
+        h[i] = cd_tanh(s)
+    }
+
+    let mut out = cd_zeros(dim)
+    for i in 0..dim {
+        let mut s = b2[i]
+        for j in 0..hidden { s = s + W2[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Consistency function (student)
+//
+//    f(x_t, t) = c_skip(t) * x_t + c_out(t) * F_theta(x_t, t)
+//
+//  At t = eps: c_skip = 1, c_out = 0 => f(x, eps) = x
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_denoise(model, x_t, t) {
+    let sigma_data = model["sigma_data"]
+    let eps = model["eps"]
+    let dim = model["dim"]
+    let c_skip = cd_skip_coeff(sigma_data, eps, t)
+    let c_out = cd_out_coeff(sigma_data, eps, t)
+    let f_out = cd_f_theta(model, x_t, t)
+
+    let mut result = cd_zeros(dim)
+    for i in 0..dim {
+        result[i] = c_skip * x_t[i] + c_out * f_out[i]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Teacher denoiser — raw MLP prediction (no skip connection)
+//
+//  Simulates a pretrained diffusion model's denoiser.
+//  In practice: teacher(x_t, t) ~ x_0  (predicts clean data)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_teacher_denoise(teacher, x_t, t) {
+    let dim = teacher["dim"]
+    let hidden = teacher["hidden"]
+    let W1 = teacher["W1"]
+    let b1 = teacher["b1"]
+    let W_t = teacher["W_t"]
+    let W2 = teacher["W2"]
+    let b2 = teacher["b2"]
+
+    let mut h = cd_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i] + W_t[i] * t
+        for j in 0..dim { s = s + W1[i][j] * x_t[j] }
+        h[i] = cd_tanh(s)
+    }
+
+    let mut out = cd_zeros(dim)
+    for i in 0..dim {
+        let mut s = b2[i]
+        for j in 0..hidden { s = s + W2[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ODE step — one Euler step using the teacher
+//
+//  Given x at noise level t_n, step to t_n1 (closer to data):
+//    x_hat_0 = teacher(x_t, t_n)  (teacher's prediction of clean x)
+//    x_{t_{n-1}} = x_t + (t_n1 - t_n) * (x_t - x_hat_0) / t_n
+//
+//  This follows the probability flow ODE from t_n to t_n1.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_ode_step(teacher, x_t, t_n, t_n1) {
+    let dim = teacher["dim"]
+    let x_hat_0 = cd_teacher_denoise(teacher, x_t, t_n)
+
+    let mut x_next = cd_zeros(dim)
+    for i in 0..dim {
+        let dx = (x_t[i] - x_hat_0[i]) / t_n
+        x_next[i] = x_t[i] + (t_n1 - t_n) * dx
+    }
+    return x_next
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  EMA model — exponential moving average of student params
+//
+//  theta^- = decay * theta^- + (1 - decay) * theta
+//  Used as the target network (stopgrad) in distillation loss.
+// ═══════════════════════════════════════════════════════════════════
+
+fn cd_ema_init(model) {
+    let dim = model["dim"]
+    let hidden = model["hidden"]
+
+    let mut W1 = cd_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            W1[i][j] = model["W1"][i][j]
+        }
+    }
+    let mut b1 = cd_zeros(hidden)
+    for i in 0..hidden { b1[i] = model["b1"][i] }
+
+    let mut W_t = cd_zeros(hidden)
+    for i in 0..hidden { W_t[i] = model["W_t"][i] }
+
+    let mut W2 = cd_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            W2[i][j] = model["W2"][i][j]
+        }
+    }
+    let mut b2 = cd_zeros(dim)
+    for i in 0..dim { b2[i] = model["b2"][i] }
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": model["sigma_data"],
+        "eps": model["eps"],
+        "W1": W1,
+        "b1": b1,
+        "W_t": W_t,
+        "W2": W2,
+        "b2": b2
+    }
+}
+
+@pure
+fn cd_ema_update(ema, model, decay) {
+    let dim = ema["dim"]
+    let hidden = ema["hidden"]
+
+    let mut W1 = cd_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            W1[i][j] = decay * ema["W1"][i][j] + (1.0 - decay) * model["W1"][i][j]
+        }
+    }
+
+    let mut b1 = cd_zeros(hidden)
+    for i in 0..hidden {
+        b1[i] = decay * ema["b1"][i] + (1.0 - decay) * model["b1"][i]
+    }
+
+    let mut W_t = cd_zeros(hidden)
+    for i in 0..hidden {
+        W_t[i] = decay * ema["W_t"][i] + (1.0 - decay) * model["W_t"][i]
+    }
+
+    let mut W2 = cd_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            W2[i][j] = decay * ema["W2"][i][j] + (1.0 - decay) * model["W2"][i][j]
+        }
+    }
+
+    let mut b2 = cd_zeros(dim)
+    for i in 0..dim {
+        b2[i] = decay * ema["b2"][i] + (1.0 - decay) * model["b2"][i]
+    }
+
+    return #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": ema["sigma_data"],
+        "eps": ema["eps"],
+        "W1": W1,
+        "b1": b1,
+        "W_t": W_t,
+        "W2": W2,
+        "b2": b2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Karras noise schedule
+//
+//  sigma_i = (sigma_min^(1/rho) + i/(N-1) * (sigma_max^(1/rho) - sigma_min^(1/rho)))^rho
+//
+//  rho = 7 is the default in Karras et al.
+//  Returns list of sigma values from sigma_max down to sigma_min.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_karras_schedule(sigma_min, sigma_max, n_steps, rho) {
+    if n_steps <= 1 { return [sigma_max] }
+    let inv_rho = 1.0 / rho
+    let min_inv = cd_pow(sigma_min, inv_rho)
+    let max_inv = cd_pow(sigma_max, inv_rho)
+
+    let mut sigmas = cd_zeros(n_steps)
+    for i in 0..n_steps {
+        if i == 0 {
+            sigmas[i] = sigma_max
+        } else {
+            if i == n_steps - 1 {
+                sigmas[i] = sigma_min
+            } else {
+                let frac = to_float(i) / to_float(n_steps - 1)
+                let val = max_inv + frac * (min_inv - max_inv)
+                sigmas[i] = cd_pow(val, rho)
+            }
+        }
+    }
+    return sigmas
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Add noise: x_t = x_0 + t * noise
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_add_noise(x_0, noise, t) {
+    let dim = len(x_0)
+    let mut x_t = cd_zeros(dim)
+    for i in 0..dim {
+        x_t[i] = x_0[i] + t * noise[i]
+    }
+    return x_t
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Distillation loss (MSE)
+//
+//  Key formula:
+//    x_{t_n}  = x_0 + t_n * noise
+//    x_{t_n1} = ODE_step(teacher, x_{t_n}, t_n, t_n1)
+//    loss = || f_theta(x_{t_n}, t_n) - f_{theta^-}(x_{t_n1}, t_n1) ||^2
+//
+//  f_theta = student consistency function
+//  f_{theta^-} = EMA teacher consistency function (stopgrad)
+//
+//  This enforces: the student at high noise and the EMA at lower
+//  noise (after one ODE step) should predict the same clean output.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_distill_loss(student, ema_model, teacher, x_0, noise, t_n, t_n1) {
+    let dim = student["dim"]
+
+    // Noisy input at t_n
+    let x_tn = cd_add_noise(x_0, noise, t_n)
+
+    // ODE step from t_n to t_n1 using the diffusion teacher
+    let x_tn1 = cd_ode_step(teacher, x_tn, t_n, t_n1)
+
+    // Student prediction at (x_{t_n}, t_n)
+    let f_student = cd_denoise(student, x_tn, t_n)
+
+    // EMA prediction at (x_{t_{n-1}}, t_{n-1}) — stopgrad target
+    let f_ema = cd_denoise(ema_model, x_tn1, t_n1)
+
+    // MSE loss
+    let mut mse = 0.0
+    for i in 0..dim {
+        let diff = f_student[i] - f_ema[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Huber loss variant — more robust to outliers
+//
+//  L_delta(a, b) = 0.5*(a-b)^2           if |a-b| <= delta
+//                = delta*(|a-b| - 0.5*delta) otherwise
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_huber_loss(a, b, delta) {
+    let n = len(a)
+    let mut total = 0.0
+    for i in 0..n {
+        let diff = cd_abs(a[i] - b[i])
+        if diff <= delta {
+            total = total + 0.5 * diff * diff
+        } else {
+            total = total + delta * (diff - 0.5 * delta)
+        }
+    }
+    return total / to_float(n)
+}
+
+@pure
+fn cd_distill_loss_huber(student, ema_model, teacher, x_0, noise, t_n, t_n1, delta) {
+    let x_tn = cd_add_noise(x_0, noise, t_n)
+    let x_tn1 = cd_ode_step(teacher, x_tn, t_n, t_n1)
+    let f_student = cd_denoise(student, x_tn, t_n)
+    let f_ema = cd_denoise(ema_model, x_tn1, t_n1)
+    return cd_huber_loss(f_student, f_ema, delta)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step — numerical gradient + EMA update
+//
+//  For each sample in batch:
+//    1. Compute distillation loss
+//    2. Finite-difference gradient on student params
+//    3. SGD update on student
+//    4. EMA update on target network
+//
+//  Returns: [updated_student, updated_ema]
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn cd_train_step(student, ema_model, teacher, batch_x0, batch_noise, batch_tn, batch_tn1, lr, ema_decay) {
+    let dim = student["dim"]
+    let hidden = student["hidden"]
+    let sigma_data = student["sigma_data"]
+    let eps_param = student["eps"]
+    let N = len(batch_x0)
+    let delta = 0.001
+
+    // Compute base loss
+    let mut base_loss = 0.0
+    for n in 0..N {
+        base_loss = base_loss + cd_distill_loss(student, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+    }
+    base_loss = base_loss / to_float(N)
+
+    // ── Gradient for W1 ─────────────────────────────────────────
+    let mut W1 = student["W1"]
+    let mut W1_new = cd_zeros_2d(hidden, dim)
+    for i in 0..hidden {
+        for j in 0..dim {
+            let orig = W1[i][j]
+            W1[i][j] = orig + delta
+            let mut m2 = #{
+                "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+                "eps": eps_param, "W1": W1, "b1": student["b1"],
+                "W_t": student["W_t"], "W2": student["W2"], "b2": student["b2"]
+            }
+            let mut loss_p = 0.0
+            for n in 0..N {
+                loss_p = loss_p + cd_distill_loss(m2, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+            }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / delta
+            W1_new[i][j] = orig - lr * grad
+            W1[i][j] = orig
+        }
+    }
+
+    // ── Gradient for b1 ─────────────────────────────────────────
+    let mut b1 = student["b1"]
+    let mut b1_new = cd_zeros(hidden)
+    for i in 0..hidden {
+        let orig = b1[i]
+        b1[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": student["W1"], "b1": b1,
+            "W_t": student["W_t"], "W2": student["W2"], "b2": student["b2"]
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cd_distill_loss(m2, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        b1_new[i] = orig - lr * grad
+        b1[i] = orig
+    }
+
+    // ── Gradient for W_t ────────────────────────────────────────
+    let mut W_t = student["W_t"]
+    let mut W_t_new = cd_zeros(hidden)
+    for i in 0..hidden {
+        let orig = W_t[i]
+        W_t[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": student["W1"], "b1": student["b1"],
+            "W_t": W_t, "W2": student["W2"], "b2": student["b2"]
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cd_distill_loss(m2, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        W_t_new[i] = orig - lr * grad
+        W_t[i] = orig
+    }
+
+    // ── Gradient for W2 ─────────────────────────────────────────
+    let mut W2 = student["W2"]
+    let mut W2_new = cd_zeros_2d(dim, hidden)
+    for i in 0..dim {
+        for j in 0..hidden {
+            let orig = W2[i][j]
+            W2[i][j] = orig + delta
+            let mut m2 = #{
+                "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+                "eps": eps_param, "W1": student["W1"], "b1": student["b1"],
+                "W_t": student["W_t"], "W2": W2, "b2": student["b2"]
+            }
+            let mut loss_p = 0.0
+            for n in 0..N {
+                loss_p = loss_p + cd_distill_loss(m2, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+            }
+            loss_p = loss_p / to_float(N)
+            let grad = (loss_p - base_loss) / delta
+            W2_new[i][j] = orig - lr * grad
+            W2[i][j] = orig
+        }
+    }
+
+    // ── Gradient for b2 ─────────────────────────────────────────
+    let mut b2 = student["b2"]
+    let mut b2_new = cd_zeros(dim)
+    for i in 0..dim {
+        let orig = b2[i]
+        b2[i] = orig + delta
+        let mut m2 = #{
+            "dim": dim, "hidden": hidden, "sigma_data": sigma_data,
+            "eps": eps_param, "W1": student["W1"], "b1": student["b1"],
+            "W_t": student["W_t"], "W2": student["W2"], "b2": b2
+        }
+        let mut loss_p = 0.0
+        for n in 0..N {
+            loss_p = loss_p + cd_distill_loss(m2, ema_model, teacher, batch_x0[n], batch_noise[n], batch_tn[n], batch_tn1[n])
+        }
+        loss_p = loss_p / to_float(N)
+        let grad = (loss_p - base_loss) / delta
+        b2_new[i] = orig - lr * grad
+        b2[i] = orig
+    }
+
+    // Build updated student
+    let new_student = #{
+        "dim": dim,
+        "hidden": hidden,
+        "sigma_data": sigma_data,
+        "eps": eps_param,
+        "W1": W1_new,
+        "b1": b1_new,
+        "W_t": W_t_new,
+        "W2": W2_new,
+        "b2": b2_new
+    }
+
+    // EMA update on target network
+    let new_ema = cd_ema_update(ema_model, new_student, ema_decay)
+
+    return [new_student, new_ema]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1-step sampling — the key advantage of consistency distillation
+//
+//  Given noise z ~ N(0, I), produce a sample with a single pass:
+//    x_hat = f(z, T)
+//
+//  T = sigma_data * 80  (Karras upper bound)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_sample_1step(model, z) {
+    let sigma_data = model["sigma_data"]
+    let t_max = sigma_data * 80.0
+    return cd_denoise(model, z, t_max)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2-step sampling — better quality with one extra evaluation
+//
+//    1. x_1 = f(z, T)           — first denoise from max noise
+//    2. x_1_noisy = x_1 + t_mid * noise_from_z
+//    3. x_hat = f(x_1_noisy, t_mid)  — second denoise at t_mid
+//
+//  Approximation: re-noise with original z scaled to t_mid.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_sample_2step(model, z, t_mid) {
+    let sigma_data = model["sigma_data"]
+    let dim = model["dim"]
+    let t_max = sigma_data * 80.0
+
+    // Step 1: denoise from T
+    let x_1 = cd_denoise(model, z, t_max)
+
+    // Step 2: add noise back at t_mid, then denoise again
+    let mut x_mid = cd_zeros(dim)
+    for i in 0..dim {
+        x_mid[i] = x_1[i] + t_mid * z[i]
+    }
+    return cd_denoise(model, x_mid, t_mid)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  LPIPS-like perceptual loss approximation
+//
+//  Approximates perceptual difference using learned feature space.
+//  In practice this is a pre-trained VGG; here we use a simple
+//  weighted MSE as a stand-in.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_perceptual_loss(a, b) {
+    let n = len(a)
+    let mut total = 0.0
+    for i in 0..n {
+        let w = 1.0 + 0.5 * to_float(i % 3)
+        let diff = a[i] - b[i]
+        total = total + w * diff * diff
+    }
+    return total / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Adaptive schedule — curriculum from many steps to few
+//
+//  During training, gradually increase N (number of discretization
+//  steps) from s0 to s1. More steps = finer ODE approximation =
+//  better distillation target early on.
+//
+//  N(k) = ceil(sqrt(k/K * ((s1)^2 - (s0)^2) + (s0)^2)) + 1
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_adaptive_n_steps(step, total_steps, s0, s1) {
+    if total_steps <= 1 { return s0 }
+    let frac = to_float(step) / to_float(total_steps)
+    let s0_sq = to_float(s0 * s0)
+    let s1_sq = to_float(s1 * s1)
+    let n_sq = frac * (s1_sq - s0_sq) + s0_sq
+    let n = int(cd_sqrt(n_sq)) + 1
+    if n < s0 { return s0 }
+    if n > s1 { return s1 }
+    return n
+}
+
+println("[consistency_distill] loaded — ODE distill + EMA target + Karras schedule + Huber loss + 1/2-step sampling")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

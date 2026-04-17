@@ -2,7 +2,635 @@
 //  test_monarch_mixer.hexa — Monarch Mixer (#329)
 // ===================================================================
 
-import "ml/monarch_mixer.hexa"
+// -- inlined from self/ml/monarch_mixer.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/monarch_mixer.hexa — Monarch Mixer (#329)
+//
+//  Monarch Mixer (Dao & Re, 2023): sub-quadratic sequence model
+//  using Monarch matrix factorization for both sequence mixing
+//  (token-to-token) and channel mixing (dimension-to-dimension).
+//
+//  Monarch matrix M = L * P * R where:
+//    L = block-diagonal matrix (sqrt(N) blocks of sqrt(N) x sqrt(N))
+//    P = fixed permutation (reshape + transpose)
+//    R = block-diagonal matrix (same structure)
+//  This gives O(N*sqrt(N)) complexity instead of O(N^2).
+//
+//  Components:
+//    1. Math helpers           — exp, sqrt, sigmoid, gelu
+//    2. Vector/Matrix utils    — zeros, dot, mat_vec, init
+//    3. Monarch factorization  — block-diagonal x permute x block-diagonal
+//    4. Sequence mixing        — Monarch matrix across token dimension
+//    5. Channel mixing         — Monarch matrix across feature dimension
+//    6. LayerNorm              — pre-norm stabilization
+//    7. FFN                    — feed-forward with GELU
+//    8. MonarchMixer block     — seq_mix + chan_mix + FFN + residuals
+//    9. Multi-layer stack      — configurable depth
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop kernels
+// ===================================================================
+
+// ===================================================================
+//  1. Math helpers
+// ===================================================================
+
+fn mm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn mm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mm_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn mm_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + mm_exp(0.0 - x))
+}
+
+fn mm_gelu(x) {
+    return x * mm_sigmoid(1.702 * x)
+}
+
+fn mm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn mm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// Integer square root (floor)
+fn mm_isqrt(n) {
+    if n <= 0 { return 0 }
+    let mut g = n / 2
+    if g < 1 { g = 1 }
+    for _i in 0..30 {
+        let next = (g + n / g) / 2
+        if next >= g { return g }
+        g = next
+    }
+    return g
+}
+
+// ===================================================================
+//  2. Vector / Matrix utilities
+// ===================================================================
+
+fn mm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mm_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn mm_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn mm_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn mm_vec_gelu(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [mm_gelu(v[i])] }
+    return out
+}
+
+fn mm_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn mm_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [mm_dot(mat[r], v)] }
+    return out
+}
+
+// Deterministic pseudo-random weight initialization
+fn mm_init_weight(rows, cols, seed) {
+    let scale = 1.0 / mm_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mm_init_vec(dim, seed) {
+    let scale = 1.0 / mm_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  3. Monarch Matrix Factorization
+//
+//  For a vector of length N where N = b*b (b = sqrt(N)):
+//    Step 1: Reshape vector into [b x b] matrix (row-major)
+//    Step 2: Apply block-diagonal L — each of b blocks is [b x b],
+//            applied to each row independently
+//    Step 3: Transpose the [b x b] matrix (= permutation P)
+//    Step 4: Apply block-diagonal R — same structure,
+//            applied to each row of the transposed matrix
+//    Step 5: Flatten back to vector of length N
+//
+//  Total cost: 2 * b * (b * b) = 2 * N * sqrt(N) = O(N * sqrt(N))
+// ===================================================================
+
+// Block-diagonal weight storage:
+//   blocks: array of b matrices, each [b x b]
+//   b = block_size = sqrt(N)
+
+struct MonarchFactors {
+    block_size: int,
+    n_blocks: int,
+    L_blocks: array,
+    R_blocks: array
+}
+
+fn mm_create_monarch_factors(block_size, seed) {
+    let b = block_size
+    let mut L = []
+    let mut R = []
+    for i in 0..b {
+        L = L + [mm_init_weight(b, b, seed + i * 100)]
+        R = R + [mm_init_weight(b, b, seed + 5000 + i * 100)]
+    }
+    return MonarchFactors {
+        block_size: b,
+        n_blocks: b,
+        L_blocks: L,
+        R_blocks: R
+    }
+}
+
+// Apply Monarch matrix to a vector of length N = b*b
+// vec: [N] input vector
+// Returns: [N] output vector
+@pure
+fn mm_monarch_forward(factors, vec) {
+    let b = factors.block_size
+    let n = b * b
+
+    // Step 1: Reshape to [b x b] (row-major)
+    let mut mat = []
+    for r in 0..b {
+        let mut row = []
+        for c in 0..b {
+            row = row + [vec[r * b + c]]
+        }
+        mat = mat + [row]
+    }
+
+    // Step 2: Apply L block-diagonal — each block L[r] acts on row r
+    let mut after_L = []
+    for r in 0..b {
+        after_L = after_L + [mm_mat_vec(factors.L_blocks[r], mat[r])]
+    }
+
+    // Step 3: Transpose (permutation P)
+    let mut transposed = []
+    for c in 0..b {
+        let mut col = []
+        for r in 0..b {
+            col = col + [after_L[r][c]]
+        }
+        transposed = transposed + [col]
+    }
+
+    // Step 4: Apply R block-diagonal — each block R[r] acts on row r
+    let mut after_R = []
+    for r in 0..b {
+        after_R = after_R + [mm_mat_vec(factors.R_blocks[r], transposed[r])]
+    }
+
+    // Step 5: Flatten back to vector
+    let mut out = []
+    for r in 0..b {
+        for c in 0..b {
+            out = out + [after_R[r][c]]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  4. Sequence Mixing — Monarch across token dimension
+//
+//  Given input [seq_len x dim], for each feature channel d:
+//    Extract column d across all tokens -> vector of length seq_len
+//    Apply Monarch factorization to this vector
+//    Write back to output column d
+//
+//  seq_len must be b*b for some integer b. Pad if needed.
+// ===================================================================
+
+struct SeqMixer {
+    seq_len: int,
+    dim: int,
+    block_size: int,
+    factors: MonarchFactors
+}
+
+fn mm_create_seq_mixer(seq_len, dim, seed) {
+    let b = mm_isqrt(seq_len)
+    return SeqMixer {
+        seq_len: seq_len,
+        dim: dim,
+        block_size: b,
+        factors: mm_create_monarch_factors(b, seed)
+    }
+}
+
+// Apply sequence mixing
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+@pure
+fn mm_seq_mix_forward(mixer, xs) {
+    let slen = mixer.seq_len
+    let d = mixer.dim
+
+    // For each feature channel, extract column, apply Monarch
+    // Collect mixed columns: mixed_cols[ch] = [slen] vector
+    let mut mixed_cols = []
+    for ch in 0..d {
+        let mut col = []
+        for t in 0..slen { col = col + [xs[t][ch]] }
+        let mixed = mm_monarch_forward(mixer.factors, col)
+        mixed_cols = mixed_cols + [mixed]
+    }
+
+    // Reassemble: for each token, gather from all channels
+    let mut out = []
+    for t in 0..slen {
+        let mut row = []
+        for ch in 0..d {
+            row = row + [mixed_cols[ch][t]]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ===================================================================
+//  5. Channel Mixing — Monarch across feature dimension
+//
+//  Given input [seq_len x dim], for each token t:
+//    Extract row t (the feature vector of length dim)
+//    Apply Monarch factorization to this vector
+//    Write back to output row t
+//
+//  dim must be b*b for some integer b.
+// ===================================================================
+
+struct ChanMixer {
+    seq_len: int,
+    dim: int,
+    block_size: int,
+    factors: MonarchFactors
+}
+
+fn mm_create_chan_mixer(seq_len, dim, seed) {
+    let b = mm_isqrt(dim)
+    return ChanMixer {
+        seq_len: seq_len,
+        dim: dim,
+        block_size: b,
+        factors: mm_create_monarch_factors(b, seed)
+    }
+}
+
+// Apply channel mixing
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+@pure
+fn mm_chan_mix_forward(mixer, xs) {
+    let slen = len(xs)
+    let mut out = []
+    for t in 0..slen {
+        let mixed = mm_monarch_forward(mixer.factors, xs[t])
+        out = out + [mixed]
+    }
+    return out
+}
+
+// ===================================================================
+//  6. LayerNorm
+// ===================================================================
+
+struct MmLayerNorm {
+    dim: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn mm_create_layer_norm(dim) {
+    return MmLayerNorm {
+        dim: dim,
+        gamma: mm_ones(dim),
+        beta: mm_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+@pure
+fn mm_layer_norm_forward(ln, x) {
+    let n = ln.dim
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / mm_sqrt(var + ln.eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [ln.gamma[i] * normed + ln.beta[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  7. FFN — Feed-Forward Network with GELU
+// ===================================================================
+
+struct MmFFN {
+    dim: int,
+    ff_dim: int,
+    W1: array,
+    b1: array,
+    W2: array,
+    b2: array
+}
+
+fn mm_create_ffn(dim, ff_dim, seed) {
+    return MmFFN {
+        dim: dim,
+        ff_dim: ff_dim,
+        W1: mm_init_weight(ff_dim, dim, seed + 1),
+        b1: mm_zeros(ff_dim),
+        W2: mm_init_weight(dim, ff_dim, seed + 2),
+        b2: mm_zeros(dim)
+    }
+}
+
+@pure
+fn mm_ffn_forward(ffn, x) {
+    let h = mm_vec_gelu(mm_vec_add(mm_mat_vec(ffn.W1, x), ffn.b1))
+    return mm_vec_add(mm_mat_vec(ffn.W2, h), ffn.b2)
+}
+
+// ===================================================================
+//  8. Monarch Mixer Block
+//
+//  Pre-norm architecture:
+//    x -> LN1 -> SeqMix (Monarch across tokens) -> + residual
+//      -> LN2 -> ChanMix (Monarch across features) -> + residual
+//      -> LN3 -> FFN -> + residual
+// ===================================================================
+
+struct MonarchMixerBlock {
+    dim: int,
+    seq_len: int,
+    ln1: MmLayerNorm,
+    ln2: MmLayerNorm,
+    ln3: MmLayerNorm,
+    seq_mixer: SeqMixer,
+    chan_mixer: ChanMixer,
+    ffn: MmFFN
+}
+
+fn mm_create_block(seq_len, dim, ff_dim, seed) {
+    return MonarchMixerBlock {
+        dim: dim,
+        seq_len: seq_len,
+        ln1: mm_create_layer_norm(dim),
+        ln2: mm_create_layer_norm(dim),
+        ln3: mm_create_layer_norm(dim),
+        seq_mixer: mm_create_seq_mixer(seq_len, dim, seed + 1000),
+        chan_mixer: mm_create_chan_mixer(seq_len, dim, seed + 2000),
+        ffn: mm_create_ffn(dim, ff_dim, seed + 3000)
+    }
+}
+
+// Block forward
+// xs: [seq_len x dim]
+// Returns: [seq_len x dim]
+fn mm_block_forward(blk, xs) {
+    let slen = blk.seq_len
+    let d = blk.dim
+
+    // Pre-norm + Sequence mixing + residual
+    let mut normed1 = []
+    for t in 0..slen {
+        normed1 = normed1 + [mm_layer_norm_forward(blk.ln1, xs[t])]
+    }
+    let seq_out = mm_seq_mix_forward(blk.seq_mixer, normed1)
+    let mut h1 = []
+    for t in 0..slen {
+        h1 = h1 + [mm_vec_add(xs[t], seq_out[t])]
+    }
+
+    // Pre-norm + Channel mixing + residual
+    let mut normed2 = []
+    for t in 0..slen {
+        normed2 = normed2 + [mm_layer_norm_forward(blk.ln2, h1[t])]
+    }
+    let chan_out = mm_chan_mix_forward(blk.chan_mixer, normed2)
+    let mut h2 = []
+    for t in 0..slen {
+        h2 = h2 + [mm_vec_add(h1[t], chan_out[t])]
+    }
+
+    // Pre-norm + FFN + residual
+    let mut output = []
+    for t in 0..slen {
+        let normed3 = mm_layer_norm_forward(blk.ln3, h2[t])
+        let ffn_out = mm_ffn_forward(blk.ffn, normed3)
+        output = output + [mm_vec_add(h2[t], ffn_out)]
+    }
+    return output
+}
+
+// ===================================================================
+//  9. Multi-layer Stack
+// ===================================================================
+
+struct MonarchMixerConfig {
+    n_layers: int,
+    seq_len: int,
+    d_model: int,
+    ff_dim: int
+}
+
+fn mm_create_config(n_layers, seq_len, d_model, ff_dim) {
+    return MonarchMixerConfig {
+        n_layers: n_layers,
+        seq_len: seq_len,
+        d_model: d_model,
+        ff_dim: ff_dim
+    }
+}
+
+struct MonarchMixerStack {
+    config: MonarchMixerConfig,
+    blocks: array,
+    ln_out: MmLayerNorm
+}
+
+fn mm_create_stack(cfg, seed) {
+    let mut blocks = []
+    for l in 0..cfg.n_layers {
+        blocks = blocks + [mm_create_block(cfg.seq_len, cfg.d_model, cfg.ff_dim, seed + l * 10000)]
+    }
+    return MonarchMixerStack {
+        config: cfg,
+        blocks: blocks,
+        ln_out: mm_create_layer_norm(cfg.d_model)
+    }
+}
+
+// Stack forward
+// xs: [seq_len x d_model]
+// Returns: [seq_len x d_model]
+fn mm_stack_forward(stack, xs) {
+    let mut h = xs
+    for l in 0..stack.config.n_layers {
+        h = mm_block_forward(stack.blocks[l], h)
+    }
+    let slen = len(h)
+    let mut output = []
+    for t in 0..slen {
+        output = output + [mm_layer_norm_forward(stack.ln_out, h[t])]
+    }
+    return output
+}
+
+// ===================================================================
+//  Embedding helpers for end-to-end testing
+// ===================================================================
+
+fn mm_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn mm_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [mm_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+// ===================================================================
+//  Parameter counting
+// ===================================================================
+
+fn mm_param_count(stack) {
+    let cfg = stack.config
+    let d = cfg.d_model
+    let ff = cfg.ff_dim
+    let nl = cfg.n_layers
+    let slen = cfg.seq_len
+    let sb = mm_isqrt(slen)
+    let db = mm_isqrt(d)
+    // Per block:
+    //   seq_mixer Monarch: 2 * sb * (sb * sb) = 2 * sb^3
+    //   chan_mixer Monarch: 2 * db * (db * db) = 2 * db^3
+    //   FFN: ff*d + ff + d*ff + d
+    //   3x LayerNorm: 3 * 2 * d
+    let seq_params = 2 * sb * sb * sb
+    let chan_params = 2 * db * db * db
+    let ffn_params = ff * d + ff + d * ff + d
+    let ln_params = 6 * d
+    let per_block = seq_params + chan_params + ffn_params + ln_params
+    let total = nl * per_block + 2 * d
+    return total
+}
+
+println("[monarch_mixer] loaded — Monarch factorization + seq/chan mixing + block + stack")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

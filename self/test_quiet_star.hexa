@@ -2,7 +2,634 @@
 //  test_quiet_star.hexa — Quiet-STaR (#292) Tests
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/quiet_star.hexa"
+// -- inlined from self/ml/quiet_star.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/quiet_star.hexa — Quiet-STaR (#292)
+//
+//  Quiet-STaR (Zelikman et al., 2024) — Self-Taught Reasoner that
+//  generates internal rationale tokens at every position in parallel,
+//  then uses a mixing head to decide how much to use the rationale
+//  vs direct prediction.
+//
+//  Architecture:
+//      h_direct    = tanh( W_enc · x + b_enc )          D_in → D_hidden
+//      rationale   = multi-step recurrence:
+//                      r_0 = h_direct
+//                      r_t = tanh( W_rat · r_{t-1} + b_rat )
+//                    for t = 1..n_rationale
+//      h_rationale = r_{n_rationale}
+//      alpha       = sigmoid( W_mix · [h_direct; h_rationale] + b_mix )
+//      h_final     = alpha * h_rationale + (1-alpha) * h_direct
+//      output      = softmax( W_out · h_final + b_out )
+//
+//  Key math:
+//      alpha = sigma( W_mix . [h_direct; h_rationale] )
+//      h_final = alpha . h_rationale + (1 - alpha) . h_direct
+//      Train with REINFORCE on correct predictions
+//
+//  API:
+//    qs_init(D_in, D_hidden, D_out, n_rationale, seed) -> model
+//    qs_generate_rationale(model, hidden) -> rationale tokens
+//    qs_mix_head(model, h_direct, h_rationale) -> alpha
+//    qs_forward(model, x) -> output (with internal reasoning)
+//    qs_forward_direct(model, x) -> output (no reasoning, baseline)
+//    qs_loss(model, x, y) -> float
+//    qs_train_step(model, X, Y, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward/loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+fn qs_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn qs_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn qs_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn qs_tanh(inp) {
+    let e_pos = qs_exp(inp)
+    let e_neg = qs_exp(0.0 - inp)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn qs_sigmoid(inp) {
+    return 1.0 / (1.0 + qs_exp(0.0 - inp))
+}
+
+fn qs_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn qs_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn qs_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn qs_uniform(state) {
+    let s = qs_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax over logit vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = qs_zeros_f(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = qs_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise Quiet-STaR model
+//    W_enc  : D_hidden x D_in       (encoder)
+//    b_enc  : D_hidden
+//    W_rat  : D_hidden x D_hidden   (rationale recurrence)
+//    b_rat  : D_hidden
+//    W_mix  : D_hidden               (mix head over 2*D_hidden concat)
+//    b_mix  : scalar
+//    W_out  : D_out x D_hidden       (output head)
+//    b_out  : D_out
+// ═══════════════════════════════════════════════════════════════════
+fn qs_init(D_in, D_hidden, D_out, n_rationale, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // W_enc: D_hidden x D_in
+    let mut W_enc = qs_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = qs_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_enc[i][j] = u[0] - 0.5
+        }
+    }
+    let b_enc = qs_zeros_f(D_hidden)
+
+    // W_rat: D_hidden x D_hidden (rationale recurrence)
+    let mut W_rat = qs_zeros_2d(D_hidden, D_hidden)
+    for i in 0..D_hidden {
+        for j in 0..D_hidden {
+            let u = qs_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_rat[i][j] = u[0] - 0.5
+        }
+    }
+    let b_rat = qs_zeros_f(D_hidden)
+
+    // W_mix: 2*D_hidden (mixing head weights over [h_direct; h_rationale])
+    let mix_dim = 2 * D_hidden
+    let mut W_mix = qs_zeros_f(mix_dim)
+    for j in 0..mix_dim {
+        let u = qs_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_mix[j] = u[0] - 0.5
+    }
+
+    // W_out: D_out x D_hidden
+    let mut W_out = qs_zeros_2d(D_out, D_hidden)
+    for k in 0..D_out {
+        for j in 0..D_hidden {
+            let u = qs_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_out[k][j] = u[0] - 0.5
+        }
+    }
+    let b_out = qs_zeros_f(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_rationale": n_rationale,
+        "W_enc": W_enc,
+        "b_enc": b_enc,
+        "W_rat": W_rat,
+        "b_rat": b_rat,
+        "W_mix": W_mix,
+        "b_mix": 0.0,
+        "W_out": W_out,
+        "b_out": b_out
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Encoder: x -> h_direct = tanh(W_enc * x + b_enc)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_encode(model, x) {
+    let W_enc = model["W_enc"]
+    let b_enc = model["b_enc"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut h = qs_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_enc[i]
+        for j in 0..D_in { s = s + W_enc[i][j] * x[j] }
+        h[i] = qs_tanh(s)
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Generate rationale: n_rationale steps of recurrence
+//    r_0 = h_direct
+//    r_t = tanh( W_rat * r_{t-1} + b_rat )
+//  Returns list of all rationale states [[float]] (length n_rationale+1)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_generate_rationale(model, hidden) {
+    let W_rat = model["W_rat"]
+    let b_rat = model["b_rat"]
+    let D_hidden = model["D_hidden"]
+    let n_rat = model["n_rationale"]
+    let mut states = [hidden]
+    let mut r = hidden
+    for _t in 0..n_rat {
+        let mut r_next = qs_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b_rat[i]
+            for j in 0..D_hidden { s = s + W_rat[i][j] * r[j] }
+            r_next[i] = qs_tanh(s)
+        }
+        states = states + [r_next]
+        r = r_next
+    }
+    return states
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mix head: alpha = sigmoid( W_mix . [h_direct; h_rationale] + b_mix )
+//  Returns per-dimension alpha vector [float] of length D_hidden
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_mix_head(model, h_direct, h_rationale) {
+    let W_mix = model["W_mix"]
+    let b_mix = model["b_mix"]
+    let D_hidden = model["D_hidden"]
+    // concat [h_direct; h_rationale] -> 2*D_hidden
+    let mut concat = qs_zeros_f(2 * D_hidden)
+    for j in 0..D_hidden { concat[j] = h_direct[j] }
+    for j in 0..D_hidden { concat[D_hidden + j] = h_rationale[j] }
+    // scalar alpha = sigmoid( sum(W_mix * concat) + b_mix )
+    let mut s = b_mix
+    for j in 0..(2 * D_hidden) { s = s + W_mix[j] * concat[j] }
+    let alpha = qs_sigmoid(s)
+    return alpha
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward (with reasoning): full Quiet-STaR pipeline
+//    1. encode -> h_direct
+//    2. rationale recurrence -> h_rationale (final state)
+//    3. mix head -> alpha
+//    4. h_final = alpha * h_rationale + (1-alpha) * h_direct
+//    5. output = softmax( W_out * h_final + b_out )
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_forward(model, x) {
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+
+    let h_direct = qs_encode(model, x)
+    let rat_states = qs_generate_rationale(model, h_direct)
+    let n_rat = model["n_rationale"]
+    let h_rationale = rat_states[n_rat]
+    let alpha = qs_mix_head(model, h_direct, h_rationale)
+
+    // h_final = alpha * h_rationale + (1-alpha) * h_direct
+    let mut h_final = qs_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        h_final[j] = alpha * h_rationale[j] + (1.0 - alpha) * h_direct[j]
+    }
+
+    // output logits + softmax
+    let mut logits = qs_zeros_f(D_out)
+    for k in 0..D_out {
+        let mut s = b_out[k]
+        for j in 0..D_hidden { s = s + W_out[k][j] * h_final[j] }
+        logits[k] = s
+    }
+    return qs_softmax(logits)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward direct (no reasoning): baseline without rationale
+//    1. encode -> h_direct
+//    2. output = softmax( W_out * h_direct + b_out )
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_forward_direct(model, x) {
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+
+    let h_direct = qs_encode(model, x)
+
+    let mut logits = qs_zeros_f(D_out)
+    for k in 0..D_out {
+        let mut s = b_out[k]
+        for j in 0..D_hidden { s = s + W_out[k][j] * h_direct[j] }
+        logits[k] = s
+    }
+    return qs_softmax(logits)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Loss: cross-entropy on forward output
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_loss(model, x, y) {
+    let prob = qs_forward(model, x)
+    let mut py = prob[y]
+    if py < 1.0e-12 { py = 1.0e-12 }
+    return 0.0 - qs_log(py)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Predict: argmax of forward output
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_predict(model, x) {
+    let prob = qs_forward(model, x)
+    let K = len(prob)
+    let mut best = prob[0]
+    let mut idx = 0
+    for k in 1..K {
+        if prob[k] > best {
+            best = prob[k]
+            idx = k
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Accuracy helper
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn qs_accuracy(model, X, Y) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..N {
+        if qs_predict(model, X[i]) == Y[i] { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(N)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step — REINFORCE-style gradient on correct predictions
+//
+//  For each sample (x, y):
+//    1. Full forward pass to get all intermediates
+//    2. Compute cross-entropy loss gradient through output softmax
+//    3. Backprop through mix head, rationale, and encoder
+//    4. REINFORCE: reward = 1 if correct, 0 otherwise
+//       Scale rationale/mix gradients by reward signal
+//
+//  Gradient flow:
+//    output layer:  u_out = p - onehot(y)           (D_out)
+//    h_final grad:  g_hf = W_out^T * u_out          (D_hidden)
+//
+//    Mix head grad (scalar alpha):
+//      d_alpha = sum_j g_hf[j] * (h_rat[j] - h_dir[j])
+//      d_alpha_pre = d_alpha * alpha * (1 - alpha)  (sigmoid derivative)
+//      dW_mix[j] = d_alpha_pre * concat[j]
+//      db_mix    = d_alpha_pre
+//
+//    h_rationale grad:
+//      g_hrat[j] = g_hf[j] * alpha
+//    h_direct grad:
+//      g_hdir[j] = g_hf[j] * (1 - alpha)
+//
+//    Rationale recurrence backprop (BPTT through n_rationale steps):
+//      delta_r[n] = g_hrat * (1 - r_n^2)   (tanh derivative)
+//      delta_r[t-1] = (W_rat^T * delta_r[t]) * (1 - r_{t-1}^2)
+//      dW_rat += delta_r[t] * r_{t-1}^T
+//      db_rat += delta_r[t]
+//
+//    Encoder backprop:
+//      g_enc = g_hdir + accumulated rationale gradient at r_0
+//      delta_enc = g_enc * (1 - h_direct^2)
+//      dW_enc += delta_enc * x^T
+//      db_enc += delta_enc
+//
+//    REINFORCE: multiply rationale/mix gradients by reward
+// ═══════════════════════════════════════════════════════════════════
+// @hot omitted: dict-mutation aliasing bug (feedback_hot_attr_dict_mutation)
+fn qs_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let n_rat = model["n_rationale"]
+    let W_enc = model["W_enc"]
+    let b_enc = model["b_enc"]
+    let W_rat = model["W_rat"]
+    let b_rat = model["b_rat"]
+    let W_mix = model["W_mix"]
+    let b_mix = model["b_mix"]
+    let W_out = model["W_out"]
+    let b_out = model["b_out"]
+    let mix_dim = 2 * D_hidden
+
+    // Accumulate gradients
+    let mut gW_enc = qs_zeros_2d(D_hidden, D_in)
+    let mut gb_enc = qs_zeros_f(D_hidden)
+    let mut gW_rat = qs_zeros_2d(D_hidden, D_hidden)
+    let mut gb_rat = qs_zeros_f(D_hidden)
+    let mut gW_mix = qs_zeros_f(mix_dim)
+    let mut gb_mix = 0.0
+    let mut gW_out = qs_zeros_2d(D_out, D_hidden)
+    let mut gb_out = qs_zeros_f(D_out)
+
+    for idx in 0..N {
+        let x = X[idx]
+        let y = Y[idx]
+
+        // ── Forward pass (keep intermediates) ────────────────
+        let h_direct = qs_encode(model, x)
+        let rat_states = qs_generate_rationale(model, h_direct)
+        let h_rationale = rat_states[n_rat]
+        let alpha = qs_mix_head(model, h_direct, h_rationale)
+
+        let mut h_final = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            h_final[j] = alpha * h_rationale[j] + (1.0 - alpha) * h_direct[j]
+        }
+
+        let mut logits = qs_zeros_f(D_out)
+        for k in 0..D_out {
+            let mut s = b_out[k]
+            for j in 0..D_hidden { s = s + W_out[k][j] * h_final[j] }
+            logits[k] = s
+        }
+        let prob = qs_softmax(logits)
+
+        // Note: REINFORCE reward signal is implicit via the mixing head --
+        // the gradient through alpha naturally scales rationale contribution
+        // proportional to how much the rationale helps prediction.
+
+        // ── Output layer gradient ────────────────────────────
+        let mut u_out = qs_zeros_f(D_out)
+        for k in 0..D_out {
+            u_out[k] = prob[k]
+            if k == y { u_out[k] = u_out[k] - 1.0 }
+        }
+
+        // grad W_out, b_out (always update)
+        for k in 0..D_out {
+            gb_out[k] = gb_out[k] + u_out[k]
+            for j in 0..D_hidden {
+                gW_out[k][j] = gW_out[k][j] + u_out[k] * h_final[j]
+            }
+        }
+
+        // grad h_final
+        let mut g_hf = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for k in 0..D_out { s = s + u_out[k] * W_out[k][j] }
+            g_hf[j] = s
+        }
+
+        // ── Mix head gradient (scaled by reward for REINFORCE) ──
+        let mut d_alpha = 0.0
+        for j in 0..D_hidden {
+            d_alpha = d_alpha + g_hf[j] * (h_rationale[j] - h_direct[j])
+        }
+        let d_alpha_pre = d_alpha * alpha * (1.0 - alpha)
+
+        // Build concat for mix gradient
+        let mut concat = qs_zeros_f(mix_dim)
+        for j in 0..D_hidden { concat[j] = h_direct[j] }
+        for j in 0..D_hidden { concat[D_hidden + j] = h_rationale[j] }
+
+        for j in 0..mix_dim {
+            gW_mix[j] = gW_mix[j] + d_alpha_pre * concat[j]
+        }
+        gb_mix = gb_mix + d_alpha_pre
+
+        // ── h_rationale gradient + h_direct gradient ─────────
+        let mut g_hrat = qs_zeros_f(D_hidden)
+        let mut g_hdir = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            g_hrat[j] = g_hf[j] * alpha
+            g_hdir[j] = g_hf[j] * (1.0 - alpha)
+        }
+
+        // ── Rationale BPTT ───────────────────────────────────
+        // delta at final rationale state
+        let mut delta_r = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let r_val = h_rationale[j]
+            delta_r[j] = g_hrat[j] * (1.0 - r_val * r_val)
+        }
+
+        // Backprop through rationale steps (n_rat -> 1)
+        let mut t = n_rat
+        while t >= 1 {
+            let r_prev = rat_states[t - 1]
+            // accumulate W_rat, b_rat gradients
+            for i in 0..D_hidden {
+                gb_rat[i] = gb_rat[i] + delta_r[i]
+                for j in 0..D_hidden {
+                    gW_rat[i][j] = gW_rat[i][j] + delta_r[i] * r_prev[j]
+                }
+            }
+            // propagate delta to previous step
+            if t > 1 {
+                let mut delta_prev = qs_zeros_f(D_hidden)
+                for j in 0..D_hidden {
+                    let mut s = 0.0
+                    for i in 0..D_hidden { s = s + delta_r[i] * W_rat[i][j] }
+                    delta_prev[j] = s * (1.0 - r_prev[j] * r_prev[j])
+                }
+                delta_r = delta_prev
+            }
+            t = t - 1
+        }
+
+        // Gradient flowing from rationale step 1 back to h_direct (r_0)
+        let mut g_rat_to_enc = qs_zeros_f(D_hidden)
+        if n_rat >= 1 {
+            for j in 0..D_hidden {
+                let mut s = 0.0
+                for i in 0..D_hidden { s = s + delta_r[i] * W_rat[i][j] }
+                g_rat_to_enc[j] = s
+            }
+        }
+
+        // ── Encoder backprop ─────────────────────────────────
+        let mut g_enc = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            g_enc[j] = g_hdir[j] + g_rat_to_enc[j]
+        }
+        let mut delta_enc = qs_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            delta_enc[j] = g_enc[j] * (1.0 - h_direct[j] * h_direct[j])
+        }
+        for j in 0..D_hidden {
+            gb_enc[j] = gb_enc[j] + delta_enc[j]
+            for ii in 0..D_in {
+                gW_enc[j][ii] = gW_enc[j][ii] + delta_enc[j] * x[ii]
+            }
+        }
+    }
+
+    // ── Apply gradients (averaged over batch) ────────────────
+    let inv_N = 1.0 / to_float(N)
+
+    let mut W_enc_new = qs_zeros_2d(D_hidden, D_in)
+    let mut b_enc_new = qs_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        b_enc_new[i] = b_enc[i] - lr * gb_enc[i] * inv_N
+        for j in 0..D_in {
+            W_enc_new[i][j] = W_enc[i][j] - lr * gW_enc[i][j] * inv_N
+        }
+    }
+
+    let mut W_rat_new = qs_zeros_2d(D_hidden, D_hidden)
+    let mut b_rat_new = qs_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        b_rat_new[i] = b_rat[i] - lr * gb_rat[i] * inv_N
+        for j in 0..D_hidden {
+            W_rat_new[i][j] = W_rat[i][j] - lr * gW_rat[i][j] * inv_N
+        }
+    }
+
+    let mut W_mix_new = qs_zeros_f(mix_dim)
+    for j in 0..mix_dim {
+        W_mix_new[j] = W_mix[j] - lr * gW_mix[j] * inv_N
+    }
+    let b_mix_new = b_mix - lr * gb_mix * inv_N
+
+    let mut W_out_new = qs_zeros_2d(D_out, D_hidden)
+    let mut b_out_new = qs_zeros_f(D_out)
+    for k in 0..D_out {
+        b_out_new[k] = b_out[k] - lr * gb_out[k] * inv_N
+        for j in 0..D_hidden {
+            W_out_new[k][j] = W_out[k][j] - lr * gW_out[k][j] * inv_N
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "n_rationale": n_rat,
+        "W_enc": W_enc_new,
+        "b_enc": b_enc_new,
+        "W_rat": W_rat_new,
+        "b_rat": b_rat_new,
+        "W_mix": W_mix_new,
+        "b_mix": b_mix_new,
+        "W_out": W_out_new,
+        "b_out": b_out_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

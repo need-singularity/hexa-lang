@@ -33,7 +33,672 @@
 //  Run: ./hexa self/test_mla_attention.hexa
 // ===================================================================
 
-use "ml/mla_attention"
+// -- inlined from self/ml/mla_attention.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/mla_attention.hexa — Multi-head Latent Attention (DeepSeek MLA)
+//
+//  DeepSeek-V2 style MLA: compress K,V into a low-rank latent vector
+//  c_kv instead of caching full K,V per head. Memory savings proportional
+//  to (d_c / (n_heads * head_dim)).
+//
+//  Architecture:
+//    Input x [d_model]
+//      -> Q projection:  W_dq [d_model, n_heads * head_dim]
+//      -> KV down-proj:  W_dkv [d_model, d_c]  =>  c_kv [d_c]  (latent)
+//      -> K up-proj:     W_uk  [d_c, n_heads * head_dim]  =>  K [n_heads * head_dim]
+//      -> V up-proj:     W_uv  [d_c, n_heads * head_dim]  =>  V [n_heads * head_dim]
+//      -> RoPE applied to a small separate head (d_rope dims) for position info
+//      -> Standard multi-head attention with reconstructed K,V
+//      -> Output projection W_o [n_heads * head_dim, d_model]
+//
+//  Latent cache stores c_kv [d_c] per position instead of full K,V
+//  [n_heads * head_dim * 2], giving memory ratio = d_c / (n_heads * head_dim * 2).
+//
+//  Reference: DeepSeek-V2 (2024), "DeepSeek-V2: A Strong, Economical,
+//             and Efficient Mixture-of-Experts Language Model"
+//
+//  AI-NATIVE attrs:
+//    @hot      — called every forward step
+//    @pure     — no side effects in math helpers
+//    @parallel — head loop independent
+// ===================================================================
+
+// ── MLA config struct ────────────────────────────────────────
+struct MLAConfig {
+    d_model: int,
+    n_heads: int,
+    head_dim: int,
+    d_c: int,
+    d_rope: int,
+    rope_base: float
+}
+
+// ── MLA weight struct ────────────────────────────────────────
+struct MLAWeights {
+    w_dq: array,
+    w_dkv: array,
+    w_uk: array,
+    w_uv: array,
+    w_rope_q: array,
+    w_rope_k: array,
+    w_o: array
+}
+
+// ── Latent cache: stores compressed c_kv per position ────────
+struct MLALatentCache {
+    data: array,
+    seq_len: int,
+    max_len: int,
+    d_c: int,
+    rope_data: array,
+    d_rope: int
+}
+
+// ===================================================================
+//  Helpers (prefixed mla_ to avoid collision)
+// ===================================================================
+
+fn mla_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn mla_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mla_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn mla_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+// Deterministic PRNG (LCG) for weight init
+let mut _mla_rng_state = 123456
+
+fn mla_rand_f() {
+    _mla_rng_state = (_mla_rng_state * 1664525 + 1013904223) % 2147483648
+    return to_float(_mla_rng_state) / 2147483648.0 - 0.5
+}
+
+fn mla_rand_seed(s) {
+    _mla_rng_state = s
+}
+
+// ===================================================================
+//  Matrix-vector multiply: W [rows, cols] * vec [cols] -> y [rows]
+//  W stored as array of rows: W[i] = row i of length cols
+// ===================================================================
+@hot
+fn mla_matvec(W, vec, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let mut dot = 0.0
+        let mut j = 0
+        while j < cols {
+            dot = dot + W[i][j] * vec[j]
+            j = j + 1
+        }
+        out = out + [dot]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Outer product: a [m] * b [n] -> M [m, n]
+// ===================================================================
+fn mla_outer(a, b) {
+    let m = len(a)
+    let n = len(b)
+    let mut M = []
+    let mut i = 0
+    while i < m {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            row = row + [a[i] * b[j]]
+            j = j + 1
+        }
+        M = M + [row]
+        i = i + 1
+    }
+    return M
+}
+
+// ===================================================================
+//  Vector dot product
+// ===================================================================
+@pure
+fn mla_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ===================================================================
+//  Softmax over 1D array
+// ===================================================================
+@pure
+fn mla_softmax(scores, n) {
+    let mut mx = scores[0]
+    let mut i = 1
+    while i < n {
+        if scores[i] > mx {
+            mx = scores[i]
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(scores[i] - mx)
+        out = out + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    let inv = 1.0 / sum_e
+    let mut result = []
+    i = 0
+    while i < n {
+        result = result + [out[i] * inv]
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  RoPE: Rotary Position Embedding on a small d_rope-dim vector
+//  vec: array [d_rope], returns array [d_rope]
+// ===================================================================
+@hot
+fn mla_apply_rope(vec, pos, d_rope, base) {
+    let half = d_rope / 2
+    let mut out = []
+    let mut p = 0
+    while p < half {
+        let freq = 1.0 / pow(base, 2.0 * to_float(p) / to_float(d_rope))
+        let angle = to_float(pos) * freq
+        let cos_a = cos(angle)
+        let sin_a = sin(angle)
+        let x0 = vec[2 * p]
+        let x1 = vec[2 * p + 1]
+        out = out + [x0 * cos_a - x1 * sin_a]
+        out = out + [x0 * sin_a + x1 * cos_a]
+        p = p + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Random weight matrix init (Kaiming-like scale)
+// ===================================================================
+fn mla_rand_matrix(rows, cols) {
+    let scale = sqrt(2.0 / to_float(cols))
+    let mut M = []
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            row = row + [mla_rand_f() * scale]
+            j = j + 1
+        }
+        M = M + [row]
+        i = i + 1
+    }
+    return M
+}
+
+// ===================================================================
+//  Create default MLA config
+// ===================================================================
+fn mla_config_new(d_model, n_heads, head_dim, d_c, d_rope) {
+    return MLAConfig {
+        d_model: d_model,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        d_c: d_c,
+        d_rope: d_rope,
+        rope_base: 10000.0
+    }
+}
+
+// ===================================================================
+//  Initialize random MLA weights
+// ===================================================================
+fn mla_weights_init(cfg: MLAConfig) {
+    let total_head = cfg.n_heads * cfg.head_dim
+    return MLAWeights {
+        w_dq: mla_rand_matrix(total_head, cfg.d_model),
+        w_dkv: mla_rand_matrix(cfg.d_c, cfg.d_model),
+        w_uk: mla_rand_matrix(total_head, cfg.d_c),
+        w_uv: mla_rand_matrix(total_head, cfg.d_c),
+        w_rope_q: mla_rand_matrix(cfg.d_rope, cfg.d_model),
+        w_rope_k: mla_rand_matrix(cfg.d_rope, cfg.d_c),
+        w_o: mla_rand_matrix(cfg.d_model, total_head)
+    }
+}
+
+// ===================================================================
+//  Latent cache constructor
+// ===================================================================
+fn mla_cache_new(max_len, d_c, d_rope) {
+    let data = mla_zeros_2d(max_len, d_c)
+    let rope_data = mla_zeros_2d(max_len, d_rope)
+    return MLALatentCache {
+        data: data,
+        seq_len: 0,
+        max_len: max_len,
+        d_c: d_c,
+        rope_data: rope_data,
+        d_rope: d_rope
+    }
+}
+
+// ===================================================================
+//  Latent cache append: store c_kv and rope_k at position pos
+//  Note: complex index assignment (a[i][j]=v) not supported in hexa,
+//  so we rebuild the rows at position pos via fresh array copy.
+// ===================================================================
+fn mla_cache_append(cache: MLALatentCache, pos, c_kv, rope_k) {
+    let d_c = cache.d_c
+    let d_rope = cache.d_rope
+    let max_len = cache.max_len
+
+    // Rebuild data: copy all rows, replace row at pos with c_kv
+    let mut new_data = []
+    let mut i = 0
+    while i < max_len {
+        if i == pos {
+            // Copy c_kv into a fresh row
+            let mut row = []
+            let mut j = 0
+            while j < d_c {
+                row = row + [c_kv[j]]
+                j = j + 1
+            }
+            new_data = new_data + [row]
+        } else {
+            new_data = new_data + [cache.data[i]]
+        }
+        i = i + 1
+    }
+
+    // Rebuild rope_data: copy all rows, replace row at pos with rope_k
+    let mut new_rope = []
+    i = 0
+    while i < max_len {
+        if i == pos {
+            let mut row = []
+            let mut j = 0
+            while j < d_rope {
+                row = row + [rope_k[j]]
+                j = j + 1
+            }
+            new_rope = new_rope + [row]
+        } else {
+            new_rope = new_rope + [cache.rope_data[i]]
+        }
+        i = i + 1
+    }
+
+    let mut new_seq = cache.seq_len
+    if pos + 1 > new_seq {
+        new_seq = pos + 1
+    }
+    return MLALatentCache {
+        data: new_data,
+        seq_len: new_seq,
+        max_len: max_len,
+        d_c: d_c,
+        rope_data: new_rope,
+        d_rope: d_rope
+    }
+}
+
+// ===================================================================
+//  KV down-projection: inp [d_model] -> c_kv [d_c]
+// ===================================================================
+@hot
+fn mla_kv_down_proj(weights: MLAWeights, inp, cfg: MLAConfig) {
+    return mla_matvec(weights.w_dkv, inp, cfg.d_c, cfg.d_model)
+}
+
+// ===================================================================
+//  KV up-projection: reconstruct K,V from c_kv [d_c]
+//  Returns [K_flat, V_flat] each [n_heads * head_dim]
+// ===================================================================
+@hot
+fn mla_kv_up_proj(weights: MLAWeights, c_kv, cfg: MLAConfig) {
+    let total_head = cfg.n_heads * cfg.head_dim
+    let K = mla_matvec(weights.w_uk, c_kv, total_head, cfg.d_c)
+    let V = mla_matvec(weights.w_uv, c_kv, total_head, cfg.d_c)
+    return [K, V]
+}
+
+// ===================================================================
+//  Q projection: inp [d_model] -> Q [n_heads * head_dim]
+// ===================================================================
+@hot
+fn mla_q_proj(weights: MLAWeights, inp, cfg: MLAConfig) {
+    let total_head = cfg.n_heads * cfg.head_dim
+    return mla_matvec(weights.w_dq, inp, total_head, cfg.d_model)
+}
+
+// ===================================================================
+//  RoPE projection for Q and K (small d_rope heads)
+//  Q rope: inp [d_model] -> q_rope [d_rope]
+//  K rope: c_kv [d_c]  -> k_rope [d_rope]
+// ===================================================================
+fn mla_rope_q_proj(weights: MLAWeights, inp, cfg: MLAConfig) {
+    return mla_matvec(weights.w_rope_q, inp, cfg.d_rope, cfg.d_model)
+}
+
+fn mla_rope_k_proj(weights: MLAWeights, c_kv, cfg: MLAConfig) {
+    return mla_matvec(weights.w_rope_k, c_kv, cfg.d_rope, cfg.d_c)
+}
+
+// ===================================================================
+//  Output projection: attn_out [n_heads * head_dim] -> out [d_model]
+// ===================================================================
+@hot
+fn mla_output_proj(weights: MLAWeights, attn_out, cfg: MLAConfig) {
+    let total_head = cfg.n_heads * cfg.head_dim
+    return mla_matvec(weights.w_o, attn_out, cfg.d_model, total_head)
+}
+
+// ===================================================================
+//  Memory ratio: latent cache vs full KV cache
+//  Full KV: 2 * n_heads * head_dim per position (K + V)
+//  Latent:  d_c + d_rope per position
+// ===================================================================
+@pure
+fn mla_memory_ratio(cfg: MLAConfig) {
+    let full_kv = 2.0 * to_float(cfg.n_heads * cfg.head_dim)
+    let latent = to_float(cfg.d_c + cfg.d_rope)
+    return latent / full_kv
+}
+
+// ===================================================================
+//  Full MLA forward pass for a single token at position pos
+//
+//  x:      input [d_model]
+//  pos:    sequence position (for RoPE)
+//  cache:  MLALatentCache (stores compressed c_kv per past position)
+//  weights, cfg: model params
+//
+//  Returns: [output [d_model], updated_cache]
+// ===================================================================
+@hot @parallel
+fn mla_forward(inp, pos, cache: MLALatentCache, weights: MLAWeights, cfg: MLAConfig) {
+    let n_heads = cfg.n_heads
+    let head_dim = cfg.head_dim
+    let d_c = cfg.d_c
+    let d_rope = cfg.d_rope
+    let total_head = n_heads * head_dim
+    let scale = 1.0 / sqrt(to_float(head_dim + d_rope))
+
+    // -- Q projection --
+    let q_flat = mla_q_proj(weights, inp, cfg)
+
+    // -- Q RoPE head --
+    let q_rope_raw = mla_rope_q_proj(weights, inp, cfg)
+    let q_rope = mla_apply_rope(q_rope_raw, pos, d_rope, cfg.rope_base)
+
+    // -- KV down-projection (compress) --
+    let c_kv = mla_kv_down_proj(weights, inp, cfg)
+
+    // -- K RoPE head from latent --
+    let k_rope_raw = mla_rope_k_proj(weights, c_kv, cfg)
+    let k_rope = mla_apply_rope(k_rope_raw, pos, d_rope, cfg.rope_base)
+
+    // -- Store latent + rope_k in cache --
+    let mut updated_cache = mla_cache_append(cache, pos, c_kv, k_rope)
+
+    // -- Up-project K,V for current token --
+    let kv_cur = mla_kv_up_proj(weights, c_kv, cfg)
+
+    // -- Attention over all cached positions (0..pos+1) --
+    let ctx_len = pos + 1
+
+    let mut attn_out = mla_zeros_1d(total_head)
+
+    let mut h = 0
+    while h < n_heads {
+        let q_base = h * head_dim
+
+        // Compute scores for this head
+        let mut scores = []
+        let mut t = 0
+        while t < ctx_len {
+            // Reconstruct K from cached latent for position t
+            let cached_ckv = updated_cache.data[t]
+            let kv_t = mla_kv_up_proj(weights, cached_ckv, cfg)
+            let k_t = kv_t[0]
+
+            // Content-based score: q_flat[h] . K_t[h]
+            let mut dot_content = 0.0
+            let mut d = 0
+            while d < head_dim {
+                dot_content = dot_content + q_flat[q_base + d] * k_t[q_base + d]
+                d = d + 1
+            }
+
+            // RoPE-based score: q_rope . k_rope_t
+            let k_rope_t = updated_cache.rope_data[t]
+            let mut dot_rope = 0.0
+            d = 0
+            while d < d_rope {
+                dot_rope = dot_rope + q_rope[d] * k_rope_t[d]
+                d = d + 1
+            }
+
+            scores = scores + [(dot_content + dot_rope) * scale]
+            t = t + 1
+        }
+
+        // Softmax
+        let attn_weights = mla_softmax(scores, ctx_len)
+
+        // Weighted sum of values
+        let mut d = 0
+        while d < head_dim {
+            let mut acc = 0.0
+            t = 0
+            while t < ctx_len {
+                // Reconstruct V from cached latent for position t
+                let cached_ckv_v = updated_cache.data[t]
+                let kv_v_t = mla_kv_up_proj(weights, cached_ckv_v, cfg)
+                let v_t = kv_v_t[1]
+                acc = acc + attn_weights[t] * v_t[q_base + d]
+                t = t + 1
+            }
+            attn_out[h * head_dim + d] = acc
+            d = d + 1
+        }
+        h = h + 1
+    }
+
+    // -- Output projection --
+    let out = mla_output_proj(weights, attn_out, cfg)
+
+    return [out, updated_cache]
+}
+
+// ===================================================================
+//  MLA forward pass for prefill (multiple tokens at once)
+//
+//  xs:    array of input vectors, each [d_model], length seq_len
+//  cache: MLALatentCache
+//  Returns: [outputs array, updated_cache]
+// ===================================================================
+@hot
+fn mla_forward_prefill(xs, cache: MLALatentCache, weights: MLAWeights, cfg: MLAConfig) {
+    let seq_len = len(xs)
+    let mut cur_cache = cache
+    let mut outputs = []
+    let mut t = 0
+    while t < seq_len {
+        let result = mla_forward(xs[t], t, cur_cache, weights, cfg)
+        outputs = outputs + [result[0]]
+        cur_cache = result[1]
+        t = t + 1
+    }
+    return [outputs, cur_cache]
+}
+
+// ===================================================================
+//  Numerical gradient for a single weight element
+//  Perturbs weight matrix W at [i][j], re-runs forward, returns dL/dw
+//  loss_fn(output) -> scalar
+// ===================================================================
+// Helper: perturb row wi at col wj by delta, return new row
+fn _mla_perturb_row(W, wi, wj, delta) {
+    let row = W[wi]
+    let ncols = len(row)
+    let mut new_row = []
+    let mut j = 0
+    while j < ncols {
+        if j == wj {
+            new_row = new_row + [row[j] + delta]
+        } else {
+            new_row = new_row + [row[j]]
+        }
+        j = j + 1
+    }
+    return new_row
+}
+
+// Helper: replace row wi in W, return new matrix
+fn _mla_replace_row(W, wi, new_row) {
+    let nrows = len(W)
+    let mut M = []
+    let mut i = 0
+    while i < nrows {
+        if i == wi {
+            M = M + [new_row]
+        } else {
+            M = M + [W[i]]
+        }
+        i = i + 1
+    }
+    return M
+}
+
+// Helper: get the weight matrix by name from weights struct
+fn _mla_get_mat(weights: MLAWeights, which) {
+    if which == "w_dq" { return weights.w_dq }
+    if which == "w_dkv" { return weights.w_dkv }
+    if which == "w_uk" { return weights.w_uk }
+    if which == "w_uv" { return weights.w_uv }
+    if which == "w_o" { return weights.w_o }
+    if which == "w_rope_q" { return weights.w_rope_q }
+    return weights.w_rope_k
+}
+
+// Helper: build MLAWeights with one matrix replaced
+fn _mla_with_mat(weights: MLAWeights, which, new_mat) {
+    let dq = if which == "w_dq" { new_mat } else { weights.w_dq }
+    let dkv = if which == "w_dkv" { new_mat } else { weights.w_dkv }
+    let uk = if which == "w_uk" { new_mat } else { weights.w_uk }
+    let uv = if which == "w_uv" { new_mat } else { weights.w_uv }
+    let wo = if which == "w_o" { new_mat } else { weights.w_o }
+    let rq = if which == "w_rope_q" { new_mat } else { weights.w_rope_q }
+    let rk = if which == "w_rope_k" { new_mat } else { weights.w_rope_k }
+    return MLAWeights {
+        w_dq: dq,
+        w_dkv: dkv,
+        w_uk: uk,
+        w_uv: uv,
+        w_rope_q: rq,
+        w_rope_k: rk,
+        w_o: wo
+    }
+}
+
+fn mla_numerical_grad(inp, pos, cache: MLALatentCache, weights: MLAWeights, cfg: MLAConfig, which, wi, wj, loss_fn, eps_g) {
+    let orig_mat = _mla_get_mat(weights, which)
+
+    let row_plus = _mla_perturb_row(orig_mat, wi, wj, eps_g)
+    let mat_plus = _mla_replace_row(orig_mat, wi, row_plus)
+    let w_plus = _mla_with_mat(weights, which, mat_plus)
+
+    let row_minus = _mla_perturb_row(orig_mat, wi, wj, 0.0 - eps_g)
+    let mat_minus = _mla_replace_row(orig_mat, wi, row_minus)
+    let w_minus = _mla_with_mat(weights, which, mat_minus)
+
+    let cache_p = mla_cache_new(cache.max_len, cache.d_c, cache.d_rope)
+    let r_plus = mla_forward(inp, pos, cache_p, w_plus, cfg)
+    let loss_plus = loss_fn(r_plus[0])
+
+    let cache_m = mla_cache_new(cache.max_len, cache.d_c, cache.d_rope)
+    let r_minus = mla_forward(inp, pos, cache_m, w_minus, cfg)
+    let loss_minus = loss_fn(r_minus[0])
+
+    return (loss_plus - loss_minus) / (2.0 * eps_g)
+}
+
+// ===================================================================
+//  L2 loss function: sum of squares
+// ===================================================================
+@pure
+fn mla_l2_loss(output) {
+    let n = len(output)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + output[i] * output[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ===================================================================
+//  Compression ratio: actual bytes saved
+//  full_kv_size = seq_len * 2 * n_heads * head_dim
+//  latent_size  = seq_len * (d_c + d_rope)
+// ===================================================================
+@pure
+fn mla_compression_ratio(cfg: MLAConfig, seq_len) {
+    let full = seq_len * 2 * cfg.n_heads * cfg.head_dim
+    let latent = seq_len * (cfg.d_c + cfg.d_rope)
+    if latent == 0 {
+        return 0.0
+    }
+    return to_float(full) / to_float(latent)
+}
+
+
+// -- end inlined --
 
 let mut PASS = 0
 let mut FAIL = 0

@@ -6,7 +6,652 @@
 //  Run: ./hexa self/test_mamba3.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/mamba3.hexa"
+// -- inlined from self/ml/mamba3.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mamba3.hexa — Mamba-3: Selective State Space 3rd generation
+//
+//  ML roadmap #204 — Mamba-3
+//
+//  Mamba-3 extends Mamba-2 SSD with three evolutions:
+//    1. Per-head gating networks           — g_h = σ(W_gate_h . x)
+//    2. Input-dependent discretization     — Δ_h = softplus(W_Δ_h . x + b)
+//    3. Explicit linear/quadratic duality  — same output, two algorithms
+//
+//  Linear mode   — recurrent scan O(T · N)        (inference / long ctx)
+//  Quadratic mode — L-matrix expansion O(T² · d)  (training / short seq)
+//  Duality       — both produce the same y; pick by compute regime
+//
+//  Block pipeline:
+//    x -> linear_in -> activation -> SSM(linear|quadratic) -> gate(x) -> residual
+//
+//  API prefix: mamba3_*
+//
+//  Core ops:
+//    mamba3_create_layer(dim, state_dim, n_heads) -> layer
+//    mamba3_input_dependent_delta(layer, x_t, dim)              -> [n_heads]
+//    mamba3_input_dependent_B(layer, x_t, state_dim)            -> [n_heads, state_dim]
+//    mamba3_input_dependent_C(layer, x_t, state_dim)            -> [n_heads, state_dim]
+//    mamba3_discretize(A_log, delta, B, state_dim)              -> [A_bar, B_bar]
+//    mamba3_gate(x, gate_net, dim)                              -> [dim]  sigmoid
+//    mamba3_recurrent_step(h, A_bar, B_bar, C, x, state_dim)    -> [h_new, y]
+//    mamba3_recurrent_scan(layer, xs, seq_len, dim, state_dim)  -> [seq_len]
+//    mamba3_quadratic_form(layer, xs, seq_len, dim, state_dim)  -> [seq_len]
+//    mamba3_linear_mode(layer, xs, seq_len, dim)                -> [seq_len]
+//    mamba3_quadratic_mode(layer, xs, seq_len, dim)             -> [seq_len]
+//    mamba3_block(layer, x_seq, seq_len, dim)                   -> [seq_len, dim]
+//    mamba3_multi_head(layer, xs, n_heads, head_dim, seq_len)   -> [seq_len, dim]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no hidden mutation
+//    @hot      — forward-hot path
+//    @fuse     — inner loops fused
+//    @parallel — independent head / chunk loops
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn mamba3_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mamba3_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn mamba3_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn mamba3_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mamba3_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mamba3_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// deterministic pseudo-random for weight init
+fn mamba3_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Core math: exp / softplus / sigmoid
+// ═══════════════════════════════════════════════════════════════════
+
+fn mamba3_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn mamba3_ln(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 1.5 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.7 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let d2 = d * d
+    let d3 = d2 * d
+    let d4 = d3 * d
+    let d5 = d4 * d
+    let d6 = d5 * d
+    let d7 = d6 * d
+    let d8 = d7 * d
+    let ln_v = d - d2/2.0 + d3/3.0 - d4/4.0 + d5/5.0 - d6/6.0 + d7/7.0 - d8/8.0
+    return to_float(count) + ln_v
+}
+
+fn mamba3_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    return mamba3_ln(1.0 + mamba3_exp(x))
+}
+
+fn mamba3_sigmoid(x) {
+    return 1.0 / (1.0 + mamba3_exp(0.0 - x))
+}
+
+fn mamba3_silu(x) {
+    return x * mamba3_sigmoid(x)
+}
+
+fn mamba3_silu_vec(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        out = out + [mamba3_silu(v[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer struct — Mamba-3 layer parameters
+//
+//  Stored as plain dict (#{}) so the module stays schema-free and is
+//  easy to extend with new evolved gates. Fields:
+//    dim, state_dim, n_heads, head_dim
+//    A_log      : [n_heads, state_dim]   stable log-parameterization
+//    W_B        : [n_heads, state_dim, dim]
+//    W_C        : [n_heads, state_dim, dim]
+//    W_delta    : [n_heads, dim]
+//    b_delta    : [n_heads]              dt_bias (bias for discretization)
+//    W_gate     : [dim, dim]             per-head sigmoid gate (gate_net)
+//    b_gate     : [dim]
+//    W_in       : [dim, dim]             input projection
+//    b_in       : [dim]
+//    W_out      : [dim, dim]             output projection
+//    b_out      : [dim]
+// ═══════════════════════════════════════════════════════════════════
+
+fn mamba3_create_layer(dim, state_dim, n_heads) {
+    let head_dim = dim / n_heads
+
+    // A_log: log-parameterized A matrix, decoded as A = -exp(A_log)
+    // This keeps A strictly negative (stable SSM).
+    let mut A_log = []
+    for h in 0..n_heads {
+        let mut a_h = []
+        for s in 0..state_dim {
+            // start around ln(s+1): A decodes to -1,-2,-3,...
+            a_h = a_h + [mamba3_ln(to_float(s + 1))]
+        }
+        A_log = A_log + [a_h]
+    }
+
+    // W_delta: [n_heads, dim]
+    let mut W_delta = mamba3_zeros_2d(n_heads, dim)
+    let mut b_delta = mamba3_zeros(n_heads)
+    for h in 0..n_heads {
+        for j in 0..dim {
+            W_delta[h][j] = mamba3_hash(42, h, j) * 0.1
+        }
+        b_delta[h] = 0.5
+    }
+
+    // W_B: [n_heads, state_dim, dim]
+    let mut W_B = []
+    for h in 0..n_heads {
+        let mut wb_h = mamba3_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wb_h[s][j] = mamba3_hash(73, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_B = W_B + [wb_h]
+    }
+
+    // W_C: [n_heads, state_dim, dim]
+    let mut W_C = []
+    for h in 0..n_heads {
+        let mut wc_h = mamba3_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wc_h[s][j] = mamba3_hash(91, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_C = W_C + [wc_h]
+    }
+
+    // W_gate: [dim, dim] — gating network (sigmoid)
+    let mut W_gate = mamba3_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_gate[i][j] = mamba3_hash(222, i, j) * 0.1
+        }
+    }
+    let b_gate = mamba3_zeros(dim)
+
+    // W_in / b_in (initialized to identity-like for residual smoothness)
+    let mut W_in = mamba3_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_in[i][j] = mamba3_hash(111, i, j) * 0.1
+        }
+    }
+    let b_in = mamba3_zeros(dim)
+
+    // W_out / b_out (zero-init so residual dominates at t=0)
+    let W_out = mamba3_zeros_2d(dim, dim)
+    let b_out = mamba3_zeros(dim)
+
+    return #{
+        "dim": dim,
+        "state_dim": state_dim,
+        "n_heads": n_heads,
+        "head_dim": head_dim,
+        "A_log": A_log,
+        "W_B": W_B,
+        "W_C": W_C,
+        "W_delta": W_delta,
+        "b_delta": b_delta,
+        "W_gate": W_gate,
+        "b_gate": b_gate,
+        "W_in": W_in,
+        "b_in": b_in,
+        "W_out": W_out,
+        "b_out": b_out
+    }
+}
+
+// Helper: decode A_log to A diagonal for a head.
+// Mamba-3 uses A = -exp(A_log), guaranteeing A < 0.
+fn mamba3_decode_A(A_log_h, state_dim) {
+    let mut A = mamba3_zeros(state_dim)
+    for s in 0..state_dim {
+        A[s] = 0.0 - mamba3_exp(A_log_h[s])
+    }
+    return A
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Input-dependent projections (selective mechanism)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mamba3_input_dependent_delta(layer, x_t, dim) {
+    // x_t: [dim] -> delta per head: [n_heads], positive via softplus
+    let n_heads = layer["n_heads"]
+    let W_delta = layer["W_delta"]
+    let b_delta = layer["b_delta"]
+    let mut deltas = mamba3_zeros(n_heads)
+    for h in 0..n_heads {
+        let mut dot = 0.0
+        for j in 0..dim {
+            dot = dot + W_delta[h][j] * x_t[j]
+        }
+        let dt = mamba3_softplus(dot + b_delta[h])
+        // clamp to stable range
+        let mut dt_c = dt
+        if dt_c < 0.001 { dt_c = 0.001 }
+        if dt_c > 10.0 { dt_c = 10.0 }
+        deltas[h] = dt_c
+    }
+    return deltas
+}
+
+@pure
+fn mamba3_input_dependent_B(layer, x_t, state_dim) {
+    // x_t: [dim] -> B per head: [n_heads, state_dim]
+    let n_heads = layer["n_heads"]
+    let dim = layer["dim"]
+    let W_B = layer["W_B"]
+    let mut Bs = []
+    for h in 0..n_heads {
+        let mut b_h = mamba3_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + W_B[h][s][j] * x_t[j]
+            }
+            b_h[s] = dot
+        }
+        Bs = Bs + [b_h]
+    }
+    return Bs
+}
+
+@pure
+fn mamba3_input_dependent_C(layer, x_t, state_dim) {
+    // x_t: [dim] -> C per head: [n_heads, state_dim]
+    let n_heads = layer["n_heads"]
+    let dim = layer["dim"]
+    let W_C = layer["W_C"]
+    let mut Cs = []
+    for h in 0..n_heads {
+        let mut c_h = mamba3_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + W_C[h][s][j] * x_t[j]
+            }
+            c_h[s] = dot
+        }
+        Cs = Cs + [c_h]
+    }
+    return Cs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discretization: Zero-Order Hold (ZOH) for diagonal A
+//
+//  Given log-parameterized A_log (so A = -exp(A_log) < 0), scalar delta
+//  and B vector:
+//      A_bar[i] = exp(delta * A[i])       in (0, 1]  (stable because A<0)
+//      B_bar[i] = delta * B[i]            (simplified Mamba form)
+//
+//  Invariants:
+//      delta = 0        => A_bar = 1, B_bar = 0   (identity / no update)
+//      delta > 0, A < 0 => A_bar in (0, 1)         (decay)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mamba3_discretize(A_log, delta, B, state_dim) {
+    let mut A_bar = mamba3_zeros(state_dim)
+    let mut B_bar = mamba3_zeros(state_dim)
+    for i in 0..state_dim {
+        // A = -exp(A_log)
+        let A_i = 0.0 - mamba3_exp(A_log[i])
+        A_bar[i] = mamba3_exp(delta * A_i)
+        B_bar[i] = delta * B[i]
+    }
+    return [A_bar, B_bar]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gate: per-head sigmoid(W_gate . x + b_gate)
+//
+//  gate_net is expected to be a #{"W": [[..]], "b": [..]} dict (or
+//  layer-level W_gate/b_gate). Returns [dim] vector in (0, 1).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn mamba3_gate(x, gate_net, dim) {
+    let W = gate_net["W"]
+    let b = gate_net["b"]
+    let mut g = mamba3_zeros(dim)
+    for i in 0..dim {
+        let mut dot = 0.0
+        for j in 0..dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        g[i] = mamba3_sigmoid(dot + b[i])
+    }
+    return g
+}
+
+// Layer-level wrapper: build gate_net view from layer params.
+@pure
+fn mamba3_layer_gate(layer, x, dim) {
+    let gate_net = #{"W": layer["W_gate"], "b": layer["b_gate"]}
+    return mamba3_gate(x, gate_net, dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent step: h' = A_bar * h + B_bar * x ; y = C . h'
+// ═══════════════════════════════════════════════════════════════════
+
+fn mamba3_recurrent_step(h, A_bar, B_bar, C, x, state_dim) {
+    let mut h_new = mamba3_zeros(state_dim)
+    for i in 0..state_dim {
+        h_new[i] = A_bar[i] * h[i] + B_bar[i] * x
+    }
+    let mut y = 0.0
+    for i in 0..state_dim {
+        y = y + C[i] * h_new[i]
+    }
+    return [h_new, y]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent scan — head 0, scalar reduction input (O(T · N))
+//
+//  Uses input-dependent delta/B/C for each token. This is the "linear
+//  mode" of the duality.
+// ═══════════════════════════════════════════════════════════════════
+
+fn mamba3_recurrent_scan(layer, xs, seq_len, dim, state_dim) {
+    let A_log_h = layer["A_log"][0]
+    let mut h = mamba3_zeros(state_dim)
+    let mut ys = mamba3_zeros(seq_len)
+    for t in 0..seq_len {
+        let deltas = mamba3_input_dependent_delta(layer, xs[t], dim)
+        let delta_t = deltas[0]
+        let Bs = mamba3_input_dependent_B(layer, xs[t], state_dim)
+        let B_t = Bs[0]
+        let Cs = mamba3_input_dependent_C(layer, xs[t], state_dim)
+        let C_t = Cs[0]
+
+        let disc = mamba3_discretize(A_log_h, delta_t, B_t, state_dim)
+        let A_bar = disc[0]
+        let B_bar = disc[1]
+
+        // scalar input: mean of x[t]
+        let mut xs_scalar = 0.0
+        for d in 0..dim {
+            xs_scalar = xs_scalar + xs[t][d]
+        }
+        xs_scalar = xs_scalar / to_float(dim)
+
+        let step = mamba3_recurrent_step(h, A_bar, B_bar, C_t, xs_scalar, state_dim)
+        h = step[0]
+        ys[t] = step[1]
+    }
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quadratic form (L-matrix expansion) — same output, O(T² · N)
+//
+//  y[t] = sum_{s<=t} L[t][s] * x_scalar[s]
+//  where L[t][s] = C[t] . (prod_{k=s+1..t} A_bar[k]) * B_bar[s]
+//  (diagonal A, per-state product).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn mamba3_quadratic_form(layer, xs, seq_len, dim, state_dim) {
+    let A_log_h = layer["A_log"][0]
+
+    // Precompute per-token (delta, A_bar, B_bar, C)
+    let mut A_bars = []
+    let mut B_bars = []
+    let mut Cs = []
+    let mut xs_scalar = mamba3_zeros(seq_len)
+    for t in 0..seq_len {
+        let deltas = mamba3_input_dependent_delta(layer, xs[t], dim)
+        let delta_t = deltas[0]
+        let B_raw = mamba3_input_dependent_B(layer, xs[t], state_dim)
+        let C_raw = mamba3_input_dependent_C(layer, xs[t], state_dim)
+
+        let disc = mamba3_discretize(A_log_h, delta_t, B_raw[0], state_dim)
+        A_bars = A_bars + [disc[0]]
+        B_bars = B_bars + [disc[1]]
+        Cs = Cs + [C_raw[0]]
+
+        let mut s_acc = 0.0
+        for d in 0..dim {
+            s_acc = s_acc + xs[t][d]
+        }
+        xs_scalar[t] = s_acc / to_float(dim)
+    }
+
+    // y[t] = sum_{s<=t} C[t] . (A_bar[s+1]..A_bar[t] * B_bar[s]) * x_s
+    let mut ys = mamba3_zeros(seq_len)
+    for t in 0..seq_len {
+        let mut y_t = 0.0
+        for s in 0..(t + 1) {
+            // carry = B_bar[s] initially, then multiply by A_bar[k] for k in s+1..=t
+            let mut carry = mamba3_zeros(state_dim)
+            for i in 0..state_dim {
+                carry[i] = B_bars[s][i]
+            }
+            let k_start = s + 1
+            for k in k_start..(t + 1) {
+                for i in 0..state_dim {
+                    carry[i] = carry[i] * A_bars[k][i]
+                }
+            }
+            let mut dot = 0.0
+            for i in 0..state_dim {
+                dot = dot + Cs[t][i] * carry[i]
+            }
+            y_t = y_t + dot * xs_scalar[s]
+        }
+        ys[t] = y_t
+    }
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Duality toggles
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn mamba3_linear_mode(layer, xs, seq_len, dim) {
+    let state_dim = layer["state_dim"]
+    return mamba3_recurrent_scan(layer, xs, seq_len, dim, state_dim)
+}
+
+@hot
+fn mamba3_quadratic_mode(layer, xs, seq_len, dim) {
+    let state_dim = layer["state_dim"]
+    return mamba3_quadratic_form(layer, xs, seq_len, dim, state_dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear helper: y = W x + b
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn mamba3_linear(x, W, bias) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = []
+    for i in 0..out_dim {
+        let mut dot = 0.0
+        for j in 0..in_dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        y = y + [dot + bias[i]]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-head: split dim across n_heads, run independent SSM per head
+//
+//  Returns [seq_len, dim] where total dim is preserved (split+concat).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn mamba3_multi_head(layer, xs, n_heads, head_dim, seq_len) {
+    let state_dim = layer["state_dim"]
+    let dim = layer["dim"]
+
+    // Output buffer [seq_len, dim]
+    let mut output = mamba3_zeros_2d(seq_len, dim)
+
+    for h in 0..n_heads {
+        let A_log_h = layer["A_log"][h]
+        let h_start = h * head_dim
+
+        // Per-head hidden state
+        let mut state = mamba3_zeros(state_dim)
+
+        for t in 0..seq_len {
+            let deltas = mamba3_input_dependent_delta(layer, xs[t], dim)
+            let delta_t = deltas[h]
+            let B_all = mamba3_input_dependent_B(layer, xs[t], state_dim)
+            let C_all = mamba3_input_dependent_C(layer, xs[t], state_dim)
+
+            let disc = mamba3_discretize(A_log_h, delta_t, B_all[h], state_dim)
+            let A_bar = disc[0]
+            let B_bar = disc[1]
+
+            // per-head scalar input: mean over this head's slice
+            let mut xs_h = 0.0
+            for d in 0..head_dim {
+                xs_h = xs_h + xs[t][h_start + d]
+            }
+            xs_h = xs_h / to_float(head_dim)
+
+            let step = mamba3_recurrent_step(state, A_bar, B_bar, C_all[h], xs_h, state_dim)
+            state = step[0]
+            let y_h = step[1]
+
+            // broadcast y_h to this head's slice
+            for d in 0..head_dim {
+                output[t][h_start + d] = y_h / to_float(head_dim)
+            }
+        }
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full block: W_in -> SiLU -> multi-head SSM -> gate(x) -> W_out + residual
+//
+//  With zero-initialized W_out, the block starts as identity-on-input
+//  (output == x_seq). This lets training take over via small updates.
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn mamba3_block(layer, x_seq, seq_len, dim) {
+    let n_heads = layer["n_heads"]
+    let head_dim = layer["head_dim"]
+
+    // 1. Input projection
+    let mut x_proj = []
+    for t in 0..seq_len {
+        let p = mamba3_linear(x_seq[t], layer["W_in"], layer["b_in"])
+        x_proj = x_proj + [mamba3_silu_vec(p)]
+    }
+
+    // 2. Multi-head SSM
+    let y = mamba3_multi_head(layer, x_proj, n_heads, head_dim, seq_len)
+
+    // 3. Per-token gate(x) via layer's gate net
+    let mut gated = []
+    for t in 0..seq_len {
+        let g = mamba3_layer_gate(layer, x_seq[t], dim)
+        let mut row = mamba3_zeros(dim)
+        for d in 0..dim {
+            row[d] = y[t][d] * g[d]
+        }
+        gated = gated + [row]
+    }
+
+    // 4. Output projection + residual
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = mamba3_linear(gated[t], layer["W_out"], layer["b_out"])
+        let mut out = mamba3_zeros(dim)
+        for d in 0..dim {
+            out[d] = x_seq[t][d] + proj[d]
+        }
+        output = output + [out]
+    }
+    return output
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -53,7 +53,853 @@
 //  Run: ./hexa self/interpreter.hexa self/test_state_space_duality.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/state_space_duality.hexa"
+// -- inlined from self/ml/state_space_duality.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/state_space_duality.hexa — State Space Duality (#327)
+//
+//  ML roadmap #327 — SSM <-> Structured Attention Duality
+//
+//  Core insight (Dao & Gu, 2024): a diagonal SSM recurrence and
+//  a structured masked attention are mathematically identical
+//  computations. This module makes the duality explicit:
+//
+//  SSM view:    h' = A_bar * h + B_bar * x;  y = C * h
+//  Attention:   y  = (M . QK^T) V
+//  where M[i,j] = prod(A_bar[k], k=j+1..i) is the causal decay mask.
+//
+//  Three computation paths (all produce identical output):
+//    1. Recurrent  — O(T * N) sequential, O(1) per-step inference
+//    2. Quadratic  — O(T^2 * d) parallel, good for short sequences
+//    3. Chunked    — O(T * (C + N)) best of both worlds
+//
+//  This module provides:
+//    - Unified layer that can run any of the three paths
+//    - Duality verification: proves rec == quad == chunk
+//    - Mode switching at runtime
+//    - Multi-head SSD with per-head diagonal A
+//    - Gated block with conv1d + residual
+//
+//  API:
+//    ssdual_create(dim, state_dim, n_heads)
+//    ssdual_discretize(A_diag, B, delta, state_dim)
+//    ssdual_recurrent(A_bars, B_bars, xs, C, seq_len, state_dim)
+//    ssdual_build_mask(A_bars, seq_len, state_dim)
+//    ssdual_quadratic(Q, K, V, M, seq_len, dim)
+//    ssdual_chunked(A_bars, B_bars, xs, C, seq_len, chunk_size, state_dim)
+//    ssdual_forward(layer, x, seq_len, dim, mode)
+//    ssdual_multi_head(layer, x, seq_len, dim, n_heads, mode)
+//    ssdual_verify_duality(layer, x, seq_len, dim)
+//    ssdual_block(layer, x, seq_len, dim, mode)
+//    ssdual_step(layer, h, x_t, dim)
+//
+//  AI-NATIVE attrs:
+//    @pure     — deterministic, no hidden state
+//    @hot      — called every forward step
+//    @fuse     — inner loops fused
+//    @parallel — independent head/chunk loops
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn ssdual_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ssdual_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ssdual_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ssdual_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ssdual_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ssdual_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// deterministic pseudo-random for weight init
+fn ssdual_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Core math
+// ═══════════════════════════════════════════════════════════════════
+
+fn ssdual_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ssdual_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    let ex = ssdual_exp(x)
+    let v = 1.0 + ex
+    // ln(v) via Taylor on (v-1)/v
+    let d = (v - 1.0) / v
+    let d2 = d * d
+    let d3 = d2 * d
+    let d4 = d3 * d
+    let d5 = d4 * d
+    let d6 = d5 * d
+    let ln_approx = d + d2/2.0 + d3/3.0 + d4/4.0 + d5/5.0 + d6/6.0
+    return ln_approx
+}
+
+fn ssdual_sigmoid(x) {
+    return 1.0 / (1.0 + ssdual_exp(0.0 - x))
+}
+
+fn ssdual_silu(x) {
+    return x * ssdual_sigmoid(x)
+}
+
+fn ssdual_silu_vec(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        out = out + [ssdual_silu(v[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer struct — SSD Duality layer parameters
+// ═══════════════════════════════════════════════════════════════════
+
+struct SSDualLayer {
+    dim: int,
+    state_dim: int,
+    n_heads: int,
+    head_dim: int,
+    A_diag: array,
+    W_delta: array,
+    b_delta: array,
+    W_B: array,
+    W_C: array,
+    W_in: array,
+    b_in: array,
+    W_gate: array,
+    b_gate: array,
+    W_out: array,
+    b_out: array,
+    conv_kernel: array
+}
+
+fn ssdual_create(dim, state_dim, n_heads) {
+    let head_dim = dim / n_heads
+
+    // A: diagonal HiPPO-style initialization per head
+    let mut A_diag = []
+    for h in 0..n_heads {
+        let mut a_h = []
+        for s in 0..state_dim {
+            a_h = a_h + [0.0 - to_float(s + 1) * 0.5]
+        }
+        A_diag = A_diag + [a_h]
+    }
+
+    // W_delta: [n_heads, dim] -> delta per head
+    let mut W_delta = ssdual_zeros_2d(n_heads, dim)
+    let mut b_delta = ssdual_zeros(n_heads)
+    for h in 0..n_heads {
+        for j in 0..dim {
+            W_delta[h][j] = ssdual_hash(42, h, j) * 0.1
+        }
+        b_delta[h] = 0.5
+    }
+
+    // W_B: [n_heads, state_dim, dim]
+    let mut W_B = []
+    for h in 0..n_heads {
+        let mut wb_h = ssdual_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wb_h[s][j] = ssdual_hash(73, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_B = W_B + [wb_h]
+    }
+
+    // W_C: [n_heads, state_dim, dim]
+    let mut W_C = []
+    for h in 0..n_heads {
+        let mut wc_h = ssdual_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wc_h[s][j] = ssdual_hash(91, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_C = W_C + [wc_h]
+    }
+
+    // W_in: [dim, dim]
+    let mut W_in = ssdual_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_in[i][j] = ssdual_hash(111, i, j) * 0.1
+        }
+    }
+    let b_in = ssdual_zeros(dim)
+
+    // W_gate: [dim, dim]
+    let mut W_gate = ssdual_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_gate[i][j] = ssdual_hash(222, i, j) * 0.1
+        }
+    }
+    let b_gate = ssdual_zeros(dim)
+
+    // W_out: [dim, dim]
+    let mut W_out = ssdual_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_out[i][j] = ssdual_hash(333, i, j) * 0.1
+        }
+    }
+    let b_out = ssdual_zeros(dim)
+
+    // conv1d kernel: [4, dim]
+    let conv_w = 4
+    let mut conv_kernel = []
+    for k in 0..conv_w {
+        let mut row = []
+        for d in 0..dim {
+            row = row + [ssdual_hash(99, k, d) * 0.3 + 0.5]
+        }
+        conv_kernel = conv_kernel + [row]
+    }
+
+    return SSDualLayer {
+        dim: dim,
+        state_dim: state_dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        A_diag: A_diag,
+        W_delta: W_delta,
+        b_delta: b_delta,
+        W_B: W_B,
+        W_C: W_C,
+        W_in: W_in,
+        b_in: b_in,
+        W_gate: W_gate,
+        b_gate: b_gate,
+        W_out: W_out,
+        b_out: b_out,
+        conv_kernel: conv_kernel
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discretization: Zero-Order Hold for diagonal A
+//
+//  A_bar[i] = exp(delta * A_diag[i])
+//  B_bar[i] = delta * B[i]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_discretize(A_diag, B, delta, state_dim) {
+    let mut A_bar = ssdual_zeros(state_dim)
+    let mut B_bar = ssdual_zeros(state_dim)
+    for i in 0..state_dim {
+        A_bar[i] = ssdual_exp(delta * A_diag[i])
+        B_bar[i] = delta * B[i]
+    }
+    return [A_bar, B_bar]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Input-dependent projections (selective mechanism)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_input_delta(layer, x, dim) {
+    let n_heads = layer.n_heads
+    let mut deltas = ssdual_zeros(n_heads)
+    for h in 0..n_heads {
+        let mut dot = 0.0
+        for j in 0..dim {
+            dot = dot + layer.W_delta[h][j] * x[j]
+        }
+        deltas[h] = ssdual_softplus(dot + layer.b_delta[h])
+        if deltas[h] < 0.001 { deltas[h] = 0.001 }
+        if deltas[h] > 10.0 { deltas[h] = 10.0 }
+    }
+    return deltas
+}
+
+@pure
+fn ssdual_input_B(layer, x, dim, state_dim) {
+    let n_heads = layer.n_heads
+    let mut Bs = []
+    for h in 0..n_heads {
+        let mut b_h = ssdual_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + layer.W_B[h][s][j] * x[j]
+            }
+            b_h[s] = dot
+        }
+        Bs = Bs + [b_h]
+    }
+    return Bs
+}
+
+@pure
+fn ssdual_input_C(layer, x, dim, state_dim) {
+    let n_heads = layer.n_heads
+    let mut Cs = []
+    for h in 0..n_heads {
+        let mut c_h = ssdual_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + layer.W_C[h][s][j] * x[j]
+            }
+            c_h[s] = dot
+        }
+        Cs = Cs + [c_h]
+    }
+    return Cs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PATH 1: Recurrent scan — O(T * N), sequential
+//
+//  h[t] = A_bar[t] * h[t-1] + B_bar[t] * x[t]
+//  y[t] = C[t] . h[t]
+//
+//  Best for inference (O(1) per step with cached state).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @fuse
+fn ssdual_recurrent(A_bars, B_bars, xs, C, seq_len, state_dim) {
+    let mut h = ssdual_zeros(state_dim)
+    let mut ys = ssdual_zeros(seq_len)
+    for t in 0..seq_len {
+        let mut h_new = ssdual_zeros(state_dim)
+        for s in 0..state_dim {
+            h_new[s] = A_bars[t][s] * h[s] + B_bars[t][s] * xs[t]
+        }
+        h = h_new
+        let mut dot = 0.0
+        for s in 0..state_dim {
+            dot = dot + C[t][s] * h[s]
+        }
+        ys[t] = dot
+    }
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Duality core: structured causal mask M
+//
+//  M[i][j] = product(A_bar[k], k=j+1..i) averaged over state_dim
+//            for i >= j, 0 otherwise (causal).
+//
+//  This is THE bridge between SSM and attention:
+//  - In SSM view, A_bar controls how fast state decays
+//  - In attention view, M is the causal mask weighting past tokens
+//  The two are the SAME mathematical object.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_build_mask(A_bars, seq_len, state_dim) {
+    let mut M = ssdual_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j > i {
+                M[i][j] = 0.0
+            } else {
+                if i == j {
+                    M[i][j] = 1.0
+                } else {
+                    let mut total = 0.0
+                    for s in 0..state_dim {
+                        let mut prod = 1.0
+                        let start = j + 1
+                        for k in start..i {
+                            prod = prod * A_bars[k][s]
+                        }
+                        prod = prod * A_bars[i][s]
+                        total = total + prod
+                    }
+                    M[i][j] = total / to_float(state_dim)
+                }
+            }
+        }
+    }
+    return M
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PATH 2: Quadratic attention — O(T^2 * d), parallel
+//
+//  y = (M . QK^T) V
+//
+//  In the duality:
+//    Q corresponds to C (output projection)
+//    K corresponds to B (input projection)
+//    V corresponds to x (input values)
+//    M is the structured causal mask from SSM decay
+//
+//  Identical to softmax attention but with structured mask M
+//  instead of softmax(QK^T / sqrt(d)).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @fuse
+fn ssdual_quadratic(Q, K, V, M, seq_len, dim) {
+    // QK^T: [seq_len, seq_len]
+    let mut QKt = ssdual_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + Q[i][d] * K[j][d]
+            }
+            QKt[i][j] = dot
+        }
+    }
+
+    // S = M . QK^T (element-wise masking)
+    let mut S = ssdual_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            S[i][j] = M[i][j] * QKt[i][j]
+        }
+    }
+
+    // y = S * V: [seq_len, dim]
+    let mut y = ssdual_zeros_2d(seq_len, dim)
+    for i in 0..seq_len {
+        for d in 0..dim {
+            let mut acc = 0.0
+            for j in 0..seq_len {
+                acc = acc + S[i][j] * V[j][d]
+            }
+            y[i][d] = acc
+        }
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PATH 3: Chunked scan — O(T * (C + N)), best of both
+//
+//  Split sequence into chunks of size C:
+//    Intra-chunk: recurrent within each chunk (parallelizable)
+//    Inter-chunk: propagate state across chunk boundaries
+//
+//  Combines parallel training of quadratic with linear memory of
+//  recurrent. This is the practical workhorse of Mamba-2.
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn ssdual_chunked(A_bars, B_bars, xs, C, seq_len, chunk_size, state_dim) {
+    let n_chunks = (seq_len + chunk_size - 1) / chunk_size
+    let mut ys = ssdual_zeros(seq_len)
+
+    // inter-chunk recurrent state
+    let mut h_inter = ssdual_zeros(state_dim)
+
+    for chunk_idx in 0..n_chunks {
+        let c_start = chunk_idx * chunk_size
+        let mut c_end = c_start + chunk_size
+        if c_end > seq_len { c_end = seq_len }
+        let c_len = c_end - c_start
+
+        // 1. Intra-chunk: local recurrence within this chunk
+        let mut h_local = ssdual_zeros(state_dim)
+        let mut intra_ys = ssdual_zeros(c_len)
+        for t in 0..c_len {
+            let gt = c_start + t
+            let mut h_new = ssdual_zeros(state_dim)
+            for s in 0..state_dim {
+                h_new[s] = A_bars[gt][s] * h_local[s] + B_bars[gt][s] * xs[gt]
+            }
+            h_local = h_new
+            let mut dot = 0.0
+            for s in 0..state_dim {
+                dot = dot + C[gt][s] * h_local[s]
+            }
+            intra_ys[t] = dot
+        }
+
+        // 2. Inter-chunk: propagate h_inter decayed through this chunk
+        let mut inter_ys = ssdual_zeros(c_len)
+        let mut h_prop = ssdual_zeros(state_dim)
+        for s in 0..state_dim {
+            h_prop[s] = h_inter[s]
+        }
+        for t in 0..c_len {
+            let gt = c_start + t
+            let mut h_decayed = ssdual_zeros(state_dim)
+            for s in 0..state_dim {
+                h_decayed[s] = A_bars[gt][s] * h_prop[s]
+            }
+            h_prop = h_decayed
+            let mut dot = 0.0
+            for s in 0..state_dim {
+                dot = dot + C[gt][s] * h_prop[s]
+            }
+            inter_ys[t] = dot
+        }
+
+        // 3. Combine intra + inter
+        for t in 0..c_len {
+            ys[c_start + t] = intra_ys[t] + inter_ys[t]
+        }
+
+        // 4. Update inter-chunk state
+        for t in 0..c_len {
+            let gt = c_start + t
+            let mut h_new = ssdual_zeros(state_dim)
+            for s in 0..state_dim {
+                h_new[s] = A_bars[gt][s] * h_inter[s] + B_bars[gt][s] * xs[gt]
+            }
+            h_inter = h_new
+        }
+    }
+
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent step: O(1) per-step inference with cached state
+//
+//  Given current state h and input x_t, produce:
+//    h' = A_bar * h + B_bar * x_t
+//    y  = C . h'
+//
+//  Returns [h_new, y_scalar]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ssdual_step(layer, h, x_t, dim) {
+    let state_dim = layer.state_dim
+    let A_diag = layer.A_diag[0]
+
+    let deltas = ssdual_input_delta(layer, x_t, dim)
+    let delta_t = deltas[0]
+    let Bs = ssdual_input_B(layer, x_t, dim, state_dim)
+    let B_t = Bs[0]
+    let Cs = ssdual_input_C(layer, x_t, dim, state_dim)
+    let C_t = Cs[0]
+
+    let disc = ssdual_discretize(A_diag, B_t, delta_t, state_dim)
+    let A_bar = disc[0]
+    let B_bar = disc[1]
+
+    // scalar input: mean of x_t
+    let mut s = 0.0
+    for d in 0..dim {
+        s = s + x_t[d]
+    }
+    let x_scalar = s / to_float(dim)
+
+    // h' = A_bar * h + B_bar * x
+    let mut h_new = ssdual_zeros(state_dim)
+    for i in 0..state_dim {
+        h_new[i] = A_bar[i] * h[i] + B_bar[i] * x_scalar
+    }
+
+    // y = C . h'
+    let mut y = 0.0
+    for i in 0..state_dim {
+        y = y + C_t[i] * h_new[i]
+    }
+
+    return [h_new, [y]]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear projection helper
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_linear(x, W, bias) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = []
+    for i in 0..out_dim {
+        let mut dot = 0.0
+        for j in 0..in_dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        y = y + [dot + bias[i]]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Conv1d causal depthwise
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_conv1d(x_seq, kernel, dim) {
+    let seq_len = len(x_seq)
+    let conv_w = len(kernel)
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = ssdual_zeros(dim)
+        for k in 0..conv_w {
+            let idx = t - k
+            if idx >= 0 {
+                for c in 0..dim {
+                    row[c] = row[c] + kernel[k][c] * x_seq[idx][c]
+                }
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Unified forward: runs any of the three paths
+//
+//  mode: "recurrent" | "quadratic" | "chunked"
+//
+//  All three produce identical output (that is the duality).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ssdual_forward(layer, x, seq_len, dim, mode) {
+    let state_dim = layer.state_dim
+    let A_diag = layer.A_diag[0]
+
+    // Compute per-step selective params
+    let mut A_bars = []
+    let mut B_bars = []
+    let mut Cs = []
+    let mut xs_scalar = ssdual_zeros(seq_len)
+    for t in 0..seq_len {
+        let deltas = ssdual_input_delta(layer, x[t], dim)
+        let delta_t = deltas[0]
+        let Bs_t = ssdual_input_B(layer, x[t], dim, state_dim)
+        let B_t = Bs_t[0]
+        let Cs_t = ssdual_input_C(layer, x[t], dim, state_dim)
+        let C_t = Cs_t[0]
+
+        let disc = ssdual_discretize(A_diag, B_t, delta_t, state_dim)
+        A_bars = A_bars + [disc[0]]
+        B_bars = B_bars + [disc[1]]
+        Cs = Cs + [C_t]
+
+        let mut s = 0.0
+        for d in 0..dim {
+            s = s + x[t][d]
+        }
+        xs_scalar[t] = s / to_float(dim)
+    }
+
+    if mode == "recurrent" {
+        return ssdual_recurrent(A_bars, B_bars, xs_scalar, Cs, seq_len, state_dim)
+    }
+
+    if mode == "quadratic" {
+        // Build Q (from C), K (from B), V (from x), and mask M
+        let M = ssdual_build_mask(A_bars, seq_len, state_dim)
+
+        // For duality: Q=C, K=B, V=x repeated to state_dim width
+        let mut Q = []
+        let mut K = []
+        let mut V = []
+        for t in 0..seq_len {
+            Q = Q + [Cs[t]]
+            let Bs_t = ssdual_input_B(layer, x[t], dim, state_dim)
+            K = K + [Bs_t[0]]
+            let mut v_row = ssdual_zeros(state_dim)
+            for s in 0..state_dim {
+                v_row[s] = xs_scalar[t]
+            }
+            V = V + [v_row]
+        }
+
+        let y_2d = ssdual_quadratic(Q, K, V, M, seq_len, state_dim)
+
+        // Reduce to 1D: sum over state_dim
+        let mut ys = ssdual_zeros(seq_len)
+        for t in 0..seq_len {
+            let mut acc = 0.0
+            for s in 0..state_dim {
+                acc = acc + y_2d[t][s]
+            }
+            ys[t] = acc
+        }
+        return ys
+    }
+
+    // default: chunked with chunk_size=2
+    return ssdual_chunked(A_bars, B_bars, xs_scalar, Cs, seq_len, 2, state_dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-head SSD: split dim across heads, run independent SSDs
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn ssdual_multi_head(layer, x, seq_len, dim, n_heads, mode) {
+    let head_dim = dim / n_heads
+    let state_dim = layer.state_dim
+
+    let mut output = ssdual_zeros_2d(seq_len, dim)
+
+    for h in 0..n_heads {
+        let A_diag_h = layer.A_diag[h]
+        let h_start = h * head_dim
+
+        let mut A_bars_h = []
+        let mut B_bars_h = []
+        let mut Cs_h = []
+        let mut xs_h = ssdual_zeros(seq_len)
+
+        for t in 0..seq_len {
+            let deltas = ssdual_input_delta(layer, x[t], dim)
+            let delta_t = deltas[h]
+            let Bs_t = ssdual_input_B(layer, x[t], dim, state_dim)
+            let B_t = Bs_t[h]
+            let Cs_t = ssdual_input_C(layer, x[t], dim, state_dim)
+            let C_t = Cs_t[h]
+
+            let disc = ssdual_discretize(A_diag_h, B_t, delta_t, state_dim)
+            A_bars_h = A_bars_h + [disc[0]]
+            B_bars_h = B_bars_h + [disc[1]]
+            Cs_h = Cs_h + [C_t]
+
+            let mut s = 0.0
+            for d in 0..head_dim {
+                s = s + x[t][h_start + d]
+            }
+            xs_h[t] = s / to_float(head_dim)
+        }
+
+        // Use recurrent for multi-head (always exact)
+        let ys_h = ssdual_recurrent(A_bars_h, B_bars_h, xs_h, Cs_h, seq_len, state_dim)
+
+        for t in 0..seq_len {
+            for d in 0..head_dim {
+                output[t][h_start + d] = ys_h[t] / to_float(head_dim)
+            }
+        }
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Duality verification: proves rec == chunked on given input
+//
+//  Returns max absolute difference (should be < 1e-10 for exact duality)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssdual_verify_duality(layer, x, seq_len, dim) {
+    let ys_rec = ssdual_forward(layer, x, seq_len, dim, "recurrent")
+    let ys_chunk = ssdual_forward(layer, x, seq_len, dim, "chunked")
+
+    let mut max_diff = 0.0
+    for t in 0..seq_len {
+        let d = ssdual_abs(ys_rec[t] - ys_chunk[t])
+        if d > max_diff { max_diff = d }
+    }
+    return max_diff
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full block: linear -> conv1d -> SSD -> gate -> out + residual
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ssdual_block(layer, x, seq_len, dim, mode) {
+    let n_heads = layer.n_heads
+
+    // 1. Input projection
+    let mut x_proj = []
+    for t in 0..seq_len {
+        x_proj = x_proj + [ssdual_linear(x[t], layer.W_in, layer.b_in)]
+    }
+
+    // 2. Gate projection
+    let mut z_proj = []
+    for t in 0..seq_len {
+        z_proj = z_proj + [ssdual_linear(x[t], layer.W_gate, layer.b_gate)]
+    }
+
+    // 3. Conv1d causal
+    let conv_out = ssdual_conv1d(x_proj, layer.conv_kernel, dim)
+
+    // 4. SiLU activation
+    let mut activated = []
+    for t in 0..seq_len {
+        activated = activated + [ssdual_silu_vec(conv_out[t])]
+    }
+
+    // 5. Multi-head SSD
+    let y = ssdual_multi_head(layer, activated, seq_len, dim, n_heads, mode)
+
+    // 6. Gating: y * silu(z)
+    let mut gated = []
+    for t in 0..seq_len {
+        let z_act = ssdual_silu_vec(z_proj[t])
+        let mut g = ssdual_zeros(dim)
+        for d in 0..dim {
+            g[d] = y[t][d] * z_act[d]
+        }
+        gated = gated + [g]
+    }
+
+    // 7. Output projection + residual
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = ssdual_linear(gated[t], layer.W_out, layer.b_out)
+        let mut out = ssdual_zeros(dim)
+        for d in 0..dim {
+            out[d] = x[t][d] + proj[d]
+        }
+        output = output + [out]
+    }
+    return output
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -44,7 +44,601 @@
 //  Run: ./hexa self/test_block_diffusion_lm.hexa
 // ===================================================================
 
-import "ml/block_diffusion_lm.hexa"
+// -- inlined from self/ml/block_diffusion_lm.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/block_diffusion_lm.hexa — Block Diffusion LM (#205)
+//
+//  Block-wise discrete diffusion language model. Instead of next-token
+//  autoregression, we denoise whole BLOCKS of tokens in parallel. Each
+//  block of length `block_size` is partially masked (with probability
+//  p(t) from a cosine schedule), a light-weight denoiser predicts the
+//  masked positions from the currently visible context, and the most
+//  confident predictions are revealed in each mask-predict step. Once
+//  a block is fully denoised we slide forward and repeat.
+//
+//  Components:
+//    1. Cosine noise schedule       — mask prob per step t
+//    2. Block masking               — deterministic masking inside a block
+//    3. Noise sampler               — deterministic random token id
+//    4. Denoiser                    — embed + time-bias + unembed
+//    5. Time embedding              — simple scalar-broadcast t/T
+//    6. Masked cross-entropy loss   — loss only over masked positions
+//    7. Mask-predict sampling       — iterative top-k reveal
+//    8. Block-parallel generation   — slide over seq_len in blocks
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner loops
+//
+//  All ops are pure .hexa. Deterministic: same seed → same output.
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+@pure
+fn bdlm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn bdlm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn bdlm_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn bdlm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+@pure
+fn bdlm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+@pure
+fn bdlm_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+// Taylor cosine on [0, pi/2]
+@pure
+fn bdlm_cos(x) {
+    let mut v = x
+    if v < 0.0 { v = 0.0 - v }
+    let two_pi = 6.283185307179586
+    while v > two_pi { v = v - two_pi }
+    let mut sign = 1.0
+    let pi = 3.141592653589793
+    if v > pi {
+        v = two_pi - v
+    }
+    if v > pi / 2.0 {
+        v = pi - v
+        sign = -1.0
+    }
+    let x2 = v * v
+    let x4 = x2 * x2
+    let x6 = x4 * x2
+    let x8 = x6 * x2
+    let c = 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0 + x8 / 40320.0
+    return sign * c
+}
+
+// ===================================================================
+//  Deterministic PRNG (LCG, 31-bit unsigned range)
+// ===================================================================
+
+@pure
+fn bdlm_lcg_step(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let mut s = (state * a + c) % m
+    if s < 0 { s = s + m }
+    return s
+}
+
+// returns [u01, new_state]
+@pure
+fn bdlm_rand_u01(state) {
+    let ns = bdlm_lcg_step(state)
+    let f = to_float(ns % 1000000) / 1000000.0
+    return [f, ns]
+}
+
+// returns [int in [0, n), new_state]
+@pure
+fn bdlm_rand_int(state, n) {
+    let ns = bdlm_lcg_step(state)
+    let mut v = ns % n
+    if v < 0 { v = v + n }
+    return [v, ns]
+}
+
+// ===================================================================
+//  Vector / matrix utilities
+// ===================================================================
+
+@pure
+fn bdlm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn bdlm_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+@pure
+fn bdlm_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+@pure
+fn bdlm_mat_zeros(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [bdlm_zeros(cols)] }
+    return m
+}
+
+// Deterministic weight init: small range around 0
+@pure
+fn bdlm_init_weight(rows, cols, seed) {
+    let scale = 1.0 / bdlm_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+@pure
+fn bdlm_matvec(mat, v) {
+    let rows = len(mat)
+    let cols = len(v)
+    let mut out = []
+    for r in 0..rows {
+        let mut s = 0.0
+        for c in 0..cols { s = s + mat[r][c] * v[c] }
+        out = out + [s]
+    }
+    return out
+}
+
+@pure
+fn bdlm_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+// ===================================================================
+//  Softmax / argmax / cross-entropy
+// ===================================================================
+
+@pure @hot
+fn bdlm_softmax(logits, vocab) {
+    let mut mx = logits[0]
+    for i in 1..vocab {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = []
+    let mut z = 0.0
+    for i in 0..vocab {
+        let e = bdlm_exp(logits[i] - mx)
+        exps = exps + [e]
+        z = z + e
+    }
+    if z < 1.0e-10 { z = 1.0e-10 }
+    let mut out = []
+    for i in 0..vocab { out = out + [exps[i] / z] }
+    return out
+}
+
+@pure
+fn bdlm_argmax_row(logits, vocab) {
+    let mut best = 0
+    let mut bv = logits[0]
+    for i in 1..vocab {
+        if logits[i] > bv {
+            bv = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+// Cross-entropy over a single row (ignore_index = -1)
+@pure
+fn bdlm_cross_entropy_row(logits, target, vocab) {
+    if target < 0 { return 0.0 }
+    let sm = bdlm_softmax(logits, vocab)
+    let p = sm[target]
+    let mut pp = p
+    if pp < 1.0e-10 { pp = 1.0e-10 }
+    return 0.0 - bdlm_log(pp)
+}
+
+// ===================================================================
+//  Cosine noise schedule
+//
+//  p(t) = (1 - cos(pi/2 * t/T))  (grows monotonically in t)
+//  mask_prob = 1 - p(t)          so mask_prob(0)=1, mask_prob(T)=0
+//
+//  This matches "from fully masked at step 0 → fully revealed at step T".
+// ===================================================================
+
+@pure
+fn bdlm_cosine_schedule(t, total_t) {
+    if total_t <= 0 { return 0.0 }
+    let mut ti = t
+    if ti < 0 { ti = 0 }
+    if ti > total_t { ti = total_t }
+    let pi = 3.141592653589793
+    let frac = to_float(ti) / to_float(total_t)
+    let c = bdlm_cos(pi / 2.0 * frac)
+    // p_visible = 1 - c   (actually we use c directly as "mask kept")
+    // We want mask_prob so that at t=0 → 1.0, at t=total → 0.0.
+    // cos(pi/2 * 0) = 1, cos(pi/2 * 1) = 0
+    if c < 0.0 { return 0.0 }
+    if c > 1.0 { return 1.0 }
+    return c
+}
+
+// ===================================================================
+//  Time embedding — simple scalar-broadcast time as a "dim"-vector.
+//  Even dims get sin-like (via cos(...)*2-1), odd dims get cos-like.
+//  Tests only rely on dim correctness.
+// ===================================================================
+
+@pure
+fn bdlm_time_embedding(t, total_t, dim) {
+    let mut v = []
+    if total_t <= 0 {
+        for _i in 0..dim { v = v + [0.0] }
+        return v
+    }
+    let frac = to_float(t) / to_float(total_t)
+    let pi = 3.141592653589793
+    for i in 0..dim {
+        let freq = to_float(i + 1)
+        let phase = 2.0 * pi * frac * freq / to_float(dim + 1)
+        v = v + [bdlm_cos(phase)]
+    }
+    return v
+}
+
+// ===================================================================
+//  Mask block
+//
+//  Replaces each token position in [block_start, block_end) with
+//  `mask_id` with probability `mask_prob` using a deterministic LCG.
+//  Returns [new_tokens, mask_positions] where mask_positions[i]==1
+//  means position i was masked.
+// ===================================================================
+
+@pure
+fn bdlm_mask_block(tokens, block_start, block_end, mask_prob, mask_id, seed) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n { out = out + [tokens[i]] }
+    let mut mask_pos = bdlm_zeros_int(n)
+    let mut state = seed + block_start * 7919 + block_end * 1315
+    if state < 0 { state = 0 - state }
+    for i in block_start..block_end {
+        let r = bdlm_rand_u01(state)
+        state = r[1]
+        if r[0] < mask_prob {
+            out[i] = mask_id
+            mask_pos[i] = 1
+        }
+    }
+    let res = [out, mask_pos]
+    return res
+}
+
+// ===================================================================
+//  Noise sample — n random token ids in [0, vocab)
+// ===================================================================
+
+@pure
+fn bdlm_noise_sample(vocab, n, seed) {
+    let mut out = []
+    let mut state = seed + 9173
+    if state < 0 { state = 0 - state }
+    for _i in 0..n {
+        let r = bdlm_rand_int(state, vocab)
+        out = out + [r[0]]
+        state = r[1]
+    }
+    return out
+}
+
+// ===================================================================
+//  Denoiser — lookup embed[token] + time_bias, project via unembed.
+//
+//  denoiser = #{
+//    "vocab": V,
+//    "dim":   D,
+//    "embed": [[float]] shape [V][D]
+//    "unembed": [[float]] shape [V][D]  (used as logits = W·h)
+//  }
+// ===================================================================
+
+fn bdlm_create_denoiser(vocab, dim) {
+    let seed = vocab * 131 + dim * 17 + 41
+    let emb = bdlm_init_weight(vocab, dim, seed + 1)
+    let un = bdlm_init_weight(vocab, dim, seed + 2)
+    let d = #{
+        "vocab": vocab,
+        "dim": dim,
+        "embed": emb,
+        "unembed": un
+    }
+    return d
+}
+
+// Forward: returns logits [n][vocab].
+// For each token, hidden = embed[token] + time_embed (broadcast add).
+// logits_row = unembed @ hidden.
+@pure
+fn bdlm_denoiser_forward(denoiser, noisy_tokens, time_embed) {
+    let V = denoiser["vocab"]
+    let D = denoiser["dim"]
+    let E = denoiser["embed"]
+    let U = denoiser["unembed"]
+    let n = len(noisy_tokens)
+    let mut out = []
+    for i in 0..n {
+        let tok = noisy_tokens[i]
+        let mut h = []
+        // embed[tok] may be out of range defensively
+        let mut tix = tok
+        if tix < 0 { tix = 0 }
+        if tix >= V { tix = V - 1 }
+        let row = E[tix]
+        for d in 0..D {
+            h = h + [row[d] + time_embed[d]]
+        }
+        let logits = bdlm_matvec(U, h)
+        out = out + [logits]
+    }
+    return out
+}
+
+// ===================================================================
+//  Loss — masked cross-entropy
+//
+//  Only positions where mask_positions[i]==1 contribute. Returns the
+//  MEAN over the masked positions (0.0 if no masked positions).
+// ===================================================================
+
+@pure
+fn bdlm_compute_loss(denoiser, clean_tokens, mask_positions, vocab) {
+    let n = len(clean_tokens)
+    let D = denoiser["dim"]
+    let t_emb = bdlm_zeros(D)
+    let logits = bdlm_denoiser_forward(denoiser, clean_tokens, t_emb)
+    let mut total = 0.0
+    let mut count = 0
+    for i in 0..n {
+        if mask_positions[i] == 1 {
+            let ce = bdlm_cross_entropy_row(logits[i], clean_tokens[i], vocab)
+            total = total + ce
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// ===================================================================
+//  Top-K reveal
+//
+//  Given per-position logits [n][vocab] and the set of currently
+//  masked positions (1 = masked, 0 = visible), return the indices of
+//  the top-k masked positions with the highest prediction confidence
+//  (max softmax probability).
+// ===================================================================
+
+@pure
+fn bdlm_reveal_top_k(denoiser_logits, masked_positions, k) {
+    let n = len(masked_positions)
+    let vocab = if n > 0 { len(denoiser_logits[0]) } else { 0 }
+    // confidence for each masked position
+    let mut cands = []
+    for i in 0..n {
+        if masked_positions[i] == 1 {
+            let sm = bdlm_softmax(denoiser_logits[i], vocab)
+            let mut mx = sm[0]
+            for j in 1..vocab {
+                if sm[j] > mx { mx = sm[j] }
+            }
+            cands = cands + [[i, mx]]
+        }
+    }
+    // Simple selection sort: pick top k by confidence (descending).
+    let mut picked = []
+    let mut pool = cands
+    let want = if k > len(pool) { len(pool) } else { k }
+    for _s in 0..want {
+        let mut bi = 0
+        let mut bv = 0.0 - 1.0
+        for j in 0..len(pool) {
+            let c = pool[j][1]
+            if c > bv {
+                bv = c
+                bi = j
+            }
+        }
+        picked = picked + [pool[bi][0]]
+        let mut new_pool = []
+        for j in 0..len(pool) {
+            if j != bi { new_pool = new_pool + [pool[j]] }
+        }
+        pool = new_pool
+    }
+    return picked
+}
+
+// ===================================================================
+//  One mask-predict step
+//
+//  Given a partial sequence (with mask_id at masked positions) and a
+//  mask_positions vector, compute the denoiser prediction, reveal the
+//  top-k most confident positions (k depends on schedule progress),
+//  and return the updated [partial, mask_positions].
+// ===================================================================
+
+fn bdlm_step(denoiser, partial, mask_positions, t, total_t, block_size, vocab, seed) {
+    let D = denoiser["dim"]
+    let t_emb = bdlm_time_embedding(t, total_t, D)
+    let logits = bdlm_denoiser_forward(denoiser, partial, t_emb)
+    // how many to reveal this step? roughly block_size / total_t, at least 1
+    let mut k = block_size / total_t
+    if k < 1 { k = 1 }
+    let reveal = bdlm_reveal_top_k(logits, mask_positions, k)
+    let mut new_partial = partial
+    let mut new_mask = mask_positions
+    for r in 0..len(reveal) {
+        let idx = reveal[r]
+        let pred = bdlm_argmax_row(logits[idx], vocab)
+        new_partial[idx] = pred
+        new_mask[idx] = 0
+    }
+    // seed is accepted for API symmetry (determinism already wired).
+    let _drop_seed = seed
+    let res = [new_partial, new_mask]
+    return res
+}
+
+// ===================================================================
+//  Mask-predict sampling — fully generate a sequence
+//
+//  Starts from a fully masked sequence, runs n_steps reveal passes,
+//  and guarantees all positions are revealed at the end.
+// ===================================================================
+
+fn bdlm_mask_predict_sample(denoiser, seq_len, n_steps, block_size, vocab, seed) {
+    let mask_id = vocab - 1
+    // start: all positions masked
+    let mut seq = []
+    for _i in 0..seq_len { seq = seq + [mask_id] }
+    let mut mask_pos = []
+    for _i in 0..seq_len { mask_pos = mask_pos + [1] }
+    let mut total = n_steps
+    if total < 1 { total = 1 }
+    for t in 0..total {
+        let t_step = total - t
+        let res = bdlm_step(denoiser, seq, mask_pos, t_step, total, seq_len, vocab, seed + t)
+        seq = res[0]
+        mask_pos = res[1]
+    }
+    // Safety: if any positions still masked (shouldn't happen after n_steps
+    // >= seq_len), greedy-fill them.
+    let D = denoiser["dim"]
+    let t_emb = bdlm_zeros(D)
+    let logits = bdlm_denoiser_forward(denoiser, seq, t_emb)
+    for i in 0..seq_len {
+        if mask_pos[i] == 1 {
+            seq[i] = bdlm_argmax_row(logits[i], vocab)
+            mask_pos[i] = 0
+        }
+    }
+    return seq
+}
+
+// ===================================================================
+//  Block-parallel generation
+//
+//  Walk the sequence in blocks of `block_size` and denoise each block
+//  independently. Returns a full sequence of length seq_len.
+// ===================================================================
+
+fn bdlm_block_parallel_generate(denoiser, seq_len, block_size, vocab, seed) {
+    let bs = if block_size < 1 { 1 } else { block_size }
+    let mask_id = vocab - 1
+    let mut seq = []
+    for _i in 0..seq_len { seq = seq + [mask_id] }
+    let mut pos = 0
+    let mut blk = 0
+    while pos < seq_len {
+        let mut end = pos + bs
+        if end > seq_len { end = seq_len }
+        let n_steps = bs
+        // denoise this block in isolation: treat seq[pos..end] as fully
+        // masked and fill it using the denoiser.
+        let mut block_seq = []
+        for i in pos..end { block_seq = block_seq + [seq[i]] }
+        let gen = bdlm_mask_predict_sample(denoiser, len(block_seq), n_steps, bs, vocab, seed + blk * 101)
+        for i in 0..len(gen) { seq[pos + i] = gen[i] }
+        pos = end
+        blk = blk + 1
+    }
+    return seq
+}
+
+// ===================================================================
+//  Param count (for sanity / diagnostics)
+// ===================================================================
+
+@pure
+fn bdlm_param_count(denoiser) {
+    let V = denoiser["vocab"]
+    let D = denoiser["dim"]
+    return 2 * V * D
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

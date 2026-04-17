@@ -36,7 +36,591 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_uncertainty_quantification.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/uncertainty_quantification.hexa"
+// -- inlined from self/ml/uncertainty_quantification.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/uncertainty_quantification.hexa — Uncertainty Quantification (#235)
+//
+//  Epistemic/aleatoric uncertainty separation — MC Dropout + ensemble + evidential.
+//
+//  Implements:
+//    1. MC Dropout: N forward passes with dropout, compute mean/variance
+//    2. Deep Ensemble: aggregate predictions from M models
+//    3. Evidential: Dirichlet distribution params from single pass
+//    4. Calibration: Expected Calibration Error (ECE) computation
+//    5. Uncertainty decomposition: epistemic vs aleatoric
+//    6. Predictive entropy + mutual information
+//
+//  API (pure):
+//    uq_zeros(n)                                        -> [float]
+//    uq_dot(a, b)                                       -> float
+//    uq_dropout_mask(n, drop_rate, seed)                -> [float]
+//    uq_linear_dropout(x, w, b, mask)                   -> [float]
+//    uq_mlp_forward(x, w1, b1, w2, b2, mask1, mask2)   -> [float]
+//    uq_mc_dropout(x, w1, b1, w2, b2, drop_rate,
+//                  n_samples, seed)                     -> result
+//    uq_mc_mean(predictions)                            -> [float]
+//    uq_mc_variance(predictions)                        -> [float]
+//    uq_ensemble_predict(x, models, n_models)           -> result
+//    uq_ensemble_mean(predictions)                      -> [float]
+//    uq_ensemble_variance(predictions)                  -> [float]
+//    uq_evidential_params(x, w1, b1, w2, b2)           -> [float]
+//    uq_evidential_uncertainty(alphas)                  -> float
+//    uq_evidential_expected(alphas)                     -> [float]
+//    uq_ece(confidences, accuracies, n_bins)            -> float
+//    uq_decompose(total_var, aleatoric_var)             -> [float]
+//    uq_predictive_entropy(probs)                       -> float
+//    uq_mutual_information(mc_probs)                    -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every inference step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn uq_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn uq_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn uq_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn uq_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    if x > 1.0 { y = x / 2.0 }
+    if x > 10.0 { y = 2.3 }
+    for _i in 0..60 {
+        let ey = uq_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn uq_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Vector Operations
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn uq_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + a[i] * b[i]
+    }
+    return s
+}
+
+@pure
+fn uq_norm(v) {
+    return uq_sqrt(uq_dot(v, v))
+}
+
+@pure
+fn uq_scale(v, s) {
+    let n = len(v)
+    let mut out = uq_zeros(n)
+    for i in 0..n {
+        out[i] = v[i] * s
+    }
+    return out
+}
+
+@pure
+fn uq_add(a, b) {
+    let n = len(a)
+    let mut out = uq_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+@pure
+fn uq_sub(a, b) {
+    let n = len(a)
+    let mut out = uq_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] - b[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = uq_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = uq_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = uq_zeros(n)
+    for i in 0..n {
+        out[i] = exps[i] / z
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. MC Dropout
+//
+//  Generate a dropout mask: each element is 0 or 1/(1-drop_rate)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_dropout_mask(n, drop_rate, seed) {
+    let mut mask = uq_zeros(n)
+    let scale = 1.0 / (1.0 - drop_rate)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let u = to_float(h % 10000) / 10000.0
+        if u >= drop_rate {
+            mask[i] = scale
+        }
+    }
+    return mask
+}
+
+// Linear layer with dropout applied to output
+@pure
+fn uq_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+@pure
+fn uq_linear_dropout(x, w, b, mask) {
+    let in_dim = len(x)
+    let out_dim = len(b)
+    let mut out = uq_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b[i]
+        for j in 0..in_dim {
+            s = s + w[i * in_dim + j] * x[j]
+        }
+        out[i] = uq_relu(s) * mask[i]
+    }
+    return out
+}
+
+// 2-layer MLP with dropout on hidden layer
+@pure @hot
+fn uq_mlp_forward(x, w1, b1, w2, b2, mask) {
+    let in_dim = len(x)
+    let hidden_dim = len(b1)
+    let out_dim = len(b2)
+
+    // Layer 1 + ReLU + dropout
+    let mut hidden = uq_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + w1[i * in_dim + j] * x[j]
+        }
+        hidden[i] = uq_relu(s) * mask[i]
+    }
+
+    // Layer 2 (no dropout on output)
+    let mut out = uq_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden_dim {
+            s = s + w2[i * hidden_dim + j] * hidden[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// MC Dropout: run N forward passes with different dropout masks
+// Returns: list of N prediction vectors (logits)
+@pure @hot
+fn uq_mc_dropout(x, w1, b1, w2, b2, drop_rate, n_samples, seed) {
+    let hidden_dim = len(b1)
+    let mut predictions = []
+    for s in 0..n_samples {
+        let mask = uq_dropout_mask(hidden_dim, drop_rate, seed + s * 137)
+        let pred = uq_mlp_forward(x, w1, b1, w2, b2, mask)
+        predictions = predictions + [pred]
+    }
+    return predictions
+}
+
+// Compute mean prediction across MC samples
+@pure
+fn uq_mc_mean(predictions) {
+    let n = len(predictions)
+    if n == 0 { return [] }
+    let dim = len(predictions[0])
+    let mut mean = uq_zeros(dim)
+    for i in 0..n {
+        for j in 0..dim {
+            mean[j] = mean[j] + predictions[i][j]
+        }
+    }
+    for j in 0..dim {
+        mean[j] = mean[j] / to_float(n)
+    }
+    return mean
+}
+
+// Compute per-dimension variance across MC samples
+@pure
+fn uq_mc_variance(predictions) {
+    let n = len(predictions)
+    if n < 2 { return [] }
+    let dim = len(predictions[0])
+    let mean = uq_mc_mean(predictions)
+    let mut var = uq_zeros(dim)
+    for i in 0..n {
+        for j in 0..dim {
+            let d = predictions[i][j] - mean[j]
+            var[j] = var[j] + d * d
+        }
+    }
+    for j in 0..dim {
+        var[j] = var[j] / to_float(n)
+    }
+    return var
+}
+
+// Total predictive uncertainty (mean variance across dims)
+@pure
+fn uq_mc_total_uncertainty(predictions) {
+    let var = uq_mc_variance(predictions)
+    let dim = len(var)
+    if dim == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..dim { total = total + var[i] }
+    return total / to_float(dim)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Deep Ensemble
+//
+//  Each model has its own weights: models[i] = [w1, b1, w2, b2]
+//  Run each model without dropout (mask = all ones)
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn uq_ensemble_predict(x, models) {
+    let n_models = len(models)
+    let mut predictions = []
+    for m in 0..n_models {
+        let model = models[m]
+        let w1 = model[0]
+        let b1 = model[1]
+        let w2 = model[2]
+        let b2 = model[3]
+        let hidden_dim = len(b1)
+        // No dropout: mask of all 1.0
+        let mask = uq_zeros(hidden_dim)
+        let mut ones = uq_zeros(hidden_dim)
+        for i in 0..hidden_dim { ones[i] = 1.0 }
+        let pred = uq_mlp_forward(x, w1, b1, w2, b2, ones)
+        predictions = predictions + [pred]
+    }
+    return predictions
+}
+
+// Ensemble mean
+@pure
+fn uq_ensemble_mean(predictions) {
+    return uq_mc_mean(predictions)
+}
+
+// Ensemble variance
+@pure
+fn uq_ensemble_variance(predictions) {
+    return uq_mc_variance(predictions)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Evidential Deep Learning
+//
+//  For K classes, output Dirichlet parameters alpha = [a1, a2, ..., aK]
+//  where ai > 0. Total evidence S = sum(ai).
+//  Expected probability: pi = ai / S
+//  Uncertainty: K / S (higher = more uncertain)
+// ═══════════════════════════════════════════════════════════════════
+
+// Compute Dirichlet parameters from network output (softplus to ensure > 0)
+@pure
+fn uq_softplus(x) {
+    if x > 20.0 { return x }
+    return uq_log(1.0 + uq_exp(x))
+}
+
+@pure @hot
+fn uq_evidential_params(x, w1, b1, w2, b2) {
+    let hidden_dim = len(b1)
+    let in_dim = len(x)
+    let out_dim = len(b2)
+
+    // Layer 1 + ReLU
+    let mut hidden = uq_zeros(hidden_dim)
+    for i in 0..hidden_dim {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + w1[i * in_dim + j] * x[j]
+        }
+        hidden[i] = uq_relu(s)
+    }
+
+    // Layer 2 + softplus (ensure alpha > 0) + add 1 (Dirichlet prior)
+    let mut alphas = uq_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden_dim {
+            s = s + w2[i * hidden_dim + j] * hidden[j]
+        }
+        alphas[i] = uq_softplus(s) + 1.0
+    }
+    return alphas
+}
+
+// Evidential uncertainty: K / S where S = sum(alphas)
+@pure
+fn uq_evidential_uncertainty(alphas) {
+    let k = len(alphas)
+    let mut s = 0.0
+    for i in 0..k { s = s + alphas[i] }
+    if s < 1.0e-12 { return to_float(k) }
+    return to_float(k) / s
+}
+
+// Expected probabilities from Dirichlet: pi = ai / S
+@pure
+fn uq_evidential_expected(alphas) {
+    let k = len(alphas)
+    let mut s = 0.0
+    for i in 0..k { s = s + alphas[i] }
+    if s < 1.0e-12 { return uq_zeros(k) }
+    let mut probs = uq_zeros(k)
+    for i in 0..k {
+        probs[i] = alphas[i] / s
+    }
+    return probs
+}
+
+// Evidential loss: sum of (y_k - p_k)^2 + p_k*(1-p_k)/(S+1)
+@pure
+fn uq_evidential_loss(alphas, target_idx) {
+    let k = len(alphas)
+    let mut s = 0.0
+    for i in 0..k { s = s + alphas[i] }
+    let probs = uq_evidential_expected(alphas)
+
+    let mut loss = 0.0
+    for i in 0..k {
+        let mut y = 0.0
+        if i == target_idx { y = 1.0 }
+        let err = y - probs[i]
+        // MSE term
+        loss = loss + err * err
+        // Variance term
+        loss = loss + probs[i] * (1.0 - probs[i]) / (s + 1.0)
+    }
+    return loss
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Calibration — Expected Calibration Error (ECE)
+//
+//  Bin predictions by confidence, compare average confidence vs accuracy.
+//  ECE = sum_b |B_b|/N * |acc(b) - conf(b)|
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_ece(confidences, accuracies, n_bins) {
+    let n = len(confidences)
+    if n == 0 { return 0.0 }
+
+    let mut bin_conf_sum = uq_zeros(n_bins)
+    let mut bin_acc_sum = uq_zeros(n_bins)
+    let mut bin_count = uq_zeros(n_bins)
+
+    for i in 0..n {
+        let mut bin = to_int(confidences[i] * to_float(n_bins))
+        if bin >= n_bins { bin = n_bins - 1 }
+        if bin < 0 { bin = 0 }
+        bin_conf_sum[bin] = bin_conf_sum[bin] + confidences[i]
+        bin_acc_sum[bin] = bin_acc_sum[bin] + accuracies[i]
+        bin_count[bin] = bin_count[bin] + 1.0
+    }
+
+    let mut ece = 0.0
+    for b in 0..n_bins {
+        if bin_count[b] > 0.0 {
+            let avg_conf = bin_conf_sum[b] / bin_count[b]
+            let avg_acc = bin_acc_sum[b] / bin_count[b]
+            let diff = avg_conf - avg_acc
+            let mut abs_diff = diff
+            if abs_diff < 0.0 { abs_diff = 0.0 - abs_diff }
+            ece = ece + (bin_count[b] / to_float(n)) * abs_diff
+        }
+    }
+    return ece
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Uncertainty Decomposition
+//
+//  Total uncertainty = Epistemic (model) + Aleatoric (data)
+//  - Total: variance of predictions
+//  - Aleatoric: mean of per-prediction variances (or data noise)
+//  - Epistemic: total - aleatoric
+//
+//  Returns: [total, epistemic, aleatoric]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_decompose(total_var, aleatoric_var) {
+    let mut epistemic = total_var - aleatoric_var
+    if epistemic < 0.0 { epistemic = 0.0 }
+    return [total_var, epistemic, aleatoric_var]
+}
+
+// Compute decomposition from MC dropout predictions
+// Each prediction includes a noise variance estimate (last element)
+@pure
+fn uq_decompose_mc(predictions) {
+    let n = len(predictions)
+    if n < 2 { return [0.0, 0.0, 0.0] }
+    let dim = len(predictions[0])
+    if dim == 0 { return [0.0, 0.0, 0.0] }
+
+    // Total variance
+    let total_var = uq_mc_variance(predictions)
+    let mut total = 0.0
+    for j in 0..dim { total = total + total_var[j] }
+    total = total / to_float(dim)
+
+    // Aleatoric: inherent data noise (estimate as min variance across samples)
+    // Approximation: fraction of total that is irreducible
+    let aleatoric = total * 0.3
+
+    let epistemic = total - aleatoric
+    return [total, epistemic, aleatoric]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Predictive Entropy
+//
+//  H[p] = -sum(p_i * log(p_i))
+//  Measures total uncertainty of a probability distribution.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_predictive_entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    for i in 0..n {
+        if probs[i] > 1.0e-12 {
+            h = h - probs[i] * uq_log(probs[i])
+        }
+    }
+    return h
+}
+
+// Mutual information: I[y; theta] = H[E[p]] - E[H[p]]
+// mc_probs: list of probability distributions from MC samples
+@pure
+fn uq_mutual_information(mc_probs) {
+    let n = len(mc_probs)
+    if n == 0 { return 0.0 }
+    let dim = len(mc_probs[0])
+
+    // Mean probability distribution
+    let mut mean_probs = uq_zeros(dim)
+    for i in 0..n {
+        for j in 0..dim {
+            mean_probs[j] = mean_probs[j] + mc_probs[i][j]
+        }
+    }
+    for j in 0..dim { mean_probs[j] = mean_probs[j] / to_float(n) }
+
+    // H[E[p]] — entropy of mean distribution (total uncertainty)
+    let h_mean = uq_predictive_entropy(mean_probs)
+
+    // E[H[p]] — mean of individual entropies (aleatoric)
+    let mut mean_h = 0.0
+    for i in 0..n {
+        mean_h = mean_h + uq_predictive_entropy(mc_probs[i])
+    }
+    mean_h = mean_h / to_float(n)
+
+    // MI = H[E[p]] - E[H[p]] (epistemic uncertainty)
+    let mi = h_mean - mean_h
+    if mi < 0.0 { return 0.0 }
+    return mi
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Confidence score: max probability
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn uq_confidence(probs) {
+    let n = len(probs)
+    let mut mx = 0.0
+    for i in 0..n {
+        if probs[i] > mx { mx = probs[i] }
+    }
+    return mx
+}
+
+// Temperature scaling for calibration
+@pure
+fn uq_temperature_scale(logits, temp) {
+    let n = len(logits)
+    let mut scaled = uq_zeros(n)
+    for i in 0..n {
+        scaled[i] = logits[i] / temp
+    }
+    return uq_softmax(scaled)
+}
+
+println("[uncertainty_quantification] loaded — MC Dropout + ensemble + evidential + ECE + decomposition")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

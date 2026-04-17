@@ -16,7 +16,520 @@
 //    T12 tsf_mse >= 0 and 0 when equal
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/time_series_foundation.hexa"
+// -- inlined from self/ml/time_series_foundation.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/time_series_foundation.hexa — Time Series Foundation Model (#247)
+//
+//  TimesFM / Chronos 풍 zero-shot 시계열 예측 foundation model.
+//
+//  Implements:
+//    1. Patch embedding — 1D sequence를 patch로 분할 후 linear projection
+//    2. Simple transformer encoder — self-attention + FFN + residual
+//    3. Forecast head — last patch embedding → horizon 예측 벡터
+//    4. Sinusoidal positional encoding (논문 TimesFM 스타일)
+//    5. Synthetic AR(2) series generator (pretraining prior)
+//    6. Zero-shot forecast API — 긴 context → future horizon prediction
+//    7. Metric: MSE / MAE / sMAPE
+//
+//  Defaults (CPU mini):
+//    context=512, patch=32, num_patches=16, horizon=96
+//    d_model=8, n_heads=2, n_layers=1 (scaffold — real TimesFM은 훨씬 큼)
+//
+//  API (pure):
+//    tsf_zeros / tsf_sqrt / tsf_exp / tsf_log / tsf_sin / tsf_cos
+//    tsf_patchify(x, patch_len)               -> [[float]]
+//    tsf_patch_embed(patches, w, b)           -> [[float]]
+//    tsf_positional_encoding(n_patches, d)    -> [[float]]
+//    tsf_attention(Q, K, V)                   -> [[float]]
+//    tsf_layer_norm(x)                        -> [float]
+//    tsf_ffn(x, w1, b1, w2, b2)               -> [float]
+//    tsf_encoder_block(tokens, wq, wk, wv, wo, w1, b1, w2, b2) -> [[float]]
+//    tsf_forecast_head(last_token, w, b, horizon) -> [float]
+//    tsf_ar2(n, a1, a2, seed)                 -> [float]
+//    tsf_forward(x, config, weights)          -> [float]
+//    tsf_mse / tsf_mae / tsf_smape
+//
+//  AI-NATIVE:
+//    @pure / @hot
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn tsf_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn tsf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..25 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn tsf_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..25 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn tsf_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    if x > 1.0 { y = x / 2.0 }
+    if x > 10.0 { y = 2.3 }
+    for _i in 0..40 {
+        let ey = tsf_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+// very small sin/cos via Taylor (|x| clamped to [-pi, pi])
+fn tsf_wrap_pi(x) {
+    let two_pi = 6.2831853
+    let mut v = x
+    while v > 3.1415926 { v = v - two_pi }
+    while v < -3.1415926 { v = v + two_pi }
+    return v
+}
+
+fn tsf_sin(x) {
+    let v = tsf_wrap_pi(x)
+    let mut result = v
+    let mut term = v
+    let v2 = v * v
+    for k in 1..10 {
+        let d = to_float((2 * k) * (2 * k + 1))
+        term = 0.0 - term * v2 / d
+        result = result + term
+    }
+    return result
+}
+
+fn tsf_cos(x) {
+    let v = tsf_wrap_pi(x)
+    let mut result = 1.0
+    let mut term = 1.0
+    let v2 = v * v
+    for k in 1..10 {
+        let d = to_float((2 * k - 1) * (2 * k))
+        term = 0.0 - term * v2 / d
+        result = result + term
+    }
+    return result
+}
+
+fn tsf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn tsf_zeros_2d(r, c) {
+    let mut out = []
+    for _i in 0..r { out = out + [tsf_zeros(c)] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Patchify — split input sequence into non-overlapping patches
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_patchify(x, patch_len) {
+    let total = len(x)
+    let n_patches = total / patch_len
+    let mut patches = []
+    for p in 0..n_patches {
+        let mut pvec = tsf_zeros(patch_len)
+        for j in 0..patch_len {
+            pvec[j] = x[p * patch_len + j]
+        }
+        patches = patches + [pvec]
+    }
+    return patches
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Patch embedding — linear projection patches -> d_model tokens
+//
+//  w: [d_model x patch_len] flat, b: [d_model]
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn tsf_patch_embed(patches, w, b) {
+    let n_p = len(patches)
+    if n_p == 0 { return [] }
+    let patch_len = len(patches[0])
+    let d_model = len(b)
+    let mut tokens = []
+    for p in 0..n_p {
+        let mut token = tsf_zeros(d_model)
+        let patch = patches[p]
+        for i in 0..d_model {
+            let mut s = b[i]
+            for j in 0..patch_len {
+                s = s + w[i * patch_len + j] * patch[j]
+            }
+            token[i] = s
+        }
+        tokens = tokens + [token]
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Sinusoidal positional encoding
+//    pos[p][2k]   = sin(p / 10000^(2k/d))
+//    pos[p][2k+1] = cos(p / 10000^(2k/d))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_positional_encoding(n_pos, d) {
+    let mut pe = tsf_zeros_2d(n_pos, d)
+    for p in 0..n_pos {
+        for k in 0..d {
+            let div = tsf_exp(to_float(k / 2 * 2) / to_float(d) * 0.0 - to_float(k / 2 * 2) / to_float(d) * 9.21)
+            let arg = to_float(p) * div
+            if k % 2 == 0 {
+                pe[p][k] = tsf_sin(arg)
+            } else {
+                pe[p][k] = tsf_cos(arg)
+            }
+        }
+    }
+    return pe
+}
+
+// add positional encoding to tokens in-place style
+@pure
+fn tsf_add_pe(tokens, pe) {
+    let n = len(tokens)
+    if n == 0 { return tokens }
+    let d = len(tokens[0])
+    let mut out = tsf_zeros_2d(n, d)
+    for i in 0..n {
+        for j in 0..d {
+            out[i][j] = tokens[i][j] + pe[i][j]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. Simple self-attention (no softmax approximation via normalization)
+//
+//  Q, K, V: [n_tokens x d]
+//  out[i] = sum_j (exp(sim_ij)/Z) * V[j]
+//  Simplification: use tanh-like normalized scores.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_attention(Q, K, V) {
+    let n = len(Q)
+    if n == 0 { return [] }
+    let d = len(Q[0])
+    let scale = 1.0 / tsf_sqrt(to_float(d))
+    let mut out = tsf_zeros_2d(n, d)
+    for i in 0..n {
+        // compute raw scores
+        let mut scores = tsf_zeros(n)
+        let mut max_s = -1.0e18
+        for j in 0..n {
+            let mut s = 0.0
+            for k in 0..d {
+                s = s + Q[i][k] * K[j][k]
+            }
+            s = s * scale
+            scores[j] = s
+            if s > max_s { max_s = s }
+        }
+        // softmax
+        let mut sum_e = 0.0
+        let mut exps = tsf_zeros(n)
+        for j in 0..n {
+            let e = tsf_exp(scores[j] - max_s)
+            exps[j] = e
+            sum_e = sum_e + e
+        }
+        if sum_e < 1.0e-12 { sum_e = 1.0 }
+        // weighted sum
+        for k in 0..d {
+            let mut v = 0.0
+            for j in 0..n {
+                v = v + (exps[j] / sum_e) * V[j][k]
+            }
+            out[i][k] = v
+        }
+    }
+    return out
+}
+
+// project tokens: token_proj[i] = W * token[i] + b (per-token linear)
+@pure
+fn tsf_proj_tokens(tokens, w, b) {
+    let n = len(tokens)
+    if n == 0 { return [] }
+    let d_in = len(tokens[0])
+    let d_out = len(b)
+    let mut out = tsf_zeros_2d(n, d_out)
+    for i in 0..n {
+        for r in 0..d_out {
+            let mut s = b[r]
+            for c in 0..d_in {
+                s = s + w[r * d_in + c] * tokens[i][c]
+            }
+            out[i][r] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Layer normalization (per-token)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_layer_norm(x) {
+    let n = len(x)
+    if n == 0 { return x }
+    let mut mu = 0.0
+    for i in 0..n { mu = mu + x[i] }
+    mu = mu / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mu
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let std = tsf_sqrt(var + 1.0e-6)
+    let mut out = tsf_zeros(n)
+    for i in 0..n {
+        out[i] = (x[i] - mu) / std
+    }
+    return out
+}
+
+// apply layer norm to every token
+@pure
+fn tsf_layer_norm_tokens(tokens) {
+    let n = len(tokens)
+    let mut out = []
+    for i in 0..n {
+        out = out + [tsf_layer_norm(tokens[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. FFN — 2-layer MLP (GELU-ish via tanh)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_gelu(x) {
+    let e2x = tsf_exp(2.0 * x)
+    if e2x > 1.0e15 { return x }
+    let t = (e2x - 1.0) / (e2x + 1.0)
+    return 0.5 * x * (1.0 + t)
+}
+
+@pure
+fn tsf_ffn(x, w1, b1, w2, b2) {
+    let d_in = len(x)
+    let d_hid = len(b1)
+    let d_out = len(b2)
+    let mut hid = tsf_zeros(d_hid)
+    for i in 0..d_hid {
+        let mut s = b1[i]
+        for j in 0..d_in {
+            s = s + w1[i * d_in + j] * x[j]
+        }
+        hid[i] = tsf_gelu(s)
+    }
+    let mut out = tsf_zeros(d_out)
+    for i in 0..d_out {
+        let mut s = b2[i]
+        for j in 0..d_hid {
+            s = s + w2[i * d_hid + j] * hid[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. Encoder block — Pre-LN transformer
+//
+//  token' = token + Attention(LN(token))
+//  token'' = token' + FFN(LN(token'))
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn tsf_encoder_block(tokens, wq, wk, wv, wo, w1, b1, w2, b2) {
+    let n = len(tokens)
+    if n == 0 { return tokens }
+    let d = len(tokens[0])
+    let zb = tsf_zeros(d)
+    let ln = tsf_layer_norm_tokens(tokens)
+    let Q = tsf_proj_tokens(ln, wq, zb)
+    let K = tsf_proj_tokens(ln, wk, zb)
+    let V = tsf_proj_tokens(ln, wv, zb)
+    let att = tsf_attention(Q, K, V)
+    let att_out = tsf_proj_tokens(att, wo, zb)
+    // residual
+    let mut tokens1 = tsf_zeros_2d(n, d)
+    for i in 0..n {
+        for j in 0..d {
+            tokens1[i][j] = tokens[i][j] + att_out[i][j]
+        }
+    }
+    // FFN
+    let ln2 = tsf_layer_norm_tokens(tokens1)
+    let mut tokens2 = tsf_zeros_2d(n, d)
+    for i in 0..n {
+        let f = tsf_ffn(ln2[i], w1, b1, w2, b2)
+        for j in 0..d {
+            tokens2[i][j] = tokens1[i][j] + f[j]
+        }
+    }
+    return tokens2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Forecast head — project last token to horizon
+//
+//  w_h: [horizon x d_model] flat, b_h: [horizon]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_forecast_head(last_token, w, b) {
+    let d = len(last_token)
+    let h = len(b)
+    let mut out = tsf_zeros(h)
+    for i in 0..h {
+        let mut s = b[i]
+        for j in 0..d {
+            s = s + w[i * d + j] * last_token[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  9. Synthetic AR(2) series — pretraining prior
+//   y_t = a1 * y_{t-1} + a2 * y_{t-2} + noise
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_pseudo_noise(n, seed) {
+    let mut out = tsf_zeros(n)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let u = to_float(h % 10000) / 10000.0
+        out[i] = (u - 0.5) * 2.0
+    }
+    return out
+}
+
+@pure
+fn tsf_ar2(n, a1, a2, noise_scale, seed) {
+    let mut y = tsf_zeros(n)
+    let noise = tsf_pseudo_noise(n, seed)
+    if n >= 1 { y[0] = noise[0] * noise_scale }
+    if n >= 2 { y[1] = a1 * y[0] + noise[1] * noise_scale }
+    for t in 2..n {
+        y[t] = a1 * y[t - 1] + a2 * y[t - 2] + noise[t] * noise_scale
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  10. Forward pass — zero-shot forecast
+//
+//  Inputs:
+//    x: [context] float series
+//    config: dict {patch_len, d_model, horizon}
+//    weights: dict {w_pe, b_pe, wq, wk, wv, wo, w1, b1, w2, b2, w_fh, b_fh}
+//
+//  Returns: [horizon] forecast
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_forward(x, patch_len, d_model, horizon, w_pe, b_pe, wq, wk, wv, wo, w1, b1, w2, b2, w_fh, b_fh) {
+    let patches = tsf_patchify(x, patch_len)
+    let tokens = tsf_patch_embed(patches, w_pe, b_pe)
+    let n_p = len(tokens)
+    let pe = tsf_positional_encoding(n_p, d_model)
+    let tokens_pe = tsf_add_pe(tokens, pe)
+    // single encoder block
+    let enc = tsf_encoder_block(tokens_pe, wq, wk, wv, wo, w1, b1, w2, b2)
+    // forecast from last token
+    let last = enc[n_p - 1]
+    return tsf_forecast_head(last, w_fh, b_fh)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  11. Metrics
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tsf_mse(pred, truth) {
+    let n = len(pred)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let d = pred[i] - truth[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn tsf_mae(pred, truth) {
+    let n = len(pred)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        s = s + tsf_abs(pred[i] - truth[i])
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn tsf_smape(pred, truth) {
+    let n = len(pred)
+    if n == 0 { return 0.0 }
+    let mut s = 0.0
+    for i in 0..n {
+        let num = tsf_abs(pred[i] - truth[i])
+        let den = (tsf_abs(pred[i]) + tsf_abs(truth[i])) / 2.0 + 1.0e-8
+        s = s + num / den
+    }
+    return s / to_float(n)
+}
+
+// naive persistence baseline: repeat last value
+@pure
+fn tsf_naive_forecast(x, horizon) {
+    let n = len(x)
+    let last = x[n - 1]
+    let mut out = tsf_zeros(horizon)
+    for i in 0..horizon { out[i] = last }
+    return out
+}
+
+println("[time_series_foundation] loaded — patch embed + transformer encoder + forecast head + AR(2) prior")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

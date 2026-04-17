@@ -2,7 +2,517 @@
 //  test_contrastive_decode.hexa — Contrastive Decoding (#295)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/contrastive_decode.hexa"
+// -- inlined from self/ml/contrastive_decode.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/contrastive_decode.hexa — Contrastive Decoding (#295)
+//
+//  Li et al. 2023 — subtract amateur (small) model logits from expert
+//  (large) model logits to suppress degenerate patterns (repetition,
+//  copying, generic outputs).
+//
+//  Key math:
+//    score(t) = log p_expert(t|x) - alpha * log p_amateur(t|x)
+//    V_head   = { t : p_expert(t|x) >= beta * max_t' p_expert(t'|x) }
+//    output   = argmax_{t in V_head} score(t)
+//
+//  Architecture:
+//    expert  = 2-layer MLP (D_in -> D_hidden -> D_out)
+//    amateur = 1-layer MLP (D_in -> D_out)  (smaller capacity)
+//
+//  Public API:
+//    cd_init(D_in, D_hidden, D_out, seed)            -> model
+//    cd_expert_logits(model, x)                      -> [float]
+//    cd_amateur_logits(model, x)                     -> [float]
+//    cd_plausibility_mask(logits, beta)              -> [bool]
+//    cd_contrastive_score(expert_logits, amateur_logits, alpha) -> [float]
+//    cd_decode_step(model, x, alpha, beta)           -> int
+//    cd_decode_sequence(model, x, max_len, alpha, beta) -> [int]
+//    cd_train_step(model, X, Y, lr)                  -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / scoring)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── tiny math helpers ──────────────────────────────────────────────
+
+fn cd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn cd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn cd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn cd_tanh(x) {
+    let ep = cd_exp(x)
+    let en = cd_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+// ── array helpers ──────────────────────────────────────────────────
+
+fn cd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn cd_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── PRNG ───────────────────────────────────────────────────────────
+
+fn cd_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn cd_uniform(state) {
+    let s = cd_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── softmax ────────────────────────────────────────────────────────
+
+@pure
+fn cd_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut out = cd_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = cd_exp(logits[i] - mx)
+        out[i] = e
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / total }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Model initialisation
+//
+//  Expert (2-layer):
+//    W_e1 : D_hidden x D_in      h = tanh(W_e1 * x + b_e1)
+//    W_e2 : D_out x D_hidden     logits = W_e2 * h + b_e2
+//
+//  Amateur (1-layer, smaller capacity):
+//    W_a  : D_out x D_in         logits = W_a * x + b_a
+// ═══════════════════════════════════════════════════════════════════
+
+fn cd_init(D_in, D_hidden, D_out, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // expert layer 1: D_hidden x D_in
+    let mut W_e1 = cd_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_e1[i][j] = u[0] - 0.5
+        }
+    }
+    let b_e1 = cd_zeros(D_hidden)
+
+    // expert layer 2: D_out x D_hidden
+    let mut W_e2 = cd_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_e2[i][j] = u[0] - 0.5
+        }
+    }
+    let b_e2 = cd_zeros(D_out)
+
+    // amateur: D_out x D_in
+    let mut W_a = cd_zeros_2d(D_out, D_in)
+    for i in 0..D_out {
+        for j in 0..D_in {
+            let u = cd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_a[i][j] = u[0] - 0.5
+        }
+    }
+    let b_a = cd_zeros(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W_e1": W_e1,
+        "b_e1": b_e1,
+        "W_e2": W_e2,
+        "b_e2": b_e2,
+        "W_a": W_a,
+        "b_a": b_a
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Expert forward: 2-layer MLP -> logits
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_expert_logits(model, x) {
+    let W_e1 = model["W_e1"]
+    let b_e1 = model["b_e1"]
+    let W_e2 = model["W_e2"]
+    let b_e2 = model["b_e2"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+
+    // hidden = tanh(W_e1 * x + b_e1)
+    let mut hidden = cd_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_e1[i]
+        for j in 0..D_in { s = s + W_e1[i][j] * x[j] }
+        hidden[i] = cd_tanh(s)
+    }
+
+    // logits = W_e2 * hidden + b_e2
+    let mut logits = cd_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_e2[i]
+        for j in 0..D_hidden { s = s + W_e2[i][j] * hidden[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Amateur forward: 1-layer linear -> logits
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_amateur_logits(model, x) {
+    let W_a = model["W_a"]
+    let b_a = model["b_a"]
+    let D_in = model["D_in"]
+    let D_out = model["D_out"]
+
+    let mut logits = cd_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b_a[i]
+        for j in 0..D_in { s = s + W_a[i][j] * x[j] }
+        logits[i] = s
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Plausibility mask
+//  V_head = { t : p_expert(t) >= beta * max_t' p_expert(t') }
+//  Returns array of booleans (1 = plausible, 0 = masked)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_plausibility_mask(logits, beta) {
+    let probs = cd_softmax(logits)
+    let n = len(probs)
+    let mut mx = probs[0]
+    for i in 1..n {
+        if probs[i] > mx { mx = probs[i] }
+    }
+    let threshold = beta * mx
+    let mut mask = []
+    for i in 0..n {
+        if probs[i] >= threshold {
+            mask = mask + [1]
+        } else {
+            mask = mask + [0]
+        }
+    }
+    return mask
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Contrastive score
+//  score(t) = log p_expert(t) - alpha * log p_amateur(t)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_contrastive_score(expert_logits, amateur_logits, alpha) {
+    let p_exp = cd_softmax(expert_logits)
+    let p_ama = cd_softmax(amateur_logits)
+    let n = len(p_exp)
+    let mut scores = cd_zeros(n)
+    for i in 0..n {
+        let mut pe = p_exp[i]
+        if pe < 1.0e-12 { pe = 1.0e-12 }
+        let mut pa = p_ama[i]
+        if pa < 1.0e-12 { pa = 1.0e-12 }
+        scores[i] = cd_log(pe) - alpha * cd_log(pa)
+    }
+    return scores
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decode one step: apply mask then pick argmax of contrastive score
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_decode_step(model, x, alpha, beta) {
+    let e_logits = cd_expert_logits(model, x)
+    let a_logits = cd_amateur_logits(model, x)
+    let mask = cd_plausibility_mask(e_logits, beta)
+    let scores = cd_contrastive_score(e_logits, a_logits, alpha)
+    let n = len(scores)
+
+    let mut best_score = -1.0e30
+    let mut best_idx = 0
+    for i in 0..n {
+        if mask[i] == 1 {
+            if scores[i] > best_score {
+                best_score = scores[i]
+                best_idx = i
+            }
+        }
+    }
+    return best_idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decode sequence: autoregressive generation
+//  Uses a simple context embedding: average of one-hot token vectors
+//  projected through a learned context (re-uses expert layer 1 input).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn cd_decode_sequence(model, x, max_len, alpha, beta) {
+    let D_in = model["D_in"]
+    let mut tokens = []
+    let mut ctx = cd_zeros(D_in)
+    // initialise context from input x
+    for j in 0..D_in { ctx[j] = x[j] }
+
+    for _step in 0..max_len {
+        let token = cd_decode_step(model, ctx, alpha, beta)
+        tokens = tokens + [token]
+        // update context: blend current with token signal
+        let D_out = model["D_out"]
+        let signal = to_float(token) / to_float(D_out)
+        for j in 0..D_in {
+            ctx[j] = ctx[j] * 0.8 + signal * 0.2
+        }
+    }
+    return tokens
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step (expert only, cross-entropy on target labels)
+//
+//  Expert 2-layer:
+//    h = tanh(W_e1 * x + b_e1)
+//    logits = W_e2 * h + b_e2
+//    p = softmax(logits)
+//    loss = -log(p[y])
+//
+//  Gradients:
+//    u = p - onehot(y)                          (D_out)
+//    dW_e2 = u * h^T                            (D_out x D_hidden)
+//    db_e2 = u                                  (D_out)
+//    grad_h = W_e2^T * u                        (D_hidden)
+//    delta_h = grad_h * (1 - h^2)               (tanh derivative)
+//    dW_e1 = delta_h * x^T                      (D_hidden x D_in)
+//    db_e1 = delta_h                            (D_hidden)
+//
+//  Amateur 1-layer:
+//    logits_a = W_a * x + b_a
+//    p_a = softmax(logits_a)
+//    u_a = p_a - onehot(y)
+//    dW_a = u_a * x^T
+//    db_a = u_a
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn cd_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+
+    let W_e1 = model["W_e1"]
+    let b_e1 = model["b_e1"]
+    let W_e2 = model["W_e2"]
+    let b_e2 = model["b_e2"]
+    let W_a = model["W_a"]
+    let b_a = model["b_a"]
+
+    // gradient accumulators
+    let mut gW_e1 = cd_zeros_2d(D_hidden, D_in)
+    let mut gb_e1 = cd_zeros(D_hidden)
+    let mut gW_e2 = cd_zeros_2d(D_out, D_hidden)
+    let mut gb_e2 = cd_zeros(D_out)
+    let mut gW_a = cd_zeros_2d(D_out, D_in)
+    let mut gb_a = cd_zeros(D_out)
+
+    for i in 0..N {
+        let x = X[i]
+        let y = Y[i]
+
+        // ── expert forward ─────────────────────────────────
+        let mut hidden = cd_zeros(D_hidden)
+        for hi in 0..D_hidden {
+            let mut s = b_e1[hi]
+            for ji in 0..D_in { s = s + W_e1[hi][ji] * x[ji] }
+            hidden[hi] = cd_tanh(s)
+        }
+        let mut logits_e = cd_zeros(D_out)
+        for oi in 0..D_out {
+            let mut s = b_e2[oi]
+            for ji in 0..D_hidden { s = s + W_e2[oi][ji] * hidden[ji] }
+            logits_e[oi] = s
+        }
+        let p_e = cd_softmax(logits_e)
+        let mut u_e = cd_zeros(D_out)
+        for oi in 0..D_out {
+            u_e[oi] = p_e[oi]
+            if oi == y { u_e[oi] = u_e[oi] - 1.0 }
+        }
+
+        // grad W_e2, b_e2
+        for oi in 0..D_out {
+            gb_e2[oi] = gb_e2[oi] + u_e[oi]
+            for ji in 0..D_hidden {
+                gW_e2[oi][ji] = gW_e2[oi][ji] + u_e[oi] * hidden[ji]
+            }
+        }
+
+        // grad hidden -> backprop through tanh
+        let mut grad_h = cd_zeros(D_hidden)
+        for ji in 0..D_hidden {
+            let mut s = 0.0
+            for oi in 0..D_out { s = s + u_e[oi] * W_e2[oi][ji] }
+            grad_h[ji] = s
+        }
+        let mut delta_h = cd_zeros(D_hidden)
+        for ji in 0..D_hidden {
+            delta_h[ji] = grad_h[ji] * (1.0 - hidden[ji] * hidden[ji])
+        }
+
+        // grad W_e1, b_e1
+        for hi in 0..D_hidden {
+            gb_e1[hi] = gb_e1[hi] + delta_h[hi]
+            for ji in 0..D_in {
+                gW_e1[hi][ji] = gW_e1[hi][ji] + delta_h[hi] * x[ji]
+            }
+        }
+
+        // ── amateur forward ────────────────────────────────
+        let mut logits_a = cd_zeros(D_out)
+        for oi in 0..D_out {
+            let mut s = b_a[oi]
+            for ji in 0..D_in { s = s + W_a[oi][ji] * x[ji] }
+            logits_a[oi] = s
+        }
+        let p_a = cd_softmax(logits_a)
+        let mut u_a = cd_zeros(D_out)
+        for oi in 0..D_out {
+            u_a[oi] = p_a[oi]
+            if oi == y { u_a[oi] = u_a[oi] - 1.0 }
+        }
+
+        // grad W_a, b_a
+        for oi in 0..D_out {
+            gb_a[oi] = gb_a[oi] + u_a[oi]
+            for ji in 0..D_in {
+                gW_a[oi][ji] = gW_a[oi][ji] + u_a[oi] * x[ji]
+            }
+        }
+    }
+
+    // ── apply gradients ────────────────────────────────────────
+    let inv_n = 1.0 / to_float(N)
+
+    let mut W_e1_new = cd_zeros_2d(D_hidden, D_in)
+    let mut b_e1_new = cd_zeros(D_hidden)
+    for hi in 0..D_hidden {
+        b_e1_new[hi] = b_e1[hi] - lr * gb_e1[hi] * inv_n
+        for ji in 0..D_in {
+            W_e1_new[hi][ji] = W_e1[hi][ji] - lr * gW_e1[hi][ji] * inv_n
+        }
+    }
+
+    let mut W_e2_new = cd_zeros_2d(D_out, D_hidden)
+    let mut b_e2_new = cd_zeros(D_out)
+    for oi in 0..D_out {
+        b_e2_new[oi] = b_e2[oi] - lr * gb_e2[oi] * inv_n
+        for ji in 0..D_hidden {
+            W_e2_new[oi][ji] = W_e2[oi][ji] - lr * gW_e2[oi][ji] * inv_n
+        }
+    }
+
+    let mut W_a_new = cd_zeros_2d(D_out, D_in)
+    let mut b_a_new = cd_zeros(D_out)
+    for oi in 0..D_out {
+        b_a_new[oi] = b_a[oi] - lr * gb_a[oi] * inv_n
+        for ji in 0..D_in {
+            W_a_new[oi][ji] = W_a[oi][ji] - lr * gW_a[oi][ji] * inv_n
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W_e1": W_e1_new,
+        "b_e1": b_e1_new,
+        "W_e2": W_e2_new,
+        "b_e2": b_e2_new,
+        "W_a": W_a_new,
+        "b_a": b_a_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

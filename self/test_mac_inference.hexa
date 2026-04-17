@@ -22,7 +22,722 @@
 //  Run: ./hexa self/test_mac_inference.hexa
 // ===================================================================
 
-import "ml/mac_inference.hexa"
+// -- inlined from self/ml/mac_inference.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/mac_inference.hexa — Mac Inference Engine (#181)
+//
+//  @attr-chain optimized transformer inference engine targeting
+//  Apple Silicon via Accelerate BLAS (cblas_sgemm).
+//  Mirrors self/ml/gpu_inference.hexa but runs on Mac/CPU.
+//
+//  Architecture (matches gpu_inference.hexa dimensions):
+//    dim=512, heads=8, head_d=64, ff=1536, vocab=32000, layers=8
+//
+//  Forward pass:
+//    1. Token embedding lookup
+//    2. For each layer:
+//       a. RMS Norm (pre-norm)
+//       b. Self-attention (Q, K, V projections + scaled dot-product)
+//       c. Residual add
+//       d. RMS Norm (pre-norm)
+//       e. SwiGLU FFN (gate, up, down projections)
+//       f. Residual add
+//    3. Final RMS Norm
+//    4. LM head -> logits
+//
+//  Two modes:
+//    mac_prefill(model, tokens, n_tokens) — process full sequence
+//    mac_decode(model, token_id, pos)     — single token with KV-cache
+//
+//  @attr integration:
+//    @lowrank(r=4)   — Wq, Wk, Wv, W_gate, W_up, W_down (reduced dims)
+//    @fuse           — QKV projection fused, FFN gate+up fused
+//    @sparse(ratio=0.5) — attention masking for long sequences
+//    @memoize        — KV-cache automatic via prefix_cache semantics
+//
+//  Accelerate vs fallback:
+//    If has_accelerate() is true at init, use acc_matmul for BLAS.
+//    Otherwise, pure hexa matmul (triple nested loop).
+//    Flag stored in global USE_ACCELERATE.
+//
+//  KV-cache design:
+//    Global mutable flat array (HEXA arrays are by-value across fn
+//    boundaries, so struct-embedded cache loses mutations). Single
+//    flat 1D: index = ((layer * max_seq + pos) * dim + d).
+//    mac_kv_init() allocates, mac_kv_reset() zeros.
+// ===================================================================
+
+// ── Accelerate detection flag ────────────────────────────────────
+let mut USE_ACCELERATE = 0
+
+// ── Model config ─────────────────────────────────────────────────
+struct MacModelConfig {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    ff_dim: int,
+    vocab_size: int,
+    n_layers: int,
+    max_seq_len: int
+}
+
+fn mac_default_config() {
+    return MacModelConfig {
+        dim: 512,
+        n_heads: 8,
+        head_dim: 64,
+        ff_dim: 1536,
+        vocab_size: 32000,
+        n_layers: 8,
+        max_seq_len: 2048
+    }
+}
+
+fn mac_small_config() {
+    return MacModelConfig {
+        dim: 4,
+        n_heads: 2,
+        head_dim: 2,
+        ff_dim: 8,
+        vocab_size: 16,
+        n_layers: 2,
+        max_seq_len: 32
+    }
+}
+
+// ── Model struct (immutable weights only) ────────────────────────
+// KV-cache lives in global mutable arrays (see below).
+struct MacModel {
+    config: MacModelConfig,
+    W_emb: array,
+    Wq: array,
+    Wk: array,
+    Wv: array,
+    Wo: array,
+    W_gate: array,
+    W_up: array,
+    W_down: array,
+    W_norm: array,
+    W_lm_head: array
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Math helpers (prefixed mi_ to avoid collision)
+// ═══════════════════════════════════════════════════════════════
+
+fn mi_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mi_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn mi_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < 0.0 - 20.0 { v = 0.0 - 20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+// ── Deterministic LCG RNG ────────────────────────────────────────
+let mut MI_RNG = 12345
+
+fn mi_rand() {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let nxt = (a * MI_RNG + c) % m
+    MI_RNG = nxt
+    return to_float(nxt) / 2147483648.0
+}
+
+fn mi_rand_init(x, scale) {
+    let u = mi_rand() * 2.0 - 1.0
+    return u * scale
+}
+
+// ── Array helpers ────────────────────────────────────────────────
+
+fn mi_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mi_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn mi_init_vec(n, scale) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [mi_rand_init(0, scale)]
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Global KV-cache
+//  Flat 1D mutable arrays. Index = (layer * max_seq + pos) * dim + d
+//  This avoids HEXA's by-value array semantics across fn boundaries.
+// ═══════════════════════════════════════════════════════════════
+
+let mut MAC_KV_KEYS = [0.0]
+let mut MAC_KV_VALS = [0.0]
+let mut MAC_KV_POS = 0
+let mut MAC_KV_DIM = 0
+let mut MAC_KV_MAX_SEQ = 0
+let mut MAC_KV_NLAYERS = 0
+
+fn mac_kv_init(n_layers, max_seq, dim) {
+    let total = n_layers * max_seq * dim
+    MAC_KV_KEYS = mi_zeros(total)
+    MAC_KV_VALS = mi_zeros(total)
+    MAC_KV_POS = 0
+    MAC_KV_DIM = dim
+    MAC_KV_MAX_SEQ = max_seq
+    MAC_KV_NLAYERS = n_layers
+    return 0
+}
+
+fn mac_kv_reset() {
+    let total = MAC_KV_NLAYERS * MAC_KV_MAX_SEQ * MAC_KV_DIM
+    MAC_KV_KEYS = mi_zeros(total)
+    MAC_KV_VALS = mi_zeros(total)
+    MAC_KV_POS = 0
+    return 0
+}
+
+fn mac_kv_idx(layer, pos, d) {
+    return (layer * MAC_KV_MAX_SEQ + pos) * MAC_KV_DIM + d
+}
+
+fn mac_kv_store(layer, pos, k_vec, v_vec) {
+    for d in 0..MAC_KV_DIM {
+        let idx = mac_kv_idx(layer, pos, d)
+        MAC_KV_KEYS[idx] = k_vec[d]
+        MAC_KV_VALS[idx] = v_vec[d]
+    }
+    return 0
+}
+
+fn mac_kv_get_key(layer, pos) {
+    let mut out = mi_zeros(MAC_KV_DIM)
+    for d in 0..MAC_KV_DIM {
+        out[d] = MAC_KV_KEYS[mac_kv_idx(layer, pos, d)]
+    }
+    return out
+}
+
+fn mac_kv_get_val(layer, pos) {
+    let mut out = mi_zeros(MAC_KV_DIM)
+    for d in 0..MAC_KV_DIM {
+        out[d] = MAC_KV_VALS[mac_kv_idx(layer, pos, d)]
+    }
+    return out
+}
+
+fn mac_kv_get_pos() {
+    return MAC_KV_POS
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Accelerate detection
+// ═══════════════════════════════════════════════════════════════
+
+fn has_accelerate() {
+    // On macOS, Accelerate framework is always available.
+    // Check via HEXA_ACCELERATE env or platform probe.
+    let env_acc = env("HEXA_ACCELERATE")
+    if env_acc == "0" { return false }
+    if env_acc == "1" { return true }
+    // Probe Accelerate dylib
+    if file_exists("/System/Library/Frameworks/Accelerate.framework/Accelerate") {
+        return true
+    }
+    return false
+}
+
+fn mi_detect_accelerate() {
+    if has_accelerate() {
+        USE_ACCELERATE = 1
+        println("[mac_inference] Accelerate BLAS detected")
+    } else {
+        USE_ACCELERATE = 0
+        println("[mac_inference] Accelerate not found, using pure hexa matmul")
+    }
+    return USE_ACCELERATE
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Pure hexa matmul fallback
+//  C[M x N] = A[M x K] * B[K x N]   (all flat 1D arrays)
+// ═══════════════════════════════════════════════════════════════
+
+fn hexa_matmul(A, B, C, M, N, K) {
+    let mut out = C
+    for i in 0..M {
+        for j in 0..N {
+            let mut sum = 0.0
+            for k in 0..K {
+                sum = sum + A[i * K + k] * B[k * N + j]
+            }
+            out[i * N + j] = sum
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_matmul — dispatches to Accelerate or pure hexa
+//  Returns flat array [M x N]
+// ═══════════════════════════════════════════════════════════════
+// @fuse
+fn mac_matmul(A, B, M, N, K) {
+    let mut C = mi_zeros(M * N)
+    // Accelerate path would call acc_matmul(A, B, C, M, N, K)
+    // but for now we always use the pure hexa path for portability.
+    // When Accelerate FFI is fully linked, the branch activates.
+    C = hexa_matmul(A, B, C, M, N, K)
+    return C
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_embed — embedding lookup (row slice from W_emb)
+//  Returns flat [dim] vector
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_embed(model, token_id) {
+    let dim = model.config.dim
+    let base = token_id * dim
+    let mut out = []
+    for i in 0..dim {
+        out = out + [model.W_emb[base + i]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_rms_norm — RMS normalization (pure hexa)
+//  x: [n], w: [n] (per-element scale)
+//  out[i] = x[i] / rms * w[i]
+//  rms = sqrt(mean(x^2) + eps)
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_rms_norm(x, w, n) {
+    let mut ss = 0.0
+    for i in 0..n {
+        ss = ss + x[i] * x[i]
+    }
+    let mean_sq = ss / to_float(n)
+    let rms = mi_sqrt(mean_sq + 1.0e-6)
+    let inv_rms = 1.0 / rms
+    let mut out = mi_zeros(n)
+    for i in 0..n {
+        out[i] = x[i] * inv_rms * w[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_silu — SiLU activation: x * sigmoid(x)
+//  x: [n]
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_silu(x, n) {
+    let mut out = mi_zeros(n)
+    for i in 0..n {
+        let sigmoid = 1.0 / (1.0 + mi_exp(0.0 - x[i]))
+        out[i] = x[i] * sigmoid
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_softmax — numerically stable softmax over flat [n]
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_softmax(x, n) {
+    // find max
+    let mut mx = x[0]
+    for i in 1..n {
+        if x[i] > mx { mx = x[i] }
+    }
+    // exp and sum
+    let mut out = mi_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = mi_exp(x[i] - mx)
+        out[i] = e
+        total = total + e
+    }
+    // normalize
+    let inv_total = 1.0 / total
+    for i in 0..n {
+        out[i] = out[i] * inv_total
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_model_create — initialize model with small random weights
+//  Also initializes the global KV-cache.
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_model_create(config) {
+    let dim = config.dim
+    let ff = config.ff_dim
+    let vocab = config.vocab_size
+    let nl = config.n_layers
+    let max_seq = config.max_seq_len
+
+    let scale = 0.02
+
+    // Embedding: [vocab * dim]
+    let W_emb = mi_init_vec(vocab * dim, scale)
+
+    // Per-layer weights
+    let mut Wq = []
+    let mut Wk = []
+    let mut Wv = []
+    let mut Wo = []
+    let mut W_gate = []
+    let mut W_up = []
+    let mut W_down = []
+    let mut W_norm = []
+
+    for _l in 0..nl {
+        Wq = Wq + [mi_init_vec(dim * dim, scale)]
+        Wk = Wk + [mi_init_vec(dim * dim, scale)]
+        Wv = Wv + [mi_init_vec(dim * dim, scale)]
+        Wo = Wo + [mi_init_vec(dim * dim, scale)]
+        W_gate = W_gate + [mi_init_vec(dim * ff, scale)]
+        W_up = W_up + [mi_init_vec(dim * ff, scale)]
+        W_down = W_down + [mi_init_vec(ff * dim, scale)]
+        W_norm = W_norm + [mi_ones(dim)]
+    }
+
+    // LM head: [dim * vocab]
+    let W_lm_head = mi_init_vec(dim * vocab, scale)
+
+    // Initialize global KV-cache
+    let _ = mac_kv_init(nl, max_seq, dim)
+
+    return MacModel {
+        config: config,
+        W_emb: W_emb,
+        Wq: Wq,
+        Wk: Wk,
+        Wv: Wv,
+        Wo: Wo,
+        W_gate: W_gate,
+        W_up: W_up,
+        W_down: W_down,
+        W_norm: W_norm,
+        W_lm_head: W_lm_head
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_attention — multi-head attention for single token
+//
+//  @attr documentation:
+//    @lowrank(r=4) applied to Wq, Wk, Wv — reduces matmul dims
+//    @fuse QKV projection fused into sequential matmuls
+//    @sparse(ratio=0.5) attention masking for long sequences
+//
+//  x: [dim], pos: current position, seq_len: total filled length
+//  Uses global KV-cache: stores new K/V at pos, reads 0..seq_len
+//  Returns [dim]
+// ═══════════════════════════════════════════════════════════════
+// @lowrank(r=4) @fuse @sparse(ratio=0.5)
+fn mac_attention(model, layer, x, pos, seq_len) {
+    let dim = model.config.dim
+    let n_heads = model.config.n_heads
+    let head_dim = model.config.head_dim
+    let kv_len = seq_len
+
+    // Q, K, V projections: x[dim] @ W[dim x dim] -> [dim]
+    // @fuse: QKV fused into sequential matmuls sharing same input
+    let Q = mac_matmul(x, model.Wq[layer], 1, dim, dim)
+    let K_new = mac_matmul(x, model.Wk[layer], 1, dim, dim)
+    let V_new = mac_matmul(x, model.Wv[layer], 1, dim, dim)
+
+    // Store new K, V in global cache at position pos
+    let _ = mac_kv_store(layer, pos, K_new, V_new)
+
+    // Multi-head attention
+    let mut attn_out = mi_zeros(dim)
+    let scale = 1.0 / mi_sqrt(to_float(head_dim))
+
+    for h in 0..n_heads {
+        let h_off = h * head_dim
+
+        // Extract Q head
+        let mut q_h = mi_zeros(head_dim)
+        for d in 0..head_dim { q_h[d] = Q[h_off + d] }
+
+        // Compute attention scores over all cached positions
+        let mut scores = mi_zeros(kv_len)
+        for p in 0..kv_len {
+            let k_p = mac_kv_get_key(layer, p)
+            let mut dot = 0.0
+            for d in 0..head_dim {
+                dot = dot + q_h[d] * k_p[h_off + d]
+            }
+            scores[p] = dot * scale
+        }
+
+        // Causal mask: mask future positions (> pos)
+        for p in 0..kv_len {
+            if p > pos {
+                scores[p] = 0.0 - 1.0e9
+            }
+        }
+
+        // Softmax
+        let probs = mac_softmax(scores, kv_len)
+
+        // Weighted sum of V heads
+        let mut head_out = mi_zeros(head_dim)
+        for p in 0..kv_len {
+            let v_p = mac_kv_get_val(layer, p)
+            for d in 0..head_dim {
+                head_out[d] = head_out[d] + probs[p] * v_p[h_off + d]
+            }
+        }
+
+        // Write head output back to full dim
+        for d in 0..head_dim {
+            attn_out[h_off + d] = head_out[d]
+        }
+    }
+
+    // Output projection: [dim] @ Wo[dim x dim] -> [dim]
+    let proj = mac_matmul(attn_out, model.Wo[layer], 1, dim, dim)
+    return proj
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_ffn — SwiGLU FFN
+//
+//  @attr documentation:
+//    @lowrank(r=4) applied to W_gate, W_up, W_down
+//    @fuse gate and up projections fused (same input)
+//
+//  hidden = silu(x @ W_gate) * (x @ W_up)
+//  out    = hidden @ W_down
+//  Returns [dim]
+// ═══════════════════════════════════════════════════════════════
+// @lowrank(r=4) @fuse
+fn mac_ffn(model, layer, x) {
+    let dim = model.config.dim
+    let ff = model.config.ff_dim
+
+    // @fuse: gate and up projections share input x
+    let gate_pre = mac_matmul(x, model.W_gate[layer], 1, ff, dim)
+    let gate = mac_silu(gate_pre, ff)
+    let up = mac_matmul(x, model.W_up[layer], 1, ff, dim)
+
+    // Element-wise multiply: gate * up
+    let mut hidden = mi_zeros(ff)
+    for i in 0..ff {
+        hidden[i] = gate[i] * up[i]
+    }
+
+    // Down projection: [ff] -> [dim]
+    let out = mac_matmul(hidden, model.W_down[layer], 1, dim, ff)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Residual add: a + b element-wise
+// ═══════════════════════════════════════════════════════════════
+
+fn mi_vec_add(a, b, n) {
+    let mut out = mi_zeros(n)
+    for i in 0..n {
+        out[i] = a[i] + b[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_forward — single token forward pass through all layers
+//
+//  @attr documentation:
+//    @memoize — KV-cache provides implicit memoization
+//
+//  token_id: int, pos: current sequence position
+//  Returns logits [vocab_size]
+// ═══════════════════════════════════════════════════════════════
+// @memoize
+fn mac_forward(model, token_id, pos) {
+    let dim = model.config.dim
+    let vocab = model.config.vocab_size
+    let nl = model.config.n_layers
+    let seq_len = pos + 1
+
+    // 1. Embedding lookup
+    let mut x = mac_embed(model, token_id)
+
+    // 2. Transformer layers
+    for l in 0..nl {
+        // Pre-norm
+        let x_norm = mac_rms_norm(x, model.W_norm[l], dim)
+
+        // Self-attention (writes to global KV-cache)
+        let attn_out = mac_attention(model, l, x_norm, pos, seq_len)
+
+        // Residual
+        x = mi_vec_add(x, attn_out, dim)
+
+        // FFN pre-norm
+        let x_norm2 = mac_rms_norm(x, model.W_norm[l], dim)
+
+        // FFN
+        let ffn_out = mac_ffn(model, l, x_norm2)
+
+        // Residual
+        x = mi_vec_add(x, ffn_out, dim)
+    }
+
+    // 3. Final RMS norm (use layer 0 norm weights as final norm)
+    let x_final = mac_rms_norm(x, model.W_norm[0], dim)
+
+    // 4. LM head: x_final[dim] @ W_lm_head[dim x vocab] -> logits[vocab]
+    let logits = mac_matmul(x_final, model.W_lm_head, 1, vocab, dim)
+
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_prefill — process full prompt sequence
+//  tokens: array of token ids, n_tokens: int
+//  Populates global KV-cache for positions 0..n_tokens-1
+//  Returns logits for last token [vocab_size]
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_prefill(model, tokens, n_tokens) {
+    let mut logits = []
+    for i in 0..n_tokens {
+        logits = mac_forward(model, tokens[i], i)
+    }
+    MAC_KV_POS = n_tokens
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_decode — single token decode using KV-cache
+//  token_id: int, pos: current position
+//  Global KV-cache already populated for 0..pos-1
+//  Returns logits [vocab_size]
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_decode(model, token_id, pos) {
+    let logits = mac_forward(model, token_id, pos)
+    MAC_KV_POS = pos + 1
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_logits_to_token — argmax over logits
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_logits_to_token(logits, vocab_size) {
+    let mut best_idx = 0
+    let mut best_val = logits[0]
+    for i in 1..vocab_size {
+        if logits[i] > best_val {
+            best_val = logits[i]
+            best_idx = i
+        }
+    }
+    return best_idx
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_generate — full generation loop
+//  prompt_tokens: array of token ids
+//  n_prompt: length of prompt
+//  max_new: max new tokens to generate
+//  Returns array of generated token ids (excluding prompt)
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_generate(model, prompt_tokens, n_prompt, max_new) {
+    let vocab = model.config.vocab_size
+
+    // Prefill phase
+    let mut logits = mac_prefill(model, prompt_tokens, n_prompt)
+
+    // First generated token from prefill logits
+    let mut generated = []
+    let mut next_token = mac_logits_to_token(logits, vocab)
+    generated = generated + [next_token]
+
+    // Decode loop
+    let mut pos = n_prompt
+    for _step in 1..max_new {
+        logits = mac_decode(model, next_token, pos)
+        next_token = mac_logits_to_token(logits, vocab)
+        generated = generated + [next_token]
+        pos = pos + 1
+    }
+
+    return generated
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_model_reset_cache — reset global KV-cache to empty
+//  Returns 0 (caller keeps same model ref).
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_model_reset_cache() {
+    return mac_kv_reset()
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  mac_model_info — print model summary
+// ═══════════════════════════════════════════════════════════════
+
+fn mac_model_info(model) {
+    let cfg = model.config
+    println("[mac_inference] dim=" + to_string(cfg.dim)
+        + " heads=" + to_string(cfg.n_heads)
+        + " ff=" + to_string(cfg.ff_dim)
+        + " vocab=" + to_string(cfg.vocab_size)
+        + " layers=" + to_string(cfg.n_layers)
+        + " max_seq=" + to_string(cfg.max_seq_len))
+    let param_count = cfg.vocab_size * cfg.dim
+        + cfg.n_layers * (4 * cfg.dim * cfg.dim + 2 * cfg.dim * cfg.ff_dim + cfg.ff_dim * cfg.dim + cfg.dim)
+        + cfg.dim * cfg.vocab_size
+    println("[mac_inference] ~" + to_string(param_count) + " parameters")
+    return 0
+}
+
+println("[mac_inference] module loaded — Mac Inference Engine (#181)")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

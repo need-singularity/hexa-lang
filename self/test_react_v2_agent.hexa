@@ -44,7 +44,582 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_react_v2_agent.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/react_v2_agent.hexa"
+// -- inlined from self/ml/react_v2_agent.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/react_v2_agent.hexa — ReAct v2 Agent (#220)
+//
+//  ReAct (Reason + Act) v2 extends the original 2022 ReAct prompting
+//  pattern with four upgrades:
+//    (a) Typed tools with JSON-schema-style argument descriptors
+//    (b) Parallel tool calls — N actions executed in one step
+//    (c) Self-reflection on tool observations (critique loop)
+//    (d) Budget-limited execution loop (steps + token budget)
+//
+//  Each iteration of the agent loop is structured as:
+//    Thought → Action(tool call) → Observation
+//  and the loop terminates when the reasoning function emits a
+//  "Final Answer:" marker, or when the budget is exhausted.
+//
+//  Public API (prefix react2_):
+//    react2_create_tool(name, description, schema)        → tool dict
+//    react2_create_agent(tools, max_steps, max_budget)    → agent dict
+//    react2_parse_action(action_str)                       → {tool, args}
+//    react2_format_action(tool_name, args)                 → string
+//    react2_execute_tool(tools, tool_name, args, exec_fn)  → observation
+//    react2_execute_parallel(tools, actions, exec_fn)      → [observations]
+//    react2_step(agent, state, reasoning_fn, exec_fn)      → state (with done)
+//    react2_run_loop(agent, query, reasoning_fn, exec_fn)  → final state
+//    react2_check_budget(agent, used_steps, used_tokens)   → bool
+//    react2_add_observation(state, observation)            → updated state
+//    react2_reflect(observation, reasoning_fn)             → reflection note
+//    react2_final_answer_marker(text)                      → bool
+//    react2_trace_to_history(trace)                        → [string]
+//    react2_create_state(query)                            → state dict
+//    react2_extract_final_answer(text)                     → string
+//    react2_lookup_tool(tools, name)                       → tool or empty dict
+//    react2_has_tool(tools, name)                          → bool
+//    react2_tool_count(tools)                              → int
+//
+//  Conventions:
+//    - All composite values are #{} dict literals (HX3)
+//    - No semicolons (P1)
+//    - String parsing only — no regex
+//    - Reasoning function returns a string. Format expected:
+//        "Thought: ... Action: tool(arg=val, ...)"  (intermediate)
+//        "Thought: ... Final Answer: ..."           (terminal)
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+//  String helpers (prefixed _r2_ to avoid collision with other modules)
+// ═══════════════════════════════════════════════════════════════════
+
+fn _r2_index_of(s, needle, start) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return start }
+    if nn > sn { return 0 - 1 }
+    let limit = sn - nn
+    let mut i = start
+    while i <= limit {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn _r2_contains(s, needle) {
+    return _r2_index_of(s, needle, 0) >= 0
+}
+
+fn _r2_starts_with(s, prefix) {
+    let sn = len(s)
+    let pn = len(prefix)
+    if pn > sn { return false }
+    let sub = s.substring(0, pn)
+    return sub == prefix
+}
+
+// trim is provided as a method on strings (.trim())
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tool descriptor — typed tool with JSON-schema-style args
+//  schema: dict { arg_name -> type_str } e.g. {"q":"string","limit":"int"}
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_create_tool(name, description, schema) {
+    let t = #{}
+    t["name"] = name
+    t["description"] = description
+    t["schema"] = schema
+    return t
+}
+
+// Lookup tool by name in a list (sequential — n is small)
+fn react2_lookup_tool(tools, name) {
+    let n = len(tools)
+    let mut i = 0
+    while i < n {
+        if tools[i]["name"] == name {
+            return tools[i]
+        }
+        i = i + 1
+    }
+    let empty = #{}
+    return empty
+}
+
+fn react2_has_tool(tools, name) {
+    let n = len(tools)
+    let mut i = 0
+    let mut found = false
+    while i < n {
+        if tools[i]["name"] == name { found = true }
+        i = i + 1
+    }
+    return found
+}
+
+fn react2_tool_count(tools) {
+    return len(tools)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Agent config — list of tools + budget
+//  max_steps  = hard ceiling on iterations
+//  max_budget = soft ceiling on cumulative "tokens" (caller-defined)
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_create_agent(tools, max_steps, max_budget) {
+    let a = #{}
+    a["tools"] = tools
+    a["max_steps"] = max_steps
+    a["max_budget"] = max_budget
+    a["n_tools"] = len(tools)
+    return a
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Action parsing — "tool_name(key=val, key=val)" → {tool, args}
+//  Empty input returns {tool:"", args:#{}}.
+//  Whitespace and trailing commas tolerated.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_parse_action(action_str) {
+    let out = #{}
+    out["tool"] = ""
+    out["args"] = #{}
+
+    let trimmed = action_str.trim()
+    if len(trimmed) == 0 { return out }
+
+    let paren = _r2_index_of(trimmed, "(", 0)
+    if paren < 0 {
+        // bare tool name with no args
+        out["tool"] = trimmed
+        return out
+    }
+
+    let tool_name = trimmed.substring(0, paren).trim()
+    out["tool"] = tool_name
+
+    // find matching close paren — use last ')' to be tolerant of nested
+    let close = _r2_index_of(trimmed, ")", paren)
+    let mut args_str = ""
+    if close < 0 {
+        args_str = trimmed.substring(paren + 1, len(trimmed))
+    } else {
+        args_str = trimmed.substring(paren + 1, close)
+    }
+
+    let args = #{}
+    let s = args_str.trim()
+    if len(s) == 0 {
+        out["args"] = args
+        return out
+    }
+
+    let parts = s.split(",")
+    let np = len(parts)
+    let mut i = 0
+    while i < np {
+        let part = parts[i].trim()
+        if len(part) > 0 {
+            let eq = _r2_index_of(part, "=", 0)
+            if eq > 0 {
+                let k = part.substring(0, eq).trim()
+                let v = part.substring(eq + 1, len(part)).trim()
+                args[k] = v
+            }
+        }
+        i = i + 1
+    }
+    out["args"] = args
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Format an action back to canonical "tool_name(k=v, k=v)" string.
+//  Args are emitted in their dict iteration order.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_format_action(tool_name, args) {
+    let mut out = tool_name + "("
+    let ks = keys(args)
+    let n = len(ks)
+    let mut i = 0
+    while i < n {
+        if i > 0 { out = out + ", " }
+        out = out + ks[i] + "=" + args[ks[i]]
+        i = i + 1
+    }
+    out = out + ")"
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Execute one tool — produces an observation dict.
+//  executor_fn signature: fn(tool_name, args_dict) -> string
+//  Observation = { tool, args, output, status, error }
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_execute_tool(tools, tool_name, args, executor_fn) {
+    let obs = #{}
+    obs["tool"] = tool_name
+    obs["args"] = args
+    obs["output"] = ""
+    obs["status"] = "ok"
+    obs["error"] = ""
+
+    let known = react2_has_tool(tools, tool_name)
+    if known == false {
+        obs["status"] = "error"
+        obs["error"] = "unknown tool: " + tool_name
+        obs["output"] = ""
+        return obs
+    }
+
+    let result = executor_fn(tool_name, args)
+    obs["output"] = result
+    return obs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Parallel execution — run N actions and collect observations.
+//  actions = [ {tool, args}, ... ]
+//  Returns [ observation, ... ] in input order.
+//
+//  Note: Hexa is single-threaded; "parallel" here means a single-pass
+//  scatter-gather of N tool calls. Real parallelism is the runtime's
+//  business; the API surface is the part that matters for downstream
+//  consumers (planner, scheduler).
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_execute_parallel(tools, actions, executor_fn) {
+    let n = len(actions)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let act = actions[i]
+        let obs = react2_execute_tool(tools, act["tool"], act["args"], executor_fn)
+        out = out + [obs]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  State — running record of one ReAct loop
+//  Fields:
+//    query        : original user query
+//    trace        : list of records — {kind, ...} kinds: thought | action | observation | final
+//    used_steps   : number of completed iterations
+//    used_tokens  : cumulative token cost (string lengths used as proxy)
+//    final_answer : "" until done
+//    done         : bool
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_create_state(query) {
+    let s = #{}
+    s["query"] = query
+    s["trace"] = []
+    s["used_steps"] = 0
+    s["used_tokens"] = 0
+    s["final_answer"] = ""
+    s["done"] = false
+    return s
+}
+
+fn _r2_state_clone(state) {
+    let out = #{}
+    out["query"] = state["query"]
+    out["trace"] = state["trace"]
+    out["used_steps"] = state["used_steps"]
+    out["used_tokens"] = state["used_tokens"]
+    out["final_answer"] = state["final_answer"]
+    out["done"] = state["done"]
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Append an observation record to the state's trace.
+//  observation should have keys: tool, output, status (and optionally error)
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_add_observation(state, observation) {
+    let out = _r2_state_clone(state)
+    let mut trace = out["trace"]
+    let entry = #{}
+    entry["kind"] = "observation"
+    entry["tool"] = observation["tool"]
+    entry["output"] = observation["output"]
+    entry["status"] = observation["status"]
+    trace = trace + [entry]
+    out["trace"] = trace
+    out["used_tokens"] = out["used_tokens"] + len(observation["output"])
+    return out
+}
+
+fn _r2_add_thought(state, thought_text) {
+    let out = _r2_state_clone(state)
+    let mut trace = out["trace"]
+    let entry = #{}
+    entry["kind"] = "thought"
+    entry["text"] = thought_text
+    trace = trace + [entry]
+    out["trace"] = trace
+    out["used_tokens"] = out["used_tokens"] + len(thought_text)
+    return out
+}
+
+fn _r2_add_action(state, tool_name, args) {
+    let out = _r2_state_clone(state)
+    let mut trace = out["trace"]
+    let entry = #{}
+    entry["kind"] = "action"
+    entry["tool"] = tool_name
+    entry["args"] = args
+    trace = trace + [entry]
+    out["trace"] = trace
+    out["used_tokens"] = out["used_tokens"] + len(tool_name)
+    return out
+}
+
+fn _r2_set_final(state, answer) {
+    let out = _r2_state_clone(state)
+    let mut trace = out["trace"]
+    let entry = #{}
+    entry["kind"] = "final"
+    entry["text"] = answer
+    trace = trace + [entry]
+    out["trace"] = trace
+    out["final_answer"] = answer
+    out["done"] = true
+    out["used_tokens"] = out["used_tokens"] + len(answer)
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Final-answer marker — "Final Answer:" prefix detector.
+//  We look for the literal "Final Answer:" anywhere in the text;
+//  callers can use _starts_with on a stripped variant.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_final_answer_marker(text) {
+    return _r2_contains(text, "Final Answer:")
+}
+
+fn react2_extract_final_answer(text) {
+    let marker = "Final Answer:"
+    let pos = _r2_index_of(text, marker, 0)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let tail = text.substring(start, len(text)).trim()
+    return tail
+}
+
+// Extract the action sub-string after "Action:" up to end-of-line or end-of-text
+fn _r2_extract_action_str(text) {
+    let marker = "Action:"
+    let pos = _r2_index_of(text, marker, 0)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    // up to newline if present, else end of text
+    let nl = _r2_index_of(text, "\n", start)
+    let mut end = len(text)
+    if nl >= 0 { end = nl }
+    return text.substring(start, end).trim()
+}
+
+// Extract the thought sub-string after "Thought:" up to next newline
+fn _r2_extract_thought_str(text) {
+    let marker = "Thought:"
+    let pos = _r2_index_of(text, marker, 0)
+    if pos < 0 { return "" }
+    let start = pos + len(marker)
+    let nl = _r2_index_of(text, "\n", start)
+    let mut end = len(text)
+    if nl >= 0 { end = nl }
+    return text.substring(start, end).trim()
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reflect — feed an observation to the reasoning function and ask
+//  it for a one-line critique. The reasoning function is reused as a
+//  generic LLM stand-in: caller is free to plug in any string-in,
+//  string-out callable.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_reflect(observation, reasoning_fn) {
+    let prefix = "Reflect on observation from tool "
+    let prompt = prefix + observation["tool"] + ": " + observation["output"]
+    let note = reasoning_fn(prompt)
+    if len(note) == 0 {
+        return "no-reflection"
+    }
+    return note
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Budget check — true if (used_steps < max_steps) AND
+//                          (used_tokens < max_budget)
+//  (max_budget == 0 disables the token check.)
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_check_budget(agent, used_steps, used_tokens) {
+    if used_steps >= agent["max_steps"] { return false }
+    let mb = agent["max_budget"]
+    if mb > 0 {
+        if used_tokens >= mb { return false }
+    }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  One step of the loop:
+//    1. Build prompt from query + trace
+//    2. Call reasoning_fn → text
+//    3. If "Final Answer:" detected → finalize, set done
+//    4. Else parse action, execute, append observation
+//    5. Increment used_steps
+//  Returns updated state.
+// ═══════════════════════════════════════════════════════════════════
+
+fn _r2_build_prompt(state) {
+    let mut p = "Question: " + state["query"] + "\n"
+    let trace = state["trace"]
+    let n = len(trace)
+    let mut i = 0
+    while i < n {
+        let e = trace[i]
+        let kind = e["kind"]
+        if kind == "thought" {
+            p = p + "Thought: " + e["text"] + "\n"
+        }
+        if kind == "action" {
+            p = p + "Action: " + react2_format_action(e["tool"], e["args"]) + "\n"
+        }
+        if kind == "observation" {
+            p = p + "Observation: " + e["output"] + "\n"
+        }
+        if kind == "final" {
+            p = p + "Final Answer: " + e["text"] + "\n"
+        }
+        i = i + 1
+    }
+    return p
+}
+
+fn react2_step(agent, state, reasoning_fn, executor_fn) {
+    let mut s = _r2_state_clone(state)
+    if s["done"] { return s }
+
+    let prompt = _r2_build_prompt(s)
+    let text = reasoning_fn(prompt)
+
+    // record cost roughly = output text length
+    s["used_tokens"] = s["used_tokens"] + len(text)
+
+    // parse thought (optional)
+    let th = _r2_extract_thought_str(text)
+    if len(th) > 0 {
+        s = _r2_add_thought(s, th)
+    }
+
+    if react2_final_answer_marker(text) {
+        let ans = react2_extract_final_answer(text)
+        s = _r2_set_final(s, ans)
+        s["used_steps"] = s["used_steps"] + 1
+        return s
+    }
+
+    let act_str = _r2_extract_action_str(text)
+    if len(act_str) == 0 {
+        // no action, no final answer — bail with current text as final
+        s = _r2_set_final(s, text)
+        s["used_steps"] = s["used_steps"] + 1
+        return s
+    }
+
+    let parsed = react2_parse_action(act_str)
+    let tool_name = parsed["tool"]
+    let args = parsed["args"]
+
+    s = _r2_add_action(s, tool_name, args)
+
+    let obs = react2_execute_tool(agent["tools"], tool_name, args, executor_fn)
+    s = react2_add_observation(s, obs)
+
+    s["used_steps"] = s["used_steps"] + 1
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full loop — terminates on:
+//    (a) Final Answer marker emitted by reasoning_fn, or
+//    (b) Budget exhausted (max_steps reached or max_budget reached)
+//  Returns the terminal state. If no final answer, state["final_answer"]
+//  is "" and state["done"] may be false.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_run_loop(agent, initial_query, reasoning_fn, executor_fn) {
+    let mut state = react2_create_state(initial_query)
+    let mut keep_going = true
+    while keep_going {
+        let in_budget = react2_check_budget(agent, state["used_steps"], state["used_tokens"])
+        if in_budget == false { keep_going = false }
+        if keep_going {
+            state = react2_step(agent, state, reasoning_fn, executor_fn)
+            if state["done"] { keep_going = false }
+        }
+    }
+    return state
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Trace → readable history. Returns a list of strings, one per record.
+// ═══════════════════════════════════════════════════════════════════
+
+fn react2_trace_to_history(trace) {
+    let n = len(trace)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let e = trace[i]
+        let kind = e["kind"]
+        let mut line = ""
+        if kind == "thought" {
+            line = "Thought: " + e["text"]
+        }
+        if kind == "action" {
+            line = "Action: " + react2_format_action(e["tool"], e["args"])
+        }
+        if kind == "observation" {
+            line = "Observation: " + e["output"]
+        }
+        if kind == "final" {
+            line = "Final Answer: " + e["text"]
+        }
+        out = out + [line]
+        i = i + 1
+    }
+    return out
+}
+
+println("[react_v2_agent] module loaded")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

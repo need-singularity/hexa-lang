@@ -2,7 +2,560 @@
 //  test_sigma_reparam.hexa — Sigma Reparameterization (#321)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/sigma_reparam.hexa"
+// -- inlined from self/ml/sigma_reparam.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/sigma_reparam.hexa — Sigma Reparameterization (#321)
+//
+//  Zhai et al., 2023 — reparameterize weight matrices by their
+//  spectral norm for training stability.
+//
+//  Instead of W, use W * (gamma / sigma(W)) where:
+//    sigma(W) = largest singular value (power iteration approx)
+//    gamma    = learnable scalar, initialized to sigma(W)
+//
+//  This prevents entropy collapse in attention and stabilizes
+//  training of deep networks without constraining expressiveness.
+//
+//  Architecture (2-layer MLP with sigma-reparam on each weight):
+//      h = tanh( W1_reparam * x + b1 )    D_in -> D_hidden
+//      y = W2_reparam * h + b2             D_hidden -> D_out
+//
+//  API:
+//    sr_init(D_in, D_hidden, D_out, seed) -> model
+//    sr_power_iteration(W, v, n_iter)      -> sigma
+//    sr_reparam(W, gamma, v)               -> [W_reparam, v_new]
+//    sr_forward(model, x)                  -> output
+//    sr_spectral_norms(model)              -> [sigma1, sigma2]
+//    sr_loss(model, X, Y)                  -> float
+//    sr_train_step(model, X, Y, lr)        -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / spectral_norms / loss)
+//    @hot   (train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+fn sr_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn sr_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sr_tanh(inp) {
+    let e_pos = sr_exp(inp)
+    let e_neg = sr_exp(0.0 - inp)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn sr_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut g = inp / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + inp / g) / 2.0
+    }
+    return g
+}
+
+fn sr_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sr_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn sr_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn sr_uniform(state) {
+    let s = sr_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Power iteration: approximate largest singular value of W
+//
+//  W is rows x cols. v is a unit vector of length cols.
+//  Iterates: u = W v / |W v|,  v = W^T u / |W^T u|
+//  Then sigma = u^T W v
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sr_power_iteration(W, v, n_iter) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut v_cur = sr_zeros_f(cols)
+    for j in 0..cols { v_cur[j] = v[j] }
+
+    let mut u_cur = sr_zeros_f(rows)
+
+    for _it in 0..n_iter {
+        // u = W * v_cur
+        for i in 0..rows {
+            let mut s = 0.0
+            for j in 0..cols { s = s + W[i][j] * v_cur[j] }
+            u_cur[i] = s
+        }
+        // normalize u
+        let mut norm_u = 0.0
+        for i in 0..rows { norm_u = norm_u + u_cur[i] * u_cur[i] }
+        norm_u = sr_sqrt(norm_u)
+        if norm_u < 1.0e-12 { norm_u = 1.0e-12 }
+        for i in 0..rows { u_cur[i] = u_cur[i] / norm_u }
+
+        // v = W^T * u_cur
+        for j in 0..cols {
+            let mut s = 0.0
+            for i in 0..rows { s = s + W[i][j] * u_cur[i] }
+            v_cur[j] = s
+        }
+        // normalize v
+        let mut norm_v = 0.0
+        for j in 0..cols { norm_v = norm_v + v_cur[j] * v_cur[j] }
+        norm_v = sr_sqrt(norm_v)
+        if norm_v < 1.0e-12 { norm_v = 1.0e-12 }
+        for j in 0..cols { v_cur[j] = v_cur[j] / norm_v }
+    }
+
+    // sigma = u^T W v
+    let mut sigma = 0.0
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols { s = s + W[i][j] * v_cur[j] }
+        sigma = sigma + u_cur[i] * s
+    }
+    if sigma < 1.0e-12 { sigma = 1.0e-12 }
+    return sigma
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Power iteration returning updated v vector as well
+// ═══════════════════════════════════════════════════════════════════
+fn sr_power_iteration_full(W, v, n_iter) {
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut v_cur = sr_zeros_f(cols)
+    for j in 0..cols { v_cur[j] = v[j] }
+
+    let mut u_cur = sr_zeros_f(rows)
+
+    for _it in 0..n_iter {
+        for i in 0..rows {
+            let mut s = 0.0
+            for j in 0..cols { s = s + W[i][j] * v_cur[j] }
+            u_cur[i] = s
+        }
+        let mut norm_u = 0.0
+        for i in 0..rows { norm_u = norm_u + u_cur[i] * u_cur[i] }
+        norm_u = sr_sqrt(norm_u)
+        if norm_u < 1.0e-12 { norm_u = 1.0e-12 }
+        for i in 0..rows { u_cur[i] = u_cur[i] / norm_u }
+
+        for j in 0..cols {
+            let mut s = 0.0
+            for i in 0..rows { s = s + W[i][j] * u_cur[i] }
+            v_cur[j] = s
+        }
+        let mut norm_v = 0.0
+        for j in 0..cols { norm_v = norm_v + v_cur[j] * v_cur[j] }
+        norm_v = sr_sqrt(norm_v)
+        if norm_v < 1.0e-12 { norm_v = 1.0e-12 }
+        for j in 0..cols { v_cur[j] = v_cur[j] / norm_v }
+    }
+
+    let mut sigma = 0.0
+    for i in 0..rows {
+        let mut s = 0.0
+        for j in 0..cols { s = s + W[i][j] * v_cur[j] }
+        sigma = sigma + u_cur[i] * s
+    }
+    if sigma < 1.0e-12 { sigma = 1.0e-12 }
+    return [sigma, v_cur]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Reparameterize: W_reparam = W * (gamma / sigma(W))
+//  Returns [W_reparam, v_new] so v can be reused next iteration
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sr_reparam(W, gamma, v) {
+    let result = sr_power_iteration_full(W, v, 3)
+    let sigma = result[0]
+    let v_new = result[1]
+    let scale = gamma / sigma
+    let rows = len(W)
+    let cols = len(W[0])
+    let mut W_rep = sr_zeros_2d(rows, cols)
+    for i in 0..rows {
+        for j in 0..cols {
+            W_rep[i][j] = W[i][j] * scale
+        }
+    }
+    return [W_rep, v_new]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Init model
+//    W1: D_hidden x D_in    (Xavier-like uniform)
+//    b1: D_hidden
+//    W2: D_out x D_hidden
+//    b2: D_out
+//    gamma1, gamma2: learnable scalars (init to sigma(W))
+//    v1: power iteration vector for W1 (length D_in)
+//    v2: power iteration vector for W2 (length D_hidden)
+// ═══════════════════════════════════════════════════════════════════
+fn sr_init(D_in, D_hidden, D_out, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // W1: D_hidden x D_in
+    let mut W1 = sr_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = sr_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = u[0] - 0.5
+        }
+    }
+    let b1 = sr_zeros_f(D_hidden)
+
+    // W2: D_out x D_hidden
+    let mut W2 = sr_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            let u = sr_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W2[i][j] = u[0] - 0.5
+        }
+    }
+    let b2 = sr_zeros_f(D_out)
+
+    // Init v1 (unit vector, length D_in)
+    let mut v1 = sr_zeros_f(D_in)
+    let mut n1 = 0.0
+    for j in 0..D_in {
+        let u = sr_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        v1[j] = u[0] - 0.5
+        n1 = n1 + v1[j] * v1[j]
+    }
+    n1 = sr_sqrt(n1)
+    if n1 < 1.0e-12 { n1 = 1.0 }
+    for j in 0..D_in { v1[j] = v1[j] / n1 }
+
+    // Init v2 (unit vector, length D_hidden)
+    let mut v2 = sr_zeros_f(D_hidden)
+    let mut n2 = 0.0
+    for j in 0..D_hidden {
+        let u = sr_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        v2[j] = u[0] - 0.5
+        n2 = n2 + v2[j] * v2[j]
+    }
+    n2 = sr_sqrt(n2)
+    if n2 < 1.0e-12 { n2 = 1.0 }
+    for j in 0..D_hidden { v2[j] = v2[j] / n2 }
+
+    // gamma1 = sigma(W1), gamma2 = sigma(W2)  (so W_reparam = W at init)
+    let sigma1 = sr_power_iteration(W1, v1, 10)
+    let sigma2 = sr_power_iteration(W2, v2, 10)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "gamma1": sigma1,
+        "gamma2": sigma2,
+        "v1": v1,
+        "v2": v2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward pass: reparameterize then compute
+//    h = tanh(W1_rep * x + b1)
+//    y = W2_rep * h + b2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sr_forward(model, x) {
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W1 = model["W1"]
+    let W2 = model["W2"]
+    let b1 = model["b1"]
+    let b2 = model["b2"]
+    let gamma1 = model["gamma1"]
+    let gamma2 = model["gamma2"]
+    let v1 = model["v1"]
+    let v2 = model["v2"]
+
+    // Reparameterize W1
+    let rep1 = sr_reparam(W1, gamma1, v1)
+    let W1r = rep1[0]
+
+    // Hidden layer
+    let mut h = sr_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..D_in { s = s + W1r[i][j] * x[j] }
+        h[i] = sr_tanh(s)
+    }
+
+    // Reparameterize W2
+    let rep2 = sr_reparam(W2, gamma2, v2)
+    let W2r = rep2[0]
+
+    // Output layer
+    let mut out = sr_zeros_f(D_out)
+    for i in 0..D_out {
+        let mut s = b2[i]
+        for j in 0..D_hidden { s = s + W2r[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Spectral norms of both weight matrices
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sr_spectral_norms(model) {
+    let W1 = model["W1"]
+    let W2 = model["W2"]
+    let v1 = model["v1"]
+    let v2 = model["v2"]
+    let s1 = sr_power_iteration(W1, v1, 5)
+    let s2 = sr_power_iteration(W2, v2, 5)
+    return [s1, s2]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  MSE loss over batch
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sr_loss(model, X, Y) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let D_out = model["D_out"]
+    let mut total = 0.0
+    for i in 0..N {
+        let pred = sr_forward(model, X[i])
+        for k in 0..D_out {
+            let diff = pred[k] - Y[i][k]
+            total = total + diff * diff
+        }
+    }
+    return total / to_float(N)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step (numerical gradient, sigma-reparam aware)
+//
+//  Gradients for W1, b1, W2, b2, gamma1, gamma2 via finite diff.
+//  The v vectors are updated via power iteration each step.
+//
+//  NOTE: We use analytic gradients for the main weights and biases,
+//  and finite difference only for gamma (cheap, scalar).
+//
+//  Analytic grad through reparam:
+//    W1_rep = W1 * (gamma1 / sigma1)
+//    d(loss)/d(W1[i][j]) = d(loss)/d(W1_rep[i][j]) * gamma1/sigma1
+//      (ignoring d(sigma)/d(W) which is second order)
+//    d(loss)/d(gamma1) = sum_ij d(loss)/d(W1_rep[i][j]) * W1[i][j]/sigma1
+//
+//  For a 2-layer MLP with MSE:
+//    d(loss)/d(out) = 2*(pred - y) / N
+//    d(loss)/d(W2_rep) = delta_out * h^T
+//    d(loss)/d(h) = W2_rep^T * delta_out
+//    delta_h = d(loss)/d(h) * (1 - h^2)   (tanh derivative)
+//    d(loss)/d(W1_rep) = delta_h * x^T
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn sr_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let D_out = model["D_out"]
+    let W1 = model["W1"]
+    let W2 = model["W2"]
+    let b1 = model["b1"]
+    let b2 = model["b2"]
+    let gamma1 = model["gamma1"]
+    let gamma2 = model["gamma2"]
+    let v1 = model["v1"]
+    let v2 = model["v2"]
+
+    // Power iteration to get current sigmas + updated v vectors
+    let pi1 = sr_power_iteration_full(W1, v1, 3)
+    let sigma1 = pi1[0]
+    let v1_new = pi1[1]
+    let pi2 = sr_power_iteration_full(W2, v2, 3)
+    let sigma2 = pi2[0]
+    let v2_new = pi2[1]
+
+    let scale1 = gamma1 / sigma1
+    let scale2 = gamma2 / sigma2
+
+    // Reparameterized weights
+    let mut W1r = sr_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in { W1r[i][j] = W1[i][j] * scale1 }
+    }
+    let mut W2r = sr_zeros_2d(D_out, D_hidden)
+    for i in 0..D_out {
+        for j in 0..D_hidden { W2r[i][j] = W2[i][j] * scale2 }
+    }
+
+    // Accumulators for gradients
+    let mut gW1 = sr_zeros_2d(D_hidden, D_in)
+    let mut gb1 = sr_zeros_f(D_hidden)
+    let mut gW2 = sr_zeros_2d(D_out, D_hidden)
+    let mut gb2 = sr_zeros_f(D_out)
+    let mut g_gamma1 = 0.0
+    let mut g_gamma2 = 0.0
+
+    let inv_n = 1.0 / to_float(N)
+
+    for n in 0..N {
+        let x = X[n]
+        let y_target = Y[n]
+
+        // --- Forward ---
+        let mut pre_h = sr_zeros_f(D_hidden)
+        let mut h = sr_zeros_f(D_hidden)
+        for i in 0..D_hidden {
+            let mut s = b1[i]
+            for j in 0..D_in { s = s + W1r[i][j] * x[j] }
+            pre_h[i] = s
+            h[i] = sr_tanh(s)
+        }
+        let mut pred = sr_zeros_f(D_out)
+        for i in 0..D_out {
+            let mut s = b2[i]
+            for j in 0..D_hidden { s = s + W2r[i][j] * h[j] }
+            pred[i] = s
+        }
+
+        // --- Backward ---
+        // delta_out = 2*(pred - y) / N
+        let mut delta_out = sr_zeros_f(D_out)
+        for i in 0..D_out {
+            delta_out[i] = 2.0 * (pred[i] - y_target[i]) * inv_n
+        }
+
+        // grad W2_rep, b2
+        for i in 0..D_out {
+            gb2[i] = gb2[i] + delta_out[i]
+            for j in 0..D_hidden {
+                gW2[i][j] = gW2[i][j] + delta_out[i] * h[j]
+            }
+        }
+
+        // grad h = W2_rep^T * delta_out
+        let mut grad_h = sr_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for i in 0..D_out { s = s + W2r[i][j] * delta_out[i] }
+            grad_h[j] = s
+        }
+
+        // delta_h = grad_h * tanh'(pre_h) = grad_h * (1 - h^2)
+        let mut delta_h = sr_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            delta_h[j] = grad_h[j] * (1.0 - h[j] * h[j])
+        }
+
+        // grad W1_rep, b1
+        for i in 0..D_hidden {
+            gb1[i] = gb1[i] + delta_h[i]
+            for j in 0..D_in {
+                gW1[i][j] = gW1[i][j] + delta_h[i] * x[j]
+            }
+        }
+    }
+
+    // Convert rep gradients to raw weight gradients
+    // d(loss)/d(W1[i][j]) = d(loss)/d(W1_rep[i][j]) * scale1
+    // d(loss)/d(gamma1) = sum_ij gW1_rep[i][j] * W1[i][j] / sigma1
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            g_gamma1 = g_gamma1 + gW1[i][j] * W1[i][j] / sigma1
+            gW1[i][j] = gW1[i][j] * scale1
+        }
+    }
+    for i in 0..D_out {
+        for j in 0..D_hidden {
+            g_gamma2 = g_gamma2 + gW2[i][j] * W2[i][j] / sigma2
+            gW2[i][j] = gW2[i][j] * scale2
+        }
+    }
+
+    // --- Apply gradients ---
+    let mut W1_new = sr_zeros_2d(D_hidden, D_in)
+    let mut b1_new = sr_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        b1_new[i] = b1[i] - lr * gb1[i]
+        for j in 0..D_in {
+            W1_new[i][j] = W1[i][j] - lr * gW1[i][j]
+        }
+    }
+    let mut W2_new = sr_zeros_2d(D_out, D_hidden)
+    let mut b2_new = sr_zeros_f(D_out)
+    for i in 0..D_out {
+        b2_new[i] = b2[i] - lr * gb2[i]
+        for j in 0..D_hidden {
+            W2_new[i][j] = W2[i][j] - lr * gW2[i][j]
+        }
+    }
+    let gamma1_new = gamma1 - lr * g_gamma1
+    let gamma2_new = gamma2 - lr * g_gamma2
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "W1": W1_new,
+        "b1": b1_new,
+        "W2": W2_new,
+        "b2": b2_new,
+        "gamma1": gamma1_new,
+        "gamma2": gamma2_new,
+        "v1": v1_new,
+        "v2": v2_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

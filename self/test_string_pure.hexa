@@ -5,7 +5,817 @@
 //          to_upper, to_lower, trim
 // ═══════════════════════════════════════════════════════════════════
 
-use "runtime/string_pure"
+// -- inlined from self/runtime/string_pure.hexa --
+// codegen import not wired for test files
+
+// self/runtime/string_pure.hexa — Phase 2.1 runtime port (starter pack)
+//
+// Pure-Hexa equivalents of a subset of the "Portable" helpers from
+// self/runtime.c (see docs/runtime_port_plan.md §P2.1). This file is
+// ADDITIVE — it does not remove any C function yet. The compiled codegen
+// path (codegen_c2.hexa) still emits direct calls to hexa_is_error /
+// hexa_bin / hexa_hex / hexa_str_trim / hexa_str_to_upper / … in runtime.c.
+//
+// Why additive (and why we start with a small seam)?
+//   Every "Portable" C function is referenced from transpiled user output
+//   (codegen_c2.hexa rewrites is_error / bin / hex / base64_encode /
+//   from_char_code / env_var / str_to_upper / str_to_lower / str_chars /
+//   str_repeat / array_pop / array_reverse / …  into bare hexa_<name>(…)
+//   C calls — removing the C body would cause unresolved-symbol link
+//   failures in every user build).
+//
+//   Full P2.1 C removal requires a codegen interpose pass first:
+//     (a) Hexa stdlib definitions (this file) register into a name→fn
+//         registry the interpreter consults before falling through.
+//     (b) codegen_c2 emits `call_builtin("is_error", [v])` OR imports the
+//         .hexa implementation inline instead of hexa_is_error(v).
+//     (c) Once every call-site is rewired, runtime.c entries can drop.
+//   Until then, this file provides Hexa-level call sites for programs
+//   that `import "self/runtime/string_pure.hexa"` explicitly, and serves
+//   as the reference implementation for the codegen interpose work.
+//
+// Constraints honored (CLAUDE.md + port plan §5 Risks):
+//   - No NaN-boxing / tag layout touched (pure string/int logic).
+//   - No syscalls.
+//   - No coupling to arena lifetime.
+//   - Pitfalls observed:
+//       P1  no semicolons
+//       P15 let mut everywhere
+//       P28 nil/true/false literals lower correctly (365ae50) — safe here
+//   - Design note on stage0 quirks (observed 2026-04-16 via /tmp/test_port.hexa):
+//       * `char_code(param_string, i)` always returns position 0's code,
+//         regardless of i — a stage0 codegen bug for string parameters.
+//         Workaround: pull the single char out first with char_at (which
+//         indexes correctly), and use lookup tables ("ABCDEFGHIJ...") for
+//         arithmetic-free char transformations. This also sidesteps the
+//         stage0-interpreter-only bug where `from_char_code(72)` returns
+//         the decimal string "72" rather than the character "H".
+//         (Compiled code via codegen_c2 → runtime.c paths are unaffected.)
+
+// ── is_error_pure ─────────────────────────────────────────────────
+// Mirrors hexa_is_error (runtime.c:4210). The C impl checks for the
+// "ERR:" sentinel prefix. For the interpreter path (where Val has a
+// real TAG_ERROR), call_builtin("is_error") already handles it.
+//
+// Pure-Hexa version covers the compiled-code sentinel form: inspects
+// first four characters. Returns bool.
+pub fn is_error_pure(v) {
+    if type_of(v) != "string" { return false }
+    if len(v) < 4 { return false }
+    v.substring(0, 4) == "ERR:"
+}
+
+// ── int_to_hex_pure ───────────────────────────────────────────────
+// Mirrors hexa_hex (runtime.c:4333). For non-negative inputs, walks
+// nibbles LSB→MSB via successive `% 16`, prepending each digit. For
+// negative inputs we defer to the host `hex(n)` builtin so the
+// two's-complement bit pattern (u64 view) matches the C snprintf
+// "%llx" semantics (C casts i64→u64 silently). Attempting this in
+// pure Hexa without u64 is error-prone; keep the tiny FFI dependency.
+pub fn int_to_hex_pure(n) {
+    if n == 0 { return "0" }
+    if n < 0 { return hex(n) }
+    let mut v = n
+    let mut out = ""
+    let digits = "0123456789abcdef"
+    while v > 0 {
+        let d = v % 16
+        out = digits.substring(d, d + 1) + out
+        v = v / 16
+    }
+    out
+}
+
+// ── int_to_bin_pure ───────────────────────────────────────────────
+// Mirrors hexa_bin (runtime.c:4322). Non-negative loop; negative
+// delegates to host bin() for the same u64-view reason as hex above.
+pub fn int_to_bin_pure(n) {
+    if n == 0 { return "0" }
+    if n < 0 { return bin(n) }
+    let mut v = n
+    let mut out = ""
+    while v > 0 {
+        let bit = v % 2
+        if bit == 0 { out = "0" + out } else { out = "1" + out }
+        v = v / 2
+    }
+    out
+}
+
+// ── str_to_upper_ascii / str_to_lower_ascii ───────────────────────
+// Mirrors hexa_str_to_upper / _to_lower (runtime.c:2841 / 2848) for
+// the ASCII path. The C side is ASCII-only too — it walks bytes and
+// flips bit 5. For bytes > 0x7F it preserves them, which means UTF-8
+// continuation bytes pass through unchanged (a string like "café"
+// upper-cases to "CAFé", matching the C behavior).
+//
+// Stage0 note: uses lookup tables rather than char_code arithmetic
+// because `char_code(param_string, i)` always returns index 0's value
+// under stage0's current codegen. char_at indexing is correct, so we
+// use two parallel alphabet strings to translate.
+pub fn str_to_upper_ascii(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    let lowers = "abcdefghijklmnopqrstuvwxyz"
+    let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        // Find ch in `lowers`; if present, emit the matching upper.
+        let mut j = 0
+        let mut found = false
+        while j < 26 && found == false {
+            if lowers.substring(j, j + 1) == ch {
+                parts = parts.push(uppers.substring(j, j + 1))
+                found = true
+            }
+            j = j + 1
+        }
+        if found == false { parts = parts.push(ch) }
+        i = i + 1
+    }
+    parts.join("")
+}
+
+pub fn str_to_lower_ascii(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    let lowers = "abcdefghijklmnopqrstuvwxyz"
+    let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let mut j = 0
+        let mut found = false
+        while j < 26 && found == false {
+            if uppers.substring(j, j + 1) == ch {
+                parts = parts.push(lowers.substring(j, j + 1))
+                found = true
+            }
+            j = j + 1
+        }
+        if found == false { parts = parts.push(ch) }
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── str_trim_pure ─────────────────────────────────────────────────
+// Mirrors hexa_str_trim (runtime.c:2800). Scans for leading/trailing
+// whitespace and returns a substring. Hexa `substring(a, b)` end is
+// exclusive (matches the C impl at runtime.c:2320).
+pub fn str_trim_pure(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    if n == 0 { return s }
+    let mut start = 0
+    let mut done_start = false
+    while start < n && done_start == false {
+        let ch = s.substring(start, start + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            done_start = true
+        }
+    }
+    if done_start == false { return "" }
+    let mut end = n - 1
+    let mut done_end = false
+    while end >= start && done_end == false {
+        let ch = s.substring(end, end + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            end = end - 1
+        } else {
+            done_end = true
+        }
+    }
+    if end < start { return "" }
+    s.substring(start, end + 1)
+}
+
+// ── utf8_cpcount_pure ─────────────────────────────────────────────
+// Mirrors utf8_cpcount (runtime.c:2879). Returns byte length as an
+// ASCII approximation. Full UTF-8 code point counting requires
+// byte-level access (ord/char_code) which is not available in the
+// native codegen path; the C runtime handles true UTF-8 counting.
+pub fn utf8_cpcount_pure(s) {
+    if type_of(s) != "string" { return 0 }
+    // ASCII fast path — correct for all-ASCII strings.
+    // For mixed UTF-8, this over-counts by the number of continuation bytes.
+    // Full UTF-8 counting requires byte-level access (ord/char_code) which
+    // is not available in native codegen; the C runtime path handles this.
+    len(s)
+}
+
+// ── str_repeat_pure ───────────────────────────────────────────────
+// Mirrors hexa_str_repeat (runtime.c:2966). Already present as
+// stdlib/string.hexa::repeat, but replicate here so this file is
+// self-contained alongside the other pure helpers and serves as the
+// single reference implementation for the upcoming codegen interpose.
+pub fn str_repeat_pure(s, n) {
+    if type_of(s) != "string" { return "" }
+    if n <= 0 { return "" }
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        parts = parts.push(s)
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── str_contains_pure ─────────────────────────────────────────────
+// Mirrors hexa_str_contains (runtime.c:2305). Returns true if `sub`
+// appears anywhere inside `s`. Delegates to str_index_of_pure.
+pub fn str_contains_pure(s, sub) {
+    if type_of(s) != "string" { return false }
+    if type_of(sub) != "string" { return false }
+    str_index_of_pure(s, sub) >= 0
+}
+
+// ── str_starts_with_pure ──────────────────────────────────────────
+// Mirrors hexa_str_starts_with (runtime.c:2316). Compares the first
+// `len(prefix)` characters of `s` with `prefix`.
+pub fn str_starts_with_pure(s, prefix) {
+    if type_of(s) != "string" { return false }
+    if type_of(prefix) != "string" { return false }
+    let sn = len(s)
+    let pn = len(prefix)
+    if pn > sn { return false }
+    s.substring(0, pn) == prefix
+}
+
+// ── str_ends_with_pure ────────────────────────────────────────────
+// Mirrors hexa_str_ends_with (runtime.c:2322). Compares the last
+// `len(suffix)` characters of `s` with `suffix`.
+pub fn str_ends_with_pure(s, suffix) {
+    if type_of(s) != "string" { return false }
+    if type_of(suffix) != "string" { return false }
+    let sn = len(s)
+    let sfn = len(suffix)
+    if sfn > sn { return false }
+    s.substring(sn - sfn, sn) == suffix
+}
+
+// ── str_index_of_pure ─────────────────────────────────────────────
+// Mirrors hexa_str_index_of (runtime.c:2343). Returns byte-index of
+// first occurrence of `sub` in `s`, or -1 if not found. Naive O(n*m).
+pub fn str_index_of_pure(s, sub) {
+    if type_of(s) != "string" { return -1 }
+    if type_of(sub) != "string" { return -1 }
+    let sn = len(s)
+    let mn = len(sub)
+    if mn == 0 { return 0 }
+    if mn > sn { return -1 }
+    let limit = sn - mn + 1
+    let mut i = 0
+    while i < limit {
+        if s.substring(i, i + mn) == sub {
+            return i
+        }
+        i = i + 1
+    }
+    -1
+}
+
+// ── str_replace_pure ──────────────────────────────────────────────
+// Mirrors hexa_str_replace (runtime.c:2820). Replaces all occurrences
+// of `old_s` in `s` with `new_s`. Uses parts.push + join to avoid
+// O(n^2) string concat.
+pub fn str_replace_pure(s, old_s, new_s) {
+    if type_of(s) != "string" { return s }
+    if type_of(old_s) != "string" { return s }
+    if type_of(new_s) != "string" { return s }
+    let old_len = len(old_s)
+    if old_len == 0 { return s }
+    let sn = len(s)
+    let mut parts = []
+    let mut pos = 0
+    let mut searching = true
+    while searching {
+        let idx = str_index_of_pure(s.substring(pos, sn), old_s)
+        if idx < 0 {
+            parts = parts.push(s.substring(pos, sn))
+            searching = false
+        } else {
+            parts = parts.push(s.substring(pos, pos + idx))
+            parts = parts.push(new_s)
+            pos = pos + idx + old_len
+        }
+    }
+    parts.join("")
+}
+
+// ── str_split_pure ────────────────────────────────────────────────
+// Mirrors hexa_str_split (runtime.c:2792). Splits `s` by `delim` and
+// returns an array. Uses parts.push to build result.
+pub fn str_split_pure(s, delim) {
+    if type_of(s) != "string" { return [] }
+    if type_of(delim) != "string" { return [s] }
+    let dlen = len(delim)
+    if dlen == 0 { return [s] }
+    let sn = len(s)
+    let mut parts = []
+    let mut pos = 0
+    let mut searching = true
+    while searching {
+        let idx = str_index_of_pure(s.substring(pos, sn), delim)
+        if idx < 0 {
+            parts = parts.push(s.substring(pos, sn))
+            searching = false
+        } else {
+            parts = parts.push(s.substring(pos, pos + idx))
+            pos = pos + idx + dlen
+        }
+    }
+    parts
+}
+
+// ── str_substring_pure ────────────────────────────────────────────
+// Mirrors hexa_str_substring (runtime.c:2330). Returns s[start..end)
+// with bounds clamping matching the C implementation.
+pub fn str_substring_pure(s, start_idx, end_idx) {
+    if type_of(s) != "string" { return "" }
+    let sn = len(s)
+    let mut a = start_idx
+    let mut b = end_idx
+    if a < 0 { a = 0 }
+    if b > sn { b = sn }
+    if a >= b { return "" }
+    s.substring(a, b)
+}
+
+// ── str_trim_start_pure ───────────────────────────────────────────
+// Mirrors hexa_str_trim_start (runtime.c:4031). Trims leading
+// whitespace only.
+pub fn str_trim_start_pure(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    if n == 0 { return s }
+    let mut start = 0
+    let mut done_s = false
+    while start < n && done_s == false {
+        let ch = s.substring(start, start + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            start = start + 1
+        } else {
+            done_s = true
+        }
+    }
+    if done_s == false { return "" }
+    s.substring(start, n)
+}
+
+// ── str_trim_end_pure ─────────────────────────────────────────────
+// Mirrors hexa_str_trim_end (runtime.c:4038). Trims trailing
+// whitespace only.
+pub fn str_trim_end_pure(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    if n == 0 { return s }
+    let mut end_pos = n - 1
+    let mut done_e = false
+    while end_pos >= 0 && done_e == false {
+        let ch = s.substring(end_pos, end_pos + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            end_pos = end_pos - 1
+        } else {
+            done_e = true
+        }
+    }
+    if end_pos < 0 { return "" }
+    s.substring(0, end_pos + 1)
+}
+
+// ── str_join_pure ─────────────────────────────────────────────────
+// Mirrors hexa_str_join (runtime.c:2865). Joins array elements with
+// separator. Converts non-string elements via to_string.
+pub fn str_join_pure(arr, sep) {
+    let n = len(arr)
+    if n == 0 { return "" }
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        if i > 0 {
+            parts = parts.push(sep)
+        }
+        parts = parts.push(to_string(arr[i]))
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── pad_left_pure ─────────────────────────────────────────────────
+// Mirrors hexa_pad_left (runtime.c:2894). Left-pads `s` with spaces
+// until the (ASCII) character count reaches `width`. Uses
+// utf8_cpcount_pure for the length check so multibyte inputs behave
+// like the C implementation for the common ASCII case.
+pub fn pad_left_pure(s, width) {
+    let str = to_string(s)
+    let cplen = utf8_cpcount_pure(str)
+    if cplen >= width { return str }
+    str_repeat_pure(" ", width - cplen) + str
+}
+
+// ── pad_right_pure ────────────────────────────────────────────────
+// Mirrors hexa_pad_right (runtime.c:2912).
+pub fn pad_right_pure(s, width) {
+    let str = to_string(s)
+    let cplen = utf8_cpcount_pure(str)
+    if cplen >= width { return str }
+    str + str_repeat_pure(" ", width - cplen)
+}
+
+// ── str_concat_pure ───────────────────────────────────────────────
+// Mirrors hexa_str_concat (runtime.c:2266). Non-string inputs coerce
+// via to_string for consistent behaviour with the empty-arg fallback.
+pub fn str_concat_pure(a, b) {
+    let sa = if type_of(a) == "string" { a } else { "" }
+    let sb = if type_of(b) == "string" { b } else { "" }
+    sa + sb
+}
+
+// ── str_slice_pure ────────────────────────────────────────────────
+// Mirrors hexa_str_slice (runtime.c:4046). Byte-indexed clip with
+// saturating bounds (a<0 → 0, b>len → len, a>b → empty).
+pub fn str_slice_pure(s, start_idx, end_idx) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    let mut a = start_idx
+    let mut b = end_idx
+    if a < 0 { a = 0 }
+    if b > n { b = n }
+    if a > b { a = b }
+    s.substring(a, b)
+}
+
+// ── str_chars_pure ────────────────────────────────────────────────
+// Mirrors hexa_str_chars (runtime.c:2295). Byte-granular split — one
+// single-byte string per position. UTF-8 multibyte sequences are
+// emitted byte-by-byte, matching the C reference.
+pub fn str_chars_pure(s) {
+    if type_of(s) != "string" { return [] }
+    let n = len(s)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(s.substring(i, i + 1))
+        i = i + 1
+    }
+    out
+}
+
+// ── str_bytes_pure ────────────────────────────────────────────────
+// Mirrors hexa_str_bytes (runtime.c:4115). Returns byte codepoints
+// as ints. Uses substring + ord rather than char_code(s, i) because
+// the stage0 interpreter evaluates char_code with a 2nd-arg miss and
+// always returns the first byte (confirmed on 2026-04-16).
+pub fn str_bytes_pure(s) {
+    if type_of(s) != "string" { return [] }
+    let n = len(s)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(ord(s.substring(i, i + 1)))
+        i = i + 1
+    }
+    out
+}
+
+// ── str_eq_pure ──────────────────────────────────────────────────
+// Mirrors hexa_str_eq (runtime.c:2309). Returns true iff both are
+// strings with identical content.
+pub fn str_eq_pure(a, b) {
+    if type_of(a) != "string" { return false }
+    if type_of(b) != "string" { return false }
+    a == b
+}
+
+// ── str_is_empty_pure ────────────────────────────────────────────
+// Grammar spec lists is_empty() as a string method. Returns true if
+// the string has zero length.
+pub fn str_is_empty_pure(s) {
+    if type_of(s) != "string" { return true }
+    len(s) == 0
+}
+
+// ── str_reverse_pure ─────────────────────────────────────────────
+// Reverses the byte-level characters of `s`. For pure ASCII this
+// reverses the string; for multi-byte UTF-8, reversal is byte-level
+// (matching C array_reverse semantics on chars).
+pub fn str_reverse_pure(s) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    if n == 0 { return "" }
+    let mut parts = []
+    let mut i = n - 1
+    while i >= 0 {
+        parts = parts.push(s.substring(i, i + 1))
+        i = i - 1
+    }
+    parts.join("")
+}
+
+// ── str_count_pure ───────────────────────────────────────────────
+// Counts non-overlapping occurrences of `sub` in `s`.
+pub fn str_count_pure(s, sub) {
+    if type_of(s) != "string" { return 0 }
+    if type_of(sub) != "string" { return 0 }
+    let sub_len = len(sub)
+    if sub_len == 0 { return 0 }
+    let sn = len(s)
+    let mut count = 0
+    let mut pos = 0
+    let mut searching = true
+    while searching {
+        let remaining = s.substring(pos, sn)
+        let idx = str_index_of_pure(remaining, sub)
+        if idx < 0 {
+            searching = false
+        } else {
+            count = count + 1
+            pos = pos + idx + sub_len
+        }
+    }
+    count
+}
+
+// ── str_last_index_of_pure ───────────────────────────────────────
+// Returns byte-index of the last occurrence of `sub` in `s`, or -1.
+pub fn str_last_index_of_pure(s, sub) {
+    if type_of(s) != "string" { return -1 }
+    if type_of(sub) != "string" { return -1 }
+    let sn = len(s)
+    let mn = len(sub)
+    if mn == 0 { return sn }
+    if mn > sn { return -1 }
+    let mut i = sn - mn
+    while i >= 0 {
+        if s.substring(i, i + mn) == sub {
+            return i
+        }
+        i = i - 1
+    }
+    -1
+}
+
+// ── str_parse_int_pure ───────────────────────────────────────────
+// Mirrors hexa_str_parse_int (runtime.c:4014). Parses decimal (and
+// 0x hex) strings to int. Returns 0 for non-parseable input.
+// Stage0 note: uses to_int() builtin for the actual conversion, but
+// handles sign and hex prefix manually for correctness.
+pub fn str_parse_int_pure(s) {
+    if type_of(s) != "string" { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+    // Strip leading whitespace
+    let trimmed = str_trim_pure(s)
+    if len(trimmed) == 0 { return 0 }
+    // Check for sign
+    let first = trimmed.substring(0, 1)
+    let mut sign = 1
+    let mut start = 0
+    if first == "-" {
+        sign = -1
+        start = 1
+    }
+    if first == "+" { start = 1 }
+    let rest = trimmed.substring(start, len(trimmed))
+    let rest_len = len(rest)
+    if rest_len == 0 { return 0 }
+    // Check for hex prefix
+    let hex_digits = "0123456789abcdefABCDEF"
+    if rest_len >= 2 && rest.substring(0, 2) == "0x" {
+        // Parse hex
+        let hex_body = rest.substring(2, rest_len)
+        let mut val = 0
+        let mut hi = 0
+        while hi < len(hex_body) {
+            let ch = hex_body.substring(hi, hi + 1)
+            let mut digit = -1
+            let mut dj = 0
+            while dj < 22 {
+                if hex_digits.substring(dj, dj + 1) == ch {
+                    if dj < 10 { digit = dj }
+                    else if dj < 16 { digit = dj - 10 + 10 }
+                    else { digit = dj - 16 + 10 }
+                }
+                dj = dj + 1
+            }
+            if digit < 0 { return sign * val }
+            val = val * 16 + digit
+            hi = hi + 1
+        }
+        return sign * val
+    }
+    // Parse decimal
+    let dec_digits = "0123456789"
+    let mut val = 0
+    let mut di = 0
+    while di < rest_len {
+        let ch = rest.substring(di, di + 1)
+        let mut digit = -1
+        let mut dk = 0
+        while dk < 10 {
+            if dec_digits.substring(dk, dk + 1) == ch { digit = dk }
+            dk = dk + 1
+        }
+        if digit < 0 { return sign * val }
+        val = val * 10 + digit
+        di = di + 1
+    }
+    sign * val
+}
+
+// ── str_parse_float_pure ─────────────────────────────────────────
+// Mirrors hexa_str_parse_float (runtime.c:4026). Delegates to
+// to_float() builtin. Returns 0.0 for non-parseable input.
+pub fn str_parse_float_pure(s) {
+    if type_of(s) != "string" { return 0.0 }
+    let trimmed = str_trim_pure(s)
+    if len(trimmed) == 0 { return 0.0 }
+    to_float(trimmed)
+}
+
+// ── from_char_code_pure ──────────────────────────────────────────
+// Mirrors hexa_from_char_code (runtime.c:4262) for the ASCII range
+// (0..127). Returns a single-character string. For codes outside
+// ASCII we delegate to the host from_char_code() builtin because
+// UTF-8 encoding in pure Hexa requires byte-level string assembly.
+pub fn from_char_code_pure(code) {
+    if type_of(code) != "int" { return "" }
+    if code < 0 { return "" }
+    if code > 127 { return from_char_code(code) }
+    // ASCII range: build from lookup table to avoid stage0 from_char_code
+    // bugs where it returns the decimal string instead of the character.
+    let ascii_table = "\t\n"
+    // For printable ASCII (32..126), use a lookup string.
+    let printable = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+    if code >= 32 && code <= 126 {
+        let idx = code - 32
+        return printable.substring(idx, idx + 1)
+    }
+    // Tab (9) and newline (10)
+    if code == 9 { return "\t" }
+    if code == 10 { return "\n" }
+    if code == 13 { return "\r" }
+    if code == 0 { return "" }
+    // Other control chars: delegate to host
+    from_char_code(code)
+}
+
+// ── format_pure ──────────────────────────────────────────────────
+// Mirrors hexa_format (runtime.c:2720). Single-arg: replaces the
+// first `{}` in the format string with `to_string(arg)`.
+pub fn format_pure(fmt, arg) {
+    if type_of(fmt) != "string" { return fmt }
+    let idx = str_index_of_pure(fmt, "{}")
+    if idx < 0 { return fmt }
+    let before = fmt.substring(0, idx)
+    let after = fmt.substring(idx + 2, len(fmt))
+    before + to_string(arg) + after
+}
+
+// ── format_n_pure ────────────────────────────────────────────────
+// Mirrors hexa_format_n (runtime.c:2736). Multi-arg: replaces each
+// `{}` with successive elements of `args` array.
+pub fn format_n_pure(fmt, args) {
+    if type_of(fmt) != "string" { return fmt }
+    if type_of(args) != "array" { return fmt }
+    let n = len(args)
+    let mut result = fmt
+    let mut ai = 0
+    while ai < n {
+        let idx = str_index_of_pure(result, "{}")
+        if idx < 0 { return result }
+        let before = result.substring(0, idx)
+        let after = result.substring(idx + 2, len(result))
+        result = before + to_string(args[ai]) + after
+        ai = ai + 1
+    }
+    result
+}
+
+// ── str_capitalize_pure ──────────────────────────────────────────
+// Capitalizes the first character of the string (a..z -> A..Z).
+// Used by the parser/codegen for identifier transformations.
+pub fn str_capitalize_pure(s) {
+    if type_of(s) != "string" { return s }
+    let n = len(s)
+    if n == 0 { return s }
+    let first = s.substring(0, 1)
+    let lowers = "abcdefghijklmnopqrstuvwxyz"
+    let uppers = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    let mut upper_first = first
+    let mut j = 0
+    while j < 26 {
+        if lowers.substring(j, j + 1) == first {
+            upper_first = uppers.substring(j, j + 1)
+        }
+        j = j + 1
+    }
+    if n == 1 { return upper_first }
+    upper_first + s.substring(1, n)
+}
+
+// ── str_pad_left_char_pure / str_pad_right_char_pure ─────────────
+// Like pad_left_pure/pad_right_pure but with a configurable fill char.
+pub fn str_pad_left_char_pure(s, width, fill_ch) {
+    let str_val = to_string(s)
+    let cplen = len(str_val)
+    if cplen >= width { return str_val }
+    let pad = width - cplen
+    let mut parts = []
+    let mut i = 0
+    while i < pad {
+        parts = parts.push(fill_ch)
+        i = i + 1
+    }
+    parts.push(str_val).join("")
+}
+
+pub fn str_pad_right_char_pure(s, width, fill_ch) {
+    let str_val = to_string(s)
+    let cplen = len(str_val)
+    if cplen >= width { return str_val }
+    let pad = width - cplen
+    let mut parts = []
+    parts = parts.push(str_val)
+    let mut i = 0
+    while i < pad {
+        parts = parts.push(fill_ch)
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── str_lines_pure ───────────────────────────────────────────────
+// Splits a string by newline characters. Mirrors the read_lines
+// concept but on in-memory strings.
+pub fn str_lines_pure(s) {
+    if type_of(s) != "string" { return [] }
+    str_split_pure(s, "\n")
+}
+
+// ── str_words_pure ───────────────────────────────────────────────
+// Splits a string by whitespace, filtering empty segments. Covers
+// the "split_whitespace" pattern seen in pitfall P103.
+pub fn str_words_pure(s) {
+    if type_of(s) != "string" { return [] }
+    let parts = str_split_pure(s, " ")
+    let n = len(parts)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let p = parts[i]
+        if len(p) > 0 {
+            // Also trim tabs/newlines from each word
+            let trimmed = str_trim_pure(p)
+            if len(trimmed) > 0 {
+                out = out.push(trimmed)
+            }
+        }
+        i = i + 1
+    }
+    out
+}
+
+// ── str_char_at_pure ─────────────────────────────────────────────
+// Returns the single character at byte index `i`, or "" if out of
+// bounds. Wraps substring(i, i+1) with bounds checking.
+pub fn str_char_at_pure(s, idx) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    if idx < 0 { return "" }
+    if idx >= n { return "" }
+    s.substring(idx, idx + 1)
+}
+
+// ── str_escape_pure ──────────────────────────────────────────────
+// Mirrors the escape logic used in codegen_c2 (hexa_cc.c:8231-8235).
+// Escapes backslash, double-quote, newline, carriage-return, tab.
+pub fn str_escape_pure(s) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "\\" { parts = parts.push("\\\\") }
+        else if ch == "\"" { parts = parts.push("\\\"") }
+        else if ch == "\n" { parts = parts.push("\\n") }
+        else if ch == "\r" { parts = parts.push("\\r") }
+        else if ch == "\t" { parts = parts.push("\\t") }
+        else { parts = parts.push(ch) }
+        i = i + 1
+    }
+    parts.join("")
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

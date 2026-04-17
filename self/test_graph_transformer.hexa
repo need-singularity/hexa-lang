@@ -24,7 +24,613 @@
 //    #20 gt_forward full forward preserves N
 // ===================================================================
 
-import "ml/graph_transformer.hexa"
+// -- inlined from self/ml/graph_transformer.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/graph_transformer.hexa — Graph Transformer (#246)
+//
+//  Transformer self-attention over a graph.  Standard MPNNs can't
+//  capture long-range structure; a Graph Transformer adds global
+//  attention and encodes the graph topology as Laplacian positional
+//  encodings (Dwivedi & Bresson, "A Generalization of Transformer
+//  Networks to Graphs", 2020).
+//
+//  Core pipeline (for a single graph, N nodes, d features):
+//    1. Build adjacency A from edges (symmetric, no self).
+//    2. Laplacian L = D - A, normalized L_n = I - D^{-1/2} A D^{-1/2}.
+//    3. Top-k smallest eigenvectors (non-trivial) → positional
+//       encoding PE ∈ R^{N×k}.   Power-iteration deflation variant.
+//    4. h0 = node_feat + PE (concat or add after projection).
+//    5. Multi-head self-attention (optionally edge-biased by A).
+//    6. Stack L layers of (MHA → FFN) with residual + LayerNorm.
+//
+//  API:
+//    gt_adj_from_edges(edges, N)              -> [[float; N]; N]
+//    gt_laplacian(A)                          -> [[float]]
+//    gt_normalized_laplacian(A)               -> [[float]]
+//    gt_power_iteration(L, max_iter)          -> (eigval, eigvec)
+//    gt_top_k_eigvecs(L, k, iters)            -> [[float]; k]
+//    gt_add_pe(h, pe)                         -> [[float]]
+//    gt_softmax_row(row)                      -> [float]
+//    gt_attention_head(Q, K, V)               -> [[float]]
+//    gt_attention_biased(Q, K, V, bias)       -> [[float]]
+//    gt_multi_head(h, Wq, Wk, Wv, Wo, n_h)    -> [[float]]
+//    gt_layer_norm(h, eps)                    -> [[float]]
+//    gt_ffn(h, W1, b1, W2, b2)                -> [[float]]
+//    gt_block(h, weights)                     -> [[float]]
+//    gt_forward(node_feat, edges, weights, L, k, n_heads) -> [[float]]
+//
+//  AI-NATIVE attrs:
+//    @pure — stateless
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ─────────────────────────────────────────────
+
+fn gt_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn gt_sqrt(val) {
+    if val <= 0.0 { return 0.0 }
+    let mut g = val / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + val / g) / 2.0 }
+    return g
+}
+
+fn gt_exp_t(val) {
+    let mut v = val
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn gt_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn gt_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r { m = m + [gt_zeros(c)] }
+    return m
+}
+
+fn gt_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Build adjacency matrix from an edge list
+//
+//  edges: dict with keys "src", "dst" (both lists of int)
+//  Returns N×N symmetric {0,1} matrix.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_adj_from_edges(edges, N) {
+    let src = edges["src"]
+    let dst = edges["dst"]
+    let m = len(src)
+    let mut A = gt_zeros_2d(N, N)
+    for e in 0..m {
+        let i = src[e]
+        let j = dst[e]
+        if i == j { continue }
+        A[i][j] = 1.0
+        A[j][i] = 1.0
+    }
+    return A
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Laplacian  L = D - A
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_laplacian(A) {
+    let N = len(A)
+    let mut L = gt_zeros_2d(N, N)
+    for i in 0..N {
+        let mut deg = 0.0
+        for j in 0..N { deg = deg + A[i][j] }
+        L[i][i] = deg
+        for j in 0..N {
+            if i != j {
+                L[i][j] = 0.0 - A[i][j]
+            }
+        }
+    }
+    return L
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Symmetric normalized Laplacian  L_n = I - D^{-1/2} A D^{-1/2}
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_normalized_laplacian(A) {
+    let N = len(A)
+    let mut d_inv_sqrt = gt_zeros(N)
+    for i in 0..N {
+        let mut deg = 0.0
+        for j in 0..N { deg = deg + A[i][j] }
+        if deg > 0.0 {
+            d_inv_sqrt[i] = 1.0 / gt_sqrt(deg)
+        }
+    }
+    let mut L = gt_zeros_2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            if i == j {
+                L[i][j] = 1.0 - d_inv_sqrt[i] * A[i][j] * d_inv_sqrt[j]
+            } else {
+                L[i][j] = 0.0 - d_inv_sqrt[i] * A[i][j] * d_inv_sqrt[j]
+            }
+        }
+    }
+    return L
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Largest-magnitude eigenpair via power iteration
+//
+//  Works for symmetric L, used as a building block for top-k.
+// ═══════════════════════════════════════════════════════════════════
+fn gt_vec_norm(v) {
+    let n = len(v)
+    let mut s = 0.0
+    for i in 0..n { s = s + v[i] * v[i] }
+    return gt_sqrt(s)
+}
+
+fn gt_mat_vec(M, v) {
+    let N = len(M)
+    let mut out = gt_zeros(N)
+    for i in 0..N {
+        let mut s = 0.0
+        for j in 0..N { s = s + M[i][j] * v[j] }
+        out[i] = s
+    }
+    return out
+}
+
+fn gt_vec_normalize(v) {
+    let n = len(v)
+    let nm = gt_vec_norm(v)
+    if nm < 1.0e-12 { return v }
+    let mut out = gt_zeros(n)
+    for i in 0..n { out[i] = v[i] / nm }
+    return out
+}
+
+fn gt_vec_sub_scaled(a, b, s) {
+    let n = len(a)
+    let mut out = gt_zeros(n)
+    for i in 0..n { out[i] = a[i] - s * b[i] }
+    return out
+}
+
+@pure
+fn gt_power_iteration(M, max_iter) {
+    let N = len(M)
+    let mut v = gt_zeros(N)
+    for i in 0..N { v[i] = gt_hash(321, i, 0) + 0.5 }
+    v = gt_vec_normalize(v)
+    let mut eig = 0.0
+    for _i in 0..max_iter {
+        let w = gt_mat_vec(M, v)
+        // Rayleigh quotient
+        let mut num = 0.0
+        for i in 0..N { num = num + v[i] * w[i] }
+        eig = num
+        v = gt_vec_normalize(w)
+    }
+    let mut out = #{}
+    out["val"] = eig
+    out["vec"] = v
+    return out
+}
+
+// Deflate M ← M − λ v v^T (removes the eigenpair).
+fn gt_deflate(M, val, vec) {
+    let N = len(M)
+    let mut M2 = gt_zeros_2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            M2[i][j] = M[i][j] - val * vec[i] * vec[j]
+        }
+    }
+    return M2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Top-k *smallest* (non-trivial) eigenvectors
+//
+//  Strategy for a symmetric PSD Laplacian with largest eigenvalue ≤ 2
+//  (after normalization): spectral-flip  M = c*I − L  so that smallest
+//  eigenvectors of L are largest of M.  Run power iteration on M,
+//  deflate, repeat.  Skip the trivial all-ones eigenvector of L (eig 0)
+//  by projecting it out first.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_top_k_eigvecs(L, k, iters) {
+    let N = len(L)
+    let shift = 2.5
+    // M = shift*I - L  (symmetric, same vecs, λ' = shift - λ)
+    let mut M = gt_zeros_2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            if i == j { M[i][j] = shift - L[i][j] }
+            else { M[i][j] = 0.0 - L[i][j] }
+        }
+    }
+    // Deflate the all-ones trivial vector of L (largest of M).
+    let inv_n = 1.0 / gt_sqrt(to_float(N))
+    let mut ones = gt_zeros(N)
+    for i in 0..N { ones[i] = inv_n }
+    // Its eigenvalue in M is shift - 0 = shift.
+    M = gt_deflate(M, shift, ones)
+
+    let mut vecs = []
+    for _p in 0..k {
+        let r = gt_power_iteration(M, iters)
+        let v = r["vec"]
+        let l = r["val"]
+        vecs = vecs + [v]
+        M = gt_deflate(M, l, v)
+    }
+    return vecs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Add PE to node features (concat or add).  Uses addition after
+//  padding / truncation to match node feature dimension.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_add_pe(h, pe_vecs) {
+    // pe_vecs: k vectors of length N
+    // return [N][d + k] concatenation
+    let N = len(h)
+    let d = len(h[0])
+    let k = len(pe_vecs)
+    let mut out = []
+    for i in 0..N {
+        let mut row = gt_zeros(d + k)
+        for j in 0..d { row[j] = h[i][j] }
+        for p in 0..k { row[d + p] = pe_vecs[p][i] }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Row softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_softmax_row(row) {
+    let n = len(row)
+    let mut m = row[0]
+    for i in 1..n { if row[i] > m { m = row[i] } }
+    let mut total = 0.0
+    let mut expv = gt_zeros(n)
+    for i in 0..n {
+        expv[i] = gt_exp_t(row[i] - m)
+        total = total + expv[i]
+    }
+    let mut out = gt_zeros(n)
+    for i in 0..n { out[i] = expv[i] / total }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) Single-head attention  softmax(QK^T / sqrt(d)) V
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_attention_head(Q, K, V) {
+    let N = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / gt_sqrt(to_float(d))
+    // scores[N][N]
+    let mut scores = gt_zeros_2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            let mut s = 0.0
+            for p in 0..d { s = s + Q[i][p] * K[j][p] }
+            scores[i][j] = s * scale
+        }
+    }
+    // softmax per row
+    let mut attn = gt_zeros_2d(N, N)
+    for i in 0..N {
+        let smv = gt_softmax_row(scores[i])
+        for j in 0..N { attn[i][j] = smv[j] }
+    }
+    // output = attn V
+    let mut out = gt_zeros_2d(N, d)
+    for i in 0..N {
+        for p in 0..d {
+            let mut s = 0.0
+            for j in 0..N { s = s + attn[i][j] * V[j][p] }
+            out[i][p] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Attention with additive bias (graph-aware)
+//
+//  bias: N×N (e.g. -∞ where no edge) added to scores before softmax.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_attention_biased(Q, K, V, bias) {
+    let N = len(Q)
+    let d = len(Q[0])
+    let scale = 1.0 / gt_sqrt(to_float(d))
+    let mut scores = gt_zeros_2d(N, N)
+    for i in 0..N {
+        for j in 0..N {
+            let mut s = 0.0
+            for p in 0..d { s = s + Q[i][p] * K[j][p] }
+            scores[i][j] = s * scale + bias[i][j]
+        }
+    }
+    let mut attn = gt_zeros_2d(N, N)
+    for i in 0..N {
+        let smv = gt_softmax_row(scores[i])
+        for j in 0..N { attn[i][j] = smv[j] }
+    }
+    let mut out = gt_zeros_2d(N, d)
+    for i in 0..N {
+        for p in 0..d {
+            let mut s = 0.0
+            for j in 0..N { s = s + attn[i][j] * V[j][p] }
+            out[i][p] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (10) Linear projection   Y = X W^T
+//   X: [N][d_in], W: [d_out][d_in]   →   Y: [N][d_out]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_linear(X, W) {
+    let N = len(X)
+    let d_in = len(X[0])
+    let d_out = len(W)
+    let mut Y = gt_zeros_2d(N, d_out)
+    for i in 0..N {
+        for p in 0..d_out {
+            let mut s = 0.0
+            for q in 0..d_in { s = s + X[i][q] * W[p][q] }
+            Y[i][p] = s
+        }
+    }
+    return Y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (11) Multi-head self-attention (single-head implementation × n_h
+//  heads, each on a slice of the projected dimensions).
+//
+//  Simplified: single head with n_heads = 1 default.  We still provide
+//  the interface for multi-head by slicing head_dim = d_model / n_heads.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_multi_head_attn(hfeat, Wq, Wk, Wv, Wo, n_heads) {
+    let N = len(hfeat)
+    let d_model = len(Wq)  // Wq is [d_model][d_in]
+    let head_dim = d_model / n_heads
+
+    let Q = gt_linear(hfeat, Wq)
+    let K = gt_linear(hfeat, Wk)
+    let V = gt_linear(hfeat, Wv)
+
+    // Concat of head outputs = output of shape [N][d_model]
+    let mut concat = gt_zeros_2d(N, d_model)
+
+    for h in 0..n_heads {
+        let start = h * head_dim
+        // slice Q/K/V [N][d_model] -> [N][head_dim]
+        let mut Qh = gt_zeros_2d(N, head_dim)
+        let mut Kh = gt_zeros_2d(N, head_dim)
+        let mut Vh = gt_zeros_2d(N, head_dim)
+        for i in 0..N {
+            for p in 0..head_dim {
+                Qh[i][p] = Q[i][start + p]
+                Kh[i][p] = K[i][start + p]
+                Vh[i][p] = V[i][start + p]
+            }
+        }
+        let head_out = gt_attention_head(Qh, Kh, Vh)
+        for i in 0..N {
+            for p in 0..head_dim {
+                concat[i][start + p] = head_out[i][p]
+            }
+        }
+    }
+
+    // Output projection
+    return gt_linear(concat, Wo)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (12) LayerNorm (per-row, no affine)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_layer_norm(h, eps) {
+    let N = len(h)
+    let d = len(h[0])
+    let mut out = gt_zeros_2d(N, d)
+    for i in 0..N {
+        let mut mean = 0.0
+        for j in 0..d { mean = mean + h[i][j] }
+        mean = mean / to_float(d)
+        let mut var = 0.0
+        for j in 0..d {
+            let diff = h[i][j] - mean
+            var = var + diff * diff
+        }
+        var = var / to_float(d)
+        let inv = 1.0 / gt_sqrt(var + eps)
+        for j in 0..d { out[i][j] = (h[i][j] - mean) * inv }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (13) Two-layer FFN with ReLU
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_relu(v) { if v > 0.0 { return v } return 0.0 }
+
+@pure
+fn gt_ffn(h, W1, b1, W2, b2) {
+    let N = len(h)
+    let d_in = len(h[0])
+    let d_h = len(W1)      // hidden dim
+    let d_out = len(W2)    // output dim
+    let mut out = gt_zeros_2d(N, d_out)
+    for i in 0..N {
+        let mut hid = gt_zeros(d_h)
+        for j in 0..d_h {
+            let mut s = b1[j]
+            for q in 0..d_in { s = s + W1[j][q] * h[i][q] }
+            hid[j] = gt_relu(s)
+        }
+        for p in 0..d_out {
+            let mut s = b2[p]
+            for j in 0..d_h { s = s + W2[p][j] * hid[j] }
+            out[i][p] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (14) Single Graph Transformer block:
+//  h' = LN(h + MHA(h))
+//  h'' = LN(h' + FFN(h'))
+// ═══════════════════════════════════════════════════════════════════
+fn gt_add(a, b) {
+    let N = len(a)
+    let d = len(a[0])
+    let mut out = gt_zeros_2d(N, d)
+    for i in 0..N {
+        for j in 0..d { out[i][j] = a[i][j] + b[i][j] }
+    }
+    return out
+}
+
+@pure
+fn gt_block(hfeat, weights) {
+    let Wq = weights["Wq"]
+    let Wk = weights["Wk"]
+    let Wv = weights["Wv"]
+    let Wo = weights["Wo"]
+    let W1 = weights["W1"]
+    let b1 = weights["b1"]
+    let W2 = weights["W2"]
+    let b2 = weights["b2"]
+    let n_heads = weights["n_heads"]
+
+    let attn = gt_multi_head_attn(hfeat, Wq, Wk, Wv, Wo, n_heads)
+    let res1 = gt_add(hfeat, attn)
+    let norm1 = gt_layer_norm(res1, 1.0e-5)
+    let ff = gt_ffn(norm1, W1, b1, W2, b2)
+    let res2 = gt_add(norm1, ff)
+    let norm2 = gt_layer_norm(res2, 1.0e-5)
+    return norm2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (15) Full forward — N nodes, edges, L blocks, k PE, n_heads heads.
+//
+//  node_feat: [N][d_in]
+//  edges:     dict src/dst
+//  weights:   dict with entries per-block and a "W_in" projection
+//             from d_in+k -> d_model before the stack.
+//
+//  Returns final [N][d_model] embeddings.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gt_forward(node_feat, edges, weights, n_blocks, k, n_heads) {
+    let N = len(node_feat)
+    let A = gt_adj_from_edges(edges, N)
+    let L = gt_normalized_laplacian(A)
+    let pe = gt_top_k_eigvecs(L, k, 30)
+    let h_in = gt_add_pe(node_feat, pe)
+    let W_in = weights["W_in"]
+    let mut hfeat = gt_linear(h_in, W_in)
+
+    let blocks = weights["blocks"]
+    for b in 0..n_blocks {
+        let block_w = blocks[b]
+        // clone block weights dict with n_heads injected
+        let mut bw = #{}
+        bw["Wq"] = block_w["Wq"]
+        bw["Wk"] = block_w["Wk"]
+        bw["Wv"] = block_w["Wv"]
+        bw["Wo"] = block_w["Wo"]
+        bw["W1"] = block_w["W1"]
+        bw["b1"] = block_w["b1"]
+        bw["W2"] = block_w["W2"]
+        bw["b2"] = block_w["b2"]
+        bw["n_heads"] = n_heads
+        hfeat = gt_block(hfeat, bw)
+    }
+    return hfeat
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (16) Tiny weight initializer for tests
+// ═══════════════════════════════════════════════════════════════════
+fn gt_init_linear(d_out, d_in, seed) {
+    let mut M = []
+    for i in 0..d_out {
+        let mut row = gt_zeros(d_in)
+        for j in 0..d_in { row[j] = gt_hash(seed, i, j) * 0.3 }
+        M = M + [row]
+    }
+    return M
+}
+
+fn gt_init_block(d_model, d_ff, seed) {
+    let mut w = #{}
+    w["Wq"] = gt_init_linear(d_model, d_model, seed + 1)
+    w["Wk"] = gt_init_linear(d_model, d_model, seed + 2)
+    w["Wv"] = gt_init_linear(d_model, d_model, seed + 3)
+    w["Wo"] = gt_init_linear(d_model, d_model, seed + 4)
+    w["W1"] = gt_init_linear(d_ff, d_model, seed + 5)
+    w["b1"] = gt_zeros(d_ff)
+    w["W2"] = gt_init_linear(d_model, d_ff, seed + 6)
+    w["b2"] = gt_zeros(d_model)
+    return w
+}
+
+fn gt_init_weights(d_in, d_model, d_ff, k, n_blocks, seed) {
+    let mut w = #{}
+    w["W_in"] = gt_init_linear(d_model, d_in + k, seed)
+    let mut blocks = []
+    for b in 0..n_blocks {
+        blocks = blocks + [gt_init_block(d_model, d_ff, seed + 100 + b * 10)]
+    }
+    w["blocks"] = blocks
+    return w
+}
+
+println("[graph_transformer] loaded — adjacency + Laplacian PE + multi-head attention + FFN + block stack")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

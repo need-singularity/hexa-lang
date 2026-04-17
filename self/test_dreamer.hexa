@@ -23,7 +23,618 @@
 //
 //  Run: ./hexa self/test_dreamer.hexa
 // ===================================================================
-import "ml/dreamer.hexa"
+// -- inlined from self/ml/dreamer.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/dreamer.hexa — World Model Dreamer (ML #92)
+//
+//  Pure Hexa implementation of a Dreamer-style world model.
+//
+//  Architecture:
+//    1. Latent Encoder : obs[O] -> z[Z]
+//         z = tanh(W_enc * obs + b_enc)
+//    2. Transition Model : (z[Z], a[A]) -> z_next[Z]
+//         z_next = tanh(W_tz * z + W_ta * a_onehot + b_t)
+//    3. Reward Head : z[Z] -> r (scalar)
+//         r = W_r . z + b_r
+//    4. Value (Critic) Head : z[Z] -> v (scalar)
+//         v = W_v . z + b_v
+//    5. Actor (Policy) Head : z[Z] -> logits[A]
+//         logits = W_pi * z + b_pi ; pi = softmax(logits)
+//    6. Imagination Rollout : starting from z0, roll H steps in latent
+//         space using actor-sampled actions; collect (z,a,r,v).
+//    7. Actor-Critic Update : lambda-return estimator over imagined rollout,
+//         REINFORCE-style actor gradient with baseline, MSE critic loss.
+//
+//  All tensors are flat float arrays. No bit-twiddling, no manual loops
+//  where matvec/dot suffice conceptually. Everything is in pure Hexa so
+//  it can be self-hosted and tested.
+//
+//  Public API:
+//    dreamer_create(obs_dim, act_dim, latent_dim)
+//    dreamer_encode(state, obs)
+//    dreamer_transition(state, z, action)
+//    dreamer_reward(state, z)
+//    dreamer_value(state, z)
+//    dreamer_actor_logits(state, z)
+//    dreamer_softmax(logits)
+//    dreamer_sample_action(state, z)
+//    dreamer_imagine(state, z0, horizon)
+//    dreamer_lambda_return(rewards, values, gamma, lam)
+//    dreamer_actor_loss(state, trajectory)
+//    dreamer_critic_loss(state, trajectory, returns)
+//    dreamer_world_loss(state, obs, action, next_obs, reward)
+//    dreamer_train_step(state, obs, action, next_obs, reward, lr)
+//
+//  Note: Pitfalls observed in this codebase that we deliberately avoid
+//    - No struct-literal inside if blocks (use pre-computed flags).
+//    - Arrays are by-value across function boundaries → we return new
+//      state maps / trajectories rather than mutating in-place.
+//    - No tail-position array literal `return [a,b]` (always bind first).
+//    - No callable parameters reused across different step functions.
+//    - Lambdas cannot mutate caller state, we keep everything functional.
+// ===================================================================
+
+// ── math helpers ───────────────────────────────────────────────────
+fn dm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dm_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn dm_tanh(x) {
+    // numerically stable tanh via exp clamp
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < 0.0 - 20.0 { v = 0.0 - 20.0 }
+    let ep = exp(v)
+    let en = exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn dm_tanh_grad(y) {
+    // d/dx tanh(x) = 1 - tanh(x)^2; receive y = tanh(x)
+    return 1.0 - y * y
+}
+
+fn dm_clip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+// Deterministic LCG — reproducible, no hidden global state touched elsewhere
+let mut DM_RNG = 1103515245
+
+fn dm_rand() {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let nxt = (a * DM_RNG + c) % m
+    DM_RNG = nxt
+    return to_float(nxt) / 2147483648.0
+}
+
+// Simple "He-ish" init: small scale, sign alternates deterministically.
+fn dm_init_vec(n, scale) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        let u = dm_rand() * 2.0 - 1.0
+        v = v + [u * scale]
+        i = i + 1
+    }
+    return v
+}
+
+fn dm_init_mat(rows, cols, scale) {
+    // row-major flat array of length rows*cols
+    return dm_init_vec(rows * cols, scale)
+}
+
+// matvec: y[rows] = M[rows,cols] * x[cols]
+fn dm_matvec(M, x, rows, cols) {
+    let mut y = []
+    let mut r = 0
+    while r < rows {
+        let base = r * cols
+        let mut sum = 0.0
+        let mut c = 0
+        while c < cols {
+            sum = sum + M[base + c] * x[c]
+            c = c + 1
+        }
+        y = y + [sum]
+        r = r + 1
+    }
+    return y
+}
+
+// dot product
+fn dm_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// elementwise add with broadcasted bias: y[i] = y[i] + b[i]
+fn dm_add(y, b) {
+    let n = len(y)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [y[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// one-hot encode action index → vector of length act_dim
+fn dm_onehot(a, act_dim) {
+    let mut v = []
+    let mut i = 0
+    while i < act_dim {
+        if i == a {
+            v = v + [1.0]
+        } else {
+            v = v + [0.0]
+        }
+        i = i + 1
+    }
+    return v
+}
+
+// ===================================================================
+//  dreamer_create — build a world-model + actor-critic state.
+//
+//  Returned map keys:
+//    obs_dim, act_dim, latent_dim
+//    W_enc [Z*O], b_enc [Z]
+//    W_tz  [Z*Z], W_ta [Z*A], b_t [Z]
+//    W_r   [Z],   b_r (float)
+//    W_v   [Z],   b_v (float)
+//    W_pi  [A*Z], b_pi [A]
+// ===================================================================
+pub fn dreamer_create(obs_dim, act_dim, latent_dim) {
+    DM_RNG = 1234567
+    let scale_enc = 0.2
+    let scale_t = 0.2
+    let scale_head = 0.15
+
+    let W_enc = dm_init_mat(latent_dim, obs_dim, scale_enc)
+    let b_enc = dm_init_vec(latent_dim, 0.01)
+
+    let W_tz = dm_init_mat(latent_dim, latent_dim, scale_t)
+    let W_ta = dm_init_mat(latent_dim, act_dim, scale_t)
+    let b_t  = dm_init_vec(latent_dim, 0.01)
+
+    let W_r = dm_init_vec(latent_dim, scale_head)
+    let b_r = 0.0
+
+    let W_v = dm_init_vec(latent_dim, scale_head)
+    let b_v = 0.0
+
+    let W_pi = dm_init_mat(act_dim, latent_dim, scale_head)
+    let b_pi = dm_init_vec(act_dim, 0.0)
+
+    let state = #{}
+    state["obs_dim"] = obs_dim
+    state["act_dim"] = act_dim
+    state["latent_dim"] = latent_dim
+    state["W_enc"] = W_enc
+    state["b_enc"] = b_enc
+    state["W_tz"] = W_tz
+    state["W_ta"] = W_ta
+    state["b_t"] = b_t
+    state["W_r"] = W_r
+    state["b_r"] = b_r
+    state["W_v"] = W_v
+    state["b_v"] = b_v
+    state["W_pi"] = W_pi
+    state["b_pi"] = b_pi
+    return state
+}
+
+// ===================================================================
+//  Latent encoder : obs -> z
+//  z = tanh(W_enc * obs + b_enc)
+// ===================================================================
+pub fn dreamer_encode(state, obs) {
+    let Z = state["latent_dim"]
+    let O = state["obs_dim"]
+    let W = state["W_enc"]
+    let b = state["b_enc"]
+    let pre = dm_matvec(W, obs, Z, O)
+    let biased = dm_add(pre, b)
+    let mut z = []
+    let mut i = 0
+    while i < Z {
+        z = z + [dm_tanh(biased[i])]
+        i = i + 1
+    }
+    return z
+}
+
+// ===================================================================
+//  Transition model : (z, action) -> z_next
+//  z_next = tanh(W_tz * z + W_ta * onehot(action) + b_t)
+// ===================================================================
+pub fn dreamer_transition(state, z, action) {
+    let Z = state["latent_dim"]
+    let A = state["act_dim"]
+    let Wz = state["W_tz"]
+    let Wa = state["W_ta"]
+    let b  = state["b_t"]
+
+    let a_vec = dm_onehot(action, A)
+    let part_z = dm_matvec(Wz, z, Z, Z)
+    let part_a = dm_matvec(Wa, a_vec, Z, A)
+
+    let mut out = []
+    let mut i = 0
+    while i < Z {
+        let s = part_z[i] + part_a[i] + b[i]
+        out = out + [dm_tanh(s)]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Reward head  : z -> scalar
+//  Value head   : z -> scalar
+// ===================================================================
+pub fn dreamer_reward(state, z) {
+    let W = state["W_r"]
+    let b = state["b_r"]
+    return dm_dot(W, z) + b
+}
+
+pub fn dreamer_value(state, z) {
+    let W = state["W_v"]
+    let b = state["b_v"]
+    return dm_dot(W, z) + b
+}
+
+// ===================================================================
+//  Actor head  : z -> logits[A]  and softmax policy.
+// ===================================================================
+pub fn dreamer_actor_logits(state, z) {
+    let Z = state["latent_dim"]
+    let A = state["act_dim"]
+    let W = state["W_pi"]
+    let b = state["b_pi"]
+    let pre = dm_matvec(W, z, A, Z)
+    return dm_add(pre, b)
+}
+
+pub fn dreamer_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut sum_e = 0.0
+    let mut probs = []
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs = probs + [e]
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    if sum_e < 1.0e-12 { sum_e = 1.0e-12 }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [probs[i] / sum_e]
+        i = i + 1
+    }
+    return out
+}
+
+pub fn dreamer_sample_action(state, z) {
+    let logits = dreamer_actor_logits(state, z)
+    let probs = dreamer_softmax(logits)
+    let n = len(probs)
+    let r = dm_rand()
+    let mut cum = 0.0
+    let mut i = 0
+    while i < n {
+        cum = cum + probs[i]
+        if r <= cum {
+            return i
+        }
+        i = i + 1
+    }
+    return n - 1
+}
+
+// Greedy (deterministic) action — used by tests for reproducibility.
+pub fn dreamer_greedy_action(state, z) {
+    let logits = dreamer_actor_logits(state, z)
+    let n = len(logits)
+    if n == 0 { return 0 }
+    let mut best = 0
+    let mut best_v = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// ===================================================================
+//  Imagination rollout in latent space.
+//
+//  Given a starting latent z0, roll H steps using the actor (greedy)
+//  and the transition + reward + value heads. Returns a trajectory map:
+//    zs        : array of H+1 latents, zs[0] = z0
+//    actions   : array of H action indices
+//    rewards   : array of H scalar rewards
+//    values    : array of H+1 scalar values
+//    log_probs : array of H log pi(a|z) at the chosen action
+// ===================================================================
+pub fn dreamer_imagine(state, z0, horizon) {
+    // copy z0 (arrays are by-value across fn boundaries, so this is safe)
+    let mut zs = [z0]
+    let mut actions = []
+    let mut rewards = []
+    let mut values = [dreamer_value(state, z0)]
+    let mut log_probs = []
+
+    let mut cur = z0
+    let mut t = 0
+    while t < horizon {
+        let logits = dreamer_actor_logits(state, cur)
+        let probs = dreamer_softmax(logits)
+        let a = dreamer_greedy_action(state, cur)
+        // log pi(a|z) = log probs[a] with guard against 0
+        let mut pa = probs[a]
+        if pa < 1.0e-12 { pa = 1.0e-12 }
+        let lp = log(pa)
+
+        let nxt = dreamer_transition(state, cur, a)
+        let r = dreamer_reward(state, nxt)
+        let v_next = dreamer_value(state, nxt)
+
+        zs = zs + [nxt]
+        actions = actions + [a]
+        rewards = rewards + [r]
+        values = values + [v_next]
+        log_probs = log_probs + [lp]
+
+        cur = nxt
+        t = t + 1
+    }
+
+    let traj = #{}
+    traj["zs"] = zs
+    traj["actions"] = actions
+    traj["rewards"] = rewards
+    traj["values"] = values
+    traj["log_probs"] = log_probs
+    traj["horizon"] = horizon
+    return traj
+}
+
+// ===================================================================
+//  Lambda-return estimator for the imagined rollout.
+//
+//  R_t = r_t + gamma * ((1 - lam) * v_{t+1} + lam * R_{t+1})
+//  R_{H-1} = r_{H-1} + gamma * v_H
+// ===================================================================
+pub fn dreamer_lambda_return(rewards, values, gamma, lam) {
+    let H = len(rewards)
+    // preallocate
+    let mut returns = []
+    let mut i = 0
+    while i < H {
+        returns = returns + [0.0]
+        i = i + 1
+    }
+    if H == 0 {
+        return returns
+    }
+    // v has length H+1 (bootstrap at end)
+    let last_v = values[H]
+    let mut prev = rewards[H - 1] + gamma * last_v
+    returns[H - 1] = prev
+
+    let mut t = H - 2
+    while t >= 0 {
+        let v_next = values[t + 1]
+        let cur = rewards[t] + gamma * ((1.0 - lam) * v_next + lam * prev)
+        returns[t] = cur
+        prev = cur
+        t = t - 1
+    }
+    return returns
+}
+
+// ===================================================================
+//  Actor-critic losses on an imagined trajectory.
+//
+//  Critic loss : sum_t (v_t - R_t)^2 / H
+//  Actor loss  : - sum_t log pi(a_t|z_t) * advantage_t / H  (REINFORCE
+//                w/ baseline, advantage = R_t - v_t, detached v_t).
+// ===================================================================
+pub fn dreamer_critic_loss(traj, returns) {
+    let values = traj["values"]
+    let H = traj["horizon"]
+    if H == 0 { return 0.0 }
+    let mut loss = 0.0
+    let mut t = 0
+    while t < H {
+        let d = values[t] - returns[t]
+        loss = loss + d * d
+        t = t + 1
+    }
+    return loss / to_float(H)
+}
+
+pub fn dreamer_actor_loss(traj, returns) {
+    let values = traj["values"]
+    let log_probs = traj["log_probs"]
+    let H = traj["horizon"]
+    if H == 0 { return 0.0 }
+    let mut loss = 0.0
+    let mut t = 0
+    while t < H {
+        let adv = returns[t] - values[t]
+        loss = loss - log_probs[t] * adv
+        t = t + 1
+    }
+    return loss / to_float(H)
+}
+
+// ===================================================================
+//  World-model supervised loss (predicts next_obs reconstruction and
+//  reward). In pure Hexa we train two heads:
+//    - next latent prediction vs encoded(next_obs) in latent space,
+//    - reward prediction vs true reward.
+//  Returns the combined MSE.
+// ===================================================================
+pub fn dreamer_world_loss(state, obs, action, next_obs, reward) {
+    let z = dreamer_encode(state, obs)
+    let z_pred = dreamer_transition(state, z, action)
+    let z_true = dreamer_encode(state, next_obs)
+    let r_pred = dreamer_reward(state, z_pred)
+
+    let Z = state["latent_dim"]
+    let mut lat_loss = 0.0
+    let mut i = 0
+    while i < Z {
+        let d = z_pred[i] - z_true[i]
+        lat_loss = lat_loss + d * d
+        i = i + 1
+    }
+    lat_loss = lat_loss / to_float(Z)
+
+    let rd = r_pred - reward
+    let r_loss = rd * rd
+
+    return lat_loss + r_loss
+}
+
+// ===================================================================
+//  One numerical-gradient training step on the reward head, as a
+//  cheap self-contained smoke path that actually decreases the loss
+//  (full backprop through tanh stacks is out of scope for this file).
+//
+//  Returns new_state, loss_before, loss_after.
+// ===================================================================
+pub fn dreamer_train_step(state, obs, action, next_obs, reward, lr) {
+    let loss_before = dreamer_world_loss(state, obs, action, next_obs, reward)
+
+    // numerical gradient on reward head only (W_r, b_r), cheap + stable
+    let Z = state["latent_dim"]
+    let eps = 1.0e-4
+    let W_r = state["W_r"]
+    let b_r = state["b_r"]
+
+    // new weights
+    let mut new_W = []
+    let mut i = 0
+    while i < Z {
+        let orig = W_r[i]
+        // perturb +eps
+        let mut probe = []
+        let mut k = 0
+        while k < Z {
+            if k == i {
+                probe = probe + [orig + eps]
+            } else {
+                probe = probe + [W_r[k]]
+            }
+            k = k + 1
+        }
+        // rebuild temp state with probed W_r
+        let tmp = #{}
+        tmp["obs_dim"] = state["obs_dim"]
+        tmp["act_dim"] = state["act_dim"]
+        tmp["latent_dim"] = state["latent_dim"]
+        tmp["W_enc"] = state["W_enc"]
+        tmp["b_enc"] = state["b_enc"]
+        tmp["W_tz"] = state["W_tz"]
+        tmp["W_ta"] = state["W_ta"]
+        tmp["b_t"] = state["b_t"]
+        tmp["W_r"] = probe
+        tmp["b_r"] = b_r
+        tmp["W_v"] = state["W_v"]
+        tmp["b_v"] = state["b_v"]
+        tmp["W_pi"] = state["W_pi"]
+        tmp["b_pi"] = state["b_pi"]
+        let loss_plus = dreamer_world_loss(tmp, obs, action, next_obs, reward)
+        let g = (loss_plus - loss_before) / eps
+        new_W = new_W + [orig - lr * g]
+        i = i + 1
+    }
+
+    // b_r gradient
+    let tmp2 = #{}
+    tmp2["obs_dim"] = state["obs_dim"]
+    tmp2["act_dim"] = state["act_dim"]
+    tmp2["latent_dim"] = state["latent_dim"]
+    tmp2["W_enc"] = state["W_enc"]
+    tmp2["b_enc"] = state["b_enc"]
+    tmp2["W_tz"] = state["W_tz"]
+    tmp2["W_ta"] = state["W_ta"]
+    tmp2["b_t"] = state["b_t"]
+    tmp2["W_r"] = W_r
+    tmp2["b_r"] = b_r + eps
+    tmp2["W_v"] = state["W_v"]
+    tmp2["b_v"] = state["b_v"]
+    tmp2["W_pi"] = state["W_pi"]
+    tmp2["b_pi"] = state["b_pi"]
+    let loss_b_plus = dreamer_world_loss(tmp2, obs, action, next_obs, reward)
+    let g_b = (loss_b_plus - loss_before) / eps
+    let new_b = b_r - lr * g_b
+
+    // assemble new state (shallow copy with updated reward head)
+    let new_state = #{}
+    new_state["obs_dim"] = state["obs_dim"]
+    new_state["act_dim"] = state["act_dim"]
+    new_state["latent_dim"] = state["latent_dim"]
+    new_state["W_enc"] = state["W_enc"]
+    new_state["b_enc"] = state["b_enc"]
+    new_state["W_tz"] = state["W_tz"]
+    new_state["W_ta"] = state["W_ta"]
+    new_state["b_t"] = state["b_t"]
+    new_state["W_r"] = new_W
+    new_state["b_r"] = new_b
+    new_state["W_v"] = state["W_v"]
+    new_state["b_v"] = state["b_v"]
+    new_state["W_pi"] = state["W_pi"]
+    new_state["b_pi"] = state["b_pi"]
+
+    let loss_after = dreamer_world_loss(new_state, obs, action, next_obs, reward)
+    let result = #{}
+    result["state"] = new_state
+    result["loss_before"] = loss_before
+    result["loss_after"] = loss_after
+    return result
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

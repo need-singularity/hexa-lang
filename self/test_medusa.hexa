@@ -41,7 +41,661 @@
 //  run: ./hexa self/test_medusa.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/medusa.hexa"
+// -- inlined from self/ml/medusa.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/medusa.hexa — Medusa Heads (speculative decoding)
+//
+//  HEXA-LANG ML #76 — Medusa-1 style speculative decoding. A shared
+//  backbone feeds K Medusa heads; head k predicts token at offset
+//  t+1+k. Each head is a residual 2-layer MLP (skip + bottleneck +
+//  FC_vocab) sharing the backbone hidden. A tree attention mask is
+//  constructed so that head k's "sibling" slot attends only to
+//  previous head slots (causal over the draft tree), and the
+//  verify/accept loop measures the accepted prefix length.
+//
+//  Pure .hexa, self/ only, zero Rust. Deterministic so tests pin
+//  exact numbers. Base follows self/ml/multi_token_predict.hexa but
+//  adds:
+//    • Medusa head MLP (shared backbone -> skip + FC2 bottleneck -> FC_vocab)
+//    • tree attention mask (K+1 x K+1, lower-triangular tree causal)
+//    • verify + accept_prefix + running acceptance rate
+//    • @medusa attribute top-level step
+//
+//  API:
+//    medusa_make_config(vocab, hidden, k)                 -> MedusaConfig
+//    medusa_make_model(cfg, seed)                         -> MedusaModel
+//    medusa_backbone(model, tokens)                       -> [float] hidden
+//    medusa_head_logits(model, k, hidden)                 -> [float] vocab
+//    medusa_tree_mask(k_plus_1)                           -> [[int]]
+//    medusa_softmax(logits)                               -> [float]
+//    medusa_log_softmax(logits)                           -> [float]
+//    medusa_ce(logits, target)                            -> float
+//    medusa_predict_k(model, tokens)                      -> [int]
+//    medusa_verify(model, tokens, drafted, target_tag)    -> [int]
+//    medusa_accept_prefix(drafted, verified)              -> int
+//    medusa_acceptance_rate(model, tokens_list, target_tag) -> int (×100)
+//    medusa_loss_per_head(model, tokens, targets_k)       -> [float]
+//    medusa_loss(model, tokens, targets_k)                -> float
+//    medusa_train_step(model, tokens, targets_k, lr)      -> [float, MedusaModel]
+//    medusa_inference_loop(model, tokens, max_tokens, tag) -> [[int],[int]]
+//    @medusa
+//    medusa_step(model, tokens, targets_k, tag)           -> [[int],[int],[int],[int]]
+//
+//  Rules: HX4 SELF-HOST FIRST, HX5 AI-native, P1 no semicolons,
+//         P4 native collections. Avoid by-value mutation (return
+//         new arrays). No `return [a,b]` at tail — use let + return.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Structs ────────────────────────────────────────────────────
+struct MedusaConfig {
+    vocab: int,
+    hidden: int,
+    k: int        // number of Medusa heads (each predicts one future token)
+}
+
+// Each Medusa head is a tiny residual MLP:
+//   h1 = hidden + FC1(hidden)                  // skip
+//   h2 = relu(FC2(h1))                         // bottleneck
+//   logits = FC_out(h2) + bias                 // vocab projection
+// We store FC1, FC2, FC_out and the head offset scalar.
+struct MedusaHead {
+    fc1: array,      // [hidden][hidden]
+    fc2: array,      // [hidden][hidden]
+    fc_out: array,   // [vocab][hidden]
+    bias: array,     // [vocab]
+    offset: float    // per-head position offset (for determinism / differentiation)
+}
+
+struct MedusaModel {
+    cfg: MedusaConfig,
+    backbone_w: array,   // [hidden][vocab]
+    backbone_b: array,   // [hidden]
+    heads: array,        // [MedusaHead] length k
+    accepted: int,       // running accepted token counter
+    proposed: int,       // running proposed token counter
+    rng: int
+}
+
+// ── Deterministic LCG ─────────────────────────────────────────
+fn _med_lcg_next(state) {
+    let a = 1103515245
+    let c = 12345
+    let m = 2147483648
+    let mut s = (state * a + c) % m
+    if s < 0 { s = s + m }
+    s
+}
+
+fn _med_lcg_float(state) {
+    let ns = _med_lcg_next(state)
+    let fv = (to_float(ns % 10000) / 10000.0) - 0.5
+    let pair = [fv, ns]
+    pair
+}
+
+// ── Math helpers ──────────────────────────────────────────────
+fn _med_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+fn _med_relu(x) {
+    if x < 0.0 { return 0.0 }
+    x
+}
+
+fn _med_ln(x) {
+    if x <= 0.0 { return 0.0 - 999.0 }
+    let mut v = x
+    let mut adj = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        adj = adj + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        adj = adj - 1.0
+    }
+    let y = v - 1.0
+    let y2 = y * y
+    let y3 = y2 * y
+    let y4 = y3 * y
+    let y5 = y4 * y
+    let approx = y - y2 / 2.0 + y3 / 3.0 - y4 / 4.0 + y5 / 5.0
+    adj + approx
+}
+
+// ── Config + model builder ────────────────────────────────────
+fn medusa_make_config(vocab, hidden, k) {
+    MedusaConfig { vocab: vocab, hidden: hidden, k: k }
+}
+
+// Build a (rows × cols) weight matrix from the LCG.
+fn _med_build_mat(rows, cols, scale, rng) {
+    let mut mat = []
+    let mut cur = rng
+    let mut i = 0
+    while i < rows {
+        let mut row = []
+        let mut j = 0
+        while j < cols {
+            let pair = _med_lcg_float(cur)
+            row = row + [pair[0] * scale]
+            cur = pair[1]
+            j = j + 1
+        }
+        mat = mat + [row]
+        i = i + 1
+    }
+    let out = [mat, cur]
+    out
+}
+
+fn medusa_make_model(cfg, seed) {
+    let mut rng = seed
+    // backbone: hidden x vocab
+    let bw_pair = _med_build_mat(cfg.hidden, cfg.vocab, 0.1, rng)
+    let bw = bw_pair[0]
+    rng = bw_pair[1]
+    // backbone bias
+    let mut bb = []
+    let mut bi = 0
+    while bi < cfg.hidden {
+        bb = bb + [0.0]
+        bi = bi + 1
+    }
+    // Build k Medusa heads
+    let mut heads = []
+    let mut h = 0
+    while h < cfg.k {
+        let fc1_pair = _med_build_mat(cfg.hidden, cfg.hidden, 0.1, rng)
+        let fc1 = fc1_pair[0]
+        rng = fc1_pair[1]
+        let fc2_pair = _med_build_mat(cfg.hidden, cfg.hidden, 0.1, rng)
+        let fc2 = fc2_pair[0]
+        rng = fc2_pair[1]
+        let fco_pair = _med_build_mat(cfg.vocab, cfg.hidden, 0.15, rng)
+        let fco = fco_pair[0]
+        rng = fco_pair[1]
+        let mut hb = []
+        let mut vi = 0
+        while vi < cfg.vocab {
+            // Per-head offset so heads truly differ per position.
+            hb = hb + [to_float(h) * 0.02]
+            vi = vi + 1
+        }
+        let head = MedusaHead {
+            fc1: fc1,
+            fc2: fc2,
+            fc_out: fco,
+            bias: hb,
+            offset: to_float(h) * 0.01
+        }
+        heads = heads + [head]
+        h = h + 1
+    }
+    MedusaModel {
+        cfg: cfg,
+        backbone_w: bw,
+        backbone_b: bb,
+        heads: heads,
+        accepted: 0,
+        proposed: 0,
+        rng: rng
+    }
+}
+
+// ── Tree attention mask (Medusa-1 style) ──────────────────────
+// Medusa draft tree has 1 root slot + k head slots (total k+1 slots).
+// Each slot i may attend to slot j iff j <= i (causal over the tree).
+// Returns [[int]] of shape (k+1 × k+1), entries 0/1.
+@pure
+fn medusa_tree_mask(k_plus_1) {
+    let mut mask = []
+    let mut i = 0
+    while i < k_plus_1 {
+        let mut row = []
+        let mut j = 0
+        while j < k_plus_1 {
+            if j <= i { row = row + [1] } else { row = row + [0] }
+            j = j + 1
+        }
+        mask = mask + [row]
+        i = i + 1
+    }
+    mask
+}
+
+// ── Shared backbone: sum of token embeddings + bias + squash ──
+@pure
+fn medusa_backbone(model, tokens) {
+    let cfg = model.cfg
+    let mut hidden = []
+    let mut i = 0
+    while i < cfg.hidden {
+        let mut s = model.backbone_b[i]
+        let mut j = 0
+        while j < len(tokens) {
+            let tok = tokens[j]
+            if tok >= 0 {
+                if tok < cfg.vocab {
+                    s = s + model.backbone_w[i][tok]
+                }
+            }
+            j = j + 1
+        }
+        let v = s / (1.0 + _med_abs(s))
+        hidden = hidden + [v]
+        i = i + 1
+    }
+    hidden
+}
+
+// ── Apply a matrix-vector product: result[i] = sum_j mat[i][j]*vec[j]
+@pure
+fn _med_matvec(mat, vec) {
+    let rows = len(mat)
+    let cols = len(vec)
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let mut s = 0.0
+        let mut j = 0
+        while j < cols {
+            s = s + mat[i][j] * vec[j]
+            j = j + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    out
+}
+
+// ── Head forward: residual MLP → vocab logits ─────────────────
+@pure
+fn medusa_head_logits(model, head_idx, hidden) {
+    let head = model.heads[head_idx]
+    // skip connection: h1 = hidden + FC1 @ hidden
+    let fc1_out = _med_matvec(head.fc1, hidden)
+    let mut h1 = []
+    let mut i = 0
+    while i < len(hidden) {
+        h1 = h1 + [hidden[i] + fc1_out[i]]
+        i = i + 1
+    }
+    // bottleneck: h2 = relu(FC2 @ h1)
+    let fc2_out = _med_matvec(head.fc2, h1)
+    let mut h2 = []
+    let mut j = 0
+    while j < len(fc2_out) {
+        h2 = h2 + [_med_relu(fc2_out[j])]
+        j = j + 1
+    }
+    // output: logits = FC_out @ h2 + bias + offset
+    let cfg = model.cfg
+    let mut logits = []
+    let mut v = 0
+    while v < cfg.vocab {
+        let mut s = head.bias[v] + head.offset
+        let mut k2 = 0
+        while k2 < cfg.hidden {
+            s = s + head.fc_out[v][k2] * h2[k2]
+            k2 = k2 + 1
+        }
+        logits = logits + [s]
+        v = v + 1
+    }
+    logits
+}
+
+// ── Softmax / log-softmax / CE ────────────────────────────────
+@pure
+fn medusa_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = []
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        exps = exps + [e]
+        total = total + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [exps[i] / total]
+        i = i + 1
+    }
+    out
+}
+
+@pure
+fn medusa_log_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut total = 0.0
+    i = 0
+    while i < n {
+        total = total + exp(logits[i] - mx)
+        i = i + 1
+    }
+    let log_total = _med_ln(total)
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out + [(logits[i] - mx) - log_total]
+        i = i + 1
+    }
+    out
+}
+
+@pure
+fn medusa_ce(logits, target) {
+    let logp = medusa_log_softmax(logits)
+    0.0 - logp[target]
+}
+
+// ── argmax ─────────────────────────────────────────────────────
+fn _med_argmax(xs) {
+    let n = len(xs)
+    let mut best = xs[0]
+    let mut idx = 0
+    let mut i = 1
+    while i < n {
+        if xs[i] > best {
+            best = xs[i]
+            idx = i
+        }
+        i = i + 1
+    }
+    idx
+}
+
+// ── Draft: k Medusa heads produce k candidate tokens ──────────
+@pure
+fn medusa_predict_k(model, tokens) {
+    let hidden = medusa_backbone(model, tokens)
+    let k = model.cfg.k
+    let mut out = []
+    let mut h = 0
+    while h < k {
+        let logits = medusa_head_logits(model, h, hidden)
+        out = out + [_med_argmax(logits)]
+        h = h + 1
+    }
+    out
+}
+
+// ── Target oracle (deterministic, tag-selected) ───────────────
+// tag 0: context-hash modulo vocab
+// tag 1: always returns 0
+// tag 2: agreement-biased (matches head0 prediction most of time)
+fn _med_target_eval(ctx, tag, vocab) {
+    if tag == 1 { return 0 }
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 7) * 1315423911)
+        i = i + 1
+    }
+    if tag == 2 {
+        // same hash but clamp to vocab
+        let v2 = h % vocab
+        let ok = if v2 < 0 { v2 + vocab } else { v2 }
+        return ok
+    }
+    let v = h % vocab
+    if v < 0 { v + vocab } else { v }
+}
+
+// ── Verify: for each drafted position, ask target what it would
+//    emit given ctx + drafted[0..i]. Returns target tokens. ────
+fn medusa_verify(model, tokens, drafted, target_tag) {
+    let cfg = model.cfg
+    let mut local = []
+    let mut a = 0
+    while a < len(tokens) {
+        local = local + [tokens[a]]
+        a = a + 1
+    }
+    let mut verified = []
+    let mut i = 0
+    while i < len(drafted) {
+        let t = _med_target_eval(local, target_tag, cfg.vocab)
+        verified = verified + [t]
+        local = local + [drafted[i]]
+        i = i + 1
+    }
+    verified
+}
+
+// ── Accept longest matching prefix ────────────────────────────
+@pure
+fn medusa_accept_prefix(drafted, verified) {
+    let mut count = 0
+    let mut i = 0
+    let mut stop = 0
+    while i < len(drafted) {
+        if stop == 0 {
+            if drafted[i] == verified[i] {
+                count = count + 1
+            } else {
+                stop = 1
+            }
+        }
+        i = i + 1
+    }
+    count
+}
+
+// ── Running acceptance rate (×100 for integer comparison) ─────
+// Runs verify over a list of token contexts and returns
+// floor(accepted_total / proposed_total * 100).
+fn medusa_acceptance_rate(model, contexts, target_tag) {
+    let mut accepted = 0
+    let mut proposed = 0
+    let mut i = 0
+    while i < len(contexts) {
+        let ctx = contexts[i]
+        let drafted = medusa_predict_k(model, ctx)
+        let verified = medusa_verify(model, ctx, drafted, target_tag)
+        let acc = medusa_accept_prefix(drafted, verified)
+        accepted = accepted + acc
+        proposed = proposed + len(drafted)
+        i = i + 1
+    }
+    if proposed == 0 { return 0 }
+    (accepted * 100) / proposed
+}
+
+// ── Loss: sum of per-head CE ──────────────────────────────────
+@pure
+fn medusa_loss_per_head(model, tokens, targets_k) {
+    let hidden = medusa_backbone(model, tokens)
+    let k = model.cfg.k
+    let mut losses = []
+    let mut h = 0
+    while h < k {
+        let logits = medusa_head_logits(model, h, hidden)
+        let tgt = targets_k[h]
+        losses = losses + [medusa_ce(logits, tgt)]
+        h = h + 1
+    }
+    losses
+}
+
+@pure
+fn medusa_loss(model, tokens, targets_k) {
+    let losses = medusa_loss_per_head(model, tokens, targets_k)
+    let mut s = 0.0
+    let mut i = 0
+    while i < len(losses) {
+        s = s + losses[i]
+        i = i + 1
+    }
+    s
+}
+
+// ── Train step: analytic gradient on head biases ──────────────
+// Only the bias vector is updated (enough to move loss). For bias
+// of a linear head under CE: dL/db[v] = softmax(logits)[v] - [v==tgt]
+fn medusa_train_step(model, tokens, targets_k, lr) {
+    let hidden = medusa_backbone(model, tokens)
+    let cfg = model.cfg
+    let mut new_heads = []
+    let mut h = 0
+    while h < cfg.k {
+        let head = model.heads[h]
+        let logits = medusa_head_logits(model, h, hidden)
+        let probs = medusa_softmax(logits)
+        let tgt = targets_k[h]
+        let mut nb = []
+        let mut v = 0
+        while v < cfg.vocab {
+            let mut grad = probs[v]
+            if v == tgt { grad = grad - 1.0 }
+            nb = nb + [head.bias[v] - lr * grad]
+            v = v + 1
+        }
+        let nh = MedusaHead {
+            fc1: head.fc1,
+            fc2: head.fc2,
+            fc_out: head.fc_out,
+            bias: nb,
+            offset: head.offset
+        }
+        new_heads = new_heads + [nh]
+        h = h + 1
+    }
+    let m2 = MedusaModel {
+        cfg: cfg,
+        backbone_w: model.backbone_w,
+        backbone_b: model.backbone_b,
+        heads: new_heads,
+        accepted: model.accepted,
+        proposed: model.proposed,
+        rng: model.rng
+    }
+    let new_loss = medusa_loss(m2, tokens, targets_k)
+    let packed = [new_loss, m2]
+    packed
+}
+
+// ── Inference loop ─────────────────────────────────────────────
+// At each step: draft k tokens, verify against target (tag), commit
+// the accepted prefix (or at least 1 token to guarantee progress —
+// the target's t+1 prediction). Returns [generated_tail, accept_counts]
+fn medusa_inference_loop(model, tokens, max_tokens, target_tag) {
+    let cfg = model.cfg
+    let mut cur = []
+    let mut i = 0
+    while i < len(tokens) {
+        cur = cur + [tokens[i]]
+        i = i + 1
+    }
+    let mut generated = []
+    let mut accept_log = []
+    let mut produced = 0
+    let mut guard = 0
+    while produced < max_tokens {
+        if guard > max_tokens + 8 {
+            produced = max_tokens   // hard stop
+        } else {
+            let drafted = medusa_predict_k(model, cur)
+            let verified = medusa_verify(model, cur, drafted, target_tag)
+            let acc = medusa_accept_prefix(drafted, verified)
+            accept_log = accept_log + [acc]
+            // commit min(acc+1, max_tokens-produced) tokens:
+            //   first acc drafted tokens (all matched target) +
+            //   1 extra target token for forward progress
+            let want = acc + 1
+            let remain = max_tokens - produced
+            let take = if want < remain { want } else { remain }
+            let mut j = 0
+            while j < take {
+                if j < acc {
+                    cur = cur + [drafted[j]]
+                    generated = generated + [drafted[j]]
+                } else {
+                    cur = cur + [verified[j]]
+                    generated = generated + [verified[j]]
+                }
+                j = j + 1
+            }
+            produced = produced + take
+            guard = guard + 1
+        }
+    }
+    let packed = [generated, accept_log]
+    packed
+}
+
+// ── @medusa top-level step ────────────────────────────────────
+// Returns [predicted_k, loss_per_head×100_int, accept_mask, mask_row_sums]
+@medusa
+fn medusa_step(model, tokens, targets_k, target_tag) {
+    let pred = medusa_predict_k(model, tokens)
+    let losses = medusa_loss_per_head(model, tokens, targets_k)
+    let mut losses_x100 = []
+    let mut i = 0
+    while i < len(losses) {
+        losses_x100 = losses_x100 + [to_int(losses[i] * 100.0)]
+        i = i + 1
+    }
+    let verified = medusa_verify(model, tokens, pred, target_tag)
+    let mut accept_mask = []
+    let mut j = 0
+    let mut stop = 0
+    while j < len(pred) {
+        if stop == 0 {
+            if pred[j] == verified[j] {
+                accept_mask = accept_mask + [1]
+            } else {
+                accept_mask = accept_mask + [0]
+                stop = 1
+            }
+        } else {
+            accept_mask = accept_mask + [0]
+        }
+        j = j + 1
+    }
+    // Tree mask row sums (shows lower-triangular structure)
+    let mask = medusa_tree_mask(model.cfg.k + 1)
+    let mut row_sums = []
+    let mut r = 0
+    while r < len(mask) {
+        let row = mask[r]
+        let mut s = 0
+        let mut c = 0
+        while c < len(row) {
+            s = s + row[c]
+            c = c + 1
+        }
+        row_sums = row_sums + [s]
+        r = r + 1
+    }
+    let packed = [pred, losses_x100, accept_mask, row_sums]
+    packed
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -33,7 +33,566 @@
 //  Run: ./hexa self/test_llm_routing.hexa
 // ===================================================================
 
-import "ml/llm_routing.hexa"
+// -- inlined from self/ml/llm_routing.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/llm_routing.hexa — LLM Routing (#319)
+//
+//  Query-level router that selects the optimal model (small/medium/
+//  large) based on estimated difficulty, balancing quality vs cost.
+//
+//  Architecture:
+//      Router (lightweight classifier):
+//          h = tanh( W_r * query + b_r )       D_in -> D_hidden
+//          logits = W_o * h + b_o              D_hidden -> n_models
+//          probs = softmax(logits)             model selection
+//
+//      Model pool: n_models models with different cost/quality
+//          model[i]:  W_m[i] * query + b_m[i]  D_in -> D_in
+//          cost[i] = (i+1) / n_models          linear cost curve
+//
+//  Routing policy:
+//      Easy queries -> small model (low cost)
+//      Hard queries -> large model (high quality)
+//
+//  Training objective:
+//      L = quality_loss + lambda * budget_loss
+//      quality_loss = MSE(model_output, target)
+//      budget_loss = max(0, avg_cost - budget)
+//
+//  API:
+//    lr_init(D_in, D_hidden, n_models, seed) -> system
+//    lr_route(system, query) -> model_id
+//    lr_route_probs(system, query) -> [probs]
+//    lr_model_forward(system, model_id, query) -> output
+//    lr_forward(system, query) -> output
+//    lr_cost(model_id) -> float
+//    lr_quality_loss(system, query, target) -> float
+//    lr_budget_loss(system, queries, budget) -> float
+//    lr_train_step(system, X, Y, lr, budget) -> system
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / route)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn lr_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn lr_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn lr_tanh(v) {
+    let ep = lr_exp(v)
+    let en = lr_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn lr_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut g = v / 2.0
+    for _i in 0..20 {
+        g = (g + v / g) / 2.0
+    }
+    return g
+}
+
+fn lr_zeros(n) {
+    let mut arr = []
+    for _i in 0..n { arr = arr + [0.0] }
+    return arr
+}
+
+fn lr_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn lr_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn lr_uniform(state) {
+    let s = lr_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ── Softmax ──────────────────────────────────────────────────────
+
+fn lr_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = lr_zeros(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = lr_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_init — create router + model pool
+//
+//  Router weights:
+//      W_r  : D_hidden x D_in     (hidden layer)
+//      b_r  : D_hidden
+//      W_o  : n_models x D_hidden (output logits)
+//      b_o  : n_models
+//
+//  Model pool (n_models linear models):
+//      W_m  : n_models x D_in x D_in
+//      b_m  : n_models x D_in
+// ═══════════════════════════════════════════════════════════════════
+fn lr_init(D_in, D_hidden, n_models, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Xavier-ish scale factor
+    let scale_r = 1.0 / lr_sqrt(to_float(D_in))
+    let scale_o = 1.0 / lr_sqrt(to_float(D_hidden))
+    let scale_m = 1.0 / lr_sqrt(to_float(D_in))
+
+    // Router hidden layer
+    let mut W_r = lr_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = lr_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_r[i][j] = (u[0] - 0.5) * scale_r
+        }
+    }
+    let b_r = lr_zeros(D_hidden)
+
+    // Router output layer
+    let mut W_o = lr_zeros_2d(n_models, D_hidden)
+    for i in 0..n_models {
+        for j in 0..D_hidden {
+            let u = lr_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[i][j] = (u[0] - 0.5) * scale_o
+        }
+    }
+    let b_o = lr_zeros(n_models)
+
+    // Model pool: n_models linear transforms  D_in -> D_in
+    let mut W_m = []
+    let mut b_m = []
+    for m in 0..n_models {
+        let mut Wm_i = lr_zeros_2d(D_in, D_in)
+        for r in 0..D_in {
+            for c in 0..D_in {
+                let u = lr_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                Wm_i[r][c] = (u[0] - 0.5) * scale_m
+            }
+        }
+        W_m = W_m + [Wm_i]
+        b_m = b_m + [lr_zeros(D_in)]
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "n_models": n_models,
+        "W_r": W_r,
+        "b_r": b_r,
+        "W_o": W_o,
+        "b_o": b_o,
+        "W_m": W_m,
+        "b_m": b_m
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Router forward — returns routing probabilities
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_route_probs(system, query) {
+    let W_r = system["W_r"]
+    let b_r = system["b_r"]
+    let W_o = system["W_o"]
+    let b_o = system["b_o"]
+    let D_hidden = system["D_hidden"]
+    let D_in = system["D_in"]
+    let n_models = system["n_models"]
+
+    // hidden = tanh(W_r * query + b_r)
+    let mut hidden = lr_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_r[i]
+        for j in 0..D_in { s = s + W_r[i][j] * query[j] }
+        hidden[i] = lr_tanh(s)
+    }
+
+    // logits = W_o * hidden + b_o
+    let mut logits = lr_zeros(n_models)
+    for i in 0..n_models {
+        let mut s = b_o[i]
+        for j in 0..D_hidden { s = s + W_o[i][j] * hidden[j] }
+        logits[i] = s
+    }
+
+    return lr_softmax(logits)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_route — argmax of routing probs
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_route(system, query) {
+    let probs = lr_route_probs(system, query)
+    let n = len(probs)
+    let mut best = probs[0]
+    let mut idx = 0
+    for i in 1..n {
+        if probs[i] > best {
+            best = probs[i]
+            idx = i
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_model_forward — run selected model on query
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_model_forward(system, model_id, query) {
+    let W_m = system["W_m"]
+    let b_m = system["b_m"]
+    let D_in = system["D_in"]
+    let Wm = W_m[model_id]
+    let bm = b_m[model_id]
+    let mut out = lr_zeros(D_in)
+    for i in 0..D_in {
+        let mut s = bm[i]
+        for j in 0..D_in { s = s + Wm[i][j] * query[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_forward — route + execute (end-to-end)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_forward(system, query) {
+    let model_id = lr_route(system, query)
+    return lr_model_forward(system, model_id, query)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_cost — cost of model_id (linear: (id+1)/n_models)
+//  model 0 is cheapest, model n_models-1 is most expensive
+// ═══════════════════════════════════════════════════════════════════
+fn lr_cost(model_id) {
+    return to_float(model_id + 1)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_quality_loss — MSE between routed output and target
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_quality_loss(system, query, target) {
+    let output = lr_forward(system, query)
+    let D = len(output)
+    let mut mse = 0.0
+    for i in 0..D {
+        let diff = output[i] - target[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(D)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_budget_loss — penalty when avg cost > budget
+//  Soft routing: uses expected cost under routing probs
+//  L_budget = max(0, E[cost] - budget)^2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn lr_budget_loss(system, queries, budget) {
+    let N = len(queries)
+    if N == 0 { return 0.0 }
+    let n_models = system["n_models"]
+    let mut total_cost = 0.0
+    for i in 0..N {
+        let probs = lr_route_probs(system, queries[i])
+        let mut expected_cost = 0.0
+        for m in 0..n_models {
+            expected_cost = expected_cost + probs[m] * lr_cost(m)
+        }
+        total_cost = total_cost + expected_cost
+    }
+    let avg_cost = total_cost / to_float(N)
+    let excess = avg_cost - budget
+    if excess <= 0.0 { return 0.0 }
+    return excess * excess
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  lr_train_step — one gradient descent step
+//
+//  For each sample (x, y):
+//    1. Router: h = tanh(W_r * x + b_r), logits = W_o * h + b_o
+//       probs = softmax(logits), selected = argmax(probs)
+//    2. Forward model: out = W_m[sel] * x + b_m[sel]
+//    3. Quality loss: L_q = (1/D) * sum((out_i - y_i)^2)
+//    4. Budget penalty: L_b = lam * max(0, E[cost] - budget)^2
+//
+//  Gradients (quality path):
+//    dL_q/dout = 2/D * (out - y)
+//    dL_q/dW_m[sel] = dout * x^T
+//    dL_q/db_m[sel] = dout
+//
+//  Router gradient (REINFORCE-style):
+//    For the selected model, nudge the router logit:
+//      if loss is low   -> increase prob of selected model
+//      if loss is high  -> decrease prob of selected model
+//    dlogit[sel] += -(loss - baseline) * (1 - prob[sel])
+//    dlogit[k!=sel] += (loss - baseline) * prob[k]
+//    Then backprop through softmax -> W_o, b_o -> tanh -> W_r, b_r
+//
+//  Budget gradient:
+//    dL_b/dlogit[m] = 2 * lam * excess * (cost_m - E[cost]) * prob[m]
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn lr_train_step(system, X, Y, lr, budget) {
+    let N = len(X)
+    let D_in = system["D_in"]
+    let D_hidden = system["D_hidden"]
+    let n_models = system["n_models"]
+    let W_r = system["W_r"]
+    let b_r = system["b_r"]
+    let W_o = system["W_o"]
+    let b_o = system["b_o"]
+    let W_m = system["W_m"]
+    let b_m = system["b_m"]
+
+    // Accumulators
+    let mut gW_r = lr_zeros_2d(D_hidden, D_in)
+    let mut gb_r = lr_zeros(D_hidden)
+    let mut gW_o = lr_zeros_2d(n_models, D_hidden)
+    let mut gb_o = lr_zeros(n_models)
+
+    let mut gW_m = []
+    let mut gb_m = []
+    for m in 0..n_models {
+        gW_m = gW_m + [lr_zeros_2d(D_in, D_in)]
+        gb_m = gb_m + [lr_zeros(D_in)]
+    }
+
+    // Compute baseline loss (mean quality loss across batch)
+    let mut baseline = 0.0
+    for i in 0..N {
+        let sel_i = lr_route(system, X[i])
+        let out_i = lr_model_forward(system, sel_i, X[i])
+        let mut mse_i = 0.0
+        for d in 0..D_in {
+            let diff = out_i[d] - Y[i][d]
+            mse_i = mse_i + diff * diff
+        }
+        baseline = baseline + mse_i / to_float(D_in)
+    }
+    baseline = baseline / to_float(N)
+
+    // Budget cost computation
+    let lam = 0.1
+    let mut total_expected_cost = 0.0
+
+    for i in 0..N {
+        let query = X[i]
+        let target = Y[i]
+
+        // ── Router forward ──────────────────────────────────
+        let mut hidden = lr_zeros(D_hidden)
+        for h in 0..D_hidden {
+            let mut s = b_r[h]
+            for j in 0..D_in { s = s + W_r[h][j] * query[j] }
+            hidden[h] = lr_tanh(s)
+        }
+
+        let mut logits = lr_zeros(n_models)
+        for m in 0..n_models {
+            let mut s = b_o[m]
+            for j in 0..D_hidden { s = s + W_o[m][j] * hidden[j] }
+            logits[m] = s
+        }
+
+        let probs = lr_softmax(logits)
+
+        // Selected model
+        let mut best_p = probs[0]
+        let mut sel = 0
+        for m in 1..n_models {
+            if probs[m] > best_p {
+                best_p = probs[m]
+                sel = m
+            }
+        }
+
+        // ── Model forward ───────────────────────────────────
+        let Wm_sel = W_m[sel]
+        let bm_sel = b_m[sel]
+        let mut out = lr_zeros(D_in)
+        for d in 0..D_in {
+            let mut s = bm_sel[d]
+            for j in 0..D_in { s = s + Wm_sel[d][j] * query[j] }
+            out[d] = s
+        }
+
+        // ── Quality loss and model gradient ─────────────────
+        let mut loss_q = 0.0
+        let mut d_out = lr_zeros(D_in)
+        for d in 0..D_in {
+            let diff = out[d] - target[d]
+            loss_q = loss_q + diff * diff
+            d_out[d] = 2.0 * diff / to_float(D_in)
+        }
+        loss_q = loss_q / to_float(D_in)
+
+        // Gradient for W_m[sel], b_m[sel]
+        for d in 0..D_in {
+            gb_m[sel][d] = gb_m[sel][d] + d_out[d]
+            for j in 0..D_in {
+                gW_m[sel][d][j] = gW_m[sel][d][j] + d_out[d] * query[j]
+            }
+        }
+
+        // ── Expected cost ───────────────────────────────────
+        let mut exp_cost = 0.0
+        for m in 0..n_models {
+            exp_cost = exp_cost + probs[m] * lr_cost(m)
+        }
+        total_expected_cost = total_expected_cost + exp_cost
+
+        // ── Router gradient (REINFORCE) ─────────────────────
+        let advantage = loss_q - baseline
+        let mut d_logits = lr_zeros(n_models)
+        for m in 0..n_models {
+            if m == sel {
+                d_logits[m] = (0.0 - advantage) * (1.0 - probs[m])
+            } else {
+                d_logits[m] = advantage * probs[m]
+            }
+        }
+
+        // ── Budget gradient on router logits ────────────────
+        let avg_cost = exp_cost
+        let excess = avg_cost - budget
+        if excess > 0.0 {
+            for m in 0..n_models {
+                let cost_dev = lr_cost(m) - avg_cost
+                d_logits[m] = d_logits[m] + 2.0 * lam * excess * cost_dev * probs[m]
+            }
+        }
+
+        // ── Backprop router: logits -> W_o, b_o -> hidden -> W_r, b_r
+        for m in 0..n_models {
+            gb_o[m] = gb_o[m] + d_logits[m]
+            for j in 0..D_hidden {
+                gW_o[m][j] = gW_o[m][j] + d_logits[m] * hidden[j]
+            }
+        }
+
+        // grad hidden from router output
+        let mut d_hidden = lr_zeros(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for m in 0..n_models { s = s + d_logits[m] * W_o[m][j] }
+            d_hidden[j] = s
+        }
+
+        // tanh backprop: d_pre = d_hidden * (1 - hidden^2)
+        let mut d_pre = lr_zeros(D_hidden)
+        for j in 0..D_hidden {
+            d_pre[j] = d_hidden[j] * (1.0 - hidden[j] * hidden[j])
+        }
+
+        for j in 0..D_hidden {
+            gb_r[j] = gb_r[j] + d_pre[j]
+            for k in 0..D_in {
+                gW_r[j][k] = gW_r[j][k] + d_pre[j] * query[k]
+            }
+        }
+    }
+
+    // ── Apply gradients ─────────────────────────────────────
+    let inv_N = 1.0 / to_float(N)
+
+    let mut W_r_new = lr_zeros_2d(D_hidden, D_in)
+    let mut b_r_new = lr_zeros(D_hidden)
+    for i in 0..D_hidden {
+        b_r_new[i] = b_r[i] - lr * gb_r[i] * inv_N
+        for j in 0..D_in {
+            W_r_new[i][j] = W_r[i][j] - lr * gW_r[i][j] * inv_N
+        }
+    }
+
+    let mut W_o_new = lr_zeros_2d(n_models, D_hidden)
+    let mut b_o_new = lr_zeros(n_models)
+    for m in 0..n_models {
+        b_o_new[m] = b_o[m] - lr * gb_o[m] * inv_N
+        for j in 0..D_hidden {
+            W_o_new[m][j] = W_o[m][j] - lr * gW_o[m][j] * inv_N
+        }
+    }
+
+    let mut W_m_new = []
+    let mut b_m_new = []
+    for m in 0..n_models {
+        let mut Wm_new = lr_zeros_2d(D_in, D_in)
+        let mut bm_new = lr_zeros(D_in)
+        for d in 0..D_in {
+            bm_new[d] = b_m[m][d] - lr * gb_m[m][d] * inv_N
+            for j in 0..D_in {
+                Wm_new[d][j] = W_m[m][d][j] - lr * gW_m[m][d][j] * inv_N
+            }
+        }
+        W_m_new = W_m_new + [Wm_new]
+        b_m_new = b_m_new + [bm_new]
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "n_models": n_models,
+        "W_r": W_r_new,
+        "b_r": b_r_new,
+        "W_o": W_o_new,
+        "b_o": b_o_new,
+        "W_m": W_m_new,
+        "b_m": b_m_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

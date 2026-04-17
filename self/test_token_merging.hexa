@@ -36,7 +36,562 @@
 //  run: ./hexa self/test_token_merging.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/token_merging.hexa"
+// -- inlined from self/ml/token_merging.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/token_merging.hexa — Token Merging (ToMe)
+//
+//  HEXA-LANG ML #115 — Redundant token merging for acceleration.
+//  Based on Bolya et al. "Token Merging: Your ViT but Faster" (2023).
+//
+//  Core idea: between attention layers, find the most similar token
+//  pairs via bipartite matching and merge them (weighted average).
+//  This reduces the token count flowing through subsequent layers,
+//  giving ~2x throughput with minimal quality loss.
+//
+//  Algorithm:
+//    1. Split tokens into src (even indices) and dst (odd indices)
+//    2. Compute pairwise cosine similarity between src and dst
+//    3. Bipartite matching: each src token matches its most-similar dst
+//    4. Select top-r most similar matched pairs
+//    5. Merge: weighted average of matched pairs
+//    6. Unmerge: duplicate merged token back to original positions
+//
+//  Pure .hexa, self/ only, zero Rust. Deterministic.
+//
+//  API:
+//    tome_make_config(dim, r, min_tokens)         -> ToMeConfig
+//    tome_cosine_sim(a, b, dim)                   -> float
+//    tome_dot(a, b, dim)                           -> float
+//    tome_norm(v, dim)                             -> float
+//    tome_split_src_dst(tokens, n, dim)            -> [src, dst, src_idx, dst_idx]
+//    tome_pairwise_sim(src, dst, ns, nd, dim)      -> [[float]]
+//    tome_bipartite_match(sim, ns, nd)             -> [int] (src->dst mapping)
+//    tome_match_scores(sim, matching, ns)          -> [float]
+//    tome_select_top_r(scores, matching, r)        -> [[int,int,float]]
+//    tome_merge(tokens, n, dim, pairs, np)         -> [merged, merged_n, merge_info]
+//    tome_unmerge(merged, merged_n, dim, info, original_n) -> [float]
+//    tome_merge_layer(tokens, n, dim, cfg)         -> [merged, merged_n, info]
+//    tome_unmerge_layer(merged, merged_n, dim, info, original_n) -> [float]
+//    tome_throughput_gain(original_n, merged_n)    -> float
+//    tome_multi_layer(tokens, n, dim, cfg, n_layers) -> [result, final_n, stats]
+//    tome_make_tracker()                           -> ToMeTracker
+//    tome_update_tracker(tracker, orig, merged)    -> ToMeTracker
+//    tome_report(tracker)                          -> [float, int]
+//    @tome
+//    tome_step(tokens, n, dim, cfg)                -> [merged, merged_n, gain, info]
+//
+//  Rules: HX4 SELF-HOST FIRST, HX5 AI-native, no semicolons.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Structs ────────────────────────────────────────────────────
+struct ToMeConfig {
+    dim: int,
+    r: int,          // number of tokens to merge per layer
+    min_tokens: int  // never merge below this count
+}
+
+struct ToMeMergeInfo {
+    src_indices: array,   // original indices of merged src tokens
+    dst_indices: array,   // original indices of merged dst tokens
+    kept_indices: array,  // original indices of kept (unmerged) tokens
+    original_n: int,
+    merged_n: int
+}
+
+struct ToMeTracker {
+    total_original: int,
+    total_merged: int,
+    layers_processed: int
+}
+
+// ── Config builder ────────────────────────────────────────────
+fn tome_make_config(dim, r, min_tokens) {
+    ToMeConfig { dim: dim, r: r, min_tokens: min_tokens }
+}
+
+// ── Math helpers ──────────────────────────────────────────────
+fn _tome_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    x
+}
+
+fn _tome_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 20 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    g
+}
+
+// ── Dot product of two flat vectors starting at given offsets ──
+fn tome_dot(a, a_off, b, b_off, dim) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < dim {
+        s = s + a[a_off + i] * b[b_off + i]
+        i = i + 1
+    }
+    s
+}
+
+// ── L2 norm of a flat vector starting at offset ──
+fn tome_norm(v, off, dim) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < dim {
+        let x = v[off + i]
+        s = s + x * x
+        i = i + 1
+    }
+    _tome_sqrt(s)
+}
+
+// ── Cosine similarity between two vectors at offsets ──
+fn tome_cosine_sim(a, a_off, b, b_off, dim) {
+    let d = tome_dot(a, a_off, b, b_off, dim)
+    let na = tome_norm(a, a_off, dim)
+    let nb = tome_norm(b, b_off, dim)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    d / denom
+}
+
+// ── Split tokens into src (even indices) and dst (odd indices) ──
+// tokens: flat [n * dim], returns [src_flat, dst_flat, src_idx, dst_idx]
+fn tome_split_src_dst(tokens, n, dim) {
+    let mut src = []
+    let mut dst = []
+    let mut src_idx = []
+    let mut dst_idx = []
+    let mut i = 0
+    while i < n {
+        let base = i * dim
+        let mut j = 0
+        if i % 2 == 0 {
+            // src set (even indices)
+            while j < dim {
+                src = src + [tokens[base + j]]
+                j = j + 1
+            }
+            src_idx = src_idx + [i]
+        } else {
+            // dst set (odd indices)
+            while j < dim {
+                dst = dst + [tokens[base + j]]
+                j = j + 1
+            }
+            dst_idx = dst_idx + [i]
+        }
+        i = i + 1
+    }
+    let packed = [src, dst, src_idx, dst_idx]
+    packed
+}
+
+// ── Pairwise cosine similarity matrix [ns x nd] ──
+fn tome_pairwise_sim(src, dst, ns, nd, dim) {
+    let mut sim = []
+    let mut i = 0
+    while i < ns {
+        let mut row = []
+        let mut j = 0
+        while j < nd {
+            let s = tome_cosine_sim(src, i * dim, dst, j * dim, dim)
+            row = row + [s]
+            j = j + 1
+        }
+        sim = sim + [row]
+        i = i + 1
+    }
+    sim
+}
+
+// ── Bipartite matching: each src picks its most similar dst ──
+// Returns [int] of length ns, where matching[i] = best dst index for src i
+fn tome_bipartite_match(sim, ns, nd) {
+    let mut matching = []
+    let mut i = 0
+    while i < ns {
+        let mut best_j = 0
+        let mut best_s = sim[i][0]
+        let mut j = 1
+        while j < nd {
+            if sim[i][j] > best_s {
+                best_s = sim[i][j]
+                best_j = j
+            }
+            j = j + 1
+        }
+        matching = matching + [best_j]
+        i = i + 1
+    }
+    matching
+}
+
+// ── Extract match scores for sorting ──
+fn tome_match_scores(sim, matching, ns) {
+    let mut scores = []
+    let mut i = 0
+    while i < ns {
+        scores = scores + [sim[i][matching[i]]]
+        i = i + 1
+    }
+    scores
+}
+
+// ── Select top-r most similar matched pairs ──
+// Returns array of [src_local_idx, dst_local_idx, score]
+fn tome_select_top_r(scores, matching, r) {
+    let ns = len(scores)
+    let actual_r = if r < ns { r } else { ns }
+
+    // Build index array and sort by score descending (selection sort)
+    let mut indices = []
+    let mut i = 0
+    while i < ns {
+        indices = indices + [i]
+        i = i + 1
+    }
+
+    // Selection sort: find top actual_r
+    let mut k = 0
+    while k < actual_r {
+        let mut best = k
+        let mut j = k + 1
+        while j < ns {
+            if scores[indices[j]] > scores[indices[best]] {
+                best = j
+            }
+            j = j + 1
+        }
+        if best != k {
+            let tmp = indices[k]
+            indices[k] = indices[best]
+            indices[best] = tmp
+        }
+        k = k + 1
+    }
+
+    let mut pairs = []
+    k = 0
+    while k < actual_r {
+        let si = indices[k]
+        let di = matching[si]
+        let sc = scores[si]
+        pairs = pairs + [[si, di, sc]]
+        k = k + 1
+    }
+    pairs
+}
+
+// ── Merge operation: weighted average of matched pairs ──
+// tokens: flat [n * dim]
+// pairs: [[src_local_idx, dst_local_idx, score]] from select_top_r
+// src_idx, dst_idx: original index arrays
+// Returns [merged_flat, merged_n, ToMeMergeInfo]
+fn tome_merge(tokens, n, dim, pairs, src_flat, dst_flat, src_idx, dst_idx) {
+    let np = len(pairs)
+    let ns = len(src_idx)
+    let nd = len(dst_idx)
+
+    // Track which src and dst local indices are being merged
+    let mut src_merged = []
+    let mut i = 0
+    while i < ns {
+        src_merged = src_merged + [0]
+        i = i + 1
+    }
+    let mut dst_merged = []
+    i = 0
+    while i < nd {
+        dst_merged = dst_merged + [0]
+        i = i + 1
+    }
+
+    let mut merged_src_orig = []
+    let mut merged_dst_orig = []
+
+    i = 0
+    while i < np {
+        let pair = pairs[i]
+        let si = pair[0]
+        let di = pair[1]
+        src_merged[si] = 1
+        dst_merged[di] = 1
+        merged_src_orig = merged_src_orig + [src_idx[si]]
+        merged_dst_orig = merged_dst_orig + [dst_idx[di]]
+        i = i + 1
+    }
+
+    // Build merged token list:
+    // 1. All unmerged tokens (from both src and dst)
+    // 2. Merged pairs (weighted average with equal weights)
+    let mut result = []
+    let mut kept = []
+
+    // Unmerged src tokens
+    i = 0
+    while i < ns {
+        if src_merged[i] == 0 {
+            let off = i * dim
+            let mut j = 0
+            while j < dim {
+                result = result + [src_flat[off + j]]
+                j = j + 1
+            }
+            kept = kept + [src_idx[i]]
+        }
+        i = i + 1
+    }
+
+    // Unmerged dst tokens
+    i = 0
+    while i < nd {
+        if dst_merged[i] == 0 {
+            let off = i * dim
+            let mut j = 0
+            while j < dim {
+                result = result + [dst_flat[off + j]]
+                j = j + 1
+            }
+            kept = kept + [dst_idx[i]]
+        }
+        i = i + 1
+    }
+
+    // Merged pairs: average of src and dst vectors
+    i = 0
+    while i < np {
+        let pair = pairs[i]
+        let si = pair[0]
+        let di = pair[1]
+        let s_off = si * dim
+        let d_off = di * dim
+        let mut j = 0
+        while j < dim {
+            let avg = (src_flat[s_off + j] + dst_flat[d_off + j]) / 2.0
+            result = result + [avg]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let merged_n = (ns - np) + (nd - np) + np
+    // = ns + nd - np = n - np
+
+    let info = ToMeMergeInfo {
+        src_indices: merged_src_orig,
+        dst_indices: merged_dst_orig,
+        kept_indices: kept,
+        original_n: n,
+        merged_n: merged_n
+    }
+
+    let packed = [result, merged_n, info]
+    packed
+}
+
+// ── Unmerge: expand merged tokens back to original positions ──
+// For merged pairs, duplicate the merged vector to both original positions
+fn tome_unmerge(merged, merged_n, dim, info) {
+    let original_n = info.original_n
+    let n_kept = len(info.kept_indices)
+    let n_pairs = len(info.src_indices)
+
+    // Build output flat array [original_n * dim]
+    let mut out = []
+    let mut i = 0
+    while i < original_n * dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+
+    // Copy kept tokens to their original positions
+    i = 0
+    while i < n_kept {
+        let orig_idx = info.kept_indices[i]
+        let src_off = i * dim
+        let dst_off = orig_idx * dim
+        let mut j = 0
+        while j < dim {
+            out[dst_off + j] = merged[src_off + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Copy merged tokens to both src and dst original positions
+    i = 0
+    while i < n_pairs {
+        let merge_off = (n_kept + i) * dim
+        let src_orig = info.src_indices[i]
+        let dst_orig = info.dst_indices[i]
+        let s_off = src_orig * dim
+        let d_off = dst_orig * dim
+        let mut j = 0
+        while j < dim {
+            out[s_off + j] = merged[merge_off + j]
+            out[d_off + j] = merged[merge_off + j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    out
+}
+
+// ── High-level merge layer: full pipeline for one layer ──
+fn tome_merge_layer(tokens, n, dim, cfg) {
+    // Don't merge if already at minimum
+    if n <= cfg.min_tokens {
+        let info = ToMeMergeInfo {
+            src_indices: [],
+            dst_indices: [],
+            kept_indices: [],
+            original_n: n,
+            merged_n: n
+        }
+        let packed = [tokens, n, info]
+        return packed
+    }
+
+    // Clamp r so we don't go below min_tokens
+    let max_r = n - cfg.min_tokens
+    let r = if cfg.r < max_r { cfg.r } else { max_r }
+    if r <= 0 {
+        let info = ToMeMergeInfo {
+            src_indices: [],
+            dst_indices: [],
+            kept_indices: [],
+            original_n: n,
+            merged_n: n
+        }
+        let packed = [tokens, n, info]
+        return packed
+    }
+
+    let split = tome_split_src_dst(tokens, n, dim)
+    let src = split[0]
+    let dst = split[1]
+    let src_idx = split[2]
+    let dst_idx = split[3]
+    let ns = len(src_idx)
+    let nd = len(dst_idx)
+
+    if ns == 0 {
+        let info = ToMeMergeInfo {
+            src_indices: [],
+            dst_indices: [],
+            kept_indices: [],
+            original_n: n,
+            merged_n: n
+        }
+        let packed = [tokens, n, info]
+        return packed
+    }
+    if nd == 0 {
+        let info = ToMeMergeInfo {
+            src_indices: [],
+            dst_indices: [],
+            kept_indices: [],
+            original_n: n,
+            merged_n: n
+        }
+        let packed = [tokens, n, info]
+        return packed
+    }
+
+    let sim = tome_pairwise_sim(src, dst, ns, nd, dim)
+    let matching = tome_bipartite_match(sim, ns, nd)
+    let scores = tome_match_scores(sim, matching, ns)
+    let pairs = tome_select_top_r(scores, matching, r)
+
+    tome_merge(tokens, n, dim, pairs, src, dst, src_idx, dst_idx)
+}
+
+// ── High-level unmerge layer ──
+fn tome_unmerge_layer(merged, merged_n, dim, info) {
+    if info.original_n == info.merged_n {
+        return merged
+    }
+    tome_unmerge(merged, merged_n, dim, info)
+}
+
+// ── Throughput gain calculation ──
+fn tome_throughput_gain(original_n, merged_n) {
+    if merged_n <= 0 { return 0.0 }
+    if original_n <= 0 { return 0.0 }
+    to_float(original_n) / to_float(merged_n)
+}
+
+// ── Multi-layer merge: simulate merging across n_layers ──
+// Each layer applies merge, "processes" (identity in this sim), collects stats
+// Returns [final_tokens, final_n, [gain_per_layer]]
+fn tome_multi_layer(tokens, n, dim, cfg, n_layers) {
+    let mut cur = tokens
+    let mut cur_n = n
+    let mut gains = []
+    let mut layer = 0
+    while layer < n_layers {
+        let result = tome_merge_layer(cur, cur_n, dim, cfg)
+        let new_tokens = result[0]
+        let new_n = result[1]
+        let gain = tome_throughput_gain(cur_n, new_n)
+        gains = gains + [gain]
+        cur = new_tokens
+        cur_n = new_n
+        layer = layer + 1
+    }
+    let packed = [cur, cur_n, gains]
+    packed
+}
+
+// ── Tracker for cumulative throughput stats ──
+fn tome_make_tracker() {
+    ToMeTracker { total_original: 0, total_merged: 0, layers_processed: 0 }
+}
+
+fn tome_update_tracker(tracker, orig, merged) {
+    ToMeTracker {
+        total_original: tracker.total_original + orig,
+        total_merged: tracker.total_merged + merged,
+        layers_processed: tracker.layers_processed + 1
+    }
+}
+
+// Returns [avg_gain, total_saved]
+fn tome_report(tracker) {
+    if tracker.layers_processed == 0 {
+        let packed = [1.0, 0]
+        return packed
+    }
+    let avg_gain = to_float(tracker.total_original) / to_float(tracker.total_merged)
+    let total_saved = tracker.total_original - tracker.total_merged
+    let packed = [avg_gain, total_saved]
+    packed
+}
+
+// ── @tome top-level step ──
+// Returns [merged_flat, merged_n, gain_float, ToMeMergeInfo]
+@tome
+fn tome_step(tokens, n, dim, cfg) {
+    let result = tome_merge_layer(tokens, n, dim, cfg)
+    let merged = result[0]
+    let merged_n = result[1]
+    let info = result[2]
+    let gain = tome_throughput_gain(n, merged_n)
+    let packed = [merged, merged_n, gain, info]
+    packed
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

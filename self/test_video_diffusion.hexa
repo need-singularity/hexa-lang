@@ -2,7 +2,771 @@
 //  test_video_diffusion.hexa — Video Diffusion Model (#299)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/video_diffusion.hexa"
+// -- inlined from self/ml/video_diffusion.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/video_diffusion.hexa — Video Diffusion Model (#299)
+//
+//  3D U-Net with temporal attention for video generation via diffusion.
+//  Extends image diffusion to video by adding temporal self-attention
+//  layers that attend across frames at the same spatial location.
+//
+//  Noising process:
+//      x_t = alpha_t * x_0 + sigma_t * epsilon
+//      where alpha_t, sigma_t follow a cosine schedule
+//
+//  Architecture (per denoise step):
+//      1. Spatial attention: per-frame self-attention (D_spatial)
+//      2. Temporal attention: cross-frame at each spatial position
+//      3. Prediction head: predict noise epsilon
+//
+//  Denoiser:  epsilon_theta(x_t, t) predicts noise across all frames
+//
+//  API:
+//    vd_init(D_spatial, D_temporal, n_frames, D_hidden, seed) -> model
+//    vd_noise_schedule(t, T)                  -> [alpha, sigma]
+//    vd_add_noise(frames, noise, t, T)        -> noisy_frames
+//    vd_spatial_attn(model, frame)            -> frame
+//    vd_temporal_attn(model, frames, pos)     -> frames
+//    vd_denoise_step(model, noisy_frames, t)  -> pred_noise
+//    vd_loss(model, clean_frames)             -> float
+//    vd_train_step(model, video_batch, lr)    -> model
+//    vd_sample(model, n_frames, T, seed)      -> generated frames
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / noise schedule / loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ─── math helpers ─────────────────────────────────────────────────
+
+fn vd_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn vd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn vd_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn vd_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 0.001 { g = 0.001 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn vd_cos(x) {
+    let mut v = x
+    // reduce to [-pi, pi]
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let x2 = v * v
+    return 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0 + x2 * x2 * x2 * x2 / 40320.0
+}
+
+fn vd_sin(x) {
+    let mut v = x
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let x2 = v * v
+    return v * (1.0 - x2 / 6.0 + x2 * x2 / 120.0 - x2 * x2 * x2 / 5040.0)
+}
+
+fn vd_tanh(x) {
+    let ep = vd_exp(x)
+    let en = vd_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+// ─── array helpers ────────────────────────────────────────────────
+
+fn vd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn vd_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ─── PRNG (LCG) ──────────────────────────────────────────────────
+
+fn vd_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn vd_uniform(state) {
+    let s = vd_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// Box-Muller for Gaussian samples
+fn vd_randn(state) {
+    let u1 = vd_uniform(state)
+    let u2 = vd_uniform(int(u1[1]))
+    let r = vd_sqrt(-2.0 * vd_log(u1[0] + 1.0e-10))
+    let theta = 6.28318530 * u2[0]
+    let z = r * vd_cos(theta)
+    return [z, int(u2[1])]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_init — initialise video diffusion model
+//
+//  Weights:
+//    W_sq, W_sk, W_sv  : spatial Q/K/V  (D_spatial x D_spatial)
+//    W_so              : spatial output  (D_spatial x D_spatial)
+//    W_tq, W_tk, W_tv  : temporal Q/K/V (D_temporal x D_temporal)
+//    W_to              : temporal output (D_temporal x D_temporal)
+//    W_proj            : spatial -> temporal projection (D_temporal x D_spatial)
+//    W_back            : temporal -> spatial projection (D_spatial x D_temporal)
+//    W_noise           : noise prediction (D_spatial x D_hidden)
+//    b_noise           : noise bias       (D_spatial)
+//    W_h1              : hidden layer 1   (D_hidden x D_spatial)
+//    b_h1              : hidden bias 1    (D_hidden)
+//    W_t_embed         : timestep embed   (D_hidden x 1) — scalar t -> D_hidden
+// ═══════════════════════════════════════════════════════════════════
+fn vd_init(D_spatial, D_temporal, n_frames, D_hidden, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let scale_s = 1.0 / vd_sqrt(to_float(D_spatial))
+    let scale_t = 1.0 / vd_sqrt(to_float(D_temporal))
+    let scale_h = 1.0 / vd_sqrt(to_float(D_hidden))
+
+    // spatial attention Q/K/V/O
+    let mut W_sq = vd_zeros_2d(D_spatial, D_spatial)
+    let mut W_sk = vd_zeros_2d(D_spatial, D_spatial)
+    let mut W_sv = vd_zeros_2d(D_spatial, D_spatial)
+    let mut W_so = vd_zeros_2d(D_spatial, D_spatial)
+
+    let spatial_mats = [W_sq, W_sk, W_sv, W_so]
+    let mut spatial_out = []
+    for mi in 0..4 {
+        let mut mat = spatial_mats[mi]
+        for r in 0..D_spatial {
+            for c in 0..D_spatial {
+                let u = vd_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                mat[r][c] = (u[0] - 0.5) * scale_s
+            }
+        }
+        spatial_out = spatial_out + [mat]
+    }
+    W_sq = spatial_out[0]
+    W_sk = spatial_out[1]
+    W_sv = spatial_out[2]
+    W_so = spatial_out[3]
+
+    // temporal attention Q/K/V/O
+    let mut W_tq = vd_zeros_2d(D_temporal, D_temporal)
+    let mut W_tk = vd_zeros_2d(D_temporal, D_temporal)
+    let mut W_tv = vd_zeros_2d(D_temporal, D_temporal)
+    let mut W_to = vd_zeros_2d(D_temporal, D_temporal)
+
+    let temp_mats = [W_tq, W_tk, W_tv, W_to]
+    let mut temp_out = []
+    for mi in 0..4 {
+        let mut mat = temp_mats[mi]
+        for r in 0..D_temporal {
+            for c in 0..D_temporal {
+                let u = vd_uniform(state)
+                state = int(u[1])
+                if state <= 0 { state = 1 }
+                mat[r][c] = (u[0] - 0.5) * scale_t
+            }
+        }
+        temp_out = temp_out + [mat]
+    }
+    W_tq = temp_out[0]
+    W_tk = temp_out[1]
+    W_tv = temp_out[2]
+    W_to = temp_out[3]
+
+    // projection spatial <-> temporal
+    let mut W_proj = vd_zeros_2d(D_temporal, D_spatial)
+    for r in 0..D_temporal {
+        for c in 0..D_spatial {
+            let u = vd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_proj[r][c] = (u[0] - 0.5) * scale_s
+        }
+    }
+
+    let mut W_back = vd_zeros_2d(D_spatial, D_temporal)
+    for r in 0..D_spatial {
+        for c in 0..D_temporal {
+            let u = vd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_back[r][c] = (u[0] - 0.5) * scale_t
+        }
+    }
+
+    // hidden layer
+    let mut W_h1 = vd_zeros_2d(D_hidden, D_spatial)
+    for r in 0..D_hidden {
+        for c in 0..D_spatial {
+            let u = vd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_h1[r][c] = (u[0] - 0.5) * scale_s
+        }
+    }
+    let b_h1 = vd_zeros(D_hidden)
+
+    // noise prediction head
+    let mut W_noise = vd_zeros_2d(D_spatial, D_hidden)
+    for r in 0..D_spatial {
+        for c in 0..D_hidden {
+            let u = vd_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_noise[r][c] = (u[0] - 0.5) * scale_h
+        }
+    }
+    let b_noise = vd_zeros(D_spatial)
+
+    // timestep embedding
+    let mut W_t_embed = vd_zeros(D_hidden)
+    for r in 0..D_hidden {
+        let u = vd_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        W_t_embed[r] = (u[0] - 0.5) * 0.1
+    }
+
+    return #{
+        "D_spatial": D_spatial,
+        "D_temporal": D_temporal,
+        "n_frames": n_frames,
+        "D_hidden": D_hidden,
+        "W_sq": W_sq, "W_sk": W_sk, "W_sv": W_sv, "W_so": W_so,
+        "W_tq": W_tq, "W_tk": W_tk, "W_tv": W_tv, "W_to": W_to,
+        "W_proj": W_proj, "W_back": W_back,
+        "W_h1": W_h1, "b_h1": b_h1,
+        "W_noise": W_noise, "b_noise": b_noise,
+        "W_t_embed": W_t_embed
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_noise_schedule — cosine schedule
+//    alpha_t = cos(pi/2 * t/T)
+//    sigma_t = sin(pi/2 * t/T)
+//    so alpha^2 + sigma^2 = 1
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_noise_schedule(t, T) {
+    let ratio = to_float(t) / to_float(T)
+    let angle = 1.5707963 * ratio
+    let alpha = vd_cos(angle)
+    let sigma = vd_sin(angle)
+    return [alpha, sigma]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_add_noise — forward diffusion
+//    x_t = alpha * x_0 + sigma * epsilon
+//  frames: [n_frames][D_spatial], noise: [n_frames][D_spatial]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_add_noise(frames, noise, t, T) {
+    let sched = vd_noise_schedule(t, T)
+    let alpha = sched[0]
+    let sigma = sched[1]
+    let n = len(frames)
+    let mut out = []
+    for f in 0..n {
+        let d = len(frames[f])
+        let mut row = vd_zeros(d)
+        for i in 0..d {
+            row[i] = alpha * frames[f][i] + sigma * noise[f][i]
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_softmax_vec — softmax over a 1D vector
+// ═══════════════════════════════════════════════════════════════════
+fn vd_softmax_vec(v) {
+    let n = len(v)
+    let mut mx = v[0]
+    for i in 1..n { if v[i] > mx { mx = v[i] } }
+    let mut out = vd_zeros(n)
+    let mut s = 0.0
+    for i in 0..n {
+        let e = vd_exp(v[i] - mx)
+        out[i] = e
+        s = s + e
+    }
+    if s <= 0.0 { s = 1.0e-12 }
+    for i in 0..n { out[i] = out[i] / s }
+    return out
+}
+
+// ─── matvec helper: y = M * x ─────────────────────────────────────
+fn vd_matvec(M, x) {
+    let rows = len(M)
+    let cols = len(x)
+    let mut y = vd_zeros(rows)
+    for r in 0..rows {
+        let mut s = 0.0
+        for c in 0..cols { s = s + M[r][c] * x[c] }
+        y[r] = s
+    }
+    return y
+}
+
+// ─── dot product ──────────────────────────────────────────────────
+fn vd_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_spatial_attn — single-head self-attention within one frame
+//
+//  Input frame: [D_spatial]  (treat each dimension as a token)
+//  Q = W_sq * frame, K = W_sk * frame, V = W_sv * frame
+//  attn = softmax(Q . K / sqrt(D)) * V  (simplified single-vector)
+//  output = W_so * attn_out + residual
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_spatial_attn(model, frame) {
+    let D = model["D_spatial"]
+    let W_sq = model["W_sq"]
+    let W_sk = model["W_sk"]
+    let W_sv = model["W_sv"]
+    let W_so = model["W_so"]
+
+    let q = vd_matvec(W_sq, frame)
+    let k = vd_matvec(W_sk, frame)
+    let v = vd_matvec(W_sv, frame)
+
+    // scaled dot-product: score = (q . k) / sqrt(D)
+    let scale = 1.0 / vd_sqrt(to_float(D))
+    let score = vd_dot(q, k) * scale
+    // single-vector attention: weight the value
+    let w = vd_tanh(score)
+    let mut weighted = vd_zeros(D)
+    for i in 0..D { weighted[i] = w * v[i] }
+
+    let out = vd_matvec(W_so, weighted)
+    // residual connection
+    let mut result = vd_zeros(D)
+    for i in 0..D { result[i] = out[i] + frame[i] }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_temporal_attn — attention across frames at a given position
+//
+//  frames: [n_frames][D_spatial]
+//  pos: spatial position index (0..D_spatial)
+//
+//  Gathers the pos-th element from each frame, projects to temporal
+//  space, runs self-attention across frames, projects back, and
+//  writes results back to each frame.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_temporal_attn(model, frames, pos) {
+    let nf = len(frames)
+    let D_s = model["D_spatial"]
+    let D_t = model["D_temporal"]
+    let W_proj = model["W_proj"]
+    let W_back = model["W_back"]
+    let W_tq = model["W_tq"]
+    let W_tk = model["W_tk"]
+    let W_tv = model["W_tv"]
+    let W_to = model["W_to"]
+
+    // gather per-frame vectors and project spatial -> temporal
+    let mut tokens = []
+    for f in 0..nf {
+        tokens = tokens + [vd_matvec(W_proj, frames[f])]
+    }
+
+    // Q, K, V for each frame-token
+    let mut Q = []
+    let mut K = []
+    let mut V = []
+    for f in 0..nf {
+        Q = Q + [vd_matvec(W_tq, tokens[f])]
+        K = K + [vd_matvec(W_tk, tokens[f])]
+        V = V + [vd_matvec(W_tv, tokens[f])]
+    }
+
+    let scale = 1.0 / vd_sqrt(to_float(D_t))
+
+    // for each query frame, attend to all key frames
+    let mut attn_out = []
+    for fi in 0..nf {
+        // compute scores
+        let mut scores = vd_zeros(nf)
+        for fj in 0..nf {
+            scores[fj] = vd_dot(Q[fi], K[fj]) * scale
+        }
+        let weights = vd_softmax_vec(scores)
+        // weighted sum of values
+        let mut acc = vd_zeros(D_t)
+        for fj in 0..nf {
+            for d in 0..D_t {
+                acc[d] = acc[d] + weights[fj] * V[fj][d]
+            }
+        }
+        attn_out = attn_out + [vd_matvec(W_to, acc)]
+    }
+
+    // project back temporal -> spatial and add residual
+    let mut out_frames = []
+    for f in 0..nf {
+        let back = vd_matvec(W_back, attn_out[f])
+        let mut frame_out = vd_zeros(D_s)
+        for i in 0..D_s {
+            frame_out[i] = frames[f][i] + back[i]
+        }
+        out_frames = out_frames + [frame_out]
+    }
+    return out_frames
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_timestep_embed — embed scalar timestep t into D_hidden vector
+// ═══════════════════════════════════════════════════════════════════
+fn vd_timestep_embed(model, t) {
+    let D_hidden = model["D_hidden"]
+    let W_t = model["W_t_embed"]
+    let tf = to_float(t)
+    let mut emb = vd_zeros(D_hidden)
+    for i in 0..D_hidden {
+        emb[i] = vd_tanh(W_t[i] * tf)
+    }
+    return emb
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_denoise_step — predict noise for all frames at timestep t
+//
+//  Pipeline per frame:
+//    1. spatial attention on each frame
+//    2. temporal attention across frames
+//    3. hidden layer + timestep embedding
+//    4. noise prediction head
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_denoise_step(model, noisy_frames, t) {
+    let nf = len(noisy_frames)
+    let D_s = model["D_spatial"]
+    let D_h = model["D_hidden"]
+    let W_h1 = model["W_h1"]
+    let b_h1 = model["b_h1"]
+    let W_noise = model["W_noise"]
+    let b_noise = model["b_noise"]
+
+    // 1) spatial attention per frame
+    let mut after_spatial = []
+    for f in 0..nf {
+        after_spatial = after_spatial + [vd_spatial_attn(model, noisy_frames[f])]
+    }
+
+    // 2) temporal attention (apply at each spatial position)
+    let mut after_temporal = after_spatial
+    for p in 0..D_s {
+        after_temporal = vd_temporal_attn(model, after_temporal, p)
+    }
+
+    // 3) timestep embedding
+    let t_emb = vd_timestep_embed(model, t)
+
+    // 4) hidden layer + noise prediction per frame
+    let mut pred_noise = []
+    for f in 0..nf {
+        // hidden = tanh(W_h1 * frame + b_h1 + t_emb)
+        let mut h = vd_zeros(D_h)
+        for r in 0..D_h {
+            let mut s = b_h1[r] + t_emb[r]
+            for c in 0..D_s { s = s + W_h1[r][c] * after_temporal[f][c] }
+            h[r] = vd_tanh(s)
+        }
+        // noise = W_noise * h + b_noise
+        let mut n_pred = vd_zeros(D_s)
+        for r in 0..D_s {
+            let mut s = b_noise[r]
+            for c in 0..D_h { s = s + W_noise[r][c] * h[c] }
+            n_pred[r] = s
+        }
+        pred_noise = pred_noise + [n_pred]
+    }
+    return pred_noise
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_loss — MSE between predicted noise and actual noise
+//
+//  Sample random noise, add to clean_frames at random t, predict,
+//  return mean squared error.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_loss(model, clean_frames) {
+    let nf = len(clean_frames)
+    let D_s = model["D_spatial"]
+    let T = 100
+
+    // generate deterministic noise from frame content
+    let mut state = 12345
+    let mut noise = []
+    for f in 0..nf {
+        let mut row = vd_zeros(D_s)
+        for i in 0..D_s {
+            let r = vd_randn(state)
+            row[i] = r[0] * 0.5
+            state = int(r[1])
+            if state <= 0 { state = 1 }
+        }
+        noise = noise + [row]
+    }
+
+    // pick t deterministically from state
+    let u_t = vd_uniform(state)
+    state = int(u_t[1])
+    let t = int(u_t[0] * to_float(T - 1)) + 1
+    if state <= 0 { state = 1 }
+
+    let noisy = vd_add_noise(clean_frames, noise, t, T)
+    let pred = vd_denoise_step(model, noisy, t)
+
+    // MSE
+    let mut mse = 0.0
+    let mut count = 0
+    for f in 0..nf {
+        for i in 0..D_s {
+            let diff = pred[f][i] - noise[f][i]
+            mse = mse + diff * diff
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return mse / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_train_step — numerical gradient descent on MSE loss
+//
+//  Uses finite differences for gradient estimation on all weight
+//  matrices, then updates each parameter.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn vd_train_step(model, video_batch, lr) {
+    let n_videos = len(video_batch)
+    if n_videos == 0 { return model }
+
+    // average loss over batch
+    let mut base_loss = 0.0
+    for v in 0..n_videos {
+        base_loss = base_loss + vd_loss(model, video_batch[v])
+    }
+    base_loss = base_loss / to_float(n_videos)
+
+    let eps = 0.001
+    let D_s = model["D_spatial"]
+    let D_t = model["D_temporal"]
+    let D_h = model["D_hidden"]
+
+    // helper: perturb a 2d weight, measure loss, compute gradient
+    // We perturb a few random elements per matrix (stochastic)
+    let mut state = 77777
+
+    // ── perturb W_h1 (D_hidden x D_spatial) ────────────────────
+    let mut W_h1_new = model["W_h1"]
+    for r in 0..D_h {
+        for c in 0..D_s {
+            let orig = W_h1_new[r][c]
+            W_h1_new[r][c] = orig + eps
+            let mut m2 = model
+            m2["W_h1"] = W_h1_new
+            let mut loss_p = 0.0
+            for v in 0..n_videos { loss_p = loss_p + vd_loss(m2, video_batch[v]) }
+            loss_p = loss_p / to_float(n_videos)
+            let grad = (loss_p - base_loss) / eps
+            W_h1_new[r][c] = orig - lr * grad
+        }
+    }
+
+    // ── perturb b_h1 ───────────────────────────────────────────
+    let mut b_h1_new = model["b_h1"]
+    for i in 0..D_h {
+        let orig = b_h1_new[i]
+        b_h1_new[i] = orig + eps
+        let mut m2 = model
+        m2["b_h1"] = b_h1_new
+        let b_orig = model["b_h1"]
+        m2["b_h1"] = b_h1_new
+        let mut loss_p = 0.0
+        for v in 0..n_videos { loss_p = loss_p + vd_loss(m2, video_batch[v]) }
+        loss_p = loss_p / to_float(n_videos)
+        let grad = (loss_p - base_loss) / eps
+        b_h1_new[i] = orig - lr * grad
+    }
+
+    // ── perturb W_noise (D_spatial x D_hidden) ─────────────────
+    let mut W_noise_new = model["W_noise"]
+    for r in 0..D_s {
+        for c in 0..D_h {
+            let orig = W_noise_new[r][c]
+            W_noise_new[r][c] = orig + eps
+            let mut m2 = model
+            m2["W_noise"] = W_noise_new
+            let mut loss_p = 0.0
+            for v in 0..n_videos { loss_p = loss_p + vd_loss(m2, video_batch[v]) }
+            loss_p = loss_p / to_float(n_videos)
+            let grad = (loss_p - base_loss) / eps
+            W_noise_new[r][c] = orig - lr * grad
+        }
+    }
+
+    // ── perturb b_noise ────────────────────────────────────────
+    let mut b_noise_new = model["b_noise"]
+    for i in 0..D_s {
+        let orig = b_noise_new[i]
+        b_noise_new[i] = orig + eps
+        let mut m2 = model
+        m2["b_noise"] = b_noise_new
+        let mut loss_p = 0.0
+        for v in 0..n_videos { loss_p = loss_p + vd_loss(m2, video_batch[v]) }
+        loss_p = loss_p / to_float(n_videos)
+        let grad = (loss_p - base_loss) / eps
+        b_noise_new[i] = orig - lr * grad
+    }
+
+    // ── perturb W_t_embed ──────────────────────────────────────
+    let mut W_t_embed_new = model["W_t_embed"]
+    for i in 0..D_h {
+        let orig = W_t_embed_new[i]
+        W_t_embed_new[i] = orig + eps
+        let mut m2 = model
+        m2["W_t_embed"] = W_t_embed_new
+        let mut loss_p = 0.0
+        for v in 0..n_videos { loss_p = loss_p + vd_loss(m2, video_batch[v]) }
+        loss_p = loss_p / to_float(n_videos)
+        let grad = (loss_p - base_loss) / eps
+        W_t_embed_new[i] = orig - lr * grad
+    }
+
+    return #{
+        "D_spatial": D_s,
+        "D_temporal": D_t,
+        "n_frames": model["n_frames"],
+        "D_hidden": D_h,
+        "W_sq": model["W_sq"], "W_sk": model["W_sk"],
+        "W_sv": model["W_sv"], "W_so": model["W_so"],
+        "W_tq": model["W_tq"], "W_tk": model["W_tk"],
+        "W_tv": model["W_tv"], "W_to": model["W_to"],
+        "W_proj": model["W_proj"], "W_back": model["W_back"],
+        "W_h1": W_h1_new, "b_h1": b_h1_new,
+        "W_noise": W_noise_new, "b_noise": b_noise_new,
+        "W_t_embed": W_t_embed_new
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  vd_sample — reverse diffusion: generate frames from noise
+//
+//  Starting from pure noise at t=T, iteratively denoise down to t=0.
+//  Returns generated frames [n_frames][D_spatial].
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn vd_sample(model, n_frames, T, seed) {
+    let D_s = model["D_spatial"]
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // start with random noise
+    let mut frames = []
+    for f in 0..n_frames {
+        let mut row = vd_zeros(D_s)
+        for i in 0..D_s {
+            let r = vd_randn(state)
+            row[i] = r[0]
+            state = int(r[1])
+            if state <= 0 { state = 1 }
+        }
+        frames = frames + [row]
+    }
+
+    // reverse diffusion: T -> 1
+    let mut t = T
+    while t > 0 {
+        let pred_noise = vd_denoise_step(model, frames, t)
+        let sched = vd_noise_schedule(t, T)
+        let alpha = sched[0]
+        let sigma = sched[1]
+
+        // DDPM-style update:
+        // x_{t-1} = (1/alpha) * (x_t - (sigma/alpha) * pred_noise)
+        // simplified: remove predicted noise component
+        let mut inv_alpha = 1.0 / alpha
+        if vd_abs(alpha) < 1.0e-8 { inv_alpha = 1.0 }
+        let noise_scale = sigma * inv_alpha
+
+        for f in 0..n_frames {
+            for i in 0..D_s {
+                let mut val = inv_alpha * (frames[f][i] - noise_scale * pred_noise[f][i])
+                // clamp to prevent divergence
+                if val > 10.0 { val = 10.0 }
+                if val < -10.0 { val = -10.0 }
+                frames[f][i] = val
+            }
+        }
+        t = t - 1
+    }
+    return frames
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

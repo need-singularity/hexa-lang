@@ -2,7 +2,704 @@
 //  test_titan_memory.hexa — Titan Memory Layer (#290)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/titan_memory.hexa"
+// -- inlined from self/ml/titan_memory.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/titan_memory.hexa — Titan Memory Layer (#290)
+//
+//  Titan (Google, 2024) — neural long-term memory module.
+//  Uses surprise-based gating to write important information to a
+//  persistent memory matrix and read it back via attention.
+//
+//  Memory matrix  M in R^(S x D), updated by surprise signal:
+//      surprise s = ||grad_M L||  (gradient magnitude w.r.t memory)
+//      write gate g = sigmoid(s - threshold)
+//      M' = M + g * k^T * v      (outer-product update)
+//      read: q * M                (query-based retrieval)
+//
+//  Architecture:
+//      key   = tanh(W_k * x + b_k)         D_in -> D
+//      value = tanh(W_v * x + b_v)         D_in -> D
+//      query = tanh(W_q * x + b_q)         D_in -> D
+//      output = W_o * read_val + b_o        D -> D_in
+//
+//  API:
+//    tm_init(D, mem_slots, seed)            -> model
+//    tm_write(model, key, value, surprise)  -> model
+//    tm_read(model, query)                  -> [float]
+//    tm_surprise(model, x, y)              -> float
+//    tm_forward(model, input_seq)           -> [[float]]
+//    tm_train_step(model, X, Y, lr)         -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (read / forward)
+//    @hot   (train)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ──────────────────────────────────────────────────
+
+fn tm_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn tm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn tm_log(x) {
+    if x <= 0.0 { return -30.0 }
+    let mut v = x
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn tm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn tm_tanh(x) {
+    let ep = tm_exp(x)
+    let en = tm_exp(0.0 - x)
+    return (ep - en) / (ep + en)
+}
+
+fn tm_sigmoid(x) {
+    return 1.0 / (1.0 + tm_exp(0.0 - x))
+}
+
+fn tm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn tm_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn tm_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn tm_uniform(state) {
+    let s = tm_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn tm_dot(a, b, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn tm_vec_norm(v, n) {
+    let mut s = 0.0
+    for i in 0..n { s = s + v[i] * v[i] }
+    return tm_sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise Titan Memory model
+//
+//    M        : mem_slots x D       (memory matrix, zeros)
+//    W_k      : D x D_in            (key projection)
+//    b_k      : D
+//    W_v      : D x D_in            (value projection)
+//    b_v      : D
+//    W_q      : D x D_in            (query projection)
+//    b_q      : D
+//    W_o      : D_in x D            (output projection)
+//    b_o      : D_in
+//    threshold: scalar               (surprise gate threshold)
+// ═══════════════════════════════════════════════════════════════════
+fn tm_init(D, mem_slots, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let D_in = D
+
+    // key projection W_k: D x D_in
+    let mut W_k = tm_zeros_2d(D, D_in)
+    for i in 0..D {
+        for j in 0..D_in {
+            let u = tm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_k[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_k = tm_zeros(D)
+
+    // value projection W_v: D x D_in
+    let mut W_v = tm_zeros_2d(D, D_in)
+    for i in 0..D {
+        for j in 0..D_in {
+            let u = tm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_v = tm_zeros(D)
+
+    // query projection W_q: D x D_in
+    let mut W_q = tm_zeros_2d(D, D_in)
+    for i in 0..D {
+        for j in 0..D_in {
+            let u = tm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_q = tm_zeros(D)
+
+    // output projection W_o: D_in x D
+    let mut W_o = tm_zeros_2d(D_in, D)
+    for i in 0..D_in {
+        for j in 0..D {
+            let u = tm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b_o = tm_zeros(D_in)
+
+    // memory matrix M: mem_slots x D (initially zero)
+    let M = tm_zeros_2d(mem_slots, D)
+
+    return #{
+        "D": D,
+        "D_in": D_in,
+        "mem_slots": mem_slots,
+        "M": M,
+        "W_k": W_k,
+        "b_k": b_k,
+        "W_v": W_v,
+        "b_v": b_v,
+        "W_q": W_q,
+        "b_q": b_q,
+        "W_o": W_o,
+        "b_o": b_o,
+        "threshold": 0.5,
+        "write_head": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Key / Value / Query projections
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tm_project_key(model, x) {
+    let D = model["D"]
+    let D_in = model["D_in"]
+    let W_k = model["W_k"]
+    let b_k = model["b_k"]
+    let mut k = tm_zeros(D)
+    for i in 0..D {
+        let mut s = b_k[i]
+        for j in 0..D_in { s = s + W_k[i][j] * x[j] }
+        k[i] = tm_tanh(s)
+    }
+    return k
+}
+
+@pure
+fn tm_project_value(model, x) {
+    let D = model["D"]
+    let D_in = model["D_in"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let mut v = tm_zeros(D)
+    for i in 0..D {
+        let mut s = b_v[i]
+        for j in 0..D_in { s = s + W_v[i][j] * x[j] }
+        v[i] = tm_tanh(s)
+    }
+    return v
+}
+
+@pure
+fn tm_project_query(model, x) {
+    let D = model["D"]
+    let D_in = model["D_in"]
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+    let mut q = tm_zeros(D)
+    for i in 0..D {
+        let mut s = b_q[i]
+        for j in 0..D_in { s = s + W_q[i][j] * x[j] }
+        q[i] = tm_tanh(s)
+    }
+    return q
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tm_write — surprise-gated memory update
+//
+//    gate g = sigmoid(surprise - threshold)
+//    M[slot] += g * key * value  (outer-product additive update)
+//    slot advances round-robin
+// ═══════════════════════════════════════════════════════════════════
+fn tm_write(model, key, value, surprise) {
+    let D = model["D"]
+    let mem_slots = model["mem_slots"]
+    let threshold = model["threshold"]
+    let mut M = model["M"]
+    let write_head = model["write_head"]
+
+    // surprise gate
+    let g = tm_sigmoid(surprise - threshold)
+
+    // outer-product update distributed across all slots with decay
+    // Primary write to current slot, small leak to all
+    let slot = write_head % mem_slots
+    for j in 0..D {
+        M[slot][j] = M[slot][j] + g * key[j] * value[j]
+    }
+
+    // advance write head
+    let new_head = (write_head + 1) % mem_slots
+
+    return #{
+        "D": model["D"],
+        "D_in": model["D_in"],
+        "mem_slots": mem_slots,
+        "M": M,
+        "W_k": model["W_k"],
+        "b_k": model["b_k"],
+        "W_v": model["W_v"],
+        "b_v": model["b_v"],
+        "W_q": model["W_q"],
+        "b_q": model["b_q"],
+        "W_o": model["W_o"],
+        "b_o": model["b_o"],
+        "threshold": threshold,
+        "write_head": new_head
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tm_read — query-based retrieval from memory
+//
+//    scores[s] = dot(query, M[s])
+//    attention  = softmax(scores)
+//    read_val   = sum_s attention[s] * M[s]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tm_read(model, query) {
+    let D = model["D"]
+    let mem_slots = model["mem_slots"]
+    let M = model["M"]
+
+    // compute attention scores
+    let mut scores = tm_zeros(mem_slots)
+    for s in 0..mem_slots {
+        scores[s] = tm_dot(query, M[s], D)
+    }
+
+    // softmax over scores
+    let mut mx = scores[0]
+    for s in 1..mem_slots {
+        if scores[s] > mx { mx = scores[s] }
+    }
+    let mut attn = tm_zeros(mem_slots)
+    let mut sum_e = 0.0
+    for s in 0..mem_slots {
+        let e = tm_exp(scores[s] - mx)
+        attn[s] = e
+        sum_e = sum_e + e
+    }
+    if sum_e <= 1.0e-12 { sum_e = 1.0e-12 }
+    for s in 0..mem_slots {
+        attn[s] = attn[s] / sum_e
+    }
+
+    // weighted sum of memory rows
+    let mut read_val = tm_zeros(D)
+    for s in 0..mem_slots {
+        for j in 0..D {
+            read_val[j] = read_val[j] + attn[s] * M[s][j]
+        }
+    }
+    return read_val
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tm_surprise — compute surprise as gradient magnitude proxy
+//
+//  For a simple MSE loss on the output:
+//    surprise = ||y - output||  (L2 norm of prediction error)
+//  This approximates ||grad_M L|| without full backprop through M.
+// ═══════════════════════════════════════════════════════════════════
+fn tm_surprise(model, x, y) {
+    let D_in = model["D_in"]
+    let D = model["D"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+
+    // project query and read from memory
+    let q = tm_project_query(model, x)
+    let read_val = tm_read(model, q)
+
+    // output = W_o * read_val + b_o
+    let mut out = tm_zeros(D_in)
+    for i in 0..D_in {
+        let mut s = b_o[i]
+        for j in 0..D { s = s + W_o[i][j] * read_val[j] }
+        out[i] = s
+    }
+
+    // surprise = ||y - out||
+    let mut err_sq = 0.0
+    for i in 0..D_in {
+        let diff = y[i] - out[i]
+        err_sq = err_sq + diff * diff
+    }
+    return tm_sqrt(err_sq)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tm_forward — process an input sequence through Titan memory
+//
+//  For each timestep t:
+//    1. project key, value, query from input[t]
+//    2. compute surprise (prediction error magnitude)
+//    3. write (key, value) to memory gated by surprise
+//    4. read from memory using query
+//    5. output = W_o * read_val + b_o
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn tm_forward(model, input_seq) {
+    let N = len(input_seq)
+    let D = model["D"]
+    let D_in = model["D_in"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+    let mut cur_model = model
+    let mut outputs = []
+
+    for t in 0..N {
+        let x = input_seq[t]
+        let k = tm_project_key(cur_model, x)
+        let v = tm_project_value(cur_model, x)
+        let q = tm_project_query(cur_model, x)
+
+        // compute surprise as prediction error before write
+        let read_before = tm_read(cur_model, q)
+        let mut pred = tm_zeros(D_in)
+        for i in 0..D_in {
+            let mut s = b_o[i]
+            for j in 0..D { s = s + W_o[i][j] * read_before[j] }
+            pred[i] = s
+        }
+        let mut surp = 0.0
+        for i in 0..D_in {
+            let diff = x[i] - pred[i]
+            surp = surp + diff * diff
+        }
+        surp = tm_sqrt(surp)
+
+        // write to memory gated by surprise
+        cur_model = tm_write(cur_model, k, v, surp)
+
+        // read from updated memory
+        let read_val = tm_read(cur_model, q)
+
+        // output projection
+        let mut out = tm_zeros(D_in)
+        for i in 0..D_in {
+            let mut s = b_o[i]
+            for j in 0..D { s = s + W_o[i][j] * read_val[j] }
+            out[i] = s
+        }
+        outputs = outputs + [out]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tm_train_step — one gradient step on MSE loss
+//
+//  For each (X[i], Y[i]) pair:
+//    forward pass -> output
+//    loss = 0.5 * ||Y[i] - output||^2
+//
+//  Gradients (numerical perturbation for memory params,
+//  analytic for projection weights):
+//
+//    d_loss/d_out = -(Y - out)
+//    backprop through W_o:  grad_W_o += d_loss/d_out * read_val^T
+//    backprop through read -> memory attention -> query proj
+//    backprop through write -> key/value proj
+//
+//  Simplified: analytic gradient through output + key/value/query
+//  projections, memory is updated via surprise gating (online).
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn tm_train_step(model, X, Y, lr) {
+    let N = len(X)
+    let D = model["D"]
+    let D_in = model["D_in"]
+    let mem_slots = model["mem_slots"]
+
+    let W_k = model["W_k"]
+    let b_k = model["b_k"]
+    let W_v = model["W_v"]
+    let b_v = model["b_v"]
+    let W_q = model["W_q"]
+    let b_q = model["b_q"]
+    let W_o = model["W_o"]
+    let b_o = model["b_o"]
+
+    // accumulators for gradients
+    let mut gW_k = tm_zeros_2d(D, D_in)
+    let mut gb_k = tm_zeros(D)
+    let mut gW_v = tm_zeros_2d(D, D_in)
+    let mut gb_v = tm_zeros(D)
+    let mut gW_q = tm_zeros_2d(D, D_in)
+    let mut gb_q = tm_zeros(D)
+    let mut gW_o = tm_zeros_2d(D_in, D)
+    let mut gb_o = tm_zeros(D_in)
+
+    let mut cur_model = model
+
+    for i in 0..N {
+        let x = X[i]
+        let y = Y[i]
+
+        // -- forward --
+        let k = tm_project_key(cur_model, x)
+        let v = tm_project_value(cur_model, x)
+        let q = tm_project_query(cur_model, x)
+
+        // surprise
+        let surp = tm_surprise(cur_model, x, y)
+
+        // write to memory
+        cur_model = tm_write(cur_model, k, v, surp)
+
+        // read from memory
+        let read_val = tm_read(cur_model, q)
+
+        // output
+        let mut out = tm_zeros(D_in)
+        for oi in 0..D_in {
+            let mut s = b_o[oi]
+            for oj in 0..D { s = s + W_o[oi][oj] * read_val[oj] }
+            out[oi] = s
+        }
+
+        // -- backward: MSE loss --
+        // d_loss/d_out = out - y
+        let mut d_out = tm_zeros(D_in)
+        for oi in 0..D_in { d_out[oi] = out[oi] - y[oi] }
+
+        // grad W_o, b_o
+        for oi in 0..D_in {
+            gb_o[oi] = gb_o[oi] + d_out[oi]
+            for oj in 0..D {
+                gW_o[oi][oj] = gW_o[oi][oj] + d_out[oi] * read_val[oj]
+            }
+        }
+
+        // grad through read_val -> query projection
+        // d_loss/d_read = W_o^T * d_out
+        let mut d_read = tm_zeros(D)
+        for oj in 0..D {
+            let mut s = 0.0
+            for oi in 0..D_in { s = s + W_o[oi][oj] * d_out[oi] }
+            d_read[oj] = s
+        }
+
+        // The read operation computes attention over memory:
+        //   read = sum_s attn[s] * M[s]
+        // d_loss/d_attn[s] = dot(d_read, M[s])
+        // d_loss/d_query goes through softmax(scores) where scores[s] = dot(q, M[s])
+        let M_cur = cur_model["M"]
+        let mut scores_q = tm_zeros(mem_slots)
+        for s in 0..mem_slots {
+            scores_q[s] = tm_dot(q, M_cur[s], D)
+        }
+        // softmax
+        let mut mx_q = scores_q[0]
+        for s in 1..mem_slots {
+            if scores_q[s] > mx_q { mx_q = scores_q[s] }
+        }
+        let mut attn_q = tm_zeros(mem_slots)
+        let mut sum_eq = 0.0
+        for s in 0..mem_slots {
+            let e = tm_exp(scores_q[s] - mx_q)
+            attn_q[s] = e
+            sum_eq = sum_eq + e
+        }
+        if sum_eq <= 1.0e-12 { sum_eq = 1.0e-12 }
+        for s in 0..mem_slots { attn_q[s] = attn_q[s] / sum_eq }
+
+        // d_loss/d_scores: softmax jacobian
+        let mut d_attn = tm_zeros(mem_slots)
+        for s in 0..mem_slots {
+            d_attn[s] = tm_dot(d_read, M_cur[s], D)
+        }
+        // dsoftmax: d_scores[s] = attn[s] * (d_attn[s] - sum_j attn[j]*d_attn[j])
+        let mut weighted_da = 0.0
+        for s in 0..mem_slots { weighted_da = weighted_da + attn_q[s] * d_attn[s] }
+        let mut d_scores = tm_zeros(mem_slots)
+        for s in 0..mem_slots {
+            d_scores[s] = attn_q[s] * (d_attn[s] - weighted_da)
+        }
+
+        // d_loss/d_q: from scores[s] = dot(q, M[s])
+        let mut d_q = tm_zeros(D)
+        for s in 0..mem_slots {
+            for j in 0..D {
+                d_q[j] = d_q[j] + d_scores[s] * M_cur[s][j]
+            }
+        }
+
+        // backprop through query projection: q = tanh(W_q * x + b_q)
+        // d_loss/d_pre_q = d_q * (1 - q^2)
+        let mut d_pre_q = tm_zeros(D)
+        for j in 0..D {
+            d_pre_q[j] = d_q[j] * (1.0 - q[j] * q[j])
+        }
+        for j in 0..D {
+            gb_q[j] = gb_q[j] + d_pre_q[j]
+            for jj in 0..D_in {
+                gW_q[j][jj] = gW_q[j][jj] + d_pre_q[j] * x[jj]
+            }
+        }
+
+        // backprop through key/value projections via memory write
+        // M[slot] += g * k * v (elementwise), so d_loss flows through
+        // the attention read. We use the d_read signal scaled by gate.
+        let g = tm_sigmoid(surp - model["threshold"])
+
+        // d_loss/d_k and d_loss/d_v from the outer product write
+        // d_read provides the signal from the read; k,v contributed to
+        // the slot that was written. d_k = g * d_read * v, d_v = g * d_read * k
+        let mut d_k = tm_zeros(D)
+        let mut d_v = tm_zeros(D)
+        for j in 0..D {
+            d_k[j] = g * d_read[j] * v[j]
+            d_v[j] = g * d_read[j] * k[j]
+        }
+
+        // backprop through key projection: k = tanh(W_k * x + b_k)
+        let mut d_pre_k = tm_zeros(D)
+        for j in 0..D {
+            d_pre_k[j] = d_k[j] * (1.0 - k[j] * k[j])
+        }
+        for j in 0..D {
+            gb_k[j] = gb_k[j] + d_pre_k[j]
+            for jj in 0..D_in {
+                gW_k[j][jj] = gW_k[j][jj] + d_pre_k[j] * x[jj]
+            }
+        }
+
+        // backprop through value projection: v = tanh(W_v * x + b_v)
+        let mut d_pre_v = tm_zeros(D)
+        for j in 0..D {
+            d_pre_v[j] = d_v[j] * (1.0 - v[j] * v[j])
+        }
+        for j in 0..D {
+            gb_v[j] = gb_v[j] + d_pre_v[j]
+            for jj in 0..D_in {
+                gW_v[j][jj] = gW_v[j][jj] + d_pre_v[j] * x[jj]
+            }
+        }
+    }
+
+    // ── Apply gradients ───────────────────────────────────────
+    let inv_n = 1.0 / to_float(N)
+
+    let mut W_k_new = tm_zeros_2d(D, D_in)
+    let mut b_k_new = tm_zeros(D)
+    for i in 0..D {
+        b_k_new[i] = b_k[i] - lr * gb_k[i] * inv_n
+        for j in 0..D_in {
+            W_k_new[i][j] = W_k[i][j] - lr * gW_k[i][j] * inv_n
+        }
+    }
+
+    let mut W_v_new = tm_zeros_2d(D, D_in)
+    let mut b_v_new = tm_zeros(D)
+    for i in 0..D {
+        b_v_new[i] = b_v[i] - lr * gb_v[i] * inv_n
+        for j in 0..D_in {
+            W_v_new[i][j] = W_v[i][j] - lr * gW_v[i][j] * inv_n
+        }
+    }
+
+    let mut W_q_new = tm_zeros_2d(D, D_in)
+    let mut b_q_new = tm_zeros(D)
+    for i in 0..D {
+        b_q_new[i] = b_q[i] - lr * gb_q[i] * inv_n
+        for j in 0..D_in {
+            W_q_new[i][j] = W_q[i][j] - lr * gW_q[i][j] * inv_n
+        }
+    }
+
+    let mut W_o_new = tm_zeros_2d(D_in, D)
+    let mut b_o_new = tm_zeros(D_in)
+    for i in 0..D_in {
+        b_o_new[i] = b_o[i] - lr * gb_o[i] * inv_n
+        for j in 0..D {
+            W_o_new[i][j] = W_o[i][j] - lr * gW_o[i][j] * inv_n
+        }
+    }
+
+    return #{
+        "D": D,
+        "D_in": D_in,
+        "mem_slots": mem_slots,
+        "M": cur_model["M"],
+        "W_k": W_k_new,
+        "b_k": b_k_new,
+        "W_v": W_v_new,
+        "b_v": b_v_new,
+        "W_q": W_q_new,
+        "b_q": b_q_new,
+        "W_o": W_o_new,
+        "b_o": b_o_new,
+        "threshold": model["threshold"],
+        "write_head": cur_model["write_head"]
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

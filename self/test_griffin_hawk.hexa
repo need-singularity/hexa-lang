@@ -2,7 +2,749 @@
 //  test_griffin_hawk.hexa — Griffin / Hawk (#312)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/griffin_hawk.hexa"
+// -- inlined from self/ml/griffin_hawk.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/griffin_hawk.hexa — Griffin / Hawk (#312)
+//
+//  Griffin/Hawk (Google DeepMind, 2024) — hybrid architecture
+//  mixing gated linear recurrence (RG-LRU) with local attention.
+//
+//    Hawk  = pure recurrent (RG-LRU only)
+//    Griffin = recurrent + local sliding-window attention
+//
+//  RG-LRU (Real-Gated Linear Recurrent Unit):
+//    r_t = sigma(W_r . x_t)         gate
+//    i_t = sigma(W_i . x_t)         input gate
+//    a_t = diag(a) where a = -8 * softplus(w_a)   learnable decay
+//    h_t = exp(a_t * r_t) . h_{t-1} + sqrt(1 - exp(2*a_t*r_t)) . (i_t . x_t)
+//
+//  Architecture per layer:
+//    Hawk mode:  x -> Linear(D_in,D_hidden) -> RG-LRU -> Linear(D_hidden,D_out)
+//    Griffin:    x -> Linear(D_in,D_hidden) -> RG-LRU + LocalAttn -> Linear(D_hidden,D_out)
+//
+//  API (gh_ prefix):
+//    gh_init(D_in, D_hidden, D_out, mode, window, seed) -> model
+//    gh_rg_lru_cell(model, x, h) -> [output, new_h]
+//    gh_local_attention(model, block, window) -> output
+//    gh_forward_seq(model, xs) -> outputs
+//    gh_loss(model, xs, ys) -> float
+//    gh_train_step(model, X_seqs, Y_seqs, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (cell / forward / loss)
+//    @hot   (train)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math helpers ──────────────────────────────────────────────────
+
+fn gh_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn gh_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn gh_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn gh_sigmoid(v) {
+    return 1.0 / (1.0 + gh_exp(0.0 - v))
+}
+
+fn gh_softplus(v) {
+    // softplus(x) = log(1 + exp(x))
+    if v > 20.0 { return v }
+    return gh_log(1.0 + gh_exp(v))
+}
+
+fn gh_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut x = v
+    for _i in 0..30 {
+        x = (x + v / x) / 2.0
+    }
+    return x
+}
+
+fn gh_tanh(v) {
+    let ep = gh_exp(v)
+    let en = gh_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+// ── array helpers ─────────────────────────────────────────────────
+
+fn gh_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn gh_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn gh_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn gh_uniform(state) {
+    let s = gh_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn gh_rand_vec(n, state_in) {
+    let mut st = state_in
+    let mut v = []
+    for _i in 0..n {
+        let u = gh_uniform(st)
+        st = int(u[1])
+        if st <= 0 { st = 1 }
+        v = v + [u[0] - 0.5]
+    }
+    return [v, st]
+}
+
+fn gh_rand_mat(rows, cols, state_in) {
+    let mut st = state_in
+    let mut m = []
+    for _r in 0..rows {
+        let rv = gh_rand_vec(cols, st)
+        m = m + [rv[0]]
+        st = int(rv[1])
+    }
+    return [m, st]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_init — initialise Griffin/Hawk model
+//
+//  mode: "hawk" (pure recurrent) or "griffin" (recurrent + local attn)
+//  window: local attention window size (only used in griffin mode)
+//
+//  Weights:
+//    W_in   : D_hidden x D_in     (input projection)
+//    b_in   : D_hidden
+//    W_r    : D_hidden x D_hidden (recurrence gate)
+//    W_i    : D_hidden x D_hidden (input gate)
+//    w_a    : D_hidden            (decay parameter, softplus input)
+//    W_q    : D_hidden x D_hidden (query, griffin only)
+//    W_k    : D_hidden x D_hidden (key, griffin only)
+//    W_v    : D_hidden x D_hidden (value, griffin only)
+//    W_out  : D_out x D_hidden    (output projection)
+//    b_out  : D_out
+// ═══════════════════════════════════════════════════════════════════
+fn gh_init(D_in, D_hidden, D_out, mode, window, seed) {
+    let mut st = seed
+    if st <= 0 { st = 1 }
+
+    // input projection
+    let r1 = gh_rand_mat(D_hidden, D_in, st)
+    let W_in = r1[0]
+    st = int(r1[1])
+    let b_in = gh_zeros(D_hidden)
+
+    // RG-LRU gates
+    let r2 = gh_rand_mat(D_hidden, D_hidden, st)
+    let W_r = r2[0]
+    st = int(r2[1])
+
+    let r3 = gh_rand_mat(D_hidden, D_hidden, st)
+    let W_i = r3[0]
+    st = int(r3[1])
+
+    // decay parameter (initialised small positive so softplus ~ small)
+    let r4 = gh_rand_vec(D_hidden, st)
+    let mut w_a = r4[0]
+    st = int(r4[1])
+    // scale to small values around 0.1
+    for i in 0..D_hidden {
+        w_a[i] = 0.1 + w_a[i] * 0.05
+    }
+
+    // local attention weights (griffin mode)
+    let r5 = gh_rand_mat(D_hidden, D_hidden, st)
+    let W_q = r5[0]
+    st = int(r5[1])
+
+    let r6 = gh_rand_mat(D_hidden, D_hidden, st)
+    let W_k = r6[0]
+    st = int(r6[1])
+
+    let r7 = gh_rand_mat(D_hidden, D_hidden, st)
+    let W_v = r7[0]
+    st = int(r7[1])
+
+    // output projection
+    let r8 = gh_rand_mat(D_out, D_hidden, st)
+    let W_out = r8[0]
+    st = int(r8[1])
+    let b_out = gh_zeros(D_out)
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "D_out": D_out,
+        "mode": mode,
+        "window": window,
+        "W_in": W_in,
+        "b_in": b_in,
+        "W_r": W_r,
+        "W_i": W_i,
+        "w_a": w_a,
+        "W_q": W_q,
+        "W_k": W_k,
+        "W_v": W_v,
+        "W_out": W_out,
+        "b_out": b_out
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_input_proj — project input x from D_in to D_hidden
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_input_proj(model, x) {
+    let W = model["W_in"]
+    let b = model["b_in"]
+    let D_h = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut out = gh_zeros(D_h)
+    for i in 0..D_h {
+        let mut s = b[i]
+        for j in 0..D_in {
+            s = s + W[i][j] * x[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_rg_lru_cell — Real-Gated Linear Recurrent Unit
+//
+//  r_t = sigma(W_r . x_t)
+//  i_t = sigma(W_i . x_t)
+//  a_t = -8 * softplus(w_a)   (element-wise learnable decay)
+//  h_t = exp(a_t * r_t) * h_{t-1}
+//      + sqrt(1 - exp(2 * a_t * r_t)) * (i_t * x_t)
+//
+//  Returns [output, new_h]
+//  where output = new_h (passed through for downstream use)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_rg_lru_cell(model, x, h) {
+    let W_r = model["W_r"]
+    let W_i = model["W_i"]
+    let w_a = model["w_a"]
+    let D_h = model["D_hidden"]
+
+    // compute gates
+    let mut r = gh_zeros(D_h)
+    let mut ig = gh_zeros(D_h)
+    for i in 0..D_h {
+        let mut sr = 0.0
+        let mut si = 0.0
+        for j in 0..D_h {
+            sr = sr + W_r[i][j] * x[j]
+            si = si + W_i[i][j] * x[j]
+        }
+        r[i] = gh_sigmoid(sr)
+        ig[i] = gh_sigmoid(si)
+    }
+
+    // compute decay and new hidden state
+    let mut new_h = gh_zeros(D_h)
+    for i in 0..D_h {
+        let a_i = -8.0 * gh_softplus(w_a[i])
+        let ar = a_i * r[i]
+        let exp_ar = gh_exp(ar)
+        let exp_2ar = gh_exp(2.0 * ar)
+        let mut norm = 1.0 - exp_2ar
+        if norm < 0.0 { norm = 0.0 }
+        let sqrt_norm = gh_sqrt(norm)
+        new_h[i] = exp_ar * h[i] + sqrt_norm * (ig[i] * x[i])
+    }
+
+    return [new_h, new_h]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_local_attention — sliding-window local attention (griffin mode)
+//
+//  For each position t, attend only to positions max(0,t-window+1)..t
+//  Q = W_q . block[t], K = W_k . block[j], V = W_v . block[j]
+//  attn = softmax(Q . K^T / sqrt(D)) . V
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_local_attention(model, block, window) {
+    let W_q = model["W_q"]
+    let W_k = model["W_k"]
+    let W_v = model["W_v"]
+    let D_h = model["D_hidden"]
+    let T = len(block)
+    let scale = 1.0 / gh_sqrt(to_float(D_h))
+
+    let mut outputs = []
+    for t in 0..T {
+        // compute query for position t
+        let mut q = gh_zeros(D_h)
+        for i in 0..D_h {
+            let mut s = 0.0
+            for j in 0..D_h { s = s + W_q[i][j] * block[t][j] }
+            q[i] = s
+        }
+
+        // window start
+        let mut w_start = t - window + 1
+        if w_start < 0 { w_start = 0 }
+        let w_len = t - w_start + 1
+
+        // compute scores over window
+        let mut scores = []
+        for _idx in 0..w_len { scores = scores + [0.0] }
+        let mut max_score = -1.0e30
+        for idx in 0..w_len {
+            let pos = w_start + idx
+            // compute key
+            let mut dot = 0.0
+            for i in 0..D_h {
+                let mut k_i = 0.0
+                for j in 0..D_h { k_i = k_i + W_k[i][j] * block[pos][j] }
+                dot = dot + q[i] * k_i
+            }
+            scores[idx] = dot * scale
+            if scores[idx] > max_score { max_score = scores[idx] }
+        }
+
+        // softmax
+        let mut exp_sum = 0.0
+        let mut weights = []
+        for _idx in 0..w_len { weights = weights + [0.0] }
+        for idx in 0..w_len {
+            let e = gh_exp(scores[idx] - max_score)
+            weights[idx] = e
+            exp_sum = exp_sum + e
+        }
+        if exp_sum <= 0.0 { exp_sum = 1.0e-12 }
+        for idx in 0..w_len {
+            weights[idx] = weights[idx] / exp_sum
+        }
+
+        // weighted sum of values
+        let mut out_t = gh_zeros(D_h)
+        for idx in 0..w_len {
+            let pos = w_start + idx
+            for i in 0..D_h {
+                let mut v_i = 0.0
+                for j in 0..D_h { v_i = v_i + W_v[i][j] * block[pos][j] }
+                out_t[i] = out_t[i] + weights[idx] * v_i
+            }
+        }
+        outputs = outputs + [out_t]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_output_proj — project from D_hidden to D_out
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_output_proj(model, h) {
+    let W = model["W_out"]
+    let b = model["b_out"]
+    let D_out = model["D_out"]
+    let D_h = model["D_hidden"]
+    let mut out = gh_zeros(D_out)
+    for i in 0..D_out {
+        let mut s = b[i]
+        for j in 0..D_h { s = s + W[i][j] * h[j] }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_forward_seq — process a sequence xs through the model
+//
+//  Hawk:    for each timestep, project input, run RG-LRU, project output
+//  Griffin: same, but after RG-LRU add local attention residual
+//
+//  Returns list of output vectors (one per timestep)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_forward_seq(model, xs) {
+    let T = len(xs)
+    let D_h = model["D_hidden"]
+    let mode = model["mode"]
+    let window = model["window"]
+
+    // run input projection for all timesteps
+    let mut projected = []
+    for t in 0..T {
+        projected = projected + [gh_input_proj(model, xs[t])]
+    }
+
+    // run RG-LRU across sequence
+    let mut h = gh_zeros(D_h)
+    let mut rnn_outs = []
+    for t in 0..T {
+        let result = gh_rg_lru_cell(model, projected[t], h)
+        let out_t = result[0]
+        h = result[1]
+        rnn_outs = rnn_outs + [out_t]
+    }
+
+    // griffin mode: add local attention residual
+    let mut hidden_seq = rnn_outs
+    if mode == "griffin" {
+        let attn_outs = gh_local_attention(model, rnn_outs, window)
+        let mut combined = []
+        for t in 0..T {
+            let mut c = gh_zeros(D_h)
+            for i in 0..D_h {
+                c[i] = rnn_outs[t][i] + attn_outs[t][i]
+            }
+            combined = combined + [c]
+        }
+        hidden_seq = combined
+    }
+
+    // output projection
+    let mut outputs = []
+    for t in 0..T {
+        outputs = outputs + [gh_output_proj(model, hidden_seq[t])]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_softmax — softmax over a vector
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = gh_zeros(K)
+    let mut total = 0.0
+    for k in 0..K {
+        let e = gh_exp(logits[k] - mx)
+        out[k] = e
+        total = total + e
+    }
+    if total <= 0.0 { total = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / total }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_loss — cross-entropy loss over sequences
+//
+//  xs: list of input sequences [[x0,x1,...], ...]
+//  ys: list of target label sequences [[y0,y1,...], ...]
+//  Each y is an integer class index, D_out = number of classes
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn gh_loss(model, xs, ys) {
+    let N = len(xs)
+    let mut total = 0.0
+    let mut count = 0
+    for n in 0..N {
+        let outs = gh_forward_seq(model, xs[n])
+        let T = len(outs)
+        for t in 0..T {
+            let p = gh_softmax(outs[t])
+            let y = ys[n][t]
+            let mut py = p[y]
+            if py < 1.0e-12 { py = 1.0e-12 }
+            total = total + (0.0 - gh_log(py))
+            count = count + 1
+        }
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  gh_train_step — one step of numerical gradient descent
+//
+//  Finite-difference gradient for all parameters.
+//  X_seqs: list of input sequences
+//  Y_seqs: list of target label sequences
+//  lr: learning rate
+//
+//  Returns updated model.
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn gh_train_step(model, X_seqs, Y_seqs, lr) {
+    let eps = 0.001
+    let base_loss = gh_loss(model, X_seqs, Y_seqs)
+    let D_in = model["D_in"]
+    let D_h = model["D_hidden"]
+    let D_out = model["D_out"]
+    let mode = model["mode"]
+    let window = model["window"]
+
+    // ── W_in gradients ────────────────────────────────────────
+    let mut W_in = model["W_in"]
+    let mut new_W_in = gh_zeros_2d(D_h, D_in)
+    for i in 0..D_h {
+        for j in 0..D_in {
+            let orig = W_in[i][j]
+            W_in[i][j] = orig + eps
+            let m2 = #{
+                "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                "mode": mode, "window": window,
+                "W_in": W_in, "b_in": model["b_in"],
+                "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+                "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+                "W_out": model["W_out"], "b_out": model["b_out"]
+            }
+            let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+            W_in[i][j] = orig
+            new_W_in[i][j] = orig - lr * g
+        }
+    }
+
+    // ── b_in gradients ────────────────────────────────────────
+    let mut b_in = model["b_in"]
+    let mut new_b_in = gh_zeros(D_h)
+    for i in 0..D_h {
+        let orig = b_in[i]
+        b_in[i] = orig + eps
+        let m2 = #{
+            "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+            "mode": mode, "window": window,
+            "W_in": model["W_in"], "b_in": b_in,
+            "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+            "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+            "W_out": model["W_out"], "b_out": model["b_out"]
+        }
+        let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+        b_in[i] = orig
+        new_b_in[i] = orig - lr * g
+    }
+
+    // ── w_a (decay) gradients ─────────────────────────────────
+    let mut w_a = model["w_a"]
+    let mut new_w_a = gh_zeros(D_h)
+    for i in 0..D_h {
+        let orig = w_a[i]
+        w_a[i] = orig + eps
+        let m2 = #{
+            "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+            "mode": mode, "window": window,
+            "W_in": model["W_in"], "b_in": model["b_in"],
+            "W_r": model["W_r"], "W_i": model["W_i"], "w_a": w_a,
+            "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+            "W_out": model["W_out"], "b_out": model["b_out"]
+        }
+        let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+        w_a[i] = orig
+        new_w_a[i] = orig - lr * g
+    }
+
+    // ── W_out gradients ───────────────────────────────────────
+    let mut W_out = model["W_out"]
+    let mut new_W_out = gh_zeros_2d(D_out, D_h)
+    for i in 0..D_out {
+        for j in 0..D_h {
+            let orig = W_out[i][j]
+            W_out[i][j] = orig + eps
+            let m2 = #{
+                "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                "mode": mode, "window": window,
+                "W_in": model["W_in"], "b_in": model["b_in"],
+                "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+                "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+                "W_out": W_out, "b_out": model["b_out"]
+            }
+            let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+            W_out[i][j] = orig
+            new_W_out[i][j] = orig - lr * g
+        }
+    }
+
+    // ── b_out gradients ───────────────────────────────────────
+    let mut b_out = model["b_out"]
+    let mut new_b_out = gh_zeros(D_out)
+    for i in 0..D_out {
+        let orig = b_out[i]
+        b_out[i] = orig + eps
+        let m2 = #{
+            "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+            "mode": mode, "window": window,
+            "W_in": model["W_in"], "b_in": model["b_in"],
+            "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+            "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+            "W_out": model["W_out"], "b_out": b_out
+        }
+        let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+        b_out[i] = orig
+        new_b_out[i] = orig - lr * g
+    }
+
+    // ── W_r gradients (recurrence gate) ───────────────────────
+    let mut W_r = model["W_r"]
+    let mut new_W_r = gh_zeros_2d(D_h, D_h)
+    for i in 0..D_h {
+        for j in 0..D_h {
+            let orig = W_r[i][j]
+            W_r[i][j] = orig + eps
+            let m2 = #{
+                "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                "mode": mode, "window": window,
+                "W_in": model["W_in"], "b_in": model["b_in"],
+                "W_r": W_r, "W_i": model["W_i"], "w_a": model["w_a"],
+                "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+                "W_out": model["W_out"], "b_out": model["b_out"]
+            }
+            let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+            W_r[i][j] = orig
+            new_W_r[i][j] = orig - lr * g
+        }
+    }
+
+    // ── W_i gradients (input gate) ────────────────────────────
+    let mut W_i = model["W_i"]
+    let mut new_W_i = gh_zeros_2d(D_h, D_h)
+    for i in 0..D_h {
+        for j in 0..D_h {
+            let orig = W_i[i][j]
+            W_i[i][j] = orig + eps
+            let m2 = #{
+                "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                "mode": mode, "window": window,
+                "W_in": model["W_in"], "b_in": model["b_in"],
+                "W_r": model["W_r"], "W_i": W_i, "w_a": model["w_a"],
+                "W_q": model["W_q"], "W_k": model["W_k"], "W_v": model["W_v"],
+                "W_out": model["W_out"], "b_out": model["b_out"]
+            }
+            let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+            W_i[i][j] = orig
+            new_W_i[i][j] = orig - lr * g
+        }
+    }
+
+    // ── Griffin attention weights (only update if mode == griffin)
+    let mut new_W_q = model["W_q"]
+    let mut new_W_k = model["W_k"]
+    let mut new_W_v = model["W_v"]
+    if mode == "griffin" {
+        let mut W_q = model["W_q"]
+        new_W_q = gh_zeros_2d(D_h, D_h)
+        for i in 0..D_h {
+            for j in 0..D_h {
+                let orig = W_q[i][j]
+                W_q[i][j] = orig + eps
+                let m2 = #{
+                    "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                    "mode": mode, "window": window,
+                    "W_in": model["W_in"], "b_in": model["b_in"],
+                    "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+                    "W_q": W_q, "W_k": model["W_k"], "W_v": model["W_v"],
+                    "W_out": model["W_out"], "b_out": model["b_out"]
+                }
+                let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+                W_q[i][j] = orig
+                new_W_q[i][j] = orig - lr * g
+            }
+        }
+
+        let mut W_k = model["W_k"]
+        new_W_k = gh_zeros_2d(D_h, D_h)
+        for i in 0..D_h {
+            for j in 0..D_h {
+                let orig = W_k[i][j]
+                W_k[i][j] = orig + eps
+                let m2 = #{
+                    "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                    "mode": mode, "window": window,
+                    "W_in": model["W_in"], "b_in": model["b_in"],
+                    "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+                    "W_q": model["W_q"], "W_k": W_k, "W_v": model["W_v"],
+                    "W_out": model["W_out"], "b_out": model["b_out"]
+                }
+                let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+                W_k[i][j] = orig
+                new_W_k[i][j] = orig - lr * g
+            }
+        }
+
+        let mut W_v = model["W_v"]
+        new_W_v = gh_zeros_2d(D_h, D_h)
+        for i in 0..D_h {
+            for j in 0..D_h {
+                let orig = W_v[i][j]
+                W_v[i][j] = orig + eps
+                let m2 = #{
+                    "D_in": D_in, "D_hidden": D_h, "D_out": D_out,
+                    "mode": mode, "window": window,
+                    "W_in": model["W_in"], "b_in": model["b_in"],
+                    "W_r": model["W_r"], "W_i": model["W_i"], "w_a": model["w_a"],
+                    "W_q": model["W_q"], "W_k": model["W_k"], "W_v": W_v,
+                    "W_out": model["W_out"], "b_out": model["b_out"]
+                }
+                let g = (gh_loss(m2, X_seqs, Y_seqs) - base_loss) / eps
+                W_v[i][j] = orig
+                new_W_v[i][j] = orig - lr * g
+            }
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_h,
+        "D_out": D_out,
+        "mode": mode,
+        "window": window,
+        "W_in": new_W_in,
+        "b_in": new_b_in,
+        "W_r": new_W_r,
+        "W_i": new_W_i,
+        "w_a": new_w_a,
+        "W_q": new_W_q,
+        "W_k": new_W_k,
+        "W_v": new_W_v,
+        "W_out": new_W_out,
+        "b_out": new_b_out
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

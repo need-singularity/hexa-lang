@@ -14,7 +14,631 @@
 //  Run: ./hexa self/test_prompt_cache.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/prompt_cache.hexa"
+// -- inlined from self/ml/prompt_cache.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/prompt_cache.hexa — Prompt Caching: prefix KV reuse
+//
+//  Implements:
+//    1. Prefix hash: FNV-1a-like hash of token sequences for cache key
+//    2. Radix tree: hierarchical prefix matching (longest common prefix)
+//    3. KV snapshot: store computed KV pairs for matched prefixes
+//    4. Cache eviction: LRU policy with max entries
+//    5. Lookup: find longest cached prefix, return KV + remaining tokens
+//    6. Cache hit rate tracking
+//
+//  All data structures are immutable-style: mutations return new structs.
+//  No semicolons. No complex index assignment. Flat 1D arrays.
+//
+//  Run: ./hexa self/test_prompt_cache.hexa
+// ═══════════════════════════════════════════════════════════════
+
+// ── Prefix Hashing ───────────────────────────────────────────
+// FNV-1a-style hash for token sequences.
+// tokens: array of int (token ids)
+// Returns an int hash.
+
+fn prefix_hash(tokens) {
+    let mut h = 2166136261
+    for i in 0..len(tokens) {
+        let t = tokens[i]
+        // XOR + multiply (FNV-1a core)
+        h = h + t * 16777619
+        // fold to avoid overflow issues: keep it positive
+        if h < 0 {
+            h = 0 - h
+        }
+    }
+    return h
+}
+
+// Hash a sub-range of tokens: tokens[start..end_idx]
+fn prefix_hash_range(tokens, start, end_idx) {
+    let mut h = 2166136261
+    let mut i = start
+    while i < end_idx {
+        let t = tokens[i]
+        h = h + t * 16777619
+        if h < 0 {
+            h = 0 - h
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ── Radix Tree Node ──────────────────────────────────────────
+// Each node stores a token-segment (edge label) and optional KV data.
+// children: array of RadixNode
+// kv_keys / kv_values: flat 1D arrays (KV snapshot) or empty
+// has_kv: bool indicating whether this node holds a cached KV
+
+struct RadixNode {
+    segment: array,
+    children: array,
+    kv_keys: array,
+    kv_values: array,
+    has_kv: bool,
+    seq_len: int
+}
+
+fn radix_node_new(segment) {
+    return RadixNode {
+        segment: segment,
+        children: [],
+        kv_keys: [],
+        kv_values: [],
+        has_kv: false,
+        seq_len: 0
+    }
+}
+
+fn radix_node_with_kv(segment, kv_keys, kv_values, seq_len) {
+    return RadixNode {
+        segment: segment,
+        children: [],
+        kv_keys: kv_keys,
+        kv_values: kv_values,
+        has_kv: true,
+        seq_len: seq_len
+    }
+}
+
+// ── Array helpers ────────────────────────────────────────────
+
+fn arr_slice(arr, start, end_idx) {
+    let mut result = []
+    let mut i = start
+    while i < end_idx {
+        result = result.push(arr[i])
+        i = i + 1
+    }
+    return result
+}
+
+fn arr_eq(a, b) {
+    if len(a) != len(b) {
+        return false
+    }
+    for i in 0..len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+    }
+    return true
+}
+
+fn arr_starts_with(arr, prefix) {
+    if len(prefix) > len(arr) {
+        return false
+    }
+    for i in 0..len(prefix) {
+        if arr[i] != prefix[i] {
+            return false
+        }
+    }
+    return true
+}
+
+// Find length of common prefix between two arrays
+fn common_prefix_len(a, b) {
+    let la = len(a)
+    let lb = len(b)
+    let mut lim = la
+    if lb < lim {
+        lim = lb
+    }
+    let mut i = 0
+    while i < lim {
+        if a[i] != b[i] {
+            return i
+        }
+        i = i + 1
+    }
+    return lim
+}
+
+// ── Radix Tree Insert ────────────────────────────────────────
+// Insert tokens into radix tree with KV data at the leaf.
+// Returns a new RadixNode (root).
+
+fn radix_insert(node: RadixNode, tokens, kv_keys, kv_values, seq_len) {
+    if len(tokens) == 0 {
+        // Mark this node with KV
+        return RadixNode {
+            segment: node.segment,
+            children: node.children,
+            kv_keys: kv_keys,
+            kv_values: kv_values,
+            has_kv: true,
+            seq_len: seq_len
+        }
+    }
+
+    // Find child whose segment shares a prefix with tokens
+    let mut found_idx = 0 - 1
+    let mut i = 0
+    while i < len(node.children) {
+        let child = node.children[i]
+        if len(child.segment) > 0 {
+            if child.segment[0] == tokens[0] {
+                found_idx = i
+            }
+        }
+        i = i + 1
+    }
+
+    if found_idx < 0 {
+        // No matching child: create a new leaf
+        let leaf = radix_node_with_kv(tokens, kv_keys, kv_values, seq_len)
+        let mut new_children = []
+        for j in 0..len(node.children) {
+            new_children = new_children.push(node.children[j])
+        }
+        new_children = new_children.push(leaf)
+        return RadixNode {
+            segment: node.segment,
+            children: new_children,
+            kv_keys: node.kv_keys,
+            kv_values: node.kv_values,
+            has_kv: node.has_kv,
+            seq_len: node.seq_len
+        }
+    }
+
+    // Found matching child at found_idx
+    let child = node.children[found_idx]
+    let cpl = common_prefix_len(child.segment, tokens)
+
+    if cpl == len(child.segment) {
+        // Entire child segment matches; recurse into child
+        let remaining = arr_slice(tokens, cpl, len(tokens))
+        let new_child = radix_insert(child, remaining, kv_keys, kv_values, seq_len)
+        let mut new_children = []
+        for j in 0..len(node.children) {
+            if j == found_idx {
+                new_children = new_children.push(new_child)
+            } else {
+                new_children = new_children.push(node.children[j])
+            }
+        }
+        return RadixNode {
+            segment: node.segment,
+            children: new_children,
+            kv_keys: node.kv_keys,
+            kv_values: node.kv_values,
+            has_kv: node.has_kv,
+            seq_len: node.seq_len
+        }
+    }
+
+    // Partial match: split the child
+    let shared_seg = arr_slice(child.segment, 0, cpl)
+    let child_tail = arr_slice(child.segment, cpl, len(child.segment))
+    let token_tail = arr_slice(tokens, cpl, len(tokens))
+
+    // Old child with trimmed segment
+    let old_child_trimmed = RadixNode {
+        segment: child_tail,
+        children: child.children,
+        kv_keys: child.kv_keys,
+        kv_values: child.kv_values,
+        has_kv: child.has_kv,
+        seq_len: child.seq_len
+    }
+
+    // New leaf for the remaining tokens
+    let new_leaf = radix_node_with_kv(token_tail, kv_keys, kv_values, seq_len)
+
+    // Split node holds the shared segment
+    let mut split_children = [old_child_trimmed]
+    if len(token_tail) > 0 {
+        split_children = split_children.push(new_leaf)
+    }
+    let mut split_has_kv = false
+    let mut split_kk = []
+    let mut split_kv = []
+    let mut split_sl = 0
+    if len(token_tail) == 0 {
+        split_has_kv = true
+        split_kk = kv_keys
+        split_kv = kv_values
+        split_sl = seq_len
+    }
+    let split_node = RadixNode {
+        segment: shared_seg,
+        children: split_children,
+        kv_keys: split_kk,
+        kv_values: split_kv,
+        has_kv: split_has_kv,
+        seq_len: split_sl
+    }
+
+    let mut new_children = []
+    for j in 0..len(node.children) {
+        if j == found_idx {
+            new_children = new_children.push(split_node)
+        } else {
+            new_children = new_children.push(node.children[j])
+        }
+    }
+    return RadixNode {
+        segment: node.segment,
+        children: new_children,
+        kv_keys: node.kv_keys,
+        kv_values: node.kv_values,
+        has_kv: node.has_kv,
+        seq_len: node.seq_len
+    }
+}
+
+// ── Radix Tree Lookup ────────────────────────────────────────
+// Find the longest cached prefix matching tokens.
+// Returns: [matched_len, kv_keys, kv_values, seq_len]
+// If no match: matched_len=0, kv_keys=[], kv_values=[], seq_len=0
+
+struct RadixLookupResult {
+    matched_len: int,
+    kv_keys: array,
+    kv_values: array,
+    seq_len: int
+}
+
+fn radix_lookup(node: RadixNode, tokens) {
+    return radix_lookup_inner(node, tokens, 0)
+}
+
+fn radix_lookup_inner(node: RadixNode, tokens, depth) {
+    // Best result so far: this node if it has KV
+    let mut best_len = 0
+    let mut best_kk = []
+    let mut best_kv = []
+    let mut best_sl = 0
+    if node.has_kv {
+        best_len = depth
+        best_kk = node.kv_keys
+        best_kv = node.kv_values
+        best_sl = node.seq_len
+    }
+
+    if depth >= len(tokens) {
+        return RadixLookupResult {
+            matched_len: best_len,
+            kv_keys: best_kk,
+            kv_values: best_kv,
+            seq_len: best_sl
+        }
+    }
+
+    // Search children
+    let mut i = 0
+    while i < len(node.children) {
+        let child = node.children[i]
+        if len(child.segment) > 0 {
+            if child.segment[0] == tokens[depth] {
+                // Check if entire segment matches
+                let remaining_tokens = arr_slice(tokens, depth, len(tokens))
+                let cpl = common_prefix_len(child.segment, remaining_tokens)
+                if cpl == len(child.segment) {
+                    // Full segment match: recurse
+                    let sub = radix_lookup_inner(child, tokens, depth + cpl)
+                    if sub.matched_len > best_len {
+                        best_len = sub.matched_len
+                        best_kk = sub.kv_keys
+                        best_kv = sub.kv_values
+                        best_sl = sub.seq_len
+                    }
+                }
+                // Partial match: no deeper child can match
+            }
+        }
+        i = i + 1
+    }
+
+    return RadixLookupResult {
+        matched_len: best_len,
+        kv_keys: best_kk,
+        kv_values: best_kv,
+        seq_len: best_sl
+    }
+}
+
+// ── LRU Entry ────────────────────────────────────────────────
+
+struct LRUEntry {
+    hash_key: int,
+    tokens: array,
+    kv_keys: array,
+    kv_values: array,
+    seq_len: int,
+    last_access: int
+}
+
+// ── Prompt Cache ─────────────────────────────────────────────
+
+struct PromptCache {
+    root: RadixNode,
+    entries: array,
+    max_entries: int,
+    access_counter: int,
+    hits: int,
+    misses: int,
+    total_lookups: int
+}
+
+fn prompt_cache_new(max_entries) {
+    return PromptCache {
+        root: radix_node_new([]),
+        entries: [],
+        max_entries: max_entries,
+        access_counter: 0,
+        hits: 0,
+        misses: 0,
+        total_lookups: 0
+    }
+}
+
+// ── Insert ───────────────────────────────────────────────────
+// Cache the KV for a given token prefix.
+
+fn prompt_cache_insert(cache: PromptCache, tokens, kv_keys, kv_values) {
+    let h = prefix_hash(tokens)
+    let new_counter = cache.access_counter + 1
+    let sl = len(tokens)
+
+    // Check if already exists (same hash + tokens)
+    let mut exists_idx = 0 - 1
+    for i in 0..len(cache.entries) {
+        let e = cache.entries[i]
+        if e.hash_key == h {
+            if arr_eq(e.tokens, tokens) {
+                exists_idx = i
+            }
+        }
+    }
+
+    let new_entry = LRUEntry {
+        hash_key: h,
+        tokens: tokens,
+        kv_keys: kv_keys,
+        kv_values: kv_values,
+        seq_len: sl,
+        last_access: new_counter
+    }
+
+    let mut new_entries = []
+    if exists_idx >= 0 {
+        // Replace existing
+        for i in 0..len(cache.entries) {
+            if i == exists_idx {
+                new_entries = new_entries.push(new_entry)
+            } else {
+                new_entries = new_entries.push(cache.entries[i])
+            }
+        }
+    } else {
+        // Add new
+        for i in 0..len(cache.entries) {
+            new_entries = new_entries.push(cache.entries[i])
+        }
+        new_entries = new_entries.push(new_entry)
+    }
+
+    // Evict if over max_entries
+    if len(new_entries) > cache.max_entries {
+        new_entries = lru_evict(new_entries)
+    }
+
+    // Insert into radix tree
+    let new_root = radix_insert(cache.root, tokens, kv_keys, kv_values, sl)
+
+    return PromptCache {
+        root: new_root,
+        entries: new_entries,
+        max_entries: cache.max_entries,
+        access_counter: new_counter,
+        hits: cache.hits,
+        misses: cache.misses,
+        total_lookups: cache.total_lookups
+    }
+}
+
+// ── LRU Eviction ─────────────────────────────────────────────
+// Remove the entry with the smallest last_access (least recently used).
+
+fn lru_evict(entries) {
+    if len(entries) == 0 {
+        return entries
+    }
+    let mut min_access = entries[0].last_access
+    let mut min_idx = 0
+    for i in 1..len(entries) {
+        if entries[i].last_access < min_access {
+            min_access = entries[i].last_access
+            min_idx = i
+        }
+    }
+    let mut result = []
+    for i in 0..len(entries) {
+        if i != min_idx {
+            result = result.push(entries[i])
+        }
+    }
+    return result
+}
+
+// ── Lookup ───────────────────────────────────────────────────
+// Find the longest cached prefix. Returns:
+//   PromptCacheLookup { matched_len, kv_keys, kv_values, remaining_tokens, hit }
+
+struct PromptCacheLookup {
+    matched_len: int,
+    kv_keys: array,
+    kv_values: array,
+    remaining_tokens: array,
+    hit: bool
+}
+
+fn prompt_cache_lookup(cache: PromptCache, tokens) {
+    let result = radix_lookup(cache.root, tokens)
+    let hit = result.matched_len > 0
+
+    let remaining = arr_slice(tokens, result.matched_len, len(tokens))
+
+    // Update hit/miss stats (returned in new cache via prompt_cache_lookup_update)
+    return PromptCacheLookup {
+        matched_len: result.matched_len,
+        kv_keys: result.kv_keys,
+        kv_values: result.kv_values,
+        remaining_tokens: remaining,
+        hit: hit
+    }
+}
+
+// Update stats after a lookup
+fn prompt_cache_record_lookup(cache: PromptCache, hit) {
+    let new_hits = cache.hits
+    let new_misses = cache.misses
+    let mut h = new_hits
+    let mut m = new_misses
+    if hit {
+        h = h + 1
+    } else {
+        m = m + 1
+    }
+    return PromptCache {
+        root: cache.root,
+        entries: cache.entries,
+        max_entries: cache.max_entries,
+        access_counter: cache.access_counter + 1,
+        hits: h,
+        misses: m,
+        total_lookups: cache.total_lookups + 1
+    }
+}
+
+// Update LRU timestamp for matching entry
+fn prompt_cache_touch(cache: PromptCache, tokens) {
+    let h = prefix_hash(tokens)
+    let new_counter = cache.access_counter + 1
+    let mut new_entries = []
+    for i in 0..len(cache.entries) {
+        let e = cache.entries[i]
+        if e.hash_key == h {
+            if arr_eq(e.tokens, tokens) {
+                let updated = LRUEntry {
+                    hash_key: e.hash_key,
+                    tokens: e.tokens,
+                    kv_keys: e.kv_keys,
+                    kv_values: e.kv_values,
+                    seq_len: e.seq_len,
+                    last_access: new_counter
+                }
+                new_entries = new_entries.push(updated)
+            } else {
+                new_entries = new_entries.push(e)
+            }
+        } else {
+            new_entries = new_entries.push(e)
+        }
+    }
+    return PromptCache {
+        root: cache.root,
+        entries: new_entries,
+        max_entries: cache.max_entries,
+        access_counter: new_counter,
+        hits: cache.hits,
+        misses: cache.misses,
+        total_lookups: cache.total_lookups
+    }
+}
+
+// ── Stats ────────────────────────────────────────────────────
+
+fn prompt_cache_hit_rate(cache: PromptCache) {
+    if cache.total_lookups == 0 {
+        return 0.0
+    }
+    return cache.hits * 1.0 / cache.total_lookups
+}
+
+fn prompt_cache_miss_rate(cache: PromptCache) {
+    if cache.total_lookups == 0 {
+        return 0.0
+    }
+    return cache.misses * 1.0 / cache.total_lookups
+}
+
+fn prompt_cache_size(cache: PromptCache) {
+    return len(cache.entries)
+}
+
+// ── Reset ────────────────────────────────────────────────────
+
+fn prompt_cache_reset(cache: PromptCache) {
+    return prompt_cache_new(cache.max_entries)
+}
+
+// ── Convenience: lookup + insert in one step ─────────────────
+// Try cache first. If hit, return cached KV + remaining.
+// If miss, caller computes full KV and can insert afterwards.
+
+fn prompt_cache_serve(cache: PromptCache, tokens) {
+    let lookup = prompt_cache_lookup(cache, tokens)
+    let updated = prompt_cache_record_lookup(cache, lookup.hit)
+    let mut final_cache = updated
+    if lookup.hit {
+        // Touch LRU for the matched prefix
+        let matched_tokens = arr_slice(tokens, 0, lookup.matched_len)
+        final_cache = prompt_cache_touch(final_cache, matched_tokens)
+    }
+    return [final_cache, lookup]
+}
+
+// ── Count nodes in radix tree (for debugging) ────────────────
+
+fn radix_node_count(node: RadixNode) {
+    let mut count = 1
+    for i in 0..len(node.children) {
+        count = count + radix_node_count(node.children[i])
+    }
+    return count
+}
+
+fn radix_kv_count(node: RadixNode) {
+    let mut count = 0
+    if node.has_kv {
+        count = 1
+    }
+    for i in 0..len(node.children) {
+        count = count + radix_kv_count(node.children[i])
+    }
+    return count
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

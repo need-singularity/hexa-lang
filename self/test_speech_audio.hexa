@@ -17,7 +17,518 @@
 //
 //  Run: hexa self/test_speech_audio.hexa
 // ===================================================================
-import "ml/speech_audio.hexa"
+// -- inlined from self/ml/speech_audio.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/speech_audio.hexa — Speech/Audio Processing Pipeline
+//
+//  Pure Hexa implementation of Whisper-style audio processing.
+//
+//  Components:
+//    1. Mel Spectrogram  — waveform -> FFT -> mel filterbank -> log power
+//    2. Audio Encoder    — conv1d stack + transformer blocks
+//    3. CTC Decoder      — CTC greedy/beam decode from logits
+//    4. Vocoder          — Griffin-Lim mel-to-waveform reconstruction
+//
+//  Public API:
+//    mel_spectrogram(waveform, n_fft, n_mels, hop)
+//    audio_encode(mel, num_layers)
+//    ctc_decode(logits, vocab)
+//    ctc_beam_decode(logits, vocab, beam_width)
+//    griffin_lim(mel, n_iter)
+//    create_audio_pipeline(n_fft, n_mels, hop, enc_layers)
+//    process_audio(pipeline, waveform, vocab)
+// ===================================================================
+
+let SA_PI = 3.14159265358979
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+fn _sa_cos(x) {
+    let mut v = x
+    let two_pi = 2.0 * SA_PI
+    while v > two_pi { v = v - two_pi }
+    while v < 0.0 { v = v + two_pi }
+    let x2 = v * v
+    let x4 = x2 * x2
+    let x6 = x4 * x2
+    let x8 = x4 * x4
+    return 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0 + x8 / 40320.0
+}
+
+fn _sa_sin(x) {
+    return _sa_cos(x - SA_PI / 2.0)
+}
+
+fn _sa_log(x) {
+    if x <= 0.0 { return 0.0 - 30.0 }
+    let mut v = x
+    let mut scale = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        scale = scale + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        scale = scale - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    let result = 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0 + t2 * t2 * t2 / 7.0)
+    return result + scale
+}
+
+fn _sa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    if guess < 0.001 { guess = 0.001 }
+    let mut i = 0
+    while i < 20 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+fn _sa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _sa_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { return 0.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i <= 20 {
+        term = term * v / (i * 1.0)
+        result = result + term
+        i = i + 1
+    }
+    return result
+}
+
+// ===================================================================
+//  DFT magnitudes for a frame
+// ===================================================================
+fn _dft_magnitudes(frame, n_fft) {
+    let half = n_fft / 2 + 1
+    let frame_len = len(frame)
+    let mut mags = []
+    let mut k = 0
+    while k < half {
+        let mut re = 0.0
+        let mut im = 0.0
+        let mut n = 0
+        while n < n_fft {
+            let sample = if n < frame_len { frame[n] } else { 0.0 }
+            let angle = 0.0 - 2.0 * SA_PI * (k * 1.0) * (n * 1.0) / (n_fft * 1.0)
+            re = re + sample * _sa_cos(angle)
+            im = im + sample * _sa_sin(angle)
+            n = n + 1
+        }
+        let mag = _sa_sqrt(re * re + im * im)
+        mags = mags + [mag]
+        k = k + 1
+    }
+    return mags
+}
+
+// ===================================================================
+//  Mel filterbank
+// ===================================================================
+fn _hz_to_mel(hz) {
+    return 2595.0 * _sa_log(1.0 + hz / 700.0) / _sa_log(10.0)
+}
+
+fn _mel_to_hz(mel) {
+    let log10 = _sa_log(10.0)
+    return 700.0 * (_sa_exp(mel * log10 / 2595.0) - 1.0)
+}
+
+fn _create_mel_filterbank(n_fft, n_mels, sample_rate) {
+    let half = n_fft / 2 + 1
+    let mel_low = _hz_to_mel(0.0)
+    let mel_high = _hz_to_mel(sample_rate / 2.0)
+    let mel_step = (mel_high - mel_low) / ((n_mels + 1) * 1.0)
+
+    let mut mel_centers = []
+    let mut m = 0
+    while m < n_mels + 2 {
+        let mel_freq = mel_low + (m * 1.0) * mel_step
+        let hz_freq = _mel_to_hz(mel_freq)
+        let bin = hz_freq * (n_fft * 1.0) / sample_rate
+        mel_centers = mel_centers + [bin]
+        m = m + 1
+    }
+
+    let mut filters = []
+    let mut fi = 0
+    while fi < n_mels {
+        let left = mel_centers[fi]
+        let center = mel_centers[fi + 1]
+        let right = mel_centers[fi + 2]
+        let mut filter = []
+        let mut k = 0
+        while k < half {
+            let kf = k * 1.0
+            let mut w = 0.0
+            if kf >= left {
+                if kf <= center {
+                    let denom = center - left
+                    if denom > 0.001 {
+                        w = (kf - left) / denom
+                    }
+                }
+            }
+            if kf > center {
+                if kf <= right {
+                    let denom = right - center
+                    if denom > 0.001 {
+                        w = (right - kf) / denom
+                    }
+                }
+            }
+            filter = filter + [w]
+            k = k + 1
+        }
+        filters = filters + [filter]
+        fi = fi + 1
+    }
+    return filters
+}
+
+// ===================================================================
+//  Mel Spectrogram
+// ===================================================================
+fn mel_spectrogram(waveform, n_fft, n_mels, hop) {
+    let wlen = len(waveform)
+    let sample_rate = 16000.0
+    let filters = _create_mel_filterbank(n_fft, n_mels, sample_rate)
+    let half = n_fft / 2 + 1
+
+    let mut frames = []
+    let mut start = 0
+    while start + n_fft <= wlen {
+        let mut frame = []
+        let mut fi = 0
+        while fi < n_fft {
+            frame = frame + [waveform[start + fi]]
+            fi = fi + 1
+        }
+
+        let mags = _dft_magnitudes(frame, n_fft)
+
+        let mut power = []
+        let mut pi = 0
+        while pi < half {
+            power = power + [mags[pi] * mags[pi]]
+            pi = pi + 1
+        }
+
+        let mut mel_frame = []
+        let mut mi = 0
+        while mi < n_mels {
+            let filt = filters[mi]
+            let mut val = 0.0
+            let mut ki = 0
+            while ki < half {
+                val = val + filt[ki] * power[ki]
+                ki = ki + 1
+            }
+            let safe_val = if val > 0.0000000001 { val } else { 0.0000000001 }
+            let log_val = _sa_log(safe_val)
+            mel_frame = mel_frame + [log_val]
+            mi = mi + 1
+        }
+        frames = frames + [mel_frame]
+        start = start + hop
+    }
+    return frames
+}
+
+// ===================================================================
+//  Audio Encoder
+// ===================================================================
+fn _sa_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn _conv1d_frame(frames, kernel_size, n_mels) {
+    let n_frames = len(frames)
+    let mut output = []
+    let mut i = 0
+    while i < n_frames {
+        let mut conv_frame = []
+        let mut m = 0
+        while m < n_mels {
+            let mut sum = 0.0
+            let mut k = 0
+            while k < kernel_size {
+                let idx = i + k - kernel_size / 2
+                if idx >= 0 {
+                    if idx < n_frames {
+                        sum = sum + frames[idx][m]
+                    }
+                }
+                k = k + 1
+            }
+            conv_frame = conv_frame + [_sa_relu(sum / (kernel_size * 1.0))]
+            m = m + 1
+        }
+        output = output + [conv_frame]
+        i = i + 1
+    }
+    return output
+}
+
+fn _layer_norm_frame(frame) {
+    let n = len(frame)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + frame[i]
+        i = i + 1
+    }
+    let mean = sum / (n * 1.0)
+    let mut var_sum = 0.0
+    i = 0
+    while i < n {
+        let d = frame[i] - mean
+        var_sum = var_sum + d * d
+        i = i + 1
+    }
+    let std = _sa_sqrt(var_sum / (n * 1.0) + 0.00001)
+    let mut normed = []
+    i = 0
+    while i < n {
+        normed = normed + [(frame[i] - mean) / std]
+        i = i + 1
+    }
+    return normed
+}
+
+fn audio_encode(mel, num_layers) {
+    let n_frames = len(mel)
+    if n_frames == 0 { return [] }
+    let n_mels = len(mel[0])
+
+    let mut encoded = _conv1d_frame(mel, 3, n_mels)
+    encoded = _conv1d_frame(encoded, 3, n_mels)
+
+    let mut layer = 0
+    while layer < num_layers {
+        let mut new_encoded = []
+        let mut fi = 0
+        while fi < n_frames {
+            let normed = _layer_norm_frame(encoded[fi])
+            let mut res_frame = []
+            let mut mi = 0
+            while mi < n_mels {
+                res_frame = res_frame + [normed[mi] + encoded[fi][mi]]
+                mi = mi + 1
+            }
+            new_encoded = new_encoded + [res_frame]
+            fi = fi + 1
+        }
+        encoded = new_encoded
+        layer = layer + 1
+    }
+    return encoded
+}
+
+// ===================================================================
+//  CTC Decode
+// ===================================================================
+fn _argmax(arr) {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    let mut best_idx = 0
+    let mut best_val = arr[0]
+    let mut i = 1
+    while i < n {
+        if arr[i] > best_val {
+            best_val = arr[i]
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+fn ctc_decode(logits, vocab) {
+    let n_frames = len(logits)
+    let vocab_size = len(vocab)
+    let blank_id = vocab_size - 1
+
+    let mut result = ""
+    let mut prev_token = blank_id
+    let mut i = 0
+    while i < n_frames {
+        let token_id = _argmax(logits[i])
+        if token_id != blank_id {
+            if token_id != prev_token {
+                result = result + vocab[token_id]
+            }
+        }
+        prev_token = token_id
+        i = i + 1
+    }
+    return result
+}
+
+fn ctc_beam_decode(logits, vocab, beam_width) {
+    let n_frames = len(logits)
+    let vocab_size = len(vocab)
+    let blank_id = vocab_size - 1
+
+    let mut beams = []
+    let init_beam = #{}
+    init_beam["text"] = ""
+    init_beam["score"] = 0.0
+    init_beam["last"] = blank_id
+    beams = beams + [init_beam]
+
+    let mut fi = 0
+    while fi < n_frames {
+        let frame = logits[fi]
+        let mut new_beams = []
+
+        let nb = len(beams)
+        let mut bi = 0
+        while bi < nb {
+            let beam = beams[bi]
+            let mut ti = 0
+            while ti < vocab_size {
+                let new_beam = #{}
+                let mut new_text = beam["text"]
+                if ti != blank_id {
+                    if ti != beam["last"] {
+                        new_text = new_text + vocab[ti]
+                    }
+                }
+                new_beam["text"] = new_text
+                new_beam["score"] = beam["score"] + frame[ti]
+                new_beam["last"] = ti
+                new_beams = new_beams + [new_beam]
+                ti = ti + 1
+            }
+            bi = bi + 1
+        }
+
+        let mut kept = []
+        let mut ki = 0
+        while ki < beam_width {
+            if ki >= len(new_beams) {
+                ki = beam_width
+            } else {
+                let nnb = len(new_beams)
+                let mut best_idx = 0
+                let mut best_s = new_beams[0]["score"]
+                let mut si = 1
+                while si < nnb {
+                    if new_beams[si]["score"] > best_s {
+                        best_s = new_beams[si]["score"]
+                        best_idx = si
+                    }
+                    si = si + 1
+                }
+                kept = kept + [new_beams[best_idx]]
+                new_beams[best_idx]["score"] = 0.0 - 999999.0
+            }
+            ki = ki + 1
+        }
+        beams = kept
+        fi = fi + 1
+    }
+
+    if len(beams) == 0 { return "" }
+    let mut best_text = beams[0]["text"]
+    let mut best_score = beams[0]["score"]
+    let mut bi = 1
+    while bi < len(beams) {
+        if beams[bi]["score"] > best_score {
+            best_score = beams[bi]["score"]
+            best_text = beams[bi]["text"]
+        }
+        bi = bi + 1
+    }
+    return best_text
+}
+
+// ===================================================================
+//  Griffin-Lim vocoder
+// ===================================================================
+fn griffin_lim(mel, n_iter) {
+    let n_frames = len(mel)
+    if n_frames == 0 { return [] }
+    let n_mels = len(mel[0])
+
+    let hop = 4
+    let waveform_len = n_frames * hop + n_mels
+
+    let mut waveform = []
+    let mut wi = 0
+    while wi < waveform_len {
+        waveform = waveform + [0.0]
+        wi = wi + 1
+    }
+
+    let mut iter = 0
+    while iter < n_iter {
+        let mut fi = 0
+        while fi < n_frames {
+            let frame = mel[fi]
+            let base = fi * hop
+            let mut mi = 0
+            while mi < n_mels {
+                let idx = base + mi
+                if idx < waveform_len {
+                    let mag = _sa_exp(frame[mi] / 2.0)
+                    let phase = _sa_cos((iter * 1.0) * 0.1 + (mi * 1.0) * 0.3)
+                    waveform[idx] = waveform[idx] * 0.5 + mag * phase * 0.5
+                }
+                mi = mi + 1
+            }
+            fi = fi + 1
+        }
+        iter = iter + 1
+    }
+    return waveform
+}
+
+// ===================================================================
+//  Pipeline
+// ===================================================================
+fn create_audio_pipeline(n_fft, n_mels, hop, enc_layers) {
+    let p = #{}
+    p["n_fft"] = n_fft
+    p["n_mels"] = n_mels
+    p["hop"] = hop
+    p["enc_layers"] = enc_layers
+    return p
+}
+
+fn process_audio(pipeline, waveform, vocab) {
+    let mel = mel_spectrogram(waveform, pipeline["n_fft"], pipeline["n_mels"], pipeline["hop"])
+    let encoded = audio_encode(mel, pipeline["enc_layers"])
+    let text = ctc_decode(encoded, vocab)
+    let result = #{}
+    result["mel"] = mel
+    result["encoded"] = encoded
+    result["text"] = text
+    return result
+}
+
+println("[speech_audio] module loaded")
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

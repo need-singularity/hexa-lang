@@ -13,7 +13,900 @@
 //  T6: Combined with gradient accumulation (micro-batches)
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/grad_checkpoint.hexa"
+// -- inlined from self/ml/grad_checkpoint.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/grad_checkpoint.hexa — Layer-level Gradient Checkpointing
+//
+//  Real activation drop + recompute on backward. Unlike
+//  `activation_checkpointing.hexa` (simulation/estimator) this
+//  module ACTUALLY executes layer forwards with real tensors,
+//  drops intermediate activations between segment boundaries, and
+//  re-runs the segment forward during backward to recover them.
+//
+//  Memory model:
+//    Baseline  : keep N activations (one per layer) → peak ≈ N*d
+//    Checkpoint: keep S boundaries + 1 active segment → peak ≈ (S+1)*d
+//      with S = ceil(N/seg_size) → 50% savings at seg_size=2, more at 4/6
+//
+//  Design:
+//    Each "layer" is [W, b, in_dim, out_dim] — dense Y = X @ W + b
+//    Layers grouped into segments of size `seg_size`.
+//    Forward:
+//       keep = [input_activation_of_segment_0,
+//               input_activation_of_segment_1, ...,
+//               final_output]
+//       mid  = discarded (not retained after segment exits)
+//    Backward:
+//       for each segment (reverse): recompute forward from the
+//       saved boundary → materialize mid activations → apply
+//       per-layer backward → forward through upstream segment.
+//
+//  API:
+//    gc_make_layer(W, b, in_dim, out_dim)
+//    gc_make_model(layers, seg_size)
+//    gc_forward(model, input)            → CheckpointedForward
+//    gc_forward_plain(model, input)      → plain forward (no ckpt)
+//    gc_backward(model, fwd, grad_out)   → [grad_input, grads_per_layer]
+//    gc_backward_plain(model, all_acts, grad_out) → same shape
+//    gc_peak_activations(fwd)            → int (sum of stored tensor lens)
+//    gc_peak_activations_plain(all_acts) → int
+//
+//  AI-native attrs:
+//    @hot   — forward / backward called every step
+//    @pure  — memory accounting helpers
+//
+//  Constraints:
+//    - No list mutation across fn boundaries (pbv leak rule).
+//    - Segment boundary saves are shallow references but we treat
+//      each segment as independent so re-computation does not
+//      corrupt the saved boundary (we only read from it).
+//    - Uses builtins: matmul, mat_add, mat_scale, tensor_zeros, len
+// ═══════════════════════════════════════════════════════════════
+
+// ── Structs ──────────────────────────────────────────────────
+
+struct GCLayer {
+    W: array,          // [in_dim * out_dim] flat
+    b: array,          // [out_dim]
+    in_dim: int,
+    out_dim: int
+}
+
+struct GCModel {
+    layers: array,     // [GCLayer]
+    seg_size: int      // checkpoint every N layers
+}
+
+struct GCForward {
+    boundaries: array, // segment-entry activations (input of each seg)
+    final_out: array,  // output tensor
+    in_dim: int,
+    num_layers: int,
+    num_segments: int
+}
+
+// ── Layer construction ──────────────────────────────────────
+
+fn gc_make_layer(W, b, in_dim, out_dim) {
+    return GCLayer { W: W, b: b, in_dim: in_dim, out_dim: out_dim }
+}
+
+fn gc_make_model(layers, seg_size) {
+    let mut s = seg_size
+    if s < 1 { s = 1 }
+    return GCModel { layers: layers, seg_size: s }
+}
+
+// ── Weight initializer: deterministic tiny values for bench ──
+fn gc_init_weights(in_dim, out_dim, seed) {
+    let n = in_dim * out_dim
+    let mut W = []
+    let mut i = 0
+    let mut s = seed
+    while i < n {
+        // Simple LCG-like deterministic init, tiny range
+        s = (s * 1103515245 + 12345) % 2147483647
+        let v = to_float(s % 1000) / 100000.0 - 0.005
+        W = W + [v]
+        i = i + 1
+    }
+    return W
+}
+
+fn gc_init_bias(out_dim) {
+    let mut b = []
+    let mut i = 0
+    while i < out_dim {
+        b = b + [0.0]
+        i = i + 1
+    }
+    return b
+}
+
+fn gc_make_random_model(num_layers, d, seg_size, seed_base) {
+    let mut layers = []
+    let mut i = 0
+    while i < num_layers {
+        let W = gc_init_weights(d, d, seed_base + i * 7919)
+        let b = gc_init_bias(d)
+        layers = layers + [gc_make_layer(W, b, d, d)]
+        i = i + 1
+    }
+    return gc_make_model(layers, seg_size)
+}
+
+fn gc_make_input(d, seed) {
+    let mut x = []
+    let mut i = 0
+    let mut s = seed
+    while i < d {
+        s = (s * 1103515245 + 12345) % 2147483647
+        x = x + [to_float(s % 1000) / 1000.0]
+        i = i + 1
+    }
+    return x
+}
+
+// ── Dense forward: Y = X @ W + b  (X 1×in, W in×out, b out) ──
+// Pure-list matmul to guarantee exact `len() == out_dim` — needed
+// for clean memory accounting. (BLAS matmul returns oversized
+// output buffers which makes gc_peak_activations inconsistent.)
+@hot
+fn gc_apply_layer(layer, x) {
+    let in_dim = layer.in_dim
+    let out_dim = layer.out_dim
+    let mut y = []
+    let mut j = 0
+    while j < out_dim {
+        let mut s = layer.b[j]
+        let mut i = 0
+        while i < in_dim {
+            s = s + x[i] * layer.W[i * out_dim + j]
+            i = i + 1
+        }
+        y = y + [s]
+        j = j + 1
+    }
+    return y
+}
+
+// ── Plain forward (no checkpointing, stores all activations) ──
+// Returns array of activations: [input, after_L0, after_L1, ..., after_L(N-1)]
+@hot
+fn gc_forward_plain(model, input) {
+    let n = len(model.layers)
+    let mut acts = [input]
+    let mut cur = input
+    let mut i = 0
+    while i < n {
+        cur = gc_apply_layer(model.layers[i], cur)
+        acts = acts + [cur]
+        i = i + 1
+    }
+    return acts
+}
+
+// ── Checkpoint-aware forward ────────────────────────────────
+// Only keeps segment-entry activations + final output.
+// Mid-segment tensors are transient (dropped at segment exit).
+@hot
+fn gc_forward(model, input) {
+    let n = len(model.layers)
+    let seg = model.seg_size
+    let mut boundaries = []
+    let mut cur = input
+
+    // Save segment 0 input
+    boundaries = boundaries + [cur]
+
+    let mut i = 0
+    while i < n {
+        // Enter new segment? (boundary save at segment start, except seg 0)
+        if i > 0 {
+            if i % seg == 0 {
+                boundaries = boundaries + [cur]
+            }
+        }
+        cur = gc_apply_layer(model.layers[i], cur)
+        i = i + 1
+    }
+
+    let mut num_segments = n / seg
+    if n % seg != 0 { num_segments = num_segments + 1 }
+
+    let mut in_dim = 0
+    if n > 0 { in_dim = model.layers[0].in_dim }
+
+    return GCForward {
+        boundaries: boundaries,
+        final_out: cur,
+        in_dim: in_dim,
+        num_layers: n,
+        num_segments: len(boundaries)
+    }
+}
+
+// ── Per-layer backward (dense) ──────────────────────────────
+// Given forward Y = X @ W + b, dY → dX, dW, db.
+//   dW = X^T @ dY  (in×out)
+//   dX = dY @ W^T  (1×in)
+//   db = dY        (1×out)
+// Returns [dX, dW, db]
+fn _gc_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn gc_layer_backward(layer, x, dy) {
+    let in_dim = layer.in_dim
+    let out_dim = layer.out_dim
+    // dW[in×out] = X^T @ dY  → element [i,j] = x[i] * dy[j]
+    let mut dW = []
+    let mut i = 0
+    while i < in_dim {
+        let xi = x[i]
+        let mut j = 0
+        while j < out_dim {
+            dW = dW + [xi * dy[j]]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // dX[in] = dy @ W^T  → element i = sum_j dy[j] * W[i*out+j]
+    let mut dX = []
+    i = 0
+    while i < in_dim {
+        let mut s = 0.0
+        let mut j = 0
+        while j < out_dim {
+            s = s + dy[j] * layer.W[i * out_dim + j]
+            j = j + 1
+        }
+        dX = dX + [s]
+        i = i + 1
+    }
+    // db = dy (copy)
+    let mut db = []
+    i = 0
+    while i < out_dim {
+        db = db + [dy[i]]
+        i = i + 1
+    }
+    return [dX, dW, db]
+}
+
+// ── Recompute a single segment forward from a saved boundary ──
+// seg_idx: which segment (0..num_segments-1)
+// Returns array of activations [boundary, after_L_first, ..., after_L_last]
+// of length (segment_layer_count + 1).
+fn gc_recompute_segment(model, fwd, seg_idx) {
+    let seg = model.seg_size
+    let n = len(model.layers)
+    let first = seg_idx * seg
+    let mut last = first + seg
+    if last > n { last = n }
+
+    let boundary = fwd.boundaries[seg_idx]
+    let mut acts = [boundary]
+    let mut cur = boundary
+    let mut i = first
+    while i < last {
+        cur = gc_apply_layer(model.layers[i], cur)
+        acts = acts + [cur]
+        i = i + 1
+    }
+    return acts
+}
+
+// helper for gc_recompute_segment — avoid struct field lookup inside
+fn _gc_num_layers(model) {
+    return len(model.layers)
+}
+
+// ── Backward through checkpointed model ─────────────────────
+// Input: fwd (GCForward), grad_out (1×out_last)
+// Output: [grad_input, grads_per_layer]
+//   grads_per_layer[i] = [dW_i, db_i]
+// Strategy:
+//   for seg_idx in reverse(0..num_segments):
+//     acts = recompute segment forward  (materialize mid acts)
+//     for layer_idx in reverse(first..last):
+//       [dX, dW, db] = gc_layer_backward(layer, x=acts[local], dy=cur_grad)
+//       grads[layer_idx] = [dW, db]
+//       cur_grad = dX
+//     (acts dropped here — no cross-segment leak)
+@hot
+fn gc_backward(model, fwd, grad_out) {
+    let n = fwd.num_layers
+    let seg = model.seg_size
+
+    // Pre-allocate grads list with placeholders
+    let mut grads = []
+    let mut k = 0
+    while k < n {
+        grads = grads + [[[], []]]
+        k = k + 1
+    }
+
+    let mut cur_grad = grad_out
+    let num_segs = fwd.num_segments
+    let mut s_idx = num_segs - 1
+    while s_idx >= 0 {
+        // Recompute forward through this segment
+        let acts = gc_recompute_segment(model, fwd, s_idx)
+        let first = s_idx * seg
+        let mut last = first + seg
+        if last > n { last = n }
+        let seg_len = last - first
+
+        // Walk layers in reverse within segment
+        let mut li = seg_len - 1
+        while li >= 0 {
+            let layer_idx = first + li
+            let layer = model.layers[layer_idx]
+            // acts[li] is the input to layer_idx; acts[li+1] is its output
+            let x = acts[li]
+            let triple = gc_layer_backward(layer, x, cur_grad)
+            let dX = triple[0]
+            let dW = triple[1]
+            let db = triple[2]
+            grads[layer_idx] = [dW, db]
+            cur_grad = dX
+            li = li - 1
+        }
+        s_idx = s_idx - 1
+    }
+
+    return [cur_grad, grads]
+}
+
+// ── Plain backward (no checkpointing, using stored acts) ────
+// acts = gc_forward_plain(model, input)  → [input, after_L0, ...]
+@hot
+fn gc_backward_plain(model, acts, grad_out) {
+    let n = len(model.layers)
+    let mut grads = []
+    let mut k = 0
+    while k < n {
+        grads = grads + [[[], []]]
+        k = k + 1
+    }
+    let mut cur_grad = grad_out
+    let mut i = n - 1
+    while i >= 0 {
+        let layer = model.layers[i]
+        let x = acts[i]              // input to layer i
+        let triple = gc_layer_backward(layer, x, cur_grad)
+        grads[i] = [triple[1], triple[2]]
+        cur_grad = triple[0]
+        i = i - 1
+    }
+    return [cur_grad, grads]
+}
+
+// ── Memory accounting ───────────────────────────────────────
+// "peak activation memory" ≈ sum of stored tensor lengths.
+// For checkpointed: boundaries + final_out (segments' internal
+// tensors are transient and not persisted).
+// For plain: all activations in the array.
+@pure
+fn gc_peak_activations(fwd) {
+    let mut total = 0
+    let n = len(fwd.boundaries)
+    let mut i = 0
+    while i < n {
+        total = total + len(fwd.boundaries[i])
+        i = i + 1
+    }
+    total = total + len(fwd.final_out)
+    return total
+}
+
+@pure
+fn gc_peak_activations_plain(acts) {
+    let mut total = 0
+    let n = len(acts)
+    let mut i = 0
+    while i < n {
+        total = total + len(acts[i])
+        i = i + 1
+    }
+    return total
+}
+
+// ── Savings ratio (1 - ckpt / plain) ────────────────────────
+@pure
+fn gc_savings_ratio(ckpt_peak, plain_peak) {
+    if plain_peak <= 0 { return 0.0 }
+    let diff = plain_peak - ckpt_peak
+    if diff <= 0 { return 0.0 }
+    return to_float(diff) / to_float(plain_peak)
+}
+
+// ── Convenience: counts ─────────────────────────────────────
+@pure
+fn gc_num_segments(num_layers, seg_size) {
+    if seg_size <= 0 { return num_layers }
+    let mut s = num_layers / seg_size
+    if num_layers % seg_size != 0 { s = s + 1 }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  GCTransformerBlock — 7B-shape transformer layer with gradient
+//  checkpointing. Bridges simple dense GCLayer to real transformer
+//  blocks: QKV projection → attention → output proj → FFN → residual.
+//
+//  Shape (7B proxy):
+//    d_model = 4096, n_heads = 32, d_head = 128
+//    FFN: d → 4d → d (SwiGLU-like with gate, but simplified to ReLU)
+//    Attention: simplified single-head matmul (no multi-head split)
+//
+//  Memory per block (activations):
+//    QKV: 3*d  |  attn_scores: d (simplified)  |  attn_out: d
+//    ffn_up: 4d  |  ffn_down: d  |  residual copies: 2*d
+//    Total ~ 12*d per block (vs 1*d for simple dense)
+// ═══════════════════════════════════════════════════════════════
+
+struct GCTransformerBlock {
+    W_q: array,         // [d * d] query projection
+    W_k: array,         // [d * d] key projection
+    W_v: array,         // [d * d] value projection
+    W_out: array,       // [d * d] attention output projection
+    W_up: array,        // [d * 4d] FFN up-projection
+    W_down: array,      // [4d * d] FFN down-projection
+    b_out: array,       // [d]
+    b_up: array,        // [4d]
+    b_down: array,      // [d]
+    ln_gamma: array,    // [d] layer norm scale
+    ln_beta: array,     // [d] layer norm bias
+    d_model: int,
+    d_ffn: int          // = 4 * d_model
+}
+
+struct GCTransformerModel {
+    blocks: array,      // [GCTransformerBlock]
+    seg_size: int
+}
+
+struct GCTransformerForward {
+    boundaries: array,
+    final_out: array,
+    num_blocks: int,
+    num_segments: int
+}
+
+// ── Transformer weight init ─────────────────────────────────
+fn gc_init_transformer_weights(dim_in, dim_out, seed) {
+    // Xavier-like tiny init: scale = 1/sqrt(dim_in)
+    let n = dim_in * dim_out
+    let mut W = []
+    let mut i = 0
+    let mut s = seed
+    let scale = 1.0 / to_float(dim_in)
+    while i < n {
+        s = (s * 1103515245 + 12345) % 2147483647
+        let v = (to_float(s % 2000) / 1000.0 - 1.0) * scale
+        W.push(v)
+        i = i + 1
+    }
+    return W
+}
+
+fn gc_init_ln_params(d) {
+    let mut gamma = []
+    let mut beta = []
+    let mut i = 0
+    while i < d {
+        gamma.push(1.0)
+        beta.push(0.0)
+        i = i + 1
+    }
+    return [gamma, beta]
+}
+
+fn gc_make_transformer_block(d, seed_base) {
+    let d_ffn = d * 4
+    let W_q = gc_init_transformer_weights(d, d, seed_base)
+    let W_k = gc_init_transformer_weights(d, d, seed_base + 1000)
+    let W_v = gc_init_transformer_weights(d, d, seed_base + 2000)
+    let W_out = gc_init_transformer_weights(d, d, seed_base + 3000)
+    let W_up = gc_init_transformer_weights(d, d_ffn, seed_base + 4000)
+    let W_down = gc_init_transformer_weights(d_ffn, d, seed_base + 5000)
+    let b_out = gc_init_bias(d)
+    let b_up = gc_init_bias(d_ffn)
+    let b_down = gc_init_bias(d)
+    let ln = gc_init_ln_params(d)
+    return GCTransformerBlock {
+        W_q: W_q, W_k: W_k, W_v: W_v, W_out: W_out,
+        W_up: W_up, W_down: W_down,
+        b_out: b_out, b_up: b_up, b_down: b_down,
+        ln_gamma: ln[0], ln_beta: ln[1],
+        d_model: d, d_ffn: d_ffn
+    }
+}
+
+fn gc_make_transformer_model(num_blocks, d, seg_size, seed_base) {
+    let mut blocks = []
+    let mut i = 0
+    while i < num_blocks {
+        blocks.push(gc_make_transformer_block(d, seed_base + i * 10000))
+        i = i + 1
+    }
+    let mut s = seg_size
+    if s < 1 { s = 1 }
+    return GCTransformerModel { blocks: blocks, seg_size: s }
+}
+
+// ── Layer norm (simplified: no variance, just affine) ───────
+fn gc_layer_norm(x, gamma, beta, d) {
+    // Mean
+    let mut sum_val = 0.0
+    let mut i = 0
+    while i < d {
+        sum_val = sum_val + x[i]
+        i = i + 1
+    }
+    let mean = sum_val / to_float(d)
+    // Variance
+    let mut var_sum = 0.0
+    i = 0
+    while i < d {
+        let diff = x[i] - mean
+        var_sum = var_sum + diff * diff
+        i = i + 1
+    }
+    let variance = var_sum / to_float(d)
+    let inv_std = 1.0 / (variance + 0.00001)
+    // We approximate sqrt via Newton's method (2 iters)
+    let mut rsqrt = 1.0
+    rsqrt = 0.5 * (rsqrt + inv_std / rsqrt)
+    rsqrt = 0.5 * (rsqrt + inv_std / rsqrt)
+    rsqrt = 0.5 * (rsqrt + inv_std / rsqrt)
+    // Normalize
+    let mut out = []
+    i = 0
+    while i < d {
+        let normed = (x[i] - mean) * rsqrt
+        out.push(gamma[i] * normed + beta[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── Dense matmul: y[j] = sum_i x[i]*W[i*out+j] + b[j] ─────
+fn gc_dense(x, W, b, in_dim, out_dim) {
+    let mut y = []
+    let mut j = 0
+    while j < out_dim {
+        let mut s = b[j]
+        let mut i = 0
+        while i < in_dim {
+            s = s + x[i] * W[i * out_dim + j]
+            i = i + 1
+        }
+        y.push(s)
+        j = j + 1
+    }
+    return y
+}
+
+// ── ReLU activation ─────────────────────────────────────────
+fn gc_relu(x, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if x[i] > 0.0 {
+            out.push(x[i])
+        } else {
+            out.push(0.0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Residual add ────────────────────────────────────────────
+fn gc_residual_add(a, b_vec, d) {
+    let mut out = []
+    let mut i = 0
+    while i < d {
+        out.push(a[i] + b_vec[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── Simplified attention: Q*K^T (dot) → scale → V ──────────
+// Single-head for simplicity. Quadratic in d for attention scores.
+fn gc_simple_attention(q, k, v, d) {
+    // score = dot(q, k) / sqrt(d)
+    let mut score = 0.0
+    let mut i = 0
+    while i < d {
+        score = score + q[i] * k[i]
+        i = i + 1
+    }
+    // Approximate 1/sqrt(d)
+    let scale = 1.0 / to_float(d)
+    let mut inv_sqrt_d = 1.0
+    inv_sqrt_d = 0.5 * (inv_sqrt_d + scale / inv_sqrt_d)
+    inv_sqrt_d = 0.5 * (inv_sqrt_d + scale / inv_sqrt_d)
+    inv_sqrt_d = 0.5 * (inv_sqrt_d + scale / inv_sqrt_d)
+    score = score * inv_sqrt_d
+    // softmax of single score = 1.0, so attn_out = v * sigmoid-ish(score)
+    // Simplified: attn_out = v * tanh_approx(score) + (1-tanh)*q
+    // For correctness testing we just use: out = score * v (linear attention proxy)
+    let mut out = []
+    i = 0
+    while i < d {
+        out.push(score * v[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── Transformer block forward ───────────────────────────────
+// Input x [d] → LayerNorm → QKV → Attention → OutProj → Residual →
+//   LayerNorm → FFN_up → ReLU → FFN_down → Residual → output [d]
+@hot
+fn gc_transformer_forward_block(block, x) {
+    let d = block.d_model
+    let d_ffn = block.d_ffn
+
+    // Pre-norm attention
+    let normed1 = gc_layer_norm(x, block.ln_gamma, block.ln_beta, d)
+    let q = gc_dense(normed1, block.W_q, block.b_out, d, d)  // reuse b_out as zeros
+    let k = gc_dense(normed1, block.W_k, block.b_out, d, d)
+    let v = gc_dense(normed1, block.W_v, block.b_out, d, d)
+    let attn = gc_simple_attention(q, k, v, d)
+    let attn_out = gc_dense(attn, block.W_out, block.b_out, d, d)
+    let res1 = gc_residual_add(x, attn_out, d)
+
+    // Pre-norm FFN
+    let normed2 = gc_layer_norm(res1, block.ln_gamma, block.ln_beta, d)
+    let ffn_up = gc_dense(normed2, block.W_up, block.b_up, d, d_ffn)
+    let ffn_act = gc_relu(ffn_up, d_ffn)
+    let ffn_down = gc_dense(ffn_act, block.W_down, block.b_down, d_ffn, d)
+    let res2 = gc_residual_add(res1, ffn_down, d)
+
+    return res2
+}
+
+// ── Checkpointed transformer forward ────────────────────────
+@hot
+fn gc_transformer_forward(model, input) {
+    let n = len(model.blocks)
+    let seg = model.seg_size
+    let mut boundaries = [input]
+    let mut cur = input
+
+    let mut i = 0
+    while i < n {
+        if i > 0 {
+            if i % seg == 0 {
+                boundaries.push(cur)
+            }
+        }
+        cur = gc_transformer_forward_block(model.blocks[i], cur)
+        i = i + 1
+    }
+
+    let mut num_segments = n / seg
+    if n % seg != 0 { num_segments = num_segments + 1 }
+
+    return GCTransformerForward {
+        boundaries: boundaries,
+        final_out: cur,
+        num_blocks: n,
+        num_segments: len(boundaries)
+    }
+}
+
+// ── Plain transformer forward (stores all activations) ──────
+@hot
+fn gc_transformer_forward_plain(model, input) {
+    let n = len(model.blocks)
+    let mut acts = [input]
+    let mut cur = input
+    let mut i = 0
+    while i < n {
+        cur = gc_transformer_forward_block(model.blocks[i], cur)
+        acts.push(cur)
+        i = i + 1
+    }
+    return acts
+}
+
+// ── Recompute transformer segment ───────────────────────────
+fn gc_transformer_recompute_segment(model, fwd, seg_idx) {
+    let seg = model.seg_size
+    let n = len(model.blocks)
+    let first = seg_idx * seg
+    let mut last = first + seg
+    if last > n { last = n }
+
+    let boundary = fwd.boundaries[seg_idx]
+    let mut acts = [boundary]
+    let mut cur = boundary
+    let mut i = first
+    while i < last {
+        cur = gc_transformer_forward_block(model.blocks[i], cur)
+        acts.push(cur)
+        i = i + 1
+    }
+    return acts
+}
+
+// ── Transformer numerical backward (finite differences) ─────
+// For correctness verification at small d. Uses perturbation eps.
+fn gc_transformer_numerical_grad(model, input, loss_fn_idx, eps) {
+    let d = len(input)
+    let mut grads = []
+    let mut i = 0
+    while i < d {
+        // f(x + eps*e_i)
+        let mut x_plus = []
+        let mut j = 0
+        while j < d {
+            if j == i {
+                x_plus.push(input[j] + eps)
+            } else {
+                x_plus.push(input[j])
+            }
+            j = j + 1
+        }
+        let fwd_plus = gc_transformer_forward(model, x_plus)
+        let out_plus = fwd_plus.final_out[loss_fn_idx]
+
+        // f(x - eps*e_i)
+        let mut x_minus = []
+        j = 0
+        while j < d {
+            if j == i {
+                x_minus.push(input[j] - eps)
+            } else {
+                x_minus.push(input[j])
+            }
+            j = j + 1
+        }
+        let fwd_minus = gc_transformer_forward(model, x_minus)
+        let out_minus = fwd_minus.final_out[loss_fn_idx]
+
+        grads.push((out_plus - out_minus) / (2.0 * eps))
+        i = i + 1
+    }
+    return grads
+}
+
+// ── Transformer backward (analytic, per-block chain rule) ───
+// Uses same approach as gc_backward but with transformer blocks.
+// dL/dx_i = dL/dy * dy/dx via chain of block Jacobians.
+// For real 7B this would use fused kernels; here we use numerical
+// Jacobian-vector product per block for correctness.
+//
+// Efficient approach: backprop through each block via finite diff JVP
+fn gc_transformer_block_backward_jvp(block, x_in, grad_out, eps) {
+    let d = len(x_in)
+    let mut grad_in = []
+    let mut i = 0
+    while i < d {
+        // Perturb input dimension i
+        let mut x_plus = []
+        let mut x_minus = []
+        let mut j = 0
+        while j < d {
+            if j == i {
+                x_plus.push(x_in[j] + eps)
+                x_minus.push(x_in[j] - eps)
+            } else {
+                x_plus.push(x_in[j])
+                x_minus.push(x_in[j])
+            }
+            j = j + 1
+        }
+        let y_plus = gc_transformer_forward_block(block, x_plus)
+        let y_minus = gc_transformer_forward_block(block, x_minus)
+        // J[k,i] = (y_plus[k] - y_minus[k]) / (2*eps)
+        // grad_in[i] = sum_k grad_out[k] * J[k,i]
+        let mut gi = 0.0
+        let mut k = 0
+        while k < d {
+            let jki = (y_plus[k] - y_minus[k]) / (2.0 * eps)
+            gi = gi + grad_out[k] * jki
+            k = k + 1
+        }
+        grad_in.push(gi)
+        i = i + 1
+    }
+    return grad_in
+}
+
+// ── Full transformer backward with checkpointing ────────────
+@hot
+fn gc_transformer_backward(model, fwd, grad_out) {
+    let n = fwd.num_blocks
+    let seg = model.seg_size
+    let eps = 0.0001
+
+    let mut cur_grad = grad_out
+    let num_segs = fwd.num_segments
+    let mut s_idx = num_segs - 1
+    while s_idx >= 0 {
+        let acts = gc_transformer_recompute_segment(model, fwd, s_idx)
+        let first = s_idx * seg
+        let mut last = first + seg
+        if last > n { last = n }
+        let seg_len = last - first
+
+        let mut li = seg_len - 1
+        while li >= 0 {
+            let block_idx = first + li
+            let block = model.blocks[block_idx]
+            let x_in = acts[li]
+            cur_grad = gc_transformer_block_backward_jvp(block, x_in, cur_grad, eps)
+            li = li - 1
+        }
+        s_idx = s_idx - 1
+    }
+
+    return cur_grad
+}
+
+// ── Plain transformer backward ──────────────────────────────
+@hot
+fn gc_transformer_backward_plain(model, acts, grad_out) {
+    let n = len(model.blocks)
+    let eps = 0.0001
+    let mut cur_grad = grad_out
+    let mut i = n - 1
+    while i >= 0 {
+        let block = model.blocks[i]
+        let x_in = acts[i]
+        cur_grad = gc_transformer_block_backward_jvp(block, x_in, cur_grad, eps)
+        i = i - 1
+    }
+    return cur_grad
+}
+
+// ── Transformer peak activation accounting ──────────────────
+@pure
+fn gc_transformer_peak_activations(fwd) {
+    let mut total = 0
+    let n = len(fwd.boundaries)
+    let mut i = 0
+    while i < n {
+        total = total + len(fwd.boundaries[i])
+        i = i + 1
+    }
+    total = total + len(fwd.final_out)
+    return total
+}
+
+@pure
+fn gc_transformer_peak_activations_plain(acts) {
+    let mut total = 0
+    let n = len(acts)
+    let mut i = 0
+    while i < n {
+        total = total + len(acts[i])
+        i = i + 1
+    }
+    return total
+}
+
+println("[grad_checkpoint] loaded — layer-level segment checkpoint (real forward/backward drop/recompute)")
+println("[grad_checkpoint] transformer block support loaded — QKV+attn+FFN+residual+layernorm")
+
+
+// -- end inlined --
 
 let mut PASS = 0
 let mut FAIL = 0

@@ -52,7 +52,787 @@
 //  Run: ./hexa self/test_mamba2_ssd.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/mamba2_ssd.hexa"
+// -- inlined from self/ml/mamba2_ssd.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/mamba2_ssd.hexa — Mamba-2 with Structured State Space Duality
+//
+//  ML roadmap #193 — Mamba-2 SSD
+//
+//  Key insight (Dao & Gu, 2024): selective state spaces can be computed
+//  as a structured masked attention, enabling hardware-efficient chunked
+//  computation. The "duality" is that recurrent SSM and quadratic
+//  attention are two views of the same linear map, related by the
+//  structured mask matrix L.
+//
+//  Three equivalent computation modes:
+//    1. Recurrent  — h' = A_bar * h + B_bar * x; y = C * h  (O(TN))
+//    2. Quadratic  — y = (L . QK^T) V                        (O(T^2 d))
+//    3. Chunked    — intra-chunk quadratic + inter-chunk recurrent
+//                    (best of both: parallelism + linear memory)
+//
+//  Structured mask L[i][j] = prod(A_bar[k], k in j+1..i) for i>=j
+//  encodes the causal decay structure of the diagonal SSM.
+//
+//  Multi-head: dim is split across n_heads; each head runs an
+//  independent SSD with its own A, B, C projections.
+//
+//  Full block: linear -> conv1d -> SSD -> gate -> output + residual
+//
+//  API:
+//    ssd_create_layer(dim, state_dim, n_heads)
+//    ssd_discretize(A_diag, B, delta, state_dim)
+//    ssd_recurrent_step(h, A_bar, B_bar, x, state_dim)
+//    ssd_recurrent_scan(A_bars, B_bars, xs, C, seq_len, state_dim)
+//    ssd_compute_L_matrix(A_bars, seq_len, state_dim)
+//    ssd_quadratic_attention(Q, K, V, L, seq_len, dim)
+//    ssd_chunk_scan(A_bars, B_bars, xs, C, seq_len, chunk_size, state_dim)
+//    ssd_input_dependent_delta(layer, x, dim)
+//    ssd_input_dependent_B(layer, x, dim, state_dim)
+//    ssd_input_dependent_C(layer, x, dim, state_dim)
+//    ssd_forward(layer, x, seq_len, dim)
+//    ssd_multi_head(layer, x, seq_len, dim, n_heads)
+//    ssd_block(layer, x, seq_len, dim)
+//
+//  AI-NATIVE attrs:
+//    @pure     — no hidden state mutation
+//    @hot      — called every forward step
+//    @fuse     — inner loops fused
+//    @parallel — independent head/chunk loops
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn ssd_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn ssd_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn ssd_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn ssd_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ssd_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn ssd_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+// deterministic pseudo-random for weight init
+fn ssd_hash(seed, i, j) {
+    let h = ((seed * 2654435761 + i * 1315423911 + j * 731) % 10007)
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Core math
+// ═══════════════════════════════════════════════════════════════════
+
+fn ssd_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ssd_softplus(x) {
+    if x > 20.0 { return x }
+    if x < -20.0 { return 0.0 }
+    // ln(1 + exp(x))
+    let ex = ssd_exp(x)
+    // ln via series around 1+ex
+    let v = 1.0 + ex
+    // use direct: ln(v) via Newton's approach
+    let mut g = v / 2.0
+    if g < 0.01 { g = 0.01 }
+    for _i in 0..30 {
+        g = (g + v / g) / 2.0
+    }
+    // g = sqrt(v), ln(v) = 2 * ln(sqrt(v))
+    // instead use Taylor on (v-1)/v
+    let d = (v - 1.0) / v
+    let d2 = d * d
+    let d3 = d2 * d
+    let d4 = d3 * d
+    let d5 = d4 * d
+    let d6 = d5 * d
+    let ln_approx = d + d2/2.0 + d3/3.0 + d4/4.0 + d5/5.0 + d6/6.0
+    return ln_approx
+}
+
+fn ssd_sigmoid(x) {
+    return 1.0 / (1.0 + ssd_exp(0.0 - x))
+}
+
+fn ssd_silu(x) {
+    return x * ssd_sigmoid(x)
+}
+
+fn ssd_silu_vec(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n {
+        out = out + [ssd_silu(v[i])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer struct — SSD layer parameters
+// ═══════════════════════════════════════════════════════════════════
+
+struct SSDLayer {
+    dim: int,
+    state_dim: int,
+    n_heads: int,
+    head_dim: int,
+    A_diag: array,
+    W_delta: array,
+    b_delta: array,
+    W_B: array,
+    W_C: array,
+    W_in: array,
+    b_in: array,
+    W_gate: array,
+    b_gate: array,
+    W_out: array,
+    b_out: array,
+    conv_kernel: array
+}
+
+fn ssd_create_layer(dim, state_dim, n_heads) {
+    let head_dim = dim / n_heads
+
+    // A: diagonal HiPPO-style initialization per head
+    let mut A_diag = []
+    for h in 0..n_heads {
+        let mut a_h = []
+        for s in 0..state_dim {
+            a_h = a_h + [0.0 - to_float(s + 1) * 0.5]
+        }
+        A_diag = A_diag + [a_h]
+    }
+
+    // W_delta: [dim] -> scalar per head -> [n_heads, dim]
+    let mut W_delta = ssd_zeros_2d(n_heads, dim)
+    let mut b_delta = ssd_zeros(n_heads)
+    for h in 0..n_heads {
+        for j in 0..dim {
+            W_delta[h][j] = ssd_hash(42, h, j) * 0.1
+        }
+        b_delta[h] = 0.5
+    }
+
+    // W_B: [n_heads, state_dim, dim] -> project x to B
+    let mut W_B = []
+    for h in 0..n_heads {
+        let mut wb_h = ssd_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wb_h[s][j] = ssd_hash(73, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_B = W_B + [wb_h]
+    }
+
+    // W_C: [n_heads, state_dim, dim] -> project x to C
+    let mut W_C = []
+    for h in 0..n_heads {
+        let mut wc_h = ssd_zeros_2d(state_dim, dim)
+        for s in 0..state_dim {
+            for j in 0..dim {
+                wc_h[s][j] = ssd_hash(91, h * state_dim + s, j) * 0.1
+            }
+        }
+        W_C = W_C + [wc_h]
+    }
+
+    // W_in: [dim, dim] input projection
+    let mut W_in = ssd_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_in[i][j] = ssd_hash(111, i, j) * 0.1
+        }
+    }
+    let b_in = ssd_zeros(dim)
+
+    // W_gate: [dim, dim] gate projection
+    let mut W_gate = ssd_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_gate[i][j] = ssd_hash(222, i, j) * 0.1
+        }
+    }
+    let b_gate = ssd_zeros(dim)
+
+    // W_out: [dim, dim] output projection
+    let mut W_out = ssd_zeros_2d(dim, dim)
+    for i in 0..dim {
+        for j in 0..dim {
+            W_out[i][j] = ssd_hash(333, i, j) * 0.1
+        }
+    }
+    let b_out = ssd_zeros(dim)
+
+    // conv1d kernel: [4, dim] causal depthwise
+    let conv_w = 4
+    let mut conv_kernel = []
+    for k in 0..conv_w {
+        let mut row = []
+        for d in 0..dim {
+            row = row + [ssd_hash(99, k, d) * 0.3 + 0.5]
+        }
+        conv_kernel = conv_kernel + [row]
+    }
+
+    return SSDLayer {
+        dim: dim,
+        state_dim: state_dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        A_diag: A_diag,
+        W_delta: W_delta,
+        b_delta: b_delta,
+        W_B: W_B,
+        W_C: W_C,
+        W_in: W_in,
+        b_in: b_in,
+        W_gate: W_gate,
+        b_gate: b_gate,
+        W_out: W_out,
+        b_out: b_out,
+        conv_kernel: conv_kernel
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Discretization: Zero-Order Hold (ZOH) for diagonal A
+//
+//  A_bar[i] = exp(delta * A_diag[i])
+//  B_bar[i] = delta * B[i]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssd_discretize(A_diag, B, delta, state_dim) {
+    let mut A_bar = ssd_zeros(state_dim)
+    let mut B_bar = ssd_zeros(state_dim)
+    for i in 0..state_dim {
+        A_bar[i] = ssd_exp(delta * A_diag[i])
+        B_bar[i] = delta * B[i]
+    }
+    return [A_bar, B_bar]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent step: h' = A_bar * h + B_bar * x  (element-wise diagonal)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure @hot
+fn ssd_recurrent_step(h, A_bar, B_bar, x, state_dim) {
+    let mut h_new = ssd_zeros(state_dim)
+    for i in 0..state_dim {
+        h_new[i] = A_bar[i] * h[i] + B_bar[i] * x
+    }
+    return h_new
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Recurrent scan: full sequence in recurrent mode
+//
+//  For each t in 0..seq_len:
+//    h[t] = A_bar[t] * h[t-1] + B_bar[t] * x[t]
+//    y[t] = C[t] . h[t]
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @fuse
+fn ssd_recurrent_scan(A_bars, B_bars, xs, C, seq_len, state_dim) {
+    let mut h = ssd_zeros(state_dim)
+    let mut ys = ssd_zeros(seq_len)
+    for t in 0..seq_len {
+        // h = A_bar[t] * h + B_bar[t] * x[t]
+        let mut h_new = ssd_zeros(state_dim)
+        for s in 0..state_dim {
+            h_new[s] = A_bars[t][s] * h[s] + B_bars[t][s] * xs[t]
+        }
+        h = h_new
+        // y[t] = C[t] . h
+        let mut dot = 0.0
+        for s in 0..state_dim {
+            dot = dot + C[t][s] * h[s]
+        }
+        ys[t] = dot
+    }
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Structured mask L: the SSD duality core
+//
+//  L[i][j] = product of A_bar[k] for k in (j+1)..i   if i >= j
+//          = 0                                         if i < j  (causal)
+//
+//  For diagonal A, the "product" is per-state-dim; we reduce to a
+//  scalar by summing over state dims (trace-like). This captures
+//  the causal decay: how much information from position j survives
+//  to position i through the SSM recurrence.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssd_compute_L_matrix(A_bars, seq_len, state_dim) {
+    let mut L = ssd_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            if j > i {
+                L[i][j] = 0.0
+            } else {
+                if i == j {
+                    L[i][j] = 1.0
+                } else {
+                    // L[i][j] = mean over state_dim of product A_bar[k][s] for k in j+1..=i
+                    let mut total = 0.0
+                    for s in 0..state_dim {
+                        let mut prod = 1.0
+                        let start = j + 1
+                        for k in start..i {
+                            prod = prod * A_bars[k][s]
+                        }
+                        prod = prod * A_bars[i][s]
+                        total = total + prod
+                    }
+                    L[i][j] = total / to_float(state_dim)
+                }
+            }
+        }
+    }
+    return L
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quadratic (dual) attention: y = (L . QK^T) V
+//
+//  This is the attention-form of the SSM. L is the structured causal
+//  mask encoding SSM decay. Q, K, V are the input-dependent
+//  projections (B -> K, C -> Q in the duality).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @fuse
+fn ssd_quadratic_attention(Q, K, V, L, seq_len, dim) {
+    // QK^T: [seq_len, seq_len]
+    let mut QKt = ssd_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            let mut dot = 0.0
+            for d in 0..dim {
+                dot = dot + Q[i][d] * K[j][d]
+            }
+            QKt[i][j] = dot
+        }
+    }
+
+    // Masked attention: S = L . QK^T  (element-wise)
+    let mut S = ssd_zeros_2d(seq_len, seq_len)
+    for i in 0..seq_len {
+        for j in 0..seq_len {
+            S[i][j] = L[i][j] * QKt[i][j]
+        }
+    }
+
+    // y = S * V: [seq_len, dim]
+    let mut y = ssd_zeros_2d(seq_len, dim)
+    for i in 0..seq_len {
+        for d in 0..dim {
+            let mut acc = 0.0
+            for j in 0..seq_len {
+                acc = acc + S[i][j] * V[j][d]
+            }
+            y[i][d] = acc
+        }
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Chunked scan: the efficient Mamba-2 algorithm
+//
+//  Split sequence into chunks of chunk_size.
+//  Intra-chunk: use quadratic attention (O(C^2 * d))
+//  Inter-chunk: carry recurrent state between chunks (O(C * N))
+//
+//  This gives O(T * C * d + T * N) total instead of O(T^2 * d) or O(T * N * d).
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn ssd_chunk_scan(A_bars, B_bars, xs, C, seq_len, chunk_size, state_dim) {
+    let n_chunks = (seq_len + chunk_size - 1) / chunk_size
+    let mut ys = ssd_zeros(seq_len)
+
+    // inter-chunk recurrent state
+    let mut h_inter = ssd_zeros(state_dim)
+
+    for chunk_idx in 0..n_chunks {
+        let c_start = chunk_idx * chunk_size
+        let mut c_end = c_start + chunk_size
+        if c_end > seq_len { c_end = seq_len }
+        let c_len = c_end - c_start
+
+        // 1. Intra-chunk: recurrent within this chunk (captures local structure)
+        let mut h_local = ssd_zeros(state_dim)
+        let mut intra_ys = ssd_zeros(c_len)
+        for t in 0..c_len {
+            let gt = c_start + t
+            let mut h_new = ssd_zeros(state_dim)
+            for s in 0..state_dim {
+                h_new[s] = A_bars[gt][s] * h_local[s] + B_bars[gt][s] * xs[gt]
+            }
+            h_local = h_new
+            let mut dot = 0.0
+            for s in 0..state_dim {
+                dot = dot + C[gt][s] * h_local[s]
+            }
+            intra_ys[t] = dot
+        }
+
+        // 2. Inter-chunk contribution: propagate h_inter through this chunk
+        // The contribution of previous chunks' state decayed through this chunk
+        let mut inter_ys = ssd_zeros(c_len)
+        let mut h_prop = ssd_zeros(state_dim)
+        for s in 0..state_dim {
+            h_prop[s] = h_inter[s]
+        }
+        for t in 0..c_len {
+            let gt = c_start + t
+            // decay inter-chunk state through current position
+            let mut h_decayed = ssd_zeros(state_dim)
+            for s in 0..state_dim {
+                h_decayed[s] = A_bars[gt][s] * h_prop[s]
+            }
+            h_prop = h_decayed
+            // inter-chunk output: C[t] . h_decayed
+            let mut dot = 0.0
+            for s in 0..state_dim {
+                dot = dot + C[gt][s] * h_prop[s]
+            }
+            inter_ys[t] = dot
+        }
+
+        // 3. Combine intra + inter
+        for t in 0..c_len {
+            ys[c_start + t] = intra_ys[t] + inter_ys[t]
+        }
+
+        // 4. Update inter-chunk state: run full recurrence through chunk
+        for t in 0..c_len {
+            let gt = c_start + t
+            let mut h_new = ssd_zeros(state_dim)
+            for s in 0..state_dim {
+                h_new[s] = A_bars[gt][s] * h_inter[s] + B_bars[gt][s] * xs[gt]
+            }
+            h_inter = h_new
+        }
+    }
+
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Input-dependent projections (selective mechanism)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssd_input_dependent_delta(layer, x, dim) {
+    // x: [dim] -> delta per head: [n_heads]
+    let n_heads = layer.n_heads
+    let mut deltas = ssd_zeros(n_heads)
+    for h in 0..n_heads {
+        let mut dot = 0.0
+        for j in 0..dim {
+            dot = dot + layer.W_delta[h][j] * x[j]
+        }
+        deltas[h] = ssd_softplus(dot + layer.b_delta[h])
+        // clamp delta to reasonable range
+        if deltas[h] < 0.001 { deltas[h] = 0.001 }
+        if deltas[h] > 10.0 { deltas[h] = 10.0 }
+    }
+    return deltas
+}
+
+@pure
+fn ssd_input_dependent_B(layer, x, dim, state_dim) {
+    // x: [dim] -> B per head: [n_heads, state_dim]
+    let n_heads = layer.n_heads
+    let mut Bs = []
+    for h in 0..n_heads {
+        let mut b_h = ssd_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + layer.W_B[h][s][j] * x[j]
+            }
+            b_h[s] = dot
+        }
+        Bs = Bs + [b_h]
+    }
+    return Bs
+}
+
+@pure
+fn ssd_input_dependent_C(layer, x, dim, state_dim) {
+    // x: [dim] -> C per head: [n_heads, state_dim]
+    let n_heads = layer.n_heads
+    let mut Cs = []
+    for h in 0..n_heads {
+        let mut c_h = ssd_zeros(state_dim)
+        for s in 0..state_dim {
+            let mut dot = 0.0
+            for j in 0..dim {
+                dot = dot + layer.W_C[h][s][j] * x[j]
+            }
+            c_h[s] = dot
+        }
+        Cs = Cs + [c_h]
+    }
+    return Cs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SSD forward: single-head, full sequence
+//
+//  1. Compute delta, B, C from each input token (selective)
+//  2. Discretize: A_bar = exp(delta*A), B_bar = delta*B
+//  3. Run recurrent scan
+//  4. Return output sequence
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ssd_forward(layer, x, seq_len, dim) {
+    let state_dim = layer.state_dim
+    let A_diag = layer.A_diag[0]  // head 0
+
+    // Compute per-step params
+    let mut A_bars = []
+    let mut B_bars = []
+    let mut Cs = []
+    let mut xs_scalar = ssd_zeros(seq_len)
+    for t in 0..seq_len {
+        let deltas = ssd_input_dependent_delta(layer, x[t], dim)
+        let delta_t = deltas[0]
+        let Bs_t = ssd_input_dependent_B(layer, x[t], dim, state_dim)
+        let B_t = Bs_t[0]
+        let Cs_t = ssd_input_dependent_C(layer, x[t], dim, state_dim)
+        let C_t = Cs_t[0]
+
+        let disc = ssd_discretize(A_diag, B_t, delta_t, state_dim)
+        A_bars = A_bars + [disc[0]]
+        B_bars = B_bars + [disc[1]]
+        Cs = Cs + [C_t]
+
+        // scalar input: sum of x[t] as a simple reduction
+        let mut s = 0.0
+        for d in 0..dim {
+            s = s + x[t][d]
+        }
+        xs_scalar[t] = s / to_float(dim)
+    }
+
+    let ys = ssd_recurrent_scan(A_bars, B_bars, xs_scalar, Cs, seq_len, state_dim)
+    return ys
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-head SSD: split dim across heads, run independent SSDs
+// ═══════════════════════════════════════════════════════════════════
+
+@hot @parallel
+fn ssd_multi_head(layer, x, seq_len, dim, n_heads) {
+    let head_dim = dim / n_heads
+    let state_dim = layer.state_dim
+
+    // Output: [seq_len, dim]
+    let mut output = ssd_zeros_2d(seq_len, dim)
+
+    for h in 0..n_heads {
+        let A_diag_h = layer.A_diag[h]
+        let h_start = h * head_dim
+
+        // Extract per-head slice and run SSD
+        let mut A_bars_h = []
+        let mut B_bars_h = []
+        let mut Cs_h = []
+        let mut xs_h = ssd_zeros(seq_len)
+
+        for t in 0..seq_len {
+            let deltas = ssd_input_dependent_delta(layer, x[t], dim)
+            let delta_t = deltas[h]
+            let Bs_t = ssd_input_dependent_B(layer, x[t], dim, state_dim)
+            let B_t = Bs_t[h]
+            let Cs_t = ssd_input_dependent_C(layer, x[t], dim, state_dim)
+            let C_t = Cs_t[h]
+
+            let disc = ssd_discretize(A_diag_h, B_t, delta_t, state_dim)
+            A_bars_h = A_bars_h + [disc[0]]
+            B_bars_h = B_bars_h + [disc[1]]
+            Cs_h = Cs_h + [C_t]
+
+            // per-head scalar input: mean of head slice
+            let mut s = 0.0
+            for d in 0..head_dim {
+                s = s + x[t][h_start + d]
+            }
+            xs_h[t] = s / to_float(head_dim)
+        }
+
+        let ys_h = ssd_recurrent_scan(A_bars_h, B_bars_h, xs_h, Cs_h, seq_len, state_dim)
+
+        // Scatter head output back to dim
+        for t in 0..seq_len {
+            for d in 0..head_dim {
+                output[t][h_start + d] = ys_h[t] / to_float(head_dim)
+            }
+        }
+    }
+
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear projection helper
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssd_linear(x, W, bias) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = []
+    for i in 0..out_dim {
+        let mut dot = 0.0
+        for j in 0..in_dim {
+            dot = dot + W[i][j] * x[j]
+        }
+        y = y + [dot + bias[i]]
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Conv1d causal depthwise
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ssd_conv1d(x_seq, kernel, dim) {
+    let seq_len = len(x_seq)
+    let conv_w = len(kernel)
+    let mut out = []
+    for t in 0..seq_len {
+        let mut row = ssd_zeros(dim)
+        for k in 0..conv_w {
+            let idx = t - k
+            if idx >= 0 {
+                for c in 0..dim {
+                    row[c] = row[c] + kernel[k][c] * x_seq[idx][c]
+                }
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Full SSD block: linear -> conv1d -> SSD -> gate -> out + residual
+//
+//  1. x_proj = linear_in(x)
+//  2. z = linear_gate(x)           (gate branch)
+//  3. x_conv = conv1d(x_proj)
+//  4. x_act = silu(x_conv)
+//  5. y = multi_head_ssd(x_act)    (SSD core)
+//  6. g = y * silu(z)              (gating)
+//  7. out = linear_out(g) + x      (residual)
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ssd_block(layer, x, seq_len, dim) {
+    let n_heads = layer.n_heads
+
+    // 1. Input projection
+    let mut x_proj = []
+    for t in 0..seq_len {
+        x_proj = x_proj + [ssd_linear(x[t], layer.W_in, layer.b_in)]
+    }
+
+    // 2. Gate projection
+    let mut z_proj = []
+    for t in 0..seq_len {
+        z_proj = z_proj + [ssd_linear(x[t], layer.W_gate, layer.b_gate)]
+    }
+
+    // 3. Conv1d causal
+    let conv_out = ssd_conv1d(x_proj, layer.conv_kernel, dim)
+
+    // 4. SiLU activation
+    let mut activated = []
+    for t in 0..seq_len {
+        activated = activated + [ssd_silu_vec(conv_out[t])]
+    }
+
+    // 5. Multi-head SSD
+    let y = ssd_multi_head(layer, activated, seq_len, dim, n_heads)
+
+    // 6. Gating: y * silu(z)
+    let mut gated = []
+    for t in 0..seq_len {
+        let z_act = ssd_silu_vec(z_proj[t])
+        let mut g = ssd_zeros(dim)
+        for d in 0..dim {
+            g[d] = y[t][d] * z_act[d]
+        }
+        gated = gated + [g]
+    }
+
+    // 7. Output projection + residual
+    let mut output = []
+    for t in 0..seq_len {
+        let proj = ssd_linear(gated[t], layer.W_out, layer.b_out)
+        let mut out = ssd_zeros(dim)
+        for d in 0..dim {
+            out[d] = x[t][d] + proj[d]
+        }
+        output = output + [out]
+    }
+    return output
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

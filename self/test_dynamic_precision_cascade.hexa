@@ -13,7 +13,639 @@
 //  Run: ./hexa self/test_dynamic_precision_cascade.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/dynamic_precision_cascade.hexa"
+// -- inlined from self/ml/dynamic_precision_cascade.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dynamic_precision_cascade.hexa — Dynamic Precision Cascade
+//
+//  ML roadmap #199 — Layer-wise adaptive quantization.
+//
+//  Sensitive layers stay high precision (FP16/FP32), tolerant layers
+//  drop to INT4. A memory budget is allocated greedily by sensitivity:
+//  the most sensitive layers claim the highest precision tier first,
+//  subsequent layers step down until the budget is exhausted, all
+//  remaining layers fall back to INT4.
+//
+//  Precision levels (int code):
+//      0 = INT4    (0.5 bytes/param)
+//      1 = INT8    (1   byte /param)
+//      2 = FP16    (2   bytes/param)
+//      3 = FP32    (4   bytes/param)
+//
+//  Sensitivity metrics supported (combined via dpc_score_layer):
+//      - magnitude stats:   mean_abs(W)
+//      - variance stats:    var(W)
+//      - hessian proxy:     sum(|W_i * g_i|)     (requires grads)
+//
+//  Quantization ops are written for pure-hexa simulation — no real
+//  low-bit packing; int4/int8 values are stored as plain ints, fp16
+//  is simulated by truncating to 10-bit mantissa. This keeps tests
+//  deterministic while preserving the numerical envelope of the real
+//  implementation.
+//
+//  Public API (prefix dpc_):
+//
+//  Utilities:
+//    dpc_zeros(n)            -> [float]
+//    dpc_abs(x)              -> float
+//    dpc_max(a, b)           -> numeric
+//    dpc_min(a, b)           -> numeric
+//    dpc_sqrt(x)             -> float
+//    dpc_clamp(x, lo, hi)    -> numeric
+//    dpc_round_to_int(x)     -> int
+//
+//  Quantization ops:
+//    dpc_int4_quantize(w, n)              -> QuantTensor
+//    dpc_int4_dequantize(q, n)            -> [float]
+//    dpc_int8_quantize(w, n)              -> QuantTensor
+//    dpc_int8_dequantize(q, n)            -> [float]
+//    dpc_fp16_simulate(w, n)              -> [float]
+//    dpc_fp32_simulate(w, n)              -> [float]
+//    dpc_quantize_layer(layer, prec)      -> QuantizedLayer
+//
+//  Sensitivity ops:
+//    dpc_layer_sensitivity_magnitude(w, n)       -> float
+//    dpc_layer_sensitivity_variance(w, n)        -> float
+//    dpc_layer_sensitivity_hessian_approx(w,g,n) -> float
+//    dpc_score_layer(w, g, n)                    -> float
+//
+//  Budget / assignment:
+//    dpc_bytes_per_param(prec)                         -> float
+//    dpc_assign_precisions(sens, budget, n_layers,
+//                          param_counts)               -> [int]
+//    dpc_memory_cost(precs, param_counts, n_layers)    -> float
+//    dpc_memory_saved(precs_new, precs_base,
+//                     param_counts, n_layers)          -> float
+//
+//  Forward simulation:
+//    dpc_layer_forward_quantized(input, layer, prec)  -> [float]
+//    dpc_reconstruction_error(orig, deq, n)           -> float (MSE)
+//    dpc_cascade_plan(sensitivities, param_counts,
+//                     n_layers, budget)               -> CascadePlan
+//
+//  AI-NATIVE attrs: @pure on math helpers, @hot on quant inner loops.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Result structs ───────────────────────────────────────────────
+
+struct DPCQuantTensor {
+    q: array,
+    scale: float,
+    zero: float,
+    n: int,
+    bits: int
+}
+
+struct DPCQuantizedLayer {
+    n: int,
+    precision: int,
+    weights: array,
+    scale: float,
+    zero: float
+}
+
+struct DPCCascadePlan {
+    n_layers: int,
+    precisions: array,
+    param_counts: array,
+    memory_cost: float,
+    memory_budget: float,
+    sensitivities: array
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utilities
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn dpc_ones(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [1.0]
+        i = i + 1
+    }
+    return v
+}
+
+fn dpc_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dpc_max(a, b) {
+    if a >= b { return a }
+    return b
+}
+
+fn dpc_min(a, b) {
+    if a <= b { return a }
+    return b
+}
+
+fn dpc_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 30 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+fn dpc_clamp(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn dpc_round_to_int(x) {
+    if x >= 0.0 { return to_int(x + 0.5) }
+    return to_int(x - 0.5)
+}
+
+fn dpc_float_floor(x) {
+    let i = to_int(x)
+    let f = to_float(i)
+    if f > x { return f - 1.0 }
+    return f
+}
+
+// Power-of-two scaling used by the fp16 simulator. Exponent is the
+// number of binary doublings; negative exponents halve. 53 fits into
+// an f64 mantissa so this stays exact.
+fn dpc_pow2(exp) {
+    let mut v = 1.0
+    if exp >= 0 {
+        let mut i = 0
+        while i < exp {
+            v = v * 2.0
+            i = i + 1
+        }
+        return v
+    }
+    let m = 0 - exp
+    let mut j = 0
+    while j < m {
+        v = v / 2.0
+        j = j + 1
+    }
+    return v
+}
+
+// Floor-log2 for positive floats. Used to find the fp16 exponent.
+// Result is an int e such that 2^e <= x < 2^(e+1). Returns -1023 for
+// zero to match the fp16 subnormal floor.
+fn dpc_floor_log2(x) {
+    if x <= 0.0 { return -1023 }
+    let mut e = 0
+    let mut v = x
+    while v >= 2.0 {
+        v = v / 2.0
+        e = e + 1
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quantization — INT4 symmetric absmax (-8..7)
+//
+//  scale = amax / 7; q = clamp(round(w / scale), -8, 7).
+//  Returns a DPCQuantTensor so tests can introspect q/scale.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_int4_quantize(w, n) {
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = dpc_abs(w[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    let mut scale = 1.0
+    if max_abs > 0.0 { scale = max_abs / 7.0 }
+    let mut q = []
+    let mut j = 0
+    while j < n {
+        let mut v = dpc_round_to_int(w[j] / scale)
+        if v > 7 { v = 7 }
+        if v < -8 { v = -8 }
+        q = q + [v]
+        j = j + 1
+    }
+    return DPCQuantTensor {
+        q: q,
+        scale: scale,
+        zero: 0.0,
+        n: n,
+        bits: 4
+    }
+}
+
+fn dpc_int4_dequantize(qt, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [to_float(qt.q[i]) * qt.scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quantization — INT8 symmetric absmax (-128..127)
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_int8_quantize(w, n) {
+    let mut max_abs = 0.0
+    let mut i = 0
+    while i < n {
+        let a = dpc_abs(w[i])
+        if a > max_abs { max_abs = a }
+        i = i + 1
+    }
+    let mut scale = 1.0
+    if max_abs > 0.0 { scale = max_abs / 127.0 }
+    let mut q = []
+    let mut j = 0
+    while j < n {
+        let mut v = dpc_round_to_int(w[j] / scale)
+        if v > 127 { v = 127 }
+        if v < -128 { v = -128 }
+        q = q + [v]
+        j = j + 1
+    }
+    return DPCQuantTensor {
+        q: q,
+        scale: scale,
+        zero: 0.0,
+        n: n,
+        bits: 8
+    }
+}
+
+fn dpc_int8_dequantize(qt, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [to_float(qt.q[i]) * qt.scale]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FP16 simulation
+//
+//  fp16 has a 10-bit mantissa. We round each value to its nearest
+//  representable fp16 magnitude by truncating mantissa precision:
+//
+//      exp_e = floor_log2(|x|)
+//      step  = 2^(exp_e - 10)
+//      x_hat = round(x / step) * step
+//
+//  Subnormals (|x| < 2^-14) are flushed to 0 for simplicity. Values
+//  above fp16 max (~65504) clamp to the sign-preserving maximum.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_fp16_round_scalar(x) {
+    if x == 0.0 { return 0.0 }
+    let a = dpc_abs(x)
+    if a < 0.00006103515625 { return 0.0 }
+    if a > 65504.0 {
+        if x < 0.0 { return -65504.0 }
+        return 65504.0
+    }
+    let e = dpc_floor_log2(a)
+    let step = dpc_pow2(e - 10)
+    let q = dpc_round_to_int(x / step)
+    return to_float(q) * step
+}
+
+fn dpc_fp16_simulate(w, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [dpc_fp16_round_scalar(w[i])]
+        i = i + 1
+    }
+    return out
+}
+
+// FP32 is the reference; the simulator simply copies the values so
+// dpc_quantize_layer treats fp32 as a no-op precision tier.
+fn dpc_fp32_simulate(w, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [w[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer-level quantization dispatch
+//
+//  precision codes: 0=INT4, 1=INT8, 2=FP16, 3=FP32
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_quantize_layer(layer, precision) {
+    let n = len(layer)
+    if precision == 0 {
+        let qt = dpc_int4_quantize(layer, n)
+        let deq = dpc_int4_dequantize(qt, n)
+        return DPCQuantizedLayer {
+            n: n,
+            precision: 0,
+            weights: deq,
+            scale: qt.scale,
+            zero: qt.zero
+        }
+    }
+    if precision == 1 {
+        let qt = dpc_int8_quantize(layer, n)
+        let deq = dpc_int8_dequantize(qt, n)
+        return DPCQuantizedLayer {
+            n: n,
+            precision: 1,
+            weights: deq,
+            scale: qt.scale,
+            zero: qt.zero
+        }
+    }
+    if precision == 2 {
+        let deq = dpc_fp16_simulate(layer, n)
+        return DPCQuantizedLayer {
+            n: n,
+            precision: 2,
+            weights: deq,
+            scale: 1.0,
+            zero: 0.0
+        }
+    }
+    // precision == 3 (FP32)
+    let deq = dpc_fp32_simulate(layer, n)
+    return DPCQuantizedLayer {
+        n: n,
+        precision: 3,
+        weights: deq,
+        scale: 1.0,
+        zero: 0.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sensitivity scoring
+//
+//  magnitude: mean(|W|)                     — how big the weights are
+//  variance:  E[(W-mean)^2]                 — how spread out
+//  hessian:   sum(|W * g|)                  — classic OBD-style proxy
+//  combined:  magnitude * (1 + variance)    — positive blend; grads
+//             optional (zero if no grads passed).
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_layer_sensitivity_magnitude(w, n) {
+    if n <= 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + dpc_abs(w[i])
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+fn dpc_layer_sensitivity_variance(w, n) {
+    if n <= 0 { return 0.0 }
+    let mut mean = 0.0
+    let mut i = 0
+    while i < n {
+        mean = mean + w[i]
+        i = i + 1
+    }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    let mut j = 0
+    while j < n {
+        let d = w[j] - mean
+        var = var + d * d
+        j = j + 1
+    }
+    return var / to_float(n)
+}
+
+fn dpc_layer_sensitivity_hessian_approx(w, g, n) {
+    if n <= 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + dpc_abs(w[i] * g[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn dpc_score_layer(w, g, n) {
+    let mag = dpc_layer_sensitivity_magnitude(w, n)
+    let var = dpc_layer_sensitivity_variance(w, n)
+    let mut hess = 0.0
+    if len(g) == n {
+        hess = dpc_layer_sensitivity_hessian_approx(w, g, n)
+    }
+    return mag * (1.0 + var) + 0.01 * hess
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Budget accounting
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_bytes_per_param(precision) {
+    if precision == 0 { return 0.5 }
+    if precision == 1 { return 1.0 }
+    if precision == 2 { return 2.0 }
+    return 4.0
+}
+
+fn dpc_memory_cost(precisions, param_counts, n_layers) {
+    let mut total = 0.0
+    let mut i = 0
+    while i < n_layers {
+        total = total + dpc_bytes_per_param(precisions[i]) * to_float(param_counts[i])
+        i = i + 1
+    }
+    return total
+}
+
+fn dpc_memory_saved(precisions_new, precisions_baseline, param_counts, n_layers) {
+    let base = dpc_memory_cost(precisions_baseline, param_counts, n_layers)
+    let new_cost = dpc_memory_cost(precisions_new, param_counts, n_layers)
+    if base <= 0.0 { return 0.0 }
+    return (base - new_cost) / base
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Assignment policy (greedy by sensitivity)
+//
+//  Start every layer at INT4, then promote layers in descending
+//  sensitivity order: each promotion costs
+//      (bpp[prec+1] - bpp[prec]) * param_counts[layer]
+//  bytes extra. Stop when no further promotion fits the remaining
+//  budget.
+//
+//  `budget` is the *total* memory budget in bytes. If the budget is
+//  smaller than the INT4 floor, we still return all-INT4 (no negative
+//  allocation allowed). If the budget covers FP32 for every layer,
+//  every layer ends at precision 3.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_assign_precisions(sensitivities, budget, n_layers, param_counts) {
+    let mut precs = []
+    let mut i = 0
+    while i < n_layers {
+        precs = precs + [0]
+        i = i + 1
+    }
+    // start with INT4 for every layer
+    let mut used = dpc_memory_cost(precs, param_counts, n_layers)
+    if budget <= used {
+        return precs
+    }
+    // Build a sortable list of (sens, layer_index) via selection pass
+    // (n_layers is tiny so O(n^2) is fine).
+    let mut order = []
+    let mut taken = []
+    let mut t = 0
+    while t < n_layers {
+        taken = taken + [0]
+        t = t + 1
+    }
+    let mut k = 0
+    while k < n_layers {
+        let mut best = -1
+        let mut best_s = -1.0e30
+        let mut j = 0
+        while j < n_layers {
+            if taken[j] == 0 {
+                if sensitivities[j] > best_s {
+                    best_s = sensitivities[j]
+                    best = j
+                }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            order = order + [best]
+            taken[best] = 1
+        }
+        k = k + 1
+    }
+    // Greedy promotion loop: walk precision tiers 1..3, promoting the
+    // currently cheapest most-sensitive layer to the next tier.
+    let target_tier = 3
+    let mut tier = 1
+    while tier <= target_tier {
+        let mut o = 0
+        while o < n_layers {
+            let layer = order[o]
+            let cur = precs[layer]
+            if cur < tier {
+                let delta = (dpc_bytes_per_param(tier) - dpc_bytes_per_param(cur)) * to_float(param_counts[layer])
+                if used + delta <= budget {
+                    precs[layer] = tier
+                    used = used + delta
+                }
+            }
+            o = o + 1
+        }
+        tier = tier + 1
+    }
+    return precs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward simulation
+//
+//  Apply quantize+dequantize to the layer weights, then run an
+//  elementwise multiply with the input. This is not a real matmul —
+//  just enough to validate the output shape and that higher precisions
+//  preserve input scale better.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_layer_forward_quantized(input, layer, precision) {
+    let n = len(input)
+    let ql = dpc_quantize_layer(layer, precision)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [input[i] * ql.weights[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn dpc_reconstruction_error(original, dequantized, n) {
+    if n <= 0 { return 0.0 }
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let d = original[i] - dequantized[i]
+        s = s + d * d
+        i = i + 1
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  High-level cascade planner
+//
+//  Given per-layer sensitivities and param counts + a memory budget,
+//  produce a DPCCascadePlan with the assigned precisions and the
+//  resulting memory footprint. Pure convenience wrapper.
+// ═══════════════════════════════════════════════════════════════════
+
+fn dpc_cascade_plan(sensitivities, param_counts, n_layers, budget) {
+    let precs = dpc_assign_precisions(sensitivities, budget, n_layers, param_counts)
+    let cost = dpc_memory_cost(precs, param_counts, n_layers)
+    return DPCCascadePlan {
+        n_layers: n_layers,
+        precisions: precs,
+        param_counts: param_counts,
+        memory_cost: cost,
+        memory_budget: budget,
+        sensitivities: sensitivities
+    }
+}
+
+// Helper to count how many layers landed in a given precision tier.
+fn dpc_count_precision(precs, n_layers, target) {
+    let mut c = 0
+    let mut i = 0
+    while i < n_layers {
+        if precs[i] == target { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

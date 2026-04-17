@@ -1,5 +1,572 @@
 // test_retrieval_interleaved.hexa — Retrieval-Interleaved Generation tests (60 checks)
-import "ml/retrieval_interleaved.hexa"
+// -- inlined from self/ml/retrieval_interleaved.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/retrieval_interleaved.hexa — Retrieval-Interleaved Generation
+//
+//  SSOT: shared/hexa-lang/ml-next-level.json id=337
+//  Goal: RETRO++ 스타일 — 생성 과정 중 실시간으로 외부 지식을
+//        청크 단위로 검색하여 크로스 어텐션으로 주입한다.
+//
+//  Components:
+//    1. Chunk encoder      — 문서 청크를 임베딩 벡터로 인코딩
+//    2. Retrieval trigger  — 생성 중 언제 검색할지 판별
+//    3. Cross-attention    — 검색 결과를 생성 히든에 주입
+//    4. Interleaved decode — 청크 주기마다 검색-생성 반복
+//    5. Knowledge store    — 청크 인덱스 + 유사도 검색
+//
+//  Representation (flat arrays, parser-friendly):
+//    chunk       = [chunk_id, text_hash, embedding]
+//    query_state = [hidden_vec, position, confidence]
+//    retrieval   = [chunk_id, score]
+//    config      = [chunk_period, top_k, threshold, max_tokens, dim]
+//
+//  API (pure):
+//    rig_vec_zeros(dim)                                -> [float]
+//    rig_vec_add(a, b)                                 -> [float]
+//    rig_vec_scale(v, s)                               -> [float]
+//    rig_dot(a, b)                                     -> float
+//    rig_act(x)                                        -> float
+//    rig_norm(v)                                       -> float
+//    rig_cosine_sim(a, b)                              -> float
+//    rig_encode_chunk(text_hash, dim)                  -> [float] embedding
+//    rig_build_store(chunk_hashes, dim)                -> [chunk]
+//    rig_search(store, query_vec, top_k)               -> [retrieval]
+//    rig_should_retrieve(hidden, position, period, threshold) -> bool
+//    rig_cross_attention(hidden, retrieved_embs, dim)  -> [float]
+//    rig_decode_step(ctx_hash, dim)                    -> [float] next hidden
+//    rig_token_from_hidden(hidden)                     -> int token
+//    rig_interleaved_generate(store, seed_ctx, config) -> [tokens, retrievals_log, stats]
+//    rig_confidence(hidden)                            -> float
+//    rig_merge_contexts(old_hidden, new_hidden, alpha) -> [float]
+//    rig_adaptive_period(base_period, confidence)      -> int
+//
+//  AI-NATIVE attrs:
+//    @pure      — no side effects
+//    @hot       — called every decode step
+//    @parallel  — chunk retrieval independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Vector utilities (rig_ prefix to avoid collision) ────────────
+
+fn rig_vec_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+fn rig_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] + b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+fn rig_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [v[i] * s]
+        i = i + 1
+    }
+    return out
+}
+
+fn rig_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + a[i] * b[i]
+        i = i + 1
+    }
+    return s
+}
+
+// soft-sign activation: x / (1 + |x|)
+fn rig_act(x) {
+    let mut ax = x
+    if ax < 0.0 { ax = 0.0 - ax }
+    return x / (1.0 + ax)
+}
+
+fn rig_norm(v) {
+    let d = rig_dot(v, v)
+    if d < 1.0e-12 { return 0.0 }
+    return sqrt(d)
+}
+
+fn rig_cosine_sim(a, b) {
+    let na = rig_norm(a)
+    let nb = rig_norm(b)
+    if na < 1.0e-12 { return 0.0 }
+    if nb < 1.0e-12 { return 0.0 }
+    return rig_dot(a, b) / (na * nb)
+}
+
+fn rig_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn rig_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn rig_max_f(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// ── 1. Chunk Encoder ─────────────────────────────────────────────
+// Deterministic embedding from a text hash.
+// Uses sin-based pseudo-random projection (same trick as embedding.hexa).
+@pure
+fn rig_encode_chunk(text_hash, dim) {
+    let mut emb = []
+    let mut d = 0
+    while d < dim {
+        let val = sin(to_float(text_hash * 131 + d * 29 + 7))
+        emb = emb + [val * 0.3]
+        d = d + 1
+    }
+    return emb
+}
+
+// Build a knowledge store: array of [chunk_id, text_hash, embedding].
+// chunk_hashes: array of [chunk_id, text_hash]
+@parallel
+fn rig_build_store(chunk_hashes, dim) {
+    let n = len(chunk_hashes)
+    let mut store = []
+    let mut i = 0
+    while i < n {
+        let cid = chunk_hashes[i][0]
+        let th = chunk_hashes[i][1]
+        let emb = rig_encode_chunk(th, dim)
+        store = store + [[cid, th, emb]]
+        i = i + 1
+    }
+    return store
+}
+
+// ── 2. Knowledge Store Search ────────────────────────────────────
+// Search store for top_k chunks most similar to query_vec.
+// Returns: array of [chunk_id, score] sorted descending by cosine similarity.
+@parallel
+fn rig_search(store, query_vec, top_k) {
+    let n = len(store)
+    // Score each chunk
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let cid = store[i][0]
+        let emb = store[i][2]
+        let sim = rig_cosine_sim(query_vec, emb)
+        scored = scored + [[cid, sim]]
+        i = i + 1
+    }
+    // Selection sort top_k (n is small for chunk stores)
+    let mut used = []
+    let mut ui = 0
+    while ui < n {
+        used = used + [false]
+        ui = ui + 1
+    }
+    let take = rig_min_i(top_k, n)
+    let mut result = []
+    let mut r = 0
+    while r < take {
+        let mut best = -1
+        let mut best_v = 0.0 - 1.0e30
+        let mut j = 0
+        while j < n {
+            if !used[j] {
+                if scored[j][1] > best_v {
+                    best_v = scored[j][1]
+                    best = j
+                }
+            }
+            j = j + 1
+        }
+        if best >= 0 {
+            let mut used2 = []
+            let mut k = 0
+            while k < n {
+                if k == best {
+                    used2 = used2 + [true]
+                } else {
+                    used2 = used2 + [used[k]]
+                }
+                k = k + 1
+            }
+            used = used2
+            result = result + [scored[best]]
+        }
+        r = r + 1
+    }
+    return result
+}
+
+// ── 3. Retrieval Trigger ─────────────────────────────────────────
+// Decide whether to retrieve at this position.
+// Triggers when:
+//   (a) position is a multiple of the chunk period, OR
+//   (b) confidence drops below threshold (model uncertainty).
+// confidence is derived from the hidden state norm.
+@pure
+fn rig_confidence(hidden) {
+    let n = rig_norm(hidden)
+    // Map norm to 0..1 confidence via sigmoid-like:
+    //   conf = n / (1 + n)
+    return n / (1.0 + n)
+}
+
+@hot
+fn rig_should_retrieve(hidden, position, period, threshold) {
+    // Periodic trigger
+    if position > 0 {
+        if (position % period) == 0 {
+            return true
+        }
+    }
+    // Confidence-based trigger
+    let conf = rig_confidence(hidden)
+    if conf < threshold {
+        return true
+    }
+    return false
+}
+
+// Adaptive period: when confidence is high, retrieve less often.
+// When confidence is low, retrieve more frequently (min period = 1).
+@pure
+fn rig_adaptive_period(base_period, confidence) {
+    // Scale period by confidence: high confidence => longer period
+    // period = max(1, floor(base_period * confidence * 2))
+    let scaled = to_int(to_float(base_period) * confidence * 2.0)
+    if scaled < 1 { return 1 }
+    return scaled
+}
+
+// ── 4. Cross-Attention ───────────────────────────────────────────
+// Inject retrieved chunk embeddings into the generation hidden state
+// via a simplified cross-attention mechanism.
+//
+// For each retrieved embedding:
+//   score = dot(hidden, retrieved_emb) / sqrt(dim)
+// Softmax over scores, then weighted sum of retrieved embeddings
+// is added to hidden.
+//
+// This is the RETRO cross-attention core: the hidden state attends
+// to external knowledge, fusing retrieval into generation.
+@hot
+fn rig_cross_attention(hidden, retrieved_embs, dim) {
+    let n = len(retrieved_embs)
+    if n == 0 { return hidden }
+
+    let scale = 1.0 / sqrt(to_float(dim))
+
+    // Compute attention scores
+    let mut scores = []
+    let mut max_s = 0.0 - 1.0e30
+    let mut i = 0
+    while i < n {
+        let s = rig_dot(hidden, retrieved_embs[i]) * scale
+        scores = scores + [s]
+        if s > max_s { max_s = s }
+        i = i + 1
+    }
+
+    // Softmax
+    let mut exp_scores = []
+    let mut sum_exp = 0.0
+    let mut j = 0
+    while j < n {
+        let e = exp(scores[j] - max_s)
+        exp_scores = exp_scores + [e]
+        sum_exp = sum_exp + e
+        j = j + 1
+    }
+
+    // Weighted sum of retrieved embeddings
+    let mut context_vec = rig_vec_zeros(dim)
+    let mut k = 0
+    while k < n {
+        let weight = exp_scores[k] / sum_exp
+        let scaled_emb = rig_vec_scale(retrieved_embs[k], weight)
+        context_vec = rig_vec_add(context_vec, scaled_emb)
+        k = k + 1
+    }
+
+    // Fuse: hidden = act(hidden + context_vec)
+    let fused = rig_vec_add(hidden, context_vec)
+    let mut activated = []
+    let mut ai = 0
+    while ai < dim {
+        activated = activated + [rig_act(fused[ai])]
+        ai = ai + 1
+    }
+    return activated
+}
+
+// ── 5. Decode Step ───────────────────────────────────────────────
+// Simulate one autoregressive decode step.
+// Takes a context hash (accumulated state) and produces a new hidden vector.
+// Uses sin-based deterministic projection.
+@hot
+fn rig_decode_step(ctx_hash, dim) {
+    let mut hidden = []
+    let mut d = 0
+    while d < dim {
+        let val = sin(to_float(ctx_hash * 97 + d * 41 + 13))
+        hidden = hidden + [val * 0.2]
+        d = d + 1
+    }
+    return hidden
+}
+
+// Extract a token (int) from a hidden vector.
+// Uses argmax-like: find dimension with highest absolute value,
+// then map to token range 0..15.
+@hot
+fn rig_token_from_hidden(hidden) {
+    let dim = len(hidden)
+    let mut best_d = 0
+    let mut best_v = 0.0 - 1.0e30
+    let mut i = 0
+    while i < dim {
+        let v = rig_abs(hidden[i])
+        if v > best_v {
+            best_v = v
+            best_d = i
+        }
+        i = i + 1
+    }
+    // Map to 0..15 token range
+    let raw = best_d % 16
+    return raw
+}
+
+// Context hash mixer: accumulate tokens into a running hash.
+fn rig_ctx_hash(prev_hash, token) {
+    let mask = 2147483647
+    let a = ((prev_hash + 1) * 2654435761) % mask
+    let b = ((token + 3) * 1315423) % mask
+    let v = (a + b) % mask
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// ── 6. Context Merge ─────────────────────────────────────────────
+// Interpolate between old and new hidden states.
+// alpha in [0,1]: 0 = keep old, 1 = fully new.
+@pure
+fn rig_merge_contexts(old_hidden, new_hidden, alpha) {
+    let dim = len(old_hidden)
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        let v = old_hidden[i] * (1.0 - alpha) + new_hidden[i] * alpha
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+// ── 7. Interleaved Generate (RETRO++ pipeline) ──────────────────
+// The core loop: generate tokens one at a time, periodically retrieving
+// from the knowledge store and injecting via cross-attention.
+//
+// store:    knowledge store from rig_build_store
+// seed_ctx: initial context hash (int)
+// config:   [chunk_period, top_k, conf_threshold, max_tokens, dim]
+//
+// Returns: [tokens, retrievals_log, stats]
+//   tokens:         array of generated token ints
+//   retrievals_log: array of [position, [retrieval]] — when retrieval fired
+//   stats:          [total_tokens, total_retrievals, avg_confidence]
+@pure
+fn rig_interleaved_generate(store, seed_ctx, config) {
+    let period = config[0]
+    let top_k = config[1]
+    let threshold = config[2]
+    let max_tokens = config[3]
+    let dim = config[4]
+
+    let mut ctx_hash = seed_ctx
+    let mut hidden = rig_decode_step(ctx_hash, dim)
+    let mut tokens = []
+    let mut retrievals_log = []
+    let mut total_retrievals = 0
+    let mut conf_sum = 0.0
+    let mut pos = 0
+
+    while pos < max_tokens {
+        // Check retrieval trigger
+        let do_retrieve = rig_should_retrieve(hidden, pos, period, threshold)
+
+        if do_retrieve {
+            // Use current hidden as query vector to search knowledge store
+            let results = rig_search(store, hidden, top_k)
+
+            // Only log and apply cross-attention when retrieval finds chunks
+            let nr = len(results)
+            if nr > 0 {
+                total_retrievals = total_retrievals + 1
+                retrievals_log = retrievals_log + [[pos, results]]
+
+                // Gather retrieved embeddings for cross-attention
+                let mut ret_embs = []
+                let mut ri = 0
+                while ri < nr {
+                    let cid = results[ri][0]
+                    // Look up embedding from store
+                    let mut si = 0
+                    while si < len(store) {
+                        if store[si][0] == cid {
+                            ret_embs = ret_embs + [store[si][2]]
+                        }
+                        si = si + 1
+                    }
+                    ri = ri + 1
+                }
+
+                // Cross-attention: inject retrieved knowledge into hidden
+                hidden = rig_cross_attention(hidden, ret_embs, dim)
+            }
+        }
+
+        // Track confidence
+        let conf = rig_confidence(hidden)
+        conf_sum = conf_sum + conf
+
+        // Extract token from hidden
+        let tok = rig_token_from_hidden(hidden)
+        tokens = tokens + [tok]
+
+        // Advance context
+        ctx_hash = rig_ctx_hash(ctx_hash, tok)
+        let new_hidden = rig_decode_step(ctx_hash, dim)
+        // Merge old and new hidden (residual connection style)
+        hidden = rig_merge_contexts(hidden, new_hidden, 0.7)
+
+        pos = pos + 1
+    }
+
+    let avg_conf = if max_tokens > 0 {
+        conf_sum / to_float(max_tokens)
+    } else {
+        0.0
+    }
+    let stats = [max_tokens, total_retrievals, avg_conf]
+    return [tokens, retrievals_log, stats]
+}
+
+// ── 8. Batch Interleaved Generate ────────────────────────────────
+// Run interleaved generation for multiple seed contexts.
+// Returns: array of [tokens, retrievals_log, stats] per seed.
+@parallel
+fn rig_batch_generate(store, seed_contexts, config) {
+    let n = len(seed_contexts)
+    let mut results = []
+    let mut i = 0
+    while i < n {
+        let r = rig_interleaved_generate(store, seed_contexts[i], config)
+        results = results + [r]
+        i = i + 1
+    }
+    return results
+}
+
+// ── 9. Retrieval Quality Metrics ─────────────────────────────────
+// Compute average retrieval score from a retrievals log.
+@pure
+fn rig_avg_retrieval_score(retrievals_log) {
+    let n = len(retrievals_log)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut count = 0
+    let mut i = 0
+    while i < n {
+        let results = retrievals_log[i][1]
+        let nr = len(results)
+        let mut j = 0
+        while j < nr {
+            total = total + results[j][1]
+            count = count + 1
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if count == 0 { return 0.0 }
+    return total / to_float(count)
+}
+
+// Count total unique chunks retrieved across all retrieval events.
+@pure
+fn rig_unique_chunks_retrieved(retrievals_log) {
+    let mut seen = []
+    let n = len(retrievals_log)
+    let mut i = 0
+    while i < n {
+        let results = retrievals_log[i][1]
+        let nr = len(results)
+        let mut j = 0
+        while j < nr {
+            let cid = results[j][0]
+            let mut found = false
+            let mut k = 0
+            while k < len(seen) {
+                if seen[k] == cid { found = true }
+                k = k + 1
+            }
+            if !found {
+                seen = seen + [cid]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return len(seen)
+}
+
+// Max retrieval score across all events.
+@pure
+fn rig_max_retrieval_score(retrievals_log) {
+    let n = len(retrievals_log)
+    if n == 0 { return 0.0 }
+    let mut best = 0.0 - 1.0e30
+    let mut i = 0
+    while i < n {
+        let results = retrievals_log[i][1]
+        let nr = len(results)
+        let mut j = 0
+        while j < nr {
+            if results[j][1] > best {
+                best = results[j][1]
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if best < (0.0 - 1.0e29) { return 0.0 }
+    return best
+}
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

@@ -25,7 +25,757 @@
 //  Run: ./hexa self/test_rag_pipeline.hexa
 // ===================================================================
 
-import "ml/rag_pipeline.hexa"
+// -- inlined from self/ml/rag_pipeline.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/rag_pipeline.hexa — RAG Pipeline (pure Hexa, SSOT id=58)
+//
+//  Full RAG (Retrieval-Augmented Generation) pipeline built on top of
+//  self/ml/embedding.hexa + self/ml/vector_store.hexa + self/ml/semantic_cache.hexa
+//  patterns. Self-contained to avoid circular imports — vector math and
+//  LRU cache are inlined.
+//
+//  Public API:
+//    create_pipeline(dim, cache_capacity, cache_threshold) → Pipeline
+//    rag_add_chunk(pipe, id, text, meta)                   → Pipeline
+//    rag_add_document(pipe, id, text, meta, chunk_size)    → Pipeline
+//    rag_update_chunk(pipe, id, text, meta)                → Pipeline
+//    rag_delete_chunk(pipe, id)                            → Pipeline
+//    rag_size(pipe)                                        → int
+//    rag_get_chunk(pipe, id)                               → [text, meta] or []
+//    rag_retrieve(pipe, query, top_k)                      → [[id, score, text, meta]]
+//    rag_build_prompt(query, chunks, template)             → string
+//    rag_query(pipe, query, top_k, template)               → RAGResult
+//    rag_query_with_hook(pipe, query, top_k, template, gen) → RAGResult
+//    rag_stats(pipe)                                       → [hits, misses, hit_rate, size, retrievals]
+//    rag_clear_cache(pipe)                                 → Pipeline
+//    rag_reset_stats(pipe)                                 → Pipeline
+//
+//  Chunk store: parallel arrays (ids, texts, metas, vectors)
+//  Query embedder: simple byte-level mean-pool hash (no model dependency)
+//  Top-k retrieval: cosine similarity, selection sort (small top_k)
+//  LRU cache: (query_embedding, response) entries, hit stats
+//  Context injection: 3 prompt templates (default / concise / detailed)
+// ===================================================================
+
+// ===================================================================
+//  Vector math (inlined — avoids circular imports with embedding.hexa)
+// ===================================================================
+fn rp_dot(a, b) {
+    let n = len(a)
+    let mut sum = 0.0
+    let mut i = 0
+    while i < n {
+        sum = sum + a[i] * b[i]
+        i = i + 1
+    }
+    return sum
+}
+
+fn rp_norm(v) {
+    let mut sum = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        sum = sum + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(sum)
+}
+
+fn rp_cosine(a, b) {
+    let d = rp_dot(a, b)
+    let na = rp_norm(a)
+    let nb = rp_norm(b)
+    let denom = na * nb
+    if denom < 0.000001 { return 0.0 }
+    return d / denom
+}
+
+fn rp_zeros(dim) {
+    let mut out = []
+    let mut i = 0
+    while i < dim {
+        out = out + [0.0]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  Built-in byte-level embedder
+//
+//  Deterministic mean-pooled embedding using a rolling hash over
+//  the character codes. Produces a dim-length float array with
+//  values in roughly [-1, 1]. Fast, self-contained, order-sensitive
+//  enough that different queries yield different vectors.
+// ===================================================================
+fn rp_embed(text, dim) {
+    let n = len(text)
+    if n == 0 { return rp_zeros(dim) }
+    if dim <= 0 { return [] }
+
+    let mut vec = rp_zeros(dim)
+    let mut i = 0
+    while i < n {
+        let ch = char_code(text, i)
+        // Spread influence of this character across multiple dims
+        // using a linear-congruential mix keyed on (i, ch).
+        let seed = i * 131 + ch * 7 + 13
+        let mut k = 0
+        while k < 4 {
+            let d = (seed + k * 997) % dim
+            if d >= 0 {
+                let mixed = sin(to_float(seed + k * 31 + d * 17))
+                vec[d] = vec[d] + mixed
+            }
+            k = k + 1
+        }
+        i = i + 1
+    }
+
+    // Mean pool
+    let inv = 1.0 / to_float(n)
+    let mut j = 0
+    while j < dim {
+        vec[j] = vec[j] * inv
+        j = j + 1
+    }
+    return vec
+}
+
+// ===================================================================
+//  Chunk store (parallel arrays) + LRU cache + stats
+// ===================================================================
+struct RAGPipeline {
+    dim: int,
+    // Chunk store (parallel arrays)
+    ids: array,
+    texts: array,
+    metas: array,
+    vectors: array,
+    // LRU semantic cache
+    cache_capacity: int,
+    cache_threshold: float,
+    cache_queries: array,
+    cache_responses: array,
+    cache_order: array,
+    cache_tick: int,
+    // Hit statistics
+    hits: int,
+    misses: int,
+    retrievals: int
+}
+
+fn create_pipeline(dim, cache_capacity, cache_threshold) {
+    return RAGPipeline {
+        dim: dim,
+        ids: [],
+        texts: [],
+        metas: [],
+        vectors: [],
+        cache_capacity: cache_capacity,
+        cache_threshold: cache_threshold,
+        cache_queries: [],
+        cache_responses: [],
+        cache_order: [],
+        cache_tick: 0,
+        hits: 0,
+        misses: 0,
+        retrievals: 0
+    }
+}
+
+// ===================================================================
+//  rag_size: number of stored chunks
+// ===================================================================
+fn rag_size(pipe) {
+    return len(pipe.ids)
+}
+
+// ===================================================================
+//  rag_find_idx: internal linear search by id (O(n))
+//  Returns index or -1 if not found.
+// ===================================================================
+fn rag_find_idx(pipe, id) {
+    let n = len(pipe.ids)
+    let mut i = 0
+    while i < n {
+        if pipe.ids[i] == id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ===================================================================
+//  rag_add_chunk: append a new chunk (re-embeds text)
+//  No-op if id already exists — use rag_update_chunk to overwrite.
+// ===================================================================
+fn rag_add_chunk(pipe, id, text, meta) {
+    let existing = rag_find_idx(pipe, id)
+    if existing >= 0 { return pipe }
+
+    let vec = rp_embed(text, pipe.dim)
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids + [id],
+        texts: pipe.texts + [text],
+        metas: pipe.metas + [meta],
+        vectors: pipe.vectors + [vec],
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: pipe.retrievals
+    }
+}
+
+// ===================================================================
+//  rag_add_document: split text into chunks of size chunk_size
+//  and add each as its own entry. Chunk ids use id + "#<n>".
+// ===================================================================
+fn rag_add_document(pipe, id, text, meta, chunk_size) {
+    let n = len(text)
+    if n == 0 { return pipe }
+    if chunk_size <= 0 { return rag_add_chunk(pipe, id, text, meta) }
+
+    let mut cur = pipe
+    let mut start = 0
+    let mut idx = 0
+    while start < n {
+        let mut endpos = start + chunk_size
+        if endpos > n { endpos = n }
+        let piece = text.substring(start, endpos)
+        let chunk_id = id + "#" + to_string(idx)
+        cur = rag_add_chunk(cur, chunk_id, piece, meta)
+        start = endpos
+        idx = idx + 1
+    }
+    return cur
+}
+
+// ===================================================================
+//  rag_update_chunk: overwrite text/meta of an existing chunk
+//  (re-embeds the new text). No-op if id not found.
+// ===================================================================
+fn rag_update_chunk(pipe, id, text, meta) {
+    let target = rag_find_idx(pipe, id)
+    if target < 0 { return pipe }
+
+    let n = len(pipe.ids)
+    let new_vec = rp_embed(text, pipe.dim)
+    let mut new_texts = []
+    let mut new_metas = []
+    let mut new_vectors = []
+    let mut i = 0
+    while i < n {
+        if i == target {
+            new_texts = new_texts + [text]
+            new_metas = new_metas + [meta]
+            new_vectors = new_vectors + [new_vec]
+        } else {
+            new_texts = new_texts + [pipe.texts[i]]
+            new_metas = new_metas + [pipe.metas[i]]
+            new_vectors = new_vectors + [pipe.vectors[i]]
+        }
+        i = i + 1
+    }
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: new_texts,
+        metas: new_metas,
+        vectors: new_vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: pipe.retrievals
+    }
+}
+
+// ===================================================================
+//  rag_delete_chunk: remove a chunk by id (preserves order)
+// ===================================================================
+fn rag_delete_chunk(pipe, id) {
+    let target = rag_find_idx(pipe, id)
+    if target < 0 { return pipe }
+
+    let n = len(pipe.ids)
+    let mut new_ids = []
+    let mut new_texts = []
+    let mut new_metas = []
+    let mut new_vectors = []
+    let mut i = 0
+    while i < n {
+        if i != target {
+            new_ids = new_ids + [pipe.ids[i]]
+            new_texts = new_texts + [pipe.texts[i]]
+            new_metas = new_metas + [pipe.metas[i]]
+            new_vectors = new_vectors + [pipe.vectors[i]]
+        }
+        i = i + 1
+    }
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: new_ids,
+        texts: new_texts,
+        metas: new_metas,
+        vectors: new_vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: pipe.retrievals
+    }
+}
+
+// ===================================================================
+//  rag_get_chunk: return [text, meta] or [] if not found
+// ===================================================================
+fn rag_get_chunk(pipe, id) {
+    let idx = rag_find_idx(pipe, id)
+    if idx < 0 { return [] }
+    return [pipe.texts[idx], pipe.metas[idx]]
+}
+
+// ===================================================================
+//  rag_retrieve: top-k cosine retrieval, returns sorted results
+//  Each result: [id, score, text, meta]. Increments retrieval counter.
+// ===================================================================
+fn rag_retrieve(pipe, query, top_k) {
+    let n = len(pipe.ids)
+    let new_retrievals = pipe.retrievals + 1
+    let new_pipe = RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: pipe.texts,
+        metas: pipe.metas,
+        vectors: pipe.vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: new_retrievals
+    }
+    if n == 0 { return [[], new_pipe] }
+
+    let qvec = rp_embed(query, pipe.dim)
+
+    // Compute all similarities
+    let mut scores = []
+    let mut i = 0
+    while i < n {
+        let sim = rp_cosine(qvec, pipe.vectors[i])
+        scores = scores + [[pipe.ids[i], sim, pipe.texts[i], pipe.metas[i]]]
+        i = i + 1
+    }
+
+    // Selection sort top_k
+    let mut results = []
+    let mut selected = 0
+    let mut limit = top_k
+    if limit > n { limit = n }
+    while selected < limit {
+        let mut best_idx = -1
+        let mut best_score = -2.0
+        let mut j = 0
+        while j < n {
+            let mut already = false
+            let mut s = 0
+            while s < len(results) {
+                if results[s][0] == scores[j][0] { already = true }
+                s = s + 1
+            }
+            if already == false {
+                if scores[j][1] > best_score {
+                    best_score = scores[j][1]
+                    best_idx = j
+                }
+            }
+            j = j + 1
+        }
+        if best_idx >= 0 {
+            results = results + [scores[best_idx]]
+        }
+        selected = selected + 1
+    }
+    return [results, new_pipe]
+}
+
+// ===================================================================
+//  rag_build_prompt: inject retrieved chunks into a prompt template
+//
+//  chunks: array of [id, score, text, meta]
+//  templates: "default", "concise", "detailed"
+// ===================================================================
+fn rag_build_prompt(query, chunks, template) {
+    let n = len(chunks)
+    let mut context = ""
+    let mut i = 0
+    while i < n {
+        let c = chunks[i]
+        if i > 0 { context = context + "\n" }
+        context = context + "[" + to_string(i + 1) + "] " + c[2]
+        i = i + 1
+    }
+
+    if template == "concise" {
+        let mut p = "Given:\n"
+        p = p + context
+        p = p + "\nBriefly answer: " + query
+        return p
+    }
+    if template == "detailed" {
+        let mut p = "You are a helpful assistant. Use the context below to answer.\n\n"
+        p = p + "Context:\n" + context
+        p = p + "\n\nQuestion: " + query
+        p = p + "\n\nProvide a detailed, grounded answer:"
+        return p
+    }
+    // default
+    let mut p = "Context:\n"
+    p = p + context
+    p = p + "\n\nQuestion: " + query
+    p = p + "\n\nAnswer:"
+    return p
+}
+
+// ===================================================================
+//  RAGResult: #{answer, prompt, chunks, cache_hit, similarity, pipe}
+//  Returned as an array [answer, prompt, chunks, cache_hit, sim, pipe]
+//  to avoid depending on anonymous struct literal support.
+// ===================================================================
+
+// ===================================================================
+//  rag_cache_lookup: internal — check LRU cache for query
+//  Returns [hit_bool, response, similarity, updated_pipe].
+// ===================================================================
+fn rag_cache_lookup(pipe, qvec) {
+    let n = len(pipe.cache_queries)
+    if n == 0 {
+        let updated = RAGPipeline {
+            dim: pipe.dim,
+            ids: pipe.ids,
+            texts: pipe.texts,
+            metas: pipe.metas,
+            vectors: pipe.vectors,
+            cache_capacity: pipe.cache_capacity,
+            cache_threshold: pipe.cache_threshold,
+            cache_queries: pipe.cache_queries,
+            cache_responses: pipe.cache_responses,
+            cache_order: pipe.cache_order,
+            cache_tick: pipe.cache_tick,
+            hits: pipe.hits,
+            misses: pipe.misses + 1,
+            retrievals: pipe.retrievals
+        }
+        return [false, "", 0.0, updated]
+    }
+
+    // Find best match
+    let mut best_idx = -1
+    let mut best_sim = -1.0
+    let mut i = 0
+    while i < n {
+        let sim = rp_cosine(qvec, pipe.cache_queries[i])
+        if sim > best_sim {
+            best_sim = sim
+            best_idx = i
+        }
+        i = i + 1
+    }
+
+    if best_sim >= pipe.cache_threshold {
+        // Hit — bump access order
+        let new_tick = pipe.cache_tick + 1
+        let mut new_order = []
+        i = 0
+        while i < n {
+            if i == best_idx {
+                new_order = new_order + [new_tick]
+            } else {
+                new_order = new_order + [pipe.cache_order[i]]
+            }
+            i = i + 1
+        }
+        let updated = RAGPipeline {
+            dim: pipe.dim,
+            ids: pipe.ids,
+            texts: pipe.texts,
+            metas: pipe.metas,
+            vectors: pipe.vectors,
+            cache_capacity: pipe.cache_capacity,
+            cache_threshold: pipe.cache_threshold,
+            cache_queries: pipe.cache_queries,
+            cache_responses: pipe.cache_responses,
+            cache_order: new_order,
+            cache_tick: new_tick,
+            hits: pipe.hits + 1,
+            misses: pipe.misses,
+            retrievals: pipe.retrievals
+        }
+        return [true, pipe.cache_responses[best_idx], best_sim, updated]
+    }
+
+    // Miss
+    let updated = RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: pipe.texts,
+        metas: pipe.metas,
+        vectors: pipe.vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: pipe.hits,
+        misses: pipe.misses + 1,
+        retrievals: pipe.retrievals
+    }
+    return [false, "", best_sim, updated]
+}
+
+// ===================================================================
+//  rag_cache_store: insert a (qvec, response) entry, evict LRU if full
+// ===================================================================
+fn rag_cache_store(pipe, qvec, response) {
+    let n = len(pipe.cache_queries)
+    let new_tick = pipe.cache_tick + 1
+
+    if n < pipe.cache_capacity {
+        return RAGPipeline {
+            dim: pipe.dim,
+            ids: pipe.ids,
+            texts: pipe.texts,
+            metas: pipe.metas,
+            vectors: pipe.vectors,
+            cache_capacity: pipe.cache_capacity,
+            cache_threshold: pipe.cache_threshold,
+            cache_queries: pipe.cache_queries + [qvec],
+            cache_responses: pipe.cache_responses + [response],
+            cache_order: pipe.cache_order + [new_tick],
+            cache_tick: new_tick,
+            hits: pipe.hits,
+            misses: pipe.misses,
+            retrievals: pipe.retrievals
+        }
+    }
+
+    // Evict LRU
+    let mut lru_idx = 0
+    let mut lru_tick = pipe.cache_order[0]
+    let mut i = 1
+    while i < n {
+        if pipe.cache_order[i] < lru_tick {
+            lru_tick = pipe.cache_order[i]
+            lru_idx = i
+        }
+        i = i + 1
+    }
+
+    let mut new_q = []
+    let mut new_r = []
+    let mut new_o = []
+    i = 0
+    while i < n {
+        if i != lru_idx {
+            new_q = new_q + [pipe.cache_queries[i]]
+            new_r = new_r + [pipe.cache_responses[i]]
+            new_o = new_o + [pipe.cache_order[i]]
+        }
+        i = i + 1
+    }
+
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: pipe.texts,
+        metas: pipe.metas,
+        vectors: pipe.vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: new_q + [qvec],
+        cache_responses: new_r + [response],
+        cache_order: new_o + [new_tick],
+        cache_tick: new_tick,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: pipe.retrievals
+    }
+}
+
+// ===================================================================
+//  rag_query: full RAG call — cache lookup → retrieve → build prompt
+//  Returns [answer, prompt, chunks, cache_hit, similarity, updated_pipe]
+//  When there is no cache hit, answer is "" and callers can run their
+//  own generate on the returned prompt, then rag_remember() to store.
+// ===================================================================
+fn rag_query(pipe, query, top_k, template) {
+    let qvec = rp_embed(query, pipe.dim)
+    let lookup = rag_cache_lookup(pipe, qvec)
+    let hit = lookup[0]
+    let cached_answer = lookup[1]
+    let sim = lookup[2]
+    let after_lookup = lookup[3]
+
+    if hit {
+        // Still do retrieval so caller sees which chunks matched
+        let r = rag_retrieve(after_lookup, query, top_k)
+        let chunks = r[0]
+        let final_pipe = r[1]
+        let prompt = rag_build_prompt(query, chunks, template)
+        return [cached_answer, prompt, chunks, true, sim, final_pipe]
+    }
+
+    let r = rag_retrieve(after_lookup, query, top_k)
+    let chunks = r[0]
+    let retrieved_pipe = r[1]
+    let prompt = rag_build_prompt(query, chunks, template)
+    return ["", prompt, chunks, false, sim, retrieved_pipe]
+}
+
+// ===================================================================
+//  rag_remember: store a generated answer back into the LRU cache
+// ===================================================================
+fn rag_remember(pipe, query, response) {
+    let qvec = rp_embed(query, pipe.dim)
+    return rag_cache_store(pipe, qvec, response)
+}
+
+// ===================================================================
+//  rag_query_with_hook: full pipeline with a user-supplied generator
+//  hook function (generator is passed prompt string → returns answer).
+//  On cache miss, calls the hook, stores result, then returns it.
+//
+//  Pass a simple echo generator for tests. Real usage would wire
+//  generate.hexa / transformer_forward() here.
+//
+//  NOTE: hexa function value calls are not uniformly supported across
+//  the codegen tiers. This helper instead delegates to three bundled
+//  generator tags (strings) to stay self-contained & portable:
+//    "echo"      → returns the prompt unchanged
+//    "first_ctx" → returns the top-1 retrieved chunk text, or ""
+//    "concat"    → concatenates all retrieved chunks
+// ===================================================================
+fn rag_run_generator(tag, prompt, chunks) {
+    if tag == "echo" { return prompt }
+    if tag == "first_ctx" {
+        if len(chunks) == 0 { return "" }
+        return chunks[0][2]
+    }
+    if tag == "concat" {
+        let n = len(chunks)
+        let mut out = ""
+        let mut i = 0
+        while i < n {
+            if i > 0 { out = out + " | " }
+            out = out + chunks[i][2]
+            i = i + 1
+        }
+        return out
+    }
+    return prompt
+}
+
+fn rag_query_with_hook(pipe, query, top_k, template, gen_tag) {
+    let qr = rag_query(pipe, query, top_k, template)
+    let cached_answer = qr[0]
+    let prompt = qr[1]
+    let chunks = qr[2]
+    let hit = qr[3]
+    let sim = qr[4]
+    let mid_pipe = qr[5]
+
+    if hit {
+        return [cached_answer, prompt, chunks, true, sim, mid_pipe]
+    }
+
+    let generated = rag_run_generator(gen_tag, prompt, chunks)
+    let final_pipe = rag_remember(mid_pipe, query, generated)
+    return [generated, prompt, chunks, false, sim, final_pipe]
+}
+
+// ===================================================================
+//  rag_stats: return [hits, misses, hit_rate, chunk_count, retrievals]
+// ===================================================================
+fn rag_stats(pipe) {
+    let total = pipe.hits + pipe.misses
+    let mut rate = 0.0
+    if total > 0 {
+        rate = to_float(pipe.hits) / to_float(total)
+    }
+    return [pipe.hits, pipe.misses, rate, len(pipe.ids), pipe.retrievals]
+}
+
+// ===================================================================
+//  rag_clear_cache: drop all cached (query, response) entries,
+//  but keep chunk store intact and preserve stats.
+// ===================================================================
+fn rag_clear_cache(pipe) {
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: pipe.texts,
+        metas: pipe.metas,
+        vectors: pipe.vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: [],
+        cache_responses: [],
+        cache_order: [],
+        cache_tick: 0,
+        hits: pipe.hits,
+        misses: pipe.misses,
+        retrievals: pipe.retrievals
+    }
+}
+
+// ===================================================================
+//  rag_reset_stats: zero hit/miss/retrieval counters
+// ===================================================================
+fn rag_reset_stats(pipe) {
+    return RAGPipeline {
+        dim: pipe.dim,
+        ids: pipe.ids,
+        texts: pipe.texts,
+        metas: pipe.metas,
+        vectors: pipe.vectors,
+        cache_capacity: pipe.cache_capacity,
+        cache_threshold: pipe.cache_threshold,
+        cache_queries: pipe.cache_queries,
+        cache_responses: pipe.cache_responses,
+        cache_order: pipe.cache_order,
+        cache_tick: pipe.cache_tick,
+        hits: 0,
+        misses: 0,
+        retrievals: 0
+    }
+}
+
+println("[rag_pipeline] loaded — chunk store + embed + top-k + prompt + LRU cache")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

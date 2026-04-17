@@ -1,5 +1,705 @@
 // test_speculative_rag.hexa — Speculative RAG tests (30+ checks)
-import "ml/speculative_rag.hexa"
+// -- inlined from self/ml/speculative_rag.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/speculative_rag.hexa — Speculative RAG
+//
+//  Combines Retrieval-Augmented Generation with Speculative Decoding:
+//  a small draft model generates tokens conditioned on retrieved
+//  context, and a larger target model verifies the drafts. Relevance
+//  filtering drops low-quality chunks mid-generation, and a citation
+//  tracker records which chunks contributed to which output tokens.
+//
+//  Components:
+//    1. Document retriever   — similarity-based document lookup
+//    2. Chunk ranker         — score and rank retrieved chunks
+//    3. Context builder      — assemble top-k chunks into context window
+//    4. Speculative RAG decode — draft with context, verify with target
+//    5. Relevance filter     — drop low-relevance chunks mid-generation
+//    6. Citation tracker     — track which chunks contributed to tokens
+//    7. Fallback             — generate without retrieval when no docs
+//
+//  Representation (flat, parser-friendly):
+//    document   = [id, text_hash, chunk_hashes]
+//    chunk      = [chunk_id, doc_id, text_hash, position]
+//    retrieval  = [chunk_id, score]
+//    context    = [chunk_ids, total_score]
+//    citation   = [token_idx, chunk_id, contribution]
+//
+//  API (pure):
+//    srag_hash(text)                              -> int
+//    srag_similarity(h1, h2)                      -> int (0-100)
+//    srag_make_document(id, text_hash, n_chunks)  -> document
+//    srag_make_chunk(chunk_id, doc_id, text_hash, pos) -> chunk
+//    srag_retrieve(query_hash, chunks, top_k)     -> [retrieval]
+//    srag_rank_chunks(retrievals)                 -> [retrieval] sorted
+//    srag_build_context(ranked, max_chunks, min_score) -> context
+//    srag_draft_model(ctx)                        -> int token
+//    srag_target_model(ctx)                       -> int token
+//    srag_speculative_step(ctx, k, context_chunks)
+//       -> [tokens, drafted, accepted, rounds]
+//    srag_relevance_filter(retrievals, threshold) -> [retrieval]
+//    srag_citation_track(tokens, chunk_scores)    -> [citation]
+//    srag_fallback_generate(ctx, k)               -> [int] tokens
+//    srag_full_pipeline(query_hash, chunks, ctx, config)
+//       -> [tokens, citations, stats]
+//
+//  AI-NATIVE attrs:
+//    @pure      — no side effects
+//    @hot       — called every decode step
+//    @parallel  — chunk retrieval independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── math / hash helpers (prefixed srag_ to avoid collision) ──────
+
+fn srag_abs(x) {
+    if x < 0 { return 0 - x }
+    return x
+}
+
+fn srag_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+fn srag_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// Simple deterministic hash for text simulation.
+// Takes an integer "text hash" and mixes it.
+fn srag_hash(val) {
+    let mask = 2147483647
+    let a = ((val + 1) * 2654435761) % mask
+    let b = ((a + 7) * 1315423) % mask
+    let v = b % mask
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// Hash mixer for combining two hashes with a salt.
+fn srag_hash_mix(h, salt) {
+    let mask = 2147483647
+    let a = (h % mask)
+    let b = ((salt + 1) * 2246822) % mask
+    let v = ((a + b) * 374761) % mask
+    if v < 0 { return 0 - v }
+    return v
+}
+
+// ── 1. Document Retriever ────────────────────────────────────────
+// Similarity between two hashes: higher = more similar (0-100).
+// Uses absolute difference of mixed hashes mapped to a 0-100 scale.
+fn srag_similarity(h1, h2) {
+    let mask = 2147483647
+    let m1 = srag_hash(h1) % 1000
+    let m2 = srag_hash(h2) % 1000
+    let diff = srag_abs(m1 - m2)
+    // Map diff to similarity: smaller diff = higher similarity
+    let sim = 100 - (diff * 100) / 1000
+    if sim < 0 { return 0 }
+    if sim > 100 { return 100 }
+    return sim
+}
+
+// Create a document: [id, text_hash, n_chunks]
+fn srag_make_document(id, text_hash, n_chunks) {
+    return [id, text_hash, n_chunks]
+}
+
+// Create a chunk: [chunk_id, doc_id, text_hash, position]
+fn srag_make_chunk(chunk_id, doc_id, text_hash, position) {
+    return [chunk_id, doc_id, text_hash, position]
+}
+
+// Retrieve top-k chunks by similarity to query_hash.
+// chunks: array of [chunk_id, doc_id, text_hash, position]
+// Returns: array of [chunk_id, score] sorted descending by score.
+@parallel
+fn srag_retrieve(query_hash, chunks, top_k) {
+    let n = len(chunks)
+    // Compute similarity for each chunk
+    let mut scored = []
+    let mut i = 0
+    while i < n {
+        let chunk_id = chunks[i][0]
+        let text_hash = chunks[i][2]
+        let score = srag_similarity(query_hash, text_hash)
+        scored = scored + [[chunk_id, score]]
+        i = i + 1
+    }
+    // Sort descending by score (insertion sort, stable)
+    let mut sorted = []
+    let mut si = 0
+    while si < len(scored) {
+        sorted = sorted + [scored[si]]
+        si = si + 1
+    }
+    let sn = len(sorted)
+    let mut ii = 1
+    while ii < sn {
+        let key = sorted[ii]
+        let mut jj = ii - 1
+        let mut done = false
+        while done == false {
+            if jj < 0 {
+                done = true
+            } else {
+                if sorted[jj][1] < key[1] {
+                    // shift right: rebuild sorted with swap
+                    let mut new_sorted = []
+                    let mut ri = 0
+                    while ri < sn {
+                        if ri == jj {
+                            new_sorted = new_sorted + [sorted[jj + 1]]
+                        } else {
+                            if ri == jj + 1 {
+                                new_sorted = new_sorted + [key]
+                            } else {
+                                new_sorted = new_sorted + [sorted[ri]]
+                            }
+                        }
+                        ri = ri + 1
+                    }
+                    sorted = new_sorted
+                    jj = jj - 1
+                } else {
+                    done = true
+                }
+            }
+        }
+        ii = ii + 1
+    }
+    // Take top-k
+    let take = srag_min(top_k, len(sorted))
+    let mut result = []
+    let mut ti = 0
+    while ti < take {
+        result = result + [sorted[ti]]
+        ti = ti + 1
+    }
+    return result
+}
+
+// ── 2. Chunk Ranker ──────────────────────────────────────────────
+// Re-rank chunks by score descending. Also applies a diversity bonus:
+// chunks from different documents get a small boost.
+fn srag_rank_chunks(retrievals, chunks) {
+    let n = len(retrievals)
+    if n == 0 { return [] }
+
+    // Look up doc_id for each retrieval and apply diversity bonus
+    let mut ranked = []
+    let mut seen_docs = []
+    let mut i = 0
+    while i < n {
+        let chunk_id = retrievals[i][0]
+        let base_score = retrievals[i][1]
+        // Find doc_id from chunks array
+        let mut doc_id = -1
+        let mut ci = 0
+        while ci < len(chunks) {
+            if chunks[ci][0] == chunk_id {
+                doc_id = chunks[ci][1]
+            }
+            ci = ci + 1
+        }
+        // Check if we have seen this doc_id
+        let mut is_new_doc = true
+        let mut di = 0
+        while di < len(seen_docs) {
+            if seen_docs[di] == doc_id {
+                is_new_doc = false
+            }
+            di = di + 1
+        }
+        let bonus = if is_new_doc { 5 } else { 0 }
+        seen_docs = seen_docs + [doc_id]
+        ranked = ranked + [[chunk_id, base_score + bonus]]
+        i = i + 1
+    }
+    // Sort descending by adjusted score
+    let rn = len(ranked)
+    let mut ii = 1
+    while ii < rn {
+        let key_item = ranked[ii]
+        let mut jj = ii - 1
+        let mut done = false
+        while done == false {
+            if jj < 0 {
+                done = true
+            } else {
+                if ranked[jj][1] < key_item[1] {
+                    let mut new_ranked = []
+                    let mut ri = 0
+                    while ri < rn {
+                        if ri == jj {
+                            new_ranked = new_ranked + [ranked[jj + 1]]
+                        } else {
+                            if ri == jj + 1 {
+                                new_ranked = new_ranked + [key_item]
+                            } else {
+                                new_ranked = new_ranked + [ranked[ri]]
+                            }
+                        }
+                        ri = ri + 1
+                    }
+                    ranked = new_ranked
+                    jj = jj - 1
+                } else {
+                    done = true
+                }
+            }
+        }
+        ii = ii + 1
+    }
+    return ranked
+}
+
+// ── 3. Context Builder ───────────────────────────────────────────
+// Assemble top-k chunks into a context window.
+// Filters by min_score and limits to max_chunks.
+// Returns: [chunk_ids_array, total_score]
+@pure
+fn srag_build_context(ranked, max_chunks, min_score) {
+    let mut chunk_ids = []
+    let mut total_score = 0
+    let mut i = 0
+    let limit = srag_min(max_chunks, len(ranked))
+    while i < limit {
+        let score = ranked[i][1]
+        if score >= min_score {
+            chunk_ids = chunk_ids + [ranked[i][0]]
+            total_score = total_score + score
+        }
+        i = i + 1
+    }
+    return [chunk_ids, total_score]
+}
+
+// ── Context hash: combine chunk IDs into a context-dependent hash ─
+fn srag_context_hash(ctx, chunk_ids) {
+    let mask = 2147483647
+    let mut h = 2654435761 % mask
+    // Mix in base context
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut i = start
+    while i < n {
+        let a = (ctx[i] + 1) % mask
+        let b = (i + 7) * 1315423 % mask
+        h = (h + ((a * b) % mask)) % mask
+        i = i + 1
+    }
+    // Mix in chunk IDs for RAG conditioning
+    let mut ci = 0
+    while ci < len(chunk_ids) {
+        let a = (chunk_ids[ci] + 3) % mask
+        h = (h + (a * 374761) % mask) % mask
+        ci = ci + 1
+    }
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// ── Plain context hash (no chunks, for fallback) ─────────────────
+fn srag_plain_ctx_hash(ctx) {
+    let mask = 2147483647
+    let mut h = 2654435761 % mask
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut i = start
+    while i < n {
+        let a = (ctx[i] + 1) % mask
+        let b = (i + 7) * 1315423 % mask
+        h = (h + ((a * b) % mask)) % mask
+        i = i + 1
+    }
+    if h < 0 { return 0 - h }
+    return h
+}
+
+// ── 4. Speculative RAG Decode ────────────────────────────────────
+// Draft model: generates a token conditioned on context + chunk IDs.
+// Uses a deterministic hash-based simulation.
+@hot
+fn srag_draft_model(ctx, chunk_ids) {
+    let h = srag_context_hash(ctx, chunk_ids)
+    let v = h % 16
+    if v < 0 { return v + 16 }
+    return v
+}
+
+// Target model: verifies drafts. Agrees with draft except when
+// hash % 7 == 0, forcing occasional rejections.
+@hot
+fn srag_target_model(ctx, chunk_ids) {
+    let h = srag_context_hash(ctx, chunk_ids)
+    let d = srag_draft_model(ctx, chunk_ids)
+    if (h % 7) == 0 {
+        return (d + 1) % 16
+    }
+    return d
+}
+
+// Draft k tokens speculatively using retrieved context.
+fn srag_draft_k(ctx, k, chunk_ids) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut tokens = []
+    let mut di = 0
+    while di < k {
+        let tok = srag_draft_model(cur, chunk_ids)
+        tokens = tokens + [tok]
+        cur = cur + [tok]
+        di = di + 1
+    }
+    return tokens
+}
+
+// Verify drafted tokens against target model.
+// Returns number of accepted tokens (prefix match).
+fn srag_verify(ctx, drafted, chunk_ids) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut accepted = 0
+    let mut vi = 0
+    while vi < len(drafted) {
+        let target_tok = srag_target_model(cur, chunk_ids)
+        if target_tok == drafted[vi] {
+            accepted = accepted + 1
+            cur = cur + [drafted[vi]]
+        } else {
+            // Reject: return accepted count and the correct token
+            return [accepted, target_tok]
+        }
+        vi = vi + 1
+    }
+    // All accepted; get next token from target for bonus
+    let bonus = srag_target_model(cur, chunk_ids)
+    return [accepted, bonus]
+}
+
+// Full speculative RAG step: draft+verify loop producing max_tokens.
+// Returns: [out_tokens, [total_drafted], [total_accepted], [rounds]]
+@speculative_rag_decode
+fn srag_speculative_step(ctx, k, chunk_ids, max_tokens) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut produced = 0
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+
+    while produced < max_tokens {
+        let drafted = srag_draft_k(cur, k, chunk_ids)
+        let result = srag_verify(cur, drafted, chunk_ids)
+        let n_accepted = result[0]
+        let correction = result[1]
+
+        total_drafted = total_drafted + k
+
+        if n_accepted == 0 {
+            // No drafts accepted: use target correction token
+            cur = cur + [correction]
+            produced = produced + 1
+            total_accepted = total_accepted + 0
+        } else {
+            // Accept prefix + bonus token from target
+            let mut ai = 0
+            while ai < n_accepted {
+                if produced < max_tokens {
+                    cur = cur + [drafted[ai]]
+                    produced = produced + 1
+                }
+                ai = ai + 1
+            }
+            total_accepted = total_accepted + n_accepted
+            // Add correction/bonus if room
+            if produced < max_tokens {
+                cur = cur + [correction]
+                produced = produced + 1
+            }
+        }
+        rounds = rounds + 1
+    }
+
+    // Extract produced tail
+    let mut out = []
+    let start = len(ctx)
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    // Trim to max_tokens if overshot
+    let mut trimmed = []
+    let mut ti = 0
+    while ti < srag_min(max_tokens, len(out)) {
+        trimmed = trimmed + [out[ti]]
+        ti = ti + 1
+    }
+    return [trimmed, [total_drafted], [total_accepted], [rounds]]
+}
+
+// ── 5. Relevance Filter ──────────────────────────────────────────
+// Drop chunks below a relevance threshold.
+// retrievals: array of [chunk_id, score]
+// Returns filtered array (preserves order).
+@pure
+fn srag_relevance_filter(retrievals, threshold) {
+    let mut result = []
+    let mut i = 0
+    while i < len(retrievals) {
+        if retrievals[i][1] >= threshold {
+            result = result + [retrievals[i]]
+        }
+        i = i + 1
+    }
+    return result
+}
+
+// Adaptive relevance filter: adjusts threshold based on score distribution.
+// Uses the mean score minus one "standard deviation" approximation.
+fn srag_adaptive_filter(retrievals) {
+    let n = len(retrievals)
+    if n == 0 { return [] }
+    // Compute mean
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + retrievals[i][1]
+        i = i + 1
+    }
+    let mean = sum / n
+    // Compute mean absolute deviation as stddev proxy
+    let mut dev_sum = 0
+    let mut j = 0
+    while j < n {
+        dev_sum = dev_sum + srag_abs(retrievals[j][1] - mean)
+        j = j + 1
+    }
+    let mad = dev_sum / n
+    let threshold = mean - mad
+    return srag_relevance_filter(retrievals, threshold)
+}
+
+// ── 6. Citation Tracker ──────────────────────────────────────────
+// Track which chunks contributed to which output tokens.
+// Uses hash correlation between token context and chunk IDs.
+// Returns: array of [token_idx, chunk_id, contribution_score]
+@pure
+fn srag_citation_track(out_tokens, base_ctx, chunk_ids) {
+    let mut citations = []
+    let mut cur = []
+    let mut ci = 0
+    while ci < len(base_ctx) {
+        cur = cur + [base_ctx[ci]]
+        ci = ci + 1
+    }
+    let mut ti = 0
+    while ti < len(out_tokens) {
+        // For each token, measure contribution of each chunk
+        let tok = out_tokens[ti]
+        cur = cur + [tok]
+        let mut cj = 0
+        while cj < len(chunk_ids) {
+            let chunk_id = chunk_ids[cj]
+            // Contribution: hash correlation between context+token and chunk
+            let ctx_h = srag_plain_ctx_hash(cur)
+            let chunk_h = srag_hash(chunk_id * 1000 + tok)
+            let contribution = srag_similarity(ctx_h, chunk_h)
+            if contribution > 20 {
+                citations = citations + [[ti, chunk_id, contribution]]
+            }
+            cj = cj + 1
+        }
+        ti = ti + 1
+    }
+    return citations
+}
+
+// Get top contributing chunk for a given token index.
+fn srag_top_citation(citations, token_idx) {
+    let mut best_chunk = -1
+    let mut best_score = -1
+    let mut i = 0
+    while i < len(citations) {
+        if citations[i][0] == token_idx {
+            if citations[i][2] > best_score {
+                best_score = citations[i][2]
+                best_chunk = citations[i][1]
+            }
+        }
+        i = i + 1
+    }
+    return [best_chunk, best_score]
+}
+
+// Count how many tokens cite a given chunk.
+fn srag_chunk_citation_count(citations, chunk_id) {
+    let mut count = 0
+    let mut i = 0
+    while i < len(citations) {
+        if citations[i][1] == chunk_id {
+            count = count + 1
+        }
+        i = i + 1
+    }
+    return count
+}
+
+// ── 7. Fallback: No Retrieval ────────────────────────────────────
+// Generate tokens without any retrieved context (empty chunk_ids).
+// Uses plain ctx hash for the draft/target models.
+fn srag_fallback_draft(ctx) {
+    let h = srag_plain_ctx_hash(ctx)
+    let v = h % 16
+    if v < 0 { return v + 16 }
+    return v
+}
+
+fn srag_fallback_target(ctx) {
+    let h = srag_plain_ctx_hash(ctx)
+    let d = srag_fallback_draft(ctx)
+    if (h % 7) == 0 {
+        return (d + 1) % 16
+    }
+    return d
+}
+
+fn srag_fallback_generate(ctx, n_tokens) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut out = []
+    let mut ti = 0
+    while ti < n_tokens {
+        let tok = srag_fallback_target(cur)
+        cur = cur + [tok]
+        out = out + [tok]
+        ti = ti + 1
+    }
+    return out
+}
+
+// ── Full Pipeline ────────────────────────────────────────────────
+// config: [top_k_retrieve, max_chunks, min_score, draft_k, max_tokens, relevance_threshold]
+@pure
+fn srag_full_pipeline(query_hash, chunks, ctx, config) {
+    let top_k_retrieve = config[0]
+    let max_chunks = config[1]
+    let min_score = config[2]
+    let draft_k = config[3]
+    let max_tokens = config[4]
+    let rel_threshold = config[5]
+
+    // Step 1: Retrieve
+    let retrievals = srag_retrieve(query_hash, chunks, top_k_retrieve)
+
+    // Step 2: Relevance filter
+    let filtered = srag_relevance_filter(retrievals, rel_threshold)
+
+    // Step 3: Check if we have relevant docs
+    if len(filtered) == 0 {
+        // Fallback: generate without retrieval
+        let fallback_tokens = srag_fallback_generate(ctx, max_tokens)
+        let empty_citations = []
+        let stats = [0, 0, 0, 0, 1]
+        return [fallback_tokens, empty_citations, stats]
+    }
+
+    // Step 4: Rank
+    let ranked = srag_rank_chunks(filtered, chunks)
+
+    // Step 5: Build context
+    let context = srag_build_context(ranked, max_chunks, min_score)
+    let chunk_ids = context[0]
+    let total_score = context[1]
+
+    // Step 6: Speculative decode with context
+    let decode_result = srag_speculative_step(ctx, draft_k, chunk_ids, max_tokens)
+    let out_tokens = decode_result[0]
+    let total_drafted = decode_result[1][0]
+    let total_accepted = decode_result[2][0]
+    let n_rounds = decode_result[3][0]
+
+    // Step 7: Citation tracking
+    let citations = srag_citation_track(out_tokens, ctx, chunk_ids)
+
+    // stats: [total_drafted, total_accepted, n_rounds, total_score, 0(=not_fallback)]
+    let stats = [total_drafted, total_accepted, n_rounds, total_score, 0]
+
+    return [out_tokens, citations, stats]
+}
+
+// ── Utility: get unique cited chunks from citation list ──────────
+fn srag_unique_cited_chunks(citations) {
+    let mut seen = []
+    let mut i = 0
+    while i < len(citations) {
+        let cid = citations[i][1]
+        let mut found = false
+        let mut j = 0
+        while j < len(seen) {
+            if seen[j] == cid { found = true }
+            j = j + 1
+        }
+        if found == false {
+            seen = seen + [cid]
+        }
+        i = i + 1
+    }
+    return seen
+}
+
+// ── Utility: average score of retrievals ─────────────────────────
+fn srag_avg_score(retrievals) {
+    let n = len(retrievals)
+    if n == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + retrievals[i][1]
+        i = i + 1
+    }
+    return sum / n
+}
+
+// ── Utility: max score of retrievals ─────────────────────────────
+fn srag_max_score(retrievals) {
+    let n = len(retrievals)
+    if n == 0 { return 0 }
+    let mut best = retrievals[0][1]
+    let mut i = 1
+    while i < n {
+        if retrievals[i][1] > best {
+            best = retrievals[i][1]
+        }
+        i = i + 1
+    }
+    return best
+}
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0
