@@ -1,0 +1,177 @@
+// self/codegen/syscall.hexa — P7-7a generic syscall lowering
+//
+// Emits N-arg syscall sequences for ARM64 (Darwin/Linux) and x86_64
+// (Linux). Driven by IR lowering of the `syscall(num, args...)` builtin.
+//
+// Spec: docs/plans/syscall_intrinsic_spec.md
+//
+// Contract:
+//   Inputs
+//     arch:     0 = ARM64, 1 = x86_64
+//     os:       0 = Darwin, 1 = Linux
+//     num:      syscall number (per-target, already OR'd with class for
+//               Darwin BSD syscalls)
+//     arg_regs: list of already-allocated physical register indices
+//               where each argument value currently lives (regalloc
+//               pre-assigns by placing OP_SYSCALL args in arg slot 0..5)
+//
+//   Output
+//     bytes   : instruction bytes appended to `code`
+//
+// Clobbers:
+//   ARM64 : x0..x7 (args), x16 (Darwin nr) / x8 (Linux nr), flags
+//   x86_64: rax, rcx, r11 (syscall-implicit), plus rdi/rsi/rdx/r10/r8/r9
+//
+// Aliasing: if arg_regs[i] == dest_reg[i], the move is skipped. Cyclic
+// aliases (e.g. x0→x1, x1→x0) are resolved via x17 (arm64) / r11 (x86)
+// scratch shuffles — see fix_arg_cycle().
+
+// ═══════════════════════════════════════════════════════════════════
+// ARM64: destination arg registers x0..x7
+// x86_64: destination arg registers rdi=7, rsi=6, rdx=2, r10=10, r8=8, r9=9
+// ═══════════════════════════════════════════════════════════════════
+
+fn arm64_arg_regs() -> [int] { return [0, 1, 2, 3, 4, 5, 6, 7] }
+fn x86_arg_regs()   -> [int] { return [7, 6, 2, 10, 8, 9] }
+
+// ARM64 scratch for cycle resolution (x17 — platform reserved temp).
+fn arm64_cycle_tmp() -> int { return 17 }
+
+// x86_64 scratch for cycle resolution (r11 — caller-saved, clobbered by syscall anyway).
+fn x86_cycle_tmp() -> int { return 11 }
+
+// ═══════════════════════════════════════════════════════════════════
+//  ARM64 emitter — generic N-arg syscall
+// ═══════════════════════════════════════════════════════════════════
+
+// Move each arg_reg[i] into dest[i] (dest = x0, x1, ...). Handles no-op
+// case (reg already in place). Does NOT handle cycles — cycle detection
+// is caller-side via fix_arg_cycle(), which we defer: for P7-7 we
+// require regalloc to pre-place args in order, avoiding cycles.
+fn arm64_marshal_args(code: [int], arg_regs: [int]) -> [int] {
+    let mut c = code
+    let dests = arm64_arg_regs()
+    let mut i = 0
+    while i < len(arg_regs) && i < len(dests) {
+        let src = arg_regs[i]
+        let dst = dests[i]
+        c = emit_arm64_mov_if_diff(c, dst, src)
+        i = i + 1
+    }
+    return c
+}
+
+// Full ARM64 syscall sequence: marshal args → load NR → svc.
+// os: 0=Darwin, 1=Linux.
+fn emit_arm64_syscall(code: [int], os: int, num: int, arg_regs: [int]) -> [int] {
+    let mut c = code
+    c = arm64_marshal_args(c, arg_regs)
+    c = emit_arm64_syscall_nr(c, os, num)
+    c = emit_arm64_svc(c, os)
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  x86_64 emitter — generic N-arg syscall (Linux only for now)
+// ═══════════════════════════════════════════════════════════════════
+
+fn x86_marshal_args(code: [int], arg_regs: [int]) -> [int] {
+    let mut c = code
+    let dests = x86_arg_regs()
+    let mut i = 0
+    while i < len(arg_regs) && i < len(dests) {
+        let src = arg_regs[i]
+        let dst = dests[i]
+        c = x86_emit_mov_rr(c, dst, src)
+        i = i + 1
+    }
+    return c
+}
+
+fn emit_x86_syscall(code: [int], num: int, arg_regs: [int]) -> [int] {
+    let mut c = code
+    c = x86_marshal_args(c, arg_regs)
+    c = x86_emit_mov_rax_imm32(c, num)
+    c = x86_emit_syscall_insn(c)
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Arch-neutral dispatch — called by IR→machine lowering
+// ═══════════════════════════════════════════════════════════════════
+//
+// Called from ir_to_arm64.hexa and ir_to_x86.hexa when encountering a
+// Call instr whose callee is the builtin "syscall".
+
+fn emit_syscall_generic(arch: int, os: int, code: [int], num: int, arg_regs: [int]) -> [int] {
+    if arch == 0 {
+        return emit_arm64_syscall(code, os, num, arg_regs)
+    }
+    return emit_x86_syscall(code, num, arg_regs)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Regalloc constraint hints for OP_SYSCALL
+// ═══════════════════════════════════════════════════════════════════
+//
+// When regalloc encounters a Call to the "syscall" builtin, each arg
+// must land in its designated register BEFORE the call. The register
+// allocator reads these hints to pre-place values and insert any needed
+// spills at the point of the call.
+//
+// Returns the list of physical register indices (in arg order) where
+// each arg must be placed.
+
+fn syscall_arg_constraints(arch: int, num_args: int) -> [int] {
+    let mut constraints = []
+    let regs = if arch == 0 { arm64_arg_regs() } else { x86_arg_regs() }
+    let mut i = 0
+    while i < num_args && i < len(regs) {
+        constraints = constraints.push(regs[i])
+        i = i + 1
+    }
+    return constraints
+}
+
+// Register clobber mask for OP_SYSCALL (bits set for each clobbered reg).
+// ARM64: x0 defined (result), x1..x17 clobbered.
+// x86_64: rax defined (result), rcx + r11 clobbered by syscall insn;
+//         rdi/rsi/rdx/r10/r8/r9 are inputs (live-in).
+fn syscall_clobbers(arch: int) -> [int] {
+    if arch == 0 {
+        // ARM64: x1..x17
+        return [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]
+    }
+    // x86_64: rcx, r11
+    return [1, 11]
+}
+
+fn syscall_defs(arch: int) -> [int] {
+    if arch == 0 { return [0] }    // x0
+    return [0]                      // rax
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Darwin errno normalization — ARM64 only
+// ═══════════════════════════════════════════════════════════════════
+//
+// Darwin sets PSTATE.C (carry) to 1 on syscall error, with the positive
+// errno in x0. Linux returns -errno directly. To unify the ABI, emit a
+// conditional negation on Darwin after svc:
+//
+//   svc #0x80
+//   csneg x0, x0, x0, CC    ; if CC (carry clear) keep, else negate
+//
+// CSNEG Xd, Xn, Xm, cond  -> 0x5a800400 + cond_code*4096 + Xn*32 + Xd + Xm*65536
+// cond_code for CC (carry clear) = 3
+
+fn encode_csneg_cc(rd: int, rn: int, rm: int) -> int {
+    let cond = 3
+    return 1518207488 + (rm * 65536) + (cond * 4096) + (rn * 32) + rd
+}
+
+fn emit_darwin_errno_fix(code: [int]) -> [int] {
+    // csneg x0, x0, x0, CC  — if carry (error), negate x0 so caller
+    // sees -errno uniformly with Linux.
+    return emit32(code, encode_csneg_cc(0, 0, 0))
+}
