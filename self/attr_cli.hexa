@@ -7,6 +7,8 @@
 
 use "self/attrs/core"
 use "self/attrs/policy"
+use "self/attrs/forbid"
+use "self/attrs/generated"
 use "self/attrs/_registry"
 
 let _raw_args = args()
@@ -143,9 +145,12 @@ fn _dirname(path: string) {
 }
 
 fn _find_project_attrs(target_path: string) {
+    // target_path 가 디렉토리면 자기 자신부터, 파일이면 dirname 부터
     let mut dir = target_path
-    // 디렉토리인지 파일인지 모르니 dirname 시작
-    dir = _dirname(dir)
+    let is_dir = to_string(exec("test -d '" + target_path + "' && echo y || echo n")).trim()
+    if is_dir != "y" {
+        dir = _dirname(target_path)
+    }
     let mut depth = 0
     while depth < 20 {
         let candidate = dir + "/.hexa-attrs"
@@ -169,17 +174,17 @@ fn _parse_attrs_file(path: string) {
     } catch e { return [forbids, allows] }
     let lines = split(raw, "\n")
     for line in lines {
-        let t = trim(line)
+        let t = line.trim()
         if t == "" { continue }
-        if starts_with(t, "#") { continue }
+        if t.starts_with("#") { continue }
         let eq = t.index_of("=")
         if eq < 0 { continue }
-        let key = trim(t.substring(0, eq))
-        let value = trim(t.substring(eq + 1, len(t)))
+        let key = t.substring(0, eq).trim()
+        let value = t.substring(eq + 1, len(t)).trim()
         let toks = split(value, ",")
         let mut list = []
         for tok in toks {
-            let tt = trim(tok)
+            let tt = tok.trim()
             if tt != "" { list = list.push(tt) }
         }
         if key == "forbid" { forbids = list }
@@ -196,16 +201,16 @@ fn _allow_exempts(allows, token: string, target_path: string) {
         let mut a_token = a
         let mut a_scope = ""
         if colon >= 0 {
-            a_token = trim(a.substring(0, colon))
-            a_scope = trim(a.substring(colon + 1, len(a)))
+            a_token = a.substring(0, colon).trim()
+            a_scope = a.substring(colon + 1, len(a)).trim()
         }
         if a_token != token { continue }
         if a_scope == "" { return true }   // scope 없으면 전역 면제
         // scope 는 glob-like: 단순 prefix 매칭 ( /* /** 무시하고 prefix 만 )
         let mut prefix = a_scope
-        if ends_with(prefix, "/**") { prefix = prefix.substring(0, len(prefix) - 3) }
-        else if ends_with(prefix, "/*") { prefix = prefix.substring(0, len(prefix) - 2) }
-        if contains(target_path, prefix) { return true }
+        if prefix.ends_with("/**") { prefix = prefix.substring(0, len(prefix) - 3) }
+        else if prefix.ends_with("/*") { prefix = prefix.substring(0, len(prefix) - 2) }
+        if target_path.contains(prefix) { return true }
     }
     return false
 }
@@ -259,6 +264,113 @@ fn run_policy(target_path: string) {
     exit(1)
 }
 
+// ── compile: .hexa-attrs → native config 코드젠 ─────────
+// 각 forbid token 에 대해 compile_claude_permissions_for() + compile_git_precommit_for()
+// 호출해 target 파일에 누적 emit. @generated 헤더 자동 주입.
+
+fn _project_root_from(target_path: string) {
+    let attrs = _find_project_attrs(target_path)
+    if attrs == "" { return "" }
+    return _dirname(attrs)
+}
+
+fn _ensure_dir(path: string) {
+    try { exec("mkdir -p '" + path + "'") } catch e {}
+}
+
+fn _write_generated(path: string, source: string, comment_prefix: string, body: string) {
+    let header = generated_header(source, comment_prefix)
+    let content = header + "\n" + body + "\n"
+    try {
+        write_file(path, content)
+    } catch e {
+        eprintln("error: cannot write " + path)
+    }
+}
+
+fn compile_claude_permissions_deny(root: string, forbids) {
+    let mut entries = []
+    for token in forbids {
+        let token_entries = compile_claude_permissions_for(token)
+        for e in token_entries {
+            entries = entries.push("    \"" + e + "\"")
+        }
+    }
+    if len(entries) == 0 { return }
+    let body = "{\n" +
+               "  \"_source\": \".hexa-attrs\",\n" +
+               "  \"_merge_into\": \".claude/settings.json#/permissions/deny\",\n" +
+               "  \"permissions_deny\": [\n" +
+               join(entries, ",\n") + "\n" +
+               "  ]\n" +
+               "}"
+    let out_dir = root + "/.attr-generated"
+    _ensure_dir(out_dir)
+    let out_path = out_dir + "/claude_permissions_deny.json"
+    _write_generated(out_path, ".hexa-attrs", "//", body)
+    println("emitted: " + out_path + " (" + to_string(len(entries)) + " deny entries)")
+}
+
+fn compile_git_precommit(root: string, forbids) {
+    let mut stanzas = []
+    for token in forbids {
+        let s = compile_git_precommit_for(token)
+        if s != "" { stanzas = stanzas.push("# [@forbid(" + token + ")]\n" + s) }
+    }
+    if len(stanzas) == 0 { return }
+    let body = "#!/bin/bash\nset -e\n\n" + join(stanzas, "\n\n") + "\n"
+    let out_dir = root + "/.attr-generated"
+    _ensure_dir(out_dir)
+    let out_path = out_dir + "/pre-commit.sh"
+    _write_generated(out_path, ".hexa-attrs", "#", body)
+    try { exec("chmod +x '" + out_path + "'") } catch e {}
+    println("emitted: " + out_path + " (" + to_string(len(stanzas)) + " stanzas)")
+}
+
+fn run_compile(target: string) {
+    // 현재 작업 디렉토리 기준 (env PWD 우선, 없으면 exec pwd)
+    let mut pwd = env("PWD")
+    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+    let attrs_path = _find_project_attrs(pwd)
+    if attrs_path == "" {
+        eprintln("error: no .hexa-attrs found upward from " + pwd)
+        exit(1)
+    }
+    let root = _dirname(attrs_path)
+    let parsed = _parse_attrs_file(attrs_path)
+    let forbids = parsed[0]
+    if len(forbids) == 0 {
+        println("no forbid tokens in " + attrs_path + " — nothing to compile")
+        exit(0)
+    }
+
+    println("─ attr_cli compile ─────────────────────────────────")
+    println("source : " + attrs_path)
+    println("root   : " + root)
+    println("forbids: " + join(forbids, ", "))
+    println("")
+
+    let mut do_claude = false
+    let mut do_git = false
+    if target == "" || target == "all" { do_claude = true; do_git = true }
+    else if target == "claude" { do_claude = true }
+    else if target == "git"    { do_git = true }
+    else {
+        eprintln("unknown target: " + target + " (valid: claude|git|all)")
+        exit(1)
+    }
+
+    if do_claude { compile_claude_permissions_deny(root, forbids) }
+    if do_git    { compile_git_precommit(root, forbids) }
+
+    println("")
+    println("done — manual step:")
+    println("  (1) review " + root + "/.attr-generated/")
+    println("  (2) merge into target natives:")
+    println("      - .claude/settings.json permissions.deny")
+    println("      - .git/hooks/pre-commit (chmod +x)")
+}
+
 // ── CLI dispatch ──────────────────────────────────────────
 if len(cli_args) == 0 {
     print_all()
@@ -270,7 +382,7 @@ let sub = cli_args[0]
 if sub == "show" {
     if len(cli_args) < 2 { eprintln("usage: show <name>"); exit(1) }
     let mut n = cli_args[1]
-    if starts_with(n, "@") { n = n.substring(1, len(n)) }
+    if n.starts_with("@") { n = n.substring(1, len(n)) }
     print_show(n)
     exit(0)
 }
@@ -292,9 +404,20 @@ if sub == "policy" || sub == "precheck" {
     exit(0)
 }
 
+if sub == "compile" {
+    let mut t = "all"
+    if len(cli_args) >= 2 {
+        let a2 = cli_args[1]
+        if a2.starts_with("--target=") { t = a2.substring(9, len(a2)) }
+        else { t = a2 }
+    }
+    run_compile(t)
+    exit(0)
+}
+
 // 직접 이름 전달 시 show 대체 (예: `hexa attr_cli.hexa pure`)
 let mut n2 = sub
-if starts_with(n2, "@") { n2 = n2.substring(1, len(n2)) }
+if n2.starts_with("@") { n2 = n2.substring(1, len(n2)) }
 let m = meta_by_name(n2)
 if m.name != "" { print_show(n2); exit(0) }
 
