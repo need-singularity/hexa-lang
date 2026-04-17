@@ -1,0 +1,394 @@
+// self/test_syscall_emit.hexa — P7-7 syscall emission smoke test
+//
+// Builds a minimal ARM64 Mach-O that prints "hello native\n" to stdout
+// via the Darwin write() syscall and exits cleanly.
+//
+// Expected emitted assembly:
+//   mov  x0, #1           ; stdout fd
+//   adr  x1, msg          ; buffer address (PC-relative)
+//   mov  x2, #13          ; length (13 chars incl. '\n')
+//   mov  x16, #0x2000004  ; SYS_write
+//   svc  #0x80
+//   mov  x0, #0           ; exit code 0
+//   mov  x16, #0x2000001  ; SYS_exit
+//   svc  #0x80
+// msg: "hello native\n"
+//
+// Doc-assertion: running the emitted binary prints "hello native\n" to
+// stdout and exits with status 0.
+
+// ═══════════════════════════════════════════════════════════
+//  Inline ARM64 encoders (mirror self/codegen/arm64.hexa; copied
+//  inline so the test runs standalone under hexa_stage0 without
+//  concat-linking the rest of the codegen module).
+// ═══════════════════════════════════════════════════════════
+
+fn emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+// MOVZ Xd, #imm16, LSL #0  (bits 16 wide)
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 0xd2800000 + (imm16 * 32) + rd
+}
+
+// MOVK Xd, #imm16, LSL #hw*16  (hw in 0..3)
+fn enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 0xf2800000 + (hw * 2097152) + (imm16 * 32) + rd
+}
+
+// SVC #imm16
+fn enc_svc(imm16: int) -> int {
+    return 0xd4000001 + (imm16 * 32)
+}
+
+// ADR Xd, label  — immediate is (label - PC) in 21 bits, signed.
+//   encoding: 0x10000000 | ((immlo & 3) << 29) | ((immhi & 0x7FFFF) << 5) | rd
+fn enc_adr(rd: int, disp: int) -> int {
+    let d = disp
+    if d < 0 { d = d + 2097152 }  // 2^21, wrap negative into 21-bit field
+    let immlo = d % 4          // bits [1:0]
+    let immhi = (d / 4) % 524288  // bits [20:2], 19 bits
+    return 0x10000000 + (immlo * 536870912) + (immhi * 32) + rd
+}
+
+// Build a Darwin ARM64 MOVZ+MOVK sequence to load a 32-bit immediate
+// into Xd. Covers values that don't fit in a single 16-bit field.
+fn emit_mov_imm32(code: [int], rd: int, val: int) -> [int] {
+    let mut c = code
+    c = emit32_le(c, enc_movz(rd, val % 65536))
+    let hi = (val / 65536) % 65536
+    if hi != 0 {
+        c = emit32_le(c, enc_movk(rd, hi, 1))
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Build the .text section bytes.
+//  Layout:
+//      [0..=N)   code instructions
+//      [N..)     "hello native\n" bytes (13)
+//  The ADR in slot 1 points to offset N bytes past the ADR itself.
+// ═══════════════════════════════════════════════════════════
+
+fn build_text_section() -> [int] {
+    // We know the code shape statically: 9 instructions before the
+    // message. Compute the byte offset of msg = 9*4 = 36 bytes from
+    // the start of .text. The ADR is at instruction index 1 (byte
+    // offset 4), so the PC-relative displacement is 36 - 4 = 32.
+    //
+    //   idx 0:  MOVZ x0, #1          ; fd
+    //   idx 1:  ADR  x1, msg         ; disp=+32
+    //   idx 2:  MOVZ x2, #13         ; len
+    //   idx 3:  MOVZ x16, #4         ; low 16 bits of 0x2000004
+    //   idx 4:  MOVK x16, #0x200, LSL #16  ; high 16 bits
+    //   idx 5:  SVC  #0x80           ; write
+    //   idx 6:  MOVZ x0, #0          ; exit code
+    //   idx 7:  MOVZ x16, #1         ; low 16 bits of 0x2000001
+    //   idx 8:  MOVK x16, #0x200, LSL #16
+    //   idx 9:  SVC  #0x80           ; exit
+
+    let mut insts = []
+    // 0: MOVZ x0, #1
+    insts = insts.push(enc_movz(0, 1))
+    // 1: ADR x1, +32
+    insts = insts.push(enc_adr(1, 36))
+    // 2: MOVZ x2, #13
+    insts = insts.push(enc_movz(2, 13))
+    // 3+4: MOVZ/MOVK x16 = 0x2000004 (SYS_write)
+    insts = insts.push(enc_movz(16, 4))
+    insts = insts.push(enc_movk(16, 0x200, 1))
+    // 5: SVC #0x80
+    insts = insts.push(enc_svc(0x80))
+    // 6: MOVZ x0, #0
+    insts = insts.push(enc_movz(0, 0))
+    // 7+8: MOVZ/MOVK x16 = 0x2000001 (SYS_exit)
+    insts = insts.push(enc_movz(16, 1))
+    insts = insts.push(enc_movk(16, 0x200, 1))
+    // 9: SVC #0x80
+    insts = insts.push(enc_svc(0x80))
+
+    // ADR at idx 1 byte 4, disp needs to reach end-of-insts (byte 10*4=40).
+    // We emitted 10 instructions = 40 bytes, so msg starts at byte 40.
+    // Re-encode idx 1 with disp = 40 - 4 = 36.
+    insts[1] = enc_adr(1, 36)
+
+    // Flatten the 10 instructions into bytes.
+    let mut bytes = []
+    let mut i = 0
+    while i < len(insts) {
+        bytes = emit32_le(bytes, insts[i])
+        i = i + 1
+    }
+
+    // Append "hello native\n" — 13 bytes. Use ord(substring) because
+    // Hexa string indexing returns a 1-char string, not a byte code.
+    let msg = "hello native\n"
+    let mut mi = 0
+    while mi < len(msg) {
+        let ch = ord(msg.substring(mi, mi + 1))
+        bytes = bytes.push(ch)
+        mi = mi + 1
+    }
+
+    // Pad to 4-byte alignment.
+    while len(bytes) % 4 != 0 {
+        bytes = bytes.push(0)
+    }
+    return bytes
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mach-O MH_EXECUTE wrapper (ported from compile_hello.hexa).
+//  Emits a single __TEXT segment with .text at file offset 0x300.
+//  Produces a hex string ready for xxd -r -p.
+// ═══════════════════════════════════════════════════════════
+
+fn u32_to_hex(v: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[(v % 256) / 16])
+    parts.push(h[(v % 256) % 16])
+    parts.push(h[((v / 256) % 256) / 16])
+    parts.push(h[((v / 256) % 256) % 16])
+    parts.push(h[((v / 65536) % 256) / 16])
+    parts.push(h[((v / 65536) % 256) % 16])
+    parts.push(h[((v / 16777216) % 256) / 16])
+    parts.push(h[((v / 16777216) % 256) % 16])
+    return parts.join("")
+}
+
+fn u64_to_hex(v: int, h: string) -> string {
+    let lo = v % 4294967296
+    let hi = v / 4294967296
+    return u32_to_hex(lo, h) + u32_to_hex(hi, h)
+}
+
+fn byte_to_hex(b: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[b / 16])
+    parts.push(h[b % 16])
+    return parts.join("")
+}
+
+fn build_macho_hex(text_bytes: [int]) -> string {
+    let HEX = "0123456789abcdef"
+    let MH_MAGIC_64 = 4277009103
+    let CPU_ARM64   = 16777228
+    let MH_EXECUTE  = 2
+    let HDR_FLAGS   = 2097285
+    let NCMDS       = 11
+    let SIZEOFCMDS  = 576
+    let PAGE        = 16384
+    let CODE_OFF    = 768
+
+    let code_bytes = len(text_bytes)
+    let mut text_size_aligned = code_bytes
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    let mut parts = []
+    let hdr_u32 = [MH_MAGIC_64, CPU_ARM64, 0, MH_EXECUTE, NCMDS, SIZEOFCMDS, HDR_FLAGS, 0]
+    let mut hi = 0
+    while hi < len(hdr_u32) {
+        parts.push(u32_to_hex(hdr_u32[hi], HEX))
+        hi = hi + 1
+    }
+
+    // LC_SEGMENT_64 __PAGEZERO
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f504147455a45524f0000000000" + "00")
+    parts.push("0000000000000000")
+    parts.push("0000000001000000")
+    parts.push("0000000000000000")
+    parts.push("0000000000000000")
+    parts.push("00000000" + "00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __TEXT
+    parts.push("19000000" + "98000000")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push("0000000001000000")
+    parts.push("0040000000000000")
+    parts.push("0000000000000000")
+    parts.push("0040000000000000")
+    parts.push("05000000")
+    parts.push("05000000")
+    parts.push("01000000")
+    parts.push("00000000")
+
+    // section __text
+    parts.push("5f5f74657874000000000000000000" + "00")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push(u64_to_hex(4294967296 + CODE_OFF, HEX))
+    parts.push(u64_to_hex(text_size_aligned, HEX))
+    parts.push(u32_to_hex(CODE_OFF, HEX))
+    parts.push("02000000")
+    parts.push("00000000" + "00000000")
+    parts.push("00040080")
+    parts.push("00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __LINKEDIT
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f4c494e4b45444954000000000000")
+    parts.push("0040000001000000")
+    parts.push("0040000000000000")
+    parts.push("0040000000000000")
+    parts.push("3100000000000000")
+    parts.push("01000000" + "01000000")
+    parts.push("00000000" + "00000000")
+
+    // LC_DYLD_CHAINED_FIXUPS
+    parts.push("34000080" + "10000000" + "00400000" + "30000000")
+
+    // LC_SYMTAB
+    parts.push("02000000" + "18000000")
+    parts.push("30400000")
+    parts.push("00000000")
+    parts.push("30400000")
+    parts.push("01000000")
+
+    // LC_DYSYMTAB
+    parts.push("0b000000" + "50000000")
+    let mut dyz_parts = []
+    let mut dyz = 0
+    while dyz < 72 {
+        dyz_parts.push("00")
+        dyz = dyz + 1
+    }
+    parts.push(dyz_parts.join(""))
+
+    // LC_LOAD_DYLINKER
+    parts.push("0e000000" + "20000000" + "0c000000")
+    parts.push("2f7573722f6c69622f64796c6400")
+    parts.push("000000000000")
+
+    // LC_UUID
+    parts.push("1b000000" + "18000000")
+    parts.push("48455841414243444546303132333435")
+
+    // LC_BUILD_VERSION
+    parts.push("32000000" + "18000000")
+    parts.push("01000000")
+    parts.push("00000e00")
+    parts.push("00000e00")
+    parts.push("00000000")
+
+    // LC_MAIN
+    parts.push("28000080" + "18000000")
+    parts.push(u64_to_hex(CODE_OFF, HEX))
+    parts.push("0000000000000000")
+
+    // LC_LOAD_DYLIB libSystem
+    parts.push("0c000000" + "38000000")
+    parts.push("18000000")
+    parts.push("02000000")
+    parts.push("00000100")
+    parts.push("00000100")
+    parts.push("2f7573722f6c69622f6c69625379737465")
+    parts.push("6d2e422e64796c696200000000000000")
+
+    let mut s = parts.join("")
+
+    // Pad to CODE_OFF.
+    while (len(s) / 2) < CODE_OFF {
+        s = s + "00"
+    }
+
+    // Append the .text bytes.
+    let mut bi = 0
+    while bi < len(text_bytes) {
+        s = s + byte_to_hex(text_bytes[bi], HEX)
+        bi = bi + 1
+    }
+
+    // Pad to PAGE.
+    while (len(s) / 2) < PAGE {
+        s = s + "00"
+    }
+
+    // __LINKEDIT stub (chained fixups + symtab strings — 49 bytes).
+    s = s + "00000000"
+    s = s + "20000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "01000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "03000000"
+    s = s + "00000000" + "00000000" + "00000000"
+    s = s + "00"
+
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Driver
+// ═══════════════════════════════════════════════════════════
+
+println("=== P7-7 syscall emit — hello native ===")
+println("")
+
+// Step 1: emit .text section with embedded message.
+println("[1] emit .text (syscalls + \"hello native\\n\")...")
+let text = build_text_section()
+println("  text bytes: " + to_string(len(text)))
+
+// Step 2: wrap in Mach-O MH_EXECUTE.
+println("[2] wrap in Mach-O MH_EXECUTE...")
+let hex = build_macho_hex(text)
+println("  macho bytes: " + to_string(len(hex) / 2))
+
+// Step 3: write /tmp/hexa_syscall_test.
+println("[3] write /tmp/hexa_syscall_test...")
+let out_path = "/tmp/hexa_syscall_test"
+exec("printf '%s' '" + hex + "' | xxd -r -p > " + out_path)
+
+// Step 4: chmod +x.
+println("[4] chmod +x...")
+exec("chmod +x " + out_path)
+
+// Step 5: codesign ad-hoc.
+println("[5] codesign (ad-hoc)...")
+let cs = exec_with_status("codesign --force --sign - " + out_path + " 2>&1")
+if cs[1] != 0 {
+    println("  WARN codesign rc=" + to_string(cs[1]) + ": " + cs[0].trim())
+}
+
+// Step 6: run and capture stdout.
+println("[6] run " + out_path + "...")
+let r = exec_with_status(out_path + " 2>&1")
+let rc = r[1]
+let out = r[0]
+println("  exit code = " + to_string(rc))
+println("  stdout    = " + out.trim())
+
+println("")
+println("=== doc-assert ===")
+let want_stdout = "hello native"
+let want_rc = 0
+let pass_stdout = out.trim() == want_stdout
+let pass_rc = rc == want_rc
+if pass_stdout {
+    println("  [PASS] stdout == \"hello native\"")
+} else {
+    println("  [FAIL] stdout mismatch: got \"" + out.trim() + "\" want \"" + want_stdout + "\"")
+}
+if pass_rc {
+    println("  [PASS] exit code == 0")
+} else {
+    println("  [FAIL] exit code mismatch: got " + to_string(rc) + " want 0")
+}
+
+if pass_stdout {
+    if pass_rc {
+        println("")
+        println("PASS — ARM64 Darwin write+exit syscall emission verified.")
+        println("P7-7 hello_world native path UNBLOCKED.")
+    }
+}
