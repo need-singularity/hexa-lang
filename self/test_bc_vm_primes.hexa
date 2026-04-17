@@ -14,7 +14,4104 @@
 //     self/test_bc_vm_primes.hexa /tmp/bcvm_primes.hexa
 //   ./build/hexa_stage0 /tmp/bcvm_primes.hexa
 
-use "bc_emitter"
+// -- inlined from self/bc_emitter.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  bc_emitter.hexa — HEXA bytecode emitter (rt#36-B)
+//
+//  Implements AST → bytecode chunk compilation per the rt#36-A
+//  design spec (docs/rt-36-bytecode-design.md + self/bytecode.h).
+//
+//  Output IR: 32-bit uniform iABC encoding — [ op(8) | B(24) ]
+//             or [ op(8) | A(8) | B(16) ] for Layout C (calls).
+//             See self/bytecode.h §decode-macros.
+//
+//  This Phase B delivers the MVP subset sufficient to emit the
+//  reference toy `experiments/rt36_bc_hello.hexa` (add + main +
+//  CALL + RETURN) and arithmetic-heavy benches like fib(N).
+//  The VM dispatch loop (rt#36-C) is the next phase and not here.
+//
+//  MVP AST coverage (11 node kinds + 7 stmt kinds):
+//    Expressions
+//      IntLit          -> OP_LOADI (|v|<2^23) or OP_LOADK
+//      FloatLit        -> OP_LOADK into floats const pool
+//      BoolLit         -> OP_LOADTRUE / OP_LOADFALSE
+//      StringLit       -> OP_LOADK
+//      Ident           -> OP_LOAD_LOCAL or OP_LOAD_GLOBAL
+//      BinOp           -> OP_ADD/SUB/MUL/DIV/MOD, EQ/NEQ/LT/LE/GT/GE
+//      UnaryOp         -> OP_NOT (!), negation via 0-x
+//      Call            -> OP_CALL (A=nargs, B16=fn_const_idx)
+//                         print/println are lowered to OP_PRINT (debug)
+//      IfExpr          -> OP_JMPF + OP_JMP skeleton
+//    Statements
+//      LetStmt         -> compile RHS then OP_STORE_LOCAL slot
+//      AssignStmt      -> same as LetStmt (no slot alloc)
+//      ReturnStmt      -> compile RHS then OP_RETURN / OP_RETURN0
+//      WhileStmt       -> back-edge OP_JMP + OP_JMPF
+//      ExprStmt        -> compile + OP_POP
+//      FnDecl          -> new proto, recursive bc_compile_proto()
+//      Block           -> sequential compile
+//
+//  Deferred to rt#36-C / rt#36-D:
+//    closures (CLOSURE / NEW_CLOSURE_UPVAL), structs (NEW_STRUCT,
+//    LOAD_FIELD w/ IC hint), maps (NEW_MAP), arrays (NEW_ARRAY),
+//    match, enum paths, try/throw, for-in iteration, destructuring,
+//    string interpolation, effect handlers, generics, macros.
+//
+//  Data shape (stage1-safe — avoids known struct-in-array bugs):
+//    AST nodes are passed as `BcNode` structs with scalar fields;
+//    child expressions are referenced via integer `*_idx` indices
+//    into a flat pool (caller builds the pool before emitting).
+//    Bytecode chunks are `int[]` (each entry a 32-bit encoded insn).
+//
+//  Design-only: this file does NOT execute — only emits.
+//  ═══════════════════════════════════════════════════════════
+
+// ── Opcode constants (must match self/bytecode.h HexaOp enum). ──
+// Bytecode v1 stable numbering — never renumber. Additions go at end.
+let BC_OP_LOADK        = 0       // 0x00
+let BC_OP_LOADI        = 1       // 0x01 (sBx=small int literal)
+let BC_OP_LOADF        = 2       // 0x02
+let BC_OP_LOADNIL      = 3       // 0x03
+let BC_OP_LOADTRUE     = 4       // 0x04
+let BC_OP_LOADFALSE    = 5       // 0x05
+let BC_OP_MOVE         = 6       // 0x06
+let BC_OP_DUP          = 7       // 0x07
+let BC_OP_POP          = 8       // 0x08
+let BC_OP_POPN         = 9       // 0x09
+
+let BC_OP_LOAD_LOCAL   = 10      // 0x0A
+let BC_OP_STORE_LOCAL  = 11      // 0x0B
+let BC_OP_LOAD_UPVAL   = 12      // 0x0C
+let BC_OP_STORE_UPVAL  = 13      // 0x0D
+let BC_OP_LOAD_GLOBAL  = 14      // 0x0E
+let BC_OP_STORE_GLOBAL = 15      // 0x0F
+
+let BC_OP_ADD          = 16      // 0x10
+let BC_OP_SUB          = 17      // 0x11
+let BC_OP_MUL          = 18      // 0x12
+let BC_OP_DIV          = 19      // 0x13
+let BC_OP_MOD          = 20      // 0x14
+
+let BC_OP_ADDF         = 21      // 0x15
+let BC_OP_SUBF         = 22      // 0x16
+let BC_OP_MULF         = 23      // 0x17
+let BC_OP_DIVF         = 24      // 0x18
+
+let BC_OP_EQ           = 25      // 0x19
+let BC_OP_NEQ          = 26      // 0x1A
+let BC_OP_LT           = 27      // 0x1B
+let BC_OP_LE           = 28      // 0x1C
+let BC_OP_GT           = 29      // 0x1D
+let BC_OP_GE           = 30      // 0x1E
+
+let BC_OP_AND          = 31      // 0x1F (reserved)
+let BC_OP_OR           = 32      // 0x20 (reserved)
+let BC_OP_NOT          = 33      // 0x21
+
+let BC_OP_JMP          = 34      // 0x22 (sBx relative)
+let BC_OP_JMPF         = 35      // 0x23
+let BC_OP_JMPT         = 36      // 0x24
+let BC_OP_CALL         = 37      // 0x25 (A=nargs, B16=fn_const_idx)
+let BC_OP_TAILCALL     = 38      // 0x26
+let BC_OP_RETURN       = 39      // 0x27
+let BC_OP_RETURN0      = 40      // 0x28
+
+let BC_OP_NEW_ARRAY    = 41      // 0x29
+let BC_OP_ARR_GET      = 42      // 0x2A
+let BC_OP_ARR_SET      = 43      // 0x2B
+let BC_OP_ARR_PUSH     = 44      // 0x2C
+let BC_OP_ARR_LEN      = 45      // 0x2D
+
+let BC_OP_NEW_MAP      = 46      // 0x2E
+let BC_OP_MAP_GET      = 47      // 0x2F
+let BC_OP_MAP_SET      = 48      // 0x30
+
+let BC_OP_NEW_STRUCT   = 49      // 0x31
+let BC_OP_LOAD_FIELD   = 50      // 0x32
+let BC_OP_STORE_FIELD  = 51      // 0x33
+
+let BC_OP_CLOSURE           = 52 // 0x34
+let BC_OP_NEW_CLOSURE_UPVAL = 53 // 0x35
+
+let BC_OP_TRY          = 54      // 0x36
+let BC_OP_THROW        = 55      // 0x37
+let BC_OP_ENDTRY       = 56      // 0x38
+
+let BC_OP_PROFILE_HOOK = 57      // 0x39
+
+let BC_OP_NOP          = 58      // 0x3A
+let BC_OP_HALT         = 59      // 0x3B
+let BC_OP_ASSERT_INT   = 60      // 0x3C
+let BC_OP_ASSERT_FLOAT = 61      // 0x3D
+let BC_OP_PRINT        = 62      // 0x3E
+
+// T56 #2 (rt#36-E) — HOIST_CELL Bx=local_slot.
+// Wraps the outer-scope local slot into a "cell" (a 2-elem array
+// [BC_CELL_TAG, val]) in place so that closures capturing this
+// slot share mutation through the same heap object. Idempotent:
+// if the slot already holds a cell, it is left as-is. Pushes the
+// cell reference onto the operand stack for the subsequent
+// NEW_CLOSURE_UPVAL to bind into the closure's upval table.
+//
+// Stack effect: +1 (pushes the cell ref).
+// Emitted ONLY at lambda-creation in the outer stream, next to
+// CLOSURE / NEW_CLOSURE_UPVAL — one per MUTABLE free var.
+let BC_OP_HOIST_CELL   = 63      // 0x3F
+// T62 — type conversion builtins (pop TOS, push converted value)
+let BC_OP_TO_STRING    = 64      // 0x40
+let BC_OP_TO_INT       = 65      // 0x41
+let BC_OP_TO_FLOAT     = 66      // 0x42
+let BC_OP_TYPE_OF      = 67      // 0x43
+// T63 — println (newline-appending variant). A operand carries
+// the arg count (0..N). OP_PRINT is no-newline; OP_PRINTLN appends \n.
+let BC_OP_PRINTLN      = 68      // 0x44
+
+let BC_OP_COUNT        = 69      // sentinel
+
+// T51 (rt#36-E #1) — CALL-of-closure sentinel. When OP_CALL is
+// emitted with b16 == BC_CALL_INDIRECT, the VM expects the callee
+// to sit on the operand stack BELOW the nargs args and to be a
+// 4-elem array tagged BC_CLOSURE_TAG. Value 65535 is chosen as the
+// b16 sentinel: proto registries with >65534 protos are out of
+// reach for any realistic stage1 program (rt#36-D's largest corpus
+// has ~12 protos), and the encoder field is 16 bits so 65535 is
+// the max representable value — no collision risk.
+let BC_CALL_INDIRECT   = 65535
+
+// ── Encoding helpers. ───────────────────────────────────
+// Stage1 hexa has no native `<<` / `|` on Int, but arithmetic
+// with 256 multipliers gives the same bit-packing result.
+//   raw = op + B*256 + C*65536 + D*16777216
+// The decoder (bytecode.h macros) reads via shift+mask; encoder
+// here reads via multiply+add. Bit-exact for op/B/C/D<256 and
+// unsigned Bx<16777216.
+
+// Encode Layout A: [ op(8) | Bx(24) ]
+fn bc_enc_abx(op, bx) {
+    // op in [0,63]; bx in [0, 2^24 - 1]
+    return op + bx * 256
+}
+
+// Encode Layout A with signed 24-bit operand (for OP_LOADI, jumps).
+// Stage1 hexa lacks two's-complement bit masks, so we treat the
+// 24-bit window as a biased range: values -(2^23) .. 2^23-1 map to
+// raw bits via `sbx & 0xFFFFFF`. Implementation: if sbx<0, add 2^24.
+fn bc_enc_sbx(op, sbx) {
+    let mut bx = sbx
+    if bx < 0 {
+        // 0x1000000 = 16777216
+        bx = bx + 16777216
+    }
+    return op + bx * 256
+}
+
+// Encode Layout C (calls): [ op(8) | A(8) | B16(16) ]
+fn bc_enc_ab16(op, a, b16) {
+    // a in [0,255], b16 in [0,65535]
+    return op + a * 256 + b16 * 65536
+}
+
+// Encode Layout A with two 8-bit sub-operands: [ op | A | B | 0 ]
+fn bc_enc_abc(op, a, b, c) {
+    return op + a * 256 + b * 65536 + c * 16777216
+}
+
+// Decoder helpers (for the test harness / disassembler).
+fn bc_op_of(raw)    { return raw % 256 }
+fn bc_bx_of(raw)    { return (raw / 256) % 16777216 }
+fn bc_a_of(raw)     { return (raw / 256) % 256 }
+fn bc_b16_of(raw)   { return (raw / 65536) % 65536 }
+
+// Signed Bx decoder (for LOADI / JMP / JMPF / JMPT).
+fn bc_sbx_of(raw) {
+    let ux = (raw / 256) % 16777216
+    if ux >= 8388608 {
+        // 0x800000 = 8388608 → negative. Subtract 0x1000000 = 16777216.
+        return ux - 16777216
+    }
+    return ux
+}
+
+// ── BcNode: stage1-safe AST shape. ───────────────────────
+// A flat pool of nodes; children are index references (*_idx).
+// The caller (or a bridge from hexa_full's AST) populates the
+// pool, then passes the root index to bc_compile_root.
+//
+// Fields follow the union of kinds we emit for. Unused fields
+// for a given kind are set to -1 (indices) or "" (strings) or
+// 0 (ints). Keeping all fields at the top level avoids stage1's
+// "struct with nested array field" bug.
+//
+// Stmt and Expr share the same node shape — the `kind` tag
+// disambiguates. This mirrors the AstNode map in hexa_full.hexa
+// and the struct-union approach in compiler.hexa.
+
+struct BcNode {
+    kind: string,       // e.g. "IntLit", "BinOp", "LetStmt", ...
+    int_val: int,       // IntLit: value
+    float_val: float,   // FloatLit: value
+    bool_val: bool,     // BoolLit: value
+    str_val: string,    // StringLit / CharLit: value (escaped form)
+    name: string,       // Ident / LetStmt / AssignStmt / FnDecl / Call-callee
+    op: string,         // BinOp: "+", "-", "*", "/", "%", "==", "!=",
+                        //        "<", "<=", ">", ">=", "&&", "||"
+                        // UnaryOp: "!", "-"
+    left_idx: int,      // BinOp.lhs / UnaryOp.operand / LetStmt.value
+                        // IfExpr.cond / WhileStmt.cond
+                        // ReturnStmt.value (-1 if bare `return`)
+                        // Call.callee index (Ident lookup by name is OK)
+                        // AssignStmt.value (RHS)
+                        // ExprStmt.expr
+                        // FnDecl.body_idx (first stmt in body)
+    right_idx: int,     // BinOp.rhs
+    body_start: int,    // IfExpr.then / WhileStmt.body / FnDecl.body — start index in stmt_list pool
+    body_end: int,      //   exclusive end index
+    else_start: int,    // IfExpr.else / -1 if absent
+    else_end: int,
+    args_start: int,    // Call.args start index in node_list pool
+    args_end: int,
+    n_params: int,      // FnDecl: parameter count
+    params_start: int,  // FnDecl.params start in param_list pool (just names)
+    params_end: int
+}
+
+// Constructor: returns a zero-initialized BcNode.
+// All ints default to -1 for sentinel-safe traversal; strings "".
+fn bc_node_zero() {
+    return BcNode {
+        kind: "",
+        int_val: 0,
+        float_val: 0.0,
+        bool_val: false,
+        str_val: "",
+        name: "",
+        op: "",
+        left_idx: -1,
+        right_idx: -1,
+        body_start: -1,
+        body_end: -1,
+        else_start: -1,
+        else_end: -1,
+        args_start: -1,
+        args_end: -1,
+        n_params: 0,
+        params_start: -1,
+        params_end: -1
+    }
+}
+
+// ── BcProto: compiled function prototype (matches HexaFnProto shape in bytecode.h). ──
+// Emitted by bc_compile_proto. The VM (rt#36-C) will consume this.
+
+struct BcProto {
+    name: string,
+    n_params: int,
+    n_locals: int,    // includes params + temps
+    max_stack: int,   // operand-stack high-water mark
+    code_len: int,    // len(code) — snapshotted for convenience
+    consts_len: int
+    // The actual arrays (code, consts, sub_protos) live in the
+    // module-level pool below — indexed by a side-table. This
+    // avoids storing arrays in struct fields (stage1 bug).
+}
+
+// ── Module-level emit state. ────────────────────────────
+// Matches self/compiler.hexa's `c_*` naming pattern for easy cross-ref.
+// Populated by bc_compile_root → bc_compile_proto → bc_compile_expr.
+// All mutations happen on a single top-level call to bc_compile_root;
+// there are no stage1 "multi-top-level-call" mutation pitfalls.
+
+// Emitted bytecode for the CURRENT proto being compiled.
+let mut bc_code = []
+
+// Constant pool for the CURRENT proto (values are preserved as
+// their source-level string forms; rt#36-C's VM boot converts).
+let mut bc_consts = []
+
+// Local variable table for the CURRENT proto.
+//   bc_local_names[i] = variable name bound to slot i
+// Slot 0..n_params-1 are params; higher slots are let-introduced temps.
+let mut bc_local_names = []
+
+// Scope tracking — for rt#36-C's stack-effect verifier and for
+// lexical scoping of let-bound temps. Mirrors compiler.hexa's
+// c_depth / c_local_depths but simplified: we do not free slots
+// on scope exit (arena-promoted), so depth info is advisory only.
+let mut bc_local_depths = []
+let mut bc_depth = 0
+
+// Operand-stack tracking for max_stack calculation.
+let mut bc_cur_sp = 0
+let mut bc_max_sp = 0
+
+// All compiled sub-protos (for CALL's fn_const_idx resolution).
+// Keyed by source-level fn name. Value is a BcProto header;
+// the bytecode for each proto lives in bc_proto_codes[i] and
+// the consts in bc_proto_consts[i] (parallel arrays).
+let mut bc_protos = []         // BcProto[]
+let mut bc_proto_codes = []    // Array<int[]>  — per-proto bytecode
+let mut bc_proto_consts = []   // Array<string[]> — per-proto consts
+let mut bc_proto_localcounts = []  // per-proto n_locals (for frame size)
+let mut bc_proto_max_stacks = []   // per-proto max_stack
+// Forward-decl name table — populated by bc_compile_root before any
+// proto is compiled, so a recursive Call inside fib's body can resolve
+// "fib" → its eventual bc_protos index even though the proto entry
+// hasn't been pushed yet. Order matches the future bc_protos order.
+let mut bc_pending_proto_names = []
+
+// Saved state stack — for nested FnDecl compilation. When a FnDecl
+// is encountered mid-emit, we push the current (code, consts,
+// locals, sp) onto the save stack, compile the inner proto with
+// fresh state, then pop back. Parallel arrays again for stage1.
+let mut bc_save_code = []
+let mut bc_save_consts = []
+let mut bc_save_localnames = []
+let mut bc_save_localdepths = []
+let mut bc_save_depth = []
+let mut bc_save_cursp = []
+let mut bc_save_maxsp = []
+
+// T51 (rt#36-E #1) — upvalue table for the CURRENT proto being
+// compiled as a Lambda body. When non-empty, the Ident branch in
+// bc_compile_expr checks this list BEFORE falling through to
+// LOAD_GLOBAL: a name hit emits OP_LOAD_UPVAL with the name's
+// const-pool index. Outside a lambda body this is empty and the
+// check is a cheap no-op. Saved/restored parallel with bc_save_code.
+let mut bc_upval_names = []
+let mut bc_save_upvals = []
+
+// ── Hoisted-cell tracking (T56 #2). ─────────────────────────
+// Slots that have been HOIST_CELL'd by a prior lambda in the same
+// scope. When a later lambda captures the same variable as read-only,
+// it must still emit HOIST_CELL (not LOAD_LOCAL) so it binds the
+// shared cell ref instead of snapshotting a raw cell array.
+let mut bc_hoisted_slots = []
+
+// ── Loop context stacks (Phase 1: BreakStmt / ContinueStmt). ───
+// One entry per active enclosing loop. WhileStmt pushes on entry
+// and pops + backpatches on exit. BreakStmt appends its own
+// JMP-pc to the topmost bc_break_pcs[]; ContinueStmt reads the
+// topmost loop_start_pc and emits a backward JMP directly.
+//   bc_loop_start_stack : int[]      — pc to jump to on `continue`
+//   bc_break_pcs        : Array<int[]> — pending break JMP pcs per loop
+let mut bc_loop_start_stack = []
+let mut bc_break_pcs = []
+
+// ── Pool accessors (AST input). ─────────────────────────
+// The caller populates `bc_node_pool` and optional index lists
+// `bc_stmt_list` / `bc_arg_list` / `bc_param_list`, then calls
+// bc_compile_root(root_stmts_start, root_stmts_end).
+//
+// Stage1 pitfall: struct-in-array + return indexing both break,
+// so we expose pools as globals and read them directly rather
+// than passing/returning them.
+
+let mut bc_node_pool = []      // BcNode[]
+let mut bc_stmt_list = []      // int[] (indices into bc_node_pool)
+let mut bc_arg_list = []       // int[] (indices into bc_node_pool)
+let mut bc_param_list = []     // string[] (parameter names)
+
+// Reset all emit state to a clean slate. Call once per compile.
+fn bc_reset() {
+    bc_code = []
+    bc_consts = []
+    bc_local_names = []
+    bc_local_depths = []
+    bc_depth = 0
+    bc_cur_sp = 0
+    bc_max_sp = 0
+    bc_protos = []
+    bc_proto_codes = []
+    bc_proto_consts = []
+    bc_proto_localcounts = []
+    bc_proto_max_stacks = []
+    bc_save_code = []
+    bc_save_consts = []
+    bc_save_localnames = []
+    bc_save_localdepths = []
+    bc_save_depth = []
+    bc_save_cursp = []
+    bc_save_maxsp = []
+    bc_loop_start_stack = []
+    bc_break_pcs = []
+    bc_upval_names = []
+    bc_save_upvals = []
+    bc_hoisted_slots = []
+}
+
+// Hard-reset pools only (caller rebuilds AST each compile).
+fn bc_reset_pools() {
+    bc_node_pool = []
+    bc_stmt_list = []
+    bc_arg_list = []
+    bc_param_list = []
+}
+
+// ── AST builder API (used by test harness + future parser bridge). ──
+// Each returns the node's index in bc_node_pool.
+
+fn bc_mk_int_lit(v) {
+    let n = BcNode {
+        kind: "IntLit", int_val: v, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_float_lit(v) {
+    let n = BcNode {
+        kind: "FloatLit", int_val: 0, float_val: v, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_bool_lit(v) {
+    let n = BcNode {
+        kind: "BoolLit", int_val: 0, float_val: 0.0, bool_val: v,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_string_lit(v) {
+    let n = BcNode {
+        kind: "StringLit", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: v, name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_ident(name) {
+    let n = BcNode {
+        kind: "Ident", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: name, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_binop(op, lhs_idx, rhs_idx) {
+    let n = BcNode {
+        kind: "BinOp", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: op,
+        left_idx: lhs_idx, right_idx: rhs_idx,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_call(fname, args_start, args_end) {
+    let n = BcNode {
+        kind: "Call", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: fname, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: args_start, args_end: args_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_if_expr(cond_idx, then_start, then_end, else_start, else_end) {
+    let n = BcNode {
+        kind: "IfExpr", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: cond_idx, right_idx: -1,
+        body_start: then_start, body_end: then_end,
+        else_start: else_start, else_end: else_end,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T44 Phase 1 — Array / Index / MapLit builders.
+// These reuse the existing args_start/args_end slice of bc_arg_list
+// to hold a contiguous list of child node indices. The AST bridge
+// (ast_to_bc_expr) populates the slice in source order.
+
+// Array literal: [e0, e1, ..., eN-1] — items is a slice in bc_arg_list.
+// `int_val` stashes the item count as a sanity check (emitter reads
+// it straight; VM reads from OP_NEW_ARRAY's B16 operand).
+fn bc_mk_array(items_start, items_end) {
+    let n = BcNode {
+        kind: "ArrayLit",
+        int_val: items_end - items_start,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// Index expression: arr[idx] — left_idx = arr, right_idx = idx.
+fn bc_mk_index(arr_idx, index_idx) {
+    let n = BcNode {
+        kind: "IndexExpr",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: arr_idx, right_idx: index_idx,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T45 — Struct literal: `Name { f1: v1, f2: v2, ... }`. Bridge
+// flattens fields into bc_arg_list as alternating
+// name_literal_node_idx, value_node_idx. args_end - args_start
+// must be even; int_val caches field count. `name` holds the
+// source-level struct type (e.g. "Point"); emitter adds it to
+// the const pool so NEW_STRUCT can resolve by index.
+fn bc_mk_struct_init(struct_name, items_start, items_end) {
+    let field_count = (items_end - items_start) / 2
+    let n = BcNode {
+        kind: "StructInit",
+        int_val: field_count,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: struct_name, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T45 — Field access: `obj.name`. left_idx = obj expr, `name` =
+// source-level field name. Emitter adds the name to the const
+// pool and encodes the index in LOAD_FIELD's Bx operand.
+fn bc_mk_field_access(obj_idx, field_name) {
+    let n = BcNode {
+        kind: "FieldAccess",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: field_name, op: "",
+        left_idx: obj_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T45 — Field assignment stmt: `obj.name = v`. MVP restricts
+// the base to a simple Ident (bridge enforces) so the emitter
+// can round-trip LOAD_LOCAL/GLOBAL → STORE_FIELD → STORE_LOCAL/
+// GLOBAL without re-walking an LHS expression. `name` = base
+// ident, `str_val` = field name, `left_idx` = value expr.
+fn bc_mk_field_assign_stmt(obj_ident, field_name, value_idx) {
+    let n = BcNode {
+        kind: "FieldAssignStmt",
+        int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: field_name, name: obj_ident, op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// Map literal: #{ k0: v0, k1: v1, ... } — the bridge flattens pairs
+// into bc_arg_list as alternating key,value,key,value. args_end -
+// args_start must therefore be even; int_val stores pair count.
+fn bc_mk_map_lit(items_start, items_end) {
+    let pair_count = (items_end - items_start) / 2
+    let n = BcNode {
+        kind: "MapLit",
+        int_val: pair_count,
+        float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: items_start, args_end: items_end,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_let_stmt(name, value_idx) {
+    let n = BcNode {
+        kind: "LetStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: name, op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_assign_stmt(name, value_idx) {
+    let n = BcNode {
+        kind: "AssignStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: name, op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_return_stmt(value_idx) {
+    // value_idx == -1 → bare `return` (compiled to OP_RETURN0)
+    let n = BcNode {
+        kind: "ReturnStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_while_stmt(cond_idx, body_start, body_end) {
+    let n = BcNode {
+        kind: "WhileStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: cond_idx, right_idx: -1,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T61 — ForRangeStmt: `for i in start..end { body }` desugared to
+// counter-based while loop. No array allocation. Fields:
+//   left_idx = start expr, right_idx = end expr, name = loop var,
+//   bool_val = inclusive (..=), body_start/end = body stmts.
+fn bc_mk_for_range_stmt(start_idx, end_idx, var_name, inclusive, body_start, body_end) {
+    let n = BcNode {
+        kind: "ForRangeStmt", int_val: 0, float_val: 0.0, bool_val: inclusive,
+        str_val: "", name: var_name, op: "",
+        left_idx: start_idx, right_idx: end_idx,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T61 — ForArrayStmt: `for item in arr { body }` — general iteration.
+// Evaluates iterable once, loops with counter + ARR_GET. Fields:
+//   left_idx = iterable expr, name = loop var, body_start/end = body.
+fn bc_mk_for_array_stmt(iter_idx, var_name, body_start, body_end) {
+    let n = BcNode {
+        kind: "ForArrayStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: var_name, op: "",
+        left_idx: iter_idx, right_idx: -1,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T48 — IndexAssignStmt: `obj[idx] = v` with obj a simple Ident.
+// Routed through OP_ARR_SET which is polymorphic array/map in the
+// VM (T48 patch). `name` = base ident, `left_idx` = index expr,
+// `right_idx` = value expr.
+fn bc_mk_index_assign_stmt(obj_ident, idx_expr, val_expr) {
+    let n = BcNode {
+        kind: "IndexAssignStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: obj_ident, op: "",
+        left_idx: idx_expr, right_idx: val_expr,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T48 — ArrPushExpr: `obj.push(val)` as an expression (returns new
+// array / map — hexa's value-returning collection semantics). The
+// caller typically binds the result (`a = a.push(v)`); bare form
+// falls through ExprStmt and is discarded via OP_POP. left_idx =
+// obj expr, right_idx = val expr.
+fn bc_mk_arr_push_expr(obj_expr, val_expr) {
+    let n = BcNode {
+        kind: "ArrPushExpr", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: obj_expr, right_idx: val_expr,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T46 — TryCatch: `try { body } catch e { handler }`. body_start/end
+// hold the try body's stmt slice; else_start/end hold the catch
+// handler's stmt slice. `name` is the catch-binding identifier.
+fn bc_mk_try_catch(catch_var, try_start, try_end, catch_start, catch_end) {
+    let n = BcNode {
+        kind: "TryCatch", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: catch_var, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: try_start, body_end: try_end,
+        else_start: catch_start, else_end: catch_end,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T46 — ThrowStmt: `throw expr`. left_idx = value expression.
+fn bc_mk_throw_stmt(value_idx) {
+    let n = BcNode {
+        kind: "ThrowStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: value_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_expr_stmt(expr_idx) {
+    let n = BcNode {
+        kind: "ExprStmt", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: expr_idx, right_idx: -1,
+        body_start: -1, body_end: -1, else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: 0, params_start: -1, params_end: -1
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+fn bc_mk_fn_decl(name, n_params, params_start, params_end, body_start, body_end) {
+    let n = BcNode {
+        kind: "FnDecl", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: name, op: "",
+        left_idx: -1, right_idx: -1,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: n_params, params_start: params_start, params_end: params_end
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// T51 / T54 — Lambda expression BcNode. Mirrors FnDecl layout but
+// anonymous. Two body forms:
+//   expr-body  — left_idx = bc_node_pool idx of the expression; the
+//                value of that expression is the return value (T51).
+//   block-body — body_start/body_end = slice of bc_stmt_list holding
+//                the block statements; the lambda returns void on
+//                fall-through (T54 — to value-return a block, use an
+//                explicit ReturnStmt).
+// Exactly one of (left_idx >= 0) and (body_start >= 0) should hold;
+// bc_mk_lambda leaves the unused pair as -1 per caller's choice.
+//
+//   params_start/end   = slice of bc_param_list holding param names
+//   n_params           = param count
+//
+// The emit-side (bc_compile_expr Lambda branch) walks the body to
+// extract free vars, registers a new proto via bc_compile_lambda_proto,
+// and emits OP_CLOSURE + N×NEW_CLOSURE_UPVAL in the outer stream.
+fn bc_mk_lambda(n_params, params_start, params_end, expr_body_idx, body_start, body_end) {
+    let n = BcNode {
+        kind: "Lambda", int_val: 0, float_val: 0.0, bool_val: false,
+        str_val: "", name: "", op: "",
+        left_idx: expr_body_idx, right_idx: -1,
+        body_start: body_start, body_end: body_end,
+        else_start: -1, else_end: -1,
+        args_start: -1, args_end: -1,
+        n_params: n_params, params_start: params_start, params_end: params_end
+    }
+    bc_node_pool = bc_node_pool.push(n)
+    return len(bc_node_pool) - 1
+}
+
+// ── Low-level emit primitives. ──────────────────────────
+// Each primitive (a) appends a raw u32 to bc_code and (b) updates
+// bc_cur_sp / bc_max_sp per the stack-effect table in §6 of the
+// rt#36-A design doc. The VM verifier (rt#36-D) will re-check
+// these values on load and diff against proto.max_stack.
+
+fn bc_emit_raw(raw) {
+    bc_code = bc_code.push(raw)
+    return len(bc_code) - 1
+}
+
+// Stage1 hexa does not honor `arr[i] = v` in-place assignment —
+// arrays are effectively immutable per-element at the parser
+// level. We rebuild the array to patch a jump target. This is
+// the same pattern used in self/compiler.hexa's c_patch_jump
+// (wrapped in Instruction struct) — here we just swap one u32.
+fn bc_patch_code(pc, new_raw) {
+    let mut out = []
+    let mut i = 0
+    let n = len(bc_code)
+    while i < n {
+        if i == pc {
+            out = out.push(new_raw)
+        } else {
+            out = out.push(bc_code[i])
+        }
+        i = i + 1
+    }
+    bc_code = out
+}
+
+fn bc_push1() {
+    bc_cur_sp = bc_cur_sp + 1
+    if bc_cur_sp > bc_max_sp {
+        bc_max_sp = bc_cur_sp
+    }
+}
+
+fn bc_pop(n) {
+    bc_cur_sp = bc_cur_sp - n
+    if bc_cur_sp < 0 {
+        // Should never happen if the emitter is correct.
+        // Phase D's verifier turns this into a hard error.
+        bc_cur_sp = 0
+    }
+}
+
+// ── Constant-pool insert (dedup). ───────────────────────
+// Constants are kept as their source-level string form — e.g.
+// "42" for an IntLit, "\"hi\"" for a StringLit. rt#36-C's VM
+// boot converts them to HexaV NaN-boxed values. Deduplicating
+// by string form is both safe and what self/compiler.hexa does.
+
+fn bc_add_const(val) {
+    let mut i = 0
+    while i < len(bc_consts) {
+        if bc_consts[i] == val {
+            return i
+        }
+        i = i + 1
+    }
+    bc_consts = bc_consts.push(val)
+    return len(bc_consts) - 1
+}
+
+// ── Local-slot allocator. ───────────────────────────────
+
+fn bc_define_local(name) {
+    let slot = len(bc_local_names)
+    bc_local_names = bc_local_names.push(name)
+    bc_local_depths = bc_local_depths.push(bc_depth)
+    return slot
+}
+
+fn bc_resolve_local(name) {
+    let mut i = len(bc_local_names) - 1
+    while i >= 0 {
+        if bc_local_names[i] == name {
+            return i
+        }
+        i = i - 1
+    }
+    return -1
+}
+
+// T51 — `name in arr` for string[] arrays (upval tables, locals
+// snapshots for free-var analysis). No early-break in stage1 loops
+// so we fall through after the first match via a found-flag trick.
+fn bc_name_in(arr, name) {
+    let mut i = 0
+    let mut hit = false
+    let n = len(arr)
+    while i < n {
+        if arr[i] == name {
+            hit = true
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+    return hit
+}
+
+// ── Proto index lookup (for CALL). ──────────────────────
+
+fn bc_lookup_proto(name) {
+    let mut i = 0
+    while i < len(bc_protos) {
+        let p = bc_protos[i]
+        if p.name == name {
+            return i
+        }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(bc_pending_proto_names) {
+        if bc_pending_proto_names[j] == name {
+            return j
+        }
+        j = j + 1
+    }
+    return -1
+}
+
+// ── Float-expr detection (rt#36-C audit Fix 1). ─────────
+// Conservative recursive check: returns true iff the expression
+// at `idx` statically looks like it produces a float, so the
+// BinOp path can emit ADDF/SUBF/MULF/DIVF instead of the integer
+// variants. Handles:
+//   FloatLit            → float (direct)
+//   BinOp (+,-,*,/)     → float if either operand is float-expr
+// Everything else (IntLit, BoolLit, StringLit, Ident, Call, IfExpr,
+// UnaryOp, unknown) conservatively reports int — we'd rather lose
+// a potential float op than mistakenly promote an integer chain,
+// because the VM's ADDF/etc. call to_float() on both operands and
+// would silently convert "string" → 0.0 style coercion. A real
+// type pass arrives in rt#36-D; this is a literal-anchored
+// minimum that fixes the emitter↔VM gap for obvious float code.
+fn bc_is_float_expr(idx) {
+    if idx < 0 { return false }
+    let n = bc_node_pool[idx]
+    let k = n.kind
+    if k == "FloatLit" { return true }
+    if k == "BinOp" {
+        let op = n.op
+        if op == "+" {
+            if bc_is_float_expr(n.left_idx)  { return true }
+            if bc_is_float_expr(n.right_idx) { return true }
+            return false
+        }
+        if op == "-" {
+            if bc_is_float_expr(n.left_idx)  { return true }
+            if bc_is_float_expr(n.right_idx) { return true }
+            return false
+        }
+        if op == "*" {
+            if bc_is_float_expr(n.left_idx)  { return true }
+            if bc_is_float_expr(n.right_idx) { return true }
+            return false
+        }
+        if op == "/" {
+            if bc_is_float_expr(n.left_idx)  { return true }
+            if bc_is_float_expr(n.right_idx) { return true }
+            return false
+        }
+    }
+    return false
+}
+
+// ── Expression compilation (post-order walk). ───────────
+
+fn bc_compile_expr(idx) {
+    if idx < 0 {
+        // Void — push nil so the stack balances.
+        let _raw = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+        bc_push1()
+        return
+    }
+
+    let node = bc_node_pool[idx]
+    let k = node.kind
+
+    if k == "IntLit" {
+        let v = node.int_val
+        // OP_LOADI sBx: inline if fits in signed 24-bit.
+        // -8388608 .. 8388607
+        if v >= -8388608 {
+            if v <= 8388607 {
+                let _r1 = bc_emit_raw(bc_enc_sbx(BC_OP_LOADI, v))
+                bc_push1()
+                return
+            }
+        }
+        // Fallback: LOADK
+        let cidx = bc_add_const(to_string(v))
+        let _r2 = bc_emit_raw(bc_enc_abx(BC_OP_LOADK, cidx))
+        bc_push1()
+        return
+    }
+
+    if k == "FloatLit" {
+        let cidx = bc_add_const(to_string(node.float_val))
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOADF, cidx))
+        bc_push1()
+        return
+    }
+
+    if k == "BoolLit" {
+        if node.bool_val {
+            let _rt = bc_emit_raw(bc_enc_abx(BC_OP_LOADTRUE, 0))
+        } else {
+            let _rf = bc_emit_raw(bc_enc_abx(BC_OP_LOADFALSE, 0))
+        }
+        bc_push1()
+        return
+    }
+
+    if k == "StringLit" {
+        let cidx = bc_add_const(node.str_val)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOADK, cidx))
+        bc_push1()
+        return
+    }
+
+    if k == "Ident" {
+        let slot = bc_resolve_local(node.name)
+        if slot >= 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, slot))
+        } else if bc_name_in(bc_upval_names, node.name) {
+            // T51 — current proto is a Lambda body; the name is
+            // captured from the enclosing scope. Emit LOAD_UPVAL
+            // with the name interned in THIS proto's const pool —
+            // the VM reads bc_proto_consts[proto_idx] at dispatch.
+            let cidx = bc_add_const(node.name)
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_UPVAL, cidx))
+        } else {
+            // rt#36-A design §7: LOAD_GLOBAL carries 8-bit IC hint
+            // byte (bits 8..15) + 16-bit globals-table index
+            // (bits 16..31). Phase B leaves hint = 0; rt#37 spec-
+            // ializer fills it. The "globals index" is a stand-in:
+            // we add the name to consts and use the const idx as
+            // the initial lookup key. rt#36-C's VM boot replaces
+            // this with a real globals table.
+            let cidx = bc_add_const(node.name)
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, cidx))
+        }
+        bc_push1()
+        return
+    }
+
+    if k == "BinOp" {
+        // Short-circuit && / || are lowered via JMPF/JMPT (§6.6 reserved).
+        // Phase B emits the dumb eager form; Phase D's optimizer lowers.
+        bc_compile_expr(node.left_idx)
+        bc_compile_expr(node.right_idx)
+        let op = node.op
+
+        // rt#36-C audit Fix 1: float-operand lowering. Before this
+        // patch the emitter always emitted the integer ADD/SUB/MUL/DIV
+        // variants even when the operands were FloatLit, which made
+        // the AST→bytecode path produce garbage for float arithmetic
+        // (the test_bc_vm_float.hexa smoke only passed because it
+        // hand-rolls raw BcProto bypassing this emitter). Detect
+        // float operands via bc_is_float_expr (FloatLit or a nested
+        // BinOp whose leaves are float) and redirect arith ops to
+        // the ADDF/SUBF/MULF/DIVF opcodes the VM already dispatches.
+        let is_float = bc_is_float_expr(node.left_idx) || bc_is_float_expr(node.right_idx)
+
+        let mut opc = -1
+        if op == "+"  {
+            if is_float { opc = BC_OP_ADDF } else { opc = BC_OP_ADD }
+        }
+        if op == "-"  {
+            if is_float { opc = BC_OP_SUBF } else { opc = BC_OP_SUB }
+        }
+        if op == "*"  {
+            if is_float { opc = BC_OP_MULF } else { opc = BC_OP_MUL }
+        }
+        if op == "/"  {
+            if is_float { opc = BC_OP_DIVF } else { opc = BC_OP_DIV }
+        }
+        if op == "%"  { opc = BC_OP_MOD }
+        if op == "==" { opc = BC_OP_EQ }
+        if op == "!=" { opc = BC_OP_NEQ }
+        if op == "<"  { opc = BC_OP_LT }
+        if op == "<=" { opc = BC_OP_LE }
+        if op == ">"  { opc = BC_OP_GT }
+        if op == ">=" { opc = BC_OP_GE }
+        if op == "&&" { opc = BC_OP_AND }
+        if op == "||" { opc = BC_OP_OR }
+        if opc < 0 {
+            // Unknown op — emit NOP and leave stack consistent.
+            // bc_cur_sp was already pushed twice; pop one to mimic
+            // a generic binop's (-2,+1) effect.
+            bc_pop(1)
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            return
+        }
+        let _r = bc_emit_raw(bc_enc_abx(opc, 0))
+        bc_pop(1)   // (-2,+1) → net -1 after two pushes above
+        return
+    }
+
+    if k == "UnaryOp" {
+        bc_compile_expr(node.left_idx)
+        let op = node.op
+        if op == "!" {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOT, 0))
+            // (-1,+1) → net 0
+            return
+        }
+        if op == "-" {
+            // Lower `-x` to `0 - x` (no dedicated NEG opcode in v1).
+            // Emit 0 first, swap via two temporaries: the simple
+            // sequence is: push 0; [x already on top] ... We need
+            // 0 BEFORE x. Re-emit: (a) emit 0, (b) re-emit x, (c)
+            // SUB. But we've already emitted x — so the cleanest
+            // fix is to re-compile the operand after emitting zero.
+            // This is cheap because operands are typically trivial
+            // literals or idents; rt#36-D will add OP_NEG if it
+            // shows up in hot code.
+            //
+            // For MVP we roll back the emitted expr:
+            //   -- truncate bc_code back to pre-operand length
+            //   -- emit LOADI 0
+            //   -- re-emit operand
+            //   -- emit SUB
+            // But truncation is expensive in hexa (no array.truncate).
+            // So instead we just leave the existing expr on the
+            // stack, emit 0, and do operand-style swap via DUP+SUB:
+            //   stack: [x]
+            //   emit LOADI 0 -> stack: [x, 0]
+            //   emit SUB     -> stack: [x - 0] (WRONG sign)
+            // The correct trick: emit LOADI 0 before the operand,
+            // but since we already emitted, we do:
+            //   emit LOADI 0    -> [x, 0]
+            //   emit LOADI 0    -> [x, 0, 0]  (placeholder)
+            // ... this gets ugly. Simpler: emit a MUL by -1:
+            //   [x] ; emit LOADI -1 ; emit MUL -> [x * -1]
+            let _l = bc_emit_raw(bc_enc_sbx(BC_OP_LOADI, -1))
+            bc_push1()
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_MUL, 0))
+            bc_pop(1)
+            return
+        }
+        // Unknown unary op — NOP.
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+        return
+    }
+
+    if k == "Call" {
+        let fname = node.name
+
+        // T51 — indirect call detection. A call to a local-bound
+        // closure (e.g. `let add5 = |x| x+c; add5(3)`) or an upval
+        // closure must load the callee onto the stack BELOW the
+        // args, then emit CALL with b16 = BC_CALL_INDIRECT so the
+        // VM pulls proto_idx from the closure value, not the opcode.
+        let is_known_proto = bc_lookup_proto(fname) >= 0
+        let local_slot = bc_resolve_local(fname)
+        let is_local = local_slot >= 0
+        let is_upval = bc_name_in(bc_upval_names, fname)
+        let is_indirect = (is_local || is_upval) && !is_known_proto
+
+        if is_indirect {
+            // Load callee BEFORE args so the operand stack layout
+            // at CALL time is [..., callee, arg0..arg_{n-1}].
+            if is_local {
+                let _cl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, local_slot))
+            } else {
+                let cl_cidx = bc_add_const(fname)
+                let _cl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_UPVAL, cl_cidx))
+            }
+            bc_push1()
+        }
+
+        // Compile args left-to-right.
+        let mut ai = node.args_start
+        let mut nargs = 0
+        if ai >= 0 {
+            while ai < node.args_end {
+                let aidx = bc_arg_list[ai]
+                bc_compile_expr(aidx)
+                ai = ai + 1
+                nargs = nargs + 1
+            }
+        }
+
+        // T63 — print/println with proper newline split and multi-arg.
+        // A operand of OP_PRINT/OP_PRINTLN carries the arg count. VM
+        // pops exactly that many values, concats in push order, prints.
+        if fname == "print" {
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_PRINT, nargs, 0))
+            bc_pop(nargs)
+            let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+            bc_push1()
+            return
+        }
+        if fname == "println" {
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_PRINTLN, nargs, 0))
+            bc_pop(nargs)
+            let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+            bc_push1()
+            return
+        }
+
+        // T44 Phase 1 — `len(x)` is a builtin: lower to OP_ARR_LEN.
+        // Works for arrays (int length) and polymorphic for maps
+        // (len of hexa dict returns pair count natively). Requires
+        // exactly 1 arg; otherwise fall through to the generic CALL
+        // path so downstream error stays loud.
+        if fname == "len" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+
+        // T62 — type conversion builtins: to_string, to_int, to_float, type_of
+        if fname == "to_string" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_STRING, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "to_int" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_INT, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "to_float" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TO_FLOAT, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+        if fname == "type_of" && nargs == 1 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_TYPE_OF, 0))
+            bc_pop(nargs)
+            bc_push1()
+            return
+        }
+
+        // T51 — indirect closure call path. Callee is already on
+        // the stack below the args (pushed before arg compilation).
+        // VM reads proto_idx from the closure value, pops callee +
+        // args, binds closure to the new frame.
+        if is_indirect {
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_CALL, nargs, BC_CALL_INDIRECT))
+            bc_pop(nargs)    // args consumed by CALL
+            bc_pop(1)        // callee consumed by CALL
+            bc_push1()       // return value pushed by callee's RETURN
+            return
+        }
+
+        // User function — look up by name in bc_protos.
+        let pidx = bc_lookup_proto(fname)
+        if pidx >= 0 {
+            // Use pidx as the fn_const_idx. rt#36-C's VM boots
+            // with consts[i] = proto_ptr_for_name(...) when i
+            // matches the proto registry order.
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_CALL, nargs, pidx))
+        } else {
+            // Forward ref / unknown — emit CALL with placeholder
+            // index = name-const-idx. rt#36-D's linker resolves.
+            let cidx = bc_add_const(fname)
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_CALL, nargs, cidx))
+        }
+        bc_pop(nargs)
+        bc_push1()
+        return
+    }
+
+    // T51 (rt#36-E #1) — Lambda expression emit.
+    //   Lambda AST shape (ast_to_bc_expr Lambda branch below):
+    //     params_start/params_end → bc_param_list slice (param names)
+    //     left_idx                → bc_node_pool idx for single-expr body
+    //                                (block body deferred to T52)
+    //     n_params                → len of params slice
+    //
+    //   Emit sequence:
+    //     1. Walk body to collect free vars (Ident refs not in params
+    //        and not LetStmt-bound in body).
+    //     2. Compile body as a new proto with bc_upval_names = free_vars
+    //        so the Ident branch routes captures to OP_LOAD_UPVAL.
+    //        Register the proto; remember its proto_idx.
+    //     3. In outer context: emit OP_CLOSURE proto_idx, then for each
+    //        free var emit (load-outer-value + NEW_CLOSURE_UPVAL name).
+    //
+    //   Stack effect: +1 (the built closure value).
+    if k == "Lambda" {
+        // T54 — two body forms. Either left_idx (expr-body) or
+        // body_start/body_end (block-body) is set, not both. See
+        // bc_mk_lambda doc.
+
+        // Step 1 — scan free vars. "locals" at lambda entry = params.
+        let mut params_seen = []
+        let mut _ip = node.params_start
+        if _ip >= 0 {
+            while _ip < node.params_end {
+                params_seen = params_seen.push(bc_param_list[_ip])
+                _ip = _ip + 1
+            }
+        }
+        let mut free_vars = []
+        if node.left_idx >= 0 {
+            free_vars = bc_collect_free_vars_expr(node.left_idx, params_seen, [])
+        } else if node.body_start >= 0 {
+            free_vars = bc_collect_free_vars_stmts(node.body_start, node.body_end, params_seen, [])
+        }
+
+        // Step 2 — compile body as new proto; save/restore outer state.
+        let new_pidx = bc_compile_lambda_proto(node, free_vars)
+
+        // Step 3 — outer-side emit: CLOSURE pidx + NEW_CLOSURE_UPVAL
+        // per free var. Each NEW_CLOSURE_UPVAL has net -1 stack effect
+        // (pops val + closure, pushes new closure).
+        //
+        // T56 #2 (rt#36-E) — for MUTABLE free vars (any name the
+        // lambda body AssignStmt-writes), emit HOIST_CELL instead of
+        // LOAD_LOCAL. HOIST_CELL wraps the outer slot into a cell and
+        // pushes the cell ref — the NEW_CLOSURE_UPVAL below then binds
+        // THAT cell ref in the closure's upval table, so the inner
+        // STORE_UPVAL / LOAD_UPVAL handlers (cell-aware) and the outer
+        // LOAD_LOCAL / STORE_LOCAL (also cell-aware) all share state
+        // through the same heap object. Immutable upvalues keep the
+        // by-value LOAD_LOCAL snapshot path from T51.
+        let _cl = bc_emit_raw(bc_enc_abx(BC_OP_CLOSURE, new_pidx))
+        bc_push1()
+        let mut fvi = 0
+        while fvi < len(free_vars) {
+            let fvn = free_vars[fvi]
+            let is_mut = bc_lambda_body_mutates(node, fvn)
+            // Resolve the free var in the OUTER emit context.
+            let o_slot = bc_resolve_local(fvn)
+            if o_slot >= 0 {
+                // T56 #2: use HOIST_CELL if this lambda mutates the
+                // var OR if a prior lambda already hoisted this slot
+                // (so read-only closures bind the shared cell ref).
+                let slot_already_hoisted = bc_name_in(bc_hoisted_slots, fvn)
+                if is_mut || slot_already_hoisted {
+                    let _hc = bc_emit_raw(bc_enc_abx(BC_OP_HOIST_CELL, o_slot))
+                    bc_push1()
+                    if !slot_already_hoisted {
+                        bc_hoisted_slots = bc_hoisted_slots.push(fvn)
+                    }
+                } else {
+                    let _ol = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, o_slot))
+                    bc_push1()
+                }
+            } else if bc_name_in(bc_upval_names, fvn) {
+                // Outer is itself a lambda — passthrough via its upval.
+                // (T56: hoist via enclosing upval chain is T57-OOS; we
+                // still emit LOAD_UPVAL which the VM auto-derefs cells,
+                // so immutable-in-nested-closure still works.)
+                let o_cidx = bc_add_const(fvn)
+                let _ou = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_UPVAL, o_cidx))
+                bc_push1()
+            } else {
+                // Global fallback. Legitimate for top-level bindings
+                // that haven't landed in a local slot (e.g. FnDecl).
+                let o_cidx = bc_add_const(fvn)
+                let _og = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, o_cidx))
+                bc_push1()
+            }
+            // NEW_CLOSURE_UPVAL reads the name via bc_proto_consts[
+            // CURRENT_PROTO][b16]. We intern it in the outer pool.
+            let uv_cidx = bc_add_const(fvn)
+            let _nu = bc_emit_raw(bc_enc_abx(BC_OP_NEW_CLOSURE_UPVAL, uv_cidx))
+            bc_pop(1)  // -2 (val+closure) +1 (new closure) = -1 net
+            fvi = fvi + 1
+        }
+        return
+    }
+
+    if k == "IfExpr" {
+        // Layout:
+        //   [cond bytecode]
+        //   JMPF  ->else_lbl
+        //   [then bytecode (expr form: leaves 1 value)]
+        //   JMP   ->end_lbl
+        // else_lbl:
+        //   [else bytecode]
+        // end_lbl:
+        //
+        // T63 — body compilation uses bc_compile_block_as_expr which
+        // inlines the last ExprStmt (no POP), so expr-form bodies
+        // leave their final value on the stack as intended.
+        bc_compile_expr(node.left_idx)          // cond
+        let jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))  // patched
+        bc_pop(1)                               // JMPF consumes cond
+
+        // Snapshot stack height before then-branch.
+        let sp_before = bc_cur_sp
+
+        bc_compile_block_as_expr(node.body_start, node.body_end)
+
+        let jmp_pc = len(bc_code)
+        let has_else = node.else_start >= 0
+        if has_else {
+            let _je = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))  // patched
+        }
+
+        // Patch JMPF to point here (start of else).
+        let else_pc = len(bc_code)
+        let delta_f = else_pc - (jmpf_pc + 1)
+        bc_patch_code(jmpf_pc, bc_enc_sbx(BC_OP_JMPF, delta_f))
+
+        if has_else {
+            // Reset sp to pre-then for a parallel-branch model —
+            // the verifier (rt#36-D) will check both arms leave
+            // the same residual count.
+            bc_cur_sp = sp_before
+            bc_compile_block_as_expr(node.else_start, node.else_end)
+
+            // Patch JMP.
+            let end_pc = len(bc_code)
+            let delta_j = end_pc - (jmp_pc + 1)
+            bc_patch_code(jmp_pc, bc_enc_sbx(BC_OP_JMP, delta_j))
+        }
+        return
+    }
+
+    // T63 — MatchExpr compile. Lowers to:
+    //   [scrutinee] STORE_LOCAL $m
+    //   for each arm (except wildcard/ident pat):
+    //     LOAD_LOCAL $m ; [pattern] ; EQ ; JMPF -> after_arm
+    //     [arm body: last ExprStmt inlined (no POP)]
+    //     JMP -> end
+    //   end:
+    // Literal patterns (IntLit/StringLit/BoolLit/FloatLit) use EQ.
+    // Wildcard (`Ident` name == "_") or bare Ident matches
+    // unconditionally. Guards + or-patterns deferred.
+    if k == "MatchExpr" {
+        bc_compile_expr(node.left_idx)
+        let me_slot = bc_define_local("$match_" + to_string(len(bc_code)))
+        let _rst = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, me_slot))
+        bc_pop(1)
+
+        let mut me_end_jmps = []
+        let sp_pre_match = bc_cur_sp
+        let mut me_ai = node.args_start
+        while me_ai < node.args_end {
+            let me_arm_idx = bc_arg_list[me_ai]
+            let me_arm = bc_node_pool[me_arm_idx]
+            let me_pat_idx = me_arm.left_idx
+            let mut is_wild = false
+            if me_pat_idx >= 0 {
+                let me_pat = bc_node_pool[me_pat_idx]
+                if me_pat.kind == "Wildcard" { is_wild = true }
+                if me_pat.kind == "Ident" && me_pat.name == "_" { is_wild = true }
+            } else {
+                is_wild = true
+            }
+
+            let mut me_jmpf_pc = -1
+            if !is_wild {
+                let _rll = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, me_slot))
+                bc_push1()
+                bc_compile_expr(me_pat_idx)
+                let _req = bc_emit_raw(bc_enc_abx(BC_OP_EQ, 0))
+                bc_pop(2)
+                bc_push1()
+                me_jmpf_pc = len(bc_code)
+                let _rjf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+                bc_pop(1)
+            }
+
+            // Compile arm body — inline last ExprStmt (no POP) so value
+            // stays on stack. Matches T59's block-body lambda pattern.
+            let me_bs = me_arm.body_start
+            let me_be = me_arm.body_end
+            let me_sp_pre_body = bc_cur_sp
+            let mut me_pushed_value = false
+            if me_bs >= 0 && me_be > me_bs {
+                let me_last_bi = me_be - 1
+                let mut me_bi = me_bs
+                while me_bi < me_be {
+                    let me_sidx = bc_stmt_list[me_bi]
+                    if me_sidx >= 0 {
+                        if me_bi == me_last_bi {
+                            let me_last = bc_node_pool[me_sidx]
+                            if me_last.kind == "ExprStmt" {
+                                bc_compile_expr(me_last.left_idx)
+                                me_pushed_value = true
+                            } else {
+                                bc_compile_stmt(me_sidx)
+                            }
+                        } else {
+                            bc_compile_stmt(me_sidx)
+                        }
+                    }
+                    me_bi = me_bi + 1
+                }
+            }
+            if !me_pushed_value {
+                let _rnv = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                bc_push1()
+            }
+
+            // JMP to end
+            let me_jmp_pc = len(bc_code)
+            let _rje = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))
+            me_end_jmps = me_end_jmps.push(me_jmp_pc)
+
+            // Patch JMPF to after arm
+            if me_jmpf_pc >= 0 {
+                let after_pc = len(bc_code)
+                let delta_af = after_pc - (me_jmpf_pc + 1)
+                bc_patch_code(me_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, delta_af))
+            }
+
+            // Reset sp to pre-match for parallel-branch model
+            bc_cur_sp = sp_pre_match
+            me_ai = me_ai + 1
+        }
+
+        // Fallthrough (no arm matched): push nil
+        let _rnm = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+
+        // Patch end jumps
+        let me_end_pc = len(bc_code)
+        let mut me_ej = 0
+        while me_ej < len(me_end_jmps) {
+            let mj = me_end_jmps[me_ej]
+            let me_de = me_end_pc - (mj + 1)
+            bc_patch_code(mj, bc_enc_sbx(BC_OP_JMP, me_de))
+            me_ej = me_ej + 1
+        }
+        bc_push1()
+        return
+    }
+
+    // T44 Phase 1 — ArrayLit: push each item left-to-right, then
+    // emit OP_NEW_ARRAY with B16 = item count. The VM pops exactly
+    // that many values (source order restored) and builds the array.
+    if k == "ArrayLit" {
+        let mut ai = node.args_start
+        let mut nitems = 0
+        if ai >= 0 {
+            while ai < node.args_end {
+                let iidx = bc_arg_list[ai]
+                bc_compile_expr(iidx)
+                ai = ai + 1
+                nitems = nitems + 1
+            }
+        }
+        // NEW_ARRAY uses Layout C (op | A | B16). We only need B16
+        // for the count — put it there so the VM can decode with
+        // bc_b16_of(raw). A is left 0 (reserved / spec-compatible).
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_ARRAY, 0, nitems))
+        bc_pop(nitems)
+        bc_push1()
+        return
+    }
+
+    // T44 Phase 1 — IndexExpr: `arr[idx]` lowers to push arr, push
+    // idx, OP_ARR_GET. Stack effect (-2, +1). Works for both arrays
+    // (int idx) and maps (any idx) because the VM dispatches to
+    // hexa's native `x[k]` which is polymorphic across array/dict.
+    if k == "IndexExpr" {
+        bc_compile_expr(node.left_idx)   // array / map
+        bc_compile_expr(node.right_idx)  // index / key
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+        bc_pop(1)  // (-2,+1) net -1 after the two pushes above
+        return
+    }
+
+    // T44 Phase 1 — MapLit: pair list is flattened into bc_arg_list
+    // as alternating key,value,key,value,... Push each in source
+    // order, emit OP_NEW_MAP with B16 = pair count.
+    if k == "MapLit" {
+        let mut mi = node.args_start
+        let mut npairs = 0
+        if mi >= 0 {
+            while mi < node.args_end {
+                // key
+                let kidx = bc_arg_list[mi]
+                bc_compile_expr(kidx)
+                mi = mi + 1
+                // value (slice length was validated to be even by
+                // bc_mk_map_lit; if mi == args_end here something is
+                // wrong — emit LOADNIL to keep the stack balanced).
+                if mi < node.args_end {
+                    let vidx = bc_arg_list[mi]
+                    bc_compile_expr(vidx)
+                    mi = mi + 1
+                } else {
+                    let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                    bc_push1()
+                }
+                npairs = npairs + 1
+            }
+        }
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_MAP, 0, npairs))
+        // -2N pops (each pair), +1 push for the map.
+        bc_pop(npairs * 2)
+        bc_push1()
+        return
+    }
+
+    // T45 — StructInit: `Name { f1: v1, ... }`. Same flatten-pairs
+    // strategy as MapLit but each pair is (field_name_literal, val).
+    // Bridge pushes StringLit BcNodes for names so compile_expr
+    // naturally lowers them to LOADK; the VM's NEW_STRUCT then pops
+    // 2N values expecting strings-on-odd, vals-on-even slots.
+    if k == "StructInit" {
+        let mut si = node.args_start
+        let mut sfields = 0
+        if si >= 0 {
+            while si < node.args_end {
+                let snk = bc_arg_list[si]
+                bc_compile_expr(snk)   // field name (StringLit → LOADK)
+                si = si + 1
+                if si < node.args_end {
+                    let svk = bc_arg_list[si]
+                    bc_compile_expr(svk)   // field value
+                    si = si + 1
+                } else {
+                    let _rns = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+                    bc_push1()
+                }
+                sfields = sfields + 1
+            }
+        }
+        let sname_cidx = bc_add_const(node.name)
+        let _r = bc_emit_raw(bc_enc_ab16(BC_OP_NEW_STRUCT, sfields, sname_cidx))
+        bc_pop(sfields * 2)
+        bc_push1()
+        return
+    }
+
+    // T45 — FieldAccess: `obj.field`. Compile obj (push), then
+    // OP_LOAD_FIELD with field name const idx in Bx.
+    if k == "FieldAccess" {
+        bc_compile_expr(node.left_idx)   // obj
+        let facc_cidx = bc_add_const(node.name)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_FIELD, facc_cidx))
+        // (-1, +1) net 0
+        return
+    }
+
+    // T48 — ArrPushExpr: `obj.push(val)` lowered by the bridge. Emits
+    // obj + val + OP_ARR_PUSH, leaving the new collection on TOS for
+    // the caller to bind (AssignStmt) or discard (ExprStmt → POP).
+    if k == "ArrPushExpr" {
+        bc_compile_expr(node.left_idx)    // obj
+        bc_compile_expr(node.right_idx)   // val
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_ARR_PUSH, 0))
+        // (-2, +1) net -1
+        bc_pop(1)
+        return
+    }
+
+    // Fallback — unknown kind. Emit nil so the stack stays valid.
+    let _r = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+    bc_push1()
+}
+
+// ── Statement compilation. ──────────────────────────────
+
+fn bc_compile_stmt(idx) {
+    if idx < 0 { return }
+    let node = bc_node_pool[idx]
+    let k = node.kind
+
+    if k == "LetStmt" {
+        bc_compile_expr(node.left_idx)
+        let slot = bc_define_local(node.name)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, slot))
+        bc_pop(1)
+        return
+    }
+
+    if k == "AssignStmt" {
+        bc_compile_expr(node.left_idx)   // RHS
+        let slot = bc_resolve_local(node.name)
+        if slot >= 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, slot))
+        } else if bc_name_in(bc_upval_names, node.name) {
+            // T52 (rt#36-E #1) — current proto is a Lambda body; the
+            // name is captured from the enclosing scope. Emit
+            // STORE_UPVAL with the name interned in THIS proto's const
+            // pool. Mirror of the LOAD_UPVAL Ident branch above
+            // (bc_compile_expr k=="Ident"): the VM resolves by name
+            // through the active frame's closure at dispatch time
+            // (bc_proto_consts[proto_idx][cidx] -> upval name ->
+            //  closure.upval_names index). Free-var analysis
+            // (bc_collect_free_vars_stmts) already admits AssignStmt
+            // LHS names into bc_upval_names for the lambda body.
+            let cidx = bc_add_const(node.name)
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_STORE_UPVAL, cidx))
+        } else {
+            let cidx = bc_add_const(node.name)
+            let _r = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, cidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    // T48 — IndexAssignStmt: `obj[idx] = v` with obj a simple Ident.
+    // Polymorphic over array/map: VM's OP_ARR_SET auto-detects
+    // BC_MAP_TAG shape and routes to map-semantics.
+    // Sequence: LOAD obj → compile idx → compile v → ARR_SET → STORE obj.
+    if k == "IndexAssignStmt" {
+        let ia_name = node.name
+        let ia_idx_e = node.left_idx
+        let ia_val_e = node.right_idx
+
+        // LOAD obj onto stack.
+        let ia_slot = bc_resolve_local(ia_name)
+        if ia_slot >= 0 {
+            let _rl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, ia_slot))
+        } else {
+            let ia_lcidx = bc_add_const(ia_name)
+            let _rl = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, ia_lcidx))
+        }
+        bc_push1()
+
+        // Compile idx + val onto stack.
+        bc_compile_expr(ia_idx_e)
+        bc_compile_expr(ia_val_e)
+
+        // ARR_SET — pops val, idx, arr; pushes new array/map. Net (-3, +1).
+        let _rs = bc_emit_raw(bc_enc_abx(BC_OP_ARR_SET, 0))
+        bc_pop(2)
+
+        // STORE updated collection back to obj binding.
+        if ia_slot >= 0 {
+            let _rw = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, ia_slot))
+        } else {
+            let ia_scidx = bc_add_const(ia_name)
+            let _rw = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, ia_scidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    // T45 — FieldAssignStmt: `obj.field = v` with obj a simple Ident.
+    // Sequence: LOAD obj → compile v → STORE_FIELD(field_cidx) → STORE obj.
+    // Bridge guarantees base is an Ident; more complex bases (chained
+    // field assign, index-then-field) fall through to generic ExprStmt.
+    if k == "FieldAssignStmt" {
+        let obj_name = node.name
+        let field_name = node.str_val
+        let val_idx = node.left_idx
+
+        // Load current obj onto stack.
+        let fs_slot = bc_resolve_local(obj_name)
+        if fs_slot >= 0 {
+            let _rl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fs_slot))
+        } else {
+            let fs_lcidx = bc_add_const(obj_name)
+            let _rl = bc_emit_raw(bc_enc_ab16(BC_OP_LOAD_GLOBAL, 0, fs_lcidx))
+        }
+        bc_push1()
+
+        // Push new value.
+        bc_compile_expr(val_idx)
+
+        // Patch field (-2, +1).
+        let fs_fcidx = bc_add_const(field_name)
+        let _rs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_FIELD, fs_fcidx))
+        bc_pop(1)
+
+        // Store rebuilt struct back into obj binding.
+        if fs_slot >= 0 {
+            let _rw = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fs_slot))
+        } else {
+            let fs_scidx = bc_add_const(obj_name)
+            let _rw = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, fs_scidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    if k == "ReturnStmt" {
+        if node.left_idx >= 0 {
+            bc_compile_expr(node.left_idx)
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+            bc_pop(1)
+        } else {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+        }
+        return
+    }
+
+    if k == "WhileStmt" {
+        // Layout:
+        // loop_start:
+        //   [cond]
+        //   JMPF ->loop_end
+        //   [body]
+        //   JMP ->loop_start
+        // loop_end:
+        let loop_start_pc = len(bc_code)
+
+        // Phase 1: push loop context so nested BreakStmt /
+        // ContinueStmt know which loop they target. Per-loop
+        // break-pc list starts empty; entries are appended by
+        // BreakStmt and backpatched after loop_end_pc is known.
+        bc_loop_start_stack = bc_loop_start_stack.push(loop_start_pc)
+        bc_break_pcs        = bc_break_pcs.push([])
+
+        bc_compile_expr(node.left_idx)    // cond
+
+        let jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // JMP back to loop_start.
+        let jmp_pc = len(bc_code)
+        let back_delta = loop_start_pc - (jmp_pc + 1)  // negative
+        let _jb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, back_delta))
+
+        // Patch JMPF to here (after the back-jump).
+        let loop_end_pc = len(bc_code)
+        let fwd_delta = loop_end_pc - (jmpf_pc + 1)
+        bc_patch_code(jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fwd_delta))
+
+        // Phase 1: backpatch every BreakStmt's JMP placeholder
+        // to point at loop_end_pc, then pop loop context.
+        let _btop = len(bc_break_pcs) - 1
+        let _bpcs = bc_break_pcs[_btop]
+        let mut _bi = 0
+        while _bi < len(_bpcs) {
+            let _bpc = _bpcs[_bi]
+            let _bdelta = loop_end_pc - (_bpc + 1)
+            bc_patch_code(_bpc, bc_enc_sbx(BC_OP_JMP, _bdelta))
+            _bi = _bi + 1
+        }
+        bc_break_pcs        = bc_shrink(bc_break_pcs, _btop)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    // T61 — ForRangeStmt: `for i in start..end { body }`
+    // Desugared to counter-based while loop at compile time:
+    //   [eval start] STORE_LOCAL $i
+    //   [eval end]   STORE_LOCAL $__end
+    // loop_start:
+    //   LOAD_LOCAL $i ; LOAD_LOCAL $__end ; LT/LE ; JMPF -> loop_end
+    //   [body]
+    //   LOAD_LOCAL $i ; LOADI 1 ; ADD ; STORE_LOCAL $i
+    //   JMP -> loop_start
+    // loop_end:
+    if k == "ForRangeStmt" {
+        // Allocate locals for loop var and end bound
+        let fr_var_slot = bc_define_local(node.name)
+        let fr_end_name = "__for_end_" + node.name
+        let fr_end_slot = bc_define_local(fr_end_name)
+
+        // Emit start → store to loop var
+        bc_compile_expr(node.left_idx)
+        let _fs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_var_slot))
+        bc_pop(1)
+
+        // Emit end → store to end bound
+        bc_compile_expr(node.right_idx)
+        let _fe = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_end_slot))
+        bc_pop(1)
+
+        // Loop start
+        let fr_loop_start = len(bc_code)
+        bc_loop_start_stack = bc_loop_start_stack.push(fr_loop_start)
+        bc_break_pcs = bc_break_pcs.push([])
+
+        // Condition: i < end (or i <= end for inclusive)
+        let _li = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_var_slot))
+        bc_push1()
+        let _le = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_end_slot))
+        bc_push1()
+        let cmp_op = if node.bool_val { BC_OP_LE } else { BC_OP_LT }
+        let _cmp = bc_emit_raw(bc_enc_abx(cmp_op, 0))
+        bc_pop(1)  // 2 popped, 1 pushed → net -1
+
+        let fr_jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+
+        // Body
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // Increment: i = i + 1
+        let _il = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fr_var_slot))
+        bc_push1()
+        let _one = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 1))
+        bc_push1()
+        let _add = bc_emit_raw(bc_enc_abx(BC_OP_ADD, 0))
+        bc_pop(1)
+        let _is = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fr_var_slot))
+        bc_pop(1)
+
+        // JMP back to loop_start
+        let fr_jmp_pc = len(bc_code)
+        let fr_back = fr_loop_start - (fr_jmp_pc + 1)
+        let _jb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, fr_back))
+
+        // Patch JMPF
+        let fr_end_pc = len(bc_code)
+        let fr_fwd = fr_end_pc - (fr_jmpf_pc + 1)
+        bc_patch_code(fr_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fr_fwd))
+
+        // Backpatch breaks
+        let _btop = len(bc_break_pcs) - 1
+        let _bpcs = bc_break_pcs[_btop]
+        let mut _bi = 0
+        while _bi < len(_bpcs) {
+            let _bpc = _bpcs[_bi]
+            let _bdelta = fr_end_pc - (_bpc + 1)
+            bc_patch_code(_bpc, bc_enc_sbx(BC_OP_JMP, _bdelta))
+            _bi = _bi + 1
+        }
+        bc_break_pcs = bc_shrink(bc_break_pcs, _btop)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    // T61 — ForArrayStmt: `for item in arr { body }`
+    // General array iteration — eval once, loop with counter + ARR_GET.
+    if k == "ForArrayStmt" {
+        // Allocate hidden locals: __arr, __len, __i, and user loop var
+        let fa_arr_name = "__for_arr_" + node.name
+        let fa_len_name = "__for_len_" + node.name
+        let fa_idx_name = "__for_idx_" + node.name
+        let fa_arr_slot = bc_define_local(fa_arr_name)
+        let fa_len_slot = bc_define_local(fa_len_name)
+        let fa_idx_slot = bc_define_local(fa_idx_name)
+        let fa_var_slot = bc_define_local(node.name)
+
+        // Eval iterable → store
+        bc_compile_expr(node.left_idx)
+        let _as = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_arr_slot))
+        bc_pop(1)
+
+        // ARR_LEN → store
+        let _al = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_arr_slot))
+        bc_push1()
+        let _alen = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+        // ARR_LEN: pop arr, push len → net 0 (already on stack)
+        let _ls = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_len_slot))
+        bc_pop(1)
+
+        // __i = 0
+        let _iz = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 0))
+        bc_push1()
+        let _is = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_idx_slot))
+        bc_pop(1)
+
+        // Loop start
+        let fa_loop_start = len(bc_code)
+        bc_loop_start_stack = bc_loop_start_stack.push(fa_loop_start)
+        bc_break_pcs = bc_break_pcs.push([])
+
+        // Condition: __i < __len
+        let _il = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _ll = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_len_slot))
+        bc_push1()
+        let _lt = bc_emit_raw(bc_enc_abx(BC_OP_LT, 0))
+        bc_pop(1)
+
+        let fa_jmpf_pc = len(bc_code)
+        let _jf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+
+        // item = arr[__i]
+        let _arl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_arr_slot))
+        bc_push1()
+        let _idl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _ag = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+        bc_pop(1)  // pop arr+idx, push val → net -1
+        let _vs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_var_slot))
+        bc_pop(1)
+
+        // Body
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // __i = __i + 1
+        let _i2l = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fa_idx_slot))
+        bc_push1()
+        let _one = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 1))
+        bc_push1()
+        let _add = bc_emit_raw(bc_enc_abx(BC_OP_ADD, 0))
+        bc_pop(1)
+        let _i2s = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fa_idx_slot))
+        bc_pop(1)
+
+        // JMP back
+        let fa_jmp_pc = len(bc_code)
+        let fa_back = fa_loop_start - (fa_jmp_pc + 1)
+        let _jb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, fa_back))
+
+        // Patch JMPF
+        let fa_end_pc = len(bc_code)
+        let fa_fwd = fa_end_pc - (fa_jmpf_pc + 1)
+        bc_patch_code(fa_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fa_fwd))
+
+        // Backpatch breaks
+        let _btop2 = len(bc_break_pcs) - 1
+        let _bpcs2 = bc_break_pcs[_btop2]
+        let mut _bi2 = 0
+        while _bi2 < len(_bpcs2) {
+            let _bpc2 = _bpcs2[_bi2]
+            let _bdelta2 = fa_end_pc - (_bpc2 + 1)
+            bc_patch_code(_bpc2, bc_enc_sbx(BC_OP_JMP, _bdelta2))
+            _bi2 = _bi2 + 1
+        }
+        bc_break_pcs = bc_shrink(bc_break_pcs, _btop2)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    // G43 — ForDestructStmt: `for (a, b) in pairs { body }`
+    // Compiled like ForArrayStmt but with element destructuring per iteration.
+    if k == "ForDestructStmt" {
+        let fd_num = node.n_params
+        // Allocate hidden locals for iteration
+        let fd_arr_name = "__for_destruct_arr"
+        let fd_len_name = "__for_destruct_len"
+        let fd_idx_name = "__for_destruct_idx"
+        let fd_elem_name = "__for_destruct_elem"
+        let fd_arr_slot = bc_define_local(fd_arr_name)
+        let fd_len_slot = bc_define_local(fd_len_name)
+        let fd_idx_slot = bc_define_local(fd_idx_name)
+        let fd_elem_slot = bc_define_local(fd_elem_name)
+        // Allocate slots for each destructured variable
+        let mut fd_var_slots = []
+        let mut _fdi = 0
+        while _fdi < fd_num {
+            let dname = bc_param_list[node.params_start + _fdi]
+            fd_var_slots = fd_var_slots.push(bc_define_local(dname))
+            _fdi = _fdi + 1
+        }
+        // Eval iterable -> store
+        bc_compile_expr(node.left_idx)
+        let _fds = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_arr_slot))
+        bc_pop(1)
+        // ARR_LEN -> store
+        let _fdal = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_arr_slot))
+        bc_push1()
+        let _fdalen = bc_emit_raw(bc_enc_abx(BC_OP_ARR_LEN, 0))
+        let _fdls = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_len_slot))
+        bc_pop(1)
+        // __idx = 0
+        let _fdiz = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 0))
+        bc_push1()
+        let _fdis = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_idx_slot))
+        bc_pop(1)
+        // Loop start
+        let fd_loop_start = len(bc_code)
+        bc_loop_start_stack = bc_loop_start_stack.push(fd_loop_start)
+        bc_break_pcs = bc_break_pcs.push([])
+        // Condition: __idx < __len
+        let _fdil = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_idx_slot))
+        bc_push1()
+        let _fdll = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_len_slot))
+        bc_push1()
+        let _fdlt = bc_emit_raw(bc_enc_abx(BC_OP_LT, 0))
+        bc_pop(1)
+        let fd_jmpf_pc = len(bc_code)
+        let _fdjf = bc_emit_raw(bc_enc_sbx(BC_OP_JMPF, 0))
+        bc_pop(1)
+        // elem = arr[__idx]
+        let _fdael = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_arr_slot))
+        bc_push1()
+        let _fdidl = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_idx_slot))
+        bc_push1()
+        let _fdag = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+        bc_pop(1)
+        let _fdes = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_elem_slot))
+        bc_pop(1)
+        // Destructure: var_i = elem[i]
+        let mut _fdvi = 0
+        while _fdvi < fd_num {
+            let _fdvel = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_elem_slot))
+            bc_push1()
+            let _fdvidx = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, _fdvi))
+            bc_push1()
+            let _fdvag = bc_emit_raw(bc_enc_abx(BC_OP_ARR_GET, 0))
+            bc_pop(1)
+            let _fdvs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_var_slots[_fdvi]))
+            bc_pop(1)
+            _fdvi = _fdvi + 1
+        }
+        // Body
+        bc_compile_stmts(node.body_start, node.body_end)
+        // __idx = __idx + 1
+        let _fdi2l = bc_emit_raw(bc_enc_abx(BC_OP_LOAD_LOCAL, fd_idx_slot))
+        bc_push1()
+        let _fdone = bc_emit_raw(bc_enc_abx(BC_OP_LOADI, 1))
+        bc_push1()
+        let _fdadd = bc_emit_raw(bc_enc_abx(BC_OP_ADD, 0))
+        bc_pop(1)
+        let _fdi2s = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, fd_idx_slot))
+        bc_pop(1)
+        // JMP back
+        let fd_jmp_pc = len(bc_code)
+        let fd_back = fd_loop_start - (fd_jmp_pc + 1)
+        let _fdjb = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, fd_back))
+        // Patch JMPF
+        let fd_end_pc = len(bc_code)
+        let fd_fwd = fd_end_pc - (fd_jmpf_pc + 1)
+        bc_patch_code(fd_jmpf_pc, bc_enc_sbx(BC_OP_JMPF, fd_fwd))
+        // Backpatch breaks
+        let _fdbtop = len(bc_break_pcs) - 1
+        let _fdbpcs = bc_break_pcs[_fdbtop]
+        let mut _fdbi = 0
+        while _fdbi < len(_fdbpcs) {
+            let _fdbpc = _fdbpcs[_fdbi]
+            let _fdbdelta = fd_end_pc - (_fdbpc + 1)
+            bc_patch_code(_fdbpc, bc_enc_sbx(BC_OP_JMP, _fdbdelta))
+            _fdbi = _fdbi + 1
+        }
+        bc_break_pcs = bc_shrink(bc_break_pcs, _fdbtop)
+        bc_loop_start_stack = bc_shrink_int(bc_loop_start_stack, len(bc_loop_start_stack) - 1)
+        return
+    }
+
+    if k == "BreakStmt" {
+        // Emit a JMP placeholder; the enclosing WhileStmt
+        // backpatches the delta when loop_end_pc is known.
+        // Outside any loop: NOP (defensive — parser should reject).
+        if len(bc_break_pcs) == 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            return
+        }
+        let _bpc = len(bc_code)
+        let _r = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))
+        let _btop = len(bc_break_pcs) - 1
+        let _list = bc_break_pcs[_btop].push(_bpc)
+        bc_break_pcs = bc_vm_setat(bc_break_pcs, _btop, _list)
+        return
+    }
+
+    if k == "ContinueStmt" {
+        // Jump back to the topmost loop_start_pc. Delta is
+        // computed immediately; no patching needed.
+        if len(bc_loop_start_stack) == 0 {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            return
+        }
+        let _ltop = len(bc_loop_start_stack) - 1
+        let _lstart = bc_loop_start_stack[_ltop]
+        let _here = len(bc_code)
+        let _delta = _lstart - (_here + 1)
+        let _r = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, _delta))
+        return
+    }
+
+    if k == "CompoundAssign" {
+        // `lhs op= rhs` desugars to `lhs = lhs op rhs`.
+        // bridge wraps node.left = LHS Ident (resolved by name) and
+        // node.right_idx = RHS expr. We lower as:
+        //   load lhs ; eval rhs ; binop ; store lhs
+        let _lhs_idx = node.left_idx
+        let _rhs_idx = node.right_idx
+        let _name = node.name
+        if _lhs_idx < 0 {
+            return
+        }
+        // Load LHS (the bridge stores an Ident node at left_idx).
+        bc_compile_expr(_lhs_idx)
+        // Eval RHS.
+        bc_compile_expr(_rhs_idx)
+        // Binop matching node.op (subset: +, -, *, /, %).
+        let _op = node.op
+        let mut _opc = -1
+        let _is_float = bc_is_float_expr(_lhs_idx) || bc_is_float_expr(_rhs_idx)
+        if _op == "+" {
+            if _is_float { _opc = BC_OP_ADDF } else { _opc = BC_OP_ADD }
+        }
+        if _op == "-" {
+            if _is_float { _opc = BC_OP_SUBF } else { _opc = BC_OP_SUB }
+        }
+        if _op == "*" {
+            if _is_float { _opc = BC_OP_MULF } else { _opc = BC_OP_MUL }
+        }
+        if _op == "/" {
+            if _is_float { _opc = BC_OP_DIVF } else { _opc = BC_OP_DIV }
+        }
+        if _op == "%" { _opc = BC_OP_MOD }
+        if _opc < 0 {
+            // Unknown compound op — pop and bail.
+            let _rn = bc_emit_raw(bc_enc_abx(BC_OP_NOP, 0))
+            bc_pop(2)
+            return
+        }
+        let _rb = bc_emit_raw(bc_enc_abx(_opc, 0))
+        bc_pop(1)
+        // Store back into the LHS binding by name.
+        let _slot = bc_resolve_local(_name)
+        if _slot >= 0 {
+            let _rs = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, _slot))
+        } else {
+            let _cidx = bc_add_const(_name)
+            let _rs = bc_emit_raw(bc_enc_ab16(BC_OP_STORE_GLOBAL, 0, _cidx))
+        }
+        bc_pop(1)
+        return
+    }
+
+    // T46 — ThrowStmt: `throw expr` → push value, OP_THROW.
+    // OP_THROW pops the value and either unwinds to the catch handler
+    // (if a try-frame is pending) or traps uncaught.
+    if k == "ThrowStmt" {
+        bc_compile_expr(node.left_idx)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_THROW, 0))
+        bc_pop(1)
+        return
+    }
+
+    // T46 — TryCatch: `try { body } catch e { handler }`.
+    // Layout:
+    //   try_pc:   TRY  sbx_to_catch              (patched)
+    //   [try body bytecode]
+    //             ENDTRY
+    //   jmp_pc:   JMP  sbx_to_end                 (patched)
+    //   catch_pc: STORE_LOCAL catch_var_slot      (VM pushed throw_val)
+    //   [catch body bytecode]
+    //   end_pc:
+    if k == "TryCatch" {
+        let try_pc = len(bc_code)
+        let _tr = bc_emit_raw(bc_enc_sbx(BC_OP_TRY, 0))     // patched
+
+        // Compile try body.
+        bc_compile_stmts(node.body_start, node.body_end)
+
+        // Normal path: ENDTRY pops the try-frame, then JMP over catch.
+        let _et = bc_emit_raw(bc_enc_abx(BC_OP_ENDTRY, 0))
+
+        let jmp_pc = len(bc_code)
+        let _je = bc_emit_raw(bc_enc_sbx(BC_OP_JMP, 0))     // patched
+
+        // Patch TRY sbx so its delta targets the catch handler entry.
+        let catch_pc = len(bc_code)
+        let try_delta = catch_pc - (try_pc + 1)
+        bc_patch_code(try_pc, bc_enc_sbx(BC_OP_TRY, try_delta))
+
+        // Catch handler: VM pushed throw_val onto operand stack before
+        // jumping here. Reflect this in the emitter's SP model.
+        bc_push1()
+        let cv_slot = bc_define_local(node.name)
+        let _sl = bc_emit_raw(bc_enc_abx(BC_OP_STORE_LOCAL, cv_slot))
+        bc_pop(1)
+
+        // Compile catch body.
+        bc_compile_stmts(node.else_start, node.else_end)
+
+        // Patch JMP over catch.
+        let end_pc = len(bc_code)
+        let jmp_delta = end_pc - (jmp_pc + 1)
+        bc_patch_code(jmp_pc, bc_enc_sbx(BC_OP_JMP, jmp_delta))
+        return
+    }
+
+    if k == "ExprStmt" {
+        bc_compile_expr(node.left_idx)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_POP, 0))
+        bc_pop(1)
+        return
+    }
+
+    if k == "FnDecl" {
+        // Compile nested — push state, compile proto, pop state.
+        bc_compile_proto(idx)
+        return
+    }
+
+    // rt#36-D bridge: IfExpr appearing at statement position.
+    // We forward to bc_compile_expr's IfExpr handler WITHOUT wrapping
+    // in ExprStmt+POP. The reason: a stmt-form if often has the then
+    // branch end in `return` (e.g. fib's base case), and there is no
+    // else branch — so `if cond { return x }` emits:
+    //   cond; JMPF end; [then-body: LOAD, RETURN]; end:
+    // At runtime the then path returns out of the frame entirely, and
+    // the else path falls through to whatever follows. Neither case
+    // leaves a residual value on the operand stack. Wrapping in
+    // ExprStmt would emit an OP_POP that underflows on the else path.
+    if k == "IfExpr" {
+        bc_compile_expr(idx)
+        return
+    }
+    if k == "IfStmt" {
+        // Defensive: parser currently emits IfExpr, but if a future
+        // parser revision emits IfStmt at stmt position we still do
+        // the right thing.
+        bc_compile_expr(idx)
+        return
+    }
+
+    // Unknown stmt kind — skip silently. The verifier (rt#36-D)
+    // flags these as warnings.
+}
+
+fn bc_compile_stmts(start, endx) {
+    if start < 0 { return }
+    let mut i = start
+    while i < endx {
+        let idx = bc_stmt_list[i]
+        bc_compile_stmt(idx)
+        i = i + 1
+    }
+}
+
+// ── Proto compilation (FnDecl → BcProto). ───────────────
+
+// T63 — Compile a stmt-list block as an expression: inline the last
+// ExprStmt so its value stays on the stack (no POP), and forward
+// trailing IfExpr/IfStmt/MatchExpr as expressions too. All preceding
+// stmts compile normally. Guarantees exactly +1 on the stack on exit
+// (pushes nil if the block is empty or has no tail value).
+fn bc_compile_block_as_expr(bs, be) {
+    if bs < 0 || be <= bs {
+        let _rn = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+        bc_push1()
+        return
+    }
+    let last_bi = be - 1
+    let mut bi = bs
+    let mut pushed = false
+    while bi < be {
+        let sidx = bc_stmt_list[bi]
+        if sidx >= 0 {
+            if bi == last_bi {
+                let last_node = bc_node_pool[sidx]
+                let lk = last_node.kind
+                if lk == "ExprStmt" {
+                    bc_compile_expr(last_node.left_idx)
+                    pushed = true
+                } else if lk == "IfExpr" || lk == "IfStmt" || lk == "MatchExpr" {
+                    bc_compile_expr(sidx)
+                    pushed = true
+                } else {
+                    bc_compile_stmt(sidx)
+                }
+            } else {
+                bc_compile_stmt(sidx)
+            }
+        }
+        bi = bi + 1
+    }
+    if !pushed {
+        let _rn2 = bc_emit_raw(bc_enc_abx(BC_OP_LOADNIL, 0))
+        bc_push1()
+    }
+}
+
+fn bc_compile_proto(fn_decl_idx) {
+    let decl = bc_node_pool[fn_decl_idx]
+
+    // Save current emit state.
+    bc_save_code        = bc_save_code.push(bc_code)
+    bc_save_consts      = bc_save_consts.push(bc_consts)
+    bc_save_localnames  = bc_save_localnames.push(bc_local_names)
+    bc_save_localdepths = bc_save_localdepths.push(bc_local_depths)
+    bc_save_depth       = bc_save_depth.push(bc_depth)
+    bc_save_cursp       = bc_save_cursp.push(bc_cur_sp)
+    bc_save_maxsp       = bc_save_maxsp.push(bc_max_sp)
+    // T51 — bc_upval_names save stack must stay parallel with the
+    // other save stacks, otherwise a Lambda nested inside this fn
+    // indexes out-of-bounds on restore (len(bc_save_code) - 1 overflows
+    // len(bc_save_upvals)). FnDecls reset upval_names to [] because a
+    // named fn body is never a lambda closure body.
+    bc_save_upvals      = bc_save_upvals.push(bc_upval_names)
+
+    // Fresh state for this proto.
+    bc_code = []
+    bc_consts = []
+    bc_local_names = []
+    bc_local_depths = []
+    bc_depth = 0
+    bc_cur_sp = 0
+    bc_max_sp = 0
+    bc_upval_names = []
+
+    // Bind parameters as locals 0..n_params-1.
+    let mut pi = decl.params_start
+    while pi < decl.params_end {
+        let pname = bc_param_list[pi]
+        let _slot = bc_define_local(pname)
+        pi = pi + 1
+    }
+
+    // T63 — Compile body with implicit return on last value-producing
+    // stmt. Mirrors T59's block-body lambda behavior for named fns.
+    // Last ExprStmt → compile inner expr + RETURN (not POP).
+    // Last IfExpr/IfStmt/MatchExpr → compile as expr + RETURN.
+    // Anything else → compile as stmt; terminating RETURN0 appended.
+    let fp_bs = decl.body_start
+    let fp_be = decl.body_end
+    if fp_bs >= 0 && fp_be > fp_bs {
+        let fp_last_bi = fp_be - 1
+        let mut fp_bi = fp_bs
+        while fp_bi < fp_be {
+            let fp_sidx = bc_stmt_list[fp_bi]
+            if fp_sidx >= 0 {
+                if fp_bi == fp_last_bi {
+                    let fp_last = bc_node_pool[fp_sidx]
+                    let fplk = fp_last.kind
+                    if fplk == "ExprStmt" {
+                        bc_compile_expr(fp_last.left_idx)
+                        let _rfr = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                    } else if fplk == "IfExpr" || fplk == "IfStmt" || fplk == "MatchExpr" {
+                        bc_compile_expr(fp_sidx)
+                        let _rfr2 = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                    } else {
+                        bc_compile_stmt(fp_sidx)
+                    }
+                } else {
+                    bc_compile_stmt(fp_sidx)
+                }
+            }
+            fp_bi = fp_bi + 1
+        }
+    }
+
+    // Ensure a terminating RETURN — the verifier insists on it.
+    // Only append if the last insn isn't already a RETURN.
+    let mut need_tail = true
+    if len(bc_code) > 0 {
+        let last = bc_code[len(bc_code) - 1]
+        let last_op = bc_op_of(last)
+        if last_op == BC_OP_RETURN { need_tail = false }
+        if last_op == BC_OP_RETURN0 { need_tail = false }
+    }
+    if need_tail {
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+    }
+
+    // Capture the finished proto into the module registry.
+    let proto = BcProto {
+        name: decl.name,
+        n_params: decl.n_params,
+        n_locals: len(bc_local_names),
+        max_stack: bc_max_sp,
+        code_len: len(bc_code),
+        consts_len: len(bc_consts)
+    }
+    bc_protos              = bc_protos.push(proto)
+    bc_proto_codes         = bc_proto_codes.push(bc_code)
+    bc_proto_consts        = bc_proto_consts.push(bc_consts)
+    bc_proto_localcounts   = bc_proto_localcounts.push(len(bc_local_names))
+    bc_proto_max_stacks    = bc_proto_max_stacks.push(bc_max_sp)
+
+    // Restore outer emit state.
+    let n = len(bc_save_code) - 1
+    bc_code         = bc_save_code[n]
+    bc_consts       = bc_save_consts[n]
+    bc_local_names  = bc_save_localnames[n]
+    bc_local_depths = bc_save_localdepths[n]
+    bc_depth        = bc_save_depth[n]
+    bc_cur_sp       = bc_save_cursp[n]
+    bc_max_sp       = bc_save_maxsp[n]
+    bc_upval_names  = bc_save_upvals[n]
+
+    // Shrink save stacks (hexa arrays are immutable-push;
+    // we rebuild minus the last entry).
+    bc_save_code        = bc_shrink(bc_save_code, n)
+    bc_save_consts      = bc_shrink(bc_save_consts, n)
+    bc_save_localnames  = bc_shrink(bc_save_localnames, n)
+    bc_save_localdepths = bc_shrink(bc_save_localdepths, n)
+    bc_save_depth       = bc_shrink_int(bc_save_depth, n)
+    bc_save_cursp       = bc_shrink_int(bc_save_cursp, n)
+    bc_save_maxsp       = bc_shrink_int(bc_save_maxsp, n)
+    bc_save_upvals      = bc_shrink(bc_save_upvals, n)
+}
+
+// Array-shrink helpers — rebuild arr[0..n].
+fn bc_shrink(arr, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn bc_shrink_int(arr, n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ── T51 (rt#36-E #1) — free-variable analysis. ──────────
+// Walk a bc_node_pool expression tree (the lambda body) and
+// collect the names of Ident refs that are NOT in `locals`
+// (lambda params + any let-declared locals in the body).
+// Deduplicated within `acc` in emit order (first use wins).
+//
+// MVP scope: expr-only body. Recurses through BinOp/UnaryOp/Call/
+// IfExpr (cond + body + else stmt slices via bc_collect_free_vars_stmts)/
+// Array/MapLit/StructInit/Index/Field/ArrPushExpr. Lambda-inside-
+// Lambda nested captures are deferred to T52 (return [] for an inner
+// Lambda so its own free-var analysis does not leak into the outer
+// body scan).
+fn bc_collect_free_vars_expr(expr_idx, locals, acc) {
+    if expr_idx < 0 { return acc }
+    if expr_idx >= len(bc_node_pool) { return acc }
+    let n = bc_node_pool[expr_idx]
+    let k = n.kind
+
+    if k == "Ident" {
+        if bc_name_in(locals, n.name) { return acc }
+        if bc_name_in(acc, n.name) { return acc }
+        return acc.push(n.name)
+    }
+    if k == "BinOp" {
+        let a1 = bc_collect_free_vars_expr(n.left_idx, locals, acc)
+        return bc_collect_free_vars_expr(n.right_idx, locals, a1)
+    }
+    if k == "UnaryOp" {
+        return bc_collect_free_vars_expr(n.left_idx, locals, acc)
+    }
+    if k == "Call" {
+        // Callee-name: treat as an Ident so a captured closure-var
+        // used by name registers as a free var. BUT skip builtins
+        // (print/println/len — handled inline by bc_compile_call) and
+        // already-known top-level proto names (resolved via
+        // bc_lookup_proto on the emit path). Otherwise they leak to
+        // LOAD_GLOBAL in the outer closure-upval emit and the VM
+        // traps with "undefined global: <name>" — the T54 block-body
+        // regression (rt#36-E).
+        let mut a = acc
+        if n.name != "" {
+            let is_builtin_call = (n.name == "print") || (n.name == "println") || (n.name == "len") || (n.name == "to_string") || (n.name == "to_int") || (n.name == "to_float") || (n.name == "type_of")
+            let is_known_proto = bc_lookup_proto(n.name) >= 0
+            if !is_builtin_call && !is_known_proto {
+                if !bc_name_in(locals, n.name) {
+                    if !bc_name_in(a, n.name) {
+                        a = a.push(n.name)
+                    }
+                }
+            }
+        }
+        let mut ci = n.args_start
+        if ci >= 0 {
+            while ci < n.args_end {
+                a = bc_collect_free_vars_expr(bc_arg_list[ci], locals, a)
+                ci = ci + 1
+            }
+        }
+        return a
+    }
+    if k == "IfExpr" || k == "IfStmt" {
+        let a1 = bc_collect_free_vars_expr(n.left_idx, locals, acc)   // cond
+        let a2 = bc_collect_free_vars_stmts(n.body_start, n.body_end, locals, a1)
+        if n.else_start >= 0 {
+            return bc_collect_free_vars_stmts(n.else_start, n.else_end, locals, a2)
+        }
+        return a2
+    }
+    // Kind strings below must match bc_mk_* constructors (bc_mk_arraylit
+    // → "ArrayLit", bc_mk_index → "IndexExpr", bc_mk_field_access →
+    // "FieldAccess"). Earlier draft used "Array"/"Index"/"Field" and
+    // silently dropped entire subtrees, causing free vars in `arr[i]`
+    // / `obj.f` / array-lit captures to leak to LOAD_GLOBAL.
+    if k == "ArrayLit" || k == "MapLit" || k == "StructInit" {
+        let mut a = acc
+        let mut i2 = n.args_start
+        if i2 >= 0 {
+            while i2 < n.args_end {
+                a = bc_collect_free_vars_expr(bc_arg_list[i2], locals, a)
+                i2 = i2 + 1
+            }
+        }
+        return a
+    }
+    if k == "IndexExpr" {
+        let a1 = bc_collect_free_vars_expr(n.left_idx, locals, acc)
+        return bc_collect_free_vars_expr(n.right_idx, locals, a1)
+    }
+    if k == "FieldAccess" {
+        return bc_collect_free_vars_expr(n.left_idx, locals, acc)
+    }
+    if k == "ArrPushExpr" {
+        let a1 = bc_collect_free_vars_expr(n.left_idx, locals, acc)
+        return bc_collect_free_vars_expr(n.right_idx, locals, a1)
+    }
+    // Lambda-in-Lambda: conservative — return acc unchanged. A
+    // nested lambda's own body is compiled separately with its own
+    // free-var scan; we would over-capture if we propagated those
+    // names into the outer proto's upval table. T52 extends this to
+    // properly support nested closure chains.
+    if k == "Lambda" { return acc }
+    // Literals / unknown → no contribution.
+    return acc
+}
+
+// Walk a bc_stmt_list slice, collecting free vars. Maintains a
+// running `locals` snapshot: LetStmt adds to the scope copy so
+// later refs to that name are NOT captured. AssignStmt writes a
+// binding whose name must already be in scope — we treat the LHS
+// like a ref for simplicity (if the binding comes from outside
+// the lambda, the Lambda branch deferred STORE_UPVAL anyway, so
+// outer-mutation within the body is not yet supported — T52).
+fn bc_collect_free_vars_stmts(start, endx, locals, acc) {
+    if start < 0 { return acc }
+    let mut cur_locals = locals
+    let mut out = acc
+    let mut i = start
+    while i < endx {
+        let sidx = bc_stmt_list[i]
+        if sidx >= 0 {
+            let s = bc_node_pool[sidx]
+            let sk = s.kind
+            if sk == "LetStmt" || sk == "LetMutStmt" || sk == "ConstStmt" || sk == "StaticStmt" {
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                cur_locals = cur_locals.push(s.name)
+            } else if sk == "AssignStmt" {
+                // LHS as ref (name field holds target binding); RHS as expr.
+                if s.name != "" {
+                    if !bc_name_in(cur_locals, s.name) {
+                        if !bc_name_in(out, s.name) {
+                            out = out.push(s.name)
+                        }
+                    }
+                }
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+            } else if sk == "ReturnStmt" {
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+            } else if sk == "ExprStmt" {
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+            } else if sk == "WhileStmt" {
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, cur_locals, out)
+            } else if sk == "IfExpr" || sk == "IfStmt" {
+                out = bc_collect_free_vars_expr(sidx, cur_locals, out)
+            } else if sk == "ForRangeStmt" {
+                // T61: start/end exprs + body
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                out = bc_collect_free_vars_expr(s.right_idx, cur_locals, out)
+                let fr_locals = cur_locals.push(s.name)
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, fr_locals, out)
+            } else if sk == "ForArrayStmt" {
+                // T61: iterable expr + body
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                let fa_locals = cur_locals.push(s.name)
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, fa_locals, out)
+            } else if sk == "ForDestructStmt" {
+                // G43: iterable expr + body, destructure names are locals
+                out = bc_collect_free_vars_expr(s.left_idx, cur_locals, out)
+                let mut fd_locals = cur_locals
+                let mut _fdci = s.params_start
+                while _fdci < s.params_end {
+                    fd_locals = fd_locals.push(bc_param_list[_fdci])
+                    _fdci = _fdci + 1
+                }
+                out = bc_collect_free_vars_stmts(s.body_start, s.body_end, fd_locals, out)
+            } else if sk == "CompoundAssign" {
+                if s.name != "" {
+                    if !bc_name_in(cur_locals, s.name) {
+                        if !bc_name_in(out, s.name) {
+                            out = out.push(s.name)
+                        }
+                    }
+                }
+                out = bc_collect_free_vars_expr(s.right_idx, cur_locals, out)
+            }
+            // BreakStmt / ContinueStmt / FnDecl inside lambda body —
+            // skip (no expr operands for the first two; nested FnDecl
+            // is t51-OOS).
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// T56 #2 (rt#36-E) — scan a lambda body for writes to a named
+// free var. Returns true iff the name appears on the LHS of any
+// AssignStmt or CompoundAssign inside the body slice (recursively
+// through nested WhileStmt/IfExpr bodies). Used by the lambda
+// emit path to decide whether to HOIST_CELL the outer binding
+// (mutable upvalue) or snapshot it by value (immutable upvalue).
+//
+// Scope: stmts-level scan; expr-level Lambda-in-Lambda is OOS for
+// T56 (matches bc_collect_free_vars_expr's `if k == "Lambda"
+// return acc` conservative cut). Nested While/If bodies ARE
+// recursed so that `while running { counter = counter + 1 }`
+// inside a block-body lambda correctly flags `counter` mutable.
+fn bc_free_var_is_mutable_in_stmts(start, endx, name) {
+    if start < 0 { return false }
+    let mut i = start
+    while i < endx {
+        let sidx = bc_stmt_list[i]
+        if sidx >= 0 {
+            let s = bc_node_pool[sidx]
+            let sk = s.kind
+            if sk == "AssignStmt" || sk == "CompoundAssign" {
+                if s.name == name { return true }
+            }
+            if sk == "WhileStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+            }
+            if sk == "IfExpr" || sk == "IfStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+                if s.else_start >= 0 {
+                    if bc_free_var_is_mutable_in_stmts(s.else_start, s.else_end, name) {
+                        return true
+                    }
+                }
+            }
+            // T61: recurse into for-loop bodies
+            if sk == "ForRangeStmt" || sk == "ForArrayStmt" {
+                if bc_free_var_is_mutable_in_stmts(s.body_start, s.body_end, name) {
+                    return true
+                }
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// T56 #2 — wrapper that also handles expr-body lambdas (T51). An
+// expr body cannot contain stmt-level assigns, so an expr-body
+// lambda has zero mutable upvalues by construction. This helper
+// unifies the call site: pass the Lambda node and the name.
+fn bc_lambda_body_mutates(lam_node, name) {
+    if lam_node.left_idx >= 0 {
+        // Expr-body (T51) — no stmts → no writes. Conservatively false.
+        return false
+    }
+    if lam_node.body_start >= 0 {
+        return bc_free_var_is_mutable_in_stmts(lam_node.body_start, lam_node.body_end, name)
+    }
+    return false
+}
+
+// T58 — pre-scan: walk a stmt range, find all Lambdas, and for each
+// free variable that any lambda mutates, seed bc_hoisted_slots. This
+// makes hoisted-slot tracking order-independent — a read-only closure
+// defined before a mutating closure will still bind the shared cell.
+fn bc_prescan_hoist_set(stmts_start, stmts_end) {
+    if stmts_start < 0 { return }
+    let mut i = stmts_start
+    while i < stmts_end {
+        let sidx = bc_stmt_list[i]
+        if sidx >= 0 {
+            let s = bc_node_pool[sidx]
+            let mut lam_node_idx = -1
+            // Direct Lambda stmt (rare but possible)
+            if s.kind == "Lambda" {
+                lam_node_idx = sidx
+            }
+            // LetStmt / LetMutStmt with Lambda RHS (common: let f = |x| ...)
+            if s.kind == "LetStmt" || s.kind == "LetMutStmt" {
+                if s.left_idx >= 0 {
+                    let rhs = bc_node_pool[s.left_idx]
+                    if rhs.kind == "Lambda" {
+                        lam_node_idx = s.left_idx
+                    }
+                }
+            }
+            if lam_node_idx >= 0 {
+                let lam = bc_node_pool[lam_node_idx]
+                // Collect params to exclude from free-var set
+                let mut params_seen = []
+                let mut pi = lam.params_start
+                if pi >= 0 {
+                    while pi < lam.params_end {
+                        params_seen = params_seen.push(bc_param_list[pi])
+                        pi = pi + 1
+                    }
+                }
+                let mut fvs = []
+                if lam.left_idx >= 0 {
+                    fvs = bc_collect_free_vars_expr(lam.left_idx, params_seen, [])
+                } else if lam.body_start >= 0 {
+                    fvs = bc_collect_free_vars_stmts(lam.body_start, lam.body_end, params_seen, [])
+                }
+                let mut fi = 0
+                while fi < len(fvs) {
+                    let fvn = fvs[fi]
+                    if bc_lambda_body_mutates(lam, fvn) {
+                        if !bc_name_in(bc_hoisted_slots, fvn) {
+                            bc_hoisted_slots = bc_hoisted_slots.push(fvn)
+                        }
+                    }
+                    fi = fi + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+}
+
+// T51 — compile a Lambda body as a new BcProto. Mirrors
+// bc_compile_proto's save/restore dance but:
+//   - uses name "<lambda>" (not the source-level fn name)
+//   - pre-sets bc_upval_names = free_vars so the body's Ident
+//     branch routes captures to OP_LOAD_UPVAL
+//   - handles expr-body via left_idx (MVP) or falls through to a
+//     bare RETURN0 for block-body (T52)
+//   - returns the proto's index in bc_protos (0-based)
+fn bc_compile_lambda_proto(lam_node, free_vars) {
+    // Save outer emit state (add bc_upval_names to the dance).
+    bc_save_code        = bc_save_code.push(bc_code)
+    bc_save_consts      = bc_save_consts.push(bc_consts)
+    bc_save_localnames  = bc_save_localnames.push(bc_local_names)
+    bc_save_localdepths = bc_save_localdepths.push(bc_local_depths)
+    bc_save_depth       = bc_save_depth.push(bc_depth)
+    bc_save_cursp       = bc_save_cursp.push(bc_cur_sp)
+    bc_save_maxsp       = bc_save_maxsp.push(bc_max_sp)
+    bc_save_upvals      = bc_save_upvals.push(bc_upval_names)
+
+    // Fresh inner state.
+    bc_code = []
+    bc_consts = []
+    bc_local_names = []
+    bc_local_depths = []
+    bc_depth = 0
+    bc_cur_sp = 0
+    bc_max_sp = 0
+    bc_upval_names = free_vars
+
+    // Bind params as locals 0..n_params-1.
+    let mut lpi = lam_node.params_start
+    if lpi >= 0 {
+        while lpi < lam_node.params_end {
+            let pname = bc_param_list[lpi]
+            let _slot = bc_define_local(pname)
+            lpi = lpi + 1
+        }
+    }
+
+    // Compile body — expr form (T51) or block form (T54).
+    if lam_node.left_idx >= 0 {
+        // Expr-body — value is the expression; emit RETURN.
+        bc_compile_expr(lam_node.left_idx)
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+        bc_pop(1)
+    } else if lam_node.body_start >= 0 {
+        // Block-body (T54) — compile each stmt in bc_stmt_list slice.
+        // T59: if the LAST stmt is an ExprStmt, compile its inner
+        // expression and RETURN the value (implicit return). Otherwise
+        // fall-through emits RETURN0 (void). Explicit `return expr`
+        // inside the block emits its own RETURN.
+        let last_bi = lam_node.body_end - 1
+        let mut lbi = lam_node.body_start
+        let mut emitted_return = false
+        while lbi < lam_node.body_end {
+            let sidx = bc_stmt_list[lbi]
+            if sidx >= 0 {
+                if lbi == last_bi {
+                    let last_node = bc_node_pool[sidx]
+                    if last_node.kind == "ExprStmt" {
+                        // T59: last expr-stmt → return its value
+                        bc_compile_expr(last_node.left_idx)
+                        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN, 0))
+                        bc_pop(1)
+                        emitted_return = true
+                    } else {
+                        bc_compile_stmt(sidx)
+                    }
+                } else {
+                    bc_compile_stmt(sidx)
+                }
+            }
+            lbi = lbi + 1
+        }
+        if !emitted_return {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+        }
+    } else {
+        // Empty lambda body — loud nil return.
+        let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+    }
+
+    // Register the proto in the module registry.
+    let new_pidx = len(bc_protos)
+    let proto = BcProto {
+        name: "<lambda>",
+        n_params: lam_node.n_params,
+        n_locals: len(bc_local_names),
+        max_stack: bc_max_sp,
+        code_len: len(bc_code),
+        consts_len: len(bc_consts)
+    }
+    bc_protos              = bc_protos.push(proto)
+    bc_proto_codes         = bc_proto_codes.push(bc_code)
+    bc_proto_consts        = bc_proto_consts.push(bc_consts)
+    bc_proto_localcounts   = bc_proto_localcounts.push(len(bc_local_names))
+    bc_proto_max_stacks    = bc_proto_max_stacks.push(bc_max_sp)
+
+    // Restore outer state.
+    let nsv = len(bc_save_code) - 1
+    bc_code         = bc_save_code[nsv]
+    bc_consts       = bc_save_consts[nsv]
+    bc_local_names  = bc_save_localnames[nsv]
+    bc_local_depths = bc_save_localdepths[nsv]
+    bc_depth        = bc_save_depth[nsv]
+    bc_cur_sp       = bc_save_cursp[nsv]
+    bc_max_sp       = bc_save_maxsp[nsv]
+    bc_upval_names  = bc_save_upvals[nsv]
+
+    bc_save_code        = bc_shrink(bc_save_code, nsv)
+    bc_save_consts      = bc_shrink(bc_save_consts, nsv)
+    bc_save_localnames  = bc_shrink(bc_save_localnames, nsv)
+    bc_save_localdepths = bc_shrink(bc_save_localdepths, nsv)
+    bc_save_depth       = bc_shrink_int(bc_save_depth, nsv)
+    bc_save_cursp       = bc_shrink_int(bc_save_cursp, nsv)
+    bc_save_maxsp       = bc_shrink_int(bc_save_maxsp, nsv)
+    bc_save_upvals      = bc_shrink(bc_save_upvals, nsv)
+
+    return new_pidx
+}
+
+// ── Top-level entry. ────────────────────────────────────
+// Reset all emit state, compile the root statement list, and
+// return a summary tuple [n_protos, total_instrs, total_consts].
+//
+// The caller retrieves detailed chunks via the getter API below.
+
+fn bc_compile_root(stmts_start, stmts_end) {
+    bc_reset()
+
+    // Pre-pass: register every top-level FnDecl name in declaration
+    // order so recursive / mutually-recursive Calls can resolve
+    // bc_lookup_proto(name) → final-bc_protos index even before the
+    // proto body has been emitted. Without this, fib's recursive
+    // call falls into the forward-ref branch and uses the const-pool
+    // index — which the VM dispatches as the WRONG proto.
+    bc_pending_proto_names = []
+    let mut p_i = stmts_start
+    while p_i < stmts_end {
+        let p_idx = bc_stmt_list[p_i]
+        let p_n = bc_node_pool[p_idx]
+        if p_n.kind == "FnDecl" {
+            bc_pending_proto_names = bc_pending_proto_names.push(p_n.name)
+        }
+        p_i = p_i + 1
+    }
+
+    // T58: pre-scan all top-level lambdas to seed bc_hoisted_slots
+    // before any emission — order-independent mutable cell tracking.
+    bc_prescan_hoist_set(stmts_start, stmts_end)
+
+    // Treat the root as an implicit proto `<main>` so the same
+    // bc_compile_proto machinery applies. First, harvest all
+    // top-level FnDecls and compile them into protos; then
+    // compile the remainder as the main proto.
+    let mut i = stmts_start
+    while i < stmts_end {
+        let idx = bc_stmt_list[i]
+        let n = bc_node_pool[idx]
+        if n.kind == "FnDecl" {
+            bc_compile_proto(idx)
+        }
+        i = i + 1
+    }
+
+    // Main proto: fresh frame, body = all non-FnDecl top-level stmts.
+    // Count non-FnDecl stmts; only emit <main> if any exist.
+    let mut non_fn_count = 0
+    let mut j = stmts_start
+    while j < stmts_end {
+        let idx = bc_stmt_list[j]
+        let n = bc_node_pool[idx]
+        if n.kind != "FnDecl" {
+            non_fn_count = non_fn_count + 1
+        }
+        j = j + 1
+    }
+
+    if non_fn_count > 0 {
+        bc_code = []
+        bc_consts = []
+        bc_local_names = []
+        bc_local_depths = []
+        bc_depth = 0
+        bc_cur_sp = 0
+        bc_max_sp = 0
+
+        let mut j2 = stmts_start
+        while j2 < stmts_end {
+            let idx = bc_stmt_list[j2]
+            let n = bc_node_pool[idx]
+            if n.kind != "FnDecl" {
+                bc_compile_stmt(idx)
+            }
+            j2 = j2 + 1
+        }
+        // Main returns nil unless the source explicitly returned.
+        let mut need_tail = true
+        if len(bc_code) > 0 {
+            let last = bc_code[len(bc_code) - 1]
+            let last_op = bc_op_of(last)
+            if last_op == BC_OP_RETURN { need_tail = false }
+            if last_op == BC_OP_RETURN0 { need_tail = false }
+        }
+        if need_tail {
+            let _r = bc_emit_raw(bc_enc_abx(BC_OP_RETURN0, 0))
+        }
+        let main_proto = BcProto {
+            name: "<main>",
+            n_params: 0,
+            n_locals: len(bc_local_names),
+            max_stack: bc_max_sp,
+            code_len: len(bc_code),
+            consts_len: len(bc_consts)
+        }
+        bc_protos            = bc_protos.push(main_proto)
+        bc_proto_codes       = bc_proto_codes.push(bc_code)
+        bc_proto_consts      = bc_proto_consts.push(bc_consts)
+        bc_proto_localcounts = bc_proto_localcounts.push(len(bc_local_names))
+        bc_proto_max_stacks  = bc_proto_max_stacks.push(bc_max_sp)
+    }
+
+    // Summary.
+    let mut total_instrs = 0
+    let mut total_consts = 0
+    let mut k = 0
+    while k < len(bc_protos) {
+        total_instrs = total_instrs + len(bc_proto_codes[k])
+        total_consts = total_consts + len(bc_proto_consts[k])
+        k = k + 1
+    }
+    return [len(bc_protos), total_instrs, total_consts]
+}
+
+// ── Introspection helpers (for the test harness / disasm). ──
+
+fn bc_get_proto_count() {
+    return len(bc_protos)
+}
+
+fn bc_get_proto_name(i) {
+    let p = bc_protos[i]
+    return p.name
+}
+
+fn bc_get_proto_code_len(i) {
+    return len(bc_proto_codes[i])
+}
+
+fn bc_get_proto_consts_len(i) {
+    return len(bc_proto_consts[i])
+}
+
+fn bc_get_proto_n_params(i) {
+    let p = bc_protos[i]
+    return p.n_params
+}
+
+fn bc_get_proto_n_locals(i) {
+    let p = bc_protos[i]
+    return p.n_locals
+}
+
+fn bc_get_proto_max_stack(i) {
+    let p = bc_protos[i]
+    return p.max_stack
+}
+
+fn bc_get_proto_insn(pi, ci) {
+    let arr = bc_proto_codes[pi]
+    return arr[ci]
+}
+
+fn bc_get_proto_const(pi, ci) {
+    let arr = bc_proto_consts[pi]
+    return arr[ci]
+}
+
+// ── Disassembler (text form for test harness). ──────────
+// Returns the opcode name for a given opcode byte. Used by
+// the test harness to verify emitted bytecode matches the
+// expected sequence from rt#36-A §11.
+
+fn bc_opname(op) {
+    if op == BC_OP_LOADK        { return "LOADK" }
+    if op == BC_OP_LOADI        { return "LOADI" }
+    if op == BC_OP_LOADF        { return "LOADF" }
+    if op == BC_OP_LOADNIL      { return "LOADNIL" }
+    if op == BC_OP_LOADTRUE     { return "LOADTRUE" }
+    if op == BC_OP_LOADFALSE    { return "LOADFALSE" }
+    if op == BC_OP_MOVE         { return "MOVE" }
+    if op == BC_OP_DUP          { return "DUP" }
+    if op == BC_OP_POP          { return "POP" }
+    if op == BC_OP_POPN         { return "POPN" }
+    if op == BC_OP_LOAD_LOCAL   { return "LOAD_LOCAL" }
+    if op == BC_OP_STORE_LOCAL  { return "STORE_LOCAL" }
+    if op == BC_OP_LOAD_UPVAL   { return "LOAD_UPVAL" }
+    if op == BC_OP_STORE_UPVAL  { return "STORE_UPVAL" }
+    if op == BC_OP_LOAD_GLOBAL  { return "LOAD_GLOBAL" }
+    if op == BC_OP_STORE_GLOBAL { return "STORE_GLOBAL" }
+    if op == BC_OP_ADD          { return "ADD" }
+    if op == BC_OP_SUB          { return "SUB" }
+    if op == BC_OP_MUL          { return "MUL" }
+    if op == BC_OP_DIV          { return "DIV" }
+    if op == BC_OP_MOD          { return "MOD" }
+    if op == BC_OP_ADDF         { return "ADDF" }
+    if op == BC_OP_SUBF         { return "SUBF" }
+    if op == BC_OP_MULF         { return "MULF" }
+    if op == BC_OP_DIVF         { return "DIVF" }
+    if op == BC_OP_EQ           { return "EQ" }
+    if op == BC_OP_NEQ          { return "NEQ" }
+    if op == BC_OP_LT           { return "LT" }
+    if op == BC_OP_LE           { return "LE" }
+    if op == BC_OP_GT           { return "GT" }
+    if op == BC_OP_GE           { return "GE" }
+    if op == BC_OP_AND          { return "AND" }
+    if op == BC_OP_OR           { return "OR" }
+    if op == BC_OP_NOT          { return "NOT" }
+    if op == BC_OP_JMP          { return "JMP" }
+    if op == BC_OP_JMPF         { return "JMPF" }
+    if op == BC_OP_JMPT         { return "JMPT" }
+    if op == BC_OP_CALL         { return "CALL" }
+    if op == BC_OP_TAILCALL     { return "TAILCALL" }
+    if op == BC_OP_RETURN       { return "RETURN" }
+    if op == BC_OP_RETURN0      { return "RETURN0" }
+    if op == BC_OP_NEW_ARRAY    { return "NEW_ARRAY" }
+    if op == BC_OP_ARR_GET      { return "ARR_GET" }
+    if op == BC_OP_ARR_SET      { return "ARR_SET" }
+    if op == BC_OP_ARR_PUSH     { return "ARR_PUSH" }
+    if op == BC_OP_ARR_LEN      { return "ARR_LEN" }
+    if op == BC_OP_NEW_MAP      { return "NEW_MAP" }
+    if op == BC_OP_MAP_GET      { return "MAP_GET" }
+    if op == BC_OP_MAP_SET      { return "MAP_SET" }
+    if op == BC_OP_NEW_STRUCT   { return "NEW_STRUCT" }
+    if op == BC_OP_LOAD_FIELD   { return "LOAD_FIELD" }
+    if op == BC_OP_STORE_FIELD  { return "STORE_FIELD" }
+    if op == BC_OP_CLOSURE           { return "CLOSURE" }
+    if op == BC_OP_NEW_CLOSURE_UPVAL { return "NEW_CLOSURE_UPVAL" }
+    if op == BC_OP_TRY          { return "TRY" }
+    if op == BC_OP_THROW        { return "THROW" }
+    if op == BC_OP_ENDTRY       { return "ENDTRY" }
+    if op == BC_OP_PROFILE_HOOK { return "PROFILE_HOOK" }
+    if op == BC_OP_NOP          { return "NOP" }
+    if op == BC_OP_HALT         { return "HALT" }
+    if op == BC_OP_ASSERT_INT   { return "ASSERT_INT" }
+    if op == BC_OP_ASSERT_FLOAT { return "ASSERT_FLOAT" }
+    if op == BC_OP_PRINT        { return "PRINT" }
+    if op == BC_OP_HOIST_CELL   { return "HOIST_CELL" }
+    if op == BC_OP_TO_STRING    { return "TO_STRING" }
+    if op == BC_OP_TO_INT       { return "TO_INT" }
+    if op == BC_OP_TO_FLOAT     { return "TO_FLOAT" }
+    if op == BC_OP_TYPE_OF      { return "TYPE_OF" }
+    if op == BC_OP_PRINTLN      { return "PRINTLN" }
+    return "UNKNOWN"
+}
+
+// Returns "op Bx" or "op A,B16" as human text — layout determined
+// by opcode family. Used by test harness + future `hexa bc-disasm`.
+fn bc_disasm_insn(raw) {
+    let op = bc_op_of(raw)
+    let name = bc_opname(op)
+    // Layout C (calls) — op + A + B16
+    if op == BC_OP_CALL {
+        let a = bc_a_of(raw)
+        let b16 = bc_b16_of(raw)
+        return name + " " + to_string(a) + "," + to_string(b16)
+    }
+    if op == BC_OP_TAILCALL {
+        let a = bc_a_of(raw)
+        let b16 = bc_b16_of(raw)
+        return name + " " + to_string(a) + "," + to_string(b16)
+    }
+    if op == BC_OP_LOAD_GLOBAL {
+        let a = bc_a_of(raw)
+        let b16 = bc_b16_of(raw)
+        return name + " hint=" + to_string(a) + " gbx=" + to_string(b16)
+    }
+    if op == BC_OP_STORE_GLOBAL {
+        let a = bc_a_of(raw)
+        let b16 = bc_b16_of(raw)
+        return name + " hint=" + to_string(a) + " gbx=" + to_string(b16)
+    }
+    // Signed Bx — LOADI, JMP*
+    if op == BC_OP_LOADI {
+        return name + " " + to_string(bc_sbx_of(raw))
+    }
+    if op == BC_OP_JMP {
+        return name + " " + to_string(bc_sbx_of(raw))
+    }
+    if op == BC_OP_JMPF {
+        return name + " " + to_string(bc_sbx_of(raw))
+    }
+    if op == BC_OP_JMPT {
+        return name + " " + to_string(bc_sbx_of(raw))
+    }
+    if op == BC_OP_TRY {
+        return name + " " + to_string(bc_sbx_of(raw))
+    }
+    // T44 Phase 1 — NEW_ARRAY / NEW_MAP use Layout C with B16 = count.
+    if op == BC_OP_NEW_ARRAY {
+        return name + " " + to_string(bc_b16_of(raw))
+    }
+    if op == BC_OP_NEW_MAP {
+        return name + " " + to_string(bc_b16_of(raw))
+    }
+    // Default: unsigned Bx.
+    return name + " " + to_string(bc_bx_of(raw))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rt#36-D bridge: hexa_full AST dict-tree → bc_node_pool walker.
+//
+//  The stage0 interpreter (self/hexa_full.hexa) produces AST nodes as
+//  recursive dict-literals with fields:
+//    kind, name, value, op,
+//    left, right, cond, then_body, else_body,
+//    params, body, args, ...
+//
+//  This is a DIFFERENT shape from the flat `bc_node_pool` that the
+//  MVP emitter consumes. `ast_to_bc_walk_root` bridges the two:
+//    - Walks the dict tree DFS.
+//    - For each expr node, calls the matching bc_mk_* builder and
+//      returns its index in bc_node_pool.
+//    - For each stmt, populates bc_node_pool AND contributes its
+//      index to a temporary local list; the parent caller then pushes
+//      those indices contiguously onto bc_stmt_list (so nested-body
+//      ranges don't interleave with parent ranges).
+//
+//  Supported subset (sufficient for recursive `fib`):
+//    Expr : IntLit, BoolLit, StringLit, Ident, BinOp, UnaryOp, Call,
+//           IfExpr
+//    Stmt : LetStmt/LetMutStmt, AssignStmt, ReturnStmt, WhileStmt,
+//           IfExpr/IfStmt (stmt-form), FnDecl, ExprStmt fallback
+//
+//  Out of scope for this bridge (return -1 / emit fallback):
+//    Match, Try, Lambda, Closure, Struct, Enum, Impl, Trait, Use,
+//    Import, For (iter_expr), Range, Slice, Index, Field, Pipe,
+//    TypeCast, MapLit, ArrayLit, GuardStmt, Defer, ContractAssert, ...
+//
+//  Caller contract:
+//    1. `bc_reset_pools()` — clear the flat pools.
+//    2. `let summary = ast_to_bc_walk_root(ast)` — returns
+//       [n_protos, total_instrs, total_consts] on success, or
+//       [-1, 0, 0] if `ast` is not a list.
+//    3. `bc_vm_run()` — execute the compiled module.
+// ═══════════════════════════════════════════════════════════════════
+
+// Is this AST "node" actually a placeholder string? Parser uses ""
+// for absent fields (see parse_let/parse_return default-case dicts),
+// so a string value means "no node here".
+fn ast_is_empty(node) {
+    return type_of(node) == "string"
+}
+
+// Get the first Ident name if the node is an Ident; otherwise "".
+// Used for Call callee extraction.
+fn ast_callee_name(node) {
+    if ast_is_empty(node) { return "" }
+    if node.kind == "Ident" { return node.name }
+    return ""
+}
+
+// Walk a list of AST stmt dicts, producing a contiguous slice of
+// bc_stmt_list indices. The caller receives (start, end). Each child
+// stmt is first fully compiled into bc_node_pool (which may allocate
+// grandchild ranges into bc_stmt_list), and only THEN are the direct
+// child indices pushed onto bc_stmt_list. This preserves contiguity:
+//    parent body slice = bc_stmt_list[start..end]
+// with no interleaved grandchild indices.
+fn ast_to_bc_walk_body(stmts) {
+    // Build a local idx buffer first.
+    let mut idxs = []
+    if type_of(stmts) == "array" {
+        let mut i = 0
+        let n = len(stmts)
+        while i < n {
+            let sidx = ast_to_bc_stmt(stmts[i])
+            idxs = idxs.push(sidx)
+            i = i + 1
+        }
+    }
+    // Now push contiguously.
+    let start = len(bc_stmt_list)
+    let mut j = 0
+    while j < len(idxs) {
+        bc_stmt_list = bc_stmt_list.push(idxs[j])
+        j = j + 1
+    }
+    let endx = len(bc_stmt_list)
+    // Return as a 2-element array (hexa doesn't have tuples).
+    return [start, endx]
+}
+
+// Walk an AST expression dict node, produce a bc_node_pool index.
+// Unknown/unsupported node kinds fall back to IntLit 0 so arithmetic
+// does not crash the emitter — the VM may still trap on the resulting
+// bytecode, which is the desired "loud failure" mode.
+fn ast_to_bc_expr(node) {
+    if ast_is_empty(node) { return -1 }
+    if type_of(node) != "struct" && type_of(node) != "map" {
+        return bc_mk_int_lit(0)
+    }
+    let k = node.kind
+
+    if k == "IntLit" {
+        // AST IntLit stores its source-level value as a string in
+        // `value`. Parse once at bridge time.
+        let iv = node.value.parse_int()
+        return bc_mk_int_lit(iv)
+    }
+    if k == "FloatLit" {
+        let fv = to_float(node.value)
+        return bc_mk_float_lit(fv)
+    }
+    if k == "BoolLit" {
+        return bc_mk_bool_lit(node.value == "true")
+    }
+    if k == "StringLit" {
+        return bc_mk_string_lit(node.value)
+    }
+    if k == "CharLit" {
+        return bc_mk_string_lit(node.value)
+    }
+    if k == "Ident" {
+        return bc_mk_ident(node.name)
+    }
+    if k == "Wildcard" {
+        let wn = BcNode {
+            kind: "Wildcard", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "_", op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(wn)
+        return len(bc_node_pool) - 1
+    }
+    if k == "BinOp" {
+        let li = ast_to_bc_expr(node.left)
+        let ri = ast_to_bc_expr(node.right)
+        return bc_mk_binop(node.op, li, ri)
+    }
+    if k == "UnaryOp" {
+        // bc_emitter has no bc_mk_unary — hand-roll a BcNode with
+        // kind "UnaryOp". bc_compile_expr reads node.op + node.left_idx.
+        let oi = ast_to_bc_expr(node.left)
+        let un = BcNode {
+            kind: "UnaryOp", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "", op: node.op,
+            left_idx: oi, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(un)
+        return len(bc_node_pool) - 1
+    }
+    if k == "Call" {
+        // AST Call: node.left = callee expr (usually Ident), node.args = list.
+        // T48 — method-call sugar: `obj.push(val)` lowers to ArrPushExpr.
+        // Detect Field callee with matching method name + arity 1, route
+        // to the bc-side ArrPushExpr so compile_expr emits OP_ARR_PUSH.
+        let callee_n = node.left
+        if type_of(callee_n) == "map" {
+            if callee_n.kind == "Field" {
+                if callee_n.name == "push" {
+                    let mc_args = node.args
+                    if type_of(mc_args) == "array" {
+                        if len(mc_args) == 1 {
+                            let mc_obj = ast_to_bc_expr(callee_n.left)
+                            let mc_val = ast_to_bc_expr(mc_args[0])
+                            return bc_mk_arr_push_expr(mc_obj, mc_val)
+                        }
+                    }
+                }
+            }
+        }
+        let fname = ast_callee_name(node.left)
+        let raw_args = node.args
+        // Walk args into bc_arg_list (contiguous slice).
+        // Same contiguity trick as walk_body: build a local buffer then push.
+        let mut arg_idxs = []
+        if type_of(raw_args) == "array" {
+            let mut i = 0
+            while i < len(raw_args) {
+                let aidx = ast_to_bc_expr(raw_args[i])
+                arg_idxs = arg_idxs.push(aidx)
+                i = i + 1
+            }
+        }
+        let astart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(arg_idxs) {
+            bc_arg_list = bc_arg_list.push(arg_idxs[j])
+            j = j + 1
+        }
+        let aend = len(bc_arg_list)
+        return bc_mk_call(fname, astart, aend)
+    }
+    if k == "IfExpr" || k == "IfStmt" {
+        // Cond goes into bc_node_pool standalone.
+        let ci = ast_to_bc_expr(node.cond)
+        // Walk then_body contiguously (children first, then push parent slice).
+        let ts = ast_to_bc_walk_body(node.then_body)
+        let ts_start = ts[0]
+        let ts_end = ts[1]
+        // else_body may be "" (absent) or a non-empty array.
+        let mut es_start = -1
+        let mut es_end = -1
+        let else_body = node.else_body
+        if type_of(else_body) == "array" {
+            if len(else_body) > 0 {
+                let es = ast_to_bc_walk_body(else_body)
+                es_start = es[0]
+                es_end = es[1]
+            }
+        }
+        return bc_mk_if_expr(ci, ts_start, ts_end, es_start, es_end)
+    }
+
+    // T44 Phase 1 — Array literal. Parser uses kind "Array" with
+    // node.items as the list of item expr dicts (see
+    // self/hexa_full.hexa L3180-3185). Flatten child indices
+    // contiguously into bc_arg_list, matching the Call-args trick.
+    if k == "Array" {
+        let raw_items = node.items
+        let mut item_idxs = []
+        if type_of(raw_items) == "array" {
+            let mut i = 0
+            while i < len(raw_items) {
+                let iidx = ast_to_bc_expr(raw_items[i])
+                item_idxs = item_idxs.push(iidx)
+                i = i + 1
+            }
+        }
+        let istart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(item_idxs) {
+            bc_arg_list = bc_arg_list.push(item_idxs[j])
+            j = j + 1
+        }
+        let iend = len(bc_arg_list)
+        return bc_mk_array(istart, iend)
+    }
+
+    // T44 Phase 1 — Index expression (`arr[idx]` / `m[k]`). Parser
+    // produces kind "Index" with node.left (container) and
+    // node.right (subscript expr). See self/hexa_full.hexa L2882.
+    if k == "Index" {
+        let li = ast_to_bc_expr(node.left)
+        let ri = ast_to_bc_expr(node.right)
+        return bc_mk_index(li, ri)
+    }
+
+    // T44 Phase 1 — Map literal (`#{ k: v, ... }`). Parser produces
+    // kind "MapLit" with node.items = list of MapEntry dicts; each
+    // MapEntry has .left = key expr, .right = value expr
+    // (self/hexa_full.hexa L3196-3214). We flatten into bc_arg_list
+    // as alternating key,value,key,value — bc_compile_expr reads
+    // the same layout.
+    if k == "MapLit" {
+        let raw_items = node.items
+        let mut flat_idxs = []
+        if type_of(raw_items) == "array" {
+            let mut i = 0
+            while i < len(raw_items) {
+                let pair = raw_items[i]
+                // Defensive: skip malformed entries (stage1 parser
+                // guarantees MapEntry shape, but stay robust).
+                if type_of(pair) == "struct" || type_of(pair) == "map" {
+                    let kidx = ast_to_bc_expr(pair.left)
+                    let vidx = ast_to_bc_expr(pair.right)
+                    flat_idxs = flat_idxs.push(kidx)
+                    flat_idxs = flat_idxs.push(vidx)
+                }
+                i = i + 1
+            }
+        }
+        let mstart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(flat_idxs) {
+            bc_arg_list = bc_arg_list.push(flat_idxs[j])
+            j = j + 1
+        }
+        let mend = len(bc_arg_list)
+        return bc_mk_map_lit(mstart, mend)
+    }
+
+    // T45 — Field access: `obj.field`. Parser produces
+    // {kind: "Field", name: field, left: obj}. Lower obj recursively
+    // and build a FieldAccess BcNode so the compiler emits
+    // OP_LOAD_FIELD with the name const idx.
+    if k == "Field" {
+        let oi = ast_to_bc_expr(node.left)
+        return bc_mk_field_access(oi, node.name)
+    }
+
+    // T51 / T54 — Lambda expression. Parser shape
+    // (hexa_full.hexa L3241-3247 / L3260-3266):
+    //   kind = "Lambda"
+    //   params = string[] (param names)
+    //   left = body — expr dict (single-expr form, T51) OR array of
+    //                 stmts (block form, T54).
+    if k == "Lambda" {
+        let raw_params = node.params
+        let ps_start = len(bc_param_list)
+        let mut np = 0
+        if type_of(raw_params) == "array" {
+            let mut pi = 0
+            while pi < len(raw_params) {
+                let pn = raw_params[pi]
+                if type_of(pn) == "string" {
+                    bc_param_list = bc_param_list.push(pn)
+                    np = np + 1
+                }
+                pi = pi + 1
+            }
+        }
+        let ps_end = len(bc_param_list)
+
+        let raw_body = node.left
+        if type_of(raw_body) == "map" || type_of(raw_body) == "struct" {
+            // Expr-body (T51).
+            let body_expr_idx = ast_to_bc_expr(raw_body)
+            return bc_mk_lambda(np, ps_start, ps_end, body_expr_idx, -1, -1)
+        }
+        if type_of(raw_body) == "array" {
+            // Block-body (T54) — lower the stmt array into a
+            // bc_stmt_list slice via the same walker the top-level
+            // code path uses, then stash (body_start, body_end) on
+            // the Lambda BcNode.
+            let rng = ast_to_bc_walk_body(raw_body)
+            return bc_mk_lambda(np, ps_start, ps_end, -1, rng[0], rng[1])
+        }
+        // Unknown body shape — produce an empty lambda (RETURN0 stub).
+        return bc_mk_lambda(np, ps_start, ps_end, -1, -1, -1)
+    }
+
+    // T45 — Struct literal: `Name { f: v, ... }`. Parser shape
+    // (hexa_full.hexa L3068): node.name = type_name,
+    // node.fields = [{kind: "FieldInit", name: fname, left: val}, ...].
+    // Flatten into bc_arg_list as alternating (StringLit(fname),
+    // val_bcnode_idx) pairs so bc_compile_expr's StructInit branch
+    // reads the same layout.
+    if k == "StructInit" {
+        let raw_fields = node.fields
+        let mut flat_idxs = []
+        if type_of(raw_fields) == "array" {
+            let mut i = 0
+            while i < len(raw_fields) {
+                let f = raw_fields[i]
+                if type_of(f) == "struct" || type_of(f) == "map" {
+                    // Name → literal StringLit BcNode (so compile_expr
+                    // emits LOADK on the field name at runtime).
+                    let kidx = bc_mk_string_lit(f.name)
+                    let vidx = ast_to_bc_expr(f.left)
+                    flat_idxs = flat_idxs.push(kidx)
+                    flat_idxs = flat_idxs.push(vidx)
+                }
+                i = i + 1
+            }
+        }
+        let sstart = len(bc_arg_list)
+        let mut j = 0
+        while j < len(flat_idxs) {
+            bc_arg_list = bc_arg_list.push(flat_idxs[j])
+            j = j + 1
+        }
+        let send = len(bc_arg_list)
+        return bc_mk_struct_init(node.name, sstart, send)
+    }
+
+    // T63 — MatchExpr: lower to BcNode with scrutinee at left_idx and
+    // arms stashed in bc_arg_list. Each arm is itself a BcNode with
+    // kind="MatchArm", left_idx = pattern expr, body_start/end = body
+    // stmts. No or-patterns, no guards (MVP); those fall through to
+    // the arm's literal pattern only.
+    if k == "MatchExpr" {
+        let me_s = ast_to_bc_expr(node.left)
+        let me_arms = node.arms
+        let mut me_arm_idxs = []
+        if type_of(me_arms) == "array" {
+            let mut ma_i = 0
+            while ma_i < len(me_arms) {
+                let ma = me_arms[ma_i]
+                let pat_idx = ast_to_bc_expr(ma.left)
+                let body_bb = ast_to_bc_walk_body(ma.body)
+                let arm_node = BcNode {
+                    kind: "MatchArm", int_val: 0, float_val: 0.0, bool_val: false,
+                    str_val: "", name: "", op: "",
+                    left_idx: pat_idx, right_idx: -1,
+                    body_start: body_bb[0], body_end: body_bb[1],
+                    else_start: -1, else_end: -1,
+                    args_start: -1, args_end: -1,
+                    n_params: 0, params_start: -1, params_end: -1
+                }
+                bc_node_pool = bc_node_pool.push(arm_node)
+                me_arm_idxs = me_arm_idxs.push(len(bc_node_pool) - 1)
+                ma_i = ma_i + 1
+            }
+        }
+        let me_start = len(bc_arg_list)
+        let mut me_k = 0
+        while me_k < len(me_arm_idxs) {
+            bc_arg_list = bc_arg_list.push(me_arm_idxs[me_k])
+            me_k = me_k + 1
+        }
+        let me_end = len(bc_arg_list)
+        let me_node = BcNode {
+            kind: "MatchExpr", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "", op: "",
+            left_idx: me_s, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: me_start, args_end: me_end,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(me_node)
+        return len(bc_node_pool) - 1
+    }
+
+    // Unsupported expr — return a harmless IntLit 0 placeholder.
+    return bc_mk_int_lit(0)
+}
+
+// Walk an AST stmt dict node, produce a bc_node_pool index for the
+// stmt BcNode. Contiguity of any inner stmt-list slices is maintained
+// by ast_to_bc_walk_body (children pushed BEFORE we return).
+fn ast_to_bc_stmt(node) {
+    if ast_is_empty(node) { return -1 }
+    if type_of(node) != "struct" && type_of(node) != "map" { return -1 }
+    let k = node.kind
+
+    if k == "FnDecl" {
+        // Params: push parameter names into bc_param_list contiguously.
+        let params = node.params
+        let ps_start = len(bc_param_list)
+        let mut np = 0
+        if type_of(params) == "array" {
+            let mut i = 0
+            while i < len(params) {
+                let p = params[i]
+                if type_of(p) != "string" {
+                    bc_param_list = bc_param_list.push(p.name)
+                    np = np + 1
+                }
+                i = i + 1
+            }
+        }
+        let ps_end = len(bc_param_list)
+        // Body: walk (children first, then push contiguous slice).
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        let bs_start = bb[0]
+        let bs_end = bb[1]
+        return bc_mk_fn_decl(node.name, np, ps_start, ps_end, bs_start, bs_end)
+    }
+
+    if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" || k == "StaticStmt" {
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_let_stmt(node.name, vi)
+    }
+
+    if k == "AssignStmt" {
+        // Parser shape (hexa_full.hexa:1376): name="", left=LHS Ident,
+        // right=RHS expr. Lower RHS, then resolve the binding name from
+        // the LHS Ident node's `name` field.
+        //
+        // T45 extension: if LHS is a `Field` node with a simple Ident
+        // base (e.g. `obj.x = v`), lower to FieldAssignStmt so the
+        // compiler emits STORE_FIELD round-tripped through the base
+        // binding. More complex bases (chained `.`, index+field, etc.)
+        // fall through to the generic ident path and currently produce
+        // a degenerate no-op — rt#36-E extends this when IC shapes land.
+        //
+        // T48 extension: if LHS is an `Index` node with a simple Ident
+        // base (e.g. `arr[i] = v` or `m[k] = v`), lower to
+        // IndexAssignStmt. Routes through OP_ARR_SET (polymorphic
+        // array/map in the VM).
+        let lhs = node.left
+        if type_of(lhs) == "map" {
+            let lk = lhs.kind
+            if lk == "Field" {
+                let base = lhs.left
+                if type_of(base) == "map" {
+                    if base.kind == "Ident" {
+                        let vi_fs = ast_to_bc_expr(node.right)
+                        return bc_mk_field_assign_stmt(base.name, lhs.name, vi_fs)
+                    }
+                }
+            }
+            if lk == "Index" {
+                let ibase = lhs.left
+                if type_of(ibase) == "map" {
+                    if ibase.kind == "Ident" {
+                        let ii = ast_to_bc_expr(lhs.right)   // idx expr
+                        let iv = ast_to_bc_expr(node.right)  // value expr
+                        return bc_mk_index_assign_stmt(ibase.name, ii, iv)
+                    }
+                }
+            }
+        }
+        let vi = ast_to_bc_expr(node.right)
+        let mut tgt = ""
+        if type_of(lhs) == "map" { tgt = lhs.name }
+        return bc_mk_assign_stmt(tgt, vi)
+    }
+
+    if k == "ReturnStmt" || k == "Return" {
+        // bare `return` → node.left is "" → ast_to_bc_expr returns -1,
+        // which bc_mk_return_stmt treats as "no value".
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_return_stmt(vi)
+    }
+
+    if k == "WhileStmt" {
+        let ci = ast_to_bc_expr(node.cond)
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        return bc_mk_while_stmt(ci, bb[0], bb[1])
+    }
+
+    // Phase 1 additions ─────────────────────────────────────────
+    // BreakStmt / ContinueStmt — the parser puts the optional label
+    // in `node.name`; we ignore it (Phase 1 supports only innermost
+    // loop targeting). bc_compile_stmt's branches above emit the
+    // JMP placeholder + backpatch / direct backward JMP.
+    if k == "BreakStmt" {
+        let _bn = BcNode {
+            kind: "BreakStmt", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: node.name, op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_bn)
+        return len(bc_node_pool) - 1
+    }
+    if k == "ContinueStmt" {
+        let _cn = BcNode {
+            kind: "ContinueStmt", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: node.name, op: "",
+            left_idx: -1, right_idx: -1,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_cn)
+        return len(bc_node_pool) - 1
+    }
+    // CompoundAssign — parser shape: left=LHS expr (Ident),
+    // right=RHS expr, op="+/-/*/// %". Lower LHS + RHS into the
+    // pool and stash the binding name on the BcNode so
+    // bc_compile_stmt's CompoundAssign branch can do
+    //   load lhs ; eval rhs ; binop ; store name.
+    if k == "CompoundAssign" {
+        let _lhs = node.left
+        let _li = ast_to_bc_expr(_lhs)
+        let _ri = ast_to_bc_expr(node.right)
+        let mut _tgt = ""
+        if type_of(_lhs) == "map" || type_of(_lhs) == "struct" {
+            if _lhs.kind == "Ident" { _tgt = _lhs.name }
+        }
+        let _ca = BcNode {
+            kind: "CompoundAssign", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: _tgt, op: node.op,
+            left_idx: _li, right_idx: _ri,
+            body_start: -1, body_end: -1,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: 0, params_start: -1, params_end: -1
+        }
+        bc_node_pool = bc_node_pool.push(_ca)
+        return len(bc_node_pool) - 1
+    }
+
+    // T46 — TryCatch: parser shape (hexa_full.hexa L3336) is
+    //   {kind: "TryCatch", name: catch_var, left: try_body_stmts,
+    //    right: catch_body_stmts}.
+    // Walk each body contiguously into bc_stmt_list and build a
+    // TryCatch BcNode.
+    if k == "TryCatch" {
+        let tb = ast_to_bc_walk_body(node.left)
+        let cb = ast_to_bc_walk_body(node.right)
+        return bc_mk_try_catch(node.name, tb[0], tb[1], cb[0], cb[1])
+    }
+
+    // T46 — ThrowStmt: `throw expr`. Parser shape: {kind: "ThrowStmt",
+    // left: value_expr}. Lower the value expr and build a ThrowStmt
+    // BcNode so the compiler emits OP_THROW after pushing the value.
+    if k == "ThrowStmt" {
+        let vi = ast_to_bc_expr(node.left)
+        return bc_mk_throw_stmt(vi)
+    }
+
+    if k == "IfExpr" || k == "IfStmt" {
+        // Stmt-form if: build the same IfExpr BcNode as the expr form,
+        // bc_compile_stmt has an IfExpr branch that forwards to
+        // bc_compile_expr (added above). No ExprStmt wrap needed.
+        let ci = ast_to_bc_expr(node.cond)
+        let ts = ast_to_bc_walk_body(node.then_body)
+        let mut es_start = -1
+        let mut es_end = -1
+        let else_body = node.else_body
+        if type_of(else_body) == "array" {
+            if len(else_body) > 0 {
+                let es = ast_to_bc_walk_body(else_body)
+                es_start = es[0]
+                es_end = es[1]
+            }
+        }
+        return bc_mk_if_expr(ci, ts[0], ts[1], es_start, es_end)
+    }
+
+    // T61 — ForStmt: `for i in expr { body }`. Detect Range iter for
+    // counter-based desugaring; otherwise fall back to array iteration.
+    if k == "ForStmt" || k == "ForElseStmt" {
+        let iter_node = node.iter_expr
+        let var_name = node.name
+        let body = node.body
+        let bb = ast_to_bc_walk_body(body)
+        let bs_start = bb[0]
+        let bs_end = bb[1]
+
+        if !ast_is_empty(iter_node) {
+            if iter_node.kind == "Range" {
+                // Range: desugar to ForRangeStmt (no array allocation)
+                let start_idx = ast_to_bc_expr(iter_node.left)
+                let end_idx = ast_to_bc_expr(iter_node.right)
+                let inclusive = false
+                if type_of(iter_node.value) == "string" {
+                    if iter_node.value == "inclusive" { inclusive = true }
+                }
+                return bc_mk_for_range_stmt(start_idx, end_idx, var_name, inclusive, bs_start, bs_end)
+            }
+        }
+        // General iteration
+        let iter_idx = ast_to_bc_expr(iter_node)
+        return bc_mk_for_array_stmt(iter_idx, var_name, bs_start, bs_end)
+    }
+
+    // G43 — ForDestructStmt: `for (a, b) in pairs { body }`
+    // Desugared to ForArrayStmt with element destructuring inside the loop.
+    // We lower to a ForArrayStmt with a hidden loop variable, then prepend
+    // destructuring LetStmts to the body.
+    if k == "ForDestructStmt" {
+        let iter_node2 = node.iter_expr
+        let destruct_names = node.params
+        let num_names = len(destruct_names)
+        let body2 = node.body
+        let bb2 = ast_to_bc_walk_body(body2)
+        let bs_start2 = bb2[0]
+        let bs_end2 = bb2[1]
+        let iter_idx2 = ast_to_bc_expr(iter_node2)
+        // Store destructure names in param_list for use in compile phase
+        let ps = len(bc_param_list)
+        let mut _pi = 0
+        while _pi < num_names {
+            bc_param_list = bc_param_list.push(destruct_names[_pi])
+            _pi = _pi + 1
+        }
+        let pe = len(bc_param_list)
+        // Create a ForDestructStmt BcNode
+        let n = BcNode {
+            kind: "ForDestructStmt", int_val: 0, float_val: 0.0, bool_val: false,
+            str_val: "", name: "", op: "",
+            left_idx: iter_idx2, right_idx: -1,
+            body_start: bs_start2, body_end: bs_end2,
+            else_start: -1, else_end: -1,
+            args_start: -1, args_end: -1,
+            n_params: num_names, params_start: ps, params_end: pe
+        }
+        bc_node_pool = bc_node_pool.push(n)
+        return len(bc_node_pool) - 1
+    }
+
+    // T62 — UseStmt / ImportStmt: runtime no-op (matches interpreter
+    // val_void() at hexa_full.hexa:7476). Preprocessor already inlined.
+    if k == "UseStmt" || k == "ImportStmt" || k == "Use" {
+        return -1
+    }
+
+    // ExprStmt: hexa parser wraps bare expressions in ExprStmt nodes
+    // (e.g. `println(fib(10))` becomes ExprStmt{ left: Call{...} }).
+    // Unwrap the inner expression and wrap with the bc-side ExprStmt.
+    //
+    // Exception: if the inner expression is an `if { ... }` block (which
+    // parse_stmt produces via parse_expr → parse_primary → parse_if_expr
+    // for bare `if n < 2 { return n }` at statement position), we do NOT
+    // wrap in ExprStmt. The bc-side ExprStmt handler unconditionally
+    // emits OP_POP after compiling the expression, but a stmt-form `if`
+    // whose then-branch ends in `return` leaves ZERO values on the
+    // operand stack (not one), so the POP would underflow at runtime.
+    // Instead, push the IfExpr BcNode directly as a stmt — bc_compile_stmt's
+    // IfExpr branch (added further above) forwards to bc_compile_expr
+    // without the POP wrapper.
+    if k == "ExprStmt" {
+        let inner = node.left
+        if !ast_is_empty(inner) {
+            let ik = inner.kind
+            if ik == "IfExpr" || ik == "IfStmt" {
+                return ast_to_bc_expr(inner)
+            }
+        }
+        let ei = ast_to_bc_expr(inner)
+        return bc_mk_expr_stmt(ei)
+    }
+
+    // Fallback: try to treat the node itself as an expression. This
+    // catches oddities where a stmt-position expression wasn't already
+    // wrapped in ExprStmt by the parser (rare but possible for
+    // edge-case grammar productions).
+    let ei2 = ast_to_bc_expr(node)
+    return bc_mk_expr_stmt(ei2)
+}
+
+// Top-level AST walker. Consumes `ast` (list of stmt dicts), populates
+// bc_node_pool / bc_stmt_list / bc_arg_list / bc_param_list, and then
+// invokes bc_compile_root on the root stmt range.
+//
+// Returns the [n_protos, total_instrs, total_consts] triple that
+// bc_compile_root yields, or [-1, 0, 0] if `ast` is unusable.
+fn ast_to_bc_walk_root(ast) {
+    bc_reset_pools()
+    if type_of(ast) != "array" { return [-1, 0, 0] }
+    let n = len(ast)
+    if n == 0 { return [0, 0, 0] }
+
+    // Walk each top-level stmt into bc_node_pool, collecting indices
+    // into a local buffer. Then push them onto bc_stmt_list contiguously.
+    let mut top_idxs = []
+    let mut i = 0
+    while i < n {
+        let sidx = ast_to_bc_stmt(ast[i])
+        top_idxs = top_idxs.push(sidx)
+        i = i + 1
+    }
+    let root_start = len(bc_stmt_list)
+    let mut j = 0
+    while j < len(top_idxs) {
+        bc_stmt_list = bc_stmt_list.push(top_idxs[j])
+        j = j + 1
+    }
+    let root_end = len(bc_stmt_list)
+
+    return bc_compile_root(root_start, root_end)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  rt#36-D deferred VM entry point.
+//
+//  This block runs as top-level code AT THE END of bc_emitter.hexa.
+//  In the flattened stage0 bundle produced by scripts/flatten_imports.hexa,
+//  bc_emitter.hexa is concatenated AFTER hexa_full.hexa and bc_vm.hexa.
+//  C-level translation from hexa_v2 emits top-level `let` bindings
+//  in order of appearance inside the main() function, so by the time
+//  this block executes:
+//
+//    1) hexa_full.hexa's entry point has already tokenized + parsed
+//       the user script into `_hx_ast` and set `_hx_has_script = true`
+//       (deferring interpret() when HEXA_VM=1 was observed).
+//    2) All `let BC_OP_*` definitions above in bc_emitter.hexa have
+//       been run, so bc_compile_expr / bc_vm_run_loop see the correct
+//       opcode integers.
+//
+//  Running bc_vm_run here — rather than inline in hexa_full's entry —
+//  eliminates the "BC_OP_* are zero at first use" ordering bug that
+//  would otherwise silently emit LOADK/POP sequences instead of
+//  LOADI/ADD/... on all non-LOADK opcodes.
+//
+//  This block is a NO-OP unless `HEXA_VM` is exported to the child.
+// ═══════════════════════════════════════════════════════════════════
+if _hx_has_script {
+    // T56 — VM path triggers on either HEXA_VM env var (legacy) OR the
+    // --vm/--bc CLI flag parsed in hexa_full.hexa's entry (new).
+    if env_var("HEXA_VM") == "1" || _hx_vm_flag {
+        let _bcv_summary = ast_to_bc_walk_root(_hx_ast)
+        // Optional debug: `HEXA_VM_DEBUG=1` dumps the compile summary
+        // and the disassembly of every emitted proto — useful when a
+        // program traps with "pc past code end" or similar so the
+        // exact bytecode can be inspected at the shell.
+        if env_var("HEXA_VM_DEBUG") == "1" {
+            println("[bc_vm] protos=" + to_string(_bcv_summary[0]) + " instrs=" + to_string(_bcv_summary[1]) + " consts=" + to_string(_bcv_summary[2]))
+            let mut _bcv_dp = 0
+            while _bcv_dp < bc_get_proto_count() {
+                println("[bc_vm] proto[" + to_string(_bcv_dp) + "] " + bc_get_proto_name(_bcv_dp) + " code_len=" + to_string(bc_get_proto_code_len(_bcv_dp)) + " n_params=" + to_string(bc_get_proto_n_params(_bcv_dp)) + " n_locals=" + to_string(bc_get_proto_n_locals(_bcv_dp)))
+                let mut _bcv_dc = 0
+                while _bcv_dc < bc_get_proto_code_len(_bcv_dp) {
+                    let _bcv_raw = bc_get_proto_insn(_bcv_dp, _bcv_dc)
+                    println("  " + to_string(_bcv_dc) + ": " + bc_disasm_insn(_bcv_raw))
+                    _bcv_dc = _bcv_dc + 1
+                }
+                _bcv_dp = _bcv_dp + 1
+            }
+        }
+        let _bcv_rv = bc_vm_run()
+        if bc_vm_trap_hit() {
+            // rt#36-d trivial fix (2026-04-15): align uncaught-throw with
+            // interpreter's `error: <msg>` diagnostic. bc_vm's OP_THROW
+            // sets reason = "uncaught throw: <val>" when no try-frame
+            // catches it — strip that prefix so the visible shell output
+            // matches interpreter exactly. Non-throw traps (unimplemented
+            // opcode, stack corruption, pc past code end, etc.) still
+            // show the `bc_vm trap:` label where the internal tag is
+            // useful for debugging.
+            let _bcv_reason = bc_vm_trap_reason()
+            if _bcv_reason.starts_with("uncaught throw: ") {
+                println("error: " + _bcv_reason.substring(len("uncaught throw: "), len(_bcv_reason)))
+            } else {
+                println("error: bc_vm trap: " + _bcv_reason)
+            }
+        }
+    }
+}
+
+
+
+// -- end inlined --
 use "bc_vm"
 
 // ── BcProto registry helpers (mirrors test_bc_vm_smoke). ─────

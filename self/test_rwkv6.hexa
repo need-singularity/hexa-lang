@@ -31,7 +31,1013 @@
 //  Run: ./hexa self/interpreter.hexa self/test_rwkv6.hexa
 // ===================================================================
 
-import "ml/rwkv6.hexa"
+// -- inlined from self/ml/rwkv6.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/rwkv6.hexa — RWKV-6: Linear Attention RNN v6 (#333)
+//
+//  RWKV-6 (Peng et al., 2024) extends RWKV with data-dependent
+//  mechanisms that close the gap with Transformers while keeping
+//  O(1) per-token inference cost.
+//
+//  Key innovations over RWKV-4/5:
+//    1. Data-Dependent Linear Interpolation (DDLERP)
+//       - Token shift mix ratios are input-dependent, not fixed
+//       - mu(x) = sigmoid(W_mu . (x - x_prev) + b_mu)
+//    2. Data-Dependent Decay (w_t)
+//       - Decay rate depends on current input, not just position
+//       - w_t = base_w + W_w . shifted_w   (per-dim, per-token)
+//    3. Multi-head WKV with group normalization
+//    4. Receptance + Key + Value + Gate (RKVG) formulation
+//
+//  Components:
+//    1. Math / vector helpers (r6_ prefix)
+//    2. LayerNorm + GroupNorm
+//    3. DDLERP token shift
+//    4. WKV-6 kernel (data-dependent decay)
+//    5. Time-mix v6 (RKVG + multi-head WKV)
+//    6. Channel-mix v6 (with DDLERP)
+//    7. RWKV6 block (LN + time-mix + channel-mix + residual)
+//    8. Multi-layer stack + recurrent state
+//    9. Generation (O(1) per token)
+//   10. Training forward pass
+//
+//  API (r6_ prefix):
+//    r6_create_stack(n_layers, d_model, n_heads, ff_dim, seed)
+//    r6_stack_step(stack, x, state)  -> [output, new_state]
+//    r6_generate(stack, start_tokens, n_gen, vocab_size, seed)
+//    r6_train_forward(stack, token_ids, vocab_size, seed)
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — inner-loop kernels
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+
+fn r6_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn r6_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn r6_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn r6_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    let mut t = (x - 1.0) / (x + 1.0)
+    let t2 = t * t
+    let mut term = t
+    for i in 0..15 {
+        y = y + term / to_float(2 * i + 1)
+        term = term * t2
+    }
+    return 2.0 * y
+}
+
+fn r6_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + r6_exp(0.0 - x))
+}
+
+fn r6_tanh(x) {
+    if x > 10.0 { return 1.0 }
+    if x < -10.0 { return -1.0 }
+    let e2x = r6_exp(2.0 * x)
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+fn r6_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+fn r6_relu_squared(x) {
+    let r = r6_relu(x)
+    return r * r
+}
+
+fn r6_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn r6_silu(x) {
+    return x * r6_sigmoid(x)
+}
+
+// ===================================================================
+//  Vector utilities
+// ===================================================================
+
+fn r6_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn r6_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+fn r6_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+fn r6_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+fn r6_vec_mul(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] * b[i]] }
+    return out
+}
+
+fn r6_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+fn r6_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+fn r6_vec_sigmoid(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [r6_sigmoid(v[i])] }
+    return out
+}
+
+fn r6_vec_silu(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [r6_silu(v[i])] }
+    return out
+}
+
+fn r6_vec_relu_sq(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [r6_relu_squared(v[i])] }
+    return out
+}
+
+fn r6_vec_exp(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [r6_exp(v[i])] }
+    return out
+}
+
+fn r6_vec_tanh(v) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [r6_tanh(v[i])] }
+    return out
+}
+
+// ===================================================================
+//  Matrix utilities (row-major: array of row-vectors)
+// ===================================================================
+
+fn r6_mat_zeros(rows, cols) {
+    let mut m = []
+    for _r in 0..rows { m = m + [r6_zeros(cols)] }
+    return m
+}
+
+fn r6_mat_vec(mat, v) {
+    let rows = len(mat)
+    let mut out = []
+    for r in 0..rows { out = out + [r6_dot(mat[r], v)] }
+    return out
+}
+
+// Deterministic pseudo-random initialization
+fn r6_init_weight(rows, cols, seed) {
+    let scale = 1.0 / r6_sqrt(to_float(cols))
+    let mut m = []
+    for r in 0..rows {
+        let mut row = []
+        for c in 0..cols {
+            let h = (r * 137 + c * 311 + seed * 7919) % 10007
+            let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+            row = row + [val]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn r6_init_vec(dim, seed) {
+    let scale = 1.0 / r6_sqrt(to_float(dim))
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        v = v + [val]
+    }
+    return v
+}
+
+fn r6_init_vec_range(dim, low, high, seed) {
+    let range = high - low
+    let mut v = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = low + to_float(h) / 10007.0 * range
+        v = v + [val]
+    }
+    return v
+}
+
+// ===================================================================
+//  LayerNorm
+// ===================================================================
+
+struct R6LayerNorm {
+    dim: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn r6_create_layer_norm(dim) {
+    return R6LayerNorm {
+        dim: dim,
+        gamma: r6_ones(dim),
+        beta: r6_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+@pure
+fn r6_layer_norm_fwd(ln, x) {
+    let n = ln.dim
+    let mut mean = 0.0
+    for i in 0..n { mean = mean + x[i] }
+    mean = mean / to_float(n)
+    let mut var = 0.0
+    for i in 0..n {
+        let d = x[i] - mean
+        var = var + d * d
+    }
+    var = var / to_float(n)
+    let inv_std = 1.0 / r6_sqrt(var + ln.eps)
+    let mut out = []
+    for i in 0..n {
+        let normed = (x[i] - mean) * inv_std
+        out = out + [ln.gamma[i] * normed + ln.beta[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  GroupNorm — normalize within each head group
+//  groups: number of groups (= n_heads)
+//  dim: total dimension (must be divisible by groups)
+// ===================================================================
+
+struct R6GroupNorm {
+    dim: int,
+    groups: int,
+    gamma: array,
+    beta: array,
+    eps: float
+}
+
+fn r6_create_group_norm(dim, groups) {
+    return R6GroupNorm {
+        dim: dim,
+        groups: groups,
+        gamma: r6_ones(dim),
+        beta: r6_zeros(dim),
+        eps: 1.0e-5
+    }
+}
+
+@pure
+fn r6_group_norm_fwd(gn, x) {
+    let group_size = gn.dim / gn.groups
+    let mut out = r6_zeros(gn.dim)
+    for g in 0..gn.groups {
+        let offset = g * group_size
+        // Compute mean for this group
+        let mut mean = 0.0
+        for i in 0..group_size {
+            mean = mean + x[offset + i]
+        }
+        mean = mean / to_float(group_size)
+        // Compute variance for this group
+        let mut var = 0.0
+        for i in 0..group_size {
+            let d = x[offset + i] - mean
+            var = var + d * d
+        }
+        var = var / to_float(group_size)
+        let inv_std = 1.0 / r6_sqrt(var + gn.eps)
+        // Normalize
+        for i in 0..group_size {
+            let idx = offset + i
+            let normed = (x[idx] - mean) * inv_std
+            out[idx] = gn.gamma[idx] * normed + gn.beta[idx]
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  DDLERP — Data-Dependent Linear Interpolation
+//
+//  Unlike RWKV-4/5 where mu is a fixed learnable vector,
+//  RWKV-6 computes mu dynamically from the difference (x - x_prev):
+//    delta = x_curr - x_prev
+//    mu = sigmoid(W_mu . delta + b_mu)
+//    output = mu * x_prev + (1 - mu) * x_curr
+//
+//  This allows the model to adaptively decide how much to shift
+//  based on the actual content change between tokens.
+// ===================================================================
+
+struct R6DDLERP {
+    dim: int,
+    W_mu: array,
+    b_mu: array
+}
+
+fn r6_create_ddlerp(dim, seed) {
+    return R6DDLERP {
+        dim: dim,
+        W_mu: r6_init_weight(dim, dim, seed),
+        b_mu: r6_init_vec_range(dim, -0.5, 0.5, seed + 1)
+    }
+}
+
+@pure @hot
+fn r6_ddlerp_forward(dd, x_curr, x_prev) {
+    let delta = r6_vec_sub(x_curr, x_prev)
+    let raw = r6_vec_add(r6_mat_vec(dd.W_mu, delta), dd.b_mu)
+    let mu = r6_vec_sigmoid(raw)
+    // mu * x_prev + (1 - mu) * x_curr
+    let n = dd.dim
+    let mut out = []
+    for i in 0..n {
+        out = out + [mu[i] * x_prev[i] + (1.0 - mu[i]) * x_curr[i]]
+    }
+    return out
+}
+
+// ===================================================================
+//  WKV-6 Kernel — Data-Dependent Decay
+//
+//  Unlike RWKV-4/5 where w is a fixed vector, RWKV-6 computes
+//  w_t dynamically from the shifted input:
+//    w_t = base_w + tanh(W_w . shifted_w) * scale_w
+//
+//  This makes the decay rate adapt to the input content,
+//  allowing the model to decide per-token how much history to keep.
+//
+//  WKV formula with data-dependent w:
+//    a_t = exp(w_t) * a_{t-1} + exp(k_t) * v_t
+//    b_t = exp(w_t) * b_{t-1} + exp(k_t)
+//    wkv_t = (a_{t-1} + exp(u + k_t) * v_t) / (b_{t-1} + exp(u + k_t))
+// ===================================================================
+
+// Single-step WKV-6 with data-dependent decay w_t
+// w_t: already-computed data-dependent decay for this step
+// Returns: [wkv_output, new_a, new_b]
+@pure @hot
+fn r6_wkv6_step(k, v, w_t, u, state_a, state_b, head_dim) {
+    let mut wkv = []
+    let mut new_a = []
+    let mut new_b = []
+    for i in 0..head_dim {
+        let ek = r6_exp(k[i])
+        let euk = r6_exp(u[i] + k[i])
+        let ew = r6_exp(w_t[i])
+        // WKV output
+        let num = state_a[i] + euk * v[i]
+        let den = state_b[i] + euk
+        let safe_den = if r6_abs(den) < 1.0e-8 { 1.0e-8 } else { den }
+        wkv = wkv + [num / safe_den]
+        // State update with data-dependent decay
+        new_a = new_a + [ew * state_a[i] + ek * v[i]]
+        new_b = new_b + [ew * state_b[i] + ek]
+    }
+    return [wkv, new_a, new_b]
+}
+
+// ===================================================================
+//  Time-Mix v6 — RKVG + Multi-Head WKV + DDLERP + GroupNorm
+//
+//  r = sigmoid(W_r . ddlerp_r(x, x_prev))
+//  k = W_k . ddlerp_k(x, x_prev)
+//  v = W_v . ddlerp_v(x, x_prev)
+//  g = silu(W_g . ddlerp_g(x, x_prev))      -- gate (new in v6)
+//  w_t = base_w + tanh(W_w . ddlerp_w(x, x_prev)) * w_scale
+//
+//  Multi-head WKV: split r,k,v,w across heads, run WKV per head
+//  output = group_norm(concat_heads(wkv))
+//  output = g * (W_o . output)                -- gated output
+// ===================================================================
+
+struct R6TimeMix {
+    dim: int,
+    n_heads: int,
+    head_dim: int,
+    W_r: array,
+    W_k: array,
+    W_v: array,
+    W_g: array,
+    W_o: array,
+    W_w: array,
+    dd_r: R6DDLERP,
+    dd_k: R6DDLERP,
+    dd_v: R6DDLERP,
+    dd_g: R6DDLERP,
+    dd_w: R6DDLERP,
+    base_w: array,
+    w_scale: array,
+    u: array,
+    gn: R6GroupNorm
+}
+
+fn r6_create_time_mix(dim, n_heads, seed) {
+    let head_dim = dim / n_heads
+    return R6TimeMix {
+        dim: dim,
+        n_heads: n_heads,
+        head_dim: head_dim,
+        W_r: r6_init_weight(dim, dim, seed + 1),
+        W_k: r6_init_weight(dim, dim, seed + 2),
+        W_v: r6_init_weight(dim, dim, seed + 3),
+        W_g: r6_init_weight(dim, dim, seed + 4),
+        W_o: r6_init_weight(dim, dim, seed + 5),
+        W_w: r6_init_weight(dim, dim, seed + 6),
+        dd_r: r6_create_ddlerp(dim, seed + 100),
+        dd_k: r6_create_ddlerp(dim, seed + 200),
+        dd_v: r6_create_ddlerp(dim, seed + 300),
+        dd_g: r6_create_ddlerp(dim, seed + 400),
+        dd_w: r6_create_ddlerp(dim, seed + 500),
+        base_w: r6_init_vec_range(dim, -2.0, -0.5, seed + 7),
+        w_scale: r6_init_vec_range(dim, 0.5, 1.5, seed + 8),
+        u: r6_init_vec_range(dim, -0.5, 0.5, seed + 9),
+        gn: r6_create_group_norm(dim, n_heads)
+    }
+}
+
+// Extract head slice: indices [head*head_dim .. (head+1)*head_dim)
+fn r6_head_slice(v, head, head_dim) {
+    let offset = head * head_dim
+    let mut out = []
+    for i in 0..head_dim {
+        out = out + [v[offset + i]]
+    }
+    return out
+}
+
+// Time-mix v6 forward (single token, recurrent mode)
+// x_curr: current token embedding
+// x_prev: previous token embedding (for DDLERP)
+// state_a, state_b: per-head WKV states, flattened [n_heads * head_dim]
+// Returns: [output, new_state_a, new_state_b, x_curr]
+@hot
+fn r6_time_mix_step(tm, x_curr, x_prev, state_a, state_b) {
+    // DDLERP for each projection
+    let shifted_r = r6_ddlerp_forward(tm.dd_r, x_curr, x_prev)
+    let shifted_k = r6_ddlerp_forward(tm.dd_k, x_curr, x_prev)
+    let shifted_v = r6_ddlerp_forward(tm.dd_v, x_curr, x_prev)
+    let shifted_g = r6_ddlerp_forward(tm.dd_g, x_curr, x_prev)
+    let shifted_w = r6_ddlerp_forward(tm.dd_w, x_curr, x_prev)
+
+    // Projections
+    let r = r6_vec_sigmoid(r6_mat_vec(tm.W_r, shifted_r))
+    let k = r6_mat_vec(tm.W_k, shifted_k)
+    let v = r6_mat_vec(tm.W_v, shifted_v)
+    let g = r6_vec_silu(r6_mat_vec(tm.W_g, shifted_g))
+
+    // Data-dependent decay: w_t = base_w + tanh(W_w . shifted_w) * w_scale
+    let w_raw = r6_vec_tanh(r6_mat_vec(tm.W_w, shifted_w))
+    let w_t = r6_vec_add(tm.base_w, r6_vec_mul(w_raw, tm.w_scale))
+
+    // Multi-head WKV
+    let hd = tm.head_dim
+    let mut wkv_concat = []
+    let mut new_sa = []
+    let mut new_sb = []
+    for h in 0..tm.n_heads {
+        let k_h = r6_head_slice(k, h, hd)
+        let v_h = r6_head_slice(v, h, hd)
+        let w_h = r6_head_slice(w_t, h, hd)
+        let u_h = r6_head_slice(tm.u, h, hd)
+        let sa_h = r6_head_slice(state_a, h, hd)
+        let sb_h = r6_head_slice(state_b, h, hd)
+        let res = r6_wkv6_step(k_h, v_h, w_h, u_h, sa_h, sb_h, hd)
+        // Append head results
+        for i in 0..hd { wkv_concat = wkv_concat + [res[0][i]] }
+        for i in 0..hd { new_sa = new_sa + [res[1][i]] }
+        for i in 0..hd { new_sb = new_sb + [res[2][i]] }
+    }
+
+    // GroupNorm on concatenated multi-head output
+    let normed = r6_group_norm_fwd(tm.gn, wkv_concat)
+
+    // Receptance gating: r * normed
+    let gated_r = r6_vec_mul(r, normed)
+
+    // Output projection + SiLU gate
+    let projected = r6_mat_vec(tm.W_o, gated_r)
+    let output = r6_vec_mul(g, projected)
+
+    return [output, new_sa, new_sb, x_curr]
+}
+
+// Time-mix v6 forward (full sequence)
+fn r6_time_mix_sequence(tm, xs) {
+    let seq_len = len(xs)
+    let d = tm.dim
+    let mut state_a = r6_zeros(d)
+    let mut state_b = r6_zeros(d)
+    let mut x_prev = r6_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = r6_time_mix_step(tm, xs[t], x_prev, state_a, state_b)
+        outputs = outputs + [res[0]]
+        state_a = res[1]
+        state_b = res[2]
+        x_prev = res[3]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Channel-Mix v6 — with DDLERP
+//
+//  Uses DDLERP instead of fixed mu for token shift.
+//  r = sigmoid(W_r . ddlerp_r(x, x_prev))
+//  k = relu^2(W_k . ddlerp_k(x, x_prev))
+//  output = r * (W_v . k)
+// ===================================================================
+
+struct R6ChannelMix {
+    dim: int,
+    ff_dim: int,
+    W_r: array,
+    W_k: array,
+    W_v: array,
+    dd_r: R6DDLERP,
+    dd_k: R6DDLERP
+}
+
+fn r6_create_channel_mix(dim, ff_dim, seed) {
+    return R6ChannelMix {
+        dim: dim,
+        ff_dim: ff_dim,
+        W_r: r6_init_weight(dim, dim, seed + 10),
+        W_k: r6_init_weight(ff_dim, dim, seed + 11),
+        W_v: r6_init_weight(dim, ff_dim, seed + 12),
+        dd_r: r6_create_ddlerp(dim, seed + 600),
+        dd_k: r6_create_ddlerp(dim, seed + 700)
+    }
+}
+
+@hot
+fn r6_channel_mix_step(cm, x_curr, x_prev) {
+    let shifted_r = r6_ddlerp_forward(cm.dd_r, x_curr, x_prev)
+    let shifted_k = r6_ddlerp_forward(cm.dd_k, x_curr, x_prev)
+    let r = r6_vec_sigmoid(r6_mat_vec(cm.W_r, shifted_r))
+    let k = r6_vec_relu_sq(r6_mat_vec(cm.W_k, shifted_k))
+    let v = r6_mat_vec(cm.W_v, k)
+    let output = r6_vec_mul(r, v)
+    return [output, x_curr]
+}
+
+fn r6_channel_mix_sequence(cm, xs) {
+    let seq_len = len(xs)
+    let mut x_prev = r6_zeros(cm.dim)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = r6_channel_mix_step(cm, xs[t], x_prev)
+        outputs = outputs + [res[0]]
+        x_prev = res[1]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  RWKV-6 Block: LN + Time-Mix v6 + residual + LN + Channel-Mix v6 + residual
+// ===================================================================
+
+struct R6Block {
+    dim: int,
+    ff_dim: int,
+    n_heads: int,
+    ln1: R6LayerNorm,
+    ln2: R6LayerNorm,
+    time_mix: R6TimeMix,
+    channel_mix: R6ChannelMix
+}
+
+fn r6_create_block(dim, n_heads, ff_dim, seed) {
+    return R6Block {
+        dim: dim,
+        ff_dim: ff_dim,
+        n_heads: n_heads,
+        ln1: r6_create_layer_norm(dim),
+        ln2: r6_create_layer_norm(dim),
+        time_mix: r6_create_time_mix(dim, n_heads, seed),
+        channel_mix: r6_create_channel_mix(dim, ff_dim, seed + 2000)
+    }
+}
+
+// Block forward (single token, recurrent mode)
+// x: current embedding
+// tm_prev: previous token for time-mix DDLERP
+// cm_prev: previous token for channel-mix DDLERP
+// state_a, state_b: WKV recurrent state
+// Returns: [output, new_state_a, new_state_b, tm_prev_new, cm_prev_new]
+fn r6_block_step(blk, x, tm_prev, cm_prev, state_a, state_b) {
+    // Time-mix branch with residual
+    let normed1 = r6_layer_norm_fwd(blk.ln1, x)
+    let tm_res = r6_time_mix_step(blk.time_mix, normed1, tm_prev, state_a, state_b)
+    let x2 = r6_vec_add(x, tm_res[0])
+    let new_a = tm_res[1]
+    let new_b = tm_res[2]
+    let tm_prev_new = tm_res[3]
+    // Channel-mix branch with residual
+    let normed2 = r6_layer_norm_fwd(blk.ln2, x2)
+    let cm_res = r6_channel_mix_step(blk.channel_mix, normed2, cm_prev)
+    let x3 = r6_vec_add(x2, cm_res[0])
+    let cm_prev_new = cm_res[1]
+    return [x3, new_a, new_b, tm_prev_new, cm_prev_new]
+}
+
+// Block forward (full sequence)
+fn r6_block_sequence(blk, xs) {
+    let seq_len = len(xs)
+    let d = blk.dim
+    let mut state_a = r6_zeros(d)
+    let mut state_b = r6_zeros(d)
+    let mut tm_prev = r6_zeros(d)
+    let mut cm_prev = r6_zeros(d)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = r6_block_step(blk, xs[t], tm_prev, cm_prev, state_a, state_b)
+        outputs = outputs + [res[0]]
+        state_a = res[1]
+        state_b = res[2]
+        tm_prev = res[3]
+        cm_prev = res[4]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Recurrent State — container for multi-layer state
+// ===================================================================
+
+struct R6State {
+    n_layers: int,
+    dim: int,
+    state_a: array,
+    state_b: array,
+    tm_prev: array,
+    cm_prev: array
+}
+
+fn r6_create_state(n_layers, dim) {
+    let mut sa = []
+    let mut sb = []
+    let mut tp = []
+    let mut cp = []
+    for _l in 0..n_layers {
+        sa = sa + [r6_zeros(dim)]
+        sb = sb + [r6_zeros(dim)]
+        tp = tp + [r6_zeros(dim)]
+        cp = cp + [r6_zeros(dim)]
+    }
+    return R6State {
+        n_layers: n_layers,
+        dim: dim,
+        state_a: sa,
+        state_b: sb,
+        tm_prev: tp,
+        cm_prev: cp
+    }
+}
+
+// ===================================================================
+//  Multi-layer RWKV-6 Stack
+// ===================================================================
+
+struct R6Stack {
+    n_layers: int,
+    d_model: int,
+    n_heads: int,
+    ff_dim: int,
+    blocks: array,
+    ln_out: R6LayerNorm
+}
+
+fn r6_create_stack(n_layers, d_model, n_heads, ff_dim, seed) {
+    let mut blocks = []
+    for l in 0..n_layers {
+        blocks = blocks + [r6_create_block(d_model, n_heads, ff_dim, seed + l * 10000)]
+    }
+    return R6Stack {
+        n_layers: n_layers,
+        d_model: d_model,
+        n_heads: n_heads,
+        ff_dim: ff_dim,
+        blocks: blocks,
+        ln_out: r6_create_layer_norm(d_model)
+    }
+}
+
+// Stack forward (single token, recurrent mode)
+// Returns: [output, new_state]
+fn r6_stack_step(stack, x, state) {
+    let mut h = x
+    let mut new_sa = []
+    let mut new_sb = []
+    let mut new_tp = []
+    let mut new_cp = []
+    for l in 0..stack.n_layers {
+        let blk = stack.blocks[l]
+        let res = r6_block_step(blk, h, state.tm_prev[l], state.cm_prev[l], state.state_a[l], state.state_b[l])
+        h = res[0]
+        new_sa = new_sa + [res[1]]
+        new_sb = new_sb + [res[2]]
+        new_tp = new_tp + [res[3]]
+        new_cp = new_cp + [res[4]]
+    }
+    let out = r6_layer_norm_fwd(stack.ln_out, h)
+    let new_state = R6State {
+        n_layers: state.n_layers,
+        dim: state.dim,
+        state_a: new_sa,
+        state_b: new_sb,
+        tm_prev: new_tp,
+        cm_prev: new_cp
+    }
+    return [out, new_state]
+}
+
+// Stack forward (full sequence)
+fn r6_stack_sequence(stack, xs) {
+    let seq_len = len(xs)
+    let mut state = r6_create_state(stack.n_layers, stack.d_model)
+    let mut outputs = []
+    for t in 0..seq_len {
+        let res = r6_stack_step(stack, xs[t], state)
+        outputs = outputs + [res[0]]
+        state = res[1]
+    }
+    return outputs
+}
+
+// ===================================================================
+//  Embedding / Unembedding
+// ===================================================================
+
+fn r6_embed(token_id, d_model, seed) {
+    let mut v = []
+    for i in 0..d_model {
+        let h = (token_id * 137 + i * 311 + seed) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.1
+        v = v + [val]
+    }
+    return v
+}
+
+fn r6_unembed(h, vocab_size, d_model, seed) {
+    let mut logits = []
+    for v in 0..vocab_size {
+        let mut score = 0.0
+        for i in 0..d_model {
+            let w_h = (v * 137 + i * 311 + seed + 999) % 10007
+            let w = (to_float(w_h) / 10007.0 - 0.5) * 0.1
+            score = score + h[i] * w
+        }
+        logits = logits + [score]
+    }
+    return logits
+}
+
+fn r6_embed_seq(token_ids, d_model, seed) {
+    let n = len(token_ids)
+    let mut xs = []
+    for t in 0..n {
+        xs = xs + [r6_embed(token_ids[t], d_model, seed)]
+    }
+    return xs
+}
+
+// ===================================================================
+//  Softmax / Argmax / Loss
+// ===================================================================
+
+@pure
+fn r6_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut exps = r6_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        exps[i] = r6_exp(logits[i] - mx)
+        z = z + exps[i]
+    }
+    let mut out = r6_zeros(n)
+    for i in 0..n { out[i] = exps[i] / z }
+    return out
+}
+
+@pure
+fn r6_argmax(logits) {
+    let n = len(logits)
+    let mut best = 0
+    let mut best_v = logits[0]
+    for i in 1..n {
+        if logits[i] > best_v {
+            best_v = logits[i]
+            best = i
+        }
+    }
+    return best
+}
+
+@pure
+fn r6_cross_entropy(logits, target) {
+    let probs = r6_softmax(logits)
+    let p = probs[target]
+    let safe_p = if p < 1.0e-10 { 1.0e-10 } else { p }
+    return 0.0 - r6_log(safe_p)
+}
+
+fn r6_sequence_loss(all_logits, targets) {
+    let n = len(targets)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        total = total + r6_cross_entropy(all_logits[i], targets[i])
+    }
+    return total / to_float(n)
+}
+
+// ===================================================================
+//  Generation — greedy, O(1) per token using recurrent state
+// ===================================================================
+
+fn r6_generate(stack, start_tokens, n_gen, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let mut state = r6_create_state(stack.n_layers, d)
+    // Process prompt (prefill)
+    let n_prompt = len(start_tokens)
+    let mut last_out = r6_zeros(d)
+    for t in 0..n_prompt {
+        let emb = r6_embed(start_tokens[t], d, emb_seed)
+        let res = r6_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    // Generate tokens
+    let mut generated = []
+    for _g in 0..n_gen {
+        let logits = r6_unembed(last_out, vocab_size, d, emb_seed)
+        let next_id = r6_argmax(logits)
+        generated = generated + [next_id]
+        let emb = r6_embed(next_id, d, emb_seed)
+        let res = r6_stack_step(stack, emb, state)
+        last_out = res[0]
+        state = res[1]
+    }
+    return generated
+}
+
+// ===================================================================
+//  Training forward — parallel over full sequence
+// ===================================================================
+
+fn r6_train_forward(stack, token_ids, vocab_size, emb_seed) {
+    let d = stack.d_model
+    let seq_len = len(token_ids)
+    let mut xs = []
+    for t in 0..seq_len {
+        xs = xs + [r6_embed(token_ids[t], d, emb_seed)]
+    }
+    let outs = r6_stack_sequence(stack, xs)
+    let mut all_logits = []
+    for t in 0..seq_len {
+        let logits = r6_unembed(outs[t], vocab_size, d, emb_seed)
+        all_logits = all_logits + [logits]
+    }
+    return all_logits
+}
+
+// ===================================================================
+//  Verify recurrent vs sequential equivalence
+// ===================================================================
+
+fn r6_verify_equivalence(stack, token_ids, emb_seed) {
+    let d = stack.d_model
+    let n = len(token_ids)
+    // Sequential: one token at a time
+    let mut state = r6_create_state(stack.n_layers, d)
+    let mut seq_outs = []
+    for t in 0..n {
+        let emb = r6_embed(token_ids[t], d, emb_seed)
+        let res = r6_stack_step(stack, emb, state)
+        seq_outs = seq_outs + [res[0]]
+        state = res[1]
+    }
+    // Parallel: full-sequence forward
+    let par_outs = r6_stack_sequence(stack, r6_embed_seq(token_ids, d, emb_seed))
+    // Compare
+    let mut max_diff = 0.0
+    for t in 0..n {
+        for i in 0..d {
+            let diff = r6_abs(seq_outs[t][i] - par_outs[t][i])
+            if diff > max_diff { max_diff = diff }
+        }
+    }
+    return max_diff
+}
+
+// ===================================================================
+//  Parameter count
+// ===================================================================
+
+fn r6_param_count(stack) {
+    let d = stack.d_model
+    let ff = stack.ff_dim
+    let nh = stack.n_heads
+    let n = stack.n_layers
+    // Per block time-mix:
+    //   W_r,W_k,W_v,W_g,W_o,W_w: 6 * d*d
+    //   dd_r..dd_w: 5 DDLERP each with d*d + d = 5*(d*d + d)
+    //   base_w, w_scale, u: 3d
+    //   group_norm: 2d
+    let tm_params = 6 * d * d + 5 * (d * d + d) + 3 * d + 2 * d
+    // Per block channel-mix:
+    //   W_r: d*d, W_k: ff*d, W_v: d*ff
+    //   dd_r, dd_k: 2 DDLERP = 2*(d*d + d)
+    let cm_params = d * d + ff * d + d * ff + 2 * (d * d + d)
+    // LayerNorm: 2 per block, 2d each
+    let ln_params = 4 * d
+    let per_block = tm_params + cm_params + ln_params
+    let total = n * per_block + 2 * d
+    return total
+}
+
+println("[rwkv6] loaded — RWKV-6 with DDLERP + data-dependent decay + multi-head WKV + GroupNorm")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0
