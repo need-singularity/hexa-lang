@@ -1,0 +1,321 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/parse_format_pure.hexa — Phase 2 runtime port
+//
+//  Pure-Hexa parse/format helpers NOT covered by the existing modules
+//  (parse_pure, conv_pure, hex_pure, fmt_pure, string_pure, format_pure).
+//
+//  New API:
+//    parse_int_base_pure(s, base)  — generalized base 2..36 string parser
+//    parse_hex_pure(s)             — "0x1F" | "1F" | "1f" → 31
+//    parse_bin_pure(s)             — "0b101" | "101" → 5
+//    hex_str_upper_pure(n)         — int → UPPERCASE hex string ("1F")
+//    zfill_pure(n, width)          — zero-pad a signed int to `width`
+//                                    ("-7",3) → "-07", (7,3) → "007"
+//
+//  Motivation:
+//    - parse_int_pure only honors "0x"/"0X" → base 16 or default base 10.
+//      Programs that consume raw bit-strings, octal without "0o", or hex
+//      without prefix needed a generalized parser.
+//    - int_to_hex_pure and conv_pure.int_to_hex_pure emit LOWERCASE. An
+//      uppercase counterpart was missing (common need: CRC/SHA diagnostic
+//      output, IEEE float hex floats, Mach-O symbol dumps).
+//    - zfill is the classic Python-style width-N zero-padded int format;
+//      previous pad helpers pad strings with spaces (pad_left_pure /
+//      pad_right_pure) or arbitrary fill char (str_pad_left_char_pure).
+//      zfill_pure handles the sign placement correctly ("-" stays at the
+//      front of the padded result, not buried among zeros).
+//
+//  Pitfalls honored (CLAUDE.md HX3 + grammar.jsonl):
+//    P1   no semicolons
+//    P15  let mut for mutated vars
+//    P28  nil/true/false literals
+//    P29  .push() returns NEW array — rebind mandatory (not used; string
+//         accumulation uses parts.join for O(n))
+//    P38  char_code(s, i>0) broken — we use ord(s.substring(i, i+1))
+//    P39  no 0b literals — recognizable prefix via string compare only
+//    P50  no `<<` or `>>` — use `* pow2` / `/ pow2` if needed (not
+//         required here; base conversion uses `/` and `%` on the base)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── _pf_digit_val — char → 0..35 or -1 ──────────────────────────────
+// Internal helper: maps "0".."9" → 0..9, "a".."z"/"A".."Z" → 10..35.
+// Returns -1 if the char is not a base-36 digit.
+@pure
+fn _pf_digit_val(ch) {
+    if type_of(ch) != "string" { return -1 }
+    if len(ch) == 0 { return -1 }
+    let o = ord(ch.substring(0, 1))
+    if o >= 48 && o <= 57  { return o - 48 }         // '0'..'9'
+    if o >= 97 && o <= 122 { return o - 97 + 10 }    // 'a'..'z'
+    if o >= 65 && o <= 90  { return o - 65 + 10 }    // 'A'..'Z'
+    -1
+}
+
+// ── parse_int_base_pure ─────────────────────────────────────────────
+// Parses `s` as an integer in base `base` (2..36).
+// Honors leading whitespace, optional "+"/"-", and returns 0 on any
+// malformed input (no digits, wrong base, non-string).
+// Unlike parse_int_pure, does NOT auto-detect 0x/0b prefixes — the
+// caller has already committed to a specific base.
+@pure
+pub fn parse_int_base_pure(s, base) {
+    if type_of(s) != "string" { return 0 }
+    if type_of(base) != "int"  { return 0 }
+    if base < 2 || base > 36   { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+
+    // Skip whitespace.
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i >= n { return 0 }
+
+    // Optional sign.
+    let mut sign = 1
+    let ch0 = s.substring(i, i + 1)
+    if ch0 == "+" {
+        i = i + 1
+    } else if ch0 == "-" {
+        sign = 0 - 1
+        i = i + 1
+    }
+
+    let mut val = 0
+    let mut consumed = false
+    while i < n {
+        let digit = _pf_digit_val(s.substring(i, i + 1))
+        if digit < 0       { break }
+        if digit >= base   { break }
+        val = val * base + digit
+        consumed = true
+        i = i + 1
+    }
+    if consumed == false { return 0 }
+    val * sign
+}
+
+// ── parse_hex_pure ──────────────────────────────────────────────────
+// Parses a hex string with an OPTIONAL "0x"/"0X" prefix. Accepts both
+// "0x1F" and bare "1f". Leading whitespace + optional sign are honored.
+// Returns 0 on malformed input.
+@pure
+pub fn parse_hex_pure(s) {
+    if type_of(s) != "string" { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+
+    // Skip whitespace.
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i >= n { return 0 }
+
+    // Sign.
+    let mut sign = 1
+    let ch0 = s.substring(i, i + 1)
+    if ch0 == "+" {
+        i = i + 1
+    } else if ch0 == "-" {
+        sign = 0 - 1
+        i = i + 1
+    }
+
+    // Optional "0x" / "0X" prefix.
+    if i + 1 < n {
+        let p0 = s.substring(i, i + 1)
+        let p1 = s.substring(i + 1, i + 2)
+        if p0 == "0" && (p1 == "x" || p1 == "X") {
+            i = i + 2
+        }
+    }
+
+    let mut val = 0
+    let mut consumed = false
+    while i < n {
+        let digit = _pf_digit_val(s.substring(i, i + 1))
+        if digit < 0  { break }
+        if digit >= 16 { break }
+        val = val * 16 + digit
+        consumed = true
+        i = i + 1
+    }
+    if consumed == false { return 0 }
+    val * sign
+}
+
+// ── parse_bin_pure ──────────────────────────────────────────────────
+// Parses a binary string with an OPTIONAL "0b"/"0B" prefix. Accepts
+// both "0b101" and bare "101". Leading whitespace + optional sign are
+// honored. Returns 0 on malformed input. Honors P39: "0b" is detected
+// via string compare, not a 0b literal.
+@pure
+pub fn parse_bin_pure(s) {
+    if type_of(s) != "string" { return 0 }
+    let n = len(s)
+    if n == 0 { return 0 }
+
+    // Skip whitespace.
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == " " || ch == "\t" || ch == "\n" || ch == "\r" {
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if i >= n { return 0 }
+
+    // Sign.
+    let mut sign = 1
+    let ch0 = s.substring(i, i + 1)
+    if ch0 == "+" {
+        i = i + 1
+    } else if ch0 == "-" {
+        sign = 0 - 1
+        i = i + 1
+    }
+
+    // Optional "0b" / "0B" prefix.
+    if i + 1 < n {
+        let p0 = s.substring(i, i + 1)
+        let p1 = s.substring(i + 1, i + 2)
+        if p0 == "0" && (p1 == "b" || p1 == "B") {
+            i = i + 2
+        }
+    }
+
+    let mut val = 0
+    let mut consumed = false
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let o = ord(ch)
+        if o == 48 {
+            val = val * 2
+            consumed = true
+            i = i + 1
+        } else if o == 49 {
+            val = val * 2 + 1
+            consumed = true
+            i = i + 1
+        } else {
+            break
+        }
+    }
+    if consumed == false { return 0 }
+    val * sign
+}
+
+// ── hex_str_upper_pure ──────────────────────────────────────────────
+// Non-negative int → UPPERCASE hex string ("1F", "ABC"). Negatives
+// prefix with "-". Mirrors int_to_hex_pure case but uses uppercase
+// digits — useful for protocol dumps that require canonical upper
+// hex (PEM, Mach-O symbol tables, etc.).
+@pure
+pub fn hex_str_upper_pure(n) {
+    if type_of(n) != "int" { return "0" }
+    if n == 0 { return "0" }
+    let digits = "0123456789ABCDEF"
+    let mut v = n
+    let mut neg = false
+    if v < 0 {
+        neg = true
+        v = 0 - v
+    }
+    let mut parts = []
+    while v > 0 {
+        let d = v % 16
+        parts = parts.push(digits.substring(d, d + 1))
+        v = v / 16
+    }
+    // parts is in LSB→MSB order; reverse via index walk.
+    let plen = len(parts)
+    let mut rev = []
+    let mut i = plen - 1
+    while i >= 0 {
+        rev = rev.push(parts[i])
+        i = i - 1
+    }
+    if neg { return "-" + rev.join("") }
+    rev.join("")
+}
+
+// ── zfill_pure — integer zero-padded to width ───────────────────────
+// Python-style zfill: `width` is the TOTAL output width including the
+// sign. Examples:
+//   (7, 3)    → "007"
+//   (-7, 3)   → "-07"   (sign counts toward width → 2 digits padded)
+//   (-1, 4)   → "-001"
+//   (1234, 2) → "1234"  (no truncation)
+//   (0, 4)    → "0000"
+// For non-int `n` the value coerces to "0" first then pads.
+@pure
+pub fn zfill_pure(n, width) {
+    if type_of(width) != "int" { return to_string(n) }
+    // Build the decimal string for |n|, track sign separately.
+    let mut neg = false
+    let mut v = 0
+    if type_of(n) == "int" {
+        v = n
+        if v < 0 {
+            neg = true
+            v = 0 - v
+        }
+    }
+    let digits = "0123456789"
+    let mut body = ""
+    if v == 0 {
+        body = "0"
+    } else {
+        let mut parts = []
+        let mut vv = v
+        while vv > 0 {
+            let d = vv % 10
+            parts = parts.push(digits.substring(d, d + 1))
+            vv = vv / 10
+        }
+        let plen = len(parts)
+        let mut i = plen - 1
+        let mut rev = []
+        while i >= 0 {
+            rev = rev.push(parts[i])
+            i = i - 1
+        }
+        body = rev.join("")
+    }
+
+    // Effective width for the digit portion: width minus 1 if negative
+    // (the sign char takes one slot toward the total output width).
+    let mut digit_width = width
+    if neg { digit_width = width - 1 }
+    if digit_width < 0 { digit_width = 0 }
+
+    let blen = len(body)
+    if blen >= digit_width {
+        if neg { return "-" + body }
+        return body
+    }
+    let missing = digit_width - blen
+    let mut zeros = []
+    let mut k = 0
+    while k < missing {
+        zeros = zeros.push("0")
+        k = k + 1
+    }
+    let pad = zeros.join("")
+    if neg { return "-" + pad + body }
+    pad + body
+}
