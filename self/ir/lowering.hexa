@@ -137,7 +137,25 @@ fn lower_expr(m, b, e, env) {
         // TODO: lower unresolved ident — inject a placeholder load
         return bld_const_i64(m, b, 0)
     }
-    // TODO: lower Expr kind (k) — call/if/match/block/lambda etc.
+    if k == "bool_lit" {
+        let v = 0
+        if e.bool_val { v = 1 }
+        return bld_const_i64(m, b, v)
+    }
+    if k == "unary_op" {
+        let inner_vid = lower_expr(m, b, e.left, env)
+        if inner_vid < 0 { return -1 }
+        let zero = bld_const_i64(m, b, 0)
+        return bld_sub(m, b, zero, inner_vid, "i64")
+    }
+    if k == "bin_op" {
+        let lhs = lower_expr(m, b, e.left, env)
+        if lhs < 0 { return -1 }
+        let rhs = lower_expr(m, b, e.right, env)
+        if rhs < 0 { return -1 }
+        return lower_binop_from_vids(m, b, e.op, lhs, rhs, "i64")
+    }
+    // TODO: lower Expr kind (k) — call/if/match/block/lambda/array/index/field etc.
     return -1
 }
 
@@ -206,6 +224,40 @@ fn lower_let(m, b, env, name, value_vid, mut_flag, ty) {
 fn lower_return(m, b, val_vid) {
     // RETURN opcode. val_vid <0 means "ret void".
     return bld_ret(m, b, val_vid)
+}
+
+// ── Assign lowering ────────────────────────────────────────
+// `name` must be a previously-declared mut binding. Emits STORE to slot.
+fn lower_assign(m, b, env, name, rhs_vid) {
+    let slot = lower_env_lookup(env, name)
+    if slot < 0 { return -1 }
+    if !lower_env_is_mut(env, name) { return -1 }
+    bld_store(m, b, slot, rhs_vid)
+    return rhs_vid
+}
+
+// ── For-range lowering skeleton ────────────────────────────
+// Returns [header_bb, body_bb, end_bb, slot_vid].
+// Caller populates body_bb then calls lower_for_range_close.
+fn lower_for_range_skeleton(m, b, env, var_name, start_vid, end_vid) {
+    let slot = bld_alloc(m, b, "i64")
+    bld_store(m, b, slot, start_vid)
+    lower_env_bind_mut(env, var_name, slot)
+    let blks = lower_while_skeleton(m, b)
+    // blks = [header, body, end]. At header: load i, compare vs end.
+    builder_switch_to(b, blks[0])
+    let cur = bld_load(m, b, slot, "i64")
+    let cmp = bld_sub(m, b, cur, end_vid, "i64")
+    bld_branch(m, b, cmp, blks[2], blks[1])
+    return [blks[0], blks[1], blks[2], slot]
+}
+
+fn lower_for_range_close(m, b, slot, header_bb) {
+    let cur = bld_load(m, b, slot, "i64")
+    let one = bld_const_i64(m, b, 1)
+    let next = bld_add(m, b, cur, one, "i64")
+    bld_store(m, b, slot, next)
+    bld_jump(m, b, header_bb)
 }
 
 // ── Function Lowering ───────────────────────────────────────
@@ -486,6 +538,67 @@ fn _lowering_test_if_in_while() {
     assert _ops_eq(got, ["jump", "load", "branch", "load", "branch", "jump", "jump", "jump", "ret"])
 }
 
+// T13: Assign — mut variable store update via lower_assign.
+fn _lowering_test_assign() {
+    let m = make_ir_module("t13")
+    let skel = lower_fn_decl_skeleton(m, "asn", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let env = lower_env_new()
+    let v = lower_int_lit(m, b, expr_int(5))
+    lower_let(m, b, env, "x", v, true, "i64")
+    let new_val = lower_int_lit(m, b, expr_int(10))
+    let r = lower_assign(m, b, env, "x", new_val)
+    assert r >= 0
+    lower_return(m, b, r)
+    let got = _collect_opcodes(m.functions[fid])
+    // load(5), alloc, store, load(10), store, ret
+    assert _ops_eq(got, ["load", "alloc", "store", "load", "store", "ret"])
+}
+
+// T14: Recursive BinOp via lower_expr — (3 + 4).
+fn _lowering_test_recursive_binop() {
+    let m = make_ir_module("t14")
+    let skel = lower_fn_decl_skeleton(m, "rbin", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let env = lower_env_new()
+    let add_expr = Expr { kind: "bin_op", op: "add",
+        left: expr_int(3), right: expr_int(4),
+        int_val: 0, float_val: 0.0, bool_val: false, name: "" }
+    let v = lower_expr(m, b, add_expr, env)
+    assert v >= 0
+    lower_return(m, b, v)
+    let got = _collect_opcodes(m.functions[fid])
+    assert _ops_eq(got, ["load", "load", "add", "ret"])
+}
+
+// T15: For-range skeleton — header check + body increment.
+fn _lowering_test_for_range() {
+    let m = make_ir_module("t15")
+    let skel = lower_fn_decl_skeleton(m, "forr", [], "i64")
+    let fid = skel[0]
+    let b = skel[1]
+    let env = lower_env_new()
+    let start = lower_int_lit(m, b, expr_int(0))
+    let end_v = lower_int_lit(m, b, expr_int(10))
+    let fr = lower_for_range_skeleton(m, b, env, "i", start, end_v)
+    let header_bb = fr[0]
+    let body_bb = fr[1]
+    let end_bb = fr[2]
+    let slot = fr[3]
+    builder_switch_to(b, body_bb)
+    lower_for_range_close(m, b, slot, header_bb)
+    builder_switch_to(b, end_bb)
+    lower_return(m, b, start)
+    let got = _collect_opcodes(m.functions[fid])
+    // entry: load(0), load(10), alloc, store, jump
+    // header: load, sub, branch
+    // body: load, load(1), add, store, jump
+    // end: ret
+    assert _ops_eq(got, ["load", "load", "alloc", "store", "jump", "load", "sub", "branch", "load", "load", "add", "store", "jump", "ret"])
+}
+
 fn lowering_run_tests() {
     _lowering_test_int_return()
     _lowering_test_add()
@@ -499,5 +612,8 @@ fn lowering_run_tests() {
     _lowering_test_let_immutable()
     _lowering_test_let_mutable()
     _lowering_test_if_in_while()
-    println("lowering: 12 tests PASS")
+    _lowering_test_assign()
+    _lowering_test_recursive_binop()
+    _lowering_test_for_range()
+    println("lowering: 15 tests PASS")
 }
