@@ -14,7 +14,406 @@
 //      - naive_bwd_alloc_count / fused_bwd_alloc_count
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/backward_fuse.hexa"
+// -- inlined from self/ai_native/backward_fuse.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/backward_fuse.hexa — AI-native ROI #102
+//
+//  @backward_fuse — chain-rule fusion for pointwise backward passes.
+//
+//  Motivation:
+//      Training hot paths thread a sequence of layer backward calls
+//      like
+//          dy  = f3.bwd(dz)
+//          dx  = f2.bwd(dy)
+//          dx0 = f1.bwd(dx)
+//      When every fN is pointwise (derivative depends only on the
+//      corresponding forward input x_i), naive backward allocates a
+//      full gradient tensor between every stage — K allocations,
+//      2·N·K round-trips, plus pressure on the allocator for every
+//      call site. Fusion keeps the gradient in a scalar register and
+//      walks the chain top-down inside a single loop per element.
+//
+//  Fusion strategy:
+//      Per output element i, starting from g = dz[i], sweep ops in
+//      reverse order applying f_k'(x_k_i) · g. The intermediate g is
+//      scalar-local, so the fused path allocates exactly ONE output
+//      array regardless of chain depth.
+//
+//  Op encoding (struct + tag int — enum is not in hexa grammar):
+//      tag 0 = add_const    fwd: y = x + c          dy/dx = 1
+//      tag 1 = sub_const    fwd: y = x - c          dy/dx = 1
+//      tag 2 = mul_const    fwd: y = x · c          dy/dx = c
+//      tag 3 = relu         fwd: y = max(x, 0)      dy/dx = (x>0)?1:0
+//      tag 4 = tanh         fwd: y = tanh(x)        dy/dx = 1 - tanh²(x)
+//      tag 5 = sigmoid      fwd: y = σ(x)           dy/dx = σ(x)·(1-σ(x))
+//      tag 6 = identity     fwd: y = x              dy/dx = 1
+//
+//  Public API:
+//      op_bwd_add_const(c)                   -> Op
+//      op_bwd_sub_const(c)                   -> Op
+//      op_bwd_mul_const(c)                   -> Op        // aka scale
+//      op_bwd_relu()                         -> Op
+//      op_bwd_tanh()                         -> Op
+//      op_bwd_sigmoid()                      -> Op
+//      op_bwd_identity()                     -> Op
+//
+//      forward_chain(x, ops)                 -> [float]
+//      forward_chain_states(x, ops)          -> [[float]]  (per-stage x_k)
+//      backward_chain_naive(dz, x, ops)      -> [float]
+//      backward_chain_fused(dz, x, ops)      -> [float]
+//
+//      detect_fusable_chain(ops)             -> bool
+//      rewrite_chain(ops)                    -> ops        // no-op if fusable,
+//                                                         // else identity
+//      naive_bwd_alloc_count(ops)            -> int        // len(ops)
+//      fused_bwd_alloc_count(ops)            -> int        // 1
+//
+//  Numerical contract:
+//      backward_chain_fused(dz, x, ops)
+//        ≡ backward_chain_naive(dz, x, ops)
+//      element-wise within tol 1e-6 for any finite dz, x, pointwise
+//      op chain. Holds regardless of chain length.
+//
+//  Allocation contract:
+//      naive : len(ops) arrays allocated for the backward sweep
+//              (one gradient tensor per stage)
+//      fused : exactly 1 array (the final dx)
+//
+//  Grammar cautions (HX3):
+//      - no bit-ops in math paths; arithmetic only
+//      - no struct literal in `if` head (use `let op = ops[j]` first)
+//      - `and`/`or` → `&&`/`||`
+//      - `@attr pub fn` unsupported → `@attr fn _impl` + `pub fn` fwd
+//      - slice `arr[(i+1)..j]` needs parens on additions
+//      - abs → use abs_pure from math_pure.hexa
+//
+//  AI-native attrs:
+//      @hot            — backward passes dominate training wall time
+//      @backward_fuse  — marker: intermediate grad tensors removed
+//      @pure           — no side effects beyond the returned array
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Op struct + constructors ───────────────────────────────────────
+
+pub struct BwdOp {
+    tag: int,
+    c: float
+}
+
+pub fn op_bwd_add_const(c) {
+    return BwdOp { tag: 0, c: c }
+}
+
+pub fn op_bwd_sub_const(c) {
+    return BwdOp { tag: 1, c: c }
+}
+
+pub fn op_bwd_mul_const(c) {
+    return BwdOp { tag: 2, c: c }
+}
+
+pub fn op_bwd_relu() {
+    return BwdOp { tag: 3, c: 0.0 }
+}
+
+pub fn op_bwd_tanh() {
+    return BwdOp { tag: 4, c: 0.0 }
+}
+
+pub fn op_bwd_sigmoid() {
+    return BwdOp { tag: 5, c: 0.0 }
+}
+
+pub fn op_bwd_identity() {
+    return BwdOp { tag: 6, c: 0.0 }
+}
+
+// ── helpers ────────────────────────────────────────────────────────
+
+// bf102_fabs → abs_pure (math_pure.hexa)
+
+fn bf102_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+// Sigmoid, numerically safe — clamp input to [-40, 40] so exp stays finite.
+fn bf102_sigmoid_scalar(x) {
+    let mut c = x
+    if c >  40.0 { c =  40.0 }
+    if c < -40.0 { c = -40.0 }
+    return 1.0 / (1.0 + exp(0.0 - c))
+}
+
+// ── forward scalar (one op) ───────────────────────────────────────
+
+fn bf102_fwd_scalar(x, op) {
+    let t = op.tag
+    if t == 0 {
+        return x + op.c
+    } else if t == 1 {
+        return x - op.c
+    } else if t == 2 {
+        return x * op.c
+    } else if t == 3 {
+        if x < 0.0 { return 0.0 }
+        return x
+    } else if t == 4 {
+        return tanh(x)
+    } else if t == 5 {
+        return bf102_sigmoid_scalar(x)
+    } else if t == 6 {
+        return x
+    }
+    return x
+}
+
+// ── derivative scalar: given the FORWARD input x_k for op k, return
+//    dy/dx_k evaluated at that point. This is the local Jacobian
+//    that the chain rule multiplies into the incoming upstream grad.
+fn bf102_deriv_scalar(x, op) {
+    let t = op.tag
+    if t == 0 {
+        return 1.0
+    } else if t == 1 {
+        return 1.0
+    } else if t == 2 {
+        return op.c
+    } else if t == 3 {
+        // relu': step function. Boundary at 0 defined as 0 (standard).
+        if x > 0.0 { return 1.0 }
+        return 0.0
+    } else if t == 4 {
+        // tanh'(x) = 1 - tanh²(x)
+        let y = tanh(x)
+        return 1.0 - y * y
+    } else if t == 5 {
+        // sigmoid'(x) = σ(x) · (1 - σ(x))
+        let s = bf102_sigmoid_scalar(x)
+        return s * (1.0 - s)
+    } else if t == 6 {
+        return 1.0
+    }
+    return 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  forward_chain(x, ops) — applied op-by-op, returning only the final
+//  activation y. Useful for end-to-end checks where no training-time
+//  cache of intermediates is needed.
+// ═══════════════════════════════════════════════════════════════════
+pub fn forward_chain(x, ops) {
+    let n = len(x)
+    let k = len(ops)
+    let mut out = bf102_zeros_1d(n)
+    for i in 0..n {
+        let mut v = x[i]
+        for j in 0..k {
+            v = bf102_fwd_scalar(v, ops[j])
+        }
+        out[i] = v
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  forward_chain_states(x, ops) — record the per-stage pre-op input
+//  at every layer. states[k] = x_k = input fed into op k. Length is
+//  k+1 so that states[0] = x and states[k] = y. The backward pass
+//  consumes states[0..k] to evaluate local Jacobians.
+//
+//  Allocation: k+1 arrays of length N. This is the standard activation
+//  cache that PyTorch/JAX etc. keep around between fwd and bwd. Both
+//  the naive and fused backward paths consume it; the fusion question
+//  is only about what gets allocated INSIDE the backward sweep.
+// ═══════════════════════════════════════════════════════════════════
+pub fn forward_chain_states(x, ops) {
+    let n = len(x)
+    let k = len(ops)
+
+    // states[0] = x (copy so the caller's array is untouched)
+    let mut states = []
+    let mut cur = bf102_zeros_1d(n)
+    for i in 0..n {
+        cur[i] = x[i]
+    }
+    states.push(cur)
+
+    let mut j = 0
+    while j < k {
+        let src = states[j]
+        let mut nxt = bf102_zeros_1d(n)
+        for i in 0..n {
+            nxt[i] = bf102_fwd_scalar(src[i], ops[j])
+        }
+        states.push(nxt)
+        j = j + 1
+    }
+    return states
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  backward_chain_naive(dz, x, ops) — stage-by-stage backward.
+//
+//  Mirrors a naive autograd: walks `ops` in REVERSE, producing a
+//  fresh [float] of length N at every stage. For a chain of length K
+//  this allocates K gradient tensors (one per layer).
+//
+//  Semantics:
+//      states = forward_chain_states(x, ops)
+//      g = dz
+//      for k in K-1 .. 0:
+//          x_k = states[k]
+//          g   = [ deriv(x_k[i], ops[k]) · g[i]  for i in 0..N ]
+//      return g
+// ═══════════════════════════════════════════════════════════════════
+pub fn backward_chain_naive(dz, x, ops) {
+    let n = len(x)
+    let k = len(ops)
+
+    let states = forward_chain_states(x, ops)
+
+    // Seed grad = copy of dz so the caller's buffer stays untouched.
+    let mut g = bf102_zeros_1d(n)
+    for i in 0..n {
+        g[i] = dz[i]
+    }
+
+    // Reverse sweep: k-1, k-2, ..., 0 — explicit alloc per stage.
+    let mut j = k - 1
+    while j >= 0 {
+        let xk = states[j]
+        let op = ops[j]
+        let mut gnext = bf102_zeros_1d(n)
+        for i in 0..n {
+            gnext[i] = bf102_deriv_scalar(xk[i], op) * g[i]
+        }
+        g = gnext
+        j = j - 1
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  backward_chain_fused(dz, x, ops) — fused chain-rule sweep.
+//
+//  For each element i we multiply the reverse chain of local
+//  derivatives in a scalar accumulator; the full dx is written once.
+//
+//  Allocation budget: exactly 1 array (the returned dx). The forward
+//  state array is assumed already cached by the training harness —
+//  it is NOT part of this backward kernel's allocation account.
+//  (Same convention as PyTorch: .backward() does not re-allocate the
+//  activations it reads.)
+//
+//  Loop structure:
+//      for i in 0..N:
+//          g = dz[i]
+//          for k in K-1 .. 0:
+//              g = deriv(states[k][i], ops[k]) · g
+//          dx[i] = g
+//
+//  `g` is a register-local scalar across the k loop, so the K-1
+//  intermediate tensors the naive path allocates collapse to zero.
+// ═══════════════════════════════════════════════════════════════════
+@hot @backward_fuse @pure
+fn backward_chain_fused_impl(dz, x, ops) {
+    let n = len(x)
+    let k = len(ops)
+
+    // Empty chain → identity: dx = dz.
+    if k == 0 {
+        let mut out0 = bf102_zeros_1d(n)
+        for i in 0..n {
+            out0[i] = dz[i]
+        }
+        return out0
+    }
+
+    // Need per-stage forward inputs for the local Jacobians.
+    let states = forward_chain_states(x, ops)
+
+    let mut dx = bf102_zeros_1d(n)
+    for i in 0..n {
+        let mut g = dz[i]
+        let mut j = k - 1
+        while j >= 0 {
+            let xk = states[j]
+            let op = ops[j]
+            g = bf102_deriv_scalar(xk[i], op) * g
+            j = j - 1
+        }
+        dx[i] = g
+    }
+    return dx
+}
+
+pub fn backward_chain_fused(dz, x, ops) {
+    return backward_chain_fused_impl(dz, x, ops)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST-level fusability detector + rewriter.
+//
+//  detect_fusable_chain(ops):
+//      Returns true iff every op in the chain is pointwise (i.e. its
+//      derivative depends only on the scalar at the same index). All
+//      tags 0..6 currently qualify; any future op whose derivative
+//      cross-couples indices (softmax, layernorm, etc.) would return
+//      false and prevent the rewrite.
+//
+//  rewrite_chain(ops):
+//      When fusable, returns `ops` unchanged — the rewriter signals
+//      that the *caller* should dispatch backward_chain_fused instead
+//      of backward_chain_naive. When not fusable, returns `ops` also
+//      (identity rewrite) — the caller keeps the naive path. The
+//      split exists so higher-level passes can insert a marker /
+//      graph-surgery hook here without changing the calling
+//      convention.
+// ═══════════════════════════════════════════════════════════════════
+pub fn detect_fusable_chain(ops) {
+    let k = len(ops)
+    let mut j = 0
+    while j < k {
+        let op = ops[j]
+        let t = op.tag
+        // all currently-defined tags 0..6 are pointwise
+        if t < 0 || t > 6 {
+            return false
+        }
+        j = j + 1
+    }
+    return true
+}
+
+pub fn rewrite_chain(ops) {
+    // Identity rewrite. Fusability is a property of `ops`; the caller
+    // dispatches fused vs naive based on detect_fusable_chain(ops).
+    return ops
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Allocation accounting for tests / bench reporting.
+//      naive : K gradient tensors in the backward sweep
+//      fused : 1 gradient tensor (the returned dx)
+// ═══════════════════════════════════════════════════════════════════
+pub fn naive_bwd_alloc_count(ops) {
+    let k = len(ops)
+    if k == 0 { return 1 }
+    return k
+}
+
+pub fn fused_bwd_alloc_count(ops) {
+    return 1
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

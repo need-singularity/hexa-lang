@@ -2,7 +2,342 @@
 //  test_mae_masked_ae.hexa — MAE Masked Autoencoder (#281) tests
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/mae_masked_ae.hexa"
+// -- inlined from self/ml/mae_masked_ae.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/mae_masked_ae.hexa — MAE Masked Autoencoder (#281)
+//
+//  He et al. 2021 Masked Autoencoder: patchify image → random-mask 75% →
+//  encode *visible* patches → insert learnable mask tokens at dropped
+//  positions → decode → reconstruct pixel patches → MSE.
+//
+//  CPU mini:
+//    • 8×8 image, patch=4 → 4 patches (2×2 grid), each patch = 16 pixels
+//    • 3 masked / 1 visible (75%)
+//    • linear patch-embed to dim D = 8
+//    • encoder: linear + GELU-lite (tanh approx) + linear
+//    • decoder: linear back to 16 pixels per token
+//
+//  API:
+//    mae_patchify(img, patch_size)              -> [[float]]  (N × P²)
+//    mae_unpatchify(patches, H, W, patch_size)  -> [[float]]
+//    mae_random_mask(N, mask_ratio, seed)       -> dict{ ids_keep, ids_mask, mask }
+//    mae_init(embed_dim, patch_dim, seed)       -> dict
+//    mae_forward(model, img, seed)              -> dict { "pred": [[f]], "mask": [f], "loss": f }
+//    mae_reconstruction_loss(pred, target, mask)-> float   (MSE on masked)
+//
+//  @pure in all math helpers.
+// ═══════════════════════════════════════════════════════════════
+
+fn mae_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mae_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mae_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m { w = w + [mae_zeros(n)] }
+    return w
+}
+
+fn mae_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn mae_hash_u(seed, k) {
+    let h = (seed * 7919 + k * 104729 + 31) % 10007
+    return to_float(h) / 10007.0
+}
+
+// GELU approximation: 0.5 x (1 + tanh(√(2/π)(x + 0.044715 x³)))
+fn mae_tanh(z) {
+    let ez = exp(z)
+    let enz = exp(0.0 - z)
+    return (ez - enz) / (ez + enz)
+}
+
+fn mae_gelu(x) {
+    let c = 0.7978845608
+    let xc = x + 0.044715 * x * x * x
+    return 0.5 * x * (1.0 + mae_tanh(c * xc))
+}
+
+// ─── (1) Patchify: an H×W image stored as [H][W] floats to
+// a list of patches, each flattened to P² ──
+fn mae_patchify(img, patch_size) {
+    let H = len(img)
+    let W = len(img[0])
+    let gh = H / patch_size
+    let gw = W / patch_size
+    let N = gh * gw
+    let P2 = patch_size * patch_size
+    let mut patches = mae_zeros2d(N, P2)
+    for pi in 0..gh {
+        for pj in 0..gw {
+            let idx = pi * gw + pj
+            for di in 0..patch_size {
+                for dj in 0..patch_size {
+                    let row = pi * patch_size + di
+                    let col = pj * patch_size + dj
+                    patches[idx][di * patch_size + dj] = img[row][col]
+                }
+            }
+        }
+    }
+    return patches
+}
+
+// Inverse: list of patches → image
+fn mae_unpatchify(patches, H, W, patch_size) {
+    let gh = H / patch_size
+    let gw = W / patch_size
+    let mut img = mae_zeros2d(H, W)
+    for pi in 0..gh {
+        for pj in 0..gw {
+            let idx = pi * gw + pj
+            for di in 0..patch_size {
+                for dj in 0..patch_size {
+                    img[pi * patch_size + di][pj * patch_size + dj] = patches[idx][di * patch_size + dj]
+                }
+            }
+        }
+    }
+    return img
+}
+
+// ─── (2) random mask: keep ⌈(1-ratio)*N⌉ patches ──
+fn mae_random_mask(N, mask_ratio, seed) {
+    // pseudo-random shuffle via hash
+    let mut order = []
+    let mut keys = []
+    for i in 0..N {
+        order = order + [i]
+        keys = keys + [mae_hash_u(seed, i)]
+    }
+    // simple insertion sort by keys (N small)
+    for i in 1..N {
+        let mut j = i
+        while j > 0 {
+            if keys[j] < keys[j - 1] {
+                let tk = keys[j]; keys[j] = keys[j - 1]; keys[j - 1] = tk
+                let to = order[j]; order[j] = order[j - 1]; order[j - 1] = to
+                j = j - 1
+            } else {
+                j = 0
+                break
+            }
+        }
+    }
+    let n_mask = N * 75 / 100
+    let mut n_keep = N - n_mask
+    if n_keep < 1 { n_keep = 1 }
+    let mut ids_keep = []
+    let mut ids_mask = []
+    for i in 0..N {
+        if i < n_keep {
+            ids_keep = ids_keep + [order[i]]
+        } else {
+            ids_mask = ids_mask + [order[i]]
+        }
+    }
+    // binary mask: 1 = masked (dropped, to reconstruct), 0 = visible
+    let mut mask = mae_zeros(N)
+    let n_m = len(ids_mask)
+    for k in 0..n_m { mask[ids_mask[k]] = 1.0 }
+    let out = #{
+        "ids_keep": ids_keep,
+        "ids_mask": ids_mask,
+        "mask": mask,
+        "n_keep": n_keep,
+        "n_mask": n_mask
+    }
+    return out
+}
+
+// ─── (3) model params ──
+fn mae_init(embed_dim, patch_dim, seed) {
+    // encoder: linear W_e [patch_dim → embed_dim]
+    let mut W_e = mae_zeros2d(patch_dim, embed_dim)
+    for i in 0..patch_dim {
+        for j in 0..embed_dim {
+            W_e[i][j] = 0.2 * mae_hash(seed, i, j)
+        }
+    }
+    let b_e = mae_zeros(embed_dim)
+
+    // encoder 2: [embed_dim → embed_dim]
+    let mut W_e2 = mae_zeros2d(embed_dim, embed_dim)
+    for i in 0..embed_dim {
+        for j in 0..embed_dim {
+            W_e2[i][j] = 0.2 * mae_hash(seed + 13, i, j)
+        }
+    }
+    let b_e2 = mae_zeros(embed_dim)
+
+    // decoder: [embed_dim → patch_dim]
+    let mut W_d = mae_zeros2d(embed_dim, patch_dim)
+    for i in 0..embed_dim {
+        for j in 0..patch_dim {
+            W_d[i][j] = 0.2 * mae_hash(seed + 27, i, j)
+        }
+    }
+    let b_d = mae_zeros(patch_dim)
+
+    // learnable mask token [embed_dim]
+    let mut mask_token = mae_zeros(embed_dim)
+    for i in 0..embed_dim { mask_token[i] = 0.05 * mae_hash(seed + 41, i, 0) }
+
+    let model = #{
+        "embed_dim": embed_dim,
+        "patch_dim": patch_dim,
+        "W_e": W_e,
+        "b_e": b_e,
+        "W_e2": W_e2,
+        "b_e2": b_e2,
+        "W_d": W_d,
+        "b_d": b_d,
+        "mask_token": mask_token
+    }
+    return model
+}
+
+// linear layer: y = W^T x + b
+fn mae_linear(W, b, feat) {
+    let din = len(W)
+    let dout = len(W[0])
+    let mut out = mae_zeros(dout)
+    for j in 0..dout { out[j] = b[j] }
+    for i in 0..din {
+        for j in 0..dout {
+            out[j] = out[j] + W[i][j] * feat[i]
+        }
+    }
+    return out
+}
+
+fn mae_vec_gelu(feat) {
+    let n = len(feat)
+    let mut out = mae_zeros(n)
+    for i in 0..n { out[i] = mae_gelu(feat[i]) }
+    return out
+}
+
+// ─── (4) encode a single patch ──
+fn mae_encode_patch(model, patch) {
+    let W_e = model["W_e"]
+    let b_e = model["b_e"]
+    let W_e2 = model["W_e2"]
+    let b_e2 = model["b_e2"]
+    let h1 = mae_linear(W_e, b_e, patch)
+    let a1 = mae_vec_gelu(h1)
+    let h2 = mae_linear(W_e2, b_e2, a1)
+    return h2
+}
+
+// ─── (5) decode a single token ──
+fn mae_decode_token(model, token) {
+    let W_d = model["W_d"]
+    let b_d = model["b_d"]
+    return mae_linear(W_d, b_d, token)
+}
+
+// ─── (6) full forward pass: patchify → mask → encode visible →
+// fill mask tokens → decode ──
+fn mae_forward(model, img, seed) {
+    let embed_dim = model["embed_dim"]
+    let patch_size = 4
+    let H = len(img)
+    let W = len(img[0])
+    let patches = mae_patchify(img, patch_size)
+    let N = len(patches)
+    let patch_dim = len(patches[0])
+
+    let mask_info = mae_random_mask(N, 0.75, seed)
+    let ids_keep = mask_info["ids_keep"]
+    let ids_mask = mask_info["ids_mask"]
+    let mask = mask_info["mask"]
+    let n_keep = mask_info["n_keep"]
+
+    // full sequence of tokens [N × embed_dim]
+    let mut tokens = mae_zeros2d(N, embed_dim)
+    let mask_token = model["mask_token"]
+    // first, copy the mask token everywhere
+    for i in 0..N {
+        for k in 0..embed_dim { tokens[i][k] = mask_token[k] }
+    }
+    // then encode the visible patches and overwrite
+    for ki in 0..n_keep {
+        let pidx = ids_keep[ki]
+        let enc = mae_encode_patch(model, patches[pidx])
+        for k in 0..embed_dim { tokens[pidx][k] = enc[k] }
+    }
+
+    // decode every token back to patch_dim
+    let mut pred = mae_zeros2d(N, patch_dim)
+    for i in 0..N {
+        let rec = mae_decode_token(model, tokens[i])
+        for k in 0..patch_dim { pred[i][k] = rec[k] }
+    }
+
+    // loss: MSE only on masked positions
+    let loss = mae_reconstruction_loss(pred, patches, mask)
+
+    let result = #{
+        "pred": pred,
+        "patches": patches,
+        "mask": mask,
+        "ids_keep": ids_keep,
+        "ids_mask": ids_mask,
+        "loss": loss,
+        "N": N,
+        "patch_dim": patch_dim
+    }
+    return result
+}
+
+// ─── (7) MSE on masked patches only, averaged over masked entries ──
+fn mae_reconstruction_loss(pred, target, mask) {
+    let N = len(pred)
+    let P2 = len(pred[0])
+    let mut s = 0.0
+    let mut cnt = 0.0
+    for i in 0..N {
+        if mask[i] > 0.5 {
+            for k in 0..P2 {
+                let d = pred[i][k] - target[i][k]
+                s = s + d * d
+                cnt = cnt + 1.0
+            }
+        }
+    }
+    if cnt < 1.0 { return 0.0 }
+    return s / cnt
+}
+
+// ─── (8) recon error over all patches (full image) ──
+fn mae_total_error(pred, target) {
+    let N = len(pred)
+    let P2 = len(pred[0])
+    let mut s = 0.0
+    for i in 0..N {
+        for k in 0..P2 {
+            let d = pred[i][k] - target[i][k]
+            s = s + d * d
+        }
+    }
+    return s / to_float(N * P2)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

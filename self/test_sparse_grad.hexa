@@ -19,7 +19,365 @@
 //    T15  tie-breaking: lower index wins
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/sparse_grad.hexa"
+// -- inlined from self/ai_native/sparse_grad.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/sparse_grad.hexa — AI-native ROI #105
+//
+//  @sparse_grad — top-k sparse gradient updates. Only the k largest-
+//  magnitude gradient entries are kept; the rest are zeroed. This
+//  reduces communication volume in distributed training by (1 − k/N),
+//  typically 90–99% for large models.
+//
+//  The naive reference transmits all N gradient floats every step.
+//  The sparse path transmits only k (index, value) pairs — an O(k)
+//  payload instead of O(N).
+//
+//  Public API  (sg_ prefix)
+//  ────────────────────────
+//      sg_topk_mask(grads, k) -> [bool]
+//          • Returns a boolean mask: true for the k entries with the
+//            largest absolute value, false for the rest.
+//          • Ties are broken by first-occurrence (lower index wins).
+//
+//      sg_sparsify(grads, k) -> [float]
+//          • Returns a dense array of the same length as grads, with
+//            entries below the top-k magnitude threshold set to 0.0.
+//
+//      sg_density(grads, k) -> float
+//          • Returns min(k, len(grads)) / len(grads).
+//          • Empty grads → 0.0.
+//
+//      sg_threshold(grads, k) -> float
+//          • Returns the magnitude cutoff: the k-th largest |g[i]|.
+//          • k >= len(grads) → 0.0 (all entries survive).
+//          • k <= 0 → returns +inf-like sentinel (1.0e308).
+//
+//      sg_compress(grads, k) -> map #{indices, values}
+//          • Sparse representation: parallel arrays of the surviving
+//            indices and their gradient values.
+//
+//      sg_decompress(sparse, n) -> [float]
+//          • Reconstructs a dense array of length n from a sparse map.
+//          • Missing indices are 0.0.
+//
+//      detect_dense_grad_update(prog) -> bool
+//          • AST-level predicate: returns true iff prog is a list
+//            containing a "for_grad_update" node (dense full-vector
+//            gradient communication).
+//
+//      rewrite_sparse_grad(prog, k) -> Program
+//          • Replaces the first "for_grad_update" with a
+//            "sparse_grad_topk" node carrying the sparsity parameter k.
+//            If no dense update is found, returns prog unchanged.
+//
+//  Numerical contract
+//  ──────────────────
+//      For every grads and valid k:
+//          sg_decompress(sg_compress(grads, k), len(grads))
+//              == sg_sparsify(grads, k)
+//      element-wise exact (no floating-point error — values are copied,
+//      not recomputed).
+//
+//  Edge cases
+//  ──────────
+//      • N = 0              → mask=[], sparsify=[], compress empty
+//      • k = 0              → all entries zeroed
+//      • k >= N             → all entries kept (identity)
+//      • k < 0              → treated as k=0
+//      • negative grads     → magnitude = |g|, sign preserved in output
+//      • all-zero grads     → threshold = 0, all survive if k >= N
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if` → maps returned at tail
+//      - no `and`/`or` → `&&` / `||`
+//      - no enum → string tags
+//      - abs → use abs_pure from math_pure.hexa
+//      - `handle` is reserved — never use as param name
+//      - range `..` binds tighter than `+` — parenthesize
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot        — gradient sparsification runs every training step
+//      @sparse_grad — marker: dense O(N) → sparse O(k) communication
+//      @pure       — returns new arrays; does not mutate caller data
+//      @parallel   — mask/sparsify sweeps are independent across i
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+// sg_fabs → abs_pure (math_pure.hexa)
+
+@pure
+fn sg_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+// ── nth-largest magnitude via partial selection ────────────────────
+// Returns the k-th largest absolute value in arr (1-indexed).
+// Uses a simple O(N*k) selection — good enough for gradient vectors
+// where k is small relative to N. For k ~ N, all entries survive
+// anyway so performance is moot.
+
+@pure
+fn sg_kth_largest_abs(arr, k) {
+    let n = len(arr)
+    if k <= 0 { return 1.0e308 }
+    if k >= n { return 0.0 }
+    // Collect absolute values
+    let mut abs_vals = []
+    for i in 0..n {
+        abs_vals.push(abs_pure(arr[i]))
+    }
+    // Partial sort: find the k-th largest by repeatedly extracting max
+    // We use a simple approach: sort descending, return element at k-1
+    for i in 0..k {
+        let mut max_idx = i
+        for j in (i+1)..n {
+            if abs_vals[j] > abs_vals[max_idx] {
+                max_idx = j
+            }
+        }
+        // swap
+        if max_idx != i {
+            let tmp = abs_vals[i]
+            abs_vals[i] = abs_vals[max_idx]
+            abs_vals[max_idx] = tmp
+        }
+    }
+    // abs_vals[0..k] are the k largest in descending order
+    return abs_vals[(k - 1)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_topk_mask(grads, k) -> [bool]
+//
+//  Boolean mask: true for the k entries with the largest |grad|.
+//  Ties broken by lower index (first-occurrence wins).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sg_topk_mask_impl(grads, k) {
+    let n = len(grads)
+    if n == 0 { return [] }
+    let kk = if k < 0 { 0 } else { if k > n { n } else { k } }
+    if kk == 0 {
+        let mut m = []
+        for _i in 0..n { m.push(false) }
+        return m
+    }
+    if kk >= n {
+        let mut m = []
+        for _i in 0..n { m.push(true) }
+        return m
+    }
+    let thresh = sg_kth_largest_abs(grads, kk)
+    // First pass: mark entries strictly above threshold
+    let mut mask = []
+    let mut count = 0
+    for i in 0..n {
+        if abs_pure(grads[i]) > thresh {
+            mask.push(true)
+            count = count + 1
+        } else {
+            mask.push(false)
+        }
+    }
+    // Second pass: fill remaining slots with entries exactly at threshold
+    // (first-occurrence tie-breaking)
+    for i in 0..n {
+        if count >= kk { break }
+        if !mask[i] && abs_pure(grads[i]) >= thresh {
+            mask[i] = true
+            count = count + 1
+        }
+    }
+    return mask
+}
+
+pub fn sg_topk_mask(grads, k) {
+    return sg_topk_mask_impl(grads, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_sparsify(grads, k) -> [float]
+//
+//  Dense array with non-top-k entries zeroed out.
+// ═══════════════════════════════════════════════════════════════════
+@hot @sparse_grad @parallel @pure
+fn sg_sparsify_impl(grads, k) {
+    let n = len(grads)
+    if n == 0 { return [] }
+    let mask = sg_topk_mask(grads, k)
+    let mut out = sg_zeros(n)
+    for i in 0..n {
+        if mask[i] { out[i] = grads[i] }
+    }
+    return out
+}
+
+pub fn sg_sparsify(grads, k) {
+    return sg_sparsify_impl(grads, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_density(grads, k) -> float
+//
+//  Fraction of entries that survive: min(k, N) / N.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sg_density_impl(grads, k) {
+    let n = len(grads)
+    if n == 0 { return 0.0 }
+    let kk = if k < 0 { 0 } else { if k > n { n } else { k } }
+    return kk * 1.0 / (n * 1.0)
+}
+
+pub fn sg_density(grads, k) {
+    return sg_density_impl(grads, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_threshold(grads, k) -> float
+//
+//  The magnitude cutoff: the k-th largest |g[i]|.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sg_threshold_impl(grads, k) {
+    let n = len(grads)
+    if n == 0 { return 0.0 }
+    return sg_kth_largest_abs(grads, k)
+}
+
+pub fn sg_threshold(grads, k) {
+    return sg_threshold_impl(grads, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_compress(grads, k) -> map #{indices, values}
+//
+//  Sparse representation: only the top-k entries as parallel arrays
+//  of indices and values.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sg_compress_impl(grads, k) {
+    let mask = sg_topk_mask(grads, k)
+    let mut indices = []
+    let mut values = []
+    for i in 0..len(grads) {
+        if mask[i] {
+            indices.push(i)
+            values.push(grads[i])
+        }
+    }
+    return #{
+        "indices": indices,
+        "values": values
+    }
+}
+
+pub fn sg_compress(grads, k) {
+    return sg_compress_impl(grads, k)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sg_decompress(sparse, n) -> [float]
+//
+//  Reconstruct a dense array of length n from a sparse map.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sg_decompress_impl(sparse, n) {
+    let mut out = sg_zeros(n)
+    let indices = sparse["indices"]
+    let values = sparse["values"]
+    for j in 0..len(indices) {
+        let idx = indices[j]
+        if idx >= 0 && idx < n {
+            out[idx] = values[j]
+        }
+    }
+    return out
+}
+
+pub fn sg_decompress(sparse, n) {
+    return sg_decompress_impl(sparse, n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  Stmt.kind in {
+//      "for_grad_update",    — dense full-vector gradient comm
+//      "sparse_grad_topk",   — sparse top-k gradient comm
+//      "other"
+//  }
+//  Stmt.index : string — loop index variable name
+//  Stmt.param : string — parameter-vector name
+//  Stmt.k     : int    — sparsity parameter (only for sparse_grad_topk)
+// ═══════════════════════════════════════════════════════════════════
+struct SgStmt {
+    kind: string
+    index: string
+    param: string
+    k: int
+}
+
+pub fn sg_stmt(kind, index, param, k) {
+    return SgStmt{kind: kind, index: index, param: param, k: k}
+}
+
+pub fn sg_stmt_dense(index, param) {
+    return sg_stmt("for_grad_update", index, param, 0)
+}
+
+pub fn sg_stmt_sparse(index, param, k) {
+    return sg_stmt("sparse_grad_topk", index, param, k)
+}
+
+pub fn sg_stmt_other() {
+    return sg_stmt("other", "", "", 0)
+}
+
+@pure
+fn detect_dense_grad_update_impl(prog) {
+    for i in 0..len(prog) {
+        if prog[i].kind == "for_grad_update" { return true }
+    }
+    return false
+}
+
+pub fn detect_dense_grad_update(prog) {
+    return detect_dense_grad_update_impl(prog)
+}
+
+@pure
+fn rewrite_sparse_grad_impl(prog, k) {
+    if !detect_dense_grad_update(prog) { return prog }
+    let mut out = []
+    let mut replaced = false
+    for i in 0..len(prog) {
+        if !replaced && prog[i].kind == "for_grad_update" {
+            let s = prog[i]
+            out.push(sg_stmt_sparse(s.index, s.param, k))
+            replaced = true
+        } else {
+            out.push(prog[i])
+        }
+    }
+    return out
+}
+
+pub fn rewrite_sparse_grad(prog, k) {
+    return rewrite_sparse_grad_impl(prog, k)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

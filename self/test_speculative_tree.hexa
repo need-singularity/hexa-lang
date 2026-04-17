@@ -1,5 +1,397 @@
 // test_speculative_tree.hexa — @speculative_tree_decode (EAGLE) tests
-import "ml/speculative_tree.hexa"
+// -- inlined from self/ml/speculative_tree.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/speculative_tree.hexa — EAGLE-style tree speculative decode
+//
+//  Extends self/ml/speculative_decode.hexa from a linear draft chain to
+//  a *tree* of candidate continuations. At each depth step the draft
+//  model expands the top-`branch` successors (via a deterministic
+//  hash perturbation to simulate top-k sampling without floats). The
+//  target model verifies every node against its own path prefix, and
+//  the verify loop returns the **longest accepted path** through the
+//  tree — which is then merged back into the running KV / context.
+//
+//  Representation (flat, parser-friendly — no tuple returns, no
+//  struct literals in if-tails):
+//    tree = [n, tokens, parents, depths]
+//      tokens[i]  : int token at node i
+//      parents[i] : int parent node index (-1 for root)
+//      depths[i]  : int tree depth (root = 0)
+//    Root is always index 0 (depth 0, parent -1) and carries the
+//    last context token as a sentinel so children reference a path.
+//
+//  Tree attention mask:
+//    mask[i][j] = 1 iff j is on the ancestor chain of i (including i).
+//    This is what EAGLE uses to verify all nodes in one parallel pass.
+//
+//  API (pure):
+//    hash_mix(h, s)                         -> int
+//    path_of(tree, node)                    -> [int]
+//    draft_top_k(ctx_path, branch)          -> [int]
+//    tree_draft_generate(ctx, k, branch)    -> tree
+//    tree_attention_mask(tree)              -> [[int]]
+//    tree_verify(ctx, tree)                 -> [int] verified[i]
+//    accept_longest_path(tree, verified)    -> [int] accepted node chain
+//    accepted_tokens(tree, chain)           -> [int] token sequence
+//    kv_merge(kv_ctx, accepted_tokens_list) -> [int] new kv ctx
+//    @speculative_tree_decode
+//    speculative_tree_step(ctx, k, branch, max_tokens)
+//        -> [out_tokens, [total_drafted], [total_accepted], [num_rounds]]
+//
+//  The mock draft/target models are inherited via explicit copies of
+//  ctx_hash / target_model semantics from speculative_decode.hexa so
+//  this file has no cross-module dependencies.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── primitive: ctx hash over tail window=4 (same semantics as
+//    speculative_decode but 31-bit masked to keep results in Int
+//    range — HEXA auto-promotes to BigInt which then refuses XOR).
+fn stree_ctx_hash(ctx) {
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mask = 2147483647
+    let mut h = 2654435761 % mask
+    let mut i = start
+    while i < n {
+        let a = (ctx[i] + 1) % mask
+        let b = (i + 7) * 1315423 % mask
+        h = (h ^ ((a * b) % mask)) % mask
+        i = i + 1
+    }
+    h
+}
+
+// Deterministic mixer to perturb a hash with a salt (for top-k).
+fn hash_mix(h, s) {
+    let mask = 2147483647
+    let a = (h % mask)
+    let b = ((s + 1) * 2246822) % mask
+    let v = ((a ^ b) * 374761) % mask
+    if v < 0 { -v } else { v }
+}
+
+// ── mock draft model: tail hash → token id ─────────────────────
+fn stree_draft_model(ctx) {
+    let h = stree_ctx_hash(ctx)
+    let v = h % 16
+    if v < 0 { v + 16 } else { v }
+}
+
+// ── mock target model: agrees with draft when hash%5 != 0 ──────
+fn stree_target_model(ctx) {
+    let h = stree_ctx_hash(ctx)
+    let d = stree_draft_model(ctx)
+    if (h % 5) == 0 {
+        (d + 1) % 16
+    } else {
+        d
+    }
+}
+
+// ── draft_top_k: produce `branch` distinct candidate tokens for
+//    the given path tail. We perturb the base hash with a salt to
+//    synthesize a deterministic pseudo-logit ordering.
+fn draft_top_k(ctx_path, branch) {
+    let h = stree_ctx_hash(ctx_path)
+    let mut out = []
+    let mut s = 0
+    while s < branch {
+        let m = hash_mix(h, s) % 16
+        let tok = if m < 0 { m + 16 } else { m }
+        out = out + [tok]
+        s = s + 1
+    }
+    out
+}
+
+// ── path_of: walk from a node back to root, return [tokens...] in
+//    context order (root-exclusive — root is just the seed).
+fn path_of(tree, node) {
+    let tokens = tree[1]
+    let parents = tree[2]
+    let mut chain = []
+    let mut cur = node
+    while cur > 0 {
+        chain = chain + [cur]
+        cur = parents[cur]
+    }
+    // reverse chain → root-first order
+    let mut ordered = []
+    let mut i = len(chain) - 1
+    while i >= 0 {
+        ordered = ordered + [tokens[chain[i]]]
+        i = i - 1
+    }
+    ordered
+}
+
+// ── tree_draft_generate: BFS expansion of `branch` successors
+//    per node up to depth `k`. Root (index 0) holds the last ctx
+//    token as a sentinel. Returns flat tree = [n, tokens, parents, depths].
+fn tree_draft_generate(ctx, k, branch) {
+    // seed token = last ctx token (or 0 for empty ctx)
+    let seed = if len(ctx) > 0 { ctx[len(ctx) - 1] } else { 0 }
+    let mut tokens = [seed]
+    let mut parents = [-1]
+    let mut depths = [0]
+    let mut n = 1
+
+    // frontier = list of node indices at the current depth
+    let mut frontier = [0]
+    let mut d = 0
+    while d < k {
+        let mut next_frontier = []
+        let mut fi = 0
+        while fi < len(frontier) {
+            let node = frontier[fi]
+            // build context path for this node: ctx + path_of(tree,node)
+            let tree_snapshot = [n, tokens, parents, depths]
+            let path = path_of(tree_snapshot, node)
+            let mut local = []
+            let mut ci = 0
+            while ci < len(ctx) {
+                local = local + [ctx[ci]]
+                ci = ci + 1
+            }
+            let mut pi = 0
+            while pi < len(path) {
+                local = local + [path[pi]]
+                pi = pi + 1
+            }
+            // top-k successors
+            let succ = draft_top_k(local, branch)
+            let mut si = 0
+            while si < len(succ) {
+                tokens = tokens + [succ[si]]
+                parents = parents + [node]
+                depths = depths + [d + 1]
+                next_frontier = next_frontier + [n]
+                n = n + 1
+                si = si + 1
+            }
+            fi = fi + 1
+        }
+        frontier = next_frontier
+        d = d + 1
+    }
+    [n, tokens, parents, depths]
+}
+
+// ── tree_attention_mask: mask[i][j] = 1 iff j is ancestor of i
+//    (ancestor-inclusive of i itself). O(n * depth).
+fn tree_attention_mask(tree) {
+    let n = tree[0]
+    let parents = tree[2]
+    let mut mask = []
+    let mut i = 0
+    while i < n {
+        // build row as n zeros then flip ancestor entries
+        let mut row = []
+        let mut z = 0
+        while z < n {
+            row = row + [0]
+            z = z + 1
+        }
+        let mut cur = i
+        let mut done = false
+        while done == false {
+            // row[cur] = 1 via rebuild (no complex index assign)
+            let mut nrow = []
+            let mut ri = 0
+            while ri < n {
+                if ri == cur {
+                    nrow = nrow + [1]
+                } else {
+                    nrow = nrow + [row[ri]]
+                }
+                ri = ri + 1
+            }
+            row = nrow
+            if cur == 0 {
+                done = true
+            } else {
+                cur = parents[cur]
+            }
+        }
+        mask = mask + [row]
+        i = i + 1
+    }
+    mask
+}
+
+// ── tree_verify: for every node i (i>=1), compute target_model's
+//    prediction given (ctx + path_to_parent(i)). That is the token
+//    the target *would* emit at node i. If verified[i] == tokens[i]
+//    then the draft at node i is accepted.
+fn tree_verify(ctx, tree) {
+    let n = tree[0]
+    let tokens = tree[1]
+    let parents = tree[2]
+    let mut verified = []
+    // root: fill with a sentinel — not verified, never compared
+    verified = verified + [tokens[0]]
+    let mut i = 1
+    while i < n {
+        // path to parent (exclusive of node i itself)
+        let parent_path = path_of(tree, parents[i])
+        let mut local = []
+        let mut ci = 0
+        while ci < len(ctx) {
+            local = local + [ctx[ci]]
+            ci = ci + 1
+        }
+        let mut pi = 0
+        while pi < len(parent_path) {
+            local = local + [parent_path[pi]]
+            pi = pi + 1
+        }
+        let t = stree_target_model(local)
+        verified = verified + [t]
+        i = i + 1
+    }
+    verified
+}
+
+// ── accept_longest_path: DFS over the tree, pick the path with the
+//    most accepted nodes. A node is accepted iff tokens[node] ==
+//    verified[node]. We return a list of node indices in root-to-leaf
+//    order (excluding root). Ties prefer lower index (stable).
+fn accept_longest_path(tree, verified) {
+    let n = tree[0]
+    let tokens = tree[1]
+    let parents = tree[2]
+    // For each node compute (accepted_prefix_len, chain_up_to_node).
+    // A node has accepted_prefix_len = parent.len + 1 iff it is
+    // accepted AND its parent chain is fully accepted from root.
+    // We also keep a "parent_ok" flag per node.
+    let mut plen = [0]         // root contributes 0
+    let mut ok = [1]           // root is trivially ok
+    let mut best_len = 0
+    let mut best_node = 0
+    let mut i = 1
+    while i < n {
+        let p = parents[i]
+        let parent_ok = ok[p]
+        let accepted_here = if tokens[i] == verified[i] { 1 } else { 0 }
+        let combined = parent_ok * accepted_here
+        let new_len = if combined == 1 { plen[p] + 1 } else { 0 }
+        plen = plen + [new_len]
+        ok = ok + [combined]
+        if new_len > best_len {
+            best_len = new_len
+            best_node = i
+        }
+        i = i + 1
+    }
+    // Walk back from best_node to root, collect chain root→leaf.
+    let mut chain_rev = []
+    let mut cur = best_node
+    while cur > 0 {
+        chain_rev = chain_rev + [cur]
+        cur = parents[cur]
+    }
+    let mut chain = []
+    let mut j = len(chain_rev) - 1
+    while j >= 0 {
+        chain = chain + [chain_rev[j]]
+        j = j - 1
+    }
+    chain
+}
+
+// ── accepted_tokens: map accepted node chain → token list
+fn accepted_tokens(tree, chain) {
+    let tokens = tree[1]
+    let mut out = []
+    let mut i = 0
+    while i < len(chain) {
+        out = out + [tokens[chain[i]]]
+        i = i + 1
+    }
+    out
+}
+
+// ── kv_merge: commit accepted tokens onto the base kv context.
+//    In a real system this would patch the KV cache; here we just
+//    append tokens in order. Pure and side-effect free.
+fn kv_merge(kv_ctx, accepted_list) {
+    let mut out = []
+    let mut i = 0
+    while i < len(kv_ctx) {
+        out = out + [kv_ctx[i]]
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(accepted_list) {
+        out = out + [accepted_list[j]]
+        j = j + 1
+    }
+    out
+}
+
+// ── count_nonroot_nodes: total draft candidates in the tree
+//    (drafted work, excluding the sentinel root).
+fn count_nonroot_nodes(tree) {
+    tree[0] - 1
+}
+
+// ── @speculative_tree_decode: full loop
+//    Returns [out_tokens, [total_drafted], [total_accepted], [num_rounds]]
+@speculative_tree_decode
+fn speculative_tree_step(ctx, k, branch, max_tokens) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut produced = 0
+    let mut total_drafted = 0
+    let mut total_accepted = 0
+    let mut rounds = 0
+
+    while produced < max_tokens {
+        let tree = tree_draft_generate(cur, k, branch)
+        let verified = tree_verify(cur, tree)
+        let chain = accept_longest_path(tree, verified)
+        let accepted = accepted_tokens(tree, chain)
+        let drafted_count = count_nonroot_nodes(tree)
+
+        // Commit accepted path. If empty, force one token from target
+        // (at root) to guarantee progress — mirrors speculative_decode.
+        let mut acc_len = len(accepted)
+        if acc_len == 0 {
+            // target prediction for current ctx (as if generating next)
+            let forced = stree_target_model(cur)
+            cur = kv_merge(cur, [forced])
+            produced = produced + 1
+        } else {
+            cur = kv_merge(cur, accepted)
+            // Respect max_tokens cap if this round overshoots.
+            let room = max_tokens - produced
+            let commit_len = if acc_len < room { acc_len } else { room }
+            produced = produced + commit_len
+        }
+        total_drafted = total_drafted + drafted_count
+        total_accepted = total_accepted + acc_len
+        rounds = rounds + 1
+    }
+
+    // Extract newly produced tail (exclude original ctx)
+    let mut out = []
+    let start = len(ctx)
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    [out, [total_drafted], [total_accepted], [rounds]]
+}
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

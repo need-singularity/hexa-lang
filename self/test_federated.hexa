@@ -18,7 +18,402 @@
 //
 //  Run: hexa self/test_federated.hexa
 // ===================================================================
-import "ml/federated.hexa"
+// -- inlined from self/ml/federated.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/federated.hexa — Federated Learning Framework
+//
+//  Pure Hexa implementation of federated learning with privacy.
+//
+//  Components:
+//    1. Client Selection    — random sampling of participating clients per round
+//    2. Local Training      — SGD on client-local data
+//    3. FedAvg Aggregation  — weighted average of client model parameters
+//    4. Differential Privacy — Gaussian noise on gradients (epsilon-delta DP)
+//
+//  Public API:
+//    create_federation(num_clients, fraction)
+//    select_clients(fed, round)
+//    local_train(client_data, model, epochs, lr)
+//    fed_avg(client_models, weights)
+//    add_dp_noise(grad, sigma, clip_norm)
+//    clip_gradients(grad, clip_norm)
+//    create_client_data(inputs, targets)
+//    run_federation_round(fed, client_data_list, global_model, epochs, lr)
+//    run_federation(fed, client_data_list, global_model, rounds, epochs, lr)
+//    compute_epsilon(sigma, delta, n_steps)
+//
+//  Conventions:
+//    - Uses #{} map literals (no {k:v} inside if blocks)
+//    - model: flat array of floats (weights)
+//    - client_data: map with "inputs" and "targets" arrays
+// ===================================================================
+
+// ===================================================================
+//  Math helpers
+// ===================================================================
+fn _fl_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _fl_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut guess = x / 2.0
+    if guess < 0.001 { guess = 0.001 }
+    let mut i = 0
+    while i < 15 {
+        guess = (guess + x / guess) / 2.0
+        i = i + 1
+    }
+    return guess
+}
+
+fn _fl_log(x) {
+    if x <= 0.0 { return 0.0 - 30.0 }
+    let mut v = x
+    let mut scale = 0.0
+    while v > 2.0 {
+        v = v / 2.718281828
+        scale = scale + 1.0
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        scale = scale - 1.0
+    }
+    let t = (v - 1.0) / (v + 1.0)
+    let t2 = t * t
+    return 2.0 * t * (1.0 + t2 / 3.0 + t2 * t2 / 5.0) + scale
+}
+
+// Simple pseudo-random (LCG)
+let mut _fl_seed = 7
+fn _fl_rand() {
+    _fl_seed = (_fl_seed * 1103515245 + 12345) % 2147483647
+    if _fl_seed < 0 { _fl_seed = 0 - _fl_seed }
+    return _fl_seed
+}
+
+fn _fl_rand_float() {
+    let r = _fl_rand()
+    return (r % 10000) * 1.0 / 10000.0
+}
+
+// Box-Muller approximation for Gaussian noise
+fn _fl_gaussian_noise(sigma) {
+    let u1 = _fl_rand_float() + 0.0001
+    let u2 = _fl_rand_float()
+    let pi = 3.14159265358979
+    // -2*ln(u1)
+    let r = _fl_sqrt(0.0 - 2.0 * _fl_log(u1))
+    let theta = 2.0 * pi * u2
+    // cos approximation
+    let x2 = theta * theta
+    let x4 = x2 * x2
+    let x6 = x4 * x2
+    let cos_v = 1.0 - x2 / 2.0 + x4 / 24.0 - x6 / 720.0
+    return r * cos_v * sigma
+}
+
+// ===================================================================
+//  Federation creation
+// ===================================================================
+
+// num_clients: total number of clients
+// fraction: fraction of clients participating per round (0.0-1.0)
+fn create_federation(num_clients, fraction) {
+    let fed = #{}
+    fed["num_clients"] = num_clients
+    fed["fraction"] = fraction
+    fed["round"] = 0
+    fed["history"] = []
+    return fed
+}
+
+// ===================================================================
+//  Client Selection — select fraction of clients per round
+//  Returns array of client indices
+// ===================================================================
+fn select_clients(fed, round) {
+    let num_clients = fed["num_clients"]
+    let fraction = fed["fraction"]
+    let n_select = _fl_max_int(1, _fl_floor(num_clients * 1.0 * fraction))
+
+    // pseudo-random selection using round as seed
+    _fl_seed = round * 31 + 17
+
+    let mut selected = []
+    let mut attempts = 0
+    while len(selected) < n_select {
+        let idx = _fl_rand() % num_clients
+        // check if already selected
+        let mut already = false
+        let ns = len(selected)
+        let mut si = 0
+        while si < ns {
+            if selected[si] == idx {
+                already = true
+                si = ns
+            }
+            si = si + 1
+        }
+        if already == false {
+            selected = selected + [idx]
+        }
+        attempts = attempts + 1
+        // safety: avoid infinite loop
+        if attempts > num_clients * 3 {
+            selected = selected + [attempts % num_clients]
+        }
+    }
+    return selected
+}
+
+fn _fl_max_int(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn _fl_floor(x) {
+    // truncate float to int
+    let i = x / 1
+    return i
+}
+
+// ===================================================================
+//  Create client data structure
+// ===================================================================
+fn create_client_data(inputs, targets) {
+    let d = #{}
+    d["inputs"] = inputs
+    d["targets"] = targets
+    d["size"] = len(inputs)
+    return d
+}
+
+// ===================================================================
+//  Local Training — simple SGD on client data
+//  client_data: map with "inputs" (array of arrays) and "targets" (array of arrays)
+//  model: flat array of floats
+//  epochs: int
+//  lr: float
+//  Returns updated model (flat array of floats)
+// ===================================================================
+fn local_train(client_data, model, epochs, lr) {
+    let inputs = client_data["inputs"]
+    let targets = client_data["targets"]
+    let n_samples = client_data["size"]
+    let n_params = len(model)
+
+    let mut weights = []
+    let mut i = 0
+    while i < n_params {
+        weights = weights + [model[i]]
+        i = i + 1
+    }
+
+    let mut epoch = 0
+    while epoch < epochs {
+        let mut si = 0
+        while si < n_samples {
+            let input = inputs[si]
+            let target = targets[si]
+            let in_len = len(input)
+
+            // simple linear forward: output[j] = sum(w[j*in_len+k] * input[k])
+            // compute gradients via MSE
+            let out_len = len(target)
+            let mut preds = []
+            let mut oi = 0
+            while oi < out_len {
+                let mut pred = 0.0
+                let mut ki = 0
+                while ki < in_len {
+                    let widx = oi * in_len + ki
+                    if widx < n_params {
+                        pred = pred + weights[widx] * input[ki]
+                    }
+                    ki = ki + 1
+                }
+                preds = preds + [pred]
+                oi = oi + 1
+            }
+
+            // SGD update: w -= lr * grad
+            oi = 0
+            while oi < out_len {
+                let error = preds[oi] - target[oi]
+                let mut ki = 0
+                while ki < in_len {
+                    let widx = oi * in_len + ki
+                    if widx < n_params {
+                        weights[widx] = weights[widx] - lr * error * input[ki]
+                    }
+                    ki = ki + 1
+                }
+                oi = oi + 1
+            }
+            si = si + 1
+        }
+        epoch = epoch + 1
+    }
+    return weights
+}
+
+// ===================================================================
+//  FedAvg Aggregation
+//  client_models: array of flat weight arrays
+//  weights: array of floats (contribution weight per client, e.g. data size)
+//  Returns: averaged model (flat array)
+// ===================================================================
+fn fed_avg(client_models, weights) {
+    let n_clients = len(client_models)
+    if n_clients == 0 { return [] }
+
+    let n_params = len(client_models[0])
+
+    // compute total weight
+    let mut total_w = 0.0
+    let mut ci = 0
+    while ci < n_clients {
+        total_w = total_w + weights[ci]
+        ci = ci + 1
+    }
+    if total_w == 0.0 { total_w = 1.0 }
+
+    // weighted average
+    let mut avg = []
+    let mut pi = 0
+    while pi < n_params {
+        let mut sum = 0.0
+        ci = 0
+        while ci < n_clients {
+            sum = sum + client_models[ci][pi] * weights[ci]
+            ci = ci + 1
+        }
+        avg = avg + [sum / total_w]
+        pi = pi + 1
+    }
+    return avg
+}
+
+// ===================================================================
+//  Differential Privacy — Gaussian mechanism
+// ===================================================================
+
+// Clip gradient to a maximum L2 norm
+fn clip_gradients(grad, clip_norm) {
+    let n = len(grad)
+    let mut norm_sq = 0.0
+    let mut i = 0
+    while i < n {
+        norm_sq = norm_sq + grad[i] * grad[i]
+        i = i + 1
+    }
+    let norm = _fl_sqrt(norm_sq)
+
+    if norm <= clip_norm { return grad }
+
+    let scale = clip_norm / norm
+    let mut clipped = []
+    i = 0
+    while i < n {
+        clipped = clipped + [grad[i] * scale]
+        i = i + 1
+    }
+    return clipped
+}
+
+// Add Gaussian noise to gradient for differential privacy
+fn add_dp_noise(grad, sigma, clip_norm) {
+    // first clip
+    let clipped = clip_gradients(grad, clip_norm)
+    let n = len(clipped)
+
+    // add noise
+    let mut noisy = []
+    let mut i = 0
+    while i < n {
+        let noise = _fl_gaussian_noise(sigma * clip_norm)
+        noisy = noisy + [clipped[i] + noise]
+        i = i + 1
+    }
+    return noisy
+}
+
+// ===================================================================
+//  Compute approximate epsilon (privacy budget) via simple composition
+//  sigma: noise multiplier
+//  delta: target delta
+//  n_steps: number of DP steps
+//  Returns: approximate epsilon
+// ===================================================================
+fn compute_epsilon(sigma, delta, n_steps) {
+    if sigma <= 0.0 { return 999999.0 }
+    // simple Gaussian mechanism: epsilon = sqrt(2 * ln(1.25/delta)) / sigma
+    let base_eps = _fl_sqrt(2.0 * _fl_log(1.25 / delta)) / sigma
+    // advanced composition: eps_total ~ base_eps * sqrt(n_steps)
+    let total_eps = base_eps * _fl_sqrt(n_steps * 1.0)
+    return total_eps
+}
+
+// ===================================================================
+//  Run one federation round
+// ===================================================================
+fn run_federation_round(fed, client_data_list, global_model, epochs, lr) {
+    let round = fed["round"]
+    let selected = select_clients(fed, round)
+    let n_selected = len(selected)
+
+    // local training
+    let mut client_models = []
+    let mut client_weights = []
+    let mut i = 0
+    while i < n_selected {
+        let client_idx = selected[i]
+        let data = client_data_list[client_idx]
+        let local_model = local_train(data, global_model, epochs, lr)
+        client_models = client_models + [local_model]
+        client_weights = client_weights + [data["size"] * 1.0]
+        i = i + 1
+    }
+
+    // aggregate
+    let new_global = fed_avg(client_models, client_weights)
+
+    // update round counter
+    fed["round"] = round + 1
+
+    let result = #{}
+    result["model"] = new_global
+    result["selected"] = selected
+    result["fed"] = fed
+    return result
+}
+
+// ===================================================================
+//  Run full federation for multiple rounds
+// ===================================================================
+fn run_federation(fed, client_data_list, global_model, rounds, epochs, lr) {
+    let mut model = global_model
+    let mut r = 0
+    while r < rounds {
+        let result = run_federation_round(fed, client_data_list, model, epochs, lr)
+        model = result["model"]
+        fed = result["fed"]
+        r = r + 1
+    }
+    let output = #{}
+    output["model"] = model
+    output["fed"] = fed
+    return output
+}
+
+println("[federated] module loaded")
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

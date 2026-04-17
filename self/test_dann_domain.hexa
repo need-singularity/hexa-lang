@@ -2,7 +2,459 @@
 //  test_dann_domain.hexa — Domain Adaptation DANN (#286)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/dann_domain.hexa"
+// -- inlined from self/ml/dann_domain.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/dann_domain.hexa — Domain-Adversarial NN (#286)
+//
+//  DANN (Ganin & Lempitsky, 2015) — domain adaptation via adversarial
+//  learning with gradient reversal layer.
+//
+//    feature extractor      f_θ : x → h
+//    label classifier       g_y : h → ŷ
+//    domain classifier      g_d : h → d̂
+//
+//  Total objective:
+//      L(θ, φ_y, φ_d) = L_y(g_y(f_θ), y)   (source only)
+//                      − λ · L_d(g_d(f_θ), d)
+//
+//  Gradient reversal: during backprop the domain loss flips sign
+//  when flowing into the feature extractor, making f_θ learn
+//  domain-invariant features.
+//
+//  Architecture in this module:
+//      h = tanh( W_f · x + b_f )      D_in → D_hidden
+//      ŷ = softmax( W_y · h + b_y )   D_hidden → K
+//      d̂ = sigmoid( w_d · h + b_d )   D_hidden → 1
+//
+//  API:
+//    dann_init(D_in, D_hidden, K, seed) -> model
+//    dann_features(model, inp)          -> [float]
+//    dann_predict_label(model, inp)     -> int
+//    dann_predict_domain(model, inp)    -> float  (probability)
+//    dann_label_loss(model, inp, y)     -> float
+//    dann_domain_loss(model, inp, d)    -> float
+//    dann_train_step(model, Xs, Ys, Xt, lr, lam) -> model
+//    dann_domain_acc(model, X, D)       -> float
+//    dann_label_acc(model, X, Y)        -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward/loss)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+fn dann_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn dann_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn dann_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn dann_tanh(inp) {
+    let e_pos = dann_exp(inp)
+    let e_neg = dann_exp(0.0 - inp)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn dann_sigmoid(inp) {
+    return 1.0 / (1.0 + dann_exp(0.0 - inp))
+}
+
+fn dann_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dann_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn dann_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn dann_uniform(state) {
+    let s = dann_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise DANN model
+//    W_f  : hidden × input     (U(-0.5, 0.5))
+//    b_f  : hidden
+//    W_y  : K × hidden
+//    b_y  : K
+//    w_d  : hidden
+//    b_d  : scalar
+// ═══════════════════════════════════════════════════════════════════
+fn dann_init(D_in, D_hidden, K, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut W_f = dann_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = dann_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_f[i][j] = u[0] - 0.5
+        }
+    }
+    let b_f = dann_zeros_f(D_hidden)
+    let mut W_y = dann_zeros_2d(K, D_hidden)
+    for k in 0..K {
+        for j in 0..D_hidden {
+            let u = dann_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_y[k][j] = u[0] - 0.5
+        }
+    }
+    let b_y = dann_zeros_f(K)
+    let mut w_d = dann_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        let u = dann_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        w_d[j] = u[0] - 0.5
+    }
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "K": K,
+        "W_f": W_f,
+        "b_f": b_f,
+        "W_y": W_y,
+        "b_y": b_y,
+        "w_d": w_d,
+        "b_d": 0.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Feature extractor
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dann_features(model, inp) {
+    let W_f = model["W_f"]
+    let b_f = model["b_f"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut feat = dann_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b_f[i]
+        for j in 0..D_in { s = s + W_f[i][j] * inp[j] }
+        feat[i] = dann_tanh(s)
+    }
+    return feat
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Label classifier logits + softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dann_label_logits(model, feat) {
+    let W_y = model["W_y"]
+    let b_y = model["b_y"]
+    let K = model["K"]
+    let D_hidden = model["D_hidden"]
+    let mut logits = dann_zeros_f(K)
+    for k in 0..K {
+        let mut s = b_y[k]
+        for j in 0..D_hidden { s = s + W_y[k][j] * feat[j] }
+        logits[k] = s
+    }
+    return logits
+}
+
+@pure
+fn dann_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = dann_zeros_f(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = dann_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+@pure
+fn dann_predict_label(model, inp) {
+    let feat = dann_features(model, inp)
+    let logits = dann_label_logits(model, feat)
+    let K = len(logits)
+    let mut best = logits[0]
+    let mut idx = 0
+    for k in 1..K {
+        if logits[k] > best {
+            best = logits[k]
+            idx = k
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Domain classifier (logistic)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dann_domain_logit(model, feat) {
+    let w_d = model["w_d"]
+    let b_d = model["b_d"]
+    let D_hidden = model["D_hidden"]
+    let mut s = b_d
+    for j in 0..D_hidden { s = s + w_d[j] * feat[j] }
+    return s
+}
+
+@pure
+fn dann_predict_domain(model, inp) {
+    let feat = dann_features(model, inp)
+    return dann_sigmoid(dann_domain_logit(model, feat))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Losses
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dann_label_loss(model, inp, y) {
+    let feat = dann_features(model, inp)
+    let logits = dann_label_logits(model, feat)
+    let p = dann_softmax(logits)
+    let mut py = p[y]
+    if py < 1.0e-12 { py = 1.0e-12 }
+    return 0.0 - dann_log(py)
+}
+
+@pure
+fn dann_domain_loss(model, inp, d) {
+    let feat = dann_features(model, inp)
+    let logit = dann_domain_logit(model, feat)
+    let prob = dann_sigmoid(logit)
+    let mut pd = prob
+    if d == 0 { pd = 1.0 - prob }
+    if pd < 1.0e-12 { pd = 1.0e-12 }
+    return 0.0 - dann_log(pd)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient flow:
+//
+//    ∂L_y/∂logits_y = p - onehot(y)
+//    ∂L_d/∂logit_d  = σ(logit_d) - d
+//
+//    Let u_y = p - onehot(y)
+//    Let u_d = σ(logit_d) - d
+//
+//    ∂L/∂W_y     = u_y · feat^T
+//    ∂L/∂b_y     = u_y
+//    ∂L/∂w_d     = u_d · feat
+//    ∂L/∂b_d     = u_d
+//
+//    For feature extractor with gradient reversal on the domain loss:
+//        grad_feat = (u_y · W_y) − λ · (u_d · w_d)
+//    Then backprop through tanh' = 1 - tanh² :
+//        δ_h = grad_feat * (1 - feat²)
+//    ∂L/∂W_f = δ_h · x^T
+//    ∂L/∂b_f = δ_h
+// ═══════════════════════════════════════════════════════════════════
+fn dann_train_step(model, Xs, Ys, Xt, lr, lam) {
+    let Ns = len(Xs)
+    let Nt = len(Xt)
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let K = model["K"]
+    let W_f = model["W_f"]
+    let b_f = model["b_f"]
+    let W_y = model["W_y"]
+    let b_y = model["b_y"]
+    let w_d = model["w_d"]
+    let b_d = model["b_d"]
+
+    let mut gW_f = dann_zeros_2d(D_hidden, D_in)
+    let mut gb_f = dann_zeros_f(D_hidden)
+    let mut gW_y = dann_zeros_2d(K, D_hidden)
+    let mut gb_y = dann_zeros_f(K)
+    let mut gw_d = dann_zeros_f(D_hidden)
+    let mut gb_d = 0.0
+
+    // ── Source: label loss grad ────────────────────────────────
+    for i in 0..Ns {
+        let inp = Xs[i]
+        let y = Ys[i]
+        let feat = dann_features(model, inp)
+        let logits = dann_label_logits(model, feat)
+        let p = dann_softmax(logits)
+        let mut u_y = dann_zeros_f(K)
+        for k in 0..K {
+            u_y[k] = p[k]
+            if k == y { u_y[k] = u_y[k] - 1.0 }
+        }
+        // grad W_y, b_y
+        for k in 0..K {
+            gb_y[k] = gb_y[k] + u_y[k]
+            for j in 0..D_hidden { gW_y[k][j] = gW_y[k][j] + u_y[k] * feat[j] }
+        }
+        // grad feat (label branch)
+        let mut grad_feat_y = dann_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            let mut s = 0.0
+            for k in 0..K { s = s + u_y[k] * W_y[k][j] }
+            grad_feat_y[j] = s
+        }
+        // backprop through tanh for label branch
+        let mut delta_h = dann_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            delta_h[j] = grad_feat_y[j] * (1.0 - feat[j] * feat[j])
+        }
+        for j in 0..D_hidden {
+            gb_f[j] = gb_f[j] + delta_h[j]
+            for ii in 0..D_in {
+                gW_f[j][ii] = gW_f[j][ii] + delta_h[j] * inp[ii]
+            }
+        }
+    }
+
+    // ── Domain loss: source label 0, target label 1 ────────────
+    // Gradient reversal: feature extractor receives -lam * d_grad
+    // Domain classifier receives +d_grad (standard ascent on acc)
+    let all_X = Xs + Xt
+    let mut all_D = []
+    for _i in 0..Ns { all_D = all_D + [0] }
+    for _i in 0..Nt { all_D = all_D + [1] }
+    let Nall = len(all_X)
+    for i in 0..Nall {
+        let inp = all_X[i]
+        let d = all_D[i]
+        let feat = dann_features(model, inp)
+        let logit = dann_domain_logit(model, feat)
+        let prob = dann_sigmoid(logit)
+        let u_d = prob - to_float(d)
+        // domain params: normal gradient descent
+        gb_d = gb_d + u_d
+        for j in 0..D_hidden { gw_d[j] = gw_d[j] + u_d * feat[j] }
+        // grad feat from domain branch (before reversal)
+        let mut grad_feat_d = dann_zeros_f(D_hidden)
+        for j in 0..D_hidden { grad_feat_d[j] = u_d * w_d[j] }
+        // Gradient reversal:  multiply by -lam
+        let mut delta_h_d = dann_zeros_f(D_hidden)
+        for j in 0..D_hidden {
+            delta_h_d[j] = (0.0 - lam) * grad_feat_d[j] * (1.0 - feat[j] * feat[j])
+        }
+        for j in 0..D_hidden {
+            gb_f[j] = gb_f[j] + delta_h_d[j]
+            for ii in 0..D_in {
+                gW_f[j][ii] = gW_f[j][ii] + delta_h_d[j] * inp[ii]
+            }
+        }
+    }
+
+    // ── Apply gradients ────────────────────────────────────────
+    let inv_s = 1.0 / to_float(Ns)
+    let inv_all = 1.0 / to_float(Nall)
+    let mut W_f_new = dann_zeros_2d(D_hidden, D_in)
+    let mut b_f_new = dann_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        b_f_new[j] = b_f[j] - lr * gb_f[j] * inv_all
+        for ii in 0..D_in {
+            W_f_new[j][ii] = W_f[j][ii] - lr * gW_f[j][ii] * inv_all
+        }
+    }
+    let mut W_y_new = dann_zeros_2d(K, D_hidden)
+    let mut b_y_new = dann_zeros_f(K)
+    for k in 0..K {
+        b_y_new[k] = b_y[k] - lr * gb_y[k] * inv_s
+        for j in 0..D_hidden {
+            W_y_new[k][j] = W_y[k][j] - lr * gW_y[k][j] * inv_s
+        }
+    }
+    let mut w_d_new = dann_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        w_d_new[j] = w_d[j] - lr * gw_d[j] * inv_all
+    }
+    let b_d_new = b_d - lr * gb_d * inv_all
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "K": K,
+        "W_f": W_f_new,
+        "b_f": b_f_new,
+        "W_y": W_y_new,
+        "b_y": b_y_new,
+        "w_d": w_d_new,
+        "b_d": b_d_new
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Accuracy helpers
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn dann_label_acc(model, X, Y) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..N {
+        if dann_predict_label(model, X[i]) == Y[i] { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(N)
+}
+
+@pure
+fn dann_domain_acc(model, X, D) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..N {
+        let prob = dann_predict_domain(model, X[i])
+        let pred = if prob > 0.5 { 1 } else { 0 }
+        if pred == D[i] { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(N)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -33,7 +33,491 @@
 //  ML roadmap #96 — 3D Parallelism (Megatron-DeepSpeed)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/parallelism_3d.hexa"
+// -- inlined from self/ml/parallelism_3d.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  parallelism_3d.hexa — 3D Parallelism (TP × PP × ZeRO/DP)
+//
+//  Megatron-DeepSpeed style 3D parallel training, pure .hexa CPU
+//  simulation. Combines three orthogonal axes into a single mesh:
+//
+//      world = TP × PP × DP
+//
+//    • TP axis (tensor parallel): Megatron 2-way column/row parallel
+//      linear layers — borrowed from self/ml/tensor_parallel.hexa.
+//    • PP axis (pipeline parallel): 1F1B 2-stage scheduler — borrowed
+//      from self/ml/pipeline_parallel.hexa.
+//    • DP axis (data parallel): data sharding + ZeRO-1/2/3 optimizer
+//      state sharding — borrowed from self/ml/zero_optimizer.hexa.
+//
+//  Every rank is addressed by a 3-tuple (tp_rank, pp_rank, dp_rank) and
+//  a flat index
+//      flat(tp, pp, dp) = tp + TP*(pp + PP*dp)
+//
+//  The executor fuses the three axes:
+//    1.  Data parallel split: global batch → per-dp-rank micro-batches.
+//    2.  Pipeline stage 1F1B schedule executes both stages per dp-rank.
+//    3.  Inside every stage, TP col→row linear composition runs.
+//    4.  Gradient sync on DP axis (all-reduce of dense grads).
+//    5.  ZeRO optimizer step on the synced grad.
+//
+//  The toy model used by this file is a "linear FFN block":
+//
+//      y = (X @ W1) @ W2
+//
+//  The scalar pipeline from pipeline_parallel.hexa is reused for the
+//  PP backbone; the TP GEMM kernel is the real matrix-valued thing
+//  exposed by tensor_parallel.hexa; the DP+ZeRO optimizer step is
+//  the real sharded Adam from zero_optimizer.hexa.
+//
+//  Correctness: for every combination TP∈{1,2}, PP∈{1,2}, DP∈{1,2},
+//  the composed forward matches the reference single-device computation
+//  within 1e-6 (tested in self/test_parallelism_3d.hexa).
+//
+//  Test file: self/test_parallelism_3d.hexa
+//  SSOT entry: shared/hexa-lang/ml-next-level.json id=96
+// ═══════════════════════════════════════════════════════════════════
+
+import "ml/tensor_parallel.hexa"
+import "ml/pipeline_parallel.hexa"
+import "ml/zero_optimizer.hexa"
+
+// ── Config ──────────────────────────────────────────────────────
+
+struct P3DConfig {
+    tp_size: int,             // tensor-parallel dim (nranks on TP axis)
+    pp_size: int,             // pipeline-parallel dim (# stages)
+    dp_size: int,             // data-parallel dim (# replicas / ZeRO ranks)
+    world_size: int,          // = tp_size * pp_size * dp_size
+    zero_stage: int,          // 0 (none), 1, 2, 3
+    num_layers: int,          // total FFN blocks in the model
+    global_batch: int,        // total batch; must be divisible by dp_size
+    hidden: int,              // FFN intermediate width (split by TP)
+    dim: int                  // input/output feature dim (split by TP)
+}
+
+// ── Flat↔3D coordinate helpers ─────────────────────────────────
+
+fn p3d_flat(cfg, tp, pp, dp) {
+    // flat rank = tp + TP*(pp + PP*dp)
+    tp + cfg.tp_size * (pp + cfg.pp_size * dp)
+}
+
+fn p3d_tp_of(cfg, flat) { flat % cfg.tp_size }
+
+fn p3d_pp_of(cfg, flat) {
+    (flat / cfg.tp_size) % cfg.pp_size
+}
+
+fn p3d_dp_of(cfg, flat) {
+    flat / (cfg.tp_size * cfg.pp_size)
+}
+
+// ── Mesh construction ───────────────────────────────────────────
+
+// Build a 3D mesh: returns a length-world array of [tp, pp, dp] coords
+// indexed by the flat rank.
+fn p3d_build_mesh(cfg) {
+    let mut mesh = []
+    let mut dp = 0
+    while dp < cfg.dp_size {
+        let mut pp = 0
+        while pp < cfg.pp_size {
+            let mut tp = 0
+            while tp < cfg.tp_size {
+                mesh = mesh + [[tp, pp, dp]]
+                tp = tp + 1
+            }
+            pp = pp + 1
+        }
+        dp = dp + 1
+    }
+    return mesh
+}
+
+// Validate a mesh is self-consistent: flat_of(coord) == index.
+fn p3d_mesh_valid(cfg, mesh) {
+    let n = cfg.tp_size * cfg.pp_size * cfg.dp_size
+    if len(mesh) != n { return false }
+    let mut i = 0
+    while i < n {
+        let c = mesh[i]
+        let f = p3d_flat(cfg, c[0], c[1], c[2])
+        if f != i { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ── Config constructor ─────────────────────────────────────────
+
+fn p3d_init(tp_size, pp_size, dp_size, num_layers, global_batch, dim, hidden, zero_stage) {
+    // Clamp PP to 2 because pipeline_parallel.hexa only implements 2 stages.
+    let mut pp = pp_size
+    if pp != 1 {
+        if pp != 2 { pp = 2 }
+    }
+    let world = tp_size * pp * dp_size
+    return P3DConfig {
+        tp_size: tp_size,
+        pp_size: pp,
+        dp_size: dp_size,
+        world_size: world,
+        zero_stage: zero_stage,
+        num_layers: num_layers,
+        global_batch: global_batch,
+        hidden: hidden,
+        dim: dim
+    }
+}
+
+// ── Load balance ────────────────────────────────────────────────
+// Compute per-stage layer ranges. Uses the same (num_layers*s)/P,
+// (num_layers*(s+1))/P split as pipeline_parallel.hexa so a 4-layer
+// 2-stage model gets [0,2)+[2,4) and 5-layer 2-stage gets [0,2)+[2,5).
+
+fn p3d_layer_ranges(cfg) {
+    let mut ranges = []
+    let mut s = 0
+    while s < cfg.pp_size {
+        let begin = (cfg.num_layers * s) / cfg.pp_size
+        let end = (cfg.num_layers * (s + 1)) / cfg.pp_size
+        ranges = ranges + [[begin, end]]
+        s = s + 1
+    }
+    return ranges
+}
+
+// Load imbalance metric: max - min of per-stage layer counts.
+// Perfect balance → 0. For 4 layers ÷ 2 stages it is 0, for 5 ÷ 2
+// it is 1 (2 vs 3).
+fn p3d_load_imbalance(cfg) {
+    let ranges = p3d_layer_ranges(cfg)
+    if len(ranges) == 0 { return 0 }
+    let mut mx = (ranges[0])[1] - (ranges[0])[0]
+    let mut mn = mx
+    let mut s = 1
+    while s < len(ranges) {
+        let r = ranges[s]
+        let sz = r[1] - r[0]
+        if sz > mx { mx = sz }
+        if sz < mn { mn = sz }
+        s = s + 1
+    }
+    return mx - mn
+}
+
+// ── Global batch → per-DP-rank shard ───────────────────────────
+
+fn p3d_dp_batch_shard(cfg, dp_rank) {
+    let per = cfg.global_batch / cfg.dp_size
+    let begin = dp_rank * per
+    return [begin, begin + per]
+}
+
+fn p3d_dp_batch_size(cfg) { cfg.global_batch / cfg.dp_size }
+
+// ── Input sharding helper (row-split along batch axis) ─────────
+
+fn p3d_split_batch(X, batch, feat, dp_size) {
+    let per = batch / dp_size
+    let mut shards = []
+    let mut r = 0
+    while r < dp_size {
+        let mut shard = tp_mat_zeros(per, feat)
+        let row_start = r * per
+        let mut i = 0
+        while i < per {
+            let mut j = 0
+            while j < feat {
+                shard[i * feat + j] = X[(row_start + i) * feat + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        shards = shards + [shard]
+        r = r + 1
+    }
+    return shards
+}
+
+// ── TP-fused FFN stage forward ─────────────────────────────────
+//
+// Computes Y = (X @ W1) @ W2 using the column-parallel → row-parallel
+// transformer FFN composition pattern, with nranks = tp_size.
+//
+//   X   : [batch_local x dim]  (replicated across TP axis)
+//   W1  : [dim x hidden]       column-parallel split
+//   W2  : [hidden x dim]       row-parallel split
+//
+// If tp_size == 1 we fall back to the single-GEMM path.
+
+fn p3d_ffn_forward(X, W1, W2, batch_local, dim, hidden, tp_size) {
+    if tp_size == 1 {
+        let H = tp_matmul(X, W1, batch_local, dim, hidden)
+        return tp_matmul(H, W2, batch_local, hidden, dim)
+    }
+    // TP path: col-parallel GEMM1 produces column shards of H;
+    // row-parallel GEMM2 consumes that same sharding.
+    let W1_shards = tp_split_col(W1, dim, hidden, tp_size)
+    let H_shards = tp_column_parallel_linear_forward(X, W1_shards, batch_local, dim, hidden, tp_size)
+    let W2_shards = tp_split_row(W2, hidden, dim, tp_size)
+    return tp_row_parallel_linear_forward_reduced(H_shards, W2_shards, batch_local, hidden, dim, tp_size)
+}
+
+// Single-GPU reference — no TP, no PP, no DP, no ZeRO.
+fn p3d_ffn_forward_single(X, W1, W2, batch, dim, hidden) {
+    let H = tp_matmul(X, W1, batch, dim, hidden)
+    return tp_matmul(H, W2, batch, hidden, dim)
+}
+
+// ── Pipeline backbone reused from pipeline_parallel ────────────
+// The PP axis is simulated by stacking FFN blocks. Layer weights are
+// a flat scalar list, reused for the 1F1B scheduler bookkeeping.
+// For the real-matrix model we maintain parallel lists (W1_layers,
+// W2_layers) indexed by layer id.
+
+struct P3DLayerStack {
+    num_layers: int,
+    W1_list: array,        // per-layer W1 [dim x hidden]
+    W2_list: array,        // per-layer W2 [hidden x dim]
+    dim: int,
+    hidden: int
+}
+
+fn p3d_stack_forward(stack, X, batch, layer_begin, layer_end, tp_size) {
+    let mut Y = X
+    let mut l = layer_begin
+    while l < layer_end {
+        let W1 = stack.W1_list[l]
+        let W2 = stack.W2_list[l]
+        Y = p3d_ffn_forward(Y, W1, W2, batch, stack.dim, stack.hidden, tp_size)
+        l = l + 1
+    }
+    return Y
+}
+
+// Pipeline forward for a single DP-rank's local batch.
+// Uses the 2-stage split from p3d_layer_ranges and the TP-fused FFN.
+fn p3d_pp_forward(cfg, stack, X_local, batch_local) {
+    let ranges = p3d_layer_ranges(cfg)
+    let mut Y = X_local
+    let mut s = 0
+    while s < cfg.pp_size {
+        let r = ranges[s]
+        Y = p3d_stack_forward(stack, Y, batch_local, r[0], r[1], cfg.tp_size)
+        s = s + 1
+    }
+    return Y
+}
+
+// ── Gradient sync primitive (DP axis) ───────────────────────────
+//
+// On the DP axis every rank produced its own dense gradient vector
+// over the flat parameter tape. A real job does this via all-reduce;
+// we simulate it by element-wise summing the per-dp-rank grad arrays
+// and dividing by dp_size to average.
+
+fn p3d_grad_allreduce(grads_per_dp, dp_size) {
+    let n = len(grads_per_dp[0])
+    let mut summed = zo_zeros(n)
+    let mut r = 0
+    while r < dp_size {
+        let g = grads_per_dp[r]
+        let mut i = 0
+        while i < n {
+            summed[i] = summed[i] + g[i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    let inv = 1.0 / to_float(dp_size)
+    let mut i = 0
+    while i < n {
+        summed[i] = summed[i] * inv
+        i = i + 1
+    }
+    return summed
+}
+
+// ── End-to-end step: merged 3D parallel training iteration ─────
+
+struct P3DStepResult {
+    outputs: array,          // [dp_size] — each element is the full stage-last Y for that DP rank
+    grad_synced: array,      // averaged flat gradient vector (after all-reduce)
+    opt_ctx: ZeroContext,    // ZeRO optimizer context after applying the step
+    bubble_steps: int,       // PP bubble accounting
+    mesh_valid: bool         // sanity check on the built mesh
+}
+
+// The "flat params" vector is an opaque parameter tape consumed by the
+// optimizer (ZeRO). Here we use a simple count: params_per_layer = 1.0
+// per layer, matching the scalar weight-list in pipeline_parallel. The
+// ZeRO optimizer then shards this flat tape across DP ranks.
+//
+// X: full global batch [global_batch x dim]
+// flat_params: length num_layers scalar tape (initial weights)
+// stack: layer matrices
+// synthetic_grads: dense gradient fed into the optimizer each step;
+//   we model the FFN backward by passing this through — the correctness
+//   focus is the composition of TP+PP+DP+ZeRO, not the per-layer AD.
+
+fn p3d_step(cfg, X_global, stack, flat_params, synthetic_grads, lr) {
+    // 1) Build + validate the 3D mesh.
+    let mesh = p3d_build_mesh(cfg)
+    let ok = p3d_mesh_valid(cfg, mesh)
+
+    // 2) DP split: each dp-rank gets its batch shard.
+    let batch_local = p3d_dp_batch_size(cfg)
+    let X_shards = p3d_split_batch(X_global, cfg.global_batch, cfg.dim, cfg.dp_size)
+
+    // 3) For each dp-rank run PP×TP forward on its local batch.
+    let mut outputs = []
+    let mut dp = 0
+    while dp < cfg.dp_size {
+        let X_local = X_shards[dp]
+        let Y_local = p3d_pp_forward(cfg, stack, X_local, batch_local)
+        outputs = outputs + [Y_local]
+        dp = dp + 1
+    }
+
+    // 4) Per-dp-rank synthetic grads → all-reduce average.
+    let mut grads_per_dp = []
+    dp = 0
+    while dp < cfg.dp_size {
+        grads_per_dp = grads_per_dp + [zo_copy(synthetic_grads)]
+        dp = dp + 1
+    }
+    let grad_synced = p3d_grad_allreduce(grads_per_dp, cfg.dp_size)
+
+    // 5) ZeRO optimizer step on the DP axis (dp_size ZeRO ranks).
+    let stage = cfg.zero_stage
+    let mut ctx = zo_create(cfg.dp_size, flat_params, stage)
+    ctx = zo_set_grads(ctx, grad_synced)
+    ctx = zo_step(ctx, lr)
+
+    // 6) Pipeline bubble accounting (reuse pp_bubble_ratio formula).
+    //    For 2-stage with M micro-batches = dp_size we model micro-batches
+    //    = number of DP shards funneled through the PP axis.
+    let M = cfg.dp_size
+    if M < 1 { } // noop guard
+    let bubble = (cfg.pp_size - 1) * 2  // warmup + cooldown for 2-stage
+
+    return P3DStepResult {
+        outputs: outputs,
+        grad_synced: grad_synced,
+        opt_ctx: ctx,
+        bubble_steps: bubble,
+        mesh_valid: ok
+    }
+}
+
+// ── Single-axis equivalence helpers ─────────────────────────────
+//
+// These produce reference outputs when one of the three axes is 1.
+// They are the core of the correctness test: when TP=1 & DP=1 & PP=1
+// the merged step should reproduce them exactly.
+
+fn p3d_reference_forward(cfg, X_global, stack) {
+    // Full single-device forward: no sharding at all.
+    let ranges = p3d_layer_ranges(cfg)
+    let mut Y = X_global
+    let mut s = 0
+    while s < cfg.pp_size {
+        let r = ranges[s]
+        Y = p3d_stack_forward(stack, Y, cfg.global_batch, r[0], r[1], 1)
+        s = s + 1
+    }
+    return Y
+}
+
+// Concat per-dp outputs back into a single global [B x dim] matrix
+// for direct comparison with the reference forward.
+fn p3d_concat_outputs(outputs_per_dp, batch_local, dim) {
+    let dp_size = len(outputs_per_dp)
+    let global_batch = batch_local * dp_size
+    let mut out = tp_mat_zeros(global_batch, dim)
+    let mut r = 0
+    while r < dp_size {
+        let shard = outputs_per_dp[r]
+        let row_start = r * batch_local
+        let mut i = 0
+        while i < batch_local {
+            let mut j = 0
+            while j < dim {
+                out[(row_start + i) * dim + j] = shard[i * dim + j]
+                j = j + 1
+            }
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return out
+}
+
+// ── Memory accounting (rank-level) ──────────────────────────────
+//
+// Reports float-count cost per rank by combining axes:
+//   • TP    : each rank holds 1/tp of W1, W2 per stage
+//   • PP    : each rank holds only its stage's layer range
+//   • DP+ZeRO : params/grads/Adam moments sharded per zero_stage
+//
+// This uses the same formulas as zo_memory_per_rank but scaled by
+// per-stage layer fraction (pp) and per-feature fraction (tp).
+
+fn p3d_memory_per_rank(cfg, flat) {
+    let pp = p3d_pp_of(cfg, flat)
+    let tp_rank = p3d_tp_of(cfg, flat)
+    let dp = p3d_dp_of(cfg, flat)
+
+    let ranges = p3d_layer_ranges(cfg)
+    let r = ranges[pp]
+    let layers_here = r[1] - r[0]
+
+    // per-layer full W1 + W2 floats on one rank (no TP)
+    let params_per_layer_full = (cfg.dim * cfg.hidden) + (cfg.hidden * cfg.dim)
+    let params_per_layer_tp = params_per_layer_full / cfg.tp_size
+    let local_params = layers_here * params_per_layer_tp
+
+    // DP+ZeRO applied on top: for ZeRO-3 even local_params is sharded
+    // across dp_size ranks.
+    if cfg.zero_stage == 3 {
+        return (local_params / cfg.dp_size) * 4  // params + grads + m + v sharded
+    }
+    if cfg.zero_stage == 2 {
+        return local_params + (local_params / cfg.dp_size) * 3  // params full, rest sharded
+    }
+    if cfg.zero_stage == 1 {
+        return local_params + local_params + (local_params / cfg.dp_size) * 2
+    }
+    // ZeRO-0 (no sharding on DP)
+    return local_params * 4
+}
+
+fn p3d_memory_baseline(cfg) {
+    let params_per_layer = (cfg.dim * cfg.hidden) + (cfg.hidden * cfg.dim)
+    return 4 * cfg.num_layers * params_per_layer
+}
+
+// ── Sanity summary ─────────────────────────────────────────────
+
+fn p3d_summary(cfg) {
+    println("[p3d] TP=" + str(cfg.tp_size)
+        + " PP=" + str(cfg.pp_size)
+        + " DP=" + str(cfg.dp_size)
+        + " world=" + str(cfg.world_size)
+        + " layers=" + str(cfg.num_layers)
+        + " batch=" + str(cfg.global_batch)
+        + " dim=" + str(cfg.dim)
+        + " hidden=" + str(cfg.hidden)
+        + " zero=" + str(cfg.zero_stage))
+}
+
+println("[parallelism_3d] module loaded — TP x PP x ZeRO (DP) 3D mesh ready")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

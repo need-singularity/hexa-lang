@@ -16,7 +16,401 @@
 //      - AST marker detect/rewrite   → conservative predicate
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/grad_clip_fused.hexa"
+// -- inlined from self/ai_native/grad_clip_fused.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/grad_clip_fused.hexa — AI-native ROI #97
+//
+//  @grad_clip_fused — fuse global-norm gradient clipping's two-pass
+//  structure (compute ||g||₂, then scale) into a single cache-friendly
+//  pass.  The naive path used by every optimizer loop ever written is:
+//
+//      // pass 1 — accumulate squared L2 norm
+//      s = 0
+//      for i in 0..n: s += g[i] * g[i]
+//      norm = sqrt(s)
+//
+//      // pass 2 — scale if we exceed the cap
+//      if norm > max_norm:
+//          factor = max_norm / norm
+//          for i in 0..n: g[i] *= factor
+//
+//  That path makes *two* full sweeps over every parameter tensor each
+//  step.  Gradient tensors for a 7B-scale model total ~14 GB of fp32;
+//  even with warm caches the second sweep re-fetches every word from
+//  main memory.  The fused kernel consolidates to:
+//
+//      // one pass — partial squared sums via pairwise tree-reduce
+//      norm² = tree_sum(g[i] * g[i])                            // log-depth
+//      factor = (sqrt(norm²) > max) ? max / sqrt(norm²) : 1.0
+//      for i in 0..n: g_out[i] = g[i] * factor                  // second pass
+//
+//  The essential wins are:
+//      (a) we only pay one FMA per element in the scale sweep (the
+//          squared sum is irreducibly its own pass because the scale
+//          factor *depends on* the global reduction — no kernel can
+//          collapse to a single sweep without speculative two-phase
+//          execution), and
+//      (b) the squared sum uses a log-depth pairwise tree (see
+//          self/ai_native/reduce_tree.hexa, ROI #85) which has
+//          O(log n · eps) fp error vs the naive linear fold's
+//          O(n · eps) — matters for billion-element tensors.
+//
+//  Public API:
+//      global_norm(grads)                  -> float        // ||g||₂
+//      global_norm_sq(grads)               -> float        // ||g||²
+//      clip_naive(grads, max_norm)         -> [float]      // two-pass
+//      clip_fused(grads, max_norm)         -> [float]      // one-sweep scale
+//      clip_naive_list(list_of_grads, mx)  -> [[float]]    // multi-tensor
+//      clip_fused_list(list_of_grads, mx)  -> [[float]]    // multi-tensor
+//      detect_clip_pattern(markers)        -> bool         // AST marker
+//      rewrite_to_fused(markers)           -> string       // AST marker
+//      naive_pass_count()                  -> int          // = 2
+//      fused_pass_count()                  -> int          // = 1 (+ 1 reduction)
+//
+//  Shapes:
+//      grads          : [float]                (single-tensor API)
+//      list_of_grads  : [[float]]              (multi-tensor API)
+//      max_norm       : float, expected > 0
+//
+//  Numerical contract:
+//      clip_fused(g, m)  ≡  clip_naive(g, m)   element-wise tol 1e-6
+//      ||clip_fused(g, m)||₂  ≤  m            (up to fp eps ~1e-6)
+//      if ||g||₂ ≤ m:  clip_*(g, m) == g       (identity — no rescale)
+//      if g is all zeros: clip_*(g, m) == g    (no division by zero)
+//      m ≤ 0: treated as a no-op (defensive, matches PyTorch semantics)
+//
+//  Edge cases:
+//      empty tensor    → returns empty copy; global_norm = 0
+//      single element  → ||g|| = |g[0]|; scale scalar case
+//      ||g|| == m      → factor = 1.0 exactly (boundary); pass through
+//      subnormal norms → factor clamped to 1.0 if norm ≈ 0
+//
+//  sqrt is a hexa builtin (see self/ai_native/flash_attention.hexa:94).
+//  No FFI, no Rust, no stage0 rebuild.
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - no bit-ops needed anywhere here
+//      - no struct literals in `if` heads
+//      - no `and`/`or`; compose with nested `if`
+//      - abs → use abs_pure from math_pure.hexa
+//      - `let mut x = 0` could contaminate via val_int(0) caching;
+//        we initialise numeric accumulators as `0.0` (float literal)
+//        to pin the type slot explicitly
+//      - slice ranges need paren when mixing with +; we don't slice
+//        inside this file
+//
+//  AI-native attrs:
+//      @hot            — per-step optimizer critical path
+//      @grad_clip_fused— marker: 2-pass → 1-sweep (+ log-depth reduce)
+//      @pure           — no side-effects; returns a fresh array
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+// gc97_fabs → abs_pure (math_pure.hexa)
+
+fn gc97_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+// pairwise tree-sum of squared values: accumulates Σ g[i]² with
+// O(log n) dependency depth and O(log n · eps) fp error.  Inlined
+// here rather than importing reduce_tree.hexa so that this module
+// stays self-contained (ROI #85 is the canonical source — this
+// specialization avoids the op-dispatch string compare per element).
+fn gc97_tree_sum_sq(g) {
+    let n = len(g)
+    if n == 0 { return 0.0 }
+    if n == 1 { return g[0] * g[0] }
+
+    // level 0 — seed with element-wise squares
+    let mut level = []
+    let mut k = 0
+    while k < n {
+        let v = g[k]
+        level = level.push(v * v)
+        k = k + 1
+    }
+
+    // pairwise collapse; odd length carries unpaired tail
+    while len(level) > 1 {
+        let ln = len(level)
+        let pairs = ln / 2
+        let rem = ln - pairs * 2
+        let mut nxt = []
+        let mut i = 0
+        while i < pairs {
+            let a = level[i * 2]
+            let b = level[i * 2 + 1]
+            nxt = nxt.push(a + b)
+            i = i + 1
+        }
+        if rem == 1 {
+            nxt = nxt.push(level[ln - 1])
+        }
+        level = nxt
+    }
+    return level[0]
+}
+
+// Linear (left-fold) squared sum — used by the naive path as the
+// historical baseline.  Keeping both lets tests show the tree
+// reduction is numerically at least as good.
+fn gc97_linear_sum_sq(g) {
+    let n = len(g)
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        s = s + g[i] * g[i]
+        i = i + 1
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  global_norm — ||g||₂ via linear fold (matches PyTorch's default).
+//  global_norm_sq — squared norm shortcut (no sqrt).
+//  Both are exposed so callers can write budgeted optimizers that
+//  skip the sqrt when all they need is the squared magnitude.
+// ═══════════════════════════════════════════════════════════════════
+pub fn global_norm(grads) {
+    let s = gc97_linear_sum_sq(grads)
+    return sqrt(s)
+}
+
+pub fn global_norm_sq(grads) {
+    return gc97_linear_sum_sq(grads)
+}
+
+// Tree-reduced variants — same spec, lower fp error envelope.
+pub fn global_norm_tree(grads) {
+    return sqrt(gc97_tree_sum_sq(grads))
+}
+
+pub fn global_norm_sq_tree(grads) {
+    return gc97_tree_sum_sq(grads)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clip_naive(grads, max_norm) — the textbook two-pass reference.
+//
+//  Pass 1 — accumulate squared norm.
+//  Pass 2 — if above the cap, scale every element by max / ||g||.
+//
+//  Returns a freshly-allocated array (input is never mutated, staying
+//  faithful to the @pure contract).  If max_norm ≤ 0 or if the norm
+//  is already within budget, we still return a copy so that both
+//  branches are allocation-symmetric — fair baseline for perf
+//  comparisons against clip_fused.
+// ═══════════════════════════════════════════════════════════════════
+pub fn clip_naive(grads, max_norm) {
+    let n = len(grads)
+    if n == 0 { return [] }
+
+    // Pass 1 — squared sum (linear fold baseline).
+    let ss = gc97_linear_sum_sq(grads)
+    let norm = sqrt(ss)
+
+    // Decide the scale factor.
+    // Defensive: max_norm ≤ 0 is treated as disable-clip (no-op copy).
+    let mut factor = 1.0
+    if max_norm > 0.0 {
+        if norm > max_norm {
+            factor = max_norm / norm
+        }
+    }
+
+    // Pass 2 — element-wise scale (or passthrough when factor==1).
+    let mut out = gc97_zeros(n)
+    for i in 0..n {
+        out[i] = grads[i] * factor
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  clip_fused(grads, max_norm) — one-sweep scale + tree-reduced norm.
+//
+//  Structurally the reduction is still its own phase (fundamental —
+//  the scale factor is a global), but the sweep cost collapses to a
+//  single element-wise mul.  The reduction itself uses a log-depth
+//  pairwise tree instead of an O(n)-depth linear fold, so the total
+//  dep-chain shortens from 2n (naive) to n + log n (fused).
+//
+//  Numerical alignment with clip_naive: both use `sqrt(Σ g²)` and the
+//  same max/norm ratio, so results agree within sqrt/div fp eps.
+//  Tests assert tol 1e-6 across random seeds.
+// ═══════════════════════════════════════════════════════════════════
+@hot @grad_clip_fused @pure
+fn clip_fused_impl(grads, max_norm) {
+    let n = len(grads)
+    if n == 0 { return [] }
+
+    // Phase 1 — log-depth pairwise squared-sum reduction.
+    let ss = gc97_tree_sum_sq(grads)
+    let norm = sqrt(ss)
+
+    // Decide the scale factor (identical policy to naive).
+    let mut factor = 1.0
+    if max_norm > 0.0 {
+        if norm > max_norm {
+            factor = max_norm / norm
+        }
+    }
+
+    // Phase 2 — single fused sweep.  No intermediate buffer for the
+    // factor; it stays in a scalar register for the whole loop.
+    let mut out = gc97_zeros(n)
+    for i in 0..n {
+        out[i] = grads[i] * factor
+    }
+    return out
+}
+
+pub fn clip_fused(grads, max_norm) {
+    return clip_fused_impl(grads, max_norm)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-tensor variants — the usual optimizer situation is a list of
+//  parameter tensors (embedding, 32 attention layers, 32 MLP layers,
+//  ...) sharing a single global-norm cap.  The global norm is
+//  computed across *all* tensors before any scaling happens.
+// ═══════════════════════════════════════════════════════════════════
+pub fn global_norm_list(list_of_grads) {
+    let L = len(list_of_grads)
+    let mut s = 0.0
+    for k in 0..L {
+        s = s + gc97_linear_sum_sq(list_of_grads[k])
+    }
+    return sqrt(s)
+}
+
+pub fn clip_naive_list(list_of_grads, max_norm) {
+    let L = len(list_of_grads)
+    // Pass 1 — global squared sum across all tensors.
+    let mut ss = 0.0
+    for k in 0..L {
+        ss = ss + gc97_linear_sum_sq(list_of_grads[k])
+    }
+    let norm = sqrt(ss)
+    let mut factor = 1.0
+    if max_norm > 0.0 {
+        if norm > max_norm {
+            factor = max_norm / norm
+        }
+    }
+    // Pass 2 — scale each tensor.
+    let mut outs = []
+    for k in 0..L {
+        let g = list_of_grads[k]
+        let n = len(g)
+        let mut o = gc97_zeros(n)
+        for i in 0..n {
+            o[i] = g[i] * factor
+        }
+        outs = outs + [o]
+    }
+    return outs
+}
+
+@hot @grad_clip_fused @pure
+fn clip_fused_list_impl(list_of_grads, max_norm) {
+    let L = len(list_of_grads)
+    // Phase 1 — one tree-reduction per tensor, then sum of partials.
+    // The outer fold over L tensors is a length-L linear fold; in
+    // practice L is small (O(100) layers) so the dep chain is
+    // dominated by the intra-tensor tree already.
+    let mut ss = 0.0
+    for k in 0..L {
+        ss = ss + gc97_tree_sum_sq(list_of_grads[k])
+    }
+    let norm = sqrt(ss)
+    let mut factor = 1.0
+    if max_norm > 0.0 {
+        if norm > max_norm {
+            factor = max_norm / norm
+        }
+    }
+    // Phase 2 — one fused sweep per tensor.
+    let mut outs = []
+    for k in 0..L {
+        let g = list_of_grads[k]
+        let n = len(g)
+        let mut o = gc97_zeros(n)
+        for i in 0..n {
+            o[i] = g[i] * factor
+        }
+        outs = outs + [o]
+    }
+    return outs
+}
+
+pub fn clip_fused_list(list_of_grads, max_norm) {
+    return clip_fused_list_impl(list_of_grads, max_norm)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST pattern detection + rewrite stubs.
+//
+//  The marker protocol mirrors the one used by
+//  self/ai_native/grad_accumulate.hexa — a list-of-strings describing
+//  syntactic facts about the candidate code region.  The rewriter
+//  runs this predicate before injecting the @grad_clip_fused attr.
+//  It is deliberately conservative: all three facts
+//      "loop:sum_sq"   (pass 1 accumulates Σ g²)
+//      "call:sqrt"     (a sqrt on that accumulator)
+//      "loop:scale"    (pass 2 scales each element by a global factor)
+//  must be present, and no "veto:noclip" may appear.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn detect_clip_pattern(markers) {
+    let n = len(markers)
+    let mut has_sum_sq = false
+    let mut has_sqrt = false
+    let mut has_scale = false
+    let mut vetoed = false
+    let mut i = 0
+    while i < n {
+        let m = markers[i]
+        if m == "veto:noclip"  { vetoed = true }
+        if m == "loop:sum_sq"  { has_sum_sq = true }
+        if m == "call:sqrt"    { has_sqrt = true }
+        if m == "loop:scale"   { has_scale = true }
+        i = i + 1
+    }
+    if vetoed { return false }
+    if has_sum_sq == false { return false }
+    if has_sqrt == false { return false }
+    if has_scale == false { return false }
+    return true
+}
+
+@pure
+pub fn rewrite_to_fused(markers) {
+    if detect_clip_pattern(markers) {
+        return "clip_fused"
+    }
+    return "clip_naive"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pass accounting (exposed for tests / benches).
+//      naive : 2 full sweeps over the tensor (sum_sq + scale)
+//      fused : 1 full sweep (scale); reduction is log-depth, not a
+//              full linear sweep.
+// ═══════════════════════════════════════════════════════════════════
+pub fn naive_pass_count() { return 2 }
+pub fn fused_pass_count() { return 1 }
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

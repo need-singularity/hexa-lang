@@ -22,7 +22,382 @@
 //    T18  convergence: 50 mixed-precision steps reduce loss
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/mixed_precision_train.hexa"
+// -- inlined from self/ai_native/mixed_precision_train.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/mixed_precision_train.hexa — HEXA-native mixed-precision training
+//
+//  AI-native ROI item #106 — @mixed_precision_train fp16 forward/backward
+//  with fp32 master weights.
+//
+//  Extends mixed_precision.hexa (inference-only, ROI #93) to the training
+//  loop. The core idea: keep an fp32 "master copy" of weights, cast to
+//  fp16 for the forward and backward passes (saving bandwidth/memory on
+//  real hardware), then accumulate gradients back into fp32 before the
+//  optimizer step. This prevents the small gradient magnitudes from
+//  vanishing in fp16's limited dynamic range.
+//
+//  Simulation approach (same as mixed_precision.hexa):
+//      Hexa has no native fp16 type; we round fp32 values to the
+//      nearest fp16-representable value. The accuracy impact is
+//      faithfully reproduced; the memory savings are not (fp32
+//      container is retained).
+//
+//  Public API  (all prefixed mpt_ to avoid collision)
+//  ──────────────────────────────────────────────────
+//      mpt_to_half(weights)                    -> [float]
+//      mpt_to_full(weights)                    -> [float]
+//      mpt_forward_half(inputs, weights_half)  -> [float]
+//      mpt_backward_half(grads, weights_half)  -> [float]
+//      mpt_update_master(master, grads_full, lr) -> [float]
+//      mpt_train_step(master, inputs, lr)      -> map #{master, loss_approx}
+//      mpt_precision_error(full, half)         -> float
+//      detect_full_precision_train(prog)       -> bool
+//      rewrite_mixed_precision_train(prog)     -> Program
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - P15: let mut x = 0 for mutable. Plain let is immutable.
+//      - handle is reserved keyword — never use as param name.
+//      - Array concat in loops O(n^2) — use .push(x).
+//      - no struct-literal head inside if -> maps returned at tail.
+//      - no and/or -> && / ||
+//      - no enum -> string tags
+//      - abs → use abs_pure from math_pure.hexa
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot              — called every training iteration
+//      @mixed_precision  — marker: fp32 master + fp16 compute
+//      @pure             — returns new state; does not mutate caller arrays
+//      @parallel         — inner sweeps are independent across i
+//
+//  See: docs/ai-native.md, CLAUDE.md HX5, self/ai_native/mixed_precision.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers (file-local, mpt_ prefix) ─────────────────────
+
+// mpt_fabs → abs_pure (math_pure.hexa)
+
+@pure
+fn mpt_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn mpt_copy(a) {
+    let n = len(a)
+    let mut out = mpt_zeros(n)
+    for i in 0..n {
+        out[i] = a[i]
+    }
+    return out
+}
+
+// Integer power of two — pure arithmetic, no bit tricks.
+@pure
+fn mpt_pow2(e) {
+    let mut p = 1.0
+    if e >= 0 {
+        let mut i = 0
+        while i < e {
+            p = p * 2.0
+            i = i + 1
+        }
+        return p
+    }
+    let neg_e = 0 - e
+    let mut i2 = 0
+    while i2 < neg_e {
+        p = p * 0.5
+        i2 = i2 + 1
+    }
+    return p
+}
+
+// Round-half-away-from-zero (deterministic).
+@pure
+fn mpt_round(x) {
+    if x >= 0.0 {
+        return floor(x + 0.5)
+    }
+    return 0.0 - floor((0.0 - x) + 0.5)
+}
+
+// Binade exponent k such that 2^k <= |x| < 2^(k+1).
+@pure
+fn mpt_binade(x) {
+    let ax = abs_pure(x)
+    if ax == 0.0 { return 0 }
+    let mut e = 0
+    let mut v = ax
+    if v >= 2.0 {
+        while v >= 2.0 {
+            v = v * 0.5
+            e = e + 1
+        }
+        return e
+    }
+    while v < 1.0 {
+        v = v * 2.0
+        e = e - 1
+    }
+    return e
+}
+
+// ── fp16 simulation ─────────────────────────────────────────────
+// IEEE 754 half: 1 sign | 5 exp (bias 15) | 10 mantissa
+// range +/-65504, smallest normal 2^-14, mantissa 10 bits.
+// Subnormals below 2^-14 flushed to zero (documented simplification).
+
+@pure
+fn mpt_fp16_quantize(x) {
+    if x == 0.0 { return 0.0 }
+    let sign = if x < 0.0 { 0.0 - 1.0 } else { 1.0 }
+    let ax = abs_pure(x)
+    let fp16_max = 65504.0
+    if ax > fp16_max { return sign * fp16_max }
+    let fp16_min_normal = mpt_pow2(0 - 14)
+    if ax < fp16_min_normal {
+        let sub_q = mpt_pow2(0 - 24)
+        let rounded = mpt_round(ax / sub_q) * sub_q
+        return sign * rounded
+    }
+    let k = mpt_binade(ax)
+    let quantum = mpt_pow2(k - 10)
+    let rounded2 = mpt_round(ax / quantum) * quantum
+    if rounded2 > fp16_max { return sign * fp16_max }
+    return sign * rounded2
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_to_half(weights) -> [float]
+//
+//  Simulate fp16 downcast: round each weight to nearest fp16 value.
+//  This is the "cast to half" step before forward/backward.
+// ═══════════════════════════════════════════════════════════════════
+@pure @mixed_precision @parallel
+pub fn mpt_to_half(weights) {
+    let n = len(weights)
+    let mut out = []
+    for i in 0..n {
+        out.push(mpt_fp16_quantize(weights[i]))
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_to_full(weights) -> [float]
+//
+//  Identity: fp32 master copy is already full precision.
+//  Exists for API symmetry and as a no-op rewrite target.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn mpt_to_full(weights) {
+    return mpt_copy(weights)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_forward_half(inputs, weights_half) -> [float]
+//
+//  Forward pass in reduced precision. Computes a simple linear
+//  transform: out[i] = sum_j(inputs[j] * weights_half[j]) for
+//  demonstration. In practice this wraps the model's forward graph.
+//
+//  Both inputs and weights are quantized to fp16 before the dot
+//  product; the accumulator stays fp32.
+// ═══════════════════════════════════════════════════════════════════
+@hot @mixed_precision @pure
+pub fn mpt_forward_half(inputs, weights_half) {
+    let n = len(inputs)
+    let m = len(weights_half)
+    let k = if n < m { n } else { m }
+    // Quantize inputs to fp16
+    let inputs_h = mpt_to_half(inputs)
+    // fp32 accumulator dot product
+    let mut acc = 0.0
+    for i in 0..k {
+        acc = acc + inputs_h[i] * weights_half[i]
+    }
+    // Return single-element output (scalar loss proxy)
+    return [acc]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_backward_half(grads, weights_half) -> [float]
+//
+//  Backward pass in reduced precision. Computes gradient w.r.t.
+//  weights: dL/dw[i] = grads[0] * input[i]. Since we don't carry
+//  forward activations here, we use weights_half as the "activation"
+//  proxy and grads as upstream gradient.
+//
+//  The result is computed in fp16 then cast back to fp32 for the
+//  master-weight update.
+// ═══════════════════════════════════════════════════════════════════
+@hot @mixed_precision @pure
+pub fn mpt_backward_half(grads, weights_half) {
+    let n = len(weights_half)
+    let grads_h = mpt_to_half(grads)
+    let upstream = if len(grads_h) > 0 { grads_h[0] } else { 0.0 }
+    let mut out = []
+    for i in 0..n {
+        let g = mpt_fp16_quantize(upstream * weights_half[i])
+        out.push(g)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_update_master(master, grads_full, lr) -> [float]
+//
+//  SGD update on the fp32 master weights:
+//      master'[i] = master[i] - lr * grads_full[i]
+//
+//  This is the "upcast accumulate" step: gradients computed in fp16
+//  are now in fp32 containers, and we apply them to the fp32 master.
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure @parallel
+pub fn mpt_update_master(master, grads_full, lr) {
+    let n = len(master)
+    let mut out = mpt_copy(master)
+    for i in 0..n {
+        out[i] = out[i] - lr * grads_full[i]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_train_step(master, inputs, lr) -> map #{master, loss_approx}
+//
+//  Full mixed-precision training pipeline in one call:
+//      1. Cast master weights to fp16
+//      2. Forward pass in fp16 (fp32 accumulator)
+//      3. Backward pass in fp16
+//      4. Update fp32 master weights with fp32 gradients
+//
+//  Returns map with updated master weights and approximate loss.
+// ═══════════════════════════════════════════════════════════════════
+@hot @mixed_precision @pure
+pub fn mpt_train_step(master, inputs, lr) {
+    // Step 1: fp32 -> fp16 weights
+    let w_half = mpt_to_half(master)
+
+    // Step 2: forward in fp16
+    let fwd = mpt_forward_half(inputs, w_half)
+    let loss_approx = if len(fwd) > 0 { fwd[0] * fwd[0] } else { 0.0 }
+
+    // Step 3: backward in fp16
+    // upstream gradient of L = out^2 is dL/dout = 2*out
+    let upstream = if len(fwd) > 0 { [2.0 * fwd[0]] } else { [0.0] }
+    let grads_half = mpt_backward_half(upstream, w_half)
+
+    // Grads are in fp32 containers now (quantized to fp16 representable values)
+    // Step 4: update fp32 master
+    let new_master = mpt_update_master(master, grads_half, lr)
+
+    return #{
+        "master": new_master,
+        "loss_approx": loss_approx
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mpt_precision_error(full, half) -> float
+//
+//  Maximum absolute difference between full-precision and
+//  half-precision vectors. Used to measure quantization error.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn mpt_precision_error(full, half) {
+    let n = len(full)
+    let mut mx = 0.0
+    for i in 0..n {
+        let d = abs_pure(full[i] - half[i])
+        if d > mx { mx = d }
+    }
+    return mx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  detect_full_precision_train(prog) -> bool
+//      Returns true if prog is a sequence of three statements:
+//      "full_forward", "full_backward", "full_update" — all operating
+//      on the same parameter variable. This is the anti-pattern where
+//      training runs entirely in fp32 without mixed precision.
+//
+//  rewrite_mixed_precision_train(prog) -> Program
+//      If detect_full_precision_train returns true, replaces the
+//      three-statement segment with a single "mixed_precision_train_step"
+//      node. Otherwise returns prog unchanged.
+//
+//  Tagged-kind struct approach (same as fused_adam.hexa / graph_pattern.hexa).
+// ═══════════════════════════════════════════════════════════════════
+
+struct MptStmt {
+    kind: string
+    param: string
+    precision: string
+}
+
+pub fn mpt_stmt(kind, param, precision) {
+    return MptStmt{kind: kind, param: param, precision: precision}
+}
+
+pub fn mpt_stmt_forward(param)  { return mpt_stmt("full_forward",  param, "fp32") }
+pub fn mpt_stmt_backward(param) { return mpt_stmt("full_backward", param, "fp32") }
+pub fn mpt_stmt_update(param)   { return mpt_stmt("full_update",   param, "fp32") }
+pub fn mpt_stmt_mixed(param)    { return mpt_stmt("mixed_precision_train_step", param, "fp16+fp32") }
+pub fn mpt_stmt_other()         { return mpt_stmt("other", "", "") }
+
+@pure
+fn detect_full_precision_train_impl(prog) {
+    if len(prog) < 3 { return false }
+    let s0 = prog[0]
+    let s1 = prog[1]
+    let s2 = prog[2]
+    if s0.kind != "full_forward"  { return false }
+    if s1.kind != "full_backward" { return false }
+    if s2.kind != "full_update"   { return false }
+    // All three must operate on the same parameter
+    if s0.param != s1.param { return false }
+    if s1.param != s2.param { return false }
+    // All must be fp32 (the anti-pattern)
+    if s0.precision != "fp32" { return false }
+    if s1.precision != "fp32" { return false }
+    if s2.precision != "fp32" { return false }
+    return true
+}
+
+pub fn detect_full_precision_train(prog) {
+    return detect_full_precision_train_impl(prog)
+}
+
+@pure
+fn rewrite_mixed_precision_train_impl(prog) {
+    if !detect_full_precision_train(prog) { return prog }
+    let s0 = prog[0]
+    let fused = mpt_stmt_mixed(s0.param)
+    let mut out = [fused]
+    // Keep any statements that followed the three rewritten ones
+    for i in 3..len(prog) {
+        out.push(prog[i])
+    }
+    return out
+}
+
+pub fn rewrite_mixed_precision_train(prog) {
+    return rewrite_mixed_precision_train_impl(prog)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -2,7 +2,504 @@
 //  test_flow_matching.hexa — Conditional Flow Matching (#288)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/flow_matching.hexa"
+// -- inlined from self/ml/flow_matching.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/flow_matching.hexa — Conditional Flow Matching (#288)
+//
+//  Flow Matching (Lipman et al., 2023) — Conditional Flow Matching
+//  (CFM) with optimal transport paths. Instead of diffusion's noise
+//  schedule, learn a velocity field v_θ(x_t, t) that transports
+//  samples from noise to data along straight OT paths.
+//
+//  Key math:
+//    x_t = (1-t)·x_0 + t·x_1   (linear interpolation, x_0=noise, x_1=data)
+//    Target velocity: u_t = x_1 - x_0
+//    Loss: ||v_θ(x_t, t) - u_t||²
+//
+//  Architecture:
+//    MLP velocity network with one hidden layer:
+//      h   = tanh( W1 · [x_t; t] + b1 )   (D_in+1) → D_hidden
+//      v_θ = W2 · h + b2                   D_hidden → D_in
+//
+//  API:
+//    fm_init(D_in, D_hidden, seed)           -> model
+//    fm_interpolate(x0, x1, t)               -> x_t
+//    fm_target_velocity(x0, x1)              -> u_t
+//    fm_predict_velocity(model, x_t, t)      -> v_t
+//    fm_loss(model, x0, x1, t)               -> float
+//    fm_train_step(model, data_batch, lr)     -> model
+//    fm_sample(model, noise, steps)           -> generated sample
+//
+//  AI-NATIVE attrs:
+//    @pure  (forward / loss / interpolation)
+//    @hot   (training step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn fm_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn fm_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn fm_tanh(inp) {
+    let e_pos = fm_exp(inp)
+    let e_neg = fm_exp(0.0 - inp)
+    return (e_pos - e_neg) / (e_pos + e_neg)
+}
+
+fn fm_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut x = inp
+    for _i in 0..30 {
+        x = (x + inp / x) / 2.0
+    }
+    return x
+}
+
+fn fm_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn fm_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn fm_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn fm_uniform(state) {
+    let s = fm_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// Approximate standard normal via Box-Muller-like using uniform pairs
+fn fm_randn(state) {
+    let u1 = fm_uniform(state)
+    let u2 = fm_uniform(int(u1[1]))
+    let r = fm_sqrt(0.0 - 2.0 * fm_ln(u1[0] + 1.0e-10))
+    let theta = 6.283185307 * u2[0]
+    let z = r * fm_cos(theta)
+    return [z, int(u2[1])]
+}
+
+fn fm_ln(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn fm_cos(inp) {
+    // Taylor series for cos around 0
+    let mut v = inp
+    // Reduce to [-pi, pi]
+    while v > 3.14159265 { v = v - 6.28318530 }
+    while v < -3.14159265 { v = v + 6.28318530 }
+    let x2 = v * v
+    return 1.0 - x2 / 2.0 + x2 * x2 / 24.0 - x2 * x2 * x2 / 720.0 + x2 * x2 * x2 * x2 / 40320.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise Flow Matching model
+//    W1 : D_hidden × (D_in + 1)   (input is [x_t; t])
+//    b1 : D_hidden
+//    W2 : D_in × D_hidden         (output is velocity, same dim as data)
+//    b2 : D_in
+// ═══════════════════════════════════════════════════════════════════
+fn fm_init(D_in, D_hidden, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let in_dim = D_in + 1
+    let mut W1 = fm_zeros_2d(D_hidden, in_dim)
+    for i in 0..D_hidden {
+        for j in 0..in_dim {
+            let u = fm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b1 = fm_zeros_f(D_hidden)
+    let mut W2 = fm_zeros_2d(D_in, D_hidden)
+    for i in 0..D_in {
+        for j in 0..D_hidden {
+            let u = fm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W2[i][j] = (u[0] - 0.5) * 0.5
+        }
+    }
+    let b2 = fm_zeros_f(D_in)
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "rng_state": state
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Interpolation: x_t = (1-t)*x0 + t*x1
+//  x0 = noise, x1 = data
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_interpolate(x0, x1, t) {
+    let D = len(x0)
+    let mut xt = fm_zeros_f(D)
+    for i in 0..D {
+        xt[i] = (1.0 - t) * x0[i] + t * x1[i]
+    }
+    return xt
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Target velocity: u_t = x1 - x0
+//  (constant along the straight OT path)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_target_velocity(x0, x1) {
+    let D = len(x0)
+    let mut u = fm_zeros_f(D)
+    for i in 0..D {
+        u[i] = x1[i] - x0[i]
+    }
+    return u
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Predict velocity: v_θ(x_t, t)
+//    input = [x_t; t]  (D_in + 1 dimensional)
+//    h = tanh(W1 · input + b1)
+//    v = W2 · h + b2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_predict_velocity(model, x_t, t) {
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+    // Build input vector [x_t; t]
+    let in_dim = D_in + 1
+    let mut inp = fm_zeros_f(in_dim)
+    for i in 0..D_in { inp[i] = x_t[i] }
+    inp[D_in] = t
+    // Hidden layer
+    let mut h = fm_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..in_dim { s = s + W1[i][j] * inp[j] }
+        h[i] = fm_tanh(s)
+    }
+    // Output layer
+    let mut v = fm_zeros_f(D_in)
+    for i in 0..D_in {
+        let mut s = b2[i]
+        for j in 0..D_hidden { s = s + W2[i][j] * h[j] }
+        v[i] = s
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Loss: MSE between predicted and target velocity
+//    L = (1/D) * sum_i (v_θ(x_t, t)_i - u_t_i)²
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_loss(model, x0, x1, t) {
+    let x_t = fm_interpolate(x0, x1, t)
+    let v_pred = fm_predict_velocity(model, x_t, t)
+    let u_t = fm_target_velocity(x0, x1)
+    let D = len(x0)
+    let mut mse = 0.0
+    for i in 0..D {
+        let diff = v_pred[i] - u_t[i]
+        mse = mse + diff * diff
+    }
+    return mse / to_float(D)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Single-sample loss + gradient (manual backprop)
+//
+//  Forward:
+//    inp = [x_t; t]                          (D_in+1)
+//    pre_h = W1 · inp + b1                   (D_hidden)
+//    h = tanh(pre_h)                         (D_hidden)
+//    v = W2 · h + b2                         (D_in)
+//    loss = (1/D) * ||v - u_t||²
+//
+//  Backward:
+//    dL/dv_i  = (2/D) * (v_i - u_t_i)
+//    dL/dW2   = dv · h^T                     => dL/dW2[i][j] = dv[i] * h[j]
+//    dL/db2   = dv
+//    dL/dh_j  = sum_i dv[i] * W2[i][j]
+//    dL/dpre_h = dh * (1 - h²)
+//    dL/dW1   = dpre_h · inp^T
+//    dL/db1   = dpre_h
+// ═══════════════════════════════════════════════════════════════════
+fn fm_loss_grad(model, x0, x1, t) {
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+    let in_dim = D_in + 1
+
+    // ── forward ──
+    let x_t = fm_interpolate(x0, x1, t)
+    let u_t = fm_target_velocity(x0, x1)
+    let mut inp = fm_zeros_f(in_dim)
+    for i in 0..D_in { inp[i] = x_t[i] }
+    inp[D_in] = t
+    let mut h = fm_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..in_dim { s = s + W1[i][j] * inp[j] }
+        h[i] = fm_tanh(s)
+    }
+    let mut v = fm_zeros_f(D_in)
+    for i in 0..D_in {
+        let mut s = b2[i]
+        for j in 0..D_hidden { s = s + W2[i][j] * h[j] }
+        v[i] = s
+    }
+
+    // ── loss ──
+    let mut loss = 0.0
+    for i in 0..D_in {
+        let diff = v[i] - u_t[i]
+        loss = loss + diff * diff
+    }
+    loss = loss / to_float(D_in)
+
+    // ── backward ──
+    let mut dv = fm_zeros_f(D_in)
+    for i in 0..D_in {
+        dv[i] = 2.0 * (v[i] - u_t[i]) / to_float(D_in)
+    }
+    // dW2, db2
+    let mut dW2 = fm_zeros_2d(D_in, D_hidden)
+    let mut db2 = fm_zeros_f(D_in)
+    for i in 0..D_in {
+        db2[i] = dv[i]
+        for j in 0..D_hidden {
+            dW2[i][j] = dv[i] * h[j]
+        }
+    }
+    // dh
+    let mut dh = fm_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        let mut s = 0.0
+        for i in 0..D_in { s = s + dv[i] * W2[i][j] }
+        dh[j] = s
+    }
+    // dpre_h = dh * (1 - h^2)
+    let mut dpre_h = fm_zeros_f(D_hidden)
+    for j in 0..D_hidden {
+        dpre_h[j] = dh[j] * (1.0 - h[j] * h[j])
+    }
+    // dW1, db1
+    let mut dW1 = fm_zeros_2d(D_hidden, in_dim)
+    let mut db1 = fm_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        db1[i] = dpre_h[i]
+        for j in 0..in_dim {
+            dW1[i][j] = dpre_h[i] * inp[j]
+        }
+    }
+
+    return #{
+        "loss": loss,
+        "dW1": dW1,
+        "db1": db1,
+        "dW2": dW2,
+        "db2": db2
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step: mini-batch SGD
+//    data_batch: list of data samples x1
+//    For each sample: draw x0 ~ noise (deterministic from rng),
+//    draw t from deterministic schedule, compute loss+grad, accumulate
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn fm_train_step(model, data_batch, lr) {
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+    let mut rng = model["rng_state"]
+    let in_dim = D_in + 1
+    let N = len(data_batch)
+    if N == 0 { return model }
+
+    let mut gW1 = fm_zeros_2d(D_hidden, in_dim)
+    let mut gb1 = fm_zeros_f(D_hidden)
+    let mut gW2 = fm_zeros_2d(D_in, D_hidden)
+    let mut gb2 = fm_zeros_f(D_in)
+
+    for n in 0..N {
+        let x1 = data_batch[n]
+        // Generate noise x0
+        let mut x0 = fm_zeros_f(D_in)
+        for d in 0..D_in {
+            let u = fm_uniform(rng)
+            rng = int(u[1])
+            if rng <= 0 { rng = 1 }
+            x0[d] = (u[0] - 0.5) * 2.0
+        }
+        // Deterministic time from rng
+        let tu = fm_uniform(rng)
+        rng = int(tu[1])
+        if rng <= 0 { rng = 1 }
+        let mut t = tu[0]
+        // Clamp t to (0.01, 0.99) to avoid boundary issues
+        if t < 0.01 { t = 0.01 }
+        if t > 0.99 { t = 0.99 }
+
+        let grads = fm_loss_grad(model, x0, x1, t)
+        let dW1 = grads["dW1"]
+        let db1 = grads["db1"]
+        let dW2 = grads["dW2"]
+        let db2_g = grads["db2"]
+
+        // Accumulate gradients
+        for i in 0..D_hidden {
+            gb1[i] = gb1[i] + db1[i]
+            for j in 0..in_dim {
+                gW1[i][j] = gW1[i][j] + dW1[i][j]
+            }
+        }
+        for i in 0..D_in {
+            gb2[i] = gb2[i] + db2_g[i]
+            for j in 0..D_hidden {
+                gW2[i][j] = gW2[i][j] + dW2[i][j]
+            }
+        }
+    }
+
+    // Apply averaged gradients
+    let inv_n = 1.0 / to_float(N)
+    let mut W1_new = fm_zeros_2d(D_hidden, in_dim)
+    let mut b1_new = fm_zeros_f(D_hidden)
+    for i in 0..D_hidden {
+        b1_new[i] = b1[i] - lr * gb1[i] * inv_n
+        for j in 0..in_dim {
+            W1_new[i][j] = W1[i][j] - lr * gW1[i][j] * inv_n
+        }
+    }
+    let mut W2_new = fm_zeros_2d(D_in, D_hidden)
+    let mut b2_new = fm_zeros_f(D_in)
+    for i in 0..D_in {
+        b2_new[i] = b2[i] - lr * gb2[i] * inv_n
+        for j in 0..D_hidden {
+            W2_new[i][j] = W2[i][j] - lr * gW2[i][j] * inv_n
+        }
+    }
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "W1": W1_new,
+        "b1": b1_new,
+        "W2": W2_new,
+        "b2": b2_new,
+        "rng_state": rng
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sampling via Euler integration of the learned velocity field
+//    x_0 = noise
+//    for k in 0..steps:
+//        t = k / steps
+//        x_{k+1} = x_k + (1/steps) * v_θ(x_k, t)
+//    return x_{steps}
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_sample(model, noise, steps) {
+    let D_in = model["D_in"]
+    let dt = 1.0 / to_float(steps)
+    let mut x = fm_zeros_f(D_in)
+    for i in 0..D_in { x[i] = noise[i] }
+    for k in 0..steps {
+        let t = to_float(k) / to_float(steps)
+        let v = fm_predict_velocity(model, x, t)
+        for i in 0..D_in {
+            x[i] = x[i] + dt * v[i]
+        }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Batch loss helper — average loss over a dataset
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn fm_batch_loss(model, data_batch, t) {
+    let N = len(data_batch)
+    if N == 0 { return 0.0 }
+    let D_in = model["D_in"]
+    let mut total = 0.0
+    let mut rng = model["rng_state"]
+    for n in 0..N {
+        let x1 = data_batch[n]
+        let mut x0 = fm_zeros_f(D_in)
+        for d in 0..D_in {
+            let u = fm_uniform(rng)
+            rng = int(u[1])
+            if rng <= 0 { rng = 1 }
+            x0[d] = (u[0] - 0.5) * 2.0
+        }
+        total = total + fm_loss(model, x0, x1, t)
+    }
+    return total / to_float(N)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

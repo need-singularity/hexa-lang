@@ -2,7 +2,419 @@
 //  self/test_neftune.hexa — NEFTune noise injection tests
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/neftune.hexa"
+// -- inlined from self/ml/neftune.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/neftune.hexa — NEFTune: Noisy Embeddings Fine-Tuning
+//
+//  Ref:  Jain et al. 2023 — "NEFTune: Noisy Embeddings Improve
+//        Instruction Finetuning"
+//
+//  Core idea — during fine-tuning, inject uniform noise into the
+//  embedding layer output:
+//    e_noisy = e + U(-alpha/sqrt(L*d), alpha/sqrt(L*d))
+//
+//  Where:
+//    e     = embedding output (batch of token vectors)
+//    alpha = noise scale hyperparameter (typically 5~15)
+//    L     = sequence length (number of tokens)
+//    d     = embedding dimension
+//
+//  At inference time, noise is disabled (training=false).
+//
+//  Why it works:
+//    - Acts as implicit regularization on the embedding space
+//    - Prevents overfitting to specific token representations
+//    - Encourages the model to learn more robust features
+//    - Shown to improve instruction-following accuracy by 5-15%
+//
+//  API:
+//    neftune_noise_scale(alpha, seq_len, embed_dim)  -> float
+//    neftune_inject(embeddings, alpha, seq_len, embed_dim, seed, training)
+//                                                    -> noisy embeddings
+//    neftune_inject_1d(vec, alpha, seq_len, embed_dim, seed, training)
+//                                                    -> noisy vector
+//    neftune_make_config(alpha, training)             -> config
+//    neftune_forward(embeddings, config, seq_len, embed_dim, seed)
+//                                                    -> noisy embeddings
+//    neftune_mse_loss(pred, target)                   -> float
+//    neftune_mse_grad(pred, target)                   -> gradient
+//    neftune_train_step(w_embed, tokens, target, alpha, lr, seed)
+//                                                    -> [new_w, loss]
+//    neftune_snr(embeddings, alpha, seq_len, embed_dim) -> float
+//    neftune_sweep(embeddings, alphas, seq_len, embed_dim, seed)
+//                                                    -> [alpha, loss] pairs
+//
+//  AI-NATIVE:
+//    @pure    — noise scale, SNR, loss computation
+//    @hot     — train step inner loop
+//
+//  HX3 pitfalls honored:
+//    - no semicolons
+//    - struct fields via rebuild
+//    - no complex-index-assignment on deep structs
+//
+//  Base: self/ml/embedding.hexa + self/ml/dora.hexa patterns.
+//  L0: src/*.rs untouched. Pure .hexa.
+// ═══════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 1: Math helpers (self-contained)
+// ═══════════════════════════════════════════════════════════════
+
+fn neftune_zeros1(n) {
+    let mut v = []
+    for i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn neftune_zeros2(rows, cols) {
+    let mut r = []
+    for i in 0..rows { r = r + [neftune_zeros1(cols)] }
+    return r
+}
+
+fn neftune_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ── deterministic LCG PRNG ────────────────────────────────────
+// Returns [next_seed, value_in_0_1]
+fn neftune_lcg(seed) {
+    let s = (seed * 1103515245 + 12345) % 2147483647
+    let mut ns = s
+    if ns < 0 { ns = 0 - ns }
+    let val = to_float(ns) / 2147483647.0
+    return [ns, val]
+}
+
+// ── uniform random in [-bound, +bound] ────────────────────────
+// Returns [next_seed, value]
+fn neftune_uniform(seed, bound) {
+    let r = neftune_lcg(seed)
+    let ns = r[0]
+    let val01 = r[1]
+    // map [0,1] -> [-bound, +bound]
+    let val = (val01 * 2.0 - 1.0) * bound
+    return [ns, val]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 2: Noise scale computation
+//
+//  noise_bound = alpha / sqrt(L * d)
+//
+//  This ensures the noise magnitude is proportional to the
+//  hyperparameter alpha but inversely proportional to the
+//  "volume" of the embedding space (sqrt of total dimensions).
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_noise_scale(alpha, seq_len, embed_dim) {
+    let ld = to_float(seq_len * embed_dim)
+    if ld <= 0.0 { return 0.0 }
+    return alpha / sqrt(ld)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 3: Noise injection for a single vector (1D)
+//
+//  Given a 1D embedding vector of length embed_dim, add uniform
+//  noise U(-bound, +bound) to each element.
+//  Disabled when training=false (inference mode).
+//
+//  Returns [noisy_vec, next_seed]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_inject_1d(vec, alpha, seq_len, embed_dim, seed, training) {
+    if !training { return [vec, seed] }
+    let bound = neftune_noise_scale(alpha, seq_len, embed_dim)
+    let d = len(vec)
+    let mut out = []
+    let mut s = seed
+    for i in 0..d {
+        let r = neftune_uniform(s, bound)
+        s = r[0]
+        let noise = r[1]
+        out = out + [vec[i] + noise]
+    }
+    return [out, s]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 4: Noise injection for 2D embeddings
+//
+//  embeddings: [seq_len x embed_dim] matrix
+//  Adds uniform noise to every element.
+//  Disabled when training=false (inference mode).
+//
+//  Returns [noisy_embeddings, next_seed]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_inject(embeddings, alpha, seq_len, embed_dim, seed, training) {
+    if !training { return [embeddings, seed] }
+    let bound = neftune_noise_scale(alpha, seq_len, embed_dim)
+    let mut out = []
+    let mut s = seed
+    for i in 0..seq_len {
+        let mut row = []
+        for j in 0..embed_dim {
+            let r = neftune_uniform(s, bound)
+            s = r[0]
+            let noise = r[1]
+            row = row + [embeddings[i][j] + noise]
+        }
+        out = out + [row]
+    }
+    return [out, s]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 5: NEFTune configuration
+// ═══════════════════════════════════════════════════════════════
+
+struct NeftuneConfig {
+    alpha: float,
+    training: bool
+}
+
+fn neftune_make_config(alpha, training) {
+    return NeftuneConfig {
+        alpha: alpha,
+        training: training
+    }
+}
+
+fn neftune_config_alpha(cfg: NeftuneConfig) {
+    return cfg.alpha
+}
+
+fn neftune_config_training(cfg: NeftuneConfig) {
+    return cfg.training
+}
+
+fn neftune_set_training(cfg: NeftuneConfig, training) {
+    return NeftuneConfig {
+        alpha: cfg.alpha,
+        training: training
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 6: NEFTune forward pass (config-based)
+//
+//  Wraps neftune_inject using a NeftuneConfig struct.
+//  Returns [noisy_embeddings, next_seed]
+// ═══════════════════════════════════════════════════════════════
+
+fn neftune_forward(embeddings, config: NeftuneConfig, seq_len, embed_dim, seed) {
+    return neftune_inject(embeddings, config.alpha, seq_len, embed_dim, seed, config.training)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 7: Embedding lookup from weight matrix
+//
+//  w_embed: [vocab_size x embed_dim] — embedding weight matrix
+//  tokens: [seq_len] — token IDs
+//  Returns: [seq_len x embed_dim] embedding matrix
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_embed_lookup(w_embed, tokens, embed_dim) {
+    let seq_len = len(tokens)
+    let mut out = []
+    for i in 0..seq_len {
+        let tid = tokens[i]
+        out = out + [w_embed[tid]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 8: Loss helpers
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_mse_loss(pred, target) {
+    let n = len(pred)
+    let mut s = 0.0
+    for i in 0..n {
+        let d = pred[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+@pure
+fn neftune_mse_grad(pred, target) {
+    let n = len(pred)
+    let inv = 2.0 / to_float(n)
+    let mut g = []
+    for i in 0..n {
+        g = g + [(pred[i] - target[i]) * inv]
+    }
+    return g
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 9: Mean pooling (reduce seq_len x embed_dim -> embed_dim)
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_mean_pool(embeddings, seq_len, embed_dim) {
+    let mut out = neftune_zeros1(embed_dim)
+    for i in 0..seq_len {
+        for j in 0..embed_dim {
+            out[j] = out[j] + embeddings[i][j]
+        }
+    }
+    let sf = to_float(seq_len)
+    let mut result = []
+    for j in 0..embed_dim {
+        result = result + [out[j] / sf]
+    }
+    return result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 10: Training step with NEFTune
+//
+//  1. Lookup embeddings from token IDs
+//  2. Inject noise (if training)
+//  3. Mean pool to get representation
+//  4. Compute MSE loss against target
+//  5. SGD update on embedding weights
+//
+//  Returns [new_w_embed, loss]
+// ═══════════════════════════════════════════════════════════════
+
+@hot
+fn neftune_train_step(w_embed, tokens, target, alpha, lr, seed, embed_dim) {
+    let seq_len = len(tokens)
+
+    // 1. Lookup
+    let emb = neftune_embed_lookup(w_embed, tokens, embed_dim)
+
+    // 2. Inject noise
+    let result = neftune_inject(emb, alpha, seq_len, embed_dim, seed, true)
+    let noisy_emb = result[0]
+
+    // 3. Mean pool
+    let pooled = neftune_mean_pool(noisy_emb, seq_len, embed_dim)
+
+    // 4. Loss
+    let loss = neftune_mse_loss(pooled, target)
+    let grad = neftune_mse_grad(pooled, target)
+
+    // 5. SGD update — push gradient back through mean pool to embeddings
+    let mut new_w = []
+    let vocab_size = len(w_embed)
+    for v in 0..vocab_size {
+        new_w = new_w + [w_embed[v]]
+    }
+    // Update only the tokens that were used
+    for i in 0..seq_len {
+        let tid = tokens[i]
+        let mut updated_row = []
+        for j in 0..embed_dim {
+            // grad for each token position = grad[j] / seq_len (from mean pool)
+            let g = grad[j] / to_float(seq_len)
+            updated_row = updated_row + [new_w[tid][j] - lr * g]
+        }
+        new_w[tid] = updated_row
+    }
+
+    return [new_w, loss]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 11: Signal-to-Noise Ratio (SNR)
+//
+//  Measures the ratio of embedding magnitude to noise magnitude.
+//  SNR = ||embeddings||_F / (noise_bound * sqrt(L * d))
+//      = ||embeddings||_F / alpha
+//
+//  Higher SNR means less noise relative to signal.
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_snr(embeddings, alpha, seq_len, embed_dim) {
+    if alpha <= 0.0 { return 999999.0 }
+    // Frobenius norm of embeddings
+    let mut frob_sq = 0.0
+    for i in 0..seq_len {
+        for j in 0..embed_dim {
+            frob_sq = frob_sq + embeddings[i][j] * embeddings[i][j]
+        }
+    }
+    let frob = sqrt(frob_sq)
+    // Expected noise RMS = bound * sqrt(1/3) * sqrt(L*d)
+    //   where bound = alpha / sqrt(L*d)
+    //   noise RMS = alpha / sqrt(L*d) * sqrt(L*d/3) = alpha / sqrt(3)
+    let noise_rms = alpha / sqrt(3.0)
+    return frob / noise_rms
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 12: Alpha sweep
+//
+//  Tests multiple alpha values and returns the noise scale for each.
+//  Useful for hyperparameter selection.
+//
+//  Returns array of [alpha, noise_bound] pairs
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_sweep(alphas, seq_len, embed_dim) {
+    let n = len(alphas)
+    let mut results = []
+    for i in 0..n {
+        let a = alphas[i]
+        let scale = neftune_noise_scale(a, seq_len, embed_dim)
+        results = results + [[a, scale]]
+    }
+    return results
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Section 13: Noise magnitude statistics
+//
+//  Given noisy and clean embeddings, compute actual noise stats.
+//  Returns [mean_abs_noise, max_abs_noise, noise_fraction]
+// ═══════════════════════════════════════════════════════════════
+
+@pure
+fn neftune_noise_stats(clean, noisy, seq_len, embed_dim) {
+    let mut sum_abs = 0.0
+    let mut max_abs = 0.0
+    let mut sum_clean_sq = 0.0
+    let count = seq_len * embed_dim
+    for i in 0..seq_len {
+        for j in 0..embed_dim {
+            let diff = noisy[i][j] - clean[i][j]
+            let ad = neftune_abs(diff)
+            sum_abs = sum_abs + ad
+            if ad > max_abs { max_abs = ad }
+            sum_clean_sq = sum_clean_sq + clean[i][j] * clean[i][j]
+        }
+    }
+    let mean_abs = sum_abs / to_float(count)
+    let clean_rms = sqrt(sum_clean_sq / to_float(count))
+    let mut noise_frac = 0.0
+    if clean_rms > 0.0 {
+        noise_frac = mean_abs / clean_rms
+    }
+    return [mean_abs, max_abs, noise_frac]
+}
+
+println("[neftune] module loaded — NEFTune: Noisy Embeddings Fine-Tuning")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -12,7 +12,427 @@
 //    8. matmul_gelu_fused matches matmul+gelu naive
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/conscious_lm.hexa"
+// -- inlined from self/ml/conscious_lm.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/conscious_lm.hexa — ConsciousLM 모델 본체
+//  anima 제타 초월 맥락 — Transformer forward/backward skeleton
+//  Scale plan: 100M → 350M → 1B → 3B (동일 코드, config로 확장)
+//
+//  AI-native attr 사용:
+//    @parallel → 배치/헤드 병렬 (matmul, attention_heads)
+//    @simd     → matmul 내부 dot-product 루프
+//    @memoize  → positional 캐시 (seq_len 기반)
+//    @fuse     → matmul+gelu, softmax+causal-mask
+//    @hot      → 핫 경로 (forward step)
+//    @pure     → 상수 재계산 방지 (gelu, softmax 내부)
+//
+//  성능 주석:
+//    - d=16/L=2: tiny 검증용
+//    - d=768/L=12:  ~110M  (GPT-2 small 급)
+//    - d=1024/L=24: ~350M
+//    - d=2048/L=24: ~1.3B
+//    - d=2560/L=32: ~3B
+//    @parallel B*H 독립 축: OpenMP #pragma omp parallel for
+//    @simd 내부 k-루프: 벡터화 → 4~16배 throughput
+//    @memoize positional: seq_len 재사용 시 O(S*D) → O(1)
+//    @fuse matmul+gelu: 중간 버퍼 제거 → 1.3x 메모리 절감
+// ═══════════════════════════════════════════════════════════════
+
+// ── Structs ────────────────────────────────────────────────────
+struct Config {
+    vocab: int,
+    d: int,
+    h: int,
+    L: int,
+    S: int,
+    d_head: int,
+    d_ff: int
+}
+
+// A layer stores 2D matrices as array-of-array-of-float, biases as array-of-float
+struct Layer {
+    wq: array,
+    wk: array,
+    wv: array,
+    wo: array,
+    bq: array,
+    bk: array,
+    bv: array,
+    bo: array,
+    w1: array,
+    b1: array,
+    w2: array,
+    b2: array
+}
+
+struct Model {
+    cfg: Config,
+    embed: array,
+    layers: array,
+    lm_head: array,
+    lm_bias: array
+}
+
+// ── Config factory ─────────────────────────────────────────────
+fn make_config(vocab, d_model, n_heads, n_layers, seq_len) {
+    return Config {
+        vocab: vocab,
+        d: d_model,
+        h: n_heads,
+        L: n_layers,
+        S: seq_len,
+        d_head: d_model / n_heads,
+        d_ff: d_model * 4
+    }
+}
+
+// ── Deterministic PRNG ─────────────────────────────────────────
+@pure fn prng_next(seed: int) -> int {
+    return (seed * 1103515245 + 12345) % 2147483647
+}
+
+fn rand_float(seed_ref) {
+    let s = prng_next(seed_ref[0])
+    seed_ref[0] = s
+    let f = (s % 20000) - 10000
+    return f / 100000.0
+}
+
+fn zeros_1d(n) {
+    let mut a = []
+    let mut i = 0
+    while i < n {
+        a = a.push(0.0)
+        i = i + 1
+    }
+    return a
+}
+
+fn zeros_2d(r, c) {
+    let mut a = []
+    let mut i = 0
+    while i < r {
+        a = a.push(zeros_1d(c))
+        i = i + 1
+    }
+    return a
+}
+
+fn rand_2d(r, c, seed_ref) {
+    let mut a = []
+    let mut i = 0
+    while i < r {
+        let mut row = []
+        let mut j = 0
+        while j < c {
+            row = row.push(rand_float(seed_ref))
+            j = j + 1
+        }
+        a = a.push(row)
+        i = i + 1
+    }
+    return a
+}
+
+// ── Linear layer: y = x @ W + b ────────────────────────────────
+// @simd on inner k-loop (dot product) → vectorize
+// @parallel on outer m-loop (batch rows) → OMP parallel for
+@hot fn matmul(x, w, b) {
+    // x: [m, k], w: [k, n], b: [n] → y: [m, n]
+    let m = len(x)
+    let k = len(w)
+    let n = len(w[0])
+    let mut y = zeros_2d(m, n)
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            let mut s = b[j]
+            let mut kk = 0
+            while kk < k {
+                s = s + x[i][kk] * w[kk][j]
+                kk = kk + 1
+            }
+            y[i][j] = s
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return y
+}
+
+// ── GELU approx (tanh variant) ─────────────────────────────────
+@pure fn gelu(x) {
+    let c = 0.7978845608
+    let x3 = x * x * x
+    let z = c * (x + 0.044715 * x3)
+    let e2z = exp(2.0 * z)
+    let t = (e2z - 1.0) / (e2z + 1.0)
+    return 0.5 * x * (1.0 + t)
+}
+
+// ── @fuse matmul + gelu (single pass, no intermediate) ────────
+@hot fn matmul_gelu_fused(x, w, b) {
+    let m = len(x)
+    let k = len(w)
+    let n = len(w[0])
+    let mut y = zeros_2d(m, n)
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            let mut s = b[j]
+            let mut kk = 0
+            while kk < k {
+                s = s + x[i][kk] * w[kk][j]
+                kk = kk + 1
+            }
+            y[i][j] = gelu(s)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return y
+}
+
+// ── Softmax with causal mask (fused) ───────────────────────────
+@hot fn softmax_causal(scores) {
+    let S = len(scores)
+    let mut out = zeros_2d(S, S)
+    let mut i = 0
+    while i < S {
+        let mut mx = scores[i][0]
+        let mut j = 1
+        while j <= i {
+            if scores[i][j] > mx { mx = scores[i][j] }
+            j = j + 1
+        }
+        let mut sm = 0.0
+        j = 0
+        while j <= i {
+            let e = exp(scores[i][j] - mx)
+            out[i][j] = e
+            sm = sm + e
+            j = j + 1
+        }
+        j = 0
+        while j <= i {
+            out[i][j] = out[i][j] / sm
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Positional encoding (memoized by seq_len signature) ───────
+@memoize fn positional_encoding_sig(seq_len: int, d_model: int) -> int {
+    return seq_len * 10000 + d_model
+}
+
+fn build_positional(seq_len, d_model) {
+    let _sig = positional_encoding_sig(seq_len, d_model)
+    let mut pe = zeros_2d(seq_len, d_model)
+    let mut pos = 0
+    while pos < seq_len {
+        let mut i = 0
+        while i < d_model {
+            let angle = (pos + 1) * (i + 1)
+            pe[pos][i] = ((angle % 100) - 50) / 500.0
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+    return pe
+}
+
+// ── Multi-head attention (simplified single-stream) ───────────
+@hot fn attention(x, L: Layer) {
+    let S = len(x)
+    let d = len(x[0])
+    let Q = matmul(x, L.wq, L.bq)
+    let K = matmul(x, L.wk, L.bk)
+    let V = matmul(x, L.wv, L.bv)
+    let scale = 1.0 / sqrt(d * 1.0)
+
+    let mut scores = zeros_2d(S, S)
+    let mut i = 0
+    while i < S {
+        let mut j = 0
+        while j < S {
+            let mut s = 0.0
+            let mut kk = 0
+            while kk < d {
+                s = s + Q[i][kk] * K[j][kk]
+                kk = kk + 1
+            }
+            scores[i][j] = s * scale
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    let attn = softmax_causal(scores)
+
+    let mut ctx = zeros_2d(S, d)
+    i = 0
+    while i < S {
+        let mut j = 0
+        while j < d {
+            let mut s = 0.0
+            let mut kk = 0
+            while kk < S {
+                s = s + attn[i][kk] * V[kk][j]
+                kk = kk + 1
+            }
+            ctx[i][j] = s
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return matmul(ctx, L.wo, L.bo)
+}
+
+@inline fn add_2d(a, b) {
+    let m = len(a)
+    let n = len(a[0])
+    let mut y = zeros_2d(m, n)
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            y[i][j] = a[i][j] + b[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return y
+}
+
+@hot fn transformer_block(x, L: Layer) {
+    let h = attention(x, L)
+    let x1 = add_2d(x, h)
+    let m1 = matmul_gelu_fused(x1, L.w1, L.b1)
+    let m2 = matmul(m1, L.w2, L.b2)
+    return add_2d(x1, m2)
+}
+
+fn init_layer(d, d_ff, seed_ref) {
+    return Layer {
+        wq: rand_2d(d, d, seed_ref),
+        wk: rand_2d(d, d, seed_ref),
+        wv: rand_2d(d, d, seed_ref),
+        wo: rand_2d(d, d, seed_ref),
+        bq: zeros_1d(d),
+        bk: zeros_1d(d),
+        bv: zeros_1d(d),
+        bo: zeros_1d(d),
+        w1: rand_2d(d, d_ff, seed_ref),
+        b1: zeros_1d(d_ff),
+        w2: rand_2d(d_ff, d, seed_ref),
+        b2: zeros_1d(d)
+    }
+}
+
+fn init_model(cfg: Config, seed) {
+    let seed_ref = [seed]
+    let d = cfg.d
+    let d_ff = cfg.d_ff
+    let L = cfg.L
+    let mut layers = []
+    let mut i = 0
+    while i < L {
+        layers = layers.push(init_layer(d, d_ff, seed_ref))
+        i = i + 1
+    }
+    return Model {
+        cfg: cfg,
+        embed: rand_2d(cfg.vocab, d, seed_ref),
+        layers: layers,
+        lm_head: rand_2d(d, cfg.vocab, seed_ref),
+        lm_bias: zeros_1d(cfg.vocab)
+    }
+}
+
+fn embed_lookup(model: Model, tokens) {
+    let E = model.embed
+    let d = len(E[0])
+    let S = len(tokens)
+    let mut x = zeros_2d(S, d)
+    let mut i = 0
+    while i < S {
+        let t = tokens[i]
+        let mut j = 0
+        while j < d {
+            x[i][j] = E[t][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return x
+}
+
+@hot fn forward(model: Model, tokens) {
+    let pe = build_positional(len(tokens), model.cfg.d)
+    let mut x = add_2d(embed_lookup(model, tokens), pe)
+    let layers = model.layers
+    let L = len(layers)
+    let mut i = 0
+    while i < L {
+        x = transformer_block(x, layers[i])
+        i = i + 1
+    }
+    return matmul(x, model.lm_head, model.lm_bias)
+}
+
+// ── Numerically stable log via Newton-on-exp ─────────────────
+@pure fn log_approx(x) {
+    let mut y = 0.0
+    if x > 0.0 {
+        let u = x - 1.0
+        y = u - u * u / 2.0 + u * u * u / 3.0
+        let mut k = 0
+        while k < 10 {
+            y = y + x / exp(y) - 1.0
+            k = k + 1
+        }
+    }
+    return y
+}
+
+@pure fn softmax_ce_loss(logits_row, target) {
+    let V = len(logits_row)
+    let mut mx = logits_row[0]
+    let mut i = 1
+    while i < V {
+        if logits_row[i] > mx { mx = logits_row[i] }
+        i = i + 1
+    }
+    let mut sm = 0.0
+    i = 0
+    while i < V {
+        sm = sm + exp(logits_row[i] - mx)
+        i = i + 1
+    }
+    let log_sum = mx + log_approx(sm)
+    return log_sum - logits_row[target]
+}
+
+fn loss_on_sequence(model: Model, tokens, target) {
+    let logits = forward(model, tokens)
+    let last = logits[len(logits) - 1]
+    return softmax_ce_loss(last, target)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  EOF conscious_lm.hexa
+// ═══════════════════════════════════════════════════════════════
+
+
+// -- end inlined --
 import "ml/train_loop.hexa"
 
 let mut pass_count = 0

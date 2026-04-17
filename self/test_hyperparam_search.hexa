@@ -13,7 +13,363 @@
 //  Minimum 10 check() statements.
 // ===================================================================
 
-import "ml/hyperparam_search.hexa"
+// -- inlined from self/ml/hyperparam_search.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/hyperparam_search.hexa — Hyperparameter Search (pure Hexa)
+//
+//  Grid search, random search, Bayesian optimization (GP surrogate),
+//  trial runner with early stopping.
+//
+//  Public API:
+//    grid_search(names, values_per_param)
+//      Generate all combinations.
+//      names: array of strings, values_per_param: array of arrays
+//      Returns array of #{} configs.
+//
+//    random_search(names, lo_arr, hi_arr, n_trials)
+//      Sample n_trials random configs.
+//      Returns array of #{} configs.
+//
+//    bayesian_step(history, names, lo_arr, hi_arr)
+//      Propose next config via GP surrogate + EI.
+//      history: array of [config_dict, metric]
+//      Returns proposed #{} config dict.
+//
+//    run_trial(config, train_fn, eval_fn, max_epochs, patience)
+//      Execute a single trial with early stopping.
+//      Returns [config, best_metric, final_epoch, stopped_early].
+//
+//    best_config(history)
+//      Return best trial record from history.
+// ===================================================================
+
+// ===================================================================
+//  Pseudo-random number generator (LCG)
+//  Deterministic for reproducibility.
+// ===================================================================
+let mut HP_SEED = 42
+
+fn hp_set_seed(s) {
+    HP_SEED = s
+}
+
+fn hp_rand_int() {
+    HP_SEED = (HP_SEED * 1103515245 + 12345) % 2147483648
+    let v = HP_SEED
+    if v < 0 {
+        return 0 - v
+    }
+    return v
+}
+
+fn hp_rand_float() {
+    let r = hp_rand_int()
+    return to_float(r) / 2147483648.0
+}
+
+// ===================================================================
+//  fabs helper
+// ===================================================================
+fn hp_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// ===================================================================
+//  Grid Search
+//
+//  names: ["lr", "batch"]
+//  values_per_param: [[0.01, 0.001], [16.0, 32.0]]
+//
+//  Returns all combinations as array of #{} dicts.
+// ===================================================================
+fn grid_search(names, values_per_param) {
+    let n_params = len(names)
+    if n_params == 0 { return [] }
+
+    // Count total combinations
+    let mut total = 1
+    let mut i = 0
+    while i < n_params {
+        total = total * len(values_per_param[i])
+        i = i + 1
+    }
+
+    // Generate all combos
+    let mut configs = []
+    let mut ci = 0
+    while ci < total {
+        let config = #{}
+        let mut remainder = ci
+        let mut pi = n_params - 1
+        while pi >= 0 {
+            let n_vals = len(values_per_param[pi])
+            let idx = remainder % n_vals
+            remainder = remainder / n_vals
+            config[names[pi]] = values_per_param[pi][idx]
+            pi = pi - 1
+        }
+        configs = configs + [config]
+        ci = ci + 1
+    }
+    return configs
+}
+
+// ===================================================================
+//  Random Search
+//
+//  names: ["lr", "dropout"]
+//  lo_arr: [0.0001, 0.0]
+//  hi_arr: [0.1, 0.5]
+//
+//  Returns n_trials random #{} configs.
+// ===================================================================
+fn random_search(names, lo_arr, hi_arr, n_trials) {
+    let n_params = len(names)
+    let mut configs = []
+    let mut t = 0
+    while t < n_trials {
+        let config = #{}
+        let mut pi = 0
+        while pi < n_params {
+            let val = lo_arr[pi] + hp_rand_float() * (hi_arr[pi] - lo_arr[pi])
+            config[names[pi]] = val
+            pi = pi + 1
+        }
+        configs = configs + [config]
+        t = t + 1
+    }
+    return configs
+}
+
+// ===================================================================
+//  GP surrogate kernel: squared exponential (RBF)
+// ===================================================================
+fn rbf_kernel(x1, x2, length_scale) {
+    let n = len(x1)
+    let mut sq_dist = 0.0
+    let mut i = 0
+    while i < n {
+        let d = x1[i] - x2[i]
+        sq_dist = sq_dist + d * d
+        i = i + 1
+    }
+    let neg_half = 0.0 - sq_dist / (2.0 * length_scale * length_scale)
+    // exp approximation: 1 + x + x^2/2 + x^3/6 + x^4/24
+    let x = neg_half
+    let x2 = x * x
+    let x3 = x2 * x
+    let x4 = x3 * x
+    let result = 1.0 + x + x2 / 2.0 + x3 / 6.0 + x4 / 24.0
+    if result < 0.0 { return 0.0001 }
+    return result
+}
+
+// ===================================================================
+//  Extract numeric feature vector from config dict
+//  config: #{name: value}, names: order of extraction
+//  Returns array of floats.
+// ===================================================================
+fn config_to_vec(config, names) {
+    let n = len(names)
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [config[names[i]]]
+        i = i + 1
+    }
+    return v
+}
+
+// ===================================================================
+//  GP predict: mean and variance at a point given history
+//  history: array of [feature_vec, metric]
+//  Returns [mean, variance]
+// ===================================================================
+fn gp_predict(x_new, history, length_scale) {
+    let n = len(history)
+    if n == 0 { return [0.0, 1.0] }
+
+    // Compute kernel vector k(x_new, x_i)
+    let mut k_vec = []
+    let mut i = 0
+    while i < n {
+        let k = rbf_kernel(x_new, history[i][0], length_scale)
+        k_vec = k_vec + [k]
+        i = i + 1
+    }
+
+    // Simple approximation: mean = weighted average by kernel similarity
+    let mut sum_k = 0.0
+    let mut sum_ky = 0.0
+    i = 0
+    while i < n {
+        sum_k = sum_k + k_vec[i]
+        sum_ky = sum_ky + k_vec[i] * history[i][1]
+        i = i + 1
+    }
+
+    let mut mean = 0.0
+    if sum_k > 0.0001 {
+        mean = sum_ky / sum_k
+    }
+
+    // Variance = 1 - max(k)^2 (approximated)
+    let mut max_k = 0.0
+    i = 0
+    while i < n {
+        if k_vec[i] > max_k {
+            max_k = k_vec[i]
+        }
+        i = i + 1
+    }
+    let var_raw = 1.0 - max_k * max_k
+    let safe_var = if var_raw < 0.001 { 0.001 } else { var_raw }
+
+    return [mean, safe_var]
+}
+
+// ===================================================================
+//  Expected Improvement acquisition function
+//  Returns EI value for a predicted (mean, var) given best_y
+// ===================================================================
+fn expected_improvement(mean, variance, best_y) {
+    let std = sqrt(variance)
+    if std < 0.0001 { return 0.0 }
+    // Simplified EI: exploration + exploitation balance
+    let ei = std * 0.3989 + (mean - best_y) * 0.5
+    if ei < 0.0 { return 0.001 * std }
+    return ei
+}
+
+// ===================================================================
+//  Bayesian step: propose next config given history
+//
+//  history: array of [config_dict, metric]
+//  names: param names
+//  lo_arr, hi_arr: bounds
+//
+//  Strategy: generate n_candidates random configs, pick one with
+//  highest Expected Improvement.
+// ===================================================================
+fn bayesian_step(history, names, lo_arr, hi_arr) {
+    let n_hist = len(history)
+    let length_scale = 1.0
+    let n_candidates = 20
+
+    // Build GP training data
+    let mut gp_data = []
+    let mut best_y = -999999.0
+    let mut i = 0
+    while i < n_hist {
+        let cvec = config_to_vec(history[i]["config"], names)
+        let metric = history[i]["metric"]
+        gp_data = gp_data + [[cvec, metric]]
+        if metric > best_y {
+            best_y = metric
+        }
+        i = i + 1
+    }
+
+    // Generate candidates and score them
+    let candidates = random_search(names, lo_arr, hi_arr, n_candidates)
+    let mut best_ei = -1.0
+    let mut best_cfg = candidates[0]
+
+    i = 0
+    while i < n_candidates {
+        let cvec = config_to_vec(candidates[i], names)
+        let pred = gp_predict(cvec, gp_data, length_scale)
+        let ei = expected_improvement(pred[0], pred[1], best_y)
+        if ei > best_ei {
+            best_ei = ei
+            best_cfg = candidates[i]
+        }
+        i = i + 1
+    }
+
+    return best_cfg
+}
+
+// ===================================================================
+//  Run Trial
+//
+//  config: #{} dict
+//  train_fn: fn(config, epoch) -> loss
+//  eval_fn: fn(config) -> metric
+//  max_epochs: int
+//  patience: int (early stopping window)
+//
+//  Returns Trial #{config, metric, epoch, stopped_early}
+// ===================================================================
+fn run_trial(config, train_fn, eval_fn, max_epochs, patience) {
+    let mut best_metric = -999999.0
+    let mut no_improve = 0
+    let mut final_epoch = 0
+    let mut stopped_early = false
+
+    let mut epoch = 0
+    while epoch < max_epochs {
+        let loss = train_fn(config, epoch)
+        let metric = eval_fn(config)
+
+        if metric > best_metric {
+            best_metric = metric
+            no_improve = 0
+        } else {
+            no_improve = no_improve + 1
+        }
+
+        final_epoch = epoch
+
+        if no_improve >= patience {
+            stopped_early = true
+            epoch = max_epochs
+        } else {
+            epoch = epoch + 1
+        }
+    }
+
+    let result = #{}
+    result["config"] = config
+    result["metric"] = best_metric
+    result["epoch"] = final_epoch
+    result["stopped_early"] = stopped_early
+    return result
+}
+
+// ===================================================================
+//  Best Config: find trial with highest metric in history
+//
+//  history: array of #{config, metric, ...} dicts
+//  Returns the best trial #{} dict.
+// ===================================================================
+fn best_config(history) {
+    let n = len(history)
+    if n == 0 {
+        let empty = #{}
+        return empty
+    }
+
+    let mut best_idx = 0
+    let mut best_val = history[0]["metric"]
+    let mut i = 1
+    while i < n {
+        if history[i]["metric"] > best_val {
+            best_val = history[i]["metric"]
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return history[best_idx]
+}
+
+println("[hyperparam_search] loaded — grid/random/bayesian search + trial runner")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

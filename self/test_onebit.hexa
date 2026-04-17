@@ -46,7 +46,390 @@
 //  Run: ./hexa self/test_onebit.hexa
 // ===================================================================
 
-import "ml/onebit.hexa"
+// -- inlined from self/ml/onebit.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  onebit.hexa — OneBit 1-bit weight quantization with SVID
+//
+//  ML roadmap #218 — extreme quantization that pushes BitNet b1.58
+//  one step further. Each weight is represented by a single sign bit
+//  in {-1, +1}, but two real-valued scale vectors a in R^rows and
+//  b in R^cols are kept so that the dense weight matrix can be
+//  reconstructed as
+//
+//      W_hat[i, j] ≈ sign(W[i, j]) * a[i] * b[j]
+//
+//  This is the SVID — Sign-Value-Independent Decomposition — used
+//  in the OneBit paper (Xu et al., 2024). The trick is that the
+//  per-row and per-column scales recover most of the lost magnitude
+//  information without spending extra bits per weight, so we get
+//  ~10x compression vs FP32 with very little quality loss.
+//
+//  Functions (prefix ob_):
+//
+//  Element ops:
+//    ob_sign(x)                          -> -1 or +1 (0 -> +1)
+//    ob_sign_matrix(W, rows, cols)       -> [int] length rows*cols
+//
+//  Scale extraction:
+//    ob_row_absmean(W, rows, cols)       -> [float] length rows
+//    ob_col_absmean(W, rows, cols)       -> [float] length cols
+//
+//  SVID decomposition:
+//    ob_svid_decompose(W, rows, cols)    -> SVIDPack
+//    ob_svid_reconstruct(sign_W, a, b, rows, cols) -> [float]
+//    ob_svid_error(W, approx, rows, cols)          -> float (Frobenius)
+//
+//  Forward computation:
+//    ob_svid_matmul(sign_W, a, b, x, rows, cols)   -> [float] length rows
+//    ob_per_column_scale(x, b, cols)               -> [float] length cols
+//    ob_per_row_scale(out, a, rows)                -> [float] length rows
+//    ob_layer_forward(sign_W, a, b, x, rows, cols) -> [float] length rows
+//
+//  Storage accounting:
+//    ob_param_bytes(rows, cols)          -> int
+//    ob_compression_ratio(fp32_bytes, ob_bytes) -> float
+//
+//  Pure .hexa — no Rust, no FFI.
+// ===================================================================
+
+// ── Result struct for SVID pack ─────────────────────────────────
+struct SVIDPack {
+    sign_W: array,   // [int] length rows*cols, values in {-1, +1}
+    a: array,        // [float] length rows  (per-row scale)
+    b: array,        // [float] length cols  (per-col scale)
+    rows: int,
+    cols: int
+}
+
+// ── Local math helpers (prefixed _ob to avoid collisions) ───────
+fn _ob_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _ob_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut i = 0
+    while i < 30 {
+        g = (g + x / g) / 2.0
+        i = i + 1
+    }
+    return g
+}
+
+// ===================================================================
+//  ob_sign(x) -> int
+//
+//  OneBit sign function: returns -1 for strictly negative, +1
+//  otherwise (the convention is to fold the 0 case into +1 so that
+//  the sign matrix never contains 0).
+// ===================================================================
+fn ob_sign(x) {
+    if x < 0.0 {
+        return 0 - 1
+    }
+    return 1
+}
+
+// ===================================================================
+//  ob_sign_matrix(W, rows, cols) -> [int]
+//
+//  Per-element sign of a row-major matrix W flattened to length
+//  rows*cols. Output values are strictly in {-1, +1}.
+// ===================================================================
+fn ob_sign_matrix(W, rows, cols) {
+    let n = rows * cols
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [ob_sign(W[i])]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  ob_row_absmean(W, rows, cols) -> [float]
+//
+//  Per-row mean absolute value: a[i] = (1/cols) * sum_j |W[i, j]|.
+//  Always non-negative.
+// ===================================================================
+fn ob_row_absmean(W, rows, cols) {
+    let mut a = []
+    let denom = to_float(cols)
+    let mut i = 0
+    while i < rows {
+        let mut acc = 0.0
+        let mut j = 0
+        while j < cols {
+            acc = acc + _ob_abs(W[i * cols + j])
+            j = j + 1
+        }
+        if cols == 0 {
+            a = a + [0.0]
+        } else {
+            a = a + [acc / denom]
+        }
+        i = i + 1
+    }
+    return a
+}
+
+// ===================================================================
+//  ob_col_absmean(W, rows, cols) -> [float]
+//
+//  Per-column mean absolute value: b[j] = (1/rows) * sum_i |W[i, j]|.
+//  Always non-negative.
+// ===================================================================
+fn ob_col_absmean(W, rows, cols) {
+    let mut b = []
+    let denom = to_float(rows)
+    let mut j = 0
+    while j < cols {
+        let mut acc = 0.0
+        let mut i = 0
+        while i < rows {
+            acc = acc + _ob_abs(W[i * cols + j])
+            i = i + 1
+        }
+        if rows == 0 {
+            b = b + [0.0]
+        } else {
+            b = b + [acc / denom]
+        }
+        j = j + 1
+    }
+    return b
+}
+
+// ===================================================================
+//  ob_svid_decompose(W, rows, cols) -> SVIDPack
+//
+//  Sign-Value-Independent Decomposition: split a dense weight matrix
+//  into a 1-bit sign matrix plus per-row and per-column real scales.
+//  The reconstructed matrix is sign[i, j] * a[i] * b[j].
+//
+//  We normalize the row/col scales by sqrt(global mean |W|) so that
+//  the outer product a * b matches the absmean of W rather than the
+//  product of the two means (which would double-count the global
+//  scale). For W = sign * outer(a0, b0) the recovery is exact.
+// ===================================================================
+fn ob_svid_decompose(W, rows, cols) {
+    let n = rows * cols
+    let sign_W = ob_sign_matrix(W, rows, cols)
+    let row_a = ob_row_absmean(W, rows, cols)
+    let col_b = ob_col_absmean(W, rows, cols)
+
+    // Global mean |W| — denominator for normalization.
+    let mut global_acc = 0.0
+    let mut k = 0
+    while k < n {
+        global_acc = global_acc + _ob_abs(W[k])
+        k = k + 1
+    }
+    let mut global_mean = 0.0
+    if n > 0 {
+        global_mean = global_acc / to_float(n)
+    }
+
+    // Normalize so that a[i] * b[j] ≈ |W[i, j]| on average.
+    // For separable W = sign * outer(a0, b0):
+    //   row_absmean[i] = a0[i] * mean_j(b0[j])
+    //   col_absmean[j] = b0[j] * mean_i(a0[i])
+    //   global_mean    = mean_i(a0[i]) * mean_j(b0[j])
+    //   so a0[i] * b0[j] = row[i] * col[j] / global_mean — exact.
+    let mut a_norm = []
+    let mut b_norm = []
+    if global_mean > 0.0 {
+        let scale = _ob_sqrt(global_mean)
+        let mut i = 0
+        while i < rows {
+            a_norm = a_norm + [row_a[i] / scale]
+            i = i + 1
+        }
+        let mut j = 0
+        while j < cols {
+            b_norm = b_norm + [col_b[j] / scale]
+            j = j + 1
+        }
+    } else {
+        // Zero matrix — keep raw zeros.
+        let mut i = 0
+        while i < rows {
+            a_norm = a_norm + [0.0]
+            i = i + 1
+        }
+        let mut j = 0
+        while j < cols {
+            b_norm = b_norm + [0.0]
+            j = j + 1
+        }
+    }
+
+    return SVIDPack {
+        sign_W: sign_W,
+        a: a_norm,
+        b: b_norm,
+        rows: rows,
+        cols: cols
+    }
+}
+
+// ===================================================================
+//  ob_svid_reconstruct(sign_W, a, b, rows, cols) -> [float]
+//
+//  Rebuild a dense FP weight matrix from the SVID pack:
+//      W_hat[i, j] = sign_W[i, j] * a[i] * b[j]
+// ===================================================================
+fn ob_svid_reconstruct(sign_W, a, b, rows, cols) {
+    let mut out = []
+    let mut i = 0
+    while i < rows {
+        let ai = a[i]
+        let mut j = 0
+        while j < cols {
+            let s = sign_W[i * cols + j]
+            out = out + [to_float(s) * ai * b[j]]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  ob_svid_error(W, approx, rows, cols) -> float
+//
+//  Frobenius reconstruction error (sqrt of sum of squared residuals).
+//  Always non-negative; zero iff the approx matches W exactly.
+// ===================================================================
+fn ob_svid_error(W, approx, rows, cols) {
+    let n = rows * cols
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        let d = W[i] - approx[i]
+        acc = acc + d * d
+        i = i + 1
+    }
+    return _ob_sqrt(acc)
+}
+
+// ===================================================================
+//  ob_per_column_scale(x, b, cols) -> [float]
+//
+//  Element-wise scaling x[j] * b[j] for j in 0..cols. Used as the
+//  pre-matmul step in the SVID forward shortcut.
+// ===================================================================
+fn ob_per_column_scale(x, b, cols) {
+    let mut out = []
+    let mut j = 0
+    while j < cols {
+        out = out + [x[j] * b[j]]
+        j = j + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  ob_per_row_scale(out, a, rows) -> [float]
+//
+//  Element-wise scaling out[i] * a[i] for i in 0..rows. Used as the
+//  post-matmul step in the SVID forward shortcut.
+// ===================================================================
+fn ob_per_row_scale(out, a, rows) {
+    let mut scaled = []
+    let mut i = 0
+    while i < rows {
+        scaled = scaled + [out[i] * a[i]]
+        i = i + 1
+    }
+    return scaled
+}
+
+// ===================================================================
+//  ob_svid_matmul(sign_W, a, b, x, rows, cols) -> [float]
+//
+//  Efficient SVID forward path:
+//      y[i] = a[i] * sum_j sign_W[i, j] * (b[j] * x[j])
+//
+//  Steps:
+//    1. xb[j] = x[j] * b[j]                  (per-column scale, O(cols))
+//    2. y_unscaled[i] = sum_j sign_W[i,j] * xb[j]   (sign-only matmul)
+//    3. y[i] = a[i] * y_unscaled[i]          (per-row scale, O(rows))
+//
+//  This is mathematically identical to dense_matmul(reconstruct, x).
+// ===================================================================
+fn ob_svid_matmul(sign_W, a, b, x, rows, cols) {
+    let xb = ob_per_column_scale(x, b, cols)
+
+    let mut y_un = []
+    let mut i = 0
+    while i < rows {
+        let mut acc = 0.0
+        let mut j = 0
+        while j < cols {
+            let s = sign_W[i * cols + j]
+            if s == 1 {
+                acc = acc + xb[j]
+            } else {
+                acc = acc - xb[j]
+            }
+            j = j + 1
+        }
+        y_un = y_un + [acc]
+        i = i + 1
+    }
+    return ob_per_row_scale(y_un, a, rows)
+}
+
+// ===================================================================
+//  ob_layer_forward(sign_W, a, b, x, rows, cols) -> [float]
+//
+//  High-level forward for a OneBit-quantized linear layer. Same
+//  semantics as ob_svid_matmul; kept as a separate symbol so call
+//  sites read like normal layer wiring.
+// ===================================================================
+fn ob_layer_forward(sign_W, a, b, x, rows, cols) {
+    return ob_svid_matmul(sign_W, a, b, x, rows, cols)
+}
+
+// ===================================================================
+//  ob_param_bytes(rows, cols) -> int
+//
+//  Storage footprint of a OneBit-quantized weight matrix:
+//      sign bits  : rows * cols / 8   (1 bit per weight, packed)
+//      a scales   : 4 * rows          (FP32)
+//      b scales   : 4 * cols          (FP32)
+//
+//  Integer division here is conservative — sub-byte tails are not
+//  rounded up because the calling layer would pad in a real packer.
+// ===================================================================
+fn ob_param_bytes(rows, cols) {
+    let n = rows * cols
+    let sign_bytes = n / 8
+    let scale_bytes = 4 * (rows + cols)
+    return sign_bytes + scale_bytes
+}
+
+// ===================================================================
+//  ob_compression_ratio(fp32_bytes, ob_bytes) -> float
+//
+//  Returns fp32_bytes / ob_bytes. Defensive against ob_bytes == 0.
+// ===================================================================
+fn ob_compression_ratio(fp32_bytes, ob_bytes) {
+    if ob_bytes <= 0 {
+        return 0.0
+    }
+    return to_float(fp32_bytes) / to_float(ob_bytes)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

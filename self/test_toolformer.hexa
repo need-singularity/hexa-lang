@@ -25,7 +25,435 @@
 //
 //  Run: hexa self/test_toolformer.hexa
 // ===================================================================
-import "ml/toolformer.hexa"
+// -- inlined from self/ml/toolformer.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/toolformer.hexa — Toolformer self-supervised tool learning
+//
+//  Pure Hexa implementation of Toolformer (Schick et al., 2023).
+//  Base module: self/ml/function_calling.hexa (tool definitions,
+//  <tool_call>/<tool_result> tags, parser, executor, loop runner).
+//
+//  Pipeline (self-supervised):
+//    1. sample_api_positions(text) -> candidate positions (P(t) > thresh)
+//    2. sample_api_calls(text, pos, tool, k) -> k candidate (name,args) pairs
+//    3. execute_candidate(call, executor) -> result string
+//    4. perplexity_with(prefix, call, result, suffix) -> ppl (lower=better)
+//    5. perplexity_without(prefix, suffix) -> baseline ppl
+//    6. filter_by_ppl_gain(candidates, tau) -> kept list
+//    7. build_incontext_dataset(text, kept) -> training example with
+//       inlined <tool_call>...</tool_call><tool_result>...</tool_result>
+//    8. inference_trigger(partial_text) -> bool (should fire tool call)
+//
+//  Public API:
+//    tf_sample_positions(text, prob_fn, threshold, max_pos)
+//    tf_sample_calls(text, position, tool, k_samples, args_gen)
+//    tf_execute_candidate(call, executor)
+//    tf_perplexity_with(prefix, call, result, suffix, target, lm_score_fn)
+//    tf_perplexity_without(prefix, suffix, target, lm_score_fn)
+//    tf_filter_candidates(candidates, tau)
+//    tf_build_training_example(text, call, result, position)
+//    tf_build_incontext_dataset(texts, tools, k, tau, prob_fn,
+//                               args_gen, executor, lm_score_fn)
+//    tf_inference_should_trigger(partial_text, trigger_tokens, lm_score_fn,
+//                                threshold)
+//    tf_inference_step(partial_text, tools, args_gen, executor, lm_score_fn,
+//                      threshold)
+//
+//  Conventions:
+//    - Re-uses <tool_call>/<tool_result> tags from function_calling.hexa
+//    - All randomness comes from seed-based pseudo-hash (deterministic tests)
+//    - Perplexity is a surrogate: caller-supplied lm_score_fn(prefix, target)
+//      returns a non-negative float (higher = worse/surprise). For tests we
+//      use a deterministic mock score.
+//    - HX3 pitfalls: no semicolons, no {k:v} inside if blocks,
+//      flag-variable break pattern, absolute-path-free relative imports.
+// ===================================================================
+
+import "ml/function_calling.hexa"
+
+// ── deterministic PRNG (avoid random() nondeterminism in tests) ────
+
+fn tf_hash(seed, i) {
+    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 100003)
+    if h < 0 { return 0 - h }
+    return h
+}
+
+fn tf_rand01(seed, i) {
+    return to_float(tf_hash(seed, i)) / 100003.0
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  1. Candidate position sampling
+//
+//  Given a text and a "trigger probability" function prob_fn(text, pos),
+//  return up to max_pos positions where prob_fn(...) >= threshold.
+//  prob_fn is typically the LM's P("<API>" | prefix) head; for tests we
+//  pass a deterministic mock.
+// ───────────────────────────────────────────────────────────────────
+fn tf_sample_positions(text, prob_fn, threshold, max_pos) {
+    let n = len(text)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if len(out) >= max_pos {
+            i = n
+        } else {
+            let p = prob_fn(text, i)
+            if p >= threshold {
+                out = out + [i]
+            }
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  2. Candidate API call sampling
+//
+//  Generate k candidate calls at a given text position for a given tool.
+//  args_gen is fn(text, pos, tool, sample_index) -> arguments_json (str).
+//  Each returned call is a map compatible with function_calling parser:
+//    { "name": str, "arguments": str(json), "position": int, "sample": int }
+// ───────────────────────────────────────────────────────────────────
+fn tf_sample_calls(text, position, tool, k_samples, args_gen) {
+    let mut out = []
+    let mut s = 0
+    while s < k_samples {
+        let args = args_gen(text, position, tool, s)
+        let call = #{}
+        call["name"] = tool["name"]
+        call["arguments"] = args
+        call["position"] = position
+        call["sample"] = s
+        out = out + [call]
+        s = s + 1
+    }
+    return out
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  3. Execute a candidate via the user-supplied executor from
+//     function_calling.hexa. Returns the string result.
+// ───────────────────────────────────────────────────────────────────
+fn tf_execute_candidate(call, executor) {
+    return executor(call["name"], call["arguments"])
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  4. Perplexity surrogate with tool result inlined
+//
+//  In Toolformer the filter is:
+//     L_i(with)   = sum_j w_j * -log p(x_j | prefix · e(c_i, r_i))
+//     L_i(without)= sum_j w_j * -log p(x_j | prefix)
+//     keep if  L_i(without) - L_i(with)  >= tau
+//
+//  We delegate -log p to lm_score_fn(context_str, target_str) so the same
+//  module can plug into a real LM later without code changes.
+// ───────────────────────────────────────────────────────────────────
+fn tf_perplexity_with(prefix, call, result, suffix, target, lm_score_fn) {
+    // Build the "weighted conditioning context":
+    //   prefix + <tool_call>{name,arguments}</tool_call><tool_result>...</tool_result> + suffix
+    let call_tag = "<tool_call>{\"name\": \"" + call["name"]
+    let call_tag2 = call_tag + "\", \"arguments\": " + call["arguments"] + "}</tool_call>"
+    let res_tag = format_tool_result(call["name"], result)
+    let ctx = prefix + call_tag2 + res_tag + suffix
+    return lm_score_fn(ctx, target)
+}
+
+fn tf_perplexity_without(prefix, suffix, target, lm_score_fn) {
+    let ctx = prefix + suffix
+    return lm_score_fn(ctx, target)
+}
+
+// Compute gain = ppl_without - ppl_with. Higher gain = tool helps more.
+fn tf_perplexity_gain(prefix, call, result, suffix, target, lm_score_fn) {
+    let with_ppl = tf_perplexity_with(prefix, call, result, suffix, target, lm_score_fn)
+    let without_ppl = tf_perplexity_without(prefix, suffix, target, lm_score_fn)
+    return without_ppl - with_ppl
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  5. Filter candidates by perplexity gain >= tau
+//
+//  candidates: array of maps with keys
+//    name, arguments, position, sample, result, ppl_with, ppl_without
+//  tau: minimum improvement to keep
+// ───────────────────────────────────────────────────────────────────
+fn tf_filter_candidates(candidates, tau) {
+    let n = len(candidates)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let c = candidates[i]
+        let gain = c["ppl_without"] - c["ppl_with"]
+        if gain >= tau {
+            let kept = #{}
+            kept["name"] = c["name"]
+            kept["arguments"] = c["arguments"]
+            kept["position"] = c["position"]
+            kept["sample"] = c["sample"]
+            kept["result"] = c["result"]
+            kept["gain"] = gain
+            out = out + [kept]
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Keep only the best (max-gain) candidate per unique position
+fn tf_top_per_position(filtered) {
+    let n = len(filtered)
+    let mut best_by_pos = #{}
+    let mut i = 0
+    while i < n {
+        let c = filtered[i]
+        let key = to_string(c["position"])
+        if has_key(best_by_pos, key) {
+            let prev = best_by_pos[key]
+            if c["gain"] > prev["gain"] {
+                best_by_pos[key] = c
+            }
+        } else {
+            best_by_pos[key] = c
+        }
+        i = i + 1
+    }
+    let ks = keys(best_by_pos)
+    let kn = len(ks)
+    let mut out = []
+    let mut j = 0
+    while j < kn {
+        out = out + [best_by_pos[ks[j]]]
+        j = j + 1
+    }
+    return out
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  6. Build a single in-context training example by inlining the kept
+//  call + result at the kept position of the original text.
+// ───────────────────────────────────────────────────────────────────
+fn tf_build_training_example(text, call, result, position) {
+    let n = len(text)
+    let mut p = position
+    if p < 0 { p = 0 }
+    if p > n { p = n }
+    let prefix = text.substring(0, p)
+    let suffix = text.substring(p, n)
+    let call_tag = "<tool_call>{\"name\": \"" + call["name"]
+    let call_tag2 = call_tag + "\", \"arguments\": " + call["arguments"] + "}</tool_call>"
+    let res_tag = format_tool_result(call["name"], result)
+    return prefix + call_tag2 + res_tag + suffix
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  7. End-to-end dataset builder
+//
+//  For each text in texts, for each tool in tools:
+//    - sample candidate positions
+//    - at each position sample k candidate calls
+//    - execute each via executor
+//    - score with/without via lm_score_fn
+//    - filter by tau
+//    - keep best per position
+//    - emit in-context training example(s)
+//
+//  Returns an array of training examples (strings).
+// ───────────────────────────────────────────────────────────────────
+fn tf_build_incontext_dataset(texts, tools, k_samples, tau, prob_fn,
+                              args_gen, executor, lm_score_fn,
+                              pos_threshold, max_pos) {
+    let nt = len(texts)
+    let ntools = len(tools)
+    let mut dataset = []
+    let mut stats = #{}
+    let mut n_candidates = 0
+    let mut n_kept = 0
+
+    let mut ti = 0
+    while ti < nt {
+        let text = texts[ti]
+        let tlen = len(text)
+
+        let positions = tf_sample_positions(text, prob_fn, pos_threshold, max_pos)
+        let np = len(positions)
+
+        let mut tool_i = 0
+        while tool_i < ntools {
+            let tool = tools[tool_i]
+
+            let mut pi = 0
+            while pi < np {
+                let pos = positions[pi]
+                let candidates = tf_sample_calls(text, pos, tool, k_samples, args_gen)
+                let nc = len(candidates)
+
+                let prefix = text.substring(0, pos)
+                let suffix = text.substring(pos, tlen)
+                let target = suffix
+
+                // Score and annotate each candidate
+                let mut scored = []
+                let mut ci = 0
+                while ci < nc {
+                    let call = candidates[ci]
+                    let result = tf_execute_candidate(call, executor)
+                    let ppl_with = tf_perplexity_with(prefix, call, result,
+                                                     suffix, target, lm_score_fn)
+                    let ppl_without = tf_perplexity_without(prefix, suffix,
+                                                           target, lm_score_fn)
+                    let annotated = #{}
+                    annotated["name"] = call["name"]
+                    annotated["arguments"] = call["arguments"]
+                    annotated["position"] = pos
+                    annotated["sample"] = call["sample"]
+                    annotated["result"] = result
+                    annotated["ppl_with"] = ppl_with
+                    annotated["ppl_without"] = ppl_without
+                    scored = scored + [annotated]
+                    n_candidates = n_candidates + 1
+                    ci = ci + 1
+                }
+
+                let kept = tf_filter_candidates(scored, tau)
+                let best = tf_top_per_position(kept)
+                let nb = len(best)
+                let mut bi = 0
+                while bi < nb {
+                    let b = best[bi]
+                    let example = tf_build_training_example(text, b,
+                                                            b["result"],
+                                                            b["position"])
+                    dataset = dataset + [example]
+                    n_kept = n_kept + 1
+                    bi = bi + 1
+                }
+
+                pi = pi + 1
+            }
+
+            tool_i = tool_i + 1
+        }
+
+        ti = ti + 1
+    }
+
+    stats["n_candidates"] = n_candidates
+    stats["n_kept"] = n_kept
+    stats["n_examples"] = len(dataset)
+
+    let out = #{}
+    out["dataset"] = dataset
+    out["stats"] = stats
+    return out
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  8. Inference-time tool-call trigger
+//
+//  During generation we check if the most recent tokens look like an
+//  "I should call a tool" signal. Two strategies:
+//    (a) explicit trigger tokens (e.g. "<API>" or "[TOOL]")
+//    (b) lm_score_fn threshold on the "<tool_call>" continuation
+// ───────────────────────────────────────────────────────────────────
+fn tf_has_trigger_token(partial_text, trigger_tokens) {
+    let n = len(trigger_tokens)
+    let mut i = 0
+    let mut hit = false
+    while i < n {
+        if partial_text.contains(trigger_tokens[i]) {
+            hit = true
+            i = n
+        } else {
+            i = i + 1
+        }
+    }
+    return hit
+}
+
+fn tf_inference_should_trigger(partial_text, trigger_tokens,
+                               lm_score_fn, threshold) {
+    if tf_has_trigger_token(partial_text, trigger_tokens) {
+        return true
+    }
+    // Fallback: LM score says "<tool_call>" is highly likely continuation
+    let score = lm_score_fn(partial_text, "<tool_call>")
+    return score <= threshold
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  9. Single inference step — if trigger fires, sample one call per tool,
+//     rank by LM score (lower = more expected), execute the best, and
+//     splice the <tool_call>...</tool_call><tool_result>...</tool_result>
+//     into the partial text.
+// ───────────────────────────────────────────────────────────────────
+fn tf_inference_step(partial_text, tools, args_gen, executor,
+                     lm_score_fn, trigger_tokens, threshold) {
+    let fire = tf_inference_should_trigger(partial_text, trigger_tokens,
+                                           lm_score_fn, threshold)
+    if fire == false {
+        let out = #{}
+        out["fired"] = false
+        out["text"] = partial_text
+        out["call"] = #{}
+        out["result"] = ""
+        return out
+    }
+
+    let nt = len(tools)
+    let pos = len(partial_text)
+    let mut best_call = #{}
+    let mut best_score = 1.0e18
+    let mut has_best = false
+    let mut i = 0
+    while i < nt {
+        let tool = tools[i]
+        let args = args_gen(partial_text, pos, tool, 0)
+        let cand = #{}
+        cand["name"] = tool["name"]
+        cand["arguments"] = args
+        let ctx = partial_text + "<tool_call>{\"name\": \"" + cand["name"] + "\", \"arguments\": " + cand["arguments"] + "}</tool_call>"
+        let score = lm_score_fn(ctx, "")
+        if score < best_score {
+            best_score = score
+            best_call = cand
+            has_best = true
+        }
+        i = i + 1
+    }
+
+    if has_best == false {
+        let out = #{}
+        out["fired"] = false
+        out["text"] = partial_text
+        out["call"] = #{}
+        out["result"] = ""
+        return out
+    }
+
+    let result = executor(best_call["name"], best_call["arguments"])
+    let call_tag = "<tool_call>{\"name\": \"" + best_call["name"]
+    let call_tag2 = call_tag + "\", \"arguments\": " + best_call["arguments"] + "}</tool_call>"
+    let res_tag = format_tool_result(best_call["name"], result)
+    let new_text = partial_text + call_tag2 + res_tag
+
+    let out = #{}
+    out["fired"] = true
+    out["text"] = new_text
+    out["call"] = best_call
+    out["result"] = result
+    return out
+}
+
+println("[toolformer] module loaded")
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

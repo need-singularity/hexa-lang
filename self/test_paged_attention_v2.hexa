@@ -18,7 +18,456 @@
 //  Run: ./hexa self/test_paged_attention_v2.hexa
 // ===================================================================
 
-import "ml/paged_attention_v2.hexa"
+// -- inlined from self/ml/paged_attention_v2.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/paged_attention_v2.hexa -- Paged Attention v2 (#297)
+//
+//  vLLM-style virtual memory KV-cache management (Kwon et al., 2023).
+//  KV blocks allocated on demand like OS pages, eliminating memory
+//  fragmentation and waste.
+//
+//  Key concepts:
+//    - Block table: maps logical block -> physical block
+//    - KV blocks: fixed-size (block_size tokens) physical memory slots
+//    - Copy-on-write for beam search (shared prefixes)
+//    - Sequence-level management (multi-sequence serving)
+//
+//  Layout per physical block:
+//    flat array of length block_size * D_head * 2
+//    first half  = keys   [block_size * D_head]
+//    second half = values [block_size * D_head]
+//
+//  API (pa_ prefix):
+//    pa_init(D_head, block_size, max_blocks)       -> mgr
+//    pa_alloc_block(mgr)                           -> [mgr, block_id]
+//    pa_free_block(mgr, block_id)                  -> mgr
+//    pa_write_kv(mgr, block_id, slot, key, value)  -> mgr
+//    pa_read_kv(mgr, block_id, slot)               -> [key, value]
+//    pa_create_sequence(mgr, seq_id)               -> mgr
+//    pa_append_token(mgr, seq_id, key, value)      -> mgr
+//    pa_attention(mgr, seq_id, query)               -> output
+//    pa_cow_fork(mgr, src_seq, dst_seq)            -> mgr
+//    pa_usage(mgr)                                  -> #{used, free, total}
+//
+//  AI-NATIVE attrs:
+//    @pure  -- attention / read (no side effects)
+//    @hot   -- write paths (called every decode step)
+// ===================================================================
+
+// -- math helpers --------------------------------------------------
+
+fn pa2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pa2_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn pa2_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pa2_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// -- array helpers -------------------------------------------------
+
+fn pa2_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn pa2_copy_arr(src) {
+    let mut dst = []
+    let n = len(src)
+    for i in 0..n { dst = dst + [src[i]] }
+    return dst
+}
+
+// ===================================================================
+//  pa_init -- create a paged attention manager
+//
+//  Returns a dict (#{}) with all state:
+//    D_head     : int -- dimension per head
+//    block_size : int -- tokens per block
+//    max_blocks : int -- total physical blocks
+//    free_list  : [int] -- available physical block IDs
+//    ref_count  : [int] -- reference count per physical block
+//    kv_data    : [[float]] -- kv_data[phys] = flat array
+//    sequences  : #{seq_id_str: #{blocks:[int], n_tokens:int}}
+// ===================================================================
+
+fn pa_init(D_head, block_size, max_blocks) {
+    let data_len = block_size * D_head * 2
+    let mut free_list = []
+    let mut ref_count = []
+    let mut kv_data = []
+    for i in 0..max_blocks {
+        free_list = free_list + [i]
+        ref_count = ref_count + [0]
+        kv_data = kv_data + [pa2_zeros(data_len)]
+    }
+    return #{
+        "D_head": D_head,
+        "block_size": block_size,
+        "max_blocks": max_blocks,
+        "free_list": free_list,
+        "ref_count": ref_count,
+        "kv_data": kv_data,
+        "sequences": #{}
+    }
+}
+
+// ===================================================================
+//  pa_alloc_block -- allocate one physical block from free list
+//  Returns [mgr, block_id] where block_id == -1 if full
+// ===================================================================
+
+fn pa_alloc_block(mgr) {
+    let n_free = len(mgr["free_list"])
+    if n_free == 0 {
+        return [mgr, -1]
+    }
+    let fl = mgr["free_list"]
+    let block_id = fl[n_free - 1]
+    // pop last
+    let mut new_fl = []
+    for i in 0..(n_free - 1) {
+        new_fl = new_fl + [fl[i]]
+    }
+    // set ref_count to 1
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    new_rc[block_id] = 1
+    let mut mgr2 = #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": new_fl,
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": mgr["sequences"]
+    }
+    return [mgr2, block_id]
+}
+
+// ===================================================================
+//  pa_free_block -- release a physical block (decrement ref count)
+// ===================================================================
+
+fn pa_free_block(mgr, block_id) {
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    new_rc[block_id] = new_rc[block_id] - 1
+    let mut new_fl = pa2_copy_arr(mgr["free_list"])
+    if new_rc[block_id] <= 0 {
+        new_rc[block_id] = 0
+        new_fl = new_fl + [block_id]
+    }
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": new_fl,
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": mgr["sequences"]
+    }
+}
+
+// ===================================================================
+//  pa_write_kv -- write key/value vectors to a specific block+slot
+// ===================================================================
+@hot
+fn pa_write_kv(mgr, block_id, slot, key, value) {
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let mut block = pa2_copy_arr(mgr["kv_data"][block_id])
+    let k_off = slot * D
+    let v_off = bs * D + slot * D
+    for d in 0..D {
+        block[k_off + d] = key[d]
+        block[v_off + d] = value[d]
+    }
+    let mut new_kv = mgr["kv_data"]
+    new_kv[block_id] = block
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": mgr["ref_count"],
+        "kv_data": new_kv,
+        "sequences": mgr["sequences"]
+    }
+}
+
+// ===================================================================
+//  pa_read_kv -- read key/value vectors from a specific block+slot
+//  Returns [key, value]
+// ===================================================================
+@pure
+fn pa_read_kv(mgr, block_id, slot) {
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let block = mgr["kv_data"][block_id]
+    let k_off = slot * D
+    let v_off = bs * D + slot * D
+    let mut key = []
+    let mut value = []
+    for d in 0..D {
+        key = key + [block[k_off + d]]
+        value = value + [block[v_off + d]]
+    }
+    return [key, value]
+}
+
+// ===================================================================
+//  pa_create_sequence -- register a new sequence in the manager
+// ===================================================================
+
+fn pa_create_sequence(mgr, seq_id) {
+    let sid = str(seq_id)
+    let mut seqs = mgr["sequences"]
+    seqs[sid] = #{"blocks": [], "n_tokens": 0}
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": mgr["ref_count"],
+        "kv_data": mgr["kv_data"],
+        "sequences": seqs
+    }
+}
+
+// ===================================================================
+//  pa_append_token -- append a KV pair for a sequence
+//  Allocates a new block if the current one is full.
+// ===================================================================
+@hot
+fn pa_append_token(mgr, seq_id, key, value) {
+    let sid = str(seq_id)
+    let bs = mgr["block_size"]
+    let seq = mgr["sequences"][sid]
+    let n_tok = seq["n_tokens"]
+    let blocks = seq["blocks"]
+    let slot = n_tok % bs
+
+    let mut m = mgr
+    let mut blks = blocks
+
+    // need a new block?
+    if slot == 0 {
+        let res = pa_alloc_block(m)
+        m = res[0]
+        let new_bid = res[1]
+        if new_bid < 0 {
+            // out of memory -- return unchanged
+            return m
+        }
+        blks = blks + [new_bid]
+    }
+
+    // which physical block holds this token?
+    let blk_idx = len(blks) - 1
+    let phys_id = blks[blk_idx]
+
+    // check if COW -- need private copy before writing
+    let rc = m["ref_count"]
+    if rc[phys_id] > 1 {
+        // COW: allocate new block, copy data, decrement old ref
+        let res2 = pa_alloc_block(m)
+        m = res2[0]
+        let new_phys = res2[1]
+        if new_phys < 0 {
+            return m
+        }
+        // copy old block data
+        let old_data = m["kv_data"][phys_id]
+        let mut new_data = pa2_copy_arr(old_data)
+        let mut kv = m["kv_data"]
+        kv[new_phys] = new_data
+        m = #{
+            "D_head": m["D_head"],
+            "block_size": m["block_size"],
+            "max_blocks": m["max_blocks"],
+            "free_list": m["free_list"],
+            "ref_count": m["ref_count"],
+            "kv_data": kv,
+            "sequences": m["sequences"]
+        }
+        // decrement old ref
+        m = pa_free_block(m, phys_id)
+        // update block list to point to new block
+        let mut new_blks = []
+        for i in 0..len(blks) {
+            if i == blk_idx {
+                new_blks = new_blks + [new_phys]
+            } else {
+                new_blks = new_blks + [blks[i]]
+            }
+        }
+        blks = new_blks
+        m = pa_write_kv(m, new_phys, slot, key, value)
+    } else {
+        m = pa_write_kv(m, phys_id, slot, key, value)
+    }
+
+    // update sequence metadata
+    let mut seqs = m["sequences"]
+    seqs[sid] = #{"blocks": blks, "n_tokens": n_tok + 1}
+    return #{
+        "D_head": m["D_head"],
+        "block_size": m["block_size"],
+        "max_blocks": m["max_blocks"],
+        "free_list": m["free_list"],
+        "ref_count": m["ref_count"],
+        "kv_data": m["kv_data"],
+        "sequences": seqs
+    }
+}
+
+// ===================================================================
+//  pa_attention -- compute attention output for a sequence
+//
+//  query: [D_head] vector
+//  Iterates all KV tokens in the sequence via block table,
+//  uses online softmax (numerically stable).
+//  Returns: [D_head] output vector
+// ===================================================================
+@pure
+fn pa_attention(mgr, seq_id, query) {
+    let sid = str(seq_id)
+    let seq = mgr["sequences"][sid]
+    let n_tok = seq["n_tokens"]
+    let blocks = seq["blocks"]
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let scale = 1.0 / pa2_sqrt(to_float(D))
+
+    // online softmax accumulators
+    let mut m_val = 0.0 - 1.0e30
+    let mut l_val = 0.0
+    let mut acc = pa2_zeros(D)
+
+    for t in 0..n_tok {
+        let blk_idx = t / bs
+        let slot = t % bs
+        let phys_id = blocks[blk_idx]
+        let kv = pa_read_kv(mgr, phys_id, slot)
+        let k_vec = kv[0]
+        let v_vec = kv[1]
+
+        // dot(query, k_vec) * scale
+        let mut dot = 0.0
+        for d in 0..D {
+            dot = dot + query[d] * k_vec[d]
+        }
+        let score = dot * scale
+
+        // online softmax update
+        let m_old = m_val
+        let m_new = pa2_max(m_old, score)
+        let alpha = pa2_exp(m_old - m_new)
+        let p = pa2_exp(score - m_new)
+        l_val = l_val * alpha + p
+        for d in 0..D {
+            acc[d] = acc[d] * alpha + p * v_vec[d]
+        }
+        m_val = m_new
+    }
+
+    // normalize
+    let mut out = pa2_zeros(D)
+    if l_val > 0.0 {
+        let inv_l = 1.0 / l_val
+        for d in 0..D {
+            out[d] = acc[d] * inv_l
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  pa_cow_fork -- copy-on-write fork of a sequence
+//
+//  src_seq's blocks are shared with dst_seq.
+//  ref_count incremented for each shared block.
+//  Actual copy deferred until pa_append_token writes to a shared block.
+// ===================================================================
+
+fn pa_cow_fork(mgr, src_seq, dst_seq) {
+    let src_sid = str(src_seq)
+    let dst_sid = str(dst_seq)
+    let src = mgr["sequences"][src_sid]
+    let src_blocks = src["blocks"]
+    let src_n = src["n_tokens"]
+
+    // increment ref_count for each block in source
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    let n_blks = len(src_blocks)
+    for i in 0..n_blks {
+        let bid = src_blocks[i]
+        new_rc[bid] = new_rc[bid] + 1
+    }
+
+    // create dst sequence sharing same blocks
+    let mut seqs = mgr["sequences"]
+    let mut dst_blocks = []
+    for i in 0..n_blks {
+        dst_blocks = dst_blocks + [src_blocks[i]]
+    }
+    seqs[dst_sid] = #{"blocks": dst_blocks, "n_tokens": src_n}
+
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": seqs
+    }
+}
+
+// ===================================================================
+//  pa_usage -- report block usage statistics
+//  Returns #{used, free, total}
+// ===================================================================
+@pure
+fn pa_usage(mgr) {
+    let total = mgr["max_blocks"]
+    let free = len(mgr["free_list"])
+    let used = total - free
+    return #{"used": used, "free": free, "total": total}
+}
+
+println("[paged_attention_v2] module loaded -- vLLM-style PA manager (#297)")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -24,7 +24,461 @@
 //    #20 hb_neg sign flip
 // ===================================================================
 
-import "ml/hyperbolic_embedding.hexa"
+// -- inlined from self/ml/hyperbolic_embedding.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/hyperbolic_embedding.hexa — Hyperbolic Embedding (#244)
+//
+//  Poincaré ball model of hyperbolic space.  The unit ball
+//    B^n = { x in R^n : ||x|| < 1 }
+//  with Riemannian metric g_x = (2 / (1 - ||x||^2))^2 * g_E
+//  gives the hyperbolic distance
+//    d(u,v) = arcosh( 1 + 2 * ||u - v||^2 / ((1 - ||u||^2) * (1 - ||v||^2)) )
+//
+//  Hierarchies (trees) embed into hyperbolic space with exponentially
+//  less distortion than Euclidean space — good for taxonomies, WordNet,
+//  citation graphs, etc.
+//
+//  API:
+//    hb_norm_sq(v)                     -> float  squared Euclidean norm
+//    hb_norm(v)                        -> float  Euclidean norm
+//    hb_vec_sub(a, b)                  -> [float]
+//    hb_vec_add(a, b)                  -> [float]
+//    hb_vec_scale(v, s)                -> [float]
+//    hb_dot(a, b)                      -> float
+//    hb_project(v, eps)                -> [float]   clip into ball
+//    hb_distance(u, v)                 -> float   Poincaré geodesic
+//    hb_mobius_add(u, v)               -> [float]  Möbius ⊕
+//    hb_mobius_scalar_mul(r, v)        -> [float]  r ⊗ v
+//    hb_exp_map_zero(v)                -> [float]  exp_0(v)
+//    hb_log_map_zero(y)                -> [float]  log_0(y)
+//    hb_exp_map(x, v)                  -> [float]  exp_x(v)
+//    hb_log_map(x, y)                  -> [float]  log_x(y)
+//    hb_parallel_transport_zero(x, v)  -> [float]  0 → x
+//    hb_neg(v)                         -> [float]
+//    hb_tree_embed(root, depth, dim)   -> dict   tiny toy tree embedding
+//    hb_hierarchical_loss(pos, neg)    -> float   rank-style loss
+//
+//  AI-NATIVE attrs:
+//    @pure  — stateless math
+//    @hot   — used in training / inference every step
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ─────────────────────────────────────────────
+
+fn hb_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn hb_sqrt_newton(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..40 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+// exp(x) Taylor (clamped) — avoids builtin edge cases
+fn hb_exp_taylor(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..40 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+// log(x), x > 0.  Range-reduce by halving to bring into [0.5, 1.5]
+// then use series for log(1+u).
+fn hb_log_natural(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut y = x
+    let mut k = 0.0
+    while y > 1.5 {
+        y = y / 2.0
+        k = k + 1.0
+    }
+    while y < 0.5 {
+        y = y * 2.0
+        k = k - 1.0
+    }
+    let u = y - 1.0
+    // log(1+u) series, alternating
+    let mut s = 0.0
+    let mut term = u
+    let mut sign = 1.0
+    for i in 1..60 {
+        s = s + sign * term / to_float(i)
+        term = term * u
+        sign = 0.0 - sign
+    }
+    // ln(2) ≈ 0.6931471805599453
+    return s + k * 0.6931471805599453
+}
+
+// arcosh(x) = log(x + sqrt(x^2 - 1)), x >= 1
+fn hb_arcosh(x) {
+    if x < 1.0 { return 0.0 }
+    let inside = x + hb_sqrt_newton(x * x - 1.0)
+    return hb_log_natural(inside)
+}
+
+// tanh(x) = (e^x - e^-x) / (e^x + e^-x)
+fn hb_tanh(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return -1.0 }
+    let ep = hb_exp_taylor(x)
+    let em = hb_exp_taylor(0.0 - x)
+    return (ep - em) / (ep + em)
+}
+
+// atanh(x) = 0.5 * log((1+x)/(1-x)), |x| < 1
+fn hb_atanh(x) {
+    let mut y = x
+    if y > 0.9999999 { y = 0.9999999 }
+    if y < -0.9999999 { y = -0.9999999 }
+    return 0.5 * hb_log_natural((1.0 + y) / (1.0 - y))
+}
+
+fn hb_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (1) Vector primitives on R^n
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hb_norm_sq(v) {
+    let n = len(v)
+    let mut s = 0.0
+    for i in 0..n { s = s + v[i] * v[i] }
+    return s
+}
+
+@pure
+fn hb_norm(v) {
+    return hb_sqrt_newton(hb_norm_sq(v))
+}
+
+@pure
+fn hb_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+@pure
+fn hb_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = a[i] - b[i] }
+    return out
+}
+
+@pure
+fn hb_vec_add(a, b) {
+    let n = len(a)
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = a[i] + b[i] }
+    return out
+}
+
+@pure
+fn hb_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = v[i] * s }
+    return out
+}
+
+@pure
+fn hb_neg(v) {
+    return hb_vec_scale(v, -1.0)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (2) Project into the (open) unit ball with margin `eps`.
+//
+//  If ||v|| >= 1-eps, scale down to radius 1-eps.  Keeps all subsequent
+//  operations numerically safe (avoid division by (1 - ||v||^2) = 0).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hb_project(v, eps) {
+    let n = len(v)
+    let nm = hb_norm(v)
+    let lim = 1.0 - eps
+    if nm < lim { return v }
+    let scale = lim / (nm + 1.0e-15)
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = v[i] * scale }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (3) Poincaré distance
+//
+//  d(u,v) = arcosh( 1 + 2 * ||u-v||^2 / ((1 - ||u||^2)(1 - ||v||^2)) )
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn hb_distance(u, v) {
+    let diff = hb_vec_sub(u, v)
+    let nd = hb_norm_sq(diff)
+    let nu = hb_norm_sq(u)
+    let nv = hb_norm_sq(v)
+    let den = (1.0 - nu) * (1.0 - nv)
+    if den <= 1.0e-15 { return 20.0 }  // clip: effectively infinite
+    let arg = 1.0 + 2.0 * nd / den
+    return hb_arcosh(arg)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (4) Möbius addition  u ⊕ v
+//
+//  (1 + 2<u,v> + ||v||^2) u + (1 - ||u||^2) v
+//  ------------------------------------------------
+//       1 + 2<u,v> + ||u||^2 ||v||^2
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn hb_mobius_add(u, v) {
+    let n = len(u)
+    let uu = hb_norm_sq(u)
+    let vv = hb_norm_sq(v)
+    let uv = hb_dot(u, v)
+    let alpha = 1.0 + 2.0 * uv + vv
+    let beta = 1.0 - uu
+    let denom = 1.0 + 2.0 * uv + uu * vv
+    let safe = denom
+    let d = if safe > 1.0e-15 { safe } else { 1.0e-15 }
+    let mut out = hb_zeros(n)
+    for i in 0..n {
+        out[i] = (alpha * u[i] + beta * v[i]) / d
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (5) Möbius scalar multiplication  r ⊗ v
+//
+//  r ⊗ v = tanh(r * atanh(||v||)) * v / ||v||
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hb_mobius_scalar_mul(r, v) {
+    let n = len(v)
+    let nm = hb_norm(v)
+    if nm < 1.0e-15 { return hb_zeros(n) }
+    let factor = hb_tanh(r * hb_atanh(nm)) / nm
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = v[i] * factor }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (6) Exponential map at origin
+//
+//  exp_0(v) = tanh(||v||) * v / ||v||
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn hb_exp_map_zero(v) {
+    let n = len(v)
+    let nm = hb_norm(v)
+    if nm < 1.0e-15 { return hb_zeros(n) }
+    let factor = hb_tanh(nm) / nm
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = v[i] * factor }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (7) Logarithmic map at origin
+//
+//  log_0(y) = atanh(||y||) * y / ||y||
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn hb_log_map_zero(y) {
+    let n = len(y)
+    let nm = hb_norm(y)
+    if nm < 1.0e-15 { return hb_zeros(n) }
+    let factor = hb_atanh(nm) / nm
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = y[i] * factor }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (8) General exp/log maps at base point x (via Möbius addition)
+//
+//  exp_x(v) = x ⊕ ( tanh( (1 - ||x||^2)^-1 * ||v|| ) * v / ||v|| )
+//  log_x(y) = 2 / (1 - ||x||^2) * atanh( ||-x ⊕ y|| ) * (-x ⊕ y) / ||-x ⊕ y||
+//
+//  Curvature c = 1 convention.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hb_lambda_x(x) {
+    // conformal factor λ_x = 2 / (1 - ||x||^2)
+    let nx = hb_norm_sq(x)
+    let denom = 1.0 - nx
+    if denom <= 1.0e-15 { return 1.0e7 }
+    return 2.0 / denom
+}
+
+@pure @hot
+fn hb_exp_map(x, v) {
+    let n = len(v)
+    let nm = hb_norm(v)
+    if nm < 1.0e-15 { return x }
+    let lam = hb_lambda_x(x)
+    let scale = hb_tanh(lam * nm / 2.0) / nm
+    let mut direction = hb_zeros(n)
+    for i in 0..n { direction[i] = v[i] * scale }
+    return hb_mobius_add(x, direction)
+}
+
+@pure @hot
+fn hb_log_map(x, y) {
+    let neg_x = hb_neg(x)
+    let sum = hb_mobius_add(neg_x, y)
+    let nm = hb_norm(sum)
+    let n = len(sum)
+    if nm < 1.0e-15 { return hb_zeros(n) }
+    let lam = hb_lambda_x(x)
+    let factor = (2.0 / lam) * hb_atanh(nm) / nm
+    let mut out = hb_zeros(n)
+    for i in 0..n { out[i] = sum[i] * factor }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (9) Parallel transport of v from 0 to x (gyrovector form)
+//
+//  P_{0→x}(v) = (1 - ||x||^2) * v  (in the tangent space model)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn hb_parallel_transport_zero(x, v) {
+    let factor = 1.0 - hb_norm_sq(x)
+    return hb_vec_scale(v, factor)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (10) Small tree embedder — places a binary tree of `depth` levels
+//  on the Poincaré ball by angular spread (toy model, deterministic).
+//
+//  Returns a dict: "coords" (list of n_nodes vectors of length dim),
+//                  "parents" (list of int parent ids, -1 for root).
+// ═══════════════════════════════════════════════════════════════════
+fn hb_int_pow(base, p) {
+    let mut r = 1
+    for _i in 0..p { r = r * base }
+    return r
+}
+
+fn hb_cos_series(theta) {
+    let mut t = theta
+    // range reduce to [-pi, pi]
+    let pi = 3.14159265358979
+    while t > pi { t = t - 2.0 * pi }
+    while t < 0.0 - pi { t = t + 2.0 * pi }
+    let mut result = 0.0
+    let mut term = 1.0
+    let mut sign = 1.0
+    for i in 0..20 {
+        if i > 0 {
+            term = term * t * t / (to_float(2 * i) * to_float(2 * i - 1))
+        }
+        result = result + sign * term
+        sign = 0.0 - sign
+    }
+    return result
+}
+
+fn hb_sin_series(theta) {
+    let mut t = theta
+    let pi = 3.14159265358979
+    while t > pi { t = t - 2.0 * pi }
+    while t < 0.0 - pi { t = t + 2.0 * pi }
+    let mut result = t
+    let mut term = t
+    let mut sign = -1.0
+    for i in 1..20 {
+        let k = 2 * i + 1
+        term = term * t * t / (to_float(k) * to_float(k - 1))
+        result = result + sign * term
+        sign = 0.0 - sign
+    }
+    return result
+}
+
+fn hb_tree_embed(depth, dim) {
+    // Binary tree with (2^(depth+1) - 1) nodes; only 2D coords supported
+    // (higher dims padded with zeros).
+    let n_nodes = hb_int_pow(2, depth + 1) - 1
+    let mut coords = []
+    let mut parents = []
+    for idx in 0..n_nodes {
+        // Level of node idx: floor(log2(idx+1))
+        let mut level = 0
+        let mut tmp = idx + 1
+        while tmp > 1 {
+            tmp = tmp / 2
+            level = level + 1
+        }
+        // Position on that level (0-based)
+        let level_start = hb_int_pow(2, level) - 1
+        let pos = idx - level_start
+        let level_count = hb_int_pow(2, level)
+        // Radius grows toward 1 with depth; keep inside ball
+        let mut r = 0.0
+        if level > 0 {
+            r = 0.95 * (1.0 - hb_exp_taylor(0.0 - to_float(level) * 0.5))
+        }
+        let theta = 2.0 * 3.14159265358979 * to_float(pos) / to_float(level_count)
+        let mut vec = hb_zeros(dim)
+        if dim >= 1 { vec[0] = r * hb_cos_series(theta) }
+        if dim >= 2 { vec[1] = r * hb_sin_series(theta) }
+        coords = coords + [vec]
+        if idx == 0 {
+            parents = parents + [-1]
+        } else {
+            parents = parents + [(idx - 1) / 2]
+        }
+    }
+    let mut d = #{}
+    d["coords"] = coords
+    d["parents"] = parents
+    d["n_nodes"] = n_nodes
+    return d
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  (11) Hierarchical ranking loss
+//
+//  For embeddings of a "positive" pair (u, v_pos) and a "negative" pair
+//  (u, v_neg), encourage d(u, v_pos) < d(u, v_neg) by margin m.
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+fn hb_hierarchical_loss(u, v_pos, v_neg, margin) {
+    let dp = hb_distance(u, v_pos)
+    let dn = hb_distance(u, v_neg)
+    let mut l = margin + dp - dn
+    if l < 0.0 { l = 0.0 }
+    return l
+}
+
+println("[hyperbolic_embedding] loaded — Poincare ball + exp/log map + Mobius + tree embed + hierarchical loss")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -2,7 +2,336 @@
 //  test_adversarial_pgd.hexa — Adversarial Training PGD (#267)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/adversarial_pgd.hexa"
+// -- inlined from self/ml/adversarial_pgd.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/adversarial_pgd.hexa — Adversarial Training PGD (#267)
+//
+//  FGSM / PGD attacks + adversarial training loop.
+//
+//  Model: linear multiclass with softmax + cross-entropy loss.
+//      logits[k] = Σ_j W[k,j] * x[j]
+//      p[k]      = softmax(logits)[k]
+//      L         = -log p[y]
+//
+//  Gradient w.r.t. x:
+//      ∇_x L = (p - onehot(y))^T · W
+//
+//  FGSM one-step:
+//      x_adv = x + ε · sign(∇_x L)
+//
+//  PGD K-step with uniform init in ε-ball (L∞):
+//      δ_0   ∼ U(-ε, ε)^D
+//      δ_t+1 = Proj_{||δ||_∞ ≤ ε}( δ_t + α · sign(∇_δ L(f(x+δ), y)) )
+//
+//  Adversarial training: generate PGD examples, then SGD step on
+//  the adversarial loss.
+//
+//  API:
+//    apgd_softmax(logits)              -> [float]
+//    apgd_ce_loss(W, x, y)             -> float
+//    apgd_grad_input(W, x, y)          -> [float]
+//    apgd_grad_weights(W, x, y)        -> [[float]]
+//    apgd_sign(v)                      -> [float]
+//    apgd_fgsm(W, x, y, eps)           -> [float]
+//    apgd_pgd(W, x, y, eps, alpha, steps, seed) -> [float]
+//    apgd_adv_train_step(W, X, Y, eps, alpha, steps, lr, seed) -> [[float]]
+//    apgd_predict(W, x)                -> int
+//    apgd_accuracy(W, X, Y)            -> float
+//
+//  AI-NATIVE attrs:
+//    @pure  — deterministic numerics
+//    @hot   — training loop
+// ═══════════════════════════════════════════════════════════════════
+
+fn apgd_abs(inp) { if inp < 0.0 { return 0.0 - inp } return inp }
+
+fn apgd_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn apgd_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn apgd_zeros_f(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn apgd_zeros_2d(rows, cols) {
+    let mut v = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        v = v + [row]
+    }
+    return v
+}
+
+fn apgd_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn apgd_uniform(state) {
+    let s = apgd_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_softmax(logits) {
+    let K = len(logits)
+    let mut mx = logits[0]
+    for k in 1..K { if logits[k] > mx { mx = logits[k] } }
+    let mut out = apgd_zeros_f(K)
+    let mut sum = 0.0
+    for k in 0..K {
+        let e = apgd_exp(logits[k] - mx)
+        out[k] = e
+        sum = sum + e
+    }
+    if sum <= 0.0 { sum = 1.0e-12 }
+    for k in 0..K { out[k] = out[k] / sum }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear forward
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_logits(W, inp) {
+    let K = len(W)
+    let D = len(inp)
+    let mut out = apgd_zeros_f(K)
+    for k in 0..K {
+        let mut s = 0.0
+        for j in 0..D { s = s + W[k][j] * inp[j] }
+        out[k] = s
+    }
+    return out
+}
+
+@pure
+fn apgd_predict(W, inp) {
+    let logits = apgd_logits(W, inp)
+    let K = len(logits)
+    let mut best = logits[0]
+    let mut idx = 0
+    for k in 1..K {
+        if logits[k] > best {
+            best = logits[k]
+            idx = k
+        }
+    }
+    return idx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cross-entropy loss
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_ce_loss(W, inp, y) {
+    let logits = apgd_logits(W, inp)
+    let p = apgd_softmax(logits)
+    let mut py = p[y]
+    if py < 1.0e-12 { py = 1.0e-12 }
+    return 0.0 - apgd_log(py)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient w.r.t. input:  ∇_x L = (p - onehot(y))^T · W
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_grad_input(W, inp, y) {
+    let K = len(W)
+    let D = len(inp)
+    let logits = apgd_logits(W, inp)
+    let p = apgd_softmax(logits)
+    let mut grad = apgd_zeros_f(D)
+    for j in 0..D {
+        let mut s = 0.0
+        for k in 0..K {
+            let mut diff = p[k]
+            if k == y { diff = diff - 1.0 }
+            s = s + diff * W[k][j]
+        }
+        grad[j] = s
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gradient w.r.t. W:  ∇_W L[k,j] = (p[k] - [k==y]) * x[j]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_grad_weights(W, inp, y) {
+    let K = len(W)
+    let D = len(inp)
+    let logits = apgd_logits(W, inp)
+    let p = apgd_softmax(logits)
+    let mut gW = apgd_zeros_2d(K, D)
+    for k in 0..K {
+        let mut diff = p[k]
+        if k == y { diff = diff - 1.0 }
+        for j in 0..D {
+            gW[k][j] = diff * inp[j]
+        }
+    }
+    return gW
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  sign()
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_sign(vec) {
+    let D = len(vec)
+    let mut out = apgd_zeros_f(D)
+    for j in 0..D {
+        if vec[j] > 0.0 { out[j] = 1.0 }
+        else {
+            if vec[j] < 0.0 { out[j] = -1.0 }
+            else { out[j] = 0.0 }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  FGSM one-step attack
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_fgsm(W, inp, y, eps) {
+    let D = len(inp)
+    let grad = apgd_grad_input(W, inp, y)
+    let sgn = apgd_sign(grad)
+    let mut adv = apgd_zeros_f(D)
+    for j in 0..D { adv[j] = inp[j] + eps * sgn[j] }
+    return adv
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  L∞ projection onto ε-ball centered at x_ref
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_proj_linf(adv, x_ref, eps) {
+    let D = len(adv)
+    let mut out = apgd_zeros_f(D)
+    for j in 0..D {
+        let lo = x_ref[j] - eps
+        let hi = x_ref[j] + eps
+        let mut v = adv[j]
+        if v < lo { v = lo }
+        if v > hi { v = hi }
+        out[j] = v
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  PGD K-step attack (uniform init inside ε-ball)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn apgd_pgd(W, inp, y, eps, alpha, steps, seed) {
+    let D = len(inp)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    // init delta ~ U(-eps, eps)
+    let mut adv = apgd_zeros_f(D)
+    for j in 0..D {
+        let u = apgd_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        let delta = (u[0] * 2.0 - 1.0) * eps
+        adv[j] = inp[j] + delta
+    }
+    let mut t = 0
+    while t < steps {
+        let grad = apgd_grad_input(W, adv, y)
+        let sgn = apgd_sign(grad)
+        let mut updated = apgd_zeros_f(D)
+        for j in 0..D { updated[j] = adv[j] + alpha * sgn[j] }
+        adv = apgd_proj_linf(updated, inp, eps)
+        t = t + 1
+    }
+    return adv
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Adversarial training step
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn apgd_adv_train_step(W, X, Y, eps, alpha, steps, lr, seed) {
+    let N = len(X)
+    let K = len(W)
+    let D = len(X[0])
+    let mut gW = apgd_zeros_2d(K, D)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for i in 0..N {
+        let adv = apgd_pgd(W, X[i], Y[i], eps, alpha, steps, state)
+        state = state + 7919
+        if state <= 0 { state = 1 }
+        let gi = apgd_grad_weights(W, adv, Y[i])
+        for k in 0..K {
+            for j in 0..D { gW[k][j] = gW[k][j] + gi[k][j] }
+        }
+    }
+    let inv_n = 1.0 / to_float(N)
+    let mut W_new = apgd_zeros_2d(K, D)
+    for k in 0..K {
+        for j in 0..D {
+            W_new[k][j] = W[k][j] - lr * gW[k][j] * inv_n
+        }
+    }
+    return W_new
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Accuracy
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn apgd_accuracy(W, X, Y) {
+    let N = len(X)
+    if N == 0 { return 0.0 }
+    let mut correct = 0
+    for i in 0..N {
+        let pred = apgd_predict(W, X[i])
+        if pred == Y[i] { correct = correct + 1 }
+    }
+    return to_float(correct) / to_float(N)
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

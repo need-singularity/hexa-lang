@@ -2,7 +2,340 @@
 //  test_dinov2_ssl.hexa — DINOv2 SSL (#266) tests
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/dinov2_ssl.hexa"
+// -- inlined from self/ml/dinov2_ssl.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/dinov2_ssl.hexa — DINOv2 Self-Supervised (#266)
+//
+//  Student/Teacher dual MLP with:
+//    • teacher EMA update
+//    • stop-grad on teacher
+//    • softmax with temperature  (teacher τt, student τs)
+//    • cross-entropy across 2 augmented views
+//
+//  Loss (DINO): -Σ_v1 Σ_v2 softmax(t(v1)/τt) · log_softmax(s(v2)/τs)
+//
+//  We simulate 2 views by adding two independent noise vectors to the input.
+//
+//  CPU mini: input_dim=8, hidden=16, proj_dim=6
+//
+//  API:
+//    dino_init(input_dim, hidden, proj_dim, seed)   -> dict
+//    dino_student_forward(model, inp)              -> [float]
+//    dino_teacher_forward(model, inp)              -> [float]
+//    dino_softmax(logits, temp)                    -> [float]
+//    dino_log_softmax(logits, temp)                -> [float]
+//    dino_cross_entropy(teacher_p, student_logp)   -> float
+//    dino_forward_pair(model, inp, seed, tau_t, tau_s) -> dict {v1,v2,loss}
+//    dino_ema_update(model, ema_rate)              -> dict (new_teacher)
+//    dino_copy_student_to_teacher(model)           -> dict
+//
+//  @pure on the math; mutation only inside init/ema update.
+// ═══════════════════════════════════════════════════════════════
+
+fn dino_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn dino_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn dino_zeros2d(m, n) {
+    let mut w = []
+    for _i in 0..m { w = w + [dino_zeros(n)] }
+    return w
+}
+
+fn dino_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+fn dino_hash_u(seed, k) {
+    let h = (seed * 7919 + k * 104729 + 31) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// ── Linear layer: feat (din), W (din × dout), b (dout) ──
+fn dino_linear(W, b, feat) {
+    let din = len(W)
+    let dout = len(W[0])
+    let mut out = dino_zeros(dout)
+    for j in 0..dout { out[j] = b[j] }
+    for i in 0..din {
+        for j in 0..dout { out[j] = out[j] + W[i][j] * feat[i] }
+    }
+    return out
+}
+
+fn dino_relu(feat) {
+    let n = len(feat)
+    let mut out = dino_zeros(n)
+    for i in 0..n {
+        if feat[i] > 0.0 { out[i] = feat[i] } else { out[i] = 0.0 }
+    }
+    return out
+}
+
+// ── Stable softmax ──
+fn dino_softmax(logits, temp) {
+    let n = len(logits)
+    let mut mx = logits[0] / temp
+    for i in 1..n {
+        let v = logits[i] / temp
+        if v > mx { mx = v }
+    }
+    let mut probs = dino_zeros(n)
+    let mut s = 0.0
+    for i in 0..n {
+        let e = exp(logits[i] / temp - mx)
+        probs[i] = e
+        s = s + e
+    }
+    if s < 1.0e-30 { s = 1.0e-30 }
+    for i in 0..n { probs[i] = probs[i] / s }
+    return probs
+}
+
+// ── Stable log-softmax ──
+fn dino_log_softmax(logits, temp) {
+    let n = len(logits)
+    let mut mx = logits[0] / temp
+    for i in 1..n {
+        let v = logits[i] / temp
+        if v > mx { mx = v }
+    }
+    let mut s = 0.0
+    for i in 0..n { s = s + exp(logits[i] / temp - mx) }
+    if s < 1.0e-30 { s = 1.0e-30 }
+    let log_s = log(s)
+    let mut out = dino_zeros(n)
+    for i in 0..n { out[i] = logits[i] / temp - mx - log_s }
+    return out
+}
+
+// ── Cross-entropy: -Σ p · log q ──
+fn dino_cross_entropy(p, log_q) {
+    let n = len(p)
+    let mut s = 0.0
+    for i in 0..n { s = s - p[i] * log_q[i] }
+    return s
+}
+
+// ── (1) init student + teacher (both start identical) ──
+fn dino_init(input_dim, hidden, proj_dim, seed) {
+    let mut W1 = dino_zeros2d(input_dim, hidden)
+    for i in 0..input_dim {
+        for j in 0..hidden { W1[i][j] = 0.3 * dino_hash(seed, i, j) }
+    }
+    let b1 = dino_zeros(hidden)
+    let mut W2 = dino_zeros2d(hidden, proj_dim)
+    for i in 0..hidden {
+        for j in 0..proj_dim { W2[i][j] = 0.3 * dino_hash(seed + 11, i, j) }
+    }
+    let b2 = dino_zeros(proj_dim)
+
+    // teacher is an identical copy
+    let mut tW1 = dino_zeros2d(input_dim, hidden)
+    for i in 0..input_dim {
+        for j in 0..hidden { tW1[i][j] = W1[i][j] }
+    }
+    let tb1 = dino_zeros(hidden)
+    let mut tW2 = dino_zeros2d(hidden, proj_dim)
+    for i in 0..hidden {
+        for j in 0..proj_dim { tW2[i][j] = W2[i][j] }
+    }
+    let tb2 = dino_zeros(proj_dim)
+
+    let model = #{
+        "input_dim": input_dim,
+        "hidden": hidden,
+        "proj_dim": proj_dim,
+        "s_W1": W1,
+        "s_b1": b1,
+        "s_W2": W2,
+        "s_b2": b2,
+        "t_W1": tW1,
+        "t_b1": tb1,
+        "t_W2": tW2,
+        "t_b2": tb2
+    }
+    return model
+}
+
+// ── (2) student forward ──
+fn dino_student_forward(model, inp) {
+    let h = dino_linear(model["s_W1"], model["s_b1"], inp)
+    let a = dino_relu(h)
+    let o = dino_linear(model["s_W2"], model["s_b2"], a)
+    return o
+}
+
+// ── (3) teacher forward (stop-grad in real training) ──
+fn dino_teacher_forward(model, inp) {
+    let h = dino_linear(model["t_W1"], model["t_b1"], inp)
+    let a = dino_relu(h)
+    let o = dino_linear(model["t_W2"], model["t_b2"], a)
+    return o
+}
+
+// ── (4) make 2 augmented views (noise) ──
+fn dino_augment(inp, seed, shift) {
+    let n = len(inp)
+    let mut out = dino_zeros(n)
+    for i in 0..n {
+        let noise = 0.1 * dino_hash_u(seed + shift, i)
+        out[i] = inp[i] + noise
+    }
+    return out
+}
+
+// ── (5) forward_pair: student on v1, teacher on v2, and vice versa ──
+fn dino_forward_pair(model, inp, seed, tau_t, tau_s) {
+    let v1 = dino_augment(inp, seed, 1)
+    let v2 = dino_augment(inp, seed, 2)
+
+    let s1 = dino_student_forward(model, v1)
+    let s2 = dino_student_forward(model, v2)
+    let t1 = dino_teacher_forward(model, v1)
+    let t2 = dino_teacher_forward(model, v2)
+
+    // teacher targets (softmax with τt)
+    let p_t1 = dino_softmax(t1, tau_t)
+    let p_t2 = dino_softmax(t2, tau_t)
+    // student log-probs (τs)
+    let lq_s1 = dino_log_softmax(s1, tau_s)
+    let lq_s2 = dino_log_softmax(s2, tau_s)
+
+    // cross-view CE: teacher(v1) vs student(v2) + teacher(v2) vs student(v1)
+    let ce1 = dino_cross_entropy(p_t1, lq_s2)
+    let ce2 = dino_cross_entropy(p_t2, lq_s1)
+    let loss = 0.5 * (ce1 + ce2)
+
+    let out = #{
+        "v1": v1,
+        "v2": v2,
+        "student_v1": s1,
+        "student_v2": s2,
+        "teacher_v1": t1,
+        "teacher_v2": t2,
+        "p_teacher_v1": p_t1,
+        "p_teacher_v2": p_t2,
+        "loss": loss
+    }
+    return out
+}
+
+// ── (6) teacher EMA update: T = m*T + (1-m)*S ──
+fn dino_ema_update(model, ema_rate) {
+    let input_dim = model["input_dim"]
+    let hidden = model["hidden"]
+    let proj_dim = model["proj_dim"]
+    let sW1 = model["s_W1"]
+    let sb1 = model["s_b1"]
+    let sW2 = model["s_W2"]
+    let sb2 = model["s_b2"]
+    let tW1 = model["t_W1"]
+    let tb1 = model["t_b1"]
+    let tW2 = model["t_W2"]
+    let tb2 = model["t_b2"]
+
+    let mut nW1 = dino_zeros2d(input_dim, hidden)
+    for i in 0..input_dim {
+        for j in 0..hidden {
+            nW1[i][j] = ema_rate * tW1[i][j] + (1.0 - ema_rate) * sW1[i][j]
+        }
+    }
+    let mut nb1 = dino_zeros(hidden)
+    for j in 0..hidden { nb1[j] = ema_rate * tb1[j] + (1.0 - ema_rate) * sb1[j] }
+
+    let mut nW2 = dino_zeros2d(hidden, proj_dim)
+    for i in 0..hidden {
+        for j in 0..proj_dim {
+            nW2[i][j] = ema_rate * tW2[i][j] + (1.0 - ema_rate) * sW2[i][j]
+        }
+    }
+    let mut nb2 = dino_zeros(proj_dim)
+    for j in 0..proj_dim { nb2[j] = ema_rate * tb2[j] + (1.0 - ema_rate) * sb2[j] }
+
+    let new_model = #{
+        "input_dim": input_dim,
+        "hidden": hidden,
+        "proj_dim": proj_dim,
+        "s_W1": sW1,
+        "s_b1": sb1,
+        "s_W2": sW2,
+        "s_b2": sb2,
+        "t_W1": nW1,
+        "t_b1": nb1,
+        "t_W2": nW2,
+        "t_b2": nb2
+    }
+    return new_model
+}
+
+// ── (7) copy student into teacher (init sync) ──
+fn dino_copy_student_to_teacher(model) {
+    let input_dim = model["input_dim"]
+    let hidden = model["hidden"]
+    let proj_dim = model["proj_dim"]
+    let sW1 = model["s_W1"]
+    let sb1 = model["s_b1"]
+    let sW2 = model["s_W2"]
+    let sb2 = model["s_b2"]
+
+    let mut tW1 = dino_zeros2d(input_dim, hidden)
+    for i in 0..input_dim {
+        for j in 0..hidden { tW1[i][j] = sW1[i][j] }
+    }
+    let mut tb1 = dino_zeros(hidden)
+    for j in 0..hidden { tb1[j] = sb1[j] }
+    let mut tW2 = dino_zeros2d(hidden, proj_dim)
+    for i in 0..hidden {
+        for j in 0..proj_dim { tW2[i][j] = sW2[i][j] }
+    }
+    let mut tb2 = dino_zeros(proj_dim)
+    for j in 0..proj_dim { tb2[j] = sb2[j] }
+
+    let new_model = #{
+        "input_dim": input_dim,
+        "hidden": hidden,
+        "proj_dim": proj_dim,
+        "s_W1": sW1,
+        "s_b1": sb1,
+        "s_W2": sW2,
+        "s_b2": sb2,
+        "t_W1": tW1,
+        "t_b1": tb1,
+        "t_W2": tW2,
+        "t_b2": tb2
+    }
+    return new_model
+}
+
+// ── (8) average cosine-similarity between student proj and teacher proj ──
+fn dino_cos_sim(a, b) {
+    let n = len(a)
+    let mut dot = 0.0
+    let mut na = 0.0
+    let mut nb = 0.0
+    for i in 0..n {
+        dot = dot + a[i] * b[i]
+        na = na + a[i] * a[i]
+        nb = nb + b[i] * b[i]
+    }
+    let denom = sqrt(na) * sqrt(nb)
+    if denom < 1.0e-30 { return 0.0 }
+    return dot / denom
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

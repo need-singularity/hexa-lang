@@ -2,7 +2,415 @@
 //  test_energy_model.hexa — Energy-Based Model (#301)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/energy_model.hexa"
+// -- inlined from self/ml/energy_model.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/energy_model.hexa — Energy-Based Model (#301)
+//
+//  EBM (LeCun et al.) — define unnormalized density via energy:
+//      p(x) proportional to exp(-E_theta(x))
+//
+//  Energy network (2-layer MLP -> scalar):
+//      h  = tanh( W1 * x + b1 )           D_in -> D_hidden
+//      E  = sum( w2 * h ) + b2            D_hidden -> 1
+//
+//  Score function:
+//      nabla_x log p(x) = -nabla_x E_theta(x)
+//      (approximated via finite differences)
+//
+//  Langevin MCMC sampling:
+//      x_{t+1} = x_t - (eps/2) * nabla_x E(x_t) + sqrt(eps) * z
+//      z ~ N(0, I)   (approximated via Box-Muller)
+//
+//  Contrastive Divergence training:
+//      L_CD = E_theta(x_pos) - E_theta(x_neg)
+//      where x_neg are MCMC samples starting from noise
+//
+//  API:
+//    ebm_init(D_in, D_hidden, seed) -> model
+//    ebm_energy(model, x) -> float          (scalar energy)
+//    ebm_score(model, x) -> [float]         (approx -nabla_x E)
+//    ebm_langevin_step(model, x, step_size, seed) -> x_new
+//    ebm_langevin_sample(model, x_init, steps, step_size, seed) -> x_final
+//    ebm_cd_loss(model, x_pos, x_neg) -> float
+//    ebm_train_step(model, X_data, n_mcmc, lr, seed) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (energy, score, loss)
+//    @hot   (train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn ebm_abs(v) { if v < 0.0 { return 0.0 - v } return v }
+
+fn ebm_exp(v) {
+    let mut x = v
+    if x > 20.0 { x = 20.0 }
+    if x < -20.0 { x = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * x / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ebm_tanh(v) {
+    let ep = ebm_exp(v)
+    let en = ebm_exp(0.0 - v)
+    return (ep - en) / (ep + en)
+}
+
+fn ebm_sqrt(v) {
+    if v <= 0.0 { return 0.0 }
+    let mut g = v
+    for _i in 0..20 {
+        g = (g + v / g) / 2.0
+    }
+    return g
+}
+
+fn ebm_log(v) {
+    if v <= 0.0 { return -30.0 }
+    let mut x = v
+    let mut count = 0
+    while x > 2.0 {
+        x = x / 2.718281828
+        count = count + 1
+    }
+    while x < 0.5 {
+        x = x * 2.718281828
+        count = count - 1
+    }
+    let d = x - 1.0
+    let ln_x = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_x
+}
+
+fn ebm_cos(v) {
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..15 {
+        term = term * (0.0 - v * v) / to_float((2 * i - 1) * (2 * i))
+        result = result + term
+    }
+    return result
+}
+
+fn ebm_sin(v) {
+    let mut result = v
+    let mut term = v
+    for i in 1..15 {
+        term = term * (0.0 - v * v) / to_float((2 * i) * (2 * i + 1))
+        result = result + term
+    }
+    return result
+}
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn ebm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ebm_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── RNG (LCG + Box-Muller) ───────────────────────────────────────
+
+fn ebm_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn ebm_uniform(state) {
+    let s = ebm_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// Box-Muller: generate one standard normal sample
+// Returns [sample, next_state]
+fn ebm_randn(state) {
+    let u1_r = ebm_uniform(state)
+    let u1 = u1_r[0]
+    let s1 = int(u1_r[1])
+    let u2_r = ebm_uniform(if s1 <= 0 { 1 } else { s1 })
+    let u2 = u2_r[0]
+    let s2 = int(u2_r[1])
+    let mut u1c = u1
+    if u1c < 1.0e-10 { u1c = 1.0e-10 }
+    let r = ebm_sqrt(-2.0 * ebm_log(u1c))
+    let theta = 6.283185307 * u2
+    let z = r * ebm_cos(theta)
+    return [z, to_float(if s2 <= 0 { 1 } else { s2 })]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise EBM
+//    W1 : D_hidden x D_in   (Xavier-like U(-0.5, 0.5))
+//    b1 : D_hidden
+//    w2 : D_hidden           (output head)
+//    b2 : scalar
+// ═══════════════════════════════════════════════════════════════════
+fn ebm_init(D_in, D_hidden, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    let mut W1 = ebm_zeros_2d(D_hidden, D_in)
+    for i in 0..D_hidden {
+        for j in 0..D_in {
+            let u = ebm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W1[i][j] = u[0] - 0.5
+        }
+    }
+    let b1 = ebm_zeros(D_hidden)
+    let mut w2 = ebm_zeros(D_hidden)
+    for j in 0..D_hidden {
+        let u = ebm_uniform(state)
+        state = int(u[1])
+        if state <= 0 { state = 1 }
+        w2[j] = u[0] - 0.5
+    }
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "W1": W1,
+        "b1": b1,
+        "w2": w2,
+        "b2": 0.0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Energy function: E_theta(x) = w2 . tanh(W1 x + b1) + b2
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_energy(model, x) {
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let w2 = model["w2"]
+    let b2 = model["b2"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut e = b2
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..D_in { s = s + W1[i][j] * x[j] }
+        e = e + w2[i] * ebm_tanh(s)
+    }
+    return e
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Score: -nabla_x E(x) via finite differences
+//    score_j = -(E(x + eps*e_j) - E(x - eps*e_j)) / (2*eps)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_score(model, x) {
+    let D_in = model["D_in"]
+    let eps = 1.0e-4
+    let mut grad = ebm_zeros(D_in)
+    for j in 0..D_in {
+        let mut x_plus = []
+        let mut x_minus = []
+        for k in 0..D_in {
+            if k == j {
+                x_plus = x_plus + [x[k] + eps]
+                x_minus = x_minus + [x[k] - eps]
+            } else {
+                x_plus = x_plus + [x[k]]
+                x_minus = x_minus + [x[k]]
+            }
+        }
+        let e_plus = ebm_energy(model, x_plus)
+        let e_minus = ebm_energy(model, x_minus)
+        // score = -dE/dx (negative gradient of energy)
+        grad[j] = 0.0 - (e_plus - e_minus) / (2.0 * eps)
+    }
+    return grad
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Langevin MCMC step
+//    x_{t+1} = x_t + (step_size/2) * score(x_t) + sqrt(step_size) * z
+//    Note: score = -nabla_x E, so x moves toward lower energy
+// ═══════════════════════════════════════════════════════════════════
+fn ebm_langevin_step(model, x, step_size, seed) {
+    let D_in = model["D_in"]
+    let sc = ebm_score(model, x)
+    let half_ss = step_size / 2.0
+    let noise_scale = ebm_sqrt(step_size)
+    let mut x_new = ebm_zeros(D_in)
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for j in 0..D_in {
+        let zr = ebm_randn(state)
+        let z = zr[0]
+        state = int(zr[1])
+        if state <= 0 { state = 1 }
+        x_new[j] = x[j] + half_ss * sc[j] + noise_scale * z
+    }
+    return x_new
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Multi-step Langevin sampling
+// ═══════════════════════════════════════════════════════════════════
+fn ebm_langevin_sample(model, x_init, steps, step_size, seed) {
+    let mut x = x_init
+    let mut state = seed
+    if state <= 0 { state = 1 }
+    for _t in 0..steps {
+        x = ebm_langevin_step(model, x, step_size, state)
+        state = ebm_lcg(state)
+        if state <= 0 { state = 1 }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Contrastive Divergence loss
+//    L = E(x_pos) - E(x_neg)
+//  Minimising pushes E down on data, up on negatives.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn ebm_cd_loss(model, x_pos, x_neg) {
+    return ebm_energy(model, x_pos) - ebm_energy(model, x_neg)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Hidden activations (needed for analytic gradient)
+// ═══════════════════════════════════════════════════════════════════
+fn ebm_hidden(model, x) {
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let D_hidden = model["D_hidden"]
+    let D_in = model["D_in"]
+    let mut h = ebm_zeros(D_hidden)
+    for i in 0..D_hidden {
+        let mut s = b1[i]
+        for j in 0..D_in { s = s + W1[i][j] * x[j] }
+        h[i] = ebm_tanh(s)
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training step (contrastive divergence)
+//
+//  For each data point x_pos:
+//    1) Generate x_neg by running n_mcmc Langevin steps from noise
+//    2) L = E(x_pos) - E(x_neg)
+//
+//  Analytic gradients of E w.r.t. params:
+//    h = tanh(W1 x + b1)
+//    E = w2 . h + b2
+//
+//    dE/dw2  = h
+//    dE/db2  = 1
+//    dE/dW1  = (w2 * (1 - h^2)) outer x
+//    dE/db1  = w2 * (1 - h^2)
+//
+//  For CD: grad_param L = dE/dparam(x_pos) - dE/dparam(x_neg)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn ebm_train_step(model, X_data, n_mcmc, lr, seed) {
+    let N = len(X_data)
+    if N == 0 { return model }
+    let D_in = model["D_in"]
+    let D_hidden = model["D_hidden"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let w2 = model["w2"]
+    let b2 = model["b2"]
+
+    let mut gW1 = ebm_zeros_2d(D_hidden, D_in)
+    let mut gb1 = ebm_zeros(D_hidden)
+    let mut gw2 = ebm_zeros(D_hidden)
+    let mut gb2 = 0.0
+
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    for i in 0..N {
+        let x_pos = X_data[i]
+        let h_pos = ebm_hidden(model, x_pos)
+
+        // Generate negative sample: init from random, run Langevin
+        let mut x_neg = ebm_zeros(D_in)
+        for j in 0..D_in {
+            let u = ebm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            x_neg[j] = u[0] * 2.0 - 1.0
+        }
+        x_neg = ebm_langevin_sample(model, x_neg, n_mcmc, 0.01, state)
+        state = ebm_lcg(state)
+        if state <= 0 { state = 1 }
+
+        let h_neg = ebm_hidden(model, x_neg)
+
+        // Accumulate gradient:  dL/dparam = dE/dparam(x_pos) - dE/dparam(x_neg)
+        // dE/dw2 = h
+        for j in 0..D_hidden {
+            gw2[j] = gw2[j] + (h_pos[j] - h_neg[j])
+        }
+        // dE/db2 = 1
+        gb2 = gb2 + 1.0 - 1.0  // cancels: +1 for pos, -1 for neg
+
+        // dE/db1 = w2 * (1 - h^2)
+        for j in 0..D_hidden {
+            let dtanh_pos = 1.0 - h_pos[j] * h_pos[j]
+            let dtanh_neg = 1.0 - h_neg[j] * h_neg[j]
+            let delta_pos = w2[j] * dtanh_pos
+            let delta_neg = w2[j] * dtanh_neg
+            gb1[j] = gb1[j] + (delta_pos - delta_neg)
+            // dE/dW1 = delta * x
+            for k in 0..D_in {
+                gW1[j][k] = gW1[j][k] + (delta_pos * x_pos[k] - delta_neg * x_neg[k])
+            }
+        }
+    }
+
+    // Apply gradients (averaged over batch)
+    let inv_n = 1.0 / to_float(N)
+    let mut W1_new = ebm_zeros_2d(D_hidden, D_in)
+    let mut b1_new = ebm_zeros(D_hidden)
+    let mut w2_new = ebm_zeros(D_hidden)
+    for j in 0..D_hidden {
+        w2_new[j] = w2[j] - lr * gw2[j] * inv_n
+        b1_new[j] = b1[j] - lr * gb1[j] * inv_n
+        for k in 0..D_in {
+            W1_new[j][k] = W1[j][k] - lr * gW1[j][k] * inv_n
+        }
+    }
+    let b2_new = b2 - lr * gb2 * inv_n
+
+    return #{
+        "D_in": D_in,
+        "D_hidden": D_hidden,
+        "W1": W1_new,
+        "b1": b1_new,
+        "w2": w2_new,
+        "b2": b2_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

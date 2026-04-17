@@ -17,7 +17,322 @@
 //  Minimum 10 check() statements.
 // ===================================================================
 
-import "ml/continuous_batching.hexa"
+// -- inlined from self/ml/continuous_batching.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/continuous_batching.hexa — Continuous Batching Scheduler
+//
+//  Iteration-level scheduling for LLM serving.
+//  Completed requests are removed each iteration; new requests
+//  fill vacated slots dynamically.
+//
+//  Public API:
+//    create_scheduler(max_batch)
+//      Create scheduler with maximum batch size.
+//
+//    add_request(scheduler, prompt, max_tokens)
+//      Enqueue a new request. Returns updated scheduler.
+//
+//    run_iteration(scheduler, model)
+//      Execute one decode iteration across all active slots.
+//      Moves completed requests to done queue.
+//      Fills vacated slots from pending queue.
+//      Returns updated scheduler.
+//
+//    get_completed(scheduler)
+//      Return array of completed request results.
+//
+//    scheduler_stats(scheduler)
+//      Return [pending, active, completed, total_tokens].
+// ===================================================================
+
+// ===================================================================
+//  Request data structures
+// ===================================================================
+struct CBRequest {
+    id: int,
+    prompt: string,
+    max_tokens: int,
+    generated_tokens: int,
+    output_text: string,
+    output_ids: array,
+    kv_state: array,
+    finished: bool,
+    decode_pos: int,
+    cur_token: int
+}
+
+struct CBScheduler {
+    max_batch: int,
+    pending: array,
+    active: array,
+    completed: array,
+    next_id: int,
+    total_iterations: int,
+    total_tokens_generated: int
+}
+
+struct CBResult {
+    id: int,
+    prompt: string,
+    output_text: string,
+    tokens_generated: int
+}
+
+// ===================================================================
+//  Create scheduler
+// ===================================================================
+fn create_scheduler(max_batch) {
+    return CBScheduler {
+        max_batch: max_batch,
+        pending: [],
+        active: [],
+        completed: [],
+        next_id: 0,
+        total_iterations: 0,
+        total_tokens_generated: 0
+    }
+}
+
+// ===================================================================
+//  Add request to pending queue
+// ===================================================================
+fn add_request(scheduler, prompt, max_tokens) {
+    let req = CBRequest {
+        id: scheduler.next_id,
+        prompt: prompt,
+        max_tokens: max_tokens,
+        generated_tokens: 0,
+        output_text: "",
+        output_ids: [],
+        kv_state: [],
+        finished: false,
+        decode_pos: 0,
+        cur_token: 0
+    }
+    return CBScheduler {
+        max_batch: scheduler.max_batch,
+        pending: scheduler.pending + [req],
+        active: scheduler.active,
+        completed: scheduler.completed,
+        next_id: scheduler.next_id + 1,
+        total_iterations: scheduler.total_iterations,
+        total_tokens_generated: scheduler.total_tokens_generated
+    }
+}
+
+// ===================================================================
+//  Simulated token generation (for testing without a model)
+//  Produces deterministic token IDs based on request state.
+// ===================================================================
+fn sim_generate_token(req) {
+    // Simulate: generate tokens based on prompt length + position
+    let prompt_hash = len(req.prompt) * 7 + req.generated_tokens * 13
+    let token_id = (prompt_hash % 94) + 33
+    return token_id
+}
+
+fn sim_token_to_char(token_id) {
+    if token_id >= 32 {
+        if token_id < 127 {
+            return chr(token_id)
+        }
+    }
+    return "?"
+}
+
+// ===================================================================
+//  Check if request should finish
+//  EOS token (id=2) or max_tokens reached
+// ===================================================================
+fn is_request_done(req) {
+    if req.generated_tokens >= req.max_tokens {
+        return true
+    }
+    if req.cur_token == 2 {
+        return true
+    }
+    return false
+}
+
+// ===================================================================
+//  Decode one token for a single request (simulation mode)
+//  Returns updated request.
+// ===================================================================
+fn decode_one_token(req) {
+    let token_id = sim_generate_token(req)
+    let tok_str = sim_token_to_char(token_id)
+
+    return CBRequest {
+        id: req.id,
+        prompt: req.prompt,
+        max_tokens: req.max_tokens,
+        generated_tokens: req.generated_tokens + 1,
+        output_text: req.output_text + tok_str,
+        output_ids: req.output_ids + [token_id],
+        kv_state: req.kv_state,
+        finished: false,
+        decode_pos: req.decode_pos + 1,
+        cur_token: token_id
+    }
+}
+
+// ===================================================================
+//  Fill active slots from pending queue
+//  Returns [new_active, new_pending]
+// ===================================================================
+fn fill_slots(active, pending, max_batch) {
+    let n_active = len(active)
+    let n_pending = len(pending)
+    let mut free_slots = max_batch - n_active
+    if free_slots <= 0 { return [active, pending] }
+
+    let mut new_active = active
+    let mut new_pending = []
+    let mut filled = 0
+    let mut i = 0
+    while i < n_pending {
+        if filled < free_slots {
+            // Initialize the request for decoding
+            let req = pending[i]
+            let init_req = CBRequest {
+                id: req.id,
+                prompt: req.prompt,
+                max_tokens: req.max_tokens,
+                generated_tokens: 0,
+                output_text: "",
+                output_ids: [],
+                kv_state: [],
+                finished: false,
+                decode_pos: len(req.prompt),
+                cur_token: 0
+            }
+            new_active = new_active + [init_req]
+            filled = filled + 1
+        } else {
+            new_pending = new_pending + [pending[i]]
+        }
+        i = i + 1
+    }
+    return [new_active, new_pending]
+}
+
+// ===================================================================
+//  Run one iteration: decode all active, retire done, fill slots
+//
+//  model parameter is reserved for real model integration.
+//  In simulation mode (model == nil or []), uses sim_generate_token.
+// ===================================================================
+fn run_iteration(scheduler, model) {
+    // Step 1: Fill any free active slots from pending queue first
+    let fill_result = fill_slots(scheduler.active, scheduler.pending, scheduler.max_batch)
+    let cur_active = fill_result[0]
+    let cur_pending = fill_result[1]
+
+    let n_active = len(cur_active)
+
+    // Step 2: Decode one token for each active request
+    let mut decoded = []
+    let mut tokens_this_iter = 0
+    let mut i = 0
+    while i < n_active {
+        let req = cur_active[i]
+        let updated = decode_one_token(req)
+        decoded = decoded + [updated]
+        tokens_this_iter = tokens_this_iter + 1
+        i = i + 1
+    }
+
+    // Step 3: Separate completed from still-active
+    let mut still_active = []
+    let mut newly_completed = scheduler.completed
+    i = 0
+    while i < len(decoded) {
+        let req = decoded[i]
+        if is_request_done(req) {
+            let result = CBResult {
+                id: req.id,
+                prompt: req.prompt,
+                output_text: req.output_text,
+                tokens_generated: req.generated_tokens
+            }
+            newly_completed = newly_completed + [result]
+        } else {
+            still_active = still_active + [req]
+        }
+        i = i + 1
+    }
+
+    return CBScheduler {
+        max_batch: scheduler.max_batch,
+        pending: cur_pending,
+        active: still_active,
+        completed: newly_completed,
+        next_id: scheduler.next_id,
+        total_iterations: scheduler.total_iterations + 1,
+        total_tokens_generated: scheduler.total_tokens_generated + tokens_this_iter
+    }
+}
+
+// ===================================================================
+//  Get completed requests
+// ===================================================================
+fn get_completed(scheduler) {
+    return scheduler.completed
+}
+
+// ===================================================================
+//  Run until all requests complete
+//  Safety limit of max_iters to prevent infinite loops.
+// ===================================================================
+fn run_until_done(scheduler, model, max_iters) {
+    let mut sched = scheduler
+    let mut iter = 0
+    while iter < max_iters {
+        let n_active = len(sched.active)
+        let n_pending = len(sched.pending)
+        if n_active == 0 {
+            if n_pending == 0 {
+                return sched
+            }
+        }
+        sched = run_iteration(sched, model)
+        iter = iter + 1
+    }
+    return sched
+}
+
+// ===================================================================
+//  Scheduler stats: [pending, active, completed, total_tokens]
+// ===================================================================
+fn scheduler_stats(scheduler) {
+    return [
+        len(scheduler.pending),
+        len(scheduler.active),
+        len(scheduler.completed),
+        scheduler.total_tokens_generated
+    ]
+}
+
+// ===================================================================
+//  Dynamic batch size: return current active count
+// ===================================================================
+fn current_batch_size(scheduler) {
+    return len(scheduler.active)
+}
+
+// ===================================================================
+//  Pending queue length
+// ===================================================================
+fn pending_count(scheduler) {
+    return len(scheduler.pending)
+}
+
+println("[continuous_batching] loaded — iteration-level scheduling with dynamic slots")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

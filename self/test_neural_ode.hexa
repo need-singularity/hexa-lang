@@ -14,7 +14,371 @@
 //  Run: ./hexa self/test_neural_ode.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/neural_ode.hexa"
+// -- inlined from self/ml/neural_ode.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/neural_ode.hexa — Neural ODE (continuous-depth network)
+//
+//  Continuous-depth neural networks via ODE solvers.
+//  dx/dt = f(x, t) where f is a neural network.
+//
+//  Implements:
+//    1. Euler solver       — first-order, x(t+dt) = x(t) + dt*f(x,t)
+//    2. RK4 solver         — 4th-order Runge-Kutta
+//    3. Adaptive step      — error-based step size control
+//    4. Neural ODE forward — integrate from t0 to t1
+//    5. Adjoint method     — memory-efficient backward (reverse-time ODE)
+//
+//  API:
+//    node_euler(x0, t0, t1, n_steps, f, params, d)
+//    node_rk4(x0, t0, t1, n_steps, f, params, d)
+//    node_adaptive(x0, t0, t1, tol, f, params, d)
+//    node_adjoint_backward(x_final, t0, t1, n_steps, f, params, d)
+//    node_linear_field(x, t, W, b, d)
+//    node_constant_field(x, t, c, d)
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @hot      — called every integration step
+//    @fuse     — RK4 stages fused
+// ═══════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────
+
+fn node_zeros(d) {
+    let mut v = []
+    for _i in 0..d {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn node_fabs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+fn node_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn node_min_f(a, b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+// ── vector operations ────────────────────────────────────────
+
+fn node_vadd(a, b, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        r[i] = a[i] + b[i]
+    }
+    return r
+}
+
+fn node_vsub(a, b, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        r[i] = a[i] - b[i]
+    }
+    return r
+}
+
+fn node_vscale(a, s, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        r[i] = a[i] * s
+    }
+    return r
+}
+
+fn node_vnorm(a, d) {
+    let mut s = 0.0
+    for i in 0..d {
+        s = s + a[i] * a[i]
+    }
+    return sqrt(s)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ODE field functions (dynamics f(x, t))
+// ═══════════════════════════════════════════════════════════════
+
+// Constant field: dx/dt = c (constant vector)
+@pure
+fn node_constant_field(x, t, c, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        r[i] = c[i]
+    }
+    return r
+}
+
+// Linear field: dx/dt = W @ x + b
+@pure
+fn node_linear_field(x, t, W, b, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        let mut acc = b[i]
+        for j in 0..d {
+            acc = acc + W[i][j] * x[j]
+        }
+        r[i] = acc
+    }
+    return r
+}
+
+// Nonlinear field: dx/dt = tanh(W @ x + b)
+// (tanh approximation for HEXA: (e^2x - 1)/(e^2x + 1))
+@pure
+fn node_tanh_field(x, t, W, b, d) {
+    let mut r = node_zeros(d)
+    for i in 0..d {
+        let mut acc = b[i]
+        for j in 0..d {
+            acc = acc + W[i][j] * x[j]
+        }
+        // tanh(acc)
+        let e2 = exp(2.0 * acc)
+        r[i] = (e2 - 1.0) / (e2 + 1.0)
+    }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Euler solver: x(t+dt) = x(t) + dt * f(x(t), t)
+//  Simple first-order, O(dt) local error
+// ═══════════════════════════════════════════════════════════════
+@hot
+fn node_euler_constant(x0, t0, t1, n_steps, c, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut t = t0
+    for _step in 0..n_steps {
+        let k = node_constant_field(x, t, c, d)
+        for i in 0..d {
+            x[i] = x[i] + dt * k[i]
+        }
+        t = t + dt
+    }
+    return x
+}
+
+@hot
+fn node_euler_linear(x0, t0, t1, n_steps, W, b, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut t = t0
+    for _step in 0..n_steps {
+        let k = node_linear_field(x, t, W, b, d)
+        for i in 0..d {
+            x[i] = x[i] + dt * k[i]
+        }
+        t = t + dt
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  RK4 solver: 4th-order Runge-Kutta
+//    k1 = f(x, t)
+//    k2 = f(x + dt/2*k1, t + dt/2)
+//    k3 = f(x + dt/2*k2, t + dt/2)
+//    k4 = f(x + dt*k3, t + dt)
+//    x_next = x + (dt/6)*(k1 + 2*k2 + 2*k3 + k4)
+// ═══════════════════════════════════════════════════════════════
+@hot @fuse
+fn node_rk4_constant(x0, t0, t1, n_steps, c, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut t = t0
+    for _step in 0..n_steps {
+        let k1 = node_constant_field(x, t, c, d)
+        let x2 = node_vadd(x, node_vscale(k1, dt / 2.0, d), d)
+        let k2 = node_constant_field(x2, t + dt / 2.0, c, d)
+        let x3 = node_vadd(x, node_vscale(k2, dt / 2.0, d), d)
+        let k3 = node_constant_field(x3, t + dt / 2.0, c, d)
+        let x4 = node_vadd(x, node_vscale(k3, dt, d), d)
+        let k4 = node_constant_field(x4, t + dt, c, d)
+
+        for i in 0..d {
+            x[i] = x[i] + (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+        }
+        t = t + dt
+    }
+    return x
+}
+
+@hot @fuse
+fn node_rk4_linear(x0, t0, t1, n_steps, W, b, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut t = t0
+    for _step in 0..n_steps {
+        let k1 = node_linear_field(x, t, W, b, d)
+        let x2 = node_vadd(x, node_vscale(k1, dt / 2.0, d), d)
+        let k2 = node_linear_field(x2, t + dt / 2.0, W, b, d)
+        let x3 = node_vadd(x, node_vscale(k2, dt / 2.0, d), d)
+        let k3 = node_linear_field(x3, t + dt / 2.0, W, b, d)
+        let x4 = node_vadd(x, node_vscale(k3, dt, d), d)
+        let k4 = node_linear_field(x4, t + dt, W, b, d)
+
+        for i in 0..d {
+            x[i] = x[i] + (dt / 6.0) * (k1[i] + 2.0 * k2[i] + 2.0 * k3[i] + k4[i])
+        }
+        t = t + dt
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Adaptive step-size Euler with error estimation
+//  Uses step doubling: compare full step vs two half steps
+//  Returns: x_final (use node_adaptive_steps for step count)
+// ═══════════════════════════════════════════════════════════════
+let mut NODE_ADAPTIVE_STEPS = 0
+
+fn node_adaptive_get_steps() {
+    return NODE_ADAPTIVE_STEPS
+}
+
+fn node_adaptive_linear(x0, t0, t1, tol, W, b, d) {
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut t = t0
+    let mut dt = (t1 - t0) / 10.0
+    let mut steps = 0
+    let max_steps = 10000
+
+    for _guard in 0..max_steps {
+        if t >= t1 - 1.0e-12 {
+            NODE_ADAPTIVE_STEPS = steps
+            return x
+        }
+        // clamp dt so we don't overshoot
+        if t + dt > t1 {
+            dt = t1 - t
+        }
+
+        // full step
+        let k_full = node_linear_field(x, t, W, b, d)
+        let x_full = node_vadd(x, node_vscale(k_full, dt, d), d)
+
+        // two half steps
+        let half_dt = dt / 2.0
+        let k_h1 = node_linear_field(x, t, W, b, d)
+        let x_mid = node_vadd(x, node_vscale(k_h1, half_dt, d), d)
+        let k_h2 = node_linear_field(x_mid, t + half_dt, W, b, d)
+        let x_half = node_vadd(x_mid, node_vscale(k_h2, half_dt, d), d)
+
+        // error estimate
+        let err_vec = node_vsub(x_half, x_full, d)
+        let err = node_vnorm(err_vec, d)
+
+        if err < tol {
+            // accept step (use the more accurate half-step result)
+            x = x_half
+            t = t + dt
+            steps = steps + 1
+            // try to grow step
+            if err > 1.0e-15 {
+                dt = dt * node_min_f(2.0, 0.9 * sqrt(tol / err))
+            } else {
+                dt = dt * 2.0
+            }
+        } else {
+            // reject step, shrink dt
+            dt = dt * node_max_f(0.1, 0.9 * sqrt(tol / err))
+        }
+    }
+    NODE_ADAPTIVE_STEPS = steps
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Adjoint method: backward pass via reverse-time ODE
+//  Computes dL/dx0 given dL/dx_final = adjoint_final
+//  Integrates adjoint ODE backwards: da/dt = -a^T * df/dx
+//  For linear field f(x) = Wx+b: df/dx = W, so da/dt = -a^T W
+//    => a(t) evolves as: a_i(t-dt) = a_i(t) + dt * sum_j(a_j * W[j][i])
+// ═══════════════════════════════════════════════════════════════
+fn node_adjoint_backward_linear(adjoint_final, t0, t1, n_steps, W, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut a = node_zeros(d)
+    for i in 0..d {
+        a[i] = adjoint_final[i]
+    }
+
+    // Reverse-time integration: from t1 back to t0
+    // The adjoint ODE in reverse time s = T-t is:
+    //   da/ds = (df/dx)^T @ a = W^T @ a
+    // So each backward step: a(s+ds) = a(s) + ds * W^T @ a
+    for _step in 0..n_steps {
+        let mut da = node_zeros(d)
+        for i in 0..d {
+            let mut acc = 0.0
+            for j in 0..d {
+                // W^T[i][j] = W[j][i]
+                acc = acc + W[j][i] * a[j]
+            }
+            da[i] = acc
+        }
+        for i in 0..d {
+            a[i] = a[i] + dt * da[i]
+        }
+    }
+    return a
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Trajectory recording: returns list of states at each step
+// ═══════════════════════════════════════════════════════════════
+fn node_trajectory_linear(x0, t0, t1, n_steps, W, b, d) {
+    let dt = (t1 - t0) / (n_steps * 1.0)
+    let mut x = node_zeros(d)
+    for i in 0..d {
+        x[i] = x0[i]
+    }
+    let mut traj = [x]
+    let mut t = t0
+    for _step in 0..n_steps {
+        let k = node_linear_field(x, t, W, b, d)
+        let mut x_new = node_zeros(d)
+        for i in 0..d {
+            x_new[i] = x[i] + dt * k[i]
+        }
+        x = x_new
+        traj = traj + [x]
+        t = t + dt
+    }
+    return traj
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

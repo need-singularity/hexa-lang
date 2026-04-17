@@ -42,7 +42,493 @@
 //    PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_jepa.hexa
 // ===================================================================
 
-import "ml/jepa.hexa"
+// -- inlined from self/ml/jepa.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/jepa.hexa — Joint Embedding Predictive Architecture (#219)
+//
+//  JEPA learns visual world models in *representation space* rather
+//  than pixel space. Three components:
+//
+//    (a) context encoder f_theta — small MLP encoder
+//    (b) target  encoder f_xi    — EMA copy of context encoder
+//    (c) predictor g_phi         — maps context latent → predicted
+//                                   target latent of masked patches
+//
+//  Training:
+//    1. split input into patches
+//    2. mask a subset of patches (visible vs masked ids)
+//    3. encode visible patches with context encoder → ctx
+//    4. encode all patches with target encoder (no-grad) → tgt
+//    5. predict target latents from ctx with predictor → pred
+//    6. minimise L2(pred, tgt[masked]) + VICReg variance/covariance
+//    7. EMA update target encoder from context encoder
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects (deterministic)
+//    @hot   — inner loops (no dict mutation here)
+//
+//  All ops pure .hexa, deterministic, prefix `jepa_`.
+// ===================================================================
+
+// ── math helpers ────────────────────────────────────────────────
+
+@pure
+fn jepa_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+@pure
+fn jepa_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+@pure
+fn jepa_min(a, b) {
+    if a < b { return a }
+    return b
+}
+
+@pure
+fn jepa_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+@pure
+fn jepa_relu(x) {
+    if x > 0.0 { return x }
+    return 0.0
+}
+
+// hinge(t) = max(0, t)
+@pure
+fn jepa_hinge(t) {
+    if t > 0.0 { return t }
+    return 0.0
+}
+
+// ── vector / matrix utilities ───────────────────────────────────
+
+@pure
+fn jepa_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+@pure
+fn jepa_zeros_int(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0] }
+    return v
+}
+
+@pure
+fn jepa_ones(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [1.0] }
+    return v
+}
+
+@pure
+fn jepa_vec_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] + b[i]] }
+    return out
+}
+
+@pure
+fn jepa_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    for i in 0..n { out = out + [a[i] - b[i]] }
+    return out
+}
+
+@pure
+fn jepa_vec_scale(v, s) {
+    let n = len(v)
+    let mut out = []
+    for i in 0..n { out = out + [v[i] * s] }
+    return out
+}
+
+@pure
+fn jepa_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+@pure
+fn jepa_norm(v) {
+    return jepa_sqrt(jepa_dot(v, v))
+}
+
+// L2-normalise; ||z|| == 1 (or zero if input is zero)
+@pure
+fn jepa_normalize_latent(z, dim) {
+    let nrm = jepa_norm(z)
+    if nrm < 1.0e-12 { return jepa_zeros(dim) }
+    let mut out = []
+    for i in 0..dim { out = out + [z[i] / nrm] }
+    return out
+}
+
+// Deterministic weight init: row-major flat [out_dim * in_dim]
+@pure
+fn jepa_init_weight(out_dim, in_dim, seed) {
+    let scale = 1.0 / jepa_sqrt(to_float(in_dim))
+    let n = out_dim * in_dim
+    let mut w = []
+    for k in 0..n {
+        let r = k / in_dim
+        let c = k % in_dim
+        let h = (r * 137 + c * 311 + seed * 7919) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 2.0 * scale
+        w = w + [val]
+    }
+    return w
+}
+
+@pure
+fn jepa_init_bias(dim, seed) {
+    let mut b = []
+    for i in 0..dim {
+        let h = (i * 251 + seed * 6173) % 10007
+        let val = (to_float(h) / 10007.0 - 0.5) * 0.02
+        b = b + [val]
+    }
+    return b
+}
+
+// y = W*x + b   (W flat row-major [out x in])
+@pure
+fn jepa_linear(x, w, b, in_dim, out_dim) {
+    let mut out = []
+    for i in 0..out_dim {
+        let mut s = b[i]
+        for j in 0..in_dim {
+            s = s + w[i * in_dim + j] * x[j]
+        }
+        out = out + [s]
+    }
+    return out
+}
+
+// ── (a) context / target encoder ─────────────────────────────────
+//
+//  Two-layer MLP encoder:
+//    h = relu(W1 x + b1)
+//    z = W2 h + b2
+//
+//  Returns parameter dict-of-arrays (no mutation; pure recreation).
+//  We use a #{} dict so the same struct can hold context and target.
+// =================================================================
+
+@pure
+fn jepa_create_encoder(input_dim, hidden_dim, out_dim) {
+    let W1 = jepa_init_weight(hidden_dim, input_dim, 11)
+    let b1 = jepa_init_bias(hidden_dim, 13)
+    let W2 = jepa_init_weight(out_dim, hidden_dim, 17)
+    let b2 = jepa_init_bias(out_dim, 19)
+    return #{
+        "W1": W1,
+        "b1": b1,
+        "W2": W2,
+        "b2": b2,
+        "input_dim": input_dim,
+        "hidden_dim": hidden_dim,
+        "out_dim": out_dim
+    }
+}
+
+@pure
+fn jepa_encoder_forward(enc, x, input_dim, hidden_dim, out_dim) {
+    let W1 = enc["W1"]
+    let b1 = enc["b1"]
+    let W2 = enc["W2"]
+    let b2 = enc["b2"]
+    let pre = jepa_linear(x, W1, b1, input_dim, hidden_dim)
+    let mut h = []
+    for i in 0..hidden_dim { h = h + [jepa_relu(pre[i])] }
+    let z = jepa_linear(h, W2, b2, hidden_dim, out_dim)
+    return z
+}
+
+// ── (c) predictor network ────────────────────────────────────────
+//
+//  Single linear projection ctx_dim → tgt_dim. Kept tiny on purpose.
+// =================================================================
+
+@pure
+fn jepa_create_predictor(ctx_dim, tgt_dim) {
+    let W = jepa_init_weight(tgt_dim, ctx_dim, 23)
+    let b = jepa_init_bias(tgt_dim, 29)
+    return #{
+        "W_pred": W,
+        "b_pred": b,
+        "ctx_dim": ctx_dim,
+        "tgt_dim": tgt_dim
+    }
+}
+
+@pure
+fn jepa_predictor_forward(pred, ctx_latent, ctx_dim, tgt_dim) {
+    let W = pred["W_pred"]
+    let b = pred["b_pred"]
+    return jepa_linear(ctx_latent, W, b, ctx_dim, tgt_dim)
+}
+
+// ── (b) EMA target encoder update ───────────────────────────────
+//
+//  target_new = tau * target_old + (1 - tau) * context
+//
+//  Operates element-wise across n params.
+// =================================================================
+
+@pure
+fn jepa_ema_update(target_params, context_params, tau, n) {
+    let mut out = []
+    for i in 0..n {
+        let v = tau * target_params[i] + (1.0 - tau) * context_params[i]
+        out = out + [v]
+    }
+    return out
+}
+
+// Apply EMA to a full encoder dict (W1/b1/W2/b2). Returns a fresh
+// encoder dict with updated parameters; does NOT mutate the input.
+@pure
+fn jepa_ema_update_encoder(target_enc, context_enc, tau) {
+    let in_d  = target_enc["input_dim"]
+    let hid_d = target_enc["hidden_dim"]
+    let out_d = target_enc["out_dim"]
+    let W1n = jepa_ema_update(target_enc["W1"], context_enc["W1"], tau, hid_d * in_d)
+    let b1n = jepa_ema_update(target_enc["b1"], context_enc["b1"], tau, hid_d)
+    let W2n = jepa_ema_update(target_enc["W2"], context_enc["W2"], tau, out_d * hid_d)
+    let b2n = jepa_ema_update(target_enc["b2"], context_enc["b2"], tau, out_d)
+    return #{
+        "W1": W1n,
+        "b1": b1n,
+        "W2": W2n,
+        "b2": b2n,
+        "input_dim": in_d,
+        "hidden_dim": hid_d,
+        "out_dim": out_d
+    }
+}
+
+// ── patch masking ────────────────────────────────────────────────
+//
+//  Splits the index range [0, n_patches) into a deterministic
+//  visible/masked partition. Returns [visible_ids, masked_ids].
+//
+//  We do not actually use `x` for masking — only the count — but
+//  accept it to match the spec API.
+// =================================================================
+
+@pure
+fn jepa_mask_patches(x, n_patches, n_masked, seed) {
+    if n_masked < 0 { return [[], []] }
+    let mut nm = n_masked
+    if nm > n_patches { nm = n_patches }
+    // Deterministic priority score per patch using hashed seed.
+    let mut scores = []
+    for i in 0..n_patches {
+        let h = (i * 2654435761 + seed * 1315423911) % 1000003
+        let mut hh = h
+        if hh < 0 { hh = 0 - hh }
+        scores = scores + [hh]
+    }
+    // Pick the `nm` patches with the largest scores → masked ids.
+    // Selection sort over indices (n_patches is small in tests).
+    let mut indices = []
+    for i in 0..n_patches { indices = indices + [i] }
+    for i in 0..nm {
+        let mut best = i
+        for j in (i + 1)..n_patches {
+            if scores[indices[j]] > scores[indices[best]] {
+                best = j
+            }
+        }
+        if best != i {
+            let tmp = indices[i]
+            indices[i] = indices[best]
+            indices[best] = tmp
+        }
+    }
+    let mut masked_ids = []
+    for i in 0..nm { masked_ids = masked_ids + [indices[i]] }
+    let mut visible_ids = []
+    for i in nm..n_patches { visible_ids = visible_ids + [indices[i]] }
+    return [visible_ids, masked_ids]
+}
+
+// ── losses ──────────────────────────────────────────────────────
+
+// MSE between two latent vectors of length n.
+@pure
+fn jepa_l2_loss(pred, target, n) {
+    let mut s = 0.0
+    for i in 0..n {
+        let d = pred[i] - target[i]
+        s = s + d * d
+    }
+    return s / to_float(n)
+}
+
+// VICReg variance regularizer:
+//   per-dim std over a batch of latents, hinge(1 - std).
+//   `latents` is [n_samples, dim].
+@pure
+fn jepa_variance_reg(latents, n, dim) {
+    if n <= 1 { return 0.0 }
+    let inv_n = 1.0 / to_float(n)
+    let mut total = 0.0
+    for d in 0..dim {
+        let mut mean = 0.0
+        for i in 0..n { mean = mean + latents[i][d] }
+        mean = mean * inv_n
+        let mut var = 0.0
+        for i in 0..n {
+            let diff = latents[i][d] - mean
+            var = var + diff * diff
+        }
+        var = var * inv_n
+        let std = jepa_sqrt(var + 1.0e-4)
+        total = total + jepa_hinge(1.0 - std)
+    }
+    return total / to_float(dim)
+}
+
+// VICReg covariance regularizer:
+//   sum of squared off-diagonal entries of the dim*dim covariance.
+@pure
+fn jepa_covariance_reg(latents, n, dim) {
+    if n <= 1 { return 0.0 }
+    let inv_n = 1.0 / to_float(n)
+    // means
+    let mut means = []
+    for d in 0..dim {
+        let mut m = 0.0
+        for i in 0..n { m = m + latents[i][d] }
+        means = means + [m * inv_n]
+    }
+    // off-diagonal sum of squares
+    let mut total = 0.0
+    for a in 0..dim {
+        for b in 0..dim {
+            if a != b {
+                let mut c = 0.0
+                for i in 0..n {
+                    c = c + (latents[i][a] - means[a]) * (latents[i][b] - means[b])
+                }
+                c = c * inv_n
+                total = total + c * c
+            }
+        }
+    }
+    return total / to_float(dim)
+}
+
+// VICReg combined loss:
+//   L = lam * L2(pred, target) + mu * var_reg(target) + nu * cov_reg(target)
+//
+//   pred, target are batches: [n_samples, dim]
+@pure
+fn jepa_vicreg_loss(pred, target, invariance_weight, variance_weight, covariance_weight, dim) {
+    let n_pred = len(pred)
+    let n_tgt  = len(target)
+    let n = if n_pred < n_tgt { n_pred } else { n_tgt }
+    if n == 0 { return 0.0 }
+    // invariance term: average L2 over the batch
+    let mut inv_term = 0.0
+    for i in 0..n {
+        inv_term = inv_term + jepa_l2_loss(pred[i], target[i], dim)
+    }
+    inv_term = inv_term / to_float(n)
+    let var_term = jepa_variance_reg(target, n, dim)
+    let cov_term = jepa_covariance_reg(target, n, dim)
+    return invariance_weight * inv_term
+         + variance_weight   * var_term
+         + covariance_weight * cov_term
+}
+
+// ── train step ──────────────────────────────────────────────────
+//
+//  One JEPA training iteration. We do not implement back-prop here:
+//  the goal of this module is the *forward* objective, plus a tiny
+//  finite-difference style "gradient" on the predictor weights so
+//  the loss provably decreases between two consecutive train_steps
+//  on the same batch — enough to satisfy the property test.
+// =================================================================
+
+@pure
+fn jepa_train_step(enc_params, tgt_params, pred_params,
+                   x, mask_ids, visible_ids,
+                   input_dim, hidden_dim, out_dim, tau, lr) {
+    // 1) encode the visible patch (we keep it simple — single patch x)
+    let ctx_latent = jepa_encoder_forward(enc_params, x, input_dim, hidden_dim, out_dim)
+    // 2) encode the same input with the target encoder
+    let tgt_latent = jepa_encoder_forward(tgt_params, x, input_dim, hidden_dim, out_dim)
+    // 3) predictor: ctx → predicted target latent
+    let pred_latent = jepa_predictor_forward(pred_params, ctx_latent, out_dim, out_dim)
+    // 4) loss = L2(pred, target)
+    let loss = jepa_l2_loss(pred_latent, tgt_latent, out_dim)
+    // 5) one tiny gradient step on the predictor bias only:
+    //      dL/db = 2/n * (pred - target)
+    //    Other parameters intentionally untouched (pure forward model).
+    let W = pred_params["W_pred"]
+    let b_old = pred_params["b_pred"]
+    let mut b_new = []
+    let inv_n = 2.0 / to_float(out_dim)
+    for i in 0..out_dim {
+        let g = inv_n * (pred_latent[i] - tgt_latent[i])
+        b_new = b_new + [b_old[i] - lr * g]
+    }
+    let new_pred = #{
+        "W_pred": W,
+        "b_pred": b_new,
+        "ctx_dim": pred_params["ctx_dim"],
+        "tgt_dim": pred_params["tgt_dim"]
+    }
+    // 6) EMA update on the target encoder
+    let new_tgt = jepa_ema_update_encoder(tgt_params, enc_params, tau)
+    return #{
+        "enc": enc_params,
+        "tgt": new_tgt,
+        "pred": new_pred,
+        "loss": loss
+    }
+}
+
+// ── parameter count helper ──────────────────────────────────────
+
+@pure
+fn jepa_param_count(enc, pred) {
+    let in_d  = enc["input_dim"]
+    let hid_d = enc["hidden_dim"]
+    let out_d = enc["out_dim"]
+    let enc_p = in_d * hid_d + hid_d + hid_d * out_d + out_d
+    let p_in  = pred["ctx_dim"]
+    let p_out = pred["tgt_dim"]
+    let pred_p = p_in * p_out + p_out
+    // Two encoders (context + EMA target) + predictor
+    return enc_p * 2 + pred_p
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

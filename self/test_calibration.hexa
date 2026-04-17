@@ -1,6 +1,423 @@
 // test_calibration.hexa — tests for self/ml/calibration.hexa
 
-import "ml/calibration.hexa"
+// -- inlined from self/ml/calibration.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/calibration.hexa — Model Calibration & Uncertainty
+//
+//  Pure .hexa implementation of calibration and uncertainty estimation
+//  for ML models. No C/FFI, no external dependencies.
+//
+//  Public API:
+//    softmax(logits)                          -> [float]
+//    temperature_scale(logits, temperature)   -> [float]
+//    calibration_error(predictions, labels, num_bins) -> float  (ECE)
+//    platt_scaling(logits, labels, lr, steps) -> dict
+//    entropy(probs)                           -> float
+//    mutual_information(probs_list)           -> float
+//    mc_dropout_uncertainty(logits_samples)   -> dict
+//
+//  AI-NATIVE attrs: @pure (no side effects)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── local math helpers ──────────────────────────────────────────────
+
+fn _cal_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _cal_exp(x) {
+    // clamp to avoid overflow
+    let mut v = x
+    if v > 709.0 { v = 709.0 }
+    if v < -709.0 { v = -709.0 }
+    // Taylor series with range reduction: e^x = 2^k * e^r
+    // reduce to |r| < 0.5*ln2
+    let ln2 = 0.69314718055994530942
+    let inv_ln2 = 1.44269504088896340736
+    let k_f = v * inv_ln2
+    let mut k = 0
+    if k_f >= 0.0 {
+        k = to_int(k_f + 0.5)
+    } else {
+        k = to_int(k_f - 0.5)
+    }
+    let r = v - to_float(k) * ln2
+    // e^r via Horner (13 terms)
+    let mut er = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i <= 20 {
+        term = term * r / to_float(i)
+        er = er + term
+        if _cal_abs(term) < 1.0e-15 { i = 21 } else { i = i + 1 }
+    }
+    // multiply by 2^k
+    let mut pow2 = 1.0
+    if k > 0 {
+        let mut j = 0
+        while j < k {
+            pow2 = pow2 * 2.0
+            j = j + 1
+        }
+    }
+    if k < 0 {
+        let mut j = 0
+        let ak = 0 - k
+        while j < ak {
+            pow2 = pow2 * 0.5
+            j = j + 1
+        }
+    }
+    return er * pow2
+}
+
+fn _cal_log(x) {
+    if x <= 0.0 { return -999999.0 }
+    // ln via Newton: converge y where e^y = x
+    let mut y = 0.0
+    // initial guess: rough log2
+    let mut t = x
+    if t > 1.0 {
+        while t > 2.0 {
+            t = t * 0.5
+            y = y + 0.69314718055994530942
+        }
+    } else {
+        while t < 0.5 {
+            t = t * 2.0
+            y = y - 0.69314718055994530942
+        }
+    }
+    // Newton: y_{n+1} = y_n + 2*(x - e^y_n)/(x + e^y_n)  (Halley-like)
+    let mut iter = 0
+    while iter < 60 {
+        let ey = _cal_exp(y)
+        let diff = x - ey
+        if _cal_abs(diff) < _cal_abs(x) * 1.0e-15 { iter = 60 } else {
+            y = y + diff / ey
+            iter = iter + 1
+        }
+    }
+    return y
+}
+
+fn _cal_max_arr(arr) {
+    let mut mx = arr[0]
+    let n = len(arr)
+    let mut i = 1
+    while i < n {
+        if arr[i] > mx { mx = arr[i] }
+        i = i + 1
+    }
+    return mx
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  softmax — numerically stable
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn softmax(logits) {
+    let n = len(logits)
+    let mx = _cal_max_arr(logits)
+    let mut exps = []
+    let mut sum_exp = 0.0
+    let mut i = 0
+    while i < n {
+        let e = _cal_exp(logits[i] - mx)
+        exps = exps.push(e)
+        sum_exp = sum_exp + e
+        i = i + 1
+    }
+    let mut out = []
+    i = 0
+    while i < n {
+        out = out.push(exps[i] / sum_exp)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  temperature_scale — scale logits by temperature before softmax
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn temperature_scale(logits, temperature) {
+    let n = len(logits)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(logits[i] / temperature)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  calibration_error — Expected Calibration Error (ECE)
+//
+//  predictions: [[float]] — each row is a probability distribution
+//  labels: [int] — true class indices
+//  num_bins: int — number of confidence bins
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn calibration_error(predictions, labels, num_bins) {
+    let n = len(predictions)
+    if n == 0 { return 0.0 }
+
+    // bin counts, bin accuracy sums, bin confidence sums
+    let mut bin_count = []
+    let mut bin_acc = []
+    let mut bin_conf = []
+    let mut b = 0
+    while b < num_bins {
+        bin_count = bin_count.push(0)
+        bin_acc = bin_acc.push(0.0)
+        bin_conf = bin_conf.push(0.0)
+        b = b + 1
+    }
+
+    let mut i = 0
+    while i < n {
+        let probs = predictions[i]
+        // find max probability (confidence) and predicted class
+        let mut max_p = probs[0]
+        let mut pred_cls = 0
+        let nc = len(probs)
+        let mut j = 1
+        while j < nc {
+            if probs[j] > max_p {
+                max_p = probs[j]
+                pred_cls = j
+            }
+            j = j + 1
+        }
+
+        // assign to bin
+        let mut bin_idx = to_int(max_p * to_float(num_bins))
+        if bin_idx >= num_bins { bin_idx = num_bins - 1 }
+        if bin_idx < 0 { bin_idx = 0 }
+
+        bin_count[bin_idx] = bin_count[bin_idx] + 1
+        bin_conf[bin_idx] = bin_conf[bin_idx] + max_p
+        if pred_cls == labels[i] {
+            bin_acc[bin_idx] = bin_acc[bin_idx] + 1.0
+        }
+        i = i + 1
+    }
+
+    // weighted average of |accuracy - confidence| per bin
+    let mut ece = 0.0
+    b = 0
+    while b < num_bins {
+        if bin_count[b] > 0 {
+            let cnt = to_float(bin_count[b])
+            let avg_acc = bin_acc[b] / cnt
+            let avg_conf = bin_conf[b] / cnt
+            ece = ece + (cnt / to_float(n)) * _cal_abs(avg_acc - avg_conf)
+        }
+        b = b + 1
+    }
+    return ece
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  platt_scaling — learn temperature and bias via gradient descent
+//
+//  Minimizes NLL loss: -sum_i log(softmax(logits_i/T + bias)[y_i])
+//  Returns {"temperature": T, "bias": B}
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn platt_scaling(logits, labels, lr, steps) {
+    let n = len(logits)
+    let num_classes = len(logits[0])
+
+    let mut temp = 1.0
+    let mut bias = 0.0
+
+    let mut step = 0
+    while step < steps {
+        // compute gradients
+        let mut grad_t = 0.0
+        let mut grad_b = 0.0
+
+        let mut i = 0
+        while i < n {
+            // scaled logits
+            let mut scaled = []
+            let mut j = 0
+            while j < num_classes {
+                scaled = scaled.push(logits[i][j] / temp + bias)
+                j = j + 1
+            }
+            let probs = softmax(scaled)
+            let y = labels[i]
+
+            // gradient of NLL w.r.t. temp:
+            //   d/dT (-log p_y) = (1/T^2) * sum_k p_k * logits_k - (1/T^2) * logits_y
+            //                   = (1/T^2) * (E[logits] - logits_y)
+            let mut mean_logit = 0.0
+            j = 0
+            while j < num_classes {
+                mean_logit = mean_logit + probs[j] * logits[i][j]
+                j = j + 1
+            }
+            grad_t = grad_t + (mean_logit - logits[i][y]) / (temp * temp)
+
+            // gradient w.r.t. bias: p_y - 1 (for correct class)
+            // d/db (-log p_y) = sum_k p_k - 1 = (p_y - 1) ... actually:
+            // d/db = sum_k (d softmax_k/db) * (-1/p_y if k==y else 0)
+            //      = p_y - 1  (standard softmax gradient for NLL)
+            grad_b = grad_b + (probs[y] - 1.0)
+
+            i = i + 1
+        }
+
+        grad_t = grad_t / to_float(n)
+        grad_b = grad_b / to_float(n)
+
+        temp = temp - lr * grad_t
+        bias = bias - lr * grad_b
+
+        // clamp temperature to positive
+        if temp < 0.01 { temp = 0.01 }
+
+        step = step + 1
+    }
+
+    return #{"temperature": temp, "bias": bias}
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  entropy — Shannon entropy H(p) = -sum p_i * log(p_i)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn entropy(probs) {
+    let n = len(probs)
+    let mut h = 0.0
+    let mut i = 0
+    while i < n {
+        if probs[i] > 1.0e-30 {
+            h = h - probs[i] * _cal_log(probs[i])
+        }
+        i = i + 1
+    }
+    return h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mutual_information — MI from ensemble predictions
+//    MI = H(mean(p)) - mean(H(p))
+//    High MI => high epistemic uncertainty
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn mutual_information(probs_list) {
+    let m = len(probs_list)
+    if m == 0 { return 0.0 }
+    let num_classes = len(probs_list[0])
+
+    // compute mean probabilities
+    let mut mean_probs = []
+    let mut c = 0
+    while c < num_classes {
+        mean_probs = mean_probs.push(0.0)
+        c = c + 1
+    }
+
+    let mut i = 0
+    while i < m {
+        c = 0
+        while c < num_classes {
+            mean_probs[c] = mean_probs[c] + probs_list[i][c]
+            c = c + 1
+        }
+        i = i + 1
+    }
+
+    c = 0
+    while c < num_classes {
+        mean_probs[c] = mean_probs[c] / to_float(m)
+        c = c + 1
+    }
+
+    // H(mean) - mean(H)
+    let h_mean = entropy(mean_probs)
+
+    let mut mean_h = 0.0
+    i = 0
+    while i < m {
+        mean_h = mean_h + entropy(probs_list[i])
+        i = i + 1
+    }
+    mean_h = mean_h / to_float(m)
+
+    return h_mean - mean_h
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  mc_dropout_uncertainty — Monte Carlo dropout uncertainty
+//
+//  logits_samples: [[float]] — multiple forward pass logit vectors
+//  Returns {"mean_probs": [float], "epistemic": float, "aleatoric": float}
+//    epistemic = MI(softmax samples) = H(mean) - mean(H)
+//    aleatoric = mean(H(softmax samples))
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn mc_dropout_uncertainty(logits_samples) {
+    let m = len(logits_samples)
+    if m == 0 { return #{"mean_probs": [], "epistemic": 0.0, "aleatoric": 0.0} }
+    let num_classes = len(logits_samples[0])
+
+    // convert all to probabilities
+    let mut probs_list = []
+    let mut i = 0
+    while i < m {
+        probs_list = probs_list.push(softmax(logits_samples[i]))
+        i = i + 1
+    }
+
+    // mean probabilities
+    let mut mean_probs = []
+    let mut c = 0
+    while c < num_classes {
+        mean_probs = mean_probs.push(0.0)
+        c = c + 1
+    }
+    i = 0
+    while i < m {
+        c = 0
+        while c < num_classes {
+            mean_probs[c] = mean_probs[c] + probs_list[i][c]
+            c = c + 1
+        }
+        i = i + 1
+    }
+    c = 0
+    while c < num_classes {
+        mean_probs[c] = mean_probs[c] / to_float(m)
+        c = c + 1
+    }
+
+    // aleatoric = mean of individual entropies
+    let mut aleatoric = 0.0
+    i = 0
+    while i < m {
+        aleatoric = aleatoric + entropy(probs_list[i])
+        i = i + 1
+    }
+    aleatoric = aleatoric / to_float(m)
+
+    // epistemic = H(mean) - aleatoric
+    let h_mean = entropy(mean_probs)
+    let epistemic = h_mean - aleatoric
+
+    return #{"mean_probs": mean_probs, "epistemic": epistemic, "aleatoric": aleatoric}
+}
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

@@ -12,7 +12,510 @@
 //      - Pass / dispatch accounting constants
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/optimizer_fuse.hexa"
+// -- inlined from self/ai_native/optimizer_fuse.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/optimizer_fuse.hexa — AI-native ROI #98
+//
+//  @optimizer_fuse — fuse `optimizer.step()` with the `zero_grad()`
+//  that follows it (or precedes the next forward). Training loops
+//  repeat the pattern
+//
+//      loss.backward()
+//      optimizer.step()     // loop over params:  p -= lr · grad
+//      optimizer.zero_grad()// loop over params:  grad = 0
+//
+//  thousands of times per training run. The naive schedule walks the
+//  parameter list twice — once to apply the update, once to clear the
+//  accumulated gradient — so every parameter tensor is streamed
+//  through the CPU cache twice in sequence, and pytorch-style
+//  implementations also re-dispatch per parameter twice.
+//
+//  The fused kernel performs both writes in a single loop body:
+//
+//      for (p, g) in params:
+//          p[i] -= lr · g[i]
+//          g[i]  = 0
+//
+//  Cache locality: each param/grad pair is touched once (grad is read
+//  for the update AND written to zero on the very next cycle while
+//  still live in L1). Dispatch overhead: halved. Memory traffic for
+//  grad: 2 reads + 1 write → 1 read + 1 write (the zeroing write
+//  replaces the second read). Net: ~2–3× training-step overhead
+//  reduction on CPU, especially when the parameter count is large
+//  relative to the useful FLOPs per step (small models, early
+//  training, LoRA-adapter fine-tunes).
+//
+//  Supported optimizers (all in a single file, one _impl + one pub):
+//      SGD                    (plain)
+//      SGD + momentum         (Polyak heavy-ball)
+//      SGD + weight_decay     (L2 regularization)
+//      SGD + momentum + wd    (full classic SGD)
+//      Adam                   (Kingma & Ba 2014)
+//      AdamW                  (Loshchilov & Hutter 2019 — decoupled wd)
+//
+//  Naming convention (used in the test suite):
+//      *_step_naive      — applies update, returns NEW params + grads
+//                          separately (grads kept, caller zeros later)
+//      *_zero_grad       — returns a zeroed gradient tensor (naive
+//                          second pass)
+//      *_step_fused      — applies update AND zeros grads in ONE pass,
+//                          returns (new_params, zero_grads) pair
+//      *_step_fused_with_zero — alias of *_step_fused for clarity
+//                               at call sites that want the "and zero"
+//                               part to be explicit in the name.
+//
+//  The numerical invariant (tested):
+//      (p_n, g_n) = fused(p, g, ...hyper)
+//      (p_ref)   = naive_step(p, g, ...hyper)
+//      (g_ref)   = naive_zero_grad(g)
+//      => p_n ≡ p_ref   element-wise within tol 1e-8
+//      => g_n ≡ g_ref   exactly (both are zero vectors)
+//
+//  Graph rewrite (AST-level pattern matcher):
+//      Call sequence [ step(...); zero_grad(...) ]  is detected and
+//      replaced with a single fused call that performs both updates.
+//      detect_step_then_zero(calls, i) → bool
+//      rewrite_step_zero(calls)        → new call list
+//
+//  Public API:
+//      ─ numeric helpers ─
+//      abs_pure(x)                         — from math_pure.hexa
+//      sqrt_stable(x)                      — safe sqrt on non-negative
+//
+//      ─ SGD family ─
+//      sgd_step_naive(p, g, lr)            → new params
+//      sgd_step_naive_wd(p, g, lr, wd)     → new params (w decoupled wd)
+//      sgd_step_naive_mom(p, g, v, lr, mu) → (new_p, new_v)  momentum
+//      sgd_step_fused(p, g, lr)            → (new_p, zeroed_g)
+//      sgd_step_fused_wd(p, g, lr, wd)     → (new_p, zeroed_g)
+//      sgd_step_fused_mom(p, g, v, lr, mu) → (new_p, new_v, zeroed_g)
+//
+//      ─ Adam family ─
+//      adam_step_naive(p, g, m, v, lr, b1, b2, eps, t)      → full 4-tuple
+//      adam_step_fused_with_zero(p, g, m, v, lr, b1, b2, eps, t)
+//                                          → (p, m, v, zeroed_g)
+//
+//      ─ AdamW family ─
+//      adamw_step_naive(p, g, m, v, lr, b1, b2, eps, wd, t) → 4-tuple
+//      adamw_step_fused_with_zero(p, g, m, v, lr, b1, b2, eps, wd, t)
+//                                          → (p, m, v, zeroed_g)
+//
+//      ─ explicit zero_grad reference ─
+//      zero_grad_naive(g)                  → [0.0; len(g)]
+//
+//      ─ AST-level rewriter ─
+//      Call(kind, a) struct
+//      c_step_sgd(), c_step_adam(), c_step_adamw()
+//      c_zero_grad()
+//      detect_step_then_zero(cs, i) → bool
+//      rewrite_step_zero(cs)        → [Call]  (fused replacements)
+//
+//      ─ alloc / dispatch accounting ─
+//      naive_param_passes()   = 2
+//      fused_param_passes()   = 1
+//      naive_kernel_dispatches() = 2
+//      fused_kernel_dispatches() = 1
+//
+//  Grammar cautions (HX3 pitfalls):
+//      - abs → use abs_pure from math_pure.hexa
+//      - no bit ops used in the numeric kernels (Adam is pure fp)
+//      - `@attr pub fn` parse pitfall avoided → @attr fn _impl + pub
+//        fn forwarder (P14 workaround)
+//      - struct literals not valid in `if` heads
+//      - slice precedence: arr[(i+1)..j] — parens (unused here, kept
+//        for future expansion)
+//      - Tuples returned as a fixed-length [any] so no field-access
+//        ambiguity at the interpreter level.
+//
+//  AI-native attrs:
+//      @hot              — runs every training step
+//      @optimizer_fuse   — marker: step+zero_grad merged
+//      @pure             — returns new arrays; does not mutate inputs
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ────────────────────────────────────────────────────────
+
+// fabs_of98 → abs_pure (math_pure.hexa)
+
+pub fn sqrt_stable(x) {
+    // sqrt is a hexa builtin; guard against tiny-negative fp dust.
+    if x < 0.0 { return 0.0 }
+    return sqrt(x)
+}
+
+fn of98_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+fn of98_copy_1d(a) {
+    let n = len(a)
+    let mut v = []
+    for i in 0..n {
+        v.push(a[i])
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  zero_grad — reference implementation (the second pass).
+//  Allocates a fresh zero array of the same length.
+// ═══════════════════════════════════════════════════════════════════
+pub fn zero_grad_naive(g) {
+    return of98_zeros_1d(len(g))
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SGD — plain:   p := p - lr * g
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn sgd_step_naive(p, g, lr) {
+    let n = len(p)
+    let mut out = of98_zeros_1d(n)
+    for i in 0..n {
+        out[i] = p[i] - lr * g[i]
+    }
+    return out
+}
+
+// Fused SGD: one sweep — update p, zero g in the same i-iteration.
+// Returns [new_p, zeroed_g] as a 2-element array-tuple.
+@hot @optimizer_fuse @pure
+fn sgd_step_fused_impl(p, g, lr) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_g = of98_zeros_1d(n)
+    for i in 0..n {
+        new_p[i] = p[i] - lr * g[i]
+        // new_g[i] already 0.0 from of98_zeros_1d — written explicitly
+        // so the fused-path semantic is unambiguous to the reader.
+        new_g[i] = 0.0
+    }
+    return [new_p, new_g]
+}
+
+pub fn sgd_step_fused(p, g, lr) {
+    return sgd_step_fused_impl(p, g, lr)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SGD + decoupled weight decay:  p := (1 - lr*wd) * p - lr * g
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn sgd_step_naive_wd(p, g, lr, wd) {
+    let n = len(p)
+    let mut out = of98_zeros_1d(n)
+    let keep = 1.0 - lr * wd
+    for i in 0..n {
+        out[i] = keep * p[i] - lr * g[i]
+    }
+    return out
+}
+
+@hot @optimizer_fuse @pure
+fn sgd_step_fused_wd_impl(p, g, lr, wd) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_g = of98_zeros_1d(n)
+    let keep = 1.0 - lr * wd
+    for i in 0..n {
+        new_p[i] = keep * p[i] - lr * g[i]
+        new_g[i] = 0.0
+    }
+    return [new_p, new_g]
+}
+
+pub fn sgd_step_fused_wd(p, g, lr, wd) {
+    return sgd_step_fused_wd_impl(p, g, lr, wd)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  SGD + momentum (Polyak heavy ball):
+//      v := mu * v + g
+//      p := p - lr * v
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn sgd_step_naive_mom(p, g, v, lr, mu) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    for i in 0..n {
+        new_v[i] = mu * v[i] + g[i]
+        new_p[i] = p[i] - lr * new_v[i]
+    }
+    return [new_p, new_v]
+}
+
+@hot @optimizer_fuse @pure
+fn sgd_step_fused_mom_impl(p, g, v, lr, mu) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    let mut new_g = of98_zeros_1d(n)
+    for i in 0..n {
+        let vi = mu * v[i] + g[i]
+        new_v[i] = vi
+        new_p[i] = p[i] - lr * vi
+        new_g[i] = 0.0
+    }
+    return [new_p, new_v, new_g]
+}
+
+pub fn sgd_step_fused_mom(p, g, v, lr, mu) {
+    return sgd_step_fused_mom_impl(p, g, v, lr, mu)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Adam (Kingma & Ba 2014)
+//      m := b1·m + (1-b1)·g
+//      v := b2·v + (1-b2)·g²
+//      m̂  := m / (1 - b1^t)
+//      v̂  := v / (1 - b2^t)
+//      p := p - lr · m̂ / (sqrt(v̂) + eps)
+// ═══════════════════════════════════════════════════════════════════
+
+// Simple integer power — t is small (up to ~1e6 in practice, but the
+// bias-correction denominators are only well-conditioned for small t,
+// so a naive loop is fine and exact-stable for the test ranges used).
+fn of98_pow(x, k) {
+    let mut r = 1.0
+    for _i in 0..k {
+        r = r * x
+    }
+    return r
+}
+
+pub fn adam_step_naive(p, g, m, v, lr, b1, b2, eps, t) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_m = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    let b1t = of98_pow(b1, t)
+    let b2t = of98_pow(b2, t)
+    let c1 = 1.0 - b1t
+    let c2 = 1.0 - b2t
+    for i in 0..n {
+        let gi = g[i]
+        let mi = b1 * m[i] + (1.0 - b1) * gi
+        let vi = b2 * v[i] + (1.0 - b2) * gi * gi
+        new_m[i] = mi
+        new_v[i] = vi
+        let m_hat = mi / c1
+        let v_hat = vi / c2
+        new_p[i] = p[i] - lr * m_hat / (sqrt_stable(v_hat) + eps)
+    }
+    return [new_p, new_m, new_v]
+}
+
+// Fused: perform all four array updates (p, m, v, g) in one sweep.
+@hot @optimizer_fuse @pure
+fn adam_step_fused_impl(p, g, m, v, lr, b1, b2, eps, t) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_m = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    let mut new_g = of98_zeros_1d(n)
+    let b1t = of98_pow(b1, t)
+    let b2t = of98_pow(b2, t)
+    let c1 = 1.0 - b1t
+    let c2 = 1.0 - b2t
+    for i in 0..n {
+        let gi = g[i]
+        let mi = b1 * m[i] + (1.0 - b1) * gi
+        let vi = b2 * v[i] + (1.0 - b2) * gi * gi
+        new_m[i] = mi
+        new_v[i] = vi
+        let m_hat = mi / c1
+        let v_hat = vi / c2
+        new_p[i] = p[i] - lr * m_hat / (sqrt_stable(v_hat) + eps)
+        new_g[i] = 0.0
+    }
+    return [new_p, new_m, new_v, new_g]
+}
+
+pub fn adam_step_fused_with_zero(p, g, m, v, lr, b1, b2, eps, t) {
+    return adam_step_fused_impl(p, g, m, v, lr, b1, b2, eps, t)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AdamW — decoupled weight decay (Loshchilov & Hutter 2019):
+//      m, v updates unchanged (NO wd in gradient path)
+//      p := (1 - lr·wd)·p - lr · m̂ / (sqrt(v̂) + eps)
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn adamw_step_naive(p, g, m, v, lr, b1, b2, eps, wd, t) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_m = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    let b1t = of98_pow(b1, t)
+    let b2t = of98_pow(b2, t)
+    let c1 = 1.0 - b1t
+    let c2 = 1.0 - b2t
+    let keep = 1.0 - lr * wd
+    for i in 0..n {
+        let gi = g[i]
+        let mi = b1 * m[i] + (1.0 - b1) * gi
+        let vi = b2 * v[i] + (1.0 - b2) * gi * gi
+        new_m[i] = mi
+        new_v[i] = vi
+        let m_hat = mi / c1
+        let v_hat = vi / c2
+        new_p[i] = keep * p[i] - lr * m_hat / (sqrt_stable(v_hat) + eps)
+    }
+    return [new_p, new_m, new_v]
+}
+
+@hot @optimizer_fuse @pure
+fn adamw_step_fused_impl(p, g, m, v, lr, b1, b2, eps, wd, t) {
+    let n = len(p)
+    let mut new_p = of98_zeros_1d(n)
+    let mut new_m = of98_zeros_1d(n)
+    let mut new_v = of98_zeros_1d(n)
+    let mut new_g = of98_zeros_1d(n)
+    let b1t = of98_pow(b1, t)
+    let b2t = of98_pow(b2, t)
+    let c1 = 1.0 - b1t
+    let c2 = 1.0 - b2t
+    let keep = 1.0 - lr * wd
+    for i in 0..n {
+        let gi = g[i]
+        let mi = b1 * m[i] + (1.0 - b1) * gi
+        let vi = b2 * v[i] + (1.0 - b2) * gi * gi
+        new_m[i] = mi
+        new_v[i] = vi
+        let m_hat = mi / c1
+        let v_hat = vi / c2
+        new_p[i] = keep * p[i] - lr * m_hat / (sqrt_stable(v_hat) + eps)
+        new_g[i] = 0.0
+    }
+    return [new_p, new_m, new_v, new_g]
+}
+
+pub fn adamw_step_fused_with_zero(p, g, m, v, lr, b1, b2, eps, wd, t) {
+    return adamw_step_fused_impl(p, g, m, v, lr, b1, b2, eps, wd, t)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST-level pattern detection  —  @optimizer_fuse rewrite
+//
+//  The ai_native_pass scans a flattened list of `Call` nodes looking
+//  for the idiom
+//
+//      opt.step()     followed by     opt.zero_grad()
+//
+//  on the same optimizer handle. When both are found adjacently the
+//  pair is rewritten to a single fused call
+//
+//      opt.step_fused_with_zero()
+//
+//  which corresponds to the _impl kernels defined above.
+//
+//  Call kinds (string-tagged; hexa has no practical enum — P11):
+//      "step_sgd"           "step_adam"           "step_adamw"
+//      "zero_grad"          "step_fused_sgd"      "step_fused_adam"
+//      "step_fused_adamw"
+// ═══════════════════════════════════════════════════════════════════
+
+pub struct Call {
+    kind: string
+    a: string   // optimizer handle / tag (empty for non-targeted calls)
+}
+
+pub fn c_step_sgd() {
+    return Call { kind: "step_sgd", a: "" }
+}
+
+pub fn c_step_adam() {
+    return Call { kind: "step_adam", a: "" }
+}
+
+pub fn c_step_adamw() {
+    return Call { kind: "step_adamw", a: "" }
+}
+
+pub fn c_zero_grad() {
+    return Call { kind: "zero_grad", a: "" }
+}
+
+pub fn c_step_fused_sgd() {
+    return Call { kind: "step_fused_sgd", a: "" }
+}
+
+pub fn c_step_fused_adam() {
+    return Call { kind: "step_fused_adam", a: "" }
+}
+
+pub fn c_step_fused_adamw() {
+    return Call { kind: "step_fused_adamw", a: "" }
+}
+
+// Predicate: is cs[i] == step_* immediately followed by cs[i+1] ==
+// zero_grad() on the same optimizer handle? Out-of-range indices
+// short-circuit to false.
+pub fn detect_step_then_zero(cs, i) {
+    let n = len(cs)
+    if i < 0 { return false }
+    if i + 1 >= n { return false }
+    let a = cs[i]
+    let b = cs[i + 1]
+    if b.kind != "zero_grad" { return false }
+    if a.kind == "step_sgd" { return true }
+    if a.kind == "step_adam" { return true }
+    if a.kind == "step_adamw" { return true }
+    return false
+}
+
+// Returns the fused-call replacement for a step kind.
+fn fused_of(kind) {
+    if kind == "step_sgd" { return c_step_fused_sgd() }
+    if kind == "step_adam" { return c_step_fused_adam() }
+    if kind == "step_adamw" { return c_step_fused_adamw() }
+    // unknown — return an identity call so the pipeline doesn't crash
+    return Call { kind: kind, a: "" }
+}
+
+// Walk cs once and emit a new list with every
+//      [step_* , zero_grad]
+// pair collapsed to a single fused call. Non-matching calls pass
+// through unchanged, preserving order.
+pub fn rewrite_step_zero(cs) {
+    let n = len(cs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if detect_step_then_zero(cs, i) {
+            let c = cs[i]
+            out.push(fused_of(c.kind))
+            i = i + 2
+        } else {
+            out.push(cs[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pass / dispatch accounting (exposed for tests + benches).
+//      naive:  2 param passes (step loop + zero_grad loop)
+//              2 kernel dispatches
+//      fused:  1 param pass
+//              1 kernel dispatch
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn naive_param_passes() { return 2 }
+pub fn fused_param_passes() { return 1 }
+pub fn naive_kernel_dispatches() { return 2 }
+pub fn fused_kernel_dispatches() { return 1 }
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

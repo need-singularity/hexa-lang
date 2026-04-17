@@ -40,7 +40,475 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_ring_flash_attn.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/ring_flash_attn.hexa"
+// -- inlined from self/ml/ring_flash_attn.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/ring_flash_attn.hexa — Ring-FlashAttention
+//
+//  ML roadmap #221 — Ring Attention + FlashAttention block fusion
+//
+//  Combines two complementary techniques:
+//    - Ring Attention   (Liu et al. 2023): K/V sharded across ranks,
+//                       rotated ring-wise. Each rank only ever holds
+//                       seq_len / n_ranks of the KV at any moment, so
+//                       no single rank needs to materialize the full
+//                       attention matrix or even the full KV cache.
+//    - FlashAttention   (Dao et al. 2022): tiled block compute with
+//                       online softmax rescaling. Computes attention
+//                       in O(N) memory per block, never materializing
+//                       the [N, N] score matrix.
+//
+//  The fusion gives full-context attention across N ranks where each
+//  rank holds only seq_len / n_ranks KV at once, AND each rank's
+//  per-tile compute uses online-softmax rescaling so the score tile
+//  never has to be kept around — exactly the recipe used by modern
+//  long-context training (>1M tokens) systems.
+//
+//  CPU simulation: ranks are array indices, communication is modeled
+//  by KV shard rotation. Real deployment maps each rank to a GPU and
+//  rotation to NCCL send/recv. Algorithm is unchanged.
+//
+//  API (prefix rfa_):
+//    rfa_shard_kv(K, V, n_ranks, seq_len, d_head)
+//      → [list_of_K_shards, list_of_V_shards]
+//
+//    rfa_rotate_ring(shards, n_ranks, step)
+//      → shards rotated by `step` positions (step=0 identity,
+//         step=n_ranks full cycle = identity)
+//
+//    rfa_online_softmax_init(q_len, d_head)
+//      → [m, l, out] with m = -inf, l = 0, out = zeros[q_len, d_head]
+//
+//    rfa_online_softmax_update(m_old, l_old, out_old,
+//                              scores_new, V_new,
+//                              q_len, d_head, kv_len)
+//      → [m, l, out] merged via the FlashAttention-2 rescale rule
+//
+//    rfa_compute_block(Q_block, K_block, V_block, q_len, k_len, d_head)
+//      → [scores, weighted_sum] for one tile (used by ring loop)
+//
+//    rfa_finalize_output(m, l, out, q_len, d_head)
+//      → final output (divide accumulator by l)
+//
+//    rfa_ring_attention(Q, K_shards, V_shards, n_ranks, rank,
+//                       seq_len, d_head)
+//      → per-rank output [seq_len, d_head] (the simulator runs every
+//         rank's view in sequence so the full output is observable)
+//
+//    rfa_reference_attention(Q, K, V, seq_len, d_head)
+//      → non-tiled, non-ringed full softmax reference
+//
+//    rfa_causal_mask_block(scores, q_start, k_start, q_len, k_len)
+//      → applies causal mask to a tile in place
+//
+//  Helpers:
+//    rfa_row_max(row, n)         row max
+//    rfa_row_sum(row, n)         row sum
+//    rfa_exp(x)                  bounded scalar exp
+//
+//  AI-NATIVE attrs:
+//    @hot      — every forward step
+//    @parallel — ring step is independent across ranks
+//    @fuse     — online softmax fused with KV rotation
+//    @pure     — no hidden mutation
+// ═══════════════════════════════════════════════════════════════
+
+// ─── numeric helpers ─────────────────────────────────────────
+
+fn rfa_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0]
+    }
+    return v
+}
+
+fn rfa_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c {
+            row = row + [0.0]
+        }
+        m = m + [row]
+    }
+    return m
+}
+
+fn rfa_neg_inf_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v = v + [0.0 - 1.0e30]
+    }
+    return v
+}
+
+fn rfa_max_f(a, b) {
+    if a > b {
+        return a
+    }
+    return b
+}
+
+fn rfa_min_i(a, b) {
+    if a < b {
+        return a
+    }
+    return b
+}
+
+fn rfa_abs(x) {
+    if x < 0.0 {
+        return 0.0 - x
+    }
+    return x
+}
+
+// Bounded scalar exp — clamps the argument so very large/very negative
+// scores don't overflow the host exp(). Used by every softmax helper.
+fn rfa_exp(x) {
+    let mut v = x
+    if v > 50.0 {
+        v = 50.0
+    }
+    if v < 0.0 - 50.0 {
+        v = 0.0 - 50.0
+    }
+    return exp(v)
+}
+
+// Row max over the first n entries.
+fn rfa_row_max(row, n) {
+    if n <= 0 {
+        return 0.0 - 1.0e30
+    }
+    let mut m = row[0]
+    for j in 1..n {
+        if row[j] > m {
+            m = row[j]
+        }
+    }
+    return m
+}
+
+// Row sum over the first n entries.
+fn rfa_row_sum(row, n) {
+    let mut s = 0.0
+    for j in 0..n {
+        s = s + row[j]
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Reference (non-tiled, non-ringed) full attention
+//
+//  Used by tests as the ground truth that ring + flash combined must
+//  reproduce within numerical tolerance.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_reference_attention(Q, K, V, seq_len, d_head) {
+    let scale = 1.0 / sqrt(d_head * 1.0)
+    let mut out = rfa_zeros_2d(seq_len, d_head)
+
+    for i in 0..seq_len {
+        // scores[j] = Q[i] · K[j] * scale
+        let mut scores = rfa_zeros_1d(seq_len)
+        for j in 0..seq_len {
+            let mut dot = 0.0
+            for k in 0..d_head {
+                dot = dot + Q[i][k] * K[j][k]
+            }
+            scores[j] = dot * scale
+        }
+
+        // numerically stable softmax
+        let m = rfa_row_max(scores, seq_len)
+        let mut sum_exp = 0.0
+        let mut exps = rfa_zeros_1d(seq_len)
+        for j in 0..seq_len {
+            let e = rfa_exp(scores[j] - m)
+            exps[j] = e
+            sum_exp = sum_exp + e
+        }
+
+        // weighted sum of V
+        for k in 0..d_head {
+            let mut acc = 0.0
+            for j in 0..seq_len {
+                acc = acc + exps[j] * V[j][k]
+            }
+            out[i][k] = acc / sum_exp
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  KV sharding — split (K, V) into n_ranks contiguous chunks along
+//  the sequence dimension. Each chunk has seq_len / n_ranks rows.
+//
+//  Returns [K_shards, V_shards] where shards[r] is the [chunk, d_head]
+//  slice owned by rank r.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_shard_kv(K, V, n_ranks, seq_len, d_head) {
+    let chunk = seq_len / n_ranks
+
+    let mut K_shards = []
+    let mut V_shards = []
+    for r in 0..n_ranks {
+        let start = r * chunk
+        let mut Ks = []
+        let mut Vs = []
+        for i in 0..chunk {
+            let mut krow = []
+            let mut vrow = []
+            for k in 0..d_head {
+                krow = krow + [K[start + i][k]]
+                vrow = vrow + [V[start + i][k]]
+            }
+            Ks = Ks + [krow]
+            Vs = Vs + [vrow]
+        }
+        K_shards = K_shards + [Ks]
+        V_shards = V_shards + [Vs]
+    }
+    return [K_shards, V_shards]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring rotation — rotate shards by `step` positions.
+//
+//  After step=1, rank r holds what rank (r-1) used to hold (i.e. the
+//  shards shift one slot toward higher index, wrapping around). With
+//  step = n_ranks the rotation is the identity.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_rotate_ring(shards, n_ranks, step) {
+    let s = ((step % n_ranks) + n_ranks) % n_ranks
+    let mut out = []
+    for r in 0..n_ranks {
+        let src = ((r - s) % n_ranks + n_ranks) % n_ranks
+        out = out + [shards[src]]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Online softmax — initial state
+//
+//  m starts at -inf so that any first observed score wins the running
+//  max comparison. l starts at 0 so the first tile_sum is the only
+//  contribution. out starts at zeros for the same reason.
+//
+//  Returns [m, l, out] as a homogeneous list.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_online_softmax_init(q_len, d_head) {
+    let m = rfa_neg_inf_1d(q_len)
+    let l = rfa_zeros_1d(q_len)
+    let out = rfa_zeros_2d(q_len, d_head)
+    return [m, l, out]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Online softmax — merge a new tile (scores_new, V_new) into the
+//  running (m_old, l_old, out_old).
+//
+//  This is the FlashAttention-2 update rule:
+//      m_new      = max(m_old, max(scores_new))
+//      alpha      = exp(m_old - m_new)
+//      tile_sum   = sum_j exp(scores_new[j] - m_new)
+//      l_new      = l_old * alpha + tile_sum
+//      out_new    = out_old * alpha + sum_j exp(scores_new[j]-m_new) * V_new[j]
+//
+//  scores_new must be [q_len, kv_len], V_new must be [kv_len, d_head].
+// ═══════════════════════════════════════════════════════════════
+fn rfa_online_softmax_update(m_old, l_old, out_old,
+                             scores_new, V_new,
+                             q_len, d_head, kv_len) {
+    let mut m_out = rfa_zeros_1d(q_len)
+    let mut l_out = rfa_zeros_1d(q_len)
+    let mut out_out = rfa_zeros_2d(q_len, d_head)
+
+    for qi in 0..q_len {
+        // tile max
+        let row = scores_new[qi]
+        let mut tile_max = 0.0 - 1.0e30
+        for kj in 0..kv_len {
+            if row[kj] > tile_max {
+                tile_max = row[kj]
+            }
+        }
+
+        let m_new = rfa_max_f(m_old[qi], tile_max)
+        let alpha = rfa_exp(m_old[qi] - m_new)
+
+        // tile_sum + p_row
+        let mut tile_sum = 0.0
+        let mut p_row = rfa_zeros_1d(kv_len)
+        for kj in 0..kv_len {
+            let p = rfa_exp(row[kj] - m_new)
+            p_row[kj] = p
+            tile_sum = tile_sum + p
+        }
+
+        let l_new = l_old[qi] * alpha + tile_sum
+
+        // out scale + accumulate
+        for k in 0..d_head {
+            let scaled = out_old[qi][k] * alpha
+            let mut acc = scaled
+            for kj in 0..kv_len {
+                acc = acc + p_row[kj] * V_new[kj][k]
+            }
+            out_out[qi][k] = acc
+        }
+
+        m_out[qi] = m_new
+        l_out[qi] = l_new
+    }
+    return [m_out, l_out, out_out]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Compute one block — used by the ring inner loop.
+//
+//  Returns [scores, weighted_sum] where:
+//    scores        : [q_len, k_len]   raw QK^T * scale (no softmax)
+//    weighted_sum  : [q_len, d_head]  exp(scores - row_max) · V_block
+//                                     (NOT yet divided by row_sum;
+//                                      that happens in finalize)
+//
+//  This is enough for callers that already track (m, l) externally —
+//  i.e. ring_attention, which folds successive blocks via
+//  online_softmax_update.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_compute_block(Q_block, K_block, V_block, q_len, k_len, d_head) {
+    let scale = 1.0 / sqrt(d_head * 1.0)
+
+    let mut scores = rfa_zeros_2d(q_len, k_len)
+    for qi in 0..q_len {
+        for kj in 0..k_len {
+            let mut dot = 0.0
+            for k in 0..d_head {
+                dot = dot + Q_block[qi][k] * K_block[kj][k]
+            }
+            scores[qi][kj] = dot * scale
+        }
+    }
+
+    let mut weighted = rfa_zeros_2d(q_len, d_head)
+    for qi in 0..q_len {
+        let row = scores[qi]
+        let row_max = rfa_row_max(row, k_len)
+        for k in 0..d_head {
+            let mut acc = 0.0
+            for kj in 0..k_len {
+                let p = rfa_exp(row[kj] - row_max)
+                acc = acc + p * V_block[kj][k]
+            }
+            weighted[qi][k] = acc
+        }
+    }
+    return [scores, weighted]
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Finalize — divide the accumulator by l to obtain the normalized
+//  output. Mirrors the trailing reduction in FlashAttention.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_finalize_output(m, l, out, q_len, d_head) {
+    let mut final_out = rfa_zeros_2d(q_len, d_head)
+    for qi in 0..q_len {
+        let li = l[qi]
+        let inv = if li > 0.0 { 1.0 / li } else { 0.0 }
+        for k in 0..d_head {
+            final_out[qi][k] = out[qi][k] * inv
+        }
+    }
+    return final_out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Apply causal mask in place to a [q_len, k_len] score tile.
+//
+//  q_start / k_start are the absolute (global) row/col offsets of
+//  this tile inside the full attention matrix. A score is masked
+//  whenever its global key index is strictly greater than its global
+//  query index.
+// ═══════════════════════════════════════════════════════════════
+fn rfa_causal_mask_block(scores, q_start, k_start, q_len, k_len) {
+    let mut out = rfa_zeros_2d(q_len, k_len)
+    for qi in 0..q_len {
+        for kj in 0..k_len {
+            let global_q = q_start + qi
+            let global_k = k_start + kj
+            if global_k > global_q {
+                out[qi][kj] = 0.0 - 1.0e30
+            } else {
+                out[qi][kj] = scores[qi][kj]
+            }
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring Attention — full forward pass
+//
+//  Q is replicated across ranks (every rank holds the full Q for
+//  simplicity in the simulator; the production version would shard
+//  Q row-wise too). K_shards / V_shards are produced by rfa_shard_kv.
+//
+//  At each ring step the rank looks at one shard, computes the score
+//  tile via rfa_compute_block, and folds it into its running
+//  (m, l, out) accumulator with rfa_online_softmax_update. After
+//  n_ranks steps every rank has seen every shard exactly once and
+//  the accumulator is ready for finalize.
+//
+//  The `rank` argument is a placeholder for future per-rank Q
+//  sharding; in the simulator we always emit the full [seq_len,
+//  d_head] output for asserting against the reference.
+// ═══════════════════════════════════════════════════════════════
+@hot @parallel @fuse
+fn rfa_ring_attention(Q, K_shards, V_shards, n_ranks, rank, seq_len, d_head) {
+    let chunk = seq_len / n_ranks
+    let init = rfa_online_softmax_init(seq_len, d_head)
+    let mut m_acc = init[0]
+    let mut l_acc = init[1]
+    let mut out_acc = init[2]
+
+    let mut K_cur = K_shards
+    let mut V_cur = V_shards
+
+    for step in 0..n_ranks {
+        // Which original shard is currently sitting at slot 0?
+        let src0 = ((0 - step) % n_ranks + n_ranks) % n_ranks
+        let K_block = K_cur[0]
+        let V_block = V_cur[0]
+        let k_start = src0 * chunk
+
+        let block = rfa_compute_block(Q, K_block, V_block, seq_len, chunk, d_head)
+        let scores_block = block[0]
+
+        let updated = rfa_online_softmax_update(m_acc, l_acc, out_acc,
+                                                scores_block, V_block,
+                                                seq_len, d_head, chunk)
+        m_acc = updated[0]
+        l_acc = updated[1]
+        out_acc = updated[2]
+
+        // rotate shards by 1 in preparation for the next step
+        K_cur = rfa_rotate_ring(K_cur, n_ranks, 1)
+        V_cur = rfa_rotate_ring(V_cur, n_ranks, 1)
+    }
+
+    return rfa_finalize_output(m_acc, l_acc, out_acc, seq_len, d_head)
+}
+
+println("[ring_flash_attn] module loaded — ring + flash fused attention ready")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

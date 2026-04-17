@@ -16,7 +16,312 @@
 //    T12 log_det sums across layers
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/normalizing_flow.hexa"
+// -- inlined from self/ml/normalizing_flow.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/normalizing_flow.hexa — RealNVP Normalizing Flow (#249)
+//
+//  Invertible generative model for exact likelihood.
+//
+//  Implements:
+//    1. RealNVP coupling layer
+//         y1 = x1
+//         y2 = x2 * exp(s(x1)) + t(x1)
+//       Jacobian is triangular → log|det J| = sum(s(x1))
+//    2. Forward / Inverse (guaranteed invertible)
+//    3. Stacked flow (multiple coupling layers with mask alternation)
+//    4. Log-likelihood under standard Gaussian base distribution
+//    5. Sampling: z ~ N(0, I) → inverse flow → x
+//    6. Permutation between layers (swap halves)
+//
+//  API (pure):
+//    nf_zeros / nf_exp / nf_log / nf_sqrt
+//    nf_gauss_log_pdf(z)                       -> float
+//    nf_mlp_forward(x, w1, b1, w2, b2)          -> [float]
+//    nf_coupling_forward(x, mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t) -> [y, log_det]
+//    nf_coupling_inverse(y, mask, ...)          -> [x]
+//    nf_flow_forward(x, layers)                 -> [z, log_det]
+//    nf_flow_inverse(z, layers)                 -> [x]
+//    nf_log_prob(x, layers)                     -> float
+//    nf_sample(z, layers)                       -> [x]
+//    nf_make_mask(d, alternate)                 -> [int]
+//
+//  AI-NATIVE:
+//    @pure / @hot
+// ═══════════════════════════════════════════════════════════════════
+
+fn nf_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn nf_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..25 { g = (g + x / g) / 2.0 }
+    return g
+}
+
+fn nf_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..25 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn nf_log(x) {
+    if x <= 0.0 { return -20.0 }
+    let mut y = 0.0
+    if x > 1.0 { y = x / 2.0 }
+    if x > 10.0 { y = 2.3 }
+    for _i in 0..40 {
+        let ey = nf_exp(y)
+        if ey < 1.0e-15 { y = y + 1.0 } else {
+            y = y + (x - ey) / ey
+        }
+    }
+    return y
+}
+
+fn nf_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Standard Gaussian log pdf
+//  log p(z) = -0.5 * sum(z^2) - (d/2)*log(2*pi)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_gauss_log_pdf(z) {
+    let d = len(z)
+    let mut sq = 0.0
+    for i in 0..d { sq = sq + z[i] * z[i] }
+    return -0.5 * sq - 0.5 * to_float(d) * nf_log(6.2831853)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Simple MLP used as s, t network inside coupling layer
+//  w1: [hidden x in] flat, b1: [hidden]
+//  w2: [out x hidden] flat, b2: [out]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_tanh(x) {
+    let e2x = nf_exp(2.0 * x)
+    if e2x > 1.0e15 { return 1.0 }
+    if e2x < 1.0e-15 { return -1.0 }
+    return (e2x - 1.0) / (e2x + 1.0)
+}
+
+@pure
+fn nf_mlp_forward(x, w1, b1, w2, b2) {
+    let d_in = len(x)
+    let d_hid = len(b1)
+    let d_out = len(b2)
+    let mut hid = nf_zeros(d_hid)
+    for i in 0..d_hid {
+        let mut s = b1[i]
+        for j in 0..d_in {
+            s = s + w1[i * d_in + j] * x[j]
+        }
+        hid[i] = nf_tanh(s)
+    }
+    let mut out = nf_zeros(d_out)
+    for i in 0..d_out {
+        let mut s = b2[i]
+        for j in 0..d_hid {
+            s = s + w2[i * d_hid + j] * hid[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Mask helper — alternating 1/0/1/0 or 0/1/0/1 pattern
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_make_mask(d, alternate) {
+    let mut m = []
+    for i in 0..d {
+        if alternate == 0 {
+            if i % 2 == 0 { m = m + [1] } else { m = m + [0] }
+        } else {
+            if i % 2 == 0 { m = m + [0] } else { m = m + [1] }
+        }
+    }
+    return m
+}
+
+// extract masked-in features (indices where mask==1) as a dense vector
+// (simplification: we pass full x to s,t networks and they internally ignore via mask multiplication)
+@pure
+fn nf_mask_apply(x, mask) {
+    let d = len(x)
+    let mut out = nf_zeros(d)
+    for i in 0..d {
+        if mask[i] == 1 { out[i] = x[i] }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Coupling layer — forward
+//
+//  Convention: where mask=1 → identity copy; where mask=0 → affine transform
+//    y_i (mask=1) = x_i
+//    y_i (mask=0) = x_i * exp(s(x_masked)) + t(x_masked)
+//
+//  log|det J| = sum of s at positions where mask=0
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_coupling_forward(x, mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t) {
+    let d = len(x)
+    let x_masked = nf_mask_apply(x, mask)
+    let s_out = nf_mlp_forward(x_masked, w1s, b1s, w2s, b2s)
+    let t_out = nf_mlp_forward(x_masked, w1t, b1t, w2t, b2t)
+    let mut y = nf_zeros(d)
+    let mut log_det = 0.0
+    for i in 0..d {
+        if mask[i] == 1 {
+            y[i] = x[i]
+        } else {
+            // clamp s for numerical stability
+            let mut si = s_out[i]
+            if si > 5.0 { si = 5.0 }
+            if si < -5.0 { si = -5.0 }
+            y[i] = x[i] * nf_exp(si) + t_out[i]
+            log_det = log_det + si
+        }
+    }
+    return [y, [log_det]]
+}
+
+// Inverse: x = (y - t) * exp(-s) at mask=0, identity at mask=1
+@pure
+fn nf_coupling_inverse(y, mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t) {
+    let d = len(y)
+    // invariant: y[i]=x[i] at mask=1, so x_masked = y_masked
+    let y_masked = nf_mask_apply(y, mask)
+    let s_out = nf_mlp_forward(y_masked, w1s, b1s, w2s, b2s)
+    let t_out = nf_mlp_forward(y_masked, w1t, b1t, w2t, b2t)
+    let mut x = nf_zeros(d)
+    for i in 0..d {
+        if mask[i] == 1 {
+            x[i] = y[i]
+        } else {
+            let mut si = s_out[i]
+            if si > 5.0 { si = 5.0 }
+            if si < -5.0 { si = -5.0 }
+            x[i] = (y[i] - t_out[i]) * nf_exp(-si)
+        }
+    }
+    return x
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layered flow — list of coupling layers with alternating masks
+//
+//  Each layer represented as dict with: mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_flow_forward(x, layers) {
+    let n = len(layers)
+    let d = len(x)
+    let mut cur = nf_zeros(d)
+    for i in 0..d { cur[i] = x[i] }
+    let mut total_log_det = 0.0
+    for l in 0..n {
+        let layer = layers[l]
+        let result = nf_coupling_forward(cur,
+            layer[0], layer[1], layer[2], layer[3], layer[4],
+            layer[5], layer[6], layer[7], layer[8])
+        cur = result[0]
+        total_log_det = total_log_det + result[1][0]
+    }
+    return [cur, [total_log_det]]
+}
+
+@pure
+fn nf_flow_inverse(z, layers) {
+    let n = len(layers)
+    let d = len(z)
+    let mut cur = nf_zeros(d)
+    for i in 0..d { cur[i] = z[i] }
+    // traverse in reverse
+    for i in 0..n {
+        let idx = n - 1 - i
+        let layer = layers[idx]
+        cur = nf_coupling_inverse(cur,
+            layer[0], layer[1], layer[2], layer[3], layer[4],
+            layer[5], layer[6], layer[7], layer[8])
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Log-probability under the flow
+//    log p_X(x) = log p_Z(f(x)) + log|det df/dx|
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_log_prob(x, layers) {
+    let result = nf_flow_forward(x, layers)
+    let z = result[0]
+    let log_det = result[1][0]
+    return nf_gauss_log_pdf(z) + log_det
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Sample: z ~ N(0, I), x = f^-1(z)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn nf_pseudo_gauss(n, seed) {
+    let mut out = nf_zeros(n)
+    for i in 0..n {
+        let mut h = (seed + 1) * 2654435761 + (i + 1) * 1315423911
+        h = h % 1000003
+        if h < 0 { h = 0 - h }
+        let u = to_float(h % 10000) / 10000.0
+        out[i] = (u - 0.5) * 3.46
+    }
+    return out
+}
+
+@pure
+fn nf_sample(layers, d, seed) {
+    let z = nf_pseudo_gauss(d, seed)
+    return nf_flow_inverse(z, layers)
+}
+
+// Build a single coupling layer as a list: [mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t]
+@pure
+fn nf_make_layer(mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t) {
+    return [mask, w1s, b1s, w2s, b2s, w1t, b1t, w2t, b2t]
+}
+
+// Max absolute error between two vectors (for invertibility test)
+@pure
+fn nf_vec_max_abs_err(a, b) {
+    let n = len(a)
+    let mut max_e = 0.0
+    for i in 0..n {
+        let e = nf_abs(a[i] - b[i])
+        if e > max_e { max_e = e }
+    }
+    return max_e
+}
+
+println("[normalizing_flow] loaded — RealNVP coupling forward/inverse + log_prob + sample")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

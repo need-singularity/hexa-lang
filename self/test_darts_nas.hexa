@@ -19,7 +19,340 @@
 //  Run: ./hexa self/test_darts_nas.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/darts_nas.hexa"
+// -- inlined from self/ml/darts_nas.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/darts_nas.hexa — DARTS NAS (#277)
+//
+//  Ref: Liu et al. 2019 — "DARTS: Differentiable Architecture
+//       Search"
+//
+//  Key ideas:
+//    1. Relax the discrete search space (choose one op per edge)
+//       to a continuous mixture via a softmax over architecture
+//       parameters alpha.
+//         o_bar(feat) = sum_k softmax(alpha)_k * op_k(feat)
+//    2. Bilevel optimization:
+//         outer: minimize L_val(w*(alpha), alpha)  over alpha
+//         inner: minimize L_train(w, alpha)        over w
+//       In practice alternate single-step updates:
+//         w     <- w     - lr_w   * grad_w   L_train
+//         alpha <- alpha - lr_a * grad_a L_val  (first-order approx)
+//    3. At the end of search, discretize: keep argmax_k alpha_k
+//       on each edge → the "searched" architecture.
+//
+//  Demo search space (kept tiny to run cheaply):
+//    - Input: feature vector x ∈ R^d
+//    - Two candidate ops on a single edge:
+//         op0: linear W0 @ x + b0         (scalar out)
+//         op1: tanh(W1 @ x + b1)          (scalar out)
+//    - Mixed output:
+//         y = s0 * op0(x) + s1 * op1(x)
+//       where (s0, s1) = softmax(alpha)
+//    - Loss: MSE against a target scalar
+//    - Known ground truth regression: target = W*.x + b*
+//      → the "linear" op should win if the true function is linear
+//
+//  This is faithful to DARTS algorithmically on a tiny search
+//  space: real DARTS has 8 operations on 14 edges, bilevel opt, and
+//  cell-level topology.
+//
+//  AI-NATIVE:
+//    @pure  — forward / softmax / loss
+// ═══════════════════════════════════════════════════════════════
+
+fn dn_abs(v) {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn dn_zeros(n) {
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    return r
+}
+
+fn dn_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+@pure
+fn dn_tanh(v) {
+    let mut u = v
+    if u > 20.0 { u = 20.0 }
+    if u < (0.0 - 20.0) { u = 0.0 - 20.0 }
+    let e2 = exp(2.0 * u)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+// softmax over K logits (stable)
+@pure
+fn dn_softmax(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut exps = []
+    let mut s = 0.0
+    for i in 0..n {
+        let e = exp(logits[i] - m)
+        exps = exps + [e]
+        s = s + e
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / s] }
+    return out
+}
+
+// derivative of softmax with respect to logits:
+//   dsoftmax_i/dalpha_j = s_i * (delta_ij - s_j)
+// Given grad w.r.t. probs g, the back-prop to alpha is:
+//   grad_alpha_j = sum_i g_i * s_i * (delta_ij - s_j)
+//                = s_j * (g_j - sum_i g_i * s_i)
+@pure
+fn dn_softmax_backward(s, g) {
+    let K = len(s)
+    let mut dot = 0.0
+    for i in 0..K { dot = dot + g[i] * s[i] }
+    let mut out = []
+    for j in 0..K {
+        out = out + [s[j] * (g[j] - dot)]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Cell with K candidate ops on a single edge.
+//
+//    cell = {
+//      "alpha": [K],
+//      "W":     [K x d]  (one vector per op)
+//      "b":     [K]
+//      "d":     int
+//      "K":     int
+//    }
+//  Both ops share the same in-dim d; op0 is linear, op1 is tanh.
+// ═══════════════════════════════════════════════════════════════
+fn dn_make_cell(in_dim, seed) {
+    let K = 2
+    let mut W = []
+    let mut b = []
+    for k in 0..K {
+        let mut row = dn_zeros(in_dim)
+        for j in 0..in_dim {
+            row[j] = 0.5 * dn_hash(seed + k * 11, 0, j)
+        }
+        W = W + [row]
+        b = b + [0.1 * dn_hash(seed + k * 23, 1, 0)]
+    }
+    // initialise alpha near zero → softmax ≈ uniform
+    let alpha = [0.0, 0.0]
+    return #{
+        "alpha": alpha,
+        "W": W,
+        "b": b,
+        "d": in_dim,
+        "K": K
+    }
+}
+
+// op0: linear W0 @ feat + b0
+@pure
+fn dn_op_linear(W_row, b, feat) {
+    let d = len(feat)
+    let mut s = b
+    for j in 0..d {
+        s = s + W_row[j] * feat[j]
+    }
+    return s
+}
+
+// op1: tanh(W1 @ feat + b1)
+@pure
+fn dn_op_tanh(W_row, b, feat) {
+    return dn_tanh(dn_op_linear(W_row, b, feat))
+}
+
+// Forward: mixed output = sum_k s_k * op_k(feat)
+@pure
+fn dn_forward(cell, feat) {
+    let s = dn_softmax(cell["alpha"])
+    let W = cell["W"]
+    let b = cell["b"]
+    let op0 = dn_op_linear(W[0], b[0], feat)
+    let op1 = dn_op_tanh(W[1], b[1], feat)
+    return s[0] * op0 + s[1] * op1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Loss: MSE against scalar target
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn dn_mse(cell, feats, targets) {
+    let n = len(feats)
+    let mut s = 0.0
+    for k in 0..n {
+        let y = dn_forward(cell, feats[k])
+        let e = y - targets[k]
+        s = s + e * e
+    }
+    return s / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) Inner-loop: update op weights W, b with grad of MSE
+//
+//  For the mixed output y = s0*op0 + s1*op1,
+//    d y / d W_k[j] = s_k * d op_k / d W_k[j]
+//  For linear op0: d op0 / d W0[j] = feat[j]
+//  For tanh  op1: d op1 / d W1[j] = (1 - tanh(W1@feat+b1)^2) * feat[j]
+//
+//  Loss per sample: L = (y - target)^2, dL/dy = 2*(y - target)
+// ═══════════════════════════════════════════════════════════════
+fn dn_train_step_w(cell, feats, targets, lr) {
+    let d = cell["d"]
+    let K = cell["K"]
+    let alpha = cell["alpha"]
+    let W = cell["W"]
+    let b = cell["b"]
+    let s = dn_softmax(alpha)
+    let n = len(feats)
+    // accumulate gradients
+    let mut gW0 = dn_zeros(d)
+    let mut gW1 = dn_zeros(d)
+    let mut gb0 = 0.0
+    let mut gb1 = 0.0
+    for k in 0..n {
+        let op0 = dn_op_linear(W[0], b[0], feats[k])
+        let lin1 = dn_op_linear(W[1], b[1], feats[k])
+        let op1 = dn_tanh(lin1)
+        let y = s[0] * op0 + s[1] * op1
+        let e = y - targets[k]
+        let dy = 2.0 * e
+        // op0 grads
+        let d_op0 = s[0] * dy
+        gb0 = gb0 + d_op0
+        for j in 0..d {
+            gW0[j] = gW0[j] + d_op0 * feats[k][j]
+        }
+        // op1 grads (chain through tanh)
+        let dtanh = 1.0 - op1 * op1
+        let d_op1 = s[1] * dy * dtanh
+        gb1 = gb1 + d_op1
+        for j in 0..d {
+            gW1[j] = gW1[j] + d_op1 * feats[k][j]
+        }
+    }
+    let inv = 1.0 / to_float(n)
+    let mut new_W0 = dn_zeros(d)
+    let mut new_W1 = dn_zeros(d)
+    for j in 0..d {
+        new_W0[j] = W[0][j] - lr * gW0[j] * inv
+        new_W1[j] = W[1][j] - lr * gW1[j] * inv
+    }
+    let new_b0 = b[0] - lr * gb0 * inv
+    let new_b1 = b[1] - lr * gb1 * inv
+    let new_W = [new_W0, new_W1]
+    let new_b = [new_b0, new_b1]
+    return #{
+        "alpha": alpha,
+        "W": new_W,
+        "b": new_b,
+        "d": d,
+        "K": K
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Outer-loop: update architecture parameters alpha with grad
+//                 of VAL MSE (first-order DARTS approximation)
+//
+//  y = sum_k s_k * o_k    where s_k = softmax(alpha)_k
+//  dL/dy = 2*(y - target)
+//  dL/ds_k = dL/dy * o_k
+//  grad_alpha_j = sum_k dL/ds_k * d s_k / d alpha_j
+//               = s_j * (dL/ds_j - sum_k dL/ds_k * s_k)
+// ═══════════════════════════════════════════════════════════════
+fn dn_train_step_alpha(cell, feats, targets, lr_a) {
+    let alpha = cell["alpha"]
+    let W = cell["W"]
+    let b = cell["b"]
+    let K = cell["K"]
+    let d = cell["d"]
+    let s = dn_softmax(alpha)
+    let n = len(feats)
+    let mut grad_s = dn_zeros(K)
+    for k in 0..n {
+        let op0 = dn_op_linear(W[0], b[0], feats[k])
+        let op1 = dn_op_tanh(W[1], b[1], feats[k])
+        let y = s[0] * op0 + s[1] * op1
+        let e = y - targets[k]
+        let dy = 2.0 * e
+        grad_s[0] = grad_s[0] + dy * op0
+        grad_s[1] = grad_s[1] + dy * op1
+    }
+    let inv = 1.0 / to_float(n)
+    let mut g_s_norm = []
+    for k in 0..K { g_s_norm = g_s_norm + [grad_s[k] * inv] }
+    let g_alpha = dn_softmax_backward(s, g_s_norm)
+    let mut new_alpha = dn_zeros(K)
+    for k in 0..K {
+        new_alpha[k] = alpha[k] - lr_a * g_alpha[k]
+    }
+    return #{
+        "alpha": new_alpha,
+        "W": W,
+        "b": b,
+        "d": d,
+        "K": K
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Bilevel search loop
+//
+//  Alternates:
+//    1. Inner step: update W on training set
+//    2. Outer step: update alpha on validation set
+//  For total_steps.
+// ═══════════════════════════════════════════════════════════════
+fn dn_search(cell, train_feats, train_targets, val_feats, val_targets,
+             total_steps, lr_w, lr_a) {
+    let mut cur = cell
+    for _t in 0..total_steps {
+        cur = dn_train_step_w(cur, train_feats, train_targets, lr_w)
+        cur = dn_train_step_alpha(cur, val_feats, val_targets, lr_a)
+    }
+    return cur
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (6) Discretization: argmax over alpha → chosen op index
+// ═══════════════════════════════════════════════════════════════
+fn dn_selected_op(cell) {
+    let alpha = cell["alpha"]
+    let K = len(alpha)
+    let mut best = 0
+    let mut bv = alpha[0]
+    for k in 1..K {
+        if alpha[k] > bv { bv = alpha[k]; best = k }
+    }
+    return best
+}
+
+// Get softmax weights of the final alphas
+@pure
+fn dn_arch_weights(cell) {
+    return dn_softmax(cell["alpha"])
+}
+
+println("[darts_nas] loaded — K-op mixed edge, bilevel w/alpha SGD, argmax discretize")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

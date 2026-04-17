@@ -19,7 +19,340 @@
 //  Run: ./hexa self/test_snapshot_ensemble.hexa
 // ═══════════════════════════════════════════════════════════════
 
-import "ml/snapshot_ensemble.hexa"
+// -- inlined from self/ml/snapshot_ensemble.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/snapshot_ensemble.hexa — Snapshot Ensemble (#274)
+//
+//  Ref: Huang et al. 2017 — "Snapshot Ensembles: Train 1, get M
+//       for free"
+//
+//  Idea: use a cyclic cosine-annealing LR schedule that resets to
+//        a large learning rate every M cycles. At the END of each
+//        cycle the weights are in a local minimum; save a snapshot.
+//        After a single training run you have M models which you
+//        ensemble at inference — for roughly the cost of one model.
+//
+//  Cosine-annealing within cycle of length T (SGDR, Loshchilov 2017):
+//    lr(step) = alpha_max/2 * (1 + cos(pi * ((step mod T) / T)))
+//
+//  Snapshot capture: at step == (i+1)*T - 1 for i in 0..M
+//
+//  Ensembling (classification): simple probability averaging.
+//
+//  Demo model: same 2-layer MLP + softmax head as Deep Ensemble,
+//  but here all snapshots come from ONE training trajectory.
+//
+//  AI-NATIVE:
+//    @pure  — schedule / aggregation helpers
+// ═══════════════════════════════════════════════════════════════
+
+fn se_abs(v) {
+    if v < 0.0 { return 0.0 - v }
+    return v
+}
+
+fn se_zeros(n) {
+    let mut r = []
+    for _i in 0..n { r = r + [0.0] }
+    return r
+}
+
+fn se_zeros2d(m, n) {
+    let mut r = []
+    for _i in 0..m { r = r + [se_zeros(n)] }
+    return r
+}
+
+fn se_hash(seed, i, j) {
+    let h = (seed * 2654435761 + i * 1315423911 + j * 731) % 10007
+    return to_float(h) / 10007.0 - 0.5
+}
+
+// Taylor-series cosine for [-pi, pi] range (no builtin cos assumed)
+@pure
+fn se_cos(x) {
+    let pi = 3.141592653589793
+    // Reduce to [-pi, pi]
+    let mut v = x
+    for _i in 0..40 {
+        if v > pi { v = v - 2.0 * pi }
+    }
+    for _i in 0..40 {
+        if v < 0.0 - pi { v = v + 2.0 * pi }
+    }
+    // Taylor series: cos(v) = 1 - v^2/2! + v^4/4! - ...
+    let v2 = v * v
+    let mut term = 1.0
+    let mut result = 0.0
+    for n in 0..18 {
+        result = result + term
+        term = 0.0 - term * v2 / to_float((2 * n + 1) * (2 * n + 2))
+    }
+    return result
+}
+
+@pure
+fn se_tanh(v) {
+    let mut u = v
+    if u > 20.0 { u = 20.0 }
+    if u < (0.0 - 20.0) { u = 0.0 - 20.0 }
+    let e2 = exp(2.0 * u)
+    return (e2 - 1.0) / (e2 + 1.0)
+}
+
+@pure
+fn se_softmax(logits) {
+    let n = len(logits)
+    let mut m = logits[0]
+    for i in 1..n {
+        if logits[i] > m { m = logits[i] }
+    }
+    let mut exps = []
+    let mut s = 0.0
+    for i in 0..n {
+        let e = exp(logits[i] - m)
+        exps = exps + [e]
+        s = s + e
+    }
+    let mut out = []
+    for i in 0..n { out = out + [exps[i] / s] }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (1) Cyclic cosine-annealing learning rate
+//    cycle_len T, current step i, max learning rate alpha_max:
+//      pos = i mod T
+//      t   = pos / T   in [0, 1)
+//      lr  = (alpha_max / 2) * (1 + cos(pi * t))
+//  At t=0 lr=alpha_max, at t→1 lr→0, then restarts.
+// ═══════════════════════════════════════════════════════════════
+@pure
+fn se_cosine_lr(step, cycle_len, alpha_max) {
+    let pi = 3.141592653589793
+    let pos = step % cycle_len
+    let t = to_float(pos) / to_float(cycle_len)
+    return 0.5 * alpha_max * (1.0 + se_cos(pi * t))
+}
+
+// Check whether a step is a "snapshot step" (end of a cycle)
+@pure
+fn se_is_snapshot_step(step, cycle_len) {
+    let pos = step % cycle_len
+    return pos == cycle_len - 1
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (2) Member: 2-layer MLP with softmax head
+// ═══════════════════════════════════════════════════════════════
+fn se_init_model(in_dim, hidden, out_dim, seed) {
+    let mut W1 = se_zeros2d(hidden, in_dim)
+    let mut b1 = se_zeros(hidden)
+    let mut W2 = se_zeros2d(out_dim, hidden)
+    let mut b2 = se_zeros(out_dim)
+    for i in 0..hidden {
+        for j in 0..in_dim {
+            W1[i][j] = 0.5 * se_hash(seed, i, j)
+        }
+        b1[i] = 0.1 * se_hash(seed + 17, i, 0)
+    }
+    for i in 0..out_dim {
+        for j in 0..hidden {
+            W2[i][j] = 0.5 * se_hash(seed + 31, i, j)
+        }
+        b2[i] = 0.1 * se_hash(seed + 47, i, 0)
+    }
+    return #{
+        "W1": W1, "b1": b1, "W2": W2, "b2": b2,
+        "in_dim": in_dim, "hidden": hidden, "out_dim": out_dim
+    }
+}
+
+fn se_clone_model(model) {
+    return #{
+        "W1": model["W1"],
+        "b1": model["b1"],
+        "W2": model["W2"],
+        "b2": model["b2"],
+        "in_dim": model["in_dim"],
+        "hidden": model["hidden"],
+        "out_dim": model["out_dim"]
+    }
+}
+
+@pure
+fn se_forward_logits(model, feat) {
+    let in_dim = model["in_dim"]
+    let hidden = model["hidden"]
+    let out_dim = model["out_dim"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let W2 = model["W2"]
+    let b2 = model["b2"]
+    let mut h = se_zeros(hidden)
+    for i in 0..hidden {
+        let mut s = b1[i]
+        for j in 0..in_dim {
+            s = s + W1[i][j] * feat[j]
+        }
+        h[i] = se_tanh(s)
+    }
+    let mut logits = se_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = b2[i]
+        for j in 0..hidden {
+            s = s + W2[i][j] * h[j]
+        }
+        logits[i] = s
+    }
+    return logits
+}
+
+@pure
+fn se_forward_probs(model, feat) {
+    return se_softmax(se_forward_logits(model, feat))
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (3) Simple cross-entropy SGD step on W2/b2 only
+//    (outer layer only — keeps the demo compact. Huang et al.
+//    naturally use full SGD; shallow update still shows the
+//    LR restart mechanic.)
+//
+//  Approximation grad on W2 from softmax CE:
+//    grad_logits = p - onehot(y)
+//    grad_W2[i][j] = grad_logits[i] * h[j]
+//    grad_b2[i]    = grad_logits[i]
+// ═══════════════════════════════════════════════════════════════
+fn se_train_step(model, feats, labels, lr) {
+    let in_dim = model["in_dim"]
+    let hidden = model["hidden"]
+    let out_dim = model["out_dim"]
+    let W1 = model["W1"]
+    let b1 = model["b1"]
+    let mut W2 = model["W2"]
+    let mut b2 = model["b2"]
+    let n = len(feats)
+    // accumulate grad
+    let mut gW2 = se_zeros2d(out_dim, hidden)
+    let mut gb2 = se_zeros(out_dim)
+    for k in 0..n {
+        // forward recompute h and logits for this sample
+        let mut h_vec = se_zeros(hidden)
+        for i in 0..hidden {
+            let mut s = b1[i]
+            for j in 0..in_dim {
+                s = s + W1[i][j] * feats[k][j]
+            }
+            h_vec[i] = se_tanh(s)
+        }
+        let mut logits = se_zeros(out_dim)
+        for i in 0..out_dim {
+            let mut s = b2[i]
+            for j in 0..hidden {
+                s = s + W2[i][j] * h_vec[j]
+            }
+            logits[i] = s
+        }
+        let p = se_softmax(logits)
+        for i in 0..out_dim {
+            let mut t = 0.0
+            if i == labels[k] { t = 1.0 }
+            let dlog = p[i] - t
+            gb2[i] = gb2[i] + dlog
+            for j in 0..hidden {
+                gW2[i][j] = gW2[i][j] + dlog * h_vec[j]
+            }
+        }
+    }
+    let inv = 1.0 / to_float(n)
+    let mut new_W2 = se_zeros2d(out_dim, hidden)
+    let mut new_b2 = se_zeros(out_dim)
+    for i in 0..out_dim {
+        new_b2[i] = b2[i] - lr * gb2[i] * inv
+        for j in 0..hidden {
+            new_W2[i][j] = W2[i][j] - lr * gW2[i][j] * inv
+        }
+    }
+    return #{
+        "W1": W1, "b1": b1,
+        "W2": new_W2, "b2": new_b2,
+        "in_dim": in_dim, "hidden": hidden, "out_dim": out_dim
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (4) Full snapshot training loop
+//
+//   Returns dict:
+//     "final"     — last model
+//     "snapshots" — list of M snapshots captured at cycle boundaries
+// ═══════════════════════════════════════════════════════════════
+fn se_train(init_model, feats, labels, n_cycles, cycle_len, alpha_max) {
+    let mut model = init_model
+    let mut snapshots = []
+    let total_steps = n_cycles * cycle_len
+    for step in 0..total_steps {
+        let lr = se_cosine_lr(step, cycle_len, alpha_max)
+        model = se_train_step(model, feats, labels, lr)
+        if se_is_snapshot_step(step, cycle_len) {
+            snapshots = snapshots + [se_clone_model(model)]
+        }
+    }
+    return #{ "final": model, "snapshots": snapshots }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  (5) Ensembling snapshots: average softmax probs
+// ═══════════════════════════════════════════════════════════════
+fn se_ensemble_probs(snapshots, feat) {
+    let M = len(snapshots)
+    let out_dim = snapshots[0]["out_dim"]
+    let mut avg = se_zeros(out_dim)
+    for m in 0..M {
+        let p = se_forward_probs(snapshots[m], feat)
+        for i in 0..out_dim {
+            avg[i] = avg[i] + p[i]
+        }
+    }
+    let inv = 1.0 / to_float(M)
+    let mut out = []
+    for i in 0..out_dim { out = out + [avg[i] * inv] }
+    return out
+}
+
+fn se_ensemble_ce_loss(snapshots, feats, labels) {
+    let n = len(feats)
+    let mut s = 0.0
+    for k in 0..n {
+        let p = se_ensemble_probs(snapshots, feats[k])
+        let y = labels[k]
+        let mut pv = p[y]
+        if pv < 1.0e-12 { pv = 1.0e-12 }
+        s = s - log(pv)
+    }
+    return s / to_float(n)
+}
+
+fn se_member_ce_loss(model, feats, labels) {
+    let n = len(feats)
+    let mut s = 0.0
+    for k in 0..n {
+        let p = se_forward_probs(model, feats[k])
+        let y = labels[k]
+        let mut pv = p[y]
+        if pv < 1.0e-12 { pv = 1.0e-12 }
+        s = s - log(pv)
+    }
+    return s / to_float(n)
+}
+
+println("[snapshot_ensemble] loaded — cosine restart LR + per-cycle snapshots + prob-averaged ensemble")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

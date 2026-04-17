@@ -2,7 +2,429 @@
 //  test_kv_compression.hexa — KV Cache Compression (#309)
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/kv_compression.hexa"
+// -- inlined from self/ml/kv_compression.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/kv_compression.hexa — KV Cache Compression (#309)
+//
+//  Reduce KV cache memory via low-rank projection + quantization.
+//  Extends GQA idea: project K,V to lower dimension, reconstruct
+//  when needed.
+//
+//  Math:
+//    Compress:   K_c = K . W_down   (D -> D_c,  D_c << D)
+//    Decompress: K' = K_c . W_up    (D_c -> D)
+//    Quantize:   round to nearest level among n_levels
+//    Combined savings: rank_ratio x quant_ratio
+//
+//  API:
+//    kvc_init(D_model, D_compressed, n_levels, seed) -> model
+//    kvc_compress(model, kv)                -> compressed
+//    kvc_decompress(model, compressed)      -> kv_approx
+//    kvc_quantize(value, n_levels)          -> quantized
+//    kvc_dequantize(quantized, n_levels)    -> value
+//    kvc_compress_quantize(model, kv)       -> compact
+//    kvc_attention(model, query, c_keys, c_vals) -> output
+//    kvc_error(original, reconstructed)     -> float (MSE)
+//    kvc_train_step(model, K_batch, V_batch, lr) -> model
+//
+//  AI-NATIVE attrs:
+//    @pure  (compress/decompress/quantize/attention/error)
+//    @hot   (train_step)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Math helpers ──────────────────────────────────────────────────
+
+fn kvc_abs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn kvc_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn kvc_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..20 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn kvc_floor(x) {
+    let i = int(x)
+    if to_float(i) > x { return i - 1 }
+    return i
+}
+
+// ── Array helpers ─────────────────────────────────────────────────
+
+fn kvc_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn kvc_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+// ── RNG ───────────────────────────────────────────────────────────
+
+fn kvc_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn kvc_uniform(state) {
+    let s = kvc_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Initialise KV Compression model
+//
+//  W_down : D_compressed x D_model   (project to low rank)
+//  W_up   : D_model x D_compressed   (reconstruct)
+//  Xavier-like init: U(-scale, scale), scale = 1/sqrt(D_model)
+// ═══════════════════════════════════════════════════════════════════
+fn kvc_init(D_model, D_compressed, n_levels, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    let scale = 1.0 / kvc_sqrt(to_float(D_model))
+
+    // W_down: D_compressed x D_model
+    let mut W_down = kvc_zeros_2d(D_compressed, D_model)
+    for i in 0..D_compressed {
+        for j in 0..D_model {
+            let u = kvc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_down[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+
+    // W_up: D_model x D_compressed
+    let mut W_up = kvc_zeros_2d(D_model, D_compressed)
+    for i in 0..D_model {
+        for j in 0..D_compressed {
+            let u = kvc_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_up[i][j] = (u[0] - 0.5) * 2.0 * scale
+        }
+    }
+
+    return #{
+        "D_model": D_model,
+        "D_compressed": D_compressed,
+        "n_levels": n_levels,
+        "W_down": W_down,
+        "W_up": W_up
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compress: kv (vector of D_model) -> compressed (D_compressed)
+//    compressed[i] = sum_j W_down[i][j] * kv[j]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_compress(model, kv) {
+    let W_down = model["W_down"]
+    let D_model = model["D_model"]
+    let D_compressed = model["D_compressed"]
+    let mut out = kvc_zeros(D_compressed)
+    for i in 0..D_compressed {
+        let mut s = 0.0
+        for j in 0..D_model {
+            s = s + W_down[i][j] * kv[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decompress: compressed (D_compressed) -> kv_approx (D_model)
+//    kv_approx[i] = sum_j W_up[i][j] * compressed[j]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_decompress(model, compressed) {
+    let W_up = model["W_up"]
+    let D_model = model["D_model"]
+    let D_compressed = model["D_compressed"]
+    let mut out = kvc_zeros(D_model)
+    for i in 0..D_model {
+        let mut s = 0.0
+        for j in 0..D_compressed {
+            s = s + W_up[i][j] * compressed[j]
+        }
+        out[i] = s
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Quantize: map float in [-1,1] to nearest discrete level
+//    levels are {0, 1, ..., n_levels-1}
+//    value -> clamp to [-1,1] -> map to [0, n_levels-1] -> round
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_quantize(value, n_levels) {
+    let mut v = value
+    if v > 1.0 { v = 1.0 }
+    if v < -1.0 { v = -1.0 }
+    let scaled = (v + 1.0) / 2.0 * to_float(n_levels - 1)
+    let rounded = kvc_floor(scaled + 0.5)
+    if rounded < 0 { return 0 }
+    if rounded >= n_levels { return n_levels - 1 }
+    return rounded
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dequantize: discrete level -> float in [-1,1]
+//    level -> [0,1] -> [-1,1]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_dequantize(quantized, n_levels) {
+    if n_levels <= 1 { return 0.0 }
+    return to_float(quantized) / to_float(n_levels - 1) * 2.0 - 1.0
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Compress + Quantize pipeline
+//    kv (D_model) -> compressed (D_compressed) -> quantized ints
+//  Returns #{"quantized": [int], "D_compressed": int, "n_levels": int}
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_compress_quantize(model, kv) {
+    let compressed = kvc_compress(model, kv)
+    let D_compressed = model["D_compressed"]
+    let n_levels = model["n_levels"]
+
+    // find range for normalization
+    let mut mx = 0.0
+    for i in 0..D_compressed {
+        let a = kvc_abs(compressed[i])
+        if a > mx { mx = a }
+    }
+    if mx < 1.0e-12 { mx = 1.0 }
+
+    let mut quant = []
+    for i in 0..D_compressed {
+        let normed = compressed[i] / mx
+        quant = quant + [kvc_quantize(normed, n_levels)]
+    }
+    return #{
+        "quantized": quant,
+        "scale": mx,
+        "D_compressed": D_compressed,
+        "n_levels": n_levels
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Decompress from quantized compact form
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_decompress_quantized(model, compact) {
+    let quant = compact["quantized"]
+    let scale = compact["scale"]
+    let D_compressed = compact["D_compressed"]
+    let n_levels = compact["n_levels"]
+
+    let mut compressed = kvc_zeros(D_compressed)
+    for i in 0..D_compressed {
+        compressed[i] = kvc_dequantize(quant[i], n_levels) * scale
+    }
+    return kvc_decompress(model, compressed)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention: query (D_model) x compressed keys/values -> output
+//    Decompresses K,V on the fly, computes dot-product attention.
+//    compressed_keys: list of compressed vectors
+//    compressed_values: list of compressed vectors
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_attention(model, query, compressed_keys, compressed_values) {
+    let D_model = model["D_model"]
+    let N = len(compressed_keys)
+    if N == 0 { return kvc_zeros(D_model) }
+
+    let scale = 1.0 / kvc_sqrt(to_float(D_model))
+
+    // compute attention scores
+    let mut scores = kvc_zeros(N)
+    let mut max_score = -1.0e30
+    for i in 0..N {
+        let ki = kvc_decompress(model, compressed_keys[i])
+        let mut dot = 0.0
+        for d in 0..D_model {
+            dot = dot + query[d] * ki[d]
+        }
+        scores[i] = dot * scale
+        if scores[i] > max_score { max_score = scores[i] }
+    }
+
+    // softmax
+    let mut sum_exp = 0.0
+    let mut weights = kvc_zeros(N)
+    for i in 0..N {
+        let w = kvc_exp(scores[i] - max_score)
+        weights[i] = w
+        sum_exp = sum_exp + w
+    }
+    if sum_exp < 1.0e-12 { sum_exp = 1.0e-12 }
+    for i in 0..N {
+        weights[i] = weights[i] / sum_exp
+    }
+
+    // weighted sum of decompressed values
+    let mut out = kvc_zeros(D_model)
+    for i in 0..N {
+        let vi = kvc_decompress(model, compressed_values[i])
+        for d in 0..D_model {
+            out[d] = out[d] + weights[i] * vi[d]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Error: MSE between original and reconstructed
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn kvc_error(original, reconstructed) {
+    let n = len(original)
+    if n == 0 { return 0.0 }
+    let mut sum_sq = 0.0
+    for i in 0..n {
+        let diff = original[i] - reconstructed[i]
+        sum_sq = sum_sq + diff * diff
+    }
+    return sum_sq / to_float(n)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training: learn W_down, W_up to minimize reconstruction MSE
+//
+//  Loss = (1/N) sum_i || x_i - W_up . W_down . x_i ||^2
+//
+//  Gradient derivation:
+//    Let c_i = W_down . x_i   (compressed)
+//    Let r_i = W_up . c_i     (reconstructed)
+//    Let e_i = r_i - x_i      (error)
+//
+//    dL/dW_up[a][b]   = (2/N) sum_i e_i[a] * c_i[b]
+//    dL/dW_down[a][b] = (2/N) sum_i (W_up^T . e_i)[a] * x_i[b]
+//
+//  K_batch, V_batch: lists of vectors (D_model).
+//  We train on both K and V jointly (same projections).
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn kvc_train_step(model, K_batch, V_batch, lr) {
+    let D_model = model["D_model"]
+    let D_compressed = model["D_compressed"]
+    let W_down = model["W_down"]
+    let W_up = model["W_up"]
+    let n_levels = model["n_levels"]
+
+    // combine K and V into one batch for shared projection training
+    let all_vecs = K_batch + V_batch
+    let N = len(all_vecs)
+    if N == 0 { return model }
+
+    let mut gW_down = kvc_zeros_2d(D_compressed, D_model)
+    let mut gW_up = kvc_zeros_2d(D_model, D_compressed)
+
+    for idx in 0..N {
+        let x = all_vecs[idx]
+
+        // forward: compress
+        let mut c = kvc_zeros(D_compressed)
+        for i in 0..D_compressed {
+            let mut s = 0.0
+            for j in 0..D_model { s = s + W_down[i][j] * x[j] }
+            c[i] = s
+        }
+
+        // forward: decompress
+        let mut r = kvc_zeros(D_model)
+        for i in 0..D_model {
+            let mut s = 0.0
+            for j in 0..D_compressed { s = s + W_up[i][j] * c[j] }
+            r[i] = s
+        }
+
+        // error
+        let mut e = kvc_zeros(D_model)
+        for i in 0..D_model { e[i] = r[i] - x[i] }
+
+        // grad W_up: e . c^T
+        for i in 0..D_model {
+            for j in 0..D_compressed {
+                gW_up[i][j] = gW_up[i][j] + e[i] * c[j]
+            }
+        }
+
+        // grad W_down: (W_up^T . e) . x^T
+        let mut wt_e = kvc_zeros(D_compressed)
+        for i in 0..D_compressed {
+            let mut s = 0.0
+            for j in 0..D_model { s = s + W_up[j][i] * e[j] }
+            wt_e[i] = s
+        }
+        for i in 0..D_compressed {
+            for j in 0..D_model {
+                gW_down[i][j] = gW_down[i][j] + wt_e[i] * x[j]
+            }
+        }
+    }
+
+    // apply gradients
+    let inv_n = 2.0 / to_float(N)
+    let mut W_down_new = kvc_zeros_2d(D_compressed, D_model)
+    for i in 0..D_compressed {
+        for j in 0..D_model {
+            W_down_new[i][j] = W_down[i][j] - lr * gW_down[i][j] * inv_n
+        }
+    }
+    let mut W_up_new = kvc_zeros_2d(D_model, D_compressed)
+    for i in 0..D_model {
+        for j in 0..D_compressed {
+            W_up_new[i][j] = W_up[i][j] - lr * gW_up[i][j] * inv_n
+        }
+    }
+
+    return #{
+        "D_model": D_model,
+        "D_compressed": D_compressed,
+        "n_levels": n_levels,
+        "W_down": W_down_new,
+        "W_up": W_up_new
+    }
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

@@ -15,7 +15,417 @@
 //  ML roadmap #241 — Multi-Node Training
 // ===================================================================
 
-import "ml/multi_node_training.hexa"
+// -- inlined from self/ml/multi_node_training.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  multi_node_training.hexa — Cross-Node Gradient Synchronization
+//
+//  Pure .hexa CPU simulation of multi-node training with:
+//    - Ring AllReduce for bandwidth-optimal gradient averaging
+//    - Tree AllReduce for logarithmic latency reduction
+//    - Async gradient sync (local SGD with periodic sync)
+//    - Topology discovery: auto-select ring vs tree
+//
+//  Each "node" is simulated as an index into arrays of per-node
+//  gradient/parameter vectors. No NCCL, no network.
+//
+//  ML roadmap #241 — Multi-Node Training
+// ===================================================================
+
+// ── Array helpers ────────────────────────────────────────────
+
+fn mnt_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+fn mnt_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+fn mnt_add(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] + b[i])
+        i = i + 1
+    }
+    out
+}
+
+fn mnt_scale(a, s) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] * s)
+        i = i + 1
+    }
+    out
+}
+
+fn mnt_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(a[i] - b[i])
+        i = i + 1
+    }
+    out
+}
+
+// ── Node configuration ──────────────────────────────────────
+
+struct MntConfig {
+    num_nodes: int,
+    param_size: int,
+    lr: float,
+    sync_every: int,
+    topology: string
+}
+
+fn mnt_config(num_nodes, param_size, lr) {
+    MntConfig {
+        num_nodes: num_nodes,
+        param_size: param_size,
+        lr: lr,
+        sync_every: 1,
+        topology: "ring"
+    }
+}
+
+fn mnt_config_async(num_nodes, param_size, lr, sync_every) {
+    MntConfig {
+        num_nodes: num_nodes,
+        param_size: param_size,
+        lr: lr,
+        sync_every: sync_every,
+        topology: "ring"
+    }
+}
+
+// ── Topology discovery ──────────────────────────────────────
+
+// Auto-detect topology: ring for <= 8 nodes, tree for > 8
+fn mnt_auto_topology(num_nodes) {
+    if num_nodes <= 8 {
+        "ring"
+    } else {
+        "tree"
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Ring AllReduce for Gradient Averaging
+//
+//  Input: per-node gradient arrays (array of arrays)
+//  Output: averaged gradient (same on all nodes)
+//  Algorithm: naive ring simulation (sum then divide by N)
+// ═══════════════════════════════════════════════════════════════
+
+fn mnt_ring_allreduce_avg(grads, num_nodes) {
+    let param_size = len(grads[0])
+
+    // Sum all gradients
+    let mut summed = mnt_zeros(param_size)
+    let mut n = 0
+    while n < num_nodes {
+        summed = mnt_add(summed, grads[n])
+        n = n + 1
+    }
+
+    // Average
+    let avg = mnt_scale(summed, 1.0 / to_float(num_nodes))
+
+    // Broadcast to all nodes
+    let mut result = []
+    n = 0
+    while n < num_nodes {
+        result.push(mnt_copy(avg))
+        n = n + 1
+    }
+    result
+}
+
+// Ring allreduce with chunked pipelining (bandwidth-optimal)
+fn mnt_ring_allreduce_chunked(grads, num_nodes) {
+    let param_size = len(grads[0])
+    let num_chunks = num_nodes
+
+    // Chunk boundaries
+    let mut chunks = []
+    let mut c = 0
+    while c < num_chunks {
+        let begin = (param_size * c) / num_chunks
+        let end = (param_size * (c + 1)) / num_chunks
+        chunks.push([begin, end])
+        c = c + 1
+    }
+
+    // Copy grads
+    let mut bufs = []
+    let mut r = 0
+    while r < num_nodes {
+        bufs.push(mnt_copy(grads[r]))
+        r = r + 1
+    }
+
+    // Phase 1: reduce-scatter (N-1 steps)
+    let mut step = 0
+    while step < num_nodes - 1 {
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_nodes {
+            new_bufs.push(mnt_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_nodes {
+            let chunk_idx = ((rr - step) % num_chunks + num_chunks) % num_chunks
+            let recv_rank = (rr + 1) % num_nodes
+            let pair = chunks[chunk_idx]
+            let begin = pair[0]
+            let end = pair[1]
+            let mut i = begin
+            while i < end {
+                new_bufs[recv_rank][i] = new_bufs[recv_rank][i] + bufs[rr][i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    // Phase 2: allgather (N-1 steps)
+    step = 0
+    while step < num_nodes - 1 {
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_nodes {
+            new_bufs.push(mnt_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_nodes {
+            let chunk_idx = ((rr - step + 1) % num_chunks + num_chunks) % num_chunks
+            let recv_rank = (rr + 1) % num_nodes
+            let pair = chunks[chunk_idx]
+            let begin = pair[0]
+            let end = pair[1]
+            let mut i = begin
+            while i < end {
+                new_bufs[recv_rank][i] = bufs[rr][i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    // Divide by N for averaging
+    let mut result = []
+    r = 0
+    while r < num_nodes {
+        result.push(mnt_scale(bufs[r], 1.0 / to_float(num_nodes)))
+        r = r + 1
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tree AllReduce for Logarithmic Latency
+//
+//  Binary tree reduction followed by broadcast.
+//  Latency: O(log N) vs ring's O(N) steps.
+// ═══════════════════════════════════════════════════════════════
+
+fn mnt_tree_allreduce_avg(grads, num_nodes) {
+    let param_size = len(grads[0])
+
+    // Copy grads into mutable buffers
+    let mut bufs = []
+    let mut n = 0
+    while n < num_nodes {
+        bufs.push(mnt_copy(grads[n]))
+        n = n + 1
+    }
+
+    // Upward reduction: binary tree, stride doubles each level
+    let mut stride = 1
+    while stride < num_nodes {
+        let mut i = 0
+        while i + stride < num_nodes {
+            if i % (stride * 2) == 0 {
+                bufs[i] = mnt_add(bufs[i], bufs[i + stride])
+            }
+            i = i + 1
+        }
+        stride = stride * 2
+    }
+
+    // Root (node 0) has the sum. Average it.
+    let avg = mnt_scale(bufs[0], 1.0 / to_float(num_nodes))
+
+    // Downward broadcast: reverse tree traversal
+    bufs[0] = avg
+    stride = stride / 2
+    while stride >= 1 {
+        let mut i = 0
+        while i + stride < num_nodes {
+            if i % (stride * 2) == 0 {
+                bufs[i + stride] = mnt_copy(bufs[i])
+            }
+            i = i + 1
+        }
+        stride = stride / 2
+    }
+
+    bufs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Gradient Sync Wrapper — applies allreduce to gradients
+//  then updates parameters with SGD.
+// ═══════════════════════════════════════════════════════════════
+
+fn mnt_sync_step(params_per_node, grads_per_node, cfg) {
+    let num_nodes = cfg.num_nodes
+
+    // AllReduce gradients
+    let mut avg_grads = []
+    if cfg.topology == "tree" {
+        avg_grads = mnt_tree_allreduce_avg(grads_per_node, num_nodes)
+    } else {
+        avg_grads = mnt_ring_allreduce_avg(grads_per_node, num_nodes)
+    }
+
+    // SGD update on each node
+    let mut new_params = []
+    let mut n = 0
+    while n < num_nodes {
+        let p = params_per_node[n]
+        let g = avg_grads[n]
+        let updated = mnt_sub(p, mnt_scale(g, cfg.lr))
+        new_params.push(updated)
+        n = n + 1
+    }
+    new_params
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Async Gradient Sync — Local SGD with periodic synchronization
+//
+//  Each node runs K local SGD steps before synchronizing.
+//  On sync steps: average all node parameters (not gradients).
+// ═══════════════════════════════════════════════════════════════
+
+struct MntAsyncState {
+    params: array,
+    step_count: int,
+    sync_count: int
+}
+
+fn mnt_async_init(initial_params, num_nodes) {
+    let mut params = []
+    let mut n = 0
+    while n < num_nodes {
+        params.push(mnt_copy(initial_params))
+        n = n + 1
+    }
+    MntAsyncState {
+        params: params,
+        step_count: 0,
+        sync_count: 0
+    }
+}
+
+// One local SGD step per node with local gradients, sync if step % sync_every == 0
+fn mnt_async_step(state, local_grads, cfg) {
+    let num_nodes = cfg.num_nodes
+    let new_step = state.step_count + 1
+
+    // Local SGD update
+    let mut new_params = []
+    let mut n = 0
+    while n < num_nodes {
+        let p = state.params[n]
+        let g = local_grads[n]
+        let updated = mnt_sub(p, mnt_scale(g, cfg.lr))
+        new_params.push(updated)
+        n = n + 1
+    }
+
+    // Check if sync is needed
+    let mut sync_count = state.sync_count
+    if new_step % cfg.sync_every == 0 {
+        // Average all node parameters
+        let param_size = len(new_params[0])
+        let mut avg = mnt_zeros(param_size)
+        n = 0
+        while n < num_nodes {
+            avg = mnt_add(avg, new_params[n])
+            n = n + 1
+        }
+        avg = mnt_scale(avg, 1.0 / to_float(num_nodes))
+
+        // Broadcast averaged params to all nodes
+        let mut synced = []
+        n = 0
+        while n < num_nodes {
+            synced.push(mnt_copy(avg))
+            n = n + 1
+        }
+        new_params = synced
+        sync_count = sync_count + 1
+    }
+
+    MntAsyncState {
+        params: new_params,
+        step_count: new_step,
+        sync_count: sync_count
+    }
+}
+
+// ── Tree latency metric ─────────────────────────────────────
+
+fn mnt_tree_latency_steps(num_nodes) {
+    // O(log2 N) for reduce + O(log2 N) for broadcast
+    let mut steps = 0
+    let mut n = num_nodes
+    while n > 1 {
+        steps = steps + 1
+        n = (n + 1) / 2
+    }
+    steps * 2
+}
+
+fn mnt_ring_latency_steps(num_nodes) {
+    2 * (num_nodes - 1)
+}
+
+println("[multi_node_training] module loaded — ring/tree allreduce + async SGD ready")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

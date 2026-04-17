@@ -27,7 +27,369 @@
 //    T23  max_abs_diff across all random seeds ≤ 1e-7
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/fused_adam.hexa"
+// -- inlined from self/ai_native/fused_adam.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/fused_adam.hexa — AI-native ROI #94
+//
+//  @fused_adam — fuse the three separate passes of AdamW (m-update,
+//  v-update, param-update) into a single parameter sweep. The naive
+//  reference implementation runs three independent loops, reading and
+//  writing every slot three times per optimizer step. The fused kernel
+//  reads each slot once, performs all three state transitions with
+//  scalar-local temporaries, and writes each slot once.
+//
+//  Training speed-up ≈ 3× on the optimizer step (memory-bound; AdamW
+//  is O(params), not O(flops)) and ≈ 1/3 of the write-back bandwidth.
+//
+//  Public API
+//  ──────────
+//      adam_step_naive(p, g, m, v, t, lr, b1, b2, eps)  -> {p,m,v}
+//      adam_step_fused(p, g, m, v, t, lr, b1, b2, eps)  -> {p,m,v}
+//          • p[i], g[i], m[i], v[i]   : [float] of equal length N
+//          • t                        : int ≥ 1 (step count)
+//          • lr                       : float (learning rate)
+//          • b1                       : float in (0,1)   first-moment decay
+//          • b2                       : float in (0,1)   second-moment decay
+//          • eps                      : float > 0        divide-by-zero guard
+//          • returns map #{p, m, v}   — updated copies
+//
+//      bias_correction(b, t)          -> float
+//          • 1 − b^t  (used by both the m-hat and v-hat rescales)
+//          • t = 0 is treated as step-before-first-update: returns 1
+//            so that mhat = m / 1 = m (a no-op on the identity path).
+//
+//      detect_adam_three_loops(prog) -> bool
+//          • AST-level predicate: returns true iff `prog` is a list of
+//            exactly three for-loops whose bodies are (in order) the
+//            m-update, the v-update, and the param-update on the same
+//            parameter index.
+//
+//      rewrite_fuse_adam(prog)       -> Program
+//          • If detect_adam_three_loops(prog) is true, replaces the
+//            three-loop segment with a single "fused_adam_loop" node.
+//            Otherwise returns `prog` unchanged.
+//
+//      naive_pass_count()             -> int   (=3)
+//      fused_pass_count()             -> int   (=1)
+//
+//  Numerical contract
+//  ──────────────────
+//      For every (p, g, m, v, t, lr, b1, b2, eps) with t ≥ 1 and
+//      eps > 0, and for every i:
+//          adam_step_fused(...).p[i] == adam_step_naive(...).p[i]
+//          ... .m[i] == naive .m[i]
+//          ... .v[i] == naive .v[i]
+//      element-wise within tol 1e-7. (Identical arithmetic, identical
+//      order: the fused loop performs exactly the same scalar ops per
+//      slot that the three naive loops do in sequence.)
+//
+//  AdamW mathematical reference
+//  ────────────────────────────
+//      m_t  = b1 · m_{t-1} + (1 - b1) · g
+//      v_t  = b2 · v_{t-1} + (1 - b2) · g²
+//      mhat = m_t / (1 - b1^t)
+//      vhat = v_t / (1 - b2^t)
+//      p_t  = p_{t-1} − lr · mhat / (√vhat + eps)
+//
+//  Edge cases
+//  ──────────
+//      • N = 0              → returns {p, m, v} unchanged (copies).
+//      • lr = 0             → param update is the identity on p.
+//                             m, v still receive their new values.
+//      • t = 0              → bias_correction returns 1 (no-op), so
+//                             mhat = m, vhat = v. This is the "step 0"
+//                             identity path used before the first
+//                             optimizer.step() call in some schedules.
+//      • eps > 0            → divide-by-zero on sqrt(vhat)=0 is
+//                             impossible; eps is the guard.
+//      • b1 = 1, b2 = 1     → m and v freeze at their prior value
+//                             (1 − b = 0). bias_correction(1, t) = 0;
+//                             we guard against the resulting 0/0 by
+//                             treating a 0 denominator as 1 (no rescale).
+//      • b1 = 0             → m_t = g (EMA with 0 memory).
+//
+//  Pattern detect / rewrite
+//  ────────────────────────
+//  The AST side follows the same kind-tagged-struct approach used in
+//  graph_pattern.hexa (#84). Three consecutive "for" nodes carrying
+//  the body kinds "m_update", "v_update", "param_update" over the
+//  same index variable collapse into one "fused_adam_loop" node.
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if` → maps/structs returned
+//        at tail of arm
+//      - no `and`/`or` → `&&` / `||`
+//      - no enum → string tags
+//      - abs → use abs_pure from math_pure.hexa
+//      - pow(x, t) for integer t handled by loop multiply (t ≤ 10⁶
+//        typical; avoids fp-pow domain issues at boundary cases)
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot        — optimizer step is called every training iteration
+//      @fused_adam — marker: 3-pass → 1-pass fusion
+//      @pure       — returns new state; does not mutate caller arrays
+//      @parallel   — the inner sweep is independent across i
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers ────────────────────────────────────────────────
+
+// fa94_fabs → abs_pure (math_pure.hexa)
+
+@pure
+fn fa94_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn fa94_copy_1d(a) {
+    let n = len(a)
+    let mut out = fa94_zeros_1d(n)
+    for i in 0..n {
+        out[i] = a[i]
+    }
+    return out
+}
+
+// Integer-exponent power.  b^t computed by t-many multiplications.
+// Exact on floats for the t that appears in real training (≤ 10⁶).
+// We avoid pow(b, t) here to sidestep any fp-pow rounding and to make
+// b1=1 / b2=1 behave as exact 1 (pow may return 1 − ε).
+@pure
+fn fa94_ipow(b, t) {
+    if t <= 0 { return 1.0 }
+    let mut r = 1.0
+    for _i in 0..t {
+        r = r * b
+    }
+    return r
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  bias_correction(b, t) — returns (1 − b^t).
+//  Convention: t = 0 → 1 (no rescale). Some training loops evaluate
+//  the optimizer "before" the first step for diagnostic reasons.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn bias_correction_impl(b, t) {
+    if t <= 0 { return 1.0 }
+    let bt = fa94_ipow(b, t)
+    return 1.0 - bt
+}
+
+pub fn bias_correction(b, t) {
+    return bias_correction_impl(b, t)
+}
+
+// Small helper: divide by a possibly-zero bias-correction denominator.
+// When b=1 the correction is 0; we fall back to a no-op rescale.
+@pure
+fn fa94_safe_div(num, den) {
+    if abs_pure(den) < 1.0e-30 { return num }
+    return num / den
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  adam_step_naive(p, g, m, v, t, lr, b1, b2, eps)
+//
+//  Reference three-pass implementation. Each state array is iterated
+//  independently; three reads + three writes per slot.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn adam_step_naive_impl(p, g, m, v, t, lr, b1, b2, eps) {
+    let n = len(p)
+    let mc = fa94_copy_1d(m)
+    let vc = fa94_copy_1d(v)
+    let pc = fa94_copy_1d(p)
+    if n == 0 {
+        return #{
+            "p": pc,
+            "m": mc,
+            "v": vc
+        }
+    }
+
+    let one_minus_b1 = 1.0 - b1
+    let one_minus_b2 = 1.0 - b2
+    let bc1 = bias_correction(b1, t)
+    let bc2 = bias_correction(b2, t)
+
+    // Pass 1 — m-update
+    for i in 0..n {
+        mc[i] = b1 * mc[i] + one_minus_b1 * g[i]
+    }
+    // Pass 2 — v-update
+    for i in 0..n {
+        vc[i] = b2 * vc[i] + one_minus_b2 * g[i] * g[i]
+    }
+    // Pass 3 — param-update
+    for i in 0..n {
+        let mhat = fa94_safe_div(mc[i], bc1)
+        let vhat = fa94_safe_div(vc[i], bc2)
+        let denom = sqrt(vhat) + eps
+        pc[i] = pc[i] - lr * mhat / denom
+    }
+
+    return #{
+        "p": pc,
+        "m": mc,
+        "v": vc
+    }
+}
+
+pub fn adam_step_naive(p, g, m, v, t, lr, b1, b2, eps) {
+    return adam_step_naive_impl(p, g, m, v, t, lr, b1, b2, eps)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  adam_step_fused(p, g, m, v, t, lr, b1, b2, eps)
+//
+//  Single-pass fused kernel. Reads (p,g,m,v)[i] once, writes (p,m,v)[i]
+//  once. All scalar math is held in local registers; no intermediate
+//  array allocations beyond the three output copies.
+//
+//  The arithmetic per slot is byte-for-byte identical to the naive
+//  sequence:
+//      m'   = b1 · m + (1 − b1) · g
+//      v'   = b2 · v + (1 − b2) · g²
+//      mhat = m' / (1 − b1^t)
+//      vhat = v' / (1 − b2^t)
+//      p'   = p − lr · mhat / (√vhat + eps)
+//  Hence the fused result equals the naive result bit-for-bit on an
+//  IEEE-754 machine (tol 1e-7 is a generous engineering margin).
+// ═══════════════════════════════════════════════════════════════════
+@hot @fused_adam @parallel @pure
+fn adam_step_fused_impl(p, g, m, v, t, lr, b1, b2, eps) {
+    let n = len(p)
+    let pc = fa94_copy_1d(p)
+    let mc = fa94_copy_1d(m)
+    let vc = fa94_copy_1d(v)
+    if n == 0 {
+        return #{
+            "p": pc,
+            "m": mc,
+            "v": vc
+        }
+    }
+
+    // Hoist loop-invariants once.
+    let one_minus_b1 = 1.0 - b1
+    let one_minus_b2 = 1.0 - b2
+    let bc1 = bias_correction(b1, t)
+    let bc2 = bias_correction(b2, t)
+
+    // Single fused sweep.
+    for i in 0..n {
+        let gi = g[i]
+        let mi = b1 * mc[i] + one_minus_b1 * gi
+        let vi = b2 * vc[i] + one_minus_b2 * gi * gi
+        mc[i] = mi
+        vc[i] = vi
+        let mhat = fa94_safe_div(mi, bc1)
+        let vhat = fa94_safe_div(vi, bc2)
+        let denom = sqrt(vhat) + eps
+        pc[i] = pc[i] - lr * mhat / denom
+    }
+
+    return #{
+        "p": pc,
+        "m": mc,
+        "v": vc
+    }
+}
+
+pub fn adam_step_fused(p, g, m, v, t, lr, b1, b2, eps) {
+    return adam_step_fused_impl(p, g, m, v, t, lr, b1, b2, eps)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  The representation mirrors graph_pattern.hexa: a tagged-kind struct.
+//  A Program is a list of Stmts; each Stmt is either a single for-loop
+//  body marker or the fused marker the rewrite produces.
+//
+//  Stmt.kind ∈ {
+//      "for_m_update", "for_v_update", "for_param_update",
+//      "fused_adam_loop", "other"
+//  }
+//  Stmt.index : string — the loop index variable name, used to confirm
+//               that all three loops iterate the same parameter vector.
+//  Stmt.param : string — the parameter-vector name ("p" typically).
+// ═══════════════════════════════════════════════════════════════════
+struct AdamStmt {
+    kind: string
+    index: string
+    param: string
+}
+
+pub fn adam_stmt(kind, index, param) {
+    return AdamStmt{kind: kind, index: index, param: param}
+}
+
+pub fn adam_stmt_for_m(index, param)     { return adam_stmt("for_m_update",     index, param) }
+pub fn adam_stmt_for_v(index, param)     { return adam_stmt("for_v_update",     index, param) }
+pub fn adam_stmt_for_param(index, param) { return adam_stmt("for_param_update", index, param) }
+pub fn adam_stmt_fused(index, param)     { return adam_stmt("fused_adam_loop",  index, param) }
+pub fn adam_stmt_other()                 { return adam_stmt("other", "", "") }
+
+// A "Program" is simply a list of AdamStmt in execution order.
+
+@pure
+fn detect_adam_three_loops_impl(prog) {
+    if len(prog) < 3 { return false }
+    let s0 = prog[0]
+    let s1 = prog[1]
+    let s2 = prog[2]
+    if s0.kind != "for_m_update"     { return false }
+    if s1.kind != "for_v_update"     { return false }
+    if s2.kind != "for_param_update" { return false }
+    // All three must iterate the same index over the same parameter.
+    if s0.index != s1.index { return false }
+    if s1.index != s2.index { return false }
+    if s0.param != s1.param { return false }
+    if s1.param != s2.param { return false }
+    return true
+}
+
+pub fn detect_adam_three_loops(prog) {
+    return detect_adam_three_loops_impl(prog)
+}
+
+@pure
+fn rewrite_fuse_adam_impl(prog) {
+    if !detect_adam_three_loops(prog) { return prog }
+    let s0 = prog[0]
+    let fused = adam_stmt_fused(s0.index, s0.param)
+    let mut out = [fused]
+    // Keep any statements that followed the three fused ones.
+    for i in 3..len(prog) {
+        out.push(prog[i])
+    }
+    return out
+}
+
+pub fn rewrite_fuse_adam(prog) {
+    return rewrite_fuse_adam_impl(prog)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Pass-count accounting (exposed for tests / benches).
+//      naive path runs 3 loops over the params.
+//      fused path runs 1 loop.
+// ═══════════════════════════════════════════════════════════════════
+pub fn naive_pass_count() { return 3 }
+pub fn fused_pass_count() { return 1 }
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

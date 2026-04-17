@@ -2,7 +2,492 @@
 //  test_streaming_llm.hexa — StreamingLLM (#308) Tests
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/streaming_llm.hexa"
+// -- inlined from self/ml/streaming_llm.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/streaming_llm.hexa — StreamingLLM (#308)
+//
+//  StreamingLLM (Xiao et al., 2023) — infinite-length generation by
+//  keeping attention sinks (first K tokens) + a sliding window of
+//  recent W tokens. Tokens between sink and window are evicted.
+//  Total KV = K + W (constant memory).
+//
+//  Core idea:
+//    - Attention sink: first K tokens always retained — they absorb
+//      disproportionate attention mass in autoregressive LLMs
+//    - Sliding window: last W tokens retained for local context
+//    - Eviction: middle tokens dropped when cache exceeds K + W
+//    - Scaled dot-product attention over retained KV pairs
+//
+//  API (sllm_ prefix):
+//    sllm_init(D_model, D_head, n_sink, window_size, seed) -> model
+//    sllm_create_cache(model)              -> cache
+//    sllm_append_token(cache, key, value)  -> cache (with eviction)
+//    sllm_get_keys(cache)                  -> [sink_keys + window_keys]
+//    sllm_get_values(cache)                -> [sink_values + window_values]
+//    sllm_attention(model, query, cache)   -> output
+//    sllm_forward_token(model, cache, x)   -> [cache, output]
+//    sllm_forward_stream(model, tokens)    -> outputs
+//    sllm_cache_size(cache)                -> int
+//
+//  AI-NATIVE attrs:
+//    @pure  — attention / forward (no side effects)
+//    @hot   — training step (performance-critical)
+// ═══════════════════════════════════════════════════════════════════
+
+// ═══════════════════════════════════════════════════════════════════
+//  Utility helpers
+// ═══════════════════════════════════════════════════════════════════
+
+fn sllm_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn sllm_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn sllm_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
+}
+
+fn sllm_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn sllm_zeros_2d(rows, cols) {
+    let mut m = []
+    for _r in 0..rows {
+        let mut row = []
+        for _c in 0..cols { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn sllm_lcg(state) {
+    return (state * 1103515245 + 12345) % 2147483648
+}
+
+fn sllm_uniform(state) {
+    let s = sllm_lcg(state)
+    return [to_float(s) / 2147483648.0, to_float(s)]
+}
+
+fn sllm_max_i(a, b) {
+    if a > b { return a }
+    return b
+}
+
+fn sllm_min_i(a, b) {
+    if a < b { return a }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Model Initialization
+//
+//  Weights:
+//    W_q : D_head x D_model  (query projection)
+//    W_k : D_head x D_model  (key projection)
+//    W_v : D_head x D_model  (value projection)
+//    W_o : D_model x D_head  (output projection)
+//
+//  Config: n_sink, window_size, scale = 1/sqrt(D_head)
+// ═══════════════════════════════════════════════════════════════════
+fn sllm_init(D_model, D_head, n_sink, window_size, seed) {
+    let mut state = seed
+    if state <= 0 { state = 1 }
+
+    // Xavier-like init: U(-0.5, 0.5)
+    let mut W_q = sllm_zeros_2d(D_head, D_model)
+    for i in 0..D_head {
+        for j in 0..D_model {
+            let u = sllm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_q[i][j] = u[0] - 0.5
+        }
+    }
+
+    let mut W_k = sllm_zeros_2d(D_head, D_model)
+    for i in 0..D_head {
+        for j in 0..D_model {
+            let u = sllm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_k[i][j] = u[0] - 0.5
+        }
+    }
+
+    let mut W_v = sllm_zeros_2d(D_head, D_model)
+    for i in 0..D_head {
+        for j in 0..D_model {
+            let u = sllm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_v[i][j] = u[0] - 0.5
+        }
+    }
+
+    let mut W_o = sllm_zeros_2d(D_model, D_head)
+    for i in 0..D_model {
+        for j in 0..D_head {
+            let u = sllm_uniform(state)
+            state = int(u[1])
+            if state <= 0 { state = 1 }
+            W_o[i][j] = u[0] - 0.5
+        }
+    }
+
+    let scale = 1.0 / sllm_sqrt(to_float(D_head))
+
+    return #{
+        "D_model": D_model,
+        "D_head": D_head,
+        "n_sink": n_sink,
+        "window_size": window_size,
+        "W_q": W_q,
+        "W_k": W_k,
+        "W_v": W_v,
+        "W_o": W_o,
+        "scale": scale
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cache: stores sink KV pairs and window KV pairs separately
+//
+//  #{
+//    "sink_keys":    [[D_head floats], ...],   // first n_sink tokens
+//    "sink_values":  [[D_head floats], ...],
+//    "win_keys":     [[D_head floats], ...],   // sliding window
+//    "win_values":   [[D_head floats], ...],
+//    "n_sink":       int,                      // max sink slots
+//    "window_size":  int,                      // max window slots
+//    "total_seen":   int                       // total tokens processed
+//  }
+// ═══════════════════════════════════════════════════════════════════
+fn sllm_create_cache(model) {
+    return #{
+        "sink_keys": [],
+        "sink_values": [],
+        "win_keys": [],
+        "win_values": [],
+        "n_sink": model["n_sink"],
+        "window_size": model["window_size"],
+        "total_seen": 0
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Append token to cache with automatic eviction
+//
+//  Logic:
+//    1. If sink slots not full yet, append to sink
+//    2. Otherwise append to window
+//    3. If window exceeds window_size, drop oldest window entry
+// ═══════════════════════════════════════════════════════════════════
+fn sllm_append_token(cache, key, value) {
+    let n_sink = cache["n_sink"]
+    let window_size = cache["window_size"]
+    let mut sk = cache["sink_keys"]
+    let mut sv = cache["sink_values"]
+    let mut wk = cache["win_keys"]
+    let mut wv = cache["win_values"]
+    let mut total = cache["total_seen"]
+
+    if len(sk) < n_sink {
+        // Still filling sink slots
+        sk = sk + [key]
+        sv = sv + [value]
+    } else {
+        // Append to window
+        wk = wk + [key]
+        wv = wv + [value]
+        // Evict oldest window entry if over capacity
+        if len(wk) > window_size {
+            let mut new_wk = []
+            let mut new_wv = []
+            for i in 1..len(wk) {
+                new_wk = new_wk + [wk[i]]
+                new_wv = new_wv + [wv[i]]
+            }
+            wk = new_wk
+            wv = new_wv
+        }
+    }
+
+    total = total + 1
+    return #{
+        "sink_keys": sk,
+        "sink_values": sv,
+        "win_keys": wk,
+        "win_values": wv,
+        "n_sink": n_sink,
+        "window_size": window_size,
+        "total_seen": total
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Retrieve concatenated keys/values: sink + window
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_get_keys(cache) {
+    return cache["sink_keys"] + cache["win_keys"]
+}
+
+@pure
+fn sllm_get_values(cache) {
+    return cache["sink_values"] + cache["win_values"]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Cache size: number of retained KV pairs
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_cache_size(cache) {
+    return len(cache["sink_keys"]) + len(cache["win_keys"])
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Linear projection: y = W * x  (W: [out x in], x: [in])
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_matmul_vec(W, x) {
+    let out_dim = len(W)
+    let in_dim = len(x)
+    let mut y = sllm_zeros(out_dim)
+    for i in 0..out_dim {
+        let mut s = 0.0
+        for j in 0..in_dim {
+            s = s + W[i][j] * x[j]
+        }
+        y[i] = s
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dot product
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_dot(a, b) {
+    let n = len(a)
+    let mut s = 0.0
+    for i in 0..n { s = s + a[i] * b[i] }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax over a vector of scores
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_softmax(scores) {
+    let n = len(scores)
+    if n == 0 { return [] }
+    let mut mx = scores[0]
+    for i in 1..n {
+        if scores[i] > mx { mx = scores[i] }
+    }
+    let mut exps = sllm_zeros(n)
+    let mut total = 0.0
+    for i in 0..n {
+        let e = sllm_exp(scores[i] - mx)
+        exps[i] = e
+        total = total + e
+    }
+    if total < 1.0e-30 { total = 1.0e-30 }
+    let mut out = sllm_zeros(n)
+    for i in 0..n { out[i] = exps[i] / total }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Attention: scaled dot-product over cached KV pairs
+//
+//  1. Project query: q = W_q * query_vec
+//  2. Retrieve keys K and values V from cache (sink + window)
+//  3. scores[i] = q . K[i] * scale
+//  4. weights = softmax(scores)
+//  5. context = sum_i(weights[i] * V[i])
+//  6. output = W_o * context
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_attention(model, query, cache) {
+    let W_q = model["W_q"]
+    let W_o = model["W_o"]
+    let scale = model["scale"]
+    let D_head = model["D_head"]
+    let D_model = model["D_model"]
+
+    // Project query
+    let q = sllm_matmul_vec(W_q, query)
+
+    // Get cached keys and values
+    let keys = sllm_get_keys(cache)
+    let values = sllm_get_values(cache)
+    let n_kv = len(keys)
+
+    if n_kv == 0 {
+        return sllm_zeros(D_model)
+    }
+
+    // Compute scaled dot-product scores
+    let mut scores = sllm_zeros(n_kv)
+    for i in 0..n_kv {
+        scores[i] = sllm_dot(q, keys[i]) * scale
+    }
+
+    // Softmax
+    let weights = sllm_softmax(scores)
+
+    // Weighted sum of values -> context vector
+    let mut context = sllm_zeros(D_head)
+    for i in 0..n_kv {
+        for d in 0..D_head {
+            context[d] = context[d] + weights[i] * values[i][d]
+        }
+    }
+
+    // Output projection
+    let output = sllm_matmul_vec(W_o, context)
+    return output
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward one token:
+//    1. Project x -> key, value via W_k, W_v
+//    2. Append to cache (with eviction)
+//    3. Compute attention output
+//    Returns [updated_cache, output]
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_forward_token(model, cache, x) {
+    let W_k = model["W_k"]
+    let W_v = model["W_v"]
+
+    // Project input to key and value
+    let key = sllm_matmul_vec(W_k, x)
+    let value = sllm_matmul_vec(W_v, x)
+
+    // Append to cache (eviction happens automatically)
+    let new_cache = sllm_append_token(cache, key, value)
+
+    // Compute attention
+    let output = sllm_attention(model, x, new_cache)
+
+    return [new_cache, output]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward stream: process arbitrary-length token sequence
+//    tokens = [[D_model floats], ...]
+//    Returns list of outputs, one per token
+//    Memory stays bounded at n_sink + window_size
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn sllm_forward_stream(model, tokens) {
+    let n = len(tokens)
+    let mut cache = sllm_create_cache(model)
+    let mut outputs = []
+    for i in 0..n {
+        let result = sllm_forward_token(model, cache, tokens[i])
+        cache = result[0]
+        outputs = outputs + [result[1]]
+    }
+    return outputs
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training: simple gradient descent on MSE loss
+//
+//  For each (input_token, target_output) pair:
+//    loss = sum_d (output_d - target_d)^2 / D_model
+//
+//  Numerical gradient via finite differences on W_o
+//  (W_o is the output projection — most impactful for quick tuning)
+// ═══════════════════════════════════════════════════════════════════
+@hot
+fn sllm_train_step(model, tokens, targets, lr) {
+    let D_model = model["D_model"]
+    let D_head = model["D_head"]
+    let n = len(tokens)
+    if n == 0 { return model }
+
+    // Forward pass to compute loss
+    let outputs = sllm_forward_stream(model, tokens)
+    let mut total_loss = 0.0
+    for i in 0..n {
+        for d in 0..D_model {
+            let diff = outputs[i][d] - targets[i][d]
+            total_loss = total_loss + diff * diff
+        }
+    }
+    let base_loss = total_loss / to_float(n * D_model)
+
+    // Numerical gradient on W_o
+    let eps = 0.001
+    let mut W_o_new = sllm_zeros_2d(D_model, D_head)
+    let W_o = model["W_o"]
+    for i in 0..D_model {
+        for j in 0..D_head {
+            // Perturb W_o[i][j]
+            let old_val = W_o[i][j]
+            let mut m_plus = model
+            let mut wo_copy = sllm_zeros_2d(D_model, D_head)
+            for ii in 0..D_model {
+                for jj in 0..D_head {
+                    wo_copy[ii][jj] = W_o[ii][jj]
+                }
+            }
+            wo_copy[i][j] = old_val + eps
+            m_plus["W_o"] = wo_copy
+
+            let out_plus = sllm_forward_stream(m_plus, tokens)
+            let mut loss_plus = 0.0
+            for t in 0..n {
+                for d in 0..D_model {
+                    let diff = out_plus[t][d] - targets[t][d]
+                    loss_plus = loss_plus + diff * diff
+                }
+            }
+            loss_plus = loss_plus / to_float(n * D_model)
+            let grad = (loss_plus - base_loss) / eps
+            W_o_new[i][j] = old_val - lr * grad
+        }
+    }
+
+    let mut new_model = model
+    new_model["W_o"] = W_o_new
+    return new_model
+}
+
+println("[streaming_llm] loaded — StreamingLLM: attention sink + sliding window infinite generation")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

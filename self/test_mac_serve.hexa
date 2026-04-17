@@ -1,5 +1,491 @@
 // test_mac_serve.hexa — Mac Serve (#182) comprehensive tests
-import "ml/mac_serve.hexa"
+// -- inlined from self/ml/mac_serve.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  self/ml/mac_serve.hexa — Mac Serve: HTTP+SSE Streaming Server (#182)
+//
+//  OpenAI-compatible serving endpoint for Mac Mini inference.
+//  Pure HEXA simulation: HTTP layer modelled as request/response queue.
+//
+//  Integrates:
+//    streaming_gen.hexa   — StreamChannel (backpressure token stream)
+//    continuous_batching  — iteration-level scheduling
+//    prefix_cache         — system-prompt KV reuse
+//
+//  Public API:
+//    serve_create(port, model_name, max_batch)  -> ServeState
+//    serve_enqueue(state, request)              -> ServeState
+//    serve_schedule(state)                      -> ServeState
+//    serve_process_request(state, request)      -> [ServeState, ChatResponse]
+//    serve_process_stream(state, request)       -> [ServeState, [SSEChunk]]
+//    serve_step(state)                          -> ServeState
+//    serve_stats(state)                         -> #{} stats dict
+//    serve_format_sse(chunk)                    -> string
+//    serve_format_response(resp)                -> string (JSON)
+//    serve_parse_request(json_str)              -> ChatRequest
+//    mock_generate_token(seed, step)            -> string
+//
+//  Data:
+//    ChatRequest   — incoming chat completion request
+//    ChatResponse  — blocking response
+//    SSEChunk      — one incremental streaming delta
+//    ServeState    — server state with queues + counters
+//
+//  AI-NATIVE: @hot serve_step, @pure mock_generate_token
+//  L0: src/*.rs untouched. Pure .hexa.
+// ===================================================================
+
+// ===================================================================
+//  Structs
+// ===================================================================
+
+struct ChatRequest {
+    id: string,
+    model: string,
+    messages: array,
+    max_tokens: int,
+    temperature: float,
+    stream: int
+}
+
+struct ChatResponse {
+    id: string,
+    model: string,
+    content: string,
+    tokens_generated: int,
+    prompt_tokens: int,
+    finish_reason: string
+}
+
+struct SSEChunk {
+    id: string,
+    delta: string,
+    finish_reason: string
+}
+
+struct ServeState {
+    port: int,
+    model_name: string,
+    max_batch: int,
+    request_queue: array,
+    active_requests: array,
+    completed: array,
+    total_served: int,
+    total_tokens: int,
+    uptime_ticks: int
+}
+
+// ===================================================================
+//  Server creation
+// ===================================================================
+fn serve_create(port, model_name, max_batch) {
+    return ServeState {
+        port: port,
+        model_name: model_name,
+        max_batch: max_batch,
+        request_queue: [],
+        active_requests: [],
+        completed: [],
+        total_served: 0,
+        total_tokens: 0,
+        uptime_ticks: 0
+    }
+}
+
+// ===================================================================
+//  Enqueue — add a ChatRequest to the queue
+// ===================================================================
+fn serve_enqueue(state, request) {
+    return ServeState {
+        port: state.port,
+        model_name: state.model_name,
+        max_batch: state.max_batch,
+        request_queue: state.request_queue + [request],
+        active_requests: state.active_requests,
+        completed: state.completed,
+        total_served: state.total_served,
+        total_tokens: state.total_tokens,
+        uptime_ticks: state.uptime_ticks
+    }
+}
+
+// ===================================================================
+//  Schedule — move requests from queue to active up to max_batch
+// ===================================================================
+fn serve_schedule(state) {
+    let n_active = len(state.active_requests)
+    let mut free_slots = state.max_batch - n_active
+    if free_slots <= 0 {
+        return state
+    }
+    let n_queue = len(state.request_queue)
+    if n_queue == 0 {
+        return state
+    }
+
+    let mut new_active = state.active_requests
+    let mut new_queue = []
+    let mut moved = 0
+    let mut i = 0
+    while i < n_queue {
+        if moved < free_slots {
+            new_active = new_active + [state.request_queue[i]]
+            moved = moved + 1
+        } else {
+            new_queue = new_queue + [state.request_queue[i]]
+        }
+        i = i + 1
+    }
+
+    return ServeState {
+        port: state.port,
+        model_name: state.model_name,
+        max_batch: state.max_batch,
+        request_queue: new_queue,
+        active_requests: new_active,
+        completed: state.completed,
+        total_served: state.total_served,
+        total_tokens: state.total_tokens,
+        uptime_ticks: state.uptime_ticks
+    }
+}
+
+// ===================================================================
+//  Mock token generation — deterministic, no actual model
+//
+//  Returns a word from a fixed vocabulary based on seed + step.
+// ===================================================================
+@pure
+fn mock_generate_token(seed, step) {
+    let words = ["the", "quick", "brown", "fox", "jumps",
+                 "over", "lazy", "dog", "and", "cat",
+                 "is", "a", "very", "good", "model",
+                 "that", "can", "do", "many", "things"]
+    let idx = (seed * 31 + step * 7) % len(words)
+    return words[idx]
+}
+
+// ===================================================================
+//  Compute a simple hash from the messages array for seeding
+// ===================================================================
+@pure
+fn _msg_seed(messages) {
+    let n = len(messages)
+    let mut h = 17
+    let mut i = 0
+    while i < n {
+        // Use index as proxy (struct field access not deep-hashed)
+        h = h * 31 + (i + 1) * 13
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+// ===================================================================
+//  Count prompt tokens (rough: sum of message content lengths)
+// ===================================================================
+@pure
+fn _count_prompt_tokens(messages) {
+    let n = len(messages)
+    let mut total = 0
+    let mut i = 0
+    while i < n {
+        let msg = messages[i]
+        // Each message counts as ~4 tokens overhead + content length / 4
+        let clen = len(msg["content"])
+        total = total + 4 + (clen / 4)
+        i = i + 1
+    }
+    if total < 1 { total = 1 }
+    return total
+}
+
+// ===================================================================
+//  Process blocking request — generate all tokens at once
+//
+//  Returns [updated_state, ChatResponse].
+// ===================================================================
+@hot
+fn serve_process_request(state, request) {
+    let seed = _msg_seed(request.messages)
+    let mut content = ""
+    let mut step = 0
+    let max_t = request.max_tokens
+    let mut finish = "length"
+
+    while step < max_t {
+        let tok = mock_generate_token(seed, step)
+        if step > 0 {
+            content = content + " " + tok
+        } else {
+            content = content + tok
+        }
+        step = step + 1
+    }
+
+    // If max_tokens was not reached (impossible in mock), mark "stop"
+    // For mock: always generates exactly max_tokens, so finish = "length"
+    // unless max_tokens <= 0
+    if max_t <= 0 {
+        finish = "stop"
+    }
+
+    let prompt_toks = _count_prompt_tokens(request.messages)
+    let resp = ChatResponse {
+        id: request.id,
+        model: state.model_name,
+        content: content,
+        tokens_generated: step,
+        prompt_tokens: prompt_toks,
+        finish_reason: finish
+    }
+
+    let new_state = ServeState {
+        port: state.port,
+        model_name: state.model_name,
+        max_batch: state.max_batch,
+        request_queue: state.request_queue,
+        active_requests: state.active_requests,
+        completed: state.completed + [resp],
+        total_served: state.total_served + 1,
+        total_tokens: state.total_tokens + step,
+        uptime_ticks: state.uptime_ticks
+    }
+    return [new_state, resp]
+}
+
+// ===================================================================
+//  Process streaming request — return array of SSEChunks
+//
+//  One chunk per generated token, plus a final [DONE] sentinel.
+//  Returns [updated_state, [SSEChunk]].
+// ===================================================================
+@hot
+fn serve_process_stream(state, request) {
+    let seed = _msg_seed(request.messages)
+    let max_t = request.max_tokens
+    let mut chunks = []
+    let mut step = 0
+    let mut total_content = ""
+
+    while step < max_t {
+        let tok = mock_generate_token(seed, step)
+        let mut delta_text = tok
+        if step > 0 {
+            delta_text = " " + tok
+        }
+        total_content = total_content + delta_text
+
+        let chunk = SSEChunk {
+            id: request.id,
+            delta: delta_text,
+            finish_reason: ""
+        }
+        chunks = chunks + [chunk]
+        step = step + 1
+    }
+
+    // Determine finish reason
+    let mut finish = "length"
+    if max_t <= 0 {
+        finish = "stop"
+    }
+
+    // Final [DONE] chunk
+    let done_chunk = SSEChunk {
+        id: request.id,
+        delta: "",
+        finish_reason: finish
+    }
+    chunks = chunks + [done_chunk]
+
+    let prompt_toks = _count_prompt_tokens(request.messages)
+    let new_state = ServeState {
+        port: state.port,
+        model_name: state.model_name,
+        max_batch: state.max_batch,
+        request_queue: state.request_queue,
+        active_requests: state.active_requests,
+        completed: state.completed,
+        total_served: state.total_served + 1,
+        total_tokens: state.total_tokens + step,
+        uptime_ticks: state.uptime_ticks
+    }
+    return [new_state, chunks]
+}
+
+// ===================================================================
+//  serve_step — process one tick
+//
+//  1. Schedule pending -> active (up to max_batch)
+//  2. Process all active requests (blocking mode for simplicity)
+//  3. Remove processed from active
+//  Returns updated state.
+// ===================================================================
+@hot
+fn serve_step(state) {
+    // Step 1: schedule
+    let mut s = serve_schedule(state)
+
+    // Step 2: process all active
+    let n_active = len(s.active_requests)
+    let mut i = 0
+    while i < n_active {
+        let req = s.active_requests[i]
+        if req.stream == 1 {
+            let result = serve_process_stream(s, req)
+            s = result[0]
+        } else {
+            let result = serve_process_request(s, req)
+            s = result[0]
+        }
+        i = i + 1
+    }
+
+    // Step 3: clear active (all processed this tick)
+    return ServeState {
+        port: s.port,
+        model_name: s.model_name,
+        max_batch: s.max_batch,
+        request_queue: s.request_queue,
+        active_requests: [],
+        completed: s.completed,
+        total_served: s.total_served,
+        total_tokens: s.total_tokens,
+        uptime_ticks: s.uptime_ticks + 1
+    }
+}
+
+// ===================================================================
+//  serve_stats — return stats as a dict
+// ===================================================================
+fn serve_stats(state) {
+    let mut avg = 0
+    if state.total_served > 0 {
+        avg = state.total_tokens / state.total_served
+    }
+    let stats = #{
+        "total_served": state.total_served,
+        "total_tokens": state.total_tokens,
+        "avg_tokens_per_req": avg,
+        "queue_depth": len(state.request_queue),
+        "active": len(state.active_requests),
+        "uptime_ticks": state.uptime_ticks
+    }
+    return stats
+}
+
+// ===================================================================
+//  serve_format_sse — format SSEChunk as SSE event line
+//
+//  Format: "data: {json}\n\n"
+//  Final chunk (empty delta + finish_reason): "data: [DONE]\n\n"
+// ===================================================================
+fn serve_format_sse(chunk) {
+    if chunk.finish_reason != "" {
+        if chunk.delta == "" {
+            return "data: [DONE]\n\n"
+        }
+    }
+    let json = "{\"id\":\"" + chunk.id + "\","
+    let json2 = json + "\"object\":\"chat.completion.chunk\","
+    let json3 = json2 + "\"choices\":[{\"delta\":{\"content\":\"" + chunk.delta + "\"},"
+    let json4 = json3 + "\"finish_reason\":null}]}"
+    return "data: " + json4 + "\n\n"
+}
+
+// ===================================================================
+//  serve_format_response — format ChatResponse as OpenAI JSON
+// ===================================================================
+fn serve_format_response(resp) {
+    let json = "{\"id\":\"" + resp.id + "\","
+    let json2 = json + "\"object\":\"chat.completion\","
+    let json3 = json2 + "\"model\":\"" + resp.model + "\","
+    let json4 = json3 + "\"choices\":[{\"message\":{\"role\":\"assistant\","
+    let json5 = json4 + "\"content\":\"" + resp.content + "\"},"
+    let json6 = json5 + "\"finish_reason\":\"" + resp.finish_reason + "\"}],"
+    let json7 = json6 + "\"usage\":{\"prompt_tokens\":" + str(resp.prompt_tokens) + ","
+    let json8 = json7 + "\"completion_tokens\":" + str(resp.tokens_generated) + "}}"
+    return json8
+}
+
+// ===================================================================
+//  serve_parse_request — parse simplified JSON string to ChatRequest
+//
+//  Expects format: "model|msg_content|max_tokens|temperature|stream"
+//  Pipe-delimited for simplicity (no full JSON parser needed).
+//  Example: "llama-3|Hello world|64|0.7|1"
+// ===================================================================
+fn serve_parse_request(input_str) {
+    // Split by '|'
+    let mut parts = []
+    let mut cur = ""
+    let n = len(input_str)
+    let mut i = 0
+    while i < n {
+        let ch = str(input_str[i])
+        if ch == "|" {
+            parts = parts + [cur]
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    parts = parts + [cur]
+
+    // Default values
+    let mut model = "default"
+    let mut msg_content = ""
+    let mut max_tok = 16
+    let mut temp = 0.7
+    let mut strm = 0
+
+    if len(parts) >= 1 { model = parts[0] }
+    if len(parts) >= 2 { msg_content = parts[1] }
+    if len(parts) >= 3 { max_tok = int(parts[2]) }
+    if len(parts) >= 4 { temp = to_float(parts[3]) }
+    if len(parts) >= 5 {
+        if parts[4] == "1" {
+            strm = 1
+        }
+    }
+
+    // Generate a unique-ish id from content
+    let req_id = "chatcmpl-" + str(len(msg_content) * 7 + max_tok)
+
+    let messages = [#{"role": "user", "content": msg_content}]
+
+    return ChatRequest {
+        id: req_id,
+        model: model,
+        messages: messages,
+        max_tokens: max_tok,
+        temperature: temp,
+        stream: strm
+    }
+}
+
+// ===================================================================
+//  Helper: create a ChatRequest programmatically
+// ===================================================================
+fn make_chat_request(id, model, messages, max_tokens, temperature, stream) {
+    return ChatRequest {
+        id: id,
+        model: model,
+        messages: messages,
+        max_tokens: max_tokens,
+        temperature: temperature,
+        stream: stream
+    }
+}
+
+println("[mac_serve] loaded — OpenAI-compatible HTTP+SSE serving for Mac Mini")
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

@@ -3,7 +3,432 @@
 // mock JSON/JSONL 입력으로 완성도(%) 계산이 일관적인지 확인.
 // 실행: ./hexa self/test_roadmap_tracker.hexa
 
-import "ml/roadmap_tracker.hexa"
+// -- inlined from self/ml/roadmap_tracker.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  roadmap_tracker.hexa — Anima Phase 진척 자동 추적기
+//
+//  Input :
+//    - roadmap: shared/blowup/todo.hexa 창발 모드 위임 (shared/todo/*.json 폐기)
+//    - fallback: roadmap JSON (shared/todo/anima_zeta_surpass.json 포맷)
+//    - bench JSONL (shared/bench/zeta_compare.jsonl)
+//    - 테스트 파일 경로 리스트 (phase → paths)
+//  Output:
+//    - 각 Phase(0-4)의 completion % 계산
+//    - 갱신된 JSON(원본 + "phase_completion" 블록) 재기록
+//
+//  Signals per phase:
+//    S1 (0..1) tests_found / tests_expected  (가중 0.5)
+//    S2 (0..1) min(1, bench_records / bench_expected) (가중 0.3)
+//    S3 (0..1) phi_ok 비율 (phi>0 인 bench 레코드 비율) (가중 0.2)
+//    completion% = round(100 * (0.5*S1 + 0.3*S2 + 0.2*S3))
+// ═══════════════════════════════════════════════════════════
+
+// ── 로컬 스트링 헬퍼 (str_utils 임포트 회피) ──
+
+fn rt_index_of(s, needle) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return 0 }
+    if nn > sn { return 0 - 1 }
+    let limit = sn - nn
+    let mut i = 0
+    while i <= limit {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok { return i }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+fn rt_slice(s, a, b) {
+    let mut parts = []
+    let n = len(s)
+    let mut lo = a
+    let mut hi = b
+    if lo < 0 { lo = 0 }
+    if hi > n { hi = n }
+    let mut i = lo
+    while i < hi {
+        parts = parts.push(s[i])
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn rt_contains(s, needle) {
+    return rt_index_of(s, needle) >= 0
+}
+
+fn rt_count_substr(s, needle) {
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 { return 0 }
+    let mut c = 0
+    let mut i = 0
+    while i <= sn - nn {
+        let mut j = 0
+        let mut ok = true
+        while j < nn {
+            if s[i + j] != needle[j] {
+                ok = false
+                j = nn
+            }
+            j = j + 1
+        }
+        if ok {
+            c = c + 1
+            i = i + nn
+        } else {
+            i = i + 1
+        }
+    }
+    return c
+}
+
+// Split jsonl text to list of non-empty lines
+fn rt_split_lines(s) {
+    let mut out = []
+    let n = len(s)
+    let mut i = 0
+    let mut start = 0
+    while i < n {
+        if s[i] == '\n' {
+            if i > start {
+                out = out.push(rt_slice(s, start, i))
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < n {
+        out = out.push(rt_slice(s, start, n))
+    }
+    return out
+}
+
+// int → string (non-negative)
+fn rt_itos(n) {
+    if n == 0 { return "0" }
+    let mut x = n
+    let mut neg = false
+    if x < 0 { neg = true; x = 0 - x }
+    let mut digits = []
+    while x > 0 {
+        let d = x - ((x / 10) * 10)
+        digits = digits.push(d)
+        x = x / 10
+    }
+    let mut parts = []
+    let mut i = len(digits) - 1
+    while i >= 0 {
+        let d = digits[i]
+        if d == 0 { parts = parts.push("0") }
+        if d == 1 { parts = parts.push("1") }
+        if d == 2 { parts = parts.push("2") }
+        if d == 3 { parts = parts.push("3") }
+        if d == 4 { parts = parts.push("4") }
+        if d == 5 { parts = parts.push("5") }
+        if d == 6 { parts = parts.push("6") }
+        if d == 7 { parts = parts.push("7") }
+        if d == 8 { parts = parts.push("8") }
+        if d == 9 { parts = parts.push("9") }
+        i = i - 1
+    }
+    let s = parts.join("")
+    if neg { return "-" + s }
+    return s
+}
+
+// ── 시그널 계산 ──────────────────────────────────────────
+
+// tests: list of file paths; returns (found, total)
+fn rt_count_tests_present(tests) {
+    let mut found = 0
+    let mut i = 0
+    while i < len(tests) {
+        if file_exists(tests[i]) { found = found + 1 }
+        i = i + 1
+    }
+    return found
+}
+
+// bench_text: full jsonl contents
+// phase_tag: substring to identify this phase's records (e.g. "phase0")
+// Returns (total_records, phi_ok_records)
+fn rt_bench_count(bench_text, phase_tag) {
+    let lines = rt_split_lines(bench_text)
+    let mut total = 0
+    let mut phi_ok = 0
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        // Match: record applies to phase if "phase":"phaseN" OR hexa_name contains phase tag,
+        //        OR we fall back to counting every record toward every phase when no tag.
+        let has_phase_field = rt_contains(line, "\"phase\":\"" + phase_tag + "\"")
+        let has_name_tag = rt_contains(line, phase_tag)
+        if has_phase_field || has_name_tag {
+            total = total + 1
+            // phi > 0 check: look for "phi": and a non-zero numeric prefix
+            let k = rt_index_of(line, "\"phi\":")
+            if k >= 0 {
+                // skip past 6 chars of key
+                let mut j = k + 6
+                let ln = len(line)
+                // skip spaces
+                let mut stop1 = false
+                while !stop1 {
+                    if j >= ln { stop1 = true }
+                    else if line[j] == ' ' { j = j + 1 }
+                    else { stop1 = true }
+                }
+                // if next char is '-' skip (negative)
+                let mut is_pos = true
+                if j < ln {
+                    if line[j] == '-' { is_pos = false }
+                }
+                // find first non-zero digit before terminator
+                let mut nonzero = false
+                let mut stop2 = false
+                while !stop2 {
+                    if j >= ln { stop2 = true }
+                    else {
+                        let c = line[j]
+                        if c == ',' { stop2 = true }
+                        else if c == '}' { stop2 = true }
+                        else {
+                            if c != '0' && c != '.' && c != '-' && c != 'e' && c != 'E' && c != '+' {
+                                nonzero = true
+                            }
+                            j = j + 1
+                        }
+                    }
+                }
+                if is_pos && nonzero { phi_ok = phi_ok + 1 }
+            }
+        }
+        i = i + 1
+    }
+    return [total, phi_ok]
+}
+
+// Compute completion for a single phase
+//   expected_bench: positive int (denominator for bench signal)
+fn rt_phase_completion(tests, bench_text, phase_tag, expected_bench) {
+    let tests_total = len(tests)
+    let tests_found = rt_count_tests_present(tests)
+    let s1_num = tests_found * 1000
+    let mut s1 = 0
+    if tests_total > 0 { s1 = s1_num / tests_total }  // 0..1000
+
+    let bc = rt_bench_count(bench_text, phase_tag)
+    let bench_total = bc[0]
+    let phi_ok = bc[1]
+
+    let mut s2 = 0
+    if expected_bench > 0 {
+        let r = bench_total * 1000 / expected_bench
+        if r > 1000 { s2 = 1000 } else { s2 = r }
+    }
+
+    let mut s3 = 0
+    if bench_total > 0 {
+        s3 = phi_ok * 1000 / bench_total
+    }
+
+    // weighted: 0.5 S1 + 0.3 S2 + 0.2 S3 ; in per-mille domain
+    let score = (s1 * 5 + s2 * 3 + s3 * 2) / 10   // 0..1000
+    let pct = (score + 5) / 10                    // round → 0..100
+    return [pct, tests_found, tests_total, bench_total, phi_ok]
+}
+
+// Expected test-file plan per phase (default paths under self/ml)
+fn rt_default_tests(phase_id) {
+    if phase_id == "phase0" {
+        return [
+            "self/ml/infer_v14_fast.hexa",
+            "self/ml/weight_dict.hexa",
+            "self/ml/zeta_bench.hexa"
+        ]
+    }
+    if phase_id == "phase1" {
+        return [
+            "self/ml/conscious_lm.hexa",
+            "self/ml/train_loop.hexa",
+            "self/ml/phi_metric.hexa"
+        ]
+    }
+    if phase_id == "phase2" {
+        return [
+            "self/ml/anima_lm_finetune.hexa",
+            "self/ml/lora.hexa",
+            "self/ml/mlp_evolve.hexa"
+        ]
+    }
+    if phase_id == "phase3" {
+        return [
+            "self/ml/clm_3b.hexa",
+            "self/ml/animalm_v1_full.hexa"
+        ]
+    }
+    if phase_id == "phase4" {
+        return [
+            "self/ml/moe_golden.hexa",
+            "self/ml/sliding_window_attn.hexa",
+            "self/ml/gqa_ratio.hexa",
+            "self/ml/mu_transfer.hexa"
+        ]
+    }
+    return []
+}
+
+// JSON 기록 — 원본 텍스트의 마지막 '}' 직전에 phase_completion 필드 삽입
+fn rt_inject_completion(original, block) {
+    let n = len(original)
+    // find last '}' scanning backward
+    let mut i = n - 1
+    let mut found = false
+    while !found {
+        if i < 0 { found = true }
+        else if original[i] == '}' { found = true }
+        else { i = i - 1 }
+    }
+    if i < 0 {
+        // no brace → append wrapper
+        return "{" + block + "}"
+    }
+    // Strip any existing phase_completion field: simple approach: search for marker
+    let marker = "\"phase_completion\""
+    let mk = rt_index_of(original, marker)
+    let head = rt_slice(original, 0, i)
+    // trim trailing whitespace
+    let mut h_end = len(head)
+    let mut done = false
+    while !done && h_end > 0 {
+        let c = head[h_end - 1]
+        if c == ' ' || c == '\n' || c == '\t' || c == '\r' {
+            h_end = h_end - 1
+        } else {
+            done = true
+        }
+    }
+    let head_trim = rt_slice(head, 0, h_end)
+    // If existing marker, remove via regeneration: we simply append; the consumer
+    // will see the latest 'phase_completion' field (JSON parsers take the last).
+    if mk >= 0 {
+        // overwrite in-place is complex; we still append — last key wins in most parsers.
+    }
+    return head_trim + ",\n  \"phase_completion\": " + block + "\n}\n"
+}
+
+fn rt_build_block(results) {
+    // results: list of [phase_id, pct, tests_found, tests_total, bench_total, phi_ok]
+    let mut parts = []
+    parts = parts.push("{")
+    let mut i = 0
+    while i < len(results) {
+        let r = results[i]
+        let pid = r[0]
+        let pct = r[1]
+        let tf = r[2]
+        let tt = r[3]
+        let bt = r[4]
+        let po = r[5]
+        let entry = "\"" + pid + "\": {\"completion_pct\": " + rt_itos(pct) + ", \"tests_found\": " + rt_itos(tf) + ", \"tests_expected\": " + rt_itos(tt) + ", \"bench_records\": " + rt_itos(bt) + ", \"phi_ok\": " + rt_itos(po) + "}"
+        if i > 0 {
+            parts = parts.push(", ")
+        }
+        parts = parts.push(entry)
+        i = i + 1
+    }
+    parts = parts.push("}")
+    return parts.join("")
+}
+
+// ── 상위 API ─────────────────────────────────────────────
+//
+// rt_track(roadmap_path, bench_path, override_ids, override_paths)
+//   roadmap_path : anima_zeta_surpass.json 경로
+//   bench_path   : zeta_compare.jsonl 경로
+//   override_ids : [] 이면 rt_default_tests 사용,
+//                  아니면 phase id 문자열 리스트
+//   override_paths : override_ids 와 같은 길이의 [[paths...], ...] 병렬 배열
+//
+// Returns [snapshot_block_string, results_list]
+
+fn rt_track(roadmap_path, bench_path, override_ids, override_paths) {
+    let original = read_file(roadmap_path)
+    let mut bench_text = ""
+    if file_exists(bench_path) { bench_text = read_file(bench_path) }
+
+    let phase_ids = ["phase0", "phase1", "phase2", "phase3", "phase4"]
+    let expected_bench = [1, 1, 1, 1, 1]  // baseline: at least 1 bench record per phase
+
+    let mut results = []
+    let mut i = 0
+    while i < len(phase_ids) {
+        let pid = phase_ids[i]
+        let mut tests = rt_default_tests(pid)
+        // override?
+        let mut k = 0
+        while k < len(override_ids) {
+            if override_ids[k] == pid { tests = override_paths[k] }
+            k = k + 1
+        }
+        let r = rt_phase_completion(tests, bench_text, pid, expected_bench[i])
+        results = results.push([pid, r[0], r[1], r[2], r[3], r[4]])
+        i = i + 1
+    }
+
+    let block = rt_build_block(results)
+
+    // Only rewrite when original was non-empty (avoid clobbering on read miss)
+    if len(original) > 0 {
+        let updated = rt_inject_completion(original, block)
+        write_file(roadmap_path, updated)
+    }
+
+    return [block, results]
+}
+
+// ── CLI 진입점 ───────────────────────────────────────────
+// 이 파일이 직접 실행될 때: 실제 경로로 트래킹 수행
+// (라이브러리 임포트 시에도 실행되지만 경로가 없으면 no-op)
+
+fn rt_run_default() {
+    // Primary: blowup 코어엔진 창발 위임
+    println("=== roadmap_tracker: emergent mode (blowup core engine) ===")
+    println("delegate → shared/blowup/core/blowup.hexa + shared/blowup/todo.hexa")
+
+    // Fallback: shared/todo JSON이 존재하면 기존 트래커도 실행
+    let rt_roadmap_default = "shared/todo/anima_zeta_surpass.json"
+    let rt_bench_default = "shared/bench/zeta_compare.jsonl"
+    if file_exists(rt_roadmap_default) {
+        let empty_ids = []
+        let empty_paths = []
+        let out = rt_track(rt_roadmap_default, rt_bench_default, empty_ids, empty_paths)
+        let results = out[1]
+        println("=== Anima Roadmap Phase Snapshot ===")
+        let mut i = 0
+        while i < len(results) {
+            let r = results[i]
+            println(r[0] + ": " + rt_itos(r[1]) + "% (tests " + rt_itos(r[2]) + "/" + rt_itos(r[3]) + ", bench " + rt_itos(r[4]) + ", phi_ok " + rt_itos(r[5]) + ")")
+            i = i + 1
+        }
+    }
+}
+
+
+// -- end inlined --
 
 println("=== test_roadmap_tracker ===")
 

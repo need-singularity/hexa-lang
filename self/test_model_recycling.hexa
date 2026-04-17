@@ -24,7 +24,348 @@
 //  Run: ./hexa self/test_model_recycling.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/model_recycling.hexa"
+// -- inlined from self/ml/model_recycling.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/model_recycling.hexa — Model Recycling
+//
+//  Weight inheritance across model generations — knowledge transfer
+//  between checkpoints with different architectures.
+//
+//  Implements:
+//    1. Layer mapping: align layers between source and target
+//    2. Width expansion: pad or project weights for different hidden sizes
+//    3. Depth expansion: duplicate or interpolate layers for deeper models
+//    4. Function-preserving transform: output matches before fine-tuning
+//    5. Progressive unfreezing: gradually unfreeze recycled layers
+//
+//  API (pure):
+//    mr_abs(x)                                       -> float
+//    mr_layer_map(src_depth, tgt_depth)               -> [int]
+//    mr_width_expand_pad(weights, new_cols)            -> [[float]]
+//    mr_width_expand_project(weights, proj_matrix)     -> [[float]]
+//    mr_depth_expand_dup(layers, tgt_depth)            -> [[[float]]]
+//    mr_depth_expand_interp(layers, tgt_depth)         -> [[[float]]]
+//    mr_function_preserving(src_layers, tgt_depth, tgt_width) -> [[[float]]]
+//    mr_unfreeze_schedule(step, total, n_layers)       -> [bool]
+//    mr_apply_unfreeze(layers, grads, schedule, lr)    -> [[[float]]]
+//    mr_matmul_2d(a, b)                               -> [[float]]
+//    mr_forward(layers, input)                        -> [float]
+//
+//  AI-NATIVE attrs:
+//    @pure     — no side effects
+//    @parallel — per-layer operations are independent
+// ═══════════════════════════════════════════════════════════════════
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn mr_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn mr_zeros_1d(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn mr_zeros_2d(r, c) {
+    let mut m = []
+    for _i in 0..r {
+        let mut row = []
+        for _j in 0..c { row = row + [0.0] }
+        m = m + [row]
+    }
+    return m
+}
+
+fn mr_copy_2d(w) {
+    let rows = len(w)
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..len(w[i]) { row = row + [w[i][j]] }
+        out = out + [row]
+    }
+    return out
+}
+
+fn mr_identity_2d(n) {
+    let mut m = mr_zeros_2d(n, n)
+    for i in 0..n { m[i][i] = 1.0 }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Layer Mapping — align source layers to target layers
+//
+//  Maps each target layer index to the nearest source layer index.
+//  Uses linear interpolation: target_i -> round(i * src_depth / tgt_depth).
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_layer_map(src_depth, tgt_depth) {
+    let mut mapping = []
+    for i in 0..tgt_depth {
+        let src_idx = (i * src_depth) / tgt_depth
+        mapping = mapping + [src_idx]
+    }
+    return mapping
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Width Expansion — Pad
+//
+//  Expand weight matrix to new_cols by zero-padding extra columns.
+//  Original weights are preserved in the first cols columns.
+// ═══════════════════════════════════════════════════════════════════
+@pure @parallel
+fn mr_width_expand_pad(weights, new_cols) {
+    let rows = len(weights)
+    let old_cols = len(weights[0])
+    if new_cols <= old_cols { return mr_copy_2d(weights) }
+    let mut out = []
+    for i in 0..rows {
+        let mut row = []
+        for j in 0..new_cols {
+            if j < old_cols {
+                row = row + [weights[i][j]]
+            } else {
+                row = row + [0.0]
+            }
+        }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Width Expansion — Project
+//
+//  Expand via projection matrix: new_W = W @ P
+//  Where P is (old_cols x new_cols). For function-preserving init,
+//  P should be identity padded with zeros.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_width_expand_project(weights, proj_matrix) {
+    let rows = len(weights)
+    let old_cols = len(weights[0])
+    let new_cols = len(proj_matrix[0])
+    let mut out = mr_zeros_2d(rows, new_cols)
+    for i in 0..rows {
+        for j in 0..new_cols {
+            let mut s = 0.0
+            for k in 0..old_cols {
+                s = s + weights[i][k] * proj_matrix[k][j]
+            }
+            out[i][j] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Depth Expansion — Duplicate
+//
+//  Create tgt_depth layers by duplicating source layers.
+//  Each target layer copies the mapped source layer directly.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_depth_expand_dup(layers, tgt_depth) {
+    let src_depth = len(layers)
+    let mapping = mr_layer_map(src_depth, tgt_depth)
+    let mut out = []
+    for i in 0..tgt_depth {
+        let src_idx = mapping[i]
+        out = out + [mr_copy_2d(layers[src_idx])]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Depth Expansion — Interpolate
+//
+//  Create tgt_depth layers by linearly interpolating between
+//  adjacent source layers. Smoother than duplication.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_depth_expand_interp(layers, tgt_depth) {
+    let src_depth = len(layers)
+    if src_depth <= 1 { return mr_depth_expand_dup(layers, tgt_depth) }
+
+    let rows = len(layers[0])
+    let cols = len(layers[0][0])
+    let mut out = []
+
+    for i in 0..tgt_depth {
+        // Map to fractional source position
+        let frac = to_float(i) * to_float(src_depth - 1) / to_float(tgt_depth - 1)
+        let lo = int(frac)
+        let mut hi = lo + 1
+        if hi >= src_depth { hi = src_depth - 1 }
+        let alpha = frac - to_float(lo)
+
+        // Interpolate: (1-alpha)*layers[lo] + alpha*layers[hi]
+        let mut layer = mr_zeros_2d(rows, cols)
+        for r in 0..rows {
+            for c in 0..cols {
+                layer[r][c] = (1.0 - alpha) * layers[lo][r][c] + alpha * layers[hi][r][c]
+            }
+        }
+        out = out + [layer]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Function-Preserving Transform
+//
+//  Expand both depth and width while preserving the function:
+//  - New layers are initialized as identity (no-op)
+//  - Width expansion pads with zeros
+//  This ensures the network output is identical before fine-tuning.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_function_preserving(src_layers, tgt_depth, tgt_width) {
+    let src_depth = len(src_layers)
+    let src_width = len(src_layers[0][0])
+
+    // Step 1: Depth expansion via duplication (preserves function)
+    let deep = mr_depth_expand_dup(src_layers, tgt_depth)
+
+    // Step 2: Width expansion via padding (preserves function)
+    let mut out = []
+    for i in 0..tgt_depth {
+        let expanded = mr_width_expand_pad(deep[i], tgt_width)
+        // Also need to expand rows to match new width for square layers
+        let old_rows = len(expanded)
+        if old_rows < tgt_width {
+            let mut full = mr_zeros_2d(tgt_width, tgt_width)
+            for r in 0..old_rows {
+                for c in 0..tgt_width {
+                    full[r][c] = expanded[r][c]
+                }
+            }
+            // New rows get identity initialization
+            for r in old_rows..tgt_width {
+                full[r][r] = 1.0
+            }
+            out = out + [full]
+        } else {
+            out = out + [expanded]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Progressive Unfreezing Schedule
+//
+//  Returns a boolean array indicating which layers are unfrozen.
+//  Layers unfreeze from top (output) to bottom (input) over training.
+//  At step 0: only top layer unfrozen.
+//  At step total: all layers unfrozen.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_unfreeze_schedule(step, total, n_layers) {
+    // Number of layers to unfreeze at this step
+    let frac = to_float(step + 1) / to_float(total)
+    let n_unfrozen = int(to_float(n_layers) * frac)
+    let mut actual = n_unfrozen
+    if actual < 1 { actual = 1 }
+    if actual > n_layers { actual = n_layers }
+
+    let mut schedule = []
+    for i in 0..n_layers {
+        // Unfreeze from top: last `actual` layers are unfrozen
+        if i >= n_layers - actual {
+            schedule = schedule + [true]
+        } else {
+            schedule = schedule + [false]
+        }
+    }
+    return schedule
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Apply Unfreeze — update only unfrozen layers
+// ═══════════════════════════════════════════════════════════════════
+fn mr_apply_unfreeze(layers, grads, schedule, lr) {
+    let n_layers = len(layers)
+    let mut out = []
+    for l in 0..n_layers {
+        if schedule[l] {
+            // Unfrozen: apply gradient update
+            let rows = len(layers[l])
+            let cols = len(layers[l][0])
+            let mut new_layer = mr_copy_2d(layers[l])
+            for i in 0..rows {
+                for j in 0..cols {
+                    new_layer[i][j] = new_layer[i][j] - lr * grads[l][i][j]
+                }
+            }
+            out = out + [new_layer]
+        } else {
+            // Frozen: keep unchanged
+            out = out + [mr_copy_2d(layers[l])]
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2D Matrix Multiply
+// ═══════════════════════════════════════════════════════════════════
+@pure
+fn mr_matmul_2d(a, b) {
+    let rows_a = len(a)
+    let cols_a = len(a[0])
+    let cols_b = len(b[0])
+    let mut out = mr_zeros_2d(rows_a, cols_b)
+    for i in 0..rows_a {
+        for j in 0..cols_b {
+            let mut s = 0.0
+            for k in 0..cols_a {
+                s = s + a[i][k] * b[k][j]
+            }
+            out[i][j] = s
+        }
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Forward Pass — run input through all layers
+//  y = layer_n @ ... @ layer_1 @ input
+//  (simplified: tanh activation between layers)
+// ═══════════════════════════════════════════════════════════════════
+fn mr_forward(layers, input) {
+    let n_layers = len(layers)
+    let dim = len(input)
+    let mut h = mr_zeros_1d(dim)
+    for i in 0..dim { h[i] = input[i] }
+
+    for l in 0..n_layers {
+        let rows = len(layers[l])
+        let cols = len(layers[l][0])
+        let mut new_h = mr_zeros_1d(rows)
+        for i in 0..rows {
+            let mut s = 0.0
+            for j in 0..cols {
+                if j < len(h) {
+                    s = s + layers[l][i][j] * h[j]
+                }
+            }
+            new_h[i] = s
+        }
+        h = new_h
+    }
+    return h
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

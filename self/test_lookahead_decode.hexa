@@ -1,5 +1,454 @@
 // test_lookahead_decode.hexa -- Lookahead Decoding (#101) tests
-import "ml/lookahead_decode.hexa"
+// -- inlined from self/ml/lookahead_decode.hexa --
+// codegen import not wired for test files
+
+// =====================================================================
+//  self/ml/lookahead_decode.hexa -- Lookahead Decoding (#101)
+//
+//  Jacobi iteration + n-gram parallel decode.
+//
+//  Core idea (Lookahead Decoding, Fu et al. 2024):
+//    1. Maintain a lookahead window of W future token positions.
+//    2. Jacobi iteration: refine all W positions in parallel from
+//       a frozen snapshot (classic Jacobi, not Gauss-Seidel).
+//    3. Collect n-grams from *all* Jacobi trajectories into a pool.
+//    4. At verification time, query the n-gram pool for cached
+//       continuations to extend the proposal beyond the window.
+//    5. Target model verifies the full proposal in one pass.
+//    6. Accept the longest matching prefix (trajectory merge).
+//    7. Commit accepted tokens, advance context, repeat.
+//
+//  Hyperparameters:
+//    window  -- parallel lookahead width (W positions)
+//    ngram   -- n-gram order for the pool (e.g. 2=bigram)
+//    iters   -- Jacobi refinement iterations per step
+//
+//  Mock models are deterministic hash functions over the context tail
+//  so tests are reproducible. @lookahead_decode is parser-accepted.
+//
+//  API (pure):
+//    lad_ctx_hash(ctx)                          -> int
+//    lad_draft(ctx)                             -> int
+//    lad_target(ctx)                            -> int
+//    jacobi_init(ctx, window)                   -> [int]
+//    jacobi_step(ctx, buf, window)              -> [int]
+//    jacobi_converged(a, b)                     -> bool
+//    jacobi_refine(ctx, window, iters)          -> [int]
+//    jacobi_collect_trajectories(ctx,win,iters) -> [[int]]
+//    ngram_key(toks, start, n)                  -> int
+//    ngram_store(pool, key, tok)                -> pool
+//    ngram_lookup(pool, key)                    -> int (-1=miss)
+//    ngram_record(pool, seq, n)                 -> pool
+//    ngram_pool_extend(pool, ctx, proposal, n)  -> [int]
+//    ngram_pool_size(pool)                      -> int
+//    trajectory_record_all(pool, trajs, ctx, n) -> pool
+//    lad_verify(ctx, proposal)                  -> [int]
+//    lad_accept(proposal, verified)             -> int
+//    lad_trajectory_merge(proposals, ctx)       -> [int]
+//    @lookahead_decode
+//    lookahead_step(ctx, window, ngram, max_tokens)
+//        -> [out, [total_proposed], [total_accepted],
+//            [steps], [ngram_hits], [jacobi_iters_total]]
+// =====================================================================
+
+// -- context hash (XOR of tail, window=4) --
+fn lad_ctx_hash(ctx) {
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 11) * 2246822519)
+        i = i + 1
+    }
+    h
+}
+
+// -- mock draft model (fast, deterministic) --
+fn lad_draft(ctx) {
+    let h = lad_ctx_hash(ctx)
+    let v = h % 16
+    if v < 0 { v + 16 } else { v }
+}
+
+// -- mock target model (agrees with draft ~80% of the time) --
+fn lad_target(ctx) {
+    let h = lad_ctx_hash(ctx)
+    let d = lad_draft(ctx)
+    if (h % 5) == 0 {
+        (d + 3) % 16
+    } else {
+        d
+    }
+}
+
+// -- Jacobi initialization: seed buffer with independent drafts --
+fn jacobi_init(ctx, window) {
+    let mut buf = []
+    let mut i = 0
+    while i < window {
+        buf = buf + [lad_draft(ctx)]
+        i = i + 1
+    }
+    buf
+}
+
+// -- Single Jacobi step: given frozen snapshot `buf`, recompute
+//    each position j from (ctx + buf[0..j]) using the draft model.
+fn jacobi_step(ctx, buf, window) {
+    let mut next = []
+    let mut j = 0
+    while j < window {
+        let mut local = []
+        let mut k = 0
+        while k < len(ctx) {
+            local = local + [ctx[k]]
+            k = k + 1
+        }
+        let mut q = 0
+        while q < j {
+            local = local + [buf[q]]
+            q = q + 1
+        }
+        next = next + [lad_draft(local)]
+        j = j + 1
+    }
+    next
+}
+
+// -- Check if two buffers are identical (Jacobi fixpoint) --
+fn jacobi_converged(a, b) {
+    if len(a) != len(b) {
+        return false
+    }
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] {
+            return false
+        }
+        i = i + 1
+    }
+    true
+}
+
+// -- Jacobi refinement: iterate until fixpoint or max iters --
+//    Returns final buffer.
+fn jacobi_refine(ctx, window, iters) {
+    let mut buf = jacobi_init(ctx, window)
+    let mut it = 0
+    while it < iters {
+        let prev = buf
+        buf = jacobi_step(ctx, prev, window)
+        if jacobi_converged(buf, prev) {
+            it = iters
+        } else {
+            it = it + 1
+        }
+    }
+    buf
+}
+
+// -- Jacobi trajectory collection: record every intermediate --
+//    buffer from all Jacobi iterations. Each trajectory is a
+//    snapshot of the W-token buffer at one iteration. These feed
+//    the n-gram pool with diverse candidate sequences.
+fn jacobi_collect_trajectories(ctx, window, iters) {
+    let mut buf = jacobi_init(ctx, window)
+    let mut trajs = [buf]
+    let mut it = 0
+    while it < iters {
+        let prev = buf
+        buf = jacobi_step(ctx, prev, window)
+        trajs = trajs + [buf]
+        if jacobi_converged(buf, prev) {
+            it = iters
+        } else {
+            it = it + 1
+        }
+    }
+    trajs
+}
+
+// -- n-gram pool: hashmap keyed by integer n-gram hash --
+fn ngram_key(toks, start, n) {
+    let mut h = 146527
+    let mut i = 0
+    while i < n {
+        h = h ^ ((toks[start + i] + 1) * (i + 13) * 2654435761)
+        i = i + 1
+    }
+    h
+}
+
+fn ngram_store(pool, key, tok) {
+    let k = to_string(key)
+    pool[k] = tok
+    pool
+}
+
+fn ngram_lookup(pool, key) {
+    let k = to_string(key)
+    if has_key(pool, k) {
+        pool[k]
+    } else {
+        -1
+    }
+}
+
+// Record all (seq[i..i+n] -> seq[i+n]) n-grams from a token sequence.
+fn ngram_record(pool, seq, n) {
+    let mut c = pool
+    let slen = len(seq)
+    if slen <= n {
+        return c
+    }
+    let mut i = 0
+    while (i + n) < slen {
+        let key = ngram_key(seq, i, n)
+        c = ngram_store(c, key, seq[i + n])
+        i = i + 1
+    }
+    c
+}
+
+// Count entries in the n-gram pool.
+fn ngram_pool_size(pool) {
+    len(keys(pool))
+}
+
+// -- n-gram pool extension: given a proposal, try to extend it
+//    by looking up successive n-grams from the pool. Returns
+//    the extended proposal (original + any pool continuations).
+fn ngram_pool_extend(pool, ctx, proposal, n) {
+    let mut extended = []
+    let mut i = 0
+    while i < len(proposal) {
+        extended = extended + [proposal[i]]
+        i = i + 1
+    }
+    // Build tail context: ctx + proposal, then try to extend
+    let mut tail = []
+    let mut ci = 0
+    while ci < len(ctx) {
+        tail = tail + [ctx[ci]]
+        ci = ci + 1
+    }
+    let mut pi = 0
+    while pi < len(extended) {
+        tail = tail + [extended[pi]]
+        pi = pi + 1
+    }
+    // Greedily extend up to 8 more tokens from pool
+    let mut ext_count = 0
+    while ext_count < 8 {
+        let tlen = len(tail)
+        if tlen < n {
+            ext_count = 8
+        } else {
+            let key = ngram_key(tail, tlen - n, n)
+            let hit = ngram_lookup(pool, key)
+            if hit >= 0 {
+                extended = extended + [hit]
+                tail = tail + [hit]
+                ext_count = ext_count + 1
+            } else {
+                ext_count = 8
+            }
+        }
+    }
+    extended
+}
+
+// -- Record n-grams from ALL Jacobi trajectories into the pool.
+//    Each trajectory is prepended with ctx to form a full sequence.
+fn trajectory_record_all(pool, trajs, ctx, n) {
+    let mut c = pool
+    let mut ti = 0
+    while ti < len(trajs) {
+        let traj = trajs[ti]
+        // Build full sequence: ctx + traj
+        let mut seq = []
+        let mut ci = 0
+        while ci < len(ctx) {
+            seq = seq + [ctx[ci]]
+            ci = ci + 1
+        }
+        let mut j = 0
+        while j < len(traj) {
+            seq = seq + [traj[j]]
+            j = j + 1
+        }
+        c = ngram_record(c, seq, n)
+        ti = ti + 1
+    }
+    c
+}
+
+// -- target verify: at each position j, what would target output
+//    given ctx + proposal[0..j]?
+fn lad_verify(ctx, proposal) {
+    let mut local = []
+    let mut i = 0
+    while i < len(ctx) {
+        local = local + [ctx[i]]
+        i = i + 1
+    }
+    let mut out = []
+    let mut j = 0
+    while j < len(proposal) {
+        let t = lad_target(local)
+        out = out + [t]
+        local = local + [proposal[j]]
+        j = j + 1
+    }
+    out
+}
+
+// -- accept longest matching prefix --
+fn lad_accept(proposal, verified) {
+    let n = len(proposal)
+    let mut i = 0
+    while i < n {
+        if proposal[i] != verified[i] {
+            return i
+        }
+        i = i + 1
+    }
+    n
+}
+
+// -- trajectory merge: given multiple proposal candidates (from
+//    Jacobi + n-gram extension), pick the one that yields the
+//    longest accepted prefix when verified against the target.
+fn lad_trajectory_merge(proposals, ctx) {
+    let mut best_proposal = []
+    let mut best_accepted = 0
+    let mut pi = 0
+    while pi < len(proposals) {
+        let prop = proposals[pi]
+        if len(prop) > 0 {
+            let ver = lad_verify(ctx, prop)
+            let nacc = lad_accept(prop, ver)
+            if nacc > best_accepted {
+                best_accepted = nacc
+                best_proposal = prop
+            }
+        }
+        pi = pi + 1
+    }
+    best_proposal
+}
+
+// -- @lookahead_decode: full Jacobi + n-gram pool decode loop --
+//    Returns [out, [total_proposed], [total_accepted],
+//             [steps], [ngram_hits], [jacobi_iters_total]]
+@lookahead_decode
+fn lookahead_step(ctx, window, ngram, max_tokens) {
+    // working context
+    let mut cur = []
+    let mut i = 0
+    while i < len(ctx) {
+        cur = cur + [ctx[i]]
+        i = i + 1
+    }
+    let mut pool = #{}
+    let mut produced = 0
+    let mut total_proposed = 0
+    let mut total_accepted = 0
+    let mut steps = 0
+    let mut ngram_hits = 0
+    let mut jacobi_iters_total = 0
+    let jiters = 3
+
+    while produced < max_tokens {
+        let remain = max_tokens - produced
+        let ww = if window < remain { window } else { remain }
+
+        // 1. Jacobi iteration: collect all trajectories.
+        let trajs = jacobi_collect_trajectories(cur, ww, jiters)
+        jacobi_iters_total = jacobi_iters_total + len(trajs)
+
+        // 2. Record n-grams from all trajectories into pool.
+        pool = trajectory_record_all(pool, trajs, cur, ngram)
+
+        // 3. Final Jacobi proposal = last trajectory.
+        let base_proposal = trajs[len(trajs) - 1]
+
+        // 4. n-gram pool extension: try to extend the proposal
+        //    beyond the window using cached n-grams.
+        let mut proposal = base_proposal
+        if len(cur) >= ngram {
+            let key = ngram_key(cur, len(cur) - ngram, ngram)
+            let hit = ngram_lookup(pool, key)
+            if hit >= 0 {
+                // Replace head with cached suggestion for better match.
+                let mut boosted = [hit]
+                let mut b = 1
+                while b < len(base_proposal) {
+                    boosted = boosted + [base_proposal[b]]
+                    b = b + 1
+                }
+                ngram_hits = ngram_hits + 1
+                // Also try n-gram extended proposal.
+                let extended = ngram_pool_extend(pool, cur, base_proposal, ngram)
+                // trajectory merge: pick best among base, boosted, extended
+                let best = lad_trajectory_merge([base_proposal, boosted, extended], cur)
+                if len(best) > 0 {
+                    proposal = best
+                }
+            } else {
+                // Try extension even without head replacement.
+                let extended = ngram_pool_extend(pool, cur, base_proposal, ngram)
+                if len(extended) > len(base_proposal) {
+                    let best = lad_trajectory_merge([base_proposal, extended], cur)
+                    if len(best) > 0 {
+                        proposal = best
+                    }
+                }
+            }
+        }
+
+        // 5. Target verify the final proposal.
+        let verified = lad_verify(cur, proposal)
+        let n_acc = lad_accept(proposal, verified)
+
+        // 6. Commit accepted prefix.
+        let mut j = 0
+        while j < n_acc {
+            cur = cur + [proposal[j]]
+            j = j + 1
+        }
+        // If nothing accepted, force one token from target.
+        if n_acc == 0 {
+            cur = cur + [verified[0]]
+            produced = produced + 1
+        } else {
+            // Respect max_tokens cap.
+            let commit = if n_acc < remain { n_acc } else { remain }
+            produced = produced + commit
+        }
+
+        // 7. Record n-grams from the updated context.
+        pool = ngram_record(pool, cur, ngram)
+
+        total_proposed = total_proposed + len(proposal)
+        total_accepted = total_accepted + n_acc
+        steps = steps + 1
+    }
+
+    // Extract the newly produced tail (exclude original ctx).
+    let mut out = []
+    let start = len(ctx)
+    let mut m = start
+    while m < len(cur) {
+        out = out + [cur[m]]
+        m = m + 1
+    }
+    [out, [total_proposed], [total_accepted], [steps], [ngram_hits], [jacobi_iters_total]]
+}
+
+
+// -- end inlined --
 
 let mut pass = 0
 let mut fail = 0

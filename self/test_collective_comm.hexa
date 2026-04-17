@@ -11,7 +11,463 @@
 //  ML roadmap #239 — Collective Comm Ops
 // ===================================================================
 
-import "ml/collective_comm.hexa"
+// -- inlined from self/ml/collective_comm.hexa --
+// codegen import not wired for test files
+
+// ===================================================================
+//  collective_comm.hexa — Collective Communication Ops
+//
+//  Pure .hexa CPU simulation of AllReduce, AllGather, ReduceScatter
+//  with ring-based topology and bandwidth-optimal chunking.
+//
+//  Each "rank" is an index 0..num_workers-1 into arrays of local
+//  tensors. Communication is simulated by reading/writing these
+//  arrays — no NCCL, no network, no CUDA.
+//
+//  Primitives:
+//    - AllReduce: ring-based sum/avg across workers
+//    - AllGather: gather tensors from all workers into one full tensor
+//    - ReduceScatter: reduce then scatter result shards
+//    - Ring topology helpers: next/prev rank in circular order
+//    - Bandwidth-optimal chunking: pipeline segments for large tensors
+//
+//  ML roadmap #239 — Collective Comm Ops
+// ===================================================================
+
+// ── Array helpers ────────────────────────────────────────────
+
+fn cc_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+fn cc_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+fn cc_slice(src, begin, end) {
+    let mut out = []
+    let mut i = begin
+    while i < end {
+        out = out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+// ── Ring topology ────────────────────────────────────────────
+
+fn cc_ring_next(rank, num_workers) {
+    (rank + 1) % num_workers
+}
+
+fn cc_ring_prev(rank, num_workers) {
+    (rank - 1 + num_workers) % num_workers
+}
+
+// Build ring order as an array [0, 1, 2, ..., num_workers-1]
+fn cc_ring_order(num_workers) {
+    let mut order = []
+    let mut i = 0
+    while i < num_workers {
+        order = order.push(i)
+        i = i + 1
+    }
+    order
+}
+
+// Verify ring connectivity: each rank's next wraps correctly
+fn cc_verify_ring(num_workers) {
+    let mut ok = true
+    let mut r = 0
+    while r < num_workers {
+        let nxt = cc_ring_next(r, num_workers)
+        let prv = cc_ring_prev(nxt, num_workers)
+        if prv != r {
+            ok = false
+        }
+        r = r + 1
+    }
+    ok
+}
+
+// ── Chunk helpers for bandwidth-optimal pipelining ──────────
+
+// Split a flat tensor of length n into num_chunks roughly equal parts.
+// Returns array of [begin, end] pairs.
+fn cc_compute_chunks(n, num_chunks) {
+    let mut chunks = []
+    let mut c = 0
+    while c < num_chunks {
+        let begin = (n * c) / num_chunks
+        let end = (n * (c + 1)) / num_chunks
+        chunks = chunks.push([begin, end])
+        c = c + 1
+    }
+    chunks
+}
+
+// Extract chunk c from flat tensor
+fn cc_get_chunk(tensor, chunks, c) {
+    let pair = chunks[c]
+    let begin = pair[0]
+    let end = pair[1]
+    cc_slice(tensor, begin, end)
+}
+
+// Write chunk data back into tensor at chunk c position
+fn cc_set_chunk(tensor, chunks, c, data) {
+    let pair = chunks[c]
+    let begin = pair[0]
+    let end = pair[1]
+    let mut out = cc_copy(tensor)
+    let mut i = 0
+    while i < end - begin {
+        out[begin + i] = data[i]
+        i = i + 1
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AllReduce — ring-based sum
+//
+//  Algorithm (Baidu ring allreduce):
+//    Phase 1 — Reduce-scatter: N-1 steps. Each step, rank r sends
+//      chunk (r - step) to rank (r+1), which adds it to its local copy.
+//      After N-1 steps each rank holds the fully reduced chunk for one
+//      chunk index.
+//    Phase 2 — AllGather: N-1 steps. Each step, rank r sends its
+//      complete chunk to rank (r+1). After N-1 steps every rank has
+//      all reduced chunks.
+//
+//  We simulate all workers in a single process using an array of
+//  per-rank tensor copies.
+// ═══════════════════════════════════════════════════════════════
+
+fn cc_allreduce_ring_sum(tensors, num_workers) {
+    let n = len(tensors[0])
+    let num_chunks = num_workers
+    let chunks = cc_compute_chunks(n, num_chunks)
+
+    // Copy per-rank tensors into mutable buffers
+    let mut bufs = []
+    let mut r = 0
+    while r < num_workers {
+        bufs = bufs.push(cc_copy(tensors[r]))
+        r = r + 1
+    }
+
+    // Phase 1: reduce-scatter
+    let mut step = 0
+    while step < num_workers - 1 {
+        // Each rank sends a chunk to its ring neighbor
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_workers {
+            new_bufs = new_bufs.push(cc_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_workers {
+            let send_chunk_idx = ((rr - step) % num_chunks + num_chunks) % num_chunks
+            let recv_rank = cc_ring_next(rr, num_workers)
+            let send_data = cc_get_chunk(bufs[rr], chunks, send_chunk_idx)
+            let recv_data = cc_get_chunk(new_bufs[recv_rank], chunks, send_chunk_idx)
+            let chunk_pair = chunks[send_chunk_idx]
+            let chunk_len = chunk_pair[1] - chunk_pair[0]
+            let mut summed = []
+            let mut i = 0
+            while i < chunk_len {
+                summed = summed.push(recv_data[i] + send_data[i])
+                i = i + 1
+            }
+            new_bufs[recv_rank] = cc_set_chunk(new_bufs[recv_rank], chunks, send_chunk_idx, summed)
+            rr = rr + 1
+        }
+
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    // Phase 2: allgather
+    step = 0
+    while step < num_workers - 1 {
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_workers {
+            new_bufs = new_bufs.push(cc_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_workers {
+            let send_chunk_idx = ((rr - step + 1) % num_chunks + num_chunks) % num_chunks
+            let recv_rank = cc_ring_next(rr, num_workers)
+            let send_data = cc_get_chunk(bufs[rr], chunks, send_chunk_idx)
+            new_bufs[recv_rank] = cc_set_chunk(new_bufs[recv_rank], chunks, send_chunk_idx, send_data)
+            rr = rr + 1
+        }
+
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    bufs
+}
+
+// AllReduce with averaging (divide by num_workers after sum)
+fn cc_allreduce_ring_avg(tensors, num_workers) {
+    let summed = cc_allreduce_ring_sum(tensors, num_workers)
+    let n = len(summed[0])
+    let div = to_float(num_workers)
+    let mut result = []
+    let mut r = 0
+    while r < num_workers {
+        let mut avg = []
+        let mut i = 0
+        while i < n {
+            avg = avg.push(summed[r][i] / div)
+            i = i + 1
+        }
+        result = result.push(avg)
+        r = r + 1
+    }
+    result
+}
+
+// Simple (non-ring) allreduce for reference/correctness comparison
+fn cc_allreduce_naive_sum(tensors, num_workers) {
+    let n = len(tensors[0])
+    let mut summed = cc_zeros(n)
+    let mut r = 0
+    while r < num_workers {
+        let mut i = 0
+        while i < n {
+            summed[i] = summed[i] + tensors[r][i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    // Broadcast to all ranks
+    let mut result = []
+    r = 0
+    while r < num_workers {
+        result = result.push(cc_copy(summed))
+        r = r + 1
+    }
+    result
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  AllGather — gather per-rank shards into full tensor
+//
+//  Each rank holds a local shard. After allgather, every rank
+//  holds the concatenation of all shards in rank order.
+// ═══════════════════════════════════════════════════════════════
+
+fn cc_allgather(shards, num_workers) {
+    // Build full tensor by concatenation
+    let mut full = []
+    let mut r = 0
+    while r < num_workers {
+        let shard = shards[r]
+        let sn = len(shard)
+        let mut i = 0
+        while i < sn {
+            full = full.push(shard[i])
+            i = i + 1
+        }
+        r = r + 1
+    }
+    // Broadcast full tensor to all ranks
+    let mut result = []
+    r = 0
+    while r < num_workers {
+        result = result.push(cc_copy(full))
+        r = r + 1
+    }
+    result
+}
+
+// Ring-based allgather: simulate ring passing of shards
+fn cc_allgather_ring(shards, num_workers) {
+    let shard_len = len(shards[0])
+    let full_len = shard_len * num_workers
+
+    // Initialize per-rank buffers with their own shard in position
+    let mut bufs = []
+    let mut r = 0
+    while r < num_workers {
+        let mut buf = cc_zeros(full_len)
+        let offset = r * shard_len
+        let mut i = 0
+        while i < shard_len {
+            buf[offset + i] = shards[r][i]
+            i = i + 1
+        }
+        bufs = bufs.push(buf)
+        r = r + 1
+    }
+
+    // N-1 ring steps: each step, rank r sends a segment to rank r+1
+    let mut step = 0
+    while step < num_workers - 1 {
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_workers {
+            new_bufs = new_bufs.push(cc_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_workers {
+            // Rank rr sends segment (rr - step) mod N to next
+            let seg_idx = ((rr - step) % num_workers + num_workers) % num_workers
+            let seg_offset = seg_idx * shard_len
+            let recv_rank = cc_ring_next(rr, num_workers)
+            let mut i = 0
+            while i < shard_len {
+                new_bufs[recv_rank][seg_offset + i] = bufs[rr][seg_offset + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    bufs
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ReduceScatter — reduce then scatter
+//
+//  Each rank starts with a full tensor. After reduce-scatter,
+//  rank r holds only its shard of the element-wise sum.
+// ═══════════════════════════════════════════════════════════════
+
+fn cc_reducescatter(tensors, num_workers) {
+    let n = len(tensors[0])
+    let shard_size = n / num_workers
+
+    // Element-wise sum all tensors
+    let mut summed = cc_zeros(n)
+    let mut r = 0
+    while r < num_workers {
+        let mut i = 0
+        while i < n {
+            summed[i] = summed[i] + tensors[r][i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+
+    // Scatter: rank r gets shard [r*shard_size .. (r+1)*shard_size)
+    let mut result = []
+    r = 0
+    while r < num_workers {
+        let begin = r * shard_size
+        let end = begin + shard_size
+        result = result.push(cc_slice(summed, begin, end))
+        r = r + 1
+    }
+    result
+}
+
+// Ring-based reduce-scatter
+// Uses the reduce-scatter phase of the ring allreduce algorithm.
+// After N-1 ring steps, rank r holds the fully reduced chunk r.
+fn cc_reducescatter_ring(tensors, num_workers) {
+    let n = len(tensors[0])
+    let num_chunks = num_workers
+    let chunks = cc_compute_chunks(n, num_chunks)
+
+    // Copy per-rank tensors
+    let mut bufs = []
+    let mut r = 0
+    while r < num_workers {
+        bufs = bufs.push(cc_copy(tensors[r]))
+        r = r + 1
+    }
+
+    // N-1 ring reduce steps. In step s, rank rr sends chunk
+    // ((rr+1) - s - 1) mod N  to rank (rr+1) mod N, which accumulates it.
+    // After all steps, rank r owns the fully reduced chunk r.
+    let mut step = 0
+    while step < num_workers - 1 {
+        let mut new_bufs = []
+        let mut rr = 0
+        while rr < num_workers {
+            new_bufs = new_bufs.push(cc_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < num_workers {
+            let recv_rank = (rr + 1) % num_workers
+            // The chunk that recv_rank will own at the end is recv_rank.
+            // In step s, we accumulate chunk (recv_rank - s) mod N on recv_rank.
+            let send_chunk_idx = ((recv_rank - step) % num_chunks + num_chunks) % num_chunks
+            let chunk_pair = chunks[send_chunk_idx]
+            let cbegin = chunk_pair[0]
+            let cend = chunk_pair[1]
+            let chunk_len = cend - cbegin
+            let mut i = 0
+            while i < chunk_len {
+                new_bufs[recv_rank][cbegin + i] = new_bufs[recv_rank][cbegin + i] + bufs[rr][cbegin + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = new_bufs
+        step = step + 1
+    }
+
+    // Each rank keeps only its own chunk
+    let mut result = []
+    r = 0
+    while r < num_workers {
+        let chunk_pair = chunks[r]
+        result = result.push(cc_slice(bufs[r], chunk_pair[0], chunk_pair[1]))
+        r = r + 1
+    }
+    result
+}
+
+// ── Bandwidth metrics ────────────────────────────────────────
+
+// Compute the total data volume moved in a ring allreduce
+// Formula: 2 * (N-1)/N * tensor_size (for sum: scatter + gather)
+fn cc_ring_bandwidth_volume(tensor_size, num_workers) {
+    let n = to_float(num_workers)
+    2.0 * (n - 1.0) / n * to_float(tensor_size)
+}
+
+// Number of ring steps for allreduce
+fn cc_ring_total_steps(num_workers) {
+    2 * (num_workers - 1)
+}
+
+println("[collective_comm] module loaded — AllReduce/AllGather/ReduceScatter ready")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

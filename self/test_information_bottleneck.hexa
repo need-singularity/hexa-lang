@@ -4,7 +4,332 @@
 //  Run: PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_information_bottleneck.hexa
 // ═══════════════════════════════════════════════════════════════════
 
-import "ml/information_bottleneck.hexa"
+// -- inlined from self/ml/information_bottleneck.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/information_bottleneck.hexa — Information Bottleneck (#270)
+//
+//  Variational Information Bottleneck (β-VIB, Alemi et al. 2016):
+//
+//      L(x,y) = E_q(z|x) [-log p(y|z)]  +  β · KL(q(z|x) || p(z))
+//      p(z)   = N(0, I)
+//      q(z|x) = N(μ(x), σ²(x) I)
+//
+//  We implement:
+//    - encoder  : linear, returns (μ, log σ²)
+//    - decoder  : linear, returns logits over K classes
+//    - reparam  : z = μ + σ · ε            (ε deterministic from seed)
+//    - KL       : analytical N(μ,σ²) ‖ N(0,1)
+//    - total loss
+//    - 1-step gradient descent via finite differences
+//
+//  API:
+//    ib_encode(inp, W_mu, W_logvar)                    -> [mu, logvar]
+//    ib_reparam(mu, logvar, seed)                      -> [float]   z
+//    ib_decode(z, W_dec)                               -> [float]   logits
+//    ib_softmax(logits)                                -> [float]
+//    ib_cross_entropy(probs, label)                    -> float
+//    ib_kl_gaussian(mu, logvar)                        -> float
+//    ib_loss(inp, label, W_mu, W_logvar, W_dec, beta, seed) -> #{"loss","ce","kl"}
+//    ib_batch_loss(X, Y, W_mu, W_logvar, W_dec, beta, seed) -> float
+//    ib_train_step(W_mu, W_logvar, W_dec, X, Y, beta, lr, seed) -> #{"W_mu","W_logvar","W_dec","loss"}
+// ═══════════════════════════════════════════════════════════════════
+
+fn ib_exp(inp) {
+    let mut v = inp
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    for i in 1..30 {
+        term = term * v / to_float(i)
+        result = result + term
+    }
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn ib_log(inp) {
+    if inp <= 0.0 { return -30.0 }
+    let mut v = inp
+    let mut count = 0
+    while v > 2.0 {
+        v = v / 2.718281828
+        count = count + 1
+    }
+    while v < 0.5 {
+        v = v * 2.718281828
+        count = count - 1
+    }
+    let d = v - 1.0
+    let ln_v = d - d * d / 2.0 + d * d * d / 3.0 - d * d * d * d / 4.0
+    return to_float(count) + ln_v
+}
+
+fn ib_sqrt(inp) {
+    if inp <= 0.0 { return 0.0 }
+    let mut g = inp / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 { g = (g + inp / g) / 2.0 }
+    return g
+}
+
+fn ib_zeros(n) {
+    let mut v = []
+    for _i in 0..n { v = v + [0.0] }
+    return v
+}
+
+fn ib_hash(seed, idx) {
+    let mut h = (seed + 1) * 2654435761 + (idx + 1) * 1315423911
+    h = h % 1000003
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn ib_rand01(seed, idx) {
+    let h = ib_hash(seed, idx)
+    return to_float(h % 10000) / 10000.0
+}
+
+// Box-Muller like deterministic Gaussian ε
+fn ib_eps(seed, idx) {
+    let mut u = ib_rand01(seed, idx * 2 + 1)
+    if u < 1.0e-6 { u = 1.0e-6 }
+    let v = ib_rand01(seed, idx * 2 + 2)
+    let r = ib_sqrt(-2.0 * ib_log(u))
+    // Use a cheap cosine approximation: cos(2πv) via 4-term series
+    let two_pi = 6.2831853
+    let theta = two_pi * v
+    // wrap to [-π, π]
+    let mut t = theta
+    while t > 3.14159265 { t = t - two_pi }
+    while t < -3.14159265 { t = t + two_pi }
+    let t2 = t * t
+    let c = 1.0 - t2 / 2.0 + t2 * t2 / 24.0 - t2 * t2 * t2 / 720.0
+    return r * c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  1. Encoder
+//
+//  W_mu, W_logvar are shapes [D_z][D_x]. Returns [[mu], [logvar]].
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_encode(inp, W_mu, W_logvar) {
+    let Dz = len(W_mu)
+    let Dx = len(inp)
+    let mut mu = ib_zeros(Dz)
+    let mut logvar = ib_zeros(Dz)
+    for k in 0..Dz {
+        let mut sm = 0.0
+        let mut sv = 0.0
+        for j in 0..Dx {
+            sm = sm + W_mu[k][j] * inp[j]
+            sv = sv + W_logvar[k][j] * inp[j]
+        }
+        mu[k] = sm
+        logvar[k] = sv
+    }
+    return [mu, logvar]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  2. Reparameterisation trick
+//
+//  z = μ + σ · ε,  σ = exp(logvar/2)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_reparam(mu, logvar, seed) {
+    let Dz = len(mu)
+    let mut z = ib_zeros(Dz)
+    for k in 0..Dz {
+        let sigma = ib_exp(logvar[k] / 2.0)
+        let e = ib_eps(seed, k)
+        z[k] = mu[k] + sigma * e
+    }
+    return z
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  3. Decoder
+//
+//  W_dec : [K][D_z]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_decode(vec, W_dec) {
+    let K = len(W_dec)
+    let Dz = len(vec)
+    let mut logits = ib_zeros(K)
+    for k in 0..K {
+        let mut s = 0.0
+        for j in 0..Dz {
+            s = s + W_dec[k][j] * vec[j]
+        }
+        logits[k] = s
+    }
+    return logits
+}
+
+@pure
+fn ib_softmax(logits) {
+    let n = len(logits)
+    let mut mx = logits[0]
+    for i in 1..n {
+        if logits[i] > mx { mx = logits[i] }
+    }
+    let mut out = ib_zeros(n)
+    let mut z = 0.0
+    for i in 0..n {
+        out[i] = ib_exp(logits[i] - mx)
+        z = z + out[i]
+    }
+    if z < 1.0e-15 {
+        for i in 0..n { out[i] = 1.0 / to_float(n) }
+    } else {
+        for i in 0..n { out[i] = out[i] / z }
+    }
+    return out
+}
+
+@pure
+fn ib_cross_entropy(probs, label) {
+    let mut p = probs[label]
+    if p < 1.0e-12 { p = 1.0e-12 }
+    return 0.0 - ib_log(p)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  4. KL divergence
+//
+//  For N(μ, σ²) || N(0, 1):
+//      KL = 0.5 * Σ (exp(logvar) + μ² - 1 - logvar)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_kl_gaussian(mu, logvar) {
+    let Dz = len(mu)
+    let mut kl = 0.0
+    for k in 0..Dz {
+        let var_k = ib_exp(logvar[k])
+        kl = kl + var_k + mu[k] * mu[k] - 1.0 - logvar[k]
+    }
+    return 0.5 * kl
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. VIB loss for a single example
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_loss(inp, label, W_mu, W_logvar, W_dec, beta, seed) {
+    let enc = ib_encode(inp, W_mu, W_logvar)
+    let mu = enc[0]
+    let logvar = enc[1]
+    let vec = ib_reparam(mu, logvar, seed)
+    let logits = ib_decode(vec, W_dec)
+    let probs = ib_softmax(logits)
+    let ce = ib_cross_entropy(probs, label)
+    let kl = ib_kl_gaussian(mu, logvar)
+    return #{
+        "loss": ce + beta * kl,
+        "ce": ce,
+        "kl": kl
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Batch loss (mean)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+fn ib_batch_loss(X, Y, W_mu, W_logvar, W_dec, beta, seed) {
+    let n = len(X)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    for i in 0..n {
+        let r = ib_loss(X[i], Y[i], W_mu, W_logvar, W_dec, beta, seed + i)
+        total = total + r["loss"]
+    }
+    return total / to_float(n)
+}
+
+fn ib_copy2(M) {
+    let R = len(M)
+    let C = len(M[0])
+    let mut out = []
+    for r in 0..R {
+        let mut row = ib_zeros(C)
+        for c in 0..C { row[c] = M[r][c] }
+        out = out + [row]
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. One training step — finite-difference gradient on total loss
+// ═══════════════════════════════════════════════════════════════════
+
+@hot
+fn ib_train_step(W_mu, W_logvar, W_dec, X, Y, beta, lr, seed) {
+    let base = ib_batch_loss(X, Y, W_mu, W_logvar, W_dec, beta, seed)
+    let eps = 0.001
+    let mut new_mu = ib_copy2(W_mu)
+    let mut new_lv = ib_copy2(W_logvar)
+    let mut new_dec = ib_copy2(W_dec)
+
+    // dL/dW_mu
+    let R1 = len(W_mu)
+    let C1 = len(W_mu[0])
+    for r in 0..R1 {
+        for c in 0..C1 {
+            let mut M = ib_copy2(W_mu)
+            M[r][c] = M[r][c] + eps
+            let lp = ib_batch_loss(X, Y, M, W_logvar, W_dec, beta, seed)
+            new_mu[r][c] = new_mu[r][c] - lr * (lp - base) / eps
+        }
+    }
+
+    // dL/dW_logvar
+    let R2 = len(W_logvar)
+    let C2 = len(W_logvar[0])
+    for r in 0..R2 {
+        for c in 0..C2 {
+            let mut M = ib_copy2(W_logvar)
+            M[r][c] = M[r][c] + eps
+            let lp = ib_batch_loss(X, Y, W_mu, M, W_dec, beta, seed)
+            new_lv[r][c] = new_lv[r][c] - lr * (lp - base) / eps
+        }
+    }
+
+    // dL/dW_dec
+    let R3 = len(W_dec)
+    let C3 = len(W_dec[0])
+    for r in 0..R3 {
+        for c in 0..C3 {
+            let mut M = ib_copy2(W_dec)
+            M[r][c] = M[r][c] + eps
+            let lp = ib_batch_loss(X, Y, W_mu, W_logvar, M, beta, seed)
+            new_dec[r][c] = new_dec[r][c] - lr * (lp - base) / eps
+        }
+    }
+
+    return #{
+        "W_mu": new_mu,
+        "W_logvar": new_lv,
+        "W_dec": new_dec,
+        "loss": base
+    }
+}
+
+println("[information_bottleneck] loaded — β-VIB encoder/decoder + KL + reparam")
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0

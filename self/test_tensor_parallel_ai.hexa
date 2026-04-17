@@ -6,7 +6,313 @@
 //  ROI #112 — AI-native 1D Tensor Parallelism
 // ═══════════════════════════════════════════════════════════════════
 
-import "ai_native/tensor_parallel.hexa"
+// -- inlined from self/ai_native/tensor_parallel.hexa --
+// codegen import not wired for test files
+
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/tensor_parallel.hexa — AI-native ROI #112
+//
+//  1D tensor parallelism (Megatron-LM style row/column partitioning).
+//  Pure hexa, CPU simulation. Flat row-major matrices as [float].
+//
+//  The reference implementation in self/ml/tensor_parallel.hexa uses
+//  monolithic sharding + attention. This ai-native version exposes a
+//  minimal public API with tp_ prefix, focusing on the core
+//  split/forward/allreduce primitives and AST pattern detect/rewrite.
+//
+//  Public API
+//  ──────────
+//      tp_column_split(weight, rows, cols, num_parts) -> [[float]]
+//          Split weight columns across workers.
+//          Requires cols % num_parts == 0.
+//
+//      tp_row_split(weight, rows, cols, num_parts) -> [[float]]
+//          Split weight rows across workers.
+//          Requires rows % num_parts == 0.
+//
+//      tp_allreduce(partials) -> [float]
+//          Element-wise sum of partial result vectors.
+//
+//      tp_column_parallel_forward(input, weight_parts, rows, cols_per_part)
+//          -> [[float]]
+//          Each worker computes input @ weight_part_r.
+//
+//      tp_row_parallel_forward(input_parts, weight_parts, rows_per_part, cols)
+//          -> [float]
+//          Each worker computes partial, then allreduce.
+//
+//      tp_memory_per_worker(total_params, num_workers) -> int
+//          Params per worker = total_params / num_workers.
+//
+//      detect_large_linear(prog, threshold) -> bool
+//          AST predicate: true iff prog contains a linear node whose
+//          param count exceeds threshold.
+//
+//      rewrite_tensor_parallel(prog, num_workers) -> Program
+//          If detect_large_linear finds a match, replaces the
+//          "large_linear" node with a "tp_linear" node annotated
+//          with num_workers. Otherwise returns prog unchanged.
+//
+//  Numerical contract
+//  ──────────────────
+//      tp_column_split then column-concat must recover the original
+//      weight matrix element-for-element. tp_row_parallel_forward
+//      must match the monolithic matmul to within 1e-9.
+//
+//  Grammar cautions (HX3 pitfalls)
+//  ──────────────────────────────
+//      - no struct-literal head inside `if`
+//      - no `and`/`or` — use `&&` / `||`
+//      - no enum — string tags
+//      - `handle` reserved — never use as param name
+//      - P15: `let mut x = 0` for mutable
+//      - array concat in loops O(n^2) — use .push(x)
+//
+//  AI-native attrs
+//  ───────────────
+//      @hot       — split/forward on the critical training path
+//      @parallel  — independent per-worker computation
+//      @pure      — no mutation of caller data
+// ═══════════════════════════════════════════════════════════════════
+
+// ── flat matrix helpers (tp112_ prefix to avoid collisions) ────────
+
+@pure
+fn tp112_zeros(n) {
+    let mut v = []
+    for _i in 0..n {
+        v.push(0.0)
+    }
+    return v
+}
+
+@pure
+fn tp112_matmul(a, b, m, k, n) {
+    let mut c = tp112_zeros(m * n)
+    for r in 0..m {
+        for ci in 0..n {
+            let mut s = 0.0
+            for ki in 0..k {
+                s = s + a[r * k + ki] * b[ki * n + ci]
+            }
+            c[r * n + ci] = s
+        }
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_column_split — split W[rows x cols] into num_parts column shards
+//  Each shard has shape [rows x cols/num_parts].
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn tp_column_split_impl(weight, rows, cols, num_parts) {
+    let cpr = cols / num_parts
+    let mut shards = []
+    for p in 0..num_parts {
+        let mut shard = tp112_zeros(rows * cpr)
+        let col_start = p * cpr
+        for i in 0..rows {
+            for j in 0..cpr {
+                shard[i * cpr + j] = weight[i * cols + (col_start + j)]
+            }
+        }
+        shards.push(shard)
+    }
+    return shards
+}
+
+pub fn tp_column_split(weight, rows, cols, num_parts) {
+    return tp_column_split_impl(weight, rows, cols, num_parts)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_row_split — split W[rows x cols] into num_parts row shards
+//  Each shard has shape [rows/num_parts x cols].
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn tp_row_split_impl(weight, rows, cols, num_parts) {
+    let rpr = rows / num_parts
+    let mut shards = []
+    for p in 0..num_parts {
+        let mut shard = tp112_zeros(rpr * cols)
+        let row_start = p * rpr
+        for i in 0..rpr {
+            for j in 0..cols {
+                shard[i * cols + j] = weight[(row_start + i) * cols + j]
+            }
+        }
+        shards.push(shard)
+    }
+    return shards
+}
+
+pub fn tp_row_split(weight, rows, cols, num_parts) {
+    return tp_row_split_impl(weight, rows, cols, num_parts)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_allreduce — element-wise sum of partial result vectors
+//  partials: [[float]] where each inner array has the same length.
+//  Returns a single [float] = sum across all partials.
+// ═══════════════════════════════════════════════════════════════════
+@hot @pure
+fn tp_allreduce_impl(partials) {
+    let num = len(partials)
+    if num == 0 { return [] }
+    let n = len(partials[0])
+    let mut result = tp112_zeros(n)
+    for r in 0..num {
+        let part = partials[r]
+        for i in 0..n {
+            result[i] = result[i] + part[i]
+        }
+    }
+    return result
+}
+
+pub fn tp_allreduce(partials) {
+    return tp_allreduce_impl(partials)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_column_parallel_forward
+//  input: [float] flat [batch x rows] — replicated on all workers
+//  weight_parts: [[float]] — each [rows x cols_per_part]
+//  Returns [[float]] — per-worker output shards [batch x cols_per_part]
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn tp_column_parallel_forward_impl(input, weight_parts, rows, cols_per_part) {
+    let num_parts = len(weight_parts)
+    let batch = len(input) / rows
+    let mut outputs = []
+    for p in 0..num_parts {
+        let y = tp112_matmul(input, weight_parts[p], batch, rows, cols_per_part)
+        outputs.push(y)
+    }
+    return outputs
+}
+
+pub fn tp_column_parallel_forward(input, weight_parts, rows, cols_per_part) {
+    return tp_column_parallel_forward_impl(input, weight_parts, rows, cols_per_part)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_row_parallel_forward
+//  input_parts: [[float]] — input split along contraction dim
+//      each [batch x rows_per_part]
+//  weight_parts: [[float]] — each [rows_per_part x cols]
+//  Returns [float] — allreduced output [batch x cols]
+// ═══════════════════════════════════════════════════════════════════
+@hot @parallel @pure
+fn tp_row_parallel_forward_impl(input_parts, weight_parts, rows_per_part, cols) {
+    let num_parts = len(weight_parts)
+    let batch = len(input_parts[0]) / rows_per_part
+    let mut partials = []
+    for p in 0..num_parts {
+        let y = tp112_matmul(input_parts[p], weight_parts[p], batch, rows_per_part, cols)
+        partials.push(y)
+    }
+    return tp_allreduce(partials)
+}
+
+pub fn tp_row_parallel_forward(input_parts, weight_parts, rows_per_part, cols) {
+    return tp_row_parallel_forward_impl(input_parts, weight_parts, rows_per_part, cols)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  tp_memory_per_worker — params per worker under uniform partition
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn tp_memory_per_worker(total_params, num_workers) {
+    return total_params / num_workers
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  AST side — pattern detect / rewrite
+//
+//  A Program is a list of TpStmt. Each TpStmt is a kind-tagged struct.
+//  TpStmt.kind in {"large_linear", "tp_linear", "other"}
+//  TpStmt.params : int — parameter count of the linear layer
+//  TpStmt.num_workers : int — TP degree (set by rewrite)
+// ═══════════════════════════════════════════════════════════════════
+struct TpStmt {
+    kind: string
+    params: int
+    num_workers: int
+}
+
+pub fn tp_stmt(kind, params, num_workers) {
+    return TpStmt{kind: kind, params: params, num_workers: num_workers}
+}
+
+pub fn tp_stmt_linear(params)              { return tp_stmt("large_linear", params, 1) }
+pub fn tp_stmt_tp_linear(params, nw)       { return tp_stmt("tp_linear", params, nw) }
+pub fn tp_stmt_other()                     { return tp_stmt("other", 0, 1) }
+
+// detect_large_linear: true iff prog contains at least one
+// "large_linear" node whose param count exceeds threshold.
+@pure
+fn detect_large_linear_impl(prog, threshold) {
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "large_linear" {
+            if s.params > threshold { return true }
+        }
+    }
+    return false
+}
+
+pub fn detect_large_linear(prog, threshold) {
+    return detect_large_linear_impl(prog, threshold)
+}
+
+// rewrite_tensor_parallel: replace each "large_linear" node that
+// exceeds a reasonable threshold (params > 0) with a "tp_linear"
+// node annotated with num_workers. Non-matching nodes pass through.
+@pure
+fn rewrite_tensor_parallel_impl(prog, num_workers) {
+    let mut out = []
+    for i in 0..len(prog) {
+        let s = prog[i]
+        if s.kind == "large_linear" {
+            let rewritten = tp_stmt_tp_linear(s.params, num_workers)
+            out.push(rewritten)
+        } else {
+            out.push(s)
+        }
+    }
+    return out
+}
+
+pub fn rewrite_tensor_parallel(prog, num_workers) {
+    return rewrite_tensor_parallel_impl(prog, num_workers)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Column unsplit — reconstruct full matrix from column shards
+//  (internal helper, useful for test round-trip verification)
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn tp_column_unsplit(shards, rows, cpr, num_parts) {
+    let cols = cpr * num_parts
+    let mut out = tp112_zeros(rows * cols)
+    for p in 0..num_parts {
+        let shard = shards[p]
+        let col_start = p * cpr
+        for i in 0..rows {
+            for j in 0..cpr {
+                out[i * cols + (col_start + j)] = shard[i * cpr + j]
+            }
+        }
+    }
+    return out
+}
+
+println("[ai_native/tensor_parallel] module loaded — ROI #112 TP primitives ready")
+
+
+// -- end inlined --
 
 let mut TESTS_PASSED = 0
 let mut TESTS_FAILED = 0

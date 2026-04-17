@@ -7,7 +7,495 @@
 //  anp_apply_fission / anp_fission_pass from ai_native_pass.hexa.
 // ═══════════════════════════════════════════════════════════
 
-import "ml/loop_fission.hexa"
+// -- inlined from self/ml/loop_fission.hexa --
+// codegen import not wired for test files
+
+// self/ml/loop_fission.hexa — ROI #54: Loop Fission (루프 피셔닝)
+// Splits loops with multiple independent operations into
+// separate single-operation loops. Improves cache utilization
+// and enables vectorization.
+//
+// Example:
+//   for i in 0..n { a[i] = b[i] + 1; c[i] = d[i] * 2 }
+// becomes:
+//   for i in 0..n { a[i] = b[i] + 1 }
+//   for i in 0..n { c[i] = d[i] * 2 }
+
+// Collect all identifiers written (assigned/mutated) in a statement.
+fn fission_collect_writes(stmt) {
+    if type_of(stmt) == "string" { return [] }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        let mut out = []
+        if stmt.name != "" {
+            out = out.push(stmt.name)
+        }
+        return out
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        let mut out = []
+        if stmt.name != "" {
+            out = out.push(stmt.name)
+        }
+        return out
+    }
+    return []
+}
+
+// Collect all identifiers read in an expression (recursive).
+fn fission_collect_reads_expr(expr) {
+    if type_of(expr) == "string" { return [] }
+    if type_of(expr) != "string" && type_of(expr) != "array" {
+        let k = expr.kind
+        if k == "Ident" {
+            let mut out = []
+            out = out.push(expr.name)
+            return out
+        }
+        if k == "BinaryExpr" || k == "BinOp" {
+            let l = fission_collect_reads_expr(expr.left)
+            let r = fission_collect_reads_expr(expr.right)
+            let mut out = l
+            let mut ri = 0
+            while ri < len(r) {
+                out = out.push(r[ri])
+                ri = ri + 1
+            }
+            return out
+        }
+        if k == "UnaryExpr" {
+            return fission_collect_reads_expr(expr.left)
+        }
+        if k == "Call" {
+            let mut out = []
+            if type_of(expr.args) == "array" {
+                let mut ai = 0
+                while ai < len(expr.args) {
+                    let sub = fission_collect_reads_expr(expr.args[ai])
+                    let mut si = 0
+                    while si < len(sub) {
+                        out = out.push(sub[si])
+                        si = si + 1
+                    }
+                    ai = ai + 1
+                }
+            }
+            return out
+        }
+        if k == "Index" {
+            let l2 = fission_collect_reads_expr(expr.left)
+            let r2 = fission_collect_reads_expr(expr.right)
+            let mut out = l2
+            let mut ri2 = 0
+            while ri2 < len(r2) {
+                out = out.push(r2[ri2])
+                ri2 = ri2 + 1
+            }
+            return out
+        }
+        if k == "MethodCall" {
+            let base = fission_collect_reads_expr(expr.left)
+            let mut out = base
+            if type_of(expr.args) == "array" {
+                let mut ai2 = 0
+                while ai2 < len(expr.args) {
+                    let sub2 = fission_collect_reads_expr(expr.args[ai2])
+                    let mut si2 = 0
+                    while si2 < len(sub2) {
+                        out = out.push(sub2[si2])
+                        si2 = si2 + 1
+                    }
+                    ai2 = ai2 + 1
+                }
+            }
+            return out
+        }
+        if k == "IntLit" || k == "FloatLit" || k == "BoolLit" || k == "StringLit" {
+            return []
+        }
+        if k == "Field" {
+            return fission_collect_reads_expr(expr.left)
+        }
+        let mut out = []
+        if type_of(expr.left) != "string" || expr.left != "" {
+            let sl = fission_collect_reads_expr(expr.left)
+            let mut sli = 0
+            while sli < len(sl) {
+                out = out.push(sl[sli])
+                sli = sli + 1
+            }
+        }
+        if type_of(expr.right) != "string" || expr.right != "" {
+            let sr = fission_collect_reads_expr(expr.right)
+            let mut sri = 0
+            while sri < len(sr) {
+                out = out.push(sr[sri])
+                sri = sri + 1
+            }
+        }
+        return out
+    }
+    return []
+}
+
+// Collect all identifiers read in a statement (RHS / condition / index).
+fn fission_collect_reads(stmt) {
+    if type_of(stmt) == "string" { return [] }
+    let k = stmt.kind
+    if k == "AssignStmt" {
+        let mut out = fission_collect_reads_expr(stmt.right)
+        if type_of(stmt.left) != "string" && type_of(stmt.left) != "array" {
+            if stmt.left.kind == "Index" {
+                let idx_reads = fission_collect_reads_expr(stmt.left.right)
+                let mut iri = 0
+                while iri < len(idx_reads) {
+                    out = out.push(idx_reads[iri])
+                    iri = iri + 1
+                }
+                let base_reads = fission_collect_reads_expr(stmt.left.left)
+                let mut bri = 0
+                while bri < len(base_reads) {
+                    out = out.push(base_reads[bri])
+                    bri = bri + 1
+                }
+            }
+        }
+        return out
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        if type_of(stmt.left) != "string" {
+            return fission_collect_reads_expr(stmt.left)
+        }
+        return []
+    }
+    if k == "ExprStmt" {
+        return fission_collect_reads_expr(stmt.left)
+    }
+    return []
+}
+
+// Check if name exists in an array of strings
+fn fission_name_in(name, arr) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Check if two statement groups are independent (no data dependency).
+// Independent iff:
+//   W_A ∩ R_B = empty  AND  W_B ∩ R_A = empty  AND  W_A ∩ W_B = empty
+fn fission_groups_independent(writes_a, reads_a, writes_b, reads_b) {
+    let mut i = 0
+    while i < len(writes_a) {
+        if fission_name_in(writes_a[i], reads_b) { return false }
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(writes_b) {
+        if fission_name_in(writes_b[j], reads_a) { return false }
+        j = j + 1
+    }
+    let mut k = 0
+    while k < len(writes_a) {
+        if fission_name_in(writes_a[k], writes_b) { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// anp_detect_fission(node) — detects loops with >=2 independent
+// statement groups (no data dependencies between groups).
+// Returns the number of groups the loop body can be split into,
+// or 0 if fission is not applicable.
+fn anp_detect_fission(node) {
+    if type_of(node) == "string" { return 0 }
+    let k = node.kind
+    if k != "ForStmt" && k != "WhileStmt" { return 0 }
+    let body = node.body
+    if type_of(body) != "array" { return 0 }
+    let n = len(body)
+    if n < 2 { return 0 }
+    // For WhileStmt: last statement is typically the induction variable
+    // increment (i = i + 1). Exclude from fission and replicate in each.
+    let mut effective_n = n
+    if k == "WhileStmt" {
+        let last = body[n - 1]
+        if type_of(last) != "string" && last.kind == "AssignStmt" {
+            effective_n = n - 1
+        }
+    }
+    if effective_n < 2 { return 0 }
+    // Build per-statement write/read sets
+    let mut all_writes = []
+    let mut all_reads = []
+    let mut si = 0
+    while si < effective_n {
+        all_writes = all_writes.push(fission_collect_writes(body[si]))
+        all_reads = all_reads.push(fission_collect_reads(body[si]))
+        si = si + 1
+    }
+    // Greedy grouping: assign each statement to first compatible group
+    let mut groups = []
+    let mut gw = []
+    let mut gr = []
+    let mut si2 = 0
+    while si2 < effective_n {
+        let sw = all_writes[si2]
+        let sr = all_reads[si2]
+        let mut placed = false
+        let mut gi = 0
+        while gi < len(groups) {
+            if fission_groups_independent(gw[gi], gr[gi], sw, sr) {
+                let mut cur_g = groups[gi]
+                cur_g = cur_g.push(si2)
+                groups[gi] = cur_g
+                let mut cwi = 0
+                let mut merged_w = gw[gi]
+                while cwi < len(sw) {
+                    merged_w = merged_w.push(sw[cwi])
+                    cwi = cwi + 1
+                }
+                gw[gi] = merged_w
+                let mut cri = 0
+                let mut merged_r = gr[gi]
+                while cri < len(sr) {
+                    merged_r = merged_r.push(sr[cri])
+                    cri = cri + 1
+                }
+                gr[gi] = merged_r
+                placed = true
+                gi = len(groups)
+            }
+            gi = gi + 1
+        }
+        if placed == false {
+            let mut new_g = []
+            new_g = new_g.push(si2)
+            groups = groups.push(new_g)
+            gw = gw.push(sw)
+            gr = gr.push(sr)
+        }
+        si2 = si2 + 1
+    }
+    if len(groups) < 2 { return 0 }
+    return len(groups)
+}
+
+// anp_apply_fission(node) — splits the loop into N separate loops,
+// one per independent statement group. Returns an array of loop nodes.
+// If fission is not applicable, returns single-element array with original.
+fn anp_apply_fission(node) {
+    let ngroups = anp_detect_fission(node)
+    if ngroups < 2 {
+        let mut out = []
+        out = out.push(node)
+        return out
+    }
+    let k = node.kind
+    let body = node.body
+    let n = len(body)
+    let mut has_iv_inc = false
+    let mut iv_stmt = ""
+    let mut effective_n = n
+    if k == "WhileStmt" {
+        let last = body[n - 1]
+        if type_of(last) != "string" && last.kind == "AssignStmt" {
+            has_iv_inc = true
+            iv_stmt = last
+            effective_n = n - 1
+        }
+    }
+    // Re-run grouping
+    let mut all_writes = []
+    let mut all_reads = []
+    let mut si = 0
+    while si < effective_n {
+        all_writes = all_writes.push(fission_collect_writes(body[si]))
+        all_reads = all_reads.push(fission_collect_reads(body[si]))
+        si = si + 1
+    }
+    let mut groups = []
+    let mut gw = []
+    let mut gr = []
+    let mut si2 = 0
+    while si2 < effective_n {
+        let sw = all_writes[si2]
+        let sr = all_reads[si2]
+        let mut placed = false
+        let mut gi = 0
+        while gi < len(groups) {
+            if fission_groups_independent(gw[gi], gr[gi], sw, sr) {
+                let mut cur_g = groups[gi]
+                cur_g = cur_g.push(si2)
+                groups[gi] = cur_g
+                let mut cwi = 0
+                let mut merged_w = gw[gi]
+                while cwi < len(sw) {
+                    merged_w = merged_w.push(sw[cwi])
+                    cwi = cwi + 1
+                }
+                gw[gi] = merged_w
+                let mut cri = 0
+                let mut merged_r = gr[gi]
+                while cri < len(sr) {
+                    merged_r = merged_r.push(sr[cri])
+                    cri = cri + 1
+                }
+                gr[gi] = merged_r
+                placed = true
+                gi = len(groups)
+            }
+            gi = gi + 1
+        }
+        if placed == false {
+            let mut new_g = []
+            new_g = new_g.push(si2)
+            groups = groups.push(new_g)
+            gw = gw.push(sw)
+            gr = gr.push(sr)
+        }
+        si2 = si2 + 1
+    }
+    // Build one loop per group
+    let mut result = []
+    let mut gi2 = 0
+    while gi2 < len(groups) {
+        let grp = groups[gi2]
+        let mut new_body = []
+        let mut gsi = 0
+        while gsi < len(grp) {
+            new_body = new_body.push(body[grp[gsi]])
+            gsi = gsi + 1
+        }
+        if has_iv_inc {
+            new_body = new_body.push(iv_stmt)
+        }
+        if k == "ForStmt" {
+            result = result.push(#{
+                "kind": "ForStmt",
+                "name": node.name,
+                "iter_expr": node.iter_expr,
+                "body": new_body
+            })
+        } else {
+            result = result.push(#{
+                "kind": "WhileStmt",
+                "cond": node.cond,
+                "body": new_body
+            })
+        }
+        gi2 = gi2 + 1
+    }
+    return result
+}
+
+// anp_fission_pass(ast) — walks top-level AST applying loop fission.
+// Descends into function bodies. Returns transformed AST.
+let mut m980_fission_splits = 0
+
+fn anp_fission_pass_body(body) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) == "string" {
+            out = out.push(stmt)
+            i = i + 1
+            continue
+        }
+        let k = stmt.kind
+        if k == "IfStmt" {
+            let mut new_then = stmt.then_body
+            if type_of(new_then) == "array" {
+                new_then = anp_fission_pass_body(new_then)
+            }
+            let mut new_else = stmt.else_body
+            if type_of(new_else) == "array" {
+                new_else = anp_fission_pass_body(new_else)
+            }
+            out = out.push(#{
+                "kind": "IfStmt",
+                "cond": stmt.cond,
+                "then_body": new_then,
+                "else_body": new_else
+            })
+            i = i + 1
+            continue
+        }
+        if k == "ForStmt" || k == "WhileStmt" {
+            let mut inner_body = stmt.body
+            if type_of(inner_body) == "array" {
+                inner_body = anp_fission_pass_body(inner_body)
+            }
+            let mut processed_stmt = stmt
+            if k == "ForStmt" {
+                processed_stmt = #{
+                    "kind": "ForStmt",
+                    "name": stmt.name,
+                    "iter_expr": stmt.iter_expr,
+                    "body": inner_body
+                }
+            } else {
+                processed_stmt = #{
+                    "kind": "WhileStmt",
+                    "cond": stmt.cond,
+                    "body": inner_body
+                }
+            }
+            let splits = anp_apply_fission(processed_stmt)
+            if len(splits) > 1 {
+                m980_fission_splits = m980_fission_splits + len(splits)
+            }
+            let mut spi = 0
+            while spi < len(splits) {
+                out = out.push(splits[spi])
+                spi = spi + 1
+            }
+            i = i + 1
+            continue
+        }
+        out = out.push(stmt)
+        i = i + 1
+    }
+    return out
+}
+
+fn anp_fission_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    m980_fission_splits = 0
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if type_of(node) != "string" && node.kind == "FnDecl" {
+            let new_body = anp_fission_pass_body(node.body)
+            out = out.push(#{
+                "kind": "FnDecl",
+                "name": node.name,
+                "params": node.params,
+                "body": new_body,
+                "value": node.value,
+                "ret_type": node.ret_type
+            })
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    if m980_fission_splits > 0 {
+        println("[ai-native] loop-fission: " + to_string(m980_fission_splits) + " loop(s) split")
+    }
+    return out
+}
+
+
+// -- end inlined --
 
 let mut pass_count = 0
 let mut fail_count = 0
