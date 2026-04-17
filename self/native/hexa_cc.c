@@ -9568,6 +9568,20 @@ HexaVal gen2_expr(HexaVal node) {
             if (hexa_truthy(hexa_eq(name, hexa_str("read_file_bytes")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_read_file_bytes("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(0)))), hexa_str(")")));
             }
+            /* P4-stream builtins (manually patched into generated hexa_cc.c —
+               mirrored in self/codegen_c2.hexa for next regen). */
+            if (hexa_truthy(hexa_eq(name, hexa_str("read_bytes_at")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_read_bytes_at("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(1)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(2)))), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes_append")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_write_bytes_append("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(1)))), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes_append_v")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_write_bytes_append_v("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(1)))), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("file_size_native")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_file_size("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_374), hexa_int(0)))), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("net_listen")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_net_listen("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_375), hexa_int(0)))), hexa_str(")")));
             }
@@ -11498,6 +11512,19 @@ HexaVal _is_builtin_name(HexaVal name) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("read_file_bytes")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    /* P4-stream builtins (mirror in codegen_c2.hexa isbuiltin list). */
+    if (hexa_truthy(hexa_eq(name, hexa_str("read_bytes_at")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes_append")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("write_bytes_append_v")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("file_size_native")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("net_listen")))) {

@@ -158,6 +158,12 @@ HexaVal hexa_write_file(HexaVal path, HexaVal content);
 HexaVal hexa_write_bytes(HexaVal path, HexaVal arr);
 HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr);
 HexaVal hexa_read_file_bytes(HexaVal path);
+// P4-stream: pread-style ranged read + append write for multi-GB streaming
+// (safetensors→hexaw converter; 14B sharded inputs >20GB cannot fit in RAM).
+HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes);
+HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr);
+HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr);
+HexaVal hexa_file_size(HexaVal path);
 HexaVal hexa_str_split(HexaVal s, HexaVal delim);
 HexaVal hexa_str_trim(HexaVal s);
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s);
@@ -2824,6 +2830,117 @@ HexaVal hexa_read_file_bytes(HexaVal path) {
     }
     free(buf);
     return arr;
+}
+
+// ── P4 streaming builtins — read_bytes_at / write_bytes_append ─────
+// Required for multi-GB safetensors→hexaw conversion on 14B Qwen2.5
+// (8 shards × ~3.7GB each). Whole-file read_file_bytes cannot fit.
+
+// read_bytes_at(path, offset, nbytes): pread-style ranged read.
+// Returns a TAG_ARRAY of at most `nbytes` ints (shorter if EOF reached
+// or offset is past EOF). Empty array on fopen failure.
+HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes) {
+    int64_t off = HX_IS_INT(offset) ? HX_INT(offset)
+                : (HX_TAG(offset) == TAG_FLOAT ? (int64_t)HX_FLOAT(offset) : 0);
+    int64_t req = HX_IS_INT(nbytes) ? HX_INT(nbytes)
+                : (HX_TAG(nbytes) == TAG_FLOAT ? (int64_t)HX_FLOAT(nbytes) : 0);
+    if (off < 0 || req <= 0) return hexa_array_new();
+    FILE* f = fopen(HX_STR(path), "rb");
+    if (!f) return hexa_array_new();
+    // Use 64-bit seek where available; on macOS/Linux fseeko is standard.
+#if defined(_WIN32)
+    if (_fseeki64(f, (long long)off, SEEK_SET) != 0) { fclose(f); return hexa_array_new(); }
+#else
+    if (fseeko(f, (off_t)off, SEEK_SET) != 0) { fclose(f); return hexa_array_new(); }
+#endif
+    unsigned char* buf = (unsigned char*)malloc((size_t)req);
+    size_t got = fread(buf, 1, (size_t)req, f);
+    fclose(f);
+    HexaVal arr = hexa_array_new();
+    if (got > 0) {
+        HX_SET_ARR_ITEMS(arr, (HexaVal*)malloc(sizeof(HexaVal) * got));
+        HX_SET_ARR_CAP(arr, (int)got);
+        HX_SET_ARR_LEN(arr, (int)got);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (size_t i = 0; i < got; i++) {
+            items[i] = hexa_int((int64_t)buf[i]);
+        }
+    }
+    free(buf);
+    return arr;
+}
+
+// write_bytes_append(path, arr): append raw bytes from an int array
+// to `path` (fopen "ab"), creating the file if needed. Returns bool.
+// Mirrors hexa_write_bytes (raw HexaVal int array path).
+HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
+    int len = HX_ARR_LEN(arr);
+    FILE* f = fopen(HX_STR(path), "ab");
+    if (!f) return hexa_bool(0);
+    if (len > 0) {
+        unsigned char* buf = (unsigned char*)malloc(len);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (int i = 0; i < len; i++) {
+            int64_t v = HX_IS_INT(items[i]) ? HX_INT(items[i]) : (int64_t)HX_FLOAT(items[i]);
+            buf[i] = (unsigned char)(v & 0xFF);
+        }
+        fwrite(buf, 1, len, f);
+        free(buf);
+    }
+    fclose(f);
+    return hexa_bool(1);
+}
+
+// write_bytes_append_v(path, arr): variant for the interpreter dispatch
+// where each array item is a TAG_VALSTRUCT (Val). Mirrors write_bytes_v.
+HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
+    int len = HX_ARR_LEN(arr);
+    FILE* f = fopen(HX_STR(path), "ab");
+    if (!f) return hexa_bool(0);
+    if (len > 0) {
+        unsigned char* buf = (unsigned char*)malloc(len);
+        HexaVal* items = HX_ARR_ITEMS(arr);
+        for (int i = 0; i < len; i++) {
+            HexaVal item = items[i];
+            int64_t v = 0;
+            if (HX_IS_INT(item)) {
+                v = HX_INT(item);
+            } else if (HX_TAG(item) == TAG_FLOAT) {
+                v = (int64_t)HX_FLOAT(item);
+            } else if (HX_TAG(item) == TAG_VALSTRUCT) {
+                HexaVal iv = hexa_valstruct_int(item);
+                if (HX_IS_INT(iv)) {
+                    v = HX_INT(iv);
+                } else if (HX_TAG(iv) == TAG_FLOAT) {
+                    v = (int64_t)HX_FLOAT(iv);
+                }
+            }
+            buf[i] = (unsigned char)(v & 0xFF);
+        }
+        fwrite(buf, 1, len, f);
+        free(buf);
+    }
+    fclose(f);
+    return hexa_bool(1);
+}
+
+// file_size(path): native 64-bit file size without loading contents.
+// Existing hexa_full dispatch read the whole file to count length — not
+// viable for multi-GB safetensors shards. Returns -1 on failure.
+HexaVal hexa_file_size(HexaVal path) {
+    FILE* f = fopen(HX_STR(path), "rb");
+    if (!f) return hexa_int(-1);
+#if defined(_WIN32)
+    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return hexa_int(-1); }
+    long long sz = _ftelli64(f);
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) { fclose(f); return hexa_int(-1); }
+    off_t sz = ftello(f);
+#endif
+    fclose(f);
+    return hexa_int((int64_t)sz);
 }
 
 // ── Command line arguments ───────────────────────────
