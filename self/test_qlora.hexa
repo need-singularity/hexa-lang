@@ -3,7 +3,351 @@
 //  Tests: NF4 round-trip, forward dims, backward frozen base
 // ═══════════════════════════════════════════════════════════
 
-import "ml/qlora.hexa"
+// ── inlined from self/ml/qlora.hexa ──────────────────
+// codegen_c2 import not wired for test files
+
+// ═══════════════════════════════════════════════════════════
+//  qlora.hexa — QLoRA: Quantized Low-Rank Adaptation
+//  (Dettmers et al. 2023)
+//
+//  Pure Hexa, no C/FFI.
+//
+//  NF4 (Normal Float 4-bit) quantization with per-block absmax
+//  scaling (block_size=64) + trainable LoRA A,B float matrices.
+//
+//  y = dequant(base_nf4) @ input + scale * (B @ A @ input)
+//
+//  Only A and B receive gradients — base weights stay frozen
+//  in 4-bit quantized form.
+//
+//  AI-NATIVE:
+//    @pure math kernels
+//    @memoize codebook + scale constants
+// ═══════════════════════════════════════════════════════════
+
+// ── NF4 codebook: 16 levels from normal distribution quantiles ──
+// These are the exact NF4 quantile levels for a standard normal
+// distribution, symmetric around zero.
+fn nf4_codebook() {
+    return [
+        -1.0, -0.6962, -0.5251, -0.3949,
+        -0.2844, -0.1848, -0.0911, 0.0,
+        0.0796, 0.1609, 0.2461, 0.3379,
+        0.4407, 0.5626, 0.7230, 1.0
+    ]
+}
+
+// ── nearest codebook index ──────────────────────────────────
+@pure
+fn nearest_nf4(x, book) {
+    let mut best = 0
+    let mut bestd = 1000000.0
+    for k in 0..16 {
+        let d = x - book[k]
+        let dd = if d < 0.0 { 0.0 - d } else { d }
+        if dd < bestd {
+            bestd = dd
+            best = k
+        }
+    }
+    return best
+}
+
+// ── absmax of a slice ───────────────────────────────────────
+@pure
+fn block_absmax(arr, start, count) {
+    let mut m = 0.0
+    for i in 0..count {
+        let v = arr[start + i]
+        let a = if v < 0.0 { 0.0 - v } else { v }
+        if a > m { m = a }
+    }
+    if m < 0.000001 { m = 0.000001 }
+    return m
+}
+
+// ═══════════════════════════════════════════════════════════
+//  1. quantize_nf4(weights) -> dict
+//     Block-wise NF4 quantization with block_size=64
+//     Returns: {"quant": [int], "scales": [float], "block_size": 64}
+// ═══════════════════════════════════════════════════════════
+fn quantize_nf4(weights) {
+    let book = nf4_codebook()
+    let n = len(weights)
+    let bs = 64
+    let num_blocks = (n + bs - 1) / bs
+
+    let mut quant = []
+    let mut scales = []
+
+    for blk in 0..num_blocks {
+        let start = blk * bs
+        let mut count = bs
+        if start + count > n { count = n - start }
+
+        let scale = block_absmax(weights, start, count)
+        scales.push(scale)
+
+        for i in 0..count {
+            let norm = weights[start + i] / scale
+            let idx = nearest_nf4(norm, book)
+            quant.push(idx)
+        }
+    }
+
+    return #{"quant": quant, "scales": scales, "block_size": bs}
+}
+
+// ═══════════════════════════════════════════════════════════
+//  2. dequantize_nf4(qw) -> [float]
+//     Restore approximate float weights from NF4 dict
+// ═══════════════════════════════════════════════════════════
+fn dequantize_nf4(qw) {
+    let book = nf4_codebook()
+    let quant = qw["quant"]
+    let scales = qw["scales"]
+    let bs = qw["block_size"]
+    let n = len(quant)
+
+    let mut out = []
+    for i in 0..n {
+        let blk = i / bs
+        let scale = scales[blk]
+        let val = book[quant[i]] * scale
+        out.push(val)
+    }
+    return out
+}
+
+// ── helper: matvec y[m] = W[m][n] @ x[n] ───────────────────
+@pure
+fn q_matvec(w, x, m, n) {
+    let mut y = []
+    for i in 0..m {
+        let mut s = 0.0
+        for j in 0..n {
+            s = s + w[i][j] * x[j]
+        }
+        y.push(s)
+    }
+    return y
+}
+
+// ── helper: zeros 1D ────────────────────────────────────────
+fn zeros1(n) {
+    let mut v = []
+    for i in 0..n { v.push(0.0) }
+    return v
+}
+
+// ── helper: zeros 2D ────────────────────────────────────────
+fn zeros2(m, n) {
+    let mut r = []
+    for i in 0..m { r.push(zeros1(n)) }
+    return r
+}
+
+// ── helper: small random init via LCG ───────────────────────
+fn lcg_init(m, n, seed) {
+    let mut s = seed
+    let mut r = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            s = (s * 1103515245 + 12345) % 2147483647
+            let v = (to_float(s % 2000) - 1000.0) / 10000.0
+            row.push(v)
+        }
+        r.push(row)
+    }
+    return r
+}
+
+// ── helper: flatten 2D matrix row-major ─────────────────────
+fn mat_to_flat(w, m, n) {
+    let mut out = []
+    for i in 0..m {
+        for j in 0..n {
+            out.push(w[i][j])
+        }
+    }
+    return out
+}
+
+// ── helper: unflatten to 2D matrix ──────────────────────────
+fn flat_to_mat(flat, m, n) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            row.push(flat[i * n + j])
+        }
+        out.push(row)
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  3. qlora_layer_new(in_dim, out_dim, rank) -> dict
+//     Frozen NF4 base weights + trainable LoRA A, B
+// ═══════════════════════════════════════════════════════════
+fn qlora_layer_new(in_dim, out_dim, rank) {
+    // Generate random base weights then quantize to NF4
+    let w_float = lcg_init(out_dim, in_dim, 42)
+    let w_flat = mat_to_flat(w_float, out_dim, in_dim)
+    let base_nf4 = quantize_nf4(w_flat)
+
+    // LoRA A: [rank, in_dim] — zero init (residual starts at 0)
+    let lora_a = zeros2(rank, in_dim)
+    // LoRA B: [out_dim, rank] — small random init
+    let lora_b = lcg_init(out_dim, rank, 7777)
+    // scale = alpha / rank (alpha = rank by default so scale = 1.0)
+    let alpha = to_float(rank)
+    let scale = alpha / to_float(rank)
+
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "base_nf4": base_nf4,
+        "lora_a": lora_a,
+        "lora_b": lora_b,
+        "scale": scale,
+        "alpha": alpha
+    }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  4. qlora_forward(layer, input) -> [float]
+//     output = dequant(base) @ input + scale * (B @ (A @ input))
+// ═══════════════════════════════════════════════════════════
+fn qlora_forward(layer, input) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let rank = layer["rank"]
+    let scale = layer["scale"]
+
+    // Dequantize base weights and reshape to [out_dim, in_dim]
+    let base_flat = dequantize_nf4(layer["base_nf4"])
+    let base_w = flat_to_mat(base_flat, out_dim, in_dim)
+
+    // base_out = base_w @ input
+    let base_out = q_matvec(base_w, input, out_dim, in_dim)
+
+    // LoRA path: A @ input -> [rank], then B @ that -> [out_dim]
+    let ax = q_matvec(layer["lora_a"], input, rank, in_dim)
+    let bax = q_matvec(layer["lora_b"], ax, out_dim, rank)
+
+    // Combine: base + scale * lora
+    let mut y = []
+    for i in 0..out_dim {
+        y.push(base_out[i] + scale * bax[i])
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════
+//  5. qlora_backward(layer, grad, input) -> dict
+//     Only compute gradients for A and B (base is frozen)
+//     grad_B[i][p] = scale * grad[i] * (A @ input)[p]
+//     grad_A[p][j] = scale * (B^T @ grad)[p] * input[j]
+//     Returns: {"grad_a": [[float]], "grad_b": [[float]]}
+// ═══════════════════════════════════════════════════════════
+fn qlora_backward(layer, grad, input) {
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+    let rank = layer["rank"]
+    let scale = layer["scale"]
+    let lora_a = layer["lora_a"]
+    let lora_b = layer["lora_b"]
+
+    // A @ input -> [rank]
+    let ax = q_matvec(lora_a, input, rank, in_dim)
+
+    // B^T @ grad -> [rank]
+    let mut bt_grad = []
+    for p in 0..rank {
+        let mut acc = 0.0
+        for i in 0..out_dim {
+            acc = acc + lora_b[i][p] * grad[i]
+        }
+        bt_grad.push(acc)
+    }
+
+    // grad_B[i][p] = scale * grad[i] * ax[p]
+    let mut grad_b = []
+    for i in 0..out_dim {
+        let mut row = []
+        for p in 0..rank {
+            row.push(scale * grad[i] * ax[p])
+        }
+        grad_b.push(row)
+    }
+
+    // grad_A[p][j] = scale * bt_grad[p] * input[j]
+    let mut grad_a = []
+    for p in 0..rank {
+        let mut row = []
+        for j in 0..in_dim {
+            row.push(scale * bt_grad[p] * input[j])
+        }
+        grad_a.push(row)
+    }
+
+    return #{"grad_a": grad_a, "grad_b": grad_b}
+}
+
+// ── SGD update for 2D matrix ────────────────────────────────
+@pure
+fn sgd_update_2d(w, g, lr, m, n) {
+    let mut out = []
+    for i in 0..m {
+        let mut row = []
+        for j in 0..n {
+            row.push(w[i][j] - lr * g[i][j])
+        }
+        out.push(row)
+    }
+    return out
+}
+
+// ── qlora_step: apply gradients to A and B only ─────────────
+fn qlora_step(layer, grads, lr) {
+    let rank = layer["rank"]
+    let in_dim = layer["in_dim"]
+    let out_dim = layer["out_dim"]
+
+    let new_a = sgd_update_2d(layer["lora_a"], grads["grad_a"], lr, rank, in_dim)
+    let new_b = sgd_update_2d(layer["lora_b"], grads["grad_b"], lr, out_dim, rank)
+
+    return #{
+        "in_dim": in_dim,
+        "out_dim": out_dim,
+        "rank": rank,
+        "base_nf4": layer["base_nf4"],
+        "lora_a": new_a,
+        "lora_b": new_b,
+        "scale": layer["scale"],
+        "alpha": layer["alpha"]
+    }
+}
+
+// ── quantization error metric ───────────────────────────────
+fn quant_error(original, restored) {
+    let n = len(original)
+    let mut sum_sq_err = 0.0
+    let mut sum_sq_orig = 0.0
+    for i in 0..n {
+        let d = original[i] - restored[i]
+        sum_sq_err = sum_sq_err + d * d
+        sum_sq_orig = sum_sq_orig + original[i] * original[i]
+    }
+    if sum_sq_orig < 0.000001 { return 0.0 }
+    return sqrt(sum_sq_err / sum_sq_orig)
+}
+
+
+// ── end inlined ──────────────────────────────
 
 let mut passed = 0
 let mut failed = 0

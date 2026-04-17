@@ -1049,12 +1049,7 @@ HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d) [caller=array_get]\n", (long long)idx, HX_ARR_LEN(arr));
-        // diagnostic: dump backtrace on OOB
-        #if defined(__APPLE__)
-        void *bt[16]; int n = backtrace(bt, 16);
-        backtrace_symbols_fd(bt, n, 2);
-        #endif
+        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
         exit(1);
     }
     return HX_ARR_ITEMS(arr)[idx];
@@ -1067,11 +1062,7 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d) [caller=array_set]\n", (long long)idx, HX_ARR_LEN(arr));
-        #if defined(__APPLE__)
-        void *bt[16]; int n = backtrace(bt, 16);
-        backtrace_symbols_fd(bt, n, 2);
-        #endif
+        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
         exit(1);
     }
     // In-place mutate (no copy — caller reassigns)
@@ -1619,13 +1610,9 @@ HexaVal hexa_valstruct_new_v(
     // Module-init time allocations (cached singletons __VAL_VOID/__VAL_TRUE/
     // __VAL_INT_CACHE etc.) go through the heap path so the first scope pop
     // doesn't wipe them.
-    // T33-fix-2: use heap when mark_top <= 1.  mark_top==1 is interpret()'s
-    // top-level scope where __init_val_int_cache runs.  Allocating there
-    // puts cache entries in mark[0]'s arena range; scope_pop from mark[0]
-    // (block=NULL → full arena reset) later wipes them.  mark_top >= 2
-    // means we're inside a user function — safe to arena-allocate because
-    // pops only rewind to mark[1]+, never touching mark[0]'s region.
-    int from_arena = hexa_val_arena_on() && __hexa_val_mark_top > 1;
+    // T33-fix-2: DISABLE arena for ValStruct. fn_arena_return only heapifies
+    // the return value; globals (__VAL_INT_CACHE, env) escape unheapified.
+    int from_arena = 0;
     HexaValStruct* s;
     if (from_arena) {
         s = (HexaValStruct*)hexa_val_arena_calloc(sizeof(HexaValStruct));
