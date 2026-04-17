@@ -159,6 +159,65 @@ fn lower_expr(m, b, e, env) {
     return -1
 }
 
+// ── UnaryOp lowering (standalone entrypoint) ────────────────
+// Map AST UnaryOp string → IR opcode.
+//   "neg"    → NEG opcode (arithmetic negation)
+//   "not"    → (1 - x) synthesized (logical not)
+//   "bitnot" → (-1) - x synthesized (two's complement bitwise not)
+// Return -1 on unsupported op.
+fn lower_unary_from_vid(m, b, op_str, operand_vid, ty) {
+    if op_str == "neg" {
+        return bld_neg(m, b, operand_vid, ty)
+    }
+    if op_str == "not" {
+        let one = bld_const_i64(m, b, 1)
+        return bld_sub(m, b, one, operand_vid, ty)
+    }
+    if op_str == "bitnot" {
+        let neg_one = bld_const_i64(m, b, -1)
+        return bld_sub(m, b, neg_one, operand_vid, ty)
+    }
+    // TODO: lower UnaryOp kind unsupported (op_str)
+    return -1
+}
+
+// ── Ident-as-expression lowering (standalone entrypoint) ───
+// Returns vid for SSA-bound names, LOAD vid for mut-slot names, -1 if unbound.
+fn lower_ident_by_name(m, b, env, name, ty) {
+    let vid = lower_env_lookup(env, name)
+    if vid < 0 { return -1 }
+    if lower_env_is_mut(env, name) {
+        return bld_load(m, b, vid, ty)
+    }
+    return vid
+}
+
+// ── FieldAccess lowering ────────────────────────────────────
+// obj.field → "load" with [obj, field_idx] operands.
+fn lower_field_access(m, b, obj_vid, field_idx, field_ty) {
+    return bld_struct_field(m, b, obj_vid, field_idx, field_ty)
+}
+
+// ── Index lowering ──────────────────────────────────────────
+// arr[i] → "load" with [arr, idx] operands.
+fn lower_index(m, b, arr_vid, idx_vid, elem_ty) {
+    return bld_array_index(m, b, arr_vid, idx_vid, elem_ty)
+}
+
+// ── Comparison BinOp lowering ───────────────────────────────
+// Eq/Ne/Lt/Le/Gt/Ge reuse Sub opcode with a CmpKind tag operand;
+// result type is "bool".
+fn lower_cmp_from_vids(m, b, cmp_kind, lhs_vid, rhs_vid) {
+    if cmp_kind == "eq" { return bld_cmp_eq(m, b, lhs_vid, rhs_vid) }
+    if cmp_kind == "ne" { return bld_cmp_ne(m, b, lhs_vid, rhs_vid) }
+    if cmp_kind == "lt" { return bld_cmp_lt(m, b, lhs_vid, rhs_vid) }
+    if cmp_kind == "le" { return bld_cmp_le(m, b, lhs_vid, rhs_vid) }
+    if cmp_kind == "gt" { return bld_cmp_gt(m, b, lhs_vid, rhs_vid) }
+    if cmp_kind == "ge" { return bld_cmp_ge(m, b, lhs_vid, rhs_vid) }
+    // TODO: lower cmp kind unsupported (cmp_kind)
+    return -1
+}
+
 // ── Call lowering ───────────────────────────────────────────
 // Evaluate args L→R (caller must lower each to a ValueId), then emit CALL.
 // `callee_fid` is a FuncId resolved by the caller (module_find_function).
@@ -234,6 +293,112 @@ fn lower_assign(m, b, env, name, rhs_vid) {
     if !lower_env_is_mut(env, name) { return -1 }
     bld_store(m, b, slot, rhs_vid)
     return rhs_vid
+}
+
+// ── Return Statement ────────────────────────────────────────
+// Convenience — identical to `lower_return` but named after the AST node.
+// `val_vid` < 0 means `return;` (void return).
+fn lower_return_stmt(m, b, val_vid) {
+    return bld_ret(m, b, val_vid)
+}
+
+// ── Break / Continue ───────────────────────────────────────
+// These rely on an enclosing loop to have published (header_bb, end_bb).
+// Caller threads these through a small loop-context struct:
+//   LoopCtx { header_bb: int, end_bb: int }
+// and passes it to lower_break / lower_continue.
+struct LoopCtx {
+    header_bb: int,
+    end_bb:    int
+}
+
+fn loop_ctx_new(header_bb, end_bb) {
+    return LoopCtx { header_bb: header_bb, end_bb: end_bb }
+}
+
+// Break → JUMP loop.end (emits terminator into current block).
+fn lower_break(m, b, ctx) {
+    if ctx.end_bb < 0 { return -1 }
+    bld_jump(m, b, ctx.end_bb)
+    return 0
+}
+
+// Continue → JUMP loop.header.
+fn lower_continue(m, b, ctx) {
+    if ctx.header_bb < 0 { return -1 }
+    bld_jump(m, b, ctx.header_bb)
+    return 0
+}
+
+// ── While lowering (full helper) ───────────────────────────
+// Given a pre-lowered cond builder callback is not supported here — instead,
+// we expose the skeleton and a close helper. This mirrors lower_for_range_*.
+// Flow:
+//   1. lower_while_skeleton(m, b)       → [header, body, end]
+//   2. builder_switch_to(b, header)     → lower cond, bld_branch(cond, body, end)
+//   3. builder_switch_to(b, body)       → lower body, then lower_while_close
+//   4. lower_while_close(m, b, header)  → emits backedge JUMP and switches to end
+fn lower_while_close(m, b, header_bb, end_bb) {
+    bld_jump(m, b, header_bb)
+    builder_switch_to(b, end_bb)
+}
+
+// ── Match lowering ─────────────────────────────────────────
+// Simple match on a scalar (int/bool). Arms are materialized as a SWITCH
+// over the discriminant `scrutinee_vid`. Each arm gets a fresh block; the
+// default block handles the wildcard / fall-through.
+//   cases: array of [case_int_val, case_block_id]
+// After lowering, caller fills each case block with its arm body and must
+// terminate with a JUMP to `end_bb`.
+// Returns [case_blocks(array), default_bb, end_bb].
+fn lower_match_skeleton(m, b, scrutinee_vid, case_count) {
+    let case_blocks = []
+    let i = 0
+    while i < case_count {
+        let bb = builder_create_block(m, b, "match.arm")
+        push(case_blocks, bb)
+        i = i + 1
+    }
+    let default_bb = builder_create_block(m, b, "match.default")
+    let end_bb = builder_create_block(m, b, "match.end")
+    return [case_blocks, default_bb, end_bb]
+}
+
+// Emit the terminating `switch` after match skeleton + cases mapping.
+// cases_assoc : array of [case_int_val, arm_block_id] (same count / order).
+fn lower_match_dispatch(m, b, scrutinee_vid, cases_assoc, default_bb) {
+    bld_switch(m, b, scrutinee_vid, cases_assoc, default_bb)
+}
+
+fn lower_match_close(m, b, end_bb) {
+    builder_switch_to(b, end_bb)
+}
+
+// ── IfExpr lowering (value-producing if) ───────────────────
+// Unlike lower_if_skeleton which is statement-oriented, IfExpr needs a PHI
+// in the end block to merge then/else results.
+// Steps:
+//   1. lower cond  → cond_vid
+//   2. lower_if_expr_skeleton(m, b, cond_vid) → [then_bb, else_bb, end_bb]
+//   3. populate then_bb with its expr, capture then_vid + then_final_bb,
+//      emit JUMP end_bb (caller does this before moving on)
+//   4. same for else_bb → else_vid + else_final_bb
+//   5. lower_if_expr_close(m, b, end_bb, then_final_bb, then_vid,
+//                                       else_final_bb, else_vid, ty)
+//      → returns phi vid
+fn lower_if_expr_skeleton(m, b, cond_vid) {
+    let then_bb = builder_create_block(m, b, "ifexpr.then")
+    let else_bb = builder_create_block(m, b, "ifexpr.else")
+    let end_bb  = builder_create_block(m, b, "ifexpr.end")
+    bld_branch(m, b, cond_vid, then_bb, else_bb)
+    return [then_bb, else_bb, end_bb]
+}
+
+fn lower_if_expr_close(m, b, end_bb, then_final_bb, then_vid,
+                                     else_final_bb, else_vid, ty) {
+    builder_switch_to(b, end_bb)
+    let incoming = [[then_final_bb, then_vid], [else_final_bb, else_vid]]
+    return bld_phi(m, b, incoming, ty)
 }
 
 // ── For-range lowering skeleton ────────────────────────────
