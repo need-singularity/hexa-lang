@@ -1,26 +1,40 @@
 // ===================================================================
-//  self/ml/mixture_of_depths.hexa — Mixture of Depths (pure Hexa)
+//  self/ml/mixture_of_depths_v2.hexa — Mixture of Depths v2 (pure Hexa)
 //
-//  Dynamic token routing: not all tokens need all layers.
-//  A lightweight router decides which tokens to process at each layer.
-//  Non-routed tokens pass through via skip connection.
+//  ML roadmap #173 — Token-level dynamic computation allocation (v2)
+//
+//  Extends v1 with:
+//    (1) Learned router per layer: trainable gate deciding skip/compute
+//    (2) Skip decision: binary skip with straight-through estimator (STE)
+//    (3) Capacity budget: limit fraction of tokens computed per layer
+//    (4) Auxiliary loss: balance token routing (not all skip/compute)
+//    (5) Early exit integration: exit model early for easy tokens
+//    (6) Dynamic depth map: visualize per-token computation depth
+//    (7) Stats: compute savings, skip rate per layer, effective FLOPs
 //
 //  Public API:
-//    create_router(hidden_dim)
-//    router_forward(router, hiddens)      -> scores per token
-//    select_topk_tokens(scores, capacity)  -> selected indices
-//    create_mod_layer(hidden_dim, ff_dim)
-//    mod_layer_forward(layer, hiddens, router, capacity_factor)
-//    aux_load_balance_loss(router_probs, n_tokens, capacity)
-//    mod_forward_full(layers, routers, hiddens, capacity_factor)
-//    create_capacity_schedule(n_layers, base_factor)
+//    create_v2_router(hidden_dim, n_layers)
+//    v2_router_forward(router, hiddens)
+//    ste_binary_skip(scores, threshold)
+//    apply_capacity_budget(skip_mask, capacity_fraction, scores)
+//    v2_aux_balance_loss(skip_mask, target_fraction)
+//    v2_aux_entropy_loss(scores)
+//    create_v2_mod_layer(hidden_dim, ff_dim)
+//    v2_mod_layer_forward(layer, router, hiddens, capacity_fraction)
+//    v2_mod_forward_full(layers, routers, hiddens, cap_fractions)
+//    early_exit_check(hiddens, threshold)
+//    compute_depth_map(layers, routers, hiddens, cap_fractions)
+//    v2_skip_rate_per_layer(depth_map, n_layers)
+//    v2_compute_savings(depth_map, n_layers)
+//    v2_effective_flops(depth_map, n_layers, flops_per_layer)
+//    v2_capacity_schedule(n_layers, base_fraction, decay)
 // ===================================================================
 
 // ===================================================================
 //  Vector utilities
 // ===================================================================
 
-fn mod_vec_zeros(dim) {
+fn v2_vec_zeros(dim) {
     let mut out = []
     let mut i = 0
     while i < dim {
@@ -30,7 +44,7 @@ fn mod_vec_zeros(dim) {
     return out
 }
 
-fn mod_vec_add(a, b) {
+fn v2_vec_add(a, b) {
     let n = len(a)
     let mut out = []
     let mut i = 0
@@ -41,7 +55,7 @@ fn mod_vec_add(a, b) {
     return out
 }
 
-fn mod_vec_scale(v, s) {
+fn v2_vec_scale(v, s) {
     let n = len(v)
     let mut out = []
     let mut i = 0
@@ -52,7 +66,7 @@ fn mod_vec_scale(v, s) {
     return out
 }
 
-fn mod_dot(a, b) {
+fn v2_dot(a, b) {
     let n = len(a)
     let mut s = 0.0
     let mut i = 0
@@ -63,52 +77,77 @@ fn mod_dot(a, b) {
     return s
 }
 
-fn mod_fabs(x) {
+fn v2_fabs(x) {
     if x < 0.0 { return 0.0 - x }
     return x
 }
 
-// ===================================================================
-//  Token Router
-//
-//  Linear projection: score = sigmoid(W . hidden + bias)
-//  W: array of floats (hidden_dim), bias: float
-// ===================================================================
-
-struct TokenRouter {
-    dim: int,
-    W: array,
-    bias: float
+fn v2_vec_norm(v) {
+    let mut s = 0.0
+    let n = len(v)
+    let mut i = 0
+    while i < n {
+        s = s + v[i] * v[i]
+        i = i + 1
+    }
+    return sqrt(s)
 }
 
-fn create_router(dim) {
+fn v2_vec_sub(a, b) {
+    let n = len(a)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out + [a[i] - b[i]]
+        i = i + 1
+    }
+    return out
+}
+
+// ===================================================================
+//  (1) Learned Router per Layer
+//
+//  Trainable gate: score = sigmoid(W . hidden + bias)
+//  Each layer has its own router with independent weights.
+//  W: array of floats (hidden_dim), bias: float, lr: learning rate
+// ===================================================================
+
+struct V2Router {
+    dim: int,
+    W: array,
+    bias: float,
+    layer_id: int
+}
+
+fn create_v2_router(dim, layer_id) {
     let scale = 1.0 / sqrt(to_float(dim))
     let mut W = []
     let mut i = 0
     while i < dim {
-        let val = sin(to_float(i * 137 + 7)) * scale
+        // Different init per layer using layer_id for diversity
+        let val = sin(to_float(i * 137 + layer_id * 53 + 7)) * scale
         W = W + [val]
         i = i + 1
     }
-    return TokenRouter { dim: dim, W: W, bias: 0.0 }
+    return V2Router { dim: dim, W: W, bias: 0.01, layer_id: layer_id }
 }
 
-fn mod_sigmoid(x) {
+fn v2_sigmoid(x) {
     if x > 20.0 { return 1.0 }
     if x < -20.0 { return 0.0 }
     return 1.0 / (1.0 + exp(0.0 - x))
 }
 
-// Compute routing score for each token
+// Compute routing scores for all tokens at a given layer
 // hiddens: array of arrays (n_tokens x hidden_dim)
 // returns: array of floats (routing probability per token)
-fn router_forward(router, hiddens) {
+fn v2_router_forward(router, hiddens) {
     let n = len(hiddens)
     let mut scores = []
     let mut i = 0
     while i < n {
-        let raw = mod_dot(router.W, hiddens[i]) + router.bias
-        let prob = mod_sigmoid(raw)
+        let raw = v2_dot(router.W, hiddens[i]) + router.bias
+        let prob = v2_sigmoid(raw)
         scores = scores + [prob]
         i = i + 1
     }
@@ -116,71 +155,221 @@ fn router_forward(router, hiddens) {
 }
 
 // ===================================================================
-//  Top-k token selection with capacity factor
+//  (2) Skip Decision: Binary Skip with Straight-Through Estimator
 //
-//  capacity = floor(n_tokens * capacity_factor)
-//  Select top-capacity tokens by router score.
-//  Returns indices of selected tokens.
+//  Hard binary decision: skip_mask[i] = 1 if score >= threshold, 0 otherwise
+//  STE forward: use hard decision for forward pass
+//  STE backward: gradient flows through soft score (simulated)
+//  Returns: [hard_mask, soft_scores] for combined usage
 // ===================================================================
 
-fn select_topk_tokens(scores, capacity) {
+fn ste_binary_skip(scores, threshold) {
     let n = len(scores)
-    let actual_cap = if capacity > n { n } else { capacity }
-    let mut used = []
+    let mut hard_mask = []
     let mut i = 0
     while i < n {
-        used = used + [false]
+        if scores[i] >= threshold {
+            hard_mask = hard_mask + [1.0]
+        } else {
+            hard_mask = hard_mask + [0.0]
+        }
         i = i + 1
     }
-    let mut selected = []
-    let mut r = 0
-    while r < actual_cap {
-        let mut best = -1
-        let mut best_v = -1.0e30
+    // STE: hard_mask for forward, scores for backward (simulated)
+    // Return both so the caller can use soft scores for gradient
+    return [hard_mask, scores]
+}
+
+// Combine STE result: hard_mask + (soft - hard).detach()
+// In inference, this is just hard_mask. In training, gradient flows via soft.
+fn ste_combine(hard_mask, soft_scores) {
+    let n = len(hard_mask)
+    let mut combined = []
+    let mut i = 0
+    while i < n {
+        // STE forward: hard value, backward: soft gradient
+        // combined = hard + (soft - hard).stop_gradient => hard in forward
+        combined = combined + [hard_mask[i]]
+        i = i + 1
+    }
+    return combined
+}
+
+// ===================================================================
+//  (3) Capacity Budget: limit fraction of tokens computed per layer
+//
+//  Given a skip_mask (1=compute, 0=skip), enforce that at most
+//  capacity_fraction * n_tokens are computed. If too many want to
+//  compute, drop lowest-scoring ones.
+// ===================================================================
+
+fn apply_capacity_budget(skip_mask, capacity_fraction, scores) {
+    let n = len(skip_mask)
+    let max_compute_f = to_float(n) * capacity_fraction
+    // Compute floor of max_compute
+    let mut max_compute = 0
+    let mut ci = 0
+    while to_float(ci) < max_compute_f {
+        max_compute = ci
+        ci = ci + 1
+    }
+    if to_float(max_compute) < max_compute_f { max_compute = max_compute + 1 }
+    if max_compute > n { max_compute = n }
+
+    // Count how many want to compute
+    let mut compute_count = 0
+    let mut i = 0
+    while i < n {
+        if skip_mask[i] > 0.5 { compute_count = compute_count + 1 }
+        i = i + 1
+    }
+
+    // If within budget, return as-is
+    if compute_count <= max_compute {
+        return skip_mask
+    }
+
+    // Need to drop (compute_count - max_compute) lowest-scoring compute tokens
+    let n_drop = compute_count - max_compute
+
+    // Collect indices of compute tokens with their scores
+    let mut compute_indices = []
+    let mut compute_scores = []
+    i = 0
+    while i < n {
+        if skip_mask[i] > 0.5 {
+            compute_indices = compute_indices + [i]
+            compute_scores = compute_scores + [scores[i]]
+        }
+        i = i + 1
+    }
+
+    // Find n_drop lowest-scoring compute tokens
+    let nc = len(compute_indices)
+    let mut dropped = []
+    i = 0
+    while i < nc {
+        dropped = dropped + [false]
+        i = i + 1
+    }
+
+    let mut d = 0
+    while d < n_drop {
+        let mut worst_j = -1
+        let mut worst_v = 1.0e30
         let mut j = 0
-        while j < n {
-            if !used[j] {
-                if scores[j] > best_v {
-                    best_v = scores[j]
-                    best = j
+        while j < nc {
+            if !dropped[j] {
+                if compute_scores[j] < worst_v {
+                    worst_v = compute_scores[j]
+                    worst_j = j
                 }
             }
             j = j + 1
         }
-        if best >= 0 {
-            let mut used2 = []
+        if worst_j >= 0 {
+            // Rebuild dropped array (no complex index assignment)
+            let mut dropped2 = []
             let mut k = 0
-            while k < n {
-                if k == best { used2 = used2 + [true] } else { used2 = used2 + [used[k]] }
+            while k < nc {
+                if k == worst_j { dropped2 = dropped2 + [true] } else { dropped2 = dropped2 + [dropped[k]] }
                 k = k + 1
             }
-            used = used2
-            selected = selected + [best]
+            dropped = dropped2
         }
-        r = r + 1
+        d = d + 1
     }
-    return selected
-}
 
-// Compute capacity from factor
-fn compute_capacity(n_tokens, capacity_factor) {
-    let cap = to_float(n_tokens) * capacity_factor
-    let mut result = 0
-    let mut i = 0
-    while to_float(i) < cap {
-        result = i
+    // Build new mask
+    let mut new_mask = []
+    i = 0
+    while i < n {
+        new_mask = new_mask + [skip_mask[i]]
         i = i + 1
     }
-    if to_float(result) < cap { result = result + 1 }
-    if result > n_tokens { result = n_tokens }
-    return result
+
+    // Zero out dropped tokens
+    let mut di = 0
+    while di < nc {
+        if dropped[di] {
+            let drop_idx = compute_indices[di]
+            let mut new_mask2 = []
+            let mut k = 0
+            while k < n {
+                if k == drop_idx { new_mask2 = new_mask2 + [0.0] } else { new_mask2 = new_mask2 + [new_mask[k]] }
+                k = k + 1
+            }
+            new_mask = new_mask2
+        }
+        di = di + 1
+    }
+
+    return new_mask
+}
+
+// Count how many tokens are set to compute in a mask
+fn count_compute(mask) {
+    let n = len(mask)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if mask[i] > 0.5 { c = c + 1 }
+        i = i + 1
+    }
+    return c
 }
 
 // ===================================================================
-//  MoD Layer: FFN applied only to selected tokens
+//  (4) Auxiliary Loss: balance token routing
+//
+//  Two components:
+//    a) Balance loss: penalize deviation from target compute fraction
+//    b) Entropy loss: encourage diverse routing (not all same decision)
 // ===================================================================
 
-struct ModLayer {
+fn v2_aux_balance_loss(skip_mask, target_fraction) {
+    let n = len(skip_mask)
+    if n == 0 { return 0.0 }
+    let mut compute_sum = 0.0
+    let mut i = 0
+    while i < n {
+        compute_sum = compute_sum + skip_mask[i]
+        i = i + 1
+    }
+    let actual_fraction = compute_sum / to_float(n)
+    let diff = actual_fraction - target_fraction
+    return diff * diff * to_float(n)
+}
+
+fn v2_aux_entropy_loss(scores) {
+    let n = len(scores)
+    if n == 0 { return 0.0 }
+    let eps = 1.0e-10
+    // Binary entropy: H = -p*log(p) - (1-p)*log(1-p) per token
+    let mut total_h = 0.0
+    let mut i = 0
+    while i < n {
+        let p = scores[i]
+        let p_clamped = if p < eps { eps } else { if p > 1.0 - eps { 1.0 - eps } else { p } }
+        let h = 0.0 - p_clamped * log(p_clamped) - (1.0 - p_clamped) * log(1.0 - p_clamped)
+        total_h = total_h + h
+        i = i + 1
+    }
+    // Negate: we want to MAXIMIZE entropy, so loss = -mean_entropy
+    return 0.0 - total_h / to_float(n)
+}
+
+fn v2_combined_aux_loss(skip_mask, scores, target_fraction, entropy_weight) {
+    let balance = v2_aux_balance_loss(skip_mask, target_fraction)
+    let entropy = v2_aux_entropy_loss(scores)
+    return balance + entropy_weight * entropy
+}
+
+// ===================================================================
+//  V2 MoD Layer: FFN with gated skip
+// ===================================================================
+
+struct V2ModLayer {
     dim: int,
     ff_dim: int,
     W_up: array,
@@ -189,9 +378,8 @@ struct ModLayer {
     bias_down: array
 }
 
-fn create_mod_layer(dim, ff_dim) {
+fn create_v2_mod_layer(dim, ff_dim) {
     let scale = 0.02
-    // W_up: [ff_dim][dim]
     let mut W_up = []
     let mut i = 0
     while i < ff_dim {
@@ -205,7 +393,6 @@ fn create_mod_layer(dim, ff_dim) {
         W_up = W_up + [row]
         i = i + 1
     }
-    // W_down: [dim][ff_dim]
     let mut W_down = []
     i = 0
     while i < dim {
@@ -219,23 +406,19 @@ fn create_mod_layer(dim, ff_dim) {
         W_down = W_down + [row]
         i = i + 1
     }
-    let bias_up = mod_vec_zeros(ff_dim)
-    let bias_down = mod_vec_zeros(dim)
-    return ModLayer {
+    return V2ModLayer {
         dim: dim,
         ff_dim: ff_dim,
         W_up: W_up,
         W_down: W_down,
-        bias_up: bias_up,
-        bias_down: bias_down
+        bias_up: v2_vec_zeros(ff_dim),
+        bias_down: v2_vec_zeros(dim)
     }
 }
 
-// FFN forward: ReLU(x @ W_up + b_up) @ W_down + b_down
-fn ffn_forward(layer, x) {
+fn v2_ffn_forward(layer, x) {
     let dim = layer.dim
     let ff_dim = layer.ff_dim
-    // Up projection
     let mut h = []
     let mut i = 0
     while i < ff_dim {
@@ -245,12 +428,10 @@ fn ffn_forward(layer, x) {
             s = s + layer.W_up[i][j] * x[j]
             j = j + 1
         }
-        // ReLU
         if s < 0.0 { s = 0.0 }
         h = h + [s]
         i = i + 1
     }
-    // Down projection
     let mut out = []
     i = 0
     while i < dim {
@@ -267,144 +448,298 @@ fn ffn_forward(layer, x) {
 }
 
 // ===================================================================
-//  MoD layer forward
+//  V2 MoD Layer Forward
 //
-//  1. Router scores all tokens
-//  2. Select top-k tokens (capacity = n_tokens * capacity_factor)
-//  3. Apply FFN only to selected tokens
-//  4. Non-selected tokens pass through unchanged (skip connection)
-//  5. Selected tokens: output = input + FFN(input)  (residual)
+//  1. Router scores tokens
+//  2. STE binary skip decision
+//  3. Capacity budget enforcement
+//  4. FFN applied only to compute tokens
+//  5. Skip tokens pass through unchanged
+//  Returns: [outputs, skip_mask, scores]
 // ===================================================================
 
-fn mod_layer_forward(layer, router, hiddens, capacity_factor) {
+fn v2_mod_layer_forward(layer, router, hiddens, capacity_fraction) {
     let n = len(hiddens)
-    let dim = layer.dim
-    let scores = router_forward(router, hiddens)
-    let capacity = compute_capacity(n, capacity_factor)
-    let selected = select_topk_tokens(scores, capacity)
-    let n_sel = len(selected)
+    let scores = v2_router_forward(router, hiddens)
 
-    // Build selected set for quick lookup
-    let mut is_selected = []
+    // STE binary decision at threshold 0.5
+    let ste_result = ste_binary_skip(scores, 0.5)
+    let hard_mask = ste_result[0]
+
+    // Enforce capacity budget
+    let final_mask = apply_capacity_budget(hard_mask, capacity_fraction, scores)
+
+    // Apply FFN to compute tokens, skip for others
+    let mut outputs = []
     let mut i = 0
     while i < n {
-        is_selected = is_selected + [false]
-        i = i + 1
-    }
-    i = 0
-    while i < n_sel {
-        let mut new_sel = []
-        let mut k = 0
-        while k < n {
-            if k == selected[i] { new_sel = new_sel + [true] } else { new_sel = new_sel + [is_selected[k]] }
-            k = k + 1
-        }
-        is_selected = new_sel
-        i = i + 1
-    }
-
-    // Process tokens
-    let mut outputs = []
-    i = 0
-    while i < n {
-        if is_selected[i] {
-            // Apply FFN + residual
-            let ffn_out = ffn_forward(layer, hiddens[i])
-            // Weight by router probability
-            let weighted = mod_vec_scale(ffn_out, scores[i])
-            let result = mod_vec_add(hiddens[i], weighted)
+        if final_mask[i] > 0.5 {
+            let ffn_out = v2_ffn_forward(layer, hiddens[i])
+            let weighted = v2_vec_scale(ffn_out, scores[i])
+            let result = v2_vec_add(hiddens[i], weighted)
             outputs = outputs + [result]
         } else {
-            // Skip connection: pass through unchanged
             outputs = outputs + [hiddens[i]]
         }
         i = i + 1
     }
-    return outputs
+    return [outputs, final_mask, scores]
 }
 
 // ===================================================================
-//  Auxiliary load balancing loss
+//  Multi-layer V2 MoD forward
 //
-//  Encourages the router to distribute tokens evenly.
-//  L_aux = n_tokens * sum(f_i * P_i)
-//  where f_i = fraction of tokens routed to bucket i
-//        P_i = mean router probability for bucket i
-//
-//  For MoD (single router), we penalize deviation from target capacity.
-//  L = (fraction_routed - capacity_factor)^2
+//  Returns: [final_hiddens, total_aux_loss, all_masks]
 // ===================================================================
 
-fn aux_load_balance_loss(scores, capacity_factor) {
-    let n = len(scores)
-    // Mean routing probability
-    let mut mean_prob = 0.0
-    let mut i = 0
-    while i < n {
-        mean_prob = mean_prob + scores[i]
-        i = i + 1
-    }
-    mean_prob = mean_prob / to_float(n)
-    // Deviation from target
-    let diff = mean_prob - capacity_factor
-    return diff * diff * to_float(n)
-}
-
-// Extended aux loss: variance of routing probabilities (encourage uniformity)
-fn aux_variance_loss(scores) {
-    let n = len(scores)
-    let mut mean = 0.0
-    let mut i = 0
-    while i < n {
-        mean = mean + scores[i]
-        i = i + 1
-    }
-    mean = mean / to_float(n)
-    let mut var = 0.0
-    i = 0
-    while i < n {
-        let d = scores[i] - mean
-        var = var + d * d
-        i = i + 1
-    }
-    return var / to_float(n)
-}
-
-// ===================================================================
-//  Multi-layer MoD forward
-//
-//  Apply multiple MoD layers sequentially, each with its own router
-//  and capacity factor.
-// ===================================================================
-
-fn mod_forward_full(layers, routers, hiddens, capacity_factors) {
+fn v2_mod_forward_full(layers, routers, hiddens, cap_fractions) {
     let n_layers = len(layers)
     let mut h = hiddens
-    let mut total_aux_loss = 0.0
+    let mut total_aux = 0.0
+    let mut all_masks = []
     let mut i = 0
     while i < n_layers {
-        let scores = router_forward(routers[i], h)
-        total_aux_loss = total_aux_loss + aux_load_balance_loss(scores, capacity_factors[i])
-        h = mod_layer_forward(layers[i], routers[i], h, capacity_factors[i])
+        let result = v2_mod_layer_forward(layers[i], routers[i], h, cap_fractions[i])
+        h = result[0]
+        let mask = result[1]
+        let scores = result[2]
+        all_masks = all_masks + [mask]
+        total_aux = total_aux + v2_combined_aux_loss(mask, scores, cap_fractions[i], 0.1)
         i = i + 1
     }
-    return [h, total_aux_loss]
+    return [h, total_aux, all_masks]
 }
 
 // ===================================================================
-//  Capacity schedule: different capacity per layer
+//  (5) Early Exit Integration
 //
-//  Early layers: higher capacity (more tokens processed)
-//  Later layers: lower capacity (easier tokens skip)
+//  Check if all tokens have low router scores (easy tokens).
+//  If mean score across tokens < threshold, exit early.
+//  Returns: [should_exit: bool, confidence: float]
 // ===================================================================
 
-fn create_capacity_schedule(n_layers, base_factor) {
+fn early_exit_check(scores, threshold) {
+    let n = len(scores)
+    if n == 0 { return [false, 0.0] }
+    let mut mean_score = 0.0
+    let mut i = 0
+    while i < n {
+        mean_score = mean_score + scores[i]
+        i = i + 1
+    }
+    mean_score = mean_score / to_float(n)
+    // Low mean score = easy tokens = can exit early
+    let confidence = 1.0 - mean_score
+    let should_exit = mean_score < threshold
+    return [should_exit, confidence]
+}
+
+// Full forward with early exit
+// Returns: [hiddens, aux_loss, exit_layer, depth_map_masks]
+fn v2_forward_with_early_exit(layers, routers, hiddens, cap_fractions, exit_threshold) {
+    let n_layers = len(layers)
+    let mut h = hiddens
+    let mut total_aux = 0.0
+    let mut all_masks = []
+    let mut exit_layer = n_layers
+    let mut i = 0
+    while i < n_layers {
+        let result = v2_mod_layer_forward(layers[i], routers[i], h, cap_fractions[i])
+        h = result[0]
+        let mask = result[1]
+        let scores = result[2]
+        all_masks = all_masks + [mask]
+        total_aux = total_aux + v2_combined_aux_loss(mask, scores, cap_fractions[i], 0.1)
+
+        // Early exit check
+        let exit_result = early_exit_check(scores, exit_threshold)
+        let should_exit = exit_result[0]
+        if should_exit {
+            exit_layer = i + 1
+            return [h, total_aux, exit_layer, all_masks]
+        }
+        i = i + 1
+    }
+    return [h, total_aux, exit_layer, all_masks]
+}
+
+// ===================================================================
+//  (6) Dynamic Depth Map
+//
+//  For each token, compute how many layers it was actually processed
+//  (not skipped) through. This gives a per-token depth.
+//  depth_map: array of int, one per token
+// ===================================================================
+
+fn compute_depth_map(layers, routers, hiddens, cap_fractions) {
+    let n_layers = len(layers)
+    let n_tokens = len(hiddens)
+
+    // Initialize depth counters
+    let mut depth = []
+    let mut i = 0
+    while i < n_tokens {
+        depth = depth + [0]
+        i = i + 1
+    }
+
+    let mut h = hiddens
+    let mut layer_idx = 0
+    while layer_idx < n_layers {
+        let result = v2_mod_layer_forward(layers[layer_idx], routers[layer_idx], h, cap_fractions[layer_idx])
+        h = result[0]
+        let mask = result[1]
+
+        // Update depth: add 1 for each computed token
+        let mut new_depth = []
+        i = 0
+        while i < n_tokens {
+            if mask[i] > 0.5 {
+                new_depth = new_depth + [depth[i] + 1]
+            } else {
+                new_depth = new_depth + [depth[i]]
+            }
+            i = i + 1
+        }
+        depth = new_depth
+        layer_idx = layer_idx + 1
+    }
+    return depth
+}
+
+// Max depth in a depth map
+fn depth_map_max(depth_map) {
+    let n = len(depth_map)
+    let mut mx = 0
+    let mut i = 0
+    while i < n {
+        if depth_map[i] > mx { mx = depth_map[i] }
+        i = i + 1
+    }
+    return mx
+}
+
+// Mean depth in a depth map
+fn depth_map_mean(depth_map) {
+    let n = len(depth_map)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
+    let mut i = 0
+    while i < n {
+        total = total + to_float(depth_map[i])
+        i = i + 1
+    }
+    return total / to_float(n)
+}
+
+// Depth histogram: count tokens at each depth level
+fn depth_histogram(depth_map, n_layers) {
+    let mut hist = []
+    let mut d = 0
+    while d <= n_layers {
+        let mut count = 0
+        let mut i = 0
+        while i < len(depth_map) {
+            if depth_map[i] == d { count = count + 1 }
+            i = i + 1
+        }
+        hist = hist + [count]
+        d = d + 1
+    }
+    return hist
+}
+
+// ===================================================================
+//  (7) Stats: compute savings, skip rate per layer, effective FLOPs
+// ===================================================================
+
+// Skip rate per layer from masks
+fn v2_skip_rate_per_layer(all_masks, n_tokens) {
+    let n_layers = len(all_masks)
+    let mut rates = []
+    let mut i = 0
+    while i < n_layers {
+        let mask = all_masks[i]
+        let mut skip_count = 0
+        let mut j = 0
+        while j < n_tokens {
+            if mask[j] < 0.5 { skip_count = skip_count + 1 }
+            j = j + 1
+        }
+        let rate = to_float(skip_count) / to_float(n_tokens)
+        rates = rates + [rate]
+        i = i + 1
+    }
+    return rates
+}
+
+// Compute savings from masks
+fn v2_compute_savings(all_masks, n_tokens) {
+    let n_layers = len(all_masks)
+    if n_layers == 0 { return 0.0 }
+    let total_possible = to_float(n_tokens) * to_float(n_layers)
+    let mut total_computed = 0.0
+    let mut i = 0
+    while i < n_layers {
+        let mask = all_masks[i]
+        let mut j = 0
+        while j < n_tokens {
+            if mask[j] > 0.5 { total_computed = total_computed + 1.0 }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return 1.0 - total_computed / total_possible
+}
+
+// Effective FLOPs: computed tokens * flops_per_layer_per_token
+fn v2_effective_flops(all_masks, n_tokens, flops_per_token) {
+    let n_layers = len(all_masks)
+    let mut total_flops = 0.0
+    let mut i = 0
+    while i < n_layers {
+        let mask = all_masks[i]
+        let mut j = 0
+        while j < n_tokens {
+            if mask[j] > 0.5 {
+                total_flops = total_flops + flops_per_token
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return total_flops
+}
+
+// Dense (no-skip) FLOPs for reference
+fn v2_dense_flops(n_tokens, n_layers, flops_per_token) {
+    return to_float(n_tokens) * to_float(n_layers) * flops_per_token
+}
+
+// ===================================================================
+//  Capacity Schedule v2: exponential decay with floor
+// ===================================================================
+
+fn v2_capacity_schedule(n_layers, base_fraction, decay) {
     let mut schedule = []
     let mut i = 0
     while i < n_layers {
-        // Linear decay: first layer = base_factor, last = base_factor * 0.5
-        let ratio = to_float(i) / to_float(n_layers)
-        let factor = base_factor * (1.0 - ratio * 0.5)
+        let factor = base_fraction * pow(decay, to_float(i))
+        // Floor at 0.1 to always compute at least 10%
+        let clamped = if factor < 0.1 { 0.1 } else { factor }
+        schedule = schedule + [clamped]
+        i = i + 1
+    }
+    return schedule
+}
+
+// Linear capacity schedule (simpler)
+fn v2_capacity_schedule_linear(n_layers, start_fraction, end_fraction) {
+    let mut schedule = []
+    let mut i = 0
+    while i < n_layers {
+        let ratio = if n_layers > 1 { to_float(i) / to_float(n_layers - 1) } else { 0.0 }
+        let factor = start_fraction + (end_fraction - start_fraction) * ratio
         schedule = schedule + [factor]
         i = i + 1
     }
@@ -412,110 +747,41 @@ fn create_capacity_schedule(n_layers, base_factor) {
 }
 
 // ===================================================================
-//  Statistics: count how many tokens were processed per layer
+//  Router gradient simulation (for training)
+//  Compute simple gradient signal for router weights
 // ===================================================================
 
-fn count_routed_tokens(router, hiddens, capacity_factor) {
+fn v2_router_gradient(router, hiddens, mask, target_fraction) {
     let n = len(hiddens)
-    let scores = router_forward(router, hiddens)
-    let capacity = compute_capacity(n, capacity_factor)
-    let selected = select_topk_tokens(scores, capacity)
-    return len(selected)
-}
+    let scores = v2_router_forward(router, hiddens)
 
-fn compute_flop_savings(n_tokens, n_layers, capacity_factors) {
-    let mut total_saved = 0.0
-    let mut i = 0
-    while i < n_layers {
-        let processed = to_float(n_tokens) * capacity_factors[i]
-        let saved = to_float(n_tokens) - processed
-        total_saved = total_saved + saved
-        i = i + 1
-    }
-    let total_possible = to_float(n_tokens) * to_float(n_layers)
-    return total_saved / total_possible
-}
-
-// ===================================================================
-//  Router entropy: measures diversity of routing decisions
-//  H = -sum(p * log(p + eps)) for normalized probabilities
-// ===================================================================
-
-fn router_entropy(scores) {
-    let n = len(scores)
-    if n == 0 { return 0.0 }
-    let eps = 1.0e-10
-    let mut s_sum = 0.0
+    // Compute fraction currently computed
+    let mut compute_sum = 0.0
     let mut i = 0
     while i < n {
-        s_sum = s_sum + scores[i]
+        compute_sum = compute_sum + mask[i]
         i = i + 1
     }
-    if s_sum < eps { return 0.0 }
-    let mut h = 0.0
+    let actual_frac = compute_sum / to_float(n)
+    let error = actual_frac - target_fraction
+
+    // Simple gradient: if too many compute, push scores down, and vice versa
+    let mut grad_W = v2_vec_zeros(router.dim)
     i = 0
     while i < n {
-        let p = scores[i] / s_sum
-        if p > eps {
-            h = h - p * log(p)
-        }
+        let scale = error * (scores[i] - 0.5) * 2.0
+        let token_grad = v2_vec_scale(hiddens[i], scale / to_float(n))
+        grad_W = v2_vec_add(grad_W, token_grad)
         i = i + 1
     }
-    return h
+    return grad_W
 }
 
 // ===================================================================
-//  Skip ratio per layer: fraction of tokens that skip
+//  Dense reference forward (for comparison)
 // ===================================================================
 
-fn skip_ratio(n_tokens, capacity_factor) {
-    if n_tokens == 0 { return 0.0 }
-    let cap = compute_capacity(n_tokens, capacity_factor)
-    return 1.0 - to_float(cap) / to_float(n_tokens)
-}
-
-// ===================================================================
-//  Sorted top-k: returns selected indices in ascending order
-//  (preserves causality/token order)
-// ===================================================================
-
-fn select_topk_sorted(scores, capacity) {
-    let sel = select_topk_tokens(scores, capacity)
-    let n = len(sel)
-    // bubble sort (tiny arrays)
-    let mut sorted = sel
-    let mut i = 0
-    while i < n {
-        let mut j = 0
-        while j < n - 1 {
-            if sorted[j] > sorted[j + 1] {
-                let tmp = sorted[j]
-                let mut s2 = []
-                let mut k = 0
-                while k < n {
-                    if k == j { s2 = s2 + [sorted[j + 1]] }
-                    else {
-                        if k == j + 1 { s2 = s2 + [tmp] }
-                        else { s2 = s2 + [sorted[k]] }
-                    }
-                    k = k + 1
-                }
-                sorted = s2
-            }
-            j = j + 1
-        }
-        i = i + 1
-    }
-    return sorted
-}
-
-// ===================================================================
-//  Dense reference forward (all tokens, all layers, no routing)
-//  For correctness: when capacity=1.0, MoD output should differ
-//  from identity but match dense forward.
-// ===================================================================
-
-fn dense_forward_full(layers, hiddens) {
+fn v2_dense_forward(layers, hiddens) {
     let n_layers = len(layers)
     let mut h = hiddens
     let mut i = 0
@@ -524,8 +790,8 @@ fn dense_forward_full(layers, hiddens) {
         let mut h2 = []
         let mut t = 0
         while t < n {
-            let ffn_out = ffn_forward(layers[i], h[t])
-            let result = mod_vec_add(h[t], ffn_out)
+            let ffn_out = v2_ffn_forward(layers[i], h[t])
+            let result = v2_vec_add(h[t], ffn_out)
             h2 = h2 + [result]
             t = t + 1
         }
@@ -533,25 +799,4 @@ fn dense_forward_full(layers, hiddens) {
         i = i + 1
     }
     return h
-}
-
-// ===================================================================
-//  Per-layer statistics: returns array of [n_processed, n_skipped]
-// ===================================================================
-
-fn mod_layer_stats(routers, hiddens, capacity_factors) {
-    let n_layers = len(routers)
-    let n = len(hiddens)
-    let mut stats = []
-    let mut h = hiddens
-    let mut i = 0
-    while i < n_layers {
-        let scores = router_forward(routers[i], h)
-        let cap = compute_capacity(n, capacity_factors[i])
-        let sel = select_topk_tokens(scores, cap)
-        let n_sel = len(sel)
-        stats = stats + [[n_sel, n - n_sel]]
-        i = i + 1
-    }
-    return stats
 }

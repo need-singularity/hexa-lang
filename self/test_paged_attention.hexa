@@ -1,491 +1,705 @@
-// ═══════════════════════════════════════════════════════════════
-//  self/test_paged_attention.hexa — Tests for paged KV-cache attention
-// ═══════════════════════════════════════════════════════════════
+// ===================================================================
+//  test_paged_attention_v2.hexa -- Paged Attention v2 (#297)
+//
+//  10+ tests covering:
+//    1. pa_init manager creation
+//    2. pa_alloc_block / pa_free_block
+//    3. pa_write_kv / pa_read_kv round-trip
+//    4. pa_create_sequence
+//    5. pa_append_token (single + multi-block)
+//    6. pa_attention correctness (single token)
+//    7. pa_attention correctness (multi token softmax)
+//    8. pa_cow_fork (shared blocks, ref_count)
+//    9. pa_cow_fork + append (COW isolation)
+//   10. pa_usage statistics
+//   11. Exhaust blocks -> alloc returns -1
+//   12. Multi-sequence independence
+//
+//  Run: ./hexa self/test_paged_attention_v2.hexa
+// ===================================================================
 
-// -- inlined from self/ml/paged_attention.hexa --
+// -- inlined from self/ml/paged_attention_v2.hexa --
 // codegen import not wired for test files
 
-// ═══════════════════════════════════════════════════════════════
-//  self/ml/paged_attention.hexa — vLLM-style Paged KV-Cache Attention
+// ===================================================================
+//  self/ml/paged_attention_v2.hexa -- Paged Attention v2 (#297)
 //
-//  Pure Hexa, no C/FFI.
+//  vLLM-style virtual memory KV-cache management (Kwon et al., 2023).
+//  KV blocks allocated on demand like OS pages, eliminating memory
+//  fragmentation and waste.
 //
-//  Design:
-//    Page table manages fixed-size pages of KV vectors.
-//    Each sequence owns an ordered list of page_ids.
-//    Within each page: flat arrays of k/v vectors, up to page_size slots.
-//    Allocation uses a free list (stack-based).
+//  Key concepts:
+//    - Block table: maps logical block -> physical block
+//    - KV blocks: fixed-size (block_size tokens) physical memory slots
+//    - Copy-on-write for beam search (shared prefixes)
+//    - Sequence-level management (multi-sequence serving)
 //
-//  API:
-//    page_table_new(num_pages, page_size, head_dim) -> dict
-//    page_alloc(pt) -> int                  (-1 if full)
-//    page_free(pt, page_id)
-//    kv_cache_append(pt, seq_id, k_vec, v_vec)
-//    paged_attention_score(pt, seq_id, query) -> [float]
-//    paged_attention_output(pt, seq_id, query) -> [float]
-// ═══════════════════════════════════════════════════════════════
+//  Layout per physical block:
+//    flat array of length block_size * D_head * 2
+//    first half  = keys   [block_size * D_head]
+//    second half = values [block_size * D_head]
+//
+//  API (pa_ prefix):
+//    pa_init(D_head, block_size, max_blocks)       -> mgr
+//    pa_alloc_block(mgr)                           -> [mgr, block_id]
+//    pa_free_block(mgr, block_id)                  -> mgr
+//    pa_write_kv(mgr, block_id, slot, key, value)  -> mgr
+//    pa_read_kv(mgr, block_id, slot)               -> [key, value]
+//    pa_create_sequence(mgr, seq_id)               -> mgr
+//    pa_append_token(mgr, seq_id, key, value)      -> mgr
+//    pa_attention(mgr, seq_id, query)               -> output
+//    pa_cow_fork(mgr, src_seq, dst_seq)            -> mgr
+//    pa_usage(mgr)                                  -> #{used, free, total}
+//
+//  AI-NATIVE attrs:
+//    @pure  -- attention / read (no side effects)
+//    @hot   -- write paths (called every decode step)
+// ===================================================================
 
-// ── Page Table Constructor ────────────────────────────────────
-// Returns a dict with:
-//   "num_pages"  : int
-//   "page_size"  : int
-//   "head_dim"   : int
-//   "free_list"  : [int]         — stack of available page ids
-//   "page_keys"  : [float]       — flat: page_id * page_size * head_dim
-//   "page_vals"  : [float]       — same layout
-//   "page_used"  : [int]         — how many slots used per page
-//   "seq_pages"  : dict          — seq_id(string) -> [int] page id list
-fn page_table_new(num_pages, page_size, head_dim) {
-    let total = num_pages * page_size * head_dim
-    let mut keys_flat = []
-    let mut vals_flat = []
-    let mut i = 0
-    while i < total {
-        keys_flat.push(0.0)
-        vals_flat.push(0.0)
+// -- math helpers --------------------------------------------------
+
+fn pa2_exp(x) {
+    let mut v = x
+    if v > 20.0 { v = 20.0 }
+    if v < -20.0 { v = -20.0 }
+    let mut result = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i < 30 {
+        term = term * v / to_float(i)
+        result = result + term
         i = i + 1
     }
-    let mut free = []
-    let mut p = num_pages - 1
-    while p >= 0 {
-        free.push(p)
-        p = p - 1
+    if result < 0.0 { return 0.0 }
+    return result
+}
+
+fn pa2_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    let mut _i = 0
+    while _i < 20 {
+        g = (g + x / g) / 2.0
+        _i = _i + 1
     }
-    let mut used = []
-    let mut u = 0
-    while u < num_pages {
-        used.push(0)
-        u = u + 1
+    return g
+}
+
+fn pa2_fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn pa2_max(a, b) {
+    if a > b { return a }
+    return b
+}
+
+// -- array helpers -------------------------------------------------
+
+fn pa2_zeros(n) {
+    let mut v = []
+    let mut _i = 0
+    while _i < n {
+    return v
+        _i = _i + 1
+}
+
+fn pa2_copy_arr(src) {
+    let mut dst = []
+    let n = len(src)
+    let mut i = 0
+    while i < n {
+    return dst
+        i = i + 1
+}
+
+// ===================================================================
+//  pa_init -- create a paged attention manager
+//
+//  Returns a dict (#{}) with all state:
+//    D_head     : int -- dimension per head
+//    block_size : int -- tokens per block
+//    max_blocks : int -- total physical blocks
+//    free_list  : [int] -- available physical block IDs
+//    ref_count  : [int] -- reference count per physical block
+//    kv_data    : [[float]] -- kv_data[phys] = flat array
+//    sequences  : #{seq_id_str: #{blocks:[int], n_tokens:int}}
+// ===================================================================
+
+fn pa_init(D_head, block_size, max_blocks) {
+    let data_len = block_size * D_head * 2
+    let mut free_list = []
+    let mut ref_count = []
+    let mut kv_data = []
+    let mut i = 0
+    while i < max_blocks {
+        free_list = free_list + [i]
+        ref_count = ref_count + [0]
+        kv_data = kv_data + [pa2_zeros(data_len)]
+        i = i + 1
     }
     return #{
-        "num_pages": num_pages,
-        "page_size": page_size,
-        "head_dim": head_dim,
-        "free_list": free,
-        "page_keys": keys_flat,
-        "page_vals": vals_flat,
-        "page_used": used,
-        "seq_pages": #{}
+        "D_head": D_head,
+        "block_size": block_size,
+        "max_blocks": max_blocks,
+        "free_list": free_list,
+        "ref_count": ref_count,
+        "kv_data": kv_data,
+        "sequences": #{}
     }
 }
 
-// ── Allocate a page ───────────────────────────────────────────
-fn page_alloc(pt) {
-    let free = pt["free_list"]
-    if len(free) == 0 {
-        return -1
+// ===================================================================
+//  pa_alloc_block -- allocate one physical block from free list
+//  Returns [mgr, block_id] where block_id == -1 if full
+// ===================================================================
+
+fn pa_alloc_block(mgr) {
+    let n_free = len(mgr["free_list"])
+    if n_free == 0 {
+        return [mgr, -1]
     }
-    let pid = free[len(free) - 1]
-    free.pop()
-    return pid
+    let fl = mgr["free_list"]
+    let block_id = fl[n_free - 1]
+    // pop last
+    let mut new_fl = []
+    let mut i = 0
+    while i < (n_free - 1) {
+        new_fl = new_fl + [fl[i]]
+        i = i + 1
+    }
+    // set ref_count to 1
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    new_rc[block_id] = 1
+    let mut mgr2 = #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": new_fl,
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": mgr["sequences"]
+    }
+    return [mgr2, block_id]
 }
 
-// ── Free a page ───────────────────────────────────────────────
-fn page_free(pt, page_id) {
-    let used = pt["page_used"]
-    used[page_id] = 0
-    let free = pt["free_list"]
-    free.push(page_id)
+// ===================================================================
+//  pa_free_block -- release a physical block (decrement ref count)
+// ===================================================================
+
+fn pa_free_block(mgr, block_id) {
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    new_rc[block_id] = new_rc[block_id] - 1
+    let mut new_fl = pa2_copy_arr(mgr["free_list"])
+    if new_rc[block_id] <= 0 {
+        new_rc[block_id] = 0
+        new_fl = new_fl + [block_id]
+    }
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": new_fl,
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": mgr["sequences"]
+    }
 }
 
-// ── Append a KV pair to a sequence ────────────────────────────
-// Automatically allocates new page when current page is full.
-fn kv_cache_append(pt, seq_id, k_vec, v_vec) {
-    let page_size = pt["page_size"]
-    let head_dim = pt["head_dim"]
-    let seq_key = to_string(seq_id)
-    let sp = pt["seq_pages"]
-
-    // Ensure sequence has a page list
-    if !has_key(sp, seq_key) {
-        sp[seq_key] = []
+// ===================================================================
+//  pa_write_kv -- write key/value vectors to a specific block+slot
+// ===================================================================
+@hot
+fn pa_write_kv(mgr, block_id, slot, key, value) {
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let mut block = pa2_copy_arr(mgr["kv_data"][block_id])
+    let k_off = slot * D
+    let v_off = bs * D + slot * D
+    let mut d = 0
+    while d < D {
+        block[k_off + d] = key[d]
+        block[v_off + d] = value[d]
+        d = d + 1
     }
-    let pages = sp[seq_key]
+    let mut new_kv = mgr["kv_data"]
+    new_kv[block_id] = block
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": mgr["ref_count"],
+        "kv_data": new_kv,
+        "sequences": mgr["sequences"]
+    }
+}
 
-    // Check if we need a new page
-    let mut need_new = false
-    if len(pages) == 0 {
-        need_new = true
+// ===================================================================
+//  pa_read_kv -- read key/value vectors from a specific block+slot
+//  Returns [key, value]
+// ===================================================================
+@pure
+fn pa_read_kv(mgr, block_id, slot) {
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let block = mgr["kv_data"][block_id]
+    let k_off = slot * D
+    let v_off = bs * D + slot * D
+    let mut key = []
+    let mut value = []
+    let mut d = 0
+    while d < D {
+        key = key + [block[k_off + d]]
+        value = value + [block[v_off + d]]
+        d = d + 1
+    }
+    return [key, value]
+}
+
+// ===================================================================
+//  pa_create_sequence -- register a new sequence in the manager
+// ===================================================================
+
+fn pa_create_sequence(mgr, seq_id) {
+    let sid = str(seq_id)
+    let mut seqs = mgr["sequences"]
+    seqs[sid] = #{"blocks": [], "n_tokens": 0}
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": mgr["ref_count"],
+        "kv_data": mgr["kv_data"],
+        "sequences": seqs
+    }
+}
+
+// ===================================================================
+//  pa_append_token -- append a KV pair for a sequence
+//  Allocates a new block if the current one is full.
+// ===================================================================
+@hot
+fn pa_append_token(mgr, seq_id, key, value) {
+    let sid = str(seq_id)
+    let bs = mgr["block_size"]
+    let seq = mgr["sequences"][sid]
+    let n_tok = seq["n_tokens"]
+    let blocks = seq["blocks"]
+    let slot = n_tok % bs
+
+    let mut m = mgr
+    let mut blks = blocks
+
+    // need a new block?
+    if slot == 0 {
+        let res = pa_alloc_block(m)
+        m = res[0]
+        let new_bid = res[1]
+        if new_bid < 0 {
+            // out of memory -- return unchanged
+            return m
+        }
+        blks = blks + [new_bid]
+    }
+
+    // which physical block holds this token?
+    let blk_idx = len(blks) - 1
+    let phys_id = blks[blk_idx]
+
+    // check if COW -- need private copy before writing
+    let rc = m["ref_count"]
+    if rc[phys_id] > 1 {
+        // COW: allocate new block, copy data, decrement old ref
+        let res2 = pa_alloc_block(m)
+        m = res2[0]
+        let new_phys = res2[1]
+        if new_phys < 0 {
+            return m
+        }
+        // copy old block data
+        let old_data = m["kv_data"][phys_id]
+        let mut new_data = pa2_copy_arr(old_data)
+        let mut kv = m["kv_data"]
+        kv[new_phys] = new_data
+        m = #{
+            "D_head": m["D_head"],
+            "block_size": m["block_size"],
+            "max_blocks": m["max_blocks"],
+            "free_list": m["free_list"],
+            "ref_count": m["ref_count"],
+            "kv_data": kv,
+            "sequences": m["sequences"]
+        }
+        // decrement old ref
+        m = pa_free_block(m, phys_id)
+        // update block list to point to new block
+        let mut new_blks = []
+        let mut i = 0
+        while i < len(blks) {
+            if i == blk_idx {
+                new_blks = new_blks + [new_phys]
+            } else {
+                new_blks = new_blks + [blks[i]]
+            }
+            i = i + 1
+        }
+        blks = new_blks
+        m = pa_write_kv(m, new_phys, slot, key, value)
     } else {
-        let last_pid = pages[len(pages) - 1]
-        let used = pt["page_used"]
-        if used[last_pid] >= page_size {
-            need_new = true
-        }
+        m = pa_write_kv(m, phys_id, slot, key, value)
     }
 
-    if need_new {
-        let new_pid = page_alloc(pt)
-        if new_pid == -1 {
-            println("paged_attention: out of pages")
-            return
-        }
-        pages.push(new_pid)
+    // update sequence metadata
+    let mut seqs = m["sequences"]
+    seqs[sid] = #{"blocks": blks, "n_tokens": n_tok + 1}
+    return #{
+        "D_head": m["D_head"],
+        "block_size": m["block_size"],
+        "max_blocks": m["max_blocks"],
+        "free_list": m["free_list"],
+        "ref_count": m["ref_count"],
+        "kv_data": m["kv_data"],
+        "sequences": seqs
     }
-
-    // Write into the last page's next slot
-    let pid = pages[len(pages) - 1]
-    let used = pt["page_used"]
-    let slot = used[pid]
-    let base = (pid * page_size + slot) * head_dim
-    let keys_flat = pt["page_keys"]
-    let vals_flat = pt["page_vals"]
-
-    let mut d = 0
-    while d < head_dim {
-        keys_flat[base + d] = k_vec[d]
-        vals_flat[base + d] = v_vec[d]
-        d = d + 1
-    }
-    used[pid] = slot + 1
 }
 
-// ── Compute total cached positions for a sequence ─────────────
-fn seq_total_tokens(pt, seq_id) {
-    let seq_key = to_string(seq_id)
-    let sp = pt["seq_pages"]
-    if !has_key(sp, seq_key) {
-        return 0
+// ===================================================================
+//  pa_attention -- compute attention output for a sequence
+//
+//  query: [D_head] vector
+//  Iterates all KV tokens in the sequence via block table,
+//  uses online softmax (numerically stable).
+//  Returns: [D_head] output vector
+// ===================================================================
+@pure
+fn pa_attention(mgr, seq_id, query) {
+    let sid = str(seq_id)
+    let seq = mgr["sequences"][sid]
+    let n_tok = seq["n_tokens"]
+    let blocks = seq["blocks"]
+    let D = mgr["D_head"]
+    let bs = mgr["block_size"]
+    let scale = 1.0 / pa2_sqrt(to_float(D))
+
+    // online softmax accumulators
+    let mut m_val = 0.0 - 1.0e30
+    let mut l_val = 0.0
+    let mut acc = pa2_zeros(D)
+
+    let mut t = 0
+    while t < n_tok {
+        let blk_idx = t / bs
+        let slot = t % bs
+        let phys_id = blocks[blk_idx]
+        let kv = pa_read_kv(mgr, phys_id, slot)
+        let k_vec = kv[0]
+        let v_vec = kv[1]
+
+        // dot(query, k_vec) * scale
+        let mut dot = 0.0
+        for d in 0..D {
+            dot = dot + query[d] * k_vec[d]
+        }
+        let score = dot * scale
+
+        // online softmax update
+        let m_old = m_val
+        let m_new = pa2_max(m_old, score)
+        let alpha = pa2_exp(m_old - m_new)
+        let p = pa2_exp(score - m_new)
+        l_val = l_val * alpha + p
+        for d in 0..D {
+            acc[d] = acc[d] * alpha + p * v_vec[d]
+        }
+        m_val = m_new
+        t = t + 1
     }
-    let pages = sp[seq_key]
-    let used = pt["page_used"]
-    let mut total = 0
+
+    // normalize
+    let mut out = pa2_zeros(D)
+    if l_val > 0.0 {
+        let inv_l = 1.0 / l_val
+        let mut d = 0
+        while d < D {
+            out[d] = acc[d] * inv_l
+            d = d + 1
+        }
+    }
+    return out
+}
+
+// ===================================================================
+//  pa_cow_fork -- copy-on-write fork of a sequence
+//
+//  src_seq's blocks are shared with dst_seq.
+//  ref_count incremented for each shared block.
+//  Actual copy deferred until pa_append_token writes to a shared block.
+// ===================================================================
+
+fn pa_cow_fork(mgr, src_seq, dst_seq) {
+    let src_sid = str(src_seq)
+    let dst_sid = str(dst_seq)
+    let src = mgr["sequences"][src_sid]
+    let src_blocks = src["blocks"]
+    let src_n = src["n_tokens"]
+
+    // increment ref_count for each block in source
+    let mut new_rc = pa2_copy_arr(mgr["ref_count"])
+    let n_blks = len(src_blocks)
     let mut i = 0
-    while i < len(pages) {
-        total = total + used[pages[i]]
+    while i < n_blks {
+        let bid = src_blocks[i]
+        new_rc[bid] = new_rc[bid] + 1
         i = i + 1
     }
-    return total
-}
 
-// ── Attention scores: Q dot K for each cached position ────────
-fn paged_attention_score(pt, seq_id, query) {
-    let head_dim = pt["head_dim"]
-    let page_size = pt["page_size"]
-    let seq_key = to_string(seq_id)
-    let sp = pt["seq_pages"]
-    if !has_key(sp, seq_key) {
-        return []
-    }
-    let pages = sp[seq_key]
-    let used = pt["page_used"]
-    let keys_flat = pt["page_keys"]
-
-    let mut scores = []
-    let mut pi = 0
-    while pi < len(pages) {
-        let pid = pages[pi]
-        let n_slots = used[pid]
-        let mut s = 0
-        while s < n_slots {
-            let base = (pid * page_size + s) * head_dim
-            let mut dot = 0.0
-            let mut d = 0
-            while d < head_dim {
-                dot = dot + query[d] * keys_flat[base + d]
-                d = d + 1
-            }
-            scores.push(dot)
-            s = s + 1
-        }
-        pi = pi + 1
-    }
-    return scores
-}
-
-// ── Full paged attention: softmax(Q*K^T / sqrt(d)) * V ───────
-fn paged_attention_output(pt, seq_id, query) {
-    let head_dim = pt["head_dim"]
-    let page_size = pt["page_size"]
-    let seq_key = to_string(seq_id)
-    let sp = pt["seq_pages"]
-
-    if !has_key(sp, seq_key) {
-        let mut zeros = []
-        let mut z = 0
-        while z < head_dim {
-            zeros.push(0.0)
-            z = z + 1
-        }
-        return zeros
-    }
-
-    // Step 1: compute raw scores (Q dot K / sqrt(d))
-    let scale = 1.0 / (to_float(head_dim) ** 0.5)
-    let raw_scores = paged_attention_score(pt, seq_id, query)
-    let n = len(raw_scores)
-
-    if n == 0 {
-        let mut zeros = []
-        let mut z = 0
-        while z < head_dim {
-            zeros.push(0.0)
-            z = z + 1
-        }
-        return zeros
-    }
-
-    // Scale scores
-    let mut scaled = []
+    // create dst sequence sharing same blocks
+    let mut seqs = mgr["sequences"]
+    let mut dst_blocks = []
     let mut i = 0
-    while i < n {
-        scaled.push(raw_scores[i] * scale)
+    while i < n_blks {
+        dst_blocks = dst_blocks + [src_blocks[i]]
         i = i + 1
     }
+    seqs[dst_sid] = #{"blocks": dst_blocks, "n_tokens": src_n}
 
-    // Step 2: softmax — find max for numerical stability
-    let mut mx = scaled[0]
-    i = 1
-    while i < n {
-        if scaled[i] > mx {
-            mx = scaled[i]
-        }
-        i = i + 1
+    return #{
+        "D_head": mgr["D_head"],
+        "block_size": mgr["block_size"],
+        "max_blocks": mgr["max_blocks"],
+        "free_list": mgr["free_list"],
+        "ref_count": new_rc,
+        "kv_data": mgr["kv_data"],
+        "sequences": seqs
     }
-
-    let mut exp_scores = []
-    let mut sum_exp = 0.0
-    i = 0
-    while i < n {
-        let e = exp(scaled[i] - mx)
-        exp_scores.push(e)
-        sum_exp = sum_exp + e
-        i = i + 1
-    }
-
-    // Normalize
-    let mut weights = []
-    i = 0
-    while i < n {
-        weights.push(exp_scores[i] / sum_exp)
-        i = i + 1
-    }
-
-    // Step 3: weighted sum of values
-    let mut output = []
-    let mut d = 0
-    while d < head_dim {
-        output.push(0.0)
-        d = d + 1
-    }
-
-    let pages = sp[seq_key]
-    let used = pt["page_used"]
-    let vals_flat = pt["page_vals"]
-    let mut wi = 0
-    let mut pi = 0
-    while pi < len(pages) {
-        let pid = pages[pi]
-        let n_slots = used[pid]
-        let mut s = 0
-        while s < n_slots {
-            let w = weights[wi]
-            let base = (pid * page_size + s) * head_dim
-            d = 0
-            while d < head_dim {
-                output[d] = output[d] + w * vals_flat[base + d]
-                d = d + 1
-            }
-            wi = wi + 1
-            s = s + 1
-        }
-        pi = pi + 1
-    }
-
-    return output
 }
+
+// ===================================================================
+//  pa_usage -- report block usage statistics
+//  Returns #{used, free, total}
+// ===================================================================
+@pure
+fn pa_usage(mgr) {
+    let total = mgr["max_blocks"]
+    let free = len(mgr["free_list"])
+    let used = total - free
+    return #{"used": used, "free": free, "total": total}
+}
+
+println("[paged_attention_v2] module loaded -- vLLM-style PA manager (#297)")
 
 
 // -- end inlined --
 
-fn test_page_table_creation() {
-    println("--- test_page_table_creation ---")
-    let pt = page_table_new(4, 8, 16)
-    assert pt["num_pages"] == 4
-    assert pt["page_size"] == 8
-    assert pt["head_dim"] == 16
-    assert len(pt["free_list"]) == 4
-    assert len(pt["page_keys"]) == 4 * 8 * 16
-    assert len(pt["page_vals"]) == 4 * 8 * 16
-    println("  PASS")
-}
+let mut pass_count = 0
+let mut fail_count = 0
 
-fn test_page_alloc_free() {
-    println("--- test_page_alloc_free ---")
-    let pt = page_table_new(3, 4, 8)
-
-    // Allocate all 3 pages
-    let p0 = page_alloc(pt)
-    let p1 = page_alloc(pt)
-    let p2 = page_alloc(pt)
-    assert p0 >= 0
-    assert p1 >= 0
-    assert p2 >= 0
-    assert p0 != p1
-    assert p1 != p2
-
-    // No more pages
-    let p3 = page_alloc(pt)
-    assert p3 == -1
-
-    // Free one and re-alloc
-    page_free(pt, p1)
-    let p4 = page_alloc(pt)
-    assert p4 == p1
-    println("  PASS")
-}
-
-fn test_kv_append_single_page() {
-    println("--- test_kv_append_single_page ---")
-    let head_dim = 4
-    let pt = page_table_new(4, 8, head_dim)
-
-    // Append 3 KV pairs to seq 0
-    let k1 = [1.0, 0.0, 0.0, 0.0]
-    let v1 = [0.1, 0.2, 0.3, 0.4]
-    kv_cache_append(pt, 0, k1, v1)
-
-    let k2 = [0.0, 1.0, 0.0, 0.0]
-    let v2 = [0.5, 0.6, 0.7, 0.8]
-    kv_cache_append(pt, 0, k2, v2)
-
-    let k3 = [0.0, 0.0, 1.0, 0.0]
-    let v3 = [0.9, 1.0, 1.1, 1.2]
-    kv_cache_append(pt, 0, k3, v3)
-
-    let total = seq_total_tokens(pt, 0)
-    assert total == 3
-    println("  total tokens = " + to_string(total))
-    println("  PASS")
-}
-
-fn test_kv_append_multi_page() {
-    println("--- test_kv_append_multi_page ---")
-    let head_dim = 2
-    let page_size = 2
-    let pt = page_table_new(8, page_size, head_dim)
-
-    // Append 5 KV pairs — should span 3 pages (2+2+1)
-    let mut i = 0
-    while i < 5 {
-        let k = [to_float(i), to_float(i) + 0.5]
-        let v = [to_float(i) * 10.0, to_float(i) * 10.0 + 1.0]
-        kv_cache_append(pt, 1, k, v)
-        i = i + 1
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
     }
-    let total = seq_total_tokens(pt, 1)
-    assert total == 5
-    let sp = pt["seq_pages"]
-    let pages = sp["1"]
-    assert len(pages) == 3
-    println("  pages used = " + to_string(len(pages)) + ", total tokens = " + to_string(total))
-    println("  PASS")
 }
 
-fn test_attention_scores() {
-    println("--- test_attention_scores ---")
-    let head_dim = 4
-    let pt = page_table_new(4, 8, head_dim)
-
-    // k1 = [1,0,0,0], k2 = [0,1,0,0]
-    kv_cache_append(pt, 0, [1.0, 0.0, 0.0, 0.0], [1.0, 1.0, 1.0, 1.0])
-    kv_cache_append(pt, 0, [0.0, 1.0, 0.0, 0.0], [2.0, 2.0, 2.0, 2.0])
-
-    // query = [1,0,0,0] -> dot with k1=1, dot with k2=0
-    let scores = paged_attention_score(pt, 0, [1.0, 0.0, 0.0, 0.0])
-    assert len(scores) == 2
-    assert scores[0] == 1.0
-    assert scores[1] == 0.0
-    println("  scores = [" + to_string(scores[0]) + ", " + to_string(scores[1]) + "]")
-    println("  PASS")
+fn fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
 }
 
-fn test_attention_output() {
-    println("--- test_attention_output ---")
-    let head_dim = 4
-    let pt = page_table_new(4, 8, head_dim)
-
-    // Two KV pairs with orthogonal keys
-    kv_cache_append(pt, 0, [1.0, 0.0, 0.0, 0.0], [10.0, 20.0, 30.0, 40.0])
-    kv_cache_append(pt, 0, [0.0, 1.0, 0.0, 0.0], [50.0, 60.0, 70.0, 80.0])
-
-    // Query aligned with k1 -> should strongly weight v1
-    let out = paged_attention_output(pt, 0, [1.0, 0.0, 0.0, 0.0])
-    assert len(out) == head_dim
-    println("  output dim = " + to_string(len(out)))
-    // Since q*k1=1, q*k2=0, after scaling and softmax, v1 gets higher weight
-    // With head_dim=4, scale=0.5, scores=[0.5, 0.0], softmax ~ [0.622, 0.378]
-    // output ~ 0.622*v1 + 0.378*v2
-    // out[0] ~ 0.622*10 + 0.378*50 ~ 25.1
-    println("  out[0] = " + to_string(out[0]))
-    assert out[0] > 6.0
-    assert out[0] < 50.0
-    println("  PASS")
+fn approx(a, b, eps) {
+    return fabs(a - b) < eps
 }
 
-fn test_multiple_sequences() {
-    println("--- test_multiple_sequences ---")
-    let head_dim = 2
-    let pt = page_table_new(8, 4, head_dim)
+println("===================================================================")
+println("  Paged Attention v2 (#297) Test Suite")
+println("===================================================================")
 
-    // Seq 10: 3 tokens
-    kv_cache_append(pt, 10, [1.0, 0.0], [1.0, 0.0])
-    kv_cache_append(pt, 10, [0.0, 1.0], [0.0, 1.0])
-    kv_cache_append(pt, 10, [1.0, 1.0], [1.0, 1.0])
+// -- T1: pa_init creates manager with correct state -----------------
+let mgr0 = pa_init(4, 2, 8)
+check("T1 D_head", mgr0["D_head"] == 4)
+check("T1 block_size", mgr0["block_size"] == 2)
+check("T1 max_blocks", mgr0["max_blocks"] == 8)
+check("T1 free_list len", len(mgr0["free_list"]) == 8)
 
-    // Seq 20: 2 tokens
-    kv_cache_append(pt, 20, [0.5, 0.5], [0.5, 0.5])
-    kv_cache_append(pt, 20, [0.3, 0.7], [0.3, 0.7])
+// -- T2: pa_alloc_block / pa_free_block ----------------------------
+let res1 = pa_alloc_block(mgr0)
+let mgr1 = res1[0]
+let bid1 = res1[1]
+check("T2 alloc: block_id >= 0", bid1 >= 0)
+check("T2 alloc: free=7", len(mgr1["free_list"]) == 7)
+check("T2 alloc: ref_count=1", mgr1["ref_count"][bid1] == 1)
 
-    assert seq_total_tokens(pt, 10) == 3
-    assert seq_total_tokens(pt, 20) == 2
-    assert seq_total_tokens(pt, 99) == 0
+let mgr1b = pa_free_block(mgr1, bid1)
+check("T2 free: free=8", len(mgr1b["free_list"]) == 8)
+check("T2 free: ref_count=0", mgr1b["ref_count"][bid1] == 0)
 
-    // Attention on each seq independently
-    let out10 = paged_attention_output(pt, 10, [1.0, 0.0])
-    let out20 = paged_attention_output(pt, 20, [1.0, 0.0])
-    assert len(out10) == head_dim
-    assert len(out20) == head_dim
-    println("  seq10 tokens=3, seq20 tokens=2")
-    println("  PASS")
+// -- T3: pa_write_kv / pa_read_kv round-trip -----------------------
+let res2 = pa_alloc_block(mgr0)
+let mgr2 = res2[0]
+let bid2 = res2[1]
+let k_in = [1.0, 2.0, 3.0, 4.0]
+let v_in = [10.0, 20.0, 30.0, 40.0]
+let mgr2w = pa_write_kv(mgr2, bid2, 0, k_in, v_in)
+let kv_out = pa_read_kv(mgr2w, bid2, 0)
+let k_out = kv_out[0]
+let v_out = kv_out[1]
+check("T3 read key[0]", approx(k_out[0], 1.0, 1.0e-9))
+check("T3 read key[3]", approx(k_out[3], 4.0, 1.0e-9))
+check("T3 read val[0]", approx(v_out[0], 10.0, 1.0e-9))
+check("T3 read val[3]", approx(v_out[3], 40.0, 1.0e-9))
+
+// -- T4: pa_create_sequence ----------------------------------------
+let mgr3 = pa_create_sequence(mgr0, 0)
+let seq0 = mgr3["sequences"]["0"]
+check("T4 seq blocks empty", len(seq0["blocks"]) == 0)
+check("T4 seq n_tokens=0", seq0["n_tokens"] == 0)
+
+// -- T5: pa_append_token (single token, auto-alloc block) ----------
+let mgr4 = pa_create_sequence(mgr0, 1)
+let k1 = [1.0, 0.0, 0.0, 0.0]
+let v1 = [5.0, 3.0, 1.0, 0.0]
+let mgr4a = pa_append_token(mgr4, 1, k1, v1)
+let seq1 = mgr4a["sequences"]["1"]
+check("T5 append: n_tokens=1", seq1["n_tokens"] == 1)
+check("T5 append: 1 block allocated", len(seq1["blocks"]) == 1)
+// verify data via read
+let phys5 = seq1["blocks"][0]
+let kv5 = pa_read_kv(mgr4a, phys5, 0)
+check("T5 append: key correct", approx(kv5[0][0], 1.0, 1.0e-9))
+check("T5 append: val correct", approx(kv5[1][0], 5.0, 1.0e-9))
+
+// -- T6: pa_attention single token (output = value) ----------------
+let mgr5 = pa_init(2, 4, 8)
+let mgr5a = pa_create_sequence(mgr5, 0)
+let mgr5b = pa_append_token(mgr5a, 0, [1.0, 0.0], [7.0, 3.0])
+let query6 = [1.0, 0.0]
+let out6 = pa_attention(mgr5b, 0, query6)
+// single token -> output = value
+check("T6 attn single: dim0", approx(out6[0], 7.0, 1.0e-5))
+check("T6 attn single: dim1", approx(out6[1], 3.0, 1.0e-5))
+
+// -- T7: pa_attention multi-token softmax correctness --------------
+// D_head=2, block_size=4, 2 tokens
+// K0=[1,0] V0=[5,3], K1=[0,1] V1=[1,7], Q=[1,0]
+let mgr6 = pa_init(2, 4, 8)
+let mgr6a = pa_create_sequence(mgr6, 0)
+let mgr6b = pa_append_token(mgr6a, 0, [1.0, 0.0], [5.0, 3.0])
+let mgr6c = pa_append_token(mgr6b, 0, [0.0, 1.0], [1.0, 7.0])
+let out7 = pa_attention(mgr6c, 0, [1.0, 0.0])
+// Q=[1,0] . K0=[1,0] = 1.0, Q=[1,0] . K1=[0,1] = 0.0
+// scale = 1/sqrt(2)
+// score0 = 1/sqrt(2), score1 = 0
+let sc0 = 1.0 / pa2_sqrt(2.0)
+let sc1 = 0.0
+let e0 = pa2_exp(sc0)
+let e1 = pa2_exp(sc1)
+let w0 = e0 / (e0 + e1)
+let w1 = e1 / (e0 + e1)
+let exp0 = w0 * 5.0 + w1 * 1.0
+let exp1 = w0 * 3.0 + w1 * 7.0
+check("T7 attn multi: dim0", approx(out7[0], exp0, 1.0e-4))
+check("T7 attn multi: dim1", approx(out7[1], exp1, 1.0e-4))
+
+// -- T8: pa_cow_fork shares blocks and increments ref_count --------
+let mgr7 = pa_init(2, 4, 8)
+let mgr7a = pa_create_sequence(mgr7, 0)
+let mgr7b = pa_append_token(mgr7a, 0, [1.0, 0.0], [5.0, 3.0])
+let mgr7c = pa_append_token(mgr7b, 0, [0.0, 1.0], [1.0, 7.0])
+let mgr7d = pa_cow_fork(mgr7c, 0, 1)
+let seq_src = mgr7d["sequences"]["0"]
+let seq_dst = mgr7d["sequences"]["1"]
+check("T8 fork: dst n_tokens == src", seq_dst["n_tokens"] == seq_src["n_tokens"])
+check("T8 fork: dst blocks == src blocks", len(seq_dst["blocks"]) == len(seq_src["blocks"]))
+// shared block should have ref_count == 2
+let shared_bid = seq_src["blocks"][0]
+check("T8 fork: ref_count=2", mgr7d["ref_count"][shared_bid] == 2)
+
+// -- T9: COW isolation -- append to fork triggers private copy -----
+// After fork, appending to dst should not affect src's data
+let mgr8 = pa_append_token(mgr7d, 1, [1.0, 1.0], [9.0, 9.0])
+// src seq 0 should still have 2 tokens
+let src_after = mgr8["sequences"]["0"]
+let dst_after = mgr8["sequences"]["1"]
+check("T9 cow: src still 2 tokens", src_after["n_tokens"] == 2)
+check("T9 cow: dst now 3 tokens", dst_after["n_tokens"] == 3)
+// src attention should be unchanged
+let out_src = pa_attention(mgr8, 0, [1.0, 0.0])
+check("T9 cow: src attn unchanged dim0", approx(out_src[0], exp0, 1.0e-4))
+check("T9 cow: src attn unchanged dim1", approx(out_src[1], exp1, 1.0e-4))
+
+// -- T10: pa_usage statistics --------------------------------------
+let mgr9 = pa_init(2, 4, 8)
+let u0 = pa_usage(mgr9)
+check("T10 usage: total=8", u0["total"] == 8)
+check("T10 usage: used=0", u0["used"] == 0)
+check("T10 usage: free=8", u0["free"] == 8)
+let mgr9a = pa_create_sequence(mgr9, 0)
+let mgr9b = pa_append_token(mgr9a, 0, [1.0, 0.0], [1.0, 0.0])
+let u1 = pa_usage(mgr9b)
+check("T10 usage: used=1 after append", u1["used"] == 1)
+check("T10 usage: free=7 after append", u1["free"] == 7)
+
+// -- T11: exhaust blocks -> alloc returns -1 -----------------------
+let mgr10 = pa_init(2, 2, 2)
+let r10a = pa_alloc_block(mgr10)
+let r10b = pa_alloc_block(r10a[0])
+let r10c = pa_alloc_block(r10b[0])
+check("T11 exhaust: 3rd alloc returns -1", r10c[1] == -1)
+
+// -- T12: multi-sequence independence ------------------------------
+let mgr11 = pa_init(2, 4, 16)
+let mgr11a = pa_create_sequence(mgr11, 10)
+let mgr11b = pa_create_sequence(mgr11a, 20)
+let mgr11c = pa_append_token(mgr11b, 10, [1.0, 0.0], [100.0, 0.0])
+let mgr11d = pa_append_token(mgr11c, 20, [0.0, 1.0], [0.0, 200.0])
+let out_s10 = pa_attention(mgr11d, 10, [1.0, 0.0])
+let out_s20 = pa_attention(mgr11d, 20, [0.0, 1.0])
+check("T12 multi-seq: seq10 dim0=100", approx(out_s10[0], 100.0, 1.0e-5))
+check("T12 multi-seq: seq20 dim1=200", approx(out_s20[1], 200.0, 1.0e-5))
+// sequences use different blocks
+let s10_blks = mgr11d["sequences"]["10"]["blocks"]
+let s20_blks = mgr11d["sequences"]["20"]["blocks"]
+check("T12 multi-seq: different blocks", s10_blks[0] != s20_blks[0])
+
+// -- T13: multi-block spanning (block_size=2, 3 tokens) ------------
+let mgr12 = pa_init(2, 2, 8)
+let mgr12a = pa_create_sequence(mgr12, 0)
+let mgr12b = pa_append_token(mgr12a, 0, [1.0, 0.0], [1.0, 0.0])
+let mgr12c = pa_append_token(mgr12b, 0, [0.0, 1.0], [0.0, 1.0])
+let mgr12d = pa_append_token(mgr12c, 0, [1.0, 1.0], [0.5, 0.5])
+let seq12 = mgr12d["sequences"]["0"]
+check("T13 multi-block: 2 blocks used", len(seq12["blocks"]) == 2)
+check("T13 multi-block: 3 tokens", seq12["n_tokens"] == 3)
+// attention should work across blocks
+let out13 = pa_attention(mgr12d, 0, [1.0, 1.0])
+// Q=[1,1] . K0=[1,0]=1, K1=[0,1]=1, K2=[1,1]=2 -> scale 1/sqrt(2)
+let s13_0 = 1.0 / pa2_sqrt(2.0)
+let s13_1 = 1.0 / pa2_sqrt(2.0)
+let s13_2 = 2.0 / pa2_sqrt(2.0)
+let e13_0 = pa2_exp(s13_0)
+let e13_1 = pa2_exp(s13_1)
+let e13_2 = pa2_exp(s13_2)
+let tot13 = e13_0 + e13_1 + e13_2
+let exp13_0 = e13_0 * 1.0 / tot13 + e13_1 * 0.0 / tot13 + e13_2 * 0.5 / tot13
+let exp13_1 = e13_0 * 0.0 / tot13 + e13_1 * 1.0 / tot13 + e13_2 * 0.5 / tot13
+check("T13 multi-block attn: dim0", approx(out13[0], exp13_0, 1.0e-4))
+check("T13 multi-block attn: dim1", approx(out13[1], exp13_1, 1.0e-4))
+
+// ===================================================================
+println("")
+println("=== Paged Attention v2 (#297) summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))
+if fail_count == 0 {
+    println("ALL PASS")
+} else {
+    println("SOME TESTS FAILED")
 }
-
-fn test_page_free_reuse() {
-    println("--- test_page_free_reuse ---")
-    let head_dim = 2
-    let pt = page_table_new(2, 2, head_dim)
-
-    // Fill both pages with seq 0 (2 slots each = 4 tokens)
-    kv_cache_append(pt, 0, [1.0, 0.0], [1.0, 0.0])
-    kv_cache_append(pt, 0, [0.0, 1.0], [0.0, 1.0])
-    kv_cache_append(pt, 0, [1.0, 1.0], [1.0, 1.0])
-    kv_cache_append(pt, 0, [0.5, 0.5], [0.5, 0.5])
-
-    // All pages used, free list empty
-    assert len(pt["free_list"]) == 0
-
-    // Free one page
-    let sp = pt["seq_pages"]
-    let pages = sp["0"]
-    let freed_pid = pages[0]
-    page_free(pt, freed_pid)
-    assert len(pt["free_list"]) == 1
-
-    // Can allocate again
-    let new_pid = page_alloc(pt)
-    assert new_pid >= 0
-    println("  freed and reused page " + to_string(freed_pid))
-    println("  PASS")
-}
-
-// ── Run all tests ─────────────────────────────────────────────
-println("=== paged_attention tests ===")
-test_page_table_creation()
-test_page_alloc_free()
-test_kv_append_single_page()
-test_kv_append_multi_page()
-test_attention_scores()
-test_attention_output()
-test_multiple_sequences()
-test_page_free_reuse()
-println("=== ALL PASS ===")

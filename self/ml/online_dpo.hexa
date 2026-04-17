@@ -1,57 +1,79 @@
 // ═══════════════════════════════════════════════════════════════════
-//  self/ml/online_dpo.hexa — Online Direct Preference Optimization
+//  self/ml/online_dpo_v2.hexa — Online DPO v2: Iterative DPO with
+//                                Online Generation
 //
-//  Standard DPO (dpo.hexa) assumes a static preference dataset. Online
-//  DPO samples fresh responses from the CURRENT policy at every step,
-//  sends them to a judge/oracle for preference labels, and immediately
-//  applies a DPO update. This closes the distribution-shift gap that
-//  offline DPO suffers from after a few epochs.
+//  Extends Online DPO (online_dpo.hexa) with iterative refinement:
+//  the policy generates its own training data each round, ranks
+//  responses via a reward model, forms preference pairs, and applies
+//  DPO loss. Includes replay buffers, rejection sampling, self-play
+//  generation, ELO tracking, and convergence detection.
 //
-//  Pipeline (per prompt):
-//    1) sample K candidates from current policy (temperature / top-k)
-//    2) judge(prompt, candidate) -> scalar reward
-//    3) pick argmax / argmin -> (chosen, rejected) pair
-//    4) DPO update on that pair
-//    5) push (prompt, chosen, rejected, reward_gap) into replay buffer
-//    6) occasionally resample from replay (stabilises drift)
-//    7) track cumulative KL / parameter drift vs ref_policy
+//  Key innovations over v1:
+//    - Rejection sampling: generate N, keep best/worst
+//    - Self-play: model generates both sides for preference learning
+//    - ELO rating system: track model quality across iterations
+//    - Convergence detection: stop when improvement plateaus
+//    - Iterative generation loop with warm-start from previous round
 //
-//  Because the full LM forward lives in dpo.hexa, this module operates
-//  on abstract *policy state vectors* (shape = [D]). A policy maps a
-//  prompt embedding -> D-dim logit vector over candidate actions, and
-//  each action has a judge-assigned reward. This gives us a self-
-//  contained, deterministic implementation with full unit tests, while
-//  keeping a clean `odpo_train_step(policy, ref, judge, prompt, ...)`
-//  API so the real transformer in dpo.hexa can plug in later.
+//  Implements (#150):
+//    1. Online generation: generate response pairs from current policy
+//    2. Reward ranking: rank generated responses by reward score
+//    3. Iterative DPO loss: standard DPO on online-generated pairs
+//    4. Replay buffer: store and sample from history of preference pairs
+//    5. Rejection sampling: generate N, keep best/worst
+//    6. Self-play generation: model generates both sides
+//    7. ELO tracking: track model quality over iterations
+//    8. Convergence check: detect when improvement plateaus
 //
 //  API:
-//    odpo_new_policy(d, seed)                        -> policy (logits D)
-//    odpo_copy_policy(p)                             -> policy
-//    odpo_log_prob(policy, action)                   -> float
-//    odpo_sample(policy, k, seed)                    -> [action, logp]
-//    odpo_judge_linear(reward_vec, action)           -> float
-//    odpo_build_pair(policy, k, seed, reward_vec)    -> [chosen, rejected, gap]
-//    odpo_loss(policy, ref, chosen, rejected, beta)  -> [loss, margin]
-//    odpo_step(policy, ref, pair, beta, lr)          -> loss
-//    odpo_replay_push(buf, cap, pair)                -> buf
-//    odpo_replay_sample(buf, seed)                   -> pair
-//    odpo_policy_drift(policy, ref)                  -> float  (L2)
-//    odpo_kl_drift(policy, ref)                      -> float  (sum p*log(p/q))
-//    odpo_train_step(state, reward_vec, beta, lr)    -> state
+//    odv2_abs(x)                                    -> float
+//    odv2_exp(x)                                    -> float
+//    odv2_log(x)                                    -> float
+//    odv2_sqrt(x)                                   -> float
+//    odv2_sigmoid(x)                                -> float
+//    odv2_log_sigmoid(x)                            -> float
+//    odv2_hash(seed, i)                             -> float [0,1)
+//    odv2_zeros(n)                                  -> [float]
+//    odv2_new_policy(d, seed)                       -> policy
+//    odv2_copy_policy(p)                            -> policy
+//    odv2_softmax(logits)                           -> [float]
+//    odv2_log_prob(policy, action)                  -> float
+//    odv2_sample(policy, k, seed)                   -> [[action, logp]]
+//    odv2_reward_score(reward_vec, action)          -> float
+//    odv2_rank_by_reward(samples, reward_vec)       -> sorted samples
+//    odv2_build_pair(policy, k, seed, reward_vec)   -> [chosen, rejected, gap]
+//    odv2_dpo_loss(pi_w, pi_l, ref_w, ref_l, beta) -> float
+//    odv2_dpo_grad_step(policy, ref, chosen, rejected, beta, lr) -> [policy, loss]
+//    odv2_replay_new(cap)                           -> buffer
+//    odv2_replay_push(buf, pair)                    -> buffer
+//    odv2_replay_sample(buf, seed)                  -> pair
+//    odv2_replay_len(buf)                           -> int
+//    odv2_rejection_sample(policy, n, seed, reward_vec) -> [best_a, worst_a, gap]
+//    odv2_self_play(policy, seed, reward_vec, n)    -> [chosen, rejected, gap]
+//    odv2_elo_new(rating)                           -> elo_state
+//    odv2_elo_update(state, opponent_rating, won)   -> elo_state
+//    odv2_elo_rating(state)                         -> float
+//    odv2_elo_games(state)                          -> int
+//    odv2_convergence_check(losses, window, threshold) -> bool
+//    odv2_convergence_delta(losses, window)         -> float
+//    odv2_train_step(policy, ref, reward_vec, k, seed, beta, lr) -> [policy, loss]
+//    odv2_train_iter(policy, ref, reward_vec, k, n_steps, seed, beta, lr) -> [policy, losses]
+//    odv2_train_with_replay(policy, ref, reward_vec, k, n_steps, seed, beta, lr, buf, replay_ratio) -> [policy, losses, buf]
+//    odv2_iterative_train(policy, ref, reward_vec, k, n_rounds, steps_per, seed, beta, lr) -> [policy, round_losses, elo]
 //
 //  AI-NATIVE attrs:
-//    @pure — loss / log_prob / drift (no side effects)
+//    @pure — loss / log_prob / reward (no side effects)
 //    @hot  — log_prob / sample / step (called every step)
 // ═══════════════════════════════════════════════════════════════════
 
 // ── numeric helpers ──────────────────────────────────────────────
 
-fn odpo_abs(x) {
+fn odv2_abs(x) {
     if x < 0.0 { return 0.0 - x }
     return x
 }
 
-fn odpo_exp(x) {
+fn odv2_exp(x) {
     let mut v = x
     if v > 20.0 { v = 20.0 }
     if v < -20.0 { v = -20.0 }
@@ -65,7 +87,7 @@ fn odpo_exp(x) {
     return result
 }
 
-fn odpo_log(x) {
+fn odv2_log(x) {
     if x <= 0.0 { return -30.0 }
     let mut v = x
     let mut count = 0
@@ -82,49 +104,59 @@ fn odpo_log(x) {
     return to_float(count) + ln_v
 }
 
-fn odpo_sigmoid(x) {
-    if x > 20.0 { return 1.0 }
-    if x < -20.0 { return 0.0 }
-    return 1.0 / (1.0 + odpo_exp(0.0 - x))
+fn odv2_sqrt(x) {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x / 2.0
+    if g < 1.0 { g = 1.0 }
+    for _i in 0..30 {
+        g = (g + x / g) / 2.0
+    }
+    return g
 }
 
-fn odpo_log_sigmoid(x) {
+@pure
+fn odv2_sigmoid(x) {
+    if x > 20.0 { return 1.0 }
+    if x < -20.0 { return 0.0 }
+    return 1.0 / (1.0 + odv2_exp(0.0 - x))
+}
+
+@pure
+fn odv2_log_sigmoid(x) {
     let neg_x = 0.0 - x
     if neg_x > 20.0 { return 0.0 - neg_x }
     if neg_x < -20.0 { return 0.0 }
-    return 0.0 - odpo_log(1.0 + odpo_exp(neg_x))
+    return 0.0 - odv2_log(1.0 + odv2_exp(neg_x))
 }
 
-// deterministic hash PRNG (no floating-point RNG available)
-fn odpo_hash(seed, i) {
-    let h = ((seed * 2654435761 + i * 1315423911 + 731) % 10007)
+// deterministic hash PRNG
+fn odv2_hash(seed, i) {
+    let mut h = (seed * 2654435761 + i * 1315423911 + 731) % 10007
+    if h < 0 { h = 0 - h }
     return to_float(h) / 10007.0
 }
 
-fn odpo_zeros(n) {
+fn odv2_zeros(n) {
     let mut v = []
     for _i in 0..n { v = v + [0.0] }
     return v
 }
 
-// ── policy state ─────────────────────────────────────────────────
-//
-// A "policy" is just a logit vector of length D — each index is an
-// action. We softmax it to get P(action). This mirrors what a real
-// LM head computes before argmax decoding.
+// ═══════════════════════════════════════════════════════════════════
+//  Policy state — logit vector of length D
+// ═══════════════════════════════════════════════════════════════════
 
-pub fn odpo_new_policy(d, seed) {
+pub fn odv2_new_policy(d, seed) {
     let mut v = []
     for i in 0..d {
-        // small Gaussian-ish init using two hashes
-        let a = odpo_hash(seed, i * 2)
-        let b = odpo_hash(seed, i * 2 + 1)
+        let a = odv2_hash(seed, i * 2)
+        let b = odv2_hash(seed, i * 2 + 1)
         v = v + [(a - 0.5) * 0.1 + (b - 0.5) * 0.1]
     }
     return v
 }
 
-pub fn odpo_copy_policy(p) {
+pub fn odv2_copy_policy(p) {
     let n = len(p)
     let mut out = []
     for i in 0..n { out = out + [p[i]] }
@@ -132,7 +164,7 @@ pub fn odpo_copy_policy(p) {
 }
 
 // softmax over full action space
-fn odpo_softmax(logits) {
+fn odv2_softmax(logits) {
     let n = len(logits)
     let mut mx = logits[0]
     let mut i = 1
@@ -140,16 +172,16 @@ fn odpo_softmax(logits) {
         if logits[i] > mx { mx = logits[i] }
         i = i + 1
     }
-    let mut exps = odpo_zeros(n)
+    let mut exps = odv2_zeros(n)
     let mut s = 0.0
     let mut j = 0
     while j < n {
-        let e = odpo_exp(logits[j] - mx)
+        let e = odv2_exp(logits[j] - mx)
         exps[j] = e
         s = s + e
         j = j + 1
     }
-    if s <= 0.0 { s = 1.0e-10 }
+    if s <= 0.0 { s = 0.0000000001 }
     let mut k = 0
     while k < n {
         exps[k] = exps[k] / s
@@ -158,8 +190,11 @@ fn odpo_softmax(logits) {
     return exps
 }
 
-// log P(action)
-pub fn odpo_log_prob(policy, action) {
+// ═══════════════════════════════════════════════════════════════════
+//  log P(action) from policy logits
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+pub fn odv2_log_prob(policy, action) {
     let n = len(policy)
     if action < 0 { return -30.0 }
     if action >= n { return -30.0 }
@@ -172,25 +207,24 @@ pub fn odpo_log_prob(policy, action) {
     let mut sum_exp = 0.0
     let mut j = 0
     while j < n {
-        sum_exp = sum_exp + odpo_exp(policy[j] - mx)
+        sum_exp = sum_exp + odv2_exp(policy[j] - mx)
         j = j + 1
     }
-    let lse = mx + odpo_log(sum_exp)
+    let lse = mx + odv2_log(sum_exp)
     return policy[action] - lse
 }
 
-// ── online sampling ──────────────────────────────────────────────
-//
-// Draws k candidate actions from current policy using inverse-CDF
-// sampling over softmax probabilities, returns [[action, log_p], ...].
-
-pub fn odpo_sample(policy, k, seed) {
-    let probs = odpo_softmax(policy)
+// ═══════════════════════════════════════════════════════════════════
+//  1. Online generation — sample K candidates from current policy
+// ═══════════════════════════════════════════════════════════════════
+@hot
+pub fn odv2_sample(policy, k, seed) {
+    let probs = odv2_softmax(policy)
     let n = len(probs)
     let mut out = []
     let mut i = 0
     while i < k {
-        let u = odpo_hash(seed + i * 97, i * 131 + 7)
+        let u = odv2_hash(seed + i * 97, i * 131 + 7)
         let mut acc = 0.0
         let mut chosen = n - 1
         let mut j = 0
@@ -205,134 +239,514 @@ pub fn odpo_sample(policy, k, seed) {
             }
             j = j + 1
         }
-        let lp = odpo_log_prob(policy, chosen)
+        let lp = odv2_log_prob(policy, chosen)
         out = out + [[chosen, lp]]
         i = i + 1
     }
     return out
 }
 
-// ── judge ────────────────────────────────────────────────────────
-//
-// The judge is an external oracle: judge(prompt, action) -> reward.
-// We expose a simple linear-reward judge: r(a) = reward_vec[a].
-// In practice this slot would call an LLM-as-judge or a reward model.
-
-pub fn odpo_judge_linear(reward_vec, action) {
+// ═══════════════════════════════════════════════════════════════════
+//  2. Reward ranking — score and rank generated responses
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn odv2_reward_score(reward_vec, action) {
     let n = len(reward_vec)
     if action < 0 { return 0.0 }
     if action >= n { return 0.0 }
     return reward_vec[action]
 }
 
-// Build a (chosen, rejected) preference pair from online samples.
-// Returns [chosen_action, rejected_action, reward_gap].
-pub fn odpo_build_pair(policy, k, seed, reward_vec) {
-    let samples = odpo_sample(policy, k, seed)
-    let ns = len(samples)
-    if ns < 2 {
-        let a = samples[0][0]
-        return [a, a, 0.0]
-    }
-    let mut best_a = samples[0][0]
-    let mut worst_a = samples[0][0]
-    let mut best_r = odpo_judge_linear(reward_vec, best_a)
-    let mut worst_r = best_r
-    let mut i = 1
-    while i < ns {
+// Rank samples by reward (selection sort, descending).
+// Input: [[action, logp], ...], reward_vec
+// Output: [[action, logp, reward], ...] sorted descending by reward
+pub fn odv2_rank_by_reward(samples, reward_vec) {
+    let n = len(samples)
+    // Build scored list
+    let mut scored = []
+    for i in 0..n {
         let a = samples[i][0]
-        let r = odpo_judge_linear(reward_vec, a)
-        if r > best_r { best_r = r; best_a = a }
-        if r < worst_r { worst_r = r; worst_a = a }
+        let lp = samples[i][1]
+        let r = odv2_reward_score(reward_vec, a)
+        scored = scored + [[a, lp, r]]
+    }
+    // Selection sort descending by reward
+    let mut i = 0
+    while i < n - 1 {
+        let mut max_idx = i
+        let mut j = i + 1
+        while j < n {
+            if scored[j][2] > scored[max_idx][2] {
+                max_idx = j
+            }
+            j = j + 1
+        }
+        if max_idx != i {
+            let tmp = scored[i]
+            scored[i] = scored[max_idx]
+            scored[max_idx] = tmp
+        }
         i = i + 1
     }
+    return scored
+}
+
+// Build preference pair: chosen = highest reward, rejected = lowest
+pub fn odv2_build_pair(policy, k, seed, reward_vec) {
+    let samples = odv2_sample(policy, k, seed)
+    let ranked = odv2_rank_by_reward(samples, reward_vec)
+    let n = len(ranked)
+    if n < 2 {
+        let a = ranked[0][0]
+        return [a, a, 0.0]
+    }
+    let best_a = ranked[0][0]
+    let best_r = ranked[0][2]
+    let worst_a = ranked[n - 1][0]
+    let worst_r = ranked[n - 1][2]
     return [best_a, worst_a, best_r - worst_r]
 }
 
-// ── DPO loss + step ──────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════
+//  3. Iterative DPO loss — standard DPO on online-generated pairs
 //
-// L = -log sigma(beta * (logpi_w - logpi_l - logref_w + logref_l))
-// Returns [loss, margin].
-pub fn odpo_loss(policy, ref, chosen, rejected, beta) {
-    let lpi_w = odpo_log_prob(policy, chosen)
-    let lpi_l = odpo_log_prob(policy, rejected)
-    let lref_w = odpo_log_prob(ref, chosen)
-    let lref_l = odpo_log_prob(ref, rejected)
-    let margin = beta * ((lpi_w - lref_w) - (lpi_l - lref_l))
-    let loss = 0.0 - odpo_log_sigmoid(margin)
-    return [loss, margin]
+//  L = -log sigma(beta * (logpi_w - logref_w - logpi_l + logref_l))
+// ═══════════════════════════════════════════════════════════════════
+@pure @hot
+pub fn odv2_dpo_loss(pi_w, pi_l, ref_w, ref_l, beta) {
+    let margin = beta * ((pi_w - ref_w) - (pi_l - ref_l))
+    let loss = 0.0 - odv2_log_sigmoid(margin)
+    return loss
 }
 
-// Analytical gradient of DPO loss w.r.t. the logit vector (policy).
-// Because policy = logits and log_prob = logits[a] - logsumexp(logits),
-// d log_prob / d logits[j] = (a==j) - softmax(logits)[j].
-// d margin / d logits[j] = beta * ((a_w==j) - p[j] - (a_l==j) + p[j])
-//                        = beta * ((a_w==j) - (a_l==j))
-// d L / d margin = -sigmoid(-margin)
-//
-// Returns [updated_policy, loss]. Hexa arrays pass by value for the
-// caller, so the caller must rebind:  policy = odpo_step(...)[0].
-fn odpo_grad_step(policy, ref, chosen, rejected, beta, lr) {
+// DPO loss on a policy/ref pair for given chosen/rejected actions
+@pure
+pub fn odv2_dpo_loss_actions(policy, ref, chosen, rejected, beta) {
+    let pi_w = odv2_log_prob(policy, chosen)
+    let pi_l = odv2_log_prob(policy, rejected)
+    let ref_w = odv2_log_prob(ref, chosen)
+    let ref_l = odv2_log_prob(ref, rejected)
+    return odv2_dpo_loss(pi_w, pi_l, ref_w, ref_l, beta)
+}
+
+// DPO gradient step: updates policy logits analytically
+// d log_prob(a)/d logit[j] = (a==j) - softmax[j]
+// d margin/d logit[j] = beta * ((chosen==j) - (rejected==j))
+// d L/d margin = -sigmoid(-margin)
+fn odv2_dpo_grad_step(policy, ref, chosen, rejected, beta, lr) {
     let n = len(policy)
-    let res = odpo_loss(policy, ref, chosen, rejected, beta)
-    let margin = res[1]
-    let neg_sigmoid = 0.0 - odpo_sigmoid(0.0 - margin)
-    let mut out = policy
+    let pi_w = odv2_log_prob(policy, chosen)
+    let pi_l = odv2_log_prob(policy, rejected)
+    let ref_w = odv2_log_prob(ref, chosen)
+    let ref_l = odv2_log_prob(ref, rejected)
+    let margin = beta * ((pi_w - ref_w) - (pi_l - ref_l))
+    let loss = 0.0 - odv2_log_sigmoid(margin)
+    let neg_sig = 0.0 - odv2_sigmoid(0.0 - margin)
+    let mut out = odv2_copy_policy(policy)
     let mut j = 0
     while j < n {
         let mut ind = 0.0
         if j == chosen { ind = ind + 1.0 }
         if j == rejected { ind = ind - 1.0 }
-        let grad = neg_sigmoid * beta * ind
+        let grad = neg_sig * beta * ind
         out[j] = out[j] - lr * grad
         j = j + 1
     }
-    return [out, res[0]]
+    return [out, loss]
 }
 
-// Returns [updated_policy, loss].
-pub fn odpo_step(policy, ref, pair, beta, lr) {
+// One train step from a pair [chosen, rejected, gap]
+pub fn odv2_train_step(policy, ref, reward_vec, k, seed, beta, lr) {
+    let pair = odv2_build_pair(policy, k, seed, reward_vec)
     let chosen = pair[0]
     let rejected = pair[1]
     if chosen == rejected { return [policy, 0.0] }
-    return odpo_grad_step(policy, ref, chosen, rejected, beta, lr)
+    return odv2_dpo_grad_step(policy, ref, chosen, rejected, beta, lr)
 }
 
-// ── replay buffer ────────────────────────────────────────────────
-//
-// Online DPO without replay is unstable — once the policy moves away
-// from an earlier pair, that pair's information is lost forever. We
-// keep a ring buffer of recent (chosen, rejected, gap) triples.
+// ═══════════════════════════════════════════════════════════════════
+//  4. Replay buffer — ring buffer of preference pairs
+// ═══════════════════════════════════════════════════════════════════
 
-pub fn odpo_replay_push(buf, cap, pair) {
-    let mut out = buf
-    out = out + [pair]
-    while len(out) > cap {
+// buffer = [cap, [pairs...]]
+pub fn odv2_replay_new(cap) {
+    return [cap, []]
+}
+
+pub fn odv2_replay_push(buf, pair) {
+    let cap = buf[0]
+    let mut items = buf[1]
+    items = items + [pair]
+    while len(items) > cap {
         let mut trimmed = []
         let mut i = 1
-        while i < len(out) {
-            trimmed = trimmed + [out[i]]
+        while i < len(items) {
+            trimmed = trimmed + [items[i]]
             i = i + 1
         }
-        out = trimmed
+        items = trimmed
     }
-    return out
+    return [cap, items]
 }
 
-pub fn odpo_replay_sample(buf, seed) {
-    let n = len(buf)
+pub fn odv2_replay_sample(buf, seed) {
+    let items = buf[1]
+    let n = len(items)
     if n <= 0 { return [0, 0, 0.0] }
-    let u = odpo_hash(seed, 17)
+    let u = odv2_hash(seed, 17)
     let mut idx = to_int(u * to_float(n))
     if idx < 0 { idx = 0 }
     if idx >= n { idx = n - 1 }
-    return buf[idx]
+    return items[idx]
 }
 
-// ── drift measurements ───────────────────────────────────────────
+pub fn odv2_replay_len(buf) {
+    return len(buf[1])
+}
+
+// Train step that mixes online and replay
+pub fn odv2_train_step_replay(policy, ref, reward_vec, k, seed, beta, lr, buf, replay_ratio) {
+    let u = odv2_hash(seed, 9991)
+    let use_replay = if u < replay_ratio {
+        if odv2_replay_len(buf) > 0 { true } else { false }
+    } else { false }
+
+    let mut pair = [0, 0, 0.0]
+    let mut new_buf = buf
+    if use_replay {
+        pair = odv2_replay_sample(buf, seed + 7)
+    } else {
+        pair = odv2_build_pair(policy, k, seed, reward_vec)
+        new_buf = odv2_replay_push(buf, pair)
+    }
+
+    let chosen = pair[0]
+    let rejected = pair[1]
+    if chosen == rejected { return [policy, 0.0, new_buf] }
+    let result = odv2_dpo_grad_step(policy, ref, chosen, rejected, beta, lr)
+    return [result[0], result[1], new_buf]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  5. Rejection sampling — generate N responses, keep best/worst
+// ═══════════════════════════════════════════════════════════════════
+pub fn odv2_rejection_sample(policy, n, seed, reward_vec) {
+    let samples = odv2_sample(policy, n, seed)
+    if len(samples) < 2 {
+        let a = samples[0][0]
+        return [a, a, 0.0]
+    }
+    let mut best_a = samples[0][0]
+    let mut worst_a = samples[0][0]
+    let mut best_r = odv2_reward_score(reward_vec, best_a)
+    let mut worst_r = best_r
+    let mut i = 1
+    while i < len(samples) {
+        let a = samples[i][0]
+        let r = odv2_reward_score(reward_vec, a)
+        if r > best_r {
+            best_r = r
+            best_a = a
+        }
+        if r < worst_r {
+            worst_r = r
+            worst_a = a
+        }
+        i = i + 1
+    }
+    return [best_a, worst_a, best_r - worst_r]
+}
+
+// Rejection sampling with configurable top-k / bottom-k
+// Returns [best_action, worst_action, gap, best_reward, worst_reward]
+pub fn odv2_rejection_sample_topk(policy, n, seed, reward_vec, top_k) {
+    let samples = odv2_sample(policy, n, seed)
+    let ranked = odv2_rank_by_reward(samples, reward_vec)
+    let nr = len(ranked)
+    if nr < 2 {
+        let a = ranked[0][0]
+        return [a, a, 0.0, ranked[0][2], ranked[0][2]]
+    }
+    // Pick from top_k best and bottom top_k worst
+    let mut best_idx = 0
+    if top_k > 1 {
+        let h = odv2_hash(seed + 31, 53)
+        let mut bi = to_int(h * to_float(top_k))
+        if bi >= nr { bi = nr - 1 }
+        if bi < 0 { bi = 0 }
+        best_idx = bi
+    }
+    let mut worst_idx = nr - 1
+    if top_k > 1 {
+        let h2 = odv2_hash(seed + 67, 89)
+        let mut wi = nr - 1 - to_int(h2 * to_float(top_k))
+        if wi < 0 { wi = 0 }
+        if wi >= nr { wi = nr - 1 }
+        worst_idx = wi
+    }
+    let best_a = ranked[best_idx][0]
+    let worst_a = ranked[worst_idx][0]
+    let best_r = ranked[best_idx][2]
+    let worst_r = ranked[worst_idx][2]
+    return [best_a, worst_a, best_r - worst_r, best_r, worst_r]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  6. Self-play generation — model generates both sides
 //
-// L2 parameter drift ||policy - ref||_2 — cheap, no softmax.
-pub fn odpo_policy_drift(policy, ref) {
+//  The policy generates N responses, then splits them into two groups.
+//  The higher-reward group is "chosen", the lower is "rejected".
+//  This enables preference learning without an external oracle.
+// ═══════════════════════════════════════════════════════════════════
+pub fn odv2_self_play(policy, seed, reward_vec, n) {
+    // Generate n samples from the same policy
+    let samples = odv2_sample(policy, n, seed)
+    let ranked = odv2_rank_by_reward(samples, reward_vec)
+    let nr = len(ranked)
+    if nr < 2 {
+        let a = ranked[0][0]
+        return [a, a, 0.0]
+    }
+    // Top half vs bottom half median split
+    let mid = nr / 2
+    // Pick one from top half and one from bottom half
+    let top_idx = to_int(odv2_hash(seed + 11, 23) * to_float(mid))
+    let mut bot_idx_raw = mid + to_int(odv2_hash(seed + 43, 67) * to_float(nr - mid))
+    if bot_idx_raw >= nr { bot_idx_raw = nr - 1 }
+    let chosen_a = ranked[top_idx][0]
+    let rejected_a = ranked[bot_idx_raw][0]
+    let gap = ranked[top_idx][2] - ranked[bot_idx_raw][2]
+    return [chosen_a, rejected_a, gap]
+}
+
+// Self-play with multiple rounds: each round the policy updates
+pub fn odv2_self_play_round(policy, ref, seed, reward_vec, n, beta, lr) {
+    let pair = odv2_self_play(policy, seed, reward_vec, n)
+    let chosen = pair[0]
+    let rejected = pair[1]
+    if chosen == rejected { return [policy, 0.0] }
+    return odv2_dpo_grad_step(policy, ref, chosen, rejected, beta, lr)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  7. ELO tracking — track model quality over iterations
+//
+//  Standard ELO formula:
+//    E = 1 / (1 + 10^((Rb - Ra) / 400))
+//    Ra_new = Ra + K * (S - E)
+//  where S=1 for win, S=0 for loss
+//
+//  elo_state = [rating, games_played, total_wins]
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn odv2_elo_new(rating) {
+    return [rating, 0, 0.0]
+}
+
+// Compute expected score against opponent
+@pure
+pub fn odv2_elo_expected(rating_a, rating_b) {
+    let diff = (rating_b - rating_a) / 400.0
+    // 10^diff = exp(diff * ln(10))
+    let pow10 = odv2_exp(diff * 2.302585)
+    return 1.0 / (1.0 + pow10)
+}
+
+// Update ELO after a game. won=1.0 for win, 0.0 for loss, 0.5 for draw.
+pub fn odv2_elo_update(state, opponent_rating, won, k_factor) {
+    let rating = state[0]
+    let games = state[1]
+    let wins = state[2]
+    let expected = odv2_elo_expected(rating, opponent_rating)
+    let new_rating = rating + k_factor * (won - expected)
+    return [new_rating, games + 1, wins + won]
+}
+
+pub fn odv2_elo_rating(state) {
+    return state[0]
+}
+
+pub fn odv2_elo_games(state) {
+    return state[1]
+}
+
+pub fn odv2_elo_wins(state) {
+    return state[2]
+}
+
+pub fn odv2_elo_win_rate(state) {
+    let games = state[1]
+    if games == 0 { return 0.0 }
+    return state[2] / to_float(games)
+}
+
+// Compare two policies on reward_vec and return 1.0 if policy_a wins
+pub fn odv2_elo_match(policy_a, policy_b, reward_vec, k, seed) {
+    // Each policy generates k samples, compare average reward
+    let samples_a = odv2_sample(policy_a, k, seed)
+    let samples_b = odv2_sample(policy_b, k, seed + 1000)
+    let mut sum_a = 0.0
+    let mut sum_b = 0.0
+    let mut i = 0
+    while i < len(samples_a) {
+        sum_a = sum_a + odv2_reward_score(reward_vec, samples_a[i][0])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(samples_b) {
+        sum_b = sum_b + odv2_reward_score(reward_vec, samples_b[j][0])
+        j = j + 1
+    }
+    if sum_a > sum_b { return 1.0 }
+    if sum_a < sum_b { return 0.0 }
+    return 0.5
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  8. Convergence check — detect when improvement plateaus
+//
+//  Looks at the last `window` loss values. If the average improvement
+//  per step is below `threshold`, we declare convergence.
+// ═══════════════════════════════════════════════════════════════════
+@pure
+pub fn odv2_convergence_delta(losses, window) {
+    let n = len(losses)
+    if n < 2 { return 999.0 }
+    let mut w = window
+    if w > n { w = n }
+    if w < 2 { w = 2 }
+    // Look at last w entries
+    let start = n - w
+    let first = losses[start]
+    let last = losses[n - 1]
+    let delta = odv2_abs(first - last) / to_float(w - 1)
+    return delta
+}
+
+@pure
+pub fn odv2_convergence_check(losses, window, threshold) {
+    let delta = odv2_convergence_delta(losses, window)
+    if delta < threshold { return true }
+    return false
+}
+
+// Detect if losses are non-decreasing (stalled)
+@pure
+pub fn odv2_is_stalled(losses, window) {
+    let n = len(losses)
+    if n < 2 { return false }
+    let mut w = window
+    if w > n { w = n }
+    let start = n - w
+    let mut non_decreasing = true
+    let mut i = start + 1
+    while i < n {
+        if losses[i] < losses[i - 1] - 0.0001 {
+            non_decreasing = false
+        }
+        i = i + 1
+    }
+    return non_decreasing
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Training loops — combining all components
+// ═══════════════════════════════════════════════════════════════════
+
+// Multi-step training: pure online (no replay)
+pub fn odv2_train_iter(policy, ref, reward_vec, k, n_steps, seed, beta, lr) {
+    let mut cur = policy
+    let mut losses = []
+    let mut i = 0
+    while i < n_steps {
+        let result = odv2_train_step(cur, ref, reward_vec, k, seed + i * 13, beta, lr)
+        cur = result[0]
+        losses = losses + [result[1]]
+        i = i + 1
+    }
+    return [cur, losses]
+}
+
+// Multi-step training with replay buffer
+pub fn odv2_train_with_replay(policy, ref, reward_vec, k, n_steps, seed, beta, lr, buf, replay_ratio) {
+    let mut cur = policy
+    let mut losses = []
+    let mut current_buf = buf
+    let mut i = 0
+    while i < n_steps {
+        let result = odv2_train_step_replay(cur, ref, reward_vec, k, seed + i * 13, beta, lr, current_buf, replay_ratio)
+        cur = result[0]
+        losses = losses + [result[1]]
+        current_buf = result[2]
+        i = i + 1
+    }
+    return [cur, losses, current_buf]
+}
+
+// Full iterative training: multiple rounds, each generating fresh data
+// Returns [final_policy, round_avg_losses, elo_state]
+pub fn odv2_iterative_train(policy, ref, reward_vec, k, n_rounds, steps_per, seed, beta, lr) {
+    let mut cur_policy = policy
+    let mut round_losses = []
+    let mut elo = odv2_elo_new(1500.0)
+    let prev_policy = odv2_copy_policy(policy)
+    let mut r = 0
+    while r < n_rounds {
+        let result = odv2_train_iter(cur_policy, ref, reward_vec, k, steps_per, seed + r * 1000, beta, lr)
+        cur_policy = result[0]
+        let step_losses = result[1]
+        // Average loss for this round
+        let mut sum_loss = 0.0
+        let mut i = 0
+        while i < len(step_losses) {
+            sum_loss = sum_loss + step_losses[i]
+            i = i + 1
+        }
+        let avg_loss = sum_loss / to_float(len(step_losses))
+        round_losses = round_losses + [avg_loss]
+        // ELO: current vs reference
+        let match_result = odv2_elo_match(cur_policy, ref, reward_vec, k, seed + r * 500)
+        elo = odv2_elo_update(elo, 1500.0, match_result, 32.0)
+        r = r + 1
+    }
+    return [cur_policy, round_losses, elo]
+}
+
+// Iterative training with early stopping on convergence
+pub fn odv2_iterative_train_converge(policy, ref, reward_vec, k, max_rounds, steps_per, seed, beta, lr, conv_window, conv_threshold) {
+    let mut cur_policy = policy
+    let mut round_losses = []
+    let mut elo = odv2_elo_new(1500.0)
+    let mut r = 0
+    let mut converged = false
+    while r < max_rounds {
+        if converged == false {
+            let result = odv2_train_iter(cur_policy, ref, reward_vec, k, steps_per, seed + r * 1000, beta, lr)
+            cur_policy = result[0]
+            let step_losses = result[1]
+            let mut sum_loss = 0.0
+            let mut i = 0
+            while i < len(step_losses) {
+                sum_loss = sum_loss + step_losses[i]
+                i = i + 1
+            }
+            let avg_loss = sum_loss / to_float(len(step_losses))
+            round_losses = round_losses + [avg_loss]
+            // ELO update
+            let match_result = odv2_elo_match(cur_policy, ref, reward_vec, k, seed + r * 500)
+            elo = odv2_elo_update(elo, 1500.0, match_result, 32.0)
+            // Check convergence
+            if len(round_losses) >= conv_window {
+                converged = odv2_convergence_check(round_losses, conv_window, conv_threshold)
+            }
+        }
+        r = r + 1
+    }
+    return [cur_policy, round_losses, elo, converged]
+}
+
+// Policy L2 drift from reference
+pub fn odv2_policy_drift(policy, ref) {
     let n = len(policy)
     let mut s = 0.0
     let mut i = 0
@@ -341,89 +755,21 @@ pub fn odpo_policy_drift(policy, ref) {
         s = s + d * d
         i = i + 1
     }
-    return sqrt(s)
+    return odv2_sqrt(s)
 }
 
-// Forward KL(policy || ref) — the quantity DPO's beta is supposed
-// to regularise. We use a numerically stable estimator.
-pub fn odpo_kl_drift(policy, ref) {
-    let p = odpo_softmax(policy)
-    let q = odpo_softmax(ref)
-    let n = len(p)
-    let mut kl = 0.0
+// Average reward of a policy over k samples
+pub fn odv2_avg_reward(policy, reward_vec, k, seed) {
+    let samples = odv2_sample(policy, k, seed)
+    let n = len(samples)
+    if n == 0 { return 0.0 }
+    let mut total = 0.0
     let mut i = 0
     while i < n {
-        let pi = p[i]
-        if pi > 1.0e-12 {
-            let qi = q[i]
-            let qsafe = if qi > 1.0e-12 { qi } else { 1.0e-12 }
-            kl = kl + pi * (odpo_log(pi) - odpo_log(qsafe))
-        }
+        total = total + odv2_reward_score(reward_vec, samples[i][0])
         i = i + 1
     }
-    return kl
+    return total / to_float(n)
 }
 
-// ── full online train step ───────────────────────────────────────
-//
-// state = [policy, ref, buf, cap, beta, lr, step, total_loss, total_drift]
-pub fn odpo_new_state(d, seed, cap, beta, lr) {
-    let policy = odpo_new_policy(d, seed)
-    let ref = odpo_copy_policy(policy)
-    return [policy, ref, [], cap, beta, lr, 0, 0.0, 0.0]
-}
-
-// Perform one full online DPO step: sample -> judge -> DPO update.
-// replay_ratio in [0,1] — probability of using a replay pair instead
-// of a fresh online pair (0 = pure online, 1 = pure replay).
-pub fn odpo_train_step(state, reward_vec, k, seed, replay_ratio) {
-    let policy = state[0]
-    let ref = state[1]
-    let mut buf = state[2]
-    let cap = state[3]
-    let beta = state[4]
-    let lr = state[5]
-    let step = state[6]
-    let mut total_loss = state[7]
-    let mut total_drift = state[8]
-
-    // 1) decide fresh vs replay
-    let u = odpo_hash(seed + step, 1019)
-    let use_replay = if u < replay_ratio {
-        if len(buf) > 0 { true } else { false }
-    } else { false }
-
-    let mut pair = [0, 0, 0.0]
-    if use_replay {
-        pair = odpo_replay_sample(buf, seed + step * 7)
-    } else {
-        pair = odpo_build_pair(policy, k, seed + step * 13, reward_vec)
-        buf = odpo_replay_push(buf, cap, pair)
-    }
-
-    // 2) DPO update — odpo_step returns [new_policy, loss]
-    let upd = odpo_step(policy, ref, pair, beta, lr)
-    let new_policy = upd[0]
-    let loss = upd[1]
-    total_loss = total_loss + loss
-
-    // 3) track drift against frozen reference
-    let drift = odpo_policy_drift(new_policy, ref)
-    total_drift = total_drift + drift
-
-    return [new_policy, ref, buf, cap, beta, lr, step + 1, total_loss, total_drift]
-}
-
-// Run n steps of online DPO. For determinism we use seed + i as the
-// per-step seed. Returns the final state.
-pub fn odpo_train(state, reward_vec, k, n_steps, base_seed, replay_ratio) {
-    let mut cur = state
-    let mut i = 0
-    while i < n_steps {
-        cur = odpo_train_step(cur, reward_vec, k, base_seed + i, replay_ratio)
-        i = i + 1
-    }
-    return cur
-}
-
-println("[online_dpo] loaded - online sample + judge + DPO + replay + drift")
+println("[online_dpo_v2] loaded — iterative DPO + online generation + rejection sampling + self-play + ELO + convergence")
