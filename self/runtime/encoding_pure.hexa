@@ -1,0 +1,324 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/encoding_pure.hexa — Phase 2 runtime port (encoding)
+//
+//  Pure-Hexa encoding codecs. Complements parse_format_pure.hexa
+//  (hex_str_upper / zfill / parse_hex / parse_bin / parse_int_base)
+//  with byte-level transport encodings.
+//
+//  New API (5 functions — net-new signatures beyond existing
+//  base64_pure.hexa / url_pure.hexa / hex_pure.hexa):
+//    base64_encode_pure(bytes)  — accepts string OR int array,
+//                                 emits RFC 4648 base64 string
+//                                 with '=' padding
+//    base64_decode_pure(s)      — decodes to int array (0..255);
+//                                 returns nil on invalid input.
+//                                 Tolerates missing padding.
+//    url_encode_pure(s)         — RFC 3986 percent-encoding.
+//                                 Unreserved = ALPHA / DIGIT / -_.~
+//    url_decode_pure(s)         — reverses url_encode_pure and
+//                                 form-style '+' → space.
+//    hex_dump_pure(bytes, cols) — `xxd`-style multi-line dump:
+//                                 "OFFSET  HH HH HH ...  |ASCII|"
+//
+//  Pitfalls honored (CLAUDE.md HX3 + grammar.jsonl):
+//    P1   no semicolons
+//    P15  let mut for mutated vars
+//    P28  nil/true/false literals
+//    P29  .push() returns NEW array — rebind mandatory
+//    P38  char_code(s, i>0) broken — use ord(s.substring(i, i+1))
+//    P50  no `<<` or `>>` — use `* 64` / `/ 64` (== pow2(6)) etc.
+// ═══════════════════════════════════════════════════════════════════
+
+let B64_ALPH_E = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+let HEX_LC_E   = "0123456789abcdef"
+let HEX_UP_E   = "0123456789ABCDEF"
+
+// ── _enc_b64_char — index into alphabet (0..63) ────────────────────
+@pure
+fn _enc_b64_char(idx) {
+    B64_ALPH_E.substring(idx, idx + 1)
+}
+
+// ── _enc_b64_val — char → 0..63 or -1 ──────────────────────────────
+@pure
+fn _enc_b64_val(c) {
+    let o = ord(c)
+    if o >= 65 && o <= 90  { return o - 65 }       // A-Z
+    if o >= 97 && o <= 122 { return o - 97 + 26 }  // a-z
+    if o >= 48 && o <= 57  { return o - 48 + 52 }  // 0-9
+    if o == 43 { return 62 }                       // +
+    if o == 47 { return 63 }                       // /
+    -1
+}
+
+// ── _enc_byte_at — uniform byte accessor (string or int array) ────
+// Returns 0..255 regardless of whether `src` is a string or int[].
+@pure
+fn _enc_byte_at(src, i) {
+    if type_of(src) == "array" {
+        let v = src[i]
+        if type_of(v) != "int" { return 0 }
+        if v < 0   { return 0 }
+        if v > 255 { return 255 }
+        return v
+    }
+    ord(src.substring(i, i + 1))
+}
+
+// ── _enc_src_len — uniform length (string or int array) ────────────
+@pure
+fn _enc_src_len(src) {
+    if type_of(src) == "array" { return len(src) }
+    if type_of(src) == "string" { return len(src) }
+    0
+}
+
+// ── base64_encode_pure ─────────────────────────────────────────────
+// Accepts either a string or an int array (bytes 0..255). Emits
+// RFC 4648 base64 ASCII with '=' padding when input length is not
+// a multiple of 3. Non-string/non-array inputs yield "".
+// Uses `* 64` / `/ 64` etc. in keeping with P50 (no << / >>).
+pub fn base64_encode_pure(src) {
+    let t = type_of(src)
+    if t != "string" && t != "array" { return "" }
+    let n = _enc_src_len(src)
+    let mut parts = []
+    let mut i = 0
+    while i + 3 <= n {
+        let b0 = _enc_byte_at(src, i)
+        let b1 = _enc_byte_at(src, i + 1)
+        let b2 = _enc_byte_at(src, i + 2)
+        // combined 24-bit value = b0*65536 + b1*256 + b2
+        //   (65536 = 256*256 = pow2(16), 262144 = 64*4096 = pow2(18))
+        let v = (b0 * 65536) + (b1 * 256) + b2
+        parts = parts.push(_enc_b64_char((v / 262144) % 64))   // top 6
+        parts = parts.push(_enc_b64_char((v / 4096) % 64))     // next 6
+        parts = parts.push(_enc_b64_char((v / 64) % 64))       // next 6
+        parts = parts.push(_enc_b64_char(v % 64))              // low 6
+        i = i + 3
+    }
+    if i < n {
+        let rem = n - i
+        let b0 = _enc_byte_at(src, i)
+        let mut v = b0 * 65536
+        if rem == 2 {
+            v = v + _enc_byte_at(src, i + 1) * 256
+        }
+        parts = parts.push(_enc_b64_char((v / 262144) % 64))
+        parts = parts.push(_enc_b64_char((v / 4096) % 64))
+        if rem == 2 {
+            parts = parts.push(_enc_b64_char((v / 64) % 64))
+        } else {
+            parts = parts.push("=")
+        }
+        parts = parts.push("=")
+    }
+    parts.join("")
+}
+
+// ── base64_decode_pure ─────────────────────────────────────────────
+// Decodes RFC 4648 base64 to an int array (0..255). Returns nil
+// when the input contains characters outside `[A-Za-z0-9+/=]` (or
+// when it is not a string at all). Missing padding is tolerated —
+// any number of trailing '=' (including zero) produces the same
+// output as long as the leading 6-bit groups are valid.
+pub fn base64_decode_pure(s) {
+    if type_of(s) != "string" { return nil }
+    let n = len(s)
+    let mut out = []
+    let mut bits = 0
+    let mut vbits = 0
+    let mut i = 0
+    let mut seen_pad = false
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "=" {
+            seen_pad = true
+            i = i + 1
+        } else {
+            if seen_pad {
+                // padding must be trailing only
+                return nil
+            }
+            let v = _enc_b64_val(c)
+            if v < 0 {
+                // skip whitespace silently, reject everything else
+                if c == " " || c == "\t" || c == "\n" || c == "\r" {
+                    i = i + 1
+                } else {
+                    return nil
+                }
+            } else {
+                bits = bits * 64 + v
+                vbits = vbits + 6
+                if vbits >= 8 {
+                    vbits = vbits - 8
+                    // scale = 2^vbits, compute by repeated doubling
+                    let mut sc = 1
+                    let mut p = 0
+                    while p < vbits {
+                        sc = sc * 2
+                        p = p + 1
+                    }
+                    let byte = (bits / sc) % 256
+                    out = out.push(byte)
+                    bits = bits % sc
+                }
+                i = i + 1
+            }
+        }
+    }
+    out
+}
+
+// ── _enc_is_unreserved — RFC 3986 unreserved set ──────────────────
+@pure
+fn _enc_is_unreserved(o) {
+    if o >= 65 && o <= 90  { return true }  // A-Z
+    if o >= 97 && o <= 122 { return true }  // a-z
+    if o >= 48 && o <= 57  { return true }  // 0-9
+    if o == 45 { return true }              // -
+    if o == 95 { return true }              // _
+    if o == 46 { return true }              // .
+    if o == 126 { return true }             // ~
+    false
+}
+
+// ── _enc_hex_val — single hex char → 0..15 or -1 ──────────────────
+@pure
+fn _enc_hex_val(c) {
+    let o = ord(c)
+    if o >= 48 && o <= 57  { return o - 48 }
+    if o >= 65 && o <= 70  { return o - 65 + 10 }
+    if o >= 97 && o <= 102 { return o - 97 + 10 }
+    -1
+}
+
+// ── url_encode_pure ────────────────────────────────────────────────
+// RFC 3986 percent-encoding. Unreserved chars pass through; every
+// other byte becomes %HH with uppercase hex.
+pub fn url_encode_pure(s) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let o = ord(c)
+        if _enc_is_unreserved(o) {
+            parts = parts.push(c)
+        } else {
+            let hi = HEX_UP_E.substring(o / 16, o / 16 + 1)
+            let lo = HEX_UP_E.substring(o % 16, o % 16 + 1)
+            parts = parts.push("%")
+            parts = parts.push(hi)
+            parts = parts.push(lo)
+        }
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── url_decode_pure ────────────────────────────────────────────────
+// Reverses url_encode_pure. '+' decodes to space (form-encoded
+// flavor). Trailing '%' without two hex digits is left verbatim.
+// Invalid %HH (non-hex) is also passed through literally.
+pub fn url_decode_pure(s) {
+    if type_of(s) != "string" { return "" }
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "+" {
+            parts = parts.push(" ")
+            i = i + 1
+        } else if c == "%" {
+            if i + 2 < n {
+                let hi = _enc_hex_val(s.substring(i + 1, i + 2))
+                let lo = _enc_hex_val(s.substring(i + 2, i + 3))
+                if hi >= 0 && lo >= 0 {
+                    parts = parts.push(from_char_code(hi * 16 + lo))
+                    i = i + 3
+                } else {
+                    parts = parts.push(c)
+                    i = i + 1
+                }
+            } else {
+                // trailing partial % — leave verbatim
+                parts = parts.push(s.substring(i, n))
+                i = n
+            }
+        } else {
+            parts = parts.push(c)
+            i = i + 1
+        }
+    }
+    parts.join("")
+}
+
+// ── _enc_hex_byte_lc — byte 0..255 → 2-char lowercase hex ─────────
+@pure
+fn _enc_hex_byte_lc(b) {
+    let hi = HEX_LC_E.substring(b / 16, b / 16 + 1)
+    let lo = HEX_LC_E.substring(b % 16, b % 16 + 1)
+    hi + lo
+}
+
+// ── _enc_offset_hex — int offset → 8-char lowercase hex (zero-pad) ─
+@pure
+fn _enc_offset_hex(n) {
+    let mut v = if n < 0 { 0 } else { n }
+    let mut out = ""
+    let mut i = 0
+    while i < 8 {
+        out = HEX_LC_E.substring(v % 16, v % 16 + 1) + out
+        v = v / 16
+        i = i + 1
+    }
+    out
+}
+
+// ── hex_dump_pure ──────────────────────────────────────────────────
+// xxd-style dump. `bytes` is a string or int array. `cols` is the
+// bytes-per-row (defaults to 16 when cols <= 0). Each row is:
+//   "OOOOOOOO: HH HH HH …  |ascii|"
+// printable bytes (0x20..0x7E) reproduced verbatim in the ASCII
+// column, everything else becomes '.'. Final row is padded so
+// the ASCII gutter lines up.
+pub fn hex_dump_pure(bytes, cols) {
+    let t = type_of(bytes)
+    if t != "string" && t != "array" { return "" }
+    let mut c = if type_of(cols) == "int" { cols } else { 16 }
+    if c <= 0 { c = 16 }
+    let n = _enc_src_len(bytes)
+    if n == 0 { return "" }
+    let mut lines = []
+    let mut off = 0
+    while off < n {
+        let mut remaining = n - off
+        let take = if remaining > c { c } else { remaining }
+        let mut hexparts = []
+        let mut asciiparts = []
+        let mut k = 0
+        while k < c {
+            if k < take {
+                let b = _enc_byte_at(bytes, off + k)
+                hexparts = hexparts.push(_enc_hex_byte_lc(b))
+                if b >= 32 && b <= 126 {
+                    asciiparts = asciiparts.push(from_char_code(b))
+                } else {
+                    asciiparts = asciiparts.push(".")
+                }
+            } else {
+                hexparts = hexparts.push("  ")  // pad hex column
+                asciiparts = asciiparts.push(" ")
+            }
+            k = k + 1
+        }
+        let row = _enc_offset_hex(off) + ": " + hexparts.join(" ") + "  |" + asciiparts.join("") + "|"
+        lines = lines.push(row)
+        off = off + c
+    }
+    lines.join("\n")
+}
