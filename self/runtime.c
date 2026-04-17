@@ -1578,15 +1578,6 @@ HexaVal hexa_index_set(HexaVal container, HexaVal key, HexaVal val) {
             : (int64_t)__hx_to_double(key);
     } else {
         idx = HX_INT(key);
-        // DEBUG: detect pointer-as-index
-        if (idx > 100000000LL || idx < -100000000LL) {
-            fprintf(stderr, "[DIAG] hexa_index_set: idx=%lld tag=%d is_vs=%d is_int=%d\n",
-                    (long long)idx, (int)HX_TAG(key), HX_IS_VALSTRUCT(key), HX_IS_INT(key));
-            #if defined(__APPLE__)
-            void *bt[16]; int n = backtrace(bt, 16);
-            backtrace_symbols_fd(bt, n, 2);
-            #endif
-        }
     }
     return hexa_array_set(container, idx, val);
 }
@@ -1628,7 +1619,13 @@ HexaVal hexa_valstruct_new_v(
     // Module-init time allocations (cached singletons __VAL_VOID/__VAL_TRUE/
     // __VAL_INT_CACHE etc.) go through the heap path so the first scope pop
     // doesn't wipe them.
-    int from_arena = hexa_val_arena_on() && __hexa_val_mark_top > 0;
+    // T33-fix-2: use heap when mark_top <= 1.  mark_top==1 is interpret()'s
+    // top-level scope where __init_val_int_cache runs.  Allocating there
+    // puts cache entries in mark[0]'s arena range; scope_pop from mark[0]
+    // (block=NULL → full arena reset) later wipes them.  mark_top >= 2
+    // means we're inside a user function — safe to arena-allocate because
+    // pops only rewind to mark[1]+, never touching mark[0]'s region.
+    int from_arena = hexa_val_arena_on() && __hexa_val_mark_top > 1;
     HexaValStruct* s;
     if (from_arena) {
         s = (HexaValStruct*)hexa_val_arena_calloc(sizeof(HexaValStruct));
@@ -2239,14 +2236,23 @@ HexaVal hexa_val_heapify(HexaVal v) {
             } else {
                 // Heap valstruct may still hold arena children (e.g. an arena
                 // string was assigned to .str_val). Recurse for safety.
-                HX_VSF(v, str_val)      = hexa_val_heapify(HX_VSF(v, str_val));
-                HX_VSF(v, char_val)     = hexa_val_heapify(HX_VSF(v, char_val));
-                HX_VSF(v, array_val)    = hexa_val_heapify(HX_VSF(v, array_val));
-                HX_VSF(v, fn_name)      = hexa_val_heapify(HX_VSF(v, fn_name));
-                HX_VSF(v, fn_params)    = hexa_val_heapify(HX_VSF(v, fn_params));
-                HX_VSF(v, fn_body)      = hexa_val_heapify(HX_VSF(v, fn_body));
-                HX_VSF(v, struct_name)  = hexa_val_heapify(HX_VSF(v, struct_name));
-                HX_VSF(v, struct_fields)= hexa_val_heapify(HX_VSF(v, struct_fields));
+                // 2026-04-17 COW: __VAL_INT_CACHE singletons are heap valstructs
+                // shared across the program. In-place mutation corrupts the cache.
+                // Shallow-copy before heapifying children.
+                HexaValStruct* hcow = (HexaValStruct*)malloc(sizeof(HexaValStruct));
+                if (hcow) {
+                    *hcow = *HX_VS(v);
+                    hcow->from_arena = 0;
+                    hcow->str_val      = hexa_val_heapify(hcow->str_val);
+                    hcow->char_val     = hexa_val_heapify(hcow->char_val);
+                    hcow->array_val    = hexa_val_heapify(hcow->array_val);
+                    hcow->fn_name      = hexa_val_heapify(hcow->fn_name);
+                    hcow->fn_params    = hexa_val_heapify(hcow->fn_params);
+                    hcow->fn_body      = hexa_val_heapify(hcow->fn_body);
+                    hcow->struct_name  = hexa_val_heapify(hcow->struct_name);
+                    hcow->struct_fields= hexa_val_heapify(hcow->struct_fields);
+                    HX_SET_VS(v, hcow);
+                }
             }
             // T33 Fix 4: when the interpreter Val is a TAG_ARRAY (5) or
             // TAG_MAP (10), its contents live in array_store / map_store
