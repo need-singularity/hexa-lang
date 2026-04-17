@@ -35,6 +35,7 @@
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행. ml 명령어: shared/hexa-lang/ml-commands.json (hexa-lang 전용)
 rules: shared/rules/common.json (R0~R27) + shared/rules/hexa-lang.json (HX1~HX7)
 L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
+attrs: `hexa self/attr_cli.hexa` (카탈로그), `... show <name>` (상세), `... lint <file>` (attr check 실행), `... policy <path>` (.hexa-attrs forbid gate) — 30 @attr SSOT = self/attrs/*.hexa (각 attr = meta + check fn 일체)
 loop: 글로벌 `~/.claude/skills/loop` + 엔진 `$NEXUS/shared/harness/loop` — roadmap `shared/roadmaps/hexa-lang.json` 3-track×phase×gate 자동
 
 hexa-lang 핵심 규칙:
@@ -74,4 +75,7 @@ ref:
   ai-native docs/ai-native.md                    24종 벡터
   ml        shared/hexa-lang/ml-next-level.json  15+N 다음 레벨
   ml-cmd    shared/hexa-lang/ml-commands.json    ml/ml go/ml next
+  attrs     self/attrs/                          30 @attr 모듈 (각 attr.hexa = meta+check), _registry.hexa 디스패치
+  attr-cli  self/attr_cli.hexa                   카탈로그/상세/lint/policy CLI
+  policy    .hexa-attrs                          프로젝트 정책 (forbid/allow 선언)
   api       shared/CLAUDE.md
