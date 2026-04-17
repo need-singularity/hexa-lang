@@ -278,9 +278,11 @@
 - [x] **P7-3** x86_64 명령어 인코더 — `self/codegen/x86_64.hexa`
 - [ ] **P7-4** runtime.c → 순수 Hexa 포팅 — `runtime_arm64.hexa` 부분 완료 (4,696 LOC 중)
 - [x] **P7-5** 레지스터 할당기 — `self/codegen/regalloc_linear.hexa` (linear scan)
-- [ ] **P7-6** 스케일업: hexa_full.hexa 전체를 native codegen으로 컴파일
-- [ ] **P7-7** fixpoint: native codegen binary가 자기 자신 빌드
-- [ ] **P7-8** 완료 시 파일명 정리: hexa_v2 → hexa, hexa_stage0 → hexa
+- [ ] **P7-6** IR lowering 확장 — Ident/Assign/StringLit/ArrayLit/MapLit/StructInit/Field/Index/ForIn/Match/TryCatch
+- [ ] **P7-7** runtime.c 183 함수 → self/runtime/*_pure.hexa 통합 (9,020 LOC 기존 + 갭 매우기)
+- [ ] **P7-8** 스케일업: hexa_full.hexa 전체를 native codegen으로 컴파일
+- [ ] **P7-9** fixpoint: native codegen binary가 자기 자신 빌드
+- [ ] **P7-10** 완료 시 파일명 정리: hexa_v2 → hexa, hexa_stage0 → hexa
 
 ---
 
