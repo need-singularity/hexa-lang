@@ -1,0 +1,348 @@
+// self/codegen/vm_to_arm64.hexa — Phase 7 P7-8
+// VM bytecode → ARM64 ahead-of-time transpiler.
+//
+// Transpiles a focused hot-path subset of self/vm.hexa opcodes into
+// raw ARM64 machine code (little-endian 4-byte instructions), skipping
+// the VM dispatch loop entirely. Paired with a Mach-O wrapper this
+// produces a native executable.
+//
+// =====================================================================
+//  Input byte format (see test_vm_to_arm64.hexa for examples)
+// =====================================================================
+//  The transpiler consumes a flat Array<u8> where each instruction is:
+//
+//    [op_id, operand_byte_0, operand_byte_1, ...]
+//
+//  op_id values match self/vm.hexa's OP_* constants (ossified 2026-04-10).
+//  This is a compact byte-coded form, NOT the Instruction{op,operand,op_id}
+//  struct the ossified VM itself interprets. The struct form is string-
+//  based (instr.operand : string); a simple encoder on top of
+//  opcode_to_id() converts it into this byte form if desired.
+//
+//  Operand widths (this transpiler):
+//    OP_CONST          (0)   : 1 byte  — 8-bit unsigned immediate (0..255)
+//    OP_POP            (2)   : 0 bytes
+//    OP_ADD            (4)   : 0 bytes
+//    OP_SUB            (5)   : 0 bytes
+//    OP_MUL            (6)   : 0 bytes
+//    OP_EQ            (13)   : 0 bytes
+//    OP_LT            (15)   : 0 bytes
+//    OP_JUMP          (26)   : 1 byte  — signed 8-bit delta in *bytes* of
+//                                         the source bytecode (relative
+//                                         to the byte just after the
+//                                         operand)
+//    OP_JUMP_IF_FALSE (27)   : 1 byte  — same semantics as OP_JUMP
+//    OP_RETURN        (31)   : 0 bytes — exits with top-of-stack as the
+//                                         process exit code (Darwin svc)
+//
+//  (The task asks for "OP_PUSH / OP_POP" as a register-stack simulation.
+//   In the ossified VM, pushing is an implicit side effect of producers
+//   like OP_CONST — there is no explicit OP_PUSH opcode. We therefore
+//   treat OP_CONST itself as the canonical "push immediate" and map
+//   OP_POP to a stack-depth decrement. This covers the intended 10
+//   hot-path opcodes: CONST, POP, ADD, SUB, MUL, EQ, LT, JUMP, JUMP_IF,
+//   RET — exactly the set the task describes.)
+//
+// =====================================================================
+//  Register file (virtual stack → physical ARM64 registers)
+// =====================================================================
+//    slot 0 → x1
+//    slot 1 → x2
+//    slot 2 → x3
+//    depth > 3  → ERROR (no real spill yet — future work)
+//
+//  The top-of-stack after the final op is copied into x0 for syscall
+//  exit by the OP_RETURN emitter.
+//
+// =====================================================================
+//  Two-pass layout
+// =====================================================================
+//  Pass 1: scan bytecode, build a map byte_offset → arm64_byte_offset
+//          so branch targets can be patched.
+//  Pass 2: emit ARM64 with resolved branch displacements.
+
+// ── Opcode IDs (must mirror self/vm.hexa) ──────────────────────────
+fn vma_op_const() -> int            { return 0 }
+fn vma_op_pop() -> int              { return 2 }
+fn vma_op_add() -> int              { return 4 }
+fn vma_op_sub() -> int              { return 5 }
+fn vma_op_mul() -> int              { return 6 }
+fn vma_op_eq() -> int               { return 13 }
+fn vma_op_lt() -> int               { return 15 }
+fn vma_op_jump() -> int             { return 26 }
+fn vma_op_jump_if_false() -> int    { return 27 }
+fn vma_op_return() -> int           { return 31 }
+
+// Operand width in bytes for each supported opcode.
+fn vma_operand_bytes(op: int) -> int {
+    if op == vma_op_const()         { return 1 }
+    if op == vma_op_jump()          { return 1 }
+    if op == vma_op_jump_if_false() { return 1 }
+    return 0
+}
+
+// ── ARM64 encoders (local copies; we do not touch self/codegen/arm64.hexa
+//    to avoid conflict with the IR→ARM64 agent). All constants verified
+//    against the ARM Architecture Reference Manual.
+
+// MOVZ Xd, #imm16                     0xD2800000
+fn vma_enc_movz(rd: int, imm: int) -> int {
+    return 3531603968 + imm * 32 + rd
+}
+
+// ADD Xd, Xn, Xm                      0x8B000000
+fn vma_enc_add(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + rm * 65536 + rn * 32 + rd
+}
+
+// SUB Xd, Xn, Xm                      0xCB000000
+fn vma_enc_sub(rd: int, rn: int, rm: int) -> int {
+    return 3405774848 + rm * 65536 + rn * 32 + rd
+}
+
+// MUL Xd, Xn, Xm                      0x9B007C00
+fn vma_enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600500224 + rm * 65536 + rn * 32 + rd
+}
+
+// MOV Xd, Xn (ORR Xd, XZR, Xn)        0xAA0003E0
+fn vma_enc_mov_reg(rd: int, rm: int) -> int {
+    return 2852127712 + rm * 65536 + rd
+}
+
+// CMP Xn, Xm (SUBS XZR, Xn, Xm)       0xEB00001F
+fn vma_enc_cmp(rn: int, rm: int) -> int {
+    return 3942645791 + rm * 65536 + rn * 32
+}
+
+// CSET Xd, cond  (CSINC Xd, XZR, XZR, inv(cond))
+// cond input: 0=EQ, 1=NE, 10=GE, 11=LT, 12=GT, 13=LE
+// base 0x9A9F07E0
+fn vma_enc_cset(rd: int, cond: int) -> int {
+    if cond == 0  { return 2594113504 + 1  * 4096 + rd }   // EQ → invert to NE
+    if cond == 1  { return 2594113504 + 0  * 4096 + rd }   // NE
+    if cond == 10 { return 2594113504 + 11 * 4096 + rd }   // GE
+    if cond == 11 { return 2594113504 + 10 * 4096 + rd }   // LT
+    if cond == 12 { return 2594113504 + 13 * 4096 + rd }   // GT
+    if cond == 13 { return 2594113504 + 12 * 4096 + rd }   // LE
+    return 2594113504 + rd
+}
+
+// B #off26 (signed, in instructions)  0x14000000
+fn vma_enc_b(off26: int) -> int {
+    let mut o = off26
+    if o < 0 { o = o + 67108864 }  // two's complement in 26 bits
+    return 335544320 + o
+}
+
+// B.cond #off19 (signed, in instructions)  0x54000000 | (imm19<<5) | cond
+fn vma_enc_bcond(cond: int, off19: int) -> int {
+    let mut o = off19
+    if o < 0 { o = o + 524288 }    // two's complement in 19 bits
+    return 1409286144 + o * 32 + cond
+}
+
+// SVC #0x80 (Darwin)                  0xD4001001
+fn vma_enc_svc() -> int {
+    return 3556773889
+}
+
+// ── Byte helpers ──────────────────────────────────────────────────
+
+fn vma_push_u32_le(bytes: [int], v: int) -> [int] {
+    let mut b = bytes
+    b = b.push(v % 256)
+    b = b.push((v / 256) % 256)
+    b = b.push((v / 65536) % 256)
+    b = b.push((v / 16777216) % 256)
+    return b
+}
+
+// ── Virtual-stack register map ────────────────────────────────────
+// depth 0 → after a push, top sits in x1
+// depth 1 → after a push, top sits in x2
+// depth 2 → after a push, top sits in x3
+// depth > 2 → spill error
+fn vma_slot_to_reg(slot: int) -> int {
+    return slot + 1
+}
+
+fn vma_max_depth() -> int { return 3 }
+
+// ── Pass 1 — map every bytecode byte-offset that starts an instruction
+//    to the ARM64 byte-offset it will expand to. Used for branch patch.
+//    Returns a flat int array of length = len(bytecode)+1, where
+//    offset_map[i] is the arm64 byte-offset at which the instruction
+//    whose first byte sits at bytecode[i] will begin (or would begin,
+//    if i == len(bytecode), the end).
+fn vma_build_offset_map(bc: [int]) -> [int] {
+    let mut map = []
+    let n = len(bc)
+    let mut i = 0
+    let mut arm = 0
+    let mut depth = 0
+    // initialise map with sentinels
+    let mut k = 0
+    while k <= n {
+        map = map.push(-1)
+        k = k + 1
+    }
+    while i < n {
+        map[i] = arm
+        let op = bc[i]
+        let ob = vma_operand_bytes(op)
+        // how many ARM64 instructions (×4 bytes) does this op emit?
+        let mut emits = 0
+        if op == vma_op_const()         { emits = 1 }
+        if op == vma_op_pop()           { emits = 0 }
+        if op == vma_op_add()           { emits = 1 }
+        if op == vma_op_sub()           { emits = 1 }
+        if op == vma_op_mul()           { emits = 1 }
+        if op == vma_op_eq()            { emits = 2 }   // CMP + CSET
+        if op == vma_op_lt()            { emits = 2 }   // CMP + CSET
+        if op == vma_op_jump()          { emits = 1 }   // B
+        if op == vma_op_jump_if_false() { emits = 2 }   // CMP + B.cond (top≠0)
+        if op == vma_op_return()        { emits = 3 }   // MOV x0,xN + MOVZ x16,1 + SVC
+        arm = arm + emits * 4
+        i = i + 1 + ob
+    }
+    map[n] = arm
+    return map
+}
+
+// ── Main entry — transpile bytecode to ARM64 bytes ────────────────
+fn transpile_bytecode(bytecode: [int]) -> [int] {
+    let offset_map = vma_build_offset_map(bytecode)
+    let n = len(bytecode)
+    let mut out = []
+    let mut i = 0
+    let mut depth = 0
+
+    while i < n {
+        let op = bytecode[i]
+        let here_arm = len(out)   // current ARM64 byte offset (= offset_map[i])
+
+        if op == vma_op_const() {
+            let imm = bytecode[i + 1]
+            if depth >= vma_max_depth() {
+                println("transpile_bytecode: stack overflow (depth > 3) at pc=" + to_string(i) + " — register-spill not yet implemented")
+                return out
+            }
+            let rd = vma_slot_to_reg(depth)
+            out = vma_push_u32_le(out, vma_enc_movz(rd, imm))
+            depth = depth + 1
+            i = i + 2
+        } else if op == vma_op_pop() {
+            if depth <= 0 {
+                println("transpile_bytecode: stack underflow on POP at pc=" + to_string(i))
+                return out
+            }
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_add() {
+            if depth < 2 {
+                println("transpile_bytecode: stack underflow on ADD at pc=" + to_string(i))
+                return out
+            }
+            let rb = vma_slot_to_reg(depth - 1)  // top
+            let ra = vma_slot_to_reg(depth - 2)
+            out = vma_push_u32_le(out, vma_enc_add(ra, ra, rb))
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_sub() {
+            if depth < 2 {
+                println("transpile_bytecode: stack underflow on SUB at pc=" + to_string(i))
+                return out
+            }
+            let rb = vma_slot_to_reg(depth - 1)
+            let ra = vma_slot_to_reg(depth - 2)
+            out = vma_push_u32_le(out, vma_enc_sub(ra, ra, rb))
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_mul() {
+            if depth < 2 {
+                println("transpile_bytecode: stack underflow on MUL at pc=" + to_string(i))
+                return out
+            }
+            let rb = vma_slot_to_reg(depth - 1)
+            let ra = vma_slot_to_reg(depth - 2)
+            out = vma_push_u32_le(out, vma_enc_mul(ra, ra, rb))
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_eq() {
+            if depth < 2 {
+                println("transpile_bytecode: stack underflow on EQ at pc=" + to_string(i))
+                return out
+            }
+            let rb = vma_slot_to_reg(depth - 1)
+            let ra = vma_slot_to_reg(depth - 2)
+            out = vma_push_u32_le(out, vma_enc_cmp(ra, rb))
+            out = vma_push_u32_le(out, vma_enc_cset(ra, 0))  // EQ
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_lt() {
+            if depth < 2 {
+                println("transpile_bytecode: stack underflow on LT at pc=" + to_string(i))
+                return out
+            }
+            let rb = vma_slot_to_reg(depth - 1)
+            let ra = vma_slot_to_reg(depth - 2)
+            out = vma_push_u32_le(out, vma_enc_cmp(ra, rb))
+            out = vma_push_u32_le(out, vma_enc_cset(ra, 11))  // LT
+            depth = depth - 1
+            i = i + 1
+        } else if op == vma_op_jump() {
+            // operand = signed-8 delta in bytecode bytes, relative to
+            // the byte right after the operand (i+2).
+            let mut delta = bytecode[i + 1]
+            if delta >= 128 { delta = delta - 256 }
+            let tgt_bc = i + 2 + delta
+            // translate to arm64 byte offset
+            let tgt_arm = offset_map[tgt_bc]
+            // imm26 is in *instructions*, from the current PC (= here_arm)
+            let rel_insns = (tgt_arm - here_arm) / 4
+            out = vma_push_u32_le(out, vma_enc_b(rel_insns))
+            i = i + 2
+        } else if op == vma_op_jump_if_false() {
+            // Pop top; if it is zero ("false") branch to target.
+            // We implement this as: CMP xTop, XZR ; B.EQ target.
+            // Because ARM64 has no direct CMP xN, XZR without SUBS, we
+            // use SUBS XZR, xTop, XZR via our enc_cmp with xzr=31.
+            if depth < 1 {
+                println("transpile_bytecode: stack underflow on JUMP_IF_FALSE at pc=" + to_string(i))
+                return out
+            }
+            let rtop = vma_slot_to_reg(depth - 1)
+            depth = depth - 1
+            let mut delta = bytecode[i + 1]
+            if delta >= 128 { delta = delta - 256 }
+            let tgt_bc = i + 2 + delta
+            let tgt_arm = offset_map[tgt_bc]
+
+            out = vma_push_u32_le(out, vma_enc_cmp(rtop, 31))  // CMP xTop, XZR
+            let after_cmp_arm = len(out)
+            let rel_insns = (tgt_arm - after_cmp_arm) / 4
+            out = vma_push_u32_le(out, vma_enc_bcond(0, rel_insns))  // B.EQ
+            i = i + 2
+        } else if op == vma_op_return() {
+            if depth < 1 {
+                println("transpile_bytecode: stack underflow on RETURN at pc=" + to_string(i))
+                return out
+            }
+            let rtop = vma_slot_to_reg(depth - 1)
+            // MOV x0, xTop
+            out = vma_push_u32_le(out, vma_enc_mov_reg(0, rtop))
+            // MOVZ x16, #1   (SYS_exit)
+            out = vma_push_u32_le(out, vma_enc_movz(16, 1))
+            // SVC #0x80
+            out = vma_push_u32_le(out, vma_enc_svc())
+            depth = depth - 1
+            i = i + 1
+        } else {
+            println("transpile_bytecode: unsupported opcode " + to_string(op) + " at pc=" + to_string(i))
+            return out
+        }
+    }
+
+    return out
+}
