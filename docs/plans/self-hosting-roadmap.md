@@ -271,13 +271,16 @@
 ## Phase 7: C 독립 — Native Codegen (clang/gcc 제거)
 > 현재: .hexa → C → clang → native. C 중간 언어 + runtime.c (4,696 LOC) 의존.
 > 목표: .hexa → ARM64/x86_64 machine code 직접 emit. clang 불필요.
+> PoC 검증 완료: `self/codegen_native.hexa` → `/tmp/hexa_native_42` (zero-tool ARM64 Mach-O, 42 출력)
 
-- [ ] **P7-1** ELF/Mach-O 바이너리 포맷 직접 생성 (헤더 + 섹션)
-- [ ] **P7-2** ARM64 명령어 인코더 (순수 Hexa)
-- [ ] **P7-3** x86_64 명령어 인코더 (순수 Hexa)
-- [ ] **P7-4** runtime.c → 순수 Hexa 포팅 (hexa_eq, hexa_add, arena 등)
-- [ ] **P7-5** 레지스터 할당기 (linear scan)
-- [ ] **P7-6** fixpoint: hexa native codegen으로 자기 자신 빌드
+- [x] **P7-1** ELF/Mach-O 바이너리 포맷 직접 생성 — `self/codegen/elf.hexa` + `macho.hexa`
+- [x] **P7-2** ARM64 명령어 인코더 — `self/codegen/arm64.hexa`
+- [x] **P7-3** x86_64 명령어 인코더 — `self/codegen/x86_64.hexa`
+- [ ] **P7-4** runtime.c → 순수 Hexa 포팅 — `runtime_arm64.hexa` 부분 완료 (4,696 LOC 중)
+- [x] **P7-5** 레지스터 할당기 — `self/codegen/regalloc_linear.hexa` (linear scan)
+- [ ] **P7-6** 스케일업: hexa_full.hexa 전체를 native codegen으로 컴파일
+- [ ] **P7-7** fixpoint: native codegen binary가 자기 자신 빌드
+- [ ] **P7-8** 완료 시 파일명 정리: hexa_v2 → hexa, hexa_stage0 → hexa
 
 ---
 
