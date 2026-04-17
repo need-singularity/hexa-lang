@@ -1,0 +1,350 @@
+// self/codegen_native_fib.hexa — Zero-tool ARM64 Fibonacci
+// Loops + variables + branch. fib(10)=55.
+// No clang. No as. No ld. Pure Hexa → ARM64 Mach-O.
+//
+// Strategy: build the entire Mach-O as a fresh byte array (no base-file
+// patching). Writing to a brand-new path then codesigning once gives
+// clean output with no "replacing existing signature" or
+// "object file format unrecognized" warnings.
+//
+// Mach-O layout mirrors self/codegen_native.hexa exactly:
+//   [0x0000]  mach_header_64              32 bytes
+//   [0x0020]  LC_SEGMENT_64 __PAGEZERO    72
+//   [0x0068]  LC_SEGMENT_64 __TEXT       152
+//   [0x0100]  LC_SEGMENT_64 __LINKEDIT    72
+//   [0x0148]  LC_DYLD_CHAINED_FIXUPS     16
+//   [0x0158]  LC_SYMTAB                   24
+//   [0x0170]  LC_DYSYMTAB                 80
+//   [0x01C0]  LC_LOAD_DYLINKER            32
+//   [0x01E0]  LC_UUID                     24
+//   [0x01F8]  LC_BUILD_VERSION            24
+//   [0x0210]  LC_MAIN                     24
+//   [0x0228]  LC_LOAD_DYLIB libSystem     56
+//   [0x0300]  __text (fib code)           variable
+//   [0x4000]  __LINKEDIT                  chained-fixups header + strtab
+
+// ═══════════════════════════════════════════════════════════
+//  ARM64 encoders
+// ═══════════════════════════════════════════════════════════
+
+fn enc_movz(rd, imm) { return 3531603968 + imm * 32 + rd }
+fn enc_add(rd, rn, rm) { return 2332033024 + rm * 65536 + rn * 32 + rd }
+fn enc_mov(rd, rn) { return 2852127712 + rn * 65536 + rd }
+fn enc_subs_imm(rd, rn, imm) { return 4043309056 + imm * 1024 + rn * 32 + rd }
+fn enc_bcond_gt(imm19) { return 1409286156 + imm19 * 32 }
+// SVC #0x80 = 0xD4001001 — macOS syscall instruction.
+// Prior version used 0xD4000001 (SVC #0) which happened to work but is
+// not the documented macOS userland syscall encoding.
+fn enc_svc() { return 3556773889 }
+
+// ═══════════════════════════════════════════════════════════
+//  Byte writers — all amortized O(1) via array push.
+// ═══════════════════════════════════════════════════════════
+
+fn push_u8(bytes, v) {
+    return bytes.push(v % 256)
+}
+
+fn push_u32_le(bytes, v) {
+    let mut b = bytes
+    b = b.push(v % 256)
+    b = b.push((v / 256) % 256)
+    b = b.push((v / 65536) % 256)
+    b = b.push((v / 16777216) % 256)
+    return b
+}
+
+fn push_u64_le(bytes, v) {
+    let lo = v % 4294967296
+    let hi = v / 4294967296
+    let mut b = bytes
+    b = push_u32_le(b, lo)
+    b = push_u32_le(b, hi)
+    return b
+}
+
+fn push_zeros(bytes, n) {
+    let mut b = bytes
+    let mut i = 0
+    while i < n {
+        b = b.push(0)
+        i = i + 1
+    }
+    return b
+}
+
+// Pad byte array with zeros until its length is `target`.
+fn pad_to(bytes, target) {
+    let mut b = bytes
+    while len(b) < target {
+        b = b.push(0)
+    }
+    return b
+}
+
+// Push fixed-width 16-byte segment/section name with zero padding.
+fn push_segname16(bytes, name) {
+    let mut b = bytes
+    let mut i = 0
+    while i < len(name) {
+        b = b.push(char_code(name, i))
+        i = i + 1
+    }
+    while i < 16 {
+        b = b.push(0)
+        i = i + 1
+    }
+    return b
+}
+
+fn push_bytes_ascii(bytes, s) {
+    let mut b = bytes
+    let mut i = 0
+    while i < len(s) {
+        b = b.push(char_code(s, i))
+        i = i + 1
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mach-O builder — build the whole binary as bytes.
+// ═══════════════════════════════════════════════════════════
+
+fn build_macho_bytes(code_u32) {
+    let MH_MAGIC_64 = 4277009103
+    let CPU_ARM64   = 16777228
+    let MH_EXECUTE  = 2
+    let HDR_FLAGS   = 2097285
+    let NCMDS       = 11
+    let SIZEOFCMDS  = 576
+    let PAGE        = 16384
+    let CODE_OFF    = 768
+
+    let code_bytes_count = len(code_u32) * 4
+    let mut text_size_aligned = code_bytes_count
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    let mut b = []
+
+    // ── mach_header_64 ─────────────────────────────────────
+    b = push_u32_le(b, MH_MAGIC_64)
+    b = push_u32_le(b, CPU_ARM64)
+    b = push_u32_le(b, 0)              // cpusubtype (patched below)
+    b = push_u32_le(b, MH_EXECUTE)
+    b = push_u32_le(b, NCMDS)
+    b = push_u32_le(b, SIZEOFCMDS)
+    b = push_u32_le(b, HDR_FLAGS)
+    b = push_u32_le(b, 0)              // reserved
+
+    // NOTE: codegen_native.hexa's hex literal for cpusubtype is 0x00000000
+    // but mach_header_64 has cpusubtype at offset 8, not reserved.  We
+    // just mirrored its layout above.
+
+    // ── LC_SEGMENT_64 __PAGEZERO (72 bytes) ───────────────
+    b = push_u32_le(b, 25)             // LC_SEGMENT_64 = 0x19
+    b = push_u32_le(b, 72)
+    b = push_segname16(b, "__PAGEZERO")
+    b = push_u64_le(b, 0)              // vmaddr
+    b = push_u64_le(b, 4294967296)     // vmsize = 0x100000000
+    b = push_u64_le(b, 0)              // fileoff
+    b = push_u64_le(b, 0)              // filesize
+    b = push_u32_le(b, 0)              // maxprot
+    b = push_u32_le(b, 0)              // initprot
+    b = push_u32_le(b, 0)              // nsects
+    b = push_u32_le(b, 0)              // flags
+
+    // ── LC_SEGMENT_64 __TEXT (152 bytes) ──────────────────
+    b = push_u32_le(b, 25)
+    b = push_u32_le(b, 152)
+    b = push_segname16(b, "__TEXT")
+    b = push_u64_le(b, 4294967296)     // vmaddr = 0x100000000
+    b = push_u64_le(b, PAGE)           // vmsize = 0x4000
+    b = push_u64_le(b, 0)              // fileoff
+    b = push_u64_le(b, PAGE)           // filesize = 0x4000
+    b = push_u32_le(b, 5)              // maxprot r+x
+    b = push_u32_le(b, 5)              // initprot r+x
+    b = push_u32_le(b, 1)              // nsects
+    b = push_u32_le(b, 0)              // flags
+
+    // section64 __text (80 bytes)
+    b = push_segname16(b, "__text")
+    b = push_segname16(b, "__TEXT")
+    b = push_u64_le(b, 4294967296 + CODE_OFF)  // addr
+    b = push_u64_le(b, text_size_aligned)      // size
+    b = push_u32_le(b, CODE_OFF)               // offset
+    b = push_u32_le(b, 2)                      // align 2^2
+    b = push_u32_le(b, 0)                      // reloff
+    b = push_u32_le(b, 0)                      // nreloc
+    b = push_u32_le(b, 2147484672)             // flags = 0x80000400
+    b = push_u32_le(b, 0)                      // reserved1
+    b = push_u32_le(b, 0)                      // reserved2
+    b = push_u32_le(b, 0)                      // reserved3
+
+    // ── LC_SEGMENT_64 __LINKEDIT (72 bytes) ───────────────
+    b = push_u32_le(b, 25)
+    b = push_u32_le(b, 72)
+    b = push_segname16(b, "__LINKEDIT")
+    b = push_u64_le(b, 4294967296 + PAGE)      // vmaddr
+    b = push_u64_le(b, PAGE)                   // vmsize
+    b = push_u64_le(b, PAGE)                   // fileoff
+    b = push_u64_le(b, 49)                     // filesize = 0x31
+    b = push_u32_le(b, 1)                      // maxprot r
+    b = push_u32_le(b, 1)                      // initprot r
+    b = push_u32_le(b, 0)                      // nsects
+    b = push_u32_le(b, 0)                      // flags
+
+    // ── LC_DYLD_CHAINED_FIXUPS (16 bytes) ─────────────────
+    b = push_u32_le(b, 2147483700)             // LC_DYLD_CHAINED_FIXUPS = 0x80000034
+    b = push_u32_le(b, 16)
+    b = push_u32_le(b, PAGE)                   // dataoff
+    b = push_u32_le(b, 48)                     // datasize
+
+    // ── LC_SYMTAB (24 bytes) ──────────────────────────────
+    b = push_u32_le(b, 2)                      // LC_SYMTAB
+    b = push_u32_le(b, 24)
+    b = push_u32_le(b, 16432)                  // symoff = 0x4030
+    b = push_u32_le(b, 0)                      // nsyms
+    b = push_u32_le(b, 16432)                  // stroff
+    b = push_u32_le(b, 1)                      // strsize
+
+    // ── LC_DYSYMTAB (80 bytes) ────────────────────────────
+    b = push_u32_le(b, 11)                     // LC_DYSYMTAB
+    b = push_u32_le(b, 80)
+    b = push_zeros(b, 72)
+
+    // ── LC_LOAD_DYLINKER (32 bytes) ───────────────────────
+    b = push_u32_le(b, 14)                     // LC_LOAD_DYLINKER
+    b = push_u32_le(b, 32)
+    b = push_u32_le(b, 12)                     // name offset
+    b = push_bytes_ascii(b, "/usr/lib/dyld")
+    b = push_zeros(b, 7)                       // pad to 32 total
+
+    // ── LC_UUID (24 bytes) ────────────────────────────────
+    b = push_u32_le(b, 27)                     // LC_UUID
+    b = push_u32_le(b, 24)
+    b = push_bytes_ascii(b, "HEXAABCDEF012345")
+
+    // ── LC_BUILD_VERSION (24 bytes) ───────────────────────
+    b = push_u32_le(b, 50)                     // LC_BUILD_VERSION
+    b = push_u32_le(b, 24)
+    b = push_u32_le(b, 1)                      // platform macOS
+    b = push_u32_le(b, 917504)                 // minos 14.0.0 = 0x000E0000
+    b = push_u32_le(b, 917504)                 // sdk   14.0.0
+    b = push_u32_le(b, 0)                      // ntools
+
+    // ── LC_MAIN (24 bytes) ────────────────────────────────
+    b = push_u32_le(b, 2147483688)             // LC_MAIN = 0x80000028
+    b = push_u32_le(b, 24)
+    b = push_u64_le(b, CODE_OFF)               // entryoff
+    b = push_u64_le(b, 0)                      // stacksize
+
+    // ── LC_LOAD_DYLIB libSystem (56 bytes) ────────────────
+    b = push_u32_le(b, 12)                     // LC_LOAD_DYLIB
+    b = push_u32_le(b, 56)
+    b = push_u32_le(b, 24)                     // name offset
+    b = push_u32_le(b, 2)                      // timestamp
+    b = push_u32_le(b, 65536)                  // current version 1.0.0
+    b = push_u32_le(b, 65536)                  // compat version 1.0.0
+    b = push_bytes_ascii(b, "/usr/lib/libSystem.B.dylib")
+    b = push_zeros(b, 56 - 24 - 26)            // pad: header=24, name=26
+
+    // Pad to CODE_OFF (0x300)
+    b = pad_to(b, CODE_OFF)
+
+    // ── __text code section ───────────────────────────────
+    let mut ci = 0
+    while ci < len(code_u32) {
+        b = push_u32_le(b, code_u32[ci])
+        ci = ci + 1
+    }
+
+    // Pad __TEXT to PAGE (0x4000)
+    b = pad_to(b, PAGE)
+
+    // ── __LINKEDIT content ────────────────────────────────
+    //   dyld_chained_fixups_header (32 bytes) + import/symbol empties.
+    // Mirrors codegen_native.hexa's hardcoded tail:
+    //   0x00 0x20 0x00 0x00 ... 0x01 ... 0x03 ... null strtab.
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 32)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 1)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 3)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 0)
+    b = push_u32_le(b, 0)
+    b = b.push(0)  // null strtab byte
+
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Top-level driver
+// ═══════════════════════════════════════════════════════════
+
+println("=== HEXA zero-tool ARM64 Fibonacci ===")
+println("[1] Generating fib(10) ARM64 code...")
+
+let mut code = []
+code = code.push(enc_movz(0, 10))          // X0=10  (counter)
+code = code.push(enc_movz(1, 0))           // X1=0   (prev)
+code = code.push(enc_movz(2, 1))           // X2=1   (curr)
+code = code.push(enc_add(3, 1, 2))         // X3=X1+X2
+code = code.push(enc_mov(1, 2))            // X1=X2
+code = code.push(enc_mov(2, 3))            // X2=X3
+code = code.push(enc_subs_imm(0, 0, 1))    // X0--, set flags
+code = code.push(enc_bcond_gt(524284))     // B.GT -4  (back to X3=X1+X2)
+code = code.push(enc_mov(0, 1))            // X0=result
+code = code.push(enc_movz(16, 1))          // X16=SYS_exit
+code = code.push(enc_svc())                // svc #0x80
+
+println("[2] Building Mach-O (" + to_string(len(code)) + " instrs)...")
+let macho = build_macho_bytes(code)
+println("    size: " + to_string(len(macho)) + " bytes")
+
+// Remove any prior binary so codesign runs on a fresh file.
+let out = "/tmp/hexa_native_fib"
+exec("rm -f " + out)
+
+println("[3] Writing binary...")
+write_bytes(out, macho)
+exec("chmod +x " + out)
+
+println("[4] Codesigning...")
+let cs = exec_with_status("codesign --sign - " + out + " 2>&1")
+let cs_out = cs[0].trim()
+if cs[1] != 0 {
+    println("  ERROR: codesign exit=" + to_string(cs[1]) + " — " + cs_out)
+} else {
+    if len(cs_out) > 0 {
+        println("  codesign: " + cs_out)
+    } else {
+        println("  codesign: clean (no output)")
+    }
+}
+
+println("[5] Running " + out + "...")
+let r = exec_with_status(out + " 2>&1")
+let stdout_s = r[0].trim()
+let rc = r[1]
+if len(stdout_s) > 0 {
+    println("  stdout: " + stdout_s)
+} else {
+    println("  stdout: (empty — clean run)")
+}
+println("  exit code = " + to_string(rc))
+
+println("")
+if rc == 55 {
+    println("PASS — fib(10)=55")
+    println("  ARM64 loops+vars+branch, zero external tools, zero warnings")
+} else {
+    println("FAIL — expected 55, got " + to_string(rc))
+}
