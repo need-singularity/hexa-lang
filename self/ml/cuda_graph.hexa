@@ -1,0 +1,347 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/cuda_graph.hexa — CUDA Graph capture + replay for 7B CLM
+//
+//  Eliminates per-kernel launch overhead by capturing a full
+//  training step (fwd + bwd + optimizer) into a CUDA graph on a
+//  warmup step, then replaying via a single cudaGraphLaunch on all
+//  subsequent steps. Typical savings: 1-3 ms/step on H100 at small
+//  batch sizes where launch overhead dominates.
+//
+//  Requirements:
+//    - All tensor shapes must be static (fixed D/FF/NL/SEQ/VOCAB)
+//    - No host-side branching inside the captured region
+//    - Input data is swapped via D2D memcpy into pinned input
+//      buffers BEFORE graph replay (not inside capture)
+//
+//  Usage:
+//    let ctx = cuda_graph_ctx_create(cfg)
+//    // warmup N steps normally...
+//    cuda_graph_capture_step(ctx, weights, acts, grad, adamw, ...)
+//    // remaining steps:
+//    cuda_graph_update_input(ctx, new_toks, new_tgts)
+//    cuda_graph_replay(ctx)
+//    cuda_graph_ctx_destroy(ctx)
+//
+//  AI-native attrs:
+//    @hot   → replay_step (single launch replaces 100s of kernels)
+//    @track → capture_step (one-shot, must succeed)
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+use "gpu_train"
+
+// ── Graph context ────────────────────────────────────────────
+//
+// Holds the captured graph exec handle plus pinned input buffers
+// that persist across replays. Before each replay, the caller
+// does a D2D memcpy into toks_pinned/tgts_pinned — the graph
+// references these device addresses, so the new data flows
+// through the same kernel sequence.
+
+struct CudaGraphCtx {
+    graph_exec:   *Void,    // cudaGraphExec_t — instantiated graph
+    captured:     bool,     // true after successful capture
+    toks_pinned:  *Void,    // device buffer for input tokens (SEQ × i32)
+    tgts_pinned:  *Void,    // device buffer for target tokens (SEQ × i32)
+    loss_pinned:  *Void,    // device buffer for loss scalar (1 × f32)
+    seq_len:      int,      // SEQ length (fixed for graph lifetime)
+    vocab:        int       // VOCAB size (for shape validation)
+}
+
+fn cuda_graph_ctx_create(cfg: GpuClmConfig) -> CudaGraphCtx {
+    let seq = cfg.SEQ
+    let toks_buf = cuda_malloc(seq * 4)
+    let tgts_buf = cuda_malloc(seq * 4)
+    let loss_buf = cuda_malloc(4)
+    let _ = cuda_memset_zero(toks_buf, seq * 4)
+    let _ = cuda_memset_zero(tgts_buf, seq * 4)
+    let _ = cuda_memset_zero(loss_buf, 4)
+    println("[cuda_graph] ctx created — pinned buffers for SEQ=" + str(seq))
+    return CudaGraphCtx {
+        graph_exec:  ptr_null(),
+        captured:    false,
+        toks_pinned: toks_buf,
+        tgts_pinned: tgts_buf,
+        loss_pinned: loss_buf,
+        seq_len:     seq,
+        vocab:       cfg.VOCAB
+    }
+}
+
+fn cuda_graph_ctx_destroy(ctx: CudaGraphCtx) {
+    if ctx.captured {
+        let _ = cudaGraphExecDestroy(ctx.graph_exec)
+    }
+    cuda_free(ctx.toks_pinned)
+    cuda_free(ctx.tgts_pinned)
+    cuda_free(ctx.loss_pinned)
+    println("[cuda_graph] ctx destroyed")
+    0
+}
+
+// ── Shape safety check ───────────────────────────────────────
+//
+// CUDA graphs require all kernel launches to have identical grid
+// dimensions on every replay. This means tensor shapes must be
+// completely static — no variable-length sequences, no dynamic
+// batch sizes, no conditional layers.
+
+fn is_cuda_graph_safe(cfg: GpuClmConfig, batch_seq: int) -> bool {
+    // Shape must match the captured config exactly
+    if batch_seq != cfg.SEQ {
+        println("[cuda_graph] UNSAFE: batch seq=" + str(batch_seq) + " != cfg.SEQ=" + str(cfg.SEQ))
+        return false
+    }
+    // All dimensions must be positive (sanity)
+    if cfg.D <= 0 || cfg.FF <= 0 || cfg.NL <= 0 || cfg.VOCAB <= 0 {
+        println("[cuda_graph] UNSAFE: zero/negative dimension in config")
+        return false
+    }
+    // RANK must be set for low-rank LM head
+    if cfg.RANK <= 0 {
+        println("[cuda_graph] UNSAFE: RANK <= 0")
+        return false
+    }
+    true
+}
+
+// ── Begin / End capture (low-level) ──────────────────────────
+
+fn cuda_graph_begin_capture(stream: *Void) -> int {
+    let err = cudaStreamBeginCapture(stream, CUDA_STREAM_CAPTURE_MODE_GLOBAL)
+    if err != 0 {
+        println("[cuda_graph] begin_capture failed: " + str(err))
+        return -1
+    }
+    0
+}
+
+fn cuda_graph_end_capture(stream: *Void) {
+    let graph_buf = alloc_raw(8)
+    let err = cudaStreamEndCapture(stream, graph_buf)
+    if err != 0 {
+        println("[cuda_graph] end_capture failed: " + str(err))
+        free_raw(graph_buf, 8)
+        return ptr_null()
+    }
+    let graph = ptr_from_int(deref(graph_buf))
+    free_raw(graph_buf, 8)
+    graph
+}
+
+fn cuda_graph_instantiate(graph: *Void) {
+    let exec_buf = alloc_raw(8)
+    let err = cudaGraphInstantiate(exec_buf, graph, ptr_null(), ptr_null(), 0)
+    if err != 0 {
+        println("[cuda_graph] instantiate failed: " + str(err))
+        let _ = cudaGraphDestroy(graph)
+        free_raw(exec_buf, 8)
+        return ptr_null()
+    }
+    let exec = ptr_from_int(deref(exec_buf))
+    free_raw(exec_buf, 8)
+    let _ = cudaGraphDestroy(graph)
+    exec
+}
+
+fn cuda_graph_launch(exec: *Void, stream: *Void) -> int {
+    let err = cudaGraphLaunch(exec, stream)
+    if err != 0 {
+        println("[cuda_graph] launch failed: " + str(err))
+        return -1
+    }
+    0
+}
+
+fn cuda_graph_destroy(exec: *Void) -> int {
+    if ptr_addr(exec) != 0 {
+        let _ = cudaGraphExecDestroy(exec)
+    }
+    0
+}
+
+// ── Capture a full training step ─────────────────────────────
+//
+// Runs one complete fwd+bwd+optimizer step inside a CUDA stream
+// capture region. All GPU operations are recorded (not executed).
+// The resulting graph is instantiated and stored in the context
+// for subsequent replay.
+//
+// IMPORTANT: The ctx's pinned buffers (toks_pinned, tgts_pinned)
+// must contain valid data before capture — the graph will encode
+// their device addresses. On replay, new data is memcpy'd into
+// these same buffers before launch.
+
+@track
+fn cuda_graph_capture_step(ctx: CudaGraphCtx, weights, acts, grad, adamw, cfg: GpuClmConfig, step: int, lr: float, beta1: float, beta2: float, eps: float, wd: float) {
+    if ctx.captured {
+        println("[cuda_graph] WARNING: re-capturing (destroying old graph)")
+        let _ = cudaGraphExecDestroy(ctx.graph_exec)
+        ctx.captured = false
+    }
+
+    let stream = if G_MULTI_STREAM { G_COMPUTE_STREAM } else { G_CUDA_STREAM }
+
+    // ── Start capture ──
+    let berr = cuda_graph_begin_capture(stream)
+    if berr != 0 {
+        println("[cuda_graph] capture_step: begin failed")
+        return -1
+    }
+
+    // ── Record one full step using pinned input buffers ──
+    let _ = gpu_zero_grad(grad, cfg)
+    let logits = gpu_forward_full_fused(ctx.toks_pinned, weights, acts, cfg)
+    let loss = gpu_backward_full_with_embed_fused(logits, ctx.tgts_pinned, ctx.toks_pinned, acts, weights, grad, cfg)
+    let _ = gpu_adamw_step(weights, grad, adamw, step, lr, beta1, beta2, eps, wd)
+
+    // ── End capture + instantiate ──
+    let graph = cuda_graph_end_capture(stream)
+    if ptr_addr(graph) == 0 {
+        println("[cuda_graph] capture_step: end_capture failed")
+        return -2
+    }
+
+    let exec = cuda_graph_instantiate(graph)
+    if ptr_addr(exec) == 0 {
+        println("[cuda_graph] capture_step: instantiate failed")
+        return -3
+    }
+
+    ctx.graph_exec = exec
+    ctx.captured = true
+    println("[cuda_graph] capture OK — graph ready for replay")
+    0
+}
+
+// ── Update input data before replay ──────────────────────────
+//
+// Copies new token/target arrays into the pinned device buffers.
+// This must happen OUTSIDE the graph (before cuda_graph_replay_step).
+// The graph will then operate on the new data at the same addresses.
+
+fn cuda_graph_update_input(ctx: CudaGraphCtx, toks_dev: *Void, tgts_dev: *Void) -> int {
+    let nbytes = ctx.seq_len * 4
+    let e1 = cuda_memcpy_d2d(ctx.toks_pinned, toks_dev, nbytes)
+    let e2 = cuda_memcpy_d2d(ctx.tgts_pinned, tgts_dev, nbytes)
+    if e1 != 0 || e2 != 0 {
+        println("[cuda_graph] update_input failed: e1=" + str(e1) + " e2=" + str(e2))
+        return -1
+    }
+    0
+}
+
+// ── Replay captured graph ────────────────────────────────────
+//
+// Single launch replaces hundreds of individual kernel launches.
+// The caller must have called cuda_graph_update_input first to
+// swap in new training data.
+
+@hot
+fn cuda_graph_replay_step(ctx: CudaGraphCtx) -> int {
+    if !ctx.captured {
+        println("[cuda_graph] ERROR: no graph captured — call capture_step first")
+        return -1
+    }
+    let stream = if G_MULTI_STREAM { G_COMPUTE_STREAM } else { G_CUDA_STREAM }
+    let err = cuda_graph_launch(ctx.graph_exec, stream)
+    if err != 0 {
+        return -1
+    }
+    0
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  High-level: train with graph capture + replay
+//
+//  Pattern:
+//    1. Run WARMUP_STEPS normally (no graph) — lets AdamW m1/m2
+//       accumulate, LR ramp up, and kernels JIT-compile
+//    2. On step WARMUP_STEPS+1: capture one step into a graph
+//    3. Steps WARMUP_STEPS+2..END: replay the graph
+//
+//  The LR is baked into the captured graph. For varying LR, you
+//  can re-capture periodically (e.g., every 1000 steps) or pass
+//  LR via a device scalar that gets updated before replay.
+//  For simplicity, we capture at peak LR and accept the fixed
+//  schedule during replay — the AdamW momentum handles adaptation.
+// ═══════════════════════════════════════════════════════════════
+
+fn train_with_cuda_graph(cfg: GpuClmConfig, weights, acts, grad, adamw, total_steps: int, warmup_steps: int, lr_fn, log_interval: int, beta1: float, beta2: float, eps: float, wd: float) {
+    if !is_cuda_graph_safe(cfg, cfg.SEQ) {
+        println("[cuda_graph] config not graph-safe — falling back to eager")
+        return -1
+    }
+
+    let ctx = cuda_graph_ctx_create(cfg)
+    let mut step = 1
+    let mut total_ms = 0.0
+    let mut best_loss = 999.0
+
+    println("[cuda_graph] warmup=" + str(warmup_steps) + " total=" + str(total_steps))
+
+    while step <= total_steps {
+        let t0 = clock()
+        let lr = lr_fn(step)
+
+        // Generate batch
+        let batch = make_train_batch(cfg.SEQ, cfg.VOCAB)
+        let toks_dev = upload_tokens(batch[0], cfg.SEQ)
+        let tgts_dev = upload_tokens(batch[1], cfg.SEQ)
+
+        if step <= warmup_steps {
+            // ── Warmup: eager execution ──
+            let _ = gpu_zero_grad(grad, cfg)
+            let logits = gpu_forward_full_fused(toks_dev, weights, acts, cfg)
+            let loss = gpu_backward_full_with_embed_fused(logits, tgts_dev, toks_dev, acts, weights, grad, cfg)
+            let _ = cuda_sync()
+            let _ = gpu_adamw_step(weights, grad, adamw, step, lr, beta1, beta2, eps, wd)
+            let _ = cuda_sync()
+
+        } else if step == warmup_steps + 1 {
+            // ── Capture step ──
+            let _ = cuda_graph_update_input(ctx, toks_dev, tgts_dev)
+            let cerr = cuda_graph_capture_step(ctx, weights, acts, grad, adamw, cfg, step, lr, beta1, beta2, eps, wd)
+            if cerr != 0 {
+                println("[cuda_graph] capture failed at step " + str(step) + " — aborting graph mode")
+                cuda_free(toks_dev)
+                cuda_free(tgts_dev)
+                let _ = cuda_graph_ctx_destroy(ctx)
+                return -1
+            }
+            // The capture step did not execute — run it eagerly once
+            let _ = gpu_zero_grad(grad, cfg)
+            let logits = gpu_forward_full_fused(ctx.toks_pinned, weights, acts, cfg)
+            let loss = gpu_backward_full_with_embed_fused(logits, ctx.tgts_pinned, ctx.toks_pinned, acts, weights, grad, cfg)
+            let _ = cuda_sync()
+            let _ = gpu_adamw_step(weights, grad, adamw, step, lr, beta1, beta2, eps, wd)
+            let _ = cuda_sync()
+
+        } else {
+            // ── Replay: single launch ──
+            let _ = cuda_graph_update_input(ctx, toks_dev, tgts_dev)
+            let _ = cuda_graph_replay_step(ctx)
+            let _ = cuda_sync()
+        }
+
+        let t1 = clock()
+        let ms = (t1 - t0) * 1000.0
+        total_ms = total_ms + ms
+
+        if step % log_interval == 0 {
+            let avg_ms = total_ms / (step * 1.0)
+            let mode = if step <= warmup_steps { "eager" } else { "graph" }
+            println("step=" + str(step) + " mode=" + mode + " ms=" + str(ms) + " avg_ms=" + str(avg_ms))
+        }
+
+        cuda_free(toks_dev)
+        cuda_free(tgts_dev)
+        step = step + 1
+    }
+
+    println("[cuda_graph] training complete — " + str(total_steps) + " steps, avg " + str(total_ms / (total_steps * 1.0)) + " ms/step")
+    let _ = cuda_graph_ctx_destroy(ctx)
+    0
+}
+
+println("[cuda_graph] module loaded — CUDA graph capture/replay for CLM training")

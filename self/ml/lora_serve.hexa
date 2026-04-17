@@ -1,0 +1,317 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/lora_serve.hexa — LoRA adapter hot-swap for inference
+//
+//  Loads LoRA adapters from .hexaw files at runtime and applies them
+//  to base model weights without server restart. Enables serving
+//  multiple fine-tuned models from a single base checkpoint.
+//
+//  LoRA math: W_eff = W_base + (alpha / rank) * B @ A
+//  Convention: A weights = [rank, d_in], B weights = [d_out, rank]
+//    (matches train_7b.hexa: U = A side, V = B side)
+//
+//  .hexaw tensor naming for LoRA adapters:
+//    lora.layers.<L>.attn_q.A   shape [rank, dim]
+//    lora.layers.<L>.attn_q.B   shape [dim, rank]
+//    lora.layers.<L>.attn_k.A   ...
+//    lora.layers.<L>.attn_k.B
+//    lora.layers.<L>.attn_v.A / .B
+//    lora.layers.<L>.attn_o.A / .B
+//    lora.layers.<L>.ffn_gate.A / .B
+//    lora.layers.<L>.ffn_up.A / .B
+//    lora.layers.<L>.ffn_down.A / .B
+//
+//  Public API:
+//    load_lora(path) -> LoraAdapter
+//    unload_lora(adapter) -> nil
+//    apply_lora_delta(base_ptr, adapter, layer_idx, weight_name, rows, cols) -> patched_ptr
+//    lora_registry_new() -> dict
+//    register_lora(registry, name, path) -> bool
+//    remove_lora(registry, name) -> bool
+//    lora_forward_patch(base_ptr, registry, active_name, layer_idx, wname, rows, cols) -> ptr
+//
+//  AI-native attrs:
+//    @hot    apply_lora_delta (per-token hot path)
+//    @pure   lora_scale
+// ═══════════════════════════════════════════════════════════════════
+
+use "self/ml/hexaw.hexa"
+
+// ── LoRA weight pair for one projection in one layer ──────────────
+struct LoraLayerWeight {
+    A: array,       // [rank, d_in] — flat float array
+    B: array,       // [d_out, rank] — flat float array
+    d_in: int,
+    d_out: int
+}
+
+// ── Per-layer LoRA weights (7 projections) ────────────────────────
+struct LoraLayerWeights {
+    attn_q: LoraLayerWeight,
+    attn_k: LoraLayerWeight,
+    attn_v: LoraLayerWeight,
+    attn_o: LoraLayerWeight,
+    ffn_gate: LoraLayerWeight,
+    ffn_up: LoraLayerWeight,
+    ffn_down: LoraLayerWeight
+}
+
+// ── Full adapter ──────────────────────────────────────────────────
+struct LoraAdapter {
+    name: string,
+    rank: int,
+    alpha: float,
+    n_layers: int,
+    layers: array       // [LoraLayerWeights]
+}
+
+// ── Scale factor ──────────────────────────────────────────────────
+@pure
+fn lora_scale(alpha, rank) {
+    return alpha / to_float(rank)
+}
+
+// ── Load one weight pair from hexaw record ────────────────────────
+fn _load_pair(hxw, prefix, rank, d_in, d_out) {
+    let a_name = prefix + ".A"
+    let b_name = prefix + ".B"
+    let a_data = hexaw_tensor(hxw, a_name)
+    let b_data = hexaw_tensor(hxw, b_name)
+    if a_data == nil || b_data == nil {
+        // Missing pair — return zeros (adapter doesn't touch this projection)
+        let mut a_zeros = []
+        let mut i = 0
+        while i < rank * d_in {
+            a_zeros.push(0.0)
+            i = i + 1
+        }
+        let mut b_zeros = []
+        i = 0
+        while i < d_out * rank {
+            b_zeros.push(0.0)
+            i = i + 1
+        }
+        return LoraLayerWeight { A: a_zeros, B: b_zeros, d_in: d_in, d_out: d_out }
+    }
+    return LoraLayerWeight { A: a_data, B: b_data, d_in: d_in, d_out: d_out }
+}
+
+// ── Load adapter from .hexaw file ─────────────────────────────────
+fn load_lora(path) {
+    let hxw = hexaw_load(path)
+    let names = hxw.names
+    if len(names) == 0 {
+        println("[lora] ERROR: empty adapter file " + path)
+        return nil
+    }
+
+    // Detect rank + n_layers from metadata tensors
+    let mut rank = 4
+    let mut alpha = 1.0
+    let mut n_layers = 0
+
+    // Try reading metadata tensors (single-element)
+    let rank_t = hexaw_tensor(hxw, "lora.meta.rank")
+    if rank_t != nil {
+        if len(rank_t) > 0 {
+            rank = to_int(rank_t[0])
+        }
+    }
+    let alpha_t = hexaw_tensor(hxw, "lora.meta.alpha")
+    if alpha_t != nil {
+        if len(alpha_t) > 0 {
+            alpha = alpha_t[0]
+        }
+    }
+    let nlayer_t = hexaw_tensor(hxw, "lora.meta.n_layers")
+    if nlayer_t != nil {
+        if len(nlayer_t) > 0 {
+            n_layers = to_int(nlayer_t[0])
+        }
+    }
+
+    // Fallback: scan names for max layer index
+    if n_layers == 0 {
+        let mut i = 0
+        while i < len(names) {
+            let nm = names[i]
+            if nm.starts_with("lora.layers.") {
+                let parts = nm.split(".")
+                if len(parts) >= 3 {
+                    let li = to_int(parts[2])
+                    if (li + 1) > n_layers {
+                        n_layers = li + 1
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    if n_layers == 0 {
+        println("[lora] ERROR: no layer weights found in " + path)
+        return nil
+    }
+
+    println("[lora] Loading adapter: rank=" + str(rank) + " alpha=" + str(alpha) + " layers=" + str(n_layers))
+
+    // Infer dimensions from first available A tensor
+    let probe = hexaw_tensor(hxw, "lora.layers.0.attn_q.A")
+    let mut dim = 4096
+    if probe != nil {
+        dim = len(probe) / rank
+    }
+    // FFN dim heuristic: 4x base dim (LLaMA convention)
+    let mut ff_dim = dim * 4
+
+    let probe_gate = hexaw_tensor(hxw, "lora.layers.0.ffn_gate.A")
+    if probe_gate != nil {
+        ff_dim = len(probe_gate) / rank
+    }
+
+    // Load all layers
+    let mut layers = []
+    let mut li = 0
+    while li < n_layers {
+        let prefix = "lora.layers." + str(li)
+        let lw = LoraLayerWeights {
+            attn_q:   _load_pair(hxw, prefix + ".attn_q",    rank, dim, dim),
+            attn_k:   _load_pair(hxw, prefix + ".attn_k",    rank, dim, dim),
+            attn_v:   _load_pair(hxw, prefix + ".attn_v",    rank, dim, dim),
+            attn_o:   _load_pair(hxw, prefix + ".attn_o",    rank, dim, dim),
+            ffn_gate: _load_pair(hxw, prefix + ".ffn_gate",  rank, dim, ff_dim),
+            ffn_up:   _load_pair(hxw, prefix + ".ffn_up",    rank, dim, ff_dim),
+            ffn_down: _load_pair(hxw, prefix + ".ffn_down",  rank, ff_dim, dim)
+        }
+        layers.push(lw)
+        li = li + 1
+    }
+
+    let adapter = LoraAdapter {
+        name: path,
+        rank: rank,
+        alpha: alpha,
+        n_layers: n_layers,
+        layers: layers
+    }
+    println("[lora] Loaded " + str(n_layers) + " layers from " + path)
+    return adapter
+}
+
+// ── Free adapter memory ───────────────────────────────────────────
+fn unload_lora(adapter) {
+    if adapter == nil { return }
+    println("[lora] Unloaded adapter: " + adapter.name)
+    // GC handles array dealloc — just drop references
+}
+
+// ── Apply LoRA delta to a bf16 matvec result ──────────────────────
+//  base_result: f32 ptr from bf16_matvec (length = rows)
+//  input_vec:   f32 ptr of the input vector (length = cols)
+//  lw:          LoraLayerWeight { A: [rank, cols], B: [rows, rank] }
+//  Computes: base_result += scale * B @ (A @ input_vec)
+//  This avoids materializing the full [rows, cols] delta matrix.
+
+@hot
+fn apply_lora_delta(base_result_ptr, input_vec_ptr, lw, rank, scale, rows, cols) {
+    // Step 1: intermediate = A @ input_vec  -> [rank]
+    let mut intermediate = []
+    let mut r = 0
+    while r < rank {
+        let mut dot = 0.0
+        let mut c = 0
+        while c < cols {
+            let a_val = lw.A[r * cols + c]
+            let x_val = deref_f32(input_vec_ptr, c * 4)
+            dot = dot + a_val * x_val
+            c = c + 1
+        }
+        intermediate.push(dot)
+        r = r + 1
+    }
+
+    // Step 2: base_result += scale * B @ intermediate
+    let mut i = 0
+    while i < rows {
+        let mut dot = 0.0
+        let mut r2 = 0
+        while r2 < rank {
+            dot = dot + lw.B[i * rank + r2] * intermediate[r2]
+            r2 = r2 + 1
+        }
+        let cur = deref_f32(base_result_ptr, i * 4)
+        write_f32(base_result_ptr, i * 4, cur + scale * dot)
+        i = i + 1
+    }
+}
+
+// ── Registry: manage multiple named adapters ──────────────────────
+
+fn lora_registry_new() {
+    return #{}
+}
+
+fn register_lora(registry, name, path) {
+    let adapter = load_lora(path)
+    if adapter == nil {
+        println("[lora] Failed to register '" + name + "' from " + path)
+        return false
+    }
+    adapter.name = name
+    registry[name] = adapter
+    println("[lora] Registered adapter '" + name + "'")
+    return true
+}
+
+fn remove_lora(registry, name) {
+    let adapter = registry[name]
+    if adapter == nil {
+        println("[lora] No adapter named '" + name + "'")
+        return false
+    }
+    unload_lora(adapter)
+    registry[name] = nil
+    println("[lora] Removed adapter '" + name + "'")
+    return true
+}
+
+fn list_lora(registry) {
+    let mut names = []
+    let keys = dict_keys(registry)
+    let mut i = 0
+    while i < len(keys) {
+        let k = keys[i]
+        if registry[k] != nil {
+            names.push(k)
+        }
+        i = i + 1
+    }
+    return names
+}
+
+// ── Lookup helper: resolve projection name to LoraLayerWeight ─────
+
+fn _get_lora_weight(lora_layer, wname) {
+    if wname == "wq" || wname == "attn_q" { return lora_layer.attn_q }
+    if wname == "wk" || wname == "attn_k" { return lora_layer.attn_k }
+    if wname == "wv" || wname == "attn_v" { return lora_layer.attn_v }
+    if wname == "wo" || wname == "attn_o" { return lora_layer.attn_o }
+    if wname == "w_gate" || wname == "ffn_gate" { return lora_layer.ffn_gate }
+    if wname == "w_up" || wname == "ffn_up"     { return lora_layer.ffn_up }
+    if wname == "w_down" || wname == "ffn_down" { return lora_layer.ffn_down }
+    return nil
+}
+
+// ── Patch a bf16 matvec result in-place with active LoRA ──────────
+//  Call this right after bf16_matvec in the transformer layer.
+//  base_ptr:  f32 result from bf16_matvec (rows elements)
+//  input_ptr: f32 input vector that was fed to bf16_matvec (cols elements)
+
+fn lora_forward_patch(base_ptr, input_ptr, adapter, layer_idx, wname, rows, cols) {
+    if adapter == nil { return }
+    if layer_idx >= adapter.n_layers { return }
+    let lora_lw = adapter.layers[layer_idx]
+    let lw = _get_lora_weight(lora_lw, wname)
+    if lw == nil { return }
+    let scale = lora_scale(adapter.alpha, adapter.rank)
+    apply_lora_delta(base_ptr, input_ptr, lw, adapter.rank, scale, rows, cols)
+}

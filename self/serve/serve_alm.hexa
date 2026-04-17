@@ -39,6 +39,7 @@ use "self/ml/hxblas_bf16.hexa"
 use "self/ml/hxmetal.hexa"
 use "self/ml/sampler.hexa"
 use "self/ml/hexaw.hexa"
+use "self/ml/lora_serve.hexa"
 
 // ── Psi constants ──────────────────────────────────────────────────
 let PSI_ALPHA      = 0.014
@@ -201,6 +202,8 @@ let mut g_use_metal       = false
 let mut g_model           = nil
 let mut g_kv_cache        = nil
 let mut g_sampler_cfg     = nil
+let mut g_lora_registry   = lora_registry_new()
+let mut g_lora_active     = nil
 
 // ── bf16 weight pack helpers ───────────────────────────────────────
 
@@ -449,10 +452,13 @@ fn alm_transformer_layer(model, layer_idx, x_ptr, pos, kv_cache, use_metal) {
     let xn = alloc_raw(dim * 4)
     alm_rms_norm(x_ptr, lw.attn_norm, xn, dim, eps)
 
-    // 1b. Q/K/V projection via bf16 matvec
+    // 1b. Q/K/V projection via bf16 matvec + LoRA delta
     let q_ptr = bf16_matvec(dim, dim, lw.wq, xn)
+    lora_forward_patch(q_ptr, xn, g_lora_active, layer_idx, "wq", dim, dim)
     let k_ptr = bf16_matvec(kv_dim, dim, lw.wk, xn)
+    lora_forward_patch(k_ptr, xn, g_lora_active, layer_idx, "wk", kv_dim, dim)
     let v_ptr = bf16_matvec(kv_dim, dim, lw.wv, xn)
+    lora_forward_patch(v_ptr, xn, g_lora_active, layer_idx, "wv", kv_dim, dim)
     free_raw(xn, dim * 4)
 
     // 1c. RoPE on Q and K
@@ -536,8 +542,9 @@ fn alm_transformer_layer(model, layer_idx, x_ptr, pos, kv_cache, use_metal) {
     }
     free_raw(q_ptr, dim * 4)
 
-    // 1f. Output projection: Wo[dim, dim] bf16 x attn_out[dim] f32 -> [dim] f32
+    // 1f. Output projection: Wo + LoRA
     let attn_proj = bf16_matvec(dim, dim, lw.wo, attn_out)
+    lora_forward_patch(attn_proj, attn_out, g_lora_active, layer_idx, "wo", dim, dim)
     free_raw(attn_out, dim * 4)
 
     // 1g. Residual connection: x += attn_proj
@@ -583,9 +590,11 @@ fn alm_transformer_layer(model, layer_idx, x_ptr, pos, kv_cache, use_metal) {
         alm_residual_add(x_ptr, ffn_out, dim)
         free_raw(ffn_out, dim * 4)
     } else {
-        // ── CPU path: SwiGLU FFN (bf16 matvec) ────────────────────
+        // ── CPU path: SwiGLU FFN (bf16 matvec) + LoRA ─────────────
         let gate = bf16_matvec(hidden_dim, dim, lw.w_gate, xn2)
+        lora_forward_patch(gate, xn2, g_lora_active, layer_idx, "w_gate", hidden_dim, dim)
         let up = bf16_matvec(hidden_dim, dim, lw.w_up, xn2)
+        lora_forward_patch(up, xn2, g_lora_active, layer_idx, "w_up", hidden_dim, dim)
         free_raw(xn2, dim * 4)
 
         alm_silu_inplace(gate, hidden_dim)
@@ -593,6 +602,7 @@ fn alm_transformer_layer(model, layer_idx, x_ptr, pos, kv_cache, use_metal) {
         free_raw(up, hidden_dim * 4)
 
         let down = bf16_matvec(dim, hidden_dim, lw.w_down, gate)
+        lora_forward_patch(down, gate, g_lora_active, layer_idx, "w_down", dim, hidden_dim)
         free_raw(gate, hidden_dim * 4)
 
         alm_residual_add(x_ptr, down, dim)
@@ -1005,6 +1015,98 @@ fn alm_router(request) {
         if path == "/consciousness" {
             return json_ok(alm_consciousness_state())
         }
+
+        // ── LoRA hot-swap endpoints ───────────────────────────────
+        if path == "/lora/load" {
+            let body = request["body"]
+            if body == nil || body == "" {
+                return json_error(400, "empty body")
+            }
+            let data = json_parse(body)
+            if data == nil {
+                return json_error(400, "invalid JSON")
+            }
+            let lname = data["name"]
+            let lpath = data["path"]
+            if lname == nil || lpath == nil {
+                return json_error(400, "need 'name' and 'path' fields")
+            }
+            let ok = register_lora(g_lora_registry, lname, lpath)
+            if !ok {
+                return json_error(500, "failed to load LoRA adapter")
+            }
+            let r = #{}
+            r["status"] = "loaded"
+            r["name"] = lname
+            return json_ok(r)
+        }
+
+        if path == "/lora/activate" {
+            let body = request["body"]
+            if body == nil || body == "" {
+                return json_error(400, "empty body")
+            }
+            let data = json_parse(body)
+            if data == nil {
+                return json_error(400, "invalid JSON")
+            }
+            let lname = data["name"]
+            if lname == nil {
+                g_lora_active = nil
+                let r = #{}
+                r["status"] = "deactivated"
+                return json_ok(r)
+            }
+            let adapter = g_lora_registry[lname]
+            if adapter == nil {
+                return json_error(404, "adapter '" + lname + "' not found")
+            }
+            g_lora_active = adapter
+            let r = #{}
+            r["status"] = "activated"
+            r["name"] = lname
+            r["rank"] = adapter.rank
+            r["alpha"] = adapter.alpha
+            r["layers"] = adapter.n_layers
+            return json_ok(r)
+        }
+
+        if path == "/lora/remove" {
+            let body = request["body"]
+            if body == nil || body == "" {
+                return json_error(400, "empty body")
+            }
+            let data = json_parse(body)
+            if data == nil {
+                return json_error(400, "invalid JSON")
+            }
+            let lname = data["name"]
+            if lname == nil {
+                return json_error(400, "need 'name' field")
+            }
+            if g_lora_active != nil {
+                if g_lora_active.name == lname {
+                    g_lora_active = nil
+                }
+            }
+            remove_lora(g_lora_registry, lname)
+            let r = #{}
+            r["status"] = "removed"
+            r["name"] = lname
+            return json_ok(r)
+        }
+
+        if path == "/lora/list" {
+            let names = list_lora(g_lora_registry)
+            let mut active_name = ""
+            if g_lora_active != nil {
+                active_name = g_lora_active.name
+            }
+            let r = #{}
+            r["adapters"] = names
+            r["active"] = active_name
+            return json_ok(r)
+        }
     }
 
     return json_error(404, "not found")
@@ -1064,6 +1166,11 @@ fn serve_alm_start(ckpt_path, port, base_model, no_metal) {
     println("  port:       " + str(port))
     println("  base:       " + base_model)
     println("  metal:      " + str(!no_metal))
+    let mut lora_info = "none"
+    if g_lora_active != nil {
+        lora_info = g_lora_active.name + " (rank=" + str(g_lora_active.rank) + ")"
+    }
+    println("  lora:       " + lora_info)
     println("============================================================")
 
     if !alm_init(ckpt_path, base_model, no_metal) {
@@ -1073,8 +1180,12 @@ fn serve_alm_start(ckpt_path, port, base_model, no_metal) {
 
     println("")
     println("[alm] Endpoints:")
-    println("  POST /generate       — text generation (bf16 inference)")
+    println("  POST /generate       — text generation (bf16 inference + LoRA)")
     println("  POST /consciousness  — consciousness state (phi, tension, psi)")
+    println("  POST /lora/load      — load LoRA adapter into registry")
+    println("  POST /lora/activate  — activate/deactivate LoRA adapter")
+    println("  POST /lora/remove    — remove adapter from registry")
+    println("  POST /lora/list      — list adapters + active name")
     println("  GET  /health         — model info + uptime + stats")
     println("  GET  /version        — engine version info")
     println("")
@@ -1120,13 +1231,14 @@ fn _print_help() {
     println("  --ckpt <path>   Path to .hexaw checkpoint (required)")
     println("  --port <N>      Listen port (default: 8090)")
     println("  --base <model>  Base model name (default: Qwen/Qwen2.5-14B-Instruct)")
+    println("  --lora <path>   Load LoRA adapter on startup (.hexaw)")
     println("  --no-metal      Disable Metal GPU, use CPU bf16 only")
     println("  --help          Show this help")
     println("")
     println("Inference pipeline:")
     println("  1. Weights loaded as bf16 (2 bytes/param) via hxblas")
-    println("  2. Attention: CPU bf16 matvec (Q/K/V proj + GQA)")
-    println("  3. FFN: Metal GPU (fused GELU matmul) or CPU bf16 fallback")
+    println("  2. Attention: CPU bf16 matvec (Q/K/V proj + GQA) + LoRA delta")
+    println("  3. FFN: Metal GPU (fused GELU matmul) or CPU bf16 fallback + LoRA delta")
     println("  4. Sampling: temperature + top-k + top-p")
     println("")
     println("Endpoints:")
@@ -1135,6 +1247,10 @@ fn _print_help() {
     println("           \"top_p\":0.9, \"top_k\":50}")
     println("")
     println("  POST /consciousness  Consciousness state (phi, tension, psi)")
+    println("  POST /lora/load      Load adapter: {\"name\":\"x\",\"path\":\"...\"}")
+    println("  POST /lora/activate  Activate: {\"name\":\"x\"} or {} to deactivate")
+    println("  POST /lora/remove    Remove: {\"name\":\"x\"}")
+    println("  POST /lora/list      List loaded adapters + active name")
     println("  GET  /health         Model info + uptime + request stats")
     println("  GET  /version        Engine version info")
     println("")
@@ -1158,6 +1274,7 @@ if _cli_has(av, n_av, "--help") {
     let ckpt = _cli_flag(av, n_av, "--ckpt", "")
     let port_str = _cli_flag(av, n_av, "--port", str(DEFAULT_PORT))
     let base = _cli_flag(av, n_av, "--base", "Qwen/Qwen2.5-14B-Instruct")
+    let lora_path = _cli_flag(av, n_av, "--lora", "")
     let no_metal = _cli_has(av, n_av, "--no-metal")
     let port = to_int(port_str)
 
@@ -1166,6 +1283,17 @@ if _cli_has(av, n_av, "--help") {
         println("")
         _print_help()
     } else {
+        // Load LoRA adapter on startup if --lora given
+        if lora_path != "" {
+            println("[serve_alm] Loading startup LoRA adapter: " + lora_path)
+            let ok = register_lora(g_lora_registry, "default", lora_path)
+            if ok {
+                g_lora_active = g_lora_registry["default"]
+                println("[serve_alm] LoRA adapter 'default' activated")
+            } else {
+                println("[serve_alm] WARNING: failed to load LoRA adapter, continuing without")
+            }
+        }
         serve_alm_start(ckpt, port, base, no_metal)
     }
 }
