@@ -5403,6 +5403,12 @@ pub let mut fn_attr_flags = []  // legacy flat array (kept for compat)
 // Same pattern as env_cache. Replaces linear memo_cache scan.
 pub let mut memo_cache = []    // 64 buckets; each bucket is [[key, val], ...]
 
+// ── @limit runtime — active call-count tracking ─────────
+// Flat [[name, count], ...] list. Singleton enforcement checks count==0
+// before entering body; increments on entry, decrements on exit. No load
+// threshold constants — system state (sysctl loadavg/ncpu) drives refusal.
+pub let mut active_fn_counts = []
+
 fn fn_attr_cache_init() {
     let mut buckets = []
     let mut i = 0
@@ -5499,6 +5505,74 @@ fn fn_attrs_get(name) {
         i = i - 1
     }
     return ""
+}
+
+// ── @limit: active call-count helpers ───────────────────
+fn active_fn_get(name) {
+    let mut i = 0
+    while i < len(active_fn_counts) {
+        if active_fn_counts[i][0] == name { return active_fn_counts[i][1] }
+        i = i + 1
+    }
+    return 0
+}
+
+fn active_fn_inc(name) {
+    let mut i = 0
+    while i < len(active_fn_counts) {
+        if active_fn_counts[i][0] == name {
+            active_fn_counts[i] = [name, active_fn_counts[i][1] + 1]
+            return 0
+        }
+        i = i + 1
+    }
+    active_fn_counts = active_fn_counts.push([name, 1])
+    return 0
+}
+
+fn active_fn_dec(name) {
+    let mut i = 0
+    while i < len(active_fn_counts) {
+        if active_fn_counts[i][0] == name {
+            let c = active_fn_counts[i][1]
+            if c > 0 { active_fn_counts[i] = [name, c - 1] }
+            return 0
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ── @limit: system-state readers (sysctl via exec passthrough) ──
+// Returns [load1, load5, load15] as floats. Parses "{ 1.23 2.34 3.45 }".
+// On parse failure returns [0.0, 0.0, 0.0] (caller treats as "no data").
+fn loadavg_triple() {
+    let raw = exec("sysctl -n vm.loadavg")
+    let mut l1 = 0.0
+    let mut l5 = 0.0
+    let mut l15 = 0.0
+    let s = raw.replace("{", " ").replace("}", " ").trim()
+    let parts = s.split(" ")
+    let mut idx = 0
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p != "" {
+            if idx == 0 { l1 = to_float(p) }
+            if idx == 1 { l5 = to_float(p) }
+            if idx == 2 { l15 = to_float(p) }
+            idx = idx + 1
+        }
+        i = i + 1
+    }
+    return [l1, l5, l15]
+}
+
+fn ncpus_detected() {
+    let raw = exec("sysctl -n hw.ncpu").trim()
+    let n = to_int(raw)
+    if n <= 0 { return 1 }
+    return n
 }
 
 // ── ROI-15: O(1) avg bitmask lookup via 64-bucket hash ──
@@ -8740,6 +8814,29 @@ fn call_user_fn(name, args) {
     if is_guard_fn {
         guard_start_ms = timestamp()
     }
+    // bit 8 (256): @limit — singleton + system-state refusal (pre-body gate)
+    // Self-calibrating: no hardcoded threshold. Refuses if (a) same fn already
+    // running (count>0) or (b) loadavg monotonically rising AND load1 > ncpus.
+    // Decrement happens post-body (paired with env_pop_scope tail).
+    let is_limit_fn = (attr_bits / 256) % 2 == 1
+    if is_limit_fn {
+        if active_fn_get(name) > 0 {
+            throw_val = val_str("@limit violation: " + name + " already active (singleton)")
+            throw_flag = true
+            return val_void()
+        }
+        let la = loadavg_triple()
+        let nc = ncpus_detected()
+        let l1 = la[0]
+        let l5 = la[1]
+        let l15 = la[2]
+        if l1 > l5 && l5 > l15 && l1 > to_float(to_string(nc)) {
+            throw_val = val_str("@limit refusal: " + name + " loadavg rising + oversubscribed")
+            throw_flag = true
+            return val_void()
+        }
+        active_fn_inc(name)
+    }
 
     let saved_flag = return_flag
     return_flag = false
@@ -8872,6 +8969,9 @@ fn call_user_fn(name, args) {
     let _arena_pop = env_var("__HEXA_ARENA_POP__")
     // ROI-14: O(1) call stack pop — index decrement, no slice/copy
     call_stack_top = call_stack_top - 1
+
+    // ── @limit: pair with pre-body increment ──
+    if is_limit_fn { active_fn_dec(name) }
 
     // ── @lazy: store result in thunk cache ──
     if is_lazy {
