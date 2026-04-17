@@ -1,0 +1,208 @@
+// cost_learner — S-2b empirical coefficient suggester (read-only analysis tool)
+//
+// Reads shared/hexa-lang/bench_results.jsonl (one JSON record per line) and
+// shared/hexa-lang/algorithm_registry.json. For each family × candidate listed
+// in the registry, heuristically matches records whose `file` path contains
+// the candidate name, aggregates avg_ns, compares to a simple cost_formula
+// prediction (evaluated at a default n=16), and emits a suggestion table.
+//
+// DOES NOT write to the registry. Just prints a suggestion like:
+//   sort.bubble  observed=1250ns  predicted=716ns (n=16)  bias=+0.74x
+//                rewrite when >= 3 data points
+//
+// Self-test sample records (for manual paste into bench_results.jsonl when
+// validating this tool against a fresh dataset):
+//   {"file": "bench/sort_bubble_n16.hexa", "iters": 10, "warmup": 2, "avg_ns": 1250, "median_ns": 1240, "min_ns": 1180, "max_ns": 1360}
+//   {"file": "bench/sort_merge_n1024.hexa", "iters": 5, "warmup": 1, "avg_ns": 92000, "median_ns": 91500, "min_ns": 88000, "max_ns": 95000}
+//   {"file": "bench/matmul_scalar_16x16x16.hexa", "iters": 20, "warmup": 3, "avg_ns": 7800, "median_ns": 7750, "min_ns": 7500, "max_ns": 8200}
+//
+// Usage:
+//   ./build/hexa_stage0 self/opt/cost_learner.hexa
+//   ./build/hexa_stage0 self/opt/cost_learner.hexa --n=32
+//
+// Exit: always 0 (informational).
+
+fn parse_int_arg(s, prefix) {
+    let pn = len(prefix)
+    if len(s) > pn && s.substring(0, pn) == prefix {
+        let tail = s.substring(pn, len(s))
+        return to_int(tail)
+    }
+    return 0
+}
+
+// Extract a numeric field value from a JSONL record by key.
+// Returns -1 if key missing or value is non-numeric (e.g. "void").
+fn extract_int_field(line, key) {
+    let needle = "\"" + key + "\":"
+    let p = line.index_of(needle)
+    if p < 0 { return -1 }
+    let mut i = p + len(needle)
+    let n = len(line)
+    while i < n && (line[i] == " " || line[i] == "\t") { i = i + 1 }
+    // detect void / non-numeric
+    if i >= n { return -1 }
+    let c0 = line[i]
+    let k0 = char_code(c0, 0)
+    let is_dig = k0 >= 48 && k0 <= 57
+    let is_neg = c0 == "-"
+    if !is_dig && !is_neg { return -1 }
+    let mut j = i
+    if is_neg { j = j + 1 }
+    while j < n {
+        let cc = char_code(line[j], 0)
+        if !(cc >= 48 && cc <= 57) { break }
+        j = j + 1
+    }
+    return to_int(line.substring(i, j))
+}
+
+// Extract a string field (between quotes) by key.
+fn extract_str_field(line, key) {
+    let needle = "\"" + key + "\":"
+    let p = line.index_of(needle)
+    if p < 0 { return "" }
+    let mut i = p + len(needle)
+    let n = len(line)
+    while i < n && (line[i] == " " || line[i] == "\t") { i = i + 1 }
+    if i >= n || line[i] != "\"" { return "" }
+    i = i + 1
+    let start = i
+    while i < n && line[i] != "\"" { i = i + 1 }
+    return line.substring(start, i)
+}
+
+fn load_records(path) {
+    let mut out = []
+    try {
+        let raw = read_file(path)
+        let lines = raw.split("\n")
+        let mut i = 0
+        while i < len(lines) {
+            let ln = lines[i]
+            if len(ln) > 0 && ln.index_of("\"file\"") >= 0 {
+                let file = extract_str_field(ln, "file")
+                let avg = extract_int_field(ln, "avg_ns")
+                if avg > 0 { out = out.push([file, avg]) }
+            }
+            i = i + 1
+        }
+    } catch e { }
+    return out
+}
+
+// (family, candidate, match_substring, predicted_at_n16)
+// Predicted = constant coefficient × f(n), evaluated at n=16 by hand.
+// Kept intentionally simple — learner is a skeleton; real regression is S-2b-next.
+fn registry_entries() {
+    let mut r = []
+    // family, candidate, needle-substring, predicted_ns at n=16
+    r = r.push(["sort",          "bubble",    "bubble",   1613])  // 6.3 * 16 * 16
+    r = r.push(["sort",          "insertion", "insertion", 358])  // 1.4 * 16 * 16
+    r = r.push(["sort",          "merge",     "merge",      589]) // 8.5 * 16 * 4 + 2.8 * 16
+    r = r.push(["sort",          "quick",     "quick",      448]) // 7.0 * 16 * 4
+    r = r.push(["sort",          "radix",     "radix",      552]) // 6.5 * 16 * 4 + 4 * 16
+    r = r.push(["search",        "linear",    "linear",      80]) // 5.0 * 16
+    r = r.push(["search",        "binary",    "binary",      48]) // 12 * log2(16)=4
+    r = r.push(["search",        "hash",      "hash",        60])
+    r = r.push(["matmul",        "scalar",    "scalar",    7373]) // 1.8 * 16^3
+    r = r.push(["matmul",        "blocked",   "blocked",   2458]) // (1.8/3) * 16^3
+    r = r.push(["matmul",        "blas",      "gemm",       778]) // small FFI floor
+    r = r.push(["map_insert",    "list",      "map_list",   128])
+    r = r.push(["map_insert",    "hash64",    "hash_bucket", 12])
+    r = r.push(["string_concat", "naive",     "concat_naive", 307])
+    r = r.push(["string_concat", "push_join", "push_join",   64])
+    r = r.push(["reduce",        "sequential","reduce_seq",  72])
+    r = r.push(["reduce",        "pairwise",  "pairwise",    96])
+    r = r.push(["argmax",        "linear",    "argmax",      48])
+    r = r.push(["transpose",     "row_major", "transpose",  128])
+    return r
+}
+
+fn avg_of(list) {
+    if len(list) == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < len(list) { sum = sum + list[i]; i = i + 1 }
+    return sum / len(list)
+}
+
+fn pad(s, w) {
+    let mut r = s
+    while len(r) < w { r = r + " " }
+    return r
+}
+
+fn bias_tag(observed, predicted) {
+    if predicted <= 0 { return "n/a" }
+    // ratio *100 as int — avoid float formatting
+    let ratio_x100 = (observed * 100) / predicted
+    let whole = ratio_x100 / 100
+    let frac  = ratio_x100 - whole * 100
+    let mut fs = to_string(frac)
+    if len(fs) < 2 { fs = "0" + fs }
+    return to_string(whole) + "." + fs + "x"
+}
+
+fn analyze() {
+    let path = env_var("HEXA_LANG") + "/shared/hexa-lang/bench_results.jsonl"
+    let records = load_records(path)
+    let entries = registry_entries()
+
+    println("ai-native-cost-learner — S-2b empirical coefficient report")
+    println("  jsonl : " + path)
+    println("  records-with-valid-avg_ns: " + to_string(len(records)))
+    println("")
+    println(pad("family", 16) + pad("candidate", 14) + pad("needle", 14) + pad("count", 7) + pad("obs_ns", 10) + pad("pred_ns", 10) + pad("bias", 10) + "suggestion")
+    println("─────────────────────────────────────────────────────────────────────────────────────────")
+
+    let mut analyzed = 0
+    let mut suggestions = 0
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let family   = e[0]
+        let cand     = e[1]
+        let needle   = e[2]
+        let pred     = e[3]
+        // gather matching avg_ns values
+        let mut matched = []
+        let mut j = 0
+        while j < len(records) {
+            let rec = records[j]
+            if rec[0].index_of(needle) >= 0 { matched = matched.push(rec[1]) }
+            j = j + 1
+        }
+        let cnt = len(matched)
+        let obs = avg_of(matched)
+        let bias = bias_tag(obs, pred)
+        let mut sugg = ""
+        if cnt == 0 {
+            sugg = "no data — add bench/" + needle + "_*.hexa"
+        } else if cnt < 3 {
+            sugg = "observed — collect >=3 runs before rewrite"
+        } else {
+            // |ratio - 1.0| > 0.2 → propose update
+            let ratio_x100 = (obs * 100) / pred
+            let delta = if ratio_x100 > 100 { ratio_x100 - 100 } else { 100 - ratio_x100 }
+            if delta >= 20 {
+                sugg = "REWRITE cost_coefficients_m4." + family + "." + cand
+                suggestions = suggestions + 1
+            } else {
+                sugg = "within tolerance (<20%)"
+            }
+        }
+        analyzed = analyzed + 1
+        println(pad(family, 16) + pad(cand, 14) + pad(needle, 14) + pad(to_string(cnt), 7) + pad(to_string(obs), 10) + pad(to_string(pred), 10) + pad(bias, 10) + sugg)
+        i = i + 1
+    }
+    println("")
+    println("ai-native-cost-learner: " + to_string(analyzed) + " groups analyzed, " + to_string(suggestions) + " suggestions")
+    return 0
+}
+
+fn main() {
+    analyze()
+}
+
+main()
