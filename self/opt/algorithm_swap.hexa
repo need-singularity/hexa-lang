@@ -1,0 +1,271 @@
+// self/opt/algorithm_swap — S-3 algorithm swap DETECTION-ONLY pass
+//
+// Text-based heuristic scanner that detects bubble-sort / insertion-sort
+// shaped functions in a .hexa source file and emits @select/@optimize
+// suggestions per shared/hexa-lang/algorithm_registry.json sort select_rules.
+//
+// Intentionally text-only (not AST) to stay aligned with scripts/ai_native_lint
+// and scripts/ai_native_hotpath siblings. Rewriting lives in S-3b.
+//
+// Usage:
+//   ./build/hexa_stage0 self/opt/algorithm_swap.hexa <file.hexa>
+//
+// Emits, per match (only when confidence >= 3):
+//   <path>:<line>: [SUGGEST swap] fn <name> <kind> (confidence=<n>) → <suggestion>
+
+fn is_digit(c) { let k = char_code(c, 0); return k >= 48 && k <= 57 }
+fn is_alpha(c) { let k = char_code(c, 0); return (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95 }
+fn is_alnum(c) { return is_digit(c) || is_alpha(c) }
+
+fn match_word(src, i, word) {
+    let n = len(src)
+    let wn = len(word)
+    if i + wn > n { return false }
+    if src.substring(i, i + wn) != word { return false }
+    if i > 0 && is_alnum(src[i - 1]) { return false }
+    if i + wn < n && is_alnum(src[i + wn]) { return false }
+    return true
+}
+
+// Strip // and /* */ comments and string literals, preserving newlines.
+fn strip_comments_and_strings(src) {
+    let n = len(src)
+    let mut i = 0
+    let mut parts = []
+    while i < n {
+        let c = src[i]
+        if c == "/" && i + 1 < n && src[i + 1] == "/" {
+            while i < n && src[i] != "\n" { parts = parts.push(" "); i = i + 1 }
+            continue
+        }
+        if c == "/" && i + 1 < n && src[i + 1] == "*" {
+            parts = parts.push("  "); i = i + 2
+            while i + 1 < n && !(src[i] == "*" && src[i + 1] == "/") {
+                if src[i] == "\n" { parts = parts.push("\n") } else { parts = parts.push(" ") }
+                i = i + 1
+            }
+            if i + 1 < n { parts = parts.push("  "); i = i + 2 }
+            continue
+        }
+        if c == "\"" {
+            parts = parts.push(" "); i = i + 1
+            while i < n && src[i] != "\"" {
+                if src[i] == "\\" && i + 1 < n { parts = parts.push(" "); i = i + 1 }
+                if i < n {
+                    if src[i] == "\n" { parts = parts.push("\n") } else { parts = parts.push(" ") }
+                    i = i + 1
+                }
+            }
+            if i < n { parts = parts.push(" "); i = i + 1 }
+            continue
+        }
+        parts = parts.push(c); i = i + 1
+    }
+    return parts.join("")
+}
+
+fn find_close_brace(src, open_idx) {
+    let n = len(src)
+    let mut i = open_idx + 1
+    let mut depth = 1
+    while i < n && depth > 0 {
+        let c = src[i]
+        if c == "{" { depth = depth + 1 }
+        if c == "}" { depth = depth - 1 }
+        i = i + 1
+    }
+    return i
+}
+
+fn line_of(src, upto) {
+    let mut i = 0
+    let mut line = 1
+    while i < upto { if src[i] == "\n" { line = line + 1 }; i = i + 1 }
+    return line
+}
+
+fn contains_sub(slice, needle) {
+    let n = len(slice)
+    let wn = len(needle)
+    if wn == 0 { return true }
+    if wn > n { return false }
+    let mut i = 0
+    while i + wn <= n {
+        if slice.substring(i, i + wn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Count words at word-boundary positions.
+fn count_word(slice, word) {
+    let n = len(slice)
+    let mut i = 0
+    let mut c = 0
+    while i < n {
+        if match_word(slice, i, word) { c = c + 1; i = i + len(word); continue }
+        i = i + 1
+    }
+    return c
+}
+
+// Detect whether body has a nested loop by scanning for `while` or `for`
+// followed (within the same function) by another `while`/`for` before we
+// close the first one's brace. Returns true if nested.
+fn has_nested_loop(body) {
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let c = body[i]
+        if is_alpha(c) && (i == 0 || !is_alnum(body[i - 1])) {
+            let is_loop = match_word(body, i, "while") || match_word(body, i, "for")
+            if is_loop {
+                // find `{` that opens this loop
+                let mut b = i
+                while b < n && body[b] != "{" { b = b + 1 }
+                if b >= n { return false }
+                let close = find_close_brace(body, b)
+                // scan between b+1 .. close for another while/for
+                let inner = body.substring(b + 1, close - 1)
+                if count_word(inner, "while") + count_word(inner, "for") >= 1 {
+                    return true
+                }
+                i = close
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Count outer loops in body (top-level `while`/`for` occurrences).
+fn total_loops(body) {
+    return count_word(body, "while") + count_word(body, "for")
+}
+
+// Swap-shape detection: either `a[i], a[j] = ...` tuple swap OR `let tmp =`
+// followed by two `] =` assigns.
+fn has_swap_pattern(body) {
+    let n = len(body)
+    // tuple swap: "],"  within 64 chars of  "] ="
+    let mut i = 0
+    while i < n {
+        if body[i] == "]" && i + 1 < n && body[i + 1] == "," {
+            let end = i + 64
+            let lim = if end > n { n } else { end }
+            if contains_sub(body.substring(i, lim), "] =") { return true }
+        }
+        i = i + 1
+    }
+    // tmp swap
+    if contains_sub(body, "let tmp") || contains_sub(body, "let swap_tmp") {
+        let mut k = 0
+        let mut cnt = 0
+        while k + 2 < n {
+            if body[k] == "]" && body[k + 1] == " " && body[k + 2] == "=" { cnt = cnt + 1 }
+            k = k + 1
+        }
+        if cnt >= 2 { return true }
+    }
+    return false
+}
+
+// Insertion-sort shift: `a[j] = a[j - 1]` or similar backward shift.
+fn has_insertion_pattern(body) {
+    let n = len(body)
+    let mut i = 0
+    while i + 3 < n {
+        if body[i] == "]" && body[i + 1] == " " && body[i + 2] == "=" && body[i + 3] == " " {
+            let end = i + 32
+            let lim = if end > n { n } else { end }
+            let slice = body.substring(i, lim)
+            if contains_sub(slice, "- 1]") || contains_sub(slice, "-1]") { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// Classify body → [kind, confidence].
+fn classify_body(body) {
+    let nested = has_nested_loop(body)
+    let loops = total_loops(body)
+    let swap = has_swap_pattern(body)
+    let insert = has_insertion_pattern(body)
+    let cmp = contains_sub(body, " > ") || contains_sub(body, " < ")
+
+    if nested && swap {
+        let mut c = 3
+        if loops >= 2 { c = c + 1 }
+        if cmp { c = c + 1 }
+        if c > 5 { c = 5 }
+        return ["bubble", c]
+    }
+    if loops >= 1 && insert {
+        let mut c = 3
+        if nested { c = c + 1 }
+        if cmp { c = c + 1 }
+        if c > 5 { c = 5 }
+        return ["insertion", c]
+    }
+    return ["", 0]
+}
+
+fn suggestion_text(kind) {
+    if kind == "bubble" {
+        return "bubble-sort → use @optimize(\"merge\") when n>1024 OR @select(\"sort\", n<=16→insertion, default→quick)"
+    }
+    if kind == "insertion" {
+        return "insertion-sort → OK for n<=16; for larger n use @select(\"sort\", n<=1024→quick, default→merge)"
+    }
+    return ""
+}
+
+fn analyze(path) {
+    let raw = read_file(path)
+    let src = strip_comments_and_strings(raw)
+    let n = len(src)
+    let mut i = 0
+    let mut hits = 0
+    while i < n {
+        if match_word(src, i, "fn") {
+            let mut k = i + 2
+            while k < n && src[k] == " " { k = k + 1 }
+            let name_start = k
+            while k < n && is_alnum(src[k]) { k = k + 1 }
+            let fn_name = src.substring(name_start, k)
+            if len(fn_name) == 0 { i = i + 2; continue }
+            let mut b = k
+            while b < n && src[b] != "{" { b = b + 1 }
+            if b >= n { break }
+            let close = find_close_brace(src, b)
+            let body = src.substring(b + 1, close - 1)
+            let cls = classify_body(body)
+            let kind = cls[0]
+            let conf = cls[1]
+            if kind != "" && conf >= 3 {
+                let line = line_of(src, i)
+                println(path + ":" + to_string(line) + ": [SUGGEST swap] fn " + fn_name + " " + kind + " (confidence=" + to_string(conf) + ") → " + suggestion_text(kind))
+                hits = hits + 1
+            }
+            i = close
+            continue
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+fn main() {
+    let argv = args()
+    if len(argv) < 3 {
+        println("usage: algorithm_swap.hexa <file.hexa>")
+        return
+    }
+    let path = argv[2]
+    let hits = analyze(path)
+    println("algorithm_swap: " + to_string(hits) + " suggestion(s) in " + path)
+}
+
+main()
