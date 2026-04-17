@@ -1,0 +1,273 @@
+// tests/t54_lora_to_hexaw.hexa — smoke for HF PEFT LoRA → merged HEXAW2
+//
+// End-to-end proof that self/tools/lora_to_hexaw correctly chains
+// multiple HF PEFT adapters into a base HEXAW2 using the canonical
+// formula  W' = W + sum_i (alpha_i / r_i) * B_i @ A_i   per target
+// module, and byte-passes every other tensor through unchanged.
+//
+// Orchestrator layout (mirrors t52):
+//   1. Build a 3-tensor base HEXAW2 directly via hexaw_save_binary
+//      - "model.layers.0.self_attn.q_proj.weight" — LoRA target
+//      - "model.layers.0.self_attn.k_proj.weight" — NOT targeted
+//                                                    (adapters only
+//                                                    mention q_proj
+//                                                    → byte-through)
+//      - "lm_head.weight"                         — byte-through
+//   2. Build 2 toy PEFT adapter directories (A1 and A2):
+//        adapter_model.safetensors + adapter_config.json
+//      Each applies only to q_proj with distinct r/alpha/A/B.
+//   3. Invoke ./build/lora_to_hexaw --base ... --adapters A1,A2 ...
+//   4. Load merged file via hexaw_load; assert per-element equality
+//      against the hand-computed W'.
+//
+// Run:   ./hexa run tests/t54_lora_to_hexaw.hexa
+
+use "../self/ml/hexaw"
+
+let mut ok = true
+fn must(label, cond) {
+    if cond { println("PASS " + label) } else { ok = false; println("FAIL " + label) }
+}
+
+// ── Tolerance comparator (f32 round-trip via HEXAW2 keeps us
+//    within 1e-4 even for the worst-case mantissa packing). ──
+fn approx(a, b) {
+    let mut d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d < 0.001
+}
+
+// ── Build a safetensors file in memory from parallel arrays ──
+// Layout (spec ref: https://github.com/huggingface/safetensors):
+//   u64 LE header_size | JSON header | raw tensor bytes
+// All tensors we emit are F32 to keep the test interp-only.
+fn pack_safetensors(names, shapes, datas) {
+    // Compute per-tensor byte offsets (relative to data region).
+    let mut offs_b = []
+    let mut offs_e = []
+    let mut cur = 0
+    let mut i = 0
+    while i < len(datas) {
+        let nel = len(datas[i])
+        offs_b = offs_b + [cur]
+        offs_e = offs_e + [cur + nel * 4]
+        cur = cur + nel * 4
+        i = i + 1
+    }
+    // Build JSON header.
+    let mut j = "{"
+    let mut k = 0
+    while k < len(names) {
+        if k > 0 { j = j + "," }
+        j = j + "\"" + names[k] + "\":{\"dtype\":\"F32\",\"shape\":["
+        let sh = shapes[k]
+        let mut s = 0
+        while s < len(sh) {
+            if s > 0 { j = j + "," }
+            j = j + to_string(sh[s])
+            s = s + 1
+        }
+        j = j + "],\"data_offsets\":[" + to_string(offs_b[k]) + "," + to_string(offs_e[k]) + "]}"
+        k = k + 1
+    }
+    j = j + "}"
+    // Emit JSON bytes.
+    let mut jb = []
+    let mut ci = 0
+    while ci < len(j) { jb = jb + [char_code(j, ci)]; ci = ci + 1 }
+    let hsz = len(jb)
+    // Header-size u64 LE.
+    let mut out = []
+    let mut tmp = hsz
+    let mut bi = 0
+    while bi < 8 {
+        out = out + [tmp % 256]
+        tmp = tmp / 256
+        bi = bi + 1
+    }
+    out = out + jb
+    // Tensor payloads (F32 LE via hexaw_f32_to_bytes).
+    let mut ti = 0
+    while ti < len(datas) {
+        let arr = datas[ti]
+        let mut qi = 0
+        while qi < len(arr) {
+            out = out + hexaw_f32_to_bytes(arr[qi])
+            qi = qi + 1
+        }
+        ti = ti + 1
+    }
+    return out
+}
+
+// ── Build one PEFT adapter directory at `dir` ────────────────
+// `a_mat` (row-major [r, d_in]), `b_mat` (row-major [d_out, r]).
+// `target_modules` is a JSON-literal-friendly string array.
+fn emit_adapter(dir, target_short, r, alpha, d_in, d_out, a_mat, b_mat) {
+    // adapter_config.json
+    let mut cfg = "{\"r\":" + to_string(r) + ",\"lora_alpha\":" + to_string(alpha)
+    cfg = cfg + ",\"target_modules\":[\"" + target_short + "\"]"
+    cfg = cfg + ",\"use_rslora\":false,\"use_dora\":false}"
+    write_file(dir + "/adapter_config.json", cfg)
+    // adapter_model.safetensors with 2 tensors.
+    let n_a = "base_model.model.model.layers.0.self_attn." + target_short + ".lora_A.weight"
+    let n_b = "base_model.model.model.layers.0.self_attn." + target_short + ".lora_B.weight"
+    let names = [n_a, n_b]
+    let shapes = [[r, d_in], [d_out, r]]
+    let datas = [a_mat, b_mat]
+    let bytes = pack_safetensors(names, shapes, datas)
+    write_bytes(dir + "/adapter_model.safetensors", bytes)
+}
+
+// ── Compute expected W' = W + (alpha/r) * B @ A ──────────────
+fn apply_ref(w, d_out, d_in, r, alpha, a_mat, b_mat) {
+    let scale = alpha / to_float(r)
+    let mut out = []
+    let mut i = 0
+    while i < d_out {
+        let mut j = 0
+        while j < d_in {
+            let mut acc = 0.0
+            let mut p = 0
+            while p < r {
+                acc = acc + b_mat[i * r + p] * a_mat[p * d_in + j]
+                p = p + 1
+            }
+            out = out + [w[i * d_in + j] + scale * acc]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── 1. Base tensors ──────────────────────────────────────────
+let d_out = 3
+let d_in = 4
+// W (base q_proj) — row-major [d_out, d_in]
+let w_q = [
+    1.0, 0.5, -0.25, 0.125,
+    0.0, 1.0,  0.0,  0.0,
+    -1.0, 0.5, 0.25, -0.125
+]
+// Untouched base tensors.
+let w_k = [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+let w_lm = [0.5, 0.75]
+
+let base_names = [
+    "model.layers.0.self_attn.q_proj.weight",
+    "model.layers.0.self_attn.k_proj.weight",
+    "lm_head.weight"
+]
+let base_shapes = [[d_out, d_in], [2, 3], [2, 1]]
+let base_datas = [w_q, w_k, w_lm]
+let base_path = "/tmp/_t54_base.hexaw"
+hexaw_save_binary(base_path, base_names, base_shapes, base_datas)
+must("wrote base hexaw", file_exists(base_path))
+
+// ── 2. Adapter A1 (r=2, alpha=4) ─────────────────────────────
+let r1 = 2
+let al1 = 4.0
+// A1: [r1, d_in] = [2,4]
+let a1_mat = [0.1, -0.2, 0.3, 0.0, 0.5, 0.0, -0.1, 0.25]
+// B1: [d_out, r1] = [3,2]
+let b1_mat = [1.0, 0.0, 0.0, 0.5, -0.25, 1.0]
+
+// ── 3. Adapter A2 (r=1, alpha=2) ─────────────────────────────
+let r2 = 1
+let al2 = 2.0
+// A2: [r2, d_in] = [1,4]
+let a2_mat = [-1.0, 0.5, 0.25, 0.0]
+// B2: [d_out, r2] = [3,1]
+let b2_mat = [0.5, -0.5, 0.25]
+
+// ── 4. Make adapter dirs and emit files ──────────────────────
+let dir1 = "/tmp/_t54_adapter_a1"
+let dir2 = "/tmp/_t54_adapter_a2"
+// mkdir -p via exec_with_status (builtin)
+exec_with_status("mkdir -p " + dir1 + " " + dir2)
+emit_adapter(dir1, "q_proj", r1, al1, d_in, d_out, a1_mat, b1_mat)
+emit_adapter(dir2, "q_proj", r2, al2, d_in, d_out, a2_mat, b2_mat)
+must("wrote adapter A1 cfg", file_exists(dir1 + "/adapter_config.json"))
+must("wrote adapter A1 sft", file_exists(dir1 + "/adapter_model.safetensors"))
+must("wrote adapter A2 cfg", file_exists(dir2 + "/adapter_config.json"))
+must("wrote adapter A2 sft", file_exists(dir2 + "/adapter_model.safetensors"))
+
+// ── 5. Ensure binary exists (build if needed) ────────────────
+let bin = "build/lora_to_hexaw"
+if !file_exists(bin) {
+    println("[t54] building merger (one-time)...")
+    let bb = exec_with_status("./hexa build self/tools/lora_to_hexaw.hexa -o " + bin + " 2>&1")
+    if bb[1] != 0 {
+        println("FAIL merger build")
+        println(bb[0])
+        ok = false
+    }
+}
+must("merger binary exists", file_exists(bin))
+
+// ── 6. Run merge ─────────────────────────────────────────────
+let out_path = "/tmp/_t54_merged.hexaw"
+let cmd = bin + " --base " + base_path + " --adapters " + dir1 + "," + dir2 + " --output " + out_path + " 2>&1"
+let rr = exec_with_status(cmd)
+if rr[1] != 0 {
+    println("FAIL merger run rc=" + to_string(rr[1]))
+    println(rr[0])
+    ok = false
+}
+must("merger exit 0", rr[1] == 0)
+must("merged hexaw exists", file_exists(out_path))
+
+// ── 7. Reference compute: W ← W + (al1/r1)*B1@A1; then same A2
+let w_q_expected_mid = apply_ref(w_q, d_out, d_in, r1, al1, a1_mat, b1_mat)
+let w_q_expected = apply_ref(w_q_expected_mid, d_out, d_in, r2, al2, a2_mat, b2_mat)
+
+// ── 8. Load merged + verify ──────────────────────────────────
+let m = hexaw_load(out_path)
+must("merged has 3 tensors", len(m.names) == 3)
+must("order preserved [0]", m.names[0] == "model.layers.0.self_attn.q_proj.weight")
+must("order preserved [1]", m.names[1] == "model.layers.0.self_attn.k_proj.weight")
+must("order preserved [2]", m.names[2] == "lm_head.weight")
+
+// q_proj merged values
+let q_out = m.datas[0]
+must("q_proj len", len(q_out) == d_out * d_in)
+let mut qi = 0
+let mut qok = true
+while qi < len(q_out) {
+    if !approx(q_out[qi], w_q_expected[qi]) {
+        println("  diff idx=" + to_string(qi) + " got=" + to_string(q_out[qi]) + " want=" + to_string(w_q_expected[qi]))
+        qok = false
+    }
+    qi = qi + 1
+}
+must("q_proj values match reference (2-adapter chain)", qok)
+
+// k_proj byte-through
+let k_out = m.datas[1]
+let mut ki = 0
+let mut kok = true
+while ki < len(k_out) {
+    if !approx(k_out[ki], w_k[ki]) { kok = false }
+    ki = ki + 1
+}
+must("k_proj byte-through (non-target)", kok)
+
+// lm_head byte-through
+let lm_out = m.datas[2]
+let mut li = 0
+let mut lmok = true
+while li < len(lm_out) {
+    if !approx(lm_out[li], w_lm[li]) { lmok = false }
+    li = li + 1
+}
+must("lm_head byte-through (non-target)", lmok)
+
+// ── 9. Magic sanity on output file ───────────────────────────
+let mb = read_file_bytes(out_path)
+must("output magic HEXAW2",
+     mb[0] == 72 && mb[1] == 69 && mb[2] == 88
+  && mb[3] == 65 && mb[4] == 87 && mb[5] == 50
+  && mb[6] == 10)
+
+if ok { println("PASS t54_lora_to_hexaw") } else { println("FAIL t54_lora_to_hexaw") }
