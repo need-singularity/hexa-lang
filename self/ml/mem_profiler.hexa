@@ -1,0 +1,216 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/mem_profiler.hexa — GPU Memory Profiler for 7B Training
+//
+//  Live tracking + static estimation for H100 80GB capacity planning.
+//  Categories: weights, gradients, optimizer, activations, kv_cache, misc
+//
+//  API: mem_profiler_new, mem_track, mem_untrack, mem_report,
+//       mem_estimate_7b, mem_check_fit, mem_profile_7b
+// ═══════════════════════════════════════════════════════════════
+
+// ── Profiler struct ──────────────────────────────────────────
+
+struct MemProfiler {
+    weights:     int,
+    gradients:   int,
+    optimizer:   int,
+    activations: int,
+    kv_cache:    int,
+    misc:        int,
+    peak_total:  int,
+    track_count: int
+}
+
+fn mem_profiler_new() -> MemProfiler {
+    return MemProfiler {
+        weights:     0,
+        gradients:   0,
+        optimizer:   0,
+        activations: 0,
+        kv_cache:    0,
+        misc:        0,
+        peak_total:  0,
+        track_count: 0
+    }
+}
+
+// ── Live tracking ────────────────────────────────────────────
+
+@hot
+fn mem_track(prof: MemProfiler, category: str, bytes: int) {
+    if category == "weights"     { prof.weights     = prof.weights     + bytes }
+    if category == "gradients"   { prof.gradients   = prof.gradients   + bytes }
+    if category == "optimizer"   { prof.optimizer   = prof.optimizer   + bytes }
+    if category == "activations" { prof.activations = prof.activations + bytes }
+    if category == "kv_cache"    { prof.kv_cache    = prof.kv_cache    + bytes }
+    if category == "misc"        { prof.misc        = prof.misc        + bytes }
+    prof.track_count = prof.track_count + 1
+    let total = prof.weights + prof.gradients + prof.optimizer + prof.activations + prof.kv_cache + prof.misc
+    if total > prof.peak_total { prof.peak_total = total }
+}
+
+@hot
+fn mem_untrack(prof: MemProfiler, category: str, bytes: int) {
+    if category == "weights"     { prof.weights     = prof.weights     - bytes }
+    if category == "gradients"   { prof.gradients   = prof.gradients   - bytes }
+    if category == "optimizer"   { prof.optimizer   = prof.optimizer   - bytes }
+    if category == "activations" { prof.activations = prof.activations - bytes }
+    if category == "kv_cache"    { prof.kv_cache    = prof.kv_cache    - bytes }
+    if category == "misc"        { prof.misc        = prof.misc        - bytes }
+}
+
+// ── Helpers ──────────────────────────────────────────────────
+
+@pure
+fn _bytes_to_gb(b: int) -> float {
+    return (b * 1.0) / (1073741824.0)
+}
+
+@pure
+fn _fmt_gb(b: int) -> str {
+    let gb = _bytes_to_gb(b)
+    // truncate to 2 decimal places
+    let whole = int(gb)
+    let frac = int((gb - whole * 1.0) * 100.0)
+    let mut fs = str(frac)
+    if frac < 10 { fs = "0" + fs }
+    return str(whole) + "." + fs + " GB"
+}
+
+@pure
+fn _bar(b: int, total: int) -> str {
+    let pct = if total > 0 { (b * 100) / total } else { 0 }
+    let bars = pct / 5
+    let mut out = "["
+    let mut i = 0
+    while i < 20 {
+        if i < bars { out = out + "#" }
+        else { out = out + "." }
+        i = i + 1
+    }
+    return out + "] " + str(pct) + "%"
+}
+
+// ── Report ───────────────────────────────────────────────────
+
+fn mem_report(prof: MemProfiler) {
+    let total = prof.weights + prof.gradients + prof.optimizer + prof.activations + prof.kv_cache + prof.misc
+    println("╔═══════════════════════════════════════════════════╗")
+    println("║         GPU Memory Profiler — Breakdown          ║")
+    println("╠═══════════════════════════════════════════════════╣")
+    println("  Weights:     " + _fmt_gb(prof.weights)     + "  " + _bar(prof.weights, total))
+    println("  Gradients:   " + _fmt_gb(prof.gradients)   + "  " + _bar(prof.gradients, total))
+    println("  Optimizer:   " + _fmt_gb(prof.optimizer)    + "  " + _bar(prof.optimizer, total))
+    println("  Activations: " + _fmt_gb(prof.activations)  + "  " + _bar(prof.activations, total))
+    println("  KV Cache:    " + _fmt_gb(prof.kv_cache)     + "  " + _bar(prof.kv_cache, total))
+    println("  Misc:        " + _fmt_gb(prof.misc)         + "  " + _bar(prof.misc, total))
+    println("╠═══════════════════════════════════════════════════╣")
+    println("  Current:     " + _fmt_gb(total))
+    println("  Peak:        " + _fmt_gb(prof.peak_total))
+    println("  Allocations: " + str(prof.track_count))
+    println("╚═══════════════════════════════════════════════════╝")
+}
+
+// ── Static 7B memory estimator (no training run needed) ──────
+
+@pure
+fn mem_estimate_7b(cfg) {
+    let D     = cfg.D
+    let FF    = cfg.FF
+    let NL    = cfg.NL
+    let VOCAB = cfg.VOCAB
+    let SEQ   = cfg.SEQ
+    let RANK  = cfg.RANK
+    let NH    = cfg.NH
+    let batch = cfg.batch_size
+
+    let embed_params   = VOCAB * D
+    let layer_params   = 4 * D * D + 3 * D * FF + 4 * D  // Wqkvo + FFN + norms
+    let lm_head_params = D * RANK + RANK * VOCAB
+    let total_params   = embed_params + NL * layer_params + lm_head_params
+
+    let weights_fp32   = total_params * 4
+    let weights_bf16   = total_params * 2
+    let gradients      = total_params * 4
+    let opt_m1         = total_params * 4
+    let opt_m2         = total_params * 4
+    let optimizer      = opt_m1 + opt_m2
+
+    let activations    = NL * batch * SEQ * D * 4 * 2  // 2 saves per layer
+    let head_dim       = if NH > 0 { D / NH } else { D }
+    let nh             = if NH > 0 { NH } else { 1 }
+    let kv_cache       = NL * batch * nh * SEQ * head_dim * 2 * 4
+
+    let total          = weights_fp32 + weights_bf16 + gradients + optimizer + activations + kv_cache
+
+    return #{
+        "total_params":   total_params,
+        "embed_params":   embed_params,
+        "layer_params":   layer_params,
+        "lm_head_params": lm_head_params,
+        "weights_fp32":   weights_fp32,
+        "weights_bf16":   weights_bf16,
+        "gradients":      gradients,
+        "optimizer":      optimizer,
+        "opt_m1":         opt_m1,
+        "opt_m2":         opt_m2,
+        "activations":    activations,
+        "kv_cache":       kv_cache,
+        "total":          total
+    }
+}
+
+// ── Fit check ────────────────────────────────────────────────
+
+fn mem_check_fit(estimate, gpu_mem_gb: int) -> bool {
+    let cap = gpu_mem_gb * 1073741824
+    let total = estimate["total"]
+    let used_gb = _bytes_to_gb(total)
+    let cap_gb = gpu_mem_gb * 1.0
+
+    println("[mem] Estimated total: " + _fmt_gb(total) + " / " + str(gpu_mem_gb) + " GB")
+
+    if total > cap {
+        let over = total - cap
+        println("[mem] WARNING: over budget by " + _fmt_gb(over))
+        println("[mem]   weights_fp32:   " + _fmt_gb(estimate["weights_fp32"]))
+        println("[mem]   weights_bf16:   " + _fmt_gb(estimate["weights_bf16"]))
+        println("[mem]   gradients:      " + _fmt_gb(estimate["gradients"]))
+        println("[mem]   optimizer:      " + _fmt_gb(estimate["optimizer"]))
+        println("[mem]   activations:    " + _fmt_gb(estimate["activations"]))
+        println("[mem]   kv_cache:       " + _fmt_gb(estimate["kv_cache"]))
+        println("[mem] Suggestions:")
+        println("[mem]   - Enable gradient checkpointing (halves activations)")
+        println("[mem]   - Use bf16-only weights (drop fp32 master)")
+        println("[mem]   - Reduce batch_size or SEQ length")
+        println("[mem]   - Use FSDP to shard across GPUs")
+        return false
+    }
+
+    let headroom = cap - total
+    println("[mem] OK — headroom " + _fmt_gb(headroom))
+    return true
+}
+
+// ── Convenience: estimate + report + fit check in one call ───
+
+fn mem_profile_7b(cfg, gpu_mem_gb: int) {
+    let est = mem_estimate_7b(cfg)
+    let total = est["total"]
+    println("╔═══════════════════════════════════════════════════╗")
+    println("║       7B Memory Estimate — Static Analysis       ║")
+    println("╠═══════════════════════════════════════════════════╣")
+    println("  Params:      " + str(est["total_params"]) + " (" + str(cfg.NL) + " layers)")
+    println("  Weights fp32:  " + _fmt_gb(est["weights_fp32"])  + "  " + _bar(est["weights_fp32"], total))
+    println("  Weights bf16:  " + _fmt_gb(est["weights_bf16"])  + "  " + _bar(est["weights_bf16"], total))
+    println("  Gradients:     " + _fmt_gb(est["gradients"])     + "  " + _bar(est["gradients"], total))
+    println("  Optimizer:     " + _fmt_gb(est["optimizer"])      + "  " + _bar(est["optimizer"], total))
+    println("  Activations:   " + _fmt_gb(est["activations"])   + "  " + _bar(est["activations"], total))
+    println("  KV Cache:      " + _fmt_gb(est["kv_cache"])      + "  " + _bar(est["kv_cache"], total))
+    println("╠═══════════════════════════════════════════════════╣")
+    println("  TOTAL:         " + _fmt_gb(total))
+    println("╚═══════════════════════════════════════════════════╝")
+    mem_check_fit(est, gpu_mem_gb)
+}
+
+println("[mem_profiler] loaded — track/untrack/report/estimate_7b/check_fit/profile_7b")
