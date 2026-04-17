@@ -1,0 +1,306 @@
+// =====================================================================
+//  self/ml/rope.hexa — Rotary Position Embeddings + KV Cache
+//
+//  RoPE API (raw f32 buffers, in-place):
+//    precompute_freqs(dim, max_seq, theta) -> freq buffer
+//    apply_rope(q, k, freqs, seq_len, n_q_heads, n_kv_heads, head_dim, seq_offset)
+//    apply_rope_neox(q, k, freqs, seq_len, n_q_heads, n_kv_heads, head_dim, seq_offset)
+//
+//  KV Cache API:
+//    kv_cache_alloc(n_layers, max_seq, n_kv_heads, head_dim) -> cache
+//    kv_cache_update(cache, layer, pos, k_ptr, v_ptr, seq_len) — write slab
+//    kv_cache_get(cache, layer, start, end_pos) -> {k_ptr, v_ptr, len}
+//    kv_cache_free(cache)
+//
+//  Shapes (7B-class):
+//    head_dim=128, n_heads=32, n_kv_heads=8 (GQA)
+//    Q layout: [seq_len, n_heads * head_dim]   (flat f32)
+//    K layout: [seq_len, n_kv_heads * head_dim] (flat f32)
+//
+//  Grammar notes (HX3):
+//    - .push() not arr+[x] in loops
+//    - parens in slice index arithmetic
+//    - no semicolons
+// =====================================================================
+
+// ── RoPE frequency precomputation ───────────────────────────────────
+//
+//  freqs[i] = 1.0 / (theta ^ (2i / dim))  for i in 0..dim/2
+//  Stored as flat f32 buffer: [max_seq, dim/2] where
+//    freqs[pos * half + i] = pos * freq[i]
+//  We store the raw angles (pos * freq) so apply_rope just does
+//  cos/sin lookups.
+// =====================================================================
+
+fn precompute_freqs(dim, max_seq, theta) {
+    let half = dim / 2
+    let total = max_seq * half
+    let buf = alloc_f32(total)
+
+    // First compute base frequencies
+    let base_freqs = alloc_f32(half)
+    let mut i = 0
+    while i < half {
+        let exponent = 2.0 * to_float(i) / to_float(dim)
+        let freq = 1.0 / pow(theta, exponent)
+        write_f32(base_freqs, i * 4, freq)
+        i = i + 1
+    }
+
+    // Fill angle table: angle[pos][i] = pos * freq[i]
+    let mut pos = 0
+    while pos < max_seq {
+        let pos_f = to_float(pos)
+        let row_off = pos * half
+        i = 0
+        while i < half {
+            let freq = deref_f32(base_freqs, i * 4)
+            let angle = pos_f * freq
+            write_f32(buf, (row_off + i) * 4, angle)
+            i = i + 1
+        }
+        pos = pos + 1
+    }
+
+    free_f32(base_freqs, half)
+    return buf
+}
+
+fn free_freqs(buf, dim, max_seq) {
+    let half = dim / 2
+    free_f32(buf, max_seq * half)
+}
+
+// =====================================================================
+//  apply_rope — standard paired layout (LLaMA style)
+//
+//  For each head, pairs (x[2i], x[2i+1]) are rotated:
+//    out[2i]   = x[2i] * cos(angle) - x[2i+1] * sin(angle)
+//    out[2i+1] = x[2i] * sin(angle) + x[2i+1] * cos(angle)
+//
+//  q_ptr: [seq_len, n_q_heads * head_dim]  — modified in-place
+//  k_ptr: [seq_len, n_kv_heads * head_dim] — modified in-place
+//  freqs: precomputed angle table from precompute_freqs
+//  seq_offset: position offset for KV cache continuation
+// =====================================================================
+@hot
+fn apply_rope(q_ptr, k_ptr, freqs, seq_len, n_q_heads, n_kv_heads, head_dim, seq_offset) {
+    let half = head_dim / 2
+    let q_stride = n_q_heads * head_dim
+    let k_stride = n_kv_heads * head_dim
+
+    let mut s = 0
+    while s < seq_len {
+        let abs_pos = s + seq_offset
+        let freq_row = abs_pos * half
+
+        // Rotate Q heads
+        let mut h = 0
+        while h < n_q_heads {
+            let base_off = s * q_stride + h * head_dim
+            let mut p = 0
+            while p < half {
+                let angle = deref_f32(freqs, (freq_row + p) * 4)
+                let cos_a = cos(angle)
+                let sin_a = sin(angle)
+                let off0 = (base_off + 2 * p) * 4
+                let off1 = (base_off + 2 * p + 1) * 4
+                let x0 = deref_f32(q_ptr, off0)
+                let x1 = deref_f32(q_ptr, off1)
+                write_f32(q_ptr, off0, x0 * cos_a - x1 * sin_a)
+                write_f32(q_ptr, off1, x0 * sin_a + x1 * cos_a)
+                p = p + 1
+            }
+            h = h + 1
+        }
+
+        // Rotate K heads
+        h = 0
+        while h < n_kv_heads {
+            let base_off = s * k_stride + h * head_dim
+            let mut p = 0
+            while p < half {
+                let angle = deref_f32(freqs, (freq_row + p) * 4)
+                let cos_a = cos(angle)
+                let sin_a = sin(angle)
+                let off0 = (base_off + 2 * p) * 4
+                let off1 = (base_off + 2 * p + 1) * 4
+                let x0 = deref_f32(k_ptr, off0)
+                let x1 = deref_f32(k_ptr, off1)
+                write_f32(k_ptr, off0, x0 * cos_a - x1 * sin_a)
+                write_f32(k_ptr, off1, x0 * sin_a + x1 * cos_a)
+                p = p + 1
+            }
+            h = h + 1
+        }
+
+        s = s + 1
+    }
+}
+
+// =====================================================================
+//  apply_rope_neox — GPT-NeoX interleaved layout
+//
+//  NeoX splits each head into first-half and second-half:
+//    x_even = x[0..half],  x_odd = x[half..dim]
+//    out[i]      = x[i]      * cos(angle) - x[i+half] * sin(angle)
+//    out[i+half] = x[i]      * sin(angle) + x[i+half] * cos(angle)
+// =====================================================================
+@hot
+fn apply_rope_neox(q_ptr, k_ptr, freqs, seq_len, n_q_heads, n_kv_heads, head_dim, seq_offset) {
+    let half = head_dim / 2
+    let q_stride = n_q_heads * head_dim
+    let k_stride = n_kv_heads * head_dim
+
+    let mut s = 0
+    while s < seq_len {
+        let abs_pos = s + seq_offset
+        let freq_row = abs_pos * half
+
+        // Rotate Q heads (NeoX layout)
+        let mut h = 0
+        while h < n_q_heads {
+            let base_off = s * q_stride + h * head_dim
+            let mut p = 0
+            while p < half {
+                let angle = deref_f32(freqs, (freq_row + p) * 4)
+                let cos_a = cos(angle)
+                let sin_a = sin(angle)
+                let off_lo = (base_off + p) * 4
+                let off_hi = (base_off + half + p) * 4
+                let x_lo = deref_f32(q_ptr, off_lo)
+                let x_hi = deref_f32(q_ptr, off_hi)
+                write_f32(q_ptr, off_lo, x_lo * cos_a - x_hi * sin_a)
+                write_f32(q_ptr, off_hi, x_lo * sin_a + x_hi * cos_a)
+                p = p + 1
+            }
+            h = h + 1
+        }
+
+        // Rotate K heads (NeoX layout)
+        h = 0
+        while h < n_kv_heads {
+            let base_off = s * k_stride + h * head_dim
+            let mut p = 0
+            while p < half {
+                let angle = deref_f32(freqs, (freq_row + p) * 4)
+                let cos_a = cos(angle)
+                let sin_a = sin(angle)
+                let off_lo = (base_off + p) * 4
+                let off_hi = (base_off + half + p) * 4
+                let x_lo = deref_f32(k_ptr, off_lo)
+                let x_hi = deref_f32(k_ptr, off_hi)
+                write_f32(k_ptr, off_lo, x_lo * cos_a - x_hi * sin_a)
+                write_f32(k_ptr, off_hi, x_lo * sin_a + x_hi * cos_a)
+                p = p + 1
+            }
+            h = h + 1
+        }
+
+        s = s + 1
+    }
+}
+
+// =====================================================================
+//  KV Cache — flat f32 buffer for autoregressive inference
+//
+//  Layout: [n_layers, max_seq, n_kv_heads * head_dim]
+//  Each layer's slab = max_seq * n_kv_heads * head_dim elements
+// =====================================================================
+
+struct KVCache {
+    keys: ptr,
+    values: ptr,
+    n_layers: int,
+    max_seq: int,
+    n_kv_heads: int,
+    head_dim: int,
+    cur_seq: int
+}
+
+fn kv_cache_alloc(n_layers, max_seq, n_kv_heads, head_dim) {
+    let total = n_layers * max_seq * n_kv_heads * head_dim
+    let bytes = total * 4
+    let k = alloc_raw(bytes)
+    let v = alloc_raw(bytes)
+    // Zero-init
+    let mut i = 0
+    while i < total {
+        write_f32(k, i * 4, 0.0)
+        write_f32(v, i * 4, 0.0)
+        i = i + 1
+    }
+    return KVCache {
+        keys: k,
+        values: v,
+        n_layers: n_layers,
+        max_seq: max_seq,
+        n_kv_heads: n_kv_heads,
+        head_dim: head_dim,
+        cur_seq: 0
+    }
+}
+
+fn kv_cache_free(cache) {
+    let total = cache.n_layers * cache.max_seq * cache.n_kv_heads * cache.head_dim
+    free_raw(cache.keys, total * 4)
+    free_raw(cache.values, total * 4)
+}
+
+fn kv_cache_reset(cache) {
+    let total = cache.n_layers * cache.max_seq * cache.n_kv_heads * cache.head_dim
+    let mut i = 0
+    while i < total {
+        write_f32(cache.keys, i * 4, 0.0)
+        write_f32(cache.values, i * 4, 0.0)
+        i = i + 1
+    }
+    cache.cur_seq = 0
+}
+
+// ── kv_cache_update — write K/V for one position (or seq_len positions) ──
+//
+//  k_ptr, v_ptr: [seq_len, n_kv_heads * head_dim] flat f32
+//  Writes into cache at positions [pos .. pos+seq_len)
+fn kv_cache_update(cache, layer, pos, k_ptr, v_ptr, seq_len) {
+    let slab = cache.n_kv_heads * cache.head_dim
+    let layer_base = layer * cache.max_seq * slab
+    let mut s = 0
+    while s < seq_len {
+        let dst_off = layer_base + (pos + s) * slab
+        let src_off = s * slab
+        let mut i = 0
+        while i < slab {
+            let kv = deref_f32(k_ptr, (src_off + i) * 4)
+            write_f32(cache.keys, (dst_off + i) * 4, kv)
+            let vv = deref_f32(v_ptr, (src_off + i) * 4)
+            write_f32(cache.values, (dst_off + i) * 4, vv)
+            i = i + 1
+        }
+        s = s + 1
+    }
+    // Track furthest position written
+    let new_end = pos + seq_len
+    if new_end > cache.cur_seq {
+        cache.cur_seq = new_end
+    }
+}
+
+// ── kv_cache_get — return sub-range pointers into the cache ─────────
+//
+//  Returns: {k_ptr, v_ptr, len} where len = (end_pos - start) * slab
+//  The returned pointers point directly into the cache buffer (no copy).
+//  Caller must NOT free them.
+fn kv_cache_get(cache, layer, start, end_pos) {
+    let slab = cache.n_kv_heads * cache.head_dim
+    let layer_base = layer * cache.max_seq * slab
+    let byte_off = (layer_base + start * slab) * 4
+    let elem_len = (end_pos - start) * slab
+    return {
+        k_ptr: ptr_offset(cache.keys, byte_off),
+        v_ptr: ptr_offset(cache.values, byte_off),
+        len: elem_len
+    }
+}
+
+println("[rope] module loaded -- RoPE (standard + NeoX) + KV cache")

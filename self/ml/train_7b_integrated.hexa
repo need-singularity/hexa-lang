@@ -29,6 +29,8 @@ use "data_loader"
 use "weight_init"
 use "hexaw"
 use "lr_schedule"
+use "grad_accumulate"
+use "rope"
 
 // ── 7B-class shape constants ────────────────────────────────────
 let D_MODEL   = 4096
@@ -39,6 +41,7 @@ let HEAD_DIM  = 128       // D_MODEL / N_HEADS
 let SEQ_LEN   = 2048
 let FF_DIM    = 11008     // SwiGLU intermediate
 let VOCAB     = 32000
+let ROPE_THETA = 10000.0  // RoPE base frequency
 
 // ── Training hyperparameters ────────────────────────────────────
 let LR          = 3.0e-4
@@ -50,6 +53,13 @@ let GRAD_CLIP   = 1.0
 let WARMUP      = 200       // warmup steps (200 for 7B-class models)
 let TOTAL_STEPS = 10000
 let LR_SCHEDULE = "cosine"  // "cosine" | "linear" | "constant_with_warmup"
+
+// ── Gradient accumulation ──────────────────────────────────────
+// micro_batch=1 is all that fits on H100 80GB for 7B seq=2048.
+// Accumulate over ACCUM_STEPS micro-batches for effective batch.
+let MICRO_BATCH  = 1
+let ACCUM_STEPS  = 8        // effective_batch = 1 * 8 = 8
+let GA_CFG = ga_config(MICRO_BATCH, ACCUM_STEPS)
 
 // ── Evaluation config ───────────────────────────────────────────
 let EVAL_INTERVAL  = 1000    // evaluate every N steps (0 = disabled)
@@ -478,7 +488,7 @@ fn silu_val(x) {
 //  Output: attn_out [SEQ, D] as raw f32 buffer
 //  Saves:  Q, K, V, O buffers for backward pass
 // =====================================================================
-fn attention_fwd_layer(hidden, weights) {
+fn attention_fwd_layer(hidden, weights, rope_freqs) {
     let wq = weights[0]
     let wk = weights[1]
     let wv = weights[2]
@@ -496,6 +506,9 @@ fn attention_fwd_layer(hidden, weights) {
     matmul_raw(hidden, wk, k_buf, SEQ_LEN, D_MODEL, KV_DIM)
     // V = hidden @ Wv  [SEQ, D] @ [D, KV_DIM] -> [SEQ, KV_DIM]
     matmul_raw(hidden, wv, v_buf, SEQ_LEN, D_MODEL, KV_DIM)
+
+    // Apply RoPE to Q and K (in-place, before attention)
+    apply_rope(q_buf, k_buf, rope_freqs, SEQ_LEN, N_HEADS, N_KV, HEAD_DIM, 0)
 
     // Flash attention forward via FFI (single packed dispatch)
     // Buffers are already in [n_heads, S, HEAD_DIM] layout after projection
@@ -983,7 +996,8 @@ fn lr_schedule(step, warmup, total, peak_lr) {
 fn train_step(all_weights, all_grads, all_m1, all_m2,
               embed_w, lm_head_w, d_embed_w, d_lm_head_w,
               embed_m1, embed_m2, lmh_m1, lmh_m2,
-              tokens, targets, step_num, hxccl_h, world_size) {
+              tokens, targets, step_num, hxccl_h, world_size,
+              rope_freqs) {
     // ── Forward pass ─────────────────────────────────────────────
 
     // 1. Embedding lookup: tokens -> hidden [SEQ, D]
@@ -1027,8 +1041,8 @@ fn train_step(all_weights, all_grads, all_m1, all_m2,
         saved_pre_attn.push(normed_attn)
         saved_rstd_attn.push(rstd_a)
 
-        // 2b. Q/K/V projection + FlashAttention + O projection
-        let attn_result = attention_fwd_layer(normed_attn, weights)
+        // 2b. Q/K/V projection + RoPE + FlashAttention + O projection
+        let attn_result = attention_fwd_layer(normed_attn, weights, rope_freqs)
         let attn_out = attn_result[0]
         saved_attn.push([attn_result[1], attn_result[2], attn_result[3], attn_result[4]])
 
@@ -1282,7 +1296,7 @@ fn train_step_bf16(all_weights, all_grads, all_m1, all_m2,
                    embed_w, lm_head_w, d_embed_w, d_lm_head_w,
                    embed_m1, embed_m2, lmh_m1, lmh_m2,
                    tokens, targets, step_num, hxccl_h, world_size,
-                   loss_scale, clean_steps) {
+                   loss_scale, clean_steps, rope_freqs) {
     let sizes = [SZ_WQ, SZ_WK, SZ_WV, SZ_WO, SZ_WGATE, SZ_WUP, SZ_WDOWN, SZ_RMS, SZ_RMS]
 
     // ── Step 1: Cast fp32 master weights -> bf16 compute copies ──
@@ -1349,7 +1363,8 @@ fn train_step_bf16(all_weights, all_grads, all_m1, all_m2,
                             scratch_embed, scratch_lm_head,
                             scratch_d_embed, scratch_d_lm_head,
                             embed_m1, embed_m2, lmh_m1, lmh_m2,
-                            tokens, targets, step_num, hxccl_h, world_size)
+                            tokens, targets, step_num, hxccl_h, world_size,
+                            rope_freqs)
     let loss_val = result[0]
     let gnorm_raw = result[1]
     let lr = result[2]
@@ -1429,6 +1444,272 @@ fn train_step_bf16(all_weights, all_grads, all_m1, all_m2,
 }
 
 // =====================================================================
+//  Gradient accumulation — forward+backward only (no optimizer)
+//
+//  Runs a single micro-batch forward+backward, accumulating gradients
+//  into the existing grad buffers (which use += semantics).
+//  Returns loss_val for logging.
+// =====================================================================
+fn train_micro_fwd_bwd(all_weights, all_grads,
+                       embed_w, lm_head_w, d_embed_w, d_lm_head_w,
+                       tokens, targets) {
+    // ── Forward pass ─────────────────────────────────────────
+
+    let hidden = alloc_f32(SZ_HIDDEN)
+    embedding_lookup(embed_w, tokens, hidden, SEQ_LEN, D_MODEL)
+
+    let mut saved_attn       = []
+    let mut saved_ffn        = []
+    let mut saved_pre_attn   = []
+    let mut saved_pre_ffn    = []
+    let mut saved_hidden_in  = []
+    let mut saved_mid_hidden = []
+    let mut saved_rstd_attn  = []
+    let mut saved_rstd_ffn   = []
+    let mut ckpt_hiddens     = []
+
+    for layer in 0..N_LAYERS {
+        if layer % CKPT_SEGMENT == 0 {
+            let ckpt = alloc_f32(SZ_HIDDEN)
+            copy_f32(hidden, ckpt, SZ_HIDDEN)
+            ckpt_hiddens.push(ckpt)
+        }
+
+        let weights = all_weights[layer]
+        let rms_attn = weights[7]
+        let rms_ffn  = weights[8]
+
+        let h_in = alloc_f32(SZ_HIDDEN)
+        copy_f32(hidden, h_in, SZ_HIDDEN)
+        saved_hidden_in.push(h_in)
+
+        let normed_attn = alloc_f32(SZ_HIDDEN)
+        let rstd_a = alloc_f32(SEQ_LEN)
+        rms_norm_fwd(hidden, rms_attn, normed_attn, rstd_a, SEQ_LEN, D_MODEL)
+        saved_pre_attn.push(normed_attn)
+        saved_rstd_attn.push(rstd_a)
+
+        let attn_result = attention_fwd_layer(normed_attn, weights)
+        let attn_out = attn_result[0]
+        saved_attn.push([attn_result[1], attn_result[2], attn_result[3], attn_result[4]])
+
+        let mid = alloc_f32(SZ_HIDDEN)
+        residual_add(hidden, attn_out, mid, SZ_HIDDEN)
+        free_f32(attn_out, SZ_ATTN_O)
+        saved_mid_hidden.push(mid)
+
+        let normed_ffn = alloc_f32(SZ_HIDDEN)
+        let rstd_f = alloc_f32(SEQ_LEN)
+        rms_norm_fwd(mid, rms_ffn, normed_ffn, rstd_f, SEQ_LEN, D_MODEL)
+        saved_pre_ffn.push(normed_ffn)
+        saved_rstd_ffn.push(rstd_f)
+
+        let ffn_result = ffn_fwd_layer(normed_ffn, weights)
+        let ffn_out = ffn_result[0]
+        saved_ffn.push([ffn_result[1], ffn_result[2], ffn_result[3]])
+
+        residual_add(mid, ffn_out, hidden, SZ_HIDDEN)
+        free_f32(ffn_out, SZ_HIDDEN)
+    }
+
+    let final_rms = all_weights[0][7]
+    let final_normed = alloc_f32(SZ_HIDDEN)
+    let final_rstd = alloc_f32(SEQ_LEN)
+    rms_norm_fwd(hidden, final_rms, final_normed, final_rstd, SEQ_LEN, D_MODEL)
+
+    let logits = alloc_f32(SEQ_LEN * VOCAB)
+    matmul_raw(final_normed, lm_head_w, logits, SEQ_LEN, D_MODEL, VOCAB)
+
+    let loss_result = cross_entropy_loss(logits, targets, SEQ_LEN, VOCAB)
+    let loss_val = loss_result[0]
+    let d_logits = loss_result[1]
+    free_f32(logits, SEQ_LEN * VOCAB)
+
+    // ── Backward pass ────────────────────────────────────────
+
+    let d_final = alloc_f32(SZ_HIDDEN)
+    for i in 0..SEQ_LEN {
+        for d in 0..D_MODEL {
+            let mut acc = 0.0
+            for v in 0..VOCAB {
+                let dl = deref_f32(d_logits, (i * VOCAB + v) * 4)
+                let wv = deref_f32(lm_head_w, (d * VOCAB + v) * 4)
+                acc = acc + dl * wv
+            }
+            write_f32(d_final, (i * D_MODEL + d) * 4, acc)
+        }
+    }
+
+    for d in 0..D_MODEL {
+        for v in 0..VOCAB {
+            let mut acc = deref_f32(d_lm_head_w, (d * VOCAB + v) * 4)
+            for i in 0..SEQ_LEN {
+                let fn_val = deref_f32(final_normed, (i * D_MODEL + d) * 4)
+                let dl = deref_f32(d_logits, (i * VOCAB + v) * 4)
+                acc = acc + fn_val * dl
+            }
+            write_f32(d_lm_head_w, (d * VOCAB + v) * 4, acc)
+        }
+    }
+    free_f32(d_logits, SEQ_LEN * VOCAB)
+
+    let d_hidden = alloc_f32(SZ_HIDDEN)
+    let d_final_rms = alloc_f32(SZ_RMS)
+    zero_f32(d_final_rms, SZ_RMS)
+    rms_norm_bwd(d_final, hidden, final_rms, final_rstd, d_hidden, d_final_rms, SEQ_LEN, D_MODEL)
+    add_f32(all_grads[0][7], d_final_rms, SZ_RMS)
+    free_f32(d_final_rms, SZ_RMS)
+    free_f32(d_final, SZ_HIDDEN)
+    free_f32(final_normed, SZ_HIDDEN)
+    free_f32(final_rstd, SEQ_LEN)
+
+    let mut layer_idx = N_LAYERS - 1
+    while layer_idx >= 0 {
+        let weights = all_weights[layer_idx]
+        let grads   = all_grads[layer_idx]
+        let rms_attn = weights[7]
+        let rms_ffn  = weights[8]
+
+        let h_in       = saved_hidden_in[layer_idx]
+        let mid        = saved_mid_hidden[layer_idx]
+        let normed_ffn = saved_pre_ffn[layer_idx]
+        let rstd_f     = saved_rstd_ffn[layer_idx]
+
+        let d_mid = alloc_f32(SZ_HIDDEN)
+        copy_f32(d_hidden, d_mid, SZ_HIDDEN)
+
+        let d_normed_ffn = alloc_f32(SZ_HIDDEN)
+        let d_rms_ffn_g = alloc_f32(SZ_RMS)
+        zero_f32(d_rms_ffn_g, SZ_RMS)
+        let d_ffn_in = ffn_bwd_layer(d_hidden, normed_ffn, saved_ffn[layer_idx], weights, grads)
+        let d_mid_ffn = alloc_f32(SZ_HIDDEN)
+        rms_norm_bwd(d_ffn_in, mid, rms_ffn, rstd_f, d_mid_ffn, d_rms_ffn_g, SEQ_LEN, D_MODEL)
+        add_f32(grads[8], d_rms_ffn_g, SZ_RMS)
+        free_f32(d_rms_ffn_g, SZ_RMS)
+        free_f32(d_ffn_in, SZ_HIDDEN)
+        free_f32(d_normed_ffn, SZ_HIDDEN)
+
+        add_f32(d_mid, d_mid_ffn, SZ_HIDDEN)
+        free_f32(d_mid_ffn, SZ_HIDDEN)
+
+        let d_h_in = alloc_f32(SZ_HIDDEN)
+        copy_f32(d_mid, d_h_in, SZ_HIDDEN)
+
+        let attn_saved = saved_attn[layer_idx]
+        let normed_attn = saved_pre_attn[layer_idx]
+        let d_attn_hidden = attention_bwd_layer(d_mid, normed_attn, attn_saved, weights, grads)
+
+        let rstd_a      = saved_rstd_attn[layer_idx]
+        let d_rms_attn_g = alloc_f32(SZ_RMS)
+        zero_f32(d_rms_attn_g, SZ_RMS)
+        let d_h_in_attn = alloc_f32(SZ_HIDDEN)
+        rms_norm_bwd(d_attn_hidden, h_in, rms_attn, rstd_a, d_h_in_attn, d_rms_attn_g, SEQ_LEN, D_MODEL)
+        add_f32(grads[7], d_rms_attn_g, SZ_RMS)
+        free_f32(d_rms_attn_g, SZ_RMS)
+        free_f32(d_attn_hidden, SZ_HIDDEN)
+
+        add_f32(d_h_in, d_h_in_attn, SZ_HIDDEN)
+        free_f32(d_h_in_attn, SZ_HIDDEN)
+
+        copy_f32(d_h_in, d_hidden, SZ_HIDDEN)
+        free_f32(d_h_in, SZ_HIDDEN)
+
+        free_f32(attn_saved[0], SZ_QH)
+        free_f32(attn_saved[1], SZ_KH)
+        free_f32(attn_saved[2], SZ_VH)
+        free_f32(attn_saved[3], SZ_QH)
+        free_f32(normed_attn, SZ_HIDDEN)
+        free_f32(rstd_a, SEQ_LEN)
+        free_f32(normed_ffn, SZ_HIDDEN)
+        free_f32(rstd_f, SEQ_LEN)
+        free_f32(saved_ffn[layer_idx][0], SEQ_LEN * FF_DIM)
+        free_f32(saved_ffn[layer_idx][1], SEQ_LEN * FF_DIM)
+        free_f32(saved_ffn[layer_idx][2], SEQ_LEN * FF_DIM)
+        free_f32(h_in, SZ_HIDDEN)
+        free_f32(mid, SZ_HIDDEN)
+        free_f32(d_mid, SZ_HIDDEN)
+
+        layer_idx = layer_idx - 1
+    }
+
+    embedding_bwd(d_hidden, tokens, d_embed_w, SEQ_LEN, D_MODEL)
+    free_f32(d_hidden, SZ_HIDDEN)
+    free_f32(hidden, SZ_HIDDEN)
+
+    for ckpt in ckpt_hiddens {
+        free_f32(ckpt, SZ_HIDDEN)
+    }
+
+    return loss_val
+}
+
+// =====================================================================
+//  Optimizer step after gradient accumulation
+//
+//  Scales accumulated grads by 1/accum_steps, syncs across nodes,
+//  clips, runs AdamW, then zeros all grad buffers.
+// =====================================================================
+fn train_accum_optimizer_step(all_weights, all_grads, all_m1, all_m2,
+                              embed_w, lm_head_w, d_embed_w, d_lm_head_w,
+                              embed_m1, embed_m2, lmh_m1, lmh_m2,
+                              step_num, hxccl_h, world_size, accum_steps) {
+    let sizes = [SZ_WQ, SZ_WK, SZ_WV, SZ_WO, SZ_WGATE, SZ_WUP, SZ_WDOWN, SZ_RMS, SZ_RMS]
+
+    // Scale accumulated gradients by 1/accum_steps
+    if accum_steps > 1 {
+        let inv_accum = 1.0 / (accum_steps * 1.0)
+        for layer in 0..N_LAYERS {
+            for idx in 0..9 {
+                scale_f32(all_grads[layer][idx], sizes[idx], inv_accum)
+            }
+        }
+        scale_f32(d_embed_w, SZ_EMBED, inv_accum)
+        scale_f32(d_lm_head_w, SZ_LM_HEAD, inv_accum)
+    }
+
+    // Gradient sync (hxccl allreduce)
+    grad_sync_allreduce(all_grads, hxccl_h)
+    if hxccl_h >= 0 {
+        hxccl_allreduce_float(hxccl_h, d_embed_w, SZ_EMBED, HXCCL_OP_SUM)
+        hxccl_allreduce_float(hxccl_h, d_lm_head_w, SZ_LM_HEAD, HXCCL_OP_SUM)
+        if world_size > 1 {
+            let inv_ws = 1.0 / (world_size * 1.0)
+            scale_f32(d_embed_w, SZ_EMBED, inv_ws)
+            scale_f32(d_lm_head_w, SZ_LM_HEAD, inv_ws)
+        }
+    }
+
+    // Gradient clipping
+    let gnorm = grad_clip_all_layers(all_grads, GRAD_CLIP)
+
+    // AdamW optimizer step with LR schedule
+    let lr = lr_schedule(step_num, WARMUP, TOTAL_STEPS, LR)
+    for layer in 0..N_LAYERS {
+        for idx in 0..9 {
+            adamw_update(all_weights[layer][idx],
+                         all_grads[layer][idx],
+                         all_m1[layer][idx],
+                         all_m2[layer][idx],
+                         sizes[idx], lr, BETA1, BETA2, WEIGHT_DECAY,
+                         step_num)
+        }
+    }
+    adamw_update(embed_w, d_embed_w, embed_m1, embed_m2,
+                 SZ_EMBED, lr, BETA1, BETA2, WEIGHT_DECAY, step_num)
+    adamw_update(lm_head_w, d_lm_head_w, lmh_m1, lmh_m2,
+                 SZ_LM_HEAD, lr, BETA1, BETA2, WEIGHT_DECAY, step_num)
+
+    // Zero all gradients for next accumulation window
+    for layer in 0..N_LAYERS {
+        zero_layer_grads(all_grads[layer])
+    }
+    zero_f32(d_embed_w, SZ_EMBED)
+    zero_f32(d_lm_head_w, SZ_LM_HEAD)
+
+    return [gnorm, lr]
+}
+
+// =====================================================================
 //  main — training loop entry point
 // =====================================================================
 // =====================================================================
@@ -1454,6 +1735,7 @@ fn main() {
     println("  ckpt_segment=" + str(CKPT_SEGMENT) + " (saves " + str(N_LAYERS / CKPT_SEGMENT) + " checkpoints)")
     println("  lr=" + str(LR) + " beta1=" + str(BETA1) + " beta2=" + str(BETA2) + " wd=" + str(WEIGHT_DECAY))
     println("  grad_clip=" + str(GRAD_CLIP) + " warmup=" + str(WARMUP) + " lr_min=" + str(LR_MIN) + " schedule=" + LR_SCHEDULE)
+    println("  grad_accum=" + str(ACCUM_STEPS) + " micro_batch=" + str(MICRO_BATCH) + " effective_batch=" + str(GA_CFG.effective_batch_size))
     println("  checkpoint_interval=" + str(CKPT_INTERVAL) + " prefix=" + CKPT_PREFIX)
     if USE_BF16 {
         println("  mixed_precision=bf16 (compute bf16, master fp32)")
@@ -1553,6 +1835,11 @@ fn main() {
     let hxccl_h = -1
     let world_size = 1
 
+    // Precompute RoPE frequency table [SEQ_LEN, HEAD_DIM/2]
+    println("[init] precomputing RoPE frequencies (theta=" + str(ROPE_THETA) + ")...")
+    let rope_freqs = precompute_freqs(HEAD_DIM, SEQ_LEN, ROPE_THETA)
+    println("[init] RoPE frequency table ready")
+
     // Synthetic data (next-token prediction)
     let mut tokens = []
     for i in 0..SEQ_LEN {
@@ -1588,8 +1875,9 @@ fn main() {
         println("[eval] EVAL_DATA_PATH not set — periodic eval disabled")
     }
 
-    // ── Training loop ───────────────────────────────────────────
+    // ── Training loop (with gradient accumulation) ────────────────
     println("")
+    ga_log_config(GA_CFG)
     println("[train] starting training loop...")
     let n_steps = 3   // demo: 3 steps (set TOTAL_STEPS for real training)
     let mut best_loss = 999999.0
@@ -1604,12 +1892,14 @@ fn main() {
         let t0 = time_ms()
 
         if USE_BF16 {
-            // ── bf16 mixed-precision path ────────────────────────
+            // ── bf16 mixed-precision path (uses its own loss scaling) ──
+            // bf16 path: accumulation handled inside train_step_bf16 for
+            // now — loss scaling interleaves with micro-batches
             let result = train_step_bf16(all_weights, all_grads, all_m1, all_m2,
                                          embed_w, lm_head_w, d_embed_w, d_lm_head_w,
                                          embed_m1, embed_m2, lmh_m1, lmh_m2,
                                          tokens, targets, step, hxccl_h, world_size,
-                                         cur_loss_scale, cur_clean_steps)
+                                         cur_loss_scale, cur_clean_steps, rope_freqs)
             let loss = result[0]
             let gnorm = result[1]
             let lr = result[2]
@@ -1640,25 +1930,63 @@ fn main() {
                                          embed_w, embed_m1, embed_m2,
                                          lm_head_w, lmh_m1, lmh_m2)
         } else {
-            // ── fp32 path (original) ─────────────────────────────
-            let result = train_step(all_weights, all_grads, all_m1, all_m2,
-                                    embed_w, lm_head_w, d_embed_w, d_lm_head_w,
-                                    embed_m1, embed_m2, lmh_m1, lmh_m2,
-                                    tokens, targets, step, hxccl_h, world_size)
-            let loss = result[0]
-            let gnorm = result[1]
-            let lr = result[2]
+            // ── fp32 path with gradient accumulation ─────────────
+            // Zero grads at start of accumulation window
+            for layer in 0..N_LAYERS {
+                zero_layer_grads(all_grads[layer])
+            }
+            zero_f32(d_embed_w, SZ_EMBED)
+            zero_f32(d_lm_head_w, SZ_LM_HEAD)
+
+            // Inner loop: accumulate gradients over ACCUM_STEPS micro-batches
+            let mut accum_loss = 0.0
+            for micro in 0..ACCUM_STEPS {
+                // Generate fresh micro-batch data each micro-step
+                let mut micro_tokens = []
+                for ti in 0..SEQ_LEN {
+                    micro_tokens.push(int(random() * VOCAB) % VOCAB)
+                }
+                let mut micro_targets = []
+                for ti in 0..SEQ_LEN {
+                    if ti < (SEQ_LEN - 1) {
+                        micro_targets.push(micro_tokens[(ti + 1)])
+                    } else {
+                        micro_targets.push(int(random() * VOCAB) % VOCAB)
+                    }
+                }
+
+                // Forward + backward only (grads accumulate via +=)
+                let micro_loss = train_micro_fwd_bwd(
+                    all_weights, all_grads,
+                    embed_w, lm_head_w, d_embed_w, d_lm_head_w,
+                    micro_tokens, micro_targets)
+                accum_loss = accum_loss + micro_loss
+            }
+
+            // Average loss across micro-batches
+            let loss = accum_loss / (ACCUM_STEPS * 1.0)
+
+            // Optimizer step: scale grads, sync, clip, AdamW, zero
+            let opt_result = train_accum_optimizer_step(
+                all_weights, all_grads, all_m1, all_m2,
+                embed_w, lm_head_w, d_embed_w, d_lm_head_w,
+                embed_m1, embed_m2, lmh_m1, lmh_m2,
+                step, hxccl_h, world_size, ACCUM_STEPS)
+            let gnorm = opt_result[0]
+            let lr = opt_result[1]
 
             if loss < best_loss { best_loss = loss }
 
             let elapsed = time_ms() - t0
-            let tps = if elapsed > 0.0 { (SEQ_LEN * 1000.0) / elapsed } else { 0.0 }
+            let total_tokens = SEQ_LEN * ACCUM_STEPS
+            let tps = if elapsed > 0.0 { (total_tokens * 1000.0) / elapsed } else { 0.0 }
 
             println("[step " + str(step) + "/" + str(n_steps) + "]"
                     + " loss=" + str(loss)
                     + " gnorm=" + str(gnorm)
                     + " lr=" + str(lr)
                     + " tok/s=" + str(tps)
+                    + " accum=" + str(ACCUM_STEPS)
                     + " time=" + str(elapsed) + "ms")
 
             // ── Auto-checkpoint (fp32 path) ─────────────────────
@@ -1669,7 +1997,7 @@ fn main() {
                                          lm_head_w, lmh_m1, lmh_m2)
         }
 
-        // ── Periodic evaluation ─────────────────────────────────
+        // ── Periodic evaluation (only at real steps, not micro-steps) ──
         if len(eval_data_path) > 0 {
             if should_eval(step, EVAL_INTERVAL) {
                 let eval_result = run_eval(all_weights, embed_w, lm_head_w,
@@ -1694,7 +2022,9 @@ fn main() {
                 + " overflows=" + str(total_overflows)
                 + " final_scale=" + str(cur_loss_scale))
     } else {
-        println("[done] training complete — best_loss=" + str(best_loss))
+        println("[done] training complete — best_loss=" + str(best_loss)
+                + " accum_steps=" + str(ACCUM_STEPS)
+                + " effective_batch=" + str(GA_CFG.effective_batch_size))
     }
 
     // ── Cleanup ─────────────────────────────────────────────────
@@ -1707,6 +2037,9 @@ fn main() {
     free_f32(embed_m2, SZ_EMBED)
     free_f32(lmh_m1, SZ_LM_HEAD)
     free_f32(lmh_m2, SZ_LM_HEAD)
+
+    // Free RoPE frequency table
+    free_freqs(rope_freqs, HEAD_DIM, SEQ_LEN)
 
     // Free layer weights + grads + moments
     let sizes = [SZ_WQ, SZ_WK, SZ_WV, SZ_WO, SZ_WGATE, SZ_WUP, SZ_WDOWN, SZ_RMS, SZ_RMS]
