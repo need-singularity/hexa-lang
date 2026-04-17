@@ -1,6 +1,8 @@
 # HEXA Self-Hosting Roadmap — Rust 완전 편입
 
-> ✅ **달성 완료 (2026-04-11)** — src/*.rs 147개 전체 self/*.hexa로 흡수, src/ 디렉토리 + Cargo.toml + Cargo.lock + .cargo/config.toml + cranelift + wasm-bindgen 의존 0건. 프로젝트 전체 .rs=0 .py=0. 빌드 파이프라인은 build_hexa.hexa(self-host) → C → clang.
+> ✅ **Phase 1 달성 (2026-04-11)** — Rust 완전 편입: src/*.rs 147개 → self/*.hexa 흡수. .rs=0 .py=0.
+> ⚠️ **C 의존 잔존** — 현재 파이프라인: `.hexa → hexa_v2(transpiler) → .c → clang → native`.
+>   runtime.c (4,696 LOC) 필수 링크. 진정한 독립 = Phase 7 (native codegen: ARM64/x86_64 직접 emit).
 >
 > 아래 본문은 역사적 기록 (2026-04-07~04-11 진행 과정).
 >
@@ -265,6 +267,17 @@
 - [ ] **P6-3** WASM 백엔드
 - [ ] **P6-4** 디버거
 - [ ] **P6-5** 포매터/린터
+
+## Phase 7: C 독립 — Native Codegen (clang/gcc 제거)
+> 현재: .hexa → C → clang → native. C 중간 언어 + runtime.c (4,696 LOC) 의존.
+> 목표: .hexa → ARM64/x86_64 machine code 직접 emit. clang 불필요.
+
+- [ ] **P7-1** ELF/Mach-O 바이너리 포맷 직접 생성 (헤더 + 섹션)
+- [ ] **P7-2** ARM64 명령어 인코더 (순수 Hexa)
+- [ ] **P7-3** x86_64 명령어 인코더 (순수 Hexa)
+- [ ] **P7-4** runtime.c → 순수 Hexa 포팅 (hexa_eq, hexa_add, arena 등)
+- [ ] **P7-5** 레지스터 할당기 (linear scan)
+- [ ] **P7-6** fixpoint: hexa native codegen으로 자기 자신 빌드
 
 ---
 

@@ -53,6 +53,9 @@ hexa-lang 핵심 규칙:
        - exec_with_status() — 실제 exit code 반환. interpreter: sentinel($?), native: pclose(WEXITSTATUS)
        - T33-fix-2 — ValStruct arena corruption 근본 수정 (from_arena=0). HEXA_VAL_ARENA=0 불필요
        - rebuild_stage0/build_stage0 — clang/flatten 실패 시 정확히 감지+롤백+exit(1)
+  HX10: self-hosting 현황 — Rust 편입 완료(P0-P5), C 의존 잔존
+       - 현재: .hexa → hexa_v2 → .c → clang → native + runtime.c(4,696 LOC) 링크
+       - Phase 7: ARM64/x86_64 native codegen → clang 제거 → 진정한 독립
 
 ref:
   rules     shared/rules/common.json             R0~R27
