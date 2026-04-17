@@ -1,0 +1,311 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/weight_init.hexa — Proper weight initialization for
+//  7B transformer training pipeline.
+//
+//  Strategies:
+//    xavier_uniform  — Glorot uniform for attention Wq/Wk/Wv
+//    he_normal       — He/Kaiming for ReLU/SwiGLU FFN layers
+//    normal_init     — general N(mean, std) via Box-Muller
+//    zeros_init      — zero fill
+//    small_init      — GPT-2 style 1/sqrt(2*n_layers) residual
+//    ones_init       — for RMSNorm gamma
+//
+//  Composite:
+//    init_transformer_layer  — full layer init with proper strategy
+//    load_pretrained_weights — load from .hexaw binary format
+//
+//  Uses alloc_f32/write_f32/deref_f32 raw buffer API (native path).
+//  Grammar notes (HX3): no semicolons, .push() not arr+[x].
+// ═══════════════════════════════════════════════════════════════
+
+let PI = 3.141592653589793
+
+// ── Box-Muller: generate one N(0,1) sample ──────────────────
+// Uses two uniform random() calls -> one normal variate.
+// Clamps log input to avoid -inf on rare random()=0.
+@pure
+fn _randn() {
+    let mut u1 = random()
+    let u2 = random()
+    if u1 < 1.0e-10 { u1 = 1.0e-10 }
+    // Box-Muller transform: z = sqrt(-2 ln u1) * cos(2 pi u2)
+    let r = sqrt(-2.0 * _wi_log(u1))
+    let theta = 2.0 * PI * u2
+    return r * _wi_cos(theta)
+}
+
+// ── Fast log via Newton (enough for init RNG) ───────────────
+@pure
+fn _wi_log(x) {
+    if x <= 0.0 { return -1.0e30 }
+    // ln(x) via identity: x = m * 2^e, ln(x) = ln(m) + e*ln(2)
+    // Use Newton iterations on exp(y) = x starting from rough est
+    let mut y = 0.0
+    if x > 1.0 { y = x - 1.0 }
+    if x < 1.0 { y = x - 1.0 }
+    // 8 Newton iterations: y <- y - 1 + x * exp(-y)
+    let mut i = 0
+    while i < 8 {
+        let ey = _wi_exp(y)
+        if ey < 1.0e-30 { y = y - 1.0 } else {
+            y = y - (ey - x) / ey
+        }
+        i = i + 1
+    }
+    return y
+}
+
+// ── Fast exp via Taylor (enough for init, |y| < 20 typical) ─
+@pure
+fn _wi_exp(y) {
+    // Range reduction + 13-term Taylor
+    let mut x = y
+    let mut k = 0
+    while x > 1.0  { x = x - 1.0; k = k + 1 }
+    while x < -1.0 { x = x + 1.0; k = k - 1 }
+    // Taylor: e^x = 1 + x + x^2/2! + ...
+    let mut s = 1.0
+    let mut t = 1.0
+    let mut n = 1
+    while n <= 12 {
+        t = t * x / (n * 1.0)
+        s = s + t
+        n = n + 1
+    }
+    // Multiply back: e^y = e^x * e^k = s * 2.718...^k
+    let e = 2.718281828459045
+    let mut ek = 1.0
+    let mut j = 0
+    if k >= 0 {
+        while j < k { ek = ek * e; j = j + 1 }
+    } else {
+        let ak = 0 - k
+        while j < ak { ek = ek * e; j = j + 1 }
+        ek = 1.0 / ek
+    }
+    return s * ek
+}
+
+// ── cos via Taylor (enough for Box-Muller) ──────────────────
+@pure
+fn _wi_cos(x) {
+    // Reduce to [-pi, pi]
+    let mut v = x
+    while v > PI  { v = v - 2.0 * PI }
+    while v < (0.0 - PI) { v = v + 2.0 * PI }
+    // Taylor: cos(v) = 1 - v^2/2! + v^4/4! - ...
+    let mut s = 1.0
+    let mut t = 1.0
+    let mut n = 1
+    while n <= 10 {
+        t = 0.0 - t * v * v / ((2 * n - 1) * 1.0) / ((2 * n) * 1.0)
+        s = s + t
+        n = n + 1
+    }
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  1. xavier_uniform(buf, n, fan_in, fan_out)
+//     U(-limit, limit) where limit = sqrt(6 / (fan_in + fan_out))
+//     Standard Glorot init for linear projections.
+// ═══════════════════════════════════════════════════════════════
+fn xavier_uniform(buf, n, fan_in, fan_out) {
+    let limit = sqrt(6.0 / (fan_in * 1.0 + fan_out * 1.0))
+    let mut i = 0
+    while i < n {
+        let u = random() * 2.0 - 1.0
+        write_f32(buf, i * 4, u * limit)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  2. he_normal(buf, n, fan_in)
+//     N(0, sqrt(2/fan_in)) — He/Kaiming for ReLU-family.
+//     SwiGLU uses this because the gate is ~ReLU-shaped.
+// ═══════════════════════════════════════════════════════════════
+fn he_normal(buf, n, fan_in) {
+    let std = sqrt(2.0 / (fan_in * 1.0))
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, _randn() * std)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  3. normal_init(buf, n, mean, std)
+//     General N(mean, std) initialization.
+// ═══════════════════════════════════════════════════════════════
+fn normal_init(buf, n, mean, std) {
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, _randn() * std + mean)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  4. zeros_init(buf, n) — zero fill
+// ═══════════════════════════════════════════════════════════════
+fn zeros_init(buf, n) {
+    zero_f32(buf, n)
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  5. ones_init(buf, n) — fill with 1.0 (RMSNorm gamma)
+// ═══════════════════════════════════════════════════════════════
+fn ones_init(buf, n) {
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, 1.0)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  6. small_init(buf, n, scale)
+//     N(0, scale) — GPT-2 style residual projection init.
+//     Typical scale = 1/sqrt(2 * n_layers) for output projections.
+//     This keeps residual stream variance stable across depth.
+// ═══════════════════════════════════════════════════════════════
+fn small_init(buf, n, scale) {
+    let mut i = 0
+    while i < n {
+        write_f32(buf, i * 4, _randn() * scale)
+        i = i + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  7. init_transformer_layer(layer_bufs, d_model, d_ff,
+//                            n_layers, layer_idx)
+//
+//  layer_bufs layout (matches train_7b_integrated.hexa):
+//    [0] wq       [d_model * d_model]     Xavier uniform
+//    [1] wk       [d_model * kv_dim]      Xavier uniform
+//    [2] wv       [d_model * kv_dim]      Xavier uniform
+//    [3] wo       [d_model * d_model]     small_init (residual)
+//    [4] wgate    [d_model * d_ff]        He normal (SwiGLU)
+//    [5] wup      [d_model * d_ff]        He normal (SwiGLU)
+//    [6] wdown    [d_ff * d_model]        small_init (residual)
+//    [7] rms_attn [d_model]               ones
+//    [8] rms_ffn  [d_model]               ones
+//
+//  Residual scale = 1/sqrt(2 * n_layers) per GPT-2/Megatron.
+//  The factor of 2 accounts for two residual additions per layer
+//  (post-attention + post-FFN).
+// ═══════════════════════════════════════════════════════════════
+fn init_transformer_layer(layer_bufs, d_model, d_ff, n_layers, layer_idx) {
+    let n_kv_heads = 8
+    let head_dim = 128
+    let kv_dim = n_kv_heads * head_dim
+
+    let sz_wq    = d_model * d_model
+    let sz_wk    = d_model * kv_dim
+    let sz_wv    = d_model * kv_dim
+    let sz_wo    = d_model * d_model
+    let sz_wgate = d_model * d_ff
+    let sz_wup   = d_model * d_ff
+    let sz_wdown = d_ff * d_model
+
+    // Residual projection scale: 1/sqrt(2 * n_layers)
+    let res_scale = 1.0 / sqrt(2.0 * n_layers * 1.0)
+
+    // Attention projections — Xavier uniform
+    xavier_uniform(layer_bufs[0], sz_wq, d_model, d_model)
+    xavier_uniform(layer_bufs[1], sz_wk, d_model, kv_dim)
+    xavier_uniform(layer_bufs[2], sz_wv, d_model, kv_dim)
+
+    // Output projection — small init (residual stream preservation)
+    small_init(layer_bufs[3], sz_wo, res_scale)
+
+    // FFN gate + up — He normal (SwiGLU ≈ ReLU activation)
+    he_normal(layer_bufs[4], sz_wgate, d_model)
+    he_normal(layer_bufs[5], sz_wup, d_model)
+
+    // FFN down — small init (second residual addition)
+    small_init(layer_bufs[6], sz_wdown, res_scale)
+
+    // RMSNorm gamma — ones
+    ones_init(layer_bufs[7], d_model)
+    ones_init(layer_bufs[8], d_model)
+
+    println("[weight_init] layer " + str(layer_idx) + " initialized (xavier/he/small)")
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  8. load_pretrained_weights(path, all_layer_bufs, embed_buf,
+//                             lm_head_buf, d_model, d_ff, n_layers)
+//
+//  Loads .hexaw file and copies weights into pre-allocated buffers.
+//  Tensor naming convention:
+//    layers.{i}.wq, layers.{i}.wk, layers.{i}.wv, layers.{i}.wo
+//    layers.{i}.wgate, layers.{i}.wup, layers.{i}.wdown
+//    layers.{i}.rms_attn, layers.{i}.rms_ffn
+//    embed, lm_head
+//
+//  Returns true on success, false on missing/corrupt file.
+// ═══════════════════════════════════════════════════════════════
+fn load_pretrained_weights(path, all_layer_bufs, embed_buf, lm_head_buf, d_model, d_ff, n_layers) {
+    println("[weight_init] loading pretrained weights from " + path)
+    let hxw = hexaw_load(path)
+    let names = hxw.names
+    if len(names) == 0 {
+        println("[weight_init] ERROR: no tensors found in " + path)
+        return false
+    }
+    println("[weight_init] found " + str(len(names)) + " tensors")
+
+    // Layer weight keys in buffer order
+    let suffixes = ["wq", "wk", "wv", "wo", "wgate", "wup", "wdown", "rms_attn", "rms_ffn"]
+
+    let mut layer = 0
+    while layer < n_layers {
+        let prefix = "layers." + str(layer) + "."
+        let bufs = all_layer_bufs[layer]
+        let mut s = 0
+        while s < 9 {
+            let tname = prefix + suffixes[s]
+            let data = hexaw_tensor(hxw, tname)
+            let cnt = len(data)
+            if cnt > 0 {
+                let mut j = 0
+                while j < cnt {
+                    write_f32(bufs[s], j * 4, data[j])
+                    j = j + 1
+                }
+            } else {
+                println("[weight_init] WARN: missing tensor " + tname)
+            }
+            s = s + 1
+        }
+        layer = layer + 1
+    }
+
+    // Embedding
+    let embed_data = hexaw_tensor(hxw, "embed")
+    if len(embed_data) > 0 {
+        let mut i = 0
+        while i < len(embed_data) {
+            write_f32(embed_buf, i * 4, embed_data[i])
+            i = i + 1
+        }
+        println("[weight_init] embed loaded (" + str(len(embed_data)) + " params)")
+    }
+
+    // LM head
+    let lmh_data = hexaw_tensor(hxw, "lm_head")
+    if len(lmh_data) > 0 {
+        let mut i = 0
+        while i < len(lmh_data) {
+            write_f32(lm_head_buf, i * 4, lmh_data[i])
+            i = i + 1
+        }
+        println("[weight_init] lm_head loaded (" + str(len(lmh_data)) + " params)")
+    }
+
+    println("[weight_init] pretrained load complete")
+    return true
+}

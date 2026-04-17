@@ -1,0 +1,318 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ml/corpus_clean.hexa — 1-pass corpus cleaning pipeline
+//
+//  Replaces 14-process bash pipe (bzcat|awk|sed|sed|sed|sed|awk|awk|awk|...)
+//  with a single hexa process reading from stdin.
+//
+//  Usage:
+//    bzcat enwiki.xml.bz2 | hexa self/ml/corpus_clean.hexa --mode=enwiki --max-bytes=10G > out.txt
+//    xzcat cc100-en.txt.xz | hexa self/ml/corpus_clean.hexa --mode=cc100 --max-bytes=10G > out.txt
+//
+//  Savings:
+//    Processes:  14 → 2 (decompressor + hexa)
+//    RAM:        4.4GB (awk dedup hash) → ~200MB (bloom filter)
+//    CPU:        ~4 cores → ~1 core (no IPC pipe overhead)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── bloom filter for O(1) dedup with bounded memory ────────────────
+
+let BLOOM_BITS = 1 << 24    // 16M bits = 2MB memory
+let BLOOM_K = 5             // 5 hash functions → ~1% FPR at 500K items
+let bloom = [0].repeat(BLOOM_BITS / 64 + 1)
+
+fn bloom_hash(s, seed) {
+    let mut h = seed
+    let n = s.length()
+    let mut i = 0
+    while i < n {
+        h = h * 2654435761 + s.char_code(i)
+        h = h ^ (h >> 16)
+        i = i + 1
+    }
+    if h < 0 { h = 0 - h }
+    return h
+}
+
+fn bloom_set(s) {
+    let mut k = 0
+    while k < BLOOM_K {
+        let bit = bloom_hash(s, k * 999983 + 1) % BLOOM_BITS
+        let idx = bit / 64
+        let off = bit % 64
+        bloom[idx] = bloom[idx] | (1 << off)
+        k = k + 1
+    }
+}
+
+fn bloom_test(s) {
+    let mut k = 0
+    while k < BLOOM_K {
+        let bit = bloom_hash(s, k * 999983 + 1) % BLOOM_BITS
+        let idx = bit / 64
+        let off = bit % 64
+        if (bloom[idx] & (1 << off)) == 0 { return false }
+        k = k + 1
+    }
+    return true
+}
+
+fn bloom_check_and_add(s) {
+    // returns true if probably seen before
+    let was = bloom_test(s)
+    if !was { bloom_set(s) }
+    return was
+}
+
+// ── text cleaning functions ────────────────────────────────────────
+
+fn is_latin_or_space(c) {
+    return (c >= 65 && c <= 90) || (c >= 97 && c <= 122) || c == 32
+}
+
+fn english_ratio(line) {
+    let n = line.length()
+    if n == 0 { return 1.0 }
+    let mut a = 0
+    let mut i = 0
+    while i < n {
+        if is_latin_or_space(line.char_code(i)) { a = a + 1 }
+        i = i + 1
+    }
+    return a.to_float() / n.to_float()
+}
+
+fn strip_templates(s) {
+    // remove {{...}} — non-greedy via manual scan
+    let mut out = []
+    let n = s.length()
+    let mut i = 0
+    let mut depth = 0
+    while i < n {
+        if i + 1 < n && s.char_code(i) == 123 && s.char_code(i + 1) == 123 {
+            depth = depth + 1
+            i = i + 2
+        } else if i + 1 < n && s.char_code(i) == 125 && s.char_code(i + 1) == 125 && depth > 0 {
+            depth = depth - 1
+            i = i + 2
+        } else if depth == 0 {
+            out.push(s.substring(i, i + 1))
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+fn strip_wikilinks(s) {
+    // [[target|display]] → display,  [[plain]] → plain
+    let mut out = []
+    let n = s.length()
+    let mut i = 0
+    while i < n {
+        if i + 1 < n && s.char_code(i) == 91 && s.char_code(i + 1) == 91 {
+            // find closing ]]
+            let start = i + 2
+            let mut j = start
+            let mut found = false
+            while j + 1 < n && j - start < 200 {
+                if s.char_code(j) == 93 && s.char_code(j + 1) == 93 {
+                    found = true
+                    break
+                }
+                j = j + 1
+            }
+            if found {
+                let inner = s.substring(start, j)
+                // check for pipe
+                let mut pipe_pos = -1
+                let mut k = 0
+                while k < inner.length() {
+                    if inner.char_code(k) == 124 {
+                        pipe_pos = k
+                        break
+                    }
+                    k = k + 1
+                }
+                if pipe_pos >= 0 {
+                    out.push(inner.substring(pipe_pos + 1, inner.length()))
+                } else {
+                    out.push(inner)
+                }
+                i = j + 2
+            } else {
+                out.push("[")
+                i = i + 1
+            }
+        } else {
+            out.push(s.substring(i, i + 1))
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+fn strip_html(s) {
+    // remove <...> tags
+    let mut out = []
+    let n = s.length()
+    let mut i = 0
+    let mut in_tag = false
+    while i < n {
+        let c = s.char_code(i)
+        if c == 60 { in_tag = true }
+        else if c == 62 { in_tag = false }
+        else if !in_tag { out.push(s.substring(i, i + 1)) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+fn clean_wiki_line(line) {
+    let mut s = strip_templates(line)
+    s = strip_wikilinks(s)
+    s = strip_html(s)
+    return s
+}
+
+// ── enwiki XML extraction (replaces _enwiki_extract.awk) ───────────
+
+fn process_enwiki(max_bytes) {
+    let mut in_text = false
+    let mut ns = "0"
+    let mut text_parts = []
+    let mut bytes_written = 0
+
+    while true {
+        let line = read_line()
+        if line == null { break }
+
+        // <ns>...</ns>
+        if line.contains("<ns>") {
+            let mut s = line
+            let a = s.index_of("<ns>")
+            if a >= 0 {
+                s = s.substring(a + 4, s.length())
+                let b = s.index_of("</ns>")
+                if b >= 0 { ns = s.substring(0, b) }
+            }
+            continue
+        }
+
+        // <text ...> start
+        if line.contains("<text") && !in_text {
+            let a = line.index_of(">")
+            if a >= 0 {
+                let rest = line.substring(a + 1, line.length())
+                if rest.contains("</text>") {
+                    let b = rest.index_of("</text>")
+                    let chunk = rest.substring(0, b)
+                    if ns == "0" && chunk.length() > 10 {
+                        let cleaned = clean_wiki_line(chunk)
+                        let clen = cleaned.length()
+                        if clen >= 50 && clen <= 10000 && cleaned.char_code(0) != 123 {
+                            if !bloom_check_and_add(cleaned) {
+                                print(cleaned)
+                                bytes_written = bytes_written + clen + 1
+                                if bytes_written >= max_bytes { break }
+                            }
+                        }
+                    }
+                } else {
+                    text_parts = [rest]
+                    in_text = true
+                }
+            }
+            continue
+        }
+
+        // </text> end
+        if in_text && line.contains("</text>") {
+            let b = line.index_of("</text>")
+            text_parts.push(line.substring(0, b))
+            in_text = false
+            if ns == "0" {
+                let text = text_parts.join(" ")
+                if text.length() > 10 {
+                    let cleaned = clean_wiki_line(text)
+                    let clen = cleaned.length()
+                    if clen >= 50 && clen <= 10000 && cleaned.char_code(0) != 123 {
+                        if !bloom_check_and_add(cleaned) {
+                            print(cleaned)
+                            bytes_written = bytes_written + clen + 1
+                            if bytes_written >= max_bytes { break }
+                        }
+                    }
+                }
+            }
+            text_parts = []
+            ns = "0"
+            continue
+        }
+
+        // accumulate text
+        if in_text {
+            text_parts.push(line)
+        }
+    }
+    eprint("enwiki done: " + bytes_written.to_string() + " bytes")
+}
+
+// ── cc100 plain-text mode ──────────────────────────────────────────
+
+fn process_cc100(max_bytes) {
+    let mut bytes_written = 0
+
+    while true {
+        let line = read_line()
+        if line == null { break }
+
+        let n = line.length()
+
+        // length filter: 50..10000
+        if n < 50 || n > 10000 { continue }
+
+        // english ratio >= 60%
+        if english_ratio(line) < 0.60 { continue }
+
+        // dedup via bloom filter
+        if bloom_check_and_add(line) { continue }
+
+        print(line)
+        bytes_written = bytes_written + n + 1
+        if bytes_written >= max_bytes { break }
+    }
+    eprint("cc100 done: " + bytes_written.to_string() + " bytes")
+}
+
+// ── main ───────────────────────────────────────────────────────────
+
+fn main() {
+    let args = argv()
+    let mut mode = "cc100"
+    let mut max_bytes = 10737418240   // 10GB default
+
+    let mut i = 0
+    while i < args.length() {
+        let a = args[i]
+        if a == "--mode=enwiki" { mode = "enwiki" }
+        if a == "--mode=cc100"  { mode = "cc100" }
+        if a.starts_with("--max-bytes=") {
+            let val = a.substring(12, a.length())
+            if val.ends_with("G") {
+                max_bytes = val.substring(0, val.length() - 1).to_int() * 1073741824
+            } else {
+                max_bytes = val.to_int()
+            }
+        }
+        i = i + 1
+    }
+
+    if mode == "enwiki" {
+        process_enwiki(max_bytes)
+    } else {
+        process_cc100(max_bytes)
+    }
+}
+
+main()

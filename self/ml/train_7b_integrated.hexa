@@ -24,6 +24,11 @@
 
 use "hxblas_bf16"
 use "checkpoint"
+use "eval_harness"
+use "data_loader"
+use "weight_init"
+use "hexaw"
+use "lr_schedule"
 
 // ── 7B-class shape constants ────────────────────────────────────
 let D_MODEL   = 4096
@@ -37,12 +42,18 @@ let VOCAB     = 32000
 
 // ── Training hyperparameters ────────────────────────────────────
 let LR          = 3.0e-4
+let LR_MIN      = 1.0e-6    // minimum LR floor (cosine/linear decay target)
 let BETA1       = 0.9
 let BETA2       = 0.95
 let WEIGHT_DECAY = 0.1
 let GRAD_CLIP   = 1.0
-let WARMUP      = 100
+let WARMUP      = 200       // warmup steps (200 for 7B-class models)
 let TOTAL_STEPS = 10000
+let LR_SCHEDULE = "cosine"  // "cosine" | "linear" | "constant_with_warmup"
+
+// ── Evaluation config ───────────────────────────────────────────
+let EVAL_INTERVAL  = 1000    // evaluate every N steps (0 = disabled)
+let EVAL_MAX_BATCH = 10      // max batches per eval (0 = all)
 
 // ── Tile sizes for flash attention ──────────────────────────────
 let FLASH_BR = 64
@@ -262,24 +273,11 @@ fn init_layer_weights(layer_idx) {
     let rms_a = alloc_f32(SZ_RMS)
     let rms_f = alloc_f32(SZ_RMS)
 
-    // Xavier init: scale = sqrt(2 / fan_in)
-    let scale_d = sqrt(2.0 / (D_MODEL * 1.0))
-    let scale_ff = sqrt(2.0 / (FF_DIM * 1.0))
+    // Proper per-component initialization via weight_init module
+    let bufs = [wq, wk, wv, wo, wgate, wup, wdown, rms_a, rms_f]
+    init_transformer_layer(bufs, D_MODEL, FF_DIM, N_LAYERS, layer_idx)
 
-    // Init weights with scaled random values
-    for i in 0..SZ_WQ { write_f32(wq, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WK { write_f32(wk, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WV { write_f32(wv, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WO { write_f32(wo, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WGATE { write_f32(wgate, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WUP { write_f32(wup, i * 4, (random() - 0.5) * scale_d) }
-    for i in 0..SZ_WDOWN { write_f32(wdown, i * 4, (random() - 0.5) * scale_ff) }
-
-    // RMSNorm weights init to 1.0
-    for i in 0..SZ_RMS { write_f32(rms_a, i * 4, 1.0) }
-    for i in 0..SZ_RMS { write_f32(rms_f, i * 4, 1.0) }
-
-    return [wq, wk, wv, wo, wgate, wup, wdown, rms_a, rms_f]
+    return bufs
 }
 
 // =====================================================================
@@ -965,16 +963,12 @@ fn grad_sync_allreduce(all_grads, hxccl_h) {
 }
 
 // =====================================================================
-//  lr_schedule — cosine warmup + decay
+//  lr_schedule — delegates to lr_schedule.hexa module
+//  Supports: "cosine" (default), "linear", "constant_with_warmup"
+//  Configured by LR_SCHEDULE, LR_MIN globals
 // =====================================================================
 fn lr_schedule(step, warmup, total, peak_lr) {
-    let min_lr = peak_lr * 0.1
-    if step <= warmup {
-        return min_lr + (peak_lr - min_lr) * (step * 1.0) / (warmup * 1.0)
-    }
-    let progress = ((step - warmup) * 1.0) / ((total - warmup) * 1.0)
-    let cosval = cos(progress * 3.14159265)
-    return min_lr + (peak_lr - min_lr) * 0.5 * (1.0 + cosval)
+    return get_lr(LR_SCHEDULE, step, warmup, total, peak_lr, LR_MIN)
 }
 
 // =====================================================================
@@ -1459,7 +1453,7 @@ fn main() {
     println("  flash_br=" + str(FLASH_BR) + " flash_bc=" + str(FLASH_BC))
     println("  ckpt_segment=" + str(CKPT_SEGMENT) + " (saves " + str(N_LAYERS / CKPT_SEGMENT) + " checkpoints)")
     println("  lr=" + str(LR) + " beta1=" + str(BETA1) + " beta2=" + str(BETA2) + " wd=" + str(WEIGHT_DECAY))
-    println("  grad_clip=" + str(GRAD_CLIP) + " warmup=" + str(WARMUP))
+    println("  grad_clip=" + str(GRAD_CLIP) + " warmup=" + str(WARMUP) + " lr_min=" + str(LR_MIN) + " schedule=" + LR_SCHEDULE)
     println("  checkpoint_interval=" + str(CKPT_INTERVAL) + " prefix=" + CKPT_PREFIX)
     if USE_BF16 {
         println("  mixed_precision=bf16 (compute bf16, master fp32)")
@@ -1503,20 +1497,14 @@ fn main() {
     }
     println("[init] " + str(N_LAYERS) + " layers allocated")
 
-    // Embedding table [VOCAB, D] — Xavier init
+    // Embedding table [VOCAB, D] — Xavier uniform
     println("[init] allocating embedding table + LM head...")
     let embed_w = alloc_f32(SZ_EMBED)
-    let scale_e = sqrt(2.0 / (VOCAB * 1.0))
-    for i in 0..SZ_EMBED {
-        write_f32(embed_w, i * 4, (random() - 0.5) * scale_e)
-    }
+    xavier_uniform(embed_w, SZ_EMBED, VOCAB, D_MODEL)
 
-    // LM head [D, VOCAB]
+    // LM head [D, VOCAB] — small init (tied with embed conceptually)
     let lm_head_w = alloc_f32(SZ_LM_HEAD)
-    let scale_lmh = sqrt(2.0 / (D_MODEL * 1.0))
-    for i in 0..SZ_LM_HEAD {
-        write_f32(lm_head_w, i * 4, (random() - 0.5) * scale_lmh)
-    }
+    normal_init(lm_head_w, SZ_LM_HEAD, 0.0, 1.0 / sqrt(D_MODEL * 1.0))
 
     // Gradient buffers for embedding + LM head
     let d_embed_w = alloc_f32(SZ_EMBED)
@@ -1578,6 +1566,26 @@ fn main() {
         } else {
             targets.push(int(random() * VOCAB) % VOCAB)
         }
+    }
+
+    // ── Eval config ────────────────────────────────────────────
+    let eval_data_path = env("EVAL_DATA_PATH")
+    let eval_cfg = EvalConfig {
+        d_model:   D_MODEL,
+        n_layers:  N_LAYERS,
+        n_heads:   N_HEADS,
+        n_kv:      N_KV,
+        head_dim:  HEAD_DIM,
+        seq_len:   SEQ_LEN,
+        ff_dim:    FF_DIM,
+        vocab:     VOCAB,
+        batch_size: 1,
+        max_batches: EVAL_MAX_BATCH
+    }
+    if len(eval_data_path) > 0 {
+        println("[eval] EVAL_DATA_PATH=" + eval_data_path + " interval=" + str(EVAL_INTERVAL))
+    } else {
+        println("[eval] EVAL_DATA_PATH not set — periodic eval disabled")
     }
 
     // ── Training loop ───────────────────────────────────────────
@@ -1659,6 +1667,14 @@ fn main() {
                                          all_weights, all_m1, all_m2,
                                          embed_w, embed_m1, embed_m2,
                                          lm_head_w, lmh_m1, lmh_m2)
+        }
+
+        // ── Periodic evaluation ─────────────────────────────────
+        if len(eval_data_path) > 0 {
+            if should_eval(step, EVAL_INTERVAL) {
+                let eval_result = run_eval(all_weights, embed_w, lm_head_w,
+                                           eval_data_path, eval_cfg, step)
+            }
         }
     }
 

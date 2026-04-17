@@ -1,0 +1,581 @@
+// =====================================================================
+//  self/ml/eval_harness.hexa — Evaluation harness for 7B training
+//
+//  Periodic evaluation during training: perplexity, top-1 accuracy,
+//  and qualitative prompt completions.
+//
+//  API:
+//    eval_perplexity(weights, eval_data, config)   -> f64
+//    eval_accuracy(weights, eval_data, config)      -> f64
+//    run_eval(weights, eval_path, config, step)     -> EvalResult
+//    eval_on_prompts(weights, prompts, config)      -> [str]
+//
+//  Uses the same forward path as train_7b_integrated.hexa (no backward).
+//  All tensor data via raw f32 pointers for zero-copy FFI compat.
+//
+//  Grammar notes (HX3):
+//    - .push() not arr+[x] in loops
+//    - parens in slice index arithmetic: arr[(i+1)..j]
+//    - avoid `handle` as param name (reserved)
+// =====================================================================
+
+use "hxblas_bf16"
+
+// ── Shape constants (must match train_7b_integrated) ────────────
+let EVAL_D_MODEL   = 4096
+let EVAL_N_LAYERS  = 32
+let EVAL_N_HEADS   = 32
+let EVAL_N_KV      = 8
+let EVAL_HEAD_DIM  = 128
+let EVAL_SEQ_LEN   = 2048
+let EVAL_FF_DIM    = 11008
+let EVAL_VOCAB     = 32000
+let EVAL_KV_DIM    = EVAL_N_KV * EVAL_HEAD_DIM
+
+// Derived sizes
+let EVAL_SZ_HIDDEN = EVAL_SEQ_LEN * EVAL_D_MODEL
+
+// ── EvalResult struct ───────────────────────────────────────────
+struct EvalResult {
+    step:       int,
+    perplexity: float,
+    accuracy:   float,
+    avg_loss:   float,
+    n_tokens:   int,
+    elapsed_ms: float
+}
+
+// ── Config struct for eval ──────────────────────────────────────
+struct EvalConfig {
+    d_model:   int,
+    n_layers:  int,
+    n_heads:   int,
+    n_kv:      int,
+    head_dim:  int,
+    seq_len:   int,
+    ff_dim:    int,
+    vocab:     int,
+    batch_size: int,
+    max_batches: int    // 0 = all batches in eval set
+}
+
+fn default_eval_config() {
+    return EvalConfig {
+        d_model:   EVAL_D_MODEL,
+        n_layers:  EVAL_N_LAYERS,
+        n_heads:   EVAL_N_HEADS,
+        n_kv:      EVAL_N_KV,
+        head_dim:  EVAL_HEAD_DIM,
+        seq_len:   EVAL_SEQ_LEN,
+        ff_dim:    EVAL_FF_DIM,
+        vocab:     EVAL_VOCAB,
+        batch_size: 1,
+        max_batches: 0
+    }
+}
+
+// =====================================================================
+//  Raw f32 buffer helpers (mirror train_7b_integrated)
+// =====================================================================
+
+fn eval_alloc_f32(n) {
+    return alloc_raw(n * 4)
+}
+
+fn eval_free_f32(buf, n) {
+    free_raw(buf, n * 4)
+}
+
+fn eval_zero_f32(buf, n) {
+    for i in 0..n {
+        write_f32(buf, i * 4, 0.0)
+    }
+}
+
+// =====================================================================
+//  forward_eval — forward-only pass through transformer
+//
+//  Returns logits_ptr [seq_len, vocab] as raw f32 buffer.
+//  Caller must free_f32(logits, seq_len * vocab).
+//  No backward state saved — pure inference.
+// =====================================================================
+fn forward_eval(all_weights, embed_w, lm_head_w, tokens, cfg: EvalConfig) {
+    let seq = cfg.seq_len
+    let dim = cfg.d_model
+    let vocab = cfg.vocab
+    let sz_hidden = seq * dim
+    let kv_dim = cfg.n_kv * cfg.head_dim
+
+    // 1. Embedding lookup
+    let hidden = eval_alloc_f32(sz_hidden)
+    for i in 0..seq {
+        let tok = tokens[i]
+        for j in 0..dim {
+            let v = deref_f32(embed_w, (tok * dim + j) * 4)
+            write_f32(hidden, (i * dim + j) * 4, v)
+        }
+    }
+
+    // 2. Transformer layers (forward only, no activation saves)
+    for layer in 0..cfg.n_layers {
+        let weights = all_weights[layer]
+        let wq   = weights[0]
+        let wk   = weights[1]
+        let wv   = weights[2]
+        let wo   = weights[3]
+        let wgate = weights[4]
+        let wup  = weights[5]
+        let wdown = weights[6]
+        let rms_attn = weights[7]
+        let rms_ffn  = weights[8]
+
+        // 2a. Pre-attention RMSNorm
+        let normed = eval_alloc_f32(sz_hidden)
+        for i in 0..seq {
+            let mut sq = 0.0
+            for j in 0..dim {
+                let v = deref_f32(hidden, (i * dim + j) * 4)
+                sq = sq + v * v
+            }
+            let rstd = 1.0 / sqrt(sq / (dim * 1.0) + 1e-6)
+            for j in 0..dim {
+                let v = deref_f32(hidden, (i * dim + j) * 4)
+                let g = deref_f32(rms_attn, j * 4)
+                write_f32(normed, (i * dim + j) * 4, v * rstd * g)
+            }
+        }
+
+        // 2b. Q/K/V projections
+        let sz_q = seq * dim
+        let sz_k = seq * kv_dim
+        let sz_v = seq * kv_dim
+        let q_buf = eval_alloc_f32(sz_q)
+        let k_buf = eval_alloc_f32(sz_k)
+        let v_buf = eval_alloc_f32(sz_v)
+
+        // Q = normed @ Wq  [seq, dim] @ [dim, dim] -> [seq, dim]
+        for i in 0..seq {
+            for j in 0..dim {
+                let mut acc = 0.0
+                for p in 0..dim {
+                    acc = acc + deref_f32(normed, (i * dim + p) * 4) * deref_f32(wq, (p * dim + j) * 4)
+                }
+                write_f32(q_buf, (i * dim + j) * 4, acc)
+            }
+        }
+        // K = normed @ Wk  [seq, dim] @ [dim, kv_dim] -> [seq, kv_dim]
+        for i in 0..seq {
+            for j in 0..kv_dim {
+                let mut acc = 0.0
+                for p in 0..dim {
+                    acc = acc + deref_f32(normed, (i * dim + p) * 4) * deref_f32(wk, (p * kv_dim + j) * 4)
+                }
+                write_f32(k_buf, (i * kv_dim + j) * 4, acc)
+            }
+        }
+        // V = normed @ Wv  [seq, dim] @ [dim, kv_dim] -> [seq, kv_dim]
+        for i in 0..seq {
+            for j in 0..kv_dim {
+                let mut acc = 0.0
+                for p in 0..dim {
+                    acc = acc + deref_f32(normed, (i * dim + p) * 4) * deref_f32(wv, (p * kv_dim + j) * 4)
+                }
+                write_f32(v_buf, (i * kv_dim + j) * 4, acc)
+            }
+        }
+
+        // 2c. Scaled dot-product attention (GQA, causal)
+        let attn_out = eval_alloc_f32(sz_q)
+        eval_zero_f32(attn_out, sz_q)
+        let heads_per_kv = cfg.n_heads / cfg.n_kv
+        let hd = cfg.head_dim
+        let scale = 1.0 / sqrt(hd * 1.0)
+
+        for h in 0..cfg.n_heads {
+            let kv_h = h / heads_per_kv
+            for i in 0..seq {
+                // Compute attention scores for position i, head h
+                let mut max_score = -1e30
+                let mut scores = []
+                for j in 0..(i + 1) {
+                    let mut dot = 0.0
+                    for d in 0..hd {
+                        let qi = deref_f32(q_buf, (i * dim + h * hd + d) * 4)
+                        let kj = deref_f32(k_buf, (j * kv_dim + kv_h * hd + d) * 4)
+                        dot = dot + qi * kj
+                    }
+                    dot = dot * scale
+                    if dot > max_score { max_score = dot }
+                    scores.push(dot)
+                }
+                // Softmax
+                let mut sum_exp = 0.0
+                let n_scores = len(scores)
+                for j in 0..n_scores {
+                    scores[j] = exp(scores[j] - max_score)
+                    sum_exp = sum_exp + scores[j]
+                }
+                let inv_sum = 1.0 / sum_exp
+                // Weighted sum of values
+                for d in 0..hd {
+                    let mut acc = 0.0
+                    for j in 0..n_scores {
+                        let vj = deref_f32(v_buf, (j * kv_dim + kv_h * hd + d) * 4)
+                        acc = acc + scores[j] * inv_sum * vj
+                    }
+                    let prev = deref_f32(attn_out, (i * dim + h * hd + d) * 4)
+                    write_f32(attn_out, (i * dim + h * hd + d) * 4, prev + acc)
+                }
+            }
+        }
+
+        eval_free_f32(q_buf, sz_q)
+        eval_free_f32(k_buf, sz_k)
+        eval_free_f32(v_buf, sz_v)
+
+        // 2d. Output projection: attn_out @ Wo
+        let proj_out = eval_alloc_f32(sz_hidden)
+        for i in 0..seq {
+            for j in 0..dim {
+                let mut acc = 0.0
+                for p in 0..dim {
+                    acc = acc + deref_f32(attn_out, (i * dim + p) * 4) * deref_f32(wo, (p * dim + j) * 4)
+                }
+                write_f32(proj_out, (i * dim + j) * 4, acc)
+            }
+        }
+        eval_free_f32(attn_out, sz_q)
+        eval_free_f32(normed, sz_hidden)
+
+        // 2e. Residual add: hidden = hidden + proj_out
+        for i in 0..sz_hidden {
+            let a = deref_f32(hidden, i * 4)
+            let b = deref_f32(proj_out, i * 4)
+            write_f32(hidden, i * 4, a + b)
+        }
+        eval_free_f32(proj_out, sz_hidden)
+
+        // 3a. Pre-FFN RMSNorm
+        let normed_ffn = eval_alloc_f32(sz_hidden)
+        for i in 0..seq {
+            let mut sq = 0.0
+            for j in 0..dim {
+                let v = deref_f32(hidden, (i * dim + j) * 4)
+                sq = sq + v * v
+            }
+            let rstd = 1.0 / sqrt(sq / (dim * 1.0) + 1e-6)
+            for j in 0..dim {
+                let v = deref_f32(hidden, (i * dim + j) * 4)
+                let g = deref_f32(rms_ffn, j * 4)
+                write_f32(normed_ffn, (i * dim + j) * 4, v * rstd * g)
+            }
+        }
+
+        // 3b. SwiGLU FFN: gate = silu(x @ Wgate) * (x @ Wup), out = gate @ Wdown
+        let ff = cfg.ff_dim
+        let gate_buf = eval_alloc_f32(seq * ff)
+        let up_buf   = eval_alloc_f32(seq * ff)
+
+        for i in 0..seq {
+            for j in 0..ff {
+                let mut g_acc = 0.0
+                let mut u_acc = 0.0
+                for p in 0..dim {
+                    let x = deref_f32(normed_ffn, (i * dim + p) * 4)
+                    g_acc = g_acc + x * deref_f32(wgate, (p * ff + j) * 4)
+                    u_acc = u_acc + x * deref_f32(wup, (p * ff + j) * 4)
+                }
+                // SiLU(gate) * up
+                let silu_g = g_acc / (1.0 + exp(0.0 - g_acc))
+                write_f32(gate_buf, (i * ff + j) * 4, silu_g * u_acc)
+            }
+        }
+        eval_free_f32(up_buf, seq * ff)
+        eval_free_f32(normed_ffn, sz_hidden)
+
+        // Down projection: gate_buf @ Wdown -> ffn_out [seq, dim]
+        let ffn_out = eval_alloc_f32(sz_hidden)
+        for i in 0..seq {
+            for j in 0..dim {
+                let mut acc = 0.0
+                for p in 0..ff {
+                    acc = acc + deref_f32(gate_buf, (i * ff + p) * 4) * deref_f32(wdown, (p * dim + j) * 4)
+                }
+                write_f32(ffn_out, (i * dim + j) * 4, acc)
+            }
+        }
+        eval_free_f32(gate_buf, seq * ff)
+
+        // 3c. Residual: hidden = hidden + ffn_out
+        for i in 0..sz_hidden {
+            let a = deref_f32(hidden, i * 4)
+            let b = deref_f32(ffn_out, i * 4)
+            write_f32(hidden, i * 4, a + b)
+        }
+        eval_free_f32(ffn_out, sz_hidden)
+    }
+
+    // 4. Final RMSNorm (use layer 0 rms_attn, same as train_7b_integrated)
+    let final_rms = all_weights[0][7]
+    let final_normed = eval_alloc_f32(sz_hidden)
+    for i in 0..seq {
+        let mut sq = 0.0
+        for j in 0..dim {
+            let v = deref_f32(hidden, (i * dim + j) * 4)
+            sq = sq + v * v
+        }
+        let rstd = 1.0 / sqrt(sq / (dim * 1.0) + 1e-6)
+        for j in 0..dim {
+            let v = deref_f32(hidden, (i * dim + j) * 4)
+            let g = deref_f32(final_rms, j * 4)
+            write_f32(final_normed, (i * dim + j) * 4, v * rstd * g)
+        }
+    }
+    eval_free_f32(hidden, sz_hidden)
+
+    // 5. LM head: final_normed @ lm_head_w -> logits [seq, vocab]
+    let logits = eval_alloc_f32(seq * vocab)
+    for i in 0..seq {
+        for j in 0..vocab {
+            let mut acc = 0.0
+            for p in 0..dim {
+                acc = acc + deref_f32(final_normed, (i * dim + p) * 4) * deref_f32(lm_head_w, (p * vocab + j) * 4)
+            }
+            write_f32(logits, (i * vocab + j) * 4, acc)
+        }
+    }
+    eval_free_f32(final_normed, sz_hidden)
+
+    return logits
+}
+
+// =====================================================================
+//  eval_perplexity — compute perplexity on held-out data
+//
+//  Runs forward pass on each batch, computes CE loss per token,
+//  returns exp(avg_loss) = perplexity.
+//  No backward pass, no gradient allocation.
+// =====================================================================
+fn eval_perplexity(all_weights, embed_w, lm_head_w, eval_dl, cfg: EvalConfig) {
+    let mut total_loss = 0.0
+    let mut total_tokens = 0
+    let mut n_batches = 0
+    let seq = cfg.seq_len
+    let vocab = cfg.vocab
+
+    while true {
+        let batch = dl_next_batch(eval_dl)
+        if batch == nil { return if total_tokens > 0 { exp(total_loss / (total_tokens * 1.0)) } else { 0.0 } }
+        if cfg.max_batches > 0 {
+            if n_batches >= cfg.max_batches { return exp(total_loss / (total_tokens * 1.0)) }
+        }
+
+        let inputs  = batch[0]
+        let targets = batch[1]
+
+        // Forward pass (inference only)
+        let logits = forward_eval(all_weights, embed_w, lm_head_w, inputs, cfg)
+
+        // CE loss per token (numerically stable log-sum-exp)
+        for i in 0..seq {
+            let row_off = i * vocab
+            // Find max logit
+            let mut mx = deref_f32(logits, (row_off) * 4)
+            for j in 1..vocab {
+                let v = deref_f32(logits, (row_off + j) * 4)
+                if v > mx { mx = v }
+            }
+            // Sum exp(logit - max)
+            let mut sum_exp = 0.0
+            for j in 0..vocab {
+                sum_exp = sum_exp + exp(deref_f32(logits, (row_off + j) * 4) - mx)
+            }
+            let lse = mx + log(sum_exp)
+            let target_tok = targets[i]
+            let target_logit = deref_f32(logits, (row_off + target_tok) * 4)
+            total_loss = total_loss + (lse - target_logit)
+            total_tokens = total_tokens + 1
+        }
+
+        eval_free_f32(logits, seq * vocab)
+        n_batches = n_batches + 1
+    }
+
+    // Perplexity = exp(avg CE loss)
+    if total_tokens > 0 {
+        return exp(total_loss / (total_tokens * 1.0))
+    }
+    return 0.0
+}
+
+// =====================================================================
+//  eval_accuracy — top-1 next-token prediction accuracy
+//
+//  For each position, check if argmax(logits) == target.
+//  Returns fraction correct in [0.0, 1.0].
+// =====================================================================
+fn eval_accuracy(all_weights, embed_w, lm_head_w, eval_dl, cfg: EvalConfig) {
+    let mut correct = 0
+    let mut total = 0
+    let mut n_batches = 0
+    let seq = cfg.seq_len
+    let vocab = cfg.vocab
+
+    while true {
+        let batch = dl_next_batch(eval_dl)
+        if batch == nil { return if total > 0 { (correct * 1.0) / (total * 1.0) } else { 0.0 } }
+        if cfg.max_batches > 0 {
+            if n_batches >= cfg.max_batches { return (correct * 1.0) / (total * 1.0) }
+        }
+
+        let inputs  = batch[0]
+        let targets = batch[1]
+
+        let logits = forward_eval(all_weights, embed_w, lm_head_w, inputs, cfg)
+
+        for i in 0..seq {
+            let row_off = i * vocab
+            let mut best_j = 0
+            let mut best_v = deref_f32(logits, (row_off) * 4)
+            for j in 1..vocab {
+                let v = deref_f32(logits, (row_off + j) * 4)
+                if v > best_v {
+                    best_v = v
+                    best_j = j
+                }
+            }
+            if best_j == targets[i] {
+                correct = correct + 1
+            }
+            total = total + 1
+        }
+
+        eval_free_f32(logits, seq * vocab)
+        n_batches = n_batches + 1
+    }
+
+    if total > 0 {
+        return (correct * 1.0) / (total * 1.0)
+    }
+    return 0.0
+}
+
+// =====================================================================
+//  run_eval — full evaluation: load data, compute perplexity + accuracy
+//
+//  Prints formatted results with step number.
+//  Returns EvalResult struct.
+// =====================================================================
+fn run_eval(all_weights, embed_w, lm_head_w, eval_path, cfg: EvalConfig, step) {
+    let t0 = time_ms()
+
+    println("[eval] step=" + str(step) + " loading eval data from " + eval_path)
+
+    // Open eval data (batch_size=1 for eval to process all sequences)
+    let eval_dl = dl_open(eval_path, cfg.batch_size, cfg.seq_len, 42)
+
+    // Compute perplexity
+    let ppl = eval_perplexity(all_weights, embed_w, lm_head_w, eval_dl, cfg)
+
+    // Reset for accuracy pass
+    let eval_dl2 = dl_open(eval_path, cfg.batch_size, cfg.seq_len, 42)
+    let acc = eval_accuracy(all_weights, embed_w, lm_head_w, eval_dl2, cfg)
+
+    // Compute avg loss from perplexity: avg_loss = log(ppl)
+    let avg_loss = if ppl > 0.0 { log(ppl) } else { 0.0 }
+
+    let elapsed = time_ms() - t0
+    let n_tok = eval_dl.batches_per_epoch * cfg.seq_len
+
+    let result = EvalResult {
+        step: step,
+        perplexity: ppl,
+        accuracy: acc,
+        avg_loss: avg_loss,
+        n_tokens: n_tok,
+        elapsed_ms: elapsed
+    }
+
+    println("─" * 52)
+    println("  [eval] step " + str(step))
+    println("    perplexity : " + str(ppl))
+    println("    accuracy   : " + str(acc * 100.0) + "%")
+    println("    avg_loss   : " + str(avg_loss))
+    println("    n_tokens   : " + str(n_tok))
+    println("    elapsed    : " + str(elapsed) + " ms")
+    println("─" * 52)
+
+    return result
+}
+
+// =====================================================================
+//  eval_on_prompts — generate completions for qualitative evaluation
+//
+//  For each prompt, run forward pass and greedily decode max_new tokens.
+//  Returns list of completed strings.
+// =====================================================================
+fn eval_on_prompts(all_weights, embed_w, lm_head_w, prompts, cfg: EvalConfig, max_new) {
+    let vocab = cfg.vocab
+    let seq = cfg.seq_len
+    let dim = cfg.d_model
+    let mut completions = []
+
+    for prompt_tokens in prompts {
+        let prompt_len = len(prompt_tokens)
+        // Pad/truncate prompt to seq_len
+        let mut tokens = []
+        for i in 0..seq {
+            if i < prompt_len {
+                tokens.push(prompt_tokens[i])
+            } else {
+                tokens.push(0)
+            }
+        }
+
+        let mut generated = []
+        let mut cur_len = prompt_len
+
+        let n_gen = if max_new < (seq - prompt_len) { max_new } else { seq - prompt_len }
+
+        for step in 0..n_gen {
+            let logits = forward_eval(all_weights, embed_w, lm_head_w, tokens, cfg)
+
+            // Argmax at position cur_len - 1 (predict next token)
+            let pos = cur_len - 1
+            let row_off = pos * vocab
+            let mut best_j = 0
+            let mut best_v = deref_f32(logits, (row_off) * 4)
+            for j in 1..vocab {
+                let v = deref_f32(logits, (row_off + j) * 4)
+                if v > best_v {
+                    best_v = v
+                    best_j = j
+                }
+            }
+            eval_free_f32(logits, seq * vocab)
+
+            // EOS check (token 2 = EOS for Llama)
+            if best_j == 2 { break }
+
+            generated.push(best_j)
+            if cur_len < seq {
+                tokens[cur_len] = best_j
+                cur_len = cur_len + 1
+            } else {
+                break
+            }
+        }
+
+        completions.push(generated)
+    }
+
+    return completions
+}
+
+// =====================================================================
+//  should_eval — check if current step triggers an eval
+// =====================================================================
+fn should_eval(step, interval) {
+    if interval <= 0 { return false }
+    return step % interval == 0
+}
