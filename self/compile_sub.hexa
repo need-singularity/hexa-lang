@@ -1,0 +1,451 @@
+// self/compile_sub.hexa — P7-8 second multi-function native Mach-O emitter.
+//
+// Companion to self/compile_add.hexa. Exercises the SUB instruction
+// encoding path (different opcode family from ADD) while reusing the
+// same multi-function BL fixup plumbing (patch_call_fixups_arm64).
+//
+// source (conceptual):
+//   fn sub(a: Int, b: Int) -> Int { return a - b }
+//   fn main() -> Int { return sub(100, 58) }   // expect exit=42
+//
+// emitted .text layout (forward BL from main → sub):
+//   offset  instr                          mnemonic
+//   ──────  ─────                          ────────
+//     0     MOVZ  x0, #100                  ; main: arg 0
+//     4     MOVZ  x1, #58                   ; main: arg 1
+//     8     BL    sub                       ; multi-function call (fixup!)
+//    12     MOVZ  x16, #0x0001
+//    16     MOVK  x16, #0x0200, LSL #16     ; x16 = 0x2000001 (SYS_exit)
+//    20     SVC   #0x80                     ; exit(sub_result)  — x0 already holds it
+//    24     SUB   x0, x0, x1                ; sub: return a-b   (entry point of "sub")
+//    28     RET                             ; return to lr
+//
+// BL at byte 8 targets byte 24:
+//   rel instructions = (24 - 8) / 4 = 4
+//   BL encoding      = 0x94000000 | 4 = 0x94000004 (LE: 04 00 00 94)
+//
+// ARM64 SUB (shifted reg, 64-bit, shift=0):
+//   0xCB000000 | (Rm << 16) | (Rn << 5) | Rd
+//
+// Output: /tmp/hexa_sub_native — runs, exits 42, zero clang / as / ld.
+
+// ═══════════════════════════════════════════════════════════
+//  Inline ARM64 encoders — mirror self/codegen/arm64.hexa so the
+//  file is standalone under hexa_stage0.
+// ═══════════════════════════════════════════════════════════
+
+fn emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+// MOVZ Xd, #imm16, LSL #0
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 0xd2800000 + (imm16 * 32) + rd
+}
+
+// MOVK Xd, #imm16, LSL #hw*16  (hw in 0..3)
+fn enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 0xf2800000 + (hw * 2097152) + (imm16 * 32) + rd
+}
+
+// SVC #imm16
+fn enc_svc(imm16: int) -> int {
+    return 0xd4000001 + (imm16 * 32)
+}
+
+// SUB Xd, Xn, Xm   (64-bit, shifted reg, shift=0)
+//   0xCB000000 | (Rm << 16) | (Rn << 5) | Rd
+fn enc_sub_reg(rd: int, rn: int, rm: int) -> int {
+    return 0xcb000000 + (rm * 65536) + (rn * 32) + rd
+}
+
+// RET Xn (default x30 = lr)
+//   0xD65F0000 | (Rn << 5)
+fn enc_ret(rn: int) -> int {
+    return 0xd65f0000 + (rn * 32)
+}
+
+// BL <offset> — placeholder encoding (imm26 = 0). Patched later.
+fn enc_bl_placeholder() -> int {
+    return 0x94000000
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Multi-function BL fixup pass — mirrors
+//  self/codegen/mod.hexa:patch_call_fixups_arm64 (line 90).
+// ═══════════════════════════════════════════════════════════
+
+struct CallFixup {
+    code_offset: int,     // byte offset in code where BL sits
+    target_fid: int       // function ID to resolve
+}
+
+struct FuncSymbol {
+    fid: int,
+    offset: int           // byte offset of function entry
+}
+
+fn symtab_lookup(syms: [FuncSymbol], fid: int) -> int {
+    let mut i = 0
+    while i < len(syms) {
+        if syms[i].fid == fid {
+            return syms[i].offset
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// Patch BL placeholders into real relative offsets.
+fn patch_call_fixups_arm64(code: [int], fixups: [CallFixup], syms: [FuncSymbol]) -> [int] {
+    let mut c = code
+    let mut i = 0
+    while i < len(fixups) {
+        let fx = fixups[i]
+        let target_off = symtab_lookup(syms, fx.target_fid)
+        if target_off >= 0 {
+            let bl_off = fx.code_offset
+            let rel = (target_off - bl_off) / 4
+            let mut imm26 = rel % 67108864          // 2^26
+            if imm26 < 0 { imm26 = imm26 + 67108864 }  // wrap negative
+            let patched = 0x94000000 + imm26
+            c[bl_off]     = patched % 256
+            c[bl_off + 1] = (patched / 256) % 256
+            c[bl_off + 2] = (patched / 65536) % 256
+            c[bl_off + 3] = (patched / 16777216) % 256
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Build the .text section for the 2-function program.
+//    bytes:   machine code with BL placeholder at offset 8
+//    fixups:  one CallFixup for the main→sub BL
+//    syms:    two FuncSymbols (main fid=0 at 0, sub fid=1 at 24)
+//  After patching, the BL imm26 resolves to (24-8)/4 = 4.
+// ═══════════════════════════════════════════════════════════
+
+fn build_text_section() -> [int] {
+    let mut syms = []
+    let mut fixups = []
+    let mut bytes = []
+
+    // ── Function 0: main ──
+    let main_offset = len(bytes)                       // = 0
+    syms = syms.push(FuncSymbol { fid: 0, offset: main_offset })
+
+    bytes = emit32_le(bytes, enc_movz(0, 100))         // 0:  MOVZ x0, #100
+    bytes = emit32_le(bytes, enc_movz(1, 58))          // 4:  MOVZ x1, #58
+    fixups = fixups.push(CallFixup {
+        code_offset: len(bytes),                        // = 8
+        target_fid: 1                                   // → function `sub`
+    })
+    bytes = emit32_le(bytes, enc_bl_placeholder())     // 8:  BL sub (placeholder)
+    bytes = emit32_le(bytes, enc_movz(16, 1))          // 12: MOVZ x16, #1
+    bytes = emit32_le(bytes, enc_movk(16, 0x200, 1))   // 16: MOVK x16, #0x200, LSL #16
+    bytes = emit32_le(bytes, enc_svc(0x80))            // 20: SVC #0x80  (exit with x0)
+
+    // ── Function 1: sub ──
+    let sub_offset = len(bytes)                        // = 24
+    syms = syms.push(FuncSymbol { fid: 1, offset: sub_offset })
+
+    bytes = emit32_le(bytes, enc_sub_reg(0, 0, 1))     // 24: SUB x0, x0, x1
+    bytes = emit32_le(bytes, enc_ret(30))              // 28: RET x30
+
+    // Multi-function link step — patch BL imm26.
+    bytes = patch_call_fixups_arm64(bytes, fixups, syms)
+
+    // Pad to 4-byte alignment (already aligned but be explicit).
+    while len(bytes) % 4 != 0 {
+        bytes = bytes.push(0)
+    }
+    return bytes
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mach-O MH_EXECUTE wrapper — identical structure to
+//  compile_add.hexa.
+// ═══════════════════════════════════════════════════════════
+
+fn u32_to_hex(v: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[(v % 256) / 16])
+    parts.push(h[(v % 256) % 16])
+    parts.push(h[((v / 256) % 256) / 16])
+    parts.push(h[((v / 256) % 256) % 16])
+    parts.push(h[((v / 65536) % 256) / 16])
+    parts.push(h[((v / 65536) % 256) % 16])
+    parts.push(h[((v / 16777216) % 256) / 16])
+    parts.push(h[((v / 16777216) % 256) % 16])
+    return parts.join("")
+}
+
+fn u64_to_hex(v: int, h: string) -> string {
+    let lo = v % 4294967296
+    let hi = v / 4294967296
+    return u32_to_hex(lo, h) + u32_to_hex(hi, h)
+}
+
+fn byte_to_hex(b: int, h: string) -> string {
+    let mut parts = []
+    parts.push(h[b / 16])
+    parts.push(h[b % 16])
+    return parts.join("")
+}
+
+fn build_macho_hex(text_bytes: [int]) -> string {
+    let HEX = "0123456789abcdef"
+    let MH_MAGIC_64 = 4277009103
+    let CPU_ARM64   = 16777228
+    let MH_EXECUTE  = 2
+    let HDR_FLAGS   = 2097285
+    let NCMDS       = 11
+    let SIZEOFCMDS  = 576
+    let PAGE        = 16384
+    let CODE_OFF    = 768
+
+    let code_bytes = len(text_bytes)
+    let mut text_size_aligned = code_bytes
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    let mut parts = []
+    let hdr_u32 = [MH_MAGIC_64, CPU_ARM64, 0, MH_EXECUTE, NCMDS, SIZEOFCMDS, HDR_FLAGS, 0]
+    let mut hi = 0
+    while hi < len(hdr_u32) {
+        parts.push(u32_to_hex(hdr_u32[hi], HEX))
+        hi = hi + 1
+    }
+
+    // LC_SEGMENT_64 __PAGEZERO
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f504147455a45524f0000000000" + "00")
+    parts.push("0000000000000000")
+    parts.push("0000000001000000")
+    parts.push("0000000000000000")
+    parts.push("0000000000000000")
+    parts.push("00000000" + "00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __TEXT
+    parts.push("19000000" + "98000000")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push("0000000001000000")
+    parts.push("0040000000000000")
+    parts.push("0000000000000000")
+    parts.push("0040000000000000")
+    parts.push("05000000")
+    parts.push("05000000")
+    parts.push("01000000")
+    parts.push("00000000")
+
+    // section __text
+    parts.push("5f5f74657874000000000000000000" + "00")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push(u64_to_hex(4294967296 + CODE_OFF, HEX))
+    parts.push(u64_to_hex(text_size_aligned, HEX))
+    parts.push(u32_to_hex(CODE_OFF, HEX))
+    parts.push("02000000")
+    parts.push("00000000" + "00000000")
+    parts.push("00040080")
+    parts.push("00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __LINKEDIT
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f4c494e4b45444954000000000000")
+    parts.push("0040000001000000")
+    parts.push("0040000000000000")
+    parts.push("0040000000000000")
+    parts.push("3100000000000000")
+    parts.push("01000000" + "01000000")
+    parts.push("00000000" + "00000000")
+
+    // LC_DYLD_CHAINED_FIXUPS
+    parts.push("34000080" + "10000000" + "00400000" + "30000000")
+
+    // LC_SYMTAB
+    parts.push("02000000" + "18000000")
+    parts.push("30400000")
+    parts.push("00000000")
+    parts.push("30400000")
+    parts.push("01000000")
+
+    // LC_DYSYMTAB
+    parts.push("0b000000" + "50000000")
+    let mut dyz_parts = []
+    let mut dyz = 0
+    while dyz < 72 {
+        dyz_parts.push("00")
+        dyz = dyz + 1
+    }
+    parts.push(dyz_parts.join(""))
+
+    // LC_LOAD_DYLINKER
+    parts.push("0e000000" + "20000000" + "0c000000")
+    parts.push("2f7573722f6c69622f64796c6400")
+    parts.push("000000000000")
+
+    // LC_UUID
+    parts.push("1b000000" + "18000000")
+    parts.push("48455841414243444546303132333435")
+
+    // LC_BUILD_VERSION
+    parts.push("32000000" + "18000000")
+    parts.push("01000000")
+    parts.push("00000e00")
+    parts.push("00000e00")
+    parts.push("00000000")
+
+    // LC_MAIN
+    parts.push("28000080" + "18000000")
+    parts.push(u64_to_hex(CODE_OFF, HEX))
+    parts.push("0000000000000000")
+
+    // LC_LOAD_DYLIB libSystem
+    parts.push("0c000000" + "38000000")
+    parts.push("18000000")
+    parts.push("02000000")
+    parts.push("00000100")
+    parts.push("00000100")
+    parts.push("2f7573722f6c69622f6c69625379737465")
+    parts.push("6d2e422e64796c696200000000000000")
+
+    let mut s = parts.join("")
+
+    while (len(s) / 2) < CODE_OFF {
+        s = s + "00"
+    }
+
+    let mut bi = 0
+    while bi < len(text_bytes) {
+        s = s + byte_to_hex(text_bytes[bi], HEX)
+        bi = bi + 1
+    }
+
+    while (len(s) / 2) < PAGE {
+        s = s + "00"
+    }
+
+    s = s + "00000000"
+    s = s + "20000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "01000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "03000000"
+    s = s + "00000000" + "00000000" + "00000000"
+    s = s + "00"
+
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Driver
+// ═══════════════════════════════════════════════════════════
+
+println("=== P7-8 compile_sub: multi-function native Mach-O ===")
+println("")
+println("source (conceptual):")
+println("  fn sub(a: Int, b: Int) -> Int { return a - b }")
+println("  fn main() -> Int { return sub(100, 58) }   // expect exit=42")
+println("")
+
+// Step 1: emit .text with BL placeholder, then patch via fixup pass.
+println("[1] emit .text with multi-function BL fixup...")
+let text = build_text_section()
+println("  text bytes: " + to_string(len(text)))
+
+// Verify BL patched correctly: bytes at offset 8..11 should be 04 00 00 94
+let bl0 = text[8]
+let bl1 = text[9]
+let bl2 = text[10]
+let bl3 = text[11]
+println("  BL @8 bytes: " + to_string(bl0) + " " + to_string(bl1) + " " + to_string(bl2) + " " + to_string(bl3))
+let bl_ok = bl0 == 4 && bl1 == 0 && bl2 == 0 && bl3 == 148
+if bl_ok {
+    println("  [PASS] BL imm26 = 4 (0x94000004)")
+} else {
+    println("  [FAIL] BL fixup wrong — expected 04 00 00 94")
+}
+
+// Verify SUB encoding at offset 24: expected 0xCB010000 (LE: 00 00 01 cb)
+let s0 = text[24]
+let s1 = text[25]
+let s2 = text[26]
+let s3 = text[27]
+println("  SUB @24 bytes: " + to_string(s0) + " " + to_string(s1) + " " + to_string(s2) + " " + to_string(s3))
+let sub_ok = s0 == 0 && s1 == 0 && s2 == 1 && s3 == 203
+if sub_ok {
+    println("  [PASS] SUB x0, x0, x1 = 0xCB010000")
+} else {
+    println("  [FAIL] SUB encoding wrong — expected 00 00 01 cb")
+}
+
+// Step 2: wrap in Mach-O MH_EXECUTE.
+println("[2] wrap in Mach-O MH_EXECUTE...")
+let hex_data = build_macho_hex(text)
+let macho_size = len(hex_data) / 2
+println("  macho bytes: " + to_string(macho_size))
+
+// Step 3: write /tmp/hexa_sub_native.
+println("[3] write /tmp/hexa_sub_native...")
+let out_path = "/tmp/hexa_sub_native"
+exec("printf '%s' '" + hex_data + "' | xxd -r -p > " + out_path)
+
+// Step 4: chmod +x.
+println("[4] chmod +x...")
+exec("chmod +x " + out_path)
+
+// Step 5: codesign ad-hoc (required on Apple Silicon).
+println("[5] codesign (ad-hoc)...")
+let cs = exec_with_status("codesign --force --sign - " + out_path + " 2>&1")
+if cs[1] != 0 {
+    println("  WARN codesign rc=" + to_string(cs[1]) + ": " + cs[0].trim())
+}
+
+// Step 6: run and capture exit code.
+println("[6] run " + out_path + "...")
+let r = exec_with_status(out_path + " 2>&1")
+let exit_code = r[1]
+println("  exit code = " + to_string(exit_code))
+
+println("")
+println("=== doc-assert ===")
+let want_rc = 42
+let pass_rc = exit_code == want_rc
+
+if bl_ok {
+    println("  [PASS] BL fixup patched")
+} else {
+    println("  [FAIL] BL fixup not patched correctly")
+}
+if sub_ok {
+    println("  [PASS] SUB encoding correct")
+} else {
+    println("  [FAIL] SUB encoding incorrect")
+}
+if pass_rc {
+    println("  [PASS] exit == 42  (sub(100, 58) = 42)")
+} else {
+    println("  [FAIL] exit mismatch: got " + to_string(exit_code) + " want " + to_string(want_rc))
+}
+
+if bl_ok {
+    if sub_ok {
+        if pass_rc {
+            println("")
+            println("PASS — second multi-function native Mach-O emitted by pure Hexa.")
+            println("Exercises SUB (0xCB family) + BL fixup ARM64 path.")
+            println("  artifact: " + out_path)
+            println("  size:     " + to_string(macho_size) + " bytes")
+        }
+    }
+}
