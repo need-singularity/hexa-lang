@@ -1,0 +1,675 @@
+// self/native_compile_poc.hexa — P7-6a (b-path) step 4
+//
+// Source-to-native for `fn main() { return <expr> }` where <expr> is
+// an int literal or a binary expression (+, -, *) over int literals.
+//
+// Scales out as more AST kinds get handled in poc_lower_expr.
+
+use "lexer"
+use "token"
+use "ast"
+use "parser"
+use "mini_native"
+use "poc/common"
+use "poc/expr/int_lit"
+use "poc/expr/string_lit"
+use "poc/expr/bool_lit"
+use "poc/expr/ident"
+use "poc/expr/unary_op"
+use "poc/expr/bin_op"
+use "poc/expr/struct_init"
+use "poc/expr/field"
+use "poc/expr/array"
+use "poc/expr/index"
+use "poc/expr/if_expr"
+use "poc/expr/match_expr"
+use "poc/expr/call"
+use "poc/builtin/push_method"
+use "poc/builtin/assert"
+use "poc/builtin/assert_eq"
+use "poc/builtin/abs"
+use "poc/builtin/min_max"
+use "poc/builtin/exit"
+use "poc/builtin/print"
+use "poc/builtin/len"
+use "poc/builtin/println"
+use "poc/builtin/syscall"
+use "poc/stmt/let"
+use "poc/stmt/return"
+use "poc/stmt/compound_assign"
+use "poc/stmt/assign"
+use "poc/stmt/for"
+use "poc/stmt/while"
+use "poc/stmt/assert"
+use "poc/stmt/break_stmt"
+use "poc/stmt/continue_stmt"
+use "poc/stmt/expr_stmt"
+
+// Emit inline int → decimal-string + write(stdout) + newline. ~30 MnInstrs.
+// Persistent regs: buf, pos, work, sign, zero, ten (6 vids).
+fn poc_emit_println_int(n_expr) {
+    let buf_vid = poc_fresh_vid()
+    poc_emit(mn_add_sp_imm(buf_vid, poc_arr_off))
+    poc_arr_off = poc_arr_off + 32
+
+    // Write '\n' (byte 10) at buf[23].
+    let sm0 = poc_next_vid
+    let nl_vid = poc_fresh_vid()
+    poc_emit(mn_load_imm(nl_vid, 10))
+    let addr0 = poc_fresh_vid()
+    poc_emit(mn_add_imm(addr0, buf_vid, 23))
+    poc_emit(mn_storeb_at(addr0, nl_vid))
+    poc_next_vid = sm0
+
+    // Persistent state — use XZR (X31) for zero compares instead of a
+    // dedicated zero_vid. No sign tracking (PoC assumes non-negative).
+    let pos_vid = poc_fresh_vid()
+    poc_emit(mn_load_imm(pos_vid, 22))
+    let work_vid = poc_fresh_vid()
+    let ten_vid = poc_fresh_vid()
+    poc_emit(mn_load_imm(ten_vid, 10))
+
+    let sm1 = poc_next_vid
+    let n_raw = poc_lower_expr(n_expr)
+    poc_emit(mn_mov(work_vid, n_raw))
+    poc_next_vid = sm1
+
+    // if work == 0: emit '0' and skip main loop.
+    let zero_case_done = poc_fresh_label()
+    let main_loop_entry = poc_fresh_label()
+    poc_emit(mn_cmp(work_vid, 31))
+    poc_emit(mn_br_cond(1, main_loop_entry))
+    let d0_vid = poc_fresh_vid()
+    poc_emit(mn_load_imm(d0_vid, 48))
+    let addr_d0 = poc_fresh_vid()
+    poc_emit(mn_add(addr_d0, buf_vid, pos_vid))
+    poc_emit(mn_storeb_at(addr_d0, d0_vid))
+    poc_next_vid = sm1
+    poc_emit(mn_sub_imm(pos_vid, pos_vid, 1))
+    poc_emit(mn_jmp(zero_case_done))
+
+    // Main loop
+    poc_emit(mn_label(main_loop_entry))
+    let loop_top = poc_fresh_label()
+    let loop_done = poc_fresh_label()
+    poc_emit(mn_label(loop_top))
+    poc_emit(mn_cmp(work_vid, 31))
+    poc_emit(mn_br_cond(0, loop_done))
+    let digit_vid = poc_fresh_vid()
+    poc_emit(mn_mod(digit_vid, work_vid, ten_vid))
+    poc_emit(mn_add_imm(digit_vid, digit_vid, 48))
+    let addr_l = poc_fresh_vid()
+    poc_emit(mn_add(addr_l, buf_vid, pos_vid))
+    poc_emit(mn_storeb_at(addr_l, digit_vid))
+    poc_next_vid = sm1
+    poc_emit(mn_sub_imm(pos_vid, pos_vid, 1))
+    poc_emit(mn_div(work_vid, work_vid, ten_vid))
+    poc_emit(mn_jmp(loop_top))
+    poc_emit(mn_label(loop_done))
+
+    poc_emit(mn_label(zero_case_done))
+
+    // Marshal args directly into x0/x1/x2 via regalloc tricks:
+    //   x1 = buf + pos + 1    (start of printable string)
+    //   x2 = 23 - pos         (length including trailing '\n')
+    //   x0 = 1                (fd=stdout)
+    let tmp_pos = poc_fresh_vid()
+    poc_emit(mn_add_imm(tmp_pos, pos_vid, 1))
+    poc_emit(mn_add(1, buf_vid, tmp_pos))     // x1 = start
+    let t23 = poc_fresh_vid()
+    poc_emit(mn_load_imm(t23, 23))
+    poc_emit(mn_sub(2, t23, pos_vid))          // x2 = length
+    poc_emit(mn_load_imm(0, 1))                // x0 = fd=1
+    poc_emit(mn_syscall3_prepared(33554436))
+    poc_next_vid = sm1
+}
+
+// Thin dispatcher for AST expr kinds. Handlers live under
+// `self/poc/expr/<snake>.hexa` — adding a new kind = new file + 1 line here.
+fn poc_lower_expr(e) -> int {
+    if e.kind == "IntLit"     { return poc_ex_int_lit(e) }
+    if e.kind == "StringLit"  { return poc_ex_string_lit(e) }
+    if e.kind == "StructInit" { return poc_ex_struct_init(e) }
+    if e.kind == "Field"      { return poc_ex_field(e) }
+    if e.kind == "Array" || e.kind == "ArrayLit" { return poc_ex_array(e) }
+    if e.kind == "Index"      { return poc_ex_index(e) }
+    if e.kind == "Ident"      { return poc_ex_ident(e) }
+    if e.kind == "BoolLit"    { return poc_ex_bool_lit(e) }
+    if e.kind == "UnaryOp"    { return poc_ex_unary_op(e) }
+    if e.kind == "BinOp"      { return poc_ex_bin_op(e) }
+    if e.kind == "IfExpr"     { return poc_ex_if_expr(e) }
+    if e.kind == "MatchExpr"  { return poc_ex_match_expr(e) }
+    if e.kind == "Call"       { return poc_ex_call(e) }
+    println("[poc] unsupported expr kind: " + e.kind)
+    return -1
+}
+
+// Map hexa BinOp comparison op to ARM64 cond code (positive sense).
+//   ==  → EQ=0,  !=  → NE=1,  <  → LT=11,  <= → LE=13,  >  → GT=12,  >= → GE=10
+fn poc_cmp_code(op: string) -> int {
+    if op == "==" { return 0 }
+    if op == "!=" { return 1 }
+    if op == "<"  { return 11 }
+    if op == "<=" { return 13 }
+    if op == ">"  { return 12 }
+    if op == ">=" { return 10 }
+    return -1
+}
+
+// Inverse cond code — used when we want B.cond to SKIP the branch when
+// the hexa comparison evaluates to FALSE.
+fn poc_inv_cmp_code(op: string) -> int {
+    if op == "==" { return 1 }
+    if op == "!=" { return 0 }
+    if op == "<"  { return 10 }
+    if op == "<=" { return 12 }
+    if op == ">"  { return 13 }
+    if op == ">=" { return 11 }
+    return -1
+}
+
+// Lower a condition to either (cmp + br_cond-false-skip, true)
+// fast-path, or (materialize bool + cmp zero + br_eq, false). Emits
+// CMP + appropriate B.cond to `else_label`. Caller continues with
+// the then-branch right after this function returns.
+fn poc_lower_cond_branch(cond_e, else_label: int) -> bool {
+    // Fast path: BinOp whose op is a simple compare.
+    if cond_e.kind == "BinOp" {
+        let inv = poc_inv_cmp_code(cond_e.op)
+        if inv >= 0 {
+            let lv = poc_lower_expr(cond_e.left)
+            let rv = poc_lower_expr(cond_e.right)
+            if lv < 0 || rv < 0 { return false }
+            poc_emit(mn_cmp(lv, rv))
+            poc_emit(mn_br_cond(inv, else_label))
+            return true
+        }
+    }
+    // General path: materialize cond as 0/1 bool then branch if zero.
+    let bool_vid = poc_lower_expr(cond_e)
+    if bool_vid < 0 { return false }
+    // cmp bool_vid, XZR (X31)  →  branch to else if EQ (i.e. false/0).
+    poc_emit(mn_cmp(bool_vid, 31))     // X31 is XZR encoded as reg 31
+    poc_emit(mn_br_cond(0, else_label))  // 0 = EQ
+    return true
+}
+
+// Lower an IfExpr as a statement (both branches produce no value).
+// Returns 1 if both branches end in return (terminating), else 0.
+fn poc_lower_if_stmt(e) -> int {
+    let else_label = poc_fresh_label()
+    let end_label = poc_fresh_label()
+
+    if !poc_lower_cond_branch(e.cond, else_label) { return -1 }
+
+    // then-body
+    let mut ti = 0
+    let mut then_returned = false
+    while ti < len(e.then_body) {
+        let r = poc_lower_stmt(e.then_body[ti])
+        if r < 0 { return -1 }
+        if r == 1 { then_returned = true; break }
+        ti = ti + 1
+    }
+    if !then_returned {
+        poc_emit(mn_jmp(end_label))
+    }
+
+    poc_emit(mn_label(else_label))
+
+    let mut ei = 0
+    let mut else_returned = false
+    while ei < len(e.else_body) {
+        let r = poc_lower_stmt(e.else_body[ei])
+        if r < 0 { return -1 }
+        if r == 1 { else_returned = true; break }
+        ei = ei + 1
+    }
+
+    poc_emit(mn_label(end_label))
+
+    if then_returned && else_returned { return 1 }
+    return 0
+}
+
+// Thin dispatcher for AST stmt kinds. Handlers live under
+// `self/poc/stmt/<snake>.hexa`. Returns -1 on error, 0 on ok, 1 on return.
+fn poc_lower_stmt(stmt) -> int {
+    if stmt.kind == "LetStmt" || stmt.kind == "LetMutStmt" { return poc_st_let(stmt) }
+    if stmt.kind == "ReturnStmt"     { return poc_st_return(stmt) }
+    if stmt.kind == "CompoundAssign" { return poc_st_compound_assign(stmt) }
+    if stmt.kind == "AssignStmt"     { return poc_st_assign(stmt) }
+    if stmt.kind == "ForStmt"        { return poc_st_for(stmt) }
+    if stmt.kind == "WhileStmt"      { return poc_st_while(stmt) }
+    if stmt.kind == "AssertStmt"     { return poc_st_assert(stmt) }
+    if stmt.kind == "BreakStmt"      { return poc_st_break_stmt(stmt) }
+    if stmt.kind == "ContinueStmt"   { return poc_st_continue_stmt(stmt) }
+    if stmt.kind == "ExprStmt"       { return poc_st_expr_stmt(stmt) }
+    println("[poc] unsupported stmt kind: " + stmt.kind)
+    return -1
+}
+
+// Lower a single fn declaration. Emits:
+//   fn_begin(fn_id) ; [prologue=8 bytes]
+//   <bind params to vids 0..n-1>
+//   <body>
+//   ret_ep(last_vid)           [epilogue+ret=12 bytes]  (or implicit ret 0)
+fn poc_lower_fn(fn_decl, fn_id: int) -> bool {
+    poc_reset_fn_scope()
+    poc_emit(mn_fn_begin(fn_id))
+
+    // Bind parameters — ARM64 AAPCS delivers args in x0..x7 (caller-saved).
+    // To survive nested calls, copy each into a callee-saved slot (x19+).
+    let params = fn_decl.params
+    let mut pi = 0
+    while pi < len(params) {
+        let target_vid = poc_fresh_vid()
+        poc_emit(mn_mov(target_vid, pi))
+        poc_bind(params[pi].name, target_vid)
+        // If the type annotation matches a registered struct, record it
+        // so field access within this fn resolves correctly.
+        if poc_struct_is_registered(params[pi].value) {
+            poc_bind_var_struct(params[pi].name, params[pi].value)
+        }
+        pi = pi + 1
+    }
+
+    let body = fn_decl.body
+    let mut i = 0
+    let mut terminated = false
+    while i < len(body) {
+        let r = poc_lower_stmt(body[i])
+        if r < 0 { return false }
+        if r == 1 { terminated = true; break }
+        i = i + 1
+    }
+    if !terminated {
+        let zero_vid = poc_fresh_vid()
+        poc_emit(mn_load_imm(zero_vid, 0))
+        poc_emit(mn_ret_ep(zero_vid))
+    }
+    return true
+}
+
+// Lower all top-level FnDecls. `main` must be first (entry per LC_MAIN).
+fn poc_lower_program(ast: array) -> bool {
+    // Collect struct decls + global const decls first so names resolve.
+    let mut si = 0
+    while si < len(ast) {
+        if ast[si].kind == "StructDecl" {
+            poc_struct_register(ast[si].name, ast[si].fields)
+        }
+        if ast[si].kind == "ConstStmt" {
+            if ast[si].left.kind == "IntLit" {
+                poc_const_register(ast[si].name, to_int(ast[si].left.value))
+            }
+        }
+        si = si + 1
+    }
+    // Register all fn names first so forward calls resolve.
+    // Order: main goes first (fn_id=0, so it's at CODE_OFF).
+    let mut main_idx = -1
+    let mut i = 0
+    while i < len(ast) {
+        if ast[i].kind == "FnDecl" && ast[i].name == "main" {
+            main_idx = i
+        }
+        i = i + 1
+    }
+    if main_idx < 0 {
+        println("[poc] no main fn")
+        return false
+    }
+    // main registers as fn_id 0
+    poc_fresh_fn_id("main")
+    i = 0
+    while i < len(ast) {
+        if ast[i].kind == "FnDecl" && ast[i].name != "main" {
+            poc_fresh_fn_id(ast[i].name)
+        }
+        i = i + 1
+    }
+    // Lower main first.
+    if !poc_lower_fn(ast[main_idx], 0) { return false }
+    // Then every other fn in source order.
+    i = 0
+    while i < len(ast) {
+        if ast[i].kind == "FnDecl" && ast[i].name != "main" {
+            let fid = poc_fn_id_for(ast[i].name)
+            if !poc_lower_fn(ast[i], fid) { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// ── Runner ──────────────────────────────────────────────────────
+
+fn poc_compile_and_run(src: string, out_path: string, want_rc: int) -> bool {
+    println("[poc] src: " + src)
+    let toks = tokenize(src)
+    let ast = parse(toks)
+
+    poc_reset()
+    let ok = poc_lower_program(ast)
+    if !ok {
+        println("[poc] FAIL at lowering")
+        return false
+    }
+    println("[poc] IR instrs: " + str(len(poc_instrs)))
+    if env_var("POC_DUMP") == "1" {
+        let mut di = 0
+        while di < len(poc_instrs) {
+            let ins = poc_instrs[di]
+            println("  [" + str(di) + "] op=" + ins.op + " result=" + str(ins.result) + " a=" + str(ins.a) + " b=" + str(ins.b) + " imm=" + str(ins.imm))
+            di = di + 1
+        }
+    }
+
+    let text = mn_lower(poc_instrs, poc_strings)
+    let hex_data = mn_macho_hex(text)
+    mn_write_and_codesign(out_path, hex_data)
+    let rc = mn_run(out_path)
+    println("[poc] rc=" + str(rc) + " (want " + str(want_rc) + ")")
+    return rc == want_rc
+}
+
+fn main() {
+    println("=== P7-6a (b-path) POC — source → native Mach-O ===")
+    let mut pass = 0
+    let mut fail = 0
+
+    if poc_compile_and_run("fn main() { return 42 }",
+                           "/tmp/hexa_poc_ret42", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return 1 + 2 + 3 }",
+                           "/tmp/hexa_poc_sum", 6) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return 7 * 6 }",
+                           "/tmp/hexa_poc_mul", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return 100 - 58 }",
+                           "/tmp/hexa_poc_sub", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return (2 + 3) * (4 + 4) }",
+                           "/tmp/hexa_poc_nested", 40) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let x = 40; let y = 2; return x + y }",
+                           "/tmp/hexa_poc_let", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let a = 6; let b = 7; return a * b }",
+                           "/tmp/hexa_poc_let_mul", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // syscall() builtin — Darwin SYS_exit(42) (P7-7a wired via self-host driver).
+    if poc_compile_and_run("fn main() { syscall(33554433, 42) }",
+                           "/tmp/hexa_poc_syscall", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // syscall with computed arg
+    if poc_compile_and_run("fn main() { let code = 6 * 7; syscall(33554433, code) }",
+                           "/tmp/hexa_poc_syscall2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // If/else — both branches return
+    if poc_compile_and_run("fn main() { if 1 == 1 { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_if_eq", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { if 1 == 2 { return 99 } else { return 42 } }",
+                           "/tmp/hexa_poc_if_ne", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let x = 10; if x > 5 { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_if_gt", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let x = 3; if x < 5 { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_if_lt", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // While loop — simple counter
+    if poc_compile_and_run("fn main() { let mut x = 0; while x < 42 { x = x + 1 } return x }",
+                           "/tmp/hexa_poc_while", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Sum 1..10 via while
+    if poc_compile_and_run("fn main() { let mut s = 0; let mut i = 1; while i <= 9 { s = s + i; i = i + 1 } return s + 6 }",
+                           "/tmp/hexa_poc_sum", 51) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Multi-fn: add(a, b) { a + b } ; main() { add(5, 37) }
+    if poc_compile_and_run("fn add(a, b) { return a + b }\nfn main() { return add(5, 37) }",
+                           "/tmp/hexa_poc_call", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Multi-fn: multiply helper
+    if poc_compile_and_run("fn mul2(a, b) { return a * b }\nfn main() { return mul2(6, 7) }",
+                           "/tmp/hexa_poc_call2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Multi-fn: nested calls
+    if poc_compile_and_run("fn dbl(n) { return n + n }\nfn main() { return dbl(dbl(10)) + 2 }",
+                           "/tmp/hexa_poc_nest", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Recursion — fib(9) = 34  (8 PASS test 1..8 with N=small)
+    let fib_src = "fn fib(n) { if n < 2 { return n } else { return fib(n - 1) + fib(n - 2) } }\nfn main() { return fib(9) }"
+    if poc_compile_and_run(fib_src, "/tmp/hexa_poc_fib", 34) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Recursion — factorial
+    let fact_src = "fn fact(n) { if n <= 1 { return 1 } else { return n * fact(n - 1) } }\nfn main() { return fact(5) }"
+    if poc_compile_and_run(fact_src, "/tmp/hexa_poc_fact", 120) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Hello world via native write + exit syscalls — the classic.
+    // 33554436 = 0x2000004 = Darwin SYS_write. 33554433 = Darwin SYS_exit.
+    let hello_src = "fn main() { syscall(33554436, 1, \"hello, hexa!\\n\", 13); syscall(33554433, 0) }"
+    if poc_compile_and_run(hello_src, "/tmp/hexa_poc_hello", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // div/mod
+    if poc_compile_and_run("fn main() { return 126 / 3 }",
+                           "/tmp/hexa_poc_div", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return 100 % 58 }",
+                           "/tmp/hexa_poc_mod", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // GCD(48, 18) = 6 via recursion + mod
+    let gcd_src = "fn gcd(a, b) { if b == 0 { return a } else { return gcd(b, a % b) } }\nfn main() { return gcd(48, 18) * 7 }"
+    if poc_compile_and_run(gcd_src, "/tmp/hexa_poc_gcd", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Bitwise
+    if poc_compile_and_run("fn main() { return (15 & 10) | (5 << 4) }",
+                           "/tmp/hexa_poc_bit", 90) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // XOR
+    if poc_compile_and_run("fn main() { return (42 ^ 13) ^ 13 }",
+                           "/tmp/hexa_poc_xor", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Unary negation (return -x where x>0 would give negative exit code; use abs via 2x)
+    if poc_compile_and_run("fn main() { let x = 10; return x + (-(-42)) - x }",
+                           "/tmp/hexa_poc_neg", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Comparisons as values + logical && / ||
+    if poc_compile_and_run("fn main() { if 1 == 1 && 2 == 2 { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_and", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { if 1 == 2 || 3 == 3 { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_or", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let x = 3 == 3; if x { return 42 } else { return 99 } }",
+                           "/tmp/hexa_poc_bool", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Array literal + constant index access (stack-allocated, fixed-size)
+    if poc_compile_and_run("fn main() { let arr = [10, 20, 12]; return arr[0] + arr[1] + arr[2] }",
+                           "/tmp/hexa_poc_arr", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let arr = [1, 2, 3, 4, 5, 6, 7, 8, 9]; return arr[5] * 7 }",
+                           "/tmp/hexa_poc_arr9", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Array sum via loop (variable index)
+    let asum_src = "fn main() { let arr = [10, 15, 7, 10]; let mut s = 0; let mut i = 0; while i < 4 { s = s + arr[i]; i = i + 1 } return s }"
+    if poc_compile_and_run(asum_src, "/tmp/hexa_poc_asum", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Array mutation — const index
+    if poc_compile_and_run("fn main() { let arr = [1, 2, 3]; arr[0] = 40; return arr[0] + arr[1] }",
+                           "/tmp/hexa_poc_amut", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Array mutation — variable index (filling an array)
+    let fill_src = "fn main() { let arr = [0, 0, 0, 0, 0, 0]; let mut i = 0; while i < 6 { arr[i] = i * 7; i = i + 1 } return arr[3] + arr[5] + 0 }"
+    if poc_compile_and_run(fill_src, "/tmp/hexa_poc_afill", 56) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Struct decl + init + field access
+    let st_src = "struct P { x: int, y: int }\nfn main() { let p = P{x: 10, y: 32}; return p.x + p.y }"
+    if poc_compile_and_run(st_src, "/tmp/hexa_poc_st", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Struct with computed init
+    let st2_src = "struct Box { w: int, h: int, d: int }\nfn main() { let b = Box{w: 6, h: 7, d: 1}; return b.w * b.h * b.d }"
+    if poc_compile_and_run(st2_src, "/tmp/hexa_poc_st2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Struct field mutation
+    let stmut_src = "struct Pt { x: int, y: int }\nfn main() { let p = Pt{x: 0, y: 0}; p.x = 40; p.y = 2; return p.x + p.y }"
+    if poc_compile_and_run(stmut_src, "/tmp/hexa_poc_stmut", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // For loop with exclusive range: sum 0..9 = 36; +6 = 42.
+    if poc_compile_and_run("fn main() { let mut s = 0; for i in 0..9 { s = s + i } return s + 6 }",
+                           "/tmp/hexa_poc_for", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // For loop with inclusive range: sum 1..=8 = 36; +6 = 42.
+    if poc_compile_and_run("fn main() { let mut s = 0; for i in 1..=8 { s = s + i } return s + 6 }",
+                           "/tmp/hexa_poc_fori", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // break — stop at 7
+    let brk_src = "fn main() { let mut s = 0; let mut i = 0; while i < 100 { if i >= 8 { break } s = s + i; i = i + 1 } return s + 14 }"
+    if poc_compile_and_run(brk_src, "/tmp/hexa_poc_brk", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // continue — sum of odd i from 0..10
+    let cont_src = "fn main() { let mut s = 0; let mut i = 0; while i < 10 { i = i + 1; if (i & 1) == 0 { continue } s = s + i } return s + 17 }"
+    if poc_compile_and_run(cont_src, "/tmp/hexa_poc_cont", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Match expression
+    let match_src = "fn main() { let x = 2; return match x { 1 -> 10, 2 -> 42, _ -> 99 } }"
+    if poc_compile_and_run(match_src, "/tmp/hexa_poc_m", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Match with wildcard default
+    let m2_src = "fn main() { let x = 99; return match x { 1 -> 10, 2 -> 20, _ -> 42 } }"
+    if poc_compile_and_run(m2_src, "/tmp/hexa_poc_m2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // len(arr) builtin — array with 5 items → return len*N
+    if poc_compile_and_run("fn main() { let arr = [1, 2, 3, 4, 5]; return len(arr) + 37 }",
+                           "/tmp/hexa_poc_len", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // println builtin — print string with newline, then exit 0
+    let pln_src = "fn main() { println(\"hello from println\"); return 0 }"
+    if poc_compile_and_run(pln_src, "/tmp/hexa_poc_pln", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // exit(n) builtin
+    if poc_compile_and_run("fn main() { exit(42) }",
+                           "/tmp/hexa_poc_exit", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // print + exit combo
+    let printex_src = "fn main() { print(\"yes\\n\"); exit(42) }"
+    if poc_compile_and_run(printex_src, "/tmp/hexa_poc_prex", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // CompoundAssign x += 2
+    if poc_compile_and_run("fn main() { let mut x = 40; x += 2; return x }",
+                           "/tmp/hexa_poc_cop", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { let mut x = 21; x *= 2; return x }",
+                           "/tmp/hexa_poc_cop2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // println(int) — inline int→str + write
+    let pnint_src = "fn main() { println(42); return 0 }"
+    if poc_compile_and_run(pnint_src, "/tmp/hexa_poc_pnint", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // println(computed int) + exit
+    let pnc_src = "fn main() { let a = 6; let b = 7; println(a * b); return a * b }"
+    if poc_compile_and_run(pnc_src, "/tmp/hexa_poc_pnc", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Loop with println(int)
+    let pnloop_src = "fn main() { for i in 0..3 { println(i * 14) } return 0 }"
+    if poc_compile_and_run(pnloop_src, "/tmp/hexa_poc_pnloop", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // for-in over array: sum elements
+    let fin_src = "fn main() { let arr = [10, 15, 7, 10]; let mut s = 0; for x in arr { s = s + x } return s }"
+    if poc_compile_and_run(fin_src, "/tmp/hexa_poc_fin", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // for-in + println(int)
+    let finln_src = "fn main() { let arr = [10, 20, 12]; for v in arr { println(v) } return 0 }"
+    if poc_compile_and_run(finln_src, "/tmp/hexa_poc_finln", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // abs(negative)
+    if poc_compile_and_run("fn main() { let x = 0 - 42; return abs(x) }",
+                           "/tmp/hexa_poc_abs", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // abs(positive) pass-through
+    if poc_compile_and_run("fn main() { return abs(42) }",
+                           "/tmp/hexa_poc_abs2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // min / max
+    if poc_compile_and_run("fn main() { return min(42, 99) }",
+                           "/tmp/hexa_poc_min", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("fn main() { return max(42, 13) }",
+                           "/tmp/hexa_poc_max", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Struct passed to fn via param type annotation
+    let spt_src = "struct P { x: int, y: int }\nfn sum(p: P) { return p.x + p.y }\nfn main() { let q = P{x: 10, y: 32}; return sum(q) }"
+    if poc_compile_and_run(spt_src, "/tmp/hexa_poc_spt", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Struct param used with methods + another fn
+    let spt2 = "struct R { w: int, h: int }\nfn area(r: R) { return r.w * r.h }\nfn main() { let r = R{w: 6, h: 7}; return area(r) }"
+    if poc_compile_and_run(spt2, "/tmp/hexa_poc_spt2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // IfExpr as value — let x = if cond { a } else { b }
+    let ifv_src = "fn main() { let x = if 1 == 1 { 42 } else { 99 }; return x }"
+    if poc_compile_and_run(ifv_src, "/tmp/hexa_poc_ifv", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    let ifv2 = "fn main() { let x = 10; let y = if x > 5 { x * 4 + 2 } else { 0 }; return y }"
+    if poc_compile_and_run(ifv2, "/tmp/hexa_poc_ifv2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // return if-expression directly
+    let ifv3 = "fn pick(b) { return if b == 1 { 42 } else { 99 } }\nfn main() { return pick(1) }"
+    if poc_compile_and_run(ifv3, "/tmp/hexa_poc_ifv3", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // if-without-else stmt
+    let ife = "fn main() { let mut x = 40; if 1 == 1 { x = x + 2 } return x }"
+    if poc_compile_and_run(ife, "/tmp/hexa_poc_ife", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Nested if-else
+    let nif = "fn main() { let n = 10; if n > 5 { if n > 8 { return 42 } else { return 1 } } else { return 2 } }"
+    if poc_compile_and_run(nif, "/tmp/hexa_poc_nif", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Hex literal
+    if poc_compile_and_run("fn main() { return 0x2A }",
+                           "/tmp/hexa_poc_hex", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Hex + arithmetic
+    if poc_compile_and_run("fn main() { return 0x20 + 0xA }",
+                           "/tmp/hexa_poc_hex2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // assert — passes (cond true)
+    if poc_compile_and_run("fn main() { assert(1 == 1); return 42 }",
+                           "/tmp/hexa_poc_as", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // assert_eq — passes
+    if poc_compile_and_run("fn main() { assert_eq(6 * 7, 42); return 42 }",
+                           "/tmp/hexa_poc_aseq", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // assert_eq — fails → exit(1)
+    if poc_compile_and_run("fn main() { assert_eq(6 * 7, 41); return 42 }",
+                           "/tmp/hexa_poc_aseqf", 1) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Global const
+    if poc_compile_and_run("const MAX = 42\nfn main() { return MAX }",
+                           "/tmp/hexa_poc_cst", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    if poc_compile_and_run("const W = 6\nconst H = 7\nfn main() { return W * H }",
+                           "/tmp/hexa_poc_cst2", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Growable array — push then index
+    if poc_compile_and_run("fn main() { let mut arr = [1, 2]; arr = arr.push(42); return arr[2] }",
+                           "/tmp/hexa_poc_psh", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Grow via push then len()
+    let grow_src = "fn main() { let mut arr = [10, 20]; arr = arr.push(5); arr = arr.push(7); return len(arr) * 10 + arr[3] }"
+    if poc_compile_and_run(grow_src, "/tmp/hexa_poc_grow", 47) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // for-in over pushed array
+    let push_iter = "fn main() { let mut xs = [1]; xs = xs.push(10); xs = xs.push(15); xs = xs.push(16); let mut s = 0; for v in xs { s = s + v } return s }"
+    if poc_compile_and_run(push_iter, "/tmp/hexa_poc_piter", 42) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    // Substantial program — fizzbuzz-like using int println
+    // Simple println(int) in while loop
+    let pwloop = "fn main() { let mut i = 0; while i < 3 { println(i); i = i + 1 } return 0 }"
+    if poc_compile_and_run(pwloop, "/tmp/hexa_poc_pw", 0) { pass = pass + 1 } else { fail = fail + 1 }
+    println("")
+    println("=== " + str(pass) + " PASS, " + str(fail) + " FAIL ===")
+}

@@ -1,0 +1,857 @@
+// self/mini_native.hexa — P7-6a (b-path) mini native codegen LIBRARY
+//
+// Extracts ARM64 encoders + Mach-O wrapper from compile_pipeline.hexa as
+// a library (no top-level driver). Used by native_compile_poc.hexa to
+// turn a parsed AST's tiny program into a runnable Mach-O binary.
+
+// ═══════════════════════════════════════════════════════════
+//  ARM64 instruction encoders
+// ═══════════════════════════════════════════════════════════
+
+fn mn_emit32_le(code: [int], instr: int) -> [int] {
+    let b0 = instr % 256
+    let b1 = (instr / 256) % 256
+    let b2 = (instr / 65536) % 256
+    let b3 = (instr / 16777216) % 256
+    return code.push(b0).push(b1).push(b2).push(b3)
+}
+
+fn mn_enc_movz(rd: int, imm16: int) -> int {
+    return 3531603968 + (imm16 * 32) + rd
+}
+
+fn mn_enc_movk(rd: int, imm16: int, hw: int) -> int {
+    return 4068474880 + (hw * 2097152) + (imm16 * 32) + rd
+}
+
+fn mn_enc_mov_reg(rd: int, rm: int) -> int {
+    return 2852127712 + (rm * 65536) + rd
+}
+
+fn mn_enc_ret() -> int { return 3596551104 }
+
+// ADR Xd, label — 21-bit signed PC-relative byte displacement.
+//   0x10000000 | (immlo & 3) << 29 | (immhi & 0x7FFFF) << 5 | rd
+fn mn_enc_adr(rd: int, disp: int) -> int {
+    let mut d = disp
+    if d < 0 { d = d + 2097152 }
+    let immlo = d % 4
+    let immhi = (d / 4) % 524288
+    return 0x10000000 + (immlo * 0x20000000) + (immhi * 32) + rd
+}
+
+// ADD Xd, Xn, Xm   (0x8b000000)
+fn mn_enc_add(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + (rm * 65536) + (rn * 32) + rd
+}
+// SUB Xd, Xn, Xm   (0xcb000000)
+fn mn_enc_sub(rd: int, rn: int, rm: int) -> int {
+    return 3405774848 + (rm * 65536) + (rn * 32) + rd
+}
+// MUL Xd, Xn, Xm   (0x9b007c00)
+fn mn_enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600500224 + (rm * 65536) + (rn * 32) + rd
+}
+// SDIV Xd, Xn, Xm  (0x9ac00c00)
+fn mn_enc_sdiv(rd: int, rn: int, rm: int) -> int {
+    return 0x9ac00c00 + (rm * 65536) + (rn * 32) + rd
+}
+// MSUB Xd, Xn, Xm, Xa  (0x9b008000)  — Xd = Xa - Xn*Xm
+fn mn_enc_msub(rd: int, rn: int, rm: int, ra: int) -> int {
+    return 0x9b008000 + (rm * 65536) + (ra * 1024) + (rn * 32) + rd
+}
+
+// Bitwise 3-reg encoders:
+//   AND Xd, Xn, Xm  (0x8a000000)
+//   ORR Xd, Xn, Xm  (0xaa000000)
+//   EOR Xd, Xn, Xm  (0xca000000)
+fn mn_enc_and(rd: int, rn: int, rm: int) -> int {
+    return 0x8a000000 + (rm * 65536) + (rn * 32) + rd
+}
+fn mn_enc_orr(rd: int, rn: int, rm: int) -> int {
+    return 0xaa000000 + (rm * 65536) + (rn * 32) + rd
+}
+fn mn_enc_eor(rd: int, rn: int, rm: int) -> int {
+    return 0xca000000 + (rm * 65536) + (rn * 32) + rd
+}
+// LSLV Xd, Xn, Xm  (0x9ac02000) — logical shift left by register
+// LSRV Xd, Xn, Xm  (0x9ac02400) — logical shift right by register
+fn mn_enc_lslv(rd: int, rn: int, rm: int) -> int {
+    return 0x9ac02000 + (rm * 65536) + (rn * 32) + rd
+}
+fn mn_enc_lsrv(rd: int, rn: int, rm: int) -> int {
+    return 0x9ac02400 + (rm * 65536) + (rn * 32) + rd
+}
+
+// CMP Xn, Xm  == SUBS XZR, Xn, Xm  (0xeb00001f)
+fn mn_enc_cmp(rn: int, rm: int) -> int {
+    return 3942645791 + (rm * 65536) + (rn * 32)
+}
+
+// B.cond #off19  (0x54000000) — cond_code 0..15
+//   0=EQ 1=NE 10=GE 11=LT 12=GT 13=LE
+fn mn_enc_b_cond(off19: int, cond_code: int) -> int {
+    let mut off = off19
+    if off < 0 { off = off + 524288 }
+    return 1409286144 + (off * 32) + cond_code
+}
+
+// B #off26  (0x14000000) — unconditional branch
+fn mn_enc_b(off26: int) -> int {
+    if off26 >= 0 {
+        return 335544320 + (off26 % 67108864)
+    }
+    return 335544320 + ((off26 + 67108864) % 67108864)
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mini IR — flat IRInstr (3 operand slots + imm + is_imm).
+// ═══════════════════════════════════════════════════════════
+
+struct MnInstr {
+    result: int,
+    op: string,
+    a: int,
+    b: int,
+    imm: int,
+    is_imm: bool
+}
+
+fn mn_load_imm(result: int, imm: int) -> MnInstr {
+    return MnInstr { result: result, op: "load", a: 0, b: 0, imm: imm, is_imm: true }
+}
+
+fn mn_ret(val_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "ret", a: val_vid, b: 0, imm: 0, is_imm: false }
+}
+
+fn mn_syscall1(nr_imm: int, arg_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "syscall1", a: arg_vid, b: 0, imm: nr_imm, is_imm: true }
+}
+
+// 3-arg Darwin syscall (e.g. sys_write(fd, buf, len)). Caller must
+// place arg0, arg1, arg2 into vids 0, 1, 2 (x0, x1, x2) before emit.
+fn mn_syscall3_prepared(nr_imm: int) -> MnInstr {
+    return MnInstr { result: -1, op: "syscall3p", a: 0, b: 0, imm: nr_imm, is_imm: true }
+}
+// 6-arg Darwin syscall (e.g. sys_mmap(addr, len, prot, flags, fd, off)).
+// Caller must place args in vids 0..5 (x0..x5) before emit.
+fn mn_syscall6_prepared(nr_imm: int) -> MnInstr {
+    return MnInstr { result: -1, op: "syscall6p", a: 0, b: 0, imm: nr_imm, is_imm: true }
+}
+
+// ADR Xrd, <string label>. `a` field stores the string id.
+fn mn_str_addr(result_vid: int, str_id: int) -> MnInstr {
+    return MnInstr { result: result_vid, op: "str_addr", a: str_id, b: 0, imm: 0, is_imm: false }
+}
+
+fn mn_add(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "add", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_sub(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "sub", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_mul(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "mul", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_div(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "div", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_mod(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "mod", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_and(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "and", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_or(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "or", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_xor(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "xor", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_shl(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "shl", a: a, b: b, imm: 0, is_imm: false }
+}
+fn mn_shr(result: int, a: int, b: int) -> MnInstr {
+    return MnInstr { result: result, op: "shr", a: a, b: b, imm: 0, is_imm: false }
+}
+
+// Bitwise NOT: MVN Xd, Xm (ORN Xd, XZR, Xm)
+fn mn_bnot(result: int, a: int) -> MnInstr {
+    return MnInstr { result: result, op: "bnot", a: a, b: 0, imm: 0, is_imm: false }
+}
+
+// CMP + CSET combo — produces a 0/1 bool in result from comparison of a and b.
+// cond_code: 0=EQ 1=NE 10=GE 11=LT 12=GT 13=LE
+fn mn_cmp_set(result: int, a: int, b: int, cond_code: int) -> MnInstr {
+    return MnInstr { result: result, op: "cmp_set", a: a, b: b, imm: cond_code, is_imm: true }
+}
+
+// Stack-frame array support (fixed 256-byte scratch per fn).
+//   add_sp_imm(rd_vid, byte_off)        — rd ← SP + byte_off
+//   store_off(base_vid, byte_off, val)  — STR val, [base, #byte_off]
+//   load_off(rd_vid, base_vid, byte_off)— LDR rd,  [base, #byte_off]
+fn mn_add_sp_imm(result: int, byte_off: int) -> MnInstr {
+    return MnInstr { result: result, op: "add_sp", a: 0, b: 0, imm: byte_off, is_imm: true }
+}
+fn mn_store_off(base_vid: int, byte_off: int, val_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "store_off", a: base_vid, b: val_vid, imm: byte_off, is_imm: true }
+}
+fn mn_load_off(result: int, base_vid: int, byte_off: int) -> MnInstr {
+    return MnInstr { result: result, op: "load_off", a: base_vid, b: 0, imm: byte_off, is_imm: true }
+}
+// STRB Xval, [Xaddr]  — store low byte of val at addr.
+fn mn_storeb_at(addr_vid: int, val_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "storeb_at", a: addr_vid, b: val_vid, imm: 0, is_imm: false }
+}
+// ADD Xrd, Xrn, #imm12  — add immediate.
+fn mn_add_imm(rd_vid: int, rn_vid: int, imm: int) -> MnInstr {
+    return MnInstr { result: rd_vid, op: "add_imm", a: rn_vid, b: 0, imm: imm, is_imm: true }
+}
+// SUB Xrd, Xrn, #imm12  — sub immediate.
+fn mn_sub_imm(rd_vid: int, rn_vid: int, imm: int) -> MnInstr {
+    return MnInstr { result: rd_vid, op: "sub_imm", a: rn_vid, b: 0, imm: imm, is_imm: true }
+}
+
+// Move register: dst ← src. Used for AssignStmt (rebind mutable locals).
+fn mn_mov(dst_vid: int, src_vid: int) -> MnInstr {
+    return MnInstr { result: dst_vid, op: "mov", a: src_vid, b: 0, imm: 0, is_imm: false }
+}
+
+// Multi-fn support. fn_id is a small int assigned by the caller, used
+// as the key in a parallel name table maintained at the POC layer.
+//
+//   fn_begin(fn_id)  — emits prologue (stp fp,lr ; mov fp,sp = 8 bytes).
+//                      Records byte offset in fn_id → offset map.
+//   ret_ep(vid)      — emits epilogue-ret (mov x0,Rv ; ldp fp,lr ; ret
+//                      = 12 bytes). Used instead of `ret` in multi-fn mode.
+//   call(fn_id)      — emits BL placeholder (4 bytes). Resolved in pass 2.
+fn mn_fn_begin(fn_id: int) -> MnInstr {
+    return MnInstr { result: -1, op: "fn_begin", a: 0, b: 0, imm: fn_id, is_imm: true }
+}
+fn mn_ret_ep(val_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "ret_ep", a: val_vid, b: 0, imm: 0, is_imm: false }
+}
+fn mn_call(fn_id: int) -> MnInstr {
+    return MnInstr { result: -1, op: "call", a: 0, b: 0, imm: fn_id, is_imm: true }
+}
+
+// Control flow via labels. `label` is a zero-byte marker; `br_cond` /
+// `jmp` target a label id via `imm` field. Label ids are fresh
+// per-function from poc_fresh_label().
+//
+// cond_code for "br_cond":
+//   0=EQ 1=NE 10=GE 11=LT 12=GT 13=LE
+fn mn_label(label_id: int) -> MnInstr {
+    return MnInstr { result: -1, op: "label", a: 0, b: 0, imm: label_id, is_imm: true }
+}
+fn mn_cmp(a_vid: int, b_vid: int) -> MnInstr {
+    return MnInstr { result: -1, op: "cmp", a: a_vid, b: b_vid, imm: 0, is_imm: false }
+}
+fn mn_br_cond(cond_code: int, label_id: int) -> MnInstr {
+    return MnInstr { result: -1, op: "br_cond", a: cond_code, b: 0, imm: label_id, is_imm: true }
+}
+fn mn_jmp(label_id: int) -> MnInstr {
+    return MnInstr { result: -1, op: "jmp", a: 0, b: 0, imm: label_id, is_imm: true }
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Codegen: instrs → ARM64 .text bytes
+// ═══════════════════════════════════════════════════════════
+
+fn mn_regfor(vid: int) -> int {
+    if vid < 0 { return 0 }
+    // Valid physical regs: x0..x28 (x29=fp, x30=lr, x31=sp/xzr — reserved).
+    if vid >= 29 { return 31 }   // spill sentinel
+    return vid
+}
+
+fn mn_emit_one(bytes: [int], ins: MnInstr) -> [int] {
+    let mut c = bytes
+    if ins.op == "load" {
+        let rd = mn_regfor(ins.result)
+        let v = ins.imm
+        c = mn_emit32_le(c, mn_enc_movz(rd, v % 65536))
+        if v > 65535 {
+            c = mn_emit32_le(c, mn_enc_movk(rd, (v / 65536) % 65536, 1))
+        }
+        return c
+    }
+    if ins.op == "ret" {
+        let rs = mn_regfor(ins.a)
+        c = mn_emit32_le(c, mn_enc_mov_reg(0, rs))
+        c = mn_emit32_le(c, mn_enc_ret())
+        return c
+    }
+    if ins.op == "syscall1" {
+        let rs = mn_regfor(ins.a)
+        c = mn_emit32_le(c, mn_enc_mov_reg(0, rs))
+        let nr = ins.imm
+        c = mn_emit32_le(c, mn_enc_movz(16, nr % 65536))
+        c = mn_emit32_le(c, mn_enc_movk(16, (nr / 65536) % 65536, 1))
+        c = mn_emit32_le(c, 3556872193)
+        return c
+    }
+    if ins.op == "syscall3p" {
+        let nr = ins.imm
+        c = mn_emit32_le(c, mn_enc_movz(16, nr % 65536))
+        c = mn_emit32_le(c, mn_enc_movk(16, (nr / 65536) % 65536, 1))
+        c = mn_emit32_le(c, 3556872193)
+        return c
+    }
+    if ins.op == "syscall6p" {
+        let nr = ins.imm
+        c = mn_emit32_le(c, mn_enc_movz(16, nr % 65536))
+        c = mn_emit32_le(c, mn_enc_movk(16, (nr / 65536) % 65536, 1))
+        c = mn_emit32_le(c, 3556872193)
+        return c
+    }
+    if ins.op == "add" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_add(rd, rn, rm))
+        return c
+    }
+    if ins.op == "sub" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_sub(rd, rn, rm))
+        return c
+    }
+    if ins.op == "mul" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_mul(rd, rn, rm))
+        return c
+    }
+    if ins.op == "div" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_sdiv(rd, rn, rm))
+        return c
+    }
+    if ins.op == "mod" {
+        // mod = a - (a/b)*b  →  SDIV tmp, Rn, Rm ; MSUB Rd, tmp, Rm, Rn
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        let tmp = 17   // x17 scratch
+        c = mn_emit32_le(c, mn_enc_sdiv(tmp, rn, rm))
+        c = mn_emit32_le(c, mn_enc_msub(rd, tmp, rm, rn))
+        return c
+    }
+    if ins.op == "and" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_and(rd, rn, rm))
+        return c
+    }
+    if ins.op == "or" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_orr(rd, rn, rm))
+        return c
+    }
+    if ins.op == "xor" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_eor(rd, rn, rm))
+        return c
+    }
+    if ins.op == "shl" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_lslv(rd, rn, rm))
+        return c
+    }
+    if ins.op == "shr" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        c = mn_emit32_le(c, mn_enc_lsrv(rd, rn, rm))
+        return c
+    }
+    if ins.op == "bnot" {
+        // MVN Xd, Xm (encoded as ORN Xd, XZR, Xm) = 0xaa2003e0 + Rm<<16 + Rd
+        let rd = mn_regfor(ins.result)
+        let rm = mn_regfor(ins.a)
+        c = mn_emit32_le(c, 0xaa2003e0 + (rm * 65536) + rd)
+        return c
+    }
+    if ins.op == "add_sp" {
+        // ADD Xrd, SP, #imm12
+        let rd = mn_regfor(ins.result)
+        let imm = ins.imm
+        c = mn_emit32_le(c, 0x91000000 + (imm * 1024) + (31 * 32) + rd)
+        return c
+    }
+    if ins.op == "store_off" {
+        // STR Xval, [Xbase, #imm12*8]  — imm12 = byte_off / 8
+        let base = mn_regfor(ins.a)
+        let val = mn_regfor(ins.b)
+        let imm12 = ins.imm / 8
+        c = mn_emit32_le(c, 0xf9000000 + (imm12 * 1024) + (base * 32) + val)
+        return c
+    }
+    if ins.op == "load_off" {
+        let rd = mn_regfor(ins.result)
+        let base = mn_regfor(ins.a)
+        let imm12 = ins.imm / 8
+        c = mn_emit32_le(c, 0xf9400000 + (imm12 * 1024) + (base * 32) + rd)
+        return c
+    }
+    if ins.op == "storeb_at" {
+        // STRB Xval, [Xaddr]  (0x39000000 + Rn<<5 + Rt)
+        let addr = mn_regfor(ins.a)
+        let val = mn_regfor(ins.b)
+        c = mn_emit32_le(c, 0x39000000 + (addr * 32) + val)
+        return c
+    }
+    if ins.op == "add_imm" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        c = mn_emit32_le(c, 0x91000000 + (ins.imm * 1024) + (rn * 32) + rd)
+        return c
+    }
+    if ins.op == "sub_imm" {
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        c = mn_emit32_le(c, 0xd1000000 + (ins.imm * 1024) + (rn * 32) + rd)
+        return c
+    }
+    if ins.op == "cmp_set" {
+        // CMP + CSET. Base CSET = 0x9a9f07e0 + inv_cond*4096 + rd
+        let rd = mn_regfor(ins.result)
+        let rn = mn_regfor(ins.a)
+        let rm = mn_regfor(ins.b)
+        let cc = ins.imm
+        let mut inv = 0
+        if cc == 0  { inv = 1 }        // EQ → NE
+        else if cc == 1  { inv = 0 }   // NE → EQ
+        else if cc == 10 { inv = 11 }  // GE → LT
+        else if cc == 11 { inv = 10 }  // LT → GE
+        else if cc == 12 { inv = 13 }  // GT → LE
+        else if cc == 13 { inv = 12 }  // LE → GT
+        c = mn_emit32_le(c, mn_enc_cmp(rn, rm))
+        c = mn_emit32_le(c, 0x9a9f07e0 + (inv * 4096) + rd)
+        return c
+    }
+    if ins.op == "mov" {
+        let rd = mn_regfor(ins.result)
+        let rs = mn_regfor(ins.a)
+        if rd != rs {
+            c = mn_emit32_le(c, mn_enc_mov_reg(rd, rs))
+        }
+        return c
+    }
+    if ins.op == "fn_begin" {
+        // Prologue — saves 10 callee-saved regs + fp/lr + reserves
+        // 256-byte scratch frame for array allocations.
+        c = mn_emit32_le(c, 0xa9bf53f3)    // stp x19, x20, [sp, #-16]!
+        c = mn_emit32_le(c, 0xa9bf5bf5)    // stp x21, x22, [sp, #-16]!
+        c = mn_emit32_le(c, 0xa9bf63f7)    // stp x23, x24, [sp, #-16]!
+        c = mn_emit32_le(c, 0xa9bf6bf9)    // stp x25, x26, [sp, #-16]!
+        c = mn_emit32_le(c, 0xa9bf73fb)    // stp x27, x28, [sp, #-16]!
+        c = mn_emit32_le(c, 0xa9bf7bfd)    // stp x29, x30, [sp, #-16]!
+        c = mn_emit32_le(c, 0x910003fd)    // mov x29, sp
+        c = mn_emit32_le(c, 0xd11003ff)    // sub sp, sp, #1024  (array scratch — ~7 arrays @ 144B)
+        return c
+    }
+    if ins.op == "ret_ep" {
+        // Epilogue-ret: restore sp ; mov x0, Rret ; restore regs ; ret
+        let rs = mn_regfor(ins.a)
+        c = mn_emit32_le(c, 0x910003bf)    // mov sp, x29  (undo #256 sub)
+        c = mn_emit32_le(c, mn_enc_mov_reg(0, rs))
+        c = mn_emit32_le(c, 0xa8c17bfd)    // ldp x29, x30, [sp], #16
+        c = mn_emit32_le(c, 0xa8c173fb)    // ldp x27, x28, [sp], #16
+        c = mn_emit32_le(c, 0xa8c16bf9)    // ldp x25, x26, [sp], #16
+        c = mn_emit32_le(c, 0xa8c163f7)    // ldp x23, x24, [sp], #16
+        c = mn_emit32_le(c, 0xa8c15bf5)    // ldp x21, x22, [sp], #16
+        c = mn_emit32_le(c, 0xa8c153f3)    // ldp x19, x20, [sp], #16
+        c = mn_emit32_le(c, 0xd65f03c0)    // ret
+        return c
+    }
+    c = mn_emit32_le(c, mn_enc_movz(0, 48863))
+    return c
+}
+
+// Size of each MnInstr in bytes (for label offset pre-pass).
+fn mn_size(ins: MnInstr) -> int {
+    if ins.op == "load" {
+        if ins.imm > 65535 { return 8 }
+        return 4
+    }
+    if ins.op == "ret"       { return 8 }
+    if ins.op == "syscall1"  { return 16 }
+    if ins.op == "syscall3p" { return 12 }
+    if ins.op == "syscall6p" { return 12 }
+    if ins.op == "str_addr"  { return 4 }
+    if ins.op == "add"       { return 4 }
+    if ins.op == "sub"       { return 4 }
+    if ins.op == "mul"       { return 4 }
+    if ins.op == "div"       { return 4 }
+    if ins.op == "mod"       { return 8 }   // sdiv + msub
+    if ins.op == "and"       { return 4 }
+    if ins.op == "or"        { return 4 }
+    if ins.op == "xor"       { return 4 }
+    if ins.op == "shl"       { return 4 }
+    if ins.op == "shr"       { return 4 }
+    if ins.op == "bnot"      { return 4 }
+    if ins.op == "cmp_set"   { return 8 }
+    if ins.op == "add_sp"    { return 4 }
+    if ins.op == "store_off" { return 4 }
+    if ins.op == "load_off"  { return 4 }
+    if ins.op == "storeb_at" { return 4 }
+    if ins.op == "add_imm"   { return 4 }
+    if ins.op == "sub_imm"   { return 4 }
+    if ins.op == "mov"       {
+        if ins.result == ins.a { return 0 }
+        return 4
+    }
+    if ins.op == "cmp"       { return 4 }
+    if ins.op == "br_cond"   { return 4 }
+    if ins.op == "jmp"       { return 4 }
+    if ins.op == "label"     { return 0 }
+    if ins.op == "fn_begin"  { return 32 }    // 6 stp + mov fp + sub sp = 8 instrs
+    if ins.op == "ret_ep"    { return 36 }    // mov sp + mov x0 + 6 ldp + ret = 9
+    if ins.op == "call"      { return 4 }
+    return 4
+}
+
+// Two-pass lowering with label + fn symbol + string literal resolution.
+// `strings` is an array of string literals indexed by str_id.
+fn mn_lower(instrs: [MnInstr], strings: [string]) -> [int] {
+    // Pass 1: compute byte offset of each instr + build label/fn offset maps.
+    let mut offsets = []
+    let mut label_ids = []
+    let mut label_offs = []
+    let mut fn_ids = []
+    let mut fn_offs = []
+    let mut off = 0
+    let mut i = 0
+    while i < len(instrs) {
+        offsets = offsets.push(off)
+        let ins = instrs[i]
+        if ins.op == "label" {
+            label_ids = label_ids.push(ins.imm)
+            label_offs = label_offs.push(off)
+        }
+        if ins.op == "fn_begin" {
+            fn_ids = fn_ids.push(ins.imm)
+            fn_offs = fn_offs.push(off)
+        }
+        off = off + mn_size(ins)
+        i = i + 1
+    }
+    let total_code = off
+    // Compute each string's byte offset (after all code).
+    let mut str_offs = []
+    let mut cur_str = total_code
+    let mut si = 0
+    while si < len(strings) {
+        str_offs = str_offs.push(cur_str)
+        cur_str = cur_str + len(strings[si])
+        si = si + 1
+    }
+
+    // Pass 2: emit bytes, resolving labels.
+    let mut bytes = []
+    i = 0
+    while i < len(instrs) {
+        let ins = instrs[i]
+        let cur_off = offsets[i]
+        if ins.op == "br_cond" {
+            // Look up target offset.
+            let mut target = 0
+            let mut j = 0
+            while j < len(label_ids) {
+                if label_ids[j] == ins.imm { target = label_offs[j] }
+                j = j + 1
+            }
+            let disp_bytes = target - cur_off
+            let imm19 = disp_bytes / 4
+            bytes = mn_emit32_le(bytes, mn_enc_b_cond(imm19, ins.a))
+            i = i + 1
+            continue
+        }
+        if ins.op == "jmp" {
+            let mut target = 0
+            let mut j = 0
+            while j < len(label_ids) {
+                if label_ids[j] == ins.imm { target = label_offs[j] }
+                j = j + 1
+            }
+            let disp_bytes = target - cur_off
+            let imm26 = disp_bytes / 4
+            bytes = mn_emit32_le(bytes, mn_enc_b(imm26))
+            i = i + 1
+            continue
+        }
+        if ins.op == "cmp" {
+            let rn = mn_regfor(ins.a)
+            let rm = mn_regfor(ins.b)
+            bytes = mn_emit32_le(bytes, mn_enc_cmp(rn, rm))
+            i = i + 1
+            continue
+        }
+        if ins.op == "label" {
+            i = i + 1
+            continue
+        }
+        if ins.op == "call" {
+            // Resolve BL target via fn symbol table.
+            let mut target = 0
+            let mut j = 0
+            while j < len(fn_ids) {
+                if fn_ids[j] == ins.imm { target = fn_offs[j] }
+                j = j + 1
+            }
+            let disp_bytes = target - cur_off
+            let imm26 = disp_bytes / 4
+            let mut imm_encoded = imm26
+            if imm_encoded < 0 { imm_encoded = imm_encoded + 67108864 }
+            imm_encoded = imm_encoded % 67108864
+            bytes = mn_emit32_le(bytes, 2483027968 + imm_encoded)
+            i = i + 1
+            continue
+        }
+        if ins.op == "str_addr" {
+            let str_id = ins.a
+            let target_off = str_offs[str_id]
+            let disp = target_off - cur_off
+            let rd = mn_regfor(ins.result)
+            bytes = mn_emit32_le(bytes, mn_enc_adr(rd, disp))
+            i = i + 1
+            continue
+        }
+        bytes = mn_emit_one(bytes, ins)
+        i = i + 1
+    }
+    // Append string literal bytes.
+    let mut sj = 0
+    while sj < len(strings) {
+        let s = strings[sj]
+        let sb = hexa_str_bytes_or_split(s)
+        let mut bk = 0
+        while bk < len(sb) {
+            bytes = bytes.push(sb[bk])
+            bk = bk + 1
+        }
+        sj = sj + 1
+    }
+    while len(bytes) % 4 != 0 {
+        bytes = bytes.push(0)
+    }
+    return bytes
+}
+
+// Convert string to byte array (hexa doesn't expose a direct builtin).
+fn hexa_str_bytes_or_split(s: string) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < len(s) {
+        let ch = s.substring(i, i + 1)
+        out = out.push(ord(ch))
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Mach-O wrap — EXACT copy of compile_pipeline.hexa's build_macho_hex
+//  (byte-for-byte identical to proven P1/P2/P3/P4 output).
+// ═══════════════════════════════════════════════════════════
+
+fn mn_hex_chars() -> string { return "0123456789abcdef" }
+
+fn mn_byte_to_hex(b: int, h: string) -> string {
+    let hi = (b / 16) % 16
+    let lo = b % 16
+    return h.substring(hi, hi + 1) + h.substring(lo, lo + 1)
+}
+
+fn mn_u32_to_hex(v: int, h: string) -> string {
+    let b0 = v % 256
+    let b1 = (v / 256) % 256
+    let b2 = (v / 65536) % 256
+    let b3 = (v / 16777216) % 256
+    return mn_byte_to_hex(b0, h) + mn_byte_to_hex(b1, h)
+        + mn_byte_to_hex(b2, h) + mn_byte_to_hex(b3, h)
+}
+
+fn mn_u64_to_hex(v: int, h: string) -> string {
+    return mn_u32_to_hex(v % 4294967296, h) + mn_u32_to_hex(v / 4294967296, h)
+}
+
+fn mn_macho_hex(text_bytes: [int]) -> string {
+    let HEX = mn_hex_chars()
+    let MH_MAGIC_64 = 4277009103
+    let CPU_ARM64   = 16777228
+    let MH_EXECUTE  = 2
+    let HDR_FLAGS   = 2097285
+    let NCMDS       = 11
+    let SIZEOFCMDS  = 576
+    let PAGE        = 16384
+    let CODE_OFF    = 768
+
+    let code_bytes = len(text_bytes)
+    let mut text_size_aligned = code_bytes
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    let mut parts = []
+    let hdr_u32 = [MH_MAGIC_64, CPU_ARM64, 0, MH_EXECUTE, NCMDS, SIZEOFCMDS, HDR_FLAGS, 0]
+    let mut hi = 0
+    while hi < len(hdr_u32) {
+        parts.push(mn_u32_to_hex(hdr_u32[hi], HEX))
+        hi = hi + 1
+    }
+
+    // LC_SEGMENT_64 __PAGEZERO
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f504147455a45524f0000000000" + "00")
+    parts.push("0000000000000000")
+    parts.push("0000000001000000")
+    parts.push("0000000000000000")
+    parts.push("0000000000000000")
+    parts.push("00000000" + "00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __TEXT
+    parts.push("19000000" + "98000000")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push("0000000001000000")
+    parts.push("0040000000000000")
+    parts.push("0000000000000000")
+    parts.push("0040000000000000")
+    parts.push("05000000")
+    parts.push("05000000")
+    parts.push("01000000")
+    parts.push("00000000")
+
+    // section __text
+    parts.push("5f5f74657874000000000000000000" + "00")
+    parts.push("5f5f54455854000000000000000000" + "00")
+    parts.push(mn_u64_to_hex(4294967296 + CODE_OFF, HEX))
+    parts.push(mn_u64_to_hex(text_size_aligned, HEX))
+    parts.push(mn_u32_to_hex(CODE_OFF, HEX))
+    parts.push("02000000")
+    parts.push("00000000" + "00000000")
+    parts.push("00040080")
+    parts.push("00000000" + "00000000" + "00000000")
+
+    // LC_SEGMENT_64 __LINKEDIT
+    parts.push("19000000" + "48000000")
+    parts.push("5f5f4c494e4b45444954000000000000")
+    parts.push("0040000001000000")
+    parts.push("0040000000000000")
+    parts.push("0040000000000000")
+    parts.push("3100000000000000")
+    parts.push("01000000" + "01000000")
+    parts.push("00000000" + "00000000")
+
+    // LC_DYLD_CHAINED_FIXUPS
+    parts.push("34000080" + "10000000" + "00400000" + "30000000")
+
+    // LC_SYMTAB
+    parts.push("02000000" + "18000000")
+    parts.push("30400000")
+    parts.push("00000000")
+    parts.push("30400000")
+    parts.push("01000000")
+
+    // LC_DYSYMTAB
+    parts.push("0b000000" + "50000000")
+    let mut dyz_parts = []
+    let mut dyz = 0
+    while dyz < 72 {
+        dyz_parts.push("00")
+        dyz = dyz + 1
+    }
+    parts.push(dyz_parts.join(""))
+
+    // LC_LOAD_DYLINKER
+    parts.push("0e000000" + "20000000" + "0c000000")
+    parts.push("2f7573722f6c69622f64796c6400")
+    parts.push("000000000000")
+
+    // LC_UUID
+    parts.push("1b000000" + "18000000")
+    parts.push("48455841414243444546303132333435")
+
+    // LC_BUILD_VERSION
+    parts.push("32000000" + "18000000")
+    parts.push("01000000")
+    parts.push("00000e00")
+    parts.push("00000e00")
+    parts.push("00000000")
+
+    // LC_MAIN
+    parts.push("28000080" + "18000000")
+    parts.push(mn_u64_to_hex(CODE_OFF, HEX))
+    parts.push("0000000000000000")
+
+    // LC_LOAD_DYLIB libSystem
+    parts.push("0c000000" + "38000000")
+    parts.push("18000000")
+    parts.push("02000000")
+    parts.push("00000100")
+    parts.push("00000100")
+    parts.push("2f7573722f6c69622f6c69625379737465")
+    parts.push("6d2e422e64796c696200000000000000")
+
+    let mut s = parts.join("")
+
+    while (len(s) / 2) < CODE_OFF {
+        s = s + "00"
+    }
+
+    let mut bi = 0
+    while bi < len(text_bytes) {
+        s = s + mn_byte_to_hex(text_bytes[bi], HEX)
+        bi = bi + 1
+    }
+
+    while (len(s) / 2) < PAGE {
+        s = s + "00"
+    }
+
+    // __LINKEDIT stub
+    s = s + "00000000"
+    s = s + "20000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "01000000"
+    s = s + "00000000"
+    s = s + "00000000"
+    s = s + "03000000"
+    s = s + "00000000" + "00000000" + "00000000"
+    s = s + "00"
+
+    return s
+}
+
+// ═══════════════════════════════════════════════════════════
+//  Driver helpers
+// ═══════════════════════════════════════════════════════════
+
+fn mn_write_and_codesign(out_path: string, hex_data: string) -> int {
+    exec("printf '%s' '" + hex_data + "' | xxd -r -p > " + out_path)
+    exec("chmod +x " + out_path)
+    let cs = exec_with_status("codesign --force --sign - " + out_path + " 2>&1")
+    return cs[1]
+}
+
+fn mn_run(out_path: string) -> int {
+    let r = exec_with_status(out_path + " 2>&1")
+    return r[1]
+}
