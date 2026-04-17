@@ -1,0 +1,632 @@
+// ═══════════════════════════════════════════════════════════
+//  safetensors_to_hexaw.hexa — streaming safetensors -> HEXAW2
+//
+//  Converts HuggingFace safetensors (single-file or sharded)
+//  into the HEXAW2 binary weight format used by
+//  self/serve/serve_alm.hexa for CPU evaluation.
+//
+//  Why this exists: the old hexaw pipeline loaded the whole
+//  safetensors shard into RAM via read_file_bytes (which is a
+//  slurp-all builtin). Qwen2.5-14B is 8 shards x ~3.7GB =
+//  ~29.5GB total — even slurping one shard at full hexa Val
+//  overhead pushes RAM past 100GB. This converter uses the
+//  P4-stream builtins (runtime.c hexa_read_bytes_at /
+//  hexa_write_bytes_append / hexa_file_size) to pread each
+//  tensor in 64MB chunks and append-write HEXAW2 bytes directly
+//  to the output file, so steady-state RAM stays under ~200MB
+//  regardless of model size.
+//
+//  CLI:
+//    --input  <file.safetensors | directory>
+//    --output <file.hexaw>
+//    --dtype-target {f32|bf16}      (default f32; HEXAW2 stores f32 either way —
+//                                    bf16 target just zero-pads the low 16 bits)
+//
+//  Build (native, required — streaming builtins are compiled-only):
+//    cd hexa-lang
+//    ./hexa build self/tools/safetensors_to_hexaw.hexa -o build/safetensors_to_hexaw
+//
+//  Qwen2.5-14B H100 command line (reference — run on the pod where
+//  /workspace/hf/Qwen2.5-14B-Instruct contains the 8 shards +
+//  model.safetensors.index.json):
+//
+//    cd /workspace/hexa-lang
+//    ./hexa build self/tools/safetensors_to_hexaw.hexa \
+//      -o build/safetensors_to_hexaw
+//    ./build/safetensors_to_hexaw \
+//      --input /workspace/hf/Qwen2.5-14B-Instruct \
+//      --output /workspace/hexaw/qwen25_14b.hexaw \
+//      --dtype-target f32
+//
+//  Expected output size: ~56GB f32 (vs 118GB HEXAW1 text).
+//  Wall-clock on NVMe: ~10-20 min dominated by sequential read.
+//
+// ═══════════════════════════════════════════════════════════
+
+// ── tiny JSON scanner for the safetensors header ────────────
+// Safetensors format:
+//   [0..8)  little-endian u64 header_size
+//   [8..8+header_size)  JSON:
+//     { "<name>": {"dtype":"F32|BF16|F16", "shape":[d0,..], "data_offsets":[beg,end]},
+//       ... ,
+//       "__metadata__": {...}           // optional, skipped
+//     }
+//   [8+header_size..)  raw tensor bytes
+
+fn u64_le_from_bytes(bs, off) {
+    // bs is a byte array (int per slot)
+    let mut v = 0
+    let mut i = 0
+    let mut mul = 1
+    while i < 8 {
+        v = v + bs[off + i] * mul
+        mul = mul * 256
+        i = i + 1
+    }
+    return v
+}
+
+// ── Byte-array JSON scanner — uses raw int codes instead of
+//    string char_at() (not in codegen_c2) or s.chars()[i] which
+//    returns a 1-char string for the many branches we match in
+//    the safetensors header. All ASCII — no unicode concerns. ──
+
+fn jc_skip_ws(b, p) {
+    let n = len(b)
+    let mut i = p
+    while i < n {
+        let c = b[i]
+        if c == 32 || c == 9 || c == 10 || c == 13 {
+            i = i + 1
+        } else {
+            return i
+        }
+    }
+    return i
+}
+
+fn jc_parse_string(b, p) {
+    // Returns [value_string, next_pos]. Assumes b[p] == '"' (34).
+    let mut i = p + 1
+    let n = len(b)
+    let mut out = ""
+    while i < n {
+        let c = b[i]
+        if c == 34 {                 // '"'
+            return [out, i + 1]
+        }
+        if c == 92 {                 // backslash
+            if i + 1 < n {
+                out = out + to_string(from_char_code(b[i + 1]))
+                i = i + 2
+            } else {
+                i = i + 1
+            }
+        } else {
+            out = out + to_string(from_char_code(c))
+            i = i + 1
+        }
+    }
+    return [out, i]
+}
+
+fn jc_parse_int(b, p) {
+    let mut i = p
+    let n = len(b)
+    let mut sign = 1
+    if i < n && b[i] == 45 { sign = -1; i = i + 1 }    // '-'
+    let mut v = 0
+    while i < n {
+        let c = b[i]
+        if c >= 48 && c <= 57 {
+            v = v * 10 + (c - 48)
+            i = i + 1
+        } else {
+            return [v * sign, i]
+        }
+    }
+    return [v * sign, i]
+}
+
+fn jc_parse_int_array(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut arr = []
+    i = jc_skip_ws(b, i)
+    if i < n && b[i] == 93 { return [arr, i + 1] }    // ']'
+    while i < n {
+        i = jc_skip_ws(b, i)
+        let pr = jc_parse_int(b, i)
+        arr = arr + [pr[0]]
+        i = pr[1]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }          // ','
+        else if i < n && b[i] == 93 { return [arr, i + 1] }  // ']'
+    }
+    return [arr, i]
+}
+
+fn jc_skip_value(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    if i >= n { return i }
+    let c = b[i]
+    if c == 34 {                    // '"'
+        let pr = jc_parse_string(b, i)
+        return pr[1]
+    }
+    if c == 91 {                    // '['
+        let mut depth = 1
+        i = i + 1
+        while i < n && depth > 0 {
+            let cc = b[i]
+            if cc == 34 { let pr = jc_parse_string(b, i); i = pr[1] }
+            else if cc == 91 || cc == 123 { depth = depth + 1; i = i + 1 }
+            else if cc == 93 || cc == 125 { depth = depth - 1; i = i + 1 }
+            else { i = i + 1 }
+        }
+        return i
+    }
+    if c == 123 {                   // '{'
+        let mut depth = 1
+        i = i + 1
+        while i < n && depth > 0 {
+            let cc = b[i]
+            if cc == 34 { let pr = jc_parse_string(b, i); i = pr[1] }
+            else if cc == 123 || cc == 91 { depth = depth + 1; i = i + 1 }
+            else if cc == 125 || cc == 93 { depth = depth - 1; i = i + 1 }
+            else { i = i + 1 }
+        }
+        return i
+    }
+    // Numeric / keyword — read to next structural delimiter.
+    while i < n {
+        let cc = b[i]
+        if cc == 44 || cc == 125 || cc == 93 { return i }
+        i = i + 1
+    }
+    return i
+}
+
+// ── Per-tensor record parsing ───────────────────────────
+// Returns [dtype, shape, beg, end, next_pos]
+
+fn jc_parse_tensor_record(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    let mut dtype = ""
+    let mut shape = []
+    let mut beg = 0
+    let mut end = 0
+    if i >= n || b[i] != 123 { return [dtype, shape, beg, end, i] }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { return [dtype, shape, beg, end, i + 1] }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }     // ':'
+        i = jc_skip_ws(b, i)
+        if key == "dtype" {
+            let vpr = jc_parse_string(b, i); i = vpr[1]
+            dtype = vpr[0]
+        } else if key == "shape" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            shape = vpr[0]
+        } else if key == "data_offsets" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            if len(vpr[0]) >= 2 { beg = vpr[0][0]; end = vpr[0][1] }
+        } else {
+            i = jc_skip_value(b, i)
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [dtype, shape, beg, end, i]
+}
+
+// Five parallel arrays: names, dtypes, shapes, offsets_beg, offsets_end.
+// Returned as a 5-element tuple (array-of-arrays) to keep the emitter happy.
+
+fn jc_parse_header_bytes(b) {
+    let n = len(b)
+    let mut names = []
+    let mut dtypes = []
+    let mut shapes = []
+    let mut offs_b = []
+    let mut offs_e = []
+    let mut i = jc_skip_ws(b, 0)
+    if i >= n || b[i] != 123 {
+        return [names, dtypes, shapes, offs_b, offs_e]
+    }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { break }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(b, i)
+        if key == "__metadata__" {
+            i = jc_skip_value(b, i)
+        } else {
+            let rec = jc_parse_tensor_record(b, i)
+            i = rec[4]
+            names = names + [key]
+            dtypes = dtypes + [rec[0]]
+            shapes = shapes + [rec[1]]
+            offs_b = offs_b + [rec[2]]
+            offs_e = offs_e + [rec[3]]
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [names, dtypes, shapes, offs_b, offs_e]
+}
+
+// ── f32 bit packing ────────────────────────────────────
+// See self/ml/hexaw.hexa hexaw_f32_to_bytes for the derivation.
+
+fn f32_to_bytes(x) {
+    let mut sign = 0
+    let mut v = x
+    if v < 0.0 { sign = 1; v = 0.0 - v }
+    if x != x { return [0, 0, 192, 127] }          // NaN
+    if v == 0.0 {
+        if sign == 1 { return [0, 0, 0, 128] }
+        return [0, 0, 0, 0]
+    }
+    if v > 3.4028235e38 {
+        if sign == 1 { return [0, 0, 128, 255] }
+        return [0, 0, 128, 127]
+    }
+    let mut e = 0
+    let mut m = v
+    while m >= 2.0 { m = m / 2.0; e = e + 1 }
+    while m < 1.0 { m = m * 2.0; e = e - 1 }
+    let biased = e + 127
+    let mut exp_bits = 0
+    let mut mant_bits = 0
+    if biased <= 0 {
+        let shift = 1 - biased
+        let mut sub = m
+        let mut s = 0
+        while s < shift { sub = sub / 2.0; s = s + 1 }
+        mant_bits = to_int(sub * 8388608.0)
+        exp_bits = 0
+    } else if biased >= 255 {
+        exp_bits = 255
+        mant_bits = 0
+    } else {
+        mant_bits = to_int((m - 1.0) * 8388608.0)
+        exp_bits = biased
+    }
+    let b0 = mant_bits % 256
+    let b1 = (mant_bits / 256) % 256
+    let lo_exp = exp_bits % 2
+    let hi_exp = exp_bits / 2
+    let b2 = ((mant_bits / 65536) % 128) + lo_exp * 128
+    let b3 = (sign * 128) + hi_exp
+    return [b0, b1, b2, b3]
+}
+
+// bf16 -> f32 (identical bit pattern in high 16 bits of f32)
+fn bf16_to_f32_bytes(lo, hi) {
+    return [0, 0, lo, hi]
+}
+
+// f16 (IEEE half) -> f32 bit-level
+fn f16_to_f32_bytes(lo, hi) {
+    let u = hi * 256 + lo
+    let sign = u / 32768
+    let exp5 = (u / 1024) % 32
+    let mant10 = u % 1024
+    if exp5 == 0 && mant10 == 0 {
+        if sign == 1 { return [0, 0, 0, 128] }
+        return [0, 0, 0, 0]
+    }
+    if exp5 == 31 {
+        if sign == 1 { return [0, 0, 128, 255] }
+        return [0, 0, 128, 127]
+    }
+    let mut exp32 = 0
+    let mut mant23 = 0
+    if exp5 == 0 {
+        let mut m = mant10
+        let mut e = -14
+        while m < 1024 { m = m * 2; e = e - 1 }
+        exp32 = e + 127
+        mant23 = (m - 1024) * 8192
+    } else {
+        exp32 = exp5 - 15 + 127
+        mant23 = mant10 * 8192
+    }
+    let b0 = mant23 % 256
+    let b1 = (mant23 / 256) % 256
+    let lo_exp = exp32 % 2
+    let hi_exp = exp32 / 2
+    let b2 = ((mant23 / 65536) % 128) + lo_exp * 128
+    let b3 = (sign * 128) + hi_exp
+    return [b0, b1, b2, b3]
+}
+
+// ── Streaming converter helpers ─────────────────────────
+
+fn dtype_elem_size(dt) {
+    if dt == "F32" { return 4 }
+    if dt == "BF16" { return 2 }
+    if dt == "F16" { return 2 }
+    return 0
+}
+
+fn numel(shape) {
+    let mut p = 1
+    let n = len(shape)
+    let mut i = 0
+    while i < n { p = p * shape[i]; i = i + 1 }
+    return p
+}
+
+fn str_to_bytes(s) {
+    let n = len(s)
+    let mut b = []
+    let mut i = 0
+    while i < n { b = b + [char_code(s, i)]; i = i + 1 }
+    return b
+}
+
+fn emit_tensor_header(out_path, name, shape, n_elem) {
+    let mut hdr = name + "\n" + to_string(len(shape)) + "\n"
+    let mut d = 0
+    while d < len(shape) {
+        hdr = hdr + to_string(shape[d]) + "\n"
+        d = d + 1
+    }
+    hdr = hdr + to_string(n_elem) + "\n"
+    write_bytes_append(out_path, str_to_bytes(hdr))
+}
+
+fn decode_chunk_f32(src, got) {
+    let mut out = []
+    let mut k = 0
+    while k < got {
+        out = out + [src[k], src[k + 1], src[k + 2], src[k + 3]]
+        k = k + 4
+    }
+    return out
+}
+
+fn decode_chunk_bf16(src, got) {
+    let mut out = []
+    let mut k = 0
+    while k < got {
+        out = out + bf16_to_f32_bytes(src[k], src[k + 1])
+        k = k + 2
+    }
+    return out
+}
+
+fn decode_chunk_f16(src, got) {
+    let mut out = []
+    let mut k = 0
+    while k < got {
+        out = out + f16_to_f32_bytes(src[k], src[k + 1])
+        k = k + 2
+    }
+    return out
+}
+
+fn pad_zeros_to_output(out_path, n_elem) {
+    let mut pad = []
+    let mut z = 0
+    while z < n_elem { pad = pad + [0, 0, 0, 0]; z = z + 1 }
+    write_bytes_append(out_path, pad)
+}
+
+// Convert one tensor from a single safetensors file into the
+// already-open HEXAW2 output (append mode).
+fn convert_one_tensor(in_path, out_path, name, dtype, shape, data_abs_off, n_elem) {
+    emit_tensor_header(out_path, name, shape, n_elem)
+
+    let chunk = 64 * 1024 * 1024
+    let elem_sz = dtype_elem_size(dtype)
+    if elem_sz == 0 {
+        println("[conv] SKIP unsupported dtype: " + dtype + " for " + name)
+        pad_zeros_to_output(out_path, n_elem)
+        return false
+    }
+    let bytes_total = n_elem * elem_sz
+    let mut done = 0
+    while done < bytes_total {
+        let mut take = chunk
+        if done + take > bytes_total { take = bytes_total - done }
+        let rem = take % elem_sz
+        if rem != 0 { take = take - rem }
+        if take <= 0 { take = elem_sz }
+        let src = read_bytes_at(in_path, data_abs_off + done, take)
+        let got = len(src)
+        if got == 0 { break }
+        let mut out = []
+        if dtype == "F32" {
+            out = decode_chunk_f32(src, got)
+        } else if dtype == "BF16" {
+            out = decode_chunk_bf16(src, got)
+        } else {
+            out = decode_chunk_f16(src, got)
+        }
+        write_bytes_append(out_path, out)
+        done = done + got
+    }
+    return true
+}
+
+// Parse a single safetensors file: returns [names, dtypes, shapes,
+// offsets_beg, offsets_end, data_origin].
+fn st_open(path) {
+    let hdr_sz_bytes = read_bytes_at(path, 0, 8)
+    if len(hdr_sz_bytes) != 8 {
+        println("[conv] ERROR: cannot read header size from " + path)
+        return [[], [], [], [], [], 0]
+    }
+    let hsz = u64_le_from_bytes(hdr_sz_bytes, 0)
+    let cap = 64 * 1024 * 1024
+    let mut take = hsz
+    if take > cap { take = cap }
+    let hdr_bytes = read_bytes_at(path, 8, take)
+    let rec = jc_parse_header_bytes(hdr_bytes)
+    return [rec[0], rec[1], rec[2], rec[3], rec[4], 8 + hsz]
+}
+
+// Detect shard layout. Returns an array of file paths.
+fn find_shard_files(dir) {
+    let idx = dir + "/model.safetensors.index.json"
+    if !file_exists(idx) {
+        let single = dir + "/model.safetensors"
+        if file_exists(single) { return [single] }
+        return []
+    }
+    let raw = read_file_bytes(idx)
+    let n = len(raw)
+    let mut seen = []
+    let mut i = 0
+    while i < n {
+        let c = raw[i]
+        if c == 34 {                      // '"'
+            let pr = jc_parse_string(raw, i)
+            let val = pr[0]
+            i = pr[1]
+            let m = len(val)
+            if m > 12 && val.index_of(".safetensors") == m - 12 {
+                let mut hit = false
+                let mut q = 0
+                while q < len(seen) {
+                    if seen[q] == val { hit = true }
+                    q = q + 1
+                }
+                if !hit { seen = seen + [val] }
+            }
+        } else {
+            i = i + 1
+        }
+    }
+    let mut out = []
+    let mut j = 0
+    while j < len(seen) {
+        out = out + [dir + "/" + seen[j]]
+        j = j + 1
+    }
+    return out
+}
+
+fn collect_shard_metadata(shards) {
+    let mut total = 0
+    let mut headers = []
+    let mut si = 0
+    while si < len(shards) {
+        let sp = shards[si]
+        eprintln("[conv] scanning " + sp)
+        let o = st_open(sp)
+        total = total + len(o[0])
+        headers = headers + [[sp, o]]
+        si = si + 1
+    }
+    return [total, headers]
+}
+
+fn emit_global_header(out_path, total) {
+    write_file(out_path, "")
+    let magic = "HEXAW2\n" + to_string(total) + "\n"
+    write_bytes_append(out_path, str_to_bytes(magic))
+}
+
+fn emit_all_tensors(out_path, headers, total) {
+    let mut emitted = 0
+    let mut si = 0
+    while si < len(headers) {
+        let entry = headers[si]
+        let sp = entry[0]
+        let o = entry[1]
+        let names = o[0]
+        let dtypes = o[1]
+        let shapes = o[2]
+        let offs_b = o[3]
+        let offs_e = o[4]
+        let data_off = o[5]
+        let n_t = len(names)
+        let mut ti = 0
+        while ti < n_t {
+            let name = names[ti]
+            let dt = dtypes[ti]
+            let shape = shapes[ti]
+            let beg = offs_b[ti]
+            let end = offs_e[ti]
+            let absolute = data_off + beg
+            let elem_sz = dtype_elem_size(dt)
+            let bytes_span = end - beg
+            let n_elem = if elem_sz > 0 { bytes_span / elem_sz } else { numel(shape) }
+            convert_one_tensor(sp, out_path, name, dt, shape, absolute, n_elem)
+            emitted = emitted + 1
+            if emitted % 10 == 0 {
+                eprintln("[conv] " + to_string(emitted) + "/" + to_string(total) + " last=" + name + " dt=" + dt)
+            }
+            ti = ti + 1
+        }
+        si = si + 1
+    }
+    return emitted
+}
+
+fn convert_all(in_path, out_path, target_dtype) {
+    let mut shards = []
+    if file_exists(in_path + "/model.safetensors.index.json") {
+        shards = find_shard_files(in_path)
+    } else if file_exists(in_path + "/model.safetensors") {
+        shards = find_shard_files(in_path)
+    } else {
+        shards = [in_path]
+    }
+    if len(shards) == 0 {
+        println("[conv] ERROR: no safetensors shards under " + in_path)
+        return false
+    }
+    let meta = collect_shard_metadata(shards)
+    let total = meta[0]
+    let headers = meta[1]
+    emit_global_header(out_path, total)
+    let emitted = emit_all_tensors(out_path, headers, total)
+    eprintln("[conv] wrote " + to_string(emitted) + " tensors -> " + out_path)
+    return true
+}
+
+// ── CLI entry ───────────────────────────────────────────
+
+fn main_convert(in_path, out_path, target_dtype) {
+    if in_path == "" || out_path == "" {
+        println("usage: safetensors_to_hexaw --input <path> --output <path.hexaw> [--dtype-target f32]")
+        return 1
+    }
+    let ok = convert_all(in_path, out_path, target_dtype)
+    if ok { return 0 }
+    return 1
+}
+
+fn cli_main() {
+    let a = args()
+    let mut in_path = ""
+    let mut out_path = ""
+    let mut dtype = "f32"
+    let mut i = 1
+    while i < len(a) {
+        let k = a[i]
+        if k == "--input" && i + 1 < len(a) { in_path = a[i + 1]; i = i + 2 }
+        else if k == "--output" && i + 1 < len(a) { out_path = a[i + 1]; i = i + 2 }
+        else if k == "--dtype-target" && i + 1 < len(a) { dtype = a[i + 1]; i = i + 2 }
+        else { i = i + 1 }
+    }
+    let rc = main_convert(in_path, out_path, dtype)
+    exit(rc)
+}
+
+cli_main()
