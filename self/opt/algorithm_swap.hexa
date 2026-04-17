@@ -1,17 +1,28 @@
-// self/opt/algorithm_swap — S-3 algorithm swap DETECTION-ONLY pass
+// self/opt/algorithm_swap — S-3/S-3b algorithm swap pass
 //
 // Text-based heuristic scanner that detects bubble-sort / insertion-sort
 // shaped functions in a .hexa source file and emits @select/@optimize
 // suggestions per shared/hexa-lang/algorithm_registry.json sort select_rules.
 //
 // Intentionally text-only (not AST) to stay aligned with scripts/ai_native_lint
-// and scripts/ai_native_hotpath siblings. Rewriting lives in S-3b.
+// and scripts/ai_native_hotpath siblings.
+//
+// S-3b adds a DRY-RUN rewrite stage behind `--apply`:
+//   * detects the canonical bubble-sort shape (nested-while + let-tmp swap),
+//   * emits the equivalent insertion-sort body as a unified-style diff,
+//   * NEVER writes files — correctness over convenience. Non-canonical
+//     shapes are skipped with `[SKIP non-canonical shape]`.
 //
 // Usage:
 //   ./build/hexa_stage0 self/opt/algorithm_swap.hexa <file.hexa>
+//   ./build/hexa_stage0 self/opt/algorithm_swap.hexa --apply <file.hexa>
 //
 // Emits, per match (only when confidence >= 3):
 //   <path>:<line>: [SUGGEST swap] fn <name> <kind> (confidence=<n>) → <suggestion>
+// With --apply, also:
+//   <path>:<line>: [REWRITE dry-run] fn <name> bubble → insertion
+//   <unified diff>
+//   <path>:<line>: [SKIP non-canonical shape] fn <name> (<reason>)
 
 fn is_digit(c) { let k = char_code(c, 0); return k >= 48 && k <= 57 }
 fn is_alpha(c) { let k = char_code(c, 0); return (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95 }
@@ -222,12 +233,165 @@ fn suggestion_text(kind) {
     return ""
 }
 
-fn analyze(path) {
+// ──────────────────────────────────────────────────────────────────────────
+// S-3b: rewrite_bubble_to_insertion — DRY-RUN.
+// Matches the canonical bubble shape (nested while + let-tmp swap via
+// indices j / j+1) and returns the equivalent insertion-sort body.
+// Returns "" when the shape is non-canonical (caller then skips with warn).
+// Correctness preservation > performance: both are stable, both in-place,
+// both len-preserving on arrays of a comparable type.
+// ──────────────────────────────────────────────────────────────────────────
+
+// Collapse runs of whitespace (space, tab, newline) to a single space and
+// trim leading/trailing whitespace.  Used to match canonical fn bodies
+// regardless of indentation.
+fn normalize_ws(s) {
+    let n = len(s)
+    let mut i = 0
+    let mut out = []
+    let mut prev_space = true
+    while i < n {
+        let c = s[i]
+        let is_ws = c == " " || c == "\t" || c == "\n" || c == "\r"
+        if is_ws {
+            if !prev_space { out = out.push(" ") }
+            prev_space = true
+        } else {
+            out = out.push(c)
+            prev_space = false
+        }
+        i = i + 1
+    }
+    let joined = out.join("")
+    let m = len(joined)
+    if m > 0 && joined[m - 1] == " " { return joined.substring(0, m - 1) }
+    return joined
+}
+
+// Canonical bubble body (whitespace-normalized) — must match exactly.
+// Parameter name is captured as `{ARR}` so we accept bubble_sort(a) /
+// bubble(xs) / sort(v) etc. Loop var names are fixed to i and j.
+fn canonical_bubble_template(arr_name) {
+    let a = arr_name
+    return "let n = len(" + a + ") "
+         + "let mut i = 0 "
+         + "while i < n - 1 { "
+         + "let mut j = 0 "
+         + "while j < n - i - 1 { "
+         + "if " + a + "[j] > " + a + "[j + 1] { "
+         + "let tmp = " + a + "[j] "
+         + a + "[j] = " + a + "[j + 1] "
+         + a + "[j + 1] = tmp "
+         + "} "
+         + "j = j + 1 "
+         + "} "
+         + "i = i + 1 "
+         + "} "
+         + "return " + a
+}
+
+// Insertion-sort body for the same array parameter. Matches
+// tests/fixtures/bubble_n8.rewritten.hexa after ws-normalization.
+fn canonical_insertion_body(arr_name) {
+    let a = arr_name
+    return "    // @rewritten_by: algorithm_swap (bubble → insertion, S-3b dry-run)\n"
+         + "    let n = len(" + a + ")\n"
+         + "    let mut i = 1\n"
+         + "    while i < n {\n"
+         + "        let key = " + a + "[i]\n"
+         + "        let mut j = i\n"
+         + "        while j > 0 && " + a + "[j - 1] > key {\n"
+         + "            " + a + "[j] = " + a + "[j - 1]\n"
+         + "            j = j - 1\n"
+         + "        }\n"
+         + "        " + a + "[j] = key\n"
+         + "        i = i + 1\n"
+         + "    }\n"
+         + "    return " + a + "\n"
+}
+
+// Extract the single parameter name from `fn NAME(PARAM)` where NAME has
+// already been sliced out. Returns "" on failure (multi-arg, trailing
+// annotations, etc.) — we stay strict on purpose.
+fn extract_single_param(src, after_name) {
+    let n = len(src)
+    let mut k = after_name
+    while k < n && src[k] == " " { k = k + 1 }
+    if k >= n || src[k] != "(" { return "" }
+    k = k + 1
+    while k < n && src[k] == " " { k = k + 1 }
+    let start = k
+    while k < n && is_alnum(src[k]) { k = k + 1 }
+    let name = src.substring(start, k)
+    while k < n && src[k] == " " { k = k + 1 }
+    if k >= n || src[k] != ")" { return "" }
+    return name
+}
+
+// Trim a leading newline (from substring(b+1, close-1) body slices that
+// begin with the newline after `{`).
+fn trim_edge_newlines(s) {
+    let n = len(s)
+    let mut start = 0
+    let mut end = n
+    while start < end && (s[start] == "\n" || s[start] == "\r") { start = start + 1 }
+    while end > start && (s[end - 1] == "\n" || s[end - 1] == "\r") { end = end - 1 }
+    return s.substring(start, end)
+}
+
+// Render a very small "unified-style" diff (not git-compatible on purpose;
+// informational only — we never write files). old_body/new_body are
+// multi-line strings; caller supplies a label for the hunk header.
+fn render_diff(label, old_body, new_body) {
+    let old_lines = trim_edge_newlines(old_body).split("\n")
+    let new_lines = trim_edge_newlines(new_body).split("\n")
+    let mut out = []
+    out = out.push("--- " + label + " (before)\n")
+    out = out.push("+++ " + label + " (after, dry-run)\n")
+    let mut i = 0
+    while i < len(old_lines) {
+        out = out.push("-")
+        out = out.push(old_lines[i])
+        out = out.push("\n")
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(new_lines) {
+        out = out.push("+")
+        out = out.push(new_lines[j])
+        out = out.push("\n")
+        j = j + 1
+    }
+    return out.join("")
+}
+
+// Try to rewrite one detected bubble site.  `raw` is the ORIGINAL source
+// (comments intact); b_raw..close_raw is the body slice in raw;
+// body_stripped is the same body after strip_comments_and_strings (already
+// computed by the caller and used for shape classification).
+// Returns [status, message] where status ∈ { "REWRITE", "SKIP" }.
+fn rewrite_bubble_to_insertion(raw, fn_name, arr_name, body_stripped) {
+    if len(arr_name) == 0 {
+        return ["SKIP", "could not extract single array parameter"]
+    }
+    let want = canonical_bubble_template(arr_name)
+    let got = normalize_ws(body_stripped)
+    if got != want {
+        return ["SKIP", "body does not match canonical bubble template"]
+    }
+    let new_body = canonical_insertion_body(arr_name)
+    let diff = render_diff("fn " + fn_name, body_stripped, new_body)
+    return ["REWRITE", diff]
+}
+
+fn analyze(path, apply_mode) {
     let raw = read_file(path)
     let src = strip_comments_and_strings(raw)
     let n = len(src)
     let mut i = 0
     let mut hits = 0
+    let mut rewrites = 0
+    let mut skips = 0
     while i < n {
         if match_word(src, i, "fn") {
             let mut k = i + 2
@@ -236,6 +400,7 @@ fn analyze(path) {
             while k < n && is_alnum(src[k]) { k = k + 1 }
             let fn_name = src.substring(name_start, k)
             if len(fn_name) == 0 { i = i + 2; continue }
+            let arr_name = extract_single_param(src, k)
             let mut b = k
             while b < n && src[b] != "{" { b = b + 1 }
             if b >= n { break }
@@ -248,23 +413,47 @@ fn analyze(path) {
                 let line = line_of(src, i)
                 println(path + ":" + to_string(line) + ": [SUGGEST swap] fn " + fn_name + " " + kind + " (confidence=" + to_string(conf) + ") → " + suggestion_text(kind))
                 hits = hits + 1
+                if apply_mode && kind == "bubble" {
+                    let r = rewrite_bubble_to_insertion(raw, fn_name, arr_name, body)
+                    let status = r[0]
+                    let msg = r[1]
+                    if status == "REWRITE" {
+                        println(path + ":" + to_string(line) + ": [REWRITE dry-run] fn " + fn_name + " bubble → insertion")
+                        println(msg)
+                        rewrites = rewrites + 1
+                    } else {
+                        println(path + ":" + to_string(line) + ": [SKIP non-canonical shape] fn " + fn_name + " (" + msg + ")")
+                        skips = skips + 1
+                    }
+                }
             }
             i = close
             continue
         }
         i = i + 1
     }
+    if apply_mode {
+        println("algorithm_swap[apply-dry-run]: " + to_string(rewrites) + " rewrite preview(s), " + to_string(skips) + " skip(s)")
+    }
     return hits
 }
 
 fn main() {
     let argv = args()
-    if len(argv) < 3 {
-        println("usage: algorithm_swap.hexa <file.hexa>")
+    let mut apply_mode = false
+    let mut path = ""
+    let mut i = 2
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--apply" { apply_mode = true; i = i + 1; continue }
+        if path == "" { path = a }
+        i = i + 1
+    }
+    if path == "" {
+        println("usage: algorithm_swap.hexa [--apply] <file.hexa>")
         return
     }
-    let path = argv[2]
-    let hits = analyze(path)
+    let hits = analyze(path, apply_mode)
     println("algorithm_swap: " + to_string(hits) + " suggestion(s) in " + path)
 }
 

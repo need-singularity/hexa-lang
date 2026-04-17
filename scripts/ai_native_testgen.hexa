@@ -1,4 +1,4 @@
-// ai_native_testgen — generate property tests from @attr catalog (S-4 skeleton)
+// ai_native_testgen — generate property tests from @attr catalog (S-4 + S-4b)
 //
 // Reads shared/hexa-lang/attrs.json to learn what each @attr promises.
 // Scans a target .hexa file for @attr annotations on fn definitions.
@@ -13,9 +13,12 @@
 //   hexa scripts/ai_native_testgen.hexa <source.hexa>
 //     → emits tests_auto/<basename>_prop_tests.hexa
 //
-// Status: skeleton — detects annotations + emits test scaffolds. Full
-// correctness verification (random-input generation per signature)
-// requires parser-level type inference (deferred to S-4b).
+// Status: S-4b signature-aware — the AST-typed path is enabled via
+// `parse_fn_signature(file, fn_name)` which spawns a driver that inlines
+// self/lexer.hexa + self/parser.hexa, re-parses the target, and walks
+// the AST for the named FnDecl to extract (name, type) pairs.
+// Fallback heuristic (untyped param-name split) kicks in when the AST
+// path returns no typed args (e.g., parser error, untyped params).
 
 fn is_alpha(c) { let k = char_code(c, 0); return (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95 }
 fn is_alnum(c) { let k = char_code(c, 0); return (k >= 48 && k <= 57) || (k >= 97 && k <= 122) || (k >= 65 && k <= 90) || k == 95 }
@@ -76,6 +79,102 @@ fn find_annotated_fns(src) {
     return out
 }
 
+// ─────────────────────────────────────────────────────────────
+// S-4b: signature-aware path — consume self/parser.hexa AST.
+//
+// parse_fn_signature(src_path, fn_name) -> [[name, type], ...]
+//
+// Strategy: write a one-shot driver that inlines self/lexer.hexa +
+// self/parser.hexa, re-reads the target, calls tokenize() + parse(),
+// finds the FnDecl whose .name == fn_name, and prints each Param node's
+// name + type (type is stored in Param.value — empty string means untyped).
+//
+// The driver emits `PARAM|name|type` lines + a `__SIGEND__` sentinel.
+// Any line mismatch / parser failure → returns []  → caller falls back
+// to the old heuristic (positional "7" for every arg).
+// ─────────────────────────────────────────────────────────────
+fn _hexa_root() {
+    let hl = env_var("HEXA_LANG")
+    if len(hl) > 0 { return hl }
+    return "."
+}
+
+fn parse_fn_signature(src_path, fn_name) {
+    let root = _hexa_root()
+    let lexer_path  = root + "/self/lexer.hexa"
+    let parser_path = root + "/self/parser.hexa"
+    let mut lexer_src  = ""
+    let mut parser_src = ""
+    try { lexer_src  = read_file(lexer_path)  } catch e1 { return [] }
+    try { parser_src = read_file(parser_path) } catch e2 { return [] }
+    if lexer_src == "" || parser_src == "" { return [] }
+
+    let esc_path = src_path     // caller passes a literal path; assume no quotes
+    let esc_name = fn_name
+    // Build driver — uses tokenize()+parse() from the inlined modules.
+    // Output contract: one "PARAM|<name>|<type>" line per param, then "__SIGEND__".
+    let driver_tail = "\n" +
+        "fn __testgen_find_fn(stmts, target_name) {\n" +
+        "    let mut i = 0\n" +
+        "    while i < len(stmts) {\n" +
+        "        let s = stmts[i]\n" +
+        "        if type_of(s) != \"string\" {\n" +
+        "            if s.kind == \"FnDecl\" && s.name == target_name { return s }\n" +
+        "        }\n" +
+        "        i = i + 1\n" +
+        "    }\n" +
+        "    return \"\"\n" +
+        "}\n" +
+        "fn __testgen_dump_sig(path, target_name) {\n" +
+        "    let src = read_file(path)\n" +
+        "    let toks = tokenize(src)\n" +
+        "    let ast = parse(toks)\n" +
+        "    let node = __testgen_find_fn(ast, target_name)\n" +
+        "    if type_of(node) == \"string\" { println(\"__SIGEND__\"); return }\n" +
+        "    let ps = node.params\n" +
+        "    if type_of(ps) != \"array\" { println(\"__SIGEND__\"); return }\n" +
+        "    let mut j = 0\n" +
+        "    while j < len(ps) {\n" +
+        "        let p = ps[j]\n" +
+        "        println(\"PARAM|\" + p.name + \"|\" + p.value)\n" +
+        "        j = j + 1\n" +
+        "    }\n" +
+        "    println(\"__SIGEND__\")\n" +
+        "}\n" +
+        "__testgen_dump_sig(\"" + esc_path + "\", \"" + esc_name + "\")\n"
+
+    let combined = lexer_src + "\n" + parser_src + "\n" + driver_tail
+    let tmp_dir = "/tmp/hexa_testgen_sig"
+    try { exec("mkdir -p '" + tmp_dir + "'") } catch e3 { }
+    let driver_file = tmp_dir + "/_sig_" + fn_name + ".hexa"
+    write_file(driver_file, combined)
+
+    let hexa_bin = root + "/hexa"
+    let mut out = ""
+    try { out = to_string(exec(hexa_bin + " " + driver_file + " 2>&1")) } catch e4 { return [] }
+
+    // Parse lines. Accept only up to __SIGEND__ marker; ignore everything else.
+    if !out.contains("__SIGEND__") { return [] }
+    let lines = out.split("\n")
+    let mut result = []
+    let mut k = 0
+    while k < len(lines) {
+        let ln = lines[k]
+        if ln == "__SIGEND__" { return result }
+        if len(ln) >= 6 && ln.substring(0, 6) == "PARAM|" {
+            let rest = ln.substring(6, len(ln))
+            let bar = rest.index_of("|")
+            if bar >= 0 {
+                let pname = rest.substring(0, bar)
+                let ptype = rest.substring(bar + 1, len(rest))
+                result = result.push([pname, ptype])
+            }
+        }
+        k = k + 1
+    }
+    return result
+}
+
 // Minimal param parser: split by `,`, take first word as name. Returns [names...]
 fn parse_param_names(params) {
     if params.trim() == "" { return [] }
@@ -93,21 +192,55 @@ fn parse_param_names(params) {
     return out
 }
 
-// Emit a single test block for one (attr, fn_name, params) combo.
-// Returns a string of hexa code.
-fn emit_test(attr, fn_name, params) {
-    let param_names = parse_param_names(params)
-    // Generate dummy arguments: int 7 for each param
+// Render a hexa-literal arg list for the given signature.
+// `sig` is either [] (heuristic mode — 1 arg of "7" per param-name) or
+// [[name, type], ...] from parse_fn_signature.
+fn _args_for_sig(sig, param_names) {
     let mut args = ""
-    let mut i = 0
-    while i < len(param_names) {
+    if len(sig) > 0 {
+        let mut i = 0
+        while i < len(sig) {
+            if args != "" { args = args + ", " }
+            let t = sig[i][1]
+            if t == "int" || t == "i32" || t == "i64" || t == "uint" || t == "u32" || t == "u64" {
+                args = args + "3"
+            } else if t == "float" || t == "f32" || t == "f64" || t == "double" {
+                args = args + "3.0"
+            } else if t == "string" || t == "str" {
+                args = args + "\"x\""
+            } else if t == "bool" {
+                args = args + "true"
+            } else {
+                // unknown / empty type — fall back to int 7
+                args = args + "7"
+            }
+            i = i + 1
+        }
+        return args
+    }
+    let mut j = 0
+    while j < len(param_names) {
         if args != "" { args = args + ", " }
         args = args + "7"
-        i = i + 1
+        j = j + 1
     }
+    return args
+}
+
+// Emit a single test block for one (attr, fn_name, params, sig) combo.
+// `sig` is the typed signature array from parse_fn_signature ([] = heuristic).
+// Returns a string of hexa code.
+fn emit_test(attr, fn_name, params, sig) {
+    let param_names = parse_param_names(params)
+    let args = _args_for_sig(sig, param_names)
+    // Marker so downstream tests can assert whether AST-typed args were used.
+    let mut path_tag = "heuristic"
+    if len(sig) > 0 { path_tag = "ast_typed" }
+    let banner = "// testgen-path: " + path_tag + " fn=" + fn_name + "\n"
 
     if attr == "pure" {
-        return "fn test_pure_" + fn_name + "() {\n" +
+        return banner +
+               "fn test_pure_" + fn_name + "() {\n" +
                "    let a = " + fn_name + "(" + args + ")\n" +
                "    let b = " + fn_name + "(" + args + ")\n" +
                "    if a != b { println(\"FAIL: @pure " + fn_name + " non-deterministic\"); return }\n" +
@@ -115,7 +248,8 @@ fn emit_test(attr, fn_name, params) {
                "}\n"
     }
     if attr == "memoize" || attr == "cache" || attr == "memo" {
-        return "fn test_memoize_" + fn_name + "() {\n" +
+        return banner +
+               "fn test_memoize_" + fn_name + "() {\n" +
                "    let a = " + fn_name + "(" + args + ")\n" +
                "    let b = " + fn_name + "(" + args + ")    // second call hits cache\n" +
                "    if a != b { println(\"FAIL: @memoize " + fn_name + " returned different value from cache\"); return }\n" +
@@ -123,14 +257,15 @@ fn emit_test(attr, fn_name, params) {
                "}\n"
     }
     if attr == "limit" {
-        return "fn test_limit_" + fn_name + "() {\n" +
+        return banner +
+               "fn test_limit_" + fn_name + "() {\n" +
                "    // @limit singleton check: sequential calls OK\n" +
                "    let a = " + fn_name + "(" + args + ")\n" +
                "    let b = " + fn_name + "(" + args + ")\n" +
                "    println(\"PASS: @limit " + fn_name + " sequential\")\n" +
                "}\n"
     }
-    return "// TODO testgen: no generator for @" + attr + " on " + fn_name + "\n"
+    return banner + "// TODO testgen: no generator for @" + attr + " on " + fn_name + "\n"
 }
 
 fn basename(path) {
@@ -170,15 +305,63 @@ fn main() {
     }
     body = body + src_inline + "\n"
 
+    // S-4b: pick ONE simplest target (first unary fn) to go through the
+    // AST-typed signature path. Everything else falls back to heuristic.
+    let mut ast_target_idx = -1
+    let mut ii = 0
+    while ii < len(annotated) {
+        let a = annotated[ii]
+        let pn = parse_param_names(a[2])
+        if len(pn) == 1 && ast_target_idx == -1 {
+            ast_target_idx = ii
+        }
+        ii = ii + 1
+    }
+
     let mut i = 0
     let mut generated = 0
+    let mut ast_typed_emitted = 0
     while i < len(annotated) {
         let a = annotated[i]
-        let test_code = emit_test(a[0], a[1], a[2])
+        let mut sig = []
+        if i == ast_target_idx {
+            sig = parse_fn_signature(src_path, a[1])
+            // Only count as ast_typed if at least one non-empty type came back.
+            let mut has_typed = false
+            let mut si = 0
+            while si < len(sig) {
+                if sig[si][1] != "" { has_typed = true }
+                si = si + 1
+            }
+            if has_typed {
+                ast_typed_emitted = ast_typed_emitted + 1
+            } else {
+                sig = []  // degrade to heuristic
+            }
+        }
+        let test_code = emit_test(a[0], a[1], a[2], sig)
         body = body + test_code + "\n"
         generated = generated + 1
         i = i + 1
     }
+
+    // S-4b meta-test: assert the AST-typed path produced at least one typed
+    // signature when a unary target was available. Embedded as a literal int
+    // so the generated file is self-contained (no external state).
+    body = body + "// S-4b meta: assert AST-typed signature was captured\n"
+    body = body + "fn test_meta_ast_typed_path() {\n"
+    body = body + "    let ast_typed = " + to_string(ast_typed_emitted) + "\n"
+    body = body + "    let unary_target_present = " + to_string(ast_target_idx + 1) + "  // 0 = none, >0 = idx+1\n"
+    body = body + "    if unary_target_present > 0 {\n"
+    body = body + "        if ast_typed < 1 {\n"
+    body = body + "            println(\"FAIL: S-4b AST-typed path produced no typed args for unary target\")\n"
+    body = body + "            return\n"
+    body = body + "        }\n"
+    body = body + "        println(\"PASS: S-4b ast_typed=\" + to_string(ast_typed))\n"
+    body = body + "    } else {\n"
+    body = body + "        println(\"SKIP: S-4b no unary target in fixture\")\n"
+    body = body + "    }\n"
+    body = body + "}\n\n"
 
     // Runner
     body = body + "fn main() {\n"
@@ -192,9 +375,11 @@ fn main() {
         }
         j = j + 1
     }
+    body = body + "    test_meta_ast_typed_path()\n"
     body = body + "}\n\nmain()\n"
 
     write_file(out_path, body)
     println("ai-native-testgen: " + to_string(generated) + " tests → " + out_path)
+    println("ai-native-testgen: ast_typed=" + to_string(ast_typed_emitted) + " heuristic=" + to_string(generated - ast_typed_emitted))
 }
 
