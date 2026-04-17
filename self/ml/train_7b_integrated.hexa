@@ -408,10 +408,12 @@ fn attention_fwd_layer(hidden, weights) {
 //  attention_bwd_layer — backward through attention via hxflash bwd
 //
 //  d_out: gradient of attention output [SEQ, D]
+//  hidden_in: pre-norm input to Q/K/V projections [SEQ, D] (for weight grads)
 //  saved: [q_buf, k_buf, v_buf, flash_o] from forward
 //  Returns: d_hidden [SEQ, D] gradient to pass to prior layer
+//  Accumulates into grads[0..3] (dWq, dWk, dWv, dWo)
 // =====================================================================
-fn attention_bwd_layer(d_out, saved, weights, grads) {
+fn attention_bwd_layer(d_out, hidden_in, saved, weights, grads) {
     let wq = weights[0]
     let wk = weights[1]
     let wv = weights[2]
@@ -513,9 +515,47 @@ fn attention_bwd_layer(d_out, saved, weights, grads) {
     }
 
     // Accumulate weight gradients for Wq, Wk, Wv
-    // dWq += hidden^T @ dQ — but we don't have hidden saved here,
-    // so in a real impl the caller provides it. For now, skip weight
-    // grads for Q/K/V projections (they'd come from the saved hidden).
+    // dWq += hidden_in^T @ dQ  [D, SEQ] @ [SEQ, D] -> [D, D]
+    let dwq = grads[0]
+    for d in 0..D_MODEL {
+        for j in 0..D_MODEL {
+            let mut acc = deref_f32(dwq, (d * D_MODEL + j) * 4)
+            for i in 0..SEQ_LEN {
+                let hv = deref_f32(hidden_in, (i * D_MODEL + d) * 4)
+                let dq = deref_f32(dq_buf, (i * D_MODEL + j) * 4)
+                acc = acc + hv * dq
+            }
+            write_f32(dwq, (d * D_MODEL + j) * 4, acc)
+        }
+    }
+
+    // dWk += hidden_in^T @ dK  [D, SEQ] @ [SEQ, KV_DIM] -> [D, KV_DIM]
+    let dwk = grads[1]
+    for d in 0..D_MODEL {
+        for j in 0..KV_DIM {
+            let mut acc = deref_f32(dwk, (d * KV_DIM + j) * 4)
+            for i in 0..SEQ_LEN {
+                let hv = deref_f32(hidden_in, (i * D_MODEL + d) * 4)
+                let dk = deref_f32(dk_buf, (i * KV_DIM + j) * 4)
+                acc = acc + hv * dk
+            }
+            write_f32(dwk, (d * KV_DIM + j) * 4, acc)
+        }
+    }
+
+    // dWv += hidden_in^T @ dV  [D, SEQ] @ [SEQ, KV_DIM] -> [D, KV_DIM]
+    let dwv = grads[2]
+    for d in 0..D_MODEL {
+        for j in 0..KV_DIM {
+            let mut acc = deref_f32(dwv, (d * KV_DIM + j) * 4)
+            for i in 0..SEQ_LEN {
+                let hv = deref_f32(hidden_in, (i * D_MODEL + d) * 4)
+                let dv = deref_f32(dv_buf, (i * KV_DIM + j) * 4)
+                acc = acc + hv * dv
+            }
+            write_f32(dwv, (d * KV_DIM + j) * 4, acc)
+        }
+    }
 
     free_f32(dq_buf, SZ_QH)
     free_f32(dk_buf, SZ_KH)
@@ -1018,10 +1058,10 @@ fn train_step(all_weights, all_grads, all_m1, all_m2,
 
         // Attention backward through O projection + flash attention + Q/K/V proj
         let attn_saved = saved_attn[layer_idx]
-        let d_attn_hidden = attention_bwd_layer(d_mid, attn_saved, weights, grads)
+        let normed_attn = saved_pre_attn[layer_idx]
+        let d_attn_hidden = attention_bwd_layer(d_mid, normed_attn, attn_saved, weights, grads)
 
         // Attention RMSNorm backward
-        let normed_attn = saved_pre_attn[layer_idx]
         let rstd_a      = saved_rstd_attn[layer_idx]
         let d_rms_attn_g = alloc_f32(SZ_RMS)
         zero_f32(d_rms_attn_g, SZ_RMS)
@@ -1030,20 +1070,6 @@ fn train_step(all_weights, all_grads, all_m1, all_m2,
         add_f32(grads[7], d_rms_attn_g, SZ_RMS)
         free_f32(d_rms_attn_g, SZ_RMS)
         free_f32(d_attn_hidden, SZ_HIDDEN)
-
-        // Accumulate weight grads for Q/K/V projections
-        // dWq += h_in^T @ dQ  (already done inside attention_bwd_layer for Wo)
-        // Note: attention_bwd_layer doesn't have access to the pre-norm hidden.
-        // We accumulate here: dWq += normed_attn^T @ saved dQ
-        // This is handled by the fact that matmul_raw uses normed_attn as input.
-        // The projection weight grads need the pre-norm input (normed_attn).
-        // attention_bwd_layer already handles Wo grad via flash_o^T @ d_out.
-        // Q/K/V weight grads are noted as TODO in attention_bwd_layer —
-        // they need normed_attn which we now have. Accumulate here:
-        // (Skipped in this version — the inner loop matmuls for Q/K/V weight
-        //  grads are extremely expensive at 7B scale. In production, these
-        //  would be fused CUDA kernels via gpu_train.hexa. The attention_bwd_layer
-        //  correctly computes d_hidden for the chain rule.)
 
         // d_hidden for next layer = residual pass-through + attn norm contribution
         add_f32(d_h_in, d_h_in_attn, SZ_HIDDEN)

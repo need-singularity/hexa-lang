@@ -87,6 +87,11 @@ if USE_GPU {
     }
 }
 
+// ── GPU memory + fused kernel imports ─────────────────────────────
+use "ml/cuda_ffi"
+use "ml/cuda_mem"
+use "ml/hxcuda"
+
 // ── H100 peak FLOPS for MFU calculation ──────────────────────────
 let H100_FP32_TFLOPS  = 67.0
 let H100_BF16_TFLOPS  = 989.0
@@ -268,18 +273,28 @@ fn rmsnorm_into(x_buf, gamma, out_buf, seq_len, dim) {
 // LoRA matmul: out[M,d_out] = in[M,d_in] @ U[d_in,R] @ V[R,d_out]
 // Uses scratch for intermediate [M,R]
 fn lora_matmul(x_buf, U, V, M, d_in, d_out, rank, scratch_lo, scratch_out) {
-    if GPU_LIVE {
-        // GPU path: two bf16 matmuls
-        // For LoRA r=4, the first matmul is tiny — CPU is fine
-        // Only use GPU for the second if d_out is large
+    if GPU_LIVE && POOL_ALIVE && d_out >= 4096 {
+        // GPU path: first matmul on CPU (tiny, rank=4), second on GPU via cuBLAS
         let _t1 = matmul_into(x_buf, U, M, d_in, rank, scratch_lo)
-        if d_out >= 4096 {
-            // TODO: cuda_matmul_bf16 for large second matmul
-            // Needs device memory management — for now CPU fallback
-            matmul_into(scratch_lo, V, M, rank, d_out, scratch_out)
-        } else {
-            matmul_into(scratch_lo, V, M, rank, d_out, scratch_out)
+
+        // Upload scratch_lo[M,R] and V[R,d_out] to device pool
+        let lo_dev = pool_upload_f32(scratch_lo, M * rank)
+        let V_dev  = pool_upload_f32(V, rank * d_out)
+        let out_dev = pool_gpu_zeros(M * d_out)
+
+        // cuBLAS SGEMM: out[M,d_out] = scratch_lo[M,R] @ V[R,d_out]
+        let _ = gpu_sgemm(lo_dev, V_dev, out_dev, M, d_out, rank)
+        let _ = cuda_sync()
+
+        // Download result back to scratch_out
+        let host_buf = alloc_raw(M * d_out * 4)
+        let _ = cuda_memcpy_d2h(host_buf, out_dev, M * d_out * 4)
+        let mut idx = 0
+        while idx < M * d_out {
+            scratch_out[idx] = deref_f32(host_buf, idx * 4)
+            idx = idx + 1
         }
+        free_raw(host_buf, M * d_out * 4)
     } else {
         let _t1 = matmul_into(x_buf, U, M, d_in, rank, scratch_lo)
         matmul_into(scratch_lo, V, M, rank, d_out, scratch_out)
@@ -389,11 +404,60 @@ fn ce_loss(logits, targets, seq_len) {
 }
 
 // GPU fused LM head + CE loss path
+//
+// With cuda_mem pool: upload activations + LoRA weight to device,
+// run fused logits+softmax+CE on GPU, read back scalar loss.
+// Pool-allocated buffers are freed on cuda_mem_pool_reset() at step boundary.
 fn lm_head_loss_gpu(h_buf, targets, seq_len) {
-    // TODO: wire cuda_fused_lmhead_fwd when device memory manager is ready
-    // For now: CPU path
-    let logits = lm_head_forward(h_buf, seq_len)
-    return ce_loss(logits, targets, seq_len)
+    // Guard: if pool not alive, fall back to CPU
+    if !POOL_ALIVE {
+        let logits = lm_head_forward(h_buf, seq_len)
+        return ce_loss(logits, targets, seq_len)
+    }
+
+    // 1. Compute full LM head weight on CPU: W[D,VOCAB] = U[D,R] @ V[R,VOCAB]
+    //    For LoRA r=4 this is tiny: 4096*4*32000 = ~512K muls
+    let W_full = tensor_zeros(D * VOCAB)
+    matmul_into(U_lmh, V_lmh, D, LORA_R, VOCAB, W_full)
+
+    // 2. Upload to device via pool
+    let h_dev = pool_tensor_to_gpu(h_buf)
+    let W_dev = pool_tensor_to_gpu(W_full)
+
+    // 3. Allocate output buffers from pool
+    let logits_dev  = pool_gpu_zeros(seq_len * VOCAB)
+    let probs_dev   = pool_gpu_zeros(seq_len * VOCAB)
+    let targets_dev = cuda_mem_pool_alloc(seq_len * 4)
+    let loss_dev    = pool_gpu_zeros(1)
+
+    // Upload targets (int32)
+    let tgt_host = alloc_raw(seq_len * 4)
+    let mut ti = 0
+    while ti < seq_len {
+        write_i32(tgt_host, ti * 4, targets[ti])
+        ti = ti + 1
+    }
+    let _ = cuda_memcpy_h2d(targets_dev, tgt_host, seq_len * 4)
+    free_raw(tgt_host, seq_len * 4)
+
+    // 4. Launch fused kernel
+    let rc = cuda_fused_lmhead_fwd(seq_len, D, VOCAB,
+                                    h_dev, W_dev,
+                                    logits_dev, probs_dev,
+                                    targets_dev, loss_dev)
+    if rc != 0 {
+        println("[7b] cuda_fused_lmhead_fwd failed: " + str(rc) + ", falling back to CPU")
+        let logits = lm_head_forward(h_buf, seq_len)
+        return ce_loss(logits, targets, seq_len)
+    }
+
+    // 5. Read back scalar loss
+    let loss_host = alloc_raw(4)
+    let _ = cuda_memcpy_d2h(loss_host, loss_dev, 4)
+    let loss = deref_f32(loss_host, 0)
+    free_raw(loss_host, 4)
+
+    return loss * 1.0
 }
 
 @hot fn forward_pass(token_ids, targets, seq_len) {
@@ -808,9 +872,27 @@ fn main() {
     let start_step = if CKPT_PATH != "" { load_checkpoint(CKPT_PATH) } else { 0 }
     let mut step = if start_step > 0 { start_step } else { 0 }
 
+    // Init CUDA device memory pool when GPU is live
+    // Pool size: 2 GB covers activations for seq=128, D=4096, VOCAB=32000
+    //   logits+probs = 2 * 128 * 32000 * 4 = ~32 MB
+    //   W_full = 4096 * 32000 * 4 = ~512 MB
+    //   h + targets + loss = negligible
+    //   Total ~600 MB per step, 2 GB gives 3x headroom
+    if GPU_LIVE {
+        let pool_bytes = 2 * 1024 * 1024 * 1024
+        let pool_rc = cuda_mem_pool_init(pool_bytes)
+        if pool_rc != 0 {
+            println("[7b] WARNING: cuda_mem_pool_init failed, GPU fused path disabled")
+            GPU_LIVE = false
+        } else {
+            println("[7b] CUDA memory pool: 2 GB initialized")
+        }
+    }
+
     // Warmup run (compile/JIT warm caches)
     let warmup_batch = make_synthetic_batch(SEQ)
     let _warmup_loss = forward_pass(warmup_batch[0], warmup_batch[1], SEQ)
+    if GPU_LIVE { cuda_mem_pool_reset() }
     println("[7b] warmup forward complete")
 
     let mut sum_loss = 0.0
@@ -819,6 +901,9 @@ fn main() {
 
     while step < MAX_STEPS {
         let t0 = clock()
+
+        // Reset device memory pool (rewind bump pointer for this step)
+        if GPU_LIVE { cuda_mem_pool_reset() }
 
         // Zero gradients
         zero_grads()
@@ -898,6 +983,12 @@ fn main() {
     // Final checkpoint
     if CKPT_PATH != "" {
         save_checkpoint(CKPT_PATH, step, best_loss)
+    }
+
+    // Cleanup device memory pool
+    if GPU_LIVE {
+        cuda_mem_pool_stats()
+        cuda_mem_pool_free()
     }
 }
 

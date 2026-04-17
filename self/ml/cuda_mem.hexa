@@ -1,0 +1,230 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/cuda_mem.hexa — CUDA device memory pool manager
+//
+//  Bump-allocator arena over a single cudaMalloc chunk.
+//  Eliminates per-tensor cudaMalloc/Free overhead during the
+//  training loop — all device memory for a step is carved from
+//  the pre-allocated pool.
+//
+//  API:
+//    cuda_mem_pool_init(size_bytes)    — one-time pool allocation
+//    cuda_mem_pool_alloc(size_bytes)   — bump-allocate from pool
+//    cuda_mem_pool_reset()             — rewind bump pointer (step boundary)
+//    cuda_mem_pool_free()              — release pool to CUDA
+//    cuda_mem_pool_stats()             — print usage / remaining
+//
+//  For tensors that outlive a single step (weights, optimizer state),
+//  use the raw cuda_malloc/cuda_free wrappers from cuda_ffi.hexa.
+//
+//  Usage:
+//    use "ml/cuda_mem"
+//    cuda_mem_pool_init(2 * 1024 * 1024 * 1024)  // 2 GB pool
+//    let act_buf = cuda_mem_pool_alloc(SEQ * D * 4)
+//    ...  // training step
+//    cuda_mem_pool_reset()  // rewind for next step
+// ═══════════════════════════════════════════════════════════════
+
+use "cuda_ffi"
+
+// ── Pool state ───────────────────────────────────────────────
+
+let mut POOL_BASE   = ptr_null()   // base device pointer
+let mut POOL_SIZE   = 0            // total pool bytes
+let mut POOL_OFFSET = 0            // current bump offset
+let mut POOL_PEAK   = 0            // high-water mark
+let mut POOL_ALIVE  = false        // guard against use-before-init
+
+// ── Alignment (256 bytes — matches cudaMalloc alignment) ─────
+
+let CUDA_MEM_ALIGN = 256
+
+fn align_up(x, a) {
+    let mask = a - 1
+    return (x + mask) & (~mask)
+}
+
+// ── Pool lifecycle ───────────────────────────────────────────
+
+fn cuda_mem_pool_init(size_bytes) {
+    if POOL_ALIVE {
+        println("[cuda_mem] WARNING: pool already alive, freeing old pool first")
+        cuda_mem_pool_free()
+    }
+
+    let aligned_size = align_up(size_bytes, CUDA_MEM_ALIGN)
+    let dev = cuda_malloc(aligned_size)
+    if ptr_addr(dev) == 0 {
+        println("[cuda_mem] FATAL: cudaMalloc(" + str(aligned_size) + ") failed")
+        return -1
+    }
+
+    POOL_BASE   = dev
+    POOL_SIZE   = aligned_size
+    POOL_OFFSET = 0
+    POOL_PEAK   = 0
+    POOL_ALIVE  = true
+
+    let mb = aligned_size / (1024 * 1024)
+    println("[cuda_mem] pool init OK — " + str(mb) + " MB (" + str(aligned_size) + " bytes)")
+    0
+}
+
+fn cuda_mem_pool_free() {
+    if !POOL_ALIVE {
+        return 0
+    }
+    let _ = cuda_free(POOL_BASE)
+    POOL_BASE   = ptr_null()
+    POOL_SIZE   = 0
+    POOL_OFFSET = 0
+    POOL_PEAK   = 0
+    POOL_ALIVE  = false
+    println("[cuda_mem] pool freed")
+    0
+}
+
+// ── Bump allocation ──────────────────────────────────────────
+
+fn cuda_mem_pool_alloc(size_bytes) {
+    if !POOL_ALIVE {
+        println("[cuda_mem] ERROR: pool not initialized — call cuda_mem_pool_init first")
+        return ptr_null()
+    }
+
+    let aligned = align_up(size_bytes, CUDA_MEM_ALIGN)
+    let new_offset = POOL_OFFSET + aligned
+
+    if new_offset > POOL_SIZE {
+        let used_mb = POOL_OFFSET / (1024 * 1024)
+        let req_mb  = aligned / (1024 * 1024)
+        let tot_mb  = POOL_SIZE / (1024 * 1024)
+        println("[cuda_mem] OOM: used=" + str(used_mb) + "MB + req=" + str(req_mb) + "MB > pool=" + str(tot_mb) + "MB")
+        return ptr_null()
+    }
+
+    // Compute device pointer at current offset
+    let dev_ptr = ptr_from_int(ptr_addr(POOL_BASE) + POOL_OFFSET)
+    POOL_OFFSET = new_offset
+
+    // Track peak
+    if POOL_OFFSET > POOL_PEAK {
+        POOL_PEAK = POOL_OFFSET
+    }
+
+    dev_ptr
+}
+
+// ── Reset (rewind bump pointer for next step) ────────────────
+
+fn cuda_mem_pool_reset() {
+    POOL_OFFSET = 0
+}
+
+// ── Stats ────────────────────────────────────────────────────
+
+fn cuda_mem_pool_stats() {
+    if !POOL_ALIVE {
+        println("[cuda_mem] pool not alive")
+        return 0
+    }
+    let used_mb = POOL_OFFSET / (1024 * 1024)
+    let peak_mb = POOL_PEAK / (1024 * 1024)
+    let tot_mb  = POOL_SIZE / (1024 * 1024)
+    let free_mb = (POOL_SIZE - POOL_OFFSET) / (1024 * 1024)
+    println("[cuda_mem] pool: used=" + str(used_mb) + "MB  peak=" + str(peak_mb) + "MB  free=" + str(free_mb) + "MB  total=" + str(tot_mb) + "MB")
+    POOL_OFFSET
+}
+
+fn cuda_mem_pool_remaining() {
+    if !POOL_ALIVE { return 0 }
+    POOL_SIZE - POOL_OFFSET
+}
+
+fn cuda_mem_pool_used() {
+    if !POOL_ALIVE { return 0 }
+    POOL_OFFSET
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Convenience: pool-backed tensor upload / zeros
+//
+//  These mirror cuda_ffi.hexa's tensor_to_gpu / gpu_zeros but
+//  allocate from the pool instead of calling cudaMalloc each time.
+// ═══════════════════════════════════════════════════════════════
+
+// pool_gpu_zeros(n_floats) — allocate n*4 bytes from pool, zero them
+fn pool_gpu_zeros(n) {
+    let dev = cuda_mem_pool_alloc(n * 4)
+    if ptr_addr(dev) == 0 { return dev }
+    let _ = cuda_memset_zero(dev, n * 4)
+    dev
+}
+
+// pool_tensor_to_gpu(t) — upload hexa tensor to pool-backed device buf
+fn pool_tensor_to_gpu(t) {
+    let n = len(t)
+    let host_buf = tensor_data_f32_ptr(t)
+    let dev = cuda_mem_pool_alloc(n * 4)
+    if ptr_addr(dev) != 0 {
+        let _ = cuda_memcpy_h2d(dev, host_buf, n * 4)
+    }
+    free_raw(host_buf, n * 4)
+    dev
+}
+
+// pool_upload_f32(host_ptr, n_floats) — upload raw f32 buffer to pool
+fn pool_upload_f32(host_ptr, n) {
+    let dev = cuda_mem_pool_alloc(n * 4)
+    if ptr_addr(dev) != 0 {
+        let _ = cuda_memcpy_h2d(dev, host_ptr, n * 4)
+    }
+    dev
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Named region allocator (for persistent buffers: weights, grads)
+//
+//  For buffers that must survive across steps, use direct
+//  cuda_malloc/cuda_free from cuda_ffi — the pool is step-scoped.
+//  These helpers provide a registry for tracking & bulk-freeing.
+// ═══════════════════════════════════════════════════════════════
+
+let mut NAMED_PTRS  = []   // list of device pointers
+let mut NAMED_SIZES = []   // corresponding sizes in bytes
+
+fn cuda_named_alloc(name, size_bytes) {
+    let dev = cuda_malloc(size_bytes)
+    if ptr_addr(dev) == 0 {
+        println("[cuda_mem] named alloc '" + name + "' failed (" + str(size_bytes) + " bytes)")
+        return ptr_null()
+    }
+    NAMED_PTRS  = NAMED_PTRS.push(dev)
+    NAMED_SIZES = NAMED_SIZES.push(size_bytes)
+    dev
+}
+
+fn cuda_named_free_all() {
+    let mut i = 0
+    while i < len(NAMED_PTRS) {
+        let _ = cuda_free(NAMED_PTRS[i])
+        i = i + 1
+    }
+    let n = len(NAMED_PTRS)
+    NAMED_PTRS  = []
+    NAMED_SIZES = []
+    n
+}
+
+fn cuda_named_stats() {
+    let mut total = 0
+    let mut i = 0
+    while i < len(NAMED_SIZES) {
+        total = total + NAMED_SIZES[i]
+        i = i + 1
+    }
+    let mb = total / (1024 * 1024)
+    println("[cuda_mem] named: " + str(len(NAMED_PTRS)) + " allocs, " + str(mb) + " MB total")
+    total
+}
+
+println("[cuda_mem] module loaded — device memory pool + named allocator ready")
