@@ -1,0 +1,314 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/ml/seq_parallel.hexa — Sequence Parallelism for long-seq
+//  distributed training
+//
+//  Splits the sequence dimension across GPUs so that 7B training
+//  with seq=4096+ fits in aggregate memory.  Two execution modes:
+//
+//    1. Vanilla SP: split seq → all-gather before attention →
+//       reduce-scatter after attention backward.
+//    2. Ring Attention: each rank holds local Q, K/V rotate in
+//       a ring — O(S/N · S · D) per rank instead of all-gathering
+//       the full hidden state.
+//
+//  Depends on:
+//    self/ml/hxccl.hexa  — ccl_all_gather_f32, ccl_reduce_scatter_f32
+//    self/ml/fsdp.hexa   — fsdp_barrier_sync (optional sync)
+//
+//  Paper refs:
+//    "Sequence Parallelism: Long Sequence Training from System
+//     Perspective", Li et al. 2023
+//    "Ring Attention with Blockwise Transformers for Near-Infinite
+//     Context", Liu et al. 2023
+//
+//  AI-NATIVE attrs:
+//    @pure  — no side effects
+//    @hot   — called every training step
+// ═══════════════════════════════════════════════════════════════
+
+use "hxccl"
+
+// ── SpConfig: decides whether SP is beneficial ──────────────
+
+struct SpConfig {
+    enabled: bool,
+    seq_len: int,
+    num_gpus: int,
+    local_seq: int,
+    ring_attn: bool
+}
+
+// sp_config: returns configuration for sequence parallelism.
+// SP activates only when seq_len > min_local_seq * num_gpus,
+// meaning each rank still gets at least min_local_seq tokens.
+// Ring attention is preferred when num_gpus >= 4 (amortises
+// the ring rotation overhead).
+@pure
+pub fn sp_config(seq_len, num_gpus, min_local_seq) {
+    if num_gpus <= 1 {
+        return SpConfig {
+            enabled: false,
+            seq_len: seq_len,
+            num_gpus: 1,
+            local_seq: seq_len,
+            ring_attn: false
+        }
+    }
+    let threshold = min_local_seq * num_gpus
+    if seq_len < threshold {
+        return SpConfig {
+            enabled: false,
+            seq_len: seq_len,
+            num_gpus: num_gpus,
+            local_seq: seq_len,
+            ring_attn: false
+        }
+    }
+    let local = seq_len / num_gpus
+    let use_ring = num_gpus >= 4
+    return SpConfig {
+        enabled: true,
+        seq_len: seq_len,
+        num_gpus: num_gpus,
+        local_seq: local,
+        ring_attn: use_ring
+    }
+}
+
+// ── 1. Split sequence across ranks ──────────────────────────
+// tokens: flat [batch * seq_len] or [seq_len]
+// Returns the local chunk for this rank: [batch * local_seq]
+
+@pure
+pub fn sp_split_sequence(tokens, seq_len, num_ranks, rank) {
+    let n = len(tokens)
+    let batch = n / seq_len
+    let local_seq = seq_len / num_ranks
+    let mut out = []
+    for b in 0..batch {
+        let base = b * seq_len + rank * local_seq
+        for s in 0..local_seq {
+            out.push(tokens[(base + s)])
+        }
+    }
+    return out
+}
+
+// ── 2. All-gather sequence (hidden states) ──────────────────
+// Before attention, each rank needs the full sequence of hidden
+// states to compute Q @ K^T.  local_hidden is [local_seq * dim]
+// per rank; after all-gather it becomes [seq_len * dim].
+//
+// CCL path: pack → all_gather_f32 → unpack.
+// Fallback: identity (single-rank, local == full).
+
+@hot
+pub fn sp_all_gather_sequence(local_hidden, seq_len, num_ranks) {
+    let local_n = len(local_hidden)
+    if num_ranks <= 1 { return local_hidden }
+
+    // Pack into raw f32 send buffer
+    let send_buf = alloc_raw(local_n * 4)
+    for i in 0..local_n {
+        write_f32(send_buf, i * 4, local_hidden[i])
+    }
+
+    let total_n = local_n * num_ranks
+    let recv_buf = alloc_raw(total_n * 4)
+    let _ = ccl_all_gather_f32(send_buf, recv_buf, local_n)
+    let _ = ccl_barrier()
+
+    let mut full = []
+    for i in 0..total_n {
+        full.push(deref_f32(recv_buf, i * 4))
+    }
+
+    free_raw(send_buf, local_n * 4)
+    free_raw(recv_buf, total_n * 4)
+    return full
+}
+
+// ── 3. Reduce-scatter sequence (gradients) ──────────────────
+// After attention backward, each rank has a full-sequence gradient
+// [seq_len * dim]. Reduce-scatter sums across ranks and returns
+// only the local shard [local_seq * dim].
+
+@hot
+pub fn sp_reduce_scatter_sequence(full_grad, seq_len, num_ranks) {
+    let total_n = len(full_grad)
+    if num_ranks <= 1 { return full_grad }
+
+    let local_n = total_n / num_ranks
+
+    let send_buf = alloc_raw(total_n * 4)
+    for i in 0..total_n {
+        write_f32(send_buf, i * 4, full_grad[i])
+    }
+
+    let recv_buf = alloc_raw(local_n * 4)
+    let _ = ccl_reduce_scatter_f32(send_buf, recv_buf, local_n)
+    let _ = ccl_barrier()
+
+    let mut local_grad = []
+    for i in 0..local_n {
+        local_grad.push(deref_f32(recv_buf, i * 4))
+    }
+
+    free_raw(send_buf, total_n * 4)
+    free_raw(recv_buf, local_n * 4)
+    return local_grad
+}
+
+// ── 4. Ring attention forward ───────────────────────────────
+// Each rank holds Q_local [local_seq, dim].  K and V rotate
+// through a ring of num_ranks steps.  At each step the rank
+// computes partial attention scores for one K/V chunk and
+// accumulates using the online softmax trick (log-sum-exp).
+//
+// q_local  : [local_seq * dim]   — this rank's queries
+// k_full   : [seq_len * dim]     — initially this rank's K chunk
+// v_full   : [seq_len * dim]     — initially this rank's V chunk
+// local_seq: int
+// dim      : int (head dim)
+// num_ranks: int
+// rank     : int
+//
+// Returns output_local [local_seq * dim].
+//
+// The "full" naming on k/v is a misnomer inherited from the API
+// spec — in ring-attn mode each rank starts with its local chunk
+// and receives remote chunks via send/recv rotation.  For the
+// Day-1 MVP we simulate the ring with all-gathered K/V (the CCL
+// send/recv pair is a Day-2 optimisation).
+
+@hot
+pub fn sp_ring_attention_fwd(q_local, k_full, v_full, local_seq, dim, num_ranks, rank) {
+    let full_seq = local_seq * num_ranks
+
+    // Day-1: k_full / v_full already contain the full gathered
+    // sequence (caller did sp_all_gather_sequence).  We iterate
+    // over chunks to mirror the ring structure so the swap to
+    // true ring send/recv is a drop-in replacement.
+
+    // output accumulator + running log-sum-exp per query row
+    let mut out = []
+    let mut lse = []
+    for i in 0..(local_seq * dim) { out.push(0.0) }
+    for i in 0..local_seq { lse.push(-1.0e30) }
+
+    // Process each K/V chunk (one per ring step)
+    for step in 0..num_ranks {
+        let chunk_off = step * local_seq
+
+        // For each query row, compute scores against this K chunk
+        for qi in 0..local_seq {
+            let q_off = qi * dim
+
+            // Compute attention scores for this query against chunk keys
+            let mut scores = []
+            for ki in 0..local_seq {
+                let k_off = (chunk_off + ki) * dim
+                let mut dot = 0.0
+                for d in 0..dim {
+                    dot = dot + q_local[(q_off + d)] * k_full[(k_off + d)]
+                }
+                scores.push(dot)
+            }
+
+            // Online softmax: find max score in this chunk
+            let mut chunk_max = -1.0e30
+            for si in 0..local_seq {
+                if scores[si] > chunk_max { chunk_max = scores[si] }
+            }
+
+            // Compute exp(score - chunk_max) and sum
+            let mut chunk_sum = 0.0
+            let mut exp_scores = []
+            for si in 0..local_seq {
+                let e = exp(scores[si] - chunk_max)
+                exp_scores.push(e)
+                chunk_sum = chunk_sum + e
+            }
+
+            // Merge with running accumulator using log-sum-exp
+            let old_lse = lse[qi]
+            let new_lse_candidate = chunk_max + log(chunk_sum)
+
+            // Stable merge: max(old_lse, new_lse_candidate)
+            let merged_max = if old_lse > new_lse_candidate { old_lse } else { new_lse_candidate }
+            let old_weight = exp(old_lse - merged_max)
+            let new_weight = exp(new_lse_candidate - merged_max)
+            let total_weight = old_weight + new_weight
+
+            // Rescale existing output and add new contribution
+            for d in 0..dim {
+                let old_val = out[(qi * dim + d)] * old_weight
+
+                // Weighted sum of V for this chunk
+                let mut v_acc = 0.0
+                for ki in 0..local_seq {
+                    let v_off = (chunk_off + ki) * dim
+                    v_acc = v_acc + exp_scores[ki] * v_full[(v_off + d)]
+                }
+                let new_val = v_acc * new_weight / (chunk_sum + 1.0e-12)
+
+                out[(qi * dim + d)] = (old_val + new_val) / (total_weight + 1.0e-12)
+            }
+
+            lse[qi] = merged_max + log(total_weight)
+        }
+    }
+
+    return out
+}
+
+// ── Memory estimator ────────────────────────────────────────
+// Returns per-rank activation memory for attention in bytes.
+// Without SP: batch * seq^2 * 4 bytes (full attention matrix).
+// With SP:    batch * (seq/N)^2 * 4 bytes per ring step,
+//             only one step's matrix alive at a time.
+
+@pure
+pub fn sp_memory_per_rank(batch, seq_len, num_ranks, dim) {
+    let local_seq = seq_len / num_ranks
+    // Attention matrix for one ring step: local_seq * local_seq
+    // Plus Q/K/V/O buffers: 4 * local_seq * dim
+    let attn_bytes = batch * local_seq * local_seq * 4
+    let buffer_bytes = batch * 4 * local_seq * dim * 4
+    return attn_bytes + buffer_bytes
+}
+
+@pure
+pub fn sp_memory_no_parallel(batch, seq_len, dim) {
+    let attn_bytes = batch * seq_len * seq_len * 4
+    let buffer_bytes = batch * 4 * seq_len * dim * 4
+    return attn_bytes + buffer_bytes
+}
+
+@pure
+pub fn sp_memory_savings_ratio(batch, seq_len, num_ranks, dim) {
+    let without = sp_memory_no_parallel(batch, seq_len, dim)
+    let with_sp = sp_memory_per_rank(batch, seq_len, num_ranks, dim)
+    if without == 0 { return 0.0 }
+    return 1.0 - to_float(with_sp) / to_float(without)
+}
+
+// ── Communication volume estimator ──────────────────────────
+// Vanilla SP: all-gather + reduce-scatter = 2 * local_seq * dim * 4 bytes
+// Ring attention: num_ranks rotations of local_seq * dim * 4 bytes each
+
+@pure
+pub fn sp_comm_volume_vanilla(seq_len, num_ranks, dim) {
+    let local_seq = seq_len / num_ranks
+    // all-gather: (N-1)/N * seq * dim * 4, reduce-scatter: same
+    return 2 * (num_ranks - 1) * local_seq * dim * 4
+}
+
+@pure
+pub fn sp_comm_volume_ring(seq_len, num_ranks, dim) {
+    let local_seq = seq_len / num_ranks
+    // Each step sends local_seq * dim floats, N-1 steps
+    return (num_ranks - 1) * local_seq * dim * 4
+}
+
+println("[seq_parallel] loaded — SP split/all-gather/reduce-scatter/ring-attention (hxccl)")

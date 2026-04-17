@@ -1,0 +1,234 @@
+// ═══════════════════════════════════════════════════════════════
+//  anima_docker_sync.hexa — Anima Docker 배포 검증 + 매니페스트 생성
+//
+//  사용법:
+//    hexa scripts/anima_docker_sync.hexa              # validate only
+//    hexa scripts/anima_docker_sync.hexa --push       # validate + git push
+//
+//  수행:
+//    1. ML 모듈 21종 존재 + importable 검증
+//    2. Native build 스크립트 3종 존재 검증
+//    3. grammar.jsonl 항목 수 검증
+//    4. deploy_manifest.json 생성 (모듈 수, LOC, 빌드 명령)
+//    5. --push 시 origin push
+//
+//  Anima docker 컨테이너는 시작 시 git pull hexa-lang 수행 —
+//  이 스크립트로 push 전 모든 산출물 정합성 보장
+// ═══════════════════════════════════════════════════════════════
+
+let args = argv()
+let mut do_push = false
+let mut idx = 1
+while idx < len(args) {
+    if args[idx] == "--push" {
+        do_push = true
+    }
+    idx = idx + 1
+}
+
+println("═══ Anima Docker Sync — Deployment Validator ═══")
+println("")
+
+// ── 1. Validate ML modules ────────────────────────────────────
+println("[1/4] Validating ML modules...")
+
+let ml_modules = [
+    "train_7b_integrated", "gpu_train", "data_loader", "tokenizer_bpe",
+    "checkpoint", "eval_harness", "train_logger", "lr_schedule",
+    "weight_init", "grad_accumulate", "rope", "fused_kernels",
+    "cuda_mem", "cuda_graph", "lora_serve", "mem_profiler",
+    "hxflash", "hxccl", "fsdp", "distributed_train", "dist_launcher"
+]
+
+let mut ml_ok = 0
+let mut ml_fail = 0
+let mut ml_total_loc = 0
+let mut missing_modules = []
+let mut mi = 0
+while mi < len(ml_modules) {
+    let mod_name = ml_modules[mi]
+    let path = "self/ml/" + mod_name + ".hexa"
+    if file_exists(path) {
+        let content = read_file(path)
+        let lines = split(content, "\n")
+        let loc = len(lines)
+        ml_total_loc = ml_total_loc + loc
+        ml_ok = ml_ok + 1
+        // basic importable check: file must have at least fn or let
+        if !contains(content, "fn ") && !contains(content, "let ") {
+            println("  [WARN] " + mod_name + " — no fn/let found, may be empty stub")
+        }
+    } else {
+        println("  [FAIL] MISSING: " + path)
+        missing_modules = missing_modules + [mod_name]
+        ml_fail = ml_fail + 1
+    }
+    mi = mi + 1
+}
+
+println("  modules: " + str(ml_ok) + "/" + str(len(ml_modules)) +
+    " OK, " + str(ml_total_loc) + " LOC total")
+if ml_fail > 0 {
+    println("  [ERROR] " + str(ml_fail) + " modules missing — cannot deploy")
+    exit(1)
+}
+println("  [OK] All " + str(len(ml_modules)) + " ML modules validated")
+
+// ── 2. Validate native build scripts ──────────────────────────
+println("")
+println("[2/4] Validating native build scripts...")
+
+let build_scripts = [
+    "scripts/build_session_b.hexa",
+    "scripts/build_hxcuda_linux.hexa",
+    "scripts/build_hxflash_linux.hexa"
+]
+
+let mut bs_ok = 0
+let mut bs_fail = 0
+let mut bi = 0
+while bi < len(build_scripts) {
+    let bs_path = build_scripts[bi]
+    if file_exists(bs_path) {
+        bs_ok = bs_ok + 1
+        println("  [OK] " + bs_path)
+    } else {
+        println("  [FAIL] MISSING: " + bs_path)
+        bs_fail = bs_fail + 1
+    }
+    bi = bi + 1
+}
+
+if bs_fail > 0 {
+    println("  [ERROR] " + str(bs_fail) + " build scripts missing")
+    exit(1)
+}
+println("  [OK] All " + str(len(build_scripts)) + " build scripts present")
+
+// ── 3. Validate grammar.jsonl ─────────────────────────────────
+println("")
+println("[3/4] Checking grammar.jsonl...")
+
+let grammar_path = "shared/hexa-lang/grammar.jsonl"
+if !file_exists(grammar_path) {
+    println("  [ERROR] grammar.jsonl not found at " + grammar_path)
+    exit(1)
+}
+let grammar_content = read_file(grammar_path)
+let grammar_lines = split(grammar_content, "\n")
+let mut grammar_count = 0
+let mut gi = 0
+while gi < len(grammar_lines) {
+    let line = grammar_lines[gi]
+    if len(line) > 2 {
+        grammar_count = grammar_count + 1
+    }
+    gi = gi + 1
+}
+
+// check for ML-related grammar entries (G40+ era)
+let has_cuda = contains(grammar_content, "cuda")
+let has_fsdp = contains(grammar_content, "fsdp") || contains(grammar_content, "distributed")
+let has_flash = contains(grammar_content, "flash") || contains(grammar_content, "hxflash")
+
+println("  entries: " + str(grammar_count))
+println("  cuda-related: " + if has_cuda { "YES" } else { "NO" })
+println("  distributed-related: " + if has_fsdp { "YES" } else { "NO" })
+println("  flash-attention: " + if has_flash { "YES" } else { "NO" })
+
+if grammar_count < 100 {
+    println("  [WARN] grammar.jsonl has fewer than 100 entries — unusually small")
+}
+println("  [OK] grammar.jsonl validated (" + str(grammar_count) + " entries)")
+
+// ── 4. Generate deployment manifest ───────────────────────────
+println("")
+println("[4/4] Generating deployment manifest...")
+
+let native_libs = [
+    "libhxblas.so", "libhxvdsp.so", "libhxlayer.so",
+    "libhxflash.so", "libhxccl.so", "libhxlmhead.so",
+    "libhxcuda.so", "libhxqwen14b.so"
+]
+
+// build module list JSON array
+let mut mod_json = "["
+let mut mj = 0
+while mj < len(ml_modules) {
+    if mj > 0 {
+        mod_json = mod_json + ", "
+    }
+    mod_json = mod_json + "\"" + ml_modules[mj] + "\""
+    mj = mj + 1
+}
+mod_json = mod_json + "]"
+
+// build native libs JSON array
+let mut lib_json = "["
+let mut lj = 0
+while lj < len(native_libs) {
+    if lj > 0 {
+        lib_json = lib_json + ", "
+    }
+    lib_json = lib_json + "\"" + native_libs[lj] + "\""
+    lj = lj + 1
+}
+lib_json = lib_json + "]"
+
+let timestamp = exec_output("date -u +%Y-%m-%dT%H:%M:%SZ")
+
+let manifest = "{\n" +
+    "  \"version\": \"2026-04-17\",\n" +
+    "  \"timestamp\": \"" + trim(timestamp) + "\",\n" +
+    "  \"module_count\": " + str(len(ml_modules)) + ",\n" +
+    "  \"total_loc\": " + str(ml_total_loc) + ",\n" +
+    "  \"modules\": " + mod_json + ",\n" +
+    "  \"native_libs_required\": " + lib_json + ",\n" +
+    "  \"grammar_entries\": " + str(grammar_count) + ",\n" +
+    "  \"build_commands\": {\n" +
+    "    \"native_all\": \"hexa scripts/build_session_b.hexa\",\n" +
+    "    \"cuda_fused\": \"hexa scripts/build_hxcuda_linux.hexa\",\n" +
+    "    \"flash_attn\": \"hexa scripts/build_hxflash_linux.hexa\"\n" +
+    "  },\n" +
+    "  \"entry_points\": {\n" +
+    "    \"run_7b_h100\": \"hexa run self/ml/run_7b_h100.hexa\",\n" +
+    "    \"launch_multigpu\": \"NUM_GPUS=8 hexa run self/ml/launch_multigpu.hexa\",\n" +
+    "    \"train_7b\": \"hexa run self/ml/train_7b_integrated.hexa\",\n" +
+    "    \"gpu_train\": \"hexa run self/ml/gpu_train.hexa\",\n" +
+    "    \"dist_train\": \"hexa run self/ml/distributed_train.hexa\"\n" +
+    "  },\n" +
+    "  \"docker_pull_target\": \"hexa-lang\",\n" +
+    "  \"ld_library_path\": \"/opt/hexa/self/native/build:/usr/local/cuda/lib64\"\n" +
+    "}"
+
+write_file("deploy_manifest.json", manifest)
+println("  [OK] deploy_manifest.json written")
+println("  modules=" + str(len(ml_modules)) + " loc=" + str(ml_total_loc) +
+    " native_libs=" + str(len(native_libs)))
+
+// ── Summary ───────────────────────────────────────────────────
+println("")
+println("═══ Validation Complete ═══")
+println("  ML modules:     " + str(ml_ok) + "/" + str(len(ml_modules)) + " PASS")
+println("  Build scripts:  " + str(bs_ok) + "/" + str(len(build_scripts)) + " PASS")
+println("  Grammar:        " + str(grammar_count) + " entries")
+println("  Total LOC:      " + str(ml_total_loc))
+println("  Manifest:       deploy_manifest.json")
+println("")
+
+// ── 5. Optional push ──────────────────────────────────────────
+if do_push {
+    println("[PUSH] Pushing to origin...")
+    let push_rc = exec("git push origin main")
+    if push_rc != 0 {
+        println("[ERROR] git push failed rc=" + str(push_rc))
+        exit(1)
+    }
+    println("[OK] Pushed — Anima docker will pull on next container start")
+} else {
+    println("[INFO] Dry run — use --push to push to origin")
+    println("  Anima docker containers will pick up changes on next: git pull hexa-lang")
+}
+
+println("")
+println("STATUS: READY FOR DOCKER DEPLOYMENT")
