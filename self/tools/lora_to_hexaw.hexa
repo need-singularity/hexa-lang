@@ -1,0 +1,927 @@
+// ═══════════════════════════════════════════════════════════
+//  lora_to_hexaw.hexa — HF PEFT LoRA adapter(s) → merged HEXAW2
+//
+//  W' = W + Σ_i (alpha_i / r_i) * B_i @ A_i   (per target module)
+//  HF PEFT layout: A=[r, d_in], B=[d_out, r]
+//
+//  Build:   ./hexa build self/tools/lora_to_hexaw.hexa -o build/lora_to_hexaw
+//
+//  Qwen2.5-14B A1+A2-Orch+A2-Tool merge on H100:
+//    ./build/lora_to_hexaw \
+//      --base /workspace/hexaw/qwen25_14b.hexaw \
+//      --adapters /workspace/ckpt_alm14b_phi_a1_20260416/step_3000,\
+//                /workspace/ckpt_alm14b_phi_a2_orch_20260416/step_XXX,\
+//                /workspace/ckpt_alm14b_phi_a2_tool_20260417/step_XXX \
+//      --output /workspace/hexaw/qwen25_14b_a1_a2orch_a2tool.hexaw
+//
+//  Punted PEFT fields (tool aborts if any is set):
+//    modules_to_save, use_rslora, use_dora
+//  Honored: r, lora_alpha, target_modules
+//  Ignored (no effect at merge-time): lora_dropout, init_lora_weights,
+//    fan_in_fan_out (Qwen2 already matches [out,in] layout), bias.
+// ═══════════════════════════════════════════════════════════
+
+// ── u64 LE helper (same as safetensors_to_hexaw) ────────────
+fn u64_le_from_bytes(bs, off) {
+    let mut v = 0
+    let mut i = 0
+    let mut mul = 1
+    while i < 8 {
+        v = v + bs[off + i] * mul
+        mul = mul * 256
+        i = i + 1
+    }
+    return v
+}
+
+// ── Byte-array JSON scanner (ported from safetensors_to_hexaw)
+fn jc_skip_ws(b, p) {
+    let n = len(b)
+    let mut i = p
+    while i < n {
+        let c = b[i]
+        if c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1 }
+        else { return i }
+    }
+    return i
+}
+
+fn jc_parse_string(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut out = ""
+    while i < n {
+        let c = b[i]
+        if c == 34 { return [out, i + 1] }
+        if c == 92 {
+            if i + 1 < n {
+                out = out + to_string(from_char_code(b[i + 1]))
+                i = i + 2
+            } else { i = i + 1 }
+        } else {
+            out = out + to_string(from_char_code(c))
+            i = i + 1
+        }
+    }
+    return [out, i]
+}
+
+fn jc_parse_int(b, p) {
+    let mut i = p
+    let n = len(b)
+    let mut sign = 1
+    if i < n && b[i] == 45 { sign = -1; i = i + 1 }
+    let mut v = 0
+    while i < n {
+        let c = b[i]
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1 }
+        else { return [v * sign, i] }
+    }
+    return [v * sign, i]
+}
+
+// Reads a JSON number (int or float with '.', 'e', 'E', '-', '+')
+// and returns its float value.
+fn jc_parse_num(b, p) {
+    let mut i = p
+    let n = len(b)
+    let mut s = ""
+    while i < n {
+        let c = b[i]
+        if (c >= 48 && c <= 57) || c == 45 || c == 43 || c == 46 || c == 101 || c == 69 {
+            s = s + to_string(from_char_code(c))
+            i = i + 1
+        } else { break }
+    }
+    return [to_float(s), i]
+}
+
+fn jc_parse_int_array(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut arr = []
+    i = jc_skip_ws(b, i)
+    if i < n && b[i] == 93 { return [arr, i + 1] }
+    while i < n {
+        i = jc_skip_ws(b, i)
+        let pr = jc_parse_int(b, i)
+        arr = arr + [pr[0]]
+        i = pr[1]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+        else if i < n && b[i] == 93 { return [arr, i + 1] }
+    }
+    return [arr, i]
+}
+
+fn jc_parse_string_array(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut arr = []
+    i = jc_skip_ws(b, i)
+    if i < n && b[i] == 93 { return [arr, i + 1] }
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 34 {
+            let pr = jc_parse_string(b, i)
+            arr = arr + [pr[0]]
+            i = pr[1]
+        } else {
+            // Skip non-string values defensively — some PEFT
+            // configs pack `null` into modules_to_save.
+            while i < n && b[i] != 44 && b[i] != 93 { i = i + 1 }
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+        else if i < n && b[i] == 93 { return [arr, i + 1] }
+    }
+    return [arr, i]
+}
+
+fn jc_skip_value(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    if i >= n { return i }
+    let c = b[i]
+    if c == 34 { let pr = jc_parse_string(b, i); return pr[1] }
+    if c == 91 || c == 123 {
+        let mut depth = 1
+        i = i + 1
+        while i < n && depth > 0 {
+            let cc = b[i]
+            if cc == 34 { let pr = jc_parse_string(b, i); i = pr[1] }
+            else if cc == 91 || cc == 123 { depth = depth + 1; i = i + 1 }
+            else if cc == 93 || cc == 125 { depth = depth - 1; i = i + 1 }
+            else { i = i + 1 }
+        }
+        return i
+    }
+    while i < n {
+        let cc = b[i]
+        if cc == 44 || cc == 125 || cc == 93 { return i }
+        i = i + 1
+    }
+    return i
+}
+
+// Tensor record inside safetensors header: returns
+//   [dtype, shape, beg, end, next_pos]
+fn jc_parse_tensor_record(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    let mut dtype = ""
+    let mut shape = []
+    let mut beg = 0
+    let mut end = 0
+    if i >= n || b[i] != 123 { return [dtype, shape, beg, end, i] }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { return [dtype, shape, beg, end, i + 1] }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(b, i)
+        if key == "dtype" {
+            let vpr = jc_parse_string(b, i); i = vpr[1]
+            dtype = vpr[0]
+        } else if key == "shape" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            shape = vpr[0]
+        } else if key == "data_offsets" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            if len(vpr[0]) >= 2 { beg = vpr[0][0]; end = vpr[0][1] }
+        } else {
+            i = jc_skip_value(b, i)
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [dtype, shape, beg, end, i]
+}
+
+// Parse safetensors header: returns parallel arrays
+//   [names, dtypes, shapes, offs_b, offs_e]
+fn st_parse_header(b) {
+    let n = len(b)
+    let mut names = []
+    let mut dtypes = []
+    let mut shapes = []
+    let mut offs_b = []
+    let mut offs_e = []
+    let mut i = jc_skip_ws(b, 0)
+    if i >= n || b[i] != 123 { return [names, dtypes, shapes, offs_b, offs_e] }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { break }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(b, i)
+        if key == "__metadata__" {
+            i = jc_skip_value(b, i)
+        } else {
+            let rec = jc_parse_tensor_record(b, i)
+            i = rec[4]
+            names = names + [key]
+            dtypes = dtypes + [rec[0]]
+            shapes = shapes + [rec[1]]
+            offs_b = offs_b + [rec[2]]
+            offs_e = offs_e + [rec[3]]
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [names, dtypes, shapes, offs_b, offs_e]
+}
+
+fn st_open(path) {
+    let hdr_sz_bytes = read_bytes_at(path, 0, 8)
+    if len(hdr_sz_bytes) != 8 {
+        eprintln("[lora] ERROR: cannot read header from " + path)
+        return [[], [], [], [], [], 0]
+    }
+    let hsz = u64_le_from_bytes(hdr_sz_bytes, 0)
+    let cap = 64 * 1024 * 1024
+    let mut take = hsz
+    if take > cap { take = cap }
+    let hdr_bytes = read_bytes_at(path, 8, take)
+    let rec = st_parse_header(hdr_bytes)
+    return [rec[0], rec[1], rec[2], rec[3], rec[4], 8 + hsz]
+}
+
+// ── adapter_config.json parser ──────────────────────────────
+//  Returns [r, alpha, target_modules, rslora, use_dora, has_mts]
+//  as a positional tuple — hexa_v2 codegen loses struct field
+//  types across a function boundary, so we stay on plain arrays.
+fn parse_adapter_cfg(path) {
+    let raw = read_file_bytes(path)
+    let n = len(raw)
+    let mut r = 8
+    let mut alpha = 16.0
+    let mut tgt = []
+    let mut rslora = 0
+    let mut dora = 0
+    let mut has_mts = 0
+    let mut i = jc_skip_ws(raw, 0)
+    if i >= n || raw[i] != 123 {
+        eprintln("[lora] ERROR: bad JSON in " + path)
+        return [r, alpha, tgt, 0, 0, 0]
+    }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(raw, i)
+        if i < n && raw[i] == 125 { break }
+        let kpr = jc_parse_string(raw, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(raw, i)
+        if i < n && raw[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(raw, i)
+        if key == "r" {
+            let pr = jc_parse_int(raw, i); i = pr[1]; r = pr[0]
+        } else if key == "lora_alpha" {
+            let pr = jc_parse_num(raw, i); i = pr[1]; alpha = pr[0]
+        } else if key == "target_modules" {
+            if i < n && raw[i] == 91 {
+                let pr = jc_parse_string_array(raw, i); i = pr[1]; tgt = pr[0]
+            } else {
+                // PEFT occasionally serializes target_modules as a single
+                // string instead of an array — treat as 1-element list.
+                let pr = jc_parse_string(raw, i); i = pr[1]; tgt = [pr[0]]
+            }
+        } else if key == "use_rslora" {
+            // true → rslora=1; anything else (false/null/absent) → 0
+            if i + 3 < n && raw[i] == 116 && raw[i + 1] == 114 && raw[i + 2] == 117 && raw[i + 3] == 101 {
+                rslora = 1
+            }
+            i = jc_skip_value(raw, i)
+        } else if key == "use_dora" {
+            if i + 3 < n && raw[i] == 116 && raw[i + 1] == 114 && raw[i + 2] == 117 && raw[i + 3] == 101 {
+                dora = 1
+            }
+            i = jc_skip_value(raw, i)
+        } else if key == "modules_to_save" {
+            // Non-null, non-empty array means we'd need to ship extra
+            // full-param tensors — we don't handle that.
+            if i < n && raw[i] == 91 {
+                let pr = jc_parse_string_array(raw, i); i = pr[1]
+                if len(pr[0]) > 0 { has_mts = 1 }
+            } else {
+                i = jc_skip_value(raw, i)
+            }
+        } else {
+            i = jc_skip_value(raw, i)
+        }
+        i = jc_skip_ws(raw, i)
+        if i < n && raw[i] == 44 { i = i + 1 }
+    }
+    return [r, alpha, tgt, rslora, dora, has_mts]
+}
+
+// ── dtype decoders (lifted from safetensors_to_hexaw) ────────
+fn dtype_elem_size(dt) {
+    if dt == "F32" { return 4 }
+    if dt == "BF16" { return 2 }
+    if dt == "F16" { return 2 }
+    return 0
+}
+
+fn decode_f32_le(b, off) {
+    let b0 = b[off]; let b1 = b[off + 1]; let b2 = b[off + 2]; let b3 = b[off + 3]
+    let sign = b3 / 128
+    let exp_bits = ((b3 % 128) * 2) + (b2 / 128)
+    let mant_bits = (b2 % 128) * 65536 + b1 * 256 + b0
+    if exp_bits == 0 && mant_bits == 0 {
+        if sign == 1 { return 0.0 - 0.0 }
+        return 0.0
+    }
+    if exp_bits == 255 {
+        if sign == 1 { return 0.0 - 3.4028235e38 }
+        return 3.4028235e38
+    }
+    let mut mant = 0.0
+    if exp_bits == 0 { mant = to_float(mant_bits) / 8388608.0 }
+    else { mant = 1.0 + to_float(mant_bits) / 8388608.0 }
+    let mut e = exp_bits - 127
+    if exp_bits == 0 { e = -126 }
+    let mut val = mant
+    if e >= 0 {
+        let mut i = 0
+        while i < e { val = val * 2.0; i = i + 1 }
+    } else {
+        let mut i = 0
+        while i < (0 - e) { val = val / 2.0; i = i + 1 }
+    }
+    if sign == 1 { val = 0.0 - val }
+    return val
+}
+
+fn decode_bf16_le(b, off) {
+    // bf16 sits in the HIGH 16 bits of f32. Padding low 2 bytes to zero
+    // and reusing the f32 decoder gives a branch-free path.
+    return decode_f32_le([0, 0, b[off], b[off + 1]], 0)
+}
+
+fn decode_f16_le(b, off) {
+    let lo = b[off]; let hi = b[off + 1]
+    let u = hi * 256 + lo
+    let sign = u / 32768
+    let exp5 = (u / 1024) % 32
+    let mant10 = u % 1024
+    if exp5 == 0 && mant10 == 0 {
+        if sign == 1 { return 0.0 - 0.0 }
+        return 0.0
+    }
+    if exp5 == 31 {
+        if sign == 1 { return 0.0 - 3.4028235e38 }
+        return 3.4028235e38
+    }
+    let mut mant = 0.0
+    let mut e = 0
+    if exp5 == 0 {
+        mant = to_float(mant10) / 1024.0
+        e = -14
+    } else {
+        mant = 1.0 + to_float(mant10) / 1024.0
+        e = exp5 - 15
+    }
+    let mut val = mant
+    if e >= 0 {
+        let mut i = 0
+        while i < e { val = val * 2.0; i = i + 1 }
+    } else {
+        let mut i = 0
+        while i < (0 - e) { val = val / 2.0; i = i + 1 }
+    }
+    if sign == 1 { val = 0.0 - val }
+    return val
+}
+
+fn decode_tensor_to_f32(path, dt, data_abs_off, n_elem) {
+    let elem_sz = dtype_elem_size(dt)
+    if elem_sz == 0 {
+        eprintln("[lora] ERROR: unsupported dtype " + dt)
+        return []
+    }
+    let total_bytes = n_elem * elem_sz
+    let bs = read_bytes_at(path, data_abs_off, total_bytes)
+    let got = len(bs)
+    if got < total_bytes {
+        eprintln("[lora] WARN: short read on tensor — got=" + to_string(got) + " want=" + to_string(total_bytes))
+    }
+    let mut out = []
+    let mut k = 0
+    while k < got {
+        if dt == "F32" { out = out + [decode_f32_le(bs, k)] }
+        else if dt == "BF16" { out = out + [decode_bf16_le(bs, k)] }
+        else { out = out + [decode_f16_le(bs, k)] }
+        k = k + elem_sz
+    }
+    return out
+}
+
+// ── adapter loader ──────────────────────────────────────────
+//  HF PEFT safetensors name =
+//    "base_model.model." + <base_name> + ".lora_A.weight"
+//  where <base_name> is verbatim from HF (e.g.
+//  "model.layers.0.self_attn.q_proj") — matches our base hexaw
+//  since safetensors_to_hexaw preserves HF names.
+
+fn strip_peft_prefix(name) {
+    let p1 = "base_model.model."
+    if name.starts_with(p1) {
+        let mut out = ""
+        let mut i = len(p1)
+        while i < len(name) {
+            out = out + to_string(from_char_code(char_code(name, i)))
+            i = i + 1
+        }
+        return out
+    }
+    return name
+}
+
+fn strip_suffix(name, suf) {
+    if name.ends_with(suf) {
+        let mut out = ""
+        let cut = len(name) - len(suf)
+        let mut i = 0
+        while i < cut {
+            out = out + to_string(from_char_code(char_code(name, i)))
+            i = i + 1
+        }
+        return out
+    }
+    return name
+}
+
+// Returns true iff base_name's last ".<short>." segment matches
+// one of the allowed target_modules (e.g. "q_proj"). We compare
+// on segment boundaries so "q_proj" doesn't spuriously match
+// "foo_q_proj".
+fn name_targets(base_name, target_modules) {
+    if len(target_modules) == 0 { return true }  // no filter → all
+    let parts = base_name.split(".")
+    let np = len(parts)
+    let mut tidx = 0
+    while tidx < len(target_modules) {
+        let m = target_modules[tidx]
+        let mut p = 0
+        while p < np {
+            if parts[p] == m { return true }
+            p = p + 1
+        }
+        tidx = tidx + 1
+    }
+    return false
+}
+
+// One adapter → an array of [base_name, A_f32_flat, A_shape,
+// B_f32_flat, B_shape, scale] rows. Non-target pairs are dropped
+// with a warning (indicates adapter_config/safetensors mismatch).
+fn load_adapter(dir) {
+    let cfg_path = dir + "/adapter_config.json"
+    let wgt_path = dir + "/adapter_model.safetensors"
+    if !file_exists(cfg_path) {
+        eprintln("[lora] ERROR: missing adapter_config.json in " + dir)
+        return [[], 1]
+    }
+    if !file_exists(wgt_path) {
+        eprintln("[lora] ERROR: missing adapter_model.safetensors in " + dir)
+        return [[], 1]
+    }
+    let cfg = parse_adapter_cfg(cfg_path)
+    let cfg_r = cfg[0]
+    let cfg_alpha = cfg[1]
+    let cfg_tgt = cfg[2]
+    let cfg_rslora = cfg[3]
+    let cfg_dora = cfg[4]
+    let cfg_has_mts = cfg[5]
+    if cfg_rslora != 0 {
+        eprintln("[lora] ERROR: use_rslora=true not supported (" + dir + ")")
+        return [[], 1]
+    }
+    if cfg_dora != 0 {
+        eprintln("[lora] ERROR: use_dora=true not supported (" + dir + ")")
+        return [[], 1]
+    }
+    if cfg_has_mts != 0 {
+        eprintln("[lora] ERROR: modules_to_save set — full-tensor replacement not supported (" + dir + ")")
+        return [[], 1]
+    }
+    let scale = cfg_alpha / to_float(cfg_r)
+    // Split long concat into several eprintln calls to dodge
+    // hexa_v2's deep-concat paren-balancing bug.
+    eprintln("[lora] " + dir)
+    eprintln("[lora]   r=" + to_string(cfg_r) + " alpha=" + to_string(cfg_alpha) + " scale=" + to_string(scale))
+    eprintln("[lora]   target_modules=" + to_string(len(cfg_tgt)))
+    let h = st_open(wgt_path)
+    let names = h[0]
+    let dtypes = h[1]
+    let shapes = h[2]
+    let offs_b = h[3]
+    let offs_e = h[4]
+    let data_off = h[5]
+    // First pass: collect lora_A / lora_B by stripped base name.
+    let mut base_names = []
+    let mut a_idx = []
+    let mut b_idx = []
+    let mut i = 0
+    while i < len(names) {
+        let nm = names[i]
+        let no_pref = strip_peft_prefix(nm)
+        let mut base = ""
+        let mut is_a = false
+        let mut is_b = false
+        if no_pref.ends_with(".lora_A.weight") {
+            base = strip_suffix(no_pref, ".lora_A.weight") + ".weight"
+            is_a = true
+        } else if no_pref.ends_with(".lora_B.weight") {
+            base = strip_suffix(no_pref, ".lora_B.weight") + ".weight"
+            is_b = true
+        } else {
+            i = i + 1
+            continue
+        }
+        if !name_targets(base, cfg_tgt) {
+            i = i + 1
+            continue
+        }
+        // Locate (or create) slot
+        let mut slot = -1
+        let mut k = 0
+        while k < len(base_names) {
+            if base_names[k] == base { slot = k; break }
+            k = k + 1
+        }
+        if slot < 0 {
+            base_names = base_names + [base]
+            a_idx = a_idx + [-1]
+            b_idx = b_idx + [-1]
+            slot = len(base_names) - 1
+        }
+        if is_a { a_idx[slot] = i }
+        if is_b { b_idx[slot] = i }
+        i = i + 1
+    }
+    // Second pass: materialize f32 A/B tensors.
+    let mut rows = []
+    let mut s = 0
+    while s < len(base_names) {
+        let ai = a_idx[s]; let bi = b_idx[s]
+        if ai < 0 || bi < 0 {
+            eprintln("[lora] WARN: unpaired LoRA for " + base_names[s])
+            s = s + 1
+            continue
+        }
+        let na = numel(shapes[ai])
+        let nb = numel(shapes[bi])
+        let a_data = decode_tensor_to_f32(wgt_path, dtypes[ai], data_off + offs_b[ai], na)
+        let b_data = decode_tensor_to_f32(wgt_path, dtypes[bi], data_off + offs_b[bi], nb)
+        rows = rows + [[base_names[s], a_data, shapes[ai], b_data, shapes[bi], scale]]
+        s = s + 1
+    }
+    return [rows, 0]
+}
+
+fn numel(shape) {
+    let mut p = 1
+    let mut i = 0
+    while i < len(shape) { p = p * shape[i]; i = i + 1 }
+    return p
+}
+
+// ── merge plan: base_name → list of adapter rows ─────────────
+//  Encoded as [names, adapter_lists] parallel arrays. Insertion
+//  order = --adapters argument order, which is also the apply
+//  order (LoRA deltas commute within a single base tensor, but
+//  the caller may still want deterministic downstream hashes).
+fn plan_new() { return [[], []] }
+
+fn plan_add(plan, row) {
+    let names = plan[0]
+    let lists = plan[1]
+    let bname = row[0]
+    let mut k = 0
+    while k < len(names) {
+        if names[k] == bname {
+            lists[k] = lists[k] + [row]
+            return [names, lists]
+        }
+        k = k + 1
+    }
+    return [names + [bname], lists + [[row]]]
+}
+
+fn plan_lookup(plan, bname) {
+    let names = plan[0]
+    let lists = plan[1]
+    let mut k = 0
+    while k < len(names) {
+        if names[k] == bname { return lists[k] }
+        k = k + 1
+    }
+    return []
+}
+
+// ── HEXAW2 streaming walker + merger ─────────────────────────
+//  Walk the base hexaw sequentially, emit the output tensor-by-
+//  tensor. For each tensor:
+//    - parse header (name, shape, count)
+//    - if no adapter hit: byte-copy count*4 bytes through
+//    - else: decode to f32, apply all adapters in order (row-wise
+//      dot product so we never materialize B@A), re-encode
+//
+//  We use the @memoize-friendly hexaw_f32_to_bytes helper inline
+//  here to avoid a use-chain (stage0 silent-exit trap) — this
+//  keeps the tool a single-file compile.
+
+fn f32_to_bytes(x) {
+    let mut sign = 0
+    let mut v = x
+    if v < 0.0 { sign = 1; v = 0.0 - v }
+    if x != x { return [0, 0, 192, 127] }
+    if v == 0.0 {
+        if sign == 1 { return [0, 0, 0, 128] }
+        return [0, 0, 0, 0]
+    }
+    if v > 3.4028235e38 {
+        if sign == 1 { return [0, 0, 128, 255] }
+        return [0, 0, 128, 127]
+    }
+    let mut e = 0
+    let mut m = v
+    while m >= 2.0 { m = m / 2.0; e = e + 1 }
+    while m < 1.0 { m = m * 2.0; e = e - 1 }
+    let biased = e + 127
+    let mut exp_bits = 0
+    let mut mant_bits = 0
+    if biased <= 0 {
+        let shift = 1 - biased
+        let mut sub = m
+        let mut s = 0
+        while s < shift { sub = sub / 2.0; s = s + 1 }
+        mant_bits = to_int(sub * 8388608.0)
+        exp_bits = 0
+    } else if biased >= 255 {
+        exp_bits = 255
+        mant_bits = 0
+    } else {
+        mant_bits = to_int((m - 1.0) * 8388608.0)
+        exp_bits = biased
+    }
+    let b0 = mant_bits % 256
+    let b1 = (mant_bits / 256) % 256
+    let lo_exp = exp_bits % 2
+    let hi_exp = exp_bits / 2
+    let b2 = ((mant_bits / 65536) % 128) + lo_exp * 128
+    let b3 = (sign * 128) + hi_exp
+    return [b0, b1, b2, b3]
+}
+
+fn str_to_bytes(s) {
+    let mut b = []
+    let mut i = 0
+    while i < len(s) { b = b + [char_code(s, i)]; i = i + 1 }
+    return b
+}
+
+// Read one \n-terminated ASCII line from HEXAW2 starting at `pos`
+// using read_bytes_at. Returns [line_str, next_pos]. Linear probe
+// one byte at a time keeps RAM O(line_len). HEXAW2 header lines
+// are max ~32 bytes so this is negligible.
+fn read_line(path, pos, file_sz) {
+    let mut s = ""
+    let mut p = pos
+    while p < file_sz {
+        let bs = read_bytes_at(path, p, 1)
+        if len(bs) == 0 { return [s, p] }
+        let c = bs[0]
+        p = p + 1
+        if c == 10 { return [s, p] }
+        s = s + to_string(from_char_code(c))
+    }
+    return [s, p]
+}
+
+// Apply `row` to `w` in-place.
+//   row = [base_name, A_flat, A_shape, B_flat, B_shape, scale]
+//   A: [r, d_in], B: [d_out, r], W: [d_out, d_in] flat
+// Per-row fused update — zero intermediate B@A matrix.
+fn apply_one_adapter(w, out_rows, in_cols, row) {
+    let a_flat = row[1]
+    let a_shape = row[2]
+    let b_flat = row[3]
+    let b_shape = row[4]
+    let scale = row[5]
+    let rk = a_shape[0]
+    let a_cols = a_shape[1]
+    let b_rows = b_shape[0]
+    let b_rk = b_shape[1]
+    if b_rk != rk || a_cols != in_cols || b_rows != out_rows {
+        eprintln("[lora] WARN: shape mismatch for " + row[0] +
+                 " A=[" + to_string(rk) + "," + to_string(a_cols) + "]" +
+                 " B=[" + to_string(b_rows) + "," + to_string(b_rk) + "]" +
+                 " W=[" + to_string(out_rows) + "," + to_string(in_cols) + "]")
+        return w
+    }
+    // For each output row i:
+    //   bar_r = B[i,:]          (length rk)
+    //   delta[j] = sum_p bar_r[p] * A[p, j]
+    //   W[i, j] += scale * delta[j]
+    let mut i = 0
+    while i < out_rows {
+        // Pull B row
+        let b_off = i * rk
+        let mut j = 0
+        while j < in_cols {
+            let mut acc = 0.0
+            let mut p = 0
+            while p < rk {
+                acc = acc + b_flat[b_off + p] * a_flat[p * in_cols + j]
+                p = p + 1
+            }
+            let w_off = i * in_cols + j
+            w[w_off] = w[w_off] + scale * acc
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return w
+}
+
+fn merge_one_tensor(base_path, out_path, name, shape, count, data_off, adapter_rows) {
+    // Write per-tensor HEXAW2 header: name\nndim\nd0..\ncount\n
+    let mut hdr = name + "\n" + to_string(len(shape)) + "\n"
+    let mut d = 0
+    while d < len(shape) { hdr = hdr + to_string(shape[d]) + "\n"; d = d + 1 }
+    hdr = hdr + to_string(count) + "\n"
+    write_bytes_append(out_path, str_to_bytes(hdr))
+
+    if len(adapter_rows) == 0 {
+        // Byte-copy payload (64 MB chunks) — no f32 decode/encode.
+        let total = count * 4
+        let chunk = 64 * 1024 * 1024
+        let mut done = 0
+        while done < total {
+            let mut take = chunk
+            if done + take > total { take = total - done }
+            let bs = read_bytes_at(base_path, data_off + done, take)
+            let got = len(bs)
+            if got == 0 { break }
+            write_bytes_append(out_path, bs)
+            done = done + got
+        }
+        return
+    }
+    // We have adapters. Must be a 2-D tensor (LoRA only defined
+    // on matrices). If rank != 2 we fall back to pass-through.
+    if len(shape) != 2 {
+        eprintln("[lora] WARN: adapter target but rank=" + to_string(len(shape)) + " for " + name + " — passing through")
+        let total = count * 4
+        let chunk = 64 * 1024 * 1024
+        let mut done = 0
+        while done < total {
+            let mut take = chunk
+            if done + take > total { take = total - done }
+            let bs = read_bytes_at(base_path, data_off + done, take)
+            let got = len(bs)
+            if got == 0 { break }
+            write_bytes_append(out_path, bs)
+            done = done + got
+        }
+        return
+    }
+    let d_out = shape[0]
+    let d_in = shape[1]
+    // Decode base tensor to f32 flat
+    let total = count * 4
+    let bs = read_bytes_at(base_path, data_off, total)
+    let mut w = []
+    let mut k = 0
+    while k < total { w = w + [decode_f32_le(bs, k)]; k = k + 4 }
+    // Apply each adapter in order
+    let mut ai = 0
+    while ai < len(adapter_rows) {
+        w = apply_one_adapter(w, d_out, d_in, adapter_rows[ai])
+        ai = ai + 1
+    }
+    // Write back as f32 LE
+    let mut out_bytes = []
+    let mut j = 0
+    while j < count {
+        out_bytes = out_bytes + f32_to_bytes(w[j])
+        j = j + 1
+        // Flush every ~1M floats to cap buffer at ~4MB
+        if j % 1048576 == 0 {
+            write_bytes_append(out_path, out_bytes)
+            out_bytes = []
+        }
+    }
+    if len(out_bytes) > 0 { write_bytes_append(out_path, out_bytes) }
+}
+
+fn merge_all(base_path, out_path, plan) {
+    let fsz = file_size_native(base_path)
+    // Header: "HEXAW2\n<n>\n"
+    let hdr1 = read_line(base_path, 0, fsz)
+    if hdr1[0] != "HEXAW2" {
+        eprintln("[lora] ERROR: base is not HEXAW2 (saw '" + hdr1[0] + "')")
+        return 1
+    }
+    let hdr2 = read_line(base_path, hdr1[1], fsz)
+    let n_tensors = to_int(hdr2[0])
+    let mut pos = hdr2[1]
+
+    write_file(out_path, "")
+    write_bytes_append(out_path, str_to_bytes("HEXAW2\n" + to_string(n_tensors) + "\n"))
+
+    let mut t = 0
+    let mut hit = 0
+    while t < n_tensors {
+        let lr_name = read_line(base_path, pos, fsz); pos = lr_name[1]
+        let name = lr_name[0]
+        let lr_nd = read_line(base_path, pos, fsz); pos = lr_nd[1]
+        let ndim = to_int(lr_nd[0])
+        let mut shape = []
+        let mut d = 0
+        while d < ndim {
+            let lr_dim = read_line(base_path, pos, fsz); pos = lr_dim[1]
+            shape = shape + [to_int(lr_dim[0])]
+            d = d + 1
+        }
+        let lr_cnt = read_line(base_path, pos, fsz); pos = lr_cnt[1]
+        let count = to_int(lr_cnt[0])
+        let data_off = pos
+        let rows = plan_lookup(plan, name)
+        if len(rows) > 0 { hit = hit + 1 }
+        merge_one_tensor(base_path, out_path, name, shape, count, data_off, rows)
+        pos = pos + count * 4
+        if (t + 1) % 50 == 0 {
+            eprintln("[lora] merged " + to_string(t + 1) + "/" + to_string(n_tensors) + " hit=" + to_string(hit))
+        }
+        t = t + 1
+    }
+    eprintln("[lora] done — " + to_string(n_tensors) + " tensors, " + to_string(hit) + " with LoRA deltas -> " + out_path)
+    return 0
+}
+
+// ── CLI entry ───────────────────────────────────────────────
+fn split_commas(s) {
+    let parts = s.split(",")
+    let mut out = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i]
+        if len(p) > 0 { out = out + [p] }
+        i = i + 1
+    }
+    return out
+}
+
+fn cli_main() {
+    let a = args()
+    let mut base = ""
+    let mut adapters_str = ""
+    let mut output = ""
+    let mut alpha_override = "auto"
+    let mut i = 1
+    while i < len(a) {
+        let k = a[i]
+        if k == "--base" && i + 1 < len(a) { base = a[i + 1]; i = i + 2 }
+        else if k == "--adapters" && i + 1 < len(a) { adapters_str = a[i + 1]; i = i + 2 }
+        else if k == "--output" && i + 1 < len(a) { output = a[i + 1]; i = i + 2 }
+        else if k == "--alpha" && i + 1 < len(a) { alpha_override = a[i + 1]; i = i + 2 }
+        else { i = i + 1 }
+    }
+    if base == "" || adapters_str == "" || output == "" {
+        println("usage: lora_to_hexaw --base <base.hexaw> --adapters <dir1,dir2,...> --output <merged.hexaw> [--alpha auto]")
+        exit(1)
+    }
+    let adapter_dirs = split_commas(adapters_str)
+    eprintln("[lora] base=" + base)
+    eprintln("[lora] output=" + output)
+    eprintln("[lora] adapters=" + to_string(len(adapter_dirs)))
+    let mut plan = plan_new()
+    let mut ai = 0
+    while ai < len(adapter_dirs) {
+        let res = load_adapter(adapter_dirs[ai])
+        if res[1] != 0 { exit(res[1]) }
+        let rows = res[0]
+        let mut r = 0
+        while r < len(rows) {
+            plan = plan_add(plan, rows[r])
+            r = r + 1
+        }
+        eprintln("[lora] adapter " + to_string(ai) + " contributed " + to_string(len(rows)) + " deltas")
+        eprintln("[lora]   plan size=" + to_string(len(plan[0])))
+        ai = ai + 1
+    }
+    let rc = merge_all(base, output, plan)
+    exit(rc)
+}
+
+cli_main()
