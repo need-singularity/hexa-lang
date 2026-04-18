@@ -286,9 +286,28 @@ fn nb_lower_expr(m, b, e, env) -> int {
         return lower_ident_by_name(m, b, env, e.name, "i64")
     }
     if k == "Call" {
-        // Parser: Call { left = callee expr, args = array }. We only
-        // resolve direct-name callees (`foo(x)`) — method calls
-        // (`obj.foo()`) parse as Call over a Field, not supported yet.
+        // Parser: Call { left = callee expr, args = array }. Two shapes:
+        //   1. direct name  — `foo(x)`       → left.kind == "Ident"
+        //   2. method call  — `obj.foo(x)`   → left.kind == "Field"
+        // For (2) we lower receiver + args and dispatch as
+        //   `method_name(receiver, args...)` (UFCS-style). Resolution
+        //   still happens via lower_call_by_name — the method must
+        //   exist as a top-level fn keyed by its bare name. Builtin
+        //   lookup is ident-only (method call bypasses builtins).
+        if e.left.kind == "Field" {
+            let recv_vid = nb_lower_expr(m, b, e.left.left, env)
+            if recv_vid < 0 { return -1 }
+            let arg_vids = [recv_vid]
+            let mut i = 0
+            while i < len(e.args) {
+                let av = nb_lower_expr(m, b, e.args[i], env)
+                if av < 0 { return -1 }
+                arg_vids = arg_vids.push(av)
+                i = i + 1
+            }
+            let mname = e.left.name
+            return lower_call_by_name(m, b, mname, arg_vids, "i64")
+        }
         if e.left.kind != "Ident" { return -1 }
         let arg_vids = []
         let mut i = 0
@@ -307,6 +326,117 @@ fn nb_lower_expr(m, b, e, env) -> int {
             return nb_lower_builtin(m, b, cname, sym, arg_vids)
         }
         return lower_call_by_name(m, b, cname, arg_vids, "i64")
+    }
+    if k == "StructInit" || k == "StructLit" || k == "Struct" {
+        // Parser StructInit: { name: TypeName, fields: [FieldInit{name, left}] }.
+        // Lowering scheme: `alloc struct` → for each field, emit a
+        // `store` with operands (slot, field_idx, value_vid). We use
+        // positional field_idx (= declaration order in the literal).
+        // Field name → idx resolution against the actual struct decl
+        // is deferred to codegen; for the nb/POC subset this keeps the
+        // IR well-formed and self-consistent.
+        let slot = bld_alloc(m, b, "struct")
+        let fields = e.fields
+        if fields == "" { return slot }
+        let mut fi = 0
+        while fi < len(fields) {
+            let fld = fields[fi]
+            let fv = nb_lower_expr(m, b, fld.left, env)
+            if fv < 0 { return -1 }
+            bld_struct_store_field(m, b, slot, fi, fv)
+            fi = fi + 1
+        }
+        return slot
+    }
+    if k == "MatchExpr" || k == "Match" {
+        // MVP match lowering — if-else chain over scrutinee.
+        // Supported arm patterns:
+        //   IntLit / BoolLit  → cmp_eq dispatch
+        //   Ident "_"         → wildcard (default fall-through)
+        //   Ident (any other) → also wildcard (binding patterns not
+        //                       destructured — treated as catch-all;
+        //                       name binding is a future pass).
+        // Arm bodies run through nb_lower_block_value so trailing
+        // expr becomes the arm value; the merged phi yields the match
+        // result. The default arm is synthesized as bld_const_i64(0)
+        // when the user didn't write `_`.
+        let scrut_vid = nb_lower_expr(m, b, e.left, env)
+        if scrut_vid < 0 { return -1 }
+        let arms = e.arms
+        if arms == "" || len(arms) == 0 {
+            return bld_const_i64(m, b, 0)
+        }
+        // Build end block up-front — every arm terminates into it so we
+        // can phi the incoming values.
+        let end_bb = builder_create_block(m, b, "match.end")
+        let mut incoming = []  // array of [block_id, value_id]
+        let mut ai = 0
+        let na = len(arms)
+        let mut has_default = false
+        while ai < na {
+            let arm = arms[ai]
+            let pat = arm.left
+            let body = arm.body
+            let pk = pat.kind
+            // Detect wildcard / plain ident patterns.
+            let mut is_wild = false
+            if pk == "Wildcard" { is_wild = true }
+            if pk == "Ident" && pat.name == "_" { is_wild = true }
+            // Emit match-arm + match-cont blocks.
+            let arm_bb  = builder_create_block(m, b, "match.arm")
+            let cont_bb = builder_create_block(m, b, "match.cont")
+            if is_wild {
+                // Unconditional jump into arm body (default). Remaining
+                // arms become unreachable — we stop walking.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            // Literal-like pattern. Lower via nb_lower_expr; if it
+            // yields < 0 we conservatively treat the arm as wildcard
+            // (guards + complex patterns land in future pass).
+            let pv = nb_lower_expr(m, b, pat, env)
+            if pv < 0 {
+                // Treat as wildcard so MVP keeps compiling.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            let eq = bld_cmp_eq(m, b, scrut_vid, pv)
+            bld_branch(m, b, eq, arm_bb, cont_bb)
+            // Arm body
+            builder_switch_to(b, arm_bb)
+            let av = nb_lower_block_value(m, b, body, env)
+            if av < 0 { return -1 }
+            let arm_final = b.current_block
+            bld_jump(m, b, end_bb)
+            incoming = incoming.push([arm_final, av])
+            // Fall through to next arm on cont.
+            builder_switch_to(b, cont_bb)
+            ai = ai + 1
+        }
+        if !has_default {
+            // Synthesize default = 0.
+            let dv = bld_const_i64(m, b, 0)
+            let dflt_final = b.current_block
+            bld_jump(m, b, end_bb)
+            incoming = incoming.push([dflt_final, dv])
+        }
+        // Merge block: phi over every incoming arm value.
+        builder_switch_to(b, end_bb)
+        return bld_phi(m, b, incoming, "i64")
     }
     if k == "IfExpr" {
         // Value-producing if — emit branch + phi. The parser always wraps
