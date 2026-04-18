@@ -1,0 +1,194 @@
+#!hexa lax
+// self/attrs/noalloc.hexa — @noalloc 계약 attr
+// fn body performs no heap allocation — safe for hot loops, realtime paths
+
+use "self/attrs/core"
+
+fn meta_noalloc() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name = "noalloc"
+    m.category = "contract"
+    m.purpose = "fn body performs no heap allocation — safe for hot loops, realtime paths"
+    m.cost_rule = "enables stack-only codegen, zero-GC fast path"
+    m.side_effect = "forbids array/map literals, .push, concat, clone, to_string, string interpolation"
+    m.auto_test = "AST scan for alloc-producing builtins and literals"
+    m.example = "@noalloc\nfn dot(a: [float], b: [float]) -> float {\n    let mut s = 0.0\n    for i in 0..len(a) { s = s + a[i] * b[i] }\n    return s\n}"
+    m.implemented = true
+    return m
+}
+
+// 힙 할당을 유발하는 빌트인/메서드 토큰
+fn _noalloc_forbidden_builtins() {
+    return [
+        ".push(", ".concat(", ".slice(", ".map(", ".filter(", ".clone(",
+        "to_string(", "string(",
+        "Array(", "Map(", "Vec(", "new_array(", "new_map("
+    ]
+}
+
+// 라인 중 주석(//) 바깥에서 `pat` 이 출현하는 첫 위치. 없으면 -1.
+fn _noalloc_find_outside_comment(line: string, pat: string) -> int {
+    let c_idx = line.index_of("//")
+    let p_idx = line.index_of(pat)
+    if p_idx < 0 { return -1 }
+    if c_idx >= 0 && p_idx >= c_idx { return -1 }
+    return p_idx
+}
+
+// 배열 리터럴 탐지: `[` 뒤 바로 `]` 아닌 경우 (empty list 는 허용, non-empty 는 alloc)
+// 인덱싱 `a[i]` 와 구분하기 위해 `[` 앞 문자가 식별자/`)`/`]` 가 아닐 때만 리터럴로 간주.
+fn _noalloc_has_array_literal(line: string) -> bool {
+    let chars = line.chars()
+    let n = len(chars)
+    let mut i = 0
+    let mut in_str = false
+    let mut in_comment = false
+    while i < n {
+        let ch = chars[i]
+        if in_comment { return false }
+        if ch == '"' { in_str = !in_str }
+        if !in_str && ch == '/' && i + 1 < n && chars[i + 1] == '/' {
+            in_comment = true
+            i = i + 1
+            continue
+        }
+        if !in_str && ch == '[' {
+            // 앞 문자 체크: 식별자/`)`/`]` 뒤 `[` 는 인덱싱
+            let mut is_index = false
+            if i > 0 {
+                let prev = chars[i - 1]
+                let is_alnum = (prev >= 'a' && prev <= 'z')
+                    || (prev >= 'A' && prev <= 'Z')
+                    || (prev >= '0' && prev <= '9')
+                    || prev == '_'
+                if is_alnum || prev == ')' || prev == ']' { is_index = true }
+            }
+            if !is_index {
+                // non-empty literal 인지: 다음 non-space 가 `]` 가 아니면 alloc
+                let mut j = i + 1
+                while j < n {
+                    let nx = chars[j]
+                    if nx == ' ' || nx == '\t' { j = j + 1; continue }
+                    if nx == ']' { return false }
+                    return true
+                }
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// 레코드/맵 리터럴 탐지: `Ident {` 또는 `{ field:` 패턴만 alloc 으로 간주.
+// if/while/for/match/fn 블록 `{` 는 제외.
+fn _noalloc_has_record_literal(line: string) -> bool {
+    let t = line.trim()
+    // 블록 문법 키워드로 시작하는 줄은 `{` 가 제어 블록
+    if t.starts_with("if ") || t.starts_with("if(") { return false }
+    if t.starts_with("else") { return false }
+    if t.starts_with("while ") || t.starts_with("while(") { return false }
+    if t.starts_with("for ") || t.starts_with("for(") { return false }
+    if t.starts_with("match ") || t.starts_with("match(") { return false }
+    if t.starts_with("fn ") || t.starts_with("pub fn ") { return false }
+    if t.starts_with("struct ") || t.starts_with("enum ") { return false }
+    if t.starts_with("try") || t.starts_with("catch") { return false }
+    if t.starts_with("loop") { return false }
+
+    let chars = line.chars()
+    let n = len(chars)
+    let mut i = 0
+    let mut in_str = false
+    while i < n {
+        let ch = chars[i]
+        if ch == '"' { in_str = !in_str }
+        if !in_str && ch == '/' && i + 1 < n && chars[i + 1] == '/' { return false }
+        if !in_str && ch == '{' {
+            // 앞 문자: 식별자/`)` 면 record 구성자 (`Foo {`, `bar() {` ← 후자는 fn body 이지만 fn 라인은 위에서 제외됨)
+            // 여기선 `Ident {` 뒤 `field:` 가 오는지로 판단
+            let mut prev_alnum = false
+            if i > 0 {
+                let prev = chars[i - 1]
+                // 공백/알파 뒤 모두 가능 → 본문 내부 `field: val, other: val}` 탐지
+                prev_alnum = (prev >= 'a' && prev <= 'z')
+                    || (prev >= 'A' && prev <= 'Z')
+                    || (prev >= '0' && prev <= '9')
+                    || prev == '_'
+                    || prev == ' '
+                    || prev == '('
+                    || prev == ','
+                    || prev == '='
+            }
+            if prev_alnum {
+                // `{` 다음 non-space 스캔 — `ident:` 또는 `}` 체크
+                let mut j = i + 1
+                while j < n {
+                    let nx = chars[j]
+                    if nx == ' ' || nx == '\t' { j = j + 1; continue }
+                    if nx == '}' { return false }
+                    // `ident` 스캔 후 `:` 면 record literal
+                    let mut k = j
+                    while k < n {
+                        let kc = chars[k]
+                        let is_id = (kc >= 'a' && kc <= 'z')
+                            || (kc >= 'A' && kc <= 'Z')
+                            || (kc >= '0' && kc <= '9')
+                            || kc == '_'
+                        if !is_id { break }
+                        k = k + 1
+                    }
+                    if k > j && k < n && chars[k] == ':' { return true }
+                    return false
+                }
+                return false
+            }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// @noalloc fn 본문에 alloc 유발 토큰이 있으면 error
+fn check_noalloc(source: string, lines: [string]) {
+    let mut out = []
+    let pairs = find_attr_fn_pairs(lines, "noalloc")
+    let forbidden = _noalloc_forbidden_builtins()
+    for pair in pairs {
+        let fn_line = pair[1]
+        let body_range = fn_body_range(lines, fn_line)
+        let body_start = body_range[0]
+        let body_end = body_range[1]
+        let mut i = body_start
+        while i <= body_end {
+            let idx = i - 1
+            if idx < 0 || idx >= len(lines) { i = i + 1; continue }
+            let raw = lines[idx]
+            let t = raw.trim()
+            if t.starts_with("//") { i = i + 1; continue }
+            if t == "" { i = i + 1; continue }
+
+            // 1) 빌트인/메서드 토큰
+            for fb in forbidden {
+                if _noalloc_find_outside_comment(raw, fb) >= 0 {
+                    out = out.push(mk_msg4("noalloc", "error", i,
+                        "@noalloc fn body calls alloc-producing builtin: " + fb))
+                }
+            }
+
+            // 2) 비어있지 않은 배열 리터럴
+            if _noalloc_has_array_literal(raw) {
+                out = out.push(mk_msg4("noalloc", "error", i,
+                    "@noalloc fn body contains non-empty array literal ('[...]' allocates)"))
+            }
+
+            // 3) 레코드/맵 리터럴 (`Ident { field: ... }`)
+            if _noalloc_has_record_literal(raw) {
+                out = out.push(mk_msg4("noalloc", "error", i,
+                    "@noalloc fn body contains record/map literal ('{ field: ... }' allocates)"))
+            }
+
+            i = i + 1
+        }
+    }
+    return out
+}

@@ -1,0 +1,349 @@
+#!hexa lax
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/lsm_tree_pure.hexa — Log-structured merge tree (pure Hexa)
+//
+//  Append-optimized key-value store. Pure in-memory: active memtable +
+//  sorted immutable levels. No file I/O, no FFI.
+//
+//  Structure: tree = #{"memtable": [[k,v]...unsorted], "memtable_cap": int,
+//             "level_ratio": int, "levels": [[run, run, ...]]}
+//             run = sorted-by-key [[k, v]...]
+//
+//  Write  : put → memtable.push. len ≥ cap → sort + drop to level 0.
+//  Read   : memtable (newest→oldest) → levels 0..N (runs newest-first).
+//           First hit wins; tombstone hit → missing sentinel.
+//  Compact: level with ≥ level_ratio runs → sorted-merge to next level
+//           (latest-wins; tombstones dropped only on bottom-most level).
+//
+//  Public API:
+//      lsm_create(memtable_cap, level_ratio)   -> map
+//      lsm_put(t, key, value)                  -> map
+//      lsm_get(t, key)                         -> value | missing sentinel
+//      lsm_delete(t, key)                      -> map
+//      lsm_compact(t)                          -> map
+//      lsm_stats(t)                            -> map
+//      lsm_missing() / lsm_is_missing(v)       -> map / bool
+//
+//  Tombstone : #{"__tombstone": true}     Missing : #{"__lsm_missing": true}
+//  HX3 pitfalls handled: P1 no-semis, P15 let mut, P29 .push() returns new
+// ═══════════════════════════════════════════════════════════════════
+
+// _str_cmp — tri-state byte-wise lex compare (self-contained)
+@pure
+fn _str_cmp(a, b) {
+    let na = len(a)
+    let nb = len(b)
+    let lim = if na < nb { na } else { nb }
+    let mut i = 0
+    while i < lim {
+        let ca = ord(a.substring(i, i + 1))
+        let cb = ord(b.substring(i, i + 1))
+        if ca < cb { return 0 - 1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if na < nb { return 0 - 1 }
+    if na > nb { return 1 }
+    return 0
+}
+
+@pure
+pub fn lsm_missing() {
+    let mut m = #{}
+    m["__lsm_missing"] = true
+    return m
+}
+@pure
+pub fn lsm_is_missing(v) {
+    if type_of(v) != "map" { return false }
+    if has_key(v, "__lsm_missing") { return v["__lsm_missing"] == true }
+    return false
+}
+@pure
+fn _tombstone() {
+    let mut m = #{}
+    m["__tombstone"] = true
+    return m
+}
+@pure
+fn _is_tombstone(v) {
+    if type_of(v) != "map" { return false }
+    if has_key(v, "__tombstone") { return v["__tombstone"] == true }
+    return false
+}
+@pure
+pub fn lsm_create(memtable_cap, level_ratio) {
+    let cap = if memtable_cap < 1 { 1 } else { memtable_cap }
+    let ratio = if level_ratio < 2 { 2 } else { level_ratio }
+    let mut t = #{}
+    t["memtable"] = []
+    t["memtable_cap"] = cap
+    t["level_ratio"] = ratio
+    t["levels"] = []
+    return t
+}
+@pure
+fn _sort_pairs(pairs) {
+    let n = len(pairs)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out = out.push(pairs[i])
+        i = i + 1
+    }
+    let mut j = 1
+    while j < n {
+        let cur = out[j]
+        let mut k = j - 1
+        let mut placed = false
+        while k >= 0 && !placed {
+            let left = out[k]
+            if _str_cmp(left[0], cur[0]) > 0 {
+                out[k + 1] = left
+                k = k - 1
+            } else { placed = true }
+        }
+        out[k + 1] = cur
+        j = j + 1
+    }
+    return out
+}
+@pure
+fn _dedup_run(sorted_pairs) {
+    let n = len(sorted_pairs)
+    if n <= 1 { return sorted_pairs }
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let cur = sorted_pairs[i]
+        let mut skip = false
+        if i + 1 < n {
+            let nxt = sorted_pairs[i + 1]
+            if _str_cmp(cur[0], nxt[0]) == 0 { skip = true }
+        }
+        if !skip { out = out.push(cur) }
+        i = i + 1
+    }
+    return out
+}
+@pure
+fn _flush_memtable(t) {
+    let mem = t["memtable"]
+    if len(mem) == 0 { return t }
+    let run = _dedup_run(_sort_pairs(mem))
+    let levels = t["levels"]
+    let mut new_levels = []
+    if len(levels) == 0 {
+        new_levels = new_levels.push([run])
+    } else {
+        let mut lvl0 = [run]
+        let old0 = levels[0]
+        let mut i = 0
+        while i < len(old0) {
+            lvl0 = lvl0.push(old0[i])
+            i = i + 1
+        }
+        new_levels = new_levels.push(lvl0)
+        let mut j = 1
+        while j < len(levels) {
+            new_levels = new_levels.push(levels[j])
+            j = j + 1
+        }
+    }
+    let mut r = #{}
+    r["memtable"] = []
+    r["memtable_cap"] = t["memtable_cap"]
+    r["level_ratio"] = t["level_ratio"]
+    r["levels"] = new_levels
+    return r
+}
+pub fn lsm_put(t, key, value) {
+    let appended = t["memtable"].push([key, value])
+    let mut r = #{}
+    r["memtable"] = appended
+    r["memtable_cap"] = t["memtable_cap"]
+    r["level_ratio"] = t["level_ratio"]
+    r["levels"] = t["levels"]
+    if len(appended) >= t["memtable_cap"] { r = _flush_memtable(r) }
+    return r
+}
+pub fn lsm_delete(t, key) { return lsm_put(t, key, _tombstone()) }
+@pure
+fn _scan_memtable(mem, key) {
+    let mut i = len(mem) - 1
+    while i >= 0 {
+        let pair = mem[i]
+        if _str_cmp(pair[0], key) == 0 { return [true, pair[1]] }
+        i = i - 1
+    }
+    return [false, 0]
+}
+
+@pure
+fn _scan_run(run, key) {
+    let mut lo = 0
+    let mut hi = len(run) - 1
+    while lo <= hi {
+        let mid = (lo + hi) / 2
+        let pair = run[mid]
+        let c = _str_cmp(pair[0], key)
+        if c == 0 { return [true, pair[1]] }
+        if c < 0 { lo = mid + 1 } else { hi = mid - 1 }
+    }
+    return [false, 0]
+}
+
+@pure
+pub fn lsm_get(t, key) {
+    let mhit = _scan_memtable(t["memtable"], key)
+    if mhit[0] == true {
+        if _is_tombstone(mhit[1]) { return lsm_missing() }
+        return mhit[1]
+    }
+    let levels = t["levels"]
+    let mut li = 0
+    while li < len(levels) {
+        let lvl = levels[li]
+        let mut ri = 0
+        while ri < len(lvl) {
+            let rhit = _scan_run(lvl[ri], key)
+            if rhit[0] == true {
+                if _is_tombstone(rhit[1]) { return lsm_missing() }
+                return rhit[1]
+            }
+            ri = ri + 1
+        }
+        li = li + 1
+    }
+    return lsm_missing()
+}
+
+@pure
+fn _merge_two(newer, older, drop_tombstones) {
+    let na = len(newer)
+    let nb = len(older)
+    let mut out = []
+    let mut i = 0
+    let mut j = 0
+    while i < na && j < nb {
+        let pa = newer[i]
+        let pb = older[j]
+        let c = _str_cmp(pa[0], pb[0])
+        if c < 0 {
+            if !(drop_tombstones && _is_tombstone(pa[1])) { out = out.push(pa) }
+            i = i + 1
+        } else { if c > 0 {
+            if !(drop_tombstones && _is_tombstone(pb[1])) { out = out.push(pb) }
+            j = j + 1
+        } else {
+            if !(drop_tombstones && _is_tombstone(pa[1])) { out = out.push(pa) }
+            i = i + 1
+            j = j + 1
+        } }
+    }
+    while i < na {
+        let pa = newer[i]
+        if !(drop_tombstones && _is_tombstone(pa[1])) { out = out.push(pa) }
+        i = i + 1
+    }
+    while j < nb {
+        let pb = older[j]
+        if !(drop_tombstones && _is_tombstone(pb[1])) { out = out.push(pb) }
+        j = j + 1
+    }
+    return out
+}
+
+@pure
+fn _merge_level(runs, drop_tombstones) {
+    let n = len(runs)
+    if n == 0 { return [] }
+    if n == 1 {
+        if !drop_tombstones { return runs[0] }
+        let r0 = runs[0]
+        let mut out = []
+        let mut i = 0
+        while i < len(r0) {
+            let p = r0[i]
+            if !_is_tombstone(p[1]) { out = out.push(p) }
+            i = i + 1
+        }
+        return out
+    }
+    let mut acc = runs[n - 1]
+    let mut i = n - 2
+    while i >= 0 {
+        acc = _merge_two(runs[i], acc, drop_tombstones)
+        i = i - 1
+    }
+    return acc
+}
+
+@pure
+pub fn lsm_compact(t) {
+    let ratio = t["level_ratio"]
+    let levels = t["levels"]
+    let mut work = []
+    let mut i = 0
+    while i < len(levels) {
+        work = work.push(levels[i])
+        i = i + 1
+    }
+    let mut new_levels = []
+    let mut idx = 0
+    while idx < len(work) {
+        let lvl = work[idx]
+        if len(lvl) >= ratio {
+            let is_bottom = (idx == len(work) - 1)
+            let merged = _merge_level(lvl, is_bottom)
+            new_levels = new_levels.push([])
+            if idx + 1 >= len(work) { work = work.push([]) }
+            let nxt = work[idx + 1]
+            let mut new_nxt = [merged]
+            let mut k = 0
+            while k < len(nxt) {
+                new_nxt = new_nxt.push(nxt[k])
+                k = k + 1
+            }
+            work[idx + 1] = new_nxt
+        } else { new_levels = new_levels.push(lvl) }
+        idx = idx + 1
+    }
+    let mut r = #{}
+    r["memtable"] = t["memtable"]
+    r["memtable_cap"] = t["memtable_cap"]
+    r["level_ratio"] = ratio
+    r["levels"] = new_levels
+    return r
+}
+
+@pure
+pub fn lsm_stats(t) {
+    let mut s = #{}
+    s["memtable_size"] = len(t["memtable"])
+    s["memtable_cap"] = t["memtable_cap"]
+    s["level_ratio"] = t["level_ratio"]
+    let levels = t["levels"]
+    s["num_levels"] = len(levels)
+    let mut per_level_runs = []
+    let mut per_level_keys = []
+    let mut total = len(t["memtable"])
+    let mut i = 0
+    while i < len(levels) {
+        let lvl = levels[i]
+        per_level_runs = per_level_runs.push(len(lvl))
+        let mut keys_here = 0
+        let mut j = 0
+        while j < len(lvl) {
+            keys_here = keys_here + len(lvl[j])
+            j = j + 1
+        }
+        per_level_keys = per_level_keys.push(keys_here)
+        total = total + keys_here
+        i = i + 1
+    }
+    s["runs_per_level"] = per_level_runs
+    s["keys_per_level"] = per_level_keys
+    s["total_entries"] = total
+    return s
+}

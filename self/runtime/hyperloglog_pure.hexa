@@ -1,0 +1,260 @@
+#!hexa lax
+// ═══════════════════════════════════════════════════════════════════
+//  self/runtime/hyperloglog_pure.hexa — HyperLogLog (pure Hexa)
+//
+//  Approximate distinct-count (cardinality) estimation in sublinear
+//  space. Replaces `set(len(arr))` patterns at large scale.
+//  ROI item #14 in hexa-lang AI-native runtime primitives (~2.0x).
+//
+//  Public API:
+//      hll_create(precision)              -> map   (p in [4,16])
+//      hll_add(h, item)                   -> map
+//      hll_estimate(h)                    -> int   (raw harmonic-mean
+//                                                   estimate; see note)
+//      hll_merge(a, b)                    -> map   (register-wise max)
+//      hll_precision(h)                   -> int
+//      hll_registers(h)                   -> array
+//
+//  Properties:
+//      - m = 1 << p registers (byte-sized small ints)
+//      - ~1.04 / sqrt(m) relative error
+//      - p=14 -> m=16384 registers -> ~0.81% error, ~16 KB
+//      - Pure Hexa, no C/FFI, no external imports
+//
+//  NOTE on estimate(): returns raw αm * m^2 / Σ 2^-reg[i].
+//      The full HLL algorithm also applies:
+//        * small-range correction (linear counting) when E <= 2.5m and
+//          there exist zero registers
+//        * large-range correction for E > 2^32 / 30
+//      These are intentionally omitted here to keep the code simple.
+//      Callers needing those regimes should layer them on top.
+//
+//  HX3 pitfalls handled:
+//      P1   no semicolons
+//      P15  let mut for mutable variables
+//      P30  no unsigned int — emulate via & 0xFFFFFFFF
+//      Array writes via index assignment (persistent rebuild safe)
+// ═══════════════════════════════════════════════════════════════════
+
+let MASK32 = 0xFFFFFFFF
+
+// ── FNV-1a 32-bit constants ─────────────────────────────────────
+let FNV_OFFSET = 0x811C9DC5
+let FNV_PRIME  = 0x01000193
+
+// ── 32-bit multiply via 16-bit split (avoid int64 overflow) ─────
+@pure
+fn _mul32(a, b) {
+    let a32 = a & MASK32
+    let b32 = b & MASK32
+    let aL = a32 & 0xFFFF
+    let aH = (a32 / 65536) & 0xFFFF
+    let bL = b32 & 0xFFFF
+    let bH = (b32 / 65536) & 0xFFFF
+    let low = aL * bL
+    let mid = aL * bH + aH * bL
+    return (low + mid * 65536) & MASK32
+}
+
+// ── _hash32 ─────────────────────────────────────────────────────
+// FNV-1a over to_string(item), finalized with an avalanche step so
+// the top bits (used for bucketing) are well mixed.
+@pure
+fn _hash32(item) {
+    let s = to_string(item)
+    let n = len(s)
+    let mut h = FNV_OFFSET & MASK32
+    let mut i = 0
+    while i < n {
+        let byte = char_code(s, i)
+        h = (h ^ (byte & 0xFF)) & MASK32
+        h = _mul32(h, FNV_PRIME)
+        i = i + 1
+    }
+    // avalanche — xorshift the hash so top-p bits carry entropy
+    h = (h ^ (h / 65536)) & MASK32
+    h = _mul32(h, 0x85EBCA6B)
+    h = (h ^ (h / 8192)) & MASK32
+    h = _mul32(h, 0xC2B2AE35)
+    h = (h ^ (h / 65536)) & MASK32
+    return h & MASK32
+}
+
+// ── _pow2i (small integer power of two as int) ──────────────────
+@pure
+fn _pow2i(k) {
+    let mut r = 1
+    let mut i = 0
+    while i < k {
+        r = r * 2
+        i = i + 1
+    }
+    return r
+}
+
+// ── _rank (leading-zero-count + 1 over w-bit value) ─────────────
+// For an w-bit integer x, returns position of leftmost 1-bit counted
+// from the MSB side, 1-indexed. If x == 0, returns w + 1.
+@pure
+fn _rank(x, w) {
+    let mut v = x & MASK32
+    let mut r = 1
+    // highest bit of a w-bit value has weight 2^(w-1)
+    let mut mask = _pow2i(w - 1)
+    while mask > 0 {
+        if (v / mask) % 2 == 1 { return r }
+        r = r + 1
+        mask = mask / 2
+    }
+    return w + 1
+}
+
+// ── _alpha_m (bias-correction constant) ─────────────────────────
+// Standard HyperLogLog α_m lookup.
+@pure
+fn _alpha_m(m) {
+    if m == 16 { return 0.673 }
+    if m == 32 { return 0.697 }
+    if m == 64 { return 0.709 }
+    // m >= 128
+    return 0.7213 / (1.0 + 1.079 / (m * 1.0))
+}
+
+// ── _pow2f (2^k as float, k may be up to ~33) ───────────────────
+@pure
+fn _pow2f(k) {
+    let mut r = 1.0
+    let mut i = 0
+    while i < k {
+        r = r * 2.0
+        i = i + 1
+    }
+    return r
+}
+
+// ── _floor_int (local copy; avoids import) ──────────────────────
+@pure
+fn _floor_int(x) {
+    if x >= 0.0 {
+        let mut fl = 0
+        let mut acc = 0.0
+        while acc + 1.0 <= x {
+            fl = fl + 1
+            acc = acc + 1.0
+        }
+        return fl
+    }
+    let mut fl = 0
+    let mut acc = 0.0
+    while acc > x {
+        fl = fl - 1
+        acc = acc - 1.0
+    }
+    return fl
+}
+
+// ── hll_create ──────────────────────────────────────────────────
+// Returns #{precision: int, m: int, registers: [int]}.
+// precision is clamped to [4, 16].
+pub fn hll_create(precision) {
+    let mut p = precision
+    if p < 4 { p = 4 }
+    if p > 16 { p = 16 }
+    let m = _pow2i(p)
+    let mut regs = []
+    let mut i = 0
+    while i < m {
+        regs.push(0)
+        i = i + 1
+    }
+    let mut r = #{}
+    r["precision"] = p
+    r["m"] = m
+    r["registers"] = regs
+    return r
+}
+
+// ── hll_add ─────────────────────────────────────────────────────
+// Hash item, bucket = top p bits, ρ = rank over remaining 32-p bits,
+// register := max(current, ρ).
+pub fn hll_add(h, item) {
+    let p = h["precision"]
+    let m = h["m"]
+    let regs = h["registers"]
+    let hv = _hash32(item)
+    // top p bits -> bucket index
+    let shift = _pow2i(32 - p)
+    let idx = (hv / shift) & (m - 1)
+    // remaining (32-p) bits -> value for rank
+    let w = 32 - p
+    let mask = _pow2i(w) - 1
+    let remainder = hv & mask
+    let rho = _rank(remainder, w)
+    if rho > regs[idx] { regs[idx] = rho }
+    let mut r = #{}
+    r["precision"] = p
+    r["m"] = m
+    r["registers"] = regs
+    return r
+}
+
+// ── hll_estimate ────────────────────────────────────────────────
+// Raw harmonic-mean estimator: αm * m^2 / Σ 2^-reg[i].
+// See header NOTE re: small/large range corrections (omitted).
+@pure
+pub fn hll_estimate(h) {
+    let m = h["m"]
+    let regs = h["registers"]
+    let mut sum = 0.0
+    let mut i = 0
+    while i < m {
+        let r = regs[i]
+        // 2^-r as float: 1.0 / _pow2f(r)
+        sum = sum + 1.0 / _pow2f(r)
+        i = i + 1
+    }
+    if sum <= 0.0 { return 0 }
+    let alpha = _alpha_m(m)
+    let mf = m * 1.0
+    let estimate = alpha * mf * mf / sum
+    return _floor_int(estimate + 0.5)
+}
+
+// ── hll_merge ───────────────────────────────────────────────────
+// Element-wise max of registers. Precisions must match.
+pub fn hll_merge(a, b) {
+    let pa = a["precision"]
+    let pb = b["precision"]
+    if pa != pb { return a }
+    let m = a["m"]
+    let ra = a["registers"]
+    let rb = b["registers"]
+    let mut regs = []
+    let mut i = 0
+    while i < m {
+        let va = ra[i]
+        let vb = rb[i]
+        if va >= vb {
+            regs.push(va)
+        } else {
+            regs.push(vb)
+        }
+        i = i + 1
+    }
+    let mut r = #{}
+    r["precision"] = pa
+    r["m"] = m
+    r["registers"] = regs
+    return r
+}
+
+// ── hll_precision / hll_registers (accessors) ───────────────────
+@pure
+pub fn hll_precision(h) {
+    return h["precision"]
+}
+
+@pure
+pub fn hll_registers(h) {
+    return h["registers"]
+}
