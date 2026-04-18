@@ -5356,6 +5356,34 @@ HexaVal hexa_tensor_mul_scalar(HexaVal a, HexaVal sv) {
     return out;
 }
 
+// hadamard(a, b): elementwise product (same semantics as tensor_add but *).
+// Matches interpreter hexa_full.hexa:10496 behavior.
+HexaVal hexa_hadamard(HexaVal a, HexaVal b) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return out;
+    int64_t na = (int64_t)HX_ARR_LEN(a), nb = (int64_t)HX_ARR_LEN(b);
+    int64_t k = na < nb ? na : nb;
+    for (int64_t i = 0; i < k; i++) {
+        double va = __hx_to_double(hexa_array_get(a, i));
+        double vb = __hx_to_double(hexa_array_get(b, i));
+        out = hexa_array_push(out, hexa_float(va * vb));
+    }
+    return out;
+}
+
+// silu(a): elementwise SiLU (Swish-1) activation: x / (1 + exp(-x)).
+// Matches interpreter silu path (standalone — used by SwiGLU decomposition).
+HexaVal hexa_silu(HexaVal a) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    for (int64_t i = 0; i < n; i++) {
+        double x = __hx_to_double(hexa_array_get(a, i));
+        out = hexa_array_push(out, hexa_float(x / (1.0 + exp(-x))));
+    }
+    return out;
+}
+
 // rms_norm(x, gamma, eps): gamma[i] * x[i] / sqrt(mean(x^2) + eps).
 // gamma may be array (per-element scale) or scalar (uniform scale).
 HexaVal hexa_rms_norm(HexaVal x, HexaVal gamma, HexaVal epsv) {
