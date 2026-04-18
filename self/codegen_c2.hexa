@@ -39,20 +39,63 @@ fn _hexa_name_is_reserved(s) {
     if s == "log" { return true }
     if s == "log2" { return true }
     if s == "log10" { return true }
+    if s == "log1p" { return true }
     if s == "exp" { return true }
     if s == "exp2" { return true }
+    if s == "expm1" { return true }
     if s == "sqrt" { return true }
+    if s == "cbrt" { return true }
+    if s == "hypot" { return true }
     if s == "pow" { return true }
     if s == "ceil" { return true }
     if s == "floor" { return true }
     if s == "round" { return true }
+    if s == "trunc" { return true }
     if s == "abs" { return true }
     if s == "sin" { return true }
     if s == "cos" { return true }
     if s == "tan" { return true }
+    if s == "asin" { return true }
+    if s == "acos" { return true }
     if s == "atan" { return true }
     if s == "atan2" { return true }
+    if s == "sinh" { return true }
+    if s == "cosh" { return true }
+    if s == "tanh" { return true }
+    if s == "fmax" { return true }
+    if s == "fmin" { return true }
     if s == "fma" { return true }
+    if s == "erf" { return true }
+    if s == "erfc" { return true }
+    if s == "gamma" { return true }
+    if s == "lgamma" { return true }
+    if s == "tgamma" { return true }
+    // string.h functions
+    if s == "strchr" { return true }
+    if s == "strrchr" { return true }
+    if s == "strstr" { return true }
+    if s == "strcmp" { return true }
+    if s == "strncmp" { return true }
+    if s == "strcpy" { return true }
+    if s == "strncpy" { return true }
+    if s == "memcpy" { return true }
+    if s == "memcmp" { return true }
+    if s == "memset" { return true }
+    // stdio.h / stdlib.h functions
+    if s == "printf" { return true }
+    if s == "fprintf" { return true }
+    if s == "sprintf" { return true }
+    if s == "snprintf" { return true }
+    if s == "scanf" { return true }
+    if s == "fopen" { return true }
+    if s == "fclose" { return true }
+    if s == "fread" { return true }
+    if s == "fwrite" { return true }
+    // main() formal param names — codegen emits `int main(int argc, char** argv)`.
+    // User top-level `let argv = args()` would otherwise shadow the param, causing
+    // HexaVal-vs-char** type errors throughout the main body (anima-core/hub.hexa).
+    if s == "argv" { return true }
+    if s == "argc" { return true }
     // C type keywords that conflict with user-defined hexa names
     if s == "int" { return true }
     if s == "float" { return true }
@@ -713,7 +756,16 @@ fn codegen_c2(ast) {
         _lfw_i = _lfw_i + 1
     }
     // C3: emit lambda definitions (static C fns with __env first param)
-    parts = parts.push(_lambda_def_parts.join(""))
+    // FIX-C (2026-04-19): counter-driven per-slot read — replaces
+    // `_lambda_def_parts.join("")` which hit T33-class arena aliasing on the
+    // large body payloads. Symptom (train_v14.hexa): lambda bodies truncated
+    // into fragments ("tr(\"exaVal __hexa_sl_6;" / "exaVal __hexa_sl_4;" /
+    // "_hexa_sl_5int main…"). Mirror of fcf275f4 (IC) + c461f60a (fwd sigs).
+    let mut _ldp_i = 0
+    while _ldp_i < _lambda_counter {
+        parts = parts.push(_lambda_def_parts[_ldp_i])
+        _ldp_i = _ldp_i + 1
+    }
     parts = parts.push(fn_parts.join(""))
     // T3 fix: emit `int main(int argc, char** argv)` + hexa_set_args(argc, argv)
     // 이전 구현은 `int main()` 으로 argv 를 받지 않아 args() 가 항상 빈 배열을
@@ -1456,16 +1508,21 @@ fn gen2_stmt(node, depth) {
                 _known_float_add(node.name)
             }
         }
+        // 2026-04-19: local let decls must match Ident-reference mangling so
+        // names in the reserved set (fmax, j1, argv, printf, …) don't land
+        // with a bare `HexaVal j1 = …;` declaration while every read emits
+        // `u_j1`. Bug surfaced on training/alm_val.hexa `let j1 = judge_…`.
+        let _local_name = _hexa_mangle_ident(node.name)
         // M975: register promotion — if value == "__reg_promote__", emit `register`
         if k == "LetMutStmt" && node.value == "__reg_promote__" {
-            return pad + "register HexaVal " + node.name + " = " + init + "; /* reg-promoted */\n"
+            return pad + "register HexaVal " + _local_name + " = " + init + "; /* reg-promoted */\n"
         }
         // bt 72: if this name was hoisted (or matches a param), emit plain
         // assignment to avoid C "redefinition" errors from shadow semantics.
         if _gen2_has_decl(node.name) {
-            return pad + node.name + " = " + init + ";\n"
+            return pad + _local_name + " = " + init + ";\n"
         }
-        return pad + "HexaVal " + node.name + " = " + init + ";\n"
+        return pad + "HexaVal " + _local_name + " = " + init + ";\n"
     }
 
     if k == "ConstStmt" {
@@ -1949,6 +2006,46 @@ fn gen2_method_builtin(obj_expr, method, args) {
     return "(fprintf(stderr, \"CODEGEN ERROR: unknown builtin method: " + method + "\\n\"), exit(1), hexa_void())"
 }
 
+// ── BinOp `+` chain flattener ────────────────────────────────
+// Long string-concat chains (e.g. anima training launcher files,
+// 100+ segments) blow past clang's default -fbracket-depth=256 when
+// emitted as left-fold hexa_add(hexa_add(...)). We detect `+` chains
+// with ≥ _LONG_CONCAT_THRESH operands and emit them as a single
+// compound-literal call to hexa_concat_many().
+let _LONG_CONCAT_THRESH = 16
+
+// Count operands in a left-leaning `+` chain rooted at `node`.
+// A `+` BinOp with a `+` BinOp left child extends the chain; anything
+// else is a leaf. Left-associative parse means right children are
+// always leaves at this chain level.
+fn _plus_chain_len(node) {
+    let mut n = 1
+    let mut cur = node
+    while type_of(cur) != "string" && cur.kind == "BinOp" && cur.op == "+" {
+        n = n + 1
+        cur = cur.left
+    }
+    return n
+}
+
+// Collect flat list of operand-expression C-strings in left-to-right order.
+fn _collect_plus_parts(node) {
+    let mut parts = []
+    let mut cur = node
+    while type_of(cur) != "string" && cur.kind == "BinOp" && cur.op == "+" {
+        parts = parts.push(gen2_expr(cur.right))
+        cur = cur.left
+    }
+    parts = parts.push(gen2_expr(cur))
+    let mut flat = []
+    let mut i = len(parts) - 1
+    while i >= 0 {
+        flat = flat.push(parts[i])
+        i = i - 1
+    }
+    return flat
+}
+
 fn gen2_expr(node) {
     let k = node.kind
 
@@ -2059,6 +2156,25 @@ fn gen2_expr(node) {
                 }
                 // (a*b) - c  →  fma(a, b, -c)
                 return "hexa_fma(" + fa + ", " + fb + ", hexa_sub(hexa_int(0), " + fc + "))"
+            }
+        }
+        // Long `+` chain → hexa_concat_many compound-literal call.
+        // Clang default -fbracket-depth=256 rejects deeply nested hexa_add(
+        // hexa_add(...)); anima launcher files routinely hit 100+ segments.
+        // Only engage for op == "+" and chain ≥ _LONG_CONCAT_THRESH.
+        if op == "+" {
+            let _chain_n = _plus_chain_len(node)
+            if _chain_n >= _LONG_CONCAT_THRESH {
+                let _parts = _collect_plus_parts(node)
+                let _n = len(_parts)
+                let mut _body = ""
+                let mut _pi = 0
+                while _pi < _n {
+                    if _pi > 0 { _body = _body + ", " }
+                    _body = _body + _parts[_pi]
+                    _pi = _pi + 1
+                }
+                return "hexa_concat_many(" + to_string(_n) + ", (HexaVal[]){" + _body + "})"
             }
         }
         let l = gen2_expr(node.left)
@@ -2258,6 +2374,34 @@ fn gen2_expr(node) {
             }
             if name == "u_floor" {
                 return "hexa_u_floor(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            // FIX-A (Anima ML eval unblock, 2026-04-19): 8 tensor_* / rms_norm /
+            // softmax / matmul fallback builtins. C syms live in self/runtime.c
+            // next to hexa_dict_keys. Callers wanting BLAS fast-path must still
+            // `use "self/ml/..."` explicitly for optimized kernels.
+            if name == "tensor_zeros" {
+                return "hexa_tensor_zeros(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "tensor_slice" {
+                return "hexa_tensor_slice(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ")"
+            }
+            if name == "tensor_add" {
+                return "hexa_tensor_add(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "tensor_dot" {
+                return "hexa_tensor_dot(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "tensor_mul_scalar" {
+                return "hexa_tensor_mul_scalar(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "rms_norm" {
+                return "hexa_rms_norm(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ")"
+            }
+            if name == "softmax" {
+                return "hexa_softmax(" + gen2_expr(node.args[0]) + ")"
+            }
+            if name == "matmul" {
+                return "hexa_matmul(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ", " + gen2_expr(node.args[2]) + ", " + gen2_expr(node.args[3]) + ", " + gen2_expr(node.args[4]) + ")"
             }
             if name == "format" {
                 // format(template, args...) -> hexa_format_n with array of args
@@ -4169,6 +4313,15 @@ fn _is_builtin_name(name) {
     // FIX-A (Anima serving unblock, 2026-04-19)
     if name == "append" { return true }
     if name == "u_floor" { return true }
+    // FIX-A (Anima ML eval unblock, 2026-04-19): 8 tensor/ML fallback builtins.
+    if name == "tensor_zeros" { return true }
+    if name == "tensor_slice" { return true }
+    if name == "tensor_add" { return true }
+    if name == "tensor_dot" { return true }
+    if name == "tensor_mul_scalar" { return true }
+    if name == "rms_norm" { return true }
+    if name == "softmax" { return true }
+    if name == "matmul" { return true }
     if name == "true" { return true }
     if name == "false" { return true }
     return false
@@ -4379,7 +4532,33 @@ fn gen2_lambda_expr(node) {
     // decl string here triggered T33-class freelist aliasing — first element
     // eaten, strings truncated in output C. Slot index == `id`.
     _lambda_fwd_sigs = _lambda_fwd_sigs.push(p)
-    let fn_def = "HexaVal " + fn_name + "(" + p + ") {\n" + body_parts.join("") + "    return hexa_void();\n}\n\n"
+    // FIX-C (2026-04-19): route fn_def through a local array + .join("")
+    // instead of chained `+` concats. `hexa_str_concat` arena-allocates under
+    // HEXA_VAL_ARENA (default ON); when gen2_lambda_expr returns via
+    // __hexa_fn_arena_return, the arena scope pops and the arena-backed
+    // fn_def stored inside module-level _lambda_def_parts becomes dangling,
+    // letting later allocations stomp lambda bodies — producing fragments
+    // like `tr("exaVal __hexa_sl_6;` / `exaVal __hexa_sl_4;` in emitted C
+    // (repro: train_v14.hexa). `hexa_str_join` uses `malloc` directly
+    // (runtime.c:3293) so the joined result escapes the arena and survives
+    // the scope pop. Complements c461f60a (_lambda_fwd_sigs counter-driven
+    // regen): here the payload is too large to regenerate from captured
+    // state because body emission has side effects on
+    // _lambda_counter/_ic_counter/_strlit_counter (nested lambdas, IC slots,
+    // string literals) that must not re-run.
+    let mut _fn_def_parts = []
+    _fn_def_parts = _fn_def_parts.push("HexaVal ")
+    _fn_def_parts = _fn_def_parts.push(fn_name)
+    _fn_def_parts = _fn_def_parts.push("(")
+    _fn_def_parts = _fn_def_parts.push(p)
+    _fn_def_parts = _fn_def_parts.push(") {\n")
+    let mut _bpi = 0
+    while _bpi < len(body_parts) {
+        _fn_def_parts = _fn_def_parts.push(body_parts[_bpi])
+        _bpi = _bpi + 1
+    }
+    _fn_def_parts = _fn_def_parts.push("    return hexa_void();\n}\n\n")
+    let fn_def = _fn_def_parts.join("")
     _lambda_def_parts = _lambda_def_parts.push(fn_def)
 
     // Construct the closure value at the callsite.
@@ -4613,7 +4792,12 @@ fn codegen_c2_full(ast) {
         _lfw_i_full = _lfw_i_full + 1
     }
     // Insert lambda definitions before user functions
-    out_parts = out_parts.push(_lambda_def_parts.join(""))
+    // FIX-C (2026-04-19): counter-driven per-slot read — see codegen_c2 note.
+    let mut _ldp_i_full = 0
+    while _ldp_i_full < _lambda_counter {
+        out_parts = out_parts.push(_lambda_def_parts[_ldp_i_full])
+        _ldp_i_full = _ldp_i_full + 1
+    }
     out_parts = out_parts.push(fn_parts.join(""))
     // T3 fix: emit `int main(int argc, char** argv)` + hexa_set_args.
     out_parts = out_parts.push("int main(int argc, char** argv) {\n")
