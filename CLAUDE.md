@@ -33,7 +33,7 @@
 -->
 
 commands: shared/config/commands.json — autonomous 블록으로 Claude Code가 작업 중 smash/free/todo/go/keep 자율 판단·실행. ml 명령어: shared/hexa-lang/ml-commands.json (hexa-lang 전용)
-rules: shared/rules/common.json (R0~R27) + shared/rules/hexa-lang.json (HX1~HX7)
+rules: shared/rules/common.json (R0~R27) + shared/rules/hexa-lang.json (HX1~HX11)
 raw: `hexa self/raw_cli.hexa` — 6 규칙 SSOT. 새 세션 인지 불필요 (pre-commit 강제). 상세: shared/hexa-lang/raw.json
 L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
 attrs: `hexa self/attr_cli.hexa` (카탈로그), `... show <name>` (상세), `... lint <file>` (attr check 실행), `... policy <path>` (.hexa-attrs forbid gate) — 30 @attr SSOT = self/attrs/*.hexa (각 attr = meta + check fn 일체)
@@ -63,10 +63,18 @@ hexa-lang 핵심 규칙:
        - PoC 검증: codegen_native.hexa → zero-tool ARM64 Mach-O (42 출력, clang 0)
        - 남은 것: P7-6 스케일업(hexa_full.hexa 전체 native 컴파일) + P7-7 fixpoint
        - 완료 시: hexa_v2 → hexa, hexa_stage0 → hexa (파일명 정리)
+  HX12: AI-native strict 기본값 + grandfather 모델 (2026-04-19)
+       - 신규 `.hexa` = rule #9 default-strict 적용 (L2 literal-ban / L3 brace-lock / L4 O(n²)-concat 등)
+       - 레거시 2종 grandfather 경로:
+         (a) 파일 상단 `#!hexa lax` shebang = per-file opt-out (명시적)
+         (b) `.hexa-lax-baseline` 리포 루트 파일 = 일괄 opt-out (점진적 drift 제거용)
+       - pre-commit hook: `ai_native_lint.hexa --default-strict` 가 staged .hexa 검증, baseline 또는 `#!hexa lax` 둘 중 하나면 lax 처리
+       - 목표: baseline 파일을 시간 경과에 따라 줄여가며 strict 로 수렴 — "새로 쓰는 코드는 엄격, 옛 코드는 단계적 청소"
+       - baseline 업데이트: `find . -name "*.hexa" ... | sort > .hexa-lax-baseline` 재생성 시 수동 PR
 
 ref:
   rules     shared/rules/common.json             R0~R27
-  project   shared/rules/hexa-lang.json          HX1~HX7
+  project   shared/rules/hexa-lang.json          HX1~HX11
   lock      shared/rules/lockdown.json           L0/L1/L2
   cdo       shared/rules/convergence_ops.json    CDO 수렴
   registry  shared/config/projects.json          7프로젝트
@@ -81,6 +89,8 @@ ref:
   attrs     self/attrs/                          30 @attr 모듈 (각 attr.hexa = meta+check), _registry.hexa 디스패치
   attr-cli  self/attr_cli.hexa                   카탈로그/상세/lint/policy CLI
   policy    .hexa-attrs                          프로젝트 정책 (forbid/allow 선언)
+  lax-base  .hexa-lax-baseline                   rule #9 grandfather 파일 목록 (HX12)
+  lint      scripts/ai_native_lint.hexa          L1/L2/L3/L4 + default-strict + baseline
   poc       self/poc/                            33 handler 모듈 (filename=dispatch-key), common.hexa + _dispatch.hexa (자동 생성)
   poc-lint  scripts/poc_lint.hexa                R1/R2/R3 규약 검증 (filename→fn, @kinds/@name/@method, unique keys)
   poc-gen   scripts/poc_gen_dispatch.hexa        dispatcher codegen — self/poc/ 스캔 → _dispatch.hexa (poc_lower_expr/stmt + poc_ex_call)
