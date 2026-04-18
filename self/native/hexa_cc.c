@@ -301,6 +301,17 @@ HexaVal tokenize(HexaVal source) {
     HexaVal col = hexa_int(1);
     HexaVal total = hexa_int(hexa_len(chars));
     HexaVal paren_depth = hexa_int(0);
+    /* POSIX shebang: if source begins with `#!`, skip the entire first line
+       so `#!/usr/bin/env python3` does not leak `usr`, `bin`, etc. as idents. */
+    if (HX_BOOL(hexa_cmp_ge(total, hexa_int(2)))
+        && hexa_truthy(hexa_eq(hexa_index_get(chars, hexa_int(0)), hexa_str("#")))
+        && hexa_truthy(hexa_eq(hexa_index_get(chars, hexa_int(1)), hexa_str("!")))) {
+        while (HX_BOOL(hexa_cmp_lt(pos, total))
+               && (!hexa_truthy(hexa_eq(hexa_index_get(chars, pos), hexa_str("\n"))))) {
+            pos = hexa_add(pos, hexa_int(1));
+            col = hexa_add(col, hexa_int(1));
+        }
+    }
     while (HX_BOOL(hexa_cmp_lt(pos, total))) {
         HexaVal ch = hexa_index_get(chars, pos);
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(ch, hexa_str(" "))) || hexa_truthy(hexa_eq(ch, hexa_str("\t"))))) || hexa_truthy(hexa_eq(ch, hexa_str("\r")))))) {
@@ -6856,6 +6867,19 @@ HexaVal _gen2_arena_wrap;
 HexaVal _method_registry;
 HexaVal _lambda_counter;
 HexaVal _lambda_def_parts;
+/* FIX-A (Anima serving unblock, 2026-04-19): __hexa_lambda_N fwd decls. */
+HexaVal _lambda_fwd_parts;
+
+/* FIX-A (2026-04-19): normalize a lambda/fn param entry to a bare name.
+ * `fn(x)` parser emits Param{name,value}; `|x|` emits a bare string. Without
+ * this both stringify-as-"<value>" in C emit and leak as free vars (bound
+ * compare fails). Mirrors self/codegen_c2.hexa:_lambda_param_name. */
+static HexaVal _lambda_param_name_c(HexaVal p) {
+    if (hexa_truthy(hexa_eq(hexa_type_of(p), hexa_str("string")))) return p;
+    /* Object: extract .name — use hexa_map_get (uncached) to avoid IC-slot
+     * collisions with the calling context. */
+    return hexa_to_string(hexa_map_get(p, "name"));
+}
 HexaVal _ic_counter;
 HexaVal _comptime_const_names;
 HexaVal _comptime_const_nodes;
@@ -8385,6 +8409,7 @@ HexaVal codegen_c2(HexaVal ast) {
     _known_set_init();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
+    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
     _ic_counter = hexa_int(0);
     _strlit_keys = hexa_array_new();
     _strlit_ids = hexa_array_new();
@@ -9668,6 +9693,10 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
     if (hexa_truthy(hexa_eq(method, hexa_str("push")))) {
         return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")")));
     }
+    /* FIX-A (Anima serving unblock, 2026-04-19): `.append(x)` alias of `.push(x)` */
+    if (hexa_truthy(hexa_eq(method, hexa_str("append")))) {
+        return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push("), obj_expr), hexa_str(", ")), gen2_expr(hexa_index_get(args, hexa_int(0)))), hexa_str(")")));
+    }
     if (hexa_truthy(hexa_eq(method, hexa_str("len")))) {
         return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_int(hexa_len("), obj_expr), hexa_str("))")));
     }
@@ -10076,6 +10105,17 @@ HexaVal gen2_expr(HexaVal node) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_dict_keys("), a), hexa_str(")")));
             }
+            /* FIX-A (Anima serving unblock, 2026-04-19): append + u_floor builtins */
+            if (hexa_truthy(hexa_eq(name, hexa_str("append")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                b = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(1)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push("), a), hexa_str(", ")), b), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("u_floor")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                b = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(1)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_u_floor("), a), hexa_str(", ")), b), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("format")))) {
                 HexaVal fmt_args = hexa_str("hexa_array_new()");
                 HexaVal fi = hexa_int(1);
@@ -10092,6 +10132,10 @@ HexaVal gen2_expr(HexaVal node) {
                 return __hexa_fn_arena_return(hexa_str("(fprintf(stderr, \"\\n\"), hexa_void())"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("args")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_args()"));
+            }
+            /* FIX-A (Anima serving unblock, 2026-04-19): argv() alias of args() */
+            if (hexa_truthy(hexa_eq(name, hexa_str("argv")))) {
                 return __hexa_fn_arena_return(hexa_str("hexa_args()"));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("exec")))) {
@@ -10547,6 +10591,10 @@ HexaVal gen2_expr(HexaVal node) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("({ HexaVal __mr = "), __saved_obj), hexa_str("; ")), chain), hexa_str("; })")));
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("push")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_508), hexa_int(0)))), hexa_str(")")));
+            }
+            /* FIX-A (Anima serving unblock, 2026-04-19): `.append(x)` alias of `.push(x)` */
+            if (hexa_truthy(hexa_eq(method, hexa_str("append")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_array_push("), obj), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_508), hexa_int(0)))), hexa_str(")")));
             }
             if (hexa_truthy(hexa_eq(method, hexa_str("len")))) {
@@ -12076,6 +12124,10 @@ HexaVal _is_builtin_name(HexaVal name) {
     if (hexa_truthy(hexa_eq(name, hexa_str("args")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
+    /* FIX-A (Anima serving unblock, 2026-04-19): argv() alias of args() */
+    if (hexa_truthy(hexa_eq(name, hexa_str("argv")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
     if (hexa_truthy(hexa_eq(name, hexa_str("exec")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
@@ -12147,6 +12199,13 @@ HexaVal _is_builtin_name(HexaVal name) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("dict_keys")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    /* FIX-A (Anima serving unblock, 2026-04-19): append + u_floor */
+    if (hexa_truthy(hexa_eq(name, hexa_str("append")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("u_floor")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("true")))) {
@@ -12253,7 +12312,8 @@ HexaVal gen2_collect_free(HexaVal node, HexaVal bound, HexaVal out) {
         HexaVal inner_bound = bound;
         HexaVal pi = hexa_int(0);
         while (HX_BOOL(hexa_cmp_lt(pi, hexa_int(hexa_len(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_770)))))) {
-            inner_bound = hexa_array_push(inner_bound, hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_771), pi));
+            /* FIX-A 2026-04-19: normalize Param obj/string. */
+            inner_bound = hexa_array_push(inner_bound, _lambda_param_name_c(hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_771), pi)));
             pi = hexa_add(pi, hexa_int(1));
         }
         return __hexa_fn_arena_return(gen2_collect_free(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_772), inner_bound, out));
@@ -12314,8 +12374,9 @@ HexaVal gen2_lambda_expr(HexaVal node) {
     HexaVal fn_name = hexa_add(hexa_str("__hexa_lambda_"), hexa_to_string(id));
     HexaVal bound = hexa_array_new();
     HexaVal pi = hexa_int(0);
+    /* FIX-A 2026-04-19: normalize Param obj/string both here and in params-list build. */
     while (HX_BOOL(hexa_cmp_lt(pi, hexa_int(hexa_len(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_796)))))) {
-        bound = hexa_array_push(bound, hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_797), pi));
+        bound = hexa_array_push(bound, _lambda_param_name_c(hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_797), pi)));
         pi = hexa_add(pi, hexa_int(1));
     }
     HexaVal free_vars = gen2_collect_free(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_798), bound, hexa_array_new());
@@ -12324,7 +12385,7 @@ HexaVal gen2_lambda_expr(HexaVal node) {
     params = hexa_array_push(params, hexa_str("HexaVal __env"));
     pi = hexa_int(0);
     while (HX_BOOL(hexa_cmp_lt(pi, hexa_int(hexa_len(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_800)))))) {
-        params = hexa_array_push(params, hexa_add(hexa_str("HexaVal "), hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_801), pi)));
+        params = hexa_array_push(params, hexa_add(hexa_str("HexaVal "), _lambda_param_name_c(hexa_index_get(hexa_map_get_ic(node, "params", &__hexa_codegen_c2_ic_801), pi))));
         pi = hexa_add(pi, hexa_int(1));
     }
     HexaVal p = hexa_str_join(params, hexa_str(", "));
@@ -12351,6 +12412,10 @@ HexaVal gen2_lambda_expr(HexaVal node) {
             body_parts = hexa_array_push(body_parts, hexa_add(hexa_add(hexa_str("    return "), gen2_expr(lbody)), hexa_str(";\n")));
         }
     }
+    /* FIX-A 2026-04-19: emit matching fwd decl so call sites preceding the
+     * def block (e.g. init_parts hexa_closure_new(&__hexa_lambda_N, ...)) resolve. */
+    HexaVal fn_fwd = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), fn_name), hexa_str("(")), p), hexa_str(");\n")), hexa_str(""));
+    _lambda_fwd_parts = hexa_array_push(_lambda_fwd_parts, fn_fwd);
     HexaVal fn_def = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), fn_name), hexa_str("(")), p), hexa_str(") {\n")), hexa_str_join(body_parts, hexa_str(""))), hexa_str("    return hexa_void();\n}\n\n"));
     _lambda_def_parts = hexa_array_push(_lambda_def_parts, fn_def);
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(free_vars)), hexa_int(0)))) {
@@ -12371,6 +12436,7 @@ HexaVal codegen_c2_full(HexaVal ast) {
     __hexa_fn_arena_enter();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
+    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
     _method_registry = hexa_array_new();
     _known_fn_globals = hexa_array_new();
     _known_nonlocal_names = hexa_array_new();
@@ -12721,6 +12787,7 @@ int _codegen_c2_init(int argc, char** argv) {
     _method_registry = hexa_array_new();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
+    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
     _ic_counter = hexa_int(0);
     _comptime_const_names = hexa_array_new();
     _comptime_const_nodes = hexa_array_new();

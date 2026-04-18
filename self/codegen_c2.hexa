@@ -470,6 +470,7 @@ fn codegen_c2(ast) {
     _known_set_init()
     _lambda_counter = 0
     _lambda_def_parts = []
+    _lambda_fwd_parts = []
     _ic_counter = 0
     // M4: reset string literal dedup table
     // rt#32-SL: _strlit_def_parts module-array push removed — emit uses
@@ -687,6 +688,9 @@ fn codegen_c2(ast) {
         _ic_i = _ic_i + 1
     }
     parts = parts.push("\n")
+    // FIX-A (2026-04-19): emit lambda fwd decls before any fn_parts so call
+    // sites that precede the def (top-level closure init, etc) resolve.
+    parts = parts.push(_lambda_fwd_parts.join(""))
     // C3: emit lambda definitions (static C fns with __env first param)
     parts = parts.push(_lambda_def_parts.join(""))
     parts = parts.push(fn_parts.join(""))
@@ -1817,6 +1821,10 @@ fn gen2_method_builtin(obj_expr, method, args) {
     if method == "push" {
         return "hexa_array_push(" + obj_expr + ", " + gen2_expr(args[0]) + ")"
     }
+    // FIX-A (Anima serving unblock, 2026-04-19): alias `.append(x)` to push.
+    if method == "append" {
+        return "hexa_array_push(" + obj_expr + ", " + gen2_expr(args[0]) + ")"
+    }
     if method == "len" {
         return "hexa_int(hexa_len(" + obj_expr + "))"
     }
@@ -2220,6 +2228,16 @@ fn gen2_expr(node) {
             if name == "dict_keys" {
                 return "hexa_dict_keys(" + gen2_expr(node.args[0]) + ")"
             }
+            // FIX-A (Anima serving unblock, 2026-04-19): append(arr, item) + u_floor(a, b).
+            // `append` = free-function form of `.push` (http_server.hexa uses
+            // `headers = append(headers, HeaderPair{...})`). `u_floor` = unsigned
+            // integer floor division, ML kernel surrogate for Python `//`.
+            if name == "append" {
+                return "hexa_array_push(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
+            if name == "u_floor" {
+                return "hexa_u_floor(" + gen2_expr(node.args[0]) + ", " + gen2_expr(node.args[1]) + ")"
+            }
             if name == "format" {
                 // format(template, args...) -> hexa_format_n with array of args
                 let mut fmt_args = "hexa_array_new()"
@@ -2237,6 +2255,12 @@ fn gen2_expr(node) {
                 return "(fprintf(stderr, \"\\n\"), hexa_void())"
             }
             if name == "args" {
+                return "hexa_args()"
+            }
+            if name == "argv" {
+                // 2026-04-19: serve_alm.hexa + anima entry scripts spell `argv()`
+                // (matching the Python/C tradition) instead of `args()`. Alias
+                // both to hexa_args() — same C return so downstream av[N] works.
                 return "hexa_args()"
             }
             if name == "exec" {
@@ -2652,6 +2676,10 @@ fn gen2_expr(node) {
                 return "({ HexaVal __mr = " + __saved_obj + "; " + chain + "; })"
             }
             if method == "push" {
+                return "hexa_array_push(" + obj + ", " + gen2_expr(node.args[0]) + ")"
+            }
+            // FIX-A (Anima serving unblock, 2026-04-19): alias `.append(x)` to push.
+            if method == "append" {
                 return "hexa_array_push(" + obj + ", " + gen2_expr(node.args[0]) + ")"
             }
             if method == "len" {
@@ -3353,6 +3381,22 @@ fn gen2_impl_block(node) {
 let mut _lambda_counter = 0
 // perf: use array accumulator — avoid O(n²) string concat for lambda defs
 let mut _lambda_def_parts = []
+// FIX-A (Anima serving unblock, 2026-04-19): forward declarations for
+// __hexa_lambda_N. Without these, call sites that appear before the lambda
+// body (e.g. same top-level let block assigning closure refs mid-module) hit
+// "implicit function declaration" and "use of undeclared identifier"
+// cascades. Mirrored in self/native/hexa_cc.c.
+let mut _lambda_fwd_parts = []
+
+// Normalize a lambda/fn parameter entry to the bare identifier name.
+// `fn(x)` parser produces Param {name:"x", value:typ} objects; `|x|` parser
+// produces bare strings. Both paths funnel into gen2_lambda_expr /
+// gen2_collect_free — without normalization the Param-object branch
+// stringifies as "<value>" and param names leak as "free vars" at call sites.
+fn _lambda_param_name(p) {
+    if type_of(p) == "string" { return p }
+    return to_string(p.name)
+}
 
 // ── rt#37: Inline cache for field access ─────────────────
 // Each `obj.field` emits a unique `static HexaIC __hexa_ic_N` slot and a
@@ -4070,6 +4114,7 @@ fn _is_builtin_name(name) {
     if name == "max" { return true }
     if name == "format" { return true }
     if name == "args" { return true }
+    if name == "argv" { return true }
     if name == "exec" { return true }
     if name == "exec_with_status" { return true }
     if name == "read_file" { return true }
@@ -4096,6 +4141,9 @@ fn _is_builtin_name(name) {
     if name == "time_ms" { return true }
     if name == "byte_len" { return true }
     if name == "dict_keys" { return true }
+    // FIX-A (Anima serving unblock, 2026-04-19)
+    if name == "append" { return true }
+    if name == "u_floor" { return true }
     if name == "true" { return true }
     if name == "false" { return true }
     return false
@@ -4183,10 +4231,11 @@ fn gen2_collect_free(node, bound, out) {
     if k == "Lambda" {
         // Nested lambda: its params shadow, but its free vars in the current
         // scope are also free in the enclosing scope (unless bound here).
+        // FIX-A (2026-04-19): normalize param entries (Param obj or string).
         let mut inner_bound = bound
         let mut pi = 0
         while pi < len(node.params) {
-            inner_bound = inner_bound.push(node.params[pi])
+            inner_bound = inner_bound.push(_lambda_param_name(node.params[pi]))
             pi = pi + 1
         }
         return gen2_collect_free(node.left, inner_bound, out)
@@ -4248,10 +4297,13 @@ fn gen2_lambda_expr(node) {
 
     // ── Free variable analysis ───────────────────────────
     // `bound` starts with the lambda's own params.
+    // FIX-A (2026-04-19): `fn(x){}` parser emits Param objects with .name,
+    // `|x|` parser emits bare strings — normalize here so free-var compare
+    // against Ident names actually matches (and param doesn't leak as free).
     let mut bound = []
     let mut pi = 0
     while pi < len(node.params) {
-        bound = bound.push(node.params[pi])
+        bound = bound.push(_lambda_param_name(node.params[pi]))
         pi = pi + 1
     }
     let free_vars = gen2_collect_free(node.left, bound, [])
@@ -4263,7 +4315,7 @@ fn gen2_lambda_expr(node) {
     params = params.push("HexaVal __env")
     pi = 0
     while pi < len(node.params) {
-        params = params.push("HexaVal " + node.params[pi])
+        params = params.push("HexaVal " + _lambda_param_name(node.params[pi]))
         pi = pi + 1
     }
     let p = params.join(", ")
@@ -4296,6 +4348,10 @@ fn gen2_lambda_expr(node) {
     }
 
     // Emit the function definition (placed before main)
+    // FIX-A (2026-04-19): also emit a matching forward declaration so call
+    // sites referencing &__hexa_lambda_N before the def-block resolve. Covers
+    // interleaved emission cases (e.g. top-level closures used in init_parts).
+    _lambda_fwd_parts = _lambda_fwd_parts.push("HexaVal " + fn_name + "(" + p + ");\n")
     let fn_def = "HexaVal " + fn_name + "(" + p + ") {\n" + body_parts.join("") + "    return hexa_void();\n}\n\n"
     _lambda_def_parts = _lambda_def_parts.push(fn_def)
 
@@ -4319,6 +4375,7 @@ fn gen2_lambda_expr(node) {
 fn codegen_c2_full(ast) {
     _lambda_counter = 0
     _lambda_def_parts = []
+    _lambda_fwd_parts = []
     _method_registry = []
     _known_fn_globals = []
     _known_nonlocal_names = []
@@ -4521,6 +4578,8 @@ fn codegen_c2_full(ast) {
         _ic_i_full = _ic_i_full + 1
     }
     out_parts = out_parts.push("\n")
+    // FIX-A (2026-04-19): lambda forward decls before defs/fn_parts.
+    out_parts = out_parts.push(_lambda_fwd_parts.join(""))
     // Insert lambda definitions before user functions
     out_parts = out_parts.push(_lambda_def_parts.join(""))
     out_parts = out_parts.push(fn_parts.join(""))
