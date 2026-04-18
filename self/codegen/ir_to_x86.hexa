@@ -1,0 +1,511 @@
+// ═══════════════════════════════════════════════════════════
+//  self/codegen/ir_to_x86.hexa — IR → x86-64 pipeline bridge (P7-7, x86 port)
+//
+//  Parallel to self/codegen/ir_to_arm64.hexa. Walks HEXA-IR basic blocks
+//  in layout order and emits x86-64 bytes via inline encoders that mirror
+//  self/codegen/x86_64.hexa (kept inline here so this bridge runs
+//  standalone under hexa_stage0 without concat-linking).
+//
+//  Entry point:
+//      fn lower_ir_to_x86(blocks, regalloc_map) -> Array<u8>
+//
+//  IR shape: identical to ir_to_arm64.hexa — see that file's header for
+//  the IRInstr record layout.
+//
+//  Register allocation policy (linear v# → x86 reg):
+//      regalloc_map[vid] = LOGICAL reg index into x86_reg_enc():
+//          0=rax, 1=rcx, 2=rdx, 3=rbx, 4=rsi, 5=rdi, 6=r8, 7=r9,
+//          8..13 = r10..r15.
+//      Spill sentinel = 31 (same as ARM64). Values 0..7 are safe
+//      for the bootstrap subset (matches ir_to_arm64's 8-SSA budget).
+//
+//  Size model: x86 is variable width, so `irx_op_bytes` returns the byte
+//  count emitted by `irx_emit_one`. Callers must use byte-relative rel32
+//  offsets, NOT instruction counts. Both pass-1 sizing and pass-2 emit
+//  share the same byte accounting.
+//
+//  Opcodes covered (subset sufficient for fib, if-return, calls):
+//      IntLit / BoolLit  (load imm)       → MOV r, imm32  (or MOVABS for big)
+//      ident / field     (load reg)       → MOV rr
+//      BinOp Add/Sub/Mul                  → ADD / SUB / IMUL (2-op, MOV+OP)
+//      Cmp (sub+cmp)                      → CMP rr + SETcc + MOVZX
+//      Branch                             → TEST rcond,rcond + Jcc + JMP
+//      Jump                               → JMP rel32
+//      Return                             → MOV rax,Rv + RET
+//      Call                               → CALL rel32 stub
+//      Assign / Store                     → MOV rr
+//      Alloc / Label                      → no emit
+//      PHI                                → MOV rr (conservative, from `a`)
+// ═══════════════════════════════════════════════════════════
+
+// ── Register encoding (mirror x86_reg_enc from self/codegen/x86_64.hexa) ──
+// Logical slot → Intel SDM reg number. Position in this array IS the logical
+// slot passed through regalloc_map. Index 0..7 are the 8-register bootstrap
+// budget; 8..13 carry r10..r15 for larger allocators.
+fn irx_reg_enc() -> [int] {
+    return [0, 1, 2, 3, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+}
+
+// Logical v# → physical x86 reg. Matches x86_resolve_reg but inlined so
+// this file has no concat-link dependency. Spill sentinel 31 propagates.
+fn irx_reg_for(regalloc_map: [int], vid: int) -> int {
+    if vid < 0 { return 0 }
+    if vid >= len(regalloc_map) { return 31 }
+    let slot = regalloc_map[vid]
+    if slot < 0 { return 0 }
+    if slot == 31 { return 31 }
+    let enc = irx_reg_enc()
+    if slot >= len(enc) { return 31 }
+    return enc[slot]
+}
+
+// ── Inline x86 encoders (parallel to self/codegen/x86_64.hexa) ──
+
+// Push raw byte (identity helper — kept for symmetry with ARM64's
+// emit32_le splitter; x86 writes one byte at a time in most forms).
+fn irx_push_byte(code: [int], b: int) -> [int] {
+    return code.push(b % 256)
+}
+
+// Emit a little-endian 32-bit immediate.
+fn irx_push_imm32(code: [int], v: int) -> [int] {
+    let mut c = code
+    c = c.push(v % 256)
+    c = c.push((v / 256) % 256)
+    c = c.push((v / 65536) % 256)
+    c = c.push((v / 16777216) % 256)
+    return c
+}
+
+// REX prefix builder — emits 0x48 (REX.W) plus optional R/B bits if any
+// operand is r8-r15. `reg_ext` = 1 when the reg-field reg is >= 8, same
+// for `rm_ext`. Returns the prefix byte.
+fn irx_rex_w(reg_ext: int, rm_ext: int) -> int {
+    let mut b = 0x48
+    if reg_ext != 0 { b = b + 4 }   // REX.R
+    if rm_ext != 0 { b = b + 1 }    // REX.B
+    return b
+}
+
+// MOV rr (64-bit): REX.W 89 /r. dst and src are raw x86 reg numbers.
+fn irx_emit_mov_rr(code: [int], dst: int, src: int) -> [int] {
+    if dst == src { return code }
+    let rex = irx_rex_w(if src >= 8 { 1 } else { 0 }, if dst >= 8 { 1 } else { 0 })
+    let low_dst = dst % 8
+    let low_src = src % 8
+    return code.push(rex).push(0x89).push(0xc0 + low_src * 8 + low_dst)
+}
+
+// MOV r, imm32 (64-bit sign-extended): REX.W c7 /0 imm32.
+// Used when imm fits in signed 32-bit. For wider values, caller emits MOVABS.
+fn irx_emit_mov_r_imm32(code: [int], dst: int, imm: int) -> [int] {
+    let rex = irx_rex_w(0, if dst >= 8 { 1 } else { 0 })
+    let low = dst % 8
+    let mut c = code.push(rex).push(0xc7).push(0xc0 + low)
+    return irx_push_imm32(c, imm)
+}
+
+// MOVABS r, imm64: REX.W b8+r imm64 (10 bytes).
+fn irx_emit_mov_r_imm64(code: [int], dst: int, imm: int) -> [int] {
+    let rex = irx_rex_w(0, if dst >= 8 { 1 } else { 0 })
+    let low = dst % 8
+    let mut c = code.push(rex).push(0xb8 + low)
+    let mut v = imm
+    let mut i = 0
+    while i < 8 {
+        c = c.push(v % 256)
+        v = v / 256
+        i = i + 1
+    }
+    return c
+}
+
+// ADD rr: REX.W 01 /r (dst += src).
+fn irx_emit_add_rr(code: [int], dst: int, src: int) -> [int] {
+    let rex = irx_rex_w(if src >= 8 { 1 } else { 0 }, if dst >= 8 { 1 } else { 0 })
+    return code.push(rex).push(0x01).push(0xc0 + (src % 8) * 8 + (dst % 8))
+}
+
+// SUB rr: REX.W 29 /r (dst -= src).
+fn irx_emit_sub_rr(code: [int], dst: int, src: int) -> [int] {
+    let rex = irx_rex_w(if src >= 8 { 1 } else { 0 }, if dst >= 8 { 1 } else { 0 })
+    return code.push(rex).push(0x29).push(0xc0 + (src % 8) * 8 + (dst % 8))
+}
+
+// IMUL rr: REX.W 0f af /r (dst *= src; two-operand form).
+fn irx_emit_imul_rr(code: [int], dst: int, src: int) -> [int] {
+    let rex = irx_rex_w(if dst >= 8 { 1 } else { 0 }, if src >= 8 { 1 } else { 0 })
+    return code.push(rex).push(0x0f).push(0xaf).push(0xc0 + (dst % 8) * 8 + (src % 8))
+}
+
+// CMP rr: REX.W 39 /r (flags = lhs - rhs).
+fn irx_emit_cmp_rr(code: [int], lhs: int, rhs: int) -> [int] {
+    let rex = irx_rex_w(if rhs >= 8 { 1 } else { 0 }, if lhs >= 8 { 1 } else { 0 })
+    return code.push(rex).push(0x39).push(0xc0 + (rhs % 8) * 8 + (lhs % 8))
+}
+
+// TEST rr: REX.W 85 /r  (zero-check flavor; dst AND src with no writeback).
+fn irx_emit_test_rr(code: [int], a: int, b: int) -> [int] {
+    let rex = irx_rex_w(if b >= 8 { 1 } else { 0 }, if a >= 8 { 1 } else { 0 })
+    return code.push(rex).push(0x85).push(0xc0 + (b % 8) * 8 + (a % 8))
+}
+
+// SETcc + MOVZX — materializes a boolean into `dst` (0 or 1, zero-extended
+// to 64 bits). `tttn` is the Intel SDM condition code (0x04=eq, 0x05=ne,
+// 0x0c=lt, 0x0d=ge, 0x0e=le, 0x0f=gt).
+//
+// Encoding (low regs, dst < 8):
+//     40 0f 9x /r          (SETcc dst_byte)         — 4 bytes with REX
+//     48 0f b6 /r          (MOVZX dst, dst_byte)    — 4 bytes
+// For high regs (r8-r15) we need 41/4d prefixes; implemented in full below.
+fn irx_emit_setcc_movzx(code: [int], dst: int, tttn: int) -> [int] {
+    let mut c = code
+    // SETcc emits a byte result; REX required to address sil/dil/bpl/spl
+    // or r8b-r15b. For rax/rcx/rdx/rbx we still prepend REX (no bits) to
+    // match the byte-safe encoding used by self/codegen/x86_64.hexa.
+    if dst >= 8 {
+        c = c.push(0x41)
+    } else {
+        // REX (40) — needed for uniform "byte reg" addressing.
+        c = c.push(0x40)
+    }
+    c = c.push(0x0f).push(0x90 + tttn).push(0xc0 + (dst % 8))
+    // MOVZX r64, r/m8 — REX.W 0f b6 /r
+    if dst >= 8 {
+        c = c.push(0x4d).push(0x0f).push(0xb6).push(0xc0 + (dst % 8) * 8 + (dst % 8))
+    } else {
+        c = c.push(0x48).push(0x0f).push(0xb6).push(0xc0 + dst * 8 + dst)
+    }
+    return c
+}
+
+// JMP rel32 — e9 disp32 (5 bytes).
+fn irx_emit_jmp_rel32(code: [int], rel: int) -> [int] {
+    let mut c = code.push(0xe9)
+    return irx_push_imm32(c, rel)
+}
+
+// Jcc rel32 — 0f 8x disp32 (6 bytes). `tttn` is the Intel condition code.
+fn irx_emit_jcc_rel32(code: [int], tttn: int, rel: int) -> [int] {
+    let mut c = code.push(0x0f).push(0x80 + tttn)
+    return irx_push_imm32(c, rel)
+}
+
+// CALL rel32 — e8 disp32 (5 bytes; stub, patched later).
+fn irx_emit_call_rel32(code: [int], rel: int) -> [int] {
+    let mut c = code.push(0xe8)
+    return irx_push_imm32(c, rel)
+}
+
+// RET — c3 (plain near return, 1 byte).
+fn irx_emit_ret(code: [int]) -> [int] {
+    return code.push(0xc3)
+}
+
+// ── Condition-code mapping (ARM64 cc → Intel tttn) ──
+// Callers use ARM64 cond codes in instr.cmp translation for parity with
+// ir_to_arm64.hexa (eq=0, ne=1, ge=10, lt=11, gt=12, le=13). Map to Intel:
+fn irx_cmp_to_tttn(cmp: string) -> int {
+    if cmp == "eq" { return 0x04 }
+    if cmp == "ne" { return 0x05 }
+    if cmp == "ge" { return 0x0d }
+    if cmp == "lt" { return 0x0c }
+    if cmp == "gt" { return 0x0f }
+    if cmp == "le" { return 0x0e }
+    return 0x05   // default NE
+}
+
+// ── Size model (byte count per IR op) ────────────────────────
+// MUST match irx_emit_one's emissions exactly — pass-1 sizing relies
+// on it for rel32 offset resolution.
+fn irx_op_bytes(op: string, is_imm: bool, imm: int, has_cmp: bool,
+                dst_logical: int, a_logical: int, b_logical: int,
+                regalloc_map: [int]) -> int {
+    if op == "load" {
+        if is_imm {
+            // MOV r,imm32 (7 bytes) for small; MOVABS (10 bytes) for wide.
+            if imm >= 0 {
+                if imm <= 2147483647 { return 7 }
+                return 10
+            }
+            // Negative — use imm32 sign-extended if fits in signed 32-bit.
+            if imm >= 0 - 2147483648 { return 7 }
+            return 10
+        }
+        // load reg-to-reg — MOV rr, 3 bytes (or 0 if dst==src).
+        let rd = irx_reg_for(regalloc_map, dst_logical)
+        let rs = irx_reg_for(regalloc_map, a_logical)
+        if rd == rs { return 0 }
+        return 3
+    }
+    if op == "add" || op == "sub" {
+        if has_cmp {
+            // CMP (3) + SETcc (4) + MOVZX (4) = 11 bytes. For r8-r15 adds
+            // one REX byte each — we pessimistically use 11 since callers
+            // stay within 0..7 in the bootstrap budget.
+            return 11
+        }
+        // 3-op → 2-op: MOV dst,a (3) + ADD/SUB dst,b (3) = 6.
+        // If dst==a, skip MOV → 3 bytes.
+        let rd = irx_reg_for(regalloc_map, dst_logical)
+        let ra = irx_reg_for(regalloc_map, a_logical)
+        if rd == ra { return 3 }
+        return 6
+    }
+    if op == "mul" {
+        // IMUL is 4 bytes; 2-op dst *= src, so same MOV prelude:
+        // MOV dst,a (3) + IMUL dst,b (4) = 7. If dst==a, skip → 4.
+        let rd = irx_reg_for(regalloc_map, dst_logical)
+        let ra = irx_reg_for(regalloc_map, a_logical)
+        if rd == ra { return 4 }
+        return 7
+    }
+    if op == "branch" {
+        // TEST rcond,rcond (3) + Jcc rel32 (6) + JMP rel32 (5) = 14.
+        return 14
+    }
+    if op == "jump" { return 5 }       // JMP rel32
+    if op == "ret" {
+        // MOV rax,Rv (3 or 0 if Rv==rax) + RET (1). Assume worst case 4.
+        let rs = irx_reg_for(regalloc_map, a_logical)
+        if rs == 0 { return 1 }
+        return 4
+    }
+    if op == "call" { return 5 }       // CALL rel32 stub
+    if op == "store" {
+        let rd = irx_reg_for(regalloc_map, a_logical)
+        let rs = irx_reg_for(regalloc_map, b_logical)
+        if rd == rs { return 0 }
+        return 3
+    }
+    if op == "alloc" { return 0 }
+    if op == "phi" {
+        let rd = irx_reg_for(regalloc_map, dst_logical)
+        let rs = irx_reg_for(regalloc_map, a_logical)
+        if rd == rs { return 0 }
+        return 3
+    }
+    if op == "label" { return 0 }
+    // Unknown — sentinel MOV r,imm32 (7 bytes).
+    return 7
+}
+
+// ── Per-instruction emitter ──────────────────────────────────
+// `cur_byte` is the byte offset of this instruction in the final stream;
+// `block_starts` maps block-id → byte offset of that block's first instr.
+// Byte-relative rel32 offsets are computed as
+//     rel = target_byte - (cur_byte + instr_size)
+// so the `rel` field is the delta from the byte AFTER the branch.
+fn irx_emit_one(bytes_in: [int], instr, regalloc_map: [int],
+                block_starts: [int], cur_byte: int) -> [int] {
+    let mut bytes = bytes_in
+
+    if instr.op == "load" {
+        let rd = irx_reg_for(regalloc_map, instr.result)
+        if instr.is_imm {
+            if rd == 31 {
+                // Spill sentinel — MOV rax, 0xDEAD (same shape as ARM64 bridge).
+                bytes = irx_emit_mov_r_imm32(bytes, 0, 0xDEAD)
+                return bytes
+            }
+            let v = instr.imm
+            let fits32 = v <= 2147483647 && v >= 0 - 2147483648
+            if fits32 {
+                bytes = irx_emit_mov_r_imm32(bytes, rd, v)
+            } else {
+                bytes = irx_emit_mov_r_imm64(bytes, rd, v)
+            }
+            return bytes
+        }
+        let rs = irx_reg_for(regalloc_map, instr.a)
+        bytes = irx_emit_mov_rr(bytes, rd, rs)
+        return bytes
+    }
+
+    if instr.op == "add" {
+        let rd = irx_reg_for(regalloc_map, instr.result)
+        let ra = irx_reg_for(regalloc_map, instr.a)
+        let rb = irx_reg_for(regalloc_map, instr.b)
+        bytes = irx_emit_mov_rr(bytes, rd, ra)
+        bytes = irx_emit_add_rr(bytes, rd, rb)
+        return bytes
+    }
+
+    if instr.op == "mul" {
+        let rd = irx_reg_for(regalloc_map, instr.result)
+        let ra = irx_reg_for(regalloc_map, instr.a)
+        let rb = irx_reg_for(regalloc_map, instr.b)
+        bytes = irx_emit_mov_rr(bytes, rd, ra)
+        bytes = irx_emit_imul_rr(bytes, rd, rb)
+        return bytes
+    }
+
+    if instr.op == "sub" {
+        let ra = irx_reg_for(regalloc_map, instr.a)
+        let rb = irx_reg_for(regalloc_map, instr.b)
+        let rd = irx_reg_for(regalloc_map, instr.result)
+        if instr.cmp != "" {
+            // Comparison → CMP ra, rb ; SETcc rd ; MOVZX rd,rd_byte
+            bytes = irx_emit_cmp_rr(bytes, ra, rb)
+            bytes = irx_emit_setcc_movzx(bytes, rd, irx_cmp_to_tttn(instr.cmp))
+            return bytes
+        }
+        bytes = irx_emit_mov_rr(bytes, rd, ra)
+        bytes = irx_emit_sub_rr(bytes, rd, rb)
+        return bytes
+    }
+
+    if instr.op == "branch" {
+        // a = cond reg (logical vid), b = then block id, c = else block id
+        let rcond = irx_reg_for(regalloc_map, instr.a)
+        let then_bb = instr.b
+        let else_bb = instr.c
+        // Byte offset of this branch's start.
+        let this_start = cur_byte
+        // Size check (must match irx_op_bytes).
+        let total_size = 14
+        let mut then_byte = this_start + total_size   // fallthrough default
+        if then_bb >= 0 {
+            if then_bb < len(block_starts) {
+                then_byte = block_starts[then_bb]
+            }
+        }
+        let mut else_byte = this_start + total_size
+        if else_bb >= 0 {
+            if else_bb < len(block_starts) {
+                else_byte = block_starts[else_bb]
+            }
+        }
+        // Emit TEST rcond,rcond (3 bytes).
+        bytes = irx_emit_test_rr(bytes, rcond, rcond)
+        let after_test = this_start + 3
+        // Jcc (NE, 0x05) rel32 → then. rel = then - (after_test + 6).
+        let jcc_rel = then_byte - (after_test + 6)
+        bytes = irx_emit_jcc_rel32(bytes, 0x05, jcc_rel)
+        let after_jcc = after_test + 6
+        // JMP rel32 → else. rel = else - (after_jcc + 5).
+        let jmp_rel = else_byte - (after_jcc + 5)
+        bytes = irx_emit_jmp_rel32(bytes, jmp_rel)
+        return bytes
+    }
+
+    if instr.op == "jump" {
+        let tgt_bb = instr.a
+        let this_start = cur_byte
+        let after = this_start + 5
+        let mut tgt_byte = after
+        if tgt_bb >= 0 {
+            if tgt_bb < len(block_starts) {
+                tgt_byte = block_starts[tgt_bb]
+            }
+        }
+        let rel = tgt_byte - after
+        bytes = irx_emit_jmp_rel32(bytes, rel)
+        return bytes
+    }
+
+    if instr.op == "ret" {
+        if instr.a >= 0 {
+            let rs = irx_reg_for(regalloc_map, instr.a)
+            bytes = irx_emit_mov_rr(bytes, 0, rs)   // rax <- Rv
+        }
+        bytes = irx_emit_ret(bytes)
+        return bytes
+    }
+
+    if instr.op == "call" {
+        // CALL stub; real offset patched later (0 here).
+        bytes = irx_emit_call_rel32(bytes, 0)
+        return bytes
+    }
+
+    if instr.op == "store" {
+        let rd = irx_reg_for(regalloc_map, instr.a)
+        let rs = irx_reg_for(regalloc_map, instr.b)
+        bytes = irx_emit_mov_rr(bytes, rd, rs)
+        return bytes
+    }
+
+    if instr.op == "alloc" { return bytes }
+
+    if instr.op == "phi" {
+        let rd = irx_reg_for(regalloc_map, instr.result)
+        let rs = irx_reg_for(regalloc_map, instr.a)
+        bytes = irx_emit_mov_rr(bytes, rd, rs)
+        return bytes
+    }
+
+    if instr.op == "label" { return bytes }
+
+    // Unknown op — sentinel MOV rax, 0xBADF (7 bytes, matches irx_op_bytes).
+    bytes = irx_emit_mov_r_imm32(bytes, 0, 0xBADF)
+    return bytes
+}
+
+// ── Entry point ──────────────────────────────────────────────
+// Two-pass byte-offset resolution; analogous to ir_to_arm64.hexa's
+// lower_ir_to_arm64 but measured in bytes instead of 4-byte instructions.
+fn lower_ir_to_x86(blocks, regalloc_map: [int]) -> [int] {
+    // ─── Pass 1: compute block_starts (byte offsets) ────
+    let mut block_starts = []
+    let mut cursor = 0
+    let mut bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let bb_id = bb.id
+        while len(block_starts) <= bb_id {
+            block_starts = block_starts.push(0)
+        }
+        block_starts[bb_id] = cursor
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            cursor = cursor + irx_op_bytes(
+                inst.op, inst.is_imm, inst.imm, has_cmp,
+                inst.result, inst.a, inst.b, regalloc_map)
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+
+    // ─── Pass 2: emit bytes ─────────────────────────────
+    let mut bytes = []
+    let mut byte_idx = 0
+    bi = 0
+    while bi < len(blocks) {
+        let bb = blocks[bi]
+        let mut ii = 0
+        while ii < len(bb.instructions) {
+            let inst = bb.instructions[ii]
+            let has_cmp = false
+            if inst.cmp != "" { has_cmp = true }
+            let sz = irx_op_bytes(
+                inst.op, inst.is_imm, inst.imm, has_cmp,
+                inst.result, inst.a, inst.b, regalloc_map)
+            bytes = irx_emit_one(bytes, inst, regalloc_map, block_starts, byte_idx)
+            byte_idx = byte_idx + sz
+            ii = ii + 1
+        }
+        bi = bi + 1
+    }
+    return bytes
+}
+
+// Linear regalloc helper — parallel to ir_to_arm64's regalloc_linear_simple.
+// Maps vid → logical slot index (not raw x86 reg); irx_reg_for translates
+// to physical at emit time.
+fn x86_regalloc_linear_simple(n_values: int) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < n_values {
+        if i < 14 {
+            out = out.push(i)
+        } else {
+            out = out.push(31)
+        }
+        i = i + 1
+    }
+    return out
+}

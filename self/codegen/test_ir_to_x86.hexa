@@ -1,0 +1,140 @@
+// ═══════════════════════════════════════════════════════════
+//  self/codegen/test_ir_to_x86.hexa
+//
+//  Smoke test for the IR → x86-64 bridge (self/codegen/ir_to_x86.hexa).
+//  Mirrors the approach from test_x86_encoders.hexa: build a flat IR
+//  shape, run lower_ir_to_x86, and assert byte-for-byte output against
+//  hand-computed golden bytes.
+//
+//  Run:  ./build/hexa_stage0 self/module_loader.hexa \
+//              self/codegen/test_ir_to_x86.hexa /tmp/flat.hexa
+//        ./build/hexa_stage0 /tmp/flat.hexa
+//
+//  (Standalone run won't resolve ir_to_x86 symbols — the module loader
+//  concat-inlines the bridge at compile time. See ir_to_arm64 header.)
+// ═══════════════════════════════════════════════════════════
+
+use "ir_to_x86"
+
+fn expect_bytes_eq(label: string, actual: [int], expected: [int]) -> int {
+    if len(actual) != len(expected) {
+        println("FAIL " + label + ": len actual=" + str(len(actual)) + " expected=" + str(len(expected)))
+        return 1
+    }
+    let mut i = 0
+    while i < len(actual) {
+        if actual[i] != expected[i] {
+            println("FAIL " + label + " @" + str(i) + ": actual=" + str(actual[i]) + " expected=" + str(expected[i]))
+            return 1
+        }
+        i = i + 1
+    }
+    println("PASS " + label)
+    return 0
+}
+
+struct IRI {
+    result: int,
+    op: string,
+    ty: string,
+    a: int,
+    b: int,
+    c: int,
+    imm: int,
+    is_imm: bool,
+    cmp: string,
+}
+
+struct BB {
+    id: int,
+    instructions: [IRI],
+}
+
+fn mk_load_imm(res: int, imm: int) -> IRI {
+    return IRI { result: res, op: "load", ty: "i64", a: 0, b: 0, c: 0, imm: imm, is_imm: true, cmp: "" }
+}
+
+fn mk_add(res: int, a: int, b: int) -> IRI {
+    return IRI { result: res, op: "add", ty: "i64", a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn mk_ret(a: int) -> IRI {
+    return IRI { result: 0 - 1, op: "ret", ty: "i64", a: a, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn mk_cmp(res: int, a: int, b: int, cmp: string) -> IRI {
+    return IRI { result: res, op: "sub", ty: "bool", a: a, b: b, c: 0, imm: 0, is_imm: false, cmp: cmp }
+}
+
+fn mk_branch(cond: int, then_bb: int, else_bb: int) -> IRI {
+    return IRI { result: 0 - 1, op: "branch", ty: "void", a: cond, b: then_bb, c: else_bb, imm: 0, is_imm: false, cmp: "" }
+}
+
+fn mk_jump(tgt: int) -> IRI {
+    return IRI { result: 0 - 1, op: "jump", ty: "void", a: tgt, b: 0, c: 0, imm: 0, is_imm: false, cmp: "" }
+}
+
+let mut fails = 0
+
+// ── Test 1: load imm + ret ──────────────────────────────
+// v0 = 42 ; ret v0
+//   mov rax, 42      → 48 c7 c0 2a 00 00 00  (7 bytes)
+//   ret              → c3                    (1 byte, mov rax,rax skipped)
+let mut t1_instrs = []
+t1_instrs = t1_instrs.push(mk_load_imm(0, 42))
+t1_instrs = t1_instrs.push(mk_ret(0))
+let t1_blocks = [BB { id: 0, instructions: t1_instrs }]
+let t1_regs = x86_regalloc_linear_simple(1)  // v0 → slot 0 → rax
+fails = fails + expect_bytes_eq("load42+ret",
+    lower_ir_to_x86(t1_blocks, t1_regs),
+    [0x48, 0xc7, 0xc0, 0x2a, 0x00, 0x00, 0x00, 0xc3])
+
+// ── Test 2: two loads + add + ret ─────────────────────────
+// v0=7, v1=3, v2 = v0 + v1, ret v2
+//   mov rax, 7       → 48 c7 c0 07 00 00 00
+//   mov rcx, 3       → 48 c7 c1 03 00 00 00
+//   mov rdx, rax     → 48 89 c2
+//   add rdx, rcx     → 48 01 ca
+//   mov rax, rdx     → 48 89 d0
+//   ret              → c3
+let mut t2 = []
+t2 = t2.push(mk_load_imm(0, 7))
+t2 = t2.push(mk_load_imm(1, 3))
+t2 = t2.push(mk_add(2, 0, 1))
+t2 = t2.push(mk_ret(2))
+let t2_blocks = [BB { id: 0, instructions: t2 }]
+let t2_regs = x86_regalloc_linear_simple(3)  // v0→rax, v1→rcx, v2→rdx
+fails = fails + expect_bytes_eq("7+3+ret",
+    lower_ir_to_x86(t2_blocks, t2_regs),
+    [0x48, 0xc7, 0xc0, 0x07, 0x00, 0x00, 0x00,
+     0x48, 0xc7, 0xc1, 0x03, 0x00, 0x00, 0x00,
+     0x48, 0x89, 0xc2,
+     0x48, 0x01, 0xca,
+     0x48, 0x89, 0xd0,
+     0xc3])
+
+// ── Test 3: jump resolves with byte-relative rel32 ───────
+// BB 0: load v0=1, jump BB 1
+// BB 1: ret v0
+//   mov rax, 1       → 48 c7 c0 01 00 00 00      (7 bytes; cur=0..6)
+//   jmp rel32 → BB1  → e9 00 00 00 00            (5 bytes; cur=7..11)
+//                      (rel = 12 - (7+5) = 0; BB1 starts at 12)
+//   ret              → c3                        (cur=12; rv==rax so MOV skipped)
+let mut t3a = []
+t3a = t3a.push(mk_load_imm(0, 1))
+t3a = t3a.push(mk_jump(1))
+let mut t3b = []
+t3b = t3b.push(mk_ret(0))
+let t3_blocks = [BB { id: 0, instructions: t3a }, BB { id: 1, instructions: t3b }]
+let t3_regs = x86_regalloc_linear_simple(1)
+fails = fails + expect_bytes_eq("jump+ret",
+    lower_ir_to_x86(t3_blocks, t3_regs),
+    [0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00,
+     0xe9, 0x00, 0x00, 0x00, 0x00,
+     0xc3])
+
+if fails > 0 {
+    println("=== IR→x86 bridge FAIL: " + str(fails) + " test(s) ===")
+} else {
+    println("=== IR→x86 bridge: all tests PASS ===")
+}
