@@ -3480,6 +3480,95 @@ int hexa_array_contains(HexaVal arr, HexaVal item) {
     return 0;
 }
 
+// pad_left / pad_right / center: fill to `width` with pad-char.
+// pad may be multi-char — interpreter prepends/appends the whole token
+// each iteration; we match that semantics (hexa_full.hexa:14975-15003).
+// Returns s unchanged if already ≥ width.
+HexaVal hexa_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
+    const char* src = HX_STR(s);
+    const char* pad = HX_STR(padv);
+    int slen = (int)strlen(src);
+    int plen = (int)strlen(pad);
+    if (slen >= width || plen == 0) return s;
+    int pad_total = width - slen;
+    int pad_iters = (pad_total + plen - 1) / plen; // ceil
+    int out_cap = slen + pad_iters * plen + 1;
+    char* out = (char*)malloc((size_t)out_cap);
+    int pos = 0;
+    for (int i = 0; i < pad_iters; i++) {
+        memcpy(out + pos, pad, (size_t)plen);
+        pos += plen;
+    }
+    memcpy(out + pos, src, (size_t)slen);
+    pos += slen;
+    out[pos] = 0;
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
+    const char* src = HX_STR(s);
+    const char* pad = HX_STR(padv);
+    int slen = (int)strlen(src);
+    int plen = (int)strlen(pad);
+    if (slen >= width || plen == 0) return s;
+    int pad_total = width - slen;
+    int pad_iters = (pad_total + plen - 1) / plen;
+    int out_cap = slen + pad_iters * plen + 1;
+    char* out = (char*)malloc((size_t)out_cap);
+    memcpy(out, src, (size_t)slen);
+    int pos = slen;
+    for (int i = 0; i < pad_iters; i++) {
+        memcpy(out + pos, pad, (size_t)plen);
+        pos += plen;
+    }
+    out[pos] = 0;
+    return hexa_str_own(out);
+}
+
+HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
+    const char* src = HX_STR(s);
+    const char* pad = HX_STR(padv);
+    int slen = (int)strlen(src);
+    int plen = (int)strlen(pad);
+    if (slen >= width || plen == 0) return s;
+    int total_pad = width - slen;
+    int left_pad = total_pad / 2;
+    int right_pad = total_pad - left_pad;
+    int li = (left_pad + plen - 1) / plen;
+    int ri = (right_pad + plen - 1) / plen;
+    int out_cap = slen + (li + ri) * plen + 1;
+    char* out = (char*)malloc((size_t)out_cap);
+    int pos = 0;
+    for (int i = 0; i < li; i++) { memcpy(out + pos, pad, (size_t)plen); pos += plen; }
+    memcpy(out + pos, src, (size_t)slen); pos += slen;
+    for (int i = 0; i < ri; i++) { memcpy(out + pos, pad, (size_t)plen); pos += plen; }
+    out[pos] = 0;
+    return hexa_str_own(out);
+}
+
+// count_substr(s, substr): number of non-overlapping occurrences.
+// Matches interpreter's greedy advance (hexa_full.hexa:14954-14973).
+HexaVal hexa_str_count_substr(HexaVal s, HexaVal sub) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(sub)) return hexa_int(0);
+    const char* src = HX_STR(s);
+    const char* pat = HX_STR(sub);
+    int plen = (int)strlen(pat);
+    if (plen == 0) return hexa_int(0);
+    int64_t cnt = 0;
+    const char* p = src;
+    while ((p = strstr(p, pat)) != NULL) {
+        cnt++;
+        p += plen; // non-overlapping
+    }
+    return hexa_int(cnt);
+}
+
 HexaVal hexa_format_float(HexaVal f, HexaVal prec) {
     double v = __hx_to_double(f);
     int p = HX_INT(prec);
