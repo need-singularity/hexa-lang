@@ -206,6 +206,10 @@ HexaVal hexa_math_round(HexaVal x);
 HexaVal hexa_math_pow(HexaVal b, HexaVal e);
 HexaVal hexa_math_min(HexaVal a, HexaVal b);
 HexaVal hexa_math_max(HexaVal a, HexaVal b);
+// FIX-A (Anima serving unblock): time_ms / byte_len / dict_keys builtin C syms.
+HexaVal hexa_time_ms(void);
+HexaVal hexa_byte_len(HexaVal v);
+HexaVal hexa_dict_keys(HexaVal m);
 
 // RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
 // path. Close Wint-conversion / Wpointer-arith categories in the
@@ -4747,6 +4751,40 @@ HexaVal hexa_timestamp(void) {
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return hexa_int((int64_t)ts.tv_sec);
+}
+
+// FIX-A (Anima serving unblock, 2026-04-18) ─────────────────────────
+// time_ms(): monotonic wall-clock milliseconds. Used by checkpoint.hexa /
+// train_logger.hexa / eval_harness.hexa / train_7b_integrated.hexa for
+// elapsed-time measurement (tok/s, save/load latency, per-step timing).
+HexaVal hexa_time_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    int64_t ms = (int64_t)ts.tv_sec * 1000
+               + (int64_t)(ts.tv_nsec / 1000000);
+    return hexa_int(ms);
+}
+
+// byte_len(v): length in bytes of a string, array, or map. Unlike hexa_len
+// (which rejects non-container tags), this is permissive — returns 0 on
+// anything without a measurable length. checkpoint.hexa uses it on byte
+// arrays returned by read_file_bytes.
+HexaVal hexa_byte_len(HexaVal v) {
+    if (HX_IS_STR(v))   return hexa_int(HX_STR(v) ? (int64_t)strlen(HX_STR(v)) : 0);
+    if (HX_IS_ARRAY(v)) return hexa_int((int64_t)HX_ARR_LEN(v));
+    if (HX_IS_MAP(v)) {
+        HexaMapTable* t = HX_MAP_TBL(v);
+        return hexa_int(t ? (int64_t)t->len : 0);
+    }
+    return hexa_int(0);
+}
+
+// dict_keys(m): return TAG_ARRAY of TAG_STR keys preserving insertion order.
+// Thin alias over hexa_map_keys (which is already the canonical C symbol for
+// HX_MAP key iteration). Kept as a distinct builtin so .hexa sources can
+// use the more familiar `dict_keys(d)` spelling (tokenizer_bpe.hexa etc.).
+HexaVal hexa_dict_keys(HexaVal m) {
+    return hexa_map_keys(m);
 }
 
 // Base64 (RFC 4648)
