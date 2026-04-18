@@ -4826,6 +4826,17 @@ HexaVal hexa_count_poly(HexaVal obj, HexaVal arg) {
     return hexa_array_count(obj, arg);
 }
 
+// contains_poly: dispatch `.contains()` method by receiver type. String
+// form is substring search; array form is element-eq search. Both return
+// bool. Matches interpreter self/hexa_full.hexa:14945 (str) and
+// 15186-15192 (arr).
+HexaVal hexa_contains_poly(HexaVal obj, HexaVal arg) {
+    if (HX_IS_STR(obj)) {
+        return hexa_bool(hexa_str_contains(obj, arg));
+    }
+    return hexa_bool(hexa_array_contains(obj, arg));
+}
+
 // find: first element matching predicate; void if none.
 HexaVal hexa_array_find(HexaVal arr, HexaVal fn) {
     if (!HX_IS_ARRAY(arr)) return hexa_void();
