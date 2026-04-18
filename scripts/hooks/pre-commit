@@ -1,0 +1,127 @@
+#!/bin/bash
+# ── HX4 HEXA-ONLY 강제: .rs/.toml 스테이지 차단 ──────────
+FORBIDDEN=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(rs|toml)$' || true)
+if [ -n "$FORBIDDEN" ]; then
+    echo "🚫 HEXA-ONLY 위반: .rs/.toml 파일 커밋 금지 (HX4)"
+    echo "$FORBIDDEN" | sed 's/^/  ✗ /'
+    echo "→ .hexa 로 작성하세요. Rust/Cargo 의존 제거 원칙."
+    exit 1
+fi
+
+# ── poc_lint (self/poc/ filename=dispatch-key 규약) ────
+# Self-contained: runs regardless of $HEXA availability — tries multiple
+# runners then skips gracefully. Fast-path: only if self/poc/ is staged.
+STAGED_POC=$(git diff --cached --diff-filter=ACMR --name-only 2>/dev/null | grep '^self/poc/' || true)
+if [ -n "$STAGED_POC" ]; then
+    POC_R=$(git rev-parse --show-toplevel 2>/dev/null)
+    POC_LINT="$POC_R/scripts/poc_lint.hexa"
+    if [ -f "$POC_LINT" ]; then
+        POC_RUNNER=""
+        HEXA_BIN=$(which hexa 2>/dev/null)
+        if [ -x "$HEXA_BIN" ]; then
+            POC_RUNNER="$HEXA_BIN"
+        elif [ -x "$HOME/Dev/hexa-lang/hexa" ]; then
+            POC_RUNNER="$HOME/Dev/hexa-lang/hexa"
+        elif [ -x "$POC_R/build/hexa_stage0" ]; then
+            POC_RUNNER="$POC_R/build/hexa_stage0"
+        fi
+        if [ -n "$POC_RUNNER" ]; then
+            POC_OUT=$(cd "$POC_R" && "$POC_RUNNER" "$POC_LINT" 2>&1)
+            POC_RC=$?
+            # hexa interpreter's exit(1) doesn't always propagate — also gate on output text.
+            if [ "$POC_RC" -ne 0 ] || echo "$POC_OUT" | grep -q "^\[poc-lint\] FAIL"; then
+                echo "🚫 poc-lint 위반: self/poc/ filename=dispatch-key 규약 위반" >&2
+                echo "$POC_OUT" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# loop-guard pre-commit — 수동 커밋 안전망
+# loop-guard 자체 커밋이면 스킵
+MSG=$(cat .git/MERGE_MSG 2>/dev/null || git log -1 --format=%s 2>/dev/null)
+echo "$MSG" | grep -q "loop-guard\|loop 정합" && exit 0
+
+R=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+GUARD="$R/.shared/hooks/loop-guard.hexa"
+[ -f "$GUARD" ] || exit 0
+
+HEXA=$(which hexa 2>/dev/null)
+# fallback
+[ -z "$HEXA" ] && HEXA="$HOME/Dev/hexa-lang/hexa"
+[ -x "$HEXA" ] || exit 0
+
+# ── SSOT precommit (타세션 자기 수정 정합) ─────────────
+SSOT_HOOK="$R/scripts/ssot_precommit_hook.hexa"
+[ -f "$SSOT_HOOK" ] && "$HEXA" run "$SSOT_HOOK" 2>&1 >&2 || true
+
+# ── ai-native naming guard (blocking, <50ms) ───────────
+# Only new .hexa files (diff-filter=A). Existing files grandfathered.
+# Full repo audit: scripts/ai_native_scan.hexa
+STAGED_HEXA=$(git diff --cached --name-only --diff-filter=AR 2>/dev/null | grep '\.hexa$' || true)
+
+# ── ai-native 3-rule linter (L1 scope / L2 literal_ban / L3 brace_lock) ──
+# Runs on staged+modified .hexa (diff-filter=ACMR), blocks only if file has
+# #!hexa strict header; otherwise emits warnings.
+STAGED_LINT=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.hexa$' || true)
+if [ -n "$STAGED_LINT" ] && [ -x "$R/build/hexa_stage0" ]; then
+    # Pass up to 20 files at a time to keep runtime bounded
+    LINT_ARGS=$(echo "$STAGED_LINT" | head -20 | tr '\n' ' ')
+    if [ -n "$LINT_ARGS" ]; then
+        LINT_OUT=$("$R/build/hexa_stage0" "$R/scripts/ai_native_lint.hexa" $LINT_ARGS 2>/dev/null | grep -v "security warning" || true)
+        if echo "$LINT_OUT" | grep -q "blocking violations"; then
+            echo "[ai-native] linter blocking violations:" >&2
+            echo "$LINT_OUT" >&2
+            exit 1
+        fi
+    fi
+fi
+
+if [ -n "$STAGED_HEXA" ]; then
+    PRODUCT_RE='^(build_stage0|build_stage1|rebuild_stage0|hexa_stage0|regression_stage1)\.hexa$'
+    AI_FAIL=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        bn=$(basename "$f"); st="${bn%.hexa}"
+        echo "$st" | grep -qE '_v[0-9]+$' && AI_FAIL="$AI_FAIL\n  F1-version      $f"
+        if ! echo "$bn" | grep -qE "$PRODUCT_RE"; then
+            echo "$st" | grep -qE '(^|_)(stage|phase)[0-9]+(_|$)' && AI_FAIL="$AI_FAIL\n  F2-stage-phase  $f"
+            echo "$st" | grep -qE '(^|_)p[0-9]{1,2}(_|$)' && AI_FAIL="$AI_FAIL\n  F2-pN-segment   $f"
+        fi
+        echo "$st" | grep -qE '_(old|new|bak|tmp|copy|backup|save)$' && AI_FAIL="$AI_FAIL\n  F3-temp         $f"
+        echo "$f" | grep -qE '(^|/)(utils|helpers|common|lib|misc|stuff|base)/' && AI_FAIL="$AI_FAIL\n  F4-generic-dir  $f"
+    done <<< "$STAGED_HEXA"
+    if [ -n "$AI_FAIL" ]; then
+        echo "[ai-native] naming violation in newly added files:" >&2
+        printf "%b\n" "$AI_FAIL" >&2
+        echo "rules: F1 _v\\d+ | F2 stage/phase/p\\d | F3 _old/_new/_bak/_tmp | F4 utils/helpers/common/lib dirs" >&2
+        echo "exception: build_stage0/rebuild_stage0/hexa_stage0 (product names)" >&2
+        exit 1
+    fi
+fi
+
+# --fix 실행, 수정된 파일 자동 stage
+# WHY not `git add -A`: 작업트리 전체를 재스테이지하면
+# `git commit -- <pathspec>` 제한이 무력화되고 타세션 변경까지 끌려옴.
+# 의도는 "이미 staged 인 파일이 --fix 로 갱신된 경우 갱신분 반영" 뿐이므로
+# 훅 진입 시점 staged 스냅샷에 한해서만 재스테이지.
+STAGED_SNAPSHOT=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+"$HEXA" "$GUARD" --fix >/tmp/.loop-pre-commit.log 2>&1
+if [ -n "$STAGED_SNAPSHOT" ]; then
+    # 편집 소실 방지 (2026-04-16): staged+unstaged 혼재 파일은
+    # git add 하면 unstaged 부분까지 끌어올려 타에이전트 변경 포함됨.
+    # unstaged diff 있는 파일은 건너뛴다.
+    UNSTAGED=$(git diff --name-only 2>/dev/null || echo "")
+    echo "$STAGED_SNAPSHOT" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ ! -e "$f" ] && continue
+        # skip if file has unstaged changes (protect concurrent edits)
+        if echo "$UNSTAGED" | grep -qxF "$f"; then
+            echo "[pre-commit] skip re-stage: $f has unstaged changes" >&2
+            continue
+        fi
+        git add -- "$f" 2>/dev/null
+    done
+fi
+exit 0
