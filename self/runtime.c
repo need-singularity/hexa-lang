@@ -1584,6 +1584,42 @@ HexaVal hexa_map_filter_keys(HexaVal m, HexaVal fn) {
     return out;
 }
 
+// invert: swap k<->v. Values get stringified via hexa_to_string to serve
+// as new keys (HexaMap keys are char*); original keys become string vals.
+// Matches interpreter at self/hexa_full.hexa:15641-15645.
+HexaVal hexa_map_invert(HexaVal m) {
+    HexaVal out = hexa_map_new();
+    if (!HX_MAP_TBL(m)) return out;
+    HexaMapTable* t = HX_MAP_TBL(m);
+    for (int i = 0; i < t->len; i++) {
+        const char* new_key = hexa_str_as_ptr(hexa_to_string(t->order_vals[i]));
+        if (!new_key) continue;
+        out = hexa_map_set(out, new_key, hexa_str(t->order_keys[i]));
+    }
+    return out;
+}
+
+// from_array: build a map from an array of [k, v] pair arrays. Receiver
+// is ignored (called as-method on an empty map per interpreter dispatch).
+// Malformed pairs (non-array or <2 elements) are skipped. Keys are
+// stringified. Matches interpreter at self/hexa_full.hexa:15622-15640.
+HexaVal hexa_map_from_array(HexaVal self_map, HexaVal arr) {
+    (void)self_map;
+    HexaVal out = hexa_map_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int n = HX_ARR_LEN(arr);
+    for (int i = 0; i < n; i++) {
+        HexaVal pair = HX_ARR_ITEMS(arr)[i];
+        if (!HX_IS_ARRAY(pair) || HX_ARR_LEN(pair) < 2) continue;
+        HexaVal k = HX_ARR_ITEMS(pair)[0];
+        HexaVal v = HX_ARR_ITEMS(pair)[1];
+        const char* k_str = hexa_str_as_ptr(hexa_to_string(k));
+        if (!k_str) continue;
+        out = hexa_map_set(out, k_str, v);
+    }
+    return out;
+}
+
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
     if (!HX_MAP_TBL(m)) return m;
     HexaMapTable* t = HX_MAP_TBL(m);
@@ -5112,6 +5148,30 @@ HexaVal hexa_array_swap(HexaVal arr, HexaVal iv, HexaVal jv) {
         if (k == i) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[j]);
         else if (k == j) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
         else out = hexa_array_push(out, HX_ARR_ITEMS(arr)[k]);
+    }
+    return out;
+}
+
+// group_by: apply fn(item) → key, bucket items into map[str(key)] = [items].
+// Interpreter (self/hexa_full.hexa:15323-15344) compares keys via
+// val_to_string, so we do the same via hexa_to_string for parity — non-
+// string keys still group correctly. Values accumulate as arrays.
+HexaVal hexa_array_group_by(HexaVal arr, HexaVal fn) {
+    HexaVal out = hexa_map_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal item = HX_ARR_ITEMS(arr)[i];
+        HexaVal key = hexa_call1(fn, item);
+        const char* k_str = hexa_str_as_ptr(hexa_to_string(key));
+        if (!k_str) continue;
+        HexaVal bucket;
+        if (hexa_map_contains_key(out, k_str)) {
+            bucket = hexa_map_get(out, k_str);
+        } else {
+            bucket = hexa_array_new();
+        }
+        bucket = hexa_array_push(bucket, item);
+        out = hexa_map_set(out, k_str, bucket);
     }
     return out;
 }
