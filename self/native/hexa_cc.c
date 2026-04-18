@@ -1742,6 +1742,30 @@ HexaVal p_expect(HexaVal expected_kind) {
 }
 
 
+// P51: narrow reserved-keyword list that is commonly mis-used as
+// identifiers in numeric/algorithmic code (bignum borrow flag etc.).
+static int p_is_reserved_id_kind_cstr(const char* k) {
+    if (!k) return 0;
+    if (strcmp(k, "Borrow") == 0) return 1;
+    if (strcmp(k, "Own") == 0) return 1;
+    if (strcmp(k, "Move") == 0) return 1;
+    return 0;
+}
+
+static HexaVal p_is_reserved_id_kind(HexaVal kind) {
+    const char* k = HX_IS_STR(kind) ? HX_STR(kind) : NULL;
+    return hexa_bool(p_is_reserved_id_kind_cstr(k));
+}
+
+static HexaVal p_reserved_id_hint(HexaVal kind) {
+    const char* k = HX_IS_STR(kind) ? HX_STR(kind) : NULL;
+    if (!k) return hexa_str("_x");
+    if (strcmp(k, "Borrow") == 0) return hexa_str("br");
+    if (strcmp(k, "Own") == 0) return hexa_str("owner");
+    if (strcmp(k, "Move") == 0) return hexa_str("mv");
+    return hexa_str("_x");
+}
+
 HexaVal p_expect_ident(void) {
     __hexa_fn_arena_enter();
     HexaVal tok = p_peek();
@@ -1749,12 +1773,30 @@ HexaVal p_expect_ident(void) {
         p_pos = hexa_add(p_pos, hexa_int(1));
         return __hexa_fn_arena_return(hexa_map_get_ic(tok, "value", &__hexa_parser_ic_37));
     }
-    HexaVal msg2 = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("expected identifier, got "), hexa_map_get_ic(tok, "kind", &__hexa_parser_ic_38)), hexa_str(" ('")), hexa_map_get_ic(tok, "value", &__hexa_parser_ic_39)), hexa_str("')"));
+    HexaVal tok_kind = hexa_map_get_ic(tok, "kind", &__hexa_parser_ic_38);
+    HexaVal tok_value = hexa_map_get_ic(tok, "value", &__hexa_parser_ic_39);
+    HexaVal msg2;
+    if (hexa_truthy(p_is_reserved_id_kind(tok_kind))) {
+        // P51: reserved keyword used in identifier position — loud error.
+        msg2 = hexa_add(hexa_add(hexa_add(hexa_add(
+            hexa_str("P51: reserved keyword '"),
+            tok_value),
+            hexa_str("' cannot be used as identifier — rename to '")),
+            p_reserved_id_hint(tok_kind)),
+            hexa_str("'"));
+    } else {
+        msg2 = hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("expected identifier, got "), tok_kind), hexa_str(" ('")), tok_value), hexa_str("')"));
+    }
     if (hexa_truthy(hexa_cmp_ge(hexa_int(hexa_len(p_errors)), p_max_errors))) {
         hexa_throw(hexa_str("too many parse errors"));
     }
     p_record_error(hexa_map_get_ic(tok, "line", &__hexa_parser_ic_40), hexa_map_get_ic(tok, "col", &__hexa_parser_ic_41), msg2);
     p_emit_parse_error(tok, msg2);
+    // Consume the offending reserved token to avoid infinite-loop parse
+    // cascades on the same token.
+    if (hexa_truthy(p_is_reserved_id_kind(tok_kind))) {
+        p_pos = hexa_add(p_pos, hexa_int(1));
+    }
     return __hexa_fn_arena_return(hexa_str(""));
     return __hexa_fn_arena_return(hexa_void());
 }
@@ -6867,8 +6909,11 @@ HexaVal _gen2_arena_wrap;
 HexaVal _method_registry;
 HexaVal _lambda_counter;
 HexaVal _lambda_def_parts;
-/* FIX-A (Anima serving unblock, 2026-04-19): __hexa_lambda_N fwd decls. */
-HexaVal _lambda_fwd_parts;
+/* FIX-B (T33 aliasing follow-up, 2026-04-19): per-lambda param-sig slots.
+ * Replaces _lambda_fwd_parts module-array push (same T33 freelist aliasing
+ * that bit _ic_def_parts / _strlit_def_parts). Fwd decls emitted via
+ * counter-driven loop over `_lambda_counter`. Mirrors self/codegen_c2.hexa. */
+HexaVal _lambda_fwd_sigs;
 
 /* FIX-A (2026-04-19): normalize a lambda/fn param entry to a bare name.
  * `fn(x)` parser emits Param{name,value}; `|x|` emits a bare string. Without
@@ -7766,6 +7811,12 @@ static HexaIC __hexa_codegen_c2_ic_868 = {0};
 static HexaIC __hexa_codegen_c2_ic_869 = {0};
 static HexaIC __hexa_codegen_c2_ic_870 = {0};
 static HexaIC __hexa_codegen_c2_ic_871 = {0};
+static HexaIC __hexa_codegen_c2_ic_872 = {0};
+static HexaIC __hexa_codegen_c2_ic_873 = {0};
+static HexaIC __hexa_codegen_c2_ic_874 = {0};
+static HexaIC __hexa_codegen_c2_ic_875 = {0};
+static HexaIC __hexa_codegen_c2_ic_876 = {0};
+static HexaIC __hexa_codegen_c2_ic_877 = {0};
 
 HexaVal _hexa_name_is_reserved(HexaVal s) {
     __hexa_fn_arena_enter();
@@ -8409,7 +8460,7 @@ HexaVal codegen_c2(HexaVal ast) {
     _known_set_init();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
-    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
+    _lambda_fwd_sigs = hexa_array_new(); /* FIX-B 2026-04-19 */
     _ic_counter = hexa_int(0);
     _strlit_keys = hexa_array_new();
     _strlit_ids = hexa_array_new();
@@ -8446,6 +8497,24 @@ HexaVal codegen_c2(HexaVal ast) {
                         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(_gk, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(_gk, hexa_str("LetStmt")))))) {
                             _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, hexa_map_get_ic(hexa_index_get(ast, _gi), "name", &__hexa_codegen_c2_ic_13));
                             _known_nonlocal_add(hexa_map_get_ic(hexa_index_get(ast, _gi), "name", &__hexa_codegen_c2_ic_14));
+                        } else if (hexa_truthy(hexa_eq(_gk, hexa_str("AssignStmt")))) {
+                            /* 2026-04-19: module-level `x = expr` (no let)
+                             * produces AssignStmt. Register bare-Ident lhs as
+                             * known global to prevent spurious lambda capture.
+                             * Skip Field/Index assigns. */
+                            HexaVal _alhs = hexa_map_get_ic(hexa_index_get(ast, _gi), "left", &__hexa_codegen_c2_ic_872);
+                            if (hexa_truthy(hexa_eq(hexa_type_of(_alhs), hexa_str("string")))) {
+                                if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(_alhs)), hexa_int(0)))) {
+                                    _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, _alhs);
+                                    _known_nonlocal_add(_alhs);
+                                }
+                            } else {
+                                if (hexa_truthy(hexa_eq(hexa_map_get_ic(_alhs, "kind", &__hexa_codegen_c2_ic_873), hexa_str("Ident")))) {
+                                    HexaVal _aname = hexa_map_get_ic(_alhs, "name", &__hexa_codegen_c2_ic_874);
+                                    _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, _aname);
+                                    _known_nonlocal_add(_aname);
+                                }
+                            }
                         } else {
                             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(_gk, hexa_str("ImportStmt"))) || hexa_truthy(hexa_eq(_gk, hexa_str("UseStmt")))))) {
                                 _resolve_use_register_names(hexa_map_get_ic(hexa_index_get(ast, _gi), "name", &__hexa_codegen_c2_ic_15));
@@ -8607,8 +8676,17 @@ HexaVal codegen_c2(HexaVal ast) {
         _ic_i = hexa_add(_ic_i, hexa_int(1));
     }
     parts = hexa_array_push(parts, hexa_str("\n"));
-    /* FIX-A 2026-04-19: lambda fwd decls before defs/fn bodies. */
-    parts = hexa_array_push(parts, hexa_str_join(_lambda_fwd_parts, hexa_str("")));
+    /* FIX-B 2026-04-19: counter-driven lambda fwd decl emission — mirror of
+     * fcf275f4 IC fix + rt#32-SL strlit fix. Replaces
+     * `_lambda_fwd_parts.join("")` which hit T33-class arena aliasing
+     * (first element eaten / strings truncated in output C). */
+    {
+        HexaVal _lfw_i = hexa_int(0);
+        while (HX_BOOL(hexa_cmp_lt(_lfw_i, _lambda_counter))) {
+            parts = hexa_array_push(parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal __hexa_lambda_"), hexa_to_string(_lfw_i)), hexa_str("(")), hexa_index_get(_lambda_fwd_sigs, _lfw_i)), hexa_str(");\n")));
+            _lfw_i = hexa_add(_lfw_i, hexa_int(1));
+        }
+    }
     parts = hexa_array_push(parts, hexa_str_join(_lambda_def_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str_join(fn_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str("int main(int argc, char** argv) {\n"));
@@ -12416,8 +12494,9 @@ HexaVal gen2_lambda_expr(HexaVal node) {
     }
     /* FIX-A 2026-04-19: emit matching fwd decl so call sites preceding the
      * def block (e.g. init_parts hexa_closure_new(&__hexa_lambda_N, ...)) resolve. */
-    HexaVal fn_fwd = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), fn_name), hexa_str("(")), p), hexa_str(");\n")), hexa_str(""));
-    _lambda_fwd_parts = hexa_array_push(_lambda_fwd_parts, fn_fwd);
+    /* FIX-B 2026-04-19: store param-sig in slot; fwd decl emitted in counter
+     * driven loop at codegen emit time. Mirror of fcf275f4 IC fix. */
+    _lambda_fwd_sigs = hexa_array_push(_lambda_fwd_sigs, p);
     HexaVal fn_def = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), fn_name), hexa_str("(")), p), hexa_str(") {\n")), hexa_str_join(body_parts, hexa_str(""))), hexa_str("    return hexa_void();\n}\n\n"));
     _lambda_def_parts = hexa_array_push(_lambda_def_parts, fn_def);
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(free_vars)), hexa_int(0)))) {
@@ -12438,7 +12517,7 @@ HexaVal codegen_c2_full(HexaVal ast) {
     __hexa_fn_arena_enter();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
-    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
+    _lambda_fwd_sigs = hexa_array_new(); /* FIX-B 2026-04-19 */
     _method_registry = hexa_array_new();
     _known_fn_globals = hexa_array_new();
     _known_nonlocal_names = hexa_array_new();
@@ -12635,8 +12714,14 @@ HexaVal codegen_c2_full(HexaVal ast) {
         _ic_i_full = hexa_add(_ic_i_full, hexa_int(1));
     }
     out_parts = hexa_array_push(out_parts, hexa_str("\n"));
-    /* FIX-A 2026-04-19: lambda fwd decls before defs/fn bodies. */
-    out_parts = hexa_array_push(out_parts, hexa_str_join(_lambda_fwd_parts, hexa_str("")));
+    /* FIX-B 2026-04-19: counter-driven lambda fwd decl emission. */
+    {
+        HexaVal _lfw_i_full = hexa_int(0);
+        while (HX_BOOL(hexa_cmp_lt(_lfw_i_full, _lambda_counter))) {
+            out_parts = hexa_array_push(out_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal __hexa_lambda_"), hexa_to_string(_lfw_i_full)), hexa_str("(")), hexa_index_get(_lambda_fwd_sigs, _lfw_i_full)), hexa_str(");\n")));
+            _lfw_i_full = hexa_add(_lfw_i_full, hexa_int(1));
+        }
+    }
     out_parts = hexa_array_push(out_parts, hexa_str_join(_lambda_def_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str_join(fn_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str("int main(int argc, char** argv) {\n"));
@@ -12791,7 +12876,7 @@ int _codegen_c2_init(int argc, char** argv) {
     _method_registry = hexa_array_new();
     _lambda_counter = hexa_int(0);
     _lambda_def_parts = hexa_array_new();
-    _lambda_fwd_parts = hexa_array_new(); /* FIX-A 2026-04-19 */
+    _lambda_fwd_sigs = hexa_array_new(); /* FIX-B 2026-04-19 */
     _ic_counter = hexa_int(0);
     _comptime_const_names = hexa_array_new();
     _comptime_const_nodes = hexa_array_new();
