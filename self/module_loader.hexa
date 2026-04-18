@@ -1,29 +1,34 @@
-// self/module_loader.hexa — concat-based HEXA module loader (Phase2 C1)
+// self/module_loader.hexa — iterative-DFS module preprocessor (Phase2 C1)
 //
-// 목적: bootstrap.hexa 1,945줄 모놀리스 해체.
-//   - 지시문: 첫 non-space 토큰이 `import "path.hexa"` 또는 `use "path.hexa"` 인 라인
-//   - 재귀적으로 파일 내용을 인라인 병합 (concat).
-//   - 순환 import 감지 (visited list).
-//   - 경로는 현재 파일의 디렉토리 상대로 해석.
+// 2026-04-18 rewrite. Previous recursive `ml_resolve` + `visited: array` passed
+// through call frames blew RSS to 4GB+ on self/native_compile_poc.hexa (41
+// transitively-used files). Root cause = the interpreter rt-32 freelist
+// aliasing class (T33 / feedback_hot_attr_dict_mutation): each nested
+// `out_parts = out_parts.push(...)` decref'd the previous array, freeing its
+// slot; the next `val_array()` reclaimed that slot for a DIFFERENT sibling's
+// backing store, corrupting the caller's cached Val.
 //
-// 이 로더는 parser/lexer/interpreter 와 독립적인 소스 전처리기다.
-// 전처리된 문자열을 parser 에 넘기면 모듈 지원이 사실상 완성된다.
+// Fix (same pattern as scripts/flatten_imports.hexa, rock-solid on this graph):
+//   * Iterative DFS with an explicit `stack` — ONE mutable global array touched
+//     inside the loop. No cross-frame aliasing.
+//   * `g_visited_hs` = 64-bucket hashset (O(1) has/add, no O(N) scan).
+//   * `g_order_parts` = leaves-first file path list; single mutable, only
+//     pushed to (never read) inside the walk.
+//   * Final output built by one `.join("")` on `flat_parts`.
 //
-// API:
-//   load_module(path)                  -> string   (preprocessed source)
-//   ml_resolve(src, base_dir, vs)      -> string   (internal helper)
-//   ml_resolve_path(path)              -> string   (.hexa 확장자 폴백)
+// Output shape:
+//   Transitively-collected files emitted leaves-first (topo order), each body
+//   passed through `ml_strip_and_clean` which (a) comments out
+//   `import "..."` / `use "..."` directives and (b) drops `pub ` prefix on
+//   top-level decls (stage0 parser pre-G39 quirk).
 //
 // CLI:
-//   stage0 self/module_loader.hexa               → 자체 스모크 테스트
-//   stage0 self/module_loader.hexa <in> <out>    → imports/uses 전개 후 <out> 기록
-//
-// 의존: read_file / write_file / file_exists 빌트인, 기본 string api.
+//   hexa self/module_loader.hexa <in> <out>   → flattened preprocessed source
+//   hexa self/module_loader.hexa              → self-tests
+
+// ── path helpers (host builtin-backed, O(n)) ───────────────
 
 fn ml_dirname(path) {
-    // T36 fix: char-by-char parts.push + join was O(n²) per line and blew
-    // memory to 143GB when expanding multi-use files (bc_emitter 1349 lines
-    // + bc_vm 719 lines). substring() on the host path stays O(n).
     let n = len(path)
     let mut i = n - 1
     while i >= 0 {
@@ -40,13 +45,25 @@ fn ml_join_path(dir, rel) {
         if rel[0] == '/' { return rel }
     }
     if len(dir) == 0 { return rel }
-    return dir + "/" + rel
+    // push/join instead of `dir + "/" + rel` — on the hot resolve path this
+    // triggers the interpreter's 101-concat PERF gate at ~15 concats × 200
+    // imports. push/join uses zero chained `+`.
+    let mut p = []
+    p = p.push(dir)
+    p = p.push("/")
+    p = p.push(rel)
+    return p.join("")
+}
+
+// Append `.hexa` via push/join — called 4× per import in ml_resolve_full.
+fn ml_with_hexa_ext(path) {
+    let mut p = []
+    p = p.push(path)
+    p = p.push(".hexa")
+    return p.join("")
 }
 
 fn ml_trim_left(s) {
-    // T36 fix: host builtin trim_start replaces the O(n²) char-array
-    // accumulator (parts.push + join) that blew memory to 143GB when
-    // expanding multi-use files (bc_emitter 1349 + bc_vm 719 lines).
     return s.trim_start()
 }
 
@@ -63,22 +80,12 @@ fn ml_starts_with(s, prefix) {
 }
 
 fn ml_split_lines(s) {
-    // T36 fix: host builtin split replaces char-by-char parts.push + join.
     return s.split("\n")
 }
 
-fn ml_contains(list, needle) {
-    let n = len(list)
-    let mut i = 0
-    while i < n {
-        if list[i] == needle { return true }
-        i = i + 1
-    }
-    return false
-}
+// ── directive parser ───────────────────────────────────────
 
 fn ml_parse_import(line) {
-    // T36 fix: substring in place of char-by-char parts.push + join.
     let trimmed = ml_trim_left(line)
     let mut prefix_len = 0
     if ml_starts_with(trimmed, "import ") {
@@ -104,147 +111,324 @@ fn ml_parse_import(line) {
     return ""
 }
 
-fn ml_resolve_path(full) {
-    if file_exists(full) { return full }
-    let with_ext = full + ".hexa"
-    if file_exists(with_ext) { return with_ext }
-    return full
-}
+// ── resolution (3-way: caller-relative, stdlib, project-root) ──
 
-// HX-stdlib-fallback: if `use "stdlib/foo"` (relative to caller dir) fails,
-// try well-known hexa-lang stdlib location: $HEXA_LANG/self/<imp>.hexa.
-// Enables consumers anywhere on disk to `use "stdlib/string"` and find the
-// HEXA-native string helpers (T4 migration target).
 fn ml_resolve_stdlib(imp) {
     if !ml_starts_with(imp, "stdlib/") { return "" }
     let hl = env_var("HEXA_LANG")
     if len(hl) == 0 { return "" }
-    let cand = hl + "/self/" + imp + ".hexa"
+    // `hl + "/self/" + imp + ".hexa"` — 3 concats, trips 101-gate in hot loop.
+    let mut p = []
+    p = p.push(hl)
+    p = p.push("/self/")
+    p = p.push(imp)
+    p = p.push(".hexa")
+    let cand = p.join("")
     if file_exists(cand) { return cand }
     return ""
 }
 
-// HX-project-root-fallback: `use "self/foo"` / `use "scripts/bar"` from any
-// caller dir resolves against $HEXA_LANG (project root) when caller-relative
-// lookup misses. Prevents `self/self/...` double-prefix bugs when attr files
-// cross-reference siblings via project-root paths (self/attrs/_registry.hexa
-// etc). Also tries cwd as a secondary root so dev builds without HEXA_LANG
-// still work when invoked from the repo root.
 fn ml_resolve_project_root(imp) {
     let hl = env_var("HEXA_LANG")
     if len(hl) > 0 {
-        let cand = hl + "/" + imp
+        let cand = ml_join_path(hl, imp)
         if file_exists(cand) { return cand }
-        let cand_ext = cand + ".hexa"
+        let cand_ext = ml_with_hexa_ext(cand)
         if file_exists(cand_ext) { return cand_ext }
     }
-    // cwd fallback — module_loader is invoked with cwd=project root in the
-    // hexa CLI path, so plain relative resolution still wins here.
     if file_exists(imp) { return imp }
-    let imp_ext = imp + ".hexa"
+    let imp_ext = ml_with_hexa_ext(imp)
     if file_exists(imp_ext) { return imp_ext }
     return ""
 }
 
-// Strip `pub ` visibility prefix from top-level declarations.
-// After module inlining everything is in a single TU; the stage0
-// parser (pre-G39 binary) chokes on `@attr pub fn` sequences.
-// Stripping `pub ` at the source level is safe — codegen ignores
-// visibility anyway (single translation unit).
-fn ml_strip_pub(src) {
-    // Fast exit: no `pub ` in source at all
-    if src.index_of("pub ") < 0 { return src }
-    let lines = ml_split_lines(src)
-    let n = len(lines)
-    let mut out = []
-    let mut i = 0
-    while i < n {
-        let line = lines[i]
-        let t = ml_trim_left(line)
-        if ml_starts_with(t, "pub fn ") || ml_starts_with(t, "pub struct ") || ml_starts_with(t, "pub enum ") || ml_starts_with(t, "pub let ") || ml_starts_with(t, "pub const ") {
-            // Compute leading whitespace length
-            let tlen = len(t)
-            let llen = len(line)
-            let ws = line.substring(0, llen - tlen)
-            // Remove "pub " (4 chars) from the trimmed line
-            out = out.push(ws + t.substring(4, tlen))
-        } else {
-            out = out.push(line)
-        }
-        i = i + 1
+// Target-dir fallback: POC convention (scripts/flatten_imports) treats all
+// `use "name"` paths as relative to the TOP-LEVEL script's dir. Without this,
+// a file at self/poc/stmt/break_stmt.hexa cannot resolve `use "poc/common"`
+// (caller-dir would look for self/poc/stmt/poc/common, which doesn't exist).
+let mut g_target_dir = "."
+
+fn ml_resolve_full(imp, caller_dir) {
+    // 1. caller-relative (C-style #include)
+    let raw_full = ml_join_path(caller_dir, imp)
+    if file_exists(raw_full) { return raw_full }
+    let with_ext = ml_with_hexa_ext(raw_full)
+    if file_exists(with_ext) { return with_ext }
+    // 2. target-relative (flatten_imports convention — POC uses this)
+    if caller_dir != g_target_dir {
+        let tgt_full = ml_join_path(g_target_dir, imp)
+        if file_exists(tgt_full) { return tgt_full }
+        let tgt_ext = ml_with_hexa_ext(tgt_full)
+        if file_exists(tgt_ext) { return tgt_ext }
     }
-    return out.join("\n")
+    // 3. stdlib ("stdlib/..." → $HEXA_LANG/self/...)
+    let sp = ml_resolve_stdlib(imp)
+    if len(sp) > 0 { return sp }
+    // 4. project-root
+    let pr = ml_resolve_project_root(imp)
+    if len(pr) > 0 { return pr }
+    return ""
 }
 
-let mut ml_has_cycle = false
+// ── 64-bucket hashset (same shape as flatten_imports fl_hset) ──
 
-// HX-dedup: `.push()` mutates in place, so `visited` is effectively a global
-// "already loaded" set shared across sibling branches. That is also what we
-// want semantically — diamond imports (A and B both `use "core"`) should
-// inline core once, not trigger a false "cycle" error. Revisits are treated
-// as include-guard dedup: skip silently with a comment marker.
-fn ml_resolve(src, base_dir, visited) {
-    let lines = ml_split_lines(src)
-    let mut out_parts = []
-    let n = len(lines)
+fn ml_hset_new() {
+    let mut buckets = []
+    let mut bi = 0
+    while bi < 64 {
+        let empty = []
+        buckets = buckets.push(empty)
+        bi = bi + 1
+    }
+    return buckets
+}
+
+fn ml_hset_hash(key) {
+    let n = len(key)
+    let mut h = 0
+    let mut ci = 0
+    while ci < n {
+        let c = key.substring(ci, ci + 1)
+        h = (h * 31 + ord(c)) % 64
+        ci = ci + 1
+    }
+    return h
+}
+
+fn ml_hset_has(buckets, key) {
+    let h = ml_hset_hash(key)
+    let bucket = buckets[h]
+    let n = len(bucket)
     let mut i = 0
     while i < n {
-        let line = lines[i]
-        let imp = ml_parse_import(line)
-        if imp == "" {
-            out_parts = out_parts.push(line)
-            out_parts = out_parts.push("\n")
+        if bucket[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn ml_hset_add(buckets, key) {
+    let h = ml_hset_hash(key)
+    let bucket = buckets[h]
+    let n = len(bucket)
+    let mut i = 0
+    while i < n {
+        if bucket[i] == key { return buckets }
+        i = i + 1
+    }
+    let new_bucket = bucket.push(key)
+    let mut new_buckets = []
+    let mut bi = 0
+    while bi < 64 {
+        if bi == h {
+            new_buckets = new_buckets.push(new_bucket)
         } else {
-            let raw_full = ml_join_path(base_dir, imp)
-            let mut full = ml_resolve_path(raw_full)
-            // HX-stdlib-fallback: if local resolve missed, try stdlib/<imp>.
-            if !file_exists(full) {
-                let std_full = ml_resolve_stdlib(imp)
-                if len(std_full) > 0 { full = std_full }
+            new_buckets = new_buckets.push(buckets[bi])
+        }
+        bi = bi + 1
+    }
+    return new_buckets
+}
+
+// ── collect imports (one pass over lines) ──────────────────
+
+fn ml_collect_imports(src) {
+    let lines = ml_split_lines(src)
+    let n = len(lines)
+    let mut imps = []
+    let mut i = 0
+    while i < n {
+        let imp = ml_parse_import(lines[i])
+        if imp != "" { imps = imps.push(imp) }
+        i = i + 1
+    }
+    return imps
+}
+
+// ── strip directives + `pub ` prefix in ONE pass ───────────
+
+// Strip `import "..."` / `use "..."` directives and `pub ` prefix on
+// top-level decls, in-place via `.replace()` — a builtin O(n) operation.
+//
+// WHY NO LINE-SPLIT: the interpreter's `out = out.push(line)` pattern
+// allocates a fresh array on every push (not amortized realloc). On
+// self/parser.hexa (4098 lines) the cumulative array storage blows the
+// heap to 7-16 GB. Replacing the per-line pass with whole-source
+// `.replace()` calls keeps the total work O(n) and peak RSS flat.
+//
+// Caveats:
+//   * Column-0 matching: directives and `pub` are only found at line start,
+//     since they are preceded by `\n` in the search pattern. Top-level
+//     decls in hexa sources never have leading indent (true in practice).
+//   * First line of the file: the source may start with a directive or
+//     `pub ` without a leading `\n`. We check and handle that case with a
+//     single string concat, not inside a loop.
+fn ml_strip_and_clean(src) {
+    if src.index_of("import ") < 0 && src.index_of("use ") < 0 && src.index_of("pub ") < 0 {
+        return src
+    }
+    let mut s = src
+    // First-line directive / pub — rare but correct-handle.
+    if ml_starts_with(s, "import ") || ml_starts_with(s, "use ") {
+        let nl = s.index_of("\n")
+        let prefix = "// [ml-stripped] "
+        if nl < 0 {
+            let mut pp = []
+            pp = pp.push(prefix)
+            pp = pp.push(s)
+            s = pp.join("")
+        } else {
+            let first_line = s.substring(0, nl)
+            let rest = s.substring(nl, len(s))
+            let mut pp = []
+            pp = pp.push(prefix)
+            pp = pp.push(first_line)
+            pp = pp.push(rest)
+            s = pp.join("")
+        }
+    } else if ml_starts_with(s, "pub fn ") || ml_starts_with(s, "pub struct ") || ml_starts_with(s, "pub enum ") || ml_starts_with(s, "pub let ") || ml_starts_with(s, "pub const ") {
+        s = s.substring(4, len(s))
+    }
+    // Interior (after a newline) — builtin replace, O(n), no intermediate arrays.
+    s = s.replace("\nimport \"", "\n// [ml-stripped] import \"")
+    s = s.replace("\nuse \"", "\n// [ml-stripped] use \"")
+    s = s.replace("\npub fn ", "\nfn ")
+    s = s.replace("\npub struct ", "\nstruct ")
+    s = s.replace("\npub enum ", "\nenum ")
+    s = s.replace("\npub let ", "\nlet ")
+    s = s.replace("\npub const ", "\nconst ")
+    return s
+}
+
+// ── globals for iterative walk (SINGLE mutable array pattern) ──
+//
+// Mutating more than one global array inside the loop risks the rt-32
+// freelist-aliasing class of bug: each `.push()` decrefs the old backing
+// slot, and the next `val_array()` can reuse that slot for a sibling
+// global, silently corrupting the caller's cached Val. See
+// feedback_hot_attr_dict_mutation / T33 in memory.
+//
+// Contract:
+//   * `stack`       — only mutated inside the loop body; local to ml_iter_walk
+//   * `g_visited_hs` — assigned once per new file; hashset is bucketed, so
+//                      rebuild allocates a single fresh outer array
+//   * `g_order_parts` — appended to once per file AFTER all reads/resolves
+//                        of that iteration are done
+
+let mut g_order_parts = []
+let mut g_visited_hs = ml_hset_new()
+
+fn ml_iter_walk(start_file) {
+    let MARKER = "<<EMIT>>"
+    let mut stack = []
+    stack = stack.push(start_file)
+
+    while len(stack) > 0 {
+        let top_idx = len(stack) - 1
+        let top = stack[top_idx]
+        stack = stack.truncate(top_idx)
+
+        if top == MARKER {
+            // Next item is the file to emit (post-DFS order)
+            let em_idx = len(stack) - 1
+            let emit_file = stack[em_idx]
+            stack = stack.truncate(em_idx)
+            if !ml_hset_has(g_visited_hs, emit_file) {
+                g_visited_hs = ml_hset_add(g_visited_hs, emit_file)
+                g_order_parts = g_order_parts.push(emit_file)
             }
-            // HX-project-root-fallback: `use "self/foo"` from a file that
-            // itself lives under self/ would double-prefix to self/self/foo.
-            // Retry against HEXA_LANG (project root) and cwd.
-            if !file_exists(full) {
-                let pr_full = ml_resolve_project_root(imp)
-                if len(pr_full) > 0 { full = pr_full }
-            }
-            if ml_contains(visited, full) {
-                out_parts = out_parts.push("// [module_loader] skip (already loaded): " + full)
-                out_parts = out_parts.push("\n")
+        } else {
+            if ml_hset_has(g_visited_hs, top) {
+                // already emitted earlier in DFS — skip
             } else {
-                let vs2 = visited.push(full)
-                let child_src = read_file(full)
-                let child_dir = ml_dirname(full)
-                let expanded = ml_resolve(child_src, child_dir, vs2)
-                let cleaned = ml_strip_pub(expanded)
-                out_parts = out_parts.push("// [module_loader] begin: " + full)
-                out_parts = out_parts.push("\n")
-                out_parts = out_parts.push(cleaned)
-                out_parts = out_parts.push("// [module_loader] end: " + full)
-                out_parts = out_parts.push("\n")
+                // Reserve the emit frame first, so children pushed below
+                // are processed before this file finalizes.
+                stack = stack.push(top)
+                stack = stack.push(MARKER)
+
+                let src = read_file(top)
+                let caller_dir = ml_dirname(top)
+                let imps = ml_collect_imports(src)
+                let dn = len(imps)
+                // Reverse-push so first `use` is popped first → natural order.
+                let mut di = dn - 1
+                while di >= 0 {
+                    let imp = imps[di]
+                    let full = ml_resolve_full(imp, caller_dir)
+                    if len(full) > 0 {
+                        if !ml_hset_has(g_visited_hs, full) {
+                            stack = stack.push(full)
+                        }
+                    } else {
+                        let mut wp = []
+                        wp = wp.push("[module_loader] WARN dep not found: ")
+                        wp = wp.push(imp)
+                        wp = wp.push(" (from ")
+                        wp = wp.push(top)
+                        wp = wp.push(")")
+                        println(wp.join(""))
+                    }
+                    di = di - 1
+                }
             }
         }
-        i = i + 1
     }
-    return out_parts.join("")
 }
+
+// ── public API ────────────────────────────────────────────
 
 fn load_module(path) {
-    let src = read_file(path)
-    let dir = ml_dirname(path)
-    let visited = [path]
-    return ml_resolve(src, dir, visited)
+    g_order_parts = []
+    g_visited_hs = ml_hset_new()
+    g_target_dir = ml_dirname(path)
+
+    ml_iter_walk(path)
+
+    let m = len(g_order_parts)
+    let mut flat_parts = []
+    flat_parts = flat_parts.push("// === EXPANDED by module_loader.hexa ===\n")
+    let mut hdr = []
+    hdr = hdr.push("// target: ")
+    hdr = hdr.push(path)
+    hdr = hdr.push("\n// files:  ")
+    hdr = hdr.push(str(m))
+    hdr = hdr.push("\n// order:  topo (leaves-first)\n\n")
+    flat_parts = flat_parts.push(hdr.join(""))
+
+    let mut ei = 0
+    while ei < m {
+        let f = g_order_parts[ei]
+        let body = read_file(f)
+        let cleaned = ml_strip_and_clean(body)
+        let mut bp = []
+        bp = bp.push("\n// [module_loader] begin: ")
+        bp = bp.push(f)
+        bp = bp.push("\n")
+        flat_parts = flat_parts.push(bp.join(""))
+        flat_parts = flat_parts.push(cleaned)
+        let mut ep = []
+        ep = ep.push("\n// [module_loader] end: ")
+        ep = ep.push(f)
+        ep = ep.push("\n")
+        flat_parts = flat_parts.push(ep.join(""))
+        ei = ei + 1
+    }
+    return flat_parts.join("")
 }
+
+// ── CLI / self-test ───────────────────────────────────────
 
 let __ml_av = args()
 if len(__ml_av) >= 4 {
     let expanded = load_module(__ml_av[2])
-    if ml_has_cycle {
-        eprintln("[module_loader] FATAL: import cycle(s) detected — output is incomplete, aborting")
-        exit(1)
-    }
     write_file(__ml_av[3], expanded)
+    let mut done = []
+    done = done.push("[module_loader] wrote ")
+    done = done.push(__ml_av[3])
+    done = done.push(" (")
+    done = done.push(str(len(g_order_parts)))
+    done = done.push(" files)")
+    println(done.join(""))
 } else {
     println("[module_loader] helpers ready")
     assert ml_dirname("a/b/c.hexa") == "a/b"
@@ -262,5 +446,12 @@ if len(__ml_av) >= 4 {
     assert len(ls) == 3
     assert ls[0] == "a"
     assert ls[2] == "c"
+    // hashset sanity
+    let mut hs = ml_hset_new()
+    assert !ml_hset_has(hs, "foo")
+    hs = ml_hset_add(hs, "foo")
+    assert ml_hset_has(hs, "foo")
+    hs = ml_hset_add(hs, "foo")  // dedup
+    assert ml_hset_has(hs, "foo")
     println("[module_loader] self-test PASS")
 }
