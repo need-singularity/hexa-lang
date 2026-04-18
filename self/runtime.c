@@ -3154,6 +3154,32 @@ HexaVal hexa_abs(HexaVal v) {
     return hexa_float(fabs(HX_FLOAT(v)));
 }
 
+// P7-6 math coverage (2026-04-19): transcendentals + rounding + conversions
+// used by training/inference codegen. All route through __hx_to_double to
+// unwrap TAG_VALSTRUCT wrappers (same pattern as hexa_sqrt).
+
+HexaVal hexa_sin(HexaVal v)   { return hexa_float(sin(__hx_to_double(v))); }
+HexaVal hexa_cos(HexaVal v)   { return hexa_float(cos(__hx_to_double(v))); }
+HexaVal hexa_tan(HexaVal v)   { return hexa_float(tan(__hx_to_double(v))); }
+HexaVal hexa_exp(HexaVal v)   { return hexa_float(exp(__hx_to_double(v))); }
+HexaVal hexa_log(HexaVal v)   { return hexa_float(log(__hx_to_double(v))); }
+HexaVal hexa_log10(HexaVal v) { return hexa_float(log10(__hx_to_double(v))); }
+HexaVal hexa_round(HexaVal v) { return hexa_int((int64_t)llround(__hx_to_double(v))); }
+
+// to_float: coerce any scalar to float
+HexaVal hexa_to_float(HexaVal v) {
+    return hexa_float(__hx_to_double(v));
+}
+
+// to_int: coerce any scalar to int (truncate toward zero for floats)
+HexaVal hexa_to_int(HexaVal v) {
+    if (HX_IS_INT(v)) return v;
+    if (HX_IS_FLOAT(v)) return hexa_int((int64_t)HX_FLOAT(v));
+    // String → int fallback via existing parser
+    if (HX_IS_STR(v)) return hexa_str_parse_int(v);
+    return hexa_int((int64_t)__hx_to_double(v));
+}
+
 // ── String format ────────────────────────────────────
 
 // Multi-arg format: hexa_format_n(fmt, args_array)
