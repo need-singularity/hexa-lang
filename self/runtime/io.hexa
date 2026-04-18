@@ -1,0 +1,220 @@
+// self/runtime/io.hexa — P7-7b chunk 4: IO/file/dir/path runtime in pure Hexa
+//
+// Role
+//   P7-7b chunk 4. runtime.c 의 file/dir/path helper 10종을 pure-Hexa 로
+//   재구현한다. chunk 1 (strings) / chunk 2 (arrays) / chunk 3 (math) 과
+//   동일한 additive 레퍼런스 구현. runtime.c 는 건드리지 않고, 추후 codegen
+//   이 해당 심볼을 pure-Hexa pub fn 으로 lowering 하게 되면 그대로 인라인
+//   emit 한다.
+//
+//   **Additive** — runtime.c 에서 아직 아무것도 제거하지 않는다.
+//
+// C ↔ Hexa 의미 대응표
+//   hexa_read_file         (runtime.c:2799)  → file_read         (builtin wrapper)
+//   hexa_write_file        (runtime.c:2812)  → file_write        (builtin wrapper)
+//   hexa_file_exists       (runtime.c via)   → file_exists       (builtin wrapper)
+//   hexa_file_size         (runtime.c:3005)  → file_size         (read_file + len)
+//   hexa_delete_file       (runtime.c:4702)  → file_delete       (builtin wrapper)
+//   hexa_append_file       (runtime.c:4708)  → file_append       (builtin wrapper)
+//   (exec "mkdir -p")                         → dir_create
+//   (exec "test -d")                          → dir_exists
+//   (신규, pure string)                        → path_join        (POSIX "/" concat)
+//   (신규, pure string)                        → path_dirname     (last "/" split)
+//   (신규, pure string)                        → path_basename    (last "/" tail)
+//
+// 선택 기준 (HX4 / HX7)
+//   · self-contained       : builtin + pure string 조작만. FFI / cstring 금지.
+//   · runtime.c 구현 <40 LOC — byte-identity 검증 쉬움.
+//   · 빌드/툴링 핫패스에서 자주 쓰는 IO 기본기.
+//
+// 제약 (CLAUDE.md)
+//   HX3  : grammar pitfalls — no ;  · let mut for reassign  · `.push()` + join
+//   HX4  : SELF-HOST FIRST — no FFI, no cstring(), builtin-only
+//   HX7  : self/ 경로 전용
+//   feedback_seed_freeze — stage0 재빌드 금지. 검증은 test_runner 로만.
+//
+// Stage0 pitfall 회피
+//   · .replace() 체인 / substring(i, i+1) 1-char peek 만 사용 — O(n²) 회피
+//   · let mut 로 loop 재대입 — P15 지침
+//   · `.push()` + `.join("")` 패턴 — P15 / HX3
+//   · 외부 shell 은 dir_create/dir_exists 두 곳만, path 는 탈주 없게 옴션 0
+//
+// 기 존재하는 file_pure.hexa / path_pure.hexa 와의 차이
+//   file_pure.hexa : "_pure" 접미어 + type_of 가드가 많음 — 타입 방어.
+//   path_pure.hexa : _last_idx_of 내부 헬퍼 — ext/stem 까지 포함.
+//   본 파일        : "file_" / "dir_" / "path_" 접두어 + 최소 10종 —
+//                    P7-7b 의 "codegen interpose 직전 이름 1:1" 철학.
+
+
+// ══════════════════════════════════════════════════════════════════
+//  FILE
+// ══════════════════════════════════════════════════════════════════
+
+// ── file_read ────────────────────────────────────────────
+// Mirrors hexa_read_file (runtime.c:2799). 파일 전체를 문자열로 반환.
+// C: fopen 실패 → "" 반환. read_file 빌트인도 동일 의미.
+pub fn file_read(path) {
+    if type_of(path) != "string" { return "" }
+    read_file(path)
+}
+
+// ── file_write ───────────────────────────────────────────
+// Mirrors hexa_write_file (runtime.c:2812). content 를 path 에 덮어쓴다.
+// C: fwrite 로 len(content) byte 기록. write_file 빌트인 동일.
+// 반환: true (성공) / false (타입 오류).
+pub fn file_write(path, content) {
+    if type_of(path) != "string" { return false }
+    if type_of(content) != "string" { return false }
+    write_file(path, content)
+    true
+}
+
+// ── io_file_exists ───────────────────────────────────────
+// Mirrors hexa_file_exists (runtime.c:158 forward decl).
+// true = 정규 파일 존재. test -e 를 사용하여 builtin 이름 재귀 회피.
+// (stage0 에서 `pub fn X` 가 builtin X 와 이름 충돌 시 자가 재귀 → infinite
+//  loop 위험. `io_` 접두어로 namespace 분리.)
+pub fn io_file_exists(path) {
+    if type_of(path) != "string" { return false }
+    if len(path) == 0 { return false }
+    let r = exec("test -e '" + path + "' && printf 1 || printf 0")
+    r == "1"
+}
+
+// ── file_size ────────────────────────────────────────────
+// Mirrors hexa_file_size (runtime.c:3005). 파일 크기(byte).
+// C 는 fseek/ftell; 여기서는 read_file 후 len() — ASCII/UTF-8 byte 길이.
+// 존재하지 않으면 read_file → "" → len 0 (C 는 -1 반환이지만, stage0
+// 포팅은 "byte 수" 의미만 유지하고 누락 감지는 io_file_exists 로 분리).
+pub fn file_size(path) {
+    if type_of(path) != "string" { return 0 }
+    if io_file_exists(path) == false { return 0 }
+    let content = read_file(path)
+    len(content)
+}
+
+// ── file_delete ──────────────────────────────────────────
+// Mirrors hexa_delete_file (runtime.c:4702). unlink(path).
+// 누락 파일은 silent — C 의 unlink ENOENT 무시와 동일.
+pub fn file_delete(path) {
+    if type_of(path) != "string" { return false }
+    delete_file(path)
+    true
+}
+
+// ── file_append ──────────────────────────────────────────
+// Mirrors hexa_append_file (runtime.c:4708). content 를 path 끝에 추가.
+// 파일 없으면 새로 생성 — C 의 fopen("ab") 와 동일.
+pub fn file_append(path, content) {
+    if type_of(path) != "string" { return false }
+    if type_of(content) != "string" { return false }
+    append_file(path, content)
+    true
+}
+
+
+// ══════════════════════════════════════════════════════════════════
+//  DIR
+// ══════════════════════════════════════════════════════════════════
+
+// ── dir_create ───────────────────────────────────────────
+// mkdir -p 의미. 이미 존재해도 OK. POSIX shell 로 위임.
+// path 는 self-host 툴체인 제어 — 외부 입력 금지 (shell injection 주의).
+pub fn dir_create(path) {
+    if type_of(path) != "string" { return false }
+    if len(path) == 0 { return false }
+    exec("mkdir -p '" + path + "'")
+    true
+}
+
+// ── dir_exists ───────────────────────────────────────────
+// test -d 의미. builtin file_exists 는 정규 파일도 true 를 주므로
+// 디렉터리 판별은 shell 로 한다.
+pub fn dir_exists(path) {
+    if type_of(path) != "string" { return false }
+    if len(path) == 0 { return false }
+    let r = exec("test -d '" + path + "' && printf 1 || printf 0")
+    r == "1"
+}
+
+
+// ══════════════════════════════════════════════════════════════════
+//  PATH — pure string (no FFI, no shell)
+// ══════════════════════════════════════════════════════════════════
+
+// 내부 헬퍼: path 문자열에서 마지막 "/" 의 byte 인덱스. 없으면 -1.
+// stage0 는 .last_index_of 메서드 미구현 — 뒤에서부터 linear scan.
+fn _io_last_slash(s) {
+    let n = len(s)
+    let mut i = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    -1
+}
+
+// ── path_join ────────────────────────────────────────────
+// 두 segment 를 "/" 하나로 연결. trailing "/" (a) / leading "/" (b) 중복
+// 제거. POSIX only — Windows drive letter/backslash 미지원.
+//   "a",  "b"   → "a/b"
+//   "a/", "b"   → "a/b"
+//   "a",  "/b"  → "a/b"
+//   "",   "b"   → "b"
+//   "a",  ""    → "a"
+pub fn path_join(a, b) {
+    if type_of(a) != "string" { return b }
+    if type_of(b) != "string" { return a }
+    if len(a) == 0 { return b }
+    if len(b) == 0 { return a }
+    let mut alen = len(a)
+    while alen > 0 && a.substring(alen - 1, alen) == "/" {
+        alen = alen - 1
+    }
+    let mut bstart = 0
+    while bstart < len(b) && b.substring(bstart, bstart + 1) == "/" {
+        bstart = bstart + 1
+    }
+    if alen == 0 {
+        return "/" + b.substring(bstart, len(b))
+    }
+    let mut parts = []
+    parts = parts.push(a.substring(0, alen))
+    parts = parts.push("/")
+    parts = parts.push(b.substring(bstart, len(b)))
+    parts.join("")
+}
+
+// ── path_dirname ─────────────────────────────────────────
+// 마지막 "/" 앞부분. 절대경로 root 는 "/". "/" 없는 이름은 "".
+//   "/a/b/c"  → "/a/b"
+//   "/a"      → "/"
+//   "foo"     → ""
+//   ""        → ""
+pub fn path_dirname(path) {
+    if type_of(path) != "string" { return "" }
+    if len(path) == 0 { return "" }
+    let idx = _io_last_slash(path)
+    if idx < 0 { return "" }
+    if idx == 0 { return "/" }
+    path.substring(0, idx)
+}
+
+// ── path_basename ────────────────────────────────────────
+// 마지막 "/" 뒷부분. trailing "/" 은 먼저 제거.
+//   "/a/b/c"   → "c"
+//   "/a/b/c/"  → "c"
+//   "foo"      → "foo"
+//   "/"        → ""
+//   ""         → ""
+pub fn path_basename(path) {
+    if type_of(path) != "string" { return "" }
+    let mut n = len(path)
+    while n > 0 && path.substring(n - 1, n) == "/" {
+        n = n - 1
+    }
+    let trimmed = path.substring(0, n)
+    let idx = _io_last_slash(trimmed)
+    if idx < 0 { return trimmed }
+    trimmed.substring(idx + 1, len(trimmed))
+}
