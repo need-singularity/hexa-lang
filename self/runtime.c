@@ -4677,6 +4677,73 @@ HexaVal hexa_is_empty(HexaVal v) {
     return hexa_bool(1); // null/undefined/etc. → empty
 }
 
+// min/max: reduction by element. Uses hexa_cmp_lt/gt which already handle
+// int/float mixing. Empty array returns void (matches interpreter at
+// hexa_full.hexa:15344).
+HexaVal hexa_array_min(HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_void();
+    int64_t n = HX_ARR_LEN(arr);
+    if (n == 0) return hexa_void();
+    HexaVal best = HX_ARR_ITEMS(arr)[0];
+    for (int64_t i = 1; i < n; i++) {
+        HexaVal it = HX_ARR_ITEMS(arr)[i];
+        if (hexa_truthy(hexa_cmp_lt(it, best))) best = it;
+    }
+    return best;
+}
+
+HexaVal hexa_array_max(HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_void();
+    int64_t n = HX_ARR_LEN(arr);
+    if (n == 0) return hexa_void();
+    HexaVal best = HX_ARR_ITEMS(arr)[0];
+    for (int64_t i = 1; i < n; i++) {
+        HexaVal it = HX_ARR_ITEMS(arr)[i];
+        if (hexa_truthy(hexa_cmp_gt(it, best))) best = it;
+    }
+    return best;
+}
+
+// flatten: one-level; non-array elements passed through.
+// Matches interpreter semantics at hexa_full.hexa:15316-15327.
+HexaVal hexa_array_flatten(HexaVal arr) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    for (int64_t i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal it = HX_ARR_ITEMS(arr)[i];
+        if (HX_IS_ARRAY(it)) {
+            for (int64_t j = 0; j < HX_ARR_LEN(it); j++) {
+                out = hexa_array_push(out, HX_ARR_ITEMS(it)[j]);
+            }
+        } else {
+            out = hexa_array_push(out, it);
+        }
+    }
+    return out;
+}
+
+// for_each: side-effect iteration. Returns void (hexa_full.hexa:15187).
+HexaVal hexa_array_for_each(HexaVal arr, HexaVal fn) {
+    if (!HX_IS_ARRAY(arr)) return hexa_void();
+    for (int64_t i = 0; i < HX_ARR_LEN(arr); i++) {
+        hexa_call1(fn, HX_ARR_ITEMS(arr)[i]);
+    }
+    return hexa_void();
+}
+
+// fill: new array of same length, every slot set to v.
+// Matches interpreter: returns a NEW array rather than mutating in place
+// (hexa_full.hexa:15486-15494).
+HexaVal hexa_array_fill(HexaVal arr, HexaVal v) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_ARR_LEN(arr);
+    for (int64_t i = 0; i < n; i++) {
+        out = hexa_array_push(out, v);
+    }
+    return out;
+}
+
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
