@@ -1,0 +1,137 @@
+// tests/native_build/cov_exec_wrap.hexa — P7-6 coverage gap #5 smoke.
+//
+// Validates that self/codegen/macho.hexa::macho_exec_wrap produces a
+// structurally-correct MH_EXECUTE image WITHOUT linking or invoking
+// the binary (seed-freeze: stage0 rebuild is blocked until the
+// hexa_v2 circular-rebuild regression is cleared — see
+// feedback_seed_freeze). Any byte-level regression surfaces as a
+// failed static-diff assertion below.
+//
+// Source of truth (import-style): the byte layout mirrors the inline
+// build_macho_hex() wrapper in self/compile_pipeline.hexa (which is
+// known to produce a running binary after `codesign -s -`). This test
+// re-derives the structural constants from the Mach-O spec and checks
+// the wrapper against them.
+//
+// Fixtures:
+//   P7 "hello world" payload = single RET (arm64 0xd65f03c0) — we do
+//   NOT need a functional program to validate the wrapper; 4 bytes is
+//   enough to exercise the text-size-aligned path and LC_MAIN offset.
+//
+// What this test does NOT cover (deferred):
+//   - Running the binary (blocked by seed-freeze).
+//   - codesign roundtrip (native_build.hexa handles this at build time).
+//   - Cross-check against an ld(1)-produced reference binary — would
+//     need a Mac host + linker, which contradicts the zero-tool goal.
+
+fn u32_at(buf: [int], off: int) -> int {
+    return buf[off]
+        + buf[off + 1] * 256
+        + buf[off + 2] * 65536
+        + buf[off + 3] * 16777216
+}
+
+fn u64_at(buf: [int], off: int) -> int {
+    let lo = u32_at(buf, off)
+    let hi = u32_at(buf, off + 4)
+    return lo + hi * 4294967296
+}
+
+fn expect_eq(label: string, got: int, want: int, ok: bool) -> bool {
+    if got == want {
+        return ok
+    }
+    println("  FAIL: " + label + " got=" + to_string(got) + " want=" + to_string(want))
+    return false
+}
+
+fn test_macho_exec_wrap() {
+    println("macho_exec_wrap — MH_EXECUTE shape self-test")
+    let mut ok = true
+
+    // ── Fixture: single RET (arm64 0xd65f03c0, LE bytes c0 03 5f d6) ──
+    let code = [0xc0, 0x03, 0x5f, 0xd6]
+    let CODE_OFF = 768        // 0x300 — default entryoff
+    let bin = macho_exec_wrap(code, CODE_OFF)
+
+    // ── Size floor ─────────────────────────────────────────────────
+    //   header(32) + LCs(576) + pad to 0x300 + code + pad to 0x4000 + LE stub(49)
+    //   = 0x4000 + 49 = 16433 bytes.
+    ok = expect_eq("total size", len(bin), 0x4000 + 49, ok)
+
+    // ── Header ─────────────────────────────────────────────────────
+    ok = expect_eq("magic",       u32_at(bin, 0),  0xFEEDFACF, ok)
+    ok = expect_eq("cputype",     u32_at(bin, 4),  0x0100000C, ok)
+    ok = expect_eq("cpusubtype",  u32_at(bin, 8),  0,          ok)
+    ok = expect_eq("filetype",    u32_at(bin, 12), 2,          ok)  // MH_EXECUTE
+    ok = expect_eq("ncmds",       u32_at(bin, 16), 11,         ok)
+    ok = expect_eq("sizeofcmds",  u32_at(bin, 20), 576,        ok)
+    ok = expect_eq("flags",       u32_at(bin, 24), 0x00200085, ok)
+
+    // ── First load command = LC_SEGMENT_64 __PAGEZERO ──────────────
+    ok = expect_eq("lc0.cmd",     u32_at(bin, 32), 0x19, ok)
+    ok = expect_eq("lc0.cmdsize", u32_at(bin, 36), 72,   ok)
+    //   __PAGEZERO vmaddr=0, vmsize=0x100000000, initprot=0
+    ok = expect_eq("pagezero.vmaddr.lo", u32_at(bin, 32 + 8 + 16),     0, ok)
+    ok = expect_eq("pagezero.vmsize",    u64_at(bin, 32 + 8 + 16 + 8), 0x100000000, ok)
+
+    // ── Sniff LC_MAIN entryoff via scan (11 cmds; find 0x80000028) ──
+    // Load commands start at offset 32 and total 576 bytes.
+    let mut found_main = false
+    let mut main_entryoff = 0 - 1
+    let mut pos = 32
+    let lc_end = 32 + 576
+    while pos < lc_end {
+        let cmd = u32_at(bin, pos)
+        let sz  = u32_at(bin, pos + 4)
+        if cmd == 0x80000028 {
+            found_main = true
+            main_entryoff = u64_at(bin, pos + 8)
+        }
+        if sz == 0 {
+            // Prevent infinite loops on malformed output.
+            pos = lc_end
+        } else {
+            pos = pos + sz
+        }
+    }
+    if !found_main {
+        println("  FAIL: LC_MAIN not found")
+        ok = false
+    }
+    ok = expect_eq("LC_MAIN.entryoff", main_entryoff, CODE_OFF, ok)
+
+    // ── .text payload lands at CODE_OFF ────────────────────────────
+    ok = expect_eq(".text[0]", bin[CODE_OFF],     0xc0, ok)
+    ok = expect_eq(".text[1]", bin[CODE_OFF + 1], 0x03, ok)
+    ok = expect_eq(".text[2]", bin[CODE_OFF + 2], 0x5f, ok)
+    ok = expect_eq(".text[3]", bin[CODE_OFF + 3], 0xd6, ok)
+
+    // ── Tail LE stub: first u32 = 0, second u32 = 0x20 ─────────────
+    ok = expect_eq("LE.hdr0", u32_at(bin, 0x4000),     0,    ok)
+    ok = expect_eq("LE.hdr1", u32_at(bin, 0x4000 + 4), 0x20, ok)
+
+    // ── Byte-diff vs macho_obj_wrap (must differ at filetype) ──────
+    //   Sanity: the old relocatable wrap must be distinguishable from
+    //   the new executable wrap. macho_obj_wrap writes MH_OBJECT (1)
+    //   at offset 12; macho_exec_wrap writes MH_EXECUTE (2).
+    let obj = macho_obj_wrap(code, 0)
+    if u32_at(obj, 12) == u32_at(bin, 12) {
+        println("  FAIL: obj vs exec share filetype — alias regression")
+        ok = false
+    }
+    ok = expect_eq("obj.filetype", u32_at(obj, 12), 1, ok)
+
+    // ── Summary ────────────────────────────────────────────────────
+    println("  total size       : " + to_string(len(bin)) + " bytes")
+    println("  filetype         : MH_EXECUTE (2)")
+    println("  ncmds            : 11")
+    println("  LC_MAIN entryoff : " + to_string(main_entryoff))
+    println("  .text at 0x300   : c0 03 5f d6 (RET)")
+
+    if ok {
+        println("  ALL CHECKS PASS")
+    }
+}
+
+test_macho_exec_wrap()
