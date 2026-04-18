@@ -309,6 +309,125 @@ fn resolve_reg_x86(alloc: FuncAlloc, vid: int) -> int {
 }
 
 // ═══════════════════════════════════════════════════════════════
+//  ARM64 PARALLEL MOVE (call/syscall arg marshalling)
+// ═══════════════════════════════════════════════════════════════
+// AArch64 call/syscall moves values from arbitrary source regs into
+// the ABI param register file (x0..xN-1). The naive 1-pass loop
+//
+//   for i: MOV dst[i], src[i]
+//
+// silently corrupts data when any src[j] (j>i) equals dst[i] — the
+// earlier MOV clobbers a value that is still a pending source.
+//
+// Example: call f(v1, v2) with regalloc placing v1→x1 and v2→x0.
+//   dst=[x0, x1]  src=[x1, x0]
+//   iter 0: MOV x0, x1   (x0 := v1)   ← OK
+//   iter 1: MOV x1, x0   (x1 := v1)   ← BUG: x0 no longer holds v2
+//
+// Algorithm: topological emit — repeatedly pick a move whose dst is
+// no longer a pending src, emit it, drop it from the worklist.
+// If only cycles remain, break one by routing through x17 (arm64_tmp2,
+// excluded from gp_regs_arm64). Cycles can still resolve after the
+// break because moving one node's src→tmp and then feeding tmp to
+// its dst leaves the remaining edges acyclic.
+
+// Count how many times `reg` appears as a source in `srcs`.
+fn pm_src_count(srcs: [int], reg: int) -> int {
+    let mut n = 0
+    let mut i = 0
+    while i < len(srcs) {
+        if srcs[i] == reg { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// Emit a safe parallel move from `srcs[i]` → `dsts[i]` for all i.
+// Moves where src==dst are elided. Caller must guarantee len(srcs)==len(dsts).
+fn emit_parallel_moves_arm64(code: [int], dsts: [int], srcs: [int]) -> [int] {
+    let mut c = code
+    // Working copies we prune as moves are emitted.
+    let mut pend_d = []
+    let mut pend_s = []
+    let mut i = 0
+    while i < len(dsts) {
+        // Drop identity moves up-front.
+        if dsts[i] != srcs[i] {
+            pend_d = pend_d.push(dsts[i])
+            pend_s = pend_s.push(srcs[i])
+        }
+        i = i + 1
+    }
+    // Topological pass with cycle-break via x17 scratch.
+    // arm64_tmp2() = 17 is reserved (not in gp_regs_arm64 or param regs),
+    // so it cannot alias any real move operand.
+    let scratch = arm64_tmp2()
+    let mut safety = 0
+    while len(pend_d) > 0 {
+        // Find a move whose dst is not a remaining src.
+        let mut picked = -1
+        let mut k = 0
+        while k < len(pend_d) {
+            if pm_src_count(pend_s, pend_d[k]) == 0 {
+                picked = k
+                k = len(pend_d)  // break
+            } else {
+                k = k + 1
+            }
+        }
+        if picked >= 0 {
+            // Emit the safe move and drop it.
+            c = emit32(c, encode_mov(pend_d[picked], pend_s[picked]))
+            let mut nd = []
+            let mut ns = []
+            let mut j = 0
+            while j < len(pend_d) {
+                if j != picked {
+                    nd = nd.push(pend_d[j])
+                    ns = ns.push(pend_s[j])
+                }
+                j = j + 1
+            }
+            pend_d = nd
+            pend_s = ns
+        } else {
+            // Only cycles left — break by staging move 0 through scratch.
+            // After this, pend_s[0]'s reg is free (copied out), so some
+            // other node whose dst == pend_s[0] becomes pickable.
+            c = emit32(c, encode_mov(scratch, pend_s[0]))
+            // Rewrite every src that equaled pend_s[0] to now read scratch;
+            // ensures subsequent moves see the saved value. Typical cycle
+            // fires only once (src[0] unique in cycle), but we loop safely.
+            let old_src = pend_s[0]
+            let mut nd = []
+            let mut ns = []
+            let mut j = 1
+            while j < len(pend_d) {
+                nd = nd.push(pend_d[j])
+                if pend_s[j] == old_src {
+                    ns = ns.push(scratch)
+                } else {
+                    ns = ns.push(pend_s[j])
+                }
+                j = j + 1
+            }
+            // The node we just staged becomes MOV pend_d[0], scratch — queue it.
+            nd = nd.push(pend_d[0])
+            ns = ns.push(scratch)
+            pend_d = nd
+            pend_s = ns
+        }
+        safety = safety + 1
+        if safety > 64 {
+            // Defensive: should never trigger for ≤8 param moves; avoids
+            // runaway loops on malformed input.
+            return c
+        }
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
 //  ARM64 FUNCTION EMITTER
 // ═══════════════════════════════════════════════════════════════
 // Walks IR instructions and emits ARM64 machine code using the
@@ -437,17 +556,24 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> EmitResult {
 
                 } else {
                 if op == "call" {
-                    // Move args to x0..x7, emit BL placeholder
+                    // Move args to x0..x7, emit BL placeholder.
+                    // Naive 1-pass marshalling corrupts data when any arg's
+                    // src aliases a prior iteration's dst (e.g., v1→x1 and
+                    // v2→x0, call f(v1, v2) would MOV x0,x1 then MOV x1,x0 →
+                    // both params become v1). Route through a topological
+                    // parallel-move pass that breaks cycles via x17 scratch.
+                    let mut call_dsts = []
+                    let mut call_srcs = []
                     let mut ai = 1  // skip operands[0] which is func ref
                     while ai < len(instr.operands) {
                         let arg_vid = instr.operands[ai].a
                         let src = resolve_reg_arm64(alloc, arg_vid)
                         let dst_param = ai - 1  // x0, x1, x2, ...
-                        if src != dst_param {
-                            code = emit32(code, encode_mov(dst_param, src))
-                        }
+                        call_dsts = call_dsts.push(dst_param)
+                        call_srcs = call_srcs.push(src)
                         ai = ai + 1
                     }
+                    code = emit_parallel_moves_arm64(code, call_dsts, call_srcs)
                     // Record call fixup: BL target is operands[0].a (function ID)
                     let target_fid = instr.operands[0].a
                     call_fixups = call_fixups.push(CallFixup {
@@ -620,15 +746,20 @@ fn emit_function_arm64(func, alloc: FuncAlloc) -> EmitResult {
                     if num_src != nr_reg {
                         code = emit32(code, encode_mov(nr_reg, num_src))
                     }
+                    // Marshal syscall args (x0..x5) via topological parallel
+                    // move — same aliasing hazard as call; see comment on
+                    // emit_parallel_moves_arm64 above for the cycle case.
+                    let mut sc_dsts = []
+                    let mut sc_srcs = []
                     let mut ai = 1
                     while ai < len(instr.operands) && ai <= 6 {
                         let src = resolve_reg_arm64(alloc, instr.operands[ai].a)
                         let dst_arg = ai - 1   // x0, x1, ...
-                        if src != dst_arg {
-                            code = emit32(code, encode_mov(dst_arg, src))
-                        }
+                        sc_dsts = sc_dsts.push(dst_arg)
+                        sc_srcs = sc_srcs.push(src)
                         ai = ai + 1
                     }
+                    code = emit_parallel_moves_arm64(code, sc_dsts, sc_srcs)
                     // SVC #0x80 (Darwin) — 0xd4001001.
                     // Linux backend emits 0xd4000001 (svc #0) in its own branch.
                     code = emit32(code, 0xd4001001)
