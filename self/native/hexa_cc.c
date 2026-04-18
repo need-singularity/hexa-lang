@@ -8607,6 +8607,8 @@ HexaVal codegen_c2(HexaVal ast) {
         _ic_i = hexa_add(_ic_i, hexa_int(1));
     }
     parts = hexa_array_push(parts, hexa_str("\n"));
+    /* FIX-A 2026-04-19: lambda fwd decls before defs/fn bodies. */
+    parts = hexa_array_push(parts, hexa_str_join(_lambda_fwd_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str_join(_lambda_def_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str_join(fn_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str("int main(int argc, char** argv) {\n"));
@@ -12633,6 +12635,8 @@ HexaVal codegen_c2_full(HexaVal ast) {
         _ic_i_full = hexa_add(_ic_i_full, hexa_int(1));
     }
     out_parts = hexa_array_push(out_parts, hexa_str("\n"));
+    /* FIX-A 2026-04-19: lambda fwd decls before defs/fn bodies. */
+    out_parts = hexa_array_push(out_parts, hexa_str_join(_lambda_fwd_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str_join(_lambda_def_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str_join(fn_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str("int main(int argc, char** argv) {\n"));
