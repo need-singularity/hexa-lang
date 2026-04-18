@@ -5001,6 +5001,35 @@ HexaVal hexa_array_scan(HexaVal arr, HexaVal init, HexaVal fn) {
     return out;
 }
 
+// product(a): multiplicative reduce. Mirrors hexa_sum but with mult.
+// Empty array returns int 1 (multiplicative identity).
+HexaVal hexa_array_product(HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_int(1);
+    int64_t n = HX_ARR_LEN(arr);
+    int has_float = 0;
+    int64_t int_total = 1;
+    double float_total = 1.0;
+    for (int64_t i = 0; i < n; i++) {
+        HexaVal e = HX_ARR_ITEMS(arr)[i];
+        if (HX_IS_FLOAT(e)) { has_float = 1; float_total *= HX_FLOAT(e); }
+        else { int_total *= HX_INT(e); }
+    }
+    if (has_float) return hexa_float((double)int_total * float_total);
+    return hexa_int(int_total);
+}
+
+// mean(a): float average. Empty array returns float 0.0.
+HexaVal hexa_array_mean(HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_float(0.0);
+    int64_t n = HX_ARR_LEN(arr);
+    if (n == 0) return hexa_float(0.0);
+    double total = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        total += __hx_to_double(HX_ARR_ITEMS(arr)[i]);
+    }
+    return hexa_float(total / (double)n);
+}
+
 // swap(i, j): returns new array with items at i and j swapped.
 // Out-of-range indices return original array copy.
 // Matches interpreter at hexa_full.hexa:15497-15512.
