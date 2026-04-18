@@ -12554,6 +12554,24 @@ HexaVal codegen_c2_full(HexaVal ast) {
                         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(gk, hexa_str("LetMutStmt"))) || hexa_truthy(hexa_eq(gk, hexa_str("LetStmt")))))) {
                             _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, hexa_map_get_ic(hexa_index_get(ast, gi), "name", &__hexa_codegen_c2_ic_816));
                             _known_nonlocal_add(hexa_map_get_ic(hexa_index_get(ast, gi), "name", &__hexa_codegen_c2_ic_817));
+                        } else if (hexa_truthy(hexa_eq(gk, hexa_str("AssignStmt")))) {
+                            /* 2026-04-19: module-level `x = expr` (no let)
+                             * produces AssignStmt. Register bare-Ident lhs as
+                             * known global to prevent spurious lambda capture.
+                             * Skip Field/Index assigns. */
+                            HexaVal _alhs = hexa_map_get_ic(hexa_index_get(ast, gi), "left", &__hexa_codegen_c2_ic_875);
+                            if (hexa_truthy(hexa_eq(hexa_type_of(_alhs), hexa_str("string")))) {
+                                if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(_alhs)), hexa_int(0)))) {
+                                    _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, _alhs);
+                                    _known_nonlocal_add(_alhs);
+                                }
+                            } else {
+                                if (hexa_truthy(hexa_eq(hexa_map_get_ic(_alhs, "kind", &__hexa_codegen_c2_ic_876), hexa_str("Ident")))) {
+                                    HexaVal _aname = hexa_map_get_ic(_alhs, "name", &__hexa_codegen_c2_ic_877);
+                                    _known_nonlocal_names = hexa_array_push(_known_nonlocal_names, _aname);
+                                    _known_nonlocal_add(_aname);
+                                }
+                            }
                         } else {
                             if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(gk, hexa_str("ImportStmt"))) || hexa_truthy(hexa_eq(gk, hexa_str("UseStmt")))))) {
                                 _resolve_use_register_names(hexa_map_get_ic(hexa_index_get(ast, gi), "name", &__hexa_codegen_c2_ic_818));

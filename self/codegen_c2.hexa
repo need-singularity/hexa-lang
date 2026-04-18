@@ -470,7 +470,7 @@ fn codegen_c2(ast) {
     _known_set_init()
     _lambda_counter = 0
     _lambda_def_parts = []
-    _lambda_fwd_parts = []
+    _lambda_fwd_sigs = []
     _ic_counter = 0
     // M4: reset string literal dedup table
     // rt#32-SL: _strlit_def_parts module-array push removed — emit uses
@@ -510,6 +510,21 @@ fn codegen_c2(ast) {
         } else if _gk == "LetMutStmt" || _gk == "LetStmt" {
             _known_nonlocal_names = _known_nonlocal_names.push(ast[_gi].name)
             _known_nonlocal_add(ast[_gi].name)
+        } else if _gk == "AssignStmt" {
+            // 2026-04-19: module-level `n_atoms = 8` (no `let` prefix) produces
+            // an AssignStmt; register the bare-Ident lhs as a known global so
+            // nested lambdas don't spuriously classify it as a free variable
+            // (which would emit an env-unpack prologue + undefined-ident ref).
+            // Only register the bare-Ident case — skip Field/Index assigns
+            // (a.b = 5 / arr[0] = x are not global bindings).
+            let _alhs = ast[_gi].left
+            if type_of(_alhs) == "string" && len(_alhs) > 0 {
+                _known_nonlocal_names = _known_nonlocal_names.push(_alhs)
+                _known_nonlocal_add(_alhs)
+            } else if type_of(_alhs) != "string" && _alhs.kind == "Ident" {
+                _known_nonlocal_names = _known_nonlocal_names.push(_alhs.name)
+                _known_nonlocal_add(_alhs.name)
+            }
         } else if _gk == "ImportStmt" || _gk == "UseStmt" {
             // 2026-04-18: pre-register imported fn/struct names so local fns
             // physically appearing before the `use` line still classify their
@@ -688,9 +703,15 @@ fn codegen_c2(ast) {
         _ic_i = _ic_i + 1
     }
     parts = parts.push("\n")
-    // FIX-A (2026-04-19): emit lambda fwd decls before any fn_parts so call
-    // sites that precede the def (top-level closure init, etc) resolve.
-    parts = parts.push(_lambda_fwd_parts.join(""))
+    // FIX-B (2026-04-19): deterministic lambda fwd decl emission — counter
+    // driven (mirror of fcf275f4 IC + rt#32-SL strlit fixes). Replaces
+    // `_lambda_fwd_parts.join("")` which hit T33-class arena aliasing —
+    // corrupt output ("xa_sl_2 = hexa_str..." garbage lines, missing fwd decls).
+    let mut _lfw_i = 0
+    while _lfw_i < _lambda_counter {
+        parts = parts.push("HexaVal __hexa_lambda_" + to_string(_lfw_i) + "(" + _lambda_fwd_sigs[_lfw_i] + ");\n")
+        _lfw_i = _lfw_i + 1
+    }
     // C3: emit lambda definitions (static C fns with __env first param)
     parts = parts.push(_lambda_def_parts.join(""))
     parts = parts.push(fn_parts.join(""))
@@ -3381,12 +3402,16 @@ fn gen2_impl_block(node) {
 let mut _lambda_counter = 0
 // perf: use array accumulator — avoid O(n²) string concat for lambda defs
 let mut _lambda_def_parts = []
-// FIX-A (Anima serving unblock, 2026-04-19): forward declarations for
-// __hexa_lambda_N. Without these, call sites that appear before the lambda
-// body (e.g. same top-level let block assigning closure refs mid-module) hit
-// "implicit function declaration" and "use of undeclared identifier"
-// cascades. Mirrored in self/native/hexa_cc.c.
-let mut _lambda_fwd_parts = []
+// FIX-B (T33 aliasing follow-up, 2026-04-19): per-lambda param-signature
+// slots. Was `_lambda_fwd_parts` module-array push — same T33-class freelist
+// aliasing that bit `_ic_def_parts` (fcf275f4) and `_strlit_def_parts`
+// (rt#32-SL) — first element / string literals occasionally eaten under
+// arena reuse, producing "xa_sl_2 = hexa_str(..)" garbage lines and missing
+// lambda fwd decls. Fix = counter-driven regeneration: store `p` per slot,
+// emit `HexaVal __hexa_lambda_i(p);\n` in a `while i < _lambda_counter`
+// loop at codegen emit time. Module-level accumulator deleted. Mirrored in
+// self/native/hexa_cc.c.
+let mut _lambda_fwd_sigs = []
 
 // Normalize a lambda/fn parameter entry to the bare identifier name.
 // `fn(x)` parser produces Param {name:"x", value:typ} objects; `|x|` parser
@@ -4348,10 +4373,12 @@ fn gen2_lambda_expr(node) {
     }
 
     // Emit the function definition (placed before main)
-    // FIX-A (2026-04-19): also emit a matching forward declaration so call
-    // sites referencing &__hexa_lambda_N before the def-block resolve. Covers
-    // interleaved emission cases (e.g. top-level closures used in init_parts).
-    _lambda_fwd_parts = _lambda_fwd_parts.push("HexaVal " + fn_name + "(" + p + ");\n")
+    // FIX-B (2026-04-19): store param-sig in per-slot array; fwd decls emitted
+    // deterministically in a `while i < _lambda_counter` loop at codegen emit
+    // time (mirror of fcf275f4 IC fix, rt#32-SL strlit fix). Pushing the full
+    // decl string here triggered T33-class freelist aliasing — first element
+    // eaten, strings truncated in output C. Slot index == `id`.
+    _lambda_fwd_sigs = _lambda_fwd_sigs.push(p)
     let fn_def = "HexaVal " + fn_name + "(" + p + ") {\n" + body_parts.join("") + "    return hexa_void();\n}\n\n"
     _lambda_def_parts = _lambda_def_parts.push(fn_def)
 
@@ -4375,7 +4402,7 @@ fn gen2_lambda_expr(node) {
 fn codegen_c2_full(ast) {
     _lambda_counter = 0
     _lambda_def_parts = []
-    _lambda_fwd_parts = []
+    _lambda_fwd_sigs = []
     _method_registry = []
     _known_fn_globals = []
     _known_nonlocal_names = []
@@ -4578,8 +4605,13 @@ fn codegen_c2_full(ast) {
         _ic_i_full = _ic_i_full + 1
     }
     out_parts = out_parts.push("\n")
-    // FIX-A (2026-04-19): lambda forward decls before defs/fn_parts.
-    out_parts = out_parts.push(_lambda_fwd_parts.join(""))
+    // FIX-B (2026-04-19): counter-driven lambda fwd decl emission (mirror of
+    // fcf275f4 IC fix). Replaces `_lambda_fwd_parts.join("")` T33 aliasing.
+    let mut _lfw_i_full = 0
+    while _lfw_i_full < _lambda_counter {
+        out_parts = out_parts.push("HexaVal __hexa_lambda_" + to_string(_lfw_i_full) + "(" + _lambda_fwd_sigs[_lfw_i_full] + ");\n")
+        _lfw_i_full = _lfw_i_full + 1
+    }
     // Insert lambda definitions before user functions
     out_parts = out_parts.push(_lambda_def_parts.join(""))
     out_parts = out_parts.push(fn_parts.join(""))
