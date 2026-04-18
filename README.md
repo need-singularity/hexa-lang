@@ -1,3 +1,6 @@
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 # 💎 hexa-lang
 
 **the perfect-number programming language**
@@ -49,9 +52,6 @@ proof law_22 {
 ## links
 
 [GitHub](https://github.com/need-singularity/hexa-lang) · [Docs](docs/) · [Spec](docs/spec.md) · [Book](docs/book/) · [Releases](https://github.com/need-singularity/hexa-lang/releases)
-
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 ## license
 
