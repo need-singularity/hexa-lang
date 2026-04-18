@@ -1555,6 +1555,35 @@ HexaVal hexa_map_merge(HexaVal a, HexaVal b) {
     return out;
 }
 
+// map_values(fn): apply fn to every value, return new map with same keys.
+// Matches interpreter at self/hexa_full.hexa:15584-15594.
+HexaVal hexa_map_map_values(HexaVal m, HexaVal fn) {
+    HexaVal out = hexa_map_new();
+    if (!HX_MAP_TBL(m)) return out;
+    HexaMapTable* t = HX_MAP_TBL(m);
+    for (int i = 0; i < t->len; i++) {
+        HexaVal new_val = hexa_call1(fn, t->order_vals[i]);
+        out = hexa_map_set(out, t->order_keys[i], new_val);
+    }
+    return out;
+}
+
+// filter_keys(fn): keep only entries where fn(key) is truthy.
+// Matches interpreter at self/hexa_full.hexa:15595-15610. Key is passed
+// to predicate as a string value (HexaMap stores keys as char*).
+HexaVal hexa_map_filter_keys(HexaVal m, HexaVal fn) {
+    HexaVal out = hexa_map_new();
+    if (!HX_MAP_TBL(m)) return out;
+    HexaMapTable* t = HX_MAP_TBL(m);
+    for (int i = 0; i < t->len; i++) {
+        HexaVal key_val = hexa_str(t->order_keys[i]);
+        if (hexa_truthy(hexa_call1(fn, key_val))) {
+            out = hexa_map_set(out, t->order_keys[i], t->order_vals[i]);
+        }
+    }
+    return out;
+}
+
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
     if (!HX_MAP_TBL(m)) return m;
     HexaMapTable* t = HX_MAP_TBL(m);
