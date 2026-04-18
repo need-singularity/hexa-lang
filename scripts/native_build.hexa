@@ -530,13 +530,25 @@ fn nb_infer_struct_type(m, e, env) -> string {
         return e.name
     }
     // P7-6 step 3c: Call through Ident callee — look up fn ret_struct.
-    // Covers `make_point().x` etc. Method calls (Call through Field)
-    // stay "" until impl-method return-type registry lands.
+    // Covers `make_point().x` etc.
     if e.kind == "Call" {
         if e.left.kind == "Ident" {
             let cidx = module_find_function(m, e.left.name)
             if cidx >= 0 {
                 return module_get_fn_ret_struct(m, cidx)
+            }
+        }
+        // P7-6 step 3d: Call through Field — impl-method chain. Infer
+        // the receiver's struct type, then probe the mangled
+        // Type__method entry for its ret_struct tag.
+        if e.left.kind == "Field" {
+            let recv_t = nb_infer_struct_type(m, e.left.left, env)
+            if len(recv_t) > 0 {
+                let mang = recv_t + "__" + e.left.name
+                let midx = module_find_function(m, mang)
+                if midx >= 0 {
+                    return module_get_fn_ret_struct(m, midx)
+                }
             }
         }
     }
@@ -700,6 +712,21 @@ fn nb_lower_expr(m, b, e, env) -> int {
                 i = i + 1
             }
             let mname = e.left.name
+            // P7-6: impl-method dispatch. When the receiver's struct
+            // type is known at AST level, probe for the mangled
+            // `Type__method` function registered by the ImplBlock
+            // Pass 1. Hits short-circuit before runtime/UFCS so a
+            // user-defined `impl Point { fn len(self) -> int }` wins
+            // over the runtime `hexa_len` builtin — deliberate: an
+            // explicit impl should override the polymorphic default.
+            let recv_tname = nb_infer_struct_type(m, e.left.left, env)
+            if len(recv_tname) > 0 {
+                let mang = recv_tname + "__" + mname
+                let mfid = module_find_function(m, mang)
+                if mfid >= 0 {
+                    return bld_call(m, b, mfid, arg_vids, "i64")
+                }
+            }
             // P7-6: runtime method dispatch. `s.starts_with(p)` etc. have
             // no free-fn definition — they live in runtime.c as
             // hexa_str_*/hexa_array_*. Check the method table first, then
@@ -1117,6 +1144,50 @@ fn nb_lower_fn_decl(m, fn_node, func_idx: int) -> bool {
     return true
 }
 
+// Lower an impl-method body. Mirrors nb_lower_fn_decl but injects the
+// impl target as the type of `self` (the first param) when the user
+// wrote `fn norm(self) -> int { ... }` without an explicit annotation.
+// Field access inside the method body can then resolve through the
+// struct registry against the correct type.
+fn nb_lower_method_decl(m, m_ast, func_idx: int, target: string) -> bool {
+    let params_ast = m_ast.params
+    let mut param_names = []
+    let mut pi = 0
+    while pi < len(params_ast) {
+        param_names = param_names.push(params_ast[pi].name)
+        pi = pi + 1
+    }
+    let b = builder_new(m, func_idx)
+    let env = lower_env_new()
+    let mut p2 = 0
+    while p2 < len(param_names) {
+        let pv = bld_load_param(m, b, p2, "i64")
+        lower_env_bind(env, param_names[p2], pv)
+        let p_ast = params_ast[p2]
+        let p_type = p_ast.value
+        if p2 == 0 && param_names[p2] == "self" && len(p_type) == 0 {
+            lower_env_set_type(env, "self", target)
+        } else if len(p_type) > 0 {
+            lower_env_set_type(env, param_names[p2], p_type)
+        }
+        p2 = p2 + 1
+    }
+    let body = m_ast.body
+    let mut i = 0
+    let mut terminated = false
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { terminated = true; break }
+        i = i + 1
+    }
+    if !terminated {
+        let zero = bld_const_i64(m, b, 0)
+        lower_return(m, b, zero)
+    }
+    return true
+}
+
 fn parse_and_lower(src: string, path: string) -> any {
     // 1. Lex + parse.
     let toks = tokenize(src)
@@ -1139,6 +1210,10 @@ fn parse_and_lower(src: string, path: string) -> any {
     // the linker track lands. Extern fns have no body, so Pass 2 skips
     // them via the fn_slots filter (only FnDecl entries go into slots).
     let mut fn_slots = []
+    // Parallel list for impl-method bodies — [m_ast, func_idx, target].
+    // Kept separate because method AST lives under node.methods, not
+    // at the top-level ast index used by fn_slots.
+    let mut method_slots = []
     let mut i = 0
     while i < len(ast) {
         let node = ast[i]
@@ -1188,6 +1263,33 @@ fn parse_and_lower(src: string, path: string) -> any {
                 sfi = sfi + 1
             }
             module_add_struct_typed(m, node.name, sf_names, sf_types)
+        } else if node.kind == "ImplBlock" {
+            // P7-6 step 3d: register each impl-method as a top-level
+            // function with mangled name `Type__method`. Method call
+            // dispatch (Call-through-Field) probes this mangled entry
+            // when it knows the receiver's struct type. Bodies are
+            // lowered in Pass 2 via method_slots. ret_struct tagging
+            // runs in Pass 1b (after all StructDecls are registered)
+            // so methods whose return type is a struct declared later
+            // in the TU still get the tag.
+            let target_n = node.target
+            let methods = node.methods
+            let mut mi = 0
+            while mi < len(methods) {
+                let m_ast = methods[mi]
+                let mangled = target_n + "__" + m_ast.name
+                let mp_ast = m_ast.params
+                let mut mir_params = []
+                let mut mpi = 0
+                while mpi < len(mp_ast) {
+                    mir_params = mir_params.push([mp_ast[mpi].name, "i64"])
+                    mpi = mpi + 1
+                }
+                module_add_function(m, mangled, mir_params, "i64")
+                let m_fidx = len(m.functions) - 1
+                method_slots = method_slots.push([m_ast, m_fidx, target_n])
+                mi = mi + 1
+            }
         }
         i = i + 1
     }
@@ -1213,6 +1315,25 @@ fn parse_and_lower(src: string, path: string) -> any {
         }
         rsi = rsi + 1
     }
+    // Pass 1b — impl-method ret_struct post-fixup. Same policy as
+    // top-level fns: only tag when the method's declared ret_type
+    // names a registered struct. "" ret_type (inferred/unspecified)
+    // stays untagged and Call-through-Field chain resolution returns
+    // "" at that link.
+    let mut msi = 0
+    while msi < len(method_slots) {
+        let ms = method_slots[msi]
+        let ms_ast = ms[0]
+        let ms_fidx = ms[1]
+        let ms_rt = ms_ast.ret_type
+        if len(ms_rt) > 0 {
+            let ms_fields = module_find_struct_fields(m, ms_rt)
+            if len(ms_fields) > 0 {
+                module_set_fn_ret_struct(m, ms_fidx, ms_rt)
+            }
+        }
+        msi = msi + 1
+    }
 
     // Pass 2 — lower bodies into the pre-registered function slots.
     let mut si = 0
@@ -1225,6 +1346,21 @@ fn parse_and_lower(src: string, path: string) -> any {
             exit(4)
         }
         si = si + 1
+    }
+    // Pass 2b — lower impl-method bodies. nb_lower_method_decl injects
+    // the impl target as the type of `self` so Field access inside
+    // the method resolves through the struct registry.
+    let mut msi2 = 0
+    while msi2 < len(method_slots) {
+        let ms = method_slots[msi2]
+        let ms_ast = ms[0]
+        let ms_fidx = ms[1]
+        let ms_target = ms[2]
+        if !nb_lower_method_decl(m, ms_ast, ms_fidx, ms_target) {
+            eprintln("[native_build] coverage gap lowering method " + ms_target + "::" + ms_ast.name)
+            exit(4)
+        }
+        msi2 = msi2 + 1
     }
     return m
 }
