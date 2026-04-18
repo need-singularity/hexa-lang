@@ -1,0 +1,198 @@
+// self/runtime/arrays.hexa — P7-7b chunk 2: array runtime in pure Hexa
+//
+// Role
+//   P7-7b chunk 2. runtime.c 의 hexa_array_* C 헬퍼 10종을 pure-Hexa 로
+//   재구현한다. chunk 1 (strings.hexa) 과 동일한 "additive 레퍼런스 구현"
+//   역할 — runtime.c 는 건드리지 않고, 추후 codegen 이 해당 심볼을 pure-
+//   Hexa pub fn 으로 lowering 하게 되면 그대로 인라인 emit 한다.
+//
+//   **Additive** — runtime.c 에서 아직 아무것도 제거하지 않는다.
+//
+// C ↔ Hexa 의미 대응표 (byte-semantic equivalence)
+//   hexa_array_new        (runtime.c:831)  → array_new
+//   hexa_len      (ARRAY) (runtime.c:1096) → array_len
+//   hexa_array_get        (runtime.c:1050) → array_get
+//   hexa_array_set        (runtime.c:1066) → array_set
+//   hexa_array_push       (runtime.c:904)  → array_push
+//   hexa_array_pop        (runtime.c:2443) → array_pop
+//   hexa_array_slice      (runtime.c:4435) → array_slice
+//   hexa_array_reverse    (runtime.c:2448) → array_reverse
+//   hexa_array_index_of   (runtime.c:4486) → array_index_of
+//   hexa_array_concat     (신규, 순수-Hexa)→ array_concat   // C 쪽엔 없음 — 단순 fold
+//
+// 선택 기준 (HX4 / HX7)
+//   · self-contained       : closure dispatch / arena 없이 top-level 의미만
+//   · runtime.c 구현 50 LOC 이하 — byte-identity 검증 쉬움
+//   · codegen_c2 가 하루에 수백 건 emit 하는 hot-path (new/push/get/len)
+//
+// 제약 (CLAUDE.md)
+//   HX3  : grammar pitfalls — no ;  · let mut for reassign  · `.push()` + join
+//   HX4  : SELF-HOST FIRST — no FFI, no cstring(), builtin-only
+//   HX7  : self/ 경로 전용
+//   feedback_seed_freeze — stage0 재빌드 금지. 본 파일은 검증 러너(build/hexa_stage0 test)만 사용
+//
+// Stage0 pitfall 회피
+//   · `arr + [x]` in-loop 은 O(n²) — `.push()` + 끝에서 한 번 join 패턴 유지.
+//   · `arr[i]` 은 hexa builtin 이 음수 인덱스를 자동 보정하지 않으므로
+//     negative-index wrap-around 은 명시적으로 처리한다 (C hexa_array_get 과 동일).
+//   · `push()` 는 값 버전이 `arr = arr.push(x)` — 재대입 필수. return 새 배열.
+
+
+// ── array_new ────────────────────────────────────────────
+// Mirrors hexa_array_new (runtime.c:831).
+// 의미: 비어있는 배열 반환. C 는 calloc(HexaArr) 으로 len=0, cap=0.
+// Hexa 쪽은 empty literal `[]` 이 동일 의미를 갖는다.
+pub fn array_new() {
+    []
+}
+
+// ── array_len ────────────────────────────────────────────
+// Mirrors hexa_len for TAG_ARRAY branch (runtime.c:1098).
+// 의미: 배열 원소 개수. 비-배열 인자는 C 에서 0 반환 → len() builtin 도
+// Hexa 쪽에선 "string/array/map" 3종에 대해서만 정의되는데, 본 포팅은
+// type_of 가드로 non-array 를 명시적으로 0 처리하여 C 의미를 재현한다.
+pub fn array_len(arr) {
+    if type_of(arr) != "array" { return 0 }
+    len(arr)
+}
+
+// ── array_get ────────────────────────────────────────────
+// Mirrors hexa_array_get (runtime.c:1050).
+// 의미: arr[idx]. 음수 idx 는 끝에서부터 (idx += len). 범위 밖은 C 에선
+// exit(1) — pure-Hexa 에선 동일하게 즉시 종료 (panic 을 exit 로 에뮬레이트).
+// non-array 인자는 C 와 동일하게 exit.
+pub fn array_get(arr, idx) {
+    if type_of(arr) != "array" {
+        panic("array[]: container is not an array")
+    }
+    let n = len(arr)
+    let mut i = idx
+    if i < 0 { i = i + n }
+    if i < 0 || i >= n {
+        panic("array_get: index out of bounds")
+    }
+    arr[i]
+}
+
+// ── array_set ────────────────────────────────────────────
+// Mirrors hexa_array_set (runtime.c:1066).
+// 의미: arr[idx] = val 후 arr 리턴. C 는 in-place mutate (pass-by-value
+// 의 alias semantics). pure-Hexa 에서는 `arr[i] = v` 가 동일 semantics.
+// 음수 idx wrap, OOB panic 은 array_get 과 동일.
+pub fn array_set(arr, idx, val) {
+    if type_of(arr) != "array" {
+        panic("array_set[]: container is not an array")
+    }
+    let n = len(arr)
+    let mut i = idx
+    if i < 0 { i = i + n }
+    if i < 0 || i >= n {
+        panic("array_set: index out of bounds")
+    }
+    arr[i] = val
+    arr
+}
+
+// ── array_push ───────────────────────────────────────────
+// Mirrors hexa_array_push (runtime.c:904).
+// 의미: arr 끝에 item 추가 후 (재대입된) arr 리턴. C 는 realloc + len++.
+// Hexa builtin `.push(x)` 가 동일 의미 — value return 이므로 호출부에서
+// `arr = array_push(arr, x)` 패턴 유지.
+pub fn array_push(arr, item) {
+    if type_of(arr) != "array" { return arr }
+    arr.push(item)
+}
+
+// ── array_pop ────────────────────────────────────────────
+// Mirrors hexa_array_pop (runtime.c:2443).
+// 의미: arr 의 마지막 원소 반환. 빈 배열 / non-array 는 void 반환.
+// 주의: C hexa_array_pop 은 마지막 원소를 읽기만 하고 arr 은 unchanged —
+// len 을 줄이지 않는다 (의도된 semantics — caller 가 slice 로 따로 자른다).
+// 본 포팅도 동일 — arr 은 변경되지 않고 tail 원소만 반환.
+// void 는 Hexa 에서 `== void` 비교가 false 이므로, caller 는 type_of 로 감지.
+pub fn array_pop(arr) {
+    if type_of(arr) != "array" { return void }
+    let n = len(arr)
+    if n == 0 { return void }
+    arr[n - 1]
+}
+
+// ── array_slice ──────────────────────────────────────────
+// Mirrors hexa_array_slice (runtime.c:4435).
+// 의미: arr[a..b) 를 복사한 새 배열. clamp 규칙:
+//   a < 0 → 0,  b > n → n,  a > b → a = b (빈 슬라이스).
+// non-array → 빈 배열. push-loop 으로 복사 (구조적 O(n)).
+pub fn array_slice(arr, start, end) {
+    if type_of(arr) != "array" { return [] }
+    let n = len(arr)
+    let mut a = start
+    let mut b = end
+    if a < 0 { a = 0 }
+    if b > n { b = n }
+    if a > b { a = b }
+    let mut out = []
+    let mut i = a
+    while i < b {
+        out = out.push(arr[i])
+        i = i + 1
+    }
+    out
+}
+
+// ── array_reverse ────────────────────────────────────────
+// Mirrors hexa_array_reverse (runtime.c:2448).
+// 의미: 원소를 뒤집은 새 배열 반환. non-array → 인자 그대로 (C 동일).
+// C 는 새 배열에 역순 push. 본 포팅도 동일 패턴.
+pub fn array_reverse(arr) {
+    if type_of(arr) != "array" { return arr }
+    let n = len(arr)
+    let mut out = []
+    let mut i = n - 1
+    while i >= 0 {
+        out = out.push(arr[i])
+        i = i - 1
+    }
+    out
+}
+
+// ── array_index_of ───────────────────────────────────────
+// Mirrors hexa_array_index_of (runtime.c:4486).
+// 의미: item 의 첫 발견 인덱스, 없으면 -1. C 는 hexa_eq 비교.
+// pure-Hexa 의 `==` 연산자가 동일 의미 (int/float/string/bool 공통).
+// non-array → -1.
+pub fn array_index_of(arr, item) {
+    if type_of(arr) != "array" { return -1 }
+    let n = len(arr)
+    let mut i = 0
+    while i < n {
+        if arr[i] == item { return i }
+        i = i + 1
+    }
+    -1
+}
+
+// ── array_concat ─────────────────────────────────────────
+// 신규 pure-Hexa helper (runtime.c 엔 직접 대응 심볼 없음 — 코드젠 시
+// emit 된 `a + b` 배열 concat 을 명시적 함수로 노출).
+// 의미: 두 배열을 이어붙인 새 배열. non-array 인자는 빈 배열로 치환.
+// strings.hexa 의 str_concat 과 동일한 방어적 코딩.
+pub fn array_concat(a, b) {
+    let aa = if type_of(a) == "array" { a } else { [] }
+    let bb = if type_of(b) == "array" { b } else { [] }
+    let na = len(aa)
+    let nb = len(bb)
+    if na == 0 { return bb }
+    if nb == 0 { return aa }
+    let mut out = []
+    let mut i = 0
+    while i < na {
+        out = out.push(aa[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < nb {
+        out = out.push(bb[j])
+        j = j + 1
+    }
+    out
+}
