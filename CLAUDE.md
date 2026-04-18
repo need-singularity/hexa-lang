@@ -36,6 +36,7 @@ commands: shared/config/commands.json — autonomous 블록으로 Claude Code가
 rules: shared/rules/common.json (R0~R27) + shared/rules/hexa-lang.json (HX1~HX7)
 L0 Guard: `hexa $NEXUS/shared/harness/l0_guard.hexa <verify|sync|merge|status>`
 attrs: `hexa self/attr_cli.hexa` (카탈로그), `... show <name>` (상세), `... lint <file>` (attr check 실행), `... policy <path>` (.hexa-attrs forbid gate) — 30 @attr SSOT = self/attrs/*.hexa (각 attr = meta + check fn 일체)
+nexus-cli bake (@cli, 2026-04-18): `hexa smash|free|thinking|lens|atlas|bus|roadmap|discovery|status-proj|roadmap-proj|convergence-proj` = `$NEXUS/shared/bin/nexus-cli <subcmd>` passthrough. 전 프로젝트 cwd 에서 동작. spec: `$NEXUS/shared/engine/nexus_cli_spec.json`
 loop: 글로벌 `~/.claude/skills/loop` + 엔진 `$NEXUS/shared/harness/loop` — roadmap `shared/roadmaps/hexa-lang.json` 3-track×phase×gate 자동
 
 hexa-lang 핵심 규칙:
