@@ -1,3 +1,4 @@
+#!hexa lax
 // scripts/native_build.hexa — P7-6c zero-tool native build driver
 //
 // Hexa → native binary. NO clang, NO cargo, NO external toolchain.
@@ -205,6 +206,69 @@ fn nb_builtin_runtime_sym(name: string) -> string {
     if name == "file_exists" { return "hexa_file_exists" }
     if name == "env" { return "hexa_env_var" }
     if name == "env_var" { return "hexa_env_var" }
+    // P7-6 expansion (2026-04-19): FFI pointer / math / timing / conversion
+    // builtins used by training + FFI code (train_7b_integrated, bench/*, etc.)
+    // Each maps to an existing runtime.c symbol — no new runtime code required.
+    if name == "alloc_raw"   { return "hexa_ptr_alloc" }
+    if name == "free_raw"    { return "hexa_ptr_free" }
+    if name == "write_f32"   { return "hexa_ptr_write_f32" }
+    if name == "deref_f32"   { return "hexa_ptr_read_f32" }
+    if name == "ptr_addr"    { return "hexa_ptr_addr" }
+    if name == "ptr_null"    { return "hexa_ptr_null" }
+    if name == "sqrt"        { return "hexa_sqrt" }
+    if name == "pow"         { return "hexa_pow" }
+    if name == "u_floor"     { return "hexa_u_floor" }
+    if name == "clock"       { return "hexa_clock" }
+    if name == "time_ms"     { return "hexa_time_ms" }
+    if name == "to_string"   { return "hexa_to_string" }
+    if name == "str"         { return "hexa_to_string" }
+    if name == "byte_len"    { return "hexa_byte_len" }
+    // FFI marshalling helpers (cstring/from_cstring) — `extern fn`
+    // wrappers routinely pass/receive C strings through these.
+    if name == "cstring"      { return "hexa_cstring" }
+    if name == "from_cstring" { return "hexa_from_cstring" }
+    return ""
+}
+
+// ── P7-6: MethodCall builtin dispatch (obj.method(args…)) ─────────
+//
+// Parser shape for `obj.m(args)` is Call { left: Field{name=m, left=obj},
+// args }. The `Call` branch below detects left.kind=="Field" and
+// UFCS-lowers to `method_name(receiver, args...)`. Many such methods —
+// `str.starts_with`, `arr.push`, etc. — are backed by runtime C
+// symbols, not user-defined free functions. This helper maps the
+// method name → runtime sym so MethodCall emits the correct BL (mirror
+// of nb_builtin_runtime_sym above). Empty return = not a runtime
+// method → fall through to lower_call_by_name (UFCS user-fn lookup).
+fn nb_method_runtime_sym(name: string) -> string {
+    // — String methods —
+    if name == "starts_with"  { return "hexa_str_starts_with" }
+    if name == "ends_with"    { return "hexa_str_ends_with" }
+    if name == "contains"     { return "hexa_str_contains" }
+    if name == "index_of"     { return "hexa_str_index_of" }
+    if name == "substring"    { return "hexa_str_substring" }
+    if name == "to_upper"     { return "hexa_str_to_upper" }
+    if name == "to_lower"     { return "hexa_str_to_lower" }
+    if name == "trim"         { return "hexa_str_trim" }
+    if name == "trim_start"   { return "hexa_str_trim_start" }
+    if name == "trim_end"     { return "hexa_str_trim_end" }
+    if name == "replace"      { return "hexa_str_replace" }
+    if name == "split"        { return "hexa_str_split" }
+    if name == "chars"        { return "hexa_str_chars" }
+    if name == "parse_int"    { return "hexa_str_parse_int" }
+    if name == "parse_float"  { return "hexa_str_parse_float" }
+    if name == "repeat"       { return "hexa_str_repeat" }
+    // — Array methods —
+    if name == "push"         { return "hexa_array_push" }
+    if name == "pop"          { return "hexa_array_pop" }
+    if name == "reverse"      { return "hexa_array_reverse" }
+    if name == "sort"         { return "hexa_array_sort" }
+    if name == "join"         { return "hexa_str_join" }      // arr.join(sep)
+    // Note: `slice` exists on both strings and arrays with the same
+    // (v, start, end) shape in runtime.c. Full disambiguation needs
+    // IR-ty info; we default to array_slice as the common case —
+    // string slices are typically spelled `.substring()`.
+    if name == "slice"        { return "hexa_array_slice" }
     return ""
 }
 
@@ -244,6 +308,25 @@ fn nb_lower_expr(m, b, e, env) -> int {
         let v = 0
         if e.value == "true" { v = 1 }
         return bld_const_i64(m, b, v)
+    }
+    // CharLit: parser emits kind="CharLit" with e.value = single-char
+    // string. Stage0 lacks an in-language `ord()` builtin, so the most
+    // robust route is to intern the 1-char string in the module pool
+    // and materialize it as a string-ref. Call-site code that actually
+    // needs the byte value goes through `s[0]` or `byte_len(s)` at
+    // runtime, both of which already lower correctly. This keeps the
+    // handler non-fatal for FFI signatures that forward chars opaquely.
+    if k == "CharLit" {
+        let idx = module_intern_string(m, e.value)
+        return bld_const_string(m, b, idx)
+    }
+    // FloatLit: stage-0 IR is i64-uniform; truncate the literal to int
+    // so FFI signatures that pass floats (`extern fn sinf(x: f32)`)
+    // don't hit a coverage-gap at parse time. Numeric precision
+    // tracking lands alongside float-typed IR in a later P7-6 slice.
+    if k == "FloatLit" {
+        let f_as_i = to_int(e.value)
+        return bld_const_i64(m, b, f_as_i)
     }
     if k == "BinOp" || k == "Binary" {
         let lhs = nb_lower_expr(m, b, e.left, env)
@@ -354,6 +437,14 @@ fn nb_lower_expr(m, b, e, env) -> int {
                 i = i + 1
             }
             let mname = e.left.name
+            // P7-6: runtime method dispatch. `s.starts_with(p)` etc. have
+            // no free-fn definition — they live in runtime.c as
+            // hexa_str_*/hexa_array_*. Check the method table first, then
+            // fall through to UFCS user-fn lookup for user-defined methods.
+            let msym = nb_method_runtime_sym(mname)
+            if len(msym) > 0 {
+                return nb_lower_builtin(m, b, mname, msym, arg_vids)
+            }
             return lower_call_by_name(m, b, mname, arg_vids, "i64")
         }
         if e.left.kind != "Ident" { return -1 }
@@ -721,6 +812,16 @@ fn parse_and_lower(src: string, path: string) -> any {
     let m = make_ir_module(path)
 
     // Pass 1 — pre-register. Record [ast_idx, func_idx] pairs.
+    //
+    // P7-6 FFI: ExternFnDecl nodes are registered under their hexa name
+    // too — call sites like `strlen(x)` parse as Call{left=Ident{name:
+    // "strlen"}}, so module_find_function must see "strlen" to resolve
+    // the BL target. When @symbol("libc_name") is present (node.value)
+    // the C symbol may differ from the hexa name; stage-1 P7-6 uses the
+    // hexa name for lookup and the backend emits BL to the same name.
+    // Full @symbol-override wiring (dlsym rename) is a follow-up once
+    // the linker track lands. Extern fns have no body, so Pass 2 skips
+    // them via the fn_slots filter (only FnDecl entries go into slots).
     let mut fn_slots = []
     let mut i = 0
     while i < len(ast) {
@@ -738,6 +839,19 @@ fn parse_and_lower(src: string, path: string) -> any {
             // module.functions pushes in order, so index == current len - 1.
             let fidx = len(m.functions) - 1
             fn_slots = fn_slots.push([i, fidx])
+        } else if node.kind == "ExternFnDecl" {
+            // Register extern declaration so call sites resolve. No body
+            // to lower → don't record in fn_slots. Params kept as
+            // [name, "i64"] tuples for arity; real per-param C-type
+            // marshalling is P7-6 follow-up.
+            let xparams_ast = node.params
+            let mut xir_params = []
+            let mut xpi = 0
+            while xpi < len(xparams_ast) {
+                xir_params = xir_params.push([xparams_ast[xpi].name, "i64"])
+                xpi = xpi + 1
+            }
+            module_add_function(m, node.name, xir_params, "i64")
         }
         i = i + 1
     }
