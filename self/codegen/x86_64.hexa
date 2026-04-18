@@ -127,3 +127,145 @@ fn encode_syscall_exit_x86(os: int, code_reg: int) -> [int] {
     code = x86_emit_syscall_insn(code)
     return code
 }
+
+// ═══════════════════════════════════════════════════════════════
+//  ALU / multiply / compare — ARM64 parity slice
+// ═══════════════════════════════════════════════════════════════
+// REX.W prefix 0x48 selects 64-bit operand size. All ops here emit
+// (REX.W, opcode, ModR/M). ModR/M = 0xc0 | (src<<3) | dst for reg-reg
+// forms — matches the Intel SDM "/r" notation.
+
+// add dst, src  — 48 01 /r
+fn x86_emit_add_rr(code: [int], dst: int, src: int) -> [int] {
+    return code.push(0x48).push(0x01).push(0xc0 + src * 8 + dst)
+}
+
+// sub dst, src  — 48 29 /r
+fn x86_emit_sub_rr(code: [int], dst: int, src: int) -> [int] {
+    return code.push(0x48).push(0x29).push(0xc0 + src * 8 + dst)
+}
+
+// imul dst, src — 48 0f af /r  (two-operand form: dst *= src)
+fn x86_emit_imul_rr(code: [int], dst: int, src: int) -> [int] {
+    return code.push(0x48).push(0x0f).push(0xaf).push(0xc0 + dst * 8 + src)
+}
+
+// cmp lhs, rhs — 48 39 /r  (sets flags = lhs - rhs)
+fn x86_emit_cmp_rr(code: [int], lhs: int, rhs: int) -> [int] {
+    return code.push(0x48).push(0x39).push(0xc0 + rhs * 8 + lhs)
+}
+
+// test dst, dst — 48 85 /r  (zero check; equivalent to cmp dst, 0)
+fn x86_emit_test_rr(code: [int], dst: int) -> [int] {
+    return code.push(0x48).push(0x85).push(0xc0 + dst * 8 + dst)
+}
+
+// Condition codes — shared by Jcc and SETcc, mirror Intel SDM encoding.
+// Use ARM64 cond_code integers as callers: eq=0, ne=1, lt=11 (signed),
+// gt=12 (signed), le=13, ge=10. Map to x86 tttn:
+//   eq→0x04, ne→0x05, lt→0x0c (SETL), gt→0x0f (SETG),
+//   le→0x0e (SETLE), ge→0x0d (SETGE).
+fn x86_cc_from_arm64(cc: int) -> int {
+    if cc == 0 { return 0x04 }   // eq
+    if cc == 1 { return 0x05 }   // ne
+    if cc == 10 { return 0x0d }  // ge
+    if cc == 11 { return 0x0c }  // lt
+    if cc == 12 { return 0x0f }  // gt
+    if cc == 13 { return 0x0e }  // le
+    return 0x05  // default: NE (safest for unknown)
+}
+
+// setcc dst, cond — 0f 9x /r  (writes byte 0/1; caller must movzx to widen).
+// The one-byte dst form works for rax/rbx/rcx/rdx only; for r8-r15 we emit
+// the REX prefix 0x41 first. `dst` here is the raw x86 reg number (0..15).
+fn x86_emit_setcc(code: [int], dst_x86: int, tttn: int) -> [int] {
+    let mut c = code
+    if dst_x86 >= 8 { c = c.push(0x41) }
+    let low = dst_x86 % 8
+    c = c.push(0x0f).push(0x90 + tttn).push(0xc0 + low)
+    // movzx dst, dst_byte — 48 0f b6 /r  (widen byte to 64-bit)
+    if dst_x86 >= 8 {
+        c = c.push(0x4d).push(0x0f).push(0xb6).push(0xc0 + low * 8 + low)
+    } else {
+        c = c.push(0x48).push(0x0f).push(0xb6).push(0xc0 + dst_x86 * 8 + dst_x86)
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Control flow — jumps, calls, ret
+// ═══════════════════════════════════════════════════════════════
+// Branches take signed 32-bit rel operands, relative to the byte AFTER
+// the branch instruction. Parallel to ARM64 patch_branch, callers emit
+// a placeholder (rel=0) then patch once the target address is known.
+
+// jmp rel32 — e9 disp32  (5 bytes total)
+fn x86_emit_jmp_rel32(code: [int], rel: int) -> [int] {
+    let mut c = code.push(0xe9)
+    c = c.push(rel % 256)
+    c = c.push((rel / 256) % 256)
+    c = c.push((rel / 65536) % 256)
+    c = c.push((rel / 16777216) % 256)
+    return c
+}
+
+// jcc rel32 — 0f 8x disp32  (6 bytes total). tttn = x86 condition code.
+fn x86_emit_jcc_rel32(code: [int], tttn: int, rel: int) -> [int] {
+    let mut c = code.push(0x0f).push(0x80 + tttn)
+    c = c.push(rel % 256)
+    c = c.push((rel / 256) % 256)
+    c = c.push((rel / 65536) % 256)
+    c = c.push((rel / 16777216) % 256)
+    return c
+}
+
+// call rel32 — e8 disp32
+fn x86_emit_call_rel32(code: [int], rel: int) -> [int] {
+    let mut c = code.push(0xe8)
+    c = c.push(rel % 256)
+    c = c.push((rel / 256) % 256)
+    c = c.push((rel / 65536) % 256)
+    c = c.push((rel / 16777216) % 256)
+    return c
+}
+
+// ret — c3 (plain near return)
+fn x86_emit_ret(code: [int]) -> [int] {
+    return code.push(0xc3)
+}
+
+// Patch a branch at `offset` in `code` with a new rel32 displacement.
+// Layout recap: E9/E8 + disp32 = 5 bytes; 0F 8x + disp32 = 6 bytes.
+// `rel` is the signed 32-bit delta from the byte AFTER the instruction.
+// `op_kind`: 0 = jmp/call (1-byte opcode), 1 = jcc (2-byte opcode).
+fn x86_patch_rel32(code: [int], offset: int, op_kind: int, rel: int) -> [int] {
+    let mut c = code
+    let disp_off = if op_kind == 1 { offset + 2 } else { offset + 1 }
+    if disp_off + 4 <= len(c) {
+        c[disp_off] = rel % 256
+        c[disp_off + 1] = (rel / 256) % 256
+        c[disp_off + 2] = (rel / 65536) % 256
+        c[disp_off + 3] = (rel / 16777216) % 256
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Stack push/pop (1-byte for low regs; REX prefix for r8-r15)
+// ═══════════════════════════════════════════════════════════════
+
+// push reg — 50+rd (rax..rdi) or 41 50+rd-8 (r8..r15)
+fn x86_emit_push_reg(code: [int], reg: int) -> [int] {
+    if reg >= 8 {
+        return code.push(0x41).push(0x50 + (reg - 8))
+    }
+    return code.push(0x50 + reg)
+}
+
+// pop reg — 58+rd, or 41 58+rd-8
+fn x86_emit_pop_reg(code: [int], reg: int) -> [int] {
+    if reg >= 8 {
+        return code.push(0x41).push(0x58 + (reg - 8))
+    }
+    return code.push(0x58 + reg)
+}
