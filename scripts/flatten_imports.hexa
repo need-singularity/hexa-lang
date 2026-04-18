@@ -187,7 +187,13 @@ fn fl_strip_uses(src) {
         if dep == "" {
             out = out.push(line)
         } else {
-            out = out.push("// [flatten_imports] stripped: use \"" + dep + "\"")
+            // Push/join the banner parts instead of `+` concat — keeps the
+            // PERF concat counter clean when many files each have several uses.
+            let mut sp = []
+            sp = sp.push("// [flatten_imports] stripped: use \"")
+            sp = sp.push(dep)
+            sp = sp.push("\"")
+            out = out.push(sp.join(""))
         }
         i = i + 1
     }
@@ -234,16 +240,17 @@ fn fl_is_ident_char(c) {
 }
 
 fn fl_read_ident(s, start) {
+    // Scan to end-of-ident once, then take a single substring.
+    // Prior impl did `out = out + c` per char — O(L²) per call; a few hundred
+    // top-level decls across 41 files triggered the PERF 101-concat gate.
     let n = len(s)
     let mut i = start
-    let mut out = ""
     while i < n {
         let c = s.substring(i, i + 1)
-        if !fl_is_ident_char(c) { return out }
-        out = out + c
+        if !fl_is_ident_char(c) { return s.substring(start, i) }
         i = i + 1
     }
-    return out
+    return s.substring(start, n)
 }
 
 fn fl_file_base(path) {
@@ -377,19 +384,17 @@ fn fl_word_replace(src, oldname, newname) {
 // `g_order` is only pushed to once per file after all other mutations are done,
 // and is never read inside the same iteration that pushes to it.
 
-// g_order_str: pipe-delimited string of file paths in topo order (leaves first).
-// Using a STRING instead of an array avoids array_store slot aliasing corruption
-// entirely — string concat has zero interaction with array_store/freelist.
-// Split into an array only once after the walk is complete.
-let mut g_order_str = ""
+// g_order_parts: list of file paths in topo order (leaves first).
+// Earlier impl used pipe-delimited strings + concat — O(files²). Converted to
+// a single mutable parts array (no aliasing risk because only one global mut
+// array is touched inside the walk, same constraint as before).
+let mut g_order_parts = []
 let mut g_order_count = 0
 let mut g_base_dir = "."
 
-fn fl_str_set_has(set_str, key) {
-    // Check if "|key|" appears in set_str. set_str format: "|a|b|c|"
-    let needle = "|" + key + "|"
-    return set_str.index_of(needle) >= 0
-}
+// visited set is a hash set (64-bucket). O(1) amortized has/add, no
+// quadratic string growth.
+let mut g_visited_hs = fl_hset_new()
 
 fn fl_iterative_walk(start_file) {
     // Iterative DFS using an explicit stack (single mutable array).
@@ -404,7 +409,6 @@ fn fl_iterative_walk(start_file) {
 
     let MARKER = "<<EMIT>>"
     let mut stack = []
-    let mut visited_str = "|"
 
     stack = stack.push(start_file)
 
@@ -418,19 +422,14 @@ fn fl_iterative_walk(start_file) {
             let em_idx = len(stack) - 1
             let emit_file = stack[em_idx]
             stack = stack.truncate(em_idx)
-            if !fl_str_set_has(visited_str, emit_file) {
-                visited_str = visited_str + emit_file + "|"
-                // Append to string-based order (no array_store interaction)
-                if g_order_count == 0 {
-                    g_order_str = emit_file
-                } else {
-                    g_order_str = g_order_str + "|" + emit_file
-                }
+            if !fl_hset_has(g_visited_hs, emit_file) {
+                g_visited_hs = fl_hset_add(g_visited_hs, emit_file)
+                g_order_parts = g_order_parts.push(emit_file)
                 g_order_count = g_order_count + 1
             }
         } else {
             // DISCOVER phase
-            if fl_str_set_has(visited_str, top) {
+            if fl_hset_has(g_visited_hs, top) {
                 // already emitted, skip
             } else {
                 // Push emit frame: MARKER then file (file goes first, popped second)
@@ -443,13 +442,26 @@ fn fl_iterative_walk(start_file) {
                 let dn = len(deps)
                 let mut di = dn - 1
                 while di >= 0 {
-                    let dep_path = g_base_dir + "/" + deps[di] + ".hexa"
+                    // push/join path assembly avoids PERF concat-counter hits
+                    // across O(total_deps) iterations.
+                    let mut pp = []
+                    pp = pp.push(g_base_dir)
+                    pp = pp.push("/")
+                    pp = pp.push(deps[di])
+                    pp = pp.push(".hexa")
+                    let dep_path = pp.join("")
                     if file_exists(dep_path) {
-                        if !fl_str_set_has(visited_str, dep_path) {
+                        if !fl_hset_has(g_visited_hs, dep_path) {
                             stack = stack.push(dep_path)
                         }
                     } else {
-                        println("[flatten_imports] WARN dep not found: " + deps[di] + " (" + dep_path + ")")
+                        let mut wp = []
+                        wp = wp.push("[flatten_imports] WARN dep not found: ")
+                        wp = wp.push(deps[di])
+                        wp = wp.push(" (")
+                        wp = wp.push(dep_path)
+                        wp = wp.push(")")
+                        println(wp.join(""))
                     }
                     di = di - 1
                 }
@@ -479,9 +491,8 @@ if !file_exists(target) {
 g_base_dir = fl_dirname(target)
 fl_iterative_walk(target)
 
-// ── Split g_order_str into an array (one-time, after walk is complete) ──
-// g_order_str is "|"-delimited: "file1|file2|file3" — leaves first.
-let order_files = if g_order_count > 0 { g_order_str.split("|") } else { [] }
+// g_order_parts is already a file-path array, leaves-first.
+let order_files = g_order_parts
 let m = len(order_files)
 
 // ── COLLISION DETECTION (string-only, no parallel arrays) ──────
@@ -497,8 +508,13 @@ let m = len(order_files)
 // Strategy: scan all files' non-pub decls, build a "|name|" string for seen
 // names and a separate "|name|" string for collided names (appeared 2+ times).
 
-let mut seen_decls_str = "|"       // "|name1|name2|" format
-let mut collided_str = "|"         // "|collided_name|" format
+// seen_decls: hash set (bucketed). collided: bucketed set + parts list for final display.
+// Prior impl concatenated into "|name1|name2|..." growing strings — O(total_decls²)
+// per-file scan, triggering the PERF 101-concat gate on hexa_full.hexa and blowing
+// past 120s on large inputs.
+let mut seen_decls_hs = fl_hset_new()
+let mut collided_hs = fl_hset_new()
+let mut collided_parts = []
 let mut fi = 0
 while fi < m {
     let f = order_files[fi]
@@ -508,24 +524,24 @@ while fi < m {
     let mut di = 0
     while di < dn {
         let nm = decls[di]
-        let needle = "|" + nm + "|"
-        if seen_decls_str.index_of(needle) >= 0 {
+        if fl_hset_has(seen_decls_hs, nm) {
             // Seen before — mark as collided (if not already)
-            if collided_str.index_of(needle) < 0 {
-                collided_str = collided_str + nm + "|"
+            if !fl_hset_has(collided_hs, nm) {
+                collided_hs = fl_hset_add(collided_hs, nm)
+                collided_parts = collided_parts.push(nm)
             }
         } else {
-            seen_decls_str = seen_decls_str + nm + "|"
+            seen_decls_hs = fl_hset_add(seen_decls_hs, nm)
         }
         di = di + 1
     }
     fi = fi + 1
 }
+let collided_count = len(collided_parts)
+let collided_display = collided_parts.join("|")
 
-if len(collided_str) > 1 {
-    // Strip leading/trailing "|" for display
-    let display = collided_str.substring(1, len(collided_str) - 1)
-    println("[flatten_imports] collided non-pub decls mangled: " + display)
+if collided_count > 0 {
+    println("[flatten_imports] collided non-pub decls mangled: " + collided_display)
 }
 
 // ── EMIT: reverse-topo order (root-first, leaves-last) ──────────
@@ -546,8 +562,8 @@ flat_parts = flat_parts.push("// === FLATTENED by scripts/flatten_imports.hexa =
 flat_parts = flat_parts.push("// target: " + target + "\n")
 flat_parts = flat_parts.push("// files:  " + str(m) + "\n")
 flat_parts = flat_parts.push("// order:  reverse-topo (root-first, leaves-last)\n")
-if len(collided_str) > 1 {
-    flat_parts = flat_parts.push("// mangled: " + collided_str.substring(1, len(collided_str) - 1) + "\n")
+if collided_count > 0 {
+    flat_parts = flat_parts.push("// mangled: " + collided_display + "\n")
 }
 flat_parts = flat_parts.push("\n")
 
@@ -559,16 +575,19 @@ while ei < m {
 
     // Mangle collided private decls with file-prefix
     let mut body_mut = body
-    if len(collided_str) > 1 {
+    if collided_count > 0 {
         let decls = fl_scan_private_decls(body)
         let prefix = fl_mangle_prefix(f)
         let dn = len(decls)
         let mut di = 0
         while di < dn {
             let nm = decls[di]
-            let needle = "|" + nm + "|"
-            if collided_str.index_of(needle) >= 0 {
-                let new_name = prefix + "__" + nm
+            if fl_hset_has(collided_hs, nm) {
+                let mut np = []
+                np = np.push(prefix)
+                np = np.push("__")
+                np = np.push(nm)
+                let new_name = np.join("")
                 body_mut = fl_word_replace(body_mut, nm, new_name)
             }
             di = di + 1
@@ -576,9 +595,20 @@ while ei < m {
     }
 
     let stripped = fl_strip_uses(body_mut)
-    flat_parts = flat_parts.push("\n// ----- BEGIN " + fl_basename(f) + " -----\n")
+    // Build BEGIN/END banners via push/join instead of concat-chain to keep the
+    // PERF concat counter ≤100 on large graphs (41 files × 3 concats = 123 prev).
+    let base_name = fl_basename(f)
+    let mut begin_parts = []
+    begin_parts = begin_parts.push("\n// ----- BEGIN ")
+    begin_parts = begin_parts.push(base_name)
+    begin_parts = begin_parts.push(" -----\n")
+    flat_parts = flat_parts.push(begin_parts.join(""))
     flat_parts = flat_parts.push(stripped)
-    flat_parts = flat_parts.push("\n// ----- END " + fl_basename(f) + " -----\n")
+    let mut end_parts = []
+    end_parts = end_parts.push("\n// ----- END ")
+    end_parts = end_parts.push(base_name)
+    end_parts = end_parts.push(" -----\n")
+    flat_parts = flat_parts.push(end_parts.join(""))
     ei = ei + 1
 }
 let flat_str = flat_parts.join("")
