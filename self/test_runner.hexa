@@ -1,0 +1,306 @@
+// self/test_runner.hexa — `hexa test <file>` 네이티브 러너
+//
+// 역할:
+//   1. 대상 .hexa 를 읽고 `@test fn <name>()` 시그니처를 자동 수집 (self/attrs/test.hexa)
+//   2. 각 테스트를 **독립 프로세스**로 실행 (assert = exit(1) 이므로 격리 필수)
+//   3. exit code 0 = PASS, 0 아님 = FAIL
+//   4. 집계: `N PASS / M FAIL / K SKIP  in  X.XXs`
+//   5. 첫 실패의 stdout/stderr tail 을 캡처해 출력
+//
+// Backward compat (anima 관행):
+//   대상 파일에 `@test fn` 이 전혀 없고 `fn run_selftest()` 가 있으면
+//   `<file> --selftest` 로 한 번 호출해서 exit code 를 관찰한다.
+//   → 15+ anima 러너가 즉시 망가지지 않음. 새 방식은 additive.
+//
+// 사용:
+//   hexa test <file>                   — 전체 @test 실행
+//   hexa test <file> --filter NAME     — 이름 substring 필터
+//   hexa test <file> --verbose         — 각 테스트 stdout 함께 출력
+//   hexa test <file> --selftest-only   — backward-compat 경로만 실행
+//
+// 호출 지점: self/main.hexa `sub == "test"` 브랜치 → cmd_run(test_runner.hexa, [file, ...])
+//
+// SSOT 설계:
+//   - `@test` 의미/name prefix 규칙: self/attrs/test.hexa
+//   - runner 실행 파이프라인: 본 파일
+
+use "self/attrs/core"
+use "self/attrs/test"
+
+// ─── argv 파싱 ─────────────────────────────────────────────
+// av[0..1] = exec 경로(중복), av[2] = 타겟 파일, av[3..] = 옵션.
+// (cmd_run 이 extra_args 를 그대로 전달하므로 자체 스크립트 args() 는
+//  [target, opts...] 또는 av[2] 부터가 target 인 경우 둘 다 존재 가능.
+//  bt 39 patch 이후 interpreter 에서 av[2] = 첫 사용자 인자.)
+let __av = args()
+
+fn _extract_runner_argv(av) {
+    // 가장 최근 hexa CLI 컨벤션: av[2..] = 유저 인자.
+    // 단, 본 스크립트가 `hexa run self/test_runner.hexa <file> ...`
+    // 식으로 호출되면 av[2]=self/test_runner.hexa 가 될 수 있다. 실전에선
+    // hexa main.hexa 의 cmd_test() 가 cmd_run(runner_path, [file, ...]) 로
+    // 호출하므로 av[2] = file 이다. 안전 fallback: 첫 .hexa 인자를 target 으로.
+    let mut out = []
+    let mut i = 2
+    while i < len(av) {
+        out = out.push(av[i])
+        i = i + 1
+    }
+    return out
+}
+
+fn _print_usage() {
+    println("usage: hexa test <file.hexa> [--filter NAME] [--verbose] [--selftest-only]")
+}
+
+// ─── 대상 파일 @test 수집 + 실행 ────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    // POSIX /bin/sh quoting: '...'...' with inner ' 를 '\'' 로 escape.
+    // .replace() 로 충분 — shell_quote() 빌트인 (main.hexa:801) 은 sed 포크
+    // 비용이 있어 N 번 호출되는 러너에서는 회피.
+    let esc = s.replace("'", "'\\''")
+    return "'" + esc + "'"
+}
+
+fn _resolve_hexa_bin() -> string {
+    // 테스트 러너가 spawn 할 `hexa` 바이너리.
+    // 1) HEXA_BIN env 가 있으면 그대로, 2) 없으면 PATH 의 `hexa`.
+    let e = env_var("HEXA_BIN")
+    if len(e) > 0 { return e }
+    return "hexa"
+}
+
+// 임시 드라이버 파일 생성 — 원본 source 뒤에 `<fn>()` 호출 + sentinel + exit(0).
+//   PASS  = fn 이 정상 리턴 → sentinel "__HEXA_TEST_OK__" 출력 + exit(0)
+//   FAIL  = assert() 는 stage0 에서 runtime abort (rc=0 이지만 sentinel 미출력).
+//           runner 는 sentinel 부재로 FAIL 판정.
+//   FAIL  = throw / exit(N>0) 도 sentinel 미출력 → FAIL.
+//
+// stage0 인터프리터 관찰 동작 (2026-04-18):
+//   · `assert(cond)` 실패 시 "error: assertion failed" 출력 후 즉시 종료 (rc=0)
+//   · 따라서 exit code 만으로는 PASS/FAIL 구분 불가 → sentinel 병행 필수.
+fn _write_driver(source: string, fn_name: string) -> string {
+    let path = "/tmp/hexa_test_driver." + to_string(clock()) + ".hexa"
+    let body = source
+             + "\n\n// ── hexa test runner driver (auto-generated) ──\n"
+             + fn_name + "()\n"
+             + "println(\"__HEXA_TEST_OK__\")\n"
+             + "exit(0)\n"
+    write_file(path, body)
+    return path
+}
+
+fn _driver_passed(output: string, rc: int) -> bool {
+    if rc != 0 { return false }
+    return output.contains("__HEXA_TEST_OK__")
+}
+
+// 한 테스트 실행 — [exit_code, output]
+fn _run_one(hexa_bin: string, driver_path: string) {
+    let cmd = _shell_quote(hexa_bin) + " run " + _shell_quote(driver_path) + " 2>&1"
+    let r = exec_with_status(cmd)
+    return r
+}
+
+// tail 최대 N 라인 (실패 원인 노이즈 축소)
+fn _tail_lines(s: string, n: int) -> string {
+    let lines = s.split("\n")
+    let total = len(lines)
+    let start = if total > n { total - n } else { 0 }
+    let mut out = ""
+    let mut i = start
+    while i < total {
+        if i > start { out = out + "\n" }
+        out = out + lines[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 메인 로직 ─────────────────────────────────────────────
+
+fn run_tests(target: string, filter: string, verbose: int, selftest_only: int) -> int {
+    let src_exists = file_exists(target)
+    if !src_exists {
+        println("error: target not found: " + target)
+        return 2
+    }
+    let source = read_file(target)
+    let lines = split(source, "\n")
+
+    // selftest-only 모드: @test 무시하고 --selftest 경로만 호출.
+    if selftest_only == 1 {
+        return _run_selftest_compat(target)
+    }
+
+    let raw = collect_test_fns(lines)
+    // 필터 적용
+    let mut tests = []
+    for row in raw {
+        let nm = row[0]
+        if len(filter) > 0 && !nm.contains(filter) { continue }
+        tests = tests.push(row)
+    }
+
+    if len(tests) == 0 {
+        // backward compat: @test 없지만 run_selftest 관행 파일일 수 있음.
+        if source.contains("fn run_selftest") || source.contains("--selftest") {
+            println("(no @test fn — falling back to `--selftest` legacy convention)")
+            return _run_selftest_compat(target)
+        }
+        println("no @test fn found in " + target)
+        return 0
+    }
+
+    let hexa_bin = _resolve_hexa_bin()
+    let t0 = clock()
+    let mut pass = 0
+    let mut fail = 0
+    let mut skip = 0
+    let mut first_fail_name = ""
+    let mut first_fail_output = ""
+
+    println("── hexa test: " + target + " (" + to_string(len(tests)) + " tests) ──")
+
+    for t in tests {
+        let name = t[0]
+        let is_skip = t[1] == "1"
+        if is_skip {
+            skip = skip + 1
+            println("  SKIP  " + name)
+            continue
+        }
+        let driver = _write_driver(source, name)
+        let r = _run_one(hexa_bin, driver)
+        let output_raw = r[0]
+        let rc = r[1]
+        // 임시파일 정리
+        exec("rm -f " + _shell_quote(driver) + " 2>/dev/null")
+
+        // sentinel 기반 PASS 판정 (rc + "__HEXA_TEST_OK__" 둘 다 요구).
+        let ok = _driver_passed(output_raw, rc)
+        // 사용자 출력에서 sentinel 제거
+        let output = output_raw.replace("__HEXA_TEST_OK__\n", "").replace("__HEXA_TEST_OK__", "")
+
+        if ok {
+            pass = pass + 1
+            if verbose == 1 {
+                println("  PASS  " + name)
+                if len(output.trim()) > 0 {
+                    println(_tail_lines(output.trim(), 10))
+                }
+            } else {
+                println("  PASS  " + name)
+            }
+        } else {
+            fail = fail + 1
+            println("  FAIL  " + name + "  (rc=" + to_string(rc) + ")")
+            if first_fail_name == "" {
+                first_fail_name = name
+                first_fail_output = _tail_lines(output, 20)
+            }
+            if verbose == 1 && len(output.trim()) > 0 {
+                println(_tail_lines(output.trim(), 20))
+            }
+        }
+    }
+
+    // clock() 단위: native runtime 은 float 초 (runtime.c:4282 CLOCK_MONOTONIC),
+    // stage0 interpreter 는 int 초 해상도. 양쪽 모두 "s" 단위로 취급하고
+    // ms 소수점은 float 결과만 보존. 안전하게 integer-part/fraction 분리.
+    let elapsed = clock() - t0
+    let elapsed_ms_total = to_int(elapsed * 1000.0)
+    let sec_part = elapsed_ms_total / 1000
+    let ms_part = elapsed_ms_total - sec_part * 1000
+    let mut ms_str = to_string(ms_part)
+    while len(ms_str) < 3 { ms_str = "0" + ms_str }
+    let elapsed_str = to_string(sec_part) + "." + ms_str
+
+    println("")
+    println("── summary ──")
+    println("  PASS : " + to_string(pass))
+    println("  FAIL : " + to_string(fail))
+    println("  SKIP : " + to_string(skip))
+    println("  total: " + to_string(len(tests)) + "   in " + elapsed_str + "s")
+
+    if fail > 0 && len(first_fail_name) > 0 {
+        println("")
+        println("── first failure: " + first_fail_name + " ──")
+        println(first_fail_output)
+    }
+
+    if fail > 0 { return 1 }
+    return 0
+}
+
+// backward compat — `<file> --selftest` 호출.
+// anima 관행: fn run_selftest() -> int { ... } + main 에서 --selftest 감지.
+fn _run_selftest_compat(target: string) -> int {
+    let hexa_bin = _resolve_hexa_bin()
+    let cmd = _shell_quote(hexa_bin) + " run " + _shell_quote(target) + " --selftest 2>&1"
+    let t0 = clock()
+    let r = exec_with_status(cmd)
+    let elapsed = clock() - t0
+    let ms = to_int(elapsed * 1000.0)
+    let output = r[0]
+    let rc = r[1]
+    println("── hexa test (legacy --selftest): " + target + " ──")
+    if len(output.trim()) > 0 { println(output.trim()) }
+    println("")
+    if rc == 0 {
+        println("  PASS  run_selftest (rc=0)   in " + to_string(ms) + "ms")
+        return 0
+    }
+    println("  FAIL  run_selftest (rc=" + to_string(rc) + ")   in " + to_string(ms) + "ms")
+    return 1
+}
+
+// ─── entry ─────────────────────────────────────────────────
+
+let __runner_args = _extract_runner_argv(__av)
+
+if len(__runner_args) == 0 {
+    _print_usage()
+    exit(2)
+}
+
+let mut __target = ""
+let mut __filter = ""
+let mut __verbose = 0
+let mut __selftest_only = 0
+let mut __i = 0
+while __i < len(__runner_args) {
+    let a = __runner_args[__i]
+    if a == "--filter" {
+        if __i + 1 < len(__runner_args) {
+            __filter = __runner_args[__i + 1]
+            __i = __i + 2
+        } else {
+            println("error: --filter requires NAME")
+            exit(2)
+        }
+    } else if a == "--verbose" || a == "-v" {
+        __verbose = 1
+        __i = __i + 1
+    } else if a == "--selftest-only" {
+        __selftest_only = 1
+        __i = __i + 1
+    } else if a == "--help" || a == "-h" {
+        _print_usage()
+        exit(0)
+    } else if len(__target) == 0 {
+        __target = a
+        __i = __i + 1
+    } else {
+        __i = __i + 1
+    }
+}
+
+if len(__target) == 0 {
+    _print_usage()
+    exit(2)
+}
+
+let __rc = run_tests(__target, __filter, __verbose, __selftest_only)
+exit(__rc)
