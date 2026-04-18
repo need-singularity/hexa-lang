@@ -4744,6 +4744,104 @@ HexaVal hexa_array_fill(HexaVal arr, HexaVal v) {
     return out;
 }
 
+// take(n): first n elements (or entire array if n ≥ len).
+HexaVal hexa_array_take(HexaVal arr, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    int64_t len = HX_ARR_LEN(arr);
+    int64_t k = n < len ? n : len;
+    if (k < 0) k = 0;
+    for (int64_t i = 0; i < k; i++) {
+        out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
+    }
+    return out;
+}
+
+// drop(n): skip first n elements, return remainder.
+HexaVal hexa_array_drop(HexaVal arr, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    int64_t len = HX_ARR_LEN(arr);
+    int64_t start = n < 0 ? 0 : (n > len ? len : n);
+    for (int64_t i = start; i < len; i++) {
+        out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
+    }
+    return out;
+}
+
+// zip(other): pairs [a_i, b_i] up to min(len(a), len(b)).
+// Matches interpreter at hexa_full.hexa:15258-15270.
+HexaVal hexa_array_zip(HexaVal a, HexaVal b) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return out;
+    int64_t na = HX_ARR_LEN(a), nb = HX_ARR_LEN(b);
+    int64_t k = na < nb ? na : nb;
+    for (int64_t i = 0; i < k; i++) {
+        HexaVal pair = hexa_array_new();
+        pair = hexa_array_push(pair, HX_ARR_ITEMS(a)[i]);
+        pair = hexa_array_push(pair, HX_ARR_ITEMS(b)[i]);
+        out = hexa_array_push(out, pair);
+    }
+    return out;
+}
+
+// chunk(n): split into non-overlapping chunks of size n (last may be shorter).
+// Matches interpreter at hexa_full.hexa:15363-15378.
+HexaVal hexa_array_chunk(HexaVal arr, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    if (n <= 0) return out;
+    int64_t len = HX_ARR_LEN(arr);
+    for (int64_t i = 0; i < len; i += n) {
+        HexaVal chunk = hexa_array_new();
+        int64_t stop = i + n;
+        if (stop > len) stop = len;
+        for (int64_t j = i; j < stop; j++) {
+            chunk = hexa_array_push(chunk, HX_ARR_ITEMS(arr)[j]);
+        }
+        out = hexa_array_push(out, chunk);
+    }
+    return out;
+}
+
+// window(n): sliding windows of size n (step 1). Empty if n > len or n ≤ 0.
+// Matches interpreter at hexa_full.hexa:15380-15395.
+HexaVal hexa_array_window(HexaVal arr, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    int64_t len = HX_ARR_LEN(arr);
+    if (n <= 0 || n > len) return out;
+    for (int64_t i = 0; i + n <= len; i++) {
+        HexaVal win = hexa_array_new();
+        for (int64_t j = 0; j < n; j++) {
+            win = hexa_array_push(win, HX_ARR_ITEMS(arr)[i + j]);
+        }
+        out = hexa_array_push(out, win);
+    }
+    return out;
+}
+
+// unique: dedupe by hexa_eq. O(n²) — matches interpreter's equality
+// check (hexa_full.hexa:15263-15277). Scaling to hash-set is a follow-up.
+HexaVal hexa_array_unique(HexaVal arr) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t len = HX_ARR_LEN(arr);
+    for (int64_t i = 0; i < len; i++) {
+        HexaVal it = HX_ARR_ITEMS(arr)[i];
+        int seen = 0;
+        for (int64_t j = 0; j < HX_ARR_LEN(out); j++) {
+            if (hexa_truthy(hexa_eq(HX_ARR_ITEMS(out)[j], it))) { seen = 1; break; }
+        }
+        if (!seen) out = hexa_array_push(out, it);
+    }
+    return out;
+}
+
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
