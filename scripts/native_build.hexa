@@ -23,6 +23,39 @@
 //   hexa scripts/native_build.hexa self/hexa_full.hexa \
 //        --target=darwin-arm64 -o build/hexa_new
 
+// ── P7-9 wiring: parse → IR-lower → codegen_module pipeline ────────
+//
+// Previously `parse_and_lower` / `codegen_module` were `exit(3)` stubs.
+// This file now composes them from the existing SSOT modules:
+//
+//   tokenize (self/lexer.hexa) → parse (self/parser.hexa)
+//     → IR module (self/ir/* via make_ir_module + builder + lowering)
+//     → generate (self/codegen/mod.hexa — regalloc + emit + wrap)
+//
+// The orchestrator below handles the FnDecl / ReturnStmt / IntLit / BinOp
+// subset — enough for the self-tests already proven by native_compile_poc
+// (77/77 PASS). Additional AST kinds route through the generic
+// `nb_lower_expr` helper which mirrors `lower_expr` in ir/lowering.hexa
+// but reads parser-native field names (`value`/`left`/`right`) rather
+// than the test-suite shape (`int_val` etc.).
+use "self/lexer"
+use "self/token"
+use "self/ast"
+use "self/parser"
+use "self/ir/types"
+use "self/ir/instr"
+use "self/ir/builder"
+use "self/ir/opcodes"
+use "self/ir/lowering"
+use "self/codegen/arm64"
+use "self/codegen/x86_64"
+use "self/codegen/regalloc"
+use "self/codegen/regalloc_linear"
+use "self/codegen/peephole"
+use "self/codegen/macho"
+use "self/codegen/elf"
+use "self/codegen/mod"
+
 // ═══════════════════════════════════════════════════════════════════
 // Target descriptor
 // ═══════════════════════════════════════════════════════════════════
@@ -147,12 +180,199 @@ fn main() {
 // modules. Until P7-6a lands (hexa_full.hexa scale), parse_and_lower
 // is a placeholder.
 
+// ── Expression lowering (parser → IR) ─────────────────────────────
+// Parser AST uses string `value` for IntLit and `left`/`right`/`op`
+// for BinOp; ir/lowering.hexa's lower_int_lit/bin_op consumers read
+// `int_val` so we lower here locally to stay on the parser-native
+// schema (no AST rewrite pass needed).
+fn nb_lower_expr(m, b, e, env) -> int {
+    let k = e.kind
+    if k == "IntLit" {
+        let n = to_int(e.value)
+        return bld_const_i64(m, b, n)
+    }
+    if k == "BoolLit" {
+        let v = 0
+        if e.value == "true" { v = 1 }
+        return bld_const_i64(m, b, v)
+    }
+    if k == "BinOp" || k == "Binary" {
+        let lhs = nb_lower_expr(m, b, e.left, env)
+        if lhs < 0 { return -1 }
+        let rhs = nb_lower_expr(m, b, e.right, env)
+        if rhs < 0 { return -1 }
+        // Parser emits symbolic ops (`+`, `-`, …); ir/lowering
+        // expects mnemonic strings (`add`, `sub`, …). Map here.
+        let op = e.op
+        if op == "+" { return bld_add(m, b, lhs, rhs, "i64") }
+        if op == "-" { return bld_sub(m, b, lhs, rhs, "i64") }
+        if op == "*" { return bld_mul(m, b, lhs, rhs, "i64") }
+        if op == "/" { return bld_div(m, b, lhs, rhs, "i64") }
+        if op == "%" { return bld_modulo(m, b, lhs, rhs, "i64") }
+        if op == "==" { return bld_cmp_eq(m, b, lhs, rhs) }
+        if op == "!=" { return bld_cmp_ne(m, b, lhs, rhs) }
+        if op == "<"  { return bld_cmp_lt(m, b, lhs, rhs) }
+        if op == "<=" { return bld_cmp_le(m, b, lhs, rhs) }
+        if op == ">"  { return bld_cmp_gt(m, b, lhs, rhs) }
+        if op == ">=" { return bld_cmp_ge(m, b, lhs, rhs) }
+        // Shift / bitwise not yet wired — coverage gap.
+        return -1
+    }
+    if k == "Unary" || k == "UnaryOp" {
+        let inner = nb_lower_expr(m, b, e.left, env)
+        if inner < 0 { return -1 }
+        let op = e.op
+        if op == "-" { return bld_neg(m, b, inner, "i64") }
+        if op == "!" {
+            let one = bld_const_i64(m, b, 1)
+            return bld_sub(m, b, one, inner, "i64")
+        }
+        return -1
+    }
+    if k == "Ident" {
+        return lower_ident_by_name(m, b, env, e.name, "i64")
+    }
+    if k == "Call" {
+        let arg_vids = []
+        let mut i = 0
+        while i < len(e.args) {
+            let av = nb_lower_expr(m, b, e.args[i], env)
+            if av < 0 { return -1 }
+            arg_vids = arg_vids.push(av)
+            i = i + 1
+        }
+        return lower_call_by_name(m, b, e.name, arg_vids, "i64")
+    }
+    // Unsupported expr kind — caller's wrap-0 policy preserves the
+    // rest of the code stream; native_build reports coverage gaps
+    // at end-of-pipeline.
+    return -1
+}
+
+// ── Statement lowering (parser → IR) ──────────────────────────────
+// Return / Let / Assign / ExprStmt. Anything outside this subset
+// returns -1 to flag a coverage gap (bubbled up as `fn_ok=false`).
+fn nb_lower_stmt(m, b, s, env) -> int {
+    let k = s.kind
+    if k == "ReturnStmt" || k == "Return" {
+        if s.left == "" {
+            lower_return(m, b, -1)
+            return 1
+        }
+        let v = nb_lower_expr(m, b, s.left, env)
+        if v < 0 { return -1 }
+        lower_return(m, b, v)
+        return 1
+    }
+    if k == "LetStmt" {
+        let rhs_vid = nb_lower_expr(m, b, s.left, env)
+        if rhs_vid < 0 { return -1 }
+        // Parser LetStmt: `op == "mut"` when declared `let mut`.
+        let is_mut = s.op == "mut"
+        lower_let(m, b, env, s.name, rhs_vid, is_mut, "i64")
+        return 0
+    }
+    if k == "Assign" {
+        let rhs_vid = nb_lower_expr(m, b, s.right, env)
+        if rhs_vid < 0 { return -1 }
+        // Assign target = s.left (Ident expr).
+        lower_assign(m, b, env, s.left.name, rhs_vid)
+        return 0
+    }
+    if k == "ExprStmt" {
+        let v = nb_lower_expr(m, b, s.left, env)
+        if v < 0 { return -1 }
+        return 0
+    }
+    // Unsupported stmt kind — flag coverage gap.
+    return -1
+}
+
+// ── FnDecl → IrFunction ───────────────────────────────────────────
+// Registers the fn in the module, creates entry block, binds params
+// to SSA param-load vids, walks the body. If the body never issues a
+// return we emit an implicit `ret void` terminator so the block is
+// well-formed for regalloc.
+fn nb_lower_fn_decl(m, fn_node) -> bool {
+    let name = fn_node.name
+    let params_ast = fn_node.params
+    let mut param_names = []
+    let mut ir_params = []
+    let mut pi = 0
+    while pi < len(params_ast) {
+        let p = params_ast[pi]
+        param_names = param_names.push(p.name)
+        ir_params = ir_params.push([p.name, "i64"])
+        pi = pi + 1
+    }
+
+    let skel = lower_fn_decl_skeleton(m, name, ir_params, "i64")
+    let fid = skel[0]
+    let b = skel[1]
+
+    // Bind each parameter to a fresh "load param" SSA vid. Codegen
+    // (emit_function_*) reads operand kind "param" and maps via
+    // AAPCS/SysV calling conventions.
+    let env = lower_env_new()
+    let mut p2 = 0
+    while p2 < len(param_names) {
+        let pv = bld_load_param(m, b, p2, "i64")
+        lower_env_bind(env, param_names[p2], pv)
+        p2 = p2 + 1
+    }
+
+    // Walk body. r == 1 means terminator emitted (ret); r == 0 is
+    // non-terminating stmt; r < 0 is a coverage gap.
+    let body = fn_node.body
+    let mut i = 0
+    let mut terminated = false
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { terminated = true; break }
+        i = i + 1
+    }
+    if !terminated {
+        // Implicit `ret 0` so the terminator invariant holds.
+        let zero = bld_const_i64(m, b, 0)
+        lower_return(m, b, zero)
+    }
+    return true
+}
+
 fn parse_and_lower(src: string, path: string) -> any {
-    // TODO(P7-6a): call self/parser.hexa::parse_file →
-    // self/ir/lowering.hexa::lower_module. Returns IRModule.
-    eprintln("[native_build] parse_and_lower: NOT YET IMPLEMENTED (P7-6a)")
-    exit(3)
-    return 0
+    // 1. Lex + parse.
+    let toks = tokenize(src)
+    let ast = parse(toks)
+
+    // 2. Build empty IR module, pre-register every fn name (for forward
+    //    call resolution), then lower each fn in source order.
+    let m = make_ir_module(path)
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            // Pre-register so later fns can call earlier-seen fns.
+            module_add_function(m, node.name, [], "i64")
+        }
+        i = i + 1
+    }
+
+    // Reset next_func so the real lower pass reuses the same IDs.
+    m.next_func = 0
+    m.functions = []
+    i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            if !nb_lower_fn_decl(m, node) {
+                eprintln("[native_build] coverage gap lowering fn " + node.name)
+                exit(4)
+            }
+        }
+        i = i + 1
+    }
+    return m
 }
 
 fn codegen_module(ir_mod: any, target: Target) -> [int] {
