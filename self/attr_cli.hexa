@@ -10,6 +10,8 @@
 use "self/attrs/core"
 use "self/attrs/policy"
 use "self/attrs/forbid"
+use "self/attrs/nonblock"
+use "self/attrs/sealed"
 use "self/attrs/generated"
 use "self/attrs/_registry"
 
@@ -318,10 +320,12 @@ fn _find_project_attrs(target_path: string) {
 fn _parse_attrs_file(path: string) {
     let mut forbids = []
     let mut allows = []
+    let mut nonblocks = []
+    let mut seals = []
     let mut raw = ""
     try {
         raw = to_string(read_file(path))
-    } catch e { return [forbids, allows] }
+    } catch e { return [forbids, allows, nonblocks, seals] }
     let lines = split(raw, "\n")
     for line in lines {
         let t = line.trim()
@@ -339,8 +343,36 @@ fn _parse_attrs_file(path: string) {
         }
         if key == "forbid" { forbids = list }
         else if key == "allow" { allows = list }
+        else if key == "nonblock" { nonblocks = list }
+        else if key == "seal" { seals = list }
     }
-    return [forbids, allows]
+    return [forbids, allows, nonblocks, seals]
+}
+
+// .hexa-attrs seal 토큰 → 실제 파일 경로 리스트 (glob 지원)
+// 토큰이 `*` 포함하면 find, 아니면 literal path (존재 검증)
+fn _expand_seal_tokens(root: string, tokens) {
+    let mut paths = []
+    for tok in tokens {
+        if tok.contains("*") {
+            // shell glob via find — 루트 기준 상대 경로
+            let cmd = "cd '" + root + "' && find . -type f -path './" + tok + "' 2>/dev/null"
+            let out = to_string(exec(cmd)).trim()
+            if out != "" {
+                for p in split(out, "\n") {
+                    let pt = p.trim()
+                    if pt == "" { continue }
+                    let rel = if pt.starts_with("./") { pt.substring(2, len(pt)) } else { pt }
+                    paths = paths.push(root + "/" + rel)
+                }
+            }
+        } else {
+            let abs = root + "/" + tok
+            let exists = to_string(exec("test -f '" + abs + "' && echo y || echo n")).trim()
+            if exists == "y" { paths = paths.push(abs) }
+        }
+    }
+    return paths
 }
 
 // allow = ["hook:shared/harness/*", "skill:experiments/**"]
@@ -477,6 +509,22 @@ fn compile_git_precommit(root: string, forbids) {
     println("emitted: " + out_path + " (" + to_string(len(stanzas)) + " stanzas)")
 }
 
+fn compile_nonblock(root: string, nonblocks) {
+    if len(nonblocks) == 0 { return }
+    let hook_body = compile_nonblock_pretool_hook(nonblocks)
+    let out_dir = root + "/.attr-generated"
+    _ensure_dir(out_dir)
+    let hook_path = out_dir + "/pre_tool_nonblock.sh"
+    _write_generated(hook_path, ".hexa-attrs", "#", hook_body)
+    try { exec("chmod +x '" + hook_path + "'") } catch e {}
+    println("emitted: " + hook_path + " (" + to_string(len(nonblocks)) + " tool guards)")
+
+    let entry = compile_nonblock_settings_entry(nonblocks)
+    let entry_path = out_dir + "/claude_pretool_nonblock.json"
+    _write_generated(entry_path, ".hexa-attrs", "//", entry)
+    println("emitted: " + entry_path + " (PreToolUse merge entry)")
+}
+
 fn run_compile(target: string) {
     // 현재 작업 디렉토리 기준 (env PWD 우선, 없으면 exec pwd)
     let mut pwd = env("PWD")
@@ -489,36 +537,139 @@ fn run_compile(target: string) {
     let root = _dirname(attrs_path)
     let parsed = _parse_attrs_file(attrs_path)
     let forbids = parsed[0]
-    if len(forbids) == 0 {
-        println("no forbid tokens in " + attrs_path + " — nothing to compile")
+    let nonblocks = if len(parsed) > 2 { parsed[2] } else { [] }
+    if len(forbids) == 0 && len(nonblocks) == 0 {
+        println("no forbid/nonblock tokens in " + attrs_path + " — nothing to compile")
         exit(0)
     }
 
     println("─ attr_cli compile ─────────────────────────────────")
-    println("source : " + attrs_path)
-    println("root   : " + root)
-    println("forbids: " + join(forbids, ", "))
+    println("source    : " + attrs_path)
+    println("root      : " + root)
+    println("forbids   : " + join(forbids, ", "))
+    println("nonblocks : " + join(nonblocks, ", "))
     println("")
 
     let mut do_claude = false
     let mut do_git = false
-    if target == "" || target == "all" { do_claude = true; do_git = true }
-    else if target == "claude" { do_claude = true }
-    else if target == "git"    { do_git = true }
+    let mut do_nonblock = false
+    if target == "" || target == "all" { do_claude = true; do_git = true; do_nonblock = true }
+    else if target == "claude"   { do_claude = true }
+    else if target == "git"      { do_git = true }
+    else if target == "nonblock" { do_nonblock = true }
     else {
-        eprintln("unknown target: " + target + " (valid: claude|git|all)")
+        eprintln("unknown target: " + target + " (valid: claude|git|nonblock|all)")
         exit(1)
     }
 
-    if do_claude { compile_claude_permissions_deny(root, forbids) }
-    if do_git    { compile_git_precommit(root, forbids) }
+    if do_claude   { compile_claude_permissions_deny(root, forbids) }
+    if do_git      { compile_git_precommit(root, forbids) }
+    if do_nonblock { compile_nonblock(root, nonblocks) }
 
     println("")
     println("done — manual step:")
     println("  (1) review " + root + "/.attr-generated/")
     println("  (2) merge into target natives:")
     println("      - .claude/settings.json permissions.deny")
+    println("      - .claude/settings.json hooks.PreToolUse (nonblock)")
     println("      - .git/hooks/pre-commit (chmod +x)")
+}
+
+// ── seal / unseal / seal-status — OS-level raw gate ─────────
+// .hexa-attrs `seal = ...` 토큰 → fs_seal/fs_unseal 적용 (hook 없음)
+// 외부 의존 = chmod/chattr/chflags 표준 OS 유틸 (hexa-native 자체해결).
+
+fn _seal_setup(target_path: string) {
+    let attrs_path = _find_project_attrs(target_path)
+    if attrs_path == "" {
+        eprintln("error: no .hexa-attrs found upward from " + target_path)
+        exit(1)
+    }
+    let root = _dirname(attrs_path)
+    let parsed = _parse_attrs_file(attrs_path)
+    let seals = if len(parsed) > 3 { parsed[3] } else { [] }
+    if len(seals) == 0 {
+        println("no `seal = ...` tokens in " + attrs_path + " — nothing to do")
+        exit(0)
+    }
+    return [root, seals, attrs_path]
+}
+
+fn run_seal(target_path: string) {
+    let ctx = _seal_setup(target_path)
+    let root = ctx[0]
+    let seals = ctx[1]
+    let attrs_path = ctx[2]
+    let paths = _expand_seal_tokens(root, seals)
+
+    println("─ attr_cli seal — OS raw gate 적용 ─────────────────")
+    println("source : " + attrs_path)
+    println("tokens : " + join(seals, ", "))
+    println("files  : " + to_string(len(paths)))
+    println("")
+
+    let mut ok = 0
+    for p in paths {
+        fs_seal(p)
+        let sealed = fs_is_sealed(p)
+        if sealed {
+            println("  ✔ sealed  " + p)
+            ok = ok + 1
+        } else {
+            println("  ✗ failed  " + p + " (mode check didn't confirm)")
+        }
+    }
+    println("")
+    println("done — " + to_string(ok) + "/" + to_string(len(paths)) + " files sealed")
+    println("      Edit/Write tool → OS EACCES (hook 0, settings 0)")
+}
+
+fn run_unseal(target_path: string) {
+    let ctx = _seal_setup(target_path)
+    let root = ctx[0]
+    let seals = ctx[1]
+    let paths = _expand_seal_tokens(root, seals)
+
+    println("─ attr_cli unseal — seal 해제 ─────────────────────")
+    println("files  : " + to_string(len(paths)))
+    println("")
+
+    for p in paths {
+        fs_unseal(p)
+        let sealed = fs_is_sealed(p)
+        if !sealed {
+            println("  ✔ unsealed  " + p)
+        } else {
+            println("  ✗ still sealed  " + p + " (chattr/chflags 권한 부족?)")
+        }
+    }
+}
+
+fn run_seal_status(target_path: string) {
+    let ctx = _seal_setup(target_path)
+    let root = ctx[0]
+    let seals = ctx[1]
+    let paths = _expand_seal_tokens(root, seals)
+
+    println("─ attr_cli seal-status ───────────────────────────")
+    println("")
+    let mut sealed_n = 0
+    let mut open_n = 0
+    for p in paths {
+        if fs_is_sealed(p) {
+            println("  [SEALED] " + p)
+            sealed_n = sealed_n + 1
+        } else {
+            println("  [OPEN  ] " + p)
+            open_n = open_n + 1
+        }
+    }
+    println("")
+    println("total=" + to_string(len(paths)) +
+            "  sealed=" + to_string(sealed_n) +
+            "  open=" + to_string(open_n))
+    if open_n > 0 { exit(1) }
+    exit(0)
 }
 
 // ── CLI dispatch ──────────────────────────────────────────
@@ -579,6 +730,27 @@ if sub == "compile" {
     exit(0)
 }
 
+if sub == "seal" {
+    let mut pwd = env("PWD")
+    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+    run_seal(pwd)
+    exit(0)
+}
+
+if sub == "unseal" {
+    let mut pwd = env("PWD")
+    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+    run_unseal(pwd)
+    exit(0)
+}
+
+if sub == "seal-status" {
+    let mut pwd = env("PWD")
+    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+    run_seal_status(pwd)
+    exit(0)
+}
+
 // 직접 이름 전달 시 show 대체 (예: `hexa attr_cli.hexa pure`)
 let mut n2 = sub
 if n2.starts_with("@") { n2 = n2.substring(1, len(n2)) }
@@ -592,4 +764,8 @@ eprintln("  hexa attr_cli.hexa missing")
 eprintln("  hexa attr_cli.hexa audit <name>")
 eprintln("  hexa attr_cli.hexa lint <file.hexa>")
 eprintln("  hexa attr_cli.hexa lint-names")
+eprintln("  hexa attr_cli.hexa compile [claude|git|nonblock|all]")
+eprintln("  hexa attr_cli.hexa seal          — .hexa-attrs seal= 파일 전부 OS-level 차단")
+eprintln("  hexa attr_cli.hexa unseal        — 차단 해제")
+eprintln("  hexa attr_cli.hexa seal-status   — 현재 seal 상태 리포트")
 exit(1)
