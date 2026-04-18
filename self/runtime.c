@@ -2583,12 +2583,43 @@ void hexa_throw(HexaVal err) {
 
 // ── Printing ─────────────────────────────────────────────
 
+// anima P0 bug #6 (2026-04-18): TAG_VALSTRUCT unwrap guard.
+// When interpreter routes print through hexa_println with an arg that
+// got boxed as TAG_VALSTRUCT (rt 32-G flat struct), the prior `default:`
+// branch rendered "<value>" — correct-ish but lossy for the common
+// string path (if true { println("inside") } inside a fn body).
+// Unwrap the inner tag here so the user-visible output matches the
+// intent even when Val-boxing sneaks through the stage0 boundary.
+// See: handoff 2026-04-18 bug #6, feedback_val_corruption_class_2026_04_17.md
 void hexa_print_val(HexaVal v) {
+    // One-hop TAG_VALSTRUCT unwrap. Not recursive — a VS wrapping a VS is
+    // already a corruption signal we surface via the fallback tail.
+    if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
+        HexaValStruct* vs = HX_VS(v);
+        switch (vs->tag_i) {
+            case TAG_INT:   printf("%lld", (long long)vs->int_val); return;
+            case TAG_FLOAT: printf("%g", vs->float_val); return;
+            case TAG_BOOL:  printf("%s", vs->bool_val ? "true" : "false"); return;
+            case TAG_STR:
+                if (vs->str_val) { printf("%s", vs->str_val); return; }
+                break;
+            case TAG_VOID:  printf("void"); return;
+        }
+        // Inner tag not one of the printable scalars — fall through to the
+        // outer switch with the boxed tag so we emit "<value>" rather than
+        // dereferencing a compound descriptor that may not survive arena
+        // rewinding (T33 class).
+    }
     switch (HX_TAG(v)) {
         case TAG_INT: printf("%lld", (long long)HX_INT(v)); break;
         case TAG_FLOAT: printf("%g", HX_FLOAT(v)); break;
         case TAG_BOOL: printf("%s", HX_BOOL(v) ? "true" : "false"); break;
-        case TAG_STR: printf("%s", HX_STR(v)); break;
+        case TAG_STR:
+            // Null-pointer guard: a corrupted TAG_STR (str_val=NULL) would
+            // crash printf("%s", NULL) on some libc builds. Surface it.
+            if (HX_STR(v)) printf("%s", HX_STR(v));
+            else printf("<str null>");
+            break;
         case TAG_VOID: printf("void"); break;
         case TAG_ARRAY:
             printf("[");
