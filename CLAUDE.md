@@ -55,6 +55,7 @@ hexa-lang 핵심 규칙:
        - exec_with_status() — 실제 exit code 반환. interpreter: sentinel($?), native: pclose(WEXITSTATUS)
        - T33-fix-2 — ValStruct arena corruption 근본 수정 (from_arena=0). HEXA_VAL_ARENA=0 불필요
        - rebuild_stage0/build_stage0 — clang/flatten 실패 시 정확히 감지+롤백+exit(1)
+  HX11: AI-native SELF-FORMAT — 모든 attr (@doc/@domain/@readme/@sealed/@publish…) 은 프로젝트별 `.<attr>-rules.json` 주입으로 양식 독립. `_meta.inherit: false` (default) = 자체 양식, `inherit: true` = 글로벌 병합. 하드코딩 섹션·임계값 금지. 글로벌 fallback: `$NEXUS/shared/config/<attr>_rules.json`. 신규 attr 은 `find_<attr>_rules(source)` helper 필수
   HX10: self-hosting 현황 — Rust 편입 완료(P0-P5), C 의존 잔존, P7 인프라 90% 완료
        - 현재: .hexa → hexa_v2 → .c → clang → native + runtime.c(4,696 LOC) 링크
        - P7-1~P7-5 완료: ARM64/x86_64 인코더 + ELF/Mach-O + regalloc + peephole (self/codegen/)

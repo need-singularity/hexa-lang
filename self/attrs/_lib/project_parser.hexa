@@ -1,0 +1,502 @@
+// self/attrs/_lib/project_parser.hexa — project.hexa 의 @<attr>_rules 블록 파싱
+//
+// HX11 (갱신안): JSON `.<attr>-rules.json` 을 폐기하고 project.hexa 를 단일 SSOT 로 사용.
+// 실제 구현은 설계 문서 §5-3-3 의 **옵션 β** (attribute + 바로 다음 `let _<name> = #{...}`):
+//
+//     @doc_rules(type="paper")
+//     let _doc_rules_paper = #{
+//         "sections": ["WHY", "COMPARE", ...],
+//         "require_verify": true,
+//         "mk_history_min_lines": 3
+//     }
+//
+// 이렇게 선언하면 project.hexa 전체가 valid hexa 파일로 `hexa parse` 통과하고,
+// 본 파서는 텍스트 스캔으로 attribute + map literal 을 추출한다 (interpreter 미거침).
+//
+// 한계:
+//   - 본문 map literal 은 top-level `#{...}` 만 처리. 내부 `#{...}` / `[...]` / 문자열
+//     literal 은 지원. 함수 호출, 연산식 등은 지원 X (순수 literal 만).
+//   - 키는 string literal ("...") 형태만 허용 (hexa map literal 의 안정 key 형식).
+//
+// API:
+//   parse_project_hexa(content: string) -> [map]
+//   find_block(blocks: [map], attr: string, selector: map) -> map
+//   find_project_hexa(source: string) -> string
+//
+// 각 blocks 엔트리 스키마:
+//   #{"attr": "doc", "selector": #{"type": "paper"}, "body": #{...}}
+
+use "self/attrs/core"
+
+// ─────────────────────────────────────────────────────────────
+// 저수준 유틸
+// ─────────────────────────────────────────────────────────────
+
+// 특정 위치에서 whitespace / newline / 주석(// ...) skip → 다음 유효 index 반환
+fn _pp_skip_ws(content: string, pos: int) -> int {
+    let n = len(content)
+    let mut i = pos
+    while i < n {
+        let c = content.substring(i, i + 1)
+        let code = char_code(c, 0)
+        // space(32), tab(9), newline(10), CR(13)
+        if code == 32 || code == 9 || code == 10 || code == 13 {
+            i = i + 1
+            continue
+        }
+        // // comment → 개행까지
+        if c == "/" && i + 1 < n && content.substring(i + 1, i + 2) == "/" {
+            while i < n && content.substring(i, i + 1) != "\n" {
+                i = i + 1
+            }
+            continue
+        }
+        break
+    }
+    return i
+}
+
+// identifier 끝 index 반환 (a-z, A-Z, 0-9, _ 연속)
+fn _pp_read_ident(content: string, pos: int) -> int {
+    let n = len(content)
+    let mut i = pos
+    while i < n {
+        let c = content.substring(i, i + 1)
+        let code = char_code(c, 0)
+        let is_alpha = (code >= 97 && code <= 122) || (code >= 65 && code <= 90)
+        let is_digit = code >= 48 && code <= 57
+        let is_under = code == 95
+        if is_alpha || is_digit || is_under { i = i + 1 }
+        else { break }
+    }
+    return i
+}
+
+// 문자열 literal 읽기 (위치는 여는 따옴표 위치).
+// 결과: [value_string, next_pos]. 실패 시 [_, -1].
+// PERF 101 회피 — parts.push() + join("") 패턴.
+fn _pp_read_string(content: string, pos: int) {
+    let n = len(content)
+    if pos >= n { return ["", -1] }
+    let q = content.substring(pos, pos + 1)
+    if q != "\"" && q != "'" { return ["", -1] }
+    let mut i = pos + 1
+    let mut parts = []
+    while i < n {
+        let c = content.substring(i, i + 1)
+        if c == q {
+            return [parts.join(""), i + 1]
+        }
+        if c == "\\" && i + 1 < n {
+            let nxt = content.substring(i + 1, i + 2)
+            if nxt == "n" { parts = parts.push("\n") }
+            else if nxt == "t" { parts = parts.push("\t") }
+            else if nxt == "\\" { parts = parts.push("\\") }
+            else if nxt == "\"" { parts = parts.push("\"") }
+            else if nxt == "'" { parts = parts.push("'") }
+            else { parts = parts.push(nxt) }
+            i = i + 2
+            continue
+        }
+        parts = parts.push(c)
+        i = i + 1
+    }
+    return ["", -1]
+}
+
+// 정수 literal 읽기 (음수 포함). 반환 [int_value, next_pos].
+fn _pp_read_int(content: string, pos: int) {
+    let n = len(content)
+    let mut i = pos
+    if i < n && content.substring(i, i + 1) == "-" { i = i + 1 }
+    let start = i
+    while i < n {
+        let c = content.substring(i, i + 1)
+        let code = char_code(c, 0)
+        if code >= 48 && code <= 57 { i = i + 1 }
+        else { break }
+    }
+    if i == start { return [0, -1] }
+    let raw = content.substring(pos, i)
+    let mut v = 0
+    try { v = to_int(raw) } catch e { return [0, -1] }
+    return [v, i]
+}
+
+// bool literal (true/false) 읽기. 반환 [bool_value, next_pos], 미매칭 시 [_, -1].
+fn _pp_read_bool(content: string, pos: int) {
+    let n = len(content)
+    if pos + 4 <= n && content.substring(pos, pos + 4) == "true" {
+        // 뒤에 ident 문자 이어지면 bool 아님
+        if pos + 4 == n { return [true, pos + 4] }
+        let c = content.substring(pos + 4, pos + 5)
+        let code = char_code(c, 0)
+        let is_ident = (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code == 95
+        if !is_ident { return [true, pos + 4] }
+    }
+    if pos + 5 <= n && content.substring(pos, pos + 5) == "false" {
+        if pos + 5 == n { return [false, pos + 5] }
+        let c = content.substring(pos + 5, pos + 6)
+        let code = char_code(c, 0)
+        let is_ident = (code >= 97 && code <= 122) || (code >= 65 && code <= 90) || (code >= 48 && code <= 57) || code == 95
+        if !is_ident { return [false, pos + 5] }
+    }
+    return [false, -1]
+}
+
+// ─────────────────────────────────────────────────────────────
+// 값(value) 파서 — string / int / bool / list / map 재귀
+// ─────────────────────────────────────────────────────────────
+
+// 반환: [value, next_pos]. 실패 시 next_pos = -1.
+fn _pp_read_value(content: string, pos: int) {
+    let p = _pp_skip_ws(content, pos)
+    if p >= len(content) { return [0, -1] }
+    let c = content.substring(p, p + 1)
+
+    // string
+    if c == "\"" || c == "'" {
+        return _pp_read_string(content, p)
+    }
+    // list
+    if c == "[" {
+        return _pp_read_list(content, p)
+    }
+    // map literal
+    if c == "#" && p + 1 < len(content) && content.substring(p + 1, p + 2) == "{" {
+        return _pp_read_map(content, p)
+    }
+    // bool
+    let b = _pp_read_bool(content, p)
+    if b[1] >= 0 { return b }
+    // int (음수 또는 숫자)
+    let code = char_code(c, 0)
+    let is_digit = code >= 48 && code <= 57
+    let is_neg = c == "-"
+    if is_digit || is_neg {
+        return _pp_read_int(content, p)
+    }
+    return [0, -1]
+}
+
+// list literal `[...]`
+fn _pp_read_list(content: string, pos: int) {
+    let n = len(content)
+    if pos >= n || content.substring(pos, pos + 1) != "[" { return [[], -1] }
+    let mut i = pos + 1
+    let mut out = []
+    while true {
+        i = _pp_skip_ws(content, i)
+        if i >= n { return [[], -1] }
+        if content.substring(i, i + 1) == "]" { return [out, i + 1] }
+        let r = _pp_read_value(content, i)
+        if r[1] < 0 { return [[], -1] }
+        out = out.push(r[0])
+        i = _pp_skip_ws(content, r[1])
+        if i >= n { return [[], -1] }
+        let sep = content.substring(i, i + 1)
+        if sep == "," { i = i + 1; continue }
+        if sep == "]" { return [out, i + 1] }
+        // newline-separated 도 허용 (skip_ws 가 이미 처리)
+    }
+    return [[], -1]
+}
+
+// map literal `#{...}` — 키는 string literal 또는 bare identifier 모두 허용
+fn _pp_read_map(content: string, pos: int) {
+    let n = len(content)
+    if pos + 1 >= n { return [#{}, -1] }
+    if content.substring(pos, pos + 1) != "#" { return [#{}, -1] }
+    if content.substring(pos + 1, pos + 2) != "{" { return [#{}, -1] }
+    let mut i = pos + 2
+    let mut out = #{}
+    while true {
+        i = _pp_skip_ws(content, i)
+        if i >= n { return [#{}, -1] }
+        if content.substring(i, i + 1) == "}" { return [out, i + 1] }
+
+        // key
+        let mut key = ""
+        let kc = content.substring(i, i + 1)
+        if kc == "\"" || kc == "'" {
+            let sr = _pp_read_string(content, i)
+            if sr[1] < 0 { return [#{}, -1] }
+            key = sr[0]
+            i = sr[1]
+        } else {
+            // bare ident
+            let kend = _pp_read_ident(content, i)
+            if kend == i { return [#{}, -1] }
+            key = content.substring(i, kend)
+            i = kend
+        }
+        i = _pp_skip_ws(content, i)
+        if i >= n || content.substring(i, i + 1) != ":" { return [#{}, -1] }
+        i = i + 1
+        let vr = _pp_read_value(content, i)
+        if vr[1] < 0 { return [#{}, -1] }
+        out[key] = vr[0]
+        i = _pp_skip_ws(content, vr[1])
+        if i >= n { return [#{}, -1] }
+        let sep = content.substring(i, i + 1)
+        if sep == "," { i = i + 1; continue }
+        if sep == "}" { return [out, i + 1] }
+        // allow newline-only separation
+    }
+    return [#{}, -1]
+}
+
+// ─────────────────────────────────────────────────────────────
+// attribute kwargs 파서 — (k1="v1", k2=true, k3=42)
+// ─────────────────────────────────────────────────────────────
+
+// 반환 [selector_map, next_pos]. `(` 위치에서 호출. `)` 이후 position.
+fn _pp_read_selector(content: string, pos: int) {
+    let n = len(content)
+    if pos >= n || content.substring(pos, pos + 1) != "(" { return [#{}, -1] }
+    let mut i = pos + 1
+    let mut out = #{}
+    while true {
+        i = _pp_skip_ws(content, i)
+        if i >= n { return [#{}, -1] }
+        if content.substring(i, i + 1) == ")" { return [out, i + 1] }
+        // key
+        let kend = _pp_read_ident(content, i)
+        if kend == i { return [#{}, -1] }
+        let key = content.substring(i, kend)
+        i = _pp_skip_ws(content, kend)
+        if i >= n || content.substring(i, i + 1) != "=" { return [#{}, -1] }
+        i = i + 1
+        let vr = _pp_read_value(content, i)
+        if vr[1] < 0 { return [#{}, -1] }
+        out[key] = vr[0]
+        i = _pp_skip_ws(content, vr[1])
+        if i >= n { return [#{}, -1] }
+        let sep = content.substring(i, i + 1)
+        if sep == "," { i = i + 1; continue }
+        if sep == ")" { return [out, i + 1] }
+    }
+    return [#{}, -1]
+}
+
+// ─────────────────────────────────────────────────────────────
+// MAIN — parse_project_hexa
+// ─────────────────────────────────────────────────────────────
+
+// content 전체를 스캔하여 @<name>_rules[(selector)] + 다음 map literal 을 수집.
+// 다음 map literal 은 두 형태 허용:
+//   (a) let _<anything> = #{...}        ← 권장 (옵션 β)
+//   (b) @<name>_rules { ... }            ← 옵션 α (현 파서는 body-block 미지원이지만
+//                                           텍스트 스캔은 시도 — 파싱 성공 시 채택)
+pub fn parse_project_hexa(content: string) -> [map] {
+    let n = len(content)
+    let mut blocks = []
+    let mut i = 0
+    while i < n {
+        // skip comments/ws
+        i = _pp_skip_ws(content, i)
+        if i >= n { break }
+        let c = content.substring(i, i + 1)
+        if c != "@" { i = i + 1; continue }
+
+        // @<ident>
+        let name_end = _pp_read_ident(content, i + 1)
+        if name_end == i + 1 { i = i + 1; continue }
+        let name = content.substring(i + 1, name_end)
+        // must end with "_rules"
+        let nl = len(name)
+        if nl <= 6 || name.substring(nl - 6, nl) != "_rules" {
+            i = name_end
+            continue
+        }
+        let attr = name.substring(0, nl - 6)
+
+        // optional (selector)
+        let mut selector = #{}
+        let mut j = _pp_skip_ws(content, name_end)
+        if j < n && content.substring(j, j + 1) == "(" {
+            let sr = _pp_read_selector(content, j)
+            if sr[1] < 0 { i = name_end; continue }
+            selector = sr[0]
+            j = sr[1]
+        }
+        j = _pp_skip_ws(content, j)
+        if j >= n { break }
+
+        // 다음 토큰: "let" (옵션 β) 또는 "{" (옵션 α).
+        let head = content.substring(j, j + 1)
+        let mut body = #{}
+        let mut next_pos = j
+        if head == "{" {
+            // 옵션 α — body block. 간이 파서: `key = value` 라인.
+            let br = _pp_read_body_block(content, j)
+            if br[1] < 0 { i = name_end; continue }
+            body = br[0]
+            next_pos = br[1]
+        } else {
+            // 옵션 β — "let <ident> = #{...}"
+            if j + 3 > n || content.substring(j, j + 3) != "let" {
+                i = name_end
+                continue
+            }
+            // 'let' 뒤는 ident
+            let after_let = _pp_skip_ws(content, j + 3)
+            let bind_end = _pp_read_ident(content, after_let)
+            if bind_end == after_let { i = name_end; continue }
+            let after_eq = _pp_skip_ws(content, bind_end)
+            if after_eq >= n || content.substring(after_eq, after_eq + 1) != "=" {
+                i = name_end
+                continue
+            }
+            let rhs = _pp_read_value(content, after_eq + 1)
+            if rhs[1] < 0 { i = name_end; continue }
+            let val = rhs[0]
+            // map 이 아니면 skip (우리는 map body 만 의미있음)
+            if !_pp_is_map(val) { i = rhs[1]; continue }
+            body = val
+            next_pos = rhs[1]
+        }
+
+        let mut entry = #{}
+        entry["attr"] = attr
+        entry["selector"] = selector
+        entry["body"] = body
+        blocks = blocks.push(entry)
+        i = next_pos
+    }
+    return blocks
+}
+
+// 옵션 α body-block 파서 (선택적; 현 hexa 파서는 이 형태를 거부하지만
+// `parse_project_hexa` 가 텍스트 수준에서 처리하므로 project.hexa 를 직접
+// `hexa parse` 하지 않을 때는 동작).
+fn _pp_read_body_block(content: string, pos: int) {
+    let n = len(content)
+    if pos >= n || content.substring(pos, pos + 1) != "{" { return [#{}, -1] }
+    let mut i = pos + 1
+    let mut out = #{}
+    while true {
+        i = _pp_skip_ws(content, i)
+        if i >= n { return [#{}, -1] }
+        if content.substring(i, i + 1) == "}" { return [out, i + 1] }
+        // key ident
+        let kend = _pp_read_ident(content, i)
+        if kend == i { return [#{}, -1] }
+        let key = content.substring(i, kend)
+        let after_k = _pp_skip_ws(content, kend)
+        if after_k >= n || content.substring(after_k, after_k + 1) != "=" { return [#{}, -1] }
+        let vr = _pp_read_value(content, after_k + 1)
+        if vr[1] < 0 { return [#{}, -1] }
+        out[key] = vr[0]
+        i = _pp_skip_ws(content, vr[1])
+        if i >= n { return [#{}, -1] }
+        let sep = content.substring(i, i + 1)
+        if sep == "," { i = i + 1; continue }
+        // newline-separated 은 skip_ws 가 알아서 처리
+    }
+    return [#{}, -1]
+}
+
+// map 여부 판별 (keys() 호출 가능한지)
+fn _pp_is_map(v) -> bool {
+    try {
+        let _ = keys(v)
+        return true
+    } catch e {
+        return false
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// find_block — attr + selector 매칭 블록 본문(body) 반환
+// ─────────────────────────────────────────────────────────────
+
+// selector 매칭: project 블록 selector 의 모든 key/value 가 query selector 와 일치.
+// query selector 가 비어있으면 "selector 키 0 개인 블록" 우선.
+pub fn find_block(blocks: [map], attr: string, selector: map) -> map {
+    // 1) 완전 일치 우선
+    for b in blocks {
+        if b["attr"] != attr { continue }
+        let bs = b["selector"]
+        if _pp_selector_match(bs, selector) {
+            return b["body"]
+        }
+    }
+    // 2) selector 비어있고 매칭이 없었으면 attr 만 같은 첫 블록 (느슨 매칭)
+    if len(keys(selector)) == 0 {
+        for b in blocks {
+            if b["attr"] == attr { return b["body"] }
+        }
+    }
+    return #{}
+}
+
+// 엄격 매칭: query selector 의 모든 key 가 block selector 에 같은 값으로 존재.
+fn _pp_selector_match(block_sel: map, query: map) -> bool {
+    let qks = keys(query)
+    let bks = keys(block_sel)
+    // query 가 비어있으면 block selector 도 비어있어야 일치
+    if len(qks) == 0 {
+        return len(bks) == 0
+    }
+    for k in qks {
+        if !has_key(block_sel, k) { return false }
+        if block_sel[k] != query[k] { return false }
+    }
+    return true
+}
+
+// ─────────────────────────────────────────────────────────────
+// find_project_hexa — source 상위 탐색 (`.git` 루트까지 또는 fs root)
+// ─────────────────────────────────────────────────────────────
+
+fn _pp_last_slash(s: string) -> int {
+    let mut found = -1
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        if s.substring(i, i + 1) == "/" { found = i }
+        i = i + 1
+    }
+    return found
+}
+
+pub fn find_project_hexa(source: string) -> string {
+    if source == "" { return "" }
+    let mut cur = source
+    if !cur.starts_with("/") {
+        let pwd = to_string(exec("pwd")).trim()
+        if pwd != "" { cur = pwd + "/" + cur }
+    }
+    // source 가 디렉토리면 먼저 자체 체크
+    let is_dir = to_string(exec("test -d '" + cur + "' && printf 1 || printf 0")).trim()
+    if is_dir == "1" {
+        let probe = cur + "/project.hexa"
+        let e = to_string(exec("test -f '" + probe + "' && printf 1 || printf 0")).trim()
+        if e == "1" { return probe }
+    }
+    let mut hops = 0
+    while hops < 20 {
+        hops = hops + 1
+        let ls = _pp_last_slash(cur)
+        if ls <= 0 { break }
+        cur = cur.substring(0, ls)
+        if cur == "" { break }
+        let probe = cur + "/project.hexa"
+        let exists = to_string(exec("test -f '" + probe + "' && printf 1 || printf 0")).trim()
+        if exists == "1" { return probe }
+        if cur == "/" { break }
+    }
+    return ""
+}
+
+// 편의 API — path 받아 파일 읽고 parse
+pub fn parse_project_hexa_file(path: string) -> [map] {
+    if path == "" { return [] }
+    let exists = to_string(exec("test -f '" + path + "' && printf 1 || printf 0")).trim()
+    if exists != "1" { return [] }
+    let mut raw = ""
+    try { raw = to_string(read_file(path)) } catch e { raw = "" }
+    if raw == "" { return [] }
+    return parse_project_hexa(raw)
+}
