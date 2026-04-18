@@ -1,13 +1,25 @@
 // self/codegen/macho.hexa — ported from src/codegen/macho.rs
-// Mach-O binary format wrapper — macOS object files.
-// Wraps raw machine code in Mach-O 64-bit relocatable object format (.o).
+// Mach-O binary format wrapper — macOS object files + executables.
+// Two modes:
+//   macho_obj_wrap  → MH_OBJECT (.o relocatable)       — linker input
+//   macho_exec_wrap → MH_EXECUTE (loadable executable) — ld-produced binary
+// macho_wrap is retained as a thin alias of macho_obj_wrap so existing
+// callers (self/codegen/mod.hexa::generate, earlier PoC tests) keep
+// working unchanged.
 
 fn mh_magic_64() -> int { return 0xFEEDFACF }
 fn mh_object() -> int { return 1 }
+fn mh_execute() -> int { return 2 }
 fn cpu_type_arm64() -> int { return 0x0100000C }
 fn cpu_subtype_all() -> int { return 0 }
 fn lc_segment_64() -> int { return 0x19 }
 fn lc_symtab() -> int { return 0x02 }
+fn lc_dysymtab() -> int { return 0x0b }
+fn lc_load_dylib() -> int { return 0x0c }
+fn lc_load_dylinker() -> int { return 0x0e }
+fn lc_uuid() -> int { return 0x1b }
+fn lc_dyld_chained_fixups() -> int { return 0x80000034 }
+fn lc_main() -> int { return 0x80000028 }
 fn lc_build_version() -> int { return 0x32 }
 fn s_attr_pure_instructions() -> int { return 0x80000000 }
 fn s_attr_some_instructions() -> int { return 0x00000400 }
@@ -19,7 +31,7 @@ fn align_to(val: int, align: int) -> int {
 }
 
 // Wrap machine code in Mach-O relocatable object (.o) format.
-fn macho_wrap(code: [int], main_offset: int) -> [int] {
+fn macho_obj_wrap(code: [int], main_offset: int) -> [int] {
     let mut out = []
     let code_size = len(code)
     let symbol_name = "_hexa_main"
@@ -137,4 +149,272 @@ fn push_u32_le(buf: [int], val: int) -> [int] {
 fn push_u64_le(buf: [int], val: int) -> [int] {
     let mut b = push_u32_le(buf, val % 0x100000000)
     return push_u32_le(b, val / 0x100000000)
+}
+
+// ───────────────────────────────────────────────────────────────
+// Compatibility alias.
+// Callers that built against the older single-mode API (relocatable
+// object) keep the original `macho_wrap(code, main_offset)` signature.
+// ───────────────────────────────────────────────────────────────
+fn macho_wrap(code: [int], main_offset: int) -> [int] {
+    return macho_obj_wrap(code, main_offset)
+}
+
+// Push N zero bytes.
+fn push_zeros(buf: [int], n: int) -> [int] {
+    let mut b = buf
+    let mut i = 0
+    while i < n {
+        b = b.push(0)
+        i = i + 1
+    }
+    return b
+}
+
+// Push a fixed-length ASCII field padded to `width` bytes with NUL.
+// Used for segname/sectname (16-byte fields) in load commands.
+fn push_fixed_ascii(buf: [int], s: [int], width: int) -> [int] {
+    let mut b = buf
+    let mut i = 0
+    while i < width {
+        if i < len(s) {
+            b = b.push(s[i])
+        } else {
+            b = b.push(0)
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// macho_exec_wrap — MH_EXECUTE loadable binary (ARM64)
+// ═══════════════════════════════════════════════════════════════════
+// Byte-level port of the build_macho_hex() wrapper that previously
+// lived inlined in self/compile_pipeline.hexa. Produces a complete
+// MH_EXECUTE image runnable on macOS arm64 after `codesign -s -`:
+//
+//   Load commands (11 total, sizeofcmds = 576):
+//     LC_SEGMENT_64 __PAGEZERO    (vmsize 0x100000000, nsects 0)
+//     LC_SEGMENT_64 __TEXT        (vmaddr 0x100000000, __text section)
+//     LC_SEGMENT_64 __LINKEDIT    (chained fixups + symtab stub)
+//     LC_DYLD_CHAINED_FIXUPS
+//     LC_SYMTAB
+//     LC_DYSYMTAB
+//     LC_LOAD_DYLINKER            (/usr/lib/dyld)
+//     LC_UUID
+//     LC_BUILD_VERSION            (macOS 14.0)
+//     LC_MAIN                     (entryoff = entry_va — file offset of _main)
+//     LC_LOAD_DYLIB libSystem
+//
+// File layout:
+//   [0x000 .. 0x300) = header + load commands + zero pad
+//   [0x300 ..       ) = .text (arm64 instructions)
+//   [pad to 0x4000 ) = page align
+//   [...          49 bytes) = __LINKEDIT stub
+//
+// `entry_va` is the LC_MAIN entryoff — the FILE offset of the first
+// instruction from the start of the __TEXT image (NOT a virtual address;
+// the loader adds __TEXT.vmaddr). Pass CODE_OFF (=0x300) for the default
+// layout where .text immediately follows the load commands.
+fn macho_exec_wrap(code: [int], entry_va: int) -> [int] {
+    let NCMDS = 11
+    let SIZEOFCMDS = 576
+    let PAGE = 16384              // 0x4000
+    let CODE_OFF = 768            // 0x300 — file offset of .text
+    let HDR_FLAGS = 0x00200085    // MH_NOUNDEFS | MH_DYLDLINK | MH_TWOLEVEL | MH_PIE
+
+    let code_bytes = len(code)
+    let mut text_size_aligned = code_bytes
+    if text_size_aligned % 4 != 0 {
+        text_size_aligned = text_size_aligned + (4 - text_size_aligned % 4)
+    }
+
+    // Segment/section name byte arrays (ASCII, NUL-padded to 16 bytes).
+    let SEG_PAGEZERO = [95, 95, 80, 65, 71, 69, 90, 69, 82, 79]       // __PAGEZERO
+    let SEG_TEXT     = [95, 95, 84, 69, 88, 84]                        // __TEXT
+    let SECT_TEXT    = [95, 95, 116, 101, 120, 116]                    // __text
+    let SEG_LINKEDIT = [95, 95, 76, 73, 78, 75, 69, 68, 73, 84]        // __LINKEDIT
+    // "/usr/lib/dyld" + NUL (14 bytes total, padded to 20 in the LC).
+    let DYLINKER_PATH = [47, 117, 115, 114, 47, 108, 105, 98,
+                         47, 100, 121, 108, 100, 0]
+    // "/usr/lib/libSystem.B.dylib" + NUL.
+    let LIBSYSTEM_PATH = [47, 117, 115, 114, 47, 108, 105, 98,
+                          47, 108, 105, 98, 83, 121, 115, 116, 101, 109,
+                          46, 66, 46, 100, 121, 108, 105, 98, 0]
+    // UUID payload — "HEXAABCDEF012345" (16 bytes, matches the inline wrapper).
+    let UUID_BYTES = [72, 69, 88, 65, 65, 66, 67, 68,
+                      69, 70, 48, 49, 50, 51, 52, 53]
+
+    // ── Mach-O header (32 bytes) ──────────────────────────────────
+    let mut out = []
+    out = push_u32_le(out, mh_magic_64())        // magic
+    out = push_u32_le(out, cpu_type_arm64())     // cputype
+    out = push_u32_le(out, 0)                    // cpusubtype = 0 (ALL)
+    out = push_u32_le(out, mh_execute())         // filetype
+    out = push_u32_le(out, NCMDS)                // ncmds
+    out = push_u32_le(out, SIZEOFCMDS)           // sizeofcmds
+    out = push_u32_le(out, HDR_FLAGS)            // flags
+    out = push_u32_le(out, 0)                    // reserved
+
+    // ── LC_SEGMENT_64 __PAGEZERO (72 bytes) ───────────────────────
+    out = push_u32_le(out, lc_segment_64())
+    out = push_u32_le(out, 72)                   // cmdsize
+    out = push_fixed_ascii(out, SEG_PAGEZERO, 16)
+    out = push_u64_le(out, 0)                    // vmaddr
+    out = push_u64_le(out, 0x100000000)          // vmsize = 4 GiB
+    out = push_u64_le(out, 0)                    // fileoff
+    out = push_u64_le(out, 0)                    // filesize
+    out = push_u32_le(out, 0)                    // maxprot
+    out = push_u32_le(out, 0)                    // initprot
+    out = push_u32_le(out, 0)                    // nsects
+    out = push_u32_le(out, 0)                    // flags
+
+    // ── LC_SEGMENT_64 __TEXT (72 + 80 = 152 bytes) ────────────────
+    out = push_u32_le(out, lc_segment_64())
+    out = push_u32_le(out, 152)                  // cmdsize
+    out = push_fixed_ascii(out, SEG_TEXT, 16)
+    out = push_u64_le(out, 0x100000000)          // vmaddr
+    out = push_u64_le(out, 0x4000)               // vmsize = 1 page
+    out = push_u64_le(out, 0)                    // fileoff
+    out = push_u64_le(out, 0x4000)               // filesize
+    out = push_u32_le(out, 5)                    // maxprot  = R+X
+    out = push_u32_le(out, 5)                    // initprot = R+X
+    out = push_u32_le(out, 1)                    // nsects
+    out = push_u32_le(out, 0)                    // flags
+
+    //   Section __text (80 bytes).
+    out = push_fixed_ascii(out, SECT_TEXT, 16)   // sectname
+    out = push_fixed_ascii(out, SEG_TEXT, 16)    // segname
+    out = push_u64_le(out, 0x100000000 + CODE_OFF)  // addr
+    out = push_u64_le(out, text_size_aligned)       // size
+    out = push_u32_le(out, CODE_OFF)                // offset
+    out = push_u32_le(out, 2)                       // align = 2^2
+    out = push_u32_le(out, 0)                       // reloff
+    out = push_u32_le(out, 0)                       // nreloc
+    out = push_u32_le(out, s_attr_pure_instructions() + s_attr_some_instructions())  // flags
+    out = push_u32_le(out, 0)                       // reserved1
+    out = push_u32_le(out, 0)                       // reserved2
+    out = push_u32_le(out, 0)                       // reserved3
+
+    // ── LC_SEGMENT_64 __LINKEDIT (72 bytes) ───────────────────────
+    out = push_u32_le(out, lc_segment_64())
+    out = push_u32_le(out, 72)                   // cmdsize
+    out = push_fixed_ascii(out, SEG_LINKEDIT, 16)
+    out = push_u64_le(out, 0x100004000)          // vmaddr (0x100000000 + 0x4000)
+    out = push_u64_le(out, 0x4000)               // vmsize
+    out = push_u64_le(out, 0x4000)               // fileoff
+    out = push_u64_le(out, 49)                   // filesize (__LINKEDIT stub)
+    out = push_u32_le(out, 1)                    // maxprot  = R
+    out = push_u32_le(out, 1)                    // initprot = R
+    out = push_u32_le(out, 0)                    // nsects
+    out = push_u32_le(out, 0)                    // flags
+
+    // ── LC_DYLD_CHAINED_FIXUPS (16 bytes) ─────────────────────────
+    out = push_u32_le(out, lc_dyld_chained_fixups())
+    out = push_u32_le(out, 16)                   // cmdsize
+    out = push_u32_le(out, 0x4000)               // dataoff
+    out = push_u32_le(out, 48)                   // datasize
+    //   (dataoff+datasize must fit inside __LINKEDIT)
+
+    // ── LC_SYMTAB (24 bytes) ──────────────────────────────────────
+    out = push_u32_le(out, lc_symtab())
+    out = push_u32_le(out, 24)                   // cmdsize
+    out = push_u32_le(out, 0x4030)               // symoff
+    out = push_u32_le(out, 0)                    // nsyms
+    out = push_u32_le(out, 0x4030)               // stroff
+    out = push_u32_le(out, 1)                    // strsize
+
+    // ── LC_DYSYMTAB (80 bytes) ────────────────────────────────────
+    out = push_u32_le(out, lc_dysymtab())
+    out = push_u32_le(out, 80)                   // cmdsize
+    out = push_zeros(out, 72)                    // 18 x u32 zero fields
+
+    // ── LC_LOAD_DYLINKER (32 bytes) ───────────────────────────────
+    out = push_u32_le(out, lc_load_dylinker())
+    out = push_u32_le(out, 32)                   // cmdsize
+    out = push_u32_le(out, 12)                   // name offset
+    //   "/usr/lib/dyld\0" + 6 bytes pad = 20 bytes payload
+    let mut di = 0
+    while di < len(DYLINKER_PATH) {
+        out = out.push(DYLINKER_PATH[di])
+        di = di + 1
+    }
+    out = push_zeros(out, 20 - len(DYLINKER_PATH))
+
+    // ── LC_UUID (24 bytes) ────────────────────────────────────────
+    out = push_u32_le(out, lc_uuid())
+    out = push_u32_le(out, 24)                   // cmdsize
+    let mut ui = 0
+    while ui < len(UUID_BYTES) {
+        out = out.push(UUID_BYTES[ui])
+        ui = ui + 1
+    }
+
+    // ── LC_BUILD_VERSION (24 bytes) ───────────────────────────────
+    out = push_u32_le(out, lc_build_version())
+    out = push_u32_le(out, 24)                   // cmdsize
+    out = push_u32_le(out, 1)                    // platform = MACOS
+    out = push_u32_le(out, 0x000E0000)           // minos = 14.0
+    out = push_u32_le(out, 0x000E0000)           // sdk   = 14.0
+    out = push_u32_le(out, 0)                    // ntools
+
+    // ── LC_MAIN (24 bytes) ────────────────────────────────────────
+    //   entryoff is the FILE offset of the entry point within __TEXT.
+    //   Default layout puts .text at CODE_OFF (0x300) so callers pass
+    //   that value for "first instruction of code[]".
+    out = push_u32_le(out, lc_main())
+    out = push_u32_le(out, 24)                   // cmdsize
+    out = push_u64_le(out, entry_va)             // entryoff
+    out = push_u64_le(out, 0)                    // stacksize (0 = default)
+
+    // ── LC_LOAD_DYLIB libSystem (56 bytes) ────────────────────────
+    out = push_u32_le(out, lc_load_dylib())
+    out = push_u32_le(out, 56)                   // cmdsize
+    out = push_u32_le(out, 24)                   // name offset
+    out = push_u32_le(out, 2)                    // timestamp
+    out = push_u32_le(out, 0x00010000)           // current_version
+    out = push_u32_le(out, 0x00010000)           // compatibility_version
+    //   dylib name payload = 32 bytes (libSystem path + NUL padding).
+    let mut li = 0
+    while li < len(LIBSYSTEM_PATH) {
+        out = out.push(LIBSYSTEM_PATH[li])
+        li = li + 1
+    }
+    out = push_zeros(out, 32 - len(LIBSYSTEM_PATH))
+
+    // ── Zero-pad to CODE_OFF ──────────────────────────────────────
+    while len(out) < CODE_OFF {
+        out = out.push(0)
+    }
+
+    // ── Append .text ──────────────────────────────────────────────
+    let mut ci = 0
+    while ci < len(code) {
+        out = out.push(code[ci])
+        ci = ci + 1
+    }
+
+    // ── Pad to PAGE (0x4000) boundary ─────────────────────────────
+    while len(out) < PAGE {
+        out = out.push(0)
+    }
+
+    // ── __LINKEDIT stub (49 bytes: chained fixups header + symtab) ──
+    //   Matches the inline compile_pipeline.hexa layout byte-for-byte.
+    out = push_u32_le(out, 0)                    // fixups header.magic
+    out = push_u32_le(out, 0x20)                 // fixups_offset
+    out = push_u32_le(out, 0)                    // imports_count
+    out = push_u32_le(out, 0)                    // symbols_offset
+    out = push_u32_le(out, 0)                    // imports_offset
+    out = push_u32_le(out, 1)                    // imports_format
+    out = push_u32_le(out, 0)                    // symbols_format
+    out = push_u32_le(out, 0)                    // page_count
+    out = push_u32_le(out, 3)                    // segment_count
+    out = push_u32_le(out, 0)                    // segment[0]
+    out = push_u32_le(out, 0)                    // segment[1]
+    out = push_u32_le(out, 0)                    // segment[2]
+    out = out.push(0)                            // trailing NUL
+
+    return out
 }
