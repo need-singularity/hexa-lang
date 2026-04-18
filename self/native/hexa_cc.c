@@ -10030,9 +10030,11 @@ HexaVal _plus_chain_len(HexaVal node) {
     return hexa_int(n);
 }
 
-/* Collect flat list of operand-expression C-strings in left-to-right order. */
+/* Collect flat list of operand-expression C-strings in left-to-right order.
+ * Two-phase: (1) snapshot leaf AST nodes (reverse order, rightmost first);
+ * (2) walk snapshot backwards, call gen2_expr in left-to-right order. */
 HexaVal _collect_plus_parts(HexaVal node) {
-    HexaVal parts = hexa_array_new();
+    HexaVal leaves_rev = hexa_array_new();
     HexaVal cur = node;
     while (1) {
         if (hexa_truthy(hexa_eq(hexa_type_of(cur), hexa_str("string")))) break;
@@ -10040,14 +10042,15 @@ HexaVal _collect_plus_parts(HexaVal node) {
         if (!hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) break;
         HexaVal op = hexa_map_get(cur, "op");
         if (!hexa_truthy(hexa_eq(op, hexa_str("+")))) break;
-        parts = hexa_array_push(parts, gen2_expr(hexa_map_get(cur, "right")));
+        leaves_rev = hexa_array_push(leaves_rev, hexa_map_get(cur, "right"));
         cur = hexa_map_get(cur, "left");
     }
-    parts = hexa_array_push(parts, gen2_expr(cur));
+    leaves_rev = hexa_array_push(leaves_rev, cur);
     HexaVal flat = hexa_array_new();
-    long i = (long)HX_ARR_LEN(parts) - 1;
+    long total = (long)hexa_len(leaves_rev);
+    long i = total - 1;
     while (i >= 0) {
-        flat = hexa_array_push(flat, HX_ARR_ITEMS(parts)[i]);
+        flat = hexa_array_push(flat, gen2_expr(hexa_index_get(leaves_rev, hexa_int(i))));
         i = i - 1;
     }
     return flat;
@@ -10278,6 +10281,10 @@ HexaVal gen2_expr(HexaVal node) {
     }
     if (hexa_truthy(hexa_eq(k, hexa_str("StructInit")))) {
         name = hexa_map_get_ic(node, "name", &__hexa_codegen_c2_ic_326);
+        /* FIX-A (Anima stdlib unblock, 2026-04-19): empty-literal Name{} → inline zero-field struct pack */
+        if (hexa_truthy(hexa_eq(hexa_int(hexa_len(hexa_map_get_ic(node, "fields", &__hexa_codegen_c2_ic_327))), hexa_int(0)))) {
+            return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_struct_pack_map(\""), name), hexa_str("\", 0, (const char* const*)0, (const HexaVal*)0)")));
+        }
         arg_strs = hexa_array_new();
         si = hexa_int(0);
         while (HX_BOOL(hexa_cmp_lt(si, hexa_int(hexa_len(hexa_map_get_ic(node, "fields", &__hexa_codegen_c2_ic_327)))))) {
@@ -10436,6 +10443,47 @@ HexaVal gen2_expr(HexaVal node) {
                 d_tensor_arg = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(3)));
                 e_tensor_arg = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(4)));
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_matmul("), a), hexa_str(", ")), b), hexa_str(", ")), c_tensor_arg), hexa_str(", ")), d_tensor_arg), hexa_str(", ")), e_tensor_arg), hexa_str(")")));
+            }
+            /* FIX-A (Anima stdlib unblock, 2026-04-19): 10 stdlib builtins */
+            if (hexa_truthy(hexa_eq(name, hexa_str("read_stdin")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_read_stdin()"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("sleep_s")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_sleep_s("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("now_monotonic_s")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_now_monotonic_s()"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("utc_iso_now")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_utc_iso_now()"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("utc_compact_now")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_utc_compact_now()"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("to_bool")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_to_bool("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("http_get")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_http_get("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("json_parse")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_json_parse("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("json_decode")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_json_decode("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("json_stringify")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_json_stringify("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("json_encode")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_json_encode("), a), hexa_str(")")));
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("format")))) {
                 HexaVal fmt_args = hexa_str("hexa_array_new()");
@@ -12554,6 +12602,18 @@ HexaVal _is_builtin_name(HexaVal name) {
     if (hexa_truthy(hexa_eq(name, hexa_str("matmul")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
+    /* FIX-A (Anima stdlib unblock, 2026-04-19): 10 cross-project stdlib builtins */
+    if (hexa_truthy(hexa_eq(name, hexa_str("read_stdin")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("sleep_s")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("now_monotonic_s")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("utc_iso_now")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("utc_compact_now")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("to_bool")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("http_get")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("json_parse")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("json_decode")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("json_stringify")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
+    if (hexa_truthy(hexa_eq(name, hexa_str("json_encode")))) { return __hexa_fn_arena_return(hexa_bool(1)); }
     if (hexa_truthy(hexa_eq(name, hexa_str("true")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }

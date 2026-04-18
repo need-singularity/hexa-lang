@@ -12,6 +12,7 @@
 #include <dlfcn.h>
 #include <time.h>
 #include <unistd.h>
+#include <sys/resource.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
 #endif
@@ -744,10 +745,25 @@ static int64_t _hx_stats_array_arena_promote = 0; // arena→heap promotions on 
 static int64_t _hx_stats_array_arena_heapify = 0; // heapify copies of arena item buffers
 // M4: string arena heapify stats
 static int64_t _hx_stats_str_arena_heapify   = 0; // arena→heap string promotions
+// M4-edge: RSS peak sampler — opt-in via HEXA_ALLOC_STATS. Sampled only on
+// arena new-block (rare: every 4MB+), so getrusage overhead is negligible.
+static int64_t _hx_stats_rss_peak_bytes      = 0;
 static int _hx_stats_enabled = -1;             // lazy probe of env
 
+static void _hx_stats_sample_rss(void) {
+    struct rusage ru;
+    if (getrusage(RUSAGE_SELF, &ru) != 0) return;
+#if defined(__APPLE__)
+    int64_t rss_bytes = (int64_t)ru.ru_maxrss;        // macOS: bytes
+#else
+    int64_t rss_bytes = (int64_t)ru.ru_maxrss * 1024; // Linux: kilobytes
+#endif
+    if (rss_bytes > _hx_stats_rss_peak_bytes) _hx_stats_rss_peak_bytes = rss_bytes;
+}
+
 static void _hx_stats_dump(void) {
-    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld arr_arena_alloc=%lld arr_arena_promote=%lld arr_arena_heapify=%lld str_arena_heapify=%lld\n",
+    _hx_stats_sample_rss();
+    fprintf(stderr, "[HEXA_ALLOC_STATS] array_new=%lld push=%lld grow=%lld reserve=%lld str_concat=%lld map_new=%lld map_set=%lld arena_alloc=%lld arena_blocks=%lld arena_bytes=%lld str_concat_arena=%lld arr_arena_alloc=%lld arr_arena_promote=%lld arr_arena_heapify=%lld str_arena_heapify=%lld rss_peak_mb=%lld\n",
         (long long)_hx_stats_array_new,
         (long long)_hx_stats_array_push,
         (long long)_hx_stats_array_grow,
@@ -762,7 +778,8 @@ static void _hx_stats_dump(void) {
         (long long)_hx_stats_array_arena_alloc,
         (long long)_hx_stats_array_arena_promote,
         (long long)_hx_stats_array_arena_heapify,
-        (long long)_hx_stats_str_arena_heapify);
+        (long long)_hx_stats_str_arena_heapify,
+        (long long)(_hx_stats_rss_peak_bytes / (1024 * 1024)));
 }
 
 static int _hx_stats_on(void) {
@@ -1894,6 +1911,7 @@ static HexaArenaBlock* hexa_arena_new_block(size_t min_cap) {
     if (_hx_stats_on()) {
         _hx_stats_arena_blocks++;
         _hx_stats_arena_bytes += (int64_t)(sizeof(HexaArenaBlock) + cap);
+        _hx_stats_sample_rss();
     }
     return b;
 }
