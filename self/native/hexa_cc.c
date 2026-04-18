@@ -8037,6 +8037,10 @@ HexaVal _hexa_name_is_reserved(HexaVal s) {
     if (hexa_truthy(hexa_eq(s, hexa_str("fwrite")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
+    /* FIX-A 2nd batch (2026-04-19): stdlib.h abort() collides with anima fn abort(c,m) */
+    if (hexa_truthy(hexa_eq(s, hexa_str("abort")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
     if (hexa_truthy(hexa_eq(s, hexa_str("argv")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
@@ -10405,6 +10409,16 @@ HexaVal gen2_expr(HexaVal node) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_tensor_zeros("), a), hexa_str(")")));
             }
+            /* FIX-A 2nd batch (2026-04-19): tensor_ones + swiglu_vec dispatch */
+            if (hexa_truthy(hexa_eq(name, hexa_str("tensor_ones")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_tensor_ones("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("swiglu_vec")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                b = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(1)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_swiglu_vec("), a), hexa_str(", ")), b), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("tensor_slice")))) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
                 b = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(1)));
@@ -12579,6 +12593,13 @@ HexaVal _is_builtin_name(HexaVal name) {
     }
     /* FIX-A (Anima ML eval unblock, 2026-04-19): 8 tensor_* / rms_norm / softmax / matmul */
     if (hexa_truthy(hexa_eq(name, hexa_str("tensor_zeros")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    /* FIX-A 2nd batch (2026-04-19): tensor_ones + swiglu_vec */
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_ones")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("swiglu_vec")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("tensor_slice")))) {

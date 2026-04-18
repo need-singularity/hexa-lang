@@ -221,6 +221,9 @@ HexaVal hexa_tensor_mul_scalar(HexaVal a, HexaVal s);
 HexaVal hexa_rms_norm(HexaVal x, HexaVal gamma, HexaVal eps);
 HexaVal hexa_softmax(HexaVal a);
 HexaVal hexa_matmul(HexaVal a, HexaVal b, HexaVal m, HexaVal k, HexaVal n);
+// FIX-A 2nd batch (2026-04-19): tensor_ones + swiglu_vec for anima serving/training.
+HexaVal hexa_tensor_ones(HexaVal n);
+HexaVal hexa_swiglu_vec(HexaVal gate, HexaVal up);
 
 // RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
 // path. Close Wint-conversion / Wpointer-arith categories in the
@@ -5245,6 +5248,33 @@ HexaVal hexa_tensor_zeros(HexaVal nv) {
     HexaVal arr = hexa_array_new();
     for (int64_t i = 0; i < n; i++) arr = hexa_array_push(arr, hexa_float(0.0));
     return arr;
+}
+
+// FIX-A 2nd batch (2026-04-19): tensor_ones(n) — length-n array filled with 1.0.
+// Pairs with tensor_zeros for anima-speak init paths (ln_g, rms_g).
+HexaVal hexa_tensor_ones(HexaVal nv) {
+    int64_t n = (int64_t)__hx_to_double(nv);
+    if (n < 0) n = 0;
+    HexaVal arr = hexa_array_new();
+    for (int64_t i = 0; i < n; i++) arr = hexa_array_push(arr, hexa_float(1.0));
+    return arr;
+}
+
+// FIX-A 2nd batch (2026-04-19): swiglu_vec(gate, up) = silu(gate) * up elementwise.
+// silu(x) = x / (1 + exp(-x)). Shape: min(|gate|, |up|). For anima eval_alm.hexa
+// + training hot paths (nn_core etc.) — scalar fallback, fast-path is FFN fused kernel.
+HexaVal hexa_swiglu_vec(HexaVal gate, HexaVal up) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(gate) || !HX_IS_ARRAY(up)) return out;
+    int64_t ng = (int64_t)HX_ARR_LEN(gate), nu = (int64_t)HX_ARR_LEN(up);
+    int64_t k = ng < nu ? ng : nu;
+    for (int64_t i = 0; i < k; i++) {
+        double g = __hx_to_double(hexa_array_get(gate, i));
+        double u = __hx_to_double(hexa_array_get(up, i));
+        double silu = g / (1.0 + exp(-g));
+        out = hexa_array_push(out, hexa_float(silu * u));
+    }
+    return out;
 }
 
 // tensor_slice(arr, lo, hi): subarray [lo, hi) with clamped bounds.
