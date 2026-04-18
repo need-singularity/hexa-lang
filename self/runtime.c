@@ -2819,6 +2819,16 @@ HexaVal hexa_write_file(HexaVal path, HexaVal content) {
     return hexa_bool(1);
 }
 
+// P7-6 builtin (2026-04-18): boolean existence probe. Used by native_build
+// and other self-hosting scripts to gate optional inputs without a
+// full read_file round-trip. Returns hexa_bool(1) when access(path, F_OK)
+// succeeds, else hexa_bool(0). Null/non-string paths → false.
+HexaVal hexa_file_exists(HexaVal path) {
+    const char* p = HX_STR(path);
+    if (!p) return hexa_bool(0);
+    return hexa_bool(access(p, F_OK) == 0);
+}
+
 // ── Binary file I/O — write_bytes / read_file_bytes ─────
 // write_bytes: takes a path and a TAG_ARRAY of integers (0-255),
 // writes raw bytes. Null bytes survive — true binary I/O.
