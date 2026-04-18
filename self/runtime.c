@@ -4815,6 +4815,17 @@ HexaVal hexa_array_count(HexaVal arr, HexaVal fn) {
     return hexa_int(c);
 }
 
+// count_poly: dispatch `.count()` method by receiver type. String form
+// takes a substring arg (hexa_str_count_substr); array form takes a
+// predicate fn (hexa_array_count). Matches interpreter at
+// self/hexa_full.hexa:14997-15014 (str) and 15351-15358 (arr).
+HexaVal hexa_count_poly(HexaVal obj, HexaVal arg) {
+    if (HX_IS_STR(obj) && HX_IS_STR(arg)) {
+        return hexa_str_count_substr(obj, arg);
+    }
+    return hexa_array_count(obj, arg);
+}
+
 // find: first element matching predicate; void if none.
 HexaVal hexa_array_find(HexaVal arr, HexaVal fn) {
     if (!HX_IS_ARRAY(arr)) return hexa_void();
