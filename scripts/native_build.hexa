@@ -477,6 +477,32 @@ fn nb_lower_builtin(m, b, name: string, sym: string, arg_vids) -> int {
     return bld_call(m, b, fid, arg_vids, "i64")
 }
 
+// ── Struct-type inference (P7-6 Field struct_idx step 3b) ─────────
+// Resolves an expression's declared struct type without emitting any
+// IR. Used by Field access lowering to support chained access:
+//
+//   a.b.c  parses as  Field{ left: Field{ left: Ident{a}, name: b }, name: c }
+//
+// Chain walks the Field-spine: infer type of the parent Field by
+// recursing on .left, then look up .name's declared type in the
+// registry. Untyped fields ("" annotation in the parser) stop the
+// chain — caller gets "" which triggers idx=0 fallback at that step.
+//
+// Non-Ident / non-Field leaves return "" (calls, array indexes,
+// literals — their type inference would need broader ret_struct
+// tracking and IR-value tagging, deferred).
+fn nb_infer_struct_type(m, e, env) -> string {
+    if e.kind == "Ident" {
+        return lower_env_type_of(env, e.name)
+    }
+    if e.kind == "Field" || e.kind == "FieldAccess" {
+        let parent = nb_infer_struct_type(m, e.left, env)
+        if len(parent) == 0 { return "" }
+        return module_find_field_type(m, parent, e.name)
+    }
+    return ""
+}
+
 // ── Expression lowering (parser → IR) ─────────────────────────────
 // Parser AST uses string `value` for IntLit and `left`/`right`/`op`
 // for BinOp; ir/lowering.hexa's lower_int_lit/bin_op consumers read
@@ -601,13 +627,15 @@ fn nb_lower_expr(m, b, e, env) -> int {
     if k == "Field" || k == "FieldAccess" {
         let obj = nb_lower_expr(m, b, e.left, env)
         if obj < 0 { return -1 }
+        // P7-6 Field struct_idx step 3b: chain-resolution. nb_infer_struct_type
+        // walks the Field-spine for nested access (a.b.c) so c's idx is
+        // resolved against b's declared struct type, not hardcoded 0.
+        // Non-struct-typed base → idx=0 fallback (legacy behavior).
         let mut idx = 0
-        if e.left.kind == "Ident" {
-            let tname = lower_env_type_of(env, e.left.name)
-            if len(tname) > 0 {
-                let resolved = module_find_field_idx(m, tname, e.name)
-                if resolved >= 0 { idx = resolved }
-            }
+        let parent_tname = nb_infer_struct_type(m, e.left, env)
+        if len(parent_tname) > 0 {
+            let resolved = module_find_field_idx(m, parent_tname, e.name)
+            if resolved >= 0 { idx = resolved }
         }
         return bld_struct_field(m, b, obj, idx, "i64")
     }
@@ -903,13 +931,14 @@ fn nb_lower_stmt(m, b, s, env) -> int {
         if s.left.kind == "Field" || s.left.kind == "FieldAccess" {
             let obj_vid = nb_lower_expr(m, b, s.left.left, env)
             if obj_vid < 0 { return -1 }
+            // Chain-resolve via nb_infer_struct_type so `a.b.c = v` uses
+            // b's declared type to find c's idx. Untyped chain step →
+            // idx=0 fallback (legacy).
             let mut fidx = 0
-            if s.left.left.kind == "Ident" {
-                let tn = lower_env_type_of(env, s.left.left.name)
-                if len(tn) > 0 {
-                    let r = module_find_field_idx(m, tn, s.left.name)
-                    if r >= 0 { fidx = r }
-                }
+            let tn = nb_infer_struct_type(m, s.left.left, env)
+            if len(tn) > 0 {
+                let r = module_find_field_idx(m, tn, s.left.name)
+                if r >= 0 { fidx = r }
             }
             bld_struct_store_field(m, b, obj_vid, fidx, rhs_vid)
             return 0
@@ -1100,20 +1129,25 @@ fn parse_and_lower(src: string, path: string) -> any {
             }
             module_add_function(m, node.name, xir_params, "i64")
         } else if node.kind == "StructDecl" {
-            // P7-6 Field struct_idx prep: register the struct name + ordered
-            // field names so later Field-access lowering can resolve
-            // `obj.foo` → idx by position rather than hardcoded 0. Parser
-            // emits node.fields as [StructField{name, value:type, ...}, ...].
-            // Registry lookup is additive; no behavior change until the
-            // lowering sites consume it in a follow-up.
+            // P7-6 Field struct_idx prep: register struct name + ordered
+            // field names + declared field types. Parser emits
+            // node.fields as [StructField{name, value:type, ...}, ...].
+            //
+            // Both names AND types are collected so chain-resolution
+            // (a.b.c where b is a nested struct field) can consult the
+            // registry transitively. Untyped fields (rare — no `: T`
+            // annotation) get "" and trigger the idx=0 fallback only
+            // at that chain step.
             let sf_ast = node.fields
             let mut sf_names = []
+            let mut sf_types = []
             let mut sfi = 0
             while sfi < len(sf_ast) {
                 sf_names = sf_names.push(sf_ast[sfi].name)
+                sf_types = sf_types.push(sf_ast[sfi].value)
                 sfi = sfi + 1
             }
-            module_add_struct(m, node.name, sf_names)
+            module_add_struct_typed(m, node.name, sf_names, sf_types)
         }
         i = i + 1
     }
