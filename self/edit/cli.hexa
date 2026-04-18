@@ -1,0 +1,186 @@
+// self/edit/cli.hexa — `hexa edit` CLI (Phase 4 Step 1, stdin 모드)
+//
+// 목적:
+//   편집 진입점 자체가 law gate. `hexa edit <path>` 로만 .hexa / 보호 파일
+//   수정 가능 → Claude Write / vim :w / sed -i 우회 억제 (습관화).
+//
+// 사용:
+//   cat new.txt | hexa self/edit/cli.hexa <path>         — stdin 내용을 law 검사 후 쓰기
+//   hexa self/edit/cli.hexa --from-file src.txt <path>   — 파일에서 읽기
+//   hexa self/edit/cli.hexa --check <path>               — write 없이 검사만
+//   hexa self/edit/cli.hexa --force <path>               — law 검사 skip (긴급 용)
+//
+// 흐름:
+//   1. 대상 path 기존 내용 백업 (.hexa-edit-backup/<hash>)
+//   2. 신규 내용 = stdin or file
+//   3. law_check — edict 위반 있으면 exit 1 (--force 없으면)
+//   4. sealed 파일이면 fs_unseal → write → fs_seal 트랜잭션
+//   5. atomic write (tmp 파일 → rename)
+//
+// 차후 (Step 2+):
+//   · self/lsp/ — LSP server, textDocument/willSaveWaitUntil 로 차단
+//   · mcp/hexa-mcp.hexa — Claude Code MCP 통합
+
+use "self/attrs/sealed"
+
+let _raw_args = args()
+let mut cli_args = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli_args = cli_args.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _read_stdin() -> string {
+    // hexa 런타임 — stdin 읽기는 builtin 또는 /dev/stdin exec
+    return to_string(exec("cat"))
+}
+
+fn _read_file_safe(path: string) -> string {
+    try { return to_string(read_file(path)) }
+    catch e { return "" }
+}
+
+fn _backup_path(path: string) -> string {
+    // 디렉토리 `.hexa-edit-backup/` 아래 timestamp 접미
+    let ts = to_string(exec("date -u +%Y%m%dT%H%M%SZ")).trim()
+    let base = to_string(exec("basename '" + path + "'")).trim()
+    return ".hexa-edit-backup/" + base + "." + ts
+}
+
+fn _save_backup(orig_path: string, content: string) {
+    if len(content) == 0 { return }   // 새 파일이면 skip
+    let bp = _backup_path(orig_path)
+    try { exec("mkdir -p '" + _pwd() + "/.hexa-edit-backup'") } catch e {}
+    try { write_file(_pwd() + "/" + bp, content) } catch e {}
+}
+
+fn _law_check(path: string) -> bool {
+    // scripts/law_check.hexa 호출. target 인자로 path 전달.
+    let cmd = "LAW_CHECK_DONE=1 hexa scripts/law_check.hexa '" + path + "' 2>&1"
+    let out = to_string(exec(cmd))
+    // 위반 감지: 결과에 "위반 :" 뒤에 0 이 아닌 숫자
+    if out.contains("🚫 law violations") { return false }
+    if out.contains("compile 차단") { return false }
+    return true
+}
+
+fn _atomic_write(path: string, content: string) -> bool {
+    let tmp = path + ".hexa-edit.tmp"
+    try {
+        write_file(tmp, content)
+        exec("mv '" + tmp + "' '" + path + "'")
+        return true
+    } catch e {
+        return false
+    }
+}
+
+// ─── dispatch ────────────────────────────────────────────────
+if len(cli_args) == 0 {
+    eprintln("usage:")
+    eprintln("  cat content | hexa self/edit/cli.hexa <path>")
+    eprintln("  hexa self/edit/cli.hexa --from-file <src> <path>")
+    eprintln("  hexa self/edit/cli.hexa --check <path>")
+    eprintln("  hexa self/edit/cli.hexa --force <path>")
+    exit(1)
+}
+
+let mut check_only = false
+let mut force = false
+let mut from_file = ""
+let mut path = ""
+
+let mut i = 0
+while i < len(cli_args) {
+    let a = cli_args[i]
+    if a == "--check"     { check_only = true; i = i + 1; continue }
+    if a == "--force"     { force = true; i = i + 1; continue }
+    if a == "--from-file" {
+        if i + 1 >= len(cli_args) { eprintln("error: --from-file needs path"); exit(1) }
+        from_file = cli_args[i + 1]
+        i = i + 2
+        continue
+    }
+    path = a
+    i = i + 1
+}
+
+if path == "" { eprintln("error: target path required"); exit(1) }
+
+let root = _pwd()
+let abs_path = if path.starts_with("/") { path } else { root + "/" + path }
+
+// check-only 모드: 현재 파일 상태만 law 검사
+if check_only {
+    println("── hexa edit --check ──")
+    println("path : " + abs_path)
+    let pass = _law_check(abs_path)
+    if pass {
+        println("✅ law gate pass")
+        exit(0)
+    } else {
+        println("🚫 위반 감지")
+        exit(1)
+    }
+}
+
+// 신규 내용 로드
+let mut new_content = ""
+if from_file != "" {
+    new_content = _read_file_safe(from_file)
+    if len(new_content) == 0 {
+        eprintln("error: empty or unreadable " + from_file)
+        exit(1)
+    }
+} else {
+    new_content = _read_stdin()
+}
+
+// 기존 백업
+let orig = _read_file_safe(abs_path)
+_save_backup(abs_path, orig)
+
+// law gate (force 아니면)
+if !force {
+    // 신규 내용을 임시 파일에 쓰고 law_check 실행 (실제 write 전에 검사)
+    let probe = abs_path + ".hexa-edit.probe"
+    try { write_file(probe, new_content) } catch e {
+        eprintln("error: probe write failed")
+        exit(1)
+    }
+    let pass = _law_check(probe)
+    try { exec("rm -f '" + probe + "'") } catch e {}
+    if !pass {
+        eprintln("🚫 law gate 차단 — edict 위반 감지")
+        eprintln("   수정 후 재실행 또는 --force (긴급)")
+        exit(1)
+    }
+}
+
+// sealed 파일 처리
+let sealed = fs_is_sealed(abs_path)
+if sealed {
+    println("ℹ sealed 파일 감지 — unseal → write → reseal 트랜잭션")
+    fs_unseal(abs_path)
+}
+
+// atomic write
+let ok = _atomic_write(abs_path, new_content)
+
+if sealed { fs_seal(abs_path) }
+
+if !ok {
+    eprintln("error: atomic write 실패 " + abs_path)
+    exit(1)
+}
+
+println("✅ wrote " + abs_path + " (" + to_string(len(new_content)) + " bytes)")
+if sealed { println("   (sealed 복원 완료)") }
+exit(0)
