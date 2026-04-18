@@ -4596,6 +4596,87 @@ HexaVal hexa_array_index_of(HexaVal arr, HexaVal item) {
     return hexa_int(-1);
 }
 
+// Higher-order array predicates + scans. Mirror interpreter semantics
+// at self/hexa_full.hexa:15189+ using hexa_call1 for callback dispatch
+// (same pattern as hexa_array_map/filter/fold).
+
+HexaVal hexa_array_any(HexaVal arr, HexaVal fn) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        if (hexa_truthy(hexa_call1(fn, HX_ARR_ITEMS(arr)[i]))) return hexa_bool(1);
+    }
+    return hexa_bool(0);
+}
+
+HexaVal hexa_array_all(HexaVal arr, HexaVal fn) {
+    if (!HX_IS_ARRAY(arr)) return hexa_bool(1);
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        if (!hexa_truthy(hexa_call1(fn, HX_ARR_ITEMS(arr)[i]))) return hexa_bool(0);
+    }
+    return hexa_bool(1);
+}
+
+HexaVal hexa_array_count(HexaVal arr, HexaVal fn) {
+    if (!HX_IS_ARRAY(arr)) return hexa_int(0);
+    int64_t c = 0;
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        if (hexa_truthy(hexa_call1(fn, HX_ARR_ITEMS(arr)[i]))) c++;
+    }
+    return hexa_int(c);
+}
+
+// find: first element matching predicate; void if none.
+HexaVal hexa_array_find(HexaVal arr, HexaVal fn) {
+    if (!HX_IS_ARRAY(arr)) return hexa_void();
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal it = HX_ARR_ITEMS(arr)[i];
+        if (hexa_truthy(hexa_call1(fn, it))) return it;
+    }
+    return hexa_void();
+}
+
+// flat_map: map then flatten one level. Non-array callback results
+// are pushed as-is (matches interpreter fallback at hexa_full.hexa:15211).
+HexaVal hexa_array_flat_map(HexaVal arr, HexaVal fn) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal sub = hexa_call1(fn, HX_ARR_ITEMS(arr)[i]);
+        if (HX_IS_ARRAY(sub)) {
+            for (int j = 0; j < HX_ARR_LEN(sub); j++) {
+                out = hexa_array_push(out, HX_ARR_ITEMS(sub)[j]);
+            }
+        } else {
+            out = hexa_array_push(out, sub);
+        }
+    }
+    return out;
+}
+
+// enumerate: [[idx, item], ...] — matches hexa_full.hexa:15220-15228.
+HexaVal hexa_array_enumerate(HexaVal arr) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        HexaVal pair = hexa_array_new();
+        pair = hexa_array_push(pair, hexa_int((int64_t)i));
+        pair = hexa_array_push(pair, HX_ARR_ITEMS(arr)[i]);
+        out = hexa_array_push(out, pair);
+    }
+    return out;
+}
+
+// is_empty: true if array/string has zero items/bytes. Map also uses
+// map_len — handled in hexa_is_empty below (polymorphic).
+HexaVal hexa_is_empty(HexaVal v) {
+    if (HX_IS_ARRAY(v)) return hexa_bool(HX_ARR_LEN(v) == 0);
+    if (HX_IS_STR(v)) {
+        const char* s = HX_STR(v);
+        return hexa_bool(!s || s[0] == '\0');
+    }
+    return hexa_bool(1); // null/undefined/etc. → empty
+}
+
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
