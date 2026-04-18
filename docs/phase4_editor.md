@@ -1,6 +1,6 @@
 # Phase 4 — hexa 자체 에디터 / LSP (편집 진입점 법)
 
-> edict 로드맵 Phase 4 — 편집 **진입점** 자체를 hexa-native 로 대체.
+> raw 로드맵 Phase 4 — 편집 **진입점** 자체를 hexa-native 로 대체.
 > Claude `Write` / IDE save / vim :w 모두 → `hexa edit` 경유 강제.
 
 ## 목적
@@ -31,7 +31,7 @@ IDE ◄─────► hexa-lsp (자체 구현)
             ├─ textDocument/didChange  → law.check_delta()
             ├─ textDocument/willSave   → law.check_full(path, content)
             ├─ textDocument/didSave    → law.pass? write : reject
-            └─ diagnostics             → publish edict violations
+            └─ diagnostics             → publish raw violations
 ```
 
 ### Claude Write tool 통합
@@ -55,7 +55,7 @@ IDE ◄─────► hexa-lsp (자체 구현)
 ┌────────────────────────────────────────────┐
 │  hexa-lsp server                           │
 │    ├ parse tree builder                    │
-│    ├ edict law engine                      │
+│    ├ raw law engine                      │
 │    │   ├ rule 1 ai-native @attr            │
 │    │   ├ rule 3 @attr naming               │
 │    │   ├ rule 4 폴더명                     │
@@ -117,7 +117,7 @@ self/lsp/
   server.hexa         ← JSON-RPC 2.0 루프
   protocol.hexa       ← LSP 메시지 타입 / serde
   handlers.hexa       ← didOpen/didChange/willSave/…
-  diagnostics.hexa    ← edict violation → LSP diagnostic 변환
+  diagnostics.hexa    ← raw violation → LSP diagnostic 변환
 self/edit/
   cli.hexa            ← `hexa edit` 진입점 (stdin/file 모드)
   law_gate.hexa       ← 공용 law 검사 (lsp + cli 공유)

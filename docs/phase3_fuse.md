@@ -1,6 +1,6 @@
 # Phase 3 — FUSE raw-fs 레벨 write intercept
 
-> edict 로드맵 Phase 3 — `git-hook` / `user-hook` 의존 완전 제거.
+> raw 로드맵 Phase 3 — `git-hook` / `user-hook` 의존 완전 제거.
 > 모든 파일 write 가 hexa-native FUSE 레이어를 통과 → 위반 시 OS EACCES.
 
 ## 목적
@@ -8,7 +8,7 @@
 Phase 1 (git-hook) + Phase 2 (compile-time) 은 사용자가 `git commit` 또는 `hexa` 를 호출할 때만 법 적용.  
 **어떤 editor / tool / syscall 이든** 통과하는 raw-fs 레벨 law 가 Phase 3 목표.
 
-- Claude Write tool → FUSE layer → open() EACCES (edict 위반 시)
+- Claude Write tool → FUSE layer → open() EACCES (raw 위반 시)
 - `vim` / `sed` / 수동 echo → 동일 차단
 - `git add` 에서 위반 파일 → 역시 차단 (차상위 동작)
 
@@ -68,7 +68,7 @@ Phase 1 (git-hook) + Phase 2 (compile-time) 은 사용자가 `git commit` 또는
 ### 2차 (full 6 rules, Linux + macOS FSKit)
 
 - 3 / 4 / 5 / 6 모두 적용
-- hexa 재사용: `self/edict_cli.hexa check` 내부 호출
+- hexa 재사용: `self/raw_cli.hexa check` 내부 호출
 - overlay 전용 (repo 외부 경로는 pass-through)
 - 500-800 LOC
 
@@ -83,7 +83,7 @@ Phase 1 (git-hook) + Phase 2 (compile-time) 은 사용자가 `git commit` 또는
 ```
 self/fs/
   fuse.hexa              ← libfuse3 바인딩 + main loop
-  law_intercept.hexa     ← open/write 훅, edict check 호출
+  law_intercept.hexa     ← open/write 훅, raw check 호출
   mount_cli.hexa         ← hexa fs mount / umount / status
 scripts/
   fuse_install.hexa      ← libfuse3 탐지 + fstab 스니펫 제안 (선택)
