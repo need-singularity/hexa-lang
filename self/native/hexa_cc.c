@@ -8546,7 +8546,13 @@ HexaVal codegen_c2(HexaVal ast) {
     parts = hexa_array_push(parts, hexa_str("\n"));
     parts = hexa_array_push(parts, hexa_str_join(global_parts, hexa_str("")));
     parts = hexa_array_push(parts, hexa_str("\n"));
-    parts = hexa_array_push(parts, hexa_str_join(_strlit_def_parts, hexa_str("")));
+    /* rt#32-SL fix: deterministic _strlit_counter loop — mirror fcf275f4 IC
+       fix pattern. Avoids T33 freelist aliasing on _strlit_def_parts push. */
+    HexaVal _sl_def_i = hexa_int(0);
+    while (HX_BOOL(hexa_cmp_lt(_sl_def_i, _strlit_counter))) {
+        parts = hexa_array_push(parts, hexa_add(hexa_add(hexa_str("static HexaVal __hexa_sl_"), hexa_to_string(_sl_def_i)), hexa_str(";\n")));
+        _sl_def_i = hexa_add(_sl_def_i, hexa_int(1));
+    }
     if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(_strlit_keys)), hexa_int(0)))) {
         parts = hexa_array_push(parts, hexa_str("static void __hexa_strlit_init(void) {\n"));
         HexaVal _sli = hexa_int(0);
@@ -8556,9 +8562,11 @@ HexaVal codegen_c2(HexaVal ast) {
         }
         parts = hexa_array_push(parts, hexa_str("}\n"));
     }
+    /* rt#32-IC fix: decl-loop string was "__hexa_codegen_c2_ic_" (module-
+       prefixed) while ref-site emits plain "__hexa_ic_". Align to plain. */
     HexaVal _ic_i = hexa_int(0);
     while (HX_BOOL(hexa_cmp_lt(_ic_i, _ic_counter))) {
-        parts = hexa_array_push(parts, hexa_add(hexa_add(hexa_str("static HexaIC __hexa_codegen_c2_ic_"), hexa_to_string(_ic_i)), hexa_str(" = {0};\n")));
+        parts = hexa_array_push(parts, hexa_add(hexa_add(hexa_str("static HexaIC __hexa_ic_"), hexa_to_string(_ic_i)), hexa_str(" = {0};\n")));
         _ic_i = hexa_add(_ic_i, hexa_int(1));
     }
     parts = hexa_array_push(parts, hexa_str("\n"));
@@ -11199,7 +11207,8 @@ HexaVal _strlit_dedup(HexaVal escaped) {
     _strlit_keys = hexa_array_push(_strlit_keys, escaped);
     _strlit_ids = hexa_array_push(_strlit_ids, id);
     HexaVal varname = hexa_add(hexa_str("__hexa_sl_"), hexa_to_string(id));
-    _strlit_def_parts = hexa_array_push(_strlit_def_parts, hexa_add(hexa_add(hexa_str("static HexaVal "), varname), hexa_str(";\n")));
+    /* rt#32-SL: no _strlit_def_parts push — decls emitted via deterministic
+       _strlit_counter loop at main emit time (mirror of fcf275f4 IC fix). */
     return __hexa_fn_arena_return(varname);
     return __hexa_fn_arena_return(hexa_void());
 }
@@ -12502,9 +12511,25 @@ HexaVal codegen_c2_full(HexaVal ast) {
     out_parts = hexa_array_push(out_parts, hexa_str("\n"));
     out_parts = hexa_array_push(out_parts, hexa_str_join(global_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str("\n"));
+    /* rt#32-SL fix (codegen_c2_full): emit string literal slots + init. */
+    HexaVal _sl_def_i_full = hexa_int(0);
+    while (HX_BOOL(hexa_cmp_lt(_sl_def_i_full, _strlit_counter))) {
+        out_parts = hexa_array_push(out_parts, hexa_add(hexa_add(hexa_str("static HexaVal __hexa_sl_"), hexa_to_string(_sl_def_i_full)), hexa_str(";\n")));
+        _sl_def_i_full = hexa_add(_sl_def_i_full, hexa_int(1));
+    }
+    if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(_strlit_keys)), hexa_int(0)))) {
+        out_parts = hexa_array_push(out_parts, hexa_str("static void __hexa_strlit_init(void) {\n"));
+        HexaVal _sli_full = hexa_int(0);
+        while (HX_BOOL(hexa_cmp_lt(_sli_full, hexa_int(hexa_len(_strlit_keys))))) {
+            out_parts = hexa_array_push(out_parts, hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("    __hexa_sl_"), hexa_to_string(hexa_index_get(_strlit_ids, _sli_full))), hexa_str(" = hexa_str(\"")), hexa_index_get(_strlit_keys, _sli_full)), hexa_str("\");\n")));
+            _sli_full = hexa_add(_sli_full, hexa_int(1));
+        }
+        out_parts = hexa_array_push(out_parts, hexa_str("}\n"));
+    }
+    /* rt#32-IC fix: plain "__hexa_ic_" decl prefix to match ref-site. */
     HexaVal _ic_i_full = hexa_int(0);
     while (HX_BOOL(hexa_cmp_lt(_ic_i_full, _ic_counter))) {
-        out_parts = hexa_array_push(out_parts, hexa_add(hexa_add(hexa_str("static HexaIC __hexa_codegen_c2_ic_"), hexa_to_string(_ic_i_full)), hexa_str(" = {0};\n")));
+        out_parts = hexa_array_push(out_parts, hexa_add(hexa_add(hexa_str("static HexaIC __hexa_ic_"), hexa_to_string(_ic_i_full)), hexa_str(" = {0};\n")));
         _ic_i_full = hexa_add(_ic_i_full, hexa_int(1));
     }
     out_parts = hexa_array_push(out_parts, hexa_str("\n"));
@@ -12512,6 +12537,9 @@ HexaVal codegen_c2_full(HexaVal ast) {
     out_parts = hexa_array_push(out_parts, hexa_str_join(fn_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str("int main(int argc, char** argv) {\n"));
     out_parts = hexa_array_push(out_parts, hexa_str("    hexa_set_args(argc, argv);\n"));
+    if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(_strlit_keys)), hexa_int(0)))) {
+        out_parts = hexa_array_push(out_parts, hexa_str("    __hexa_strlit_init();\n"));
+    }
     out_parts = hexa_array_push(out_parts, hexa_str_join(init_parts, hexa_str("")));
     out_parts = hexa_array_push(out_parts, hexa_str_join(main_parts, hexa_str("")));
     if (hexa_truthy(hexa_bool(hexa_truthy(has_user_main) && hexa_truthy(hexa_bool(!hexa_truthy(has_explicit_main_call)))))) {
