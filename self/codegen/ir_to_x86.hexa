@@ -264,19 +264,30 @@ fn irx_op_bytes(op: string, is_imm: bool, imm: int, has_cmp: bool,
             // stay within 0..7 in the bootstrap budget.
             return 11
         }
-        // 3-op → 2-op: MOV dst,a (3) + ADD/SUB dst,b (3) = 6.
-        // If dst==a, skip MOV → 3 bytes.
+        // Aliasing fix (2026-04-18) — size depends on rd vs ra/rb:
+        //   rd == ra    → skip MOV, OP rd,rb  = 3 bytes
+        //   rd == rb:
+        //     add (commutative) → ADD rd,ra  = 3 bytes
+        //     sub (non-commute) → SUB rd,ra + NEG rd = 6 bytes
+        //   otherwise  → MOV rd,ra + OP rd,rb = 6 bytes
         let rd = irx_reg_for(regalloc_map, dst_logical)
         let ra = irx_reg_for(regalloc_map, a_logical)
+        let rb = irx_reg_for(regalloc_map, b_logical)
         if rd == ra { return 3 }
+        if op == "add" && rd == rb { return 3 }
+        // sub + rd==rb falls through to 6 (SUB+NEG)
         return 6
     }
     if op == "mul" {
         // IMUL is 4 bytes; 2-op dst *= src, so same MOV prelude:
-        // MOV dst,a (3) + IMUL dst,b (4) = 7. If dst==a, skip → 4.
+        // MOV dst,a (3) + IMUL dst,b (4) = 7.
+        // Aliasing fix (2026-04-18): IMUL is commutative → rd==ra or
+        // rd==rb both skip the MOV → 4 bytes.
         let rd = irx_reg_for(regalloc_map, dst_logical)
         let ra = irx_reg_for(regalloc_map, a_logical)
+        let rb = irx_reg_for(regalloc_map, b_logical)
         if rd == ra { return 4 }
+        if rd == rb { return 4 }
         return 7
     }
     if op == "branch" {
@@ -349,20 +360,36 @@ fn irx_emit_one(bytes_in: [int], instr, regalloc_map: [int],
     }
 
     if instr.op == "add" {
+        // Aliasing fix (2026-04-18): when rd == rb the naive
+        //   MOV rd,ra ; ADD rd,rb
+        // destroys rb (now in rd) before ADD reads it. ADD is
+        // commutative → emit ADD rd,ra when rd==rb. Must match
+        // irx_op_bytes size model (3 bytes).
         let rd = irx_reg_for(regalloc_map, instr.result)
         let ra = irx_reg_for(regalloc_map, instr.a)
         let rb = irx_reg_for(regalloc_map, instr.b)
-        bytes = irx_emit_mov_rr(bytes, rd, ra)
-        bytes = irx_emit_add_rr(bytes, rd, rb)
+        if rd == rb {
+            bytes = irx_emit_add_rr(bytes, rd, ra)
+        } else {
+            bytes = irx_emit_mov_rr(bytes, rd, ra)
+            bytes = irx_emit_add_rr(bytes, rd, rb)
+        }
         return bytes
     }
 
     if instr.op == "mul" {
+        // Aliasing fix (2026-04-18): IMUL is commutative → swap
+        // operand order when rd==rb so we can skip the MOV. Must
+        // match irx_op_bytes size model (4 bytes).
         let rd = irx_reg_for(regalloc_map, instr.result)
         let ra = irx_reg_for(regalloc_map, instr.a)
         let rb = irx_reg_for(regalloc_map, instr.b)
-        bytes = irx_emit_mov_rr(bytes, rd, ra)
-        bytes = irx_emit_imul_rr(bytes, rd, rb)
+        if rd == rb {
+            bytes = irx_emit_imul_rr(bytes, rd, ra)
+        } else {
+            bytes = irx_emit_mov_rr(bytes, rd, ra)
+            bytes = irx_emit_imul_rr(bytes, rd, rb)
+        }
         return bytes
     }
 
@@ -376,8 +403,18 @@ fn irx_emit_one(bytes_in: [int], instr, regalloc_map: [int],
             bytes = irx_emit_setcc_movzx(bytes, rd, irx_cmp_to_tttn(instr.cmp))
             return bytes
         }
-        bytes = irx_emit_mov_rr(bytes, rd, ra)
-        bytes = irx_emit_sub_rr(bytes, rd, rb)
+        // Aliasing fix (2026-04-18): SUB non-commutative, so when
+        // rd==rb emit SUB rd,ra ; NEG rd → rd = -(rb-ra) = ra-rb.
+        // NEG r/m64: REX.W F7 /3 = 3 bytes, total 6 bytes (matches
+        // irx_op_bytes fallthrough).
+        if rd == rb {
+            bytes = irx_emit_sub_rr(bytes, rd, ra)
+            let neg_rex = if rd >= 8 { 0x49 } else { 0x48 }
+            bytes = bytes.push(neg_rex).push(0xf7).push(0xd8 + (rd % 8))
+        } else {
+            bytes = irx_emit_mov_rr(bytes, rd, ra)
+            bytes = irx_emit_sub_rr(bytes, rd, rb)
+        }
         return bytes
     }
 
