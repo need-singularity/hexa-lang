@@ -1,0 +1,222 @@
+// scripts/drift_scanner.hexa — proof-carrying mark 검증 (raw #8)
+//
+// 목적:
+//   status=done/live/ossified 선언이 실제 proof_path 가리키고,
+//   proof 파일이 존재하며, 선언 상태와 일치하는지 검증.
+//
+// 배경 (2026-04-18):
+//   anima roadmap 136 phases 전부 "done" — 실제 22 unwired + 3 FALSIFIED + 9 drift.
+//   선언과 현실의 drift 원천 차단 = raw #8 proof-carrying mark.
+//
+// 사용:
+//   hexa scripts/drift_scanner.hexa                     — 기본 SSOT 전체 스캔
+//   hexa scripts/drift_scanner.hexa <file.json>          — 특정 JSON
+//   hexa scripts/drift_scanner.hexa --strict             — warn 도 fail 처리
+//   hexa scripts/drift_scanner.hexa --ci                 — machine-readable (jsonl)
+//
+// 대상 SSOT (hexa-lang repo 기준):
+//   · shared/hexa-lang/raw.json                          — L0 raw (universal)
+//   · .own-rules.json                                    — L1 own (project)
+//   · shared/roadmaps/*.json                             — (anima 이식 시)
+//
+// 검증 규칙:
+//   1) status ∈ {"done","live","ossified"} 이면 proof_path 필드 필수
+//   2) proof_path 가 가리키는 파일 존재 필수
+//   3) (선택) proof 파일 state 필드가 ossified/done/live/true 중 하나
+//
+// exit code:
+//   0 — 전체 통과
+//   1 — drift 감지 (proof_path 없음 / 파일 없음 / 상태 불일치)
+
+let _raw_args = args()
+let mut cli_args = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli_args = cli_args.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _has_file(path: string) -> bool {
+    let r = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _read_safe(path: string) -> string {
+    try { return to_string(read_file(path)) }
+    catch e { return "" }
+}
+
+// ─── flag parsing ────────────────────────────────────────────
+let mut strict = false
+let mut ci = false
+let mut target_files = []
+
+for a in cli_args {
+    if a == "--strict" { strict = true }
+    else if a == "--ci" { ci = true }
+    else { target_files = target_files.push(a) }
+}
+
+// 대상 파일 기본값 — 프로젝트 SSOT 자동 감지
+let root = _pwd()
+if len(target_files) == 0 {
+    let raw_json = root + "/shared/hexa-lang/raw.json"
+    if _has_file(raw_json) { target_files = target_files.push(raw_json) }
+    let own_rules = root + "/.own-rules.json"
+    if _has_file(own_rules) { target_files = target_files.push(own_rules) }
+    // anima 추가 감지
+    let anima_json = root + "/shared/roadmaps/anima.json"
+    if _has_file(anima_json) { target_files = target_files.push(anima_json) }
+}
+
+if len(target_files) == 0 {
+    eprintln("error: 검사 대상 JSON 없음 — 인자 지정 또는 raw.json/.own-rules.json 생성 필요")
+    exit(1)
+}
+
+// ─── JSON 간이 파싱 (rule chunk split) ───────────────────────
+// "id": N 으로 split → 각 chunk 에서 status/proof_path 추출
+fn _extract_str(chunk: string, key: string) -> string {
+    let needle = "\"" + key + "\": \""
+    let idx = chunk.index_of(needle)
+    if idx < 0 { return "" }
+    let after = chunk.substring(idx + len(needle), len(chunk))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+
+fn _extract_id(chunk: string) -> string {
+    let trimmed = chunk.trim_start()
+    let mut id_str = ""
+    let mut k = 0
+    while k < len(trimmed) {
+        let c = trimmed.substring(k, k + 1)
+        if c == "," || c == " " || c == "\n" || c == "}" { break }
+        id_str = id_str + c
+        k = k + 1
+    }
+    return id_str
+}
+
+// proof_path 가리키는 파일의 state 확인 — ossified/done/live/true 중 하나
+fn _proof_state_ok(proof_path: string) -> bool {
+    if proof_path == "" { return false }
+    let abs = if proof_path.starts_with("/") { proof_path } else { _pwd() + "/" + proof_path }
+    if !_has_file(abs) { return false }
+    // state 필드가 있으면 값 확인, 없으면 파일 존재만으로 pass (source file 의 경우)
+    let content = _read_safe(abs)
+    if content == "" { return false }
+    // JSON state 필드 체크
+    if content.contains("\"state\":") {
+        if content.contains("\"state\": \"ossified\"") { return true }
+        if content.contains("\"state\": \"done\"") { return true }
+        if content.contains("\"state\": \"live\"") { return true }
+        if content.contains("\"state\":\"ossified\"") { return true }
+        if content.contains("\"state\":\"done\"") { return true }
+        if content.contains("\"state\":\"live\"") { return true }
+        return false
+    }
+    // state 필드 없음 (예: .hexa 소스 파일) — 존재만으로 pass
+    return true
+}
+
+// ─── 메인 스캔 ───────────────────────────────────────────────
+let mut violations = []
+let mut warnings = []
+let mut total_rules = 0
+
+for file_path in target_files {
+    let raw = _read_safe(file_path)
+    if raw == "" {
+        warnings = warnings.push([file_path, "", "파일 읽기 실패 또는 비어있음"])
+        continue
+    }
+
+    let parts = split(raw, "\"id\":")
+    let mut i = 1  // 첫 chunk 는 _meta 전이라 skip
+    while i < len(parts) {
+        let chunk = parts[i]
+        let rid = _extract_id(chunk)
+        let status = _extract_str(chunk, "status")
+        let name = _extract_str(chunk, "name")
+        let proof_path = _extract_str(chunk, "proof_path")
+
+        total_rules = total_rules + 1
+
+        // status=done/live/ossified 만 검증 대상
+        let needs_proof = status == "done" || status == "live" || status == "ossified"
+
+        if needs_proof {
+            if proof_path == "" {
+                violations = violations.push([
+                    file_path, rid, "proof_path 필드 누락 (status=" + status + ")"
+                ])
+            } else {
+                let abs = if proof_path.starts_with("/") { proof_path } else { _pwd() + "/" + proof_path }
+                if !_has_file(abs) {
+                    violations = violations.push([
+                        file_path, rid, "proof_path 파일 없음: " + proof_path
+                    ])
+                } else if !_proof_state_ok(proof_path) {
+                    violations = violations.push([
+                        file_path, rid, "proof state 불일치 (ossified/done/live 중 하나 아님): " + proof_path
+                    ])
+                }
+            }
+        }
+
+        i = i + 1
+    }
+}
+
+// ─── 리포트 ──────────────────────────────────────────────────
+if ci {
+    // machine-readable JSONL
+    for v in violations {
+        println("{\"file\":\"" + v[0] + "\",\"id\":\"" + v[1] + "\",\"reason\":\"" + v[2] + "\"}")
+    }
+    if len(violations) > 0 { exit(1) }
+    exit(0)
+}
+
+println("── drift scanner (raw #8 proof-carrying mark) ──")
+println("files   : " + to_string(len(target_files)))
+println("rules   : " + to_string(total_rules))
+println("")
+
+if len(violations) == 0 && len(warnings) == 0 {
+    println("✅ 전체 통과 — proof-carrying mark 준수")
+    exit(0)
+}
+
+if len(violations) > 0 {
+    println("🚫 drift 감지 (" + to_string(len(violations)) + ")")
+    for v in violations {
+        println("  ✗ [" + v[0] + "] id=" + v[1])
+        println("    " + v[2])
+    }
+    println("")
+}
+
+if len(warnings) > 0 {
+    println("⚠ 경고 (" + to_string(len(warnings)) + ")")
+    for w in warnings {
+        println("  · [" + w[0] + "] " + w[2])
+    }
+    println("")
+}
+
+if len(violations) > 0 {
+    println("commit 차단 — proof_path 보강 또는 status 강등 필요")
+    exit(1)
+}
+
+if strict && len(warnings) > 0 { exit(1) }
+exit(0)
