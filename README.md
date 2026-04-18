@@ -1,4 +1,3 @@
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.19365284.svg)](https://doi.org/10.5281/zenodo.19365284)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
 # 💎 hexa-lang
@@ -28,7 +27,7 @@ installs both into `~/.hx/bin/`:
 ## features
 
 - **perfect-number** — every constant derived from n=6 (65 keywords, 46 operators, 8 primitives — zero arbitrary choices)
-- **self-hosted** — 100% `.hexa`, no Rust, compiles itself (lex → parse → check → opt → codegen → exec)
+- **self-hosted** — 100% `.hexa`, compiles itself (lex → parse → check → opt → codegen → exec)
 - **multi-target** — native ARM64/x86_64, VM, ESP32, FPGA Verilog, WGSL shader — one source
 - **proof-native** — `proof`/`assert`/`invariant`/`theorem` with SAT backend
 - **AI-native** — `@attr` semantic rewrites (contract, symbolic, fuse, approximate, specialize)
