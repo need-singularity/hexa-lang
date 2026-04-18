@@ -8032,30 +8032,42 @@ HexaVal _resolve_use_path(HexaVal name) {
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(name)), hexa_int(0)))) {
         return __hexa_fn_arena_return(hexa_str(""));
     }
+    /* 2026-04-18 fix: accept both `use "foo"` and `use "foo.hexa"` — strip
+     * trailing .hexa so we don't end up searching for `foo.hexa.hexa`.
+     * Without this, serve_alm.hexa's use of `self/ml/hxblas_bf16.hexa`
+     * silently fails to resolve → no extern fwd decls → bare-identifier
+     * call emit → clang undeclared error. */
+    HexaVal base = name;
+    if (hexa_truthy(hexa_cmp_ge(hexa_int(hexa_len(base)), hexa_int(5)))) {
+        HexaVal tail = hexa_str_substring(base, hexa_sub(hexa_int(hexa_len(base)), hexa_int(5)), hexa_int(hexa_len(base)));
+        if (hexa_truthy(hexa_eq(tail, hexa_str(".hexa")))) {
+            base = hexa_str_substring(base, hexa_int(0), hexa_sub(hexa_int(hexa_len(base)), hexa_int(5)));
+        }
+    }
     HexaVal cdir = _resolve_caller_dir_get();
-    HexaVal cand1 = hexa_add(hexa_add(hexa_add(cdir, hexa_str("/")), name), hexa_str(".hexa"));
+    HexaVal cand1 = hexa_add(hexa_add(hexa_add(cdir, hexa_str("/")), base), hexa_str(".hexa"));
     HexaVal r1 = _resolve_try_candidate(cand1);
     if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(r1)), hexa_int(0)))) {
         return __hexa_fn_arena_return(r1);
     }
     HexaVal hl = hexa_env_var(hexa_str("HEXA_LANG"));
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_type_of(hl), hexa_str("string"))) && hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(hl)), hexa_int(0)))))) {
-        HexaVal cand2 = hexa_add(hexa_add(hexa_add(hl, hexa_str("/self/")), name), hexa_str(".hexa"));
+        HexaVal cand2 = hexa_add(hexa_add(hexa_add(hl, hexa_str("/self/")), base), hexa_str(".hexa"));
         HexaVal r2 = _resolve_try_candidate(cand2);
         if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(r2)), hexa_int(0)))) {
             return __hexa_fn_arena_return(r2);
         }
-        HexaVal cand2b = hexa_add(hexa_add(hexa_add(hl, hexa_str("/")), name), hexa_str(".hexa"));
+        HexaVal cand2b = hexa_add(hexa_add(hexa_add(hl, hexa_str("/")), base), hexa_str(".hexa"));
         HexaVal r2b = _resolve_try_candidate(cand2b);
         if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(r2b)), hexa_int(0)))) {
             return __hexa_fn_arena_return(r2b);
         }
     }
-    HexaVal r3 = _resolve_try_candidate(hexa_add(name, hexa_str(".hexa")));
+    HexaVal r3 = _resolve_try_candidate(hexa_add(base, hexa_str(".hexa")));
     if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(r3)), hexa_int(0)))) {
         return __hexa_fn_arena_return(r3);
     }
-    HexaVal r4 = _resolve_try_candidate(hexa_add(hexa_add(hexa_str("self/"), name), hexa_str(".hexa")));
+    HexaVal r4 = _resolve_try_candidate(hexa_add(hexa_add(hexa_str("self/"), base), hexa_str(".hexa")));
     if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(r4)), hexa_int(0)))) {
         return __hexa_fn_arena_return(r4);
     }
