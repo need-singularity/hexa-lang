@@ -78,4 +78,7 @@ ref:
   attrs     self/attrs/                          30 @attr 모듈 (각 attr.hexa = meta+check), _registry.hexa 디스패치
   attr-cli  self/attr_cli.hexa                   카탈로그/상세/lint/policy CLI
   policy    .hexa-attrs                          프로젝트 정책 (forbid/allow 선언)
+  poc       self/poc/                            33 handler 모듈 (filename=dispatch-key), common.hexa + _dispatch.hexa (자동 생성)
+  poc-lint  scripts/poc_lint.hexa                R1/R2/R3 규약 검증 (filename→fn, @kinds/@name/@method, unique keys)
+  poc-gen   scripts/poc_gen_dispatch.hexa        dispatcher codegen — self/poc/ 스캔 → _dispatch.hexa (poc_lower_expr/stmt + poc_ex_call)
   api       shared/CLAUDE.md
