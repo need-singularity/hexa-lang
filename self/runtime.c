@@ -155,6 +155,8 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width);
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
 HexaVal hexa_read_file(HexaVal path);
 HexaVal hexa_write_file(HexaVal path, HexaVal content);
+HexaVal hexa_file_exists(HexaVal path);
+HexaVal hexa_eprintln(HexaVal v);
 HexaVal hexa_write_bytes(HexaVal path, HexaVal arr);
 HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr);
 HexaVal hexa_read_file_bytes(HexaVal path);
@@ -2600,9 +2602,11 @@ void hexa_print_val(HexaVal v) {
             case TAG_INT:   printf("%lld", (long long)vs->int_val); return;
             case TAG_FLOAT: printf("%g", vs->float_val); return;
             case TAG_BOOL:  printf("%s", vs->bool_val ? "true" : "false"); return;
-            case TAG_STR:
-                if (vs->str_val) { printf("%s", vs->str_val); return; }
+            case TAG_STR: {
+                const char* cs = HX_STR(vs->str_val);
+                if (cs) { printf("%s", cs); return; }
                 break;
+            }
             case TAG_VOID:  printf("void"); return;
         }
         // Inner tag not one of the printable scalars — fall through to the
@@ -2634,6 +2638,44 @@ void hexa_print_val(HexaVal v) {
 }
 
 void hexa_println(HexaVal v) { hexa_print_val(v); printf("\n"); }
+
+// P7-6 builtin (2026-04-18): stderr counterpart to hexa_println. Used
+// by user code that needs to emit diagnostics without polluting stdout
+// (e.g. CLI tools whose stdout is a result stream piped to another
+// process). Returns void-equivalent HexaVal so it can slot into the
+// uniform i64-ret IR shape that the native_build dispatcher emits.
+HexaVal hexa_eprintln(HexaVal v) {
+    // Route through the same hexa_print_val logic but redirect the
+    // writes to stderr. We cannot reuse hexa_print_val directly because
+    // it hard-codes printf() — mirror the body with fprintf(stderr).
+    if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
+        HexaValStruct* vs = HX_VS(v);
+        switch (vs->tag_i) {
+            case TAG_INT:   fprintf(stderr, "%lld\n", (long long)vs->int_val); return hexa_void();
+            case TAG_FLOAT: fprintf(stderr, "%g\n", vs->float_val); return hexa_void();
+            case TAG_BOOL:  fprintf(stderr, "%s\n", vs->bool_val ? "true" : "false"); return hexa_void();
+            case TAG_STR: {
+                const char* cs = HX_STR(vs->str_val);
+                if (cs) { fprintf(stderr, "%s\n", cs); return hexa_void(); }
+                break;
+            }
+            case TAG_VOID:  fprintf(stderr, "void\n"); return hexa_void();
+        }
+        // fall through to outer switch for corrupted/compound inner tags
+    }
+    switch (HX_TAG(v)) {
+        case TAG_INT: fprintf(stderr, "%lld\n", (long long)HX_INT(v)); break;
+        case TAG_FLOAT: fprintf(stderr, "%g\n", HX_FLOAT(v)); break;
+        case TAG_BOOL: fprintf(stderr, "%s\n", HX_BOOL(v) ? "true" : "false"); break;
+        case TAG_STR:
+            if (HX_STR(v)) fprintf(stderr, "%s\n", HX_STR(v));
+            else fprintf(stderr, "<str null>\n");
+            break;
+        case TAG_VOID: fprintf(stderr, "void\n"); break;
+        default: fprintf(stderr, "<value>\n"); break;
+    }
+    return hexa_void();
+}
 
 // ── to_string ────────────────────────────────────────────
 
