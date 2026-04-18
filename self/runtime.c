@@ -1519,6 +1519,42 @@ int hexa_map_contains_key(HexaVal m, const char* key) {
     return hmap_find(HX_MAP_TBL(m), key, h) >= 0;
 }
 
+// entries: flat array of [key, value] pairs. Keys come out as strings
+// (HexaMap stores keys as char*). Matches interpreter semantics at
+// self/hexa_full.hexa:15558-15568.
+HexaVal hexa_map_entries(HexaVal m) {
+    HexaVal out = hexa_array_new();
+    if (!HX_MAP_TBL(m)) return out;
+    HexaMapTable* t = HX_MAP_TBL(m);
+    for (int i = 0; i < t->len; i++) {
+        HexaVal pair = hexa_array_new();
+        pair = hexa_array_push(pair, hexa_str(t->order_keys[i]));
+        pair = hexa_array_push(pair, t->order_vals[i]);
+        out = hexa_array_push(out, pair);
+    }
+    return out;
+}
+
+// to_array: same shape as entries() — keeps names consistent with
+// interpreter dispatch (self/hexa_full.hexa:15611-15620).
+HexaVal hexa_map_to_array(HexaVal m) {
+    return hexa_map_entries(m);
+}
+
+// merge: overlay other's entries onto self. Other wins on key collision.
+// Matches interpreter at self/hexa_full.hexa:15570-15583. Non-map `other`
+// returns self unchanged.
+HexaVal hexa_map_merge(HexaVal a, HexaVal b) {
+    if (!HX_MAP_TBL(a)) return a;
+    if (!HX_MAP_TBL(b)) return a;
+    HexaVal out = a;
+    HexaMapTable* tb = HX_MAP_TBL(b);
+    for (int i = 0; i < tb->len; i++) {
+        out = hexa_map_set(out, tb->order_keys[i], tb->order_vals[i]);
+    }
+    return out;
+}
+
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
     if (!HX_MAP_TBL(m)) return m;
     HexaMapTable* t = HX_MAP_TBL(m);
