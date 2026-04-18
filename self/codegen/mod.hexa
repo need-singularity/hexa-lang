@@ -1024,17 +1024,36 @@ fn emit_function_x86(func, alloc: FuncAlloc) -> EmitResult {
                     // rdi=7, rsi=6, rdx=2, rcx=1, r8=8, r9=9). Prior value
                     // `[5, 4, ...]` mapped to rbp/rsp (stack frame regs) →
                     // silent stack-pointer clobber on every call with args.
+                    //
+                    // Parallel-move aliasing fix (2026-04-18): naive
+                    //   for each arg: MOV param_reg[i], src[i]
+                    // corrupts whenever src[j>i] == param_reg[i] — once
+                    // we write param_reg[i] we lose the source value for
+                    // arg j. gp_regs_x86 includes rcx(1)/rdx(2)/rsi(6)/
+                    // rdi(7)/r8(8)/r9(9), so any of the param regs can
+                    // hold a live SSA value. Fix: push all sources in
+                    // forward order, then pop in reverse order into the
+                    // param registers. Stack-based shuffle has no reg
+                    // aliasing; rsp nets to 0 before the CALL so ABI
+                    // alignment (16B at CALL) is preserved by prologue.
                     let x86_param_regs = [7, 6, 2, 1, 8, 9]
-                    let mut ai = 1  // skip operands[0] which is func ref
-                    while ai < len(instr.operands) {
-                        let arg_vid = instr.operands[ai].a
-                        let src = resolve_reg_x86(alloc, arg_vid)
-                        let pidx = ai - 1
-                        if pidx < len(x86_param_regs) {
-                            let dst_param = x86_param_regs[pidx]
-                            code = x86_emit_mov_rr(code, dst_param, src)
-                        }
+                    let n_args = len(instr.operands) - 1
+                    let mut n_push = n_args
+                    if n_push > len(x86_param_regs) { n_push = len(x86_param_regs) }
+                    // Pass 1: push src[0]..src[n_push-1] in forward order.
+                    let mut ai = 0
+                    while ai < n_push {
+                        let src = resolve_reg_x86(alloc, instr.operands[ai + 1].a)
+                        code = x86_emit_push_reg(code, src)
                         ai = ai + 1
+                    }
+                    // Pass 2: pop in reverse into param regs — last pushed
+                    // is first popped, so pop order is param[n-1..0].
+                    ai = n_push - 1
+                    while ai >= 0 {
+                        let dst_param = x86_param_regs[ai]
+                        code = x86_emit_pop_reg(code, dst_param)
+                        ai = ai - 1
                     }
                     // Record call fixup
                     let target_fid = instr.operands[0].a
@@ -1066,19 +1085,43 @@ fn emit_function_x86(func, alloc: FuncAlloc) -> EmitResult {
                     // SysV syscall ABI: num in rax, args in rdi, rsi, rdx, r10, r8, r9.
                     // Note: r10 (not rcx) — syscall insn clobbers rcx with RIP.
                     //
-                    // Move num into rax FIRST — otherwise marshalling args can
-                    // clobber num if it happens to live in rdi/rsi/rdx/etc.
-                    // Order: save num → marshal args.
+                    // Parallel-move aliasing fix (2026-04-18): sc_arg_regs
+                    // includes rdi(7)/rsi(6)/rdx(2)/r10(10)/r8(8)/r9(9),
+                    // all of which regalloc can assign to live SSAs. Naive
+                    // sequential MOVs corrupted whenever src[j] matched a
+                    // previously-written dst. Same push-then-pop shuffle
+                    // as the call path. num → rax is done BEFORE the pops
+                    // so a num_src register that happens to be a pop dst
+                    // is still readable when we materialize rax. After
+                    // pops, rsp is back to the pre-push value, so syscall
+                    // insn fires at the expected alignment.
+                    // (Supersedes earlier num-first-only fix 1981af14 —
+                    // the push/pop shuffle removes arg-marshalling clobber
+                    // entirely, which was the original motivation.)
+                    let sc_arg_regs = [7, 6, 2, 10, 8, 9]   // rdi,rsi,rdx,r10,r8,r9
+                    let n_args = len(instr.operands) - 1
+                    let mut n_push = n_args
+                    if n_push > len(sc_arg_regs) { n_push = len(sc_arg_regs) }
+                    // Pass 1: push arg src registers in forward order.
+                    let mut ai = 0
+                    while ai < n_push {
+                        let src = resolve_reg_x86(alloc, instr.operands[ai + 1].a)
+                        code = x86_emit_push_reg(code, src)
+                        ai = ai + 1
+                    }
+                    // Materialize syscall nr into rax BEFORE pops, so that
+                    // if num_src lives in one of the sc_arg_regs we read
+                    // its original value. Stack memory holds the arg srcs
+                    // separately, so later pops can overwrite the source
+                    // registers without affecting the pushed bytes.
                     let num_src = resolve_reg_x86(alloc, instr.operands[0].a)
                     code = x86_emit_mov_rr(code, 0, num_src)
-                    let sc_arg_regs = [7, 6, 2, 10, 8, 9]   // rdi,rsi,rdx,r10,r8,r9
-                    let mut ai = 1
-                    while ai < len(instr.operands) && ai <= 6 {
-                        let src = resolve_reg_x86(alloc, instr.operands[ai].a)
-                        let pidx = ai - 1
-                        let dst_arg = sc_arg_regs[pidx]
-                        code = x86_emit_mov_rr(code, dst_arg, src)
-                        ai = ai + 1
+                    // Pass 2: pop in reverse into sc_arg_regs.
+                    ai = n_push - 1
+                    while ai >= 0 {
+                        let dst_arg = sc_arg_regs[ai]
+                        code = x86_emit_pop_reg(code, dst_arg)
+                        ai = ai - 1
                     }
                     // syscall insn: 0f 05
                     code = code.push(0x0f).push(0x05)
