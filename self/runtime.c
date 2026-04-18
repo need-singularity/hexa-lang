@@ -3165,6 +3165,8 @@ HexaVal hexa_exp(HexaVal v)   { return hexa_float(exp(__hx_to_double(v))); }
 HexaVal hexa_log(HexaVal v)   { return hexa_float(log(__hx_to_double(v))); }
 HexaVal hexa_log10(HexaVal v) { return hexa_float(log10(__hx_to_double(v))); }
 HexaVal hexa_round(HexaVal v) { return hexa_int((int64_t)llround(__hx_to_double(v))); }
+HexaVal hexa_tanh(HexaVal v)  { return hexa_float(tanh(__hx_to_double(v))); }
+HexaVal hexa_log2(HexaVal v)  { return hexa_float(log2(__hx_to_double(v))); }
 
 // to_float: coerce any scalar to float
 HexaVal hexa_to_float(HexaVal v) {
@@ -5382,6 +5384,36 @@ HexaVal hexa_silu(HexaVal a) {
         out = hexa_array_push(out, hexa_float(x / (1.0 + exp(-x))));
     }
     return out;
+}
+
+// gelu(a): elementwise Gaussian Error Linear Unit (tanh approximation).
+// Matches interpreter hexa_full.hexa:10108 — 0.5*x*(1+tanh(sqrt(2/pi)*(x+0.044715*x^3))).
+HexaVal hexa_gelu(HexaVal a) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    const double k = 0.7978845608028654; // sqrt(2/pi)
+    for (int64_t i = 0; i < n; i++) {
+        double x = __hx_to_double(hexa_array_get(a, i));
+        double inner = k * (x + 0.044715 * x * x * x);
+        out = hexa_array_push(out, hexa_float(0.5 * x * (1.0 + tanh(inner))));
+    }
+    return out;
+}
+
+// argmax(a): return index of largest element (ties → lowest index).
+// Matches interpreter hexa_full.hexa:9616 — int result.
+HexaVal hexa_argmax(HexaVal a) {
+    if (!HX_IS_ARRAY(a)) return hexa_int(-1);
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    if (n == 0) return hexa_int(-1);
+    int64_t best_i = 0;
+    double best_v = __hx_to_double(hexa_array_get(a, 0));
+    for (int64_t i = 1; i < n; i++) {
+        double v = __hx_to_double(hexa_array_get(a, i));
+        if (v > best_v) { best_v = v; best_i = i; }
+    }
+    return hexa_int(best_i);
 }
 
 // rms_norm(x, gamma, eps): gamma[i] * x[i] / sqrt(mean(x^2) + eps).
