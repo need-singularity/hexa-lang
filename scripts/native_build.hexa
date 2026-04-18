@@ -176,6 +176,59 @@ fn main() {
 // modules. Until P7-6a lands (hexa_full.hexa scale), parse_and_lower
 // is a placeholder.
 
+// ── Builtin runtime dispatch (P7-6) ───────────────────────────────
+//
+// Map hexa-source builtin names → runtime C symbols (self/runtime.c).
+// Returning "" signals "not a builtin — fall through to user-fn
+// resolution". When a builtin is recognized, nb_lower_builtin below
+// auto-registers an extern stub fn in the IrModule (so bld_call has a
+// valid fid) and emits a CALL. The ARM64 backend currently lowers
+// CALL to a BL stub (offset 0) — real symbol resolution is P7-6b
+// linker work. For the interpreter path (`hexa test ...`), these
+// builtins are resolved natively by the stage0 runtime.
+//
+// Parser uses `argv()` in some files and `args()` in others; both
+// route to the same runtime symbol `hexa_args`. Same for `env` /
+// `env_var`.
+fn nb_builtin_runtime_sym(name: string) -> string {
+    if name == "print" { return "hexa_print_val" }
+    if name == "println" { return "hexa_println" }
+    if name == "eprintln" { return "hexa_eprintln_stub" }
+    if name == "len" { return "hexa_len" }
+    if name == "argv" { return "hexa_args" }
+    if name == "args" { return "hexa_args" }
+    if name == "exit" { return "hexa_exit" }
+    if name == "exec" { return "hexa_exec" }
+    if name == "exec_with_status" { return "hexa_exec_with_status" }
+    if name == "read_file" { return "hexa_read_file" }
+    if name == "write_file" { return "hexa_write_file" }
+    if name == "file_exists" { return "hexa_file_exists_stub" }
+    if name == "env" { return "hexa_env_var" }
+    if name == "env_var" { return "hexa_env_var" }
+    return ""
+}
+
+// Idempotent extern registration: on first use, add a placeholder
+// IrFunction entry so that `bld_call` has a valid fid. Subsequent
+// calls reuse the same index. Param shape is intentionally empty —
+// ARM64/x86_64 backends emit BL/CALL stubs and ABI-place args via
+// regalloc from the operand list rather than the fn's declared params.
+fn nb_ensure_extern_fn(m, sym: string) -> int {
+    let existing = module_find_function(m, sym)
+    if existing >= 0 { return existing }
+    module_add_function(m, sym, [], "i64")
+    return len(m.functions) - 1
+}
+
+// Lower a recognized builtin call: register extern + emit CALL.
+// Void-returning builtins (print/println/eprintln/exit) still yield
+// an SSA vid because the IR is uniformly typed i64 at this stage;
+// upstream callers discard the value via ExprStmt.
+fn nb_lower_builtin(m, b, name: string, sym: string, arg_vids) -> int {
+    let fid = nb_ensure_extern_fn(m, sym)
+    return bld_call(m, b, fid, arg_vids, "i64")
+}
+
 // ── Expression lowering (parser → IR) ─────────────────────────────
 // Parser AST uses string `value` for IntLit and `left`/`right`/`op`
 // for BinOp; ir/lowering.hexa's lower_int_lit/bin_op consumers read
@@ -245,12 +298,88 @@ fn nb_lower_expr(m, b, e, env) -> int {
             arg_vids = arg_vids.push(av)
             i = i + 1
         }
-        return lower_call_by_name(m, b, e.left.name, arg_vids, "i64")
+        // P7-6 builtin coverage: recognize hx runtime builtins before
+        // generic user-fn resolution. Unrecognized names fall through
+        // to lower_call_by_name (user fn lookup).
+        let cname = e.left.name
+        let sym = nb_builtin_runtime_sym(cname)
+        if len(sym) > 0 {
+            return nb_lower_builtin(m, b, cname, sym, arg_vids)
+        }
+        return lower_call_by_name(m, b, cname, arg_vids, "i64")
+    }
+    if k == "IfExpr" {
+        // Value-producing if — emit branch + phi. The parser always wraps
+        // `if` in IfExpr; stmt-position `if` is reached via ExprStmt and
+        // also flows through here (result is discarded by ExprStmt path).
+        //
+        // Shape: e.cond / e.then_body (array of stmts) / e.else_body
+        //        (array of stmts or "" when no else).
+        let cond_vid = nb_lower_expr(m, b, e.cond, env)
+        if cond_vid < 0 { return -1 }
+        let blks = lower_if_expr_skeleton(m, b, cond_vid)
+        let then_bb = blks[0]
+        let else_bb = blks[1]
+        let end_bb  = blks[2]
+        // THEN branch
+        builder_switch_to(b, then_bb)
+        let tv = nb_lower_block_value(m, b, e.then_body, env)
+        if tv < 0 { return -1 }
+        // Capture the actual terminating block — nested if/loops inside
+        // the then-body may have moved the builder off `then_bb`; phi
+        // incoming must reference the block that emits the end-jump.
+        let then_final = b.current_block
+        bld_jump(m, b, end_bb)
+        // ELSE branch — when parser left `else_body` as "" there is no
+        // else; emit a zero value so the phi stays well-formed.
+        builder_switch_to(b, else_bb)
+        let mut ev = 0
+        if e.else_body == "" {
+            ev = bld_const_i64(m, b, 0)
+        } else {
+            ev = nb_lower_block_value(m, b, e.else_body, env)
+            if ev < 0 { return -1 }
+        }
+        let else_final = b.current_block
+        bld_jump(m, b, end_bb)
+        return lower_if_expr_close(m, b, end_bb, then_final, tv, else_final, ev, "i64")
     }
     // Unsupported expr kind — caller's wrap-0 policy preserves the
     // rest of the code stream; native_build reports coverage gaps
     // at end-of-pipeline.
     return -1
+}
+
+// Lower a block (array of stmts) whose trailing value is wanted for an
+// IfExpr / block-as-expr context. Walks each stmt via nb_lower_stmt; if
+// the final stmt is an ExprStmt, its expression's ValueId is returned.
+// Otherwise returns bld_const_i64(0). Terminator-producing stmts (Return)
+// short-circuit and return a dummy 0 — the phi value is unreachable.
+fn nb_lower_block_value(m, b, body, env) -> int {
+    if body == "" { return bld_const_i64(m, b, 0) }
+    let n = len(body)
+    if n == 0 { return bld_const_i64(m, b, 0) }
+    let mut i = 0
+    while i < n - 1 {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return -1 }
+        if r == 1 {
+            // terminator emitted mid-block — phi incoming unreachable.
+            return bld_const_i64(m, b, 0)
+        }
+        i = i + 1
+    }
+    // Trailing stmt: if ExprStmt, return its expr's vid; else lower as
+    // stmt and fall back to 0.
+    let last = body[n - 1]
+    if last.kind == "ExprStmt" {
+        let v = nb_lower_expr(m, b, last.left, env)
+        if v < 0 { return -1 }
+        return v
+    }
+    let r = nb_lower_stmt(m, b, last, env)
+    if r < 0 { return -1 }
+    return bld_const_i64(m, b, 0)
 }
 
 // ── Statement lowering (parser → IR) ──────────────────────────────
@@ -290,8 +419,68 @@ fn nb_lower_stmt(m, b, s, env) -> int {
         if v < 0 { return -1 }
         return 0
     }
+    if k == "WhileStmt" {
+        // Shape: s.cond / s.body (array of stmts).
+        //
+        //   entry: … ; jump header
+        //   header: <cond>; branch body, end
+        //   body:   <stmts>; jump header
+        //   end:    …
+        let blks = lower_while_skeleton(m, b)
+        let header_bb = blks[0]
+        let body_bb   = blks[1]
+        let end_bb    = blks[2]
+        // Header
+        builder_switch_to(b, header_bb)
+        let cond_vid = nb_lower_expr(m, b, s.cond, env)
+        if cond_vid < 0 { return -1 }
+        bld_branch(m, b, cond_vid, body_bb, end_bb)
+        // Body
+        builder_switch_to(b, body_bb)
+        if !nb_lower_block(m, b, s.body, env) { return -1 }
+        lower_while_close(m, b, header_bb, end_bb)
+        // After close, builder is on end_bb — ready for subsequent stmts.
+        return 0
+    }
+    if k == "ForStmt" {
+        // Only numeric range lowering for now: `for i in start..end`.
+        // TODO: inclusive range (..=), step, array iteration.
+        let it = s.iter_expr
+        if it.kind != "Range" { return -1 }
+        if it.value != "exclusive" { return -1 }
+        let start_vid = nb_lower_expr(m, b, it.left, env)
+        if start_vid < 0 { return -1 }
+        let end_vid   = nb_lower_expr(m, b, it.right, env)
+        if end_vid < 0 { return -1 }
+        let fr = lower_for_range_skeleton(m, b, env, s.name, start_vid, end_vid)
+        let header_bb = fr[0]
+        let body_bb   = fr[1]
+        let end_bb    = fr[2]
+        let slot      = fr[3]
+        // Body
+        builder_switch_to(b, body_bb)
+        if !nb_lower_block(m, b, s.body, env) { return -1 }
+        lower_for_range_close(m, b, slot, header_bb)
+        builder_switch_to(b, end_bb)
+        return 0
+    }
     // Unsupported stmt kind — flag coverage gap.
     return -1
+}
+
+// Walk a block (array of stmts) in statement position — terminator short
+// circuit stops the walk. Returns true when every stmt lowered OK (r >= 0)
+// and false on coverage gap.
+fn nb_lower_block(m, b, body, env) -> bool {
+    if body == "" { return true }
+    let mut i = 0
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { return true }
+        i = i + 1
+    }
+    return true
 }
 
 // ── FnDecl → IrFunction ───────────────────────────────────────────
