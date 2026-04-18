@@ -5416,6 +5416,46 @@ HexaVal hexa_argmax(HexaVal a) {
     return hexa_int(best_i);
 }
 
+// sum(a): reduce-sum; returns int if all elements int, float otherwise.
+// Matches interpreter hexa_full.hexa:13232.
+HexaVal hexa_sum(HexaVal a) {
+    if (!HX_IS_ARRAY(a)) return hexa_int(0);
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    int has_float = 0;
+    int64_t int_total = 0;
+    double float_total = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        HexaVal e = hexa_array_get(a, i);
+        if (HX_IS_FLOAT(e)) { has_float = 1; float_total += HX_FLOAT(e); }
+        else { int_total += HX_INT(e); }
+    }
+    if (has_float) return hexa_float((double)int_total + float_total);
+    return hexa_int(int_total);
+}
+
+// clamp(x, lo, hi): scalar clamp, float result.
+// Matches interpreter hexa_full.hexa:13468.
+HexaVal hexa_clamp(HexaVal xv, HexaVal lov, HexaVal hiv) {
+    double x = __hx_to_double(xv);
+    double lo = __hx_to_double(lov);
+    double hi = __hx_to_double(hiv);
+    if (x < lo) return hexa_float(lo);
+    if (x > hi) return hexa_float(hi);
+    return hexa_float(x);
+}
+
+// one_hot(idx, n): n-length binary vector, 1.0 at idx, 0.0 elsewhere.
+// Matches interpreter hexa_full.hexa:10512.
+HexaVal hexa_one_hot(HexaVal idxv, HexaVal nv) {
+    int64_t idx = HX_IS_INT(idxv) ? HX_INT(idxv) : (int64_t)__hx_to_double(idxv);
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    HexaVal out = hexa_array_new();
+    for (int64_t i = 0; i < n; i++) {
+        out = hexa_array_push(out, hexa_float(i == idx ? 1.0 : 0.0));
+    }
+    return out;
+}
+
 // rms_norm(x, gamma, eps): gamma[i] * x[i] / sqrt(mean(x^2) + eps).
 // gamma may be array (per-element scale) or scalar (uniform scale).
 HexaVal hexa_rms_norm(HexaVal x, HexaVal gamma, HexaVal epsv) {
