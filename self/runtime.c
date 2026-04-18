@@ -5195,6 +5195,24 @@ HexaVal hexa_array_frequencies(HexaVal arr) {
     return out;
 }
 
+// sample(n): return n items drawn uniformly at random (with replacement)
+// from arr. Empty array or n<=0 returns empty array. Uses rand()/RAND_MAX
+// like hexa_random() so the RNG stream is shared. Matches interpreter at
+// self/hexa_full.hexa:15544-15556.
+HexaVal hexa_array_sample(HexaVal arr, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n_items = HX_ARR_LEN(arr);
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    if (n_items == 0 || n <= 0) return out;
+    for (int64_t i = 0; i < n; i++) {
+        int64_t idx = (int64_t)(rand() / (double)RAND_MAX * (double)n_items);
+        if (idx >= n_items) idx = n_items - 1;
+        out = hexa_array_push(out, HX_ARR_ITEMS(arr)[idx]);
+    }
+    return out;
+}
+
 // substr: JS-style substring(start, length). length defaults to "rest of
 // string" when not supplied. Negative start clamps to 0, negative length
 // to 0, end clamps to strlen. Matches interpreter at
