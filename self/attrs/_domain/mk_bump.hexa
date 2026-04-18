@@ -1,0 +1,208 @@
+// self/attrs/_domain/mk_bump.hexa — intent=update 시 §21 역순 mk 삽입
+//
+// 동작:
+//   1. 기존 md 읽기
+//   2. §21 헤더 (## §21 ...) 위치 찾기
+//   3. §21 본문 첫 mk 블록 (### §21.mkX) 직전에 새 mk 블록 삽입
+//   4. 기존 최신 mk (첫 mk 블록) <details open> → <details> 로 변경,
+//      summary 의 "/blob/main/" → "/compare/<prev_tag>...main" 로 링크 승격
+//   5. 새 mk 블록 is_latest=true 로 <details open> + /blob/main/ 링크
+//
+// 멱등성:
+//   · 같은 mk 가 이미 §21 에 있으면 no-op (already)
+//   · 각 mk 블록 당 하나의 <details> 태그만 처리 (첫 매치)
+//
+// 준수 규칙 (self/attrs/_paper/mk_history.hexa 체커와 정합):
+//   · 역시간순 (최신 상단)
+//   · 최신 = <details open>, 과거 = <details>
+//   · summary 에 github /blob/ /compare/ /releases/ 노출
+//   · ③ 안 바뀌는 것 ≥ 3 항목 (tmpl_mk_details 이 3 항목 기본 제공)
+
+use "self/attrs/core"
+use "self/attrs/_domain/templates"
+use "self/attrs/_domain/scaffold"
+
+// md 내 특정 mk 존재?
+fn _mk_already_in(md: string, mk: string) -> bool {
+    let lines = md.split("\n")
+    for line in lines {
+        let t = line.trim()
+        if t.starts_with("### ") && t.contains(mk) {
+            // 단독 "mk1" 가 "mk10" 에 오탐하지 않도록 경계 확인
+            let idx = t.index_of(mk)
+            if idx >= 0 {
+                let after_idx = idx + len(mk)
+                if after_idx >= len(t) { return true }
+                let next_ch = t.substring(after_idx, after_idx + 1)
+                let c = char_code(next_ch, 0)
+                let is_digit = c >= 48 && c <= 57
+                if !is_digit { return true }
+            }
+        }
+    }
+    return false
+}
+
+// md 줄배열에서 §21 섹션 시작 라인 (0-based, ## §21 헤더 직후)
+// -1 = 없음
+fn _find_section21_header(lines) -> int {
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        if t.starts_with("## ") && t.contains("§21") { return i }
+        if t.starts_with("## §21") { return i }
+        if t.starts_with("## ") && t.to_upper().contains("IMPACT") {
+            // IMPACT 키워드도 허용
+            return i
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// §21 섹션 내 첫 "### §21.mkX" 라인 인덱스 (0-based). -1 없음
+fn _find_first_mk_h3(lines, sec21_start: int) -> int {
+    let mut i = sec21_start + 1
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        if t.starts_with("## ") { return -1 }  // 다음 ## 로 넘어감 → mk 없음
+        if t.starts_with("### ") && t.contains("mk") { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// 기존 최신 mk 블록 (### 부터 다음 ### 또는 ## 직전까지) 범위
+// 반환: [start_0based, end_0based_exclusive]
+fn _mk_block_range(lines, mk_h3_idx: int) {
+    let n = len(lines)
+    let mut i = mk_h3_idx + 1
+    while i < n {
+        let t = lines[i].trim()
+        if t.starts_with("### ") { return [mk_h3_idx, i] }
+        if t.starts_with("## ") { return [mk_h3_idx, i] }
+        i = i + 1
+    }
+    return [mk_h3_idx, n]
+}
+
+// 기존 최신 mk 블록을 collapsed 로 변환 + summary 링크 /blob/ → /compare/ 재작성
+fn _collapse_prev_mk_block(lines, start: int, end_excl: int, prev_tag: string) {
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let ln = lines[i]
+        if i >= start && i < end_excl {
+            let mut modified = ln
+            // <details open> → <details>
+            if modified.contains("<details open>") {
+                modified = modified.replace("<details open>", "<details>")
+            }
+            // summary 내 /blob/main/ → /compare/<prev_tag>...main
+            if prev_tag != "" && modified.contains("<summary") {
+                // nothing here; link processed below
+            }
+            // 모든 /blob/main/ 링크를 /compare/<tag>...main 으로 (summary 라인 한정)
+            if prev_tag != "" && modified.contains("/blob/main/") && modified.contains("<a href") {
+                // 단순 치환: /blob/main/domains/... → /compare/<tag>...main
+                // 원본 링크 구조는 보존을 위해 href 만 교체
+                let old_frag = "/blob/main/"
+                let new_frag = "/compare/" + prev_tag + "...main\" data-old-blob=\""
+                // data-* 보존 속성은 체커에는 영향 없음
+                modified = modified.replace(old_frag, new_frag)
+            }
+            out = out.push(modified)
+        } else {
+            out = out.push(ln)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// md 본문에 새 mk 블록을 §21 최상단 (첫 mk 블록 위) 삽입
+// 반환: 새 md 문자열 (또는 에러 시 원본)
+fn _insert_new_mk(md: string, new_mk: string, prev_tag: string, ctx) -> string {
+    let c = _ctx_or_default(ctx)
+    let lines = md.split("\n")
+    let sec21 = _find_section21_header(lines)
+    if sec21 < 0 {
+        // §21 섹션 자체 없음 — append
+        let mut parts = []
+        parts.push(md)
+        if !md.ends_with("\n") { parts.push("\n") }
+        parts.push(tmpl_section_21_impact(c))
+        return parts.join("")
+    }
+
+    // 새 mk 블록 (ctx 의 mk_target 을 new_mk 로 override)
+    let mut new_ctx = #{}
+    let keys = ["id", "axis", "name_ko", "intent", "product_line",
+                "mk_target", "alien_now", "alien_target", "prev_tag",
+                "requires", "repo_owner", "repo_name"]
+    for k in keys {
+        if has_key(c, k) { new_ctx[k] = c[k] }
+    }
+    new_ctx["mk_target"] = new_mk
+    let new_block = tmpl_mk_details(new_mk, "", true, new_ctx)
+
+    let first_mk = _find_first_mk_h3(lines, sec21)
+    if first_mk < 0 {
+        // §21 있으나 mk 블록 없음 — 섹션 본문 앞쪽에 삽입
+        // sec21 라인 뒤 빈 줄 하나 건너뛰고 insert
+        let mut out = []
+        let mut i = 0
+        while i < len(lines) {
+            out = out.push(lines[i])
+            if i == sec21 {
+                out = out.push("")
+                let nb_lines = new_block.split("\n")
+                for nb in nb_lines { out = out.push(nb) }
+            }
+            i = i + 1
+        }
+        return out.join("\n")
+    }
+
+    // 기존 최신 블록 범위 찾아 collapsed 전환
+    let rng = _mk_block_range(lines, first_mk)
+    let start = rng[0]
+    let end_excl = rng[1]
+    let collapsed = _collapse_prev_mk_block(lines, start, end_excl, prev_tag)
+
+    // new_block 을 first_mk 직전에 삽입
+    let mut out = []
+    let mut i = 0
+    let n = len(collapsed)
+    while i < n {
+        if i == first_mk {
+            let nb_lines = new_block.split("\n")
+            for nb in nb_lines { out = out.push(nb) }
+        }
+        out = out.push(collapsed[i])
+        i = i + 1
+    }
+    return out.join("\n")
+}
+
+// 외부 API — md 파일 경로에 대해 mk_bump 실행
+// 반환: "bumped" | "already" | "missing" | "error: ..."
+fn mk_bump(md_path: string, new_mk: string, prev_tag: string, ctx) -> string {
+    if !file_exists(md_path) { return "missing" }
+
+    let mut md = ""
+    let mut ok = true
+    try { md = read_file(md_path) } catch e { ok = false }
+    if !ok { return "error: read failed" }
+
+    if _mk_already_in(md, new_mk) { return "already" }
+
+    let new_md = _insert_new_mk(md, new_mk, prev_tag, ctx)
+    let mut wok = true
+    try { write_file(md_path, new_md) } catch e { wok = false }
+    if !wok { return "error: write failed" }
+    return "bumped"
+}

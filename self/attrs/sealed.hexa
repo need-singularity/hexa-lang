@@ -1,0 +1,222 @@
+// self/attrs/sealed.hexa — @sealed 보호 attr
+// 파일/섹션의 **직접 수정 금지** 강제. 수정은 전용 attr (@domain, @doc, @readme) 경유만 허용.
+//
+// 사용 형식:
+//   파일 전체:
+//     <!-- @sealed(allowed_via=@domain) -->
+//     // @sealed(allowed_via="@domain,@doc")
+//   섹션 범위:
+//     <!-- @sealed:begin -->
+//     ...보호 구간...
+//     <!-- @sealed:end -->
+//
+// sidecar: `<file>.sealed.hash` — 콘텐츠 checksum(sdbm, len 결합) 저장.
+//          최초 봉인 시 자동 생성, 이후 변경 감지용.
+//          `.gitignore` 권장 (보고 레벨에서 안내, 파일 자체에 적지 않음).
+
+use "self/attrs/core"
+use "self/attrs/_lib/error_catalog"
+use "self/attrs/_lib/paper_utils"
+use "self/attrs/_lib/rules_loader"
+
+// HX11 AI-native SELF-FORMAT — `.sealed-rules.json` (프로젝트) / 글로벌
+// `/Users/ghost/Dev/nexus/shared/config/sealed_rules.json` 에서 hash 알고리즘 /
+// sidecar 정책 / 감지 윈도우 크기 주입. 본 파일은 기본값 안전 fallback 내장.
+
+fn _global_sealed_rules_path() -> string {
+    return "/Users/ghost/Dev/nexus/shared/config/sealed_rules.json"
+}
+
+pub fn find_sealed_rules(source: string) {
+    return find_attr_rules(source, "sealed", _global_sealed_rules_path())
+}
+
+// rules → sidecar suffix (default ".sealed.hash")
+pub fn sealed_sidecar_suffix(rules) -> string {
+    if has_key(rules, "rules") {
+        let r = rules["rules"]
+        if has_key(r, "sidecar") {
+            let sc = r["sidecar"]
+            if has_key(sc, "suffix") { return sc["suffix"] }
+        }
+    }
+    return ".sealed.hash"
+}
+
+// rules → file-level 선언 감지 window (default 50 lines)
+pub fn sealed_detection_window(rules) -> int {
+    if has_key(rules, "rules") {
+        let r = rules["rules"]
+        if has_key(r, "detection_window") {
+            let dw = r["detection_window"]
+            if has_key(dw, "max_lines_for_file_decl") {
+                let mut n = 50
+                try { n = to_int(dw["max_lines_for_file_decl"]) } catch e { n = 50 }
+                return n
+            }
+        }
+    }
+    return 50
+}
+
+fn meta_sealed() {
+    let mut m = empty_meta()
+    m.name = "sealed"
+    m.category = "safety"
+    m.purpose = "파일/섹션 직접 수정 금지 선언 — 전용 attr 경유만 허용 (감지 레벨)"
+    m.cost_rule = "sidecar `.sealed.hash` 대조. 전용 attr 경유 수정 시 hash 갱신, 수동 수정 시 감지."
+    m.side_effect = "선언 없는 파일은 no-op. git hook 연동은 범위 밖 (감지만 수행)."
+    m.auto_test = "가짜 sealed md 만들어 수정 전/후 check_sealed 동작 확인"
+    m.example = "<!-- @sealed(allowed_via=@domain) -->\n// @sealed(allowed_via=\"@domain\")\n<!-- @sealed:begin -->...<!-- @sealed:end -->"
+    m.implemented = true
+    return m
+}
+
+// ─── checksum (sdbm 계열, PERF 101 회피 — O(n) 단일 패스) ───────────
+fn _sealed_checksum(content: string) {
+    let two32 = 4294967296
+    let mult = 65599
+    let mut h = 0
+    let mut i = 0
+    let n = len(content)
+    while i < n {
+        let c = ord(content.substring(i, i + 1))
+        h = (c + h * mult) % two32
+        i = i + 1
+    }
+    // 길이 결합으로 동일 sdbm 충돌 리스크 완화
+    return to_string(h) + ":" + to_string(n)
+}
+
+// ─── 선언 파서 ────────────────────────────────────────────────────
+// 파일 상단 50줄 내 `@sealed(allowed_via=...)` 또는 `@sealed:begin/end` 블록 감지.
+// 주석 3종 지원: `//` / `<!--` / `#`.
+// 반환: { file_sealed: bool, allowed_via: string, section_blocks: [[begin_line, end_line], ...] }
+fn detect_sealed_decls(lines) {
+    let mut file_sealed = false
+    let mut allowed_via = ""
+    let mut section_blocks = []
+    let mut pending_begin = -1
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        let t = line.trim()
+        let is_comment = t.starts_with("//") || t.starts_with("<!--") || t.starts_with("#")
+        if !is_comment { continue }
+
+        // 섹션 begin/end (전체 파일 대상 스캔)
+        if t.contains("@sealed:begin") {
+            pending_begin = i
+        } else if t.contains("@sealed:end") {
+            if pending_begin > 0 {
+                section_blocks = section_blocks.push([pending_begin, i])
+                pending_begin = -1
+            }
+        }
+
+        // 파일 전체 선언은 상단 50줄에서만 인정
+        if i <= 50 && !file_sealed {
+            let idx = t.index_of("@sealed(")
+            if idx >= 0 {
+                let after = t.substring(idx + 8, len(t))
+                let cp = after.index_of(")")
+                if cp >= 0 {
+                    let body = after.substring(0, cp)
+                    let parts = split(body, ",")
+                    for p in parts {
+                        let kv = p.trim()
+                        if kv.starts_with("allowed_via=") {
+                            let raw = kv.substring(12, len(kv)).trim()
+                            // 따옴표 제거
+                            let mut v = raw
+                            if v.starts_with("\"") && v.ends_with("\"") && len(v) >= 2 {
+                                v = v.substring(1, len(v) - 1)
+                            }
+                            allowed_via = v
+                            file_sealed = true
+                        }
+                    }
+                }
+            }
+        }
+    }
+    return [file_sealed, allowed_via, section_blocks]
+}
+
+// 전용 attr (caller 측) 가 수정 완료 후 호출 → sidecar hash 갱신
+// 일반 파이프라인은 이 함수를 호출하지 않으므로 자동 감지 가능.
+pub fn reseal_file(path: string, content: string) {
+    let sum = _sealed_checksum(content)
+    let sidecar = path + ".sealed.hash"
+    exec("printf '%s' '" + sum + "' > '" + sidecar + "'")
+    return sum
+}
+
+// sidecar 존재 여부
+fn _sidecar_path(path: string) {
+    return path + ".sealed.hash"
+}
+
+fn _read_sidecar(path: string) {
+    let sc = _sidecar_path(path)
+    let exists = exec("test -f '" + sc + "' && printf 1 || printf 0")
+    if exists != "1" { return "" }
+    return exec("cat '" + sc + "'")
+}
+
+// ─── 메인 검증 ────────────────────────────────────────────────────
+// source = 파일 경로 (sidecar 위치 결정용)
+// lines  = 파일 라인 배열
+// 동작:
+//   1) 선언 감지. 선언 없으면 no-op.
+//   2) sidecar 없으면 최초 봉인 → hash 저장 + info 메시지.
+//   3) sidecar 있으면 현재 콘텐츠 checksum 대조.
+//      일치 → 통과, 불일치 → error (allowed_via 유도 메시지 포함).
+fn check_sealed(source: string, lines: [string]) {
+    let mut out = []
+    let decl = detect_sealed_decls(lines)
+    let file_sealed = decl[0]
+    let allowed_via = decl[1]
+    let section_blocks = decl[2]
+
+    if !file_sealed && len(section_blocks) == 0 {
+        return out   // 선언 없으면 no-op
+    }
+
+    // 현재 파일 콘텐츠 재구성 (parts.join — PERF 101 회피)
+    let mut parts = []
+    let mut k = 0
+    while k < len(lines) {
+        parts = parts.push(lines[k])
+        k = k + 1
+    }
+    let content = parts.join("\n")
+    let current_sum = _sealed_checksum(content)
+
+    let prev = _read_sidecar(source)
+    if prev == "" {
+        // 최초 봉인
+        reseal_file(source, content)
+        let via = allowed_via
+        let mut info = "최초 봉인 완료 — 이후 수정은 `" + via + "` 경유만 허용"
+        if !file_sealed { info = "최초 섹션 봉인 완료 — 섹션 블록 " + to_string(len(section_blocks)) + "개" }
+        out = out.push(mk_msg_k("sealed", "info", source, 1, info,
+            "sealed_first_seal"))
+        return out
+    }
+
+    if prev == current_sum {
+        return out   // 일치 → 통과
+    }
+
+    // 불일치 → error
+    let mut msg = "봉인 위반 감지 — 파일이 전용 attr 경유 없이 수정됨"
+    if allowed_via != "" {
+        msg = msg + " (수정은 `" + allowed_via + "` 경유만 허용)"
+    } else if len(section_blocks) > 0 {
+        msg = msg + " (섹션 블록 " + to_string(len(section_blocks)) + "개 보호 중)"
+    }
+    out = out.push(mk_msg_k("sealed", "error", source, 1, msg,
+        "sealed_checksum_mismatch"))
+    return out
+}

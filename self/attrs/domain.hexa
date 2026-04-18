@@ -1,0 +1,344 @@
+// self/attrs/domain.hexa — @domain attr 메인 디스패처
+//
+// 목적: "궁극의 X" 도메인 생성/업데이트를 hexa-lang 으로만 자동화.
+//       외부 의존 0. Python/Rust/bash 미사용.
+//
+// 선언 형식:
+//   @domain(id="dog-robot", axis="life", name_ko="강아지 로봇", mk_target="mk1")
+//   @domain(id="sscb", axis="compute", intent="update", mk_target="mk3",
+//           prev_tag="sscb-mk2-v1.0")
+//
+// 필드 (keyword):
+//   id             *  필수  — 도메인 slug (lowercase kebab)
+//   axis           *  필수  — 10축 (self/attrs/_domain/axes.hexa)
+//   name_ko           — 한글 이름 (기본 id)
+//   intent            — "create" (기본) | "update" | "auto"
+//   product_line      — 제품 라인 이름 (기본 name_ko)
+//   mk_target         — "mk1" (기본) | "mkN"
+//   alien_now         — 7 (기본)
+//   alien_target      — 10 (기본)
+//   prev_tag          — intent=update 시 이전 git tag
+//   requires          — 선행 도메인 id (comma-separated: "a,b,c")
+//
+// 실행 경로 (intent):
+//   · create  → scaffold_domain() + append_entry()
+//   · update  → mk_bump() + patch_entry()
+//   · auto    → 이미 있으면 update, 없으면 create
+//
+// 검증 (check_domain):
+//   · axis 유효성 (axis_reason)
+//   · id 비어있지 않음 / 소문자/하이픈 only
+//   · intent 유효 ("create"|"update"|"auto")
+//   · prev_tag: intent=update + mk_target != mk1 이면 필수 (warn)
+
+use "self/attrs/core"
+use "self/attrs/_lib/error_catalog"
+use "self/attrs/_lib/rules_loader"
+use "self/attrs/_domain/axes"
+use "self/attrs/_domain/templates"
+use "self/attrs/_domain/scaffold"
+use "self/attrs/_domain/registry"
+use "self/attrs/_domain/mk_bump"
+
+// HX11 AI-native SELF-FORMAT — `.domain-rules.json` (프로젝트) / 글로벌
+// `/Users/ghost/Dev/nexus/shared/config/domain_rules.json` 에서 axes enum / defaults 주입.
+// axes 가 JSON 에 있으면 우선, 없으면 _domain/axes.hexa builtin 으로 fallback.
+
+fn _global_domain_rules_path() -> string {
+    return "/Users/ghost/Dev/nexus/shared/config/domain_rules.json"
+}
+
+pub fn find_domain_rules(source: string) {
+    return find_attr_rules(source, "domain", _global_domain_rules_path())
+}
+
+// rules → axes list (없으면 builtin axis_list())
+pub fn domain_axes_from_rules(rules) {
+    if has_key(rules, "rules") {
+        let r = rules["rules"]
+        if has_key(r, "axes") { return r["axes"] }
+    }
+    return axis_list()
+}
+
+// rules → intent default
+pub fn domain_intent_default(rules) -> string {
+    if has_key(rules, "rules") {
+        let r = rules["rules"]
+        if has_key(r, "intent_default") { return r["intent_default"] }
+    }
+    return "create"
+}
+
+// rules → mk_target default
+pub fn domain_mk_target_default(rules) -> string {
+    if has_key(rules, "rules") {
+        let r = rules["rules"]
+        if has_key(r, "mk_target_default") { return r["mk_target_default"] }
+    }
+    return "mk1"
+}
+
+fn meta_domain() {
+    let mut m = empty_meta()
+    m.name = "domain"
+    m.category = "workflow"
+    m.purpose = "궁극의 X 도메인 생성/업데이트 자동화 (외부 의존 0, self-host)"
+    m.cost_rule = "create=mkdir+write 2파일. update=§21 삽입 1파일. registry patch."
+    m.side_effect = "domains/<axis>/<id>/ 디렉토리 + 2파일. n6shared/n6/docs/domains.json 갱신."
+    m.auto_test = "seed .hexa 실행 → md 생성 → check_doc 0 위반 → 재실행 멱등"
+    m.example = "// @domain(id=\"dog-robot\", axis=\"life\", name_ko=\"강아지 로봇\", mk_target=\"mk1\")"
+    m.implemented = true
+    return m
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 파서: @domain(k=v, k="v", ...) 라인에서 keyword 추출
+// ─────────────────────────────────────────────────────────────────────────
+
+// "a=b, c=\"d, e\", f=g" → map{a:b, c:"d, e", f:g}
+// 따옴표 내부의 쉼표는 구분자로 취급하지 않음
+fn _parse_kv(body: string) {
+    let mut out = #{}
+    let chars = body.chars()
+    let mut in_str = false
+    let mut cur = ""
+    let mut items = []
+    for ch in chars {
+        let s = to_string(ch)
+        if s == "\"" {
+            in_str = !in_str
+            cur = cur + s
+            continue
+        }
+        if s == "," && !in_str {
+            items = items.push(cur)
+            cur = ""
+            continue
+        }
+        cur = cur + s
+    }
+    if cur != "" { items = items.push(cur) }
+
+    for item in items {
+        let t = item.trim()
+        let eq = t.index_of("=")
+        if eq <= 0 { continue }
+        let k = t.substring(0, eq).trim()
+        let mut v = t.substring(eq + 1, len(t)).trim()
+        // 따옴표 벗기기
+        if len(v) >= 2 && v.starts_with("\"") && v.ends_with("\"") {
+            v = v.substring(1, len(v) - 1)
+        }
+        out[k] = v
+    }
+    return out
+}
+
+// 파일 상단 @domain(...) 선언 감지 — 첫 매치. 없으면 빈 map
+fn detect_domain_decl(lines) {
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        if i > 100 { break }
+        let t = line.trim()
+        let is_comment = t.starts_with("//") || t.starts_with("<!--") || t.starts_with("#")
+        // @domain 은 코멘트 안이나 밖 모두 허용
+        let idx = t.index_of("@domain(")
+        if idx < 0 { continue }
+        // 다중 줄 지원 — ')' 탐색
+        let mut body = t.substring(idx + 8, len(t))
+        let mut combined = body
+        let close_idx = body.index_of(")")
+        if close_idx >= 0 {
+            combined = body.substring(0, close_idx)
+        } else {
+            // 이후 라인까지 모아서 ')' 찾기
+            let mut j = i  // i 는 1-based, lines 는 0-based → lines[i] 다음부터
+            while j < len(lines) {
+                let more = lines[j]
+                let cp = more.index_of(")")
+                if cp >= 0 {
+                    combined = combined + "\n" + more.substring(0, cp)
+                    break
+                }
+                combined = combined + "\n" + more
+                j = j + 1
+            }
+        }
+        let mut parsed = _parse_kv(combined)
+        parsed["_line"] = to_string(i)
+        return parsed
+    }
+    return #{}
+}
+
+// ctx 정규화 — 파싱된 kv 를 templates.hexa 의 ctx 형태로
+fn _kv_to_ctx(kv) {
+    let mut ctx = #{}
+    if has_key(kv, "id") { ctx["id"] = kv["id"] }
+    if has_key(kv, "axis") { ctx["axis"] = kv["axis"] }
+    if has_key(kv, "name_ko") { ctx["name_ko"] = kv["name_ko"] }
+    if has_key(kv, "intent") { ctx["intent"] = kv["intent"] } else { ctx["intent"] = "create" }
+    if has_key(kv, "product_line") { ctx["product_line"] = kv["product_line"] }
+    if has_key(kv, "mk_target") { ctx["mk_target"] = kv["mk_target"] }
+    if has_key(kv, "prev_tag") { ctx["prev_tag"] = kv["prev_tag"] }
+    if has_key(kv, "alien_now") {
+        let mut n = 7
+        try { n = to_int(kv["alien_now"]) } catch e { n = 7 }
+        ctx["alien_now"] = n
+    }
+    if has_key(kv, "alien_target") {
+        let mut n = 10
+        try { n = to_int(kv["alien_target"]) } catch e { n = 10 }
+        ctx["alien_target"] = n
+    }
+    if has_key(kv, "requires") {
+        let raw = kv["requires"]
+        let mut list = []
+        let ps = raw.split(",")
+        for p in ps {
+            let tp = p.trim()
+            if tp != "" { list = list.push(tp) }
+        }
+        ctx["requires"] = list
+    }
+    return ctx
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 검증 (lint-only — 실행 없이 규칙 체크)
+// ─────────────────────────────────────────────────────────────────────────
+
+fn _check_id_format(id: string) -> string {
+    if id == "" { return "id empty" }
+    if len(id) > 40 { return "id too long (max 40)" }
+    let chars = id.chars()
+    for ch in chars {
+        let s = to_string(ch)
+        let c = char_code(s, 0)
+        let is_lower = c >= 97 && c <= 122
+        let is_digit = c >= 48 && c <= 57
+        let is_dash = c == 45
+        if !is_lower && !is_digit && !is_dash {
+            return "id must be lowercase/digit/dash only, got '" + s + "'"
+        }
+    }
+    return ""
+}
+
+fn check_domain(source: string, lines) {
+    let mut out = []
+    let decl = detect_domain_decl(lines)
+    if !has_key(decl, "id") && !has_key(decl, "axis") { return out }
+
+    let line = if has_key(decl, "_line") { to_int(decl["_line"]) } else { 1 }
+
+    // id
+    let id = if has_key(decl, "id") { decl["id"] } else { "" }
+    let id_reason = _check_id_format(id)
+    if id_reason != "" {
+        let cat_key = if id == "" { "domain_id_empty" } else { "domain_id_format" }
+        out = out.push(mk_msg_k("domain", "error", source, line, id_reason, cat_key))
+    }
+
+    // axis
+    let axis = if has_key(decl, "axis") { decl["axis"] } else { "" }
+    let ax_reason = axis_reason(axis)
+    if ax_reason != "" {
+        out = out.push(mk_msg_k("domain", "error", source, line, ax_reason,
+            "domain_axis_invalid"))
+    }
+
+    // intent → 내부 변수명 goal (intent 는 hexa 예약어)
+    let goal = if has_key(decl, "intent") { decl["intent"] } else { "create" }
+    if goal != "create" && goal != "update" && goal != "auto" {
+        out = out.push(mk_msg_k("domain", "error", source, line,
+            "intent must be create|update|auto, got '" + goal + "'",
+            "domain_intent_invalid"))
+    }
+
+    // update + mk_target != mk1 → prev_tag 권장
+    if goal == "update" {
+        let mk = if has_key(decl, "mk_target") { decl["mk_target"] } else { "mk1" }
+        let prev = if has_key(decl, "prev_tag") { decl["prev_tag"] } else { "" }
+        if mk != "mk1" && prev == "" {
+            out = out.push(mk_msg_k("domain", "warn", source, line,
+                "intent=update 시 prev_tag 권장 (§21 이전 mk 의 /compare/ 링크용)",
+                "domain_prev_tag_missing"))
+        }
+    }
+
+    return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// 실행 디스패치 (run_domain) — seed .hexa 의 main() 에서 호출
+// ─────────────────────────────────────────────────────────────────────────
+
+// intent 에 따라 create | update | auto 실행
+// 반환 map: { intent, id, axis, md, md_status, claude_status, registry_status, mk_bump_status? }
+fn run_domain(ctx) {
+    let c = _ctx_or_default(ctx)
+    let mut out = #{}
+    out["intent"] = c["intent"]
+    out["id"] = c["id"]
+    out["axis"] = c["axis"]
+
+    let goal = c["intent"]
+
+    // auto → create or update 결정
+    let mut eff = goal
+    if goal == "auto" {
+        if entry_exists(c["id"]) { eff = "update" } else { eff = "create" }
+    }
+    out["effective_intent"] = eff
+
+    if eff == "create" {
+        let s = scaffold_domain(c)
+        out["dir"] = s["dir"]
+        out["md"] = s["md"]
+        out["md_status"] = s["md_status"]
+        out["claude_status"] = s["claude_status"]
+        out["registry_status"] = append_entry(c)
+        return out
+    }
+
+    if eff == "update" {
+        // md 경로 재구성
+        let md_path = domain_dir(c) + "/" + c["id"] + ".md"
+        out["md"] = md_path
+        out["mk_bump_status"] = mk_bump(md_path, c["mk_target"], c["prev_tag"], c)
+        out["registry_status"] = patch_entry(c)
+        return out
+    }
+
+    out["error"] = "unknown intent: " + eff
+    return out
+}
+
+// 파일 (source + lines) 로부터 @domain 선언 파싱 + 실행
+// seed .hexa 실행 시 편의 API. 반환: run_domain out map
+fn dispatch_domain(source: string, lines) {
+    let decl = detect_domain_decl(lines)
+    let ctx = _kv_to_ctx(decl)
+    return run_domain(ctx)
+}
+
+// 요약 출력 (사용자 친화 한글)
+fn format_run_result(res) -> string {
+    let mut parts = []
+    parts.push("─ @domain 실행 결과 ─\n")
+    if has_key(res, "id") { parts.push("id: " + res["id"] + "\n") }
+    if has_key(res, "axis") { parts.push("axis: " + res["axis"] + "\n") }
+    if has_key(res, "intent") { parts.push("intent: " + res["intent"] + "\n") }
+    if has_key(res, "effective_intent") { parts.push("effective: " + res["effective_intent"] + "\n") }
+    if has_key(res, "dir") { parts.push("dir: " + res["dir"] + "\n") }
+    if has_key(res, "md") { parts.push("md: " + res["md"] + "\n") }
+    if has_key(res, "md_status") { parts.push("md 상태: " + res["md_status"] + "\n") }
+    if has_key(res, "claude_status") { parts.push("CLAUDE.md 상태: " + res["claude_status"] + "\n") }
+    if has_key(res, "mk_bump_status") { parts.push("mk_bump: " + res["mk_bump_status"] + "\n") }
+    if has_key(res, "registry_status") { parts.push("registry: " + res["registry_status"] + "\n") }
+    if has_key(res, "error") { parts.push("오류: " + res["error"] + "\n") }
+    return parts.join("")
+}

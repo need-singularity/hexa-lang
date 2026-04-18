@@ -1,0 +1,660 @@
+// self/attrs/readme.hexa — README.md 양식 강제 검증 attr
+// @readme(scope=<name>) — scope 별 필수 섹션 세트 + 코드블록/.md 링크/봉인 강제
+// 파일 생성/scaffold 는 @domain 담당. 본 attr 은 검증 + 봉인 관리.
+//
+// 사용:
+//   <!-- @readme(scope=root) -->    레포 최상위 README.md
+//   <!-- @readme(scope=project) --> 서브 프로젝트 README.md
+//   <!-- @readme(scope=domain) -->  domains/<axis>/<id>/README.md
+//   <!-- @readme(scope=attr-doc) --> hexa-lang attr 문서 등 자체 정의 scope
+//
+// 규칙 소스 (SSOT):
+//   1) 프로젝트 root 의 `.readme-rules.json`  — 독립 규약. `_meta.inherit=false` 가 기본.
+//   2) 없으면 global fallback `/Users/ghost/Dev/nexus/shared/config/readme_rules.json`.
+//   3) 둘 다 없으면 내장 default (readme_builtin_rules()).
+//
+// raw 봉인:
+//   - scope_cfg.require_sealed == true 이면 `<readme_path>.sealed.hash` sidecar 강제.
+//   - 최초 검증 시 sidecar 없으면 현재 checksum 으로 생성 + info 로그, 통과.
+//   - sidecar 있으나 hash 불일치 → "직접 수정 감지" error.
+//   - @readme/@domain/@publish 가 정식 수정 후 `_readme_reseal(path)` 호출하면 hash 재기록.
+
+use "self/attrs/core"
+use "self/attrs/_lib/error_catalog"
+use "self/attrs/_lib/paper_utils"
+use "self/attrs/_lib/ascii_utils"
+use "self/attrs/_lib/rules_loader"
+
+// ─────────────────────────────────────────────────────────────
+// meta
+// ─────────────────────────────────────────────────────────────
+
+fn meta_readme() {
+    let mut m = empty_meta()
+    m.name = "readme"
+    m.category = "meta"
+    m.purpose = "README.md 양식 강제 검증 + raw 봉인 — scope 별 필수 섹션 / 코드블록 / md 링크 / sealed hash"
+    m.cost_rule = "scope=root/project/domain/자체정의 별 rules. 누락=error. require_sealed=true면 hash 대조."
+    m.side_effect = "sidecar `<path>.sealed.hash` 자동 생성(최초). 정식 수정 후 _readme_reseal 필요."
+    m.auto_test = "repo root README.md / domains/<axis>/<id>/README.md / .readme-rules.json"
+    m.example = "<!-- @readme(scope=root) --> + .readme-rules.json { scopes.root.require_sealed: true }"
+    m.implemented = true
+    return m
+}
+
+// ─────────────────────────────────────────────────────────────
+// 내장 default rules — 규칙 파일이 없을 때만 사용
+// ─────────────────────────────────────────────────────────────
+
+fn readme_builtin_rules() {
+    let mut r = #{}
+    let mut meta = #{}
+    meta["project"] = "_builtin"
+    meta["version"] = 1
+    meta["inherit"] = false
+    r["_meta"] = meta
+
+    let mut scopes = #{}
+
+    let mut root = #{}
+    root["sections"] = ["Overview", "Quick Start", "Architecture", "Domains", "Contributing", "License"]
+    root["require_codeblock"] = false
+    root["require_mdlink"] = false
+    root["require_sealed"] = false
+    scopes["root"] = root
+
+    let mut project = #{}
+    project["sections"] = ["Purpose", "Usage", "Structure", "Dependencies", "Test", "License"]
+    project["require_codeblock"] = true
+    project["require_mdlink"] = false
+    project["require_sealed"] = false
+    scopes["project"] = project
+
+    // scope=domain 은 builtin 에서는 별도 "요약/외계인지수/빠른참조" 4대 단서 로직 유지 (아래 _check_domain_hints)
+    let mut domain = #{}
+    domain["sections"] = []
+    domain["require_codeblock"] = false
+    domain["require_mdlink"] = true
+    domain["require_sealed"] = false
+    domain["_domain_hints"] = true
+    scopes["domain"] = domain
+
+    r["scopes"] = scopes
+    return r
+}
+
+// ─────────────────────────────────────────────────────────────
+// @readme(scope=X) 마커 파싱
+// ─────────────────────────────────────────────────────────────
+
+// 상단 50줄 내 `@readme(...)` 마커에서 scope 추출
+// 코멘트 3종 지원: `<!--` / `//` / `#`
+// 반환: [scope_string, found_bool]
+fn detect_readme_marker(lines) {
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        if i > 50 { break }
+        let t = line.trim()
+        let is_comment = t.starts_with("<!--") || t.starts_with("//") || t.starts_with("#")
+        if !is_comment { continue }
+        let idx = t.index_of("@readme")
+        if idx < 0 { continue }
+        let after = t.substring(idx + 7, len(t))
+        let open = after.index_of("(")
+        // 괄호 없는 @readme → scope 미지정 취급
+        if open < 0 {
+            return ["", true]
+        }
+        let close = after.index_of(")")
+        if close < 0 {
+            return ["", true]
+        }
+        let body = after.substring(open + 1, close)
+        let parts = body.split(",")
+        for p in parts {
+            let kv = p.trim()
+            if kv.starts_with("scope=") {
+                return [kv.substring(6, len(kv)).trim(), true]
+            }
+        }
+        // 괄호 있으나 scope 키 없음
+        return ["", true]
+    }
+    return ["", false]
+}
+
+// ─────────────────────────────────────────────────────────────
+// 규칙 파일 로더 — 프로젝트 `.readme-rules.json` 우선, 없으면 글로벌 fallback
+// ─────────────────────────────────────────────────────────────
+
+fn _global_readme_rules_path() -> string {
+    let raw = env("HEXA_README_RULES")
+    if raw != "" { return raw }
+    return "/Users/ghost/Dev/nexus/shared/config/readme_rules.json"
+}
+
+// stage0 는 method `last_index_of` 가 없으므로 내부 헬퍼 사용
+fn _readme_last_idx(s: string, needle: string) -> int {
+    let mut found = -1
+    let mut i = 0
+    let sn = len(s)
+    let nn = len(needle)
+    if nn == 0 || sn < nn { return -1 }
+    while i <= sn - nn {
+        if s.substring(i, i + nn) == needle { found = i }
+        i = i + 1
+    }
+    return found
+}
+
+// attr_cli.hexa run_lint 가 /tmp/.hexa_readme_lint_target 에 현재 lint 대상 경로를 기록한다.
+// 그것을 최우선 참조 (check_readme 가 source 로 내용을 받았을 때의 해결책).
+fn _read_lint_target_sidecar() -> string {
+    let p = "/tmp/.hexa_readme_lint_target"
+    let exists = to_string(exec("test -f '" + p + "' && printf 1 || printf 0")).trim()
+    if exists != "1" { return "" }
+    let mut raw = ""
+    try { raw = to_string(read_file(p)) } catch e { raw = "" }
+    return raw.trim()
+}
+
+// md 파일 경로에서 상위로 거슬러 올라가며 `.readme-rules.{json,hexa}` / `readme_rules.json` 탐색.
+// 찾으면 경로 반환, 못 찾으면 "".
+// 해석 순서:
+//   1) source_path 가 실제 경로이면 그것
+//   2) 아니면 /tmp/.hexa_readme_lint_target sidecar
+//   3) 아니면 pwd + /README.md 시드
+fn _find_project_rules_path(source_path: string) -> string {
+    let candidates = [".readme-rules.json", ".readme-rules.hexa", "readme_rules.json"]
+    let mut cur = source_path
+    // source_path 가 경로처럼 보이지 않거나 줄바꿈 포함 (내용 추정) → sidecar 또는 pwd 시드
+    let looks_like_path = cur.starts_with("/") || cur.contains("/")
+    let has_newline = cur.contains("\n")
+    if cur == "" || !looks_like_path || has_newline {
+        let side = _read_lint_target_sidecar()
+        if side != "" {
+            cur = side
+        } else {
+            let pwd = to_string(exec("pwd")).trim()
+            if pwd != "" { cur = pwd + "/README.md" } else { return "" }
+        }
+    } else if !cur.starts_with("/") {
+        let pwd = to_string(exec("pwd")).trim()
+        if pwd != "" { cur = pwd + "/" + cur }
+    }
+    // md 파일 경로 → 상위 디렉토리부터 시작
+    let last_slash0 = _readme_last_idx(cur, "/")
+    if last_slash0 > 0 { cur = cur.substring(0, last_slash0) }
+    let mut hops = 0
+    while hops < 32 {
+        hops = hops + 1
+        if cur == "" || cur == "." { break }
+        for name in candidates {
+            let probe = cur + "/" + name
+            let exists = to_string(exec("test -f '" + probe + "' && printf 1 || printf 0")).trim()
+            if exists == "1" { return probe }
+        }
+        if cur == "/" { break }
+        let ls = _readme_last_idx(cur, "/")
+        if ls <= 0 { break }
+        let parent = cur.substring(0, ls)
+        if parent == cur { break }
+        cur = if parent == "" { "/" } else { parent }
+    }
+    return ""
+}
+
+// 파일 로드 + json_parse. 실패 시 empty map.
+fn _load_rules_file(path: string) {
+    if path == "" { return #{} }
+    let exists = to_string(exec("test -f '" + path + "' && printf 1 || printf 0")).trim()
+    if exists != "1" { return #{} }
+    let mut raw = ""
+    try { raw = to_string(read_file(path)) } catch e { raw = "" }
+    if raw == "" { return #{} }
+    let mut parsed = #{}
+    try { parsed = json_parse(raw) } catch e { parsed = #{} }
+    return parsed
+}
+
+// rules 정규화 — scopes / custom_scopes 키 보강
+fn _normalize_rules(r) {
+    let mut out = r
+    if !has_key(out, "scopes")        { out["scopes"] = #{} }
+    if !has_key(out, "custom_scopes") { out["custom_scopes"] = #{} }
+    if !has_key(out, "_meta") {
+        let mut m = #{}
+        m["project"] = "unknown"
+        m["version"] = 1
+        out["_meta"] = m
+    }
+    return out
+}
+
+// 프로젝트 자기양식 우선, inherit=true 일 때만 global 병합, 둘 다 없으면 builtin.
+// 반환: rules map (`_meta`, `scopes`, `custom_scopes`)
+fn find_readme_rules(source: string) {
+    let proj_path = _find_project_rules_path(source)
+    let proj_raw = if proj_path != "" { _load_rules_file(proj_path) } else { #{} }
+    let proj_ok = has_key(proj_raw, "scopes") || has_key(proj_raw, "custom_scopes")
+
+    let mut inherit = false
+    if has_key(proj_raw, "_meta") {
+        let m = proj_raw["_meta"]
+        if has_key(m, "inherit") && m["inherit"] == true { inherit = true }
+    }
+
+    // (A) 프로젝트 파일 있고 inherit=false → 단독 사용
+    if proj_path != "" && !inherit && proj_ok {
+        return _normalize_rules(proj_raw)
+    }
+
+    // global fallback
+    let global_raw = _load_rules_file(_global_readme_rules_path())
+    let global_ok = has_key(global_raw, "scopes") || has_key(global_raw, "custom_scopes")
+
+    // (B) 프로젝트 파일 있고 inherit=true → scopes + custom_scopes merge (프로젝트가 override)
+    if proj_path != "" && inherit && proj_ok {
+        if global_ok {
+            let proj = _normalize_rules(proj_raw)
+            let global = _normalize_rules(global_raw)
+            let mut merged = #{}
+            merged["_meta"] = if has_key(proj, "_meta") { proj["_meta"] } else { #{} }
+            // scopes merge (project overrides global)
+            let mut out_scopes = #{}
+            for k in keys(global["scopes"]) { out_scopes[k] = global["scopes"][k] }
+            for k in keys(proj["scopes"])   { out_scopes[k] = proj["scopes"][k] }
+            merged["scopes"] = out_scopes
+            // custom_scopes merge (project overrides global)
+            let mut out_customs = #{}
+            for k in keys(global["custom_scopes"]) { out_customs[k] = global["custom_scopes"][k] }
+            for k in keys(proj["custom_scopes"])   { out_customs[k] = proj["custom_scopes"][k] }
+            merged["custom_scopes"] = out_customs
+            return merged
+        }
+        return _normalize_rules(proj_raw)
+    }
+
+    // (C) 프로젝트 파일 없음 → global 또는 builtin
+    if global_ok { return _normalize_rules(global_raw) }
+    return _normalize_rules(readme_builtin_rules())
+}
+
+// scope lookup — scopes + custom_scopes 모두 검사
+// 반환: [spec_map, found_bool]
+fn _lookup_scope(rules, sc: string) {
+    if has_key(rules, "scopes") {
+        let s = rules["scopes"]
+        if has_key(s, sc) { return [s[sc], true] }
+    }
+    if has_key(rules, "custom_scopes") {
+        let c = rules["custom_scopes"]
+        if has_key(c, sc) { return [c[sc], true] }
+    }
+    return [#{}, false]
+}
+
+// ─────────────────────────────────────────────────────────────
+// raw 봉인 — checksum / sidecar / reseal
+// ─────────────────────────────────────────────────────────────
+
+// sealed.hexa 의 _sealed_checksum 과 동일 알고리즘 (sdbm + len 결합)
+// sealed 모듈에 use 의존을 피하기 위해 복제. 수정 시 양쪽 동기화 필수.
+fn _readme_checksum(content: string) -> string {
+    let two32 = 4294967296
+    let mult = 65599
+    let mut h = 0
+    let mut i = 0
+    let n = len(content)
+    while i < n {
+        let c = ord(content.substring(i, i + 1))
+        h = (c + h * mult) % two32
+        i = i + 1
+    }
+    return to_string(h) + ":" + to_string(n)
+}
+
+// lines 배열 → 단일 content 문자열 (줄바꿈 결합, 원본 그대로)
+fn _lines_to_content(lines) -> string {
+    let mut content = ""
+    let mut k = 0
+    let n = len(lines)
+    while k < n {
+        if k > 0 { content = content + "\n" }
+        content = content + lines[k]
+        k = k + 1
+    }
+    return content
+}
+
+fn _readme_sidecar_path(source: string) -> string {
+    return source + ".sealed.hash"
+}
+
+// sidecar 읽기 — 없으면 "" 반환
+fn _read_readme_sidecar(source: string) -> string {
+    let sc = _readme_sidecar_path(source)
+    let exists = to_string(exec("test -f '" + sc + "' && printf 1 || printf 0")).trim()
+    if exists != "1" { return "" }
+    return to_string(exec("cat '" + sc + "'")).trim()
+}
+
+// 정식 수정 후 호출 — hash 재기록. @readme/@domain/@publish 가 README 쓰기 직후 사용.
+// path = README 실제 파일경로.
+pub fn _readme_reseal(path: string) -> string {
+    let mut content = ""
+    try { content = to_string(read_file(path)) } catch e { content = "" }
+    if content == "" { return "error: read failed" }
+    let sum = _readme_checksum(content)
+    let sc = _readme_sidecar_path(path)
+    exec("printf '%s' '" + sum + "' > '" + sc + "'")
+    return sum
+}
+
+// ─────────────────────────────────────────────────────────────
+// 내부 헬퍼 — 섹션/본문 감지 (기존 로직 유지)
+// ─────────────────────────────────────────────────────────────
+
+// `## SECTION` 뿐 아니라 `# SECTION` / `### SECTION` / `## §N SECTION` 도 인식
+fn _has_heading(lines, needle: string) {
+    for line in lines {
+        let t = line.trim()
+        if !t.starts_with("#") { continue }
+        let mut k = 0
+        let n = len(t)
+        while k < n && t.substring(k, k+1) == "#" {
+            k = k + 1
+        }
+        let rest = t.substring(k, n).trim()
+        if rest.contains(needle) { return true }
+    }
+    return false
+}
+
+fn _has_exec_codeblock(lines) {
+    for line in lines {
+        let t = line.trim()
+        if t.starts_with("```hexa") { return true }
+        if t.starts_with("```bash") { return true }
+        if t.starts_with("```sh")   { return true }
+        if t.starts_with("```zsh")  { return true }
+    }
+    return false
+}
+
+fn _count_relative_md_links(lines) {
+    let mut count = 0
+    for line in lines {
+        let t = line
+        let mut from = 0
+        let n = len(t)
+        while from < n {
+            let open = t.substring(from, n).index_of("](")
+            if open < 0 { break }
+            let abs = from + open + 2
+            if abs >= n { break }
+            let tail = t.substring(abs, n)
+            let close = tail.index_of(")")
+            if close < 0 { break }
+            let url = tail.substring(0, close).trim()
+            let is_http = url.starts_with("http://") || url.starts_with("https://")
+            let is_md = url.contains(".md")
+            if is_md && !is_http {
+                count = count + 1
+            }
+            from = abs + close + 1
+        }
+    }
+    return count
+}
+
+// ─── scope=domain 4대 단서 (builtin 전용 유지) ───
+
+fn _has_summary_line(lines) {
+    let mut saw_h1 = false
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        let t = line.trim()
+        if !saw_h1 {
+            if t.starts_with("# ") { saw_h1 = true }
+            continue
+        }
+        if t == "" { continue }
+        if t.starts_with("#") { return false }
+        if t.starts_with("<!--") { continue }
+        if t.starts_with("---") { continue }
+        if t.starts_with("[![") { continue }
+        return true
+    }
+    return false
+}
+
+fn _has_alien_index_hint(lines) {
+    for line in lines {
+        if line.contains("alien_index") { return true }
+        if line.contains("외계인 지수") { return true }
+        if line.contains("외계지수")    { return true }
+        if line.contains("Alien Index") { return true }
+    }
+    return false
+}
+
+fn _has_prereq_hint(lines) {
+    for line in lines {
+        if line.contains("선행 도메인") { return true }
+        if line.contains("선행 조건")   { return true }
+        if line.contains("prerequisites") { return true }
+        if line.contains("requires:")   { return true }
+        if line.contains("Requires")    { return true }
+    }
+    return false
+}
+
+fn _has_quick_ref_hint(lines) {
+    for line in lines {
+        if line.contains("빠른 참조") { return true }
+        if line.contains("Quick Ref") { return true }
+        if line.contains("Quick Reference") { return true }
+    }
+    return false
+}
+
+fn _mentions_claude_md(lines) {
+    for line in lines {
+        if line.contains("CLAUDE.md") { return true }
+    }
+    return false
+}
+
+fn _check_domain_hints(lines) {
+    let mut miss_parts = []
+    if !_has_summary_line(lines) {
+        miss_parts = miss_parts.push("요약 1줄 (H1 제목 아래)")
+    }
+    let md_links = _count_relative_md_links(lines)
+    if md_links < 1 {
+        miss_parts = miss_parts.push("관련 문서 (.md 상대링크 최소 1개)")
+    }
+    if !_mentions_claude_md(lines) {
+        miss_parts = miss_parts.push("CLAUDE.md 참조")
+    }
+    if !_has_prereq_hint(lines) {
+        miss_parts = miss_parts.push("선행 도메인 (requires/선행/prerequisites)")
+    }
+    if !_has_alien_index_hint(lines) {
+        miss_parts = miss_parts.push("외계인 지수 (alien_index/외계인지수)")
+    }
+    if !_has_quick_ref_hint(lines) {
+        miss_parts = miss_parts.push("빠른 참조 (Quick Ref/빠른 참조)")
+    }
+    return miss_parts
+}
+
+// ─────────────────────────────────────────────────────────────
+// scope_cfg 필드 safe getter
+// ─────────────────────────────────────────────────────────────
+
+fn _cfg_bool(cfg, key: string, default_val: bool) -> bool {
+    if !has_key(cfg, key) { return default_val }
+    let v = cfg[key]
+    if v == true { return true }
+    if v == false { return false }
+    return default_val
+}
+
+fn _cfg_sections(cfg) {
+    if !has_key(cfg, "sections") { return [] }
+    return cfg["sections"]
+}
+
+// ─────────────────────────────────────────────────────────────
+// check_readme — 메인 검증
+// ─────────────────────────────────────────────────────────────
+
+fn check_readme(source: string, lines: [string]) {
+    let mut out = []
+    let detected = detect_readme_marker(lines)
+    let detected_scope = detected[0]
+    let found = detected[1]
+
+    // @readme 마커 없으면 skip
+    if !found { return out }
+
+    // scope 미지정 → warn, default "project"
+    let mut effective = detected_scope
+    if effective == "" {
+        out = out.push(mk_msg_k("readme", "warn", source, 1,
+            "@readme scope 미지정 — 'project' 기본값으로 진행 (scope 명시 권장)",
+            "readme_scope_missing"))
+        effective = "project"
+    }
+
+    // 규칙 로드 (경로 기반 — source 는 파일 경로 우선, 내용이면 pwd 기반 탐색)
+    let rules = find_readme_rules(source)
+    let no_scopes = !has_key(rules, "scopes") && !has_key(rules, "custom_scopes")
+    if no_scopes {
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "@readme: 규칙 소스 없음 — .readme-rules.json 도, 글로벌 fallback 도 로드 실패",
+            "readme_section_missing"))
+        return out
+    }
+    // scopes 또는 custom_scopes 에서 찾기
+    let lookup = _lookup_scope(rules, effective)
+    let spec_found = lookup[1]
+    if !spec_found {
+        let mut have = []
+        if has_key(rules, "scopes") {
+            for k in keys(rules["scopes"]) { have = have.push(k) }
+        }
+        if has_key(rules, "custom_scopes") {
+            for k in keys(rules["custom_scopes"]) { have = have.push(k + "(custom)") }
+        }
+        let list_s = if len(have) > 0 { join(have, ", ") } else { "(없음)" }
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "@readme: 프로젝트 규칙에 scope='" + effective + "' 없음 (정의: " + list_s + ")",
+            "readme_scope_invalid"))
+        return out
+    }
+    let scope_cfg = lookup[0]
+
+    // ─── 필수 섹션 ───
+    let required = _cfg_sections(scope_cfg)
+    let mut missing = []
+    for sec in required {
+        if !_has_heading(lines, sec) { missing = missing.push(sec) }
+    }
+    if len(missing) > 0 {
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "@readme(scope=" + effective + ") 필수 섹션 누락: " + join(missing, ", "),
+            "readme_section_missing"))
+    }
+
+    // ─── require_codeblock ───
+    if _cfg_bool(scope_cfg, "require_codeblock", false) {
+        if !_has_exec_codeblock(lines) {
+            out = out.push(mk_msg_k("readme", "error", source, 1,
+                "@readme(scope=" + effective + ") 실행 가능 코드블록 (hexa|bash|sh|zsh) 최소 1개 필요",
+                "readme_codeblock_missing"))
+        }
+    }
+
+    // ─── require_mdlink ───
+    if _cfg_bool(scope_cfg, "require_mdlink", false) {
+        if _count_relative_md_links(lines) < 1 {
+            out = out.push(mk_msg_k("readme", "error", source, 1,
+                "@readme(scope=" + effective + ") .md 상대링크 최소 1개 필요",
+                "readme_section_missing"))
+        }
+    }
+
+    // ─── scope=domain 4대 단서 (builtin 호환 모드) ───
+    if _cfg_bool(scope_cfg, "_domain_hints", false) || (effective == "domain" && len(required) == 0) {
+        let miss_parts = _check_domain_hints(lines)
+        if len(miss_parts) > 0 {
+            out = out.push(mk_msg_k("readme", "error", source, 1,
+                "@readme(scope=domain) 필수 요소 누락: " + join(miss_parts, ", "),
+                "readme_domain_elements_missing"))
+        }
+    }
+
+    // ─── ASCII 통일성 (전 scope 공통) ───
+    let report = ascii_uniformity_report(lines)
+    if report[0] {
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "README ASCII box 문자 혼재 (unicode ┌─┐ vs ascii7 +-| 등 2종 이상)",
+            "readme_ascii_box_mix"))
+    }
+    if report[1] {
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "README ASCII bar 문자 혼재 (█ ■ ● 중 2종 이상)",
+            "readme_ascii_bar_mix"))
+    }
+    if report[2] {
+        out = out.push(mk_msg_k("readme", "error", source, 1,
+            "README 화살표 혼재 (→↓↑← vs -> <-)",
+            "readme_ascii_arrow_mix"))
+    }
+    if report[3] {
+        out = out.push(mk_msg_k("readme", "warn", source, 1,
+            "README 트리 문자 혼재 (├└│ vs |-- \\--)",
+            "readme_ascii_tree_mix"))
+    }
+
+    // ─── require_sealed → raw 봉인 검증 ───
+    if _cfg_bool(scope_cfg, "require_sealed", false) {
+        let content = _lines_to_content(lines)
+        let current_sum = _readme_checksum(content)
+        let prev = _read_readme_sidecar(source)
+        if prev == "" {
+            // 최초 봉인 자동 저장 → 통과 + info
+            let sc = _readme_sidecar_path(source)
+            exec("printf '%s' '" + current_sum + "' > '" + sc + "'")
+            out = out.push(mk_msg_k("readme", "info", source, 1,
+                "@readme(scope=" + effective + ") 최초 봉인 완료 — 이후 직접 수정 감지 활성화 (sidecar: " + sc + ")",
+                "sealed_first_seal"))
+        } else if prev != current_sum {
+            out = out.push(mk_msg_k("readme", "error", source, 1,
+                "@readme(scope=" + effective + ") 직접 수정 감지 — README 가 @readme/@domain/@publish 경유 없이 변경됨 (sidecar: " + _readme_sidecar_path(source) + ", 복구: 정식 attr 경유 수정 후 _readme_reseal 호출)",
+                "readme_seal_violation"))
+        }
+        // 일치 → 통과 (메시지 없음)
+    }
+
+    return out
+}
+
+// ─────────────────────────────────────────────────────────────
+// 하위 호환 — scope 별 required sections 질의 (기존 caller 보존)
+// ─────────────────────────────────────────────────────────────
+
+fn readme_required_sections(sc: string) {
+    // 규칙 파일을 몰라도 builtin 기준으로 답하도록 유지
+    let rules = readme_builtin_rules()
+    let scopes = rules["scopes"]
+    if has_key(scopes, sc) {
+        return _cfg_sections(scopes[sc])
+    }
+    return []
+}
