@@ -10064,6 +10064,18 @@ HexaVal gen2_expr(HexaVal node) {
                 a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_bool(access(HX_STR("), a), hexa_str("), F_OK) == 0)")));
             }
+            /* FIX-A (Anima serving unblock, 2026-04-18): time_ms/byte_len/dict_keys builtins */
+            if (hexa_truthy(hexa_eq(name, hexa_str("time_ms")))) {
+                return __hexa_fn_arena_return(hexa_str("hexa_time_ms()"));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("byte_len")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_byte_len("), a), hexa_str(")")));
+            }
+            if (hexa_truthy(hexa_eq(name, hexa_str("dict_keys")))) {
+                a = gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_356), hexa_int(0)));
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_dict_keys("), a), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("format")))) {
                 HexaVal fmt_args = hexa_str("hexa_array_new()");
                 HexaVal fi = hexa_int(1);
@@ -12125,6 +12137,16 @@ HexaVal _is_builtin_name(HexaVal name) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("is_alphanumeric")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    /* FIX-A (Anima serving unblock, 2026-04-18) */
+    if (hexa_truthy(hexa_eq(name, hexa_str("time_ms")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("byte_len")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("dict_keys")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("true")))) {
