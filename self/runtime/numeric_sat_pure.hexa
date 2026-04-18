@@ -1,0 +1,280 @@
+// self/runtime/numeric_sat_pure.hexa — Wave 1 runtime port (saturating numeric conv + float format)
+//
+// Pure-Hexa ports of three C runtime helpers that conv_pure.hexa does
+// not cover verbatim:
+//
+//   hexa_float_to_int     (runtime.c:4472) → float_to_int_saturating_pure
+//   hexa_format_float     (runtime.c:3305) → format_float_pure
+//   hexa_format_float_sci (runtime.c:3313) → format_float_sci_pure
+//
+// Why separate from conv_pure:
+//   - conv_pure::to_int_pure uses an iterative digit-subtract scheme that
+//     truncates toward zero using only hexa int ops (works around the
+//     absence of a cast intrinsic). It DOES NOT replicate the C
+//     saturating-clamp behaviour (NaN/Inf -> 0, out-of-range -> INT64
+//     sentinel). The runtime uses the saturating form from the `to_int`
+//     builtin path; this module provides that exact semantics.
+//   - format_float / format_float_sci are the only two C runtime entries
+//     for decimal-with-precision and scientific-with-precision output.
+//     Pure-hexa versions keep `%.<prec>f` and `%.<prec>e` style output
+//     without linking snprintf — sufficient for log / debug / stdlib
+//     consumers of `format_float(x, 6)` style calls. Rounding matches
+//     half-away-from-zero (the portable C default for %f).
+//
+// ADDITIVE — runtime.c remains the SSOT for codegen-emitted calls; this
+// file is the interpose reference impl and what
+// `import "self/runtime/numeric_sat_pure"` resolves to.
+//
+// Pitfalls honoured (CLAUDE.md HX3):
+//   P1  no semicolons
+//   P15 let mut for reassigned locals
+//   P29 .push() returns new array
+//   P39 no 0b binary literals — use decimal constants
+
+// ── float_to_int_saturating_pure ──────────────────────────────────
+// Mirrors hexa_float_to_int. Behaviour:
+//   NaN  -> 0
+//   +Inf -> 0x7fffffffffffffff  (INT64_MAX)
+//   -Inf -> 0x8000000000000000  (INT64_MIN, as int64 two's complement)
+//   otherwise -> truncation toward zero clamped to int64 range
+//
+// Constants match the C source: 9.2233720368547758e+18 ≈ 2^63 boundary.
+//
+// Note: hexa int is 64-bit signed. INT64_MIN is `0 - 0x7fffffffffffffff - 1`
+// = -9223372036854775808. We build it as two decimal literals because
+// the hexa surface parser has no hex-literal-with-leading-bit-63 form.
+@pure
+pub fn float_to_int_saturating_pure(f) {
+    if type_of(f) != "float" {
+        // Accept int pass-through: identity in the saturating sense.
+        if type_of(f) == "int" { return f }
+        return 0
+    }
+    // NaN check: in IEEE-754, NaN != NaN.
+    if f != f { return 0 }
+    // Inf checks via magnitude comparison against the 2^63 threshold
+    // used by the C runtime.
+    let MAX_BOUND = 9.2233720368547758e+18
+    let MIN_BOUND = 0.0 - 9.2233720368547758e+18
+    if f >= MAX_BOUND {
+        // INT64_MAX = 9223372036854775807 — literal form
+        return 9223372036854775807
+    }
+    if f <= MIN_BOUND {
+        // INT64_MIN = -9223372036854775808 — built as (-MAX-1) to avoid
+        // literal lexing of the boundary number
+        return 0 - 9223372036854775807 - 1
+    }
+    // In-range: truncate toward zero using iterative digit-subtract.
+    // Matches the behaviour of conv_pure::to_int_pure for finite reals.
+    let mut sign = 1
+    let mut x = f
+    if x < 0.0 {
+        sign = 0 - 1
+        x = 0.0 - x
+    }
+    let mut result = 0
+    let mut remaining = x
+    let mut power = 1
+    while to_float(power) * 10.0 <= remaining {
+        power = power * 10
+    }
+    while power >= 1 {
+        let fp = to_float(power)
+        let mut digit = 0
+        while to_float(digit + 1) * fp <= remaining {
+            digit = digit + 1
+        }
+        result = result + digit * power
+        remaining = remaining - to_float(digit) * fp
+        power = power / 10
+    }
+    result * sign
+}
+
+// ── _rep (internal) — return s repeated n times ────────────────────
+@pure
+fn _rep(s, n) {
+    if n <= 0 { return "" }
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        parts = parts.push(s)
+        i = i + 1
+    }
+    parts.join("")
+}
+
+// ── _int_abs_digits (internal) — non-negative int to decimal string.
+@pure
+fn _int_abs_digits(n) {
+    if n == 0 { return "0" }
+    let digits = "0123456789"
+    let mut v = n
+    if v < 0 { v = 0 - v }
+    let mut out = ""
+    while v > 0 {
+        let d = v % 10
+        out = digits.substring(d, d + 1) + out
+        v = v / 10
+    }
+    out
+}
+
+// ── _pow10_f (internal) — 10.0^k as float via repeated multiply.
+@pure
+fn _pow10_f(k) {
+    let mut v = 1.0
+    let mut i = 0
+    while i < k {
+        v = v * 10.0
+        i = i + 1
+    }
+    v
+}
+
+// ── format_float_pure ─────────────────────────────────────────────
+// Mirrors hexa_format_float. C body:
+//   snprintf(buf, 64, "%.*f", p, v)
+// Produces fixed-point "[-]D+.d{prec}" with half-away-from-zero
+// rounding. Precision is clamped to 0..18 to stay within int64 scale.
+@pure
+pub fn format_float_pure(f, prec) {
+    let mut p = prec
+    if type_of(p) != "int" { p = 6 }
+    if p < 0 { p = 0 }
+    if p > 18 { p = 18 }
+
+    let mut x = 0.0
+    let tf = type_of(f)
+    if tf == "float" { x = f }
+    else if tf == "int" { x = to_float(f) }
+    else { return "0" }
+
+    // NaN / Inf: match C's %f-style output.
+    if x != x { return "nan" }
+    if x > 1.0e308 { return "inf" }
+    if x < 0.0 - 1.0e308 { return "-inf" }
+
+    let mut neg = false
+    if x < 0.0 {
+        neg = true
+        x = 0.0 - x
+    }
+
+    // Scale up by 10^prec and round-half-up, then split.
+    let scale = _pow10_f(p)
+    let scaled = x * scale + 0.5
+    let whole_f = scaled  // float view; truncate below
+    let scaled_int = float_to_int_saturating_pure(whole_f)
+    let denom = float_to_int_saturating_pure(scale)
+    let mut int_part = 0
+    let mut frac_part = 0
+    if denom <= 0 {
+        int_part = scaled_int
+        frac_part = 0
+    } else {
+        int_part = scaled_int / denom
+        frac_part = scaled_int - int_part * denom
+    }
+
+    let int_str = _int_abs_digits(int_part)
+    let mut frac_str = ""
+    if p > 0 {
+        let raw = _int_abs_digits(frac_part)
+        let pad = p - len(raw)
+        if pad > 0 {
+            frac_str = _rep("0", pad) + raw
+        } else {
+            frac_str = raw
+        }
+    }
+
+    let sign = if neg { "-" } else { "" }
+    if p == 0 { return sign + int_str }
+    sign + int_str + "." + frac_str
+}
+
+// ── format_float_sci_pure ─────────────────────────────────────────
+// Mirrors hexa_format_float_sci. C body:
+//   snprintf(buf, 64, "%.*e", p, v)
+// Produces "d.d{prec}e[+-]dd" with half-away-from-zero rounding.
+@pure
+pub fn format_float_sci_pure(f, prec) {
+    let mut p = prec
+    if type_of(p) != "int" { p = 6 }
+    if p < 0 { p = 0 }
+    if p > 18 { p = 18 }
+
+    let mut x = 0.0
+    let tf = type_of(f)
+    if tf == "float" { x = f }
+    else if tf == "int" { x = to_float(f) }
+    else { return "0e+00" }
+
+    if x != x { return "nan" }
+    if x > 1.0e308 { return "inf" }
+    if x < 0.0 - 1.0e308 { return "-inf" }
+
+    let mut neg = false
+    if x < 0.0 {
+        neg = true
+        x = 0.0 - x
+    }
+
+    // Special-case zero to avoid log/scale on 0.
+    if x == 0.0 {
+        let mantissa = if p == 0 { "0" } else { "0." + _rep("0", p) }
+        let sign = if neg { "-" } else { "" }
+        return sign + mantissa + "e+00"
+    }
+
+    // Normalise to [1, 10). Count decimal exponent by repeated *10/÷10.
+    let mut exp = 0
+    while x >= 10.0 {
+        x = x / 10.0
+        exp = exp + 1
+    }
+    while x < 1.0 {
+        x = x * 10.0
+        exp = exp - 1
+    }
+
+    // Round mantissa to `prec` fractional digits (half-up). If rounding
+    // pushes it to 10.0 we must bump the exponent back up.
+    let scale = _pow10_f(p)
+    let mr = x * scale + 0.5
+    let mant_scaled = float_to_int_saturating_pure(mr)
+    let mut denom = float_to_int_saturating_pure(scale)
+    if denom <= 0 { denom = 1 }
+    let mut mant_int = mant_scaled / denom
+    let mut mant_frac = mant_scaled - mant_int * denom
+    if mant_int >= 10 {
+        // Carry: mantissa became 10.d{p} — rewrite as 1.(d+1 shifted).
+        mant_int = 1
+        mant_frac = 0
+        exp = exp + 1
+    }
+
+    let mant_int_str = _int_abs_digits(mant_int)
+    let mut mant_frac_str = ""
+    if p > 0 {
+        let raw = _int_abs_digits(mant_frac)
+        let pad = p - len(raw)
+        if pad > 0 {
+            mant_frac_str = _rep("0", pad) + raw
+        } else {
+            mant_frac_str = raw
+        }
+    }
+
+    let sign = if neg { "-" } else { "" }
+    let mantissa = if p == 0 { mant_int_str } else { mant_int_str + "." + mant_frac_str }
+
+    let exp_sign = if exp < 0 { "-" } else { "+" }
+    let exp_abs = if exp < 0 { 0 - exp } else { exp }
+    let exp_raw = _int_abs_digits(exp_abs)
+    let exp_str = if len(exp_raw) < 2 { "0" + exp_raw } else { exp_raw }
+
+    sign + mantissa + "e" + exp_sign + exp_str
+}
