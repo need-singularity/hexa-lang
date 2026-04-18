@@ -5176,6 +5176,47 @@ HexaVal hexa_array_group_by(HexaVal arr, HexaVal fn) {
     return out;
 }
 
+// frequencies: count occurrences per value; keys are stringified via
+// hexa_to_string (same as group_by). Returns map<str, int>. Matches
+// interpreter at self/hexa_full.hexa:15509-15528.
+HexaVal hexa_array_frequencies(HexaVal arr) {
+    HexaVal out = hexa_map_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    for (int i = 0; i < HX_ARR_LEN(arr); i++) {
+        const char* k = hexa_str_as_ptr(hexa_to_string(HX_ARR_ITEMS(arr)[i]));
+        if (!k) continue;
+        int64_t cur = 0;
+        if (hexa_map_contains_key(out, k)) {
+            HexaVal v = hexa_map_get(out, k);
+            cur = HX_IS_INT(v) ? HX_INT(v) : (int64_t)__hx_to_double(v);
+        }
+        out = hexa_map_set(out, k, hexa_int(cur + 1));
+    }
+    return out;
+}
+
+// substr: JS-style substring(start, length). length defaults to "rest of
+// string" when not supplied. Negative start clamps to 0, negative length
+// to 0, end clamps to strlen. Matches interpreter at
+// self/hexa_full.hexa:14959-14972.
+HexaVal hexa_str_substr(HexaVal s, HexaVal start_v, HexaVal len_v) {
+    if (!HX_IS_STR(s)) return hexa_str("");
+    int64_t slen = (int64_t)strlen(HX_STR(s));
+    int64_t start = HX_IS_INT(start_v) ? HX_INT(start_v) : (int64_t)__hx_to_double(start_v);
+    if (start < 0) start = 0;
+    if (start > slen) start = slen;
+    int64_t count;
+    if (HX_TAG(len_v) == TAG_VOID) {
+        count = slen - start;
+    } else {
+        count = HX_IS_INT(len_v) ? HX_INT(len_v) : (int64_t)__hx_to_double(len_v);
+    }
+    if (count < 0) count = 0;
+    int64_t end_idx = start + count;
+    if (end_idx > slen) end_idx = slen;
+    return hexa_str_substring(s, hexa_int(start), hexa_int(end_idx));
+}
+
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
