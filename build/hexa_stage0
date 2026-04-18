@@ -1,0 +1,104 @@
+#!/bin/bash
+# hexa_stage0 shim — serialize + RSS cap (Mac panic 근본 차단)
+#
+# Layered defense against Mac panic / compressor blowup caused by N parallel
+# hexa_stage0 spawns (e.g. ai_native_lint 여러 POC 파일 병렬 컴파일):
+#
+#   Layer 1  mkdir-lock  → concurrency limit (default 1, override via
+#                          HEXA_STAGE0_CONCURRENCY, though only 1 is honored
+#                          by the simple lock below — higher values would
+#                          need counting semaphore)
+#   Layer 2  safe_hexa_launchd  → per-job RSS cap 4GB + jetsam priority 40
+#                                 (so WindowServer/Terminal survive OOM)
+#
+# Without Layer 1, N uncapped hexa_stage0 could sum to N*RSS irrespective of
+# the per-job cap in Layer 2 — which is what caused 2026-04-18 13:22 panic +
+# 16:23 load=376 + compressor 12.72GB.
+#
+# Opt-outs (emergency escape):
+#   HEXA_LOCAL_NO_CAP=1   full bypass (both layers) — raw binary direct
+#   HEXA_LOCAL=1          full bypass (matches hexa dispatch convention)
+#   HEXA_STAGE0_NO_CAP=1  alias of HEXA_LOCAL
+#   HEXA_NO_LAUNCHD=1     skip launchd re-entry (set by safe_hexa_launchd itself)
+#
+# Rollback:
+#   mv /Users/ghost/Dev/hexa-lang/build/hexa_stage0.real \
+#      /Users/ghost/Dev/hexa-lang/build/hexa_stage0
+#
+# Raw copy preserved at: build/hexa_stage0.bak.20260418
+
+set -u
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+REAL="$DIR/hexa_stage0.real"
+WRAPPER="$HOME/Dev/nexus/shared/harness/safe_hexa_launchd.sh"
+
+LOCKDIR="/tmp/hexa_stage0.lock.d"
+LOCK_WAIT_SECS="${HEXA_STAGE0_LOCK_WAIT:-300}"   # 5 min default
+
+# ---------------- Opt-out paths ----------------
+# Full bypass — no lock, no launchd, raw binary.
+if [ "${HEXA_LOCAL_NO_CAP:-}" = "1" ] || \
+   [ "${HEXA_LOCAL:-}" = "1" ] || \
+   [ "${HEXA_STAGE0_NO_CAP:-}" = "1" ]; then
+    exec "$REAL" "$@"
+fi
+
+# Re-entry from safe_hexa_launchd — wrapper already holds the lock (our parent
+# acquired it before calling $WRAPPER). Skip launchd re-entry AND re-locking.
+if [ "${HEXA_NO_LAUNCHD:-}" = "1" ]; then
+    exec "$REAL" "$@"
+fi
+
+# ---------------- Layer 1: serialize via mkdir lock ----------------
+# mkdir is atomic on POSIX. macOS has no flock(1) by default, and we refuse
+# to depend on Homebrew here. Loop with 0.5s sleep + deadline; stale lock
+# (PID no longer alive) is reaped.
+
+acquire_lock() {
+    local deadline=$(( $(date +%s) + LOCK_WAIT_SECS ))
+    while true; do
+        if mkdir "$LOCKDIR" 2>/dev/null; then
+            echo "$$" > "$LOCKDIR/pid" 2>/dev/null || true
+            return 0
+        fi
+        # Reap stale lock: holder PID dead?
+        if [ -r "$LOCKDIR/pid" ]; then
+            local holder
+            holder=$(cat "$LOCKDIR/pid" 2>/dev/null)
+            if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
+                rm -rf "$LOCKDIR" 2>/dev/null
+                continue
+            fi
+        fi
+        # Deadline exceeded → fail loud so caller sees the problem.
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            echo "hexa_stage0 shim: lock timeout after ${LOCK_WAIT_SECS}s (holder: $(cat $LOCKDIR/pid 2>/dev/null || echo unknown))" >&2
+            return 1
+        fi
+        sleep 0.5
+    done
+}
+
+release_lock() {
+    # Only release if we own it.
+    if [ -r "$LOCKDIR/pid" ] && [ "$(cat "$LOCKDIR/pid" 2>/dev/null)" = "$$" ]; then
+        rm -rf "$LOCKDIR" 2>/dev/null
+    fi
+}
+trap release_lock EXIT INT TERM
+
+if ! acquire_lock; then
+    exit 75   # EX_TEMPFAIL
+fi
+
+# ---------------- Layer 2: route through launchd for RSS cap ----------------
+# If wrapper missing (nexus absent), run raw — defense-in-depth, not hard gate.
+if [ ! -x "$WRAPPER" ]; then
+    exec "$REAL" "$@"
+fi
+
+HEXA_BIN="$REAL" "$WRAPPER" "$@"
+rc=$?
+# release_lock via trap
+exit "$rc"
