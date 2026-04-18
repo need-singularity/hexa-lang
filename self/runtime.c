@@ -4842,6 +4842,97 @@ HexaVal hexa_array_unique(HexaVal arr) {
     return out;
 }
 
+// rotate(k): k>0 shifts left (items[k] becomes new head); k<0 shifts right.
+// k is normalized mod len — matches interpreter at hexa_full.hexa:15486-15499.
+HexaVal hexa_array_rotate(HexaVal arr, HexaVal kv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_ARR_LEN(arr);
+    if (n == 0) return out;
+    int64_t k = HX_IS_INT(kv) ? HX_INT(kv) : (int64_t)__hx_to_double(kv);
+    k = k % n;
+    if (k < 0) k += n;
+    for (int64_t i = 0; i < n; i++) {
+        out = hexa_array_push(out, HX_ARR_ITEMS(arr)[(i + k) % n]);
+    }
+    return out;
+}
+
+// partition(pred): returns [matching, non_matching] as a 2-element array.
+// Matches interpreter at hexa_full.hexa:15437-15449.
+HexaVal hexa_array_partition(HexaVal arr, HexaVal fn) {
+    HexaVal matching = hexa_array_new();
+    HexaVal rest = hexa_array_new();
+    if (HX_IS_ARRAY(arr)) {
+        for (int64_t i = 0; i < HX_ARR_LEN(arr); i++) {
+            HexaVal it = HX_ARR_ITEMS(arr)[i];
+            if (hexa_truthy(hexa_call1(fn, it))) {
+                matching = hexa_array_push(matching, it);
+            } else {
+                rest = hexa_array_push(rest, it);
+            }
+        }
+    }
+    HexaVal out = hexa_array_new();
+    out = hexa_array_push(out, matching);
+    out = hexa_array_push(out, rest);
+    return out;
+}
+
+// interleave(other): alternates items from both arrays up to max length.
+// When one array runs out, the other's remaining items still alternate in.
+// Matches interpreter at hexa_full.hexa:15451-15464.
+HexaVal hexa_array_interleave(HexaVal a, HexaVal b) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) {
+        return HX_IS_ARRAY(b) ? b : out;
+    }
+    if (!HX_IS_ARRAY(b)) return a;
+    int64_t na = HX_ARR_LEN(a), nb = HX_ARR_LEN(b);
+    int64_t m = na > nb ? na : nb;
+    for (int64_t i = 0; i < m; i++) {
+        if (i < na) out = hexa_array_push(out, HX_ARR_ITEMS(a)[i]);
+        if (i < nb) out = hexa_array_push(out, HX_ARR_ITEMS(b)[i]);
+    }
+    return out;
+}
+
+// scan(init, fn): like fold but returns all intermediate accumulators.
+// Result length is len(arr) + 1 (includes init as first element).
+// Matches interpreter at hexa_full.hexa:15426-15435.
+HexaVal hexa_array_scan(HexaVal arr, HexaVal init, HexaVal fn) {
+    HexaVal out = hexa_array_new();
+    out = hexa_array_push(out, init);
+    if (!HX_IS_ARRAY(arr)) return out;
+    HexaVal acc = init;
+    for (int64_t i = 0; i < HX_ARR_LEN(arr); i++) {
+        acc = hexa_call2(fn, acc, HX_ARR_ITEMS(arr)[i]);
+        out = hexa_array_push(out, acc);
+    }
+    return out;
+}
+
+// swap(i, j): returns new array with items at i and j swapped.
+// Out-of-range indices return original array copy.
+// Matches interpreter at hexa_full.hexa:15497-15512.
+HexaVal hexa_array_swap(HexaVal arr, HexaVal iv, HexaVal jv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(arr)) return out;
+    int64_t n = HX_ARR_LEN(arr);
+    int64_t i = HX_IS_INT(iv) ? HX_INT(iv) : (int64_t)__hx_to_double(iv);
+    int64_t j = HX_IS_INT(jv) ? HX_INT(jv) : (int64_t)__hx_to_double(jv);
+    if (i < 0 || j < 0 || i >= n || j >= n) {
+        for (int64_t k = 0; k < n; k++) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[k]);
+        return out;
+    }
+    for (int64_t k = 0; k < n; k++) {
+        if (k == i) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[j]);
+        else if (k == j) out = hexa_array_push(out, HX_ARR_ITEMS(arr)[i]);
+        else out = hexa_array_push(out, HX_ARR_ITEMS(arr)[k]);
+    }
+    return out;
+}
+
 HexaVal hexa_str_bytes(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
     HexaVal out = hexa_array_new();
