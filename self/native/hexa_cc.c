@@ -6899,6 +6899,10 @@ HexaVal _is_known_float(HexaVal node);
 HexaVal _is_float_init_expr(HexaVal node);
 HexaVal _gen2_while_cond(HexaVal node);
 HexaVal gen2_lambda_expr(HexaVal node);
+/* Long `+` chain flattener — relieves clang -fbracket-depth=256 overflow
+ * when anima launcher files emit 100+ segment string concats. */
+HexaVal _plus_chain_len(HexaVal node);
+HexaVal _collect_plus_parts(HexaVal node);
 
 HexaVal _resolved_modules;
 HexaVal _resolve_caller_dir;
@@ -10007,6 +10011,47 @@ HexaVal gen2_method_builtin(HexaVal obj_expr, HexaVal method, HexaVal args) {
     return __hexa_fn_arena_return(hexa_void());
 }
 
+/* ── BinOp `+` chain flattener (manual mirror of codegen_c2.hexa) ────
+ * Count operands in a left-leaning `+` chain rooted at `node`.
+ * Left-associative parse: right children are always leaves at this
+ * chain level; walk down the left spine. */
+HexaVal _plus_chain_len(HexaVal node) {
+    long n = 1;
+    HexaVal cur = node;
+    while (1) {
+        if (hexa_truthy(hexa_eq(hexa_type_of(cur), hexa_str("string")))) break;
+        HexaVal k = hexa_map_get(cur, "kind");
+        if (!hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) break;
+        HexaVal op = hexa_map_get(cur, "op");
+        if (!hexa_truthy(hexa_eq(op, hexa_str("+")))) break;
+        n = n + 1;
+        cur = hexa_map_get(cur, "left");
+    }
+    return hexa_int(n);
+}
+
+/* Collect flat list of operand-expression C-strings in left-to-right order. */
+HexaVal _collect_plus_parts(HexaVal node) {
+    HexaVal parts = hexa_array_new();
+    HexaVal cur = node;
+    while (1) {
+        if (hexa_truthy(hexa_eq(hexa_type_of(cur), hexa_str("string")))) break;
+        HexaVal k = hexa_map_get(cur, "kind");
+        if (!hexa_truthy(hexa_eq(k, hexa_str("BinOp")))) break;
+        HexaVal op = hexa_map_get(cur, "op");
+        if (!hexa_truthy(hexa_eq(op, hexa_str("+")))) break;
+        parts = hexa_array_push(parts, gen2_expr(hexa_map_get(cur, "right")));
+        cur = hexa_map_get(cur, "left");
+    }
+    parts = hexa_array_push(parts, gen2_expr(cur));
+    HexaVal flat = hexa_array_new();
+    long i = (long)HX_ARR_LEN(parts) - 1;
+    while (i >= 0) {
+        flat = hexa_array_push(flat, HX_ARR_ITEMS(parts)[i]);
+        i = i - 1;
+    }
+    return flat;
+}
 
 HexaVal gen2_expr(HexaVal node) {
     HexaVal _lv = hexa_void();
@@ -10123,6 +10168,26 @@ HexaVal gen2_expr(HexaVal node) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_fma("), fa), hexa_str(", ")), fb), hexa_str(", ")), fc), hexa_str(")")));
                 }
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_fma("), fa), hexa_str(", ")), fb), hexa_str(", hexa_sub(hexa_int(0), ")), fc), hexa_str("))")));
+            }
+        }
+        /* Long `+` chain → hexa_concat_many compound-literal call.
+         * Clang default -fbracket-depth=256 rejects deeply nested
+         * hexa_add(hexa_add(...)); anima launcher files hit 100+ segments. */
+        if (hexa_truthy(hexa_eq(op, hexa_str("+")))) {
+            long __chain_n = HX_INT(_plus_chain_len(node));
+            if (__chain_n >= 16) {
+                HexaVal __parts = _collect_plus_parts(node);
+                long __pn = (long)HX_ARR_LEN(__parts);
+                HexaVal __body = hexa_str("");
+                for (long __pi = 0; __pi < __pn; __pi++) {
+                    if (__pi > 0) __body = hexa_add(__body, hexa_str(", "));
+                    __body = hexa_add(__body, HX_ARR_ITEMS(__parts)[__pi]);
+                }
+                HexaVal __out = hexa_add(hexa_str("hexa_concat_many("), hexa_to_string(hexa_int(__pn)));
+                __out = hexa_add(__out, hexa_str(", (HexaVal[]){"));
+                __out = hexa_add(__out, __body);
+                __out = hexa_add(__out, hexa_str("})"));
+                return __hexa_fn_arena_return(__out);
             }
         }
         l = gen2_expr(hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_311));
@@ -12464,6 +12529,31 @@ HexaVal _is_builtin_name(HexaVal name) {
     if (hexa_truthy(hexa_eq(name, hexa_str("u_floor")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
+    /* FIX-A (Anima ML eval unblock, 2026-04-19): 8 tensor_* / rms_norm / softmax / matmul */
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_zeros")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_slice")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_add")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_dot")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("tensor_mul_scalar")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("rms_norm")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("softmax")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("matmul")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
     if (hexa_truthy(hexa_eq(name, hexa_str("true")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
@@ -12673,7 +12763,29 @@ HexaVal gen2_lambda_expr(HexaVal node) {
     /* FIX-B 2026-04-19: store param-sig in slot; fwd decl emitted in counter
      * driven loop at codegen emit time. Mirror of fcf275f4 IC fix. */
     _lambda_fwd_sigs = hexa_array_push(_lambda_fwd_sigs, p);
-    HexaVal fn_def = hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("HexaVal "), fn_name), hexa_str("(")), p), hexa_str(") {\n")), hexa_str_join(body_parts, hexa_str(""))), hexa_str("    return hexa_void();\n}\n\n"));
+    /* FIX-C 2026-04-19: route fn_def through local array + hexa_str_join
+     * instead of chained hexa_add. hexa_str_concat arena-allocates under
+     * HEXA_VAL_ARENA; after __hexa_fn_arena_return pops the scope the
+     * arena-backed fn_def inside module-level _lambda_def_parts becomes
+     * dangling — later allocs stomp lambda bodies (repro: train_v14.hexa
+     * "tr(\"exaVal __hexa_sl_6;" etc). hexa_str_join uses malloc
+     * (runtime.c:3293) so the joined result escapes the arena. */
+    HexaVal fn_def;
+    {
+        HexaVal _fn_def_parts = hexa_array_new();
+        _fn_def_parts = hexa_array_push(_fn_def_parts, hexa_str("HexaVal "));
+        _fn_def_parts = hexa_array_push(_fn_def_parts, fn_name);
+        _fn_def_parts = hexa_array_push(_fn_def_parts, hexa_str("("));
+        _fn_def_parts = hexa_array_push(_fn_def_parts, p);
+        _fn_def_parts = hexa_array_push(_fn_def_parts, hexa_str(") {\n"));
+        HexaVal _bpi = hexa_int(0);
+        while (HX_BOOL(hexa_cmp_lt(_bpi, hexa_int(hexa_len(body_parts))))) {
+            _fn_def_parts = hexa_array_push(_fn_def_parts, hexa_index_get(body_parts, _bpi));
+            _bpi = hexa_add(_bpi, hexa_int(1));
+        }
+        _fn_def_parts = hexa_array_push(_fn_def_parts, hexa_str("    return hexa_void();\n}\n\n"));
+        fn_def = hexa_str_join(_fn_def_parts, hexa_str(""));
+    }
     _lambda_def_parts = hexa_array_push(_lambda_def_parts, fn_def);
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(free_vars)), hexa_int(0)))) {
         return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_closure_new((void*)&"), fn_name), hexa_str(", ")), hexa_to_string(arity)), hexa_str(", hexa_array_new())")));

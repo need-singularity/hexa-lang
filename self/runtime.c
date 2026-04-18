@@ -137,6 +137,7 @@ static const char* hexa_intern(const char* s) {
 // to uint64_t (NaN-boxed) without touching field access patterns.
 typedef struct HexaVal_ HexaVal;
 HexaVal hexa_add(HexaVal a, HexaVal b);
+HexaVal hexa_concat_many(int n, HexaVal* parts);
 HexaVal hexa_sub(HexaVal a, HexaVal b);
 HexaVal hexa_mul(HexaVal a, HexaVal b);
 HexaVal hexa_div(HexaVal a, HexaVal b);
@@ -210,6 +211,15 @@ HexaVal hexa_math_max(HexaVal a, HexaVal b);
 HexaVal hexa_time_ms(void);
 HexaVal hexa_byte_len(HexaVal v);
 HexaVal hexa_dict_keys(HexaVal m);
+// FIX-A (Anima ML eval unblock): 8 tensor_* fallback builtins.
+HexaVal hexa_tensor_zeros(HexaVal n);
+HexaVal hexa_tensor_slice(HexaVal a, HexaVal lo, HexaVal hi);
+HexaVal hexa_tensor_add(HexaVal a, HexaVal b);
+HexaVal hexa_tensor_dot(HexaVal a, HexaVal b);
+HexaVal hexa_tensor_mul_scalar(HexaVal a, HexaVal s);
+HexaVal hexa_rms_norm(HexaVal x, HexaVal gamma, HexaVal eps);
+HexaVal hexa_softmax(HexaVal a);
+HexaVal hexa_matmul(HexaVal a, HexaVal b, HexaVal m, HexaVal k, HexaVal n);
 
 // RT-P3-1 wrapper shims — tagged-value → C-native conversion for codegen regen
 // path. Close Wint-conversion / Wpointer-arith categories in the
@@ -2780,6 +2790,23 @@ static HexaVal hexa_add_slow(HexaVal a, HexaVal b) {
            ? hexa_int(HX_INT(__ha) + HX_INT(__hb)) \
            : hexa_add_slow(__ha, __hb); })
 
+// ── Variadic concat (N-way) — clang bracket-depth relief ─────
+// codegen_c2 flattens long `+` chains (≥16 operands) into a single call:
+//   hexa_concat_many(N, (HexaVal[]){e1, e2, ..., eN})
+// instead of hexa_add(hexa_add(hexa_add(...))) which blows past clang's
+// default 256-level bracket nesting limit on anima launcher files
+// (launch_alm_14b_r9.hexa ~170 deep → fatal). Semantics = left-fold via
+// hexa_add so mixed int/string/array inputs follow the same rules as the
+// pairwise operator.
+HexaVal hexa_concat_many(int n, HexaVal* parts) {
+    if (n <= 0) return hexa_str("");
+    HexaVal acc = parts[0];
+    for (int i = 1; i < n; i++) {
+        acc = hexa_add(acc, parts[i]);
+    }
+    return acc;
+}
+
 // ── Polymorphic equality ─────────────────────────────────
 
 HexaVal hexa_eq(HexaVal a, HexaVal b) {
@@ -4800,6 +4827,535 @@ HexaVal hexa_byte_len(HexaVal v) {
 // use the more familiar `dict_keys(d)` spelling (tokenizer_bpe.hexa etc.).
 HexaVal hexa_dict_keys(HexaVal m) {
     return hexa_map_keys(m);
+}
+
+// FIX-A (Anima stdlib unblock, 2026-04-19) ─────────────────────────
+// 10 builtins required across ~230 Anima/serve/train .hexa files
+// (read_stdin ×53, json_parse ×119, json_stringify ×37, json_encode ×5,
+// json_decode ×4, http_get ×6, sleep_s ×2, to_bool/now_monotonic_s/
+// utc_iso_now/utc_compact_now ×1-2). Keep surface minimal — no libcurl,
+// no locale tables, no float parse-path perfection: goal is unblock
+// compilation + serve_alm dogfooding.
+
+// read_stdin(): slurp all of stdin into a TAG_STR. Returns "" on EOF-only.
+// Used by cli tools + test harnesses that pipe input.
+HexaVal hexa_read_stdin(void) {
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return hexa_str("");
+    int c;
+    while ((c = fgetc(stdin)) != EOF) {
+        if (len + 1 >= cap) {
+            cap *= 2;
+            char* nb = (char*)realloc(buf, cap);
+            if (!nb) { free(buf); return hexa_str(""); }
+            buf = nb;
+        }
+        buf[len++] = (char)c;
+    }
+    buf[len] = 0;
+    return hexa_str_own(buf);
+}
+
+// sleep_s(n): sleep n seconds (int or float). Wraps nanosleep for
+// sub-second precision. Returns void.
+HexaVal hexa_sleep_s(HexaVal n) {
+    double s = 0.0;
+    if (HX_IS_INT(n))        s = (double)HX_INT(n);
+    else if (HX_IS_FLOAT(n)) s = HX_FLOAT(n);
+    else                     s = (double)hexa_as_num(n);
+    if (s < 0) s = 0;
+    struct timespec ts;
+    ts.tv_sec  = (time_t)s;
+    ts.tv_nsec = (long)((s - (double)ts.tv_sec) * 1e9);
+    nanosleep(&ts, NULL);
+    return hexa_void();
+}
+
+// now_monotonic_s(): TAG_FLOAT seconds from CLOCK_MONOTONIC (wall-clock
+// elapsed, immune to system clock adjustment). Paired with time_ms()
+// for finer-grained benchmarks.
+HexaVal hexa_now_monotonic_s(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return hexa_float((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
+}
+
+// utc_iso_now(): RFC-3339 / ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ".
+HexaVal hexa_utc_iso_now(void) {
+    time_t t = time(NULL);
+    struct tm g;
+    gmtime_r(&t, &g);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y-%m-%dT%H:%M:%SZ", &g);
+    return hexa_str(buf);
+}
+
+// utc_compact_now(): compact "YYYYMMDDHHMMSS" UTC (checkpoint filename).
+HexaVal hexa_utc_compact_now(void) {
+    time_t t = time(NULL);
+    struct tm g;
+    gmtime_r(&t, &g);
+    char buf[32];
+    strftime(buf, sizeof(buf), "%Y%m%d%H%M%S", &g);
+    return hexa_str(buf);
+}
+
+// to_bool(v): generic truthy coercion. Mirrors hexa_truthy semantics
+// but returns a TAG_BOOL HexaVal (as opposed to int).
+HexaVal hexa_to_bool(HexaVal v) {
+    return hexa_bool(hexa_truthy(v) ? 1 : 0);
+}
+
+// http_get(url): popen("curl -s <url>") → TAG_STR body. Keeps the
+// dependency surface at /usr/bin/curl (universal on macOS/linux) and
+// avoids pulling libcurl into runtime.c. Returns "" on curl-missing or
+// non-zero exit. http_get is used by anima serve_alm health-checks +
+// a handful of blowup-engine scrapers (~6 sites).
+HexaVal hexa_http_get(HexaVal url) {
+    if (!HX_IS_STR(url) || !HX_STR(url)) return hexa_str("");
+    const char* u = HX_STR(url);
+    // Reject URLs with shell-meta chars — we pass through /bin/sh via popen.
+    for (const char* p = u; *p; p++) {
+        char c = *p;
+        if (c == '`' || c == '$' || c == ';' || c == '|' || c == '&'
+            || c == '<' || c == '>' || c == '\n' || c == '\r'
+            || c == '\'' || c == '"' || c == '\\') {
+            return hexa_str("");
+        }
+    }
+    char cmd[4096];
+    int k = snprintf(cmd, sizeof(cmd), "curl -fsSL --max-time 30 '%s' 2>/dev/null", u);
+    if (k < 0 || (size_t)k >= sizeof(cmd)) return hexa_str("");
+    FILE* fp = popen(cmd, "r");
+    if (!fp) return hexa_str("");
+    size_t cap = 4096, len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) { pclose(fp); return hexa_str(""); }
+    size_t r;
+    char chunk[2048];
+    while ((r = fread(chunk, 1, sizeof(chunk), fp)) > 0) {
+        if (len + r + 1 >= cap) {
+            while (len + r + 1 >= cap) cap *= 2;
+            char* nb = (char*)realloc(buf, cap);
+            if (!nb) { free(buf); pclose(fp); return hexa_str(""); }
+            buf = nb;
+        }
+        memcpy(buf + len, chunk, r);
+        len += r;
+    }
+    buf[len] = 0;
+    pclose(fp);
+    return hexa_str_own(buf);
+}
+
+// ── JSON mini (parse + stringify) ─────────────────────────────────
+// Minimal recursive-descent JSON handler that covers Anima's use
+// (tokenizer configs, checkpoint metadata, serve_alm request bodies).
+// Supported: null / bool / int / float / string / array / object.
+// Limits: no \uXXXX surrogates (passthrough as raw bytes), no +NaN/Inf.
+// TAG mapping:
+//   null   → TAG_VOID  (hexa_void)
+//   true   → TAG_BOOL 1
+//   false  → TAG_BOOL 0
+//   int    → TAG_INT
+//   float  → TAG_FLOAT
+//   string → TAG_STR
+//   array  → TAG_ARRAY
+//   object → TAG_MAP   (keys always string)
+
+static void _jp_skip_ws(const char* s, size_t n, size_t* pi) {
+    while (*pi < n) {
+        char c = s[*pi];
+        if (c == ' ' || c == '\t' || c == '\n' || c == '\r') (*pi)++;
+        else break;
+    }
+}
+
+static HexaVal _jp_parse_value(const char* s, size_t n, size_t* pi);
+
+static HexaVal _jp_parse_string(const char* s, size_t n, size_t* pi) {
+    if (*pi >= n || s[*pi] != '"') return hexa_str("");
+    (*pi)++;
+    size_t cap = 64, len = 0;
+    char* buf = (char*)malloc(cap);
+    if (!buf) return hexa_str("");
+    while (*pi < n) {
+        char c = s[*pi];
+        if (c == '"') { (*pi)++; buf[len] = 0; return hexa_str_own(buf); }
+        if (c == '\\' && *pi + 1 < n) {
+            char e = s[*pi + 1];
+            char out = 0;
+            int consumed = 2;
+            switch (e) {
+                case '"':  out = '"';  break;
+                case '\\': out = '\\'; break;
+                case '/':  out = '/';  break;
+                case 'n':  out = '\n'; break;
+                case 'r':  out = '\r'; break;
+                case 't':  out = '\t'; break;
+                case 'b':  out = '\b'; break;
+                case 'f':  out = '\f'; break;
+                case 'u':
+                    // Raw passthrough (no unicode expansion) — write literal
+                    // \uXXXX as the 6 bytes so round-trip is lossless.
+                    if (*pi + 5 < n) {
+                        if (len + 6 >= cap) { cap = (cap + 6) * 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+                        memcpy(buf + len, s + *pi, 6);
+                        len += 6;
+                        *pi += 6;
+                        continue;
+                    }
+                    out = 'u';
+                    break;
+                default:   out = e; break;
+            }
+            if (len + 1 >= cap) { cap *= 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+            buf[len++] = out;
+            *pi += consumed;
+            continue;
+        }
+        if (len + 1 >= cap) { cap *= 2; char* nb = (char*)realloc(buf, cap); if (!nb) { free(buf); return hexa_str(""); } buf = nb; }
+        buf[len++] = c;
+        (*pi)++;
+    }
+    buf[len] = 0;
+    return hexa_str_own(buf);
+}
+
+static HexaVal _jp_parse_number(const char* s, size_t n, size_t* pi) {
+    size_t start = *pi;
+    int is_float = 0;
+    if (*pi < n && (s[*pi] == '-' || s[*pi] == '+')) (*pi)++;
+    while (*pi < n) {
+        char c = s[*pi];
+        if (c >= '0' && c <= '9') { (*pi)++; continue; }
+        if (c == '.' || c == 'e' || c == 'E' || c == '+' || c == '-') {
+            is_float = 1;
+            (*pi)++;
+            continue;
+        }
+        break;
+    }
+    size_t k = *pi - start;
+    char buf[64];
+    if (k >= sizeof(buf)) k = sizeof(buf) - 1;
+    memcpy(buf, s + start, k);
+    buf[k] = 0;
+    if (is_float) return hexa_float(atof(buf));
+    return hexa_int((int64_t)strtoll(buf, NULL, 10));
+}
+
+static HexaVal _jp_parse_array(const char* s, size_t n, size_t* pi) {
+    if (*pi >= n || s[*pi] != '[') return hexa_array_new();
+    (*pi)++;
+    HexaVal arr = hexa_array_new();
+    _jp_skip_ws(s, n, pi);
+    if (*pi < n && s[*pi] == ']') { (*pi)++; return arr; }
+    while (*pi < n) {
+        _jp_skip_ws(s, n, pi);
+        HexaVal v = _jp_parse_value(s, n, pi);
+        arr = hexa_array_push(arr, v);
+        _jp_skip_ws(s, n, pi);
+        if (*pi < n && s[*pi] == ',') { (*pi)++; continue; }
+        if (*pi < n && s[*pi] == ']') { (*pi)++; break; }
+        break;
+    }
+    return arr;
+}
+
+static HexaVal _jp_parse_object(const char* s, size_t n, size_t* pi) {
+    if (*pi >= n || s[*pi] != '{') return hexa_map_new();
+    (*pi)++;
+    HexaVal m = hexa_map_new();
+    _jp_skip_ws(s, n, pi);
+    if (*pi < n && s[*pi] == '}') { (*pi)++; return m; }
+    while (*pi < n) {
+        _jp_skip_ws(s, n, pi);
+        HexaVal key = _jp_parse_string(s, n, pi);
+        _jp_skip_ws(s, n, pi);
+        if (*pi < n && s[*pi] == ':') (*pi)++;
+        _jp_skip_ws(s, n, pi);
+        HexaVal val = _jp_parse_value(s, n, pi);
+        if (HX_IS_STR(key) && HX_STR(key)) m = hexa_map_set(m, HX_STR(key), val);
+        _jp_skip_ws(s, n, pi);
+        if (*pi < n && s[*pi] == ',') { (*pi)++; continue; }
+        if (*pi < n && s[*pi] == '}') { (*pi)++; break; }
+        break;
+    }
+    return m;
+}
+
+static HexaVal _jp_parse_value(const char* s, size_t n, size_t* pi) {
+    _jp_skip_ws(s, n, pi);
+    if (*pi >= n) return hexa_void();
+    char c = s[*pi];
+    if (c == '"') return _jp_parse_string(s, n, pi);
+    if (c == '{') return _jp_parse_object(s, n, pi);
+    if (c == '[') return _jp_parse_array(s, n, pi);
+    if (c == 't' && *pi + 3 < n && memcmp(s + *pi, "true", 4) == 0) { *pi += 4; return hexa_bool(1); }
+    if (c == 'f' && *pi + 4 < n && memcmp(s + *pi, "false", 5) == 0) { *pi += 5; return hexa_bool(0); }
+    if (c == 'n' && *pi + 3 < n && memcmp(s + *pi, "null", 4) == 0) { *pi += 4; return hexa_void(); }
+    if (c == '-' || (c >= '0' && c <= '9')) return _jp_parse_number(s, n, pi);
+    (*pi)++;  // skip unknown
+    return hexa_void();
+}
+
+HexaVal hexa_json_parse(HexaVal s) {
+    if (!HX_IS_STR(s) || !HX_STR(s)) return hexa_void();
+    const char* cs = HX_STR(s);
+    size_t n = strlen(cs);
+    size_t i = 0;
+    return _jp_parse_value(cs, n, &i);
+}
+
+HexaVal hexa_json_decode(HexaVal s) { return hexa_json_parse(s); }
+
+// Stringify — one-shot growth buffer, no intermediate HexaVals.
+static void _js_buf_reserve(char** pbuf, size_t* pcap, size_t need) {
+    if (*pcap >= need) return;
+    size_t nc = *pcap ? *pcap : 64;
+    while (nc < need) nc *= 2;
+    char* nb = (char*)realloc(*pbuf, nc);
+    if (!nb) return;
+    *pbuf = nb;
+    *pcap = nc;
+}
+
+static void _js_buf_append(char** pbuf, size_t* pcap, size_t* plen, const char* s, size_t n) {
+    _js_buf_reserve(pbuf, pcap, *plen + n + 1);
+    if (!*pbuf) return;
+    memcpy(*pbuf + *plen, s, n);
+    *plen += n;
+    (*pbuf)[*plen] = 0;
+}
+
+static void _js_emit_string(char** pbuf, size_t* pcap, size_t* plen, const char* s) {
+    _js_buf_append(pbuf, pcap, plen, "\"", 1);
+    if (!s) { _js_buf_append(pbuf, pcap, plen, "\"", 1); return; }
+    for (const char* p = s; *p; p++) {
+        unsigned char c = (unsigned char)*p;
+        if (c == '"')       _js_buf_append(pbuf, pcap, plen, "\\\"", 2);
+        else if (c == '\\') _js_buf_append(pbuf, pcap, plen, "\\\\", 2);
+        else if (c == '\n') _js_buf_append(pbuf, pcap, plen, "\\n", 2);
+        else if (c == '\r') _js_buf_append(pbuf, pcap, plen, "\\r", 2);
+        else if (c == '\t') _js_buf_append(pbuf, pcap, plen, "\\t", 2);
+        else if (c == '\b') _js_buf_append(pbuf, pcap, plen, "\\b", 2);
+        else if (c == '\f') _js_buf_append(pbuf, pcap, plen, "\\f", 2);
+        else if (c < 0x20) {
+            char esc[8];
+            int k = snprintf(esc, sizeof(esc), "\\u%04x", c);
+            if (k > 0) _js_buf_append(pbuf, pcap, plen, esc, (size_t)k);
+        } else {
+            char ch = (char)c;
+            _js_buf_append(pbuf, pcap, plen, &ch, 1);
+        }
+    }
+    _js_buf_append(pbuf, pcap, plen, "\"", 1);
+}
+
+static void _js_emit_value(char** pbuf, size_t* pcap, size_t* plen, HexaVal v);
+
+static void _js_emit_array(char** pbuf, size_t* pcap, size_t* plen, HexaVal v) {
+    _js_buf_append(pbuf, pcap, plen, "[", 1);
+    int64_t n = (int64_t)HX_ARR_LEN(v);
+    for (int64_t i = 0; i < n; i++) {
+        if (i) _js_buf_append(pbuf, pcap, plen, ",", 1);
+        _js_emit_value(pbuf, pcap, plen, HX_ARR_ITEMS(v)[i]);
+    }
+    _js_buf_append(pbuf, pcap, plen, "]", 1);
+}
+
+static void _js_emit_object(char** pbuf, size_t* pcap, size_t* plen, HexaVal v) {
+    _js_buf_append(pbuf, pcap, plen, "{", 1);
+    HexaVal keys = hexa_map_keys(v);
+    int64_t n = (int64_t)HX_ARR_LEN(keys);
+    for (int64_t i = 0; i < n; i++) {
+        if (i) _js_buf_append(pbuf, pcap, plen, ",", 1);
+        HexaVal k = HX_ARR_ITEMS(keys)[i];
+        if (HX_IS_STR(k)) _js_emit_string(pbuf, pcap, plen, HX_STR(k));
+        else              _js_emit_string(pbuf, pcap, plen, "");
+        _js_buf_append(pbuf, pcap, plen, ":", 1);
+        HexaVal vv = hexa_map_get(v, HX_IS_STR(k) ? HX_STR(k) : "");
+        _js_emit_value(pbuf, pcap, plen, vv);
+    }
+    _js_buf_append(pbuf, pcap, plen, "}", 1);
+}
+
+static void _js_emit_value(char** pbuf, size_t* pcap, size_t* plen, HexaVal v) {
+    if (HX_IS_VOID(v))       { _js_buf_append(pbuf, pcap, plen, "null", 4); return; }
+    if (HX_IS_BOOL(v))       { if (HX_BOOL(v)) _js_buf_append(pbuf, pcap, plen, "true", 4); else _js_buf_append(pbuf, pcap, plen, "false", 5); return; }
+    if (HX_IS_INT(v))        { char nb[32]; int k = snprintf(nb, sizeof(nb), "%lld", (long long)HX_INT(v)); if (k > 0) _js_buf_append(pbuf, pcap, plen, nb, (size_t)k); return; }
+    if (HX_IS_FLOAT(v))      {
+        double f = HX_FLOAT(v);
+        char nb[64];
+        int k;
+        if (f != f) k = snprintf(nb, sizeof(nb), "null");
+        else if (f == (double)(int64_t)f) k = snprintf(nb, sizeof(nb), "%lld.0", (long long)f);
+        else k = snprintf(nb, sizeof(nb), "%.17g", f);
+        if (k > 0) _js_buf_append(pbuf, pcap, plen, nb, (size_t)k);
+        return;
+    }
+    if (HX_IS_STR(v))        { _js_emit_string(pbuf, pcap, plen, HX_STR(v) ? HX_STR(v) : ""); return; }
+    if (HX_IS_ARRAY(v))      { _js_emit_array(pbuf, pcap, plen, v); return; }
+    if (HX_IS_MAP(v))        { _js_emit_object(pbuf, pcap, plen, v); return; }
+    _js_buf_append(pbuf, pcap, plen, "null", 4);
+}
+
+HexaVal hexa_json_stringify(HexaVal v) {
+    char* buf = NULL;
+    size_t cap = 0, len = 0;
+    _js_emit_value(&buf, &cap, &len, v);
+    if (!buf) return hexa_str("");
+    return hexa_str_own(buf);
+}
+
+HexaVal hexa_json_encode(HexaVal v) { return hexa_json_stringify(v); }
+
+// FIX-A (Anima ML eval unblock, 2026-04-19) ─────────────────────────
+// 8 tensor_* fallback builtins required by anima/serving/eval_alm.hexa
+// (and siblings) that do not explicitly `use "self/ml/tensor_ops.hexa"`.
+// Semantics mirror the pure-hexa tensor_ops implementation; performance
+// is intentionally naive — callers on the fast-path still pull the
+// BLAS/NEON-optimized self/ml/ modules explicitly. All ops operate on
+// flat row-major arrays of TAG_FLOAT / TAG_INT (coerced via __hx_to_double).
+
+// tensor_zeros(n): length-n array filled with 0.0.
+HexaVal hexa_tensor_zeros(HexaVal nv) {
+    int64_t n = (int64_t)__hx_to_double(nv);
+    if (n < 0) n = 0;
+    HexaVal arr = hexa_array_new();
+    for (int64_t i = 0; i < n; i++) arr = hexa_array_push(arr, hexa_float(0.0));
+    return arr;
+}
+
+// tensor_slice(arr, lo, hi): subarray [lo, hi) with clamped bounds.
+HexaVal hexa_tensor_slice(HexaVal a, HexaVal lov, HexaVal hiv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    int64_t lo = (int64_t)__hx_to_double(lov);
+    int64_t hi = (int64_t)__hx_to_double(hiv);
+    if (lo < 0) lo = 0;
+    if (hi > n) hi = n;
+    for (int64_t i = lo; i < hi; i++) out = hexa_array_push(out, hexa_array_get(a, i));
+    return out;
+}
+
+// tensor_add(a, b): elementwise a[i] + b[i], length = min(|a|, |b|).
+HexaVal hexa_tensor_add(HexaVal a, HexaVal b) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return out;
+    int64_t na = (int64_t)HX_ARR_LEN(a), nb = (int64_t)HX_ARR_LEN(b);
+    int64_t k = na < nb ? na : nb;
+    for (int64_t i = 0; i < k; i++) {
+        double va = __hx_to_double(hexa_array_get(a, i));
+        double vb = __hx_to_double(hexa_array_get(b, i));
+        out = hexa_array_push(out, hexa_float(va + vb));
+    }
+    return out;
+}
+
+// tensor_dot(a, b): scalar sum(a[i] * b[i]) over min length.
+HexaVal hexa_tensor_dot(HexaVal a, HexaVal b) {
+    if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return hexa_float(0.0);
+    int64_t na = (int64_t)HX_ARR_LEN(a), nb = (int64_t)HX_ARR_LEN(b);
+    int64_t k = na < nb ? na : nb;
+    double s = 0.0;
+    for (int64_t i = 0; i < k; i++) {
+        s += __hx_to_double(hexa_array_get(a, i)) *
+             __hx_to_double(hexa_array_get(b, i));
+    }
+    return hexa_float(s);
+}
+
+// tensor_mul_scalar(a, s): elementwise a[i] * s.
+HexaVal hexa_tensor_mul_scalar(HexaVal a, HexaVal sv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    double s = __hx_to_double(sv);
+    for (int64_t i = 0; i < n; i++) {
+        double va = __hx_to_double(hexa_array_get(a, i));
+        out = hexa_array_push(out, hexa_float(va * s));
+    }
+    return out;
+}
+
+// rms_norm(x, gamma, eps): gamma[i] * x[i] / sqrt(mean(x^2) + eps).
+// gamma may be array (per-element scale) or scalar (uniform scale).
+HexaVal hexa_rms_norm(HexaVal x, HexaVal gamma, HexaVal epsv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(x)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(x);
+    if (n == 0) return out;
+    double ss = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        double v = __hx_to_double(hexa_array_get(x, i));
+        ss += v * v;
+    }
+    double mean = ss / (double)n;
+    double eps = __hx_to_double(epsv);
+    double inv = 1.0 / sqrt(mean + eps);
+    int gamma_is_arr = HX_IS_ARRAY(gamma);
+    double gamma_scalar = gamma_is_arr ? 1.0 : __hx_to_double(gamma);
+    for (int64_t i = 0; i < n; i++) {
+        double v = __hx_to_double(hexa_array_get(x, i));
+        double g = gamma_is_arr
+            ? __hx_to_double(hexa_array_get(gamma, i < (int64_t)HX_ARR_LEN(gamma) ? i : 0))
+            : gamma_scalar;
+        out = hexa_array_push(out, hexa_float(g * v * inv));
+    }
+    return out;
+}
+
+// softmax(a): stable softmax — subtract max, exp, normalize by sum.
+HexaVal hexa_softmax(HexaVal a) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a)) return out;
+    int64_t n = (int64_t)HX_ARR_LEN(a);
+    if (n == 0) return out;
+    double m = __hx_to_double(hexa_array_get(a, 0));
+    for (int64_t i = 1; i < n; i++) {
+        double v = __hx_to_double(hexa_array_get(a, i));
+        if (v > m) m = v;
+    }
+    double sum = 0.0;
+    double* tmp = (double*)malloc(sizeof(double) * (size_t)n);
+    for (int64_t i = 0; i < n; i++) {
+        double v = __hx_to_double(hexa_array_get(a, i));
+        tmp[i] = exp(v - m);
+        sum += tmp[i];
+    }
+    double inv = sum > 0.0 ? 1.0 / sum : 0.0;
+    for (int64_t i = 0; i < n; i++) out = hexa_array_push(out, hexa_float(tmp[i] * inv));
+    free(tmp);
+    return out;
+}
+
+// matmul(A, B, m, k, n): row-major C[m*n] = A[m*k] @ B[k*n], naive O(mkn).
+HexaVal hexa_matmul(HexaVal a, HexaVal b, HexaVal mv, HexaVal kv, HexaVal nv) {
+    HexaVal out = hexa_array_new();
+    if (!HX_IS_ARRAY(a) || !HX_IS_ARRAY(b)) return out;
+    int64_t m = (int64_t)__hx_to_double(mv);
+    int64_t k = (int64_t)__hx_to_double(kv);
+    int64_t n = (int64_t)__hx_to_double(nv);
+    if (m < 0 || k < 0 || n < 0) return out;
+    int64_t alen = (int64_t)HX_ARR_LEN(a), blen = (int64_t)HX_ARR_LEN(b);
+    for (int64_t i = 0; i < m; i++) {
+        for (int64_t j = 0; j < n; j++) {
+            double s = 0.0;
+            for (int64_t p = 0; p < k; p++) {
+                int64_t ai = i * k + p;
+                int64_t bi = p * n + j;
+                if (ai >= alen || bi >= blen) continue;
+                s += __hx_to_double(hexa_array_get(a, ai)) *
+                     __hx_to_double(hexa_array_get(b, bi));
+            }
+            out = hexa_array_push(out, hexa_float(s));
+        }
+    }
+    return out;
 }
 
 // Base64 (RFC 4648)
