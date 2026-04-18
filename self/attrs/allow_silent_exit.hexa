@@ -1,0 +1,289 @@
+// self/attrs/allow_silent_exit.hexa — @allow-silent-exit safety attr
+//
+// 배경 (2026-04-19, PR-1):
+//   · stage0 `exit(N)` 미전파 — fn 이 exit(3) 호출해도 프로세스 종료 코드는 0
+//   · nexus 워크어라운드: stdout-prefix 프로토콜 (`println("REJECT:...")`)
+//     + bash wrapper (`$NEXUS/shared/harness/exec_validated`) 가 파싱·합성
+//   · 160+ 회 출현 (40 파일) — 기술 부채 누적
+//
+// 설계 (PR-1 scope: attr + policy plumbing 만; 런타임 전파 는 PR-3):
+//   · `@allow-silent-exit` 를 first-class attr 로 승격
+//   · fn 이 의도적으로 exit() 하지만 exit code 를 OS 로 propagate 안 하는 경우 마킹
+//   · .hexa-attrs 에 `warn = ["unannotated-exit"]` 토큰 선언 시 lint 가
+//     annotation 없는 exit() 호출 fn 을 warn (block 은 migration 후 PR)
+//   · HX11 — `find_silentexit_rules(source)` helper 제공 (프로젝트별 `.silentexit-rules.json`)
+//
+// 등록 이름: "silentexit" (단일 lowercase 단어, _naming 규칙 준수)
+// 인식 마커: `@allow-silent-exit` (canonical), `@silent-exit`, `@silentexit`
+
+use "self/attrs/core"
+use "self/attrs/_lib/rules_loader"
+
+fn meta_silentexit() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name        = "silentexit"
+    m.category    = "safety"
+    m.purpose     = "fn 이 의도적으로 exit() 호출하되 exit code 전파 안함을 선언 (stdout-prefix 프로토콜 등)"
+    m.cost_rule   = "lint 시 .hexa-attrs warn=[unannotated-exit] 활성 + @allow-silent-exit 부재 → warn"
+    m.side_effect = "declarative marker. 런타임 동작 변경 없음 — PR-3 에서 exit() propagate 후 강제 적용"
+    m.requires    = "ai_native_lint.hexa 또는 attr_cli lint 실행"
+    m.auto_test   = "fn t() { exit(3) } + .hexa-attrs warn=[unannotated-exit] → warn 1개; @allow-silent-exit 부착 → 0개"
+    m.example     = "// @allow-silent-exit — stdout-prefix 프로토콜 (REJECT:...)\nfn gate() { println(\"REJECT:reason\"); exit(1) }"
+    m.implemented = true
+    return m
+}
+
+// ─── 마커 인식 ────────────────────────────────────────────────
+// @allow-silent-exit (canonical) / @silent-exit / @silentexit 중 하나면 true
+fn _has_silent_exit_marker(lines, attr_line_1based: int) -> bool {
+    // attr_line_1based 직전의 연속 주석 블록 + 해당 줄의 주석 + fn 시그니처 줄 직전
+    // 까지 스캔. 관례상 fn 선언 직전 라인들에 `// @allow-silent-exit` 위치.
+    if attr_line_1based <= 0 { return false }
+    // attr_line_1based 는 fn 시그니처 라인이므로 그 이전 라인들을 위로 훑음
+    let mut i = attr_line_1based - 2  // fn line - 1 = 직전 줄 (0-based idx)
+    while i >= 0 {
+        if i >= len(lines) { i = i - 1; continue }
+        let t = lines[i].trim()
+        // 빈 줄 또는 다른 주석은 통과하되, 비주석·비빈줄 만나면 stop
+        if t == "" { i = i - 1; continue }
+        if !t.starts_with("//") { break }
+        if t.contains("@allow-silent-exit") { return true }
+        if t.contains("@silent-exit") { return true }
+        if t.contains("@silentexit") { return true }
+        i = i - 1
+    }
+    return false
+}
+
+// fn body 에서 `exit(<non-zero>)` 호출 감지 → 첫 라인 번호 반환 (없으면 -1)
+// 단순 문법: `exit(` 뒤 숫자 리터럴. `exit(0)` 는 무시 (정상 종료).
+fn _find_nonzero_exit(lines, fn_start_1based: int, fn_end_1based: int) -> int {
+    let start_idx = fn_start_1based - 1
+    let end_idx = fn_end_1based - 1
+    let mut i = start_idx
+    while i <= end_idx && i < len(lines) {
+        let t = lines[i].trim()
+        // 주석 내 문자열은 무시
+        if t.starts_with("//") { i = i + 1; continue }
+        let p = t.index_of("exit(")
+        if p >= 0 {
+            let after = t.substring(p + 5, len(t))
+            let cp = after.index_of(")")
+            if cp > 0 {
+                let arg = after.substring(0, cp).trim()
+                // `exit(0)` 은 정상 — skip
+                if arg != "0" && arg != "" {
+                    return i + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// fn 시그니처 줄에서 이름 추출 — `fn foo(...)` 또는 `pub fn foo(...)`
+fn _fn_name_at(line: string) -> string {
+    let t = line.trim()
+    let mut rest = t
+    if rest.starts_with("pub fn ") { rest = rest.substring(7, len(rest)) }
+    else if rest.starts_with("fn ") { rest = rest.substring(3, len(rest)) }
+    else { return "" }
+    let mut name = ""
+    let chars = rest.chars()
+    for ch in chars {
+        let c = char_code(to_string(ch), 0)
+        let is_alpha = (c >= 97 && c <= 122) || (c >= 65 && c <= 90) || c == 95
+        let is_digit = c >= 48 && c <= 57
+        if is_alpha || (name != "" && is_digit) {
+            name = name + to_string(ch)
+        } else {
+            break
+        }
+    }
+    return name
+}
+
+// ─── HX11 프로젝트 규칙 로더 ──────────────────────────────────
+// `.silentexit-rules.json` 또는 `project.hexa` 의 @silentexit_rules 블록
+// 현재 지원 키: `warn_on_unannotated_exit: bool`, `exempt_fns: [string]`
+pub fn find_silentexit_rules(source: string) {
+    // project.hexa / json 공통 경로 — _lib/rules_loader 재사용
+    let sel = #{}
+    let rules = find_attr_rules_v2(source, "silentexit", sel)
+    if len(keys(rules)) > 0 { return rules }
+    // 빈 map → 호출자가 .hexa-attrs `warn = [...]` 로 fallback 판정
+    return #{}
+}
+
+// rules 에서 warn_on_unannotated_exit 효과치 — default false
+fn _rules_warn_enabled(rules) -> bool {
+    if !has_key(rules, "warn_on_unannotated_exit") { return false }
+    let v = rules["warn_on_unannotated_exit"]
+    if v == true { return true }
+    return false
+}
+
+// rules 에서 exempt_fns 리스트 — default []
+fn _rules_exempt_fns(rules) {
+    if !has_key(rules, "exempt_fns") { return [] }
+    let v = rules["exempt_fns"]
+    // array type guard
+    try {
+        let _ = len(v)
+        return v
+    } catch e {
+        return []
+    }
+}
+
+// .hexa-attrs 의 `warn = [...]` 토큰 로드 — attr_cli._parse_attrs_file 이 전달 못할 때
+// source 기반 자체 탐색 fallback
+fn _hexa_attrs_warn_has(source: string, token: string) -> bool {
+    // source 가 파일 경로가 아니라 content 일 수 있음 — 줄바꿈 포함 시 skip
+    if source == "" { return false }
+    if source.contains("\n") { return false }
+    // 상위 traverse 로 .hexa-attrs 탐색
+    let mut cur = source
+    if !cur.starts_with("/") {
+        let pwd = to_string(exec("pwd")).trim()
+        if pwd != "" { cur = pwd + "/" + cur }
+    }
+    // 파일이면 dirname 부터
+    let is_dir = to_string(exec("test -d '" + cur + "' && printf 1 || printf 0")).trim()
+    if is_dir != "1" {
+        let dn = to_string(exec("dirname '" + cur + "'")).trim()
+        if dn != "" { cur = dn }
+    }
+    let mut hops = 0
+    while hops < 20 {
+        hops = hops + 1
+        let probe = cur + "/.hexa-attrs"
+        let exists = to_string(exec("test -f '" + probe + "' && printf 1 || printf 0")).trim()
+        if exists == "1" {
+            let mut raw = ""
+            try { raw = to_string(read_file(probe)) } catch e { raw = "" }
+            if raw != "" {
+                let plines = split(raw, "\n")
+                for pl in plines {
+                    let pt = pl.trim()
+                    if pt == "" { continue }
+                    if pt.starts_with("#") { continue }
+                    let eq = pt.index_of("=")
+                    if eq < 0 { continue }
+                    let k = pt.substring(0, eq).trim()
+                    if k != "warn" { continue }
+                    let v = pt.substring(eq + 1, len(pt)).trim()
+                    let toks = split(v, ",")
+                    for tk in toks {
+                        if tk.trim() == token { return true }
+                    }
+                }
+            }
+            return false
+        }
+        if cur == "/" || cur == "" { break }
+        let parent = to_string(exec("dirname '" + cur + "'")).trim()
+        if parent == cur { break }
+        cur = parent
+    }
+    return false
+}
+
+// ─── check fn ─────────────────────────────────────────────────
+// 동작:
+//   1) rules.warn_on_unannotated_exit == true
+//      OR .hexa-attrs warn=[unannotated-exit]  → warn_enabled
+//   2) warn_enabled=false 면 조용히 통과 ([])
+//   3) warn_enabled=true 면 lines 스캔 → 각 fn 순회
+//      · fn body 에 exit(<non-zero>) 있고
+//      · 직전에 @allow-silent-exit 마커 없으면
+//      · warn 메시지 1건 발행
+//
+// `@silentexit` 자체가 파일에 있는지는 unknown_attrs_in 이 알아서 인식 (registered attr).
+// 따라서 여기선 rules/policy 판정 → 전체 fn 스캔 모드.
+fn check_silentexit(source: string, lines: [string]) {
+    let mut out = []
+
+    // policy 감지 — 프로젝트 rules 또는 .hexa-attrs warn=[]
+    let rules = find_silentexit_rules(source)
+    let mut warn_enabled = _rules_warn_enabled(rules)
+    if !warn_enabled {
+        // source 가 파일 경로처럼 보이면 .hexa-attrs warn=[] 직접 조회
+        if _hexa_attrs_warn_has(source, "unannotated-exit") {
+            warn_enabled = true
+        }
+    }
+    if !warn_enabled { return out }
+
+    let exempt_list = _rules_exempt_fns(rules)
+
+    // fn 시그니처 줄 전부 찾기 → body range → exit() 탐지
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        let is_fn = t.starts_with("fn ") || t.starts_with("pub fn ")
+        if !is_fn { i = i + 1; continue }
+
+        let fn_line_1based = i + 1
+        let fname = _fn_name_at(lines[i])
+        // exempt check
+        let mut is_exempt = false
+        for ef in exempt_list {
+            if ef == fname { is_exempt = true }
+        }
+        if is_exempt { i = i + 1; continue }
+
+        let rng = fn_body_range(lines, fn_line_1based)
+        let body_start = rng[0]
+        let body_end = rng[1]
+
+        let exit_line = _find_nonzero_exit(lines, body_start, body_end)
+        if exit_line < 0 { i = i + 1; continue }
+
+        // annotation 체크 — fn 시그니처 직전 주석 블록
+        if _has_silent_exit_marker(lines, fn_line_1based) { i = i + 1; continue }
+
+        let fname_show = if fname != "" { fname } else { "(anonymous)" }
+        out = out.push(mk_msg(
+            "silentexit", "warn", source, exit_line, 0,
+            "fn `" + fname_show + "` calls exit() without @allow-silent-exit annotation " +
+            "(warn_on_unannotated_exit active)",
+            "add `// @allow-silent-exit — <reason>` above fn signature, or add fn to exempt_fns rule",
+            "// @allow-silent-exit — <reason>\nfn " + fname_show + "() { ... exit(N) ... }",
+            "self/attrs/allow_silent_exit.hexa (HX11 warn_on_unannotated_exit)"))
+
+        // fn body 밖으로 skip
+        if body_end > i { i = body_end } else { i = i + 1 }
+    }
+
+    return out
+}
+
+// ─── audit helper (스크립트 migrate 에서 재사용) ──────────────
+// read-only 감사 — (file, line, fn_name) 튜플 배열 반환.
+// warn_enabled 와 무관하게 "부착이 필요할" 후보를 전부 리스트업.
+pub fn audit_unannotated_exits(source: string, lines) {
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        let is_fn = t.starts_with("fn ") || t.starts_with("pub fn ")
+        if !is_fn { i = i + 1; continue }
+
+        let fn_line_1based = i + 1
+        let fname = _fn_name_at(lines[i])
+        let rng = fn_body_range(lines, fn_line_1based)
+        let body_start = rng[0]
+        let body_end = rng[1]
+        let exit_line = _find_nonzero_exit(lines, body_start, body_end)
+        if exit_line < 0 { i = i + 1; continue }
+        if _has_silent_exit_marker(lines, fn_line_1based) { i = i + 1; continue }
+
+        out = out.push([source, to_string(exit_line), fname])
+        if body_end > i { i = body_end } else { i = i + 1 }
+    }
+    return out
+}
