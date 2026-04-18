@@ -142,6 +142,260 @@ fn build_response(resp) {
 }
 
 // ===================================================================
+//  JSON mini — pure-hexa encoder + parser (subset)
+//
+//  Stringify: handles nil, bool, int, float, string, array, map
+//  Parse:     object / array / string / number / bool / null
+//
+//  Scope limits (2026-04-19, Anima ALM serving unblock):
+//    * no \uXXXX in strings (ASCII/byte escapes only)
+//    * numbers: decimal only (no scientific notation)
+//    * no trailing commas, no comments, no BOM
+//
+//  These are sufficient for /generate request bodies and the server's
+//  own response envelopes. Keep in sync with self/runtime/json_mini_pure.hexa.
+// ===================================================================
+
+fn _json_escape_body(s) {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let o = ord(c)
+        if o == 34 { parts.push("\\\"") }
+        else if o == 92 { parts.push("\\\\") }
+        else if o == 10 { parts.push("\\n") }
+        else if o == 13 { parts.push("\\r") }
+        else if o == 9  { parts.push("\\t") }
+        else if o == 8  { parts.push("\\b") }
+        else if o == 12 { parts.push("\\f") }
+        else { parts.push(c) }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn json_stringify(v) {
+    let t = type_of(v)
+    if t == "nil" { return "null" }
+    if t == "bool" {
+        if v == true { return "true" }
+        return "false"
+    }
+    if t == "int" { return to_string(v) }
+    if t == "float" { return to_string(v) }
+    if t == "string" { return "\"" + _json_escape_body(v) + "\"" }
+    if t == "array" {
+        let n = len(v)
+        let mut parts = []
+        parts.push("[")
+        let mut i = 0
+        while i < n {
+            if i > 0 { parts.push(",") }
+            parts.push(json_stringify(v[i]))
+            i = i + 1
+        }
+        parts.push("]")
+        return parts.join("")
+    }
+    if t == "map" {
+        let keys = dict_keys(v)
+        let n = len(keys)
+        let mut parts = []
+        parts.push("{")
+        let mut i = 0
+        while i < n {
+            if i > 0 { parts.push(",") }
+            let k = keys[i]
+            parts.push("\"")
+            parts.push(_json_escape_body(k))
+            parts.push("\":")
+            parts.push(json_stringify(v[k]))
+            i = i + 1
+        }
+        parts.push("}")
+        return parts.join("")
+    }
+    // fallback: coerce via to_string
+    return "\"" + _json_escape_body(to_string(v)) + "\""
+}
+
+// ── Parser ─────────────────────────────────────────────────────────
+// Returns a 2-element array: [value, next_index]. On parse error,
+// returns [nil, -1]. The top-level wrapper `json_parse` unwraps.
+
+fn _json_skip_ws(s, i) {
+    let n = len(s)
+    let mut j = i
+    while j < n {
+        let c = s.substring(j, j + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" {
+            j = j + 1
+        } else {
+            return j
+        }
+    }
+    return j
+}
+
+fn _json_parse_string(s, i) {
+    // Expect s[i] == '"'. Returns [str, next].
+    let n = len(s)
+    if i >= n { return [nil, 0 - 1] }
+    if s.substring(i, i + 1) != "\"" { return [nil, 0 - 1] }
+    let mut j = i + 1
+    let mut parts = []
+    while j < n {
+        let c = s.substring(j, j + 1)
+        if c == "\"" {
+            return [parts.join(""), j + 1]
+        }
+        if c == "\\" && (j + 1) < n {
+            let esc = s.substring(j + 1, j + 2)
+            if esc == "\"" { parts.push("\"") }
+            else if esc == "\\" { parts.push("\\") }
+            else if esc == "/" { parts.push("/") }
+            else if esc == "n" { parts.push("\n") }
+            else if esc == "r" { parts.push("\r") }
+            else if esc == "t" { parts.push("\t") }
+            else if esc == "b" { parts.push(from_char_code(8)) }
+            else if esc == "f" { parts.push(from_char_code(12)) }
+            else { parts.push(esc) }
+            j = j + 2
+        } else {
+            parts.push(c)
+            j = j + 1
+        }
+    }
+    return [nil, 0 - 1]
+}
+
+fn _json_is_num_char(c) {
+    if c == "-" { return true }
+    if c == "+" { return true }
+    if c == "." { return true }
+    let o = ord(c)
+    if o >= 48 && o <= 57 { return true }
+    return false
+}
+
+fn _json_parse_number(s, i) {
+    let n = len(s)
+    let mut j = i
+    let mut has_dot = false
+    while j < n {
+        let c = s.substring(j, j + 1)
+        if c == "." {
+            has_dot = true
+            j = j + 1
+        } else {
+            if _json_is_num_char(c) {
+                j = j + 1
+            } else {
+                return [_json_num_from(s, i, j, has_dot), j]
+            }
+        }
+    }
+    return [_json_num_from(s, i, j, has_dot), j]
+}
+
+fn _json_num_from(s, start, end_idx, has_dot) {
+    let raw = s.substring(start, end_idx)
+    if has_dot { return to_float(raw) }
+    return to_int(raw)
+}
+
+fn _json_parse_value(s, i) {
+    let n = len(s)
+    let p = _json_skip_ws(s, i)
+    if p >= n { return [nil, 0 - 1] }
+    let c = s.substring(p, p + 1)
+    if c == "\"" { return _json_parse_string(s, p) }
+    if c == "{" { return _json_parse_object(s, p) }
+    if c == "[" { return _json_parse_array(s, p) }
+    if c == "t" {
+        if (p + 4) <= n {
+            if s.substring(p, p + 4) == "true" { return [true, p + 4] }
+        }
+        return [nil, 0 - 1]
+    }
+    if c == "f" {
+        if (p + 5) <= n {
+            if s.substring(p, p + 5) == "false" { return [false, p + 5] }
+        }
+        return [nil, 0 - 1]
+    }
+    if c == "n" {
+        if (p + 4) <= n {
+            if s.substring(p, p + 4) == "null" { return [nil, p + 4] }
+        }
+        return [nil, 0 - 1]
+    }
+    if _json_is_num_char(c) { return _json_parse_number(s, p) }
+    return [nil, 0 - 1]
+}
+
+fn _json_parse_object(s, i) {
+    let n = len(s)
+    if s.substring(i, i + 1) != "{" { return [nil, 0 - 1] }
+    let mut j = _json_skip_ws(s, i + 1)
+    let mut obj = #{}
+    if j < n {
+        if s.substring(j, j + 1) == "}" { return [obj, j + 1] }
+    }
+    while j < n {
+        let kr = _json_parse_string(s, j)
+        if kr[1] < 0 { return [nil, 0 - 1] }
+        let key = kr[0]
+        j = _json_skip_ws(s, kr[1])
+        if j >= n { return [nil, 0 - 1] }
+        if s.substring(j, j + 1) != ":" { return [nil, 0 - 1] }
+        j = _json_skip_ws(s, j + 1)
+        let vr = _json_parse_value(s, j)
+        if vr[1] < 0 { return [nil, 0 - 1] }
+        obj[key] = vr[0]
+        j = _json_skip_ws(s, vr[1])
+        if j >= n { return [nil, 0 - 1] }
+        let sep = s.substring(j, j + 1)
+        if sep == "}" { return [obj, j + 1] }
+        if sep != "," { return [nil, 0 - 1] }
+        j = _json_skip_ws(s, j + 1)
+    }
+    return [nil, 0 - 1]
+}
+
+fn _json_parse_array(s, i) {
+    let n = len(s)
+    if s.substring(i, i + 1) != "[" { return [nil, 0 - 1] }
+    let mut j = _json_skip_ws(s, i + 1)
+    let mut arr = []
+    if j < n {
+        if s.substring(j, j + 1) == "]" { return [arr, j + 1] }
+    }
+    while j < n {
+        let vr = _json_parse_value(s, j)
+        if vr[1] < 0 { return [nil, 0 - 1] }
+        arr.push(vr[0])
+        j = _json_skip_ws(s, vr[1])
+        if j >= n { return [nil, 0 - 1] }
+        let sep = s.substring(j, j + 1)
+        if sep == "]" { return [arr, j + 1] }
+        if sep != "," { return [nil, 0 - 1] }
+        j = _json_skip_ws(s, j + 1)
+    }
+    return [nil, 0 - 1]
+}
+
+fn json_parse(text) {
+    if type_of(text) != "string" { return nil }
+    if len(text) == 0 { return nil }
+    let r = _json_parse_value(text, 0)
+    if r[1] < 0 { return nil }
+    return r[0]
+}
+
+// ===================================================================
 //  JSON helpers
 // ===================================================================
 fn json_ok(data) {
