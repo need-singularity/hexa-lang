@@ -1,0 +1,207 @@
+// tool/no_hardcode_lint.hexa — raw#14 enforcer (no hardcoding — values belong in SSOT)
+//
+// usage:
+//   hexa tool/no_hardcode_lint.hexa             — scan + exit 0 (report-only, status=new)
+//   hexa tool/no_hardcode_lint.hexa --bake      — regenerate .hardcode-baseline (grandfather current)
+//   hexa tool/no_hardcode_lint.hexa --list      — list violations w/o baseline filter
+//   hexa tool/no_hardcode_lint.hexa --block     — exit 1 on any non-baseline hit (CI)
+//
+// rule: raw#14 — forbids hardcoded paths (/Users/, /tmp/, /var/, /etc/),
+//   URLs (http://, https://), and hostnames (192.168., 10.0., 127.0.0.1, localhost)
+//   inside .hexa source string literals. Opt-out: `@const` marker on same line.
+//   Baseline: .hardcode-baseline (grandfather current drift).
+//
+// STATUS=new policy: report-only default. Literal-level accuracy deferred —
+//   current impl uses grep over raw source; string-literal isolation via `"..."` heuristic.
+//   Magic-number detection NOT implemented (parser-dependent, follow-up).
+//
+// Implementation: delegates heavy scanning to shell (grep -n + fgrep patterns) for speed.
+//   Pure-hexa char-walk of 2200+ .hexa files is prohibitively slow in interpreter.
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _scan_dirs() -> array {
+    return ["self", "tool", "bench", "test", "example", "stdlib"]
+}
+
+fn _ban_patterns() -> array {
+    return [
+        "/Users/",
+        "/tmp/",
+        "/var/",
+        "/etc/",
+        "http://",
+        "https://",
+        "192.168.",
+        "10.0.",
+        "127.0.0.1",
+        "localhost",
+    ]
+}
+
+fn _load_baseline(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut out = []
+    for raw_line in lines {
+        let l = _rstrip(raw_line)
+        if len(l) == 0 { continue }
+        if l.substring(0, 1) == "#" { continue }
+        out = out.push(l)
+    }
+    return out
+}
+
+fn _in_baseline(baseline: array, key: string) -> bool {
+    for b in baseline {
+        if b == key { return true }
+    }
+    return false
+}
+
+// Use grep -rn with fixed strings for each pattern. Returns array of [path, lineno, pattern, key].
+// Filters out lines matching @const, pure // comments, and lines with no `"` (non-literal).
+fn _grep_dir_for_pattern(dir: string, pat: string) -> array {
+    // grep -rn -F --include='*.hexa' "<pat>" <dir>
+    // NOTE: stage0 exec() shell-metachar warning is informational; escape quotes manually.
+    let cmd = "grep -rn -F --include='*.hexa' -- " + _shell_quote(pat) + " " + dir + " 2>/dev/null || true"
+    let raw = to_string(exec(cmd))
+    if len(raw) == 0 { return [] }
+    let lines = split(raw, "\n")
+    let mut hits = []
+    for ln in lines {
+        let l = _rstrip(ln)
+        if len(l) == 0 { continue }
+        // format: <path>:<lineno>:<text>
+        let c1 = l.index_of(":")
+        if c1 < 0 { continue }
+        let path = l.substring(0, c1)
+        let rest = l.substring(c1 + 1, len(l))
+        let c2 = rest.index_of(":")
+        if c2 < 0 { continue }
+        let lineno = rest.substring(0, c2)
+        let text = rest.substring(c2 + 1, len(rest))
+        // filter 1: must contain `"` (string literal present on line)
+        if !text.contains("\"") { continue }
+        // filter 2: skip @const opt-out
+        if text.contains("@const") { continue }
+        // filter 3: pure // comment lines
+        let ts = text.trim_start()
+        if len(ts) >= 2 && ts.substring(0, 2) == "//" { continue }
+        let key = path + ":" + lineno + ":" + pat
+        hits = hits.push([path, lineno, pat, key])
+    }
+    return hits
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s + "'"
+}
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli = cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut bake = false
+let mut list_only = false
+let mut block_mode = false
+for a in cli {
+    if a == "--bake" { bake = true }
+    else if a == "--list" { list_only = true }
+    else if a == "--block" { block_mode = true }
+}
+
+let root = _pwd()
+let baseline_path = root + "/.hardcode-baseline"
+let baseline = _load_baseline(baseline_path)
+let use_baseline = !bake && !list_only
+
+// gather hits per pattern per dir
+let dirs = _scan_dirs()
+let pats = _ban_patterns()
+let mut all_hits = []
+
+for d in dirs {
+    let abs = root + "/" + d
+    let exists = to_string(exec("test -d '" + abs + "' && echo y || echo n")).trim()
+    if exists != "y" { continue }
+    for p in pats {
+        let hits = _grep_dir_for_pattern(d, p)
+        for h in hits {
+            if use_baseline && _in_baseline(baseline, h[3]) { continue }
+            all_hits = all_hits.push(h)
+        }
+    }
+}
+
+println("── raw#14 no_hardcode_lint ──")
+println("dirs    : " + to_string(len(dirs)))
+println("patterns: " + to_string(len(pats)))
+println("baseline: " + to_string(len(baseline)) + " entries")
+println("hits    : " + to_string(len(all_hits)))
+
+if bake {
+    let mut parts = []
+    parts = parts.push("# .hardcode-baseline — raw#14 grandfather list")
+    parts = parts.push("# format: <path>:<line>:<pattern>")
+    parts = parts.push("# regenerate: hexa tool/no_hardcode_lint.hexa --bake")
+    parts = parts.push("")
+    for h in all_hits {
+        parts = parts.push(h[3])
+    }
+    let body = parts.join("\n") + "\n"
+    write_file(baseline_path, body)
+    println("✅ baked " + to_string(len(all_hits)) + " entries into " + baseline_path)
+    exit(0)
+}
+
+if list_only {
+    for h in all_hits {
+        println("  " + h[0] + ":" + h[1] + " — " + h[2])
+    }
+    exit(0)
+}
+
+if len(all_hits) == 0 {
+    println("✅ PASS")
+    exit(0)
+}
+
+// truncate report to 30 lines
+let limit = 30
+let mut shown = 0
+for h in all_hits {
+    if shown >= limit { break }
+    eprintln("  " + h[0] + ":" + h[1] + " — " + h[2])
+    shown = shown + 1
+}
+if len(all_hits) > limit {
+    eprintln("  … " + to_string(len(all_hits) - limit) + " more (run --list for full)")
+}
+
+if block_mode {
+    println("🚫 FAIL — " + to_string(len(all_hits)) + " hardcoded violations")
+    exit(1)
+}
+println("⚠ WARN (status=new, report-only) — " + to_string(len(all_hits)) + " hardcoded hits")
+println("  bake current state: hexa tool/no_hardcode_lint.hexa --bake")
+exit(0)
