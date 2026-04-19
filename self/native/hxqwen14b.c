@@ -2506,3 +2506,692 @@ int hxqwen14b_smoke_v52(void* args) {
 }
 
 // End of v5.2 addendum.
+
+// ═════════════════════════════════════════════════════════════════════
+// v5.3 addendum — dispatch wrappers + safetensors shard parser.
+//
+// The 4 CUDA kernels (rmsnorm/rope/gqa/swiglu) live in the sibling TU
+// hxqwen14b_cuda.cu, exposed as extern "C" launchers:
+//   hxqwen14b_cu_launch_{rmsnorm,rope,gqa,swiglu}
+//   hxqwen14b_cu_{malloc_bytes,free_ptr,memcpy_h2d,memcpy_d2h,device_sync}
+//
+// This split keeps the main .c compilable by gcc (no nvcc C++ init-past-
+// goto complaints against pre-existing v5.1 code). Link time brings the
+// two TUs together into libhxqwen14b.so.
+//
+// Scope discipline (4-6h budget):
+//   (a) CUDA kernel dispatch wrappers — HxQwenKernelDispatch struct +
+//       _v53-suffixed entry points that route CPU vs CUDA by env
+//       HXQWEN_CPU=1 OR the is_device flag.
+//   (b) Safetensors shard header parser — hxqwen14b_shard_tensor_info
+//       reads offset-0 JSON header and returns {dtype, shape, byte
+//       range} for a named tensor. Used by (c).
+//   (c) hxqwen14b_load_tensor_bf16 — load ONE named BF16 tensor by
+//       mmap + cu_malloc + cu_memcpy. Trainer iterates 360+ tensor
+//       names. Full-model upload orchestration left to hexa caller.
+//   (d) hxqwen14b_smoke_v53 — runs the 4 CUDA kernels with the same
+//       seeded inputs as smoke_v52; compares to CPU kernel outputs.
+//
+// Tabled for v5.4 (NOT in this commit):
+//   * Full 48-layer forward_with_lora rewire (real weights + cuBLAS
+//     matmul per layer + tied-embed lm_head). v5.1 identity-plus-
+//     residual scaffold preserved; trainer contract unchanged.
+//   * Backward CUDA ports for rmsnorm/rope/gqa/swiglu.
+//   * cuDNN SDPA path (pod image lacks cuDNN; hand-rolled GQA used).
+// ═════════════════════════════════════════════════════════════════════
+
+// ─────────────────────────────────────────────────────────────
+// Extern CUDA launchers — defined in hxqwen14b_cuda.cu. When the build
+// is gcc-only (no nvcc linkage), these are declared but not linked; the
+// dispatch helper routes around them so the CPU path always works.
+// ─────────────────────────────────────────────────────────────
+#ifdef HXQWEN14B_CUDA
+extern int  hxqwen14b_cu_launch_rmsnorm(const float* x, const float* w,
+                                         float* y, int64_t M, int64_t d,
+                                         float eps);
+extern int  hxqwen14b_cu_launch_rope(float* x, int64_t B, int64_t S,
+                                      int64_t H, int64_t D,
+                                      float theta_base, int64_t pos_offset);
+extern int  hxqwen14b_cu_launch_gqa(const float* Q, const float* K,
+                                     const float* V, float* O,
+                                     int64_t B, int64_t S,
+                                     int64_t HQ, int64_t HK, int64_t D,
+                                     float scale, int64_t causal);
+extern int  hxqwen14b_cu_launch_swiglu(const float* g, const float* u,
+                                        float* y, int64_t N);
+extern int64_t hxqwen14b_cu_malloc_bytes(int64_t n_bytes);
+extern int  hxqwen14b_cu_free_ptr(int64_t dev_ptr);
+extern int  hxqwen14b_cu_memcpy_h2d(int64_t dst_dev, const void* src_host,
+                                     int64_t n_bytes);
+extern int  hxqwen14b_cu_memcpy_d2h(void* dst_host, int64_t src_dev,
+                                     int64_t n_bytes);
+extern int  hxqwen14b_cu_device_sync(void);
+#endif
+
+int64_t hxqwen14b_version_v53(void) {
+    // Returns 53 so hexa-side trainer can detect v5.3 by calling the new
+    // symbol; hxqwen14b_version() continues to return 52 for ABI stability.
+    return 53;
+}
+
+// ─────────────────────────────────────────────────────────────
+// v5.3 kernel-dispatch helper: pick CPU vs CUDA path.
+// Env HXQWEN_CPU=1 forces CPU; else is_device flag decides.
+// ─────────────────────────────────────────────────────────────
+static int v53_use_cuda(int64_t is_device_flag) {
+#ifndef HXQWEN14B_CUDA
+    (void)is_device_flag;
+    return 0;
+#else
+    const char* e = getenv("HXQWEN_CPU");
+    if (e != NULL && e[0] == '1') return 0;
+    return is_device_flag ? 1 : 0;
+#endif
+}
+
+typedef struct HxQwenKernelDispatch {
+    int64_t arg_p;       // points to v5.2 arg struct (rms/rope/gqa/swiglu)
+    int64_t is_device;   // 1 = CUDA, 0 = CPU
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenKernelDispatch;
+
+int hxqwen14b_rmsnorm_fwd_v53(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenKernelDispatch* dsp = (HxQwenKernelDispatch*)args;
+    if (dsp->arg_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenRmsNormArgs* a = (HxQwenRmsNormArgs*)(uintptr_t)dsp->arg_p;
+
+    if (!v53_use_cuda(dsp->is_device)) {
+        return hxqwen14b_rmsnorm_fwd((void*)a);
+    }
+#ifdef HXQWEN14B_CUDA
+    if (a->x_p == 0 || a->w_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->M_rows <= 0 || a->d_model <= 0) return RC_ERR_BAD_ARGS;
+    float eps = (a->eps > 0.0) ? (float)a->eps : 1e-6f;
+    return hxqwen14b_cu_launch_rmsnorm(
+        (const float*)(uintptr_t)a->x_p,
+        (const float*)(uintptr_t)a->w_p,
+        (float*)(uintptr_t)a->y_p,
+        a->M_rows, a->d_model, eps);
+#else
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+int hxqwen14b_rope_fwd_v53(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenKernelDispatch* dsp = (HxQwenKernelDispatch*)args;
+    if (dsp->arg_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenRopeArgs* a = (HxQwenRopeArgs*)(uintptr_t)dsp->arg_p;
+
+    if (!v53_use_cuda(dsp->is_device)) {
+        return hxqwen14b_rope_fwd((void*)a);
+    }
+#ifdef HXQWEN14B_CUDA
+    if (a->x_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->B_batch <= 0 || a->S_seq <= 0 || a->n_heads <= 0 || a->head_dim <= 0)
+        return RC_ERR_BAD_ARGS;
+    if ((a->head_dim & 1) != 0) return RC_ERR_BAD_ARGS;
+    float theta = (a->theta_base > 0.0) ? (float)a->theta_base : 1e6f;
+    return hxqwen14b_cu_launch_rope(
+        (float*)(uintptr_t)a->x_p,
+        a->B_batch, a->S_seq, a->n_heads, a->head_dim,
+        theta, a->pos_offset);
+#else
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+int hxqwen14b_gqa_attn_fwd_v53(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenKernelDispatch* dsp = (HxQwenKernelDispatch*)args;
+    if (dsp->arg_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenGqaArgs* a = (HxQwenGqaArgs*)(uintptr_t)dsp->arg_p;
+
+    if (!v53_use_cuda(dsp->is_device)) {
+        return hxqwen14b_gqa_attn_fwd((void*)a);
+    }
+#ifdef HXQWEN14B_CUDA
+    if (a->q_p == 0 || a->k_p == 0 || a->v_p == 0 || a->out_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->B_batch <= 0 || a->S_seq <= 0 || a->head_dim <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head <= 0 || a->n_kv_head <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head % a->n_kv_head != 0) return RC_ERR_SHAPE_MISMATCH;
+    if (a->head_dim > 256) return RC_ERR_BAD_ARGS;
+    float scale = (a->softmax_scale > 0.0) ? (float)a->softmax_scale
+                                           : (1.0f / sqrtf((float)a->head_dim));
+    return hxqwen14b_cu_launch_gqa(
+        (const float*)(uintptr_t)a->q_p,
+        (const float*)(uintptr_t)a->k_p,
+        (const float*)(uintptr_t)a->v_p,
+        (float*)(uintptr_t)a->out_p,
+        a->B_batch, a->S_seq,
+        a->n_q_head, a->n_kv_head, a->head_dim,
+        scale, a->causal);
+#else
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+int hxqwen14b_swiglu_fwd_v53(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenKernelDispatch* dsp = (HxQwenKernelDispatch*)args;
+    if (dsp->arg_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenSwigluArgs* a = (HxQwenSwigluArgs*)(uintptr_t)dsp->arg_p;
+
+    if (!v53_use_cuda(dsp->is_device)) {
+        return hxqwen14b_swiglu_fwd((void*)a);
+    }
+#ifdef HXQWEN14B_CUDA
+    if (a->gate_p == 0 || a->up_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->M_rows <= 0 || a->ffn_dim <= 0) return RC_ERR_BAD_ARGS;
+    return hxqwen14b_cu_launch_swiglu(
+        (const float*)(uintptr_t)a->gate_p,
+        (const float*)(uintptr_t)a->up_p,
+        (float*)(uintptr_t)a->y_p,
+        a->M_rows * a->ffn_dim);
+#else
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Safetensors shard header parser (v5.3)
+//
+// File format:
+//   u64 (little-endian) header_byte_length
+//   char[header_byte_length] JSON header
+//   char[remainder]          concatenated tensor bytes
+//
+// JSON entries:
+//   "<name>": {"dtype":"BF16","shape":[d0,d1,...],"data_offsets":[s,e]}
+// ═════════════════════════════════════════════════════════════════════
+
+typedef struct HxQwenTensorInfo {
+    int64_t dtype;        // 0=F32, 1=F16, 2=BF16
+    int64_t rank;
+    int64_t shape[4];
+    int64_t byte_start;   // offset within the shard file
+    int64_t byte_count;   // size of tensor data
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenTensorInfo;
+
+static const char* v53_find_tensor_obj(const char* hdr, size_t hdr_len,
+                                       const char* name)
+{
+    size_t nl = strlen(name);
+    for (size_t i = 0; i + nl + 2 < hdr_len; i++) {
+        if (hdr[i] != '"') continue;
+        if (memcmp(hdr + i + 1, name, nl) != 0) continue;
+        if (hdr[i + 1 + nl] != '"') continue;
+        size_t j = i + 2 + nl;
+        while (j < hdr_len && (hdr[j] == ' ' || hdr[j] == ':' || hdr[j] == '\t')) j++;
+        if (j < hdr_len && hdr[j] == '{') return hdr + j;
+    }
+    return NULL;
+}
+
+static int v53_extract_string(const char* s, size_t n, const char* key,
+                              char* out, size_t out_cap)
+{
+    size_t kl = strlen(key);
+    for (size_t i = 0; i + kl + 3 < n; i++) {
+        if (s[i] != '"') continue;
+        if (memcmp(s + i + 1, key, kl) != 0) continue;
+        if (s[i + 1 + kl] != '"') continue;
+        size_t j = i + 2 + kl;
+        while (j < n && (s[j] == ' ' || s[j] == ':' || s[j] == '\t')) j++;
+        if (j >= n || s[j] != '"') continue;
+        j++;
+        size_t w = 0;
+        while (j < n && s[j] != '"' && w + 1 < out_cap) {
+            out[w++] = s[j++];
+        }
+        out[w] = '\0';
+        return 0;
+    }
+    return -1;
+}
+
+static int v53_extract_int_array(const char* s, size_t n, const char* key,
+                                 int64_t* out, int max_n)
+{
+    size_t kl = strlen(key);
+    for (size_t i = 0; i + kl + 3 < n; i++) {
+        if (s[i] != '"') continue;
+        if (memcmp(s + i + 1, key, kl) != 0) continue;
+        if (s[i + 1 + kl] != '"') continue;
+        size_t j = i + 2 + kl;
+        while (j < n && (s[j] == ' ' || s[j] == ':' || s[j] == '\t')) j++;
+        if (j >= n || s[j] != '[') continue;
+        j++;
+        int cnt = 0;
+        while (j < n && s[j] != ']' && cnt < max_n) {
+            while (j < n && (s[j] == ' ' || s[j] == ',' || s[j] == '\t')) j++;
+            if (j >= n || s[j] == ']') break;
+            int64_t v = 0;
+            int have = 0;
+            while (j < n && s[j] >= '0' && s[j] <= '9') {
+                v = v * 10 + (s[j] - '0');
+                j++;
+                have = 1;
+            }
+            if (have) out[cnt++] = v;
+        }
+        return cnt;
+    }
+    return -1;
+}
+
+static int v53_read_shard_header(const char* path, char** out_hdr,
+                                 size_t* out_hdr_len, int64_t* out_data_off)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    uint64_t hdr_bytes = 0;
+    if (read(fd, &hdr_bytes, 8) != 8) { close(fd); return -2; }
+    if (hdr_bytes == 0 || hdr_bytes > (uint64_t)(1 << 26)) {
+        close(fd); return -3;
+    }
+    char* hdr = (char*)malloc((size_t)hdr_bytes + 1);
+    if (!hdr) { close(fd); return -4; }
+    ssize_t got = 0;
+    while (got < (ssize_t)hdr_bytes) {
+        ssize_t n = read(fd, hdr + got, (size_t)hdr_bytes - (size_t)got);
+        if (n <= 0) { free(hdr); close(fd); return -5; }
+        got += n;
+    }
+    hdr[hdr_bytes] = '\0';
+    close(fd);
+    *out_hdr = hdr;
+    *out_hdr_len = (size_t)hdr_bytes;
+    *out_data_off = (int64_t)(8 + hdr_bytes);
+    return 0;
+}
+
+int hxqwen14b_shard_tensor_info(int64_t path_p, int64_t name_p, void* info_p) {
+    if (path_p == 0 || name_p == 0 || info_p == NULL) return RC_ERR_NULL_ARGS;
+    const char* path = (const char*)(uintptr_t)path_p;
+    const char* name = (const char*)(uintptr_t)name_p;
+    HxQwenTensorInfo* info = (HxQwenTensorInfo*)info_p;
+
+    char*  hdr = NULL;
+    size_t hdr_len = 0;
+    int64_t data_off = 0;
+    int rc = v53_read_shard_header(path, &hdr, &hdr_len, &data_off);
+    if (rc != 0) return RC_ERR_IO;
+
+    const char* obj = v53_find_tensor_obj(hdr, hdr_len, name);
+    if (obj == NULL) { free(hdr); return RC_ERR_INDEX_JSON; }
+    size_t rem = hdr_len - (size_t)(obj - hdr);
+    size_t win = rem < 512 ? rem : 512;
+
+    char dtype_str[16] = {0};
+    if (v53_extract_string(obj, win, "dtype", dtype_str, sizeof(dtype_str)) != 0) {
+        free(hdr); return RC_ERR_INDEX_JSON;
+    }
+    int64_t dtype = -1;
+    if (strcmp(dtype_str, "F32") == 0)       dtype = 0;
+    else if (strcmp(dtype_str, "F16") == 0)  dtype = 1;
+    else if (strcmp(dtype_str, "BF16") == 0) dtype = 2;
+    else { free(hdr); return RC_ERR_SHAPE_MISMATCH; }
+
+    int64_t shape[4] = {0, 0, 0, 0};
+    int rank = v53_extract_int_array(obj, win, "shape", shape, 4);
+    if (rank <= 0 || rank > 4) { free(hdr); return RC_ERR_INDEX_JSON; }
+
+    int64_t offsets[2] = {0, 0};
+    int noff = v53_extract_int_array(obj, win, "data_offsets", offsets, 2);
+    if (noff != 2) { free(hdr); return RC_ERR_INDEX_JSON; }
+
+    info->dtype = dtype;
+    info->rank  = rank;
+    for (int i = 0; i < 4; i++) info->shape[i] = (i < rank) ? shape[i] : 0;
+    info->byte_start = data_off + offsets[0];
+    info->byte_count = offsets[1] - offsets[0];
+    free(hdr);
+    return RC_OK;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Load a named BF16 tensor to device memory.
+// bf16 stored as u16 LE; we copy raw 2-byte-per-element buffer to device
+// (native bf16 supported on sm_80+ including H100 sm_90).
+// ─────────────────────────────────────────────────────────────
+typedef struct HxQwenTensorLoadOut {
+    int64_t device_ptr;
+    int64_t n_elems;
+    int64_t byte_count;
+    int64_t dtype;        // 0=F32, 2=BF16
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenTensorLoadOut;
+
+int hxqwen14b_load_tensor_bf16(int64_t shard_path_p, int64_t name_p,
+                                void* load_out_p) {
+    if (shard_path_p == 0 || name_p == 0 || load_out_p == NULL)
+        return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)shard_path_p; (void)name_p; (void)load_out_p;
+    return RC_ERR_CUDA_TODO;
+#else
+    const char* path = (const char*)(uintptr_t)shard_path_p;
+    HxQwenTensorInfo info;
+    memset(&info, 0, sizeof(info));
+    int rc = hxqwen14b_shard_tensor_info(shard_path_p, name_p, &info);
+    if (rc != 0) return rc;
+    if (info.dtype != 2) return RC_ERR_SHAPE_MISMATCH;  // BF16 only here
+
+    int64_t n_elems = 1;
+    for (int i = 0; i < info.rank; i++) n_elems *= info.shape[i];
+    if (n_elems * 2 != info.byte_count) return RC_ERR_SHAPE_MISMATCH;
+
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return RC_ERR_IO;
+    size_t map_len = (size_t)(info.byte_start + info.byte_count);
+    void* mapped = mmap(NULL, map_len, PROT_READ, MAP_PRIVATE, fd, 0);
+    close(fd);
+    if (mapped == MAP_FAILED) return RC_ERR_IO;
+
+    int64_t dev = hxqwen14b_cu_malloc_bytes(info.byte_count);
+    if (dev == 0) {
+        munmap(mapped, map_len);
+        return RC_ERR_OOM;
+    }
+    int cpy_rc = hxqwen14b_cu_memcpy_h2d(dev,
+                    (const char*)mapped + info.byte_start,
+                    info.byte_count);
+    munmap(mapped, map_len);
+    if (cpy_rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(dev);
+        return RC_ERR_KERNEL_FAIL;
+    }
+
+    HxQwenTensorLoadOut* out = (HxQwenTensorLoadOut*)load_out_p;
+    out->device_ptr = dev;
+    out->n_elems    = n_elems;
+    out->byte_count = info.byte_count;
+    out->dtype      = info.dtype;
+    return RC_OK;
+#endif
+}
+
+int hxqwen14b_free_device_ptr(int64_t dev_ptr) {
+#ifdef HXQWEN14B_CUDA
+    return hxqwen14b_cu_free_ptr(dev_ptr);
+#else
+    (void)dev_ptr;
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// v5.3 smoke test — runs the 4 CUDA kernels with same seeded inputs as
+// smoke_v52; compares to CPU-kernel outputs within fp32 tolerance.
+// ═════════════════════════════════════════════════════════════════════
+
+typedef struct HxQwenV53SmokeArgs {
+    int64_t B_batch;
+    int64_t S_seq;
+    int64_t d_model;
+    int64_t n_q_head;
+    int64_t n_kv_head;
+    int64_t head_dim;
+    int64_t ffn_dim;
+    int64_t seed;
+    int64_t out_p;
+    int64_t force_cpu;
+} HxQwenV53SmokeArgs;
+
+typedef struct HxQwenV53SmokeResult {
+    int64_t rc_rmsnorm_cpu;
+    int64_t rc_rmsnorm_cuda;
+    int64_t rc_rope_cpu;
+    int64_t rc_rope_cuda;
+    int64_t rc_gqa_cpu;
+    int64_t rc_gqa_cuda;
+    int64_t rc_swiglu_cpu;
+    int64_t rc_swiglu_cuda;
+    double  max_abs_diff_rmsnorm;
+    double  max_abs_diff_rope;
+    double  max_abs_diff_gqa;
+    double  max_abs_diff_swiglu;
+    int64_t used_cuda;
+    int64_t n_nan_total;
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenV53SmokeResult;
+
+static double v53_max_abs_diff(const float* a, const float* b, int64_t n) {
+    double m = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        double d = fabs((double)a[i] - (double)b[i]);
+        if (d > m) m = d;
+    }
+    return m;
+}
+
+int hxqwen14b_smoke_v53(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenV53SmokeArgs* a = (HxQwenV53SmokeArgs*)args;
+    if (a->out_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenV53SmokeResult* r = (HxQwenV53SmokeResult*)(uintptr_t)a->out_p;
+    memset(r, 0, sizeof(*r));
+
+    if (a->B_batch <= 0 || a->S_seq <= 0 || a->d_model <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head <= 0 || a->n_kv_head <= 0 || a->head_dim <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head % a->n_kv_head != 0) return RC_ERR_SHAPE_MISMATCH;
+    if (a->ffn_dim <= 0) return RC_ERR_BAD_ARGS;
+    if (a->head_dim > 256) return RC_ERR_BAD_ARGS;
+
+    const int64_t B  = a->B_batch;
+    const int64_t S  = a->S_seq;
+    const int64_t d  = a->d_model;
+    const int64_t HQ = a->n_q_head;
+    const int64_t HK = a->n_kv_head;
+    const int64_t HD = a->head_dim;
+    const int64_t F  = a->ffn_dim;
+    const int64_t M  = B * S;
+
+    float* x        = (float*)calloc((size_t)(M * d),       sizeof(float));
+    float* w_rms    = (float*)calloc((size_t)(d),           sizeof(float));
+    float* ln_cpu   = (float*)calloc((size_t)(M * d),       sizeof(float));
+    float* q_cpu    = (float*)calloc((size_t)(M * HQ * HD), sizeof(float));
+    float* q_dev_h  = (float*)calloc((size_t)(M * HQ * HD), sizeof(float));
+    float* q_in     = (float*)calloc((size_t)(M * HQ * HD), sizeof(float));
+    float* k_in     = (float*)calloc((size_t)(M * HK * HD), sizeof(float));
+    float* v_in     = (float*)calloc((size_t)(M * HK * HD), sizeof(float));
+    float* o_cpu    = (float*)calloc((size_t)(M * HQ * HD), sizeof(float));
+    float* o_dev_h  = (float*)calloc((size_t)(M * HQ * HD), sizeof(float));
+    float* gate     = (float*)calloc((size_t)(M * F),       sizeof(float));
+    float* up       = (float*)calloc((size_t)(M * F),       sizeof(float));
+    float* sw_cpu   = (float*)calloc((size_t)(M * F),       sizeof(float));
+    float* sw_dev_h = (float*)calloc((size_t)(M * F),       sizeof(float));
+    float* ln_dev_h = (float*)calloc((size_t)(M * d),       sizeof(float));
+    if (!x || !w_rms || !ln_cpu || !q_cpu || !q_dev_h || !q_in || !k_in ||
+        !v_in || !o_cpu || !o_dev_h || !gate || !up || !sw_cpu || !sw_dev_h ||
+        !ln_dev_h) {
+        free(x); free(w_rms); free(ln_cpu); free(q_cpu); free(q_dev_h);
+        free(q_in); free(k_in); free(v_in); free(o_cpu); free(o_dev_h);
+        free(gate); free(up); free(sw_cpu); free(sw_dev_h); free(ln_dev_h);
+        return RC_ERR_OOM;
+    }
+
+    uint32_t rng = (uint32_t)(a->seed ? a->seed : 0xABCD);
+    if (rng == 0) rng = 0xABCD;
+    for (int64_t i = 0; i < M * d; i++)       x[i]    = v52_randn(&rng) * 0.5f;
+    for (int64_t i = 0; i < d; i++)           w_rms[i]= 0.5f + 0.5f * v52_randn(&rng);
+    for (int64_t i = 0; i < M * HQ * HD; i++) q_in[i] = v52_randn(&rng) * 0.3f;
+    for (int64_t i = 0; i < M * HK * HD; i++) k_in[i] = v52_randn(&rng) * 0.3f;
+    for (int64_t i = 0; i < M * HK * HD; i++) v_in[i] = v52_randn(&rng) * 0.3f;
+    for (int64_t i = 0; i < M * F; i++)       gate[i] = v52_randn(&rng) * 0.4f;
+    for (int64_t i = 0; i < M * F; i++)       up[i]   = v52_randn(&rng) * 0.4f;
+
+    // 1) CPU reference — RMSNorm.
+    HxQwenRmsNormArgs rms;
+    memset(&rms, 0, sizeof(rms));
+    rms.M_rows = M; rms.d_model = d; rms.eps = 1e-6;
+    rms.x_p = (int64_t)(uintptr_t)x;
+    rms.w_p = (int64_t)(uintptr_t)w_rms;
+    rms.y_p = (int64_t)(uintptr_t)ln_cpu;
+    r->rc_rmsnorm_cpu = hxqwen14b_rmsnorm_fwd(&rms);
+
+    // 2) CPU reference — RoPE (in-place, copy q_in first).
+    memcpy(q_cpu, q_in, (size_t)(M * HQ * HD) * sizeof(float));
+    HxQwenRopeArgs rope;
+    memset(&rope, 0, sizeof(rope));
+    rope.B_batch = B; rope.S_seq = S; rope.n_heads = HQ; rope.head_dim = HD;
+    rope.theta_base = 1e6; rope.pos_offset = 0;
+    rope.x_p = (int64_t)(uintptr_t)q_cpu;
+    r->rc_rope_cpu = hxqwen14b_rope_fwd(&rope);
+
+    // 3) CPU reference — GQA.
+    HxQwenGqaArgs gqa;
+    memset(&gqa, 0, sizeof(gqa));
+    gqa.B_batch = B; gqa.S_seq = S;
+    gqa.n_q_head = HQ; gqa.n_kv_head = HK; gqa.head_dim = HD;
+    gqa.q_p = (int64_t)(uintptr_t)q_cpu;
+    gqa.k_p = (int64_t)(uintptr_t)k_in;
+    gqa.v_p = (int64_t)(uintptr_t)v_in;
+    gqa.out_p = (int64_t)(uintptr_t)o_cpu;
+    gqa.softmax_scale = 0.0;
+    gqa.causal = 1;
+    r->rc_gqa_cpu = hxqwen14b_gqa_attn_fwd(&gqa);
+
+    // 4) CPU reference — SwiGLU.
+    HxQwenSwigluArgs sw;
+    memset(&sw, 0, sizeof(sw));
+    sw.M_rows = M; sw.ffn_dim = F;
+    sw.gate_p = (int64_t)(uintptr_t)gate;
+    sw.up_p   = (int64_t)(uintptr_t)up;
+    sw.y_p    = (int64_t)(uintptr_t)sw_cpu;
+    r->rc_swiglu_cpu = hxqwen14b_swiglu_fwd(&sw);
+
+    int do_cuda = 0;
+#ifdef HXQWEN14B_CUDA
+    if (!a->force_cpu) do_cuda = 1;
+#endif
+    r->used_cuda = do_cuda ? 1 : 0;
+
+    if (!do_cuda) {
+        free(x); free(w_rms); free(ln_cpu); free(q_cpu); free(q_dev_h);
+        free(q_in); free(k_in); free(v_in); free(o_cpu); free(o_dev_h);
+        free(gate); free(up); free(sw_cpu); free(sw_dev_h); free(ln_dev_h);
+        if (r->rc_rmsnorm_cpu != RC_OK) return (int)r->rc_rmsnorm_cpu;
+        if (r->rc_rope_cpu    != RC_OK) return (int)r->rc_rope_cpu;
+        if (r->rc_gqa_cpu     != RC_OK) return (int)r->rc_gqa_cpu;
+        if (r->rc_swiglu_cpu  != RC_OK) return (int)r->rc_swiglu_cpu;
+        return RC_OK;
+    }
+
+#ifdef HXQWEN14B_CUDA
+    // CUDA path — use cu_malloc wrappers so the .c doesn't need CUDA headers.
+    int64_t d_x  = hxqwen14b_cu_malloc_bytes((int64_t)(M * d)       * sizeof(float));
+    int64_t d_w  = hxqwen14b_cu_malloc_bytes((int64_t)(d)           * sizeof(float));
+    int64_t d_ln = hxqwen14b_cu_malloc_bytes((int64_t)(M * d)       * sizeof(float));
+    int64_t d_q  = hxqwen14b_cu_malloc_bytes((int64_t)(M * HQ * HD) * sizeof(float));
+    int64_t d_k  = hxqwen14b_cu_malloc_bytes((int64_t)(M * HK * HD) * sizeof(float));
+    int64_t d_v  = hxqwen14b_cu_malloc_bytes((int64_t)(M * HK * HD) * sizeof(float));
+    int64_t d_o  = hxqwen14b_cu_malloc_bytes((int64_t)(M * HQ * HD) * sizeof(float));
+    int64_t d_g  = hxqwen14b_cu_malloc_bytes((int64_t)(M * F)       * sizeof(float));
+    int64_t d_u  = hxqwen14b_cu_malloc_bytes((int64_t)(M * F)       * sizeof(float));
+    int64_t d_y  = hxqwen14b_cu_malloc_bytes((int64_t)(M * F)       * sizeof(float));
+
+    if (d_x == 0 || d_w == 0 || d_ln == 0 || d_q == 0 || d_k == 0 ||
+        d_v == 0 || d_o == 0 || d_g == 0 || d_u == 0 || d_y == 0) {
+        if (d_x)  hxqwen14b_cu_free_ptr(d_x);
+        if (d_w)  hxqwen14b_cu_free_ptr(d_w);
+        if (d_ln) hxqwen14b_cu_free_ptr(d_ln);
+        if (d_q)  hxqwen14b_cu_free_ptr(d_q);
+        if (d_k)  hxqwen14b_cu_free_ptr(d_k);
+        if (d_v)  hxqwen14b_cu_free_ptr(d_v);
+        if (d_o)  hxqwen14b_cu_free_ptr(d_o);
+        if (d_g)  hxqwen14b_cu_free_ptr(d_g);
+        if (d_u)  hxqwen14b_cu_free_ptr(d_u);
+        if (d_y)  hxqwen14b_cu_free_ptr(d_y);
+        free(x); free(w_rms); free(ln_cpu); free(q_cpu); free(q_dev_h);
+        free(q_in); free(k_in); free(v_in); free(o_cpu); free(o_dev_h);
+        free(gate); free(up); free(sw_cpu); free(sw_dev_h); free(ln_dev_h);
+        return RC_ERR_OOM;
+    }
+
+    hxqwen14b_cu_memcpy_h2d(d_x, x,     (int64_t)(M * d)       * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_w, w_rms, (int64_t)(d)           * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_q, q_in,  (int64_t)(M * HQ * HD) * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_k, k_in,  (int64_t)(M * HK * HD) * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_v, v_in,  (int64_t)(M * HK * HD) * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_g, gate,  (int64_t)(M * F)       * sizeof(float));
+    hxqwen14b_cu_memcpy_h2d(d_u, up,    (int64_t)(M * F)       * sizeof(float));
+
+    r->rc_rmsnorm_cuda = hxqwen14b_cu_launch_rmsnorm(
+        (const float*)(uintptr_t)d_x, (const float*)(uintptr_t)d_w,
+        (float*)(uintptr_t)d_ln, M, d, 1e-6f);
+    hxqwen14b_cu_device_sync();
+    hxqwen14b_cu_memcpy_d2h(ln_dev_h, d_ln, (int64_t)(M * d) * sizeof(float));
+
+    r->rc_rope_cuda = hxqwen14b_cu_launch_rope(
+        (float*)(uintptr_t)d_q, B, S, HQ, HD, 1e6f, 0);
+    hxqwen14b_cu_device_sync();
+    hxqwen14b_cu_memcpy_d2h(q_dev_h, d_q, (int64_t)(M * HQ * HD) * sizeof(float));
+
+    float scale = 1.0f / sqrtf((float)HD);
+    r->rc_gqa_cuda = hxqwen14b_cu_launch_gqa(
+        (const float*)(uintptr_t)d_q, (const float*)(uintptr_t)d_k,
+        (const float*)(uintptr_t)d_v, (float*)(uintptr_t)d_o,
+        B, S, HQ, HK, HD, scale, 1);
+    hxqwen14b_cu_device_sync();
+    hxqwen14b_cu_memcpy_d2h(o_dev_h, d_o, (int64_t)(M * HQ * HD) * sizeof(float));
+
+    r->rc_swiglu_cuda = hxqwen14b_cu_launch_swiglu(
+        (const float*)(uintptr_t)d_g, (const float*)(uintptr_t)d_u,
+        (float*)(uintptr_t)d_y, M * F);
+    hxqwen14b_cu_device_sync();
+    hxqwen14b_cu_memcpy_d2h(sw_dev_h, d_y, (int64_t)(M * F) * sizeof(float));
+
+    r->max_abs_diff_rmsnorm = v53_max_abs_diff(ln_cpu, ln_dev_h, M * d);
+    r->max_abs_diff_rope    = v53_max_abs_diff(q_cpu,  q_dev_h,  M * HQ * HD);
+    r->max_abs_diff_gqa     = v53_max_abs_diff(o_cpu,  o_dev_h,  M * HQ * HD);
+    r->max_abs_diff_swiglu  = v53_max_abs_diff(sw_cpu, sw_dev_h, M * F);
+
+    int64_t nan_ct = 0;
+    for (int64_t i = 0; i < M * d; i++)       if (ln_dev_h[i] != ln_dev_h[i]) nan_ct++;
+    for (int64_t i = 0; i < M * HQ * HD; i++) if (q_dev_h[i] != q_dev_h[i])  nan_ct++;
+    for (int64_t i = 0; i < M * HQ * HD; i++) if (o_dev_h[i] != o_dev_h[i])  nan_ct++;
+    for (int64_t i = 0; i < M * F; i++)       if (sw_dev_h[i] != sw_dev_h[i]) nan_ct++;
+    r->n_nan_total = nan_ct;
+
+    hxqwen14b_cu_free_ptr(d_x);  hxqwen14b_cu_free_ptr(d_w);  hxqwen14b_cu_free_ptr(d_ln);
+    hxqwen14b_cu_free_ptr(d_q);  hxqwen14b_cu_free_ptr(d_k);  hxqwen14b_cu_free_ptr(d_v);
+    hxqwen14b_cu_free_ptr(d_o);  hxqwen14b_cu_free_ptr(d_g);  hxqwen14b_cu_free_ptr(d_u);
+    hxqwen14b_cu_free_ptr(d_y);
+    free(x); free(w_rms); free(ln_cpu); free(q_cpu); free(q_dev_h);
+    free(q_in); free(k_in); free(v_in); free(o_cpu); free(o_dev_h);
+    free(gate); free(up); free(sw_cpu); free(sw_dev_h); free(ln_dev_h);
+
+    if (r->rc_rmsnorm_cpu  != RC_OK) return (int)r->rc_rmsnorm_cpu;
+    if (r->rc_rope_cpu     != RC_OK) return (int)r->rc_rope_cpu;
+    if (r->rc_gqa_cpu      != RC_OK) return (int)r->rc_gqa_cpu;
+    if (r->rc_swiglu_cpu   != RC_OK) return (int)r->rc_swiglu_cpu;
+    if (r->rc_rmsnorm_cuda != RC_OK) return (int)r->rc_rmsnorm_cuda;
+    if (r->rc_rope_cuda    != RC_OK) return (int)r->rc_rope_cuda;
+    if (r->rc_gqa_cuda     != RC_OK) return (int)r->rc_gqa_cuda;
+    if (r->rc_swiglu_cuda  != RC_OK) return (int)r->rc_swiglu_cuda;
+    if (nan_ct > 0) return RC_ERR_KERNEL_FAIL;
+    // Tolerance: fp32 accum CPU vs GPU typically <1e-4 relative. We use
+    // looser abs budgets below since cascaded ops + random seed can
+    // produce larger absolute diffs even with correct kernels.
+    if (r->max_abs_diff_rmsnorm > 1e-2) return RC_ERR_KERNEL_FAIL;
+    if (r->max_abs_diff_rope    > 1e-3) return RC_ERR_KERNEL_FAIL;
+    if (r->max_abs_diff_gqa     > 5e-2) return RC_ERR_KERNEL_FAIL;
+    if (r->max_abs_diff_swiglu  > 1e-3) return RC_ERR_KERNEL_FAIL;
+    return RC_OK;
+#else
+    free(x); free(w_rms); free(ln_cpu); free(q_cpu); free(q_dev_h);
+    free(q_in); free(k_in); free(v_in); free(o_cpu); free(o_dev_h);
+    free(gate); free(up); free(sw_cpu); free(sw_dev_h); free(ln_dev_h);
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+// End of v5.3 addendum.
