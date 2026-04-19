@@ -244,18 +244,7 @@ typedef struct HexaValStruct HexaValStruct;
 // field maps) survive verbatim instead of being coerced to "".
 HexaVal hexa_valstruct_new_v(HexaVal, HexaVal, HexaVal, HexaVal, HexaVal,
     HexaVal, HexaVal, HexaVal, HexaVal, HexaVal, HexaVal, HexaVal);
-HexaVal hexa_valstruct_tag(HexaVal v);
 HexaVal hexa_valstruct_int(HexaVal v);
-HexaVal hexa_valstruct_float(HexaVal v);
-HexaVal hexa_valstruct_bool(HexaVal v);
-HexaVal hexa_valstruct_str(HexaVal v);
-HexaVal hexa_valstruct_char(HexaVal v);
-HexaVal hexa_valstruct_array(HexaVal v);
-HexaVal hexa_valstruct_fn_name(HexaVal v);
-HexaVal hexa_valstruct_fn_params(HexaVal v);
-HexaVal hexa_valstruct_fn_body(HexaVal v);
-HexaVal hexa_valstruct_struct_name(HexaVal v);
-HexaVal hexa_valstruct_struct_fields(HexaVal v);
 HexaVal hexa_valstruct_get_by_key(HexaVal v, const char* key);
 HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val);
 
@@ -1787,55 +1776,10 @@ HexaVal hexa_valstruct_new_v(
 }
 
 // Helper: scalar accessors (tag/int/float/bool) still return primitive Vals.
-HexaVal hexa_valstruct_tag(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_int(0);
-    return hexa_int(HX_VSF(v, tag_i));
-}
+// NOTE: hexa_valstruct_int kept — referenced internally by hexa_write_bytes helpers.
 HexaVal hexa_valstruct_int(HexaVal v) {
     if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_int(0);
     return hexa_int(HX_VSF(v, int_val));
-}
-HexaVal hexa_valstruct_float(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_float(0.0);
-    return hexa_float(HX_VSF(v, float_val));
-}
-HexaVal hexa_valstruct_bool(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_bool(0);
-    return hexa_bool(HX_VSF(v, bool_val));
-}
-// Polymorphic accessors return the stored HexaVal directly (no string
-// re-wrap — the original tag survives so closures work end-to-end).
-HexaVal hexa_valstruct_str(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VSF(v, str_val);
-}
-HexaVal hexa_valstruct_char(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VSF(v, char_val);
-}
-HexaVal hexa_valstruct_array(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VSF(v, array_val);
-}
-HexaVal hexa_valstruct_fn_name(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VSF(v, fn_name);
-}
-HexaVal hexa_valstruct_fn_params(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VSF(v, fn_params);
-}
-HexaVal hexa_valstruct_fn_body(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VSF(v, fn_body);
-}
-HexaVal hexa_valstruct_struct_name(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_str("");
-    return HX_VSF(v, struct_name);
-}
-HexaVal hexa_valstruct_struct_fields(HexaVal v) {
-    if (!HX_IS_VALSTRUCT(v) || !HX_VS(v)) return hexa_void();
-    return HX_VSF(v, struct_fields);
 }
 
 // Key-string dispatch — branches on key[0] to amortize strcmp.
@@ -2461,17 +2405,6 @@ static void hexa_val_arena_heapify_return(void) {
 void __hexa_fn_arena_enter(void) {
     if (!hexa_val_arena_on()) return;
     hexa_val_arena_scope_push();
-}
-
-// T33-fix-2: callable from generated code to force heap allocation
-// around cache initialization (e.g. __init_val_int_cache).
-HexaVal hexa_force_heap_begin(void) {
-    __hexa_val_force_heap = 1;
-    return hexa_void();
-}
-HexaVal hexa_force_heap_end(void) {
-    __hexa_val_force_heap = 0;
-    return hexa_void();
 }
 
 HexaVal __hexa_fn_arena_return(HexaVal ret) {
@@ -4308,58 +4241,6 @@ HexaVal hexa_host_ffi_call_6(
         empty_str, empty_str);
 }
 
-// hexa_host_ffi_call_14(fn_ptr, nargs, float_mask, ret_kind, a0..a13)
-//   Extended variant supporting up to 14 positional args — covers
-//   cblas_sgemm (14 args) and vDSP_mmul (9 args).
-HexaVal hexa_host_ffi_call_14(
-    HexaVal fn_ptr, HexaVal nargs_v, HexaVal float_mask, HexaVal ret_kind,
-    HexaVal a0, HexaVal a1, HexaVal a2,  HexaVal a3,
-    HexaVal a4, HexaVal a5, HexaVal a6,  HexaVal a7,
-    HexaVal a8, HexaVal a9, HexaVal a10, HexaVal a11,
-    HexaVal a12, HexaVal a13
-) {
-    HexaVal fp_v = hexa_host_ffi_unwrap(fn_ptr);
-    void* fp = HX_IS_INT(fp_v) ? (void*)(uintptr_t)HX_INT(fp_v) : NULL;
-    if (!fp) return hexa_int(0);
-    HexaVal na_v = hexa_host_ffi_unwrap(nargs_v);
-    HexaVal rk_v = hexa_host_ffi_unwrap(ret_kind);
-    HexaVal fm_v = hexa_host_ffi_unwrap(float_mask);
-    int nargs = HX_IS_INT(na_v) ? (int)HX_INT(na_v) : 0;
-    int rk    = HX_IS_INT(rk_v) ? (int)HX_INT(rk_v) : 1;
-    int mask  = HX_IS_INT(fm_v) ? (int)HX_INT(fm_v) : 0;
-    if (nargs < 0) nargs = 0;
-    if (nargs > 14) nargs = 14;
-    HexaVal slots[14];
-    slots[0]  = a0;  slots[1]  = a1;  slots[2]  = a2;  slots[3]  = a3;
-    slots[4]  = a4;  slots[5]  = a5;  slots[6]  = a6;  slots[7]  = a7;
-    slots[8]  = a8;  slots[9]  = a9;  slots[10] = a10; slots[11] = a11;
-    slots[12] = a12; slots[13] = a13;
-    HexaVal hargs[14];
-    for (int i = 0; i < 14; i++) hargs[i] = hexa_host_ffi_unwrap(slots[i]);
-    HexaVal native_ret;
-    if (mask) {
-        native_ret = hexa_extern_call_typed(fp, hargs, nargs, rk, mask);
-    } else {
-        native_ret = hexa_extern_call(fp, hargs, nargs, rk);
-    }
-    int64_t iv = 0;
-    double  fv = 0.0;
-    int bv = 0;
-    if (HX_IS_INT(native_ret))   iv = HX_INT(native_ret);
-    if (HX_IS_FLOAT(native_ret)) fv = HX_FLOAT(native_ret);
-    if (HX_IS_BOOL(native_ret))  bv = HX_BOOL(native_ret);
-    int hexa_tag = 0;
-    if (rk == 2) hexa_tag = 1;
-    if (rk == 3) hexa_tag = 2;
-    if (rk == 0) hexa_tag = 8;
-    HexaVal empty_str = hexa_str("");
-    return hexa_valstruct_new_v(
-        hexa_int(hexa_tag), hexa_int(iv), hexa_float(fv), hexa_bool(bv),
-        empty_str, empty_str, empty_str,
-        empty_str, empty_str, empty_str,
-        empty_str, empty_str);
-}
-
 // ── G5: Pointer arithmetic builtins ─────────────────────
 
 HexaVal hexa_ptr_alloc(HexaVal size) {
@@ -4510,10 +4391,6 @@ static HexaCallbackSlot __hexa_cb_slots[HEXA_TRAMPOLINE_POOL_SIZE];
 typedef HexaVal (*hexa_cb_dispatch_fn)(int slot_id, int argc, int64_t* args);
 static hexa_cb_dispatch_fn __hexa_cb_dispatcher = NULL;
 
-void hexa_set_callback_dispatcher(hexa_cb_dispatch_fn fn) {
-    __hexa_cb_dispatcher = fn;
-}
-
 // Internal dispatch: called by every trampoline.
 // Converts raw C int64 args back to HexaVal and calls the registered function.
 static int64_t hexa_trampoline_dispatch(int slot_id, int argc, int64_t* args) {
@@ -4634,14 +4511,6 @@ HexaVal hexa_callback_slot_id(HexaVal ptr) {
         }
     }
     return hexa_int(-1);
-}
-
-// callback_get_fn(slot_id) -> HexaVal
-// Returns the hexa function registered at the given slot.
-HexaVal hexa_callback_get_fn(int slot_id) {
-    if (slot_id < 0 || slot_id >= HEXA_TRAMPOLINE_POOL_SIZE) return hexa_void();
-    if (!__hexa_cb_slots[slot_id].in_use) return hexa_void();
-    return __hexa_cb_slots[slot_id].hexa_fn;
 }
 
 /* @hot_kernel B4 tensor stubs extracted to tensor_kernels.c (see include
