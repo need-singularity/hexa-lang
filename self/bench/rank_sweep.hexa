@@ -1,0 +1,329 @@
+// rank_sweep.hexa — LoRA rank sweep: compute-bound vs BLAS overhead separation
+//
+// ROI #165 — Measures GFLOPs achieved across rank r ∈ {1,2,4,8,16,32,64,128}
+// for a fixed M×K · K×N lowrank matmul pair (A·U · V). Also emits a
+// kv-cache continuous-decode rank sweep using the same U,V adapter inside
+// an autoregressive loop — the "serving-number" half of the benchmark
+// (see memory/feedback_kvcache_serving_number.md).
+//
+// Methodology (docs/bench/rank_sweep_methodology.md + memory/feedback_rank_sweep_methodology.md):
+//   - Compute-bound linear region (r ≥ knee): time scales linearly with rank,
+//     GFLOPs ~ constant (honest operating point).
+//   - BLAS overhead regime (r ≤ knee): dispatch / threading overhead dominates,
+//     GFLOPs drops. Non-linear time jump between r=2 → r=1 is the signature.
+//
+// Each rank: GFLOPs = (2*M*K*R + 2*M*R*N) / time_s / 1e9.
+// overhead_ratio = linear_projection_time / actual_time  (1.0 at max rank; < 1
+//   means actual slower than compute-linear projection = dispatch tax).
+//
+// For the decode sweep: tok_s = n_decoded / decode_s  — DECODE phase only
+// (see memory/feedback_bench_unit_check.md for why we pin the unit).
+//
+// CLI: hexa self/bench/rank_sweep.hexa [M] [K] [N] [iters]
+// Defaults: M=128 K=512 N=128 iters=50
+//
+// Status (2026-04-19): forward-pass sweep runs under stage0 interpreter;
+// kv-cache decode sweep emits metrics but wall times are coarsened by
+// clock() ~1s resolution. For production figures requires native codegen
+// + hxblas linkage (see docs/bench/rank_sweep_methodology.md "Self-check").
+
+// ---- arg parsing --------------------------------------------------------
+let args = argv()
+let n_args = len(args)
+
+// Defaults sized so each rank runs ≥ 1s against the builtin matmul
+// (clock() has ~1s resolution in the interpreter path — coarser ranks
+// scale iters up inversely to keep timing representative).
+let default_M = 128
+let default_K = 512
+let default_N = 128
+// Iters applied uniformly per rank. Needs to be large enough to clear
+// clock() ~1ms resolution at small ranks (where ops/iter is tiny).
+let default_iters = 50
+
+let mut M = default_M
+let mut K = default_K
+let mut N = default_N
+let mut iters = default_iters
+
+// argv layout: [0]=binary [1]=script [2..]=user args
+if n_args > 2 { M = to_int(args[2]) }
+if n_args > 3 { K = to_int(args[3]) }
+if n_args > 4 { N = to_int(args[4]) }
+if n_args > 5 { iters = to_int(args[5]) }
+
+// ---- fixed inputs -------------------------------------------------------
+let A = tensor_zeros(M * K)
+
+// ---- sweep --------------------------------------------------------------
+// Sweep: {2,4,8,16,32,64}. r=2 exercises the BLAS-overhead regime;
+// r=32/64 exercises the compute-bound plateau. The split point (knee)
+// is where tok_s / GFLOPs transitions from flat (overhead-bound) to
+// linear-in-rank (compute-bound).
+//
+// Note: r=1 and r=128 are omitted in the interpreter path:
+//   r=1:   stage0 matmul builtin has a degenerate-case bound bug at R=1.
+//   r=128: combined with inverse iters-scaling, produces runtimes the
+//          stage0 interpreter cannot finish in reasonable time.
+// Both are re-enabled once the bench runs under native codegen + hxblas
+// linkage (see docs/bench/rank_sweep_methodology.md "Self-check").
+let ranks = [2, 4, 8, 16, 32, 64]
+let n_ranks = len(ranks)
+let rmax_local = ranks[n_ranks - 1]
+
+// Per-rank arrays (no inner string concat to respect L4).
+let mut times_ms = []
+let mut gflops_arr = []
+let mut iters_used = []
+
+let mut k = 0
+while k < n_ranks {
+    let R = ranks[k]
+    let U = tensor_zeros(K * R)
+    let V = tensor_zeros(R * N)
+
+    // Keep iter count CONSTANT across ranks — this is the key to seeing
+    // the overhead regime. If we inverse-scale iters, total FLOPs become
+    // identical and the overhead signal (non-linear time at low rank) is
+    // hidden. Tradeoff: clock() ~1ms resolution may floor the smallest
+    // ranks; the reader compensates by running with larger `iters`.
+    let iters_r = iters
+    let iters_f = to_float(iters_r)
+
+    // warmup (1 iter, not counted)
+    let _wa = matmul(A, U, M, K, R)
+    let _wb = matmul(_wa, V, M, R, N)
+
+    let t0 = clock()
+    let mut ii = 0
+    while ii < iters_r {
+        let T = matmul(A, U, M, K, R)
+        let _ = matmul(T, V, M, R, N)
+        ii = ii + 1
+    }
+    let t1 = clock()
+    let mut elapsed = t1 - t0
+    // Guard: clock() has ~1s resolution; clamp so GFLOPs stays finite.
+    if elapsed <= 0.0 { elapsed = 0.001 }
+
+    let each_s = elapsed / iters_f
+    let each_ms = each_s * 1000.0
+
+    // FLOPs per iter: 2 * M * K * R  (A·U)  +  2 * M * R * N  (T·V)
+    let flops_part1 = to_float(2 * M * K * R)
+    let flops_part2 = to_float(2 * M * R * N)
+    let flops = flops_part1 + flops_part2
+    let gflops = flops / each_s / 1000000000.0
+
+    times_ms = times_ms.push(each_ms)
+    gflops_arr = gflops_arr.push(gflops)
+    iters_used = iters_used.push(iters_r)
+
+    k = k + 1
+}
+
+// ---- post-process: overhead_ratio relative to max-rank linear projection
+// At r_max, assume compute-bound → time_ideal(r) = time(r_max) * (r / r_max).
+// overhead_ratio = time_ideal / time_actual. Below 1.0 = overhead tax.
+let last_idx = n_ranks - 1
+let r_max = ranks[last_idx]
+let time_max = times_ms[last_idx]
+let r_max_f = to_float(r_max)
+
+// ---- emit per-rank JSON lines ------------------------------------------
+let mut i = 0
+while i < n_ranks {
+    let R = ranks[i]
+    let R_f = to_float(R)
+    let t_ms = times_ms[i]
+    let gf = gflops_arr[i]
+    let time_ideal = time_max * (R_f / r_max_f)
+    let overhead_ratio = time_ideal / t_ms
+
+    let mut parts = []
+    parts = parts.push("{")
+    parts = parts.push("\"rank\":"); parts = parts.push(str(R))
+    parts = parts.push(",\"M\":"); parts = parts.push(str(M))
+    parts = parts.push(",\"K\":"); parts = parts.push(str(K))
+    parts = parts.push(",\"N\":"); parts = parts.push(str(N))
+    parts = parts.push(",\"iters\":"); parts = parts.push(str(iters_used[i]))
+    parts = parts.push(",\"time_ms\":"); parts = parts.push(str(t_ms))
+    parts = parts.push(",\"gflops\":"); parts = parts.push(str(gf))
+    parts = parts.push(",\"overhead_ratio\":"); parts = parts.push(str(overhead_ratio))
+    parts = parts.push("}")
+    println(parts.join(""))
+
+    i = i + 1
+}
+
+// ---- find compute-bound plateau + overhead knee ------------------------
+// Plateau: contiguous tail of ranks where GFLOPs stays within 20% of max.
+// Knee:   first rank (scanning low→high) where gflops ≥ 0.8 * gflops_max.
+let mut gflops_max = gflops_arr[0]
+let mut j = 1
+while j < n_ranks {
+    if gflops_arr[j] > gflops_max { gflops_max = gflops_arr[j] }
+    j = j + 1
+}
+let plateau_threshold = gflops_max * 0.8
+
+let mut knee_rank = ranks[last_idx]
+let mut m = 0
+while m < n_ranks {
+    if gflops_arr[m] >= plateau_threshold {
+        knee_rank = ranks[m]
+        m = n_ranks  // break
+    } else {
+        m = m + 1
+    }
+}
+
+// ---- summary JSON ------------------------------------------------------
+let mut sparts = []
+sparts = sparts.push("{")
+sparts = sparts.push("\"summary\":\"rank_sweep\"")
+sparts = sparts.push(",\"M\":"); sparts = sparts.push(str(M))
+sparts = sparts.push(",\"K\":"); sparts = sparts.push(str(K))
+sparts = sparts.push(",\"N\":"); sparts = sparts.push(str(N))
+sparts = sparts.push(",\"iters_base\":"); sparts = sparts.push(str(iters))
+sparts = sparts.push(",\"gflops_max\":"); sparts = sparts.push(str(gflops_max))
+sparts = sparts.push(",\"compute_knee_rank\":"); sparts = sparts.push(str(knee_rank))
+sparts = sparts.push(",\"plateau_threshold_gflops\":"); sparts = sparts.push(str(plateau_threshold))
+sparts = sparts.push("}")
+println(sparts.join(""))
+
+// ══════════════════════════════════════════════════════════════════════
+//  KV-CACHE CONTINUOUS-DECODE RANK SWEEP
+//
+//  Why this second sweep exists:
+//    A single forward-pass tok/s number OVERSTATES real serving
+//    throughput — the kv-cache decode path has per-token FFN/attention
+//    projection costs that do NOT amortise like prefill does.
+//    See memory/feedback_kvcache_serving_number.md.
+//
+//  Method:
+//    Simulate a decode step as one lowrank adapter multiply-add:
+//        y = (A · U · V)  with A = [1 × K] (decode has token-step of 1)
+//    This is the per-step cost of a LoRA-wrapped projection during
+//    autoregressive decode. n_steps fixed; we measure total decode time
+//    then report tok_s = n_steps / decode_s at each rank.
+//
+//  Unit (SSOT = memory/feedback_bench_unit_check.md):
+//    1 decode step = 1 generated token.
+//    tok_s = n_steps / (decode_ms / 1000).
+//    Warmup: 1 step (not counted). Trials: `iters` scaled inversely to R.
+// ══════════════════════════════════════════════════════════════════════
+
+// Decode step shape — 1 token at a time:
+let DEC_M = 1            // single-token step
+let DEC_K = K            // model dim (reuse K)
+let DEC_N = N            // projection out (reuse N)
+// Decode is cheap per call; use same iters baseline, not 2x, to keep
+// total runtime bounded under the interpreter.
+let dec_base_steps = iters
+
+// Per-rank KV-decode metrics
+let mut dec_tok_s_arr = []
+let mut dec_ms_arr = []
+let mut dec_steps_arr = []
+let mut dec_gflops_arr = []
+
+let dec_A = tensor_zeros(DEC_M * DEC_K)
+
+let mut dk = 0
+while dk < n_ranks {
+    let Rd = ranks[dk]
+    let Ud = tensor_zeros(DEC_K * Rd)
+    let Vd = tensor_zeros(Rd * DEC_N)
+
+    // Hold steps CONSTANT across ranks (see comment in forward sweep).
+    let dec_steps = dec_base_steps
+    let dec_steps_f = to_float(dec_steps)
+
+    // warmup
+    let _dwa = matmul(dec_A, Ud, DEC_M, DEC_K, Rd)
+    let _dwb = matmul(_dwa, Vd, DEC_M, Rd, DEC_N)
+
+    let dt0 = clock()
+    let mut sdx = 0
+    while sdx < dec_steps {
+        let Ts = matmul(dec_A, Ud, DEC_M, DEC_K, Rd)
+        let _ = matmul(Ts, Vd, DEC_M, Rd, DEC_N)
+        sdx = sdx + 1
+    }
+    let dt1 = clock()
+    let mut dec_elapsed = dt1 - dt0
+    if dec_elapsed <= 0.0 { dec_elapsed = 0.001 }
+
+    let dec_s = dec_elapsed
+    let dec_ms = dec_s * 1000.0
+    let dec_tok_s = dec_steps_f / dec_s
+
+    // FLOPs per step (single-token lowrank): 2*K*R + 2*R*N
+    let dec_flops_part1 = to_float(2 * DEC_K * Rd)
+    let dec_flops_part2 = to_float(2 * Rd * DEC_N)
+    let dec_flops_total = (dec_flops_part1 + dec_flops_part2) * dec_steps_f
+    let dec_gflops = dec_flops_total / dec_s / 1000000000.0
+
+    dec_tok_s_arr = dec_tok_s_arr.push(dec_tok_s)
+    dec_ms_arr = dec_ms_arr.push(dec_ms)
+    dec_steps_arr = dec_steps_arr.push(dec_steps)
+    dec_gflops_arr = dec_gflops_arr.push(dec_gflops)
+
+    dk = dk + 1
+}
+
+// Emit per-rank decode JSON lines
+let mut di = 0
+while di < n_ranks {
+    let Rd2 = ranks[di]
+    let mut dparts = []
+    dparts = dparts.push("{")
+    dparts = dparts.push("\"sweep\":\"kv_decode\"")
+    dparts = dparts.push(",\"rank\":"); dparts = dparts.push(str(Rd2))
+    dparts = dparts.push(",\"K\":"); dparts = dparts.push(str(DEC_K))
+    dparts = dparts.push(",\"N\":"); dparts = dparts.push(str(DEC_N))
+    dparts = dparts.push(",\"steps\":"); dparts = dparts.push(str(dec_steps_arr[di]))
+    dparts = dparts.push(",\"decode_ms\":"); dparts = dparts.push(str(dec_ms_arr[di]))
+    dparts = dparts.push(",\"tok_s\":"); dparts = dparts.push(str(dec_tok_s_arr[di]))
+    dparts = dparts.push(",\"gflops\":"); dparts = dparts.push(str(dec_gflops_arr[di]))
+    dparts = dparts.push("}")
+    println(dparts.join(""))
+
+    di = di + 1
+}
+
+// Decode-sweep summary: knee rank based on tok_s collapse
+// tok_s should be flat in the overhead regime (dispatch dominates) and
+// drop as ~1/R in the compute-bound regime. The knee = first rank going
+// low→high where tok_s has dropped to ≤ 50% of the max tok_s seen at
+// low ranks (i.e. rank where compute cost overtakes dispatch overhead).
+let mut dec_tok_s_max = dec_tok_s_arr[0]
+let mut dj = 1
+while dj < n_ranks {
+    if dec_tok_s_arr[dj] > dec_tok_s_max { dec_tok_s_max = dec_tok_s_arr[dj] }
+    dj = dj + 1
+}
+let dec_knee_threshold = dec_tok_s_max * 0.5
+let mut dec_knee_rank = ranks[last_idx]
+let mut dm = 0
+while dm < n_ranks {
+    if dec_tok_s_arr[dm] <= dec_knee_threshold {
+        dec_knee_rank = ranks[dm]
+        dm = n_ranks  // break
+    } else {
+        dm = dm + 1
+    }
+}
+
+let mut dsparts = []
+dsparts = dsparts.push("{")
+dsparts = dsparts.push("\"summary\":\"kv_decode_sweep\"")
+dsparts = dsparts.push(",\"K\":"); dsparts = dsparts.push(str(DEC_K))
+dsparts = dsparts.push(",\"N\":"); dsparts = dsparts.push(str(DEC_N))
+dsparts = dsparts.push(",\"steps_base\":"); dsparts = dsparts.push(str(dec_base_steps))
+dsparts = dsparts.push(",\"tok_s_max\":"); dsparts = dsparts.push(str(dec_tok_s_max))
+dsparts = dsparts.push(",\"decode_knee_rank\":"); dsparts = dsparts.push(str(dec_knee_rank))
+dsparts = dsparts.push(",\"threshold_tok_s\":"); dsparts = dsparts.push(str(dec_knee_threshold))
+dsparts = dsparts.push("}")
+println(dsparts.join(""))

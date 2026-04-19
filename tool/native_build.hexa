@@ -1,0 +1,1648 @@
+#!hexa lax
+// tool/native_build.hexa — P7-6c zero-tool native build driver
+//
+// Hexa → native binary. NO clang, NO cargo, NO external toolchain.
+// Uses self/codegen/{arm64,x86_64,elf,macho}.hexa directly.
+//
+// Usage:
+//   hexa tool/native_build.hexa INPUT.hexa [OUTPUT] [--target=TARGET]
+//
+// Targets (default = host):
+//   darwin-arm64   → Mach-O MH_EXECUTE, ARM64
+//   linux-x86_64   → ELF64 EXEC, x86_64
+//   linux-arm64    → ELF64 EXEC, ARM64
+//
+// Examples:
+//   # Build for current machine (Mac → Mach-O, Linux → ELF)
+//   hexa tool/native_build.hexa self/rt/test_syscall.hexa
+//
+//   # Cross-compile from Mac to Linux (ubu unblock)
+//   hexa tool/native_build.hexa self/rt/test_syscall.hexa \
+//        --target=linux-x86_64 -o build/test_syscall_linux
+//
+//   # Scale check: full compiler
+//   hexa tool/native_build.hexa self/hexa_full.hexa \
+//        --target=darwin-arm64 -o build/hexa_new
+
+// ── P7-9 wiring: parse → IR-lower → codegen_module pipeline ────────
+//
+// Previously `parse_and_lower` / `codegen_module` were `exit(3)` stubs.
+// This file now composes them from the existing SSOT modules:
+//
+//   tokenize (self/lexer.hexa) → parse (self/parser.hexa)
+//     → IR module (self/ir/* via make_ir_module + builder + lowering)
+//     → cg_generate (self/codegen/mod.hexa — regalloc + emit + wrap)
+//
+// The orchestrator below handles the FnDecl / ReturnStmt / IntLit / BinOp
+// subset — enough for the self-tests already proven by native_compile_poc
+// (77/77 PASS). Additional AST kinds route through the generic
+// `nb_lower_expr` helper which mirrors `lower_expr` in ir/lowering.hexa
+// but reads parser-native field names (`value`/`left`/`right`) rather
+// than the test-suite shape (`int_val` etc.).
+use "self/lexer"
+use "self/token"
+use "self/ast"
+use "self/parser"
+use "self/ir/types"
+use "self/ir/instr"
+use "self/ir/builder"
+use "self/ir/opcodes"
+use "self/ir/lowering"
+use "self/codegen/arm64"
+use "self/codegen/x86_64"
+use "self/codegen/regalloc"
+use "self/codegen/regalloc_linear"
+use "self/codegen/peephole"
+use "self/codegen/macho"
+use "self/codegen/elf"
+use "self/codegen/mod"
+
+// ═══════════════════════════════════════════════════════════════════
+// Target descriptor
+// ═══════════════════════════════════════════════════════════════════
+
+struct Target {
+    arch: int,     // 0 = arm64, 1 = x86_64
+    os: int,       // 0 = darwin, 1 = linux
+    format: int    // 0 = mach-o, 1 = elf
+}
+
+fn target_from_string(s: string) -> Target {
+    if s == "darwin-arm64" { return Target{arch: 0, os: 0, format: 0} }
+    if s == "linux-x86_64" { return Target{arch: 1, os: 1, format: 1} }
+    if s == "linux-arm64"  { return Target{arch: 0, os: 1, format: 1} }
+    eprintln("unknown --target: " + s)
+    exit(2)
+    return Target{arch: 0, os: 0, format: 0}
+}
+
+fn detect_host_target() -> Target {
+    let uname = exec("uname -s").trim()
+    let arch  = exec("uname -m").trim()
+    if uname == "Darwin" {
+        return Target{arch: 0, os: 0, format: 0}
+    }
+    if arch == "x86_64" || arch == "amd64" {
+        return Target{arch: 1, os: 1, format: 1}
+    }
+    return Target{arch: 0, os: 1, format: 1}
+}
+
+fn target_to_string(t: Target) -> string {
+    if t.os == 0 { return "darwin-arm64" }
+    if t.arch == 1 { return "linux-x86_64" }
+    return "linux-arm64"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// P7-7 rt_target routing — SSOT mirror of self/codegen/rt_symbols.hexa.
+// Inlined because native_build.hexa is a flatten-monolith (use directives
+// are comments per tool/flatten_imports.hexa:9). Keep entries byte-
+// for-byte in sync with self/codegen/rt_symbols.hexa (and the parallel
+// inline copy in self/codegen_c2.hexa, landed in commit 3b99e34c).
+//
+// Flip knob: cg_rt_target() = "c" (legacy hexa_*) | "rt" (rt_*_v via abi
+// wrappers). Current default "c" preserves all existing behavior — the
+// helper returns exactly the same literal the prior inline `return "hexa_*"`
+// form produced. Activation (Step C) is a single-line edit below.
+// ═══════════════════════════════════════════════════════════════════
+
+fn cg_rt_target() { return "c" }
+
+fn cg_math_sym(name) {
+    if cg_rt_target() == "rt" {
+        if name == "abs"   { return "rt_math_abs_v" }
+        if name == "sqrt"  { return "rt_math_sqrt_v" }
+        if name == "floor" { return "rt_math_floor_v" }
+        if name == "ceil"  { return "rt_math_ceil_v" }
+        if name == "round" { return "rt_math_round_v" }
+        if name == "pow"   { return "rt_math_pow_v" }
+        if name == "min"   { return "rt_math_min_v" }
+        if name == "max"   { return "rt_math_max_v" }
+        if name == "sin"   { return "rt_math_sin_v" }
+        if name == "cos"   { return "rt_math_cos_v" }
+        if name == "tan"   { return "rt_math_tan_v" }
+        if name == "asin"  { return "rt_math_asin_v" }
+        if name == "acos"  { return "rt_math_acos_v" }
+        if name == "atan"  { return "rt_math_atan_v" }
+        if name == "atan2" { return "rt_math_atan2_v" }
+        if name == "log"   { return "rt_math_log_v" }
+        if name == "exp"   { return "rt_math_exp_v" }
+        if name == "tanh"  { return "rt_math_tanh_v" }
+        return ""
+    }
+    if name == "abs"   { return "hexa_math_abs" }
+    if name == "sqrt"  { return "hexa_math_sqrt" }
+    if name == "floor" { return "hexa_math_floor" }
+    if name == "ceil"  { return "hexa_math_ceil" }
+    if name == "round" { return "hexa_math_round" }
+    if name == "pow"   { return "hexa_math_pow" }
+    if name == "min"   { return "hexa_math_min" }
+    if name == "max"   { return "hexa_math_max" }
+    if name == "sin"   { return "hexa_math_sin" }
+    if name == "cos"   { return "hexa_math_cos" }
+    if name == "tan"   { return "hexa_math_tan" }
+    if name == "asin"  { return "hexa_math_asin" }
+    if name == "acos"  { return "hexa_math_acos" }
+    if name == "atan"  { return "hexa_math_atan" }
+    if name == "atan2" { return "hexa_math_atan2" }
+    if name == "log"   { return "hexa_math_log" }
+    if name == "exp"   { return "hexa_math_exp" }
+    if name == "tanh"  { return "hexa_math_tanh" }
+    return ""
+}
+
+fn cg_string_sym(name) {
+    if cg_rt_target() == "rt" {
+        if name == "str_concat"      { return "rt_str_concat_v" }
+        if name == "str_contains"    { return "rt_str_contains_v" }
+        if name == "str_eq"          { return "rt_str_eq_v" }
+        if name == "str_substring"   { return "rt_str_substring_v" }
+        if name == "str_slice"       { return "rt_str_slice_v" }
+        if name == "str_trim"        { return "rt_str_trim_v" }
+        if name == "str_trim_start"  { return "rt_str_trim_start_v" }
+        if name == "str_trim_end"    { return "rt_str_trim_end_v" }
+        if name == "str_replace"     { return "rt_str_replace_v" }
+        if name == "str_pad_left"    { return "rt_str_pad_left_v" }
+        if name == "str_pad_right"   { return "rt_str_pad_right_v" }
+        if name == "str_repeat"      { return "rt_str_repeat_v" }
+        if name == "str_index_of"    { return "rt_str_index_of_v" }
+        if name == "str_reverse"     { return "rt_str_reverse_v" }
+        if name == "str_split"       { return "rt_str_split_v" }
+        if name == "str_join"        { return "rt_str_join_v" }
+        if name == "str_to_upper"    { return "rt_str_to_upper_v" }
+        if name == "str_to_lower"    { return "rt_str_to_lower_v" }
+        if name == "str_char_at"     { return "rt_str_char_at_v" }
+        if name == "str_char_code_at"{ return "rt_str_char_code_at_v" }
+        if name == "str_parse_int"   { return "rt_str_parse_int_v" }
+        if name == "str_parse_float" { return "rt_str_parse_float_v" }
+        if name == "str_bytes"       { return "rt_str_bytes_v" }
+        if name == "str_from_chars"  { return "rt_str_from_chars_v" }
+        return ""
+    }
+    if name == "str_concat"      { return "hexa_str_concat" }
+    if name == "str_contains"    { return "hexa_str_contains" }
+    if name == "str_eq"          { return "hexa_str_eq" }
+    if name == "str_substring"   { return "hexa_str_substring" }
+    if name == "str_slice"       { return "hexa_str_slice" }
+    if name == "str_trim"        { return "hexa_str_trim" }
+    if name == "str_trim_start"  { return "hexa_str_trim_start" }
+    if name == "str_trim_end"    { return "hexa_str_trim_end" }
+    if name == "str_replace"     { return "hexa_str_replace" }
+    if name == "str_pad_left"    { return "hexa_str_pad_left" }
+    if name == "str_pad_right"   { return "hexa_str_pad_right" }
+    if name == "str_repeat"      { return "hexa_str_repeat" }
+    if name == "str_index_of"    { return "hexa_str_index_of" }
+    if name == "str_reverse"     { return "hexa_str_reverse" }
+    if name == "str_split"       { return "hexa_str_split" }
+    if name == "str_join"        { return "hexa_str_join" }
+    if name == "str_to_upper"    { return "hexa_str_to_upper" }
+    if name == "str_to_lower"    { return "hexa_str_to_lower" }
+    if name == "str_char_at"     { return "hexa_str_char_at" }
+    if name == "str_char_code_at"{ return "hexa_str_char_code_at" }
+    if name == "str_parse_int"   { return "hexa_str_parse_int" }
+    if name == "str_parse_float" { return "hexa_str_parse_float" }
+    if name == "str_bytes"       { return "hexa_str_bytes" }
+    if name == "str_from_chars"  { return "hexa_str_from_chars" }
+    return ""
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Main
+// ═══════════════════════════════════════════════════════════════════
+
+fn main() {
+    let av = argv()
+    if len(av) < 3 {
+        eprintln("usage: hexa tool/native_build.hexa INPUT.hexa [OUTPUT] [--target=TARGET]")
+        exit(1)
+    }
+
+    let mut input = ""
+    let mut output = ""
+    let mut target = detect_host_target()
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a.starts_with("--target=") {
+            target = target_from_string(a.slice(9, len(a)))
+        } else if a == "-o" && i + 1 < len(av) {
+            output = av[i + 1]
+            i = i + 1
+        } else if input == "" {
+            input = a
+        } else if output == "" {
+            output = a
+        }
+        i = i + 1
+    }
+
+    if input == "" {
+        eprintln("no input file")
+        exit(1)
+    }
+    if output == "" {
+        let base = exec("basename " + input + " .hexa").trim()
+        output = "build/" + base + "_" + target_to_string(target)
+    }
+
+    println("[native_build] " + input + " → " + output)
+    println("[native_build] target: " + target_to_string(target))
+
+    // ── Parse + lower to IR ────────────────────────────────────────
+    //
+    // parse_and_lower returns an IRModule. This is the scaled-up path
+    // (P7-6a) — until it compiles hexa_full.hexa end-to-end, the call
+    // stays a stub and this script only works for small programs.
+    let src = read_file(input)
+    let ir_mod = parse_and_lower(src, input)
+
+    // ── Codegen ────────────────────────────────────────────────────
+    // codegen_module now delegates to self/codegen/mod.hexa::cg_generate,
+    // which handles regalloc + per-fn emit + peephole + object-format
+    // wrap (Mach-O or ELF) in one shot. `bin_bytes` is therefore
+    // already the final file image — no script-level wrap pass.
+    let bin_bytes = codegen_module(ir_mod, target)
+
+    // ── Write + chmod ──────────────────────────────────────────────
+    write_bytes(output, bin_bytes)
+    exec("chmod +x " + output)
+
+    // ── Darwin ad-hoc codesign (skip when cross-compiling to Darwin from Linux) ──
+    if target.os == 0 {
+        let uname = exec("uname -s").trim()
+        if uname == "Darwin" {
+            exec("codesign -s - " + output)
+        } else {
+            eprintln("[native_build] WARN: skipping codesign (cross-compile to Darwin from non-Mac host — binary may not run on SIP-enforced macOS)")
+        }
+    }
+
+    let sz = file_size(output)
+    println("[native_build] OK: " + output + " (" + str(sz) + " bytes)")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Hooks — must be provided by the compiler at link time
+// ═══════════════════════════════════════════════════════════════════
+//
+// These are the integration points between the parser/IR/codegen
+// modules. Until P7-6a lands (hexa_full.hexa scale), parse_and_lower
+// is a placeholder.
+
+// ── Builtin runtime dispatch (P7-6) ───────────────────────────────
+//
+// Map hexa-source builtin names → runtime C symbols (self/runtime.c).
+// Returning "" signals "not a builtin — fall through to user-fn
+// resolution". When a builtin is recognized, nb_lower_builtin below
+// auto-registers an extern stub fn in the IrModule (so bld_call has a
+// valid fid) and emits a CALL. The ARM64 backend currently lowers
+// CALL to a BL stub (offset 0) — real symbol resolution is P7-6b
+// linker work. For the interpreter path (`hexa test ...`), these
+// builtins are resolved natively by the stage0 runtime.
+//
+// Parser uses `argv()` in some files and `args()` in others; both
+// route to the same runtime symbol `hexa_args`. Same for `env` /
+// `env_var`.
+fn nb_builtin_runtime_sym(name: string) -> string {
+    if name == "print" { return "hexa_print_val" }
+    if name == "println" { return "hexa_println" }
+    if name == "eprintln" { return "hexa_eprintln" }
+    if name == "len" { return "hexa_len" }
+    if name == "argv" { return "hexa_args" }
+    if name == "args" { return "hexa_args" }
+    if name == "exit" { return "hexa_exit" }
+    if name == "exec" { return "hexa_exec" }
+    if name == "exec_with_status" { return "hexa_exec_with_status" }
+    if name == "read_file" { return "hexa_read_file" }
+    if name == "write_file" { return "hexa_write_file" }
+    if name == "file_exists" { return "hexa_file_exists" }
+    if name == "env" { return "hexa_env_var" }
+    if name == "env_var" { return "hexa_env_var" }
+    // P7-6 expansion (2026-04-19): FFI pointer / math / timing / conversion
+    // builtins used by training + FFI code (train_7b_integrated, bench/*, etc.)
+    // Each maps to an existing runtime.c symbol — no new runtime code required.
+    if name == "alloc_raw"   { return "hexa_ptr_alloc" }
+    if name == "free_raw"    { return "hexa_ptr_free" }
+    if name == "write_f32"   { return "hexa_ptr_write_f32" }
+    if name == "deref_f32"   { return "hexa_ptr_read_f32" }
+    if name == "ptr_addr"    { return "hexa_ptr_addr" }
+    if name == "ptr_null"    { return "hexa_ptr_null" }
+    if name == "sqrt"        { return "hexa_sqrt" }
+    if name == "pow"         { return "hexa_pow" }
+    if name == "u_floor"     { return "hexa_u_floor" }
+    if name == "clock"       { return "hexa_clock" }
+    if name == "time_ms"     { return "hexa_time_ms" }
+    if name == "to_string"   { return "hexa_to_string" }
+    if name == "str"         { return "hexa_to_string" }
+    if name == "byte_len"    { return "hexa_byte_len" }
+    // FFI marshalling helpers (cstring/from_cstring) — `extern fn`
+    // wrappers routinely pass/receive C strings through these.
+    if name == "cstring"      { return "hexa_cstring" }
+    if name == "from_cstring" { return "hexa_from_cstring" }
+    // P7-6 math transcendentals + rounding + conversions (runtime.c 2026-04-19)
+    if name == "sin"         { return "hexa_sin" }
+    if name == "cos"         { return "hexa_cos" }
+    if name == "tan"         { return "hexa_tan" }
+    if name == "exp"         { return "hexa_exp" }
+    if name == "log"         { return "hexa_log" }
+    if name == "log10"       { return "hexa_log10" }
+    if name == "floor"       { return "hexa_floor" }
+    if name == "ceil"        { return "hexa_ceil" }
+    if name == "round"       { return "hexa_round" }
+    if name == "abs"         { return "hexa_abs" }
+    if name == "to_float"    { return "hexa_to_float" }
+    if name == "to_int"      { return "hexa_to_int" }
+    if name == "int"         { return "hexa_to_int" }
+    if name == "float"       { return "hexa_to_float" }
+    // Inverse trig + atan2 — runtime has hexa_math_* shims (use _hexa_f).
+    // Matches codegen_c2 dispatch (self/codegen_c2.hexa:2812-2814,2867).
+    if name == "asin"        { return cg_math_sym("asin") }
+    if name == "acos"        { return cg_math_sym("acos") }
+    if name == "atan"        { return cg_math_sym("atan") }
+    if name == "atan2"       { return cg_math_sym("atan2") }
+    // P7-6 string builtins — all pre-existing in runtime.c
+    if name == "str_concat"     { return cg_string_sym("str_concat") }
+    if name == "str_split"      { return cg_string_sym("str_split") }
+    if name == "str_trim"       { return cg_string_sym("str_trim") }
+    if name == "str_trim_start" { return cg_string_sym("str_trim_start") }
+    if name == "str_trim_end"   { return cg_string_sym("str_trim_end") }
+    if name == "str_replace"    { return cg_string_sym("str_replace") }
+    if name == "str_join"       { return cg_string_sym("str_join") }
+    if name == "str_to_upper"   { return cg_string_sym("str_to_upper") }
+    if name == "str_to_lower"   { return cg_string_sym("str_to_lower") }
+    if name == "str_chars"      { return "hexa_str_chars" }
+    if name == "str_bytes"      { return cg_string_sym("str_bytes") }
+    if name == "str_slice"      { return cg_string_sym("str_slice") }
+    if name == "str_repeat"     { return cg_string_sym("str_repeat") }
+    if name == "str_parse_int"  { return cg_string_sym("str_parse_int") }
+    if name == "str_parse_float"{ return cg_string_sym("str_parse_float") }
+    if name == "str_pad_left"   { return cg_string_sym("str_pad_left") }
+    if name == "str_pad_right"  { return cg_string_sym("str_pad_right") }
+    if name == "str_center"     { return "hexa_str_center" }
+    if name == "str_count_substr" { return "hexa_str_count_substr" }
+    if name == "append_file"    { return "hexa_append_file" }
+    // P7-6 tensor + math builtins (runtime.c pre-existing + FIX-A 2nd batch)
+    if name == "tensor_zeros"     { return "hexa_tensor_zeros" }
+    if name == "tensor_ones"      { return "hexa_tensor_ones" }
+    if name == "tensor_slice"     { return "hexa_tensor_slice" }
+    if name == "tensor_add"       { return "hexa_tensor_add" }
+    if name == "tensor_dot"       { return "hexa_tensor_dot" }
+    if name == "tensor_mul_scalar" { return "hexa_tensor_mul_scalar" }
+    // Aliases used by training code (mat_* — same semantics as tensor_*)
+    if name == "mat_add"          { return "hexa_tensor_add" }
+    if name == "mat_scale"        { return "hexa_tensor_mul_scalar" }
+    // Elementwise activations (new in runtime.c 2026-04-19)
+    if name == "hadamard"         { return "hexa_hadamard" }
+    if name == "silu"             { return "hexa_silu" }
+    if name == "gelu"             { return "hexa_gelu" }
+    if name == "argmax"           { return "hexa_argmax" }
+    if name == "tanh"             { return "hexa_tanh" }
+    if name == "log2"             { return "hexa_log2" }
+    // Reductions + scalar helpers (runtime.c 2026-04-19)
+    if name == "sum"              { return "hexa_sum" }
+    if name == "clamp"            { return "hexa_clamp" }
+    if name == "one_hot"          { return "hexa_one_hot" }
+    if name == "min"              { return cg_math_sym("min") }
+    if name == "max"              { return cg_math_sym("max") }
+    if name == "rms_norm"         { return "hexa_rms_norm" }
+    if name == "softmax"          { return "hexa_softmax" }
+    if name == "matmul"           { return "hexa_matmul" }
+    if name == "matvec"           { return "hexa_matvec" }
+    if name == "swiglu_vec"       { return "hexa_swiglu_vec" }
+    if name == "fma"              { return "hexa_fma" }
+    // P7-6 formatting + reflection
+    if name == "pad_left"         { return "hexa_pad_left" }
+    if name == "pad_right"        { return "hexa_pad_right" }
+    if name == "type_of"          { return "hexa_type_of" }
+    if name == "substring"        { return cg_string_sym("str_substring") }
+    if name == "format"           { return "hexa_format" }
+    if name == "format_n"         { return "hexa_format_n" }
+    if name == "format_float"     { return "hexa_format_float" }
+    if name == "format_float_sci" { return "hexa_format_float_sci" }
+    // P7-6 byte I/O — safetensors + binary protocols
+    if name == "write_bytes"         { return "hexa_write_bytes" }
+    if name == "write_bytes_v"       { return "hexa_write_bytes_v" }
+    if name == "read_file_bytes"     { return "hexa_read_file_bytes" }
+    if name == "read_bytes_at"       { return "hexa_read_bytes_at" }
+    if name == "write_bytes_append"  { return "hexa_write_bytes_append" }
+    if name == "write_bytes_append_v"{ return "hexa_write_bytes_append_v" }
+    if name == "file_size"           { return "hexa_file_size" }
+    // P7-6 dict reflection
+    if name == "dict_keys"        { return "hexa_dict_keys" }
+    // P7-6 system/time/IO/JSON — pre-existing runtime.c symbols
+    if name == "exec_replace"     { return "hexa_exec_replace" }
+    if name == "delete_file"      { return "hexa_delete_file" }
+    if name == "read_lines"       { return "hexa_read_lines" }
+    if name == "read_stdin"       { return "hexa_read_stdin" }
+    if name == "input"            { return "hexa_input" }
+    if name == "sleep"            { return "hexa_sleep" }
+    if name == "sleep_s"          { return "hexa_sleep_s" }
+    if name == "random"           { return "hexa_random" }
+    if name == "timestamp"        { return "hexa_timestamp" }
+    if name == "now_monotonic_s"  { return "hexa_now_monotonic_s" }
+    if name == "utc_iso_now"      { return "hexa_utc_iso_now" }
+    if name == "utc_compact_now"  { return "hexa_utc_compact_now" }
+    if name == "to_bool"          { return "hexa_to_bool" }
+    if name == "http_get"         { return "hexa_http_get" }
+    if name == "json_parse"       { return "hexa_json_parse" }
+    if name == "json_decode"      { return "hexa_json_decode" }
+    if name == "json_encode"      { return "hexa_json_encode" }
+    if name == "json_stringify"   { return "hexa_json_stringify" }
+    if name == "base64_encode"    { return "hexa_base64_encode" }
+    if name == "base64_decode"    { return "hexa_base64_decode" }
+    // P7-6 char/byte/number formatting — surface builtins in runtime.c
+    if name == "char_code"      { return "hexa_char_code" }
+    if name == "from_char_code" { return "hexa_from_char_code" }
+    if name == "bin"            { return "hexa_bin" }
+    if name == "hex"            { return "hexa_hex" }
+    // Generic untyped pointer ops (f32-typed variants already mapped above)
+    if name == "ptr_read"       { return "hexa_ptr_read" }
+    if name == "ptr_write"      { return "hexa_ptr_write" }
+    if name == "ptr_offset"     { return "hexa_ptr_offset" }
+    if name == "deref"          { return "hexa_deref" }
+    // P7-6 struct pack/unpack for FFI struct-arg marshalling
+    if name == "struct_unpack"  { return "hexa_struct_unpack" }
+    return ""
+}
+
+// ── P7-6: MethodCall builtin dispatch (obj.method(args…)) ─────────
+//
+// Parser shape for `obj.m(args)` is Call { left: Field{name=m, left=obj},
+// args }. The `Call` branch below detects left.kind=="Field" and
+// UFCS-lowers to `method_name(receiver, args...)`. Many such methods —
+// `str.starts_with`, `arr.push`, etc. — are backed by runtime C
+// symbols, not user-defined free functions. This helper maps the
+// method name → runtime sym so MethodCall emits the correct BL (mirror
+// of nb_builtin_runtime_sym above). Empty return = not a runtime
+// method → fall through to lower_call_by_name (UFCS user-fn lookup).
+fn nb_method_runtime_sym(name: string) -> string {
+    // — String methods —
+    if name == "starts_with"  { return "hexa_str_starts_with" }
+    if name == "ends_with"    { return "hexa_str_ends_with" }
+    if name == "contains"     { return cg_string_sym("str_contains") }
+    if name == "index_of"     { return cg_string_sym("str_index_of") }
+    if name == "substring"    { return cg_string_sym("str_substring") }
+    if name == "to_upper"     { return cg_string_sym("str_to_upper") }
+    if name == "to_lower"     { return cg_string_sym("str_to_lower") }
+    if name == "trim"         { return cg_string_sym("str_trim") }
+    if name == "trim_start"   { return cg_string_sym("str_trim_start") }
+    if name == "trim_end"     { return cg_string_sym("str_trim_end") }
+    if name == "replace"      { return cg_string_sym("str_replace") }
+    if name == "split"        { return cg_string_sym("str_split") }
+    if name == "chars"        { return "hexa_str_chars" }
+    if name == "parse_int"    { return cg_string_sym("str_parse_int") }
+    if name == "parse_float"  { return cg_string_sym("str_parse_float") }
+    if name == "repeat"       { return cg_string_sym("str_repeat") }
+    // String padding + substr count — runtime.c ports of interpreter
+    // at self/hexa_full.hexa:14954-15003. pad char may be multi-char.
+    if name == "pad_left"     { return cg_string_sym("str_pad_left") }
+    if name == "pad_right"    { return cg_string_sym("str_pad_right") }
+    if name == "center"       { return "hexa_str_center" }
+    // — Array methods —
+    if name == "push"         { return "hexa_array_push" }
+    if name == "pop"          { return "hexa_array_pop" }
+    if name == "reverse"      { return "hexa_array_reverse" }
+    if name == "sort"         { return "hexa_array_sort" }
+    if name == "join"         { return cg_string_sym("str_join") }      // arr.join(sep)
+    if name == "map"          { return "hexa_array_map" }
+    if name == "filter"       { return "hexa_array_filter" }
+    if name == "fold"         { return "hexa_array_fold" }
+    if name == "index_of"     { return "hexa_array_index_of" }
+    // Note: `slice` exists on both strings and arrays with the same
+    // (v, start, end) shape in runtime.c. Full disambiguation needs
+    // IR-ty info; we default to array_slice as the common case —
+    // string slices are typically spelled `.substring()`.
+    if name == "slice"        { return "hexa_array_slice" }
+    // slice_fast: zero-copy slice (runtime.c:1039, HexaVal sig).
+    // truncate: in-place shrink (runtime.c:1121, HexaVal sig).
+    // reserve deliberately omitted — takes `int n` not HexaVal, unsafe to
+    // expose as a builtin without a wrapper.
+    if name == "slice_fast"   { return "hexa_array_slice_fast" }
+    if name == "truncate"     { return "hexa_array_truncate" }
+    // Higher-order predicates + scans — runtime.c ports of interpreter
+    // methods at self/hexa_full.hexa:15189-15292. Callback arity:
+    // any/all/count/find/flat_map take one-arg fn; enumerate takes none.
+    // any/all now route maps to hexa_map_any/hexa_map_all inside the
+    // hexa_array_any/all wrappers (runtime.c HX_IS_MAP early-delegate).
+    // count uses hexa_count_poly which covers str/map/array receivers
+    // (2026-04-19).
+    if name == "any"          { return "hexa_array_any" }
+    if name == "all"          { return "hexa_array_all" }
+    if name == "count"        { return "hexa_count_poly" }
+    if name == "find"         { return "hexa_array_find" }
+    if name == "flat_map"     { return "hexa_array_flat_map" }
+    if name == "enumerate"    { return "hexa_array_enumerate" }
+    // Reductions + transforms (no-callback) — interpreter methods at
+    // self/hexa_full.hexa:15316-15494. Note: `min`/`max` as *methods*
+    // differ from the 2-arg scalar `min(a,b)`/`max(a,b)` builtins in
+    // nb_builtin_runtime_sym (hexa_math_min/max). Method dispatch fires
+    // for the Field-based call path only, so no collision.
+    if name == "min"          { return "hexa_array_min" }
+    if name == "max"          { return "hexa_array_max" }
+    if name == "flatten"      { return "hexa_array_flatten" }
+    if name == "for_each"     { return "hexa_array_for_each" }
+    if name == "fill"         { return "hexa_array_fill" }
+    // Slicing + combinators (interpreter 15258-15395, 15263-15277).
+    if name == "take"         { return "hexa_array_take" }
+    if name == "drop"         { return "hexa_array_drop" }
+    if name == "zip"          { return "hexa_array_zip" }
+    if name == "chunk"        { return "hexa_array_chunk" }
+    if name == "window"       { return "hexa_array_window" }
+    if name == "unique"       { return "hexa_array_unique" }
+    // More combinators — runtime.c ports of interpreter methods at
+    // self/hexa_full.hexa:15426-15512 (rotate/partition/interleave/scan/swap).
+    if name == "rotate"       { return "hexa_array_rotate" }
+    if name == "partition"    { return "hexa_array_partition" }
+    if name == "interleave"   { return "hexa_array_interleave" }
+    if name == "scan"         { return "hexa_array_scan" }
+    if name == "swap"         { return "hexa_array_swap" }
+    // Reductions — sum(arr) already lives in the free-function table
+    // above; as methods they reuse the same runtime symbols. mean/product
+    // are new (runtime.c 2026-04-19).
+    if name == "sum"          { return "hexa_sum" }
+    if name == "product"      { return "hexa_array_product" }
+    if name == "mean"         { return "hexa_array_mean" }
+    // — Map methods (runtime.c 2026-04-19) —
+    // `.keys()` / `.values()` already covered by the free-function table
+    // above. entries/to_array return flat [[k,v], ...] arrays; merge
+    // returns self with other's entries overlaid (other wins on collision).
+    if name == "entries"      { return "hexa_map_entries" }
+    if name == "to_array"     { return "hexa_map_to_array" }
+    if name == "merge"        { return "hexa_map_merge" }
+    if name == "map_values"   { return "hexa_map_map_values" }
+    if name == "filter_keys"  { return "hexa_map_filter_keys" }
+    // invert: swap k<->v with string coercion on new keys.
+    // from_array: receiver-ignored, arg is [[k,v],...]; see codegen_c2
+    // dispatch for the 2-arg emit shape.
+    if name == "invert"       { return "hexa_map_invert" }
+    if name == "from_array"   { return "hexa_map_from_array" }
+    // array.group_by: fn(item)→key, buckets into map[str(key)] = [items].
+    // Map.group_by is not yet ported (distinct semantics per interpreter).
+    if name == "group_by"     { return "hexa_array_group_by" }
+    // array.frequencies: count occurrences per value → map<str, int>.
+    if name == "frequencies"  { return "hexa_array_frequencies" }
+    // array.sample(n): n draws with replacement from uniform rand().
+    if name == "sample"       { return "hexa_array_sample" }
+    // str.substr: JS-style (start, length). codegen_c2 handles optional
+    // length arg (emits hexa_void() sentinel when omitted).
+    if name == "substr"       { return "hexa_str_substr" }
+    // — Common cross-type methods —
+    // `.len()` and `.bytes()` work on strings, arrays, maps via the
+    // universal hexa_len / hexa_byte_len helpers.
+    // `.is_empty()` is polymorphic (runtime.c hexa_is_empty).
+    if name == "len"          { return "hexa_len" }
+    if name == "bytes"        { return cg_string_sym("str_bytes") }
+    // str.lines(): split on '\n', delegates to hexa_str_split.
+    if name == "lines"        { return "hexa_str_lines" }
+    if name == "is_empty"     { return "hexa_is_empty" }
+    return ""
+}
+
+// Idempotent extern registration: on first use, add a placeholder
+// IrFunction entry so that `bld_call` has a valid fid. Subsequent
+// calls reuse the same index. Param shape is intentionally empty —
+// ARM64/x86_64 backends emit BL/CALL stubs and ABI-place args via
+// regalloc from the operand list rather than the fn's declared params.
+fn nb_ensure_extern_fn(m, sym: string) -> int {
+    let existing = module_find_function(m, sym)
+    if existing >= 0 { return existing }
+    module_add_function(m, sym, [], "i64")
+    return len(m.functions) - 1
+}
+
+// Lower a recognized builtin call: register extern + emit CALL.
+// Void-returning builtins (print/println/eprintln/exit) still yield
+// an SSA vid because the IR is uniformly typed i64 at this stage;
+// upstream callers discard the value via ExprStmt.
+fn nb_lower_builtin(m, b, name: string, sym: string, arg_vids) -> int {
+    let fid = nb_ensure_extern_fn(m, sym)
+    return bld_call(m, b, fid, arg_vids, "i64")
+}
+
+// ── Struct-type inference (P7-6 Field struct_idx step 3b) ─────────
+// Resolves an expression's declared struct type without emitting any
+// IR. Used by Field access lowering to support chained access:
+//
+//   a.b.c  parses as  Field{ left: Field{ left: Ident{a}, name: b }, name: c }
+//
+// Chain walks the Field-spine: infer type of the parent Field by
+// recursing on .left, then look up .name's declared type in the
+// registry. Untyped fields ("" annotation in the parser) stop the
+// chain — caller gets "" which triggers idx=0 fallback at that step.
+//
+// Non-Ident / non-Field leaves return "" (calls, array indexes,
+// literals — their type inference would need broader ret_struct
+// tracking and IR-value tagging, deferred).
+fn nb_infer_struct_type(m, e, env) -> string {
+    if e.kind == "Ident" {
+        // Env may carry either a bare struct name ("Point") or an
+        // array-wrapped annotation ("[Point]") stored by LetStmt. We
+        // return the raw tag unchanged — the Index handler below is
+        // what strips the [..] wrapper. Field handlers feed the raw
+        // name into module_find_field_type which returns "" for any
+        // unregistered key, so "[Point]" as a struct name is harmless.
+        return lower_env_type_of(env, e.name)
+    }
+    if e.kind == "Field" || e.kind == "FieldAccess" {
+        let parent = nb_infer_struct_type(m, e.left, env)
+        if len(parent) == 0 { return "" }
+        return module_find_field_type(m, parent, e.name)
+    }
+    // P7-6 step 3c: StructInit self-type — lets `Point{x:1,y:2}.x`
+    // resolve without an intermediate let-binding.
+    if e.kind == "StructInit" || e.kind == "StructLit" || e.kind == "Struct" {
+        return e.name
+    }
+    // P7-6 step 3e: Index — `arr[i]` receiver. Resolve arr's tracked
+    // type (e.g. "[Point]") and strip the [..] wrapper to yield the
+    // element struct. Non-array-tagged / unknown → "". Strictly
+    // additive: untyped arrays still fall through to the legacy
+    // idx=0 Field path downstream.
+    if e.kind == "Index" {
+        let arr_t = nb_infer_struct_type(m, e.left, env)
+        return nb_strip_array_wrap(arr_t)
+    }
+    // P7-6 step 3c: Call through Ident callee — look up fn ret_struct.
+    // Covers `make_point().x` etc.
+    if e.kind == "Call" {
+        if e.left.kind == "Ident" {
+            let cidx = module_find_function(m, e.left.name)
+            if cidx >= 0 {
+                return module_get_fn_ret_struct(m, cidx)
+            }
+        }
+        // P7-6 step 3d: Call through Field — impl-method chain. Infer
+        // the receiver's struct type, then probe the mangled
+        // Type__method entry for its ret_struct tag.
+        if e.left.kind == "Field" {
+            let recv_t = nb_infer_struct_type(m, e.left.left, env)
+            if len(recv_t) > 0 {
+                let mang = recv_t + "__" + e.left.name
+                let midx = module_find_function(m, mang)
+                if midx >= 0 {
+                    return module_get_fn_ret_struct(m, midx)
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// P7-6 step 3e helper: unwrap an `[Inner]` array annotation and return
+// Inner. Non-wrapped strings return "" (the caller then treats the
+// base as non-array). Recognized shapes: "[X]" → "X". Longer nested
+// shapes ("[[X]]" → "[X]") are handled by a single unwrap so chained
+// Index access needs to call nb_strip_array_wrap once per dimension
+// — fine for stage-0 since matrix-of-struct isn't a common path.
+fn nb_strip_array_wrap(t: string) -> string {
+    let n = len(t)
+    if n < 3 { return "" }
+    if t.substring(0, 1) != "[" { return "" }
+    if t.substring(n - 1, n) != "]" { return "" }
+    return t.substring(1, n - 1)
+}
+
+// ── Expression lowering (parser → IR) ─────────────────────────────
+// Parser AST uses string `value` for IntLit and `left`/`right`/`op`
+// for BinOp; ir/lowering.hexa's lower_int_lit/bin_op consumers read
+// `int_val` so we lower here locally to stay on the parser-native
+// schema (no AST rewrite pass needed).
+fn nb_lower_expr(m, b, e, env) -> int {
+    let k = e.kind
+    if k == "IntLit" {
+        let n = to_int(e.value)
+        return bld_const_i64(m, b, n)
+    }
+    if k == "BoolLit" {
+        let v = 0
+        if e.value == "true" { v = 1 }
+        return bld_const_i64(m, b, v)
+    }
+    // CharLit: parser emits kind="CharLit" with e.value = single-char
+    // string. Stage0 lacks an in-language `ord()` builtin, so the most
+    // robust route is to intern the 1-char string in the module pool
+    // and materialize it as a string-ref. Call-site code that actually
+    // needs the byte value goes through `s[0]` or `byte_len(s)` at
+    // runtime, both of which already lower correctly. This keeps the
+    // handler non-fatal for FFI signatures that forward chars opaquely.
+    if k == "CharLit" {
+        let idx = module_intern_string(m, e.value)
+        return bld_const_string(m, b, idx)
+    }
+    // FloatLit: stage-0 IR is i64-uniform; truncate the literal to int
+    // so FFI signatures that pass floats (`extern fn sinf(x: f32)`)
+    // don't hit a coverage-gap at parse time. Numeric precision
+    // tracking lands alongside float-typed IR in a later P7-6 slice.
+    if k == "FloatLit" {
+        let f_as_i = to_int(e.value)
+        return bld_const_i64(m, b, f_as_i)
+    }
+    if k == "BinOp" || k == "Binary" {
+        let lhs = nb_lower_expr(m, b, e.left, env)
+        if lhs < 0 { return -1 }
+        let rhs = nb_lower_expr(m, b, e.right, env)
+        if rhs < 0 { return -1 }
+        // Parser emits symbolic ops (`+`, `-`, …); ir/lowering
+        // expects mnemonic strings (`add`, `sub`, …). Map here.
+        let op = e.op
+        if op == "+" { return bld_add(m, b, lhs, rhs, "i64") }
+        if op == "-" { return bld_sub(m, b, lhs, rhs, "i64") }
+        if op == "*" { return bld_mul(m, b, lhs, rhs, "i64") }
+        if op == "/" { return bld_div(m, b, lhs, rhs, "i64") }
+        if op == "%" { return bld_modulo(m, b, lhs, rhs, "i64") }
+        if op == "==" { return bld_cmp_eq(m, b, lhs, rhs) }
+        if op == "!=" { return bld_cmp_ne(m, b, lhs, rhs) }
+        if op == "<"  { return bld_cmp_lt(m, b, lhs, rhs) }
+        if op == "<=" { return bld_cmp_le(m, b, lhs, rhs) }
+        if op == ">"  { return bld_cmp_gt(m, b, lhs, rhs) }
+        if op == ">=" { return bld_cmp_ge(m, b, lhs, rhs) }
+        if op == "&"  { return bld_band(m, b, lhs, rhs, "i64") }
+        if op == "|"  { return bld_bor (m, b, lhs, rhs, "i64") }
+        if op == "^"  { return bld_bxor(m, b, lhs, rhs, "i64") }
+        if op == "<<" { return bld_shl (m, b, lhs, rhs, "i64") }
+        if op == ">>" { return bld_shr (m, b, lhs, rhs, "i64") }
+        return -1
+    }
+    if k == "Unary" || k == "UnaryOp" {
+        let inner = nb_lower_expr(m, b, e.left, env)
+        if inner < 0 { return -1 }
+        let op = e.op
+        if op == "-" { return bld_neg(m, b, inner, "i64") }
+        if op == "!" {
+            let one = bld_const_i64(m, b, 1)
+            return bld_sub(m, b, one, inner, "i64")
+        }
+        return -1
+    }
+    if k == "Ident" {
+        return lower_ident_by_name(m, b, env, e.name, "i64")
+    }
+    // ── P7-6 expr kind coverage (2026-04-18) ──────────────────
+    // StringLit: parser emits `value = <raw string>` on a node whose
+    // kind is "StringLit". The string pool lives on the IrModule;
+    // module_intern_string dedups and returns the pool index, which
+    // bld_const_string wraps as an op_string_ref load.
+    if k == "StringLit" {
+        let idx = module_intern_string(m, e.value)
+        return bld_const_string(m, b, idx)
+    }
+    // ArrayLit: parser kind is "Array" (with "ArrayLit" as a historical
+    // alias).  e.items holds the element expressions.  We lower each,
+    // then delegate to lower_array_from_vids which materializes the
+    // array as alloc + N bld_array_store operations.  elem_ty stays i64
+    // for now — heterogeneous arrays lower as boxed i64 slots.
+    if k == "Array" || k == "ArrayLit" {
+        let items = e.items
+        let n = len(items)
+        let mut elem_vids = []
+        let mut i = 0
+        while i < n {
+            let ev = nb_lower_expr(m, b, items[i], env)
+            if ev < 0 { return -1 }
+            elem_vids = elem_vids.push(ev)
+            i = i + 1
+        }
+        return lower_array_from_vids(m, b, elem_vids, "i64")
+    }
+    // Index: `arr[i]` parses as kind="Index" with e.left=array,
+    // e.right=index.  Both sub-exprs lower recursively; bld_array_index
+    // emits a load with [array_vid, index_vid] operands.
+    if k == "Index" {
+        let arr = nb_lower_expr(m, b, e.left, env)
+        if arr < 0 { return -1 }
+        let idx = nb_lower_expr(m, b, e.right, env)
+        if idx < 0 { return -1 }
+        return bld_array_index(m, b, arr, idx, "i64")
+    }
+    // FieldAccess: parser emits kind="Field" (not "FieldAccess"),
+    // with e.left=object expr and e.name=field name.
+    //
+    // P7-6 struct_idx resolution (partial):
+    //   If e.left is a bare Ident whose type is tracked in env (set by
+    //   LetStmt when RHS was a StructInit), resolve the field name via
+    //   the module struct registry. Unknown idents / non-Ident bases
+    //   fall back to idx=0 (the legacy behavior) — safe for the POC
+    //   field="field" smoke path and doesn't regress un-typed flows.
+    if k == "Field" || k == "FieldAccess" {
+        let obj = nb_lower_expr(m, b, e.left, env)
+        if obj < 0 { return -1 }
+        // P7-6 Field struct_idx step 3b: chain-resolution. nb_infer_struct_type
+        // walks the Field-spine for nested access (a.b.c) so c's idx is
+        // resolved against b's declared struct type, not hardcoded 0.
+        // Non-struct-typed base → idx=0 fallback (legacy behavior).
+        let mut idx = 0
+        let parent_tname = nb_infer_struct_type(m, e.left, env)
+        if len(parent_tname) > 0 {
+            let resolved = module_find_field_idx(m, parent_tname, e.name)
+            if resolved >= 0 { idx = resolved }
+        }
+        return bld_struct_field(m, b, obj, idx, "i64")
+    }
+    if k == "Call" {
+        // Parser: Call { left = callee expr, args = array }. Two shapes:
+        //   1. direct name  — `foo(x)`       → left.kind == "Ident"
+        //   2. method call  — `obj.foo(x)`   → left.kind == "Field"
+        // For (2) we lower receiver + args and dispatch as
+        //   `method_name(receiver, args...)` (UFCS-style). Resolution
+        //   still happens via lower_call_by_name — the method must
+        //   exist as a top-level fn keyed by its bare name. Builtin
+        //   lookup is ident-only (method call bypasses builtins).
+        if e.left.kind == "Field" {
+            let recv_vid = nb_lower_expr(m, b, e.left.left, env)
+            if recv_vid < 0 { return -1 }
+            let arg_vids = [recv_vid]
+            let mut i = 0
+            while i < len(e.args) {
+                let av = nb_lower_expr(m, b, e.args[i], env)
+                if av < 0 { return -1 }
+                arg_vids = arg_vids.push(av)
+                i = i + 1
+            }
+            let mname = e.left.name
+            // P7-6: impl-method dispatch. When the receiver's struct
+            // type is known at AST level, probe for the mangled
+            // `Type__method` function registered by the ImplBlock
+            // Pass 1. Hits short-circuit before runtime/UFCS so a
+            // user-defined `impl Point { fn len(self) -> int }` wins
+            // over the runtime `hexa_len` builtin — deliberate: an
+            // explicit impl should override the polymorphic default.
+            let recv_tname = nb_infer_struct_type(m, e.left.left, env)
+            if len(recv_tname) > 0 {
+                let mang = recv_tname + "__" + mname
+                let mfid = module_find_function(m, mang)
+                if mfid >= 0 {
+                    return bld_call(m, b, mfid, arg_vids, "i64")
+                }
+            }
+            // P7-6: runtime method dispatch. `s.starts_with(p)` etc. have
+            // no free-fn definition — they live in runtime.c as
+            // hexa_str_*/hexa_array_*. Check the method table first, then
+            // fall through to UFCS user-fn lookup for user-defined methods.
+            let msym = nb_method_runtime_sym(mname)
+            if len(msym) > 0 {
+                return nb_lower_builtin(m, b, mname, msym, arg_vids)
+            }
+            return lower_call_by_name(m, b, mname, arg_vids, "i64")
+        }
+        if e.left.kind != "Ident" { return -1 }
+        let arg_vids = []
+        let mut i = 0
+        while i < len(e.args) {
+            let av = nb_lower_expr(m, b, e.args[i], env)
+            if av < 0 { return -1 }
+            arg_vids = arg_vids.push(av)
+            i = i + 1
+        }
+        // P7-6 builtin coverage: recognize hx runtime builtins before
+        // generic user-fn resolution. Unrecognized names fall through
+        // to lower_call_by_name (user fn lookup).
+        let cname = e.left.name
+        let sym = nb_builtin_runtime_sym(cname)
+        if len(sym) > 0 {
+            return nb_lower_builtin(m, b, cname, sym, arg_vids)
+        }
+        return lower_call_by_name(m, b, cname, arg_vids, "i64")
+    }
+    if k == "EnumPath" {
+        // P7-6 EnumPath lowering (payload-free).
+        // Shape: e.name = enum type, e.value = variant name.
+        //
+        // Strategy: lookup variant tag in module.enum_names registry
+        // (populated by Pass 1 from EnumDecl nodes). Tag = positional
+        // index within the enum's variant list. Emit a plain i64
+        // constant so:
+        //   - constructor use `Color::Red` reduces to `bld_const_i64(0)`
+        //   - match pattern `Color::Red => …` routes through the same
+        //     lower_expr path; the MVP arm loop (line ~1020) does
+        //     `let pv = nb_lower_expr(m, b, pat, env)` and emits
+        //     `cmp_eq(scrut, pv)`, so pattern dispatch works for free.
+        //
+        // Payload-carrying variants (e.left != "" or e.items != "")
+        // still register their tag in Pass 1 so the equality check
+        // fires correctly, but destructure binding is out of scope —
+        // we fall through here only for payload-free usage. The arm
+        // loop treats payload-carrying patterns as is_bind (ident
+        // shape) or drops to the nb_lower_expr < 0 wildcard branch.
+        //
+        // Fallback: if the enum isn't registered (unknown / imported
+        // from an unscanned TU) return -1 so the caller's conservative
+        // wildcard path kicks in. This preserves pre-patch behavior
+        // for any unregistered EnumPath.
+        let e_name = e.name
+        let v_name = e.value
+        let tag = module_find_variant_idx(m, e_name, v_name)
+        if tag < 0 { return -1 }
+        return bld_const_i64(m, b, tag)
+    }
+    if k == "StructInit" || k == "StructLit" || k == "Struct" {
+        // Parser StructInit: { name: TypeName, fields: [FieldInit{name, left}] }.
+        // Lowering scheme: `alloc struct` → for each field, emit a
+        // `store` with operands (slot, field_idx, value_vid).
+        //
+        // Field idx resolution (P7-6):
+        //   1. Look up e.name in the module struct registry populated by
+        //      Pass 1 (module_find_field_idx).
+        //   2. Use decl-position — the canonical field order — so IR stays
+        //      correct regardless of literal ordering in the .hexa source.
+        //   3. If the struct isn't registered (rare: anonymous / imported
+        //      from an unscanned module), fall back to literal position.
+        let slot = bld_alloc(m, b, "struct")
+        let fields = e.fields
+        if fields == "" { return slot }
+        let mut fi = 0
+        while fi < len(fields) {
+            let fld = fields[fi]
+            let fv = nb_lower_expr(m, b, fld.left, env)
+            if fv < 0 { return -1 }
+            let mut idx = module_find_field_idx(m, e.name, fld.name)
+            if idx < 0 { idx = fi }
+            bld_struct_store_field(m, b, slot, idx, fv)
+            fi = fi + 1
+        }
+        return slot
+    }
+    if k == "MatchExpr" || k == "Match" {
+        // MVP match lowering — if-else chain over scrutinee.
+        // Supported arm patterns:
+        //   IntLit / BoolLit  → cmp_eq dispatch
+        //   Ident "_"         → wildcard (default fall-through)
+        //   Ident (any other) → catch-all binding (step 3e): binds the
+        //                       pattern name to the scrutinee value +
+        //                       propagates its inferred struct type so
+        //                       `match x { y => y.field }` resolves.
+        //                       Uses lower_env_rebind to avoid stale
+        //                       first-arm names shadowing later arms.
+        // Arm bodies run through nb_lower_block_value so trailing
+        // expr becomes the arm value; the merged phi yields the match
+        // result. The default arm is synthesized as bld_const_i64(0)
+        // when the user didn't write `_`.
+        //
+        // Payload-free EnumPath patterns (`Color::Red =>`) resolve
+        // via the generic nb_lower_expr path + cmp_eq (step 3f —
+        // module.enum_names registry populated in Pass 1).
+        //
+        // Not yet handled (deferred to an enum-variant field registry):
+        //   EnumPath{Variant(a, b)} destructure — sub-ident types
+        //   require knowing each variant's field types, which the
+        //   IrModule struct registry doesn't yet carry.
+        let scrut_vid = nb_lower_expr(m, b, e.left, env)
+        if scrut_vid < 0 { return -1 }
+        let scrut_tname = nb_infer_struct_type(m, e.left, env)
+        let arms = e.arms
+        if arms == "" || len(arms) == 0 {
+            return bld_const_i64(m, b, 0)
+        }
+        // Build end block up-front — every arm terminates into it so we
+        // can phi the incoming values.
+        let end_bb = builder_create_block(m, b, "match.end")
+        let mut incoming = []  // array of [block_id, value_id]
+        let mut ai = 0
+        let na = len(arms)
+        let mut has_default = false
+        while ai < na {
+            let arm = arms[ai]
+            let pat = arm.left
+            let body = arm.body
+            let pk = pat.kind
+            // Detect wildcard / plain ident patterns.
+            let mut is_wild = false
+            let mut is_bind = false
+            if pk == "Wildcard" { is_wild = true }
+            if pk == "Ident" && pat.name == "_" { is_wild = true }
+            // P7-6 step 3e: non-"_" ident patterns become catch-all
+            // bindings. They still behave as default arms (no cmp
+            // dispatch) but carry a scope-local ident → scrutinee
+            // binding so body Field access can resolve.
+            if pk == "Ident" && pat.name != "_" { is_bind = true }
+            // Emit match-arm + match-cont blocks.
+            let arm_bb  = builder_create_block(m, b, "match.arm")
+            let cont_bb = builder_create_block(m, b, "match.cont")
+            if is_wild {
+                // Unconditional jump into arm body (default). Remaining
+                // arms become unreachable — we stop walking.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            if is_bind {
+                // Unconditional jump + bind pat.name → scrut_vid in
+                // arm scope. Like wildcards, subsequent arms are
+                // unreachable so we stop walking.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                lower_env_rebind(env, pat.name, scrut_vid)
+                if len(scrut_tname) > 0 {
+                    lower_env_set_type(env, pat.name, scrut_tname)
+                }
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            // Literal-like pattern. Lower via nb_lower_expr; if it
+            // yields < 0 we conservatively treat the arm as wildcard
+            // (guards + complex patterns land in future pass).
+            let pv = nb_lower_expr(m, b, pat, env)
+            if pv < 0 {
+                // Treat as wildcard so MVP keeps compiling.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            let eq = bld_cmp_eq(m, b, scrut_vid, pv)
+            bld_branch(m, b, eq, arm_bb, cont_bb)
+            // Arm body
+            builder_switch_to(b, arm_bb)
+            let av = nb_lower_block_value(m, b, body, env)
+            if av < 0 { return -1 }
+            let arm_final = b.current_block
+            bld_jump(m, b, end_bb)
+            incoming = incoming.push([arm_final, av])
+            // Fall through to next arm on cont.
+            builder_switch_to(b, cont_bb)
+            ai = ai + 1
+        }
+        if !has_default {
+            // Synthesize default = 0.
+            let dv = bld_const_i64(m, b, 0)
+            let dflt_final = b.current_block
+            bld_jump(m, b, end_bb)
+            incoming = incoming.push([dflt_final, dv])
+        }
+        // Merge block: phi over every incoming arm value.
+        builder_switch_to(b, end_bb)
+        return bld_phi(m, b, incoming, "i64")
+    }
+    if k == "IfExpr" {
+        // Value-producing if — emit branch + phi. The parser always wraps
+        // `if` in IfExpr; stmt-position `if` is reached via ExprStmt and
+        // also flows through here (result is discarded by ExprStmt path).
+        //
+        // Shape: e.cond / e.then_body (array of stmts) / e.else_body
+        //        (array of stmts or "" when no else).
+        let cond_vid = nb_lower_expr(m, b, e.cond, env)
+        if cond_vid < 0 { return -1 }
+        let blks = lower_if_expr_skeleton(m, b, cond_vid)
+        let then_bb = blks[0]
+        let else_bb = blks[1]
+        let end_bb  = blks[2]
+        // THEN branch
+        builder_switch_to(b, then_bb)
+        let tv = nb_lower_block_value(m, b, e.then_body, env)
+        if tv < 0 { return -1 }
+        // Capture the actual terminating block — nested if/loops inside
+        // the then-body may have moved the builder off `then_bb`; phi
+        // incoming must reference the block that emits the end-jump.
+        let then_final = b.current_block
+        bld_jump(m, b, end_bb)
+        // ELSE branch — when parser left `else_body` as "" there is no
+        // else; emit a zero value so the phi stays well-formed.
+        builder_switch_to(b, else_bb)
+        let mut ev = 0
+        if e.else_body == "" {
+            ev = bld_const_i64(m, b, 0)
+        } else {
+            ev = nb_lower_block_value(m, b, e.else_body, env)
+            if ev < 0 { return -1 }
+        }
+        let else_final = b.current_block
+        bld_jump(m, b, end_bb)
+        return lower_if_expr_close(m, b, end_bb, then_final, tv, else_final, ev, "i64")
+    }
+    // Unsupported expr kind — caller's wrap-0 policy preserves the
+    // rest of the code stream; native_build reports coverage gaps
+    // at end-of-pipeline.
+    return -1
+}
+
+// Lower a block (array of stmts) whose trailing value is wanted for an
+// IfExpr / block-as-expr context. Walks each stmt via nb_lower_stmt; if
+// the final stmt is an ExprStmt, its expression's ValueId is returned.
+// Otherwise returns bld_const_i64(0). Terminator-producing stmts (Return)
+// short-circuit and return a dummy 0 — the phi value is unreachable.
+fn nb_lower_block_value(m, b, body, env) -> int {
+    if body == "" { return bld_const_i64(m, b, 0) }
+    let n = len(body)
+    if n == 0 { return bld_const_i64(m, b, 0) }
+    let mut i = 0
+    while i < n - 1 {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return -1 }
+        if r == 1 {
+            // terminator emitted mid-block — phi incoming unreachable.
+            return bld_const_i64(m, b, 0)
+        }
+        i = i + 1
+    }
+    // Trailing stmt: if ExprStmt, return its expr's vid; else lower as
+    // stmt and fall back to 0.
+    let last = body[n - 1]
+    if last.kind == "ExprStmt" {
+        let v = nb_lower_expr(m, b, last.left, env)
+        if v < 0 { return -1 }
+        return v
+    }
+    let r = nb_lower_stmt(m, b, last, env)
+    if r < 0 { return -1 }
+    return bld_const_i64(m, b, 0)
+}
+
+// ── Statement lowering (parser → IR) ──────────────────────────────
+// Return / Let / Assign / ExprStmt. Anything outside this subset
+// returns -1 to flag a coverage gap (bubbled up as `fn_ok=false`).
+fn nb_lower_stmt(m, b, s, env) -> int {
+    let k = s.kind
+    if k == "ReturnStmt" || k == "Return" {
+        if s.left == "" {
+            lower_return(m, b, -1)
+            return 1
+        }
+        let v = nb_lower_expr(m, b, s.left, env)
+        if v < 0 { return -1 }
+        lower_return(m, b, v)
+        return 1
+    }
+    if k == "LetStmt" || k == "LetMutStmt" {
+        let rhs_vid = nb_lower_expr(m, b, s.left, env)
+        if rhs_vid < 0 { return -1 }
+        // Parser split: `let` → LetStmt, `let mut` → LetMutStmt.
+        let is_mut = k == "LetMutStmt"
+        lower_let(m, b, env, s.name, rhs_vid, is_mut, "i64")
+        // P7-6 struct_idx: propagate type info to the env binding.
+        //   (a) Direct literal — RHS is a StructInit: type = literal name.
+        //   (b) Fn return — RHS is a Call to a known fn whose ret_struct
+        //       tag was set in Pass 1b: type = callee's ret_struct.
+        //   (c) Array of structs — RHS is an Array literal whose first
+        //       element is a StructInit: type = "[Inner]".
+        //   (d) Explicit annotation — `let arr: [Point] = ...`: use the
+        //       parser-recorded `s.value` type annotation verbatim (it
+        //       already carries the [..] wrapper for array types and
+        //       the bare struct name for scalars).
+        // Non-struct RHS leaves the type empty (lower_let default).
+        if s.left.kind == "StructInit" || s.left.kind == "StructLit" || s.left.kind == "Struct" {
+            lower_env_set_type(env, s.name, s.left.name)
+        } else if s.left.kind == "Call" {
+            if s.left.left.kind == "Ident" {
+                let callee_idx = module_find_function(m, s.left.left.name)
+                if callee_idx >= 0 {
+                    let ret_s = module_get_fn_ret_struct(m, callee_idx)
+                    if len(ret_s) > 0 {
+                        lower_env_set_type(env, s.name, ret_s)
+                    }
+                }
+            }
+        } else if s.left.kind == "Array" || s.left.kind == "ArrayLit" {
+            // Peek the first element for a struct-literal shape. Empty
+            // arrays or heterogeneous first-elements leave type unset
+            // so downstream Index.field falls back to idx=0.
+            let items = s.left.items
+            if items != "" && len(items) > 0 {
+                let first = items[0]
+                if first.kind == "StructInit" || first.kind == "StructLit" || first.kind == "Struct" {
+                    lower_env_set_type(env, s.name, "[" + first.name + "]")
+                }
+            }
+        }
+        // Explicit annotation wins over heuristic inference when the
+        // parser recorded a non-empty type in s.value. Applied last so
+        // `let arr: [Point] = []` still types correctly even when the
+        // array literal is empty.
+        if len(s.value) > 0 {
+            lower_env_set_type(env, s.name, s.value)
+        }
+        return 0
+    }
+    if k == "AssignStmt" {
+        let rhs_vid = nb_lower_expr(m, b, s.right, env)
+        if rhs_vid < 0 { return -1 }
+        // P7-6 Field assignment: `obj.foo = v` → bld_struct_store_field.
+        // Parser emits AssignStmt{ left: Field{ left: <obj expr>, name: foo },
+        // right: v }. Only bare Ident bases resolve to a typed object via
+        // env; chained (a.b.c = v) is future work.
+        if s.left.kind == "Field" || s.left.kind == "FieldAccess" {
+            let obj_vid = nb_lower_expr(m, b, s.left.left, env)
+            if obj_vid < 0 { return -1 }
+            // Chain-resolve via nb_infer_struct_type so `a.b.c = v` uses
+            // b's declared type to find c's idx. Untyped chain step →
+            // idx=0 fallback (legacy).
+            let mut fidx = 0
+            let tn = nb_infer_struct_type(m, s.left.left, env)
+            if len(tn) > 0 {
+                let r = module_find_field_idx(m, tn, s.left.name)
+                if r >= 0 { fidx = r }
+            }
+            bld_struct_store_field(m, b, obj_vid, fidx, rhs_vid)
+            return 0
+        }
+        // Assign target = s.left (Ident expr). Plain ident path.
+        if s.left.kind != "Ident" { return -1 }
+        lower_assign(m, b, env, s.left.name, rhs_vid)
+        return 0
+    }
+    if k == "ExprStmt" {
+        let v = nb_lower_expr(m, b, s.left, env)
+        if v < 0 { return -1 }
+        return 0
+    }
+    if k == "WhileStmt" {
+        // Shape: s.cond / s.body (array of stmts).
+        //
+        //   entry: … ; jump header
+        //   header: <cond>; branch body, end
+        //   body:   <stmts>; jump header
+        //   end:    …
+        let blks = lower_while_skeleton(m, b)
+        let header_bb = blks[0]
+        let body_bb   = blks[1]
+        let end_bb    = blks[2]
+        // Header
+        builder_switch_to(b, header_bb)
+        let cond_vid = nb_lower_expr(m, b, s.cond, env)
+        if cond_vid < 0 { return -1 }
+        bld_branch(m, b, cond_vid, body_bb, end_bb)
+        // Body
+        builder_switch_to(b, body_bb)
+        if !nb_lower_block(m, b, s.body, env) { return -1 }
+        lower_while_close(m, b, header_bb, end_bb)
+        // After close, builder is on end_bb — ready for subsequent stmts.
+        return 0
+    }
+    if k == "ForStmt" {
+        // Only numeric range lowering for now: `for i in start..end`.
+        // TODO: inclusive range (..=), step, array iteration.
+        let it = s.iter_expr
+        if it.kind != "Range" { return -1 }
+        if it.value != "exclusive" { return -1 }
+        let start_vid = nb_lower_expr(m, b, it.left, env)
+        if start_vid < 0 { return -1 }
+        let end_vid   = nb_lower_expr(m, b, it.right, env)
+        if end_vid < 0 { return -1 }
+        let fr = lower_for_range_skeleton(m, b, env, s.name, start_vid, end_vid)
+        let header_bb = fr[0]
+        let body_bb   = fr[1]
+        let end_bb    = fr[2]
+        let slot      = fr[3]
+        // Body
+        builder_switch_to(b, body_bb)
+        if !nb_lower_block(m, b, s.body, env) { return -1 }
+        lower_for_range_close(m, b, slot, header_bb)
+        builder_switch_to(b, end_bb)
+        return 0
+    }
+    // Unsupported stmt kind — flag coverage gap.
+    return -1
+}
+
+// Walk a block (array of stmts) in statement position — terminator short
+// circuit stops the walk. Returns true when every stmt lowered OK (r >= 0)
+// and false on coverage gap.
+fn nb_lower_block(m, b, body, env) -> bool {
+    if body == "" { return true }
+    let mut i = 0
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { return true }
+        i = i + 1
+    }
+    return true
+}
+
+// ── FnDecl → IrFunction ───────────────────────────────────────────
+// Called after the fn has already been registered in the module during
+// the pre-registration pass (so forward calls resolve). `func_idx` is
+// the stable index into `m.functions` assigned by that earlier pass.
+// We create a builder bound to that function, populate params + body.
+fn nb_lower_fn_decl(m, fn_node, func_idx: int) -> bool {
+    let params_ast = fn_node.params
+    let mut param_names = []
+    let mut pi = 0
+    while pi < len(params_ast) {
+        let p = params_ast[pi]
+        param_names = param_names.push(p.name)
+        pi = pi + 1
+    }
+
+    // Build a fresh builder pointing at the existing (pre-registered)
+    // function index. `builder_new` creates an entry block if missing.
+    let b = builder_new(m, func_idx)
+
+    // Bind each parameter to a fresh "load param" SSA vid. Codegen
+    // (emit_function_*) reads operand kind "param" and maps via
+    // AAPCS/SysV calling conventions.
+    //
+    // P7-6 struct_idx: when a param's type annotation names a registered
+    // struct, record the type on the binding so Field access inside the
+    // body can resolve. Non-struct types (int/string/array<…>) are
+    // recorded as the literal annotation; module_find_field_idx returns
+    // -1 on unknown struct lookups so Field falls back to idx=0 safely.
+    let env = lower_env_new()
+    let mut p2 = 0
+    while p2 < len(param_names) {
+        let pv = bld_load_param(m, b, p2, "i64")
+        lower_env_bind(env, param_names[p2], pv)
+        let p_ast = params_ast[p2]
+        let p_type = p_ast.value
+        if len(p_type) > 0 {
+            lower_env_set_type(env, param_names[p2], p_type)
+        }
+        p2 = p2 + 1
+    }
+
+    // Walk body. r == 1 means terminator emitted (ret); r == 0 is
+    // non-terminating stmt; r < 0 is a coverage gap.
+    let body = fn_node.body
+    let mut i = 0
+    let mut terminated = false
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { terminated = true; break }
+        i = i + 1
+    }
+    if !terminated {
+        // Implicit `ret 0` so the terminator invariant holds.
+        let zero = bld_const_i64(m, b, 0)
+        lower_return(m, b, zero)
+    }
+    return true
+}
+
+// Lower an impl-method body. Mirrors nb_lower_fn_decl but injects the
+// impl target as the type of `self` (the first param) when the user
+// wrote `fn norm(self) -> int { ... }` without an explicit annotation.
+// Field access inside the method body can then resolve through the
+// struct registry against the correct type.
+fn nb_lower_method_decl(m, m_ast, func_idx: int, target: string) -> bool {
+    let params_ast = m_ast.params
+    let mut param_names = []
+    let mut pi = 0
+    while pi < len(params_ast) {
+        param_names = param_names.push(params_ast[pi].name)
+        pi = pi + 1
+    }
+    let b = builder_new(m, func_idx)
+    let env = lower_env_new()
+    let mut p2 = 0
+    while p2 < len(param_names) {
+        let pv = bld_load_param(m, b, p2, "i64")
+        lower_env_bind(env, param_names[p2], pv)
+        let p_ast = params_ast[p2]
+        let p_type = p_ast.value
+        if p2 == 0 && param_names[p2] == "self" && len(p_type) == 0 {
+            lower_env_set_type(env, "self", target)
+        } else if len(p_type) > 0 {
+            lower_env_set_type(env, param_names[p2], p_type)
+        }
+        p2 = p2 + 1
+    }
+    let body = m_ast.body
+    let mut i = 0
+    let mut terminated = false
+    while i < len(body) {
+        let r = nb_lower_stmt(m, b, body[i], env)
+        if r < 0 { return false }
+        if r == 1 { terminated = true; break }
+        i = i + 1
+    }
+    if !terminated {
+        let zero = bld_const_i64(m, b, 0)
+        lower_return(m, b, zero)
+    }
+    return true
+}
+
+fn parse_and_lower(src: string, path: string) -> any {
+    // 1. Lex + parse.
+    let toks = tokenize(src)
+    let ast = parse(toks)
+
+    // 2. Build empty IR module. Pass 1 = pre-register every fn name
+    //    (captures fid in source order), Pass 2 = lower bodies into
+    //    the same IDs so forward `main → helper` calls resolve.
+    let m = make_ir_module(path)
+
+    // Pass 1 — pre-register. Record [ast_idx, func_idx] pairs.
+    //
+    // P7-6 FFI: ExternFnDecl nodes are registered under their hexa name
+    // too — call sites like `strlen(x)` parse as Call{left=Ident{name:
+    // "strlen"}}, so module_find_function must see "strlen" to resolve
+    // the BL target. When @symbol("libc_name") is present (node.value)
+    // the C symbol may differ from the hexa name; stage-1 P7-6 uses the
+    // hexa name for lookup and the backend emits BL to the same name.
+    // Full @symbol-override wiring (dlsym rename) is a follow-up once
+    // the linker track lands. Extern fns have no body, so Pass 2 skips
+    // them via the fn_slots filter (only FnDecl entries go into slots).
+    let mut fn_slots = []
+    // Parallel list for impl-method bodies — [m_ast, func_idx, target].
+    // Kept separate because method AST lives under node.methods, not
+    // at the top-level ast index used by fn_slots.
+    let mut method_slots = []
+    let mut i = 0
+    while i < len(ast) {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            // Build ir-level params (name, type) from parser params.
+            let params_ast = node.params
+            let mut ir_params = []
+            let mut pi = 0
+            while pi < len(params_ast) {
+                ir_params = ir_params.push([params_ast[pi].name, "i64"])
+                pi = pi + 1
+            }
+            let fid = module_add_function(m, node.name, ir_params, "i64")
+            // module.functions pushes in order, so index == current len - 1.
+            let fidx = len(m.functions) - 1
+            fn_slots = fn_slots.push([i, fidx])
+        } else if node.kind == "ExternFnDecl" {
+            // Register extern declaration so call sites resolve. No body
+            // to lower → don't record in fn_slots. Params kept as
+            // [name, "i64"] tuples for arity; real per-param C-type
+            // marshalling is P7-6 follow-up.
+            let xparams_ast = node.params
+            let mut xir_params = []
+            let mut xpi = 0
+            while xpi < len(xparams_ast) {
+                xir_params = xir_params.push([xparams_ast[xpi].name, "i64"])
+                xpi = xpi + 1
+            }
+            module_add_function(m, node.name, xir_params, "i64")
+        } else if node.kind == "StructDecl" {
+            // P7-6 Field struct_idx prep: register struct name + ordered
+            // field names + declared field types. Parser emits
+            // node.fields as [StructField{name, value:type, ...}, ...].
+            //
+            // Both names AND types are collected so chain-resolution
+            // (a.b.c where b is a nested struct field) can consult the
+            // registry transitively. Untyped fields (rare — no `: T`
+            // annotation) get "" and trigger the idx=0 fallback only
+            // at that chain step.
+            let sf_ast = node.fields
+            let mut sf_names = []
+            let mut sf_types = []
+            let mut sfi = 0
+            while sfi < len(sf_ast) {
+                sf_names = sf_names.push(sf_ast[sfi].name)
+                sf_types = sf_types.push(sf_ast[sfi].value)
+                sfi = sfi + 1
+            }
+            module_add_struct_typed(m, node.name, sf_names, sf_types)
+        } else if node.kind == "EnumDecl" {
+            // P7-6 EnumPath lowering: collect variant names into the
+            // module-level enum registry. Tag = positional index within
+            // node.variants. Payload-free variants are wired here; any
+            // variant carrying fields is still registered (so the tag
+            // compares correctly in match arms) — only destructure is
+            // deferred to a later field-type table pass.
+            let var_ast = node.variants
+            let mut vnames = []
+            let mut vi = 0
+            while vi < len(var_ast) {
+                vnames = vnames.push(var_ast[vi].name)
+                vi = vi + 1
+            }
+            module_add_enum(m, node.name, vnames)
+        } else if node.kind == "ImplBlock" {
+            // P7-6 step 3d: register each impl-method as a top-level
+            // function with mangled name `Type__method`. Method call
+            // dispatch (Call-through-Field) probes this mangled entry
+            // when it knows the receiver's struct type. Bodies are
+            // lowered in Pass 2 via method_slots. ret_struct tagging
+            // runs in Pass 1b (after all StructDecls are registered)
+            // so methods whose return type is a struct declared later
+            // in the TU still get the tag.
+            let target_n = node.target
+            let methods = node.methods
+            let mut mi = 0
+            while mi < len(methods) {
+                let m_ast = methods[mi]
+                let mangled = target_n + "__" + m_ast.name
+                let mp_ast = m_ast.params
+                let mut mir_params = []
+                let mut mpi = 0
+                while mpi < len(mp_ast) {
+                    mir_params = mir_params.push([mp_ast[mpi].name, "i64"])
+                    mpi = mpi + 1
+                }
+                module_add_function(m, mangled, mir_params, "i64")
+                let m_fidx = len(m.functions) - 1
+                method_slots = method_slots.push([m_ast, m_fidx, target_n])
+                mi = mi + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Pass 1b — post-fixup return-struct tags on registered fns. Runs
+    // after all StructDecls in the TU are in the registry so fns that
+    // appear before their declared-struct return type still resolve.
+    // No-op for fns with non-struct annotations (int/string/array<…>);
+    // module_set_fn_ret_struct stays silent on empty strings, but we
+    // gate on a registry hit to keep the fn's ret_struct tag tight
+    // ("Point" only when Point actually exists).
+    let mut rsi = 0
+    while rsi < len(fn_slots) {
+        let rs_slot = fn_slots[rsi]
+        let rs_ast_idx = rs_slot[0]
+        let rs_func_idx = rs_slot[1]
+        let rs_rt = ast[rs_ast_idx].ret_type
+        if len(rs_rt) > 0 {
+            let rs_fields = module_find_struct_fields(m, rs_rt)
+            if len(rs_fields) > 0 {
+                module_set_fn_ret_struct(m, rs_func_idx, rs_rt)
+            }
+        }
+        rsi = rsi + 1
+    }
+    // Pass 1b — impl-method ret_struct post-fixup. Same policy as
+    // top-level fns: only tag when the method's declared ret_type
+    // names a registered struct. "" ret_type (inferred/unspecified)
+    // stays untagged and Call-through-Field chain resolution returns
+    // "" at that link.
+    let mut msi = 0
+    while msi < len(method_slots) {
+        let ms = method_slots[msi]
+        let ms_ast = ms[0]
+        let ms_fidx = ms[1]
+        let ms_rt = ms_ast.ret_type
+        if len(ms_rt) > 0 {
+            let ms_fields = module_find_struct_fields(m, ms_rt)
+            if len(ms_fields) > 0 {
+                module_set_fn_ret_struct(m, ms_fidx, ms_rt)
+            }
+        }
+        msi = msi + 1
+    }
+
+    // Pass 2 — lower bodies into the pre-registered function slots.
+    let mut si = 0
+    while si < len(fn_slots) {
+        let slot = fn_slots[si]
+        let ast_idx = slot[0]
+        let func_idx = slot[1]
+        if !nb_lower_fn_decl(m, ast[ast_idx], func_idx) {
+            eprintln("[native_build] coverage gap lowering fn " + ast[ast_idx].name)
+            exit(4)
+        }
+        si = si + 1
+    }
+    // Pass 2b — lower impl-method bodies. nb_lower_method_decl injects
+    // the impl target as the type of `self` so Field access inside
+    // the method resolves through the struct registry.
+    let mut msi2 = 0
+    while msi2 < len(method_slots) {
+        let ms = method_slots[msi2]
+        let ms_ast = ms[0]
+        let ms_fidx = ms[1]
+        let ms_target = ms[2]
+        if !nb_lower_method_decl(m, ms_ast, ms_fidx, ms_target) {
+            eprintln("[native_build] coverage gap lowering method " + ms_target + "::" + ms_ast.name)
+            exit(4)
+        }
+        msi2 = msi2 + 1
+    }
+    return m
+}
+
+// ── Codegen bridge (IR module → final file image) ─────────────────
+// Delegates to self/codegen/mod.hexa::cg_generate, which internally:
+//
+//   flatten_ir_instrs → compute_live_intervals → allocate_function_linear
+//     → emit_function_{arm64,x86} → run_peephole (arm64)
+//     → macho_wrap / elf_wrap
+//
+// Target-tuple resolution (arch 0/1, format 0/1) maps 1-to-1 onto
+// codegen's target_arm64/target_x86_64 + objformat_macho/objformat_elf
+// integer codes — no translation layer required.
+// Bitwise/shift (P7-6 gap #2) folded into nb_lower_expr at the top of
+// this file — the 4-arg (m,b,e,env) version is the live dispatcher.
+fn codegen_module(ir_mod: any, target: Target) -> [int] {
+    // Map our (arch, format) → codegen integer codes.
+    let mut arch_code = target_arm64()
+    if target.arch == 1 { arch_code = target_x86_64() }
+    let mut fmt_code = objformat_macho()
+    if target.format == 1 { fmt_code = objformat_elf() }
+
+    let result = cg_generate(ir_mod, arch_code, fmt_code)
+    if len(result.code) == 0 {
+        eprintln("[native_build] codegen: empty output — no functions emitted")
+        exit(5)
+    }
+    return result.code
+}

@@ -1,0 +1,336 @@
+// self/vm/ic.hexa — V8-style Hidden Class + Inline Cache scaffold (ROI #167)
+//
+// Scope: data structures + 1 mono dispatch path. poly/mega = follow-up.
+// Design: docs/plans/specialize_v8_ic.md
+//
+// This module is pure Hexa (HX4). No C shim, no codegen touch. It can be
+// consumed today by test code; follow-up ROIs will plug it into the field-
+// access AST lower.
+//
+// State encoding:
+//   state 0 = UNINIT  (never observed)
+//   state 1 = MONO    (one hc observed — current scaffold path)
+//   state 2 = POLY    (2..4 hcs observed — follow-up)
+//   state 3 = MEGA    (>4 hcs — follow-up; falls back to generic lookup)
+
+// ─── HIDDEN CLASS ────────────────────────────────────────────────────
+
+// fields/transitions are encoded as parallel arrays to stay compatible
+// with stage0 lack-of-generic-map in struct fields. Keys are small; linear
+// scan is fine.
+struct HiddenClass {
+    id: int,
+    parent_id: int,             // -1 for root
+    field_names: [string],
+    field_offsets: [int],
+    field_tags: [string],
+    trans_keys: [string],       // transitions: field_name →
+    trans_child_ids: [int]      //               child hc id
+}
+
+fn hc_empty_class(id: int) -> HiddenClass {
+    return HiddenClass {
+        id: id,
+        parent_id: -1,
+        field_names: [],
+        field_offsets: [],
+        field_tags: [],
+        trans_keys: [],
+        trans_child_ids: []
+    }
+}
+
+fn hc_find_field(c: HiddenClass, name: string) -> int {
+    // returns offset or -1
+    let mut i = 0
+    while i < len(c.field_names) {
+        if c.field_names[i] == name { return c.field_offsets[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hc_field_tag(c: HiddenClass, name: string) -> string {
+    let mut i = 0
+    while i < len(c.field_names) {
+        if c.field_names[i] == name { return c.field_tags[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn hc_find_transition(c: HiddenClass, name: string) -> int {
+    // returns child hc id or -1
+    let mut i = 0
+    while i < len(c.trans_keys) {
+        if c.trans_keys[i] == name { return c.trans_child_ids[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── CLASS REGISTRY ──────────────────────────────────────────────────
+//
+// Process-global. In stage0 we have no module-level mut state pattern well-
+// supported (the common idiom is a wrapping struct passed by reference).
+// We return it from `hc_new_registry()` and thread it through calls.
+
+struct ClassRegistry {
+    classes: [HiddenClass],
+    next_id: int
+}
+
+fn hc_new_registry() -> ClassRegistry {
+    let root = hc_empty_class(0)
+    return ClassRegistry { classes: [root], next_id: 1 }
+}
+
+fn hc_get(reg: ClassRegistry, id: int) -> HiddenClass {
+    return reg.classes[id]
+}
+
+// Add a field to the class graph: returns [new_registry, child_hc_id].
+// If the transition already exists, returns [reg, existing_child_id].
+fn hc_add_field(reg: ClassRegistry, parent_id: int, name: string, tag: string) {
+    let parent = reg.classes[parent_id]
+    let existing = hc_find_transition(parent, name)
+    if existing >= 0 {
+        return [reg, existing]
+    }
+    // Build child class: parent fields + (name, next_offset, tag)
+    let next_offset = len(parent.field_names)
+    let mut child_names = []
+    let mut child_offsets = []
+    let mut child_tags = []
+    let mut i = 0
+    while i < len(parent.field_names) {
+        child_names = child_names.push(parent.field_names[i])
+        child_offsets = child_offsets.push(parent.field_offsets[i])
+        child_tags = child_tags.push(parent.field_tags[i])
+        i = i + 1
+    }
+    child_names = child_names.push(name)
+    child_offsets = child_offsets.push(next_offset)
+    child_tags = child_tags.push(tag)
+    let new_id = reg.next_id
+    let child = HiddenClass {
+        id: new_id,
+        parent_id: parent_id,
+        field_names: child_names,
+        field_offsets: child_offsets,
+        field_tags: child_tags,
+        trans_keys: [],
+        trans_child_ids: []
+    }
+    // Rebuild parent with the new transition recorded.
+    let mut parent_tk = []
+    let mut parent_tc = []
+    let mut j = 0
+    while j < len(parent.trans_keys) {
+        parent_tk = parent_tk.push(parent.trans_keys[j])
+        parent_tc = parent_tc.push(parent.trans_child_ids[j])
+        j = j + 1
+    }
+    parent_tk = parent_tk.push(name)
+    parent_tc = parent_tc.push(new_id)
+    let new_parent = HiddenClass {
+        id: parent.id,
+        parent_id: parent.parent_id,
+        field_names: parent.field_names,
+        field_offsets: parent.field_offsets,
+        field_tags: parent.field_tags,
+        trans_keys: parent_tk,
+        trans_child_ids: parent_tc
+    }
+    // Rebuild class list with parent replaced and child appended.
+    let mut new_classes = []
+    let mut k = 0
+    while k < len(reg.classes) {
+        if k == parent_id {
+            new_classes = new_classes.push(new_parent)
+        } else {
+            new_classes = new_classes.push(reg.classes[k])
+        }
+        k = k + 1
+    }
+    new_classes = new_classes.push(child)
+    let new_reg = ClassRegistry { classes: new_classes, next_id: new_id + 1 }
+    return [new_reg, new_id]
+}
+
+// ─── OBJECT ─────────────────────────────────────────────────────────
+//
+// Lightweight runtime object carrying a hc_id + inline slot array.
+// Real compiler-level objects will carry hc_id as a header word; here we
+// model it as a dedicated struct for the scaffold tests.
+
+struct ICObject {
+    hc_id: int,
+    slots: [int]                // scaffold: int-typed slots only
+}
+
+fn ic_obj_new(hc_id: int, slots: [int]) -> ICObject {
+    return ICObject { hc_id: hc_id, slots: slots }
+}
+
+// ─── IC SLOT ────────────────────────────────────────────────────────
+
+// State constants
+fn ic_state_uninit() -> int { return 0 }
+fn ic_state_mono()   -> int { return 1 }
+fn ic_state_poly()   -> int { return 2 }
+fn ic_state_mega()   -> int { return 3 }
+
+struct ICSlot {
+    site_id: int,
+    state: int,
+    expected_hc: int,
+    cached_offset: int,
+    cached_tag: string,
+    poly_cache: [int],          // flat [hc0, off0, hc1, off1, ...] (future)
+    miss_count: int,
+    hit_count: int
+}
+
+fn ic_slot_new(site_id: int) -> ICSlot {
+    return ICSlot {
+        site_id: site_id,
+        state: 0,                // UNINIT
+        expected_hc: -1,
+        cached_offset: -1,
+        cached_tag: "",
+        poly_cache: [],
+        miss_count: 0,
+        hit_count: 0
+    }
+}
+
+// ─── MONO DISPATCH (the 1 scaffold path) ────────────────────────────
+//
+// Returns [new_slot, value].
+// On UNINIT → MONO transition: miss_count becomes 1.
+// On MONO HIT: hit_count++.
+// On MONO MISS (different hc): miss_count++, returns correct value via
+// generic lookup. State stays MONO — POLY transition is follow-up ROI.
+
+fn ic_field_lookup(slot: ICSlot, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    // Fast path: MONO + matching hc
+    if slot.state == 1 {
+        if slot.expected_hc == obj.hc_id {
+            let val = obj.slots[slot.cached_offset]
+            let new_slot = ICSlot {
+                site_id: slot.site_id,
+                state: slot.state,
+                expected_hc: slot.expected_hc,
+                cached_offset: slot.cached_offset,
+                cached_tag: slot.cached_tag,
+                poly_cache: slot.poly_cache,
+                miss_count: slot.miss_count,
+                hit_count: slot.hit_count + 1
+            }
+            return [new_slot, val]
+        }
+    }
+    // Slow path: UNINIT init or MONO-miss fallback
+    return ic_miss(slot, reg, obj, field_name)
+}
+
+fn ic_miss(slot: ICSlot, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    let cls = hc_get(reg, obj.hc_id)
+    let off = hc_find_field(cls, field_name)
+    let tag = hc_field_tag(cls, field_name)
+    let val = if off >= 0 { obj.slots[off] } else { 0 }
+    if slot.state == 0 {
+        // UNINIT → MONO: install expected hc + offset.
+        let new_slot = ICSlot {
+            site_id: slot.site_id,
+            state: 1,                     // MONO
+            expected_hc: obj.hc_id,
+            cached_offset: off,
+            cached_tag: tag,
+            poly_cache: slot.poly_cache,
+            miss_count: slot.miss_count + 1,
+            hit_count: slot.hit_count
+        }
+        return [new_slot, val]
+    }
+    // MONO miss: scaffold degrades to generic lookup, bumps miss_count.
+    // Follow-up ROI: flip state to POLY here.
+    let new_slot = ICSlot {
+        site_id: slot.site_id,
+        state: slot.state,
+        expected_hc: slot.expected_hc,
+        cached_offset: slot.cached_offset,
+        cached_tag: slot.cached_tag,
+        poly_cache: slot.poly_cache,
+        miss_count: slot.miss_count + 1,
+        hit_count: slot.hit_count
+    }
+    return [new_slot, val]
+}
+
+// ─── IC TABLE (site_id → ICSlot) ────────────────────────────────────
+//
+// Parallel-array map keyed by site_id. In scaffold we only test small
+// site counts; linear scan is acceptable and keeps stage0 happy.
+
+struct ICTable {
+    site_ids: [int],
+    slots: [ICSlot]
+}
+
+fn ic_table_new() -> ICTable {
+    return ICTable { site_ids: [], slots: [] }
+}
+
+// Get-or-create slot for a site_id. Returns [new_table, index].
+fn ic_table_slot(tbl: ICTable, site_id: int) {
+    let mut i = 0
+    while i < len(tbl.site_ids) {
+        if tbl.site_ids[i] == site_id { return [tbl, i] }
+        i = i + 1
+    }
+    // create
+    let new_slot = ic_slot_new(site_id)
+    let mut new_ids = []
+    let mut new_slots = []
+    let mut k = 0
+    while k < len(tbl.site_ids) {
+        new_ids = new_ids.push(tbl.site_ids[k])
+        new_slots = new_slots.push(tbl.slots[k])
+        k = k + 1
+    }
+    new_ids = new_ids.push(site_id)
+    new_slots = new_slots.push(new_slot)
+    let new_tbl = ICTable { site_ids: new_ids, slots: new_slots }
+    return [new_tbl, len(new_ids) - 1]
+}
+
+// Update a slot at index, returning a new table (immutable-style).
+fn ic_table_set(tbl: ICTable, index: int, slot: ICSlot) -> ICTable {
+    let mut new_slots = []
+    let mut k = 0
+    while k < len(tbl.slots) {
+        if k == index {
+            new_slots = new_slots.push(slot)
+        } else {
+            new_slots = new_slots.push(tbl.slots[k])
+        }
+        k = k + 1
+    }
+    return ICTable { site_ids: tbl.site_ids, slots: new_slots }
+}
+
+// High-level helper: one call per field access site.
+// Returns [new_table, value].
+fn ic_site_lookup(tbl: ICTable, site_id: int, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    let gs = ic_table_slot(tbl, site_id)
+    let tbl1 = gs[0]
+    let idx = gs[1]
+    let slot = tbl1.slots[idx]
+    let res = ic_field_lookup(slot, reg, obj, field_name)
+    let new_slot = res[0]
+    let val = res[1]
+    let tbl2 = ic_table_set(tbl1, idx, new_slot)
+    return [tbl2, val]
+}

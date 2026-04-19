@@ -53,12 +53,12 @@ itself so *every* caller inherits it.
 ### 2. `self/interpreter.hexa` — no current UseStmt arm
 
 `grep UseStmt self/interpreter.hexa` → 0 matches. The interpreter relies on
-`scripts/flatten_imports.hexa` as a preprocessing step (all `use` lines are
+`tool/flatten_imports.hexa` as a preprocessing step (all `use` lines are
 inlined before interpretation). Two options when L2 goes live:
 
 - **Option A** (minimal): leave interpreter alone — flatten_imports is
   already the load gate; add `module_gate_check` inside
-  `scripts/flatten_imports.hexa` at its file-read site.
+  `tool/flatten_imports.hexa` at its file-read site.
 - **Option B** (true runtime gate): add a dedicated UseStmt arm to the
   interpreter's stmt dispatcher that calls `module_gate_check` + dynamic
   parse. Requires parser/AST reentrancy — larger change.
@@ -69,7 +69,7 @@ Option A is recommended for Layer 2 v1.
 
 **DO NOT TOUCH** (HX8 seed-freeze + `.c` purge policy). Once
 `codegen_c2.hexa` is re-bootable, rebuilding stage0 via
-`scripts/rebuild_stage0.hexa` regenerates the native path automatically.
+`tool/rebuild_stage0.hexa` regenerates the native path automatically.
 
 ## Dependency
 
@@ -85,5 +85,5 @@ Option A is recommended for Layer 2 v1.
    (see `project_hexa_v2_circular_rebuild_20260417`).
 2. Add the 5-line hook block at `codegen_c2.hexa:~420`.
 3. Add `use "stdlib/module_gate"` at codegen_c2's top-level imports block.
-4. Run `scripts/rebuild_stage0.hexa` (normal, not `FORCE=1`).
+4. Run `tool/rebuild_stage0.hexa` (normal, not `FORCE=1`).
 5. Exercise `self/test/test_module_gate.hexa` → expect clean pass + fail-closed on violation case.

@@ -43,6 +43,12 @@ struct PeepholeStats {
     mov_zero_to_xzr: int,
     add_zero_to_mov: int,
     sub_zero_to_mov: int,
+    // Tier-2 counters (ROI #166)
+    cmp_beq_to_cbz: int,
+    cmp_bne_to_cbnz: int,
+    mul_add_fuse: int,
+    mul_sub_fuse: int,
+    movz_str_to_strxzr: int,
     rounds: int
 }
 
@@ -58,12 +64,17 @@ fn peephole_stats_default() -> PeepholeStats {
         mov_zero_to_xzr: 0,
         add_zero_to_mov: 0,
         sub_zero_to_mov: 0,
+        cmp_beq_to_cbz: 0,
+        cmp_bne_to_cbnz: 0,
+        mul_add_fuse: 0,
+        mul_sub_fuse: 0,
+        movz_str_to_strxzr: 0,
         rounds: 0
     }
 }
 
 fn peephole_stats_total(s: PeepholeStats) -> int {
-    return s.identity_nop + s.mul_add_to_madd + s.mul_sub_to_msub + s.str_ldr_elim + s.redundant_reverse_mov + s.ldp_fuse + s.stp_fuse + s.mov_zero_to_xzr + s.add_zero_to_mov + s.sub_zero_to_mov
+    return s.identity_nop + s.mul_add_to_madd + s.mul_sub_to_msub + s.str_ldr_elim + s.redundant_reverse_mov + s.ldp_fuse + s.stp_fuse + s.mov_zero_to_xzr + s.add_zero_to_mov + s.sub_zero_to_mov + s.cmp_beq_to_cbz + s.cmp_bne_to_cbnz + s.mul_add_fuse + s.mul_sub_fuse + s.movz_str_to_strxzr
 }
 
 // Decode a 32-bit ARM64 word into a tag.
@@ -227,6 +238,131 @@ fn peep_decode_sub_imm(word: int) -> [int] {
     return [rd, rs, imm12]
 }
 
+// ──────────────────────────────────────────────────────────────
+//  Tier-2 decoders / encoders (ROI #166)
+// ──────────────────────────────────────────────────────────────
+
+// Decode CMP Xn, #imm12 (= SUBS XZR, Xn, #imm12, shift=0, 64-bit).
+// Encoding: 0xF1000000 | (shift<<22) | (imm12<<10) | (Rn<<5) | 31
+// Top 9 bits = 0xF1000000 >> 23 = 0x1E2 = 482. Rd must be 31.
+// Returns [rn, imm12] on match, else [-1, -1].
+fn peep_decode_cmp_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 482 { return [0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    if rd != 31 { return [0 - 1, 0 - 1] }
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rn, imm12]
+}
+
+// Decode B.cond imm19 (conditional branch).
+// Encoding: 0x54000000 | (imm19<<5) | (0<<4) | cond.
+// Top 8 bits (bits 24..31) must equal 0x54 = 84. Bit 4 must be 0.
+// Returns [cond, imm19_signed] on match, else [-1, 0].
+// imm19 is returned raw (unsigned 19-bit); caller interprets sign via bit 18.
+fn peep_decode_bcond(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 84 { return [0 - 1, 0] }
+    let bit4 = (word / 16) % 2
+    if bit4 != 0 { return [0 - 1, 0] }
+    let cond = word % 16
+    let imm19 = (word / 32) % 524288
+    return [cond, imm19]
+}
+
+// Decode MUL Xd, Xn, Xm (= MADD Xd, Xn, Xm, XZR), 64-bit.
+// Encoding: 0x9B000000 | (Rm<<16) | (31<<10) | (Rn<<5) | Rd
+// Top 11 bits (mask 0xFFE00000) must equal 0x9B000000 >> 21 = 0x4D8 = 1240.
+// Ra field (bits 10..14) must equal 31 (XZR) for pure MUL.
+// Returns [rd, rn, rm] on match, else [-1,-1,-1].
+fn peep_decode_mul(word: int) -> [int] {
+    let top11 = (word / 2097152) % 2048
+    if top11 != 1240 { return [0 - 1, 0 - 1, 0 - 1] }
+    let ra = (word / 1024) % 32
+    if ra != 31 { return [0 - 1, 0 - 1, 0 - 1] }
+    // Bit 15 (o0) must be 0 for MADD (MSUB sets it to 1).
+    let bit15 = (word / 32768) % 2
+    if bit15 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+// Decode ADD Xd, Xn, Xm (shifted register form, shift=0, imm6=0, 64-bit).
+// Encoding: 0x8B000000 | (shift<<22) | (Rm<<16) | (imm6<<10) | (Rn<<5) | Rd
+// Top 8 bits (bits 24..31) must equal 0x8B = 139. shift=0, imm6=0.
+// Returns [rd, rn, rm] on match.
+fn peep_decode_add_reg(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 139 { return [0 - 1, 0 - 1, 0 - 1] }
+    // bits 21..23 must be 0 (shift=LSL ∧ op[21]=0)
+    let mid = (word / 2097152) % 8
+    if mid != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let imm6 = (word / 1024) % 64
+    if imm6 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+// Decode SUB Xd, Xn, Xm (shifted register form, shift=0, imm6=0, 64-bit).
+// Encoding: 0xCB000000 | (shift<<22) | (Rm<<16) | (imm6<<10) | (Rn<<5) | Rd
+// Top 8 bits = 0xCB = 203.
+fn peep_decode_sub_reg(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 203 { return [0 - 1, 0 - 1, 0 - 1] }
+    let mid = (word / 2097152) % 8
+    if mid != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let imm6 = (word / 1024) % 64
+    if imm6 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+// Encode CBZ Xt, imm19 (compare-and-branch-if-zero, 64-bit).
+// Encoding: 0xB4000000 | (imm19<<5) | Rt.  Base = 0xB4000000 = 3019898880.
+// imm19 raw (already masked to 19 bits by caller for negative).
+fn peep_enc_cbz(rt: int, imm19: int) -> int {
+    let m = imm19 % 524288
+    if m < 0 { return 3019898880 + (m + 524288) * 32 + rt }
+    return 3019898880 + m * 32 + rt
+}
+
+// Encode CBNZ Xt, imm19 (compare-and-branch-if-nonzero, 64-bit).
+// Encoding: 0xB5000000 | (imm19<<5) | Rt.  Base = 0xB5000000 = 3036676096.
+fn peep_enc_cbnz(rt: int, imm19: int) -> int {
+    let m = imm19 % 524288
+    if m < 0 { return 3036676096 + (m + 524288) * 32 + rt }
+    return 3036676096 + m * 32 + rt
+}
+
+// Encode MADD Xd, Xn, Xm, Xa (64-bit).
+// Encoding: 0x9B000000 | (Rm<<16) | (0<<15) | (Ra<<10) | (Rn<<5) | Rd.
+// Base = 0x9B000000 = 2600468480.
+fn peep_enc_madd(rd: int, rn: int, rm: int, ra: int) -> int {
+    return 2600468480 + rm * 65536 + ra * 1024 + rn * 32 + rd
+}
+
+// Encode MSUB Xd, Xn, Xm, Xa (64-bit).
+// Encoding: 0x9B008000 | (Rm<<16) | (1<<15) | (Ra<<10) | (Rn<<5) | Rd.
+// Base = 0x9B008000 = 2600501248 (= 2600468480 + 32768).
+fn peep_enc_msub(rd: int, rn: int, rm: int, ra: int) -> int {
+    return 2600501248 + rm * 65536 + ra * 1024 + rn * 32 + rd
+}
+
+// Encode STR Xt, [Xn, #imm12*8] unsigned-offset 64-bit (matching decode_str_uoff).
+// Base 0xF9000000 = 4177526784.
+fn peep_enc_str_uoff(rt: int, rn: int, imm12: int) -> int {
+    return 4177526784 + imm12 * 1024 + rn * 32 + rt
+}
+
 // Run the peephole optimizer over a code buffer (array of bytes).
 // Currently implements rule 1 of the 12: identity-MOV → NOP.
 // Detects MOV Xd, Xd (same src/dst via ORR Xd,XZR,Xd encoding) and rewrites
@@ -376,6 +512,169 @@ fn run_peephole(code: [int]) -> PeepholeResult {
             stats.sub_zero_to_mov = stats.sub_zero_to_mov + 1
         }
         off = off + 4
+    }
+
+    // ──────────────────────────────────────────────────────────
+    //  Tier-2 passes (ROI #166)
+    // ──────────────────────────────────────────────────────────
+
+    // Rule 8 pass — CMP Xn, #0 ; B.EQ target  →  CBZ Xn, target ; NOP
+    // B.EQ at offset+4 uses imm19 measured from +4. After collapsing CMP to
+    // CBZ at offset 0, the branch needs +1 word adjustment so it still lands
+    // at the same target address.
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let cmp_parts = peep_decode_cmp_imm(w1)
+        let b_parts = peep_decode_bcond(w2)
+        let cn = cmp_parts[0]
+        let ci = cmp_parts[1]
+        let cond = b_parts[0]
+        let imm19 = b_parts[1]
+        if cn >= 0 && ci == 0 && cond == 0 {
+            // Adjust imm19: B.cond offset is from +4, CBZ offset from 0.
+            // So new imm19 = old imm19 + 1 (word). Preserve sign by raw-mod.
+            // Detect sign: bit 18 set → negative in 19-bit two's complement.
+            let neg = imm19 / 262144
+            let new_imm = imm19 + 1
+            // If new_imm overflows 19-bit range after +1, skip the rewrite.
+            let overflowed = (neg == 0 && new_imm >= 262144) || (neg == 1 && new_imm >= 524288)
+            if overflowed == false {
+                let cbz = peep_enc_cbz(cn, new_imm)
+                c = peep_write_word_le(c, off, cbz)
+                c = peep_write_word_le(c, off + 4, nop)
+                stats.cmp_beq_to_cbz = stats.cmp_beq_to_cbz + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 9 pass — CMP Xn, #0 ; B.NE target  →  CBNZ Xn, target ; NOP
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let cmp_parts = peep_decode_cmp_imm(w1)
+        let b_parts = peep_decode_bcond(w2)
+        let cn = cmp_parts[0]
+        let ci = cmp_parts[1]
+        let cond = b_parts[0]
+        let imm19 = b_parts[1]
+        if cn >= 0 && ci == 0 && cond == 1 {
+            let neg = imm19 / 262144
+            let new_imm = imm19 + 1
+            let overflowed = (neg == 0 && new_imm >= 262144) || (neg == 1 && new_imm >= 524288)
+            if overflowed == false {
+                let cbnz = peep_enc_cbnz(cn, new_imm)
+                c = peep_write_word_le(c, off, cbnz)
+                c = peep_write_word_le(c, off + 4, nop)
+                stats.cmp_bne_to_cbnz = stats.cmp_bne_to_cbnz + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 10 pass — MUL Xt, Xa, Xb ; ADD Xd, Xc, Xt  →  MADD Xd, Xa, Xb, Xc ; NOP
+    // Conditions:
+    //   - ADD Rm == MUL Rd (Xt is the multiplier result feeding ADD)
+    //   - ADD Rn != MUL Rd (accumulator must not also be the multiplier dst)
+    //   - MUL Rd != 31 and ADD Rd != 31 (XZR writes forbidden)
+    //   - shift=0/imm6=0 ADD register form (enforced by decoder)
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let mul_parts = peep_decode_mul(w1)
+        let add_parts = peep_decode_add_reg(w2)
+        let mrd = mul_parts[0]
+        let mrn = mul_parts[1]
+        let mrm = mul_parts[2]
+        let ard = add_parts[0]
+        let arn = add_parts[1]
+        let arm = add_parts[2]
+        if mrd >= 0 && ard >= 0 && arm == mrd && arn != mrd && mrd != 31 && ard != 31 {
+            let madd = peep_enc_madd(ard, mrn, mrm, arn)
+            c = peep_write_word_le(c, off, madd)
+            c = peep_write_word_le(c, off + 4, nop)
+            stats.mul_add_fuse = stats.mul_add_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 11 pass — MUL Xt, Xa, Xb ; SUB Xd, Xc, Xt  →  MSUB Xd, Xa, Xb, Xc ; NOP
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let mul_parts = peep_decode_mul(w1)
+        let sub_parts = peep_decode_sub_reg(w2)
+        let mrd = mul_parts[0]
+        let mrn = mul_parts[1]
+        let mrm = mul_parts[2]
+        let srd = sub_parts[0]
+        let srn = sub_parts[1]
+        let srm = sub_parts[2]
+        if mrd >= 0 && srd >= 0 && srm == mrd && srn != mrd && mrd != 31 && srd != 31 {
+            let msub = peep_enc_msub(srd, mrn, mrm, srn)
+            c = peep_write_word_le(c, off, msub)
+            c = peep_write_word_le(c, off + 4, nop)
+            stats.mul_sub_fuse = stats.mul_sub_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 12 pass — MOV Xd, #0 ; STR Xd, [Xn, #imm]  →  NOP ; STR XZR, [Xn, #imm]
+    // Recognise both the MOVZ form (raw emit) and the post-rule-5 ORR-XZR form
+    // (MOV Xd, XZR). Rule 5 runs earlier in this same pass, so in practice we'll
+    // usually see the ORR-XZR form here. Guard: Xd must equal STR's Rt, Xd!=Xn,
+    // and we conservatively require Xd != 31 (otherwise the MOV is already a nop).
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        // Try MOV Xd, XZR form first (rule-5 output)
+        let mov_parts = peep_decode_mov(w1)
+        let mrd = mov_parts[0]
+        let mrs = mov_parts[1]
+        let is_zero_mov = (mrd >= 0 && mrs == 31 && mrd != 31)
+        // Else try MOVZ Xd, #0 form (raw)
+        if is_zero_mov == false {
+            let mz = peep_decode_movz(w1)
+            if mz[0] >= 0 && mz[1] == 0 && mz[0] != 31 {
+                mrd = mz[0]
+                is_zero_mov = true
+            }
+        }
+        if is_zero_mov == true {
+            let str_parts = peep_decode_str_uoff(w2)
+            let srt = str_parts[0]
+            let srn = str_parts[1]
+            let simm = str_parts[2]
+            if srt >= 0 && srt == mrd && srn != mrd {
+                // Rewrite STR Xd,... → STR XZR,...
+                c = peep_write_word_le(c, off, nop)
+                c = peep_write_word_le(c, off + 4, peep_enc_str_uoff(31, srn, simm))
+                stats.movz_str_to_strxzr = stats.movz_str_to_strxzr + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
     }
 
     stats.rounds = 1

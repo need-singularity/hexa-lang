@@ -3317,7 +3317,7 @@ HexaVal parse_and(void) {
 HexaVal parse_bit_ops(void) {
     __hexa_fn_arena_enter();
     HexaVal left = parse_comparison();
-    while (((((hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitAnd"))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitXor")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitOr")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Shl")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Shr"))))) {
+    while ((((((hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitAnd"))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitXor")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("BitOr")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Shl")))) || hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Shr")))) || hexa_truthy(p_continue_bin_op(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_push(hexa_array_new(), hexa_str("BitAnd")), hexa_str("BitXor")), hexa_str("BitOr")), hexa_str("Shl")), hexa_str("Shr")))))) {
         HexaVal op_tok = p_advance();
         p_skip_newlines();
         HexaVal right = parse_comparison();

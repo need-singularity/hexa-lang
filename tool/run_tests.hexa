@@ -1,0 +1,206 @@
+// tool/run_tests.hexa — Self-hosted isolated test runner
+//
+// HX4 self-host: bash 의존 제거, 순수 hexa 로 테스트 실행.
+// macOS-native 프로세스 격리 (ulimit + timeout + renice).
+//
+// Usage:
+//   ./hexa run tool/run_tests.hexa                    # all tests/t*.hexa
+//   ./hexa run tool/run_tests.hexa tests/t34*.hexa    # specific (via args)
+//   ARENA=1 ./hexa run tool/run_tests.hexa            # override arena
+
+// ── Isolation config ──
+let CPU_SEC  = if env("CPU_SEC")  != "" { to_int(env("CPU_SEC"))  } else { 30 }
+let RAM_MB   = if env("RAM_MB")   != "" { to_int(env("RAM_MB"))   } else { 2048 }
+let WALL_SEC = if env("WALL_SEC") != "" { to_int(env("WALL_SEC")) } else { 30 }
+let ARENA    = if env("ARENA")    != "" { env("ARENA") } else { "0" }
+let RAM_KB   = RAM_MB * 1024
+
+// ── Parse directive from file header ──
+// Scans first 20 lines for "// TAG: value" and returns value (or "")
+fn parse_directive(content, tag) {
+    let lines = content.split("\n")
+    let limit = if len(lines) < 20 { len(lines) } else { 20 }
+    let prefix = "// " + tag + ": "
+    let mut i = 0
+    while i < limit {
+        if lines[i].starts_with(prefix) {
+            return lines[i].split(prefix)[1]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// ── Check if header mentions stage0 rebuild requirement ──
+fn needs_rebuild(content) {
+    let lines = content.split("\n")
+    let limit = if len(lines) < 10 { len(lines) } else { 10 }
+    let mut i = 0
+    while i < limit {
+        if lines[i].contains("Requires stage0 rebuild") || lines[i].contains("requires stage0 rebuild") {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ── Collect // ENV: KEY=VAL lines ──
+fn collect_env(content) {
+    let lines = content.split("\n")
+    let limit = if len(lines) < 20 { len(lines) } else { 20 }
+    let mut parts = []
+    let mut i = 0
+    while i < limit {
+        if lines[i].starts_with("// ENV: ") {
+            parts.push(lines[i].split("// ENV: ")[1])
+        }
+        i = i + 1
+    }
+    return parts
+}
+
+// ── Run one test with isolation ──
+// Returns: 0=PASS, 1=FAIL, 2=SKIP
+fn run_one(path) {
+    let content = read_file(path)
+
+    // SKIP directive
+    let skip_reason = parse_directive(content, "SKIP")
+    if skip_reason != "" {
+        println("SKIP  " + path + "  " + skip_reason)
+        return 2
+    }
+
+    // Stage0 rebuild gate
+    if needs_rebuild(content) {
+        println("SKIP  " + path + "  needs stage0 rebuild")
+        return 2
+    }
+
+    // Build env string
+    let env_parts = collect_env(content)
+    let mut env_str = "HEXA_VAL_ARENA=" + ARENA + " DYLD_LIBRARY_PATH=$PWD/self/native/build"
+    let mut ei = 0
+    while ei < len(env_parts) {
+        env_str = env_str + " " + env_parts[ei]
+        ei = ei + 1
+    }
+
+    // Isolated subprocess via bash
+    let cmd = "( ulimit -t " + to_string(CPU_SEC) + " -v " + to_string(RAM_KB) + " 2>/dev/null; " +
+              "renice +19 $$ >/dev/null 2>&1; " +
+              env_str + " timeout --kill-after=5 " + to_string(WALL_SEC) + " ./hexa run " + path + " 2>&1 )"
+
+    let result = exec_with_status(cmd)
+    let output = result[0]
+    let code   = result[1]
+
+    // EXPECTED directive check
+    let expected = parse_directive(content, "EXPECTED")
+    let mut final_code = code
+    if code == 0 && expected != "" {
+        if !output.contains(expected) {
+            final_code = 99
+        }
+    }
+
+    // Classify & print
+    if final_code == 0 {
+        println("PASS  " + path)
+    } else if final_code == 124 {
+        println("TIME  " + path + "  wall>" + to_string(WALL_SEC) + "s")
+    } else if final_code == 137 || final_code == 152 {
+        println("KILL  " + path + "  SIGKILL (CPU/RAM limit)")
+    } else if final_code == 99 {
+        println("FAIL  " + path + "  expected: " + expected)
+    } else {
+        println("FAIL  " + path + "  exit=" + to_string(final_code))
+    }
+
+    // Show tail on failure
+    if final_code != 0 && output != "" {
+        let out_lines = output.split("\n")
+        let start = if len(out_lines) > 5 { len(out_lines) - 5 } else { 0 }
+        let mut oi = start
+        while oi < len(out_lines) {
+            println("       " + out_lines[oi])
+            oi = oi + 1
+        }
+    }
+
+    return final_code
+}
+
+// ── Main ──
+// NOTE: Test discovery is intentionally inlined at top level instead of a
+// separate fn. Under HEXA_VAL_ARENA=1 (default since 2026-04-16), arrays of
+// strings returned from a user fn get rewound when the fn frame pops — main
+// then iterates over freed slots and path prints come out corrupted as
+// bleed-through from later read_file() content (e.g. "<__not_fused__>" or
+// "// --- fill ---"). Keeping discovery in the top-level scope sidesteps the
+// rewind (arena holds until program exit), so `files[fi]` stays valid for
+// the whole run_one() loop. If this is ever factored back into a fn, also
+// re-run under ARENA=1 to confirm no regression.
+let cli_args = args()
+let mut files = []
+if len(cli_args) > 2 {
+    // args() = [hexa, run, script.hexa, ...user_args]
+    let mut ai = 3
+    while ai < len(cli_args) {
+        files.push(cli_args[ai])
+        ai = ai + 1
+    }
+} else {
+    let all = list_dir("tests")
+    let mut di = 0
+    while di < len(all) {
+        let name = all[di]
+        if name.starts_with("t") && name.ends_with(".hexa") {
+            files.push("tests/" + name)
+        }
+        di = di + 1
+    }
+}
+
+let total = len(files)
+let mut pass = 0
+let mut fail = 0
+let mut skip = 0
+let mut failed = []
+
+println("=== hexa test runner (" + to_string(total) + " tests) ===")
+println("    CPU<=" + to_string(CPU_SEC) + "s  RAM<=" + to_string(RAM_MB) + "MB  wall<=" + to_string(WALL_SEC) + "s  nice=+19  arena=" + ARENA)
+println("")
+
+let mut fi = 0
+while fi < total {
+    let rc = run_one(files[fi])
+    if rc == 0 {
+        pass = pass + 1
+    } else if rc == 2 {
+        skip = skip + 1
+    } else {
+        fail = fail + 1
+        failed.push(files[fi])
+    }
+    fi = fi + 1
+}
+
+println("")
+println("=== " + to_string(pass) + " pass  " + to_string(fail) + " fail  " + to_string(skip) + " skip  (" + to_string(total) + " total) ===")
+
+if len(failed) > 0 {
+    let mut fstr = ""
+    let mut fi2 = 0
+    while fi2 < len(failed) {
+        if fi2 > 0 { fstr = fstr + " " }
+        fstr = fstr + failed[fi2]
+        fi2 = fi2 + 1
+    }
+    println("FAILED: " + fstr)
+}
+
+if fail > 0 {
+    exec("exit 1")
+}

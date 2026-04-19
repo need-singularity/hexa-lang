@@ -1,0 +1,192 @@
+// tool/poc_test.hexa
+//
+// Co-located test runner for self/poc/<cat>/*_test.hexa handlers.
+//
+// Convention (see self/poc/TESTING.md):
+//   - Test files live next to their handlers:
+//       self/poc/expr/int_lit.hexa         (handler, fn poc_ex_int_lit)
+//       self/poc/expr/int_lit_test.hexa    (test,    fn poc_test_ex_int_lit)
+//   - Each test file exports a zero-arg fn returning int:
+//       fn poc_test_<cat2>_<snake>() -> int
+//     Returns 0 on pass, >0 on fail (failure count is fine).
+//   - The filename (minus `_test.hexa`) must match the handler filename,
+//     so the cat (expr/stmt/builtin) and snake name derive from the path.
+//
+// Operation:
+//   1. Scan `self/poc/{expr,stmt,builtin}/*_test.hexa` via exec("ls ...").
+//   2. Codegen `self/poc/_tests.hexa` — a dispatcher that `use`s each
+//      discovered test module and calls its fn via an if-chain keyed on
+//      the test's full fn name. This mirrors how `_dispatch.hexa` routes
+//      handlers (hexa lacks first-class fn refs).
+//   3. Codegen `self/poc/_test_main.hexa` — a `main()` entry that walks
+//      the discovered list and invokes each test through the dispatcher,
+//      tallying pass/fail.
+//   4. Print `[poc-test] N tests, M PASS, K FAIL`, exit 1 if any FAIL.
+//
+// Usage:  hexa tool/poc_test.hexa
+//
+// Note: this runner does the codegen + tally inline in its own main(),
+// so it doesn't need to shell out to a separately-compiled binary —
+// the discovery and dispatching happen through strings + eval-by-name.
+// Because we cannot evaluate fns by name at runtime, we instead spawn
+// the stage0 compiler on a generated per-test driver file. This keeps
+// each test isolated (its own process, its own poc_* globals).
+
+use "self/stdlib/law_io"
+
+let CATS = [["expr", "ex"], ["stmt", "st"], ["builtin", "bi"]]
+
+fn strip(s) {
+    let mut i = 0
+    while i < len(s) && (s[i] == " " || s[i] == "\t") { i = i + 1 }
+    let mut j = len(s) - 1
+    while j >= i && (s[j] == " " || s[j] == "\t" || s[j] == "\r" || s[j] == "\n") { j = j - 1 }
+    let mut out = ""
+    let mut k = i
+    while k <= j { out = out + s[k]; k = k + 1 }
+    return out
+}
+
+fn list_dir_tests(dir) {
+    let raw = exec("ls " + dir + "/*_test.hexa 2>/dev/null")
+    if raw == "" { return [] }
+    let lines = raw.split("\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let s = strip(lines[i])
+        if s != "" { out = out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+fn basename_noext(path) {
+    let mut last = -1
+    let mut i = 0
+    while i < len(path) { if path[i] == "/" { last = i } ; i = i + 1 }
+    let start = last + 1
+    let mut out = ""
+    let mut k = start
+    while k < len(path) { out = out + path[k]; k = k + 1 }
+    if len(out) > 5 {
+        let n = len(out)
+        let dot = out[n - 5]
+        if dot == "." {
+            let mut m = ""
+            let mut q = 0
+            while q < n - 5 { m = m + out[q]; q = q + 1 }
+            return m
+        }
+    }
+    return out
+}
+
+// Strip "_test" suffix from basename → returns bare snake name.
+fn strip_test_suffix(base) {
+    let n = len(base)
+    if n <= 5 { return base }
+    let mut out = ""
+    let mut i = 0
+    while i < n - 5 { out = out + base[i]; i = i + 1 }
+    // Check the stripped tail was "_test".
+    let tail = ""
+    let mut j = n - 5
+    let mut tail2 = ""
+    while j < n { tail2 = tail2 + base[j]; j = j + 1 }
+    if tail2 == "_test" { return out }
+    return base
+}
+
+fn main() {
+    // Discover.
+    let mut rows = []   // each: [cat, cat2, snake, path, fn_name]
+    let mut c = 0
+    while c < len(CATS) {
+        let cat = CATS[c][0]
+        let cat2 = CATS[c][1]
+        let dir = "self/poc/" + cat
+        let files = list_dir_tests(dir)
+        let mut fi = 0
+        while fi < len(files) {
+            let path = files[fi]
+            let base = basename_noext(path)              // e.g. "int_lit_test"
+            let snake = strip_test_suffix(base)          // e.g. "int_lit"
+            let fn_name = "poc_test_" + cat2 + "_" + snake
+            rows = rows.push([cat, cat2, snake, path, fn_name])
+            fi = fi + 1
+        }
+        c = c + 1
+    }
+
+    let n_tests = len(rows)
+    println("[poc-test] discovered " + str(n_tests) + " test file(s)")
+    if n_tests == 0 {
+        println("[poc-test] 0 tests, 0 PASS, 0 FAIL")
+        exit(0)
+    }
+
+    // Run each test in its own hexa subprocess via a generated driver
+    // file. This keeps poc_* module state fully reset between tests.
+    //
+    // Driver template (written to /tmp/__poc_test_driver_<fn>.hexa):
+    //   use "ast"
+    //   use "mini_native"
+    //   use "poc/common"
+    //   use "poc/expr/<snake>"              // the handler
+    //   use "poc/<cat>/<snake>_test"        // the test
+    //   fn main() {
+    //       let rc = poc_test_<cat2>_<snake>()
+    //       if rc == 0 { println("[poc-test-ok] <fn_name>") }
+    //       else       { println("[poc-test-fail] <fn_name> rc=" + str(rc)) }
+    //       exit(rc)
+    //   }
+
+    let mut passed = 0
+    let mut failed = 0
+    let mut i = 0
+    while i < n_tests {
+        let cat     = rows[i][0]
+        let cat2    = rows[i][1]
+        let snake   = rows[i][2]
+        let path    = rows[i][3]
+        let fn_name = rows[i][4]
+
+        // Build driver source.
+        let mut src = "// auto-generated by tool/poc_test.hexa — do not edit\n"
+        src = src + "use \"ast\"\n"
+        src = src + "use \"mini_native\"\n"
+        src = src + "use \"poc/common\"\n"
+        src = src + "use \"poc/" + cat + "/" + snake + "\"\n"
+        src = src + "use \"poc/" + cat + "/" + snake + "_test\"\n"
+        src = src + "\n"
+        src = src + "fn main() {\n"
+        src = src + "    let rc = " + fn_name + "()\n"
+        src = src + "    if rc == 0 { println(\"[poc-test-ok] " + fn_name + "\") }\n"
+        src = src + "    else       { println(\"[poc-test-fail] " + fn_name + " rc=\" + str(rc)) }\n"
+        src = src + "    exit(rc)\n"
+        src = src + "}\n"
+
+        let driver_path = "/tmp/__poc_test_driver_" + fn_name + ".hexa"
+        safe_write_file(driver_path, src)
+
+        // Execute driver. We rely on `hexa` (stage0) being on PATH.
+        let output = exec("hexa " + driver_path + " 2>&1")
+        print(output)
+
+        // Classify: a test "passes" only if we see the ok marker for it.
+        let ok_marker = "[poc-test-ok] " + fn_name
+        if output.contains(ok_marker) {
+            passed = passed + 1
+        } else {
+            failed = failed + 1
+        }
+
+        i = i + 1
+    }
+
+    let summary = "[poc-test] " + str(n_tests) + " tests, " + str(passed) + " PASS, " + str(failed) + " FAIL"
+    println(summary)
+    if failed > 0 { exit(1) }
+    exit(0)
+}

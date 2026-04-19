@@ -1,0 +1,218 @@
+// self/raws/ai_native_algo.hexa — raw #2: ai-native 알고리즘 (O(2^n)→O(n))
+//
+// rule (HX5): 핵심 수치/ML 함수는 AI-native 대체 (hxblas/neon_gemm/memoize/fused kernel 등)
+//             사용. naive 구현 (3중 for-loop matmul, 재귀 fib 등) 은 차단 또는 경고.
+//
+// 현 단계: status = new (deferred → 활성화). scope 좁힘:
+//   - self/serve/  (서빙 핫패스)
+//   - self/ml/     (ML 커널)
+//   - anima/       (연동 경로)
+// 기타 경로 (self/attrs/, tool/ 등) 는 제외.
+//
+// Level 1 (현 구현): 심볼 이름 + 서명 휴리스틱 — false positive 낮음, recall 낮음
+//   L1a: `fn naive_*` / `fn slow_*` / `fn on2_*` / `fn bruteforce_*` 접두사 차단
+//   L1b: `fn *_matmul` / `fn *_gemm` / `fn *_attention` 내부에 3중 for 루프 (naive) 감지
+//        → AI-native 대체 (hxblas/fused/memoize 등) 호출 없으면 violation
+//
+// Level 2 (후속): AI-native 대체 구현 존재 확인 — 심볼 테이블 필요. Tier 2, deferred.
+//
+// opt-out: @allow-naive-algo marker 또는 .ai-native-algo-baseline 파일 grandfather.
+//
+// 참고: HX5 의무 — docs/ai-native.md 24종 벡터. raw.json raw#2 SSOT.
+
+use "self/attrs/core"
+
+fn meta_ai_native_algo() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name        = "ai_native_algo"
+    m.category    = "raw"
+    m.purpose     = "naive O(2^n)/O(n^3) 알고리즘 → AI-native 대체 강제 (HX5)"
+    m.cost_rule   = ".hexa line-scan — naive_* 접두사 + 3중 for 루프 휴리스틱. scope: self/serve/, self/ml/, anima/"
+    m.side_effect = "enforce() 는 LintMsg 배열 반환. tool/ai_native_algo_lint.hexa 실행 시 violation>0 이면 exit 1"
+    m.requires    = "self/attrs/core (mk_msg). baseline 파일 (.ai-native-algo-baseline) 파싱"
+    m.auto_test   = "tests/raws/ai_native_algo_cases.hexa (추후)"
+    m.example     = "fn matmul(a, b) { hxblas_gemm(a, b) }  // ai-native 대체"
+    m.implemented = true
+    return m
+}
+
+// ─── scope 판정 ──────────────────────────────────────────────
+fn _in_scope(path: string) -> bool {
+    if path.contains("self/serve/") { return true }
+    if path.contains("self/ml/") { return true }
+    if path.starts_with("anima/") { return true }
+    if path.contains("/anima/") { return true }
+    return false
+}
+
+// ─── baseline 로드 (grandfather) ─────────────────────────────
+// .ai-native-algo-baseline — 1 path/line, 선행 whitespace/주석 무시
+fn _load_baseline() {
+    let mut pwd = env("PWD")
+    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+    let path = pwd + "/.ai-native-algo-baseline"
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let raw = to_string(exec("cat '" + path + "' 2>/dev/null"))
+    let mut out = []
+    let lines = split(raw, "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        if t.starts_with("#") { continue }
+        out = out.push(t)
+    }
+    return out
+}
+
+fn _is_grandfathered(path: string, baseline: [string]) -> bool {
+    for b in baseline {
+        if path == b { return true }
+        if path.ends_with("/" + b) { return true }
+    }
+    return false
+}
+
+// ─── naive-prefix 감지 ───────────────────────────────────────
+// L1a: fn naive_foo / fn slow_foo / fn on2_foo / fn bruteforce_foo — 즉시 violation
+fn _scan_naive_prefix(path: string, lines: [string]) {
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        if t.starts_with("//") { i = i + 1; continue }
+
+        // fn signature 체크
+        let is_fn = t.starts_with("fn ") || t.starts_with("pub fn ")
+        if !is_fn { i = i + 1; continue }
+
+        // fn name 추출
+        let after_fn = if t.starts_with("pub fn ") { t.substring(7, len(t)) } else { t.substring(3, len(t)) }
+        let sp = after_fn.index_of("(")
+        if sp < 0 { i = i + 1; continue }
+        let name = after_fn.substring(0, sp).trim()
+
+        // 접두사 블랙리스트
+        let bad = name.starts_with("naive_") || name.starts_with("slow_") ||
+                  name.starts_with("on2_") || name.starts_with("bruteforce_") ||
+                  name.starts_with("quadratic_")
+
+        if bad {
+            // @allow-naive-algo marker 검사 — 선행 3줄 내
+            let back = if i >= 3 { i - 3 } else { 0 }
+            let mut j = back
+            let mut allow = false
+            while j < i {
+                if lines[j].contains("@allow-naive-algo") { allow = true; break }
+                j = j + 1
+            }
+            if !allow {
+                out = out.push(mk_msg(
+                    "ai_native_algo", "error", path, i + 1, 0,
+                    "naive 알고리즘 접두사 함수 — " + name,
+                    "AI-native 대체 (hxblas/fused/memoize) 로 rewrite, 또는 @allow-naive-algo 마커 추가",
+                    "@hot @fuse fn " + name.substring(name.index_of("_") + 1, len(name)) + "(...) { hxblas_* }",
+                    "raw #2 / self/raws/ai_native_algo.hexa"))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 3중 for-loop matmul/gemm 감지 (L1b) ─────────────────────
+// matmul/gemm/attention 이름 fn 내부에서 `for .* in` 3번 연속 등장 + hxblas/fused/memoize 호출 없음 → violation
+fn _scan_naive_kernel(path: string, lines: [string]) {
+    let mut out = []
+    let mut i = 0
+    let n = len(lines)
+    while i < n {
+        let t = lines[i].trim()
+        let is_fn = t.starts_with("fn ") || t.starts_with("pub fn ")
+        if !is_fn { i = i + 1; continue }
+
+        let after_fn = if t.starts_with("pub fn ") { t.substring(7, len(t)) } else { t.substring(3, len(t)) }
+        let sp = after_fn.index_of("(")
+        if sp < 0 { i = i + 1; continue }
+        let name = after_fn.substring(0, sp).trim()
+
+        let is_kernel = name.contains("matmul") || name.contains("gemm") ||
+                        name.contains("attention") || name.contains("conv2d")
+        if !is_kernel { i = i + 1; continue }
+
+        // fn body 스캔 — 다음 `fn ` 또는 EOF 전까지
+        let mut for_cnt = 0
+        let mut has_ai = false
+        let mut k = i + 1
+        while k < n {
+            let nt = lines[k].trim()
+            if nt.starts_with("fn ") || nt.starts_with("pub fn ") { break }
+            if nt.contains("for ") && nt.contains(" in ") { for_cnt = for_cnt + 1 }
+            // AI-native 대체 호출 감지
+            if nt.contains("hxblas") || nt.contains("neon_gemm") ||
+               nt.contains("_fused") || nt.contains("memoize") ||
+               nt.contains("amx_") || nt.contains("metal_") {
+                has_ai = true
+            }
+            k = k + 1
+        }
+
+        if for_cnt >= 3 && !has_ai {
+            // @allow-naive-algo marker 검사
+            let back = if i >= 3 { i - 3 } else { 0 }
+            let mut j = back
+            let mut allow = false
+            while j < i {
+                if lines[j].contains("@allow-naive-algo") { allow = true; break }
+                j = j + 1
+            }
+            if !allow {
+                out = out.push(mk_msg(
+                    "ai_native_algo", "warn", path, i + 1, 0,
+                    "naive 3중 for-loop kernel — " + name + " (for=" + to_string(for_cnt) + ", AI-native 호출 없음)",
+                    "hxblas_gemm / metal_* / amx_* 등 AI-native 대체 호출, 또는 @allow-naive-algo 마커",
+                    "@hot fn " + name + "(a, b) { return hxblas_gemm(a, b) }",
+                    "raw #2 / self/raws/ai_native_algo.hexa"))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── 파일 단위 scan ─────────────────────────────────────────
+pub fn ai_native_algo_scan_file(path: string) {
+    let mut msgs = []
+    if !_in_scope(path) { return msgs }
+    let baseline = _load_baseline()
+    if _is_grandfathered(path, baseline) { return msgs }
+
+    let src = to_string(exec("cat '" + path + "' 2>/dev/null"))
+    if src == "" { return msgs }
+    let lines = split(src, "\n")
+
+    let a = _scan_naive_prefix(path, lines)
+    for m in a { msgs = msgs.push(m) }
+
+    let b = _scan_naive_kernel(path, lines)
+    for m in b { msgs = msgs.push(m) }
+
+    return msgs
+}
+
+pub fn ai_native_algo_enforce(paths: [string]) {
+    let mut all = []
+    for p in paths {
+        let msgs = ai_native_algo_scan_file(p)
+        for m in msgs { all = all.push(m) }
+    }
+    return all
+}
+
+pub fn ai_native_algo_induce() -> string {
+    return "raw #2 ai_native_algo — scope: self/serve/, self/ml/, anima/. " +
+           "scan via `hexa tool/ai_native_algo_lint.hexa [path...]`. " +
+           "opt-out: @allow-naive-algo marker fn, or path in .ai-native-algo-baseline. " +
+           "HX5 의무 — docs/ai-native.md 24 벡터."
+}

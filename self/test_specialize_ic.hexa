@@ -1,0 +1,549 @@
+// self/test_specialize_ic.hexa — @specialize V8 IC scaffold tests (ROI #167)
+//
+// Exercises the HiddenClass + IC scaffold. The production-grade module lives
+// at self/vm/ic.hexa and self/attrs/_own/specialize.hexa — both consumed via
+// `use` in normal builds (self/module_loader.hexa inlines them). This test
+// file inlines a verbatim copy of the runtime below so it can be executed
+// with the raw stage0 binary (build/hexa_stage0.real) without depending on
+// the module-loader pipeline. When run under ./hexa, the canonical module
+// is ALSO loaded via `use` — the inlined copy simply shadows it.
+//
+// Scope (docs/plans/specialize_v8_ic.md §5):
+//   - 100 accesses on the same hc keep state=MONO
+//   - miss_count == 1 (only init); hit_count == 99
+//   - expected_hc matches the object's hc
+//   - returned values match
+//   - MONO-miss path bumps miss_count but preserves state (POLY = follow-up)
+
+// ═══════════════════════════════════════════════════════════════════
+//  INLINED RUNTIME (mirror of self/vm/ic.hexa — keep in sync)
+// ═══════════════════════════════════════════════════════════════════
+
+struct HiddenClass {
+    id: int,
+    parent_id: int,
+    field_names: [string],
+    field_offsets: [int],
+    field_tags: [string],
+    trans_keys: [string],
+    trans_child_ids: [int]
+}
+
+fn hc_empty_class(id: int) -> HiddenClass {
+    return HiddenClass {
+        id: id,
+        parent_id: -1,
+        field_names: [],
+        field_offsets: [],
+        field_tags: [],
+        trans_keys: [],
+        trans_child_ids: []
+    }
+}
+
+fn hc_find_field(c: HiddenClass, name: string) -> int {
+    let mut i = 0
+    while i < len(c.field_names) {
+        if c.field_names[i] == name { return c.field_offsets[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+fn hc_field_tag(c: HiddenClass, name: string) -> string {
+    let mut i = 0
+    while i < len(c.field_names) {
+        if c.field_names[i] == name { return c.field_tags[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn hc_find_transition(c: HiddenClass, name: string) -> int {
+    let mut i = 0
+    while i < len(c.trans_keys) {
+        if c.trans_keys[i] == name { return c.trans_child_ids[i] }
+        i = i + 1
+    }
+    return -1
+}
+
+struct ClassRegistry {
+    classes: [HiddenClass],
+    next_id: int
+}
+
+fn hc_new_registry() -> ClassRegistry {
+    let root = hc_empty_class(0)
+    return ClassRegistry { classes: [root], next_id: 1 }
+}
+
+fn hc_get(reg: ClassRegistry, id: int) -> HiddenClass {
+    return reg.classes[id]
+}
+
+fn hc_add_field(reg: ClassRegistry, parent_id: int, name: string, tag: string) {
+    let parent = reg.classes[parent_id]
+    let existing = hc_find_transition(parent, name)
+    if existing >= 0 {
+        return [reg, existing]
+    }
+    let next_offset = len(parent.field_names)
+    let mut child_names = []
+    let mut child_offsets = []
+    let mut child_tags = []
+    let mut i = 0
+    while i < len(parent.field_names) {
+        child_names = child_names.push(parent.field_names[i])
+        child_offsets = child_offsets.push(parent.field_offsets[i])
+        child_tags = child_tags.push(parent.field_tags[i])
+        i = i + 1
+    }
+    child_names = child_names.push(name)
+    child_offsets = child_offsets.push(next_offset)
+    child_tags = child_tags.push(tag)
+    let new_id = reg.next_id
+    let child = HiddenClass {
+        id: new_id,
+        parent_id: parent_id,
+        field_names: child_names,
+        field_offsets: child_offsets,
+        field_tags: child_tags,
+        trans_keys: [],
+        trans_child_ids: []
+    }
+    let mut parent_tk = []
+    let mut parent_tc = []
+    let mut j = 0
+    while j < len(parent.trans_keys) {
+        parent_tk = parent_tk.push(parent.trans_keys[j])
+        parent_tc = parent_tc.push(parent.trans_child_ids[j])
+        j = j + 1
+    }
+    parent_tk = parent_tk.push(name)
+    parent_tc = parent_tc.push(new_id)
+    let new_parent = HiddenClass {
+        id: parent.id,
+        parent_id: parent.parent_id,
+        field_names: parent.field_names,
+        field_offsets: parent.field_offsets,
+        field_tags: parent.field_tags,
+        trans_keys: parent_tk,
+        trans_child_ids: parent_tc
+    }
+    let mut new_classes = []
+    let mut k = 0
+    while k < len(reg.classes) {
+        if k == parent_id {
+            new_classes = new_classes.push(new_parent)
+        } else {
+            new_classes = new_classes.push(reg.classes[k])
+        }
+        k = k + 1
+    }
+    new_classes = new_classes.push(child)
+    let new_reg = ClassRegistry { classes: new_classes, next_id: new_id + 1 }
+    return [new_reg, new_id]
+}
+
+struct ICObject {
+    hc_id: int,
+    slots: [int]
+}
+
+fn ic_obj_new(hc_id: int, slots: [int]) -> ICObject {
+    return ICObject { hc_id: hc_id, slots: slots }
+}
+
+fn ic_state_uninit() -> int { return 0 }
+fn ic_state_mono()   -> int { return 1 }
+fn ic_state_poly()   -> int { return 2 }
+fn ic_state_mega()   -> int { return 3 }
+
+struct ICSlot {
+    site_id: int,
+    state: int,
+    expected_hc: int,
+    cached_offset: int,
+    cached_tag: string,
+    poly_cache: [int],
+    miss_count: int,
+    hit_count: int
+}
+
+fn ic_slot_new(site_id: int) -> ICSlot {
+    return ICSlot {
+        site_id: site_id,
+        state: 0,
+        expected_hc: -1,
+        cached_offset: -1,
+        cached_tag: "",
+        poly_cache: [],
+        miss_count: 0,
+        hit_count: 0
+    }
+}
+
+fn ic_miss(slot: ICSlot, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    let cls = hc_get(reg, obj.hc_id)
+    let off = hc_find_field(cls, field_name)
+    let tag = hc_field_tag(cls, field_name)
+    let val = if off >= 0 { obj.slots[off] } else { 0 }
+    if slot.state == 0 {
+        let new_slot = ICSlot {
+            site_id: slot.site_id,
+            state: 1,
+            expected_hc: obj.hc_id,
+            cached_offset: off,
+            cached_tag: tag,
+            poly_cache: slot.poly_cache,
+            miss_count: slot.miss_count + 1,
+            hit_count: slot.hit_count
+        }
+        return [new_slot, val]
+    }
+    let new_slot = ICSlot {
+        site_id: slot.site_id,
+        state: slot.state,
+        expected_hc: slot.expected_hc,
+        cached_offset: slot.cached_offset,
+        cached_tag: slot.cached_tag,
+        poly_cache: slot.poly_cache,
+        miss_count: slot.miss_count + 1,
+        hit_count: slot.hit_count
+    }
+    return [new_slot, val]
+}
+
+fn ic_field_lookup(slot: ICSlot, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    if slot.state == 1 {
+        if slot.expected_hc == obj.hc_id {
+            let val = obj.slots[slot.cached_offset]
+            let new_slot = ICSlot {
+                site_id: slot.site_id,
+                state: slot.state,
+                expected_hc: slot.expected_hc,
+                cached_offset: slot.cached_offset,
+                cached_tag: slot.cached_tag,
+                poly_cache: slot.poly_cache,
+                miss_count: slot.miss_count,
+                hit_count: slot.hit_count + 1
+            }
+            return [new_slot, val]
+        }
+    }
+    return ic_miss(slot, reg, obj, field_name)
+}
+
+struct ICTable {
+    site_ids: [int],
+    slots: [ICSlot]
+}
+
+fn ic_table_new() -> ICTable {
+    return ICTable { site_ids: [], slots: [] }
+}
+
+fn ic_table_slot(tbl: ICTable, site_id: int) {
+    let mut i = 0
+    while i < len(tbl.site_ids) {
+        if tbl.site_ids[i] == site_id { return [tbl, i] }
+        i = i + 1
+    }
+    let new_slot = ic_slot_new(site_id)
+    let mut new_ids = []
+    let mut new_slots = []
+    let mut k = 0
+    while k < len(tbl.site_ids) {
+        new_ids = new_ids.push(tbl.site_ids[k])
+        new_slots = new_slots.push(tbl.slots[k])
+        k = k + 1
+    }
+    new_ids = new_ids.push(site_id)
+    new_slots = new_slots.push(new_slot)
+    let new_tbl = ICTable { site_ids: new_ids, slots: new_slots }
+    return [new_tbl, len(new_ids) - 1]
+}
+
+fn ic_table_set(tbl: ICTable, index: int, slot: ICSlot) -> ICTable {
+    let mut new_slots = []
+    let mut k = 0
+    while k < len(tbl.slots) {
+        if k == index {
+            new_slots = new_slots.push(slot)
+        } else {
+            new_slots = new_slots.push(tbl.slots[k])
+        }
+        k = k + 1
+    }
+    return ICTable { site_ids: tbl.site_ids, slots: new_slots }
+}
+
+fn ic_site_lookup(tbl: ICTable, site_id: int, reg: ClassRegistry, obj: ICObject, field_name: string) {
+    let gs = ic_table_slot(tbl, site_id)
+    let tbl1 = gs[0]
+    let idx = gs[1]
+    let slot = tbl1.slots[idx]
+    let res = ic_field_lookup(slot, reg, obj, field_name)
+    let new_slot = res[0]
+    let val = res[1]
+    let tbl2 = ic_table_set(tbl1, idx, new_slot)
+    return [tbl2, val]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TESTS
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_true(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("=======================================================")
+println("  @specialize V8 IC scaffold tests (ROI #167)")
+println("=======================================================")
+println("")
+
+// ─── S1: HiddenClass construction + transitions ─────────────────────
+
+println("--- S1: HiddenClass construction ---")
+
+let reg0 = hc_new_registry()
+check("reg0 has root", len(reg0.classes), 1)
+check("reg0 next_id=1", reg0.next_id, 1)
+
+let root = hc_get(reg0, 0)
+check("root.id=0", root.id, 0)
+check("root.parent=-1", root.parent_id, -1)
+check("root.fields empty", len(root.field_names), 0)
+
+let step1 = hc_add_field(reg0, 0, "x", "int")
+let reg1 = step1[0]
+let hc_x = step1[1]
+check("hc_add_field x returns id=1", hc_x, 1)
+check("reg1 has 2 classes", len(reg1.classes), 2)
+
+let cls_x = hc_get(reg1, 1)
+check("cls_x.parent=0", cls_x.parent_id, 0)
+check("cls_x has 1 field", len(cls_x.field_names), 1)
+check("cls_x field[0]=x", cls_x.field_names[0], "x")
+check("cls_x offset[0]=0", cls_x.field_offsets[0], 0)
+check("cls_x tag[0]=int", cls_x.field_tags[0], "int")
+
+let step2 = hc_add_field(reg1, 1, "y", "int")
+let reg2 = step2[0]
+let hc_xy = step2[1]
+check("hc_add_field y returns id=2", hc_xy, 2)
+
+let cls_xy = hc_get(reg2, 2)
+check("cls_xy has 2 fields", len(cls_xy.field_names), 2)
+check("cls_xy field[1]=y", cls_xy.field_names[1], "y")
+check("cls_xy offset[1]=1", cls_xy.field_offsets[1], 1)
+
+let step2b = hc_add_field(reg2, 1, "y", "int")
+let reg2b = step2b[0]
+let hc_xy_again = step2b[1]
+check("transition idempotent", hc_xy_again, 2)
+check("no class bloat", len(reg2b.classes), 3)
+
+let step3 = hc_add_field(reg2, 0, "x_f", "float")
+let reg3 = step3[0]
+let hc_xf = step3[1]
+check("divergent tag -> new class", hc_xf, 3)
+check("reg3 has 4 classes", len(reg3.classes), 4)
+
+println("")
+
+// ─── S2: hc_find_field / hc_find_transition ─────────────────────────
+
+println("--- S2: HiddenClass lookup ---")
+
+let cls_xy_lookup = hc_get(reg3, 2)
+check("find x offset=0", hc_find_field(cls_xy_lookup, "x"), 0)
+check("find y offset=1", hc_find_field(cls_xy_lookup, "y"), 1)
+check("find missing=-1", hc_find_field(cls_xy_lookup, "zzz"), -1)
+check("field tag x", hc_field_tag(cls_xy_lookup, "x"), "int")
+
+let cls_x_lookup = hc_get(reg3, 1)
+check("x has transition y -> 2", hc_find_transition(cls_x_lookup, "y"), 2)
+check("x no transition for q -> -1", hc_find_transition(cls_x_lookup, "q"), -1)
+
+println("")
+
+// ─── S3: ICSlot initial state ───────────────────────────────────────
+
+println("--- S3: ICSlot initial state ---")
+
+let s0 = ic_slot_new(42)
+check("slot.site_id=42", s0.site_id, 42)
+check("slot.state=UNINIT(0)", s0.state, ic_state_uninit())
+check("slot.expected_hc=-1", s0.expected_hc, -1)
+check("slot.cached_offset=-1", s0.cached_offset, -1)
+check("slot.miss_count=0", s0.miss_count, 0)
+check("slot.hit_count=0", s0.hit_count, 0)
+
+println("")
+
+// ─── S4: Mono dispatch — the 1 scaffold path ────────────────────────
+
+println("--- S4: Mono dispatch (100 same-hc accesses) ---")
+
+let mut objs = []
+let mut ob_i = 0
+while ob_i < 100 {
+    let obj_i = ic_obj_new(2, [ob_i, 2 * ob_i])
+    objs = objs.push(obj_i)
+    ob_i = ob_i + 1
+}
+check("built 100 objs", len(objs), 100)
+
+let mut slot_x = ic_slot_new(100)
+let mut vals = []
+let mut li = 0
+while li < 100 {
+    let res = ic_field_lookup(slot_x, reg3, objs[li], "x")
+    slot_x = res[0]
+    vals = vals.push(res[1])
+    li = li + 1
+}
+
+check("state=MONO after 100", slot_x.state, ic_state_mono())
+check("miss_count=1", slot_x.miss_count, 1)
+check("hit_count=99", slot_x.hit_count, 99)
+check("expected_hc=2", slot_x.expected_hc, 2)
+check("cached_offset=0", slot_x.cached_offset, 0)
+check("cached_tag=int", slot_x.cached_tag, "int")
+
+let mut vi = 0
+let mut all_match = true
+while vi < 100 {
+    if vals[vi] != vi { all_match = false; break }
+    vi = vi + 1
+}
+check_true("all 100 values match", all_match)
+
+println("")
+
+// ─── S5: Distinct site, same hc — independent slot ──────────────────
+
+println("--- S5: Distinct site, same hc ---")
+
+let mut slot_y = ic_slot_new(101)
+let mut vi2 = 0
+while vi2 < 10 {
+    let res = ic_field_lookup(slot_y, reg3, objs[vi2], "y")
+    slot_y = res[0]
+    vi2 = vi2 + 1
+}
+check("slot_y state=MONO", slot_y.state, ic_state_mono())
+check("slot_y miss=1", slot_y.miss_count, 1)
+check("slot_y hit=9", slot_y.hit_count, 9)
+check("slot_y cached_offset=1", slot_y.cached_offset, 1)
+check("slot_x hit unchanged=99", slot_x.hit_count, 99)
+
+println("")
+
+// ─── S6: MONO-miss degrade (scaffold behavior) ──────────────────────
+
+println("--- S6: MONO-miss degrade path ---")
+
+let step4 = hc_add_field(reg3, 0, "q", "int")
+let reg4 = step4[0]
+let hc_q = step4[1]
+check("hc_q=4", hc_q, 4)
+
+let obj_q = ic_obj_new(4, [999])
+let miss_res = ic_field_lookup(slot_x, reg4, obj_q, "q")
+let slot_after_miss = miss_res[0]
+let val_after_miss = miss_res[1]
+
+check("miss bumps miss_count=2", slot_after_miss.miss_count, 2)
+check("state stays MONO", slot_after_miss.state, ic_state_mono())
+check("expected_hc stays 2", slot_after_miss.expected_hc, 2)
+check("generic lookup returned 999", val_after_miss, 999)
+
+println("")
+
+// ─── S7: ic_site_lookup (table-driven convenience API) ──────────────
+
+println("--- S7: ICTable site-driven lookup ---")
+
+let tbl0 = ic_table_new()
+check("tbl0 empty", len(tbl0.site_ids), 0)
+
+let mut tbl = tbl0
+let mut ti = 0
+let mut tbl_vals = []
+while ti < 50 {
+    let r = ic_site_lookup(tbl, 7, reg4, objs[ti], "x")
+    tbl = r[0]
+    tbl_vals = tbl_vals.push(r[1])
+    ti = ti + 1
+}
+check("tbl has 1 site", len(tbl.site_ids), 1)
+check("tbl site[0]=7", tbl.site_ids[0], 7)
+let site_slot = tbl.slots[0]
+check("site slot state=MONO", site_slot.state, ic_state_mono())
+check("site slot miss=1", site_slot.miss_count, 1)
+check("site slot hit=49", site_slot.hit_count, 49)
+
+let mut tv = 0
+let mut tv_ok = true
+while tv < 50 {
+    if tbl_vals[tv] != tv { tv_ok = false; break }
+    tv = tv + 1
+}
+check_true("tbl returned values 0..49", tv_ok)
+
+let r8 = ic_site_lookup(tbl, 8, reg4, objs[3], "y")
+tbl = r8[0]
+let v8 = r8[1]
+check("tbl now has 2 sites", len(tbl.site_ids), 2)
+check("site8 first value", v8, 6)
+let slot8 = tbl.slots[1]
+check("site8 slot miss=1", slot8.miss_count, 1)
+check("site7 slot hit=49 still", tbl.slots[0].hit_count, 49)
+
+println("")
+
+// ─── S8: @specialize attr smoke ─────────────────────────────────────
+
+println("--- S8: @specialize attr smoke (hint-only, no violations) ---")
+
+@specialize fn _demo_fn(x) {
+    return x + 1
+}
+check("@specialize demo still callable", _demo_fn(9), 10)
+
+println("")
+
+// ─── Summary ────────────────────────────────────────────────────────
+
+println("=======================================================")
+let total = pass_count + fail_count
+println("  IC scaffold: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL / " + to_string(total) + " total")
+if fail_count == 0 {
+    println("  ALL IC SCAFFOLD TESTS PASSED")
+} else {
+    println("  SOME IC TESTS FAILED")
+}
+println("=======================================================")

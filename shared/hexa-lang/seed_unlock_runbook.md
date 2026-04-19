@@ -59,7 +59,7 @@ Checklist (resumable):
       ```
 - [ ] Only after the diff looks sane, run the wrapped rebuild:
       ```
-      FORCE=1 hexa scripts/rebuild_stage0.hexa
+      FORCE=1 hexa tool/rebuild_stage0.hexa
       ```
 - [ ] Verify fixpoint: `self/native/hexa_v2` new size/hash changes; re-run
       detection test — must still report 38 on `minimal.hexa`.
@@ -72,7 +72,7 @@ Use only if path (a) fails verification. Tooling already present on Mac:
 /opt/homebrew/bin/x86_64-linux-musl-gcc   # GCC 14.2.0 — confirmed 2026-04-18
 ```
 
-Pipeline (`scripts/build_hexa_v2_linux.hexa`):
+Pipeline (`tool/build_hexa_v2_linux.hexa`):
 input = `self/native/hexa_cc.c` + `self/runtime.c`;
 tools = `x86_64-linux-musl-gcc` (override via `LINUX_CC`);
 output = `build/hexa_v2_linux` (static ELF, `-O2 -static -lm`).
@@ -93,7 +93,7 @@ host (anima pod / H100):
 - [ ] `clang -O2 -I self self/native/hexa_cc.c -o self/native/hexa_v2
       -lm` (Mac-side build of the final arm64 seed)
 - [ ] Run detection test on new `self/native/hexa_v2` — must report 38.
-- [ ] `FORCE=1 hexa scripts/rebuild_stage0.hexa` to close fixpoint.
+- [ ] `FORCE=1 hexa tool/rebuild_stage0.hexa` to close fixpoint.
 
 ## Path (c) — Mac interpreter transpile
 

@@ -1,0 +1,187 @@
+// =====================================================================
+//  test_hxblas_dispatch.hexa -- HXBLAS backend dispatch verification
+//
+//  Verifies self/ml/hxblas_dispatch.hexa :: hx_dispatch_backend() +
+//  hx_sgemm() + hx_attn_softmax_causal() route correctly based on
+//  HXBLAS_BACKEND env var, on both Mac (libhxblas.dylib) and simulated
+//  CUDA backends (no GPU required — we pin the backend via a test hook).
+//
+//  Tests (all platforms, no GPU required):
+//    T1  HXBLAS_BACKEND unset  -> hx_dispatch_backend() == "dylib"
+//    T2  pinned "dylib"        -> "dylib"
+//    T3  pinned "cuda"         -> "cuda"  (simulates H100 pod decision)
+//    T4  pinned "cpu_fallback" -> "cpu_fallback"
+//    T5  cpu_fallback sgemm correctness: 2x2 identity A @ I == A
+//    T6  cpu_fallback softmax: row 0 -> [1,0,0]; row-sum invariants
+//    T7  hx_dispatch_version() == 1
+//
+//  T1 reads the real env var at process start, so to verify the "unset
+//  default -> dylib" path the test uses:
+//      HXBLAS_BACKEND="" ./hexa run self/test_hxblas_dispatch.hexa
+//  This is the Mac default invocation. To observe the cuda decision at
+//  env-var level (without going through hx_dispatch_force_for_test),
+//  run:
+//      HXBLAS_BACKEND=cuda ./hexa run self/test_hxblas_dispatch.hexa
+//  and read the "[env-driven backend]" line in the output.
+//
+//  Run:
+//    ./hexa run self/test_hxblas_dispatch.hexa
+//    HXBLAS_BACKEND=cuda ./hexa run self/test_hxblas_dispatch.hexa
+// =====================================================================
+
+use "self/ml/hxblas_dispatch"
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + label)
+    }
+}
+
+fn approx(a, b, eps) {
+    let d = a - b
+    if d < 0.0 { return (0.0 - d) < eps }
+    return d < eps
+}
+
+// ─── T1: env-driven default (reads real HXBLAS_BACKEND at process start) ──
+// This test verifies the ACTUAL env var path — not the force-pin hook.
+// When the env var is unset, default must be "dylib".
+
+fn t_env_default() {
+    hx_dispatch_reset_for_test()
+    let env = env_var("HXBLAS_BACKEND")
+    let be = hx_dispatch_backend()
+    println("[env-driven backend] HXBLAS_BACKEND='" + env + "' -> backend='" + be + "'")
+    // Accept whatever the real env var dictates; assert the mapping rule:
+    //   "" | unset | "dylib"      -> dylib
+    //   "cuda"                    -> cuda
+    //   "cpu_fallback"            -> cpu_fallback
+    let expected = ""
+    if env == "cuda" {
+        expected = "cuda"
+    } else if env == "cpu_fallback" {
+        expected = "cpu_fallback"
+    } else {
+        expected = "dylib"
+    }
+    check("T1 env-driven dispatch '" + env + "' -> " + expected, be == expected)
+}
+
+// ─── T2-T4: pinned backend (test hook, no env var needed) ─────────────
+
+fn t_pinned_dylib() {
+    hx_dispatch_force_for_test("dylib")
+    let be = hx_dispatch_backend()
+    check("T2 pinned dylib (got: " + be + ")", be == "dylib")
+}
+
+fn t_pinned_cuda() {
+    hx_dispatch_force_for_test("cuda")
+    let be = hx_dispatch_backend()
+    check("T3 pinned cuda (got: " + be + ")", be == "cuda")
+}
+
+fn t_pinned_cpu_fallback() {
+    hx_dispatch_force_for_test("cpu_fallback")
+    let be = hx_dispatch_backend()
+    check("T4 pinned cpu_fallback (got: " + be + ")", be == "cpu_fallback")
+}
+
+// ─── T5: cpu_fallback sgemm identity ────────────────────────────────
+// C = A @ I (2x2, row-major f32). Uses cpu_fallback so the test runs
+// without libhxblas on the loader path.
+
+fn t_sgemm_identity() {
+    hx_dispatch_force_for_test("cpu_fallback")
+
+    let A = alloc_raw(16)  // 2x2 f32 = 16 bytes
+    let B = alloc_raw(16)
+    let C = alloc_raw(16)
+
+    write_f32(A, 0, 1.5); write_f32(A, 4, 2.5)
+    write_f32(A, 8, 3.5); write_f32(A, 12, 4.5)
+    // B = identity
+    write_f32(B, 0, 1.0); write_f32(B, 4, 0.0)
+    write_f32(B, 8, 0.0); write_f32(B, 12, 1.0)
+    // C = 0
+    write_f32(C, 0, 0.0); write_f32(C, 4, 0.0)
+    write_f32(C, 8, 0.0); write_f32(C, 12, 0.0)
+
+    // order=101 row-major, transA=transB=111 no-trans, alpha=1, beta=0
+    hx_sgemm(101, 111, 111, 2, 2, 2, 1.0, A, 2, B, 2, 0.0, C, 2)
+
+    let ok = approx(deref_f32(C, 0),  1.5, 0.0001)
+          && approx(deref_f32(C, 4),  2.5, 0.0001)
+          && approx(deref_f32(C, 8),  3.5, 0.0001)
+          && approx(deref_f32(C, 12), 4.5, 0.0001)
+
+    check("T5 cpu_fallback sgemm A@I == A", ok)
+
+    free_raw(A, 16); free_raw(B, 16); free_raw(C, 16)
+}
+
+// ─── T6: cpu_fallback softmax causal ────────────────────────────────
+
+fn t_softmax_causal() {
+    hx_dispatch_force_for_test("cpu_fallback")
+
+    let S = 3
+    let buf = alloc_raw(S * S * 4)
+    let mut k = 0
+    while k < S * S {
+        write_f32(buf, k * 4, 0.5 + k * 0.1)
+        k = k + 1
+    }
+
+    hx_attn_softmax_causal(S, 1.0, buf)
+
+    let r0_0 = deref_f32(buf, 0)
+    let r0_1 = deref_f32(buf, 4)
+    let r0_2 = deref_f32(buf, 8)
+    let r1_0 = deref_f32(buf, 12)
+    let r1_1 = deref_f32(buf, 16)
+    let r1_2 = deref_f32(buf, 20)
+    let r2_0 = deref_f32(buf, 24)
+    let r2_1 = deref_f32(buf, 28)
+    let r2_2 = deref_f32(buf, 32)
+
+    let ok =
+        approx(r0_0, 1.0, 0.0001) && approx(r0_1, 0.0, 0.0001) && approx(r0_2, 0.0, 0.0001)
+        && approx(r1_0 + r1_1, 1.0, 0.001) && approx(r1_2, 0.0, 0.0001)
+        && approx(r2_0 + r2_1 + r2_2, 1.0, 0.001)
+
+    check("T6 cpu_fallback softmax causal row-sum invariants", ok)
+
+    free_raw(buf, S * S * 4)
+}
+
+// ─── T7: version probe ──────────────────────────────────────────────
+
+fn t_version() {
+    let v = hx_dispatch_version()
+    check("T7 hx_dispatch_version == 1 (got: " + str(v) + ")", v == 1)
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+
+fn main() {
+    println("=== hxblas_dispatch verification ===")
+    t_env_default()
+    t_pinned_dylib()
+    t_pinned_cuda()
+    t_pinned_cpu_fallback()
+    t_sgemm_identity()
+    t_softmax_causal()
+    t_version()
+    println("")
+    println("PASS=" + str(PASS) + " FAIL=" + str(FAIL))
+    if FAIL > 0 { exit(1) }
+    exit(0)
+}

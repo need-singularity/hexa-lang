@@ -1,0 +1,188 @@
+// self/test_hxmetal_matmul.hexa — ROI #160 matmul PoC stage 1
+//
+// Verifies the hxm_matmul driver added on top of the 9-fn Metal FFI
+// surface (hxmetal_stub.hexa). Stage 1 asserts:
+//   - shape contract (M*K / K*N / M*N lengths, empty on mismatch)
+//   - MSL source string is non-empty and references matmul signature
+//   - CPU reference correctness on small fixed operands (identity, 2x3*3x2, 4x4)
+//   - dispatch driver correctness on 128×128×128 vs CPU reference
+//     (max abs error < 1e-4 — tight because HXM_MATMUL_LIVE=0 today
+//     means driver == CPU ref, so this becomes a self-consistency check
+//     that MUST pass; once stage 2 flips LIVE=1, same threshold guards
+//     GPU vs CPU numerical drift)
+//   - tile dimension exposed (stage 2 sizing contract)
+//
+// Dependency on ROI #157:
+//   hxm_matmul today routes to hxm_matmul_cpu_ref when HXM_MATMUL_LIVE=0.
+//   When #157 + stage 2 land and HXM_MATMUL_LIVE is flipped to 1, this
+//   same test becomes the live GPU vs CPU correctness gate WITHOUT any
+//   assertion change — the tolerance was chosen for f32 GEMM rounding.
+//   If #157 has not yet landed at test time, the live-branch assertion
+//   block trivially passes (CPU==CPU). No skip() is needed.
+//
+// Run:
+//   hexa self/test_hxmetal_matmul.hexa
+// Expected: all checks "ok", exit 0, on any host (macOS or Linux).
+
+use self::runtime::hxmetal_stub
+use self::runtime::math_pure
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label: string, cond: bool) -> int {
+    if cond {
+        PASS = PASS + 1
+        println("ok: " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("FAIL: " + label)
+    }
+    return 0
+}
+
+// Deterministic PRNG — avoid pulling rng module, strict-safe.
+// Lehmer xorshift; state is a single int. Returns float in [0, 1).
+let mut RNG_STATE = 2463534242
+
+fn rng_next() -> int {
+    let mut x = RNG_STATE
+    x = x * 1103515245 + 12345
+    if x < 0 { x = 0 - x }
+    x = x % 2147483647
+    RNG_STATE = x
+    return x
+}
+
+fn rng_float() -> float {
+    let v = rng_next()
+    return (v * 1.0) / 2147483647.0
+}
+
+// Build a deterministic row-major m×n matrix in [0, 1).
+fn make_matrix(m: int, n: int) {
+    let mut out = []
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        out.push(rng_float())
+        i = i + 1
+    }
+    return out
+}
+
+// Max absolute elementwise diff between two flat arrays.
+fn max_abs_diff(a, b) -> float {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = abs_pure(a[i] - b[i])
+        if d > m { m = d }
+        i = i + 1
+    }
+    return m
+}
+
+fn main() -> int {
+    // ── shape contract ─────────────────────────────────────────
+    // Empty inputs: any dim <= 0 → []
+    let e0 = hxm_matmul([], [], 0, 0, 0)
+    check("hxm_matmul zero dims returns []", len(e0) == 0)
+    let e1 = hxm_matmul([], [], 1, 1, 0)
+    check("hxm_matmul k=0 returns []", len(e1) == 0)
+
+    // Mismatched A length → []
+    let bad_a = hxm_matmul([1.0], [1.0, 0.0, 0.0, 1.0], 2, 2, 2)
+    check("hxm_matmul len(A)!=m*k returns []", len(bad_a) == 0)
+    // Mismatched B length → []
+    let bad_b = hxm_matmul([1.0, 0.0, 0.0, 1.0], [1.0], 2, 2, 2)
+    check("hxm_matmul len(B)!=k*n returns []", len(bad_b) == 0)
+
+    // ── MSL source sanity ──────────────────────────────────────
+    let msl = hxm_matmul_msl_source()
+    check("msl source non-empty", len(msl) > 0)
+    // Must reference kernel name and buffer 0..5 bindings by substring.
+    check("msl contains 'kernel void matmul'", contains(msl, "kernel void matmul"))
+    check("msl contains 'buffer(0)'", contains(msl, "buffer(0)"))
+    check("msl contains 'buffer(5)'", contains(msl, "buffer(5)"))
+    check("msl contains 'thread_position_in_grid'", contains(msl, "thread_position_in_grid"))
+    check("msl contains output write 'C[gid.y*N'", contains(msl, "C[gid.y*N"))
+
+    // ── tile + live exposure ───────────────────────────────────
+    check("hxm_matmul_tile() == 16 (stage 1)", hxm_matmul_tile() == 16)
+    check("hxm_matmul_live() == 0 (stage 1 pre-157)", hxm_matmul_live() == 0)
+
+    // ── identity matmul: I * I = I (4x4) ───────────────────────
+    let ident = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    let id_out = hxm_matmul(ident, ident, 4, 4, 4)
+    check("I*I output length == 16", len(id_out) == 16)
+    check("I*I[0,0] == 1", id_out[0] == 1.0)
+    check("I*I[1,1] == 1", id_out[5] == 1.0)
+    check("I*I[2,2] == 1", id_out[10] == 1.0)
+    check("I*I[3,3] == 1", id_out[15] == 1.0)
+    check("I*I[0,1] == 0", id_out[1] == 0.0)
+    check("I*I[3,0] == 0", id_out[12] == 0.0)
+
+    // ── 2x3 * 3x2 = 2x2 by hand ────────────────────────────────
+    //   A = [[1,2,3],[4,5,6]]                row-major [1,2,3,4,5,6]
+    //   B = [[7,8],[9,10],[11,12]]           row-major [7,8,9,10,11,12]
+    //   C = [[58,64],[139,154]]
+    let a23 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let b32 = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    let c22 = hxm_matmul(a23, b32, 2, 2, 3)
+    check("2x3*3x2 length == 4", len(c22) == 4)
+    check("2x3*3x2 [0,0] == 58", c22[0] == 58.0)
+    check("2x3*3x2 [0,1] == 64", c22[1] == 64.0)
+    check("2x3*3x2 [1,0] == 139", c22[2] == 139.0)
+    check("2x3*3x2 [1,1] == 154", c22[3] == 154.0)
+
+    // ── 64x64x64 driver vs CPU reference (self-consistency) ─────
+    // In stage 1 (HXM_MATMUL_LIVE=0) the driver IS the CPU ref, so
+    // this asserts the routing is wired (no empty return, no
+    // silent-zero). Once stage 2 flips LIVE=1, the same threshold
+    // guards GPU vs CPU f32 drift (should be << 1e-4 at unit scale).
+    // 64 chosen over 128 because the stage0 interpreter's O(MNK)
+    // scalar loop is ≈30s at 128^3 and <5s at 64^3. Both exercise
+    // the exact same kernel + dispatch + read-back scaffold. Stage 2
+    // bench will scale back up to 128^3 / 1024^3 once the live path
+    // is on the GPU.
+    let M = 64
+    let N = 64
+    let K = 64
+    let big_a = make_matrix(M, K)
+    let big_b = make_matrix(K, N)
+    let out = hxm_matmul(big_a, big_b, M, N, K)
+    check("64^3 matmul length == M*N", len(out) == M * N)
+    let ref_c = hxm_matmul_cpu_ref(big_a, big_b, M, N, K)
+    let err = max_abs_diff(out, ref_c)
+    check("64^3 max-abs-err < 1e-4", err < 0.0001)
+
+    // First output element sanity: must be sum over K positives.
+    check("64^3 C[0,0] > 0 (routing wired)", out[0] > 0.0)
+    // Some deep element: ensure routing didn't truncate.
+    check("64^3 C[last] > 0 (full dispatch)", out[M * N - 1] > 0.0)
+
+    // ── dispatch signature round-trip (surface intact) ──────────
+    // Ensure matmul PoC is additive. The stub ABI version is set by
+    // ROI #147 (v1) + #157 (v2 bump: contents/dispatch3/live). The
+    // matmul PoC is additive on top and does NOT bump further — this
+    // assertion tracks #157's current value; flip to 3 only if matmul
+    // surface ever promotes to an ABI-level change.
+    let v = hxm_version()
+    check("HXMETAL_ABI_VERSION >= 1 (surface intact)", v >= 1)
+    check("HXMETAL_ABI_VERSION <= 2 (matmul additive, no bump)", v <= 2)
+
+    // ── summary ────────────────────────────────────────────────
+    println("")
+    println("hxmetal_matmul: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL))
+    if FAIL == 0 {
+        return 0
+    }
+    return 1
+}

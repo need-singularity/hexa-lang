@@ -12,7 +12,7 @@ real CUDA 11.8 + cuBLAS + bf16 Tensor Core kernels.
 ## Artefacts
 
 - `self/native/hxqwen14b.c` — 3 core + 2 lifecycle symbols, struct-args v2 ABI
-- `scripts/build_hxqwen14b_linux.hexa` — stub path (default) + `HXQWEN14B_CUDA=1` real path
+- `tool/build_hxqwen14b_linux.hexa` — stub path (default) + `HXQWEN14B_CUDA=1` real path
 - `self/ml/qwen14b.hexa` — @link wrapper matching `self/ml/hxlmhead.hexa` shape
 - `training/deploy/hxqwen14b_deploy_plan.md` — this file
 
@@ -72,10 +72,10 @@ huggingface-cli download Qwen/Qwen2.5-14B --local-dir /workspace/models/qwen2.5-
 
 ```
 # 1. push source via existing deploy script (already uploads self/native/*.c)
-hexa scripts/deploy_h100.hexa root@$POD /workspace/hexa
+hexa tool/deploy_h100.hexa root@$POD /workspace/hexa
 
 # 2. build libhxqwen14b.so on the pod (CUDA path)
-ssh root@$POD "cd /workspace/hexa && HXQWEN14B_CUDA=1 hexa scripts/build_hxqwen14b_linux.hexa"
+ssh root@$POD "cd /workspace/hexa && HXQWEN14B_CUDA=1 hexa tool/build_hxqwen14b_linux.hexa"
 
 # 3. smoke test
 ssh root@$POD "cd /workspace/hexa && \
@@ -85,7 +85,7 @@ ssh root@$POD "cd /workspace/hexa && \
 
 ## deploy_h100.hexa integration (pending)
 
-Add `hxqwen14b` to three tables in `scripts/deploy_h100.hexa`:
+Add `hxqwen14b` to three tables in `tool/deploy_h100.hexa`:
 
 1. `cpu_support` list (line ~80-93) — append `"hxqwen14b"` for the hexa wrapper
 2. `native_files` list (line ~110-118) — append `"hxqwen14b.c"` for the shim

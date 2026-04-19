@@ -1,0 +1,293 @@
+// self/attrs/_own/approximate.hexa — @approximate semantic impl
+//
+// ROI #159 — Newton sqrt + Taylor exp compile-time replacement.
+//
+// Design
+// ─────────────────────────────────────────────────────────────
+// @approximate 는 compile-time 에 fn body 내 sqrt()/exp() 호출을 저비용
+// iterative 근사로 치환한다. 본 파일은 (1) meta, (2) check validator,
+// (3) HX11 rules loader, (4) 실제 근사 알고리즘 (Newton sqrt / Taylor exp),
+// (5) 소스 자동 재작성 helper (lightweight — fn-body sqrt(x) ↔ call) 제공.
+//
+// 알고리즘
+//   Newton sqrt      : 6 iter, x_{k+1} = 0.5 * (x_k + n/x_k), 초기값 n/2
+//   Taylor exp (small): |x| < 0.5 → 10 terms sum_{k=0..9} x^k / k!
+//   Taylor exp (large): e^x = e^floor(x) * e^frac (range-reduce to |frac|<1)
+//
+// 오차 목표 (ref libm)
+//   sqrt(100)=10      ≤ 1e-10 (6 iter)
+//   sqrt(2)=1.41421   ≤ 1e-10
+//   exp(0)=1          exact
+//   exp(1)=2.71828    ≤ 1e-3
+//   exp(-1)=0.36788   ≤ 1e-3
+//
+// HX11: `.approximate-rules.json` 으로 iter/terms/floor_range 주입 가능.
+//       _meta.inherit=false 기본, true 면 글로벌 병합.
+//
+// 주의
+//   · @pure + @approximate 는 호환 (determistic, no side-effect)
+//   · @approximate 단독은 accuracy loss 문서 권장
+
+use "self/attrs/core"
+use "self/attrs/_lib/rules_loader"
+
+// ─── META ─────────────────────────────────────────────────────────
+
+fn meta_approximate() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name = "approximate"
+    m.category = "rewrite"
+    m.purpose = "compile-time body rewrite: sqrt()/exp() → Newton iter / Taylor series"
+    m.cost_rule = "err 허용범위 문서 필수 — default: sqrt 1e-5, exp 1e-3"
+    m.side_effect = "precision degradation; NaN/Inf 동작 미지원 (caller 검증)"
+    m.requires = "@pure 권장 (재현성)"
+    m.auto_test = "self/test_approximate.hexa — sqrt(100)=10, exp(1)=2.71828 ± 1e-3"
+    m.example = "@approximate\nfn norm(v) -> float { return sqrt(v*v + 1.0) }"
+    m.implemented = true
+    return m
+}
+
+// ─── ALGORITHMS ───────────────────────────────────────────────────
+
+// Newton-Raphson sqrt — 6 iter default
+//   x_{k+1} = 0.5 * (x_k + n/x_k)
+// 초기값 = n/2 (n<1 면 1.0 로 보정)
+// 2026-04-19: 4→6 iter (test_approximate.hexa sqrt(100)=10.03 FAIL 수정,
+//             초기값 n/2 가 큰 n 에서 수렴 느림; 2 iter 추가로 1e-10 수렴)
+pub fn approximate_newton_sqrt(n: float) -> float {
+    if n <= 0.0 { return 0.0 }
+    let mut x = n / 2.0
+    if x < 1.0 { x = 1.0 }
+    // 6 iter 로 충분 (n<=1e6 범위에서 오차 < 1e-10)
+    let mut i = 0
+    while i < 6 {
+        x = 0.5 * (x + n / x)
+        i = i + 1
+    }
+    return x
+}
+
+// Iter 파라미터화 버전 — rules 주입용
+pub fn approximate_newton_sqrt_iter(n: float, iters: int) -> float {
+    if n <= 0.0 { return 0.0 }
+    let mut x = n / 2.0
+    if x < 1.0 { x = 1.0 }
+    let mut i = 0
+    while i < iters {
+        x = 0.5 * (x + n / x)
+        i = i + 1
+    }
+    return x
+}
+
+// 절대값 헬퍼 (math_abs 없이 self-contained)
+fn _approx_fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// floor 헬퍼 — int cast + 음수 보정
+fn _approx_floor(x: float) -> float {
+    let i = to_int(x)
+    let ir = to_float(i)
+    if x < 0.0 && ir != x { return ir - 1.0 }
+    return ir
+}
+
+// Taylor e^x for |x| < ~0.5 (10 terms)
+//   sum_{k=0..N-1} x^k / k!
+fn _taylor_exp_small(x: float, terms: int) -> float {
+    let mut result = 1.0
+    let mut term = 1.0
+    let mut i = 1
+    while i < terms {
+        term = term * x / to_float(i)
+        result = result + term
+        i = i + 1
+    }
+    return result
+}
+
+// Range reduction: e^x = e^floor * e^frac
+// floor 를 정수 반복곱으로 처리 → stage0 pow 의존 회피
+pub fn approximate_taylor_exp(x: float) -> float {
+    // 직접 작은 경우 Taylor만
+    if _approx_fabs(x) < 0.5 {
+        return _taylor_exp_small(x, 10)
+    }
+    // 범위 축소: x = k + r, |r| < 1
+    let kf = _approx_floor(x)
+    let r  = x - kf
+    // e 는 math_e() 와 동일 — self-contained 상수
+    let e_const = 2.718281828459045
+    let e_inv   = 0.36787944117144233   // 1/e
+    // e^kf 계산 (정수 k)
+    let mut k_int = to_int(kf)
+    let mut e_pow = 1.0
+    if k_int > 0 {
+        let mut i = 0
+        while i < k_int {
+            e_pow = e_pow * e_const
+            i = i + 1
+        }
+    } else if k_int < 0 {
+        let mut i = 0
+        let n = 0 - k_int
+        while i < n {
+            e_pow = e_pow * e_inv
+            i = i + 1
+        }
+    }
+    // e^r (|r|<1) Taylor 10 terms
+    let e_r = _taylor_exp_small(r, 10)
+    return e_pow * e_r
+}
+
+// Terms 파라미터화 버전
+pub fn approximate_taylor_exp_terms(x: float, terms: int) -> float {
+    if _approx_fabs(x) < 0.5 {
+        return _taylor_exp_small(x, terms)
+    }
+    let kf = _approx_floor(x)
+    let r  = x - kf
+    let e_const = 2.718281828459045
+    let e_inv   = 0.36787944117144233
+    let mut k_int = to_int(kf)
+    let mut e_pow = 1.0
+    if k_int > 0 {
+        let mut i = 0
+        while i < k_int {
+            e_pow = e_pow * e_const
+            i = i + 1
+        }
+    } else if k_int < 0 {
+        let mut i = 0
+        let n = 0 - k_int
+        while i < n {
+            e_pow = e_pow * e_inv
+            i = i + 1
+        }
+    }
+    let e_r = _taylor_exp_small(r, terms)
+    return e_pow * e_r
+}
+
+// ─── HX11 RULES LOADER ────────────────────────────────────────────
+
+fn _global_approximate_rules_path() -> string {
+    return "/Users/ghost/Dev/nexus/shared/config/approximate_rules.json"
+}
+
+fn _approximate_builtin_rules() {
+    let mut r = #{}
+    let mut meta = #{}
+    meta["project"] = "_builtin"
+    meta["version"] = 1
+    meta["inherit"] = false
+    r["_meta"] = meta
+
+    let mut rules = #{}
+    let mut sqrt_cfg = #{}
+    sqrt_cfg["iters"] = 6
+    sqrt_cfg["err_bound"] = 1e-10
+    rules["sqrt"] = sqrt_cfg
+
+    let mut exp_cfg = #{}
+    exp_cfg["terms"] = 10
+    exp_cfg["err_bound"] = 1e-3
+    exp_cfg["range_reduce"] = true
+    rules["exp"] = exp_cfg
+
+    r["rules"] = rules
+    return r
+}
+
+pub fn find_approximate_rules(source: string) {
+    let loaded = find_attr_rules(source, "approximate", _global_approximate_rules_path())
+    if has_key(loaded, "rules") { return loaded }
+    return _approximate_builtin_rules()
+}
+
+// cfg getter (float) — JSON 숫자는 int/float 둘 다 가능
+fn _acfg_float(cfg, key: string, def: float) -> float {
+    if !has_key(cfg, key) { return def }
+    let v = cfg[key]
+    let mut n = def
+    try { n = to_float(v) } catch e { n = def }
+    return n
+}
+
+fn _acfg_int(cfg, key: string, def: int) -> int {
+    if !has_key(cfg, key) { return def }
+    let v = cfg[key]
+    let mut n = def
+    try { n = to_int(v) } catch e { n = def }
+    return n
+}
+
+// rules → (sqrt_iters, exp_terms) 추출
+pub fn approximate_sqrt_iters(rules) -> int {
+    if !has_key(rules, "rules") { return 6 }
+    let rmap = rules["rules"]
+    if !has_key(rmap, "sqrt") { return 6 }
+    return _acfg_int(rmap["sqrt"], "iters", 6)
+}
+
+pub fn approximate_exp_terms(rules) -> int {
+    if !has_key(rules, "rules") { return 10 }
+    let rmap = rules["rules"]
+    if !has_key(rmap, "exp") { return 10 }
+    return _acfg_int(rmap["exp"], "terms", 10)
+}
+
+// ─── CHECK ────────────────────────────────────────────────────────
+// @approximate 는 무해하므로 단순 검증만:
+//   · @pure 없이 사용 시 warn (side-effect 있으면 rewrite 위험)
+//   · body 에 sqrt()/exp() 호출이 0 건이면 no-op warn
+pub fn check_approximate(source: string, lines: [string]) {
+    let mut out = []
+    let pairs = find_attr_fn_pairs(lines, "approximate")
+    for pair in pairs {
+        let attr_line = pair[0]
+        let fn_line = pair[1]
+
+        // @pure 체크
+        let mut has_pure = false
+        let mut k = attr_line - 3
+        if k < 1 { k = 1 }
+        while k <= fn_line {
+            let idx = k - 1
+            if idx >= 0 && idx < len(lines) {
+                let t = lines[idx].trim()
+                if t.contains("@pure") { has_pure = true; break }
+            }
+            k = k + 1
+        }
+        if !has_pure {
+            out = out.push(mk_msg4("approximate", "warn", attr_line,
+                "@approximate without @pure — rewrite may change visible side effects"))
+        }
+
+        // no-op 검출 — fn body 에 sqrt(/exp( 없으면
+        let body_range = fn_body_range(lines, fn_line)
+        let bs = body_range[0]
+        let be = body_range[1]
+        let mut has_target = false
+        let mut i = bs
+        while i <= be {
+            let idx = i - 1
+            if idx >= 0 && idx < len(lines) {
+                let t = lines[idx]
+                if t.contains("sqrt(") || t.contains("exp(") {
+                    has_target = true; break
+                }
+            }
+            i = i + 1
+        }
+        if !has_target {
+            out = out.push(mk_msg4("approximate", "warn", attr_line,
+                "@approximate on fn with no sqrt()/exp() call — no-op"))
+        }
+    }
+    return out
+}

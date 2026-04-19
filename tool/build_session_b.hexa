@@ -1,0 +1,179 @@
+// build_session_b.hexa — unified builder for Session B native dependencies
+//
+// Builds all native FFI libraries needed for the integrated training pipeline:
+//   1. libhxblas.so/.dylib   — BLAS + bf16 NEON kernels
+//   2. libhxflash.so/.dylib  — FlashAttention (fwd + bwd)
+//   3. libhxccl.so/.dylib    — NCCL collective communication shim
+//   4. libhxcuda.so          — CUDA fused mega-kernels (Linux only, nvcc)
+//   5. libhxmetal.dylib      — Metal GPU compute (macOS only)
+//
+// Usage:
+//   hexa tool/build_session_b.hexa               # build all for current platform
+//   hexa tool/build_session_b.hexa --mac-xverify  # cross-verify Linux sources on Mac
+//   hexa tool/build_session_b.hexa --linux        # Linux-only build (H100)
+//   hexa tool/build_session_b.hexa --check        # symbol check only (no compile)
+//
+// Output:
+//   self/native/build/libhx{blas,flash,ccl,cuda,metal}.{so,dylib}
+//
+// After build:
+//   export LD_LIBRARY_PATH=self/native/build   # Linux
+//   export DYLD_LIBRARY_PATH=self/native/build # macOS
+
+fn run(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        eprintln(result[0])
+        return false
+    }
+    true
+}
+
+fn check_symbol(lib_path, sym) {
+    let result = exec_with_status("nm -gU " + lib_path + " | grep -q '" + sym + "'")
+    result[1] == 0
+}
+
+fn check_lib_symbols(lib_path, symbols, label) {
+    let mut pass = 0
+    let mut fail = 0
+    let n = len(symbols)
+    let mut i = 0
+    while i < n {
+        if check_symbol(lib_path, symbols[i]) {
+            pass = pass + 1
+        } else {
+            eprintln("  MISSING: " + symbols[i] + " in " + label)
+            fail = fail + 1
+        }
+        i = i + 1
+    }
+    println("  " + label + ": " + to_string(pass) + "/" + to_string(n) + " symbols")
+    fail == 0
+}
+
+fn main() {
+    let args = argv()
+    let hexa_dir = exec("cd \"$(dirname '" + args[1] + "')/../\" && pwd").trim()
+    let src = hexa_dir + "/self/native"
+    let out = hexa_dir + "/self/native/build"
+    let mode = if len(args) > 2 { args[2] } else { "auto" }
+    let uname = exec("uname -s").trim()
+    let arch = exec("uname -m").trim()
+    let is_mac = uname == "Darwin"
+    let is_linux = uname == "Linux"
+    let is_arm64 = arch == "aarch64" || arch == "arm64"
+
+    exec("mkdir -p " + out)
+
+    println("═══ Session B Unified Build ═══")
+    println("platform=" + uname + " arch=" + arch + " mode=" + mode)
+    println("")
+
+    let mut total_pass = 0
+    let mut total_fail = 0
+
+    // ── 1. hxblas ────────────────────────────────────────────────────
+    println("[1/5] libhxblas")
+    if mode != "--check" {
+        if is_linux {
+            let arm_flag = if is_arm64 { " -march=armv8.2-a+bf16" } else { " -march=native" }
+            let ok = run("gcc -O3 -fPIC -shared -fopenmp" + arm_flag + " " + src + "/hxblas_linux.c -o " + out + "/libhxblas.so -lopenblas -lgomp -lm")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        } else if is_mac {
+            let ok = run("clang -O3 -fPIC -dynamiclib -arch arm64 " + src + "/hxblas_linux.c -o " + out + "/libhxblas.dylib -lm")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        }
+    }
+    let blas_lib = if is_linux { out + "/libhxblas.so" } else { out + "/libhxblas.dylib" }
+    let blas_syms = ["_hxblas_version", "_hxblas_matmul_scalar", "_hxblas_bgemm", "_hxblas_bgemv", "_hxblas_f32_to_bf16", "_hxblas_bf16_to_f32", "_hxblas_bf16_version"]
+    check_lib_symbols(blas_lib, blas_syms, "hxblas")
+
+    // ── 2. hxflash ───────────────────────────────────────────────────
+    println("[2/5] libhxflash")
+    if mode != "--check" {
+        if is_linux {
+            let ok = run("gcc -O3 -fPIC -shared -march=native " + src + "/hxflash_linux.c -o " + out + "/libhxflash.so -lm")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        } else if is_mac {
+            // hxflash_linux.c gates all functions behind #ifdef __linux__ — pass -D__linux__=1 for Mac build
+            let ok = run("clang -O3 -fPIC -dynamiclib -D__linux__=1 " + src + "/hxflash_linux.c -o " + out + "/libhxflash.dylib -lm")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        }
+    }
+    let flash_lib = if is_linux { out + "/libhxflash.so" } else { out + "/libhxflash.dylib" }
+    let flash_syms = ["_hxflash_attn_fwd", "_hxflash_attn_fwd_packed", "_hxflash_attn_bwd_packed", "_hxflash_version"]
+    check_lib_symbols(flash_lib, flash_syms, "hxflash")
+
+    // ── 3. hxccl ────────────────────────────────────────────────────
+    println("[3/5] libhxccl")
+    if mode != "--check" {
+        if is_linux {
+            let ok = run("gcc -O3 -fPIC -shared " + src + "/hxccl_linux.c -o " + out + "/libhxccl.so")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        } else if is_mac {
+            let ok = run("clang -O3 -fPIC -dynamiclib " + src + "/hxccl_linux.c -o " + out + "/libhxccl_stub.dylib")
+            if ok {
+                exec("ln -sf libhxccl_stub.dylib " + out + "/libhxccl.dylib")
+                total_pass = total_pass + 1
+            } else { total_fail = total_fail + 1 }
+        }
+    }
+    let ccl_lib = if is_linux { out + "/libhxccl.so" } else { out + "/libhxccl_stub.dylib" }
+    let ccl_syms = ["_hxccl_init", "_hxccl_world_size", "_hxccl_rank", "_hxccl_all_gather", "_hxccl_reduce_scatter", "_hxccl_barrier", "_hxccl_version", "_hxccl_init_handle", "_hxccl_allreduce_float", "_hxccl_broadcast_float", "_hxccl_finalize"]
+    check_lib_symbols(ccl_lib, ccl_syms, "hxccl")
+
+    // ── 4. hxcuda (Linux only — requires nvcc + CUDA toolkit) ─────────
+    if is_linux {
+        println("[4/5] libhxcuda (CUDA fused mega-kernels)")
+        if mode != "--check" {
+            let nvcc_check = exec_with_status("which nvcc")
+            if nvcc_check[1] == 0 {
+                // Detect arch: default sm_90 (H100), fallback sm_80 (A100)
+                let arch_flag = "-arch=sm_90"
+                let cu_files = src + "/hxcuda_fused.cu " + src + "/hxcuda_stft.cu " + src + "/hxcuda_conv1d.cu"
+                let ok = run("nvcc -O3 -shared -Xcompiler -fPIC " + arch_flag + " " + cu_files + " -o " + out + "/libhxcuda.so -lcublas -lcudart")
+                if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+            } else {
+                println("  SKIP: nvcc not found — install CUDA toolkit for libhxcuda.so")
+            }
+        }
+        let cuda_lib = out + "/libhxcuda.so"
+        let cuda_syms = ["_hxcuda_version", "_hxcuda_matmul_bf16", "_hxcuda_fused_lmhead_fwd", "_hxcuda_sync"]
+        if file_exists(cuda_lib) {
+            check_lib_symbols(cuda_lib, cuda_syms, "hxcuda")
+        } else {
+            println("  hxcuda: not built (nvcc required)")
+        }
+    } else {
+        println("[4/5] libhxcuda SKIP (Linux only — requires CUDA)")
+    }
+
+    // ── 5. hxmetal (macOS only) ──────────────────────────────────────
+    if is_mac {
+        println("[5/5] libhxmetal (macOS Metal)")
+        if mode != "--check" {
+            let ok = run("clang -O3 -fPIC -dynamiclib -fobjc-arc -framework Metal -framework MetalPerformanceShaders -framework Foundation " + src + "/hxmetal_macos.m -o " + out + "/libhxmetal.dylib")
+            if ok { total_pass = total_pass + 1 } else { total_fail = total_fail + 1 }
+        }
+        let metal_syms = ["_hxmetal_init", "_hxmetal_version", "_hxmetal_matmul", "_hxmetal_ffn_fwd", "_hxmetal_sync", "_hxmetal_buf_create", "_hxmetal_buf_write", "_hxmetal_buf_read", "_hxmetal_buf_free"]
+        check_lib_symbols(out + "/libhxmetal.dylib", metal_syms, "hxmetal")
+    } else {
+        println("[5/5] libhxmetal SKIP (macOS only)")
+    }
+
+    // ── Summary ──────────────────────────────────────────────────────
+    println("")
+    println("═══ Build Summary ═══")
+    println("libs: " + to_string(total_pass) + " built, " + to_string(total_fail) + " failed")
+    println("")
+    if is_linux {
+        println("set: export LD_LIBRARY_PATH=" + out)
+    } else {
+        println("set: export DYLD_LIBRARY_PATH=" + out)
+    }
+
+    if total_fail > 0 { exit(1) }
+}
+

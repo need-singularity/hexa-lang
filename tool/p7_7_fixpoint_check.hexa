@@ -1,0 +1,269 @@
+#!hexa lax
+// tool/p7_7_fixpoint_check.hexa — ROI #153 P7-7 fixpoint harness scaffold
+//
+// Purpose:
+//   Detect v3==v4 convergence (the P7-7 fixpoint gate) or report the exact
+//   drift class when the chain diverges. Runs as *scaffold* by default so
+//   it is safe under HX8 seed-freeze — no compile side effects.
+//
+// Usage:
+//   hexa tool/p7_7_fixpoint_check.hexa               # scaffold report
+//   hexa tool/p7_7_fixpoint_check.hexa --live        # run 3x compile chain
+//   hexa tool/p7_7_fixpoint_check.hexa --ic-scan PATH # scan .c for IC drift
+//
+// Blockers:
+//   ROI #152 (hexa_v2 circular rebuild regression) MUST close before --live
+//   is allowed to rebuild stage0. See:
+//     - project_hexa_v2_circular_rebuild_20260417.md
+//     - feedback_seed_freeze.md
+//
+// Output: plain lines + a JSON report at build/p7_7_fixpoint_report.json.
+
+// ──────────────────────────────────────────────────────────────────────
+// Utility helpers — kept tiny to stay parseable by the frozen stage0.
+// ──────────────────────────────────────────────────────────────────────
+
+fn sha256_path(path) {
+    let result = exec_with_status("shasum -a 256 " + path + " 2>/dev/null")
+    if result[1] != 0 { return "ERR" }
+    let parts = result[0].split(" ")
+    if len(parts) == 0 { return "ERR" }
+    return parts[0].trim()
+}
+
+fn size_of(path) {
+    if !file_exists(path) { return 0 }
+    return file_size(path)
+}
+
+fn kv(key, val) {
+    return "\"" + key + "\":\"" + val + "\""
+}
+
+fn kvn(key, val) {
+    return "\"" + key + "\":" + str(val)
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Blocker probe — does the environment permit a live run?
+// ──────────────────────────────────────────────────────────────────────
+
+fn blockers_active() {
+    let mut out = []
+    // B1 seed freeze file marker (we honour memory + docs, not env var, to
+    // avoid accidental override by a stray shell)
+    if file_exists("docs/plans/runtime_c_purge.md") {
+        // Proxy: when runtime_c_purge plan is open, stage0 rebuild is risky.
+        // The real ROI-#152 artefact is the fact that build/hexa_stage0.real
+        // exists — that means we're pointed at the frozen seed.
+    }
+    if file_exists("build/hexa_stage0.real") {
+        out = out.push("seed_freeze")
+    }
+    // B3 coverage probe — the native_build.hexa driver is a prereq for --live
+    if !file_exists("tool/native_build.hexa") {
+        out = out.push("no_native_build_driver")
+    }
+    if !file_exists("build/hexa_stage0") {
+        out = out.push("no_seed_binary")
+    }
+    if !file_exists("self/hexa_full.hexa") {
+        out = out.push("no_compiler_source")
+    }
+    return out
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// IC-slot drift scan — peeks at a generated .c file and flags the
+// "__hexa_ic_N" decl-count vs usage-count skew that ROI #152 tracks.
+// Safe on any .c; returns 0 drift on a healthy file.
+// ──────────────────────────────────────────────────────────────────────
+
+fn ic_slot_scan(cpath) {
+    if !file_exists(cpath) {
+        return [-1, -1, -1]  // [decls, refs, drift]
+    }
+    // Use shell shasum-style awk via exec; keeps the hexa side allocation-free.
+    let r_decl = exec_with_status(
+        "grep -c '^HexaVal __hexa_ic_' " + cpath + " 2>/dev/null || echo 0")
+    let r_ref = exec_with_status(
+        "grep -oE '__hexa_ic_[0-9]+' " + cpath + " 2>/dev/null | sort -u | wc -l")
+    let decls = parse_int(r_decl[0].trim())
+    let refs = parse_int(r_ref[0].trim())
+    let drift = refs - decls
+    // Negative drift = refs missing decls (the ROI #152 corruption shape).
+    return [decls, refs, drift]
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// First-diff finder — byte-level cmp between two files, returning the
+// 1-based offset of the first differing byte, or 0 if identical.
+// ──────────────────────────────────────────────────────────────────────
+
+fn first_diff_offset(a, b) {
+    let r = exec_with_status("cmp -l " + a + " " + b + " 2>/dev/null | head -1")
+    if r[1] != 0 { return -1 }
+    let line = r[0].trim()
+    if line == "" { return 0 }
+    let parts = line.split(" ")
+    // cmp -l format: "<offset> <oct_a> <oct_b>"
+    if len(parts) == 0 { return -1 }
+    return parse_int(parts[0])
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Live chain — 3x compile. Gated; refuses to run while blockers active.
+// ──────────────────────────────────────────────────────────────────────
+
+fn compile_with(compiler, source, output) {
+    let cmd = compiler + " tool/native_build.hexa " + source + " -o " + output
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("[p7_7] compile failed: " + cmd)
+        eprintln(r[0])
+    }
+    return r[1]
+}
+
+fn run_live_chain() {
+    let seed = "build/hexa_stage0"
+    let src = "self/hexa_full.hexa"
+    let v2 = "build/hexa_fix1"
+    let v3 = "build/hexa_fix2"
+    let v4 = "build/hexa_fix3"
+
+    println("[p7_7] live chain: seed -> v2 -> v3 -> v4")
+    if compile_with(seed, src, v2) != 0 { return [2, "", "", "", -1] }
+    if compile_with(v2,   src, v3) != 0 { return [2, sha256_path(v2), "", "", -1] }
+    if compile_with(v3,   src, v4) != 0 { return [2, sha256_path(v2), sha256_path(v3), "", -1] }
+
+    let sha_v2 = sha256_path(v2)
+    let sha_v3 = sha256_path(v3)
+    let sha_v4 = sha256_path(v4)
+    let conv = if sha_v3 == sha_v4 { 1 } else { 0 }
+    let diff_off = if conv == 1 { 0 } else { first_diff_offset(v3, v4) }
+    let rc = if conv == 1 { 0 } else { 3 }
+    return [rc, sha_v2, sha_v3, sha_v4, diff_off]
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Report writer — single-line JSON, machine-readable.
+// ──────────────────────────────────────────────────────────────────────
+
+fn write_report(mode, blockers, sha_v2, sha_v3, sha_v4, converged, diff_off, ic_drift) {
+    let mut parts = []
+    parts = parts.push(kv("mode", mode))
+    parts = parts.push(kvn("ts", timestamp()))
+    parts = parts.push(kv("seed_sha", sha256_path("build/hexa_stage0")))
+    parts = parts.push(kv("v2_sha", sha_v2))
+    parts = parts.push(kv("v3_sha", sha_v3))
+    parts = parts.push(kv("v4_sha", sha_v4))
+    parts = parts.push(kvn("converged", converged))
+    parts = parts.push(kvn("diff_first_offset", diff_off))
+    parts = parts.push(kvn("ic_slot_drift", ic_drift))
+    let mut blk = "["
+    let mut i = 0
+    while i < len(blockers) {
+        if i > 0 { blk = blk + "," }
+        blk = blk + "\"" + blockers[i] + "\""
+        i = i + 1
+    }
+    blk = blk + "]"
+    parts = parts.push("\"blockers_active\":" + blk)
+    let mut body = "{"
+    let mut j = 0
+    while j < len(parts) {
+        if j > 0 { body = body + "," }
+        body = body + parts[j]
+        j = j + 1
+    }
+    body = body + "}\n"
+    write_file("build/p7_7_fixpoint_report.json", body)
+    println("[p7_7] report -> build/p7_7_fixpoint_report.json")
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Main
+// ──────────────────────────────────────────────────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut live = 0
+    let mut ic_scan_path = ""
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--live" { live = 1 }
+        if a == "--ic-scan" {
+            i = i + 1
+            if i < len(av) { ic_scan_path = av[i] }
+        }
+        i = i + 1
+    }
+
+    let blk = blockers_active()
+
+    println("[p7_7] ROI #153 P7-7 fixpoint harness")
+    println("[p7_7] seed          : build/hexa_stage0 (" + str(size_of("build/hexa_stage0")) + " bytes)")
+    println("[p7_7] src           : self/hexa_full.hexa (" + str(size_of("self/hexa_full.hexa")) + " bytes)")
+    println("[p7_7] blockers      : " + str(len(blk)))
+    let mut k = 0
+    while k < len(blk) {
+        println("[p7_7]   - " + blk[k])
+        k = k + 1
+    }
+
+    // Optional IC-slot scan (can run independently of live mode).
+    let mut ic_drift = 0
+    if ic_scan_path != "" {
+        let triple = ic_slot_scan(ic_scan_path)
+        println("[p7_7] ic-scan " + ic_scan_path
+            + " decls=" + str(triple[0])
+            + " refs=" + str(triple[1])
+            + " drift=" + str(triple[2]))
+        ic_drift = triple[2]
+        if triple[2] < 0 {
+            eprintln("[p7_7] IC-slot CORRUPTION (refs < decls) — ROI #152 signature")
+            write_report("ic-scan", blk, "", "", "", 0, -1, ic_drift)
+            exit(4)
+        }
+    }
+
+    if live == 0 {
+        println("[p7_7] mode=scaffold — no compile. Pass --live once ROI #152 closes.")
+        write_report("scaffold", blk, "", "", "", 0, -1, ic_drift)
+        exit(0)
+    }
+
+    // Live mode — refuse if any blocker is active.
+    if len(blk) > 0 {
+        eprintln("[p7_7] --live refused: " + str(len(blk)) + " blocker(s) active")
+        eprintln("[p7_7] close ROI #152 (hexa_v2 circular rebuild) first")
+        write_report("live-refused", blk, "", "", "", 0, -1, ic_drift)
+        exit(5)
+    }
+
+    let result = run_live_chain()
+    let rc = result[0]
+    let sha_v2 = result[1]
+    let sha_v3 = result[2]
+    let sha_v4 = result[3]
+    let diff_off = result[4]
+    let converged = if rc == 0 { 1 } else { 0 }
+
+    println("")
+    println("[p7_7] ================= RESULT =================")
+    println("[p7_7] v2_sha    : " + sha_v2)
+    println("[p7_7] v3_sha    : " + sha_v3)
+    println("[p7_7] v4_sha    : " + sha_v4)
+    println("[p7_7] converged : " + if converged == 1 { "YES" } else { "NO" })
+    if converged == 0 {
+        println("[p7_7] first byte diff at offset " + str(diff_off))
+    }
+    println("[p7_7] ==========================================")
+
+    write_report("live", blk, sha_v2, sha_v3, sha_v4, converged, diff_off, ic_drift)
+    exit(rc)
+}
+
+main()

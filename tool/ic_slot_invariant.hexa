@@ -1,0 +1,196 @@
+// tool/ic_slot_invariant.hexa
+//
+// IC-slot 대수적 fixpoint 불변량 가드레일.
+//
+// Blocker #5 (hexa_v2 circular rebuild IC-slot collapse, 2026-04-17) 류 재발
+// 방지. nexus smash + free 양측 탐색 수렴 결론을 정적 lint 로 실체화:
+//
+//   IC-slot 체계는 monoid fixpoint 다 — 단순 codegen 버그가 아니라
+//   (counter 증가 사이트 수) = (emit `__hexa_ic_N` reference 수) 이
+//   invariant 로 유지되어야 한다.
+//
+// 검증 규칙 (self/codegen_c2.hexa 대상):
+//   R1 monotone           `_ic_counter = _ic_counter + 1` 증가 사이트 수 ==
+//                         소스코드 내 "__hexa_ic_" literal reference 수 와
+//                         의미론적으로 대응한다.
+//                         (기대: 증가 1 ∧ 참조 3 — emit decl-loop 2개 +
+//                          field-access emit 1개. fixpoint signature.)
+//   R2 deterministic loop emit `_ic_counter` 로 유도되는 emit 루프는 반드시
+//                         `while _ic_i < _ic_counter` 꼴의 counter-bounded
+//                         deterministic loop 여야 한다. 중간 accumulator
+//                         (`_ic_def_parts` 등 module-array push) 금지 —
+//                         T33-class freelist aliasing 재발 방지.
+//   R3 decl-ref balance   `__hexa_ic_` reference 중 최소 2개는 decl emit
+//                         ("static HexaIC __hexa_ic_") 루프 안에 있고,
+//                         최소 1개는 site emit ("&" 로 주소를 취하는 곳) 에
+//                         있어야 한다.
+//
+// Usage:  hexa tool/ic_slot_invariant.hexa
+// Exit :  0 clean, 1 violations.
+
+// Target defaults to self/codegen_c2.hexa; override via first real arg.
+// Note: stage0 args() emits argv[0] twice (pitfall P16); user args start at 2.
+fn resolve_target() {
+    let av = args()
+    if len(av) > 2 { return av[2] }
+    return "self/codegen_c2.hexa"
+}
+
+fn starts_with(s, p) { return s.starts_with(p) }
+
+fn contains(s, p) { return s.index_of(p) >= 0 }
+
+fn ch_at(s, i) { return s.substring(i, i + 1) }
+
+fn strip(s) {
+    let mut i = 0
+    while i < len(s) {
+        let c = ch_at(s, i)
+        if c != " " && c != "\t" { break }
+        i = i + 1
+    }
+    let mut j = len(s) - 1
+    while j >= i {
+        let c = ch_at(s, j)
+        if c != " " && c != "\t" && c != "\r" && c != "\n" { break }
+        j = j - 1
+    }
+    if j < i { return "" }
+    return s.substring(i, j + 1)
+}
+
+// Count all occurrences of `needle` in a single line via index_of walk.
+fn count_in_line(s, needle) {
+    if len(needle) == 0 { return 0 }
+    let mut n = 0
+    let mut rest = s
+    while true {
+        let at = rest.index_of(needle)
+        if at < 0 { break }
+        n = n + 1
+        rest = rest.substring(at + len(needle), len(rest))
+    }
+    return n
+}
+
+fn main() {
+    let TARGET = resolve_target()
+    let src = read_file(TARGET)
+    if src == "" {
+        println("[ic-lint] FAIL read: " + TARGET)
+        exit(1)
+    }
+    let lines = src.split("\n")
+    let mut fail = 0
+
+    // Scan line by line.
+    let mut inc_sites = []        // [line_no] — counter++ sites
+    let mut decl_loop_sites = []  // [line_no] — emit "static HexaIC __hexa_ic_"
+    let mut site_refs = []        // [line_no] — `&__hexa_ic_` field-access emits
+    let mut accumulator_hits = [] // forbidden module-array push for ic
+
+    let mut idx = 0
+    while idx < len(lines) {
+        let raw = lines[idx]
+        let s = strip(raw)
+        // R1 counter increment site
+        if contains(s, "_ic_counter = _ic_counter + 1") {
+            inc_sites = inc_sites.push(idx + 1)
+        }
+        // decl-emit line inside deterministic loop (exclude comment narration)
+        if contains(s, "static HexaIC __hexa") && contains(s, "_ic_")
+                && !starts_with(s, "//") {
+            decl_loop_sites = decl_loop_sites.push(idx + 1)
+        }
+        // site emit — taking &slot address for hexa_map_get_ic
+        if contains(s, "&\" + slot") || contains(s, "\"&__hexa") {
+            site_refs = site_refs.push(idx + 1)
+        }
+        // R2 accumulator ban — `_ic_def_parts.push(` or `_ic_def_parts =` writes
+        if contains(s, "_ic_def_parts") && !starts_with(s, "//") {
+            accumulator_hits = accumulator_hits.push(idx + 1)
+        }
+        idx = idx + 1
+    }
+
+    // R2 secondary: every decl-emit line must sit inside a `while _ic_... < _ic_counter`
+    // loop. We check that within 4 lines above each decl_loop_site there is a
+    // `while ` line referencing `_ic_counter`.
+    let mut r2_fail = 0
+    let mut li = 0
+    while li < len(decl_loop_sites) {
+        let at = decl_loop_sites[li] - 1
+        let mut found = false
+        let mut look = at - 1
+        let mut steps = 0
+        while look >= 0 && steps < 6 {
+            let probe = strip(lines[look])
+            if contains(probe, "while ") && contains(probe, "_ic_counter") {
+                found = true
+                break
+            }
+            look = look - 1
+            steps = steps + 1
+        }
+        if !found {
+            println("[ic-lint] R2 decl-emit outside deterministic _ic_counter loop: "
+                + TARGET + ":" + to_string(at + 1))
+            r2_fail = r2_fail + 1
+        }
+        li = li + 1
+    }
+
+    // R1: at least 1 increment, ≥2 decl-emit lines (two emit passes: parts +
+    // out_parts), ≥1 site-ref emit.
+    if len(inc_sites) < 1 {
+        println("[ic-lint] R1 monotone: no `_ic_counter = _ic_counter + 1` site found")
+        fail = fail + 1
+    }
+    if len(decl_loop_sites) < 2 {
+        println("[ic-lint] R1 monotone: expected ≥2 decl-emit lines (parts + out_parts), got "
+            + to_string(len(decl_loop_sites)))
+        fail = fail + 1
+    }
+    if len(site_refs) < 1 {
+        println("[ic-lint] R1 monotone: no `&__hexa_ic_` site-emit found")
+        fail = fail + 1
+    }
+
+    // R2 accumulator ban: any live `_ic_def_parts` push/assign → fail.
+    let mut ai = 0
+    while ai < len(accumulator_hits) {
+        println("[ic-lint] R2 forbidden accumulator `_ic_def_parts` at "
+            + TARGET + ":" + to_string(accumulator_hits[ai])
+            + " — use deterministic _ic_counter loop instead (T33-class guard)")
+        fail = fail + 1
+        ai = ai + 1
+    }
+
+    fail = fail + r2_fail
+
+    // R3 decl/ref balance: total `__hexa_ic_` literal references in file should
+    // equal decl-emit count + site-emit count (+ comments/doc ≈ 2). We only
+    // enforce the floor: decl-emits ≥ 2 ∧ site-emits ≥ 1 which implies ≥3
+    // distinct references.
+    let mut total_refs = 0
+    let mut tr_i = 0
+    while tr_i < len(lines) {
+        total_refs = total_refs + count_in_line(lines[tr_i], "__hexa_ic_")
+        tr_i = tr_i + 1
+    }
+    if total_refs < 3 {
+        println("[ic-lint] R3 decl/ref balance: total `__hexa_ic_` references < 3 (" +
+            to_string(total_refs) + ") — emit path broken")
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("[ic-lint] OK — inc=" + to_string(len(inc_sites))
+            + " decl-emit=" + to_string(len(decl_loop_sites))
+            + " site-emit=" + to_string(len(site_refs))
+            + " refs=" + to_string(total_refs))
+        exit(0)
+    }
+    println("[ic-lint] FAIL — " + to_string(fail) + " violation(s)")
+    exit(1)
+}
