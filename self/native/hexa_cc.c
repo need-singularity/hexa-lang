@@ -10307,17 +10307,43 @@ HexaVal gen2_expr(HexaVal node) {
         HexaVal callee = hexa_map_get_ic(node, "left", &__hexa_codegen_c2_ic_330);
         if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(callee), hexa_str("string"))))) && hexa_truthy(hexa_eq(hexa_map_get_ic(callee, "kind", &__hexa_codegen_c2_ic_331), hexa_str("Ident")))))) {
             name = hexa_map_get_ic(callee, "name", &__hexa_codegen_c2_ic_332);
+            /* FIX (2026-04-20): variadic println/print — prior codegen
+             * dropped args[1..], emitting only hexa_println(args[0]).
+             * For println("step=", n, " loss=", f) this produced "step=".
+             * Now chain hexa_print_val per arg and let the last one run
+             * through hexa_println so all args reach stdout with a single
+             * trailing newline. */
             if (hexa_truthy(hexa_eq(name, hexa_str("println")))) {
-                if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_333))), hexa_int(0)))) {
+                HexaVal _pln_args = hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_333);
+                int64_t _pln_n = hexa_len(_pln_args);
+                if (_pln_n == 0) {
+                    return __hexa_fn_arena_return(hexa_str("(printf(\"\\n\"), hexa_void())"));
+                }
+                if (_pln_n == 1) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_println("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_334), hexa_int(0)))), hexa_str(")")));
                 }
-                return __hexa_fn_arena_return(hexa_str("(printf(\"\\n\"), hexa_void())"));
+                HexaVal _pln_out = hexa_str("(");
+                for (int64_t _pi = 0; _pi < _pln_n - 1; _pi++) {
+                    _pln_out = hexa_add(hexa_add(hexa_add(_pln_out, hexa_str("hexa_print_val(")), gen2_expr(hexa_index_get(_pln_args, hexa_int(_pi)))), hexa_str("), "));
+                }
+                _pln_out = hexa_add(hexa_add(hexa_add(_pln_out, hexa_str("hexa_println(")), gen2_expr(hexa_index_get(_pln_args, hexa_int(_pln_n - 1)))), hexa_str("))"));
+                return __hexa_fn_arena_return(_pln_out);
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("print")))) {
-                if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_335))), hexa_int(0)))) {
+                HexaVal _prn_args = hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_335);
+                int64_t _prn_n = hexa_len(_prn_args);
+                if (_prn_n == 0) {
+                    return __hexa_fn_arena_return(hexa_str("hexa_void()"));
+                }
+                if (_prn_n == 1) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("(hexa_print_val("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_336), hexa_int(0)))), hexa_str("), hexa_void())")));
                 }
-                return __hexa_fn_arena_return(hexa_str("hexa_void()"));
+                HexaVal _prn_out = hexa_str("(");
+                for (int64_t _pri = 0; _pri < _prn_n; _pri++) {
+                    _prn_out = hexa_add(hexa_add(hexa_add(_prn_out, hexa_str("hexa_print_val(")), gen2_expr(hexa_index_get(_prn_args, hexa_int(_pri)))), hexa_str("), "));
+                }
+                _prn_out = hexa_add(_prn_out, hexa_str("hexa_void())"));
+                return __hexa_fn_arena_return(_prn_out);
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("len")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_int(hexa_len("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_337), hexa_int(0)))), hexa_str("))")));
@@ -10514,11 +10540,23 @@ HexaVal gen2_expr(HexaVal node) {
                 }
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_format_n("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_359), hexa_int(0)))), hexa_str(", ")), fmt_args), hexa_str(")")));
             }
+            /* FIX (2026-04-20): variadic eprintln — same bug as println.
+             * Chain hexa_eprint_val per arg then print trailing newline. */
             if (hexa_truthy(hexa_eq(name, hexa_str("eprintln")))) {
-                if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_360))), hexa_int(0)))) {
+                HexaVal _epl_args = hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_360);
+                int64_t _epl_n = hexa_len(_epl_args);
+                if (_epl_n == 0) {
+                    return __hexa_fn_arena_return(hexa_str("(fprintf(stderr, \"\\n\"), hexa_void())"));
+                }
+                if (_epl_n == 1) {
                     return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("(hexa_eprint_val("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_361), hexa_int(0)))), hexa_str("), fprintf(stderr, \"\\n\"), hexa_void())")));
                 }
-                return __hexa_fn_arena_return(hexa_str("(fprintf(stderr, \"\\n\"), hexa_void())"));
+                HexaVal _epl_out = hexa_str("(");
+                for (int64_t _ei = 0; _ei < _epl_n; _ei++) {
+                    _epl_out = hexa_add(hexa_add(hexa_add(_epl_out, hexa_str("hexa_eprint_val(")), gen2_expr(hexa_index_get(_epl_args, hexa_int(_ei)))), hexa_str("), "));
+                }
+                _epl_out = hexa_add(_epl_out, hexa_str("fprintf(stderr, \"\\n\"), hexa_void())"));
+                return __hexa_fn_arena_return(_epl_out);
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("args")))) {
                 return __hexa_fn_arena_return(hexa_str("hexa_args()"));
