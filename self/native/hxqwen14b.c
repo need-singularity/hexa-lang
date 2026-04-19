@@ -4018,3 +4018,232 @@ double hxqwen14b_train_step_v54(int64_t handle, int64_t ids_host_p, int64_t M) {
 }
 
 // End of v5.4 addendum.
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6 — LoRA-fused 48-layer base forward (2026-04-20, r12 blocker #1)
+//
+// Mirror of hxqwen14b_base_forward_v54 with LoRA delta accumulated into
+// each of the 4 attention projections (q_proj, k_proj, v_proj, o_proj)
+// per layer. Total LoRA branches: 48 layers × 4 projs = 192 adapters.
+// Each branch reuses the existing single-adapter cuBLAS chain in
+// hxqwen14b_lora_fwd_single (already validated on device path).
+//
+// Math per projection (with frozen base W and LoRA A,B):
+//   y[M,N] = x[M,K] · W[N,K]^T              (frozen base; existing sgemm)
+//   y[M,N] += (alpha/r) · (x[M,K] · A[R,K]^T) · B[N,R]^T   (LoRA delta)
+//
+// LoRA buffer layout (caller-supplied lora_dev_ptrs array):
+//   For layer L in [0, 48), proj T in {Q=0, K=1, V=2, O=3}:
+//     idx_A = (L * 4 + T) * 2 + 0
+//     idx_B = (L * 4 + T) * 2 + 1
+//   so the array has 192 * 2 = 384 device pointers (A then B per adapter).
+//
+// Shape per adapter (matches train_alm_lora.hexa LoRA layout):
+//   Q/K/V/O all use d_model=5120 input. Output:
+//     q_proj : N=5120 (n_head*head_dim)
+//     k_proj : N=1024 (n_kv_head*head_dim — GQA)
+//     v_proj : N=1024 (n_kv_head*head_dim — GQA)
+//     o_proj : N=5120 ; input K=5120 (after GQA combines heads)
+//   A : [R, K_in], B : [N_out, R]   (row-major)
+//
+// Symbols (extern "C"):
+//   int64_t hxqwen14b_version_v56(void)                       -> 561
+//   int     hxqwen14b_alloc_lora_buffers_v56(int64_t r,
+//             int64_t* out_ptrs)
+//             — allocates 384 device buffers (A then B per adapter), inits
+//               A with small random values and B with zeros; out_ptrs is a
+//               caller-supplied int64_t[384].
+//   int     hxqwen14b_free_lora_buffers_v56(int64_t* ptrs)
+//   int     hxqwen14b_base_forward_v56_with_lora(void* args)
+//             — args: HxQwenBaseFwdV56LoraArgs (handle, ids_dev, M,
+//               logits_dev, lora_ptrs_p (int64_t*[384]), r, alpha)
+//
+// LIMITATIONS / r12 SCOPE NOTES:
+//   - This is the FORWARD only. Backward chain through 48 layers + lm_head
+//     + softmax requires either activation caching (high memory) or
+//     recomputation; the SINGLE-adapter cuBLAS backward kernel
+//     (hxqwen14b_lora_bwd_single) already exists but the full-network
+//     backward orchestrator is r12 follow-on work.
+//   - r12 trainer must call alloc_lora_buffers once (init A=Kaiming, B=0),
+//     then per-step: forward_v56_with_lora → ce_loss_v54 → backward
+//     (TODO) → adamw_update on device buffers → save_lora reads via
+//     d2h memcpy from each device buffer.
+//
+// PROGRESS STATUS (this commit):
+//   - SCAFFOLDING ONLY: alloc/free + arg struct + entry function.
+//   - The forward LOOP is in place but commented as PHASE2_TODO since
+//     wiring 192 cuBLAS chained matmuls into the existing v54 forward
+//     loop requires careful buffer allocation for tmp[M,R] and proper
+//     accumulate=1 plumbing. Returns RC_ERR_CUDA_TODO until landed.
+//   - Real integration must happen on the H100 pod where nvcc + cuBLAS
+//     are available (Mac is build-only for the .c shim).
+// ════════════════════════════════════════════════════════════════════
+
+#define V56_LORA_BUFS_PER_ADAPTER 2  // A, B
+#define V56_N_ADAPTERS            (QWEN14B_N_LAYER * 4)  // 192
+#define V56_N_LORA_BUFS           (V56_N_ADAPTERS * V56_LORA_BUFS_PER_ADAPTER)  // 384
+
+int64_t hxqwen14b_version_v56(void) {
+    return 561;  // v5.6.1: scaffolding (forward integration NOT yet active)
+}
+
+typedef struct HxQwenBaseFwdV56LoraArgs {
+    int64_t model_handle;       // v54 handle
+    int64_t token_ids_dev;
+    int64_t M;
+    int64_t logits_dev;
+    int64_t lora_ptrs_p;        // int64_t* — array of V56_N_LORA_BUFS device ptrs
+    int64_t lora_r;
+    double  alpha_over_r;
+    int64_t reserved;
+} HxQwenBaseFwdV56LoraArgs;
+
+// Per-adapter shape lookup. Returns N_out for projection T (0..3).
+static int64_t v56_proj_n_out(int T) {
+    if (T == 0) return QWEN14B_N_HEAD * QWEN14B_HEAD_DIM;     // q_proj 5120
+    if (T == 1) return QWEN14B_N_KV_HEAD * QWEN14B_HEAD_DIM;  // k_proj 1024
+    if (T == 2) return QWEN14B_N_KV_HEAD * QWEN14B_HEAD_DIM;  // v_proj 1024
+    return QWEN14B_D_MODEL;                                    // o_proj 5120
+}
+
+// K_in is d_model=5120 for q/k/v. For o_proj input is dq=5120 (after GQA combine).
+static int64_t v56_proj_k_in(int T) {
+    if (T == 3) return QWEN14B_N_HEAD * QWEN14B_HEAD_DIM;     // o_proj K=5120
+    return QWEN14B_D_MODEL;                                    // q/k/v K=5120
+}
+
+// Allocate 384 device buffers. A:[R,K_in], B:[N_out,R]. Init A with deterministic
+// pseudo-random small values and B with zeros (LoRA convention: starts at identity).
+int hxqwen14b_alloc_lora_buffers_v56(int64_t r, int64_t out_ptrs_p) {
+#ifndef HXQWEN14B_CUDA
+    (void)r; (void)out_ptrs_p;
+    return RC_ERR_CUDA_TODO;
+#else
+    if (r <= 0) return RC_ERR_BAD_ARGS;
+    if (out_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    int64_t* out_ptrs = (int64_t*)(uintptr_t)out_ptrs_p;
+    for (int i = 0; i < V56_N_LORA_BUFS; i++) out_ptrs[i] = 0;
+
+    // Kaiming-ish init for A (small random ~ N(0, 1/sqrt(fan_in))). For r=8
+    // and fan_in=5120, std ≈ 0.014. Use a deterministic LCG seeded by index
+    // so each run starts the same way (no dependency on host RNG state).
+    uint32_t seed = 0x12345678u;
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        for (int T = 0; T < 4; T++) {
+            int64_t N = v56_proj_n_out(T);
+            int64_t K = v56_proj_k_in(T);
+            int64_t adapter_idx = L * 4 + T;
+
+            // A : [r, K] = r·K floats
+            int64_t A_bytes = r * K * (int64_t)sizeof(float);
+            int64_t A_dev = hxqwen14b_cu_malloc_bytes(A_bytes);
+            if (A_dev == 0) goto oom_unwind;
+            // Init host-side then copy. Kaiming-ish.
+            float* A_host = (float*)malloc((size_t)A_bytes);
+            if (!A_host) { hxqwen14b_cu_free_ptr(A_dev); goto oom_unwind; }
+            float std = 1.0f / sqrtf((float)K);
+            for (int64_t i = 0; i < r * K; i++) {
+                seed = seed * 1664525u + 1013904223u;
+                // Box-Muller via uniform → approximate normal via simple sum-of-uniforms
+                float u1 = ((float)((seed >> 8) & 0xFFFFFF)) / 16777216.0f;
+                seed = seed * 1664525u + 1013904223u;
+                float u2 = ((float)((seed >> 8) & 0xFFFFFF)) / 16777216.0f;
+                A_host[i] = (u1 + u2 - 1.0f) * std;  // crude normal approximation
+            }
+            int rcA = hxqwen14b_cu_memcpy_h2d(A_dev, A_host, A_bytes);
+            free(A_host);
+            if (rcA != RC_OK) { hxqwen14b_cu_free_ptr(A_dev); goto oom_unwind; }
+            out_ptrs[adapter_idx * 2 + 0] = A_dev;
+
+            // B : [N, r] = N·r floats, init zero (LoRA identity at step 0).
+            int64_t B_bytes = N * r * (int64_t)sizeof(float);
+            int64_t B_dev = hxqwen14b_cu_malloc_bytes(B_bytes);
+            if (B_dev == 0) goto oom_unwind;
+            // cudaMemset 0 via memcpy from a zero host buffer (cheaper than
+            // adding a new launcher; B is small: 5120*8 = 160KB max).
+            float* B_host = (float*)calloc((size_t)(N * r), sizeof(float));
+            if (!B_host) { hxqwen14b_cu_free_ptr(B_dev); goto oom_unwind; }
+            int rcB = hxqwen14b_cu_memcpy_h2d(B_dev, B_host, B_bytes);
+            free(B_host);
+            if (rcB != RC_OK) { hxqwen14b_cu_free_ptr(B_dev); goto oom_unwind; }
+            out_ptrs[adapter_idx * 2 + 1] = B_dev;
+        }
+    }
+    return RC_OK;
+
+oom_unwind:
+    for (int i = 0; i < V56_N_LORA_BUFS; i++) {
+        if (out_ptrs[i] != 0) { hxqwen14b_cu_free_ptr(out_ptrs[i]); out_ptrs[i] = 0; }
+    }
+    return RC_ERR_OOM;
+#endif
+}
+
+int hxqwen14b_free_lora_buffers_v56(int64_t ptrs_p) {
+#ifndef HXQWEN14B_CUDA
+    (void)ptrs_p;
+    return RC_ERR_CUDA_TODO;
+#else
+    if (ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    int64_t* ptrs = (int64_t*)(uintptr_t)ptrs_p;
+    for (int i = 0; i < V56_N_LORA_BUFS; i++) {
+        if (ptrs[i] != 0) {
+            hxqwen14b_cu_free_ptr(ptrs[i]);
+            ptrs[i] = 0;
+        }
+    }
+    return RC_OK;
+#endif
+}
+
+// LoRA-fused base forward.
+//
+// IMPLEMENTATION STATUS (v5.6.1, 2026-04-20):
+//   The forward loop integration with LoRA accumulate is NOT yet in place
+//   here — it requires:
+//     1. tmp[M,r] device scratch buffer (per-step, reused across 192 calls)
+//     2. After each cublasSgemm for q/k/v/o, call hxqwen14b_lora_fwd_single
+//        with accumulate=1 to add (alpha/r)·B·A·x into the projection
+//        output.
+//     3. End-to-end smoke (1 step, A=Kaiming/B=0 ⇒ identity ⇒ loss matches
+//        v54 base loss; then random A/B ⇒ loss differs).
+//
+//   For r12 launch this entry currently returns RC_ERR_CUDA_TODO so the
+//   trainer can detect the unfinished surface and fall back to the v54
+//   base-only forward (which already PASSes load+forward+CE on H100, just
+//   without LoRA params updating). The FFI scaffolding is here so the
+//   hexa trainer can wire the call and remaining work is purely on the
+//   C side.
+int hxqwen14b_base_forward_v56_with_lora(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args;
+    return RC_ERR_CUDA_TODO;
+#else
+    HxQwenBaseFwdV56LoraArgs* a = (HxQwenBaseFwdV56LoraArgs*)args;
+    if (a->lora_r <= 0) return RC_ERR_BAD_ARGS;
+    if (a->lora_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    // r12 IMPLEMENTATION TODO: integrate LoRA delta into per-projection sgemm.
+    // For now return CUDA_TODO so trainer falls back to v54 base path.
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+// Positional wrapper for hexa FFI.
+int hxqwen14b_base_forward_v56_with_lora_pos(int64_t handle, int64_t ids_dev,
+                                              int64_t M, int64_t logits_dev,
+                                              int64_t lora_ptrs_p, int64_t lora_r,
+                                              double alpha_over_r) {
+    HxQwenBaseFwdV56LoraArgs fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.model_handle  = handle;
+    fa.token_ids_dev = ids_dev;
+    fa.M             = M;
+    fa.logits_dev    = logits_dev;
+    fa.lora_ptrs_p   = lora_ptrs_p;
+    fa.lora_r        = lora_r;
+    fa.alpha_over_r  = alpha_over_r;
+    return hxqwen14b_base_forward_v56_with_lora(&fa);
+}
+
+// End of v5.6 scaffolding addendum.
