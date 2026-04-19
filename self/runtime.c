@@ -198,6 +198,7 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
 // rt 32-B: scratch-buffer primitives for reusable args vector (NK_CALL path).
 HexaVal hexa_array_push_nostat(HexaVal arr, HexaVal item);
 HexaVal hexa_val_snapshot_array(HexaVal v);  // rt#32-N forward decl
+HexaVal hexa_array_shallow_clone(HexaVal v); // ROI #148 forward decl
 HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end);
 HexaVal __hexa_range_array(HexaVal start, HexaVal end, int inclusive);
 HexaVal hexa_matvec(HexaVal w, HexaVal x, HexaVal rows_v, HexaVal cols_v);
@@ -859,6 +860,45 @@ HexaVal hexa_array_new() {
     return v;
 }
 
+// ROI #148: shallow-clone a TAG_ARRAY. Gives the caller a fresh HexaArr
+// descriptor (own len/cap) and a fresh items buffer of the same logical
+// contents. Inner HexaVals (ints/strs/nested arrays) are copied as-is —
+// nested arrays remain aliased, matching standard "one level ownership"
+// semantics. Non-array inputs are returned unchanged.
+//
+// Used by hexa_struct_pack_map to break caller→struct-field aliasing on
+// struct construction: `Box { items: xs }` stores xs's contents into a
+// NEW descriptor so that subsequent hexa_array_push on one struct's
+// .items cannot leak into a sibling struct initialized from the same xs.
+HexaVal hexa_array_shallow_clone(HexaVal v) {
+    if (!HX_IS_ARRAY(v)) return v;
+    int n = HX_ARR_LEN(v);
+    int src_cap = HX_ARR_CAP(v);
+    int real_cap = src_cap < 0 ? -src_cap : src_cap;
+    HexaVal out = {.tag=TAG_ARRAY};
+    HexaArr* d = (HexaArr*)calloc(1, sizeof(HexaArr));
+    if (!d) { fprintf(stderr, "OOM in array_shallow_clone\n"); exit(1); }
+    HX_SET_ARR_PTR(out, d);
+    if (n == 0 && real_cap == 0) {
+        // Empty: leave items NULL, cap 0. Push from here behaves like fresh.
+        return out;
+    }
+    // Always allocate a heap buffer (positive cap) sized to hold the
+    // current contents. Avoid the arena-sentinel so downstream push/grow
+    // can realloc freely without aliasing the source arena slab.
+    int new_cap = real_cap > 0 ? real_cap : (n > 0 ? n : 8);
+    if (new_cap < n) new_cap = n;
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)new_cap);
+    if (!items) { fprintf(stderr, "OOM in array_shallow_clone items\n"); exit(1); }
+    if (n > 0 && HX_ARR_ITEMS(v)) {
+        memcpy(items, HX_ARR_ITEMS(v), sizeof(HexaVal) * (size_t)n);
+    }
+    HX_SET_ARR_ITEMS(out, items);
+    HX_SET_ARR_LEN(out, n);
+    HX_SET_ARR_CAP(out, new_cap);
+    return out;
+}
+
 // rt#32-N: snapshot-promote helper. Invoked by the transpiler around every
 // `let y = x` and fn-argument expression where x may be a TAG_ARRAY whose items
 // buffer is arena-allocated (cap < 0). Deep-copies arena items to malloc so
@@ -1305,9 +1345,20 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
         }
         t->slots[idx].hash = h;
         t->slots[idx].order_idx = t->len;  // ROI-24
-        t->vals[idx] = vals[i];
+        // ROI #148: break caller→struct-field array aliasing. A struct
+        // literal's array fields must own a private backing buffer so
+        // that `.push` mutations on one instance cannot leak into a
+        // sibling struct built from the same source array.
+        // Type-named struct literals only — anonymous map literals
+        // (type_name=="") preserve raw-store semantics (map of scalars,
+        // no ownership contract).
+        HexaVal stored = vals[i];
+        if (type_name && type_name[0] && HX_IS_ARRAY(stored)) {
+            stored = hexa_array_shallow_clone(stored);
+        }
+        t->vals[idx] = stored;
         t->order_keys[t->len] = t->slots[idx].key;
-        t->order_vals[t->len] = vals[i];
+        t->order_vals[t->len] = stored;
         t->len++;
     }
     HX_SET_MAP_LEN(v, t->len);

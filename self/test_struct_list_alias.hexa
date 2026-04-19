@@ -1,0 +1,219 @@
+// ═══════════════════════════════════════════════════════════
+//  test_struct_list_alias.hexa — ROI #148 repro + regression
+//  Minimal reproducer for "struct list field aliasing" bug that
+//  blocks running the blowup engine on native hexa (M4 edge path).
+//
+//  Setup: two Box instances each with its own [int] list.
+//  Expectation: mutating a.items via .push() must NOT leak into
+//  b.items. Each struct instance owns its own list.
+//
+//  Bug pattern (case H): two struct instances constructed from the
+//  same source array share its items buffer. hexa_array_push mutates
+//  the buffer in place — so writes to one instance's list leak into
+//  the sibling's backing storage. Fix: hexa_struct_pack_map now
+//  shallow-clones any TAG_ARRAY field value at construction time.
+//
+//  Native path: FIXED via self/runtime.c (hexa_array_shallow_clone +
+//  hook in hexa_struct_pack_map).
+//
+//  Interpreter path: bug present (see Val-level field sharing in
+//  self/hexa_full.hexa:7181 val_struct). Fix deferred — requires
+//  stage0 rebuild (HX8 blocks). Tracked as follow-up for ROI #148b.
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " — expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  ROI #148: struct list field aliasing")
+println("═══════════════════════════════════════════════════════")
+
+struct Box { items: array }
+
+// ── A. Distinct-literal construction ──────────────────────
+// Each literal [1,2] / [3,4] creates a fresh array via hexa_array_new.
+// After mutation, siblings must be unaffected.
+
+let mut a = Box { items: [1, 2] }
+let mut b = Box { items: [3, 4] }
+
+// Sanity: initial state
+check("A.0 a.items len initial", len(a.items), 2)
+check("A.1 b.items len initial", len(b.items), 2)
+check("A.2 a.items[0]", a.items[0], 1)
+check("A.3 b.items[0]", b.items[0], 3)
+
+// Mutate a via field reassign pattern (P29: .push returns new array)
+a = Box { items: a.items.push(99) }
+
+check("A.4 a.items len after push", len(a.items), 3)
+check("A.5 a.items last pushed", a.items[2], 99)
+check("A.6 b.items len unchanged", len(b.items), 2)    // ← ALIAS CANARY
+check("A.7 b.items[0] unchanged", b.items[0], 3)
+check("A.8 b.items[1] unchanged", b.items[1], 4)
+
+// ── B. Shared literal via variable (SSA-copy) ─────────────
+// let shared = [10, 20]
+// let c = Box { items: shared }; let d = Box { items: shared }
+// After c.items.push, does d see it? This tests pass-by-value semantics.
+
+let shared = [10, 20]
+let mut c = Box { items: shared }
+let mut d = Box { items: shared }
+
+check("B.0 c.items[0]", c.items[0], 10)
+check("B.1 d.items[0]", d.items[0], 10)
+
+c = Box { items: c.items.push(77) }
+
+check("B.2 c.items len after push", len(c.items), 3)
+check("B.3 d.items len unchanged", len(d.items), 2)    // ← ALIAS CANARY (pass-by-value)
+check("B.4 shared len unchanged", len(shared), 2)      // ← ALIAS CANARY (original)
+
+// ── C. Array-of-structs sibling isolation ─────────────────
+
+let mut boxes = []
+boxes = boxes.push(Box { items: [1] })
+boxes = boxes.push(Box { items: [2] })
+boxes = boxes.push(Box { items: [3] })
+
+check("C.0 boxes[0].items[0]", boxes[0].items[0], 1)
+check("C.1 boxes[1].items[0]", boxes[1].items[0], 2)
+check("C.2 boxes[2].items[0]", boxes[2].items[0], 3)
+
+// Rebuild boxes[1] with an extended items list.
+let mut new_items = boxes[1].items.push(22)
+boxes = [boxes[0], Box { items: new_items }, boxes[2]]
+
+check("C.3 boxes[1] extended len", len(boxes[1].items), 2)
+check("C.4 boxes[1][1] new item", boxes[1].items[1], 22)
+check("C.5 boxes[0] unchanged", len(boxes[0].items), 1)  // ← ALIAS CANARY
+check("C.6 boxes[2] unchanged", len(boxes[2].items), 1)  // ← ALIAS CANARY
+
+// ── D. In-place field assignment (.items = newval) ────────
+// This exercises the gen2_stmt Assign→Field path at codegen_c2.hexa:1680-1686
+// which emits: obj = hexa_map_set(obj, "items", val). If hexa_map_set
+// aliases the table across struct instances that share hidden provenance,
+// sibling .items would leak.
+
+let mut e = Box { items: [100, 200] }
+let mut f = Box { items: [300, 400] }
+
+e.items = e.items.push(500)
+
+check("D.0 e.items len", len(e.items), 3)
+check("D.1 e.items[2]", e.items[2], 500)
+check("D.2 f.items len unchanged", len(f.items), 2)
+check("D.3 f.items[0] unchanged", f.items[0], 300)
+
+// ── E. Struct literal with SAME nested array expression ──
+// Pathological case: `let a = Box { items: xs }; let b = Box { items: xs }`.
+// xs is one HexaVal — two struct instances' items slots should each carry
+// an independent logical view. This is where aliasing is most likely.
+
+let xs = [7, 8, 9]
+let mut g = Box { items: xs }
+let mut h = Box { items: xs }
+
+check("E.0 g.items len", len(g.items), 3)
+check("E.1 h.items len", len(h.items), 3)
+
+// Mutate g via field-assign — does h see it?
+g.items = g.items.push(77)
+
+check("E.2 g.items len after push", len(g.items), 4)
+check("E.3 h.items len unchanged", len(h.items), 3)  // ← ALIAS CANARY
+check("E.4 xs len unchanged", len(xs), 3)            // ← ALIAS CANARY
+
+// ── F. Pre-grown buffer (cap > len) → in-place push aliasing ─
+// Ensure the source array has spare capacity so hexa_array_push
+// mutates in place. Two Box instances sharing the same items pointer
+// would then see each other's data.
+
+let mut pre = []
+pre = pre.push(1)
+pre = pre.push(2)  // cap is likely 8 after first grow, len=2
+
+let mut p = Box { items: pre }
+let mut q = Box { items: pre }
+
+check("F.0 p.items len", len(p.items), 2)
+check("F.1 q.items len", len(q.items), 2)
+
+// Mutation via field-assign. Key question: does p's new push
+// reach into q because items buffer is shared at cap=8 available slot?
+p.items = p.items.push(999)
+
+check("F.2 p.items len after push", len(p.items), 3)
+check("F.3 q.items len unchanged", len(q.items), 2)  // ← ALIAS CANARY
+check("F.4 pre len unchanged", len(pre), 2)          // ← ALIAS CANARY
+
+// ── G. Method-style mutation (self.items.push) ──────────────
+// impl method returns new struct, checks sibling isolation
+// when struct-field-of-struct is an array.
+
+struct Wrapper { inner: any }
+
+let init_arr = [50, 51]
+let mut wr1 = Wrapper { inner: Box { items: init_arr } }
+let mut wr2 = Wrapper { inner: Box { items: init_arr } }
+
+check("G.0 wr1.inner.items len", len(wr1.inner.items), 2)
+check("G.1 wr2.inner.items len", len(wr2.inner.items), 2)
+
+wr1 = Wrapper { inner: Box { items: wr1.inner.items.push(52) } }
+
+check("G.2 wr1 extended", len(wr1.inner.items), 3)
+check("G.3 wr2 unchanged", len(wr2.inner.items), 2)     // ← ALIAS CANARY
+check("G.4 init_arr unchanged", len(init_arr), 2)
+
+// ── H. In-buffer value leak with len-aware view ────────────
+// Shared items buffer: mutation via one struct's rebind writes
+// to the buffer slots that a sibling's len-capped view would
+// reveal if the sibling's len later grows.
+// This exercises the "hidden backing buffer" aliasing mode.
+
+let mut base = []
+base = base.push(10)
+base = base.push(20)   // len=2, cap=8
+
+// Both h1.items and h2.items point to the same underlying buffer.
+let mut h1 = Box { items: base }
+let mut h2 = Box { items: base }
+
+// Push on h1 — mutates the shared buffer at offset 2.
+h1.items = h1.items.push(333)
+
+// Now push on h2 at offset 2 — if aliased, would overwrite h1's 333.
+h2.items = h2.items.push(444)
+
+// If buffers are independent, h1.items[2] = 333 and h2.items[2] = 444.
+// If buffers are aliased (shared pointer + separate len), both share
+// offset 2 → whichever pushed last wins; the other reads the wrong value.
+check("H.0 h1.items[2] is 333", h1.items[2], 333)
+check("H.1 h2.items[2] is 444", h2.items[2], 444)
+check("H.2 h1.items[0] is 10", h1.items[0], 10)
+check("H.3 h2.items[0] is 10", h2.items[0], 10)
+check("H.4 h1.items[1] is 20", h1.items[1], 20)
+check("H.5 h2.items[1] is 20", h2.items[1], 20)
+
+// ═══════════════════════════════════════════════════════════
+println("═══════════════════════════════════════════════════════")
+let total = pass_count + fail_count
+println("  Results: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL / " + to_string(total) + " total")
+if fail_count == 0 {
+    println("  ROI #148 struct list aliasing — NO LEAK DETECTED")
+} else {
+    println("  ROI #148 struct list aliasing — LEAK DETECTED")
+}
+println("═══════════════════════════════════════════════════════")
