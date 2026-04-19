@@ -1,0 +1,431 @@
+// self/codegen/test_regalloc_baseline_vs_graph.hexa — head-to-head
+// register-pressure comparison between linear-scan (baseline) and
+// graph coloring (ROI #146) on a hand-crafted scenario.
+//
+// Scenario (mirrors T3 in test_regalloc_graph.hexa):
+//   3 values pairwise-interfering over [0..20), k=2, use counts
+//   [10, 1, 10]. Optimal allocator spills only v1 (the cold one);
+//   plain first-fit linear scan spills v2 (the last to arrive) even
+//   though it's hot.
+//
+// Expected:
+//   linear:  spills v2, 1 stack slot, 20 hot uses in memory (v0+v2's
+//            combined use count was 20 but v2 went cold-stacked).
+//   graph :  spills v1, 1 stack slot,  1 hot use in memory.
+//
+// Metric: sum of use_counts that land on LOC_STACK. Lower is better.
+// This is the direct proxy for executed load/store traffic.
+//
+// Run: hexa_stage0 self/codegen/test_regalloc_baseline_vs_graph.hexa
+
+struct LiveInterval {
+    value: int,
+    start: int,
+    end_pos: int,
+    fixed_reg: int
+}
+
+struct FuncAlloc {
+    locations_tag: [int],
+    locations_val: [int],
+    stack_size: int,
+    used_regs: [int],
+    callee_saved: [int]
+}
+
+fn func_alloc_empty() -> FuncAlloc {
+    return FuncAlloc {
+        locations_tag: [],
+        locations_val: [],
+        stack_size: 0,
+        used_regs: [],
+        callee_saved: []
+    }
+}
+
+fn array_contains(arr: [int], val: int) -> bool {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ───── Linear-scan reference (copy of regalloc_linear.hexa body) ─
+fn allocate_function_linear(intervals: [LiveInterval], regs: [int]) -> FuncAlloc {
+    let k = len(regs)
+    if len(intervals) == 0 { return func_alloc_empty() }
+    let mut locations_tag = []
+    let mut locations_val = []
+    let mut used_regs = []
+    let mut stack_offset = 0
+    let mut free_regs = []
+    let mut i = k - 1
+    while i >= 0 {
+        free_regs = free_regs.push(i)
+        i = i - 1
+    }
+    let mut active_reg = []
+    let mut active_end = []
+    i = 0
+    while i < len(intervals) {
+        let iv = intervals[i]
+        let mut j = 0
+        while j < len(active_end) {
+            if active_end[j] < iv.start {
+                free_regs = free_regs.push(active_reg[j])
+                let mut new_ar = []
+                let mut new_ae = []
+                let mut k2 = 0
+                while k2 < len(active_reg) {
+                    if k2 != j {
+                        new_ar = new_ar.push(active_reg[k2])
+                        new_ae = new_ae.push(active_end[k2])
+                    }
+                    k2 = k2 + 1
+                }
+                active_reg = new_ar
+                active_end = new_ae
+            } else {
+                j = j + 1
+            }
+        }
+        while len(locations_tag) <= iv.value {
+            locations_tag = locations_tag.push(0)
+            locations_val = locations_val.push(0)
+        }
+        if len(active_reg) == k {
+            stack_offset = stack_offset - 8
+            locations_tag[iv.value] = 1
+            locations_val[iv.value] = stack_offset
+        } else {
+            let top = len(free_regs) - 1
+            let reg_idx = free_regs[top]
+            let mut new_free = []
+            let mut fi = 0
+            while fi < top {
+                new_free = new_free.push(free_regs[fi])
+                fi = fi + 1
+            }
+            free_regs = new_free
+            let reg = regs[reg_idx]
+            locations_tag[iv.value] = 0
+            locations_val[iv.value] = reg
+            if !array_contains(used_regs, reg) {
+                used_regs = used_regs.push(reg)
+            }
+            active_reg = active_reg.push(reg_idx)
+            active_end = active_end.push(iv.end_pos)
+        }
+        i = i + 1
+    }
+    let mut stack_size = 0
+    if stack_offset < 0 {
+        stack_size = (0 - stack_offset + 15) / 16 * 16
+    }
+    return FuncAlloc {
+        locations_tag: locations_tag,
+        locations_val: locations_val,
+        stack_size: stack_size,
+        used_regs: used_regs,
+        callee_saved: []
+    }
+}
+
+// ───── Graph coloring — minimal inline copy ─────────────────────
+struct InterferenceGraphFlat {
+    node_degree: [int],
+    adj_start: [int],
+    adj_flat: [int],
+    n: int
+}
+fn gc_overlap(as_s: int, ae_s: int, bs_s: int, be_s: int) -> bool {
+    if as_s >= be_s { return false }
+    if bs_s >= ae_s { return false }
+    return true
+}
+fn gc_build(intervals: [LiveInterval]) -> InterferenceGraphFlat {
+    let n = len(intervals)
+    let mut degree = []
+    let mut adj_start = []
+    let mut adj_flat = []
+    if n == 0 {
+        adj_start = adj_start.push(0)
+        return InterferenceGraphFlat { node_degree: degree, adj_start: adj_start, adj_flat: adj_flat, n: 0 }
+    }
+    let mut i = 0
+    while i < n { degree = degree.push(0); i = i + 1 }
+    i = 0
+    while i < n {
+        let ai = intervals[i]
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let bi = intervals[j]
+                if gc_overlap(ai.start, ai.end_pos, bi.start, bi.end_pos) {
+                    degree[i] = degree[i] + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    adj_start = adj_start.push(0)
+    i = 0
+    while i < n {
+        adj_start = adj_start.push(adj_start[i] + degree[i])
+        i = i + 1
+    }
+    let total = adj_start[n]
+    i = 0
+    while i < total { adj_flat = adj_flat.push(0); i = i + 1 }
+    let mut cursor = []
+    i = 0
+    while i < n { cursor = cursor.push(adj_start[i]); i = i + 1 }
+    i = 0
+    while i < n {
+        let ai = intervals[i]
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let bi = intervals[j]
+                if gc_overlap(ai.start, ai.end_pos, bi.start, bi.end_pos) {
+                    adj_flat[cursor[i]] = j
+                    cursor[i] = cursor[i] + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return InterferenceGraphFlat { node_degree: degree, adj_start: adj_start, adj_flat: adj_flat, n: n }
+}
+fn gc_simplify(graph: InterferenceGraphFlat, uses_per_node: [int], k: int) -> [int] {
+    let n = graph.n
+    let mut removed = []
+    let mut cur_degree = []
+    let mut order = []
+    let mut i = 0
+    while i < n {
+        removed = removed.push(0)
+        cur_degree = cur_degree.push(graph.node_degree[i])
+        i = i + 1
+    }
+    let mut iter_count = 0
+    while iter_count < n {
+        let mut pick = -1
+        i = 0
+        while i < n {
+            if removed[i] == 0 {
+                if cur_degree[i] < k {
+                    pick = i
+                    i = n
+                } else { i = i + 1 }
+            } else { i = i + 1 }
+        }
+        if pick < 0 {
+            let mut best_num = 0
+            let mut best_den = 1
+            let mut best_idx = -1
+            i = 0
+            while i < n {
+                if removed[i] == 0 {
+                    let uc = uses_per_node[i]
+                    let mut d = cur_degree[i]
+                    if d < 1 { d = 1 }
+                    if best_idx < 0 {
+                        best_idx = i
+                        best_num = uc
+                        best_den = d
+                    } else {
+                        let lhs = uc * best_den
+                        let rhs = best_num * d
+                        if lhs < rhs {
+                            best_idx = i
+                            best_num = uc
+                            best_den = d
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            pick = best_idx
+        }
+        if pick < 0 {
+            iter_count = n
+        } else {
+            removed[pick] = 1
+            order = order.push(pick)
+            let s = graph.adj_start[pick]
+            let e = graph.adj_start[pick + 1]
+            let mut idx = s
+            while idx < e {
+                let nb = graph.adj_flat[idx]
+                if removed[nb] == 0 { cur_degree[nb] = cur_degree[nb] - 1 }
+                idx = idx + 1
+            }
+            iter_count = iter_count + 1
+        }
+    }
+    return order
+}
+fn gc_select(graph: InterferenceGraphFlat, pop_order: [int], k: int) -> [int] {
+    let n = graph.n
+    let mut colors = []
+    let mut i = 0
+    while i < n { colors = colors.push(-1); i = i + 1 }
+    let mut pi = len(pop_order) - 1
+    while pi >= 0 {
+        let node = pop_order[pi]
+        let mut used = []
+        let mut u = 0
+        while u < k { used = used.push(0); u = u + 1 }
+        let s = graph.adj_start[node]
+        let e = graph.adj_start[node + 1]
+        let mut idx = s
+        while idx < e {
+            let nb = graph.adj_flat[idx]
+            let c = colors[nb]
+            if c >= 0 {
+                if c < k { used[c] = 1 }
+            }
+            idx = idx + 1
+        }
+        let mut chosen = -1
+        u = 0
+        while u < k {
+            if used[u] == 0 {
+                if chosen < 0 { chosen = u }
+            }
+            u = u + 1
+        }
+        colors[node] = chosen
+        pi = pi - 1
+    }
+    return colors
+}
+fn allocate_function_graph(intervals: [LiveInterval], regs: [int], uses_by_vid: [int]) -> FuncAlloc {
+    let k = len(regs)
+    let n = len(intervals)
+    if n == 0 { return func_alloc_empty() }
+    let graph = gc_build(intervals)
+    let mut uses_per_node = []
+    let mut i = 0
+    while i < n {
+        let vid = intervals[i].value
+        if vid >= 0 && vid < len(uses_by_vid) {
+            uses_per_node = uses_per_node.push(uses_by_vid[vid])
+        } else {
+            uses_per_node = uses_per_node.push(0)
+        }
+        i = i + 1
+    }
+    let pop_order = gc_simplify(graph, uses_per_node, k)
+    let colors = gc_select(graph, pop_order, k)
+    let mut max_vid = -1
+    i = 0
+    while i < n {
+        if intervals[i].value > max_vid { max_vid = intervals[i].value }
+        i = i + 1
+    }
+    let mut locations_tag = []
+    let mut locations_val = []
+    let mut used_regs = []
+    let mut stack_offset = 0
+    let mut vi = 0
+    while vi <= max_vid {
+        locations_tag = locations_tag.push(0)
+        locations_val = locations_val.push(0)
+        vi = vi + 1
+    }
+    i = 0
+    while i < n {
+        let iv = intervals[i]
+        let c = colors[i]
+        let v = iv.value
+        if c >= 0 && c < k {
+            let reg = regs[c]
+            locations_tag[v] = 0
+            locations_val[v] = reg
+            if !array_contains(used_regs, reg) {
+                used_regs = used_regs.push(reg)
+            }
+        } else {
+            stack_offset = stack_offset - 8
+            locations_tag[v] = 1
+            locations_val[v] = stack_offset
+        }
+        i = i + 1
+    }
+    let mut stack_size = 0
+    if stack_offset < 0 {
+        stack_size = (0 - stack_offset + 15) / 16 * 16
+    }
+    return FuncAlloc {
+        locations_tag: locations_tag,
+        locations_val: locations_val,
+        stack_size: stack_size,
+        used_regs: used_regs,
+        callee_saved: []
+    }
+}
+
+// ───── Benchmark driver ────────────────────────────────────────
+fn memory_traffic(alloc: FuncAlloc, uses_by_vid: [int]) -> int {
+    // Sum of use counts for spilled VIDs = per-exec load/store count.
+    let mut total = 0
+    let mut v = 0
+    while v < len(alloc.locations_tag) {
+        if alloc.locations_tag[v] == 1 {
+            if v < len(uses_by_vid) {
+                total = total + uses_by_vid[v]
+            }
+        }
+        v = v + 1
+    }
+    return total
+}
+
+// Scenario: 3 mutually-interfering values, k=2, uses = [10, 1, 10].
+let mut ivs = []
+ivs = ivs.push(LiveInterval { value: 0, start: 0, end_pos: 20, fixed_reg: -1 })
+ivs = ivs.push(LiveInterval { value: 1, start: 0, end_pos: 20, fixed_reg: -1 })
+ivs = ivs.push(LiveInterval { value: 2, start: 0, end_pos: 20, fixed_reg: -1 })
+
+let regs = [30, 31]
+let mut uses = []
+uses = uses.push(10)
+uses = uses.push(1)
+uses = uses.push(10)
+
+println("═══════════════════════════════════════════════════════")
+println("  baseline linear-scan  vs  graph-coloring (Briggs)")
+println("═══════════════════════════════════════════════════════")
+
+let lin = allocate_function_linear(ivs, regs)
+let gr = allocate_function_graph(ivs, regs, uses)
+
+let lin_mem = memory_traffic(lin, uses)
+let gr_mem = memory_traffic(gr, uses)
+
+println("linear-scan:")
+println("  v0 tag=" + to_string(lin.locations_tag[0]) + " val=" + to_string(lin.locations_val[0]))
+println("  v1 tag=" + to_string(lin.locations_tag[1]) + " val=" + to_string(lin.locations_val[1]))
+println("  v2 tag=" + to_string(lin.locations_tag[2]) + " val=" + to_string(lin.locations_val[2]))
+println("  memory traffic (sum of uses on stack) = " + to_string(lin_mem))
+
+println("graph-coloring:")
+println("  v0 tag=" + to_string(gr.locations_tag[0]) + " val=" + to_string(gr.locations_val[0]))
+println("  v1 tag=" + to_string(gr.locations_tag[1]) + " val=" + to_string(gr.locations_val[1]))
+println("  v2 tag=" + to_string(gr.locations_tag[2]) + " val=" + to_string(gr.locations_val[2]))
+println("  memory traffic (sum of uses on stack) = " + to_string(gr_mem))
+
+println("")
+if gr_mem < lin_mem {
+    println("WIN: graph coloring reduced memory traffic by "
+        + to_string(lin_mem - gr_mem) + " uses ("
+        + to_string((lin_mem - gr_mem) * 100 / lin_mem) + "% fewer spills)")
+} else {
+    println("TIE or regression: lin=" + to_string(lin_mem) + " graph=" + to_string(gr_mem))
+}

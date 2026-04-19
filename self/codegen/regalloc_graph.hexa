@@ -1,0 +1,501 @@
+// self/codegen/regalloc_graph.hexa — Chaitin-Briggs graph coloring allocator.
+//
+// ROI #146 — replaces the linear-scan allocator (regalloc_linear.hexa)
+// with an interference-graph coloring pass. Same caller contract:
+// consumes [LiveInterval] + physical regs, returns FuncAlloc with
+// locations_tag / locations_val / stack_size / used_regs parallel
+// arrays. Linear-scan is retained as the default via `allocate_function`
+// dispatcher; this module is opt-in until a stage0 rebuild promotes it.
+//
+// Algorithm (Briggs' optimistic variant of Chaitin 1982):
+//
+//   1) Build interference graph. Two intervals (a, b) interfere iff
+//      their live ranges strictly overlap — `a.start < b.end_pos`
+//      && `b.start < a.end_pos` over the global flattened instruction
+//      stream that compute_live_intervals already produces.
+//
+//   2) Simplify. Repeatedly remove any node with degree < K onto a
+//      worklist stack. When only nodes with degree >= K remain, pick
+//      the Briggs spill candidate: the one minimizing
+//
+//            cost(n) = use_count(n) / max(1, degree(n))
+//
+//      and optimistically push it too. This is Briggs' key insight:
+//      optimistic pushing sometimes admits a coloring the plain
+//      Chaitin heuristic would reject.
+//
+//   3) Select. Pop the stack in reverse. For each node, find the
+//      lowest-indexed physical register not used by any still-colored
+//      neighbor. If every K register clashes, the node actually spills
+//      — assign a stack slot.
+//
+// Interface:
+//   allocate_function_graph(intervals, regs, use_counts) -> FuncAlloc
+//   allocate_function(intervals, regs, use_counts, strategy) -> FuncAlloc
+//
+// Notes on stage0 constraints:
+//   - Nested arrays returned from functions round-trip poorly (see
+//     regalloc_linear.hexa). The interference graph is therefore
+//     stored as parallel flat arrays: `adj_start[i]..adj_start[i+1]`
+//     delimits node i's neighbors in `adj_nodes`.
+//   - `use_counts` is indexed by ValueId, so negative VIDs (sentinel
+//     terminators) must be skipped by the caller before building the
+//     counts array. See self/codegen/regalloc.hexa:count_uses.
+//   - LOC_REG and LOC_STACK constants are reused from regalloc.hexa
+//     to keep FuncAlloc binary-compatible with the linear-scan path.
+
+// ──────────────────────────────────────────────────────────────
+// Strategy enum (plain ints to avoid stage0 enum translation cost).
+// ──────────────────────────────────────────────────────────────
+fn regalloc_strategy_linear() -> int { return 0 }
+fn regalloc_strategy_graph() -> int { return 1 }
+
+// ──────────────────────────────────────────────────────────────
+// Interference detection — strict live-range overlap.
+// Two SSA values share a physical register only when their ranges
+// don't touch. We treat equal endpoints as non-overlapping, which
+// matches how compute_live_intervals emits [def..last_use].
+// ──────────────────────────────────────────────────────────────
+fn gc_intervals_overlap(a_start: int, a_end: int, b_start: int, b_end: int) -> bool {
+    if a_start >= b_end { return false }
+    if b_start >= a_end { return false }
+    return true
+}
+
+// ──────────────────────────────────────────────────────────────
+// Build the interference adjacency lists. Output is three parallel
+// arrays over the interval index space [0..n):
+//   node_degree[i]    — number of interference edges on node i
+//   adj_start[i]      — offset into adj_flat where node i's neighbors begin
+//   adj_flat          — concatenated neighbor indices
+// adj_start has length n+1 so `adj_start[n]` is the end sentinel.
+// ──────────────────────────────────────────────────────────────
+struct InterferenceGraphFlat {
+    node_degree: [int],
+    adj_start: [int],
+    adj_flat: [int],
+    n: int
+}
+
+fn gc_empty_graph() -> InterferenceGraphFlat {
+    return InterferenceGraphFlat {
+        node_degree: [],
+        adj_start: [0],
+        adj_flat: [],
+        n: 0
+    }
+}
+
+fn gc_build_interference(intervals: [LiveInterval]) -> InterferenceGraphFlat {
+    let n = len(intervals)
+    if n == 0 {
+        return gc_empty_graph()
+    }
+
+    // First pass: accumulate neighbor lists as flat per-node arrays
+    // using a (start, count) layout. Because stage0 nested-array round
+    // trips are fragile we materialize adjacency twice:
+    //   pass 1: per-node append into neighbors_flat + start/count tables
+    //   pass 2: emit compact adj_start[] + adj_flat[]
+    let mut neighbors_flat = []   // flat: groups of neighbor indices
+    let mut ng_start = []         // per-node start into neighbors_flat
+    let mut ng_count = []         // per-node count
+
+    let mut i = 0
+    while i < n {
+        ng_start = ng_start.push(0)
+        ng_count = ng_count.push(0)
+        i = i + 1
+    }
+
+    // Pair-scan. O(n^2) adequate for function-sized graphs (typical
+    // functions have <200 live intervals). If that ever ceases to be
+    // true, switch to a sweep-line over sorted start positions.
+    i = 0
+    while i < n {
+        let ai = intervals[i]
+        let as_start = ai.start
+        let ae = ai.end_pos
+        let mut j = i + 1
+        while j < n {
+            let bi = intervals[j]
+            if gc_intervals_overlap(as_start, ae, bi.start, bi.end_pos) {
+                // Record edge i->j
+                if ng_count[i] == 0 { ng_start[i] = len(neighbors_flat) }
+                neighbors_flat = neighbors_flat.push(j)
+                ng_count[i] = ng_count[i] + 1
+                // Record edge j->i (append — will be contiguous with j's
+                // future edges because j has not emitted yet from this i).
+                if ng_count[j] == 0 { ng_start[j] = len(neighbors_flat) }
+                neighbors_flat = neighbors_flat.push(i)
+                ng_count[j] = ng_count[j] + 1
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    // Note the i-vs-j append order interleaves neighbors for i and j,
+    // so ng_start / ng_count cannot be used directly. Compact into a
+    // proper CSR-style layout.
+    let mut degree = []
+    let mut adj_start = []
+    let mut adj_flat = []
+    adj_start = adj_start.push(0)
+    i = 0
+    while i < n {
+        // Scan the entire pass-1 buffer and lift every neighbor of i.
+        let mut d = 0
+        let mut k = 0
+        while k < n {
+            // For (a,b) ordered pair we recorded ai edges then bi edges;
+            // re-deriving by re-walking the pair scan is cheaper than
+            // trying to thread a proper CSR into the first pass under
+            // stage0 array semantics.
+            k = k + 1
+        }
+        adj_start = adj_start.push(0) // placeholder, overwritten below
+        degree = degree.push(0)
+        i = i + 1
+    }
+
+    // Rebuild cleanly by a second overlap pass directly into CSR.
+    adj_start = []
+    degree = []
+    adj_flat = []
+    i = 0
+    while i < n {
+        degree = degree.push(0)
+        i = i + 1
+    }
+    // First compute degree.
+    i = 0
+    while i < n {
+        let ai = intervals[i]
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let bi = intervals[j]
+                if gc_intervals_overlap(ai.start, ai.end_pos, bi.start, bi.end_pos) {
+                    degree[i] = degree[i] + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    // Prefix-sum to adj_start, length n+1.
+    adj_start = adj_start.push(0)
+    i = 0
+    while i < n {
+        adj_start = adj_start.push(adj_start[i] + degree[i])
+        i = i + 1
+    }
+    // Allocate adj_flat with sentinel zeros.
+    let total = adj_start[n]
+    i = 0
+    while i < total {
+        adj_flat = adj_flat.push(0)
+        i = i + 1
+    }
+    // Cursor per node.
+    let mut cursor = []
+    i = 0
+    while i < n {
+        cursor = cursor.push(adj_start[i])
+        i = i + 1
+    }
+    // Fill.
+    i = 0
+    while i < n {
+        let ai = intervals[i]
+        let mut j = 0
+        while j < n {
+            if j != i {
+                let bi = intervals[j]
+                if gc_intervals_overlap(ai.start, ai.end_pos, bi.start, bi.end_pos) {
+                    adj_flat[cursor[i]] = j
+                    cursor[i] = cursor[i] + 1
+                }
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+
+    return InterferenceGraphFlat {
+        node_degree: degree,
+        adj_start: adj_start,
+        adj_flat: adj_flat,
+        n: n
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Simplify phase — Briggs optimistic.
+// Returns the `pop order` — nodes pushed onto the coloring stack in
+// the order they were removed from the graph. Spill candidates are
+// chosen by lowest (use_count/degree) ratio at the point where every
+// remaining node has degree >= K.
+// ──────────────────────────────────────────────────────────────
+fn gc_simplify(graph: InterferenceGraphFlat, use_counts_per_node: [int], k: int) -> [int] {
+    let n = graph.n
+    let mut removed = []     // bool flags per node
+    let mut cur_degree = []
+    let mut order = []
+    let mut i = 0
+    while i < n {
+        removed = removed.push(0)     // 0 = present, 1 = removed
+        cur_degree = cur_degree.push(graph.node_degree[i])
+        i = i + 1
+    }
+
+    let mut iterations = 0
+    while iterations < n {
+        // Step A — try to find any remaining node with degree < k.
+        let mut pick = -1
+        i = 0
+        while i < n {
+            if removed[i] == 0 {
+                if cur_degree[i] < k {
+                    pick = i
+                    i = n
+                } else {
+                    i = i + 1
+                }
+            } else {
+                i = i + 1
+            }
+        }
+
+        // Step B — no trivially-colorable node; pick Briggs spill metric.
+        // Scoring = use_count / max(1, degree). Lower score = better
+        // spill candidate (rarely used and/or many conflicts).
+        if pick < 0 {
+            let mut best_score_num = 0
+            let mut best_score_den = 1
+            let mut best_idx = -1
+            i = 0
+            while i < n {
+                if removed[i] == 0 {
+                    let uc = use_counts_per_node[i]
+                    let mut d = cur_degree[i]
+                    if d < 1 { d = 1 }
+                    // Compare uc/d < best_score_num/best_score_den via
+                    // cross-multiplication to avoid floating-point.
+                    if best_idx < 0 {
+                        best_idx = i
+                        best_score_num = uc
+                        best_score_den = d
+                    } else {
+                        // uc * best_score_den  <  best_score_num * d ?
+                        let lhs = uc * best_score_den
+                        let rhs = best_score_num * d
+                        if lhs < rhs {
+                            best_idx = i
+                            best_score_num = uc
+                            best_score_den = d
+                        }
+                    }
+                }
+                i = i + 1
+            }
+            pick = best_idx
+        }
+
+        if pick < 0 {
+            // All removed — done.
+            iterations = n
+        } else {
+            // Remove `pick` from graph.
+            removed[pick] = 1
+            order = order.push(pick)
+            // Decrement neighbor degrees.
+            let s = graph.adj_start[pick]
+            let e = graph.adj_start[pick + 1]
+            let mut idx = s
+            while idx < e {
+                let nb = graph.adj_flat[idx]
+                if removed[nb] == 0 {
+                    cur_degree[nb] = cur_degree[nb] - 1
+                }
+                idx = idx + 1
+            }
+            iterations = iterations + 1
+        }
+    }
+
+    return order
+}
+
+// ──────────────────────────────────────────────────────────────
+// Select phase — pop stack LIFO and assign colors.
+// `colors` is parallel to intervals: colors[i] = reg_idx or -1 (spill).
+// ──────────────────────────────────────────────────────────────
+fn gc_select(graph: InterferenceGraphFlat, pop_order: [int], k: int) -> [int] {
+    let n = graph.n
+    let mut colors = []
+    let mut i = 0
+    while i < n {
+        colors = colors.push(-1)
+        i = i + 1
+    }
+
+    // Process in REVERSE of removal order (stack pop).
+    let mut pi = len(pop_order) - 1
+    while pi >= 0 {
+        let node = pop_order[pi]
+        // Collect neighbor colors.
+        let mut used = []
+        let mut u = 0
+        while u < k {
+            used = used.push(0)
+            u = u + 1
+        }
+        let s = graph.adj_start[node]
+        let e = graph.adj_start[node + 1]
+        let mut idx = s
+        while idx < e {
+            let nb = graph.adj_flat[idx]
+            let c = colors[nb]
+            if c >= 0 {
+                if c < k {
+                    used[c] = 1
+                }
+            }
+            idx = idx + 1
+        }
+        // Pick lowest free color.
+        let mut chosen = -1
+        u = 0
+        while u < k {
+            if used[u] == 0 {
+                if chosen < 0 { chosen = u }
+            }
+            u = u + 1
+        }
+        colors[node] = chosen   // -1 = actual spill
+        pi = pi - 1
+    }
+
+    return colors
+}
+
+// ──────────────────────────────────────────────────────────────
+// Map ValueIds to their index in the `intervals` array so we can
+// look up the allocation result by VID in downstream code.
+// ──────────────────────────────────────────────────────────────
+fn gc_max_vid(intervals: [LiveInterval]) -> int {
+    let mut mx = -1
+    let mut i = 0
+    while i < len(intervals) {
+        let v = intervals[i].value
+        if v > mx { mx = v }
+        i = i + 1
+    }
+    return mx
+}
+
+// ──────────────────────────────────────────────────────────────
+// Project per-interval use counts down to a flat array indexed by
+// node (= interval index). `use_counts_by_vid` is indexed by ValueId.
+// Missing VIDs default to 0 (conservative — they look very
+// spill-friendly, but since their degree is also 0 they'll be trivially
+// colorable first anyway).
+// ──────────────────────────────────────────────────────────────
+fn gc_uses_per_node(intervals: [LiveInterval], use_counts_by_vid: [int]) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < len(intervals) {
+        let vid = intervals[i].value
+        if vid >= 0 && vid < len(use_counts_by_vid) {
+            out = out.push(use_counts_by_vid[vid])
+        } else {
+            out = out.push(0)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ──────────────────────────────────────────────────────────────
+// Top-level entry point. Mirrors allocate_function_linear's contract.
+// ──────────────────────────────────────────────────────────────
+fn allocate_function_graph(intervals: [LiveInterval], regs: [int], use_counts_by_vid: [int]) -> FuncAlloc {
+    let k = len(regs)
+    let n = len(intervals)
+    if n == 0 {
+        return func_alloc_empty()
+    }
+
+    let graph = gc_build_interference(intervals)
+    let uses_per_node = gc_uses_per_node(intervals, use_counts_by_vid)
+    let pop_order = gc_simplify(graph, uses_per_node, k)
+    let colors = gc_select(graph, pop_order, k)
+
+    // Project colors back into FuncAlloc parallel arrays keyed by VID.
+    let max_vid = gc_max_vid(intervals)
+    let mut locations_tag = []
+    let mut locations_val = []
+    let mut used_regs = []
+    let mut stack_offset = 0
+    let mut vi = 0
+    while vi <= max_vid {
+        locations_tag = locations_tag.push(0)
+        locations_val = locations_val.push(0)
+        vi = vi + 1
+    }
+
+    // Assign in interval order — deterministic stack offsets match the
+    // linear allocator's behavior on pure spill.
+    let mut i = 0
+    while i < n {
+        let iv = intervals[i]
+        let c = colors[i]
+        let v = iv.value
+        // Guard against out-of-range VID (should not occur if max_vid
+        // is correct, but keeps the allocator total).
+        while len(locations_tag) <= v {
+            locations_tag = locations_tag.push(0)
+            locations_val = locations_val.push(0)
+        }
+        if c >= 0 && c < k {
+            let reg = regs[c]
+            locations_tag[v] = 0   // LOC_REG
+            locations_val[v] = reg
+            if !array_contains(used_regs, reg) {
+                used_regs = used_regs.push(reg)
+            }
+        } else {
+            stack_offset = stack_offset - 8
+            locations_tag[v] = 1   // LOC_STACK
+            locations_val[v] = stack_offset
+        }
+        i = i + 1
+    }
+
+    let mut stack_size = 0
+    if stack_offset < 0 {
+        stack_size = (0 - stack_offset + 15) / 16 * 16
+    }
+
+    return FuncAlloc {
+        locations_tag: locations_tag,
+        locations_val: locations_val,
+        stack_size: stack_size,
+        used_regs: used_regs,
+        callee_saved: []
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Dispatcher — default strategy remains linear-scan for production
+// stability; graph coloring is opt-in by explicit strategy flag.
+// Callers migrating incrementally pass `regalloc_strategy_graph()`.
+// ──────────────────────────────────────────────────────────────
+fn allocate_function(intervals: [LiveInterval], regs: [int], use_counts_by_vid: [int], strategy: int) -> FuncAlloc {
+    if strategy == 1 {
+        return allocate_function_graph(intervals, regs, use_counts_by_vid)
+    }
+    return allocate_function_linear(intervals, regs)
+}
