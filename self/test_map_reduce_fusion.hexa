@@ -1,0 +1,189 @@
+// ═══════════════════════════════════════════════════════════
+//  test_map_reduce_fusion.hexa — ROI #142 map+reduce loop fusion
+//
+//  Verifies hand-written fused loops (mirroring the AST rewrite
+//  produced by ai_native_pass.hexa / fuse_reduce_body for ROI #142)
+//  are semantically equivalent to the original chain expression
+//  across 4 cases:
+//    1) .map(f).reduce(init, g) sum  — integer accumulate
+//    2) .map(f).reduce("", concat-with-sep) — replaced with push+join
+//         per anima hot-path pattern (O(n²) concat forbidden)
+//    3) .map(f).sum() — normalized-to-reduce sugar
+//    4) non-pure predicate — documents conservative skip behavior
+//
+//  All fused forms match the AST lowering shape:
+//      let mut __fracc<N> = <init>
+//      let __frsrc<N> = <source>
+//      let mut __fri<N> = 0
+//      while __fri<N> < __frsrc<N>.len() {
+//          let __frx<N> = __frsrc<N>[__fri<N>]
+//          let __frm<N>_0 = f(__frx<N>)
+//          __fracc<N> = g(__fracc<N>, __frm<N>_0)
+//          __fri<N> = __fri<N> + 1
+//      }
+//      let <result> = __fracc<N>
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " expected=" + to_string(expected) + " got=" + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  ROI #142: map+reduce loop fusion (4 cases)")
+println("═══════════════════════════════════════════════════════")
+println("")
+
+// ────────────────────────────────────────────────────────────
+//  CASE 1: .map(f).reduce(0, +)  — integer sum
+//  Note: stage0 runtime aliases .reduce → .fold; the fuser
+//  (self/ai_native_pass.hexa is_reduce_field) accepts both
+//  identifiers. We write .fold here so the "orig" arm actually
+//  executes on the current runtime; the fused arm mirrors the
+//  AST rewrite M974 produces for either.
+//  Original: arr.map(|x| x * x).fold(0, |a, b| a + b)
+//  [1,2,3,4] → [1,4,9,16] → 30
+// ────────────────────────────────────────────────────────────
+println("--- CASE 1: .map(f).reduce(0, +) sum  [written as .fold] ---")
+
+fn orig_map_reduce_sum(arr) {
+    return arr.map(|x| x * x).fold(0, |a, b| a + b)
+}
+
+fn fused_map_reduce_sum(arr) {
+    let mut __fracc0 = 0
+    let __frsrc0 = arr
+    let mut __fri0 = 0
+    while __fri0 < __frsrc0.len() {
+        let __frx0 = __frsrc0[__fri0]
+        let __frm0_0 = __frx0 * __frx0
+        __fracc0 = __fracc0 + __frm0_0
+        __fri0 = __fri0 + 1
+    }
+    return __fracc0
+}
+
+check("case1 [1,2,3,4] orig", orig_map_reduce_sum([1, 2, 3, 4]), 30)
+check("case1 [1,2,3,4] fused", fused_map_reduce_sum([1, 2, 3, 4]), 30)
+check("case1 [] orig", orig_map_reduce_sum([]), 0)
+check("case1 [] fused", fused_map_reduce_sum([]), 0)
+check("case1 [5] orig", orig_map_reduce_sum([5]), 25)
+check("case1 [5] fused", fused_map_reduce_sum([5]), 25)
+
+// ────────────────────────────────────────────────────────────
+//  CASE 2: .map(f).reduce("", concat) — string-concat replaced
+//           with push+join (per anima O(n²)-concat hot-path rule)
+//  Original (O(n²)): words.map(|w| w + "-").reduce("", |a, b| a + b)
+//  Replaced:          parts.push(w+"-") + parts.join("")
+//  Both produce identical strings — verifies fused loop body
+//  shape still emits correct output for string accumulator.
+// ────────────────────────────────────────────────────────────
+println("")
+println("--- CASE 2: .map(f).reduce(\"\", concat) → push+join ---")
+
+fn orig_concat_reduce_pushjoin(words) {
+    // Equivalent to words.map(|w| w + "-").reduce("", |a, b| a + b)
+    // but written as the push+join pattern that the fuse pass would
+    // emit (concat-accumulator form is semantically identical).
+    let mut parts = []
+    let mut i = 0
+    while i < words.len() {
+        parts = parts.push(words[i] + "-")
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn fused_concat_reduce(words) {
+    let mut __fracc0 = ""
+    let __frsrc0 = words
+    let mut __fri0 = 0
+    while __fri0 < __frsrc0.len() {
+        let __frx0 = __frsrc0[__fri0]
+        let __frm0_0 = __frx0 + "-"
+        __fracc0 = __fracc0 + __frm0_0
+        __fri0 = __fri0 + 1
+    }
+    return __fracc0
+}
+
+check("case2 [a,b,c] orig", orig_concat_reduce_pushjoin(["a", "b", "c"]), "a-b-c-")
+check("case2 [a,b,c] fused", fused_concat_reduce(["a", "b", "c"]), "a-b-c-")
+check("case2 [] orig", orig_concat_reduce_pushjoin([]), "")
+check("case2 [] fused", fused_concat_reduce([]), "")
+check("case2 [x] orig", orig_concat_reduce_pushjoin(["x"]), "x-")
+check("case2 [x] fused", fused_concat_reduce(["x"]), "x-")
+
+// ────────────────────────────────────────────────────────────
+//  CASE 3: .map(f).sum() — normalizes to .reduce(0, +) then fuses
+//  Original: arr.map(|x| x + 10).sum()
+//  [1,2,3] → [11,12,13] → 36
+// ────────────────────────────────────────────────────────────
+println("")
+println("--- CASE 3: .map(f).sum() — normalized to reduce ---")
+
+fn orig_map_sum(arr) {
+    return arr.map(|x| x + 10).sum()
+}
+
+fn fused_map_sum(arr) {
+    let mut __fracc0 = 0
+    let __frsrc0 = arr
+    let mut __fri0 = 0
+    while __fri0 < __frsrc0.len() {
+        let __frx0 = __frsrc0[__fri0]
+        let __frm0_0 = __frx0 + 10
+        __fracc0 = __fracc0 + __frm0_0
+        __fri0 = __fri0 + 1
+    }
+    return __fracc0
+}
+
+check("case3 [1,2,3] orig", orig_map_sum([1, 2, 3]), 36)
+check("case3 [1,2,3] fused", fused_map_sum([1, 2, 3]), 36)
+check("case3 [] orig", orig_map_sum([]), 0)
+check("case3 [] fused", fused_map_sum([]), 0)
+
+// ────────────────────────────────────────────────────────────
+//  CASE 4: non-pure predicate → fusion SKIPPED (conservative)
+//
+//  If the map lambda invokes an impure builtin (println/exec/…),
+//  the ROI #142 purity gate rejects the fusion candidate and
+//  leaves the original expression intact. This test documents
+//  that behavior by asserting the original (unfused) form still
+//  computes the correct value — i.e., semantics are preserved
+//  even when fusion is declined.
+// ────────────────────────────────────────────────────────────
+println("")
+println("--- CASE 4: non-pure lambda → fusion skipped ---")
+
+fn orig_map_reduce_impure(arr) {
+    // A lambda that invokes println is treated as impure by the
+    // ROI #142 purity gate (mr_lambda_is_pure). The pass must
+    // NOT fuse this form; the original chain keeps its semantics.
+    return arr.map(|x| {
+        println("seen " + to_string(x))
+        return x * 2
+    }).fold(0, |a, b| a + b)
+}
+
+// The value computed is unchanged whether the pass fuses or skips:
+// both paths yield 2+4+6 = 12 for [1,2,3]. The gate's job is
+// correctness, not numerical difference — fusion is a perf rewrite.
+check("case4 [1,2,3] unfused-semantics", orig_map_reduce_impure([1, 2, 3]), 12)
+
+// ────────────────────────────────────────────────────────────
+//  Summary
+// ────────────────────────────────────────────────────────────
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  RESULT: " + to_string(pass_count) + " passed, " + to_string(fail_count) + " failed")
+println("═══════════════════════════════════════════════════════")
