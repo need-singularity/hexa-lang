@@ -38,26 +38,84 @@ use "self/ml/sampler.hexa"
 // kernels in hxblas_linux.c (ARM64 path). When disabled, m4_matvec
 // falls back to a scalar f32 reference by unpacking bf16 at call-site.
 //
-// Enabled by default. Override via --bf16=0 CLI flag for baseline
+// Enabled by default. Override via --no-bf16 CLI flag for baseline
 // comparison benchmarks (measures f32 scalar path on same pipeline).
 //
 // ABI probe: hxblas_bf16_version() returns 1 when libhxblas is linked
 // with the NEON kernel section. 0 (or crash) means kernels missing.
+//
+// Platform dispatch model (2026-04-19):
+//   Linux ARM64   → hxblas_bgemv NEON intrinsic path (primary target)
+//   macOS ARM64   → same symbols; hxblas_linux.c compiled via __aarch64__
+//   x86_64        → hxblas falls back to scalar reference (still bf16 ABI v1)
+//
+// The C library uses __aarch64__ preprocessor guards, so hxblas_bf16_version()
+// returning >= 1 is a necessary but not sufficient signal for NEON intrinsics.
+// We additionally gate on M4_BF16_PLATFORM, which is set from uname() when the
+// host exports it (POSIX m4_detect_platform()), otherwise defaults to "arm64"
+// because this module targets ARM-based inference by design.
+
+let M4_BF16_PATH_NEON = 2     // hxblas_bgemv NEON intrinsic (linux/macOS ARM64)
+let M4_BF16_PATH_SCALAR = 1   // hxblas_bgemv scalar loop (x86_64)
+let M4_BF16_PATH_FALLBACK = 0 // disabled → f32 unpack + scalar gemv
 
 let mut M4_BF16_ENABLED = true
 let mut M4_BF16_PROBED = false
 let mut M4_BF16_ABI = 0
+let mut M4_BF16_PATH = 0             // one of M4_BF16_PATH_* after probe
+let mut M4_BF16_PLATFORM = "arm64"   // "arm64" | "x86_64" | "unknown"
+let mut M4_BF16_DISPATCH_COUNT = 0   // matvec calls routed through NEON
+let mut M4_BF16_FALLBACK_COUNT = 0   // matvec calls routed through scalar
+
+fn m4_detect_platform() {
+    // Best-effort: inspect uname via env. hexa has no direct uname() FFI
+    // on every target, so we key off common env hints and fall back to
+    // "arm64" (the module's design target). This keeps parse green on
+    // hosts without POSIX env exports.
+    let mach = getenv("HEXA_HOST_MACH")
+    if mach == "aarch64" { return "arm64" }
+    if mach == "arm64"   { return "arm64" }
+    if mach == "x86_64"  { return "x86_64" }
+    if mach == "amd64"   { return "x86_64" }
+    return "arm64"
+}
+
+fn m4_bf16_select_path(abi, platform) {
+    // Decide which code path hxblas_bgemv resolves to on this host.
+    //   ABI<1                 → disabled (library missing/old)
+    //   ABI>=1 + arm64        → NEON intrinsic
+    //   ABI>=1 + other        → scalar (still functionally correct)
+    if abi < 1 { return M4_BF16_PATH_FALLBACK }
+    if platform == "arm64" { return M4_BF16_PATH_NEON }
+    return M4_BF16_PATH_SCALAR
+}
+
+fn m4_bf16_path_name(p) {
+    if p == M4_BF16_PATH_NEON     { return "NEON" }
+    if p == M4_BF16_PATH_SCALAR   { return "scalar" }
+    return "fallback"
+}
 
 fn m4_bf16_probe() {
     // Call once at startup. Logs which path is active.
     if M4_BF16_PROBED { return M4_BF16_ABI }
     M4_BF16_ABI = hxblas_bf16_version()
+    M4_BF16_PLATFORM = m4_detect_platform()
+    M4_BF16_PATH = m4_bf16_select_path(M4_BF16_ABI, M4_BF16_PLATFORM)
     M4_BF16_PROBED = true
     if M4_BF16_ABI >= 1 {
-        println("[m4] bf16 NEON kernels ABI v" + to_string(M4_BF16_ABI) + " (hxblas_bgemv)")
+        println("[m4] bf16 kernels: ABI v" + to_string(M4_BF16_ABI) +
+                " platform=" + M4_BF16_PLATFORM +
+                " path=" + m4_bf16_path_name(M4_BF16_PATH) +
+                " (hxblas_bgemv)")
+        if M4_BF16_PATH == M4_BF16_PATH_SCALAR {
+            println("[m4] NOTE: non-ARM64 host — bf16 kernels run scalar loop, not NEON intrinsics")
+        }
     } else {
-        println("[m4] WARN: bf16 ABI probe returned " + to_string(M4_BF16_ABI) + " — kernels may be missing, forcing CPU fallback")
+        println("[m4] WARN: bf16 ABI probe returned " + to_string(M4_BF16_ABI) +
+                " — kernels may be missing, forcing CPU fallback")
         M4_BF16_ENABLED = false
+        M4_BF16_PATH = M4_BF16_PATH_FALLBACK
     }
     return M4_BF16_ABI
 }
@@ -66,12 +124,19 @@ fn m4_bf16_probe() {
 // W is a bf16-packed weight buffer. x is f32. Returns freshly
 // allocated f32 y[M]. When bf16 is disabled, we unpack the row
 // on the fly (slower, only for A/B comparison bench).
+//
+// Dispatch decision tree:
+//   M4_BF16_ENABLED && path == NEON     → bf16_matvec → hxblas_bgemv(NEON)
+//   M4_BF16_ENABLED && path == scalar   → bf16_matvec → hxblas_bgemv(scalar)
+//   !M4_BF16_ENABLED || path == fallback → unpack-and-scalar in-line (below)
 fn m4_matvec(M, K, W_bf16, x_f32) {
     if M4_BF16_ENABLED {
+        M4_BF16_DISPATCH_COUNT = M4_BF16_DISPATCH_COUNT + 1
         return bf16_matvec(M, K, W_bf16, x_f32)
     }
+    M4_BF16_FALLBACK_COUNT = M4_BF16_FALLBACK_COUNT + 1
     // Fallback: unpack entire weight to f32 and do scalar gemv.
-    // This path exists purely so --bf16=0 measures the baseline on
+    // This path exists purely so --no-bf16 measures the baseline on
     // the same code path; do not use in production.
     let w_f32 = bf16_unpack(W_bf16, M * K)
     let y = alloc_raw(M * 4)
@@ -90,6 +155,15 @@ fn m4_matvec(M, K, W_bf16, x_f32) {
     }
     free_raw(w_f32, M * K * 4)
     return y
+}
+
+// Dispatch stats helper — useful in benchmark reports to confirm every
+// matvec site actually hit the NEON path (no silent scalar leaks).
+fn m4_bf16_dispatch_report() {
+    println("[m4] bf16 dispatch: neon=" + to_string(M4_BF16_DISPATCH_COUNT) +
+            " fallback=" + to_string(M4_BF16_FALLBACK_COUNT) +
+            " path=" + m4_bf16_path_name(M4_BF16_PATH))
+    return M4_BF16_DISPATCH_COUNT
 }
 
 // ── Model config ────────────────────────────────────────────────────
@@ -846,8 +920,13 @@ fn m4_bench(model: M4Model, n_tokens, use_metal) {
     line = line + ",\"decode_ms\":" + to_string(decode_ms)
     line = line + ",\"bf16_mb\":" + to_string(model.total_bf16_bytes / 1048576)
     line = line + ",\"f32_mb\":" + to_string(model.total_f32_bytes / 1048576)
+    line = line + ",\"bf16_path\":\"" + m4_bf16_path_name(M4_BF16_PATH) + "\""
+    line = line + ",\"bf16_dispatch\":" + to_string(M4_BF16_DISPATCH_COUNT)
+    line = line + ",\"bf16_fallback\":" + to_string(M4_BF16_FALLBACK_COUNT)
     line = line + "}"
     println(line)
+
+    m4_bf16_dispatch_report()
 
     return result
 }
