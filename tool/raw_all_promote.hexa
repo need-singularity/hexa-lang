@@ -1,0 +1,514 @@
+#!hexa strict
+// tool/raw_all_promote.hexa — raw#0 rule status lifecycle automation
+//
+// PURPOSE
+//   Every rule in .raw / .own declares a `status`: one of
+//     deferred → new → warn → live → deprecated
+//
+//   Manual promotion is error-prone and gets forgotten; this tool
+//   inspects the .raw-audit history for each rule and recommends
+//   (or applies, under explicit unlock) a forward step when the
+//   promotion criteria are met.
+//
+//   Criteria (heuristic, intentionally conservative):
+//     new      → warn       : last 7 days with 0 FAIL for this rule
+//     warn     → live       : last 30 days with 0 FAIL for this rule
+//     live     → deprecated : follow-up text contains "retire" marker
+//                             OR keys contain a `deprecated-at` field
+//     deferred → -          : never auto-promoted (requires human)
+//     convention → -        : advisory only, no promotion target
+//
+// USAGE
+//   ./hexa tool/raw_all_promote.hexa check
+//       — dry-run: scan every rule, print SUGGEST lines
+//   ./hexa tool/raw_all_promote.hexa apply <rule_id> <target_status>
+//       — mutate .raw (rule header status token). Requires unlock.
+//       — append audit event: promote | actor | rule | old→new | ok
+//
+// SUGGEST LINE FORMAT
+//   SUGGEST: raw#7 warn → live  (0 FAIL in last 30d, 14 evaluations)
+//   SUGGEST: own#2 new → warn   (0 FAIL in last 7d, 5 evaluations)
+//
+// FLOW (check)
+//   1. load_raw_file(".raw") + load_raw_file(".own")
+//   2. for each rule, determine current status
+//   3. if status ∈ {new, warn, live}: scan .raw-audit for matching
+//      violation/evaluation entries within window
+//   4. emit SUGGEST if criteria met
+//
+// FLOW (apply)
+//   1. verify target rule exists with declared current status
+//   2. verify unlock window is open (chflags nouchg observable) —
+//      if the SSOT is still immutable, fail fast and advise hx_unlock.
+//   3. regenerate the header line with the new status token.
+//   4. write the file back atomically via tmp + mv.
+//   5. audit_append("promote", user, "raw#<id> <old>→<new>", "ok", …)
+
+use self.core.law_io
+use self.raw_loader
+
+// ─── shell helpers ───────────────────────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(p: string) -> bool {
+    let r = exec_with_status("test -f " + _shell_quote(p))
+    return r[1] == 0
+}
+
+fn _today_iso() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%d\"")).trim()
+}
+
+fn _is_darwin() -> bool {
+    let u = to_string(exec("uname -s")).trim()
+    return u == "Darwin"
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+// ─── audit-log scanning ──────────────────────────────────────────
+//
+// .raw-audit lines are `ts | event | actor | reason | result | sha_b | sha_a`.
+// Evaluation evidence for rule N is detected heuristically: the rule id
+// typically appears in the `reason` field as "raw#N" (or "own#N"). We
+// count how many entries fall within the window and whether any recorded
+// a violation outcome for that id.
+
+fn _audit_lines() -> array {
+    let p = ".raw-audit"
+    if !_file_exists(p) { return [] }
+    let src = to_string(read_file(p))
+    let mut out = []
+    for ln in split(src, "\n") {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        if t.substring(0, 1) == "#" { continue }
+        out = out.push(t)
+    }
+    return out
+}
+
+fn _audit_ts(line: string) -> string {
+    // "2026-04-20T12:34:56Z | ..." → "2026-04-20"
+    let p = line.index_of("|")
+    if p < 0 { return "" }
+    let head = line.substring(0, p).trim()
+    let tsplit = head.index_of("T")
+    if tsplit < 0 { return head }
+    return head.substring(0, tsplit)
+}
+
+fn _audit_event(line: string) -> string {
+    // second field
+    let p = line.index_of("|")
+    if p < 0 { return "" }
+    let rest = line.substring(p + 1, len(line))
+    let q = rest.index_of("|")
+    if q < 0 { return rest.trim() }
+    return rest.substring(0, q).trim()
+}
+
+fn _audit_reason(line: string) -> string {
+    // fourth field — skip three pipes
+    let mut s = line
+    let mut k = 0
+    while k < 3 {
+        let p = s.index_of("|")
+        if p < 0 { return "" }
+        s = s.substring(p + 1, len(s))
+        k = k + 1
+    }
+    let q = s.index_of("|")
+    if q < 0 { return s.trim() }
+    return s.substring(0, q).trim()
+}
+
+fn _audit_result(line: string) -> string {
+    // fifth field — skip four pipes
+    let mut s = line
+    let mut k = 0
+    while k < 4 {
+        let p = s.index_of("|")
+        if p < 0 { return "" }
+        s = s.substring(p + 1, len(s))
+        k = k + 1
+    }
+    let q = s.index_of("|")
+    if q < 0 { return s.trim() }
+    return s.substring(0, q).trim()
+}
+
+fn _days_since_iso(iso: string) -> int {
+    if iso == "" { return -1 }
+    let r = exec_with_status("date -u -d " + _shell_quote(iso) + " +%s 2>/dev/null")
+    let mut t = -1
+    if r[1] == 0 {
+        let s = to_string(r[0]).trim()
+        if s != "" { t = to_int(s) }
+    }
+    if t < 0 {
+        let r2 = exec_with_status("date -j -f '%Y-%m-%d' " + _shell_quote(iso) + " +%s 2>/dev/null")
+        if r2[1] == 0 {
+            let s2 = to_string(r2[0]).trim()
+            if s2 != "" { t = to_int(s2) }
+        }
+    }
+    if t < 0 { return -1 }
+    let now = to_int(to_string(exec("date -u +%s")).trim())
+    return (now - t) / 86400
+}
+
+// Returns [eval_count, fail_count] for a given rule tag within last N days.
+// rule_tag = "raw#7" or "own#2"
+fn _window_stats(rule_tag: string, window_days: int) -> array {
+    let lines = _audit_lines()
+    let mut evals = 0
+    let mut fails = 0
+    for ln in lines {
+        let reason = _audit_reason(ln)
+        if reason.index_of(rule_tag) < 0 { continue }
+        let iso = _audit_ts(ln)
+        let age = _days_since_iso(iso)
+        if age < 0 { continue }
+        if age > window_days { continue }
+        evals = evals + 1
+        let result = _audit_result(ln)
+        let event = _audit_event(ln)
+        if event == "violation" { fails = fails + 1 }
+        else if result == "fail" || result == "blocked" { fails = fails + 1 }
+    }
+    return [evals, fails]
+}
+
+// ─── promotion heuristics ────────────────────────────────────────
+
+fn _suggest_next(kind: string, rule: array) -> array {
+    // returns [target_status, rationale] or [] when no suggestion
+    let id = rule[0]
+    let status = rule[1]
+    let keys = rule[3]
+    let tag = kind + "#" + id
+
+    if status == "deferred" { return [] }
+    if status == "convention" { return [] }
+    if status == "deprecated" { return [] }
+
+    if status == "live" {
+        // live → deprecated detection
+        let dep_at = keys_first(keys, "deprecated-at")
+        if dep_at != "" {
+            return ["deprecated", "deprecated-at=" + dep_at + " present"]
+        }
+        // scan follow-up entries for "retire" marker
+        let fus = keys_all(keys, "follow-up")
+        for f in fus {
+            if f.index_of("retire") >= 0 {
+                return ["deprecated", "follow-up contains 'retire' marker"]
+            }
+        }
+        return []
+    }
+
+    if status == "new" {
+        let s = _window_stats(tag, 7)
+        if s[1] == 0 {
+            let rationale = "0 FAIL in last 7d (" + to_string(s[0]) + " evaluations)"
+            return ["warn", rationale]
+        }
+        return []
+    }
+
+    if status == "warn" {
+        let s = _window_stats(tag, 30)
+        if s[1] == 0 {
+            let rationale = "0 FAIL in last 30d (" + to_string(s[0]) + " evaluations)"
+            return ["live", rationale]
+        }
+        return []
+    }
+
+    return []
+}
+
+// ─── check command ───────────────────────────────────────────────
+
+fn _check_kind(kind: string, path: string) -> int {
+    if !_file_exists(path) { return 0 }
+    let rules = load_raw_file(path)
+    let mut n = 0
+    for r in rules {
+        let sug = _suggest_next(kind, r)
+        if len(sug) != 2 { continue }
+        let id = r[0]
+        let cur = r[1]
+        println("SUGGEST: " + kind + "#" + id + " " + cur + " → " + sug[0] + "  (" + sug[1] + ")")
+        n = n + 1
+    }
+    return n
+}
+
+fn cmd_check() -> int {
+    let mut total = 0
+    total = total + _check_kind("raw", ".raw")
+    total = total + _check_kind("own", ".own")
+    if total == 0 {
+        println("(no promotion candidates — all rules are stable in their current lane)")
+    } else {
+        println("-- " + to_string(total) + " promotion suggestion(s)")
+    }
+    return 0
+}
+
+// ─── apply command ───────────────────────────────────────────────
+//
+// Minimal in-place header rewrite. We locate the `<kind> <id>` line in
+// the target file (.raw or .own) and replace only the 3rd whitespace-
+// separated token (the status word). All comments, key lines, and
+// spacing are preserved byte-for-byte.
+
+fn _valid_status(s: string) -> bool {
+    if s == "new" { return true }
+    if s == "warn" { return true }
+    if s == "live" { return true }
+    if s == "deprecated" { return true }
+    if s == "deferred" { return true }
+    if s == "convention" { return true }
+    return false
+}
+
+fn _split_kind_id(rule_id: string) -> array {
+    // "raw#7" → ["raw", "7"]
+    // "own#3" → ["own", "3"]
+    // bare "7" → ["raw", "7"] (default kind)
+    let h = rule_id.index_of("#")
+    if h < 0 { return ["raw", rule_id] }
+    return [rule_id.substring(0, h), rule_id.substring(h + 1, len(rule_id))]
+}
+
+fn _target_file_for(kind: string) -> string {
+    if kind == "own" { return ".own" }
+    return ".raw"
+}
+
+fn _first_non_space(s: string) -> int {
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c != " " && c != "\t" { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// splits a header line into its 4 logical chunks keeping spacing:
+//   <kind> <id> <status> "<name>"
+// returns [kind, id, status, rest_from_name_onwards] or [] if malformed.
+fn _parse_header_line(line: string) -> array {
+    let i1 = _first_non_space(line)
+    if i1 < 0 { return [] }
+    let rest1 = line.substring(i1, len(line))
+    let sp1 = rest1.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = rest1.substring(0, sp1)
+    let after1 = rest1.substring(sp1, len(rest1))
+    let i2 = _first_non_space(after1)
+    if i2 < 0 { return [] }
+    let rest2 = after1.substring(i2, len(after1))
+    let sp2 = rest2.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest2.substring(0, sp2)
+    let after2 = rest2.substring(sp2, len(rest2))
+    let i3 = _first_non_space(after2)
+    if i3 < 0 { return [] }
+    let rest3 = after2.substring(i3, len(after2))
+    let sp3 = rest3.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest3.substring(0, sp3)
+    let after3 = rest3.substring(sp3, len(rest3))
+    return [kind, id, status, after3]
+}
+
+fn _rewrite_status(path: string, kind: string, id: string, new_status: string, expect_old: string) -> array {
+    // returns [ok, old_status, detail]
+    if !_file_exists(path) { return [false, "", "file missing: " + path] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut out = []
+    let mut found = false
+    let mut old_status = ""
+    for ln in lines {
+        let h = _parse_header_line(ln)
+        if len(h) == 4 && h[0] == kind && h[1] == id {
+            old_status = h[2]
+            if expect_old != "" && expect_old != old_status {
+                return [false, old_status, "current status is " + old_status + ", not " + expect_old]
+            }
+            // reconstruct: leading-indent preserved via slicing out status token only
+            let i1 = _first_non_space(ln)
+            let prefix = ln.substring(0, i1) + kind + " " + id + " " + new_status
+            let new_line = prefix + h[3]
+            out = out.push(new_line)
+            found = true
+        } else {
+            out = out.push(ln)
+        }
+    }
+    if !found { return [false, "", "rule not found: " + kind + "#" + id] }
+
+    // atomic write via tmp
+    let tmp = path + ".promote.tmp"
+    let mut body = ""
+    let n = len(out)
+    let mut i = 0
+    while i < n {
+        if i > 0 { body = body + "\n" }
+        body = body + out[i]
+        i = i + 1
+    }
+    let q = _shell_quote(body)
+    let w = exec_with_status("printf '%s' " + q + " > " + _shell_quote(tmp))
+    if w[1] != 0 { return [false, old_status, "tmp write failed"] }
+
+    // On Darwin the SSOT may be uchg-locked; we deliberately do NOT
+    // touch chflags here — caller must have opened an unlock window
+    // via tool/hx_unlock.hexa. mv into place; if EPERM, bail.
+    let mv = exec_with_status("mv " + _shell_quote(tmp) + " " + _shell_quote(path))
+    if mv[1] != 0 {
+        exec_with_status("rm -f " + _shell_quote(tmp))
+        return [false, old_status, "mv refused (file likely still locked — run hx_unlock first)"]
+    }
+    return [true, old_status, "ok"]
+}
+
+// ─── audit logging (local wrapper) ───────────────────────────────
+
+fn _audit_path() -> string { return ".raw-audit" }
+
+fn _audit_append_promote(actor: string, detail: string, result: string) -> bool {
+    if !_file_exists(_audit_path()) {
+        // create shell for audit log so apply doesn't silently fail
+        let hdr = "# .raw-audit — append-only event log (raw#0 P1c)\n" +
+                  "# format: timestamp | event | actor | reason | result | sha_before | sha_after\n"
+        let qh = _shell_quote(hdr)
+        let r = exec_with_status("printf '%s' " + qh + " > " + _audit_path())
+        if r[1] != 0 { return false }
+    }
+    let ts = to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+    let line = ts + " | promote | " + actor + " | " + detail + " | " + result + " | - | -\n"
+
+    // open append window on Darwin
+    if _is_darwin() {
+        exec_with_status("chflags nouchg " + _shell_quote(_audit_path()) + " 2>&1")
+    }
+    let q = _shell_quote(line)
+    let r = exec_with_status("printf '%s' " + q + " >> " + _audit_path())
+    if _is_darwin() {
+        exec_with_status("chflags uchg " + _shell_quote(_audit_path()) + " 2>&1")
+    }
+    return r[1] == 0
+}
+
+fn cmd_apply(rule_arg: string, target_status: string) -> int {
+    if rule_arg == "" || target_status == "" {
+        eprintln("usage: apply <rule_id> <target_status>")
+        eprintln("  rule_id examples: 7, raw#7, own#3")
+        eprintln("  target_status   : new | warn | live | deprecated")
+        return 2
+    }
+    if !_valid_status(target_status) {
+        eprintln("raw_all_promote: invalid target status '" + target_status + "'")
+        return 2
+    }
+    let ki = _split_kind_id(rule_arg)
+    let kind = ki[0]
+    let id = ki[1]
+    let path = _target_file_for(kind)
+
+    // Find the current rule + verify the suggestion logic agrees.
+    // (agrees = the target matches what `check` would propose OR the
+    // caller explicitly opts into a reverse move; we allow either but
+    // warn on the reverse direction.)
+    let rules = load_raw_file(path)
+    let mut current = ""
+    for r in rules {
+        if r[0] == id { current = r[1] }
+    }
+    if current == "" {
+        eprintln("raw_all_promote: no rule " + kind + "#" + id + " in " + path)
+        return 2
+    }
+    if current == target_status {
+        println("raw_all_promote: no-op — already at " + target_status)
+        return 0
+    }
+
+    // monotonic forward order check — warn only, do not block
+    let order_new = 0
+    let order_warn = 1
+    let order_live = 2
+    let order_dep = 3
+    let mut cur_o = -1
+    let mut tgt_o = -1
+    if current == "new" { cur_o = order_new }
+    else if current == "warn" { cur_o = order_warn }
+    else if current == "live" { cur_o = order_live }
+    else if current == "deprecated" { cur_o = order_dep }
+    if target_status == "new" { tgt_o = order_new }
+    else if target_status == "warn" { tgt_o = order_warn }
+    else if target_status == "live" { tgt_o = order_live }
+    else if target_status == "deprecated" { tgt_o = order_dep }
+    if cur_o >= 0 && tgt_o >= 0 && tgt_o < cur_o {
+        eprintln("raw_all_promote: WARN — reverse promotion " + current + " → " + target_status)
+    }
+
+    let res = _rewrite_status(path, kind, id, target_status, current)
+    let ok = res[0]
+    let detail = res[2]
+    let rule_label = kind + "#" + id + " " + current + "→" + target_status
+
+    if !ok {
+        eprintln("raw_all_promote: apply FAILED — " + detail)
+        _audit_append_promote(_current_user(), rule_label, "fail")
+        return 1
+    }
+
+    println("raw_all_promote: applied " + rule_label)
+    _audit_append_promote(_current_user(), rule_label, "ok")
+    return 0
+}
+
+// ─── dispatch ────────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_all_promote.hexa <cmd>")
+    eprintln("  check                                 — dry-run suggestion scan")
+    eprintln("  apply <rule_id> <target_status>       — mutate status (needs unlock)")
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let cmd = av[2]
+    if cmd == "check" { return cmd_check() }
+    if cmd == "apply" {
+        if len(av) < 5 {
+            _usage()
+            return 2
+        }
+        return cmd_apply(av[3], av[4])
+    }
+    _usage()
+    return 2
+}
+
+exit(main())

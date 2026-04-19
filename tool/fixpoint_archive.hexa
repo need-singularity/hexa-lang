@@ -1,0 +1,391 @@
+#!hexa strict
+// tool/fixpoint_archive.hexa — raw#0 P7 fixpoint evidence archive manager
+//
+// PURPOSE
+//   Long-term cryptographic evidence of self-host fixpoint stability.
+//   Each snapshot captures the SHA-256 of build/hexa_stage0.real (the
+//   canonical fixpoint artifact) together with the current day stamp.
+//   The snapshot binary is copied into a repo-external directory so that
+//   even a `git clean -fdx` cannot destroy the provenance chain.
+//
+//   A text index `.raw-fixpoint-index` lives inside the repo: a
+//   sequential audit log of every snapshot taken, one line per entry.
+//   macOS hosts additionally apply `chflags uchg` to each snapshot copy
+//   so that the evidence cannot be silently overwritten.
+//
+// USAGE
+//   ./hexa tool/fixpoint_archive.hexa snapshot
+//   ./hexa tool/fixpoint_archive.hexa list [N]
+//   ./hexa tool/fixpoint_archive.hexa rotate
+//
+// FLOW (snapshot)
+//   1. Read $HOME, compute archive dir path
+//   2. Compute today YYYYMMDD (UTC)
+//   3. Run sha256sum on build/hexa_stage0.real → full 64-char hex
+//   4. Target path: $HOME/.hexa-fixpoint-archive/YYYYMMDD_<sha12>.bin
+//   5. mkdir -p archive dir; cp binary into place; chflags uchg on Darwin
+//   6. Append "YYYY-MM-DD | <full_sha> | <abs_archive_path>" to index
+//
+// FLOW (rotate)
+//   - Snapshots older than 30 days: keep only one per ISO-week (Mon).
+//   - Snapshots older than 12 weeks: keep only one per month (day 01).
+//   - Deletion is attempted via rm; on Darwin we chflags nouchg first.
+//   - Index is not rewritten (append-only) — deleted rows keep a
+//     "(rotated-out)" suffix written to a sibling `.raw-fixpoint-rotated`.
+
+use self.core.law_io
+
+fn _index_path() -> string { return ".raw-fixpoint-index" }
+fn _rotated_path() -> string { return ".raw-fixpoint-rotated" }
+fn _artifact_path() -> string { return "build/hexa_stage0.real" }
+
+fn _home_dir() -> string {
+    let h = env("HOME")
+    if h != "" { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _archive_dir() -> string {
+    return _home_dir() + "/.hexa-fixpoint-archive"
+}
+
+fn _is_darwin() -> bool {
+    let u = to_string(exec("uname -s")).trim()
+    return u == "Darwin"
+}
+
+fn _today_utc_ymd() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%d\"")).trim()
+}
+
+fn _today_utc_compact() -> string {
+    return to_string(exec("date -u +\"%Y%m%d\"")).trim()
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _file_exists(p: string) -> bool {
+    let r = exec_with_status("test -f " + _shell_quote(p))
+    return r[1] == 0
+}
+
+fn _dir_exists(p: string) -> bool {
+    let r = exec_with_status("test -d " + _shell_quote(p))
+    return r[1] == 0
+}
+
+// ─── hash computation ────────────────────────────────────────────
+
+fn _sha256_of(path: string) -> string {
+    // prefer sha256sum (linux), fall back to shasum -a 256 (macOS)
+    let r = exec_with_status("sha256sum " + _shell_quote(path) + " 2>/dev/null")
+    if r[1] == 0 {
+        let out = to_string(r[0]).trim()
+        if out != "" {
+            let sp = out.index_of(" ")
+            if sp > 0 { return out.substring(0, sp) }
+            return out
+        }
+    }
+    let r2 = exec_with_status("shasum -a 256 " + _shell_quote(path) + " 2>/dev/null")
+    if r2[1] == 0 {
+        let out2 = to_string(r2[0]).trim()
+        if out2 != "" {
+            let sp2 = out2.index_of(" ")
+            if sp2 > 0 { return out2.substring(0, sp2) }
+            return out2
+        }
+    }
+    return ""
+}
+
+// ─── Darwin chflags helpers ──────────────────────────────────────
+
+fn _lock_darwin(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags uchg " + _shell_quote(path) + " 2>&1")
+    return r[1] == 0
+}
+
+fn _unlock_darwin(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags nouchg " + _shell_quote(path) + " 2>&1")
+    return r[1] == 0
+}
+
+// ─── snapshot ────────────────────────────────────────────────────
+
+fn _ensure_archive_dir() -> bool {
+    let d = _archive_dir()
+    if _dir_exists(d) { return true }
+    let r = exec_with_status("mkdir -p " + _shell_quote(d))
+    return r[1] == 0
+}
+
+fn _short_sha(full: string) -> string {
+    if len(full) <= 12 { return full }
+    return full.substring(0, 12)
+}
+
+fn _append_index(line: string) -> bool {
+    let q = _shell_quote(line)
+    let r = exec_with_status("printf '%s\\n' " + q + " >> " + _index_path())
+    return r[1] == 0
+}
+
+fn cmd_snapshot() -> int {
+    let art = _artifact_path()
+    if !_file_exists(art) {
+        eprintln("fixpoint_archive: missing artifact — " + art)
+        return 1
+    }
+    let full = _sha256_of(art)
+    if full == "" {
+        eprintln("fixpoint_archive: sha256 computation failed")
+        return 1
+    }
+    if !_ensure_archive_dir() {
+        eprintln("fixpoint_archive: cannot create " + _archive_dir())
+        return 1
+    }
+
+    let stamp = _today_utc_compact()
+    let target = _archive_dir() + "/" + stamp + "_" + _short_sha(full) + ".bin"
+
+    // copy artifact into archive (overwrite if same-day same-hash exists)
+    if _file_exists(target) {
+        // unlock before overwrite on Darwin; leaves prior evidence intact
+        // via index history if rotation occurs later.
+        _unlock_darwin(target)
+    }
+    let cp = exec_with_status("cp " + _shell_quote(art) + " " + _shell_quote(target))
+    if cp[1] != 0 {
+        eprintln("fixpoint_archive: cp failed (exit " + to_string(cp[1]) + ")")
+        return 1
+    }
+
+    // immutable flag on macOS (chflags uchg)
+    let locked = _lock_darwin(target)
+    if !locked && _is_darwin() {
+        eprintln("fixpoint_archive: WARN — chflags uchg failed on " + target)
+    }
+
+    let today = _today_utc_ymd()
+    let line = today + " | " + full + " | " + target
+    if !_append_index(line) {
+        eprintln("fixpoint_archive: index append failed")
+        return 1
+    }
+
+    println("[fixpoint-archive] snapshot OK")
+    println("  date   : " + today)
+    println("  sha256 : " + full)
+    println("  path   : " + target)
+    return 0
+}
+
+// ─── list ────────────────────────────────────────────────────────
+
+fn _index_lines() -> array {
+    let mut out = []
+    if !_file_exists(_index_path()) { return out }
+    let src = to_string(read_file(_index_path()))
+    for ln in split(src, "\n") {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        if t.substring(0, 1) == "#" { continue }
+        out = out.push(t)
+    }
+    return out
+}
+
+fn cmd_list(n: int) -> int {
+    let rows = _index_lines()
+    let total = len(rows)
+    if total == 0 {
+        println("(no fixpoint snapshots yet — run: snapshot)")
+        return 0
+    }
+    let mut start = 0
+    if total > n { start = total - n }
+    let mut i = start
+    while i < total {
+        println(rows[i])
+        i = i + 1
+    }
+    println("-- shown " + to_string(total - start) + " / total " + to_string(total))
+    return 0
+}
+
+// ─── rotate ──────────────────────────────────────────────────────
+//
+// Rules (kept intentionally conservative; destructive path runs only
+// when _is_archived_keeper returns false for the given filename):
+//   · filename convention: YYYYMMDD_<short>.bin
+//   · day_of_year parsed from filename; month parsed from substring 4:6
+//   · age bucket determined by _days_since(YYYYMMDD) vs today
+//   · keep-set: every file ≤ 30 days → always keep
+//              every file 31..84 days → keep only Monday (weekday==1)
+//              every file > 84 days  → keep only day-01 of its month
+
+fn _days_since(ymd_compact: string) -> int {
+    // "YYYYMMDD" → seconds_since_epoch(midnight), compare with today
+    if len(ymd_compact) != 8 { return -1 }
+    let y = ymd_compact.substring(0, 4)
+    let m = ymd_compact.substring(4, 6)
+    let d = ymd_compact.substring(6, 8)
+    let iso = y + "-" + m + "-" + d
+    let r = exec_with_status("date -u -d " + _shell_quote(iso) + " +%s 2>/dev/null")
+    let s = to_string(r[0]).trim()
+    let mut t = -1
+    if r[1] == 0 && s != "" {
+        t = to_int(s)
+    } else {
+        let r2 = exec_with_status("date -j -f '%Y-%m-%d' " + _shell_quote(iso) + " +%s 2>/dev/null")
+        let s2 = to_string(r2[0]).trim()
+        if r2[1] == 0 && s2 != "" { t = to_int(s2) }
+    }
+    if t < 0 { return -1 }
+    let now_s = to_int(to_string(exec("date -u +%s")).trim())
+    let diff = (now_s - t) / 86400
+    return diff
+}
+
+fn _weekday_iso(ymd_compact: string) -> int {
+    // returns 1..7 (Mon..Sun) or -1
+    if len(ymd_compact) != 8 { return -1 }
+    let y = ymd_compact.substring(0, 4)
+    let m = ymd_compact.substring(4, 6)
+    let d = ymd_compact.substring(6, 8)
+    let iso = y + "-" + m + "-" + d
+    let r = exec_with_status("date -u -d " + _shell_quote(iso) + " +%u 2>/dev/null")
+    if r[1] == 0 {
+        let s = to_string(r[0]).trim()
+        if s != "" { return to_int(s) }
+    }
+    let r2 = exec_with_status("date -j -f '%Y-%m-%d' " + _shell_quote(iso) + " +%u 2>/dev/null")
+    if r2[1] == 0 {
+        let s2 = to_string(r2[0]).trim()
+        if s2 != "" { return to_int(s2) }
+    }
+    return -1
+}
+
+fn _is_keeper(fname: string) -> bool {
+    // fname "YYYYMMDD_<short>.bin"
+    if len(fname) < 12 { return true }
+    let stamp = fname.substring(0, 8)
+    let age = _days_since(stamp)
+    if age < 0 { return true }      // unknown → keep (safe default)
+    if age <= 30 { return true }    // recent → always keep
+    if age <= 84 {
+        // weekly bucket: keep only Monday
+        let wd = _weekday_iso(stamp)
+        return wd == 1
+    }
+    // > 84 days → keep only the 1st of the month
+    let dd = stamp.substring(6, 8)
+    return dd == "01"
+}
+
+fn _list_archive_files() -> array {
+    let mut out = []
+    let d = _archive_dir()
+    if !_dir_exists(d) { return out }
+    let raw = to_string(exec("ls -1 " + _shell_quote(d) + " 2>/dev/null"))
+    for ln in split(raw, "\n") {
+        let t = ln.trim()
+        if t == "" { continue }
+        if !t.ends_with(".bin") { continue }
+        out = out.push(t)
+    }
+    return out
+}
+
+fn _append_rotated(line: string) -> bool {
+    let q = _shell_quote(line)
+    let r = exec_with_status("printf '%s\\n' " + q + " >> " + _rotated_path())
+    return r[1] == 0
+}
+
+fn cmd_rotate() -> int {
+    let files = _list_archive_files()
+    if len(files) == 0 {
+        println("(no archive files — rotate is a no-op)")
+        return 0
+    }
+    let today = _today_utc_ymd()
+    let mut kept = 0
+    let mut dropped = 0
+    for f in files {
+        if _is_keeper(f) {
+            kept = kept + 1
+            continue
+        }
+        let full = _archive_dir() + "/" + f
+        _unlock_darwin(full)
+        let r = exec_with_status("rm -f " + _shell_quote(full))
+        if r[1] == 0 {
+            dropped = dropped + 1
+            _append_rotated(today + " | rotated-out | " + full)
+        } else {
+            eprintln("fixpoint_archive: rm failed for " + full)
+        }
+    }
+    println("[fixpoint-archive] rotate complete")
+    println("  kept    : " + to_string(kept))
+    println("  dropped : " + to_string(dropped))
+    return 0
+}
+
+// ─── CLI dispatch ────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/fixpoint_archive.hexa <cmd>")
+    eprintln("  snapshot              — capture current fixpoint evidence")
+    eprintln("  list [N]              — show last N snapshots (default 10)")
+    eprintln("  rotate                — prune by daily/weekly/monthly buckets")
+}
+
+fn _parse_int_or(def: int, s: string) -> int {
+    if s == "" { return def }
+    let mut n = 0
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c >= "0" && c <= "9" {
+            n = n * 10 + (ord(c) - ord("0"))
+        } else {
+            return def
+        }
+        i = i + 1
+    }
+    if n <= 0 { return def }
+    return n
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let cmd = av[2]
+    if cmd == "snapshot" {
+        return cmd_snapshot()
+    }
+    if cmd == "list" {
+        let mut n = 10
+        if len(av) >= 4 { n = _parse_int_or(10, av[3]) }
+        return cmd_list(n)
+    }
+    if cmd == "rotate" {
+        return cmd_rotate()
+    }
+    _usage()
+    return 2
+}
+
+exit(main())

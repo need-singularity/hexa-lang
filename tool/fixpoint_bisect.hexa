@@ -1,0 +1,353 @@
+#!hexa strict
+// tool/fixpoint_bisect.hexa — raw#0 P7 drift-commit bisecter
+//
+// PURPOSE
+//   When SHA256(hexa_2) != SHA256(hexa_3) the fixpoint gate has broken.
+//   Finding the first bad commit by hand is slow and error-prone; git
+//   bisect automates it but needs a reproducible per-step verdict.
+//
+//   This tool drives `git bisect` between a known-good and known-bad
+//   commit, invoking `tool/verify_fixpoint.hexa` at each step and
+//   translating its exit code into the bisect verdict:
+//
+//     verify_fixpoint exit 0  → bisect good
+//     verify_fixpoint exit 2  → bisect bad  (fixpoint not reached)
+//     anything else           → bisect skip (compile failure etc.)
+//
+//   After bisect terminates, the drift commit is reported together
+//   with author, date, subject, and a files-touched summary.
+//
+// USAGE
+//   ./hexa tool/fixpoint_bisect.hexa <good_sha> <bad_sha>
+//   ./hexa tool/fixpoint_bisect.hexa --last-30d
+//
+// FLOW (sha mode)
+//   1. Precondition — git repo clean (no dirty working tree).
+//   2. git bisect start <bad> <good>
+//   3. git bisect run `hexa tool/fixpoint_bisect.hexa --verdict`
+//   4. Parse the final "<sha> is the first bad commit" line.
+//   5. git bisect reset.  Print report.
+//
+// FLOW (--last-30d)
+//   1. Read .raw-fixpoint-index rows, filter age ≤ 30d.
+//   2. Walk entries in chronological order comparing sha column.
+//   3. First row whose sha differs from prior rows = drift candidate.
+//   4. Emit commit spec (if rows include git SHA hint) or date window.
+//
+// SUBCOMMAND (internal, invoked by git bisect run)
+//   --verdict                — build + run verify_fixpoint, translate exit
+
+use self.core.law_io
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exec_capture(cmd: string) -> array {
+    return exec_with_status(cmd + " 2>&1")
+}
+
+fn _git_worktree_clean() -> bool {
+    let r = _exec_capture("git status --porcelain")
+    if r[1] != 0 { return false }
+    return to_string(r[0]).trim() == ""
+}
+
+fn _git_rev_parse(r: string) -> string {
+    let res = _exec_capture("git rev-parse --verify " + _shell_quote(r))
+    if res[1] != 0 { return "" }
+    return to_string(res[0]).trim()
+}
+
+// ─── verdict subcommand (run inside bisect) ──────────────────────
+//
+// Strategy:
+//   · If stage0 self-build + verify_fixpoint path exists, invoke it.
+//   · Exit code mapping uses the contract from tool/verify_fixpoint.hexa:
+//       0 = converged → bisect good (exit 0)
+//       2 = not converged → bisect bad (exit 1)
+//       other = skip (exit 125)
+//   · Build failures are treated as skip to keep the search moving.
+
+fn cmd_verdict() -> int {
+    // require stage0 available — otherwise skip
+    let s0 = exec_with_status("test -x ./build/hexa_stage0")
+    if s0[1] != 0 {
+        eprintln("[fixpoint-bisect] stage0 unavailable → skip")
+        return 125
+    }
+    let vf = "tool/verify_fixpoint.hexa"
+    let vf_exists = exec_with_status("test -f " + _shell_quote(vf))
+    if vf_exists[1] != 0 {
+        eprintln("[fixpoint-bisect] " + vf + " missing → skip")
+        return 125
+    }
+    let cmd = "./build/hexa_stage0 " + vf + " 2>&1"
+    let r = exec_with_status(cmd)
+    let rc = r[1]
+    if rc == 0 { return 0 }          // good
+    if rc == 2 { return 1 }          // bad (diverged)
+    // build failure, missing artifact, etc. → skip
+    eprintln("[fixpoint-bisect] verify_fixpoint exit " + to_string(rc) + " → skip")
+    return 125
+}
+
+// ─── report extraction ───────────────────────────────────────────
+
+fn _commit_info(sha: string) -> array {
+    // returns [author, iso_date, subject, files_summary]
+    // Use %x1f (ASCII Unit Separator, 0x1F) as field separator via git's
+    // own expansion — we then split on the literal byte captured into out.
+    // To stay portable across hexa_v2 string literals we instead emit a
+    // 5-char sentinel "||~||" which is extremely unlikely in author names.
+    let sep = "||~||"
+    let fmt = "%an" + sep + "%aI" + sep + "%s"
+    let r = _exec_capture("git show -s --format=" + _shell_quote(fmt) + " " + _shell_quote(sha))
+    let mut author = ""
+    let mut date = ""
+    let mut subject = ""
+    if r[1] == 0 {
+        let line = to_string(r[0]).trim()
+        let parts = split(line, sep)
+        if len(parts) >= 1 { author = parts[0] }
+        if len(parts) >= 2 { date = parts[1] }
+        if len(parts) >= 3 { subject = parts[2] }
+    }
+    // files touched
+    let rf = _exec_capture("git show --stat --format= " + _shell_quote(sha))
+    let mut files_summary = ""
+    if rf[1] == 0 {
+        let txt = to_string(rf[0]).trim()
+        let lines = split(txt, "\n")
+        let n = len(lines)
+        let mut shown = 0
+        let mut i = 0
+        while i < n && shown < 6 {
+            let ln = lines[i].trim()
+            if ln != "" {
+                if files_summary != "" { files_summary = files_summary + "\n  " }
+                files_summary = "  " + files_summary + ln
+                shown = shown + 1
+            }
+            i = i + 1
+        }
+        if n > 6 { files_summary = files_summary + "\n  … (+" + to_string(n - 6) + " more)" }
+    }
+    return [author, date, subject, files_summary]
+}
+
+fn _print_report(drift_sha: string) {
+    let info = _commit_info(drift_sha)
+    println("")
+    println("============ FIXPOINT DRIFT REPORT ============")
+    println(" commit  : " + drift_sha)
+    println(" author  : " + info[0])
+    println(" date    : " + info[1])
+    println(" subject : " + info[2])
+    println(" files   :")
+    println(info[3])
+    println("================================================")
+}
+
+// ─── bisect driver ───────────────────────────────────────────────
+
+fn _parse_first_bad_line(bisect_log: string) -> string {
+    // git bisect run prints "<sha> is the first bad commit"
+    for ln in split(bisect_log, "\n") {
+        let t = ln.trim()
+        let needle = " is the first bad commit"
+        let idx = t.index_of(needle)
+        if idx > 0 {
+            return t.substring(0, idx)
+        }
+    }
+    return ""
+}
+
+fn cmd_bisect(good_raw: string, bad_raw: string) -> int {
+    if !_git_worktree_clean() {
+        eprintln("fixpoint_bisect: working tree is dirty — commit or stash first")
+        return 2
+    }
+    let good = _git_rev_parse(good_raw)
+    if good == "" {
+        eprintln("fixpoint_bisect: cannot resolve good commit — " + good_raw)
+        return 2
+    }
+    let bad = _git_rev_parse(bad_raw)
+    if bad == "" {
+        eprintln("fixpoint_bisect: cannot resolve bad commit — " + bad_raw)
+        return 2
+    }
+
+    println("[fixpoint-bisect] good=" + good)
+    println("[fixpoint-bisect] bad =" + bad)
+
+    // start
+    let rs = _exec_capture("git bisect start")
+    if rs[1] != 0 {
+        eprintln("fixpoint_bisect: git bisect start failed")
+        eprintln(to_string(rs[0]))
+        return 1
+    }
+    let rb = _exec_capture("git bisect bad " + _shell_quote(bad))
+    if rb[1] != 0 {
+        eprintln("fixpoint_bisect: git bisect bad failed")
+        eprintln(to_string(rb[0]))
+        _exec_capture("git bisect reset")
+        return 1
+    }
+    let rg = _exec_capture("git bisect good " + _shell_quote(good))
+    if rg[1] != 0 {
+        eprintln("fixpoint_bisect: git bisect good failed")
+        eprintln(to_string(rg[0]))
+        _exec_capture("git bisect reset")
+        return 1
+    }
+
+    // run
+    let runner = "./build/hexa_stage0 tool/fixpoint_bisect.hexa --verdict"
+    let rr = _exec_capture("git bisect run " + runner)
+    let log = to_string(rr[0])
+    println(log)
+    let drift = _parse_first_bad_line(log)
+
+    // always reset to leave repo in known state
+    _exec_capture("git bisect reset")
+
+    if drift == "" {
+        eprintln("fixpoint_bisect: could not extract drift commit from bisect output")
+        return 1
+    }
+
+    _print_report(drift)
+    return 0
+}
+
+// ─── --last-30d mode ─────────────────────────────────────────────
+//
+// Walk .raw-fixpoint-index chronologically, flag the first row whose
+// hash differs from the preceding majority baseline. This does not
+// invoke git; it only narrows the investigation window.
+
+fn _index_rows() -> array {
+    let path = ".raw-fixpoint-index"
+    let r = exec_with_status("test -f " + _shell_quote(path))
+    if r[1] != 0 { return [] }
+    let src = to_string(read_file(path))
+    let mut rows = []
+    for ln in split(src, "\n") {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        if t.substring(0, 1) == "#" { continue }
+        rows = rows.push(t)
+    }
+    return rows
+}
+
+fn _row_date(row: string) -> string {
+    // "YYYY-MM-DD | <sha> | <path>"
+    let p = row.index_of("|")
+    if p < 0 { return "" }
+    return row.substring(0, p).trim()
+}
+
+fn _row_sha(row: string) -> string {
+    let p = row.index_of("|")
+    if p < 0 { return "" }
+    let rest = row.substring(p + 1, len(row))
+    let q = rest.index_of("|")
+    if q < 0 { return rest.trim() }
+    return rest.substring(0, q).trim()
+}
+
+fn _days_since_iso(iso: string) -> int {
+    let r = exec_with_status("date -u -d " + _shell_quote(iso) + " +%s 2>/dev/null")
+    let mut t = -1
+    if r[1] == 0 {
+        let s = to_string(r[0]).trim()
+        if s != "" { t = to_int(s) }
+    }
+    if t < 0 {
+        let r2 = exec_with_status("date -j -f '%Y-%m-%d' " + _shell_quote(iso) + " +%s 2>/dev/null")
+        if r2[1] == 0 {
+            let s2 = to_string(r2[0]).trim()
+            if s2 != "" { t = to_int(s2) }
+        }
+    }
+    if t < 0 { return -1 }
+    let now = to_int(to_string(exec("date -u +%s")).trim())
+    return (now - t) / 86400
+}
+
+fn cmd_last_30d() -> int {
+    let rows = _index_rows()
+    if len(rows) == 0 {
+        println("fixpoint_bisect: .raw-fixpoint-index empty — run fixpoint_archive snapshot first")
+        return 0
+    }
+    let mut baseline = ""
+    let mut drift_row = ""
+    for r in rows {
+        let d = _row_date(r)
+        if d == "" { continue }
+        let age = _days_since_iso(d)
+        if age < 0 { continue }
+        if age > 30 { continue }
+        let sha = _row_sha(r)
+        if baseline == "" {
+            baseline = sha
+            continue
+        }
+        if sha != baseline {
+            drift_row = r
+            break
+        }
+    }
+    if baseline == "" {
+        println("fixpoint_bisect: no snapshots within last 30 days")
+        return 0
+    }
+    if drift_row == "" {
+        println("fixpoint_bisect: no drift detected in last 30 days")
+        println("  baseline sha: " + baseline)
+        return 0
+    }
+    println("fixpoint_bisect: DRIFT detected")
+    println("  baseline sha : " + baseline)
+    println("  drift row    : " + drift_row)
+    println("  → investigate commits between this date and the prior snapshot")
+    return 0
+}
+
+// ─── dispatch ────────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/fixpoint_bisect.hexa <good_sha> <bad_sha>")
+    eprintln("       hexa tool/fixpoint_bisect.hexa --last-30d")
+    eprintln("       hexa tool/fixpoint_bisect.hexa --verdict   (internal; used by git bisect run)")
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let a0 = av[2]
+    if a0 == "--verdict" { return cmd_verdict() }
+    if a0 == "--last-30d" { return cmd_last_30d() }
+    if len(a0) >= 2 && a0.substring(0, 2) == "--" {
+        _usage()
+        return 2
+    }
+    if len(av) < 4 {
+        _usage()
+        return 2
+    }
+    let good = a0
+    let bad = av[3]
+    return cmd_bisect(good, bad)
+}
+
+exit(main())
