@@ -77,6 +77,38 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
+#include <unistd.h>     // unlink, nanosleep companions
+#include <time.h>       // nanosleep
+
+#ifdef HXCCL_NCCL
+// Day-2: real NCCL + CUDA runtime headers. Compile with -DHXCCL_NCCL=1
+// and link -lnccl -lcudart. tool/build_hxccl_linux.hexa --with-nccl
+// already wires the include + link flags; nothing else to do.
+#include <cuda_runtime.h>
+#include <nccl.h>
+
+// Process-global NCCL communicator and stream. NCCL collectives need
+// a stream; we use a dedicated non-blocking stream rather than the
+// default 0 stream so other CUDA work on stream 0 doesn't serialize
+// against collectives.
+static ncclComm_t  g_hxccl_comm   = NULL;
+static cudaStream_t g_hxccl_stream = 0;
+static int          g_hxccl_device = -1;
+
+// Map our ABI dtype int → ncclDataType_t.
+//   0 = f32 → ncclFloat
+//   1 = f16 → ncclFloat16
+//   2 = bf16 → ncclBfloat16  (NCCL >= 2.10)
+static inline ncclDataType_t hxccl_dtype_to_nccl(int64_t dtype) {
+    switch (dtype) {
+        case 0: return ncclFloat;
+        case 1: return ncclFloat16;
+        case 2: return ncclBfloat16;
+        default: return ncclFloat;
+    }
+}
+#endif
 
 // ─────────────────────────────────────────────────────────────
 // Process-local rank/world cache. The real NCCL path will store
@@ -113,8 +145,113 @@ int64_t hxccl_init(int64_t rank, int64_t world_size) {
     if (rank < 0 || rank >= world_size) return -3;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclCommInitRank here. For now the macro is undefined so
-    // we fall through to the stub regardless.
+    // Day-2 real NCCL path.
+    //
+    // Rendezvous: rank 0 calls ncclGetUniqueId() and writes it to
+    // $HXCCL_UNIQUE_ID_FILE (default /tmp/hxccl_uid_<world_size>).
+    // Other ranks spin-wait until that file appears, then read it.
+    // This avoids pulling in MPI / TCP store as a hard dep — the
+    // FSDP launcher is responsible for placing all ranks on the
+    // same node (intra-node NVLink path) or sharing the file via
+    // shared FS (inter-node).
+    //
+    // Device binding: each rank pins to cuda device index = rank
+    // (matches the SXM 2-GPU layout in alm_r11_fsdp_plan).
+    {
+        const char* uid_path_env = getenv("HXCCL_UNIQUE_ID_FILE");
+        char uid_path[256];
+        if (uid_path_env && uid_path_env[0]) {
+            snprintf(uid_path, sizeof(uid_path), "%s", uid_path_env);
+        } else {
+            snprintf(uid_path, sizeof(uid_path),
+                     "/tmp/hxccl_uid_%lld", (long long)world_size);
+        }
+
+        // Pin device to rank — must happen BEFORE ncclCommInitRank.
+        cudaError_t cerr = cudaSetDevice((int)rank);
+        if (cerr != cudaSuccess) {
+            fprintf(stderr, "[hxccl] cudaSetDevice(%lld) failed: %s\n",
+                    (long long)rank, cudaGetErrorString(cerr));
+            return -10;
+        }
+        g_hxccl_device = (int)rank;
+
+        // Create a dedicated stream for NCCL collectives.
+        cerr = cudaStreamCreateWithFlags(&g_hxccl_stream, cudaStreamNonBlocking);
+        if (cerr != cudaSuccess) {
+            fprintf(stderr, "[hxccl] cudaStreamCreate failed: %s\n",
+                    cudaGetErrorString(cerr));
+            return -11;
+        }
+
+        ncclUniqueId uid;
+        memset(&uid, 0, sizeof(uid));
+
+        if (rank == 0) {
+            ncclResult_t nres = ncclGetUniqueId(&uid);
+            if (nres != ncclSuccess) {
+                fprintf(stderr, "[hxccl] ncclGetUniqueId failed: %s\n",
+                        ncclGetErrorString(nres));
+                return -12;
+            }
+            // Write to a sidecar tmp file then atomic rename, so other
+            // ranks never observe a partial uid.
+            char tmp_path[300];
+            snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%d", uid_path, (int)rank);
+            FILE* fp = fopen(tmp_path, "wb");
+            if (!fp) {
+                fprintf(stderr, "[hxccl] fopen(%s) failed\n", tmp_path);
+                return -13;
+            }
+            size_t wn = fwrite(&uid, 1, sizeof(uid), fp);
+            fclose(fp);
+            if (wn != sizeof(uid)) {
+                fprintf(stderr, "[hxccl] short write for unique id\n");
+                return -14;
+            }
+            if (rename(tmp_path, uid_path) != 0) {
+                fprintf(stderr, "[hxccl] rename(%s -> %s) failed\n",
+                        tmp_path, uid_path);
+                return -15;
+            }
+        } else {
+            // Spin-wait up to ~30s for rank 0 to publish the uid.
+            int waited_ms = 0;
+            FILE* fp = NULL;
+            while (waited_ms < 30000) {
+                fp = fopen(uid_path, "rb");
+                if (fp) break;
+                struct timespec ts = {0, 50 * 1000 * 1000}; // 50ms
+                nanosleep(&ts, NULL);
+                waited_ms += 50;
+            }
+            if (!fp) {
+                fprintf(stderr, "[hxccl] timeout waiting for unique id at %s\n",
+                        uid_path);
+                return -16;
+            }
+            size_t rn = fread(&uid, 1, sizeof(uid), fp);
+            fclose(fp);
+            if (rn != sizeof(uid)) {
+                fprintf(stderr, "[hxccl] short read for unique id\n");
+                return -17;
+            }
+        }
+
+        // All ranks now hold the same unique id — initialize comm.
+        ncclResult_t nres = ncclCommInitRank(&g_hxccl_comm,
+                                             (int)world_size, uid, (int)rank);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclCommInitRank failed: %s\n",
+                    ncclGetErrorString(nres));
+            return -18;
+        }
+
+        g_hxccl_rank       = rank;
+        g_hxccl_world_size = world_size;
+        g_hxccl_inited     = 1;
+        return 0;
+    }
 #endif
 
     if (world_size != 1) {
@@ -151,9 +288,19 @@ void hxccl_all_gather(int64_t send_ptr, int64_t recv_ptr,
     if (!sp || !rp) return;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclAllGather(sp, rp, (size_t)count, dtype_to_nccl(dtype),
-    //                      g_hxccl_comm, 0);
-    // For now fall through.
+    if (g_hxccl_world_size > 1 && g_hxccl_comm) {
+        ncclResult_t nres = ncclAllGather(sp, rp, (size_t)count,
+                                          hxccl_dtype_to_nccl(dtype),
+                                          g_hxccl_comm, g_hxccl_stream);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclAllGather failed: %s\n",
+                    ncclGetErrorString(nres));
+            return;
+        }
+        // Synchronize so caller sees the result on host immediately.
+        cudaStreamSynchronize(g_hxccl_stream);
+        return;
+    }
 #endif
 
     // Stub: single-rank — output layout is [rank0 = send_buf].
@@ -178,8 +325,20 @@ void hxccl_reduce_scatter(int64_t send_ptr, int64_t recv_ptr,
     if (!sp || !rp) return;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclReduceScatter(sp, rp, (size_t)count, dtype_to_nccl(dtype),
-    //                          ncclSum, g_hxccl_comm, 0);
+    if (g_hxccl_world_size > 1 && g_hxccl_comm) {
+        // ncclReduceScatter takes recvcount (per-rank output count).
+        ncclResult_t nres = ncclReduceScatter(sp, rp, (size_t)count,
+                                              hxccl_dtype_to_nccl(dtype),
+                                              ncclSum, g_hxccl_comm,
+                                              g_hxccl_stream);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclReduceScatter failed: %s\n",
+                    ncclGetErrorString(nres));
+            return;
+        }
+        cudaStreamSynchronize(g_hxccl_stream);
+        return;
+    }
 #endif
 
     // Stub: single-rank — reduction over {send} is just send itself.
@@ -195,7 +354,26 @@ void hxccl_reduce_scatter(int64_t send_ptr, int64_t recv_ptr,
 // ─────────────────────────────────────────────────────────────
 void hxccl_barrier(void) {
 #ifdef HXCCL_NCCL
-    // Day-2: ncclGroupStart/End + wait on the current stream.
+    if (g_hxccl_world_size > 1 && g_hxccl_comm) {
+        // Canonical NCCL barrier: 1-byte allreduce on a device buffer.
+        // Allocate once and reuse across calls (static device pointer).
+        static void* s_barrier_buf = NULL;
+        if (!s_barrier_buf) {
+            cudaMalloc(&s_barrier_buf, 4); // 1 f32 slot
+            float zero = 0.0f;
+            cudaMemcpy(s_barrier_buf, &zero, 4, cudaMemcpyHostToDevice);
+        }
+        ncclResult_t nres = ncclAllReduce(s_barrier_buf, s_barrier_buf,
+                                          1, ncclFloat, ncclSum,
+                                          g_hxccl_comm, g_hxccl_stream);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclAllReduce(barrier) failed: %s\n",
+                    ncclGetErrorString(nres));
+            return;
+        }
+        cudaStreamSynchronize(g_hxccl_stream);
+        return;
+    }
 #endif
     // Stub: no-op.
     return;
@@ -239,8 +417,20 @@ int64_t hxccl_init_handle(int64_t rank, int64_t world_size) {
     if (rank < 0 || rank >= world_size) return -1;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclCommInitRank via the rendezvous path. For Day-1 we
-    // fall through to the single-rank stub regardless.
+    // Day-2: route handle init through the same rendezvous as Family A
+    // hxccl_init so both families share one comm. Skip if already inited.
+    if (world_size > 1) {
+        if (!g_hxccl_inited) {
+            int64_t ir = hxccl_init(rank, world_size);
+            if (ir != 0) return -1;
+        }
+        hxccl_handle* h = (hxccl_handle*)calloc(1, sizeof(hxccl_handle));
+        if (!h) return -1;
+        h->rank  = (int32_t)rank;
+        h->world = (int32_t)world_size;
+        h->magic = 0x48584343;
+        return (int64_t)(uintptr_t)h;
+    }
 #endif
 
     if (world_size != 1) {
@@ -273,8 +463,34 @@ int64_t hxccl_allreduce_float(int64_t handle, int64_t buf, int64_t count, int64_
     if (!bp) return -1;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclAllReduce(bp, bp, count, ncclFloat, ncclSum, comm, stream);
-    // For op==AVG, post-scale by 1/world or use ncclAvg (NCCL >= 2.14).
+    if (h->world > 1 && g_hxccl_comm) {
+        ncclRedOp_t nccl_op = ncclSum;
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0)
+        if (op == 1) nccl_op = ncclAvg;
+#endif
+        ncclResult_t nres = ncclAllReduce(bp, bp, (size_t)count,
+                                          ncclFloat, nccl_op,
+                                          g_hxccl_comm, g_hxccl_stream);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclAllReduce failed: %s\n",
+                    ncclGetErrorString(nres));
+            return -1;
+        }
+        cudaStreamSynchronize(g_hxccl_stream);
+#if !(NCCL_VERSION_CODE >= NCCL_VERSION(2,14,0))
+        // Pre-2.14 fallback: post-scale by 1/world for AVG semantics.
+        if (op == 1) {
+            // Scale on host then memcpy back — simple but not hot-path.
+            // Caller of hxccl_allreduce_float passes device pointer in
+            // FFI mode, so post-scaling requires a kernel; we punt and
+            // require NCCL >= 2.14 in production. Keep a hard error so
+            // the build fails loudly if mismatched.
+            fprintf(stderr, "[hxccl] AVG op requires NCCL >= 2.14\n");
+            return -1;
+        }
+#endif
+        return 0;
+    }
 #endif
 
     // Stub: single-rank reduction is identity (sum of one copy is itself).
@@ -292,10 +508,22 @@ int64_t hxccl_broadcast_float(int64_t handle, int64_t buf, int64_t count, int64_
     if (!h || h->magic != 0x48584343) return -1;
     if (count <= 0) return -1;
     if (root < 0 || root >= h->world) return -1;
-    if (!(float*)(uintptr_t)buf) return -1;
+    float* bp = (float*)(uintptr_t)buf;
+    if (!bp) return -1;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclBroadcast(buf, buf, count, ncclFloat, root, comm, stream);
+    if (h->world > 1 && g_hxccl_comm) {
+        ncclResult_t nres = ncclBroadcast(bp, bp, (size_t)count,
+                                          ncclFloat, (int)root,
+                                          g_hxccl_comm, g_hxccl_stream);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclBroadcast failed: %s\n",
+                    ncclGetErrorString(nres));
+            return -1;
+        }
+        cudaStreamSynchronize(g_hxccl_stream);
+        return 0;
+    }
 #endif
 
     // Stub: single-rank broadcast is identity — root is the only rank.
@@ -308,7 +536,30 @@ int64_t hxccl_finalize(int64_t handle) {
     if (!h || h->magic != 0x48584343) return -1;
 
 #ifdef HXCCL_NCCL
-    // Day-2: ncclCommDestroy + cudaStreamDestroy here.
+    if (g_hxccl_comm) {
+        ncclResult_t nres = ncclCommDestroy(g_hxccl_comm);
+        if (nres != ncclSuccess) {
+            fprintf(stderr, "[hxccl] ncclCommDestroy failed: %s\n",
+                    ncclGetErrorString(nres));
+        }
+        g_hxccl_comm = NULL;
+    }
+    if (g_hxccl_stream) {
+        cudaStreamDestroy(g_hxccl_stream);
+        g_hxccl_stream = 0;
+    }
+    // Best-effort: remove the rendezvous file rank 0 published.
+    if (g_hxccl_rank == 0) {
+        const char* uid_path_env = getenv("HXCCL_UNIQUE_ID_FILE");
+        char uid_path[256];
+        if (uid_path_env && uid_path_env[0]) {
+            snprintf(uid_path, sizeof(uid_path), "%s", uid_path_env);
+        } else {
+            snprintf(uid_path, sizeof(uid_path),
+                     "/tmp/hxccl_uid_%lld", (long long)g_hxccl_world_size);
+        }
+        unlink(uid_path);
+    }
 #endif
 
     h->magic = 0;
@@ -354,14 +605,20 @@ int64_t hxccl_init(int64_t rank, int64_t world_size) {
     return 0;
 }
 
-/* Family B handle init — renamed 2026-04-16 to match Linux ABI. */
+/* Family B handle init — renamed 2026-04-16 to match Linux ABI.
+ * Mac stub: also populate Family A globals so world_size/rank accessors
+ * return the right value after init_handle(0, 1) (used by hxnccl smoke).
+ * Mac stub intentionally only supports world_size==1; >1 returns -1. */
 int64_t hxccl_init_handle(int64_t rank, int64_t world_size) {
     if (world_size < 1 || rank < 0 || rank >= world_size) return -1;
+    if (world_size != 1) return -1;
     hxccl_handle_mac* h = (hxccl_handle_mac*)calloc(1, sizeof(hxccl_handle_mac));
     if (!h) return -1;
     h->rank  = (int32_t)rank;
     h->world = (int32_t)world_size;
     h->magic = 0x48584343;
+    g_hxccl_rank_mac       = rank;
+    g_hxccl_world_size_mac = world_size;
     return (int64_t)(uintptr_t)h;
 }
 
@@ -386,6 +643,10 @@ int64_t hxccl_finalize(int64_t handle) {
     if (!h || h->magic != 0x48584343) return -1;
     h->magic = 0;
     free(h);
+    /* Reset Family A globals so world_size()/rank() report cleared
+     * state — matches Linux finalize behaviour. */
+    g_hxccl_rank_mac       = -1;
+    g_hxccl_world_size_mac =  0;
     return 0;
 }
 
