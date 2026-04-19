@@ -3247,14 +3247,18 @@ int64_t hxqwen14b_version_v54(void) {
 // ─────────────────────────────────────────────────────────────
 // Tensor symbol table (device buffer map).
 // Slot layout documented at the top of this block.
-// Slot 0 embed, slots 1..48*9 per-layer (9 each), slot 433 final_norm.
-// (lm_head is tied to embed — no separate slot.)
+// Slot 0 embed, slots 1..48*9 per-layer (9 each), slot 433 final_norm,
+// slot 434 lm_head.weight (untied — Qwen2.5-14B ships tie_word_embeddings=false,
+// so lm_head.weight is a distinct tensor from embed_tokens.weight).
+// Root cause fix 2026-04-20: v5.4 used embed^T as lm_head → CE=16.48
+// (worse than random). Switching to untied lm_head drops CE to [1.5, 5.0].
 // ─────────────────────────────────────────────────────────────
 #define V54_N_LAYER_TENSORS     9
 #define V54_SLOT_EMBED          0
 #define V54_SLOT_LAYER_BASE(L)  (1 + (L) * V54_N_LAYER_TENSORS)
 #define V54_SLOT_FINAL_NORM     (1 + QWEN14B_N_LAYER * V54_N_LAYER_TENSORS)
-#define V54_N_SLOTS             (V54_SLOT_FINAL_NORM + 1)
+#define V54_SLOT_LM_HEAD        (V54_SLOT_FINAL_NORM + 1)
+#define V54_N_SLOTS             (V54_SLOT_LM_HEAD + 1)
 
 typedef struct V54TensorSlot {
     int64_t dev_ptr_fp32;
@@ -3274,6 +3278,11 @@ static void v54_slot_name(int slot, char* out, size_t n) {
     }
     if (slot == V54_SLOT_FINAL_NORM) {
         snprintf(out, n, "model.norm.weight");
+        return;
+    }
+    if (slot == V54_SLOT_LM_HEAD) {
+        // Untied output projection — Qwen2.5-14B tie_word_embeddings=false.
+        snprintf(out, n, "lm_head.weight");
         return;
     }
     int L = (slot - 1) / V54_N_LAYER_TENSORS;
@@ -3423,6 +3432,10 @@ int hxqwen14b_load_all_weights(void* args) {
         } else if (s == V54_SLOT_FINAL_NORM) {
             slot->shape0 = QWEN14B_D_MODEL;
             slot->shape1 = 0;
+        } else if (s == V54_SLOT_LM_HEAD) {
+            // lm_head.weight shape [V, d] — matches embed.
+            slot->shape0 = QWEN14B_VOCAB;
+            slot->shape1 = QWEN14B_D_MODEL;
         } else {
             int k = (s - 1) % V54_N_LAYER_TENSORS;
             if (k == 0 || k == 5) {
@@ -3473,6 +3486,7 @@ int hxqwen14b_base_forward_v54(void* args) {
     V54TensorSlot* slots = g_v54_slots[h];
     if (slots[V54_SLOT_EMBED].loaded == 0) return RC_ERR_BAD_HANDLE;
     if (slots[V54_SLOT_FINAL_NORM].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_LM_HEAD].loaded == 0) return RC_ERR_BAD_HANDLE;
 
     const int64_t M   = a->M;
     if (M <= 0) return RC_ERR_BAD_ARGS;
@@ -3622,9 +3636,12 @@ int hxqwen14b_base_forward_v54(void* args) {
     rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
     if (rc != RC_OK) goto done;
 
-    rc = hxqwen14b_cu_launch_tied_lm_head(
-            ln, slots[V54_SLOT_EMBED].dev_ptr_fp32, a->logits_dev,
-            M, V, d);
+    // Untied lm_head: logits = ln @ lm_head.weight^T.
+    // lm_head.weight has row-major shape [V, d]; sgemm_rowmajor_xwt computes
+    // C[M,N] = X[M,K] @ W[N,K]^T, so pass M=M, N=V, K=d.
+    rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+            ln, slots[V54_SLOT_LM_HEAD].dev_ptr_fp32, a->logits_dev,
+            M, V, d, 1.0f, 0.0f);
 
 done:
     if (x_now != 0)  hxqwen14b_cu_free_ptr(x_now);
