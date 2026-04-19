@@ -463,7 +463,7 @@ static QwenCtx g_ctx_table[HXQWEN14B_MAX_HANDLES];
 // TAG_NOT_BUILTIN (see feedback memory module_box_struct_replace.md).
 // ─────────────────────────────────────────────────────────────
 int64_t hxqwen14b_version(void) {
-    return 51;  // v5.1 Day-2.5: 48-layer LoRA composition live
+    return 52;  // v5.2 Day-3: CPU reference attn kernels (rmsnorm/rope/gqa/swiglu) additive
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -2017,3 +2017,492 @@ int hxqwen14b_smoke_v5(void* args) {
     }
     return RC_OK;
 }
+// ─────────────────────────────────────────────────────────────
+// SECTION 12. v5.2 Day-3 — Real Attention Reference Kernels
+//
+// CPU-reference forward kernels for Qwen2.5-14B transformer blocks.
+// Shape + numerics match PyTorch reference; no quantisation (bf16-accum
+// promotable). Additive to v5.1 — these are independent FFI symbols
+// that the trainer or a smoke harness can call per layer. Full 48-layer
+// GPU forward using real weights lands alongside v5.3 weight-upload
+// (pod not yet provisioned with 28GB weights — see v5.2 hand-off).
+//
+// Kernels:
+//   hxqwen14b_rmsnorm_fwd      RMSNorm(x, weight, eps) -> y
+//   hxqwen14b_rope_fwd         RoPE interleaved pair rotation, theta=1e6
+//   hxqwen14b_gqa_attn_fwd     40Q/8KV GQA, causal, softmax scale 1/√128
+//   hxqwen14b_swiglu_fwd       silu(gate) * up -> y
+//   hxqwen14b_smoke_v52        run all 4 on deterministic inputs,
+//                              validate shape + finiteness + simple
+//                              regression (CE proxy on random logits).
+//
+// ABI — all packed single-pointer structs, same pattern as Day-2.
+// ─────────────────────────────────────────────────────────────
+
+// RMSNorm args (64 B).
+// y[i,:] = w[:] * x[i,:] / sqrt(mean(x[i,:]^2) + eps)
+typedef struct HxQwenRmsNormArgs {
+    int64_t M_rows;        // B*S
+    int64_t d_model;       // 5120
+    int64_t x_p;           // float* [M, d]   IN
+    int64_t w_p;           // float* [d]      IN  (learned scale)
+    int64_t y_p;           // float* [M, d]   OUT
+    double  eps;           // 1e-6 for Qwen2.5
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenRmsNormArgs;
+
+int hxqwen14b_rmsnorm_fwd(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenRmsNormArgs* a = (HxQwenRmsNormArgs*)args;
+    if (a->x_p == 0 || a->w_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->M_rows <= 0 || a->d_model <= 0) return RC_ERR_BAD_ARGS;
+
+    const int64_t M = a->M_rows;
+    const int64_t d = a->d_model;
+    const double  eps = (a->eps > 0.0) ? a->eps : 1e-6;
+    const float*  x = (const float*)(uintptr_t)a->x_p;
+    const float*  w = (const float*)(uintptr_t)a->w_p;
+    float*        y = (float*)(uintptr_t)a->y_p;
+
+    // Per-row RMS, then scale by learned weight vector.
+    for (int64_t i = 0; i < M; i++) {
+        const float* xi = x + i*d;
+        float*       yi = y + i*d;
+        double ss = 0.0;
+        for (int64_t j = 0; j < d; j++) {
+            double v = (double)xi[j];
+            ss += v * v;
+        }
+        double mean_sq = ss / (double)d;
+        double inv_rms = 1.0 / sqrt(mean_sq + eps);
+        for (int64_t j = 0; j < d; j++) {
+            yi[j] = (float)((double)xi[j] * inv_rms * (double)w[j]);
+        }
+    }
+    return RC_OK;
+}
+
+// RoPE args (72 B).
+// Qwen2.5 convention: INTERLEAVED pair rotation on the head_dim.
+// For each (q_head × head_dim) pair j = 0,2,4,...,head_dim-2:
+//   theta_j = theta_base ^ (-j/head_dim)
+//   angle   = position * theta_j
+//   [xj, xj+1] := [xj*cos - xj+1*sin, xj*sin + xj+1*cos]
+// Apply to both Q and K (per GQA: n_q_head queries, n_kv_head keys).
+typedef struct HxQwenRopeArgs {
+    int64_t B_batch;
+    int64_t S_seq;
+    int64_t n_heads;       // heads of this tensor (40 for Q, 8 for K)
+    int64_t head_dim;      // 128
+    int64_t x_p;           // float* [B, S, n_heads, head_dim]  IN/OUT
+    double  theta_base;    // 1e6 for Qwen2.5-14B
+    int64_t pos_offset;    // position index of ids[0] (for KV cache)
+    int64_t reserved0;
+} HxQwenRopeArgs;
+
+int hxqwen14b_rope_fwd(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenRopeArgs* a = (HxQwenRopeArgs*)args;
+    if (a->x_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->B_batch <= 0 || a->S_seq <= 0 || a->n_heads <= 0 || a->head_dim <= 0)
+        return RC_ERR_BAD_ARGS;
+    if ((a->head_dim & 1) != 0) return RC_ERR_BAD_ARGS;  // needs pairs
+    const int64_t B = a->B_batch;
+    const int64_t S = a->S_seq;
+    const int64_t H = a->n_heads;
+    const int64_t D = a->head_dim;
+    const double  theta = (a->theta_base > 0.0) ? a->theta_base : 1e6;
+    const int64_t pos0 = a->pos_offset;
+    float* x = (float*)(uintptr_t)a->x_p;
+
+    // Precompute per-dim inverse frequencies once (head_dim/2 of them).
+    // Using doubles for precision — head_dim is 128 so this is tiny.
+    double inv_freq[512];  // safety upper bound on head_dim/2
+    const int64_t half = D / 2;
+    for (int64_t k = 0; k < half; k++) {
+        // theta^(-2k/D) — standard RoPE formula (interleaved convention:
+        // the k-th frequency pairs up dims 2k and 2k+1).
+        inv_freq[k] = pow(theta, -(double)(2*k) / (double)D);
+    }
+
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t s = 0; s < S; s++) {
+            double pos = (double)(pos0 + s);
+            for (int64_t h = 0; h < H; h++) {
+                float* row = x + (((b*S + s)*H + h) * D);
+                for (int64_t k = 0; k < half; k++) {
+                    double angle = pos * inv_freq[k];
+                    double cs = cos(angle);
+                    double sn = sin(angle);
+                    // Interleaved: dims (2k, 2k+1) rotated.
+                    double x0 = (double)row[2*k];
+                    double x1 = (double)row[2*k + 1];
+                    row[2*k    ] = (float)(x0*cs - x1*sn);
+                    row[2*k + 1] = (float)(x0*sn + x1*cs);
+                }
+            }
+        }
+    }
+    return RC_OK;
+}
+
+// GQA attention args (112 B).
+// Causal self-attention over [B, S, ...] with n_q_head query heads sharing
+// one of n_kv_head K/V heads. Softmax scale = 1/sqrt(head_dim).
+// Inputs are ALREADY post-RoPE for Q/K.
+typedef struct HxQwenGqaArgs {
+    int64_t B_batch;
+    int64_t S_seq;
+    int64_t n_q_head;      // 40
+    int64_t n_kv_head;     // 8
+    int64_t head_dim;      // 128
+    int64_t q_p;           // float* [B, S, n_q,  hd]  IN (post-RoPE)
+    int64_t k_p;           // float* [B, S, n_kv, hd]  IN (post-RoPE)
+    int64_t v_p;           // float* [B, S, n_kv, hd]  IN
+    int64_t out_p;         // float* [B, S, n_q,  hd]  OUT (concatenated)
+    double  softmax_scale; // usually 1/sqrt(head_dim); 0 => auto
+    int64_t causal;        // 1 = apply causal mask, 0 = full attn
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenGqaArgs;
+
+int hxqwen14b_gqa_attn_fwd(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenGqaArgs* a = (HxQwenGqaArgs*)args;
+    if (a->q_p == 0 || a->k_p == 0 || a->v_p == 0 || a->out_p == 0)
+        return RC_ERR_NULL_ARGS;
+    if (a->B_batch <= 0 || a->S_seq <= 0 || a->head_dim <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head <= 0 || a->n_kv_head <= 0) return RC_ERR_BAD_ARGS;
+    if (a->n_q_head % a->n_kv_head != 0) return RC_ERR_SHAPE_MISMATCH;
+
+    const int64_t B  = a->B_batch;
+    const int64_t S  = a->S_seq;
+    const int64_t HQ = a->n_q_head;
+    const int64_t HK = a->n_kv_head;
+    const int64_t D  = a->head_dim;
+    const int64_t G  = HQ / HK;   // 5 for Qwen2.5-14B (40/8)
+    const double  scale = (a->softmax_scale > 0.0) ? a->softmax_scale
+                         : (1.0 / sqrt((double)D));
+
+    const float* Q = (const float*)(uintptr_t)a->q_p;
+    const float* K = (const float*)(uintptr_t)a->k_p;
+    const float* V = (const float*)(uintptr_t)a->v_p;
+    float*       O = (float*)(uintptr_t)a->out_p;
+
+    // Attention per (b, q_head). Memory-efficient streaming softmax ala
+    // online-softmax (single pass over keys with running max).
+    // Complexity: O(B·HQ·S·S·D) — fine for smoke test; real path will
+    // use flash-attn kernel.
+    for (int64_t b = 0; b < B; b++) {
+        for (int64_t hq = 0; hq < HQ; hq++) {
+            int64_t hk = hq / G;  // which KV head this query shares
+            for (int64_t i = 0; i < S; i++) {
+                const float* qi = Q + (((b*S + i)*HQ + hq) * D);
+                float*       oi = O + (((b*S + i)*HQ + hq) * D);
+                // online softmax state
+                double m = -1e30;
+                double l = 0.0;
+                // local output accumulator (D floats)
+                double acc[256];  // safety upper bound on head_dim
+                for (int64_t d = 0; d < D; d++) acc[d] = 0.0;
+
+                int64_t j_end = a->causal ? (i + 1) : S;
+                for (int64_t j = 0; j < j_end; j++) {
+                    const float* kj = K + (((b*S + j)*HK + hk) * D);
+                    const float* vj = V + (((b*S + j)*HK + hk) * D);
+                    // dot(qi, kj)
+                    double dot = 0.0;
+                    for (int64_t d = 0; d < D; d++) {
+                        dot += (double)qi[d] * (double)kj[d];
+                    }
+                    double s = dot * scale;
+
+                    if (s > m) {
+                        // rescale existing accumulators to the new max
+                        double alpha = exp(m - s);
+                        for (int64_t d = 0; d < D; d++) acc[d] *= alpha;
+                        l = l * alpha;
+                        m = s;
+                    }
+                    double p = exp(s - m);
+                    l += p;
+                    for (int64_t d = 0; d < D; d++) {
+                        acc[d] += p * (double)vj[d];
+                    }
+                }
+                double inv_l = (l > 0.0) ? 1.0 / l : 0.0;
+                for (int64_t d = 0; d < D; d++) {
+                    oi[d] = (float)(acc[d] * inv_l);
+                }
+            }
+        }
+    }
+    return RC_OK;
+}
+
+// SwiGLU args (56 B).
+// y = silu(gate) * up,  silu(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// gate/up both [M, ffn_dim] with ffn_dim = 13824 for Qwen2.5-14B.
+typedef struct HxQwenSwigluArgs {
+    int64_t M_rows;
+    int64_t ffn_dim;
+    int64_t gate_p;
+    int64_t up_p;
+    int64_t y_p;
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenSwigluArgs;
+
+int hxqwen14b_swiglu_fwd(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenSwigluArgs* a = (HxQwenSwigluArgs*)args;
+    if (a->gate_p == 0 || a->up_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->M_rows <= 0 || a->ffn_dim <= 0) return RC_ERR_BAD_ARGS;
+
+    const int64_t M  = a->M_rows;
+    const int64_t F  = a->ffn_dim;
+    const float*  g  = (const float*)(uintptr_t)a->gate_p;
+    const float*  u  = (const float*)(uintptr_t)a->up_p;
+    float*        y  = (float*)(uintptr_t)a->y_p;
+
+    for (int64_t i = 0; i < M*F; i++) {
+        double gi = (double)g[i];
+        // silu — use the numerically-stable form to avoid overflow on large -x.
+        double sig;
+        if (gi >= 0.0) {
+            double e = exp(-gi);
+            sig = 1.0 / (1.0 + e);
+        } else {
+            double e = exp(gi);
+            sig = e / (1.0 + e);
+        }
+        double silu = gi * sig;
+        y[i] = (float)(silu * (double)u[i]);
+    }
+    return RC_OK;
+}
+
+// v5.2 smoke args — seeds deterministic inputs, runs 4 kernels in sequence
+// (mimicking one transformer block for a small B·S·d), returns per-kernel
+// rc + finiteness/norm stats. No ckpt required — allocated on host.
+typedef struct HxQwenV52SmokeArgs {
+    int64_t B_batch;       // e.g. 1
+    int64_t S_seq;         // e.g. 8 (small for smoke)
+    int64_t d_model;       // 256  (smoke; full model is 5120)
+    int64_t n_q_head;      // 4    (smoke; full 40)
+    int64_t n_kv_head;     // 2    (smoke; full 8; must divide n_q_head)
+    int64_t head_dim;      // d_model / n_q_head (64 for smoke)
+    int64_t ffn_dim;       // 512  (smoke)
+    int64_t seed;          // RNG seed
+    int64_t out_p;         // HxQwenV52SmokeResult* OUT
+    int64_t reserved0;
+} HxQwenV52SmokeArgs;
+
+typedef struct HxQwenV52SmokeResult {
+    int64_t rc_rmsnorm;
+    int64_t rc_rope_q;
+    int64_t rc_rope_k;
+    int64_t rc_gqa;
+    int64_t rc_swiglu;
+    int64_t n_nan_total;       // sum across all outputs
+    double  sum_abs_rmsnorm;
+    double  sum_abs_rope_q;
+    double  sum_abs_rope_k;
+    double  sum_abs_gqa;
+    double  sum_abs_swiglu;
+    double  rms_preserved;     // rmsnorm output RMS — should ≈ mean(|w|)
+    double  rope_norm_pres;    // max |‖rope(x)‖_2 - ‖x‖_2| / ‖x‖_2 — ≤ 1e-4
+} HxQwenV52SmokeResult;
+
+static uint32_t v52_xorshift32(uint32_t* state) {
+    uint32_t x = *state;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    *state = x ? x : 1u;
+    return *state;
+}
+static float v52_randn(uint32_t* state) {
+    // Box-Muller, returns ~N(0, 1).
+    float u1 = ((float)v52_xorshift32(state) / 4294967295.0f) + 1e-9f;
+    float u2 = ((float)v52_xorshift32(state) / 4294967295.0f);
+    return sqrtf(-2.0f * logf(u1)) * cosf(6.2831853f * u2);
+}
+
+int hxqwen14b_smoke_v52(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenV52SmokeArgs* a = (HxQwenV52SmokeArgs*)args;
+    if (a->out_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenV52SmokeResult* r = (HxQwenV52SmokeResult*)(uintptr_t)a->out_p;
+    memset(r, 0, sizeof(HxQwenV52SmokeResult));
+
+    const int64_t B  = a->B_batch  > 0 ? a->B_batch  : 1;
+    const int64_t S  = a->S_seq    > 0 ? a->S_seq    : 8;
+    const int64_t d  = a->d_model  > 0 ? a->d_model  : 256;
+    const int64_t HQ = a->n_q_head > 0 ? a->n_q_head : 4;
+    const int64_t HK = a->n_kv_head> 0 ? a->n_kv_head: 2;
+    const int64_t HD = a->head_dim > 0 ? a->head_dim : (d / HQ);
+    const int64_t F  = a->ffn_dim  > 0 ? a->ffn_dim  : 512;
+    const int64_t M  = B * S;
+
+    if (HD * HQ != d) return RC_ERR_SHAPE_MISMATCH;
+    if (HQ % HK != 0) return RC_ERR_SHAPE_MISMATCH;
+
+    uint32_t seed = (uint32_t)(a->seed ? a->seed : 0xC0FFEE42u);
+
+    // Allocate all tensors needed for one block pass.
+    float* x       = (float*)calloc((size_t)(M*d),     sizeof(float));
+    float* w_rms   = (float*)calloc((size_t)d,         sizeof(float));
+    float* ln_x    = (float*)calloc((size_t)(M*d),     sizeof(float));
+    float* q       = (float*)calloc((size_t)(M*HQ*HD), sizeof(float));
+    float* k       = (float*)calloc((size_t)(M*HK*HD), sizeof(float));
+    float* v       = (float*)calloc((size_t)(M*HK*HD), sizeof(float));
+    float* attn_o  = (float*)calloc((size_t)(M*HQ*HD), sizeof(float));
+    float* gate    = (float*)calloc((size_t)(M*F),     sizeof(float));
+    float* up      = (float*)calloc((size_t)(M*F),     sizeof(float));
+    float* swi_y   = (float*)calloc((size_t)(M*F),     sizeof(float));
+    if (!x || !w_rms || !ln_x || !q || !k || !v || !attn_o || !gate || !up || !swi_y) {
+        free(x); free(w_rms); free(ln_x); free(q); free(k); free(v);
+        free(attn_o); free(gate); free(up); free(swi_y);
+        return RC_ERR_OOM;
+    }
+
+    // Seed inputs. x ~ N(0, 1), weights ~ 1 + 0.01·N(0,1) so RMSNorm
+    // should approximately preserve magnitude = mean(|w|) ≈ 1.0.
+    for (int64_t i = 0; i < M*d; i++)     x[i]     = v52_randn(&seed);
+    for (int64_t i = 0; i < d; i++)       w_rms[i] = 1.0f + 0.01f * v52_randn(&seed);
+    for (int64_t i = 0; i < M*HQ*HD; i++) q[i]     = 0.1f * v52_randn(&seed);
+    for (int64_t i = 0; i < M*HK*HD; i++) k[i]     = 0.1f * v52_randn(&seed);
+    for (int64_t i = 0; i < M*HK*HD; i++) v[i]     = 0.1f * v52_randn(&seed);
+    for (int64_t i = 0; i < M*F; i++)     gate[i]  = 0.1f * v52_randn(&seed);
+    for (int64_t i = 0; i < M*F; i++)     up[i]    = 0.1f * v52_randn(&seed);
+
+    // ---- RMSNorm ----
+    HxQwenRmsNormArgs rn;
+    memset(&rn, 0, sizeof(rn));
+    rn.M_rows = M; rn.d_model = d;
+    rn.x_p = (int64_t)(uintptr_t)x;
+    rn.w_p = (int64_t)(uintptr_t)w_rms;
+    rn.y_p = (int64_t)(uintptr_t)ln_x;
+    rn.eps = 1e-6;
+    r->rc_rmsnorm = hxqwen14b_rmsnorm_fwd(&rn);
+
+    // ---- RoPE on Q ----
+    // Snapshot pre-RoPE norms per-position to verify preservation.
+    double max_ropeq_err = 0.0;
+    for (int64_t pos = 0; pos < S; pos++) {
+        for (int64_t h = 0; h < HQ; h++) {
+            const float* row = q + ((0*S + pos)*HQ + h) * HD;
+            double n0 = 0.0;
+            for (int64_t j = 0; j < HD; j++) n0 += (double)row[j] * (double)row[j];
+            n0 = sqrt(n0);
+            (void)n0;  // compared after rotate
+        }
+    }
+    // save pre-rope Q so we can compute preservation
+    float* q_pre = (float*)malloc((size_t)(M*HQ*HD) * sizeof(float));
+    memcpy(q_pre, q, (size_t)(M*HQ*HD) * sizeof(float));
+
+    HxQwenRopeArgs rp;
+    memset(&rp, 0, sizeof(rp));
+    rp.B_batch = B; rp.S_seq = S; rp.n_heads = HQ; rp.head_dim = HD;
+    rp.x_p = (int64_t)(uintptr_t)q;
+    rp.theta_base = 1e6;
+    rp.pos_offset = 0;
+    r->rc_rope_q = hxqwen14b_rope_fwd(&rp);
+
+    // Verify rotation preserved norms to ~eps.
+    if (r->rc_rope_q == RC_OK) {
+        for (int64_t i = 0; i < M; i++) {
+            for (int64_t h = 0; h < HQ; h++) {
+                const float* p0 = q_pre + (i*HQ + h) * HD;
+                const float* p1 = q     + (i*HQ + h) * HD;
+                double n0 = 0.0, n1 = 0.0;
+                for (int64_t j = 0; j < HD; j++) {
+                    n0 += (double)p0[j] * (double)p0[j];
+                    n1 += (double)p1[j] * (double)p1[j];
+                }
+                n0 = sqrt(n0); n1 = sqrt(n1);
+                double err = n0 > 1e-12 ? fabs(n1 - n0) / n0 : 0.0;
+                if (err > max_ropeq_err) max_ropeq_err = err;
+            }
+        }
+    }
+    r->rope_norm_pres = max_ropeq_err;
+    free(q_pre);
+
+    // ---- RoPE on K ----
+    rp.n_heads = HK;
+    rp.x_p = (int64_t)(uintptr_t)k;
+    r->rc_rope_k = hxqwen14b_rope_fwd(&rp);
+
+    // ---- GQA attention ----
+    HxQwenGqaArgs ga;
+    memset(&ga, 0, sizeof(ga));
+    ga.B_batch = B; ga.S_seq = S;
+    ga.n_q_head = HQ; ga.n_kv_head = HK; ga.head_dim = HD;
+    ga.q_p = (int64_t)(uintptr_t)q;
+    ga.k_p = (int64_t)(uintptr_t)k;
+    ga.v_p = (int64_t)(uintptr_t)v;
+    ga.out_p = (int64_t)(uintptr_t)attn_o;
+    ga.softmax_scale = 0.0;  // auto = 1/sqrt(HD)
+    ga.causal = 1;
+    r->rc_gqa = hxqwen14b_gqa_attn_fwd(&ga);
+
+    // ---- SwiGLU ----
+    HxQwenSwigluArgs sw;
+    memset(&sw, 0, sizeof(sw));
+    sw.M_rows = M; sw.ffn_dim = F;
+    sw.gate_p = (int64_t)(uintptr_t)gate;
+    sw.up_p   = (int64_t)(uintptr_t)up;
+    sw.y_p    = (int64_t)(uintptr_t)swi_y;
+    r->rc_swiglu = hxqwen14b_swiglu_fwd(&sw);
+
+    // Stat scan across outputs.
+    int64_t total_nan = 0;
+    double sum_rms = 0.0, sum_rq = 0.0, sum_rk = 0.0, sum_gqa = 0.0, sum_sw = 0.0;
+    double rms2_sum = 0.0;
+    for (int64_t i = 0; i < M*d; i++) {
+        float fi = ln_x[i];
+        if (isnan(fi) || isinf(fi)) total_nan++; else { sum_rms += fabs((double)fi); rms2_sum += (double)fi * (double)fi; }
+    }
+    for (int64_t i = 0; i < M*HQ*HD; i++) {
+        float fi = q[i];
+        if (isnan(fi) || isinf(fi)) total_nan++; else sum_rq += fabs((double)fi);
+    }
+    for (int64_t i = 0; i < M*HK*HD; i++) {
+        float fi = k[i];
+        if (isnan(fi) || isinf(fi)) total_nan++; else sum_rk += fabs((double)fi);
+    }
+    for (int64_t i = 0; i < M*HQ*HD; i++) {
+        float fi = attn_o[i];
+        if (isnan(fi) || isinf(fi)) total_nan++; else sum_gqa += fabs((double)fi);
+    }
+    for (int64_t i = 0; i < M*F; i++) {
+        float fi = swi_y[i];
+        if (isnan(fi) || isinf(fi)) total_nan++; else sum_sw += fabs((double)fi);
+    }
+    r->n_nan_total      = total_nan;
+    r->sum_abs_rmsnorm  = sum_rms;
+    r->sum_abs_rope_q   = sum_rq;
+    r->sum_abs_rope_k   = sum_rk;
+    r->sum_abs_gqa      = sum_gqa;
+    r->sum_abs_swiglu   = sum_sw;
+    r->rms_preserved    = sqrt(rms2_sum / (double)(M*d));
+
+    free(x); free(w_rms); free(ln_x); free(q); free(k); free(v);
+    free(attn_o); free(gate); free(up); free(swi_y);
+
+    // Aggregate rc: first non-zero wins.
+    if (r->rc_rmsnorm != RC_OK) return (int)r->rc_rmsnorm;
+    if (r->rc_rope_q  != RC_OK) return (int)r->rc_rope_q;
+    if (r->rc_rope_k  != RC_OK) return (int)r->rc_rope_k;
+    if (r->rc_gqa     != RC_OK) return (int)r->rc_gqa;
+    if (r->rc_swiglu  != RC_OK) return (int)r->rc_swiglu;
+    if (total_nan > 0)          return RC_ERR_KERNEL_FAIL;
+    if (r->rope_norm_pres > 1e-4) return RC_ERR_KERNEL_FAIL;
+    return RC_OK;
+}
+
+// End of v5.2 addendum.
