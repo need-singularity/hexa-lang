@@ -530,11 +530,28 @@ int hxqwen14b_cu_launch_add_bias_1d(
 }
 
 // Compute C[M,N] = X[M,K] @ W_T[K,N] where W is stored row-major as [N,K]
-// (HF weight convention).  cuBLAS is column-major; we use the standard
-// trick: treat row-major X[M,K] as col-major X^T [K,M]; row-major W[N,K]
-// as col-major W^T [K,N]; compute (W[N,K]) @ (X^T[K,M]) = (X @ W^T)^T [N,M]
-// which in row-major is the correct C[M,N]. So: cublasSgemm with
-//   opA=N, opB=N, m=N, n=M, k=K, A=W (lda=N), B=X (ldb=K), C (ldc=N).
+// (HF weight convention).
+//
+// v5.4.4 CORRECTED LAYOUT — prior v5.4.0..v5.4.3 used (OP_N, OP_N, lda=N)
+// which silently returns a permuted/strided WRONG result whenever N != K.
+// That single bug was the BLOCKED_WEIGHT_DECODE smoke CE≈16 symptom: it
+// garbles every sgemm (q/k/v/o/gate/up/down + lm_head), producing
+// confidently wrong logits — exactly the pattern expected.
+// Verified against /tmp/sgemm_verify.cu on H100 (2026-04-20).
+//
+// Derivation (col-major cuBLAS, row-major inputs):
+//   row-major M[a,b] == col-major M^T[b,a] with lda=b.
+// So:
+//   row-major X[M,K]         → col-major X^T[K,M]          with ldb=K
+//   row-major W[N,K]         → col-major W^T[K,N]          with lda=K
+//   desired row-major C[M,N] → col-major C^T[N,M]          with ldc=N
+// We need col-major C^T = (X @ W^T)^T = W @ X^T.
+//   op(A) = col-major W[N,K] → apply OP_T to col-major W^T[K,N]
+//   op(B) = col-major X^T[K,M] → OP_N (no transpose).
+// => cublasSgemm(OP_T, OP_N, m=N, n=M, k=K,
+//                A=W ptr, lda=K,
+//                B=X ptr, ldb=K,
+//                C ptr, ldc=N).
 int hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
     int64_t X_dev, int64_t W_dev, int64_t C_dev,
     int64_t M, int64_t N, int64_t K,
@@ -545,10 +562,10 @@ int hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
     if (M <= 0 || N <= 0 || K <= 0) return HXQ_RC_KERNEL_FAIL;
     cublasStatus_t st = cublasSgemm(
         g_cublas_handle,
-        CUBLAS_OP_N, CUBLAS_OP_N,
+        CUBLAS_OP_T, CUBLAS_OP_N,
         (int)N, (int)M, (int)K,
         &alpha,
-        (const float*)(uintptr_t)W_dev, (int)N,
+        (const float*)(uintptr_t)W_dev, (int)K,
         (const float*)(uintptr_t)X_dev, (int)K,
         &beta,
         (float*)(uintptr_t)C_dev, (int)N);
