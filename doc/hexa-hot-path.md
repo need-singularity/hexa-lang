@@ -20,7 +20,7 @@ stay in C (`@hot_kernel`) and the rest migrates to HEXA over time.
 | **T1** | OS boundary (syscall/dlopen/mmap/malloc) | `self/runtime.c` | **NEVER** — C ABI required |
 | **T2** | Value system (`HexaVal` tagged union, tag constants) | `self/runtime.c` | **NEVER** — foundation of C-compile model |
 | **T3** | Tensor/BLAS hot kernels | **`self/native/tensor_kernels.c`** | **NEVER** without benchmark gate |
-| **T4** | String/array/map helpers | `self/runtime.c` (logic) | → `self/stdlib/*.hexa` (planned) |
+| **T4** | String/array/map helpers | `self/runtime.c` (logic) | → `self/core/*.hexa` (planned) |
 | **T5** | Utilities (print, time, exec) | `self/runtime.c` | → HEXA body, thin C wrapper only |
 
 ## T3 Function List

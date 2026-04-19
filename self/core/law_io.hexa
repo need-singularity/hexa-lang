@@ -1,0 +1,169 @@
+// self/core/law_io.hexa — Layer 1 of 3-layer law enforcement (#38 + #39)
+// Stdlib gate: every write routed through this module is checked against
+// the raw SSOT (/.raw L0 + /.own L1) + tool/ai_native_scan
+// before the byte hits the filesystem.
+// NOTE (raw-migration 2026-04-19): legacy shared/hexa-lang/raw.json 대체,
+//   파서는 self/raw_loader.hexa (hexa-directive 포맷).
+//
+// Layer 0  git-hook pre-commit  (live)
+// Layer 1  THIS FILE            (stdlib gate — caller opt-in)
+// Layer 2  raw-compile          (hexa_stage0 internal, future)
+//
+// Public API (drop-in replacements for raw builtins):
+//   safe_write_file(path, content)  -> bool
+//   safe_append_file(path, content) -> bool
+//   safe_exec(cmd)                  -> int
+//
+// Style reference: self/attrs/sealed.hexa (fs_seal/fs_is_sealed).
+// This module itself calls `write_file` exactly once on a probe path —
+// all other writes must go through safe_write_file. Marker below.
+
+// ─── law_check ───────────────────────────────────────────────────────
+// Probe the would-be file against the same enforcement pipeline the
+// pre-commit hook runs. Materialise under /tmp (never the real target),
+// apply raw7/raw6 subset + probe write+delete, return verdict.
+// Returns [ok: bool, reason: string].
+
+fn _law_probe_dir() -> string { return "/tmp/hexa_law_io_probe" }
+
+fn _law_ensure_probe_dir() {
+    exec("mkdir -p '" + _law_probe_dir() + "' 2>/dev/null")
+}
+
+fn _law_probe_path(real_path: string) -> string {
+    // Use the trailing filename only; probe extension preserved so raw7
+    // (.rs/.toml/.py/.sh ban) catches forbidden extensions exactly.
+    let mut base = real_path
+    let mut i = len(real_path) - 1
+    while i >= 0 {
+        if real_path[i] == "/" {
+            base = real_path.substring(i + 1, len(real_path))
+            break
+        }
+        i = i - 1
+    }
+    if base == "" { base = "probe" }
+    return _law_probe_dir() + "/" + base
+}
+
+// raw #7 — HEXA-ONLY: forbidden extensions on write path
+fn _law_raw7_extension_ban(path: string) -> string {
+    let bad = [".rs", ".toml", ".py", ".sh"]
+    let mut i = 0
+    while i < len(bad) {
+        let ext = bad[i]
+        if len(path) > len(ext) {
+            let tail = path.substring(len(path) - len(ext), len(path))
+            if tail == ext {
+                return "raw#7 HEXA-ONLY: write to `" + ext + "` blocked (path=" + path + ")"
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// raw #6 — F1/F2/F3 filename shape (lightweight subset, report-level)
+// We defer the full scan to the git hook; here we only catch egregious
+// _old/_new/_bak/_tmp suffixes so obvious violations die at write time.
+fn _law_raw6_temp_suffix(path: string) -> string {
+    let suffixes = ["_old.hexa", "_new.hexa", "_bak.hexa", "_tmp.hexa"]
+    let mut i = 0
+    while i < len(suffixes) {
+        let s = suffixes[i]
+        if len(path) > len(s) {
+            let tail = path.substring(len(path) - len(s), len(path))
+            if tail == s {
+                return "raw#6 filename temp-suffix: `" + s + "` blocked (path=" + path + ")"
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+pub fn law_check(path: string, content: string) {
+    // 1. Extension ban (raw #7)
+    let r7 = _law_raw7_extension_ban(path)
+    if r7 != "" { return [false, r7] }
+
+    // 2. Filename temp suffix (raw #6 subset)
+    let r6 = _law_raw6_temp_suffix(path)
+    if r6 != "" { return [false, r6] }
+
+    // 3. Probe write+remove cycle. Full ai-native scan is whole-repo and
+    //    deferred to Layer 2 (raw-compile) to avoid O(N*repo) per write.
+    _law_ensure_probe_dir()
+    let probe = _law_probe_path(path)
+    // intentional raw write — wrapped by law_check
+    try {
+        write_file(probe, content)
+    } catch e {
+        // Probe failure is not a law violation — it's an IO fault.
+        // Emit non-fatal and allow the real write to surface the real error.
+        exec("rm -f '" + probe + "' 2>/dev/null")
+        return [true, ""]
+    }
+    // Cleanup deterministically.
+    exec("rm -f '" + probe + "' 2>/dev/null")
+
+    return [true, ""]
+}
+
+// ─── public write API ────────────────────────────────────────────────
+// safe_write_file — law-gated replacement for raw `write_file`.
+// Violation: eprintln reason + exit(1). Success: perform write + return true.
+pub fn safe_write_file(path: string, content: string) -> bool {
+    let verdict = law_check(path, content)
+    let ok = verdict[0]
+    let reason = verdict[1]
+    if !ok {
+        eprintln("❌ [law_io] safe_write_file refused: " + reason)
+        exit(1)
+    }
+    // intentional raw write — wrapped by law_check
+    write_file(path, content)
+    return true
+}
+
+// safe_append_file — read-merge-write through the same gate.
+pub fn safe_append_file(path: string, content: string) -> bool {
+    // Read existing (best-effort — missing file starts empty).
+    let mut prev = ""
+    try { prev = to_string(read_file(path)) } catch _e { prev = "" }
+    let merged = prev + content
+    return safe_write_file(path, merged)
+}
+
+// safe_exec — sniff forbidden extensions in cmd before dispatch.
+pub fn safe_exec(cmd: string) -> int {
+    let bad = [".rs ", ".toml ", ".py ", ".sh "]
+    let mut i = 0
+    while i < len(bad) {
+        if cmd.contains(bad[i]) {
+            eprintln("❌ [law_io] safe_exec refused: raw#7 forbidden extension in cmd=" + cmd)
+            exit(1)
+        }
+        i = i + 1
+    }
+    // Delegate. Callers needing real status should use exec_with_status.
+    try {
+        let _ = exec(cmd)
+        return 0
+    } catch e {
+        eprintln("❌ [law_io] safe_exec runtime error: " + e.to_string())
+        return 1
+    }
+}
+
+// Self-test entry. `hexa run self/core/law_io.hexa` for smoke.
+fn main() {
+    println("law_io: self-test")
+    let p = "/tmp/hexa_law_io_selftest.hexa"
+    let ok = safe_write_file(p, "fn main() { println(\"ok\") }\n")
+    let ok2 = safe_append_file(p, "// appended\n")
+    let rc = safe_exec("test -f '" + p + "'")
+    println("  write=" + to_string(ok) + " append=" + to_string(ok2) + " exec_rc=" + to_string(rc))
+    exec("rm -f '" + p + "' 2>/dev/null")
+    println("law_io: selftest OK")
+}

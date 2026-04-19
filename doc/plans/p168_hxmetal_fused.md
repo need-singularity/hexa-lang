@@ -1,6 +1,6 @@
 # hxmetal — Fused SiLU × Matmul kernel PoC (ROI #168)
 
-Status: **design only** (2026-04-19). Depends on ROI #157 (objc_msgSend live wiring) and ROI #160 (matmul PoC). Both are currently `running` in `shared/hexa-lang/roi.json`; this document locks the fused-kernel design so that as soon as #157+#160 land, #168 can be implemented by swapping the stub body and flipping the test's `HXMETAL_FFI_LIVE` gate.
+Status: **design only** (2026-04-19). Depends on ROI #157 (objc_msgSend live wiring) and ROI #160 (matmul PoC). Both are currently `running` in `doc/roi.json`; this document locks the fused-kernel design so that as soon as #157+#160 land, #168 can be implemented by swapping the stub body and flipping the test's `HXMETAL_FFI_LIVE` gate.
 
 Related:
 - ROI #147 — FFI scaffold (9-function surface, landed 728b8202).
@@ -251,7 +251,7 @@ No live body. The stub follows the exact pattern of #147's `hxm_dispatch`
 | Live-mode numerical PoC (MSL compile + dispatch + 1e-3 tolerance)     | **blocked on #157+#160** |
 | ROI status transition to `done`                                       | only after live-mode PoC passes |
 
-Until #157+#160 land, ROI #168 stays `running` in `shared/hexa-lang/roi.json`
+Until #157+#160 land, ROI #168 stays `running` in `doc/roi.json`
 with `note: "design only, blocked on #157+#160"`.
 
 ## 8. Pitfalls honoured

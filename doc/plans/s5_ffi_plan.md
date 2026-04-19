@@ -1,7 +1,7 @@
 # S-5 — FFI Marshalling Plan (skeleton)
 
 **Status:** PLAN_DRAFTED (skeleton only — no marshalling logic yet)
-**Roadmap item:** `shared/hexa-lang/ai_native_s_level.json` → S-5 / S5-1
+**Roadmap item:** `self/ai_native/ai_native_s_level.json` → S-5 / S5-1
 **Owner:** hexa-lang
 **Drafted:** 2026-04-17
 

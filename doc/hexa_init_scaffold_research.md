@@ -162,7 +162,7 @@ hexa-lang 은 위 도구들과 다른 **2 가지 독특한 요구**가 있다:
 
 ### 3-1. HX3 (grammar pitfalls)
 
-- `.hexa` 생성 시 hexa 문법 준수. 예시 scaffold 의 project.hexa 는 `shared/hexa-lang/grammar.jsonl` P1~P5 검증 통과 필요.
+- `.hexa` 생성 시 hexa 문법 준수. 예시 scaffold 의 project.hexa 는 `doc/grammar.jsonl` P1~P5 검증 통과 필요.
 - **영향**: 생성된 project.hexa 가 `hexa parse project.hexa` 로 파싱 성공해야 함.
 - **연구 범위 내 조치**: 예시 scaffold 의 project.hexa 샘플은 self_format_examples 의 검증된 문법만 사용.
 

@@ -482,7 +482,7 @@ Total: **10 instructions, 40 bytes** for the entire program. The same source und
 
 ## 12. Build-toolchain entries (bt#83/84/85)
 
-This document drives three follow-up toolchain items added to `shared/hexa-lang/build-toolchain.json`:
+This document drives three follow-up toolchain items added to `tool/config/build_toolchain.json`:
 
 * **bt#83** — rt#36-B "AST→BC compiler". Owner: TBD. Deliverable: `self/native/hexa_bc_emit.c` (or `self/bytecode_emit.hexa` if pure-hexa is faster). Produces `HexaFnProto` from `Decl::Fn`. Validation: `dump_proto(fn) == golden` for 12 reference programs (fib, matvec, struct field access, closure, tail-rec, try/throw, string concat, array push, map get, generic add, mutual rec, deep recursion).
 * **bt#84** — rt#36-C "VM dispatch loop". Owner: TBD. Deliverable: `self/bytecode_interp.c` (replaces the `.stub` from this Phase A). Both switch and computed-goto modes. Validation: `verify_suite` 6/6 + `bench_suite` semantics-equiv across all opcodes.
@@ -525,7 +525,7 @@ This document drives three follow-up toolchain items added to `shared/hexa-lang/
 7. Andreas Gal, Brendan Eich et al., *Trace-based Just-in-Time Type Specialization for Dynamic Languages*, PLDI 2009 — the rt#39 trace-JIT entry path implied by `PROFILE_HOOK`.
 8. JSC LLInt — JavaScriptCore Low-Level Interpreter, hand-written in CSA-style portable assembly; informs the computed-goto choice in §10.
 9. Hexa internal: `self/hexa_nanbox.h` (rt#38-A design doc) — the HexaV encoding.
-10. Hexa internal: `shared/hexa-lang/runtime-bottlenecks.json` items rt#1, rt#2, rt#5, rt#32-A..M, rt#37 — measured cost model in §1.
+10. Hexa internal: `doc/runtime_bottlenecks.json` items rt#1, rt#2, rt#5, rt#32-A..M, rt#37 — measured cost model in §1.
 
 ---
 
@@ -565,7 +565,7 @@ Phase C headline numbers (2026-04-14):
 * **Remaining**: 33 opcodes (try/throw handler stack, closure upval open/close, string ops, `CALL_METHOD` with IC slot, `LOAD_FIELD` with shape hint, `PROFILE_HOOK`, wide-prefix form). Tracked under bt#84 subtasks.
 * **Open follow-up**: **T38** — `bc_emitter` uses some AST node layouts that drift from `self/hexa_full.hexa`; nil slot appears at transition boundaries on whole-program paths. Must resolve before Phase D makes `--vm` the default.
 
-Related breakthroughs landed in `shared/hexa-lang/state.json`:
+Related breakthroughs landed in `doc/state.json`:
 
 * `BT_RT36_A` (2026-04-13) — design doc + spec header skeleton
 * `BT_RT36_B` (2026-04-13) — bc_emitter.hexa 47 KB

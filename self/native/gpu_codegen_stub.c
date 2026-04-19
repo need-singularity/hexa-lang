@@ -6,7 +6,7 @@
  * so the rt#45 wave-6 implementer has a fixed contract to fill in.
  *
  * Companion design: docs/rt-45-gpu-design.md
- * Roadmap entry:   shared/hexa-lang/build-toolchain.json bt#82
+ * Roadmap entry:   tool/config/build_toolchain.json bt#82
  *
  * This file is intentionally standalone (no hexa_cc.c headers required)
  * so it compiles with `gcc -c gpu_codegen_stub.c -o /tmp/gpu_codegen_stub.o`

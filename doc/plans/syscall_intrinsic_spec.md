@@ -191,5 +191,5 @@ Success criteria:
 3. `self/codegen/arm64.hexa` — +40 LOC, syscall emit helper
 4. `self/codegen/x86_64.hexa` — +40 LOC, syscall emit helper
 5. `self/ir/lowering.hexa` — +30 LOC, `syscall(...)` call → OP_SYSCALL
-6. `shared/hexa-lang/grammar.jsonl` — +1 spec entry SPEC_SYSCALL_BUILTIN
+6. `doc/grammar.jsonl` — +1 spec entry SPEC_SYSCALL_BUILTIN
 7. `self/rt/test_syscall.hexa` — 30 LOC smoke test

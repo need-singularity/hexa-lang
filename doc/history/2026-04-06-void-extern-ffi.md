@@ -53,6 +53,6 @@ JIT 불가 → VM에서 extern 감지 → 컴파일 실패 → Interpreter fallb
 
 ## 다음 단계 (Phase 2)
 
-- PTY 래퍼 모듈 (`mk2_hexa/native/sys/pty.hexa`)
+- PTY 래퍼 모듈 (`self/experiment/mk2/sys/pty.hexa`)
 - Cocoa/AppKit 윈도우 생성 (macOS)
 - Metal GPU 렌더링 파이프라인

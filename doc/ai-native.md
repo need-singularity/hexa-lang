@@ -1,6 +1,6 @@
 # AI-Native Grammar System
 
-> **SoT 포인터 (R14)**: @attr 상태/수치 값의 단일 진실은 `shared/hexa-lang/ai-native.json` — 본 문서는 **narrative companion** (배경/유도/M0~M99 돌파 이력). 상태 불일치 시 JSON을 신뢰.
+> **SoT 포인터 (R14)**: @attr 상태/수치 값의 단일 진실은 `self/ai_native/ai_native.json` — 본 문서는 **narrative companion** (배경/유도/M0~M99 돌파 이력). 상태 불일치 시 JSON을 신뢰.
 
 > 2026-04-07 — Hexa-lang AI-native @attr 시스템 돌파
 
@@ -697,11 +697,11 @@ AI-native (Tier 6):
 
 | attr | 프로젝트 override | 글로벌 fallback |
 |------|-------------------|-----------------|
-| `@readme` | `.readme-rules.json` | `$NEXUS/shared/config/readme_rules.json` |
-| `@doc` | `.doc-rules.json` | `$NEXUS/shared/config/doc_rules.json` |
-| `@domain` | `.domain-rules.json` | `$NEXUS/shared/config/domain_rules.json` |
-| `@sealed` | `.sealed-rules.json` | `$NEXUS/shared/config/sealed_rules.json` |
-| `@publish` | `.publish-rules.json` | `$NEXUS/shared/config/publish_rules.json` |
+| `@readme` | `.readme-rules.json` | `$NEXUS/tool/config/readme_rules.json` |
+| `@doc` | `.doc-rules.json` | `$NEXUS/tool/config/doc_rules.json` |
+| `@domain` | `.domain-rules.json` | `$NEXUS/tool/config/domain_rules.json` |
+| `@sealed` | `.sealed-rules.json` | `$NEXUS/tool/config/sealed_rules.json` |
+| `@publish` | `.publish-rules.json` | `$NEXUS/tool/config/publish_rules.json` |
 
 **효과:**
 - attr scale — 신규 프로젝트 도입 시 attr 코드 변경 0

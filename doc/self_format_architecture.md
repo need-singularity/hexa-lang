@@ -95,7 +95,7 @@ fn project_meta() -> ProjectMeta { ... }
 - 규칙 자체는 JSON 외부 파일 5종에 분산.
 
 ### 3-4. JSON 파일 현황 (폐기 대상)
-- nexus `shared/config/` 에 5개: `readme_rules.json`, `doc_rules.json`, `domain_rules.json`, `sealed_rules.json`, `publish_rules.json` (전부 `_meta.inherit=false` 기본).
+- nexus `tool/config/` 에 5개: `readme_rules.json`, `doc_rules.json`, `domain_rules.json`, `sealed_rules.json`, `publish_rules.json` (전부 `_meta.inherit=false` 기본).
 - 프로젝트 루트별 `.{attr}-rules.json` 은 현재 미존재 (n6-arch 에도 없음). 즉 **지금 마이그레이션하면 손실 0**.
 
 ---
@@ -330,7 +330,7 @@ pub fn find_attr_rules_v2(source: string, attr: string, selector: map) -> map
 ### 5-4. 파일 배치
 
 - 각 프로젝트 루트: `project.hexa` (기존 위치 유지, 내용 확장).
-- **글로벌 default** 는 `$HEXA_LANG/self/attrs/_defaults.hexa` 로 이관. nexus `shared/config/*.json` 5종 폐기.
+- **글로벌 default** 는 `$HEXA_LANG/self/attrs/_defaults.hexa` 로 이관. nexus `tool/config/*.json` 5종 폐기.
 - `$HEXA_LANG/docs/self_format_examples/` 에 4개 예시 유지 (참조용).
 
 ### 5-5. 규모 예시 — 4 프로젝트
@@ -361,7 +361,7 @@ pub fn find_attr_rules_v2(source: string, attr: string, selector: map) -> map
 - 동일: `doc.hexa` / `sealed.hexa` / `domain.hexa` / `publish.hexa`.
 
 ### 6-4. Phase 3 — JSON 파일 폐기
-- nexus `shared/config/{doc,readme,domain,sealed,publish}_rules.json` 5종을 `$HEXA_LANG/self/attrs/_defaults.hexa` 로 이관.
+- nexus `tool/config/{doc,readme,domain,sealed,publish}_rules.json` 5종을 `$HEXA_LANG/self/attrs/_defaults.hexa` 로 이관.
 - 프로젝트별 `.{attr}-rules.json` 은 존재 시 `hexa migrate-rules` 커맨드로 `project.hexa` 에 자동 병합 후 삭제.
 
 ### 6-5. Phase 4 — v1 API 제거
@@ -412,7 +412,7 @@ pub fn find_attr_rules_v2(source: string, attr: string, selector: map) -> map
 
 ### 9-1. 원문 (CLAUDE.md:58)
 
-> HX11: AI-native SELF-FORMAT — 모든 attr (@doc/@domain/@readme/@sealed/@publish…) 은 프로젝트별 `.<attr>-rules.json` 주입으로 양식 독립. `_meta.inherit: false` (default) = 자체 양식, `inherit: true` = 글로벌 병합. 하드코딩 섹션·임계값 금지. 글로벌 fallback: `$NEXUS/shared/config/<attr>_rules.json`. 신규 attr 은 `find_<attr>_rules(source)` helper 필수
+> HX11: AI-native SELF-FORMAT — 모든 attr (@doc/@domain/@readme/@sealed/@publish…) 은 프로젝트별 `.<attr>-rules.json` 주입으로 양식 독립. `_meta.inherit: false` (default) = 자체 양식, `inherit: true` = 글로벌 병합. 하드코딩 섹션·임계값 금지. 글로벌 fallback: `$NEXUS/tool/config/<attr>_rules.json`. 신규 attr 은 `find_<attr>_rules(source)` helper 필수
 
 ### 9-2. 갱신안
 
@@ -420,7 +420,7 @@ pub fn find_attr_rules_v2(source: string, attr: string, selector: map) -> map
 
 ### 9-3. 변경 요약
 - `.{attr}-rules.json` → `project.hexa` 의 `@{attr}_rules` 블록.
-- 글로벌 fallback 위치: nexus/shared/config/ → hexa-lang/self/attrs/_defaults.hexa.
+- 글로벌 fallback 위치: nexus/tool/config/ → hexa-lang/self/attrs/_defaults.hexa.
 - helper: `find_<attr>_rules(source)` → `find_attr_rules_v2(source, attr, selector)` (단일 API, selector 로 type/scope 표현).
 - deprecation timeline 명시.
 

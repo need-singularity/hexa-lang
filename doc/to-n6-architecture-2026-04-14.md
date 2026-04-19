@@ -102,7 +102,7 @@ self/bc_vm.hexa           NEW_ARRAY/ARR_GET/ARR_PUSH/MAP_* opcodes (+223)  [C1 a
 self/interpreter.hexa     .substr() 메서드 추가  [이 답신 작업]
 self/hexa_full.hexa       .substr() mirror  [이 답신 작업]
 docs/rt-36-bytecode-design.md §17 진도   [C2 commit-ready]
-shared/hexa-lang/state.json  BT_T41/T42/T43  [C2 commit-ready]
+doc/state.json  BT_T41/T42/T43  [C2 commit-ready]
 shared/roadmaps/anima_hexa_common.json  rt36 47/62  [C2 commit-ready]
 shared/todo/hexa-lang.json  T37/T40 close + T41/T42/T43  [C2 commit-ready]
 docs/from-n6-architecture-2026-04-14.md  (n6-arch 전달)  [untracked]

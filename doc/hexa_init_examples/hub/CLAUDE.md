@@ -6,7 +6,7 @@ hexa 허브/SSOT 리포.
 
 1. `Read project.hexa` — @readme_rules(scope=module) + @sealed 엄격
 2. `Read README.md` — 허브 목적 + 참조 프로젝트
-3. `Glob shared/config/*.json`, `Glob shared/rules/*.json` — 공유 자원 구조
+3. `Glob tool/config/*.json`, `Glob shared/rules/*.json` — 공유 자원 구조
 
 ## 핵심 규칙
 
@@ -22,6 +22,6 @@ hexa 허브/SSOT 리포.
 
 ## 참조
 
-- 프로젝트 목록: `shared/config/projects.json`
+- 프로젝트 목록: `tool/config/projects.json`
 - 공통 규칙: `shared/rules/common.json`
 - harness: `shared/harness/`

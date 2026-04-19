@@ -2,7 +2,7 @@
 
 Status: stage 1 landed (this PR).
 Date: 2026-04-19.
-ROI item: `shared/hexa-lang/roi.json` → id 160 (`ffi_backend`, P0, 24h budget).
+ROI item: `doc/roi.json` → id 160 (`ffi_backend`, P0, 24h budget).
 Depends on: ROI #147 (stub, done) + ROI #157 (objc_msgSend live wiring, running).
 Upstream consumer: `$NEXUS/shared/roadmaps/m4_edge_deploy.json` → E2-3 (`metal_matmul.hexa`).
 
@@ -169,7 +169,7 @@ Work items:
 - Surface + stubs: `self/runtime/hxmetal_stub.hexa` (9-fn ABI + matmul scaffold).
 - Tests: `self/test_hxmetal_stub.hexa` (shape tests) + `self/test_hxmetal_matmul.hexa` (matmul PoC).
 - FFI design (ROI #147): `docs/plans/hxmetal_ffi_design.md`.
-- Live wiring (ROI #157): tracked in `shared/hexa-lang/roi.json` id=157.
+- Live wiring (ROI #157): tracked in `doc/roi.json` id=157.
 - Fused kernel (ROI #168): `docs/plans/p168_hxmetal_fused.md` (parallel).
 - Upstream roadmap: `$NEXUS/shared/roadmaps/m4_edge_deploy.json` E2-3.
-- ROI: `shared/hexa-lang/roi.json` id=160.
+- ROI: `doc/roi.json` id=160.

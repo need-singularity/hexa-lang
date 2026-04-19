@@ -2,7 +2,7 @@
 
 Status: scaffold / PoC. Execution path is stubbed; surface locked for future `objc_msgSend` wiring.
 Date: 2026-04-19.
-ROI item: `shared/hexa-lang/roi.json` → id 147 (`ffi_backend`, P0, M4 edge ceiling highest).
+ROI item: `doc/roi.json` → id 147 (`ffi_backend`, P0, M4 edge ceiling highest).
 Upstream consumer: `$NEXUS/shared/roadmaps/m4_edge_deploy.json` → E2-2 / E2-3 / E2-4 (`metal_ffi.hexa`, `metal_matmul.hexa`, `metal_fused.hexa`).
 
 ## 1. Why

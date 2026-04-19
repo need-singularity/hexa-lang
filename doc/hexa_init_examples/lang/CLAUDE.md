@@ -11,7 +11,7 @@ hexa 기반 언어/도구 프로젝트용.
 
 ## 핵심 규칙 (hexa-lang HX 준수)
 
-- **HX3**: `.hexa` 작성 전 `shared/hexa-lang/grammar.jsonl` P1~P5 체크.
+- **HX3**: `.hexa` 작성 전 `doc/grammar.jsonl` P1~P5 체크.
 - **HX4**: 모든 코드 `.hexa`. Rust/Python/JS 도입 금지.
 - **HX7**: 언어 기능 변경은 `self/` 경로 전용 (외부 디렉토리에 codegen 로직 금지).
 - **HX11**: attr 규칙은 `project.hexa` 의 `@<attr>_rules` 블록으로.
@@ -34,5 +34,5 @@ hexa 기반 언어/도구 프로젝트용.
 ## 참조
 
 - hexa-lang SSOT: `$HEXA_LANG/CLAUDE.md`
-- 문법: `$NEXUS/shared/hexa-lang/grammar.jsonl`
+- 문법: `$NEXUS/doc/grammar.jsonl`
 - ai-native 벡터: `$HEXA_LANG/docs/ai-native.md`

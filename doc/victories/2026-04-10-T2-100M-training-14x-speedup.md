@@ -316,7 +316,7 @@ T2 핵심 4 커밋 (anima 핸드오프 명시):
 | `$HEXA_LANG/self/lowrank_rect_sweep.hexa` | 직사각 shape 스위프 (7B 최적값 테이블) |
 | `$NEXUS/shared/growth_bus.jsonl` | 돌파 타임라인 (2026-04-09 ~ 04-10) |
 | `$NEXUS/shared/hexa_to_anima_20260410.json` | anima 핸드오프 (5 findings) |
-| `$HEXA_LANG/shared/bench/zeta_compare.jsonl` | bench harness 실측 로그 |
+| `$HEXA_LANG/bench/zeta_compare.jsonl` | bench harness 실측 로그 |
 
 ### 7.3 growth_bus 돌파 엔트리 (요약)
 

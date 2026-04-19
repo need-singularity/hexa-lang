@@ -26,8 +26,8 @@ purity-discipline attrs precedes it:
 
 | Layer | File                              | Scope                            |
 | ----- | --------------------------------- | -------------------------------- |
-| L1    | `self/stdlib/law_io.hexa`         | runtime write gate (live)        |
-| L2    | `self/stdlib/module_gate.hexa`    | load-time gate (design wired)    |
+| L1    | `self/core/law_io.hexa`         | runtime write gate (live)        |
+| L2    | `self/core/module_gate.hexa`    | load-time gate (design wired)    |
 | **L3** | **parser.hexa attr-mandatory**  | **AST-build-time gate (this)**   |
 
 L3 is the *earliest* possible enforcement — before typechecking, before

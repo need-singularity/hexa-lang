@@ -513,7 +513,7 @@ Each is a future ticket. None block rt#45 v1.
 - `docs/rt-45-gpu-design.md` (this file)
 - `experiments/rt45_gpu_hello.hexa` — illustrative `@gpu` syntax
 - `self/native/gpu_codegen_stub.c` — function-signature skeleton
-- `shared/hexa-lang/build-toolchain.json` — bt#82 entry, status=planned
+- `tool/config/build_toolchain.json` — bt#82 entry, status=planned
 
 No runtime modified. No `hexa_cc.c`, `runtime.c`, `hexa_full.hexa`, or
 `main.hexa` touched. Orthogonal to rt#32-L, rt#35, bt#81 in flight.

@@ -43,7 +43,7 @@ fn main() {
 
 ## Contributing
 
-- HX3 (grammar pitfalls): `.hexa` 작성 전 `shared/hexa-lang/grammar.jsonl` 참조.
+- HX3 (grammar pitfalls): `.hexa` 작성 전 `doc/grammar.jsonl` 참조.
 - HX4 (self-host): Rust/Python 소스 금지. `.hexa` 만.
 - HX7 (self-host 경로): 언어 기능 변경은 `self/` 하위에만.
 
