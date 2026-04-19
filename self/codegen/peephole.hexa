@@ -30,6 +30,11 @@ struct PeepholeStats {
     mul_sub_to_msub: int,
     str_ldr_elim: int,
     redundant_reverse_mov: int,
+    ldp_fuse: int,
+    stp_fuse: int,
+    mov_zero_to_xzr: int,
+    add_zero_to_mov: int,
+    sub_zero_to_mov: int,
     rounds: int
 }
 
@@ -40,12 +45,17 @@ fn peephole_stats_default() -> PeepholeStats {
         mul_sub_to_msub: 0,
         str_ldr_elim: 0,
         redundant_reverse_mov: 0,
+        ldp_fuse: 0,
+        stp_fuse: 0,
+        mov_zero_to_xzr: 0,
+        add_zero_to_mov: 0,
+        sub_zero_to_mov: 0,
         rounds: 0
     }
 }
 
 fn peephole_stats_total(s: PeepholeStats) -> int {
-    return s.identity_nop + s.mul_add_to_madd + s.mul_sub_to_msub + s.str_ldr_elim + s.redundant_reverse_mov
+    return s.identity_nop + s.mul_add_to_madd + s.mul_sub_to_msub + s.str_ldr_elim + s.redundant_reverse_mov + s.ldp_fuse + s.stp_fuse + s.mov_zero_to_xzr + s.add_zero_to_mov + s.sub_zero_to_mov
 }
 
 // Decode a 32-bit ARM64 word into a tag.
@@ -96,6 +106,99 @@ fn peep_decode_mov(word: int) -> [int] {
     return [rd, rm]
 }
 
+// Decode LDR Xt, [Xn, #imm12*8] unsigned-offset 64-bit form.
+// Encoding: 0xF9400000 | (imm12<<10) | (Rn<<5) | Rt   (top 10 bits = 0x3E5)
+// Returns [rt, rn, imm12] on match, else [-1,-1,-1]
+fn peep_decode_ldr_uoff(word: int) -> [int] {
+    let top10 = (word / 4194304) % 1024
+    if top10 != 0x3E5 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rt = word % 32
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rt, rn, imm12]
+}
+
+// Decode STR Xt, [Xn, #imm12*8] unsigned-offset 64-bit form.
+// Encoding: 0xF9000000 | (imm12<<10) | (Rn<<5) | Rt   (top 10 bits = 0x3E4)
+fn peep_decode_str_uoff(word: int) -> [int] {
+    let top10 = (word / 4194304) % 1024
+    if top10 != 0x3E4 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rt = word % 32
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rt, rn, imm12]
+}
+
+// Encode LDP Xt1, Xt2, [Xn, #imm7*8] signed-offset 64-bit form.
+// Base 0xA9400000 | (imm7 & 0x7F) << 15 | Rt2<<10 | Rn<<5 | Rt1
+// imm7 signed, scaled *8, range -64..63 (i.e. -512..504 bytes).
+fn peep_enc_ldp_soff(rt1: int, rt2: int, rn: int, imm7: int) -> int {
+    let imm7m = imm7 % 128
+    if imm7m < 0 { return 0xA9400000 + (imm7m + 128) * 32768 + rt2 * 1024 + rn * 32 + rt1 }
+    return 0xA9400000 + imm7m * 32768 + rt2 * 1024 + rn * 32 + rt1
+}
+
+// Encode STP Xt1, Xt2, [Xn, #imm7*8] signed-offset 64-bit form.
+// Base 0xA9000000 | (imm7 & 0x7F) << 15 | Rt2<<10 | Rn<<5 | Rt1
+fn peep_enc_stp_soff(rt1: int, rt2: int, rn: int, imm7: int) -> int {
+    let imm7m = imm7 % 128
+    if imm7m < 0 { return 0xA9000000 + (imm7m + 128) * 32768 + rt2 * 1024 + rn * 32 + rt1 }
+    return 0xA9000000 + imm7m * 32768 + rt2 * 1024 + rn * 32 + rt1
+}
+
+// Encode MOV Xd, XZR  (ORR Xd, XZR, XZR) = 0xAA1F03E0 | Rd
+fn peep_enc_mov_xzr(rd: int) -> int {
+    return 0xAA1F03E0 + rd
+}
+
+// Encode MOV Xd, Xs  (ORR Xd, XZR, Xs) = 0xAA0003E0 | (Rs<<16) | Rd
+fn peep_enc_mov_reg(rd: int, rs: int) -> int {
+    return 0xAA0003E0 + rs * 65536 + rd
+}
+
+// Decode MOVZ Xd, #imm16, LSL #0 (64-bit). Returns [rd, imm16] if matches, else [-1,-1].
+// Encoding: 0xD2800000 | (hw<<21) | (imm16<<5) | Rd.  We match hw==0 only (LSL #0).
+// Top 9 bits (mask 0xFF800000) must equal 0xD2800000's top 9: 0x1A5.
+fn peep_decode_movz(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x1A5 { return [0 - 1, 0 - 1] }
+    // hw = bits [22:21], must be 0 for LSL #0
+    let hw = (word / 2097152) % 4
+    if hw != 0 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    let imm16 = (word / 32) % 65536
+    return [rd, imm16]
+}
+
+// Decode ADD Xd, Xs, #imm12 (imm form, shift=0, 64-bit, S=0).
+// Encoding: 0x91000000 | (shift<<22) | (imm12<<10) | (Rs<<5) | Rd
+// Top 9 bits (mask 0xFF800000) must equal 0x91000000's top 9: 0x122.
+// shift bits [23:22] must be 0.
+fn peep_decode_add_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x122 { return [0 - 1, 0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rs = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rd, rs, imm12]
+}
+
+// Decode SUB Xd, Xs, #imm12 (imm form, shift=0, 64-bit, S=0).
+// Encoding: 0xD1000000 | (shift<<22) | (imm12<<10) | (Rs<<5) | Rd
+// Top 9 bits must equal 0xD1000000's top 9: 0x1A2.
+fn peep_decode_sub_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x1A2 { return [0 - 1, 0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rs = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rd, rs, imm12]
+}
+
 // Run the peephole optimizer over a code buffer (array of bytes).
 // Currently implements rule 1 of the 12: identity-MOV → NOP.
 // Detects MOV Xd, Xd (same src/dst via ORR Xd,XZR,Xd encoding) and rewrites
@@ -140,6 +243,109 @@ fn run_peephole(code: [int]) -> PeepholeResult {
         if a1 >= 0 && a2 >= 0 && a1 != 31 && b1 != 31 && a1 == b2 && b1 == a2 {
             c = peep_write_word_le(c, off + 4, nop)
             stats.redundant_reverse_mov = stats.redundant_reverse_mov + 1
+        }
+        off = off + 4
+    }
+
+    // Rule 3 pass — LDP fusion.
+    //   LDR Xt1, [Xn, #off] ; LDR Xt2, [Xn, #off+8]  →  LDP Xt1, Xt2, [Xn, #off] ; NOP
+    // Constraint: Rt1 != Rt2, offsets 8-byte aligned, fits signed imm7 (imm12<=63).
+    // Also: Rt1 != Rn (first LDR must not clobber base before second load in original;
+    // LDP loads both atomically so we need the base unchanged — if Rt1==Rn the original
+    // sequence would have used the clobbered base for load#2 which is already UB-adjacent,
+    // but conservatively we skip.)
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let l1 = peep_decode_ldr_uoff(w1)
+        let l2 = peep_decode_ldr_uoff(w2)
+        let rt1 = l1[0]
+        let rn1 = l1[1]
+        let im1 = l1[2]
+        let rt2 = l2[0]
+        let rn2 = l2[1]
+        let im2 = l2[2]
+        if rt1 >= 0 && rt2 >= 0 && rn1 == rn2 && rt1 != rt2 && im2 == im1 + 1 && im1 <= 63 && rt1 != rn1 {
+            let ldp = peep_enc_ldp_soff(rt1, rt2, rn1, im1)
+            c = peep_write_word_le(c, off, ldp)
+            c = peep_write_word_le(c, off + 4, nop)
+            stats.ldp_fuse = stats.ldp_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 4 pass — STP fusion.
+    //   STR Xt1, [Xn, #off] ; STR Xt2, [Xn, #off+8]  →  STP Xt1, Xt2, [Xn, #off] ; NOP
+    // Store side is safer than load (no dst-base clobber concern) — still require imm fits.
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = peep_read_word_le(c, off)
+        let w2 = peep_read_word_le(c, off + 4)
+        let s1 = peep_decode_str_uoff(w1)
+        let s2 = peep_decode_str_uoff(w2)
+        let rt1 = s1[0]
+        let rn1 = s1[1]
+        let im1 = s1[2]
+        let rt2 = s2[0]
+        let rn2 = s2[1]
+        let im2 = s2[2]
+        if rt1 >= 0 && rt2 >= 0 && rn1 == rn2 && im2 == im1 + 1 && im1 <= 63 {
+            let stp = peep_enc_stp_soff(rt1, rt2, rn1, im1)
+            c = peep_write_word_le(c, off, stp)
+            c = peep_write_word_le(c, off + 4, nop)
+            stats.stp_fuse = stats.stp_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Rule 5 pass — MOV Xd, #0  →  MOV Xd, XZR (ORR Xd, XZR, XZR)
+    // Size-identical rewrite (both 4 bytes) — switches from MOVZ to ORR-XZR form.
+    // Rd==31 (XZR) would be a no-op write to the zero register; skip.
+    off = 0
+    while off + 4 <= len(c) {
+        let w = peep_read_word_le(c, off)
+        let mz = peep_decode_movz(w)
+        let rd = mz[0]
+        let imm = mz[1]
+        if rd >= 0 && imm == 0 && rd != 31 {
+            c = peep_write_word_le(c, off, peep_enc_mov_xzr(rd))
+            stats.mov_zero_to_xzr = stats.mov_zero_to_xzr + 1
+        }
+        off = off + 4
+    }
+
+    // Rule 6 pass — ADD Xd, Xs, #0  →  MOV Xd, Xs
+    // Identity add with zero immediate. Size-identical.
+    off = 0
+    while off + 4 <= len(c) {
+        let w = peep_read_word_le(c, off)
+        let a = peep_decode_add_imm(w)
+        let rd = a[0]
+        let rs = a[1]
+        let imm = a[2]
+        if rd >= 0 && imm == 0 && rd != 31 && rs != 31 {
+            c = peep_write_word_le(c, off, peep_enc_mov_reg(rd, rs))
+            stats.add_zero_to_mov = stats.add_zero_to_mov + 1
+        }
+        off = off + 4
+    }
+
+    // Rule 7 pass — SUB Xd, Xs, #0  →  MOV Xd, Xs
+    off = 0
+    while off + 4 <= len(c) {
+        let w = peep_read_word_le(c, off)
+        let s = peep_decode_sub_imm(w)
+        let rd = s[0]
+        let rs = s[1]
+        let imm = s[2]
+        if rd >= 0 && imm == 0 && rd != 31 && rs != 31 {
+            c = peep_write_word_le(c, off, peep_enc_mov_reg(rd, rs))
+            stats.sub_zero_to_mov = stats.sub_zero_to_mov + 1
         }
         off = off + 4
     }

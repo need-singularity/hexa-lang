@@ -1,0 +1,379 @@
+// ═══════════════════════════════════════════════════════════
+//  test_peephole_arm64.hexa — ROI #139 ARM64 peephole pattern tests
+//
+//  Verifies 5 rewrite rules added to self/codegen/peephole.hexa:
+//    1. Adjacent LDR → LDP fusion
+//    2. Adjacent STR → STP fusion
+//    3. MOV Xd, #0    → MOV Xd, XZR
+//    4. ADD Xd, Xs, #0 → MOV Xd, Xs
+//    5. SUB Xd, Xs, #0 → MOV Xd, Xs
+//  + imm7 overflow guard for LDP.
+//
+//  Standalone — mirrors the decoder/encoder/rewrite math from
+//  self/codegen/peephole.hexa so the suite can run without the
+//  module-loader concat pipeline (same style as other self/test_*.hexa).
+//
+//  Run: ./hexa self/test_peephole_arm64.hexa
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name: string, cond: bool) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ─── Byte-buffer helpers (mirror peephole.hexa exactly) ────────
+fn t_nop_word() -> int { return 0xd503201f }
+
+fn t_read_word_le(code: [int], off: int) -> int {
+    return code[off] + code[off + 1] * 256 + code[off + 2] * 65536 + code[off + 3] * 16777216
+}
+
+fn t_write_word_le(code: [int], off: int, word: int) -> [int] {
+    let mut c = code
+    c[off] = word % 256
+    c[off + 1] = (word / 256) % 256
+    c[off + 2] = (word / 65536) % 256
+    c[off + 3] = (word / 16777216) % 256
+    return c
+}
+
+fn t_push_word(buf: [int], word: int) -> [int] {
+    let mut b = buf
+    b = b.push(word % 256)
+    b = b.push((word / 256) % 256)
+    b = b.push((word / 65536) % 256)
+    b = b.push((word / 16777216) % 256)
+    return b
+}
+
+// ─── Decoders / encoders (copy of peephole.hexa helpers) ───────
+
+fn t_decode_ldr_uoff(word: int) -> [int] {
+    let top10 = (word / 4194304) % 1024
+    if top10 != 0x3E5 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rt = word % 32
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rt, rn, imm12]
+}
+
+fn t_decode_str_uoff(word: int) -> [int] {
+    let top10 = (word / 4194304) % 1024
+    if top10 != 0x3E4 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rt = word % 32
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rt, rn, imm12]
+}
+
+fn t_enc_ldp(rt1: int, rt2: int, rn: int, imm7: int) -> int {
+    let m = imm7 % 128
+    if m < 0 { return 0xA9400000 + (m + 128) * 32768 + rt2 * 1024 + rn * 32 + rt1 }
+    return 0xA9400000 + m * 32768 + rt2 * 1024 + rn * 32 + rt1
+}
+
+fn t_enc_stp(rt1: int, rt2: int, rn: int, imm7: int) -> int {
+    let m = imm7 % 128
+    if m < 0 { return 0xA9000000 + (m + 128) * 32768 + rt2 * 1024 + rn * 32 + rt1 }
+    return 0xA9000000 + m * 32768 + rt2 * 1024 + rn * 32 + rt1
+}
+
+fn t_enc_mov_xzr(rd: int) -> int { return 0xAA1F03E0 + rd }
+
+fn t_enc_mov_reg(rd: int, rs: int) -> int {
+    return 0xAA0003E0 + rs * 65536 + rd
+}
+
+fn t_decode_movz(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x1A5 { return [0 - 1, 0 - 1] }
+    let hw = (word / 2097152) % 4
+    if hw != 0 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    let imm16 = (word / 32) % 65536
+    return [rd, imm16]
+}
+
+fn t_decode_add_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x122 { return [0 - 1, 0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rs = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rd, rs, imm12]
+}
+
+fn t_decode_sub_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 0x1A2 { return [0 - 1, 0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rs = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rd, rs, imm12]
+}
+
+// ─── Input-side encoders (how ir_to_arm64 emits) ───────────────
+
+fn enc_ldr_uoff(rt: int, rn: int, imm12: int) -> int {
+    return 0xF9400000 + imm12 * 1024 + rn * 32 + rt
+}
+
+fn enc_str_uoff(rt: int, rn: int, imm12: int) -> int {
+    return 0xF9000000 + imm12 * 1024 + rn * 32 + rt
+}
+
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 0xD2800000 + imm16 * 32 + rd
+}
+
+fn enc_add_imm(rd: int, rs: int, imm12: int) -> int {
+    return 0x91000000 + imm12 * 1024 + rs * 32 + rd
+}
+
+fn enc_sub_imm(rd: int, rs: int, imm12: int) -> int {
+    return 0xD1000000 + imm12 * 1024 + rs * 32 + rd
+}
+
+// ─── Minimal standalone reproduction of peephole passes 3-7 ────
+//  (Tests the same math as self/codegen/peephole.hexa::run_peephole.)
+
+struct PeepCounts {
+    ldp_fuse: int,
+    stp_fuse: int,
+    mov_zero_to_xzr: int,
+    add_zero_to_mov: int,
+    sub_zero_to_mov: int
+}
+
+struct PeepRun {
+    code: [int],
+    counts: PeepCounts
+}
+
+fn peep_counts_zero() -> PeepCounts {
+    return PeepCounts { ldp_fuse: 0, stp_fuse: 0, mov_zero_to_xzr: 0, add_zero_to_mov: 0, sub_zero_to_mov: 0 }
+}
+
+fn peep_run_new_rules(code: [int]) -> PeepRun {
+    let mut c = code
+    let mut cnt = peep_counts_zero()
+    let nop = t_nop_word()
+    if len(c) % 4 != 0 { return PeepRun { code: c, counts: cnt } }
+
+    // LDP fusion
+    let mut off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let l1 = t_decode_ldr_uoff(w1)
+        let l2 = t_decode_ldr_uoff(w2)
+        let rt1 = l1[0]
+        let rn1 = l1[1]
+        let im1 = l1[2]
+        let rt2 = l2[0]
+        let rn2 = l2[1]
+        let im2 = l2[2]
+        if rt1 >= 0 && rt2 >= 0 && rn1 == rn2 && rt1 != rt2 && im2 == im1 + 1 && im1 <= 63 && rt1 != rn1 {
+            c = t_write_word_le(c, off, t_enc_ldp(rt1, rt2, rn1, im1))
+            c = t_write_word_le(c, off + 4, nop)
+            cnt.ldp_fuse = cnt.ldp_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // STP fusion
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let s1 = t_decode_str_uoff(w1)
+        let s2 = t_decode_str_uoff(w2)
+        let rt1 = s1[0]
+        let rn1 = s1[1]
+        let im1 = s1[2]
+        let rt2 = s2[0]
+        let rn2 = s2[1]
+        let im2 = s2[2]
+        if rt1 >= 0 && rt2 >= 0 && rn1 == rn2 && im2 == im1 + 1 && im1 <= 63 {
+            c = t_write_word_le(c, off, t_enc_stp(rt1, rt2, rn1, im1))
+            c = t_write_word_le(c, off + 4, nop)
+            cnt.stp_fuse = cnt.stp_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // MOV #0 → XZR
+    off = 0
+    while off + 4 <= len(c) {
+        let w = t_read_word_le(c, off)
+        let mz = t_decode_movz(w)
+        let rd = mz[0]
+        let imm = mz[1]
+        if rd >= 0 && imm == 0 && rd != 31 {
+            c = t_write_word_le(c, off, t_enc_mov_xzr(rd))
+            cnt.mov_zero_to_xzr = cnt.mov_zero_to_xzr + 1
+        }
+        off = off + 4
+    }
+
+    // ADD #0 → MOV
+    off = 0
+    while off + 4 <= len(c) {
+        let w = t_read_word_le(c, off)
+        let a = t_decode_add_imm(w)
+        let rd = a[0]
+        let rs = a[1]
+        let imm = a[2]
+        if rd >= 0 && imm == 0 && rd != 31 && rs != 31 {
+            c = t_write_word_le(c, off, t_enc_mov_reg(rd, rs))
+            cnt.add_zero_to_mov = cnt.add_zero_to_mov + 1
+        }
+        off = off + 4
+    }
+
+    // SUB #0 → MOV
+    off = 0
+    while off + 4 <= len(c) {
+        let w = t_read_word_le(c, off)
+        let s = t_decode_sub_imm(w)
+        let rd = s[0]
+        let rs = s[1]
+        let imm = s[2]
+        if rd >= 0 && imm == 0 && rd != 31 && rs != 31 {
+            c = t_write_word_le(c, off, t_enc_mov_reg(rd, rs))
+            cnt.sub_zero_to_mov = cnt.sub_zero_to_mov + 1
+        }
+        off = off + 4
+    }
+
+    return PeepRun { code: c, counts: cnt }
+}
+
+fn count_nops(buf: [int]) -> int {
+    let mut n = 0
+    let mut off = 0
+    while off + 4 <= len(buf) {
+        if t_read_word_le(buf, off) == t_nop_word() { n = n + 1 }
+        off = off + 4
+    }
+    return n
+}
+
+// ═══════════════════════════════════════
+//  Test 1 — LDP fusion
+// ═══════════════════════════════════════
+fn test_ldp_fusion() {
+    let mut buf = []
+    // imm12 is already scaled ×8. X0 ← [X5, #16] (imm12=2), X1 ← [X5, #24] (imm12=3)
+    buf = t_push_word(buf, enc_ldr_uoff(0, 5, 2))
+    buf = t_push_word(buf, enc_ldr_uoff(1, 5, 3))
+    let result = peep_run_new_rules(buf)
+    let w0 = t_read_word_le(result.code, 0)
+    let top10 = (w0 / 4194304) % 1024
+    check("LDP fusion: stats.ldp_fuse == 1", result.counts.ldp_fuse == 1)
+    check("LDP fusion: NOP present at off+4", count_nops(result.code) == 1)
+    check("LDP fusion: slot 0 is LDP (top10 == 0x2A5)", top10 == 0x2A5)
+}
+
+// ═══════════════════════════════════════
+//  Test 2 — STP fusion
+// ═══════════════════════════════════════
+fn test_stp_fusion() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_str_uoff(2, 6, 0))
+    buf = t_push_word(buf, enc_str_uoff(3, 6, 1))
+    let result = peep_run_new_rules(buf)
+    let w0 = t_read_word_le(result.code, 0)
+    let top10 = (w0 / 4194304) % 1024
+    check("STP fusion: stats.stp_fuse == 1", result.counts.stp_fuse == 1)
+    check("STP fusion: NOP present at off+4", count_nops(result.code) == 1)
+    check("STP fusion: slot 0 is STP (top10 == 0x2A4)", top10 == 0x2A4)
+}
+
+// ═══════════════════════════════════════
+//  Test 3 — MOV #0 → XZR
+// ═══════════════════════════════════════
+fn test_mov_zero_to_xzr() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_movz(7, 0))
+    let result = peep_run_new_rules(buf)
+    let w0 = t_read_word_le(result.code, 0)
+    let expected = 0xAA1F03E7
+    check("MOV #0 → XZR: counter incremented", result.counts.mov_zero_to_xzr == 1)
+    check("MOV #0 → XZR: encoding == ORR X7, XZR, XZR", w0 == expected)
+}
+
+// ═══════════════════════════════════════
+//  Test 4 — ADD #0 identity
+// ═══════════════════════════════════════
+fn test_add_zero_identity() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_add_imm(9, 10, 0))
+    let result = peep_run_new_rules(buf)
+    let w0 = t_read_word_le(result.code, 0)
+    let expected = 0xAA0003E0 + 10 * 65536 + 9
+    check("ADD #0 → MOV: counter incremented", result.counts.add_zero_to_mov == 1)
+    check("ADD #0 → MOV: encoding == MOV X9, X10", w0 == expected)
+}
+
+// ═══════════════════════════════════════
+//  Test 5 — SUB #0 identity
+// ═══════════════════════════════════════
+fn test_sub_zero_identity() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_sub_imm(11, 12, 0))
+    let result = peep_run_new_rules(buf)
+    let w0 = t_read_word_le(result.code, 0)
+    let expected = 0xAA0003E0 + 12 * 65536 + 11
+    check("SUB #0 → MOV: counter incremented", result.counts.sub_zero_to_mov == 1)
+    check("SUB #0 → MOV: encoding == MOV X11, X12", w0 == expected)
+}
+
+// ═══════════════════════════════════════
+//  Test 6 — imm7 overflow guard (LDP)
+// ═══════════════════════════════════════
+fn test_ldp_imm7_overflow_guard() {
+    let mut buf = []
+    // imm12 = 64 (= 512B offset) is one past signed imm7 positive range (max 63)
+    buf = t_push_word(buf, enc_ldr_uoff(0, 5, 64))
+    buf = t_push_word(buf, enc_ldr_uoff(1, 5, 65))
+    let result = peep_run_new_rules(buf)
+    check("LDP imm7 guard: no fuse for imm12 > 63", result.counts.ldp_fuse == 0)
+}
+
+// ═══════════════════════════════════════
+//  Driver
+// ═══════════════════════════════════════
+fn run_all() {
+    test_ldp_fusion()
+    test_stp_fusion()
+    test_mov_zero_to_xzr()
+    test_add_zero_identity()
+    test_sub_zero_identity()
+    test_ldp_imm7_overflow_guard()
+
+    println("")
+    println("═══════════════════════════════════════")
+    println("  ROI #139 peephole tests")
+    println("  PASS: " + to_string(pass_count))
+    println("  FAIL: " + to_string(fail_count))
+    println("═══════════════════════════════════════")
+}
+
+run_all()
