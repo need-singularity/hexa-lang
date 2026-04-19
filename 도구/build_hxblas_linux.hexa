@@ -1,0 +1,182 @@
+// build_hxblas_linux.hexa — build libhxblas.so + libhxvdsp.so on Linux,
+// OR run a syntactic/link cross-verify on Mac before deploying to
+// the H100 pod.
+//
+// Port of the Mac build recipe from hxblas_wrapper.c/hxvdsp_wrapper.c
+// (Accelerate-based) to Linux using OpenBLAS + libm. Same exported
+// symbol set so hexa's @link("hxblas") / @link("hxvdsp") resolves to
+// the same ABI on both platforms (dylib on Mac, .so on Linux).
+//
+// Prerequisites (Ubuntu/Debian, runpod/pytorch:2.4.0 image):
+//   apt install gcc libopenblas-dev libgomp1
+//
+// Prerequisites (Mac cross-verify mode):
+//   brew install openblas
+//
+// Usage:
+//   hexa 도구/build_hxblas_linux.hexa                   // normal Linux build
+//   hexa 도구/build_hxblas_linux.hexa --debug           // -O0 -g for debug
+//   hexa 도구/build_hxblas_linux.hexa --mac-xverify     // syntactic + link
+//   CC=clang hexa 도구/build_hxblas_linux.hexa          // use clang instead
+//   DEPLOY=/usr/local/lib hexa 도구/build_hxblas_linux.hexa  // install
+//
+// Outputs (Linux mode):
+//   self/native/build/libhxblas.so
+//   self/native/build/libhxvdsp.so
+//
+// Outputs (--mac-xverify mode):
+//   self/native/build/xverify/libhxblas_xverify.dylib
+//   self/native/build/xverify/libhxvdsp_xverify.dylib
+
+fn run(cmd) {
+    let result = exec_with_status(cmd)
+    if result[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        exit(1)
+    }
+    result[0]
+}
+
+fn check_symbol(lib_path, sym) {
+    let result = exec_with_status("nm -gU " + lib_path + " | grep -q '" + sym + "'")
+    if result[1] == 0 {
+        println("  " + sym + " SYMBOL=PRESENT")
+        true
+    } else {
+        eprintln("  " + sym + " SYMBOL=MISSING")
+        false
+    }
+}
+
+fn main() {
+    let args = argv()
+    let hexa_dir = exec("cd \"$(dirname '" + args[1] + "')/../\" && pwd").trim()
+    let src_dir = hexa_dir + "/self/native"
+    let out_dir = hexa_dir + "/self/native/build"
+    let cc = if env("CC") != "" { env("CC") } else { "gcc" }
+    let mode = if len(args) > 2 { args[2] } else { "build" }
+
+    exec("mkdir -p " + out_dir)
+
+    // ────────────────────────────────────────────────────────────────
+    // --mac-xverify : run on Mac to validate the Linux source compiles
+    // and links cleanly against OpenBLAS BEFORE committing or pushing to
+    // the H100 pod. Uses Homebrew OpenBLAS for the cblas headers and
+    // -D__linux__=1 to enable the gated #ifdef block.
+    // ────────────────────────────────────────────────────────────────
+    if mode == "--mac-xverify" {
+        let uname = exec("uname -s").trim()
+        if uname != "Darwin" {
+            eprintln("--mac-xverify requires macOS, got " + uname)
+            exit(2)
+        }
+        let obs_inc = if env("OPENBLAS_INC") != "" { env("OPENBLAS_INC") } else { "/opt/homebrew/opt/openblas/include" }
+        let obs_lib = if env("OPENBLAS_LIB") != "" { env("OPENBLAS_LIB") } else { "/opt/homebrew/opt/openblas/lib" }
+        if !file_exists(obs_inc + "/cblas.h") {
+            eprintln("Homebrew openblas not found; install with: brew install openblas")
+            exit(3)
+        }
+        let xv_dir = out_dir + "/xverify"
+        exec("mkdir -p " + xv_dir)
+        // Force clang on Mac
+        let cc_x = if env("CC") != "" { env("CC") } else { "clang" }
+        // ARM64 Mac: enable bf16 NEON kernels (outside __linux__ guard)
+        let xv_arch = exec("uname -m").trim()
+        let xv_arch_flags = if xv_arch == "arm64" { " -march=armv8.2-a+bf16" } else { "" }
+        println("[xverify 1/2] linking hxblas_linux.c -> libhxblas_xverify.dylib")
+        run(cc_x + " -O3 -fPIC -dynamiclib -D__linux__=1" + xv_arch_flags + " -I" + obs_inc + " " + src_dir + "/hxblas_linux.c -L" + obs_lib + " -lopenblas -lm -o " + xv_dir + "/libhxblas_xverify.dylib")
+        println("[xverify 2/2] linking hxvdsp_linux.c -> libhxvdsp_xverify.dylib")
+        run(cc_x + " -O3 -fPIC -dynamiclib -D__linux__=1 " + src_dir + "/hxvdsp_linux.c -lm -o " + xv_dir + "/libhxvdsp_xverify.dylib")
+
+        // Diff the exported symbol set against the existing Mac production
+        // dylibs at anima/training/build/. ABI_DIFF=NONE means the Linux
+        // binding will resolve every Hexa-side extern fn that the Mac
+        // binding currently does.
+        let mac_blas = if env("MAC_BLAS") != "" { env("MAC_BLAS") } else { "/Users/ghost/Dev/anima/training/build/libhxblas.dylib" }
+        let mac_vdsp = if env("MAC_VDSP") != "" { env("MAC_VDSP") } else { "/Users/ghost/Dev/anima/training/build/libhxvdsp.dylib" }
+        println("── ABI parity check (vs " + mac_blas + ") ──")
+        if file_exists(mac_blas) {
+            run("nm -gU " + mac_blas + " | awk '/_hxblas_/{print $3}' | sort > " + xv_dir + "/mac_hxblas.txt")
+            run("nm -gU " + xv_dir + "/libhxblas_xverify.dylib | awk '/_hxblas_/{print $3}' | sort > " + xv_dir + "/lin_hxblas.txt")
+            let diff_result = exec_with_status("diff -q " + xv_dir + "/mac_hxblas.txt " + xv_dir + "/lin_hxblas.txt")
+            if diff_result[1] == 0 {
+                let count = exec("wc -l < " + xv_dir + "/lin_hxblas.txt | tr -d ' '").trim()
+                println("  hxblas ABI_DIFF=NONE (" + count + " symbols)")
+            } else {
+                eprintln("  hxblas ABI_DIFF=MISMATCH (see " + xv_dir + "/{mac,lin}_hxblas.txt)")
+                println(exec("diff " + xv_dir + "/mac_hxblas.txt " + xv_dir + "/lin_hxblas.txt || true").trim())
+                exit(4)
+            }
+        }
+        println("── ABI parity check (vs " + mac_vdsp + ") ──")
+        if file_exists(mac_vdsp) {
+            run("nm -gU " + mac_vdsp + " | awk '/_hxvdsp_/{print $3}' | sort > " + xv_dir + "/mac_hxvdsp.txt")
+            run("nm -gU " + xv_dir + "/libhxvdsp_xverify.dylib | awk '/_hxvdsp_/{print $3}' | sort > " + xv_dir + "/lin_hxvdsp.txt")
+            let diff_result = exec_with_status("diff -q " + xv_dir + "/mac_hxvdsp.txt " + xv_dir + "/lin_hxvdsp.txt")
+            if diff_result[1] == 0 {
+                let count = exec("wc -l < " + xv_dir + "/lin_hxvdsp.txt | tr -d ' '").trim()
+                println("  hxvdsp ABI_DIFF=NONE (" + count + " symbols)")
+            } else {
+                eprintln("  hxvdsp ABI_DIFF=MISMATCH (see " + xv_dir + "/{mac,lin}_hxvdsp.txt)")
+                println(exec("diff " + xv_dir + "/mac_hxvdsp.txt " + xv_dir + "/lin_hxvdsp.txt || true").trim())
+                exit(5)
+            }
+        }
+        println("── xverify outputs ──")
+        println(exec("ls -la " + xv_dir + "/libhx*_xverify.dylib").trim())
+        println("done — Linux source compiles + links + matches Mac ABI exactly")
+        exit(0)
+    }
+
+    // ────────────────────────────────────────────────────────────────
+    // Normal build mode — Linux only.
+    // ────────────────────────────────────────────────────────────────
+    let uname = exec("uname -s").trim()
+    if uname != "Linux" {
+        eprintln("build_hxblas_linux: expected Linux for normal build, got " + uname)
+        eprintln("  - On Linux:  hexa 도구/build_hxblas_linux.hexa")
+        eprintln("  - On Mac:    hexa 도구/build_hxblas_linux.hexa --mac-xverify")
+        eprintln("  - Mac wrappers live at anima/training/hxblas_wrapper.c")
+        exit(2)
+    }
+
+    let mut cflags_base = "-O3 -fPIC -shared -march=native"
+    if mode == "--debug" {
+        cflags_base = "-O0 -g -fPIC -shared"
+    }
+
+    // Detect ARM64 (aarch64) for bf16 NEON support
+    let arch = exec("uname -m").trim()
+    let is_arm64 = arch == "aarch64" || arch == "arm64"
+    if is_arm64 {
+        // ARMv8.2-a+bf16 enables FEAT_BF16 NEON instructions
+        cflags_base = "-O3 -fPIC -shared -march=armv8.2-a+bf16"
+        if mode == "--debug" {
+            cflags_base = "-O0 -g -fPIC -shared -march=armv8.2-a+bf16"
+        }
+        println("[arch] ARM64 detected — enabling NEON bf16 kernels (-march=armv8.2-a+bf16)")
+    }
+
+    // ── libhxblas.so — depends on libopenblas + libgomp + libm ────
+    println("[1/2] building libhxblas.so")
+    run(cc + " " + cflags_base + " -fopenmp " + src_dir + "/hxblas_linux.c -o " + out_dir + "/libhxblas.so -lopenblas -lgomp -lm")
+
+    // ── libhxvdsp.so — libm only (scalar + O3 + -march=native auto-vec) ──
+    println("[2/2] building libhxvdsp.so")
+    run(cc + " " + cflags_base + " " + src_dir + "/hxvdsp_linux.c -o " + out_dir + "/libhxvdsp.so -lm")
+
+    println("built:")
+    println(exec("ls -la " + out_dir + "/libhx*.so").trim())
+
+    // ── Optional: deploy to system lib path ────────────────────────
+    let deploy = env("DEPLOY")
+    if deploy != "" {
+        println("deploying to " + deploy)
+        run("cp " + out_dir + "/libhxblas.so " + deploy + "/")
+        run("cp " + out_dir + "/libhxvdsp.so " + deploy + "/")
+        exec_with_status("command -v ldconfig >/dev/null && ldconfig")
+    }
+
+    println("done — set LD_LIBRARY_PATH=" + out_dir + " (or DEPLOY=/usr/local/lib)")
+}
+

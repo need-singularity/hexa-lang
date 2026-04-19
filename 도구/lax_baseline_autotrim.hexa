@@ -1,0 +1,183 @@
+#!hexa lax
+// 도구/lax_baseline_autotrim.hexa — auto-prune `.hexa-lax-baseline`
+//
+// HX12 grandfather list shrinks over time. This helper scans every path
+// currently in `.hexa-lax-baseline`, runs ai_native_lint in strict mode
+// against it (bypassing the baseline itself), and reports which entries
+// are now strict-clean — i.e. safe to drop from the baseline.
+//
+// Usage:
+//   hexa 도구/lax_baseline_autotrim.hexa             # dry-run, print diff
+//   hexa 도구/lax_baseline_autotrim.hexa --apply     # rewrite baseline
+//   hexa 도구/lax_baseline_autotrim.hexa --verbose   # per-file lint lines
+//
+// Exit:
+//   0 — scan ok (regardless of how many entries trimmed)
+//   1 — infra failure (baseline unreadable, lint invocation broken, etc.)
+//
+// Implementation note — the linter normally honours `.hexa-lax-baseline`
+// itself, so running `hexa 도구/ai_native_lint.hexa --default-strict <f>`
+// from the repo root would still treat a baselined file as lax and return 0.
+// To force real strict evaluation we shell out from a tempdir (`/tmp`) where
+// `read_file(".hexa-lax-baseline")` fails → baseline string is "" → the
+// `path_in_baseline` check returns false → strict applies. The lint script
+// + target file are passed via absolute paths so cwd does not matter.
+
+fn repo_root() {
+    return exec("pwd").trim()
+}
+
+fn load_baseline_lines(path) {
+    try {
+        let raw = read_file(path)
+        return raw.split("\n")
+    } catch e { return [] }
+}
+
+fn is_comment_or_blank(line) {
+    let t = line.trim()
+    if len(t) == 0 { return true }
+    if t[0] == "#" { return true }
+    return false
+}
+
+// Run ai_native_lint in a baseline-free environment. Returns true iff the
+// file is strict-clean (lint exit 0, zero blocking violations).
+fn is_strict_clean(root, rel_path, verbose) {
+    let abs_file = root + "/" + rel_path
+    let abs_lint = root + "/도구/ai_native_lint.hexa"
+    let cmd = "cd /tmp && hexa " + abs_lint + " --default-strict " + abs_file + " 2>&1"
+    let result = exec_with_status(cmd)
+    let out = result[0]
+    let code = result[1]
+    if verbose {
+        let status = if code == 0 { "CLEAN" } else { "DIRTY" }
+        println("  [" + status + "] " + rel_path)
+        if code != 0 {
+            let preview = if len(out) > 240 { out.substring(0, 240) + "..." } else { out }
+            println("    " + preview.replace("\n", "\n    "))
+        }
+    }
+    return code == 0
+}
+
+fn print_diff(removed, kept_count, total, scanned, errors) {
+    println("")
+    println("=== lax-baseline autotrim report ===")
+    println("scanned : " + to_string(scanned) + " / " + to_string(total))
+    println("trimmable : " + to_string(len(removed)))
+    println("kept : " + to_string(kept_count))
+    if errors > 0 { println("errors : " + to_string(errors)) }
+    println("")
+    if len(removed) > 0 {
+        println("--- would remove (strict-clean now) ---")
+        let mut i = 0
+        while i < len(removed) {
+            println("- " + removed[i])
+            i = i + 1
+        }
+    } else {
+        println("(nothing to trim — every listed file still has strict violations)")
+    }
+}
+
+fn rebuild_baseline(orig_lines, to_remove) {
+    // Preserve leading comment / blank block + keep any still-dirty path.
+    // Membership test via "\n<p>\n" on a joined string (O(1)-ish) — same
+    // trick as ai_native_lint's path_in_baseline, feedback_interp_push_quadratic
+    let needle_bag = "\n" + to_remove.join("\n") + "\n"
+    let mut out_parts = []
+    let mut i = 0
+    while i < len(orig_lines) {
+        let line = orig_lines[i]
+        let t = line.trim()
+        let is_meta = is_comment_or_blank(line)
+        let norm = if len(t) >= 2 && t.substring(0, 2) == "./" { t.substring(2, len(t)) } else { t }
+        let should_drop = !is_meta && needle_bag.contains("\n" + norm + "\n")
+        if !should_drop { out_parts = out_parts.push(line) }
+        i = i + 1
+    }
+    return out_parts.join("\n")
+}
+
+fn main() {
+    let argv = args()
+    let mut apply = false
+    let mut verbose = false
+    let mut i = 2
+    while i < len(argv) {
+        let a = argv[i]
+        if a == "--apply" { apply = true }
+        else if a == "--verbose" || a == "-v" { verbose = true }
+        else if a == "--help" || a == "-h" {
+            println("usage: hexa 도구/lax_baseline_autotrim.hexa [--apply] [--verbose]")
+            return
+        } else {
+            println("unknown arg: " + a)
+            exit(1)
+        }
+        i = i + 1
+    }
+
+    let root = repo_root()
+    let baseline_path = root + "/.hexa-lax-baseline"
+    let lint_path = root + "/도구/ai_native_lint.hexa"
+
+    let lint_check = exec_with_status("test -f " + lint_path)
+    if lint_check[1] != 0 {
+        println("[err] ai_native_lint.hexa not found at " + lint_path)
+        exit(1)
+    }
+
+    let lines = load_baseline_lines(baseline_path)
+    if len(lines) == 0 {
+        println("[info] `.hexa-lax-baseline` empty or missing — nothing to trim")
+        return
+    }
+
+    let mut removed = []
+    let mut kept = 0
+    let mut scanned = 0
+    let mut errors = 0
+    let mut total_paths = 0
+    let mut j = 0
+    while j < len(lines) {
+        let line = lines[j]
+        if is_comment_or_blank(line) { j = j + 1; continue }
+        total_paths = total_paths + 1
+        let t = line.trim()
+        let rel = if len(t) >= 2 && t.substring(0, 2) == "./" { t.substring(2, len(t)) } else { t }
+        let exists = exec_with_status("test -f " + root + "/" + rel)
+        if exists[1] != 0 {
+            // stale entry — also trimmable (file is gone)
+            removed = removed.push(rel)
+            if verbose { println("  [GONE ] " + rel) }
+            j = j + 1
+            continue
+        }
+        scanned = scanned + 1
+        let clean = is_strict_clean(root, rel, verbose)
+        if clean { removed = removed.push(rel) }
+        else { kept = kept + 1 }
+        j = j + 1
+    }
+
+    print_diff(removed, kept, total_paths, scanned, errors)
+
+    if apply && len(removed) > 0 {
+        let new_body = rebuild_baseline(lines, removed)
+        try {
+            write_file(baseline_path, new_body)
+            println("")
+            println("[apply] `.hexa-lax-baseline` rewritten — " + to_string(len(removed)) + " entries removed")
+        } catch e {
+            println("[err] failed to rewrite baseline: " + e)
+            exit(1)
+        }
+    } else if !apply && len(removed) > 0 {
+        println("")
+        println("(dry-run — rerun with `--apply` to rewrite `.hexa-lax-baseline`)")
+    }
+}
+
+main()

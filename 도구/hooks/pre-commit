@@ -1,0 +1,228 @@
+#!/bin/bash
+# ── HX4 HEXA-ONLY 강제: .rs/.toml/.py/.sh 스테이지 차단 ──
+FORBIDDEN=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.(rs|toml|py|sh)$' || true)
+if [ -n "$FORBIDDEN" ]; then
+    echo "🚫 HEXA-ONLY 위반: .rs/.toml/.py/.sh 파일 커밋 금지 (HX4 + raw#7)"
+    echo "$FORBIDDEN" | sed 's/^/  ✗ /'
+    echo "→ .hexa 로 작성하세요. Rust/Cargo/Python/Shell 의존 제거 원칙."
+    exit 1
+fi
+
+# ── poc_lint (self/poc/ filename=dispatch-key 규약) ────
+# Self-contained: runs regardless of $HEXA availability — tries multiple
+# runners then skips gracefully. Fast-path: only if self/poc/ is staged.
+STAGED_POC=$(git diff --cached --diff-filter=ACMR --name-only 2>/dev/null | grep '^self/poc/' || true)
+if [ -n "$STAGED_POC" ]; then
+    POC_R=$(git rev-parse --show-toplevel 2>/dev/null)
+    POC_LINT="$POC_R/도구/poc_lint.hexa"
+    if [ -f "$POC_LINT" ]; then
+        POC_RUNNER=""
+        HEXA_BIN=$(which hexa 2>/dev/null)
+        if [ -x "$HEXA_BIN" ]; then
+            POC_RUNNER="$HEXA_BIN"
+        elif [ -x "$HOME/Dev/hexa-lang/hexa" ]; then
+            POC_RUNNER="$HOME/Dev/hexa-lang/hexa"
+        elif [ -x "$POC_R/build/hexa_stage0" ]; then
+            POC_RUNNER="$POC_R/build/hexa_stage0"
+        fi
+        if [ -n "$POC_RUNNER" ]; then
+            POC_OUT=$(cd "$POC_R" && "$POC_RUNNER" "$POC_LINT" 2>&1)
+            POC_RC=$?
+            # hexa interpreter's exit(1) doesn't always propagate — also gate on output text.
+            if [ "$POC_RC" -ne 0 ] || echo "$POC_OUT" | grep -q "^\[poc-lint\] FAIL"; then
+                echo "🚫 poc-lint 위반: self/poc/ filename=dispatch-key 규약 위반" >&2
+                echo "$POC_OUT" >&2
+                exit 1
+            fi
+        fi
+    fi
+fi
+
+# loop-guard pre-commit — 수동 커밋 안전망
+# loop-guard 자체 커밋이면 스킵
+MSG=$(cat .git/MERGE_MSG 2>/dev/null || git log -1 --format=%s 2>/dev/null)
+echo "$MSG" | grep -q "loop-guard\|loop 정합" && exit 0
+
+R=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+GUARD="$R/.shared/hooks/loop-guard.hexa"
+[ -f "$GUARD" ] || exit 0
+
+HEXA=$(which hexa 2>/dev/null)
+# fallback
+[ -z "$HEXA" ] && HEXA="$HOME/Dev/hexa-lang/hexa"
+[ -x "$HEXA" ] || exit 0
+
+# ── SSOT precommit (타세션 자기 수정 정합) ─────────────
+SSOT_HOOK="$R/도구/ssot_precommit_hook.hexa"
+[ -f "$SSOT_HOOK" ] && "$HEXA" run "$SSOT_HOOK" 2>&1 >&2 || true
+
+# ── ai-native naming guard (blocking, <50ms) ───────────
+# Only new .hexa files (diff-filter=A). Existing files grandfathered.
+# Full repo audit: 도구/ai_native_scan.hexa
+STAGED_HEXA=$(git diff --cached --name-only --diff-filter=AR 2>/dev/null | grep '\.hexa$' || true)
+
+# ── ai-native 3-rule linter (L1 scope / L2 literal_ban / L3 brace_lock) ──
+# Runs on staged+modified .hexa (diff-filter=ACMR), blocks only if file has
+# #!hexa strict header; otherwise emits warnings.
+STAGED_LINT=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\.hexa$' || true)
+if [ -n "$STAGED_LINT" ] && [ -x "$R/build/hexa_stage0" ]; then
+    # Pass up to 20 files at a time to keep runtime bounded
+    LINT_ARGS=$(echo "$STAGED_LINT" | head -20 | tr '\n' ' ')
+    if [ -n "$LINT_ARGS" ]; then
+        LINT_OUT=$("$R/build/hexa_stage0" "$R/도구/ai_native_lint.hexa" $LINT_ARGS 2>/dev/null | grep -v "security warning" || true)
+        if echo "$LINT_OUT" | grep -q "blocking violations"; then
+            echo "[ai-native] linter blocking violations:" >&2
+            echo "$LINT_OUT" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# ── law_io Layer 1: raw write_file() report (warn-only) ─────────
+# SSOT: self/stdlib/law_io.hexa (safe_write_file gate).
+# staged .hexa 변경이 있을 때 repo 전반의 raw `write_file(` 잔존 수를
+# stderr 로만 경고한다. Layer 2 승격 시 staged 파일 한정 blocking 으로 전환.
+if [ -n "$STAGED_LINT" ] && [ -f "$R/도구/lint_raw_write.hexa" ] && [ -x "$R/build/hexa_stage0" ]; then
+    LAW_OUT=$("$R/build/hexa_stage0" "$R/도구/lint_raw_write.hexa" 2>&1 | grep -v "^security warning" | head -3 || true)
+    if echo "$LAW_OUT" | grep -q "direct write_file"; then
+        echo "[law_io] warn: raw write_file() sites remain (Layer 2 will block):" >&2
+        echo "$LAW_OUT" >&2
+        echo "  → migrate to safe_write_file (self/stdlib/law_io)" >&2
+    fi
+fi
+
+if [ -n "$STAGED_HEXA" ]; then
+    PRODUCT_RE='^(build_stage0|build_stage1|rebuild_stage0|hexa_stage0|regression_stage1|install_stage0_shim)\.hexa$'
+    AI_FAIL=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        bn=$(basename "$f"); st="${bn%.hexa}"
+        echo "$st" | grep -qE '_v[0-9]+$' && AI_FAIL="$AI_FAIL\n  F1-version      $f"
+        if ! echo "$bn" | grep -qE "$PRODUCT_RE"; then
+            echo "$st" | grep -qE '(^|_)(stage|phase)[0-9]+(_|$)' && AI_FAIL="$AI_FAIL\n  F2-stage-phase  $f"
+            echo "$st" | grep -qE '(^|_)p[0-9]{1,2}(_|$)' && AI_FAIL="$AI_FAIL\n  F2-pN-segment   $f"
+        fi
+        echo "$st" | grep -qE '_(old|new|bak|tmp|copy|backup|save)$' && AI_FAIL="$AI_FAIL\n  F3-temp         $f"
+        echo "$f" | grep -qE '(^|/)(utils|helpers|common|lib|misc|stuff|base)/' && AI_FAIL="$AI_FAIL\n  F4-generic-dir  $f"
+    done <<< "$STAGED_HEXA"
+    if [ -n "$AI_FAIL" ]; then
+        echo "[ai-native] naming violation in newly added files:" >&2
+        printf "%b\n" "$AI_FAIL" >&2
+        echo "rules: F1 _v\\d+ | F2 stage/phase/p\\d | F3 _old/_new/_bak/_tmp | F4 utils/helpers/common/lib dirs" >&2
+        echo "exception: build_stage0/rebuild_stage0/hexa_stage0 (product names)" >&2
+        exit 1
+    fi
+fi
+
+# @raw-stanza ────────────────────────────────────────────
+# ── raw #0: self-format (.raw/.own/.ext strict validation, blocking) ─
+# SSOT: self/raw_cli.hexa verify (reads .raw + .own + .ext, strict parse)
+# Only fires when any of these files are staged.
+RAW0_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E '^\.(raw|own|ext)$' || true)
+if [ -n "$RAW0_STAGED" ] && [ -x "$R/build/hexa_stage0" ] && [ -f "$R/self/raw_cli.hexa" ]; then
+    RAW0_OUT=$("$R/build/hexa_stage0" "$R/self/raw_cli.hexa" verify 2>&1 | grep -v "security warning" || true)
+    if echo "$RAW0_OUT" | grep -q "🚫 FAIL"; then
+        echo "$RAW0_OUT" >&2
+        exit 1
+    fi
+fi
+
+# ── raw #3: @attr 네이밍 (blocking) ─────────────────────
+# SSOT: self/attrs/_naming.hexa via self/attr_cli.hexa lint
+if [ -n "$STAGED_LINT" ] && [ -x "$R/build/hexa_stage0" ] && [ -f "$R/self/attr_cli.hexa" ]; then
+    ATTR_ARGS=$(echo "$STAGED_LINT" | head -10 | tr '\n' ' ')
+    if [ -n "$ATTR_ARGS" ]; then
+        ATTR_OUT=$("$R/build/hexa_stage0" "$R/self/attr_cli.hexa" lint $ATTR_ARGS 2>&1 | grep -v "security warning" | grep -E 'naming violation|attr_naming' || true)
+        if [ -n "$ATTR_OUT" ]; then
+            echo "🚫 raw#3 @attr naming violation" >&2
+            echo "$ATTR_OUT" >&2
+            exit 1
+        fi
+    fi
+fi
+
+# ── raw #8: proof-carrying mark (blocking) ─────────────
+# SSOT: 도구/drift_scanner.hexa — rule declarations must have proof_path
+# + file must exist + state ∈ {live,done,ossified}. Only fires when rule
+# metadata files are staged (.raw / .own / roadmap.json).
+# NOTE (raw-migration 2026-04-19): legacy raw.json / .own-rules.json forwarded
+# to new SSOT .raw / .own (hexa-directive format, parsed by self/raw_loader.hexa).
+RAW8_STAGED=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E '(^\.raw$|^\.own$|raw\.json|\.own-rules\.json|roadmaps/.+\.json)$' || true)
+if [ -n "$RAW8_STAGED" ] && [ -x "$R/build/hexa_stage0" ] && [ -f "$R/도구/drift_scanner.hexa" ]; then
+    DRIFT_OUT=$("$R/build/hexa_stage0" "$R/도구/drift_scanner.hexa" 2>&1 | grep -v "security warning" || true)
+    if echo "$DRIFT_OUT" | grep -q "drift 감지\|drift detected"; then
+        echo "🚫 raw#8 proof-carrying drift — 선언 vs 현실 매치 실패" >&2
+        echo "$DRIFT_OUT" >&2
+        exit 1
+    fi
+fi
+
+# ── raw #5: 트리구조 F5 loner / F6 parent-child (blocking) ─
+# Only fires when a brand-new .hexa lands — existing violations grandfathered.
+STAGED_NEW=$(git diff --cached --name-only --diff-filter=A 2>/dev/null | grep '\.hexa$' || true)
+if [ -n "$STAGED_NEW" ] && [ -x "$R/build/hexa_stage0" ] && [ -f "$R/도구/ai_native_scan.hexa" ]; then
+    F5F6_OUT=$("$R/build/hexa_stage0" "$R/도구/ai_native_scan.hexa" 2>&1 | grep -v "security warning" | grep -E '^[[:space:]]*(F5|F6)' || true)
+    # Filter: only block if violation path matches a newly-added file.
+    F5F6_HIT=""
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        if echo "$F5F6_OUT" | grep -qF "$f"; then
+            F5F6_HIT="$F5F6_HIT\n  $f"
+        fi
+    done <<< "$STAGED_NEW"
+    if [ -n "$F5F6_HIT" ]; then
+        echo "🚫 raw#5 트리구조 위반 (F5 loner / F6 parent-child) — newly-added files" >&2
+        printf "%b\n" "$F5F6_HIT" >&2
+        echo "→ flatten loner dir OR rename parent_child.hexa" >&2
+        exit 1
+    fi
+fi
+# ── raw #10: silent error (warn-only, staged .hexa) ──────
+# 354 pre-existing violations → warn-only 까지 triage (@allow-silent-exit migration) 완료 후 block 승격.
+# SSOT: self/raws/silent_error.hexa via 도구/error_propagation_lint.hexa
+if [ -n "$STAGED_LINT" ] && [ -x "$R/build/hexa_stage0" ] && [ -f "$R/도구/error_propagation_lint.hexa" ]; then
+    RAW10_OUT=$("$R/build/hexa_stage0" "$R/도구/error_propagation_lint.hexa" --staged 2>&1 | grep -E '^error\[@silent_error\]' || true)
+    if [ -n "$RAW10_OUT" ]; then
+        echo "⚠ raw#10 silent_error warning (not blocking yet)" >&2
+        echo "$RAW10_OUT" | head -10 >&2
+        echo "→ see self/raws/silent_error.hexa (opt-out: @allow-silent-exit marker)" >&2
+    fi
+fi
+
+# ── raw #11: AI-tool config 금지 (blocking) ────────────
+# SSOT: 도구/ai_tool_ban_lint.hexa — bans CLAUDE.md, AGENTS.md, CODEX.md,
+# .cursorrules, .cursor/, .windsurfrules, .aider.conf.yml, .continuerules,
+# .github/copilot-instructions.md, .claude/. Grandfather existing, block add/modify.
+if [ -x "$R/build/hexa_stage0" ] && [ -f "$R/도구/ai_tool_ban_lint.hexa" ]; then
+    RAW11_OUT=$("$R/build/hexa_stage0" "$R/도구/ai_tool_ban_lint.hexa" 2>&1 | grep -v "security warning" || true)
+    if echo "$RAW11_OUT" | grep -q "raw#11"; then
+        echo "$RAW11_OUT" >&2
+        exit 1
+    fi
+fi
+# @raw-stanza-end ────────────────────────────────────────
+
+# --fix 실행, 수정된 파일 자동 stage
+# WHY not `git add -A`: 작업트리 전체를 재스테이지하면
+# `git commit -- <pathspec>` 제한이 무력화되고 타세션 변경까지 끌려옴.
+# 의도는 "이미 staged 인 파일이 --fix 로 갱신된 경우 갱신분 반영" 뿐이므로
+# 훅 진입 시점 staged 스냅샷에 한해서만 재스테이지.
+STAGED_SNAPSHOT=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null)
+"$HEXA" "$GUARD" --fix >/tmp/.loop-pre-commit.log 2>&1
+if [ -n "$STAGED_SNAPSHOT" ]; then
+    # 편집 소실 방지 (2026-04-16): staged+unstaged 혼재 파일은
+    # git add 하면 unstaged 부분까지 끌어올려 타에이전트 변경 포함됨.
+    # unstaged diff 있는 파일은 건너뛴다.
+    UNSTAGED=$(git diff --name-only 2>/dev/null || echo "")
+    echo "$STAGED_SNAPSHOT" | while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        [ ! -e "$f" ] && continue
+        # skip if file has unstaged changes (protect concurrent edits)
+        if echo "$UNSTAGED" | grep -qxF "$f"; then
+            echo "[pre-commit] skip re-stage: $f has unstaged changes" >&2
+            continue
+        fi
+        git add -- "$f" 2>/dev/null
+    done
+fi
+exit 0

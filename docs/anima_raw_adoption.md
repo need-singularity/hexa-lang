@@ -43,8 +43,8 @@ anima 에 파일 배치:
 ~/Dev/anima/.hexa-attrs           ← forbid + nonblock + seal 선언
 ~/Dev/anima/.raw                   ← L0 universal raw SSOT (hexa-directive)
 ~/Dev/anima/.own                   ← L1 anima-local raw SSOT (A1~A4 등)
-~/Dev/anima/scripts/law_check.hexa   ← hexa-lang 에서 복사
-~/Dev/anima/scripts/hexa_init.hexa   ← 동일
+~/Dev/anima/도구/law_check.hexa   ← hexa-lang 에서 복사
+~/Dev/anima/도구/hexa_init.hexa   ← 동일
 ```
 
 `.hexa-attrs` 초안:
@@ -70,7 +70,7 @@ seal     = README.md, CLAUDE.md,
 
 ```bash
 cd ~/Dev/anima
-hexa scripts/hexa_init.hexa
+hexa 도구/hexa_init.hexa
   → raw install (pre-commit @raw-stanza)
   → attr compile (.attr-generated/)
   → attr seal (ckpts + results chmod 0444)
@@ -120,5 +120,5 @@ Week 3  : fix.txt 시나리오 E2E 테스트 — interrupt 수 측정
 **참고**:
 - hexa-lang raw SSOT: `/.raw` (L0) + `/.own` (L1), 파서 `self/raw_loader.hexa` (hexa-directive 포맷)
 - (레거시) `shared/hexa-lang/raw.json` / `.own-rules.json` — deprecated, raw-migration 진행 중
-- 이식 스크립트 예정: `scripts/raw_port.hexa <target-project>` (후속)
+- 이식 스크립트 예정: `도구/raw_port.hexa <target-project>` (후속)
 - fix.txt 원본: `/Users/ghost/loss/fix.txt`

@@ -1,0 +1,604 @@
+// 도구/ssot_drift_report.hexa — bt 74-B — detailed SSOT drift report.
+//
+// Companion to 도구/check_ssot_sync.hexa (bt 74-A, commit ac9f103).
+// The 74-A tool computes a single FNV-1a 64 hash per fn body and reports
+// any mismatch. That mixes TWO very different kinds of drift:
+//
+//   * signature drift — param list, param types, return type,
+//     attributes (@inline, @pure …) — i.e. the function CONTRACT changed
+//   * body drift — implementation logic changed, same contract
+//
+// Reconciliation priorities differ: signature drift requires caller-site
+// audits and is higher risk; body drift can often be back-ported
+// verbatim. This tool splits those categories and reports them
+// separately (+ a "both drifted" bucket).
+//
+// It does NOT replace check_ssot_sync — that tool remains the canonical
+// single-number health check consumed by bt 74-A auto-patch. This tool
+// is the `--detail` companion.
+//
+// ─────────────────────────────────────────────────────────────
+// Design:
+//   * For each top-level `fn NAME(PARAMS) [-> RET] {` line we split the
+//     declaration into:
+//         sig_str  = everything between `fn NAME` and the final `{`,
+//                    trimmed. Normally "(a, b, c)" or "(a, b) -> Int".
+//         body_hash = FNV-1a 64 of the normalised body lines
+//                     (blank + `//`-comment lines stripped, each
+//                     remaining line trimmed).
+//     sig_hash = FNV-1a 64 of the normalised signature string.
+//   * Signatures on these two SSOTs are single-line (audited:
+//     `grep -cE '^fn ' == grep -cE '^fn .*\{'` in both files), so we do
+//     NOT attempt multi-line signature joining. A future multi-line
+//     sig would land in the tail of the first line and still hash
+//     correctly because we hash the whole pre-`{` slice.
+//
+// Classification per common fn:
+//     identical       — sig_hash == && body_hash ==
+//     drift_sig_only  — sig_hash != && body_hash ==
+//     drift_body_only — sig_hash == && body_hash !=
+//     drift_both      — sig_hash != && body_hash !=
+//
+// ─────────────────────────────────────────────────────────────
+// Usage (same arg order as check_ssot_sync for consistency):
+//   hexa build 도구/ssot_drift_report.hexa -o /tmp/ssot_drift && /tmp/ssot_drift
+//   /tmp/ssot_drift <interp_path> <full_path>
+//   /tmp/ssot_drift <interp_path> <full_path> <max_report>
+//   /tmp/ssot_drift <interp_path> <full_path> <max_report> --json
+//
+// --json emits one JSON object on stdout (after the header lines) that
+// bt 74-A auto-patch can consume without string parsing.
+//
+// Exit codes (unchanged from 74-A family):
+//   0 — no divergence
+//   1 — at least one common fn diverges (sig, body, or both)
+//   2 — argv / file-read error
+//
+// AI-native: pure hexa. Builtins: read_file, file_exists, args, println,
+// exit. R1 HEXA-FIRST.
+//
+// Runtime: MUST be native-built. stage0 OOMs on hexa_full.hexa (14.7k
+// SLOC) just like 74-A. Native C build compiles in <1s, runs in <5s.
+
+// ─────────────────────────────────────────────────────────────
+// tiny helpers (duplicated from check_ssot_sync.hexa — we keep the two
+// tools independent to avoid an import-graph dependency that the native
+// transpiler does not yet support for 도구/).
+// ─────────────────────────────────────────────────────────────
+
+fn dr_idx_of(list, needle) {
+    let n = len(list)
+    let mut i = 0
+    while i < n {
+        if list[i] == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Count a single ASCII byte in a line.
+fn dr_count_byte(line, target_byte) {
+    let bs = line.bytes()
+    let n = len(bs)
+    let mut c = 0
+    let mut i = 0
+    while i < n {
+        if bs[i] == target_byte { c = c + 1 }
+        i = i + 1
+    }
+    return c
+}
+
+// FNV-1a 64 step: fold bytes of `s` into running hash `h`.
+fn dr_fnv1a_step(h_in, s) {
+    let prime = 1099511628211
+    let bs = s.bytes()
+    let n = len(bs)
+    let mut h = h_in
+    let mut i = 0
+    while i < n {
+        h = h ^ bs[i]
+        h = h * prime
+        i = i + 1
+    }
+    // Mix in newline separator so adjacent lines don't fuse.
+    h = h ^ 10
+    h = h * prime
+    return h
+}
+
+// FNV-1a 64 one-shot over a single string (no newline mix).
+fn dr_fnv1a_of(s) {
+    let prime = 1099511628211
+    let bs = s.bytes()
+    let n = len(bs)
+    // Same seed as check_ssot_sync.hexa — arbitrary large odd int.
+    let mut h = 1125899906842597
+    let mut i = 0
+    while i < n {
+        h = h ^ bs[i]
+        h = h * prime
+        i = i + 1
+    }
+    return h
+}
+
+// Parse name out of "fn NAME(...".
+fn dr_parse_fn_name(line_trimmed) {
+    if !line_trimmed.starts_with("fn ") { return "" }
+    let rest = line_trimmed.substring(3, len(line_trimmed))
+    let lp = rest.index_of("(")
+    if lp < 0 { return "" }
+    return rest.substring(0, lp).trim()
+}
+
+// Extract the normalised signature string from "fn NAME(PARAMS) [-> RET] {".
+// Returns everything after the name and before the final `{`, trimmed.
+// Any whitespace collapse beyond .trim() is NOT attempted — two sources
+// that spell `fn f(a,b)` vs `fn f(a, b)` SHOULD report as sig drift, and
+// that is exactly what we want (formatting drift IS signature drift for
+// the purpose of this detector).
+fn dr_parse_fn_sig(line_trimmed) {
+    if !line_trimmed.starts_with("fn ") { return "" }
+    let rest = line_trimmed.substring(3, len(line_trimmed))
+    let lp = rest.index_of("(")
+    if lp < 0 { return "" }
+    // Walk forward from `(` tracking paren depth. The FIRST `{` seen at
+    // paren depth == 0 AFTER the opening `(` is closed marks the end of
+    // the signature. This correctly handles one-liner fns like
+    // `fn val_int(n) { return Val { tag: ... } }` where the LAST `{`
+    // belongs to the struct literal, not the fn body.
+    let bs = rest.bytes()
+    let line_len = len(bs)
+    let mut depth = 0
+    let mut lb = -1
+    let mut k = lp
+    let mut closed_paren = false
+    while k < line_len {
+        let b = bs[k]
+        if b == 40 {
+            // '('
+            depth = depth + 1
+        } else {
+            if b == 41 {
+                // ')'
+                depth = depth - 1
+                if depth == 0 { closed_paren = true }
+            } else {
+                if b == 123 {
+                    // '{' — only accept after the opening paren list
+                    // has closed and we are back at paren depth 0.
+                    if closed_paren {
+                        if depth == 0 {
+                            lb = k
+                            k = line_len
+                        }
+                    }
+                }
+            }
+        }
+        k = k + 1
+    }
+    if lb < 0 { return "" }
+    // Slice from the `(` to the `{` — inclusive of '(' but exclusive of '{'.
+    return rest.substring(lp, lb).trim()
+}
+
+// ─────────────────────────────────────────────────────────────
+// single-pass extractor: for each top-level fn produce
+//   (name, start_line, sig_hash, sig_str, body_hash).
+// sig_str is kept verbatim (for the human-readable report).
+// ─────────────────────────────────────────────────────────────
+
+fn dr_scan(src, label) {
+    let open_b = 123   // byte '{'
+    let close_b = 125  // byte '}'
+
+    let lines = src.split("\n")
+    let n = len(lines)
+
+    let mut names = []
+    let mut starts = []
+    let mut sig_hashes = []
+    let mut sig_strs = []
+    let mut body_hashes = []
+
+    let mut i = 0
+    while i < n {
+        let line = lines[i]
+        let t = line.trim()
+        if t.starts_with("fn ") {
+            let name = dr_parse_fn_name(t)
+            if name != "" {
+                let sig_str = dr_parse_fn_sig(t)
+                let sig_h = dr_fnv1a_of(sig_str)
+
+                let start_line = i
+                let mut depth = 0
+                let mut opened = false
+                // FNV-1a seed — same as sig for symmetry.
+                let mut h = 1125899906842597
+                let mut j = i
+                let mut done = false
+                while j < n {
+                    if done {
+                        j = n
+                    } else {
+                        let ln = lines[j]
+                        let o = dr_count_byte(ln, open_b)
+                        let c = dr_count_byte(ln, close_b)
+                        depth = depth + o - c
+                        if o > 0 { opened = true }
+
+                        // Normalise body line: trim; skip blanks;
+                        // skip `//`-only. The FIRST line (j == i) is
+                        // the `fn NAME(...) {` header — we DELIBERATELY
+                        // skip it so that sig drift and body drift
+                        // stay orthogonal. Without this skip, every
+                        // sig change also shows as body change because
+                        // the param list is textually part of line i.
+                        // One-liner fns (body AND header on same line,
+                        // e.g. `fn val_int(n) { return ... }`) keep
+                        // their body content by stripping everything
+                        // up to and INCLUDING the first `{`; the tail
+                        // still folds in as the "body" content.
+                        let nt = ln.trim()
+                        let mut fold_line = nt
+                        if j == i {
+                            // Strip the header prefix. Find first `{`
+                            // in nt and keep only what's AFTER it.
+                            let fb = nt.index_of("{")
+                            if fb >= 0 {
+                                fold_line = nt.substring(fb + 1, len(nt)).trim()
+                            } else {
+                                fold_line = ""
+                            }
+                        }
+                        if fold_line == "" {
+                            // skip
+                        } else {
+                            if fold_line.starts_with("//") {
+                                // skip
+                            } else {
+                                h = dr_fnv1a_step(h, fold_line)
+                            }
+                        }
+
+                        if opened {
+                            if depth <= 0 {
+                                names = names.push(name)
+                                starts = starts.push(start_line)
+                                sig_hashes = sig_hashes.push(sig_h)
+                                sig_strs = sig_strs.push(sig_str)
+                                body_hashes = body_hashes.push(h)
+                                i = j
+                                done = true
+                            }
+                        }
+                        j = j + 1
+                    }
+                }
+                // EOF-inside-fn: silently drop this one, outer loop
+                // resumes at i + 1.
+            }
+        }
+        i = i + 1
+    }
+
+    println("[ssot-drift] " + label + " fns = " + (len(names)))
+
+    let mut pack = []
+    pack = pack.push(names)
+    pack = pack.push(starts)
+    pack = pack.push(sig_hashes)
+    pack = pack.push(sig_strs)
+    pack = pack.push(body_hashes)
+    return pack
+}
+
+// JSON string escape — just the characters bt 74-A might choke on.
+// We only emit ASCII-safe content here (fn names, sig strings from
+// hexa sources, line numbers) so the fast path is sufficient.
+fn dr_json_escape(s) {
+    let bs = s.bytes()
+    let n = len(bs)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let b = bs[i]
+        if b == 92 {
+            out = out + "\\\\"
+        } else {
+            if b == 34 {
+                out = out + "\\\""
+            } else {
+                if b == 10 {
+                    out = out + "\\n"
+                } else {
+                    if b == 13 {
+                        out = out + "\\r"
+                    } else {
+                        if b == 9 {
+                            out = out + "\\t"
+                        } else {
+                            // pass-through single byte via substring
+                            // (avoids char->string builtin dep).
+                            out = out + s.substring(i, i + 1)
+                        }
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─────────────────────────────────────────────────────────────
+// main
+// ─────────────────────────────────────────────────────────────
+
+let args = args()
+let mut interp_path = "self/interpreter.hexa"
+let mut full_path = "self/hexa_full.hexa"
+let mut max_report = 40
+let mut json_mode = false
+
+// Flag scan. `--json` may appear anywhere in argv so we make one pass.
+// We deliberately DO NOT hoist len(args) into an intermediate `let
+// argc` — the native transpiler mis-types that as raw C int.
+let mut ai = 0
+while ai < len(args) {
+    if args[ai] == "--json" { json_mode = true }
+    ai = ai + 1
+}
+
+// Positional args: [2]=interp, [3]=full, [4]=max_report (if numeric).
+// We skip positional slots whose value is "--json" so `--json` in any
+// position works.
+let mut pos_slot = 2
+let mut ap = 2
+while ap < len(args) {
+    let v = args[ap]
+    if v == "--json" {
+        // skip
+    } else {
+        if pos_slot == 2 { interp_path = v }
+        if pos_slot == 3 { full_path = v }
+        if pos_slot == 4 { max_report = v.parse_int() }
+        pos_slot = pos_slot + 1
+    }
+    ap = ap + 1
+}
+
+if !file_exists(interp_path) {
+    println("[ssot-drift] FATAL interp not found: " + interp_path)
+    exit(2)
+}
+if !file_exists(full_path) {
+    println("[ssot-drift] FATAL full not found: " + full_path)
+    exit(2)
+}
+
+println("[ssot-drift] interp = " + interp_path)
+println("[ssot-drift] full   = " + full_path)
+if json_mode {
+    println("[ssot-drift] json mode = ON")
+}
+
+let interp_src = read_file(interp_path)
+let full_src = read_file(full_path)
+
+let ipack = dr_scan(interp_src, "interp")
+let fpack = dr_scan(full_src, "full  ")
+
+let inames = ipack[0]
+let istarts = ipack[1]
+let i_sig_hashes = ipack[2]
+let i_sig_strs = ipack[3]
+let i_body_hashes = ipack[4]
+
+let fnames = fpack[0]
+let fstarts = fpack[1]
+let f_sig_hashes = fpack[2]
+let f_sig_strs = fpack[3]
+let f_body_hashes = fpack[4]
+
+let mut common = 0
+let mut identical = 0
+let mut drift_sig = 0
+let mut drift_body = 0
+let mut drift_both = 0
+let mut interp_only = 0
+
+// Categorised reports — each entry: (name, interp_line, full_line,
+// interp_sig, full_sig, body_drifted_bool)
+let mut rep_sig = []
+let mut rep_body = []
+let mut rep_both = []
+
+let ni = len(inames)
+let mut i = 0
+while i < ni {
+    let name = inames[i]
+    let fi = dr_idx_of(fnames, name)
+    if fi < 0 {
+        interp_only = interp_only + 1
+    } else {
+        common = common + 1
+        let sa = i_sig_hashes[i]
+        let sb = f_sig_hashes[fi]
+        let ba = i_body_hashes[i]
+        let bb = f_body_hashes[fi]
+        let sig_same = sa == sb
+        let body_same = ba == bb
+        if sig_same {
+            if body_same {
+                identical = identical + 1
+            } else {
+                drift_body = drift_body + 1
+                if len(rep_body) < max_report {
+                    let msg = "  [body] " + name + "  interp:L" + (istarts[i] + 1) + "  full:L" + (fstarts[fi] + 1)
+                    rep_body = rep_body.push(msg)
+                }
+            }
+        } else {
+            if body_same {
+                drift_sig = drift_sig + 1
+                if len(rep_sig) < max_report {
+                    let msg = "  [sig ] " + name + "  interp:L" + (istarts[i] + 1) + " " + i_sig_strs[i] + "  full:L" + (fstarts[fi] + 1) + " " + f_sig_strs[fi]
+                    rep_sig = rep_sig.push(msg)
+                }
+            } else {
+                drift_both = drift_both + 1
+                if len(rep_both) < max_report {
+                    let msg = "  [both] " + name + "  interp:L" + (istarts[i] + 1) + " " + i_sig_strs[i] + "  full:L" + (fstarts[fi] + 1) + " " + f_sig_strs[fi]
+                    rep_both = rep_both.push(msg)
+                }
+            }
+        }
+    }
+    i = i + 1
+}
+
+let mut full_only = 0
+let nf = len(fnames)
+let mut j = 0
+while j < nf {
+    if dr_idx_of(inames, fnames[j]) < 0 {
+        full_only = full_only + 1
+    }
+    j = j + 1
+}
+
+let divergent_total = drift_sig + drift_body + drift_both
+
+println("")
+println("[ssot-drift] summary")
+println("  common         = " + (common))
+println("  identical      = " + (identical))
+println("  drift_sig_only = " + (drift_sig))
+println("  drift_body_only= " + (drift_body))
+println("  drift_both     = " + (drift_both))
+println("  divergent_total= " + (divergent_total))
+println("  interp_only    = " + (interp_only))
+println("  full_only      = " + (full_only))
+
+if divergent_total > 0 {
+    println("")
+    if drift_sig > 0 {
+        println("[ssot-drift] signature-only drift (first " + (max_report) + "):")
+        let nr = len(rep_sig)
+        let mut k = 0
+        while k < nr {
+            println(rep_sig[k])
+            k = k + 1
+        }
+    }
+    if drift_body > 0 {
+        println("")
+        println("[ssot-drift] body-only drift (first " + (max_report) + "):")
+        let nr2 = len(rep_body)
+        let mut k2 = 0
+        while k2 < nr2 {
+            println(rep_body[k2])
+            k2 = k2 + 1
+        }
+    }
+    if drift_both > 0 {
+        println("")
+        println("[ssot-drift] signature + body drift (first " + (max_report) + "):")
+        let nr3 = len(rep_both)
+        let mut k3 = 0
+        while k3 < nr3 {
+            println(rep_both[k3])
+            k3 = k3 + 1
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────
+// --json machine-readable output (consumed by bt 74-A auto-patch).
+// Emitted AFTER the human summary so humans still see the numbers;
+// the JSON object appears on a single line prefixed with "JSON: ".
+// Auto-patch greps for that prefix.
+// ─────────────────────────────────────────────────────────────
+
+if json_mode {
+    // Build per-category fn-name arrays for the consumer.
+    let mut json_sig_names = []
+    let mut json_body_names = []
+    let mut json_both_names = []
+    let mut jj = 0
+    while jj < ni {
+        let nm = inames[jj]
+        let fj = dr_idx_of(fnames, nm)
+        if fj >= 0 {
+            let ss = i_sig_hashes[jj] == f_sig_hashes[fj]
+            let bs = i_body_hashes[jj] == f_body_hashes[fj]
+            if ss {
+                if !bs {
+                    json_body_names = json_body_names.push(nm)
+                }
+            } else {
+                if bs {
+                    json_sig_names = json_sig_names.push(nm)
+                } else {
+                    json_both_names = json_both_names.push(nm)
+                }
+            }
+        }
+        jj = jj + 1
+    }
+
+    let mut js = ""
+    js = js + "{"
+    js = js + "\"common\":" + (common) + ","
+    js = js + "\"identical\":" + (identical) + ","
+    js = js + "\"drift_sig_only\":" + (drift_sig) + ","
+    js = js + "\"drift_body_only\":" + (drift_body) + ","
+    js = js + "\"drift_both\":" + (drift_both) + ","
+    js = js + "\"interp_only\":" + (interp_only) + ","
+    js = js + "\"full_only\":" + (full_only) + ","
+
+    js = js + "\"sig_only\":["
+    let mut ks = 0
+    while ks < len(json_sig_names) {
+        if ks > 0 { js = js + "," }
+        js = js + "\"" + dr_json_escape(json_sig_names[ks]) + "\""
+        ks = ks + 1
+    }
+    js = js + "],"
+
+    js = js + "\"body_only\":["
+    let mut kb = 0
+    while kb < len(json_body_names) {
+        if kb > 0 { js = js + "," }
+        js = js + "\"" + dr_json_escape(json_body_names[kb]) + "\""
+        kb = kb + 1
+    }
+    js = js + "],"
+
+    js = js + "\"both\":["
+    let mut kab = 0
+    while kab < len(json_both_names) {
+        if kab > 0 { js = js + "," }
+        js = js + "\"" + dr_json_escape(json_both_names[kab]) + "\""
+        kab = kab + 1
+    }
+    js = js + "]"
+
+    js = js + "}"
+    println("")
+    println("JSON: " + js)
+}
+
+if divergent_total > 0 {
+    println("")
+    println("[ssot-drift] FAIL — " + (drift_sig) + " sig / " + (drift_body) + " body / " + (drift_both) + " both. Fix signature drift first (contract change).")
+    exit(1)
+} else {
+    println("")
+    println("[ssot-drift] OK — all common fns identical in both signature and body.")
+    exit(0)
+}

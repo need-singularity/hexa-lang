@@ -1,0 +1,188 @@
+// 도구/stability_c3_pbv.hexa
+// ═══════════════════════════════════════════════════════════════════
+//  C3 "stage0 PBV leak" 24h stability scaffold (2026-04-16)
+// ───────────────────────────────────────────────────────────────────
+//  Background
+//    extreme.json SR2: "PBV leak (C3) 미해결 시 CLM 장시간 학습 중단.
+//    mitigation: pre-flight 24h stability test 통과 필수."
+//
+//    A fix landed in self/hexa_full.hexa this session that replaces the
+//    IndexAssign "push-rebuild" pattern with an in-place write through
+//    the host runtime's O(1) array_store slot (see hexa_full.hexa
+//    lines ~6489, ~7139, ~7248). This scaffold exercises the paths
+//    that previously leaked so that a long-running stress test can
+//    detect both (a) unbounded RSS growth (leak) and (b) silent
+//    corruption (wrong checksum at end).
+//
+//  Strategy
+//    We repeatedly pound four PBV-heavy operations that all flow
+//    through the three fix points:
+//       1. IndexAssign on a fixed-size rolling buffer  (hot slot)
+//       2. push() growth on a separate log array       (amortised COW)
+//       3. concat / slice on the log array             (fresh alloc)
+//       4. CompoundAssign  (arr[i] += v)               (third fix site)
+//
+//    Every 1000 iterations we snapshot:
+//       - iteration count
+//       - current log-array length
+//       - resident set size (via `ps -o rss= -p $$`)
+//       - elapsed wall time (via `date +%s%3N`)
+//    …and print one JSON-line (jq-friendly) per sample.
+//
+//    At the end we emit a final checksum that folds the rolling buffer
+//    state.  Any memory corruption across iterations will change this
+//    checksum away from its reference value for a given N, giving us
+//    an invariant that's cheap to check across builds.
+//
+//  Parameters (environment variables)
+//    STABILITY_ITERS     total outer-loop count
+//                         default: 100_000
+//                         smoke : 1_000   (sub-second)
+//                         real  : 1_000_000  (~8min on Mac arm64)
+//                         24h eq: 150_000_000  (extrapolated)
+//    STABILITY_SAMPLE    every Nth iter emit a sample (default 1000)
+//    STABILITY_LOG_CAP   trim log every K iter to avoid O(N) memory
+//                         (default 256, set 0 to disable trimming —
+//                          useful when you *want* to observe growth)
+//
+//  Output
+//    stdout: one line per sample  (begins with "SAMPLE ")
+//    stdout: one final line "RESULT {...}" with checksum + totals
+//    exit 0 on success, non-zero on abort
+//
+//  HX7 compliance: pure self-host, no Rust bridge, no C FFI beyond
+//  the already-existing builtins (exec / env_var / to_int / to_string
+//  / print / len).  Runs against the existing build/hexa_stage0
+//  binary — we do NOT require any rebuild to use this scaffold.
+// ═══════════════════════════════════════════════════════════════════
+
+fn read_int_env(name, def_val) {
+    let raw = env_var(name)
+    if len(raw) == 0 {
+        return def_val
+    }
+    return to_int(raw)
+}
+
+fn rss_kb() {
+    // Returns resident set size of the CURRENT shell/hexa process in KB.
+    // `$$` is substituted by the shell `exec()` spawns — this is the
+    // hexa_stage0 interpreter's own pid.  Trimmed to plain int-string.
+    let raw = exec("ps -o rss= -p $$ 2>/dev/null | tr -d ' \n'")
+    if len(raw) == 0 {
+        return 0
+    }
+    return to_int(raw)
+}
+
+fn wall_ms() {
+    // Millisecond wall clock — macOS `date` lacks `%N`, so we shell out
+    // to perl (ubiquitous on Mac & Linux).  Returns 0 if perl is
+    // unavailable so the script still runs (samples just lose ms
+    // precision).  Avoids the __builtin_time_now_ms gap in stage0
+    // surface syntax.
+    let raw = exec("perl -MTime::HiRes=time -e 'printf \"%.0f\", time()*1000' 2>/dev/null | tr -d ' \n'")
+    if len(raw) == 0 {
+        // fallback: seconds * 1000
+        let sec = exec("date +%s | tr -d ' \n'")
+        if len(sec) == 0 {
+            return 0
+        }
+        return to_int(sec) * 1000
+    }
+    return to_int(raw)
+}
+
+fn main() {
+    let iters    = read_int_env("STABILITY_ITERS", 100000)
+    let sample_every = read_int_env("STABILITY_SAMPLE", 1000)
+    let log_cap      = read_int_env("STABILITY_LOG_CAP", 256)
+
+    // Fixed-size rolling buffer — hot IndexAssign target.
+    let mut buf = [0, 0, 0, 0, 0, 0, 0, 0]
+    let n = 8
+
+    // Variable-length log — push/concat/slice target.
+    let mut log = []
+
+    let t0 = wall_ms()
+    let rss0 = rss_kb()
+
+    println("{\"event\":\"start\",\"iters\":" + to_string(iters) +
+          ",\"sample_every\":" + to_string(sample_every) +
+          ",\"log_cap\":" + to_string(log_cap) +
+          ",\"rss0_kb\":" + to_string(rss0) +
+          ",\"t0_ms\":" + to_string(t0) + "}")
+
+    let mut i = 0
+    let mut sample_count = 0
+    let mut rss_peak = rss0
+
+    while i < iters {
+        let slot = i % n
+
+        // (1) IndexAssign — first C3 fix site (NK_ASSIGN, ~L6499)
+        buf[slot] = (buf[slot] + i + 1) % 1000003
+
+        // (2) push() growth — amortised COW path
+        log = log.push(buf[slot])
+
+        // (3) concat / slice — trim when log_cap is hit, exercising
+        // the fresh-alloc fast path that the old push-rebuild regressed.
+        if log_cap > 0 {
+            if len(log) > log_cap {
+                // keep only the newest half
+                let keep = log_cap / 2
+                log = log[(len(log) - keep)..len(log)]
+            }
+        }
+
+        // (4) CompoundAssign — third C3 fix site (CompoundAssign, ~L7252)
+        buf[(slot + 1) % n] = buf[(slot + 1) % n] + 1
+
+        // Periodic sample emission.
+        if sample_every > 0 {
+            if i % sample_every == 0 {
+                let rss = rss_kb()
+                if rss > rss_peak {
+                    rss_peak = rss
+                }
+                let tnow = wall_ms()
+                println("SAMPLE {\"i\":" + to_string(i) +
+                      ",\"log_len\":" + to_string(len(log)) +
+                      ",\"rss_kb\":" + to_string(rss) +
+                      ",\"elapsed_ms\":" + to_string(tnow - t0) + "}")
+                sample_count = sample_count + 1
+            }
+        }
+
+        i = i + 1
+    }
+
+    // Final checksum — folds the rolling buffer state.
+    // Any corruption during iteration will drift this value.
+    let mut checksum = 0
+    let mut j = 0
+    while j < n {
+        checksum = (checksum * 31 + buf[j]) % 1000003
+        j = j + 1
+    }
+
+    let t1 = wall_ms()
+    let rss1 = rss_kb()
+    if rss1 > rss_peak {
+        rss_peak = rss1
+    }
+
+    // One-line final summary — jq-parseable.
+    println("RESULT {\"iters\":" + to_string(iters) +
+          ",\"checksum\":" + to_string(checksum) +
+          ",\"log_len_final\":" + to_string(len(log)) +
+          ",\"elapsed_ms\":" + to_string(t1 - t0) +
+          ",\"rss0_kb\":" + to_string(rss0) +
+          ",\"rss_final_kb\":" + to_string(rss1) +
+          ",\"rss_peak_kb\":" + to_string(rss_peak) +
+          ",\"rss_growth_kb\":" + to_string(rss1 - rss0) +
+          ",\"samples\":" + to_string(sample_count) +
+          ",\"ok\":true}")
+}
