@@ -3869,4 +3869,152 @@ int hxqwen14b_smoke_v54(void* args) {
 #endif
 }
 
+// ════════════════════════════════════════════════════════════════════
+// v5.5 positional-arg wrappers (2026-04-20, r11 wire) — added to fix the
+// ABI mismatch where the hexa trainer declares positional extern fns
+// while the v5.4 entries take packed-struct pointers. The wrappers below
+// pack args into the existing v5.4 structs and forward the call. They
+// are pure pass-through — same return codes, same side effects.
+//
+// Naming convention: <orig>_pos. New entries do NOT replace the struct
+// entries; both ABIs are exposed so existing C smoke drivers keep working.
+//
+// Trainer FFI surface:
+//   hxqwen14b_load_all_weights_pos(handle, ckpt_dir_p) -> int
+//   hxqwen14b_base_forward_v54_pos(handle, ids_dev, M, logits_dev) -> int
+//   hxqwen14b_ce_loss_v54_pos(logits_dev, targets_dev, M, V) -> double mean CE
+//   hxqwen14b_train_step_v54(handle, ids_host_p, M) -> double mean CE
+//      (one-shot: ids→dev, base_forward, ce_loss with shifted targets,
+//       free buffers, return mean CE; the hexa trainer just passes a flat
+//       int32 array of M token ids and gets the loss back. No device-buffer
+//       management on the hexa side. LoRA delta NOT applied — base only.
+//       LoRA delta on device requires r12 work — see r11 docs.)
+// ════════════════════════════════════════════════════════════════════
+
+int hxqwen14b_load_all_weights_pos(int64_t handle, int64_t ckpt_dir_p) {
+    HxQwenLoadAllArgs la;
+    memset(&la, 0, sizeof(la));
+    la.model_handle = handle;
+    la.ckpt_dir_p   = ckpt_dir_p;
+    return hxqwen14b_load_all_weights(&la);
+}
+
+int hxqwen14b_base_forward_v54_pos(int64_t handle, int64_t ids_dev,
+                                    int64_t M, int64_t logits_dev) {
+    HxQwenBaseFwdV54Args fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.model_handle  = handle;
+    fa.token_ids_dev = ids_dev;
+    fa.M             = M;
+    fa.logits_dev    = logits_dev;
+    return hxqwen14b_base_forward_v54(&fa);
+}
+
+double hxqwen14b_ce_loss_v54_pos(int64_t logits_dev, int64_t targets_dev,
+                                  int64_t M, int64_t V) {
+    HxQwenCeLossArgs ca;
+    memset(&ca, 0, sizeof(ca));
+    ca.logits_dev    = logits_dev;
+    ca.targets_dev   = targets_dev;
+    ca.M             = M;
+    ca.V             = V;
+    double mean_ce = -1.0;
+    ca.out_mean_ce_p = (int64_t)(uintptr_t)&mean_ce;
+    int rc = hxqwen14b_ce_loss_v54(&ca);
+    if (rc != RC_OK) return -((double)(-rc));   // negative rc encoded as negative loss
+    return mean_ce;
+}
+
+// One-shot training-step entry: hexa trainer passes a flat int32 array of
+// M token ids (host memory). We do the dev-side malloc+copy+forward+ce+free
+// internally and return the mean CE. Targets are the next-token shift
+// (ids[1..M-1]) so M must be >=2.
+//
+// Returns: mean CE (double, positive on success, negative on failure
+// where the magnitude encodes -RC code so the trainer can branch).
+double hxqwen14b_train_step_v54(int64_t handle, int64_t ids_host_p, int64_t M) {
+#ifndef HXQWEN14B_CUDA
+    (void)handle; (void)ids_host_p; (void)M;
+    return -((double)(-RC_ERR_CUDA_TODO));
+#else
+    if (M < 2) return -((double)(-RC_ERR_BAD_ARGS));
+    if (ids_host_p == 0) return -((double)(-RC_ERR_NULL_ARGS));
+    if (handle <= 0 || handle >= HXQWEN14B_MAX_HANDLES)
+        return -((double)(-RC_ERR_BAD_HANDLE));
+
+    const int32_t* ids_host = (const int32_t*)(uintptr_t)ids_host_p;
+    int64_t V = QWEN14B_VOCAB;
+
+    int64_t ids_bytes = M * (int64_t)sizeof(int32_t);
+    int64_t ids_dev = hxqwen14b_cu_malloc_bytes(ids_bytes);
+    if (ids_dev == 0) return -((double)(-RC_ERR_OOM));
+
+    int rc = hxqwen14b_cu_memcpy_h2d(ids_dev, (void*)(uintptr_t)ids_host_p, ids_bytes);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-rc));
+    }
+
+    int64_t logits_bytes = M * V * (int64_t)sizeof(float);
+    int64_t logits_dev = hxqwen14b_cu_malloc_bytes(logits_bytes);
+    if (logits_dev == 0) {
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-RC_ERR_OOM));
+    }
+
+    HxQwenBaseFwdV54Args fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.model_handle = handle; fa.token_ids_dev = ids_dev;
+    fa.M = M; fa.logits_dev = logits_dev;
+    rc = hxqwen14b_base_forward_v54(&fa);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-rc));
+    }
+    hxqwen14b_cu_device_sync();
+
+    int64_t tgt_bytes = (M - 1) * (int64_t)sizeof(int32_t);
+    int64_t tgt_dev = hxqwen14b_cu_malloc_bytes(tgt_bytes);
+    if (tgt_dev == 0) {
+        hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-RC_ERR_OOM));
+    }
+    int32_t* tgt_host = (int32_t*)malloc((size_t)tgt_bytes);
+    if (!tgt_host) {
+        hxqwen14b_cu_free_ptr(tgt_dev);
+        hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-RC_ERR_OOM));
+    }
+    for (int64_t i = 0; i < M - 1; i++) tgt_host[i] = ids_host[i + 1];
+    rc = hxqwen14b_cu_memcpy_h2d(tgt_dev, tgt_host, tgt_bytes);
+    free(tgt_host);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(tgt_dev);
+        hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);
+        return -((double)(-rc));
+    }
+
+    HxQwenCeLossArgs ca;
+    memset(&ca, 0, sizeof(ca));
+    ca.logits_dev  = logits_dev;
+    ca.targets_dev = tgt_dev;
+    ca.M = M - 1;
+    ca.V = V;
+    double mean_ce = -1.0;
+    ca.out_mean_ce_p = (int64_t)(uintptr_t)&mean_ce;
+    rc = hxqwen14b_ce_loss_v54(&ca);
+
+    hxqwen14b_cu_free_ptr(tgt_dev);
+    hxqwen14b_cu_free_ptr(logits_dev);
+    hxqwen14b_cu_free_ptr(ids_dev);
+
+    if (rc != RC_OK) return -((double)(-rc));
+    return mean_ce;
+#endif
+}
+
 // End of v5.4 addendum.
