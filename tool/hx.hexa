@@ -1,0 +1,419 @@
+#!hexa strict
+// tool/hx.hexa — SSOT unified entry point (raw#0 top-level wrapper)
+//
+// PURPOSE
+//   Single developer-facing CLI that replaces bare `git` for the raw#0
+//   SSOT workflow. Dispatches to raw_all, hx_unlock, hx_lock, git, and
+//   raw_audit in the right order so every state transition is audited
+//   and every commit/push carries a raw-all attestation trailer.
+//
+//   The philosophy: `git commit` and `git push` are dangerous because
+//   they have no idea whether .raw / .own / .ext / .roadmap / .loop
+//   are still consistent. `./hx commit` and `./hx push` refuse unless
+//   raw_all exits 0, stamp the pre-push SSOT fingerprint into the
+//   commit message, and append an audit line.
+//
+// USAGE
+//   ./hx commit  -m "msg"          run raw_all → git commit → audit
+//   ./hx push    [branch]          run raw_all → git push → audit
+//   ./hx edit    <file>            hx_unlock → $EDITOR <file> → hx_lock
+//   ./hx unlock  --reason "..."    delegate to tool/hx_unlock.hexa
+//   ./hx lock                      delegate to tool/hx_lock.hexa
+//   ./hx status                    chflags status + last audit + raw_all summary
+//   ./hx verify                    raw_all --fast
+//   ./hx help                      print usage
+//
+// FLOW (commit)
+//   1. raw_all (full) → refuse on FAIL
+//   2. sha_before = ssot_fingerprint()
+//   3. augment -m message with attestation trailer:
+//        "\n\nraw-all: <sha>@<iso-utc>"
+//   4. git commit -m "<augmented>"
+//   5. sha_after = ssot_fingerprint()   (may equal sha_before)
+//   6. audit_append("commit", user, msg, "ok"|"fail", sha_before, sha_after)
+//
+// FLOW (push)
+//   1. raw_all (full) → refuse on FAIL
+//   2. collect to-be-pushed commits via `git log @{u}..HEAD --format=%H`
+//   3. each commit: verify body contains "raw-all: " trailer; warn if absent
+//   4. git push origin <branch>
+//   5. audit_append("push", user, "<N commits to <branch>>", result, -, -)
+//
+// FLOW (edit)
+//   1. tool/hx_unlock.hexa --reason "edit <file>"
+//   2. exec $EDITOR <file>   (fallback: vi)
+//   3. tool/hx_lock.hexa
+//
+// EXIT CODES
+//   0   — success
+//   1   — subcommand failed (raw_all, git, editor non-zero)
+//   2   — invocation error (bad args, missing flags)
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+// ─── env helpers ─────────────────────────────────────────────────
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _stage0() -> string { return "./build/hexa_stage0" }
+
+fn _stage0_ok() -> bool {
+    let r = to_string(exec("test -x " + _stage0() + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+// ─── raw_all gate ────────────────────────────────────────────────
+
+fn _run_raw_all(fast: bool) -> int {
+    // Echoes full raw_all output so developer sees what failed. Returns
+    // raw_all's exit code verbatim (0 = PASS, 1 = FAIL, 2 = bad args).
+    if !_stage0_ok() {
+        eprintln("hx: " + _stage0() + " not executable — cannot run raw_all gate")
+        return 1
+    }
+    let suffix = fast ? " --fast" : ""
+    let r = exec_with_status(_stage0() + " tool/raw_all.hexa" + suffix + " 2>&1")
+    print(to_string(r[0]))
+    return r[1]
+}
+
+// ─── git helpers ─────────────────────────────────────────────────
+
+fn _git_current_branch() -> string {
+    return to_string(exec("git rev-parse --abbrev-ref HEAD 2>/dev/null")).trim()
+}
+
+fn _git_has_upstream() -> bool {
+    let r = to_string(exec("git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null")).trim()
+    return r != ""
+}
+
+// ─── subcommand: commit ──────────────────────────────────────────
+
+fn _cmd_commit(args: array) -> int {
+    // expect -m "<msg>" (only form supported; other git commit flags
+    // are intentionally not forwarded to keep the audit surface small)
+    let mut msg = ""
+    let mut i = 0
+    while i < len(args) {
+        let a = args[i]
+        if a == "-m" || a == "--message" {
+            if i + 1 < len(args) { msg = args[i + 1]; i = i + 1 }
+        }
+        i = i + 1
+    }
+    if msg == "" {
+        eprintln("hx commit: -m \"<message>\" is required")
+        return 2
+    }
+
+    // 1. gate
+    println("── hx commit: gate raw_all ──")
+    let rc = _run_raw_all(false)
+    if rc != 0 {
+        eprintln("")
+        eprintln("hx commit: refused — raw_all exit=" + to_string(rc))
+        let actor = _current_user()
+        let sha = ssot_fingerprint()
+        audit_append("commit", actor, msg, "blocked (raw_all " + to_string(rc) + ")", sha, "-")
+        return 1
+    }
+
+    // 2. fingerprint + attestation trailer
+    let sha_before = ssot_fingerprint()
+    let ts = _iso_utc_now()
+    let trailer = "\n\nraw-all: " + sha_before + "@" + ts
+    let full_msg = msg + trailer
+
+    // 3. git commit
+    println("")
+    println("── hx commit: git commit ──")
+    let r = exec_with_status("git commit -m " + _shell_quote(full_msg) + " 2>&1")
+    print(to_string(r[0]))
+    let grc = r[1]
+
+    // 4. audit
+    let sha_after = ssot_fingerprint()
+    let actor = _current_user()
+    if grc != 0 {
+        audit_append("commit", actor, msg, "fail (git " + to_string(grc) + ")", sha_before, sha_after)
+        eprintln("")
+        eprintln("hx commit: git commit exit=" + to_string(grc))
+        return 1
+    }
+    audit_append("commit", actor, msg, "ok", sha_before, sha_after)
+
+    println("")
+    println("── OK ──")
+    println("raw-all: " + sha_before + "@" + ts)
+    return 0
+}
+
+// ─── subcommand: push ────────────────────────────────────────────
+
+fn _cmd_push(args: array) -> int {
+    let mut branch = ""
+    if len(args) > 0 { branch = args[0] }
+    if branch == "" { branch = _git_current_branch() }
+    if branch == "" {
+        eprintln("hx push: could not determine current branch")
+        return 2
+    }
+
+    // 1. gate
+    println("── hx push: gate raw_all ──")
+    let rc = _run_raw_all(false)
+    if rc != 0 {
+        eprintln("")
+        eprintln("hx push: refused — raw_all exit=" + to_string(rc))
+        let actor = _current_user()
+        audit_append("push", actor, "branch=" + branch, "blocked (raw_all " + to_string(rc) + ")", "-", "-")
+        return 1
+    }
+
+    // 2. collect to-be-pushed commits
+    let mut commit_count = 0
+    let mut missing_trailer = 0
+    if _git_has_upstream() {
+        let shas = to_string(exec("git log @{u}..HEAD --format=%H 2>/dev/null"))
+        let lines = split(shas, "\n")
+        for ln in lines {
+            let h = ln.trim()
+            if h == "" { continue }
+            commit_count = commit_count + 1
+            // 3. check each for raw-all trailer
+            let body = to_string(exec("git log -1 --format=%B " + h + " 2>/dev/null"))
+            if body.index_of("raw-all: ") < 0 {
+                eprintln("hx push: WARN — commit " + h.substring(0, 12) + " missing raw-all trailer")
+                missing_trailer = missing_trailer + 1
+            }
+        }
+    } else {
+        eprintln("hx push: WARN — branch '" + branch + "' has no upstream; cannot diff against remote")
+    }
+
+    // 4. git push
+    println("")
+    println("── hx push: git push origin " + branch + " ──")
+    let r = exec_with_status("git push origin " + _shell_quote(branch) + " 2>&1")
+    print(to_string(r[0]))
+    let grc = r[1]
+
+    // 5. audit
+    let actor = _current_user()
+    let reason = "branch=" + branch + " commits=" + to_string(commit_count)
+                 + (missing_trailer > 0 ? " missing_trailer=" + to_string(missing_trailer) : "")
+    if grc != 0 {
+        audit_append("push", actor, reason, "fail (git " + to_string(grc) + ")", "-", "-")
+        eprintln("")
+        eprintln("hx push: git push exit=" + to_string(grc))
+        return 1
+    }
+    audit_append("push", actor, reason, "ok", "-", "-")
+
+    println("")
+    println("── OK ──")
+    println("pushed " + to_string(commit_count) + " commit(s) to origin/" + branch)
+    if missing_trailer > 0 {
+        println("(warn: " + to_string(missing_trailer) + " commit(s) had no raw-all trailer)")
+    }
+    return 0
+}
+
+// ─── subcommand: edit ────────────────────────────────────────────
+
+fn _cmd_edit(args: array) -> int {
+    if len(args) < 1 {
+        eprintln("hx edit: <file> argument required")
+        return 2
+    }
+    let file = args[0]
+
+    if !_stage0_ok() {
+        eprintln("hx edit: " + _stage0() + " not executable — cannot run unlock gate")
+        return 1
+    }
+
+    // 1. unlock
+    println("── hx edit: unlock ──")
+    let u = exec_with_status(_stage0() + " tool/hx_unlock.hexa --reason " + _shell_quote("edit " + file) + " 2>&1")
+    print(to_string(u[0]))
+    if u[1] != 0 {
+        eprintln("hx edit: unlock failed exit=" + to_string(u[1]))
+        return 1
+    }
+
+    // 2. editor
+    let mut editor = env("EDITOR")
+    if editor == "" { editor = "vi" }
+    println("")
+    println("── hx edit: " + editor + " " + file + " ──")
+    let er = exec_with_status(editor + " " + _shell_quote(file))
+    let erc = er[1]
+    if erc != 0 {
+        eprintln("hx edit: editor exit=" + to_string(erc) + " (will still attempt lock)")
+    }
+
+    // 3. lock (always try — we don't want to leave the tree unlocked)
+    println("")
+    println("── hx edit: lock ──")
+    let l = exec_with_status(_stage0() + " tool/hx_lock.hexa 2>&1")
+    print(to_string(l[0]))
+    if l[1] != 0 {
+        eprintln("hx edit: lock failed exit=" + to_string(l[1]))
+        return 1
+    }
+
+    if erc != 0 { return 1 }
+    return 0
+}
+
+// ─── subcommand: unlock / lock (thin delegate) ───────────────────
+
+fn _cmd_unlock(args: array) -> int {
+    if !_stage0_ok() {
+        eprintln("hx unlock: " + _stage0() + " not executable")
+        return 1
+    }
+    let mut cmd = _stage0() + " tool/hx_unlock.hexa"
+    for a in args { cmd = cmd + " " + _shell_quote(a) }
+    cmd = cmd + " 2>&1"
+    let r = exec_with_status(cmd)
+    print(to_string(r[0]))
+    return r[1]
+}
+
+fn _cmd_lock(args: array) -> int {
+    if !_stage0_ok() {
+        eprintln("hx lock: " + _stage0() + " not executable")
+        return 1
+    }
+    let mut cmd = _stage0() + " tool/hx_lock.hexa"
+    for a in args { cmd = cmd + " " + _shell_quote(a) }
+    cmd = cmd + " 2>&1"
+    let r = exec_with_status(cmd)
+    print(to_string(r[0]))
+    return r[1]
+}
+
+// ─── subcommand: status ──────────────────────────────────────────
+
+fn _cmd_status() -> int {
+    println("── hx status ──")
+    println("user:   " + _current_user())
+    println("pwd:    " + to_string(exec("pwd")).trim())
+    println("branch: " + _git_current_branch())
+    println("")
+
+    // 1. chflags status (Darwin only)
+    println("── chflags status ──")
+    if _is_darwin() && _stage0_ok() {
+        let r = exec_with_status(_stage0() + " tool/os_level_lock.hexa status 2>&1")
+        print(to_string(r[0]))
+    } else if !_is_darwin() {
+        println("(non-Darwin — chflags unavailable)")
+    } else {
+        println("(" + _stage0() + " not executable — skipping chflags probe)")
+    }
+    println("")
+
+    // 2. last audit entry
+    println("── last audit entry ──")
+    let audit_exists = to_string(exec("test -f .raw-audit && echo y || echo n")).trim()
+    if audit_exists == "y" {
+        let tail = to_string(exec("tail -n 3 .raw-audit"))
+        print(tail)
+    } else {
+        println("(no .raw-audit yet)")
+    }
+    println("")
+
+    // 3. raw_all summary (fast)
+    println("── raw_all --fast ──")
+    let rc = _run_raw_all(true)
+    return rc
+}
+
+// ─── subcommand: verify ──────────────────────────────────────────
+
+fn _cmd_verify() -> int {
+    return _run_raw_all(true)
+}
+
+// ─── usage ───────────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: ./hx <subcommand> [args...]")
+    eprintln("")
+    eprintln("  commit  -m \"<msg>\"          run raw_all → git commit → audit")
+    eprintln("  push    [branch]              run raw_all → git push → audit")
+    eprintln("  edit    <file>                hx_unlock → $EDITOR <file> → hx_lock")
+    eprintln("  unlock  --reason \"...\"       delegate to tool/hx_unlock.hexa")
+    eprintln("  lock                          delegate to tool/hx_lock.hexa")
+    eprintln("  status                        chflags + last audit + raw_all --fast")
+    eprintln("  verify                        raw_all --fast")
+    eprintln("  help                          this text")
+    eprintln("")
+    eprintln("  commit/push refuse unless raw_all exit 0. Every commit carries a")
+    eprintln("  `raw-all: <sha>@<timestamp>` attestation trailer. Every state")
+    eprintln("  transition is appended to .raw-audit.")
+}
+
+// ─── main dispatcher ─────────────────────────────────────────────
+
+fn _subargs() -> array {
+    let av = argv()
+    let mut rest = []
+    let mut i = 3   // argv[0]=hexa, argv[1]=tool/hx.hexa, argv[2]=subcmd
+    while i < len(av) {
+        rest = rest.push(av[i])
+        i = i + 1
+    }
+    return rest
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let sub = av[2]
+    let args = _subargs()
+
+    if sub == "commit"      { return _cmd_commit(args) }
+    if sub == "push"        { return _cmd_push(args) }
+    if sub == "edit"        { return _cmd_edit(args) }
+    if sub == "unlock"      { return _cmd_unlock(args) }
+    if sub == "lock"        { return _cmd_lock(args) }
+    if sub == "status"      { return _cmd_status() }
+    if sub == "verify"      { return _cmd_verify() }
+    if sub == "help"        { _usage(); return 0 }
+    if sub == "-h"          { _usage(); return 0 }
+    if sub == "--help"      { _usage(); return 0 }
+
+    eprintln("hx: unknown subcommand '" + sub + "'")
+    eprintln("")
+    _usage()
+    return 2
+}
+
+exit(main())
