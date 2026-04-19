@@ -38,6 +38,98 @@
 
 ---
 
+## 1.5. Phase A–D 요약 (ROI #169 태스크 포맷)
+
+내부 Wave 0-7 구조를 태스크 요구 Phase A/B/C/D 로 재매핑:
+
+### Phase A — 인벤토리 (완료, 이 문서 섹션 1 + 섹션 4)
+
+`self/runtime.c` = **6,331 LOC / 313 hexa_* + 11 underscore 심볼 = 324 export**. 카테고리:
+
+| 카테고리 | 심볼수 | 의미 |
+|---|---:|---|
+| math (G-math) | 18 | libm 래퍼 (sin/cos/sqrt/…) |
+| fmt (C-fmt) | 9 | to_string/format/println/print_val/… |
+| proc (D-proc-env) | 16 | exec/exit/args/clock/random/sleep/timestamp/env_var/… |
+| syscall / fs (C-io-fs) | 15 | read_file/write_file/write_bytes/file_size/stdin/… |
+| io (C-fmt + fs subset) | 9+15 | 24 총 I/O exit points |
+| net (D-net) | 7 | socket/bind/listen/accept/http_get |
+| except (H-except) | 2 | throw/is_error |
+| value-ops (A-value-ops) | 56 | add/sub/mul/div/eq/cmp/truthy/int/float/… |
+| array (A-pure-array) | 49 | push/new/get/map/filter/sort/… |
+| string (A-pure-string) | 37 | str/split/trim/replace/lines/… |
+| map (A-pure-map) | 19 | map_get/set/keys/values/… |
+| tensor (A-tensor) | 16 | matmul/rms_norm/softmax/swiglu/… |
+| encoding + json (A-encoding + A-json) | 8 | bin/hex/base64/json_{encode,decode} |
+| util + valstruct + struct pack (A-util + A-valstruct) | 7 | fnv1a/sort_cmp/valstruct_* |
+| alloc (B-alloc) | 16 | arena/intern/heapify/snapshot |
+| ptr (B-ptr) | 8 | ptr_alloc/read/write/offset/null |
+| closure (B-closure) | 9 | call0..4/fn_new/closure_new/iter_get |
+| ffi (F-ffi) | 19 | host_ffi_*/extern_call/dlopen/dlsym/trampoline |
+| ic-dev (Z-ic) | 2 | ic_dump_stats/ic_stats_on (dev-only) |
+| **TOTAL** | **313** | |
+
+### Phase B — 심볼 → 대체 경로 매핑 (섹션 4 전체 테이블)
+
+| 대체 전략 | 심볼수 | 타겟 모듈 | 상태 |
+|---|---:|---|---|
+| pure-fn (이미 `self/rt/` 존재) | ~160 | `rt/{core,array_ops,string,map_ops,tensor,math,fmt}.hexa` | 포팅 부분 완료 |
+| pure-fn (신규 포팅 필요) | ~40 | `rt/{json,encoding,valstruct,struct_pack}.hexa` (신규) | 미착수 |
+| intrinsic + codegen 직접 emit | ~35 | `self/codegen/` (P7-7 native) | 설계 완료 |
+| `@syscall(…)` 기반 | ~40 | `rt/{io,fs,proc,net,except}.hexa` | 설계 완료, intrinsic 구현 필요 |
+| drop (dead leaf) | ~15 | — | Wave 0 즉시 |
+| **합계** | **~290 + 23 (rounded)** = 313 | | |
+
+각 심볼의 ext/int refcount + 카테고리 + 전략 → 섹션 4 의 테이블 (313 rows).
+
+### Phase C — `self/native/*.c` 처분 (P7-7 fixpoint 시점)
+
+| 파일 | LOC | 운명 | 대체 |
+|---|---:|---|---|
+| `hexa_cc.c` | 13,308 | **완전 삭제** | `self/hexa_full.hexa` (self-hosted parser/lexer/typer) + native codegen (P7-7) 완료 시 |
+| `codegen_c2_v2.c` | 1,996 | **완전 삭제** | `self/codegen/` ARM64/x86_64 네이티브 백엔드 (ROI #162 P7-6a) |
+| `parser_v2.c` | 3,169 | **완전 삭제** | `self/parser.hexa` |
+| `lexer_v2.c` | 758 | **완전 삭제** | `self/lexer.hexa` |
+| `type_checker_v2.c` | 1,697 | **완전 삭제** | `self/type_checker.hexa` (포팅 필요) |
+| `net.c` | 175 | **완전 삭제** | `self/rt/net.hexa` (Wave 4, `@syscall`) |
+| `hxblas_linux.c` | 672 | **@hot_kernel drop** | pure-hexa NEON/SVE kernel (ROI #139) |
+| `hxccl_linux.c` | 403 | **@hot_kernel drop** | pure-hexa MPI/gloo 대체 |
+| `hxflash_linux.c` | 579 | **@hot_kernel drop** | pure-hexa flash-attn |
+| `hxlayer_linux.c` | 93 | **@hot_kernel drop** | pure-hexa layer fusion |
+| `hxlmhead_linux.c` | 293 | **@hot_kernel drop** | pure-hexa LM head |
+| `hxqwen14b.c` | 342 | **@hot_kernel drop** | pure-hexa Qwen weight loader |
+| `hxvdsp_linux.c` | 226 | **@hot_kernel drop** | pure-hexa vDSP |
+| `hxvocoder.c` | 455 | **@hot_kernel drop** | `self/vocoder.hexa` (이미 1,922x native 달성) |
+| `tensor_kernels.c` | 138 | **@hot_kernel drop** | pure-hexa kernel |
+| `gpu_codegen_stub.c` | 264 | **완전 삭제** | `self/codegen/gpu.hexa` |
+| **합계** | **24,568** | | 메모리 `feedback_c_total_purge_after_fixpoint.md`: @hot_kernel 예외 없음 |
+
+### Phase D — `self/bootstrap_compiler.c` 처분 (hexa_v2 circular fix 시점)
+
+| 파일 | LOC | 운명 | Gate |
+|---|---:|---|---|
+| `self/bootstrap_compiler.c` | 1,493 | **완전 삭제** | hexa_v2 on-disk 가 스스로를 재빌드 가능 → bootstrap `.c` seed 불필요 |
+
+---
+
+## 1.6. Gate conditions (phase prerequisites)
+
+| Phase | Gate (ROI) | 의미 |
+|---|---|---|
+| **Phase A** (inventory) | — | 이 문서. **완료** (2026-04-19). |
+| **Phase B** (port + drop) | **#152 IC-slot fix** completed | hexa_v2 circular rebuild 가 정상화되어야 rt/ 모듈 증분 테스트 가능 (현재 seed freeze — `project_hexa_v2_circular_rebuild_20260417.md`) |
+| **Phase B.Wave 2+** | **@syscall intrinsic** (P7-7a) | `self/codegen/` 에 `@syscall(name, arg0..5) → int64` lowering 필수 |
+| **Phase C** (native/*.c drop) | **#153 P7-7 v3==v4 fixpoint** closure | hexa_full.hexa → native 컴파일러가 자기 자신을 빌드하는 fixpoint 닫힘 |
+| **Phase C.@hot_kernel** | **#162 P7-6a native gap** closed | ARM64/x86_64 pure-hexa kernel 이 hxblas/hxflash/… 성능 회복 |
+| **Phase D** (bootstrap_compiler.c) | **#152 fix** + **#153 fixpoint** 모두 | hexa_v2 가 circular rebuild 로 자기 seed 생성 가능 |
+
+**Cross-ref**:
+- ROI **#152** (hexa_v2 IC-slot circular rebuild fix): seed freeze 해제. Phase B/D 의 전제.
+- ROI **#153** (P7-7 v3==v4 fixpoint closure): hexa-only 컴파일러 수렴. Phase C/D 의 전제.
+- ROI **#162** (P7-6a hexa_full native gap analysis): `.c` → native 경로 확보. Phase C 의 @hot_kernel 교체 전제.
+
+---
+
 ## 2. Purge DAG (ASCII)
 
 ```
