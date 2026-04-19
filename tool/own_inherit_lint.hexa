@@ -1,0 +1,253 @@
+#!hexa strict
+// tool/own_inherit_lint.hexa — raw#0 .own monotonic inheritance check (P0c)
+//
+// PURPOSE
+//   Enforce that .own (L1) rules never weaken or broaden the .raw (L0)
+//   rules they shadow. .own may only strengthen: tighter status, same or
+//   superset `bans`, same or narrower `scope`. Independent .own rules
+//   (no id overlap with .raw) are untouched.
+//
+// CHECKS
+//   For every rule in .own:
+//     (a) id overlap with .raw
+//         · status           — .own tier ≥ .raw tier (strength ladder)
+//           live > warn > new > convention > deferred
+//         · bans             — .own bans ⊇ .raw bans (no narrowing)
+//         · scope            — .own scope must be substring of .raw scope
+//                              (heuristic: narrowing only, no widening)
+//     (b) no overlap           — pass (independent L1 rule)
+//     (c) .own id duplicate    — FAIL (parser catches too, belt+braces)
+//
+// USAGE
+//   hexa tool/own_inherit_lint.hexa          — validate + exit 1 on FAIL
+//   hexa tool/own_inherit_lint.hexa --list   — dump .own entries
+//
+// EXIT CODES
+//   0 — PASS (no violations)
+//   1 — FAIL (one or more inheritance violations)
+//
+// FOLLOW-UP
+//   Wire this lint into raw#0 `enforce` chain once .raw is unlocked
+//   (currently chflags uchg). Until then, invoke manually or via raw_all
+//   once raw#0 dispatch learns the composite form.
+
+use "self/core/law_io"
+use "self/raw_loader"
+
+// ─── status strength ladder ──────────────────────────────────────
+// higher number = stronger enforcement. .own must be ≥ .raw.
+fn _status_rank(s: string) -> int {
+    if s == "live" { return 4 }
+    if s == "warn" { return 3 }
+    if s == "new" { return 2 }
+    if s == "convention" { return 1 }
+    if s == "deferred" { return 0 }
+    return -1
+}
+
+// ─── path helpers ────────────────────────────────────────────────
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _raw_path() -> string { return _pwd() + "/.raw" }
+fn _own_path() -> string { return _pwd() + "/.own" }
+
+// ─── rule lookup ─────────────────────────────────────────────────
+
+fn _find_rule_by_id(rules: array, id: string) -> array {
+    for r in rules {
+        if r[0] == id { return r }
+    }
+    return []
+}
+
+// ─── bans: whitespace-split tokens ───────────────────────────────
+// .raw/.own stores `bans` as a single space-joined string per key line.
+
+fn _split_tokens(s: string) -> array {
+    let mut out = []
+    let n = len(s)
+    let mut i = 0
+    let mut cur = ""
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == " " || c == "\t" {
+            if len(cur) > 0 { out = out.push(cur); cur = "" }
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if len(cur) > 0 { out = out.push(cur) }
+    return out
+}
+
+fn _contains_token(arr: array, tok: string) -> bool {
+    for a in arr {
+        if a == tok { return true }
+    }
+    return false
+}
+
+// collect ALL bans entries (key may repeat across lines in raw_loader)
+fn _collect_bans(keys: array) -> array {
+    let mut out = []
+    let all = keys_all(keys, "bans")
+    for line in all {
+        let toks = _split_tokens(line)
+        for t in toks {
+            if !_contains_token(out, t) { out = out.push(t) }
+        }
+    }
+    return out
+}
+
+// missing = tokens in `a` not in `b`
+fn _missing_tokens(a: array, b: array) -> array {
+    let mut out = []
+    for t in a {
+        if !_contains_token(b, t) { out = out.push(t) }
+    }
+    return out
+}
+
+fn _join_tokens(arr: array) -> string {
+    let mut out = ""
+    let mut first = true
+    for t in arr {
+        if first { out = t; first = false } else { out = out + " " + t }
+    }
+    return out
+}
+
+// ─── argv parsing ────────────────────────────────────────────────
+
+fn _parse_flags() -> array {
+    // returns [list_mode(bool)]
+    let av = args()
+    let mut list_mode = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--list" { list_mode = true }
+        i = i + 1
+    }
+    return [list_mode]
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let flags = _parse_flags()
+    let list_mode = flags[0]
+
+    let own_path = _own_path()
+    let raw_path = _raw_path()
+
+    let own_exists = to_string(exec("test -f '" + own_path + "' && echo y || echo n")).trim()
+    if own_exists != "y" {
+        println("── raw#0 own_inherit_lint ──")
+        println(".own missing — nothing to check")
+        println("status: PASS")
+        return 0
+    }
+
+    let own_rules = load_raw_file(own_path)
+    let raw_rules = load_raw_file(raw_path)
+
+    if list_mode {
+        println("── .own entries (" + to_string(len(own_rules)) + ") ──")
+        for r in own_rules {
+            println("  #" + r[0] + " [" + r[1] + "] — " + r[2])
+        }
+        return 0
+    }
+
+    let mut errs = []
+    let mut seen_ids = []
+    let mut overlap_ct = 0
+
+    for orule in own_rules {
+        let oid = orule[0]
+        let ostatus = orule[1]
+        let okeys = orule[3]
+        let tag = "[own#" + oid + "] "
+
+        // (c) duplicate id inside .own
+        if _contains_token(seen_ids, oid) {
+            errs = errs.push(tag + "duplicate .own id '" + oid + "'")
+        } else {
+            seen_ids = seen_ids.push(oid)
+        }
+
+        // lookup sibling in .raw
+        let rrule = _find_rule_by_id(raw_rules, oid)
+        if len(rrule) == 0 {
+            // (b) independent rule — pass
+            continue
+        }
+        overlap_ct = overlap_ct + 1
+
+        let rstatus = rrule[1]
+        let rkeys = rrule[3]
+
+        // (a1) status weakening check
+        let orank = _status_rank(ostatus)
+        let rrank = _status_rank(rstatus)
+        if orank < 0 || rrank < 0 {
+            errs = errs.push(tag + "unknown status in ladder (.raw=" + rstatus + ", .own=" + ostatus + ")")
+        } else if orank < rrank {
+            errs = errs.push(tag + "status weakening: .raw=" + rstatus + ", .own=" + ostatus)
+        }
+
+        // (a2) bans narrowing check — .own must be superset of .raw
+        let rbans = _collect_bans(rkeys)
+        let obans = _collect_bans(okeys)
+        if len(rbans) > 0 {
+            let missing = _missing_tokens(rbans, obans)
+            if len(missing) > 0 {
+                errs = errs.push(tag + "bans narrowing: .raw has '" + _join_tokens(rbans) +
+                                 "', .own missing '" + _join_tokens(missing) + "'")
+            }
+        }
+
+        // (a3) scope widening check — .own scope must be substring of .raw scope
+        let rscope = keys_first(rkeys, "scope")
+        let oscope = keys_first(okeys, "scope")
+        if rscope != "" && oscope != "" {
+            if !rscope.contains(oscope) {
+                errs = errs.push(tag + "scope widening: .raw scope='" + rscope +
+                                 "', .own scope='" + oscope + "'")
+            }
+        }
+    }
+
+    // ─── output ──────────────────────────────────────────────────
+    println("── raw#0 own_inherit_lint ──")
+    println("entries (.own): " + to_string(len(own_rules)))
+    if overlap_ct == 0 {
+        println("checked against .raw: 0  (no id overlap)")
+    } else {
+        println("checked against .raw: " + to_string(overlap_ct))
+    }
+
+    if len(errs) == 0 {
+        println("violations: 0")
+        println("")
+        println("status: PASS")
+        return 0
+    }
+
+    println("")
+    for e in errs { println(e) }
+    println("")
+    println("violations: " + to_string(len(errs)))
+    println("status: FAIL")
+    return 1
+}
+
+exit(main())
