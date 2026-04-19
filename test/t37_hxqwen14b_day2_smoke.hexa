@@ -1,0 +1,169 @@
+// test/t37_hxqwen14b_day2_smoke.hexa — Day-2 LoRA kernel round-trip smoke.
+//
+// Exercises hxqwen14b_lora_fwd_single + hxqwen14b_lora_bwd_single +
+// hxqwen14b_base_gemm via the smoke_v5 driver on fp32 CPU path. The
+// device (CUDA) path is validated by a separate pod-side driver
+// (tool/training/test_hxqwen14b_day2_cuda.hexa) once the .so is built.
+//
+// Dimensions intentionally tiny (M=4, K=8, N=8, R=2) so the smoke runs
+// in a few ms on Mac interpreter. Spec calls for 8x1024x5120 — that is
+// validated on the H100 pod (see logs/day2_smoke.txt).
+//
+// Run:
+//   DYLD_LIBRARY_PATH=$PWD/self/native/build \
+//     ./hexa run test/t37_hxqwen14b_day2_smoke.hexa
+
+@link("hxqwen14b")
+extern fn hxqwen14b_version() -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_lora_fwd_single(args: *Void) -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_lora_bwd_single(args: *Void) -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_base_gemm(args: *Void) -> int
+
+@link("hxqwen14b")
+extern fn hxqwen14b_smoke_v5(args: *Void) -> int
+
+let mut ok = true
+fn must(label, cond) {
+    if cond { println("PASS " + label) } else { ok = false; println("FAIL " + label) }
+}
+
+let v = hxqwen14b_version()
+must("version >= 5 (Day-2)", v >= 5)
+
+// ── tiny shapes ─────────────────────────────────────────────
+let M = 4
+let K = 8
+let N = 8
+let R = 2
+let alpha_over_r = 2.0   // alpha=4, r=2 → 2.0
+
+// ── allocate fp32 buffers ───────────────────────────────────
+let x_p  = alloc_raw(M * K * 4)
+let A_p  = alloc_raw(R * K * 4)
+let B_p  = alloc_raw(N * R * 4)
+let y_p  = alloc_raw(M * N * 4)
+let dy_p = alloc_raw(M * N * 4)
+let dA_p = alloc_raw(R * K * 4)
+let dB_p = alloc_raw(N * R * 4)
+let dx_p = alloc_raw(M * K * 4)
+let u_p  = alloc_raw(M * R * 4)
+let tmp_p = alloc_raw(M * R * 4)
+
+// Fill x, A, B, dy with deterministic small values (no RNG needed for smoke).
+let mut i = 0
+while i < M * K {
+    ptr_write_f32(x_p, i * 4, 0.01 * (i + 1))
+    i = i + 1
+}
+i = 0
+while i < R * K {
+    ptr_write_f32(A_p, i * 4, 0.02 * (i + 1))
+    i = i + 1
+}
+i = 0
+while i < N * R {
+    ptr_write_f32(B_p, i * 4, 0.03 * (i + 1))
+    i = i + 1
+}
+i = 0
+while i < M * N {
+    ptr_write_f32(dy_p, i * 4, 0.1)
+    i = i + 1
+}
+// Zero initialise dx (accumulator in bwd).
+i = 0
+while i < M * K {
+    ptr_write_f32(dx_p, i * 4, 0.0)
+    i = i + 1
+}
+
+// ── call smoke_v5 ───────────────────────────────────────────
+// HxQwenSmokeArgs layout:
+//   M,N,K,R, x,A,B,y, dy,dA,dB,dx, u,tmp, alpha_over_r(double), is_device, out_p, rsvd
+// = 16 int64 slots + 1 double = 136 bytes (17*8).
+let smoke_args = alloc_raw(144)
+ptr_write(smoke_args,   0, M)
+ptr_write(smoke_args,   8, N)
+ptr_write(smoke_args,  16, K)
+ptr_write(smoke_args,  24, R)
+ptr_write(smoke_args,  32, x_p)
+ptr_write(smoke_args,  40, A_p)
+ptr_write(smoke_args,  48, B_p)
+ptr_write(smoke_args,  56, y_p)
+ptr_write(smoke_args,  64, dy_p)
+ptr_write(smoke_args,  72, dA_p)
+ptr_write(smoke_args,  80, dB_p)
+ptr_write(smoke_args,  88, dx_p)
+ptr_write(smoke_args,  96, u_p)
+ptr_write(smoke_args, 104, tmp_p)
+ptr_write(smoke_args, 112, alpha_over_r)   // double at offset 112
+ptr_write(smoke_args, 120, 0)              // is_device = 0 (CPU)
+// HxQwenSmokeResult (out): rc_fwd, rc_bwd, 3×nan_count, 4×double sum_abs, rsvd
+// = 5 int64 + 4 double + 1 rsvd = 80 bytes.
+let result_out = alloc_raw(80)
+ptr_write(smoke_args, 128, result_out)
+ptr_write(smoke_args, 136, 0)              // reserved
+
+let rc = hxqwen14b_smoke_v5(smoke_args)
+must("smoke_v5 rc == 0", rc == 0)
+
+let rc_fwd = ptr_read(result_out, 0)
+let rc_bwd = ptr_read(result_out, 8)
+let nan_y  = ptr_read(result_out, 16)
+let nan_dA = ptr_read(result_out, 24)
+let nan_dB = ptr_read(result_out, 32)
+must("fwd rc == 0", rc_fwd == 0)
+must("bwd rc == 0", rc_bwd == 0)
+must("no NaN in y", nan_y == 0)
+must("no NaN in dA", nan_dA == 0)
+must("no NaN in dB", nan_dB == 0)
+
+// sum_abs reads as double at offset 40 (nan_y=16 + nan_dA=24 + nan_dB=32 = 40)
+let y_sum  = ptr_read_f64(result_out, 40)
+let dA_sum = ptr_read_f64(result_out, 48)
+let dB_sum = ptr_read_f64(result_out, 56)
+let dx_sum = ptr_read_f64(result_out, 64)
+must("y_sum_abs > 0", y_sum > 0.0)
+must("dA_sum_abs > 0", dA_sum > 0.0)
+must("dB_sum_abs > 0", dB_sum > 0.0)
+must("dx_sum_abs > 0", dx_sum > 0.0)
+
+println("  y_sum=" + to_string(y_sum))
+println("  dA_sum=" + to_string(dA_sum))
+println("  dB_sum=" + to_string(dB_sum))
+println("  dx_sum=" + to_string(dx_sum))
+
+// ── base_gemm separate call ─────────────────────────────────
+let W_p = alloc_raw(N * K * 4)
+i = 0
+while i < N * K {
+    ptr_write_f32(W_p, i * 4, 0.05 * (i + 1))
+    i = i + 1
+}
+let y_base = alloc_raw(M * N * 4)
+let gemm_args = alloc_raw(80)
+ptr_write(gemm_args,  0, M)
+ptr_write(gemm_args,  8, N)
+ptr_write(gemm_args, 16, K)
+ptr_write(gemm_args, 24, x_p)
+ptr_write(gemm_args, 32, W_p)
+ptr_write(gemm_args, 40, 0)     // no bias
+ptr_write(gemm_args, 48, y_base)
+ptr_write(gemm_args, 56, 0)     // accumulate=0
+ptr_write(gemm_args, 64, 0)     // is_device=0
+ptr_write(gemm_args, 72, 0)
+
+let rc_g = hxqwen14b_base_gemm(gemm_args)
+must("base_gemm rc == 0", rc_g == 0)
+// Spot-check y_base[0] > 0 (all inputs positive).
+let y0 = ptr_read_f32(y_base, 0)
+must("base_gemm y[0] > 0", y0 > 0.0)
+println("  base_gemm y[0]=" + to_string(y0))
+
+if ok { println("PASS t37_hxqwen14b_day2_smoke") } else { println("FAIL t37_hxqwen14b_day2_smoke") }

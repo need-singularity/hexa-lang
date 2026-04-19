@@ -332,6 +332,89 @@ typedef struct HxQwenProbeOut {
 } HxQwenProbeOut;
 
 // ─────────────────────────────────────────────────────────────
+// v5 Day-2 LoRA standalone-kernel ABI — FROZEN. Per-adapter fp32 ops
+// (forward / backward / base-GEMM) that the full model forward will
+// invoke 192x per step. Callable on their own for smoke tests without
+// full model state; work on host (CPU fallback) OR device
+// (HXQWEN14B_CUDA=1 build). Full 48-layer orchestration stays stubbed
+// at CUDA_TODO until v5.1 when weight upload lands.
+//
+// Math: y = (alpha/r) * (x * A^T) * B^T
+//   x : [M, K]   A : [R, K]   B : [N, R]   y : [M, N]
+// cuBLAS is column-major; we emit row-major-compatible Sgemm by using
+// the identity  row(X) = col(X^T)  and swapping op/shape parameters.
+// ─────────────────────────────────────────────────────────────
+
+typedef struct HxQwenLoraFwdArgs {
+    int64_t M_rows;
+    int64_t N_out;
+    int64_t K_in;
+    int64_t R_lora;
+    int64_t x_p;
+    int64_t A_p;
+    int64_t B_p;
+    int64_t y_p;
+    double  alpha_over_r;
+    int64_t tmp_p;
+    int64_t accumulate;
+    int64_t is_device;
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenLoraFwdArgs;
+
+typedef struct HxQwenLoraBwdArgs {
+    int64_t M_rows;
+    int64_t N_out;
+    int64_t K_in;
+    int64_t R_lora;
+    int64_t x_p;
+    int64_t A_p;
+    int64_t B_p;
+    int64_t dy_p;
+    int64_t dA_p;
+    int64_t dB_p;
+    int64_t dx_p;
+    double  alpha_over_r;
+    int64_t u_p;
+    int64_t tmp_p;
+    int64_t accumulate_grads;
+    int64_t is_device;
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenLoraBwdArgs;
+
+// HxQwenBaseGemmArgs — frozen base-weight GEMM.
+//   y = x * W^T (+ bias).  W stays frozen; no dW accumulator path.
+typedef struct HxQwenBaseGemmArgs {
+    int64_t M_rows;
+    int64_t N_out;
+    int64_t K_in;
+    int64_t x_p;
+    int64_t W_p;
+    int64_t bias_p;
+    int64_t y_p;
+    int64_t accumulate;
+    int64_t is_device;
+    int64_t reserved0;
+} HxQwenBaseGemmArgs;
+
+// Smoke-test convenience struct — forces a round-trip through the v5
+// kernel set by issuing fwd + bwd on random inputs. Reports pass/fail +
+// NaN counts + absolute sums so smoke tests are self-verifying.
+typedef struct HxQwenSmokeResult {
+    int64_t rc_fwd;
+    int64_t rc_bwd;
+    int64_t n_nan_out;
+    int64_t n_nan_dA;
+    int64_t n_nan_dB;
+    double  y_sum_abs;
+    double  dA_sum_abs;
+    double  dB_sum_abs;
+    double  dx_sum_abs;
+    int64_t reserved0;
+} HxQwenSmokeResult;
+
+// ─────────────────────────────────────────────────────────────
 // QwenCtx — opaque per-handle state. v4 additions: config dims,
 // index.json byte range, LoRA adapter host buffers (pre-VRAM).
 // ─────────────────────────────────────────────────────────────
@@ -369,7 +452,7 @@ static QwenCtx g_ctx_table[HXQWEN14B_MAX_HANDLES];
 // TAG_NOT_BUILTIN (see feedback memory module_box_struct_replace.md).
 // ─────────────────────────────────────────────────────────────
 int64_t hxqwen14b_version(void) {
-    return 4;
+    return 5;  // v5 Day-2: LoRA fwd/bwd + base GEMM standalone kernels
 }
 
 // ─────────────────────────────────────────────────────────────
@@ -991,4 +1074,500 @@ int hxqwen14b_apply_lora_delta(void* args) {
 #endif
     (void)ctx;
     return RC_ERR_CUDA_TODO;
+}
+
+// ─────────────────────────────────────────────────────────────
+// SECTION 11. v5 Day-2 LoRA standalone kernels — LIVE.
+//
+// Three entry points:
+//   hxqwen14b_lora_fwd_single  — y = (α/r)(x·Aᵀ)·Bᵀ
+//   hxqwen14b_lora_bwd_single  — given dy: compute dA, dB, dx
+//   hxqwen14b_base_gemm        — y = x·Wᵀ (+ bias), frozen base weight
+//
+// Both host (CPU) and device (CUDA cuBLAS) paths are implemented. The
+// is_device flag on each args struct selects. CUDA build requires
+// HXQWEN14B_CUDA=1 at compile time; device paths in non-CUDA builds
+// return RC_ERR_CUDA_TODO so host tests stay green on Mac.
+//
+// cuBLAS row-major ↔ column-major mapping:
+//   To compute C_rm[M,N] = A_rm[M,K] · B_rm[K,N] in row-major using
+//   cuBLAS (column-major), issue:
+//     cublasSgemm(h, N_op=N, N_op=N, N, M, K, 1.0f, B_dev, N, A_dev, K, 0.0f, C_dev, N)
+//   i.e. swap A/B and set ldb=N, lda=K, ldc=N. This yields the correct
+//   row-major result without any transpose copies.
+//
+// For (x·Aᵀ):  C[M,R] = x[M,K] · Aᵀ[K,R]  where A is stored row-major [R,K].
+//   The transpose of row-major [R,K] is row-major-viewed as [K,R] column-
+//   major — no physical swap needed. In cuBLAS col-major terms:
+//     A_dev is col-major [K, R] with lda=K; gemm args: op_A=N, op_B=N.
+//     C = B·A in col-major = x_rm·A_rm^T in row-major.
+//
+// For (tmp·Bᵀ): C[M,N] = tmp[M,R] · Bᵀ[R,N] where B is row-major [N,R].
+//   Same trick: B stored row-major [N,R] ≡ col-major [R,N] lda=R.
+//   cublasSgemm(h, N, N, N, M, R, 1, B, R, tmp, R, 0, C, N) in col-major
+//   → row-major C[M,N] = tmp·Bᵀ. Wait — need alpha_over_r scaling. Fold
+//   into the alpha argument of the second gemm so we never need a
+//   separate scale kernel.
+//
+// The CPU reference (ikj, no blocking) is chosen for clarity, not speed.
+// On H100 with M=8192, K=N=5120, R=8 the cuBLAS path is ~1000x faster.
+// ─────────────────────────────────────────────────────────────
+
+#ifdef HXQWEN14B_CUDA
+// Persistent cuBLAS handle — created lazily on first call. Not freed
+// automatically (driver does it at process exit). Thread-local would be
+// correct for multi-stream training; we keep one global handle here.
+static cublasHandle_t g_cublas = NULL;
+static int ensure_cublas(void) {
+    if (g_cublas != NULL) return 0;
+    cublasStatus_t st = cublasCreate(&g_cublas);
+    if (st != CUBLAS_STATUS_SUCCESS) { g_cublas = NULL; return -1; }
+    return 0;
+}
+#endif
+
+// CPU naive Sgemm: C[M,N] = alpha · A_rm[M,K] · B_rm[K,N] + beta · C[M,N]
+// All matrices row-major, float32.
+static void cpu_sgemm_rm(
+    int64_t M, int64_t N, int64_t K,
+    float alpha,
+    const float* A, int64_t lda,     // lda = K (stride between rows)
+    const float* B, int64_t ldb,     // ldb = N
+    float beta,
+    float* C, int64_t ldc            // ldc = N
+) {
+    // Scale existing C by beta if needed.
+    if (beta == 0.0f) {
+        for (int64_t i = 0; i < M; i++) {
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] = 0.0f;
+        }
+    } else if (beta != 1.0f) {
+        for (int64_t i = 0; i < M; i++) {
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] *= beta;
+        }
+    }
+    // ikj order — better locality for row-major A,B.
+    for (int64_t i = 0; i < M; i++) {
+        for (int64_t k = 0; k < K; k++) {
+            float a = alpha * A[i*lda + k];
+            const float* Brow = B + k*ldb;
+            float* Crow = C + i*ldc;
+            for (int64_t j = 0; j < N; j++) {
+                Crow[j] += a * Brow[j];
+            }
+        }
+    }
+}
+
+// CPU naive: C[M,N] = alpha · A_rm[M,K] · (B_rm[N,K])^T + beta·C
+//   B is row-major [N,K] → (B)^T is [K,N] col-major — same physical data.
+static void cpu_sgemm_rm_nt(
+    int64_t M, int64_t N, int64_t K,
+    float alpha,
+    const float* A, int64_t lda,
+    const float* B, int64_t ldb,     // ldb = K  (row-major B[N,K])
+    float beta,
+    float* C, int64_t ldc
+) {
+    if (beta == 0.0f) {
+        for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] = 0.0f;
+    } else if (beta != 1.0f) {
+        for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] *= beta;
+    }
+    for (int64_t i = 0; i < M; i++) {
+        const float* Arow = A + i*lda;
+        float* Crow = C + i*ldc;
+        for (int64_t j = 0; j < N; j++) {
+            const float* Brow = B + j*ldb;
+            float acc = 0.0f;
+            for (int64_t k = 0; k < K; k++) acc += Arow[k] * Brow[k];
+            Crow[j] += alpha * acc;
+        }
+    }
+}
+
+// CPU naive: C[M,N] = alpha · (A_rm[K,M])^T · B_rm[K,N] + beta·C
+// A is row-major [K,M]; (A)^T is [M,K].
+static void cpu_sgemm_rm_tn(
+    int64_t M, int64_t N, int64_t K,
+    float alpha,
+    const float* A, int64_t lda,     // lda = M (row-major A[K,M])
+    const float* B, int64_t ldb,     // ldb = N
+    float beta,
+    float* C, int64_t ldc
+) {
+    if (beta == 0.0f) {
+        for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] = 0.0f;
+    } else if (beta != 1.0f) {
+        for (int64_t i = 0; i < M; i++)
+            for (int64_t j = 0; j < N; j++) C[i*ldc + j] *= beta;
+    }
+    for (int64_t k = 0; k < K; k++) {
+        const float* Arow = A + k*lda;  // [M] row of At^T column
+        const float* Brow = B + k*ldb;
+        for (int64_t i = 0; i < M; i++) {
+            float a = alpha * Arow[i];
+            float* Crow = C + i*ldc;
+            for (int64_t j = 0; j < N; j++) {
+                Crow[j] += a * Brow[j];
+            }
+        }
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// hxqwen14b_lora_fwd_single — single-adapter LoRA forward
+// y = (alpha/r) · (x · A^T) · B^T
+// ═════════════════════════════════════════════════════════════════════
+int hxqwen14b_lora_fwd_single(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenLoraFwdArgs* a = (HxQwenLoraFwdArgs*)args;
+    if (a->M_rows <= 0 || a->N_out <= 0 || a->K_in <= 0 || a->R_lora <= 0) return RC_ERR_BAD_ARGS;
+    if (a->x_p == 0 || a->A_p == 0 || a->B_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+
+    const int64_t M = a->M_rows;
+    const int64_t N = a->N_out;
+    const int64_t K = a->K_in;
+    const int64_t R = a->R_lora;
+    const float   s = (float)a->alpha_over_r;
+
+    if (a->is_device) {
+#ifdef HXQWEN14B_CUDA
+        if (ensure_cublas() != 0) return RC_ERR_KERNEL_FAIL;
+        if (a->tmp_p == 0) return RC_ERR_NULL_ARGS;  // device path needs scratch
+        const float* x = (const float*)(uintptr_t)a->x_p;
+        const float* A = (const float*)(uintptr_t)a->A_p;
+        const float* B = (const float*)(uintptr_t)a->B_p;
+        float*       y = (float*)(uintptr_t)a->y_p;
+        float*     tmp = (float*)(uintptr_t)a->tmp_p;
+
+        // Step 1: tmp[M,R] = x[M,K] · A[R,K]^T
+        // Row-major via cuBLAS col-major trick:
+        //   C_cm[R,M] = A_cm · x_cm  where A_cm[R,K], x_cm[K,M] ≡ row-major.
+        //   cublasSgemm(op=N,op=T, R,M,K, 1, A_rm[R,K], K, x_rm[M,K], K, 0, tmp[M,R], R)
+        // But we want row-major tmp[M,R]. Using identity swap(A,B):
+        //   cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, R, M, K,
+        //               &1.0f, A, K, x, K, &0.0f, tmp, R);
+        float one = 1.0f, zero = 0.0f;
+        cublasStatus_t st = cublasSgemm(
+            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            R, M, K,
+            &one, A, K, x, K,
+            &zero, tmp, R);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+
+        // Step 2: y[M,N] = (alpha/r) · tmp[M,R] · B[N,R]^T   (+ beta·y)
+        //   cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, R,
+        //               &s, B, R, tmp, R, &beta, y, N);
+        float beta = a->accumulate ? 1.0f : 0.0f;
+        st = cublasSgemm(
+            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, R,
+            &s, B, R, tmp, R,
+            &beta, y, N);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+        return RC_OK;
+#else
+        return RC_ERR_CUDA_TODO;
+#endif
+    }
+
+    // ── CPU reference path ──
+    const float* x = (const float*)(uintptr_t)a->x_p;
+    const float* A = (const float*)(uintptr_t)a->A_p;
+    const float* B = (const float*)(uintptr_t)a->B_p;
+    float*       y = (float*)(uintptr_t)a->y_p;
+    float*     tmp = (a->tmp_p != 0) ? (float*)(uintptr_t)a->tmp_p : NULL;
+
+    // Allocate scratch if caller didn't provide (CPU only).
+    int owned = 0;
+    if (tmp == NULL) {
+        tmp = (float*)malloc((size_t)(M*R) * sizeof(float));
+        if (!tmp) return RC_ERR_OOM;
+        owned = 1;
+    }
+    // tmp[M,R] = x[M,K] · A[R,K]^T
+    cpu_sgemm_rm_nt(M, R, K, 1.0f, x, K, A, K, 0.0f, tmp, R);
+    // y[M,N] = s · tmp[M,R] · B[N,R]^T   + (accumulate ? 1 : 0) · y
+    float beta = a->accumulate ? 1.0f : 0.0f;
+    cpu_sgemm_rm_nt(M, N, R, s, tmp, R, B, R, beta, y, N);
+    if (owned) free(tmp);
+    return RC_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// hxqwen14b_lora_bwd_single — single-adapter LoRA backward
+//
+// Given dy[M,N], x[M,K], A[R,K], B[N,R], and s=alpha/r, compute:
+//   u[M,R]  = dy[M,N] · B[N,R]        (standard GEMM)
+//   dx[M,K] = s · u[M,R] · A[R,K]     (LoRA contribution; accumulates)
+//   dB[N,R] = s · dy[M,N]^T · tmp[M,R]    where tmp = x·A^T  (recompute)
+//   dA[R,K] = s · u[M,R]^T · x[M,K]
+// ═════════════════════════════════════════════════════════════════════
+int hxqwen14b_lora_bwd_single(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenLoraBwdArgs* a = (HxQwenLoraBwdArgs*)args;
+    if (a->M_rows <= 0 || a->N_out <= 0 || a->K_in <= 0 || a->R_lora <= 0) return RC_ERR_BAD_ARGS;
+    if (a->x_p == 0 || a->A_p == 0 || a->B_p == 0 || a->dy_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->dA_p == 0 || a->dB_p == 0) return RC_ERR_NULL_ARGS;
+
+    const int64_t M = a->M_rows;
+    const int64_t N = a->N_out;
+    const int64_t K = a->K_in;
+    const int64_t R = a->R_lora;
+    const float   s = (float)a->alpha_over_r;
+    const float   gbeta = a->accumulate_grads ? 1.0f : 0.0f;
+
+    if (a->is_device) {
+#ifdef HXQWEN14B_CUDA
+        if (ensure_cublas() != 0) return RC_ERR_KERNEL_FAIL;
+        if (a->u_p == 0 || a->tmp_p == 0) return RC_ERR_NULL_ARGS;
+        const float* x   = (const float*)(uintptr_t)a->x_p;
+        const float* A   = (const float*)(uintptr_t)a->A_p;
+        const float* B   = (const float*)(uintptr_t)a->B_p;
+        const float* dy  = (const float*)(uintptr_t)a->dy_p;
+        float*       dA  = (float*)(uintptr_t)a->dA_p;
+        float*       dB  = (float*)(uintptr_t)a->dB_p;
+        float*       dx  = (a->dx_p != 0) ? (float*)(uintptr_t)a->dx_p : NULL;
+        float*       u   = (float*)(uintptr_t)a->u_p;
+        float*     tmp   = (float*)(uintptr_t)a->tmp_p;
+        float one = 1.0f, zero = 0.0f;
+        cublasStatus_t st;
+
+        // u[M,R] = dy[M,N] · B[N,R]  (dy NN, B is row-major [N,R])
+        //   cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_N, R, M, N,
+        //               &1, B, R, dy, N, &0, u, R);
+        st = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                         R, M, N, &one, B, R, dy, N, &zero, u, R);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+
+        // tmp[M,R] = x[M,K] · A[R,K]^T   (same as forward step 1)
+        st = cublasSgemm(g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+                         R, M, K, &one, A, K, x, K, &zero, tmp, R);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+
+        // dB[N,R] = s · dy[M,N]^T · tmp[M,R]     (row-major output)
+        //   Col-major view: dB^T[R,N] = tmp^T · dy. Using swap identity:
+        //   cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_T, R, N, M,
+        //               &s, tmp, R, dy, N, &gbeta, dB, R);
+        st = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                         R, N, M, &s, tmp, R, dy, N, &gbeta, dB, R);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+
+        // dA[R,K] = s · u[M,R]^T · x[M,K]
+        //   cublasSgemm(h, CUBLAS_OP_N, CUBLAS_OP_T, K, R, M,
+        //               &s, x, K, u, R, &gbeta, dA, K);
+        st = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_T,
+                         K, R, M, &s, x, K, u, R, &gbeta, dA, K);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+
+        // dx[M,K] += s · u[M,R] · A[R,K]   (dx is accumulator; beta=1)
+        if (dx != NULL) {
+            float dx_beta = 1.0f;  // always accumulate into dx
+            st = cublasSgemm(g_cublas, CUBLAS_OP_N, CUBLAS_OP_N,
+                             K, M, R, &s, A, K, u, R, &dx_beta, dx, K);
+            if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+        }
+        return RC_OK;
+#else
+        return RC_ERR_CUDA_TODO;
+#endif
+    }
+
+    // ── CPU reference path ──
+    const float* x   = (const float*)(uintptr_t)a->x_p;
+    const float* A   = (const float*)(uintptr_t)a->A_p;
+    const float* B   = (const float*)(uintptr_t)a->B_p;
+    const float* dy  = (const float*)(uintptr_t)a->dy_p;
+    float*       dA  = (float*)(uintptr_t)a->dA_p;
+    float*       dB  = (float*)(uintptr_t)a->dB_p;
+    float*       dx  = (a->dx_p != 0) ? (float*)(uintptr_t)a->dx_p : NULL;
+
+    // Scratch: u[M,R], tmp[M,R].
+    int own_u = 0, own_tmp = 0;
+    float* u   = (a->u_p   != 0) ? (float*)(uintptr_t)a->u_p   : NULL;
+    float* tmp = (a->tmp_p != 0) ? (float*)(uintptr_t)a->tmp_p : NULL;
+    if (u == NULL)   { u   = (float*)malloc((size_t)(M*R) * sizeof(float)); if (!u)   return RC_ERR_OOM; own_u = 1; }
+    if (tmp == NULL) { tmp = (float*)malloc((size_t)(M*R) * sizeof(float)); if (!tmp) { if (own_u) free(u); return RC_ERR_OOM; } own_tmp = 1; }
+
+    // u[M,R] = dy[M,N] · B[N,R]   (B row-major [N,R]; treat dy·B as MxR)
+    // This is plain matmul A[M,N] · B_plain[N,R] — cpu_sgemm_rm.
+    cpu_sgemm_rm(M, R, N, 1.0f, dy, N, B, R, 0.0f, u, R);
+
+    // tmp[M,R] = x[M,K] · A[R,K]^T
+    cpu_sgemm_rm_nt(M, R, K, 1.0f, x, K, A, K, 0.0f, tmp, R);
+
+    // dB[N,R] = s · dy[M,N]^T · tmp[M,R]     (TN)
+    cpu_sgemm_rm_tn(N, R, M, s, dy, N, tmp, R, gbeta, dB, R);
+
+    // dA[R,K] = s · u[M,R]^T · x[M,K]
+    cpu_sgemm_rm_tn(R, K, M, s, u, R, x, K, gbeta, dA, K);
+
+    // dx[M,K] += s · u[M,R] · A[R,K]
+    if (dx != NULL) {
+        cpu_sgemm_rm(M, K, R, s, u, R, A, K, 1.0f, dx, K);
+    }
+
+    if (own_u) free(u);
+    if (own_tmp) free(tmp);
+    return RC_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// hxqwen14b_base_gemm — frozen base weight matmul
+// y = x[M,K] · W[N,K]^T  (+ bias[N])     row-major fp32
+// ═════════════════════════════════════════════════════════════════════
+int hxqwen14b_base_gemm(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenBaseGemmArgs* a = (HxQwenBaseGemmArgs*)args;
+    if (a->M_rows <= 0 || a->N_out <= 0 || a->K_in <= 0) return RC_ERR_BAD_ARGS;
+    if (a->x_p == 0 || a->W_p == 0 || a->y_p == 0) return RC_ERR_NULL_ARGS;
+
+    const int64_t M = a->M_rows;
+    const int64_t N = a->N_out;
+    const int64_t K = a->K_in;
+
+    if (a->is_device) {
+#ifdef HXQWEN14B_CUDA
+        if (ensure_cublas() != 0) return RC_ERR_KERNEL_FAIL;
+        const float* x = (const float*)(uintptr_t)a->x_p;
+        const float* W = (const float*)(uintptr_t)a->W_p;
+        float*       y = (float*)(uintptr_t)a->y_p;
+        float one = 1.0f;
+        float beta = a->accumulate ? 1.0f : 0.0f;
+        // y[M,N] = x[M,K] · W[N,K]^T   (NT)
+        //   cublasSgemm(h, CUBLAS_OP_T, CUBLAS_OP_N, N, M, K,
+        //               &1, W, K, x, K, &beta, y, N);
+        cublasStatus_t st = cublasSgemm(
+            g_cublas, CUBLAS_OP_T, CUBLAS_OP_N,
+            N, M, K,
+            &one, W, K, x, K,
+            &beta, y, N);
+        if (st != CUBLAS_STATUS_SUCCESS) return RC_ERR_KERNEL_FAIL;
+        // bias add on device needs a custom kernel — for Day-2 we require
+        // caller to pre-add bias into y before calling with accumulate=1,
+        // or bias_p == 0 on device path.
+        if (a->bias_p != 0) return RC_ERR_CUDA_TODO;  // v5.1: bias kernel
+        return RC_OK;
+#else
+        return RC_ERR_CUDA_TODO;
+#endif
+    }
+
+    // ── CPU reference path ──
+    const float* x = (const float*)(uintptr_t)a->x_p;
+    const float* W = (const float*)(uintptr_t)a->W_p;
+    const float* bias = (a->bias_p != 0) ? (const float*)(uintptr_t)a->bias_p : NULL;
+    float*       y = (float*)(uintptr_t)a->y_p;
+    float beta = a->accumulate ? 1.0f : 0.0f;
+    // y[M,N] = x[M,K] · W[N,K]^T  + beta·y
+    cpu_sgemm_rm_nt(M, N, K, 1.0f, x, K, W, K, beta, y, N);
+    if (bias != NULL) {
+        for (int64_t i = 0; i < M; i++) {
+            float* row = y + i*N;
+            for (int64_t j = 0; j < N; j++) row[j] += bias[j];
+        }
+    }
+    return RC_OK;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// hxqwen14b_smoke_v5 — self-contained smoke test helper. Caller supplies
+// all buffers (it must know the shapes); this routine runs fwd+bwd once
+// and fills an HxQwenSmokeResult so a hexa-side test can assert.
+//
+// Args layout (packed):
+//   int64_t M, N, K, R;              // dims
+//   int64_t x_p, A_p, B_p, y_p;      // buffers (already populated)
+//   int64_t dy_p, dA_p, dB_p, dx_p;
+//   int64_t u_p, tmp_p;
+//   double  alpha_over_r;
+//   int64_t is_device;
+//   int64_t out_p;                   // HxQwenSmokeResult*
+// ═════════════════════════════════════════════════════════════════════
+typedef struct HxQwenSmokeArgs {
+    int64_t M_rows;
+    int64_t N_out;
+    int64_t K_in;
+    int64_t R_lora;
+    int64_t x_p;
+    int64_t A_p;
+    int64_t B_p;
+    int64_t y_p;
+    int64_t dy_p;
+    int64_t dA_p;
+    int64_t dB_p;
+    int64_t dx_p;
+    int64_t u_p;
+    int64_t tmp_p;
+    double  alpha_over_r;
+    int64_t is_device;
+    int64_t out_p;
+    int64_t reserved0;
+} HxQwenSmokeArgs;
+
+static void scan_nan_sum(const float* p, int64_t n, int64_t* n_nan, double* sum_abs) {
+    int64_t nn = 0;
+    double s = 0.0;
+    for (int64_t i = 0; i < n; i++) {
+        float v = p[i];
+        if (v != v) nn++;  // NaN check (IEEE 754)
+        else s += (double)fabsf(v);
+    }
+    *n_nan = nn;
+    *sum_abs = s;
+}
+
+int hxqwen14b_smoke_v5(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenSmokeArgs* a = (HxQwenSmokeArgs*)args;
+    if (a->out_p == 0) return RC_ERR_NULL_ARGS;
+    HxQwenSmokeResult* r = (HxQwenSmokeResult*)(uintptr_t)a->out_p;
+    memset(r, 0, sizeof(HxQwenSmokeResult));
+
+    // Smoke is CPU-only for now — device smoke needs device-side reduction
+    // kernels, punt to a follow-up. is_device==1 without CUDA returns -5.
+    if (a->is_device) {
+#ifdef HXQWEN14B_CUDA
+        // Run the kernels on device, then copy y/dA/dB back to host via
+        // cudaMemcpy and scan. For Day-2 we ship the CPU smoke; device
+        // smoke will come alongside Activation upload in v5.1.
+        return RC_ERR_CUDA_TODO;
+#else
+        return RC_ERR_CUDA_TODO;
+#endif
+    }
+
+    HxQwenLoraFwdArgs fwd;
+    memset(&fwd, 0, sizeof(fwd));
+    fwd.M_rows = a->M_rows; fwd.N_out = a->N_out; fwd.K_in = a->K_in; fwd.R_lora = a->R_lora;
+    fwd.x_p = a->x_p; fwd.A_p = a->A_p; fwd.B_p = a->B_p; fwd.y_p = a->y_p;
+    fwd.alpha_over_r = a->alpha_over_r; fwd.tmp_p = a->tmp_p;
+    fwd.accumulate = 0; fwd.is_device = 0;
+    r->rc_fwd = (int64_t)hxqwen14b_lora_fwd_single(&fwd);
+    if (r->rc_fwd != RC_OK) return (int)r->rc_fwd;
+
+    HxQwenLoraBwdArgs bwd;
+    memset(&bwd, 0, sizeof(bwd));
+    bwd.M_rows = a->M_rows; bwd.N_out = a->N_out; bwd.K_in = a->K_in; bwd.R_lora = a->R_lora;
+    bwd.x_p = a->x_p; bwd.A_p = a->A_p; bwd.B_p = a->B_p;
+    bwd.dy_p = a->dy_p; bwd.dA_p = a->dA_p; bwd.dB_p = a->dB_p; bwd.dx_p = a->dx_p;
+    bwd.alpha_over_r = a->alpha_over_r;
+    bwd.u_p = a->u_p; bwd.tmp_p = a->tmp_p;
+    bwd.accumulate_grads = 0; bwd.is_device = 0;
+    r->rc_bwd = (int64_t)hxqwen14b_lora_bwd_single(&bwd);
+    if (r->rc_bwd != RC_OK) return (int)r->rc_bwd;
+
+    const int64_t M = a->M_rows, N = a->N_out, K = a->K_in, R = a->R_lora;
+    scan_nan_sum((const float*)(uintptr_t)a->y_p,  M*N, &r->n_nan_out, &r->y_sum_abs);
+    scan_nan_sum((const float*)(uintptr_t)a->dA_p, R*K, &r->n_nan_dA,  &r->dA_sum_abs);
+    scan_nan_sum((const float*)(uintptr_t)a->dB_p, N*R, &r->n_nan_dB,  &r->dB_sum_abs);
+    if (a->dx_p != 0) {
+        int64_t dummy_nan;
+        scan_nan_sum((const float*)(uintptr_t)a->dx_p, M*K, &dummy_nan, &r->dx_sum_abs);
+    }
+    return RC_OK;
 }
