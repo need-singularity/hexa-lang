@@ -304,6 +304,16 @@ let mut m133_max_nodes_per_fn = 0
 let mut m134_min_nodes_per_fn = 0
 // M136: trivially simple fn (no while, no call, size ≤ 2)
 let mut m136_trivial_fns = 0
+// ROI #136: filter→early-exit rewrite counters (find-first loop)
+let mut m136_filter_first_detected = 0
+let mut m136_filter_first_rewrites = 0
+let mut m136_any_rewrites = 0
+let mut m136_filter_len_rewrites = 0
+// ROI #141: sort().take(k) / sort().first(k) → Quickselect nth_element
+let mut m_roi141_detected = 0
+let mut m_roi141_rewrites_unordered = 0
+let mut m_roi141_rewrites_sorted = 0
+let mut m_roi141_rejects_no_k = 0
 // M153: trivial → auto @inline (9th promotion)
 let mut m153_trivial_inline = 0
 // M177: return-only fn count (single stmt, kind == ReturnStmt)
@@ -1172,6 +1182,8 @@ let mut m973_sliding_ok = 0
 let mut m973_sliding_candidates = 0
 // M981: O(n²) string concat in loop — UNIVERSAL detection
 let mut m981_str_concat_in_loop = 0
+// M981b (ROI #137): O(n²) string concat → parts.push() + .join() AST rewrite count
+let mut m981_str_concat_rewrites = 0
 // M982: O(n²) array push in loop — UNIVERSAL detection
 let mut m982_arr_push_in_loop = 0
 // M983: Unbounded recursion — UNIVERSAL detection
@@ -1182,6 +1194,11 @@ let mut m984_float_equality = 0
 let mut m985_exec_injection = 0
 // M986: Redundant val_to_string in loop — UNIVERSAL detection
 let mut m986_redundant_tostring = 0
+// M987: map chain fusion — .map(f).map(g) → .map(|x| g(f(x))) (ROI #138)
+//   Covers .map.map, .map.filter, .filter.map. Requires both lambdas pure (no impure
+//   builtins) and syntactically inline 1-arg expression lambdas. Conservative: fn
+//   references NOT fused (no @pure propagation for named fns yet).
+let mut m987_map_chain_fused = 0
 // M974: @approximate rewrite — Newton/Taylor approximation injection
 let mut m974_approx_rewrites = 0
 // M975: linear-search → binary-search AST rewrite count
@@ -3153,6 +3170,293 @@ fn count_str_concat_in_loop(body) {
         i = i + 1
     }
     return c
+}
+
+// ── M981b (ROI #137): O(n²) string-concat-in-loop → StringBuilder AST rewrite ──
+// Precision guards (must all hold to rewrite):
+//   (1) Preceding stmt is `let mut <s> = <StrLit>` — proves string-typed + mutable.
+//   (2) Immediately-following stmt is While/For/ForInStmt.
+//   (3) Loop body contains at least one AssignStmt matching `<s> = <s> + <str_expr>`
+//       (desugared form of both `s = s + x` and `s += x`).
+//   (4) No other read of <s> inside the loop body (pure accumulator).
+// Rewrite:
+//   let mut <s> = ""           ← kept (so post-loop reads of <s> still typecheck as str)
+//   let mut __sb_<s> = []      ← inserted
+//   while/for ... {
+//     __sb_<s> = __sb_<s>.push(<x>)   ← in place of `<s> = <s> + <x>`
+//   }
+//   <s> = __sb_<s>.join("")    ← inserted after loop
+// O(n²) → O(n).
+
+fn m981_count_ident_uses_expr(expr, name) {
+    if type_of(expr) == "string" { return 0 }
+    if expr.kind == "Ident" {
+        if expr.name == name { return 1 }
+        return 0
+    }
+    let mut c = 0
+    if expr.kind == "BinOp" {
+        c = c + m981_count_ident_uses_expr(expr.left, name)
+        c = c + m981_count_ident_uses_expr(expr.right, name)
+        return c
+    }
+    if expr.kind == "UnaryOp" { return m981_count_ident_uses_expr(expr.left, name) }
+    if expr.kind == "Index" {
+        c = c + m981_count_ident_uses_expr(expr.left, name)
+        c = c + m981_count_ident_uses_expr(expr.right, name)
+        return c
+    }
+    if expr.kind == "Call" {
+        c = c + m981_count_ident_uses_expr(expr.left, name)
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                c = c + m981_count_ident_uses_expr(expr.args[ai], name)
+                ai = ai + 1
+            }
+        }
+        return c
+    }
+    if expr.kind == "MethodCall" {
+        c = c + m981_count_ident_uses_expr(expr.left, name)
+        if type_of(expr.args) == "array" {
+            let mut ai2 = 0
+            while ai2 < len(expr.args) {
+                c = c + m981_count_ident_uses_expr(expr.args[ai2], name)
+                ai2 = ai2 + 1
+            }
+        }
+        return c
+    }
+    if expr.kind == "FieldAccess" { return m981_count_ident_uses_expr(expr.left, name) }
+    if expr.kind == "ArrayLit" {
+        if type_of(expr.items) == "array" {
+            let mut ii = 0
+            while ii < len(expr.items) {
+                c = c + m981_count_ident_uses_expr(expr.items[ii], name)
+                ii = ii + 1
+            }
+        }
+        return c
+    }
+    return 0
+}
+
+fn m981_is_concat_stmt(stmt, name) {
+    if type_of(stmt) == "string" { return false }
+    if stmt.kind != "AssignStmt" { return false }
+    let lhs = stmt.left
+    let rhs = stmt.right
+    if type_of(lhs) == "string" || type_of(rhs) == "string" { return false }
+    if lhs.kind != "Ident" { return false }
+    if lhs.name != name { return false }
+    if rhs.kind != "BinOp" { return false }
+    if rhs.op != "+" { return false }
+    if type_of(rhs.left) == "string" { return false }
+    if rhs.left.kind != "Ident" { return false }
+    if rhs.left.name != name { return false }
+    if !m981_is_string_expr(rhs.right) { return false }
+    return true
+}
+
+fn m981_loop_body_safe(body, name) {
+    if type_of(body) != "array" { return false }
+    let mut i = 0
+    let n = len(body)
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) != "string" {
+            let k = stmt.kind
+            if k == "AssignStmt" {
+                if m981_is_concat_stmt(stmt, name) {
+                    if m981_count_ident_uses_expr(stmt.right.right, name) > 0 { return false }
+                } else {
+                    if m981_count_ident_uses_expr(stmt.left, name) > 0 { return false }
+                    if m981_count_ident_uses_expr(stmt.right, name) > 0 { return false }
+                }
+            } else if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+                if stmt.name == name { return false }
+                if m981_count_ident_uses_expr(stmt.left, name) > 0 { return false }
+            } else if k == "ReturnStmt" {
+                if m981_count_ident_uses_expr(stmt.left, name) > 0 { return false }
+            } else if k == "ExprStmt" {
+                if m981_count_ident_uses_expr(stmt.left, name) > 0 { return false }
+            } else if k == "IfStmt" {
+                if m981_count_ident_uses_expr(stmt.cond, name) > 0 { return false }
+                if !m981_loop_body_safe(stmt.then_body, name) { return false }
+                if type_of(stmt.else_body) == "array" {
+                    if !m981_loop_body_safe(stmt.else_body, name) { return false }
+                }
+            } else if k == "WhileStmt" {
+                if m981_count_ident_uses_expr(stmt.cond, name) > 0 { return false }
+                if !m981_loop_body_safe(stmt.body, name) { return false }
+            } else if k == "ForStmt" || k == "ForInStmt" {
+                if m981_count_ident_uses_expr(stmt.iter_expr, name) > 0 { return false }
+                if !m981_loop_body_safe(stmt.body, name) { return false }
+            }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn m981_rewrite_loop_body(body, name, sb_name) {
+    if type_of(body) != "array" { return body }
+    let mut out = []
+    let mut i = 0
+    let n = len(body)
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) == "string" {
+            out = out.push(stmt)
+        } else {
+            let k = stmt.kind
+            if k == "AssignStmt" && m981_is_concat_stmt(stmt, name) {
+                let push_call = AstNode {
+                    kind: "MethodCall", name: "push", value: "", op: "",
+                    left: make_ident(sb_name), right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: [stmt.right.right], fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+                let new_assign = AstNode {
+                    kind: "AssignStmt", name: "", value: "", op: "",
+                    left: make_ident(sb_name), right: push_call, cond: "", then_body: "", else_body: "",
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                }
+                out = out.push(new_assign)
+            } else if k == "IfStmt" {
+                let mut eb = ""
+                if type_of(stmt.else_body) == "array" {
+                    eb = m981_rewrite_loop_body(stmt.else_body, name, sb_name)
+                }
+                out = out.push(AstNode {
+                    kind: "IfStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond,
+                    then_body: m981_rewrite_loop_body(stmt.then_body, name, sb_name),
+                    else_body: eb,
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else if k == "WhileStmt" {
+                out = out.push(AstNode {
+                    kind: "WhileStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond, then_body: "", else_body: "",
+                    params: "", body: m981_rewrite_loop_body(stmt.body, name, sb_name),
+                    args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else if k == "ForStmt" || k == "ForInStmt" {
+                out = out.push(AstNode {
+                    kind: k, name: stmt.name, value: stmt.value, op: "",
+                    left: "", right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: m981_rewrite_loop_body(stmt.body, name, sb_name),
+                    args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: stmt.iter_expr, ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else {
+                out = out.push(stmt)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn rewrite_str_concat_in_loop(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        if type_of(stmt) == "string" {
+            out = out.push(stmt)
+            i = i + 1
+        } else if stmt.kind == "IfStmt" {
+            let mut eb = ""
+            if type_of(stmt.else_body) == "array" { eb = rewrite_str_concat_in_loop(stmt.else_body) }
+            out = out.push(AstNode {
+                kind: "IfStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: stmt.cond,
+                then_body: rewrite_str_concat_in_loop(stmt.then_body), else_body: eb,
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+            i = i + 1
+        } else if stmt.kind == "LetMutStmt" && i + 1 < n && type_of(stmt.left) != "string" && stmt.left.kind == "StrLit" && type_of(body[i + 1]) != "string" && (body[i + 1].kind == "WhileStmt" || body[i + 1].kind == "ForStmt" || body[i + 1].kind == "ForInStmt") && count_str_concat_in_loop([body[i + 1]]) > 0 && m981_loop_body_safe(body[i + 1].body, stmt.name) {
+            let sname = stmt.name
+            let nxt = body[i + 1]
+            let nk = nxt.kind
+            let hits = count_str_concat_in_loop([nxt])
+            let sb_name = "__sb_" + sname
+            out = out.push(stmt)
+            out = out.push(make_let_mut_stmt(sb_name, make_empty_array()))
+            let new_loop_body = m981_rewrite_loop_body(nxt.body, sname, sb_name)
+            if nk == "WhileStmt" {
+                out = out.push(AstNode {
+                    kind: "WhileStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: nxt.cond, then_body: "", else_body: "",
+                    params: "", body: new_loop_body, args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else {
+                out = out.push(AstNode {
+                    kind: nk, name: nxt.name, value: nxt.value, op: "",
+                    left: "", right: "", cond: "", then_body: "", else_body: "",
+                    params: "", body: new_loop_body, args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: nxt.iter_expr, ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            }
+            let join_call = AstNode {
+                kind: "MethodCall", name: "join", value: "", op: "",
+                left: make_ident(sb_name), right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: [make_string_lit("")], fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            let join_assign = AstNode {
+                kind: "AssignStmt", name: "", value: "", op: "",
+                left: make_ident(sname), right: join_call, cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            out = out.push(join_assign)
+            m981_str_concat_rewrites = m981_str_concat_rewrites + hits
+            i = i + 2
+        } else if stmt.kind == "WhileStmt" {
+            out = out.push(AstNode {
+                kind: "WhileStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: stmt.cond, then_body: "", else_body: "",
+                params: "", body: rewrite_str_concat_in_loop(stmt.body), args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+            i = i + 1
+        } else if stmt.kind == "ForStmt" || stmt.kind == "ForInStmt" {
+            out = out.push(AstNode {
+                kind: stmt.kind, name: stmt.name, value: stmt.value, op: "",
+                left: "", right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: rewrite_str_concat_in_loop(stmt.body), args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: stmt.iter_expr, ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+            i = i + 1
+        } else {
+            out = out.push(stmt)
+            i = i + 1
+        }
+    }
+    return out
 }
 
 // ── M982 helper: is this rhs an append-style O(n²) array growth? ──
@@ -6122,12 +6426,321 @@ fn fuse_mapfilter_body(body) {
     return out
 }
 
+// ── M987: map chain fusion — .map(f).map(g) → .map(|x| g(f(x))) ──────────────
+// (ROI #138) Covers .map.map, .map.filter, .filter.map. Unlike M965 (which lowers
+// a chain to a while-loop and requires @fuse attr), M987 operates at expression
+// level and fires UNIVERSALLY (no attr required). Purely an AST rewrite that
+// collapses two method calls into one, eliminating the intermediate array.
+//
+// SAFETY / LIMITATIONS (documented, conservative):
+//   - Both lambdas must be SYNTACTICALLY INLINE 1-arg expression lambdas
+//     (e.g. `|x| x * 2`). Named fn references (`arr.map(square).map(cube)`) are
+//     NOT fused — hexa has no cross-fn @pure propagation for named fns yet.
+//   - Lambda bodies must contain NO impure builtin calls (println/print/getenv/
+//     setenv/now/time/random/rand/read_file/write_file/exec/spawn/exit/abort).
+//     Mirrors ff_expr_has_impure_call but implemented locally to avoid forward-
+//     ref dependency on ff_ helpers defined later in the file.
+//   - Unknown user fn calls inside the lambda body are ALLOWED (conservative
+//     trust — purity of arbitrary user fns is not decidable without whole-
+//     program analysis, but side-effecting builtins are caught).
+//
+// Rewrite shapes:
+//   .map(f).map(g)    → .map(|x| g(f(x)))      — 2 passes → 1
+//   .map(f).filter(p) → NOT rewritten at expr level (M965 handles via loop).
+//   .filter(p).map(f) → NOT rewritten at expr level (M965 handles via loop).
+// The .map.filter / .filter.map variants are left to M965 which lowers to a
+// single while-loop under @fuse. M987 complements M965 by handling the pure
+// .map.map case UNIVERSALLY (no attr required).
+
+fn m987_is_impure_builtin_name(nm) {
+    if nm == "println" { return true }
+    if nm == "print" { return true }
+    if nm == "eprintln" { return true }
+    if nm == "getenv" { return true }
+    if nm == "setenv" { return true }
+    if nm == "now" { return true }
+    if nm == "now_iso" { return true }
+    if nm == "time" { return true }
+    if nm == "random" { return true }
+    if nm == "rand" { return true }
+    if nm == "read_file" { return true }
+    if nm == "write_file" { return true }
+    if nm == "exec" { return true }
+    if nm == "spawn" { return true }
+    if nm == "exit" { return true }
+    if nm == "abort" { return true }
+    return false
+}
+
+fn m987_expr_has_impure_call(expr) {
+    if type_of(expr) == "string" { return false }
+    let k = expr.kind
+    if k == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" {
+            if callee.kind == "Ident" && m987_is_impure_builtin_name(callee.name) { return true }
+            if callee.kind == "Field" {
+                if m987_is_impure_builtin_name(callee.name) { return true }
+                if m987_expr_has_impure_call(callee.left) { return true }
+            }
+        }
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                if m987_expr_has_impure_call(expr.args[ai]) { return true }
+                ai = ai + 1
+            }
+        }
+        return false
+    }
+    if k == "BinOp" {
+        if m987_expr_has_impure_call(expr.left) { return true }
+        if m987_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "UnaryOp" { return m987_expr_has_impure_call(expr.left) }
+    if k == "Index" {
+        if m987_expr_has_impure_call(expr.left) { return true }
+        if m987_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "FieldAccess" || k == "Field" { return m987_expr_has_impure_call(expr.left) }
+    return false
+}
+
+fn m987_is_pure_inline_lambda(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Lambda" { return false }
+    if type_of(expr.params) != "array" { return false }
+    if len(expr.params) != 1 { return false }
+    if type_of(expr.left) == "array" { return false }
+    if type_of(expr.left) == "string" { return false }
+    if m987_expr_has_impure_call(expr.left) { return false }
+    return true
+}
+
+fn m987_make_lambda(param_name, body_expr) {
+    return AstNode {
+        kind: "Lambda", name: "", value: "", op: "",
+        left: body_expr, right: "", cond: "", then_body: "", else_body: "",
+        params: [param_name], body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn m987_make_map_call(receiver, lambda) {
+    let map_field = AstNode {
+        kind: "Field", name: "map", value: "", op: "",
+        left: receiver, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    return AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: map_field, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [lambda], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+fn m987_is_pure_map_call(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Call" { return false }
+    let callee = expr.left
+    if type_of(callee) == "string" { return false }
+    if callee.kind != "Field" { return false }
+    if callee.name != "map" { return false }
+    if type_of(expr.args) != "array" { return false }
+    if len(expr.args) != 1 { return false }
+    return m987_is_pure_inline_lambda(expr.args[0])
+}
+
+// If expr matches .map(f).map(g) with pure inline lambdas, return fused
+// .map(|x| g(f(x))); else "" (string sentinel).
+fn m987_try_fuse_map_map(expr) {
+    if !m987_is_pure_map_call(expr) { return "" }
+    let inner = expr.left.left
+    if !m987_is_pure_map_call(inner) { return "" }
+    let g_lam = expr.args[0]
+    let f_lam = inner.args[0]
+    let f_param = f_lam.params[0]
+    let g_param = g_lam.params[0]
+    let f_body = f_lam.left
+    let g_body = g_lam.left
+    // Fused body: substitute g's param with f's body inside g's body → g(f(x))
+    let fused_body = substitute_in_expr(g_body, g_param, f_body)
+    let fused_lam = m987_make_lambda(f_param, fused_body)
+    let src = inner.left.left
+    return m987_make_map_call(src, fused_lam)
+}
+
+// Recursive expression walker: bottom-up rewrite, then local fixpoint at top.
+fn m987_fuse_expr(expr) {
+    if type_of(expr) == "string" { return expr }
+    let k = expr.kind
+    if k == "Call" {
+        let new_callee = m987_fuse_expr(expr.left)
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                new_args = new_args.push(m987_fuse_expr(expr.args[ai]))
+                ai = ai + 1
+            }
+        }
+        let rebuilt = AstNode {
+            kind: "Call", name: expr.name, value: expr.value, op: "",
+            left: new_callee, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: new_args, fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+        let mut cur = rebuilt
+        let mut iter = 0
+        while iter < 8 {
+            let fused = m987_try_fuse_map_map(cur)
+            if type_of(fused) == "string" { iter = 8 }
+            else {
+                cur = fused
+                m987_map_chain_fused = m987_map_chain_fused + 1
+                iter = iter + 1
+            }
+        }
+        return cur
+    }
+    if k == "BinOp" {
+        let new_l = m987_fuse_expr(expr.left)
+        let new_r = m987_fuse_expr(expr.right)
+        return AstNode {
+            kind: "BinOp", name: expr.name, value: expr.value, op: expr.op,
+            left: new_l, right: new_r, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "UnaryOp" {
+        let new_l = m987_fuse_expr(expr.left)
+        return AstNode {
+            kind: "UnaryOp", name: expr.name, value: expr.value, op: expr.op,
+            left: new_l, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Field" || k == "FieldAccess" {
+        let new_l = m987_fuse_expr(expr.left)
+        return AstNode {
+            kind: k, name: expr.name, value: expr.value, op: "",
+            left: new_l, right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Index" {
+        let new_l = m987_fuse_expr(expr.left)
+        let new_r = m987_fuse_expr(expr.right)
+        return AstNode {
+            kind: "Index", name: expr.name, value: expr.value, op: "",
+            left: new_l, right: new_r, cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return expr
+}
+
+fn m987_fuse_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+            let new_init = m987_fuse_expr(stmt.left)
+            out = out.push(AstNode {
+                kind: k, name: stmt.name, value: stmt.value, op: "",
+                left: new_init, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "ReturnStmt" {
+            let new_e = m987_fuse_expr(stmt.left)
+            out = out.push(AstNode {
+                kind: "ReturnStmt", name: "", value: "", op: "",
+                left: new_e, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "ExprStmt" {
+            let new_e = m987_fuse_expr(stmt.left)
+            out = out.push(AstNode {
+                kind: "ExprStmt", name: "", value: "", op: "",
+                left: new_e, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "AssignStmt" {
+            let new_e = m987_fuse_expr(stmt.left)
+            out = out.push(AstNode {
+                kind: "AssignStmt", name: stmt.name, value: stmt.value, op: "",
+                left: new_e, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "WhileStmt" {
+            let new_cond = m987_fuse_expr(stmt.cond)
+            let new_body = m987_fuse_body(stmt.body)
+            out = out.push(AstNode {
+                kind: "WhileStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: new_cond, then_body: "", else_body: "",
+                params: "", body: new_body, args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "IfStmt" {
+            let new_cond = m987_fuse_expr(stmt.cond)
+            let new_then = m987_fuse_body(stmt.then_body)
+            let new_else = m987_fuse_body(stmt.else_body)
+            out = out.push(AstNode {
+                kind: "IfStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: new_cond, then_body: new_then, else_body: new_else,
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
 // ── M974: @fuse map/filter/reduce chain → single-loop AST rewrite ────────────
 // Extends M965 to handle chains ending in reduce/fold/sum.
 // Pattern: arr.map(f).filter(g).reduce(init, h) → single while-loop with acc.
 // Also handles: arr.map(f).reduce(init, h) and arr.filter(g).reduce(init, h).
+// ROI #142: `.product`/`.any`/`.all` normalize to reduce first, then fuse.
 
-// Check if a Field node has name "reduce", "fold", or "sum"
+// Check if a Field node has a recognized reduce-family terminal name.
+// reduce/fold  — generic left-fold with user (acc, x) lambda
+// sum          — arithmetic sum, init = 0, op = +
+// product      — arithmetic prod, init = 1, op = *  (ROI #142)
+// any          — bool OR fold,   init = false, op = ||  (ROI #142)
+// all          — bool AND fold,  init = true,  op = &&  (ROI #142)
 fn is_reduce_field(expr) {
     if type_of(expr) == "string" { return false }
     if expr.kind != "Field" { return false }
@@ -6135,7 +6748,80 @@ fn is_reduce_field(expr) {
     if nm == "reduce" { return true }
     if nm == "fold" { return true }
     if nm == "sum" { return true }
+    if nm == "product" { return true }
+    if nm == "any" { return true }
+    if nm == "all" { return true }
     return false
+}
+
+// ── ROI #142 purity gate ─────────────────────────────────────
+// Conservative check: body must not invoke any known-impure builtin
+// (println/print/read_file/exec/now/random/…). Unknown call targets
+// are permitted — user fns assumed pure, matching existing M974 policy.
+fn mr_name_is_impure_builtin(nm) {
+    if nm == "println" { return true }
+    if nm == "eprintln" { return true }
+    if nm == "print" { return true }
+    if nm == "read_file" { return true }
+    if nm == "write_file" { return true }
+    if nm == "append_file" { return true }
+    if nm == "read_stdin" { return true }
+    if nm == "exec" { return true }
+    if nm == "system" { return true }
+    if nm == "env" { return true }
+    if nm == "getenv" { return true }
+    if nm == "setenv" { return true }
+    if nm == "now" { return true }
+    if nm == "now_iso" { return true }
+    if nm == "time" { return true }
+    if nm == "random" { return true }
+    if nm == "rand" { return true }
+    return false
+}
+
+fn mr_expr_has_impure_call(expr) {
+    if type_of(expr) == "string" { return false }
+    let k = expr.kind
+    if k == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" {
+            if callee.kind == "Ident" && mr_name_is_impure_builtin(callee.name) { return true }
+            if callee.kind == "Field" {
+                if mr_name_is_impure_builtin(callee.name) { return true }
+                if mr_expr_has_impure_call(callee.left) { return true }
+            }
+        }
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                if mr_expr_has_impure_call(expr.args[ai]) { return true }
+                ai = ai + 1
+            }
+        }
+        return false
+    }
+    if k == "BinOp" {
+        if mr_expr_has_impure_call(expr.left) { return true }
+        if mr_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "UnaryOp" { return mr_expr_has_impure_call(expr.left) }
+    if k == "Index" {
+        if mr_expr_has_impure_call(expr.left) { return true }
+        if mr_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "FieldAccess" || k == "Field" { return mr_expr_has_impure_call(expr.left) }
+    if k == "Lambda" { return mr_expr_has_impure_call(expr.left) }
+    return false
+}
+
+// Pure-lambda guard — missing/non-Lambda returns true (defer to caller).
+fn mr_lambda_is_pure(lam) {
+    if type_of(lam) == "string" { return true }
+    if lam.kind != "Lambda" { return true }
+    if mr_expr_has_impure_call(lam.left) { return false }
+    return true
 }
 
 // Detect a map/filter chain ending in reduce/fold/sum.
@@ -6161,11 +6847,23 @@ fn reduce_chain_len(expr) {
 fn build_fused_reduce_inner(ops, idx, cur_expr, acc_name, reduce_op, counter) {
     let n = len(ops)
     if idx >= n {
-        // Terminal: apply the reduce lambda (or += for sum)
+        // Terminal: apply reduce lambda, or normalized sugar form (sum/product/any/all).
         let rname = reduce_op.name
         if rname == "sum" {
             // acc = acc + cur_expr
             return [make_assign_stmt(acc_name, make_binop("+", make_ident(acc_name), cur_expr))]
+        }
+        if rname == "product" {
+            // ROI #142: acc = acc * cur_expr  (normalized .product → .reduce(1, *))
+            return [make_assign_stmt(acc_name, make_binop("*", make_ident(acc_name), cur_expr))]
+        }
+        if rname == "any" {
+            // ROI #142: acc = acc || (cur_expr)  (normalized .any(p) → .reduce(false, ||), p already applied by map)
+            return [make_assign_stmt(acc_name, make_binop("||", make_ident(acc_name), cur_expr))]
+        }
+        if rname == "all" {
+            // ROI #142: acc = acc && (cur_expr)  (normalized .all(p) → .reduce(true, &&))
+            return [make_assign_stmt(acc_name, make_binop("&&", make_ident(acc_name), cur_expr))]
         }
         // reduce/fold: lambda(acc, elem) → new acc
         let lam = reduce_op.left
@@ -6217,13 +6915,56 @@ fn fuse_reduce_stmt(stmt, counter) {
     // Collect the map/filter chain
     let chain = collect_mapfilter_chain(inner_chain_expr)
     let src_expr = chain.left
-    let ops = chain.items
+    let mut ops = chain.items
+    // ROI #142 purity gate: every map/filter lambda must be pure (no println/exec/io/…)
+    let mut opi = 0
+    let opn = len(ops)
+    while opi < opn {
+        let _lam = ops[opi].left
+        if !mr_lambda_is_pure(_lam) { return [] }
+        opi = opi + 1
+    }
     // Determine init value and reduce lambda
     let mut reduce_init_expr = make_int_lit(0)
     let mut reduce_lam = ""
     if reduce_name == "sum" {
         // .sum() has no args, init = 0
         reduce_init_expr = make_int_lit(0)
+    } else if reduce_name == "product" {
+        // ROI #142: .product() has no args, init = 1
+        reduce_init_expr = make_int_lit(1)
+    } else if reduce_name == "any" {
+        // ROI #142: .any() init = false; .any(p) → synthesize trailing map(p) + any()
+        reduce_init_expr = make_bool_lit("false")
+        if type_of(init.args) == "array" && len(init.args) == 1 {
+            let pred = init.args[0]
+            if !is_expr_lambda_1arg(pred) { return [] }
+            if !mr_lambda_is_pure(pred) { return [] }
+            let map_op = AstNode {
+                kind: "__FuseOp", name: "map", value: "", op: "",
+                left: pred, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            ops = ops.push(map_op)
+        }
+    } else if reduce_name == "all" {
+        // ROI #142: .all() init = true; .all(p) → synthesize trailing map(p) + all()
+        reduce_init_expr = make_bool_lit("true")
+        if type_of(init.args) == "array" && len(init.args) == 1 {
+            let pred = init.args[0]
+            if !is_expr_lambda_1arg(pred) { return [] }
+            if !mr_lambda_is_pure(pred) { return [] }
+            let map_op = AstNode {
+                kind: "__FuseOp", name: "map", value: "", op: "",
+                left: pred, right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            }
+            ops = ops.push(map_op)
+        }
     } else {
         // .reduce(init, lambda) or .fold(init, lambda)
         if type_of(init.args) != "array" { return [] }
@@ -6235,6 +6976,8 @@ fn fuse_reduce_stmt(stmt, counter) {
         if reduce_lam.kind != "Lambda" { return [] }
         if type_of(reduce_lam.params) != "array" { return [] }
         if len(reduce_lam.params) != 2 { return [] }
+        // ROI #142 purity gate on the reduce (acc, x) lambda
+        if !mr_lambda_is_pure(reduce_lam) { return [] }
     }
     let result_name = stmt.name
     let src_name = "__frsrc" + to_string(counter)
@@ -11180,11 +11923,13 @@ fn ai_native_pass(ast) {
     m12_g4_size = 0
     m13_max_while_depth = 0
     m981_str_concat_in_loop = 0
+    m981_str_concat_rewrites = 0
     m982_arr_push_in_loop = 0
     m983_unbounded_recursion = 0
     m984_float_equality = 0
     m985_exec_injection = 0
     m986_redundant_tostring = 0
+    m987_map_chain_fused = 0
     m14_bubble_candidates = 0
     m15_tail_call_candidates = 0
     m16_strassen_candidates = 0
@@ -14071,6 +14816,13 @@ fn ai_native_pass(ast) {
             if str_concat_sites > 0 {
                 m981_str_concat_in_loop = m981_str_concat_in_loop + str_concat_sites
                 println("[ai-native] fn " + node.name + " PERF: O(n^2) string concat in loop (" + to_string(str_concat_sites) + " site(s)) -> use parts.push() + .join()")
+                // M981b (ROI #137): attempt AST rewrite to parts.push() + .join()
+                let before_m981 = m981_str_concat_rewrites
+                let sb_body = rewrite_str_concat_in_loop(node.body)
+                if m981_str_concat_rewrites > before_m981 {
+                    node = rewrite_fn_with_body(node, sb_body)
+                    println("[ai-native] fn " + node.name + " REWRITE: O(n^2) string concat -> StringBuilder (" + to_string(m981_str_concat_rewrites - before_m981) + " site(s))")
+                }
             }
             // M982: O(n²) array push in loop — UNIVERSAL (no attr required)
             let arr_push_sites = count_array_push_in_loop(node.body)
@@ -14100,6 +14852,14 @@ fn ai_native_pass(ast) {
             if tostring_sites > 0 {
                 m986_redundant_tostring = m986_redundant_tostring + tostring_sites
                 println("[ai-native] fn " + node.name + " PERF: redundant val_to_string(arr[i]) in loop (" + to_string(tostring_sites) + " site(s)) -> cache or batch convert")
+            }
+            // M987: map chain fusion — .map(f).map(g) → .map(|x| g(f(x))) — UNIVERSAL (ROI #138)
+            let before_mm = m987_map_chain_fused
+            let mm_body = m987_fuse_body(node.body)
+            let mm_count = m987_map_chain_fused - before_mm
+            if mm_count > 0 {
+                node = rewrite_fn_with_body(node, mm_body)
+                println("[ai-native] fn " + node.name + " REWRITE: .map.map → .map(|x| g(f(x))) fused " + to_string(mm_count) + " site(s)")
             }
             // M17/M23: recursive @optimize without @memoize → auto-inject
             if attr_has(attrs, "optimize") && is_rec && !attr_has(attrs, "memoize") {
@@ -14655,6 +15415,10 @@ fn ai_native_pass(ast) {
     out = apply_nonnull_pass(out)
     // ROI #56: loop interchange pass
     out = anp_interchange_pass(out)
+    // ROI #136: filter→early-exit rewrite pass
+    out = apply_filter_first_pass(out)
+    // ROI #141: sort().take(k)/first(k) → rt_top_k_sorted
+    out = apply_sort_topk_pass(out)
     let mut cov_pct = 0
     if m6_total_fns > 0 {
         cov_pct = (m6_annotated_fns * 100) / m6_total_fns
@@ -14865,6 +15629,9 @@ fn ai_native_pass(ast) {
     if m981_str_concat_in_loop > 0 {
         println("[ai-native] O(n^2) string concat: " + to_string(m981_str_concat_in_loop) + " site(s) in loops -> parts.push() + .join()")
     }
+    if m981_str_concat_rewrites > 0 {
+        println("[ai-native] string-concat rewrite (ROI #137): " + to_string(m981_str_concat_rewrites) + " site(s) rewritten to StringBuilder")
+    }
     if m982_arr_push_in_loop > 0 {
         println("[ai-native] O(n^2) array push: " + to_string(m982_arr_push_in_loop) + " site(s) in loops -> pre-allocate or mutable buffer")
     }
@@ -14879,6 +15646,9 @@ fn ai_native_pass(ast) {
     }
     if m986_redundant_tostring > 0 {
         println("[ai-native] redundant val_to_string: " + to_string(m986_redundant_tostring) + " site(s) in loops -> cache or batch")
+    }
+    if m987_map_chain_fused > 0 {
+        println("[ai-native] map chain fusion: " + to_string(m987_map_chain_fused) + " .map.map site(s) collapsed (ROI #138)")
     }
     // ROI #63: select pattern recognition (cmov conversion)
     out = anp_select_pass(out)
@@ -19138,6 +19908,703 @@ fn anp_string_match_pass(ast) {
             }
         }
         out = out.push(node)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  ROI #136: filter-first / any → find-first loop with early exit
+//  Patterns rewritten (statement-level only, RHS of let/const):
+//      arr.filter(p).first()       → find-first, bind matched elem
+//      arr.filter(p).head()        → same as .first()
+//      arr.any(p)                  → find-first returning bool
+//      arr.filter(p).len() > 0     → same as .any(p)
+//      arr.filter(p).len() != 0    → same as .any(p)
+//      arr.filter(p).len() >= 1    → same as .any(p)
+//
+//  Why: current map/filter codegen materializes the full filtered
+//  array then peeks index 0 — O(n) unconditional scan + O(n) alloc.
+//  A find-first loop is O(match_idx), zero alloc, with early exit.
+//
+//  Safety: predicate must be a 1-arg expression lambda whose body
+//  contains no impure builtins (println/print/exec/io/time/random)
+//  and no method-call sites we can't classify. We skip aggressive
+//  rewrites where the filter result is captured into a variable
+//  and reused — that's a separate (harder) DCE/forwarding problem.
+// ═══════════════════════════════════════════════════════════════
+
+// Disallowed builtins inside a "pure" predicate lambda body.
+// Mirrors self/attrs/pure.hexa _pure_forbidden_builtins (call-site form).
+fn ff_is_impure_builtin_name(nm) {
+    if nm == "println" { return true }
+    if nm == "eprintln" { return true }
+    if nm == "print" { return true }
+    if nm == "read_file" { return true }
+    if nm == "write_file" { return true }
+    if nm == "append_file" { return true }
+    if nm == "read_stdin" { return true }
+    if nm == "exec" { return true }
+    if nm == "system" { return true }
+    if nm == "env" { return true }
+    if nm == "getenv" { return true }
+    if nm == "setenv" { return true }
+    if nm == "now" { return true }
+    if nm == "now_iso" { return true }
+    if nm == "time" { return true }
+    if nm == "random" { return true }
+    if nm == "rand" { return true }
+    return false
+}
+
+// Walk an expression and report whether any nested Call invokes an
+// impure builtin. Conservative: returns true only when we KNOW the
+// callee is one of the forbidden idents. Unknown call targets are
+// allowed (the predicate may legitimately call user fns).
+fn ff_expr_has_impure_call(expr) {
+    if type_of(expr) == "string" { return false }
+    let k = expr.kind
+    if k == "Call" {
+        let callee = expr.left
+        if type_of(callee) != "string" {
+            if callee.kind == "Ident" && ff_is_impure_builtin_name(callee.name) { return true }
+            // method-call form: Field.left = receiver, Field.name = method
+            if callee.kind == "Field" {
+                if ff_is_impure_builtin_name(callee.name) { return true }
+                if ff_expr_has_impure_call(callee.left) { return true }
+            }
+        }
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                if ff_expr_has_impure_call(expr.args[ai]) { return true }
+                ai = ai + 1
+            }
+        }
+        return false
+    }
+    if k == "BinOp" {
+        if ff_expr_has_impure_call(expr.left) { return true }
+        if ff_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "UnaryOp" { return ff_expr_has_impure_call(expr.left) }
+    if k == "Index" {
+        if ff_expr_has_impure_call(expr.left) { return true }
+        if ff_expr_has_impure_call(expr.right) { return true }
+        return false
+    }
+    if k == "FieldAccess" || k == "Field" { return ff_expr_has_impure_call(expr.left) }
+    return false
+}
+
+// 1-arg expression lambda whose body looks pure enough to inline
+// inside an early-exit loop.
+fn ff_is_pure_predicate_lambda(expr) {
+    if !is_expr_lambda_1arg(expr) { return false }
+    if ff_expr_has_impure_call(expr.left) { return false }
+    return true
+}
+
+// Detect Field { name: <fname>, left: <inner> } shape used by
+// hexa's parser for method calls (`receiver.method(args)` is parsed
+// as Call { left: Field{name, left: receiver}, args }).
+fn ff_is_field_named(expr, fname) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Field" { return false }
+    return expr.name == fname
+}
+
+// Returns true if `expr` is `<inner>.filter(<lambda>)` where the
+// lambda is a 1-arg pure predicate.
+fn ff_is_filter_call(expr) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Call" { return false }
+    if !ff_is_field_named(expr.left, "filter") { return false }
+    if type_of(expr.args) != "array" { return false }
+    if len(expr.args) != 1 { return false }
+    return ff_is_pure_predicate_lambda(expr.args[0])
+}
+
+// Returns true if `expr` is `<inner>.<method>()` arg-less call.
+fn ff_is_arg_less_method(expr, method_name) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Call" { return false }
+    if !ff_is_field_named(expr.left, method_name) { return false }
+    if type_of(expr.args) != "array" { return false }
+    if len(expr.args) != 0 { return false }
+    return true
+}
+
+// Pattern descriptor returned from detect_filter_first_pattern.
+// kind:
+//   "first"     — bind first matching elem (sentinel "" if none)
+//   "any"       — return bool (true if any match)
+// Carries the source expression and the predicate lambda.
+fn ff_make_pattern(kind_str, src_expr, predicate_lambda) {
+    return AstNode {
+        kind: "__FFPattern", name: kind_str, value: "", op: "",
+        left: src_expr, right: predicate_lambda, cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// Inspect an RHS expression and classify it as one of the
+// rewritable patterns. Returns "" (string) on no match, or an
+// __FFPattern AstNode otherwise.
+fn detect_filter_first_pattern(expr) {
+    if type_of(expr) == "string" { return "" }
+    // arr.any(p) — direct, no .filter() prefix
+    if expr.kind == "Call" && ff_is_field_named(expr.left, "any") {
+        if type_of(expr.args) == "array" && len(expr.args) == 1 {
+            if ff_is_pure_predicate_lambda(expr.args[0]) {
+                return ff_make_pattern("any", expr.left.left, expr.args[0])
+            }
+        }
+        return ""
+    }
+    // arr.filter(p).first()  /  .head()
+    if expr.kind == "Call" {
+        if ff_is_arg_less_method(expr, "first") || ff_is_arg_less_method(expr, "head") {
+            let inner = expr.left.left
+            if ff_is_filter_call(inner) {
+                return ff_make_pattern("first", inner.left.left, inner.args[0])
+            }
+            return ""
+        }
+    }
+    // arr.filter(p).len() <op> <int> where op normalizes to "any":
+    //   .len() > 0 / != 0 / >= 1
+    if expr.kind == "BinOp" {
+        let op = expr.op
+        let lhs = expr.left
+        let rhs = expr.right
+        if type_of(lhs) != "string" && type_of(rhs) != "string" {
+            if rhs.kind == "IntLit" && ff_is_arg_less_method(lhs, "len") {
+                let inner = lhs.left.left
+                if ff_is_filter_call(inner) {
+                    let v = rhs.value
+                    let mut hit = false
+                    if op == ">" && v == "0" { hit = true }
+                    if op == "!=" && v == "0" { hit = true }
+                    if op == ">=" && v == "1" { hit = true }
+                    if hit {
+                        m136_filter_len_rewrites = m136_filter_len_rewrites + 1
+                        return ff_make_pattern("any", inner.left.left, inner.args[0])
+                    }
+                }
+            }
+        }
+    }
+    return ""
+}
+
+// Build the find-first loop statements, returning the list that
+// replaces the original LetStmt/LetMutStmt/ConstStmt.
+//
+// For pattern.kind == "first":
+//   let mut <bind> = ""                  // sentinel for "not found"
+//   let __ffsrc<N> = <src>
+//   let mut __ffi<N> = 0
+//   let mut __ffdone<N> = false
+//   while __ffi<N> < __ffsrc<N>.len() && !__ffdone<N> {
+//       let __ffe<N> = __ffsrc<N>[__ffi<N>]
+//       if <pred>(__ffe<N>) { <bind> = __ffe<N>; __ffdone<N> = true }
+//       __ffi<N> = __ffi<N> + 1
+//   }
+//
+// For pattern.kind == "any":
+//   let mut <bind> = false
+//   ...same loop, body sets <bind> = true; __ffdone<N> = true
+//
+// We use a __ffdone flag rather than a `break` keyword so the form
+// fuses cleanly with the existing while-cond infrastructure; a later
+// DCE / loop-cond simplifier can collapse the flag if desired.
+fn rewrite_filter_first(stmt, pattern, counter) {
+    let bind_name = stmt.name
+    let src_expr = pattern.left
+    let pred_lam = pattern.right
+    let pred_param = pred_lam.params[0]
+    let pred_body = pred_lam.left
+    let suffix = to_string(counter)
+    let src_var = "__ffsrc" + suffix
+    let idx_var = "__ffi" + suffix
+    let elem_var = "__ffe" + suffix
+    let done_var = "__ffdone" + suffix
+    // Initial bind for the result variable
+    let mut init_val = ""
+    if pattern.name == "any" {
+        init_val = make_bool_lit("false")
+    } else {
+        // "first" — empty-string sentinel for "not found" (matches
+        // existing placeholder convention used elsewhere in this file)
+        init_val = AstNode {
+            kind: "StringLit", name: "", value: "", op: "",
+            left: "", right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    let init_bind = make_let_mut_stmt(bind_name, init_val)
+    let bind_src = make_let_stmt(src_var, src_expr)
+    let init_idx = make_let_mut_stmt(idx_var, make_int_lit(0))
+    let init_done = make_let_mut_stmt(done_var, make_bool_lit("false"))
+    // Loop cond: idx < src.len() && !done
+    let len_field = AstNode {
+        kind: "Field", name: "len", value: "", op: "",
+        left: make_ident(src_var), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let len_call = AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: len_field, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let lt_cond = make_binop("<", make_ident(idx_var), len_call)
+    let not_done = AstNode {
+        kind: "UnaryOp", name: "", value: "", op: "!",
+        left: make_ident(done_var), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let loop_cond = make_binop("&&", lt_cond, not_done)
+    // elem bind + predicate inline
+    let elem_bind = make_let_stmt(elem_var, make_index(make_ident(src_var), make_ident(idx_var)))
+    let pred_applied = substitute_in_expr(pred_body, pred_param, make_ident(elem_var))
+    let mut then_stmts = []
+    if pattern.name == "any" {
+        then_stmts = then_stmts.push(make_assign_stmt(bind_name, make_bool_lit("true")))
+    } else {
+        then_stmts = then_stmts.push(make_assign_stmt(bind_name, make_ident(elem_var)))
+    }
+    then_stmts = then_stmts.push(make_assign_stmt(done_var, make_bool_lit("true")))
+    let if_node = AstNode {
+        kind: "IfStmt", name: "", value: "", op: "",
+        left: "", right: "", cond: pred_applied, then_body: then_stmts, else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let incr_idx = make_assign_stmt(idx_var, make_binop("+", make_ident(idx_var), make_int_lit(1)))
+    let loop_body = [elem_bind, if_node, incr_idx]
+    let while_s = make_while_stmt(loop_cond, loop_body)
+    return [init_bind, bind_src, init_idx, init_done, while_s]
+}
+
+// Body-level rewrite: scan each statement, rewrite matching let-bindings.
+// Recurses into nested while/if bodies so we don't miss sites in loops.
+fn ff_rewrite_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut i = 0
+    let mut counter = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        let mut emitted = false
+        if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+            let pat = detect_filter_first_pattern(stmt.left)
+            if type_of(pat) != "string" {
+                m136_filter_first_detected = m136_filter_first_detected + 1
+                let replacement = rewrite_filter_first(stmt, pat, counter)
+                let mut ri = 0
+                let rn = len(replacement)
+                while ri < rn {
+                    out = out.push(replacement[ri])
+                    ri = ri + 1
+                }
+                if pat.name == "any" {
+                    m136_any_rewrites = m136_any_rewrites + 1
+                } else {
+                    m136_filter_first_rewrites = m136_filter_first_rewrites + 1
+                }
+                counter = counter + 1
+                emitted = true
+            }
+        }
+        if !emitted {
+            // Recurse into nested control flow.
+            if k == "WhileStmt" {
+                let new_body = ff_rewrite_body(stmt.body)
+                out = out.push(AstNode {
+                    kind: "WhileStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond, then_body: "", else_body: "",
+                    params: "", body: new_body, args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else if k == "IfStmt" {
+                let new_then = ff_rewrite_body(stmt.then_body)
+                let mut new_else = stmt.else_body
+                if type_of(stmt.else_body) == "array" {
+                    new_else = ff_rewrite_body(stmt.else_body)
+                }
+                out = out.push(AstNode {
+                    kind: "IfStmt", name: "", value: "", op: "",
+                    left: "", right: "", cond: stmt.cond,
+                    then_body: new_then, else_body: new_else,
+                    params: "", body: "", args: "", fields: "", items: "",
+                    variants: "", arms: "", iter_expr: "", ret_type: "",
+                    target: "", trait_name: "", methods: ""
+                })
+            } else {
+                out = out.push(stmt)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Top-level pass: rewrite all FnDecls in `ast`.
+fn apply_filter_first_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            let before = m136_filter_first_detected
+            let new_body = ff_rewrite_body(node.body)
+            if m136_filter_first_detected > before {
+                out = out.push(rewrite_fn_with_body(node, new_body))
+                println("[ai-native] fn " + node.name + " REWRITE: filter-first/any → find-first loop ("
+                    + to_string(m136_filter_first_detected - before) + " site(s))")
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── ROI #136 inline test — builds tiny ASTs for the rewrite shape
+//    and asserts the rewrite produces a 5-stmt block ending in
+//    WhileStmt. Not auto-run; invoke explicitly via test_filter_first_pass()
+//    so the regular pass output stays clean.
+fn test_filter_first_pass() {
+    // Build: users.filter(|u| u.age > 30).first()
+    let arr_ident = make_ident("users")
+    let u_param = make_param("u")
+    let u_age = AstNode {
+        kind: "FieldAccess", name: "age", value: "", op: "",
+        left: make_ident("u"), right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let pred_body = make_binop(">", u_age, make_int_lit(30))
+    let lam = AstNode {
+        kind: "Lambda", name: "", value: "", op: "",
+        left: pred_body, right: "", cond: "", then_body: "", else_body: "",
+        params: [u_param], body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let filter_field = AstNode {
+        kind: "Field", name: "filter", value: "", op: "",
+        left: arr_ident, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let filter_call = AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: filter_field, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [lam], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let first_field = AstNode {
+        kind: "Field", name: "first", value: "", op: "",
+        left: filter_call, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let first_call = AstNode {
+        kind: "Call", name: "", value: "", op: "",
+        left: first_field, right: "", cond: "", then_body: "", else_body: "",
+        params: "", body: "", args: [], fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+    let pat = detect_filter_first_pattern(first_call)
+    if type_of(pat) == "string" {
+        println("[ff-test] FAIL: filter().first() not detected")
+        return
+    }
+    if pat.name != "first" {
+        println("[ff-test] FAIL: expected pattern 'first', got " + pat.name)
+        return
+    }
+    let stmt = make_let_stmt("oldest", first_call)
+    let rewritten = rewrite_filter_first(stmt, pat, 0)
+    if len(rewritten) != 5 {
+        println("[ff-test] FAIL: expected 5 stmts, got " + to_string(len(rewritten)))
+        return
+    }
+    if rewritten[4].kind != "WhileStmt" {
+        println("[ff-test] FAIL: stmt[4] not WhileStmt, got " + rewritten[4].kind)
+        return
+    }
+    println("[ff-test] OK: filter().first() → " + to_string(len(rewritten)) + " stmts incl. WhileStmt")
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// ROI #141 — `.sort().take(k)` / `.sort().first(k)` → Quickselect
+// Rewrites an AST call chain
+//     receiver.sort[_by](cmp?).take(k)
+//     receiver.sort[_by](cmp?).first(k)
+// into
+//     rt_top_k_sorted(receiver, k, cmp_or_default)
+// which is O(n + k log k) vs. the O(n log n) original.  The unordered
+// helper rt_top_k_unordered exists in self/rt/array_ops.hexa for
+// callers that do not need a sorted prefix; we emit the sorted form
+// here because the source language contract (sort().take) IS sorted.
+//
+// Precision (MUST reject, otherwise dropping sort changes semantics):
+//   R1. outer call must be `.take(k)` or `.first(k)` with exactly one
+//       arg — plain `.first()` means arr[0] (scalar), NEVER top-k.
+//   R2. inner call must be `.sort()` (0 args) or `.sort_by(cmp)`.
+//   R3. k argument is passed through; rt_top_k_sorted handles k>=n
+//       by falling back to full sort for correctness.
+// ═══════════════════════════════════════════════════════════════════
+
+// Returns true iff `expr` is Call{left: Field{name==fname, left:inner}, args}
+// with exactly `arity` args.
+fn r141_is_method_call(expr, fname, arity) {
+    if type_of(expr) == "string" { return false }
+    if expr.kind != "Call" { return false }
+    if type_of(expr.left) == "string" { return false }
+    if expr.left.kind != "Field" { return false }
+    if expr.left.name != fname { return false }
+    if type_of(expr.args) != "array" { return false }
+    if len(expr.args) != arity { return false }
+    return true
+}
+
+// Pattern descriptor: src receiver + k expr + optional cmp ("" = default)
+fn r141_make_pattern(src_expr, k_expr, cmp_expr) {
+    return AstNode {
+        kind: "__R141Pattern", name: "", value: "", op: "",
+        left: src_expr, right: k_expr, cond: cmp_expr, then_body: "", else_body: "",
+        params: "", body: "", args: "", fields: "", items: "",
+        variants: "", arms: "", iter_expr: "", ret_type: "",
+        target: "", trait_name: "", methods: ""
+    }
+}
+
+// Try to classify `expr` as a top-k pattern; returns "" on miss.
+// Accepts BOTH `.take(k)` and `.first(k)`; explicitly rejects the
+// arg-less `.first()` form (R1).
+fn detect_sort_topk_pattern(expr) {
+    if type_of(expr) == "string" { return "" }
+    if expr.kind != "Call" { return "" }
+    let is_take = r141_is_method_call(expr, "take", 1)
+    let is_first = r141_is_method_call(expr, "first", 1)
+    if !is_take && !is_first { return "" }
+    let inner = expr.left.left
+    if type_of(inner) == "string" { return "" }
+    if r141_is_method_call(inner, "sort", 0) {
+        let src = inner.left.left
+        return r141_make_pattern(src, expr.args[0], "")
+    }
+    if r141_is_method_call(inner, "sort_by", 1) {
+        let src = inner.left.left
+        return r141_make_pattern(src, expr.args[0], inner.args[0])
+    }
+    return ""
+}
+
+// Build the replacement expression: rt_top_k_sorted(<src>, <k>, <cmp>)
+fn rewrite_sort_topk_expr(pattern) {
+    let src_expr = pattern.left
+    let k_expr = pattern.right
+    let cmp_expr = pattern.cond
+    let mut cmp_arg = ""
+    if type_of(cmp_expr) == "string" {
+        cmp_arg = make_ident("rt_nth_cmp_default")
+    } else {
+        cmp_arg = cmp_expr
+    }
+    return make_call_node("rt_top_k_sorted", [src_expr, k_expr, cmp_arg])
+}
+
+// Walk an expression tree and replace any sort-top-k subexpression.
+fn r141_rewrite_expr(expr) {
+    if type_of(expr) == "string" { return expr }
+    let pat = detect_sort_topk_pattern(expr)
+    if type_of(pat) != "string" {
+        m_roi141_detected = m_roi141_detected + 1
+        m_roi141_rewrites_sorted = m_roi141_rewrites_sorted + 1
+        return rewrite_sort_topk_expr(pat)
+    }
+    let k = expr.kind
+    if k == "BinOp" {
+        return AstNode {
+            kind: "BinOp", name: "", value: "", op: expr.op,
+            left: r141_rewrite_expr(expr.left), right: r141_rewrite_expr(expr.right),
+            cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "UnaryOp" {
+        return AstNode {
+            kind: "UnaryOp", name: "", value: "", op: expr.op,
+            left: r141_rewrite_expr(expr.left), right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Call" {
+        let mut new_args = []
+        if type_of(expr.args) == "array" {
+            let mut ai = 0
+            while ai < len(expr.args) {
+                new_args = new_args.push(r141_rewrite_expr(expr.args[ai]))
+                ai = ai + 1
+            }
+        }
+        return AstNode {
+            kind: "Call", name: "", value: "", op: "",
+            left: r141_rewrite_expr(expr.left), right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: new_args, fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Field" {
+        return AstNode {
+            kind: "Field", name: expr.name, value: "", op: "",
+            left: r141_rewrite_expr(expr.left), right: "", cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    if k == "Index" {
+        return AstNode {
+            kind: "Index", name: "", value: "", op: "",
+            left: r141_rewrite_expr(expr.left), right: r141_rewrite_expr(expr.right),
+            cond: "", then_body: "", else_body: "",
+            params: "", body: "", args: "", fields: "", items: "",
+            variants: "", arms: "", iter_expr: "", ret_type: "",
+            target: "", trait_name: "", methods: ""
+        }
+    }
+    return expr
+}
+
+// Walk a body (stmt list) and rewrite sort-topk in RHS of let/assign/return.
+fn r141_rewrite_body(body) {
+    if type_of(body) != "array" { return body }
+    let n = len(body)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let stmt = body[i]
+        let k = stmt.kind
+        if k == "LetStmt" || k == "LetMutStmt" || k == "ConstStmt" {
+            out = out.push(AstNode {
+                kind: k, name: stmt.name, value: "", op: "",
+                left: r141_rewrite_expr(stmt.left), right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "AssignStmt" {
+            out = out.push(AstNode {
+                kind: "AssignStmt", name: "", value: "", op: "",
+                left: stmt.left, right: r141_rewrite_expr(stmt.right),
+                cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "ReturnStmt" {
+            out = out.push(AstNode {
+                kind: "ReturnStmt", name: "", value: "", op: "",
+                left: r141_rewrite_expr(stmt.left), right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "ExprStmt" {
+            out = out.push(AstNode {
+                kind: "ExprStmt", name: "", value: "", op: "",
+                left: r141_rewrite_expr(stmt.left), right: "", cond: "", then_body: "", else_body: "",
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "WhileStmt" {
+            out = out.push(AstNode {
+                kind: "WhileStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: r141_rewrite_expr(stmt.cond),
+                then_body: "", else_body: "",
+                params: "", body: r141_rewrite_body(stmt.body), args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else if k == "IfStmt" {
+            let mut eb = stmt.else_body
+            if type_of(stmt.else_body) == "array" {
+                eb = r141_rewrite_body(stmt.else_body)
+            }
+            out = out.push(AstNode {
+                kind: "IfStmt", name: "", value: "", op: "",
+                left: "", right: "", cond: r141_rewrite_expr(stmt.cond),
+                then_body: r141_rewrite_body(stmt.then_body), else_body: eb,
+                params: "", body: "", args: "", fields: "", items: "",
+                variants: "", arms: "", iter_expr: "", ret_type: "",
+                target: "", trait_name: "", methods: ""
+            })
+        } else {
+            out = out.push(stmt)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Top-level pass: rewrite all FnDecls in `ast`.
+fn apply_sort_topk_pass(ast) {
+    if type_of(ast) != "array" { return ast }
+    let mut out = []
+    let n = len(ast)
+    let mut i = 0
+    while i < n {
+        let node = ast[i]
+        if node.kind == "FnDecl" {
+            let before = m_roi141_detected
+            let new_body = r141_rewrite_body(node.body)
+            if m_roi141_detected > before {
+                out = out.push(rewrite_fn_with_body(node, new_body))
+                println("[ai-native] fn " + node.name + " REWRITE: sort().take/first(k) → rt_top_k_sorted ("
+                    + to_string(m_roi141_detected - before) + " site(s))")
+            } else {
+                out = out.push(node)
+            }
+        } else {
+            out = out.push(node)
+        }
         i = i + 1
     }
     return out
