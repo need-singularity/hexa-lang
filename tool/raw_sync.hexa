@@ -1,0 +1,607 @@
+#!hexa strict
+// tool/raw_sync.hexa — multi-repo .raw canonical sync (raw#0 P4)
+//
+// PURPOSE
+//   `.raw` 는 cross-project L0 universal rule. 이상적으로는 모든 repo 에서
+//   동일해야 한다. hexa-lang 이 canonical source-of-truth 이며, 다른 repo
+//   는 `.raw-ref` 파일로 canonical 추종을 선언한다. 본 tool 은 그 drift
+//   를 감지하고, 단방향 (canonical → follower) 동기화를 수행한다.
+//
+// CONCEPT
+//   · hexa-lang = canonical: `.raw-ref` 불필요.
+//   · follower  = `.raw-ref` 보유 repo: pinned-hash 로 drift 추적.
+//
+// `.raw-ref` FORMAT (hexa-like directive)
+//     ref 1 live "hexa-lang canonical"
+//       source github.com/need-singularity/hexa-lang
+//       branch main
+//       path .raw
+//       pinned-hash <sha256_of_raw_file>
+//       checked-at 2026-04-20T00:00:00Z
+//
+//   status (kind=`ref`):
+//     live     — active mirror, drift = error
+//     paused   — temporary divergence allowed (branch migration 등)
+//     archived — historical entry
+//
+//   NOTE: kind `ref` 는 raw_loader 의 5-kind header whitelist
+//   (raw|own|ext|roadmap|loop) 에 포함되지 않는다 — 본 파일이 custom
+//   파서를 제공한다. raw_loader 는 수정 금지.
+//
+// CLI
+//   ./hexa tool/raw_sync.hexa status   — local .raw sha256 vs pinned-hash
+//   ./hexa tool/raw_sync.hexa check    — fetch canonical + diff (network)
+//   ./hexa tool/raw_sync.hexa pull     — overwrite local .raw w/ canonical
+//                                         (unlock 필요, audit 자동 append)
+//   ./hexa tool/raw_sync.hexa push     — canonical PR hint (실행 X)
+//
+// EXIT CODES
+//   0 — SYNCED / IN_SYNC / hint 출력
+//   1 — DRIFT / BEHIND / error
+//   2 — usage / NO_REF / unsupported
+//
+// DEPENDENCIES
+//   · sha256sum | shasum -a 256   (raw_audit 와 동일)
+//   · curl                         (check/pull)
+//   · date, test, cp               (POSIX)
+//
+// STYLE
+//   raw_audit.hexa 의 ssot_fingerprint / audit_append 패턴 재활용.
+//   audit_append 는 sync-pull 이벤트를 기록한다.
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+// ─── constants ──────────────────────────────────────────────────
+
+fn _ref_path()   -> string { return ".raw-ref" }
+fn _raw_path()   -> string { return ".raw" }
+fn _example()    -> string { return ".raw-ref.example" }
+
+// ─── generic helpers ────────────────────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e " + _shell_quote(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = to_string(exec("test -f " + _shell_quote(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _epoch_now() -> string {
+    return to_string(exec("date -u +%s")).trim()
+}
+
+fn _is_darwin() -> bool {
+    return to_string(exec("uname -s")).trim() == "Darwin"
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+// sha256 of a single file — portable (macOS shasum / Linux sha256sum)
+fn _sha256_of(path: string) -> string {
+    if !_file_exists(path) { return "" }
+    let cmd = "sha256sum " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    let out1 = to_string(exec(cmd)).trim()
+    if out1 != "" { return out1 }
+    let cmd2 = "shasum -a 256 " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    return to_string(exec(cmd2)).trim()
+}
+
+// chflags uchg 감지 (macOS only) — 잠긴 상태에서 덮어쓰기 시도 시 우회 안 함
+fn _is_uchg_locked(path: string) -> bool {
+    if !_is_darwin() { return false }
+    let cmd = "ls -lO " + _shell_quote(path) + " 2>/dev/null | grep -q uchg && echo y || echo n"
+    return to_string(exec(cmd)).trim() == "y"
+}
+
+// ─── `.raw-ref` custom parser ───────────────────────────────────
+//
+// raw_loader 는 5-kind 만 허용하므로 여기서 직접 파싱한다. 허용 키:
+//   source, branch, path, pinned-hash, checked-at
+// 구조는 raw_loader 와 동일 (column-0 header / 2-space indented keys).
+//
+// 반환: refs — array of [id, status, name, keys]
+//   keys = array of [key, value]
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _is_valid_ref_status(s: string) -> bool {
+    return s == "live" || s == "paused" || s == "archived"
+}
+
+fn _is_valid_ref_key(k: string) -> bool {
+    if k == "source" { return true }
+    if k == "branch" { return true }
+    if k == "path"   { return true }
+    if k == "pinned-hash" { return true }
+    if k == "checked-at"  { return true }
+    return false
+}
+
+// parse header: `ref 1 live "hexa-lang canonical"` → [id, status, name]
+fn _parse_ref_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "ref" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_is_valid_ref_status(status) { return [] }
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_refs(path: string) -> array {
+    if !_file_exists(path) { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut refs = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has = false
+    let mut line_no = 0
+
+    for raw_line in lines {
+        line_no = line_no + 1
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has {
+                refs = refs.push([cur_id, cur_status, cur_name, cur_keys])
+                has = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if !has { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            if !_is_valid_ref_key(key) {
+                eprintln("warn[raw_sync]: " + path + ":" + to_string(line_no)
+                         + " unknown key '" + key + "'")
+                continue
+            }
+            cur_keys = cur_keys.push([key, val])
+        } else {
+            if has {
+                refs = refs.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_ref_header(line)
+            if len(hdr) == 0 {
+                eprintln("warn[raw_sync]: " + path + ":" + to_string(line_no)
+                         + " bad ref header — " + line)
+                has = false
+                continue
+            }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has = true
+        }
+    }
+    if has {
+        refs = refs.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return refs
+}
+
+fn _ref_key(ref: array, key: string) -> string {
+    let keys = ref[3]
+    for kv in keys {
+        if kv[0] == key { return kv[1] }
+    }
+    return ""
+}
+
+// first live ref — tools expect exactly one active canonical
+fn _primary_ref(refs: array) -> array {
+    for r in refs {
+        if r[1] == "live" { return r }
+    }
+    if len(refs) > 0 { return refs[0] }
+    return []
+}
+
+// ─── canonical URL derivation ───────────────────────────────────
+//
+// source=`github.com/need-singularity/hexa-lang`, branch=main, path=.raw
+// → https://raw.githubusercontent.com/need-singularity/hexa-lang/main/.raw
+
+fn _derive_raw_url(source: string, branch: string, ipath: string) -> string {
+    // strip protocol if present
+    let mut src = source
+    if src.index_of("://") >= 0 {
+        let p = src.index_of("://")
+        src = src.substring(p + 3, len(src))
+    }
+    // only github.com is supported for now
+    let prefix = "github.com/"
+    if src.index_of(prefix) != 0 {
+        return ""
+    }
+    let rest = src.substring(len(prefix), len(src))
+    return "https://raw.githubusercontent.com/" + rest + "/" + branch + "/" + ipath
+}
+
+// ─── CLI commands ───────────────────────────────────────────────
+
+fn _print_no_ref() {
+    println("NO_REF — this repo is not tracking a canonical .raw")
+    println("")
+    println("To declare canonical tracking:")
+    println("  cp " + _example() + " " + _ref_path())
+    println("  ./hexa tool/raw_sync.hexa check   # fetch + fill pinned-hash")
+    println("")
+    println("If this repo IS the canonical (e.g. hexa-lang itself), .raw-ref is")
+    println("intentionally absent.")
+}
+
+fn cmd_status() -> int {
+    if !_file_exists(_ref_path()) {
+        _print_no_ref()
+        return 2
+    }
+    let refs = _load_refs(_ref_path())
+    let ref = _primary_ref(refs)
+    if len(ref) == 0 {
+        eprintln("raw_sync: no ref entries in " + _ref_path())
+        return 1
+    }
+    let pinned = _ref_key(ref, "pinned-hash")
+    let checked_at = _ref_key(ref, "checked-at")
+    let name = ref[2]
+
+    if !_file_exists(_raw_path()) {
+        eprintln("raw_sync: local " + _raw_path() + " missing")
+        return 1
+    }
+    let local = _sha256_of(_raw_path())
+
+    if pinned == "" || pinned == "TO_BE_FILLED_ON_FIRST_SYNC" {
+        println("UNINITIALIZED — pinned-hash not yet recorded")
+        println("  canonical: " + name)
+        println("  local sha: " + local)
+        println("  run `./hexa tool/raw_sync.hexa check` to populate pinned-hash")
+        return 1
+    }
+
+    if local == pinned {
+        println("SYNCED")
+        println("  canonical: " + name)
+        println("  sha:       " + local)
+        println("  checked-at:" + checked_at)
+        return 0
+    }
+    println("DRIFT")
+    println("  canonical:  " + name)
+    println("  local hash: " + local)
+    println("  pinned:     " + pinned)
+    println("  checked-at: " + checked_at)
+    println("")
+    println("Resolve:")
+    println("  · accept canonical: ./hexa tool/raw_sync.hexa pull")
+    println("  · propose upstream: ./hexa tool/raw_sync.hexa push")
+    return 1
+}
+
+// fetch canonical .raw → /tmp/canonical_raw_<ts>; print path or "" on failure
+fn _fetch_canonical(url: string) -> string {
+    let ts = _epoch_now()
+    let dst = "/tmp/canonical_raw_" + ts
+    let cmd = "curl -fsSL " + _shell_quote(url)
+            + " -o " + _shell_quote(dst) + " 2>/dev/null"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 { return "" }
+    if !_file_exists(dst) { return "" }
+    return dst
+}
+
+fn cmd_check() -> int {
+    if !_file_exists(_ref_path()) {
+        _print_no_ref()
+        return 2
+    }
+    let refs = _load_refs(_ref_path())
+    let ref = _primary_ref(refs)
+    if len(ref) == 0 {
+        eprintln("raw_sync: no ref entries in " + _ref_path())
+        return 1
+    }
+    let source = _ref_key(ref, "source")
+    let branch = _ref_key(ref, "branch")
+    let ipath  = _ref_key(ref, "path")
+    if source == "" || branch == "" || ipath == "" {
+        eprintln("raw_sync: ref missing source/branch/path")
+        return 1
+    }
+    let url = _derive_raw_url(source, branch, ipath)
+    if url == "" {
+        eprintln("raw_sync: unsupported source (github.com/... only): " + source)
+        return 2
+    }
+    println("fetching canonical: " + url)
+    let tmp = _fetch_canonical(url)
+    if tmp == "" {
+        eprintln("raw_sync: curl failed (network? auth? path?)")
+        return 1
+    }
+    let remote_sha = _sha256_of(tmp)
+    let local_sha = _sha256_of(_raw_path())
+    println("  local  sha: " + local_sha)
+    println("  remote sha: " + remote_sha)
+
+    if remote_sha == local_sha {
+        println("IN_SYNC with canonical")
+        return 0
+    }
+    println("BEHIND — run `./hexa tool/raw_sync.hexa pull` to update (requires unlock)")
+    println("")
+    println("diff (first 50 lines):")
+    let diff_cmd = "diff " + _shell_quote(_raw_path()) + " " + _shell_quote(tmp)
+                  + " | head -50"
+    let out = to_string(exec(diff_cmd))
+    print(out)
+    return 1
+}
+
+// rewrite .raw-ref with updated pinned-hash / checked-at
+// only single `ref 1 live` is handled; multi-ref repos keep stable order.
+fn _update_ref_file(new_sha: string, new_ts: string) -> bool {
+    if !_file_exists(_ref_path()) { return false }
+    let src = to_string(read_file(_ref_path()))
+    let lines = split(src, "\n")
+    let mut out = ""
+    let mut first = true
+    // track whether we are inside the primary (first live) block
+    let mut in_primary = false
+    let mut found_primary = false
+
+    for raw_line in lines {
+        let line = raw_line
+        let stripped = _rstrip(line)
+        let emit_nl = first ? "" : "\n"
+        first = false
+
+        if len(stripped) == 0 {
+            if in_primary { in_primary = false }
+            out = out + emit_nl + line
+            continue
+        }
+
+        let lead = stripped.substring(0, 1)
+        if lead == "#" {
+            out = out + emit_nl + line
+            continue
+        }
+
+        if lead != " " && lead != "\t" {
+            // header line
+            let hdr = _parse_ref_header(stripped)
+            if len(hdr) >= 2 && hdr[1] == "live" && !found_primary {
+                in_primary = true
+                found_primary = true
+            } else {
+                in_primary = false
+            }
+            out = out + emit_nl + line
+            continue
+        }
+
+        // indented key line
+        if in_primary {
+            let body = line.trim_start()
+            let sp = body.index_of(" ")
+            let key = sp < 0 ? body : body.substring(0, sp)
+            if key == "pinned-hash" {
+                out = out + emit_nl + "  pinned-hash " + new_sha
+                continue
+            }
+            if key == "checked-at" {
+                out = out + emit_nl + "  checked-at " + new_ts
+                continue
+            }
+        }
+        out = out + emit_nl + line
+    }
+    let ok = safe_write_file(_ref_path(), out)
+    return ok
+}
+
+fn cmd_pull() -> int {
+    if !_file_exists(_ref_path()) {
+        _print_no_ref()
+        return 2
+    }
+    // chflags uchg 사전 체크 — 사용자에게 친절한 안내
+    if _is_uchg_locked(_raw_path()) {
+        eprintln("raw_sync: " + _raw_path() + " is chflags uchg — locked.")
+        eprintln("  Run first:  ./hx unlock --reason \"sync .raw from canonical\"")
+        eprintln("  Then retry: ./hexa tool/raw_sync.hexa pull")
+        return 1
+    }
+
+    let refs = _load_refs(_ref_path())
+    let ref = _primary_ref(refs)
+    if len(ref) == 0 {
+        eprintln("raw_sync: no ref entries in " + _ref_path())
+        return 1
+    }
+    let source = _ref_key(ref, "source")
+    let branch = _ref_key(ref, "branch")
+    let ipath  = _ref_key(ref, "path")
+    let url = _derive_raw_url(source, branch, ipath)
+    if url == "" {
+        eprintln("raw_sync: unsupported source: " + source)
+        return 2
+    }
+
+    let tmp = _fetch_canonical(url)
+    if tmp == "" {
+        eprintln("raw_sync: curl failed")
+        return 1
+    }
+
+    let sha_before = _sha256_of(_raw_path())
+    let remote_sha = _sha256_of(tmp)
+
+    if sha_before == remote_sha {
+        println("already IN_SYNC — nothing to pull")
+        // still refresh checked-at
+        let now = _iso_utc_now()
+        let _u = _update_ref_file(remote_sha, now)
+        return 0
+    }
+
+    // backup
+    let stamp = to_string(exec("date -u +\"%Y%m%d_%H%M%S\"")).trim()
+    let bak = _raw_path() + ".bak." + stamp
+    let rb = exec_with_status("cp " + _shell_quote(_raw_path()) + " " + _shell_quote(bak))
+    if rb[1] != 0 {
+        eprintln("raw_sync: backup failed → " + bak)
+        return 1
+    }
+    println("backup: " + bak)
+
+    // overwrite
+    let rc = exec_with_status("cp " + _shell_quote(tmp) + " " + _shell_quote(_raw_path()))
+    if rc[1] != 0 {
+        eprintln("raw_sync: overwrite failed")
+        return 1
+    }
+
+    let sha_after = _sha256_of(_raw_path())
+    let now = _iso_utc_now()
+    let upd = _update_ref_file(sha_after, now)
+    if !upd {
+        eprintln("raw_sync: WARN — .raw-ref update failed (pinned-hash stale)")
+    }
+
+    // audit trail
+    let _a = audit_append("sync-pull", _current_user(), "canonical pull from " + source,
+                          "ok", sha_before, sha_after)
+
+    println("PULLED")
+    println("  before: " + sha_before)
+    println("  after:  " + sha_after)
+    println("  backup: " + bak)
+    println("")
+    println("Next: re-lock .raw (if Level 2): ./hx lock")
+    return 0
+}
+
+fn cmd_push() -> int {
+    if !_file_exists(_ref_path()) {
+        _print_no_ref()
+        return 2
+    }
+    let refs = _load_refs(_ref_path())
+    let ref = _primary_ref(refs)
+    if len(ref) == 0 {
+        eprintln("raw_sync: no ref entries in " + _ref_path())
+        return 1
+    }
+    let source = _ref_key(ref, "source")
+    let branch = _ref_key(ref, "branch")
+    let name = ref[2]
+
+    println("not implemented — requires PR to canonical repo.")
+    println("")
+    println("Canonical: " + name + " (" + source + "@" + branch + ")")
+    println("")
+    println("Manual workflow (execute yourself; raw_sync will NOT run these):")
+    println("")
+    let stamp = _epoch_now()
+    let clone_dir = "/tmp/canonical-" + stamp
+    println("  git clone https://" + source + " " + clone_dir)
+    println("  cp .raw " + clone_dir + "/.raw")
+    println("  cd " + clone_dir)
+    println("  ./hx unlock --reason \"sync .raw from follower\"")
+    println("  cp /dev/stdin .raw  # (or editor merge)")
+    println("  ./hx lock")
+    println("  ./hx commit -m \"sync(raw#0): update from follower repo\"")
+    println("  gh pr create --title \"raw sync\" --body \"Propose .raw update from follower.\"")
+    println("")
+    println("Rationale: push direction is rare — canonical evolves in hexa-lang first.")
+    println("Only use this if your follower repo genuinely leads on a rule.")
+    return 0
+}
+
+// ─── entry point ────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_sync.hexa <status|check|pull|push>")
+    eprintln("")
+    eprintln("  status — local .raw sha256 vs pinned-hash in .raw-ref")
+    eprintln("  check  — fetch canonical .raw (curl) + diff")
+    eprintln("  pull   — overwrite local .raw with canonical (needs unlock)")
+    eprintln("  push   — print PR hint to canonical repo (no-op execution)")
+}
+
+let _av = argv()
+let mut cmd = ""
+let mut i = 2
+while i < len(_av) {
+    let a = _av[i]
+    if a == "status" || a == "check" || a == "pull" || a == "push" { cmd = a }
+    i = i + 1
+}
+
+if cmd == "" {
+    _usage()
+    exit(2)
+}
+
+let mut rc = 0
+if cmd == "status"      { rc = cmd_status() }
+else if cmd == "check"  { rc = cmd_check() }
+else if cmd == "pull"   { rc = cmd_pull() }
+else if cmd == "push"   { rc = cmd_push() }
+else {
+    _usage()
+    exit(2)
+}
+exit(rc)
