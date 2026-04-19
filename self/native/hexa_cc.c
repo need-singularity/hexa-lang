@@ -2470,9 +2470,15 @@ HexaVal parse_assert_stmt(void) {
 
 
 HexaVal parse_resume_stmt(void) {
+    /* P51: bare `resume` (no expr) valid — guards Newline/RBrace/Eof
+     * to avoid empty-LHS ident fall-through when resume appears at
+     * end of handler body. */
     __hexa_fn_arena_enter();
     p_advance();
-    HexaVal expr = parse_expr();
+    HexaVal expr = hexa_str("");
+    if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Newline"))))) && hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("RBrace"))))))) && hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(p_peek_kind(), hexa_str("Eof")))))))) {
+        expr = parse_expr();
+    }
     return __hexa_fn_arena_return(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_set(hexa_map_new(), "kind", hexa_str("Resume")), "name", hexa_str("")), "value", hexa_str("")), "op", hexa_str("")), "left", expr), "right", hexa_str("")), "cond", hexa_str("")), "then_body", hexa_str("")), "else_body", hexa_str("")), "params", hexa_str("")), "body", hexa_str("")), "args", hexa_str("")), "fields", hexa_str("")), "items", hexa_str("")), "variants", hexa_str("")), "arms", hexa_str("")), "iter_expr", hexa_str("")), "ret_type", hexa_str("")), "target", hexa_str("")), "trait_name", hexa_str("")), "methods", hexa_str("")));
     return __hexa_fn_arena_return(hexa_void());
 }
