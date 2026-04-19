@@ -2719,10 +2719,42 @@ HexaVal hexa_exec_replace(HexaVal cmd) {
 
 // ── Stderr ──────────────────────────────────────────
 void hexa_eprint_val(HexaVal v) {
-    if (HX_IS_STR(v)) fprintf(stderr, "%s", HX_STR(v));
+    // 2026-04-20 silent-fallback fix: prior body dropped TAG_VOID /
+    // TAG_ARRAY / TAG_MAP / TAG_VALSTRUCT entirely (no output, not even
+    // "<value>"). User-visible path is eprintln(arr) / eprintln(map) —
+    // emitting nothing is strictly worse than the hexa_to_string repr.
+    // One-hop TAG_VALSTRUCT unwrap mirrors hexa_print_val.
+    if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
+        HexaValStruct* vs = HX_VS(v);
+        switch (vs->tag_i) {
+            case TAG_INT:   fprintf(stderr, "%lld", (long long)vs->int_val); return;
+            case TAG_FLOAT: fprintf(stderr, "%g", vs->float_val); return;
+            case TAG_BOOL:  fprintf(stderr, "%s", vs->bool_val ? "true" : "false"); return;
+            case TAG_STR: {
+                const char* cs = HX_STR(vs->str_val);
+                if (cs) { fprintf(stderr, "%s", cs); return; }
+                break;
+            }
+            case TAG_VOID:  fprintf(stderr, "void"); return;
+        }
+        // fall through for compound inner tags
+    }
+    if (HX_IS_STR(v)) {
+        if (HX_STR(v)) fprintf(stderr, "%s", HX_STR(v));
+        else fprintf(stderr, "<str null>");
+    }
     else if (HX_IS_INT(v)) fprintf(stderr, "%lld", (long long)HX_INT(v));
     else if (HX_IS_FLOAT(v)) fprintf(stderr, "%g", HX_FLOAT(v));
     else if (HX_IS_BOOL(v)) fprintf(stderr, HX_BOOL(v) ? "true" : "false");
+    else if (HX_IS_VOID(v)) fprintf(stderr, "void");
+    else if (HX_IS_ARRAY(v) || HX_IS_MAP(v)) {
+        // Delegate to hexa_to_string for container repr (depth/element
+        // caps are inherited). Guards against null arr/map pointers.
+        HexaVal s = hexa_to_string(v);
+        if (HX_IS_STR(s) && HX_STR(s)) fprintf(stderr, "%s", HX_STR(s));
+        else fprintf(stderr, "<value>");
+    }
+    else fprintf(stderr, "<value>");
 }
 
 // ── Try/catch (setjmp based) ────────────────────────
@@ -2801,6 +2833,15 @@ void hexa_print_val(HexaVal v) {
             }
             printf("]");
             break;
+        case TAG_MAP: {
+            // 2026-04-20 silent-fallback fix: TAG_MAP branch added.
+            // Prior default emitted "<value>" — lossy for println(map).
+            // Delegate to hexa_to_string so depth/element caps apply.
+            HexaVal s = hexa_to_string(v);
+            if (HX_IS_STR(s) && HX_STR(s)) printf("%s", HX_STR(s));
+            else printf("<value>");
+            break;
+        }
         default: printf("<value>"); break;
     }
 }
@@ -2840,6 +2881,16 @@ HexaVal hexa_eprintln(HexaVal v) {
             else fprintf(stderr, "<str null>\n");
             break;
         case TAG_VOID: fprintf(stderr, "void\n"); break;
+        case TAG_ARRAY:
+        case TAG_MAP: {
+            // 2026-04-20 silent-fallback fix: TAG_ARRAY/TAG_MAP branches
+            // added. Prior default emitted "<value>\n" — lossy for
+            // eprintln(arr) / eprintln(map). Delegate to hexa_to_string.
+            HexaVal s = hexa_to_string(v);
+            if (HX_IS_STR(s) && HX_STR(s)) fprintf(stderr, "%s\n", HX_STR(s));
+            else fprintf(stderr, "<value>\n");
+            break;
+        }
         default: fprintf(stderr, "<value>\n"); break;
     }
     return hexa_void();
@@ -2847,7 +2898,23 @@ HexaVal hexa_eprintln(HexaVal v) {
 
 // ── to_string ────────────────────────────────────────────
 
+// 2026-04-20 container-repr fix: TAG_ARRAY/TAG_MAP branches added so
+// `str(arr)` / `str(map)` produce readable `[e1, e2]` / `{k: v, ...}`
+// output instead of the "<value>" fallback. Mirrors hexa_print_val
+// (runtime.c:2796) which already handled TAG_ARRAY — the asymmetry
+// between hexa_print_val (direct print) and hexa_to_string (string
+// concat via `+`) was surfacing as `"arr=" + str(arr) -> "arr=<value>"`.
+// Guards: recursion depth cap (8) to prevent stack blow-up on cyclic
+// references; element cap (64) so a 1M-element tensor-as-array does
+// not allocate a multi-MB string; null pointer guards on arr_ptr /
+// map_ptr / order_keys before deref (T33 arena-dangling defence).
+static HexaVal _hexa_to_string_rec(HexaVal v, int depth);
+
 HexaVal hexa_to_string(HexaVal v) {
+    return _hexa_to_string_rec(v, 0);
+}
+
+static HexaVal _hexa_to_string_rec(HexaVal v, int depth) {
     if (!_cached_strs_ready) _hexa_init_cached_strs();
     char buf[64];
     switch (HX_TAG(v)) {
@@ -2871,6 +2938,49 @@ HexaVal hexa_to_string(HexaVal v) {
             snprintf(buf, 64, "Val{tag=%lld,i=%lld}",
                 (long long)HX_VSF(v, tag_i), (long long)HX_VSF(v, int_val));
             return hexa_str(buf);
+        }
+        case TAG_ARRAY: {
+            if (depth >= 8) return hexa_str("[...]");
+            if (!v.arr_ptr) return hexa_str("[<null>]");
+            int n = HX_ARR_LEN(v);
+            int cap = 64;  // element-dump cap
+            HexaVal out = hexa_str("[");
+            HexaVal sep = hexa_str(", ");
+            int shown = n < cap ? n : cap;
+            for (int i = 0; i < shown; i++) {
+                if (i > 0) out = hexa_str_concat(out, sep);
+                out = hexa_str_concat(out, _hexa_to_string_rec(HX_ARR_ITEMS(v)[i], depth + 1));
+            }
+            if (n > cap) {
+                snprintf(buf, 64, ", ... (%d more)", n - cap);
+                out = hexa_str_concat(out, hexa_str(buf));
+            }
+            out = hexa_str_concat(out, hexa_str("]"));
+            return out;
+        }
+        case TAG_MAP: {
+            if (depth >= 8) return hexa_str("{...}");
+            HexaMapTable* t = HX_MAP_TBL(v);
+            if (!t) return hexa_str("{}");
+            int n = t->len;
+            int cap = 64;
+            HexaVal out = hexa_str("{");
+            HexaVal sep = hexa_str(", ");
+            HexaVal kv_sep = hexa_str(": ");
+            int shown = n < cap ? n : cap;
+            for (int i = 0; i < shown; i++) {
+                if (i > 0) out = hexa_str_concat(out, sep);
+                const char* k = (t->order_keys && t->order_keys[i]) ? t->order_keys[i] : "<null>";
+                out = hexa_str_concat(out, hexa_str(k));
+                out = hexa_str_concat(out, kv_sep);
+                out = hexa_str_concat(out, _hexa_to_string_rec(t->order_vals[i], depth + 1));
+            }
+            if (n > cap) {
+                snprintf(buf, 64, ", ... (%d more)", n - cap);
+                out = hexa_str_concat(out, hexa_str(buf));
+            }
+            out = hexa_str_concat(out, hexa_str("}"));
+            return out;
         }
         default: return _cached_str_value;
     }
