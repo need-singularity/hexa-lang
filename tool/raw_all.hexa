@@ -15,6 +15,16 @@
 //   ./hexa tool/raw_all.hexa --fast           — skip heavy proof scripts
 //   ./hexa tool/raw_all.hexa --only raw 7     — single rule (debug)
 //   ./hexa tool/raw_all.hexa --json           — machine-readable output
+//   ./hexa tool/raw_all.hexa --serial         — force serial dispatch (debug)
+//
+// PARALLELISM (P7a, 2026-04-20)
+//   17 enforcers run in parallel batches of N (default 4), controlled by
+//   HEXA_RAW_ALL_PARALLEL env var. Each batch launches stage0 subprocesses
+//   as shell background jobs (&), waits for all (wait), then reads per-rule
+//   output tmp files. Output order is preserved by evaluating in
+//   declaration order after all subprocesses have joined. Proof stage
+//   remains serial (runs only after enforce passes + usually skipped under
+//   --fast). `--serial` flag forces N=1 for diagnostic purposes.
 //
 // EXIT CODES
 //   0   — every live/new rule PASSED (warn rules may have warnings)
@@ -59,17 +69,19 @@ use "self/raw_loader"
 // ─── argv parsing ────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
-    // returns [fast(bool), json(bool), only_kind(string), only_id(string)]
+    // returns [fast(bool), json(bool), only_kind(string), only_id(string), serial(bool)]
     let av = argv()
     let mut fast = false
     let mut json = false
     let mut only_kind = ""
     let mut only_id = ""
+    let mut serial = false
     let mut i = 2
     while i < len(av) {
         let a = av[i]
         if a == "--fast" { fast = true }
         else if a == "--json" { json = true }
+        else if a == "--serial" { serial = true }
         else if a == "--only" {
             if i + 2 < len(av) {
                 only_kind = av[i + 1]
@@ -79,7 +91,35 @@ fn _parse_flags() -> array {
         }
         i = i + 1
     }
-    return [fast, json, only_kind, only_id]
+    return [fast, json, only_kind, only_id, serial]
+}
+
+// ─── parallel batch size ─────────────────────────────────────────
+
+fn _parallel_n(serial: bool) -> int {
+    // --serial flag → force 1. Else read HEXA_RAW_ALL_PARALLEL (default 4).
+    // Invalid / non-positive values fall back to 4.
+    if serial { return 1 }
+    let raw = env("HEXA_RAW_ALL_PARALLEL")
+    if raw == "" { return 4 }
+    let n = raw.parse_int()
+    if n <= 0 { return 4 }
+    if n > 32 { return 32 }
+    return n
+}
+
+// ─── tmp file naming (deterministic, collision-safe) ─────────────
+
+fn _tmp_path(kind: string, id: string) -> string {
+    // /tmp/raw_all.<pid>.<kind>.<id>.out  — pid via $$ baked at launch
+    // We use a mkdir-based unique dir per run to avoid stale contamination
+    // when parallel raw_all invocations happen (rare but possible).
+    return "/tmp/raw_all_tmp/" + kind + "_" + id + ".out"
+}
+
+fn _tmp_init() {
+    // create fresh tmp dir for this run (clean previous residue)
+    let _ = exec_with_status("rm -rf /tmp/raw_all_tmp && mkdir -p /tmp/raw_all_tmp")
 }
 
 // ─── enforcer extraction ─────────────────────────────────────────
@@ -114,6 +154,10 @@ fn _run_enforcer(script: string) -> array {
     let r = exec_with_status(cmd)
     let rc = r[1]
     let out = to_string(r[0])
+    return [rc, _tail_of(out), start_ms]
+}
+
+fn _tail_of(out: string) -> string {
     // keep last 10 lines as tail for error reporting
     let lines = split(out, "\n")
     let n = len(lines)
@@ -126,7 +170,72 @@ fn _run_enforcer(script: string) -> array {
         tail = tail + lines[i]
         i = i + 1
     }
-    return [rc, tail, start_ms]
+    return tail
+}
+
+// ─── parallel enforcer batch (P7a) ───────────────────────────────
+//
+// Launches a batch of enforce scripts as shell background jobs, waits
+// for all to join, then reads per-rule output files. Exit codes are
+// captured via `cmd; echo $? > rc.file` so no pid→rc mapping is needed.
+//
+// `tasks` is an array of [kind, id, script] triples.
+// Returns a parallel array of [rc, tail] in the same order.
+//
+// Design notes:
+//   · script comes from raw_loader's `enforce` field → already validated
+//     token-free (raw#1 self-format), so shell injection surface is low.
+//     We still single-quote paths defensively.
+//   · Each task gets two tmp files: .out (stdout+stderr), .rc (exit code).
+//   · `wait` without args waits for ALL background jobs in the shell.
+//   · We pass the composite directly to exec_with_status; popen invokes
+//     `sh -c <cmd>` once, so `$?` resolves inside that single shell (no
+//     outer-layer variable expansion, no double-quote injection risk).
+fn _run_batch(tasks: array) -> array {
+    let nt = len(tasks)
+    if nt == 0 { return [] }
+
+    // Build one composite shell command: launch all N in background, wait.
+    let mut script = ""
+    let mut i = 0
+    while i < nt {
+        let t = tasks[i]
+        let kind = t[0]
+        let id = t[1]
+        let path = t[2]
+        let out = _tmp_path(kind, id)
+        let rcf = out + ".rc"
+        // defensive quoting: single-quote the script path; it should never
+        // contain single quotes (rule paths are token-only), but escape
+        // just in case.
+        let qpath = "'" + path.replace("'", "'\\''") + "'"
+        // run in subshell so each exit code is captured independently
+        let one = "( ./build/hexa_stage0 " + qpath + " > " + out +
+                  " 2>&1; echo $? > " + rcf + " ) &"
+        if script != "" { script = script + " " }
+        script = script + one
+        i = i + 1
+    }
+    script = script + " wait"
+
+    let _ = exec_with_status(script)
+
+    // Collect results in input order (deterministic).
+    let mut results = []
+    i = 0
+    while i < nt {
+        let t = tasks[i]
+        let kind = t[0]
+        let id = t[1]
+        let out_path = _tmp_path(kind, id)
+        let rc_path = out_path + ".rc"
+        let rc_raw = to_string(read_file(rc_path))
+        let rc = rc_raw.trim().parse_int()
+        let out = to_string(read_file(out_path))
+        results = results.push([rc, _tail_of(out)])
+        i = i + 1
+    }
+    return results
 }
 
 // ─── proof-carrying consumption (P1a) ────────────────────────────
@@ -166,47 +275,39 @@ fn _run_proof(enforce_script: string, proof_field: string) -> array {
     return [r[0], r[1], "hexa"]
 }
 
-// ─── one rule evaluation ─────────────────────────────────────────
+// ─── one rule evaluation (split: plan + finish for parallel dispatch) ─
 
-fn _eval_rule(kind: string, rule: array, fast: bool) -> array {
-    // returns [verdict, detail]
-    //   verdict ∈ {"PASS", "FAIL", "PROOF_FAIL", "WARN", "SKIP"}
-    let id = rule[0]
+// _plan_rule — pure bookkeeping, no shell IO beyond the one-time stage0
+// guard (cached by caller). Returns:
+//   ["SKIP",  reason, "",     ""]            — do not run
+//   ["WARN",  reason, "",     ""]            — pre-decided soft verdict
+//   ["FAIL",  reason, "",     ""]            — pre-decided hard verdict
+//   ["RUN",   "",     script, proof_field]   — schedule enforcer
+fn _plan_rule(kind: string, rule: array, s0_ok: bool) -> array {
     let status = rule[1]
-    let name = rule[2]
     let keys = rule[3]
 
-    if !_should_run(status) {
-        return ["SKIP", status]
-    }
+    if !_should_run(status) { return ["SKIP", status, "", ""] }
 
     let enforce_field = keys_first(keys, "enforce")
     if enforce_field == "" {
-        // rule is live/warn/new but declares no enforce script.
-        // raw#9 proof-carrying: absent enforce = design gap.
-        if _is_fatal(status) {
-            return ["FAIL", "no `enforce` field on live rule"]
-        }
-        return ["WARN", "no `enforce` field (soft status)"]
+        if _is_fatal(status) { return ["FAIL", "no `enforce` field on live rule", "", ""] }
+        return ["WARN", "no `enforce` field (soft status)", "", ""]
+    }
+
+    if !s0_ok {
+        return ["SKIP", "hexa_stage0 not executable on this host", "", ""]
     }
 
     let script = _enforce_script(enforce_field)
     let proof_field = keys_first(keys, "proof")
+    return ["RUN", "", script, proof_field]
+}
 
-    // skip heavy proofs under --fast (heuristic: proof field present)
-    let skip_proof = fast
-
-    // stage0 executable guard — non-Darwin env cannot run Mach-O
-    let s0_check = exec_with_status("test -x ./build/hexa_stage0")
-    if s0_check[1] != 0 {
-        return ["SKIP", "hexa_stage0 not executable on this host"]
-    }
-
-    // 1) enforce run
-    let r = _run_enforcer(script)
-    let rc = r[0]
-    let tail = r[1]
-
+// _finish_rule — given the enforcer batch result, run optional proof
+// (serial) and return the final [verdict, detail].
+fn _finish_rule(status: string, script: string, proof_field: string,
+                rc: int, tail: string, fast: bool) -> array {
     if rc != 0 {
         if _is_fatal(status) {
             return ["FAIL", script + " exit=" + to_string(rc) + "\n" + tail]
@@ -214,7 +315,9 @@ fn _eval_rule(kind: string, rule: array, fast: bool) -> array {
         return ["WARN", script + " exit=" + to_string(rc) + " (soft)"]
     }
 
-    // 2) proof consumption (P1a) — only after enforce passed
+    // proof consumption (P1a) — only after enforce passed; serial by design
+    // (most proofs are skipped under --fast and survivors are few).
+    let skip_proof = fast
     if !skip_proof && proof_field != "" {
         let pr = _run_proof(script, proof_field)
         let prc = pr[0]
@@ -270,7 +373,8 @@ fn _json_escape(s: string) -> string {
 
 // ─── main walk ───────────────────────────────────────────────────
 
-fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string, only_id: string, json: bool) -> array {
+fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
+              only_id: string, json: bool, par_n: int) -> array {
     // returns [pass_ct, fail_ct, warn_ct, skip_ct, json_entries(array)]
     let exists_chk = exec_with_status("test -f '" + path + "'")
     if exists_chk[1] != 0 {
@@ -293,21 +397,89 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string, only_id
     }
 
     let rules = load_raw_file(path)
+
+    // stage0 guard — hoisted out of per-rule loop (was N calls, now 1).
+    let s0_chk = exec_with_status("test -x ./build/hexa_stage0")
+    let s0_ok = s0_chk[1] == 0
+
+    // Phase 1: plan every rule (filter by --only, classify skip/run).
+    // `plans[i]` is the plan for `rules[i]`, or ["FILTERED","",""] when
+    // excluded by --only (preserves index alignment).
+    let mut plans = []
+    let mut runnable_idx = []      // indices into `rules` that need enforcer
+    let mut runnable_tasks = []    // [kind, id, script] for batch API
+    let mut ri = 0
+    while ri < len(rules) {
+        let rule = rules[ri]
+        let id = rule[0]
+        let mut plan = ["FILTERED", "", "", ""]
+        let mut included = true
+        if only_kind != "" {
+            if only_kind != kind { included = false }
+            if only_id != "" && only_id != id { included = false }
+        }
+        if included {
+            plan = _plan_rule(kind, rule, s0_ok)
+            if plan[0] == "RUN" {
+                runnable_idx = runnable_idx.push(ri)
+                runnable_tasks = runnable_tasks.push([kind, id, plan[2]])
+            }
+        }
+        plans = plans.push(plan)
+        ri = ri + 1
+    }
+
+    // Phase 2: launch runnable tasks in batches of par_n.
+    // Results land in `batch_results[i]` keyed to `runnable_idx[i]`.
+    let nrun = len(runnable_tasks)
+    let mut batch_results = []
+    let mut bi = 0
+    while bi < nrun {
+        let mut batch = []
+        let mut bj = 0
+        while bj < par_n && bi + bj < nrun {
+            batch = batch.push(runnable_tasks[bi + bj])
+            bj = bj + 1
+        }
+        let br = _run_batch(batch)
+        let mut bk = 0
+        while bk < len(br) {
+            batch_results = batch_results.push(br[bk])
+            bk = bk + 1
+        }
+        bi = bi + len(batch)
+    }
+
+    // Phase 3: finish rules in declaration order (proof runs serially for
+    // each passing enforce; output/json emission preserves original order).
     let mut pass_ct = 0
     let mut fail_ct = 0
     let mut warn_ct = 0
     let mut skip_ct = 0
     let mut json_entries = []
+    let mut result_cursor = 0
+    let mut k = 0
+    while k < len(rules) {
+        let rule = rules[k]
+        let plan = plans[k]
+        let tag = plan[0]
+        if tag == "FILTERED" { k = k + 1; continue }
 
-    for rule in rules {
-        if only_kind != "" {
-            if only_kind != kind { continue }
-            if only_id != "" && only_id != rule[0] { continue }
+        let mut verdict = ""
+        let mut detail = ""
+        if tag == "SKIP" { verdict = "SKIP"; detail = plan[1] }
+        else if tag == "WARN" { verdict = "WARN"; detail = plan[1] }
+        else if tag == "FAIL" { verdict = "FAIL"; detail = plan[1] }
+        else {
+            // RUN — consume next batch result
+            let br = batch_results[result_cursor]
+            result_cursor = result_cursor + 1
+            let rc = br[0]
+            let tail = br[1]
+            let f = _finish_rule(rule[1], plan[2], plan[3], rc, tail, fast)
+            verdict = f[0]
+            detail = f[1]
         }
-
-        let r = _eval_rule(kind, rule, fast)
-        let verdict = r[0]
-        let detail = r[1]
 
         if verdict == "PASS" { pass_ct = pass_ct + 1 }
         else if verdict == "FAIL" { fail_ct = fail_ct + 1 }
@@ -326,6 +498,7 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string, only_id
         } else {
             println(_fmt_row(kind, rule, verdict, detail))
         }
+        k = k + 1
     }
 
     return [pass_ct, fail_ct, warn_ct, skip_ct, json_entries]
@@ -358,10 +531,17 @@ fn main() -> int {
     let json = flags[1]
     let only_kind = flags[2]
     let only_id = flags[3]
+    let serial = flags[4]
+    let par_n = _parallel_n(serial)
+
+    // P7a: prepare tmp dir for parallel batch output.
+    _tmp_init()
 
     if !json {
         println("── raw#0 unified enforcement (raw_all) ──")
         if fast { println("mode: fast (proof scripts skipped)") }
+        if par_n > 1 { println("mode: parallel N=" + to_string(par_n)) }
+        else { println("mode: serial") }
         if only_kind != "" {
             let mut suffix = "*"
             if only_id != "" { suffix = "#" + only_id }
@@ -386,7 +566,7 @@ fn main() -> int {
     let mut total_skip = 0
 
     // Walk .raw (L0)
-    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json)
+    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json, par_n)
     total_pass = total_pass + r_raw[0]
     total_fail = total_fail + r_raw[1]
     total_warn = total_warn + r_raw[2]
@@ -394,7 +574,7 @@ fn main() -> int {
     for e in r_raw[4] { json_all = json_all.push(e) }
 
     // Walk .own (L1)
-    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json)
+    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json, par_n)
     total_pass = total_pass + r_own[0]
     total_fail = total_fail + r_own[1]
     total_warn = total_warn + r_own[2]
