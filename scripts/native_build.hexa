@@ -523,6 +523,12 @@ fn nb_lower_builtin(m, b, name: string, sym: string, arg_vids) -> int {
 // tracking and IR-value tagging, deferred).
 fn nb_infer_struct_type(m, e, env) -> string {
     if e.kind == "Ident" {
+        // Env may carry either a bare struct name ("Point") or an
+        // array-wrapped annotation ("[Point]") stored by LetStmt. We
+        // return the raw tag unchanged — the Index handler below is
+        // what strips the [..] wrapper. Field handlers feed the raw
+        // name into module_find_field_type which returns "" for any
+        // unregistered key, so "[Point]" as a struct name is harmless.
         return lower_env_type_of(env, e.name)
     }
     if e.kind == "Field" || e.kind == "FieldAccess" {
@@ -534,6 +540,15 @@ fn nb_infer_struct_type(m, e, env) -> string {
     // resolve without an intermediate let-binding.
     if e.kind == "StructInit" || e.kind == "StructLit" || e.kind == "Struct" {
         return e.name
+    }
+    // P7-6 step 3e: Index — `arr[i]` receiver. Resolve arr's tracked
+    // type (e.g. "[Point]") and strip the [..] wrapper to yield the
+    // element struct. Non-array-tagged / unknown → "". Strictly
+    // additive: untyped arrays still fall through to the legacy
+    // idx=0 Field path downstream.
+    if e.kind == "Index" {
+        let arr_t = nb_infer_struct_type(m, e.left, env)
+        return nb_strip_array_wrap(arr_t)
     }
     // P7-6 step 3c: Call through Ident callee — look up fn ret_struct.
     // Covers `make_point().x` etc.
@@ -559,6 +574,20 @@ fn nb_infer_struct_type(m, e, env) -> string {
         }
     }
     return ""
+}
+
+// P7-6 step 3e helper: unwrap an `[Inner]` array annotation and return
+// Inner. Non-wrapped strings return "" (the caller then treats the
+// base as non-array). Recognized shapes: "[X]" → "X". Longer nested
+// shapes ("[[X]]" → "[X]") are handled by a single unwrap so chained
+// Index access needs to call nb_strip_array_wrap once per dimension
+// — fine for stage-0 since matrix-of-struct isn't a common path.
+fn nb_strip_array_wrap(t: string) -> string {
+    let n = len(t)
+    if n < 3 { return "" }
+    if t.substring(0, 1) != "[" { return "" }
+    if t.substring(n - 1, n) != "]" { return "" }
+    return t.substring(1, n - 1)
 }
 
 // ── Expression lowering (parser → IR) ─────────────────────────────
@@ -794,15 +823,24 @@ fn nb_lower_expr(m, b, e, env) -> int {
         // Supported arm patterns:
         //   IntLit / BoolLit  → cmp_eq dispatch
         //   Ident "_"         → wildcard (default fall-through)
-        //   Ident (any other) → also wildcard (binding patterns not
-        //                       destructured — treated as catch-all;
-        //                       name binding is a future pass).
+        //   Ident (any other) → catch-all binding (step 3e): binds the
+        //                       pattern name to the scrutinee value +
+        //                       propagates its inferred struct type so
+        //                       `match x { y => y.field }` resolves.
+        //                       Uses lower_env_rebind to avoid stale
+        //                       first-arm names shadowing later arms.
         // Arm bodies run through nb_lower_block_value so trailing
         // expr becomes the arm value; the merged phi yields the match
         // result. The default arm is synthesized as bld_const_i64(0)
         // when the user didn't write `_`.
+        //
+        // Not yet handled (deferred to an enum-variant field registry):
+        //   EnumPath{Variant(a, b)} destructure — sub-ident types
+        //   require knowing each variant's field types, which the
+        //   IrModule struct registry doesn't yet carry.
         let scrut_vid = nb_lower_expr(m, b, e.left, env)
         if scrut_vid < 0 { return -1 }
+        let scrut_tname = nb_infer_struct_type(m, e.left, env)
         let arms = e.arms
         if arms == "" || len(arms) == 0 {
             return bld_const_i64(m, b, 0)
@@ -821,8 +859,14 @@ fn nb_lower_expr(m, b, e, env) -> int {
             let pk = pat.kind
             // Detect wildcard / plain ident patterns.
             let mut is_wild = false
+            let mut is_bind = false
             if pk == "Wildcard" { is_wild = true }
             if pk == "Ident" && pat.name == "_" { is_wild = true }
+            // P7-6 step 3e: non-"_" ident patterns become catch-all
+            // bindings. They still behave as default arms (no cmp
+            // dispatch) but carry a scope-local ident → scrutinee
+            // binding so body Field access can resolve.
+            if pk == "Ident" && pat.name != "_" { is_bind = true }
             // Emit match-arm + match-cont blocks.
             let arm_bb  = builder_create_block(m, b, "match.arm")
             let cont_bb = builder_create_block(m, b, "match.cont")
@@ -831,6 +875,24 @@ fn nb_lower_expr(m, b, e, env) -> int {
                 // arms become unreachable — we stop walking.
                 bld_jump(m, b, arm_bb)
                 builder_switch_to(b, arm_bb)
+                let av = nb_lower_block_value(m, b, body, env)
+                if av < 0 { return -1 }
+                let arm_final = b.current_block
+                bld_jump(m, b, end_bb)
+                incoming = incoming.push([arm_final, av])
+                has_default = true
+                break
+            }
+            if is_bind {
+                // Unconditional jump + bind pat.name → scrut_vid in
+                // arm scope. Like wildcards, subsequent arms are
+                // unreachable so we stop walking.
+                bld_jump(m, b, arm_bb)
+                builder_switch_to(b, arm_bb)
+                lower_env_rebind(env, pat.name, scrut_vid)
+                if len(scrut_tname) > 0 {
+                    lower_env_set_type(env, pat.name, scrut_tname)
+                }
                 let av = nb_lower_block_value(m, b, body, env)
                 if av < 0 { return -1 }
                 let arm_final = b.current_block
@@ -978,6 +1040,12 @@ fn nb_lower_stmt(m, b, s, env) -> int {
         //   (a) Direct literal — RHS is a StructInit: type = literal name.
         //   (b) Fn return — RHS is a Call to a known fn whose ret_struct
         //       tag was set in Pass 1b: type = callee's ret_struct.
+        //   (c) Array of structs — RHS is an Array literal whose first
+        //       element is a StructInit: type = "[Inner]".
+        //   (d) Explicit annotation — `let arr: [Point] = ...`: use the
+        //       parser-recorded `s.value` type annotation verbatim (it
+        //       already carries the [..] wrapper for array types and
+        //       the bare struct name for scalars).
         // Non-struct RHS leaves the type empty (lower_let default).
         if s.left.kind == "StructInit" || s.left.kind == "StructLit" || s.left.kind == "Struct" {
             lower_env_set_type(env, s.name, s.left.name)
@@ -991,6 +1059,24 @@ fn nb_lower_stmt(m, b, s, env) -> int {
                     }
                 }
             }
+        } else if s.left.kind == "Array" || s.left.kind == "ArrayLit" {
+            // Peek the first element for a struct-literal shape. Empty
+            // arrays or heterogeneous first-elements leave type unset
+            // so downstream Index.field falls back to idx=0.
+            let items = s.left.items
+            if items != "" && len(items) > 0 {
+                let first = items[0]
+                if first.kind == "StructInit" || first.kind == "StructLit" || first.kind == "Struct" {
+                    lower_env_set_type(env, s.name, "[" + first.name + "]")
+                }
+            }
+        }
+        // Explicit annotation wins over heuristic inference when the
+        // parser recorded a non-empty type in s.value. Applied last so
+        // `let arr: [Point] = []` still types correctly even when the
+        // array literal is empty.
+        if len(s.value) > 0 {
+            lower_env_set_type(env, s.name, s.value)
         }
         return 0
     }
