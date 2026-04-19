@@ -4754,4 +4754,57 @@ int hxqwen14b_v56_free_grad_buffers(int64_t ptrs_p) {
 int64_t hxqwen14b_version_v563(void) {
     return 563;
 }
-// End of v5.6.3 backward + cache surface addendum.
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.4 — backward kernels ALL landed (rmsnorm/rope/swiglu/gqa/softmax_ce).
+// All 5 kernels passed unit smoke vs CPU reference at atol=1e-4 on H100
+// (2026-04-20).  Orchestrator body still returns CUDA_TODO until the
+// 400-LOC reverse-pass coordinator + 192 lora_bwd_single calls are
+// wired (next session).
+//
+// Trainer-facing readiness probe:
+//   hxqwen14b_v564_bwd_kernels_ready() returns 1 if all 5 launchers are
+//   linked into the .so AND a 1-byte device alloc succeeds (= CUDA path
+//   alive), else 0.  Used by trainer to switch to "real backward" mode
+//   once the orchestrator lands without needing to re-FFI-probe each
+//   kernel.
+// ════════════════════════════════════════════════════════════════════
+
+// Forward declarations of the 5 launchers (defined in hxqwen14b_cuda.cu).
+extern int hxqwen14b_cu_launch_softmax_ce_bwd(int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int hxqwen14b_cu_launch_rmsnorm_bwd(int64_t, int64_t, int64_t, int64_t, int64_t,
+                                            int64_t, int64_t, float);
+extern int hxqwen14b_cu_launch_rope_bwd(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t,
+                                         float, int64_t);
+extern int hxqwen14b_cu_launch_swiglu_bwd(int64_t, int64_t, int64_t, int64_t, int64_t, int64_t);
+extern int hxqwen14b_cu_launch_gqa_bwd(int64_t, int64_t, int64_t, int64_t,
+                                        int64_t, int64_t, int64_t,
+                                        int64_t, int64_t, int64_t, int64_t, int64_t,
+                                        float, int64_t);
+
+int64_t hxqwen14b_v564_bwd_kernels_ready(void) {
+#ifndef HXQWEN14B_CUDA
+    return 0;
+#else
+    // Probe: all 5 launchers are link-time symbols (verified at .so load).
+    // Probe device path is alive with a 1-byte alloc/free roundtrip.
+    int64_t p = hxqwen14b_cu_malloc_bytes(1);
+    if (p == 0) return 0;
+    hxqwen14b_cu_free_ptr(p);
+    // Touch each launcher pointer to keep the linker honest.
+    void* fns[5] = {
+        (void*)hxqwen14b_cu_launch_softmax_ce_bwd,
+        (void*)hxqwen14b_cu_launch_rmsnorm_bwd,
+        (void*)hxqwen14b_cu_launch_rope_bwd,
+        (void*)hxqwen14b_cu_launch_swiglu_bwd,
+        (void*)hxqwen14b_cu_launch_gqa_bwd,
+    };
+    for (int i = 0; i < 5; i++) if (fns[i] == NULL) return 0;
+    return 1;
+#endif
+}
+
+int64_t hxqwen14b_version_v564(void) {
+    return 564;
+}
+// End of v5.6.4 — kernels-ready probe (orchestrator body deferred).

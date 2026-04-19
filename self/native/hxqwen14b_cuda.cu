@@ -698,4 +698,442 @@ int hxqwen14b_cu_launch_softmax_ce_bwd(
     return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
 }
 
-}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 softmax_ce_bwd added inside)
+// ═════════════════════════════════════════════════════════════════════
+// Kernel: RMSNorm backward.
+//   Forward: y[i,j] = x[i,j] * rsqrt(mean(x[i]^2) + eps) * w[j]
+//   Let r = rsqrt(mean(x[i]^2) + eps).  (computed per-row in fwd, here recomputed.)
+//   ∂L/∂x[i,k] = w[k] * r * ∂y[i,k]
+//                - (1/d) * x[i,k] * r^3 * Σ_j (w[j] * ∂y[i,j] * x[i,j])
+//   ∂L/∂w[j]  += Σ_i ∂y[i,j] * x[i,j] * r_i           (atomic across rows)
+//
+// One block per row m. Threads tree-reduce sum_sq (for r) then sum(w*dy*x)
+// (for the second term and for dw partials). Two reductions — recompute r
+// inside kernel rather than reading rstd cache (avoids extra slot).
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v563_rmsnorm_bwd_kernel(
+    const float* __restrict__ x,    // [M, d]
+    const float* __restrict__ w,    // [d]
+    const float* __restrict__ dy,   // [M, d]
+    float* __restrict__ dx,         // [M, d]   (written)
+    float* __restrict__ dw,         // [d]      (atomicAdd accumulated)
+    int d, float eps
+) {
+    int row = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* xr  = x  + row * d;
+    const float* dyr = dy + row * d;
+    float*       dxr = dx + row * d;
+
+    // Pass 1: sum_sq for r = rsqrt(mean(x^2)+eps)
+    float sum_sq = 0.0f;
+    for (int j = tid; j < d; j += blockDim.x) {
+        float v = xr[j];
+        sum_sq += v * v;
+    }
+    __shared__ float s_red[32];
+    unsigned mask = 0xffffffff;
+    for (int off = 16; off > 0; off >>= 1) sum_sq += __shfl_down_sync(mask, sum_sq, off);
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    if (lane == 0) s_red[warp] = sum_sq;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) >> 5;
+        float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+        if (lane == 0) s_red[0] = v;
+    }
+    __syncthreads();
+    float mean_sq = s_red[0] / (float)d;
+    float r       = rsqrtf(mean_sq + eps);
+
+    // Pass 2: c = Σ_j (w[j] * dy[j] * x[j])  — needed for dx second term.
+    float c_part = 0.0f;
+    for (int j = tid; j < d; j += blockDim.x) {
+        c_part += w[j] * dyr[j] * xr[j];
+    }
+    for (int off = 16; off > 0; off >>= 1) c_part += __shfl_down_sync(mask, c_part, off);
+    if (lane == 0) s_red[warp] = c_part;
+    __syncthreads();
+    if (warp == 0) {
+        int n_warps = (blockDim.x + 31) >> 5;
+        float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+        if (lane == 0) s_red[0] = v;
+    }
+    __syncthreads();
+    float c = s_red[0];
+
+    // Pass 3: write dx + accumulate dw.
+    float r3_over_d = r * r * r / (float)d;
+    for (int j = tid; j < d; j += blockDim.x) {
+        float wj = w[j];
+        float dyj = dyr[j];
+        float xj  = xr[j];
+        dxr[j] = wj * r * dyj - xj * r3_over_d * c;
+        // dw partial — atomic across rows. Cheap because contention is per-col.
+        atomicAdd(&dw[j], dyj * xj * r);
+    }
+}
+
+int hxqwen14b_cu_launch_rmsnorm_bwd(
+    int64_t x_dev, int64_t w_dev, int64_t dy_dev,
+    int64_t dx_dev, int64_t dw_dev,
+    int64_t M, int64_t d, float eps
+) {
+    if (x_dev == 0 || w_dev == 0 || dy_dev == 0 || dx_dev == 0 || dw_dev == 0)
+        return HXQ_RC_KERNEL_FAIL;
+    if (M <= 0 || d <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    if (d < 256) threads = 128;
+    if (d < 128) threads = 64;
+    v563_rmsnorm_bwd_kernel<<<(unsigned)M, threads>>>(
+        (const float*)(uintptr_t)x_dev,
+        (const float*)(uintptr_t)w_dev,
+        (const float*)(uintptr_t)dy_dev,
+        (float*)(uintptr_t)dx_dev,
+        (float*)(uintptr_t)dw_dev,
+        (int)d, eps);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Kernel: RoPE backward (rotate_half layout, Llama/Qwen2).
+//   Forward (per (bs, h, k) with k in [0, D/2)):
+//     x0' = x0 * cs - x1 * sn
+//     x1' = x1 * cs + x0 * sn
+//   Backward (rotation is unitary; transpose = inverse rotation):
+//     dx0 =  dy0 * cs + dy1 * sn
+//     dx1 = -dy0 * sn + dy1 * cs
+//
+// dy is the upstream gradient on the rotated tensor; we write dx in-place.
+// Caller may pass dx_dev == dy_dev for in-place backward (kernel reads
+// both halves into registers before writing, like the forward).
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v563_rope_bwd_kernel(
+    const float* __restrict__ dy,
+    float* __restrict__ dx,
+    int B, int S, int H, int D,
+    float theta_base, int pos_offset
+) {
+    int bs   = blockIdx.x;
+    int h    = blockIdx.y;
+    int k    = threadIdx.x;
+    int half = D >> 1;
+    if (k >= half) return;
+    (void)B;
+    int s = bs - (bs / S) * S;
+    float pos = (float)(pos_offset + s);
+    float inv_freq = powf(theta_base, -((float)(2 * k)) / (float)D);
+    float angle    = pos * inv_freq;
+    float cs, sn;
+    __sincosf(angle, &sn, &cs);
+
+    int base = (bs * H + h) * D;
+    float dy0 = dy[base + k];
+    float dy1 = dy[base + half + k];
+    // Inverse rotation (transpose).
+    dx[base + k]        =  dy0 * cs + dy1 * sn;
+    dx[base + half + k] = -dy0 * sn + dy1 * cs;
+}
+
+int hxqwen14b_cu_launch_rope_bwd(
+    int64_t dy_dev, int64_t dx_dev,
+    int64_t B, int64_t S, int64_t H, int64_t D,
+    float theta_base, int64_t pos_offset
+) {
+    if (dy_dev == 0 || dx_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    if (B <= 0 || S <= 0 || H <= 0 || D <= 0) return HXQ_RC_KERNEL_FAIL;
+    dim3 grid((unsigned)(B * S), (unsigned)H, 1);
+    int  threads = (int)(D / 2);
+    if (threads < 32) threads = 32;
+    v563_rope_bwd_kernel<<<grid, threads>>>(
+        (const float*)(uintptr_t)dy_dev,
+        (float*)(uintptr_t)dx_dev,
+        (int)B, (int)S, (int)H, (int)D, theta_base, (int)pos_offset);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Kernel: SwiGLU backward.
+//   Forward: y = silu(g) * u   where silu(g) = g * sigmoid(g)
+//   Let s = sigmoid(g);  silu(g) = g*s;  silu'(g) = s + g*s*(1-s)
+//   ∂L/∂g = ∂L/∂y * u * silu'(g)
+//   ∂L/∂u = ∂L/∂y * silu(g)
+// Element-wise. dg/du can alias g/u (read both into registers first).
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v563_swiglu_bwd_kernel(
+    const float* __restrict__ g,
+    const float* __restrict__ u,
+    const float* __restrict__ dy,
+    float* __restrict__ dg,
+    float* __restrict__ du,
+    int64_t N
+) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float gi = g[i];
+    float ui = u[i];
+    float dyi = dy[i];
+    float sig;
+    if (gi >= 0.0f) {
+        sig = 1.0f / (1.0f + expf(-gi));
+    } else {
+        float e = expf(gi);
+        sig = e / (1.0f + e);
+    }
+    float silu_g = gi * sig;
+    float silu_d = sig + gi * sig * (1.0f - sig);  // silu'(g)
+    dg[i] = dyi * ui * silu_d;
+    du[i] = dyi * silu_g;
+}
+
+int hxqwen14b_cu_launch_swiglu_bwd(
+    int64_t g_dev, int64_t u_dev, int64_t dy_dev,
+    int64_t dg_dev, int64_t du_dev, int64_t N
+) {
+    if (g_dev == 0 || u_dev == 0 || dy_dev == 0 || dg_dev == 0 || du_dev == 0)
+        return HXQ_RC_KERNEL_FAIL;
+    if (N <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    unsigned blocks = (unsigned)((N + threads - 1) / threads);
+    v563_swiglu_bwd_kernel<<<blocks, threads>>>(
+        (const float*)(uintptr_t)g_dev,
+        (const float*)(uintptr_t)u_dev,
+        (const float*)(uintptr_t)dy_dev,
+        (float*)(uintptr_t)dg_dev,
+        (float*)(uintptr_t)du_dev, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Kernel: GQA attention backward (reference; not flash).
+//
+// Forward (per (b, hq, i)):
+//   dot[j] = scale * Σ_d Q[b,i,hq,d] * K[b,j,hk,d]    (hk = hq/G)
+//   p[j]   = softmax_j(dot[j])    (causal: j <= i)
+//   O[b,i,hq,d] = Σ_j p[j] * V[b,j,hk,d]
+//
+// Backward (given dO):
+//   dV[b,j,hk,d] += Σ_i p[j|i] * dO[b,i,hq,d]    (sum over hq in the GQA group)
+//   dp[j]        = Σ_d dO[b,i,hq,d] * V[b,j,hk,d]
+//   dscore[j]    = (dp[j] - Σ_k p[k]*dp[k]) * p[j]
+//   dQ[b,i,hq,d] += scale * Σ_j dscore[j] * K[b,j,hk,d]
+//   dK[b,j,hk,d] += scale * Σ_i dscore[j|i] * Q[b,i,hq,d] (sum over hq in group)
+//
+// Recompute p inside the kernel (memory-saving, like the fwd online softmax).
+// One block per (b, hq, i).  Threads = D, used to:
+//   - hold q[d] in shared
+//   - compute dot per j (warp reduce)
+//   - compute softmax (recompute with the same online-max trick as fwd)
+//   - compute p[j], dp[j], sum(p*dp) → dscore[j] → atomic dK / dQ accumulation
+//   - per-d update dQ[i,hq,d] (no atomic; unique per block)
+//   - atomicAdd into dV[j,hk,d] (multiple hq blocks share hk)
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v563_gqa_bwd_kernel(
+    const float* __restrict__ Q,    // [B, S, HQ, D]
+    const float* __restrict__ K,    // [B, S, HK, D]
+    const float* __restrict__ V,    // [B, S, HK, D]
+    const float* __restrict__ dO,   // [B, S, HQ, D]
+    float* __restrict__ dQ,         // [B, S, HQ, D]   (written; assume zero-init by caller)
+    float* __restrict__ dK,         // [B, S, HK, D]   (atomicAdd)
+    float* __restrict__ dV,         // [B, S, HK, D]   (atomicAdd)
+    int B, int S, int HQ, int HK, int D,
+    float scale, int causal
+) {
+    int b  = blockIdx.x;
+    int hq = blockIdx.y;
+    int i  = blockIdx.z;
+    int d  = threadIdx.x;
+    if (d >= D) return;
+    int G  = HQ / HK;
+    int hk = hq / G;
+    (void)B;
+
+    const float* qi   = Q  + (((b * S + i) * HQ + hq) * D);
+    const float* dOi  = dO + (((b * S + i) * HQ + hq) * D);
+    float*       dQi  = dQ + (((b * S + i) * HQ + hq) * D);
+
+    __shared__ float s_qi[256];
+    __shared__ float s_dOi[256];
+    __shared__ float s_red[8];   // warp partials for dot reductions
+    __shared__ float s_max;
+    __shared__ float s_sumZ;
+    __shared__ float s_sum_pdp;
+
+    s_qi[d]  = qi[d];
+    s_dOi[d] = dOi[d];
+    if (d == 0) { s_max = -1e30f; s_sumZ = 0.0f; s_sum_pdp = 0.0f; }
+    __syncthreads();
+
+    int j_end = causal ? (i + 1) : S;
+    unsigned mask = 0xffffffff;
+
+    // ── Pass 1: row max of dot[j] for numerical stability.
+    float my_max = -1e30f;
+    for (int j = 0; j < j_end; j++) {
+        const float* kj = K + (((b * S + j) * HK + hk) * D);
+        float partial = s_qi[d] * kj[d];
+        for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off);
+        int warp = d >> 5;
+        int lane = d & 31;
+        if (lane == 0) s_red[warp] = partial;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dot = s_red[0] * scale;
+        if (d == 0 && dot > my_max) my_max = dot;
+        __syncthreads();
+    }
+    if (d == 0) s_max = my_max;
+    __syncthreads();
+    float row_max = s_max;
+
+    // ── Pass 2: row sum Z = Σ exp(dot - max) — needed to normalize p.
+    float my_Z = 0.0f;
+    for (int j = 0; j < j_end; j++) {
+        const float* kj = K + (((b * S + j) * HK + hk) * D);
+        float partial = s_qi[d] * kj[d];
+        for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off);
+        int warp = d >> 5;
+        int lane = d & 31;
+        if (lane == 0) s_red[warp] = partial;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dot = s_red[0] * scale;
+        if (d == 0) my_Z += expf(dot - row_max);
+        __syncthreads();
+    }
+    if (d == 0) s_sumZ = my_Z;
+    __syncthreads();
+    float invZ = 1.0f / s_sumZ;
+
+    // ── Pass 3: compute Σ_j p[j]*dp[j]   where dp[j] = Σ_d dO[d] * V[j,d]
+    float my_sum_pdp = 0.0f;
+    for (int j = 0; j < j_end; j++) {
+        const float* kj = K + (((b * S + j) * HK + hk) * D);
+        const float* vj = V + (((b * S + j) * HK + hk) * D);
+        // dot for p[j]
+        float partial = s_qi[d] * kj[d];
+        for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off);
+        int warp = d >> 5;
+        int lane = d & 31;
+        if (lane == 0) s_red[warp] = partial;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dot = s_red[0] * scale;
+        float p = expf(dot - row_max) * invZ;
+        // dp[j] = Σ_d dO[d] * V[j,d]
+        float dpp = s_dOi[d] * vj[d];
+        for (int off = 16; off > 0; off >>= 1) dpp += __shfl_down_sync(mask, dpp, off);
+        if (lane == 0) s_red[warp] = dpp;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dp = s_red[0];
+        if (d == 0) my_sum_pdp += p * dp;
+        __syncthreads();
+    }
+    if (d == 0) s_sum_pdp = my_sum_pdp;
+    __syncthreads();
+    float sum_pdp = s_sum_pdp;
+
+    // ── Pass 4: write dQ, accumulate dK and dV. dQ[i,hq,d] uniquely owned by
+    //          this block; dK and dV shared across hq in the group → atomic.
+    float my_dQ = 0.0f;
+    for (int j = 0; j < j_end; j++) {
+        const float* kj = K + (((b * S + j) * HK + hk) * D);
+        const float* vj = V + (((b * S + j) * HK + hk) * D);
+        float* dKj = dK + (((b * S + j) * HK + hk) * D);
+        float* dVj = dV + (((b * S + j) * HK + hk) * D);
+
+        // Recompute dot, p[j].
+        float partial = s_qi[d] * kj[d];
+        for (int off = 16; off > 0; off >>= 1) partial += __shfl_down_sync(mask, partial, off);
+        int warp = d >> 5;
+        int lane = d & 31;
+        if (lane == 0) s_red[warp] = partial;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dot = s_red[0] * scale;
+        float p = expf(dot - row_max) * invZ;
+
+        // Recompute dp[j].
+        float dpp = s_dOi[d] * vj[d];
+        for (int off = 16; off > 0; off >>= 1) dpp += __shfl_down_sync(mask, dpp, off);
+        if (lane == 0) s_red[warp] = dpp;
+        __syncthreads();
+        if (warp == 0) {
+            int n_warps = (D + 31) >> 5;
+            float v = (lane < n_warps) ? s_red[lane] : 0.0f;
+            for (int off = 16; off > 0; off >>= 1) v += __shfl_down_sync(mask, v, off);
+            if (lane == 0) s_red[0] = v;
+        }
+        __syncthreads();
+        float dp = s_red[0];
+
+        float dscore = (dp - sum_pdp) * p;
+        // dQ[d] += scale * dscore * K[j,d]
+        my_dQ += scale * dscore * kj[d];
+        // dK[j,d] += scale * dscore * Q[i,d]
+        atomicAdd(&dKj[d], scale * dscore * s_qi[d]);
+        // dV[j,d] += p * dO[d]
+        atomicAdd(&dVj[d], p * s_dOi[d]);
+    }
+    dQi[d] = my_dQ;
+}
+
+int hxqwen14b_cu_launch_gqa_bwd(
+    int64_t Q_dev, int64_t K_dev, int64_t V_dev, int64_t dO_dev,
+    int64_t dQ_dev, int64_t dK_dev, int64_t dV_dev,
+    int64_t B, int64_t S, int64_t HQ, int64_t HK, int64_t D,
+    float scale, int64_t causal
+) {
+    if (Q_dev == 0 || K_dev == 0 || V_dev == 0 || dO_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    if (dQ_dev == 0 || dK_dev == 0 || dV_dev == 0)             return HXQ_RC_KERNEL_FAIL;
+    if (B <= 0 || S <= 0 || HQ <= 0 || HK <= 0 || D <= 0)      return HXQ_RC_KERNEL_FAIL;
+    if (HQ % HK != 0)                                          return HXQ_RC_KERNEL_FAIL;
+    dim3 grid((unsigned)B, (unsigned)HQ, (unsigned)S);
+    int  threads = (int)D;
+    v563_gqa_bwd_kernel<<<grid, threads>>>(
+        (const float*)(uintptr_t)Q_dev,
+        (const float*)(uintptr_t)K_dev,
+        (const float*)(uintptr_t)V_dev,
+        (const float*)(uintptr_t)dO_dev,
+        (float*)(uintptr_t)dQ_dev,
+        (float*)(uintptr_t)dK_dev,
+        (float*)(uintptr_t)dV_dev,
+        (int)B, (int)S, (int)HQ, (int)HK, (int)D,
+        scale, (int)causal);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 bwd kernels added inside)
