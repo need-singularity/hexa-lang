@@ -362,6 +362,22 @@ __global__ void v54_residual_add_kernel(
     y[i] += x[i];
 }
 
+// v5.4.2: 1D bias add — tensor[M, D] += bias[D] broadcast over rows.
+// Grid: (M,), Block: min(D, 1024). Inner loop handles D > 1024 case
+// (Q dim dq=5120 > 1024, K/V dim dkv=1024 fits exactly).
+__global__ void v54_add_bias_1d_kernel(
+    float* __restrict__ tensor,       // [M, D]
+    const float* __restrict__ bias,   // [D]
+    int64_t M, int64_t D
+) {
+    int64_t row = blockIdx.x;
+    if (row >= M) return;
+    float* tr = tensor + row * D;
+    for (int64_t col = threadIdx.x; col < D; col += blockDim.x) {
+        tr[col] += bias[col];
+    }
+}
+
 // Log-softmax + gather target token's nll, then reduce to sum.
 // Grid: (M,). Block: min(V_pow2, 256). Shared: max + sum.
 // out_nll: [M] — each cell's -log p(target[m]).
@@ -487,6 +503,22 @@ int hxqwen14b_cu_launch_residual_add(
     v54_residual_add_kernel<<<blocks, threads>>>(
         (const float*)(uintptr_t)x_dev,
         (float*)(uintptr_t)y_dev, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+// v5.4.2: launch 1D bias add — tensor[M, D] += bias[D].
+int hxqwen14b_cu_launch_add_bias_1d(
+    int64_t tensor_dev, int64_t bias_dev, int64_t M, int64_t D
+) {
+    if (tensor_dev == 0 || bias_dev == 0 || M <= 0 || D <= 0)
+        return HXQ_RC_KERNEL_FAIL;
+    int threads = (D < 1024) ? (int)D : 1024;
+    dim3 grid((unsigned)M);
+    dim3 block(threads);
+    v54_add_bias_1d_kernel<<<grid, block>>>(
+        (float*)(uintptr_t)tensor_dev,
+        (const float*)(uintptr_t)bias_dev,
+        M, D);
     return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
 }
 

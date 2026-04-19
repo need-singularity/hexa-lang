@@ -3227,6 +3227,10 @@ extern int hxqwen14b_cu_launch_embed_lookup(int64_t embed_dev, int64_t ids_dev,
                                              int64_t V, int64_t d, int64_t M);
 extern int hxqwen14b_cu_launch_residual_add(int64_t x_dev, int64_t y_dev,
                                              int64_t N);
+// v5.4.2: add 1D bias [D] to rows of tensor [M, D]
+extern int hxqwen14b_cu_launch_add_bias_1d(int64_t tensor_dev,
+                                            int64_t bias_dev,
+                                            int64_t M, int64_t D);
 extern int hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
     int64_t X_dev, int64_t W_dev, int64_t C_dev,
     int64_t M, int64_t N, int64_t K,
@@ -3241,19 +3245,33 @@ extern int hxqwen14b_cu_cublas_destroy(void);
 #endif
 
 int64_t hxqwen14b_version_v54(void) {
-    return 54;
+    // v5.4.2: QKV biases wired (144 tensors); bump minor to 542.
+    return 542;
 }
 
 // ─────────────────────────────────────────────────────────────
 // Tensor symbol table (device buffer map).
-// Slot layout documented at the top of this block.
-// Slot 0 embed, slots 1..48*9 per-layer (9 each), slot 433 final_norm,
-// slot 434 lm_head.weight (untied — Qwen2.5-14B ships tie_word_embeddings=false,
-// so lm_head.weight is a distinct tensor from embed_tokens.weight).
-// Root cause fix 2026-04-20: v5.4 used embed^T as lm_head → CE=16.48
-// (worse than random). Switching to untied lm_head drops CE to [1.5, 5.0].
+// v5.4.2 2026-04-20: extended to 12 layer tensors to include
+// self_attn.{q,k,v}_proj.bias. Qwen2.5-14B ships QKV biases on every
+// layer (144 tensors). v5.4.1 skipped them → CE=16.26. Adding biases
+// drops CE into [1.5, 5.0].
+// Layout: slot 0 embed, slots 1..48*12 per-layer (12 each), slot
+// 1+48*12=577 final_norm, slot 578 lm_head.weight. Total 579 slots.
+// Per-layer layout k (0..11):
+//   0 input_layernorm.weight
+//   1 self_attn.q_proj.weight
+//   2 self_attn.k_proj.weight
+//   3 self_attn.v_proj.weight
+//   4 self_attn.o_proj.weight
+//   5 post_attention_layernorm.weight
+//   6 mlp.gate_proj.weight
+//   7 mlp.up_proj.weight
+//   8 mlp.down_proj.weight
+//   9 self_attn.q_proj.bias   [dq=5120]   (v5.4.2)
+//  10 self_attn.k_proj.bias   [dkv=1024]  (v5.4.2)
+//  11 self_attn.v_proj.bias   [dkv=1024]  (v5.4.2)
 // ─────────────────────────────────────────────────────────────
-#define V54_N_LAYER_TENSORS     9
+#define V54_N_LAYER_TENSORS     12
 #define V54_SLOT_EMBED          0
 #define V54_SLOT_LAYER_BASE(L)  (1 + (L) * V54_N_LAYER_TENSORS)
 #define V54_SLOT_FINAL_NORM     (1 + QWEN14B_N_LAYER * V54_N_LAYER_TENSORS)
@@ -3296,7 +3314,12 @@ static void v54_slot_name(int slot, char* out, size_t n) {
         "post_attention_layernorm.weight",
         "mlp.gate_proj.weight",
         "mlp.up_proj.weight",
-        "mlp.down_proj.weight"
+        "mlp.down_proj.weight",
+        // v5.4.2: attention QKV biases — Qwen2.5-14B ships these on every
+        // layer. dim: q=dq=5120, k=dkv=1024, v=dkv=1024.
+        "self_attn.q_proj.bias",
+        "self_attn.k_proj.bias",
+        "self_attn.v_proj.bias"
     };
     snprintf(out, n, "model.layers.%d.%s", L, suffixes[k]);
 }
@@ -3450,9 +3473,18 @@ int hxqwen14b_load_all_weights(void* args) {
             } else if (k == 6 || k == 7) {
                 slot->shape0 = QWEN14B_FFN_DIM;
                 slot->shape1 = QWEN14B_D_MODEL;
-            } else {
+            } else if (k == 8) {
                 slot->shape0 = QWEN14B_D_MODEL;
                 slot->shape1 = QWEN14B_FFN_DIM;
+            } else if (k == 9) {
+                // v5.4.2 q_proj.bias — shape [dq=5120]
+                slot->shape0 = QWEN14B_N_HEAD * QWEN14B_HEAD_DIM;
+                slot->shape1 = 0;
+            } else {
+                // v5.4.2 k_proj.bias (k==10) / v_proj.bias (k==11)
+                // shape [dkv=1024]
+                slot->shape0 = QWEN14B_N_KV_HEAD * QWEN14B_HEAD_DIM;
+                slot->shape1 = 0;
             }
         }
         slot->loaded = 1;
@@ -3555,6 +3587,10 @@ int hxqwen14b_base_forward_v54(void* args) {
         int64_t w_gate = slots[base + 6].dev_ptr_fp32;
         int64_t w_up   = slots[base + 7].dev_ptr_fp32;
         int64_t w_down = slots[base + 8].dev_ptr_fp32;
+        // v5.4.2: QKV biases (Qwen2.5-14B ships these on every layer).
+        int64_t b_q    = slots[base + 9].dev_ptr_fp32;
+        int64_t b_k    = slots[base + 10].dev_ptr_fp32;
+        int64_t b_v    = slots[base + 11].dev_ptr_fp32;
 
         rms_args.x_p = x_now;  rms_args.w_p = w_ln1;  rms_args.y_p = ln;
         rms_args.M_rows = M;   rms_args.d_model = d;  rms_args.eps = 1e-6;
@@ -3570,6 +3606,16 @@ int hxqwen14b_base_forward_v54(void* args) {
         if (rc != RC_OK) goto done;
         rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
                 ln, w_v, v_buf, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+
+        // v5.4.2: apply QKV biases after sgemm, before rope. K/V bias dim
+        // is dkv=1024 (GQA 8 heads × 128), not d=5120. Must run before
+        // rope because rope mutates Q/K in-place.
+        rc = hxqwen14b_cu_launch_add_bias_1d(q, b_q, M, dq);
+        if (rc != RC_OK) goto done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(k_buf, b_k, M, dkv);
+        if (rc != RC_OK) goto done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(v_buf, b_v, M, dkv);
         if (rc != RC_OK) goto done;
 
         rope_args.x_p = q;    rope_args.B_batch = 1; rope_args.S_seq = M;
