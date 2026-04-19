@@ -1,0 +1,167 @@
+// self/rt/except.hexa — P7-7i: hexa try/throw without setjmp/longjmp
+//
+// ═══════════════════════════════════════════════════════════════════
+// DESIGN: two options. Scaffold implements Option A.
+// ═══════════════════════════════════════════════════════════════════
+//
+// Option A — Result-tagged return  ← IMPLEMENTED HERE
+// --------------------------------------------------
+// Every throwing function is lowered to return an RtResult record:
+//     struct RtResult { ok: bool, value: any, error: any }
+//
+//   throw x              →  return rt_err(x)
+//   try { body } catch e { handler }
+//                        →  let __r = rt_try_block(fn -> body)
+//                           if !__r.ok { let e = __r.error; handler }
+//                           else { /* use __r.value if expression form */ }
+//
+// Pro:
+//   - Zero platform-specific context save. Pure hexa, pure data.
+//   - No stack discipline hazard (the 2026-04-16 ARM64 cleanup bug
+//     becomes structurally impossible — no jmp_buf stack to leak).
+//   - Trivially composable with @pure / @sealed analysis.
+//
+// Con:
+//   - Every function on a throwing path needs its return type widened
+//     to RtResult (or an `err` out-param). codegen_c2.hexa must rewrite
+//     ALL call sites on the throw path, not just try/throw sites.
+//   - Performance: an extra struct copy per call on the throw path.
+//     Hot-path allocs must stay scalar (ok=true, value=scalar).
+//
+// Option B — @save_context / @restore_context intrinsics  ← DEFERRED
+// ------------------------------------------------------------------
+// Per-arch inline asm intrinsic that saves { callee-save regs, SP,
+// FP, LR/return addr } into a linked TryFrame, and a paired restore
+// that jumps back. Drop-in replacement for setjmp/longjmp.
+//
+// Pro:
+//   - Drop-in: codegen shape from codegen_c2.hexa L1762-L1802 stays
+//     identical; just swap setjmp→@save_context and longjmp→@restore.
+//   - No ABI change. Existing .hexa source compiles unchanged.
+//
+// Con:
+//   - Arch-specific inline asm — ARM64 (AAPCS64 x19–x28, d8–d15, SP,
+//     FP, LR) AND x86_64 (SysV rbx/rbp/r12–r15, SP, RIP) AND Windows
+//     x64 (extra xmm6–xmm15) if we ever go there.
+//   - Requires new intrinsic kind in the IR (not @syscall-shaped —
+//     @syscall has fixed register inputs; @save_context clobbers all
+//     callee-save across the call-return boundary).
+//   - Escape-to-ancestor-frame semantics need careful interaction
+//     with hexa's arena / ValStruct lifetime (TAG_VALSTRUCT on the
+//     saved SP could dangle if the throw pops past its defining
+//     frame — same class of bug as ValStruct arena corruption we
+//     fixed in T33-fix-2).
+//
+// Blockers for Option B (audit 2026-04-19):
+//   - [ ] self/codegen/arm64.hexa has no @save_context emitter — only
+//         @syscall-style SVC emission. Would need a new IR op
+//         (IR_SAVE_CTX / IR_RESTORE_CTX) plus encoder entries that
+//         spill x19..x28, d8..d15, sp, fp, lr to a fixed offset block.
+//   - [ ] self/codegen/x86_64.hexa likewise — no save-ctx primitive.
+//         Needs encoder for `mov %rbx,(frame+0)` … `mov %r15,(+40)`
+//         + rsp/rbp/return-addr capture.
+//   - [ ] IR lowering (codegen_c2.hexa path): no TryFrame struct
+//         layout decided — must pick field order shared by both
+//         encoders so one TryFrame on the hexa stack is portable.
+//   - [ ] Interaction with arena: throwing past an arena scope must
+//         free/reset arena_top to the TryFrame's saved arena_top —
+//         currently runtime.c's longjmp doesn't do this, causing a
+//         slow leak. Option B would make the leak explicit and fixable.
+//
+// ═══════════════════════════════════════════════════════════════════
+// Option A surface
+// ═══════════════════════════════════════════════════════════════════
+
+use self::rt::alloc
+
+// Result record — ok=true carries `value`, ok=false carries `error`.
+// `any` is hexa's tagged Val, so we can stuff int/string/struct alike.
+struct RtResult {
+    ok: bool,
+    value: any,
+    error: any,
+}
+
+// Compatibility mirror of runtime.c's __hexa_last_error. Kept as a
+// module global so consumers during migration can still call a
+// rt_last_error() accessor (same name shape as the C symbol, minus
+// the __hexa_ prefix — rt_ prefix is the P7-7 convention).
+let mut __rt_last_error: any = void
+
+fn rt_ok(v: any) -> RtResult {
+    return RtResult { ok: true, value: v, error: void }
+}
+
+fn rt_err(e: any) -> RtResult {
+    __rt_last_error = e
+    return RtResult { ok: false, value: void, error: e }
+}
+
+// rt_throw: shorthand alias for rt_err. Named for parity with the
+// C `hexa_throw` symbol. Codegen lowers `throw x` → `return rt_throw(x)`
+// inside functions that have been widened to return RtResult.
+fn rt_throw(e: any) -> RtResult {
+    return rt_err(e)
+}
+
+// rt_try: invoke a zero-arg callable that returns RtResult, propagate
+// its tag. This is the primitive that replaces the C try/catch block.
+// Callers pattern-match on the returned record's `ok` field.
+//
+// Note: the callable MUST itself return RtResult. Codegen enforces
+// this by widening any fn body that contains a ThrowStmt or whose
+// transitive call graph reaches one.
+fn rt_try(callable) -> RtResult {
+    let r = callable()
+    // Trust the callable's tag. No implicit wrapping — if the callable
+    // returned a bare value, that's a codegen bug, not a runtime one.
+    return r
+}
+
+// Accessor for the last thrown value. Mirrors __hexa_last_error() in
+// runtime.c. Useful for legacy handler blocks that used the implicit
+// `__err = __hexa_last_error()` pattern from codegen_c2.hexa L1789.
+fn rt_last_error() -> any {
+    return __rt_last_error
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Bridge: codegen_c2.hexa changes required to actually switch over
+// ═══════════════════════════════════════════════════════════════════
+//
+// codegen_c2.hexa currently emits setjmp-based C at L1755-L1802
+// (ThrowStmt + TryCatchStmt branches). To lower to Option A instead:
+//
+//   1. ThrowStmt branch (L1755-L1760):
+//        replace  "hexa_throw(" + expr + ");\n"
+//        with     "return rt_throw(" + expr + ");\n"
+//      — and remove the string-literal special-case; rt_throw takes
+//      any. The function's return-type slot must have been widened
+//      to RtResult by an earlier pass (see step 3).
+//
+//   2. TryCatchStmt branch (L1762-L1802):
+//        emit instead a call to rt_try with a lambda-wrapped try body,
+//        pattern-match ok:
+//          let __r = rt_try(fn -> { <try_body>; return rt_ok(void) })
+//          if !__r.ok { let <catch_var> = __r.error; <catch_body> }
+//      Drop the jmp_buf / setjmp / __hexa_try_push / __hexa_try_cleanup
+//      scaffolding entirely (~15 lines).
+//
+//   3. New pre-pass (call graph widening): mark every fn that contains
+//      ThrowStmt, or calls a marked fn, as throwing. Rewrite its
+//      signature `-> T` to `-> RtResult` and every `return v` to
+//      `return rt_ok(v)`. Every call to a throwing fn at a non-try
+//      site must auto-propagate: `let t = f(x)` in a throwing caller
+//      becomes `let __t = f(x); if !__t.ok { return __t }; let t = __t.value`.
+//      This is the big refactor — grep candidates:
+//        gen2_stmt / gen2_expr / gen2_fn_decl in codegen_c2.hexa.
+//
+//   4. Remove runtime.c symbols once no emitted C references them:
+//        __hexa_try_push / __hexa_try_pop / __hexa_try_cleanup
+//        __hexa_last_error / __hexa_error_val / hexa_throw
+//      Keep the #include <setjmp.h> removal as the last step (grep
+//      "setjmp" across emitted C — it should be zero hits).
+//
+// Migration order (safe rollout): implement steps 1-3 behind a
+// codegen flag `--except=result` (default off). Flip default once
+// hexa_full.hexa self-compiles cleanly under it.

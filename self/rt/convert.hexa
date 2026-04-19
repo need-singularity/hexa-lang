@@ -1,0 +1,198 @@
+// self/rt/convert.hexa — P7-7 value-conversion suite (libc-independent)
+//
+// Pure-hexa replacements for the generic coercion helpers in runtime.c:
+//   hexa_to_int     → rt_to_int
+//   hexa_to_float   → rt_to_float
+//   hexa_to_bool    → rt_to_bool
+//   hexa_to_string  → rt_to_string
+//   hexa_to_cstring → rt_to_cstring     (NUL-terminated, heap-backed ptr)
+//   hexa_from_cstring → rt_from_cstring (walks NUL-terminated memory)
+//   hexa_is_error   → rt_is_error       ("ERR:" sentinel compat)
+//   hexa_type_of    → see rt/core.rt_type_of (not re-defined here)
+//
+// Dispatch is typeof()-driven — no raw tag peek. For int→string we
+// delegate to fmt.int_to_string, for float→string to fmt.float_to_string
+// (6 digits matches runtime.c's %g default for common magnitudes).
+// String→int/float reuse string.rt_str_parse_int / rt_str_parse_float.
+//
+// rt_to_cstring / rt_from_cstring traffic in raw pointer ints — they
+// need alloc.hexa_ptr_alloc + the memory intrinsics (__mem_store8 /
+// __mem_load8) from rt/alloc.hexa. These are interpreter-fallback paths
+// today (see rt/alloc.hexa L276-283); once codegen/memop lowering lands,
+// both functions compile to a handful of LDRB/STRB instructions.
+
+use self::rt::fmt
+use self::rt::string
+use self::rt::alloc
+
+// ═══════════════════════════════════════════════════════════════════
+// Scalar coercions
+// ═══════════════════════════════════════════════════════════════════
+
+// rt_to_int — truncate toward zero for floats; strings via parse_int.
+// Mirrors runtime.c L3278-3284. void→0, bool→0/1 (C treats TAG_BOOL as
+// int fallthrough, we surface the explicit mapping).
+@pure fn rt_to_int(v) -> int {
+    let t = typeof(v)
+    if t == "int" { return v }
+    if t == "float" { return int_of(v) }
+    if t == "string" { return rt_str_parse_int(v) }
+    if t == "bool" {
+        if v { return 1 }
+        return 0
+    }
+    if t == "void" { return 0 }
+    return 0
+}
+
+// rt_to_float — int→float promotion; string via parse_float. Mirrors
+// runtime.c L3273-3275 (__hx_to_double). bool treated as 0.0/1.0.
+@pure fn rt_to_float(v) -> float {
+    let t = typeof(v)
+    if t == "float" { return v }
+    if t == "int" { return float_of_int(v) }
+    if t == "string" { return rt_str_parse_float(v) }
+    if t == "bool" {
+        if v { return 1.0 }
+        return 0.0
+    }
+    return 0.0
+}
+
+// rt_to_bool — explicit-typed truthy. Mirrors runtime.c L5616, but with
+// the string special case: "true"/"false" parse as their boolean value
+// rather than "any non-empty → true". Anything else falls through to
+// length/nonzero checks (matches rt_truthy semantics).
+@pure fn rt_to_bool(v) -> bool {
+    let t = typeof(v)
+    if t == "bool" { return v }
+    if t == "int" { return v != 0 }
+    if t == "float" { return v != 0.0 }
+    if t == "string" {
+        if v == "true" { return true }
+        if v == "false" { return false }
+        return len(v) > 0
+    }
+    if t == "void" { return false }
+    return true
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Stringification
+// ═══════════════════════════════════════════════════════════════════
+
+// rt_to_string — polymorphic stringify. Mirrors runtime.c L2818-2845.
+// For arrays / maps we emit a debug-style repr ("[a, b]" / "{k: v}").
+// This is coarser than the interpreter's val_to_string but matches the
+// runtime.c fallback shape at L2843 ("<value>") — callers wanting a
+// round-trippable form should use rt_json_stringify.
+fn rt_to_string(v) -> string {
+    let t = typeof(v)
+    if t == "string" { return v }
+    if t == "int" { return int_to_string(v) }
+    if t == "float" { return float_to_string(v, 6) }
+    if t == "bool" {
+        if v { return "true" }
+        return "false"
+    }
+    if t == "void" { return "void" }
+    if t == "array" {
+        let n = len(v)
+        let mut parts = []
+        parts = parts.push("[")
+        let mut i = 0
+        while i < n {
+            if i > 0 { parts = parts.push(", ") }
+            parts = parts.push(rt_to_string(v[i]))
+            i = i + 1
+        }
+        parts = parts.push("]")
+        return parts.join("")
+    }
+    if t == "map" {
+        let ks = keys(v)
+        let n = len(ks)
+        let mut parts = []
+        parts = parts.push("{")
+        let mut i = 0
+        while i < n {
+            if i > 0 { parts = parts.push(", ") }
+            let k = ks[i]
+            parts = parts.push(rt_to_string(k))
+            parts = parts.push(": ")
+            parts = parts.push(rt_to_string(v[k]))
+            i = i + 1
+        }
+        parts = parts.push("}")
+        return parts.join("")
+    }
+    return "<value>"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// C-string round-trip (raw pointer ints)
+// ═══════════════════════════════════════════════════════════════════
+
+// rt_to_cstring — copy string bytes into a fresh heap region with a
+// trailing NUL. Returns the raw pointer as int. Matches the C contract
+// where the caller treats the pointer as `char*`.
+//
+// Allocation comes from the shared rt arena — the returned block lives
+// until the next arena_reset. Callers holding pointers across resets
+// must copy out (same rule as runtime.c L4114 hexa_cstring).
+fn rt_to_cstring(s: string) -> int {
+    let n = len(s)
+    let ptr = hexa_ptr_alloc(n + 1)
+    let bytes = hexa_str_bytes(s)
+    let mut i = 0
+    while i < n {
+        hexa_ptr_write_byte(ptr, i, bytes[i])
+        i = i + 1
+    }
+    // Trailing NUL.
+    hexa_ptr_write_byte(ptr, n, 0)
+    return ptr
+}
+
+// rt_from_cstring — walk a NUL-terminated byte sequence starting at
+// `ptr`, accumulate bytes, return as a hexa string. Mirrors runtime.c
+// L4117 hexa_from_cstring. ptr==0 → "".
+fn rt_from_cstring(ptr: int) -> string {
+    if ptr == 0 { return "" }
+    let mut codes = []
+    let mut i = 0
+    // Safety cap — don't scan unbounded memory if the source isn't
+    // actually NUL-terminated. 1MB matches the arena page size and is
+    // larger than any string produced by the self-host toolchain.
+    let limit = 1048576
+    while i < limit {
+        let b = hexa_ptr_read_byte(ptr, i)
+        if b == 0 { break }
+        codes = codes.push(b)
+        i = i + 1
+    }
+    return rt_str_from_chars(codes)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Error-value check
+// ═══════════════════════════════════════════════════════════════════
+
+// rt_is_error — runtime.c has no TAG_ERROR; the C shim at L5372 checks
+// for a TAG_STR beginning with the "ERR:" sentinel. We preserve that
+// convention here so interpreter output stays lint-compatible with the
+// rest of the pipeline.
+@pure fn rt_is_error(v) -> bool {
+    let t = typeof(v)
+    if t == "error" { return true }
+    if t != "string" { return false }
+    if len(v) < 4 { return false }
+    return v.substring(0, 4) == "ERR:"
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Intrinsic shims — resolved at codegen time
+// ═══════════════════════════════════════════════════════════════════
+
+@inline fn int_of(x) -> int { return 0 }
+@inline fn float_of_int(n: int) -> float { return 0.0 }

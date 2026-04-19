@@ -1,0 +1,338 @@
+// self/rt/json.hexa — P7-7 JSON codec (libc-independent)
+//
+// Pure-hexa replacements for runtime.c L5660-5923:
+//   hexa_json_parse     → rt_json_parse
+//   hexa_json_stringify → rt_json_stringify(v, pretty)
+//   hexa_json_encode    → rt_json_stringify(v, false)
+//   hexa_json_decode    → rt_json_parse
+//
+// Parser
+// ------
+// Recursive-descent mirroring runtime.c's _jp_* helpers. hexa cannot use
+// an out-pointer cursor the way C does (no &size_t*), so every parse fn
+// returns a 2-element array [value, next_index]. The outer driver runs
+// from index 0 and discards the trailing cursor.
+//
+// Supports: null / true / false / numbers (int or float via '.' / 'e')
+//           / strings (with \n \t \" \\ \/ \b \f \r escapes; \uXXXX passes
+//           through literally for round-trip safety) / arrays / objects.
+// Parse errors return `void` — the host treats void as "no value".
+//
+// Stringifier
+// -----------
+// typeof-dispatch on the input. String bodies are JSON-escaped (matching
+// runtime.c _js_emit_string L5843-5864). `pretty` adds 2-space indent +
+// newlines for arrays/objects. For compact output callers pass false.
+//
+// Total ~290 LOC — keeps the scaffold slim so a later pass can swap in
+// the full Unicode-aware codec when the host arena supports it.
+
+use self::rt::fmt
+use self::rt::string
+
+// ═══════════════════════════════════════════════════════════════════
+// Parser — every fn returns [value, next_index]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure fn _jp_is_ws(c: int) -> bool {
+    return c == 32 || c == 9 || c == 10 || c == 13
+}
+
+@pure fn _jp_is_digit(c: int) -> bool {
+    return c >= 48 && c <= 57
+}
+
+fn _jp_skip_ws(s: string, i: int) -> int {
+    let n = len(s)
+    let mut p = i
+    while p < n && _jp_is_ws(char_code(s, p)) { p = p + 1 }
+    return p
+}
+
+// Parse a quoted JSON string starting at s[i] == '"'. Returns
+// [string_value, next_index]. On malformed input returns ["", i].
+fn _jp_parse_string(s: string, i: int) {
+    let n = len(s)
+    if i >= n || char_code(s, i) != 34 { return ["", i] }
+    let mut p = i + 1
+    let mut codes = []
+    while p < n {
+        let c = char_code(s, p)
+        if c == 34 {
+            // Closing quote.
+            return [rt_str_from_chars(codes), p + 1]
+        }
+        if c == 92 && p + 1 < n {
+            let e = char_code(s, p + 1)
+            if e == 34      { codes = codes.push(34); p = p + 2; continue }   // \"
+            if e == 92      { codes = codes.push(92); p = p + 2; continue }   // \\
+            if e == 47      { codes = codes.push(47); p = p + 2; continue }   // \/
+            if e == 110     { codes = codes.push(10); p = p + 2; continue }   // \n
+            if e == 114     { codes = codes.push(13); p = p + 2; continue }   // \r
+            if e == 116     { codes = codes.push(9);  p = p + 2; continue }   // \t
+            if e == 98      { codes = codes.push(8);  p = p + 2; continue }   // \b
+            if e == 102     { codes = codes.push(12); p = p + 2; continue }   // \f
+            if e == 117 {
+                // \uXXXX — pass through all 6 bytes literally (matches
+                // runtime.c L5709-5720; full unicode decode is left for
+                // a later pass).
+                if p + 5 < n {
+                    let mut k = 0
+                    while k < 6 {
+                        codes = codes.push(char_code(s, p + k))
+                        k = k + 1
+                    }
+                    p = p + 6
+                    continue
+                }
+                codes = codes.push(117)
+                p = p + 2
+                continue
+            }
+            // Unknown escape — emit the literal escape char.
+            codes = codes.push(e)
+            p = p + 2
+            continue
+        }
+        codes = codes.push(c)
+        p = p + 1
+    }
+    // Unterminated — return what we have.
+    return [rt_str_from_chars(codes), p]
+}
+
+// Parse a number. Returns [int-or-float, next_index].
+fn _jp_parse_number(s: string, i: int) {
+    let n = len(s)
+    let mut p = i
+    let mut is_float = false
+    // Optional sign.
+    if p < n {
+        let c0 = char_code(s, p)
+        if c0 == 45 || c0 == 43 { p = p + 1 }
+    }
+    while p < n {
+        let c = char_code(s, p)
+        if _jp_is_digit(c) { p = p + 1; continue }
+        if c == 46 || c == 101 || c == 69 || c == 43 || c == 45 {
+            // '.', 'e', 'E', '+', '-' inside exponent → float
+            is_float = true
+            p = p + 1
+            continue
+        }
+        break
+    }
+    let body = s.substring(i, p)
+    if is_float { return [rt_str_parse_float(body), p] }
+    return [rt_str_parse_int(body), p]
+}
+
+fn _jp_parse_value(s: string, i: int) {
+    let n = len(s)
+    let start = _jp_skip_ws(s, i)
+    if start >= n { return [void, start] }
+    let c = char_code(s, start)
+    if c == 34 { return _jp_parse_string(s, start) }            // '"'
+    if c == 123 { return _jp_parse_object(s, start) }           // '{'
+    if c == 91 { return _jp_parse_array(s, start) }             // '['
+    if c == 116 {  // 't'
+        if start + 4 <= n && s.substring(start, start + 4) == "true" {
+            return [true, start + 4]
+        }
+    }
+    if c == 102 {  // 'f'
+        if start + 5 <= n && s.substring(start, start + 5) == "false" {
+            return [false, start + 5]
+        }
+    }
+    if c == 110 {  // 'n'
+        if start + 4 <= n && s.substring(start, start + 4) == "null" {
+            return [void, start + 4]
+        }
+    }
+    if c == 45 || _jp_is_digit(c) {  // '-' or digit
+        return _jp_parse_number(s, start)
+    }
+    // Unknown — skip one byte and return void.
+    return [void, start + 1]
+}
+
+fn _jp_parse_array(s: string, i: int) {
+    let n = len(s)
+    if i >= n || char_code(s, i) != 91 { return [[], i] }
+    let mut p = i + 1
+    let mut arr = []
+    p = _jp_skip_ws(s, p)
+    if p < n && char_code(s, p) == 93 { return [arr, p + 1] }   // ']'
+    while p < n {
+        p = _jp_skip_ws(s, p)
+        let r = _jp_parse_value(s, p)
+        arr = arr.push(r[0])
+        p = r[1]
+        p = _jp_skip_ws(s, p)
+        if p < n {
+            let c = char_code(s, p)
+            if c == 44 { p = p + 1; continue }                  // ','
+            if c == 93 { return [arr, p + 1] }                  // ']'
+        }
+        break
+    }
+    return [arr, p]
+}
+
+fn _jp_parse_object(s: string, i: int) {
+    let n = len(s)
+    if i >= n || char_code(s, i) != 123 { return [#{}, i] }
+    let mut p = i + 1
+    let mut m = #{}
+    p = _jp_skip_ws(s, p)
+    if p < n && char_code(s, p) == 125 { return [m, p + 1] }    // '}'
+    while p < n {
+        p = _jp_skip_ws(s, p)
+        let kr = _jp_parse_string(s, p)
+        let key = kr[0]
+        p = kr[1]
+        p = _jp_skip_ws(s, p)
+        if p < n && char_code(s, p) == 58 { p = p + 1 }         // ':'
+        p = _jp_skip_ws(s, p)
+        let vr = _jp_parse_value(s, p)
+        m[key] = vr[0]
+        p = vr[1]
+        p = _jp_skip_ws(s, p)
+        if p < n {
+            let c = char_code(s, p)
+            if c == 44 { p = p + 1; continue }                  // ','
+            if c == 125 { return [m, p + 1] }                   // '}'
+        }
+        break
+    }
+    return [m, p]
+}
+
+// Public entry — discards trailing cursor.
+fn rt_json_parse(s: string) {
+    if typeof(s) != "string" { return void }
+    let r = _jp_parse_value(s, 0)
+    return r[0]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Stringifier
+// ═══════════════════════════════════════════════════════════════════
+
+// Escape a raw string into a quoted JSON string literal. Mirrors
+// runtime.c _js_emit_string at L5843-5864 — RFC 8259 minimum escape
+// set, control bytes below 0x20 become \u00XX.
+fn _js_escape_string(s: string) -> string {
+    let bytes = hexa_str_bytes(s)
+    let n = len(bytes)
+    let mut parts = []
+    parts = parts.push("\"")
+    let mut i = 0
+    while i < n {
+        let c = bytes[i]
+        if c == 34      { parts = parts.push("\\\"") }
+        else if c == 92 { parts = parts.push("\\\\") }
+        else if c == 10 { parts = parts.push("\\n") }
+        else if c == 13 { parts = parts.push("\\r") }
+        else if c == 9  { parts = parts.push("\\t") }
+        else if c == 8  { parts = parts.push("\\b") }
+        else if c == 12 { parts = parts.push("\\f") }
+        else if c < 32  {
+            // \u00XX emission — two hex digits after the leading 00.
+            let hi = c / 16
+            let lo = c % 16
+            let mut esc = []
+            esc = esc.push(92).push(117).push(48).push(48)      // "\\u00"
+            esc = esc.push(_js_hex_digit(hi))
+            esc = esc.push(_js_hex_digit(lo))
+            parts = parts.push(rt_str_from_chars(esc))
+        } else {
+            parts = parts.push(chr(c))
+        }
+        i = i + 1
+    }
+    parts = parts.push("\"")
+    return parts.join("")
+}
+
+@pure fn _js_hex_digit(n: int) -> int {
+    if n < 10 { return 48 + n }       // '0'-'9'
+    return 87 + n                     // 'a'-'f'
+}
+
+// Indent helper: pretty==true appends `level` × "  "; else "".
+fn _js_indent(pretty: bool, level: int) -> string {
+    if !pretty { return "" }
+    let mut parts = []
+    let mut i = 0
+    while i < level { parts = parts.push("  "); i = i + 1 }
+    return parts.join("")
+}
+
+@pure fn _js_newline(pretty: bool) -> string {
+    if pretty { return "\n" }
+    return ""
+}
+
+fn _js_emit(v, pretty: bool, level: int) -> string {
+    let t = typeof(v)
+    if t == "void" { return "null" }
+    if t == "bool" {
+        if v { return "true" }
+        return "false"
+    }
+    if t == "int" { return int_to_string(v) }
+    if t == "float" { return float_to_string(v, 6) }
+    if t == "string" { return _js_escape_string(v) }
+    if t == "array" {
+        let n = len(v)
+        if n == 0 { return "[]" }
+        let mut parts = []
+        parts = parts.push("[")
+        parts = parts.push(_js_newline(pretty))
+        let mut i = 0
+        while i < n {
+            parts = parts.push(_js_indent(pretty, level + 1))
+            parts = parts.push(_js_emit(v[i], pretty, level + 1))
+            if i + 1 < n { parts = parts.push(",") }
+            parts = parts.push(_js_newline(pretty))
+            i = i + 1
+        }
+        parts = parts.push(_js_indent(pretty, level))
+        parts = parts.push("]")
+        return parts.join("")
+    }
+    if t == "map" {
+        let ks = keys(v)
+        let n = len(ks)
+        if n == 0 { return "{}" }
+        let mut parts = []
+        parts = parts.push("{")
+        parts = parts.push(_js_newline(pretty))
+        let mut i = 0
+        while i < n {
+            parts = parts.push(_js_indent(pretty, level + 1))
+            let k = ks[i]
+            // Keys always stringified.
+            if typeof(k) == "string" {
+                parts = parts.push(_js_escape_string(k))
+            } else {
+                parts = parts.push(_js_escape_string(""))
+            }
+            if pretty { parts = parts.push(": ") } else { parts = parts.push(":") }
+            parts = parts.push(_js_emit(v[k], pretty, level + 1))
+            if i + 1 < n { parts = parts.push(",") }
+            parts = parts.push(_js_newline(pretty))
+            i = i + 1
+        }
+        parts = parts.push(_js_indent(pretty, level))
+        parts = parts.push("}")
+        return parts.join("")
+    }
+    return "null"
+}
+
+fn rt_json_stringify(v, pretty: bool) -> string {
+    return _js_emit(v, pretty, 0)
+}
