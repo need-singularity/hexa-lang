@@ -798,8 +798,36 @@ fn parse_stmt() {
     }
 
     // Expression statement or assignment (incl. compound: +=, -=, *=, /=, %=)
+    //
+    // T2 FIX-A Patch #5 — empty-LHS ident edge resume point.
+    // Before: when parse_expr() fell through (e.g. after an error-recovery
+    // advance that consumed the ident leaving only whitespace before `=`),
+    // the subsequent `Eq` branch still fired with `expr = empty_node()` —
+    // producing an AssignStmt with an empty LHS that downstream codegen
+    // silently emitted as `<blank>  = rhs;` in generated C.
+    //
+    // After: if parse_expr returned an empty node (name=="" && kind=="" or
+    // kind=="Empty") AND the next token is `Eq`/compound-assign, record a
+    // descriptive error and recover by skipping the statement. Mirrors the
+    // parse_resume_stmt Newline/RBrace guard style (Patch #4, bdd1a347).
+    //
+    // This also defensively fast-paths the common `Ident Eq Expr` form even
+    // when one or more spaces precede `=` — lexer already collapses runs of
+    // whitespace, but the guard below makes the pattern explicit so future
+    // refactors of parse_expr() precedence do not reintroduce the edge.
+    let stmt_start_tok = p_peek()
     let expr = parse_expr()
     let pk = p_peek_kind()
+    // Empty-LHS guard: reject `  = rhs` / `  += rhs` etc. with clear error.
+    let lhs_kind = expr.kind
+    let is_assign_tok = pk == "Eq" || pk == "PlusEq" || pk == "MinusEq" || pk == "StarEq" || pk == "SlashEq" || pk == "PercentEq" || pk == "NullCoalescingAssign" || pk == "OrAssign" || pk == "AndAssign"
+    if is_assign_tok && (lhs_kind == "" || lhs_kind == "Empty") {
+        p_record_error(stmt_start_tok.line, stmt_start_tok.col, "empty LHS before '=' — expected identifier or expression on left-hand side")
+        // Recover: consume the assign op + RHS so parse_stmt advances past the bad line.
+        p_advance()
+        let _ = parse_expr()
+        return empty_node()
+    }
     if pk == "Eq" {
         p_advance() // consume =
         let rhs = parse_expr()
@@ -2175,9 +2203,33 @@ fn parse_and() {
 // can only be bitwise-OR.  Lambda `|x| body` is parsed in parse_primary()
 // which is expression-start only.  Similarly `<<`/`>>` have no ambiguity
 // since generics `<T>` are parsed in type-annotation contexts, never here.
+//
+// T2 FIX-B — surface bit-op `<<`/`>>` support.
+// Before: a leading `<<` / `>>` (no left operand) fell into parse_comparison
+// → parse_primary's unknown-token branch, which recorded an error and
+// returned empty_node(). The surrounding while loop then still matched the
+// Shl/Shr peek and built a BinOp(left=empty_node, right=...) which the
+// downstream interpreter evaluated as 0 — producing the user-visible
+// "silent reject + 0 리턴" symptom. Workaround was to write `x*pow2(n)` or
+// `x/pow2(n)` explicitly.
+// After: when left came back empty AND the peek is Shl/Shr, we record a
+// clear error and do not build a phantom BinOp. The normal infix case
+// (`x << y`, `x >> y`) is unchanged. Continuation across newlines still
+// works via p_continue_bin_op(["...","Shl","Shr"]).
 fn parse_bit_ops() {
     let mut left = parse_comparison()
     while p_peek_kind() == "BitAnd" || p_peek_kind() == "BitXor" || p_peek_kind() == "BitOr" || p_peek_kind() == "Shl" || p_peek_kind() == "Shr" || p_continue_bin_op(["BitAnd", "BitXor", "BitOr", "Shl", "Shr"]) {
+        let pk_bit = p_peek_kind()
+        let left_kind_bit = left.kind
+        // Guard: empty LHS in front of a bit op (esp. Shl/Shr at expr-start)
+        // — record error once, consume the op + rhs, and bail to outer caller.
+        if (pk_bit == "Shl" || pk_bit == "Shr") && (left_kind_bit == "" || left_kind_bit == "Empty") {
+            let err_tok = p_peek()
+            p_record_error(err_tok.line, err_tok.col, "'" + err_tok.value + "' with no left operand — bit-shift requires LHS")
+            p_advance()
+            let _rhs = parse_comparison()
+            return empty_node()
+        }
         let op_tok = p_advance()
         p_skip_newlines()
         let right = parse_comparison()
