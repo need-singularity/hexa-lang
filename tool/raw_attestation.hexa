@@ -1,0 +1,436 @@
+#!hexa strict
+// tool/raw_attestation.hexa — raw#0 commit-bound raw_all attestation token
+//
+// PURPOSE
+//   Bind a successful `raw_all` pass to a specific commit. The token
+//   captures the SSOT fingerprint at the moment raw_all succeeded,
+//   signs it with a repo-private HMAC key, and is intended to be
+//   embedded as a git commit trailer:
+//
+//       raw-all-attest: raw-all-attest:v1:<ssot_sha>:<ts>:<hmac>
+//
+//   Server-side CI re-computes the HMAC from the same key (CI secret)
+//   and rejects commits whose trailer does not match the current SSOT
+//   state. Because the CI runner has no hexa binary, the verification
+//   logic is mirrored as a bash script emitted on demand by the
+//   `emit-verify` subcommand below (raw#8 HEXA-ONLY exception — the
+//   bash text lives INSIDE this .hexa file; no standalone .sh is
+//   committed to the repo).
+//
+// FORMAT
+//       raw-all-attest:v1:<ssot_sha256>:<timestamp>:<hmac>
+//
+//   ssot_sha256 — sha256(cat .raw .own .ext .roadmap .loop) — reuses
+//                 tool/raw_audit.hexa :: ssot_fingerprint().
+//   timestamp   — ISO-8601 UTC (date -u +"%Y-%m-%dT%H:%M:%SZ").
+//   hmac        — HMAC-SHA256(ssot_sha256 + "|" + timestamp, repo_key)
+//                 as lowercase hex.
+//   repo_key    — read from `.raw-attest-key`. If absent, a fresh
+//                 32-byte random key is generated (openssl rand -hex 32)
+//                 and a warning is emitted. The key file is
+//                 gitignored by default and MUST NOT be committed.
+//
+// USAGE
+//   ./hexa tool/raw_attestation.hexa generate       — print token
+//   ./hexa tool/raw_attestation.hexa verify <token> — exit 0 if valid
+//   ./hexa tool/raw_attestation.hexa trailer <msg>  — append trailer to msg
+//   ./hexa tool/raw_attestation.hexa check <commit> — verify trailer of commit
+//   ./hexa tool/raw_attestation.hexa emit-verify    — print the server-side
+//                                                     bash verifier to stdout
+//                                                     (CI pipes > a file on
+//                                                     the runner — never
+//                                                     checked into the repo)
+//
+// VERIFY WINDOW
+//   A token older than 1 hour (or dated >1h in the future) is rejected
+//   even if its HMAC matches. This bounds replay of stale tokens.
+//
+// DEPENDENCIES
+//   · openssl (dgst -sha256 -hmac, rand -hex)
+//   · sha256sum OR shasum -a 256 (ssot_fingerprint reuses the latter)
+//   · git (only for `check` subcommand)
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+// ─── constants ──────────────────────────────────────────────────
+
+fn _token_version() -> string { return "v1" }
+fn _token_prefix()  -> string { return "raw-all-attest" }
+fn _key_path()      -> string { return ".raw-attest-key" }
+fn _trailer_label() -> string { return "raw-all-attest" }
+fn _window_seconds() -> int   { return 3600 }  // +-1 hour
+
+// ─── helpers ────────────────────────────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e " + _shell_quote(path) + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+// ─── repo key management ────────────────────────────────────────
+
+fn _read_key() -> string {
+    if !_path_exists(_key_path()) { return "" }
+    let raw = to_string(read_file(_key_path())).trim()
+    return raw
+}
+
+fn _generate_key() -> string {
+    // openssl rand -hex 32 → 64-char lowercase hex key
+    let k = to_string(exec("openssl rand -hex 32")).trim()
+    // write via safe_write_file (law-gated)
+    let ok = safe_write_file(_key_path(), k + "\n")
+    if !ok {
+        eprintln("raw_attestation: FAILED to write " + _key_path())
+        return ""
+    }
+    // chmod 600 — best effort
+    let _r = exec_with_status("chmod 600 " + _shell_quote(_key_path()) + " 2>/dev/null")
+    eprintln("raw_attestation: WARN — generated new " + _key_path()
+             + " (64 hex chars). Keep this file OUT of the repo "
+             + "(check .gitignore) and mirror it as a CI secret "
+             + "named REPO_ATTEST_KEY.")
+    return k
+}
+
+fn _ensure_key() -> string {
+    let existing = _read_key()
+    if existing != "" { return existing }
+    return _generate_key()
+}
+
+// ─── HMAC ───────────────────────────────────────────────────────
+
+fn _hmac_sha256(msg: string, key: string) -> string {
+    // openssl dgst output shape:
+    //   "HMAC-SHA2-256(stdin)= <hex>"
+    // cut -d' ' -f2 strips the label.
+    let cmd = "printf %s " + _shell_quote(msg)
+            + " | openssl dgst -sha256 -mac HMAC -macopt hexkey:" + _shell_quote(key)
+            + " | awk '{print $NF}'"
+    return to_string(exec(cmd)).trim()
+}
+
+// ─── token build / parse ────────────────────────────────────────
+
+fn _build_token(sha: string, ts: string, hmac: string) -> string {
+    return _token_prefix() + ":" + _token_version()
+         + ":" + sha + ":" + ts + ":" + hmac
+}
+
+fn _split_token(token: string) -> array {
+    // returns [prefix, version, sha, ts, hmac] or [] on malformed.
+    let parts = split(token, ":")
+    if len(parts) != 5 { return [] }
+    return parts
+}
+
+// ─── timestamp window check ─────────────────────────────────────
+
+fn _epoch_of(ts: string) -> int {
+    // date -d "<ts>" +%s — GNU coreutils. macOS fallback uses -jf.
+    let uname = to_string(exec("uname -s")).trim()
+    let mut cmd = ""
+    if uname == "Darwin" {
+        cmd = "date -u -jf \"%Y-%m-%dT%H:%M:%SZ\" " + _shell_quote(ts) + " +%s 2>/dev/null"
+    } else {
+        cmd = "date -u -d " + _shell_quote(ts) + " +%s 2>/dev/null"
+    }
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return -1 }
+    // parse digits
+    let mut n = 0
+    let mut i = 0
+    while i < len(out) {
+        let c = out.substring(i, i + 1)
+        if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+        else { break }
+        i = i + 1
+    }
+    return n
+}
+
+fn _now_epoch() -> int {
+    let out = to_string(exec("date -u +%s")).trim()
+    let mut n = 0
+    let mut i = 0
+    while i < len(out) {
+        let c = out.substring(i, i + 1)
+        if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+        else { break }
+        i = i + 1
+    }
+    return n
+}
+
+fn _within_window(ts: string) -> bool {
+    let te = _epoch_of(ts)
+    if te < 0 { return false }
+    let now = _now_epoch()
+    let delta = te > now ? (te - now) : (now - te)
+    return delta <= _window_seconds()
+}
+
+// ─── command: generate ──────────────────────────────────────────
+
+pub fn generate_token() -> string {
+    let sha = ssot_fingerprint()
+    if sha == "" {
+        eprintln("raw_attestation: ssot_fingerprint empty — missing SSOT?")
+        return ""
+    }
+    let ts = _iso_utc_now()
+    let key = _ensure_key()
+    if key == "" { return "" }
+    let hmac = _hmac_sha256(sha + "|" + ts, key)
+    if hmac == "" { return "" }
+    return _build_token(sha, ts, hmac)
+}
+
+fn cmd_generate() -> int {
+    let t = generate_token()
+    if t == "" { return 1 }
+    println(t)
+    return 0
+}
+
+// ─── command: verify ────────────────────────────────────────────
+
+pub fn verify_token(token: string) -> bool {
+    let p = _split_token(token)
+    if len(p) == 0 {
+        eprintln("raw_attestation: malformed token (expected 5 colon-fields)")
+        return false
+    }
+    if p[0] != _token_prefix() {
+        eprintln("raw_attestation: bad prefix: " + p[0])
+        return false
+    }
+    if p[1] != _token_version() {
+        eprintln("raw_attestation: unsupported version: " + p[1])
+        return false
+    }
+    let sha = p[2]
+    let ts = p[3]
+    let hmac = p[4]
+
+    if !_within_window(ts) {
+        eprintln("raw_attestation: timestamp outside +-1h window: " + ts)
+        return false
+    }
+
+    let key = _read_key()
+    if key == "" {
+        eprintln("raw_attestation: no " + _key_path() + " — cannot verify")
+        return false
+    }
+
+    let expect = _hmac_sha256(sha + "|" + ts, key)
+    if expect == "" {
+        eprintln("raw_attestation: hmac recompute failed")
+        return false
+    }
+    if expect != hmac {
+        eprintln("raw_attestation: HMAC MISMATCH")
+        return false
+    }
+    return true
+}
+
+fn cmd_verify(token: string) -> int {
+    if verify_token(token) {
+        println("attestation: OK")
+        return 0
+    }
+    return 1
+}
+
+// ─── command: trailer ───────────────────────────────────────────
+
+pub fn trailer_for(msg: string) -> string {
+    let t = generate_token()
+    if t == "" { return msg }
+    // Two blank lines to separate subject/body from trailers,
+    // matching git's conventional trailer parsing.
+    return msg + "\n\n" + _trailer_label() + ": " + t
+}
+
+fn cmd_trailer(msg: string) -> int {
+    let out = trailer_for(msg)
+    if out == msg { return 1 }
+    println(out)
+    return 0
+}
+
+// ─── command: check <commit> ────────────────────────────────────
+
+fn _extract_trailer(commit_msg: string) -> string {
+    let label = _trailer_label() + ":"
+    let lines = split(commit_msg, "\n")
+    let mut i = len(lines) - 1
+    while i >= 0 {
+        let ln = lines[i].trim()
+        if len(ln) >= len(label) && ln.substring(0, len(label)) == label {
+            return ln.substring(len(label), len(ln)).trim()
+        }
+        i = i - 1
+    }
+    return ""
+}
+
+pub fn check_commit(commit: string) -> bool {
+    let cmd = "git log -1 --format=%B " + _shell_quote(commit) + " 2>/dev/null"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("raw_attestation: git log failed for " + commit)
+        return false
+    }
+    let msg = to_string(r[0])
+    let token = _extract_trailer(msg)
+    if token == "" {
+        eprintln("raw_attestation: no '" + _trailer_label() + ":' trailer on " + commit)
+        return false
+    }
+    return verify_token(token)
+}
+
+fn cmd_check(commit: string) -> int {
+    if check_commit(commit) {
+        println("attestation: OK (" + commit + ")")
+        return 0
+    }
+    return 1
+}
+
+// ─── command: emit-verify (server-side bash) ────────────────────
+//
+//   Prints a self-contained bash verifier to stdout. CI pipelines
+//   consume it like:
+//
+//       ./hexa tool/raw_attestation.hexa emit-verify > /tmp/verify.sh
+//       chmod +x /tmp/verify.sh
+//       REPO_ATTEST_KEY=$SECRET /tmp/verify.sh $GITHUB_SHA
+//
+//   The script is NOT committed to the repo (raw#8 HEXA-ONLY). It
+//   mirrors the `check` subcommand in pure bash so the CI runner
+//   (which has no hexa binary) can still validate the trailer.
+
+fn _bash_verifier_text() -> string {
+    // NOTE: kept verbatim in sync with check_commit() above. If you
+    // change the token format, update both.
+    let mut s = ""
+    s = s + "#!/usr/bin/env bash\n"
+    s = s + "# verify_attestation.sh — emitted by tool/raw_attestation.hexa\n"
+    s = s + "# Re-computes the raw-all-attest HMAC for a given commit.\n"
+    s = s + "# Usage: REPO_ATTEST_KEY=<hex> verify_attestation.sh <commit>\n"
+    s = s + "# Exit: 0 valid, 1 invalid, 2 invocation error.\n"
+    s = s + "set -euo pipefail\n"
+    s = s + "bad() { echo \"verify_attestation: $*\" >&2; exit 1; }\n"
+    s = s + "if [[ $# -lt 1 ]]; then\n"
+    s = s + "    echo \"usage: REPO_ATTEST_KEY=<hex> $0 <commit>\" >&2; exit 2\n"
+    s = s + "fi\n"
+    s = s + "COMMIT=\"$1\"\n"
+    s = s + "if [[ -z \"${REPO_ATTEST_KEY:-}\" ]]; then\n"
+    s = s + "    echo \"verify_attestation: REPO_ATTEST_KEY required\" >&2; exit 2\n"
+    s = s + "fi\n"
+    s = s + "command -v git     >/dev/null || { echo missing:git     >&2; exit 2; }\n"
+    s = s + "command -v openssl >/dev/null || { echo missing:openssl >&2; exit 2; }\n"
+    s = s + "command -v awk     >/dev/null || { echo missing:awk     >&2; exit 2; }\n"
+    s = s + "if command -v sha256sum >/dev/null 2>&1; then SHA_CMD=\"sha256sum\";\n"
+    s = s + "elif command -v shasum >/dev/null 2>&1;   then SHA_CMD=\"shasum -a 256\";\n"
+    s = s + "else echo 'missing: sha256sum or shasum' >&2; exit 2; fi\n"
+    s = s + "MSG=\"$(git log -1 --format=%B \"$COMMIT\" 2>/dev/null)\" || bad \"git log failed: $COMMIT\"\n"
+    s = s + "TRAILER=\"$(printf '%s\\n' \"$MSG\" | awk '/^raw-all-attest: / { line=$0 } END { print line }')\"\n"
+    s = s + "[[ -n \"$TRAILER\" ]] || bad \"no 'raw-all-attest:' trailer on $COMMIT\"\n"
+    s = s + "TOKEN=\"${TRAILER#raw-all-attest: }\"\n"
+    s = s + "IFS=':' read -r P1 P2 P3 P4 P5 <<<\"$TOKEN\" || bad 'malformed token'\n"
+    s = s + "[[ \"$P1\" == 'raw-all-attest' ]] || bad \"bad prefix: $P1\"\n"
+    s = s + "[[ \"$P2\" == 'v1'             ]] || bad \"bad version: $P2\"\n"
+    s = s + "SSOT_SHA=\"$P3\"; TS=\"$P4\"; HMAC_CLAIMED=\"$P5\"\n"
+    s = s + "[[ -n \"$SSOT_SHA\" && -n \"$TS\" && -n \"$HMAC_CLAIMED\" ]] || bad 'empty field'\n"
+    s = s + "TS_EPOCH=\"$(date -u -d \"$TS\" +%s 2>/dev/null || true)\"\n"
+    s = s + "if [[ -z \"$TS_EPOCH\" ]]; then\n"
+    s = s + "    TS_EPOCH=\"$(date -u -jf '%Y-%m-%dT%H:%M:%SZ' \"$TS\" +%s 2>/dev/null || true)\"\n"
+    s = s + "fi\n"
+    s = s + "[[ -n \"$TS_EPOCH\" ]] || bad \"cannot parse timestamp: $TS\"\n"
+    s = s + "NOW=\"$(date -u +%s)\"\n"
+    s = s + "DELTA=$(( TS_EPOCH > NOW ? TS_EPOCH - NOW : NOW - TS_EPOCH ))\n"
+    s = s + "(( DELTA <= 3600 )) || bad \"timestamp outside +-1h (delta=${DELTA}s)\"\n"
+    s = s + "CURRENT_SHA=\"$(cat .raw .own .ext .roadmap .loop 2>/dev/null | $SHA_CMD | awk '{print $1}')\"\n"
+    s = s + "[[ -n \"$CURRENT_SHA\" ]] || bad 'ssot fingerprint empty'\n"
+    s = s + "[[ \"$CURRENT_SHA\" == \"$SSOT_SHA\" ]] || bad \"SSOT drift: token=$SSOT_SHA current=$CURRENT_SHA\"\n"
+    s = s + "HMAC_EXPECT=\"$(printf '%s' \"${SSOT_SHA}|${TS}\" | openssl dgst -sha256 -mac HMAC -macopt \"hexkey:${REPO_ATTEST_KEY}\" | awk '{print $NF}')\"\n"
+    s = s + "[[ -n \"$HMAC_EXPECT\" ]] || bad 'hmac recompute failed'\n"
+    s = s + "[[ \"$HMAC_EXPECT\" == \"$HMAC_CLAIMED\" ]] || bad 'HMAC MISMATCH'\n"
+    s = s + "echo \"attestation: OK ($COMMIT)\"\n"
+    s = s + "exit 0\n"
+    return s
+}
+
+fn cmd_emit_verify() -> int {
+    print(_bash_verifier_text())
+    return 0
+}
+
+// ─── CLI dispatch ───────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_attestation.hexa <subcommand>")
+    eprintln("  generate             print a fresh token")
+    eprintln("  verify <token>       exit 0 if token is valid")
+    eprintln("  trailer <msg>        print <msg> with raw-all-attest trailer")
+    eprintln("  check <commit>       verify trailer of the given commit")
+    eprintln("  emit-verify          print server-side bash verifier (stdout)")
+}
+
+let _av = argv()
+let mut cmd = ""
+let mut arg1 = ""
+let mut i = 2
+while i < len(_av) {
+    let a = _av[i]
+    if cmd == "" {
+        if a == "generate" || a == "verify" || a == "trailer"
+        || a == "check" || a == "emit-verify" {
+            cmd = a
+        }
+    } else if arg1 == "" {
+        arg1 = a
+    }
+    i = i + 1
+}
+
+if cmd == "" {
+    _usage()
+    exit(2)
+}
+
+let mut rc = 0
+if cmd == "generate" { rc = cmd_generate() }
+else if cmd == "verify" {
+    if arg1 == "" { eprintln("verify: missing <token>"); exit(2) }
+    rc = cmd_verify(arg1)
+}
+else if cmd == "trailer" {
+    if arg1 == "" { eprintln("trailer: missing <msg>"); exit(2) }
+    rc = cmd_trailer(arg1)
+}
+else if cmd == "check" {
+    if arg1 == "" { eprintln("check: missing <commit>"); exit(2) }
+    rc = cmd_check(arg1)
+}
+else if cmd == "emit-verify" { rc = cmd_emit_verify() }
+else {
+    _usage()
+    exit(2)
+}
+exit(rc)
