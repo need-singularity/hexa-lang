@@ -1936,10 +1936,33 @@ fn parse_invariant_decl() {
     }
 }
 
-// ── use path::to::module ────────────────────────────────────
-
+// ── use path::to::module  OR  use "path/to/module" ──────────
+//
+// Accepts both forms:
+//   (a) Rust-style ident path — `use foo::bar::baz`
+//       Stored as items = ["foo", "bar", "baz"]
+//   (b) String-literal path — `use "serving/voice_routes"`
+//       Stored as name = "serving/voice_routes" (ImportStmt shape)
+// Form (b) is the dominant usage in downstream hexa projects (anima
+// serving/*.hexa etc.) and was previously parse-error'd here because
+// p_expect_ident rejects StringLit tokens. The module_loader preprocessor
+// masked this at the CLI layer by commenting out the directive before the
+// parser ran; direct stage0 invocations (bypassing the preprocessor) and
+// `hexa parse` on raw source both leaked the parse error.
 fn parse_use_decl() {
     p_advance() // consume 'use'
+    // Form (b): string-literal path → ImportStmt shape for runtime loader.
+    if p_peek_kind() == "StringLit" {
+        let str_tok = p_advance()
+        return #{
+            "kind": "ImportStmt", "name": str_tok.value, "value": "", "op": "",
+            "left": "", "right": "", "cond": "", "then_body": "", "else_body": "",
+            "params": "", "body": "", "args": "", "fields": "", "items": "",
+            "variants": "", "arms": "", "iter_expr": "", "ret_type": "",
+            "target": "", "trait_name": "", "methods": ""
+        }
+    }
+    // Form (a): ident::ident::... path.
     let mut path = []
     path = path.push(p_expect_ident())
     while p_peek_kind() == "ColonColon" {
@@ -5029,6 +5052,23 @@ pub let mut env_cache = []     // legacy alias: len==64 flag retained for fallba
 // On scope pop, only those buckets need pruning — not all 64.
 pub let mut env_scope_dirty = []   // stack of [bucket_idx, ...] arrays
 pub let mut env_fns = []      // function registry: name -> {params, body}
+// ── Runtime `use`/`import` module cache (2026-04-20 bugfix) ──
+// CLI path (self/main.hexa cmd_run) preprocesses imports via
+// self/module_loader.hexa BEFORE the interpreter sees them, so UseStmt/
+// ImportStmt nodes normally never reach exec_stmt. This cache backs the
+// runtime-level fallback path for cases the preprocessor cannot cover
+// (direct build/hexa_stage0 invocation, re-entered AST eval, `use a::b`
+// Rust-style paths that module_loader.hexa's `replace("\nuse \"", ...)`
+// does NOT match, etc.). Keyed by resolved absolute/relative path; value
+// is true once the module's top-level fns/structs are pushed into env_fns.
+// Guards against circular imports + double-load.
+// See feedback_hexa_silent_exit_5_imports.md for the separate 3+ chain
+// silent-exit regression (not fixed here; this fallback keeps depth low).
+pub let mut __use_loaded_paths = []
+// Script dir captured at interpret() start — used by UseStmt runtime loader
+// to resolve caller-relative paths (`use "voice_routes"` from serving/*.hexa
+// must look in serving/, not cwd).
+pub let mut __use_script_dir = ""
 // ── O(1) fn_lookup cache (perf) ─────────────────────────
 // Parallel to env_fns: 64 buckets, each a list of [name, env_fns_index].
 // find_fn scans only the name's bucket and picks the entry with the
@@ -8252,8 +8292,29 @@ fn exec_stmt_at(stmts, idx) {
         return val_void()
     }
 
-    // Stmt::Use / ImportStmt — module path import: no-op (resolution at parser level)
+    // Stmt::Use / ImportStmt — module path import.
+    //
+    // 2026-04-20 fix (shared/state/voice_routes_loader_stall_20260420.json):
+    //   Previously `return val_void()` with no side effect → imported fns
+    //   never landed in env_fns → "Runtime error: undefined function: X"
+    //   for every call site in downstream projects (anima voice_routes /
+    //   hire_routes E2E blocked dest1_alm P1). The CLI preprocessor
+    //   (self/main.hexa cmd_run → self/module_loader.hexa) already inlines
+    //   `use "path"` directives for the normal flow, but direct stage0
+    //   invocations + `use a::b::c` Rust-style paths fell through the
+    //   preprocessor's textual replace() patterns and hit this no-op.
+    //
+    // Fix: resolve path, parse target module, register its top-level fns
+    // into env_fns + run its top-level body for global-let initialisation.
+    // Dedup via __use_loaded_paths so re-entry and circular imports are safe.
+    // Silent on unresolvable paths (matches legacy no-op — caller's own
+    // "undefined function" error surfaces downstream if the load failed).
     if k == "Use" || k == "UseStmt" || k == "ImportStmt" {
+        let _use_path = __use_extract_path(node)
+        if _use_path == "" { return val_void() }
+        let _resolved = __use_resolve_module_path(_use_path)
+        if _resolved == "" { return val_void() }
+        __use_load_module_from_path(_resolved)
         return val_void()
     }
 
@@ -8581,6 +8642,156 @@ fn eval_block(stmts) {
     let result = eval_body(stmts)
     env_pop_scope()
     return result
+}
+
+// ── Runtime `use`/`import` fallback loader (2026-04-20 bugfix) ──
+//
+// Background:
+//   The canonical import resolution path is the CLI preprocessor in
+//   self/main.hexa::cmd_run, which invokes self/module_loader.hexa to
+//   flatten `use "path"` / `import "path"` directives into a single source
+//   before the interpreter sees them. That path handles transitive imports,
+//   hashset dedup, and leaves-first topo order.
+//
+// The gap this block closes:
+//   If hexa_full is entered WITHOUT the preprocessor (direct stage0 run,
+//   eval'd AST, `use a::b::c` Rust-style paths that module_loader's
+//   replace("\nuse \"", ...) does not match), UseStmt/ImportStmt nodes
+//   previously executed as silent val_void() — downstream projects then saw
+//   "Runtime error: undefined function" for every imported symbol. Ref:
+//   shared/state/voice_routes_loader_stall_20260420.json.
+//
+// Semantics (best-effort, preprocessor-compatible):
+//   * Resolve path: `<name>.hexa`, `<name>`, caller-dir-relative, cwd
+//   * Dedup via __use_loaded_paths (prevents circular + double-load)
+//   * Tokenize + parse the module, then register every top-level
+//     FnDecl/AsyncFnDecl/PureFnDecl/ExternFnDecl into env_fns (mirrors
+//     the hoist pass in interpret()). Struct/enum decls are left to the
+//     normal eval pass when the module body runs.
+//   * Top-level exec via eval_body so global `let` bindings initialise.
+//   * On any resolution or parse failure: silently return val_void()
+//     (match the legacy behaviour — interpreter never aborts on bad use).
+//
+// Depth caveat:
+//   feedback_hexa_silent_exit_5_imports.md documents a stage0 silent-exit
+//   at 3+ import chain depth. This loader does NOT work around that — it
+//   just resolves ONE level at a time. Deep chains still need the CLI
+//   preprocessor or an explicit flatten step.
+
+fn __use_resolve_module_path(name) {
+    // 1. Exact path as given (absolute or cwd-relative).
+    if file_exists(name) { return name }
+    let with_ext = name + ".hexa"
+    if file_exists(with_ext) { return with_ext }
+    // 2. Script-dir-relative — mirrors module_loader.hexa's caller-dir lookup.
+    //    `use "voice_routes"` from serving/serve_alm_native.hexa must find
+    //    serving/voice_routes.hexa, not cwd/voice_routes.hexa.
+    if len(__use_script_dir) > 0 {
+        let sd_raw = __use_script_dir + "/" + name
+        if file_exists(sd_raw) { return sd_raw }
+        let sd_ext = __use_script_dir + "/" + name + ".hexa"
+        if file_exists(sd_ext) { return sd_ext }
+    }
+    // 3. HEXA_LANG project-root fallback — matches module_loader.hexa semantics.
+    let hl = env_var("HEXA_LANG")
+    if len(hl) > 0 {
+        let pr = hl + "/" + name
+        if file_exists(pr) { return pr }
+        let pr_ext = hl + "/" + name + ".hexa"
+        if file_exists(pr_ext) { return pr_ext }
+    }
+    return ""
+}
+
+fn __use_register_module_fns(mod_ast) {
+    // Mirrors interpret()'s FIX-9-1 pre-registration pass (lines ~17056–17086).
+    // Pushes every top-level fn-like decl into env_fns + fn_cache + env so that
+    // subsequent `find_fn` / `call_user_fn` calls from the caller resolve.
+    let mut _mi = 0
+    while _mi < len(mod_ast) {
+        let _mn = mod_ast[_mi]
+        if type_of(_mn) == "struct" || type_of(_mn) == "map" {
+            let _mk = _mn.kind
+            if type_of(_mk) == "string" {
+                if _mk == "FnDecl" || _mk == "AsyncFnDecl" || _mk == "PureFnDecl" {
+                    env_fns = env_fns.push([_mn.name, _mn.params, _mn.body])
+                    fn_cache_add(_mn.name, len(env_fns) - 1)
+                    let _mfv = val_fn(_mn.name, _mn.params, _mn.body)
+                    env_define(_mn.name, _mfv)
+                    if _mn.value != "" {
+                        fn_attrs_set(_mn.name, _mn.value)
+                    }
+                }
+                if _mk == "ExternFnDecl" {
+                    let _ec = _mn.value
+                    if _ec == "" { _ec = _mn.name }
+                    let _el = _mn.op
+                    extern_fns = extern_fns.push([_mn.name, _ec, _mn.ret_type, _el])
+                    extern_fn_cache_add(_mn.name, len(extern_fns) - 1)
+                    env_define(_mn.name, val_str("__extern_" + _mn.name))
+                }
+            }
+        }
+        _mi = _mi + 1
+    }
+}
+
+fn __use_load_module_from_path(resolved_path) {
+    // Dedup — prevent circular imports + double load.
+    let mut _ui = 0
+    while _ui < len(__use_loaded_paths) {
+        if __use_loaded_paths[_ui] == resolved_path { return true }
+        _ui = _ui + 1
+    }
+    __use_loaded_paths = __use_loaded_paths.push(resolved_path)
+
+    // Snapshot parser globals — tokenize + parse share mutable state and the
+    // outer parse has already completed, but a defensive save-restore keeps
+    // re-entrant use (module-level use inside a loaded module) safe.
+    let _saved_tokens = p_tokens
+    let _saved_pos = p_pos
+    let _saved_errors = p_errors
+
+    let _src = read_file(resolved_path)
+    let _toks = tokenize(_src)
+    let _mod_ast = parse(_toks)
+
+    // Restore parser globals — the outer AST was already parsed, but other
+    // eval paths (e.g. `@comptime`) might re-enter parse later.
+    p_tokens = _saved_tokens
+    p_pos = _saved_pos
+    p_errors = _saved_errors
+
+    __use_register_module_fns(_mod_ast)
+    // Also execute module's top-level stmts so globals/consts initialise.
+    // eval_body respects return_flag/throw_flag; if the module throws on
+    // top-level, that propagates to the caller — same as a preprocessed run.
+    eval_body(_mod_ast)
+    return true
+}
+
+fn __use_extract_path(node) {
+    // ImportStmt: parser stores path in node.name as string.
+    if node.name != "" && type_of(node.name) == "string" { return node.name }
+    // UseStmt: parser stores ident segments in node.items as array.
+    let items = node.items
+    if type_of(items) == "array" {
+        let n = len(items)
+        if n == 0 { return "" }
+        // Join with "/" so `use foo::bar` resolves to foo/bar(.hexa)
+        let mut parts = []
+        let mut _pi = 0
+        while _pi < n {
+            let seg = items[_pi]
+            if type_of(seg) == "string" {
+                parts = parts.push(seg)
+            }
+            _pi = _pi + 1
+        }
+        if len(parts) == 0 { return "" }
+        return parts.join("/")
+    }
+    return ""
 }
 
 // ── Function call ────────────────────────────────────────
@@ -14942,7 +15153,10 @@ fn call_method(obj, method, args) {
             return val_array([])
         }
         if method == "replace" || method == "replacen" { return val_str("") }
-        if method == "find" || method == "rfind" || method == "index_of" { return val_int(-1) }
+        if method == "find" || method == "rfind" || method == "index_of" || method == "last_index_of" { return val_int(-1) }
+        if method == "char_at" || method == "slice" || method == "nth_char" || method == "char_substring" { return val_str("") }
+        if method == "byte_at" || method == "char_count" { return val_int(0) }
+        if method == "to_lowercase" || method == "to_uppercase" { return val_str("") }
         if method == "to_string" { return val_str(obj.str_val) }
         // 그 외 메소드는 fall-through (오류 명시는 dispatcher 끝에서)
     }
@@ -14951,9 +15165,26 @@ fn call_method(obj, method, args) {
     if obj.tag == TAG_STR {
         let s = obj.str_val
         if method == "chars" {
-            let cs = s.chars()
+            // 2026-04-20: UTF-8 codepoint-aware iteration at dispatch level.
+            // Native s.chars() byte-splits multibyte content (Korean/emoji),
+            // corrupting downstream index math. Walk UTF-8 boundaries here:
+            // head bytes are those with top 2 bits != 10 (0x80..=0xBF).
+            let sl = len(s)
             let mut result = []
-            for c in cs { result = result.push(val_str(to_string(c))) }
+            let mut bi = 0
+            while bi < sl {
+                let b = char_code(s, bi)
+                let mut cp_len = 1
+                if b >= 240 { cp_len = 4 }
+                else if b >= 224 { cp_len = 3 }
+                else if b >= 192 { cp_len = 2 }
+                else if b >= 128 { cp_len = 1 }
+                else { cp_len = 1 }
+                let mut endx = bi + cp_len
+                if endx > sl { endx = sl }
+                result = result.push(val_str(s.substring(bi, endx)))
+                bi = endx
+            }
             return val_array(result)
         }
         if method == "len" { return val_int(len(s)) }
@@ -15091,6 +15322,145 @@ fn call_method(obj, method, args) {
             let mut result = []
             for c in cs { result = result.push(val_int(char_code(to_string(c), 0))) }
             return val_array(result)
+        }
+        // ── Byte-indexed string API (2026-04-20) ────────────────
+        // Standardized semantics: ALL string indices are BYTE offsets.
+        // This matches s.len() (bytes), s.index_of() (bytes), and
+        // s.substring(a,b) (bytes via native memcpy). For multibyte
+        // (UTF-8) content use .char_count() / .nth_char() / .chars().
+        if method == "find" {
+            // .find(sub) — alias for .index_of. Missing method fix
+            // (previously forced anima to workaround via .index_of).
+            return val_int(s.index_of(args[0].str_val))
+        }
+        if method == "rfind" || method == "last_index_of" {
+            // .last_index_of(sub) — byte position of LAST occurrence.
+            // Returns -1 if not found. Previously missing; workaround
+            // was manual backward scan (see tool/raw_exemptions.hexa).
+            if len(args) == 0 || args[0].tag != TAG_STR { return val_int(-1) }
+            let sub = args[0].str_val
+            let slen = len(s)
+            let sublen = len(sub)
+            if sublen == 0 { return val_int(slen) }
+            if sublen > slen { return val_int(-1) }
+            let mut li = slen - sublen
+            while li >= 0 {
+                if s.substring(li, li + sublen) == sub { return val_int(li) }
+                li = li - 1
+            }
+            return val_int(-1)
+        }
+        if method == "char_at" {
+            // .char_at(i) — byte-indexed single-byte extract.
+            // For ASCII this returns the expected character; for
+            // multibyte content it returns the raw byte at i (use
+            // .nth_char(i) for codepoint-aware access).
+            if len(args) == 0 { return val_str("") }
+            let i = args[0].int_val
+            let sl = len(s)
+            if i < 0 || i >= sl { return val_str("") }
+            return val_str(s.substring(i, i + 1))
+        }
+        if method == "slice" {
+            // .slice(start, end) — alias for .substring(start, end).
+            // Byte indices. Both args optional-ish: if end omitted
+            // (len(args) < 2), slice to end of string.
+            if len(args) == 0 { return val_str(s) }
+            let sl = len(s)
+            let mut a = args[0].int_val
+            let mut b = if len(args) >= 2 { args[1].int_val } else { sl }
+            if a < 0 { a = 0 }
+            if b > sl { b = sl }
+            if a >= b { return val_str("") }
+            return val_str(s.substring(a, b))
+        }
+        if method == "byte_at" {
+            // .byte_at(i) — raw byte value (0-255) at byte index i.
+            // Returns -1 if out of range.
+            if len(args) == 0 { return val_int(-1) }
+            let i = args[0].int_val
+            let sl = len(s)
+            if i < 0 || i >= sl { return val_int(-1) }
+            return val_int(char_code(s, i))
+        }
+        if method == "char_count" {
+            // .char_count() — UTF-8 codepoint count (multibyte-safe).
+            // For ASCII equals .len(); for Korean/emoji is smaller.
+            // Counts bytes whose top 2 bits are not 10 (continuation).
+            let sl = len(s)
+            let mut cc = 0
+            let mut bi = 0
+            while bi < sl {
+                let b = char_code(s, bi)
+                // continuation bytes: 10xxxxxx (0x80..=0xBF)
+                if b < 128 || b >= 192 { cc = cc + 1 }
+                bi = bi + 1
+            }
+            return val_int(cc)
+        }
+        if method == "nth_char" {
+            // .nth_char(i) — UTF-8 codepoint at char position i,
+            // returned as a string. Returns "" if out of range.
+            if len(args) == 0 { return val_str("") }
+            let target = args[0].int_val
+            if target < 0 { return val_str("") }
+            let sl = len(s)
+            let mut cc = 0
+            let mut bi = 0
+            let mut start = -1
+            let mut endx = -1
+            while bi < sl {
+                let b = char_code(s, bi)
+                let is_head = b < 128 || b >= 192
+                if is_head {
+                    if cc == target { start = bi }
+                    if start >= 0 && bi > start && endx == -1 { endx = bi }
+                    cc = cc + 1
+                }
+                bi = bi + 1
+            }
+            if start < 0 { return val_str("") }
+            if endx < 0 { endx = sl }
+            return val_str(s.substring(start, endx))
+        }
+        if method == "char_substring" {
+            // .char_substring(a, b) — char-indexed substring.
+            // Safe for multibyte content. Converts char indices to
+            // byte offsets via UTF-8 walk, then delegates to native
+            // byte-level .substring(). Use this for JSON/text where
+            // indices come from char-counted sources.
+            if len(args) < 2 { return val_str("") }
+            let ca = args[0].int_val
+            let cb = args[1].int_val
+            if ca >= cb { return val_str("") }
+            let sl = len(s)
+            let mut cc = 0
+            let mut bi = 0
+            let mut byte_a = -1
+            let mut byte_b = -1
+            let mut done = false
+            while bi <= sl && !done {
+                let mut is_boundary = bi == sl
+                if !is_boundary {
+                    let bb = char_code(s, bi)
+                    if bb < 128 || bb >= 192 { is_boundary = true }
+                }
+                if is_boundary {
+                    if cc == ca { byte_a = bi }
+                    if cc == cb { byte_b = bi; done = true }
+                    cc = cc + 1
+                }
+                bi = bi + 1
+            }
+            if byte_a < 0 { return val_str("") }
+            if byte_b < 0 { byte_b = sl }
+            return val_str(s.substring(byte_a, byte_b))
+        }
+        if method == "to_lowercase" {
+            return val_str(s.to_lower())
+        }
+        if method == "to_uppercase" {
+            return val_str(s.to_upper())
         }
     }
 
@@ -16993,6 +17363,9 @@ fn interpret(ast) {
     env_scope_dirty = []
     env_fns = []
     fn_cache_init()
+    // 2026-04-20 use-loader fix — reset per-run cache so module bodies
+    // re-exec on fresh interpret() (CLM train loops re-use the interpreter).
+    __use_loaded_paths = []
     return_flag = false
     return_val = val_void()
     break_flag = false
@@ -17225,6 +17598,27 @@ if _hx_file != "" {
     let _hx_tokens = tokenize(_hx_src)
     _hx_ast = parse(_hx_tokens)
     _hx_has_script = true
+    // Capture script-dir for runtime `use` loader so caller-relative
+    // `use "voice_routes"` from serving/*.hexa resolves to serving/voice_routes.hexa.
+    // Inline dirname — last '/' in path; '.' if no slash. Uses substring(i,i+1)
+    // byte match instead of path[i] char indexing to avoid the stage0 char
+    // coercion path (hexa string indexing returns chars not strings, and the
+    // '/' literal is an ASCII code; portability of == across those varies).
+    let mut __sd_i = len(_hx_file) - 1
+    let mut __sd_pos = 0 - 1
+    while __sd_i >= 0 {
+        if _hx_file.substring(__sd_i, __sd_i + 1) == "/" {
+            __sd_pos = __sd_i
+            __sd_i = 0 - 1
+        } else {
+            __sd_i = __sd_i - 1
+        }
+    }
+    if __sd_pos >= 0 {
+        __use_script_dir = _hx_file.substring(0, __sd_pos)
+    } else {
+        __use_script_dir = "."
+    }
     if _hx_mode == "test" {
         // @test runner: interpret to populate fn_attrs, then run @test fns
         interpret(_hx_ast)
