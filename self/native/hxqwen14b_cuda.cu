@@ -605,4 +605,97 @@ int hxqwen14b_cu_cublas_destroy(void) {
     return HXQ_RC_OK;
 }
 
-}  // extern "C"
+// ═════════════════════════════════════════════════════════════════════
+// v5.6.3 backward kernels — Phase-2 LoRA training surface.
+// ═════════════════════════════════════════════════════════════════════
+
+// Kernel: softmax + cross-entropy backward.
+// Given logits[M,V] and targets[M] (int32 token ids), produce
+//   dlogits[m,v] = (softmax(logits[m])[v] - onehot(targets[m])[v]) / M
+// One block per row m, threads tree-reduce sum(exp).
+__global__ void v563_softmax_ce_bwd_kernel(
+    const float* __restrict__ logits,
+    const int32_t* __restrict__ targets,
+    float* __restrict__ dlogits,
+    int V, int M
+) {
+    int m = blockIdx.x;
+    int tid = threadIdx.x;
+    const float* lr = logits + m * V;
+    float*       dr = dlogits + m * V;
+
+    // Step 1: row max for numerical stability.
+    __shared__ float s_max[32];
+    float local_max = -INFINITY;
+    for (int v = tid; v < V; v += blockDim.x) {
+        float lv = lr[v];
+        if (lv > local_max) local_max = lv;
+    }
+    // warp reduce
+    for (int off = 16; off > 0; off >>= 1) {
+        float other = __shfl_down_sync(0xffffffff, local_max, off);
+        if (other > local_max) local_max = other;
+    }
+    int warp = tid >> 5;
+    int lane = tid & 31;
+    if (lane == 0) s_max[warp] = local_max;
+    __syncthreads();
+    if (warp == 0) {
+        float vmax = (tid < (blockDim.x + 31)/32) ? s_max[lane] : -INFINITY;
+        for (int off = 16; off > 0; off >>= 1) {
+            float other = __shfl_down_sync(0xffffffff, vmax, off);
+            if (other > vmax) vmax = other;
+        }
+        if (lane == 0) s_max[0] = vmax;
+    }
+    __syncthreads();
+    float row_max = s_max[0];
+
+    // Step 2: row sum of exp(l-max).
+    __shared__ float s_sum[32];
+    float local_sum = 0.0f;
+    for (int v = tid; v < V; v += blockDim.x) {
+        local_sum += expf(lr[v] - row_max);
+    }
+    for (int off = 16; off > 0; off >>= 1) {
+        local_sum += __shfl_down_sync(0xffffffff, local_sum, off);
+    }
+    if (lane == 0) s_sum[warp] = local_sum;
+    __syncthreads();
+    if (warp == 0) {
+        float vs = (tid < (blockDim.x + 31)/32) ? s_sum[lane] : 0.0f;
+        for (int off = 16; off > 0; off >>= 1) {
+            vs += __shfl_down_sync(0xffffffff, vs, off);
+        }
+        if (lane == 0) s_sum[0] = vs;
+    }
+    __syncthreads();
+    float row_Z = s_sum[0];
+    float invZ = 1.0f / row_Z;
+    float invM = 1.0f / (float)M;
+
+    int t = targets[m];
+    // Step 3: write dlogits = (softmax - onehot) / M
+    for (int v = tid; v < V; v += blockDim.x) {
+        float p = expf(lr[v] - row_max) * invZ;
+        float oh = (v == t) ? 1.0f : 0.0f;
+        dr[v] = (p - oh) * invM;
+    }
+}
+
+int hxqwen14b_cu_launch_softmax_ce_bwd(
+    int64_t logits_dev, int64_t targets_dev, int64_t dlogits_dev,
+    int64_t M, int64_t V
+) {
+    if (logits_dev == 0 || targets_dev == 0 || dlogits_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    if (M <= 0 || V <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    v563_softmax_ce_bwd_kernel<<<(unsigned)M, threads>>>(
+        (const float*)(uintptr_t)logits_dev,
+        (const int32_t*)(uintptr_t)targets_dev,
+        (float*)(uintptr_t)dlogits_dev,
+        (int)V, (int)M);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 softmax_ce_bwd added inside)

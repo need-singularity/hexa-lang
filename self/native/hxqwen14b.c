@@ -4490,3 +4490,268 @@ int hxqwen14b_base_forward_v56_with_lora_pos(int64_t handle, int64_t ids_dev,
 }
 
 // End of v5.6 scaffolding addendum.
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.3 — LoRA backward ACTIVATION CACHE surface (host-only design,
+// CUDA backward kernels NOT yet written — PHASE-2 r12 follow-on).
+//
+// Goal: provide alloc/free/describe API the trainer can use to reserve
+// the per-layer activation buffers needed by the future
+// hxqwen14b_base_backward_v56 orchestrator. Until the 5 missing CUDA
+// bwd kernels (rmsnorm_bwd, rope_bwd, gqa_bwd, swiglu_bwd, softmax_ce_bwd)
+// land, hxqwen14b_base_backward_v56 returns RC_ERR_CUDA_TODO with a
+// well-defined error code so the trainer detects "backward not ready"
+// and skips the optimizer step rather than producing garbage gradients.
+//
+// CACHE LAYOUT (per layer L in 0..47, M=token count, d=5120, dkv=1024,
+// dq=5120, Fn=13824):
+//
+//   slot 0  ln1_input    [M*d]    (== x_now BEFORE rmsnorm1 ; needed for rmsnorm_bwd dx)
+//   slot 1  ln1_out      [M*d]    (rmsnorm1 output ; needed as q/k/v_proj input for sgemm bwd)
+//   slot 2  q_pre_rope   [M*dq]   (q after sgemm+LoRA+bias, BEFORE rope ; needed for rope_bwd)
+//   slot 3  k_pre_rope   [M*dkv]  (k after sgemm+LoRA+bias, BEFORE rope ; same)
+//   slot 4  v_buf        [M*dkv]  (v after sgemm+LoRA+bias ; for o-attn bwd)
+//   slot 5  q_post_rope  [M*dq]   (after rope ; for gqa_bwd)
+//   slot 6  k_post_rope  [M*dkv]  (after rope ; for gqa_bwd)
+//   slot 7  attn_out     [M*dq]   (gqa output, == o_proj input ; for o sgemm bwd)
+//   slot 8  x_post_attn  [M*d]    (== ln1_input + proj_out ; for ln2 bwd dx and chain to ln1)
+//   slot 9  ln2_out      [M*d]    (rmsnorm2 output ; for gate/up_proj bwd)
+//   slot 10 gate         [M*Fn]   (gate sgemm output ; for swiglu_bwd)
+//   slot 11 up           [M*Fn]   (up sgemm output ; for swiglu_bwd)
+//   slot 12 ffn_mid      [M*Fn]   (swiglu output, == down_proj input ; for down sgemm bwd)
+//
+// Plus 2 final-stage entries shared by all layers:
+//   slot ALL+0  x_final_pre_norm [M*d]  (after layer 47 residual ; for final rmsnorm_bwd)
+//   slot ALL+1  ln_final_out     [M*d]  (final rmsnorm output ; for lm_head bwd)
+//
+// MEMORY (bf16 cache trick deferred — fp32 first to match forward dtype):
+//   per-layer bytes = M * (d*4 + d*4 + dq*4 + dkv*4 + dkv*4 + dq*4 + dkv*4
+//                          + dq*4 + d*4 + d*4 + Fn*4 + Fn*4 + Fn*4)
+//   At M=1024, d=5120, dq=5120, dkv=1024, Fn=13824:
+//     = 1024 * (5120+5120+5120+1024+1024+5120+1024+5120+5120+5120+13824+13824+13824)*4
+//     = 1024 * 79404 * 4 bytes
+//     = 325,279,744 B = 310 MB / layer
+//   × 48 layers = 14.9 GB
+//   + 2 final  = 14.9 GB + 2*M*d*4 = +0.04 GB
+//   Total ≈ 15 GB on H100 80GB (≤19% — fits).
+//   M=2048 would be 30 GB ; would need bf16 cache for those.
+//
+// Note: this exceeds the original prompt estimate of 4.4 GB because we
+// cache q_post_rope/k_post_rope (rope-bwd recompute would save 2 slots
+// = ~6 GB) and ffn_mid (swiglu re-fwd would save 1 slot = ~5 GB).
+// Recomputation passes can shrink to ~4 GB but cost extra 2 fwd kernels
+// per layer. v5.6.3 ships pure-cache for clarity; v5.6.4 may add
+// recompute toggles.
+// ════════════════════════════════════════════════════════════════════
+
+#define V56_CACHE_SLOTS_PER_LAYER 13
+#define V56_CACHE_GLOBAL_SLOTS    2     // x_final_pre_norm, ln_final_out
+#define V56_CACHE_TOTAL_SLOTS     (QWEN14B_N_LAYER * V56_CACHE_SLOTS_PER_LAYER + V56_CACHE_GLOBAL_SLOTS)
+
+// Slot byte size for layer L, slot S, given M token count.
+// Returns -1 for invalid S/L combos.
+static int64_t v56_cache_slot_bytes(int slot_idx, int64_t M) {
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t dkv = QWEN14B_N_KV_HEAD * QWEN14B_HEAD_DIM;
+    const int64_t dq  = QWEN14B_N_HEAD    * QWEN14B_HEAD_DIM;
+    const int64_t Fn  = QWEN14B_FFN_DIM;
+    const int64_t fp  = (int64_t)sizeof(float);
+    const int s = slot_idx % V56_CACHE_SLOTS_PER_LAYER;
+    if (slot_idx >= QWEN14B_N_LAYER * V56_CACHE_SLOTS_PER_LAYER) {
+        // Global tail slots.
+        int g = slot_idx - QWEN14B_N_LAYER * V56_CACHE_SLOTS_PER_LAYER;
+        if (g == 0) return M * d * fp;     // x_final_pre_norm
+        if (g == 1) return M * d * fp;     // ln_final_out
+        return -1;
+    }
+    switch (s) {
+        case 0:  return M * d  * fp;  // ln1_input
+        case 1:  return M * d  * fp;  // ln1_out
+        case 2:  return M * dq * fp;  // q_pre_rope
+        case 3:  return M * dkv* fp;  // k_pre_rope
+        case 4:  return M * dkv* fp;  // v_buf
+        case 5:  return M * dq * fp;  // q_post_rope
+        case 6:  return M * dkv* fp;  // k_post_rope
+        case 7:  return M * dq * fp;  // attn_out
+        case 8:  return M * d  * fp;  // x_post_attn
+        case 9:  return M * d  * fp;  // ln2_out
+        case 10: return M * Fn * fp;  // gate
+        case 11: return M * Fn * fp;  // up
+        case 12: return M * Fn * fp;  // ffn_mid
+        default: return -1;
+    }
+}
+
+// Public: compute total cache bytes needed for given M (host-side query;
+// trainer can use this to budget VRAM before alloc).
+int64_t hxqwen14b_v56_activation_cache_bytes(int64_t M) {
+    if (M <= 0) return 0;
+    int64_t total = 0;
+    int n = V56_CACHE_TOTAL_SLOTS;
+    for (int i = 0; i < n; i++) {
+        int64_t b = v56_cache_slot_bytes(i, M);
+        if (b > 0) total += b;
+    }
+    return total;
+}
+
+// Allocate a flat int64_t* table with V56_CACHE_TOTAL_SLOTS device pointers.
+// Caller passes a host buffer of (V56_CACHE_TOTAL_SLOTS * 8) bytes via
+// out_ptrs_p — we cudaMalloc each slot and write the device addr in.
+// Returns RC_OK on success, RC_ERR_OOM on partial failure (rolls back).
+int hxqwen14b_v56_alloc_activation_cache(int64_t M, int64_t out_ptrs_p) {
+    if (M <= 0) return RC_ERR_BAD_ARGS;
+    if (out_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)M; (void)out_ptrs_p;
+    return RC_ERR_CUDA_TODO;
+#else
+    int64_t* out = (int64_t*)(uintptr_t)out_ptrs_p;
+    int n = V56_CACHE_TOTAL_SLOTS;
+    for (int i = 0; i < n; i++) out[i] = 0;
+    for (int i = 0; i < n; i++) {
+        int64_t b = v56_cache_slot_bytes(i, M);
+        if (b <= 0) { out[i] = 0; continue; }
+        int64_t dev = hxqwen14b_cu_malloc_bytes(b);
+        if (dev == 0) {
+            // Roll back partial allocs.
+            for (int j = 0; j < i; j++) {
+                if (out[j] != 0) hxqwen14b_cu_free_ptr(out[j]);
+                out[j] = 0;
+            }
+            return RC_ERR_OOM;
+        }
+        out[i] = dev;
+    }
+    return RC_OK;
+#endif
+}
+
+int hxqwen14b_v56_free_activation_cache(int64_t ptrs_p) {
+    if (ptrs_p == 0) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    return RC_ERR_CUDA_TODO;
+#else
+    int64_t* p = (int64_t*)(uintptr_t)ptrs_p;
+    int n = V56_CACHE_TOTAL_SLOTS;
+    for (int i = 0; i < n; i++) {
+        if (p[i] != 0) {
+            hxqwen14b_cu_free_ptr(p[i]);
+            p[i] = 0;
+        }
+    }
+    return RC_OK;
+#endif
+}
+
+// Host-callable describe helpers (for trainer logging / smoke tests).
+int64_t hxqwen14b_v56_cache_total_slots(void) { return V56_CACHE_TOTAL_SLOTS; }
+int64_t hxqwen14b_v56_cache_slots_per_layer(void) { return V56_CACHE_SLOTS_PER_LAYER; }
+int64_t hxqwen14b_v56_cache_slot_bytes_at(int64_t slot_idx, int64_t M) {
+    if (slot_idx < 0 || slot_idx >= V56_CACHE_TOTAL_SLOTS) return -1;
+    return v56_cache_slot_bytes((int)slot_idx, M);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.3 — backward orchestrator SCAFFOLDING.
+//
+// Returns RC_ERR_CUDA_TODO unconditionally until the 5 missing CUDA
+// backward kernels land. The struct + arg shape is FROZEN here so the
+// trainer can wire the call site now and only the inner implementation
+// changes when kernels arrive.
+//
+// MISSING KERNELS (PHASE-2 follow-on, v5.6.4+):
+//   1. hxqwen14b_cu_launch_softmax_ce_bwd(logits, targets, dlogits, M, V)
+//      grad of softmax+ce wrt logits = (softmax(logits) - onehot(targets)) / M
+//   2. hxqwen14b_cu_launch_rmsnorm_bwd(x, w, dy, dx, dw, M, d, eps)
+//      jacobian-transpose of rmsnorm; dw is accumulated, dx written
+//   3. hxqwen14b_cu_launch_rope_bwd(dy, dx, B, S, n_heads, head_dim, theta_base, pos_offset)
+//      rope is a unitary rotation; bwd is the inverse rotation applied to dy
+//   4. hxqwen14b_cu_launch_gqa_bwd(q, k, v, dattn, dq, dk, dv, B, S, HQ, HK, HD, scale, causal)
+//      attention bwd; recomputes softmax internally (memory-saving)
+//   5. hxqwen14b_cu_launch_swiglu_bwd(gate, up, dy, dgate, dup, M, Fn)
+//      d/dgate = silu'(g) * up * dy; d/dup = silu(g) * dy
+//
+// Once those 5 land, the orchestrator body is ~400 LOC straight-line
+// reverse pass mirroring the forward loop. Currently we only allocate
+// the dx scratch and immediately return CUDA_TODO so callers see a
+// crisp failure mode rather than uninitialized output.
+// ════════════════════════════════════════════════════════════════════
+
+typedef struct HxQwenBaseBwdV56Args {
+    int64_t model_handle;       // v54 handle (frozen base weights)
+    int64_t M;                  // batch * seq token count (must match forward)
+    int64_t logits_dev;         // [M, V] forward output
+    int64_t targets_dev;        // [M] int32 token ids (CE bwd input)
+    int64_t cache_ptrs_p;       // int64_t* of V56_CACHE_TOTAL_SLOTS device addrs
+    int64_t lora_ptrs_p;        // int64_t* of 384 LoRA A/B device addrs (same as fwd)
+    int64_t grad_lora_ptrs_p;   // int64_t* of 384 grad-A/grad-B device addrs (output)
+    int64_t lora_r;
+    double  alpha_over_r;
+    double  loss_scale;         // grad_scale = 1 / loss_scale; default 1.0
+    int64_t accumulate_grads;   // 0 = zero gradA/gradB first, 1 = beta=1 accumulate
+    int64_t reserved[2];
+} HxQwenBaseBwdV56Args;
+
+int hxqwen14b_base_backward_v56(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenBaseBwdV56Args* a = (HxQwenBaseBwdV56Args*)args;
+    if (a->model_handle <= 0 || a->model_handle >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    if (a->M <= 0) return RC_ERR_BAD_ARGS;
+    if (a->logits_dev == 0 || a->targets_dev == 0) return RC_ERR_NULL_ARGS;
+    if (a->cache_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->lora_ptrs_p == 0 || a->grad_lora_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->lora_r <= 0) return RC_ERR_BAD_ARGS;
+#ifndef HXQWEN14B_CUDA
+    return RC_ERR_CUDA_TODO;
+#else
+    // PHASE-2 r12 follow-on: full reverse pass through 48 layers using the
+    // 5 CUDA bwd kernels listed above + per-projection
+    // hxqwen14b_lora_bwd_single calls (×4 projs ×48 layers = 192).
+    //
+    // Today: signal CUDA_TODO so trainer takes the safe "skip optimizer"
+    // path rather than producing garbage gradients.
+    return RC_ERR_CUDA_TODO;
+#endif
+}
+
+// Positional FFI wrapper.
+int hxqwen14b_base_backward_v56_pos(int64_t handle, int64_t M, int64_t logits_dev,
+                                     int64_t targets_dev, int64_t cache_ptrs_p,
+                                     int64_t lora_ptrs_p, int64_t grad_lora_ptrs_p,
+                                     int64_t lora_r, double alpha_over_r) {
+    HxQwenBaseBwdV56Args ba;
+    memset(&ba, 0, sizeof(ba));
+    ba.model_handle      = handle;
+    ba.M                 = M;
+    ba.logits_dev        = logits_dev;
+    ba.targets_dev       = targets_dev;
+    ba.cache_ptrs_p      = cache_ptrs_p;
+    ba.lora_ptrs_p       = lora_ptrs_p;
+    ba.grad_lora_ptrs_p  = grad_lora_ptrs_p;
+    ba.lora_r            = lora_r;
+    ba.alpha_over_r      = alpha_over_r;
+    ba.loss_scale        = 1.0;
+    ba.accumulate_grads  = 0;
+    return hxqwen14b_base_backward_v56(&ba);
+}
+
+// Allocate the 384-pointer grad table (mirror of LoRA A/B alloc but for
+// gradient buffers; same shapes, zero-init). Trainer calls this once at
+// start-of-run; per-step it just zeros via cudaMemset before backward.
+int hxqwen14b_v56_alloc_grad_buffers(int64_t r, int64_t out_ptrs_p) {
+    // Identical shape as alloc_lora_buffers_v56 — same per-adapter
+    // sizes (A: r×K_in, B: N_out×r). Reuse that path.
+    return hxqwen14b_alloc_lora_buffers_v56(r, out_ptrs_p);
+}
+
+int hxqwen14b_v56_free_grad_buffers(int64_t ptrs_p) {
+    return hxqwen14b_free_lora_buffers_v56(ptrs_p);
+}
+
+// Bumped version to 563: backward + cache surface added (orchestrator
+// returns CUDA_TODO until kernels land).
+int64_t hxqwen14b_version_v563(void) {
+    return 563;
+}
+// End of v5.6.3 backward + cache surface addendum.
