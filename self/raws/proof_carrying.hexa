@@ -1,0 +1,188 @@
+// self/raws/proof_carrying.hexa — raw #8: proof-carrying mark (선언 vs 현실 매치)
+//
+// rule:
+//   status ∈ {done, live, ossified} 선언 JSON entry 는 proof_path 필드 필수.
+//     · proof_path 가 가리키는 파일 존재 검증
+//     · proof 파일 내 `"state": "<allowed>"` 값이 _allowed_states() 멤버인지 검증
+//     · state 필드 없는 source file 은 존재만으로 pass
+//
+// enforcement:
+//   기존 (git-hook): hexa build/hexa_stage0 scripts/drift_scanner.hexa 2>&1 | grep "drift"
+//                     RAW8_STAGED 교집합 (raw.json/.own-rules.json/roadmaps/*.json) 조건
+//   본 모듈 (Phase 3 이관): proof_carrying_enforce(paths) → LintMsg[]
+//     · drift_scanner.hexa 로직 그대로 인용 포팅 — 간이 JSON 파서 + _proof_state_ok
+//     · paths 가 비어있으면 기본 SSOT 3종 (raw.json + .own-rules.json + anima.json) 자동 감지
+//
+// SSOT: scripts/drift_scanner.hexa (원본) — 본 모듈은 LintMsg 인터페이스 거울
+// 포팅 범위: 간이 JSON 파서 + state 검증 + file existence — 전부 인용 포팅.
+
+use "self/attrs/core"
+
+fn meta_proof_carrying() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name        = "proof_carrying"
+    m.category    = "raw"
+    m.purpose     = "status=done/live/ossified 선언은 proof_path 필수 — 선언 vs 현실 매치 검증"
+    m.cost_rule   = "JSON 간이 파서 + file existence + state 필드 값 검증"
+    m.side_effect = "enforce() 는 LintMsg 배열 반환. drift 시 violation 리턴."
+    m.requires    = "read_file / test -f (exec 헬퍼), self/attrs/core (mk_msg)"
+    m.auto_test   = "tests/raws/proof_carrying_cases/ drift 케이스 (추후)"
+    m.example     = "status=done + proof_path=\"<file>\" + <file>.state=\"ossified\""
+    m.implemented = true
+    return m
+}
+
+// ─── config (하드코딩 대신 fn 추출) ──────────────────────────────
+fn _pc_allowed_states() {
+    return ["ossified", "done", "live"]
+}
+
+fn _pc_status_needs_proof(status: string) -> bool {
+    for s in _pc_allowed_states() {
+        if s == status { return true }
+    }
+    return false
+}
+
+// ─── env + file helpers ──────────────────────────────────────────
+fn _pc_pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _pc_has_file(path: string) -> bool {
+    let r = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _pc_read_safe(path: string) -> string {
+    try { return to_string(read_file(path)) }
+    catch e { return "" }
+}
+
+// ─── 간이 JSON 파서 (drift_scanner 인용) ──────────────────────────
+fn _pc_extract_str(chunk: string, key: string) -> string {
+    let needle = "\"" + key + "\": \""
+    let idx = chunk.index_of(needle)
+    if idx < 0 { return "" }
+    let after = chunk.substring(idx + len(needle), len(chunk))
+    let end = after.index_of("\"")
+    if end < 0 { return "" }
+    return after.substring(0, end)
+}
+
+fn _pc_extract_id(chunk: string) -> string {
+    let trimmed = chunk.trim_start()
+    let mut id_str = ""
+    let mut k = 0
+    while k < len(trimmed) {
+        let c = trimmed.substring(k, k + 1)
+        if c == "," || c == " " || c == "\n" || c == "}" { break }
+        id_str = id_str + c
+        k = k + 1
+    }
+    return id_str
+}
+
+// proof 파일 내 state 값 검증 — allowed states 중 하나인지
+fn _pc_proof_state_ok(proof_path: string) -> bool {
+    if proof_path == "" { return false }
+    let abs = if proof_path.starts_with("/") { proof_path } else { _pc_pwd() + "/" + proof_path }
+    if !_pc_has_file(abs) { return false }
+    let content = _pc_read_safe(abs)
+    if content == "" { return false }
+    if content.contains("\"state\":") {
+        for s in _pc_allowed_states() {
+            if content.contains("\"state\": \"" + s + "\"") { return true }
+            if content.contains("\"state\":\"" + s + "\"") { return true }
+        }
+        return false
+    }
+    // state 필드 없는 source file 은 존재만으로 pass
+    return true
+}
+
+// ─── scan 1 JSON file — entry 별 proof_path 검증 ─────────────────
+pub fn proof_carrying_scan_file(path: string) {
+    let mut out = []
+    let raw = _pc_read_safe(path)
+    if raw == "" {
+        out = out.push(mk_msg(
+            "proof_carrying", "warn", path, 0, 0,
+            "파일 읽기 실패 또는 비어있음",
+            "파일 존재 + 읽기 권한 확인",
+            "ls -la " + path,
+            "raw #8 / self/raws/proof_carrying.hexa"))
+        return out
+    }
+
+    let parts = split(raw, "\"id\":")
+    let mut i = 1  // 첫 chunk 는 _meta 전이라 skip
+    while i < len(parts) {
+        let chunk = parts[i]
+        let rid = _pc_extract_id(chunk)
+        let status = _pc_extract_str(chunk, "status")
+        let proof_path = _pc_extract_str(chunk, "proof_path")
+
+        if _pc_status_needs_proof(status) {
+            if proof_path == "" {
+                out = out.push(mk_msg(
+                    "proof_carrying", "error", path, 0, 0,
+                    "id=" + rid + " status=" + status + " 에 proof_path 필드 누락",
+                    "status done/live/ossified 선언은 proof_path 필수 — 선언 vs 현실 매치",
+                    "entry 에 \"proof_path\": \"<path>\" 추가 또는 status 강등",
+                    "raw #8 / self/raws/proof_carrying.hexa"))
+            } else {
+                let abs = if proof_path.starts_with("/") { proof_path } else { _pc_pwd() + "/" + proof_path }
+                if !_pc_has_file(abs) {
+                    out = out.push(mk_msg(
+                        "proof_carrying", "error", path, 0, 0,
+                        "id=" + rid + " proof_path 파일 없음: " + proof_path,
+                        "proof 파일 생성 또는 경로 수정",
+                        "touch " + proof_path + "  # 구현 파일 생성 후 state 필드 삽입",
+                        "raw #8 / self/raws/proof_carrying.hexa"))
+                } else if !_pc_proof_state_ok(proof_path) {
+                    out = out.push(mk_msg(
+                        "proof_carrying", "error", path, 0, 0,
+                        "id=" + rid + " proof state 불일치: " + proof_path,
+                        "proof 파일 내 \"state\" 필드 ∈ {ossified, done, live} 필요",
+                        "echo '\"state\": \"ossified\"' 해당 JSON 에 삽입 (또는 status 강등)",
+                        "raw #8 / self/raws/proof_carrying.hexa"))
+                }
+            }
+        }
+
+        i = i + 1
+    }
+    return out
+}
+
+// ─── enforce — paths 없으면 기본 SSOT 3종 자동 감지 ──────────────
+pub fn proof_carrying_enforce(paths: [string]) {
+    let mut targets = paths
+    if len(targets) == 0 {
+        let root = _pc_pwd()
+        let raw_json = root + "/shared/hexa-lang/raw.json"
+        if _pc_has_file(raw_json) { targets = targets.push(raw_json) }
+        let own_rules = root + "/.own-rules.json"
+        if _pc_has_file(own_rules) { targets = targets.push(own_rules) }
+        let anima_json = root + "/shared/roadmaps/anima.json"
+        if _pc_has_file(anima_json) { targets = targets.push(anima_json) }
+    }
+
+    let mut all = []
+    for p in targets {
+        // JSON 파일만 검사 (proof-carrying 은 JSON 선언에 붙는 규칙)
+        if !p.ends_with(".json") { continue }
+        let msgs = proof_carrying_scan_file(p)
+        for m in msgs { all = all.push(m) }
+    }
+    return all
+}
+
+pub fn proof_carrying_induce() -> string {
+    return "raw #8 proof_carrying — status=done/live/ossified 선언 시 proof_path 필수 + 파일 존재 + state 일치. " +
+           "scan via proof_carrying_enforce(paths) or `hexa scripts/drift_scanner.hexa` (legacy). " +
+           "default targets: shared/hexa-lang/raw.json, .own-rules.json, shared/roadmaps/anima.json."
+}

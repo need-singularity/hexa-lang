@@ -1,0 +1,144 @@
+// self/raws/tree_structure.hexa — raw #5: 트리구조 (F5 loner + F6 parent-child)
+//
+// rule:
+//   F5 loner dir     — 하위에 단일 .hexa 파일만 있는 디렉토리 → 부모로 flatten
+//                      (예: self/foo/foo.hexa 만 있고 다른 건 없음 → self/foo.hexa)
+//   F6 parent-child  — parent/parent_<child>.hexa 중복 네이밍 금지
+//                      (예: parser/parser_core.hexa → parser/core.hexa)
+//
+// enforcement:
+//   기존 (git-hook): hexa build/hexa_stage0 scripts/ai_native_scan.hexa | grep -E '^[[:space:]]*(F5|F6)'
+//                     + staged diff-filter=A 교집합만 block
+//   본 모듈 (Phase 3 이관): tree_structure_enforce(paths) → LintMsg[]
+//     · ai_native_scan.hexa scan_dir 의 F5 로직을 인용 포팅 (재구현 최소)
+//     · F6 파서 기반 검출 — parent 디렉토리명과 파일 basename prefix 매칭
+//     · staged diff-filter=A 교집합은 호출부 (raw_registry) 에서 담당
+//
+// SSOT: scripts/ai_native_scan.hexa F5/F6 (원본) — 본 모듈은 hexa 모듈화 거울
+// 포팅 범위: F5 loner 감지만 구조적으로 이관, F6 는 본 모듈에서 신규 구현
+//            (기존 ai_native_scan 은 F6 플래그만 있고 실제 추가 로직 미구현).
+
+use "self/attrs/core"
+
+fn meta_tree_structure() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name        = "tree_structure"
+    m.category    = "raw"
+    m.purpose     = "F5 loner dir + F6 parent/parent_child.hexa 중복 네이밍 차단"
+    m.cost_rule   = "디렉토리 스캔 — 단일 .hexa / parent_child 매칭 판정"
+    m.side_effect = "enforce() 는 LintMsg 배열 반환. staged 교집합은 git-hook/호출부 책임"
+    m.requires    = "ls / test -d (exec 헬퍼), self/attrs/core (mk_msg)"
+    m.auto_test   = "tests/raws/tree_structure_cases/ 디렉토리에 F5/F6 케이스 작성 (추후)"
+    m.example     = "self/foo/foo.hexa 단독 → self/foo.hexa 로 flatten; parser/parser_core.hexa → parser/core.hexa"
+    m.implemented = true
+    return m
+}
+
+// ─── shell helpers ───────────────────────────────────────────────
+fn _dir_exists(path: string) -> bool {
+    let r = to_string(exec("test -d '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _list_dir_hexa(dir: string) {
+    // ls -1 <dir> 의 결과를 split — 내부 엔트리만 추출
+    let out = to_string(exec("ls -1 '" + dir + "' 2>/dev/null")).trim()
+    let mut entries = []
+    if out == "" { return entries }
+    let parts = split(out, "\n")
+    for p in parts {
+        let t = p.trim()
+        if t != "" { entries = entries.push(t) }
+    }
+    return entries
+}
+
+fn _dirname(path: string) -> string {
+    return to_string(exec("dirname '" + path + "'")).trim()
+}
+
+fn _basename(path: string) -> string {
+    return to_string(exec("basename '" + path + "'")).trim()
+}
+
+// ─── F5: loner dir 감지 ───────────────────────────────────────────
+// path 가 .hexa 파일일 때, 해당 디렉토리에 .hexa 가 1개 + subdir 0 이면 loner.
+pub fn tree_structure_is_f5_loner(path: string) -> bool {
+    if !path.ends_with(".hexa") { return false }
+    let dir = _dirname(path)
+    if dir == "" || dir == "." || dir == "./tests" { return false }
+    if !_dir_exists(dir) { return false }
+
+    let entries = _list_dir_hexa(dir)
+    let mut hexa_count = 0
+    let mut subdir_count = 0
+    for e in entries {
+        if e.starts_with(".") { continue }
+        if e == "node_modules" || e == "target" || e == "build" { continue }
+        let full = dir + "/" + e
+        if _dir_exists(full) {
+            subdir_count = subdir_count + 1
+        } else if e.ends_with(".hexa") {
+            hexa_count = hexa_count + 1
+        }
+    }
+    return hexa_count == 1 && subdir_count == 0
+}
+
+// ─── F6: parent/parent_<child>.hexa 중복 네이밍 ────────────────────
+// parser/parser_core.hexa → parser/core.hexa 로 권고.
+// _registry / _naming 등 underscore-prefixed meta-파일 은 예외.
+pub fn tree_structure_is_f6_parent_child(path: string) -> bool {
+    if !path.ends_with(".hexa") { return false }
+    let dir = _dirname(path)
+    if dir == "" || dir == "." { return false }
+
+    let bn = _basename(path)
+    // strip .hexa
+    let stem = bn.substring(0, len(bn) - 5)
+    // underscore-prefixed meta (_registry, _naming, _lib) 예외
+    if stem.starts_with("_") { return false }
+
+    let parent = _basename(dir)
+    if parent == "" || parent == "." { return false }
+
+    // stem 이 parent_ prefix 로 시작하고 stem != parent 이면 violation
+    // (parent_ 만 있고 뒤가 비는 경우는 정상 — foo/foo.hexa 는 F5 책임)
+    let pfx = parent + "_"
+    if len(stem) <= len(pfx) { return false }
+    return stem.starts_with(pfx)
+}
+
+// ─── scan — path 리스트 → LintMsg[] ─────────────────────────────
+pub fn tree_structure_scan_paths(paths: [string]) {
+    let mut out = []
+    for p in paths {
+        if tree_structure_is_f5_loner(p) {
+            out = out.push(mk_msg(
+                "tree_structure", "error", p, 0, 0,
+                "F5 loner dir — 단일 .hexa 파일만 있는 디렉토리",
+                "상위 디렉토리로 flatten (self/foo/foo.hexa → self/foo.hexa)",
+                "mv " + p + " $(dirname $(dirname " + p + "))/",
+                "raw #5 / self/raws/tree_structure.hexa"))
+        }
+        if tree_structure_is_f6_parent_child(p) {
+            out = out.push(mk_msg(
+                "tree_structure", "error", p, 0, 0,
+                "F6 parent-child 중복 네이밍 — parent/parent_<child>.hexa",
+                "parent_ prefix 제거 (parser/parser_core.hexa → parser/core.hexa)",
+                "디렉토리+파일명 중복 제거 — git mv 로 rename",
+                "raw #5 / self/raws/tree_structure.hexa"))
+        }
+    }
+    return out
+}
+
+pub fn tree_structure_enforce(paths: [string]) {
+    return tree_structure_scan_paths(paths)
+}
+
+pub fn tree_structure_induce() -> string {
+    return "raw #5 tree_structure — F5 loner dir + F6 parent/parent_child.hexa 중복 네이밍. " +
+           "scan via tree_structure_enforce(paths) or `hexa scripts/ai_native_scan.hexa` (legacy). " +
+           "exception: underscore-prefixed meta files (_registry/_naming/_lib)."
+}
