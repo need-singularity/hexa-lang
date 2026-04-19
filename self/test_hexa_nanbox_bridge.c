@@ -48,7 +48,7 @@
  *  rt#38-A Phase 2 integration note: the struct layout below MUST
  *  mirror runtime.c's HexaVal. This is fragile. The forward decl
  *  of HexaTag/HexaVal is one of the integration conflicts
- *  documented in docs/rt-38-a-phase2.md — any rt#38-B refactor
+ *  documented in doc/rt_38_a.md — any rt#38-B refactor
  *  has to update both sides in lockstep.
  * ─────────────────────────────────────────────────────────────── */
 typedef enum { TAG_INT = 0, TAG_FLOAT, TAG_BOOL, TAG_STR, TAG_VOID,
@@ -100,7 +100,7 @@ static int g_fail = 0;
  *  were reserved on the heap (sizeof(HexaVal) * cap bytes).
  *
  *  This is the same measurement strategy used in Phase-1 bench
- *  reports. See docs/rt-38-a-phase2.md "measurement approach".
+ *  reports. See doc/rt_38_a.md "measurement approach".
  * ─────────────────────────────────────────────────────────────── */
 
 /* ── Test 1: shadow-path round-trip (pure NaN-box) ──────────── */

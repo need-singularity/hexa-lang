@@ -2157,7 +2157,7 @@ void hexa_arena_reset(void) {
 // reclaimed (array_store[K] = []) even though `l` and `z` still hold it —
 // consistent with a missed env_pop_scope decref path that operates on a
 // stale-tag HexaValStruct after arena rewind. Canary test: T33b-on in
-// tests/regression_stage1.hexa. Fix is blocked on the stage0 rebuild
+// tests/regression.hexa. Fix is blocked on the stage0 rebuild
 // regression (codegen_c2 FnDecl + forward-decl issue; see task tracker).
 // Keep default OFF until both the canary flips PASS and the module_loader
 // use-path smoke (see ml_resolve heapify discussion above) goes green.

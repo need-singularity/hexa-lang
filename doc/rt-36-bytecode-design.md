@@ -614,7 +614,7 @@ Related breakthroughs landed in `doc/state.json`:
 - mut_mvp.hexa — 7/7 (arr[i]=v, chained push, map m[k]=v polymorphic)
 - main_autocall.hexa / main_only.hexa / main_nouser.hexa — 양 모드
 
-**회귀**: bridge_mvp 12/12 + bridge_arr/map + interpreter regression_stage1 14/14 전부 양 모드 유지.
+**회귀**: bridge_mvp 12/12 + bridge_arr/map + interpreter regression 14/14 전부 양 모드 유지.
 
 **rt#36-E 작업 큐**:
 - ✓ **Lambda emit** (T51, 2026-04-14) — free-var 분석 + CLOSURE + N×NEW_CLOSURE_UPVAL.

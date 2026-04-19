@@ -19,7 +19,7 @@ Scope landed this run: **step 3f — payload-free `EnumPath` lowering**
     (existing "< 0 → wildcard" path) stays intact.
   - Match-expr comment updated: payload-free EnumPath patterns now
     resolve through the shared `nb_lower_expr` path + `cmp_eq`.
-- **`self/test_p7_6_enum_path.hexa`** — 26 asserts. Covers:
+- **`self/test_enum_path.hexa`** — 26 asserts. Covers:
   (T1) basic tag lookup, (T2) miss → -1, (T3) multi-enum
   independence, (T4) idempotent re-register, (T5) Pass 1 AST-walk
   simulation, (T6) EnumPath shape invariants, (T7) match-arm

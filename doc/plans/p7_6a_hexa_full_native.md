@@ -23,7 +23,7 @@ Mach-O executable
 ```
 
 Adjacent POC already verified (`codegen_native.hexa` → `codegen_native_fib.hexa`
-→ `test_p7_6_enum_path.hexa`): hello-world / multi-fn add / IR lowering 43 ops.
+→ `test_enum_path.hexa`): hello-world / multi-fn add / IR lowering 43 ops.
 
 ## Gap matrix (AST kind × backend state)
 
@@ -127,9 +127,9 @@ already implements them (`band/bor/bxor/shl/shr` opcodes) but
 
 ## Acceptance after P7-6a.1
 
-- `self/test_p7_6a_cmp.hexa`: a<b / a==b / !a return correct bool via IR lowering.
-- `self/test_p7_6a_bitops.hexa`: a&b / a|b / a^b / a<<n / a>>n round-trip.
-- `self/test_p7_6a_ifblock.hexa`: `if c { 7 } else { 3 }` lowers to 3 BBs, emits
+- `self/test_cmp.hexa`: a<b / a==b / !a return correct bool via IR lowering.
+- `self/test_bitops.hexa`: a&b / a|b / a^b / a<<n / a>>n round-trip.
+- `self/test_ifblock.hexa`: `if c { 7 } else { 3 }` lowers to 3 BBs, emits
   ARM64 branch + phi, returns 7 or 3.
 
 ## References

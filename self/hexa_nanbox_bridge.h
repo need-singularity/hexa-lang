@@ -28,7 +28,7 @@
  *  NOT included here: ptr-kind bridges (STR / ARRAY / MAP / ...),
  *  TAG_VALSTRUCT unwrap, closure env migration. Those are rt#38-B
  *  concerns — integration conflicts documented in
- *  docs/rt-38-a-phase2.md.
+ *  doc/rt_38_a.md.
  * ═══════════════════════════════════════════════════════════ */
 #ifndef HEXA_NANBOX_BRIDGE_H
 #define HEXA_NANBOX_BRIDGE_H
@@ -120,6 +120,6 @@ static inline double hexa_nb_shadow_as_float(HexaV v) {
  *  include runtime.c (or a forward-decl) and write their own
  *  one-liner extractor; the bridge does not dictate ABI.
  *
- *  See docs/rt-38-a-phase2.md "ABI integration" for the rationale. */
+ *  See doc/rt_38_a.md "ABI integration" for the rationale. */
 
 #endif /* HEXA_NANBOX_BRIDGE_H */

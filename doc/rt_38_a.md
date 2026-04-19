@@ -163,7 +163,7 @@ can target Route B with measurable gains on the VM register file.
   instrumentation counters. Header-only, additive, C99.
 - `self/test_hexa_nanbox_bridge.c` — 10 030-check test suite.
   Links `self/runtime.c` for the legacy baseline. Exits 0 on pass.
-- `docs/rt-38-a-phase2.md` — this document.
+- `doc/rt_38_a.md` — this document.
 
 Existing files NOT modified: `self/hexa_nanbox.h`,
 `self/test_hexa_nanbox.c`, `self/runtime.c`, `self/bc_vm.hexa`,
