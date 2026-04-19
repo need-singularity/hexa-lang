@@ -3195,3 +3195,615 @@ int hxqwen14b_smoke_v53(void* args) {
 }
 
 // End of v5.3 addendum.
+
+// ═════════════════════════════════════════════════════════════════════
+// v5.4 — real 48-layer LM forward + weight orchestrator + tied lm_head + CE
+//
+// Composition layer that stitches v5.3 primitives + cuBLAS Sgemm into a
+// full Qwen2.5-14B base forward pass.  No LoRA delta in this first cut —
+// per the v5.4 escape hatch ("base-only forward first, CE smoke, then add
+// LoRA"). Weight orchestration loads ~434 tensors from 8 shards via the
+// safetensors index.json weight_map, dequants bf16 → fp32 on device, and
+// keeps everything addressed via a symbol table indexed by slot index.
+//
+// Symbols added (all extern "C"):
+//
+//   int64_t hxqwen14b_version_v54(void)                      -> 54
+//   int     hxqwen14b_load_all_weights(void* args)           HxQwenLoadAllArgs
+//   int     hxqwen14b_base_forward_v54(void* args)           HxQwenBaseFwdV54Args
+//   int     hxqwen14b_ce_loss_v54(void* args)                HxQwenCeLossArgs
+//   int     hxqwen14b_smoke_v54(void* args)                  HxQwenSmokeV54Args
+//   int     hxqwen14b_free_all_weights_v54(int64_t model_h)
+//
+// All args are packed struct pointers, matching the v5.x ABI pattern.
+// ═════════════════════════════════════════════════════════════════════
+
+#ifdef HXQWEN14B_CUDA
+// v5.4 additional CUDA launcher declarations (defined in hxqwen14b_cuda.cu).
+extern int hxqwen14b_cu_launch_bf16_to_fp32(int64_t src_bf16_dev,
+                                             int64_t dst_fp32_dev, int64_t N);
+extern int hxqwen14b_cu_launch_embed_lookup(int64_t embed_dev, int64_t ids_dev,
+                                             int64_t out_dev,
+                                             int64_t V, int64_t d, int64_t M);
+extern int hxqwen14b_cu_launch_residual_add(int64_t x_dev, int64_t y_dev,
+                                             int64_t N);
+extern int hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+    int64_t X_dev, int64_t W_dev, int64_t C_dev,
+    int64_t M, int64_t N, int64_t K,
+    float alpha, float beta);
+extern int hxqwen14b_cu_launch_tied_lm_head(
+    int64_t x_dev, int64_t embed_dev, int64_t logits_dev,
+    int64_t M, int64_t V, int64_t d);
+extern int hxqwen14b_cu_launch_softmax_ce(
+    int64_t logits_dev, int64_t targets_dev, int64_t out_nll_dev,
+    int64_t M, int64_t V);
+extern int hxqwen14b_cu_cublas_destroy(void);
+#endif
+
+int64_t hxqwen14b_version_v54(void) {
+    return 54;
+}
+
+// ─────────────────────────────────────────────────────────────
+// Tensor symbol table (device buffer map).
+// Slot layout documented at the top of this block.
+// Slot 0 embed, slots 1..48*9 per-layer (9 each), slot 433 final_norm.
+// (lm_head is tied to embed — no separate slot.)
+// ─────────────────────────────────────────────────────────────
+#define V54_N_LAYER_TENSORS     9
+#define V54_SLOT_EMBED          0
+#define V54_SLOT_LAYER_BASE(L)  (1 + (L) * V54_N_LAYER_TENSORS)
+#define V54_SLOT_FINAL_NORM     (1 + QWEN14B_N_LAYER * V54_N_LAYER_TENSORS)
+#define V54_N_SLOTS             (V54_SLOT_FINAL_NORM + 1)
+
+typedef struct V54TensorSlot {
+    int64_t dev_ptr_fp32;
+    int64_t n_elems;
+    int64_t shape0;
+    int64_t shape1;
+    int64_t loaded;
+} V54TensorSlot;
+
+static V54TensorSlot g_v54_slots[HXQWEN14B_MAX_HANDLES][V54_N_SLOTS];
+static char g_v54_shard_name[V54_N_SLOTS][64];
+
+static void v54_slot_name(int slot, char* out, size_t n) {
+    if (slot == V54_SLOT_EMBED) {
+        snprintf(out, n, "model.embed_tokens.weight");
+        return;
+    }
+    if (slot == V54_SLOT_FINAL_NORM) {
+        snprintf(out, n, "model.norm.weight");
+        return;
+    }
+    int L = (slot - 1) / V54_N_LAYER_TENSORS;
+    int k = (slot - 1) % V54_N_LAYER_TENSORS;
+    const char* suffixes[V54_N_LAYER_TENSORS] = {
+        "input_layernorm.weight",
+        "self_attn.q_proj.weight",
+        "self_attn.k_proj.weight",
+        "self_attn.v_proj.weight",
+        "self_attn.o_proj.weight",
+        "post_attention_layernorm.weight",
+        "mlp.gate_proj.weight",
+        "mlp.up_proj.weight",
+        "mlp.down_proj.weight"
+    };
+    snprintf(out, n, "model.layers.%d.%s", L, suffixes[k]);
+}
+
+static int v54_shard_for_name(const char* idx_buf, size_t idx_n,
+                               const char* name, char* out_shard, size_t cap) {
+    size_t nl = strlen(name);
+    for (size_t i = 0; i + nl + 2 < idx_n; i++) {
+        if (idx_buf[i] != '"') continue;
+        if (memcmp(idx_buf + i + 1, name, nl) != 0) continue;
+        if (idx_buf[i + 1 + nl] != '"') continue;
+        size_t j = i + 2 + nl;
+        while (j < idx_n && (idx_buf[j] == ' ' || idx_buf[j] == ':' ||
+                             idx_buf[j] == '\t')) j++;
+        if (j >= idx_n || idx_buf[j] != '"') return -1;
+        j++;
+        size_t k = j;
+        while (k < idx_n && idx_buf[k] != '"') k++;
+        if (k >= idx_n) return -1;
+        size_t len = k - j;
+        if (len >= cap) len = cap - 1;
+        memcpy(out_shard, idx_buf + j, len);
+        out_shard[len] = '\0';
+        return 0;
+    }
+    return -2;
+}
+
+static void v54_zero_slots(int handle_slot) {
+    memset(g_v54_slots[handle_slot], 0, sizeof(g_v54_slots[handle_slot]));
+}
+
+int hxqwen14b_free_all_weights_v54(int64_t model_h) {
+#ifndef HXQWEN14B_CUDA
+    (void)model_h;
+    return RC_ERR_CUDA_TODO;
+#else
+    if (model_h <= 0 || model_h >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    V54TensorSlot* slots = g_v54_slots[model_h];
+    for (int s = 0; s < V54_N_SLOTS; s++) {
+        if (slots[s].dev_ptr_fp32 != 0) {
+            hxqwen14b_cu_free_ptr(slots[s].dev_ptr_fp32);
+        }
+    }
+    v54_zero_slots((int)model_h);
+    return RC_OK;
+#endif
+}
+
+typedef struct HxQwenLoadAllArgs {
+    int64_t model_handle;
+    int64_t ckpt_dir_p;
+    int64_t out_n_loaded_p;
+    int64_t reserved;
+} HxQwenLoadAllArgs;
+
+int hxqwen14b_load_all_weights(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args;
+    return RC_ERR_CUDA_TODO;
+#else
+    HxQwenLoadAllArgs* a = (HxQwenLoadAllArgs*)args;
+    int64_t h = a->model_handle;
+    if (h <= 0 || h >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    const char* dir = (const char*)(uintptr_t)a->ckpt_dir_p;
+    if (dir == NULL) return RC_ERR_NULL_ARGS;
+
+    char idx_path[1024];
+    snprintf(idx_path, sizeof(idx_path), "%s/model.safetensors.index.json", dir);
+    char* idx_buf = NULL;
+    size_t idx_n = 0;
+    if (read_file_to_buf(idx_path, &idx_buf, &idx_n) != 0)
+        return RC_ERR_INDEX_JSON;
+
+    for (int s = 0; s < V54_N_SLOTS; s++) {
+        char name[128];
+        v54_slot_name(s, name, sizeof(name));
+        if (v54_shard_for_name(idx_buf, idx_n, name,
+                                g_v54_shard_name[s],
+                                sizeof(g_v54_shard_name[s])) != 0) {
+            free(idx_buf);
+            return RC_ERR_SHAPE_MISMATCH;
+        }
+    }
+    free(idx_buf);
+
+    v54_zero_slots((int)h);
+
+    int64_t n_loaded = 0;
+    for (int s = 0; s < V54_N_SLOTS; s++) {
+        char name[128];
+        v54_slot_name(s, name, sizeof(name));
+
+        char shard_path[1024];
+        snprintf(shard_path, sizeof(shard_path), "%s/%s", dir, g_v54_shard_name[s]);
+
+        HxQwenTensorLoadOut lo;
+        memset(&lo, 0, sizeof(lo));
+        int rc = hxqwen14b_load_tensor_bf16(
+            (int64_t)(uintptr_t)shard_path,
+            (int64_t)(uintptr_t)name,
+            &lo);
+        if (rc != RC_OK) {
+            if (a->out_n_loaded_p != 0)
+                *(int64_t*)(uintptr_t)a->out_n_loaded_p = n_loaded;
+            return rc;
+        }
+        int64_t fp32_bytes = lo.n_elems * (int64_t)sizeof(float);
+        int64_t fp32_dev = hxqwen14b_cu_malloc_bytes(fp32_bytes);
+        if (fp32_dev == 0) {
+            hxqwen14b_cu_free_ptr(lo.device_ptr);
+            if (a->out_n_loaded_p != 0)
+                *(int64_t*)(uintptr_t)a->out_n_loaded_p = n_loaded;
+            return RC_ERR_OOM;
+        }
+        int dq_rc = hxqwen14b_cu_launch_bf16_to_fp32(
+            lo.device_ptr, fp32_dev, lo.n_elems);
+        hxqwen14b_cu_free_ptr(lo.device_ptr);
+        if (dq_rc != RC_OK) {
+            hxqwen14b_cu_free_ptr(fp32_dev);
+            if (a->out_n_loaded_p != 0)
+                *(int64_t*)(uintptr_t)a->out_n_loaded_p = n_loaded;
+            return RC_ERR_KERNEL_FAIL;
+        }
+
+        V54TensorSlot* slot = &g_v54_slots[h][s];
+        slot->dev_ptr_fp32 = fp32_dev;
+        slot->n_elems = lo.n_elems;
+        if (s == V54_SLOT_EMBED) {
+            slot->shape0 = QWEN14B_VOCAB;
+            slot->shape1 = QWEN14B_D_MODEL;
+        } else if (s == V54_SLOT_FINAL_NORM) {
+            slot->shape0 = QWEN14B_D_MODEL;
+            slot->shape1 = 0;
+        } else {
+            int k = (s - 1) % V54_N_LAYER_TENSORS;
+            if (k == 0 || k == 5) {
+                slot->shape0 = QWEN14B_D_MODEL;
+                slot->shape1 = 0;
+            } else if (k == 1 || k == 4) {
+                slot->shape0 = QWEN14B_N_HEAD * QWEN14B_HEAD_DIM;
+                slot->shape1 = QWEN14B_D_MODEL;
+            } else if (k == 2 || k == 3) {
+                slot->shape0 = QWEN14B_N_KV_HEAD * QWEN14B_HEAD_DIM;
+                slot->shape1 = QWEN14B_D_MODEL;
+            } else if (k == 6 || k == 7) {
+                slot->shape0 = QWEN14B_FFN_DIM;
+                slot->shape1 = QWEN14B_D_MODEL;
+            } else {
+                slot->shape0 = QWEN14B_D_MODEL;
+                slot->shape1 = QWEN14B_FFN_DIM;
+            }
+        }
+        slot->loaded = 1;
+        n_loaded++;
+    }
+
+    if (a->out_n_loaded_p != 0)
+        *(int64_t*)(uintptr_t)a->out_n_loaded_p = n_loaded;
+    return RC_OK;
+#endif
+}
+
+typedef struct HxQwenBaseFwdV54Args {
+    int64_t model_handle;
+    int64_t token_ids_dev;
+    int64_t M;
+    int64_t logits_dev;
+    int64_t reserved0;
+    int64_t reserved1;
+} HxQwenBaseFwdV54Args;
+
+int hxqwen14b_base_forward_v54(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args;
+    return RC_ERR_CUDA_TODO;
+#else
+    HxQwenBaseFwdV54Args* a = (HxQwenBaseFwdV54Args*)args;
+    int64_t h = a->model_handle;
+    if (h <= 0 || h >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    V54TensorSlot* slots = g_v54_slots[h];
+    if (slots[V54_SLOT_EMBED].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_FINAL_NORM].loaded == 0) return RC_ERR_BAD_HANDLE;
+
+    const int64_t M   = a->M;
+    if (M <= 0) return RC_ERR_BAD_ARGS;
+    if (a->token_ids_dev == 0 || a->logits_dev == 0) return RC_ERR_NULL_ARGS;
+
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t V   = QWEN14B_VOCAB;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t Fn  = QWEN14B_FFN_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+
+    int64_t sz_Md  = M * d * (int64_t)sizeof(float);
+    int64_t sz_Mq  = M * dq * (int64_t)sizeof(float);
+    int64_t sz_Mkv = M * dkv * (int64_t)sizeof(float);
+    int64_t sz_MF  = M * Fn * (int64_t)sizeof(float);
+
+    int64_t x_now  = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t ln     = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t q      = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t k_buf  = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t v_buf  = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t attn   = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t proj   = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t gate   = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t up     = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t ffn_mid= hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t ffn_out= hxqwen14b_cu_malloc_bytes(sz_Md);
+    int rc = RC_OK;
+    if (x_now==0||ln==0||q==0||k_buf==0||v_buf==0||attn==0||
+        proj==0||gate==0||up==0||ffn_mid==0||ffn_out==0) {
+        rc = RC_ERR_OOM;
+        goto done;
+    }
+
+    rc = hxqwen14b_cu_launch_embed_lookup(
+        slots[V54_SLOT_EMBED].dev_ptr_fp32,
+        a->token_ids_dev, x_now, V, d, M);
+    if (rc != RC_OK) goto done;
+
+    HxQwenRmsNormArgs rms_args;
+    HxQwenKernelDispatch dsp;
+    memset(&rms_args, 0, sizeof(rms_args));
+    memset(&dsp, 0, sizeof(dsp));
+    dsp.is_device = 1;
+
+    HxQwenRopeArgs rope_args;
+    memset(&rope_args, 0, sizeof(rope_args));
+
+    HxQwenGqaArgs gqa_args;
+    memset(&gqa_args, 0, sizeof(gqa_args));
+
+    HxQwenSwigluArgs sw_args;
+    memset(&sw_args, 0, sizeof(sw_args));
+
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        int base = V54_SLOT_LAYER_BASE(L);
+        int64_t w_ln1  = slots[base + 0].dev_ptr_fp32;
+        int64_t w_q    = slots[base + 1].dev_ptr_fp32;
+        int64_t w_k    = slots[base + 2].dev_ptr_fp32;
+        int64_t w_v    = slots[base + 3].dev_ptr_fp32;
+        int64_t w_o    = slots[base + 4].dev_ptr_fp32;
+        int64_t w_ln2  = slots[base + 5].dev_ptr_fp32;
+        int64_t w_gate = slots[base + 6].dev_ptr_fp32;
+        int64_t w_up   = slots[base + 7].dev_ptr_fp32;
+        int64_t w_down = slots[base + 8].dev_ptr_fp32;
+
+        rms_args.x_p = x_now;  rms_args.w_p = w_ln1;  rms_args.y_p = ln;
+        rms_args.M_rows = M;   rms_args.d_model = d;  rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_q, q, M, dq, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_k, k_buf, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_v, v_buf, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+
+        rope_args.x_p = q;    rope_args.B_batch = 1; rope_args.S_seq = M;
+        rope_args.n_heads = HQ; rope_args.head_dim = HD;
+        rope_args.theta_base = 1e6; rope_args.pos_offset = 0;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        rope_args.x_p = k_buf; rope_args.n_heads = HK;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        gqa_args.q_p = q;     gqa_args.k_p = k_buf; gqa_args.v_p = v_buf;
+        gqa_args.out_p = attn;
+        gqa_args.B_batch = 1; gqa_args.S_seq = M;
+        gqa_args.n_q_head = HQ; gqa_args.n_kv_head = HK;
+        gqa_args.head_dim = HD;
+        gqa_args.softmax_scale = 1.0 / sqrt((double)HD);
+        gqa_args.causal = 1;
+        dsp.arg_p = (int64_t)(uintptr_t)&gqa_args;
+        rc = hxqwen14b_gqa_attn_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                attn, w_o, proj, M, d, dq, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_residual_add(proj, x_now, M * d);
+        if (rc != RC_OK) goto done;
+
+        rms_args.x_p = x_now; rms_args.w_p = w_ln2; rms_args.y_p = ln;
+        rms_args.M_rows = M;  rms_args.d_model = d; rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_gate, gate, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_up, up, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+
+        sw_args.gate_p = gate; sw_args.up_p = up; sw_args.y_p = ffn_mid;
+        sw_args.M_rows = M;    sw_args.ffn_dim = Fn;
+        dsp.arg_p = (int64_t)(uintptr_t)&sw_args;
+        rc = hxqwen14b_swiglu_fwd_v53(&dsp);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ffn_mid, w_down, ffn_out, M, d, Fn, 1.0f, 0.0f);
+        if (rc != RC_OK) goto done;
+
+        rc = hxqwen14b_cu_launch_residual_add(ffn_out, x_now, M * d);
+        if (rc != RC_OK) goto done;
+    }
+
+    rms_args.x_p = x_now; rms_args.w_p = slots[V54_SLOT_FINAL_NORM].dev_ptr_fp32;
+    rms_args.y_p = ln;    rms_args.M_rows = M; rms_args.d_model = d;
+    rms_args.eps = 1e-6;
+    dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+    rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+    if (rc != RC_OK) goto done;
+
+    rc = hxqwen14b_cu_launch_tied_lm_head(
+            ln, slots[V54_SLOT_EMBED].dev_ptr_fp32, a->logits_dev,
+            M, V, d);
+
+done:
+    if (x_now != 0)  hxqwen14b_cu_free_ptr(x_now);
+    if (ln != 0)     hxqwen14b_cu_free_ptr(ln);
+    if (q != 0)      hxqwen14b_cu_free_ptr(q);
+    if (k_buf != 0)  hxqwen14b_cu_free_ptr(k_buf);
+    if (v_buf != 0)  hxqwen14b_cu_free_ptr(v_buf);
+    if (attn != 0)   hxqwen14b_cu_free_ptr(attn);
+    if (proj != 0)   hxqwen14b_cu_free_ptr(proj);
+    if (gate != 0)   hxqwen14b_cu_free_ptr(gate);
+    if (up != 0)     hxqwen14b_cu_free_ptr(up);
+    if (ffn_mid != 0)hxqwen14b_cu_free_ptr(ffn_mid);
+    if (ffn_out != 0)hxqwen14b_cu_free_ptr(ffn_out);
+    return rc;
+#endif
+}
+
+typedef struct HxQwenCeLossArgs {
+    int64_t logits_dev;
+    int64_t targets_dev;
+    int64_t M;
+    int64_t V;
+    int64_t out_mean_ce_p;
+    int64_t reserved;
+} HxQwenCeLossArgs;
+
+int hxqwen14b_ce_loss_v54(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args; return RC_ERR_CUDA_TODO;
+#else
+    HxQwenCeLossArgs* a = (HxQwenCeLossArgs*)args;
+    if (a->M <= 0 || a->V <= 0) return RC_ERR_BAD_ARGS;
+    if (a->logits_dev == 0 || a->targets_dev == 0) return RC_ERR_NULL_ARGS;
+
+    int64_t nll_bytes = a->M * (int64_t)sizeof(float);
+    int64_t nll_dev = hxqwen14b_cu_malloc_bytes(nll_bytes);
+    if (nll_dev == 0) return RC_ERR_OOM;
+
+    int rc = hxqwen14b_cu_launch_softmax_ce(
+        a->logits_dev, a->targets_dev, nll_dev, a->M, a->V);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(nll_dev);
+        return rc;
+    }
+    hxqwen14b_cu_device_sync();
+
+    float* nll_host = (float*)malloc((size_t)nll_bytes);
+    if (!nll_host) { hxqwen14b_cu_free_ptr(nll_dev); return RC_ERR_OOM; }
+    rc = hxqwen14b_cu_memcpy_d2h(nll_host, nll_dev, nll_bytes);
+    hxqwen14b_cu_free_ptr(nll_dev);
+    if (rc != RC_OK) { free(nll_host); return rc; }
+
+    double sum = 0.0;
+    for (int64_t i = 0; i < a->M; i++) sum += (double)nll_host[i];
+    double mean = sum / (double)a->M;
+    free(nll_host);
+
+    if (a->out_mean_ce_p != 0)
+        *(double*)(uintptr_t)a->out_mean_ce_p = mean;
+    return RC_OK;
+#endif
+}
+
+typedef struct HxQwenSmokeV54Args {
+    int64_t ckpt_dir_p;
+    int64_t token_ids_host_p;
+    int64_t M;
+    int64_t out_mean_ce_p;
+    int64_t out_n_loaded_p;
+    int64_t out_top1_tok_p;
+    int64_t reserved;
+} HxQwenSmokeV54Args;
+
+int hxqwen14b_smoke_v54(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args; return RC_ERR_CUDA_TODO;
+#else
+    HxQwenSmokeV54Args* a = (HxQwenSmokeV54Args*)args;
+    if (a->M < 2) return RC_ERR_BAD_ARGS;
+    if (a->ckpt_dir_p == 0 || a->token_ids_host_p == 0) return RC_ERR_NULL_ARGS;
+
+    int64_t h = 1;
+
+    HxQwenLoadAllArgs la;
+    memset(&la, 0, sizeof(la));
+    la.model_handle = h;
+    la.ckpt_dir_p = a->ckpt_dir_p;
+    la.out_n_loaded_p = a->out_n_loaded_p;
+    int rc = hxqwen14b_load_all_weights(&la);
+    if (rc != RC_OK) return rc;
+
+    const int32_t* ids_host = (const int32_t*)(uintptr_t)a->token_ids_host_p;
+    int64_t M = a->M;
+    int64_t ids_bytes = M * (int64_t)sizeof(int32_t);
+    int64_t ids_dev = hxqwen14b_cu_malloc_bytes(ids_bytes);
+    if (ids_dev == 0) { hxqwen14b_free_all_weights_v54(h); return RC_ERR_OOM; }
+    rc = hxqwen14b_cu_memcpy_h2d(ids_dev, ids_host, ids_bytes);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(ids_dev); hxqwen14b_free_all_weights_v54(h);
+        return rc;
+    }
+
+    int64_t V = QWEN14B_VOCAB;
+    int64_t logits_bytes = M * V * (int64_t)sizeof(float);
+    int64_t logits_dev = hxqwen14b_cu_malloc_bytes(logits_bytes);
+    if (logits_dev == 0) {
+        hxqwen14b_cu_free_ptr(ids_dev); hxqwen14b_free_all_weights_v54(h);
+        return RC_ERR_OOM;
+    }
+
+    HxQwenBaseFwdV54Args fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.model_handle = h;
+    fa.token_ids_dev = ids_dev;
+    fa.M = M;
+    fa.logits_dev = logits_dev;
+    rc = hxqwen14b_base_forward_v54(&fa);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);
+        hxqwen14b_free_all_weights_v54(h);
+        return rc;
+    }
+    hxqwen14b_cu_device_sync();
+
+    int64_t tgt_bytes = (M - 1) * (int64_t)sizeof(int32_t);
+    int64_t tgt_dev = hxqwen14b_cu_malloc_bytes(tgt_bytes);
+    if (tgt_dev == 0) {
+        hxqwen14b_cu_free_ptr(logits_dev); hxqwen14b_cu_free_ptr(ids_dev);
+        hxqwen14b_free_all_weights_v54(h); return RC_ERR_OOM;
+    }
+    int32_t* tgt_host = (int32_t*)malloc((size_t)tgt_bytes);
+    if (!tgt_host) {
+        hxqwen14b_cu_free_ptr(tgt_dev);  hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);  hxqwen14b_free_all_weights_v54(h);
+        return RC_ERR_OOM;
+    }
+    for (int64_t i = 0; i < M - 1; i++) tgt_host[i] = ids_host[i + 1];
+    rc = hxqwen14b_cu_memcpy_h2d(tgt_dev, tgt_host, tgt_bytes);
+    free(tgt_host);
+    if (rc != RC_OK) {
+        hxqwen14b_cu_free_ptr(tgt_dev);  hxqwen14b_cu_free_ptr(logits_dev);
+        hxqwen14b_cu_free_ptr(ids_dev);  hxqwen14b_free_all_weights_v54(h);
+        return rc;
+    }
+
+    HxQwenCeLossArgs ca;
+    memset(&ca, 0, sizeof(ca));
+    ca.logits_dev = logits_dev;
+    ca.targets_dev = tgt_dev;
+    ca.M = M - 1;
+    ca.V = V;
+    ca.out_mean_ce_p = a->out_mean_ce_p;
+    rc = hxqwen14b_ce_loss_v54(&ca);
+
+    if (a->out_top1_tok_p != 0) {
+        float* row0 = (float*)malloc((size_t)(V * sizeof(float)));
+        if (row0) {
+            int rc2 = hxqwen14b_cu_memcpy_d2h(
+                row0, logits_dev, V * (int64_t)sizeof(float));
+            if (rc2 == RC_OK) {
+                int32_t best = 0; float bv = row0[0];
+                for (int64_t j = 1; j < V; j++) {
+                    if (row0[j] > bv) { bv = row0[j]; best = (int32_t)j; }
+                }
+                *(int32_t*)(uintptr_t)a->out_top1_tok_p = best;
+            }
+            free(row0);
+        }
+    }
+
+    hxqwen14b_cu_free_ptr(tgt_dev);
+    hxqwen14b_cu_free_ptr(logits_dev);
+    hxqwen14b_cu_free_ptr(ids_dev);
+
+    return rc;
+#endif
+}
+
+// End of v5.4 addendum.
