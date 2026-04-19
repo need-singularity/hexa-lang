@@ -1,0 +1,182 @@
+#!hexa strict
+// tool/hx_harden.hexa — raw#0 tiered-lock Level 1 → Level 2 promotion
+//
+// PURPOSE
+//   Escalate the critical SSOT subset (default: .raw .own) from Level 1
+//   (chflags uchg / chattr +i user-removable) to Level 2 (chflags schg /
+//   root-only chattr +i). Opt-in hardening — intended for maintainers on
+//   stable trees, not for active development.
+//
+// USAGE
+//   ./hexa tool/hx_harden.hexa --reason "stable checkpoint"
+//   ./hexa tool/hx_harden.hexa --reason "..." --yes   (skip prompt)
+//
+// PRECONDITIONS
+//   · Platform Darwin or Linux
+//   · Passwordless sudo available (`sudo -n true`) — otherwise refused
+//     with instructions to `sudo -v` first.
+//   · Targets currently exist and are at Level ≥ 0.
+//
+// FLOW
+//   1. parse args, require --reason
+//   2. confirm (unless --yes): explain that L2 removal needs sudo
+//   3. probe `sudo -n true`; refuse on failure
+//   4. sha fingerprint before
+//   5. for each critical target, call os_level_lock cmd_lock_level2
+//   6. sha fingerprint after
+//   7. audit_append("harden", …) with before/after
+//   8. banner with downgrade instructions
+//
+// UNDO
+//   ./hx downgrade --reason "..."    — Level 2 → Level 1
+//
+// 한글 안내: 숙련자 옵션입니다. sudo 없이는 해제되지 않습니다.
+
+use "self/core/law_io"
+use "tool/raw_audit"
+use "tool/os_level_lock"
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _has_passwordless_sudo() -> bool {
+    let r = exec_with_status("sudo -n true 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+fn _read_yes_no(default_no: bool) -> bool {
+    // Read one line from stdin. Accepts y / Y / yes / YES as affirmative.
+    let raw = to_string(exec("head -n 1")).trim()
+    if raw == "" { return !default_no }
+    let c = raw.substring(0, 1)
+    if c == "y" || c == "Y" { return true }
+    return false
+}
+
+fn _parse_args() -> array {
+    // returns [reason, yes, ok]
+    let av = argv()
+    let mut reason = ""
+    let mut yes = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--reason" {
+            if i + 1 < len(av) { reason = av[i + 1]; i = i + 1 }
+        } else if a == "--yes" || a == "-y" {
+            yes = true
+        }
+        i = i + 1
+    }
+    let ok = reason != ""
+    return [reason, yes, ok]
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/hx_harden.hexa --reason \"<text>\" [--yes]")
+    eprintln("")
+    eprintln("  Promotes critical SSOT (.raw .own) from Level 1 → Level 2.")
+    eprintln("  Level 2 removal requires sudo (chflags schg / root chattr).")
+    eprintln("  Audit-logged. Undo with: ./hx downgrade --reason \"...\"")
+}
+
+fn main() -> int {
+    let args = _parse_args()
+    let reason = args[0]
+    let yes = args[1]
+    let ok = args[2]
+
+    if !ok {
+        _usage()
+        return 2
+    }
+
+    if !_is_darwin() && !_is_linux() {
+        eprintln("hx_harden: unsupported OS — Level 2 unavailable")
+        return 0
+    }
+
+    println("── hx harden (Level 1 → Level 2) ──")
+    println("actor:   " + _current_user())
+    println("reason:  " + reason)
+    println("targets: " + _join(_critical_targets()))
+    println("")
+    println("숙련자 옵션 / Expert option:")
+    println("  · Level 2 sets macOS schg (system immutable) / Linux root +i.")
+    println("  · Removal requires sudo. Regular `./hx unlock` will invoke")
+    println("    sudo automatically on these targets from now on.")
+    println("  · Undo with `./hx downgrade --reason \"...\"` (also sudo).")
+    println("")
+
+    if !yes {
+        print("Continue? [y/N] ")
+        let confirmed = _read_yes_no(true)
+        if !confirmed {
+            eprintln("hx_harden: aborted by user")
+            return 1
+        }
+    }
+
+    // probe sudo
+    if !_has_passwordless_sudo() {
+        eprintln("")
+        eprintln("hx_harden: passwordless sudo unavailable (`sudo -n true` failed).")
+        eprintln("  Run `sudo -v` to cache credentials, then retry.")
+        return 1
+    }
+
+    let sha_before = ssot_fingerprint()
+
+    // delegate to os_level_lock's Level 2 apply
+    println("")
+    println("── promoting to Level 2 ──")
+    let rc = cmd_lock_level2(_critical_targets())
+    let sha_after = ssot_fingerprint()
+
+    if rc != 0 {
+        audit_append("harden", _current_user(), reason, "fail", sha_before, sha_after)
+        eprintln("hx_harden: FAILED — see errors above")
+        return 1
+    }
+
+    audit_append("harden", _current_user(), reason, "ok", sha_before, sha_after)
+
+    println("")
+    println("── OK ──")
+    println(".raw / .own are now Level 2 (schg / root-immutable).")
+    println("Editing flow: `./hx unlock --reason \"...\"` will invoke sudo")
+    println("  automatically to clear schg on these targets.")
+    println("Revert with: `./hx downgrade --reason \"...\"`")
+    return 0
+}
+
+fn _join(a: array) -> string {
+    let mut s = ""
+    let mut first = true
+    for x in a {
+        if first { s = x; first = false }
+        else     { s = s + " " + x }
+    }
+    return s
+}
+
+exit(main())

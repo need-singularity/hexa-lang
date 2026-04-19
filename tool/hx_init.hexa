@@ -1,0 +1,210 @@
+#!hexa strict
+// tool/hx_init.hexa — raw#0 tiered-lock first-run installer
+//
+// PURPOSE
+//   One-shot bootstrap for a fresh clone. Verifies this is a hexa-lang
+//   repository, applies Level 1 OS locks to all SSOT + raw#12 bans,
+//   creates `.raw-audit` (if missing), generates `.raw-attest-key`
+//   (if missing), and prints status + next-step guidance.
+//
+// USAGE
+//   ./hexa tool/hx_init.hexa
+//   ./hexa tool/hx_init.hexa --force       (re-run even if already locked)
+//
+// PRECONDITIONS
+//   · Run at repo root.
+//   · `.raw` `.own` `.ext` `.roadmap` `.loop` all exist (else error —
+//     "this is not a hexa-lang repo?").
+//   · `openssl` on PATH for attestation key generation.
+//
+// FLOW
+//   1. verify 5 SSOT exist; fail fast otherwise
+//   2. apply Level 1 (chflags uchg / chattr +i) to all targets
+//   3. create empty `.raw-audit` (via audit_append; library handles it)
+//   4. create `.raw-attest-key` with `openssl rand -hex 32` if absent;
+//      ensure it appears in `.gitignore` (add entry if missing)
+//   5. emit status
+//   6. guide user to `./hx harden` for Level 2 opt-in
+//
+// SAFETY
+//   · Idempotent: repeated runs re-verify but never clobber existing
+//     `.raw-attest-key` or overwrite `.raw-audit` contents.
+//   · Does NOT promote to Level 2 — that is explicit opt-in.
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+fn _parse_args() -> array {
+    // returns [force]
+    let av = argv()
+    let mut force = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--force" || a == "-f" { force = true }
+        i = i + 1
+    }
+    return [force]
+}
+
+// ─── step 1: repo shape check ──────────────────────────────────
+
+fn _verify_ssot_exists() -> int {
+    let required = [".raw", ".own", ".ext", ".roadmap", ".loop"]
+    let mut missing = []
+    for rel in required {
+        if !_path_exists(rel) { missing = missing.push(rel) }
+    }
+    if len(missing) == 0 { return 0 }
+    eprintln("hx_init: this is not a hexa-lang repo?")
+    eprintln("  missing SSOT files:")
+    for m in missing { eprintln("    - " + m) }
+    eprintln("")
+    eprintln("  hx_init must be run at the root of a hexa-lang checkout.")
+    return 1
+}
+
+// ─── step 2: Level 1 apply ─────────────────────────────────────
+
+fn _apply_level1() -> int {
+    let r = exec_with_status("./build/hexa_stage0 tool/os_level_lock.hexa lock 2>&1")
+    print(to_string(r[0]))
+    return r[1]
+}
+
+// ─── step 3: .raw-audit bootstrap ──────────────────────────────
+
+fn _bootstrap_audit() -> bool {
+    if _path_exists(".raw-audit") { return true }
+    // audit_append will create the header on first call; we emit an
+    // "init" event so the log is non-empty from day one.
+    return audit_append("init", _current_user(),
+                        "hx_init first-run bootstrap",
+                        "ok", ssot_fingerprint(), "-")
+}
+
+// ─── step 4: .raw-attest-key bootstrap ─────────────────────────
+
+fn _ensure_attest_key() -> bool {
+    if _path_exists(".raw-attest-key") { return true }
+    // openssl rand -hex 32 → 64 hex chars (256-bit HMAC key)
+    let r = exec_with_status("openssl rand -hex 32 > .raw-attest-key 2>&1")
+    if r[1] != 0 {
+        eprintln("hx_init: openssl rand failed — `.raw-attest-key` not created")
+        return false
+    }
+    // tight mode bits
+    exec_with_status("chmod 600 .raw-attest-key 2>&1")
+    println("  created   .raw-attest-key (600, 256-bit HMAC)")
+    return true
+}
+
+fn _ensure_gitignore_entry() -> bool {
+    // `.raw-attest-key` should be repo-private. We check that .gitignore
+    // already covers it; append a line if not.
+    if !_path_exists(".gitignore") {
+        let w = exec_with_status("printf '%s\\n' '.raw-attest-key' > .gitignore 2>&1")
+        if w[1] == 0 { println("  created   .gitignore with .raw-attest-key entry") }
+        return w[1] == 0
+    }
+    let r = exec_with_status("grep -qE '^\\.raw-attest-key\\b' .gitignore")
+    if r[1] == 0 { return true }  // already present
+    let a = exec_with_status("printf '\\n# raw#0 attestation HMAC key — repo-private\\n.raw-attest-key\\n' >> .gitignore 2>&1")
+    if a[1] == 0 { println("  updated   .gitignore (+ .raw-attest-key)") }
+    return a[1] == 0
+}
+
+// ─── step 5: status ────────────────────────────────────────────
+
+fn _emit_status() {
+    let r = exec_with_status("./build/hexa_stage0 tool/os_level_lock.hexa status 2>&1")
+    print(to_string(r[0]))
+}
+
+// ─── main ──────────────────────────────────────────────────────
+
+fn main() -> int {
+    let args = _parse_args()
+    let force = args[0]
+
+    println("── hx init (tiered lock, Level 1 default) ──")
+    println("root:  " + _pwd())
+    println("actor: " + _current_user())
+    println("")
+
+    // Step 1
+    println("── step 1: verify repo shape ──")
+    let rc = _verify_ssot_exists()
+    if rc != 0 { return rc }
+    println("  ok — 5 SSOT present")
+
+    if !_is_darwin() && !_is_linux() {
+        eprintln("")
+        eprintln("hx_init: warning — unsupported OS; Level 0 fallback (no immutable flags).")
+    }
+
+    // Step 2
+    println("")
+    println("── step 2: apply Level 1 ──")
+    let lrc = _apply_level1()
+    if lrc != 0 && !force {
+        eprintln("hx_init: Level 1 apply failed — investigate or re-run with --force")
+        return 1
+    }
+
+    // Step 3
+    println("")
+    println("── step 3: .raw-audit bootstrap ──")
+    if _bootstrap_audit() { println("  ok — audit log ready") }
+    else {
+        eprintln("  WARN — audit bootstrap failed (continuing)")
+    }
+
+    // Step 4
+    println("")
+    println("── step 4: .raw-attest-key bootstrap ──")
+    _ensure_attest_key()
+    _ensure_gitignore_entry()
+
+    // Step 5
+    println("")
+    println("── step 5: final status ──")
+    _emit_status()
+
+    println("")
+    println("── OK ──")
+    println("기본 Level 1 설치 완료.")
+    println("  · All 5 SSOT + raw#12 bans locked at Level 1 (user-removable).")
+    println("  · Editing: `./hx unlock --reason \"...\"`")
+    println("강화 원하면 `./hx harden` (sudo 필요). Level 2 opt-in.")
+    return 0
+}
+
+exit(main())

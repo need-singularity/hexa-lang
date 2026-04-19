@@ -1,24 +1,31 @@
 #!hexa strict
-// tool/hx_lock.hexa — blessed lock path (companion to hx_unlock)
+// tool/hx_lock.hexa — blessed lock path (companion to hx_unlock, tiered)
 //
 // PURPOSE
-//   Re-apply chflags uchg to all SSOT targets after an edit window.
+//   Re-apply OS-level locks to all SSOT targets after an edit window.
 //   Re-runs raw_all first — if rules are now broken, reports the
 //   failure and LEAVES TREE UNLOCKED so the developer can fix rather
 //   than losing work.
 //
+// LEVEL RESTORATION
+//   On auto-relock, hx_unlock passes --prior-levels "rel=lvl,rel=lvl,…"
+//   so targets that were at Level 2 before unlock are re-promoted via
+//   sudo chflags schg (macOS) or sudo chattr +i (Linux). If passwordless
+//   sudo is no longer available, the target falls back to Level 1 and
+//   an audit "downgrade-on-relock" event is appended.
+//
 // FLOW
-//   1. run raw_all (full)
-//   2. on PASS → chflags uchg on all targets → audit "lock ok"
+//   1. run raw_all (full) — unless --force
+//   2. on PASS → apply Level 1 to all targets
+//              → for each target with prior level 2, promote to L2
+//              → audit "lock ok" (with any downgrade-on-relock notes)
 //   3. on FAIL → do NOT lock. audit "lock fail". exit 1.
 //
 // USAGE
-//   ./hexa tool/hx_lock.hexa                 — explicit manual lock
-//   ./hexa tool/hx_lock.hexa --auto          — invoked by relock daemon
-//   ./hexa tool/hx_lock.hexa --force --reason "recovery"
-//                                            — lock even if raw_all fails
-//                                              (recovery path; audited as
-//                                              FORCED; not recommended)
+//   ./hexa tool/hx_lock.hexa                               — manual lock
+//   ./hexa tool/hx_lock.hexa --auto                        — relock daemon
+//   ./hexa tool/hx_lock.hexa --auto --prior-levels "...]"  — restore L2
+//   ./hexa tool/hx_lock.hexa --force --reason "recovery"   — lock on rule fail
 
 use "self/core/law_io"
 use "tool/raw_audit"
@@ -28,12 +35,23 @@ fn _is_darwin() -> bool {
     return uname == "Darwin"
 }
 
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _has_passwordless_sudo() -> bool {
+    let r = exec_with_status("sudo -n true 2>/dev/null")
+    return r[1] == 0
+}
+
 fn _parse_args() -> array {
-    // returns [auto, force, reason]
+    // returns [auto, force, reason, prior_levels]
     let av = argv()
     let mut auto = false
     let mut force = false
     let mut reason = ""
+    let mut prior_levels = ""
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -42,9 +60,12 @@ fn _parse_args() -> array {
         else if a == "--reason" {
             if i + 1 < len(av) { reason = av[i + 1]; i = i + 1 }
         }
+        else if a == "--prior-levels" {
+            if i + 1 < len(av) { prior_levels = av[i + 1]; i = i + 1 }
+        }
         i = i + 1
     }
-    return [auto, force, reason]
+    return [auto, force, reason, prior_levels]
 }
 
 fn _run_raw_all() -> int {
@@ -59,21 +80,80 @@ fn _apply_lock() -> int {
     return r[1]
 }
 
+// parse "rel=lvl,rel=lvl,..." into list of [rel, lvl_int] pairs
+fn _parse_prior_levels(s: string) -> array {
+    let mut out = []
+    if s == "" { return out }
+    let entries = split(s, ",")
+    for e in entries {
+        if e == "" { continue }
+        let eq = e.index_of("=")
+        if eq <= 0 { continue }
+        let rel = e.substring(0, eq)
+        let lvl_s = e.substring(eq + 1, len(e))
+        let mut n = 0
+        let mut j = 0
+        while j < len(lvl_s) {
+            let c = lvl_s.substring(j, j + 1)
+            if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+            else { break }
+            j = j + 1
+        }
+        out = out.push([rel, n])
+    }
+    return out
+}
+
+// Re-promote targets to Level 2 based on prior_levels map.
+// Returns list of relatives that could NOT be promoted (fell back to L1).
+fn _restore_level2(prior: array) -> array {
+    let mut downgraded = []
+    let mut l2_targets = []
+    for entry in prior {
+        let rel = entry[0]
+        let lvl = entry[1]
+        if lvl >= 2 { l2_targets = l2_targets.push(rel) }
+    }
+    if len(l2_targets) == 0 { return downgraded }
+    if !_has_passwordless_sudo() {
+        // can't promote — record all as downgraded
+        for rel in l2_targets { downgraded = downgraded.push(rel) }
+        return downgraded
+    }
+    // use os_level_lock's Level 2 set — but it operates on _critical_targets
+    // by default; here we want per-target control for arbitrary prior set.
+    // Call chflags/chattr directly for precise restoration.
+    for rel in l2_targets {
+        let mut rc = 1
+        if _is_darwin() {
+            // uchg may already be set; noop for existing L2, harmless re-set
+            let r = exec_with_status("sudo -n chflags schg '" + rel + "' 2>&1")
+            rc = r[1]
+        } else if _is_linux() {
+            let r = exec_with_status("sudo -n chattr +i '" + rel + "' 2>&1")
+            rc = r[1]
+        }
+        if rc != 0 { downgraded = downgraded.push(rel) }
+    }
+    return downgraded
+}
+
 fn main() -> int {
     let args = _parse_args()
     let auto = args[0]
     let force = args[1]
     let reason = args[2]
+    let prior_levels = args[3]
 
-    if !_is_darwin() {
-        eprintln("hx_lock: non-Darwin OS — no-op")
+    if !_is_darwin() && !_is_linux() {
+        eprintln("hx_lock: unsupported OS — no-op")
         return 0
     }
 
     let sha_before = ssot_fingerprint()
 
     let label = auto ? "auto-relock" : "manual-lock"
-    if !auto { println("── hx lock (" + label + ") ──") }
+    if !auto { println("── hx lock (" + label + ", tiered) ──") }
 
     // gate: raw_all must pass, unless --force
     if !force {
@@ -91,21 +171,49 @@ fn main() -> int {
         }
     }
 
+    // Phase 1: Level 1 for everything
     let lrc = _apply_lock()
-    let sha_after = ssot_fingerprint()
-    let tag = force ? "FORCED" : "ok"
-    let why = force ? ("forced: " + reason) : (auto ? "auto-relock after window" : "manual lock")
-    audit_append("lock", env("USER"), why, tag, sha_before, sha_after)
-
     if lrc != 0 {
-        eprintln("hx_lock: chflags uchg failed exit=" + to_string(lrc))
+        eprintln("hx_lock: L1 apply failed exit=" + to_string(lrc))
+        audit_append("lock", env("USER"),
+                     (auto ? "auto-relock" : "manual lock") + " (L1 phase)",
+                     "fail", sha_before, "-")
         return 1
     }
+
+    // Phase 2: restore Level 2 for targets that were at L2 before unlock
+    let prior = _parse_prior_levels(prior_levels)
+    let downgraded = _restore_level2(prior)
+    let sha_after = ssot_fingerprint()
+
+    // audit record
+    let tag = force ? "FORCED" : "ok"
+    let base_why = force ? ("forced: " + reason)
+                         : (auto ? "auto-relock after window" : "manual lock")
+    let mut why = base_why
+    if len(downgraded) > 0 {
+        let mut dg = ""
+        let mut first = true
+        for r in downgraded {
+            if first { dg = r; first = false }
+            else { dg = dg + "," + r }
+        }
+        why = why + " [downgraded-on-relock=" + dg + "]"
+        // also record a separate audit event for clarity
+        audit_append("downgrade-on-relock", env("USER"),
+                     "sudo unavailable; L2 targets re-locked at L1: " + dg,
+                     "warn", sha_before, sha_after)
+    }
+    audit_append("lock", env("USER"), why, tag, sha_before, sha_after)
 
     if !auto {
         println("")
         println("── OK ──")
-        println("SSOT re-locked.")
+        if len(downgraded) > 0 {
+            println("SSOT re-locked (some L2 targets fell back to L1; see .raw-audit).")
+        } else {
+            println("SSOT re-locked (levels restored).")
+        }
     }
     return 0
 }

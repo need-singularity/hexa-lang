@@ -1,35 +1,52 @@
 #!hexa strict
-// tool/os_level_lock.hexa — raw#0 OS-level file lock (chflags uchg)
+// tool/os_level_lock.hexa — raw#0 OS-level file lock (tiered)
 //
 // PURPOSE
 //   Pre-commit hooks and PreToolUse hooks are bypassable. Kernel EPERM
-//   (Operation not permitted, triggered by BSD `uchg` immutable flag) is
-//   the only real enforcement for SSOT files.
+//   (Operation not permitted, triggered by BSD `uchg` / `schg` immutable
+//   flags, or Linux `chattr +i`) is the only real enforcement for SSOT.
 //
-//   This tool applies / removes / inspects the `uchg` user-immutable flag
-//   on the raw#0 lock target set (5 SSOT + raw#12 grandfather list).
+//   This tool applies / removes / inspects OS-level immutable flags on
+//   the raw#0 lock target set (5 SSOT + raw#12 grandfather list) at
+//   three tiers of strictness.
+//
+// LEVELS (tiered lock, 2026-04-20)
+//   Level 0 — readonly filesystem permissions only (fallback when the
+//             platform does not support immutable flags). No sudo.
+//   Level 1 — macOS `chflags uchg` / Linux `chattr +i` (best-effort).
+//             Owner-removable without sudo on macOS; root required on
+//             Linux. DEFAULT for all 5 SSOT — allows `hx install` flow
+//             to work without demanding sudo up-front.
+//   Level 2 — macOS `chflags schg` (system immutable) / Linux
+//             `chattr +i` with root. REQUIRES sudo to set or clear.
+//             Opt-in via `./hx harden`. Protects .raw .own from even
+//             an accidental root-less remove.
 //
 // USAGE
-//   ./hexa tool/os_level_lock.hexa lock     — apply chflags uchg to all targets
-//   ./hexa tool/os_level_lock.hexa unlock   — remove chflags uchg (owner-only)
-//   ./hexa tool/os_level_lock.hexa status   — list each target + lock state
-//   ./hexa tool/os_level_lock.hexa verify   — exit 1 if any SSOT is unlocked
-//                                             (intended for pre-commit hook)
+//   ./hexa tool/os_level_lock.hexa lock           — Level 1 apply (uchg)
+//   ./hexa tool/os_level_lock.hexa unlock         — Level 1 remove (nouchg)
+//   ./hexa tool/os_level_lock.hexa lock-level2    — Level 2 apply (sudo schg)
+//   ./hexa tool/os_level_lock.hexa unlock-level2  — Level 2 remove (sudo noschg)
+//   ./hexa tool/os_level_lock.hexa status         — list each target + level
+//   ./hexa tool/os_level_lock.hexa verify         — exit 1 if any SSOT < L1
 //
 // PLATFORM
-//   macOS only. Darwin `chflags uchg` sets BSD immutable flag; any write /
-//   unlink / rename attempt returns EPERM until owner runs `chflags nouchg`.
-//   Linux equivalent would be `chattr +i` (root only) — not implemented.
-//   On non-Darwin OS the tool no-ops with a warning (does not fail).
+//   macOS — full support (uchg / schg).
+//   Linux — best-effort via chattr; `+i` maps Level 1 & Level 2 both
+//           (Linux has no user-immutable flag — root is required for
+//           either set or clear, so L1≡L2 semantically on Linux).
+//   Other — Level 0 (no-op with warning).
 //
 // TARGETS
-//   Split into two groups:
-//     required : 5 SSOT — must exist; verify fails if missing or unlocked
-//     optional : raw#12 grandfather bans — locked only if present on disk
+//   required          : 5 SSOT — must exist; verify fails if missing / < L1
+//   optional          : raw#12 grandfather bans — locked if present on disk
+//   critical (L2)     : subset of required — default {.raw .own}, the set
+//                       `hx harden` promotes to Level 2
+//   non_critical (L1) : required - critical — stays at Level 1 always
 //
-//   Names are declared inline in _required_targets / _optional_targets
-//   rather than hardcoded at call sites (raw#14 — values belong in SSOT,
-//   but the target list IS an SSOT declaration here, so centralized).
+//   Names are declared inline rather than hardcoded at call sites
+//   (raw#14 — values belong in SSOT, but the target list IS an SSOT
+//   declaration here, so centralized).
 
 // ─── target lists (raw#0 scope) ─────────────────────────────────
 
@@ -54,6 +71,18 @@ fn _optional_targets() -> array {
     ]
 }
 
+pub fn _critical_targets() -> array {
+    // Level 2 candidates — the most sensitive SSOT. `hx harden` promotes
+    // these to schg; `hx downgrade` reverts to L1.
+    return [".raw", ".own"]
+}
+
+pub fn _non_critical_targets() -> array {
+    // Stays at Level 1 regardless of harden — legitimate edit flow is
+    // frequent enough that schg would cause friction without benefit.
+    return [".ext", ".roadmap", ".loop"]
+}
+
 // ─── environment helpers ────────────────────────────────────────
 
 fn _pwd() -> string {
@@ -69,45 +98,156 @@ fn _path_exists(path: string) -> bool {
     return r == "y"
 }
 
-fn _is_darwin() -> bool {
+pub fn _is_darwin() -> bool {
     let uname = to_string(exec("uname -s")).trim()
     return uname == "Darwin"
 }
 
-// ─── lock state inspection ──────────────────────────────────────
+pub fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
 
-fn _is_locked(path: string) -> bool {
-    // `ls -lOd` prints flag column 5 on Darwin: "uchg" when immutable,
-    // "-" when clear. We match on literal token "uchg" to avoid false
-    // positives (filename containing 'uchg' would still land in a
-    // different column).
+fn _has_passwordless_sudo() -> bool {
+    // `sudo -n true` — non-interactive probe; returns 0 iff cached / NOPASSWD.
+    let r = exec_with_status("sudo -n true 2>/dev/null")
+    return r[1] == 0
+}
+
+// ─── lock state inspection (Level-aware) ────────────────────────
+
+fn _darwin_has_uchg(path: string) -> bool {
     let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
     if r[1] != 0 { return false }
     let line = to_string(r[0])
-    // Flag token is surrounded by whitespace — match " uchg " substring
-    // to reject a filename accidentally called "uchg*".
     if line.contains(" uchg ") { return true }
-    if line.contains(" uchg,") { return true }  // combined flag form
+    if line.contains(" uchg,") { return true }
+    if line.contains(",uchg ") { return true }
+    if line.contains(",uchg,") { return true }
     return false
 }
 
-// ─── mutations ──────────────────────────────────────────────────
+fn _darwin_has_schg(path: string) -> bool {
+    let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    if line.contains(" schg ") { return true }
+    if line.contains(" schg,") { return true }
+    if line.contains(",schg ") { return true }
+    if line.contains(",schg,") { return true }
+    return false
+}
+
+fn _linux_has_immutable(path: string) -> bool {
+    // `lsattr -d` prints flags like "----i---------e-- path"
+    let r = exec_with_status("lsattr -d '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    // First token contains flag letters; 'i' means immutable.
+    // We scan only up to first whitespace to avoid matching the filename.
+    let mut i = 0
+    while i < len(line) {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        if c == "i" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_locked(path: string) -> bool {
+    if _is_darwin() { return _darwin_has_uchg(path) || _darwin_has_schg(path) }
+    if _is_linux()  { return _linux_has_immutable(path) }
+    return false
+}
+
+// Returns 0 (unlocked / L0), 1 (L1 = uchg or linux +i), 2 (L2 = schg).
+// On Linux there is no distinction between L1 and L2 from the flag
+// alone — callers may consult the critical-target list to interpret
+// which level is "intended".
+pub fn _detect_level(path: string) -> int {
+    if !_path_exists(path) { return 0 }
+    if _is_darwin() {
+        if _darwin_has_schg(path) { return 2 }
+        if _darwin_has_uchg(path) { return 1 }
+        return 0
+    }
+    if _is_linux() {
+        if _linux_has_immutable(path) { return 1 }
+        return 0
+    }
+    return 0
+}
+
+fn _level_label(level: int, platform_darwin: bool) -> string {
+    if level == 2 { return platform_darwin ? "L2-schg" : "L2-immut" }
+    if level == 1 { return platform_darwin ? "L1-uchg" : "L1-immut" }
+    return "L0"
+}
+
+// ─── mutations (Level 1) ────────────────────────────────────────
 
 fn _apply_lock(path: string) -> int {
-    let r = exec_with_status("chflags uchg '" + path + "' 2>&1")
-    return r[1]
+    if _is_darwin() {
+        let r = exec_with_status("chflags uchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        // best-effort: try without sudo first, fall back to sudo -n
+        let r = exec_with_status("chattr +i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return 0  // Level 0 no-op platforms
 }
 
 fn _remove_lock(path: string) -> int {
-    let r = exec_with_status("chflags nouchg '" + path + "' 2>&1")
-    return r[1]
+    if _is_darwin() {
+        let r = exec_with_status("chflags nouchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("chattr -i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return 0
+}
+
+// ─── mutations (Level 2 — sudo required on macOS) ───────────────
+
+pub fn _apply_lock_level2(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("sudo -n chflags schg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        // Linux: chattr +i always root; treat as L2 equivalently
+        let r = exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")
+        return r[1]
+    }
+    return 0
+}
+
+pub fn _remove_lock_level2(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("sudo -n chflags noschg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")
+        return r[1]
+    }
+    return 0
 }
 
 // ─── command implementations ────────────────────────────────────
 
 fn cmd_lock() -> int {
-    if !_is_darwin() {
-        eprintln("warn[os_level_lock]: non-Darwin OS — chflags uchg unavailable, no-op")
+    if !_is_darwin() && !_is_linux() {
+        eprintln("warn[os_level_lock]: unsupported OS — Level 0 no-op")
         return 0
     }
     let root = _pwd()
@@ -130,10 +270,10 @@ fn cmd_lock() -> int {
         let rc = _apply_lock(abs)
         if rc == 0 {
             locked_count = locked_count + 1
-            println("  locked    " + rel)
+            println("  locked    " + rel + " (L1)")
         } else {
             failures = failures.push(rel)
-            eprintln("  FAILED    " + rel + " (chflags exit " + to_string(rc) + ")")
+            eprintln("  FAILED    " + rel + " (lock exit " + to_string(rc) + ")")
         }
     }
 
@@ -147,8 +287,8 @@ fn cmd_lock() -> int {
 }
 
 fn cmd_unlock() -> int {
-    if !_is_darwin() {
-        eprintln("warn[os_level_lock]: non-Darwin OS — no-op")
+    if !_is_darwin() && !_is_linux() {
+        eprintln("warn[os_level_lock]: unsupported OS — no-op")
         return 0
     }
     let root = _pwd()
@@ -164,17 +304,27 @@ fn cmd_unlock() -> int {
             skipped_missing = skipped_missing + 1
             continue
         }
-        if !_is_locked(abs) {
+        let lvl = _detect_level(abs)
+        if lvl == 0 {
             skipped_already = skipped_already + 1
             continue
         }
-        let rc = _remove_lock(abs)
+        // Level 2 requires sudo — prefer the level-appropriate call
+        let mut rc = 0
+        if lvl == 2 { rc = _remove_lock_level2(abs) }
+        else        { rc = _remove_lock(abs) }
         if rc == 0 {
             unlocked_count = unlocked_count + 1
-            println("  unlocked  " + rel)
+            println("  unlocked  " + rel + " (was L" + to_string(lvl) + ")")
         } else {
             failures = failures.push(rel)
-            eprintln("  FAILED    " + rel + " (chflags exit " + to_string(rc) + ")")
+            if lvl == 2 {
+                eprintln("  FAILED    " + rel
+                         + " (L2 unlock needs sudo; passwordless sudo unavailable, exit "
+                         + to_string(rc) + ") — try: ./hx downgrade")
+            } else {
+                eprintln("  FAILED    " + rel + " (unlock exit " + to_string(rc) + ")")
+            }
         }
     }
 
@@ -187,11 +337,89 @@ fn cmd_unlock() -> int {
     return 0
 }
 
+pub fn cmd_lock_level2(target_list: array) -> int {
+    if !_is_darwin() && !_is_linux() {
+        eprintln("warn[os_level_lock]: Level 2 requires Darwin or Linux")
+        return 0
+    }
+    if !_has_passwordless_sudo() {
+        eprintln("os_level_lock: Level 2 needs passwordless sudo (sudo -n true failed).")
+        eprintln("  Grant NOPASSWD for chflags/chattr, or run `sudo -v` first, then retry.")
+        return 1
+    }
+    let root = _pwd()
+    let mut promoted = 0
+    let mut failures = []
+    for rel in target_list {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            eprintln("  MISSING   " + rel + " — skipped")
+            continue
+        }
+        // Level 2 set must clear L1 first on Darwin (uchg blocks schg set
+        // otherwise — chflags toggles the flag set, not a level).
+        if _is_darwin() && _darwin_has_uchg(abs) { _remove_lock(abs) }
+        let rc = _apply_lock_level2(abs)
+        if rc == 0 {
+            promoted = promoted + 1
+            println("  L2        " + rel + " (schg/immutable)")
+        } else {
+            failures = failures.push(rel)
+            eprintln("  FAILED    " + rel + " (sudo exit " + to_string(rc) + ")")
+        }
+    }
+    println("")
+    println("level-2 summary: promoted=" + to_string(promoted)
+            + " failed=" + to_string(len(failures)))
+    if len(failures) > 0 { return 1 }
+    return 0
+}
+
+pub fn cmd_unlock_level2(target_list: array) -> int {
+    if !_is_darwin() && !_is_linux() {
+        eprintln("warn[os_level_lock]: Level 2 unlock needs Darwin or Linux")
+        return 0
+    }
+    if !_has_passwordless_sudo() {
+        eprintln("os_level_lock: Level 2 unlock needs passwordless sudo.")
+        return 1
+    }
+    let root = _pwd()
+    let mut cleared = 0
+    let mut failures = []
+    for rel in target_list {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { continue }
+        let rc = _remove_lock_level2(abs)
+        if rc == 0 {
+            cleared = cleared + 1
+            println("  cleared   " + rel + " (L2→L0)")
+        } else {
+            failures = failures.push(rel)
+            eprintln("  FAILED    " + rel + " (sudo exit " + to_string(rc) + ")")
+        }
+    }
+    println("")
+    println("level-2 unlock summary: cleared=" + to_string(cleared)
+            + " failed=" + to_string(len(failures)))
+    if len(failures) > 0 { return 1 }
+    return 0
+}
+
 fn cmd_status() -> int {
     let root = _pwd()
     let darwin = _is_darwin()
+    let linux = _is_linux()
+    let supported = darwin || linux
 
-    println("── raw#0 os-level lock status ──")
+    println("── raw#0 os-level lock status (tiered) ──")
+    if !supported {
+        println("  platform: UNSUPPORTED (Level 0 fallback)")
+    } else if darwin {
+        println("  platform: Darwin (uchg=L1, schg=L2)")
+    } else {
+        println("  platform: Linux (chattr +i; L1≡L2)")
+    }
     println("")
     println("required SSOT (5):")
     for rel in _required_targets() {
@@ -200,14 +428,16 @@ fn cmd_status() -> int {
             println("  MISSING   " + rel)
             continue
         }
-        if !darwin {
-            println("  N/A       " + rel + " (non-Darwin)")
+        if !supported {
+            println("  N/A       " + rel + " (L0)")
             continue
         }
-        if _is_locked(abs) {
-            println("  locked    " + rel)
+        let lvl = _detect_level(abs)
+        let tag = _level_label(lvl, darwin)
+        if lvl == 0 {
+            println("  UNLOCKED  " + rel + "  " + tag)
         } else {
-            println("  UNLOCKED  " + rel)
+            println("  locked    " + rel + "  " + tag)
         }
     }
 
@@ -219,14 +449,16 @@ fn cmd_status() -> int {
             println("  absent    " + rel)
             continue
         }
-        if !darwin {
-            println("  N/A       " + rel + " (non-Darwin)")
+        if !supported {
+            println("  N/A       " + rel + " (L0)")
             continue
         }
-        if _is_locked(abs) {
-            println("  locked    " + rel)
+        let lvl = _detect_level(abs)
+        let tag = _level_label(lvl, darwin)
+        if lvl == 0 {
+            println("  UNLOCKED  " + rel + "  " + tag)
         } else {
-            println("  UNLOCKED  " + rel)
+            println("  locked    " + rel + "  " + tag)
         }
     }
     return 0
@@ -234,8 +466,8 @@ fn cmd_status() -> int {
 
 fn cmd_verify() -> int {
     // pre-commit mode: silent on pass, exit 1 with detail on fail.
-    if !_is_darwin() {
-        // Non-Darwin treated as pass (tool noop) — raw#0 note says macOS.
+    if !_is_darwin() && !_is_linux() {
+        // Unsupported platform — treat as pass (Level 0 fallback).
         return 0
     }
     let root = _pwd()
@@ -247,21 +479,21 @@ fn cmd_verify() -> int {
             fails = fails.push(rel + " (missing)")
             continue
         }
-        if !_is_locked(abs) {
-            fails = fails.push(rel + " (unlocked)")
+        if _detect_level(abs) < 1 {
+            fails = fails.push(rel + " (unlocked, < L1)")
         }
     }
     // Optional bans: if present, must be locked. If absent, skip.
     for rel in _optional_targets() {
         let abs = root + "/" + rel
         if !_path_exists(abs) { continue }
-        if !_is_locked(abs) {
-            fails = fails.push(rel + " (unlocked)")
+        if _detect_level(abs) < 1 {
+            fails = fails.push(rel + " (unlocked, < L1)")
         }
     }
 
     if len(fails) == 0 { return 0 }
-    eprintln("raw#0 verify FAILED — the following targets are not OS-locked:")
+    eprintln("raw#0 verify FAILED — the following targets are below Level 1:")
     for f in fails { eprintln("  - " + f) }
     eprintln("")
     eprintln("Remedy: ./hexa tool/os_level_lock.hexa lock")
@@ -271,7 +503,8 @@ fn cmd_verify() -> int {
 // ─── CLI dispatch ───────────────────────────────────────────────
 
 fn _usage() {
-    eprintln("usage: hexa tool/os_level_lock.hexa <lock|unlock|status|verify>")
+    eprintln("usage: hexa tool/os_level_lock.hexa <cmd>")
+    eprintln("  cmd = lock | unlock | lock-level2 | unlock-level2 | status | verify")
 }
 
 let _av = argv()
@@ -281,7 +514,8 @@ let mut cmd = ""
 let mut i = 2
 while i < len(_av) {
     let a = _av[i]
-    if a == "lock" || a == "unlock" || a == "status" || a == "verify" {
+    if a == "lock" || a == "unlock" || a == "status" || a == "verify"
+       || a == "lock-level2" || a == "unlock-level2" {
         cmd = a
         break
     }
@@ -294,10 +528,12 @@ if cmd == "" {
 }
 
 let mut rc = 0
-if cmd == "lock"        { rc = cmd_lock() }
-else if cmd == "unlock" { rc = cmd_unlock() }
-else if cmd == "status" { rc = cmd_status() }
-else if cmd == "verify" { rc = cmd_verify() }
+if cmd == "lock"                  { rc = cmd_lock() }
+else if cmd == "unlock"           { rc = cmd_unlock() }
+else if cmd == "lock-level2"      { rc = cmd_lock_level2(_critical_targets()) }
+else if cmd == "unlock-level2"    { rc = cmd_unlock_level2(_critical_targets()) }
+else if cmd == "status"           { rc = cmd_status() }
+else if cmd == "verify"           { rc = cmd_verify() }
 else {
     _usage()
     exit(2)

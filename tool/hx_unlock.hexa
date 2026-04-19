@@ -1,27 +1,35 @@
 #!hexa strict
-// tool/hx_unlock.hexa — blessed unlock gate (P0b)
+// tool/hx_unlock.hexa — blessed unlock gate (P0b, tiered)
 //
 // PURPOSE
-//   The ONLY sanctioned path to remove chflags uchg from SSOT files.
+//   The ONLY sanctioned path to remove OS-level locks from SSOT files.
 //   Requires:
 //     · raw_all exit 0 (all live rules pass)
 //     · --reason "<text>" (mandatory, written to audit log)
 //     · optional --actor <name> (defaults to $USER)
 //     · optional --window <seconds> (default 300, max 3600)
 //
+// LEVELS
+//   For each target:
+//     · L0 → nothing to do
+//     · L1 → chflags nouchg (macOS) / chattr -i (Linux, sudo -n)
+//     · L2 → sudo -n chflags noschg (macOS) / sudo -n chattr -i (Linux)
+//   After unlock, re-lock daemon restores targets to their ORIGINAL
+//   level (L2 targets are promoted back via sudo schg on auto-relock).
+//
 // FLOW
 //   1. parse args; fail fast on missing --reason
-//   2. fingerprint SSOT (sha256 of 5 files)
-//   3. run raw_all; on FAIL → refuse, log "blocked" to audit, exit 1
-//   4. on PASS → chflags nouchg on required + optional targets
-//   5. audit "unlock" event with sha_before + reason
-//   6. schedule background re-lock at T + window (spawn detached)
-//   7. print banner with countdown + next steps
+//   2. snapshot per-target level map (for relock restore)
+//   3. fingerprint SSOT (sha256 of 5 files)
+//   4. run raw_all; on FAIL → refuse, log "blocked" to audit, exit 1
+//   5. on PASS → per-target unlock (level-aware)
+//   6. audit "unlock" event with sha_before + reason + level map
+//   7. schedule background re-lock at T + window (spawn detached)
+//   8. print banner with countdown + next steps
 //
 // RELOCK
 //   A background child `sh -c "sleep N; ./hexa tool/hx_lock.hexa auto"`
-//   is spawned. Even if the developer forgets, the tree re-locks after
-//   the window. The child re-runs raw_all on re-lock — if edits broke
+//   is spawned. The child re-runs raw_all on re-lock — if edits broke
 //   rules, the audit logs a warning and the files remain unlocked
 //   (letting developer fix rather than auto-reverting work).
 //
@@ -29,16 +37,29 @@
 //   ./hexa tool/hx_unlock.hexa --reason "add raw#17 rule"
 //   ./hexa tool/hx_unlock.hexa --reason "fix typo" --window 60
 //
-// RAW chflags BYPASS DETECTION
-//   If an edit happens while raw_all fails, --force is NOT supported.
-//   The only escape is tool/emergency/raw_reset.sh (documented).
+// SUDO FAILURE
+//   If target is at L2 and `sudo -n true` fails, hx_unlock prints:
+//     "Level 2 requires sudo; either cache credentials (`sudo -v`)
+//      and retry, or run `./hx downgrade` to drop to Level 1 first."
+//   and exits non-zero without partial unlock.
 
 use "self/core/law_io"
 use "tool/raw_audit"
+use "tool/os_level_lock"
 
 fn _is_darwin() -> bool {
     let uname = to_string(exec("uname -s")).trim()
     return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _has_passwordless_sudo() -> bool {
+    let r = exec_with_status("sudo -n true 2>/dev/null")
+    return r[1] == 0
 }
 
 fn _default_window() -> int { return 300 }
@@ -107,10 +128,76 @@ fn _run_raw_all() -> int {
     return r[1]
 }
 
-// ─── unlock operation ────────────────────────────────────────────
+// ─── per-target level snapshot + unlock ──────────────────────────
 
-fn _unlock_targets() -> int {
-    // delegate to os_level_lock.hexa unlock — it knows the target set
+fn _all_targets() -> array {
+    // 5 SSOT + raw#12 grandfather bans — same set os_level_lock handles
+    return [".raw", ".own", ".ext", ".roadmap", ".loop",
+            "CLAUDE.md", "AGENTS.md", "CODEX.md",
+            ".cursorrules", ".cursor", ".windsurfrules",
+            ".aider.conf.yml", ".continuerules",
+            ".github/copilot-instructions.md", ".claude"]
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _snapshot_levels() -> array {
+    // returns parallel array of "rel=level" strings — consumed by relock
+    // daemon as inline args so the detached child can restore levels
+    // without re-reading state after edits.
+    let root = _pwd()
+    let mut out = []
+    for rel in _all_targets() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { continue }
+        let lvl = _detect_level(abs)
+        out = out.push(rel + "=" + to_string(lvl))
+    }
+    return out
+}
+
+fn _serialize_levels(levels: array) -> string {
+    // comma-separated; used as --prior-levels arg to hx_lock
+    let mut s = ""
+    let mut first = true
+    for entry in levels {
+        if first { s = entry; first = false }
+        else     { s = s + "," + entry }
+    }
+    return s
+}
+
+// Returns rc; any L2 target failure on sudo short-circuits with a
+// helpful message. All-or-nothing semantics — we refuse to leave a
+// mix of locked / unlocked SSOT after exit.
+fn _unlock_targets_leveled() -> int {
+    let root = _pwd()
+    // Pre-flight: if any target is L2, require passwordless sudo.
+    let mut any_l2 = false
+    for rel in _all_targets() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { continue }
+        if _detect_level(abs) >= 2 { any_l2 = true }
+    }
+    if any_l2 && !_has_passwordless_sudo() {
+        eprintln("hx_unlock: one or more targets are at Level 2 (schg / root-immutable).")
+        eprintln("  Passwordless sudo is unavailable (sudo -n true failed).")
+        eprintln("")
+        eprintln("  Options:")
+        eprintln("    1) sudo -v       # cache credentials, then retry hx unlock")
+        eprintln("    2) ./hx downgrade --reason \"temp edit\"   # L2 → L1, then unlock normally")
+        return 1
+    }
+    // Delegate to os_level_lock's unlock — it is already level-aware.
     let r = exec_with_status("./build/hexa_stage0 tool/os_level_lock.hexa unlock 2>&1")
     let out = to_string(r[0])
     print(out)
@@ -119,13 +206,16 @@ fn _unlock_targets() -> int {
 
 // ─── relock daemon ───────────────────────────────────────────────
 
-fn _spawn_relock(window_sec: int, reason: string) -> int {
+fn _spawn_relock(window_sec: int, reason: string, prior_levels: string) -> int {
     // detach so this script exits but child survives
-    // child: sleep N → hx_lock auto → audit entry
+    // child: sleep N → hx_lock auto (with prior_levels) → audit entry
+    let esc_reason = reason.replace("\"", "'\\''")
+    let esc_prior = prior_levels.replace("\"", "'\\''")
     let cmd = "nohup sh -c '"
               + "sleep " + to_string(window_sec) + "; "
               + "./build/hexa_stage0 tool/hx_lock.hexa --auto --reason \"window expired after "
-              + to_string(window_sec) + "s (unlock reason: " + reason.replace("\"", "'\\''") + ")\""
+              + to_string(window_sec) + "s (unlock reason: " + esc_reason + ")\""
+              + " --prior-levels \"" + esc_prior + "\""
               + "' >/dev/null 2>&1 &"
     let r = exec_with_status(cmd)
     return r[1]
@@ -145,12 +235,12 @@ fn main() -> int {
         return 2
     }
 
-    if !_is_darwin() {
-        eprintln("hx_unlock: non-Darwin OS — chflags unavailable, exiting without action")
+    if !_is_darwin() && !_is_linux() {
+        eprintln("hx_unlock: unsupported OS — OS-level locks unavailable, exiting without action")
         return 0
     }
 
-    println("── hx unlock ──")
+    println("── hx unlock (tiered) ──")
     println("actor:  " + actor)
     println("reason: " + reason)
     println("window: " + to_string(window) + "s")
@@ -158,6 +248,10 @@ fn main() -> int {
 
     // fingerprint BEFORE raw_all (we want the pre-unlock state hash)
     let sha_before = ssot_fingerprint()
+
+    // snapshot per-target levels so relock daemon can restore
+    let level_snapshot = _snapshot_levels()
+    let prior_serialized = _serialize_levels(level_snapshot)
 
     // gate — raw_all must pass
     println("── gate: raw_all ──")
@@ -171,18 +265,20 @@ fn main() -> int {
 
     println("")
     println("── unlock ──")
-    let urc = _unlock_targets()
+    let urc = _unlock_targets_leveled()
     if urc != 0 {
-        eprintln("hx_unlock: chflags nouchg failed exit=" + to_string(urc))
+        eprintln("hx_unlock: unlock failed exit=" + to_string(urc))
         audit_append("unlock", actor, reason, "fail", sha_before, "-")
         return 1
     }
 
-    // audit: successful unlock
-    audit_append("unlock", actor, reason, "ok", sha_before, "-")
+    // audit: successful unlock (record prior level map in reason suffix)
+    audit_append("unlock", actor,
+                 reason + " [prior_levels=" + prior_serialized + "]",
+                 "ok", sha_before, "-")
 
-    // schedule re-lock
-    let src = _spawn_relock(window, reason)
+    // schedule re-lock with level restoration
+    let src = _spawn_relock(window, reason, prior_serialized)
     if src != 0 {
         eprintln("hx_unlock: WARN — relock daemon spawn failed (will need manual ./hx lock)")
     }
@@ -190,7 +286,7 @@ fn main() -> int {
     println("")
     println("── OK ──")
     println("SSOT unlocked for " + to_string(window) + "s.")
-    println("Auto re-lock at T+" + to_string(window) + "s (best effort).")
+    println("Auto re-lock at T+" + to_string(window) + "s (best effort, level-restoring).")
     println("Prefer explicit: ./hexa tool/hx_lock.hexa   when done editing.")
     return 0
 }
