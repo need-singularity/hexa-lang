@@ -139,6 +139,7 @@ static const char* hexa_intern(const char* s) {
 typedef struct HexaVal_ HexaVal;
 HexaVal hexa_add(HexaVal a, HexaVal b);
 HexaVal hexa_concat_many(int n, HexaVal* parts);
+int hexa_truthy(HexaVal v);
 HexaVal hexa_sub(HexaVal a, HexaVal b);
 HexaVal hexa_mul(HexaVal a, HexaVal b);
 HexaVal hexa_div(HexaVal a, HexaVal b);
@@ -1607,6 +1608,53 @@ HexaVal hexa_map_from_array(HexaVal self_map, HexaVal arr) {
         out = hexa_map_set(out, k_str, v);
     }
     return out;
+}
+
+// count(pred): pred is 2-arg fn(key, value) returning truthy for hits.
+// No-pred variant (arg is void sentinel) returns total entry count.
+// Keys are exposed to the predicate as TAG_STR per interpreter semantics.
+// Matches interpreter at self/hexa_full.hexa:15689-15704.
+HexaVal hexa_map_count(HexaVal m, HexaVal pred) {
+    if (!HX_MAP_TBL(m)) return hexa_int(0);
+    HexaMapTable* t = HX_MAP_TBL(m);
+    if (HX_IS_VOID(pred)) return hexa_int(t->len);
+    int cnt = 0;
+    for (int i = 0; i < t->len; i++) {
+        HexaVal key_val = hexa_str(t->order_keys[i]);
+        HexaVal r = hexa_call2(pred, key_val, t->order_vals[i]);
+        if (hexa_truthy(r)) cnt++;
+    }
+    return hexa_int(cnt);
+}
+
+// any(pred): pred is 2-arg fn(key, value). Returns true on first truthy
+// result, else false. Empty map → false.
+// Matches interpreter at self/hexa_full.hexa:15705-15718.
+HexaVal hexa_map_any(HexaVal m, HexaVal pred) {
+    if (!HX_MAP_TBL(m)) return hexa_bool(0);
+    HexaMapTable* t = HX_MAP_TBL(m);
+    if (HX_IS_VOID(pred)) return hexa_bool(0);
+    for (int i = 0; i < t->len; i++) {
+        HexaVal key_val = hexa_str(t->order_keys[i]);
+        HexaVal r = hexa_call2(pred, key_val, t->order_vals[i]);
+        if (hexa_truthy(r)) return hexa_bool(1);
+    }
+    return hexa_bool(0);
+}
+
+// all(pred): pred is 2-arg fn(key, value). Returns false on first falsy
+// result, else true. Empty map → true (vacuous).
+// Matches interpreter at self/hexa_full.hexa:15719-15732.
+HexaVal hexa_map_all(HexaVal m, HexaVal pred) {
+    if (!HX_MAP_TBL(m)) return hexa_bool(1);
+    HexaMapTable* t = HX_MAP_TBL(m);
+    if (HX_IS_VOID(pred)) return hexa_bool(1);
+    for (int i = 0; i < t->len; i++) {
+        HexaVal key_val = hexa_str(t->order_keys[i]);
+        HexaVal r = hexa_call2(pred, key_val, t->order_vals[i]);
+        if (!hexa_truthy(r)) return hexa_bool(0);
+    }
+    return hexa_bool(1);
 }
 
 HexaVal hexa_map_remove(HexaVal m, const char* key) {
@@ -4659,7 +4707,13 @@ HexaVal hexa_array_index_of(HexaVal arr, HexaVal item) {
 // at self/hexa_full.hexa:15189+ using hexa_call1 for callback dispatch
 // (same pattern as hexa_array_map/filter/fold).
 
+HexaVal hexa_map_any(HexaVal m, HexaVal pred);
+HexaVal hexa_map_all(HexaVal m, HexaVal pred);
+
 HexaVal hexa_array_any(HexaVal arr, HexaVal fn) {
+    // Map receiver: delegate to hexa_map_any (2-arg predicate over k,v).
+    // Matches interpreter dispatch at self/hexa_full.hexa:15705-15718.
+    if (HX_IS_MAP(arr)) return hexa_map_any(arr, fn);
     if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         if (hexa_truthy(hexa_call1(fn, HX_ARR_ITEMS(arr)[i]))) return hexa_bool(1);
@@ -4668,6 +4722,9 @@ HexaVal hexa_array_any(HexaVal arr, HexaVal fn) {
 }
 
 HexaVal hexa_array_all(HexaVal arr, HexaVal fn) {
+    // Map receiver: delegate to hexa_map_all. Empty map → true (vacuous).
+    // Matches interpreter dispatch at self/hexa_full.hexa:15719-15732.
+    if (HX_IS_MAP(arr)) return hexa_map_all(arr, fn);
     if (!HX_IS_ARRAY(arr)) return hexa_bool(1);
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         if (!hexa_truthy(hexa_call1(fn, HX_ARR_ITEMS(arr)[i]))) return hexa_bool(0);
@@ -4684,13 +4741,19 @@ HexaVal hexa_array_count(HexaVal arr, HexaVal fn) {
     return hexa_int(c);
 }
 
+HexaVal hexa_map_count(HexaVal m, HexaVal pred);
+
 // count_poly: dispatch `.count()` method by receiver type. String form
-// takes a substring arg (hexa_str_count_substr); array form takes a
-// predicate fn (hexa_array_count). Matches interpreter at
-// self/hexa_full.hexa:14997-15014 (str) and 15351-15358 (arr).
+// takes a substring arg (hexa_str_count_substr); map form takes a 2-arg
+// predicate fn(k,v) or acts as len() when pred is void; array form takes
+// a 1-arg predicate fn (hexa_array_count). Matches interpreter at
+// self/hexa_full.hexa:14997-15014 (str), 15689-15704 (map), 15351-15358 (arr).
 HexaVal hexa_count_poly(HexaVal obj, HexaVal arg) {
     if (HX_IS_STR(obj) && HX_IS_STR(arg)) {
         return hexa_str_count_substr(obj, arg);
+    }
+    if (HX_IS_MAP(obj)) {
+        return hexa_map_count(obj, arg);
     }
     return hexa_array_count(obj, arg);
 }
