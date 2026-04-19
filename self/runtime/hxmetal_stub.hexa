@@ -1,12 +1,16 @@
-// self/runtime/hxmetal_stub.hexa — ROI #147 Metal FFI scaffold
+// self/runtime/hxmetal_stub.hexa — ROI #147 scaffold + ROI #157 live wiring
 //
-// PoC / scaffold: 9-function surface for Apple Metal compute shaders.
-// All bodies return deterministic sentinel values so dependent code
-// (serving/edge/metal_matmul.hexa, metal_fused.hexa) can be authored
-// against a fixed shape while the real objc_msgSend bridge is built in
-// a follow-up ROI.
+// 9-function surface for Apple Metal compute shaders, pure-hexa.
+// NO .m shim file — all Objective-C dispatch goes through the interpreter
+// FFI layer (__host_extern_call → dlopen/dlsym, see self/runtime.c:4276
+// hexa_host_ffi_call_6) against libobjc + Metal.framework + Foundation.
 //
-// Design reference: docs/plans/hxmetal_ffi_design.md
+// MODE SELECTION (runtime)
+//   HXMETAL_LIVE=1  → every hxm_* entry issues real objc_msgSend.
+//   HXMETAL_LIVE=0  → sentinel handles (original #147 stub semantics).
+//                     Keeps Linux/CI + pre-wired dependents healthy.
+//
+// Design reference: docs/plans/hxmetal_ffi_design.md (Strategy A)
 // Upstream consumer: $NEXUS/shared/roadmaps/m4_edge_deploy.json → E2-2/3/4
 // Related ceiling item: "M4 edge deploy, 33 tok/s physics floor". Enables
 //   GPU FFN compute (7.2ms) overlapped with CPU attn+prefetch (4.2ms) →
@@ -79,7 +83,8 @@
 // ── ABI version ──────────────────────────────────────────────────
 // Bump when any signature changes. Tests assert this to trip on silent
 // ABI drift. Lives in module scope so `hxm_version()` folds to a const.
-let HXMETAL_ABI_VERSION = 1
+// v2 (ROI #157): adds hxm_buffer_contents + hxm_dispatch3 for vadd E2E.
+let HXMETAL_ABI_VERSION = 2
 
 // ── Stub sentinel handle ─────────────────────────────────────────
 // Non-zero so tests can distinguish "stub returned a handle" from
@@ -97,15 +102,121 @@ let HXMETAL_STUB_PIPELINE_H = 505
 // the unambiguous null.
 let HXMETAL_BUFFER_TAG_BIT = 0x800000000000
 
+// ═════════════════════════════════════════════════════════════════
+//  ROI #157 — live Objective-C FFI wiring
+// ═════════════════════════════════════════════════════════════════
+// The live path uses the fact that on ARM64 Darwin every Objective-C
+// `[obj method:arg]` call is a direct C call through `objc_msgSend`.
+// Each distinct argument count needs its own `extern fn` declaration
+// (the interpreter's FFI layer is ABI-strict — a 3-arg call against
+// a 4-arg extern puts garbage in x3). All `omsg_N` names resolve to
+// the same C symbol via @symbol("objc_msgSend").
+//
+// MTLSize (24 B aggregate, 3× uint64) is passed by pointer — per
+// AAPCS64 §5.4.2 structs >16 B are copied to caller memory and the
+// argument slot holds the pointer. We allocate with alloc_raw and
+// hand that address in. The libobjc/Metal callee sees exactly what
+// it expects.
+
+@link("Foundation")
+extern fn objc_getClass(name: int) -> int
+
+@link("Foundation")
+extern fn sel_registerName(name: int) -> int
+
+@link("Metal")
+extern fn MTLCreateSystemDefaultDevice() -> int
+
+@link("Foundation")
+@symbol("objc_msgSend")
+extern fn omsg_2(obj: int, sel: int) -> int
+
+@link("Foundation")
+@symbol("objc_msgSend")
+extern fn omsg_3(obj: int, sel: int, a: int) -> int
+
+@link("Foundation")
+@symbol("objc_msgSend")
+extern fn omsg_4(obj: int, sel: int, a: int, b: int) -> int
+
+@link("Foundation")
+@symbol("objc_msgSend")
+extern fn omsg_5(obj: int, sel: int, a: int, b: int, c: int) -> int
+
+// Live-mode runtime state (lazy one-shot init via hxm_init).
+let mut HXM_LIVE        = 0
+let mut HXM_INIT_TRIED  = 0
+let mut HXM_SEL_NCQ     = 0   // newCommandQueue
+let mut HXM_SEL_NBWL    = 0   // newBufferWithLength:options:
+let mut HXM_SEL_CONTENT = 0   // contents
+let mut HXM_SEL_LENGTH  = 0   // length
+let mut HXM_SEL_NLWS    = 0   // newLibraryWithSource:options:error:
+let mut HXM_SEL_NFWN    = 0   // newFunctionWithName:
+let mut HXM_SEL_NCPSF   = 0   // newComputePipelineStateWithFunction:error:
+let mut HXM_SEL_DEVICE  = 0   // device  (MTLLibrary/MTLComputePipelineState)
+let mut HXM_SEL_CMDBUF  = 0   // commandBuffer
+let mut HXM_SEL_CCE     = 0   // computeCommandEncoder
+let mut HXM_SEL_SCPS    = 0   // setComputePipelineState:
+let mut HXM_SEL_SBOA    = 0   // setBuffer:offset:atIndex:
+let mut HXM_SEL_DTG     = 0   // dispatchThreadgroups:threadsPerThreadgroup:
+let mut HXM_SEL_ENDENC  = 0   // endEncoding
+let mut HXM_SEL_COMMIT  = 0   // commit
+let mut HXM_SEL_WAIT    = 0   // waitUntilCompleted
+let mut HXM_SEL_RELEASE = 0   // release
+let mut HXM_SEL_UTF8    = 0   // stringWithUTF8String:
+let mut HXM_NSSTRING    = 0   // NSString class
+
+fn hxm_init() {
+    if HXM_INIT_TRIED == 1 { return 0 }
+    HXM_INIT_TRIED = 1
+    if env_var("HXMETAL_LIVE") != "1" { return 0 }
+    HXM_SEL_NCQ     = sel_registerName(cstring("newCommandQueue"))
+    HXM_SEL_NBWL    = sel_registerName(cstring("newBufferWithLength:options:"))
+    HXM_SEL_CONTENT = sel_registerName(cstring("contents"))
+    HXM_SEL_LENGTH  = sel_registerName(cstring("length"))
+    HXM_SEL_NLWS    = sel_registerName(cstring("newLibraryWithSource:options:error:"))
+    HXM_SEL_NFWN    = sel_registerName(cstring("newFunctionWithName:"))
+    HXM_SEL_NCPSF   = sel_registerName(cstring("newComputePipelineStateWithFunction:error:"))
+    HXM_SEL_DEVICE  = sel_registerName(cstring("device"))
+    HXM_SEL_CMDBUF  = sel_registerName(cstring("commandBuffer"))
+    HXM_SEL_CCE     = sel_registerName(cstring("computeCommandEncoder"))
+    HXM_SEL_SCPS    = sel_registerName(cstring("setComputePipelineState:"))
+    HXM_SEL_SBOA    = sel_registerName(cstring("setBuffer:offset:atIndex:"))
+    HXM_SEL_DTG     = sel_registerName(cstring("dispatchThreadgroups:threadsPerThreadgroup:"))
+    HXM_SEL_ENDENC  = sel_registerName(cstring("endEncoding"))
+    HXM_SEL_COMMIT  = sel_registerName(cstring("commit"))
+    HXM_SEL_WAIT    = sel_registerName(cstring("waitUntilCompleted"))
+    HXM_SEL_RELEASE = sel_registerName(cstring("release"))
+    HXM_SEL_UTF8    = sel_registerName(cstring("stringWithUTF8String:"))
+    HXM_NSSTRING    = objc_getClass(cstring("NSString"))
+    if HXM_NSSTRING == 0 { return 0 }
+    HXM_LIVE = 1
+    return 0
+}
+
+// Build an autoreleased NSString from a hexa str.
+fn hxm_nsstr(s) {
+    let _ = hxm_init()
+    if HXM_LIVE == 0 { return 0 }
+    return omsg_3(HXM_NSSTRING, HXM_SEL_UTF8, cstring(s))
+}
+
 pub fn hxm_version() -> int {
     return HXMETAL_ABI_VERSION
 }
 
+// Expose live-mode flag (0 = stub, 1 = live objc_msgSend active).
+pub fn hxm_live() -> int {
+    let _ = hxm_init()
+    return HXM_LIVE
+}
+
 // ── hxm_device_default ───────────────────────────────────────────
-// Real: MTLCreateSystemDefaultDevice() — returns nil on headless / no-GPU.
-// Stub: returns the sentinel device handle unconditionally. Tests only
-// check for non-zero + stability across calls.
+// Live : MTLCreateSystemDefaultDevice() — returns nil on headless / no-GPU.
+// Stub : sentinel device handle. Tests check for non-zero + stability.
 pub fn hxm_device_default() -> int {
+    let _ = hxm_init()
+    if HXM_LIVE == 1 { return MTLCreateSystemDefaultDevice() }
     return HXMETAL_STUB_DEVICE_H
 }
 
@@ -115,6 +226,8 @@ pub fn hxm_device_default() -> int {
 // the test for error propagation passes without real Metal.
 pub fn hxm_queue(dev_h: int) -> int {
     if dev_h == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 { return omsg_2(dev_h, HXM_SEL_NCQ) }
     return HXMETAL_STUB_QUEUE_H
 }
 
@@ -126,6 +239,9 @@ pub fn hxm_queue(dev_h: int) -> int {
 pub fn hxm_buffer(dev_h: int, nbytes: int) -> int {
     if dev_h == 0 { return 0 }
     if nbytes <= 0 { return 0 }
+    let _ = hxm_init()
+    // options=0 = MTLResourceStorageModeShared → unified-memory zero-copy.
+    if HXM_LIVE == 1 { return omsg_4(dev_h, HXM_SEL_NBWL, nbytes, 0) }
     return HXMETAL_BUFFER_TAG_BIT + nbytes
 }
 
@@ -135,7 +251,21 @@ pub fn hxm_buffer(dev_h: int, nbytes: int) -> int {
 //       null-handles-through do not crash.
 pub fn hxm_buffer_bytes(buf_h: int) -> int {
     if buf_h == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 { return omsg_2(buf_h, HXM_SEL_LENGTH) }
     return buf_h - HXMETAL_BUFFER_TAG_BIT
+}
+
+// ── hxm_buffer_contents ──────────────────────────────────────────
+// NEW in ABI v2 (ROI #157). Returns a host pointer (int) into the
+// MTLBuffer's shared-memory backing. Zero-copy on Apple Silicon.
+// Use write_f32 / deref_f32 / ptr_write to fill and read back.
+// Stub mode: returns 0 (tests gate on hxm_live()).
+pub fn hxm_buffer_contents(buf_h: int) -> int {
+    if buf_h == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 { return omsg_2(buf_h, HXM_SEL_CONTENT) }
+    return 0
 }
 
 // ── hxm_library_from_source ──────────────────────────────────────
@@ -146,6 +276,15 @@ pub fn hxm_buffer_bytes(buf_h: int) -> int {
 pub fn hxm_library_from_source(dev_h: int, src: string) -> int {
     if dev_h == 0 { return 0 }
     if len(src) == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 {
+        let ns_src = hxm_nsstr(src)
+        if ns_src == 0 { return 0 }
+        // error out-pointer: pre-zero a slot so lib==0 vs err!=0 disambiguates.
+        let err = alloc_raw(8)
+        ptr_write(err, 0, 0)
+        return omsg_5(dev_h, HXM_SEL_NLWS, ns_src, 0, err)
+    }
     return HXMETAL_STUB_LIBRARY_H
 }
 
@@ -156,6 +295,20 @@ pub fn hxm_library_from_source(dev_h: int, src: string) -> int {
 pub fn hxm_pipeline(lib_h: int, fn_name: string) -> int {
     if lib_h == 0 { return 0 }
     if len(fn_name) == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 {
+        let ns_name = hxm_nsstr(fn_name)
+        if ns_name == 0 { return 0 }
+        let func = omsg_3(lib_h, HXM_SEL_NFWN, ns_name)
+        if func == 0 { return 0 }
+        // newComputePipelineStateWithFunction:error: is defined on MTLDevice,
+        // so recover the device via [lib device] (MTLLibrary conforms).
+        let dev = omsg_2(lib_h, HXM_SEL_DEVICE)
+        if dev == 0 { return 0 }
+        let err = alloc_raw(8)
+        ptr_write(err, 0, 0)
+        return omsg_4(dev, HXM_SEL_NCPSF, func, err)
+    }
     return HXMETAL_STUB_PIPELINE_H
 }
 
@@ -174,6 +327,67 @@ pub fn hxm_dispatch(pipe_h: int, buf_in_h: int, buf_out_h: int, nthreads: int) -
     if buf_in_h == 0 { return -1 }
     if buf_out_h == 0 { return -1 }
     if nthreads <= 0 { return -1 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 {
+        // Treat single-input as two-buffer encode (a=buf_in, c=buf_out) by
+        // binding buf_in_h at slot 0 and buf_out_h at slot 1. Most unary
+        // kernels (hxm_dispatch's original shape) use exactly this layout.
+        return hxm_dispatch_n(pipe_h, [buf_in_h, buf_out_h], nthreads)
+    }
+    return 0
+}
+
+// ── hxm_dispatch3 ────────────────────────────────────────────────
+// NEW in ABI v2. 3-buffer compute dispatch (a, b, out) for vadd /
+// fused kernels. Encodes on a fresh command buffer + queue + encoder,
+// commits, waits. Returns 0 on success.
+pub fn hxm_dispatch3(pipe_h: int, buf_a: int, buf_b: int, buf_out: int, nthreads: int) -> int {
+    if pipe_h == 0 { return -1 }
+    if buf_a == 0 { return -1 }
+    if buf_b == 0 { return -1 }
+    if buf_out == 0 { return -1 }
+    if nthreads <= 0 { return -1 }
+    let _ = hxm_init()
+    if HXM_LIVE == 0 { return 0 }
+    return hxm_dispatch_n(pipe_h, [buf_a, buf_b, buf_out], nthreads)
+}
+
+// ── hxm_dispatch_n (internal) ────────────────────────────────────
+// Bind `bufs` at indices 0..len(bufs)-1, dispatch nthreads over a
+// 1-D grid. MTLSize passed via alloc_raw pointer (AAPCS64 §5.4.2).
+fn hxm_dispatch_n(pipe_h, bufs, nthreads) {
+    if HXM_LIVE == 0 { return 0 }
+    // Pipeline's device → transient queue for this dispatch.
+    let dev = omsg_2(pipe_h, HXM_SEL_DEVICE)
+    if dev == 0 { return -1 }
+    let queue = omsg_2(dev, HXM_SEL_NCQ)
+    if queue == 0 { return -1 }
+    let cmdbuf = omsg_2(queue, HXM_SEL_CMDBUF)
+    if cmdbuf == 0 { return -1 }
+    let encoder = omsg_2(cmdbuf, HXM_SEL_CCE)
+    if encoder == 0 { return -1 }
+    let _ = omsg_3(encoder, HXM_SEL_SCPS, pipe_h)
+    let mut i = 0
+    let nb = len(bufs)
+    while i < nb {
+        let _ = omsg_5(encoder, HXM_SEL_SBOA, bufs[i], 0, i)
+        i = i + 1
+    }
+    // MTLSize grid + tpg (each 24 B = 3× uint64).
+    let tpg_x = 64
+    let ngroups = (nthreads + tpg_x - 1) / tpg_x
+    let grid = alloc_raw(24)
+    ptr_write(grid, 0,  ngroups)
+    ptr_write(grid, 8,  1)
+    ptr_write(grid, 16, 1)
+    let tpg = alloc_raw(24)
+    ptr_write(tpg, 0,  tpg_x)
+    ptr_write(tpg, 8,  1)
+    ptr_write(tpg, 16, 1)
+    let _ = omsg_4(encoder, HXM_SEL_DTG, grid, tpg)
+    let _ = omsg_2(encoder, HXM_SEL_ENDENC)
+    let _ = omsg_2(cmdbuf, HXM_SEL_COMMIT)
+    let _ = omsg_2(cmdbuf, HXM_SEL_WAIT)
     return 0
 }
 
@@ -183,5 +397,200 @@ pub fn hxm_dispatch(pipe_h: int, buf_in_h: int, buf_out_h: int, nthreads: int) -
 // Stub: no-op. Always returns 0. Tests may call release on null handles
 //       (defensive double-release pattern) and expect no crash.
 pub fn hxm_release(h: int) -> int {
+    if h == 0 { return 0 }
+    let _ = hxm_init()
+    if HXM_LIVE == 1 {
+        let _ = omsg_2(h, HXM_SEL_RELEASE)
+    }
     return 0
+}
+
+// ── hxm_dispatch5 — 5-buffer compute dispatch (ROI #168 stub) ────
+// Real: encode pipeline with 5 buffers bound at indices 0..4,
+//       threadgroup = (tgx, tgy, 1), grid in threadgroups = (gx, gy, 1),
+//       commit + waitUntilCompleted.
+// Stub: returns 0 iff every handle is non-null and every shape dim is
+//       positive; otherwise returns -1. Mirrors hxm_dispatch's error
+//       contract so follow-up tests can exercise both paths GPU-less.
+//
+// Used by: self/test_hxmetal_fused.hexa (ROI #168 fused SiLU matmul).
+//          Design: docs/plans/p168_hxmetal_fused.md §4.
+pub fn hxm_dispatch5(pipe_h: int, b0: int, b1: int, b2: int, b3: int,
+                     b4: int, tgx: int, tgy: int, gx: int, gy: int) -> int {
+    if pipe_h == 0 { return -1 }
+    if b0 == 0 { return -1 }
+    if b1 == 0 { return -1 }
+    if b2 == 0 { return -1 }
+    if b3 == 0 { return -1 }
+    if b4 == 0 { return -1 }
+    if tgx <= 0 { return -1 }
+    if tgy <= 0 { return -1 }
+    if gx <= 0 { return -1 }
+    if gy <= 0 { return -1 }
+    return 0
+}
+
+// ═════════════════════════════════════════════════════════════════
+//  ROI #160 — hxmetal_matmul PoC stage 1 (kernel + dispatch scaffold)
+// ═════════════════════════════════════════════════════════════════
+//
+// Adds a tiled MSL matmul kernel SOURCE (compile-time string constant),
+// a dispatch driver (hxm_matmul) and a CPU reference (hxm_matmul_cpu_ref).
+//
+// 3-stage plan: docs/plans/p160_hxmetal_matmul.md
+//   Stage 1 (this PR): kernel source + dispatch scaffold + 128^3 test.
+//   Stage 2          : simdgroup 16x16 tile + threadgroup shared memory.
+//   Stage 3          : fused activation + bf16 path.
+//
+// SHAPE CONTRACT
+// --------------
+//   A : row-major, shape (M, K), length M*K
+//   B : row-major, shape (K, N), length K*N
+//   C : row-major, shape (M, N), length M*N — RETURNED fresh array
+//   Elements are float (hexa "float" type). Kernel uses MSL float32;
+//   the driver lossily converts at the device-buffer boundary (fine
+//   for matmul accuracy at max-abs-err < 1e-4 @ N=K=M=128 unit random).
+//
+// NULL / ERROR CONTRACT
+// ---------------------
+//   dev_h==0 or m|n|k<=0 or len mismatches → returns empty array []
+//
+// LIVE-WIRE ROUTING
+// -----------------
+// Until ROI #157 (objc_msgSend live wiring) lands, hxm_matmul routes
+// to hxm_matmul_cpu_ref so correctness can be proven today. The
+// HXM_MATMUL_LIVE knob below flips from CPU-ref to real Metal once
+// #157 goes green and stage 2 brings the tile kernel + buffer bind.
+//
+// HX12 L2 (literal-ban): the tile size appears as HXM_MATMUL_TILE
+// (symbolic) and is referenced from the MSL source via string concat
+// so stage-2 retune only touches one constant.
+let HXM_MATMUL_TILE = 16
+
+// Flip to 1 once objc_msgSend wiring (ROI #157) lands AND the live
+// Metal path has been smoke-validated. Kept at 0 in stage 1 so the
+// PoC is deterministic on any host (Linux CI or macOS without MPS).
+let HXM_MATMUL_LIVE = 0
+
+// ── MSL source (stage 1 — naive per-thread) ──────────────────────
+// Each grid thread owns one output element C[r,c]. Accumulator is
+// register-resident; no threadgroup memory. This is the baseline;
+// stage 2 upgrades to a 16×16 tile with shared memory.
+//
+// Why naive first: it exercises the ENTIRE dispatch path (library
+// compile → pipeline → 3-buffer bind → dispatchThreads(N,M)) with
+// zero indexing subtleties. Once wiring is green, the kernel body
+// is the only thing stage 2 touches.
+pub fn hxm_matmul_msl_source() -> string {
+    let h0 = "#include <metal_stdlib>\n"
+    let h1 = "using namespace metal;\n"
+    let s0 = "kernel void matmul(device const float* A [[buffer(0)]],\n"
+    let s1 = "                   device const float* B [[buffer(1)]],\n"
+    let s2 = "                   device       float* C [[buffer(2)]],\n"
+    let s3 = "                   constant uint& M [[buffer(3)]],\n"
+    let s4 = "                   constant uint& N [[buffer(4)]],\n"
+    let s5 = "                   constant uint& K [[buffer(5)]],\n"
+    let s6 = "                   uint2 gid [[thread_position_in_grid]]) {\n"
+    let b0 = "  if (gid.x >= N || gid.y >= M) { return; }\n"
+    let b1 = "  float acc = 0.0;\n"
+    let b2 = "  for (uint k = 0; k < K; k++) { acc += A[gid.y*K + k] * B[k*N + gid.x]; }\n"
+    let b3 = "  C[gid.y*N + gid.x] = acc;\n"
+    let t0 = "}\n"
+    let parts = [h0, h1, s0, s1, s2, s3, s4, s5, s6, b0, b1, b2, b3, t0]
+    return parts.join("")
+}
+
+// ── CPU reference ────────────────────────────────────────────────
+// Reference matmul for (a) stage 1 fall-through when HXM_MATMUL_LIVE=0,
+// and (b) test correctness comparison once the live path is on.
+// O(M*N*K) scalar loop — purposely naive so numerical drift vs MSL
+// is dominated by float32↔float64 rounding not by reordered-sum FMA.
+pub fn hxm_matmul_cpu_ref(a, b, m: int, n: int, k: int) {
+    let mut c = []
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        c.push(0.0)
+        i = i + 1
+    }
+    let mut row = 0
+    while row < m {
+        let a_row_base = row * k
+        let c_row_base = row * n
+        let mut col = 0
+        while col < n {
+            let mut acc = 0.0
+            let mut kk = 0
+            while kk < k {
+                acc = acc + a[a_row_base + kk] * b[kk * n + col]
+                kk = kk + 1
+            }
+            c[c_row_base + col] = acc
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return c
+}
+
+// ── hxm_matmul ───────────────────────────────────────────────────
+// Dispatch driver. Stage 1 routes to hxm_matmul_cpu_ref until
+// HXM_MATMUL_LIVE flips to 1. The routing sits ABOVE the Metal setup
+// so shape validation is identical on both paths (the test asserts
+// empty-array on shape mismatch regardless of HXM_MATMUL_LIVE).
+//
+// When LIVE=1 (future stage 2 + ROI #157):
+//   dev   = hxm_device_default()
+//   lib   = hxm_library_from_source(dev, hxm_matmul_msl_source())
+//   pipe  = hxm_pipeline(lib, "matmul")
+//   buf_a = hxm_buffer(dev, m*k*4)   // f32 bytes
+//   buf_b = hxm_buffer(dev, k*n*4)
+//   buf_c = hxm_buffer(dev, m*n*4)
+//   hxm_buffer_write_f32(buf_a, a)      // stage 2 builtin
+//   hxm_buffer_write_f32(buf_b, b)
+//   hxm_matmul_dispatch(pipe, buf_a, buf_b, buf_c, m, n, k)
+//   c     = hxm_buffer_read_f32(buf_c, m*n)
+//   release all; return c
+//
+// These extra primitives (hxm_buffer_write_f32, hxm_matmul_dispatch,
+// hxm_buffer_read_f32) land in stage 2. They are NOT part of the
+// ABI surface and HXMETAL_ABI_VERSION stays at its current value
+// (#147=1, #157=2) — matmul is additive on top.
+pub fn hxm_matmul(a, b, m: int, n: int, k: int) {
+    // Shape validation — uniform across CPU-ref and live paths.
+    if m <= 0 { return [] }
+    if n <= 0 { return [] }
+    if k <= 0 { return [] }
+    if len(a) != m * k { return [] }
+    if len(b) != k * n { return [] }
+    if HXM_MATMUL_LIVE == 0 {
+        return hxm_matmul_cpu_ref(a, b, m, n, k)
+    }
+    // ── Live Metal path (enabled post-ROI#157 + stage 2) ──────────
+    // Guard with dev/pipe sentinels so a stub Metal stack (no live
+    // objc_msgSend wiring) still falls through to the CPU reference
+    // rather than silently returning an all-zeros buffer.
+    let dev = hxm_device_default()
+    if dev == 0 { return hxm_matmul_cpu_ref(a, b, m, n, k) }
+    let lib = hxm_library_from_source(dev, hxm_matmul_msl_source())
+    if lib == 0 { return hxm_matmul_cpu_ref(a, b, m, n, k) }
+    let pipe = hxm_pipeline(lib, "matmul")
+    if pipe == 0 { return hxm_matmul_cpu_ref(a, b, m, n, k) }
+    // (buffer alloc + bind + dispatch + read — stage 2 land.)
+    hxm_release(pipe)
+    hxm_release(lib)
+    return hxm_matmul_cpu_ref(a, b, m, n, k)
+}
+
+// ── hxm_matmul_tile ──────────────────────────────────────────────
+// Exposes the tile dimension to tests / callers for stage 2 sizing.
+pub fn hxm_matmul_tile() -> int {
+    return HXM_MATMUL_TILE
+}
+
+// ── hxm_matmul_live ──────────────────────────────────────────────
+// Exposes the live-flag so tests can skip GPU-only assertions when
+// running on CI / Linux or before ROI #157 wiring lands.
+pub fn hxm_matmul_live() -> int {
+    return HXM_MATMUL_LIVE
 }

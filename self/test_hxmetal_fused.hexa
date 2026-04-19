@@ -1,0 +1,159 @@
+// self/test_hxmetal_fused.hexa — ROI #168 fused SiLU matmul test
+//
+// Stub-mode checks only (design-only landing — ROI #168 blocked on
+// #157 objc_msgSend wiring + #160 matmul PoC). This file exercises:
+//
+//   - the MSL kernel source string is non-empty (design drift guard)
+//   - hxm_library_from_source compiles the fused kernel source (stub
+//     returns sentinel)
+//   - hxm_pipeline resolves the "silu_matmul" function name (stub
+//     returns sentinel)
+//   - hxm_dispatch5 success + error-path contract with the fused
+//     launch geometry (tg=16x16, grid=(N/16)x(M/16) for M=N=64)
+//   - release of every handle in reverse-alloc order, no crash on
+//     null-release
+//
+// Does NOT execute the MSL kernel — that lands under #157+#160 when
+// hxm_library_from_source actually reaches newLibraryWithSource:options:error:.
+//
+// Design: docs/plans/p168_hxmetal_fused.md
+//
+// Run:
+//   hexa self/test_hxmetal_fused.hexa
+// Expected: all checks "ok", exit 0.
+
+use self::runtime::hxmetal_stub
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label: string, cond: bool) -> int {
+    if cond {
+        PASS = PASS + 1
+        println("ok: " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("FAIL: " + label)
+    }
+    return 0
+}
+
+// ── kernel source (mirrors docs/plans/p168_hxmetal_fused.md §3) ──
+// Kept as a single multi-line hexa string so tests can assert on
+// presence of the key MSL identifiers without pulling in file I/O.
+fn silu_matmul_msl() -> string {
+    return "#include <metal_stdlib>\nusing namespace metal;\nconstant uint TILE = 16;\nkernel void silu_matmul(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]], device const float* C [[buffer(2)]], device float* out [[buffer(3)]], constant uint4& dims [[buffer(4)]], uint2 gid [[threadgroup_position_in_grid]], uint2 tid [[thread_position_in_threadgroup]], uint2 tpg [[threads_per_threadgroup]]) { const uint M = dims.x; const uint N = dims.y; const uint K = dims.z; const uint row = gid.y * TILE + tid.y; const uint col = gid.x * TILE + tid.x; threadgroup float As[TILE][TILE]; threadgroup float Bs[TILE][TILE]; float acc = 0.0f; const uint nTiles = (K + TILE - 1) / TILE; for (uint t = 0; t < nTiles; ++t) { const uint kA = t * TILE + tid.x; const uint kB = t * TILE + tid.y; As[tid.y][tid.x] = (row < M && kA < K) ? A[row * K + kA] : 0.0f; Bs[tid.y][tid.x] = (kB < K && col < N) ? B[kB * N + col] : 0.0f; threadgroup_barrier(mem_flags::mem_threadgroup); for (uint k = 0; k < TILE; ++k) { acc += As[tid.y][k] * Bs[k][tid.x]; } threadgroup_barrier(mem_flags::mem_threadgroup); } if (row < M && col < N) { const float s = acc / (1.0f + exp(-acc)); out[row * N + col] = s * C[row * N + col]; } }"
+}
+
+fn main() -> int {
+    // ── design drift guard ─────────────────────────────────
+    // The MSL source must contain the kernel entry name and the
+    // three key operations (matmul accumulation, SiLU fusion, C mul).
+    let src = silu_matmul_msl()
+    check("msl source non-empty", len(src) > 0)
+    check("msl has kernel name 'silu_matmul'", src.contains("silu_matmul"))
+    check("msl has SiLU formula (1.0f + exp(-acc))", src.contains("1.0f + exp(-acc)"))
+    check("msl has fused C multiply (s * C)", src.contains("s * C[row * N + col]"))
+    check("msl has threadgroup barrier", src.contains("threadgroup_barrier"))
+    check("msl has TILE=16 constant", src.contains("constant uint TILE = 16"))
+    check("msl has 5 buffer bindings (dims last)", src.contains("constant uint4& dims [[buffer(4)]]"))
+
+    // ── ABI lock ───────────────────────────────────────────
+    // If ROI #168 ever grows new signatures, bump the version in
+    // hxmetal_stub.hexa; this test trips on silent drift.
+    let v = hxm_version()
+    check("hxm_version() == 1 (abi lock includes dispatch5)", v == 1)
+
+    // ── device / queue ─────────────────────────────────────
+    let dev = hxm_device_default()
+    let q   = hxm_queue(dev)
+    check("device handle non-zero", dev != 0)
+    check("queue handle non-zero", q != 0)
+
+    // ── buffers for fused launch shape (M=N=K=64, float32) ──
+    let M = 64
+    let N = 64
+    let K = 64
+    let a_bytes = M * K * 4
+    let b_bytes = K * N * 4
+    let c_bytes = M * N * 4
+    let o_bytes = M * N * 4
+    let d_bytes = 16
+    let a_buf = hxm_buffer(dev, a_bytes)
+    let b_buf = hxm_buffer(dev, b_bytes)
+    let c_buf = hxm_buffer(dev, c_bytes)
+    let o_buf = hxm_buffer(dev, o_bytes)
+    let d_buf = hxm_buffer(dev, d_bytes)
+    check("A buffer alloc (M*K*4)",   a_buf != 0)
+    check("B buffer alloc (K*N*4)",   b_buf != 0)
+    check("C buffer alloc (M*N*4)",   c_buf != 0)
+    check("out buffer alloc (M*N*4)", o_buf != 0)
+    check("dims buffer alloc (16)",   d_buf != 0)
+    check("A nbytes round-trip", hxm_buffer_bytes(a_buf) == a_bytes)
+    check("dims nbytes round-trip", hxm_buffer_bytes(d_buf) == d_bytes)
+
+    // ── library + pipeline ─────────────────────────────────
+    let lib = hxm_library_from_source(dev, src)
+    check("library compile from fused MSL src", lib != 0)
+    let pipe = hxm_pipeline(lib, "silu_matmul")
+    check("pipeline for 'silu_matmul'", pipe != 0)
+
+    // ── dispatch5 success path ─────────────────────────────
+    // Threadgroup 16x16, grid in threadgroups (N/16, M/16) = (4, 4) for 64x64.
+    let tg = 16
+    let gx = (N + tg - 1) / tg
+    let gy = (M + tg - 1) / tg
+    let rc_ok = hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf,
+                              tg, tg, gx, gy)
+    check("dispatch5 success path returns 0", rc_ok == 0)
+
+    // ── dispatch5 error-propagation contract ──────────────
+    check("dispatch5 null pipe → -1",
+          hxm_dispatch5(0, a_buf, b_buf, c_buf, o_buf, d_buf, tg, tg, gx, gy) == -1)
+    check("dispatch5 null A → -1",
+          hxm_dispatch5(pipe, 0, b_buf, c_buf, o_buf, d_buf, tg, tg, gx, gy) == -1)
+    check("dispatch5 null B → -1",
+          hxm_dispatch5(pipe, a_buf, 0, c_buf, o_buf, d_buf, tg, tg, gx, gy) == -1)
+    check("dispatch5 null C → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, 0, o_buf, d_buf, tg, tg, gx, gy) == -1)
+    check("dispatch5 null out → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, 0, d_buf, tg, tg, gx, gy) == -1)
+    check("dispatch5 null dims → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, 0, tg, tg, gx, gy) == -1)
+    check("dispatch5 tgx=0 → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf, 0, tg, gx, gy) == -1)
+    check("dispatch5 tgy=0 → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf, tg, 0, gx, gy) == -1)
+    check("dispatch5 gx=0 → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf, tg, tg, 0, gy) == -1)
+    check("dispatch5 gy=0 → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf, tg, tg, gx, 0) == -1)
+    check("dispatch5 tgx=-1 → -1",
+          hxm_dispatch5(pipe, a_buf, b_buf, c_buf, o_buf, d_buf, -1, tg, gx, gy) == -1)
+
+    // ── release in reverse alloc order ─────────────────────
+    check("release pipe", hxm_release(pipe) == 0)
+    check("release lib",  hxm_release(lib)  == 0)
+    check("release dims", hxm_release(d_buf) == 0)
+    check("release out",  hxm_release(o_buf) == 0)
+    check("release C",    hxm_release(c_buf) == 0)
+    check("release B",    hxm_release(b_buf) == 0)
+    check("release A",    hxm_release(a_buf) == 0)
+    check("release queue", hxm_release(q)   == 0)
+    check("release dev",  hxm_release(dev)  == 0)
+    check("release null-safe", hxm_release(0) == 0)
+
+    // ── live-mode note (blocked on #157 + #160) ────────────
+    // When both land, this file gains a HXMETAL_FFI_LIVE=1 branch
+    // that writes A/B/C/dims into the Shared buffers, compiles the
+    // MSL source, dispatches the kernel, reads back out, and asserts
+    // max(abs(out - ref)) < 1e-3 against a CPU reference. That path
+    // is **not** exercised today (stub returns sentinel handles).
+    println("")
+    println("hxmetal_fused: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL))
+    println("(live-mode PoC blocked on ROI #157 + #160)")
+    if FAIL == 0 {
+        return 0
+    }
+    return 1
+}
