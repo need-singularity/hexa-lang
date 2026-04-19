@@ -41,7 +41,8 @@ anima 는 hexa-lang 과 다른 도메인 (ML 학습/서빙) — 6 raw 규칙 그
 anima 에 파일 배치:
 ```
 ~/Dev/anima/.hexa-attrs           ← forbid + nonblock + seal 선언
-~/Dev/anima/shared/anima/raw.json  ← 6+A4 anima raw SSOT
+~/Dev/anima/.raw                   ← L0 universal raw SSOT (hexa-directive)
+~/Dev/anima/.own                   ← L1 anima-local raw SSOT (A1~A4 등)
 ~/Dev/anima/scripts/law_check.hexa   ← hexa-lang 에서 복사
 ~/Dev/anima/scripts/hexa_init.hexa   ← 동일
 ```
@@ -59,11 +60,11 @@ seal     = README.md, CLAUDE.md,
 
 ### Step 2 — anima 전용 raw (~1시간)
 
-`shared/anima/raw.json` — hexa-lang raw.json 복제 후 anima 재해석:
+`~/Dev/anima/.raw` + `~/Dev/anima/.own` — hexa-lang `/.raw` + `/.own` 복제 후 anima 재해석:
 - rule 1 → @mlgate (ML 모델 attr 누락 경고)
 - rule 2 → N/A (제거)
 - rule 3~6 → 동일
-- A1~A4 → 신규
+- A1~A4 → 신규 (`.own` L1 project-local)
 
 ### Step 3 — bootstrap (1회)
 
@@ -117,6 +118,7 @@ Week 3  : fix.txt 시나리오 E2E 테스트 — interrupt 수 측정
 ---
 
 **참고**:
-- hexa-lang raw 파일: `shared/hexa-lang/raw.json`
+- hexa-lang raw SSOT: `/.raw` (L0) + `/.own` (L1), 파서 `self/raw_loader.hexa` (hexa-directive 포맷)
+- (레거시) `shared/hexa-lang/raw.json` / `.own-rules.json` — deprecated, raw-migration 진행 중
 - 이식 스크립트 예정: `scripts/raw_port.hexa <target-project>` (후속)
 - fix.txt 원본: `/Users/ghost/loss/fix.txt`

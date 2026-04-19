@@ -3,17 +3,356 @@
 //   hexa self/raw_cli.hexa               — raw(L0) + own(L1) 병합 표
 //   hexa self/raw_cli.hexa list          — 동일 (명시적)
 //   hexa self/raw_cli.hexa show <id>     — 상세
-//   hexa self/raw_cli.hexa check         — 전체 위반 리포트 (read-only)
-//   hexa self/raw_cli.hexa check <file>  — 특정 파일만
-//   hexa self/raw_cli.hexa install       — pre-commit 스탠자 설치 (safety net)
+//   hexa self/raw_cli.hexa verify        — whitelist/status 포맷 검증
 //
-// 2 레이어:
-//   · raw core  (L0): shared/hexa-lang/raw.json — hexa-lang 전역 공통 6+
-//   · own local (L1): .own-rules.json — 프로젝트 고유 절대 규칙 (HX11 패턴)
+// SSOT:
+//   L0 raw : /.raw (프로젝트 루트, universal rule)
+//   L1 own : /.own (프로젝트 루트, project-local rule)
 //
-// 목적: CLAUDE.md 의존 축소. hexa 바이너리 자체가 raw 공표 + 검사 + 설치.
+// 파서: self/raw_loader.hexa (inlined — stage0 module loader 회피, seed-freeze 기간)
 
 use "self/stdlib/law_io"
+
+// ─── inlined from self/raw_loader.hexa ──────────────────────────
+fn _raw_status_list() {
+    return ["live", "warn", "new", "deferred", "convention"]
+}
+
+fn _raw_key_list() {
+    return ["enforce", "hook", "decl", "scope", "opt-out", "base",
+            "since", "why", "note", "bans", "defer-until", "follow-up",
+            "promoted-at", "proof"]
+}
+
+pub fn is_valid_raw_status(s: string) -> bool {
+    for v in _raw_status_list() { if v == s { return true } }
+    return false
+}
+
+pub fn is_valid_raw_key(k: string) -> bool {
+    for v in _raw_key_list() { if v == k { return true } }
+    return false
+}
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _parse_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "raw" && kind != "own" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !is_valid_raw_status(status) { return [] }
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [kind, id, status, name]
+}
+
+// ─── strict format validator (spec A) ──────────────────────────────
+// 규칙:
+//   · column 0: 3종만 — rule header / # 주석 / 빈 줄 (whitespace-only 금지)
+//   · column 2: `  <key>(\s+.*)?` — 정확히 2 스페이스 indent + key 토큰
+//   · 전역 금지: tab 문자, trailing whitespace, 0/2 이외 indent
+//   · 구조: 2 rule header 사이 ≥1 빈 줄 (EOF 는 관대)
+// 반환: error 문자열 배열 (빈 배열 = pass). 포맷:
+//   "[<path>:<lineno>] <reason>: <line>"  (line >80 자 truncate)
+fn _fmt_trunc(s: string) -> string {
+    if len(s) <= 80 { return s }
+    return s.substring(0, 80) + "…"
+}
+
+fn _fmt_is_header_token(line: string) -> bool {
+    let sp = line.index_of(" ")
+    if sp < 0 { return false }
+    let kind = line.substring(0, sp)
+    if kind != "raw" && kind != "own" && kind != "ext" { return false }
+    return true
+}
+
+fn _fmt_count_leading_spaces(line: string) -> int {
+    let mut i = 0
+    let n = len(line)
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c != " " { break }
+        i = i + 1
+    }
+    return i
+}
+
+fn _fmt_has_tab(line: string) -> bool {
+    return line.contains("\t")
+}
+
+fn _fmt_trailing_ws(line: string) -> bool {
+    let n = len(line)
+    if n == 0 { return false }
+    let last = line.substring(n - 1, n)
+    if last == " " || last == "\t" || last == "\r" { return true }
+    return false
+}
+
+fn _fmt_alpha() -> string { return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ" }
+fn _fmt_alnum() -> string { return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-" }
+fn _fmt_digits() -> string { return "0123456789" }
+
+fn _fmt_is_ident_char(c: string, first: bool) -> bool {
+    if len(c) == 0 { return false }
+    if first { return _fmt_alpha().contains(c) }
+    return _fmt_alnum().contains(c)
+}
+
+fn _fmt_validate_key_line(line: string) -> bool {
+    let n = len(line)
+    if n < 3 { return false }
+    let first_c = line.substring(2, 3)
+    if !_fmt_is_ident_char(first_c, true) { return false }
+    let mut i = 3
+    while i < n {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { return true }
+        if !_fmt_is_ident_char(c, false) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _fmt_validate_header(line: string) -> bool {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return false }
+    let kind = line.substring(0, sp1)
+    if kind != "raw" && kind != "own" && kind != "ext" { return false }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return false }
+    let id = rest1.substring(0, sp2)
+    if len(id) == 0 { return false }
+    let mut i = 0
+    let digits = _fmt_digits()
+    while i < len(id) {
+        let c = id.substring(i, i + 1)
+        if !digits.contains(c) { return false }
+        i = i + 1
+    }
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return false }
+    let status = rest2.substring(0, sp3)
+    if !is_valid_raw_status(status) { return false }
+
+    let name_part = rest2.substring(sp3 + 1, len(rest2))
+    let np = len(name_part)
+    if np < 2 { return false }
+    if name_part.substring(0, 1) != "\"" { return false }
+    if name_part.substring(np - 1, np) != "\"" { return false }
+    if np < 3 { return false }
+    return true
+}
+
+pub fn validate_strict(path: string) -> array {
+    let mut errs = []
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return errs }
+
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut prev_kind = "none"
+    let mut saw_blank_since = true
+    let mut line_no = 0
+    let total = len(lines)
+
+    for raw_line in lines {
+        line_no = line_no + 1
+        if line_no == total && len(raw_line) == 0 { continue }
+
+        let tag_prefix = "[" + path + ":" + to_string(line_no) + "] "
+
+        if _fmt_has_tab(raw_line) {
+            errs = errs.push(tag_prefix + "tab forbidden: " + _fmt_trunc(raw_line))
+        }
+        if _fmt_trailing_ws(raw_line) {
+            errs = errs.push(tag_prefix + "trailing whitespace: " + _fmt_trunc(raw_line))
+        }
+
+        let ln_len = len(raw_line)
+        if ln_len == 0 {
+            saw_blank_since = true
+            continue
+        }
+
+        let lead = _fmt_count_leading_spaces(raw_line)
+        if lead == ln_len {
+            saw_blank_since = true
+            continue
+        }
+
+        if lead == 0 && raw_line.substring(0, 1) == "#" {
+            prev_kind = "comment"
+            saw_blank_since = false
+            continue
+        }
+
+        if lead == 0 {
+            if !_fmt_is_header_token(raw_line) {
+                errs = errs.push(tag_prefix + "unknown column-0 line (expected `raw|own|ext` header or `#` comment): " + _fmt_trunc(raw_line))
+                prev_kind = "header"
+                saw_blank_since = false
+                continue
+            }
+            if !_fmt_validate_header(raw_line) {
+                errs = errs.push(tag_prefix + "malformed rule header: " + _fmt_trunc(raw_line))
+            }
+            if prev_kind == "key" && !saw_blank_since {
+                errs = errs.push(tag_prefix + "rule header needs preceding blank line: " + _fmt_trunc(raw_line))
+            }
+            prev_kind = "header"
+            saw_blank_since = false
+            continue
+        }
+
+        if lead == 2 {
+            if !_fmt_validate_key_line(raw_line) {
+                errs = errs.push(tag_prefix + "malformed key line (expected `  <ident>[ value]`): " + _fmt_trunc(raw_line))
+            }
+            prev_kind = "key"
+            saw_blank_since = false
+            continue
+        }
+
+        errs = errs.push(tag_prefix + "bad indent (only 0 or 2 spaces allowed, got " + to_string(lead) + "): " + _fmt_trunc(raw_line))
+        prev_kind = "key"
+        saw_blank_since = false
+    }
+
+    return errs
+}
+
+pub fn load_raw_file(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+    let mut line_no = 0
+
+    for raw_line in lines {
+        line_no = line_no + 1
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            if !is_valid_raw_key(key) {
+                eprintln("warn[raw_loader]: " + path + ":" + to_string(line_no) +
+                         " unknown key '" + key + "' (whitelist 외) — 14 키 확인")
+                continue
+            }
+            cur_keys = cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_header(line)
+            if len(hdr) == 0 {
+                eprintln("warn[raw_loader]: " + path + ":" + to_string(line_no) +
+                         " bad header — " + line)
+                has_rule = false
+                continue
+            }
+            cur_id = hdr[1]
+            cur_status = hdr[2]
+            cur_name = hdr[3]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+pub fn keys_first(keys: array, key: string) -> string {
+    for kv in keys {
+        if kv[0] == key { return kv[1] }
+    }
+    return ""
+}
+
+pub fn keys_all(keys: array, key: string) -> array {
+    let mut out = []
+    for kv in keys {
+        if kv[0] == key { out = out.push(kv[1]) }
+    }
+    return out
+}
+
+pub fn rule_level(rule: array) -> string {
+    let keys = rule[3]
+    if keys_first(keys, "hook") != "" { return "git-hook" }
+    if keys_first(keys, "enforce") != "" { return "script" }
+    if rule[1] == "deferred" { return "-" }
+    return "convention"
+}
+
+pub fn rule_action(rule: array) -> string {
+    let keys = rule[3]
+    let why = keys_first(keys, "why")
+    if why != "" { return why }
+    let note = keys_first(keys, "note")
+    if note != "" { return note }
+    let decl = keys_first(keys, "decl")
+    if decl != "" { return "decl: " + decl }
+    return ""
+}
+// ─── end inlined raw_loader ─────────────────────────────────────
 
 let _raw_args = args()
 let mut cli_args = []
@@ -23,329 +362,199 @@ while _ai < len(_raw_args) {
     _ai = _ai + 1
 }
 
-// ─── 6 raw (raw.json 과 1:1, install 상태 동적 감지) ─────
-// per-stanza 감지 — 각 rule 고유 마커를 개별 확인하여 display drift 방지
-fn _hook_path() -> string {
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
-    return pwd + "/.git/hooks/pre-commit"
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
 }
 
-fn _raw3_installed() -> bool {
-    let hook = _hook_path()
-    // tolerant pattern: `raw #3`, `raw#3`, `raw  #3` 모두 매치
-    let c = to_string(exec("grep -cE 'raw *#? *3' '" + hook + "' 2>/dev/null || echo 0")).trim()
-    return c != "0"
-}
+fn _raw_path() -> string { return _pwd() + "/.raw" }
+fn _own_path() -> string { return _pwd() + "/.own" }
+fn _ext_path() -> string { return _pwd() + "/.ext" }
 
-fn _raw5_installed() -> bool {
-    let hook = _hook_path()
-    let c = to_string(exec("grep -cE 'raw *#? *5' '" + hook + "' 2>/dev/null || echo 0")).trim()
-    return c != "0"
-}
-
-fn _raw8_installed() -> bool {
-    // proof-carrying 은 standalone — drift_scanner.hexa 존재 여부로 판정
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
-    let path = pwd + "/scripts/drift_scanner.hexa"
-    let e = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
-    return e == "y"
-}
-
-fn _raw10_installed() -> bool {
-    // raw #10 silent_error — 모듈/엔트리/hook 스탠자 3개 확인
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
-    let mod_path = pwd + "/self/raws/silent_error.hexa"
-    let entry_path = pwd + "/scripts/error_propagation_lint.hexa"
-    let hook_path = pwd + "/.git/hooks/pre-commit"
-    let m = to_string(exec("test -f '" + mod_path + "' && echo y || echo n")).trim()
-    let e = to_string(exec("test -f '" + entry_path + "' && echo y || echo n")).trim()
-    let h = to_string(exec("grep -c 'raw#10' '" + hook_path + "' 2>/dev/null || echo 0")).trim()
-    return m == "y" && e == "y" && h != "0"
-}
-
-fn raw_rows() {
-    let s3 = if _raw3_installed() { "live" } else { "unwired" }
-    let s5 = if _raw5_installed() { "live" } else { "unwired" }
-    let s8 = if _raw8_installed() { "live" } else { "new" }
-    let s10 = if _raw10_installed() { "warn" } else { "new" }
-    return [
-        ["1", "ai-native 24 @attr",              "warn",     "git-hook",    "AST scan — hot fn attr 누락 경고"],
-        ["2", "ai-native 알고리즘",               "deferred", "-",           "semantic — 2026-10 까지 연기"],
-        ["3", "@attr 네이밍",                    s3,         "git-hook",    "_naming 규칙 — check_naming_all"],
-        ["4", "폴더명 (F4 generic_dir)",          "live",     "git-hook",    "utils/helpers/common/lib 차단"],
-        ["5", "트리구조 (F5 loner + F6 parent)",  s5,         "git-hook",    "F5/F6 scan block 승격"],
-        ["6", "파일명 (F1 _v + F2 stage + F3 _)", "live",     "git-hook",    "_v\\d+ / stage|phase / _old|_bak"],
-        ["7", "HEXA-ONLY (.rs/.toml/.py/.sh)",    "live",     "git-hook",    "언어 순도 — HX4 + AN13"],
-        ["8", "proof-carrying mark",              s8,         "git-hook",    "done 선언 = proof_path 파일 + state 확인"],
-        ["9", "AI-native default-on",             "new",      "git-hook",    "#!hexa lax 없으면 strict 강제 (grandfather)"],
-        ["10", "silent error (exit/empty-catch)", s10,        "git-hook",    "warn 중 — 354 migration 후 block 승격"]
-    ]
+fn _has_path(p: string) -> bool {
+    let r = to_string(exec("test -f '" + p + "' && echo y || echo n")).trim()
+    return r == "y"
 }
 
 fn _status_mark(s: string) -> string {
-    if s == "live"     { return "✅" }
-    if s == "warn"     { return "⚠" }
-    if s == "unwired"  { return "❌" }
-    if s == "deferred" { return "⏸" }
+    if s == "live"       { return "✅" }
+    if s == "warn"       { return "⚠" }
+    if s == "new"        { return "🆕" }
+    if s == "deferred"   { return "⏸" }
     if s == "convention" { return "📖" }
-    if s == "new"      { return "🆕" }
     return "?"
 }
 
-// ─── own (L1, project-local) 파싱 ────────────────────────
-// .own-rules.json 간이 파서 — id/name/status/enforce_level 추출
-fn _own_rows() {
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
-    let path = pwd + "/.own-rules.json"
-    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
-    if exists != "y" { return [] }
-
-    let mut out = []
-    let raw = to_string(exec("cat '" + path + "' 2>/dev/null"))
-    // rule 블록 split: `"id":` 매번
-    let parts = split(raw, "\"id\":")
-    let mut i = 1  // 첫 chunk 는 _meta 이전이라 skip
-    while i < len(parts) {
-        let chunk = parts[i]
-        // id 추출 — chunk 맨앞 숫자
-        let mut id_str = ""
-        let trimmed = chunk.trim_start()
-        let mut k = 0
-        while k < len(trimmed) {
-            let c = trimmed.substring(k, k + 1)
-            if c == "," || c == " " || c == "\n" || c == "}" { break }
-            id_str = id_str + c
-            k = k + 1
-        }
-
-        // field extractor — 단일 라인 `"key": "value"`
-        let name = _own_extract_str(chunk, "name")
-        let status = _own_extract_str(chunk, "status")
-        let level = _own_extract_str(chunk, "enforce_level")
-        let action = _own_extract_str(chunk, "action")
-
-        if id_str != "" && name != "" {
-            out = out.push([id_str, name, status, level, action])
-        }
-        i = i + 1
-    }
-    return out
+fn _pad_right(s: string, n: int) -> string {
+    let mut r = s
+    while len(r) < n { r = r + " " }
+    return r
 }
 
-fn _own_extract_str(chunk: string, key: string) -> string {
-    let needle = "\"" + key + "\": \""
-    let idx = chunk.index_of(needle)
-    if idx < 0 { return "" }
-    let after = chunk.substring(idx + len(needle), len(chunk))
-    let end = after.index_of("\"")
-    if end < 0 { return "" }
-    return after.substring(0, end)
+fn _print_table(title: string, rules: array) {
+    if len(rules) == 0 { return }
+    println("── " + title + " ─────────────────────")
+    println("#  | status     | level     | name")
+    println("───|────────────|───────────|─────────────────────────────")
+    for r in rules {
+        let id_s = _pad_right(r[0], 2)
+        let st = r[1]
+        let mark = _status_mark(st)
+        let st_pad = _pad_right(st, 10)
+        let level = _pad_right(rule_level(r), 9)
+        println(id_s + " | " + mark + " " + st_pad + " | " + level + " | " + r[2])
+    }
 }
 
 fn print_list() {
-    // L0 — raw core
-    println("── raw core (L0, universal) ─────────────────────")
-    println("# | status | level     | name")
-    println("──|────────|───────────|─────────────────────────────────────")
-    let rows = raw_rows()
-    for r in rows {
-        let mark = _status_mark(r[2])
-        let mut ps = r[2]
-        while len(ps) < 8 { ps = ps + " " }
-        let mut pl = r[3]
-        while len(pl) < 9 { pl = pl + " " }
-        println(r[0] + " | " + mark + " " + ps + "| " + pl + " | " + r[1])
+    let raws = load_raw_file(_raw_path())
+    let owns = load_raw_file(_own_path())
+
+    if len(raws) == 0 && len(owns) == 0 {
+        eprintln("error: /.raw, /.own 둘 다 없음 — " + _pwd())
+        exit(1)
     }
 
-    // L1 — own local
-    // P51: `own` is a reserved keyword (ownership DSL) — use `owned_rows`.
-    let owned_rows = _own_rows()
-    if len(owned_rows) > 0 {
+    _print_table("raw (L0, universal)", raws)
+    if len(owns) > 0 {
         println("")
-        println("── own local (L1, project-specific) ────────────")
-        println("#   | status     | level      | name")
-        println("────|────────────|────────────|──────────────────────────────")
-        for r in owned_rows {
-            let mark = _status_mark(r[2])
-            let mut ps = r[2]
-            while len(ps) < 10 { ps = ps + " " }
-            let mut pl = r[3]
-            while len(pl) < 10 { pl = pl + " " }
-            let mut pid = r[0]
-            while len(pid) < 3 { pid = pid + " " }
-            println(pid + " | " + mark + " " + ps + " | " + pl + " | " + r[1])
-        }
+        _print_table("own (L1, project-local)", owns)
     }
 
     println("")
-    println("SSOT L0 : shared/hexa-lang/raw.json")
-    if len(owned_rows) > 0 { println("SSOT L1 : .own-rules.json") }
+    println("SSOT L0 : .raw")
+    if len(owns) > 0 { println("SSOT L1 : .own") }
     println("상세    : hexa self/raw_cli.hexa show <id>")
-    println("검사    : hexa self/raw_cli.hexa check")
-    println("설치    : hexa self/raw_cli.hexa install")
+    println("검증    : hexa self/raw_cli.hexa verify")
     println("")
 
-    // rollup 동적 계산 (L0 + L1)
-    let mut n_live = 0
-    let mut n_warn = 0
-    let mut n_unwired = 0
-    let mut n_deferred = 0
-    let mut n_other = 0
-    for r in rows {
-        if r[2] == "live"     { n_live     = n_live + 1 }
-        else if r[2] == "warn"     { n_warn     = n_warn + 1 }
-        else if r[2] == "unwired"  { n_unwired  = n_unwired + 1 }
-        else if r[2] == "deferred" { n_deferred = n_deferred + 1 }
-        else { n_other = n_other + 1 }
+    // rollup
+    let mut counts = [0, 0, 0, 0, 0]  // live warn new deferred convention
+    let all_rules = _concat_rules(raws, owns)
+    for r in all_rules {
+        if r[1] == "live"       { counts[0] = counts[0] + 1 }
+        else if r[1] == "warn"       { counts[1] = counts[1] + 1 }
+        else if r[1] == "new"        { counts[2] = counts[2] + 1 }
+        else if r[1] == "deferred"   { counts[3] = counts[3] + 1 }
+        else if r[1] == "convention" { counts[4] = counts[4] + 1 }
     }
-    for r in owned_rows {
-        if r[2] == "live"     { n_live     = n_live + 1 }
-        else if r[2] == "warn"     { n_warn     = n_warn + 1 }
-        else if r[2] == "unwired"  { n_unwired  = n_unwired + 1 }
-        else if r[2] == "deferred" { n_deferred = n_deferred + 1 }
-        else { n_other = n_other + 1 }
-    }
-    let total = len(rows) + len(owned_rows)
+    let total = len(all_rules)
     println("rollup : total " + to_string(total) +
-            " | live " + to_string(n_live) +
-            " / warn " + to_string(n_warn) +
-            " / unwired " + to_string(n_unwired) +
-            " / deferred " + to_string(n_deferred) +
-            (if n_other > 0 { " / other " + to_string(n_other) } else { "" }))
+            " | live " + to_string(counts[0]) +
+            " / warn " + to_string(counts[1]) +
+            " / new " + to_string(counts[2]) +
+            " / deferred " + to_string(counts[3]) +
+            " / convention " + to_string(counts[4]))
     println("원칙   : low level 강제 — 새 세션 인지 없이도 위반 불가")
 }
 
+fn _concat_rules(a: array, b: array) -> array {
+    let mut out = []
+    for r in a { out = out.push(r) }
+    for r in b { out = out.push(r) }
+    return out
+}
+
+fn _print_show_rule(layer: string, r: array) {
+    println("── " + layer + " #" + r[0] + " ──")
+    println("  이름    : " + r[2])
+    println("  상태    : " + r[1] + " " + _status_mark(r[1]))
+    println("  레벨    : " + rule_level(r))
+    for kv in r[3] {
+        let k = _pad_right(kv[0], 12)
+        println("  " + k + ": " + kv[1])
+    }
+}
+
 fn print_show(id: string) {
-    let rows = raw_rows()
-    for r in rows {
+    let raws = load_raw_file(_raw_path())
+    for r in raws {
         if r[0] == id {
-            println("── raw #" + id + " ──")
-            println("  이름     : " + r[1])
-            println("  상태     : " + r[2] + " " + _status_mark(r[2]))
-            println("  레벨     : " + r[3])
-            println("  동작     : " + r[4])
+            _print_show_rule("raw", r)
             println("")
-            println("  SSOT     : shared/hexa-lang/raw.json")
+            println("  SSOT    : .raw")
             return
         }
     }
-    eprintln("error: raw id 없음 — " + id)
+    let owns = load_raw_file(_own_path())
+    for r in owns {
+        if r[0] == id {
+            _print_show_rule("own", r)
+            println("")
+            println("  SSOT    : .own")
+            return
+        }
+    }
+    eprintln("error: id 없음 — " + id + " (raw+own 양쪽 확인)")
     exit(1)
 }
 
-// ─── check: 기존 도구 다 돌림 (read-only) ─────────────────────
-fn run_check(target: string) {
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
+// verify: whitelist/status/required-keys 검증
+fn _check_rule(layer: string, r: array) -> int {
+    let id = r[0]
+    let status = r[1]
+    let keys = r[3]
+    let mut e = 0
+    if !is_valid_raw_status(status) {
+        eprintln("  [" + layer + " #" + id + "] invalid status: " + status)
+        e = e + 1
+    }
+    // 필수: enforce|hook OR (deferred + defer-until + why)
+    let has_enf = keys_first(keys, "enforce") != "" || keys_first(keys, "hook") != ""
+    if status == "deferred" {
+        if keys_first(keys, "defer-until") == "" {
+            eprintln("  [" + layer + " #" + id + "] deferred rule missing 'defer-until'")
+            e = e + 1
+        }
+        if keys_first(keys, "why") == "" {
+            eprintln("  [" + layer + " #" + id + "] deferred rule missing 'why'")
+            e = e + 1
+        }
+    } else if status != "convention" && !has_enf {
+        eprintln("  [" + layer + " #" + id + "] active rule missing 'enforce' or 'hook'")
+        e = e + 1
+    }
+    return e
+}
 
-    println("── raw check ─────────────────────────────────")
-    let mut violations = 0
+fn _run_strict_for(layer: string, path: string) -> int {
+    if !_has_path(path) { return 0 }
+    let errs = validate_strict(path)
+    if len(errs) == 0 { return 0 }
+    for e in errs {
+        eprintln("  [" + layer + " strict] " + e)
+    }
+    return len(errs)
+}
 
-    // Rule 3 — @attr naming (check_naming_all 호출 시 위반 출력)
+fn run_verify() {
+    let raws = load_raw_file(_raw_path())
+    let owns = load_raw_file(_own_path())
+    let mut errs = 0
+    println("── raw verify ──")
+    for r in raws { errs = errs + _check_rule("raw", r) }
+    for r in owns { errs = errs + _check_rule("own", r) }
+
+    // strict format (spec A) — .raw / .own / .ext
+    println("── strict format ──")
+    errs = errs + _run_strict_for("raw", _raw_path())
+    errs = errs + _run_strict_for("own", _own_path())
+    errs = errs + _run_strict_for("ext", _ext_path())
+
+    let ext_exists = _has_path(_ext_path())
     println("")
-    println("[3] @attr 네이밍 — _naming 규칙 검사")
-    let naming_out = to_string(exec("cd '" + pwd + "' && hexa self/attrs/_registry.hexa 2>&1 | grep -E 'viol|fail|error' || echo '  (pass)'"))
-    println(naming_out.trim())
-
-    // Rule 4/5/6 — ai_native_scan
-    println("")
-    println("[4/5/6] 폴더/트리/파일명 — ai_native_scan")
-    let scan_exists = to_string(exec("cd '" + pwd + "' && test -f scripts/ai_native_scan.hexa && echo y || echo n")).trim()
-    if scan_exists == "y" {
-        let scan_out = to_string(exec("cd '" + pwd + "' && hexa scripts/ai_native_scan.hexa 2>&1 | tail -20"))
-        println(scan_out.trim())
+    if errs == 0 {
+        let mut summary = to_string(len(raws)) + " raw + " + to_string(len(owns)) + " own"
+        if ext_exists { summary = summary + " + .ext strict" }
+        println("✅ PASS — " + summary)
     } else {
-        println("  (skip — scripts/ai_native_scan.hexa 없음)")
-    }
-
-    // Rule 1 — ai-native 24 @attr (stub)
-    println("")
-    println("[1] ai-native 24 @attr — warn-only (scan 미구현)")
-
-    println("")
-    println("── 종료 ────────────────────────────────────────")
-    if target != "" {
-        println("target: " + target)
-    }
-}
-
-// ─── install: pre-commit 스탠자 설치 ─────────────────────────
-fn run_install() {
-    let mut pwd = env("PWD")
-    if pwd == "" { pwd = to_string(exec("pwd")).trim() }
-    let hook_path = pwd + "/.git/hooks/pre-commit"
-
-    let exists = to_string(exec("test -f '" + hook_path + "' && echo y || echo n")).trim()
-    if exists != "y" {
-        eprintln("error: " + hook_path + " 없음 — git repo 아님?")
-        exit(1)
-    }
-
-    // 이미 raw 스탠자 있는지 검사
-    let marker = to_string(exec("grep -c '@raw-stanza' '" + hook_path + "' 2>/dev/null || echo 0")).trim()
-    if marker != "0" {
-        println("already installed — '" + hook_path + "' 에 @raw-stanza 마커 존재")
-        println("재설치 하려면 해당 블록 수동 삭제 후 재실행")
-        exit(0)
-    }
-
-    // 4개 스탠자 append
-    let stanza = "\n" +
-        "# @raw-stanza — generated by self/raw_cli.hexa install (DO NOT EDIT)\n" +
-        "# ── raw #3: @attr 네이밍 ────────────────────\n" +
-        "EDICT_STAGED_HEXA=$(git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\\.hexa$' || true)\n" +
-        "if [ -n \"$EDICT_STAGED_HEXA\" ] && [ -x \"./hexa\" ]; then\n" +
-        "    EDICT_OUT=$(./hexa self/attrs/_registry.hexa 2>&1 | grep -E 'violation|fail' || true)\n" +
-        "    if [ -n \"$EDICT_OUT\" ]; then\n" +
-        "        echo \"🚫 raw#3 @attr 네이밍 위반\" >&2\n" +
-        "        echo \"$EDICT_OUT\" >&2\n" +
-        "        exit 1\n" +
-        "    fi\n" +
-        "fi\n" +
-        "\n" +
-        "# ── raw #5: 트리구조 (F5/F6) ─────────────────\n" +
-        "if [ -x \"./hexa\" ] && [ -f \"scripts/ai_native_scan.hexa\" ]; then\n" +
-        "    SCAN_F5F6=$(./hexa scripts/ai_native_scan.hexa 2>&1 | grep -E '^(F5|F6)' || true)\n" +
-        "    if [ -n \"$SCAN_F5F6\" ]; then\n" +
-        "        echo \"🚫 raw#5 트리구조 위반 (F5 loner / F6 parent-child)\" >&2\n" +
-        "        echo \"$SCAN_F5F6\" >&2\n" +
-        "        exit 1\n" +
-        "    fi\n" +
-        "fi\n" +
-        "\n" +
-        "# ── raw #10: silent error (warn-only, staged .hexa) ──\n" +
-        "# (현 단계 warn 만 — 기존 violation 354 건 triage 후 block 승격)\n" +
-        "if [ -n \"$EDICT_STAGED_HEXA\" ] && [ -x \"./hexa\" ] && [ -f \"scripts/error_propagation_lint.hexa\" ]; then\n" +
-        "    RAW10_OUT=$(./hexa scripts/error_propagation_lint.hexa --staged 2>&1 | grep -E '^error\\[@silent_error\\]' || true)\n" +
-        "    if [ -n \"$RAW10_OUT\" ]; then\n" +
-        "        echo \"⚠ raw#10 silent_error 경고 (warn-only)\" >&2\n" +
-        "        echo \"$RAW10_OUT\" | head -20 >&2\n" +
-        "        # block 승격은 기존 violation migration 후 — 현재 commit 허용\n" +
-        "    fi\n" +
-        "fi\n" +
-        "\n" +
-        "# ── raw #1: ai-native 24 @attr (warn-only) ──\n" +
-        "# (현 단계 warn 만 — block 승격은 Tier 2/3 semantic 분석 후)\n" +
-        "# @raw-stanza-end\n"
-
-    try {
-        let existing = to_string(read_file(hook_path))
-        safe_write_file(hook_path, existing + stanza)
-        exec("chmod +x '" + hook_path + "'")
-        println("✅ installed — " + hook_path)
-        println("   3 stanzas: raw#3 (attr naming), raw#5 (F5/F6), raw#1 (warn stub)")
-        println("   제거: @raw-stanza ~ @raw-stanza-end 블록 수동 삭제")
-    } catch e {
-        eprintln("error: 쓰기 실패 " + hook_path)
+        eprintln("🚫 FAIL — " + to_string(errs) + " issues")
         exit(1)
     }
 }
 
-// ─── dispatch ────────────────────────────────────────────────
+// ── dispatch ──
 if len(cli_args) == 0 {
     print_list()
     exit(0)
@@ -353,10 +562,7 @@ if len(cli_args) == 0 {
 
 let sub = cli_args[0]
 
-if sub == "list" {
-    print_list()
-    exit(0)
-}
+if sub == "list" { print_list(); exit(0) }
 
 if sub == "show" {
     if len(cli_args) < 2 { eprintln("usage: show <id>"); exit(1) }
@@ -364,17 +570,8 @@ if sub == "show" {
     exit(0)
 }
 
-if sub == "check" {
-    let target = if len(cli_args) >= 2 { cli_args[1] } else { "" }
-    run_check(target)
-    exit(0)
-}
-
-if sub == "install" {
-    run_install()
-    exit(0)
-}
+if sub == "verify" { run_verify(); exit(0) }
 
 eprintln("usage:")
-eprintln("  hexa self/raw_cli.hexa [list|show <id>|check [file]|install]")
+eprintln("  hexa self/raw_cli.hexa [list|show <id>|verify]")
 exit(1)
