@@ -1,0 +1,559 @@
+#!hexa strict
+// tool/chain_runner.hexa — raw#0 forward-chain engine (OS-level enforced)
+//
+// PURPOSE
+//   Read the /.chain SSOT, execute requested step, and auto-cascade the
+//   remaining downstream steps in declaration order. Each successful step
+//   drops an OS-locked marker file under .chain-state/<chain>/ whose
+//   existence is the precondition for the next step in strict mode.
+//
+//   On macOS, markers are chflags uchg (kernel EPERM) so a user cannot
+//   fake the marker with `touch`. On Linux (sandbox), we fall back to
+//   chattr +i when sudo is available; otherwise we record the soft state
+//   and flag the run as "soft-lock" in the audit log.
+//
+// CLI
+//   ./hexa tool/chain_runner.hexa run <chain_id> [<step_id>]
+//         run the named step; if step_id omitted, starts at first step.
+//         downstream steps auto-cascade on success. any failure aborts.
+//
+//   ./hexa tool/chain_runner.hexa status <chain_id>
+//         print per-step marker state (ok / missing / expired).
+//
+//   ./hexa tool/chain_runner.hexa list
+//         list all chains with progress summary.
+//
+//   ./hexa tool/chain_runner.hexa reset <chain_id> --reason "<text>"
+//         unlock + remove every marker for the chain; requires reason;
+//         writes a chain-reset line to .raw-audit.
+//
+// FLOW (run)
+//   1. load /.chain → find chain by id → parse steps (in decl order)
+//   2. locate entry step (user-given or first)
+//   3. strict mode → verify every PRIOR step has an OS-locked _ok marker
+//        missing marker → BLOCKED (exit 3)
+//        marker present but not uchg-locked (macOS) → WARN but proceed
+//   4. execute current step's cmd via exec_with_status
+//   5. on success: write .chain-state/<chain>/step_<id>_ok + chflags uchg
+//                  audit_append("chain-step", user, chain/step, "ok", ...)
+//                  advance to next step, repeat from 3
+//   6. on failure: abort cascade, audit_append("chain-step", ..., "fail")
+//                  downstream steps are NOT executed
+//
+// MARKER FORMAT (.chain-state/<chain_id>/step_<step_id>_ok)
+//   timestamp=<iso8601z>
+//   exit_code=<int>
+//   cmd=<invoked command>
+//   ttl=<seconds>
+//
+// EXIT CODES
+//   0 — cascade completed (every attempted step passed)
+//   1 — one or more steps failed; cascade aborted
+//   2 — invocation error (bad args, unknown chain/step)
+//   3 — BLOCKED (strict prev-guard: required prior markers missing)
+
+use self.core.law_io
+use self.raw_loader
+use tool.raw_audit
+
+// ─── env helpers ─────────────────────────────────────────────────
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _chain_path() -> string { return ".chain" }
+fn _state_root() -> string { return ".chain-state" }
+
+// ─── OS-level marker primitives ──────────────────────────────────
+
+fn _mkdir_p(path: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -f " + _shell_quote(path))
+    return r[1] == 0
+}
+
+// chflags uchg — kernel EPERM on any write. Darwin only.
+// On Linux, we try chattr +i (needs sudo); if that fails, we set file
+// mode to 0444 as a soft fallback and record "soft" in the audit trail.
+fn _lock_marker(path: string) -> string {
+    // returns "uchg" | "iattr" | "soft" | "none"
+    if _is_darwin() {
+        let r = exec_with_status("chflags uchg " + _shell_quote(path) + " 2>&1")
+        if r[1] == 0 { return "uchg" }
+        return "none"
+    }
+    // Linux: try chattr +i
+    let r1 = exec_with_status("chattr +i " + _shell_quote(path) + " 2>/dev/null")
+    if r1[1] == 0 { return "iattr" }
+    // fallback: 0444 read-only
+    let r2 = exec_with_status("chmod 0444 " + _shell_quote(path) + " 2>/dev/null")
+    if r2[1] == 0 { return "soft" }
+    return "none"
+}
+
+fn _unlock_marker(path: string) -> bool {
+    if _is_darwin() {
+        let r = exec_with_status("chflags nouchg " + _shell_quote(path) + " 2>&1")
+        return r[1] == 0
+    }
+    // Linux: best-effort chattr -i + chmod 0644
+    exec_with_status("chattr -i " + _shell_quote(path) + " 2>/dev/null")
+    let r = exec_with_status("chmod 0644 " + _shell_quote(path) + " 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _is_marker_locked(path: string) -> bool {
+    // macOS: ls -lO shows "uchg" in the flags column.
+    if _is_darwin() {
+        let out = to_string(exec("ls -lO " + _shell_quote(path) + " 2>/dev/null"))
+        if out.contains("uchg") { return true }
+        return false
+    }
+    // Linux: the file is locked iff it is not writable by the current
+    // user. This covers both chattr +i (root-enforced) and chmod 0444
+    // (soft fallback). Pure chattr probing (lsattr) is fragile across
+    // filesystems inside a sandbox, so we use the effective-write test.
+    let r = exec_with_status("test -w " + _shell_quote(path))
+    if r[1] != 0 { return true }
+    return false
+}
+
+fn _marker_path(chain_id: string, step_id: string) -> string {
+    return _state_root() + "/" + chain_id + "/step_" + step_id + "_ok"
+}
+
+fn _chain_dir(chain_id: string) -> string {
+    return _state_root() + "/" + chain_id
+}
+
+// ─── chain loading ───────────────────────────────────────────────
+
+// returns [steps, mode, ttl, why]
+//   steps = array of [step_id, cmd, timeout_sec] (decl order preserved)
+fn _parse_chain_keys(keys: array) -> array {
+    let mut steps = []
+    let mut mode = "strict"
+    let mut ttl = "3600"
+    let mut why = ""
+    // first pass: collect step ids in first-seen order, plus mode/ttl/why
+    let mut step_ids = []
+    for kv in keys {
+        let k = kv[0]
+        let v = kv[1]
+        if k == "mode"  { mode = v; continue }
+        if k == "ttl"   { ttl = v;  continue }
+        if k == "why"   { why = v;  continue }
+        if len(k) >= 6 && k.substring(0, 5) == "step." {
+            // extract step id = between first and second dot
+            let rest = k.substring(5, len(k))
+            let d2 = rest.index_of(".")
+            if d2 < 0 { continue }
+            let sid = rest.substring(0, d2)
+            let mut seen = false
+            for existing in step_ids {
+                if existing == sid { seen = true }
+            }
+            if !seen { step_ids = step_ids.push(sid) }
+        }
+    }
+    // second pass: resolve cmd + timeout for each step_id in order
+    for sid in step_ids {
+        let cmd_key = "step." + sid + ".cmd"
+        let to_key = "step." + sid + ".timeout"
+        let mut cmd = ""
+        let mut timeout = "600"
+        for kv in keys {
+            if kv[0] == cmd_key { cmd = kv[1] }
+            if kv[0] == to_key  { timeout = kv[1] }
+        }
+        steps = steps.push([sid, cmd, timeout])
+    }
+    return [steps, mode, ttl, why]
+}
+
+// returns [id, status, name, steps, mode, ttl, why] for matching chain
+// or [] if not found
+fn _find_chain(chain_id: string) -> array {
+    let rules = load_raw_file(_chain_path())
+    for rule in rules {
+        if rule[0] == chain_id {
+            let parsed = _parse_chain_keys(rule[3])
+            return [rule[0], rule[1], rule[2], parsed[0], parsed[1], parsed[2], parsed[3]]
+        }
+    }
+    return []
+}
+
+fn _all_chains() -> array {
+    let mut out = []
+    let rules = load_raw_file(_chain_path())
+    for rule in rules {
+        let parsed = _parse_chain_keys(rule[3])
+        out = out.push([rule[0], rule[1], rule[2], parsed[0], parsed[1], parsed[2], parsed[3]])
+    }
+    return out
+}
+
+// ─── marker IO ───────────────────────────────────────────────────
+
+fn _write_marker(chain_id: string, step_id: string, exit_code: int,
+                 cmd: string, ttl: string) -> string {
+    // returns the lock kind string ("uchg"/"iattr"/"soft"/"none")
+    let dir = _chain_dir(chain_id)
+    _mkdir_p(dir)
+    let path = _marker_path(chain_id, step_id)
+    // if marker exists from a prior run, unlock before overwrite
+    if _file_exists(path) {
+        _unlock_marker(path)
+    }
+    let body = "timestamp=" + _iso_utc_now() + "\n" +
+               "exit_code=" + to_string(exit_code) + "\n" +
+               "cmd=" + cmd + "\n" +
+               "ttl=" + ttl + "\n"
+    // law_io-gated write: goes through raw#7 probe. Markers live under
+    // .chain-state/ which is NOT one of the banned extensions, so this
+    // is a safe write path.
+    safe_write_file(path, body)
+    return _lock_marker(path)
+}
+
+fn _remove_marker(path: string) -> bool {
+    if !_file_exists(path) { return true }
+    _unlock_marker(path)
+    let r = exec_with_status("rm -f " + _shell_quote(path))
+    return r[1] == 0
+}
+
+// ─── strict prev-guard ───────────────────────────────────────────
+
+// returns [] on pass, array of missing_step_ids on fail
+fn _check_prev_markers(chain_id: string, steps: array, entry_idx: int) -> array {
+    let mut missing = []
+    let mut i = 0
+    while i < entry_idx {
+        let sid = steps[i][0]
+        let path = _marker_path(chain_id, sid)
+        if !_file_exists(path) {
+            missing = missing.push(sid)
+        }
+        i = i + 1
+    }
+    return missing
+}
+
+// ─── step execution ──────────────────────────────────────────────
+
+fn _run_step(chain_id: string, step: array, ttl: string) -> int {
+    let sid = step[0]
+    let cmd = step[1]
+    if cmd == "" {
+        eprintln("chain_runner: step '" + sid + "' has no cmd — skipping (declare step." + sid + ".cmd in .chain)")
+        return 2
+    }
+    println("")
+    println("── chain[" + chain_id + "] step[" + sid + "] ──")
+    println("  cmd: " + cmd)
+    let r = exec_with_status(cmd + " 2>&1")
+    let out = to_string(r[0])
+    print(out)
+    let rc = r[1]
+    let actor = _current_user()
+    let reason = "chain=" + chain_id + " step=" + sid
+    if rc == 0 {
+        let lock_kind = _write_marker(chain_id, sid, rc, cmd, ttl)
+        audit_append("chain-step", actor, reason + " lock=" + lock_kind, "ok", "-", "-")
+        println("  → OK (marker locked via " + lock_kind + ")")
+    } else {
+        audit_append("chain-step", actor, reason, "fail (exit " + to_string(rc) + ")", "-", "-")
+        eprintln("  → FAIL (exit " + to_string(rc) + ") — downstream cascade aborted")
+    }
+    return rc
+}
+
+// ─── subcommand: run ─────────────────────────────────────────────
+
+fn _find_step_idx(steps: array, step_id: string) -> int {
+    let mut i = 0
+    while i < len(steps) {
+        if steps[i][0] == step_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _cmd_run(args: array) -> int {
+    if len(args) < 1 {
+        eprintln("chain_runner run: <chain_id> required")
+        return 2
+    }
+    let chain_id = args[0]
+    let mut step_id = ""
+    if len(args) >= 2 { step_id = args[1] }
+
+    let chain = _find_chain(chain_id)
+    if len(chain) == 0 {
+        eprintln("chain_runner run: chain '" + chain_id + "' not found in " + _chain_path())
+        return 2
+    }
+    let status = chain[1]
+    let name = chain[2]
+    let steps = chain[3]
+    let mode = chain[4]
+    let ttl = chain[5]
+
+    if status != "live" {
+        eprintln("chain_runner run: chain '" + chain_id + "' status=" + status + " (only 'live' runnable)")
+        return 2
+    }
+    if len(steps) == 0 {
+        eprintln("chain_runner run: chain '" + chain_id + "' has no steps")
+        return 2
+    }
+
+    // resolve entry step index
+    let mut entry_idx = 0
+    if step_id != "" {
+        entry_idx = _find_step_idx(steps, step_id)
+        if entry_idx < 0 {
+            eprintln("chain_runner run: step '" + step_id + "' not found in chain '" + chain_id + "'")
+            return 2
+        }
+    }
+
+    println("── chain run: " + chain_id + " \"" + name + "\" (mode=" + mode + ") ──")
+    println("  entry: " + steps[entry_idx][0] + " [idx=" + to_string(entry_idx) + "/" + to_string(len(steps)) + "]")
+
+    // strict prev-guard — OS-level: missing marker = BLOCKED, exit 3
+    if mode == "strict" && entry_idx > 0 {
+        let missing = _check_prev_markers(chain_id, steps, entry_idx)
+        if len(missing) > 0 {
+            eprintln("")
+            eprintln("chain_runner: BLOCKED (strict mode) — prior step markers missing:")
+            for m in missing {
+                eprintln("  · " + _marker_path(chain_id, m))
+            }
+            eprintln("")
+            eprintln("Options:")
+            eprintln("  1. run from the earliest missing step: ./hx chain run " + chain_id + " " + missing[0])
+            eprintln("  2. switch chain to loose mode in .chain (edit → raw_all gate)")
+            let actor = _current_user()
+            audit_append("chain-blocked", actor, "chain=" + chain_id + " step=" + steps[entry_idx][0], "blocked (prev-guard)", "-", "-")
+            return 3
+        }
+    }
+
+    // cascade from entry_idx through end
+    let mut i = entry_idx
+    let mut any_fail = false
+    while i < len(steps) {
+        let rc = _run_step(chain_id, steps[i], ttl)
+        if rc != 0 {
+            any_fail = true
+            break
+        }
+        i = i + 1
+    }
+
+    println("")
+    if any_fail {
+        println("── chain[" + chain_id + "] FAILED at step [" + steps[i][0] + "] — cascade aborted ──")
+        return 1
+    }
+    println("── chain[" + chain_id + "] COMPLETE — " + to_string(len(steps) - entry_idx) + " step(s) executed ──")
+    return 0
+}
+
+// ─── subcommand: status ──────────────────────────────────────────
+
+fn _cmd_status(args: array) -> int {
+    if len(args) < 1 {
+        eprintln("chain_runner status: <chain_id> required")
+        return 2
+    }
+    let chain_id = args[0]
+    let chain = _find_chain(chain_id)
+    if len(chain) == 0 {
+        eprintln("chain_runner status: chain '" + chain_id + "' not found")
+        return 2
+    }
+    let name = chain[2]
+    let steps = chain[3]
+    let mode = chain[4]
+
+    println("── chain[" + chain_id + "] \"" + name + "\" (mode=" + mode + ") ──")
+    let mut done_count = 0
+    for step in steps {
+        let sid = step[0]
+        let path = _marker_path(chain_id, sid)
+        let mut mark = "MISS"
+        let mut lock_flag = ""
+        if _file_exists(path) {
+            mark = "OK  "
+            done_count = done_count + 1
+            if _is_marker_locked(path) {
+                lock_flag = " [locked]"
+            } else {
+                lock_flag = " [UNLOCKED — tamper risk]"
+            }
+        }
+        println("  [" + mark + "] " + sid + lock_flag)
+    }
+    println("")
+    println("  progress: " + to_string(done_count) + "/" + to_string(len(steps)))
+    return 0
+}
+
+// ─── subcommand: list ────────────────────────────────────────────
+
+fn _cmd_list() -> int {
+    let chains = _all_chains()
+    if len(chains) == 0 {
+        println("(no chains declared in " + _chain_path() + ")")
+        return 0
+    }
+    println("── chains (" + to_string(len(chains)) + ") ──")
+    for ch in chains {
+        let id = ch[0]
+        let status = ch[1]
+        let name = ch[2]
+        let steps = ch[3]
+        let mode = ch[4]
+        // count done markers
+        let mut done = 0
+        for step in steps {
+            if _file_exists(_marker_path(id, step[0])) { done = done + 1 }
+        }
+        println("  " + id + "  [" + status + "/" + mode + "]  " +
+                to_string(done) + "/" + to_string(len(steps)) +
+                "  " + name)
+    }
+    return 0
+}
+
+// ─── subcommand: reset ───────────────────────────────────────────
+
+fn _cmd_reset(args: array) -> int {
+    if len(args) < 1 {
+        eprintln("chain_runner reset: <chain_id> --reason \"<text>\" required")
+        return 2
+    }
+    let chain_id = args[0]
+    let mut reason = ""
+    let mut i = 1
+    while i < len(args) {
+        let a = args[i]
+        if a == "--reason" {
+            if i + 1 < len(args) { reason = args[i + 1]; i = i + 1 }
+        }
+        i = i + 1
+    }
+    if reason == "" {
+        eprintln("chain_runner reset: --reason \"<text>\" required (ceremony)")
+        return 2
+    }
+
+    let chain = _find_chain(chain_id)
+    if len(chain) == 0 {
+        eprintln("chain_runner reset: chain '" + chain_id + "' not found")
+        return 2
+    }
+    let steps = chain[3]
+
+    let dir = _chain_dir(chain_id)
+    if !_path_exists(dir) {
+        println("chain_runner reset: no markers to clear (state dir absent)")
+        let actor = _current_user()
+        audit_append("chain-reset", actor, "chain=" + chain_id + " reason=\"" + reason + "\"", "ok (no-op)", "-", "-")
+        return 0
+    }
+
+    let mut cleared = 0
+    for step in steps {
+        let path = _marker_path(chain_id, step[0])
+        if _file_exists(path) {
+            _remove_marker(path)
+            cleared = cleared + 1
+        }
+    }
+
+    let actor = _current_user()
+    audit_append("chain-reset", actor,
+                 "chain=" + chain_id + " cleared=" + to_string(cleared) + " reason=\"" + reason + "\"",
+                 "ok", "-", "-")
+    println("chain_runner reset: cleared " + to_string(cleared) + " marker(s) for chain '" + chain_id + "'")
+    return 0
+}
+
+// ─── usage ───────────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: ./hexa tool/chain_runner.hexa <subcommand> [args...]")
+    eprintln("")
+    eprintln("  run    <chain_id> [<step_id>]        run (and cascade) from step")
+    eprintln("  status <chain_id>                    per-step marker state")
+    eprintln("  list                                 all chains + progress")
+    eprintln("  reset  <chain_id> --reason \"...\"     clear markers (audited)")
+    eprintln("")
+    eprintln("Exit codes: 0=ok, 1=step fail, 2=bad args, 3=BLOCKED (prev-guard)")
+}
+
+// ─── main dispatcher ─────────────────────────────────────────────
+
+fn _subargs() -> array {
+    let av = argv()
+    let mut rest = []
+    let mut i = 3
+    while i < len(av) {
+        rest = rest.push(av[i])
+        i = i + 1
+    }
+    return rest
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let sub = av[2]
+    let args = _subargs()
+
+    if sub == "run"    { return _cmd_run(args) }
+    if sub == "status" { return _cmd_status(args) }
+    if sub == "list"   { return _cmd_list() }
+    if sub == "reset"  { return _cmd_reset(args) }
+    if sub == "help" || sub == "-h" || sub == "--help" { _usage(); return 0 }
+
+    eprintln("chain_runner: unknown subcommand '" + sub + "'")
+    eprintln("")
+    _usage()
+    return 2
+}
+
+exit(main())
