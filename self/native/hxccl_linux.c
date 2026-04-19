@@ -531,6 +531,37 @@ int64_t hxccl_broadcast_float(int64_t handle, int64_t buf, int64_t count, int64_
     return -1;
 }
 
+// ─────────────────────────────────────────────────────────────
+// hxnccl_internal_allreduce_bf16_dev — leaf helper used by
+// lib/hxnccl/hxnccl.c hxnccl_allreduce_bf16. Direct ncclAllReduce
+// over a bf16 device buffer in place, summed across ranks. Returns
+// 0 on success, -1 on NCCL error or missing comm.
+//
+// Lives here (not in hxnccl.c) so it can reach g_hxccl_comm /
+// g_hxccl_stream / <nccl.h> without re-including the headers in
+// the wrapper TU. Mac stub equivalent below returns 0 for world=1
+// and -1 for any world>1 attempt.
+// ─────────────────────────────────────────────────────────────
+int64_t hxnccl_internal_allreduce_bf16_dev(int64_t buf, int64_t count) {
+    if (count <= 0) return 0;
+    if (!g_hxccl_comm) {
+        fprintf(stderr, "[hxccl] bf16_allreduce: no comm initialised\n");
+        return -1;
+    }
+    void* bp = (void*)(uintptr_t)buf;
+    if (!bp) return -1;
+    ncclResult_t nres = ncclAllReduce(bp, bp, (size_t)count,
+                                      ncclBfloat16, ncclSum,
+                                      g_hxccl_comm, g_hxccl_stream);
+    if (nres != ncclSuccess) {
+        fprintf(stderr, "[hxccl] ncclAllReduce(bf16) failed: %s\n",
+                ncclGetErrorString(nres));
+        return -1;
+    }
+    cudaStreamSynchronize(g_hxccl_stream);
+    return 0;
+}
+
 int64_t hxccl_finalize(int64_t handle) {
     hxccl_handle* h = (hxccl_handle*)(uintptr_t)handle;
     if (!h || h->magic != 0x48584343) return -1;
@@ -660,5 +691,14 @@ void hxccl_reduce_scatter(int64_t send_ptr, int64_t recv_ptr,
     (void)send_ptr; (void)recv_ptr; (void)count; (void)dtype;
 }
 void hxccl_barrier(void) {}
+
+/* Mac stub for the leaf helper used by lib/hxnccl/hxnccl.c bf16 path.
+ * Mac single-rank stub: identity (return 0). Multi-rank attempts on
+ * Mac are impossible — Mac stub init refuses world>1 anyway. */
+int64_t hxnccl_internal_allreduce_bf16_dev(int64_t buf, int64_t count) {
+    (void)buf; (void)count;
+    if (g_hxccl_world_size_mac <= 1) return 0;
+    return -1;
+}
 
 #endif /* __linux__ */
