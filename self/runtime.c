@@ -618,6 +618,19 @@ const char* hexa_to_cstring(HexaVal v) {
     if (HX_IS_INT(v))   { snprintf(buf, 64, "%lld", (long long)HX_INT(v)); return buf; }
     if (HX_IS_FLOAT(v)) { snprintf(buf, 64, "%g", HX_FLOAT(v)); return buf; }
     if (HX_IS_BOOL(v))  return HX_BOOL(v) ? "true" : "false";
+    // 2026-04-20 silent-fallback audit: prior code returned the literal
+    // "<value>" for TAG_ARRAY / TAG_MAP / TAG_FN / TAG_CHAR / TAG_CLOSURE.
+    // Callers include codegen-emitted `map.has/get/set(k)` paths and FFI
+    // entry points (net.c) — a literal "<value>" string silently collides
+    // across every bad callsite (all array/map/fn keys hash to the same
+    // bucket). Delegate to hexa_to_string for a structural repr that at
+    // least preserves distinctness ("[1, 2]" != "[3, 4]") and surface the
+    // root cause in logs rather than corrupting the map. The returned
+    // pointer points into the intern table (hexa_to_string → hexa_str),
+    // so lifetime matches the legacy static-buf contract for callers that
+    // treat the result as short-lived.
+    HexaVal s = hexa_to_string(v);
+    if (HX_IS_STR(s) && HX_STR(s)) return HX_STR(s);
     return "<value>";
 }
 
@@ -669,6 +682,9 @@ static HexaVal _cached_str_string;
 static HexaVal _cached_str_array;
 static HexaVal _cached_str_map;
 static HexaVal _cached_str_struct;
+static HexaVal _cached_str_fn;
+static HexaVal _cached_str_char;
+static HexaVal _cached_str_closure;
 static HexaVal _cached_str_unknown;
 static HexaVal _cached_str_value;  // "<value>" fallback
 static int     _cached_strs_ready = 0;
@@ -687,6 +703,9 @@ static void _hexa_init_cached_strs(void) {
     _cached_str_array   = hexa_str("array");
     _cached_str_map     = hexa_str("map");
     _cached_str_struct  = hexa_str("struct");
+    _cached_str_fn      = hexa_str("fn");
+    _cached_str_char    = hexa_str("char");
+    _cached_str_closure = hexa_str("closure");
     _cached_str_unknown = hexa_str("unknown");
     _cached_str_value   = hexa_str("<value>");
     _cached_strs_ready  = 1;
@@ -3036,7 +3055,11 @@ int hexa_truthy(HexaVal v) {
     switch (HX_TAG(v)) {
         case TAG_BOOL: return HX_BOOL(v);
         case TAG_INT: return HX_INT(v) != 0;
-        case TAG_STR: return HX_STR(v)[0] != 0;
+        // 2026-04-20 silent-fallback audit: TAG_FLOAT was falling through
+        // to `default: return 1`, so `if 0.0 { ... }` evaluated truthy.
+        // Match TAG_INT semantics — zero is falsy. NaN is truthy (non-zero).
+        case TAG_FLOAT: return HX_FLOAT(v) != 0.0;
+        case TAG_STR: return HX_STR(v) != NULL && HX_STR(v)[0] != 0;
         case TAG_VOID: return 0;
         // rt 32-G: TAG_VALSTRUCT truthy iff .vs pointer non-null.
         case TAG_VALSTRUCT: return HX_VS(v) != NULL;
@@ -3056,6 +3079,13 @@ HexaVal hexa_type_of(HexaVal v) {
         case TAG_VOID: return _cached_str_void;
         case TAG_ARRAY: return _cached_str_array;
         case TAG_MAP: return _cached_str_map;
+        // 2026-04-20 silent-fallback audit: prior default dropped TAG_FN /
+        // TAG_CHAR / TAG_CLOSURE into "unknown" — Hexa-side dispatch like
+        // `type_of(x) != "string"` then misclassified callable values.
+        // Surface them explicitly; any remaining unknown tag is a real bug.
+        case TAG_FN: return _cached_str_fn;
+        case TAG_CHAR: return _cached_str_char;
+        case TAG_CLOSURE: return _cached_str_closure;
         // rt 32-G: Val is a struct at the Hexa level; surface "struct".
         case TAG_VALSTRUCT: return _cached_str_struct;
         default: return _cached_str_unknown;
@@ -3129,6 +3159,27 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
         // TAG_MAP semantics — two separately constructed maps never compare
         // equal by value).
         case TAG_VALSTRUCT: return hexa_bool(HX_VS(a) == HX_VS(b));
+        // 2026-04-20 silent-fallback audit: reference types used to fall to
+        // `default: false`, so `let a = [1,2]; a == a` returned false in the
+        // native path (interpreter's val_eq handles them correctly via
+        // get_array identity). Switch to reference (pointer) equality — value
+        // equality for arrays/maps would require deep comparison and is not
+        // the interpreter's contract either.
+        case TAG_ARRAY: return hexa_bool(a.arr_ptr == b.arr_ptr);
+        case TAG_MAP: return hexa_bool(HX_MAP_TBL(a) == HX_MAP_TBL(b));
+        // TAG_FN: compare underlying C function pointer (descriptor indirection
+        // may differ for two separately-constructed wrappers of the same fn).
+        case TAG_FN:
+            return hexa_bool(
+                (a.fn_ptr_d && b.fn_ptr_d)
+                    ? (HX_FN_PTR(a) == HX_FN_PTR(b))
+                    : (a.fn_ptr_d == b.fn_ptr_d));
+        case TAG_CHAR: return hexa_bool(HX_INT(a) == HX_INT(b));
+        case TAG_CLOSURE:
+            return hexa_bool(
+                (a.clo_ptr && b.clo_ptr)
+                    ? (HX_CLO_PTR(a) == HX_CLO_PTR(b))
+                    : (a.clo_ptr == b.clo_ptr));
         default: return hexa_bool(0);
     }
 }
