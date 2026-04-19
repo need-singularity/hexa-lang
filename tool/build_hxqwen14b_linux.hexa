@@ -89,6 +89,11 @@ fn main() {
     // v5 symbol surface: v4 (12) + Day-2 standalone kernels (4) = 16
     //   Day-2 adds per-adapter LoRA fwd/bwd + frozen base GEMM (cuBLAS on
     //   device, CPU reference on host) + smoke_v5 self-test driver.
+    // v5.2 Day-3: CPU reference attn (rmsnorm/rope/gqa/swiglu) +1 smoke
+    // v5.3       : CUDA dispatch wrappers for the 4 kernels +1 smoke
+    // v5.4 (2026-04-20): real 48-layer base forward + tied lm_head + CE +
+    //                    weight-orchestrator (load_all_weights). Adds 5
+    //                    extern symbols + 1 v54 version probe.
     let symbols = [
         "hxqwen14b_load",
         "hxqwen14b_generate",
@@ -105,7 +110,48 @@ fn main() {
         "hxqwen14b_lora_fwd_single",
         "hxqwen14b_lora_bwd_single",
         "hxqwen14b_base_gemm",
-        "hxqwen14b_smoke_v5"
+        "hxqwen14b_smoke_v5",
+        // v5.2 / v5.3 attention kernel surface
+        "hxqwen14b_rmsnorm_fwd",
+        "hxqwen14b_rope_fwd",
+        "hxqwen14b_gqa_attn_fwd",
+        "hxqwen14b_swiglu_fwd",
+        "hxqwen14b_smoke_v52",
+        "hxqwen14b_rmsnorm_fwd_v53",
+        "hxqwen14b_rope_fwd_v53",
+        "hxqwen14b_gqa_attn_fwd_v53",
+        "hxqwen14b_swiglu_fwd_v53",
+        "hxqwen14b_smoke_v53",
+        "hxqwen14b_version_v53",
+        "hxqwen14b_shard_tensor_info",
+        // v5.4 — full 48-layer base forward + weight orchestrator + CE
+        "hxqwen14b_version_v54",
+        "hxqwen14b_load_all_weights",
+        "hxqwen14b_base_forward_v54",
+        "hxqwen14b_ce_loss_v54",
+        "hxqwen14b_smoke_v54",
+        "hxqwen14b_free_all_weights_v54"
+    ]
+    // v5.4 CUDA-only symbols (only present when nvcc TU is linked, i.e.,
+    // HXQWEN14B_CUDA=1 Linux build). Mac stub paths skip this list.
+    let cuda_symbols = [
+        "hxqwen14b_cu_launch_rmsnorm",
+        "hxqwen14b_cu_launch_rope",
+        "hxqwen14b_cu_launch_gqa",
+        "hxqwen14b_cu_launch_swiglu",
+        "hxqwen14b_cu_launch_bf16_to_fp32",
+        "hxqwen14b_cu_launch_embed_lookup",
+        "hxqwen14b_cu_launch_residual_add",
+        "hxqwen14b_cu_launch_add_bias_1d",
+        "hxqwen14b_cu_launch_sgemm_rowmajor_xwt",
+        "hxqwen14b_cu_launch_tied_lm_head",
+        "hxqwen14b_cu_launch_softmax_ce",
+        "hxqwen14b_cu_malloc_bytes",
+        "hxqwen14b_cu_free_ptr",
+        "hxqwen14b_cu_memcpy_h2d",
+        "hxqwen14b_cu_memcpy_d2h",
+        "hxqwen14b_cu_device_sync",
+        "hxqwen14b_cu_cublas_destroy"
     ]
 
     // ────────────────────────────────────────────────────────────────
@@ -182,14 +228,59 @@ fn main() {
 
     // ── libhxqwen14b.so ─────────────────────────────────────────────
     if env("HXQWEN14B_CUDA") == "1" {
-        // Day-1 real CUDA path — cuBLAS + bf16 Tensor Core.
+        // v5.4 real CUDA path — cuBLAS + bf16 Tensor Core + 48-layer fwd.
+        // Two TUs:
+        //   hxqwen14b.c       — gcc (host control flow + cuBLAS Sgemm calls)
+        //   hxqwen14b_cuda.cu — nvcc (CUDA kernels: rmsnorm/rope/gqa/swiglu
+        //                       /embed_lookup/residual_add/bias_1d/softmax_ce
+        //                       /bf16_to_fp32/sgemm wrapper/tied_lm_head)
+        // Linked together via gcc -shared into libhxqwen14b.so. nvcc is
+        // used in -c mode only (compile, not link) so cuBLAS and cudart
+        // are linked at the gcc step, keeping the recipe simple.
         if !file_exists(cuda_home) {
             eprintln("[ERROR] HXQWEN14B_CUDA=1 but CUDA_HOME=" + cuda_home + " not found")
             eprintln("  Override with CUDA_HOME=/path/to/cuda")
             exit(3)
         }
-        println("[1/1] building libhxqwen14b.so (CUDA path — cuBLAS + bf16)")
-        run(cc + " " + cflags_base + " -DHXQWEN14B_CUDA -I" + cuda_home + "/include " + src_dir + "/hxqwen14b.c -o " + out_dir + "/libhxqwen14b.so -L" + cuda_home + "/lib64 -lcudart -lcublas -lm")
+        let nvcc = if env("NVCC") != "" { env("NVCC") } else { cuda_home + "/bin/nvcc" }
+        if !file_exists(nvcc) {
+            eprintln("[ERROR] nvcc not found at " + nvcc)
+            eprintln("  Set NVCC=/path/to/nvcc or ensure CUDA_HOME points at a SDK")
+            exit(3)
+        }
+        // CUDA TU exists?
+        if !file_exists(src_dir + "/hxqwen14b_cuda.cu") {
+            eprintln("[ERROR] expected " + src_dir + "/hxqwen14b_cuda.cu but file missing")
+            exit(3)
+        }
+
+        let host_obj = out_dir + "/hxqwen14b.host.o"
+        let cuda_obj = out_dir + "/hxqwen14b_cuda.cu.o"
+
+        // H100 = sm_90; A100 = sm_80; pass both for portability across pods.
+        // Allow override via NVCC_ARCH env.
+        let nvcc_arch = if env("NVCC_ARCH") != "" { env("NVCC_ARCH") }
+                        else { "-gencode arch=compute_80,code=sm_80 -gencode arch=compute_90,code=sm_90" }
+
+        println("[1/3] compiling hxqwen14b.c → " + host_obj + " (gcc -DHXQWEN14B_CUDA)")
+        // -fPIC -c (no -shared) — produces a relocatable host object.
+        let host_cflags = if mode == "--debug" { "-O0 -g -fPIC -c" }
+                          else { "-O3 -fPIC -c -march=native" }
+        run(cc + " " + host_cflags + " -DHXQWEN14B_CUDA -I" + cuda_home + "/include " +
+            src_dir + "/hxqwen14b.c -o " + host_obj)
+
+        println("[2/3] compiling hxqwen14b_cuda.cu → " + cuda_obj + " (nvcc)")
+        // -Xcompiler -fPIC so the resulting object can be linked into a .so.
+        // -lineinfo lets cuda-gdb / nsight map back to source.
+        let nvcc_flags = if mode == "--debug" { "-O0 -g -G -Xcompiler -fPIC -c" }
+                         else { "-O3 -Xcompiler -fPIC -c -lineinfo" }
+        run(nvcc + " " + nvcc_flags + " " + nvcc_arch + " " +
+            src_dir + "/hxqwen14b_cuda.cu -o " + cuda_obj)
+
+        println("[3/3] linking libhxqwen14b.so (gcc -shared, cudart + cublas)")
+        run(cc + " -shared -fPIC " + host_obj + " " + cuda_obj +
+            " -L" + cuda_home + "/lib64 -lcudart -lcublas -lm" +
+            " -o " + out_dir + "/libhxqwen14b.so")
     } else {
         // v0 stub path — no CUDA linked. Symbol surface only.
         println("[1/1] building libhxqwen14b.so (stub path — no CUDA)")
@@ -198,6 +289,21 @@ fn main() {
 
     for sym in symbols {
         check_symbol_D(out_dir + "/libhxqwen14b.so", sym)
+    }
+    if env("HXQWEN14B_CUDA") == "1" {
+        println("── checking CUDA-only symbols (extern from hxqwen14b_cuda.cu) ──")
+        for sym in cuda_symbols {
+            check_symbol_D(out_dir + "/libhxqwen14b.so", sym)
+        }
+        // Also probe for the actual cudart launch symbol — the watchdog
+        // (anima/training/r11_ffi_watchdog.hexa) keys off this to detect
+        // a real CUDA-linked .so vs the stub.
+        let probe = exec_with_status("nm -D " + out_dir + "/libhxqwen14b.so 2>/dev/null | grep -E 'cudaLaunchKernel|cuLaunchKernel' | head -1")
+        if probe[1] == 0 {
+            println("  cudaLaunchKernel SYMBOL=PRESENT (watchdog probe will pass)")
+        } else {
+            eprintln("  cudaLaunchKernel SYMBOL=MISSING (watchdog will retry forever)")
+        }
     }
 
     println("built:")
