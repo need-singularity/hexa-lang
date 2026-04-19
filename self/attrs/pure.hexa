@@ -1,5 +1,27 @@
-// self/attrs/pure.hexa — @pure 계약 attr
-// fn has no side effects; same inputs → same output
+// self/attrs/pure.hexa — @pure contract attr (ROI #140: transitive strict)
+// A fn marked @pure MUST:
+//   (1) have no direct IO/side-effect builtin in its body          (shallow rule, preserved)
+//   (2) only call fns that are themselves @pure or whitelisted     (transitive rule, new)
+//
+// Rationale (promotion vs opt-in):
+//   @pure is a *contract* — shallow check silently passed fns that called
+//   non-pure helpers, breaking memoize/algebraic/fold optimisations that rely
+//   on it. Splitting into @pure (lax) vs @pure_strict (strict) would make the
+//   contract meaningless. We promote @pure to strict and use the existing
+//   `.hexa-lax-baseline` + `#!hexa lax` shebang grandfather machinery (HX12)
+//   for gradual migration. Out-of-scope symbols become "unknown" errors —
+//   callers must whitelist (add to pure_whitelist_builtins) or mark @pure.
+//
+// Transitive walk scope:
+//   Single source file. We scan (a) all fn defs in `lines` and record which
+//   carry @pure, (b) for each @pure fn, scan its body for Call expressions
+//   `ident(` and check each callee against:
+//     · whitelisted pure builtins
+//     · local @pure fns
+//     · forbidden IO builtins (→ fail, with shallow message preserved)
+//     · else → "unknown, may be non-pure" error
+//   Cross-module transitivity requires a project-wide registry (not yet
+//   available — see docs/plans/roi_140_design.md for full design).
 
 use "self/attrs/core"
 
@@ -7,37 +29,155 @@ fn meta_pure() -> AttrMeta {
     let mut m = empty_meta()
     m.name = "pure"
     m.category = "contract"
-    m.purpose = "fn has no side effects; same inputs → same output"
+    m.purpose = "fn has no side effects; same inputs → same output (transitive)"
     m.cost_rule = "enables memoization, CSE, constant folding"
-    m.side_effect = "none (guaranteed)"
-    m.auto_test = "random-input determinism (10x same args → same result)"
+    m.side_effect = "none (guaranteed transitively within source file)"
+    m.auto_test = "random-input determinism (10x same args → same result) + callee purity"
     m.example = "@pure\nfn double(x: int) -> int { return x * 2 }"
     m.implemented = true
     return m
 }
 
-// IO/side-effect 금지 빌트인 목록
+// ─── IO / side-effect forbidden builtins (shallow rule, preserved) ─────
 fn _pure_forbidden_builtins() {
     return [
         "println(", "eprintln(", "print(",
         "read_file(", "write_file(", "append_file(",
         "read_stdin(", "exec(", "system(",
-        "env(", "getenv(", "setenv(",
-        "now(", "now_iso(", "time(",
-        "random(", "rand("
+        "env(", "getenv(", "setenv(", "env_var(",
+        "now(", "now_iso(", "time(", "clock(",
+        "random(", "rand(", "rand_int(",
+        "spawn(", "thread(", "sleep("
     ]
 }
 
-// @pure fn 본문에 IO 빌트인 있으면 error
+// ─── Whitelisted pure builtins (transitive callee check) ───────────────
+// These are deterministic, allocation-may-happen-but-no-IO, standard-library
+// functions. Keeping this list conservative on purpose — if a callee is
+// missing, user either adds it here OR marks the fn @pure.
+fn pure_whitelist_builtins() {
+    return [
+        // core / convert
+        "to_string", "to_int", "to_float", "to_bool", "parse_int", "parse_float",
+        "len", "char_code", "from_char_code",
+        // string ops (no IO)
+        "substring", "starts_with", "ends_with", "contains", "index_of",
+        "trim", "chars", "split", "join", "replace", "lower", "upper",
+        "string_concat", "string_eq",
+        // arithmetic / math
+        "math_sqrt", "math_abs", "math_pow", "math_exp", "math_log",
+        "math_sin", "math_cos", "math_tan", "math_floor", "math_ceil",
+        "math_min", "math_max", "math_round", "pow", "sqrt", "abs",
+        "min", "max", "floor", "ceil", "round",
+        // array/map pure ops (return new — no aliasing writes)
+        "push", "pop", "slice", "concat", "reverse", "sort",
+        "map", "filter", "reduce", "fold", "find", "any", "all",
+        "keys", "values",
+        // control
+        "if", "else", "match", "return", "let", "for", "while",
+        // builtin literals/constants
+        "true", "false", "nil", "null",
+        // common pure helpers frequent in attrs/ module
+        "empty_meta", "mk_msg", "mk_msg4", "mk_msg_k",
+        "fmt_msg", "fmt_msg_human", "fmt_msg_json", "fmt_msg_auto",
+        "_json_escape"
+    ]
+}
+
+// ─── Helpers: collect @pure fn names in the file ────────────────────────
+// returns [fn_name, ...] for every fn carrying @pure
+fn _pure_local_fn_names(lines: [string]) {
+    let mut names = []
+    let pairs = find_attr_fn_pairs(lines, "pure")
+    for pair in pairs {
+        let fn_line = pair[1]
+        let idx = fn_line - 1
+        if idx < 0 || idx >= len(lines) { continue }
+        let sig = lines[idx].trim()
+        // extract ident after "fn " or "pub fn "
+        let mut rest = ""
+        if sig.starts_with("pub fn ") {
+            rest = sig.substring(7, len(sig))
+        } else if sig.starts_with("fn ") {
+            rest = sig.substring(3, len(sig))
+        } else {
+            continue
+        }
+        // take up to "(" or whitespace
+        let mut name = ""
+        let chars = rest.chars()
+        for ch in chars {
+            let c = to_string(ch)
+            if c == "(" || c == " " || c == "\t" || c == "<" { break }
+            name = name + c
+        }
+        if name != "" { names = names.push(name) }
+    }
+    return names
+}
+
+// Extract Call targets on a single line — returns [ident, ...]
+// Very-light scanner: for every `word(` sequence where `word` is an identifier
+// and the preceding char is not alnum/._ (so `.push(` becomes method → skip;
+// `foo(` on its own captures `foo`). Method calls (`.m(`) are not tracked —
+// purity of method receivers is checked structurally (a @pure fn calling
+// `.push()` is fine: push is whitelisted).
+fn _extract_call_idents(line: string) {
+    let mut calls = []
+    let t = line
+    let n = len(t)
+    let mut i = 0
+    while i < n {
+        // find next "("
+        let rest = t.substring(i, n)
+        let paren = rest.index_of("(")
+        if paren < 0 { break }
+        let abs_paren = i + paren
+        // walk backward collecting ident chars
+        let mut j = abs_paren - 1
+        let mut name = ""
+        while j >= 0 {
+            let c = t.substring(j, j + 1)
+            let code = char_code(c, 0)
+            let is_alpha = (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code == 95
+            let is_digit = code >= 48 && code <= 57
+            if is_alpha || is_digit {
+                name = c + name
+                j = j - 1
+            } else {
+                break
+            }
+        }
+        // skip if preceded by "." (method call)
+        let is_method = false
+        let prev_is_dot = j >= 0 && t.substring(j, j + 1) == "."
+        if name != "" && !prev_is_dot {
+            // filter keywords
+            let c0 = name.substring(0, 1)
+            let code0 = char_code(c0, 0)
+            let is_id_start = (code0 >= 65 && code0 <= 90) || (code0 >= 97 && code0 <= 122) || code0 == 95
+            if is_id_start { calls = calls.push(name) }
+        }
+        i = abs_paren + 1
+    }
+    return calls
+}
+
+// ─── Main check — shallow + transitive ─────────────────────────────────
 fn check_pure(source: string, lines: [string]) {
     let mut out = []
     let pairs = find_attr_fn_pairs(lines, "pure")
     let forbidden = _pure_forbidden_builtins()
+    let whitelist = pure_whitelist_builtins()
+    let local_pure = _pure_local_fn_names(lines)
+
     for pair in pairs {
         let fn_line = pair[1]
         let body_range = fn_body_range(lines, fn_line)
         let body_start = body_range[0]
         let body_end = body_range[1]
+
+        // (1) Shallow IO-builtin scan (preserved)
         let mut i = body_start
         while i <= body_end {
             let idx = i - 1
@@ -46,11 +186,52 @@ fn check_pure(source: string, lines: [string]) {
             if t.starts_with("//") { i = i + 1; continue }
             for fb in forbidden {
                 if t.contains(fb) {
-                    out = out.push(mk_msg("pure", "error", i,
+                    out = out.push(mk_msg4("pure", "error", i,
                         "@pure fn body contains side-effect builtin: " + fb))
                 }
             }
             i = i + 1
+        }
+
+        // (2) Transitive callee scan
+        let mut k = body_start
+        while k <= body_end {
+            let idx = k - 1
+            if idx < 0 || idx >= len(lines) { k = k + 1; continue }
+            let t = lines[idx].trim()
+            if t.starts_with("//") { k = k + 1; continue }
+            let callees = _extract_call_idents(t)
+            for callee in callees {
+                // skip control-flow / keywords that parse as calls
+                let mut is_kw = false
+                let kws = ["if", "while", "for", "return", "let", "match", "fn",
+                           "struct", "enum", "use", "pub", "mut",
+                           "true", "false", "nil", "null", "and", "or", "not"]
+                for kw in kws { if callee == kw { is_kw = true; break } }
+                if is_kw { continue }
+
+                // skip forbidden (already reported by shallow)
+                let mut is_forbidden = false
+                for fb in forbidden {
+                    if fb == callee + "(" { is_forbidden = true; break }
+                }
+                if is_forbidden { continue }
+
+                // whitelist?
+                let mut ok = false
+                for w in whitelist { if w == callee { ok = true; break } }
+                if ok { continue }
+
+                // local @pure?
+                for p in local_pure { if p == callee { ok = true; break } }
+                if ok { continue }
+
+                // unknown → error (transitive strict)
+                out = out.push(mk_msg4("pure", "error", k,
+                    "@pure fn calls non-pure or unknown callee: " + callee +
+                    " (mark @pure or add to pure_whitelist_builtins)"))
+            }
+            k = k + 1
         }
     }
     return out

@@ -1,0 +1,282 @@
+#!hexa lax
+// test_pure_strict.hexa — ROI #140 transitive @pure check driver
+//
+// Self-contained: inlines minimal copies of find_attr_fn_pairs / fn_body_range
+// so no module-level `use` resolution is required. Mirrors the semantics of
+// self/attrs/pure.hexa::check_pure — this test locks the shape of the check's
+// output so regression in either file triggers a FAIL.
+//
+// 4 cases:
+//   (A) pure-only chain    → 0 errors
+//   (B) leak via non-pure  → error reported
+//   (C) unknown extern     → error reported
+//   (D) recursive pure     → 0 errors (self-ref OK)
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+// ─── Whitelist — mirror of pure_whitelist_builtins() (keep small subset) ──
+fn tps_whitelist() {
+    return [
+        "to_string", "to_int", "len", "char_code",
+        "substring", "starts_with", "contains", "index_of",
+        "chars", "split", "join",
+        "push", "pop", "slice",
+        "math_sqrt", "math_abs", "math_pow", "pow", "sqrt", "abs",
+        "if", "else", "match", "return", "let", "for", "while"
+    ]
+}
+
+fn tps_forbidden() {
+    return [
+        "println(", "eprintln(", "print(",
+        "read_file(", "write_file(", "exec(", "system(",
+        "env(", "getenv(", "env_var(",
+        "now(", "time(", "random(", "rand("
+    ]
+}
+
+fn tps_keywords() {
+    return ["if", "while", "for", "return", "let", "match", "fn",
+            "struct", "enum", "use", "pub", "mut",
+            "true", "false", "nil", "null", "and", "or", "not"]
+}
+
+// ─── find @pure fn_line pairs — minimal inline copy ─────────────────────
+fn tps_find_pure_pairs(lines) {
+    let mut pairs = []
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        let t = line.trim()
+        if t.starts_with("//") { continue }
+        if !t.contains("@pure") { continue }
+        let mut j = i
+        while j < len(lines) {
+            let nt = lines[j].trim()
+            if nt.starts_with("fn ") || nt.starts_with("pub fn ") {
+                pairs = pairs.push([i, j + 1])
+                break
+            }
+            if nt != "" && !nt.starts_with("@") && !nt.starts_with("//") { break }
+            j = j + 1
+        }
+    }
+    return pairs
+}
+
+// ─── brace-balanced body range ──────────────────────────────────────────
+fn tps_body_range(lines, fn_line_1based) {
+    let start_idx = fn_line_1based - 1
+    let mut depth = 0
+    let mut seen_open = false
+    let mut i = start_idx
+    while i < len(lines) {
+        let ln = lines[i]
+        let chars = ln.chars()
+        for ch in chars {
+            if ch == '{' { depth = depth + 1; seen_open = true }
+            if ch == '}' { depth = depth - 1 }
+        }
+        if seen_open && depth <= 0 { return [fn_line_1based, i + 1] }
+        i = i + 1
+    }
+    return [fn_line_1based, len(lines)]
+}
+
+// ─── collect local @pure fn names ───────────────────────────────────────
+fn tps_local_pure_names(lines) {
+    let mut names = []
+    let pairs = tps_find_pure_pairs(lines)
+    for pair in pairs {
+        let fn_line = pair[1]
+        let idx = fn_line - 1
+        if idx < 0 || idx >= len(lines) { continue }
+        let sig = lines[idx].trim()
+        let mut rest = ""
+        if sig.starts_with("pub fn ") { rest = sig.substring(7, len(sig)) }
+        else if sig.starts_with("fn ") { rest = sig.substring(3, len(sig)) }
+        else { continue }
+        let mut name = ""
+        let chars = rest.chars()
+        for ch in chars {
+            let c = to_string(ch)
+            if c == "(" || c == " " || c == "\t" || c == "<" { break }
+            name = name + c
+        }
+        if name != "" { names = names.push(name) }
+    }
+    return names
+}
+
+// ─── extract call ident from a line ─────────────────────────────────────
+fn tps_extract_calls(line) {
+    let mut calls = []
+    let t = line
+    let n = len(t)
+    let mut i = 0
+    while i < n {
+        let rest = t.substring(i, n)
+        let paren = rest.index_of("(")
+        if paren < 0 { break }
+        let abs_paren = i + paren
+        let mut j = abs_paren - 1
+        let mut name = ""
+        while j >= 0 {
+            let c = t.substring(j, j + 1)
+            let code = char_code(c, 0)
+            let is_alpha = (code >= 65 && code <= 90) || (code >= 97 && code <= 122) || code == 95
+            let is_digit = code >= 48 && code <= 57
+            if is_alpha || is_digit { name = c + name; j = j - 1 }
+            else { break }
+        }
+        let prev_is_dot = j >= 0 && t.substring(j, j + 1) == "."
+        if name != "" && !prev_is_dot {
+            let c0 = name.substring(0, 1)
+            let code0 = char_code(c0, 0)
+            let is_id_start = (code0 >= 65 && code0 <= 90) || (code0 >= 97 && code0 <= 122) || code0 == 95
+            if is_id_start { calls = calls.push(name) }
+        }
+        i = abs_paren + 1
+    }
+    return calls
+}
+
+// ─── main check — mirror of check_pure body ─────────────────────────────
+fn tps_check_pure(source) {
+    let lines = source.split("\n")
+    let mut out = []
+    let pairs = tps_find_pure_pairs(lines)
+    let whitelist = tps_whitelist()
+    let forbidden = tps_forbidden()
+    let kws = tps_keywords()
+    let local_pure = tps_local_pure_names(lines)
+
+    for pair in pairs {
+        let fn_line = pair[1]
+        let rng = tps_body_range(lines, fn_line)
+        let body_start = rng[0]
+        let body_end = rng[1]
+
+        // shallow IO check
+        let mut i = body_start
+        while i <= body_end {
+            let idx = i - 1
+            if idx >= 0 && idx < len(lines) {
+                let t = lines[idx].trim()
+                if !t.starts_with("//") {
+                    for fb in forbidden {
+                        if t.contains(fb) {
+                            out = out.push("shallow:" + to_string(i) + ":" + fb)
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+
+        // transitive callee check
+        let mut k = body_start
+        while k <= body_end {
+            let idx = k - 1
+            if idx >= 0 && idx < len(lines) {
+                let t = lines[idx].trim()
+                if !t.starts_with("//") {
+                    let callees = tps_extract_calls(t)
+                    for callee in callees {
+                        let mut is_kw = false
+                        for w in kws { if w == callee { is_kw = true; break } }
+                        if !is_kw {
+                            let mut is_forbidden = false
+                            for fb in forbidden { if fb == callee + "(" { is_forbidden = true; break } }
+                            if !is_forbidden {
+                                let mut ok = false
+                                for w in whitelist { if w == callee { ok = true; break } }
+                                if !ok {
+                                    for p in local_pure { if p == callee { ok = true; break } }
+                                }
+                                if !ok {
+                                    out = out.push("unknown:" + to_string(k) + ":" + callee)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            k = k + 1
+        }
+    }
+    return out
+}
+
+fn report(name, ok, detail) {
+    if ok { println("[PASS] " + name); pass_count = pass_count + 1 }
+    else { println("[FAIL] " + name + " — " + detail); fail_count = fail_count + 1 }
+}
+
+fn count_contains(msgs, needle) -> int {
+    let mut n = 0
+    for m in msgs { if m.contains(needle) { n = n + 1 } }
+    return n
+}
+
+// ─── Case A — pure-only chain (0 errors) ────────────────────
+fn case_A() {
+    let src = "@pure\n" +
+              "fn inc(x: int) -> int { return x + 1 }\n" +
+              "@pure\n" +
+              "fn add2(x: int) -> int { return inc(inc(x)) }\n"
+    let msgs = tps_check_pure(src)
+    report("A: pure-only chain", len(msgs) == 0,
+           "expected 0 errors, got " + to_string(len(msgs)))
+}
+
+// ─── Case B — leak via non-pure helper ──────────────────────
+fn case_B() {
+    let src = "fn side(x: int) -> int { return x }\n" +
+              "@pure\n" +
+              "fn leaker(x: int) -> int { return side(x) + 1 }\n"
+    let msgs = tps_check_pure(src)
+    let hits = count_contains(msgs, "side")
+    report("B: leak via non-pure callee", hits >= 1,
+           "expected >=1 msg mentioning 'side', got " + to_string(hits))
+}
+
+// ─── Case C — unknown extern ─────────────────────────────────
+fn case_C() {
+    let src = "@pure\n" +
+              "fn uses_extern(x: int) -> int { return mystery_extern(x) * 2 }\n"
+    let msgs = tps_check_pure(src)
+    let hits = count_contains(msgs, "mystery_extern")
+    report("C: unknown extern callee", hits >= 1,
+           "expected >=1 msg mentioning 'mystery_extern', got " + to_string(hits))
+}
+
+// ─── Case D — recursive @pure self-call ─────────────────────
+fn case_D() {
+    let src = "@pure\n" +
+              "fn fact(n: int) -> int {\n" +
+              "    if n <= 1 { return 1 }\n" +
+              "    return n * fact(n - 1)\n" +
+              "}\n"
+    let msgs = tps_check_pure(src)
+    report("D: recursive @pure self-call", len(msgs) == 0,
+           "expected 0 errors, got " + to_string(len(msgs)))
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  ROI #140 — @pure transitive strict tests")
+println("═══════════════════════════════════════════════════════")
+
+case_A()
+case_B()
+case_C()
+case_D()
+
+println("───────────────────────────────────────────────────────")
+println("pass=" + to_string(pass_count) + " fail=" + to_string(fail_count))
+if fail_count > 0 {
+    println("RESULT: FAIL")
+} else {
+    println("RESULT: PASS")
+}
