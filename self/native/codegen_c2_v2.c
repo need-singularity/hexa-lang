@@ -1022,6 +1022,23 @@ HexaVal gen2_expr(HexaVal node) {
                 _epl_out = hexa_add(_epl_out, hexa_str("fprintf(stderr, \"\\n\"), hexa_void())"));
                 return _epl_out;
             }
+            /* FIX (2026-04-20): eprint — stderr + NO trailing newline. */
+            if (hexa_truthy(hexa_eq(name, hexa_str("eprint")))) {
+                HexaVal _epn_args = hexa_map_get(node, "args");
+                int64_t _epn_n = hexa_len(_epn_args);
+                if (_epn_n == 0) {
+                    return hexa_str("hexa_void()");
+                }
+                if (_epn_n == 1) {
+                    return hexa_add(hexa_add(hexa_str("(hexa_eprint_val("), gen2_expr(hexa_index_get(_epn_args, hexa_int(0)))), hexa_str("), hexa_void())"));
+                }
+                HexaVal _epn_out = hexa_str("(");
+                for (int64_t _eni = 0; _eni < _epn_n; _eni++) {
+                    _epn_out = hexa_add(hexa_add(hexa_add(_epn_out, hexa_str("hexa_eprint_val(")), gen2_expr(hexa_index_get(_epn_args, hexa_int(_eni)))), hexa_str("), "));
+                }
+                _epn_out = hexa_add(_epn_out, hexa_str("hexa_void())"));
+                return _epn_out;
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("args")))) {
                 return hexa_str("hexa_args()");
             }
@@ -1633,6 +1650,10 @@ HexaVal _is_builtin_name(HexaVal name) {
         return hexa_bool(1);
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("eprintln")))) {
+        return hexa_bool(1);
+    }
+    /* FIX (2026-04-20): eprint builtin — println symmetry. */
+    if (hexa_truthy(hexa_eq(name, hexa_str("eprint")))) {
         return hexa_bool(1);
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("len")))) {

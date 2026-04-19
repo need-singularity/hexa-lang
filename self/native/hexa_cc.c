@@ -7827,6 +7827,9 @@ static HexaIC __hexa_codegen_c2_ic_874 = {0};
 static HexaIC __hexa_codegen_c2_ic_875 = {0};
 static HexaIC __hexa_codegen_c2_ic_876 = {0};
 static HexaIC __hexa_codegen_c2_ic_877 = {0};
+/* FIX (2026-04-20): eprint builtin ic slots. */
+static HexaIC __hexa_codegen_c2_ic_878 = {0};
+static HexaIC __hexa_codegen_c2_ic_879 = {0};
 
 HexaVal _hexa_name_is_reserved(HexaVal s) {
     __hexa_fn_arena_enter();
@@ -9134,6 +9137,10 @@ HexaVal gen2_fn_decl(HexaVal node) {
                                 _skip = hexa_bool(1);
                             }
                             if (hexa_truthy(hexa_eq(_cname, hexa_str("eprintln")))) {
+                                _skip = hexa_bool(1);
+                            }
+                            /* FIX (2026-04-20): eprint void-builtin skip. */
+                            if (hexa_truthy(hexa_eq(_cname, hexa_str("eprint")))) {
                                 _skip = hexa_bool(1);
                             }
                             if (hexa_truthy(hexa_eq(_cname, hexa_str("exit")))) {
@@ -10557,6 +10564,23 @@ HexaVal gen2_expr(HexaVal node) {
                 }
                 _epl_out = hexa_add(_epl_out, hexa_str("fprintf(stderr, \"\\n\"), hexa_void())"));
                 return __hexa_fn_arena_return(_epl_out);
+            }
+            /* FIX (2026-04-20): eprint — stderr + NO trailing newline. */
+            if (hexa_truthy(hexa_eq(name, hexa_str("eprint")))) {
+                HexaVal _epn_args = hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_878);
+                int64_t _epn_n = hexa_len(_epn_args);
+                if (_epn_n == 0) {
+                    return __hexa_fn_arena_return(hexa_str("hexa_void()"));
+                }
+                if (_epn_n == 1) {
+                    return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("(hexa_eprint_val("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_879), hexa_int(0)))), hexa_str("), hexa_void())")));
+                }
+                HexaVal _epn_out = hexa_str("(");
+                for (int64_t _eni = 0; _eni < _epn_n; _eni++) {
+                    _epn_out = hexa_add(hexa_add(hexa_add(_epn_out, hexa_str("hexa_eprint_val(")), gen2_expr(hexa_index_get(_epn_args, hexa_int(_eni)))), hexa_str("), "));
+                }
+                _epn_out = hexa_add(_epn_out, hexa_str("hexa_void())"));
+                return __hexa_fn_arena_return(_epn_out);
             }
             if (hexa_truthy(hexa_eq(name, hexa_str("args")))) {
                 return __hexa_fn_arena_return(hexa_str("hexa_args()"));
@@ -12486,6 +12510,10 @@ HexaVal _is_builtin_name(HexaVal name) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("eprintln")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    /* FIX (2026-04-20): eprint builtin — println symmetry. */
+    if (hexa_truthy(hexa_eq(name, hexa_str("eprint")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("len")))) {

@@ -160,6 +160,7 @@ HexaVal hexa_read_file(HexaVal path);
 HexaVal hexa_write_file(HexaVal path, HexaVal content);
 HexaVal hexa_file_exists(HexaVal path);
 HexaVal hexa_eprintln(HexaVal v);
+HexaVal hexa_eprint(HexaVal v);
 HexaVal hexa_write_bytes(HexaVal path, HexaVal arr);
 HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr);
 HexaVal hexa_read_file_bytes(HexaVal path);
@@ -2892,6 +2893,49 @@ HexaVal hexa_eprintln(HexaVal v) {
             break;
         }
         default: fprintf(stderr, "<value>\n"); break;
+    }
+    return hexa_void();
+}
+
+// 2026-04-20 builtin: stderr + NO trailing newline (print/println symmetry).
+// Mirrors hexa_eprintln byte-for-byte except the "\n" suffix is dropped from
+// every format branch. Motivating callers:
+//   tool/pkg/packages/token-forge/proxy/server.hexa
+//   self/ml/corpus_clean.hexa
+// which pre-2026-04-20 fell through to hexa_call1(eprint,...) and produced a
+// clang link error in AOT. Interp path also route-checks this name.
+HexaVal hexa_eprint(HexaVal v) {
+    if (HX_IS_VALSTRUCT(v) && HX_VS(v)) {
+        HexaValStruct* vs = HX_VS(v);
+        switch (vs->tag_i) {
+            case TAG_INT:   fprintf(stderr, "%lld", (long long)vs->int_val); return hexa_void();
+            case TAG_FLOAT: fprintf(stderr, "%g", vs->float_val); return hexa_void();
+            case TAG_BOOL:  fprintf(stderr, "%s", vs->bool_val ? "true" : "false"); return hexa_void();
+            case TAG_STR: {
+                const char* cs = HX_STR(vs->str_val);
+                if (cs) { fprintf(stderr, "%s", cs); return hexa_void(); }
+                break;
+            }
+            case TAG_VOID:  fprintf(stderr, "void"); return hexa_void();
+        }
+    }
+    switch (HX_TAG(v)) {
+        case TAG_INT: fprintf(stderr, "%lld", (long long)HX_INT(v)); break;
+        case TAG_FLOAT: fprintf(stderr, "%g", HX_FLOAT(v)); break;
+        case TAG_BOOL: fprintf(stderr, "%s", HX_BOOL(v) ? "true" : "false"); break;
+        case TAG_STR:
+            if (HX_STR(v)) fprintf(stderr, "%s", HX_STR(v));
+            else fprintf(stderr, "<str null>");
+            break;
+        case TAG_VOID: fprintf(stderr, "void"); break;
+        case TAG_ARRAY:
+        case TAG_MAP: {
+            HexaVal s = hexa_to_string(v);
+            if (HX_IS_STR(s) && HX_STR(s)) fprintf(stderr, "%s", HX_STR(s));
+            else fprintf(stderr, "<value>");
+            break;
+        }
+        default: fprintf(stderr, "<value>"); break;
     }
     return hexa_void();
 }
