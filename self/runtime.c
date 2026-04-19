@@ -3357,6 +3357,14 @@ HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
     return arr;
 }
 
+// lines: split on '\n'. Thin wrapper around hexa_str_split matching the
+// interpreter shape `s.split("\n")`. Non-str receiver returns empty
+// array (TAG_ERROR safety fallback at self/hexa_full.hexa:14926-14928).
+HexaVal hexa_str_lines(HexaVal s) {
+    if (!HX_IS_STR(s)) return hexa_array_new();
+    return hexa_str_split(s, hexa_str("\n"));
+}
+
 HexaVal hexa_str_trim(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     char* str = HX_STR(s);
