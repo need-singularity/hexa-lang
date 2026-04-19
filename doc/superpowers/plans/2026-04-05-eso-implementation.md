@@ -4,7 +4,7 @@
 
 **Goal:** hexa-lang 컴파일러의 opt 파이프라인 결과를 `CycleEngine`에 feed 하여, 창발 패턴이 다음 라운드 opt 패스 순서를 결정하는 자가 학습 루프를 구축. 벤치 0.032s → <0.010s.
 
-**Architecture:** opt::run_pipeline 실행 시 패스별 IR 통계 + 시간을 수집 → eso_bridge가 CycleEngine에 feed → run_cycle → EmergencePattern → pass_policy가 다음 순서 결정. Fixed/Adaptive/Hybrid 3정책. 모든 메트릭 `config/eso_metrics.json`(SSOT).
+**Architecture:** opt::run_pipeline 실행 시 패스별 IR 통계 + 시간을 수집 → eso_bridge가 CycleEngine에 feed → run_cycle → EmergencePattern → pass_policy가 다음 순서 결정. Fixed/Adaptive/Hybrid 3정책. 모든 메트릭 `doc/eso_metrics.json`(SSOT).
 
 **Tech Stack:** Rust (기존 컴파일러), `src/singularity.rs` (기존 CycleEngine 재사용), `serde_json` (이미 Cargo.toml 포함 가정).
 
@@ -18,7 +18,7 @@
 - `src/opt/pass_policy.rs` — Fixed/Adaptive/Hybrid 정책 (단일 책임: 순서 결정)
 - `src/opt/emergence_density.rs` — ED 메트릭 계산/저장 (단일 책임: 메트릭)
 - `tests/eso_integration.rs` — 10라운드 통합 테스트
-- `config/eso_metrics.json` — 런타임 생성 (초기엔 빈 템플릿)
+- `doc/eso_metrics.json` — 런타임 생성 (초기엔 빈 템플릿)
 
 **Modify:**
 - `src/opt/mod.rs` — `PassResult`에 `elapsed_ns` 추가, `run_pipeline_with_policy` 추가
@@ -845,15 +845,15 @@ git commit -m "feat(eso): add --eso-tune multi-round driver"
 
 ---
 
-### Task 9: Persist metrics to config/eso_metrics.json (SSOT)
+### Task 9: Persist metrics to doc/eso_metrics.json (SSOT)
 
 **Files:**
-- Create: `config/eso_metrics.json` (initial template)
+- Create: `doc/eso_metrics.json` (initial template)
 - Modify: `src/main.rs` (write JSON after tune loop)
 
 - [ ] **Step 1: Create initial template**
 
-Create `config/eso_metrics.json`:
+Create `doc/eso_metrics.json`:
 
 ```json
 {
@@ -888,7 +888,7 @@ fn test_round_record_serialization() {
 At end of `run_eso_tune` (before `std::process::exit(0)`), add:
 
 ```rust
-    let json_path = "config/eso_metrics.json";
+    let json_path = "doc/eso_metrics.json";
     let rounds_json: Vec<String> = history.values.iter().enumerate().map(|(i, ed)| {
         format!(r#"{{"round":{},"ed":{:.6}}}"#, i, ed)
     }).collect();
@@ -923,14 +923,14 @@ Expected: Build OK
 
 - [ ] **Step 5: Run tune and verify JSON written**
 
-Run: `./hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -3 && cat config/eso_metrics.json | head -5`
-Expected: `wrote config/eso_metrics.json` + JSON content starts with `{"_meta":`
+Run: `./hexa --eso-tune examples/bench_suite.hexa 2>&1 | tail -3 && cat doc/eso_metrics.json | head -5`
+Expected: `wrote doc/eso_metrics.json` + JSON content starts with `{"_meta":`
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add config/eso_metrics.json src/main.rs src/opt/emergence_density.rs
-git commit -m "feat(eso): persist tune metrics to config/eso_metrics.json (SSOT)"
+git add doc/eso_metrics.json src/main.rs src/opt/emergence_density.rs
+git commit -m "feat(eso): persist tune metrics to doc/eso_metrics.json (SSOT)"
 ```
 
 ---
@@ -1072,9 +1072,9 @@ Expected: `8422360000`
 Run: `HEXA_ESO=adaptive ./hexa examples/bench_suite.hexa 2>&1 | head -1`
 Expected: `8422360000`
 
-- [ ] **Step 4: Check config/eso_metrics.json exists and valid JSON**
+- [ ] **Step 4: Check doc/eso_metrics.json exists and valid JSON**
 
-Run: `python3 -c "import json; print(json.load(open('config/eso_metrics.json'))['_meta'])"`
+Run: `python3 -c "import json; print(json.load(open('doc/eso_metrics.json'))['_meta'])"`
 Expected: Dict with `version`, `source`, keys present (after running eso-tune at least once)
 
 - [ ] **Step 5: If all gates pass, final commit**
@@ -1087,11 +1087,11 @@ Expected: See all 11 ESO commits in sequence
 ### Task 13: Troubleshooting log entry (CDO compliance)
 
 **Files:**
-- Modify: `config/hexa_ir_convergence.json` (append entry)
+- Modify: `doc/hexa_ir_convergence.json` (append entry)
 
 - [ ] **Step 1: Check current structure**
 
-Run: `python3 -c "import json; d=json.load(open('config/hexa_ir_convergence.json')); print(list(d.keys()))"`
+Run: `python3 -c "import json; d=json.load(open('doc/hexa_ir_convergence.json')); print(list(d.keys()))"`
 Expected: `['_meta', 'absolute_rules', 'troubleshooting_log']` (or similar)
 
 - [ ] **Step 2: Append ESO deployment entry via Python**
@@ -1101,7 +1101,7 @@ Create a small Python helper and run once:
 ```bash
 python3 - <<'EOF'
 import json, time
-p = "config/hexa_ir_convergence.json"
+p = "doc/hexa_ir_convergence.json"
 d = json.load(open(p))
 d.setdefault("troubleshooting_log", []).append({
     "id": f"eso-deploy-{int(time.time())}",
@@ -1120,7 +1120,7 @@ EOF
 - [ ] **Step 3: Commit**
 
 ```bash
-git add config/hexa_ir_convergence.json
+git add doc/hexa_ir_convergence.json
 git commit -m "cdo(eso): log ESO deployment to convergence troubleshooting"
 ```
 
@@ -1134,7 +1134,7 @@ git commit -m "cdo(eso): log ESO deployment to convergence troubleshooting"
 - [x] pass_policy Fixed/Adaptive/Hybrid → Task 4
 - [x] Emergence density metric → Task 5
 - [x] Bench runner integration → Task 11
-- [x] config/eso_metrics.json SSOT → Task 9
+- [x] doc/eso_metrics.json SSOT → Task 9
 - [x] Error: feed dim mismatch fallback → Policy::Fixed default in Task 7
 - [x] Error: correctness fail rollback → Task 8 regression detection + best_round tracking
 - [x] Error: ED 3-round drop rollback → Task 5 is_regressing + Task 8 break on regression

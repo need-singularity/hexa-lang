@@ -57,7 +57,7 @@ parser → typeck → lower → IR → opt(p01..p12) → codegen
 
 ### 2-4. 창발 밀도 메트릭 (`src/opt/emergence_density.rs` 신규)
 - 공식: `ED = (창발 패턴 수 × 벤치 가속비) / 사이클 수`
-- 저장: `config/eso_metrics.json` (SSOT)
+- 저장: `doc/eso_metrics.json` (SSOT)
 
 ### 2-5. 벤치 러너 통합 (`tool/bench_hexa_ir.hexa` 확장)
 - 기존 벤치 + ESO ON/OFF 비교 섹션
@@ -92,8 +92,8 @@ codegen                              eso_bridge::vectorize()
 ```
 
 **저장 위치**:
-- `config/eso_metrics.json` — 라운드별 ED, 시간, 창발 패턴 (SSOT)
-- `config/emergence_patterns.json` — 발견된 패턴 (기존 파일 확장)
+- `doc/eso_metrics.json` — 라운드별 ED, 시간, 창발 패턴 (SSOT)
+- `doc/emergence_patterns.json` — 발견된 패턴 (기존 파일 확장)
 
 ## 에러 처리
 
@@ -135,9 +135,9 @@ codegen                              eso_bridge::vectorize()
 
 ## SSOT / CDO 준수
 
-- 모든 메트릭은 `config/eso_metrics.json`이 원본
+- 모든 메트릭은 `doc/eso_metrics.json`이 원본
 - 벤치 리포트 `docs/hexa-ir-benchmark.md`는 JSON에서 자동 생성
-- 트러블슈팅은 `config/hexa_ir_convergence.json`에 기록
+- 트러블슈팅은 `doc/hexa_ir_convergence.json`에 기록
 - 2회 재발 시 `absolute_rules`로 승격
 
 ## 비목표 (YAGNI)
