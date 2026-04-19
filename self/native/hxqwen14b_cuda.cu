@@ -73,8 +73,14 @@ __global__ void v53_rmsnorm_kernel(
 }
 
 // ═════════════════════════════════════════════════════════════════════
-// Kernel 2: RoPE interleaved forward (in-place)
-// Grid: (B*S, n_heads). Block: head_dim/2 threads — one per rotation pair.
+// Kernel 2: RoPE rotate_half forward (in-place, Llama/Qwen2 layout — v5.4.3)
+// Grid: (B*S, n_heads). Block: head_dim/2 threads — one per freq index.
+// Pair layout: x0 = x[k], x1 = x[D/2+k]. Each thread owns unique (k, D/2+k)
+// slot pair — safe in-place after register load.
+// Matches HF transformers.models.qwen2.modeling_qwen2.apply_rotary_pos_emb:
+//   rotate_half(x) = cat([-x[..., D/2:], x[..., :D/2]], dim=-1)
+// Prior interleaved (GPT-J / NeoX) version confirmed incompatible with
+// Qwen2 weights — v5.4.2 smoke CE=16.09 before this fix.
 // ═════════════════════════════════════════════════════════════════════
 __global__ void v53_rope_kernel(
     float* __restrict__ x,
@@ -89,16 +95,17 @@ __global__ void v53_rope_kernel(
     (void)B;
     int s = bs - (bs / S) * S;
     float pos = (float)(pos_offset + s);
+    // HF Qwen2 freq formula: inv_freq[k] = 1 / theta^(2k/D), k in [0, D/2).
     float inv_freq = powf(theta_base, -((float)(2 * k)) / (float)D);
     float angle    = pos * inv_freq;
     float cs, sn;
     __sincosf(angle, &sn, &cs);
 
-    int offset = (bs * H + h) * D + 2 * k;
-    float x0 = x[offset];
-    float x1 = x[offset + 1];
-    x[offset    ] = x0 * cs - x1 * sn;
-    x[offset + 1] = x0 * sn + x1 * cs;
+    int base = (bs * H + h) * D;
+    float x0 = x[base + k];
+    float x1 = x[base + half + k];
+    x[base + k]        = x0 * cs - x1 * sn;
+    x[base + half + k] = x1 * cs + x0 * sn;
 }
 
 // ═════════════════════════════════════════════════════════════════════
