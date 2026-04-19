@@ -1,0 +1,227 @@
+# raw-verify.yml — server-side enforcement of raw#0 attestation
+#
+# PURPOSE
+#   로컬 chflags(uchg) 는 friction — 진짜 강제력은 server-side CI.
+#   PR / push 시 각 commit 의 `raw-all-attest:v1:...` trailer 를 검증한다.
+#   trailer 가 없거나 HMAC 이 불일치하면 CI fail → merge 차단.
+#
+# STRATEGY (c)
+#   hexa_stage0 는 macOS Mach-O 바이너리라 ubuntu-latest 에서 돌지 않는다.
+#   따라서 CI 는 raw_all 을 직접 수행하지 않고, 대신 commit trailer 에 박힌
+#   attestation (local 에서 `./hx commit` 으로 raw_all 통과 후 생성) 을
+#   순수 bash 로 검증한다. 로컬 → trailer → 서버 재검증 — 이중 gate.
+#
+# DEPENDENCIES (runner-provided on ubuntu-latest)
+#   · git, bash, openssl, awk, sha256sum — 전부 기본 설치
+#
+# SECRETS
+#   REPO_ATTEST_KEY — `.raw-attest-key` 와 동일한 64-hex HMAC 키.
+#                     GitHub Settings → Secrets → Actions 에 수동 등록.
+#                     없으면 attestation job 이 즉시 fail 한다.
+
+name: raw-verify
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Job 1: attestation ─────────────────────────────────────────
+  # 각 commit 의 raw-all-attest trailer 를 순수 bash 로 검증.
+  attestation:
+    name: attestation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@v4
+        with:
+          # PR base...head / push before...after 범위를 walk 하려면 full history 필요
+          fetch-depth: 0
+
+      - name: Determine commit range
+        id: range
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+            HEAD="${{ github.event.pull_request.head.sha }}"
+          else
+            BASE="${{ github.event.before }}"
+            HEAD="${{ github.event.after }}"
+          fi
+          # force-push 또는 최초 push 의 경우 BASE 가 0000... 일 수 있다
+          if [[ "$BASE" == "0000000000000000000000000000000000000000" || -z "$BASE" ]]; then
+            BASE="$(git rev-list --max-parents=0 HEAD | tail -1)"
+          fi
+          echo "base=$BASE" >> "$GITHUB_OUTPUT"
+          echo "head=$HEAD" >> "$GITHUB_OUTPUT"
+          echo "range: $BASE..$HEAD"
+
+      - name: Write bash verifier (inlined from tool/raw_attestation.hexa emit-verify)
+        shell: bash
+        run: |
+          # raw#8 HEXA-ONLY: 이 verifier 는 repo 에 commit 되지 않으며, runner
+          # tmpfs 에서만 생성된다. 원본은 tool/raw_attestation.hexa :: _bash_verifier_text().
+          cat > /tmp/verify_attestation.sh <<'BASH_EOF'
+          #!/usr/bin/env bash
+          # verify_attestation.sh — emitted by tool/raw_attestation.hexa
+          # Re-computes the raw-all-attest HMAC for a given commit.
+          # Usage: REPO_ATTEST_KEY=<hex> verify_attestation.sh <commit>
+          # Exit: 0 valid, 1 invalid, 2 invocation error.
+          set -euo pipefail
+          bad() { echo "verify_attestation: $*" >&2; exit 1; }
+          if [[ $# -lt 1 ]]; then
+              echo "usage: REPO_ATTEST_KEY=<hex> $0 <commit>" >&2; exit 2
+          fi
+          COMMIT="$1"
+          if [[ -z "${REPO_ATTEST_KEY:-}" ]]; then
+              echo "verify_attestation: REPO_ATTEST_KEY required" >&2; exit 2
+          fi
+          command -v git     >/dev/null || { echo missing:git     >&2; exit 2; }
+          command -v openssl >/dev/null || { echo missing:openssl >&2; exit 2; }
+          command -v awk     >/dev/null || { echo missing:awk     >&2; exit 2; }
+          if command -v sha256sum >/dev/null 2>&1; then SHA_CMD="sha256sum";
+          elif command -v shasum >/dev/null 2>&1;   then SHA_CMD="shasum -a 256";
+          else echo 'missing: sha256sum or shasum' >&2; exit 2; fi
+          MSG="$(git log -1 --format=%B "$COMMIT" 2>/dev/null)" || bad "git log failed: $COMMIT"
+          TRAILER="$(printf '%s\n' "$MSG" | awk '/^raw-all-attest: / { line=$0 } END { print line }')"
+          [[ -n "$TRAILER" ]] || bad "no 'raw-all-attest:' trailer on $COMMIT"
+          TOKEN="${TRAILER#raw-all-attest: }"
+          IFS=':' read -r P1 P2 P3 P4 P5 <<<"$TOKEN" || bad 'malformed token'
+          [[ "$P1" == 'raw-all-attest' ]] || bad "bad prefix: $P1"
+          [[ "$P2" == 'v1'             ]] || bad "bad version: $P2"
+          SSOT_SHA="$P3"; TS="$P4"; HMAC_CLAIMED="$P5"
+          [[ -n "$SSOT_SHA" && -n "$TS" && -n "$HMAC_CLAIMED" ]] || bad 'empty field'
+          TS_EPOCH="$(date -u -d "$TS" +%s 2>/dev/null || true)"
+          if [[ -z "$TS_EPOCH" ]]; then
+              TS_EPOCH="$(date -u -jf '%Y-%m-%dT%H:%M:%SZ' "$TS" +%s 2>/dev/null || true)"
+          fi
+          [[ -n "$TS_EPOCH" ]] || bad "cannot parse timestamp: $TS"
+          # NOTE: CI 에서는 +-1h window 를 적용하지 않는다 (old PR 의 commit 검증 필요).
+          # 대신 HMAC + SSOT-SHA drift 만 강제한다.
+          CURRENT_SHA="$(cat .raw .own .ext .roadmap .loop 2>/dev/null | $SHA_CMD | awk '{print $1}')"
+          [[ -n "$CURRENT_SHA" ]] || bad 'ssot fingerprint empty'
+          # SSOT drift 는 warn 만 — PR 중 .raw 수정이 정상일 수 있다.
+          if [[ "$CURRENT_SHA" != "$SSOT_SHA" ]]; then
+              echo "verify_attestation: NOTE — SSOT drift since attestation (token=$SSOT_SHA current=$CURRENT_SHA)" >&2
+          fi
+          HMAC_EXPECT="$(printf '%s' "${SSOT_SHA}|${TS}" | openssl dgst -sha256 -mac HMAC -macopt "hexkey:${REPO_ATTEST_KEY}" | awk '{print $NF}')"
+          [[ -n "$HMAC_EXPECT" ]] || bad 'hmac recompute failed'
+          [[ "$HMAC_EXPECT" == "$HMAC_CLAIMED" ]] || bad 'HMAC MISMATCH'
+          echo "attestation: OK ($COMMIT)"
+          exit 0
+          BASH_EOF
+          chmod +x /tmp/verify_attestation.sh
+
+      - name: Guard REPO_ATTEST_KEY secret presence
+        env:
+          REPO_ATTEST_KEY: ${{ secrets.REPO_ATTEST_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${REPO_ATTEST_KEY:-}" ]]; then
+            echo "::error::REPO_ATTEST_KEY secret 미등록 — doc/runbook/raw_ci.md 참조"
+            exit 1
+          fi
+          echo "secret: present (${#REPO_ATTEST_KEY} chars)"
+
+      - name: Verify attestation on each commit in range
+        id: verify
+        env:
+          REPO_ATTEST_KEY: ${{ secrets.REPO_ATTEST_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          BASE="${{ steps.range.outputs.base }}"
+          HEAD="${{ steps.range.outputs.head }}"
+          COMMITS="$(git rev-list --no-merges "${BASE}..${HEAD}")"
+          if [[ -z "$COMMITS" ]]; then
+            echo "no non-merge commits in range — nothing to verify"
+            exit 0
+          fi
+          FAIL=0
+          MISSING=0
+          while IFS= read -r C; do
+            [[ -z "$C" ]] && continue
+            echo "── verifying $C ──"
+            if ! /tmp/verify_attestation.sh "$C"; then
+              rc=$?
+              if git log -1 --format=%B "$C" | grep -q '^raw-all-attest: '; then
+                echo "::error::HMAC mismatch on $C"
+              else
+                echo "::error::missing-attestation on $C — use ./hx commit"
+                MISSING=1
+              fi
+              FAIL=1
+            fi
+          done <<< "$COMMITS"
+          if (( MISSING )); then
+            echo "::error title=missing-attestation::하나 이상 commit 에 raw-all-attest trailer 없음"
+          fi
+          exit "$FAIL"
+
+  # ── Job 2: raw_all (skipped — strategy (c)) ────────────────────
+  # hexa_stage0 Mach-O 바이너리는 Linux 에서 돌지 않는다.
+  # raw_all 은 local 에서 `./hx commit` 이 호출하며, 그 결과는 attestation
+  # trailer 로 encode 된다. 서버는 trailer 만 검증해도 충분한 gate 이다.
+  # 향후 stage0 가 cross-compile 가능해지면 strategy (a) 로 전환.
+  raw_all:
+    name: raw_all (local-only — verified via attestation)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Note — raw_all 은 local 에서만 실행됨
+        shell: bash
+        run: |
+          echo "raw_all 은 hexa_stage0 (Mach-O) 를 요구하므로 Linux CI 에서는 skip."
+          echo "대신 attestation job 이 로컬 raw_all 통과를 HMAC 으로 증명한다."
+          echo "향후 Linux stage0 cross-build 가 준비되면 이 job 을 활성화."
+
+  # ── Job 3: own_inherit (skipped — strategy (c)) ────────────────
+  # own_inherit_lint.hexa 도 hexa_stage0 를 요구. raw_all 과 동일 사유.
+  own_inherit:
+    name: own_inherit (local-only — verified via attestation)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Note — own_inherit 은 local 에서만 실행됨
+        shell: bash
+        run: |
+          echo "own_inherit_lint 는 hexa_stage0 를 요구하므로 Linux CI 에서는 skip."
+          echo "raw_all 이 own_inherit_lint 를 포함하므로 attestation 이 간접 gate."
+
+  # ── Job 4: regression ──────────────────────────────────────────
+  # test/regression/raw_*.hexa fixture 가 있으면 실행, 없으면 graceful skip.
+  # test-suite agent 가 병행 작성 중이라 fixture 부재를 허용한다.
+  regression:
+    name: regression (soft)
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect regression fixtures
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ls test/regression/raw_*.hexa >/dev/null 2>&1; then
+            echo "found=1" >> "$GITHUB_OUTPUT"
+            echo "regression fixtures present:"
+            ls test/regression/raw_*.hexa
+          else
+            echo "found=0" >> "$GITHUB_OUTPUT"
+            echo "::warning::test/regression/raw_*.hexa fixture 없음 — test-suite agent 작업 중일 가능성. skip."
+          fi
+
+      - name: Run fixtures (skipped — no hexa_stage0 on Linux)
+        if: steps.detect.outputs.found == '1'
+        shell: bash
+        run: |
+          echo "fixture 는 있으나 hexa_stage0 (Mach-O) 부재로 execute 불가."
+          echo "attestation trailer 로 간접 검증 — local `./hx test regression` 이 필수."
