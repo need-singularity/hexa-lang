@@ -1,0 +1,309 @@
+// self/attrs/_own/harness.hexa — @own 하네스 통합 (parser + 3 validators)
+//
+// 저수준 구현 단일 파일. 4-module 분할은 use-depth 제한 회피.
+// L2 parser (parse_own_decl, extract_own_sections)
+// L3 validators (check_own_sections, check_own_strict, check_own_order)
+
+use "self/attrs/core"
+use "self/attrs/_lib/error_catalog"
+use "self/attrs/_lib/paper_utils"
+
+// ─── L2 PARSER ────────────────────────────────────────────────────
+
+fn _strip_comment(line: string) -> string {
+    let t = line.trim()
+    if t.starts_with("//") { return t.substring(2, len(t)).trim() }
+    if t.starts_with("<!--") {
+        let mut s = t.substring(4, len(t))
+        let ei = s.index_of("-->")
+        if ei >= 0 { s = s.substring(0, ei) }
+        return s.trim()
+    }
+    if t.starts_with("#") { return t.substring(1, len(t)).trim() }
+    return t
+}
+
+fn _find_own_open(lines) {
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        if i > 50 { break }
+        let stripped = _strip_comment(line)
+        let idx = stripped.index_of("@own(")
+        if idx >= 0 { return i }
+    }
+    return -1
+}
+
+// returns: [found, malformed, reason, body, end_line]
+fn _extract_own_body(lines, start_line: int) {
+    let mut body = ""
+    let mut paren = 0
+    let mut bracket = 0
+    let mut in_string = false
+    let mut quote_ch = ""
+    let mut malformed = false
+    let mut reason = ""
+    let mut end_line = start_line
+    let mut done = false
+    let mut li = start_line
+    let n_lines = len(lines)
+    let max_line = start_line + 50
+    while li <= n_lines && li <= max_line && !done {
+        let raw = lines[li - 1]
+        let mut s = _strip_comment(raw)
+        if li == start_line {
+            let idx = s.index_of("@own(")
+            if idx < 0 { return [false, true, "no_open", "", start_line] }
+            s = s.substring(idx + 5, len(s))
+            paren = 1
+        }
+        let mut i = 0
+        let n = len(s)
+        while i < n && !done {
+            let c = s.substring(i, i + 1)
+            if in_string {
+                body = body + c
+                if c == quote_ch { in_string = false; quote_ch = "" }
+            } else {
+                if c == "\"" || c == "'" {
+                    in_string = true
+                    quote_ch = c
+                    body = body + c
+                } else if c == "[" {
+                    bracket = bracket + 1
+                    body = body + c
+                } else if c == "]" {
+                    if bracket == 0 {
+                        malformed = true; reason = "bracket_underflow"; done = true
+                    } else {
+                        bracket = bracket - 1
+                        body = body + c
+                    }
+                } else if c == "(" {
+                    paren = paren + 1
+                    body = body + c
+                } else if c == ")" {
+                    paren = paren - 1
+                    if paren == 0 {
+                        end_line = li
+                        if bracket != 0 { malformed = true; reason = "bracket_unclosed" }
+                        if in_string { malformed = true; reason = "string_unclosed" }
+                        done = true
+                    } else {
+                        body = body + c
+                    }
+                } else {
+                    body = body + c
+                }
+            }
+            i = i + 1
+        }
+        if !done {
+            body = body + " "
+            li = li + 1
+        }
+    }
+    if !done { return [true, true, "paren_unclosed", body, li] }
+    return [true, malformed, reason, body, end_line]
+}
+
+fn _parse_array_literal(v: string) {
+    let mut items = []
+    let t = v.trim()
+    if !t.starts_with("[") { return items }
+    let ci = t.index_of("]")
+    if ci < 0 { return items }
+    let inner = t.substring(1, ci)
+    let parts = inner.split(",")
+    for p in parts {
+        let mut x = p.trim()
+        if len(x) >= 2 && x.starts_with("\"") && x.ends_with("\"") { x = x.substring(1, len(x) - 1) }
+        else if len(x) >= 2 && x.starts_with("'") && x.ends_with("'") { x = x.substring(1, len(x) - 1) }
+        if len(x) > 0 { items = items.push(x) }
+    }
+    return items
+}
+
+fn _split_top_pairs(body: string) {
+    let mut pairs = []
+    let mut cur = ""
+    let mut paren = 0
+    let mut br = 0
+    let mut in_s = false
+    let mut qc = ""
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if in_s {
+            cur = cur + c
+            if c == qc { in_s = false; qc = "" }
+        } else {
+            if c == "\"" || c == "'" { in_s = true; qc = c; cur = cur + c }
+            else if c == "[" { br = br + 1; cur = cur + c }
+            else if c == "]" { br = br - 1; cur = cur + c }
+            else if c == "(" { paren = paren + 1; cur = cur + c }
+            else if c == ")" { paren = paren - 1; cur = cur + c }
+            else if c == "," && paren == 0 && br == 0 {
+                let tt = cur.trim()
+                if len(tt) > 0 { pairs = pairs.push(tt) }
+                cur = ""
+            } else { cur = cur + c }
+        }
+        i = i + 1
+    }
+    let tt = cur.trim()
+    if len(tt) > 0 { pairs = pairs.push(tt) }
+    return pairs
+}
+
+fn parse_own_decl(lines) {
+    let start_line = _find_own_open(lines)
+    if start_line < 0 {
+        return #{"found": false, "sections": [], "strict": false, "order": "free", "depth": 2, "prefix": "", "decl_start": -1, "decl_end": -1, "malformed": false, "reason": ""}
+    }
+    let ext = _extract_own_body(lines, start_line)
+    let ext_malformed = ext[1]
+    let ext_reason = ext[2]
+    let ext_body = ext[3]
+    let ext_end = ext[4]
+    if ext_malformed {
+        return #{"found": true, "sections": [], "strict": false, "order": "free", "depth": 2, "prefix": "", "decl_start": start_line, "decl_end": ext_end, "malformed": true, "reason": ext_reason}
+    }
+    let pairs = _split_top_pairs(ext_body)
+    let mut sections = []
+    let mut strict = false
+    let mut order = "free"
+    let mut depth = 2
+    let mut prefix = ""
+    for p in pairs {
+        let eqi = p.index_of("=")
+        if eqi >= 0 {
+            let k = p.substring(0, eqi).trim()
+            let v = p.substring(eqi + 1, len(p)).trim()
+            if k == "sections" { sections = _parse_array_literal(v) }
+            else if k == "strict" { if v == "true" || v == "True" { strict = true } }
+            else if k == "order" {
+                let mut ov = v
+                if len(ov) >= 2 && ov.starts_with("\"") && ov.ends_with("\"") { ov = ov.substring(1, len(ov) - 1) }
+                order = ov
+            }
+            else if k == "depth" {
+                let mut d = 2
+                try { d = to_int(v) } catch e { d = 2 }
+                depth = d
+            }
+            else if k == "prefix" {
+                let mut px = v
+                if len(px) >= 2 && px.starts_with("\"") && px.ends_with("\"") { px = px.substring(1, len(px) - 1) }
+                else if len(px) >= 2 && px.starts_with("'") && px.ends_with("'") { px = px.substring(1, len(px) - 1) }
+                prefix = px
+            }
+        }
+    }
+    return #{"found": true, "sections": sections, "strict": strict, "order": order, "depth": depth, "prefix": prefix, "decl_start": start_line, "decl_end": ext_end, "malformed": false, "reason": ""}
+}
+
+fn extract_own_sections(lines, prefix: string) {
+    let mut names = []
+    for line in lines {
+        let t = line.trim()
+        if t.starts_with("## ") {
+            let mut name = t.substring(3, len(t)).trim()
+            if len(prefix) > 0 && name.starts_with(prefix) {
+                name = name.substring(len(prefix), len(name)).trim()
+            }
+            let space = name.index_of(" ")
+            let mut head = name
+            if space > 0 { head = name.substring(0, space) }
+            if len(head) > 0 { names = names.push(head) }
+        }
+    }
+    return names
+}
+
+// ─── L3 VALIDATORS ────────────────────────────────────────────────
+
+fn check_own_sections(lines, decl, source: string) {
+    let mut out = []
+    let sections = decl["sections"]
+    let prefix = decl["prefix"]
+    let decl_line = decl["decl_start"]
+    if len(sections) == 0 {
+        out = out.push(mk_msg_k("own", "error", source, decl_line, "@own(sections=[]) empty — at least 1 section required", "own_declared_zero"))
+        return out
+    }
+    let mut missing = []
+    for sec in sections {
+        let mut ok = has_section(lines, sec)
+        if !ok && len(prefix) > 0 {
+            let want = prefix + sec
+            ok = has_section(lines, want)
+        }
+        if !ok { missing = missing.push(sec) }
+    }
+    if len(missing) > 0 {
+        out = out.push(mk_msg_k("own", "error", source, decl_line, "@own declared sections missing in body: " + join(missing, ", "), "own_sections_missing"))
+    }
+    return out
+}
+
+fn check_own_strict(lines, decl, source: string) {
+    let mut out = []
+    if !decl["strict"] { return out }
+    let declared = decl["sections"]
+    let prefix = decl["prefix"]
+    let decl_line = decl["decl_start"]
+    let actual = extract_own_sections(lines, prefix)
+    let mut extra = []
+    for a in actual {
+        let mut matched = false
+        for d in declared {
+            if a == d { matched = true; break }
+        }
+        if !matched { extra = extra.push(a) }
+    }
+    if len(extra) > 0 {
+        out = out.push(mk_msg_k("own", "error", source, decl_line, "@own(strict=true) extra undeclared sections: " + join(extra, ", "), "own_sections_extra"))
+    }
+    return out
+}
+
+fn check_own_order(lines, decl, source: string) {
+    let mut out = []
+    if decl["order"] != "sequential" { return out }
+    let declared = decl["sections"]
+    let prefix = decl["prefix"]
+    let decl_line = decl["decl_start"]
+    let actual = extract_own_sections(lines, prefix)
+    let mut positions = []
+    for d in declared {
+        let mut pos = -1
+        let mut idx = 0
+        for a in actual {
+            if a == d { pos = idx; break }
+            idx = idx + 1
+        }
+        positions = positions.push(pos)
+    }
+    let mut prev = -1
+    let mut violating = ""
+    let mut violated = false
+    let mut i = 0
+    for p in positions {
+        if p >= 0 {
+            if p <= prev {
+                violated = true
+                violating = declared[i]
+                break
+            }
+            prev = p
+        }
+        i = i + 1
+    }
+    if violated {
+        out = out.push(mk_msg_k("own", "error", source, decl_line, "@own(order=sequential) '" + violating + "' out of declared order", "own_order_violation"))
+    }
+    return out
+}
