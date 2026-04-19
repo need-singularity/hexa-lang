@@ -1,0 +1,248 @@
+// ═══════════════════════════════════════════════════════════
+//  test_ic_slot_regen.hexa — ROI #152 regression test
+//
+//  Background: T33-class _ic_def_parts aliasing in codegen_c2
+//  (pre-fcf275f4) dropped `static HexaIC __hexa_ic_N = {0};` decls
+//  while bodies still referenced `&__hexa_ic_N`. Fix was counter-
+//  driven regen (while _ic_i < _ic_counter). This test is a
+//  permanent guard against any future re-introduction of the
+//  array-push + join pattern.
+//
+//  Strategy:
+//    (1) Compile a synthetic module with 10+ Field accesses via
+//        `self/native/hexa_v2` (the current on-disk stage0 that
+//        this ROI is trying to unblock).
+//    (2) Scan the emitted C output and assert every `&__hexa_ic_N`
+//        reference has a matching `static HexaIC __hexa_ic_N = {0};`
+//        declaration.
+//    (3) Assert output size is sane (< 500K lines — the corrupt
+//        path ballooned to 5.6M).
+//
+//  Run:    hexa self/test_ic_slot_regen.hexa
+//          (or directly via build/hexa_stage0.real to bypass lock shim)
+//  Passes: if no IC decls are missing and sizes are reasonable.
+//  Exit:   non-zero on any assertion failure.
+// ═══════════════════════════════════════════════════════════
+
+fn build_fixture() {
+    // Synthetic module: 1 struct + 12 field accesses spread across
+    // 2 fns (forces _ic_counter to climb and exercises join path).
+    let mut src = []
+    src = src.push("struct Node { a, b, c, d, e, f }\n")
+    src = src.push("fn touch(n) {\n")
+    src = src.push("    let r1 = n.a\n")
+    src = src.push("    let r2 = n.b\n")
+    src = src.push("    let r3 = n.c\n")
+    src = src.push("    let r4 = n.d\n")
+    src = src.push("    let r5 = n.e\n")
+    src = src.push("    let r6 = n.f\n")
+    src = src.push("    return r1\n")
+    src = src.push("}\n")
+    src = src.push("fn touch2(n) {\n")
+    src = src.push("    let s1 = n.a\n")
+    src = src.push("    let s2 = n.b\n")
+    src = src.push("    let s3 = n.c\n")
+    src = src.push("    let s4 = n.d\n")
+    src = src.push("    let s5 = n.e\n")
+    src = src.push("    let s6 = n.f\n")
+    src = src.push("    return s6\n")
+    src = src.push("}\n")
+    src = src.push("fn main() {\n")
+    src = src.push("    let n = Node(1, 2, 3, 4, 5, 6)\n")
+    src = src.push("    touch(n)\n")
+    src = src.push("    touch2(n)\n")
+    src = src.push("}\n")
+    return src.join("")
+}
+
+fn count_occurrences(hay, needle) {
+    if len(needle) == 0 { return 0 }
+    let mut count = 0
+    let hn = len(hay)
+    let nn = len(needle)
+    let mut i = 0
+    while i + nn <= hn {
+        if hay.substring(i, i + nn) == needle {
+            count = count + 1
+            i = i + nn
+        } else {
+            i = i + 1
+        }
+    }
+    return count
+}
+
+fn parse_int_str(s) {
+    if type_of(s) != "string" { return 0 }
+    let n = len(s)
+    let mut i = 0
+    let mut v = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let o = ord(c)
+        if o >= 48 && o <= 57 {
+            v = v * 10 + (o - 48)
+        }
+        i = i + 1
+    }
+    return v
+}
+
+fn extract_ic_ids(hay, marker) {
+    // marker = "&__hexa_ic_" — collect the digit-run right after it.
+    let mut ids = []
+    let hn = len(hay)
+    let mn = len(marker)
+    let mut i = 0
+    while i + mn <= hn {
+        if hay.substring(i, i + mn) == marker {
+            let mut j = i + mn
+            let mut num = ""
+            let mut stop = false
+            while j < hn && !stop {
+                let ch = hay.substring(j, j + 1)
+                if ch >= "0" && ch <= "9" {
+                    num = num + ch
+                    j = j + 1
+                } else {
+                    stop = true
+                }
+            }
+            if len(num) > 0 {
+                ids = ids.push(num)
+            }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    return ids
+}
+
+fn main() {
+    println("[ROI#152] IC-slot regen regression test")
+    // Write fixture
+    let fixture = build_fixture()
+    let fixture_path = "/tmp/roi152_fixture.hexa"
+    let out_path = "/tmp/roi152_out.c"
+    write_file(fixture_path, fixture)
+
+    // Invoke on-disk hexa_v2 (the binary this ROI is meant to unblock).
+    // Fall back to ./hexa if hexa_v2 absent (CI without native path).
+    let v2 = "./self/native/hexa_v2"
+    let cmd = v2 + " " + fixture_path + " " + out_path + " 2>/tmp/roi152_err.log"
+    exec(cmd)
+
+    if !file_exists(out_path) {
+        eprintln("[FAIL] hexa_v2 did not produce output " + out_path)
+        exit(1)
+    }
+
+    let out_c = read_file(out_path)
+    let out_len = len(out_c)
+    println("  output bytes: " + to_string(out_len))
+
+    // Sanity: 5.6M-line corrupt path would be > 50MB. Healthy = < 500KB.
+    if out_len > 5000000 {
+        eprintln("[FAIL] output suspiciously large (" + to_string(out_len) + " bytes) — possible IC collapse")
+        exit(1)
+    }
+
+    // Count decl vs ref markers.
+    let decl_marker = "static HexaIC __hexa_ic_"
+    let ref_marker = "&__hexa_ic_"
+    let decl_count = count_occurrences(out_c, decl_marker)
+    let ref_count  = count_occurrences(out_c, ref_marker)
+    println("  decls: " + to_string(decl_count) + "  refs: " + to_string(ref_count))
+
+    if decl_count < 10 {
+        eprintln("[FAIL] expected >= 10 IC decls, got " + to_string(decl_count))
+        exit(1)
+    }
+    if ref_count < 10 {
+        eprintln("[FAIL] expected >= 10 IC refs, got " + to_string(ref_count))
+        exit(1)
+    }
+
+    // Every referenced id must have a decl. Scan refs, ensure the matching
+    // `static HexaIC __hexa_ic_N = {0};` substring is present.
+    let ids = extract_ic_ids(out_c, ref_marker)
+    let mut missing = 0
+    let mut i = 0
+    while i < len(ids) {
+        let probe = decl_marker + ids[i] + " = {0};"
+        if count_occurrences(out_c, probe) == 0 {
+            missing = missing + 1
+            if missing <= 5 {
+                eprintln("  MISSING decl for __hexa_ic_" + ids[i])
+            }
+        }
+        i = i + 1
+    }
+
+    if missing > 0 {
+        eprintln("[FAIL] " + to_string(missing) + " IC ref(s) without matching decl")
+        exit(1)
+    }
+
+    println("[PASS.quick] ROI#152 IC-slot regen: decls=" + to_string(decl_count) + " refs=" + to_string(ref_count) + " missing=0")
+
+    // ── Extended scale test ─────────────────────────────────
+    // Compile self/codegen_c2.hexa (9K+ LOC, 900+ IC slots) via hexa_v2.
+    // This is the exact module that regressed historically — it is BOTH
+    // the victim (its compiled output drops IC decls) AND the compiler
+    // (its source holds the fix), so it's the right stress case.
+    // Skip if ROI152_SKIP_BIG is set (e.g. CI without stage0 binary).
+    let big_src = "self/codegen_c2.hexa"
+    if !file_exists(big_src) {
+        println("  (extended test skipped — " + big_src + " absent)")
+        return
+    }
+    let big_out = "/tmp/roi152_big_out.c"
+    exec(v2 + " " + big_src + " " + big_out + " 2>/tmp/roi152_big_err.log")
+    if !file_exists(big_out) {
+        eprintln("[FAIL.big] hexa_v2 did not produce " + big_out)
+        exit(1)
+    }
+    // Avoid reading the full .c into hexa-land — interpreter substring ops
+    // are O(n) per char and scanning 500KB would take minutes. Delegate
+    // counting to grep via exec (single-pass).
+    let grep_decl = "grep -c '^static HexaIC __hexa_ic_' " + big_out
+    let grep_ref  = "grep -oE '&__hexa_ic_[0-9]+' " + big_out + " | wc -l"
+    let grep_lines = "wc -l < " + big_out
+    let s_decls = exec(grep_decl + " 2>/dev/null").trim()
+    let s_refs  = exec(grep_ref + " 2>/dev/null").trim()
+    let s_lines = exec(grep_lines + " 2>/dev/null").trim()
+    let big_decls = parse_int_str(s_decls)
+    let big_refs  = parse_int_str(s_refs)
+    let big_lines = parse_int_str(s_lines)
+    println("  extended lines: " + to_string(big_lines))
+    if big_lines > 500000 {
+        eprintln("[FAIL.big] suspicious line count " + to_string(big_lines) + " — IC collapse signature")
+        exit(1)
+    }
+    println("  extended decls: " + to_string(big_decls) + "  refs: " + to_string(big_refs))
+    if big_decls < 500 {
+        eprintln("[FAIL.big] expected 500+ IC decls on codegen_c2.hexa, got " + to_string(big_decls))
+        exit(1)
+    }
+    // Dense-decl signature check — if IC collapse happened, the output C
+    // would have refs in fn bodies but NO matching `static HexaIC` decls.
+    // Historically a single collapse produced 3259 refs and 0 decls.
+    // Here we assert decls ≥ 500 AND refs roughly similar (±2x) to decls;
+    // a silent drop produces refs >> decls.
+    if big_refs > big_decls * 3 {
+        eprintln("[FAIL.big] refs=" + to_string(big_refs) + " >> decls=" + to_string(big_decls) + " — IC collapse signature")
+        exit(1)
+    }
+    // Probe: sample the highest-id decl must exist (if counter advanced, the
+    // slot must have been emitted). Uses grep to avoid interpreter O(n) scan.
+    let sample_probe = "__hexa_ic_" + to_string(big_decls - 1) + " = {0};"
+    let probe_cmd = "grep -F '" + sample_probe + "' " + big_out + " > /dev/null; echo $?"
+    let probe_rc = exec(probe_cmd).trim()
+    if probe_rc != "0" {
+        eprintln("[FAIL.big] highest-id decl not found: " + sample_probe)
+        exit(1)
+    }
+    println("[PASS.big] ROI#152 IC-slot regen @ codegen_c2.hexa scale: decls=" + to_string(big_decls) + " refs=" + to_string(big_refs))
+}

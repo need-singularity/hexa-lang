@@ -154,6 +154,25 @@ fn lower_binop_mnemonic(op_str) {
     if op_str == "div" { return "div" }
     if op_str == "rem" { return "mod" }   // AST uses "rem"; IR opcode is "mod"
     if op_str == "mod" { return "mod" }
+    // ── P7-6a GAP-2: comparison ops (route to cmp helpers, result is bool).
+    if op_str == "eq" { return "eq" }
+    if op_str == "ne" { return "ne" }
+    if op_str == "lt" { return "lt" }
+    if op_str == "le" { return "le" }
+    if op_str == "gt" { return "gt" }
+    if op_str == "ge" { return "ge" }
+    // ── P7-6a GAP-3: bitwise / shift (builder + ir_to_arm64 support present).
+    if op_str == "bitand" { return "bitand" }
+    if op_str == "bitor"  { return "bitor" }
+    if op_str == "bitxor" { return "bitxor" }
+    if op_str == "shl"    { return "shl" }
+    if op_str == "shr"    { return "shr" }
+    // Logical and/or/xor — keep the caller-side (mul / sum-prod) synth in
+    // bld_and / bld_or / bld_xor; they are reachable via bld_* directly
+    // but BinOp op_str = "and"/"or"/"xor" routes here for parity.
+    if op_str == "and" { return "and" }
+    if op_str == "or"  { return "or" }
+    if op_str == "xor" { return "xor" }
     return ""   // unsupported
 }
 
@@ -171,6 +190,23 @@ fn lower_binop_from_vids(m, b, op_str, lhs_vid, rhs_vid, ty) {
     if mnem == "mul" { return bld_mul(m, b, lhs_vid, rhs_vid, ty) }
     if mnem == "div" { return bld_div(m, b, lhs_vid, rhs_vid, ty) }
     if mnem == "mod" { return bld_modulo(m, b, lhs_vid, rhs_vid, ty) }
+    // Comparisons — bool-typed result.
+    if mnem == "eq" { return bld_cmp_eq(m, b, lhs_vid, rhs_vid) }
+    if mnem == "ne" { return bld_cmp_ne(m, b, lhs_vid, rhs_vid) }
+    if mnem == "lt" { return bld_cmp_lt(m, b, lhs_vid, rhs_vid) }
+    if mnem == "le" { return bld_cmp_le(m, b, lhs_vid, rhs_vid) }
+    if mnem == "gt" { return bld_cmp_gt(m, b, lhs_vid, rhs_vid) }
+    if mnem == "ge" { return bld_cmp_ge(m, b, lhs_vid, rhs_vid) }
+    // Bitwise / shift — i64 by default.
+    if mnem == "bitand" { return bld_band(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "bitor"  { return bld_bor(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "bitxor" { return bld_bxor(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "shl"    { return bld_shl(m, b, lhs_vid, rhs_vid, ty) }
+    if mnem == "shr"    { return bld_shr(m, b, lhs_vid, rhs_vid, ty) }
+    // Logical — reuse existing synth helpers (bool-typed).
+    if mnem == "and" { return bld_and(m, b, lhs_vid, rhs_vid) }
+    if mnem == "or"  { return bld_or(m, b, lhs_vid, rhs_vid) }
+    if mnem == "xor" { return bld_xor(m, b, lhs_vid, rhs_vid) }
     return -1
 }
 
@@ -280,7 +316,55 @@ fn lower_expr(m, b, e, env) {
         }
         return bld_call(m, b, fid, arg_vids, "i64")
     }
-    // TODO: lower Expr kind (k) — if/match/block/lambda/array etc.
+    // ── P7-6a GAP-1: minimal If / Block / IfExpr dispatch ─────
+    //
+    // Block — evaluate statement children L→R, return last value (expr-level
+    // block). Caller-side stmt driver handles Stmt children; here we accept
+    // the simplest shape: e.body / e.args array of child Expr nodes, last
+    // value is the block result. Unknown shape → -1.
+    if k == "block" || e.kind == "Block" {
+        let mut last = -1
+        let mut bi = 0
+        while bi < len(e.args) {
+            let cv = lower_expr(m, b, e.args[bi], env)
+            if cv >= 0 { last = cv }
+            bi = bi + 1
+        }
+        if last >= 0 { return last }
+        return bld_const_i64(m, b, 0)
+    }
+    // IfExpr / If — value-producing if. Requires a phi merge. `e.left` = cond,
+    // `e.right` = then-expr, `e.else_body` = else-expr. Any of the three may
+    // be missing in a stmt-only If; unknown → -1.
+    if k == "if" || e.kind == "If" || e.kind == "IfExpr" {
+        let cond_vid = lower_expr(m, b, e.left, env)
+        if cond_vid < 0 { return -1 }
+        let skel = lower_if_expr_skeleton(m, b, cond_vid)
+        let then_bb = skel[0]
+        let else_bb = skel[1]
+        let end_bb  = skel[2]
+        // then
+        builder_switch_to(b, then_bb)
+        let then_vid = lower_expr(m, b, e.right, env)
+        let then_final = b.current_block
+        bld_jump(m, b, end_bb)
+        // else
+        builder_switch_to(b, else_bb)
+        let else_raw = e.else_body
+        let mut else_vid = -1
+        if else_raw != "" {
+            else_vid = lower_expr(m, b, else_raw, env)
+        }
+        if else_vid < 0 {
+            else_vid = bld_const_i64(m, b, 0)
+        }
+        let else_final = b.current_block
+        bld_jump(m, b, end_bb)
+        // merge
+        return lower_if_expr_close(m, b, end_bb, then_final, then_vid,
+                                             else_final, else_vid, "i64")
+    }
+    // TODO: lower Expr kind (k) — match/lambda/array/tuple/maplit/range etc.
     return -1
 }
 

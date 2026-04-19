@@ -1,0 +1,613 @@
+// ═══════════════════════════════════════════════════════════
+//  test_peephole_arm64_tier2.hexa — ROI #166 ARM64 tier-2 tests
+//
+//  Verifies 5 rewrite rules added to self/codegen/peephole.hexa:
+//    8.  CMP Xn,#0 ; B.EQ → CBZ Xn,target ; NOP
+//    9.  CMP Xn,#0 ; B.NE → CBNZ Xn,target ; NOP
+//    10. MUL Xt,Xa,Xb ; ADD Xd,Xc,Xt → MADD Xd,Xa,Xb,Xc ; NOP
+//    11. MUL Xt,Xa,Xb ; SUB Xd,Xc,Xt → MSUB Xd,Xa,Xb,Xc ; NOP
+//    12. MOV Xd,#0 ; STR Xd,[Xn,#imm] → NOP ; STR XZR,[Xn,#imm]
+//  + negative tests (non-matching patterns must not fuse).
+//
+//  Standalone — mirrors decoder/encoder math from peephole.hexa so the
+//  suite runs without module-loader (same style as test_peephole_arm64.hexa).
+//
+//  Run: ./hexa self/test_peephole_arm64_tier2.hexa
+// ═══════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name: string, cond: bool) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ─── Byte-buffer helpers (mirror peephole.hexa) ────────────────
+fn t_nop_word() -> int { return 3573751839 } // 0xd503201f
+
+fn t_read_word_le(code: [int], off: int) -> int {
+    return code[off] + code[off + 1] * 256 + code[off + 2] * 65536 + code[off + 3] * 16777216
+}
+
+fn t_write_word_le(code: [int], off: int, word: int) -> [int] {
+    let b0 = word % 256
+    let b1 = (word / 256) % 256
+    let b2 = (word / 65536) % 256
+    let b3 = (word / 16777216) % 256
+    let mut out = []
+    let mut i = 0
+    let n = len(code)
+    while i < n {
+        if i == off {
+            out = out.push(b0)
+        } else if i == off + 1 {
+            out = out.push(b1)
+        } else if i == off + 2 {
+            out = out.push(b2)
+        } else if i == off + 3 {
+            out = out.push(b3)
+        } else {
+            out = out.push(code[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn t_push_word(buf: [int], word: int) -> [int] {
+    let mut b = buf
+    b = b.push(word % 256)
+    b = b.push((word / 256) % 256)
+    b = b.push((word / 65536) % 256)
+    b = b.push((word / 16777216) % 256)
+    return b
+}
+
+// ─── Tier-2 decoders (mirror peephole.hexa) ───────────────────
+
+fn t_decode_cmp_imm(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 482 { return [0 - 1, 0 - 1] }
+    let shift = (word / 4194304) % 4
+    if shift != 0 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    if rd != 31 { return [0 - 1, 0 - 1] }
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rn, imm12]
+}
+
+fn t_decode_bcond(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 84 { return [0 - 1, 0] }
+    let bit4 = (word / 16) % 2
+    if bit4 != 0 { return [0 - 1, 0] }
+    let cond = word % 16
+    let imm19 = (word / 32) % 524288
+    return [cond, imm19]
+}
+
+fn t_decode_mul(word: int) -> [int] {
+    let top11 = (word / 2097152) % 2048
+    if top11 != 1240 { return [0 - 1, 0 - 1, 0 - 1] }
+    let ra = (word / 1024) % 32
+    if ra != 31 { return [0 - 1, 0 - 1, 0 - 1] }
+    let bit15 = (word / 32768) % 2
+    if bit15 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+fn t_decode_add_reg(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 139 { return [0 - 1, 0 - 1, 0 - 1] }
+    let mid = (word / 2097152) % 8
+    if mid != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let imm6 = (word / 1024) % 64
+    if imm6 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+fn t_decode_sub_reg(word: int) -> [int] {
+    let top8 = (word / 16777216) % 256
+    if top8 != 203 { return [0 - 1, 0 - 1, 0 - 1] }
+    let mid = (word / 2097152) % 8
+    if mid != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let imm6 = (word / 1024) % 64
+    if imm6 != 0 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rn = (word / 32) % 32
+    let rm = (word / 65536) % 32
+    return [rd, rn, rm]
+}
+
+fn t_decode_mov(word: int) -> [int] {
+    let top11 = (word / 2097152) % 2048
+    if top11 != 1360 { return [0 - 1, 0 - 1] }
+    let rn_field = (word / 32) % 32
+    if rn_field != 31 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    let rm = (word / 65536) % 32
+    return [rd, rm]
+}
+
+fn t_decode_movz(word: int) -> [int] {
+    let top9 = (word / 8388608) % 512
+    if top9 != 421 { return [0 - 1, 0 - 1] }
+    let hw = (word / 2097152) % 4
+    if hw != 0 { return [0 - 1, 0 - 1] }
+    let rd = word % 32
+    let imm16 = (word / 32) % 65536
+    return [rd, imm16]
+}
+
+fn t_decode_str_uoff(word: int) -> [int] {
+    let top10 = (word / 4194304) % 1024
+    if top10 != 996 { return [0 - 1, 0 - 1, 0 - 1] }
+    let rt = word % 32
+    let rn = (word / 32) % 32
+    let imm12 = (word / 1024) % 4096
+    return [rt, rn, imm12]
+}
+
+fn t_decode_cbz(word: int) -> [int] {
+    // Top 8 bits = 0xB4 = 180.
+    let top8 = (word / 16777216) % 256
+    if top8 != 180 { return [0 - 1, 0] }
+    // sf bit (bit31) must be 1 for 64-bit. Handled by the top8 match (0xB4 has bit31=1).
+    let rt = word % 32
+    let imm19 = (word / 32) % 524288
+    return [rt, imm19]
+}
+
+fn t_decode_cbnz(word: int) -> [int] {
+    // Top 8 bits = 0xB5 = 181.
+    let top8 = (word / 16777216) % 256
+    if top8 != 181 { return [0 - 1, 0] }
+    let rt = word % 32
+    let imm19 = (word / 32) % 524288
+    return [rt, imm19]
+}
+
+// ─── Tier-2 encoders (match peephole.hexa) ────────────────────
+
+fn t_enc_cbz(rt: int, imm19: int) -> int {
+    let m = imm19 % 524288
+    if m < 0 { return 3019898880 + (m + 524288) * 32 + rt }
+    return 3019898880 + m * 32 + rt
+}
+
+fn t_enc_cbnz(rt: int, imm19: int) -> int {
+    let m = imm19 % 524288
+    if m < 0 { return 3036676096 + (m + 524288) * 32 + rt }
+    return 3036676096 + m * 32 + rt
+}
+
+fn t_enc_madd(rd: int, rn: int, rm: int, ra: int) -> int {
+    return 2600468480 + rm * 65536 + ra * 1024 + rn * 32 + rd
+}
+
+fn t_enc_msub(rd: int, rn: int, rm: int, ra: int) -> int {
+    return 2600501248 + rm * 65536 + ra * 1024 + rn * 32 + rd
+}
+
+fn t_enc_str_uoff(rt: int, rn: int, imm12: int) -> int {
+    return 4177526784 + imm12 * 1024 + rn * 32 + rt
+}
+
+// ─── Input-side encoders (producer side — how ir_to_arm64 emits) ──
+
+// CMP Xn, #imm12 (= SUBS XZR, Xn, #imm12 shift=0, 64-bit).
+// 0xF1000000 = 4043309056. Rd=31 fixed.
+fn enc_cmp_imm(rn: int, imm12: int) -> int {
+    return 4043309056 + imm12 * 1024 + rn * 32 + 31
+}
+
+// B.cond imm19 — 0x54000000 = 1409286144, bit4=0, cond low 4.
+fn enc_bcond(cond: int, imm19: int) -> int {
+    let m = imm19 % 524288
+    if m < 0 { return 1409286144 + (m + 524288) * 32 + cond }
+    return 1409286144 + m * 32 + cond
+}
+
+// MUL Xd, Xn, Xm  (= MADD Xd,Xn,Xm,XZR). Base 0x9B000000 = 2600468480.
+fn enc_mul(rd: int, rn: int, rm: int) -> int {
+    return 2600468480 + rm * 65536 + 31 * 1024 + rn * 32 + rd
+}
+
+// ADD Xd, Xn, Xm (register form, shift=0, imm6=0). Base 0x8B000000 = 2332033024.
+fn enc_add_reg(rd: int, rn: int, rm: int) -> int {
+    return 2332033024 + rm * 65536 + rn * 32 + rd
+}
+
+// SUB Xd, Xn, Xm (register form, shift=0, imm6=0). Base 0xCB000000 = 3405774848.
+fn enc_sub_reg(rd: int, rn: int, rm: int) -> int {
+    return 3405774848 + rm * 65536 + rn * 32 + rd
+}
+
+// MOVZ Xd, #imm16 LSL 0. Base 0xD2800000 = 3531603968.
+fn enc_movz(rd: int, imm16: int) -> int {
+    return 3531603968 + imm16 * 32 + rd
+}
+
+// MOV Xd, XZR (ORR form). Base 0xAA1F03E0 = 2854159328.
+fn enc_mov_xzr(rd: int) -> int { return 2854159328 + rd }
+
+// STR Xt, [Xn, #imm12*8]. Base 0xF9000000 = 4177526784.
+fn enc_str_uoff(rt: int, rn: int, imm12: int) -> int {
+    return 4177526784 + imm12 * 1024 + rn * 32 + rt
+}
+
+// ─── Tier-2 pass repro ────────────────────────────────────────
+
+struct Peep2Counts {
+    cmp_beq_to_cbz: int,
+    cmp_bne_to_cbnz: int,
+    mul_add_fuse: int,
+    mul_sub_fuse: int,
+    movz_str_to_strxzr: int
+}
+
+struct Peep2Run {
+    code: [int],
+    counts: Peep2Counts
+}
+
+fn peep2_counts_zero() -> Peep2Counts {
+    return Peep2Counts { cmp_beq_to_cbz: 0, cmp_bne_to_cbnz: 0, mul_add_fuse: 0, mul_sub_fuse: 0, movz_str_to_strxzr: 0 }
+}
+
+fn peep2_run(code: [int]) -> Peep2Run {
+    let mut c = code
+    let mut cnt = peep2_counts_zero()
+    let nop = t_nop_word()
+    if len(c) % 4 != 0 { return Peep2Run { code: c, counts: cnt } }
+
+    // Pass — CMP + B.EQ → CBZ
+    let mut off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let cp = t_decode_cmp_imm(w1)
+        let bp = t_decode_bcond(w2)
+        let cn = cp[0]
+        let ci = cp[1]
+        let cond = bp[0]
+        let imm19 = bp[1]
+        if cn >= 0 && ci == 0 && cond == 0 {
+            let neg = imm19 / 262144
+            let new_imm = imm19 + 1
+            let overflowed = (neg == 0 && new_imm >= 262144) || (neg == 1 && new_imm >= 524288)
+            if overflowed == false {
+                c = t_write_word_le(c, off, t_enc_cbz(cn, new_imm))
+                c = t_write_word_le(c, off + 4, nop)
+                cnt.cmp_beq_to_cbz = cnt.cmp_beq_to_cbz + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Pass — CMP + B.NE → CBNZ
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let cp = t_decode_cmp_imm(w1)
+        let bp = t_decode_bcond(w2)
+        let cn = cp[0]
+        let ci = cp[1]
+        let cond = bp[0]
+        let imm19 = bp[1]
+        if cn >= 0 && ci == 0 && cond == 1 {
+            let neg = imm19 / 262144
+            let new_imm = imm19 + 1
+            let overflowed = (neg == 0 && new_imm >= 262144) || (neg == 1 && new_imm >= 524288)
+            if overflowed == false {
+                c = t_write_word_le(c, off, t_enc_cbnz(cn, new_imm))
+                c = t_write_word_le(c, off + 4, nop)
+                cnt.cmp_bne_to_cbnz = cnt.cmp_bne_to_cbnz + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Pass — MUL + ADD → MADD
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let mp = t_decode_mul(w1)
+        let ap = t_decode_add_reg(w2)
+        let mrd = mp[0]
+        let mrn = mp[1]
+        let mrm = mp[2]
+        let ard = ap[0]
+        let arn = ap[1]
+        let arm = ap[2]
+        if mrd >= 0 && ard >= 0 && arm == mrd && arn != mrd && mrd != 31 && ard != 31 {
+            c = t_write_word_le(c, off, t_enc_madd(ard, mrn, mrm, arn))
+            c = t_write_word_le(c, off + 4, nop)
+            cnt.mul_add_fuse = cnt.mul_add_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Pass — MUL + SUB → MSUB
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let mp = t_decode_mul(w1)
+        let sp = t_decode_sub_reg(w2)
+        let mrd = mp[0]
+        let mrn = mp[1]
+        let mrm = mp[2]
+        let srd = sp[0]
+        let srn = sp[1]
+        let srm = sp[2]
+        if mrd >= 0 && srd >= 0 && srm == mrd && srn != mrd && mrd != 31 && srd != 31 {
+            c = t_write_word_le(c, off, t_enc_msub(srd, mrn, mrm, srn))
+            c = t_write_word_le(c, off + 4, nop)
+            cnt.mul_sub_fuse = cnt.mul_sub_fuse + 1
+            off = off + 8
+        } else {
+            off = off + 4
+        }
+    }
+
+    // Pass — MOV Xd,#0 ; STR Xd,... → NOP ; STR XZR,...
+    off = 0
+    while off + 8 <= len(c) {
+        let w1 = t_read_word_le(c, off)
+        let w2 = t_read_word_le(c, off + 4)
+        let mov_parts = t_decode_mov(w1)
+        let mut mrd = mov_parts[0]
+        let mrs = mov_parts[1]
+        let mut is_zero = (mrd >= 0 && mrs == 31 && mrd != 31)
+        if is_zero == false {
+            let mz = t_decode_movz(w1)
+            if mz[0] >= 0 && mz[1] == 0 && mz[0] != 31 {
+                mrd = mz[0]
+                is_zero = true
+            }
+        }
+        if is_zero == true {
+            let sp = t_decode_str_uoff(w2)
+            let srt = sp[0]
+            let srn = sp[1]
+            let simm = sp[2]
+            if srt >= 0 && srt == mrd && srn != mrd {
+                c = t_write_word_le(c, off, t_nop_word())
+                c = t_write_word_le(c, off + 4, t_enc_str_uoff(31, srn, simm))
+                cnt.movz_str_to_strxzr = cnt.movz_str_to_strxzr + 1
+                off = off + 8
+            } else {
+                off = off + 4
+            }
+        } else {
+            off = off + 4
+        }
+    }
+
+    return Peep2Run { code: c, counts: cnt }
+}
+
+fn count_nops(buf: [int]) -> int {
+    let mut n = 0
+    let mut off = 0
+    while off + 4 <= len(buf) {
+        if t_read_word_le(buf, off) == t_nop_word() { n = n + 1 }
+        off = off + 4
+    }
+    return n
+}
+
+// ═══════════════════════════════════════
+//  Test 1 — CMP + B.EQ → CBZ
+// ═══════════════════════════════════════
+fn test_cmp_beq_to_cbz() {
+    let mut buf = []
+    // CMP X3, #0 ; B.EQ +8 (imm19=2 → branch 2 words forward from B.EQ)
+    buf = t_push_word(buf, enc_cmp_imm(3, 0))
+    buf = t_push_word(buf, enc_bcond(0, 2))
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    let cbz = t_decode_cbz(w0)
+    let rt = cbz[0]
+    let imm19 = cbz[1]
+    check("CMP+B.EQ→CBZ: counter", r.counts.cmp_beq_to_cbz == 1)
+    check("CMP+B.EQ→CBZ: slot 0 is CBZ (top8==0xB4)", rt >= 0)
+    check("CMP+B.EQ→CBZ: rt==3", rt == 3)
+    // imm19 adjusted from B.cond's 2 (from +4) → CBZ's 3 (from 0) — same absolute target.
+    check("CMP+B.EQ→CBZ: imm19 adjusted (+1 word)", imm19 == 3)
+    check("CMP+B.EQ→CBZ: slot 1 is NOP", count_nops(r.code) == 1)
+}
+
+// ═══════════════════════════════════════
+//  Test 2 — CMP + B.NE → CBNZ
+// ═══════════════════════════════════════
+fn test_cmp_bne_to_cbnz() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_cmp_imm(7, 0))
+    buf = t_push_word(buf, enc_bcond(1, 5)) // B.NE with imm19=5
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    let cbnz = t_decode_cbnz(w0)
+    let rt = cbnz[0]
+    let imm19 = cbnz[1]
+    check("CMP+B.NE→CBNZ: counter", r.counts.cmp_bne_to_cbnz == 1)
+    check("CMP+B.NE→CBNZ: slot 0 is CBNZ (top8==0xB5)", rt >= 0)
+    check("CMP+B.NE→CBNZ: rt==7", rt == 7)
+    check("CMP+B.NE→CBNZ: imm19 adjusted (+1)", imm19 == 6)
+}
+
+// ═══════════════════════════════════════
+//  Test 3 — MUL + ADD → MADD
+// ═══════════════════════════════════════
+fn test_mul_add_fuse() {
+    let mut buf = []
+    // MUL X5, X2, X3 ; ADD X9, X4, X5 → MADD X9, X2, X3, X4
+    buf = t_push_word(buf, enc_mul(5, 2, 3))
+    buf = t_push_word(buf, enc_add_reg(9, 4, 5))
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    // MADD X9, X2, X3, X4 = 2600468480 + 3*65536 + 4*1024 + 2*32 + 9
+    let expected = 2600468480 + 3 * 65536 + 4 * 1024 + 2 * 32 + 9
+    check("MUL+ADD→MADD: counter", r.counts.mul_add_fuse == 1)
+    check("MUL+ADD→MADD: slot 0 is MADD X9,X2,X3,X4", w0 == expected)
+    check("MUL+ADD→MADD: slot 1 is NOP", count_nops(r.code) == 1)
+}
+
+// ═══════════════════════════════════════
+//  Test 4 — MUL + SUB → MSUB
+// ═══════════════════════════════════════
+fn test_mul_sub_fuse() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_mul(6, 1, 2))
+    buf = t_push_word(buf, enc_sub_reg(10, 3, 6))
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    // MSUB X10, X1, X2, X3 = 2600501248 + 2*65536 + 3*1024 + 1*32 + 10
+    let expected = 2600501248 + 2 * 65536 + 3 * 1024 + 1 * 32 + 10
+    check("MUL+SUB→MSUB: counter", r.counts.mul_sub_fuse == 1)
+    check("MUL+SUB→MSUB: slot 0 is MSUB X10,X1,X2,X3", w0 == expected)
+    check("MUL+SUB→MSUB: slot 1 is NOP", count_nops(r.code) == 1)
+}
+
+// ═══════════════════════════════════════
+//  Test 5 — MOV Xd,XZR + STR Xd → STR XZR
+// ═══════════════════════════════════════
+fn test_mov_str_to_strxzr() {
+    let mut buf = []
+    // Use post-rule-5 form: MOV X8, XZR ; STR X8, [X5, #16] (imm12=2 scaled ×8)
+    buf = t_push_word(buf, enc_mov_xzr(8))
+    buf = t_push_word(buf, enc_str_uoff(8, 5, 2))
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    let w1 = t_read_word_le(r.code, 4)
+    // Slot 0 should be NOP, slot 1 should be STR XZR, [X5, #16]
+    let expected_str = enc_str_uoff(31, 5, 2)
+    check("MOV+STR→STR XZR: counter", r.counts.movz_str_to_strxzr == 1)
+    check("MOV+STR→STR XZR: slot 0 is NOP", w0 == t_nop_word())
+    check("MOV+STR→STR XZR: slot 1 is STR XZR,[X5,#16]", w1 == expected_str)
+}
+
+// ═══════════════════════════════════════
+//  Test 6 — MOVZ Xd,#0 + STR Xd → STR XZR (raw form)
+// ═══════════════════════════════════════
+fn test_movz_str_to_strxzr() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_movz(12, 0))
+    buf = t_push_word(buf, enc_str_uoff(12, 6, 4))
+    let r = peep2_run(buf)
+    let w0 = t_read_word_le(r.code, 0)
+    let w1 = t_read_word_le(r.code, 4)
+    let expected_str = enc_str_uoff(31, 6, 4)
+    check("MOVZ#0+STR→STR XZR: counter", r.counts.movz_str_to_strxzr == 1)
+    check("MOVZ#0+STR→STR XZR: slot 0 is NOP", w0 == t_nop_word())
+    check("MOVZ#0+STR→STR XZR: slot 1 is STR XZR,[X6,#32]", w1 == expected_str)
+}
+
+// ═══════════════════════════════════════
+//  Test 7 — Negative: CMP with non-zero imm must NOT fuse
+// ═══════════════════════════════════════
+fn test_cmp_nonzero_no_fuse() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_cmp_imm(3, 7)) // CMP X3, #7 (non-zero)
+    buf = t_push_word(buf, enc_bcond(0, 2))
+    let r = peep2_run(buf)
+    check("CMP#7+B.EQ: no fuse (imm!=0)", r.counts.cmp_beq_to_cbz == 0)
+}
+
+// ═══════════════════════════════════════
+//  Test 8 — Negative: MUL result used as ADD Rn (accumulator) must NOT fuse
+// ═══════════════════════════════════════
+fn test_mul_add_accumulator_conflict() {
+    let mut buf = []
+    // MUL X5, X2, X3 ; ADD X9, X5, X4 — here Xt(X5) is in Rn pos, not Rm
+    buf = t_push_word(buf, enc_mul(5, 2, 3))
+    buf = t_push_word(buf, enc_add_reg(9, 5, 4))
+    let r = peep2_run(buf)
+    check("MUL+ADD: no fuse when Xt is ADD Rn", r.counts.mul_add_fuse == 0)
+}
+
+// ═══════════════════════════════════════
+//  Test 9 — Negative: MUL+ADD when accumulator == MUL dst must NOT fuse
+// ═══════════════════════════════════════
+fn test_mul_add_self_accumulator() {
+    let mut buf = []
+    // MUL X5, X2, X3 ; ADD X9, X5, X5 — Rn==Rm==Xt, conservative skip
+    buf = t_push_word(buf, enc_mul(5, 2, 3))
+    buf = t_push_word(buf, enc_add_reg(9, 5, 5))
+    let r = peep2_run(buf)
+    check("MUL+ADD: no fuse when Rn==Rm==Xt", r.counts.mul_add_fuse == 0)
+}
+
+// ═══════════════════════════════════════
+//  Test 10 — Negative: MOV+STR with different Rt must NOT rewrite
+// ═══════════════════════════════════════
+fn test_mov_str_different_rt() {
+    let mut buf = []
+    buf = t_push_word(buf, enc_mov_xzr(8))
+    buf = t_push_word(buf, enc_str_uoff(9, 5, 2)) // STR X9, not X8
+    let r = peep2_run(buf)
+    check("MOV+STR: no rewrite when STR.Rt != MOV.Rd", r.counts.movz_str_to_strxzr == 0)
+}
+
+// ═══════════════════════════════════════
+//  Test 11 — CBZ encoding sanity (independent of fusion)
+// ═══════════════════════════════════════
+fn test_cbz_encoding() {
+    // CBZ X5, +16 (imm19=4)
+    let w = t_enc_cbz(5, 4)
+    let d = t_decode_cbz(w)
+    check("CBZ encode/decode rt=5", d[0] == 5)
+    check("CBZ encode/decode imm19=4", d[1] == 4)
+}
+
+// ═══════════════════════════════════════
+//  Driver
+// ═══════════════════════════════════════
+fn run_all() {
+    test_cmp_beq_to_cbz()
+    test_cmp_bne_to_cbnz()
+    test_mul_add_fuse()
+    test_mul_sub_fuse()
+    test_mov_str_to_strxzr()
+    test_movz_str_to_strxzr()
+    test_cmp_nonzero_no_fuse()
+    test_mul_add_accumulator_conflict()
+    test_mul_add_self_accumulator()
+    test_mov_str_different_rt()
+    test_cbz_encoding()
+
+    println("")
+    println("═══════════════════════════════════════")
+    println("  ROI #166 peephole tier-2 tests")
+    println("  PASS: " + to_string(pass_count))
+    println("  FAIL: " + to_string(fail_count))
+    println("═══════════════════════════════════════")
+}
+
+run_all()

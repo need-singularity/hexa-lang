@@ -1,0 +1,413 @@
+// self/attrs/_own/contract.hexa — @contract semantics attr (ROI #150)
+//
+// Design
+// ─────────────────────────────────────────────────────────────
+// @contract 은 사전/사후 조건을 fn 시그니처 옆에 선언한다.
+//   · pre-assert  → fn body 진입 직전 evaluated. false → HEXA_CONTRACT_FAIL
+//   · post-assert → return 직전 evaluated. false → log+warn (soft).
+//   · bounds-elim → pre 에 `i < arr.len()` 형태가 있으면 arr[i] bounds check
+//                   codegen 에서 제거 후보. apply 지점은 ai_native_pass.
+//
+// 표면 문법 (stage0 파서는 이미 AttrKind 등록. ROI #1 에서 contract.hexa
+// bootstrap 완료. 본 attr 모듈은 meta/check/apply 를 @attr SSOT 로 노출):
+//   @contract(pre="x > 0", post="result > x")
+//   fn inc(x: int) -> int { return x + 1 }
+//
+//   @contract(requires: x > 0, ensures: result > 0)   ← legacy alias
+//   fn inc(x) { return x + 1 }
+//
+// HX11: `.contract-rules.json` 주입 가능.
+//   · severity_pre  "error" | "warn"   (default error)
+//   · severity_post "warn"  | "error"  (default warn)
+//   · enable_bounds_elim  bool         (default true)
+//
+// 본 파일 책임:
+//   (1) meta_contract                 — @attr 카탈로그 등록
+//   (2) find_contract_rules(source)   — HX11 rules loader
+//   (3) parse_contract_decl(lines)    — @contract(...) 파싱 (pre/post/requires/ensures)
+//   (4) check_contract(source, lines) — lint (빈 clause, 알 수 없는 key 등)
+//   (5) contract_bounds_elim_hint(pre_expr) — "i < arr.len()" 패턴 감지
+//   (6) contract_error_tag()          — runtime fail 태그 "HEXA_CONTRACT_FAIL"
+
+use "self/attrs/core"
+use "self/attrs/_lib/rules_loader"
+use "self/attrs/_lib/error_catalog"
+
+// ─── META ─────────────────────────────────────────────────────────
+
+fn meta_contract() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name = "contract"
+    m.category = "verification"
+    m.purpose = "사전/사후 조건 assertion + bounds elimination — @contract(pre, post)"
+    m.cost_rule = "pre-assert = 1 cmp+br. post-assert = 1 cmp (warn). bounds-elim = -1 bc per arr access."
+    m.side_effect = "pre-fail → HEXA_CONTRACT_FAIL (abort). post-fail → log+warn (non-fatal)."
+    m.requires = "pre/post expression 은 fn param 만 참조 (+ post 는 result). side-effect free."
+    m.auto_test = "self/test_contract.hexa — 4 cases (pass / pre-fail / post-fail / bounds-elim)"
+    m.example = "@contract(pre=\"x > 0\", post=\"result > x\")\nfn inc(x: int) -> int { return x + 1 }"
+    m.implemented = true
+    return m
+}
+
+// ─── HX11 RULES LOADER ────────────────────────────────────────────
+
+fn _global_contract_rules_path() -> string {
+    return "/Users/ghost/Dev/nexus/shared/config/contract_rules.json"
+}
+
+fn _contract_builtin_rules() {
+    let mut r = #{}
+    let mut meta = #{}
+    meta["project"] = "_builtin"
+    meta["version"] = 1
+    meta["inherit"] = false
+    r["_meta"] = meta
+
+    let mut rules = #{}
+    rules["severity_pre"] = "error"
+    rules["severity_post"] = "warn"
+    rules["enable_bounds_elim"] = true
+    r["rules"] = rules
+    return r
+}
+
+pub fn find_contract_rules(source: string) {
+    let loaded = find_attr_rules(source, "contract", _global_contract_rules_path())
+    if has_key(loaded, "rules") { return loaded }
+    return _contract_builtin_rules()
+}
+
+fn _ccfg_str(cfg, key: string, def: string) -> string {
+    if !has_key(cfg, key) { return def }
+    let v = cfg[key]
+    if type_of(v) == "string" { return v }
+    return def
+}
+
+fn _ccfg_bool(cfg, key: string, def: bool) -> bool {
+    if !has_key(cfg, key) { return def }
+    return cfg[key] == true
+}
+
+pub fn contract_severity_pre(rules) -> string {
+    if !has_key(rules, "rules") { return "error" }
+    return _ccfg_str(rules["rules"], "severity_pre", "error")
+}
+
+pub fn contract_severity_post(rules) -> string {
+    if !has_key(rules, "rules") { return "warn" }
+    return _ccfg_str(rules["rules"], "severity_post", "warn")
+}
+
+pub fn contract_bounds_elim_enabled(rules) -> bool {
+    if !has_key(rules, "rules") { return true }
+    return _ccfg_bool(rules["rules"], "enable_bounds_elim", true)
+}
+
+// ─── DECL PARSER ──────────────────────────────────────────────────
+// parse_contract_decl(lines, attr_line) →
+//   #{"found": bool, "pre": string, "post": string, "malformed": bool,
+//     "reason": string, "decl_start": int, "decl_end": int}
+//
+// 지원 key: pre / post / requires / ensures (legacy aliases)
+// 값 형태: "string" | bare_expr  — 내부는 모두 string 으로 정규화
+
+fn _strip_line_comment(line: string) -> string {
+    let t = line.trim()
+    if t.starts_with("//") { return "" }
+    return t
+}
+
+fn _find_contract_open(lines, attr_line: int) -> int {
+    if attr_line >= 1 && attr_line <= len(lines) {
+        let t = lines[attr_line - 1].trim()
+        if t.contains("@contract(") { return attr_line }
+    }
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        let t = _strip_line_comment(line)
+        if t.contains("@contract(") { return i }
+    }
+    return -1
+}
+
+// 괄호 균형 본문 추출 [body_str, end_line, malformed, reason]
+fn _extract_contract_body(lines, start_line: int) {
+    let mut body = ""
+    let mut paren = 0
+    let mut in_string = false
+    let mut quote_ch = ""
+    let mut malformed = false
+    let mut reason = ""
+    let mut end_line = start_line
+    let mut done = false
+    let mut li = start_line
+    let n_lines = len(lines)
+    let max_line = start_line + 20
+    while li <= n_lines && li <= max_line && !done {
+        let raw = lines[li - 1]
+        let mut s = raw
+        if li == start_line {
+            let idx = s.index_of("@contract(")
+            if idx < 0 { return ["", start_line, true, "no_open"] }
+            s = s.substring(idx + 10, len(s))
+            paren = 1
+        }
+        let mut i = 0
+        let n = len(s)
+        while i < n && !done {
+            let c = s.substring(i, i + 1)
+            if in_string {
+                body = body + c
+                if c == quote_ch { in_string = false; quote_ch = "" }
+            } else {
+                if c == "\"" || c == "'" {
+                    in_string = true
+                    quote_ch = c
+                    body = body + c
+                } else if c == "(" {
+                    paren = paren + 1
+                    body = body + c
+                } else if c == ")" {
+                    paren = paren - 1
+                    if paren == 0 {
+                        end_line = li
+                        if in_string { malformed = true; reason = "string_unclosed" }
+                        done = true
+                    } else {
+                        body = body + c
+                    }
+                } else {
+                    body = body + c
+                }
+            }
+            i = i + 1
+        }
+        if !done {
+            body = body + " "
+            li = li + 1
+        }
+    }
+    if !done { return [body, li, true, "paren_unclosed"] }
+    return [body, end_line, malformed, reason]
+}
+
+// top-level "," split (respect quotes/parens)
+fn _split_contract_pairs(body: string) {
+    let mut pairs = []
+    let mut cur = ""
+    let mut paren = 0
+    let mut in_s = false
+    let mut qc = ""
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if in_s {
+            cur = cur + c
+            if c == qc { in_s = false; qc = "" }
+        } else {
+            if c == "\"" || c == "'" { in_s = true; qc = c; cur = cur + c }
+            else if c == "(" { paren = paren + 1; cur = cur + c }
+            else if c == ")" { paren = paren - 1; cur = cur + c }
+            else if c == "," && paren == 0 {
+                let tt = cur.trim()
+                if len(tt) > 0 { pairs = pairs.push(tt) }
+                cur = ""
+            } else { cur = cur + c }
+        }
+        i = i + 1
+    }
+    let tt = cur.trim()
+    if len(tt) > 0 { pairs = pairs.push(tt) }
+    return pairs
+}
+
+fn _unquote(v: string) -> string {
+    let t = v.trim()
+    if len(t) >= 2 && t.starts_with("\"") && t.ends_with("\"") {
+        return t.substring(1, len(t) - 1)
+    }
+    if len(t) >= 2 && t.starts_with("'") && t.ends_with("'") {
+        return t.substring(1, len(t) - 1)
+    }
+    return t
+}
+
+// attr_line 0 → 전체 스캔; >0 → 해당 라인에서 파싱
+pub fn parse_contract_decl(lines, attr_line: int) {
+    let start_line = _find_contract_open(lines, attr_line)
+    if start_line < 0 {
+        return #{"found": false, "pre": "", "post": "",
+                 "malformed": false, "reason": "",
+                 "decl_start": -1, "decl_end": -1,
+                 "unknown_keys": []}
+    }
+    let ext = _extract_contract_body(lines, start_line)
+    let body_str = ext[0]
+    let end_line = ext[1]
+    let body_malformed = ext[2]
+    let body_reason = ext[3]
+    if body_malformed {
+        return #{"found": true, "pre": "", "post": "",
+                 "malformed": true, "reason": body_reason,
+                 "decl_start": start_line, "decl_end": end_line,
+                 "unknown_keys": []}
+    }
+    let pairs = _split_contract_pairs(body_str)
+    let mut pre_expr = ""
+    let mut post_expr = ""
+    let mut unknown = []
+    let mut malformed = false
+    let mut reason = ""
+    for p in pairs {
+        // 두 형태 허용: `pre = "..."` 과 `pre: "..."` / `requires: x > 0`
+        let mut eqi = p.index_of("=")
+        let mut sep_is_eq = true
+        let ci = p.index_of(":")
+        if ci >= 0 && (eqi < 0 || ci < eqi) {
+            eqi = ci
+            sep_is_eq = false
+        }
+        if eqi < 0 {
+            malformed = true
+            reason = "key_without_value"
+            continue
+        }
+        let k = p.substring(0, eqi).trim()
+        let v = p.substring(eqi + 1, len(p)).trim()
+        if k == "pre" || k == "requires" {
+            pre_expr = _unquote(v)
+        } else if k == "post" || k == "ensures" {
+            post_expr = _unquote(v)
+        } else {
+            unknown = unknown.push(k)
+        }
+    }
+    return #{"found": true, "pre": pre_expr, "post": post_expr,
+             "malformed": malformed, "reason": reason,
+             "decl_start": start_line, "decl_end": end_line,
+             "unknown_keys": unknown}
+}
+
+// ─── BOUNDS-ELIM HINT ─────────────────────────────────────────────
+// pre_expr 가 `i < arr.len()` / `i < len(arr)` / `arr.len() > i`
+// 패턴이면 arr[i] 인덱스 bounds check elim 후보로 판정.
+// 반환: #{"eligible": bool, "index": string, "array": string}
+
+pub fn contract_bounds_elim_hint(pre_expr: string) {
+    let mut r = #{}
+    r["eligible"] = false
+    r["index"] = ""
+    r["array"] = ""
+    let e = pre_expr.trim()
+    if len(e) == 0 { return r }
+
+    // pattern A:  IDX < ARR.len()
+    let lt = e.index_of("<")
+    if lt > 0 {
+        let lhs = e.substring(0, lt).trim()
+        let rhs = e.substring(lt + 1, len(e)).trim()
+        // rhs: ARR.len()
+        let dot = rhs.index_of(".len()")
+        if dot > 0 {
+            let arr = rhs.substring(0, dot).trim()
+            if _is_simple_ident(lhs) && _is_simple_ident(arr) {
+                r["eligible"] = true
+                r["index"] = lhs
+                r["array"] = arr
+                return r
+            }
+        }
+        // rhs: len(ARR)
+        if rhs.starts_with("len(") && rhs.ends_with(")") {
+            let inner = rhs.substring(4, len(rhs) - 1).trim()
+            if _is_simple_ident(lhs) && _is_simple_ident(inner) {
+                r["eligible"] = true
+                r["index"] = lhs
+                r["array"] = inner
+                return r
+            }
+        }
+    }
+    return r
+}
+
+fn _is_simple_ident(s: string) -> bool {
+    let n = len(s)
+    if n == 0 { return false }
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let ch = char_code(c, 0)
+        let is_alpha = (ch >= 65 && ch <= 90) || (ch >= 97 && ch <= 122) || ch == 95
+        let is_digit = ch >= 48 && ch <= 57
+        if i == 0 {
+            if !is_alpha { return false }
+        } else {
+            if !is_alpha && !is_digit { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// 런타임 실패 태그 (native runtime 이 abort 시 출력)
+pub fn contract_error_tag() -> string {
+    return "HEXA_CONTRACT_FAIL"
+}
+
+// ─── CHECK (lint) ─────────────────────────────────────────────────
+
+pub fn check_contract(source: string, lines: [string]) {
+    let mut out = []
+    let pairs = find_attr_fn_pairs(lines, "contract")
+    let rules = find_contract_rules(source)
+    let sev_pre = contract_severity_pre(rules)
+    let bounds_on = contract_bounds_elim_enabled(rules)
+    for pair in pairs {
+        let attr_line = pair[0]
+        let fn_line = pair[1]
+        let decl = parse_contract_decl(lines, attr_line)
+        if !decl["found"] {
+            out = out.push(mk_msg4("contract", "error", attr_line,
+                "@contract(...) declaration missing"))
+            continue
+        }
+        if decl["malformed"] {
+            out = out.push(mk_msg4("contract", "error", attr_line,
+                "@contract(...) malformed: " + decl["reason"]))
+            continue
+        }
+        let pre_s = decl["pre"]
+        let post_s = decl["post"]
+        if len(pre_s) == 0 && len(post_s) == 0 {
+            out = out.push(mk_msg4("contract", "warn", attr_line,
+                "@contract with neither pre nor post — no-op"))
+        }
+        let unk = decl["unknown_keys"]
+        if len(unk) > 0 {
+            out = out.push(mk_msg4("contract", "warn", attr_line,
+                "@contract unknown keys: " + join(unk, ", ") +
+                " (expected: pre, post, requires, ensures)"))
+        }
+        // bounds-elim info (non-error)
+        if bounds_on && len(pre_s) > 0 {
+            let hint = contract_bounds_elim_hint(pre_s)
+            if hint["eligible"] {
+                out = out.push(mk_msg4("contract", "info", attr_line,
+                    "@contract bounds-elim candidate: " +
+                    hint["array"] + "[" + hint["index"] + "] bounds check elidable"))
+            }
+        }
+        // fn_line sanity (not strictly required)
+        if fn_line <= 0 {
+            out = out.push(mk_msg4("contract", "warn", attr_line,
+                "@contract not followed by fn declaration"))
+        }
+    }
+    // sev_pre 는 런타임 코드생성 힌트 — lint 메시지로는 강제하지 않음
+    if sev_pre == "" { /* unused guard */ }
+    return out
+}

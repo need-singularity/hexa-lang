@@ -1,0 +1,133 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_hxmetal_vadd.hexa — ROI #157 live objc_msgSend vadd E2E
+//
+//  Proves end-to-end Metal compute:
+//    host array → MTLBuffer (zero-copy shared) → compile MSL →
+//    pipeline → dispatch → readback → compare vs CPU.
+//
+//  GATING
+//  ------
+//  HXMETAL_LIVE=1   → real Metal dispatch. Requires macOS + Metal GPU.
+//  HXMETAL_LIVE=0   → stub path; test exits PASS after shape-only checks
+//                     so CI (Linux) stays green. Matches ROI #147 strategy.
+//
+//  HXLAYER_FFI_LIVE=1 is auto-detected by the interpreter when any
+//  @link extern resolves, but we set it explicitly so alloc_raw always
+//  returns a real pointer (needed to pass MTLSize + error out-pointers
+//  through objc_msgSend).
+//
+//  Run (live):
+//    HXMETAL_LIVE=1 HXLAYER_FFI_LIVE=1 ./hexa run self/test_hxmetal_vadd.hexa
+//  Run (stub):
+//    ./hexa run self/test_hxmetal_vadd.hexa
+// ═══════════════════════════════════════════════════════════════
+
+use self::runtime::hxmetal_stub
+
+let VADD_MSL = "#include <metal_stdlib>\nusing namespace metal;\nkernel void vadd(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], device float* c [[buffer(2)]], uint id [[thread_position_in_grid]]) { c[id] = a[id] + b[id]; }"
+
+let N = 1024
+let NBYTES = N * 4
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+
+fn main() {
+    let live = hxm_live()
+    println("hxm_live() = " + to_string(live))
+    println("hxm_version() = " + to_string(hxm_version()))
+
+    check("abi_version_v2", hxm_version() == 2)
+
+    // Shape-path checks (always run, both modes).
+    let dev = hxm_device_default()
+    check("device_non_null", dev != 0)
+    let queue = hxm_queue(dev)
+    check("queue_non_null", queue != 0)
+    let lib = hxm_library_from_source(dev, VADD_MSL)
+    check("library_compiled", lib != 0)
+    let pipe = hxm_pipeline(lib, "vadd")
+    check("pipeline_non_null", pipe != 0)
+
+    if live == 0 {
+        println("--- stub mode: skipping GPU dispatch ---")
+        println(to_string(pass_count) + " pass, " + to_string(fail_count) + " fail")
+        if fail_count > 0 { return 1 }
+        return 0
+    }
+
+    // LIVE PATH — only executes with HXMETAL_LIVE=1.
+    let buf_a = hxm_buffer(dev, NBYTES)
+    let buf_b = hxm_buffer(dev, NBYTES)
+    let buf_c = hxm_buffer(dev, NBYTES)
+    check("buf_a_non_null", buf_a != 0)
+    check("buf_b_non_null", buf_b != 0)
+    check("buf_c_non_null", buf_c != 0)
+
+    let ca = hxm_buffer_contents(buf_a)
+    let cb = hxm_buffer_contents(buf_b)
+    let cc = hxm_buffer_contents(buf_c)
+    check("contents_a_non_null", ca != 0)
+    check("contents_b_non_null", cb != 0)
+    check("contents_c_non_null", cc != 0)
+
+    // Fill a[i] = i, b[i] = 2*i; expected c[i] = 3*i.
+    let mut i = 0
+    while i < N {
+        let fi = i * 1.0
+        write_f32(ca, i * 4, fi)
+        write_f32(cb, i * 4, fi * 2.0)
+        write_f32(cc, i * 4, 0.0)
+        i = i + 1
+    }
+
+    // Dispatch — async submit + wait. Measure wall-time in ms.
+    let t0 = timestamp()
+    let rc = hxm_dispatch3(pipe, buf_a, buf_b, buf_c, N)
+    let t1 = timestamp()
+    let dispatch_ms = t1 - t0
+    println("dispatch_ms = " + to_string(dispatch_ms))
+    check("dispatch_rc_0", rc == 0)
+
+    // Readback + compare against CPU reference.
+    let mut max_err = 0.0
+    let mut k = 0
+    let mut all_match = 1
+    while k < N {
+        let expected = k * 3.0
+        let got = deref_f32(cc, k * 4)
+        let err = fabs(got - expected)
+        if err > max_err { max_err = err }
+        if err > 0.0001 { all_match = 0 }
+        k = k + 1
+    }
+    println("max_err = " + to_string(max_err))
+    check("gpu_matches_cpu_all_N", all_match == 1)
+
+    // Release GPU resources (ARC-off manual).
+    let _ = hxm_release(buf_a)
+    let _ = hxm_release(buf_b)
+    let _ = hxm_release(buf_c)
+    let _ = hxm_release(pipe)
+    let _ = hxm_release(lib)
+    let _ = hxm_release(queue)
+
+    println("--- summary ---")
+    println(to_string(pass_count) + " pass, " + to_string(fail_count) + " fail")
+    if fail_count > 0 { return 1 }
+    return 0
+}
+
+main()
