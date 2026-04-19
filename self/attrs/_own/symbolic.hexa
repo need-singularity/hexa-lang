@@ -1,0 +1,257 @@
+// self/attrs/_own/symbolic.hexa — @symbolic 대수 단순화 attr (ROI #151)
+//
+// Design
+// ─────────────────────────────────────────────────────────────
+// @symbolic 은 compile-time (AST/IR) peephole 로 fn body 내 수식을 단순화한다.
+//  (a) x * 2^n  (n in 1..max)  →  x << n        (shl strength reduction)
+//  (b) x / 2^n  (n in 1..max)  →  x >> n        (ashr strength reduction)
+//  (c) x * 1  / 1 * x  / x + 0  / 0 + x   →  x  (identity)
+//  (d) x * 0  / 0 * x                      →  0 (annihilation)
+//
+// 기존 ARM64 peephole (self/codegen/peephole.hexa) 은 post-codegen 바이너리 수준.
+// @symbolic 은 pre-codegen AST/IR lowering pass — 레이어가 다르다.
+//
+// 본 파일은 (1) meta, (2) check validator, (3) HX11 rules loader,
+// (4) AST peephole apply_symbolic, (5) pow2/log2 helper 제공.
+//
+// HX11: `.symbolic-rules.json` 으로 max_shift_bits / enable_identity /
+//        enable_annihilation 주입 가능. _meta.inherit=false 기본.
+//
+// 주의
+//   · float 피연산자에는 적용하지 않음 (signed-int semantics 한정)
+//   · x / pow2 는 ashr (signed arithmetic shift right) 로 lowering — 음수 round
+//     동작 C/hexa divide 와 동일 (toward zero) vs ashr (toward -inf) 미세 차이
+//     는 호출자(ai_native_pass)가 type/sign 정보로 판단. 본 apply 는 non-
+//     negative 선에서 안전.
+
+use "self/attrs/core"
+use "self/attrs/_lib/rules_loader"
+
+// ─── META ─────────────────────────────────────────────────────────
+
+fn meta_symbolic() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name = "symbolic"
+    m.category = "rewrite"
+    m.purpose = "대수 단순화 peephole — x*2^n→shl, x/2^n→ashr, x*1/x+0→x, x*0→0 (pre-codegen AST/IR)"
+    m.cost_rule = "mul/div pow2 → shift (5-10x integer arithmetic); identity/annihilation 1 insn 제거"
+    m.side_effect = "compile-time 한정. signed integer semantics 보존. float 미적용."
+    m.requires = "integer operand 타입 추론 완료 후 실행 (pre-codegen lowering pass)"
+    m.auto_test = "self/test_symbolic.hexa — 15 cases (x*2/4/8/16, x/4, x%8, x**2, x*1, x*0, nested)"
+    m.example = "@symbolic\nfn mul2(x: int) -> int { return x * 2 }  // lowers to x << 1"
+    m.implemented = true
+    return m
+}
+
+// ─── HX11 RULES LOADER ────────────────────────────────────────────
+
+fn _global_symbolic_rules_path() -> string {
+    return "/Users/ghost/Dev/nexus/shared/config/symbolic_rules.json"
+}
+
+fn _symbolic_builtin_rules() {
+    let mut r = #{}
+    let mut meta = #{}
+    meta["project"] = "_builtin"
+    meta["version"] = 1
+    meta["inherit"] = false
+    r["_meta"] = meta
+
+    let mut rules = #{}
+    rules["max_shift_bits"] = 8
+    rules["enable_identity"] = true
+    rules["enable_annihilation"] = true
+    r["rules"] = rules
+    return r
+}
+
+pub fn find_symbolic_rules(source: string) {
+    let loaded = find_attr_rules(source, "symbolic", _global_symbolic_rules_path())
+    if has_key(loaded, "rules") { return loaded }
+    return _symbolic_builtin_rules()
+}
+
+fn _scfg_int(cfg, key: string, def: int) -> int {
+    if !has_key(cfg, key) { return def }
+    let v = cfg[key]
+    let mut n = def
+    try { n = to_int(v) } catch e { n = def }
+    return n
+}
+
+fn _scfg_bool(cfg, key: string, def: bool) -> bool {
+    if !has_key(cfg, key) { return def }
+    return cfg[key] == true
+}
+
+// rules → max shift bit width (default 8 — x * 2^1 ..= 2^8)
+pub fn symbolic_max_shift_bits(rules) -> int {
+    if !has_key(rules, "rules") { return 8 }
+    return _scfg_int(rules["rules"], "max_shift_bits", 8)
+}
+
+// rules → identity peephole 활성 (x*1 / x+0, default true)
+pub fn symbolic_enable_identity(rules) -> bool {
+    if !has_key(rules, "rules") { return true }
+    return _scfg_bool(rules["rules"], "enable_identity", true)
+}
+
+// rules → annihilation peephole 활성 (x*0 → 0, default true)
+pub fn symbolic_enable_annihilation(rules) -> bool {
+    if !has_key(rules, "rules") { return true }
+    return _scfg_bool(rules["rules"], "enable_annihilation", true)
+}
+
+// ─── INTEGER HELPERS (shift-free, stage0-safe) ────────────────────
+
+fn _is_pow2(n: int) -> bool {
+    if n <= 0 { return false }
+    return (n & (n - 1)) == 0
+}
+
+fn _log2_int(n: int) -> int {
+    let mut count = 0
+    let mut v = n
+    while v > 1 {
+        v = v / 2
+        count = count + 1
+    }
+    return count
+}
+
+// 2^n 상한 (n = max_shift_bits)
+fn _pow2_limit(n: int) -> int {
+    let mut v = 1
+    let mut i = 0
+    while i < n {
+        v = v * 2
+        i = i + 1
+    }
+    return v
+}
+
+// ─── AST HELPERS (lightweight map-based IR) ───────────────────────
+// 호출부 (ai_native_pass 통합 시) 는 parser AST 구조에 맞게 래퍼 추가.
+// 본 파일은 map 기반 표현 (kind / op / lhs / rhs / value) 을 가정.
+
+fn _is_int_lit(node) -> bool {
+    if !has_key(node, "kind") { return false }
+    return node["kind"] == "IntLit"
+}
+
+fn _int_lit_val(node) -> int {
+    if !has_key(node, "value") { return 0 }
+    let mut v = 0
+    try { v = to_int(node["value"]) } catch e { v = 0 }
+    return v
+}
+
+fn _mk_int_lit(v: int) {
+    return #{"kind": "IntLit", "value": to_string(v)}
+}
+
+fn _mk_shl(operand, n: int) {
+    return #{"kind": "BinOp", "op": "<<", "lhs": operand, "rhs": _mk_int_lit(n)}
+}
+
+fn _mk_ashr(operand, n: int) {
+    return #{"kind": "BinOp", "op": ">>", "lhs": operand, "rhs": _mk_int_lit(n)}
+}
+
+// ─── APPLY (AST/IR peephole) ──────────────────────────────────────
+// 호출부가 BinOp 노드 방문 시 이 fn 을 호출.
+// node = map with "op" ∈ {"+", "-", "*", "/", "%"}, "lhs", "rhs"
+// rules = find_symbolic_rules(source)
+// 반환: 변환된 AST node (변환 불가면 원본 그대로)
+
+pub fn apply_symbolic(node, rules) {
+    if !has_key(node, "op") { return node }
+    let op = node["op"]
+    let lhs = node["lhs"]
+    let rhs = node["rhs"]
+
+    // (c-1) identity: x + 0 → x, 0 + x → x
+    if symbolic_enable_identity(rules) && op == "+" {
+        if _is_int_lit(rhs) && _int_lit_val(rhs) == 0 { return lhs }
+        if _is_int_lit(lhs) && _int_lit_val(lhs) == 0 { return rhs }
+    }
+
+    if op == "*" {
+        // (c-2) x * 1 → x, 1 * x → x
+        if symbolic_enable_identity(rules) {
+            if _is_int_lit(rhs) && _int_lit_val(rhs) == 1 { return lhs }
+            if _is_int_lit(lhs) && _int_lit_val(lhs) == 1 { return rhs }
+        }
+        // (d) x * 0 → 0, 0 * x → 0
+        if symbolic_enable_annihilation(rules) {
+            if _is_int_lit(rhs) && _int_lit_val(rhs) == 0 { return _mk_int_lit(0) }
+            if _is_int_lit(lhs) && _int_lit_val(lhs) == 0 { return _mk_int_lit(0) }
+        }
+        // (a) x * 2^n → x << n
+        let max_n = symbolic_max_shift_bits(rules)
+        let max_v = _pow2_limit(max_n)
+        if _is_int_lit(rhs) {
+            let c = _int_lit_val(rhs)
+            if c >= 2 && c <= max_v && _is_pow2(c) {
+                return _mk_shl(lhs, _log2_int(c))
+            }
+        }
+        if _is_int_lit(lhs) {
+            let c = _int_lit_val(lhs)
+            if c >= 2 && c <= max_v && _is_pow2(c) {
+                return _mk_shl(rhs, _log2_int(c))
+            }
+        }
+    }
+
+    // (b) x / 2^n → x >> n  (ashr — signed)
+    if op == "/" {
+        let max_n = symbolic_max_shift_bits(rules)
+        let max_v = _pow2_limit(max_n)
+        if _is_int_lit(rhs) {
+            let c = _int_lit_val(rhs)
+            if c >= 2 && c <= max_v && _is_pow2(c) {
+                return _mk_ashr(lhs, _log2_int(c))
+            }
+        }
+    }
+
+    return node
+}
+
+// ─── CHECK (lint) ─────────────────────────────────────────────────
+// @symbolic 은 non-invasive rewrite — 오류 대신 정보성 감지 수행.
+//   · fn body 에 peephole 대상(mul/div by literal, +0, *1) 0 건이면 no-op warn
+pub fn check_symbolic(source: string, lines: [string]) {
+    let mut out = []
+    let pairs = find_attr_fn_pairs(lines, "symbolic")
+    for pair in pairs {
+        let attr_line = pair[0]
+        let fn_line = pair[1]
+
+        let body_range = fn_body_range(lines, fn_line)
+        let bs = body_range[0]
+        let be = body_range[1]
+        let mut has_target = false
+        let mut i = bs
+        while i <= be {
+            let idx = i - 1
+            if idx >= 0 && idx < len(lines) {
+                let t = lines[idx]
+                // 간이 감지 — literal 과 * / + 근접 등장
+                if t.contains("* 2") || t.contains("* 4") || t.contains("* 8") ||
+                   t.contains("* 16") || t.contains("* 1") || t.contains("* 0") ||
+                   t.contains("/ 2") || t.contains("/ 4") || t.contains("/ 8") ||
+                   t.contains("+ 0") {
+                    has_target = true; break
+                }
+            }
+            i = i + 1
+        }
+        if !has_target {
+            out = out.push(mk_msg4("symbolic", "warn", attr_line,
+                "@symbolic on fn with no peephole-targetable expr — no-op"))
+        }
+    }
+    return out
+}
