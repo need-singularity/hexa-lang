@@ -5,13 +5,18 @@
 //
 // Surface:
 //   int_to_string(n: int) -> string
-//   float_to_string(f: float, prec: int) -> string
+//   float_to_string(f: float, prec: int) -> string              — %.Nf
+//   float_to_string_sci(f: float, prec: int) -> string          — %.Ne
 //   hex_string(n: int) -> string
 //   bin_string(n: int) -> string
 //   pad_left(s: string, width: int, pad_char: int) -> string
-//   format_simple(fmt: string, args: [any]) -> string    — basic %d/%s/%f
+//   pad_right(s: string, width: int, pad_char: int) -> string
+//   format_simple(fmt: string, args: [any]) -> string           — %d %s %f %x %%
+//   base64_encode(bytes: [int]) -> string
+//   base64_decode(s: string) -> [int]
 
 use self::rt::alloc
+use self::rt::math
 
 // ═══════════════════════════════════════════════════════════════════
 // int_to_string
@@ -71,6 +76,56 @@ fn float_to_string(f: float, prec: int) -> string {
         out = out.push(digit + 48)
         frac = frac - float_of_int(digit)
         k = k + 1
+    }
+    return bytes_array_to_string(out)
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// float_to_string_sci — scientific notation %.Ne
+// ═══════════════════════════════════════════════════════════════════
+//
+// Output shape: "[-]m.dddde[+-]NN" — mantissa in [1.0, 10.0) with `prec`
+// fractional digits, then 'e', then signed 2+-digit exponent. Matches
+// snprintf("%.*e", prec, v) for the common case. Subnormals / inf / nan
+// are NOT handled — those paths stay on the formatter-less IR.
+
+fn float_to_string_sci(f: float, prec: int) -> string {
+    let mut out = []
+    let mut x = f
+    if x < 0.0 { out = out.push(45); x = -x }   // '-'
+    if x == 0.0 {
+        // "0.000…e+00"
+        out = out.push(48)                 // '0'
+        if prec > 0 {
+            out = out.push(46)             // '.'
+            let mut k = 0
+            while k < prec { out = out.push(48); k = k + 1 }
+        }
+        out = out.push(101).push(43).push(48).push(48)  // "e+00"
+        return bytes_array_to_string(out)
+    }
+    // Normalise x into [1.0, 10.0) and track exponent.
+    let mut exp = 0
+    while x >= 10.0 { x = x * 0.1; exp = exp + 1 }
+    while x < 1.0 { x = x * 10.0; exp = exp - 1 }
+    // Append mantissa with `prec` fractional digits.
+    let mantissa = float_to_string(x, prec)
+    let mb = hexa_str_bytes(mantissa)
+    let mut mi = 0
+    while mi < len(mb) { out = out.push(mb[mi]); mi = mi + 1 }
+    // Exponent.
+    out = out.push(101)                    // 'e'
+    let mut e_abs = exp
+    if e_abs < 0 { out = out.push(45); e_abs = -e_abs } else { out = out.push(43) }
+    // Two-digit minimum.
+    if e_abs < 10 {
+        out = out.push(48)
+        out = out.push(48 + e_abs)
+    } else {
+        let es = int_to_string(e_abs)
+        let eb = hexa_str_bytes(es)
+        let mut ei = 0
+        while ei < len(eb) { out = out.push(eb[ei]); ei = ei + 1 }
     }
     return bytes_array_to_string(out)
 }
@@ -177,26 +232,25 @@ fn format_simple(fmt: string, args: [any]) -> string {
         if b == 37 && i + 1 < len(bytes) {   // '%'
             let next = bytes[i + 1]
             if next == 100 {   // 'd'
-                let s = int_to_string(int_of(args[arg_idx]))
-                append_bytes(out, s)
+                out = append_bytes(out, int_to_string(int_of(args[arg_idx])))
                 arg_idx = arg_idx + 1
                 i = i + 2
                 continue
             }
             if next == 115 {   // 's'
-                append_bytes(out, hexa_to_string(args[arg_idx]))
+                out = append_bytes(out, hexa_to_string(args[arg_idx]))
                 arg_idx = arg_idx + 1
                 i = i + 2
                 continue
             }
             if next == 102 {   // 'f'
-                append_bytes(out, float_to_string(float_of(args[arg_idx]), 6))
+                out = append_bytes(out, float_to_string(float_of(args[arg_idx]), 6))
                 arg_idx = arg_idx + 1
                 i = i + 2
                 continue
             }
             if next == 120 {   // 'x'
-                append_bytes(out, hex_string(int_of(args[arg_idx])))
+                out = append_bytes(out, hex_string(int_of(args[arg_idx])))
                 arg_idx = arg_idx + 1
                 i = i + 2
                 continue
@@ -222,6 +276,106 @@ fn append_bytes(buf: [int], s: string) -> [int] {
         j = j + 1
     }
     return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// Base64 — RFC 4648 standard alphabet, '=' padded
+// ═══════════════════════════════════════════════════════════════════
+//
+// Mirrors runtime.c hexa_base64_encode/decode (which operate on C
+// strings). The hexa surface takes [int] byte arrays so we can round-
+// trip arbitrary binary without UTF-8 reinterpretation.
+
+@pure fn base64_alphabet() -> string {
+    return "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+}
+
+fn base64_encode(bytes: [int]) -> string {
+    let n = len(bytes)
+    if n == 0 { return "" }
+    let alpha = hexa_str_bytes(base64_alphabet())
+    let mut out = []
+    let mut i = 0
+    while i + 3 <= n {
+        let b0 = bytes[i] & 255
+        let b1 = bytes[i + 1] & 255
+        let b2 = bytes[i + 2] & 255
+        let t = (b0 * 65536) + (b1 * 256) + b2
+        out = out.push(alpha[(t / 262144) & 63])
+        out = out.push(alpha[(t / 4096) & 63])
+        out = out.push(alpha[(t / 64) & 63])
+        out = out.push(alpha[t & 63])
+        i = i + 3
+    }
+    let rem = n - i
+    if rem > 0 {
+        let b0 = bytes[i] & 255
+        let mut t = b0 * 65536
+        if rem == 2 {
+            let b1 = bytes[i + 1] & 255
+            t = t + (b1 * 256)
+        }
+        out = out.push(alpha[(t / 262144) & 63])
+        out = out.push(alpha[(t / 4096) & 63])
+        if rem == 2 {
+            out = out.push(alpha[(t / 64) & 63])
+        } else {
+            out = out.push(61)   // '='
+        }
+        out = out.push(61)       // '='
+    }
+    return bytes_array_to_string(out)
+}
+
+// Decoder table: ASCII byte → 0..63 or -1. Built lazily via alphabet
+// scan (no static init hooks yet). Cost is O(256) per call which is
+// fine for the self-hosting path (kilobytes, not megabytes).
+fn base64_build_decode_table() -> [int] {
+    let mut dec = []
+    let mut i = 0
+    while i < 256 { dec = dec.push(-1); i = i + 1 }
+    let alpha = hexa_str_bytes(base64_alphabet())
+    let mut j = 0
+    while j < 64 {
+        dec[alpha[j]] = j
+        j = j + 1
+    }
+    return dec
+}
+
+fn base64_decode(s: string) -> [int] {
+    let sb = hexa_str_bytes(s)
+    let n = len(sb)
+    if n == 0 { return [] }
+    let dec = base64_build_decode_table()
+    let mut out = []
+    let mut bits = 0
+    let mut vbits = 0
+    let mut i = 0
+    while i < n {
+        let c = sb[i]
+        if c == 61 { break }                // '=' → end of data
+        let v = dec[c]
+        if v >= 0 {
+            bits = (bits * 64) + v
+            vbits = vbits + 6
+            if vbits >= 8 {
+                vbits = vbits - 8
+                let shift = pow2(vbits)
+                out = out.push((bits / shift) & 255)
+                bits = bits & (shift - 1)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+@pure fn pow2(k: int) -> int {
+    let mut v = 1
+    let mut i = 0
+    while i < k { v = v * 2; i = i + 1 }
+    return v
 }
 
 // ═══════════════════════════════════════════════════════════════════

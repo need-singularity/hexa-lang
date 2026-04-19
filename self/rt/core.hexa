@@ -1,12 +1,20 @@
-// self/rt/core.hexa — P7-7b slice 4: core type ops (libc-independent)
+// self/rt/core.hexa — P7-7b slice 4: core value ops (libc-independent)
 //
-// Pure-hexa replacements for three core-type helpers in runtime.c:
-//   hexa_truthy    L2640  (TAG switch — truthy/falsy rule)
-//   hexa_null_coal L620   (null/empty → fallback)
-//   hexa_len       L?     (strlen for string, array length otherwise)
+// Pure-hexa replacements for the polymorphic value kernel in runtime.c:
+//   truthy / null_coal / len / type_of / abs / is_type
+//   eq  / cmp_lt / cmp_gt / cmp_le / cmp_ge
+//   add / sub / mul / div / mod
 //
-// hexa does not expose raw HX_TAG to user code; typeof() is used to
-// branch on value kind. Semantics preserved from runtime.c.
+// hexa does not expose raw HX_TAG to user code; typeof() (which returns
+// lowercase strings "int"/"float"/"bool"/"string"/"void"/"array"/"map")
+// is used as the dispatch key. Semantics preserved from runtime.c —
+// notably add(string,string)=concat, add(array,array)=concat, and the
+// float-promoting arithmetic rule "one side float → both promoted".
+//
+// See rt/math.hexa for scalar math (math_abs is float-only; rt_iabs is
+// the int-only twin; rt_abs below is the typeof-dispatching polymorph).
+
+// ── Truthy / null-coalesce ──────────────────────────────────────────
 
 @pure fn rt_truthy(v) -> bool {
     let t = typeof(v)
@@ -20,7 +28,7 @@
 }
 
 // Null-coalesce: if `a` is void OR an empty string, return `b`; else `a`.
-// Mirrors runtime.c L620 exactly.
+// Mirrors runtime.c L620.
 @pure fn rt_null_coal(a, b) {
     let t = typeof(a)
     if t == "void" { return b }
@@ -28,9 +36,209 @@
     return a
 }
 
+// ── Length / type introspection ─────────────────────────────────────
+
 // Generic len — routes by type. Strings → byte length, arrays → element
-// count. hexa's `len()` builtin already covers both, this is a stable
-// symbol so codegen_c2 can link rt_len unconditionally.
+// count, maps → pair count. hexa's `len()` builtin already covers all
+// three; this wrapper is a stable symbol so codegen_c2 can link rt_len
+// unconditionally in place of hexa_len.
 @pure fn rt_len(v) -> int {
     return len(v)
 }
+
+// type_of — returns the canonical type string. runtime.c collapses the
+// internal "none" tag into "void"; hexa's typeof already emits "void"
+// for unset values, so this is a thin passthrough that additionally
+// maps the legacy "none" alias (in case a host embeds one) to "void".
+@pure fn rt_type_of(v) -> string {
+    let t = typeof(v)
+    if t == "none" { return "void" }
+    return t
+}
+
+// is_type — compare typeof(v) with the requested name. For compound
+// types like map-carrying-__type__, runtime.c peeks the __type__ field;
+// this hexa version only handles the scalar/container cases. Map type
+// tagging is handled at a higher layer (see runtime.c L1723 for the
+// TAG_MAP "__type__" lookup path if that fidelity is needed later).
+@pure fn rt_is_type(v, type_name: string) -> bool {
+    return rt_type_of(v) == type_name
+}
+
+// ── Absolute value (polymorphic) ────────────────────────────────────
+
+@pure fn rt_abs(v) {
+    let t = typeof(v)
+    if t == "int" {
+        if v < 0 { return 0 - v }
+        return v
+    }
+    if t == "float" {
+        if v < 0.0 { return 0.0 - v }
+        return v
+    }
+    return v
+}
+
+// ── Equality (polymorphic) ──────────────────────────────────────────
+
+// Numeric cross-type compare: int vs float coerce both to float.
+// float_of is a builtin shim declared in fmt.hexa / proc.hexa.
+@pure fn _rt_num_eq(a, b) -> bool {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" { return a == b }
+    return float_of(a) == float_of(b)
+}
+
+// Structural equality.
+//   - int/float cross: numeric compare (5 == 5.0)
+//   - string: byte equality (delegates to == which runtime.c strcmp's)
+//   - array: same length + elementwise rt_eq
+//   - everything else: fall through to host `==` (bool/void/identity)
+@pure fn rt_eq(a, b) -> bool {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    // Numeric cross-type path.
+    if (ta == "int" || ta == "float") && (tb == "int" || tb == "float") {
+        return _rt_num_eq(a, b)
+    }
+    if ta != tb { return false }
+    if ta == "string" { return a == b }
+    if ta == "array" {
+        let n = len(a)
+        if n != len(b) { return false }
+        let mut i = 0
+        while i < n {
+            if !rt_eq(a[i], b[i]) { return false }
+            i = i + 1
+        }
+        return true
+    }
+    if ta == "void" { return true }
+    // bool / map / struct / fn → host identity (ok for bool; runtime.c
+    // uses pointer equality for the rest, which `==` already provides).
+    return a == b
+}
+
+// ── Ordered comparison (polymorphic) ────────────────────────────────
+// Numeric side mirrors hexa_cmp_{lt,gt,le,ge}. runtime.c does NOT
+// compare strings lexicographically (bug/feature depending on lens);
+// we extend to string lex-compare here because call sites (sort, min,
+// max) clearly want it. Dispatch via typeof to keep the tag-free rule.
+
+@pure fn _rt_str_cmp(a: string, b: string) -> int {
+    let na = len(a)
+    let nb = len(b)
+    let mut i = 0
+    let mut lim = na
+    if nb < lim { lim = nb }
+    while i < lim {
+        let ca = char_code(a, i)
+        let cb = char_code(b, i)
+        if ca != cb { return ca - cb }
+        i = i + 1
+    }
+    return na - nb
+}
+
+@pure fn _rt_num_cmp(a, b) -> int {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" {
+        if a < b { return -1 }
+        if a > b { return 1 }
+        return 0
+    }
+    let fa = float_of(a)
+    let fb = float_of(b)
+    if fa < fb { return -1 }
+    if fa > fb { return 1 }
+    return 0
+}
+
+@pure fn _rt_cmp(a, b) -> int {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "string" && tb == "string" { return _rt_str_cmp(a, b) }
+    return _rt_num_cmp(a, b)
+}
+
+@pure fn rt_cmp_lt(a, b) -> bool { return _rt_cmp(a, b) <  0 }
+@pure fn rt_cmp_gt(a, b) -> bool { return _rt_cmp(a, b) >  0 }
+@pure fn rt_cmp_le(a, b) -> bool { return _rt_cmp(a, b) <= 0 }
+@pure fn rt_cmp_ge(a, b) -> bool { return _rt_cmp(a, b) >= 0 }
+
+// ── Arithmetic (polymorphic) ────────────────────────────────────────
+// int+int → int; any float → float; add also handles string concat
+// and array concat (runtime.c L2892-2901 fallthrough).
+
+@pure fn _rt_is_num(t: string) -> bool {
+    return t == "int" || t == "float"
+}
+
+fn rt_add(a, b) {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" { return a + b }
+    if _rt_is_num(ta) && _rt_is_num(tb) { return float_of(a) + float_of(b) }
+    if ta == "string" && tb == "string" { return a + b }
+    if ta == "array" && tb == "array" {
+        let mut out = []
+        let na = len(a)
+        let nb = len(b)
+        let mut i = 0
+        while i < na { out = out.push(a[i]); i = i + 1 }
+        i = 0
+        while i < nb { out = out.push(b[i]); i = i + 1 }
+        return out
+    }
+    // Final fallback — runtime.c collapses to to_string + concat.
+    return to_string(a) + to_string(b)
+}
+
+@pure fn rt_sub(a, b) {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" { return a - b }
+    return float_of(a) - float_of(b)
+}
+
+@pure fn rt_mul(a, b) {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" { return a * b }
+    return float_of(a) * float_of(b)
+}
+
+@pure fn rt_div(a, b) {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" {
+        if b == 0 { return 0 }
+        return a / b
+    }
+    let fb = float_of(b)
+    if fb == 0.0 { return 0.0 }
+    return float_of(a) / fb
+}
+
+@pure fn rt_mod(a, b) {
+    let ta = typeof(a)
+    let tb = typeof(b)
+    if ta == "int" && tb == "int" {
+        if b == 0 { return 0 }
+        return a % b
+    }
+    // runtime.c uses fmod for the float path; hexa has no fmod intrinsic,
+    // so we emulate via truncated division.
+    let fa = float_of(a)
+    let fb = float_of(b)
+    if fb == 0.0 { return 0.0 }
+    let q = int_of_float(fa / fb)
+    return fa - float_of_int(q) * fb
+}
+
+// Intrinsic shims (float_of_int / int_of_float / to_string / char_code)
+// are already declared in math.hexa / fmt.hexa / string.hexa or resolved
+// as hexa builtins at codegen time — no redeclarations here.
