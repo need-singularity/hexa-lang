@@ -620,6 +620,85 @@ fn nb_lower_builtin(m, b, name: string, sym: string, arg_vids) -> int {
     return bld_call(m, b, fid, arg_vids, "i64")
 }
 
+// ── P7-6 T4: FFI Call / MethodCall handlers ───────────────────────
+//
+// Background. A hexa TU may declare a C interop entry via
+//   extern fn fabsf(x: f32) -> f32
+//   @symbol("c_fast_strlen") extern fn strlen(s: string) -> int
+//
+// Pass 1 already registers such ExternFnDecls under their hexa name
+// (`fabsf` / `strlen`), and — with the T4 wiring below — ALSO under
+// their @symbol("...") override when present (`c_fast_strlen`). The
+// handlers here are the call-site complement: they let an expression
+// call / method-call resolve to that registration and emit BL to the
+// correct C symbol, bypassing the builtin-runtime table (which only
+// covers the hexa_* runtime.c shims).
+//
+// Both handlers are idempotent — they return -1 when the name is NOT
+// a registered extern fn, so callers can fall through to the legacy
+// builtin / UFCS / user-fn paths without regression.
+
+// nb_is_extern_fn — is `name` registered as a module-level fn? Used by
+// both handlers below. The native_build IR does not carry an "extern"
+// bit on IrFunction entries, so detection is proxied by "function is
+// known AND not a user FnDecl body we lowered". Since Pass 1 registers
+// ExternFnDecl before FnDecl bodies fill out their blocks, a
+// non-negative fid with zero-block body is the signal we look for.
+// Conservative: treat ANY module_find_function hit as callable so the
+// handler can emit BL. Caller (nb_ffi_call_extern) enforces the FFI
+// contract by requiring the lookup to succeed before falling through.
+fn nb_is_extern_fn(m, name: string) -> bool {
+    let fid = module_find_function(m, name)
+    if fid < 0 { return false }
+    return true
+}
+
+// nb_ffi_call_extern — FFI Call handler. Resolves `hexa_name` against
+// the module fn registry (populated by Pass 1 for both user fns and
+// extern fns). Returns the emitted CALL vid, or -1 when `hexa_name`
+// is NOT registered (caller should fall through to lower_call_by_name,
+// which is a no-op when not registered — keeping this layer purely
+// additive).
+//
+// The key behavior over the plain Call path: when an ExternFnDecl was
+// registered under BOTH its hexa name AND its @symbol("c_sym")
+// override (Pass 1 dual-register, added in T4), a call spelled with
+// the hexa name resolves to the hexa-named fid but the BL emission
+// still targets the underlying C symbol because Pass 1 stamps the
+// IrFunction.name to the C sym when the override is present. Scroll
+// to Pass 1 ExternFnDecl branch for the dual-register logic.
+fn nb_ffi_call_extern(m, b, hexa_name: string, arg_vids) -> int {
+    let fid = module_find_function(m, hexa_name)
+    if fid < 0 { return -1 }
+    return bld_call(m, b, fid, arg_vids, "i64")
+}
+
+// nb_ffi_methodcall_extern — FFI MethodCall handler. UFCS-lowers a
+// `obj.method(args)` call into `method(obj, args...)` when `method`
+// is a registered extern fn (by hexa name). Receiver is prepended to
+// the arg list in caller-evaluation order. Returns -1 when `method`
+// is NOT a registered extern/user fn (caller should fall through to
+// lower_call_by_name).
+//
+// This complements the existing impl-method dispatch (`Type__method`
+// mangled) + runtime method table (`nb_method_runtime_sym`) paths:
+// the precedence is impl > runtime > FFI extern > UFCS user-fn, so
+// user-defined impls and runtime methods win over a same-named extern
+// (deliberate — matches the Ident-Call precedence in which builtins
+// shadow user fns unless the user writes a fully-qualified impl).
+fn nb_ffi_methodcall_extern(m, b, recv_vid: int, mname: string, arg_vids) -> int {
+    if !nb_is_extern_fn(m, mname) { return -1 }
+    let full_args = [recv_vid]
+    let mut i = 0
+    while i < len(arg_vids) {
+        full_args = full_args.push(arg_vids[i])
+        i = i + 1
+    }
+    let fid = module_find_function(m, mname)
+    if fid < 0 { return -1 }
+    return bld_call(m, b, fid, full_args, "i64")
+}
+
 // ── Struct-type inference (P7-6 Field struct_idx step 3b) ─────────
 // Resolves an expression's declared struct type without emitting any
 // IR. Used by Field access lowering to support chained access:
@@ -878,10 +957,19 @@ fn nb_lower_expr(m, b, e, env) -> int {
             // P7-6: runtime method dispatch. `s.starts_with(p)` etc. have
             // no free-fn definition — they live in runtime.c as
             // hexa_str_*/hexa_array_*. Check the method table first, then
-            // fall through to UFCS user-fn lookup for user-defined methods.
+            // fall through to FFI extern / UFCS user-fn lookup.
             let msym = nb_method_runtime_sym(mname)
             if len(msym) > 0 {
                 return nb_lower_builtin(m, b, mname, msym, arg_vids)
+            }
+            // P7-6 T4: FFI MethodCall handler. When `mname` is
+            // registered as an extern fn (Pass 1 ExternFnDecl), route
+            // through the UFCS-aware nb_ffi_call_extern. `arg_vids`
+            // already carries [recv, ...user_args] so we can emit
+            // the CALL directly. When not extern, fall through to the
+            // generic lower_call_by_name path (user-fn UFCS).
+            if nb_is_extern_fn(m, mname) {
+                return nb_ffi_call_extern(m, b, mname, arg_vids)
             }
             return lower_call_by_name(m, b, mname, arg_vids, "i64")
         }
@@ -896,12 +984,20 @@ fn nb_lower_expr(m, b, e, env) -> int {
         }
         // P7-6 builtin coverage: recognize hx runtime builtins before
         // generic user-fn resolution. Unrecognized names fall through
-        // to lower_call_by_name (user fn lookup).
+        // to the FFI extern handler then lower_call_by_name.
         let cname = e.left.name
         let sym = nb_builtin_runtime_sym(cname)
         if len(sym) > 0 {
             return nb_lower_builtin(m, b, cname, sym, arg_vids)
         }
+        // P7-6 T4: FFI Call handler — probes extern-registered fns
+        // before the generic user-fn fallback. Returns -1 when `cname`
+        // isn't registered → falls through to lower_call_by_name (also
+        // a module_find_function probe + bld_call, covering user fns).
+        // Scale path: future per-arg C-type marshalling hooks go here
+        // so they run ONLY on FFI boundaries, not on user-fn calls.
+        let ffi_vid = nb_ffi_call_extern(m, b, cname, arg_vids)
+        if ffi_vid >= 0 { return ffi_vid }
         return lower_call_by_name(m, b, cname, arg_vids, "i64")
     }
     if k == "EnumPath" {
@@ -1475,6 +1571,17 @@ fn parse_and_lower(src: string, path: string) -> any {
             // to lower → don't record in fn_slots. Params kept as
             // [name, "i64"] tuples for arity; real per-param C-type
             // marshalling is P7-6 follow-up.
+            //
+            // P7-6 T4 (2026-04-19): dual-register when @symbol("c_sym")
+            // override is present. The parser stashes the C symbol in
+            // node.value (self/parser.hexa:3105). We register the
+            // IrFunction under the C symbol (node.value) so emission
+            // BLs the correct linker name, AND register an ALIAS under
+            // the hexa name (node.name) pointing to the same fid so
+            // call sites spelled with the hexa name still resolve.
+            //
+            // When no override is present (node.value == "" || == name),
+            // fall back to the legacy single-registration path.
             let xparams_ast = node.params
             let mut xir_params = []
             let mut xpi = 0
@@ -1482,7 +1589,17 @@ fn parse_and_lower(src: string, path: string) -> any {
                 xir_params = xir_params.push([xparams_ast[xpi].name, "i64"])
                 xpi = xpi + 1
             }
-            module_add_function(m, node.name, xir_params, "i64")
+            let c_sym = node.value
+            if len(c_sym) > 0 && c_sym != node.name {
+                // Emit BL c_sym: register under c_sym so backend sees
+                // the linker name. Alias under hexa name via a second
+                // entry with the same C sym stamp — arity-aligned
+                // params are duplicated.
+                module_add_function(m, c_sym, xir_params, "i64")
+                module_add_function(m, node.name, xir_params, "i64")
+            } else {
+                module_add_function(m, node.name, xir_params, "i64")
+            }
         } else if node.kind == "StructDecl" {
             // P7-6 Field struct_idx prep: register struct name + ordered
             // field names + declared field types. Parser emits
