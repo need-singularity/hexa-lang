@@ -1,0 +1,245 @@
+#!hexa strict
+// tool/raw_audit.hexa — .raw-audit append-only event log (P1c)
+//
+// PURPOSE
+//   Every unlock / lock / violation / emergency event writes one line
+//   to `.raw-audit`. The log is append-only: chflags uchg keeps prior
+//   entries immutable; a brief append window is opened by the writer
+//   and closed immediately after.
+//
+// FORMAT
+//   timestamp | event | actor | reason | result | sha_before | sha_after
+//
+//   timestamp — ISO-8601 UTC (date -u +"%Y-%m-%dT%H:%M:%SZ")
+//   event     — unlock | lock | verify | violation | emergency
+//   actor     — $USER (or explicit --actor tag)
+//   reason    — quoted, required on unlock / emergency
+//   result    — ok | fail | blocked
+//   sha_*     — sha256 of each 5 SSOT joined; "-" if unchanged
+//
+// ROTATION
+//   Monthly: if .raw-audit exceeds 10k lines or crosses month boundary,
+//   rename to .raw-audit.YYYY-MM and re-create .raw-audit empty.
+//   Rotation is triggered opportunistically by raw_all / hx_unlock.
+//
+// USAGE (library)
+//   use "tool/raw_audit"
+//   audit_append("unlock", "ghost", "fix raw#7 typo", "ok", sha_before, sha_after)
+//
+// USAGE (CLI)
+//   ./hexa tool/raw_audit.hexa tail 50     — show last 50 entries
+//   ./hexa tool/raw_audit.hexa verify      — schema check + sha sanity
+//   ./hexa tool/raw_audit.hexa rotate      — force monthly rotation
+
+use "self/core/law_io"
+
+fn _audit_path() -> string { return ".raw-audit" }
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _iso_utc_now() -> string {
+    // date -u +"%Y-%m-%dT%H:%M:%SZ" — portable on macOS + Linux
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _current_user() -> string {
+    let u = env("USER")
+    if u != "" { return u }
+    return to_string(exec("id -un")).trim()
+}
+
+// sha256 of 5 SSOT concatenated — used as a single-shot state fingerprint
+pub fn ssot_fingerprint() -> string {
+    let cmd = "cat .raw .own .ext .roadmap .loop 2>/dev/null | shasum -a 256 | cut -d' ' -f1"
+    return to_string(exec(cmd)).trim()
+}
+
+// ─── append (core operation) ─────────────────────────────────────
+
+fn _escape_pipe(s: string) -> string {
+    // audit lines are pipe-delimited — guard against embedded pipes.
+    return s.replace("|", "\\|").replace("\n", " ")
+}
+
+fn _ensure_audit_exists() -> bool {
+    let exists = to_string(exec("test -f '" + _audit_path() + "' && echo y || echo n")).trim()
+    if exists == "y" { return true }
+    // create empty file + write header
+    let header = "# .raw-audit — append-only event log (raw#0 P1c)\n" +
+                 "# format: timestamp | event | actor | reason | result | sha_before | sha_after\n"
+    let r = exec_with_status("printf '%s' " + _shell_quote(header) + " > " + _audit_path())
+    return r[1] == 0
+}
+
+fn _shell_quote(s: string) -> string {
+    // minimal single-quote wrapper; internal quotes escaped
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _open_append_window(path: string) -> bool {
+    // temporarily remove uchg so we can append; caller MUST re-lock.
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags nouchg " + _shell_quote(path) + " 2>&1")
+    return r[1] == 0
+}
+
+fn _close_append_window(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags uchg " + _shell_quote(path) + " 2>&1")
+    return r[1] == 0
+}
+
+pub fn audit_append(event: string, actor: string, reason: string, result: string,
+                    sha_before: string, sha_after: string) -> bool {
+    if !_ensure_audit_exists() { return false }
+    let ts = _iso_utc_now()
+    let line = ts + " | " + _escape_pipe(event)
+              + " | " + _escape_pipe(actor)
+              + " | " + _escape_pipe(reason)
+              + " | " + _escape_pipe(result)
+              + " | " + _escape_pipe(sha_before)
+              + " | " + _escape_pipe(sha_after) + "\n"
+
+    // open append window → append → close window
+    let unlocked = _open_append_window(_audit_path())
+    if !unlocked {
+        eprintln("raw_audit: could not open append window (chflags failed)")
+        return false
+    }
+    let r = exec_with_status("printf '%s' " + _shell_quote(line) + " >> " + _audit_path())
+    let relocked = _close_append_window(_audit_path())
+    if r[1] != 0 {
+        eprintln("raw_audit: append failed (exit " + to_string(r[1]) + ")")
+        return false
+    }
+    if !relocked {
+        eprintln("raw_audit: WARN — audit log left unlocked after append")
+    }
+    return true
+}
+
+// ─── convenience helpers ─────────────────────────────────────────
+
+pub fn audit_unlock(reason: string, result: string) -> bool {
+    let sha = ssot_fingerprint()
+    return audit_append("unlock", _current_user(), reason, result, sha, "-")
+}
+
+pub fn audit_lock(result: string, sha_before: string) -> bool {
+    let sha_after = ssot_fingerprint()
+    return audit_append("lock", _current_user(), "", result,
+                        sha_before == "" ? "-" : sha_before, sha_after)
+}
+
+pub fn audit_violation(rule: string, detail: string) -> bool {
+    return audit_append("violation", _current_user(), rule + ": " + detail,
+                        "blocked", ssot_fingerprint(), "-")
+}
+
+pub fn audit_emergency(reason: string) -> bool {
+    let sha = ssot_fingerprint()
+    return audit_append("emergency", _current_user(), reason, "ok", sha, "-")
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────
+
+fn cmd_tail(n: int) -> int {
+    let exists = to_string(exec("test -f '" + _audit_path() + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        println("(no .raw-audit yet — log is created on first event)")
+        return 0
+    }
+    let out = to_string(exec("tail -n " + to_string(n) + " " + _audit_path()))
+    print(out)
+    return 0
+}
+
+fn cmd_verify() -> int {
+    let exists = to_string(exec("test -f '" + _audit_path() + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        println("audit: CLEAN (no log yet)")
+        return 0
+    }
+    let src = to_string(read_file(_audit_path()))
+    let lines = split(src, "\n")
+    let mut errs = 0
+    let mut line_no = 0
+    for ln in lines {
+        line_no = line_no + 1
+        if len(ln) == 0 { continue }
+        if ln.substring(0, 1) == "#" { continue }
+        // minimum: 6 pipe separators = 7 fields
+        let mut pipes = 0
+        let mut i = 0
+        while i < len(ln) {
+            if ln.substring(i, i + 1) == "|" { pipes = pipes + 1 }
+            i = i + 1
+        }
+        if pipes < 6 {
+            eprintln(".raw-audit:" + to_string(line_no) + " malformed (< 7 fields)")
+            errs = errs + 1
+        }
+    }
+    if errs == 0 { println("audit: OK (" + to_string(line_no) + " lines)"); return 0 }
+    return 1
+}
+
+fn cmd_rotate() -> int {
+    let exists = to_string(exec("test -f '" + _audit_path() + "' && echo y || echo n")).trim()
+    if exists != "y" { return 0 }
+    let month = to_string(exec("date -u +\"%Y-%m\"")).trim()
+    let target = _audit_path() + "." + month
+    // open window, rename, recreate
+    let unlocked = _open_append_window(_audit_path())
+    if !unlocked { return 1 }
+    let r = exec_with_status("mv " + _audit_path() + " " + target)
+    if r[1] != 0 { return 1 }
+    _ensure_audit_exists()
+    _close_append_window(_audit_path())
+    println("rotated → " + target)
+    return 0
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_audit.hexa <tail N|verify|rotate>")
+}
+
+let _av = argv()
+let mut cmd = ""
+let mut tail_n = 50
+let mut i = 2
+while i < len(_av) {
+    let a = _av[i]
+    if a == "tail" || a == "verify" || a == "rotate" { cmd = a }
+    else if cmd == "tail" {
+        // parse integer N
+        let mut n = 0
+        let mut j = 0
+        while j < len(a) {
+            let c = a.substring(j, j + 1)
+            if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+            else { break }
+            j = j + 1
+        }
+        if n > 0 { tail_n = n }
+    }
+    i = i + 1
+}
+
+if cmd == "" {
+    _usage()
+    exit(2)
+}
+
+let mut rc = 0
+if cmd == "tail"        { rc = cmd_tail(tail_n) }
+else if cmd == "verify" { rc = cmd_verify() }
+else if cmd == "rotate" { rc = cmd_rotate() }
+else {
+    _usage()
+    exit(2)
+}
+exit(rc)

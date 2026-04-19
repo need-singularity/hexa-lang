@@ -1,0 +1,340 @@
+#!hexa strict
+// tool/raw_all.hexa — raw#0 unified enforcement orchestrator (P0a)
+//
+// PURPOSE
+//   Single entry point that walks every rule declared in .raw / .own
+//   (and .ext, when live), dispatches to each rule's declared enforcer,
+//   aggregates exit codes, and produces a pass/fail verdict for the
+//   whole repository.
+//
+//   This is the gate behind tool/hx_unlock.hexa — unlock is refused
+//   unless raw_all returns exit 0.
+//
+// USAGE
+//   ./hexa tool/raw_all.hexa                  — full run (live + warn + new)
+//   ./hexa tool/raw_all.hexa --fast           — skip heavy proof scripts
+//   ./hexa tool/raw_all.hexa --only raw 7     — single rule (debug)
+//   ./hexa tool/raw_all.hexa --json           — machine-readable output
+//
+// EXIT CODES
+//   0   — every live/new rule PASSED (warn rules may have warnings)
+//   1   — one or more rules FAILED
+//   2   — invocation error (bad args, missing files)
+//
+// DISPATCH MODEL
+//   For each rule:
+//     · status=deferred   → SKIP (rule not yet enforced)
+//     · status=convention → SKIP (advisory, no enforcer)
+//     · status=warn       → RUN enforce, report but never fail the gate
+//     · status=new        → RUN enforce, report (new rules block but soft)
+//     · status=live       → RUN enforce, any non-zero exit = FAIL
+//
+//   The enforce field is taken verbatim. If it contains a '#method'
+//   suffix (e.g., "tool/ai_native_scan.hexa#F5,F6"), only the file
+//   portion is invoked — each enforcer is expected to run its full
+//   method set when called without args. Rule-level #method selection
+//   is a P2a refinement (rule DAG).
+//
+// NOTES
+//   · Kinds validated: raw (L0) + own (L1). ext / roadmap / loop have
+//     their own dedicated lints (raw#13/#15/#16) and are invoked via
+//     the owning raw rule's enforce field.
+//   · Each enforcer runs in the same stage0 process via exec_with_status.
+//   · Output is deterministic — rules walked in declaration order.
+
+use "self/core/law_io"
+use "self/raw_loader"
+
+// ─── argv parsing ────────────────────────────────────────────────
+
+fn _parse_flags() -> array {
+    // returns [fast(bool), json(bool), only_kind(string), only_id(string)]
+    let av = argv()
+    let mut fast = false
+    let mut json = false
+    let mut only_kind = ""
+    let mut only_id = ""
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--fast" { fast = true }
+        else if a == "--json" { json = true }
+        else if a == "--only" {
+            if i + 2 < len(av) {
+                only_kind = av[i + 1]
+                only_id = av[i + 2]
+                i = i + 2
+            }
+        }
+        i = i + 1
+    }
+    return [fast, json, only_kind, only_id]
+}
+
+// ─── enforcer extraction ─────────────────────────────────────────
+
+fn _enforce_script(enforce_field: string) -> string {
+    // strip "#method" suffix: "tool/foo.hexa#F1,F2" → "tool/foo.hexa"
+    if enforce_field == "" { return "" }
+    let h = enforce_field.index_of("#")
+    if h < 0 { return enforce_field }
+    return enforce_field.substring(0, h)
+}
+
+fn _should_run(status: string) -> bool {
+    if status == "deferred" { return false }
+    if status == "convention" { return false }
+    return true
+}
+
+fn _is_fatal(status: string) -> bool {
+    // live blocks, warn/new soft-report (do not flip exit code)
+    return status == "live"
+}
+
+// ─── single enforcer invocation ──────────────────────────────────
+
+fn _run_enforcer(script: string) -> array {
+    // returns [exit_code, stdout_tail, duration_ms]
+    // stage0 binary path already on $PATH via ./hexa wrapper;
+    // we call the raw binary to avoid wrapper re-entry.
+    let cmd = "./build/hexa_stage0 " + script + " 2>&1"
+    let start_ms = 0  // stage0 lacks high-res clock builtin — placeholder
+    let r = exec_with_status(cmd)
+    let rc = r[1]
+    let out = to_string(r[0])
+    // keep last 10 lines as tail for error reporting
+    let lines = split(out, "\n")
+    let n = len(lines)
+    let mut tail = ""
+    let mut start_idx = 0
+    if n > 10 { start_idx = n - 10 }
+    let mut i = start_idx
+    while i < n {
+        if tail != "" { tail = tail + "\n" }
+        tail = tail + lines[i]
+        i = i + 1
+    }
+    return [rc, tail, start_ms]
+}
+
+// ─── one rule evaluation ─────────────────────────────────────────
+
+fn _eval_rule(kind: string, rule: array, fast: bool) -> array {
+    // returns [verdict, detail]
+    //   verdict ∈ {"PASS", "FAIL", "WARN", "SKIP"}
+    let id = rule[0]
+    let status = rule[1]
+    let name = rule[2]
+    let keys = rule[3]
+
+    if !_should_run(status) {
+        return ["SKIP", status]
+    }
+
+    let enforce_field = keys_first(keys, "enforce")
+    if enforce_field == "" {
+        // rule is live/warn/new but declares no enforce script.
+        // raw#9 proof-carrying: absent enforce = design gap.
+        if _is_fatal(status) {
+            return ["FAIL", "no `enforce` field on live rule"]
+        }
+        return ["WARN", "no `enforce` field (soft status)"]
+    }
+
+    let script = _enforce_script(enforce_field)
+    // skip heavy proofs under --fast (heuristic: proof field present)
+    if fast {
+        let proof = keys_first(keys, "proof")
+        if proof != "" && proof != script {
+            return ["SKIP", "fast-mode: proof-only rule"]
+        }
+    }
+
+    // stage0 executable guard — non-Darwin env cannot run Mach-O
+    let s0_check = exec_with_status("test -x ./build/hexa_stage0 && echo y || echo n")
+    let s0_ok = to_string(s0_check[0]).trim()
+    if s0_ok != "y" {
+        return ["SKIP", "hexa_stage0 not executable on this host"]
+    }
+
+    let r = _run_enforcer(script)
+    let rc = r[0]
+    let tail = r[1]
+
+    if rc == 0 { return ["PASS", script] }
+
+    if _is_fatal(status) {
+        return ["FAIL", script + " exit=" + to_string(rc) + "\n" + tail]
+    }
+    return ["WARN", script + " exit=" + to_string(rc) + " (soft)"]
+}
+
+// ─── output formatting ───────────────────────────────────────────
+
+fn _fmt_row(kind: string, rule: array, verdict: string, detail: string) -> string {
+    // "  [raw#7 live ]  PASS   tool/ai_native_scan.hexa"
+    let id = rule[0]
+    let status = rule[1]
+    let head = "  [" + kind + "#" + id + " " + status + "]"
+    // pad status to 10 chars so columns align (best-effort)
+    let pad = 22 - len(head)
+    let mut p = ""
+    let mut i = 0
+    while i < pad {
+        p = p + " "
+        i = i + 1
+    }
+    let v = verdict
+    let vpad = 7 - len(v)
+    let mut vp = ""
+    i = 0
+    while i < vpad {
+        vp = vp + " "
+        i = i + 1
+    }
+    return head + p + v + vp + " " + detail
+}
+
+fn _json_escape(s: string) -> string {
+    // minimal escaping for stdout JSON — no nested quotes expected in
+    // script paths or status strings; newlines replaced with \n.
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", "\\n")
+    return c
+}
+
+// ─── main walk ───────────────────────────────────────────────────
+
+fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string, only_id: string, json: bool) -> array {
+    // returns [pass_ct, fail_ct, warn_ct, skip_ct, json_entries(array)]
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        if kind == "raw" {
+            // .raw MUST exist
+            eprintln("raw_all: FATAL — " + path + " missing")
+            return [0, 1, 0, 0, []]
+        }
+        return [0, 0, 0, 0, []]
+    }
+
+    // self-format validation (raw#1) — must pass before any rule walk
+    let strict_errs = validate_strict(path)
+    if len(strict_errs) > 0 {
+        if !json {
+            eprintln("raw_all: " + path + " fails self-format (raw#1):")
+            for e in strict_errs { eprintln("  " + e) }
+        }
+        return [0, 1, 0, 0, []]
+    }
+
+    let rules = load_raw_file(path)
+    let mut pass_ct = 0
+    let mut fail_ct = 0
+    let mut warn_ct = 0
+    let mut skip_ct = 0
+    let mut json_entries = []
+
+    for rule in rules {
+        if only_kind != "" {
+            if only_kind != kind { continue }
+            if only_id != "" && only_id != rule[0] { continue }
+        }
+
+        let r = _eval_rule(kind, rule, fast)
+        let verdict = r[0]
+        let detail = r[1]
+
+        if verdict == "PASS" { pass_ct = pass_ct + 1 }
+        else if verdict == "FAIL" { fail_ct = fail_ct + 1 }
+        else if verdict == "WARN" { warn_ct = warn_ct + 1 }
+        else { skip_ct = skip_ct + 1 }
+
+        if json {
+            let entry = "{\"kind\":\"" + kind +
+                        "\",\"id\":\"" + rule[0] +
+                        "\",\"status\":\"" + rule[1] +
+                        "\",\"name\":\"" + _json_escape(rule[2]) +
+                        "\",\"verdict\":\"" + verdict +
+                        "\",\"detail\":\"" + _json_escape(detail) + "\"}"
+            json_entries = json_entries.push(entry)
+        } else {
+            println(_fmt_row(kind, rule, verdict, detail))
+        }
+    }
+
+    return [pass_ct, fail_ct, warn_ct, skip_ct, json_entries]
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let flags = _parse_flags()
+    let fast = flags[0]
+    let json = flags[1]
+    let only_kind = flags[2]
+    let only_id = flags[3]
+
+    if !json {
+        println("── raw#0 unified enforcement (raw_all) ──")
+        if fast { println("mode: fast (proof scripts skipped)") }
+        if only_kind != "" {
+            println("filter: " + only_kind + (only_id == "" ? "*" : "#" + only_id))
+        }
+        println("")
+    }
+
+    let mut json_all = []
+    let mut total_pass = 0
+    let mut total_fail = 0
+    let mut total_warn = 0
+    let mut total_skip = 0
+
+    // Walk .raw (L0)
+    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json)
+    total_pass = total_pass + r_raw[0]
+    total_fail = total_fail + r_raw[1]
+    total_warn = total_warn + r_raw[2]
+    total_skip = total_skip + r_raw[3]
+    for e in r_raw[4] { json_all = json_all.push(e) }
+
+    // Walk .own (L1)
+    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json)
+    total_pass = total_pass + r_own[0]
+    total_fail = total_fail + r_own[1]
+    total_warn = total_warn + r_own[2]
+    total_skip = total_skip + r_own[3]
+    for e in r_own[4] { json_all = json_all.push(e) }
+
+    if json {
+        let mut body = ""
+        let mut first = true
+        for e in json_all {
+            if first { body = e; first = false } else { body = body + "," + e }
+        }
+        let verdict_str = (total_fail == 0 ? "PASS" : "FAIL")
+        println("{\"verdict\":\"" + verdict_str +
+                "\",\"pass\":" + to_string(total_pass) +
+                ",\"fail\":" + to_string(total_fail) +
+                ",\"warn\":" + to_string(total_warn) +
+                ",\"skip\":" + to_string(total_skip) +
+                ",\"rules\":[" + body + "]}")
+    } else {
+        println("")
+        println("summary: pass=" + to_string(total_pass)
+                + " fail=" + to_string(total_fail)
+                + " warn=" + to_string(total_warn)
+                + " skip=" + to_string(total_skip))
+        if total_fail == 0 {
+            println("verdict: PASS — unlock gate would accept")
+        } else {
+            println("verdict: FAIL — unlock gate would refuse")
+        }
+    }
+
+    if total_fail > 0 { return 1 }
+    return 0
+}
+
+exit(main())

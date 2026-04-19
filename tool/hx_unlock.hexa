@@ -1,0 +1,198 @@
+#!hexa strict
+// tool/hx_unlock.hexa — blessed unlock gate (P0b)
+//
+// PURPOSE
+//   The ONLY sanctioned path to remove chflags uchg from SSOT files.
+//   Requires:
+//     · raw_all exit 0 (all live rules pass)
+//     · --reason "<text>" (mandatory, written to audit log)
+//     · optional --actor <name> (defaults to $USER)
+//     · optional --window <seconds> (default 300, max 3600)
+//
+// FLOW
+//   1. parse args; fail fast on missing --reason
+//   2. fingerprint SSOT (sha256 of 5 files)
+//   3. run raw_all; on FAIL → refuse, log "blocked" to audit, exit 1
+//   4. on PASS → chflags nouchg on required + optional targets
+//   5. audit "unlock" event with sha_before + reason
+//   6. schedule background re-lock at T + window (spawn detached)
+//   7. print banner with countdown + next steps
+//
+// RELOCK
+//   A background child `sh -c "sleep N; ./hexa tool/hx_lock.hexa auto"`
+//   is spawned. Even if the developer forgets, the tree re-locks after
+//   the window. The child re-runs raw_all on re-lock — if edits broke
+//   rules, the audit logs a warning and the files remain unlocked
+//   (letting developer fix rather than auto-reverting work).
+//
+// USAGE
+//   ./hexa tool/hx_unlock.hexa --reason "add raw#17 rule"
+//   ./hexa tool/hx_unlock.hexa --reason "fix typo" --window 60
+//
+// RAW chflags BYPASS DETECTION
+//   If an edit happens while raw_all fails, --force is NOT supported.
+//   The only escape is tool/emergency/raw_reset.sh (documented).
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _default_window() -> int { return 300 }
+fn _max_window() -> int { return 3600 }
+
+// ─── arg parsing ─────────────────────────────────────────────────
+
+fn _parse_args() -> array {
+    // returns [reason, actor, window_sec, ok]
+    let av = argv()
+    let mut reason = ""
+    let mut actor = ""
+    let mut window = _default_window()
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--reason" {
+            if i + 1 < len(av) { reason = av[i + 1]; i = i + 1 }
+        } else if a == "--actor" {
+            if i + 1 < len(av) { actor = av[i + 1]; i = i + 1 }
+        } else if a == "--window" {
+            if i + 1 < len(av) {
+                // parse integer
+                let s = av[i + 1]
+                let mut n = 0
+                let mut j = 0
+                while j < len(s) {
+                    let c = s.substring(j, j + 1)
+                    if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+                    else { break }
+                    j = j + 1
+                }
+                if n > 0 { window = n }
+                i = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if actor == "" {
+        actor = env("USER")
+        if actor == "" { actor = to_string(exec("id -un")).trim() }
+    }
+    if window > _max_window() { window = _max_window() }
+    let ok = reason != ""
+    return [reason, actor, window, ok]
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/hx_unlock.hexa --reason \"<text>\" [--actor NAME] [--window SEC]")
+    eprintln("")
+    eprintln("  --reason   mandatory. Written verbatim to .raw-audit.")
+    eprintln("  --actor    defaults to $USER.")
+    eprintln("  --window   seconds until auto re-lock (default 300, max 3600).")
+    eprintln("")
+    eprintln("  raw_all must return exit 0 — no --force override.")
+    eprintln("  Escape hatch: tool/emergency/raw_reset.sh (sudo required).")
+}
+
+// ─── gate ────────────────────────────────────────────────────────
+
+fn _run_raw_all() -> int {
+    let r = exec_with_status("./build/hexa_stage0 tool/raw_all.hexa 2>&1")
+    let out = to_string(r[0])
+    // echo raw_all output so developer sees what failed
+    print(out)
+    return r[1]
+}
+
+// ─── unlock operation ────────────────────────────────────────────
+
+fn _unlock_targets() -> int {
+    // delegate to os_level_lock.hexa unlock — it knows the target set
+    let r = exec_with_status("./build/hexa_stage0 tool/os_level_lock.hexa unlock 2>&1")
+    let out = to_string(r[0])
+    print(out)
+    return r[1]
+}
+
+// ─── relock daemon ───────────────────────────────────────────────
+
+fn _spawn_relock(window_sec: int, reason: string) -> int {
+    // detach so this script exits but child survives
+    // child: sleep N → hx_lock auto → audit entry
+    let cmd = "nohup sh -c '"
+              + "sleep " + to_string(window_sec) + "; "
+              + "./build/hexa_stage0 tool/hx_lock.hexa --auto --reason \"window expired after "
+              + to_string(window_sec) + "s (unlock reason: " + reason.replace("\"", "'\\''") + ")\""
+              + "' >/dev/null 2>&1 &"
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let args = _parse_args()
+    let reason = args[0]
+    let actor = args[1]
+    let window = args[2]
+    let ok = args[3]
+
+    if !ok {
+        _usage()
+        return 2
+    }
+
+    if !_is_darwin() {
+        eprintln("hx_unlock: non-Darwin OS — chflags unavailable, exiting without action")
+        return 0
+    }
+
+    println("── hx unlock ──")
+    println("actor:  " + actor)
+    println("reason: " + reason)
+    println("window: " + to_string(window) + "s")
+    println("")
+
+    // fingerprint BEFORE raw_all (we want the pre-unlock state hash)
+    let sha_before = ssot_fingerprint()
+
+    // gate — raw_all must pass
+    println("── gate: raw_all ──")
+    let rc = _run_raw_all()
+    if rc != 0 {
+        eprintln("")
+        eprintln("hx_unlock: refused — raw_all exit=" + to_string(rc))
+        audit_append("unlock", actor, reason, "blocked", sha_before, "-")
+        return 1
+    }
+
+    println("")
+    println("── unlock ──")
+    let urc = _unlock_targets()
+    if urc != 0 {
+        eprintln("hx_unlock: chflags nouchg failed exit=" + to_string(urc))
+        audit_append("unlock", actor, reason, "fail", sha_before, "-")
+        return 1
+    }
+
+    // audit: successful unlock
+    audit_append("unlock", actor, reason, "ok", sha_before, "-")
+
+    // schedule re-lock
+    let src = _spawn_relock(window, reason)
+    if src != 0 {
+        eprintln("hx_unlock: WARN — relock daemon spawn failed (will need manual ./hx lock)")
+    }
+
+    println("")
+    println("── OK ──")
+    println("SSOT unlocked for " + to_string(window) + "s.")
+    println("Auto re-lock at T+" + to_string(window) + "s (best effort).")
+    println("Prefer explicit: ./hexa tool/hx_lock.hexa   when done editing.")
+    return 0
+}
+
+exit(main())
