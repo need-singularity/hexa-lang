@@ -326,7 +326,136 @@ void hxblas_embed_scatter(int64_t S, int64_t D, int64_t dembed_p, int64_t dh_p, 
 #endif
 
 int64_t hxblas_version(void) {
-    return 2;
+    return 3;  // bumped 2026-04-20: + hxckpt_* binary ckpt FFI
+}
+
+// =============================================================
+// HEXACKPT-v2 binary ckpt FFI (2026-04-20) - Linux port
+// Mirrors anima/training/hxblas_wrapper.c (Mac Accelerate build).
+// See that file for format spec + design rationale. All little-endian.
+// =============================================================
+
+#include <stdio.h>
+
+int64_t hxckpt_open_append(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "ab");
+    return (int64_t)(uintptr_t)f;
+}
+int64_t hxckpt_open_write(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "wb");
+    return (int64_t)(uintptr_t)f;
+}
+int64_t hxckpt_open_read(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return 0;
+    FILE* f = fopen(path, "rb");
+    return (int64_t)(uintptr_t)f;
+}
+int64_t hxckpt_close(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    return (int64_t)fclose(f);
+}
+int64_t hxckpt_write_bytes(int64_t handle, int64_t buf_p, int64_t n_bytes) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    const void* buf = (const void*)(uintptr_t)buf_p;
+    if (!f || !buf || n_bytes < 0) return -1;
+    size_t got = fwrite(buf, 1, (size_t)n_bytes, f);
+    return (got == (size_t)n_bytes) ? 0 : -2;
+}
+int64_t hxckpt_read_bytes(int64_t handle, int64_t buf_p, int64_t n_bytes) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    void* buf = (void*)(uintptr_t)buf_p;
+    if (!f || !buf || n_bytes < 0) return -1;
+    size_t got = fread(buf, 1, (size_t)n_bytes, f);
+    return (int64_t)got;
+}
+int64_t hxckpt_write_u32(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint32_t v = (uint32_t)val;
+    unsigned char b[4];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    b[2] = (unsigned char)((v >> 16) & 0xFF);
+    b[3] = (unsigned char)((v >> 24) & 0xFF);
+    return (fwrite(b, 1, 4, f) == 4) ? 0 : -2;
+}
+int64_t hxckpt_read_u32(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[4];
+    if (fread(b, 1, 4, f) != 4) return -1;
+    uint32_t v = (uint32_t)b[0] | ((uint32_t)b[1] << 8)
+               | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+    return (int64_t)v;
+}
+int64_t hxckpt_write_u64(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint64_t v = (uint64_t)val;
+    unsigned char b[8];
+    for (int i = 0; i < 8; i++) b[i] = (unsigned char)((v >> (i * 8)) & 0xFF);
+    return (fwrite(b, 1, 8, f) == 8) ? 0 : -2;
+}
+int64_t hxckpt_read_u64(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[8];
+    if (fread(b, 1, 8, f) != 8) return -1;
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v |= ((uint64_t)b[i]) << (i * 8);
+    return (int64_t)v;
+}
+int64_t hxckpt_write_u16(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    uint16_t v = (uint16_t)val;
+    unsigned char b[2];
+    b[0] = (unsigned char)(v & 0xFF);
+    b[1] = (unsigned char)((v >> 8) & 0xFF);
+    return (fwrite(b, 1, 2, f) == 2) ? 0 : -2;
+}
+int64_t hxckpt_read_u16(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b[2];
+    if (fread(b, 1, 2, f) != 2) return -1;
+    uint16_t v = (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+    return (int64_t)v;
+}
+int64_t hxckpt_write_u8(int64_t handle, int64_t val) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b = (unsigned char)(val & 0xFF);
+    return (fwrite(&b, 1, 1, f) == 1) ? 0 : -2;
+}
+int64_t hxckpt_read_u8(int64_t handle) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    if (!f) return -1;
+    unsigned char b;
+    if (fread(&b, 1, 1, f) != 1) return -1;
+    return (int64_t)b;
+}
+int64_t hxckpt_write_str_bytes(int64_t handle, int64_t str_p, int64_t slen) {
+    FILE* f = (FILE*)(uintptr_t)handle;
+    const char* s = (const char*)(uintptr_t)str_p;
+    if (!f || !s || slen < 0) return -1;
+    return (fwrite(s, 1, (size_t)slen, f) == (size_t)slen) ? 0 : -2;
+}
+int64_t hxckpt_file_size(int64_t path_p) {
+    const char* path = (const char*)(uintptr_t)path_p;
+    if (!path) return -1;
+    FILE* f = fopen(path, "rb");
+    if (!f) return -1;
+    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+    long sz = ftell(f);
+    fclose(f);
+    return (int64_t)sz;
 }
 
 #ifndef __linux__
