@@ -1,0 +1,243 @@
+// self/attrs/_own/speculative_decode.hexa
+// @speculative_decode scaffold implementation (ROI #163)
+//
+// 배경:
+//   shared/hexa-lang/ai-native.json status=stub_registered.
+//   AttrKind 는 self/token.hexa 에 등록 완료. 여기선 attr 의미·검증·apply 를 제공.
+//
+// 의미:
+//   @speculative_decode(draft=<fn>, verify=<fn>, k=<int>) 가 fn 에 붙으면
+//   런타임이 2-model dispatch 로 추론을 가속한다:
+//     (1) draft(ctx, k)   → k 토큰 예측 (small/fast model)
+//     (2) verify(ctx+d)   → 대형 모델이 병렬 검증 → accept mask
+//     (3) matched prefix  → emit, 첫 불일치에서 rollback
+//
+// 이 파일은 scaffold:
+//   · 파서 (선언 parse_specdecode_decl)
+//   · 정적 검증 (check_specdecode_sections)
+//   · apply 런타임 helper (specdecode_loop — mock draft/verify)
+//   · find_specdecode_rules (HX11 프로젝트 .specdecode-rules.json 주입)
+//
+// 실제 인퍼런스 백엔드 연결은 후속 ROI — 현재 mock 으로 end-to-end 동작 확인.
+
+use "self/attrs/core"
+use "self/attrs/_lib/error_catalog"
+
+// ─── L2 PARSER ────────────────────────────────────────────────
+
+fn _sd_strip_comment(line: string) -> string {
+    let t = line.trim()
+    if t.starts_with("//") { return t.substring(2, len(t)).trim() }
+    if t.starts_with("#")  { return t.substring(1, len(t)).trim() }
+    return t
+}
+
+// @speculative_decode(...) 선언 라인 index (1-based), 없으면 -1
+fn _sd_find_open(lines) -> int {
+    let mut i = 0
+    for line in lines {
+        i = i + 1
+        let t = line.trim()
+        if t.starts_with("//") { continue }
+        if t.contains("@speculative_decode(") { return i }
+    }
+    return -1
+}
+
+// 선언 `@speculative_decode(k=v, ...)` body 추출 (단일 라인 전제)
+// 반환: [found, malformed, reason, body, line]
+fn _sd_extract_body(lines, start_line: int) {
+    if start_line <= 0 || start_line > len(lines) {
+        return [false, true, "no_open", "", start_line]
+    }
+    let raw = lines[start_line - 1]
+    let idx = raw.index_of("@speculative_decode(")
+    if idx < 0 { return [false, true, "no_open", "", start_line] }
+    let after = raw.substring(idx + 20, len(raw))
+    let close = after.index_of(")")
+    if close < 0 { return [true, true, "paren_unclosed", after, start_line] }
+    return [true, false, "", after.substring(0, close), start_line]
+}
+
+// k=v 쌍 top-level split (괄호/대괄호 depth 고려)
+fn _sd_split_pairs(body: string) {
+    let mut pairs = []
+    let mut cur = ""
+    let mut paren = 0
+    let mut br = 0
+    let n = len(body)
+    let mut i = 0
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == "(" { paren = paren + 1; cur = cur + c }
+        else if c == ")" { paren = paren - 1; cur = cur + c }
+        else if c == "[" { br = br + 1; cur = cur + c }
+        else if c == "]" { br = br - 1; cur = cur + c }
+        else if c == "," && paren == 0 && br == 0 {
+            let tt = cur.trim()
+            if len(tt) > 0 { pairs = pairs.push(tt) }
+            cur = ""
+        } else { cur = cur + c }
+        i = i + 1
+    }
+    let tt = cur.trim()
+    if len(tt) > 0 { pairs = pairs.push(tt) }
+    return pairs
+}
+
+// 선언 파싱 — map {found, malformed, reason, draft, verify, k, decl_line}
+pub fn parse_specdecode_decl(lines) {
+    let start_line = _sd_find_open(lines)
+    if start_line < 0 {
+        return #{"found": false, "malformed": false, "reason": "",
+                 "draft": "", "verify": "", "k": 4, "decl_line": -1}
+    }
+    let ext = _sd_extract_body(lines, start_line)
+    let ext_malformed = ext[1]
+    let ext_reason = ext[2]
+    let ext_body = ext[3]
+    if ext_malformed {
+        return #{"found": true, "malformed": true, "reason": ext_reason,
+                 "draft": "", "verify": "", "k": 4, "decl_line": start_line}
+    }
+    let pairs = _sd_split_pairs(ext_body)
+    let mut draft_s = ""
+    let mut verify_s = ""
+    let mut k = 4
+    for p in pairs {
+        let eqi = p.index_of("=")
+        if eqi < 0 { continue }
+        let key = p.substring(0, eqi).trim()
+        let val = p.substring(eqi + 1, len(p)).trim()
+        if key == "draft"  { draft_s  = val }
+        else if key == "verify" { verify_s = val }
+        else if key == "k" {
+            try { k = to_int(val) } catch e { k = 4 }
+        }
+    }
+    return #{"found": true, "malformed": false, "reason": "",
+             "draft": draft_s, "verify": verify_s, "k": k, "decl_line": start_line}
+}
+
+// ─── L3 VALIDATORS ────────────────────────────────────────────
+
+// 정적 검증:
+//   · draft / verify 둘 다 비어있으면 error
+//   · k < 1 또는 k > 64 이면 warn
+pub fn check_specdecode_decl(decl, source: string) {
+    let mut out = []
+    if !decl["found"] { return out }
+    if decl["malformed"] {
+        out = out.push(mk_msg4("specdecode", "error", decl["decl_line"],
+            "@speculative_decode(...) declaration malformed: " + decl["reason"]))
+        return out
+    }
+    if decl["draft"] == "" {
+        out = out.push(mk_msg4("specdecode", "error", decl["decl_line"],
+            "@speculative_decode missing draft= argument (e.g. draft=small_model)"))
+    }
+    if decl["verify"] == "" {
+        out = out.push(mk_msg4("specdecode", "error", decl["decl_line"],
+            "@speculative_decode missing verify= argument (e.g. verify=large_model)"))
+    }
+    let k = decl["k"]
+    if k < 1 {
+        out = out.push(mk_msg4("specdecode", "error", decl["decl_line"],
+            "@speculative_decode k must be >= 1 (got " + to_string(k) + ")"))
+    } else if k > 64 {
+        out = out.push(mk_msg4("specdecode", "warn", decl["decl_line"],
+            "@speculative_decode k=" + to_string(k) + " is unusually high (>64) — verify cost may dominate"))
+    }
+    return out
+}
+
+// ─── APPLY HELPERS (runtime scaffold) ─────────────────────────
+// 실제 codegen 통합 전 mock 런타임 helper.
+// 사용자는 draft/verify callback 을 직접 전달하여 loop 를 구동할 수 있다.
+//
+//   specdecode_step(ctx, draft_fn, verify_fn, k)
+//     → [accepted_tokens, new_ctx, rollback_count]
+//
+// 반환:
+//   accepted_tokens — verify 가 draft 와 일치로 확정한 token list
+//   new_ctx         — ctx + accepted_tokens (다음 step 의 입력)
+//   rollback_count  — draft 가 예측했으나 reject 된 토큰 수 (k - |accepted|)
+
+// 기본 draft — ctx 기반 deterministic stub: "ctx_k_i" 문자열 token 생성
+pub fn mock_draft_fn(ctx, k: int) {
+    let mut toks = []
+    let mut i = 0
+    let ctx_len = len(ctx)
+    while i < k {
+        toks = toks.push("t" + to_string(ctx_len + i))
+        i = i + 1
+    }
+    return toks
+}
+
+// 기본 verify — ctx + draft_toks 받아 accept mask ([bool]) 반환.
+// mock: 모든 토큰 accept (identity verify).
+pub fn mock_verify_fn(ctx, draft_toks) {
+    let mut mask = []
+    for _ in draft_toks { mask = mask.push(true) }
+    return mask
+}
+
+// 핵심 루프 1 step — draft → verify → accept prefix → rollback suffix
+pub fn specdecode_step(ctx, draft_fn, verify_fn, k: int) {
+    let draft_toks = draft_fn(ctx, k)
+    let mask = verify_fn(ctx, draft_toks)
+    // accept prefix: 첫 false 또는 길이까지
+    let mut accepted = []
+    let mut i = 0
+    let n = len(mask)
+    while i < n {
+        if mask[i] { accepted = accepted.push(draft_toks[i]) } else { break }
+        i = i + 1
+    }
+    // new_ctx = ctx + accepted
+    let mut new_ctx = ctx
+    for t in accepted { new_ctx = new_ctx.push(t) }
+    let rollback = k - len(accepted)
+    return [accepted, new_ctx, rollback]
+}
+
+// 다중-step loop — `steps` 횟수만큼 specdecode_step 반복.
+// 반환: [final_ctx, total_accepted, total_rollback]
+pub fn specdecode_loop(initial_ctx, draft_fn, verify_fn, k: int, steps: int) {
+    let mut ctx = initial_ctx
+    let mut total_accept = 0
+    let mut total_rb = 0
+    let mut s = 0
+    while s < steps {
+        let r = specdecode_step(ctx, draft_fn, verify_fn, k)
+        let accepted = r[0]
+        ctx = r[1]
+        total_rb = total_rb + r[2]
+        total_accept = total_accept + len(accepted)
+        // accept 가 0 이면 정체 — early stop
+        if len(accepted) == 0 { break }
+        s = s + 1
+    }
+    return [ctx, total_accept, total_rb]
+}
+
+// ─── HX11 RULES LOADER (scaffold) ─────────────────────────────
+// find_specdecode_rules(source) — 현재는 빈 map 반환.
+// 후속 ROI 에서 `.specdecode-rules.json` 또는 project.hexa 블록 로드 예정.
+// 예상 키: min_k, max_k, default_draft, default_verify, reject_rate_threshold
+pub fn find_specdecode_rules(source: string) {
+    // Phase 1 scaffold — empty map (caller uses builtin defaults)
+    return #{}
+}
+
+// 내장 defaults
+pub fn specdecode_builtin_rules() {
+    let mut r = #{}
+    r["min_k"] = 1
+    r["max_k"] = 64
+    r["default_draft"] = "mock_draft_fn"
+    r["default_verify"] = "mock_verify_fn"
+    r["reject_rate_warn"] = 0.5
+    return r
+}
