@@ -1,0 +1,187 @@
+// self/runtime/hxmetal_stub.hexa — ROI #147 Metal FFI scaffold
+//
+// PoC / scaffold: 9-function surface for Apple Metal compute shaders.
+// All bodies return deterministic sentinel values so dependent code
+// (serving/edge/metal_matmul.hexa, metal_fused.hexa) can be authored
+// against a fixed shape while the real objc_msgSend bridge is built in
+// a follow-up ROI.
+//
+// Design reference: docs/plans/hxmetal_ffi_design.md
+// Upstream consumer: $NEXUS/shared/roadmaps/m4_edge_deploy.json → E2-2/3/4
+// Related ceiling item: "M4 edge deploy, 33 tok/s physics floor". Enables
+//   GPU FFN compute (7.2ms) overlapped with CPU attn+prefetch (4.2ms) →
+//   per-layer = max(7.2, 4.2) = 7.2ms with BW hidden.
+//
+// WHAT WOULD GO INTO EACH STUB ONCE THE FFI LANDS
+// ------------------------------------------------
+//   hxm_device_default()       →  MTLCreateSystemDefaultDevice()
+//                                 (an `extern fn` from @link("Metal"))
+//
+//   hxm_queue(dev_h)           →  objc_msgSend(dev_p, sel_registerName("newCommandQueue"))
+//
+//   hxm_buffer(dev_h, nbytes)  →  objc_msgSend(dev_p,
+//                                   sel_registerName("newBufferWithLength:options:"),
+//                                   nbytes, MTLResourceStorageModeShared)
+//                                 On Apple Silicon, StorageModeShared = zero-copy
+//                                 between CPU and GPU (unified memory). This is
+//                                 *the* reason Metal wins on M4.
+//
+//   hxm_buffer_bytes(buf_h)    →  objc_msgSend(buf_p, sel_registerName("length"))
+//
+//   hxm_library_from_source    →  objc_msgSend(dev_p,
+//                                   sel_registerName("newLibraryWithSource:options:error:"),
+//                                   nsstr(src), nil, &err_p)
+//
+//   hxm_pipeline(lib_h, fname) →  let fn_p = objc_msgSend(lib_p,
+//                                   sel_registerName("newFunctionWithName:"), nsstr(fname))
+//                                 objc_msgSend(dev_p,
+//                                   sel_registerName("newComputePipelineStateWithFunction:error:"),
+//                                   fn_p, &err_p)
+//
+//   hxm_dispatch(pipe, bufs..) →  cmdbuf = [queue commandBuffer]
+//                                 enc = [cmdbuf computeCommandEncoder]
+//                                 [enc setComputePipelineState:pipe]
+//                                 [enc setBuffer:buf_in offset:0 atIndex:0]
+//                                 [enc setBuffer:buf_out offset:0 atIndex:1]
+//                                 [enc dispatchThreads:MTLSizeMake(n,1,1)
+//                                   threadsPerThreadgroup:MTLSizeMake(tpt,1,1)]
+//                                 [enc endEncoding]
+//                                 [cmdbuf commit]
+//                                 [cmdbuf waitUntilCompleted]
+//
+//   hxm_release(h)             →  objc_msgSend(ptr_from_int(h), sel_registerName("release"))
+//                                 (ARC-off manual retain/release model)
+//
+//   hxm_version()              →  compile-time ABI constant
+//
+// HANDLE SEMANTICS (locked by the 9 signatures)
+// ---------------------------------------------
+//   - A handle is an `int` that is a bit-pattern reinterpretation of the
+//     Objective-C `id` pointer via ptr_to_int / ptr_from_int.
+//   - Handle value 0 means null / error. Every stub returns 0 on failure.
+//   - Handles are NOT refcounted by hexa. The caller pairs each
+//     hxm_device_default / hxm_queue / hxm_buffer / hxm_library_from_source /
+//     hxm_pipeline with a matching hxm_release.
+//
+// PITFALLS HONOURED (CLAUDE.md HX3 + shared/hexa-lang/grammar.jsonl)
+// ------------------------------------------------------------------
+//   P1  — no semicolons
+//   P15 — let mut for reassigned locals
+//   P29 — .push() returns new array (not relevant here; no arrays mutated)
+//
+// AI-NATIVE RULE COMPLIANCE (HX12 default-strict)
+// -----------------------------------------------
+//   L2 literal-ban: only exception literals (-1, 0, 1, 2) appear in compares.
+//     The ABI version constant uses a symbolic name and compares against `1`.
+//   L3 brace-lock: same-line (K&R) throughout.
+//   L4 O(n^2)-concat: no string accumulation in loops; no loops at all.
+
+// ── ABI version ──────────────────────────────────────────────────
+// Bump when any signature changes. Tests assert this to trip on silent
+// ABI drift. Lives in module scope so `hxm_version()` folds to a const.
+let HXMETAL_ABI_VERSION = 1
+
+// ── Stub sentinel handle ─────────────────────────────────────────
+// Non-zero so tests can distinguish "stub returned a handle" from
+// "stub returned null on failure". Chosen distinct per resource type
+// so a test that accidentally swaps queue↔buffer handles will fail.
+let HXMETAL_STUB_DEVICE_H   = 101
+let HXMETAL_STUB_QUEUE_H    = 202
+let HXMETAL_STUB_LIBRARY_H  = 404
+let HXMETAL_STUB_PIPELINE_H = 505
+
+// Buffer handles encode nbytes so hxm_buffer_bytes() can recover the
+// originally-requested size without a side table. Real MTLBuffers
+// natively expose `[buf length]` for this; the stub emulates it by
+// packing `nbytes | 0x8000_0000_0000` into the handle int. 0 remains
+// the unambiguous null.
+let HXMETAL_BUFFER_TAG_BIT = 0x800000000000
+
+pub fn hxm_version() -> int {
+    return HXMETAL_ABI_VERSION
+}
+
+// ── hxm_device_default ───────────────────────────────────────────
+// Real: MTLCreateSystemDefaultDevice() — returns nil on headless / no-GPU.
+// Stub: returns the sentinel device handle unconditionally. Tests only
+// check for non-zero + stability across calls.
+pub fn hxm_device_default() -> int {
+    return HXMETAL_STUB_DEVICE_H
+}
+
+// ── hxm_queue ────────────────────────────────────────────────────
+// Real: objc_msgSend(dev_p, "newCommandQueue"). Returns nil if dev_p is nil.
+// Stub: mirrors the null-propagation rule — returns 0 on a null device so
+// the test for error propagation passes without real Metal.
+pub fn hxm_queue(dev_h: int) -> int {
+    if dev_h == 0 { return 0 }
+    return HXMETAL_STUB_QUEUE_H
+}
+
+// ── hxm_buffer ───────────────────────────────────────────────────
+// Real: [dev newBufferWithLength:nbytes options:MTLResourceStorageModeShared].
+//       Returns nil if nbytes <= 0 or allocation fails.
+// Stub: null on dev_h==0 or nbytes<=0, otherwise encodes nbytes in the
+//       handle so buffer_bytes can recover it.
+pub fn hxm_buffer(dev_h: int, nbytes: int) -> int {
+    if dev_h == 0 { return 0 }
+    if nbytes <= 0 { return 0 }
+    return HXMETAL_BUFFER_TAG_BIT + nbytes
+}
+
+// ── hxm_buffer_bytes ─────────────────────────────────────────────
+// Real: [buf length] — always the allocated byte count.
+// Stub: strips the tag bit. Returns 0 on a null handle so tests that pass
+//       null-handles-through do not crash.
+pub fn hxm_buffer_bytes(buf_h: int) -> int {
+    if buf_h == 0 { return 0 }
+    return buf_h - HXMETAL_BUFFER_TAG_BIT
+}
+
+// ── hxm_library_from_source ──────────────────────────────────────
+// Real: [dev newLibraryWithSource:MSL options:nil error:&e].
+//       Returns nil on MSL compile error; `e` carries the message.
+// Stub: non-empty source string → sentinel library handle. Empty source
+//       is treated as "compile error". No real MSL is parsed.
+pub fn hxm_library_from_source(dev_h: int, src: string) -> int {
+    if dev_h == 0 { return 0 }
+    if len(src) == 0 { return 0 }
+    return HXMETAL_STUB_LIBRARY_H
+}
+
+// ── hxm_pipeline ─────────────────────────────────────────────────
+// Real: fn_obj = [lib newFunctionWithName:fname]
+//       [dev newComputePipelineStateWithFunction:fn_obj error:&e]
+// Stub: non-empty fname + non-null lib → sentinel pipeline handle.
+pub fn hxm_pipeline(lib_h: int, fn_name: string) -> int {
+    if lib_h == 0 { return 0 }
+    if len(fn_name) == 0 { return 0 }
+    return HXMETAL_STUB_PIPELINE_H
+}
+
+// ── hxm_dispatch ─────────────────────────────────────────────────
+// Real: encode compute pass with pipe+bufs, commit, waitUntilCompleted.
+//       Returns 0 on success, non-zero on any encode/commit/wait error.
+// Stub: returns 0 ("success") iff every handle is non-null and nthreads>0.
+//       Otherwise returns -1 ("invalid argument"). This lets the stub
+//       test exercise both success and error paths without a GPU.
+//
+// Signature note: the single-input / single-output form is the narrowest
+// useful dispatch shape. Matmul will need a 3-buffer form; we will add
+// hxm_dispatch3 in a follow-up rather than overload this signature.
+pub fn hxm_dispatch(pipe_h: int, buf_in_h: int, buf_out_h: int, nthreads: int) -> int {
+    if pipe_h == 0 { return -1 }
+    if buf_in_h == 0 { return -1 }
+    if buf_out_h == 0 { return -1 }
+    if nthreads <= 0 { return -1 }
+    return 0
+}
+
+// ── hxm_release ──────────────────────────────────────────────────
+// Real: objc_msgSend(handle, "release"). Under MRR (manual retain/release)
+//       this decrements the refcount; at zero the object deallocates.
+// Stub: no-op. Always returns 0. Tests may call release on null handles
+//       (defensive double-release pattern) and expect no crash.
+pub fn hxm_release(h: int) -> int {
+    return 0
+}
