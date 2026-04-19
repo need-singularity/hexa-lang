@@ -1136,4 +1136,121 @@ int hxqwen14b_cu_launch_gqa_bwd(
     return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
 }
 
-}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 bwd kernels added inside)
+// ═════════════════════════════════════════════════════════════════════
+// v5.6.5 — host helpers needed by the backward orchestrator.
+//
+// 1. sgemm_rowmajor_xw  — dx = dy[M,N] @ W[N,K]   (input-grad through a
+//    frozen base sgemm whose forward was C = X @ W^T). cuBLAS row-major
+//    derivation: row-major dy[M,N] @ W[N,K] = row-major dx[M,K].
+//    col-major view: dx^T[K,M] = W^T[N,K]^T_col · dy^T[N,M]_col.
+//    Use cublasSgemm(OP_N, OP_N, m=K, n=M, k=N,
+//                    A=W,  lda=K,
+//                    B=dy, ldb=N,
+//                    C=dx, ldc=K).
+// 2. cu_memset_zero(dst, bytes) — wraps cudaMemsetAsync, used to zero
+//    accumulators between layer steps without per-launch malloc.
+// 3. cu_axpy(dst, src, N, alpha) — dst += alpha * src; element-wise.
+//    Used for accumulating dnormed contributions from q/k/v branches and
+//    residual carry adds.
+// ═════════════════════════════════════════════════════════════════════
+
+int hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+    int64_t dy_dev, int64_t W_dev, int64_t dx_dev,
+    int64_t M, int64_t K, int64_t N,
+    float alpha, float beta
+) {
+    if (v54_ensure_cublas() != HXQ_RC_OK) return HXQ_RC_KERNEL_FAIL;
+    if (dy_dev == 0 || W_dev == 0 || dx_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    if (M <= 0 || N <= 0 || K <= 0) return HXQ_RC_KERNEL_FAIL;
+    cublasStatus_t st = cublasSgemm(
+        g_cublas_handle,
+        CUBLAS_OP_N, CUBLAS_OP_N,
+        (int)K, (int)M, (int)N,
+        &alpha,
+        (const float*)(uintptr_t)W_dev,  (int)K,
+        (const float*)(uintptr_t)dy_dev, (int)N,
+        &beta,
+        (float*)(uintptr_t)dx_dev, (int)K);
+    return (st == CUBLAS_STATUS_SUCCESS) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+int hxqwen14b_cu_launch_memset_zero(int64_t dst_dev, int64_t bytes) {
+    if (dst_dev == 0 || bytes <= 0) return HXQ_RC_KERNEL_FAIL;
+    cudaError_t e = cudaMemsetAsync((void*)(uintptr_t)dst_dev, 0, (size_t)bytes, 0);
+    return (e == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+__global__ void v565_axpy_kernel(
+    float* __restrict__ dst, const float* __restrict__ src,
+    float alpha, int64_t N
+) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    dst[i] = dst[i] + alpha * src[i];
+}
+
+int hxqwen14b_cu_launch_axpy(int64_t dst_dev, int64_t src_dev,
+                              int64_t N, float alpha) {
+    if (dst_dev == 0 || src_dev == 0 || N <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    unsigned blocks = (unsigned)((N + threads - 1) / threads);
+    v565_axpy_kernel<<<blocks, threads>>>(
+        (float*)(uintptr_t)dst_dev,
+        (const float*)(uintptr_t)src_dev, alpha, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// v5.6.5 — on-device AdamW step.
+//   Update rule (per element):
+//     m = β1·m + (1-β1)·g
+//     v = β2·v + (1-β2)·g²
+//     m_hat = m / (1 - β1^t)
+//     v_hat = v / (1 - β2^t)
+//     θ -= lr · (m_hat / (sqrt(v_hat) + eps) + wd · θ)
+//   Decoupled weight decay (AdamW). bias_correction handled per-call so
+//   caller passes step t≥1.
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v565_adamw_step_kernel(
+    float* __restrict__ p,
+    const float* __restrict__ g,
+    float* __restrict__ m,
+    float* __restrict__ v,
+    float lr, float beta1, float beta2, float eps, float wd,
+    float bc1, float bc2,    // bias corrections: 1 - beta^t
+    int64_t N
+) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    float gi = g[i];
+    float mi = beta1 * m[i] + (1.0f - beta1) * gi;
+    float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
+    m[i] = mi;
+    v[i] = vi;
+    float m_hat = mi / bc1;
+    float v_hat = vi / bc2;
+    float upd = m_hat / (sqrtf(v_hat) + eps) + wd * p[i];
+    p[i] = p[i] - lr * upd;
+}
+
+extern "C" int hxqwen14b_cu_launch_adamw_step(
+    int64_t p_dev, int64_t g_dev, int64_t m_dev, int64_t v_dev,
+    float lr, float beta1, float beta2, float eps, float wd,
+    int64_t step, int64_t N
+) {
+    if (p_dev == 0 || g_dev == 0 || m_dev == 0 || v_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    if (N <= 0 || step <= 0) return HXQ_RC_KERNEL_FAIL;
+    float bc1 = 1.0f - powf(beta1, (float)step);
+    float bc2 = 1.0f - powf(beta2, (float)step);
+    int threads = 256;
+    unsigned blocks = (unsigned)((N + threads - 1) / threads);
+    v565_adamw_step_kernel<<<blocks, threads>>>(
+        (float*)(uintptr_t)p_dev,
+        (const float*)(uintptr_t)g_dev,
+        (float*)(uintptr_t)m_dev,
+        (float*)(uintptr_t)v_dev,
+        lr, beta1, beta2, eps, wd, bc1, bc2, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 bwd kernels + v5.6.5 helpers + adamw added inside)

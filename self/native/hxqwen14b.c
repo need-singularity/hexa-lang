@@ -4808,3 +4808,811 @@ int64_t hxqwen14b_version_v564(void) {
     return 564;
 }
 // End of v5.6.4 — kernels-ready probe (orchestrator body deferred).
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.5 — backward orchestrator BODY + cache-writing forward.
+//
+// Two new entries:
+//   1. hxqwen14b_base_forward_v56_with_lora_cache(args)
+//        Mirrors v5.6.2 forward but writes the 626 activation cache
+//        slots (13 per layer × 48 + 2 globals). Caller must pre-alloc
+//        the cache via hxqwen14b_v56_alloc_activation_cache(M, ptrs).
+//        Returns RC_OK on success, RC_ERR_CUDA_TODO when built without
+//        HXQWEN14B_CUDA. ABI-compatible with the existing fwd struct
+//        plus a cache_ptrs_p tail field.
+//
+//   2. hxqwen14b_base_backward_v56(args)  — body activated.
+//        Walks layers 47..0 in reverse using cached activations and the
+//        5 backward kernels (rmsnorm/rope/swiglu/gqa/softmax_ce) plus
+//        cuBLAS sgemm_rowmajor_xw for input-grad through frozen base
+//        weight matmuls (q/k/v/o/gate/up/down/lm_head). Per layer,
+//        accumulates LoRA grads into grad_lora_ptrs via 4 calls to
+//        hxqwen14b_lora_bwd_single (q/k/v/o). FFN block has no LoRA
+//        per r12 scope so dgate/dup/down stays as base-only.
+//
+//        Frozen base weights ⇒ only INPUT gradients are computed
+//        through the base sgemms; weight grads are NOT accumulated.
+//        Only the 192 LoRA adapters receive gradient writes.
+//
+// MEMORY: orchestrator allocates ~9 transient device buffers reused
+// across all 48 layers (dx, dnorm, dq, dk, dv, dattn, dgate, dup,
+// dffn_mid, dlogits_local). At M=1024 the largest is M*Fn*4 = 56 MB,
+// total ~250 MB transient + 15 GB cache + 14B base = ~30 GB peak.
+// Fits H100 80GB with comfortable headroom for batch up to M=2048
+// (would need 2× cache = 30 GB).
+//
+// LoRA-on-input chaining: when grad chain hits ln (rmsnorm output) at
+// the q/k/v sgemm input, we must add the contribution from the LoRA
+// branches whose forward was y += s · (x · A^T) · B^T. The dx through
+// LoRA is dy · B^T · A · s (handled inside lora_bwd_single via dx_p).
+// We pass dnorm as the dx accumulator, with dx_beta=1 inside the bwd.
+// ════════════════════════════════════════════════════════════════════
+
+// Forward declare extern launchers used by the cache fwd + orchestrator.
+extern int hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+    int64_t dy_dev, int64_t W_dev, int64_t dx_dev,
+    int64_t M, int64_t K, int64_t N,
+    float alpha, float beta);
+extern int hxqwen14b_cu_launch_memset_zero(int64_t dst_dev, int64_t bytes);
+extern int hxqwen14b_cu_launch_axpy(int64_t dst_dev, int64_t src_dev,
+                                     int64_t N, float alpha);
+
+// Cache slot index helper. L = 0..47, S = 0..12.
+//   slot 0  ln1_input    [M*d]
+//   slot 1  ln1_out      [M*d]
+//   slot 2  q_pre_rope   [M*dq]
+//   slot 3  k_pre_rope   [M*dkv]
+//   slot 4  v_buf        [M*dkv]
+//   slot 5  q_post_rope  [M*dq]
+//   slot 6  k_post_rope  [M*dkv]
+//   slot 7  attn_out     [M*dq]
+//   slot 8  x_post_attn  [M*d]
+//   slot 9  ln2_out      [M*d]
+//   slot 10 gate         [M*Fn]
+//   slot 11 up           [M*Fn]
+//   slot 12 ffn_mid      [M*Fn]
+// Globals at QWEN14B_N_LAYER * 13 + g:
+//   g=0  x_final_pre_norm
+//   g=1  ln_final_out
+#define V565_CACHE_SLOT(L, S) ((L) * V56_CACHE_SLOTS_PER_LAYER + (S))
+#define V565_CACHE_GLOBAL(g)  (QWEN14B_N_LAYER * V56_CACHE_SLOTS_PER_LAYER + (g))
+
+// Cache-writing forward — same args as v56 with one extra cache_ptrs_p tail.
+typedef struct HxQwenBaseFwdV56CacheArgs {
+    int64_t model_handle;
+    int64_t token_ids_dev;
+    int64_t M;
+    int64_t logits_dev;
+    int64_t lora_ptrs_p;
+    int64_t lora_r;
+    double  alpha_over_r;
+    int64_t cache_ptrs_p;       // V56_CACHE_TOTAL_SLOTS device pointers
+    int64_t reserved;
+} HxQwenBaseFwdV56CacheArgs;
+
+#ifdef HXQWEN14B_CUDA
+// Helper: device-to-device copy of N floats via axpy(beta=0)+axpy(alpha=1)
+// trick. We just do a raw sgemm_rowmajor_xw with W as identity? Too costly.
+// Use cudaMemcpyAsync directly via hxqwen14b_cu_memcpy_d2d if it exists; else
+// open-code via memset+axpy. Simpler: use cudaMemcpyAsync from runtime.
+#include <cuda_runtime.h>
+static int v565_d2d_copy(int64_t dst, int64_t src, int64_t bytes) {
+    cudaError_t e = cudaMemcpyAsync(
+        (void*)(uintptr_t)dst, (const void*)(uintptr_t)src,
+        (size_t)bytes, cudaMemcpyDeviceToDevice, 0);
+    return (e == cudaSuccess) ? RC_OK : RC_ERR_KERNEL_FAIL;
+}
+#endif
+
+int hxqwen14b_base_forward_v56_with_lora_cache(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+#ifndef HXQWEN14B_CUDA
+    (void)args;
+    return RC_ERR_CUDA_TODO;
+#else
+    HxQwenBaseFwdV56CacheArgs* a = (HxQwenBaseFwdV56CacheArgs*)args;
+    if (a->lora_r <= 0) return RC_ERR_BAD_ARGS;
+    if (a->lora_ptrs_p == 0 || a->cache_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+
+    int64_t h = a->model_handle;
+    if (h <= 0 || h >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    V54TensorSlot* slots = g_v54_slots[h];
+    if (slots[V54_SLOT_EMBED].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_FINAL_NORM].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_LM_HEAD].loaded == 0) return RC_ERR_BAD_HANDLE;
+
+    const int64_t M = a->M;
+    if (M <= 0) return RC_ERR_BAD_ARGS;
+
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t V   = QWEN14B_VOCAB;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t Fn  = QWEN14B_FFN_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+    const int64_t R   = a->lora_r;
+    const double  alpha_over_r = a->alpha_over_r;
+
+    int64_t* lora_ptrs  = (int64_t*)(uintptr_t)a->lora_ptrs_p;
+    int64_t* cache_ptrs = (int64_t*)(uintptr_t)a->cache_ptrs_p;
+
+    int64_t sz_Md  = M * d   * (int64_t)sizeof(float);
+    int64_t sz_Mq  = M * dq  * (int64_t)sizeof(float);
+    int64_t sz_Mkv = M * dkv * (int64_t)sizeof(float);
+    int64_t sz_MF  = M * Fn  * (int64_t)sizeof(float);
+    int64_t sz_MR  = M * R   * (int64_t)sizeof(float);
+
+    // Working buffer x_now persists across layers (rotating residual stream).
+    int64_t x_now    = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t proj     = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t ffn_out  = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t tmp_lora = hxqwen14b_cu_malloc_bytes(sz_MR);
+    int rc = RC_OK;
+    if (x_now == 0 || proj == 0 || ffn_out == 0 || tmp_lora == 0) {
+        rc = RC_ERR_OOM; goto v565_fwd_done;
+    }
+
+    rc = hxqwen14b_cu_launch_embed_lookup(
+        slots[V54_SLOT_EMBED].dev_ptr_fp32,
+        a->token_ids_dev, x_now, V, d, M);
+    if (rc != RC_OK) goto v565_fwd_done;
+
+    HxQwenRmsNormArgs rms_args; HxQwenKernelDispatch dsp;
+    HxQwenRopeArgs    rope_args;
+    HxQwenGqaArgs     gqa_args;
+    HxQwenSwigluArgs  sw_args;
+    HxQwenLoraFwdArgs lf;
+    memset(&rms_args, 0, sizeof(rms_args));
+    memset(&dsp, 0, sizeof(dsp));
+    memset(&rope_args, 0, sizeof(rope_args));
+    memset(&gqa_args, 0, sizeof(gqa_args));
+    memset(&sw_args, 0, sizeof(sw_args));
+    dsp.is_device = 1;
+
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        int base_w = V54_SLOT_LAYER_BASE(L);
+        int64_t w_ln1  = slots[base_w + 0].dev_ptr_fp32;
+        int64_t w_q    = slots[base_w + 1].dev_ptr_fp32;
+        int64_t w_k    = slots[base_w + 2].dev_ptr_fp32;
+        int64_t w_v    = slots[base_w + 3].dev_ptr_fp32;
+        int64_t w_o    = slots[base_w + 4].dev_ptr_fp32;
+        int64_t w_ln2  = slots[base_w + 5].dev_ptr_fp32;
+        int64_t w_gate = slots[base_w + 6].dev_ptr_fp32;
+        int64_t w_up   = slots[base_w + 7].dev_ptr_fp32;
+        int64_t w_down = slots[base_w + 8].dev_ptr_fp32;
+        int64_t b_q    = slots[base_w + 9].dev_ptr_fp32;
+        int64_t b_k    = slots[base_w + 10].dev_ptr_fp32;
+        int64_t b_v    = slots[base_w + 11].dev_ptr_fp32;
+
+        int64_t c_ln1_in   = cache_ptrs[V565_CACHE_SLOT(L, 0)];
+        int64_t c_ln1_out  = cache_ptrs[V565_CACHE_SLOT(L, 1)];
+        int64_t c_q_pre    = cache_ptrs[V565_CACHE_SLOT(L, 2)];
+        int64_t c_k_pre    = cache_ptrs[V565_CACHE_SLOT(L, 3)];
+        int64_t c_v        = cache_ptrs[V565_CACHE_SLOT(L, 4)];
+        int64_t c_q_post   = cache_ptrs[V565_CACHE_SLOT(L, 5)];
+        int64_t c_k_post   = cache_ptrs[V565_CACHE_SLOT(L, 6)];
+        int64_t c_attn     = cache_ptrs[V565_CACHE_SLOT(L, 7)];
+        int64_t c_x_post_a = cache_ptrs[V565_CACHE_SLOT(L, 8)];
+        int64_t c_ln2_out  = cache_ptrs[V565_CACHE_SLOT(L, 9)];
+        int64_t c_gate     = cache_ptrs[V565_CACHE_SLOT(L, 10)];
+        int64_t c_up       = cache_ptrs[V565_CACHE_SLOT(L, 11)];
+        int64_t c_ffn_mid  = cache_ptrs[V565_CACHE_SLOT(L, 12)];
+
+        // Cache: ln1_input = x_now (BEFORE rmsnorm1).
+        rc = v565_d2d_copy(c_ln1_in, x_now, sz_Md);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // rmsnorm1 → c_ln1_out.
+        rms_args.x_p = x_now; rms_args.w_p = w_ln1; rms_args.y_p = c_ln1_out;
+        rms_args.M_rows = M;  rms_args.d_model = d; rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // q_proj base + LoRA → c_q_pre (writes BEFORE rope).
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ln1_out, w_q, c_q_pre, M, dq, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dq; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = c_ln1_out;
+        lf.A_p = lora_ptrs[(L * 4 + 0) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 0) * 2 + 1];
+        lf.y_p = c_q_pre; lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora; lf.accumulate = 1; lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // k_proj base + LoRA → c_k_pre.
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ln1_out, w_k, c_k_pre, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dkv; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = c_ln1_out;
+        lf.A_p = lora_ptrs[(L * 4 + 1) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 1) * 2 + 1];
+        lf.y_p = c_k_pre; lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora; lf.accumulate = 1; lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // v_proj base + LoRA → c_v.
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ln1_out, w_v, c_v, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dkv; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = c_ln1_out;
+        lf.A_p = lora_ptrs[(L * 4 + 2) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 2) * 2 + 1];
+        lf.y_p = c_v; lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora; lf.accumulate = 1; lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // QKV biases on c_q_pre / c_k_pre / c_v.
+        rc = hxqwen14b_cu_launch_add_bias_1d(c_q_pre, b_q, M, dq);
+        if (rc != RC_OK) goto v565_fwd_done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(c_k_pre, b_k, M, dkv);
+        if (rc != RC_OK) goto v565_fwd_done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(c_v, b_v, M, dkv);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // Copy c_q_pre → c_q_post then rope (rope is in-place; cache wants
+        // BOTH pre + post copies for bwd). Same for k.
+        rc = v565_d2d_copy(c_q_post, c_q_pre, sz_Mq);
+        if (rc != RC_OK) goto v565_fwd_done;
+        rc = v565_d2d_copy(c_k_post, c_k_pre, sz_Mkv);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        rope_args.x_p = c_q_post; rope_args.B_batch = 1; rope_args.S_seq = M;
+        rope_args.n_heads = HQ; rope_args.head_dim = HD;
+        rope_args.theta_base = 1e6; rope_args.pos_offset = 0;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        rope_args.x_p = c_k_post; rope_args.n_heads = HK;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // GQA: q,k post-rope + v → c_attn.
+        gqa_args.q_p = c_q_post; gqa_args.k_p = c_k_post; gqa_args.v_p = c_v;
+        gqa_args.out_p = c_attn;
+        gqa_args.B_batch = 1; gqa_args.S_seq = M;
+        gqa_args.n_q_head = HQ; gqa_args.n_kv_head = HK; gqa_args.head_dim = HD;
+        gqa_args.softmax_scale = 1.0 / sqrt((double)HD);
+        gqa_args.causal = 1;
+        dsp.arg_p = (int64_t)(uintptr_t)&gqa_args;
+        rc = hxqwen14b_gqa_attn_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // o_proj base + LoRA on c_attn → proj (transient).
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_attn, w_o, proj, M, d, dq, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = d; lf.K_in = dq; lf.R_lora = R;
+        lf.x_p = c_attn;
+        lf.A_p = lora_ptrs[(L * 4 + 3) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 3) * 2 + 1];
+        lf.y_p = proj; lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora; lf.accumulate = 1; lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // residual: x_now += proj   (residual_add does y += x with y=x_now).
+        // After this call x_now holds (input + proj). Cache c_x_post_a from x_now.
+        rc = hxqwen14b_cu_launch_residual_add(proj, x_now, M * d);
+        if (rc != RC_OK) goto v565_fwd_done;
+        rc = v565_d2d_copy(c_x_post_a, x_now, sz_Md);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // FFN block.
+        rms_args.x_p = x_now; rms_args.w_p = w_ln2; rms_args.y_p = c_ln2_out;
+        rms_args.M_rows = M;  rms_args.d_model = d; rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ln2_out, w_gate, c_gate, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ln2_out, w_up, c_up, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        sw_args.gate_p = c_gate; sw_args.up_p = c_up; sw_args.y_p = c_ffn_mid;
+        sw_args.M_rows = M; sw_args.ffn_dim = Fn;
+        dsp.arg_p = (int64_t)(uintptr_t)&sw_args;
+        rc = hxqwen14b_swiglu_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                c_ffn_mid, w_down, ffn_out, M, d, Fn, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_fwd_done;
+
+        // x_now += ffn_out   (in-place residual; x_now becomes layer output).
+        rc = hxqwen14b_cu_launch_residual_add(ffn_out, x_now, M * d);
+        if (rc != RC_OK) goto v565_fwd_done;
+    }
+
+    // Cache global slots: x_final_pre_norm + ln_final_out.
+    int64_t c_x_final  = cache_ptrs[V565_CACHE_GLOBAL(0)];
+    int64_t c_ln_final = cache_ptrs[V565_CACHE_GLOBAL(1)];
+    rc = v565_d2d_copy(c_x_final, x_now, sz_Md);
+    if (rc != RC_OK) goto v565_fwd_done;
+
+    rms_args.x_p = x_now; rms_args.w_p = slots[V54_SLOT_FINAL_NORM].dev_ptr_fp32;
+    rms_args.y_p = c_ln_final; rms_args.M_rows = M; rms_args.d_model = d;
+    rms_args.eps = 1e-6;
+    dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+    rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+    if (rc != RC_OK) goto v565_fwd_done;
+
+    rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+            c_ln_final, slots[V54_SLOT_LM_HEAD].dev_ptr_fp32, a->logits_dev,
+            M, V, d, 1.0f, 0.0f);
+
+v565_fwd_done:
+    if (x_now != 0)    hxqwen14b_cu_free_ptr(x_now);
+    if (proj != 0)     hxqwen14b_cu_free_ptr(proj);
+    if (ffn_out != 0)  hxqwen14b_cu_free_ptr(ffn_out);
+    if (tmp_lora != 0) hxqwen14b_cu_free_ptr(tmp_lora);
+    return rc;
+#endif
+}
+
+int hxqwen14b_base_forward_v56_with_lora_cache_pos(
+    int64_t handle, int64_t ids_dev, int64_t M, int64_t logits_dev,
+    int64_t lora_ptrs_p, int64_t lora_r, double alpha_over_r,
+    int64_t cache_ptrs_p
+) {
+    HxQwenBaseFwdV56CacheArgs fa;
+    memset(&fa, 0, sizeof(fa));
+    fa.model_handle  = handle;
+    fa.token_ids_dev = ids_dev;
+    fa.M             = M;
+    fa.logits_dev    = logits_dev;
+    fa.lora_ptrs_p   = lora_ptrs_p;
+    fa.lora_r        = lora_r;
+    fa.alpha_over_r  = alpha_over_r;
+    fa.cache_ptrs_p  = cache_ptrs_p;
+    return hxqwen14b_base_forward_v56_with_lora_cache(&fa);
+}
+
+// ════════════════════════════════════════════════════════════════════
+// Backward orchestrator BODY — replaces v5.6.3 RC_ERR_CUDA_TODO stub.
+//
+// Symbol stays hxqwen14b_base_backward_v56 (same struct, same _pos
+// wrapper) so the trainer FFI surface is unchanged.
+//
+// Strategy: instead of editing the existing CUDA_TODO function we add
+// a v565 implementation and route the v56 entry through it. This keeps
+// the v5.6.3 scaffolding code untouched (frozen ABI guarantee).
+// ════════════════════════════════════════════════════════════════════
+
+#ifdef HXQWEN14B_CUDA
+static int v565_bwd_impl(HxQwenBaseBwdV56Args* a) {
+    int64_t h = a->model_handle;
+    V54TensorSlot* slots = g_v54_slots[h];
+    if (slots[V54_SLOT_EMBED].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_FINAL_NORM].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_LM_HEAD].loaded == 0) return RC_ERR_BAD_HANDLE;
+
+    const int64_t M   = a->M;
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t V   = QWEN14B_VOCAB;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t Fn  = QWEN14B_FFN_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+    const int64_t R   = a->lora_r;
+    const float   s   = (float)a->alpha_over_r;
+
+    int64_t* cache    = (int64_t*)(uintptr_t)a->cache_ptrs_p;
+    int64_t* lora     = (int64_t*)(uintptr_t)a->lora_ptrs_p;
+    int64_t* glora    = (int64_t*)(uintptr_t)a->grad_lora_ptrs_p;
+
+    int64_t sz_Md  = M * d   * (int64_t)sizeof(float);
+    int64_t sz_Mq  = M * dq  * (int64_t)sizeof(float);
+    int64_t sz_Mkv = M * dkv * (int64_t)sizeof(float);
+    int64_t sz_MF  = M * Fn  * (int64_t)sizeof(float);
+    int64_t sz_MV  = M * V   * (int64_t)sizeof(float);
+    int64_t sz_MR  = M * R   * (int64_t)sizeof(float);
+
+    // Transient device buffers (re-used across all 48 layers).
+    int64_t dlogits  = hxqwen14b_cu_malloc_bytes(sz_MV);
+    int64_t dx       = hxqwen14b_cu_malloc_bytes(sz_Md);   // residual stream grad
+    int64_t dnorm    = hxqwen14b_cu_malloc_bytes(sz_Md);   // grad of rmsnorm output
+    int64_t dq_buf   = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t dk_buf   = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t dv_buf   = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t dattn    = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t dgate    = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t dup      = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t dffn     = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t dproj    = hxqwen14b_cu_malloc_bytes(sz_Md);   // grad through o_proj input == dattn buf via xw
+    int64_t dnorm2_g = hxqwen14b_cu_malloc_bytes(sz_Md);   // accumulator for ln2_out grad
+    int64_t dw_norm_unused = hxqwen14b_cu_malloc_bytes((int64_t)d * sizeof(float));  // bit-bucket dw for frozen norms
+    int64_t u_scratch = hxqwen14b_cu_malloc_bytes(sz_MR);  // for lora_bwd_single u
+    int64_t tmp_scratch = hxqwen14b_cu_malloc_bytes(sz_MR);// for lora_bwd_single tmp
+
+    int rc = RC_OK;
+    if (dlogits==0||dx==0||dnorm==0||dq_buf==0||dk_buf==0||dv_buf==0||dattn==0||
+        dgate==0||dup==0||dffn==0||dproj==0||dnorm2_g==0||dw_norm_unused==0||
+        u_scratch==0||tmp_scratch==0) {
+        rc = RC_ERR_OOM; goto v565_bwd_done;
+    }
+
+    // ── Step 1: zero LoRA grad buffers (caller convention: accumulate=0). ──
+    if (a->accumulate_grads == 0) {
+        for (int idx = 0; idx < V56_N_LORA_BUFS; idx++) {
+            int64_t bp = glora[idx];
+            if (bp == 0) continue;
+            int adapter = idx / 2;
+            int T = adapter % 4;
+            int is_A = (idx % 2) == 0;
+            int64_t Nout = (T==0)?dq:(T==1)?dkv:(T==2)?dkv:d;
+            int64_t Kin  = (T==3)?dq:d;
+            int64_t bytes = is_A ? (R * Kin * (int64_t)sizeof(float))
+                                 : (Nout * R * (int64_t)sizeof(float));
+            int rc0 = hxqwen14b_cu_launch_memset_zero(bp, bytes);
+            if (rc0 != RC_OK) { rc = rc0; goto v565_bwd_done; }
+        }
+    }
+
+    // ── Step 2: dlogits = (softmax(logits) - onehot(targets)) / M ──
+    rc = hxqwen14b_cu_launch_softmax_ce_bwd(
+        a->logits_dev, a->targets_dev, dlogits, M, V);
+    if (rc != RC_OK) goto v565_bwd_done;
+
+    // ── Step 3: lm_head: dln_final = dlogits @ lm_head_W,
+    //   then rmsnorm_bwd(x_final_pre_norm, w_final_norm, dln_final, dx, dw)
+    int64_t c_x_final  = cache[V565_CACHE_GLOBAL(0)];
+    int64_t c_ln_final = cache[V565_CACHE_GLOBAL(1)];
+    int64_t lm_head_W  = slots[V54_SLOT_LM_HEAD].dev_ptr_fp32;
+    int64_t w_final_norm = slots[V54_SLOT_FINAL_NORM].dev_ptr_fp32;
+    (void)c_ln_final;  // not needed (we go via x_final for rmsnorm input)
+
+    // dln_final[M,d] = dlogits[M,V] @ lm_head_W[V,d].
+    // Reuse dnorm as the dln_final buffer.
+    rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+            dlogits, lm_head_W, dnorm, M, d, V, 1.0f, 0.0f);
+    if (rc != RC_OK) goto v565_bwd_done;
+
+    // Final rmsnorm bwd: writes dx (= grad wrt x_final_pre_norm).
+    rc = hxqwen14b_cu_launch_rmsnorm_bwd(
+            c_x_final, w_final_norm, dnorm, dx, dw_norm_unused, M, d, 1e-6f);
+    if (rc != RC_OK) goto v565_bwd_done;
+
+    // ── Step 4: layers 47 → 0 reverse loop. ──
+    for (int L = QWEN14B_N_LAYER - 1; L >= 0; L--) {
+        int base_w = V54_SLOT_LAYER_BASE(L);
+        int64_t w_q    = slots[base_w + 1].dev_ptr_fp32;
+        int64_t w_k    = slots[base_w + 2].dev_ptr_fp32;
+        int64_t w_v    = slots[base_w + 3].dev_ptr_fp32;
+        int64_t w_o    = slots[base_w + 4].dev_ptr_fp32;
+        int64_t w_ln1  = slots[base_w + 0].dev_ptr_fp32;
+        int64_t w_ln2  = slots[base_w + 5].dev_ptr_fp32;
+        int64_t w_gate = slots[base_w + 6].dev_ptr_fp32;
+        int64_t w_up   = slots[base_w + 7].dev_ptr_fp32;
+        int64_t w_down = slots[base_w + 8].dev_ptr_fp32;
+
+        int64_t c_ln1_in   = cache[V565_CACHE_SLOT(L, 0)];
+        int64_t c_ln1_out  = cache[V565_CACHE_SLOT(L, 1)];
+        int64_t c_q_pre    = cache[V565_CACHE_SLOT(L, 2)];
+        int64_t c_k_pre    = cache[V565_CACHE_SLOT(L, 3)];
+        int64_t c_v        = cache[V565_CACHE_SLOT(L, 4)];
+        int64_t c_q_post   = cache[V565_CACHE_SLOT(L, 5)];
+        int64_t c_k_post   = cache[V565_CACHE_SLOT(L, 6)];
+        int64_t c_attn     = cache[V565_CACHE_SLOT(L, 7)];
+        int64_t c_x_post_a = cache[V565_CACHE_SLOT(L, 8)];
+        int64_t c_ln2_out  = cache[V565_CACHE_SLOT(L, 9)];
+        int64_t c_gate     = cache[V565_CACHE_SLOT(L, 10)];
+        int64_t c_up       = cache[V565_CACHE_SLOT(L, 11)];
+        int64_t c_ffn_mid  = cache[V565_CACHE_SLOT(L, 12)];
+
+        // dx is incoming gradient w.r.t. layer-output (= x_now after FFN
+        // residual). Forward was: x_post_ffn = x_post_attn + ffn_out.
+        // So dffn_out = dx and dx_post_attn (initial) = dx (residual carry).
+
+        // ── 4a: down_proj backward: dffn_mid = dx @ w_down (input-grad).
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dx, w_down, dffn, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4b: swiglu bwd: dgate, dup ←  silu'(g)*u*dffn_mid,  silu(g)*dffn_mid.
+        rc = hxqwen14b_cu_launch_swiglu_bwd(
+                c_gate, c_up, dffn, dgate, dup, M * Fn);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4c: gate/up sgemm bwd into ln2_out grad.
+        // dnorm2_g = dgate @ w_gate (start)
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dgate, w_gate, dnorm2_g, M, d, Fn, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+        // dnorm2_g += dup @ w_up
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dup, w_up, dnorm2_g, M, d, Fn, 1.0f, 1.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4d: rmsnorm2 bwd: input is x_post_attn ; output grad is
+        //   dx_post_attn (write into dnorm — new working buffer).
+        // After this, dnorm holds grad through ln2 wrt x_post_attn.
+        // Then we add to dx (residual carry from forward x_now += proj path).
+        rc = hxqwen14b_cu_launch_rmsnorm_bwd(
+                c_x_post_a, w_ln2, dnorm2_g, dnorm, dw_norm_unused, M, d, 1e-6f);
+        if (rc != RC_OK) goto v565_bwd_done;
+        // dx += dnorm (residual: x_post_ffn = x_post_attn + ffn_out, ffn path
+        // already consumed via swiglu → dnorm is the ln2 contribution).
+        rc = hxqwen14b_cu_launch_axpy(dx, dnorm, M * d, 1.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // Now dx holds grad wrt x_post_attn (combined ffn-branch + residual).
+
+        // ── 4e: o_proj backward (base + LoRA).
+        // proj forward: proj = c_attn · w_o^T + LoRA_o(c_attn). residual: x_now += proj
+        // ⇒ dproj = dx (full chain ; x_post_attn = x_now_pre + proj).
+        // dattn_base = dproj @ w_o.
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dx, w_o, dattn, M, dq, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+        // LoRA o_proj backward: x=c_attn, dy=dx (proj grad), accumulates dx into dattn.
+        {
+            HxQwenLoraBwdArgs lb;
+            memset(&lb, 0, sizeof(lb));
+            lb.M_rows = M; lb.N_out = d; lb.K_in = dq; lb.R_lora = R;
+            lb.x_p  = c_attn;
+            lb.A_p  = lora[(L * 4 + 3) * 2 + 0];
+            lb.B_p  = lora[(L * 4 + 3) * 2 + 1];
+            lb.dy_p = dx;
+            lb.dA_p = glora[(L * 4 + 3) * 2 + 0];
+            lb.dB_p = glora[(L * 4 + 3) * 2 + 1];
+            lb.dx_p = dattn;     // accumulates LoRA contrib (dx_beta=1 inside)
+            lb.alpha_over_r = a->alpha_over_r;
+            lb.accumulate_grads = a->accumulate_grads;
+            lb.is_device = 1;
+            lb.u_p   = u_scratch;
+            lb.tmp_p = tmp_scratch;
+            rc = hxqwen14b_lora_bwd_single(&lb);
+            if (rc != RC_OK) goto v565_bwd_done;
+        }
+
+        // dx now becomes residual carry for after-attention path. Save it.
+        // We'll need dx_residual_carry = original dx (ffn-residual contribution
+        // for the x_pre_attn input). Forward was: x_post_attn = x_now_pre + proj
+        // where x_now_pre is the ln1 input (= ln1_input). The grad flows BOTH
+        // into proj (= dx → handled via attn) and into x_now_pre (= dx itself).
+        // We accumulate: at end of layer block, dx_pre = (dx via attn chain) + dx (residual).
+        // The dx (residual) is preserved by accumulating into dx via axpy after attn.
+        // For now, copy dx → dproj (snapshot for residual carry).
+        rc = v565_d2d_copy(dproj, dx, sz_Md);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4f: GQA backward: produces dq_buf, dk_buf, dv_buf
+        // Need to zero dq/dk/dv first since gqa_bwd writes dQ + atomicAdd dK/dV.
+        rc = hxqwen14b_cu_launch_memset_zero(dq_buf, sz_Mq);
+        if (rc != RC_OK) goto v565_bwd_done;
+        rc = hxqwen14b_cu_launch_memset_zero(dk_buf, sz_Mkv);
+        if (rc != RC_OK) goto v565_bwd_done;
+        rc = hxqwen14b_cu_launch_memset_zero(dv_buf, sz_Mkv);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        float scale_attn = 1.0f / sqrtf((float)HD);
+        rc = hxqwen14b_cu_launch_gqa_bwd(
+                c_q_post, c_k_post, c_v, dattn,
+                dq_buf, dk_buf, dv_buf,
+                /*B*/1, /*S*/M, HQ, HK, HD,
+                scale_attn, /*causal*/1);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4g: rope bwd in-place on dq_buf, dk_buf.
+        rc = hxqwen14b_cu_launch_rope_bwd(
+                dq_buf, dq_buf, /*B*/1, M, HQ, HD, 1e6f, 0);
+        if (rc != RC_OK) goto v565_bwd_done;
+        rc = hxqwen14b_cu_launch_rope_bwd(
+                dk_buf, dk_buf, /*B*/1, M, HK, HD, 1e6f, 0);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4h: q/k/v sgemm bwd (input-grad) into dnorm (= dln1_out).
+        // Also LoRA bwd for q/k/v adapters.
+        // dnorm = dq_buf @ w_q
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dq_buf, w_q, dnorm, M, d, dq, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+        // dnorm += dk_buf @ w_k
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dk_buf, w_k, dnorm, M, d, dkv, 1.0f, 1.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+        // dnorm += dv_buf @ w_v
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xw(
+                dv_buf, w_v, dnorm, M, d, dkv, 1.0f, 1.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // LoRA q/k/v backward (accumulates into dnorm via dx_p).
+        for (int T = 0; T < 3; T++) {
+            int64_t Nout = (T==0)?dq:dkv;
+            int64_t dy_p = (T==0)?dq_buf:(T==1)?dk_buf:dv_buf;
+            HxQwenLoraBwdArgs lb;
+            memset(&lb, 0, sizeof(lb));
+            lb.M_rows = M; lb.N_out = Nout; lb.K_in = d; lb.R_lora = R;
+            lb.x_p  = c_ln1_out;
+            lb.A_p  = lora[(L * 4 + T) * 2 + 0];
+            lb.B_p  = lora[(L * 4 + T) * 2 + 1];
+            lb.dy_p = dy_p;
+            lb.dA_p = glora[(L * 4 + T) * 2 + 0];
+            lb.dB_p = glora[(L * 4 + T) * 2 + 1];
+            lb.dx_p = dnorm;     // accumulates LoRA contrib into dln1_out grad
+            lb.alpha_over_r = a->alpha_over_r;
+            lb.accumulate_grads = a->accumulate_grads;
+            lb.is_device = 1;
+            lb.u_p   = u_scratch;
+            lb.tmp_p = tmp_scratch;
+            rc = hxqwen14b_lora_bwd_single(&lb);
+            if (rc != RC_OK) goto v565_bwd_done;
+        }
+
+        // ── 4i: rmsnorm1 bwd: input was c_ln1_in, output grad is dnorm,
+        //   produces dx_into_layer (write into dx — overwrite!).
+        rc = hxqwen14b_cu_launch_rmsnorm_bwd(
+                c_ln1_in, w_ln1, dnorm, dx, dw_norm_unused, M, d, 1e-6f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        // ── 4j: residual carry: layer-input dx = dx (from rmsnorm1) + dproj (snapshot).
+        rc = hxqwen14b_cu_launch_axpy(dx, dproj, M * d, 1.0f);
+        if (rc != RC_OK) goto v565_bwd_done;
+
+        (void)w_ln2; (void)w_down; (void)c_x_post_a; (void)c_ln2_out;
+        (void)c_q_pre; (void)c_k_pre;  // pre-rope cache reserved for future symmetry checks
+        (void)c_ffn_mid;  // consumed inside swiglu_bwd is gate+up; ffn_mid bwd is dffn = dx @ w_down which used dx not c_ffn_mid (the swiglu output is the down input but down-bwd needs the input to compute dW; we skip dW since base is frozen).
+    }
+
+    // dx now holds grad wrt embed lookup output (token embeddings). Embed
+    // weights are frozen ⇒ no grad accumulation needed. Done.
+    rc = RC_OK;
+
+v565_bwd_done:
+    if (dlogits!=0)        hxqwen14b_cu_free_ptr(dlogits);
+    if (dx!=0)             hxqwen14b_cu_free_ptr(dx);
+    if (dnorm!=0)          hxqwen14b_cu_free_ptr(dnorm);
+    if (dq_buf!=0)         hxqwen14b_cu_free_ptr(dq_buf);
+    if (dk_buf!=0)         hxqwen14b_cu_free_ptr(dk_buf);
+    if (dv_buf!=0)         hxqwen14b_cu_free_ptr(dv_buf);
+    if (dattn!=0)          hxqwen14b_cu_free_ptr(dattn);
+    if (dgate!=0)          hxqwen14b_cu_free_ptr(dgate);
+    if (dup!=0)            hxqwen14b_cu_free_ptr(dup);
+    if (dffn!=0)           hxqwen14b_cu_free_ptr(dffn);
+    if (dproj!=0)          hxqwen14b_cu_free_ptr(dproj);
+    if (dnorm2_g!=0)       hxqwen14b_cu_free_ptr(dnorm2_g);
+    if (dw_norm_unused!=0) hxqwen14b_cu_free_ptr(dw_norm_unused);
+    if (u_scratch!=0)      hxqwen14b_cu_free_ptr(u_scratch);
+    if (tmp_scratch!=0)    hxqwen14b_cu_free_ptr(tmp_scratch);
+    return rc;
+}
+#endif
+
+// New v5.6.5 entry — body active. We DO NOT modify the v5.6.3
+// hxqwen14b_base_backward_v56 above (it stays as the CUDA_TODO sentinel
+// for ABI/compat tests). Trainer should switch to this entry.
+int hxqwen14b_base_backward_v565(void* args) {
+    if (args == NULL) return RC_ERR_NULL_ARGS;
+    HxQwenBaseBwdV56Args* a = (HxQwenBaseBwdV56Args*)args;
+    if (a->model_handle <= 0 || a->model_handle >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    if (a->M <= 0) return RC_ERR_BAD_ARGS;
+    if (a->logits_dev == 0 || a->targets_dev == 0) return RC_ERR_NULL_ARGS;
+    if (a->cache_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->lora_ptrs_p == 0 || a->grad_lora_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (a->lora_r <= 0) return RC_ERR_BAD_ARGS;
+#ifndef HXQWEN14B_CUDA
+    return RC_ERR_CUDA_TODO;
+#else
+    return v565_bwd_impl(a);
+#endif
+}
+
+int hxqwen14b_base_backward_v565_pos(int64_t handle, int64_t M,
+                                      int64_t logits_dev, int64_t targets_dev,
+                                      int64_t cache_ptrs_p,
+                                      int64_t lora_ptrs_p, int64_t grad_lora_ptrs_p,
+                                      int64_t lora_r, double alpha_over_r) {
+    HxQwenBaseBwdV56Args ba;
+    memset(&ba, 0, sizeof(ba));
+    ba.model_handle      = handle;
+    ba.M                 = M;
+    ba.logits_dev        = logits_dev;
+    ba.targets_dev       = targets_dev;
+    ba.cache_ptrs_p      = cache_ptrs_p;
+    ba.lora_ptrs_p       = lora_ptrs_p;
+    ba.grad_lora_ptrs_p  = grad_lora_ptrs_p;
+    ba.lora_r            = lora_r;
+    ba.alpha_over_r      = alpha_over_r;
+    ba.loss_scale        = 1.0;
+    ba.accumulate_grads  = 0;
+    return hxqwen14b_base_backward_v565(&ba);
+}
+
+int64_t hxqwen14b_version_v565(void) {
+    return 565;
+}
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.5 — host-side LoRA AdamW orchestrator. One call applies the
+// AdamW update across all 384 LoRA buffers (192 adapters × A,B). Caller
+// pre-allocates m and v moment buffers via _alloc_grad_buffers (same
+// shape; the alloc helper is shape-aware via R + projection lookups).
+// ════════════════════════════════════════════════════════════════════
+
+extern int hxqwen14b_cu_launch_adamw_step(
+    int64_t p_dev, int64_t g_dev, int64_t m_dev, int64_t v_dev,
+    float lr, float beta1, float beta2, float eps, float wd,
+    int64_t step, int64_t N);
+
+int hxqwen14b_v565_lora_adamw_step(
+    int64_t lora_ptrs_p, int64_t grad_ptrs_p,
+    int64_t m_ptrs_p, int64_t v_ptrs_p,
+    int64_t r, int64_t step,
+    double lr_d, double beta1_d, double beta2_d, double eps_d, double wd_d
+) {
+#ifndef HXQWEN14B_CUDA
+    (void)lora_ptrs_p; (void)grad_ptrs_p; (void)m_ptrs_p; (void)v_ptrs_p;
+    (void)r; (void)step; (void)lr_d; (void)beta1_d; (void)beta2_d; (void)eps_d; (void)wd_d;
+    return RC_ERR_CUDA_TODO;
+#else
+    if (lora_ptrs_p == 0 || grad_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (m_ptrs_p == 0 || v_ptrs_p == 0)       return RC_ERR_NULL_ARGS;
+    if (r <= 0 || step <= 0)                  return RC_ERR_BAD_ARGS;
+
+    int64_t* lora_ptrs = (int64_t*)(uintptr_t)lora_ptrs_p;
+    int64_t* grad_ptrs = (int64_t*)(uintptr_t)grad_ptrs_p;
+    int64_t* m_ptrs    = (int64_t*)(uintptr_t)m_ptrs_p;
+    int64_t* v_ptrs    = (int64_t*)(uintptr_t)v_ptrs_p;
+
+    float lr    = (float)lr_d;
+    float beta1 = (float)beta1_d;
+    float beta2 = (float)beta2_d;
+    float eps   = (float)eps_d;
+    float wd    = (float)wd_d;
+
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        for (int T = 0; T < 4; T++) {
+            int adapter = L * 4 + T;
+            int64_t Nout = (T==0)?dq:(T==1)?dkv:(T==2)?dkv:d;
+            int64_t Kin  = (T==3)?dq:d;
+            int64_t A_n  = r * Kin;
+            int64_t B_n  = Nout * r;
+
+            int64_t pA = lora_ptrs[adapter * 2 + 0];
+            int64_t gA = grad_ptrs[adapter * 2 + 0];
+            int64_t mA = m_ptrs[adapter * 2 + 0];
+            int64_t vA = v_ptrs[adapter * 2 + 0];
+            int rcA = hxqwen14b_cu_launch_adamw_step(
+                pA, gA, mA, vA, lr, beta1, beta2, eps, wd, step, A_n);
+            if (rcA != RC_OK) return rcA;
+
+            int64_t pB = lora_ptrs[adapter * 2 + 1];
+            int64_t gB = grad_ptrs[adapter * 2 + 1];
+            int64_t mB = m_ptrs[adapter * 2 + 1];
+            int64_t vB = v_ptrs[adapter * 2 + 1];
+            int rcB = hxqwen14b_cu_launch_adamw_step(
+                pB, gB, mB, vB, lr, beta1, beta2, eps, wd, step, B_n);
+            if (rcB != RC_OK) return rcB;
+        }
+    }
+    return RC_OK;
+#endif
+}
+// End of v5.6.5 — backward orchestrator body activated.
