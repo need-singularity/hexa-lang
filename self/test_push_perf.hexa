@@ -1,0 +1,167 @@
+// ROI #155 — arr.push O(N^2) benchmark + fix plan
+// ==================================================
+//
+// SYMPTOM
+// -------
+// Loop `arr = arr.push(i)` in stage0 interpreter consumes
+//   N=4000  -> ~10.8 GB RSS (OOM / watchdog kill)
+//   N=1000  -> measurable quadratic growth in both time and RSS
+// Expected: O(N) total, since sole-owner push on the host array
+// is amortized O(1) (runtime.c hexa_array_push realloc 2x).
+//
+// MEASUREMENT (run with `./hexa run self/test_push_perf.hexa`)
+// ------------------------------------------------------------
+// Small N so we do not trigger the RSS watchdog. Curve doubles:
+// if build(2N) takes ~2x build(N), push is O(1) amortized.
+// If it takes ~4x, push is O(N) per iteration (O(N^2) total).
+//
+// ROOT CAUSE CANDIDATE
+// --------------------
+// self/hexa_full.hexa array_push_inplace  (line 16200)
+//
+//   fn array_push_inplace(arr_val, item) {
+//       let idx = arr_val.int_val
+//       if array_is_sole_owner(idx) {
+//           let items = array_store[idx]        // <-- items = alias to slot
+//           array_store[idx] = items.push(item) // host push (amortized O(1))
+//           return arr_val
+//       }
+//       ...
+//   }
+//
+// Path: user `arr = arr.push(i)`
+//   1. NK_ASSIGN (hexa_full.hexa:7129) evaluates RHS `arr.push(i)`
+//      -> call_method ARRAY dispatch (line 15159) -> array_push_inplace
+//      -> refcount==1 => sole owner => mutates array_store[idx] in place
+//      -> returns same arr_val
+//   2. env_set("arr", arr_val)
+//      -> incref slot (1 -> 2)
+//      -> decref old same-slot (2 -> 1)
+//      -> assigns
+// Net refcount stays 1, so next iteration ALSO takes sole-owner path.
+//
+// BUT: `let items = array_store[idx]` binds a NEW hexa variable `items` to
+// the array handle. In stage0, variable binding of an ARRAY-typed Hexa
+// value in the C-compiled output goes through `hexa_val_snapshot_array`
+// (when PBV-snapshot arena is live) OR aliases the underlying HexaVal
+// array items. The `items.push(item)` call may then reallocate the
+// underlying buffer but the *items* local keeps the OLD pointer; the
+// writeback `array_store[idx] = items` then re-aliases the slot to the
+// freshly reallocated buffer -- OK in the sole-owner fast path.
+//
+// PRIMARY SUSPECTS (requires reading C-compiled codegen of hexa_full.hexa
+// + runtime.c hexa_val_snapshot_array to confirm):
+//
+//   A. `let items = array_store[idx]` triggers a snapshot COPY of the
+//      items buffer each iteration (O(N) per push). Fix: replace with
+//      a direct `array_store[idx] = array_store[idx].push(item)` without
+//      the intermediate `items` local, so no snapshot happens.
+//
+//   B. call_method/method-dispatch path (hexa_full.hexa:6950 & 8614)
+//      ALSO calls `env_set(callee.left.name, result)` AFTER NK_ASSIGN
+//      already handled the binding -- double env_set would re-incref
+//      and break sole-ownership next iteration. Verify only one path
+//      fires for Assign-with-method-RHS.
+//
+//   C. @pure/PBV-snapshot arena at the Call node boundary snapshots the
+//      receiver (obj) before dispatch. If the snapshot bumps refcount
+//      without a matching decref after return, refcount is 2 on the
+//      next iteration -> falls into COW path (line 16210) = O(N) copy.
+//
+// PROPOSED FIX DIFF (pseudocode, hexa_full.hexa around line 16200)
+// ----------------------------------------------------------------
+// Option A — eliminate snapshot-copy path:
+//   fn array_push_inplace(arr_val, item) {
+//       let idx = arr_val.int_val
+//       if array_is_sole_owner(idx) {
+//           // Direct slot mutation: no `let items = ...` local to avoid
+//           // host snapshot of items buffer. The host `.push` on the
+//           // slot-indexed expression realloc-grows in place (2x cap).
+//           array_store[idx] = array_store[idx].push(item)
+//           return arr_val
+//       }
+//       let items = array_store[idx]
+//       let new_items = items.push(item)
+//       array_decref(idx)
+//       return val_array(new_items)
+//   }
+//
+// Option B — add `push_mut` builtin that bypasses refcount/snapshot,
+// exposed as Hexa method for hot loops. Requires C runtime FFI + parser
+// keyword. Heavier but unambiguous.
+//
+// BLOCKER
+// -------
+// SEED-FREEZE is active (memory feedback_seed_freeze.md): hexa_v2 circular
+// rebuild is broken (ROI #152). Edits to self/hexa_full.hexa will NOT
+// propagate into build/hexa_stage0 or ./hexa until #152 lands. So this
+// file documents the fix plan and benchmarks the CURRENT (broken) state;
+// the actual patch lands in a follow-up once seeds unfreeze.
+//
+// ============================================================
+
+fn build(n) {
+    let mut arr = []
+    let mut i = 0
+    while i < n {
+        arr = arr.push(i)
+        i = i + 1
+    }
+    return arr
+}
+
+fn check(arr, n) {
+    if len(arr) != n {
+        println("FAIL: expected len=" + to_string(n) + " got " + to_string(len(arr)))
+        return false
+    }
+    if arr[0] != 0 {
+        println("FAIL: arr[0] != 0")
+        return false
+    }
+    if arr[n - 1] != n - 1 {
+        println("FAIL: arr[n-1] != n-1")
+        return false
+    }
+    if n >= 2 && arr[n / 2] != n / 2 {
+        println("FAIL: arr[n/2] mismatch")
+        return false
+    }
+    return true
+}
+
+fn bench_one(n) {
+    let t0 = time()
+    let a = build(n)
+    let t1 = time()
+    let ok = check(a, n)
+    let ms = (t1 - t0) * 1000.0
+    println("N=" + to_string(n) + " ms=" + to_string(ms) + " ok=" + to_string(ok))
+    return ms
+}
+
+fn main() {
+    // Curve check — doubling N should roughly double ms if O(1) amortized,
+    // quadruple ms if O(N) per push (= O(N^2) total).
+    let m100  = bench_one(100)
+    let m500  = bench_one(500)
+    let m1000 = bench_one(1000)
+    let m2000 = bench_one(2000)
+
+    // Ratio report (integer math for portability)
+    let r500   = if m100  > 0.0 { m500  / m100  } else { 0.0 }
+    let r1000  = if m500  > 0.0 { m1000 / m500  } else { 0.0 }
+    let r2000  = if m1000 > 0.0 { m2000 / m1000 } else { 0.0 }
+
+    println("ratio  500/100  = " + to_string(r500)  + " (expect ~5  for O(N), ~25  for O(N^2))")
+    println("ratio 1000/500  = " + to_string(r1000) + " (expect ~2  for O(N), ~4   for O(N^2))")
+    println("ratio 2000/1000 = " + to_string(r2000) + " (expect ~2  for O(N), ~4   for O(N^2))")
+
+    if r2000 > 3.0 {
+        println("PUSH_PERF_QUADRATIC_CONFIRMED")
+    } else {
+        println("PUSH_PERF_LINEAR")
+    }
+}
+
+main()
