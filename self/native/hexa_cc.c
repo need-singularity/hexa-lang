@@ -10774,6 +10774,15 @@ HexaVal gen2_expr(HexaVal node) {
             if (hexa_truthy(hexa_eq(name, hexa_str("free_raw")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_ptr_free("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_463), hexa_int(0)))), hexa_str(", hexa_int(0))")));
             }
+            // r5-a10.5-A (rt#32-O, 2026-04-20): _tz_native — single-shot
+            // zero-fill float array. Replaces N-push pattern in CLM training.
+            if (hexa_truthy(hexa_eq(name, hexa_str("_tz_native")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_array_zeros_float("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")")));
+            }
+            // r5-a10.5-A: free_array — explicit array free for end-of-step.
+            if (hexa_truthy(hexa_eq(name, hexa_str("free_array")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_array_free("), gen2_expr(hexa_index_get(hexa_map_get(node, "args"), hexa_int(0)))), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("write_f32")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_ptr_write_f32("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_464), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_465), hexa_int(1)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_466), hexa_int(2)))), hexa_str(")")));
             }

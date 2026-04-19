@@ -5152,6 +5152,55 @@ HexaVal hexa_array_fill(HexaVal arr, HexaVal v) {
     return out;
 }
 
+// rt#32-O (r5-a10.5-A, 2026-04-20): leak-fix primitives for CLM training.
+//
+// Root cause: train_clm.hexa per-step has ~88 _tz(N) calls (decoder forward
+// 12-block stack). Each _tz did N hexa_array_push() from cap=0, accumulating
+// to a malloc'd buffer of N*sizeof(HexaVal) ~= N*32B that hexa never frees
+// (no GC, value-typed). At seq=512 d=768 that is 12.6 MB per call, ~1.1 GB
+// per step = 1.5 GB/min observed leak. Two new primitives fix this:
+//
+// 1) hexa_array_zeros_float(n): single-shot calloc of N HexaVal slots
+//    pre-filled with hexa_float(0.0). Returns array with cap=len=n. No
+//    realloc churn (was 17 grows per call at N=393K). Replaces _tz body.
+//
+// 2) hexa_array_free(arr): frees items buffer + descriptor. Hexa is
+//    pass-by-value at HexaVal level, but the .arr_ptr / .items pointers
+//    are shared. Caller MUST guarantee no other live alias. Used at
+//    end-of-train_step to reclaim block_hs / fwd / bwd buffers known to
+//    be local. Returns hexa_void().
+HexaVal hexa_array_zeros_float(HexaVal nv) {
+    if (_hx_stats_on()) _hx_stats_array_new++;
+    HexaVal out = {.tag=TAG_ARRAY};
+    HX_SET_ARR_PTR(out, (HexaArr*)calloc(1, sizeof(HexaArr)));
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    if (n <= 0) return out;
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)n);
+    if (!items) { fprintf(stderr, "OOM in array_zeros_float n=%lld\n", (long long)n); exit(1); }
+    HexaVal zero = {.tag=TAG_FLOAT, .f=0.0};
+    for (int64_t i = 0; i < n; i++) items[i] = zero;
+    HX_SET_ARR_ITEMS(out, items);
+    HX_SET_ARR_LEN(out, (int)n);
+    HX_SET_ARR_CAP(out, (int)n);  // positive → heap
+    return out;
+}
+
+HexaVal hexa_array_free(HexaVal arr) {
+    if (!HX_IS_ARRAY(arr)) return hexa_void();
+    HexaArr* p = arr.arr_ptr;
+    if (!p) return hexa_void();
+    // Only free heap-backed buffers (cap>0). Arena-backed (cap<0) belong
+    // to the arena slab and must not be passed to free().
+    if (p->items && p->cap > 0) {
+        free(p->items);
+    }
+    p->items = NULL;
+    p->len = 0;
+    p->cap = 0;
+    free(p);
+    return hexa_void();
+}
+
 // take(n): first n elements (or entire array if n ≥ len).
 HexaVal hexa_array_take(HexaVal arr, HexaVal nv) {
     HexaVal out = hexa_array_new();
