@@ -4084,7 +4084,7 @@ double hxqwen14b_train_step_v54(int64_t handle, int64_t ids_host_p, int64_t M) {
 #define V56_N_LORA_BUFS           (V56_N_ADAPTERS * V56_LORA_BUFS_PER_ADAPTER)  // 384
 
 int64_t hxqwen14b_version_v56(void) {
-    return 561;  // v5.6.1: scaffolding (forward integration NOT yet active)
+    return 562;  // v5.6.2: forward integrated (per-projection sgemm chain live, 192 adapters)
 }
 
 typedef struct HxQwenBaseFwdV56LoraArgs {
@@ -4198,22 +4198,17 @@ int hxqwen14b_free_lora_buffers_v56(int64_t ptrs_p) {
 
 // LoRA-fused base forward.
 //
-// IMPLEMENTATION STATUS (v5.6.1, 2026-04-20):
-//   The forward loop integration with LoRA accumulate is NOT yet in place
-//   here — it requires:
-//     1. tmp[M,r] device scratch buffer (per-step, reused across 192 calls)
-//     2. After each cublasSgemm for q/k/v/o, call hxqwen14b_lora_fwd_single
-//        with accumulate=1 to add (alpha/r)·B·A·x into the projection
-//        output.
-//     3. End-to-end smoke (1 step, A=Kaiming/B=0 ⇒ identity ⇒ loss matches
-//        v54 base loss; then random A/B ⇒ loss differs).
+// IMPLEMENTATION STATUS (v5.6.2, 2026-04-20):
+//   Integrated. Mirror of base_forward_v54 with per-projection LoRA delta
+//   accumulation via hxqwen14b_lora_fwd_single (accumulate=1). One scratch
+//   tmp[M,R] device buffer is allocated once and reused across all 192
+//   adapter calls (48 layers × 4 projs).
 //
-//   For r12 launch this entry currently returns RC_ERR_CUDA_TODO so the
-//   trainer can detect the unfinished surface and fall back to the v54
-//   base-only forward (which already PASSes load+forward+CE on H100, just
-//   without LoRA params updating). The FFI scaffolding is here so the
-//   hexa trainer can wire the call and remaining work is purely on the
-//   C side.
+//   At init A=Kaiming-ish + B=0 the LoRA branch contributes 0 (since B=0)
+//   so loss is bit-identical to v54 base forward. With B≠0 a measurable
+//   delta appears.
+//
+//   Backward orchestrator (full-network) is r12 follow-on (separate BG).
 int hxqwen14b_base_forward_v56_with_lora(void* args) {
     if (args == NULL) return RC_ERR_NULL_ARGS;
 #ifndef HXQWEN14B_CUDA
@@ -4223,9 +4218,257 @@ int hxqwen14b_base_forward_v56_with_lora(void* args) {
     HxQwenBaseFwdV56LoraArgs* a = (HxQwenBaseFwdV56LoraArgs*)args;
     if (a->lora_r <= 0) return RC_ERR_BAD_ARGS;
     if (a->lora_ptrs_p == 0) return RC_ERR_NULL_ARGS;
-    // r12 IMPLEMENTATION TODO: integrate LoRA delta into per-projection sgemm.
-    // For now return CUDA_TODO so trainer falls back to v54 base path.
-    return RC_ERR_CUDA_TODO;
+
+    int64_t h = a->model_handle;
+    if (h <= 0 || h >= HXQWEN14B_MAX_HANDLES) return RC_ERR_BAD_HANDLE;
+    V54TensorSlot* slots = g_v54_slots[h];
+    if (slots[V54_SLOT_EMBED].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_FINAL_NORM].loaded == 0) return RC_ERR_BAD_HANDLE;
+    if (slots[V54_SLOT_LM_HEAD].loaded == 0) return RC_ERR_BAD_HANDLE;
+
+    const int64_t M = a->M;
+    if (M <= 0) return RC_ERR_BAD_ARGS;
+    if (a->token_ids_dev == 0 || a->logits_dev == 0) return RC_ERR_NULL_ARGS;
+
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t V   = QWEN14B_VOCAB;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t Fn  = QWEN14B_FFN_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+    const int64_t R   = a->lora_r;
+    const double  alpha_over_r = a->alpha_over_r;
+
+    int64_t* lora_ptrs = (int64_t*)(uintptr_t)a->lora_ptrs_p;
+
+    int64_t sz_Md  = M * d * (int64_t)sizeof(float);
+    int64_t sz_Mq  = M * dq * (int64_t)sizeof(float);
+    int64_t sz_Mkv = M * dkv * (int64_t)sizeof(float);
+    int64_t sz_MF  = M * Fn * (int64_t)sizeof(float);
+    int64_t sz_MR  = M * R * (int64_t)sizeof(float);
+
+    int64_t x_now  = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t ln     = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t q      = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t k_buf  = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t v_buf  = hxqwen14b_cu_malloc_bytes(sz_Mkv);
+    int64_t attn   = hxqwen14b_cu_malloc_bytes(sz_Mq);
+    int64_t proj   = hxqwen14b_cu_malloc_bytes(sz_Md);
+    int64_t gate   = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t up     = hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t ffn_mid= hxqwen14b_cu_malloc_bytes(sz_MF);
+    int64_t ffn_out= hxqwen14b_cu_malloc_bytes(sz_Md);
+    // v5.6: shared LoRA scratch tmp[M,R], reused across all 192 adapter calls.
+    int64_t tmp_lora = hxqwen14b_cu_malloc_bytes(sz_MR);
+    int rc = RC_OK;
+    if (x_now==0||ln==0||q==0||k_buf==0||v_buf==0||attn==0||
+        proj==0||gate==0||up==0||ffn_mid==0||ffn_out==0||tmp_lora==0) {
+        rc = RC_ERR_OOM;
+        goto v56_done;
+    }
+
+    rc = hxqwen14b_cu_launch_embed_lookup(
+        slots[V54_SLOT_EMBED].dev_ptr_fp32,
+        a->token_ids_dev, x_now, V, d, M);
+    if (rc != RC_OK) goto v56_done;
+
+    HxQwenRmsNormArgs rms_args;
+    HxQwenKernelDispatch dsp;
+    memset(&rms_args, 0, sizeof(rms_args));
+    memset(&dsp, 0, sizeof(dsp));
+    dsp.is_device = 1;
+
+    HxQwenRopeArgs rope_args;
+    memset(&rope_args, 0, sizeof(rope_args));
+
+    HxQwenGqaArgs gqa_args;
+    memset(&gqa_args, 0, sizeof(gqa_args));
+
+    HxQwenSwigluArgs sw_args;
+    memset(&sw_args, 0, sizeof(sw_args));
+
+    // Reusable LoRA fwd args struct (refilled per call).
+    HxQwenLoraFwdArgs lf;
+
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        int base = V54_SLOT_LAYER_BASE(L);
+        int64_t w_ln1  = slots[base + 0].dev_ptr_fp32;
+        int64_t w_q    = slots[base + 1].dev_ptr_fp32;
+        int64_t w_k    = slots[base + 2].dev_ptr_fp32;
+        int64_t w_v    = slots[base + 3].dev_ptr_fp32;
+        int64_t w_o    = slots[base + 4].dev_ptr_fp32;
+        int64_t w_ln2  = slots[base + 5].dev_ptr_fp32;
+        int64_t w_gate = slots[base + 6].dev_ptr_fp32;
+        int64_t w_up   = slots[base + 7].dev_ptr_fp32;
+        int64_t w_down = slots[base + 8].dev_ptr_fp32;
+        int64_t b_q    = slots[base + 9].dev_ptr_fp32;
+        int64_t b_k    = slots[base + 10].dev_ptr_fp32;
+        int64_t b_v    = slots[base + 11].dev_ptr_fp32;
+
+        rms_args.x_p = x_now;  rms_args.w_p = w_ln1;  rms_args.y_p = ln;
+        rms_args.M_rows = M;   rms_args.d_model = d;  rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        // ── q_proj: base sgemm + LoRA delta accumulate ─────────────────
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_q, q, M, dq, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+        // Adapter idx for q at layer L = (L*4 + 0).
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dq; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = ln;
+        lf.A_p = lora_ptrs[(L * 4 + 0) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 0) * 2 + 1];
+        lf.y_p = q;
+        lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora;
+        lf.accumulate = 1;     // y += LoRA delta on top of base sgemm output
+        lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v56_done;
+
+        // ── k_proj ─────────────────────────────────────────────────────
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_k, k_buf, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dkv; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = ln;
+        lf.A_p = lora_ptrs[(L * 4 + 1) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 1) * 2 + 1];
+        lf.y_p = k_buf;
+        lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora;
+        lf.accumulate = 1;
+        lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v56_done;
+
+        // ── v_proj ─────────────────────────────────────────────────────
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_v, v_buf, M, dkv, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = dkv; lf.K_in = d; lf.R_lora = R;
+        lf.x_p = ln;
+        lf.A_p = lora_ptrs[(L * 4 + 2) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 2) * 2 + 1];
+        lf.y_p = v_buf;
+        lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora;
+        lf.accumulate = 1;
+        lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v56_done;
+
+        // QKV biases after sgemm + LoRA, before rope.
+        rc = hxqwen14b_cu_launch_add_bias_1d(q, b_q, M, dq);
+        if (rc != RC_OK) goto v56_done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(k_buf, b_k, M, dkv);
+        if (rc != RC_OK) goto v56_done;
+        rc = hxqwen14b_cu_launch_add_bias_1d(v_buf, b_v, M, dkv);
+        if (rc != RC_OK) goto v56_done;
+
+        rope_args.x_p = q;    rope_args.B_batch = 1; rope_args.S_seq = M;
+        rope_args.n_heads = HQ; rope_args.head_dim = HD;
+        rope_args.theta_base = 1e6; rope_args.pos_offset = 0;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        rope_args.x_p = k_buf; rope_args.n_heads = HK;
+        dsp.arg_p = (int64_t)(uintptr_t)&rope_args;
+        rc = hxqwen14b_rope_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        gqa_args.q_p = q;     gqa_args.k_p = k_buf; gqa_args.v_p = v_buf;
+        gqa_args.out_p = attn;
+        gqa_args.B_batch = 1; gqa_args.S_seq = M;
+        gqa_args.n_q_head = HQ; gqa_args.n_kv_head = HK;
+        gqa_args.head_dim = HD;
+        gqa_args.softmax_scale = 1.0 / sqrt((double)HD);
+        gqa_args.causal = 1;
+        dsp.arg_p = (int64_t)(uintptr_t)&gqa_args;
+        rc = hxqwen14b_gqa_attn_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        // ── o_proj: base sgemm + LoRA delta accumulate (input = attn) ──
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                attn, w_o, proj, M, d, dq, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+        memset(&lf, 0, sizeof(lf));
+        lf.M_rows = M; lf.N_out = d; lf.K_in = dq; lf.R_lora = R;
+        lf.x_p = attn;     // o_proj input is GQA-combined attn (dim dq=5120)
+        lf.A_p = lora_ptrs[(L * 4 + 3) * 2 + 0];
+        lf.B_p = lora_ptrs[(L * 4 + 3) * 2 + 1];
+        lf.y_p = proj;
+        lf.alpha_over_r = alpha_over_r;
+        lf.tmp_p = tmp_lora;
+        lf.accumulate = 1;
+        lf.is_device = 1;
+        rc = hxqwen14b_lora_fwd_single(&lf);
+        if (rc != RC_OK) goto v56_done;
+
+        rc = hxqwen14b_cu_launch_residual_add(proj, x_now, M * d);
+        if (rc != RC_OK) goto v56_done;
+
+        // FFN block (no LoRA on FFN per r12 scope: q/k/v/o only).
+        rms_args.x_p = x_now; rms_args.w_p = w_ln2; rms_args.y_p = ln;
+        rms_args.M_rows = M;  rms_args.d_model = d; rms_args.eps = 1e-6;
+        dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+        rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_gate, gate, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ln, w_up, up, M, Fn, d, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+
+        sw_args.gate_p = gate; sw_args.up_p = up; sw_args.y_p = ffn_mid;
+        sw_args.M_rows = M;    sw_args.ffn_dim = Fn;
+        dsp.arg_p = (int64_t)(uintptr_t)&sw_args;
+        rc = hxqwen14b_swiglu_fwd_v53(&dsp);
+        if (rc != RC_OK) goto v56_done;
+
+        rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+                ffn_mid, w_down, ffn_out, M, d, Fn, 1.0f, 0.0f);
+        if (rc != RC_OK) goto v56_done;
+
+        rc = hxqwen14b_cu_launch_residual_add(ffn_out, x_now, M * d);
+        if (rc != RC_OK) goto v56_done;
+    }
+
+    rms_args.x_p = x_now; rms_args.w_p = slots[V54_SLOT_FINAL_NORM].dev_ptr_fp32;
+    rms_args.y_p = ln;    rms_args.M_rows = M; rms_args.d_model = d;
+    rms_args.eps = 1e-6;
+    dsp.arg_p = (int64_t)(uintptr_t)&rms_args;
+    rc = hxqwen14b_rmsnorm_fwd_v53(&dsp);
+    if (rc != RC_OK) goto v56_done;
+
+    rc = hxqwen14b_cu_launch_sgemm_rowmajor_xwt(
+            ln, slots[V54_SLOT_LM_HEAD].dev_ptr_fp32, a->logits_dev,
+            M, V, d, 1.0f, 0.0f);
+
+v56_done:
+    if (x_now != 0)   hxqwen14b_cu_free_ptr(x_now);
+    if (ln != 0)      hxqwen14b_cu_free_ptr(ln);
+    if (q != 0)       hxqwen14b_cu_free_ptr(q);
+    if (k_buf != 0)   hxqwen14b_cu_free_ptr(k_buf);
+    if (v_buf != 0)   hxqwen14b_cu_free_ptr(v_buf);
+    if (attn != 0)    hxqwen14b_cu_free_ptr(attn);
+    if (proj != 0)    hxqwen14b_cu_free_ptr(proj);
+    if (gate != 0)    hxqwen14b_cu_free_ptr(gate);
+    if (up != 0)      hxqwen14b_cu_free_ptr(up);
+    if (ffn_mid != 0) hxqwen14b_cu_free_ptr(ffn_mid);
+    if (ffn_out != 0) hxqwen14b_cu_free_ptr(ffn_out);
+    if (tmp_lora != 0)hxqwen14b_cu_free_ptr(tmp_lora);
+    return rc;
 #endif
 }
 
