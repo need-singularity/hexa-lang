@@ -16,6 +16,10 @@
 //   ./hexa tool/raw_all.hexa --only raw 7     — single rule (debug)
 //   ./hexa tool/raw_all.hexa --json           — machine-readable output
 //   ./hexa tool/raw_all.hexa --serial         — force serial dispatch (debug)
+//   ./hexa tool/raw_all.hexa --exclude raw:<slug>   — skip specific rule(s)
+//                                               (repeatable; matching rules
+//                                                emit SKIP with
+//                                                detail="excluded via --exclude")
 //
 // PARALLELISM (P7a, 2026-04-20)
 //   17 enforcers run in parallel batches of N (default 4), controlled by
@@ -71,13 +75,21 @@ use "tool/raw_dag"
 // ─── argv parsing ────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
-    // returns [fast(bool), json(bool), only_kind(string), only_id(string), serial(bool)]
+    // returns [fast(bool), json(bool), only_kind(string), only_id(string),
+    //          serial(bool), excludes(array-of-slug-strings)]
+    //
+    // --exclude raw:<slug> is repeatable; each match causes the rule to
+    // emit SKIP with detail="excluded via --exclude raw:<slug>" and does
+    // NOT count as a failure in the summary. The "raw:" prefix is
+    // optional — callers may pass either "raw:self-host-fixpoint" or
+    // bare "self-host-fixpoint"; both match the same slug.
     let av = argv()
     let mut fast = false
     let mut json = false
     let mut only_kind = ""
     let mut only_id = ""
     let mut serial = false
+    let mut excludes = []
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -91,9 +103,21 @@ fn _parse_flags() -> array {
                 i = i + 2
             }
         }
+        else if a == "--exclude" {
+            if i + 1 < len(av) {
+                let raw_tok = av[i + 1]
+                // normalize: strip optional "raw:" prefix for slug-only compare
+                let mut tok = raw_tok
+                if len(tok) >= 4 && tok.substring(0, 4) == "raw:" {
+                    tok = tok.substring(4, len(tok))
+                }
+                if tok != "" { excludes = excludes.push(tok) }
+                i = i + 1
+            }
+        }
         i = i + 1
     }
-    return [fast, json, only_kind, only_id, serial]
+    return [fast, json, only_kind, only_id, serial, excludes]
 }
 
 // ─── parallel batch size ─────────────────────────────────────────
@@ -326,10 +350,28 @@ fn _run_proof(enforce_script: string, proof_field: string) -> array {
 //   ["FAIL",    reason,  "",     ""]          — pre-decided hard verdict
 //   ["MISSING", script,  "",     ""]          — enforce path not on disk (warn)
 //   ["RUN",     "",      script, proof_field] — schedule enforcer
-fn _plan_rule(kind: string, rule: array, s0_ok: bool) -> array {
-    let status = rule[1]
+//
+// excludes: array of slug strings (raw: prefix already stripped). A rule
+// whose slug appears here is short-circuited to SKIP regardless of
+// status — used by --exclude raw:<slug> to bypass structurally blocked
+// enforcers (e.g. raw:self-host-fixpoint while hexa_v2 seed-freeze holds).
+fn _plan_rule(kind: string, rule: array, s0_ok: bool, excludes: array) -> array {
     let keys = rule[3]
 
+    // --exclude precedence: checked BEFORE status so that a live rule
+    // whose enforcer is broken can still be skipped for ceremony purposes.
+    if len(excludes) > 0 {
+        let slug = keys_first(keys, "slug")
+        if slug != "" {
+            for ex in excludes {
+                if ex == slug {
+                    return ["SKIP", "excluded via --exclude raw:" + slug, "", ""]
+                }
+            }
+        }
+    }
+
+    let status = rule[1]
     if !_should_run(status) { return ["SKIP", status, "", ""] }
 
     let enforce_field = keys_first(keys, "enforce")
@@ -424,7 +466,8 @@ fn _json_escape(s: string) -> string {
 // ─── main walk ───────────────────────────────────────────────────
 
 fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
-              only_id: string, json: bool, par_n: int, ssot_fp: string) -> array {
+              only_id: string, json: bool, par_n: int, ssot_fp: string,
+              excludes: array) -> array {
     // returns [pass_ct, fail_ct, warn_ct, skip_ct, json_entries(array), missing_ct, enforce_ct]
     //   enforce_ct — total rules that attempted enforcement (RUN + MISSING + pre-FAIL-due-to-no-enforce).
     //                Used by the "N/M enforcers PASS" summary line.
@@ -473,7 +516,7 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
             if only_id != "" && only_id != id { included = false }
         }
         if included {
-            plan = _plan_rule(kind, rule, s0_ok)
+            plan = _plan_rule(kind, rule, s0_ok, excludes)
             if plan[0] == "RUN" {
                 // P1d (2026-04-20): --fast cache fast-path.
                 //   If a prior PASS for this slug under the current SSOT
@@ -698,6 +741,7 @@ fn main() -> int {
     let only_kind = flags[2]
     let only_id = flags[3]
     let serial = flags[4]
+    let excludes = flags[5]
     let par_n = _parallel_n(serial)
 
     // P7a: prepare tmp dir for parallel batch output.
@@ -721,6 +765,11 @@ fn main() -> int {
             if only_id != "" { suffix = "#" + only_id }
             println("filter: " + only_kind + suffix)
         }
+        if len(excludes) > 0 {
+            let mut ex_parts = []
+            for ex in excludes { ex_parts = ex_parts.push("raw:" + ex) }
+            println("excluded: " + ex_parts.join(", "))
+        }
         println("")
     }
 
@@ -742,7 +791,7 @@ fn main() -> int {
     let mut total_enforce = 0
 
     // Walk .raw (L0)
-    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json, par_n, ssot_fp)
+    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json, par_n, ssot_fp, excludes)
     total_pass = total_pass + r_raw[0]
     total_fail = total_fail + r_raw[1]
     total_warn = total_warn + r_raw[2]
@@ -752,7 +801,7 @@ fn main() -> int {
     total_enforce = total_enforce + r_raw[6]
 
     // Walk .own (L1)
-    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json, par_n, ssot_fp)
+    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json, par_n, ssot_fp, excludes)
     total_pass = total_pass + r_own[0]
     total_fail = total_fail + r_own[1]
     total_warn = total_warn + r_own[2]
