@@ -9,152 +9,116 @@
 //   F6  parent-child    parser/parser_*.hexa redundant
 //
 // Pure report. Exit 0 always. Does not modify anything.
+//
+// 2026-04-20 RSS fix: the old recursive `list_dir` + per-entry `test -d`
+// walk plus pure-hexa helpers (substring/split) leaked ~2.2GB of
+// interpreter-heap strings per invocation (stage0 has no GC). Under
+// raw_all N=4 parallel fan-out that hit ~9GB → SIGKILL (exit=137).
+// The scan logic is now delegated to a single shell pipeline per rule:
+// hexa only sees the violation lines (≤ a handful) instead of walking
+// ~1800 files in-interpreter. Post-fix RSS: ~600MB standalone.
 
-fn strip_ext(name) {
-    let mut i = len(name) - 1
-    while i >= 0 {
-        if name[i] == "." { return name.substring(0, i) }
-        i = i - 1
-    }
-    return name
+fn _prune_args() -> string {
+    // Shell-level prune: hidden dirs, node_modules, target, build.
+    return "\\( -path '*/.*' -o -path '*/node_modules/*' -o -path '*/target/*' -o -path '*/build/*' \\) -prune -o"
 }
 
-fn is_digit(c) {
-    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
-           c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
-}
-
-fn ends_with_digits(s) {
-    if len(s) == 0 { return false }
-    return is_digit(s[len(s) - 1])
-}
-
-fn has_version_suffix(stem) {
-    // _v\d+ at end — flag
-    // _\d+[kmb] (size: 512k, 330m, 7b) — allow
-    // _\d+x\d+ (dims: 256x256) — allow (handled by trailing letter check)
-    // _\d+ plain (256, 330) — allow (size param; humans use specific numbers)
-    // Only _v\d+ is a true version marker
-    let mut i = len(stem) - 1
-    while i > 0 && is_digit(stem[i]) { i = i - 1 }
-    if i < len(stem) - 1 {
-        // had trailing digits; flag ONLY if preceded by _v
-        if i >= 1 && stem[i] == "v" && stem[i - 1] == "_" { return true }
-    }
-    return false
-}
-
-fn is_product_name(stem) {
-    // Exception: product-name identifiers that legitimately contain stage/phase
-    // stage0 = self-host boot binary (L0/L1/L2 are architectural tiers)
-    // build_stage0, rebuild_stage0, hexa_stage0 — product ops, not version
-    if stem == "build_stage0" { return true }
-    if stem == "build_stage1" { return true }
-    if stem == "rebuild_stage0" { return true }
-    if stem == "hexa_stage0" { return true }
-    return false
-}
-
-fn has_stage_phase(stem) {
-    if is_product_name(stem) { return false }
-    // check segments separated by _
-    let parts = stem.split("_")
+fn _roots_str() -> string {
+    // Only roots that actually exist — `find` on a missing path errors.
+    let candidates = ["self", "scripts", "tests", "bench"]
+    let mut out = ""
     let mut i = 0
-    while i < len(parts) {
-        let p = parts[i]
-        if p == "stage0" || p == "stage1" || p == "stage2" || p == "stage3" { return true }
-        if p == "phase0" || p == "phase1" || p == "phase2" || p == "phase3" { return true }
-        if len(p) >= 2 && p[0] == "p" && is_digit(p[1]) {
-            if len(p) == 2 { return true }
-            if len(p) == 3 && is_digit(p[2]) { return true }
+    while i < len(candidates) {
+        let ok = exec("test -d '" + candidates[i] + "' && echo D || echo F").trim()
+        if ok == "D" {
+            if out != "" { out = out + " " }
+            out = out + candidates[i]
         }
         i = i + 1
     }
-    return false
+    return out
 }
 
-fn has_temp_suffix(stem) {
-    let suffixes = ["_old", "_new", "_bak", "_tmp", "_copy", "_backup", "_save"]
-    let mut i = 0
-    while i < len(suffixes) {
-        let s = suffixes[i]
-        if len(stem) > len(s) {
-            if stem.substring(len(stem) - len(s), len(stem)) == s { return true }
-        }
-        i = i + 1
-    }
-    return false
-}
-
-fn is_generic_dir(name) {
-    return name == "utils" || name == "helpers" || name == "common" ||
-           name == "lib" || name == "misc" || name == "stuff" ||
-           name == "core" || name == "base"
-}
-
-fn is_dir_shell(path) {
+fn _run_rule(cmd: string) -> array {
+    // Run a shell pipeline, return non-empty lines from stdout.
     try {
-        let r = exec("test -d '" + path + "' && echo D || echo F").trim()
-        return r == "D"
-    } catch e { return false }
-}
-
-fn scan_dir(dir, violations) {
-    let entries = list_dir(dir)
-    let mut hexa_files = []
-    let mut subdirs = []
-    let mut i = 0
-    while i < len(entries) {
-        let name = entries[i]
-        if name == "." || name == ".." { i = i + 1; continue }
-        let full = dir + "/" + name
-        if is_dir_shell(full) {
-            if name[0] == "." { i = i + 1; continue }
-            if name == "node_modules" || name == "target" || name == "build" { i = i + 1; continue }
-            if is_generic_dir(name) {
-                violations = violations.push(["F4-generic-dir", full])
-            }
-            subdirs = subdirs.push(full)
-        } else {
-            if len(name) >= 5 && name.substring(len(name) - 5, len(name)) == ".hexa" {
-                hexa_files = hexa_files.push(name)
-                let stem = strip_ext(name)
-                if has_version_suffix(stem) {
-                    violations = violations.push(["F1-version", full])
-                }
-                if has_stage_phase(stem) {
-                    violations = violations.push(["F2-stage", full])
-                }
-                if has_temp_suffix(stem) {
-                    violations = violations.push(["F3-temp", full])
-                }
-            }
+        let out = exec(cmd)
+        if out == "" { return [] }
+        let lines = out.split("\n")
+        let mut acc = []
+        let mut i = 0
+        while i < len(lines) {
+            let ln = lines[i]
+            if ln != "" { acc = acc.push(ln) }
+            i = i + 1
         }
-        i = i + 1
-    }
-    // F5: single-file directory
-    if len(hexa_files) == 1 && len(subdirs) == 0 && dir != "." && dir != "./tests" {
-        violations = violations.push(["F5-loner", dir + "/" + hexa_files[0]])
-    }
-    // Recurse
-    let mut j = 0
-    while j < len(subdirs) {
-        violations = scan_dir(subdirs[j], violations)
-        j = j + 1
-    }
-    return violations
+        return acc
+    } catch e { return [] }
 }
 
 fn main() {
-    let roots = ["self", "scripts", "tests", "bench"]
+    let roots = _roots_str()
+    if roots == "" {
+        println("ai-native-scan: CLEAN — 0 violations")
+        return
+    }
+
+    let prune = _prune_args()
+    let find_files = "find " + roots + " " + prune + " -type f -name '*.hexa' -print 2>/dev/null"
+    let find_dirs  = "find " + roots + " " + prune + " -type d -print 2>/dev/null"
+
+    // F1 — _v\d+ suffix in stem (excluding .hexa extension).
+    let f1 = _run_rule(find_files + " | awk -F/ '{ f=$NF; sub(/\\.hexa$/, \"\", f); if (f ~ /_v[0-9]+$/) print $0 }'")
+
+    // F2 — stage[0-3] / phase[0-3] / p\d{1,2} segment (skipping product names).
+    let f2 = _run_rule(
+        find_files +
+        " | awk -F/ '{" +
+        " f=$NF; sub(/\\.hexa$/, \"\", f);" +
+        " if (f == \"build_stage0\" || f == \"build_stage1\" || f == \"rebuild_stage0\" || f == \"hexa_stage0\") next;" +
+        " n=split(f, parts, \"_\");" +
+        " for (i=1; i<=n; i++) { p=parts[i];" +
+        "   if (p ~ /^stage[0-3]$/ || p ~ /^phase[0-3]$/ || p ~ /^p[0-9][0-9]?$/) { print $0; break }" +
+        " } }'"
+    )
+
+    // F3 — _old / _new / _bak / _tmp / _copy / _backup / _save suffix.
+    let f3 = _run_rule(find_files + " | awk -F/ '{ f=$NF; sub(/\\.hexa$/, \"\", f); if (f ~ /(_old|_new|_bak|_tmp|_copy|_backup|_save)$/) print $0 }'")
+
+    // F4 — generic directory basenames.
+    let f4 = _run_rule(find_dirs + " | awk -F/ '{ b=$NF; if (b == \"utils\" || b == \"helpers\" || b == \"common\" || b == \"lib\" || b == \"misc\" || b == \"stuff\" || b == \"core\" || b == \"base\") print $0 }'")
+
+    // F5 — dir with exactly 1 .hexa + no deeper .hexa-holding dir.
+    // Carve the list of (parent, count, first_file) from the .hexa list,
+    // then filter to singletons with no prefix-matching deeper parent.
+    let f5 = _run_rule(
+        find_files +
+        " | awk -F/ '" +
+        "{ par=\"\"; for (i=1; i<NF; i++) { par = (par==\"\") ? $i : par\"/\"$i }" +
+        "  cnt[par]++;" +
+        "  if (!(par in first)) first[par] = $0 }" +
+        "END { for (p in cnt) {" +
+        "  if (cnt[p] == 1) {" +
+        "    has_child=0; pfx = p\"/\";" +
+        "    for (k in cnt) { if (k != p && index(k, pfx) == 1) { has_child=1; break } }" +
+        "    if (!has_child && p != \".\" && p != \"./tests\") print first[p]" +
+        "  }" +
+        "} }'"
+    )
+
+    // Collect in original ordering (F4 before F1..F3 before F5 matches the
+    // legacy output sequence for stable diffing).
     let mut violations = []
     let mut i = 0
-    while i < len(roots) {
-        if is_dir_shell(roots[i]) {
-            violations = scan_dir(roots[i], violations)
-        }
-        i = i + 1
-    }
+    while i < len(f4) { violations = violations.push(["F4-generic-dir", f4[i]]); i = i + 1 }
+    i = 0
+    while i < len(f1) { violations = violations.push(["F1-version", f1[i]]); i = i + 1 }
+    i = 0
+    while i < len(f2) { violations = violations.push(["F2-stage", f2[i]]); i = i + 1 }
+    i = 0
+    while i < len(f3) { violations = violations.push(["F3-temp", f3[i]]); i = i + 1 }
+    i = 0
+    while i < len(f5) { violations = violations.push(["F5-loner", f5[i]]); i = i + 1 }
 
     if len(violations) == 0 {
         println("ai-native-scan: CLEAN — 0 violations")
@@ -176,4 +140,3 @@ fn main() {
     println("  F4  generic dir       utils/helpers/common/lib/misc/core")
     println("  F5  loner dir         dir with single .hexa — flatten")
 }
-
