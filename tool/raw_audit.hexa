@@ -7,20 +7,29 @@
 //   entries immutable; a brief append window is opened by the writer
 //   and closed immediately after.
 //
-// FORMAT
-//   timestamp | event | actor | reason | result | sha_before | sha_after
+// FORMAT (raw#1 hash-chain, 8 fields)
+//   timestamp | event | actor | reason | result | sha_before | sha_after | prev_line_sha
 //
-//   timestamp — ISO-8601 UTC (date -u +"%Y-%m-%dT%H:%M:%SZ")
-//   event     — unlock | lock | verify | violation | emergency
-//   actor     — $USER (or explicit --actor tag)
-//   reason    — quoted, required on unlock / emergency
-//   result    — ok | fail | blocked
-//   sha_*     — sha256 of each 5 SSOT joined; "-" if unchanged
+//   timestamp     — ISO-8601 UTC (date -u +"%Y-%m-%dT%H:%M:%SZ")
+//   event         — unlock | lock | verify | violation | emergency | ...
+//   actor         — $USER (or explicit --actor tag)
+//   reason        — quoted, required on unlock / emergency
+//   result        — ok | fail | blocked
+//   sha_*         — sha256 of each 5 SSOT joined; "-" if unchanged
+//   prev_line_sha — sha256 of the literal prior audit line (newline excluded);
+//                   first data line uses the constant GENESIS.
+//
+// TAMPER EVIDENCE (raw#1)
+//   Each appended line embeds sha256 of the previous line. Any in-place
+//   edit to the middle of the log breaks the chain at that line. `verify`
+//   re-walks the file and reports the first break.
 //
 // ROTATION
 //   Monthly: if .raw-audit exceeds 10k lines or crosses month boundary,
 //   rename to .raw-audit.YYYY-MM and re-create .raw-audit empty.
 //   Rotation is triggered opportunistically by raw_all / hx_unlock.
+//   Chain is DECOUPLED per file — the first data line of a freshly
+//   rotated .raw-audit starts with prev_line_sha=GENESIS.
 //
 // USAGE (library)
 //   use tool.raw_audit
@@ -28,7 +37,7 @@
 //
 // USAGE (CLI)
 //   ./hexa tool/raw_audit.hexa tail 50     — show last 50 entries
-//   ./hexa tool/raw_audit.hexa verify      — schema check + sha sanity
+//   ./hexa tool/raw_audit.hexa verify      — schema + hash-chain integrity
 //   ./hexa tool/raw_audit.hexa rotate      — force monthly rotation
 
 use "self/core/law_io"
@@ -66,9 +75,9 @@ fn _escape_pipe(s: string) -> string {
 fn _ensure_audit_exists() -> bool {
     let chk = exec_with_status("test -f '" + _audit_path() + "'")
     if chk[1] == 0 { return true }
-    // create empty file + write header
-    let header = "# .raw-audit — append-only event log (raw#0 P1c)\n" +
-                 "# format: timestamp | event | actor | reason | result | sha_before | sha_after\n"
+    // create empty file + write header (raw#1 hash-chain format)
+    let header = "# .raw-audit — append-only event log (raw#1 hash-chain)\n" +
+                 "# format: timestamp | event | actor | reason | result | sha_before | sha_after | prev_line_sha\n"
     let r = exec_with_status("printf '%s' " + _shell_quote(header) + " > " + _audit_path())
     return r[1] == 0
 }
@@ -76,6 +85,95 @@ fn _ensure_audit_exists() -> bool {
 fn _shell_quote(s: string) -> string {
     // minimal single-quote wrapper; internal quotes escaped
     return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── raw#1 hash-chain helpers ─────────────────────────────────────
+
+// genesis sentinel — first data line's prev_line_sha
+fn _genesis_sha() -> string { return "GENESIS" }
+
+// sha256 of an arbitrary string (no trailing newline added).
+fn _sha256_of_string(s: string) -> string {
+    // printf %s prints s literally (no newline). Double-quote the shell
+    // format, keep the payload single-quoted to survive embedded chars.
+    let cmd = "printf '%s' " + _shell_quote(s) +
+              " | shasum -a 256 2>/dev/null | awk '{print $1}'"
+    let out = to_string(exec(cmd)).trim()
+    if out != "" { return out }
+    // fallback (linux): sha256sum
+    let cmd2 = "printf '%s' " + _shell_quote(s) +
+               " | sha256sum 2>/dev/null | awk '{print $1}'"
+    return to_string(exec(cmd2)).trim()
+}
+
+// Count non-header, non-empty lines currently in the audit file.
+fn _count_data_lines(path: string) -> int {
+    let chk = exec_with_status("test -f " + _shell_quote(path))
+    if chk[1] != 0 { return 0 }
+    let cmd = "grep -cv -E '^(#|$)' " + _shell_quote(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i < len(out) {
+        let c = out.substring(i, i + 1)
+        if c >= "0" && c <= "9" { n = n * 10 + (ord(c) - ord("0")) }
+        else { break }
+        i = i + 1
+    }
+    return n
+}
+
+// Return the literal text of the last non-header, non-empty line
+// (no trailing newline). Empty string if no data line exists.
+fn _last_data_line(path: string) -> string {
+    let chk = exec_with_status("test -f " + _shell_quote(path))
+    if chk[1] != 0 { return "" }
+    let cmd = "grep -v -E '^(#|$)' " + _shell_quote(path) +
+              " 2>/dev/null | tail -n 1"
+    // grep/tail emit a trailing newline — strip it.
+    let out = to_string(exec(cmd))
+    let mut s = out
+    // strip exactly one trailing \n (keep internal chars intact)
+    if len(s) > 0 && s.substring(len(s) - 1, len(s)) == "\n" {
+        s = s.substring(0, len(s) - 1)
+    }
+    return s
+}
+
+// Migration: if .raw-audit exists and has pre-chain (7-field) data
+// lines, back it up to .raw-audit.pre-chain and start a fresh log.
+// Idempotent — runs once per upgrade. Returns true if migration ran.
+fn _migrate_pre_chain_if_needed() -> bool {
+    let path = _audit_path()
+    let chk = exec_with_status("test -f " + _shell_quote(path))
+    if chk[1] != 0 { return false }
+    // Detect any data line with fewer than 7 pipes (→ <8 fields).
+    let cmd = "grep -v -E '^(#|$)' " + _shell_quote(path) +
+              " 2>/dev/null | awk -F'|' 'NF < 8 { bad=1 } END { exit bad ? 0 : 1 }'"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 { return false }   // no pre-chain lines found → no migration
+    let backup = path + ".pre-chain"
+    // If backup already exists, don't clobber — append .N suffix.
+    let bchk = exec_with_status("test -e " + _shell_quote(backup))
+    let mut target = backup
+    if bchk[1] == 0 {
+        let stamp = to_string(exec("date -u +%Y%m%dT%H%M%SZ")).trim()
+        target = backup + "." + stamp
+    }
+    // Open append window so we can move the uchg-locked file.
+    let _u = _open_append_window(path)
+    let mv = exec_with_status("mv " + _shell_quote(path) + " " + _shell_quote(target))
+    if mv[1] != 0 {
+        _close_append_window(path)
+        eprintln("raw_audit: migration mv failed (exit " + to_string(mv[1]) + ")")
+        return false
+    }
+    // Recreate fresh chained log (new header).
+    _ensure_audit_exists()
+    _close_append_window(path)
+    eprintln("raw_audit: migrated pre-chain log → " + target)
+    return true
 }
 
 fn _open_append_window(path: string) -> bool {
@@ -93,14 +191,23 @@ fn _close_append_window(path: string) -> bool {
 
 pub fn audit_append(event: string, actor: string, reason: string, result: string,
                     sha_before: string, sha_after: string) -> bool {
+    // One-shot migration: pre-chain logs are backed up + reset.
+    let _m = _migrate_pre_chain_if_needed()
     if !_ensure_audit_exists() { return false }
     let ts = _iso_utc_now()
+
+    // raw#1 hash-chain: prev_line_sha = sha256(last data line) or GENESIS.
+    let last = _last_data_line(_audit_path())
+    let mut prev_sha = _genesis_sha()
+    if last != "" { prev_sha = _sha256_of_string(last) }
+
     let line = ts + " | " + _escape_pipe(event)
               + " | " + _escape_pipe(actor)
               + " | " + _escape_pipe(reason)
               + " | " + _escape_pipe(result)
               + " | " + _escape_pipe(sha_before)
-              + " | " + _escape_pipe(sha_after) + "\n"
+              + " | " + _escape_pipe(sha_after)
+              + " | " + _escape_pipe(prev_sha) + "\n"
 
     // open append window → append → close window
     let unlocked = _open_append_window(_audit_path())
@@ -158,6 +265,25 @@ fn cmd_tail(n: int) -> int {
     return 0
 }
 
+// Extract the last pipe-delimited field from a line, trimming surrounding
+// whitespace. Returns "" if the line contains no pipe.
+fn _last_field(ln: string) -> string {
+    let mut idx = -1
+    let mut i = 0
+    while i < len(ln) {
+        if ln.substring(i, i + 1) == "|" { idx = i }
+        i = i + 1
+    }
+    if idx < 0 { return "" }
+    let mut tail = ln.substring(idx + 1, len(ln))
+    // manual trim (spaces only — trim() exists but keep it cheap)
+    let mut s = 0
+    while s < len(tail) && tail.substring(s, s + 1) == " " { s = s + 1 }
+    let mut e = len(tail)
+    while e > s && tail.substring(e - 1, e) == " " { e = e - 1 }
+    return tail.substring(s, e)
+}
+
 fn cmd_verify() -> int {
     let chk = exec_with_status("test -f '" + _audit_path() + "'")
     if chk[1] != 0 {
@@ -167,24 +293,57 @@ fn cmd_verify() -> int {
     let src = to_string(read_file(_audit_path()))
     let lines = split(src, "\n")
     let mut errs = 0
+    let mut chain_breaks = 0
     let mut line_no = 0
+    let mut data_lines = 0
+    let mut prev_line_text = ""          // text of the previous data line
+    let mut first_data = true
     for ln in lines {
         line_no = line_no + 1
         if len(ln) == 0 { continue }
         if ln.substring(0, 1) == "#" { continue }
-        // minimum: 6 pipe separators = 7 fields
+        // count pipe separators
         let mut pipes = 0
         let mut i = 0
         while i < len(ln) {
             if ln.substring(i, i + 1) == "|" { pipes = pipes + 1 }
             i = i + 1
         }
-        if pipes < 6 {
-            eprintln(".raw-audit:" + to_string(line_no) + " malformed (< 7 fields)")
+        // raw#1 expects 7 pipes (8 fields). Accept 6 (legacy 7-field) as
+        // malformed when migration is pending, but still fail.
+        if pipes < 7 {
+            eprintln(".raw-audit:" + to_string(line_no) +
+                     " malformed (< 8 fields, pipes=" + to_string(pipes) + ")")
+            errs = errs + 1
+            // Without a prev_line_sha field, further chain checks on this
+            // line make no sense — advance prev_line_text anyway so that
+            // the subsequent line has *some* anchor.
+            prev_line_text = ln
+            first_data = false
+            data_lines = data_lines + 1
+            continue
+        }
+        let stored_prev = _last_field(ln)
+        let mut expected_prev = _genesis_sha()
+        if !first_data { expected_prev = _sha256_of_string(prev_line_text) }
+        if stored_prev != expected_prev {
+            eprintln(".raw-audit:" + to_string(line_no) + " CHAIN BREAK")
+            eprintln("  stored prev_line_sha   = " + stored_prev)
+            eprintln("  expected prev_line_sha = " + expected_prev)
+            eprintln("  line: " + ln)
+            chain_breaks = chain_breaks + 1
             errs = errs + 1
         }
+        prev_line_text = ln
+        first_data = false
+        data_lines = data_lines + 1
     }
-    if errs == 0 { println("audit: OK (" + to_string(line_no) + " lines)"); return 0 }
+    if errs == 0 {
+        println("audit: OK (" + to_string(data_lines) + " data lines, chain intact)")
+        return 0
+    }
+    eprintln("audit: FAIL (" + to_string(errs) + " error(s), " +
+             to_string(chain_breaks) + " chain break(s))")
     return 1
 }
 
