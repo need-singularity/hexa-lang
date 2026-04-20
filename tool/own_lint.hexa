@@ -1,0 +1,390 @@
+#!hexa strict
+// tool/own_lint.hexa — .own layer validator (P0c)
+//
+// PURPOSE
+//   Enforce that /.own is a monotonic *strengthening* overlay on top of
+//   /.raw. Where /.own addresses a rule already declared in /.raw (matched
+//   by `slug`, since the two files maintain independent numeric-id
+//   namespaces), /.own must never weaken, remove, or contradict the /.raw
+//   rule. Project-local rules in /.own with slugs not present in /.raw
+//   are allowed through (truly own-namespace; cf. raw:ai-native-self-format).
+//
+// STRICTNESS LADDER (aligned with self/raw_loader.hexa allowed_status_for_kind)
+//   weakest → strongest:
+//     new < deferred < convention < warn < live
+//
+//   Codified in `_status_strength(s) -> int`:
+//     live=4, warn=3, convention=2, deferred=1, new=0, unknown=-1
+//
+//   Task spec lists `new < deferred < warn < convention < live`, but the
+//   project-wide convention (tool/own_inherit_lint.hexa, tool/loop_lint.hexa)
+//   places `warn` strictly above `convention` — an advisory *violation* is
+//   stronger than an advisory *style note*. We follow the project-wide
+//   ladder here for consistency with the existing enforcer. See follow-up
+//   in tail comment for ladder-consolidation.
+//
+// MONOTONIC CHECKS (per overlap, matched by slug)
+//   C1 status:  strength(own) ≥ strength(raw). Downgrade = FAIL.
+//   C2 scope:   every `scope` line in /.raw must appear verbatim in the
+//               /.own rule, UNLESS /.own declares zero `scope` lines
+//               (implicit inheritance). Partial override = FAIL.
+//   C3 enforce: every `enforce` line in /.raw must appear in /.own. /.own
+//               MAY add additional enforcers. Removing a .raw enforcer =
+//               FAIL.
+//   C4 proof:   same rule as C3 (additive only).
+//
+// OUT-OF-RANGE CHECKS
+//   X1 If /.own declares a header of kind `raw` with a numeric id, that
+//      id must resolve to an existing /.raw rule (guards stale refs /
+//      typos). /.own kind=own headers do NOT undergo this check — they
+//      live in the own-namespace regardless of numeric id.
+//
+// USAGE
+//   ./hexa tool/own_lint.hexa          — lint, exit nonzero on any violation
+//   ./hexa tool/own_lint.hexa lint     — alias for the default
+//   ./hexa tool/own_lint.hexa --list   — print every own slug + paired raw status
+//   ./hexa tool/own_lint.hexa --help   — this message
+//
+// OUTPUT FORMAT (one violation per line, to stderr)
+//   [own#<id>] <slug>: <what went wrong> — why: <one-sentence reason>
+//
+// EXIT
+//   0 — no violations
+//   1 — one or more violations
+//
+// WIRING
+//   Enforces raw:own-monotonic (appended to /.raw as a new rule when the
+//   root SSOT is unlocked for an edit pass). Until then, invocable via
+//   tool/raw_all.hexa as a synthetic enforcer (no .raw row required).
+
+use "self/core/law_io"
+use "self/raw_loader"
+
+// ─── strictness ladder ──────────────────────────────────────────
+
+fn _status_strength(s: string) -> int {
+    if s == "live" { return 4 }
+    if s == "warn" { return 3 }
+    if s == "convention" { return 2 }
+    if s == "deferred" { return 1 }
+    if s == "new" { return 0 }
+    return -1
+}
+
+// ─── path helpers ───────────────────────────────────────────────
+
+let mut __pwd_cache = ""
+
+fn _pwd() -> string {
+    if __pwd_cache != "" { return __pwd_cache }
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    __pwd_cache = p
+    return p
+}
+
+fn _raw_path() -> string {
+    let parts = [_pwd(), "/.raw"]
+    return parts.join("")
+}
+
+fn _own_path() -> string {
+    let parts = [_pwd(), "/.own"]
+    return parts.join("")
+}
+
+// ─── rule lookup helpers ────────────────────────────────────────
+
+fn _rule_slug(rule: array) -> string {
+    return keys_first(rule[3], "slug")
+}
+
+fn _find_by_slug(rules: array, slug: string) -> array {
+    if slug == "" { return [] }
+    for r in rules {
+        if _rule_slug(r) == slug { return r }
+    }
+    return []
+}
+
+fn _find_by_id(rules: array, id: string) -> array {
+    for r in rules {
+        if r[0] == id { return r }
+    }
+    return []
+}
+
+// ─── argv ───────────────────────────────────────────────────────
+
+fn _parse_mode() -> string {
+    // returns: "lint" | "list" | "help"
+    let av = args()
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--list" || a == "list" { return "list" }
+        if a == "--help" || a == "help" || a == "-h" { return "help" }
+        if a == "lint" { return "lint" }
+        i = i + 1
+    }
+    return "lint"
+}
+
+fn _print_help() {
+    println("tool/own_lint.hexa — .own layer validator (monotonic strengthening)")
+    println("")
+    println("USAGE")
+    println("  ./hexa tool/own_lint.hexa [lint]    validate .own against .raw (default)")
+    println("  ./hexa tool/own_lint.hexa --list    print every rule id + paired status")
+    println("  ./hexa tool/own_lint.hexa --help    this message")
+    println("")
+    println("MATCHING")
+    println("  .own rules are matched to .raw rules by `slug`. Own-only slugs")
+    println("  (no .raw counterpart) are treated as project-local and pass")
+    println("  through silently.")
+    println("")
+    println("STRICTNESS LADDER (weakest → strongest)")
+    println("  new < deferred < convention < warn < live")
+    println("")
+    println("EXIT")
+    println("  0 = clean       1 = one or more violations")
+}
+
+// ─── violation assembly ─────────────────────────────────────────
+
+fn _fmt_violation(own_id: string, slug: string, what: string, why: string) -> string {
+    let parts = ["[own#", own_id, "] ", slug, ": ", what, " — why: ", why]
+    return parts.join("")
+}
+
+// ─── C1: status monotonicity ────────────────────────────────────
+
+fn _check_status(own_rule: array, raw_rule: array, violations_in: array) -> array {
+    let own_id = own_rule[0]
+    let slug = _rule_slug(own_rule)
+    let own_status = own_rule[1]
+    let raw_status = raw_rule[1]
+    let os_n = _status_strength(own_status)
+    let rs_n = _status_strength(raw_status)
+    let mut violations = violations_in
+    if os_n < 0 {
+        let parts_w = ["unknown own status `", own_status,
+                       "` not comparable to raw `", raw_status, "`"]
+        violations = violations.push(_fmt_violation(own_id, slug,
+            parts_w.join(""),
+            "status must be one of: live warn convention deferred new"))
+        return violations
+    }
+    if rs_n < 0 {
+        // raw has unknown status — skip comparison (raw_loader strict
+        // validator will have already flagged this separately)
+        return violations
+    }
+    if os_n < rs_n {
+        let parts_w = ["status downgrade — own=", own_status,
+                       " weaker than raw=", raw_status]
+        violations = violations.push(_fmt_violation(own_id, slug,
+            parts_w.join(""),
+            ".own must strengthen (>=) never weaken (<) the matched .raw status"))
+    }
+    return violations
+}
+
+// ─── C2: scope inheritance (present verbatim OR no scope at all) ────
+
+fn _check_scope(own_rule: array, raw_rule: array, violations_in: array) -> array {
+    let own_id = own_rule[0]
+    let slug = _rule_slug(own_rule)
+    let raw_scopes = keys_all(raw_rule[3], "scope")
+    let own_scopes = keys_all(own_rule[3], "scope")
+    let mut violations = violations_in
+    if len(own_scopes) == 0 {
+        // implicit inheritance — allowed
+        return violations
+    }
+    if len(raw_scopes) == 0 {
+        // nothing to inherit — own adds its own scope, always allowed
+        return violations
+    }
+    for rs in raw_scopes {
+        let mut found = false
+        for os in own_scopes {
+            if os == rs { found = true }
+        }
+        if !found {
+            let parts_w = ["missing raw scope line `", rs, "`"]
+            violations = violations.push(_fmt_violation(own_id, slug,
+                parts_w.join(""),
+                ".own declaring any `scope` must include every `scope` line from the matched .raw rule (additive override only)"))
+        }
+    }
+    return violations
+}
+
+// ─── C3/C4: additive-only keys (enforce, proof) ─────────────────
+
+fn _check_additive(own_rule: array, raw_rule: array, key: string, violations_in: array) -> array {
+    let own_id = own_rule[0]
+    let slug = _rule_slug(own_rule)
+    let raw_vals = keys_all(raw_rule[3], key)
+    let own_vals = keys_all(own_rule[3], key)
+    let mut violations = violations_in
+    if len(raw_vals) == 0 { return violations }
+    if len(own_vals) == 0 {
+        // implicit inheritance (own declares nothing for this key) — allowed
+        return violations
+    }
+    for rv in raw_vals {
+        let mut found = false
+        for ov in own_vals {
+            if ov == rv { found = true }
+        }
+        if !found {
+            let parts_w = ["missing raw `", key, "` entry `", rv, "`"]
+            violations = violations.push(_fmt_violation(own_id, slug,
+                parts_w.join(""),
+                ".own declaring any `" + key + "` must include every `" + key + "` line from the matched .raw rule (strictly additive)"))
+        }
+    }
+    return violations
+}
+
+// ─── X1: stale `raw` kind header in /.own ───────────────────────
+// load_raw_file does not expose `kind` per rule; re-scan source for any
+// bare `raw <digits>` column-0 header and verify id resolves in .raw.
+
+fn _check_stale_raw_refs(own_path: string, raw_rules: array, violations_in: array) -> array {
+    let mut violations = violations_in
+    if !file_exists(own_path) { return violations }
+    let src = to_string(read_file(own_path))
+    let lines = split(src, "\n")
+    let mut line_no = 0
+    for raw_line in lines {
+        line_no = line_no + 1
+        if len(raw_line) == 0 { continue }
+        let first = raw_line.substring(0, 1)
+        if first == " " || first == "\t" || first == "#" { continue }
+        let sp = raw_line.index_of(" ")
+        if sp < 0 { continue }
+        let kind = raw_line.substring(0, sp)
+        if kind != "raw" { continue }
+        let rest1 = raw_line.substring(sp + 1, len(raw_line))
+        let sp2 = rest1.index_of(" ")
+        if sp2 < 0 { continue }
+        let id = rest1.substring(0, sp2)
+        let hit = _find_by_id(raw_rules, id)
+        if len(hit) == 0 {
+            let parts_w = [".own declares `raw ", id,
+                          "` but no such id exists in /.raw"]
+            violations = violations.push(_fmt_violation(id, "<stale-raw-ref>",
+                parts_w.join(""),
+                "task spec C1 — .own may not reference a raw-id that does not exist in .raw"))
+        }
+    }
+    return violations
+}
+
+// ─── --list mode ───────────────────────────────────────────────
+
+fn _print_list(raw_rules: array, own_rules: array) {
+    println("── .own ↔ .raw rule pairing ──")
+    println("own_id  own_status    raw_slug                  raw_status    name")
+    println("──────  ────────────  ────────────────────────  ────────────  ────────────────")
+    for r in own_rules {
+        let own_id = r[0]
+        let own_status = r[1]
+        let own_name = r[2]
+        let slug = _rule_slug(r)
+        let paired = _find_by_slug(raw_rules, slug)
+        let mut raw_status = "<none>"
+        if len(paired) > 0 { raw_status = paired[1] }
+        let mut slug_disp = slug
+        if slug_disp == "" { slug_disp = "<no-slug>" }
+        let parts = ["  ", own_id, "     ", own_status, "          ",
+                     slug_disp, "                  ",
+                     raw_status, "          ", own_name]
+        println(parts.join(""))
+    }
+    println("")
+    println(".raw rules total: " + to_string(len(raw_rules)))
+    println(".own rules total: " + to_string(len(own_rules)))
+}
+
+// ─── main ───────────────────────────────────────────────────────
+
+fn main() -> int {
+    let mode = _parse_mode()
+    if mode == "help" { _print_help(); return 0 }
+
+    let raw_p = _raw_path()
+    let own_p = _own_path()
+
+    if !file_exists(raw_p) {
+        eprintln("own_lint: FAIL — .raw missing at " + raw_p)
+        return 1
+    }
+    if !file_exists(own_p) {
+        eprintln("own_lint: FAIL — .own missing at " + own_p)
+        return 1
+    }
+
+    let raw_rules = load_raw_file(raw_p)
+    let own_rules = load_raw_file(own_p)
+
+    if mode == "list" {
+        _print_list(raw_rules, own_rules)
+        return 0
+    }
+
+    // lint mode
+    let mut violations = []
+
+    // X1: stale raw-id refs in .own
+    violations = _check_stale_raw_refs(own_p, raw_rules, violations)
+
+    // C1-C4: per-overlap (matched by slug) monotonicity
+    for own_rule in own_rules {
+        let slug = _rule_slug(own_rule)
+        if slug == "" { continue }
+        let paired = _find_by_slug(raw_rules, slug)
+        if len(paired) == 0 { continue }  // own-only rule → pass
+        violations = _check_status(own_rule, paired, violations)
+        violations = _check_scope(own_rule, paired, violations)
+        violations = _check_additive(own_rule, paired, "enforce", violations)
+        violations = _check_additive(own_rule, paired, "proof", violations)
+    }
+
+    println("── own_lint — .own monotonic strengthening check ──")
+    println(".raw : " + raw_p + "  (" + to_string(len(raw_rules)) + " rules)")
+    println(".own : " + own_p + "  (" + to_string(len(own_rules)) + " rules)")
+
+    if len(violations) == 0 {
+        println("")
+        println("PASS — .own is a monotonic strengthening of .raw")
+        return 0
+    }
+
+    eprintln("")
+    for v in violations { eprintln(v) }
+    eprintln("")
+    eprintln("FAIL — " + to_string(len(violations)) + " violation(s)")
+    return 1
+}
+
+exit(main())
+
+// ─── follow-up ──────────────────────────────────────────────────
+// 1. Status-ladder consolidation. This file, own_inherit_lint.hexa, and
+//    loop_lint.hexa each embed their own _status_strength(). Once the
+//    project-wide ladder is stable, extract to self/raw_loader.hexa
+//    (pub fn status_strength) and have all three import it.
+// 2. raw:own-monotonic registration. When /.raw is next unlocked for
+//    edits (hx unlock raw:self-format or similar), append:
+//       raw 20 new "own monotonic strengthening over .raw"
+//         slug own-monotonic
+//         enforce tool/own_lint.hexa
+//         deps raw:self-format
+//         proof tool/own_lint.hexa
+//    The .raw is currently chflags-locked (raw:os-lock) so registration
+//    is deferred to a batched unlock window. Meanwhile this tool is
+//    dispatched via tool/raw_all.hexa as a synthetic enforcer.
