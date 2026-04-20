@@ -1,0 +1,420 @@
+// tool/roadmap_critical_path.hexa — Tier1#4 (roadmap 36): critical path
+//
+// PURPOSE
+//   Compute the critical path (longest-duration path) through the
+//   cross-repo roadmap DAG. Unit weight per node (= 1 day) unless the
+//   entry has a `days` key. Also emits span(DAG) — the Brent/Graham
+//   lower bound on makespan T* for infinite parallel workers.
+//
+// FORMULA
+//   Given DAG G=(V,E), node weight w_v:
+//     earliest[v] = w_v + max(earliest[u]) over predecessors u
+//   span(G)      = max_v earliest[v]
+//   critical path = reverse trace of argmax earliest chain.
+//
+// OUTPUT
+//   { span: int, critical_path: [keys], depth: {key:d,...} }
+//
+// CLI
+//   hexa tool/roadmap_critical_path.hexa                — all 3 repos
+//   hexa tool/roadmap_critical_path.hexa --sel PathB  — subset
+//   hexa tool/roadmap_critical_path.hexa --selftest     — sanity
+//
+// EXIT
+//   0 → computation ok
+//   1 → cycle detected (cannot compute)
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _hdr_r(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let r1 = line.substring(sp1 + 1, len(line))
+    let sp2 = r1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = r1.substring(0, sp2)
+    let r2 = r1.substring(sp2 + 1, len(r1))
+    let sp3 = r2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let st = r2.substring(0, sp3)
+    let mut nm = r2.substring(sp3 + 1, len(r2)).trim()
+    if len(nm) >= 2 && nm.substring(0, 1) == "\"" { nm = nm.substring(1, len(nm) - 1) }
+    return [id, st, nm]
+}
+
+fn parse_roadmap(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut kind = ""
+    let mut cid = ""; let mut cst = ""; let mut cnm = ""; let mut ck = []
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            kind = ""; ck = []
+            continue
+        }
+        let f = line.substring(0, 1)
+        if f == "#" { continue }
+        if f == " " || f == "\t" {
+            if kind == "" { continue }
+            let s = line.trim_start()
+            let sp = s.index_of(" ")
+            if sp < 0 { continue }
+            ck.push([s.substring(0, sp), s.substring(sp + 1, len(s)).trim()])
+        } else {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            ck = []; kind = ""
+            let fs = line.index_of(" ")
+            if fs < 0 { continue }
+            if line.substring(0, fs) == "roadmap" {
+                let h = _hdr_r(line)
+                if len(h) == 0 { continue }
+                cid = h[0]; cst = h[1]; cnm = h[2]; kind = "r"
+            }
+        }
+    }
+    if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+    return rules
+}
+
+fn _load(path: string) -> array {
+    let r = exec_with_status("test -f '" + path + "'")
+    if r[1] != 0 { return [] }
+    return parse_roadmap(to_string(read_file(path)))
+}
+
+fn _kv(keys: array, k: string) -> string {
+    for kv in keys { if kv[0] == k { return kv[1] } }
+    return ""
+}
+
+fn _is_int(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) { if !d.contains(s.substring(i, i + 1)) { return false } i = i + 1 }
+    return true
+}
+
+fn _parse_int(s: string) -> int {
+    let mut n = 0
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if !d.contains(c) { return n }
+        let v = d.index_of(c)
+        n = n * 10 + v
+        i = i + 1
+    }
+    return n
+}
+
+fn parse_deps(val: string, default_repo: string) -> array {
+    let mut out = []
+    if len(val) == 0 || val == "—" { return out }
+    let cleaned = val.replace(",", " ").replace("+", " ")
+    let toks = split(cleaned, " ")
+    let mut current = default_repo
+    for raw in toks {
+        let t = raw.trim()
+        if len(t) == 0 { continue }
+        let at = t.index_of("@")
+        if at > 0 && at < len(t) - 1 {
+            let repo = t.substring(0, at)
+            let id = t.substring(at + 1, len(t))
+            if _is_int(id) { out.push([repo, id]); current = repo; continue }
+        }
+        if _is_int(t) { out.push([current, t]) }
+    }
+    return out
+}
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+// Build DAG with weights. repos = [[name, rules], ...]
+// Returns [node_keys, node_weights, node_titles, node_repos, node_ids, node_statuses, edges]
+fn build_weighted_dag(repos: array) -> array {
+    let mut keys = []
+    let mut weights = []
+    let mut titles = []
+    let mut rr_names = []
+    let mut ids = []
+    let mut sts = []
+    let mut edges = []
+
+    for rr in repos {
+        let repo = rr[0]
+        for rule in rr[1] {
+            let id = rule[0]
+            let key = repo + "#" + id
+            keys.push(key)
+            let dv = _kv(rule[3], "days")
+            if _is_int(dv) && _parse_int(dv) > 0 { weights.push(_parse_int(dv)) } else { weights.push(1) }
+            titles.push(rule[2])
+            rr_names.push(repo)
+            ids.push(id)
+            sts.push(rule[1])
+        }
+    }
+    for rr in repos {
+        let repo = rr[0]
+        for rule in rr[1] {
+            let id = rule[0]
+            let key = repo + "#" + id
+            let dep = _kv(rule[3], "depends-on")
+            for pair in parse_deps(dep, repo) {
+                let target = pair[0] + "#" + pair[1]
+                // edge: target → key  (target must precede key)
+                edges.push([target, key])
+            }
+        }
+    }
+    return [keys, weights, titles, rr_names, ids, sts, edges]
+}
+
+// Longest-path DP. Unknown predecessor refs (cross-repo to non-existent node)
+// are ignored (treated as absent). Returns [earliest, predecessor].
+fn longest_path(keys: array, weights: array, edges: array) -> array {
+    let n = len(keys)
+    // build adjacency: pred[i] = list of j such that edge j→i
+    let mut pred = []
+    let mut succ = []
+    let mut i = 0
+    while i < n { pred.push([]); succ.push([]); i = i + 1 }
+
+    // key → index map (linear lookup ok for n≤200)
+    for e in edges {
+        let mut fi = -1
+        let mut ti = -1
+        let mut k = 0
+        while k < n {
+            if keys[k] == e[0] { fi = k }
+            if keys[k] == e[1] { ti = k }
+            k = k + 1
+        }
+        if fi < 0 || ti < 0 { continue }
+        let pt = pred[ti]; pt.push(fi); pred[ti] = pt
+        let sf = succ[fi]; sf.push(ti); succ[fi] = sf
+    }
+
+    // topo sort via Kahn
+    let mut indeg = []
+    let mut j = 0
+    while j < n { indeg.push(len(pred[j])); j = j + 1 }
+    let mut q = []
+    let mut qi = 0
+    let mut topo = []
+    let mut jj = 0
+    while jj < n { if indeg[jj] == 0 { q.push(jj) } jj = jj + 1 }
+    while qi < len(q) {
+        let u = q[qi]
+        topo.push(u)
+        for v in succ[u] {
+            indeg[v] = indeg[v] - 1
+            if indeg[v] == 0 { q.push(v) }
+        }
+        qi = qi + 1
+    }
+    if len(topo) != n {
+        return [[], [], [], true]  // cycle
+    }
+
+    // DP
+    let mut earliest = []
+    let mut predbest = []
+    let mut depth = []
+    let mut k2 = 0
+    while k2 < n {
+        earliest.push(weights[k2])
+        predbest.push(-1)
+        depth.push(0)
+        k2 = k2 + 1
+    }
+    for u in topo {
+        let ps = pred[u]
+        let mut best = 0
+        let mut bp = -1
+        let mut bd = -1
+        for p in ps {
+            if earliest[p] > best { best = earliest[p]; bp = p }
+            if depth[p] > bd { bd = depth[p] }
+        }
+        earliest[u] = best + weights[u]
+        predbest[u] = bp
+        if len(ps) == 0 { depth[u] = 0 } else { depth[u] = bd + 1 }
+    }
+    return [earliest, predbest, depth, false]
+}
+
+fn find_critical(keys: array, earliest: array, predbest: array) -> array {
+    // find argmax earliest
+    let n = len(keys)
+    let mut best = -1
+    let mut bi = -1
+    let mut i = 0
+    while i < n {
+        if earliest[i] > best { best = earliest[i]; bi = i }
+        i = i + 1
+    }
+    if bi < 0 { return [] }
+    // walk back
+    let mut path = []
+    let mut cur = bi
+    while cur >= 0 {
+        path.push(keys[cur])
+        cur = predbest[cur]
+    }
+    // reverse
+    let mut rev = []
+    let mut j = len(path) - 1
+    while j >= 0 { rev.push(path[j]); j = j - 1 }
+    return rev
+}
+
+fn _je(s: string) -> string {
+    let mut o = s.replace("\\", "\\\\")
+    o = o.replace("\"", "\\\"")
+    o = o.replace("\n", "\\n")
+    return o
+}
+
+fn strs_to_json(a: array) -> string {
+    let mut p = []; p.push("[")
+    let mut first = true
+    for s in a {
+        if !first { p.push(",") }
+        p.push("\""); p.push(_je(s)); p.push("\"")
+        first = false
+    }
+    p.push("]")
+    return p.join("")
+}
+
+fn _load_repos_filter(want: array) -> array {
+    let home = _home()
+    let repos = ["anima", "airgenome", "hexa-lang"]
+    let mut out = []
+    for r in repos {
+        let mut include = len(want) == 0
+        for w in want { if w == r { include = true } }
+        if !include { continue }
+        out.push([r, _load(home + "/core/" + r + "/.roadmap")])
+    }
+    return out
+}
+
+// Filter to Path B subset (anima#22..30).
+fn _filter_pathB(repos: array) -> array {
+    let mut out = []
+    for rr in repos {
+        if rr[0] != "anima" { continue }
+        let mut kept = []
+        for rule in rr[1] {
+            let idv = rule[0]
+            if !_is_int(idv) { continue }
+            let n = _parse_int(idv)
+            if n >= 22 && n <= 30 { kept.push(rule) }
+        }
+        out.push(["anima", kept])
+    }
+    return out
+}
+
+fn compute(repos: array) -> array {
+    let dag = build_weighted_dag(repos)
+    let keys = dag[0]
+    let weights = dag[1]
+    let edges = dag[6]
+    let lp = longest_path(keys, weights, edges)
+    if lp[3] {
+        return [[], [], 0, [], true]
+    }
+    let earliest = lp[0]
+    let predbest = lp[1]
+    let mut span = 0
+    for v in earliest { if v > span { span = v } }
+    let cp = find_critical(keys, earliest, predbest)
+    return [keys, earliest, span, cp, false]
+}
+
+fn _selftest() -> int {
+    // synthesized linear chain: 1→2→3 → span=3
+    let lin = "roadmap 1 planned \"a\"\n  track x\n  phase p\n  eta TBD\n  why x\n\nroadmap 2 planned \"b\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 1\n\nroadmap 3 planned \"c\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 2\n"
+    let rules = parse_roadmap(lin)
+    let r1 = compute([["t", rules]])
+    if r1[4] != false {
+        eprintln("selftest FAIL: linear chain span compute failed (cycle flag?)")
+        return 1
+    }
+    let sp1 = r1[2]
+    if sp1 != 3 {
+        eprintln("selftest FAIL: linear span expected 3, got " + to_string(sp1))
+        return 1
+    }
+
+    // Path B subset: must span == 6
+    let all = _load_repos_filter([])
+    let pb = _filter_pathB(all)
+    let r2 = compute(pb)
+    let sp2 = r2[2]
+    println("Path B span = " + to_string(sp2))
+    println("Path B critical path: " + r2[3].join(" → "))
+    if sp2 != 6 {
+        eprintln("selftest FAIL: Path B span expected 6, got " + to_string(sp2))
+        return 1
+    }
+
+    // Full 3-repo compute (smoke)
+    let r3 = compute(all)
+    println("Full graph span = " + to_string(r3[2]))
+    println("selftest PASS — Path B = 6 days (Brent/Graham)")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let mut sel = ""
+    let mut j = 0
+    while j < len(args) {
+        if args[j] == "--sel" && j + 1 < len(args) { sel = args[j + 1]; j = j + 1 }
+        j = j + 1
+    }
+    let all = _load_repos_filter([])
+    let mut repos = all
+    if sel == "PathB" { repos = _filter_pathB(all) }
+
+    let r = compute(repos)
+    if r[4] == true {
+        eprintln("CYCLE — cannot compute critical path")
+        exit(1)
+    }
+    let mut p = []
+    p.push("{\"span\":")
+    p.push(to_string(r[2]))
+    p.push(",\"critical_path\":")
+    p.push(strs_to_json(r[3]))
+    p.push(",\"node_count\":")
+    p.push(to_string(len(r[0])))
+    p.push("}")
+    println(p.join(""))
+}
