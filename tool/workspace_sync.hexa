@@ -79,6 +79,27 @@ fn _readlink(path: string) -> string {
     return to_string(r[0]).trim()
 }
 
+// realpath — resolve all symlinks and relative parts. Returns "" on failure
+// (path missing, loop, permission). Used to detect self-reference through
+// intermediate symlinks: e.g. ~/Dev/nexus/... and ~/core/nexus/... resolve
+// to the same inode when ~/Dev is a symlink to ~/core. Portable across
+// macOS (coreutils via brew) and Linux (GNU readlink).
+fn _resolve_path(path: string) -> string {
+    if path == "" { return "" }
+    // Try GNU coreutils `realpath` first (Linux default, macOS via brew).
+    let r1 = exec_with_status("realpath " + _shell_quote(path) + " 2>/dev/null")
+    let out1 = to_string(r1[0]).trim()
+    if r1[1] == 0 && len(out1) > 0 { return out1 }
+    // Fallback: `readlink -f` (GNU). On macOS without coreutils this errors.
+    let r2 = exec_with_status("readlink -f " + _shell_quote(path) + " 2>/dev/null")
+    let out2 = to_string(r2[0]).trim()
+    if r2[1] == 0 && len(out2) > 0 { return out2 }
+    // Last resort: `cd + pwd -P` — always available, follows symlinks on dir
+    // component, then appends basename. Good enough for self-ref detection.
+    let r3 = exec_with_status("sh -c 'd=$(dirname " + _shell_quote(path) + "); b=$(basename " + _shell_quote(path) + "); cd \"$d\" 2>/dev/null && printf %s/%s \"$(pwd -P)\" \"$b\"' 2>/dev/null")
+    return to_string(r3[0]).trim()
+}
+
 fn _iso_utc_now() -> string {
     return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
 }
@@ -575,6 +596,31 @@ for m in members {
         let abs_src = _path_join(_path_join(ws_root, owner_path), src_rel)
         let abs_tgt = _path_join(_path_join(ws_root, m_path_rel), target_rel)
 
+        // SAFETY GUARD: forbid self-reference. An op where source == target
+        // would produce `ln -s X X`, a self-loop that destroys the source
+        // file (replaced by a symlink to itself). Catches both literal string
+        // equality and resolved-path equality (e.g. ~/Dev/nexus/... and
+        // ~/core/nexus/... when ~/Dev is a symlink to ~/core).
+        if abs_src == abs_tgt {
+            operations.push(["error", alias, abs_tgt, abs_src, res_id, install,
+                "self-reference: source == target (" + abs_src + ")"])
+            warn_count = warn_count + 1
+            continue
+        }
+        let res_src = _resolve_path(abs_src)
+        let res_tgt_dir = _resolve_path(_dirname(abs_tgt))
+        let tgt_base = abs_tgt.substring(len(_dirname(abs_tgt)) + 1, len(abs_tgt))
+        if res_src != "" && res_tgt_dir != "" {
+            let res_tgt_parts = [res_tgt_dir, "/", tgt_base]
+            let res_tgt = res_tgt_parts.join("")
+            if res_src == res_tgt {
+                operations.push(["error", alias, abs_tgt, abs_src, res_id, install,
+                    "self-reference (resolved): " + res_src + " == " + res_tgt])
+                warn_count = warn_count + 1
+                continue
+            }
+        }
+
         if install == "path" {
             operations.push(["advice", alias, abs_tgt, abs_src, res_id, install, "add to PATH: " + abs_src])
             continue
@@ -738,12 +784,26 @@ for op in operations {
         skipped = skipped + 1
         continue
     }
-    if op_kind == "warn" {
-        // already counted in warn_count; skip FS action
+    if op_kind == "warn" || op_kind == "error" {
+        // already counted in warn_count; skip FS action. "error" ops come
+        // from the self-reference guard above and must never execute.
+        if op_kind == "error" {
+            eprintln("[workspace] refuse op (" + op[1] + " " + op[4] + "): " + op[6])
+            op_errors = op_errors + 1
+        }
         continue
     }
     let abs_tgt = op[2]
     let abs_src = op[3]
+
+    // SAFETY GUARD (belt-and-braces): even after plan-phase check, verify
+    // at execute time that we are not about to `ln -s X X`. Guards against
+    // state drift between plan and execute.
+    if abs_src == abs_tgt {
+        eprintln("[workspace] refuse self-link: " + abs_tgt)
+        op_errors = op_errors + 1
+        continue
+    }
 
     if dry_run { continue }
 
@@ -805,6 +865,16 @@ if !dry_run {
         let abs_src = _path_join(_path_join(ws_root, om[2]), src_rel)
         let sha = _sha256_of(abs_src)
         let bytes_s = _bytes_of(abs_src)
+
+        // Refuse lock write when owner source is unreadable (missing file,
+        // self-referential symlink, permission). Empty sha + bytes=0 is a
+        // silent corruption indicator. Better to fail loudly than persist
+        // a useless lock entry.
+        if sha == "" || bytes_s == "0" {
+            eprintln("[workspace] lock refuse: " + rid + " — unreadable source " + abs_src)
+            eprintln("  (missing file, broken symlink, or self-reference)")
+            exit(1)
+        }
 
         // consumers list — members that import this resource
         let mut consumers = []
