@@ -39,12 +39,27 @@
 //           either set or clear, so L1≡L2 semantically on Linux).
 //   Other — Level 0 (no-op with warning).
 //
-// TARGETS
-//   required          : 5 SSOT — must exist; verify fails if missing / < L1
-//   optional          : raw#12 grandfather bans — locked if present on disk
-//   critical (L2)     : subset of required — default {.raw .own}, the set
-//                       `hx harden` promotes to Level 2
-//   non_critical (L1) : required - critical — stays at Level 1 always
+// TARGETS  (2026-04-20 raw#1 E2 — scope expansion)
+//   tier1_required    : 5 SSOT (.raw .own .ext .roadmap .loop) — must
+//                       exist; verify fails if missing / < L1
+//   tier2_required    : 6 infra (self/raw_loader.hexa, tool/raw_all.hexa,
+//                       tool/hx_unlock.hexa, tool/os_level_lock.hexa,
+//                       tool/raw_audit.hexa, .raw-audit) — must exist
+//                       and be locked; mutable infra defeats SSOT
+//                       enforcement.
+//   tier2_optional    : build artifacts (build/hexa_stage0) — locked
+//                       when present, warned (not failed) when absent.
+//   optional          : raw#12 grandfather bans — locked if present on
+//                       disk, skipped silently if absent.
+//   critical (L2)     : subset of tier1 — default {.raw .own}, the set
+//                       `hx harden` promotes to Level 2 (schg)
+//   non_critical (L1) : tier1 − critical — stays at Level 1 always
+//
+//   REENTRY FLOW after lock (tier2 includes this file):
+//     ./hexa tool/hx_unlock.hexa --reason "<why>" --roadmap-ref <id>
+//       → .raw-audit append + nouchg on the target
+//       → edit → stage → commit
+//       → ./hexa tool/os_level_lock.hexa lock   # re-lock
 //
 //   Names are declared inline rather than hardcoded at call sites
 //   (raw#14 — values belong in SSOT, but the target list IS an SSOT
@@ -53,10 +68,56 @@
 use "self/core/ai_err"
 
 // ─── target lists (raw#0 scope) ─────────────────────────────────
+//
+// Scope is tiered (2026-04-20, raw#1 E2):
+//   _tier1_required — 5 SSOT (.raw .own .ext .roadmap .loop). MUST exist,
+//                     MUST be locked. Core invariant surface of raw#0.
+//   _tier2_required — 6 infra files that implement / enforce the SSOT
+//                     semantics (parser, dispatcher, unlock wrapper,
+//                     self-lock, audit writer, audit log). If they are
+//                     mutable, the SSOT guarantees are bypassable, so
+//                     they MUST be locked alongside tier1.
+//   _tier2_optional — build artifacts (build/hexa_stage0). Locked when
+//                     present, skipped without warning when absent.
+//   _required_targets() = tier1 ∪ tier2_required — used by lock/unlock/
+//                         verify (every command treats both tiers the
+//                         same at the enforcement layer).
 
-fn _required_targets() -> array {
+fn _tier1_required() -> array {
     // 5 SSOT — raw/own/ext/roadmap/loop. MUST exist, MUST be locked.
     return [".raw", ".own", ".ext", ".roadmap", ".loop"]
+}
+
+fn _tier2_required() -> array {
+    // 6 infra targets — the SSOT parser, orchestrator, unlock flow, self
+    // lock tool, audit writer, and audit log. Mutable infra = bypassable
+    // SSOT. MUST exist (except .raw-audit, which is seeded lazily — we
+    // still include it; path-exists guard in cmd_lock covers first-run).
+    return [
+        "self/raw_loader.hexa",
+        "tool/raw_all.hexa",
+        "tool/hx_unlock.hexa",
+        "tool/os_level_lock.hexa",
+        "tool/raw_audit.hexa",
+        ".raw-audit"
+    ]
+}
+
+fn _tier2_optional() -> array {
+    // Build artifact — present only after rebuild_stage0. Locked when
+    // present so a regenerated binary can't be silently swapped; warn-not-
+    // fail on absent (raw#0 tree clones before first build).
+    return ["build/hexa_stage0"]
+}
+
+fn _required_targets() -> array {
+    // Union used by lock / unlock / verify. Order preserved: tier1 first
+    // so summary output keeps SSOT group together.
+    let mut out = []
+    for r in _tier1_required() { out = out.push(r) }
+    for r in _tier2_required() { out = out.push(r) }
+    for r in _tier2_optional() { out = out.push(r) }
+    return out
 }
 
 fn _optional_targets() -> array {
@@ -266,10 +327,56 @@ fn cmd_lock() -> int {
     let mut locked_count = 0
     let mut skipped_missing = 0
     let mut skipped_already = 0
+    let mut warn_optional_missing = 0
     let mut failures = []
 
-    let targets = _required_targets() + _optional_targets()
-    for rel in targets {
+    // tier1 + tier2_required: missing is silent skip (cmd_verify will flag)
+    let required = _tier1_required() + _tier2_required()
+    for rel in required {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            skipped_missing = skipped_missing + 1
+            continue
+        }
+        if _is_locked(abs) {
+            skipped_already = skipped_already + 1
+            continue
+        }
+        let rc = _apply_lock(abs)
+        if rc == 0 {
+            locked_count = locked_count + 1
+            println("  locked    " + rel + " (L1)")
+        } else {
+            failures = failures.push(rel)
+            eprintln("  FAILED    " + rel + " (lock exit " + to_string(rc) + ")")
+        }
+    }
+
+    // tier2_optional: missing is warned, not skipped silently. Present
+    // artifacts (build/hexa_stage0 after rebuild) get locked.
+    for rel in _tier2_optional() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            warn_optional_missing = warn_optional_missing + 1
+            eprintln("  WARN      " + rel + " (absent — build artifact; skipping)")
+            continue
+        }
+        if _is_locked(abs) {
+            skipped_already = skipped_already + 1
+            continue
+        }
+        let rc = _apply_lock(abs)
+        if rc == 0 {
+            locked_count = locked_count + 1
+            println("  locked    " + rel + " (L1)")
+        } else {
+            failures = failures.push(rel)
+            eprintln("  FAILED    " + rel + " (lock exit " + to_string(rc) + ")")
+        }
+    }
+
+    // raw#12 grandfather bans (optional_targets): existing semantics.
+    for rel in _optional_targets() {
         let abs = root + "/" + rel
         if !_path_exists(abs) {
             skipped_missing = skipped_missing + 1
@@ -293,6 +400,7 @@ fn cmd_lock() -> int {
     println("summary: locked=" + to_string(locked_count)
             + " already=" + to_string(skipped_already)
             + " missing=" + to_string(skipped_missing)
+            + " warn_optional=" + to_string(warn_optional_missing)
             + " failed=" + to_string(len(failures)))
     if len(failures) > 0 { return 1 }
     return 0
@@ -312,6 +420,7 @@ fn cmd_unlock() -> int {
     let mut skipped_already = 0
     let mut failures = []
 
+    // tier1 ∪ tier2_required ∪ tier2_optional ∪ optional(raw#12)
     let targets = _required_targets() + _optional_targets()
     for rel in targets {
         let abs = root + "/" + rel
@@ -552,9 +661,35 @@ fn cmd_status_ai() -> int {
     let mut fields = []
     if darwin { fields = fields.push(["platform", "darwin"]) }
     else { fields = fields.push(["platform", "linux"]) }
-    for rel in _required_targets() {
+    for rel in _tier1_required() {
         let abs = root + "/" + rel
         if !_path_exists(abs) { fields = fields.push([rel, "MISSING"]); continue }
+        let lvl = _detect_level(abs)
+        let mut tag = "NOFLAG"
+        if darwin {
+            if _darwin_has_schg(abs) { tag = "schg" }
+            else if _darwin_has_uchg(abs) { tag = "uchg" }
+        } else if linux {
+            if _linux_has_immutable(abs) { tag = "immut" }
+        }
+        fields = fields.push([rel, tag + " (L" + to_string(lvl) + ")"])
+    }
+    for rel in _tier2_required() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { fields = fields.push([rel, "MISSING"]); continue }
+        let lvl = _detect_level(abs)
+        let mut tag = "NOFLAG"
+        if darwin {
+            if _darwin_has_schg(abs) { tag = "schg" }
+            else if _darwin_has_uchg(abs) { tag = "uchg" }
+        } else if linux {
+            if _linux_has_immutable(abs) { tag = "immut" }
+        }
+        fields = fields.push([rel, tag + " (L" + to_string(lvl) + ")"])
+    }
+    for rel in _tier2_optional() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { fields = fields.push([rel, "absent"]); continue }
         let lvl = _detect_level(abs)
         let mut tag = "NOFLAG"
         if darwin {
@@ -637,11 +772,53 @@ fn cmd_status() -> int {
         println("  platform: Linux (chattr +i; L1≡L2)")
     }
     println("")
-    println("required SSOT (5):")
-    for rel in _required_targets() {
+    println("tier1 SSOT (5):")
+    for rel in _tier1_required() {
         let abs = root + "/" + rel
         if !_path_exists(abs) {
             println("  MISSING   " + rel)
+            continue
+        }
+        if !supported {
+            println("  N/A       " + rel + " (L0)")
+            continue
+        }
+        let lvl = _detect_level(abs)
+        let tag = _level_label(lvl, darwin)
+        if lvl == 0 {
+            println("  UNLOCKED  " + rel + "  " + tag)
+        } else {
+            println("  locked    " + rel + "  " + tag)
+        }
+    }
+
+    println("")
+    println("tier2 infra (6):")
+    for rel in _tier2_required() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            println("  MISSING   " + rel)
+            continue
+        }
+        if !supported {
+            println("  N/A       " + rel + " (L0)")
+            continue
+        }
+        let lvl = _detect_level(abs)
+        let tag = _level_label(lvl, darwin)
+        if lvl == 0 {
+            println("  UNLOCKED  " + rel + "  " + tag)
+        } else {
+            println("  locked    " + rel + "  " + tag)
+        }
+    }
+
+    println("")
+    println("tier2 optional (build artifacts):")
+    for rel in _tier2_optional() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            println("  absent    " + rel + " (build not yet produced)")
             continue
         }
         if !supported {
@@ -689,12 +866,32 @@ fn cmd_verify() -> int {
     let root = _pwd()
     let mut fails = []
 
-    for rel in _required_targets() {
+    // tier1 + tier2_required — missing = hard fail
+    for rel in _tier1_required() {
         let abs = root + "/" + rel
         if !_path_exists(abs) {
             fails = fails.push(rel + " (missing)")
             continue
         }
+        if _detect_level(abs) < 1 {
+            fails = fails.push(rel + " (unlocked, < L1)")
+        }
+    }
+    for rel in _tier2_required() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) {
+            fails = fails.push(rel + " (missing)")
+            continue
+        }
+        if _detect_level(abs) < 1 {
+            fails = fails.push(rel + " (unlocked, < L1)")
+        }
+    }
+    // tier2_optional — build artifacts, warn (not fail) when absent.
+    // When present, the lock is still required.
+    for rel in _tier2_optional() {
+        let abs = root + "/" + rel
+        if !_path_exists(abs) { continue }
         if _detect_level(abs) < 1 {
             fails = fails.push(rel + " (unlocked, < L1)")
         }
