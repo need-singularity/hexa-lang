@@ -1,0 +1,410 @@
+// tool/roadmap_dag.hexa — Tier1#3 (roadmap 35): depends-on DAG builder
+//
+// PURPOSE
+//   Build a directed acyclic graph from entry depends-on edges. Supports
+//   cross-repo refs with "repo@N" syntax. Detects cycles via Kahn topo
+//   sort residual. Outputs JSON { nodes, edges, topo, cycles }.
+//
+// NODE KEY FORMAT
+//   "<repo>#<id>"   — e.g. "anima#22", "hexa-lang#42"
+//
+// CLI
+//   hexa tool/roadmap_dag.hexa                 — build from 3 default repos
+//   hexa tool/roadmap_dag.hexa --repo <name>   — single repo (cwd or name)
+//   hexa tool/roadmap_dag.hexa --selftest      — cycle detection sanity
+//
+// EXIT
+//   0 → DAG acyclic
+//   1 → cycle detected (cycle edges printed)
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _parse_hdr_r(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let st = rest2.substring(0, sp3)
+    let mut nm = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(nm) >= 2 && nm.substring(0, 1) == "\"" { nm = nm.substring(1, len(nm) - 1) }
+    return [id, st, nm]
+}
+
+fn parse_roadmap(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut kind = ""
+    let mut cid = ""
+    let mut cst = ""
+    let mut cnm = ""
+    let mut ck = []
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            kind = ""; ck = []
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if kind == "" { continue }
+            let st = line.trim_start()
+            let sp = st.index_of(" ")
+            if sp < 0 { continue }
+            let k = st.substring(0, sp)
+            let v = st.substring(sp + 1, len(st)).trim()
+            ck.push([k, v])
+        } else {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            ck = []; kind = ""
+            let fs = line.index_of(" ")
+            if fs < 0 { continue }
+            let tok = line.substring(0, fs)
+            if tok == "roadmap" {
+                let h = _parse_hdr_r(line)
+                if len(h) == 0 { continue }
+                cid = h[0]; cst = h[1]; cnm = h[2]; kind = "r"
+            }
+        }
+    }
+    if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+    return rules
+}
+
+fn _load(path: string) -> array {
+    let r = exec_with_status("test -f '" + path + "'")
+    if r[1] != 0 { return [] }
+    return parse_roadmap(to_string(read_file(path)))
+}
+
+fn _kv_find(keys: array, k: string) -> string {
+    for kv in keys { if kv[0] == k { return kv[1] } }
+    return ""
+}
+
+// Parse a depends-on value into an array of (repo, id) pairs.
+// Accepts:
+//   "11"                 → [(default_repo, "11")]
+//   "11, 12"             → [(dr,"11"), (dr,"12")]
+//   "hexa-lang@33,34"    → [(hexa-lang,"33"), (hexa-lang,"34")]
+//   "hexa-lang@33, anima@22" → [(hexa-lang,"33"), (anima,"22")]
+// Non-numeric tokens are skipped.
+fn _is_int(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) { if !d.contains(s.substring(i, i + 1)) { return false } i = i + 1 }
+    return true
+}
+
+fn parse_depends(val: string, default_repo: string) -> array {
+    let mut out = []
+    if len(val) == 0 || val == "—" { return out }
+    let cleaned = val.replace(",", " ").replace("+", " ")
+    let tokens = split(cleaned, " ")
+    let mut current_repo = default_repo
+    for raw in tokens {
+        let t = raw.trim()
+        if len(t) == 0 { continue }
+        let at = t.index_of("@")
+        if at > 0 && at < len(t) - 1 {
+            let repo = t.substring(0, at)
+            let id = t.substring(at + 1, len(t))
+            if _is_int(id) {
+                out.push([repo, id])
+                current_repo = repo  // subsequent bare numbers inherit
+                continue
+            }
+        }
+        if _is_int(t) {
+            out.push([current_repo, t])
+        }
+    }
+    return out
+}
+
+// Build cross-repo DAG.
+// nodes: array of [key, repo, id, status, title]
+// edges: array of [from_key, to_key]   (edge means from depends on to)
+fn build_dag(repo_rules: array) -> array {
+    let mut nodes = []
+    let mut edges = []
+    let mut known_keys = []
+
+    // first pass: register nodes
+    for rr in repo_rules {
+        let repo = rr[0]
+        let rules = rr[1]
+        for rule in rules {
+            let id = rule[0]
+            let key = repo + "#" + id
+            nodes.push([key, repo, id, rule[1], rule[2]])
+            known_keys.push(key)
+        }
+    }
+
+    // second pass: edges
+    for rr in repo_rules {
+        let repo = rr[0]
+        let rules = rr[1]
+        for rule in rules {
+            let id = rule[0]
+            let key = repo + "#" + id
+            let dep = _kv_find(rule[3], "depends-on")
+            let parsed = parse_depends(dep, repo)
+            for pair in parsed {
+                let target = pair[0] + "#" + pair[1]
+                edges.push([key, target])
+            }
+        }
+    }
+    return [nodes, edges, known_keys]
+}
+
+// Kahn topological sort. Returns [topo_order, cycles].
+// If cycles non-empty, nodes not in topo_order form the cycle set.
+fn topo_sort(nodes: array, edges: array) -> array {
+    // Build in-degree (edge from→to means "from depends on to" → node `from`
+    // cannot run until `to` is done. In scheduling terms, `to` must precede
+    // `from`. So treat edge as `to → from` for topo purposes).
+    let mut indeg_keys = []
+    let mut indeg_vals = []
+    let mut adj_keys = []
+    let mut adj_vals = []
+
+    for n in nodes {
+        indeg_keys.push(n[0])
+        indeg_vals.push(0)
+        adj_keys.push(n[0])
+        adj_vals.push([])
+    }
+
+    for e in edges {
+        let from = e[0]  // depends on to
+        let to = e[1]
+        // edge to → from  for topo
+        let mut i = 0
+        let mut fi = -1
+        let mut ti = -1
+        while i < len(adj_keys) {
+            if adj_keys[i] == to { ti = i }
+            if adj_keys[i] == from { fi = i }
+            i = i + 1
+        }
+        if ti < 0 || fi < 0 { continue }
+        let lst = adj_vals[ti]
+        lst.push(from)
+        adj_vals[ti] = lst
+        indeg_vals[fi] = indeg_vals[fi] + 1
+    }
+
+    // init queue
+    let mut queue = []
+    let mut i = 0
+    while i < len(indeg_keys) {
+        if indeg_vals[i] == 0 { queue.push(indeg_keys[i]) }
+        i = i + 1
+    }
+
+    let mut topo = []
+    let mut qi = 0
+    while qi < len(queue) {
+        let k = queue[qi]
+        topo.push(k)
+        // find in adj
+        let mut ai = 0
+        while ai < len(adj_keys) {
+            if adj_keys[ai] == k {
+                for nb in adj_vals[ai] {
+                    let mut bj = 0
+                    while bj < len(indeg_keys) {
+                        if indeg_keys[bj] == nb {
+                            indeg_vals[bj] = indeg_vals[bj] - 1
+                            if indeg_vals[bj] == 0 { queue.push(nb) }
+                        }
+                        bj = bj + 1
+                    }
+                }
+            }
+            ai = ai + 1
+        }
+        qi = qi + 1
+    }
+
+    // cycle nodes = indeg > 0 after drain
+    let mut cycles = []
+    let mut ci = 0
+    while ci < len(indeg_keys) {
+        if indeg_vals[ci] > 0 { cycles.push(indeg_keys[ci]) }
+        ci = ci + 1
+    }
+    return [topo, cycles]
+}
+
+// ─── JSON emit ───────────────────────────────────────────────────
+fn _je(s: string) -> string {
+    let mut o = s.replace("\\", "\\\\")
+    o = o.replace("\"", "\\\"")
+    o = o.replace("\n", "\\n")
+    return o
+}
+
+fn nodes_to_json(nodes: array) -> string {
+    let mut p = []
+    p.push("[")
+    let mut first = true
+    for n in nodes {
+        if !first { p.push(",") }
+        p.push("{\"key\":\"")
+        p.push(_je(n[0]))
+        p.push("\",\"repo\":\"")
+        p.push(_je(n[1]))
+        p.push("\",\"id\":\"")
+        p.push(_je(n[2]))
+        p.push("\",\"status\":\"")
+        p.push(_je(n[3]))
+        p.push("\",\"title\":\"")
+        p.push(_je(n[4]))
+        p.push("\"}")
+        first = false
+    }
+    p.push("]")
+    return p.join("")
+}
+
+fn edges_to_json(edges: array) -> string {
+    let mut p = []
+    p.push("[")
+    let mut first = true
+    for e in edges {
+        if !first { p.push(",") }
+        p.push("[\"")
+        p.push(_je(e[0]))
+        p.push("\",\"")
+        p.push(_je(e[1]))
+        p.push("\"]")
+        first = false
+    }
+    p.push("]")
+    return p.join("")
+}
+
+fn strs_to_json(arr: array) -> string {
+    let mut p = []
+    p.push("[")
+    let mut first = true
+    for s in arr {
+        if !first { p.push(",") }
+        p.push("\"")
+        p.push(_je(s))
+        p.push("\"")
+        first = false
+    }
+    p.push("]")
+    return p.join("")
+}
+
+fn dag_to_json(nodes: array, edges: array, topo: array, cycles: array) -> string {
+    let mut p = []
+    p.push("{\"nodes\":")
+    p.push(nodes_to_json(nodes))
+    p.push(",\"edges\":")
+    p.push(edges_to_json(edges))
+    p.push(",\"topo\":")
+    p.push(strs_to_json(topo))
+    p.push(",\"cycles\":")
+    p.push(strs_to_json(cycles))
+    p.push(",\"stats\":{\"nodes\":")
+    p.push(to_string(len(nodes)))
+    p.push(",\"edges\":")
+    p.push(to_string(len(edges)))
+    p.push(",\"cyclic\":")
+    if len(cycles) > 0 { p.push("true") } else { p.push("false") }
+    p.push("}}")
+    return p.join("")
+}
+
+// ─── driver ─────────────────────────────────────────────────────
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn load_all_repos() -> array {
+    let home = _home()
+    let repos = ["anima", "airgenome", "hexa-lang"]
+    let mut out = []
+    for r in repos {
+        let rules = _load(home + "/core/" + r + "/.roadmap")
+        out.push([r, rules])
+    }
+    return out
+}
+
+fn _selftest() -> int {
+    // synthesized cycle: A→B→A
+    let cyclic = "roadmap 1 planned \"a\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 2\n\nroadmap 2 planned \"b\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 1\n"
+    let rules = parse_roadmap(cyclic)
+    let dag = build_dag([["test", rules]])
+    let ts = topo_sort(dag[0], dag[1])
+    if len(ts[1]) != 2 {
+        eprintln("selftest FAIL: expected 2 cycle nodes, got " + to_string(len(ts[1])))
+        return 1
+    }
+
+    // synthesized acyclic: A→B, A→C
+    let acyc = "roadmap 1 planned \"a\"\n  track x\n  phase p\n  eta TBD\n  why x\n\nroadmap 2 planned \"b\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 1\n\nroadmap 3 planned \"c\"\n  track x\n  phase p\n  eta TBD\n  why x\n  depends-on 1,2\n"
+    let ar = parse_roadmap(acyc)
+    let adag = build_dag([["test", ar]])
+    let ats = topo_sort(adag[0], adag[1])
+    if len(ats[1]) != 0 {
+        eprintln("selftest FAIL: acyclic case reported " + to_string(len(ats[1])) + " cycles")
+        return 1
+    }
+    if len(ats[0]) != 3 {
+        eprintln("selftest FAIL: topo order size " + to_string(len(ats[0])))
+        return 1
+    }
+
+    // real 3 repos
+    let repos = load_all_repos()
+    let dag2 = build_dag(repos)
+    let ts2 = topo_sort(dag2[0], dag2[1])
+    println("selftest: nodes=" + to_string(len(dag2[0])) + " edges=" + to_string(len(dag2[1])) + " topo=" + to_string(len(ts2[0])) + " cycles=" + to_string(len(ts2[1])))
+    if len(ts2[1]) > 0 {
+        println("selftest WARN: real repos contain cycle nodes:")
+        for c in ts2[1] { println("  " + c) }
+    }
+    println("selftest PASS")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let repos = load_all_repos()
+    let dag = build_dag(repos)
+    let ts = topo_sort(dag[0], dag[1])
+    println(dag_to_json(dag[0], dag[1], ts[0], ts[1]))
+    if len(ts[1]) > 0 { exit(1) }
+}
