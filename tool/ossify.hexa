@@ -31,6 +31,7 @@
 //   2 — usage / bad args
 
 use "self/attrs/ossify"
+use "self/proof/certificate"
 
 // ─── constants ──────────────────────────────────────────────────
 
@@ -419,6 +420,119 @@ fn _cmd_release_all() -> int {
     return 0
 }
 
+// Field extraction that tolerates both `"k": "v"` (manifest style)
+// and `"k":"v"` (compact jsonl style used by codegen NEXUS_CERT).
+fn _extract_field_compact(line, key) {
+    let v1 = _extract_field(line, key)
+    if len(v1) > 0 { return v1 }
+    let needle = "\"" + key + "\":\""
+    let idx = line.index_of(needle)
+    if idx < 0 { return "" }
+    let rest = line.substring(idx + len(needle), len(line))
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+// Parse one JSON-line cert (emitted by codegen_c2 NEXUS_CERT=1) into
+// a dict matching self/proof/certificate.hexa's cert shape, so we can
+// call verify_certificate() on it.
+fn _cert_parse_line(line) {
+    let t = line.trim()
+    if len(t) == 0 { return #{} }
+    if !t.starts_with("{") { return #{} }
+    let pred   = _extract_field_compact(t, "predicate")
+    let target = _extract_field_compact(t, "target")
+    let bucket = _extract_field_compact(t, "bucket")
+    let status = _extract_field_compact(t, "status")
+    // hash field is numeric (no quotes) — scan "hash":<digits>
+    let needle = "\"hash\":"
+    let idx = t.index_of(needle)
+    let mut h = 0
+    if idx >= 0 {
+        let rest = t.substring(idx + len(needle), len(t))
+        // strip trailing "}" and whitespace
+        let mut n = 0
+        let mut acc = 0
+        let mut started = false
+        while n < len(rest) {
+            let ch = rest.substring(n, n + 1)
+            if ch == " " || ch == "\t" {
+                if started { n = len(rest) } else { n = n + 1 }
+            } else if ch == "}" || ch == "," || ch == "\n" {
+                n = len(rest)
+            } else {
+                let digit = 0
+                if ch == "0" { acc = acc * 10 + 0; started = true }
+                else if ch == "1" { acc = acc * 10 + 1; started = true }
+                else if ch == "2" { acc = acc * 10 + 2; started = true }
+                else if ch == "3" { acc = acc * 10 + 3; started = true }
+                else if ch == "4" { acc = acc * 10 + 4; started = true }
+                else if ch == "5" { acc = acc * 10 + 5; started = true }
+                else if ch == "6" { acc = acc * 10 + 6; started = true }
+                else if ch == "7" { acc = acc * 10 + 7; started = true }
+                else if ch == "8" { acc = acc * 10 + 8; started = true }
+                else if ch == "9" { acc = acc * 10 + 9; started = true }
+                else { n = len(rest) }
+                n = n + 1
+            }
+        }
+        h = acc
+    }
+    return #{
+        "predicate": pred,
+        "target":    target,
+        "bucket":    bucket,
+        "status":    status,
+        "hash":      h
+    }
+}
+
+// Given an ossified manifest path, derive the sibling .certificates
+// sidecar path. Module base = basename - .hexa suffix.
+fn _cert_sidecar_for(path) {
+    // basename
+    let mut i = len(path) - 1
+    let mut slash = -1
+    while i >= 0 {
+        let ch = path.substring(i, i + 1)
+        if ch == "/" { slash = i; i = -1 } else { i = i - 1 }
+    }
+    let base = if slash >= 0 { path.substring(slash + 1, len(path)) } else { path }
+    let bn = len(base)
+    let stem = if bn >= 5 && base.substring(bn - 5, bn) == ".hexa" { base.substring(0, bn - 5) } else { base }
+    return ".certificates/" + stem + ".cert.jsonl"
+}
+
+// Verify every line in the cert sidecar (if present). Backward
+// compatible — missing sidecar → 0 errors.
+fn _cert_verify_sidecar(manifest_path) -> int {
+    let side = _cert_sidecar_for(manifest_path)
+    if !_file_exists(side) { return 0 }
+    let src = to_string(read_file(side))
+    let lines = src.split("\n")
+    let mut total = 0
+    let mut fail  = 0
+    for raw in lines {
+        let t = raw.trim()
+        if len(t) == 0 { continue }
+        if !t.starts_with("{") { continue }
+        total = total + 1
+        let cert = _cert_parse_line(t)
+        let v = verify_certificate(cert)
+        if v != "VERIFY_OK" {
+            _err("cert FAIL [" + v + "]  " + manifest_path + " :: " + to_string(cert["target"]))
+            fail = fail + 1
+        }
+    }
+    if total > 0 {
+        let mut tag = "PASS"
+        if fail > 0 { tag = "FAIL" }
+        println("  cert " + tag + " [" + to_string(total - fail) + "/" + to_string(total) + "]  " + side)
+    }
+    return fail
+}
+
 fn _cmd_verify() -> int {
     let entries = _manifest_load()
     if len(entries) == 0 {
@@ -426,6 +540,7 @@ fn _cmd_verify() -> int {
         return 0
     }
     let mut mismatch = 0
+    let mut cert_fail = 0
     for e in entries {
         let p        = e[0]
         let hash_old = e[1]
@@ -445,9 +560,15 @@ fn _cmd_verify() -> int {
             else          { status = "LOCK_MISMATCH(" + lock + "/" + expect_lock + ")"; mismatch = mismatch + 1 }
         }
         println("  " + status + "  [" + strength + "]  " + p)
+        // sidecar cert verify — non-fatal, missing sidecar = 0.
+        cert_fail = cert_fail + _cert_verify_sidecar(p)
     }
     if mismatch > 0 {
         _err("verify: " + to_string(mismatch) + " mismatch(es)")
+        return 1
+    }
+    if cert_fail > 0 {
+        _err("verify: " + to_string(cert_fail) + " certificate failure(s)")
         return 1
     }
     _info("verify: all " + to_string(len(entries)) + " entries SYNCED")
