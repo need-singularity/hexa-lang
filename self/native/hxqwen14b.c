@@ -5616,3 +5616,137 @@ int hxqwen14b_v565_lora_adamw_step(
 #endif
 }
 // End of v5.6.5 — backward orchestrator body activated.
+
+// ════════════════════════════════════════════════════════════════════
+// v5.6.6 — host orchestrator: global L2 grad-norm clip across all 384
+// LoRA gradient buffers (192 adapters × {A,B}).
+//
+//   r12 NaN root-cause fix (2026-04-20): without grad-clip, a single
+//   activation outlier in the 48-layer chained sgemm can blow dA/dB
+//   into Inf, the subsequent AdamW step poisons every element, and
+//   every later step is NaN. With max_norm=1.0 default, norms in the
+//   1e2-1e4 range get rescaled to 1.0, preserving direction.
+//
+//   Two passes:
+//     pass A: zero scratch scalar → for each of 384 buffers, accumulate
+//             ||g_i||^2 via hxqwen14b_cu_launch_sumsq → d2h read → norm.
+//     pass B: if norm > max_norm and norm is finite, scale each buffer
+//             by max_norm / norm in-place via launch_scale_inplace.
+//
+//   Caller convention: invoke between hxqwen14b_base_backward_v565 and
+//   hxqwen14b_v565_lora_adamw_step. r12 trainer wires it accordingly.
+// ════════════════════════════════════════════════════════════════════
+
+extern int hxqwen14b_cu_launch_sumsq(int64_t g_dev, int64_t acc_dev, int64_t N);
+extern int hxqwen14b_cu_launch_scale_inplace(int64_t dst_dev, int64_t N, float scale);
+extern int64_t hxqwen14b_cu_alloc_scalar_fp32(void);
+extern int hxqwen14b_cu_zero_scalar_fp32(int64_t scalar_dev);
+extern double hxqwen14b_cu_read_scalar_fp32(int64_t scalar_dev);
+extern int hxqwen14b_cu_free_scalar_fp32(int64_t scalar_dev);
+
+int hxqwen14b_v566_lora_grad_clip(
+    int64_t grad_ptrs_p, int64_t r,
+    double max_norm_d,
+    int64_t out_norm_p, int64_t out_clipped_p
+) {
+#ifndef HXQWEN14B_CUDA
+    (void)grad_ptrs_p; (void)r; (void)max_norm_d;
+    (void)out_norm_p; (void)out_clipped_p;
+    return RC_ERR_CUDA_TODO;
+#else
+    if (grad_ptrs_p == 0) return RC_ERR_NULL_ARGS;
+    if (r <= 0) return RC_ERR_BAD_ARGS;
+
+    int64_t* grad_ptrs = (int64_t*)(uintptr_t)grad_ptrs_p;
+    float max_norm = (float)max_norm_d;
+
+    const int64_t d   = QWEN14B_D_MODEL;
+    const int64_t HQ  = QWEN14B_N_HEAD;
+    const int64_t HK  = QWEN14B_N_KV_HEAD;
+    const int64_t HD  = QWEN14B_HEAD_DIM;
+    const int64_t dq  = HQ * HD;
+    const int64_t dkv = HK * HD;
+
+    // Allocate scratch scalar accumulator (zeroed inside alloc helper).
+    int64_t acc_dev = hxqwen14b_cu_alloc_scalar_fp32();
+    if (acc_dev == 0) return RC_ERR_OOM;
+
+    // Pass A: accumulate sum-of-squares across 384 buffers.
+    int rc = hxqwen14b_cu_zero_scalar_fp32(acc_dev);
+    if (rc != RC_OK) { hxqwen14b_cu_free_scalar_fp32(acc_dev); return rc; }
+
+    for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+        for (int T = 0; T < 4; T++) {
+            int adapter = L * 4 + T;
+            int64_t Nout = (T==0)?dq:(T==1)?dkv:(T==2)?dkv:d;
+            int64_t Kin  = (T==3)?dq:d;
+            int64_t A_n  = r * Kin;
+            int64_t B_n  = Nout * r;
+            int64_t gA = grad_ptrs[adapter * 2 + 0];
+            int64_t gB = grad_ptrs[adapter * 2 + 1];
+            if (gA != 0) {
+                rc = hxqwen14b_cu_launch_sumsq(gA, acc_dev, A_n);
+                if (rc != RC_OK) { hxqwen14b_cu_free_scalar_fp32(acc_dev); return rc; }
+            }
+            if (gB != 0) {
+                rc = hxqwen14b_cu_launch_sumsq(gB, acc_dev, B_n);
+                if (rc != RC_OK) { hxqwen14b_cu_free_scalar_fp32(acc_dev); return rc; }
+            }
+        }
+    }
+
+    // d2h sync read of accumulated sum-of-squares.
+    double sumsq = hxqwen14b_cu_read_scalar_fp32(acc_dev);
+    double norm  = sqrt(sumsq);
+
+    if (out_norm_p != 0) *(double*)(uintptr_t)out_norm_p = norm;
+
+    int clipped = 0;
+    // Only clip if norm finite AND exceeds budget. NaN/Inf propagates
+    // and skips clip; AdamW NaN-guard masks individual bad elements.
+    if (max_norm > 0.0f && isfinite(norm) && norm > (double)max_norm) {
+        float scale = (float)((double)max_norm / norm);
+        for (int L = 0; L < QWEN14B_N_LAYER; L++) {
+            for (int T = 0; T < 4; T++) {
+                int adapter = L * 4 + T;
+                int64_t Nout = (T==0)?dq:(T==1)?dkv:(T==2)?dkv:d;
+                int64_t Kin  = (T==3)?dq:d;
+                int64_t A_n  = r * Kin;
+                int64_t B_n  = Nout * r;
+                int64_t gA = grad_ptrs[adapter * 2 + 0];
+                int64_t gB = grad_ptrs[adapter * 2 + 1];
+                if (gA != 0) {
+                    rc = hxqwen14b_cu_launch_scale_inplace(gA, A_n, scale);
+                    if (rc != RC_OK) { hxqwen14b_cu_free_scalar_fp32(acc_dev); return rc; }
+                }
+                if (gB != 0) {
+                    rc = hxqwen14b_cu_launch_scale_inplace(gB, B_n, scale);
+                    if (rc != RC_OK) { hxqwen14b_cu_free_scalar_fp32(acc_dev); return rc; }
+                }
+            }
+        }
+        clipped = 1;
+    }
+    if (out_clipped_p != 0) *(int64_t*)(uintptr_t)out_clipped_p = (int64_t)clipped;
+
+    hxqwen14b_cu_free_scalar_fp32(acc_dev);
+    return RC_OK;
+#endif
+}
+
+// Positional FFI wrapper for hexa-side trainer call.
+//   step / measured_norm_out / clipped_out are simple; everything else
+//   is by-value double / int64_t.
+int hxqwen14b_v566_lora_grad_clip_pos(
+    int64_t grad_ptrs_p, int64_t r,
+    double max_norm_d,
+    int64_t out_norm_p, int64_t out_clipped_p
+) {
+    return hxqwen14b_v566_lora_grad_clip(grad_ptrs_p, r, max_norm_d,
+                                          out_norm_p, out_clipped_p);
+}
+
+int64_t hxqwen14b_version_v566(void) {
+    return 566;
+}
+// End of v5.6.6 — global grad-clip orchestrator (r12 NaN fix).

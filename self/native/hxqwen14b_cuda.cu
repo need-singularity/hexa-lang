@@ -1210,6 +1210,11 @@ int hxqwen14b_cu_launch_axpy(int64_t dst_dev, int64_t src_dev,
 //     θ -= lr · (m_hat / (sqrt(v_hat) + eps) + wd · θ)
 //   Decoupled weight decay (AdamW). bias_correction handled per-call so
 //   caller passes step t≥1.
+//
+// v5.6.6 NaN-guard (r12 NaN root-cause fix 2026-04-20):
+//   If gi is NaN/Inf, skip element entirely (preserve previous m/v/p),
+//   so a single bad gradient cannot poison every subsequent step. This
+//   is defense-in-depth alongside the new global L2 grad-clip helper.
 // ═════════════════════════════════════════════════════════════════════
 __global__ void v565_adamw_step_kernel(
     float* __restrict__ p,
@@ -1223,6 +1228,9 @@ __global__ void v565_adamw_step_kernel(
     int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
     if (i >= N) return;
     float gi = g[i];
+    // r12 NaN-guard: drop bad gradient elements without corrupting state.
+    // isfinite() returns false for NaN, +Inf, -Inf.
+    if (!isfinite(gi)) return;
     float mi = beta1 * m[i] + (1.0f - beta1) * gi;
     float vi = beta2 * v[i] + (1.0f - beta2) * gi * gi;
     m[i] = mi;
@@ -1230,7 +1238,11 @@ __global__ void v565_adamw_step_kernel(
     float m_hat = mi / bc1;
     float v_hat = vi / bc2;
     float upd = m_hat / (sqrtf(v_hat) + eps) + wd * p[i];
-    p[i] = p[i] - lr * upd;
+    float p_new = p[i] - lr * upd;
+    // r12 NaN-guard: also drop poisoned param updates (e.g. NaN m/v leak
+    // from a pre-fix run). Parameter stays at its last finite value.
+    if (!isfinite(p_new)) return;
+    p[i] = p_new;
 }
 
 extern "C" int hxqwen14b_cu_launch_adamw_step(
@@ -1253,4 +1265,127 @@ extern "C" int hxqwen14b_cu_launch_adamw_step(
     return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
 }
 
-}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 bwd kernels + v5.6.5 helpers + adamw added inside)
+// ═════════════════════════════════════════════════════════════════════
+// v5.6.6 — global L2 grad-norm + clip helpers (r12 NaN fix 2026-04-20).
+//
+//   ALM r12 M=512 real-corpus smoke explodes to NaN by step 10 once
+//   warmup completes. Diagnosis: chained sgemm backward through 48
+//   layers can produce dA/dB tensors with very large L2 (~1e3+) for a
+//   handful of activation outliers; AdamW v_hat normalises per-element
+//   but a single Inf grad poisons the entire downstream cascade.
+//
+//   Standard fix is global L2 grad clipping:
+//     1. compute total = Σ_i ||g_i||²  across all 384 LoRA buffers
+//     2. norm = sqrt(total) ; if norm > max_norm, scale = max_norm / norm
+//     3. multiply every grad in-place by `scale`
+//
+//   Two device kernels:
+//     v566_sumsq_kernel — block-strided fp32 reduction, atomic add into
+//                          single-element accumulator (per-call zeroed).
+//     v566_scale_kernel — element-wise dst[i] *= scale.
+//
+//   Hosts (extern "C" wrappers):
+//     hxqwen14b_cu_launch_sumsq      — accumulate ||g||² of one buffer
+//     hxqwen14b_cu_launch_scale_inplace — multiply one buffer by scale
+//     hxqwen14b_cu_alloc_scalar_fp32 / free_scalar_fp32 — accumulator
+//     hxqwen14b_cu_read_scalar_fp32  — d2h sync read of accumulator
+//
+//   The .c orchestrator iterates the 384 buffers twice: once for sum-sq
+//   accumulate, once for scale (only if norm > max_norm). NaN/Inf in
+//   any element → norm becomes NaN → scale = max_norm / NaN = NaN; the
+//   .c orchestrator detects this and treats the step as a "skip" (no
+//   scale, no AdamW; AdamW NaN-guard above handles in-flight NaNs as a
+//   final safety net).
+// ═════════════════════════════════════════════════════════════════════
+__global__ void v566_sumsq_kernel(
+    const float* __restrict__ g,
+    float* __restrict__ acc,    // single fp32, atomicAdd target
+    int64_t N
+) {
+    extern __shared__ float s_data[];
+    int tid = threadIdx.x;
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + tid;
+
+    float local = 0.0f;
+    if (i < N) {
+        float v = g[i];
+        // NaN-tolerant accumulation: NaN²=NaN poisons sum, but caller
+        // can detect via final isnan(norm). Inf² overflows to Inf.
+        local = v * v;
+    }
+    s_data[tid] = local;
+    __syncthreads();
+
+    for (int s = blockDim.x >> 1; s > 0; s >>= 1) {
+        if (tid < s) s_data[tid] += s_data[tid + s];
+        __syncthreads();
+    }
+
+    if (tid == 0 && s_data[0] != 0.0f) {
+        atomicAdd(acc, s_data[0]);
+    }
+}
+
+extern "C" int hxqwen14b_cu_launch_sumsq(
+    int64_t g_dev, int64_t acc_dev, int64_t N
+) {
+    if (g_dev == 0 || acc_dev == 0 || N <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    unsigned blocks = (unsigned)((N + threads - 1) / threads);
+    size_t shmem = (size_t)threads * sizeof(float);
+    v566_sumsq_kernel<<<blocks, threads, shmem>>>(
+        (const float*)(uintptr_t)g_dev,
+        (float*)(uintptr_t)acc_dev, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+__global__ void v566_scale_kernel(
+    float* __restrict__ dst, float scale, int64_t N
+) {
+    int64_t i = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= N) return;
+    dst[i] = dst[i] * scale;
+}
+
+extern "C" int hxqwen14b_cu_launch_scale_inplace(
+    int64_t dst_dev, int64_t N, float scale
+) {
+    if (dst_dev == 0 || N <= 0) return HXQ_RC_KERNEL_FAIL;
+    int threads = 256;
+    unsigned blocks = (unsigned)((N + threads - 1) / threads);
+    v566_scale_kernel<<<blocks, threads>>>(
+        (float*)(uintptr_t)dst_dev, scale, N);
+    return (cudaGetLastError() == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+extern "C" int64_t hxqwen14b_cu_alloc_scalar_fp32(void) {  // r12 fix scratch
+    void* p = NULL;
+    cudaError_t e = cudaMalloc(&p, sizeof(float));
+    if (e != cudaSuccess) return 0;
+    cudaMemsetAsync(p, 0, sizeof(float), 0);
+    return (int64_t)(uintptr_t)p;
+}
+
+extern "C" int hxqwen14b_cu_zero_scalar_fp32(int64_t scalar_dev) {
+    if (scalar_dev == 0) return HXQ_RC_KERNEL_FAIL;
+    cudaError_t e = cudaMemsetAsync((void*)(uintptr_t)scalar_dev, 0, sizeof(float), 0);
+    return (e == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+extern "C" double hxqwen14b_cu_read_scalar_fp32(int64_t scalar_dev) {
+    if (scalar_dev == 0) return 0.0;
+    cudaDeviceSynchronize();
+    float v = 0.0f;
+    cudaError_t e = cudaMemcpy(&v, (void*)(uintptr_t)scalar_dev,
+                                sizeof(float), cudaMemcpyDeviceToHost);
+    if (e != cudaSuccess) return 0.0;
+    return (double)v;
+}
+
+extern "C" int hxqwen14b_cu_free_scalar_fp32(int64_t scalar_dev) {
+    if (scalar_dev == 0) return HXQ_RC_OK;
+    cudaError_t e = cudaFree((void*)(uintptr_t)scalar_dev);
+    return (e == cudaSuccess) ? HXQ_RC_OK : HXQ_RC_KERNEL_FAIL;
+}
+
+}  // extern "C" (closes the v5.4 block opened at line 466; v5.6.3 bwd kernels + v5.6.5 helpers + adamw + v5.6.6 grad-clip added inside)
