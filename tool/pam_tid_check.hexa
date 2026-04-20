@@ -1,0 +1,166 @@
+#!hexa strict
+// tool/pam_tid_check.hexa — verify /etc/pam.d/sudo has pam_tid.so enabled
+//
+// TouchID sudo on macOS requires a `auth sufficient pam_tid.so` line in
+// /etc/pam.d/sudo (or sudo_local on macOS 14+). Without it the Tier-2 defense
+// (TouchID-gated chflags schg) collapses to a plain password prompt, which
+// a persistent agent can shoulder-surf from history/clipboard.
+//
+// This tool is read-only — it only reports; it never edits sudo config.
+// Writing to /etc/pam.d/sudo requires the user to hold sudo + make a
+// decision; we refuse to automate that path.
+//
+// OUTPUT
+//   ai_ok    pam-tid/configured     — pam_tid.so present as auth sufficient
+//   ai_err   pam-tid/not-configured — missing
+//   ai_err   pam-tid/disabled       — commented out or after a reject
+//   ai_err   pam-tid/non-darwin     — platform doesn't ship pam_tid
+//   ai_err   pam-tid/read-failed    — cannot read (permission denied)
+
+use "self/core/ai_err"
+
+fn _is_darwin() -> bool {
+    let u = to_string(exec("uname -s")).trim()
+    return u == "Darwin"
+}
+
+// macOS 14+ prefers /etc/pam.d/sudo_local (survives softwareupdate).
+// Older systems only have /etc/pam.d/sudo. We check both.
+fn _sudo_pam_paths() -> array {
+    return ["/etc/pam.d/sudo_local", "/etc/pam.d/sudo"]
+}
+
+fn _path_exists(p: string) -> bool {
+    let r = to_string(exec("test -e " + p + " && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _read_sudo_pam(path: string) -> string {
+    // /etc/pam.d/sudo is world-readable (0644) on stock macOS — no sudo
+    // needed for read. If perms have been changed, cat will fail and we
+    // return "" → caller emits read-failed.
+    let r = exec_with_status("cat " + path + " 2>/dev/null")
+    if r[1] != 0 { return "" }
+    return to_string(r[0])
+}
+
+// Returns true if `line` (already trimmed) configures pam_tid as an active
+// auth sufficient entry. Comment lines (`#`) are rejected here.
+fn _is_active_pam_tid(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return false }
+    if t.starts_with("#") { return false }
+    // Typical forms:
+    //   auth       sufficient     pam_tid.so
+    //   auth       include        sudo_local    (this is the include on 14+)
+    if !t.starts_with("auth") { return false }
+    if !t.contains("pam_tid.so") { return false }
+    // control must be sufficient or optional — "required" gates the chain
+    // too aggressively and "substack" is unusual.
+    return t.contains("sufficient") || t.contains("optional")
+}
+
+fn _scan_for_pam_tid(body: string) -> int {
+    // Returns 0 = active, 1 = present-but-commented, 2 = absent
+    let lines = split(body, "\n")
+    let mut commented = false
+    for ln in lines {
+        if _is_active_pam_tid(ln) { return 0 }
+        let t = ln.trim()
+        if t.starts_with("#") && t.contains("pam_tid.so") { commented = true }
+    }
+    if commented { return 1 }
+    return 2
+}
+
+fn main() -> int {
+    if !_is_darwin() {
+        ai_err("pam-tid", "non-darwin", [
+            ["cause", "pam_tid is Apple TouchID; only meaningful on macOS"],
+            ["remedy", "run on macOS to use Tier-2 TouchID gate"],
+            ["ref", "doc/os_level_lock_setup.md"]
+        ])
+        return 1
+    }
+
+    let mut checked = []
+    let mut any_active = false
+    let mut any_commented = false
+    let mut any_present = false
+
+    for path in _sudo_pam_paths() {
+        if !_path_exists(path) { continue }
+        any_present = true
+        let body = _read_sudo_pam(path)
+        if body == "" {
+            ai_err("pam-tid", "read-failed", [
+                ["file", path],
+                ["cause", "cannot read — perms may have been tightened"],
+                ["remedy", "sudo cat " + path + "   # check permissions"],
+                ["ref", "doc/os_level_lock_setup.md"]
+            ])
+            return 1
+        }
+        let verdict = _scan_for_pam_tid(body)
+        checked = checked.push([path, to_string(verdict)])
+        if verdict == 0 { any_active = true }
+        else if verdict == 1 { any_commented = true }
+    }
+
+    if !any_present {
+        ai_err("pam-tid", "no-sudo-pam", [
+            ["cause", "neither /etc/pam.d/sudo nor /etc/pam.d/sudo_local present"],
+            ["remedy", "install sudo (should come with macOS by default)"],
+            ["ref", "doc/os_level_lock_setup.md"]
+        ])
+        return 1
+    }
+
+    if any_active {
+        let mut fields = [["status", "active"]]
+        for p in checked {
+            if p[1] == "0" { fields = fields.push([p[0], "active"]) }
+            else if p[1] == "1" { fields = fields.push([p[0], "commented"]) }
+            else { fields = fields.push([p[0], "absent"]) }
+        }
+        ai_ok("pam-tid/configured", fields)
+        return 0
+    }
+
+    if any_commented {
+        ai_err("pam-tid", "disabled", [
+            ["cause", "pam_tid.so line present but commented out"],
+            ["remedy", "sudo vi /etc/pam.d/sudo_local   # uncomment the pam_tid line"],
+            ["remedy", "see doc/os_level_lock_setup.md for the exact line"],
+            ["ref", "doc/os_level_lock_setup.md"]
+        ])
+        return 1
+    }
+
+    // nothing matched — not configured at all
+    let mut suggest = "/etc/pam.d/sudo_local"
+    // Prefer sudo_local on modern macOS but fall back to sudo if only
+    // that exists.
+    if !_path_exists("/etc/pam.d/sudo_local") {
+        suggest = "/etc/pam.d/sudo"
+    }
+    ai_err("pam-tid", "not-configured", [
+        ["file", suggest],
+        ["cause", "pam_tid.so not listed as auth sufficient"],
+        ["remedy", "sudo vi " + suggest + "   # add: auth sufficient pam_tid.so"],
+        ["remedy", "the line MUST be the first non-comment auth entry"],
+        ["ref", "doc/os_level_lock_setup.md"]
+    ])
+    return 1
+}
+
+let _av = argv()
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let s = _av[1]
+    if s.ends_with("/pam_tid_check.hexa") { return true }
+    if s == "pam_tid_check.hexa" { return true }
+    return false
+}
+
+if _is_main() { exit(main()) }
