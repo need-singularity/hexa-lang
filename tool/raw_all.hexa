@@ -66,6 +66,7 @@
 
 use "self/core/law_io"
 use "self/raw_loader"
+use "tool/raw_cache"
 // ─── argv parsing ────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
@@ -407,10 +408,12 @@ fn _json_escape(s: string) -> string {
 // ─── main walk ───────────────────────────────────────────────────
 
 fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
-              only_id: string, json: bool, par_n: int) -> array {
+              only_id: string, json: bool, par_n: int, ssot_fp: string) -> array {
     // returns [pass_ct, fail_ct, warn_ct, skip_ct, json_entries(array), missing_ct, enforce_ct]
     //   enforce_ct — total rules that attempted enforcement (RUN + MISSING + pre-FAIL-due-to-no-enforce).
     //                Used by the "N/M enforcers PASS" summary line.
+    //                CACHED entries count as PASS but do NOT bump enforce_ct
+    //                (they did not actually run — cache fast-path, P1d).
     if !file_exists(path) {
         if kind == "raw" {
             // .raw MUST exist
@@ -455,8 +458,23 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
         if included {
             plan = _plan_rule(kind, rule, s0_ok)
             if plan[0] == "RUN" {
-                runnable_idx = runnable_idx.push(ri)
-                runnable_tasks = runnable_tasks.push([kind, id, plan[2]])
+                // P1d (2026-04-20): --fast cache fast-path.
+                //   If a prior PASS for this slug under the current SSOT
+                //   fingerprint is recorded, replace the RUN plan with a
+                //   CACHED sentinel and skip the enforcer launch.
+                let mut cached = false
+                if fast && ssot_fp != "" {
+                    let slug = keys_first(rule[3], "slug")
+                    if slug != "" && cache_hit(slug, ssot_fp) {
+                        let short_fp = ssot_fp.substring(0, 8)
+                        plan = ["CACHED", "cache hit @ " + short_fp, "", ""]
+                        cached = true
+                    }
+                }
+                if !cached {
+                    runnable_idx = runnable_idx.push(ri)
+                    runnable_tasks = runnable_tasks.push([kind, id, plan[2]])
+                }
             }
         }
         plans = plans.push(plan)
@@ -506,6 +524,7 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
         if tag == "SKIP" { verdict = "SKIP"; detail = plan[1] }
         else if tag == "WARN" { verdict = "WARN"; detail = plan[1] }
         else if tag == "FAIL" { verdict = "FAIL"; detail = plan[1] }
+        else if tag == "CACHED" { verdict = "CACHED"; detail = plan[1] }
         else if tag == "MISSING" {
             verdict = "MISSING"
             detail = "enforce path not on disk: " + plan[1]
@@ -519,9 +538,17 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
             let f = _finish_rule(rule[1], plan[2], plan[3], rc, tail, fast)
             verdict = f[0]
             detail = f[1]
+            // P1d: persist PASS verdicts under current SSOT fingerprint so
+            // subsequent --fast runs can skip this enforcer. Only real PASS
+            // (from enforce); CACHED never reaches this branch.
+            if verdict == "PASS" && ssot_fp != "" {
+                let slug = keys_first(rule[3], "slug")
+                if slug != "" { let _ = cache_write(slug, ssot_fp, "PASS") }
+            }
         }
 
         if verdict == "PASS" { pass_ct = pass_ct + 1; enforce_ct = enforce_ct + 1 }
+        else if verdict == "CACHED" { pass_ct = pass_ct + 1 }
         else if verdict == "FAIL" { fail_ct = fail_ct + 1; enforce_ct = enforce_ct + 1 }
         else if verdict == "PROOF_FAIL" { fail_ct = fail_ct + 1; enforce_ct = enforce_ct + 1 }
         else if verdict == "WARN" { warn_ct = warn_ct + 1 }
@@ -609,6 +636,14 @@ fn main() -> int {
     // P7a: prepare tmp dir for parallel batch output.
     _tmp_init()
 
+    // P1d: compute SSOT fingerprint exactly ONCE (it spawns a shell).
+    //   Only consulted under --fast — full runs always re-enforce every
+    //   rule so there is no correctness surface for the cache. We still
+    //   record the fingerprint after a non-fast PASS so a follow-up
+    //   --fast run sees fresh entries.
+    let mut ssot_fp = ""
+    ssot_fp = ssot_fingerprint()
+
     if !json {
         println("── raw#0 unified enforcement (raw_all) ──")
         if fast { println("mode: fast (proof scripts skipped)") }
@@ -640,7 +675,7 @@ fn main() -> int {
     let mut total_enforce = 0
 
     // Walk .raw (L0)
-    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json, par_n)
+    let r_raw = _walk_kind("raw", ".raw", fast, only_kind, only_id, json, par_n, ssot_fp)
     total_pass = total_pass + r_raw[0]
     total_fail = total_fail + r_raw[1]
     total_warn = total_warn + r_raw[2]
@@ -650,7 +685,7 @@ fn main() -> int {
     total_enforce = total_enforce + r_raw[6]
 
     // Walk .own (L1)
-    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json, par_n)
+    let r_own = _walk_kind("own", ".own", fast, only_kind, only_id, json, par_n, ssot_fp)
     total_pass = total_pass + r_own[0]
     total_fail = total_fail + r_own[1]
     total_warn = total_warn + r_own[2]
@@ -733,6 +768,13 @@ fn main() -> int {
         } else {
             println("verdict: FAIL — unlock gate would refuse")
         }
+    }
+
+    // P1d: record the SSOT fingerprint for `raw_cache status` display.
+    //   Only on full PASS — a failing run should not advertise a fresh
+    //   cache state. Writes .raw-cache/ssot.sha.
+    if !gate_fail && ssot_fp != "" {
+        let _ = cache_record_fingerprint(ssot_fp)
     }
 
     if gate_fail { return 1 }
