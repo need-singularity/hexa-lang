@@ -1,50 +1,70 @@
 #!hexa strict
-// tool/own_inherit_lint.hexa — raw#0 .own monotonic inheritance check (P0c)
+// tool/own_inherit_lint.hexa — nested .own monotonic inheritance (P1c)
 //
 // PURPOSE
-//   Enforce that .own (L1) rules never weaken or broaden the .raw (L0)
-//   rules they shadow. .own may only strengthen: tighter status, same or
-//   superset `bans`, same or narrower `scope`. Independent .own rules
-//   (no id overlap with .raw) are untouched.
+//   Enforce that worktree-local .own files (nested under
+//   .claude/worktrees/*/.own) never weaken the root /.own. Nested entries
+//   may match or strengthen, never relax.
 //
-// CHECKS
-//   For every rule in .own:
-//     (a) id overlap with .raw
-//         · status           — .own tier ≥ .raw tier (strength ladder)
-//           live > warn > new > convention > deferred
-//         · bans             — .own bans ⊇ .raw bans (no narrowing)
-//         · scope            — .own scope must be substring of .raw scope
-//                              (heuristic: narrowing only, no widening)
-//     (b) no overlap           — pass (independent L1 rule)
-//     (c) .own id duplicate    — FAIL (parser catches too, belt+braces)
+//   This is complementary to (and succeeds) the older .own-vs-.raw check:
+//   root .own is now considered the L1 truth; each worktree-local .own
+//   must honor it or strengthen it.
+//
+// STRICTNESS LADDER (task spec)
+//   live > warn > convention > deferred > new
+//
+//   Codified in `_status_strength(s) -> int`:
+//     live=4, warn=3, convention=2, deferred=1, new=0, unknown=-1
+//
+//   A nested rule VIOLATES inheritance iff strength(nested) < strength(root).
+//   Equal or greater is OK.
+//
+// MATCHING
+//   For each nested rule r_n:
+//     key = slug (if present) else rule name.
+//     Look up the matching root rule r_r by same key.
+//       · found    → compare _status_strength — must be ≥ root's.
+//       · missing  → nested is independent; pass (not a violation).
+//
+// BFS SCAN
+//   · roots:    /.own
+//   · nested:   .claude/worktrees/*/.own  (list_dir on .claude/worktrees,
+//                                         filter to dirs containing .own)
+//   · path-sort is lexicographic so output is stable across runs.
+//
+// OUTPUT
+//   Per violation:
+//     [FAIL] <nested-path>#<slug> relaxes root <slug>
+//            (root=<rootStatus> > nested=<nestedStatus>)
+//   Final:
+//     ✅ PASS — N nested .own files checked
+//     🚫 FAIL — K violations
+//
+// EXIT
+//   0 = no violations
+//   1 = one or more violations
 //
 // USAGE
-//   hexa tool/own_inherit_lint.hexa          — validate + exit 1 on FAIL
-//   hexa tool/own_inherit_lint.hexa --list   — dump .own entries
+//   ./hexa tool/own_inherit_lint.hexa            — lint, exit nonzero on fail
+//   ./hexa tool/own_inherit_lint.hexa --list     — dump discovered nested .own
 //
-// EXIT CODES
-//   0 — PASS (no violations)
-//   1 — FAIL (one or more inheritance violations)
-//
-// FOLLOW-UP
-//   Wire this lint into raw#0 `enforce` chain once .raw is unlocked
-//   (currently chflags uchg). Until then, invoke manually or via raw_all
-//   once raw#0 dispatch learns the composite form.
+// WIRING
+//   Invoked by tool/raw_all.hexa as a synthetic enforcer (no .raw/.own row).
 
 use "self/core/law_io"
 use "self/raw_loader"
-// ─── status strength ladder ──────────────────────────────────────
-// higher number = stronger enforcement. .own must be ≥ .raw.
-fn _status_rank(s: string) -> int {
+// ─── strictness ladder ──────────────────────────────────────────
+
+fn _status_strength(s: string) -> int {
     if s == "live" { return 4 }
     if s == "warn" { return 3 }
-    if s == "new" { return 2 }
-    if s == "convention" { return 1 }
-    if s == "deferred" { return 0 }
+    if s == "convention" { return 2 }
+    if s == "deferred" { return 1 }
+    if s == "new" { return 0 }
     return -1
 }
 
-// ─── path helpers ────────────────────────────────────────────────
+// ─── path helpers ───────────────────────────────────────────────
 
 fn _pwd() -> string {
     let mut p = env("PWD")
@@ -52,78 +72,72 @@ fn _pwd() -> string {
     return p
 }
 
-fn _raw_path() -> string { return _pwd() + "/.raw" }
-fn _own_path() -> string { return _pwd() + "/.own" }
+fn _root_own_path() -> string { return _pwd() + "/.own" }
+fn _worktrees_dir() -> string { return _pwd() + "/.claude/worktrees" }
 
-// ─── rule lookup ─────────────────────────────────────────────────
+// ─── discovery: BFS nested .own list ────────────────────────────
 
-fn _find_rule_by_id(rules: array, id: string) -> array {
+fn _discover_nested_owns() -> array {
+    // Returns array of absolute paths to nested .own files, sorted
+    // lexicographically. Empty if .claude/worktrees is absent.
+    let wt_dir = _worktrees_dir()
+    if !file_exists(wt_dir) { return [] }
+    let entries = list_dir(wt_dir)
+    let mut paths = []
+    for e in entries {
+        if e == "." || e == ".." { continue }
+        let own_path = wt_dir + "/" + e + "/.own"
+        if file_exists(own_path) {
+            paths = paths.push(own_path)
+        }
+    }
+    // sort paths lexicographically (stable output)
+    return _sort_strings(paths)
+}
+
+fn _sort_strings(arr: array) -> array {
+    // insertion sort — N is small (< 20 worktrees)
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let v = arr[i]
+        let mut inserted = false
+        let mut res = []
+        let mut j = 0
+        while j < len(out) {
+            if !inserted && v < out[j] {
+                res = res.push(v)
+                inserted = true
+            }
+            res = res.push(out[j])
+            j = j + 1
+        }
+        if !inserted { res = res.push(v) }
+        out = res
+        i = i + 1
+    }
+    return out
+}
+
+// ─── rule key (slug | name) ─────────────────────────────────────
+
+fn _rule_key(rule: array) -> string {
+    // task spec: "matching slug (or matching name if slug absent)"
+    let keys = rule[3]
+    let slug = keys_first(keys, "slug")
+    if slug != "" { return slug }
+    return rule[2]   // rule[2] = name
+}
+
+fn _find_by_key(rules: array, key: string) -> array {
     for r in rules {
-        if r[0] == id { return r }
+        if _rule_key(r) == key { return r }
     }
     return []
 }
 
-// ─── bans: whitespace-split tokens ───────────────────────────────
-// .raw/.own stores `bans` as a single space-joined string per key line.
-
-fn _split_tokens(s: string) -> array {
-    let mut out = []
-    let n = len(s)
-    let mut i = 0
-    let mut cur = ""
-    while i < n {
-        let c = s.substring(i, i + 1)
-        if c == " " || c == "\t" {
-            if len(cur) > 0 { out = out.push(cur); cur = "" }
-        } else {
-            cur = cur + c
-        }
-        i = i + 1
-    }
-    if len(cur) > 0 { out = out.push(cur) }
-    return out
-}
-
-fn _contains_token(arr: array, tok: string) -> bool {
-    for a in arr {
-        if a == tok { return true }
-    }
-    return false
-}
-
-// collect ALL bans entries (key may repeat across lines in raw_loader)
-fn _collect_bans(keys: array) -> array {
-    let mut out = []
-    let all = keys_all(keys, "bans")
-    for line in all {
-        let toks = _split_tokens(line)
-        for t in toks {
-            if !_contains_token(out, t) { out = out.push(t) }
-        }
-    }
-    return out
-}
-
-// missing = tokens in `a` not in `b`
-fn _missing_tokens(a: array, b: array) -> array {
-    let mut out = []
-    for t in a {
-        if !_contains_token(b, t) { out = out.push(t) }
-    }
-    return out
-}
-
-fn _join_tokens(arr: array) -> string {
-    let mut out = ""
-    let mut first = true
-    for t in arr {
-        if first { out = t; first = false } else { out = out + " " + t }
-    }
-    return out
-}
-
-// ─── argv parsing ────────────────────────────────────────────────
+// ─── argv ───────────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
     // returns [list_mode(bool)]
@@ -138,114 +152,82 @@ fn _parse_flags() -> array {
     return [list_mode]
 }
 
-// ─── main ────────────────────────────────────────────────────────
+// ─── main ───────────────────────────────────────────────────────
 
 fn main() -> int {
     let flags = _parse_flags()
     let list_mode = flags[0]
 
-    let own_path = _own_path()
-    let raw_path = _raw_path()
-
-    let own_check = exec_with_status("test -f '" + own_path + "'")
-    if own_check[1] != 0 {
-        println("── raw#0 own_inherit_lint ──")
-        println(".own missing — nothing to check")
-        println("status: PASS")
+    let root_path = _root_own_path()
+    if !file_exists(root_path) {
+        println("── raw#0 own_inherit_lint (nested) ──")
+        println("root .own missing — nothing to inherit from")
+        println("")
+        println("✅ PASS — 0 nested .own files checked")
         return 0
     }
 
-    let own_rules = load_raw_file(own_path)
-    let raw_rules = load_raw_file(raw_path)
+    let root_rules = load_raw_file(root_path)
+    let nested_paths = _discover_nested_owns()
 
     if list_mode {
-        println("── .own entries (" + to_string(len(own_rules)) + ") ──")
-        for r in own_rules {
-            println("  #" + r[0] + " [" + r[1] + "] — " + r[2])
-        }
-        return 0
-    }
-
-    let mut errs = []
-    let mut seen_ids = []
-    let mut overlap_ct = 0
-
-    for orule in own_rules {
-        let oid = orule[0]
-        let ostatus = orule[1]
-        let okeys = orule[3]
-        let tag = "[own#" + oid + "] "
-
-        // (c) duplicate id inside .own
-        if _contains_token(seen_ids, oid) {
-            errs = errs.push(tag + "duplicate .own id '" + oid + "'")
+        println("── nested .own discovery ──")
+        println("root:   " + root_path + "  (" + to_string(len(root_rules)) + " rules)")
+        if len(nested_paths) == 0 {
+            println("nested: 0  (no worktree .own files)")
         } else {
-            seen_ids = seen_ids.push(oid)
+            println("nested: " + to_string(len(nested_paths)))
+            for p in nested_paths { println("  " + p) }
         }
-
-        // lookup sibling in .raw
-        let rrule = _find_rule_by_id(raw_rules, oid)
-        if len(rrule) == 0 {
-            // (b) independent rule — pass
-            continue
-        }
-        overlap_ct = overlap_ct + 1
-
-        let rstatus = rrule[1]
-        let rkeys = rrule[3]
-
-        // (a1) status weakening check
-        let orank = _status_rank(ostatus)
-        let rrank = _status_rank(rstatus)
-        if orank < 0 || rrank < 0 {
-            errs = errs.push(tag + "unknown status in ladder (.raw=" + rstatus + ", .own=" + ostatus + ")")
-        } else if orank < rrank {
-            errs = errs.push(tag + "status weakening: .raw=" + rstatus + ", .own=" + ostatus)
-        }
-
-        // (a2) bans narrowing check — .own must be superset of .raw
-        let rbans = _collect_bans(rkeys)
-        let obans = _collect_bans(okeys)
-        if len(rbans) > 0 {
-            let missing = _missing_tokens(rbans, obans)
-            if len(missing) > 0 {
-                errs = errs.push(tag + "bans narrowing: .raw has '" + _join_tokens(rbans) +
-                                 "', .own missing '" + _join_tokens(missing) + "'")
-            }
-        }
-
-        // (a3) scope widening check — .own scope must be substring of .raw scope
-        let rscope = keys_first(rkeys, "scope")
-        let oscope = keys_first(okeys, "scope")
-        if rscope != "" && oscope != "" {
-            if !rscope.contains(oscope) {
-                errs = errs.push(tag + "scope widening: .raw scope='" + rscope +
-                                 "', .own scope='" + oscope + "'")
-            }
-        }
-    }
-
-    // ─── output ──────────────────────────────────────────────────
-    println("── raw#0 own_inherit_lint ──")
-    println("entries (.own): " + to_string(len(own_rules)))
-    if overlap_ct == 0 {
-        println("checked against .raw: 0  (no id overlap)")
-    } else {
-        println("checked against .raw: " + to_string(overlap_ct))
-    }
-
-    if len(errs) == 0 {
-        println("violations: 0")
-        println("")
-        println("status: PASS")
         return 0
     }
 
+    println("── raw#0 own_inherit_lint (nested) ──")
+    println("root   : " + root_path)
+    println("nested : " + to_string(len(nested_paths)) + " file(s)")
+
+    let mut violations = []
+    let mut files_checked = 0
+
+    for np in nested_paths {
+        files_checked = files_checked + 1
+        let nrules = load_raw_file(np)
+        for nr in nrules {
+            let key = _rule_key(nr)
+            let nstatus = nr[1]
+            let rr = _find_by_key(root_rules, key)
+            if len(rr) == 0 {
+                // nested-only rule — independent, pass
+                continue
+            }
+            let rstatus = rr[1]
+            let rstr = _status_strength(rstatus)
+            let nstr = _status_strength(nstatus)
+            if rstr < 0 || nstr < 0 {
+                let msg = "[FAIL] " + np + "#" + key +
+                          " unknown status (root=" + rstatus +
+                          ", nested=" + nstatus + ")"
+                violations = violations.push(msg)
+                continue
+            }
+            if nstr < rstr {
+                let msg = "[FAIL] " + np + "#" + key +
+                          " relaxes root " + key +
+                          " (root=" + rstatus + " > nested=" + nstatus + ")"
+                violations = violations.push(msg)
+            }
+        }
+    }
+
     println("")
-    for e in errs { println(e) }
+    if len(violations) == 0 {
+        println("✅ PASS — " + to_string(files_checked) + " nested .own files checked")
+        return 0
+    }
+
+    for v in violations { println(v) }
     println("")
-    println("violations: " + to_string(len(errs)))
-    println("status: FAIL")
+    println("🚫 FAIL — " + to_string(len(violations)) + " violations")
     return 1
 }
 
