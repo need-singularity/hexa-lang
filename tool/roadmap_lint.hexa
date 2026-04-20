@@ -39,34 +39,74 @@ fn _parse_roadmap_header(line: string) -> array {
     return [id, status, name]
 }
 
-// Parse roadmap SSOT text (lines) into rules array.
+// header: `checkpoint <ID> "<name>"` — raw#15 checkpoint DSL
+//
+// Returns [id, name] on match, [] on non-match. ID is a short label
+// (`CP1`, `CP2`, `FINAL`, ...) — no status field. Name may carry the
+// 🧠 symbol to mark FINAL checkpoint (V4).
+fn _parse_checkpoint_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "checkpoint" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let mut name = rest1.substring(sp2 + 1, len(rest1)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, name]
+}
+
+// Parse roadmap SSOT text (lines) into rules + checkpoints.
 // Factored out so both `_load_roadmap(path)` and the git-HEAD transition
 // check can share a single parser implementation.
+//
+// Returns [rules, checkpoints] where:
+//   rules        = array of [id, status, name, keys]
+//   checkpoints  = array of [id, name, keys]
+//
+// Header dispatch by first whitespace-delimited token:
+//   `roadmap`    → rules entry (existing)
+//   `checkpoint` → checkpoint block (raw#15 DSL)
+//   (anything else at column 0) → unrecognized header → drop current block
 fn _parse_roadmap_text(src: string) -> array {
     let lines = split(src, "\n")
 
     let mut rules = []
+    let mut checkpoints = []
+
+    // current block state — one of:
+    //   kind = ""  (none)
+    //   kind = "r" (roadmap rule)
+    //   kind = "c" (checkpoint)
+    let mut kind = ""
     let mut cur_id = ""
     let mut cur_status = ""
     let mut cur_name = ""
     let mut cur_keys = []
-    let mut has_rule = false
 
     for raw_line in lines {
         let line = _rstrip(raw_line)
         if len(line) == 0 {
-            if has_rule {
+            if kind == "r" {
                 rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
-                has_rule = false
-                cur_keys = []
             }
+            if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            kind = ""
+            cur_keys = []
             continue
         }
         let first = line.substring(0, 1)
         if first == "#" { continue }
 
         if first == " " || first == "\t" {
-            if !has_rule { continue }
+            if kind == "" { continue }
             let stripped = line.trim_start()
             let sp = stripped.index_of(" ")
             if sp < 0 { continue }
@@ -74,28 +114,51 @@ fn _parse_roadmap_text(src: string) -> array {
             let val = stripped.substring(sp + 1, len(stripped)).trim()
             cur_keys = cur_keys.push([key, val])
         } else {
-            if has_rule {
+            // flush previous block
+            if kind == "r" {
                 rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
-                cur_keys = []
             }
-            let hdr = _parse_roadmap_header(line)
-            if len(hdr) == 0 { has_rule = false; continue }
-            cur_id = hdr[0]
-            cur_status = hdr[1]
-            cur_name = hdr[2]
-            has_rule = true
+            if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            cur_keys = []
+            kind = ""
+
+            // dispatch on first token
+            let first_sp = line.index_of(" ")
+            if first_sp < 0 { continue }
+            let tok = line.substring(0, first_sp)
+            if tok == "roadmap" {
+                let hdr = _parse_roadmap_header(line)
+                if len(hdr) == 0 { continue }
+                cur_id = hdr[0]
+                cur_status = hdr[1]
+                cur_name = hdr[2]
+                kind = "r"
+            }
+            if tok == "checkpoint" {
+                let chdr = _parse_checkpoint_header(line)
+                if len(chdr) == 0 { continue }
+                cur_id = chdr[0]
+                cur_name = chdr[1]
+                kind = "c"
+            }
         }
     }
-    if has_rule {
+    if kind == "r" {
         rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
     }
-    return rules
+    if kind == "c" {
+        checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+    }
+    return [rules, checkpoints]
 }
 
-// Load .roadmap from a filesystem path. Returns [] if the file does not exist.
+// Load .roadmap from a filesystem path. Returns [[], []] if the file does
+// not exist — shape mirrors _parse_roadmap_text: [rules, checkpoints].
 fn _load_roadmap(path: string) -> array {
     let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
-    if exists != "y" { return [] }
+    if exists != "y" { return [[], []] }
     let src = to_string(read_file(path))
     return _parse_roadmap_text(src)
 }
@@ -352,6 +415,58 @@ fn _cycle_walk(start_id: string, residual_ids: array, edges: array) -> array {
     return []
 }
 
+// ─── checkpoint DSL helpers (raw#15) ─────────────────────────────────
+//
+// Per-entry CP references:
+//   reaches   → comma-separated CP IDs this entry contributes to when done
+//   requires  → comma-separated CP IDs that must be satisfied before active
+//   verify    → single CP ID evaluated for done transition
+// CP refs are parsed via _split_cp_refs (comma-split + trim). Empty input
+// returns [] — callers treat empty as "no CP involvement".
+
+// Split a comma-separated CP ID list. Trims each token, drops empties.
+fn _split_cp_refs(val: string) -> array {
+    let mut out = []
+    let v = val.trim()
+    if len(v) == 0 { return out }
+    let parts = split(v, ",")
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out = out.push(t) }
+    }
+    return out
+}
+
+// Lookup checkpoint by ID. Returns [] if absent.
+fn _find_checkpoint(checkpoints: array, id: string) -> array {
+    for c in checkpoints {
+        if c[0] == id { return c }
+    }
+    return []
+}
+
+// Detect FINAL checkpoint via 🧠 symbol in the name.
+fn _is_final_cp(name: string) -> bool {
+    return name.contains("🧠")
+}
+
+// A CP is "satisfied" when ≥1 OTHER entry (excluding self) with
+// `reaches <CP>` has status=done. self_id excludes the current rule from
+// satisfying its own requires — enforces strictly external progress.
+fn _cp_satisfied(rules: array, cp_id: string, self_id: string) -> bool {
+    for r in rules {
+        if r[0] == self_id { continue }
+        if r[1] != "done" { continue }
+        let reaches_val = _keys_first(r[3], "reaches")
+        if reaches_val == "" { continue }
+        let refs = _split_cp_refs(reaches_val)
+        for ref in refs {
+            if ref == cp_id { return true }
+        }
+    }
+    return false
+}
+
 fn _roadmap_path() -> string { return _pwd() + "/.roadmap" }
 
 let _raw_args = args()
@@ -368,7 +483,9 @@ for a in cli {
 }
 
 let path = _roadmap_path()
-let rules = _load_roadmap(path)
+let parsed = _load_roadmap(path)
+let rules = parsed[0]
+let checkpoints = parsed[1]
 
 if list_mode {
     println("── .roadmap entries (" + to_string(len(rules)) + ") ──")
@@ -377,10 +494,16 @@ if list_mode {
         let track = _keys_first(r[3], "track")
         println("  #" + r[0] + " [" + r[1] + "] track=" + track + " phase=" + phase + " — " + r[2])
     }
+    if len(checkpoints) > 0 {
+        println("── checkpoints (" + to_string(len(checkpoints)) + ") ──")
+        for c in checkpoints {
+            println("  " + c[0] + " — " + c[1])
+        }
+    }
     exit(0)
 }
 
-if len(rules) == 0 {
+if len(rules) == 0 && len(checkpoints) == 0 {
     println("raw#15 roadmap_lint: .roadmap empty or missing — pass")
     exit(0)
 }
@@ -434,18 +557,70 @@ for r in rules {
     //   - non-existent path   → FAIL "roadmap #<id> proof path missing: <path>"
     let is_done = (hdr_status == "done") || (phase_status == "done")
     if is_done {
-        let proof_val = _keys_first(keys, "proof").trim()
-        if len(proof_val) == 0 {
-            errs = errs.push(tag + "status=done requires 'proof' (raw#9 proof-carrying)")
-        } else if len(proof_val) >= 7 && proof_val.substring(0, 7) == "assert:" {
-            // runtime shell assertion — no static path check
-        } else {
-            let tokens = _split_proof_tokens(proof_val)
-            for tok in tokens {
-                if !_proof_path_exists(tok) {
-                    errs = errs.push(tag + "proof path missing: " + tok)
+        // V2 DONE_PROOF_GATE — accept `proof` OR `verify` (raw#15 DSL tighten).
+        // Existing entries use proof only; new entries may use verify <CPID>
+        // instead. Error only when BOTH are absent.
+        let proof_val  = _keys_first(keys, "proof").trim()
+        let verify_val = _keys_first(keys, "verify").trim()
+        if len(proof_val) == 0 && len(verify_val) == 0 {
+            errs = errs.push(tag + "done requires proof or verify")
+        }
+        if len(proof_val) > 0 {
+            if len(proof_val) >= 7 && proof_val.substring(0, 7) == "assert:" {
+                // runtime shell assertion — no static path check
+            } else {
+                let tokens = _split_proof_tokens(proof_val)
+                for tok in tokens {
+                    if !_proof_path_exists(tok) {
+                        errs = errs.push(tag + "proof path missing: " + tok)
+                    }
                 }
             }
+        }
+    }
+
+    // V1 REF_EXISTS — every CP ID referenced by reaches/requires/verify
+    // must match a declared `checkpoint` block.
+    let reaches_refs  = _split_cp_refs(_keys_first(keys, "reaches"))
+    let requires_refs = _split_cp_refs(_keys_first(keys, "requires"))
+    let verify_val2   = _keys_first(keys, "verify").trim()
+    for rref in reaches_refs {
+        if len(_find_checkpoint(checkpoints, rref)) == 0 {
+            errs = errs.push(tag + "unknown checkpoint: " + rref)
+        }
+    }
+    for qref in requires_refs {
+        if len(_find_checkpoint(checkpoints, qref)) == 0 {
+            errs = errs.push(tag + "unknown checkpoint: " + qref)
+        }
+    }
+    if len(verify_val2) > 0 {
+        if len(_find_checkpoint(checkpoints, verify_val2)) == 0 {
+            errs = errs.push(tag + "unknown checkpoint: " + verify_val2)
+        }
+    }
+
+    // V3 ACTIVE_REQUIRES — entry with status=active AND non-empty
+    // requires: every CP must be satisfied (≥1 OTHER rule reaches→done).
+    // Runs on current-disk state only — not in _transition_allowed path.
+    if hdr_status == "active" && len(requires_refs) > 0 {
+        let mut unmet = []
+        for qref in requires_refs {
+            // skip CPs that failed V1 — avoid double error
+            if len(_find_checkpoint(checkpoints, qref)) == 0 { continue }
+            if !_cp_satisfied(rules, qref, id) {
+                unmet = unmet.push(qref)
+            }
+        }
+        if len(unmet) > 0 {
+            let mut ulist = ""
+            let mut ui = 0
+            while ui < len(unmet) {
+                if ui == 0 { ulist = unmet[ui] }
+                else { ulist = ulist + ", " + unmet[ui] }
+                ui = ui + 1
+            }
+            errs = errs.push(tag + "active blocked by unmet requires: " + ulist)
         }
     }
 
@@ -564,7 +739,8 @@ if len(rules) >= 1 {
         let exists_prev = to_string(exec("test -s '" + prev_path + "' && echo y || echo n")).trim()
         if exists_prev == "y" {
             let prev_src = to_string(read_file(prev_path))
-            let prev_rules = _parse_roadmap_text(prev_src)
+            let prev_parsed = _parse_roadmap_text(prev_src)
+            let prev_rules = prev_parsed[0]
 
             // forward check: each previous entry must survive (no deletion)
             // and its transition to the current status must be allowed.
@@ -694,8 +870,154 @@ if len(rules) >= 1 {
     }
 }
 
+// ─── V4 FINAL_UNIQUE (checkpoint DSL) ────────────────────────────────
+//
+// If ≥1 checkpoint declared, exactly one must carry the 🧠 symbol in its
+// name. Zero checkpoints → skip (soft rollout — current .roadmap has none).
+if len(checkpoints) >= 1 {
+    let mut finals = []
+    for c in checkpoints {
+        if _is_final_cp(c[1]) { finals = finals.push(c[0]) }
+    }
+    if len(finals) == 0 {
+        errs = errs.push("[roadmap] no FINAL (🧠) checkpoint declared")
+    } else if len(finals) >= 2 {
+        let mut flist = ""
+        let mut fi = 0
+        while fi < len(finals) {
+            if fi == 0 { flist = finals[fi] }
+            else { flist = flist + ", " + finals[fi] }
+            fi = fi + 1
+        }
+        errs = errs.push("[roadmap] multiple FINAL checkpoints: " + flist)
+    }
+}
+
+// ─── V5 BIPARTITE_DAG (entry ↔ checkpoint cycle detection) ───────────
+//
+// Graph model (bipartite over entries + checkpoints):
+//   node  = "R:<rule_id>" | "C:<cp_id>"
+//   edges:
+//     R:<id> -reaches→ C:<cp>      (entry contributes to CP)
+//     C:<cp> -satisfied-by→ R:<id> (inverse of reaches — a CP's satisfaction
+//                                   depends on the entries reaching it)
+//     R:<id> -requires→ C:<cp>     (entry depends on CP being satisfied)
+//
+// A cycle across these nodes means: CP's satisfaction depends on an
+// entry's activation, which depends on another CP that (transitively)
+// loops back. Reuses Kahn logic with string nodes.
+if len(checkpoints) >= 1 {
+    let mut nodes = []
+    for r in rules { nodes = nodes.push("R:" + r[0]) }
+    for c in checkpoints { nodes = nodes.push("C:" + c[0]) }
+
+    let mut bedges = []
+    let mut bindeg = []
+    let mut bi = 0
+    while bi < len(nodes) { bindeg = bindeg.push(0); bi = bi + 1 }
+
+    // Build DEPENDENCY edges (not declaration edges). Semantic model:
+    //   requires: R depends on C being satisfied → edge  R → C
+    //   reaches:  C's satisfaction depends on R being done → edge C → R
+    // Under this model, a pure `reaches` (no corresponding requires) does
+    // NOT create a cycle — it only injects a C→R edge. A cycle requires
+    // the closing leg: C → R → C' → R' → ... → C.
+    // Edges are de-duplicated to keep Kahn sweeps stable (duplicate edges
+    // inflate in-degree and can mask a real DAG as a false cycle).
+    for r in rules {
+        let rn = "R:" + r[0]
+        let rreach = _split_cp_refs(_keys_first(r[3], "reaches"))
+        for cp in rreach {
+            if len(_find_checkpoint(checkpoints, cp)) == 0 { continue }
+            let cn = "C:" + cp
+            // C -depends-on-> R (C is satisfied only when R done)
+            let mut dup = false
+            for e in bedges {
+                if e[0] == cn && e[1] == rn { dup = true }
+            }
+            if !dup {
+                bedges = bedges.push([cn, rn])
+                let ridx = _idx_of(nodes, rn)
+                if ridx >= 0 { bindeg = _arr_set_int(bindeg, ridx, bindeg[ridx] + 1) }
+            }
+        }
+        let rreq = _split_cp_refs(_keys_first(r[3], "requires"))
+        for cp in rreq {
+            if len(_find_checkpoint(checkpoints, cp)) == 0 { continue }
+            let cn = "C:" + cp
+            // R -depends-on-> C (R can only activate once C satisfied)
+            let mut dup2 = false
+            for e in bedges {
+                if e[0] == rn && e[1] == cn { dup2 = true }
+            }
+            if !dup2 {
+                bedges = bedges.push([rn, cn])
+                let cidx2 = _idx_of(nodes, cn)
+                if cidx2 >= 0 { bindeg = _arr_set_int(bindeg, cidx2, bindeg[cidx2] + 1) }
+            }
+        }
+    }
+
+    // Kahn sweep
+    let mut bqueue = []
+    let mut bqi = 0
+    while bqi < len(nodes) {
+        if bindeg[bqi] == 0 { bqueue = bqueue.push(nodes[bqi]) }
+        bqi = bqi + 1
+    }
+    let mut bseen = 0
+    let mut bhead = 0
+    while bhead < len(bqueue) {
+        let cur = bqueue[bhead]
+        bhead = bhead + 1
+        bseen = bseen + 1
+        for e in bedges {
+            if e[0] != cur { continue }
+            let tidx = _idx_of(nodes, e[1])
+            if tidx < 0 { continue }
+            let nv = bindeg[tidx] - 1
+            bindeg = _arr_set_int(bindeg, tidx, nv)
+            if nv == 0 { bqueue = bqueue.push(e[1]) }
+        }
+    }
+
+    if bseen < len(nodes) {
+        let mut bresid = []
+        let mut bri = 0
+        while bri < len(nodes) {
+            if bindeg[bri] > 0 { bresid = bresid.push(nodes[bri]) }
+            bri = bri + 1
+        }
+        if len(bresid) > 0 {
+            let cyc = _cycle_walk(bresid[0], bresid, bedges)
+            if len(cyc) >= 2 {
+                let mut path_str = ""
+                let mut pi = 0
+                while pi < len(cyc) {
+                    if pi == 0 { path_str = cyc[pi] }
+                    else { path_str = path_str + " -> " + cyc[pi] }
+                    pi = pi + 1
+                }
+                errs = errs.push("[roadmap cycle] " + path_str)
+            } else {
+                let mut list_str = ""
+                let mut li = 0
+                while li < len(bresid) {
+                    if li == 0 { list_str = bresid[li] }
+                    else { list_str = list_str + ", " + bresid[li] }
+                    li = li + 1
+                }
+                errs = errs.push("[roadmap cycle] participants: " + list_str)
+            }
+        }
+    }
+}
+
 println("── raw#15 roadmap_lint ──")
 println("entries : " + to_string(len(rules)))
+if len(checkpoints) > 0 {
+    println("checkpoints : " + to_string(len(checkpoints)))
+}
 
 if len(errs) == 0 {
     println("✅ PASS")
