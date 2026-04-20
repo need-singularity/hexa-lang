@@ -775,3 +775,33 @@ domains/life/dog-robot/          (신규 생성)
 **HX4 해석 확정**: "모든 **코드** .hexa" 이지 "모든 **파일** .hexa" 아님. README.md, .gitignore, LICENSE 는 비코드 컨텍스트로 허용.
 
 구현은 본 설계 승인 후 별도 세션에서 진행 (본 문서는 설계 + 예시 scaffold 만).
+
+---
+
+## §11. .raw + .own day-zero seed (2026-04-20 추가)
+
+**결정**: basic 이상 모든 preset 은 `.raw` + `.own` 을 scaffold 에 포함한다. 이전까지 새 프로젝트는 enforcement orphan 상태로 시작 (project.hexa 만 있고 low-level SSOT 없음) 했는데, 이게 raw:root-ssot 이 요구하는 "2 파일이 프로젝트 진리원" 초기 상태를 위반했다.
+
+**Seed 전략**:
+- `.raw` — hexa-lang canonical `/.raw` 를 **verbatim copy** (`render_raw_seed(hexa_lang)`). 21 L0 universal rule 을 수정 없이 상속. read 실패 시 빈 문자열 + `eprintln` 경고 + scaffold 중단 (empty .raw 방출 금지).
+- `.own` — minimal skeleton (`render_own_skeleton(name)`). 헤더 주석 + 포맷 doc 만, 규칙 0 개. 프로젝트 고유 rule 은 사용자가 직접 추가하고 `./hexa tool/own_lint.hexa` 로 monotonic 검증한다. hexa-lang 자체 /.own 의 3 개 rule (stage0-wrapper / self-host-path / ai-native-self-format) 은 hexa-lang 고유이므로 **상속하지 않는다**.
+
+**Preset 동작**:
+- `minimum` — skip (HX4 순혈, project.hexa 하나). 사용자가 enforcement 를 명시적으로 옵트인할 때만 `hexa init . --preset basic --force` 로 승격.
+- `basic` / `paper` / `lang` / `hub` — 둘 다 emit.
+- `domain_only` — 기존 프로젝트에 머지하는 모드이므로 preset template 이 .raw/.own 자체를 내보내지 않는다. 추가로 `init_project.hexa` 의 write loop 는 `.raw`/`.own` 에 대해 **merge-safe guard** — target 에 이미 있으면 `--force` 여도 무조건 스킵.
+
+**예시 run**:
+```
+hexa init my-proj --preset basic
+→ my-proj/.raw          (hexa-lang 21 rules verbatim)
+   my-proj/.own          (skeleton, 0 rules)
+   my-proj/project.hexa
+   my-proj/README.md
+   my-proj/.gitignore
+
+cd my-proj && ./hexa tool/own_lint.hexa
+→ PASS — .own is a monotonic strengthening of .raw
+```
+
+**Follow-up**: 사용자가 .own 에 .raw slug 와 겹치는 rule 을 추가하면 `own_lint` 가 strengthening 위반을 자동 감지. raw:own-monotonic rule 이 /.raw 에 appended 되면 이 검증이 `tool/raw_all.hexa` orchestrator 에 synthetic enforcer 로 합류한다 (현재 P0c 진행 중).
