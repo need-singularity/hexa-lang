@@ -1,0 +1,438 @@
+// tool/roadmap_run.hexa — raw#15 verify-gate auto-runner
+//
+// usage:
+//   hexa tool/roadmap_run.hexa              — run all active+verify gates
+//   hexa tool/roadmap_run.hexa --strict     — exit 1 on any FAIL
+//   hexa tool/roadmap_run.hexa --id 9       — single entry
+//   hexa tool/roadmap_run.hexa --dry-run    — skip exec, preview
+//   hexa tool/roadmap_run.hexa --json       — structured output
+//
+// observational only — .roadmap never mutated. Status promotion = human.
+
+// ─── string helpers ─────────────────────────────────────────────────
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+// ─── parser (pattern-copied from tool/roadmap_lint.hexa) ────────────
+//
+// Duplicated intentionally: keeps roadmap_run.hexa self-contained so a
+// seed-freeze regression in roadmap_lint cannot break the verify runner.
+
+fn _parse_roadmap_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _parse_checkpoint_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "checkpoint" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let mut name = rest1.substring(sp2 + 1, len(rest1)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, name]
+}
+
+// Parse .roadmap text into [rules, checkpoints]:
+//   rules        = array of [id, status, name, keys]
+//   checkpoints  = array of [id, name, keys]
+fn _parse_roadmap_text(src: string) -> array {
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut checkpoints = []
+
+    let mut kind = ""
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+            } else if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            kind = ""
+            cur_keys = []
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if kind == "" { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys = cur_keys.push([key, val])
+        } else {
+            if kind == "r" {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+            } else if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            cur_keys = []
+            kind = ""
+
+            let first_sp = line.index_of(" ")
+            if first_sp < 0 { continue }
+            let tok = line.substring(0, first_sp)
+            if tok == "roadmap" {
+                let hdr = _parse_roadmap_header(line)
+                if len(hdr) == 0 { continue }
+                cur_id = hdr[0]
+                cur_status = hdr[1]
+                cur_name = hdr[2]
+                kind = "r"
+            } else if tok == "checkpoint" {
+                let chdr = _parse_checkpoint_header(line)
+                if len(chdr) == 0 { continue }
+                cur_id = chdr[0]
+                cur_name = chdr[1]
+                kind = "c"
+            }
+        }
+    }
+    if kind == "r" {
+        rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+    } else if kind == "c" {
+        checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+    }
+    return [rules, checkpoints]
+}
+
+// ─── key lookups ────────────────────────────────────────────────────
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _find_checkpoint(checkpoints: array, id: string) -> array {
+    for c in checkpoints {
+        if c[0] == id { return c }
+    }
+    return []
+}
+
+// ─── condition unwrap ───────────────────────────────────────────────
+//
+// Condition value shape is `exec "<shell-command>"`. Strip the wrapper to
+// yield the raw command string. Returns "" if format is unsupported — the
+// caller uses that as the skip signal.
+fn _unwrap_exec(cond: string) -> string {
+    let c = cond.trim()
+    if len(c) < 7 { return "" }
+    if c.substring(0, 5) != "exec " { return "" }
+    let rest = c.substring(5, len(c)).trim()
+    if len(rest) < 2 { return "" }
+    if rest.substring(0, 1) != "\"" { return "" }
+    // strip leading quote; find trailing quote
+    let inner = rest.substring(1, len(rest))
+    let end_q = inner.index_of("\"")
+    if end_q < 0 { return "" }
+    return inner.substring(0, end_q)
+}
+
+// ─── JSON escape ────────────────────────────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── timing ─────────────────────────────────────────────────────────
+//
+// Uses shell `date +%s.%N` before/after the exec. `timestamp()` returns
+// integer seconds which is too coarse for sub-second gates.
+fn _now_float() -> string {
+    return to_string(exec("date +%s.%N")).trim()
+}
+
+fn _delta_secs(t0: string, t1: string) -> string {
+    let expr: [string] = ["awk 'BEGIN{printf \"%.2f\", ", t1, " - ", t0, "}'"]
+    return to_string(exec(expr.join(""))).trim()
+}
+
+// ─── path ───────────────────────────────────────────────────────────
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _roadmap_path() -> string { return _pwd() + "/.roadmap" }
+
+// ─── CLI args ───────────────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli = cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut strict_mode = false
+let mut dry_run = false
+let mut json_mode = false
+let mut filter_id = ""
+let mut ci = 0
+while ci < len(cli) {
+    let a = cli[ci]
+    if a == "--strict" { strict_mode = true }
+    else if a == "--dry-run" { dry_run = true }
+    else if a == "--json" { json_mode = true }
+    else if a == "--id" {
+        if ci + 1 < len(cli) {
+            filter_id = cli[ci + 1]
+            ci = ci + 1
+        }
+    }
+    ci = ci + 1
+}
+
+// ─── load roadmap ───────────────────────────────────────────────────
+
+let path = _roadmap_path()
+if !file_exists(path) {
+    if json_mode {
+        println("[]")
+    } else {
+        println("── roadmap_run ──")
+        println("")
+        println(".roadmap not found at " + path)
+    }
+    exit(1)
+}
+
+let src = to_string(read_file(path))
+let parsed = _parse_roadmap_text(src)
+let rules = parsed[0]
+let checkpoints = parsed[1]
+
+// ─── select active+verify entries ───────────────────────────────────
+
+let mut targets = []
+for r in rules {
+    if r[1] != "active" { continue }
+    let verify_val = _keys_first(r[3], "verify").trim()
+    if len(verify_val) == 0 { continue }
+    if len(filter_id) > 0 && r[0] != filter_id { continue }
+    targets = targets.push(r)
+}
+
+// ─── empty-list early exit ──────────────────────────────────────────
+
+if len(targets) == 0 {
+    if json_mode {
+        println("[]")
+    } else {
+        println("── roadmap_run ──")
+        println("")
+        println("no active entries with verify gate declared.")
+    }
+    exit(0)
+}
+
+// ─── run gates ──────────────────────────────────────────────────────
+//
+// Classification:
+//   exit == 0         → PASS
+//   exit != 0         → FAIL
+//   unknown CP        → SKIP
+//   unsupported cond  → SKIP
+//   --dry-run         → bypass exec, verdict="DRY"
+//
+// Results: array of [id, status, cp, cp_name, condition, gate, exit_str,
+//                    verdict, retries, elapsed, note].
+let mut results = []
+let mut n_pass = 0
+let mut n_fail = 0
+let mut n_skipped = 0
+
+for r in targets {
+    let id = r[0]
+    let hdr_status = r[1]
+    let keys = r[3]
+    let cp_id = _keys_first(keys, "verify").trim()
+    let retries_raw = _keys_first(keys, "retries").trim()
+    let retries = if len(retries_raw) == 0 { "0/3" } else { retries_raw }
+
+    let cp = _find_checkpoint(checkpoints, cp_id)
+    if len(cp) == 0 {
+        n_skipped = n_skipped + 1
+        results = results.push([id, hdr_status, cp_id, "", "", "", "", "SKIP", retries, "", "unknown checkpoint"])
+        continue
+    }
+    let cp_name = cp[1]
+    let cp_keys = cp[2]
+    let condition = _keys_first(cp_keys, "condition").trim()
+    let gate = _keys_first(cp_keys, "gate").trim()
+
+    let cmd = _unwrap_exec(condition)
+    if len(cmd) == 0 {
+        n_skipped = n_skipped + 1
+        results = results.push([id, hdr_status, cp_id, cp_name, condition, gate, "", "SKIP", retries, "", "condition format unsupported"])
+        continue
+    }
+
+    if dry_run {
+        results = results.push([id, hdr_status, cp_id, cp_name, condition, gate, "", "DRY", retries, "", "dry-run — not executed"])
+        continue
+    }
+
+    let t0 = _now_float()
+    let rc = exec_with_status(cmd)
+    let t1 = _now_float()
+    let elapsed = _delta_secs(t0, t1)
+    let exit_code = rc[1]
+    let exit_str = to_string(exit_code)
+
+    let verdict = if exit_code == 0 { "PASS" } else { "FAIL" }
+    if verdict == "PASS" { n_pass = n_pass + 1 } else { n_fail = n_fail + 1 }
+
+    results = results.push([id, hdr_status, cp_id, cp_name, condition, gate, exit_str, verdict, retries, elapsed, ""])
+}
+
+// ─── emit ───────────────────────────────────────────────────────────
+
+if json_mode {
+    // [{id, status, cp, condition, exit, verdict, retries}, ...]
+    print("[")
+    let mut ri = 0
+    while ri < len(results) {
+        let r = results[ri]
+        if ri > 0 { print(",") }
+        print("{")
+        print("\"id\":\"" + _json_escape(r[0]) + "\"")
+        print(",\"status\":\"" + _json_escape(r[1]) + "\"")
+        print(",\"cp\":\"" + _json_escape(r[2]) + "\"")
+        print(",\"condition\":\"" + _json_escape(r[4]) + "\"")
+        print(",\"exit\":\"" + _json_escape(r[6]) + "\"")
+        print(",\"verdict\":\"" + _json_escape(r[7]) + "\"")
+        print(",\"retries\":\"" + _json_escape(r[8]) + "\"")
+        print("}")
+        ri = ri + 1
+    }
+    println("]")
+    if strict_mode && n_fail > 0 { exit(1) }
+    exit(0)
+}
+
+// Human mode
+println("── roadmap_run ──")
+println("")
+let mut n_verified = 0
+for r in results {
+    let id = r[0]
+    let hdr_status = r[1]
+    let cp_id = r[2]
+    let cp_name = r[3]
+    let condition = r[4]
+    let gate = r[5]
+    let exit_str = r[6]
+    let verdict = r[7]
+    let retries = r[8]
+    let elapsed = r[9]
+    let note = r[10]
+
+    // Header line
+    let mut head = "[roadmap #" + id + "] " + hdr_status + " — verify " + cp_id
+    if len(cp_name) > 0 { head = head + " (" + cp_name + ")" }
+    println(head)
+
+    if verdict == "SKIP" {
+        if len(condition) > 0 {
+            println("  condition : " + condition)
+        }
+        println("  verdict   : SKIP (" + note + ")")
+        println("")
+        continue
+    }
+
+    println("  condition : " + condition)
+    if len(gate) > 0 { println("  gate      : " + gate) }
+
+    if verdict == "DRY" {
+        println("  ran       : (dry-run — skipped)")
+        println("  verdict   : DRY")
+        println("  retries   : " + retries)
+        println("  action    : would exec")
+        println("")
+        continue
+    }
+
+    // Real run
+    n_verified = n_verified + 1
+    println("  ran       : exit=" + exit_str + " (" + elapsed + "s)")
+    println("  verdict   : " + verdict)
+    println("  retries   : " + retries)
+    if verdict == "PASS" {
+        println("  action    : -> done (manual commit required)")
+    } else {
+        println("  action    : retry (manual)")
+    }
+    println("")
+}
+
+println("─── summary ───")
+println("verified : " + to_string(n_verified))
+println("pass     : " + to_string(n_pass))
+println("fail     : " + to_string(n_fail))
+println("skipped  : " + to_string(n_skipped))
+
+if strict_mode && n_fail > 0 { exit(1) }
+exit(0)
