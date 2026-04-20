@@ -5556,6 +5556,31 @@ fn fn_attrs_set(name, attrs) {
         if attrs == "guard" || contains(attrs, "guard") {
             bitmask = bitmask + 2048
         }
+        // Bits 12-16 added 2026-04-20 (runtime resource gates — Mac panic prevention).
+        // @refuse (4096): Darwin exit(77) unless HEXA_MAC_OK=1
+        if attrs == "refuse" || contains(attrs, "refuse") {
+            bitmask = bitmask + 4096
+        }
+        // @watchdog (8192): fork shell watchdog with rss_mb/time_s caps
+        if attrs == "watchdog" || contains(attrs, "watchdog") {
+            bitmask = bitmask + 8192
+        }
+        // @monitor (16384): getrusage snapshot → .hexa-monitor.jsonl
+        if attrs == "monitor" || contains(attrs, "monitor") {
+            bitmask = bitmask + 16384
+        }
+        // @heavy (32768): advisory + auto-imply refuse+watchdog
+        if attrs == "heavy" || contains(attrs, "heavy") {
+            bitmask = bitmask + 32768
+            // Auto-imply @refuse if not already set
+            if (bitmask / 4096) % 2 == 0 { bitmask = bitmask + 4096 }
+            // Auto-imply @watchdog if not already set
+            if (bitmask / 8192) % 2 == 0 { bitmask = bitmask + 8192 }
+        }
+        // @repuse (65536): hostname allowlist gate
+        if attrs == "repuse" || contains(attrs, "repuse") {
+            bitmask = bitmask + 65536
+        }
     }
     // ── @stable: redefinition guard ──
     // If this function was previously declared @stable, warn or error
@@ -5662,6 +5687,131 @@ fn ncpus_detected() {
     let n = to_int(raw)
     if n <= 0 { return 1 }
     return n
+}
+
+// ── @refuse/@repuse/@watchdog/@monitor runtime helpers ───
+// Added 2026-04-20 after Mac kernel panic from train_alm_lora_mac.
+// Purpose: make previously-advisory attrs actually enforce at fn entry.
+
+fn host_is_darwin() {
+    let u = exec("uname 2>/dev/null").trim()
+    return u == "Darwin"
+}
+
+fn host_name_short() {
+    let h = exec("hostname -s 2>/dev/null").trim()
+    if h == "" { return exec("hostname 2>/dev/null").trim() }
+    return h
+}
+
+// Returns current process RSS in KB (0 on failure).
+fn pid_rss_kb() {
+    let raw = exec("ps -o rss= -p $$ 2>/dev/null").trim()
+    let n = to_int(raw)
+    if n < 0 { return 0 }
+    return n
+}
+
+// Extract integer arg from attrs string like "watchdog(rss_mb=8192,time_s=7200)".
+// Returns default if attr not present or arg not found.
+fn attr_arg_int(attrs, attr_name, arg_name, default_v) {
+    let marker = attr_name + "("
+    let idx = attrs.index_of(marker)
+    if idx < 0 { return default_v }
+    let after = attrs.substring(idx + len(marker), len(attrs))
+    let close = after.index_of(")")
+    if close < 0 { return default_v }
+    let body = after.substring(0, close)
+    let key = arg_name + "="
+    let ki = body.index_of(key)
+    if ki < 0 { return default_v }
+    let rest = body.substring(ki + len(key), len(body))
+    // Collect digits only
+    let mut num = ""
+    let chars = rest.chars()
+    let mut ci = 0
+    let mut stop = false
+    while ci < len(chars) && !stop {
+        let ch = chars[ci]
+        let c = char_code(to_string(ch), 0)
+        if c >= 48 && c <= 57 { num = num + to_string(ch) } else { stop = true }
+        ci = ci + 1
+    }
+    if num == "" { return default_v }
+    return to_int(num)
+}
+
+// Host allowlist for @repuse. Hardcoded for MVP; override via HEXA_REPUSE_OK=1.
+fn repuse_host_allowed(h) {
+    if h == "" { return false }
+    let hl = h.to_lower()
+    if hl == "ubu" { return true }
+    if hl == "ubu2" { return true }
+    if hl == "hetzner" { return true }
+    if hl == "htz" { return true }
+    if hl == "runpod" { return true }
+    // RunPod pods often named like "xxxxxx-x" — accept if env HEXA_HOST_CLASS=remote
+    if env_var("HEXA_HOST_CLASS") == "remote" { return true }
+    return false
+}
+
+// Watchdog state: [[fn_name, wpid], ...]. wpid="" means no watchdog spawned.
+pub let mut watchdog_pids = []
+
+fn watchdog_spawn(name, rss_mb, time_s) {
+    // Shell watchdog: polls parent RSS every 500ms; SIGKILL on breach.
+    // Also kills after time_s seconds regardless.
+    let ppid = exec("echo $$").trim()
+    let cap_kb = rss_mb * 1024
+    let script = "(PPID_TO_WATCH=" + ppid + "; DEADLINE=$(($(date +%s)+" + to_string(time_s) + ")); "
+                + "while kill -0 $PPID_TO_WATCH 2>/dev/null; do "
+                + "  RSS=$(ps -o rss= -p $PPID_TO_WATCH 2>/dev/null | tr -d ' '); "
+                + "  if [ -n \"$RSS\" ] && [ \"$RSS\" -gt \"" + to_string(cap_kb) + "\" ]; then "
+                + "    echo \"[watchdog] RSS $RSS kb > " + to_string(cap_kb) + " kb — KILL fn=" + name + "\" >&2; "
+                + "    kill -9 $PPID_TO_WATCH; break; fi; "
+                + "  if [ $(date +%s) -gt $DEADLINE ]; then "
+                + "    echo \"[watchdog] wall > " + to_string(time_s) + "s — KILL fn=" + name + "\" >&2; "
+                + "    kill -9 $PPID_TO_WATCH; break; fi; "
+                + "  sleep 0.5; "
+                + "done) & echo $!"
+    let wpid = exec(script).trim()
+    watchdog_pids = watchdog_pids.push([name, wpid])
+    return wpid
+}
+
+fn watchdog_stop(name) {
+    let mut i = len(watchdog_pids) - 1
+    while i >= 0 {
+        if watchdog_pids[i][0] == name {
+            let wpid = watchdog_pids[i][1]
+            if wpid != "" { exec("kill " + wpid + " 2>/dev/null") }
+            // Pop entry (remove by rebuild — hexa list PBV)
+            let mut nl = []
+            let mut k = 0
+            while k < len(watchdog_pids) {
+                if k != i { nl = nl.push(watchdog_pids[k]) }
+                k = k + 1
+            }
+            watchdog_pids = nl
+            return 0
+        }
+        i = i - 1
+    }
+    return 0
+}
+
+fn monitor_emit(name, wall_ms, rss_peak_kb) {
+    let sink = env_var("HEXA_MONITOR_SINK")
+    let path = if sink == "" { ".hexa-monitor.jsonl" } else { sink }
+    let line = "{\"fn\":\"" + name + "\",\"wall_ms\":" + to_string(wall_ms)
+             + ",\"rss_peak_kb\":" + to_string(rss_peak_kb) + "}"
+    exec("printf '%s\\n' " + shell_quote(line) + " >> " + shell_quote(path) + " 2>/dev/null")
+    return 0
+}
+
+fn shell_quote(s) {
+    // Minimal single-quote escape for shell.
+    return "'" + s.replace("'", "'\\''") + "'"
 }
 
 // ── ROI-15: O(1) avg bitmask lookup via 64-bucket hash ──
@@ -9109,16 +9259,73 @@ fn call_user_fn(name, args) {
     if is_guard_fn {
         guard_start_ms = timestamp()
     }
+    // ── bits 12-16 (added 2026-04-20 after Mac kernel panic) ──
+    // Pre-body runtime gates: refuse/repuse/watchdog-spawn/monitor-start.
+    // Order: refuse → repuse → watchdog → monitor → limit (most restrictive first).
+    let attrs_raw = fn_attrs_get(name)
+    // bit 12 (4096): @refuse — Darwin block unless HEXA_MAC_OK=1
+    let is_refuse_fn = (attr_bits / 4096) % 2 == 1
+    if is_refuse_fn {
+        if host_is_darwin() && env_var("HEXA_MAC_OK") != "1" {
+            throw_val = val_str("@refuse: " + name + " blocked on Darwin (Mac panic prevention). "
+                              + "Set HEXA_MAC_OK=1 to override or dispatch to ubu/hetzner.")
+            throw_flag = true
+            return val_void()
+        }
+    }
+    // bit 16 (65536): @repuse — hostname allowlist (ubu/ubu2/hetzner/htz/runpod)
+    let is_repuse_fn = (attr_bits / 65536) % 2 == 1
+    if is_repuse_fn {
+        if env_var("HEXA_REPUSE_OK") != "1" {
+            let h = host_name_short()
+            if !repuse_host_allowed(h) {
+                throw_val = val_str("@repuse: " + name + " blocked on host '" + h + "' "
+                                  + "(allowlist: ubu,ubu2,hetzner,htz,runpod). "
+                                  + "Set HEXA_REPUSE_OK=1 to override.")
+                throw_flag = true
+                return val_void()
+            }
+        }
+    }
+    // bit 13 (8192): @watchdog — spawn shell watchdog with rss_mb/time_s caps
+    let is_watchdog_fn = (attr_bits / 8192) % 2 == 1
+    if is_watchdog_fn {
+        let wrss = attr_arg_int(attrs_raw, "watchdog", "rss_mb", 4096)
+        let wtime = attr_arg_int(attrs_raw, "watchdog", "time_s", 300)
+        watchdog_spawn(name, wrss, wtime)
+    }
+    // bit 14 (16384): @monitor — wall/rss snapshot start
+    let is_monitor_fn = (attr_bits / 16384) % 2 == 1
+    let mut mon_start_ms = 0
+    let mut mon_start_rss = 0
+    if is_monitor_fn {
+        mon_start_ms = timestamp()
+        mon_start_rss = pid_rss_kb()
+    }
     // bit 8 (256): @limit — singleton + system-state refusal (pre-body gate)
     // Self-calibrating: no hardcoded threshold. Refuses if (a) same fn already
     // running (count>0) or (b) loadavg monotonically rising AND load1 > ncpus.
     // Decrement happens post-body (paired with env_pop_scope tail).
+    // Extended 2026-04-20: if @limit(mem_mb=N) arg present, also refuse when
+    // current RSS already exceeds cap at entry.
     let is_limit_fn = (attr_bits / 256) % 2 == 1
     if is_limit_fn {
         if active_fn_get(name) > 0 {
             throw_val = val_str("@limit violation: " + name + " already active (singleton)")
             throw_flag = true
+            if is_watchdog_fn { watchdog_stop(name) }
             return val_void()
+        }
+        let lim_mem = attr_arg_int(attrs_raw, "limit", "mem_mb", 0)
+        if lim_mem > 0 {
+            let cur_rss = pid_rss_kb()
+            if cur_rss > lim_mem * 1024 {
+                throw_val = val_str("@limit(mem_mb=" + to_string(lim_mem) + "): " + name
+                                  + " refused — RSS " + to_string(cur_rss / 1024) + "MB already over cap")
+                throw_flag = true
+                if is_watchdog_fn { watchdog_stop(name) }
+                return val_void()
+            }
         }
         let la = loadavg_triple()
         let nc = ncpus_detected()
@@ -9128,6 +9335,7 @@ fn call_user_fn(name, args) {
         if l1 > l5 && l5 > l15 && l1 > to_float(to_string(nc)) {
             throw_val = val_str("@limit refusal: " + name + " loadavg rising + oversubscribed")
             throw_flag = true
+            if is_watchdog_fn { watchdog_stop(name) }
             return val_void()
         }
         active_fn_inc(name)
@@ -9267,6 +9475,18 @@ fn call_user_fn(name, args) {
 
     // ── @limit: pair with pre-body increment ──
     if is_limit_fn { active_fn_dec(name) }
+
+    // ── @watchdog (bit 13): kill spawned watchdog child ──
+    if is_watchdog_fn { watchdog_stop(name) }
+
+    // ── @monitor (bit 14): emit metric line ──
+    if is_monitor_fn {
+        let mon_end_ms = timestamp()
+        let mon_end_rss = pid_rss_kb()
+        let wall_ms = mon_end_ms - mon_start_ms
+        let peak_rss = if mon_end_rss > mon_start_rss { mon_end_rss } else { mon_start_rss }
+        monitor_emit(name, wall_ms, peak_rss)
+    }
 
     // ── @lazy: store result in thunk cache ──
     if is_lazy {
