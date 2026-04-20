@@ -666,6 +666,19 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
             let f = _finish_rule(rule[1], plan[2], plan[3], rc, tail, fast)
             verdict = f[0]
             detail = f[1]
+            // Post-enforce chain-verify hook (raw:self-host-fixpoint).
+            //   verify_fixpoint.hexa probes one rebuild round; meta2_verify
+            //   chain-verify audits the whole .meta2-cert/ chain. A broken
+            //   chain must flip the verdict to FAIL even when the enforce
+            //   passed — tamper evidence dominates single-point verification.
+            //   Under --fast we still run it: chain-verify is read-only and
+            //   cheap (O(#cert files)), and skipping would hide tamper.
+            let slug_for_hook = keys_first(rule[3], "slug")
+            if slug_for_hook == "self-host-fixpoint" {
+                let cv = _run_chain_verify(verdict, detail)
+                verdict = cv[0]
+                detail = cv[1]
+            }
             // P1d: persist PASS verdicts under current SSOT fingerprint so
             // subsequent --fast runs can skip this enforcer. Only real PASS
             // (from enforce); CACHED never reaches this branch.
@@ -818,6 +831,47 @@ fn _exemption_precheck() -> array {
     return [true, out]
 }
 
+// ─── post-enforce chain-verify hook (raw:self-host-fixpoint) ────
+//
+// After the self-host-fixpoint enforce (verify_fixpoint.hexa) finishes,
+// run tool/meta2_verify.hexa chain-verify to confirm the on-disk
+// .meta2-cert/ chain isn't tampered with. If the chain is broken we
+// mark this rule FAIL even when verify_fixpoint was OK.
+//
+// Rationale: chain tamper evidence > single-point verification.
+// verify_fixpoint checks one rebuild round; chain-verify walks every
+// recorded certificate in sort order and validates prev_cert_sha.
+// A passing enforce with a broken chain means the on-disk history is
+// inconsistent with the current attestation — the gate must refuse.
+//
+// Returns [verdict, detail]. verdict is one of PASS/FAIL/SKIP.
+// SKIP when meta2_verify.hexa is not on disk (older trees) —
+// treated as soft (no gate flip) since the wire is advisory in that case.
+fn _run_chain_verify(prior_verdict: string, prior_detail: string) -> array {
+    let path = "tool/meta2_verify.hexa"
+    if !file_exists(path) {
+        // meta2_verify not yet on this tree — leave prior verdict intact.
+        return [prior_verdict, prior_detail]
+    }
+    let s0_chk = exec_with_status("test -x ./build/hexa_stage0")
+    if s0_chk[1] != 0 {
+        return [prior_verdict, prior_detail]
+    }
+    let r = exec_with_status("./build/hexa_stage0 " + path + " chain-verify 2>&1")
+    let out = to_string(r[0])
+    let rc = r[1]
+    let tail = _tail_of(out).trim()
+    if rc == 0 {
+        let mut det = prior_detail
+        if det != "" { det = det + " | chain-verify: ok" }
+        else { det = "chain-verify: ok" }
+        return [prior_verdict, det]
+    }
+    // chain break → fold-in as FAIL regardless of prior verdict
+    let msg = "chain-verify FAIL exit=" + to_string(rc) + " " + tail
+    return ["FAIL", msg]
+}
+
 // ─── synthetic enforcer: own-inherit (P1c) ──────────────────────
 //
 // tool/own_inherit_lint.hexa enforces that nested .own files (under
@@ -826,6 +880,63 @@ fn _exemption_precheck() -> array {
 //
 // Returns [verdict, detail_line].
 //   verdict ∈ {"PASS","FAIL","MISSING","SKIP"}
+// ─── synthetic enforcer: own-monotonic (raw#20 wire) ────────────
+//
+// tool/own_lint.hexa enforces that /.own monotonically strengthens /.raw
+// (status never relaxed, scope never shrunk, enforce/proof never dropped).
+// The companion rule row lives at /.raw raw#20 (slug=own-monotonic).
+//
+// When raw#20 is present in the loaded .raw rule set, the DSL dispatch
+// loop already runs tool/own_lint.hexa via the rule's `enforce` field —
+// this synthetic path is SKIPPED to avoid double-counting. When raw#20
+// has not yet been added (e.g. an older tree, or this wire is landing
+// ahead of the parallel agent's .raw edit), this synthetic path
+// guarantees the lint still runs.
+//
+// Exit code is passed through directly (no proof/tail massage).
+// Returns [verdict, detail_line].
+//   verdict ∈ {"PASS","FAIL","MISSING","SKIP","SKIPPED_DEP"}
+fn _run_own_lint(json: bool, own_monotonic_in_raw: bool) -> array {
+    if own_monotonic_in_raw {
+        return ["SKIPPED_DEP", "own-monotonic dispatched via .raw raw#20 row"]
+    }
+    let path = "tool/own_lint.hexa"
+    if !file_exists(path) {
+        return ["MISSING", "own_lint.hexa not on disk"]
+    }
+    let s0_chk = exec_with_status("test -x ./build/hexa_stage0")
+    if s0_chk[1] != 0 {
+        return ["SKIP", "stage0 unavailable"]
+    }
+    let r = exec_with_status("./build/hexa_stage0 " + path + " 2>&1")
+    let out = to_string(r[0])
+    let rc = r[1]
+    let tail = _tail_of(out).trim()
+    let lines = split(tail, "\n")
+    let mut last = ""
+    for l in lines {
+        let t = l.trim()
+        if t != "" { last = t }
+    }
+    if rc == 0 { return ["PASS", last] }
+    return ["FAIL", "exit=" + to_string(rc) + " " + last]
+}
+
+// Scan loaded .raw rules for slug=own-monotonic presence.
+// Used to suppress the synthetic _run_own_lint path when raw#20
+// already owns the dispatch via its enforce field.
+fn _raw_has_slug(path: string, slug: string) -> bool {
+    if !file_exists(path) { return false }
+    let rules = load_raw_file(path)
+    let mut i = 0
+    while i < len(rules) {
+        let s = keys_first(rules[i][3], "slug")
+        if s == slug { return true }
+        i = i + 1
+    }
+    return false
+}
+
 fn _run_own_inherit(json: bool) -> array {
     let path = "tool/own_inherit_lint.hexa"
     if !file_exists(path) {
@@ -990,6 +1101,49 @@ fn main() -> int {
             i = 0
             while i < vpad { vp = vp + " "; i = i + 1 }
             println(head + p + syn_verdict + vp + " " + syn_detail)
+        }
+    }
+
+    // Synthetic enforcer: own_lint (raw#20 own-monotonic wire, 2026-04-20).
+    //   tool/own_lint.hexa validates that /.own rows monotonically
+    //   strengthen their /.raw counterparts. raw#20 (slug=own-monotonic)
+    //   dispatches this tool via its `enforce` field, so when the rule
+    //   is present in /.raw the synthetic path is SKIPPED_DEP to avoid
+    //   double-counting. When raw#20 is absent (older tree, or landing
+    //   ahead of the .raw edit), this synthetic guarantees the lint runs.
+    //   Honors --only: skipped when only_kind is set and not "own-monotonic".
+    let own_syn_run = (only_kind == "" || only_kind == "own-monotonic"
+                       || (only_kind == "raw" && only_id == "20"))
+    if own_syn_run {
+        let own_in_raw = _raw_has_slug(".raw", "own-monotonic")
+        let syno = _run_own_lint(json, own_in_raw)
+        let syno_verdict = syno[0]
+        let syno_detail = syno[1]
+        if syno_verdict == "PASS" { total_pass = total_pass + 1; total_enforce = total_enforce + 1 }
+        else if syno_verdict == "FAIL" { total_fail = total_fail + 1; total_enforce = total_enforce + 1 }
+        else if syno_verdict == "MISSING" { total_missing = total_missing + 1; total_enforce = total_enforce + 1 }
+        else if syno_verdict == "SKIP" { total_skip = total_skip + 1 }
+        else if syno_verdict == "SKIPPED_DEP" { total_skip = total_skip + 1 }
+        else { total_warn = total_warn + 1 }
+        if json {
+            let entry = "{\"kind\":\"synthetic\"" +
+                        ",\"id\":\"own-monotonic\"" +
+                        ",\"status\":\"live\"" +
+                        ",\"name\":\"own monotonic strengthening over .raw\"" +
+                        ",\"verdict\":\"" + syno_verdict +
+                        "\",\"detail\":\"" + _json_escape(syno_detail) + "\"}"
+            json_all = json_all.push(entry)
+        } else {
+            let head = "  [synthetic own-monotonic live]"
+            let pad = 22 - len(head)
+            let mut p = ""
+            let mut i = 0
+            while i < pad { p = p + " "; i = i + 1 }
+            let vpad = 7 - len(syno_verdict)
+            let mut vp = ""
+            i = 0
+            while i < vpad { vp = vp + " "; i = i + 1 }
+            println(head + p + syno_verdict + vp + " " + syno_detail)
         }
     }
 
