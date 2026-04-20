@@ -1021,6 +1021,49 @@ static config = { debug: false, verbose: true }
 
 ---
 
+## τ-bound for metaprogramming
+
+HEXA-LANG caps macro (`@macro fn`) and `comptime fn` expansion at **τ=4**
+by default. Without this bound, a recursive expansion such as
+
+```hexa
+@macro fn loop_forever() {
+    () => { loop_forever!() }
+}
+```
+
+would halt compilation forever — a compile-time DoS.
+
+### Default (τ=4)
+- Fires from `n=6` metaprogramming derivation (see `doc/n6_hexa_ir_spec.md`).
+- Enforced in `self/macro_expand.hexa::MacroExpansionContext` and
+  `self/comptime.hexa::ComptimeExpansionContext`.
+- On overflow the compiler aborts with a deterministic error that
+  includes the expansion stack:
+
+  ```
+  macro loop_forever exceeded tau-bound (depth=5 > 4)
+    at chain: loop_forever -> loop_forever -> loop_forever -> loop_forever -> loop_forever
+  ```
+
+### Override via `@depth(N)`
+- Syntax: `@depth(N) @macro fn deep() { ... }` or
+  `@depth(N) comptime fn ...`.
+- `N` is clamped to **[1, 64]**. `<1` or `>64` is rejected at lint time
+  with an `error` diagnostic by `self/attrs/depth.hexa::check_depth`.
+- `@depth` on a non-macro/non-comptime fn yields a `warn` (no effect
+  silently).
+
+### Enforcement layers
+| Layer | Source | Behavior |
+|-------|--------|----------|
+| Parser | `self/parser.hexa` | Captures `@depth(N)` IntLit, emits `depth\|N` annotation |
+| Macro expand | `self/macro_expand.hexa` | `expand_macro_with_ctx` bumps `ctx.depth`, halts `> ctx.max_depth` |
+| Comptime | `self/comptime.hexa` | `eval_comptime_with_ctx` same protocol |
+| Lint | `self/attrs/depth.hexa` | `check_depth` validates `N ∈ [1,64]` + scope |
+
+---
+
 ## 부록: 관련 BT 및 가설
 
 | BT | 제목 | HEXA-LANG 적용 |
