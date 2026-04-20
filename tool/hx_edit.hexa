@@ -1,0 +1,318 @@
+#!hexa strict
+// tool/hx_edit.hexa — tier-3 "ceremony" edit flow for raw:os-lock scope
+//
+// FLOW
+//   1. verify <file> is in raw:os-lock scope (ai_err otherwise)
+//   2. sudo -k  (invalidate cache → forces re-auth + TouchID if configured)
+//   3. sudo chflags noschg <file>  (may prompt TouchID via pam_tid)
+//   4. exec $EDITOR (or $VISUAL, else `vi`) on <file>
+//   5. ./hexa self/raw_cli.hexa verify
+//      on FAIL → ai_err, DO NOT relock; user fixes then calls --retry
+//      on PASS → continue
+//   6. sudo chflags schg <file>  (relock)
+//   7. ai_ok summary + git diff snippet
+//
+// FLAGS
+//   --retry        skip step 2 (reuse fresh sudo ticket)
+//   --list-scope   dump protected-file list for agent consumption (then exit)
+//   --dry-run      show the plan; do not touch sudo or the editor
+//
+// ERRORS (all go through self/core/ai_err)
+//   err hx-edit/no-file         — missing positional
+//   err hx-edit/unknown-file    — not in raw:os-lock scope
+//   err hx-edit/missing-file    — in scope but not on disk
+//   err hx-edit/sudo-aborted    — sudo ctrl-C or auth failure
+//   err hx-edit/noschg-failed   — unlock step failed
+//   err hx-edit/editor-failed   — editor exited non-zero
+//   err hx-edit/verify-failed   — raw_cli verify failed; file left UNLOCKED
+//   err hx-edit/relock-failed   — schg re-apply failed
+//   err hx-edit/linux-unsupported-tier — Linux doesn't have schg
+
+use "self/core/ai_err"
+use "tool/os_level_lock"
+
+// ─── environment helpers (minimal, avoid heavy imports) ────────
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _file_in_scope(rel: string) -> bool {
+    return is_in_scope(rel)
+}
+
+// relativise abs path against pwd — returns rel if path is under pwd, else
+// returns path unchanged.
+fn _relativise(p: string) -> string {
+    let root = _pwd()
+    if p.starts_with(root + "/") {
+        return p.substring(len(root) + 1, len(p))
+    }
+    return p
+}
+
+// ─── arg parsing ───────────────────────────────────────────────
+
+fn _parse_args() -> array {
+    // returns [file, retry, list_scope, dry_run]
+    let av = argv()
+    let mut file = ""
+    let mut retry = false
+    let mut list_scope = false
+    let mut dry = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--retry"      { retry = true }
+        else if a == "--list-scope" { list_scope = true }
+        else if a == "--dry-run"    { dry = true }
+        else if a.starts_with("--") {
+            // unknown flag — emit ai_err and stop parsing
+            ai_err("hx-edit", "unknown-flag", [
+                ["cause", "unrecognized flag: " + a],
+                ["remedy", "valid flags: --retry --list-scope --dry-run"],
+                ["ref", "tool/hx_edit.hexa"]
+            ])
+            exit(2)
+        }
+        else if file == "" { file = a }
+        i = i + 1
+    }
+    return [file, retry, list_scope, dry]
+}
+
+// ─── subcommands ───────────────────────────────────────────────
+
+fn cmd_list_scope() -> int {
+    let entries = scope_list()
+    ai_ok("hx-edit/scope", [
+        ["count", to_string(len(entries))],
+        ["source", "tool/os_level_lock.hexa:_required_targets + _optional_targets"]
+    ])
+    // Also emit each entry as a plain `  - <rel>` line on stderr so the
+    // list is trivially parseable (ai_ok appends blank line after fields).
+    for rel in entries { eprintln("  - " + rel) }
+    eprintln("")
+    return 0
+}
+
+// Runs sudo -k + sudo chflags noschg; returns 0 on ok, ≠0 on error.
+// On error we've already emitted ai_err.
+fn _unlock_step(rel: string, skip_kinval: bool) -> int {
+    if !skip_kinval {
+        // sudo -k — invalidates the cache silently; exit is always 0
+        // (the kernel call; if it fails sudo itself is broken).
+        exec("sudo -k 2>/dev/null")
+    }
+
+    // The actual chflags noschg. This is the point where TouchID / passphrase
+    // prompt appears. If the user ctrl-C's the prompt, sudo exits 1 with
+    // no chflags mutation (safe). We surface that as sudo-aborted.
+    let cmd = "sudo chflags noschg '" + rel + "' 2>&1"
+    let r = exec_with_status(cmd)
+    let rc = r[1]
+    let out = to_string(r[0]).trim()
+
+    if rc == 0 { return 0 }
+
+    // Distinguish ctrl-C / cancel (exit 1 with empty or "canceled" output)
+    // from hard failure (file not writable, sudoers config error, etc).
+    let canceled = out == "" || out.contains("canceled") || out.contains("Cancel")
+    if canceled {
+        ai_err("hx-edit", "sudo-aborted", [
+            ["file", rel],
+            ["cause", "sudo prompt aborted or TouchID canceled (exit " + to_string(rc) + ")"],
+            ["remedy", "./hexa tool/hx_edit.hexa " + rel + " --retry"],
+            ["remedy", "sudo -v   # refresh sudo cache first"],
+            ["ref", "raw:os-lock"]
+        ])
+    } else {
+        ai_err("hx-edit", "noschg-failed", [
+            ["file", rel],
+            ["cause", "sudo chflags noschg exit=" + to_string(rc) + " — " + out],
+            ["remedy", "sudo chflags noschg " + rel + "   # manual fallback"],
+            ["ref", "raw:os-lock"]
+        ])
+    }
+    return rc
+}
+
+fn _relock_step(rel: string) -> int {
+    let cmd = "sudo -n chflags schg '" + rel + "' 2>&1"
+    let r = exec_with_status(cmd)
+    let rc = r[1]
+    if rc == 0 { return 0 }
+    let out = to_string(r[0]).trim()
+    // sudo -n may fail if ticket expired during edit — offer --retry path
+    ai_err("hx-edit", "relock-failed", [
+        ["file", rel],
+        ["cause", "sudo -n chflags schg exit=" + to_string(rc) + " — " + out],
+        ["remedy", "sudo chflags schg " + rel + "   # manual relock"],
+        ["remedy", "./hexa tool/os_level_lock.hexa harden   # or global harden"],
+        ["ref", "raw:os-lock"]
+    ])
+    return rc
+}
+
+fn _editor_name() -> string {
+    let e = env("EDITOR")
+    if e != "" { return e }
+    let v = env("VISUAL")
+    if v != "" { return v }
+    return "vi"
+}
+
+fn cmd_edit(file: string, retry: bool, dry: bool) -> int {
+    if !_is_darwin() {
+        // Linux path — schg does not exist; we'd use chattr +i which is
+        // symmetric and already L2. The ceremony still makes sense but the
+        // flag names differ. For now, guide the user explicitly.
+        ai_err("hx-edit", "linux-unsupported-tier", [
+            ["cause", "hx_edit ceremony assumes Darwin chflags schg"],
+            ["remedy", "on Linux: sudo chattr -i " + file + " && $EDITOR " + file + " && sudo chattr +i " + file],
+            ["remedy", "or extend tool/hx_edit.hexa with Linux branch"],
+            ["ref", "raw:os-lock"]
+        ])
+        return 1
+    }
+
+    if file == "" {
+        ai_err("hx-edit", "no-file", [
+            ["cause", "no file argument supplied"],
+            ["remedy", "./hexa tool/hx_edit.hexa <file>"],
+            ["remedy", "./hexa tool/hx_edit.hexa --list-scope   # see allowed files"],
+            ["ref", "raw:os-lock"]
+        ])
+        return 2
+    }
+
+    let rel = _relativise(file)
+
+    if !_file_in_scope(rel) {
+        ai_err("hx-edit", "unknown-file", [
+            ["file", rel],
+            ["cause", "file not in raw:os-lock scope"],
+            ["remedy", "./hexa tool/hx_edit.hexa --list-scope   # see allowed files"],
+            ["remedy", "edit directly with $EDITOR (no ceremony needed)"],
+            ["ref", "raw:os-lock"]
+        ])
+        return 2
+    }
+
+    let root = _pwd()
+    let abs = root + "/" + rel
+    if !_path_exists(abs) {
+        ai_err("hx-edit", "missing-file", [
+            ["file", rel],
+            ["cause", "file is in scope but not present on disk"],
+            ["remedy", "restore " + rel + " from raw:os-lock scope"],
+            ["ref", "raw:os-lock"]
+        ])
+        return 2
+    }
+
+    let editor = _editor_name()
+
+    if dry {
+        ai_ok("hx-edit/plan", [
+            ["file", rel],
+            ["editor", editor],
+            ["retry", if retry { "true" } else { "false" }],
+            ["steps", "sudo-k -> chflags-noschg -> $EDITOR -> raw-verify -> chflags-schg"]
+        ])
+        return 0
+    }
+
+    // Step 2+3: unlock ceremony
+    let u = _unlock_step(rel, retry)
+    if u != 0 { return 1 }
+
+    // Step 4: launch editor. We do NOT capture output — editor needs tty.
+    let ecmd = editor + " '" + abs + "'"
+    let ercs = exec_with_status(ecmd)
+    let erc = ercs[1]
+    if erc != 0 {
+        ai_err("hx-edit", "editor-failed", [
+            ["file", rel],
+            ["editor", editor],
+            ["cause", "editor exited non-zero (" + to_string(erc) + ")"],
+            ["remedy", "file is currently UNLOCKED; fix editor session then run --retry"],
+            ["ref", "raw:os-lock"]
+        ])
+        // leave unlocked — user needs to inspect
+        return 1
+    }
+
+    // Step 5: raw verify
+    let v = exec_with_status("./build/hexa_stage0 self/raw_cli.hexa verify 2>&1")
+    let vrc = v[1]
+    if vrc != 0 {
+        let vout = to_string(v[0])
+        // Print the verifier output verbatim first so the user can read it
+        eprintln("── raw_cli verify output ──")
+        eprint(vout)
+        eprintln("")
+        ai_err("hx-edit", "verify-failed", [
+            ["file", rel],
+            ["cause", "raw_cli verify exit=" + to_string(vrc) + " — file left UNLOCKED"],
+            ["remedy", "./hexa tool/hx_edit.hexa " + rel + " --retry   # edit again"],
+            ["remedy", "./hexa self/raw_cli.hexa verify   # re-check manually"],
+            ["ref", "raw:self-format"]
+        ])
+        return 1
+    }
+
+    // Step 6: relock
+    let r = _relock_step(rel)
+    if r != 0 { return 1 }
+
+    // Step 7: ai_ok + git diff summary
+    let diff_cmd = "git -C '" + root + "' diff --stat -- '" + rel + "' 2>/dev/null"
+    let diff = to_string(exec(diff_cmd)).trim()
+    let mut stat = diff
+    if stat == "" { stat = "(no changes)" }
+
+    ai_ok("hx-edit/done", [
+        ["file", rel],
+        ["editor", editor],
+        ["verify", "pass"],
+        ["relocked", "schg"],
+        ["git-diff-stat", stat]
+    ])
+    return 0
+}
+
+// ─── is_main guard ─────────────────────────────────────────────
+
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let s = _av[1]
+    if s.ends_with("/hx_edit.hexa") { return true }
+    if s == "hx_edit.hexa" { return true }
+    return false
+}
+
+if _is_main() {
+    let args = _parse_args()
+    let file = args[0]
+    let retry = args[1]
+    let list_scope = args[2]
+    let dry = args[3]
+
+    if list_scope { exit(cmd_list_scope()) }
+    exit(cmd_edit(file, retry, dry))
+}
