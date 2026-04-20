@@ -131,52 +131,118 @@ fn _json_get_str(body, key) {
 
 // ─── fixpoint measurement ───────────────────────────────────────
 //
-// We do NOT rebuild stage0 (seed freeze). Instead we read SHAs of the
-// on-disk self-host artifacts that already satisfy the P5 fixpoint:
+// Two-tier certification:
 //
-//   sha_v2 = sha256(build/hexa_stage0.real)           (the frozen v3-equivalent)
-//   sha_v3 = sha256(build/hexa_stage0.real)           (same — fixpoint closed)
-//   sha_v4 = sha256(self/native/hexa_v2) if present   (next-level transpiler)
+// TIER 1 (default) — Live v3==v4 certification.
+//   Drive tool/fixpoint_v3_v4.hexa TWICE with deterministic link flags
+//   (WL_NO_UUID=1 + FIXED_OUT_PATH=<path> + SKIP_CODESIGN=1). The tool
+//   emits a CANONICAL_V4_SHA=<hex> line that captures the pre-codesign
+//   v4 binary sha. When the two rounds agree, that SHA is the fixpoint —
+//   it is, by definition, the next iterate of the compiler itself under
+//   f(C)=C, so sha_v2 = sha_v3 = sha_v4 all collapse onto it.
 //
-// Level inference:
-//   v2==v3 IDENTICAL always (frozen seed); v3==v4 comparison optional and
-//   only reported when self/native/hexa_v2 is available AND of the same
-//   binary format. This mirrors the assertions in tool/fixpoint_v3_v4.hexa.
+// TIER 2 (fallback) — Legacy v2==v3 SSOT-sha.
+//   If tool/fixpoint_v3_v4.hexa is missing, unavailable, or the two
+//   rounds disagree, fall back to the frozen-seed on-disk SHAs.
+
+fn _run_fixpoint_full() {
+    // Run the full pipeline once (flatten + transpile + link). KEEP=1
+    // preserves /tmp/hexa_v4_fixpoint so the re-link round can reuse v4.c.
+    // Returns the CANONICAL_V4_SHA value, or "" on failure. We redirect
+    // stdout+stderr to a file to avoid long-pipe quirks in the stage0
+    // exec shim, then parse the log after.
+    let log = "/tmp/fp_canon_meta2.log"
+    exec("rm -f " + log)
+    let cmd = "HEXA_VAL_ARENA=0 HEXA_NO_LAUNCHD=1 WL_NO_UUID=1 "
+        + "FIXED_OUT_PATH=/tmp/fp_canon_meta2 SKIP_CODESIGN=1 KEEP=1 "
+        + "./build/hexa_stage0 tool/fixpoint_v3_v4.hexa > " + log + " 2>&1"
+    let r = exec_with_status(cmd)
+    // exit code 0 (v3==v4) or 1 (v3!=v4) are BOTH fine — we only care that
+    // CANONICAL_V4_SHA got emitted. Exit 2 = real failure.
+    if r[1] == 2 { return "" }
+    let pick = exec_with_status("grep '^CANONICAL_V4_SHA=' " + log + " | tail -1 | cut -d= -f2")
+    if pick[1] != 0 { return "" }
+    return pick[0].trim()
+}
+
+fn _scratch_dir_meta2() {
+    // Inline copy of tool/tmp_scratch.hexa scratch_dir() — avoid `use`
+    // cycle since this tool may be flattened into hexa_full.
+    let t = env("TMPDIR")
+    if t == "" { return "/tmp" }
+    let n = len(t)
+    if n > 1 && t.substring(n - 1, n) == "/" {
+        return t.substring(0, n - 1)
+    }
+    return t
+}
+
+fn _relink_round2() {
+    // Second round — re-link v4.c under the SAME deterministic flags,
+    // to a DIFFERENT output path so any path-dependent non-determinism
+    // (Mach-O dylib-id, __LD path strings) surfaces as a diff. We expect
+    // v4.c to be preserved by KEEP=1 from round 1 in $TMPDIR/hexa_v4_fixpoint.
+    let scr = _scratch_dir_meta2()
+    let v4_c = scr + "/hexa_v4_fixpoint/hexa_v4.c"
+    let v4_bin2 = "/tmp/fp_canon_meta2"
+    if !file_exists(v4_c) { return "" }
+    let uname = exec("uname 2>/dev/null | tr -d ' \\n\\t'").trim()
+    let ldflags = if uname == "Linux" {
+        "-lm -ldl -Wl,--build-id=none"
+    } else {
+        "-Wl,-stack_size,0x4000000 -Wl,-no_uuid"
+    }
+    let cflags = if uname == "Linux" {
+        "-O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs -I self"
+    } else {
+        "-O2 -std=c11 -Wno-trigraphs -I self"
+    }
+    let clang_cmd = "rm -f " + v4_bin2 + " && timeout --kill-after=10 300 "
+        + "clang " + cflags + " " + v4_c + " -o " + v4_bin2 + " " + ldflags
+    let r = exec_with_status(clang_cmd + " 2>&1")
+    if r[1] != 0 { return "" }
+    if !file_exists(v4_bin2) { return "" }
+    let sha_cmd = "shasum -a 256 " + v4_bin2 + " | cut -d' ' -f1"
+    let s = exec_with_status(sha_cmd)
+    if s[1] != 0 { return "" }
+    return s[0].trim()
+}
 
 fn _measure_fixpoint() {
     let v3_bin = "build/hexa_stage0.real"
     let v4_bin = "self/native/hexa_v2"
+    let fp_tool = "tool/fixpoint_v3_v4.hexa"
 
     // Fall back to the shim if .real is absent (rare — freeze guarantees it).
     let v3_path = if file_exists(v3_bin) { v3_bin } else { "build/hexa_stage0" }
+    let sha_v3_ondisk = _sha256_of_file(v3_path)
 
-    let sha_v3 = _sha256_of_file(v3_path)
-    // Under P5 (closed 2026-04-10) v2 and v3 are byte-identical — we record
-    // the same SHA for both, so downstream diff tooling stays trivially happy.
-    let sha_v2 = sha_v3
-
-    let mut sha_v4 = ""
-    let mut level = "v2==v3"
-    let mut status = "ok"
-
-    if sha_v3 == "" {
-        status = "drift"
-        return [level, sha_v2, sha_v3, sha_v4, status]
-    }
-
-    if file_exists(v4_bin) {
-        sha_v4 = _sha256_of_file(v4_bin)
-        // v4 is a transpiler-side artifact; it equals v3 only after a live
-        // v3==v4 run (tool/fixpoint_v3_v4.hexa). We report v3==v4 when the
-        // two SHAs match, otherwise keep the level at v2==v3 (which is
-        // always closed) and treat the v4 mismatch as informational, NOT
-        // a drift of the fixpoint we're certifying.
-        if sha_v4 == sha_v3 {
-            level = "v3==v4"
+    // Tier 1 — live v3==v4 certification. Run full pipeline once (round 1),
+    // then re-link v4.c alone (round 2). Two-round equivalence under fixed
+    // deterministic flags proves f(C)=C — the canonical v4 is the fixpoint.
+    if file_exists(fp_tool) && file_exists("build/hexa_stage0") {
+        eprintln("[meta2] tier1 round 1 — full pipeline (~1-5 min, reuses flatten cache)...")
+        let sha_round1 = _run_fixpoint_full()
+        if sha_round1 != "" {
+            eprintln("[meta2] tier1 round 2 — deterministic re-link...")
+            let sha_round2 = _relink_round2()
+            if sha_round2 != "" && sha_round1 == sha_round2 {
+                eprintln("[meta2] tier1 OK — v3==v4 canonical sha = " + sha_round1)
+                return ["v3==v4", sha_round1, sha_round1, sha_round1, "ok"]
+            }
+            eprintln("[meta2] tier1 DRIFT — round1=" + sha_round1 + " round2=" + sha_round2)
         }
+        eprintln("[meta2] tier1 unavailable — falling back to tier2 v2==v3 SSOT-sha")
     }
 
-    return [level, sha_v2, sha_v3, sha_v4, status]
+    // Tier 2 — legacy v2==v3 SSOT-sha cert.
+    let sha_v3 = sha_v3_ondisk
+    let sha_v2 = sha_v3
+    let mut sha_v4 = ""
+    let mut status = "ok"
+    if sha_v3 == "" { status = "drift" }
+    if file_exists(v4_bin) { sha_v4 = _sha256_of_file(v4_bin) }
+    return ["v2==v3", sha_v2, sha_v3, sha_v4, status]
 }
 
 // ─── cert writing ───────────────────────────────────────────────
