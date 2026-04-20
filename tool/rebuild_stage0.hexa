@@ -421,7 +421,17 @@ if env("NO_CACHE") != "" {
     }
 
     let smoke_prefix = if env("WITH_SMOKE") == "" { "NO_SMOKE=1 " } else { "" }
-    let build_result = exec_with_status(smoke_prefix + "./hexa " + hexa_dir + "/tool/build_stage0.hexa")
+    // 2026-04-20 fix: prefer build/hexa_stage0 over ./hexa (see main
+    // path above for root-cause notes on argv[1] expansion).
+    let mut legacy_runner = "./hexa"
+    let mut legacy_prefix = ""
+    let legacy_s0 = hexa_dir + "/build/hexa_stage0"
+    let legacy_s0_chk = exec_with_status("test -x " + legacy_s0)
+    if legacy_s0_chk[1] == 0 {
+        legacy_runner = legacy_s0
+        legacy_prefix = "HEXA_NO_LAUNCHD=1 HEXA_VAL_ARENA=0 "
+    }
+    let build_result = exec_with_status(legacy_prefix + smoke_prefix + legacy_runner + " " + hexa_dir + "/tool/build_stage0.hexa")
     if build_result[1] != 0 {
         cleanup_lock(lock_dir)
         exit(1)
@@ -438,7 +448,16 @@ let flatten_script = hexa_dir + "/tool/flatten_imports.hexa"
 let root_hexa = hexa_dir + "/self/hexa_full.hexa"
 if !file_exists(root_hexa) || !file_exists(flatten_script) {
     eprintln("[rebuild_stage0] missing root inputs — falling back to legacy")
-    let fb = exec_with_status("./hexa " + hexa_dir + "/tool/build_stage0.hexa")
+    // 2026-04-20 fix: prefer build/hexa_stage0 over ./hexa.
+    let mut fb_runner = "./hexa"
+    let mut fb_prefix = ""
+    let fb_s0 = hexa_dir + "/build/hexa_stage0"
+    let fb_s0_chk = exec_with_status("test -x " + fb_s0)
+    if fb_s0_chk[1] == 0 {
+        fb_runner = fb_s0
+        fb_prefix = "HEXA_NO_LAUNCHD=1 HEXA_VAL_ARENA=0 "
+    }
+    let fb = exec_with_status(fb_prefix + fb_runner + " " + hexa_dir + "/tool/build_stage0.hexa")
     cleanup_lock(lock_dir)
     exit(fb[1])
 }
@@ -600,7 +619,18 @@ if env("FORCE") == "" && file_exists(link_cache_bin) {
         }
         // Re-install the flock+RSS-cap shim so cache-restored Mach-O
         // regains the layered defense (commit ca46279).
-        let cache_shim_res = exec_with_status("./hexa " + hexa_dir + "/tool/install_stage0_shim.hexa")
+        // 2026-04-20: invoke via stage0 shim so install_stage0_shim
+        // resolves hexa_dir correctly (./hexa native launcher mangles
+        // argv[1] to a temp path).
+        let mut cs_runner = "./hexa"
+        let mut cs_prefix = ""
+        let cs_s0 = hexa_dir + "/build/hexa_stage0"
+        let cs_s0_chk = exec_with_status("test -x " + cs_s0)
+        if cs_s0_chk[1] == 0 {
+            cs_runner = cs_s0
+            cs_prefix = "HEXA_NO_LAUNCHD=1 HEXA_VAL_ARENA=0 "
+        }
+        let cache_shim_res = exec_with_status(cs_prefix + cs_runner + " " + hexa_dir + "/tool/install_stage0_shim.hexa")
         if cache_shim_res[1] != 0 {
             eprintln("[rebuild_stage0] WARN: install_stage0_shim failed after cache hit (rc=" + str(cache_shim_res[1]) + ")")
             eprintln(cache_shim_res[0])
@@ -806,14 +836,78 @@ let hit_flatten_int = if hit_flatten { 1 } else { 0 }
 let hit_transpile_int = if hit_transpile { 1 } else { 0 }
 println("[rebuild_stage0] invoking build_stage0.hexa (flatten=" + str(hit_flatten_int) + " transpile=" + str(hit_transpile_int) + " link=0)")
 
-// HEXA_SKIP_SHIM=1: let build_stage0 produce raw Mach-O at `out` without
-// installing the shim internally. rebuild_stage0 handles shim install at
-// the end (line 869) so the post-build size check and link-cache save
-// below see the 2.7MB Mach-O, not the 6KB shim.
-let build_cmd = "HEXA_SKIP_SHIM=1 " + smoke_env + skip_env + "./hexa " + hexa_dir + "/tool/build_stage0.hexa"
+// HEXA_SKIP_SHIM=1: let build_stage0 produce raw Mach-O at `out`.real
+// without installing the shim internally. rebuild_stage0 handles shim
+// install at the end (line 869) so the post-build size check and
+// link-cache save below see the freshly compiled Mach-O directly.
+//
+// 2026-04-20 fix: invoke build_stage0.hexa via the stage0 binary
+// (build/hexa_stage0 shim) — NOT via `./hexa`. The native `./hexa`
+// launcher rewrites argv[1] to an expanded temp file path, which makes
+// build_stage0.hexa compute hexa_dir=/ → "SSOT missing" → exit(1) →
+// false "build FAILED". The stage0 shim passes argv cleanly and runs
+// identically to a direct user invocation.
+let build_runner = ""
+let build_env_prefix = ""
+let stage0_bin = hexa_dir + "/build/hexa_stage0"
+let stage0_bin_chk = exec_with_status("test -x " + stage0_bin)
+if stage0_bin_chk[1] == 0 {
+    build_runner = stage0_bin
+    // Stage0 shim needs HEXA_NO_LAUNCHD to skip launchd re-entry (we
+    // already hold the outer rebuild lock, so the layered defense is
+    // redundant for this nested call).
+    build_env_prefix = "HEXA_NO_LAUNCHD=1 HEXA_VAL_ARENA=0 "
+} else {
+    // Fallback: ./hexa is a native launcher that mangles argv[1] into a
+    // temp path, so build_stage0 would mis-resolve hexa_dir. As a last
+    // resort still try it — the size-check below will catch the failure.
+    let hexa_chk = exec_with_status("test -x " + hexa_dir + "/hexa")
+    if hexa_chk[1] == 0 {
+        build_runner = hexa_dir + "/hexa"
+    }
+}
+if build_runner == "" {
+    eprintln("[rebuild_stage0] no build runner (build/hexa_stage0 or ./hexa) — abort")
+    cleanup_lock(lock_dir)
+    exit(1)
+}
+
+let build_cmd = build_env_prefix + "HEXA_SKIP_SHIM=1 " + smoke_env + skip_env + build_runner + " " + hexa_dir + "/tool/build_stage0.hexa"
 let build_result = exec_with_status(build_cmd)
-if build_result[1] != 0 {
-    eprintln("[rebuild_stage0] build FAILED")
+
+// Success predicate (build_stage0 writes fresh Mach-O/ELF to build/hexa_stage0.real).
+// TRUSTS subprocess exit code 0 AND verifies fresh .real binary exists at
+// expected size (≥ HEXA_STAGE0_MIN_SIZE, default 1MB). Only declares
+// "build FAILED" when BOTH conditions fail — protects against false
+// negatives when build_stage0 prints a harmless stderr warning but
+// otherwise completes cleanly.
+let real_out = out + ".real"
+let mut build_succeeded = false
+if build_result[1] == 0 {
+    let real_chk = exec_with_status("test -f " + real_out)
+    if real_chk[1] == 0 {
+        let rsz = to_int(exec("wc -c < " + real_out + " | tr -d ' '").trim())
+        if rsz >= min_size_val {
+            build_succeeded = true
+            println("[rebuild_stage0] build OK -> " + real_out + " (" + str(rsz) + " bytes)")
+        }
+    }
+}
+if !build_succeeded {
+    eprintln("[rebuild_stage0] build FAILED (exit=" + str(build_result[1]) + ")")
+    let real_present = exec_with_status("test -f " + real_out)
+    if real_present[1] == 0 {
+        let rsz_bad = exec("wc -c < " + real_out + " | tr -d ' '").trim()
+        eprintln("  .real size: " + rsz_bad + " bytes (expected >= " + str(min_size_val) + ")")
+    } else {
+        eprintln("  .real output missing: " + real_out)
+    }
+    if len(build_result[0]) > 0 {
+        eprintln("  subprocess tail:")
+        let tail_out = build_result[0]
+        let tstart = if len(tail_out) > 600 { len(tail_out) - 600 } else { 0 }
+        eprintln(tail_out.substring(tstart, len(tail_out)))
+    }
     if backup_path != "" && file_exists(backup_path) {
         exec("cp -f " + backup_path + " " + out)
         eprintln("[rebuild_stage0] rolled back to backup")
@@ -822,21 +916,22 @@ if build_result[1] != 0 {
     exit(1)
 }
 
-// size guard
-let out_check2 = exec_with_status("test -x " + out)
+// Legacy size guard: kept for defensive parity but expected to no-op now
+// (build_succeeded predicate above already verified .real size).
+let out_check2 = exec_with_status("test -f " + real_out)
 if out_check2[1] == 0 {
-    let new_size = to_int(exec("wc -c < " + out + " | tr -d ' '").trim())
+    let new_size = to_int(exec("wc -c < " + real_out + " | tr -d ' '").trim())
     if new_size < min_size_val {
         eprintln("[rebuild_stage0] ERROR: output too small (" + str(new_size) + " < " + str(min_size_val) + " bytes) — broken transpile?")
         if backup_path != "" && file_exists(backup_path) {
-            exec("cp -f " + backup_path + " " + out)
+            exec("cp -f " + backup_path + " " + real_out)
             if uname == "Darwin" {
                 let cs = exec_with_status("command -v codesign >/dev/null 2>&1")
                 if cs[1] == 0 {
-                    exec_with_status("codesign --force --sign - " + out + " 2>/dev/null")
+                    exec_with_status("codesign --force --sign - " + real_out + " 2>/dev/null")
                 }
             }
-            let rolled_size = exec("wc -c < " + out + " | tr -d ' '").trim()
+            let rolled_size = exec("wc -c < " + real_out + " | tr -d ' '").trim()
             eprintln("[rebuild_stage0] rolled back to backup (" + rolled_size + " bytes)")
         }
         if backup_path != "" {
@@ -850,26 +945,30 @@ if out_check2[1] == 0 {
 // ── 10b. Sanity check — run a trivial .hexa through the new binary and
 // verify output matches "ok\n42\n" exactly. Rolls back + exits(1) if it
 // doesn't. Runs BEFORE cache save so a bad binary can't poison link cache.
-sanity_check_stage0(out, backup_path, uname)
+//
+// 2026-04-20 fix: sanity-check .real directly (where build_stage0 wrote
+// the fresh Mach-O). `out` still holds the PREVIOUS shim/binary at this
+// point — sanity-checking it would validate stale state.
+sanity_check_stage0(real_out, backup_path, uname)
 
 if backup_path != "" {
     exec("rm -f " + backup_path)
 }
 
 // ── 11. 캐시 저장 — 빌드 성공 + sanity PASS 이후에만 ───────
-// IMPORTANT: cache the RAW Mach-O (still at `out` now), BEFORE installing
-// the shim. If we shim first, link_cache_bin would contain the bash shim
-// and a future cache HIT would restore the shim over the shim, losing the
-// real binary.
+// IMPORTANT: cache the RAW Mach-O from .real, BEFORE installing the shim.
+// If we shim first, link_cache_bin would contain the bash shim and a
+// future cache HIT would restore the shim over the shim, losing the real
+// binary.
 if file_exists(src_c) && !file_exists(transpile_cache) {
     exec_with_status("cp -f " + src_c + " " + transpile_cache + " 2>/dev/null")
 }
 if file_exists(flat_out) && !file_exists(flat_cache) {
     exec_with_status("cp -f " + flat_out + " " + flat_cache + " 2>/dev/null")
 }
-let out_check3 = exec_with_status("test -x " + out)
+let out_check3 = exec_with_status("test -x " + real_out)
 if out_check3[1] == 0 {
-    exec_with_status("cp -f " + out + " " + link_cache_bin + " 2>/dev/null")
+    exec_with_status("cp -f " + real_out + " " + link_cache_bin + " 2>/dev/null")
 }
 
 // ── 11c. Re-install flock+RSS-cap shim (commit ca46279) ─────
@@ -877,12 +976,21 @@ if out_check3[1] == 0 {
 // bash shim from git HEAD to build/hexa_stage0. Without this the next
 // rebuild lands the Mac back in the 2026-04-18 panic trap (N parallel
 // uncapped spawns → compressor blowup).
-let shim_res = exec_with_status("./hexa " + hexa_dir + "/tool/install_stage0_shim.hexa")
+// 2026-04-20: invoke via stage0 shim (./hexa mangles argv[1]).
+let mut ish_runner = "./hexa"
+let mut ish_prefix = ""
+let ish_s0 = hexa_dir + "/build/hexa_stage0"
+let ish_s0_chk = exec_with_status("test -x " + ish_s0)
+if ish_s0_chk[1] == 0 {
+    ish_runner = ish_s0
+    ish_prefix = "HEXA_NO_LAUNCHD=1 HEXA_VAL_ARENA=0 "
+}
+let shim_res = exec_with_status(ish_prefix + ish_runner + " " + hexa_dir + "/tool/install_stage0_shim.hexa")
 if shim_res[1] != 0 {
     eprintln("[rebuild_stage0] WARN: install_stage0_shim failed (rc=" + str(shim_res[1]) + ")")
     eprintln(shim_res[0])
     eprintln("[rebuild_stage0] build/hexa_stage0 remains raw Mach-O — reinstall shim manually:")
-    eprintln("  ./hexa tool/install_stage0_shim.hexa")
+    eprintln("  ./build/hexa_stage0 tool/install_stage0_shim.hexa")
 }
 
 // ── 11b. Per-file manifest update ───────────────────────────
