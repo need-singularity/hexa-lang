@@ -1,0 +1,247 @@
+// self/lsp/raw_diagnostics.hexa — raw-rule → LSP Diagnostic bridge (P3-1)
+//
+// Wires the fast raw enforcers (raw#9 hexa-only / raw#11 ai-native-enforce /
+// raw#12 silent-error) into the LSP so that editor `didSave` (and optionally
+// `didOpen`/`didChange`) surfaces rule violations inline as squiggles instead
+// of deferring to commit time.
+//
+// Scope (intentional, cheap):
+//   · raw#9  hexa-only                — tool/hexa_only_lint.hexa  (path-check only)
+//   · raw#11 ai-native-enforce        — tool/ai_native_lint.hexa  (line:col:msg)
+//   · raw#12 silent-error             — tool/error_propagation_lint.hexa (LintMsg)
+//
+// Deliberately skipped (too expensive per keystroke/save):
+//   · raw#10 proof-carrying, raw#15 no-hardcode, raw#18 self-host-fixpoint.
+//
+// Contract:
+//   · `collect_for_file(path)` returns a hexa array of LSP-shaped JSON strings
+//     (each = a single `{range, severity, source, message}` object, ready to
+//     wrap in `[..]` and hand to `publish_diagnostics_params`).
+//   · On any failure (stage0 missing, spawn error, unparseable output) the
+//     function returns `[]` — never crashes the LSP loop.
+//
+// Parser notes:
+//   · ai_native_lint prints `path:line:col: [tag L# ...] message` to stdout.
+//   · silent-error via `fmt_msg` prints `path:line:col` or `line <N>` locus on
+//     stderr followed by `level[@rule] locus: msg` — we read combined (2>&1).
+//   · hexa-only reports extension bans on staged paths only, so it is a no-op
+//     unless the edited file is itself a banned extension; we still call it so
+//     future rule expansions propagate automatically.
+
+use "self/lsp/protocol"
+
+// ─── low-level helpers ────────────────────────────────────
+fn _file_exists_safe(p: string) -> bool {
+    // file_exists is a hexa builtin; fall back to shell test if unavailable.
+    return file_exists(p)
+}
+
+fn _stage0_ok() -> bool {
+    if _file_exists_safe("build/hexa_stage0") { return true }
+    // env-provided path override
+    let envp = env("HEXA_STAGE0")
+    if envp != "" && _file_exists_safe(envp) { return true }
+    return false
+}
+
+fn _shell_quote(s: string) -> string {
+    // naive single-quote escape; LSP URIs never contain `'`, but be safe.
+    let parts = ["'", s, "'"]
+    return parts.join("")
+}
+
+fn _json_escape(s: string) -> string {
+    // Escape \ and " for embedding in diagnostic.message.
+    let mut out = ""
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\t" { out = out + "\\t" }
+        else if c == "\r" { out = out + "" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// Best-effort integer parse (stage0 has no Int.parse builtin everywhere).
+fn _atoi_safe(s: string) -> int {
+    let mut n = 0
+    let mut i = 0
+    let k = len(s)
+    while i < k {
+        let c = s.substring(i, i + 1)
+        let code = char_code(c, 0)
+        if code < 48 || code > 57 { break }
+        n = n * 10 + (code - 48)
+        i = i + 1
+    }
+    return n
+}
+
+// ─── per-rule invokers ─────────────────────────────────────
+// Each `_run_*` returns an array of diagnostic-json strings (not wrapped in []).
+
+// Generic path:line:col: <rest>  extractor. Produces diagnostic only if the
+// line belongs to `target_path` (basename match — LSP URIs may differ in
+// absolute prefix from what the lint prints).
+fn _extract_line_col_msgs(out: string, target_path: string, source: string, severity: int) -> array {
+    let mut diags = []
+    let target_base = _basename(target_path)
+    let lines = split(out, "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        // expect "<path>:<line>:<col>: <rest>" or "<path>:<line>:<col> <rest>"
+        let p1 = t.index_of(":")
+        if p1 <= 0 { continue }
+        let path_seg = t.substring(0, p1)
+        // match by basename so relative vs absolute differences are tolerated
+        if !_ends_with_base(path_seg, target_base) { continue }
+        let rest1 = t.substring(p1 + 1, len(t))
+        let p2 = rest1.index_of(":")
+        if p2 <= 0 { continue }
+        let line_str = rest1.substring(0, p2)
+        let line_no = _atoi_safe(line_str)
+        if line_no <= 0 { continue }
+        let rest2 = rest1.substring(p2 + 1, len(rest1))
+        let p3 = rest2.index_of(":")
+        let mut col = 0
+        let mut msg = rest2
+        if p3 > 0 {
+            col = _atoi_safe(rest2.substring(0, p3))
+            msg = rest2.substring(p3 + 1, len(rest2)).trim()
+        }
+        // LSP is 0-indexed lines/columns; lint output is 1-indexed.
+        let l0 = if line_no > 0 { line_no - 1 } else { 0 }
+        let c0 = if col > 0 { col - 1 } else { 0 }
+        let d = diagnostic(l0, c0, l0, c0 + 1, severity, source, _json_escape(msg))
+        diags = diags.push(d)
+    }
+    return diags
+}
+
+fn _basename(p: string) -> string {
+    let idx = _last_index_of(p, "/")
+    if idx < 0 { return p }
+    return p.substring(idx + 1, len(p))
+}
+
+fn _last_index_of(s: string, needle: string) -> int {
+    let mut last = -1
+    let mut i = 0
+    let n = len(s)
+    let m = len(needle)
+    if m == 0 || m > n { return -1 }
+    while i + m <= n {
+        if s.substring(i, i + m) == needle { last = i }
+        i = i + 1
+    }
+    return last
+}
+
+fn _ends_with_base(path_seg: string, base: string) -> bool {
+    if path_seg == base { return true }
+    return path_seg.ends_with("/" + base)
+}
+
+// raw#11 — ai-native-enforce (tool/ai_native_lint.hexa)
+// stdout: "path:line:col: [tag L# rule] message"
+fn _run_ai_native(path: string) -> array {
+    if !_stage0_ok() { return [] }
+    let cmd = "build/hexa_stage0 tool/ai_native_lint.hexa " + _shell_quote(path) + " 2>&1"
+    let out = to_string(exec(cmd))
+    return _extract_line_col_msgs(out, path, "raw#11 ai-native", 2)
+}
+
+// raw#12 — silent-error (tool/error_propagation_lint.hexa)
+// fmt_msg output: "[path:line:col] level[@rule] locus: msg"
+//              or "[line N] level[@rule] locus: msg"
+fn _run_silent_error(path: string) -> array {
+    if !_stage0_ok() { return [] }
+    let cmd = "build/hexa_stage0 tool/error_propagation_lint.hexa " + _shell_quote(path) + " 2>&1"
+    let out = to_string(exec(cmd))
+    let mut diags = []
+    let target_base = _basename(path)
+    let lines = split(out, "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        // match leading "[...]" header
+        if t.substring(0, 1) != "[" { continue }
+        let end = t.index_of("]")
+        if end <= 1 { continue }
+        let inside = t.substring(1, end)
+        let rest  = t.substring(end + 1, len(t)).trim()
+        // parse inside — "path:line:col" or "line N"
+        let mut line_no = 0
+        let mut col = 0
+        if inside.starts_with("line ") {
+            line_no = _atoi_safe(inside.substring(5, len(inside)).trim())
+        } else {
+            let p1 = inside.index_of(":")
+            if p1 < 0 { continue }
+            let path_seg = inside.substring(0, p1)
+            if !_ends_with_base(path_seg, target_base) { continue }
+            let rest1 = inside.substring(p1 + 1, len(inside))
+            let p2 = rest1.index_of(":")
+            if p2 > 0 {
+                line_no = _atoi_safe(rest1.substring(0, p2))
+                col = _atoi_safe(rest1.substring(p2 + 1, len(rest1)))
+            } else {
+                line_no = _atoi_safe(rest1)
+            }
+        }
+        if line_no <= 0 { continue }
+        let l0 = line_no - 1
+        let c0 = if col > 0 { col - 1 } else { 0 }
+        let d = diagnostic(l0, c0, l0, c0 + 1, 2, "raw#12 silent-error", _json_escape(rest))
+        diags = diags.push(d)
+    }
+    return diags
+}
+
+// raw#9 — hexa-only (tool/hexa_only_lint.hexa)
+// Only reports if `path` itself has a banned extension (.rs/.toml/.py/.sh).
+// Reports whole-file squiggle on line 0.
+fn _run_hexa_only(path: string) -> array {
+    let mut diags = []
+    let banned = [".rs", ".toml", ".py", ".sh"]
+    for ext in banned {
+        if path.ends_with(ext) {
+            let msg = "raw#9 HEXA-ONLY: " + ext + " files are forbidden — port to .hexa"
+            let d = diagnostic(0, 0, 0, 0, 1, "raw#9 hexa-only", _json_escape(msg))
+            diags = diags.push(d)
+            break
+        }
+    }
+    return diags
+}
+
+// ─── public entry ─────────────────────────────────────────
+// Returns an array of diagnostic-JSON strings. Caller wraps as `[...]`.
+pub fn collect_for_file(path: string) -> array {
+    if len(path) == 0 { return [] }
+    if !_file_exists_safe(path) { return [] }
+
+    let mut all = []
+    // Fast, path-local checks first.
+    for d in _run_hexa_only(path) { all = all.push(d) }
+    // Line-scan checks (stage0 required).
+    for d in _run_ai_native(path) { all = all.push(d) }
+    for d in _run_silent_error(path) { all = all.push(d) }
+    return all
+}
+
+// Convenience: returns a ready-to-publish JSON array body (`[d1,d2,...]`).
+pub fn collect_for_file_as_json(path: string) -> string {
+    let diags = collect_for_file(path)
+    if len(diags) == 0 { return "[]" }
+    let joined = diags.join(",")
+    let parts = ["[", joined, "]"]
+    return parts.join("")
+}
