@@ -1,0 +1,337 @@
+#!hexa strict
+// tool/worktree_own_lock.hexa — chflags uchg for .claude/worktrees/*/.own
+//
+// PURPOSE
+//   raw:os-lock (raw#1) scope covers root .raw + .own. The worktree
+//   copies at .claude/worktrees/agent-*/.own are experimental playgrounds
+//   that the separate root-lock tool (tool/os_level_lock.hexa) does NOT
+//   touch. This tool lives at a lower tier — a per-worktree .own locker
+//   — so bg agents can't silently overwrite their own directive file.
+//
+//   On macOS we issue `chflags uchg <path>` (owner-removable, no sudo).
+//   On Linux we fall back to `chattr +i <path>` (tries without sudo,
+//   then with sudo -n). On unsupported platforms the file reports SKIP
+//   with a clear reason and exits 0 for the scan so non-Darwin/non-Linux
+//   CI never blocks.
+//
+// USAGE
+//   ./hexa tool/worktree_own_lock.hexa
+//       lock every .claude/worktrees/*/.own (default)
+//
+//   ./hexa tool/worktree_own_lock.hexa --list
+//       report each .own + current lock state; no mutation.
+//
+//   ./hexa tool/worktree_own_lock.hexa --unlock <path>
+//       single-file escape hatch. chflags nouchg / chattr -i.
+//
+// EXIT
+//   0 on success, 1 on any chflags/chattr failure not covered by SKIP.
+//
+// SAFETY
+//   - Paths are whitelisted to [A-Za-z0-9._/-] (the worktree naming
+//     convention is agent-<hex> so this is tight).
+//   - A path containing any other byte is SKIPPED with a clear warning
+//     rather than shell-quoted — we trade flexibility for audit clarity.
+
+// ─── platform detection (shared pattern with os_level_lock) ─────
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _is_dir(path: string) -> bool {
+    let r = to_string(exec("test -d '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+// ─── path sanitization ──────────────────────────────────────────
+
+fn _is_safe_char(c: string) -> bool {
+    // Whitelist of chars allowed in our relative paths.
+    // Stage0 quirk: string <=/>= compare is unreliable on 1-char strings;
+    // use char_code for byte-level range tests.
+    if c == "/" || c == "." || c == "_" || c == "-" { return true }
+    let k = char_code(c, 0)
+    if k >= 48 && k <= 57 { return true }   // 0-9
+    if k >= 97 && k <= 122 { return true }  // a-z
+    if k >= 65 && k <= 90 { return true }   // A-Z
+    return false
+}
+
+fn _is_safe_path(path: string) -> bool {
+    let mut i = 0
+    let n = len(path)
+    if n == 0 { return false }
+    while i < n {
+        let c = path.substring(i, i + 1)
+        if !_is_safe_char(c) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── lock-state detection ───────────────────────────────────────
+
+fn _darwin_has_uchg(path: string) -> bool {
+    let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    if line.contains(" uchg ") { return true }
+    if line.contains(" uchg,") { return true }
+    if line.contains(",uchg ") { return true }
+    if line.contains(",uchg,") { return true }
+    return false
+}
+
+fn _linux_has_immutable(path: string) -> bool {
+    let r = exec_with_status("lsattr -d '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    let mut i = 0
+    while i < len(line) {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        if c == "i" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_locked(path: string) -> bool {
+    if _is_darwin() { return _darwin_has_uchg(path) }
+    if _is_linux()  { return _linux_has_immutable(path) }
+    return false
+}
+
+// ─── mutations ──────────────────────────────────────────────────
+
+fn _apply_lock(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("chflags uchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("chattr +i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return -1
+}
+
+fn _remove_lock(path: string) -> int {
+    if _is_darwin() {
+        let r = exec_with_status("chflags nouchg '" + path + "' 2>&1")
+        return r[1]
+    }
+    if _is_linux() {
+        let r = exec_with_status("chattr -i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        let r2 = exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")
+        return r2[1]
+    }
+    return -1
+}
+
+// ─── BFS scan .claude/worktrees/*/.own ──────────────────────────
+
+fn _scan_worktree_owns() -> array {
+    // Returns array of relative paths like ".claude/worktrees/agent-xxx/.own".
+    // Empty array if the glob matches nothing (dir missing or no subdirs).
+    let mut out = []
+    let root = ".claude/worktrees"
+    if !_is_dir(root) { return out }
+
+    let entries = list_dir(root)
+    let mut i = 0
+    while i < len(entries) {
+        let name = entries[i]
+        let sub = root + "/" + name
+        if _is_dir(sub) {
+            let own_path = sub + "/.own"
+            if _path_exists(own_path) { out = out.push(own_path) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── command implementations ────────────────────────────────────
+
+fn _platform_supported() -> bool {
+    return _is_darwin() || _is_linux()
+}
+
+fn cmd_lock() -> int {
+    let targets = _scan_worktree_owns()
+    if len(targets) == 0 {
+        println("no .claude/worktrees/*/.own found — nothing to lock")
+        return 0
+    }
+    if !_platform_supported() {
+        for t in targets {
+            println("[SKIP] " + t + " — no supported lock syscall")
+        }
+        return 0
+    }
+    let mut locked = 0
+    let mut already = 0
+    let mut skipped = 0
+    let mut failures = []
+
+    for t in targets {
+        if !_is_safe_path(t) {
+            println("[SKIP] " + t + " — path contains unsafe chars")
+            skipped = skipped + 1
+            continue
+        }
+        if _is_locked(t) {
+            println("[ALREADY-LOCKED] " + t)
+            already = already + 1
+            continue
+        }
+        let rc = _apply_lock(t)
+        if rc == 0 {
+            println("[LOCK] " + t)
+            locked = locked + 1
+        } else {
+            eprintln("[FAIL] " + t + " — chflags/chattr exit " + to_string(rc))
+            failures = failures.push(t)
+        }
+    }
+
+    println("")
+    println("summary: locked=" + to_string(locked)
+            + " already=" + to_string(already)
+            + " skipped=" + to_string(skipped)
+            + " failed=" + to_string(len(failures)))
+    if len(failures) > 0 { return 1 }
+    return 0
+}
+
+fn cmd_list() -> int {
+    let targets = _scan_worktree_owns()
+    if len(targets) == 0 {
+        println("no .claude/worktrees/*/.own found")
+        return 0
+    }
+    let supported = _platform_supported()
+    for t in targets {
+        if !supported {
+            println("[UNKNOWN] " + t + " — platform unsupported")
+            continue
+        }
+        if !_is_safe_path(t) {
+            println("[UNSAFE-PATH] " + t)
+            continue
+        }
+        if _is_locked(t) {
+            println("[LOCKED]   " + t)
+        } else {
+            println("[UNLOCKED] " + t)
+        }
+    }
+    return 0
+}
+
+fn cmd_unlock(target: string) -> int {
+    if target == "" {
+        eprintln("usage: ./hexa tool/worktree_own_lock.hexa --unlock <path>")
+        return 2
+    }
+    if !_is_safe_path(target) {
+        eprintln("[FAIL] " + target + " — path contains unsafe chars")
+        return 1
+    }
+    if !_path_exists(target) {
+        eprintln("[FAIL] " + target + " — path does not exist")
+        return 1
+    }
+    if !_platform_supported() {
+        println("[SKIP] " + target + " — no supported unlock syscall")
+        return 0
+    }
+    if !_is_locked(target) {
+        println("[ALREADY-UNLOCKED] " + target)
+        return 0
+    }
+    let rc = _remove_lock(target)
+    if rc == 0 {
+        println("[UNLOCK] " + target)
+        return 0
+    }
+    eprintln("[FAIL] " + target + " — chflags/chattr exit " + to_string(rc))
+    return 1
+}
+
+// ─── CLI dispatch ───────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("usage: ./hexa tool/worktree_own_lock.hexa [--list | --unlock <path>]")
+    eprintln("  (no args)         lock all .claude/worktrees/*/.own")
+    eprintln("  --list            report each .own + lock state")
+    eprintln("  --unlock <path>   unlock a single .own file")
+}
+
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let script = _av[1]
+    if script.ends_with("/worktree_own_lock.hexa") { return true }
+    if script == "worktree_own_lock.hexa" { return true }
+    return false
+}
+
+if _is_main() {
+    let mut mode = "lock"
+    let mut unlock_target = ""
+    let mut i = 2
+    while i < len(_av) {
+        let a = _av[i]
+        if a == "--list" {
+            mode = "list"
+        } else if a == "--unlock" {
+            mode = "unlock"
+            if i + 1 < len(_av) {
+                unlock_target = _av[i + 1]
+                i = i + 1
+            }
+        } else if a == "--help" || a == "-h" {
+            _usage()
+            exit(0)
+        } else {
+            eprintln("unknown arg: " + a)
+            _usage()
+            exit(2)
+        }
+        i = i + 1
+    }
+
+    let mut rc = 0
+    if mode == "lock"        { rc = cmd_lock() }
+    else if mode == "list"   { rc = cmd_list() }
+    else if mode == "unlock" { rc = cmd_unlock(unlock_target) }
+    else {
+        _usage()
+        exit(2)
+    }
+    exit(rc)
+}
