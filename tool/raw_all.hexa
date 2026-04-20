@@ -67,6 +67,7 @@
 use "self/core/law_io"
 use "self/raw_loader"
 use "tool/raw_cache"
+use "tool/raw_dag"
 // ─── argv parsing ────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
@@ -156,6 +157,21 @@ fn _run_enforcer(script: string) -> array {
     let rc = r[1]
     let out = to_string(r[0])
     return [rc, _tail_of(out), start_ms]
+}
+
+// Stage0 arrays lack .set() — rebuild with the new plan at idx.
+// Mirrors tool/raw_dag.hexa:_arr_set but typed for the plan tuple
+// (array-of-strings). Used by Phase 1b dep-cascade downgrade.
+fn _arr_set_plan(arr: array, idx: int, val: array) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) }
+        else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
 }
 
 fn _tail_of(out: string) -> string {
@@ -439,12 +455,13 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
     let s0_chk = exec_with_status("test -x ./build/hexa_stage0")
     let s0_ok = s0_chk[1] == 0
 
-    // Phase 1: plan every rule (filter by --only, classify skip/run).
+    // Phase 1a: plan every rule (filter by --only, classify skip/run).
     // `plans[i]` is the plan for `rules[i]`, or ["FILTERED","",""] when
-    // excluded by --only (preserves index alignment).
+    // excluded by --only (preserves index alignment). This pass also
+    // applies the --fast cache fast-path (P1d). Dep-cascade skip (P2a)
+    // is a second pass below so it can observe pre-decided FAIL/MISSING
+    // verdicts regardless of rule declaration order.
     let mut plans = []
-    let mut runnable_idx = []      // indices into `rules` that need enforcer
-    let mut runnable_tasks = []    // [kind, id, script] for batch API
     let mut ri = 0
     while ri < len(rules) {
         let rule = rules[ri]
@@ -471,14 +488,62 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
                         cached = true
                     }
                 }
-                if !cached {
-                    runnable_idx = runnable_idx.push(ri)
-                    runnable_tasks = runnable_tasks.push([kind, id, plan[2]])
-                }
             }
         }
         plans = plans.push(plan)
         ri = ri + 1
+    }
+
+    // Phase 1b (P2a, 2026-04-20): dep-cascade skip — wire raw_dag in.
+    //   Collect pre-decided hard-fail slugs (FAIL, MISSING) from Phase 1a
+    //   plans. Then, for every remaining RUN plan, ask raw_dag whether
+    //   any transitive dep is in the failed set; if so, downgrade to
+    //   SKIPPED_DEP with detail naming the blockers. This only catches
+    //   pre-decided failures (before the batch runs) — it does NOT
+    //   cascade from enforcer-runtime failures, which is a P2b refinement
+    //   requiring topo-chunked batch dispatch (see raw_all header notes).
+    let mut failed_slugs_initial = []
+    let mut fi = 0
+    while fi < len(plans) {
+        let fp = plans[fi]
+        let ftag = fp[0]
+        if ftag == "FAIL" || ftag == "MISSING" {
+            let fslug = keys_first(rules[fi][3], "slug")
+            if fslug != "" { failed_slugs_initial = failed_slugs_initial.push(fslug) }
+        }
+        fi = fi + 1
+    }
+    if len(failed_slugs_initial) > 0 {
+        let mut di = 0
+        while di < len(plans) {
+            let dp = plans[di]
+            if dp[0] == "RUN" {
+                let dslug = keys_first(rules[di][3], "slug")
+                if dslug != "" {
+                    let blockers = blockers_for(dslug, failed_slugs_initial)
+                    if len(blockers) > 0 {
+                        let mut parts = []
+                        for b in blockers { parts = parts.push("raw:" + b) }
+                        let msg = "blocked by: " + parts.join(", ")
+                        plans = _arr_set_plan(plans, di, ["SKIPPED_DEP", msg, "", ""])
+                    }
+                }
+            }
+            di = di + 1
+        }
+    }
+
+    // Phase 1c: collect runnable tasks from the post-cascade plan list.
+    let mut runnable_idx = []      // indices into `rules` that need enforcer
+    let mut runnable_tasks = []    // [kind, id, script] for batch API
+    let mut si = 0
+    while si < len(plans) {
+        let sp = plans[si]
+        if sp[0] == "RUN" {
+            runnable_idx = runnable_idx.push(si)
+            runnable_tasks = runnable_tasks.push([kind, rules[si][0], sp[2]])
+        }
+        si = si + 1
     }
 
     // Phase 2: launch runnable tasks in batches of par_n.
@@ -525,6 +590,7 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
         else if tag == "WARN" { verdict = "WARN"; detail = plan[1] }
         else if tag == "FAIL" { verdict = "FAIL"; detail = plan[1] }
         else if tag == "CACHED" { verdict = "CACHED"; detail = plan[1] }
+        else if tag == "SKIPPED_DEP" { verdict = "SKIPPED_DEP"; detail = plan[1] }
         else if tag == "MISSING" {
             verdict = "MISSING"
             detail = "enforce path not on disk: " + plan[1]
@@ -553,6 +619,7 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
         else if verdict == "PROOF_FAIL" { fail_ct = fail_ct + 1; enforce_ct = enforce_ct + 1 }
         else if verdict == "WARN" { warn_ct = warn_ct + 1 }
         else if verdict == "MISSING" { missing_ct = missing_ct + 1; enforce_ct = enforce_ct + 1 }
+        else if verdict == "SKIPPED_DEP" { skip_ct = skip_ct + 1 }
         else { skip_ct = skip_ct + 1 }
 
         if json {
