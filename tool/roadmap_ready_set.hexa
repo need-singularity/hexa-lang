@@ -1,0 +1,270 @@
+// tool/roadmap_ready_set.hexa — Tier6#53 (roadmap 48): Kahn ready-set
+//
+// PURPOSE
+//   Invariant 1: |R(t)| ≥ 1 (Kahn ready-set never empty while work remains).
+//   Given current status markers (done / active / planned), compute R(t) =
+//   {entries whose depends-on is fully satisfied (all deps done)} that
+//   themselves are NOT yet done.
+//   ALARM if remaining work > 0 AND |R(t)| = 0 — this is deadlock.
+//
+// CLI
+//   hexa tool/roadmap_ready_set.hexa             — current ready set
+//   hexa tool/roadmap_ready_set.hexa --json      — JSON
+//   hexa tool/roadmap_ready_set.hexa --selftest  — invariant check
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _hdr(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let r1 = line.substring(sp1 + 1, len(line))
+    let sp2 = r1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = r1.substring(0, sp2)
+    let r2 = r1.substring(sp2 + 1, len(r1))
+    let sp3 = r2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let st = r2.substring(0, sp3)
+    let mut nm = r2.substring(sp3 + 1, len(r2)).trim()
+    if len(nm) >= 2 && nm.substring(0, 1) == "\"" { nm = nm.substring(1, len(nm) - 1) }
+    return [id, st, nm]
+}
+
+fn parse_roadmap(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut kind = ""
+    let mut cid = ""; let mut cst = ""; let mut cnm = ""; let mut ck = []
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            kind = ""; ck = []
+            continue
+        }
+        let f = line.substring(0, 1)
+        if f == "#" { continue }
+        if f == " " || f == "\t" {
+            if kind == "" { continue }
+            let s = line.trim_start()
+            let sp = s.index_of(" ")
+            if sp < 0 { continue }
+            ck.push([s.substring(0, sp), s.substring(sp + 1, len(s)).trim()])
+        } else {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            ck = []; kind = ""
+            let fs = line.index_of(" ")
+            if fs < 0 { continue }
+            if line.substring(0, fs) == "roadmap" {
+                let h = _hdr(line)
+                if len(h) == 0 { continue }
+                cid = h[0]; cst = h[1]; cnm = h[2]; kind = "r"
+            }
+        }
+    }
+    if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+    return rules
+}
+
+fn _load(path: string) -> array {
+    let r = exec_with_status("test -f '" + path + "'")
+    if r[1] != 0 { return [] }
+    return parse_roadmap(to_string(read_file(path)))
+}
+
+fn _kv(keys: array, k: string) -> string {
+    for kv in keys { if kv[0] == k { return kv[1] } }
+    return ""
+}
+
+fn _is_int(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) { if !d.contains(s.substring(i, i + 1)) { return false } i = i + 1 }
+    return true
+}
+
+fn parse_deps(val: string, default_repo: string) -> array {
+    let mut out = []
+    if len(val) == 0 || val == "—" { return out }
+    let cleaned = val.replace(",", " ").replace("+", " ")
+    let toks = split(cleaned, " ")
+    let mut current = default_repo
+    for raw in toks {
+        let t = raw.trim()
+        if len(t) == 0 { continue }
+        let at = t.index_of("@")
+        if at > 0 && at < len(t) - 1 {
+            let repo = t.substring(0, at)
+            let id = t.substring(at + 1, len(t))
+            if _is_int(id) { out.push([repo, id]); current = repo; continue }
+        }
+        if _is_int(t) { out.push([current, t]) }
+    }
+    return out
+}
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _load_repos() -> array {
+    let home = _home()
+    let mut out = []
+    for r in ["anima", "airgenome", "hexa-lang"] {
+        out.push([r, _load(home + "/core/" + r + "/.roadmap")])
+    }
+    return out
+}
+
+// For all entries in repos:
+//   node is ready iff every dep (same-repo numeric or repo@N) that EXISTS
+//   in the graph has status=done AND node itself is NOT done.
+// Cross-repo dep references to non-existent nodes are treated as "satisfied"
+// (absent node = not blocking — conservative).
+//
+// Returns [ready_set, blocked_set, done_count, remaining_count, deadlock]
+fn compute_ready(repos: array) -> array {
+    // build status map
+    let mut key2status = []
+    for rr in repos {
+        for rule in rr[1] {
+            key2status.push([rr[0] + "#" + rule[0], rule[1]])
+        }
+    }
+    fn _status_of(map: array, k: string) -> string {
+        for p in map { if p[0] == k { return p[1] } }
+        return ""
+    }
+
+    let mut ready = []
+    let mut blocked = []
+    let mut done = 0
+    let mut remaining = 0
+    for rr in repos {
+        let repo = rr[0]
+        for rule in rr[1] {
+            let sk = repo + "#" + rule[0]
+            let st = rule[1]
+            if st == "done" { done = done + 1; continue }
+            remaining = remaining + 1
+            let dep = _kv(rule[3], "depends-on")
+            let parsed = parse_deps(dep, repo)
+            let mut blocker = ""
+            let mut blocking = false
+            for pair in parsed {
+                let tk = pair[0] + "#" + pair[1]
+                let ts = _status_of(key2status, tk)
+                if len(ts) == 0 {
+                    // unknown — skip (absent means not blocking here)
+                    continue
+                }
+                if ts != "done" {
+                    blocking = true
+                    blocker = tk
+                    break
+                }
+            }
+            if blocking { blocked.push([sk, blocker, st]) }
+            else { ready.push([sk, st]) }
+        }
+    }
+    let deadlock = remaining > 0 && len(ready) == 0
+    return [ready, blocked, done, remaining, deadlock]
+}
+
+fn _je(s: string) -> string {
+    let mut o = s.replace("\\", "\\\\")
+    o = o.replace("\"", "\\\"")
+    return o
+}
+
+fn _selftest() -> int {
+    // real graph — should be non-empty ready set (many active/planned)
+    let repos = _load_repos()
+    let r = compute_ready(repos)
+    let ready = r[0]; let blocked = r[1]; let done = r[2]; let rem = r[3]
+    println("ready=" + to_string(len(ready)) + " blocked=" + to_string(len(blocked)) + " done=" + to_string(done) + " remaining=" + to_string(rem))
+    if r[4] == true {
+        eprintln("selftest FAIL: deadlock detected in real graph (|R(t)| = 0 with work remaining)")
+        return 1
+    }
+    if rem > 0 && len(ready) == 0 {
+        eprintln("selftest FAIL: remaining > 0 but ready = 0")
+        return 1
+    }
+    // synthesized deadlock: A depends on B, B depends on A-absent, actually
+    // A depends on X where X is not done → blocked; X not in graph → treated
+    // as absent = not blocking. So synth deadlock: both A and B planned, A
+    // deps B, B deps A — but cycle detected earlier. Use: both planned, A
+    // deps absent nothing, B deps A → A ready, B blocked. So |R|>0.
+    // For true deadlock: single node with unresolved known dep and no ready
+    // starts.
+    let txt = "roadmap 1 active \"a\"\n  track t\n  phase p\n  eta TBD\n  why y\n  depends-on 2\n\nroadmap 2 planned \"b\"\n  track t\n  phase p\n  eta TBD\n  why y\n  depends-on 1\n"
+    let rules = parse_roadmap(txt)
+    let ms = compute_ready([["t", rules]])
+    // A deps 2(planned-not-done) → blocked
+    // B deps 1(active-not-done) → blocked
+    // both blocked → deadlock
+    if ms[4] != true {
+        eprintln("selftest FAIL: synth deadlock not detected")
+        return 1
+    }
+    println("selftest PASS — Kahn invariant |R(t)| ≥ 1 verified")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+    let mut as_json = false
+    let mut j = 0
+    while j < len(args) { if args[j] == "--json" { as_json = true } j = j + 1 }
+
+    let repos = _load_repos()
+    let r = compute_ready(repos)
+    let ready = r[0]; let blocked = r[1]; let done = r[2]; let rem = r[3]
+    if as_json {
+        let mut p = []
+        p.push("{\"ready\":[")
+        let mut first = true
+        for rd in ready {
+            if !first { p.push(",") }
+            p.push("{\"key\":\""); p.push(_je(rd[0])); p.push("\",\"status\":\""); p.push(_je(rd[1])); p.push("\"}")
+            first = false
+        }
+        p.push("],\"blocked\":[")
+        first = true
+        for bl in blocked {
+            if !first { p.push(",") }
+            p.push("{\"key\":\""); p.push(_je(bl[0])); p.push("\",\"blocker\":\""); p.push(_je(bl[1])); p.push("\",\"status\":\""); p.push(_je(bl[2])); p.push("\"}")
+            first = false
+        }
+        p.push("],\"done\":"); p.push(to_string(done))
+        p.push(",\"remaining\":"); p.push(to_string(rem))
+        p.push(",\"deadlock\":"); if r[4] { p.push("true") } else { p.push("false") }
+        p.push("}")
+        println(p.join(""))
+    } else {
+        println("ready = " + to_string(len(ready)))
+        for rd in ready { println("  + " + rd[0] + " [" + rd[1] + "]") }
+        println("blocked = " + to_string(len(blocked)))
+        for bl in blocked { println("  - " + bl[0] + " [" + bl[2] + "] waiting on " + bl[1]) }
+        println("done=" + to_string(done) + " remaining=" + to_string(rem))
+        if r[4] == true { eprintln("ALARM: DEADLOCK — |R(t)| = 0 with work remaining"); exit(1) }
+    }
+}
