@@ -1,0 +1,696 @@
+// tool/roadmap_status.hexa — raw#15 progress view (.roadmap SSOT)
+//
+// Renders an ASCII progress view of the hexa-lang project roadmap, keyed
+// by track × checkpoint. Pure hexa — reads /.roadmap via read_file().
+//
+// usage:
+//   ./hexa run tool/roadmap_status.hexa            — ASCII table
+//   ./hexa run tool/roadmap_status.hexa --json     — machine-readable JSON
+//
+// Modes:
+//   full      — .roadmap declares `checkpoint` blocks → track × CP matrix
+//   fallback  — no checkpoints declared → track × status counts
+//
+// Grammar (excerpt, shared with tool/roadmap_lint.hexa):
+//   roadmap <id> <status> "<name>"        one header + indented key/value pairs
+//   checkpoint <CPID> "<name>"            indented condition/gate/why keys
+//   (per-entry) reaches CP1, CP2          comma/whitespace-list of CP ids
+//   (per-entry) requires CPn              single CP id
+//   (per-entry) verify   CPn              single CP id
+//
+// Exit: 0 on success, 1 on read/parse error.
+
+// ─── string helpers ─────────────────────────────────────────────────
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _pad_right(s: string, w: int) -> string {
+    let mut out = s
+    let mut i = len(s)
+    while i < w {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn _pad_left(s: string, w: int) -> string {
+    let mut out = ""
+    let mut i = len(s)
+    while i < w {
+        out = out + " "
+        i = i + 1
+    }
+    return out + s
+}
+
+// Count display-width columns for a string holding common unicode glyphs
+// (▇, ░, emojis). A rough mapping:
+//   ASCII byte (0x00..0x7F) → 1 col
+//   Non-ASCII lead byte     → scan continuation + emit width
+// We approximate:
+//   3-byte UTF-8 (0xE0..0xEF lead) → 1 col (e.g. ▇, ░, ─)
+//   4-byte UTF-8 (0xF0.. lead)     → 2 col (emoji)
+// Display-char-aware padding is essential for mixed ASCII/unicode cells.
+fn _disp_width(s: string) -> int {
+    let n = len(s)
+    let mut w = 0
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        let b = c.byte_at(0)
+        if b < 128 {
+            w = w + 1
+            i = i + 1
+        } else if b < 224 {
+            w = w + 1
+            i = i + 2
+        } else if b < 240 {
+            w = w + 1
+            i = i + 3
+        } else {
+            w = w + 2
+            i = i + 4
+        }
+    }
+    return w
+}
+
+fn _pad_right_disp(s: string, w: int) -> string {
+    let dw = _disp_width(s)
+    let mut out = s
+    let mut i = dw
+    while i < w {
+        out = out + " "
+        i = i + 1
+    }
+    return out
+}
+
+fn _pad_left_disp(s: string, w: int) -> string {
+    let dw = _disp_width(s)
+    let mut out = ""
+    let mut i = dw
+    while i < w {
+        out = out + " "
+        i = i + 1
+    }
+    return out + s
+}
+
+// ─── parser (mirrors tool/roadmap_lint.hexa) ────────────────────────
+
+fn _parse_roadmap_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _parse_checkpoint_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "checkpoint" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let mut name = rest1.substring(sp2 + 1, len(rest1)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, name]
+}
+
+// Parse .roadmap text into [rules, checkpoints].
+//   rules        = array of [id, status, name, keys]
+//   checkpoints  = array of [id, name, keys]
+fn _parse_roadmap_text(src: string) -> array {
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut checkpoints = []
+
+    let mut kind = ""
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+            } else if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            kind = ""
+            cur_keys = []
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if kind == "" { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys = cur_keys.push([key, val])
+        } else {
+            if kind == "r" {
+                rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+            } else if kind == "c" {
+                checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+            }
+            cur_keys = []
+            kind = ""
+
+            let first_sp = line.index_of(" ")
+            if first_sp < 0 { continue }
+            let tok = line.substring(0, first_sp)
+            if tok == "roadmap" {
+                let hdr = _parse_roadmap_header(line)
+                if len(hdr) == 0 { continue }
+                cur_id = hdr[0]
+                cur_status = hdr[1]
+                cur_name = hdr[2]
+                kind = "r"
+            } else if tok == "checkpoint" {
+                let chdr = _parse_checkpoint_header(line)
+                if len(chdr) == 0 { continue }
+                cur_id = chdr[0]
+                cur_name = chdr[1]
+                kind = "c"
+            }
+        }
+    }
+    if kind == "r" {
+        rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
+    } else if kind == "c" {
+        checkpoints = checkpoints.push([cur_id, cur_name, cur_keys])
+    }
+    return [rules, checkpoints]
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+// Split `reaches CP1, CP2` value into trimmed id tokens.
+fn _split_cp_list(val: string) -> array {
+    let parts = split(val, ",")
+    let mut out = []
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out = out.push(t) }
+    }
+    return out
+}
+
+// ─── rendering helpers ──────────────────────────────────────────────
+
+// Render a [n/d] fill bar of width w as ▇ + ░. d=0 → centered "---".
+fn _bar(n: int, d: int, w: int) -> string {
+    if d == 0 {
+        let pad_total = w - 3
+        let left = pad_total / 2
+        let right = pad_total - left
+        let mut out = ""
+        let mut i = 0
+        while i < left { out = out + " "; i = i + 1 }
+        out = out + "---"
+        let mut j = 0
+        while j < right { out = out + " "; j = j + 1 }
+        return out
+    }
+    // fill = round(n * w / d)
+    let mut fill = (n * w + d / 2) / d
+    if fill < 0 { fill = 0 }
+    if fill > w { fill = w }
+    let mut out = ""
+    let mut i = 0
+    while i < fill { out = out + "▇"; i = i + 1 }
+    while i < w { out = out + "░"; i = i + 1 }
+    return out
+}
+
+// Integer percent from (n, d). Returns 0 if d=0.
+fn _pct(n: int, d: int) -> int {
+    if d == 0 { return 0 }
+    return (n * 100 + d / 2) / d
+}
+
+fn _repeat_char(c: string, n: int) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < n { out = out + c; i = i + 1 }
+    return out
+}
+
+// ─── track extraction / sorting ─────────────────────────────────────
+
+// Compare two ASCII strings byte-wise: -1 if a<b, 0 if eq, +1 if a>b.
+// String `<` is not reliably available in stage0, so we substring + byte_at.
+fn _str_cmp(a: string, b: string) -> int {
+    let na = len(a)
+    let nb = len(b)
+    let mut i = 0
+    while i < na && i < nb {
+        let ba = a.byte_at(i)
+        let bb = b.byte_at(i)
+        if ba < bb { return -1 }
+        if ba > bb { return 1 }
+        i = i + 1
+    }
+    if na < nb { return -1 }
+    if na > nb { return 1 }
+    return 0
+}
+
+// Sorted unique tracks present in rules. `unknown` for entries missing track.
+fn _unique_tracks(rules: array) -> array {
+    let mut tracks = []
+    for r in rules {
+        let t = _keys_first(r[3], "track")
+        let tt = if len(t) == 0 { "unknown" } else { t }
+        let mut seen = false
+        for x in tracks {
+            if x == tt { seen = true }
+        }
+        if !seen { tracks = tracks.push(tt) }
+    }
+    // selection sort — n is tiny (tracks ≤ ~10 in practice).
+    let n = len(tracks)
+    let mut sorted = []
+    let mut used = []
+    let mut k = 0
+    while k < n { used = used.push(false); k = k + 1 }
+    let mut picked = 0
+    while picked < n {
+        let mut best_idx = -1
+        let mut best = ""
+        let mut i = 0
+        while i < n {
+            if !used[i] {
+                if best_idx < 0 || _str_cmp(tracks[i], best) < 0 {
+                    best_idx = i
+                    best = tracks[i]
+                }
+            }
+            i = i + 1
+        }
+        sorted = sorted.push(tracks[best_idx])
+        let mut new_used = []
+        let mut j = 0
+        while j < n {
+            if j == best_idx { new_used = new_used.push(true) }
+            else { new_used = new_used.push(used[j]) }
+            j = j + 1
+        }
+        used = new_used
+        picked = picked + 1
+    }
+    return sorted
+}
+
+// ─── JSON helpers ───────────────────────────────────────────────────
+
+fn _json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── main ───────────────────────────────────────────────────────────
+
+fn _roadmap_path() -> string {
+    let p = env("PWD")
+    if p == "" { return ".roadmap" }
+    return p + "/.roadmap"
+}
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli = cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut json_mode = false
+for a in cli {
+    if a == "--json" { json_mode = true }
+}
+
+let path = _roadmap_path()
+if !file_exists(path) {
+    println("[roadmap_status] .roadmap not found at " + path)
+    exit(1)
+}
+
+let src = read_file(path)
+let parsed = _parse_roadmap_text(src)
+let rules = parsed[0]
+let checkpoints = parsed[1]
+
+if len(rules) == 0 {
+    println("[roadmap_status] .roadmap parsed 0 entries")
+    exit(1)
+}
+
+let tracks = _unique_tracks(rules)
+let has_cp = len(checkpoints) > 0
+
+if json_mode {
+    // JSON emission
+    print("{")
+    print("\"mode\":")
+    if has_cp { print("\"full\"") } else { print("\"fallback\"") }
+    print(",\"checkpoints\":[")
+    let mut ci = 0
+    while ci < len(checkpoints) {
+        let cp = checkpoints[ci]
+        if ci > 0 { print(",") }
+        print("{\"id\":\"" + _json_escape(cp[0]) + "\"")
+        print(",\"name\":\"" + _json_escape(cp[1]) + "\"")
+        print(",\"condition\":\"" + _json_escape(_keys_first(cp[2], "condition")) + "\"")
+        print(",\"gate\":\"" + _json_escape(_keys_first(cp[2], "gate")) + "\"")
+        print(",\"why\":\"" + _json_escape(_keys_first(cp[2], "why")) + "\"}")
+        ci = ci + 1
+    }
+    print("],\"tracks\":{")
+    let mut ti = 0
+    while ti < len(tracks) {
+        let tr = tracks[ti]
+        if ti > 0 { print(",") }
+        print("\"" + _json_escape(tr) + "\":{")
+
+        // total entries for this track
+        let mut t_total = 0
+        let mut t_done = 0
+        for r in rules {
+            let rt = _keys_first(r[3], "track")
+            let rtr = if len(rt) == 0 { "unknown" } else { rt }
+            if rtr != tr { continue }
+            t_total = t_total + 1
+            if r[1] == "done" { t_done = t_done + 1 }
+        }
+        print("\"overall\":{\"done\":" + to_string(t_done))
+        print(",\"total\":" + to_string(t_total))
+        print(",\"pct\":" + to_string(_pct(t_done, t_total)) + "}")
+
+        if has_cp {
+            print(",\"cp\":{")
+            let mut cj = 0
+            while cj < len(checkpoints) {
+                let cpid = checkpoints[cj][0]
+                if cj > 0 { print(",") }
+                let mut d_cnt = 0
+                let mut t_cnt = 0
+                for r in rules {
+                    let rt = _keys_first(r[3], "track")
+                    let rtr = if len(rt) == 0 { "unknown" } else { rt }
+                    if rtr != tr { continue }
+                    let reaches_val = _keys_first(r[3], "reaches")
+                    if len(reaches_val) == 0 { continue }
+                    let cps = _split_cp_list(reaches_val)
+                    let mut hit = false
+                    for x in cps {
+                        if x == cpid { hit = true }
+                    }
+                    if !hit { continue }
+                    t_cnt = t_cnt + 1
+                    if r[1] == "done" { d_cnt = d_cnt + 1 }
+                }
+                print("\"" + _json_escape(cpid) + "\":{\"done\":" + to_string(d_cnt))
+                print(",\"total\":" + to_string(t_cnt))
+                print(",\"pct\":" + to_string(_pct(d_cnt, t_cnt)) + "}")
+                cj = cj + 1
+            }
+            print("}")
+        } else {
+            // per-status counts
+            let statuses = ["done", "active", "blocked", "planned", "deferred"]
+            print(",\"status\":{")
+            let mut sk = 0
+            while sk < len(statuses) {
+                let st = statuses[sk]
+                if sk > 0 { print(",") }
+                let mut cnt = 0
+                for r in rules {
+                    let rt = _keys_first(r[3], "track")
+                    let rtr = if len(rt) == 0 { "unknown" } else { rt }
+                    if rtr != tr { continue }
+                    if r[1] == st { cnt = cnt + 1 }
+                }
+                print("\"" + st + "\":" + to_string(cnt))
+                sk = sk + 1
+            }
+            print("}")
+        }
+        print("}")
+        ti = ti + 1
+    }
+    print("}}")
+    println("")
+    exit(0)
+}
+
+// ─── ASCII rendering ────────────────────────────────────────────────
+
+// Common pre-work: global totals
+let mut g_total = 0
+let mut g_done = 0
+for r in rules {
+    g_total = g_total + 1
+    if r[1] == "done" { g_done = g_done + 1 }
+}
+
+// track column width — widen for readability
+let mut track_w = 5   // "track"
+for t in tracks {
+    if len(t) > track_w { track_w = len(t) }
+}
+if track_w < 11 { track_w = 11 }
+
+if has_cp {
+    // Legend block — cp[1] already carries the icon (e.g. "🦴 ossification").
+    let mut li = 0
+    while li < len(checkpoints) {
+        let cp = checkpoints[li]
+        let cond = _keys_first(cp[2], "condition")
+        println("  " + _pad_right_disp(cp[0], 6) + " " + _pad_right_disp(cp[1], 18) + " — " + cond)
+        li = li + 1
+    }
+    println("")
+
+    // Table header. Bar cells hold 10 glyph-block chars (▇/░ = 3 bytes each
+    // in UTF-8), so we budget 30 bytes + 4 spacing = 34 bytes per cp column.
+    // The ASCII column label (e.g. "🦴 CP1") also carries multi-byte icons;
+    // we pad to 34 bytes to keep alignment roughly stable across rows.
+    // Display-width budget: bar = 10 glyph-cols, cell width = 12 (2 col pad).
+    let cp_col_w = 12
+    let pct_col_w = 9
+    let mut header = "  " + _pad_right_disp("track", track_w)
+    let mut ci = 0
+    while ci < len(checkpoints) {
+        let cp = checkpoints[ci]
+        // cp[1] = e.g. "🦴 ossification" — extract icon = up to first space.
+        let mut icon = "•"
+        let sp = cp[1].index_of(" ")
+        if sp > 0 { icon = cp[1].substring(0, sp) }
+        header = header + " " + _pad_right_disp(icon + " " + cp[0], cp_col_w)
+        ci = ci + 1
+    }
+    header = header + " " + _pad_left_disp("progress", pct_col_w)
+    println(header)
+
+    // Separator row — ─ is a 3-byte 1-col glyph; each iteration emits `w` glyphs.
+    let mut sep = "  " + _repeat_char("─", track_w)
+    let mut si = 0
+    while si < len(checkpoints) {
+        sep = sep + " " + _repeat_char("─", cp_col_w)
+        si = si + 1
+    }
+    sep = sep + " " + _repeat_char("─", pct_col_w)
+    println(sep)
+
+    // Rows
+    for tr in tracks {
+        let mut row = "  " + _pad_right_disp(tr, track_w)
+        let mut t_total = 0
+        let mut t_done = 0
+        let mut cj = 0
+        while cj < len(checkpoints) {
+            let cpid = checkpoints[cj][0]
+            let mut d_cnt = 0
+            let mut t_cnt = 0
+            for r in rules {
+                let rt = _keys_first(r[3], "track")
+                let rtr = if len(rt) == 0 { "unknown" } else { rt }
+                if rtr != tr { continue }
+                let reaches_val = _keys_first(r[3], "reaches")
+                if len(reaches_val) == 0 { continue }
+                let cps = _split_cp_list(reaches_val)
+                let mut hit = false
+                for x in cps {
+                    if x == cpid { hit = true }
+                }
+                if !hit { continue }
+                t_cnt = t_cnt + 1
+                if r[1] == "done" { d_cnt = d_cnt + 1 }
+            }
+            let bar = _bar(d_cnt, t_cnt, 10)
+            row = row + " " + _pad_right_disp(bar, cp_col_w)
+            cj = cj + 1
+        }
+        // per-track overall %
+        for r in rules {
+            let rt = _keys_first(r[3], "track")
+            let rtr = if len(rt) == 0 { "unknown" } else { rt }
+            if rtr != tr { continue }
+            t_total = t_total + 1
+            if r[1] == "done" { t_done = t_done + 1 }
+        }
+        let pct = _pct(t_done, t_total)
+        row = row + " " + _pad_left_disp(to_string(pct) + "%", pct_col_w)
+        println(row)
+    }
+
+    // Footer
+    println(sep)
+    let mut footer = "  " + _pad_right_disp("ALL", track_w)
+    let mut fi = 0
+    while fi < len(checkpoints) {
+        footer = footer + " " + _pad_right_disp("", cp_col_w)
+        fi = fi + 1
+    }
+    footer = footer + " " + _pad_left_disp(to_string(_pct(g_done, g_total)) + "%", pct_col_w)
+    println(footer)
+} else {
+    // Fallback mode
+    println("(no checkpoints declared — fallback mode)")
+    println("")
+
+    let w_done = 5
+    let w_active = 7
+    let w_blocked = 8
+    let w_planned = 8
+    let w_deferred = 9
+    let w_total = 6
+
+    let mut header = "  " + _pad_right("track", track_w)
+    header = header + " " + _pad_right("done", w_done)
+    header = header + " " + _pad_right("active", w_active)
+    header = header + " " + _pad_right("blocked", w_blocked)
+    header = header + " " + _pad_right("planned", w_planned)
+    header = header + " " + _pad_right("deferred", w_deferred)
+    header = header + " " + _pad_right("total", w_total)
+    println(header)
+
+    let sep = "  " + _repeat_char("─", track_w)
+        + " " + _repeat_char("─", w_done)
+        + " " + _repeat_char("─", w_active)
+        + " " + _repeat_char("─", w_blocked)
+        + " " + _repeat_char("─", w_planned)
+        + " " + _repeat_char("─", w_deferred)
+        + " " + _repeat_char("─", w_total)
+    println(sep)
+
+    // per-track cells
+    let mut sum_done = 0
+    let mut sum_active = 0
+    let mut sum_blocked = 0
+    let mut sum_planned = 0
+    let mut sum_deferred = 0
+    let mut sum_total = 0
+
+    for tr in tracks {
+        let mut c_done = 0
+        let mut c_active = 0
+        let mut c_blocked = 0
+        let mut c_planned = 0
+        let mut c_deferred = 0
+        let mut c_total = 0
+        for r in rules {
+            let rt = _keys_first(r[3], "track")
+            let rtr = if len(rt) == 0 { "unknown" } else { rt }
+            if rtr != tr { continue }
+            c_total = c_total + 1
+            if r[1] == "done"     { c_done = c_done + 1 }
+            else if r[1] == "active"   { c_active = c_active + 1 }
+            else if r[1] == "blocked"  { c_blocked = c_blocked + 1 }
+            else if r[1] == "planned"  { c_planned = c_planned + 1 }
+            else if r[1] == "deferred" { c_deferred = c_deferred + 1 }
+        }
+        sum_done = sum_done + c_done
+        sum_active = sum_active + c_active
+        sum_blocked = sum_blocked + c_blocked
+        sum_planned = sum_planned + c_planned
+        sum_deferred = sum_deferred + c_deferred
+        sum_total = sum_total + c_total
+
+        let row = "  " + _pad_right(tr, track_w)
+            + " " + _pad_right(to_string(c_done), w_done)
+            + " " + _pad_right(to_string(c_active), w_active)
+            + " " + _pad_right(to_string(c_blocked), w_blocked)
+            + " " + _pad_right(to_string(c_planned), w_planned)
+            + " " + _pad_right(to_string(c_deferred), w_deferred)
+            + " " + _pad_right(to_string(c_total), w_total)
+        println(row)
+    }
+
+    println(sep)
+    let footer = "  " + _pad_right("ALL", track_w)
+        + " " + _pad_right(to_string(sum_done), w_done)
+        + " " + _pad_right(to_string(sum_active), w_active)
+        + " " + _pad_right(to_string(sum_blocked), w_blocked)
+        + " " + _pad_right(to_string(sum_planned), w_planned)
+        + " " + _pad_right(to_string(sum_deferred), w_deferred)
+        + " " + _pad_right(to_string(sum_total), w_total)
+    println(footer)
+}
+
+exit(0)
