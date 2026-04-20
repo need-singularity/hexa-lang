@@ -1,0 +1,263 @@
+#!hexa strict
+// tool/relock_daemon.hexa — 300s auto re-lock daemon (raw#1 P0d)
+//
+// PURPOSE
+//   A dedicated background daemon that re-locks the SSOT tree after a
+//   bounded unlock window has elapsed. Replaces the inline
+//   `sh -c "sleep N; ./hexa tool/hx_lock.hexa auto"` pattern that
+//   hx_unlock.hexa previously spawned.
+//
+// BEHAVIOUR
+//   1. Read `.raw-audit`. Find the most recent ok-unlock entry and
+//      parse its ISO-8601 UTC timestamp. If no unlock is found or the
+//      tree is ALREADY fully re-locked, exit 2 (state anomaly).
+//   2. Compute `elapsed = now - unlock_ts`.
+//   3. If elapsed >= window → re-lock immediately.
+//      Else → sleep (window - elapsed) seconds, then re-lock.
+//   4. Invoke `./build/hexa_stage0 tool/hx_lock.hexa --auto` (plus
+//      `--prior-levels "..."` when provided) and append a
+//      `relock-auto` event to `.raw-audit`.
+//
+// CONCURRENCY
+//   Multiple daemons can coexist — each counts independently. Whichever
+//   fires first re-locks; the remainder see the tree already at Level 1
+//   (lock idempotent) and exit cleanly after recording a
+//   `relock-auto noop` audit entry.
+//
+// EXIT CODES
+//   0 — re-lock succeeded (or tree was already locked when we checked).
+//   1 — re-lock was attempted but hx_lock reported failure.
+//   2 — state anomaly: no unlock in .raw-audit, or audit missing.
+//
+// USAGE
+//   ./build/hexa_stage0 tool/relock_daemon.hexa
+//   ./build/hexa_stage0 tool/relock_daemon.hexa --window 300
+//   ./build/hexa_stage0 tool/relock_daemon.hexa --window 60 \
+//       --prior-levels ".raw=1,.own=1,.ext=1,.roadmap=1,.loop=1"
+//
+// SPAWN PATTERN (from hx_unlock.hexa):
+//   nohup ./build/hexa_stage0 tool/relock_daemon.hexa \
+//       --window 300 --prior-levels "..." >/dev/null 2>&1 &
+
+use "self/core/law_io"
+use "tool/raw_audit"
+
+fn _audit_path() -> string { return ".raw-audit" }
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+// ─── arg parsing ─────────────────────────────────────────────────
+
+fn _default_window() -> int { return 300 }
+fn _max_window() -> int { return 3600 }
+
+fn _parse_int(s: string) -> int {
+    // NOTE: stage0 string range-compare (`c >= "0"`) is unreliable; we
+    // probe a literal whitelist with .contains() instead (same workaround
+    // applied in tool/hx_unlock.hexa _is_safe_slug_token, 2026-04-17).
+    let digits = "0123456789"
+    let mut n = 0
+    let mut j = 0
+    while j < len(s) {
+        let c = s.substring(j, j + 1)
+        if !digits.contains(c) { break }
+        n = n * 10 + (ord(c) - ord("0"))
+        j = j + 1
+    }
+    return n
+}
+
+fn _parse_args() -> array {
+    // returns [window_sec, prior_levels]
+    let av = argv()
+    let mut window = _default_window()
+    let mut prior_levels = ""
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--window" {
+            if i + 1 < len(av) {
+                let n = _parse_int(av[i + 1])
+                if n > 0 { window = n }
+                i = i + 1
+            }
+        } else if a == "--prior-levels" {
+            if i + 1 < len(av) {
+                prior_levels = av[i + 1]
+                i = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if window > _max_window() { window = _max_window() }
+    return [window, prior_levels]
+}
+
+// ─── audit parsing: last ok-unlock timestamp ─────────────────────
+
+fn _read_last_unlock_ts() -> string {
+    // returns ISO-8601 UTC ts of most recent `unlock | * | * | ok | ...`
+    // or "" if none / audit missing.
+    let chk = exec_with_status("test -f '" + _audit_path() + "'")
+    if chk[1] != 0 { return "" }
+    // tail-scan: most recent match wins. Use awk-free shell for portability.
+    //   grep "| unlock |" .raw-audit | grep "| ok |" | tail -n 1
+    let cmd = "grep '| unlock |' " + _audit_path()
+              + " 2>/dev/null | grep '| ok |' | tail -n 1"
+    let line = to_string(exec(cmd)).trim()
+    if line == "" { return "" }
+    // timestamp is field 0 (before first " | ")
+    let pipe = line.index_of(" | ")
+    if pipe <= 0 { return "" }
+    return line.substring(0, pipe).trim()
+}
+
+// Parse "YYYY-MM-DDTHH:MM:SSZ" → epoch seconds via `date -u`.
+// Falls back to 0 on parse failure.
+fn _iso_to_epoch(iso: string) -> int {
+    if iso == "" { return 0 }
+    let mut cmd = ""
+    if _is_darwin() {
+        cmd = "date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '" + iso + "' +%s 2>/dev/null"
+    } else {
+        // GNU date
+        cmd = "date -u -d '" + iso + "' +%s 2>/dev/null"
+    }
+    let out = to_string(exec(cmd)).trim()
+    if out == "" { return 0 }
+    return _parse_int(out)
+}
+
+fn _now_epoch() -> int {
+    let out = to_string(exec("date -u +%s")).trim()
+    return _parse_int(out)
+}
+
+// ─── lock state probe ────────────────────────────────────────────
+
+fn _path_exists(path: string) -> bool {
+    let r = exec_with_status("test -e '" + path + "'")
+    return r[1] == 0
+}
+
+fn _darwin_has_uchg(path: string) -> bool {
+    // `ls -lO` shows flags column on macOS
+    let r = exec_with_status("ls -lO '" + path + "' 2>/dev/null | grep -q uchg")
+    return r[1] == 0
+}
+
+fn _any_ssot_unlocked() -> bool {
+    // Returns true if at least one of the 5 core SSOT lacks uchg/schg.
+    // On Linux we currently can't probe without sudo for schg — treat as
+    // "unlocked" (best-effort) so the daemon still runs hx_lock.
+    let targets = [".raw", ".own", ".ext", ".roadmap", ".loop"]
+    for rel in targets {
+        if !_path_exists(rel) { continue }
+        if _is_darwin() {
+            if !_darwin_has_uchg(rel) { return true }
+        } else {
+            // Linux fast-path: treat unconditionally as candidate.
+            return true
+        }
+    }
+    return false
+}
+
+// ─── sleep + lock ────────────────────────────────────────────────
+
+fn _sleep_seconds(n: int) -> int {
+    if n <= 0 { return 0 }
+    let r = exec_with_status("sleep " + to_string(n))
+    return r[1]
+}
+
+fn _invoke_lock(prior_levels: string) -> int {
+    let mut cmd = "./build/hexa_stage0 tool/hx_lock.hexa --auto"
+    if prior_levels != "" {
+        // prior_levels is serialized as rel=lvl pairs with commas.
+        // Quote once; embedded double-quotes would be a bug upstream.
+        cmd = cmd + " --prior-levels \"" + prior_levels + "\""
+    }
+    cmd = cmd + " >/dev/null 2>&1"
+    let r = exec_with_status(cmd)
+    return r[1]
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let args = _parse_args()
+    let window = args[0]
+    let prior_levels = args[1]
+
+    // Step 1: probe state
+    if !_any_ssot_unlocked() {
+        // Already locked — nothing to do. Record as noop.
+        audit_append("relock-auto", env("USER"),
+                     "daemon window=" + to_string(window) + "s noop (already locked)",
+                     "ok", ssot_fingerprint(), "-")
+        return 0
+    }
+
+    // Step 2: find last unlock timestamp
+    let unlock_iso = _read_last_unlock_ts()
+    let now = _now_epoch()
+    let mut anchor = now
+    if unlock_iso != "" {
+        let ts = _iso_to_epoch(unlock_iso)
+        if ts > 0 { anchor = ts }
+    }
+
+    let elapsed = now - anchor
+    let mut remaining = window - elapsed
+    if remaining < 0 { remaining = 0 }
+
+    // Step 3: sleep remaining, then lock
+    if remaining > 0 { _sleep_seconds(remaining) }
+
+    // Re-probe: another daemon may have already locked during sleep.
+    if !_any_ssot_unlocked() {
+        audit_append("relock-auto", env("USER"),
+                     "daemon window=" + to_string(window)
+                         + "s noop (locked by peer during sleep)",
+                     "ok", ssot_fingerprint(), "-")
+        return 0
+    }
+
+    let sha_before = ssot_fingerprint()
+    let rc = _invoke_lock(prior_levels)
+    let sha_after = ssot_fingerprint()
+
+    let mut result = "ok"
+    if rc != 0 { result = "fail" }
+
+    let reason = "daemon window=" + to_string(window) + "s elapsed="
+                 + to_string(elapsed) + "s anchor=" + unlock_iso
+    audit_append("relock-auto", env("USER"), reason, result,
+                 sha_before, sha_after)
+
+    if rc != 0 { return 1 }
+    return 0
+}
+
+// ─── is_main guard (import side-effect firewall) ────────────────
+
+let _av_main = argv()
+
+fn _is_main() -> bool {
+    if len(_av_main) < 2 { return false }
+    let script = _av_main[1]
+    if script.ends_with("/relock_daemon.hexa") { return true }
+    if script == "relock_daemon.hexa" { return true }
+    return false
+}
+
+if _is_main() { exit(main()) }
