@@ -38,10 +38,14 @@
 //   ./hexa tool/hx_unlock.hexa --reason "fix typo" --window 60
 //   ./hexa tool/hx_unlock.hexa --reason "demo"  \
 //        --exclude raw:self-host-fixpoint      # pass-through to raw_all
+//        --roadmap-ref 9                       # mandatory with --exclude/--fast
 //   --exclude raw:<slug> is repeatable; each entry instructs raw_all to
 //   treat that rule as SKIP with detail="excluded via --exclude". Used
 //   when a specific enforcer is structurally broken (seed-freeze, etc.)
 //   and the ceremony still needs to proceed.
+//   --roadmap-ref <id> (raw#15, 2026-04-20) — required whenever
+//   --exclude is used, forwarded verbatim to raw_all. id must resolve in
+//   /.roadmap with status ∈ {active, blocked}.
 //
 // SUDO FAILURE
 //   If target is at L2 and `sudo -n true` fails, hx_unlock prints:
@@ -73,15 +77,19 @@ fn _max_window() -> int { return 3600 }
 // ─── arg parsing ─────────────────────────────────────────────────
 
 fn _parse_args() -> array {
-    // returns [reason, actor, window_sec, ok, excludes(array-of-strings)]
+    // returns [reason, actor, window_sec, ok, excludes(array-of-strings),
+    //          roadmap_ref(string)]
     //
     // --exclude raw:<slug> is repeatable; entries are forwarded verbatim
     // to raw_all so matching rules appear as SKIP (excluded via --exclude).
+    // --roadmap-ref <id> (raw#15, 2026-04-20): passed through to raw_all;
+    // raw_all rejects --exclude/--fast without it.
     let av = argv()
     let mut reason = ""
     let mut actor = ""
     let mut window = _default_window()
     let mut excludes = []
+    let mut roadmap_ref = ""
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -93,6 +101,11 @@ fn _parse_args() -> array {
             if i + 1 < len(av) {
                 let tok = av[i + 1]
                 if tok != "" { excludes = excludes.push(tok) }
+                i = i + 1
+            }
+        } else if a == "--roadmap-ref" {
+            if i + 1 < len(av) {
+                roadmap_ref = av[i + 1]
                 i = i + 1
             }
         } else if a == "--window" {
@@ -119,18 +132,21 @@ fn _parse_args() -> array {
     }
     if window > _max_window() { window = _max_window() }
     let ok = reason != ""
-    return [reason, actor, window, ok, excludes]
+    return [reason, actor, window, ok, excludes, roadmap_ref]
 }
 
 fn _usage() {
-    eprintln("usage: hexa tool/hx_unlock.hexa --reason \"<text>\" [--actor NAME] [--window SEC] [--exclude raw:<slug>]...")
+    eprintln("usage: hexa tool/hx_unlock.hexa --reason \"<text>\" [--actor NAME] [--window SEC] [--exclude raw:<slug>]... [--roadmap-ref <id>]")
     eprintln("")
-    eprintln("  --reason   mandatory. Written verbatim to .raw-audit.")
-    eprintln("  --actor    defaults to $USER.")
-    eprintln("  --window   seconds until auto re-lock (default 300, max 3600).")
-    eprintln("  --exclude  raw:<slug> — skip a specific enforcer in the gate")
-    eprintln("             run (repeatable). Used when an enforcer is")
-    eprintln("             structurally broken (e.g. seed-freeze).")
+    eprintln("  --reason        mandatory. Written verbatim to .raw-audit.")
+    eprintln("  --actor         defaults to $USER.")
+    eprintln("  --window        seconds until auto re-lock (default 300, max 3600).")
+    eprintln("  --exclude       raw:<slug> — skip a specific enforcer in the gate")
+    eprintln("                  run (repeatable). Used when an enforcer is")
+    eprintln("                  structurally broken (e.g. seed-freeze).")
+    eprintln("  --roadmap-ref   roadmap milestone id that justifies a bypass.")
+    eprintln("                  REQUIRED when --exclude is used (raw#15).")
+    eprintln("                  Must exist in /.roadmap with status active|blocked.")
     eprintln("")
     eprintln("  raw_all must return exit 0 — no --force override.")
     eprintln("  Escape hatch: tool/emergency/raw_reset.sh (sudo required).")
@@ -138,16 +154,25 @@ fn _usage() {
 
 // ─── gate ────────────────────────────────────────────────────────
 
-fn _run_raw_all(excludes: array) -> int {
-    // Pass through --exclude raw:<slug> to raw_all. Tokens are validated
-    // to slug shape (alnum + dash + colon only) so they are safe to
-    // concatenate into the command line without quoting.
+fn _run_raw_all(excludes: array, roadmap_ref: string) -> int {
+    // Pass through --exclude raw:<slug> and --roadmap-ref <id> to raw_all.
+    // Tokens are validated to slug shape (alnum + dash + colon only) so
+    // they are safe to concatenate into the command line without quoting.
+    // roadmap_ref is validated to [A-Za-z0-9_-] only (roadmap ids are
+    // numeric today but the scheme is reserved for future slugs).
     let mut ex_args = ""
     for ex in excludes {
         if _is_safe_slug_token(ex) {
             ex_args = ex_args + " --exclude " + ex
         } else {
             eprintln("hx_unlock: WARN — ignoring malformed --exclude token: " + ex)
+        }
+    }
+    if roadmap_ref != "" {
+        if _is_safe_roadmap_id(roadmap_ref) {
+            ex_args = ex_args + " --roadmap-ref " + roadmap_ref
+        } else {
+            eprintln("hx_unlock: WARN — ignoring malformed --roadmap-ref token: " + roadmap_ref)
         }
     }
     let cmd = "./build/hexa_stage0 tool/raw_all.hexa" + ex_args + " 2>&1"
@@ -158,17 +183,38 @@ fn _run_raw_all(excludes: array) -> int {
     return r[1]
 }
 
-fn _is_safe_slug_token(s: string) -> bool {
-    // allowed chars: a-z A-Z 0-9 - _ : (for "raw:self-host-fixpoint" style)
+// stage0 string range-compare (`c >= "a"`) is unreliable on this build —
+// use .contains() against an explicit whitelist instead (mirrors the
+// fix applied in self/raw_loader.hexa _fmt_is_ident_char, 2026-04-17).
+fn _safe_slug_charset() -> string {
+    return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_:"
+}
+
+fn _safe_roadmap_id_charset() -> string {
+    return "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_"
+}
+
+fn _is_safe_roadmap_id(s: string) -> bool {
+    // allowed: a-z A-Z 0-9 - _  (no colon — roadmap ids are plain).
     if s == "" { return false }
+    let allowed = _safe_roadmap_id_charset()
     let mut i = 0
     while i < len(s) {
         let c = s.substring(i, i + 1)
-        let ok = (c >= "a" && c <= "z")
-                 || (c >= "A" && c <= "Z")
-                 || (c >= "0" && c <= "9")
-                 || c == "-" || c == "_" || c == ":"
-        if !ok { return false }
+        if !allowed.contains(c) { return false }
+        i = i + 1
+    }
+    return true
+}
+
+fn _is_safe_slug_token(s: string) -> bool {
+    // allowed chars: a-z A-Z 0-9 - _ : (for "raw:self-host-fixpoint" style)
+    if s == "" { return false }
+    let allowed = _safe_slug_charset()
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if !allowed.contains(c) { return false }
         i = i + 1
     }
     return true
@@ -276,6 +322,7 @@ fn main() -> int {
     let window = args[2]
     let ok = args[3]
     let excludes = args[4]
+    let roadmap_ref = args[5]
 
     if !ok {
         _usage()
@@ -296,6 +343,9 @@ fn main() -> int {
         for ex in excludes { parts = parts.push(ex) }
         println("exclude: " + parts.join(", "))
     }
+    if roadmap_ref != "" {
+        println("roadmap-ref: " + roadmap_ref)
+    }
     println("")
 
     // fingerprint BEFORE raw_all (we want the pre-unlock state hash)
@@ -307,7 +357,7 @@ fn main() -> int {
 
     // gate — raw_all must pass
     println("── gate: raw_all ──")
-    let rc = _run_raw_all(excludes)
+    let rc = _run_raw_all(excludes, roadmap_ref)
     if rc != 0 {
         eprintln("")
         eprintln("hx_unlock: refused — raw_all exit=" + to_string(rc))

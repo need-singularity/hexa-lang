@@ -20,6 +20,11 @@
 //                                               (repeatable; matching rules
 //                                                emit SKIP with
 //                                                detail="excluded via --exclude")
+//   ./hexa tool/raw_all.hexa --roadmap-ref <id>    — roadmap milestone id that
+//                                                    justifies the bypass (required
+//                                                    when --exclude or --fast used).
+//                                                    Must exist in .roadmap with
+//                                                    status ∈ {active, blocked}.
 //
 // PARALLELISM (P7a, 2026-04-20)
 //   17 enforcers run in parallel batches of N (default 4), controlled by
@@ -70,19 +75,26 @@
 
 use "self/core/law_io"
 use "self/raw_loader"
+use "tool/raw_audit"
 use "tool/raw_cache"
 use "tool/raw_dag"
 // ─── argv parsing ────────────────────────────────────────────────
 
 fn _parse_flags() -> array {
     // returns [fast(bool), json(bool), only_kind(string), only_id(string),
-    //          serial(bool), excludes(array-of-slug-strings)]
+    //          serial(bool), excludes(array-of-slug-strings),
+    //          roadmap_ref(string)]
     //
     // --exclude raw:<slug> is repeatable; each match causes the rule to
     // emit SKIP with detail="excluded via --exclude raw:<slug>" and does
     // NOT count as a failure in the summary. The "raw:" prefix is
     // optional — callers may pass either "raw:self-host-fixpoint" or
     // bare "self-host-fixpoint"; both match the same slug.
+    //
+    // --roadmap-ref <id> (raw#15, 2026-04-20): required when --exclude or
+    // --fast is used. Provides traceable roadmap milestone justification
+    // for the bypass; id must resolve in /.roadmap with status ∈
+    // {active, blocked}.
     let av = argv()
     let mut fast = false
     let mut json = false
@@ -90,6 +102,7 @@ fn _parse_flags() -> array {
     let mut only_id = ""
     let mut serial = false
     let mut excludes = []
+    let mut roadmap_ref = ""
     let mut i = 2
     while i < len(av) {
         let a = av[i]
@@ -115,9 +128,15 @@ fn _parse_flags() -> array {
                 i = i + 1
             }
         }
+        else if a == "--roadmap-ref" {
+            if i + 1 < len(av) {
+                roadmap_ref = av[i + 1]
+                i = i + 1
+            }
+        }
         i = i + 1
     }
-    return [fast, json, only_kind, only_id, serial, excludes]
+    return [fast, json, only_kind, only_id, serial, excludes, roadmap_ref]
 }
 
 // ─── parallel batch size ─────────────────────────────────────────
@@ -682,6 +701,103 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
     return [pass_ct, fail_ct, warn_ct, skip_ct, json_entries, missing_ct, enforce_ct]
 }
 
+// ─── roadmap-ref gate (raw#15, 2026-04-20) ───────────────────────
+//
+// When --exclude or --fast is used, callers must supply --roadmap-ref
+// <id>. The id is resolved against /.roadmap and the milestone's status
+// must be "active" or "blocked" (i.e. legitimate in-flight or blocked
+// work that justifies a temporary bypass). "done" rejects with FAIL
+// (already finished — no bypass justification). "planned" / "deferred"
+// WARN (not yet started — bypass is suspect but not fatal).
+//
+// We parse /.roadmap headers inline (rather than via self/raw_loader's
+// load_raw_file) because that loader only recognises raw/own/chain
+// kinds — teaching it "roadmap" kind touches a shared parser that
+// another agent (P1-5) is editing. Header grammar is identical to the
+// roadmap_lint.hexa parser (kept in sync by design):
+//   `roadmap <id> <status> "<name>"`
+//
+// Returns [ok(bool), status(string), err_or_warn_line(string)]
+//   ok=true  → gate passes. err_or_warn_line may contain a WARN note
+//              for planned/deferred; caller prints but continues.
+//   ok=false → gate refused. err_or_warn_line = user-visible error.
+fn _roadmap_status_for_id(path: string, ref_id: string) -> string {
+    // scan header lines of the form `roadmap <id> <status> "<name>"`.
+    // returns status string or "" if not found.
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    for raw_line in lines {
+        if len(raw_line) == 0 { continue }
+        let first = raw_line.substring(0, 1)
+        if first == " " || first == "\t" || first == "#" { continue }
+        let sp1 = raw_line.index_of(" ")
+        if sp1 < 0 { continue }
+        if raw_line.substring(0, sp1) != "roadmap" { continue }
+        let rest1 = raw_line.substring(sp1 + 1, len(raw_line))
+        let sp2 = rest1.index_of(" ")
+        if sp2 < 0 { continue }
+        let id = rest1.substring(0, sp2)
+        if id != ref_id { continue }
+        let rest2 = rest1.substring(sp2 + 1, len(rest1))
+        let sp3 = rest2.index_of(" ")
+        if sp3 < 0 { continue }
+        return rest2.substring(0, sp3)
+    }
+    return ""
+}
+
+fn _check_roadmap_ref(ref_id: string) -> array {
+    if ref_id == "" {
+        return [false, "", "[gate] --exclude / --fast 는 --roadmap-ref <id> 와 함께 사용 필수 (로드맵 근거 없음)"]
+    }
+    let roadmap_path = ".roadmap"
+    if !file_exists(roadmap_path) {
+        return [false, "", "[gate] /.roadmap 미존재 — --roadmap-ref 검증 불가"]
+    }
+    let found_status = _roadmap_status_for_id(roadmap_path, ref_id)
+    if found_status == "" {
+        return [false, "", "[gate] --roadmap-ref " + ref_id + " 가 /.roadmap 에 없음 (유효 milestone id 필요)"]
+    }
+    if found_status == "done" {
+        return [false, found_status, "[gate] roadmap " + ref_id + " status=done — 이미 완료된 milestone 은 우회 근거 불가"]
+    }
+    if found_status == "active" || found_status == "blocked" {
+        return [true, found_status, ""]
+    }
+    // planned / deferred → WARN (soft)
+    return [true, found_status,
+            "[gate] roadmap " + ref_id + " status=" + found_status +
+            " — 아직 착수 전/유보된 milestone. 우회 근거로 약함 (WARN)"]
+}
+
+// ─── bypass audit (raw#15, 2026-04-20) ───────────────────────────
+//
+// Records a "bypass" event to .raw-audit when --exclude or --fast
+// is used alongside a valid --roadmap-ref. The reason field packs
+// slug list + roadmap_id + roadmap_status + fast flag so downstream
+// audits retain the full justification without schema changes.
+fn _audit_bypass(excludes: array, fast: bool, roadmap_ref: string,
+                 roadmap_status: string, user_reason: string) {
+    // format reason: "roadmap=<id>(<status>) fast=<bool> excludes=raw:a,raw:b reason=<user>"
+    let mut ex_parts = []
+    for ex in excludes { ex_parts = ex_parts.push("raw:" + ex) }
+    let mut ex_str = "-"
+    if len(ex_parts) > 0 { ex_str = ex_parts.join(",") }
+    let mut fast_str = "false"
+    if fast { fast_str = "true" }
+    let mut ur = user_reason
+    if ur == "" { ur = "raw_all bypass" }
+    let reason = "roadmap=" + roadmap_ref
+                 + "(" + roadmap_status + ")"
+                 + " fast=" + fast_str
+                 + " excludes=" + ex_str
+                 + " reason=" + ur
+    let sha = ssot_fingerprint()
+    let mut actor = env("USER")
+    if actor == "" { actor = to_string(exec("id -un")).trim() }
+    let _ = audit_append("bypass", actor, reason, "ok", sha, "-")
+}
+
 // ─── main ────────────────────────────────────────────────────────
 
 // ─── exemption pre-check (P1b) ───────────────────────────────────
@@ -742,7 +858,33 @@ fn main() -> int {
     let only_id = flags[3]
     let serial = flags[4]
     let excludes = flags[5]
+    let roadmap_ref = flags[6]
     let par_n = _parallel_n(serial)
+
+    // raw#15 (2026-04-20): --exclude or --fast require --roadmap-ref.
+    // The roadmap id must resolve in /.roadmap with status ∈
+    // {active, blocked}. done → FAIL. planned/deferred → WARN (soft).
+    let bypass_used = (len(excludes) > 0) || fast
+    let mut roadmap_status = ""
+    if bypass_used {
+        let chk = _check_roadmap_ref(roadmap_ref)
+        let ok = chk[0]
+        let st = chk[1]
+        let line = chk[2]
+        if !ok {
+            eprintln(line)
+            eprintln("usage: --exclude raw:<slug> 또는 --fast 사용 시 --roadmap-ref <id> 필수")
+            eprintln("       예: ./hexa tool/raw_all.hexa --fast --roadmap-ref 9")
+            return 2
+        }
+        roadmap_status = st
+        if line != "" {
+            // WARN (planned/deferred) — print but continue.
+            if !json { eprintln(line) }
+        }
+        // Record bypass to audit before any enforcer runs.
+        _audit_bypass(excludes, fast, roadmap_ref, roadmap_status, "")
+    }
 
     // P7a: prepare tmp dir for parallel batch output.
     _tmp_init()
@@ -769,6 +911,9 @@ fn main() -> int {
             let mut ex_parts = []
             for ex in excludes { ex_parts = ex_parts.push("raw:" + ex) }
             println("excluded: " + ex_parts.join(", "))
+        }
+        if bypass_used && roadmap_ref != "" {
+            println("roadmap-ref: " + roadmap_ref + " (status=" + roadmap_status + ")")
         }
         println("")
     }
