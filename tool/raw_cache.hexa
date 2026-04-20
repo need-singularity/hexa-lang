@@ -1,0 +1,198 @@
+#!hexa strict
+// tool/raw_cache.hexa — raw#0 P1d sha256 fast-path cache
+//
+// PURPOSE
+//   raw_all currently re-runs every enforcer on every invocation. For
+//   most interactive edits (typo in prose, adding a test file, etc.) the
+//   5 SSOT files (.raw .own .ext .roadmap .loop) are unchanged and the
+//   per-rule verdict from the prior pass is still valid.
+//
+//   This module computes a single "SSOT fingerprint" (sha256 of the 5
+//   files concatenated) and records each rule's verdict keyed by that
+//   fingerprint. A subsequent `raw_all --fast` can then skip enforcers
+//   whose cached entry matches the current fingerprint, collapsing a
+//   multi-second full pass into sub-100ms.
+//
+//   SAFETY
+//   · Enforcement correctness is never weakened — cache only fires when
+//     a rule previously PASSED under the exact current SSOT fingerprint.
+//   · Any SSOT edit invalidates every entry (fingerprint shifts).
+//   · --fast is caller-opt-in; `hx_lock` always runs the full path.
+//
+// STORAGE
+//   .raw-cache/
+//     ssot.sha                — current SSOT fingerprint (single line)
+//     <slug>.entry            — one line: "<sha>|<result>|<utc_iso>"
+//
+// LIBRARY API
+//   ssot_fingerprint()               -> string   — sha256 of 5 SSOT concat
+//   cache_hit(slug, fp)              -> bool
+//   cache_read(slug)                 -> array    — [sha, result, ts] or []
+//   cache_write(slug, fp, result)    -> bool
+//   cache_invalidate()               -> bool
+//
+// CLI
+//   ./hexa tool/raw_cache.hexa status         — hits/entries summary
+//   ./hexa tool/raw_cache.hexa show <slug>    — dump one entry
+//   ./hexa tool/raw_cache.hexa invalidate     — wipe .raw-cache/
+//   ./hexa tool/raw_cache.hexa fingerprint    — print current SSOT fp
+
+use "self/core/law_io"
+fn _cache_dir() -> string { return ".raw-cache" }
+
+fn _ensure_dir() -> bool {
+    let r = exec_with_status("test -d '" + _cache_dir() + "'")
+    if r[1] == 0 { return true }
+    let mk = exec_with_status("mkdir -p '" + _cache_dir() + "'")
+    return mk[1] == 0
+}
+
+fn _file_exists(p: string) -> bool {
+    let r = exec_with_status("test -f '" + p + "'")
+    return r[1] == 0
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── fingerprint ─────────────────────────────────────────────────
+
+pub fn ssot_fingerprint() -> string {
+    // identical to tool/raw_audit.hexa#ssot_fingerprint — duplicated
+    // here to keep raw_cache self-contained (no circular import).
+    let cmd = "cat .raw .own .ext .roadmap .loop 2>/dev/null | shasum -a 256 | cut -d' ' -f1"
+    return to_string(exec(cmd)).trim()
+}
+
+// ─── read / write ────────────────────────────────────────────────
+
+fn _entry_path(slug: string) -> string {
+    // slug sanitized — colons / slashes rejected by raw_loader already,
+    // but defensively strip to be safe.
+    let safe = slug.replace("/", "_").replace(":", "_")
+    return _cache_dir() + "/" + safe + ".entry"
+}
+
+pub fn cache_read(slug: string) -> array {
+    let p = _entry_path(slug)
+    if !_file_exists(p) { return [] }
+    let raw = to_string(read_file(p)).trim()
+    if raw == "" { return [] }
+    let parts = split(raw, "|")
+    if len(parts) < 3 { return [] }
+    return [parts[0].trim(), parts[1].trim(), parts[2].trim()]
+}
+
+pub fn cache_write(slug: string, fp: string, result: string) -> bool {
+    if !_ensure_dir() { return false }
+    let line = fp + "|" + result + "|" + _iso_utc_now() + "\n"
+    let r = exec_with_status("printf '%s' " + _shell_quote(line) + " > " + _entry_path(slug))
+    return r[1] == 0
+}
+
+pub fn cache_hit(slug: string, fp: string) -> bool {
+    let e = cache_read(slug)
+    if len(e) == 0 { return false }
+    if e[0] != fp { return false }
+    // only PASS verdicts are reusable; FAIL/SKIP must re-run to surface
+    // the current state (user wants updated context, not stale failure).
+    if e[1] != "PASS" { return false }
+    return true
+}
+
+pub fn cache_invalidate() -> bool {
+    let r = exec_with_status("rm -rf " + _shell_quote(_cache_dir()))
+    return r[1] == 0
+}
+
+fn _ssot_sha_path() -> string { return _cache_dir() + "/ssot.sha" }
+
+pub fn cache_record_fingerprint(fp: string) -> bool {
+    if !_ensure_dir() { return false }
+    let r = exec_with_status("printf '%s\\n' " + _shell_quote(fp) + " > " + _ssot_sha_path())
+    return r[1] == 0
+}
+
+pub fn cache_last_fingerprint() -> string {
+    if !_file_exists(_ssot_sha_path()) { return "" }
+    return to_string(read_file(_ssot_sha_path())).trim()
+}
+
+// ─── CLI ─────────────────────────────────────────────────────────
+
+fn cmd_status() -> int {
+    let fp = ssot_fingerprint()
+    let prev = cache_last_fingerprint()
+    println("current SSOT fingerprint: " + fp)
+    if prev == "" {
+        println("cache:  (empty — no prior run recorded)")
+        return 0
+    }
+    if prev == fp { println("cache:  fresh (matches current SSOT)") }
+    else { println("cache:  stale (SSOT changed since last run)") }
+    // count entries
+    let r = exec_with_status("ls " + _cache_dir() + "/*.entry 2>/dev/null | wc -l | tr -d ' '")
+    let n = to_string(r[0]).trim()
+    println("entries: " + n)
+    return 0
+}
+
+fn cmd_show(slug: string) -> int {
+    let e = cache_read(slug)
+    if len(e) == 0 {
+        println("(no cache entry for slug: " + slug + ")")
+        return 0
+    }
+    println("slug:   " + slug)
+    println("sha:    " + e[0])
+    println("result: " + e[1])
+    println("ts:     " + e[2])
+    let fp = ssot_fingerprint()
+    if e[0] == fp { println("state:  HIT (current SSOT matches)") }
+    else { println("state:  MISS (SSOT has changed)") }
+    return 0
+}
+
+fn cmd_invalidate() -> int {
+    if cache_invalidate() { println("cache cleared"); return 0 }
+    eprintln("failed to clear cache")
+    return 1
+}
+
+fn cmd_fingerprint() -> int {
+    println(ssot_fingerprint())
+    return 0
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_cache.hexa <status|show <slug>|invalidate|fingerprint>")
+}
+
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let script = _av[1]
+    if script.ends_with("/raw_cache.hexa") { return true }
+    if script == "raw_cache.hexa" { return true }
+    return false
+}
+
+if _is_main() {
+    if len(_av) < 3 { _usage(); exit(2) }
+    let cmd = _av[2]
+    let mut rc = 0
+    if cmd == "status" { rc = cmd_status() }
+    else if cmd == "fingerprint" { rc = cmd_fingerprint() }
+    else if cmd == "invalidate" { rc = cmd_invalidate() }
+    else if cmd == "show" {
+        if len(_av) < 4 { _usage(); exit(2) }
+        rc = cmd_show(_av[3])
+    } else { _usage(); exit(2) }
+    exit(rc)
+}
