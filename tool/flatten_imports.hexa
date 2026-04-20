@@ -96,47 +96,19 @@ fn fl_hset_add(buckets, key) {
         if bucket[i] == key { return buckets }
         i = i + 1
     }
-    // rebuild buckets with updated bucket at index h
-    let new_bucket = bucket.push(key)
-    let mut new_buckets = []
-    let mut bi = 0
-    while bi < 64 {
-        // O(N^2) 방지: in-place push, new_buckets 단일 mut
-        if bi == h {
-            new_buckets.push(new_bucket)
-        } else {
-            new_buckets.push(buckets[bi])
-        }
-        bi = bi + 1
-    }
-    return new_buckets
+    // In-place append to bucket (no 64-array rebuild, no new_bucket copy).
+    // Prior impl allocated a fresh 64-entry array per add, retained by the
+    // interpreter (no GC) — 1000+ adds × 64 refs = 3GB+ RSS on hexa_full.hexa.
+    // In-place .push mutates the bucket element in `buckets` directly; caller
+    // keeps the same `buckets` handle so no aliasing.
+    bucket.push(key)
+    return buckets
 }
 
 fn fl_hset_remove(buckets, key) {
-    let h = fl_hset_hash(key)
-    let bucket = buckets[h]
-    let n = len(bucket)
-    let mut new_bucket = []
-    let mut i = 0
-    while i < n {
-        if bucket[i] != key {
-            // O(N^2) 방지: in-place push, new_bucket 단일 mut
-            new_bucket.push(bucket[i])
-        }
-        i = i + 1
-    }
-    let mut new_buckets = []
-    let mut bi = 0
-    while bi < 64 {
-        // O(N^2) 방지: in-place push, new_buckets 단일 mut
-        if bi == h {
-            new_buckets.push(new_bucket)
-        } else {
-            new_buckets.push(buckets[bi])
-        }
-        bi = bi + 1
-    }
-    return new_buckets
+    // Not currently called; kept for API symmetry. If re-enabled, prefer
+    // in-place bucket mutation (see fl_hset_add) over 64-array rebuild.
+    return buckets
 }
 
 // Legacy fl_contains kept for non-hot paths (collided check in pass 2)
@@ -370,6 +342,9 @@ fn fl_word_replace(src, oldname, newname) {
     let segments = src.split(oldname)
     let n_seg = len(segments)
     if n_seg <= 1 { return src }
+    // In-place push: `parts = parts.push(...)` previously allocated a fresh
+    // parts array on every segment and retained the old refs (no GC) —
+    // m_files × collided × n_seg push-reassigns = dominant OOM contributor.
     let mut parts = []
     let mut pos = 0
     let mut i = 0
@@ -377,7 +352,7 @@ fn fl_word_replace(src, oldname, newname) {
         let seg = segments[i]
         let seg_len = len(seg)
         if i == 0 {
-            parts = parts.push(seg)
+            parts.push(seg)
             pos = seg_len
         } else {
             // oldname 이 src[pos] 에서 시작. word boundary 체크.
@@ -390,11 +365,11 @@ fn fl_word_replace(src, oldname, newname) {
                 is_word = !fl_is_ident_char(src.substring((match_pos + L), (match_pos + L + 1)))
             }
             if is_word {
-                parts = parts.push(newname)
+                parts.push(newname)
             } else {
-                parts = parts.push(oldname)
+                parts.push(oldname)
             }
-            parts = parts.push(seg)
+            parts.push(seg)
             pos = match_pos + L + seg_len
         }
         i = i + 1
@@ -491,21 +466,21 @@ fn fl_iterative_walk(start_file) {
     let MARKER = "<<EMIT>>"
     let mut stack = []
 
-    stack = stack.push(start_file)
+    stack.push(start_file)
 
     while len(stack) > 0 {
         let top_idx = len(stack) - 1
         let top = stack[top_idx]
-        stack = stack.truncate(top_idx)
+        stack.truncate(top_idx)
 
         if top == MARKER {
             // Next item on stack is the file to emit
             let em_idx = len(stack) - 1
             let emit_file = stack[em_idx]
-            stack = stack.truncate(em_idx)
+            stack.truncate(em_idx)
             if !fl_hset_has(g_visited_hs, emit_file) {
                 g_visited_hs = fl_hset_add(g_visited_hs, emit_file)
-                g_order_parts = g_order_parts.push(emit_file)
+                g_order_parts.push(emit_file)
                 g_order_count = g_order_count + 1
             }
         } else {
@@ -514,8 +489,8 @@ fn fl_iterative_walk(start_file) {
                 // already emitted, skip
             } else {
                 // Push emit frame: MARKER then file (file goes first, popped second)
-                stack = stack.push(top)
-                stack = stack.push(MARKER)
+                stack.push(top)
+                stack.push(MARKER)
 
                 // Read file, collect deps, push unvisited deps (reverse order for DFS)
                 let src = read_file(top)
@@ -530,13 +505,13 @@ fn fl_iterative_walk(start_file) {
                     let dep_path = fl_resolve_use(deps[di])
                     if len(dep_path) > 0 {
                         if !fl_hset_has(g_visited_hs, dep_path) {
-                            stack = stack.push(dep_path)
+                            stack.push(dep_path)
                         }
                     } else {
                         let mut wp = []
-                        wp = wp.push("[flatten_imports] WARN dep not found: ")
-                        wp = wp.push(deps[di])
-                        wp = wp.push(" (searched caller-dir, cwd, self/, $HEXA_LANG)")
+                        wp.push("[flatten_imports] WARN dep not found: ")
+                        wp.push(deps[di])
+                        wp.push(" (searched caller-dir, cwd, self/, $HEXA_LANG)")
                         println(wp.join(""))
                     }
                     di = di - 1
@@ -562,6 +537,17 @@ let output = args[3]
 if !file_exists(target) {
     println("[flatten_imports] FATAL target not found: " + target)
     exit(1)
+}
+
+// Guard: HexaVal arena (default ON) does NOT rewind across the many
+// .split()/word-replace calls in the collision-mangle pass. On large graphs
+// (self/hexa_full.hexa, 28 files → 36K LoC output) RSS climbs past 4GB and
+// the shim's launchd cap SIGKILLs (exit 137). rebuild_stage0.hexa already
+// sets HEXA_VAL_ARENA=0 when invoking flatten; this print warns any direct
+// caller that forgot. (We cannot setenv from within the running process.)
+let arena_env = env_var("HEXA_VAL_ARENA")
+if type_of(arena_env) != "string" || arena_env != "0" {
+    println("[flatten_imports] WARN HEXA_VAL_ARENA is not \"0\" — large graphs may OOM (peak 6GB+ on hexa_full.hexa). Prefix: HEXA_VAL_ARENA=0 hexa tool/flatten_imports.hexa …")
 }
 
 g_base_dir = fl_dirname(target)
@@ -604,7 +590,7 @@ while fi < m {
             // Seen before — mark as collided (if not already)
             if !fl_hset_has(collided_hs, nm) {
                 collided_hs = fl_hset_add(collided_hs, nm)
-                collided_parts = collided_parts.push(nm)
+                collided_parts.push(nm)
             }
         } else {
             seen_decls_hs = fl_hset_add(seen_decls_hs, nm)
@@ -634,14 +620,14 @@ if collided_count > 0 {
 // O(n) 출력: parts 배열에 모아 최종 1회 join.
 // 이전 `flat_str = flat_str + big_chunk` 반복은 O(total²) — 메모리 폭주 원인 #2.
 let mut flat_parts = []
-flat_parts = flat_parts.push("// === FLATTENED by tool/flatten_imports.hexa ===\n")
-flat_parts = flat_parts.push("// target: " + target + "\n")
-flat_parts = flat_parts.push("// files:  " + str(m) + "\n")
-flat_parts = flat_parts.push("// order:  reverse-topo (root-first, leaves-last)\n")
+flat_parts.push("// === FLATTENED by tool/flatten_imports.hexa ===\n")
+flat_parts.push("// target: " + target + "\n")
+flat_parts.push("// files:  " + str(m) + "\n")
+flat_parts.push("// order:  reverse-topo (root-first, leaves-last)\n")
 if collided_count > 0 {
-    flat_parts = flat_parts.push("// mangled: " + collided_display + "\n")
+    flat_parts.push("// mangled: " + collided_display + "\n")
 }
-flat_parts = flat_parts.push("\n")
+flat_parts.push("\n")
 
 let mut ei = 0
 while ei < m {
@@ -660,9 +646,9 @@ while ei < m {
             let nm = decls[di]
             if fl_hset_has(collided_hs, nm) {
                 let mut np = []
-                np = np.push(prefix)
-                np = np.push("__")
-                np = np.push(nm)
+                np.push(prefix)
+                np.push("__")
+                np.push(nm)
                 let new_name = np.join("")
                 body_mut = fl_word_replace(body_mut, nm, new_name)
             }
@@ -675,16 +661,16 @@ while ei < m {
     // PERF concat counter ≤100 on large graphs (41 files × 3 concats = 123 prev).
     let base_name = fl_basename(f)
     let mut begin_parts = []
-    begin_parts = begin_parts.push("\n// ----- BEGIN ")
-    begin_parts = begin_parts.push(base_name)
-    begin_parts = begin_parts.push(" -----\n")
-    flat_parts = flat_parts.push(begin_parts.join(""))
-    flat_parts = flat_parts.push(stripped)
+    begin_parts.push("\n// ----- BEGIN ")
+    begin_parts.push(base_name)
+    begin_parts.push(" -----\n")
+    flat_parts.push(begin_parts.join(""))
+    flat_parts.push(stripped)
     let mut end_parts = []
-    end_parts = end_parts.push("\n// ----- END ")
-    end_parts = end_parts.push(base_name)
-    end_parts = end_parts.push(" -----\n")
-    flat_parts = flat_parts.push(end_parts.join(""))
+    end_parts.push("\n// ----- END ")
+    end_parts.push(base_name)
+    end_parts.push(" -----\n")
+    flat_parts.push(end_parts.join(""))
     ei = ei + 1
 }
 let flat_str = flat_parts.join("")
