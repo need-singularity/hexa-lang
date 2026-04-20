@@ -1,0 +1,565 @@
+#!hexa strict
+// tool/ossify.hexa — OS-level file immutability for @ossify-marked files
+//
+// PURPOSE
+//   Walk the repo for files whose first non-comment line is exactly
+//   `@ossify` (plus any path listed in .ossify_seeds) and apply OS-level
+//   immutability (macOS chflags uchg / schg). Maintains a manifest at
+//   `.ossify.json` recording path, sha256 hash, strength, and timestamp.
+//
+//   `self/attrs/ossify.hexa::check_ossify` already handles function-level
+//   hash-pin semantics — this tool is the complementary file-level
+//   enforcer. Consumes `self/attrs/ossify.hexa::is_file_ossify`.
+//
+// CLI
+//   ./hexa tool/ossify.hexa apply [--strength=weak|strong|max]
+//   ./hexa tool/ossify.hexa release <path>
+//   ./hexa tool/ossify.hexa release-all
+//   ./hexa tool/ossify.hexa verify
+//   ./hexa tool/ossify.hexa list
+//   ./hexa tool/ossify.hexa status <path>
+//
+// STRENGTH LEVELS
+//   weak   (default) — chflags uchg <f>                      (user-revocable)
+//   strong           — chflags uchg + sudo chown root:wheel + sudo chmod 444
+//   max              — sudo chflags schg <f>                 (near-irrevocable,
+//                                                             single-user reboot)
+//
+// EXIT CODES
+//   0 — OK (apply / verify SYNCED / release / list)
+//   1 — verify mismatch, release failure, other error
+//   2 — usage / bad args
+
+use "self/attrs/ossify"
+
+// ─── constants ──────────────────────────────────────────────────
+
+fn _manifest_path() -> string { return ".ossify.json" }
+fn _seeds_path()    -> string { return ".ossify_seeds" }
+
+// ─── generic helpers ────────────────────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -f " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _is_darwin() -> bool {
+    return to_string(exec("uname -s")).trim() == "Darwin"
+}
+
+fn _sha256_of(path: string) -> string {
+    if !_file_exists(path) { return "" }
+    let cmd = "sha256sum " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    let out1 = to_string(exec(cmd)).trim()
+    if out1 != "" { return "sha256:" + out1 }
+    let cmd2 = "shasum -a 256 " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    let out2 = to_string(exec(cmd2)).trim()
+    if out2 != "" { return "sha256:" + out2 }
+    return ""
+}
+
+// macOS `ls -lO` lock-state detection.
+// Returns "" = unlocked, "uchg" / "schg" = locked.
+fn _lock_state(path: string) -> string {
+    if !_is_darwin() { return "" }
+    let cmd = "ls -lO " + _shell_quote(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd))
+    if out.contains("schg") { return "schg" }
+    if out.contains("uchg") { return "uchg" }
+    return ""
+}
+
+fn _warn(msg: string) {
+    eprintln("[ossify] WARN: " + msg)
+}
+
+fn _info(msg: string) {
+    println("[ossify] " + msg)
+}
+
+fn _err(msg: string) {
+    eprintln("[ossify] ERROR: " + msg)
+}
+
+// ─── manifest (line-oriented JSON, single-pass write) ──────────
+
+// We emit pretty-printed JSON by string concat. No nested parser —
+// read is a simple scan for "path", "hash", "strength", "applied_at"
+// keys. Manifest is small (dozens of entries max), so this is fine.
+//
+// Entry representation inside hexa: array of [path, hash, strength, applied_at].
+
+fn _json_escape(s: string) -> string {
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    return b
+}
+
+fn _manifest_serialize(entries) -> string {
+    let mut out = "{\n"
+    out = out + "  \"version\": 1,\n"
+    out = out + "  \"entries\": [\n"
+    let n = len(entries)
+    let mut i = 0
+    while i < n {
+        let e = entries[i]
+        let path     = e[0]
+        let hash     = e[1]
+        let strength = e[2]
+        let applied  = e[3]
+        out = out + "    {"
+        out = out + "\"path\": \"" + _json_escape(path) + "\", "
+        out = out + "\"hash\": \"" + _json_escape(hash) + "\", "
+        out = out + "\"strength\": \"" + _json_escape(strength) + "\", "
+        out = out + "\"applied_at\": \"" + _json_escape(applied) + "\""
+        out = out + "}"
+        if i < n - 1 { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  ]\n"
+    out = out + "}\n"
+    return out
+}
+
+// Minimal parse — one entry per `{...}` object line.
+// Extracts the four known fields by substring search.
+fn _extract_field(line: string, key: string) -> string {
+    let needle = "\"" + key + "\": \""
+    let idx = line.index_of(needle)
+    if idx < 0 { return "" }
+    let rest = line.substring(idx + len(needle), len(line))
+    // Find the closing quote (ignoring the trivial case of escaped quotes —
+    // ossify paths and strengths never contain backslashes or quotes).
+    let end = rest.index_of("\"")
+    if end < 0 { return "" }
+    return rest.substring(0, end)
+}
+
+fn _manifest_load() {
+    let mut entries = []
+    if !_file_exists(_manifest_path()) { return entries }
+    let src = to_string(read_file(_manifest_path()))
+    let lines = src.split("\n")
+    for raw in lines {
+        let t = raw.trim()
+        if !t.starts_with("{") { continue }
+        let p = _extract_field(t, "path")
+        if p == "" { continue }
+        let h = _extract_field(t, "hash")
+        let s = _extract_field(t, "strength")
+        let a = _extract_field(t, "applied_at")
+        entries = entries.push([p, h, s, a])
+    }
+    return entries
+}
+
+fn _manifest_save(entries) {
+    let out = _manifest_serialize(entries)
+    write_file(_manifest_path(), out)
+}
+
+fn _manifest_find(entries, path: string) -> int {
+    let n = len(entries)
+    let mut i = 0
+    while i < n {
+        if entries[i][0] == path { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _manifest_remove(entries, path: string) {
+    let mut out = []
+    for e in entries {
+        if e[0] != path { out = out.push(e) }
+    }
+    return out
+}
+
+// ─── scanning ──────────────────────────────────────────────────
+
+// Enumerate candidate files via `find` — pure FS walk, no recursive
+// hexa (would need self/fs which only has fuse_skel here).
+fn _find_candidates() {
+    let cmd = "find self build shared/roadmaps tool -type f \\( -name '*.hexa' -o -name '*.json' \\) 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let parts = out.split("\n")
+    let mut paths = []
+    for p in parts {
+        let t = p.trim()
+        if t == "" { continue }
+        paths = paths.push(t)
+    }
+    return paths
+}
+
+fn _first_lines(path: string, n: int) {
+    // Cap read at ~20 lines to stay fast on the whole-repo walk.
+    let cmd = "head -n " + to_string(n) + " " + _shell_quote(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd))
+    return out.split("\n")
+}
+
+fn _load_seeds() {
+    let mut seeds = []
+    if !_file_exists(_seeds_path()) { return seeds }
+    let src = to_string(read_file(_seeds_path()))
+    let lines = src.split("\n")
+    for raw in lines {
+        let t = raw.trim()
+        if t == "" { continue }
+        if t.starts_with("#") { continue }
+        seeds = seeds.push(t)
+    }
+    return seeds
+}
+
+fn _scan_ossify_targets() {
+    let mut targets = []
+    let mut seen = []
+    let cands = _find_candidates()
+    for p in cands {
+        let lines = _first_lines(p, 20)
+        if is_file_ossify(lines) {
+            targets = targets.push(p)
+            seen = seen.push(p)
+        }
+    }
+    // Seeds union
+    let seeds = _load_seeds()
+    for s in seeds {
+        let mut dup = false
+        for x in seen { if x == s { dup = true; break } }
+        if dup { continue }
+        if !_path_exists(s) {
+            _warn("seed path not found, skipping: " + s)
+            continue
+        }
+        targets = targets.push(s)
+        seen = seen.push(s)
+    }
+    return targets
+}
+
+// ─── apply / release primitives ────────────────────────────────
+
+fn _apply_weak(path: string) -> int {
+    let r = exec_with_status("chflags uchg " + _shell_quote(path))
+    if r[1] != 0 {
+        _err("chflags uchg failed for " + path + ": " + r[0])
+        return 1
+    }
+    return 0
+}
+
+fn _apply_strong(path: string) -> int {
+    let rc = _apply_weak(path)
+    if rc != 0 { return rc }
+    // sudo steps — emit guidance if not interactive (can't reliably detect
+    // without a `tty` FFI, so we try non-interactive sudo -n first).
+    let r1 = exec_with_status("sudo -n chown root:wheel " + _shell_quote(path) + " 2>&1")
+    if r1[1] != 0 {
+        _warn("sudo chown requires password — run manually:")
+        _warn("  sudo chown root:wheel " + _shell_quote(path))
+        _warn("  sudo chmod 444 "        + _shell_quote(path))
+        return 0
+    }
+    let r2 = exec_with_status("sudo -n chmod 444 " + _shell_quote(path) + " 2>&1")
+    if r2[1] != 0 {
+        _warn("sudo chmod failed (non-interactive): " + r2[0])
+        return 0
+    }
+    return 0
+}
+
+fn _apply_max(path: string) -> int {
+    _warn("strength=max requests system-immutable (schg) — release requires single-user mode reboot")
+    let r = exec_with_status("sudo -n chflags schg " + _shell_quote(path) + " 2>&1")
+    if r[1] != 0 {
+        _warn("sudo chflags schg requires password — run manually:")
+        _warn("  sudo chflags schg " + _shell_quote(path))
+        return 0
+    }
+    return 0
+}
+
+fn _apply_one(path: string, strength: string) -> int {
+    if strength == "weak"   { return _apply_weak(path) }
+    if strength == "strong" { return _apply_strong(path) }
+    if strength == "max"    { return _apply_max(path) }
+    _err("unknown strength: " + strength)
+    return 2
+}
+
+fn _release_one(path: string, strength: string) -> int {
+    // Always drop uchg first (covers weak + strong uchg layer).
+    let r1 = exec_with_status("chflags nouchg " + _shell_quote(path) + " 2>&1")
+    if r1[1] != 0 {
+        // Non-fatal — may already be unlocked or may be schg.
+        _warn("chflags nouchg non-zero for " + path + ": " + r1[0])
+    }
+    if strength == "strong" {
+        let r2 = exec_with_status("sudo -n chown " + _shell_quote(env("USER")) + ":staff " + _shell_quote(path) + " 2>&1")
+        if r2[1] != 0 {
+            _warn("sudo chown revert needs password — run manually:")
+            _warn("  sudo chown $USER:staff " + _shell_quote(path))
+        }
+        let r3 = exec_with_status("sudo -n chmod 644 " + _shell_quote(path) + " 2>&1")
+        if r3[1] != 0 {
+            _warn("sudo chmod 644 revert needs password — run manually:")
+            _warn("  sudo chmod 644 " + _shell_quote(path))
+        }
+    }
+    if strength == "max" {
+        let r4 = exec_with_status("sudo -n chflags noschg " + _shell_quote(path) + " 2>&1")
+        if r4[1] != 0 {
+            _warn("sudo chflags noschg requires password (may require single-user mode):")
+            _warn("  sudo chflags noschg " + _shell_quote(path))
+            return 1
+        }
+    }
+    return 0
+}
+
+// ─── subcommands ───────────────────────────────────────────────
+
+fn _cmd_apply(strength: string) -> int {
+    if !_is_darwin() {
+        _err("OS-level ossify currently implemented for macOS (BSD chflags) only")
+        return 1
+    }
+    let targets = _scan_ossify_targets()
+    if len(targets) == 0 {
+        _info("no @ossify targets found (checked self/, build/, shared/roadmaps/, tool/, and .ossify_seeds)")
+        return 0
+    }
+    _info("found " + to_string(len(targets)) + " target(s), strength=" + strength)
+    let mut entries = _manifest_load()
+    let mut ok = 0
+    let mut fail = 0
+    for p in targets {
+        let rc = _apply_one(p, strength)
+        if rc != 0 { fail = fail + 1; continue }
+        let h = _sha256_of(p)
+        let idx = _manifest_find(entries, p)
+        let rec = [p, h, strength, _iso_utc_now()]
+        if idx >= 0 {
+            // replace in place (hexa: rebuild slice)
+            let mut rebuilt = []
+            let mut i = 0
+            while i < len(entries) {
+                if i == idx { rebuilt = rebuilt.push(rec) }
+                else        { rebuilt = rebuilt.push(entries[i]) }
+                i = i + 1
+            }
+            entries = rebuilt
+        } else {
+            entries = entries.push(rec)
+        }
+        ok = ok + 1
+        _info("  applied: " + p + "  [" + strength + "]")
+    }
+    _manifest_save(entries)
+    _info("applied=" + to_string(ok) + " failed=" + to_string(fail) + "  manifest=" + _manifest_path())
+    if fail > 0 { return 1 }
+    return 0
+}
+
+fn _cmd_release(path: string) -> int {
+    let entries = _manifest_load()
+    let idx = _manifest_find(entries, path)
+    if idx < 0 {
+        _err("path not in manifest: " + path)
+        return 1
+    }
+    let strength = entries[idx][2]
+    let rc = _release_one(path, strength)
+    if rc != 0 { return rc }
+    let updated = _manifest_remove(entries, path)
+    _manifest_save(updated)
+    _info("released: " + path + "  [" + strength + "]")
+    return 0
+}
+
+fn _cmd_release_all() -> int {
+    let entries = _manifest_load()
+    if len(entries) == 0 {
+        _info("manifest is empty — nothing to release")
+        return 0
+    }
+    let mut fail = 0
+    let mut remaining = []
+    for e in entries {
+        let rc = _release_one(e[0], e[2])
+        if rc == 0 {
+            _info("  released: " + e[0] + "  [" + e[2] + "]")
+        } else {
+            _err("  release failed: " + e[0])
+            fail = fail + 1
+            remaining = remaining.push(e)
+        }
+    }
+    _manifest_save(remaining)
+    if fail > 0 { return 1 }
+    return 0
+}
+
+fn _cmd_verify() -> int {
+    let entries = _manifest_load()
+    if len(entries) == 0 {
+        _info("manifest empty — nothing to verify")
+        return 0
+    }
+    let mut mismatch = 0
+    for e in entries {
+        let p        = e[0]
+        let hash_old = e[1]
+        let strength = e[2]
+        if !_file_exists(p) {
+            _err("MISSING  " + p)
+            mismatch = mismatch + 1
+            continue
+        }
+        let hash_new = _sha256_of(p)
+        let lock     = _lock_state(p)
+        let expect_lock = if strength == "max" { "schg" } else { "uchg" }
+        let mut status = "OK"
+        if hash_new != hash_old { status = "HASH_DRIFT"; mismatch = mismatch + 1 }
+        else if lock != expect_lock {
+            if lock == "" { status = "UNLOCKED"; mismatch = mismatch + 1 }
+            else          { status = "LOCK_MISMATCH(" + lock + "/" + expect_lock + ")"; mismatch = mismatch + 1 }
+        }
+        println("  " + status + "  [" + strength + "]  " + p)
+    }
+    if mismatch > 0 {
+        _err("verify: " + to_string(mismatch) + " mismatch(es)")
+        return 1
+    }
+    _info("verify: all " + to_string(len(entries)) + " entries SYNCED")
+    return 0
+}
+
+fn _cmd_list() -> int {
+    let entries = _manifest_load()
+    if len(entries) == 0 {
+        _info("manifest empty")
+        return 0
+    }
+    for e in entries {
+        let p        = e[0]
+        let strength = e[2]
+        let applied  = e[3]
+        let lock     = _lock_state(p)
+        let lock_s   = if lock == "" { "unlocked" } else { lock }
+        println("  [" + strength + "]  lock=" + lock_s + "  applied=" + applied + "  " + p)
+    }
+    return 0
+}
+
+fn _cmd_status(path: string) -> int {
+    let entries = _manifest_load()
+    let idx = _manifest_find(entries, path)
+    if idx < 0 {
+        _info("not in manifest: " + path)
+        return 0
+    }
+    let e        = entries[idx]
+    let hash_old = e[1]
+    let strength = e[2]
+    let applied  = e[3]
+    let hash_new = _sha256_of(path)
+    let lock     = _lock_state(path)
+    let lock_s   = if lock == "" { "unlocked" } else { lock }
+    println("path:       " + path)
+    println("strength:   " + strength)
+    println("applied_at: " + applied)
+    println("lock:       " + lock_s)
+    println("hash(manifest): " + hash_old)
+    println("hash(ondisk):   " + hash_new)
+    if hash_new != hash_old {
+        _err("HASH_DRIFT")
+        return 1
+    }
+    _info("SYNCED")
+    return 0
+}
+
+// ─── dispatch ──────────────────────────────────────────────────
+
+fn _usage() {
+    eprintln("Usage:")
+    eprintln("  ./hexa tool/ossify.hexa apply [--strength=weak|strong|max]")
+    eprintln("  ./hexa tool/ossify.hexa release <path>")
+    eprintln("  ./hexa tool/ossify.hexa release-all")
+    eprintln("  ./hexa tool/ossify.hexa verify")
+    eprintln("  ./hexa tool/ossify.hexa list")
+    eprintln("  ./hexa tool/ossify.hexa status <path>")
+}
+
+let av = argv()
+// argv = [program, script, subcmd, args...] when invoked via ./hexa tool/ossify.hexa ...
+if len(av) < 3 {
+    _usage()
+    exit(2)
+}
+
+let sub = av[2]
+
+if sub == "apply" {
+    let mut strength = "weak"
+    let mut i = 3
+    while i < len(av) {
+        let a = av[i]
+        if a.starts_with("--strength=") {
+            strength = a.substring(len("--strength="), len(a))
+        }
+        i = i + 1
+    }
+    if strength != "weak" && strength != "strong" && strength != "max" {
+        _err("bad --strength value: " + strength)
+        _usage()
+        exit(2)
+    }
+    exit(_cmd_apply(strength))
+}
+
+if sub == "release" {
+    if len(av) < 4 { _usage(); exit(2) }
+    exit(_cmd_release(av[3]))
+}
+
+if sub == "release-all" {
+    exit(_cmd_release_all())
+}
+
+if sub == "verify" {
+    exit(_cmd_verify())
+}
+
+if sub == "list" {
+    exit(_cmd_list())
+}
+
+if sub == "status" {
+    if len(av) < 4 { _usage(); exit(2) }
+    exit(_cmd_status(av[3]))
+}
+
+_err("unknown subcommand: " + sub)
+_usage()
+exit(2)
