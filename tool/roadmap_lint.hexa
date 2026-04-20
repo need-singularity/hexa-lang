@@ -39,10 +39,10 @@ fn _parse_roadmap_header(line: string) -> array {
     return [id, status, name]
 }
 
-fn _load_roadmap(path: string) -> array {
-    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
-    if exists != "y" { return [] }
-    let src = to_string(read_file(path))
+// Parse roadmap SSOT text (lines) into rules array.
+// Factored out so both `_load_roadmap(path)` and the git-HEAD transition
+// check can share a single parser implementation.
+fn _parse_roadmap_text(src: string) -> array {
     let lines = split(src, "\n")
 
     let mut rules = []
@@ -90,6 +90,14 @@ fn _load_roadmap(path: string) -> array {
         rules = rules.push([cur_id, cur_status, cur_name, cur_keys])
     }
     return rules
+}
+
+// Load .roadmap from a filesystem path. Returns [] if the file does not exist.
+fn _load_roadmap(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    return _parse_roadmap_text(src)
 }
 
 fn _keys_first(keys: array, k: string) -> string {
@@ -495,6 +503,96 @@ for r in rules {
                 }
             }
         }
+    }
+}
+
+// ─── status transition invariants (git HEAD diff) ───────────────────
+//
+// Compares the current .roadmap against its tracked HEAD version and
+// validates per-id status transitions. Purpose: prevent "phantom work"
+// rewrites — once an entry is sealed (done) or promoted, it cannot be
+// silently regressed to an earlier status.
+//
+// Transition matrix:
+//   allowed:
+//     any → same           (no change)
+//     planned  → active|blocked|deferred
+//     active   → done|blocked|deferred
+//     blocked  → active|done|deferred
+//     deferred → planned|active
+//   forbidden (FAIL):
+//     done → any           (done is sealed)
+//     active  → planned    (regression)
+//     blocked → planned    (regression)
+//
+//   new entry (id absent in HEAD): allowed to start in any status
+//   deleted entry (id present in HEAD, absent now): FAIL
+//
+// Failure modes for git show:
+//   - initial commit (no HEAD yet)
+//   - .roadmap not tracked in HEAD
+//   - not a git checkout
+// All three → SKIP silently (no WARN, no FAIL) — first landing of
+// .roadmap must not self-trip.
+fn _transition_allowed(prev: string, cur: string) -> bool {
+    if prev == cur { return true }
+    if prev == "done" { return false }
+    if prev == "planned" {
+        if cur == "active" || cur == "blocked" || cur == "deferred" { return true }
+        return false
+    }
+    if prev == "active" {
+        if cur == "done" || cur == "blocked" || cur == "deferred" { return true }
+        return false
+    }
+    if prev == "blocked" {
+        if cur == "active" || cur == "done" || cur == "deferred" { return true }
+        return false
+    }
+    if prev == "deferred" {
+        if cur == "planned" || cur == "active" { return true }
+        return false
+    }
+    return false
+}
+
+if len(rules) >= 1 {
+    let tmp_pid = exec("echo $$").trim()
+    let prev_path = "/tmp/.roadmap.prev." + tmp_pid
+    let show = exec_with_status("git show HEAD:.roadmap > " + prev_path + " 2>/dev/null")
+    if show[1] == 0 {
+        let exists_prev = to_string(exec("test -s '" + prev_path + "' && echo y || echo n")).trim()
+        if exists_prev == "y" {
+            let prev_src = to_string(read_file(prev_path))
+            let prev_rules = _parse_roadmap_text(prev_src)
+
+            // forward check: each previous entry must survive (no deletion)
+            // and its transition to the current status must be allowed.
+            for pr in prev_rules {
+                let pid_str = pr[0]
+                let prev_status = pr[1]
+                let ptag = "[roadmap #" + pid_str + "] "
+                let cur_rule = _find_rule(rules, pid_str)
+                if len(cur_rule) == 0 {
+                    errs = errs.push(ptag + "삭제 금지 — 이전에 존재 (status=" + prev_status + ")")
+                    continue
+                }
+                let cur_status = cur_rule[1]
+                if prev_status == cur_status { continue }
+                if prev_status == "done" {
+                    errs = errs.push(ptag + "done 선언은 sealed (" + prev_status + "=done → " + cur_status + "=?)")
+                    continue
+                }
+                if !_transition_allowed(prev_status, cur_status) {
+                    errs = errs.push(ptag + "status 역행 금지: " + prev_status + " → " + cur_status)
+                }
+            }
+            // cleanup — best-effort, never fail.
+            exec("rm -f '" + prev_path + "' 2>/dev/null")
+        }
+    } else {
+        // git show failed — .roadmap untracked or no HEAD. silent skip.
+        exec("rm -f '" + prev_path + "' 2>/dev/null")
     }
 }
 
