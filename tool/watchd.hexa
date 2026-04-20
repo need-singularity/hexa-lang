@@ -1,0 +1,168 @@
+#!hexa strict
+// tool/watchd.hexa — launchd-resident hexa shim watchdog (pure hexa, no JSON)
+//
+// Mission
+//   Keep $HEXA_HOME/shared/bin/<name> symlinks in sync with the SSOT
+//   declared by shared/config/.commands :: shim_names() (via loader).
+//   Every ~1 second we stat each expected shim path; missing entries are
+//   recreated (ln -sf) against the current hexa binary. Every 300 iters
+//   we readlink each shim and verify the target still matches.
+//
+// Log
+//   $HOME/.hx/watchd.log — append-only timestamped audit trail. doctor.hexa
+//   checks the mtime of this file to prove the daemon is alive.
+//
+// No JSON anywhere. Command names come from shim_names() only.
+
+use "tool/commands_loader"
+
+// ─── small helpers ─────────────────────────────────────────────
+
+fn _wd_home() -> string {
+    let h = env("HOME")
+    if h != "" { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _wd_hexa_home() -> string {
+    let e = env("HEXA_HOME")
+    if e != "" { return e }
+    return _wd_home() + "/.hx"
+}
+
+fn _wd_hexa_bin() -> string {
+    // Matches install_os.hexa convention.
+    return _wd_hexa_home() + "/packages/hexa/hexa"
+}
+
+fn _wd_log_path() -> string {
+    return _wd_home() + "/.hx/watchd.log"
+}
+
+fn _wd_quote(s: string) -> string {
+    let mut out = "'"
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = char_code(s, i)
+        if c == 39 {
+            out = out + "'\\''"
+        } else {
+            out = out + chr(c)
+        }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+fn _wd_path_exists(path: string) -> bool {
+    // -L catches symlinks (even dangling); -e covers regular files.
+    let r = exec_with_status("test -L " + _wd_quote(path) + " -o -e " + _wd_quote(path))
+    return r[1] == 0
+}
+
+fn _wd_timestamp() -> string {
+    let r = exec_with_status("date -u +'%Y-%m-%dT%H:%M:%SZ'")
+    return to_string(r[0]).trim()
+}
+
+fn _wd_log(msg: string) {
+    let line = _wd_timestamp() + " " + msg + "\n"
+    exec_with_status("mkdir -p " + _wd_quote(_wd_home() + "/.hx"))
+    exec_with_status("printf '%s' " + _wd_quote(line) + " >> " + _wd_quote(_wd_log_path()))
+}
+
+fn _wd_ensure_bin_dir(bin_dir: string) {
+    exec_with_status("mkdir -p " + _wd_quote(bin_dir))
+}
+
+// ─── shim repair ───────────────────────────────────────────────
+
+fn _wd_install_shim(bin_dir: string, name: string, target: string) -> bool {
+    let shim = bin_dir + "/" + name
+    exec_with_status("rm -f " + _wd_quote(shim))
+    let cmd = "ln -sf " + _wd_quote(target) + " " + _wd_quote(shim)
+    let r = exec_with_status(cmd)
+    return r[1] == 0
+}
+
+// Returns count of shims (re)created this tick.
+fn _wd_repair_missing(bin_dir: string, names: [string], target: string) -> int {
+    let n = len(names)
+    let mut created = 0
+    let mut i = 0
+    while i < n {
+        let name = names[i]
+        let shim = bin_dir + "/" + name
+        if !_wd_path_exists(shim) {
+            let ok = _wd_install_shim(bin_dir, name, target)
+            if ok {
+                created = created + 1
+                _wd_log("create " + shim + " -> " + target)
+            } else {
+                _wd_log("ERROR create failed " + shim)
+            }
+        }
+        i = i + 1
+    }
+    return created
+}
+
+// ─── self-test (every 300 iterations) ──────────────────────────
+// readlink every shim, confirm it points at target. Re-heal mismatches.
+fn _wd_selftest(bin_dir: string, names: [string], target: string) -> int {
+    let n = len(names)
+    let mut ok_count = 0
+    let mut i = 0
+    while i < n {
+        let name = names[i]
+        let shim = bin_dir + "/" + name
+        let r = exec_with_status("readlink " + _wd_quote(shim) + " 2>/dev/null")
+        let link = to_string(r[0]).trim()
+        if link == target {
+            ok_count = ok_count + 1
+        } else {
+            _wd_log("selftest mismatch " + shim + " link=" + link + " want=" + target)
+            _wd_install_shim(bin_dir, name, target)
+        }
+        i = i + 1
+    }
+    _wd_log("selftest ok=" + str(ok_count) + "/" + str(n))
+    return ok_count
+}
+
+// ─── sleep ─────────────────────────────────────────────────────
+// 1 s tick — exec /bin/sleep; nanosleep builtin wire-up tracked in rt/proc.hexa.
+fn _wd_sleep_1s() {
+    exec_with_status("sleep 1")
+}
+
+// ─── main loop ─────────────────────────────────────────────────
+
+fn main() -> int {
+    let hexa_home = _wd_hexa_home()
+    let bin_dir   = hexa_home + "/shared/bin"
+    let target    = _wd_hexa_bin()
+
+    _wd_ensure_bin_dir(bin_dir)
+    _wd_log("start bin_dir=" + bin_dir + " target=" + target)
+
+    let mut iter = 0
+    while true {
+        let cmds = load_commands("shared/config/.commands")
+        let names = shim_names(cmds)
+        let created = _wd_repair_missing(bin_dir, names, target)
+        if created > 0 {
+            _wd_log("tick iter=" + str(iter) + " created=" + str(created))
+        }
+        if iter > 0 && iter % 300 == 0 {
+            let _ = _wd_selftest(bin_dir, names, target)
+        }
+        iter = iter + 1
+        _wd_sleep_1s()
+    }
+    return 0
+}
+
+exit(main())

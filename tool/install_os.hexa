@@ -1,0 +1,400 @@
+#!hexa strict
+// tool/install_os.hexa — OS-level hexa command shim installer
+//
+// PURPOSE
+//   Zero-LLM bootstrap — make `drill`, `go`, `todo`, `smash`, `free`,
+//   `loop`, `roi`, `keep`, `list`, ... callable from any shell without
+//   Claude Code / any agent layer. The LLM dispatcher becomes *optional*:
+//   the OS itself routes the command name straight to the hexa binary.
+//
+// SSOT (2026-04-20 rewrite)
+//   Command list is sourced from shared/config/.commands (raw-style SSOT,
+//   no extension) via `tool/commands_loader` + shim_names(cmds). The old
+//   `tool/config/commands.json` + rt_json_parse path is **removed**, and
+//   the earlier `shared/config/.commands.hexa` pure-hexa module has been
+//   superseded by the raw file.
+//
+// FLOW (main)
+//   1. Resolve hexa binary — prefer $HEXA_HOME/packages/hexa/hexa, then
+//      $REPO_ROOT/hexa, finally `which hexa` — and verify the candidate
+//      prints `SUBCOMMANDS` for `help` (brew v0.1.0 REPL-only skipped).
+//   2. HOME + HEXA_HOME env lookup (default $HOME/.hx).
+//   3. shim_dir = $HEXA_HOME/shared/bin — mkdir -p.
+//   4. for name in shim_names(cmds): rm -f shim + ln -sf hexa_bin shim.
+//   5. Grep-guarded append `export PATH=...` to ~/.zshenv.
+//   6. Write ~/Library/LaunchAgents/io.hexa.watchd.plist (XML).
+//   7. launchctl bootout (swallow fail) → bootstrap gui/$UID.
+//   8. Darwin only: chflags uchg shared/config/.commands.
+//   9. Emit ASCII summary (no emoji).
+//
+// IDEMPOTENT
+//   All destructive ops are guarded — safe to run repeatedly.
+
+use "self/core/law_io"
+use "tool/commands_loader"
+
+// ─── small helpers ─────────────────────────────────────────────
+
+fn _io_home() -> string {
+    let h = env("HOME")
+    if h != "" { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _io_hexa_home() -> string {
+    let e = env("HEXA_HOME")
+    if e != "" { return e }
+    return _io_home() + "/.hx"
+}
+
+fn _io_uname() -> string {
+    return to_string(exec("uname -s 2>/dev/null")).trim()
+}
+
+fn _io_uid() -> string {
+    let u = to_string(exec("id -u 2>/dev/null")).trim()
+    if u != "" { return u }
+    return "501"
+}
+
+fn _io_quote(s: string) -> string {
+    // Minimal single-quote shell escaping. Wraps arg in single quotes
+    // and escapes embedded single quotes as '\''.
+    let parts: [string] = []
+    parts.push("'")
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = char_code(s, i)
+        if c == 39 {  // '
+            parts.push("'\\''")
+        } else {
+            parts.push(chr(c))
+        }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _io_path_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _io_quote(path))
+    return r[1] == 0
+}
+
+fn _io_mkdir_p(path: string) -> bool {
+    let r = exec_with_status("mkdir -p " + _io_quote(path))
+    return r[1] == 0
+}
+
+// ─── step 0: resolve hexa binary (priority order) ──────────────
+//
+// Priority:
+//   1. $HEXA_HOME/packages/hexa/hexa
+//   2. $REPO_ROOT/hexa
+//   3. `which hexa` (realpath)
+//
+// Each candidate is validated by running `<cand> help` and checking
+// stdout for the literal "SUBCOMMANDS". The brew-packaged v0.1.0 is a
+// REPL-only build that lacks subcommand help text and is auto-skipped.
+
+fn _hx_bin_valid(cand: string) -> bool {
+    // test -x first — avoids error spew on missing paths.
+    let ok = exec_with_status("test -x " + _io_quote(cand))
+    if ok[1] != 0 { return false }
+    // `--help` is unreliable across builds; `help` is the subcommand form.
+    let r = exec_with_status(_io_quote(cand) + " help 2>&1")
+    let out = to_string(r[0])
+    if out.contains("SUBCOMMANDS") { return true }
+    // Retry via --help (rust-built variants)
+    let r2 = exec_with_status(_io_quote(cand) + " --help 2>&1")
+    let out2 = to_string(r2[0])
+    return out2.contains("SUBCOMMANDS")
+}
+
+fn _repo_root() -> string {
+    // argv[1] = this script path when invoked via `./hexa run tool/install_os.hexa`.
+    // Best-effort: resolve to repo root via realpath.
+    let a = argv()
+    if len(a) >= 2 {
+        let r = to_string(exec("cd \"$(dirname " + _io_quote(a[1]) + ")/..\" && pwd")).trim()
+        if r != "" { return r }
+    }
+    // Fallback: cwd.
+    return to_string(exec("pwd")).trim()
+}
+
+fn _resolve_hexa_binary() -> string {
+    // Priority 1: $HEXA_HOME/packages/hexa/hexa
+    let c1 = _io_hexa_home() + "/packages/hexa/hexa"
+    if _hx_bin_valid(c1) { return c1 }
+
+    // Priority 2: $REPO_ROOT/hexa
+    let c2 = _repo_root() + "/hexa"
+    if _hx_bin_valid(c2) { return c2 }
+
+    // Priority 3: which hexa (walk multiple PATH hits — brew's REPL-only
+    // /opt/homebrew/.../hexa v0.1.0 gets skipped because it lacks
+    // SUBCOMMANDS in its help output).
+    let r = to_string(exec("which -a hexa 2>/dev/null")).trim()
+    if r != "" {
+        let hits = split(r, "\n")
+        let mut i = 0
+        while i < len(hits) {
+            let w = hits[i].trim()
+            if w != "" {
+                let real = to_string(exec("realpath " + _io_quote(w) + " 2>/dev/null")).trim()
+                let cand = real
+                if cand == "" { cand = w }
+                if _hx_bin_valid(cand) { return cand }
+            }
+            i = i + 1
+        }
+    }
+
+    // Final fallback — return c1 (will fail the test -e pre-flight below).
+    return c1
+}
+
+// ─── step 4: install shim symlinks ──────────────────────────────
+
+fn _install_shim(bin_dir: string, name: string, target: string) -> bool {
+    let shim = bin_dir + "/" + name
+    // Best-effort remove. ln -sf also overwrites, but explicit rm ensures
+    // a stale regular file (not just a symlink) is replaced.
+    exec_with_status("rm -f " + _io_quote(shim))
+    let cmd = "ln -sf " + _io_quote(target) + " " + _io_quote(shim)
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("install_os: ln -sf failed for " + shim + " -> " + target)
+        return false
+    }
+    return true
+}
+
+// ─── step 5: ~/.zshenv PATH export ──────────────────────────────
+
+fn _ensure_zshenv_path(home: string) -> bool {
+    let zshenv = home + "/.zshenv"
+    let line = "export PATH=\"$HEXA_HOME/shared/bin:$PATH\""
+    // If zshenv missing, create it with just this line + HEXA_HOME default.
+    let seed = "# hexa-lang OS shim PATH\nexport HEXA_HOME=\"${HEXA_HOME:-$HOME/.hx}\"\n" + line + "\n"
+    if !_io_path_exists(zshenv) {
+        let ok = safe_write_file(zshenv, seed)
+        if !ok {
+            eprintln("install_os: failed to create " + zshenv)
+            return false
+        }
+        println("  created   " + zshenv + " (+ PATH export)")
+        return true
+    }
+    // Grep for the exact path segment — idempotent check.
+    let grep = exec_with_status("grep -qE 'shared/bin' " + _io_quote(zshenv))
+    if grep[1] == 0 {
+        println("  unchanged " + zshenv + " (PATH export already present)")
+        return true
+    }
+    // Append (preserve existing body).
+    let ok = safe_append_file(zshenv, "\n" + seed)
+    if !ok {
+        eprintln("install_os: append to " + zshenv + " failed")
+        return false
+    }
+    println("  updated   " + zshenv + " (+ PATH export)")
+    return true
+}
+
+// ─── step 6: launchd plist for watchd ───────────────────────────
+
+fn _watchd_plist_xml(hexa_bin: string) -> string {
+    // Fixed-size block, no loop — plain string concat is safe (not O(n^2)).
+    return "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" +
+           "<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n" +
+           "<plist version=\"1.0\">\n" +
+           "<dict>\n" +
+           "  <key>Label</key><string>io.hexa.watchd</string>\n" +
+           "  <key>ProgramArguments</key>\n" +
+           "  <array>\n" +
+           "    <string>" + hexa_bin + "</string>\n" +
+           "    <string>watchd</string>\n" +
+           "  </array>\n" +
+           "  <key>KeepAlive</key><true/>\n" +
+           "  <key>RunAtLoad</key><true/>\n" +
+           "</dict>\n" +
+           "</plist>\n"
+}
+
+fn _install_watchd_plist(home: string, hexa_bin: string) -> string {
+    let dir = home + "/Library/LaunchAgents"
+    if !_io_mkdir_p(dir) {
+        eprintln("install_os: mkdir -p " + dir + " failed")
+        return ""
+    }
+    let path = dir + "/io.hexa.watchd.plist"
+    let xml = _watchd_plist_xml(hexa_bin)
+    let ok = safe_write_file(path, xml)
+    if !ok {
+        eprintln("install_os: failed to write " + path)
+        return ""
+    }
+    println("  wrote     " + path)
+    return path
+}
+
+// ─── step 7: launchctl bootstrap ────────────────────────────────
+
+fn _launchd_bootstrap(plist_path: string, uid: string) -> bool {
+    // Pre-unload any previous copy — bootstrap errors on duplicate label.
+    exec_with_status("launchctl bootout gui/" + uid + " " + _io_quote(plist_path) + " 2>/dev/null")
+    let r = exec_with_status("launchctl bootstrap gui/" + uid + " " + _io_quote(plist_path) + " 2>&1")
+    if r[1] == 0 {
+        println("  bootstrap gui/" + uid + " " + plist_path)
+        return true
+    }
+    // Non-fatal — watchd binary may not exist yet. Emit warning, don't fail.
+    eprintln("  WARN launchctl bootstrap rc=" + str(r[1]) + " (watchd binary may be pending)")
+    return false
+}
+
+// ─── step 8: chflags uchg SSOT (shared/config/.commands) ────
+
+fn _lock_commands_file(cmd_path: string, uname: string) -> bool {
+    if uname != "Darwin" {
+        println("  skip      chflags uchg (non-Darwin: " + uname + ")")
+        return true
+    }
+    if !_io_path_exists(cmd_path) {
+        eprintln("  WARN SSOT file missing at " + cmd_path + " — skipping chflags")
+        return false
+    }
+    let r = exec_with_status("chflags uchg " + _io_quote(cmd_path) + " 2>&1")
+    if r[1] == 0 {
+        println("  locked    " + cmd_path + " (uchg)")
+        return true
+    }
+    eprintln("  WARN chflags uchg failed rc=" + str(r[1]) + " (may need sudo or already locked)")
+    return false
+}
+
+// ─── summary ────────────────────────────────────────────────────
+
+fn _emit_summary(shim_ok: int, shim_total: int, bin_dir: string,
+                 zshenv_ok: bool, plist_path: string,
+                 bootstrap_ok: bool, lock_ok: bool) {
+    println("")
+    println("-- install_os summary --")
+    println("  shims            " + str(shim_ok) + "/" + str(shim_total) + " -> " + bin_dir)
+    if zshenv_ok { println("  ~/.zshenv        ok") } else { println("  ~/.zshenv        FAILED") }
+    if plist_path != "" {
+        println("  plist            " + plist_path)
+    } else {
+        println("  plist            FAILED")
+    }
+    if bootstrap_ok { println("  launchd          bootstrapped") } else { println("  launchd          warn (watchd pending)") }
+    if lock_ok { println("  .commands        locked") } else { println("  .commands        warn") }
+}
+
+// ─── main ───────────────────────────────────────────────────────
+
+fn main() -> int {
+    let hexa_home = _io_hexa_home()
+    let home      = _io_home()
+    let uname     = _io_uname()
+    let uid       = _io_uid()
+    let bin_dir   = hexa_home + "/shared/bin"
+    let hexa_bin  = _resolve_hexa_binary()
+    let repo      = _repo_root()
+    let cmd_path  = repo + "/shared/config/.commands"
+
+    println("-- install_os (OS-level hexa command shims) --")
+    println("  HEXA_HOME        " + hexa_home)
+    println("  hexa binary      " + hexa_bin)
+    println("  shim dir         " + bin_dir)
+    println("  uname            " + uname)
+    println("  SSOT file        " + cmd_path)
+    println("")
+
+    // Pre-flight: hexa binary must exist (shim target).
+    if !_io_path_exists(hexa_bin) {
+        eprintln("install_os: hexa binary missing at " + hexa_bin)
+        eprintln("  run tool/install_stage0_shim.hexa or reinstall the package first")
+        return 1
+    }
+
+    // Step 3 — ensure shim dir exists.
+    if !_io_mkdir_p(bin_dir) {
+        eprintln("install_os: cannot create shim dir " + bin_dir)
+        return 1
+    }
+
+    // Step 4 — enumerate shim names from the raw SSOT + install each.
+    let cmds  = load_commands(cmd_path)
+    let names = shim_names(cmds)
+    let total = len(names)
+    if total == 0 {
+        eprintln("install_os: shim_names() returned empty list")
+        eprintln("  SSOT file may still be pending: " + cmd_path)
+        return 1
+    }
+    println("-- step 4: install " + str(total) + " shim(s) --")
+
+    let mut shim_ok = 0
+    let mut i = 0
+    while i < total {
+        let name = names[i]
+        if _install_shim(bin_dir, name, hexa_bin) {
+            shim_ok = shim_ok + 1
+            println("  link      " + bin_dir + "/" + name + " -> " + hexa_bin)
+        }
+        i = i + 1
+    }
+
+    // Step 5 — ~/.zshenv PATH export.
+    println("")
+    println("-- step 5: PATH export (~/.zshenv) --")
+    let zshenv_ok = _ensure_zshenv_path(home)
+
+    // Step 6 — write watchd plist.
+    println("")
+    println("-- step 6: watchd plist --")
+    let mut plist_path = ""
+    if uname == "Darwin" {
+        plist_path = _install_watchd_plist(home, hexa_bin)
+    } else {
+        println("  skip      non-Darwin (" + uname + ") -- launchd plist is mac-only")
+    }
+
+    // Step 7 — launchctl bootstrap.
+    println("")
+    println("-- step 7: launchctl bootstrap --")
+    let mut bootstrap_ok = false
+    if plist_path != "" {
+        bootstrap_ok = _launchd_bootstrap(plist_path, uid)
+    } else if uname != "Darwin" {
+        println("  skip      non-Darwin")
+        bootstrap_ok = true
+    }
+
+    // Step 8 — chflags uchg shared/config/.commands.
+    println("")
+    println("-- step 8: lock SSOT file (.commands) --")
+    let lock_ok = _lock_commands_file(cmd_path, uname)
+
+    // Step 9 — summary.
+    _emit_summary(shim_ok, total, bin_dir, zshenv_ok, plist_path, bootstrap_ok, lock_ok)
+
+    if shim_ok < total {
+        eprintln("")
+        eprintln("install_os: " + str(total - shim_ok) + " shim(s) failed")
+        return 2
+    }
+    if !zshenv_ok {
+        return 3
+    }
+    println("")
+    println("-- OK --")
+    println("Open a new terminal or `source ~/.zshenv`, then drill/go/todo/... are usable.")
+    return 0
+}
+
+exit(main())
