@@ -1,0 +1,959 @@
+// tool/workspace_sync.hexa — .workspace SSOT parser + symlink materializer
+//
+// PURPOSE
+//   `.workspace` 는 6번째 SSOT kind — super-project (e.g. ~/Dev) 레벨에서
+//   sibling project 들 간의 공유 리소스(바이너리/시그널 아틀라스 등)를 선언
+//   한다. 이 tool 은 `.workspace` 를 파싱해서 각 consumer 프로젝트 안에
+//   symlink 를 재료화한다 (idempotent). `.workspace.lock` 에 각 리소스의
+//   SHA256 을 기록해서 drift 를 감지한다.
+//
+// GRAMMAR (hexa-like directive — 2-space indent key-value pairs)
+//   workspace "<display-name>"
+//     version  v1
+//     root     <abs-path>
+//
+//   member <alias> "<display>"
+//     path     <relative-to-root>
+//     role     exporter | consumer | both
+//     exports  <res>, <res>, ...
+//     imports  <res>@<alias>, ...
+//
+//   resource <id> "<description>"
+//     owner    <member-alias>
+//     source   <relative-from-owner-root>
+//     kind     file | dir | executable
+//     install  symlink | copy | path
+//     target   <relative-from-consumer-root>
+//
+// CLI
+//   ./hexa tool/workspace_sync.hexa [--dry-run|--force|--json|--check|--verify] <path>
+//   default <path> = ~/Dev/.workspace
+//
+// EXIT CODES
+//   0 — OK / in-sync
+//   1 — validation failure / FS drift / content drift
+//   2 — usage / IO error
+//
+// SAFETY
+//   · target 이 심볼릭 링크가 아닌데 --force 없으면 건너뛰고 warn.
+//   · member.path 에 ".." 포함 시 거부 (root escape 방지).
+//   · root 밖 경로 건드리지 않음.
+//   · chflags uchg 등 permission denied 는 warn 으로 처리 (fatal X).
+//
+// SEED-FREEZE
+//   stage0 module loader 접근 금지. 이 tool 은 self-contained (raw_loader
+//   의 _parse_header 를 의존하지 않는 custom mini-parser 를 내장).
+
+// ─── generic helpers ────────────────────────────────────────────
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = exec_with_status("test -e " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _is_symlink(path: string) -> bool {
+    let r = exec_with_status("test -L " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _readlink(path: string) -> string {
+    let r = exec_with_status("readlink " + _shell_quote(path))
+    if r[1] != 0 { return "" }
+    return to_string(r[0]).trim()
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+// sha256 of a single file — portable (macOS shasum / Linux sha256sum)
+fn _sha256_of(path: string) -> string {
+    if !_path_exists(path) { return "" }
+    let cmd = "sha256sum " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    let out1 = to_string(exec(cmd)).trim()
+    if len(out1) > 0 { return out1 }
+    let cmd2 = "shasum -a 256 " + _shell_quote(path) + " 2>/dev/null | awk '{print $1}'"
+    return to_string(exec(cmd2)).trim()
+}
+
+fn _bytes_of(path: string) -> string {
+    if !_path_exists(path) { return "0" }
+    let cmd = "wc -c < " + _shell_quote(path) + " 2>/dev/null | tr -d ' '"
+    return to_string(exec(cmd)).trim()
+}
+
+// home dir expansion for ~/Dev/.workspace default
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+// ─── .workspace parser ──────────────────────────────────────────
+//
+// Returns [ws_meta, members, resources] where:
+//   ws_meta    = [name, version, root]
+//   members    = array of [alias, display, path, role, exports[], imports[]]
+//                imports[i] = [res_id, owner_alias]
+//   resources  = array of [id, desc, owner, source, kind, install, target]
+
+fn _parse_block_header(line: string) -> array {
+    // workspace "<name>"         → ["workspace", "", name]
+    // member <alias> "<display>" → ["member", alias, display]
+    // resource <id> "<desc>"     → ["resource", id, desc]
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 {
+        // allow bare `workspace` no name
+        if line == "workspace" { return ["workspace", "", ""] }
+        return []
+    }
+    let kind = line.substring(0, sp1)
+    if kind != "workspace" && kind != "member" && kind != "resource" { return [] }
+    let rest = line.substring(sp1 + 1, len(line)).trim()
+
+    if kind == "workspace" {
+        // rest = "<name>" (quoted) or empty
+        if len(rest) >= 2 && rest.substring(0, 1) == "\"" && rest.substring(len(rest) - 1, len(rest)) == "\"" {
+            return ["workspace", "", rest.substring(1, len(rest) - 1)]
+        }
+        return ["workspace", "", rest]
+    }
+
+    // member / resource — next token is the identifier
+    let sp2 = rest.index_of(" ")
+    if sp2 < 0 {
+        // just `member foo` with no display — accept
+        return [kind, rest, ""]
+    }
+    let ident = rest.substring(0, sp2)
+    let mut disp = rest.substring(sp2 + 1, len(rest)).trim()
+    if len(disp) >= 2 && disp.substring(0, 1) == "\"" && disp.substring(len(disp) - 1, len(disp)) == "\"" {
+        disp = disp.substring(1, len(disp) - 1)
+    }
+    return [kind, ident, disp]
+}
+
+fn _split_csv(val: string) -> array {
+    let mut out = []
+    let v = val.trim()
+    if len(v) == 0 { return out }
+    let parts = split(v, ",")
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn _parse_import_tok(tok: string) -> array {
+    // "<res>@<alias>" → [res, alias]; alias = "" if missing (validation will flag)
+    let at = tok.index_of("@")
+    if at <= 0 { return [tok, ""] }
+    let res = tok.substring(0, at)
+    let alias = tok.substring(at + 1, len(tok))
+    return [res, alias]
+}
+
+fn _parse_workspace(path: string) -> array {
+    let empty_meta = ["", "", ""]
+    if !_path_exists(path) {
+        return [empty_meta, [], []]
+    }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut ws_name = ""
+    let mut ws_version = ""
+    let mut ws_root = ""
+    let mut members = []
+    let mut resources = []
+
+    // active block state:
+    //   kind = "" | "workspace" | "member" | "resource"
+    let mut kind = ""
+    let mut cur_id = ""
+    let mut cur_disp = ""
+    // member accumulators
+    let mut m_path = ""
+    let mut m_role = ""
+    let mut m_exports = []
+    let mut m_imports = []
+    // resource accumulators
+    let mut r_owner = ""
+    let mut r_source = ""
+    let mut r_kind = ""
+    let mut r_install = ""
+    let mut r_target = ""
+
+    let mut line_no = 0
+    let total = len(lines)
+
+    for raw_line in lines {
+        line_no = line_no + 1
+        let line = _rstrip(raw_line)
+
+        // blank line = flush current block
+        if len(line) == 0 {
+            if kind == "workspace" {
+                ws_name = cur_disp
+            } else if kind == "member" {
+                members.push([cur_id, cur_disp, m_path, m_role, m_exports, m_imports])
+            } else if kind == "resource" {
+                resources.push([cur_id, cur_disp, r_owner, r_source, r_kind, r_install, r_target])
+            }
+            kind = ""
+            cur_id = ""
+            cur_disp = ""
+            m_path = ""
+            m_role = ""
+            m_exports = []
+            m_imports = []
+            r_owner = ""
+            r_source = ""
+            r_kind = ""
+            r_install = ""
+            r_target = ""
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if kind == "" { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            let mut k = stripped
+            let mut v = ""
+            if sp >= 0 {
+                k = stripped.substring(0, sp)
+                v = stripped.substring(sp + 1, len(stripped)).trim()
+            }
+
+            if kind == "workspace" {
+                if k == "version"      { ws_version = v }
+                else if k == "root"    { ws_root = v }
+                else if k == "name"    { ws_name = v }
+                else {
+                    eprintln("warn[workspace] " + path + ":" + to_string(line_no) + " unknown key '" + k + "' in workspace block")
+                }
+            } else if kind == "member" {
+                if k == "path"         { m_path = v }
+                else if k == "role"    { m_role = v }
+                else if k == "exports" {
+                    let toks = _split_csv(v)
+                    for t in toks { m_exports.push(t) }
+                }
+                else if k == "imports" {
+                    let toks = _split_csv(v)
+                    for t in toks { m_imports.push(_parse_import_tok(t)) }
+                }
+                else {
+                    eprintln("warn[workspace] " + path + ":" + to_string(line_no) + " unknown key '" + k + "' in member block")
+                }
+            } else if kind == "resource" {
+                if k == "owner"        { r_owner = v }
+                else if k == "source"  { r_source = v }
+                else if k == "kind"    { r_kind = v }
+                else if k == "install" { r_install = v }
+                else if k == "target"  { r_target = v }
+                else {
+                    eprintln("warn[workspace] " + path + ":" + to_string(line_no) + " unknown key '" + k + "' in resource block")
+                }
+            }
+        } else {
+            // flush previous block (same as blank)
+            if kind == "workspace" {
+                ws_name = cur_disp
+            } else if kind == "member" {
+                members.push([cur_id, cur_disp, m_path, m_role, m_exports, m_imports])
+            } else if kind == "resource" {
+                resources.push([cur_id, cur_disp, r_owner, r_source, r_kind, r_install, r_target])
+            }
+            kind = ""
+            cur_id = ""
+            cur_disp = ""
+            m_path = ""
+            m_role = ""
+            m_exports = []
+            m_imports = []
+            r_owner = ""
+            r_source = ""
+            r_kind = ""
+            r_install = ""
+            r_target = ""
+
+            let hdr = _parse_block_header(line)
+            if len(hdr) == 0 {
+                eprintln("warn[workspace] " + path + ":" + to_string(line_no) + " unknown column-0 line: " + line)
+                continue
+            }
+            kind = hdr[0]
+            cur_id = hdr[1]
+            cur_disp = hdr[2]
+        }
+    }
+    // flush final block
+    if kind == "workspace" {
+        ws_name = cur_disp
+    } else if kind == "member" {
+        members.push([cur_id, cur_disp, m_path, m_role, m_exports, m_imports])
+    } else if kind == "resource" {
+        resources.push([cur_id, cur_disp, r_owner, r_source, r_kind, r_install, r_target])
+    }
+
+    return [[ws_name, ws_version, ws_root], members, resources]
+}
+
+// ─── helpers on parsed data ─────────────────────────────────────
+
+fn _find_member(members: array, alias: string) -> array {
+    for m in members {
+        if m[0] == alias { return m }
+    }
+    return []
+}
+
+fn _find_resource(resources: array, id: string) -> array {
+    for r in resources {
+        if r[0] == id { return r }
+    }
+    return []
+}
+
+fn _role_is_consumer(role: string) -> bool {
+    return role == "consumer" || role == "both"
+}
+
+fn _role_is_exporter(role: string) -> bool {
+    return role == "exporter" || role == "both"
+}
+
+fn _has_dotdot(p: string) -> bool {
+    // reject any segment == ".." — simple containment scan
+    let parts = split(p, "/")
+    for s in parts {
+        if s == ".." { return true }
+    }
+    return false
+}
+
+fn _path_join(a: string, b: string) -> string {
+    if len(a) == 0 { return b }
+    if len(b) == 0 { return a }
+    let a_end = a.substring(len(a) - 1, len(a))
+    let b_start = b.substring(0, 1)
+    if a_end == "/" && b_start == "/" { return a + b.substring(1, len(b)) }
+    if a_end == "/" || b_start == "/" { return a + b }
+    let parts = [a, "/", b]
+    return parts.join("")
+}
+
+fn _dirname(p: string) -> string {
+    let mut i = len(p) - 1
+    while i >= 0 {
+        if p.substring(i, i + 1) == "/" { return p.substring(0, i) }
+        i = i - 1
+    }
+    return ""
+}
+
+fn _sha_short(s: string) -> string {
+    if len(s) < 7 { return s }
+    return s.substring(0, 7)
+}
+
+// JSON helpers — minimal string escaping (quotes + backslash)
+fn _json_str(s: string) -> string {
+    let mut out = "\""
+    let n = len(s)
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else if c == "\\" { out = out + "\\\\" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+// ─── args parsing ───────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut dry_run = false
+let mut force = false
+let mut json_out = false
+let mut check_mode = false
+let mut verify_mode = false
+let mut ws_path = ""
+
+for a in cli {
+    if a == "--dry-run" { dry_run = true }
+    else if a == "--force" { force = true }
+    else if a == "--json" { json_out = true }
+    else if a == "--check" { check_mode = true }
+    else if a == "--verify" { verify_mode = true }
+    else if len(a) >= 2 && a.substring(0, 2) == "--" {
+        eprintln("warn[workspace] unknown flag: " + a)
+    }
+    else { ws_path = a }
+}
+
+if ws_path == "" {
+    ws_path = _path_join(_home(), "Dev/.workspace")
+}
+
+if !_path_exists(ws_path) {
+    eprintln("[workspace] file not found: " + ws_path)
+    exit(2)
+}
+
+// ─── parse + validate ───────────────────────────────────────────
+
+let parsed = _parse_workspace(ws_path)
+let ws_meta = parsed[0]
+let members = parsed[1]
+let resources = parsed[2]
+
+let ws_name = ws_meta[0]
+let ws_version = ws_meta[1]
+let mut ws_root = ws_meta[2]
+if ws_root == "" {
+    ws_root = _path_join(_home(), "Dev")
+}
+
+let mut errs = []
+
+// V1 — resource owner must match a declared member
+for r in resources {
+    let rid = r[0]
+    let owner = r[2]
+    if len(_find_member(members, owner)) == 0 {
+        errs.push("[workspace] unknown owner for resource " + rid + ": " + owner)
+    }
+}
+
+// V2 — each member import <res>@<alias> resolves
+for m in members {
+    let alias = m[0]
+    let imports = m[5]
+    for imp in imports {
+        let res_id = imp[0]
+        let declared_owner = imp[1]
+        let res = _find_resource(resources, res_id)
+        if len(res) == 0 {
+            errs.push("[workspace] import mismatch: " + alias + " imports " + res_id + "@" + declared_owner + " (resource undeclared)")
+            continue
+        }
+        if res[2] != declared_owner {
+            errs.push("[workspace] import mismatch: " + alias + " imports " + res_id + "@" + declared_owner + " (owner actually " + res[2] + ")")
+        }
+    }
+}
+
+// V3 — resource source path exists on disk (resolve root + owner.path + source)
+// V4 — install ∈ {symlink, copy, path}
+for r in resources {
+    let rid = r[0]
+    let owner = r[2]
+    let src_rel = r[3]
+    let install = r[5]
+
+    if install != "symlink" && install != "copy" && install != "path" {
+        errs.push("[workspace] resource " + rid + ": invalid install '" + install + "' — expected symlink|copy|path")
+    }
+
+    let om = _find_member(members, owner)
+    if len(om) == 0 { continue }      // already flagged in V1
+    let owner_path = om[2]
+    if _has_dotdot(owner_path) {
+        errs.push("[workspace] member " + owner + ": path '" + owner_path + "' contains '..' (root escape denied)")
+        continue
+    }
+    let abs_src = _path_join(_path_join(ws_root, owner_path), src_rel)
+    if !_path_exists(abs_src) {
+        errs.push("[workspace] missing source: " + abs_src)
+    }
+}
+
+// V5 — no consumer target collision
+// For every (consumer_alias, resolved_target_abs) pair, ensure uniqueness.
+let mut seen_keys = []
+let mut seen_res = []
+for m in members {
+    let alias = m[0]
+    let role = m[3]
+    if !_role_is_consumer(role) { continue }
+    let m_path_rel = m[2]
+    if _has_dotdot(m_path_rel) {
+        errs.push("[workspace] member " + alias + ": path '" + m_path_rel + "' contains '..' (root escape denied)")
+        continue
+    }
+    let imports = m[5]
+    for imp in imports {
+        let res_id = imp[0]
+        let res = _find_resource(resources, res_id)
+        if len(res) == 0 { continue }
+        let target_rel = res[6]
+        let abs_tgt = _path_join(_path_join(ws_root, m_path_rel), target_rel)
+        let key_parts = [alias, "|", abs_tgt]
+        let key = key_parts.join("")
+        let mut dup = false
+        let mut si = 0
+        while si < len(seen_keys) {
+            if seen_keys[si] == key { dup = true; break }
+            si = si + 1
+        }
+        if dup {
+            errs.push("[workspace] target collision: " + alias + " has two resources resolving to " + abs_tgt + " (" + seen_res[si] + " + " + res_id + ")")
+        } else {
+            seen_keys.push(key)
+            seen_res.push(res_id)
+        }
+    }
+}
+
+if len(errs) > 0 {
+    eprintln("[workspace] validation FAIL — " + to_string(len(errs)) + " errors")
+    for e in errs { eprintln("  " + e) }
+    exit(1)
+}
+
+// ─── plan operations ────────────────────────────────────────────
+//
+// operations[i] = [op, consumer_alias, target_abs, source_abs, resource_id, install, note]
+// op ∈ {"create", "skip", "warn", "replace", "advice"}
+
+let mut operations = []
+let mut warn_count = 0
+
+for m in members {
+    let alias = m[0]
+    let role = m[3]
+    if !_role_is_consumer(role) { continue }
+    let m_path_rel = m[2]
+    let imports = m[5]
+
+    for imp in imports {
+        let res_id = imp[0]
+        let res = _find_resource(resources, res_id)
+        if len(res) == 0 { continue }
+        let owner = res[2]
+        let src_rel = res[3]
+        let install = res[5]
+        let target_rel = res[6]
+
+        let om = _find_member(members, owner)
+        if len(om) == 0 { continue }
+        let owner_path = om[2]
+        let abs_src = _path_join(_path_join(ws_root, owner_path), src_rel)
+        let abs_tgt = _path_join(_path_join(ws_root, m_path_rel), target_rel)
+
+        if install == "path" {
+            operations.push(["advice", alias, abs_tgt, abs_src, res_id, install, "add to PATH: " + abs_src])
+            continue
+        }
+
+        if install == "copy" {
+            // MVP: STUB — emit warn and treat like symlink.
+            operations.push(["warn", alias, abs_tgt, abs_src, res_id, install, "install=copy STUB — symlink fallback"])
+            warn_count = warn_count + 1
+        }
+
+        // symlink (or copy-fallback) handling
+        // NOTE: stage0 interpreter has historical quirks with nested `continue`
+        // inside deep if-trees — we flatten to a single push per iteration
+        // using a local `planned` flag to ensure exactly one operation pushed.
+        let mut op_tag = ""
+        let mut op_note = ""
+
+        if _is_symlink(abs_tgt) {
+            let cur = _readlink(abs_tgt)
+            if cur == abs_src {
+                op_tag = "skip"
+                op_note = "already symlink to " + owner
+            } else {
+                if force {
+                    op_tag = "replace"
+                    op_note = "mismatch was → " + cur
+                } else {
+                    op_tag = "warn"
+                    op_note = "symlink mismatch (target → " + cur + "), use --force to replace"
+                    warn_count = warn_count + 1
+                }
+            }
+        } else if _path_exists(abs_tgt) {
+            // not a symlink — regular file/dir
+            if force {
+                op_tag = "replace"
+                op_note = "backup to .bak"
+            } else {
+                op_tag = "warn"
+                op_note = "target exists (non-symlink), use --force to replace"
+                warn_count = warn_count + 1
+            }
+        } else {
+            op_tag = "create"
+            op_note = ""
+        }
+
+        operations.push([op_tag, alias, abs_tgt, abs_src, res_id, install, op_note])
+    }
+}
+
+// ─── lock file paths ────────────────────────────────────────────
+
+let lock_path = _path_join(ws_root, ".workspace.lock")
+
+// ─── --check: compare current FS against .workspace.lock ────────
+
+if check_mode {
+    if !_path_exists(lock_path) {
+        eprintln("[workspace] --check: lock file missing: " + lock_path)
+        exit(1)
+    }
+    // re-read operations + verify each symlink resolves as expected.
+    let mut drift = []
+    for op in operations {
+        let op_kind = op[0]
+        let abs_tgt = op[2]
+        let abs_src = op[3]
+        let install = op[5]
+        if install != "symlink" && install != "copy" { continue }
+        if !_is_symlink(abs_tgt) {
+            drift.push("missing symlink: " + abs_tgt)
+            continue
+        }
+        let cur = _readlink(abs_tgt)
+        if cur != abs_src {
+            drift.push("symlink drift: " + abs_tgt + " → " + cur + " (expected " + abs_src + ")")
+        }
+    }
+    if len(drift) > 0 {
+        eprintln("[workspace] --check: FS drift (" + to_string(len(drift)) + ")")
+        for d in drift { eprintln("  " + d) }
+        exit(1)
+    }
+    println("[workspace] --check: in sync (" + to_string(len(operations)) + " links)")
+    exit(0)
+}
+
+// ─── --verify: compare content SHA256 against lock ──────────────
+
+if verify_mode {
+    if !_path_exists(lock_path) {
+        eprintln("[workspace] --verify: lock file missing: " + lock_path)
+        exit(1)
+    }
+    let lock_src = to_string(read_file(lock_path))
+    let lock_lines = split(lock_src, "\n")
+    // parse "resource <id>" blocks with sha256 key
+    let mut lock_map = []  // array of [id, sha]
+    let mut cur_res = ""
+    for raw_line in lock_lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 { cur_res = ""; continue }
+        if line.substring(0, 1) == "#" { continue }
+        if line.substring(0, 1) == " " {
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let k = stripped.substring(0, sp)
+            let v = stripped.substring(sp + 1, len(stripped)).trim()
+            if k == "sha256" && cur_res != "" {
+                lock_map.push([cur_res, v])
+            }
+        } else {
+            let sp = line.index_of(" ")
+            if sp < 0 { continue }
+            if line.substring(0, sp) == "resource" {
+                cur_res = line.substring(sp + 1, len(line)).trim()
+            }
+        }
+    }
+    let mut drift = []
+    for r in resources {
+        let rid = r[0]
+        let owner = r[2]
+        let src_rel = r[3]
+        let om = _find_member(members, owner)
+        if len(om) == 0 { continue }
+        let abs_src = _path_join(_path_join(ws_root, om[2]), src_rel)
+        let cur_sha = _sha256_of(abs_src)
+        let mut locked_sha = ""
+        for kv in lock_map {
+            if kv[0] == rid { locked_sha = kv[1]; break }
+        }
+        if locked_sha == "" {
+            drift.push(rid + ": absent from lock")
+        } else if locked_sha != cur_sha {
+            drift.push(rid + ": sha256 drift (was " + _sha_short(locked_sha) + ", now " + _sha_short(cur_sha) + ")")
+        }
+    }
+    if len(drift) > 0 {
+        eprintln("[workspace] --verify: content drift (" + to_string(len(drift)) + ")")
+        for d in drift { eprintln("  " + d) }
+        exit(1)
+    }
+    println("[workspace] --verify: content in sync (" + to_string(len(resources)) + " resources)")
+    exit(0)
+}
+
+// ─── execute operations (or dry-run) ────────────────────────────
+
+let mut created = 0
+let mut skipped = 0
+let mut replaced = 0
+let mut op_errors = 0
+
+for op in operations {
+    let op_kind = op[0]
+    if op_kind == "skip" || op_kind == "advice" {
+        skipped = skipped + 1
+        continue
+    }
+    if op_kind == "warn" {
+        // already counted in warn_count; skip FS action
+        continue
+    }
+    let abs_tgt = op[2]
+    let abs_src = op[3]
+
+    if dry_run { continue }
+
+    // ensure parent dir exists
+    let parent = _dirname(abs_tgt)
+    if parent != "" && !_path_exists(parent) {
+        let mkd = exec_with_status("mkdir -p " + _shell_quote(parent))
+        if mkd[1] != 0 {
+            eprintln("[workspace] mkdir failed (permission?): " + parent + " — skip " + abs_tgt)
+            op_errors = op_errors + 1
+            continue
+        }
+    }
+
+    if op_kind == "replace" {
+        // backup + remove existing target
+        if _path_exists(abs_tgt) || _is_symlink(abs_tgt) {
+            let bak_parts = [abs_tgt, ".bak"]
+            let bak = bak_parts.join("")
+            let mv = exec_with_status("mv " + _shell_quote(abs_tgt) + " " + _shell_quote(bak))
+            if mv[1] != 0 {
+                eprintln("[workspace] backup failed (permission?): " + abs_tgt + " — skip")
+                op_errors = op_errors + 1
+                continue
+            }
+        }
+    }
+
+    let ln = exec_with_status("ln -s " + _shell_quote(abs_src) + " " + _shell_quote(abs_tgt))
+    if ln[1] != 0 {
+        eprintln("[workspace] ln -s failed (permission?): " + abs_tgt)
+        op_errors = op_errors + 1
+        continue
+    }
+    if op_kind == "create" { created = created + 1 }
+    if op_kind == "replace" { replaced = replaced + 1 }
+}
+
+// ─── write lock file ────────────────────────────────────────────
+//
+// Only write lock on real run (not --dry-run). --check / --verify already
+// exited above.
+
+if !dry_run {
+    let mut lock_parts = []
+    lock_parts.push("# auto-generated by tool/workspace_sync.hexa — do not edit\n")
+    let hdr_parts = ["# workspace: ", ws_name, " ", ws_version, "\n"]
+    lock_parts.push(hdr_parts.join(""))
+    let gen_parts = ["# generated: ", _iso_utc_now(), "\n"]
+    lock_parts.push(gen_parts.join(""))
+    lock_parts.push("\n")
+
+    for r in resources {
+        let rid = r[0]
+        let owner = r[2]
+        let src_rel = r[3]
+        let om = _find_member(members, owner)
+        if len(om) == 0 { continue }
+        let abs_src = _path_join(_path_join(ws_root, om[2]), src_rel)
+        let sha = _sha256_of(abs_src)
+        let bytes_s = _bytes_of(abs_src)
+
+        // consumers list — members that import this resource
+        let mut consumers = []
+        for m in members {
+            if !_role_is_consumer(m[3]) { continue }
+            for imp in m[5] {
+                if imp[0] == rid { consumers.push(m[0]); break }
+            }
+        }
+
+        let h_parts = ["resource ", rid, "\n"]
+        lock_parts.push(h_parts.join(""))
+        let s_parts = ["  sha256  ", sha, "\n"]
+        lock_parts.push(s_parts.join(""))
+        let b_parts = ["  bytes   ", bytes_s, "\n"]
+        lock_parts.push(b_parts.join(""))
+        let src_parts = ["  source  ", abs_src, "\n"]
+        lock_parts.push(src_parts.join(""))
+        if len(consumers) > 0 {
+            let c_parts = ["  consumers ", consumers.join(" "), "\n"]
+            lock_parts.push(c_parts.join(""))
+        }
+        lock_parts.push("\n")
+    }
+
+    let lock_text = lock_parts.join("")
+    write_file(lock_path, lock_text)
+}
+
+// ─── output ─────────────────────────────────────────────────────
+
+if json_out {
+    // Minimal JSON shape: {workspace,version,root,members:[...],resources:[...],operations:[...],lock}
+    let mut out = "{"
+    out = out + "\"workspace\":" + _json_str(ws_name) + ","
+    out = out + "\"version\":" + _json_str(ws_version) + ","
+    out = out + "\"root\":" + _json_str(ws_root) + ","
+    out = out + "\"members\":["
+    let mut mi = 0
+    while mi < len(members) {
+        let m = members[mi]
+        if mi > 0 { out = out + "," }
+        out = out + "{"
+        out = out + "\"alias\":" + _json_str(m[0]) + ","
+        out = out + "\"display\":" + _json_str(m[1]) + ","
+        out = out + "\"path\":" + _json_str(m[2]) + ","
+        out = out + "\"role\":" + _json_str(m[3])
+        out = out + "}"
+        mi = mi + 1
+    }
+    out = out + "],\"resources\":["
+    let mut ri = 0
+    while ri < len(resources) {
+        let r = resources[ri]
+        if ri > 0 { out = out + "," }
+        out = out + "{"
+        out = out + "\"id\":" + _json_str(r[0]) + ","
+        out = out + "\"desc\":" + _json_str(r[1]) + ","
+        out = out + "\"owner\":" + _json_str(r[2]) + ","
+        out = out + "\"source\":" + _json_str(r[3]) + ","
+        out = out + "\"kind\":" + _json_str(r[4]) + ","
+        out = out + "\"install\":" + _json_str(r[5]) + ","
+        out = out + "\"target\":" + _json_str(r[6])
+        out = out + "}"
+        ri = ri + 1
+    }
+    out = out + "],\"operations\":["
+    let mut oi = 0
+    while oi < len(operations) {
+        let op = operations[oi]
+        if oi > 0 { out = out + "," }
+        out = out + "{"
+        out = out + "\"op\":" + _json_str(op[0]) + ","
+        out = out + "\"consumer\":" + _json_str(op[1]) + ","
+        out = out + "\"target\":" + _json_str(op[2]) + ","
+        out = out + "\"source\":" + _json_str(op[3]) + ","
+        out = out + "\"resource\":" + _json_str(op[4]) + ","
+        out = out + "\"install\":" + _json_str(op[5]) + ","
+        out = out + "\"note\":" + _json_str(op[6])
+        out = out + "}"
+        oi = oi + 1
+    }
+    out = out + "],\"lock\":" + _json_str(lock_path)
+    out = out + ",\"dry_run\":"
+    if dry_run { out = out + "true" } else { out = out + "false" }
+    out = out + "}"
+    println(out)
+    if op_errors > 0 { exit(1) }
+    exit(0)
+}
+
+// human output
+println("── workspace_sync ──")
+let ws_line_parts = ["workspace : ", ws_name, " ", ws_version]
+println(ws_line_parts.join(""))
+let root_line_parts = ["root      : ", ws_root]
+println(root_line_parts.join(""))
+println("")
+
+let res_hdr_parts = ["resources : ", to_string(len(resources))]
+println(res_hdr_parts.join(""))
+for r in resources {
+    let rid = r[0]
+    let rkind = r[4]
+    let owner = r[2]
+    let src_rel = r[3]
+    let om = _find_member(members, owner)
+    let abs_src = _path_join(_path_join(ws_root, om[2]), src_rel)
+    let sha = _sha256_of(abs_src)
+    let mut type_tag = "file"
+    if rkind == "executable" { type_tag = "exec" }
+    else if rkind == "dir" { type_tag = "dir " }
+    let rp = ["  ", rid, "\t", type_tag, "  ", abs_src, "  (sha256:", _sha_short(sha), "...)"]
+    println(rp.join(""))
+}
+println("")
+
+let mut ex_count = 0
+let mut co_count = 0
+for m in members {
+    if _role_is_exporter(m[3]) { ex_count = ex_count + 1 }
+    if _role_is_consumer(m[3]) { co_count = co_count + 1 }
+}
+let mem_parts = ["members   : ", to_string(len(members)), " (", to_string(ex_count), " exporter, ", to_string(co_count), " consumers)"]
+println(mem_parts.join(""))
+println("")
+
+println("operations:")
+for op in operations {
+    let op_kind = op[0]
+    let abs_tgt = op[2]
+    let abs_src = op[3]
+    let note = op[6]
+    let tag_parts = ["  [", op_kind, "]\t"]
+    let mut line_parts = [tag_parts.join(""), abs_tgt, " → ", abs_src]
+    if len(note) > 0 {
+        line_parts.push("  (")
+        line_parts.push(note)
+        line_parts.push(")")
+    }
+    println(line_parts.join(""))
+}
+println("")
+
+let summary_parts = ["summary   : created=", to_string(created), " skipped=", to_string(skipped), " replaced=", to_string(replaced), " warnings=", to_string(warn_count), " errors=", to_string(op_errors)]
+println(summary_parts.join(""))
+let lock_line_parts = ["lock      : ", lock_path]
+println(lock_line_parts.join(""))
+println("")
+
+if op_errors > 0 { exit(1) }
+exit(0)
