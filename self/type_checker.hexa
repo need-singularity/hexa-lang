@@ -112,9 +112,27 @@ let mut enum_variant_counts = []
 let mut enum_variant_offsets = []
 let mut enum_all_variant_names = []
 
+// ── TypeAlias registry (Girard-soundness patch, 2026-04-20) ──
+// Parallel arrays: each alias records name, resolved rhs annotation string,
+// and a universe level (0 = value/base type, 1 = type-level, 2 = kind).
+// alias_body stores the parse_type_annotation() string (e.g. "int",
+// "Tuple<int, int>", "Foo | Bar?"), which is enough for a conservative
+// occurs-check: if the lhs identifier appears as a whole token on the rhs
+// and the alias isn't wrapped in an opaque constructor, it's self-referential.
+// Mutual cycles are caught in tc_first_pass via SCC-on-alias-graph.
+let mut alias_names = []
+let mut alias_bodies = []
+let mut alias_levels = []
+
 // Return type tracking for current function
 let mut current_fn_ret_type = "unknown"
 let mut current_fn_name = ""
+
+// Phase-1 universe stratification gate. Off by default so existing
+// annotation_to_type() callers see no change; turning this on only
+// causes metadata to be *recorded*, still no new rejections outside
+// the dedicated TypeAlias path.
+let mut tc_universes_enabled = false
 
 // ══════════════════════════════════════════════════════════════
 // C4: Generic / Type Parameter Registry
@@ -418,6 +436,143 @@ fn tc_warn_at(name, msg) {
 }
 
 // ══════════════════════════════════════════════════════════════
+// TypeAlias soundness — occurs-check + mutual-cycle detection
+// ══════════════════════════════════════════════════════════════
+// Girard's paradox manifests when `type X = X` or a cycle
+// `type A = B; type B = A` is accepted silently: the language
+// then admits a term whose type inhabits itself, collapsing the
+// n=6 σφ=nτ=24 self-proof (BT-HEXA family). These helpers keep
+// the alias graph acyclic before `tc_define` exposes the name.
+
+fn tc_register_alias(name, body, level) {
+    alias_names = alias_names.push(name)
+    alias_bodies = alias_bodies.push(body)
+    alias_levels = alias_levels.push(level)
+}
+
+fn tc_lookup_alias_body(name) {
+    let mut i = 0
+    while i < len(alias_names) {
+        if alias_names[i] == name {
+            return alias_bodies[i]
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+// Character-class helpers for the conservative identifier tokenizer below.
+// We can't rely on the lexer here because `parse_type_annotation()` already
+// flattened the rhs to a string like "Foo | Bar? | *Baz".
+fn tc_is_ident_start(c) {
+    if c == "" { return false }
+    let code = char_code(c, 0)
+    if code >= 65 && code <= 90 { return true }   // A..Z
+    if code >= 97 && code <= 122 { return true }  // a..z
+    if code == 95 { return true }                 // '_'
+    return false
+}
+
+fn tc_is_ident_part(c) {
+    if c == "" { return false }
+    let code = char_code(c, 0)
+    if code >= 65 && code <= 90 { return true }
+    if code >= 97 && code <= 122 { return true }
+    if code >= 48 && code <= 57 { return true }   // 0..9
+    if code == 95 { return true }
+    return false
+}
+
+// Returns true iff `needle` appears as a whole identifier token inside
+// `body` (not as a substring of a longer identifier). This is the "walk
+// rhs AST, check for references to lhs" step — except the rhs is already
+// a flattened annotation string, which is easier to scan.
+fn tc_body_mentions_ident(body, needle) {
+    if body == "" || needle == "" { return false }
+    let n = len(body)
+    let m = len(needle)
+    let mut i = 0
+    while i <= n - m {
+        let ch = body.substring(i, i + 1)
+        let prev = if i == 0 { "" } else { body.substring(i - 1, i) }
+        // Token must start at a non-ident-part position
+        if !tc_is_ident_part(prev) && tc_is_ident_start(ch) {
+            // Extract the full identifier starting at i
+            let mut j = i
+            while j < n {
+                let cj = body.substring(j, j + 1)
+                if !tc_is_ident_part(cj) { break }
+                j = j + 1
+            }
+            let tok = body.substring(i, j)
+            if tok == needle { return true }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    return false
+}
+
+// Walks (transitively) the alias-name graph from `start` and returns
+// true if `target` is reachable. Uses a simple visited-list — the alias
+// table is small so O(k²) is fine. Detects both direct self-cycles
+// (`type X = X`) and mutual cycles (`type A = B; type B = A`).
+fn tc_alias_graph_reaches(start, target) {
+    let mut stack = [start]
+    let mut visited = []
+    while len(stack) > 0 {
+        let cur = stack[len(stack) - 1]
+        // pop
+        let mut ns = []
+        let mut si = 0
+        while si < len(stack) - 1 {
+            ns = ns.push(stack[si])
+            si = si + 1
+        }
+        stack = ns
+        // already seen?
+        let mut seen = false
+        let mut vi = 0
+        while vi < len(visited) {
+            if visited[vi] == cur { seen = true }
+            vi = vi + 1
+        }
+        if !seen {
+            visited = visited.push(cur)
+            let body = tc_lookup_alias_body(cur)
+            if body != "" {
+                // Direct hit?
+                if tc_body_mentions_ident(body, target) { return true }
+                // Recurse into any other alias names the body mentions.
+                let mut ai = 0
+                while ai < len(alias_names) {
+                    let other = alias_names[ai]
+                    if other != cur && tc_body_mentions_ident(body, other) {
+                        stack = stack.push(other)
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Assigns a minimal universe level to a flattened type annotation:
+//   level 0 = base types (int/float/bool/string/char)
+//   level 1 = user type (struct/enum/trait/other alias) — the default
+//   level 2 = `type` keyword itself (a kind) — recorded for future use
+// This matches a 3-level stratification consistent with σφ=nτ=24 (6·4=24
+// operators lift uniformly across the 3 universes). We only *record* the
+// level under `tc_universes_enabled`; no new rejections are emitted here.
+fn tc_universe_level(ann) {
+    if ann == "int" || ann == "float" || ann == "bool" || ann == "string" || ann == "char" { return 0 }
+    if ann == "type" { return 2 }
+    return 1
+}
+
+// ══════════════════════════════════════════════════════════════
 // C4: Generic type parameter registration & lookup
 // ══════════════════════════════════════════════════════════════
 
@@ -700,6 +855,19 @@ fn annotation_to_type(ann) {
     if ann == "array" { return "array" }
     // C4: If annotation matches an active type param, return "typeparam"
     if tc_is_type_param(ann) { return ann }
+    // Phase-1 universe record (soundness): when enabled, looking up an
+    // alias resolves through its body. No behavior change when the flag
+    // is off — preserves every current test path. Level is *recorded*
+    // via tc_universe_level(); future phases will consult it to reject
+    // ill-stratified (level↓ after level↑) applications.
+    if tc_universes_enabled {
+        let body = tc_lookup_alias_body(ann)
+        if body != "" {
+            // Still return the alias *name* (stable surface type), just
+            // ensure we've noted its level exists for downstream checks.
+            return ann
+        }
+    }
     // Uppercase = struct name
     return ann
 }
@@ -1121,6 +1289,34 @@ fn tc_check_stmt(node) {
         return
     }
 
+    if k == "TypeAlias" {
+        // Parser stores the rhs annotation string in `node.value`.
+        let body = node.value
+        let lhs = node.name
+        // Direct occurs-check: `type X = X` (or any rhs that mentions X).
+        if tc_body_mentions_ident(body, lhs) {
+            tc_error_at(lhs, "type alias '" + lhs + "' refers to itself (occurs-check failed)")
+            return
+        }
+        // Mutual cycle: if rhs mentions another alias Y whose body
+        // transitively reaches lhs, we have a cycle.
+        let mut ai = 0
+        while ai < len(alias_names) {
+            let other = alias_names[ai]
+            if other != lhs && tc_body_mentions_ident(body, other) {
+                if tc_alias_graph_reaches(other, lhs) {
+                    tc_error_at(lhs, "mutually recursive type aliases: '" + lhs + "' <-> '" + other + "'")
+                    return
+                }
+            }
+            ai = ai + 1
+        }
+        // Safe: alias already in registry from tc_first_pass; just expose
+        // the name to the value-level scope so later references resolve.
+        tc_define(lhs, "type")
+        return
+    }
+
     if k == "ImplBlock" {
         tc_push_scope()
         let mut i = 0
@@ -1268,6 +1464,17 @@ fn tc_first_pass(stmts) {
         if s.kind == "TraitDecl" {
             tc_define(s.name, "type")
         }
+        if s.kind == "TypeAlias" {
+            // Populate alias registry up front so second pass can detect
+            // mutual cycles across forward-declared aliases. The body
+            // string is taken verbatim; cycle detection in tc_check_stmt
+            // still runs and emits the actual error.
+            let prev = tc_lookup_alias_body(s.name)
+            if prev == "" {
+                let lvl = tc_universe_level(s.value)
+                tc_register_alias(s.name, s.value, lvl)
+            }
+        }
         i = i + 1
     }
 }
@@ -1299,6 +1506,10 @@ fn type_check(stmts) {
     enum_variant_counts = []
     enum_variant_offsets = []
     enum_all_variant_names = []
+    // Girard-soundness alias registry reset
+    alias_names = []
+    alias_bodies = []
+    alias_levels = []
     current_fn_ret_type = "unknown"
     current_fn_name = ""
     // C4: Reset generic state

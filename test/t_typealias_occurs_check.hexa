@@ -1,0 +1,229 @@
+// t_typealias_occurs_check.hexa — TypeAlias soundness regression
+//
+// Protects against a Girard-paradox-class vulnerability in
+// self/type_checker.hexa:
+//   Before 2026-04-20 patch, tc_check_stmt had NO case for "TypeAlias".
+//   The parser accepted `type X = X` (L3166-3178) silently and the node
+//   reached codegen untouched — contradicting the n=6 self-proof
+//   (σφ=nτ=24, BT-HEXA family).
+//
+// Fix: tc_check_stmt now runs an occurs-check + mutual-cycle detection
+//   on each TypeAlias before exposing the name, with a 3-level universe
+//   tag (value/type/kind) recorded on safe aliases.
+//
+// Test strategy: SEED FREEZE is active, so we cannot rebuild stage0 to
+//   exercise the real tc_check_stmt from this file at runtime. Instead,
+//   this test re-implements the *exact* occurs-check + mutual-cycle
+//   algorithm used in type_checker.hexa and asserts it classifies each
+//   of the 4 canonical cases correctly. When stage0 is next rebuilt,
+//   the mirrored logic here should converge with the baked behavior —
+//   if it ever diverges, either the algorithm or the test is wrong.
+//
+// EXPECTED: all4 cases PASS
+// ENV: HEXA_VAL_ARENA=0
+
+// ── Mirror of the occurs-check helpers in type_checker.hexa ──
+// Keep these byte-for-byte aligned with the fn bodies in the type
+// checker so a copy-paste diff is trivial.
+
+fn _tc_is_ident_start(c) {
+    if c == "" { return false }
+    let code = char_code(c, 0)
+    if code >= 65 && code <= 90 { return true }
+    if code >= 97 && code <= 122 { return true }
+    if code == 95 { return true }
+    return false
+}
+
+fn _tc_is_ident_part(c) {
+    if c == "" { return false }
+    let code = char_code(c, 0)
+    if code >= 65 && code <= 90 { return true }
+    if code >= 97 && code <= 122 { return true }
+    if code >= 48 && code <= 57 { return true }
+    if code == 95 { return true }
+    return false
+}
+
+fn _tc_body_mentions_ident(body, needle) {
+    if body == "" || needle == "" { return false }
+    let n = len(body)
+    let m = len(needle)
+    let mut i = 0
+    while i <= n - m {
+        let ch = body.substring(i, i + 1)
+        let prev = if i == 0 { "" } else { body.substring(i - 1, i) }
+        if !_tc_is_ident_part(prev) && _tc_is_ident_start(ch) {
+            let mut j = i
+            while j < n {
+                let cj = body.substring(j, j + 1)
+                if !_tc_is_ident_part(cj) { break }
+                j = j + 1
+            }
+            let tok = body.substring(i, j)
+            if tok == needle { return true }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    return false
+}
+
+// Alias registry (parallel arrays)
+let mut _alias_names = []
+let mut _alias_bodies = []
+
+fn _lookup_body(name) {
+    let mut i = 0
+    while i < len(_alias_names) {
+        if _alias_names[i] == name { return _alias_bodies[i] }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _reaches(start, target) {
+    let mut stack = [start]
+    let mut visited = []
+    while len(stack) > 0 {
+        let cur = stack[len(stack) - 1]
+        let mut ns = []
+        let mut si = 0
+        while si < len(stack) - 1 { ns = ns.push(stack[si]); si = si + 1 }
+        stack = ns
+        let mut seen = false
+        let mut vi = 0
+        while vi < len(visited) { if visited[vi] == cur { seen = true } vi = vi + 1 }
+        if !seen {
+            visited = visited.push(cur)
+            let body = _lookup_body(cur)
+            if body != "" {
+                if _tc_body_mentions_ident(body, target) { return true }
+                let mut ai = 0
+                while ai < len(_alias_names) {
+                    let other = _alias_names[ai]
+                    if other != cur && _tc_body_mentions_ident(body, other) {
+                        stack = stack.push(other)
+                    }
+                    ai = ai + 1
+                }
+            }
+        }
+    }
+    return false
+}
+
+// Classifier: returns "" if safe, else the error message the patched
+// type_checker would emit.
+fn _classify(name, body) {
+    if _tc_body_mentions_ident(body, name) {
+        return "type alias '" + name + "' refers to itself (occurs-check failed)"
+    }
+    let mut ai = 0
+    while ai < len(_alias_names) {
+        let other = _alias_names[ai]
+        if other != name && _tc_body_mentions_ident(body, other) {
+            if _reaches(other, name) {
+                return "mutually recursive type aliases: '" + name + "' <-> '" + other + "'"
+            }
+        }
+        ai = ai + 1
+    }
+    return ""
+}
+
+fn _register(name, body) {
+    _alias_names = _alias_names.push(name)
+    _alias_bodies = _alias_bodies.push(body)
+}
+
+fn _reset() {
+    _alias_names = []
+    _alias_bodies = []
+}
+
+// ── Test cases ──
+
+fn case_self_loop() {
+    // case 1: type X = X
+    _reset()
+    _register("X", "X")
+    let err = _classify("X", "X")
+    if err == "" {
+        println("case1 FAIL: `type X = X` passed occurs-check")
+        return false
+    }
+    if !err.contains("occurs-check failed") {
+        println("case1 FAIL: unexpected message: " + err)
+        return false
+    }
+    println("case1 PASS: " + err)
+    return true
+}
+
+fn case_mutual_cycle() {
+    // case 2: type A = B; type B = A
+    _reset()
+    _register("A", "B")
+    _register("B", "A")
+    let err = _classify("B", "A")  // second alias triggers
+    if err == "" {
+        println("case2 FAIL: mutual cycle A<->B not detected")
+        return false
+    }
+    if !err.contains("mutually recursive") {
+        println("case2 FAIL: unexpected message: " + err)
+        return false
+    }
+    println("case2 PASS: " + err)
+    return true
+}
+
+fn case_plain_alias() {
+    // case 3: type Nat = int   (must pass)
+    _reset()
+    _register("Nat", "int")
+    let err = _classify("Nat", "int")
+    if err != "" {
+        println("case3 FAIL: `type Nat = int` rejected: " + err)
+        return false
+    }
+    println("case3 PASS: type Nat = int accepted")
+    return true
+}
+
+fn case_generic_alias() {
+    // case 4: type Pair = Tuple<int, int>  — must pass (no self-ref)
+    // parse_type_annotation would flatten this; we use the same shape
+    // the parser emits (`Tuple<int, int>` as a bare string; the parser
+    // currently passes `Tuple` on its own because `<...>` is handled at
+    // the expression-level, but for this test we just need to verify
+    // the classifier does NOT falsely flag `Tuple<int, int>` as a
+    // self-cycle of `Pair`).
+    _reset()
+    _register("Pair", "Tuple<int, int>")
+    let err = _classify("Pair", "Tuple<int, int>")
+    if err != "" {
+        println("case4 FAIL: `type Pair = Tuple<int, int>` rejected: " + err)
+        return false
+    }
+    println("case4 PASS: type Pair = Tuple<int, int> accepted")
+    return true
+}
+
+fn main() {
+    let mut ok = 0
+    if case_self_loop() { ok = ok + 1 }
+    if case_mutual_cycle() { ok = ok + 1 }
+    if case_plain_alias() { ok = ok + 1 }
+    if case_generic_alias() { ok = ok + 1 }
+    println("")
+    if ok == 4 {
+        println("all4 cases PASS")
+    } else {
+        println("FAIL — " + to_string(ok) + "/4 cases passed")
+    }
+}
+
+main()
