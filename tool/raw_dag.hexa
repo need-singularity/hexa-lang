@@ -1,0 +1,325 @@
+#!hexa strict
+// tool/raw_dag.hexa — raw#0 P2 rule DAG + topological dispatch
+//
+// PURPOSE
+//   raw_all currently dispatches enforcers in .raw declaration order.
+//   Some rules are structurally dependent — e.g. raw:proof-carrying
+//   (raw#10) cannot be meaningfully evaluated until raw:self-format
+//   (raw#2) confirms the 5 SSOT files parse cleanly. When an upstream
+//   rule fails, every downstream check inherits noise that obscures
+//   the real root cause.
+//
+//   This module builds a dependency graph over the 20 raw rules and
+//   computes a topological dispatch order so raw_all can short-circuit
+//   cascade failures (upstream fail → skip downstream).
+//
+//   SAFETY
+//   · Graph is currently hardcoded from domain knowledge. Once .raw
+//     gains a `deps <slug>` key, _hardcoded_deps() becomes the fallback.
+//   · All rules implicitly depend on raw:os-lock + raw:root-ssot; the
+//     roots are emitted first in topo order.
+//   · Cycles → exit 2 with offending cycle printed (defensive; current
+//     hardcoded DAG is acyclic).
+//
+// LIBRARY API
+//   deps_of(slug)                   -> array   — direct dep slugs
+//   topo_order(rules)               -> array   — reordered rule list
+//   blockers_for(slug, failed)      -> array   — subset of failed that
+//                                                blocks this slug
+//                                                (transitive closure)
+//
+// CLI
+//   ./hexa tool/raw_dag.hexa show              — adjacency list
+//   ./hexa tool/raw_dag.hexa topo              — topological slug order
+//   ./hexa tool/raw_dag.hexa blockers <slug>   — slugs that would block
+//                                                <slug> given current
+//                                                raw_all verdicts
+
+use "self/core/law_io"
+use "self/raw_loader"
+
+// ─── hardcoded initial DAG ──────────────────────────────────────────
+//
+// Roots (everyone implicitly depends on these):
+//   raw:root-ssot  (raw#0)
+//   raw:os-lock    (raw#1)
+//
+// Explicit edges (child → parents):
+//   raw:proof-carrying    → raw:self-format
+//   raw:ai-native-enforce → raw:attr-usage
+//   raw:roadmap-ssot      → raw:proof-carrying
+//   raw:cli-required      → raw:ext-ssot
+//   raw:self-host-fixpoint→ raw:proof-carrying
+
+fn _root_slugs() -> array {
+    return ["root-ssot", "os-lock"]
+}
+
+fn _is_root(slug: string) -> bool {
+    for r in _root_slugs() { if r == slug { return true } }
+    return false
+}
+
+fn _hardcoded_deps(slug: string) -> array {
+    // Roots have no deps (would be self-cycle).
+    if _is_root(slug) { return [] }
+    // Explicit edges from brainstorm II.B3 + domain knowledge.
+    if slug == "proof-carrying"     { return ["self-format"] }
+    if slug == "ai-native-enforce"  { return ["attr-usage"] }
+    if slug == "roadmap-ssot"       { return ["proof-carrying"] }
+    if slug == "cli-required"       { return ["ext-ssot"] }
+    if slug == "self-host-fixpoint" { return ["proof-carrying"] }
+    // Default: only implicit roots.
+    return []
+}
+
+// Deps including implicit roots. root-ssot / os-lock themselves skip
+// the implicit injection to avoid self-loops.
+pub fn deps_of(slug: string) -> array {
+    let explicit = _hardcoded_deps(slug)
+    if _is_root(slug) { return explicit }
+    let mut out = []
+    for r in _root_slugs() { out = out.push(r) }
+    for d in explicit { out = out.push(d) }
+    return out
+}
+
+// ─── rule list helpers ──────────────────────────────────────────────
+
+fn _rule_slug(rule: array) -> string {
+    // rule shape from raw_loader.load_raw_file:
+    //   [id, status, name, keys] where keys = [[k,v], ...]
+    return keys_first(rule[3], "slug")
+}
+
+fn _find_rule_by_slug(rules: array, slug: string) -> array {
+    for r in rules {
+        if _rule_slug(r) == slug { return r }
+    }
+    return []
+}
+
+fn _contains_slug(arr: array, slug: string) -> bool {
+    for s in arr { if s == slug { return true } }
+    return false
+}
+
+// Stage0 arrays have no .set() — rebuild with the new value at idx.
+fn _arr_set(arr: array, idx: int, val: int) -> array {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == idx { out = out.push(val) }
+        else { out = out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── topological sort (Kahn's algorithm) ───────────────────────────
+//
+// Input: rules (as loaded). Output: rules reordered so every rule's
+// deps appear before it. Unknown-slug deps are tolerated (skipped) so
+// partial .raw during edits doesn't deadlock the sort.
+
+pub fn topo_order(rules: array) -> array {
+    let mut slugs = []
+    for r in rules {
+        let s = _rule_slug(r)
+        if s != "" { slugs = slugs.push(s) }
+    }
+
+    // Build indegree over slugs actually present in `rules`.
+    let mut indeg_slugs = []
+    let mut indeg_vals  = []
+    for s in slugs {
+        indeg_slugs = indeg_slugs.push(s)
+        indeg_vals  = indeg_vals.push(0)
+    }
+
+    let mut edges = []  // [parent, child] pairs for diagnostics
+    for s in slugs {
+        for d in deps_of(s) {
+            if !_contains_slug(slugs, d) { continue }  // unknown → skip
+            edges = edges.push([d, s])
+            let mut i = 0
+            while i < len(indeg_slugs) {
+                if indeg_slugs[i] == s {
+                    indeg_vals = _arr_set(indeg_vals, i, indeg_vals[i] + 1)
+                    break
+                }
+                i = i + 1
+            }
+        }
+    }
+
+    // Kahn: seed queue with indeg==0 nodes, preserving original order
+    // so ties remain deterministic (matches .raw declaration order).
+    let mut queue = []
+    let mut qi = 0
+    while qi < len(indeg_slugs) {
+        if indeg_vals[qi] == 0 { queue = queue.push(indeg_slugs[qi]) }
+        qi = qi + 1
+    }
+
+    let mut ordered_slugs = []
+    let mut head = 0
+    while head < len(queue) {
+        let cur = queue[head]
+        head = head + 1
+        ordered_slugs = ordered_slugs.push(cur)
+        // Scan edges for children of cur.
+        for e in edges {
+            if e[0] != cur { continue }
+            let child = e[1]
+            let mut j = 0
+            while j < len(indeg_slugs) {
+                if indeg_slugs[j] == child {
+                    let nv = indeg_vals[j] - 1
+                    indeg_vals = _arr_set(indeg_vals, j, nv)
+                    if nv == 0 { queue = queue.push(child) }
+                    break
+                }
+                j = j + 1
+            }
+        }
+    }
+
+    // Cycle detection: any slug with residual indeg > 0 sits on a cycle.
+    if len(ordered_slugs) != len(slugs) {
+        eprintln("raw_dag: cycle detected in dependency graph")
+        let mut k = 0
+        while k < len(indeg_slugs) {
+            if indeg_vals[k] > 0 {
+                eprintln("  on-cycle: raw:" + indeg_slugs[k])
+            }
+            k = k + 1
+        }
+        exit(2)
+    }
+
+    // Materialize reordered rule list.
+    let mut out = []
+    for s in ordered_slugs {
+        let r = _find_rule_by_slug(rules, s)
+        if len(r) > 0 { out = out.push(r) }
+    }
+    return out
+}
+
+// ─── blockers (transitive) ─────────────────────────────────────────
+//
+// Given a target slug and the set of currently-failing slugs, return
+// the subset of `failed` that transitively gates `slug`. Used by
+// raw_all to justify a SKIP verdict to the user.
+
+pub fn blockers_for(slug: string, failed: array) -> array {
+    let mut blockers = []
+    let mut stack = deps_of(slug)
+    let mut seen = []
+    while len(stack) > 0 {
+        let cur = stack[len(stack) - 1]
+        stack = stack.slice(0, len(stack) - 1)
+        if _contains_slug(seen, cur) { continue }
+        seen = seen.push(cur)
+        if _contains_slug(failed, cur) && !_contains_slug(blockers, cur) {
+            blockers = blockers.push(cur)
+        }
+        for d in deps_of(cur) {
+            if !_contains_slug(seen, d) { stack = stack.push(d) }
+        }
+    }
+    return blockers
+}
+
+// ─── CLI ────────────────────────────────────────────────────────────
+
+fn _load_rules() -> array {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return load_raw_file(p + "/.raw")
+}
+
+fn cmd_show() -> int {
+    let rules = _load_rules()
+    println("raw_dag adjacency (child → deps):")
+    for r in rules {
+        let s = _rule_slug(r)
+        if s == "" { continue }
+        let ds = deps_of(s)
+        if len(ds) == 0 {
+            println("  raw:" + s + "  (no deps)")
+        } else {
+            let mut parts = []
+            for d in ds { parts = parts.push("raw:" + d) }
+            println("  raw:" + s + "  ← " + parts.join(", "))
+        }
+    }
+    return 0
+}
+
+fn cmd_topo() -> int {
+    let rules = _load_rules()
+    let ordered = topo_order(rules)
+    for r in ordered {
+        let s = _rule_slug(r)
+        if s == "" { continue }
+        let parts = ["raw#", r[0], "  raw:", s, "  [", r[1], "]"]
+        println(parts.join(""))
+    }
+    return 0
+}
+
+fn cmd_blockers(slug: string) -> int {
+    // "Current raw_all state" proxy: any rule whose status is warn/new
+    // is a plausible upstream blocker candidate. This is a conservative
+    // estimate — real verdict comes from raw_all run artifacts once
+    // wired. Command still useful as a what-if inspector.
+    let rules = _load_rules()
+    let mut failed = []
+    for r in rules {
+        let st = r[1]
+        if st == "warn" || st == "new" {
+            let s = _rule_slug(r)
+            if s != "" { failed = failed.push(s) }
+        }
+    }
+    let bs = blockers_for(slug, failed)
+    if len(bs) == 0 {
+        println("no blockers for raw:" + slug +
+                " (upstream deps all live or absent from failed set)")
+        return 0
+    }
+    println("raw:" + slug + " blocked by:")
+    for b in bs { println("  raw:" + b) }
+    return 0
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/raw_dag.hexa <show|topo|blockers <slug>>")
+}
+
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let script = _av[1]
+    if script.ends_with("/raw_dag.hexa") { return true }
+    if script == "raw_dag.hexa" { return true }
+    return false
+}
+
+if _is_main() {
+    if len(_av) < 3 { _usage(); exit(2) }
+    let cmd = _av[2]
+    let mut rc = 0
+    if cmd == "show" { rc = cmd_show() }
+    else if cmd == "topo" { rc = cmd_topo() }
+    else if cmd == "blockers" {
+        if len(_av) < 4 { _usage(); exit(2) }
+        rc = cmd_blockers(_av[3])
+    } else if cmd == "--help" || cmd == "-h" { _usage(); exit(0) }
+    else { _usage(); exit(2) }
+    exit(rc)
+}
