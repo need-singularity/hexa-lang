@@ -1,0 +1,249 @@
+// gate/wrappers/src/cargo.hexa — phase-1 port of archive/v1/gate/wrappers/cargo
+// @allow-bare-exec
+//
+// Scope: filter-decide + budget counter + local exec with telemetry record.
+// Remote routing (ubu rsync + nc, hetzner ssh) is DEFERRED for phase 1:
+// any non-local target falls back to local with a stamped ag_gate_msg.
+//
+// Ref: gate/hexa_url.hexa for ai_err / $WS / @allow-bare-exec conventions.
+// Reserved-word guard (gate/HEXA_RESERVED.md): spawn / scope / find → bg_cmd / sc / index_of.
+
+use "_cache"
+
+// ─── env + paths ─────────────────────────────────────────────────────
+let WS = env("WS")
+let HOME_DIR = env("HOME")
+
+// ─── ai-native error helper ───────────────────────────────────────────
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[cargo/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── small helper: trim+echo for pure-string exec results ────────────
+fn _sh(cmd: str) -> str {
+    return to_string(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+// ─── epoch seconds ────────────────────────────────────────────────────
+fn _epoch_i() -> i64 {
+    let s = _sh("date +%s")
+    if s.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    try { n = to_int(s) } catch e { return 0 }
+    return n
+}
+
+// ─── join argv starting at index start with ' ' ──────────────────────
+fn _join_args(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + argv[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── quote each argv element for safe shell re-exec ──────────────────
+// Single-quote wrap with embedded-quote escaping: foo'bar → 'foo'\''bar'.
+fn _sh_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _quote_args(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + _sh_quote(argv[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── resolve real cargo binary, skipping this wrapper itself ─────────
+// Probe order matches v1: ~/.cargo/bin/cargo → /opt/homebrew/bin/cargo →
+// PATH-next `cargo` (skip any entry whose readlink -f equals our own path).
+fn _self_real_path() -> str {
+    // argv[0] may be a symlink into ~/.local/bin/cargo etc; readlink -f
+    // normalizes to the concrete .hexa / bin file we are running as.
+    let argv = args()
+    if argv.len() == 0 { return "" }
+    let a0 = argv[0]
+    if a0.len() == 0 { return "" }
+    let a0_sh = a0.replace("'", "'\\''")
+    return _sh("readlink -f '" + a0_sh + "' 2>/dev/null || printf '%s' '" + a0_sh + "'")
+}
+
+fn _resolve_cargo() -> str {
+    let home_candidate = HOME_DIR + "/.cargo/bin/cargo"
+    if file_exists(home_candidate) { return home_candidate }
+    let brew_candidate = "/opt/homebrew/bin/cargo"
+    if file_exists(brew_candidate) { return brew_candidate }
+
+    // PATH-walk fallback. Ask `which -a cargo`, skip entries whose
+    // readlink -f matches our own argv[0] to avoid re-entering the wrapper.
+    let myself = _self_real_path()
+    let all = _sh("which -a cargo 2>/dev/null")
+    if all.len() == 0 { return "cargo" }
+    let lines = all.split("\n")
+    let mut i = 0
+    while i < lines.len() {
+        let cand = to_string(lines[i]).trim()
+        if cand.len() > 0 {
+            let cand_sh = cand.replace("'", "'\\''")
+            let real = _sh("readlink -f '" + cand_sh + "' 2>/dev/null || printf '%s' '" + cand_sh + "'")
+            if real.len() > 0 && real != myself {
+                return cand
+            }
+        }
+        i = i + 1
+    }
+    return "cargo"
+}
+
+// ─── exec real cargo; return [exit_code_str, elapsed_str] ────────────
+// Uses `<cmd>; echo __AG_RC_$?` sentinel so we can recover the child's
+// exit code from the captured stdout (hexa's exec() returns a string,
+// not a (rc, out) tuple). Stdout + stderr are streamed through verbatim
+// by writing them back to our own stdout/stderr before returning.
+fn _exec_cargo_local(cargo_bin: str, argv_quoted: str) -> [i64] {
+    let bin_sh = cargo_bin.replace("'", "'\\''")
+    // Carry through stderr so rustc diagnostics reach the user's terminal.
+    // We merge 2>&1 into stdout to keep a single stream, then print it.
+    // Sentinel at end captures the child rc so we can parse it out.
+    let t0 = _epoch_i()
+    let cmd = "'" + bin_sh + "' " + argv_quoted + " 2>&1; printf '\\n__AG_RC_%s\\n' \"$?\""
+    let raw = to_string(exec(cmd))  // @allow-bare-exec
+    let t1 = _epoch_i()
+
+    // Split the sentinel off the end and write the rest to stdout.
+    let mut rc: i64 = 0
+    let mut body = raw
+    let idx = raw.index_of("__AG_RC_")
+    if idx >= 0 {
+        body = raw.substring(0, idx)
+        let tail = raw.substring(idx + 8, raw.len()).trim()
+        // tail may contain extra newline after the number — take leading digits.
+        let mut digits = ""
+        let mut j = 0
+        while j < tail.len() {
+            let ch = tail.substring(j, j + 1)
+            let o = ord(ch)
+            if o >= 48 && o <= 57 { digits = digits + ch } else { break }
+            j = j + 1
+        }
+        if digits.len() > 0 {
+            try { rc = to_int(digits) } catch e { rc = 0 }
+        }
+    }
+    // Strip the trailing "\n" we added before the sentinel so output is clean.
+    if body.ends_with("\n") {
+        body = body.substring(0, body.len() - 1)
+    }
+    print(body)
+    return [rc, t1 - t0]
+}
+
+fn main() {
+    // ── $WS guard — required by gate conventions (AG10) ─────────────
+    if WS.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — cargo wrapper cannot resolve config",
+               "export WS=<repo-root> in shell rc or ~/.claude/settings.json env",
+               "airgenome/rules/airgenome.json#AG10")
+        // Fall through to emergency local exec anyway — failing closed
+        // would break every cargo invocation, which is worse than losing
+        // telemetry for this one call.
+    }
+
+    let argv = args()
+    // argv layout depends on invocation mode:
+    //   - compiled binary (hexa_set_args dup'd argv[0]): [bin, bin, user1, user2, ...]
+    //   - `hexa run script.hexa` :                        [hexa, script, user1, user2, ...]
+    // Detect compiled-binary mode (argv[0] == argv[1]) and skip the duplicated
+    // program path so real-cargo doesn't see "cargo" as a bogus subcommand.
+    let mut start: i64 = 0
+    if argv.len() >= 2 && argv[0] == argv[1] { start = 2 }
+    let joined = _join_args(argv, start)
+    let quoted = _quote_args(argv, start)
+
+    // ── Emergency bypass ────────────────────────────────────────────
+    if env("CLAUDX_NO_WRAPPER") == "1" {
+        let bin = _resolve_cargo()
+        let bin_sh = bin.replace("'", "'\\''")
+        // Pass through stderr live — no sentinel needed, just let the
+        // shell return its rc via an env capture.
+        let cmd = "'" + bin_sh + "' " + quoted + " 2>&1; printf '__AG_RC_%s' \"$?\""
+        let raw = to_string(exec(cmd))  // @allow-bare-exec
+        let mut rc: i64 = 0
+        let mut body = raw
+        let idx = raw.index_of("__AG_RC_")
+        if idx >= 0 {
+            body = raw.substring(0, idx)
+            let tail = raw.substring(idx + 8, raw.len()).trim()
+            let mut digits = ""
+            let mut j = 0
+            while j < tail.len() {
+                let ch = tail.substring(j, j + 1)
+                let o = ord(ch)
+                if o >= 48 && o <= 57 { digits = digits + ch } else { break }
+                j = j + 1
+            }
+            if digits.len() > 0 {
+                try { rc = to_int(digits) } catch e { rc = 0 }
+            }
+        }
+        print(body)
+        exit(rc)
+    }
+
+    // ── Filter decision ─────────────────────────────────────────────
+    let decision = ag_filter_decide("cargo", joined)
+    let target = decision[0]
+    let reason = decision[1]
+
+    // ── Budget: wrap exec in try/catch so we always leave on the way out.
+    ag_budget_enter()
+    let cargo_bin = _resolve_cargo()
+
+    let mut rc: i64 = 0
+    let mut elapsed: i64 = 0
+    let mut effective_target = target
+
+    try {
+        if target == "local" {
+            ag_gate_msg("local", "cargo " + joined + " [filter:" + reason + "]")
+            let r = _exec_cargo_local(cargo_bin, quoted)
+            rc = r[0]
+            elapsed = r[1]
+        } else {
+            // TODO(phase-2): implement ubu rsync+nc and hetzner ssh routes
+            // (see archive/v1/gate/wrappers/cargo lines 49–64). For now we
+            // record the decision for telemetry but execute locally so the
+            // user's build doesn't regress while remote glue is unfinished.
+            ag_gate_msg("local", "remote routing deferred — cargo " + joined +
+                        " [wanted:" + target + " reason:" + reason + "]")
+            let r = _exec_cargo_local(cargo_bin, quoted)
+            rc = r[0]
+            elapsed = r[1]
+            effective_target = "local"
+        }
+    } catch e {
+        ai_err("EXEC-FAIL",
+               "cargo exec threw — falling back to bare exec",
+               "check that " + cargo_bin + " is executable",
+               "gate/wrappers/src/cargo.hexa:main")
+        rc = 1
+        elapsed = 0
+    }
+
+    ag_budget_leave()
+    ag_filter_record("cargo", effective_target, rc, elapsed)
+    exit(rc)
+}
+
+main()

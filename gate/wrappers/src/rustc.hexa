@@ -1,0 +1,190 @@
+// gate/wrappers/src/rustc.hexa — phase-1 port of archive/v1/gate/wrappers/rustc.
+// @allow-bare-exec
+//
+// Scope: local-exec fast-path + budget enter/leave + filter decide/record.
+// v1's remote dispatch (htz scp+ssh, ubu nc+rsync, host probe fallback) is
+// DEFERRED to phase 2 — a target=="ubu" decision currently degrades to local
+// and logs a TODO marker in the filter log. The CARGO-env fast-path is
+// preserved exactly: when AG_ENTANGLE_KEY is unset AND CARGO is set, the
+// wrapper runs rustc locally without going through the decide path, because
+// a cargo parent's entanglement already chose routing for the whole build.
+//
+// Ref: gate/hexa_url.hexa for ai_err / $WS / @allow-bare-exec conventions.
+// Reserved-word guard (gate/HEXA_RESERVED.md): no spawn / scope / find.
+
+use "_cache"
+
+let HOME = env("HOME")
+let WS = env("WS")
+
+// ─── ai-native error helper ───────────────────────────────────────────
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[rustc/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── join argv → single raw_args string for ag_filter_decide ─────────
+fn _join_args(a: [str]) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    // Skip duplicated argv[0] emitted by hexa_set_args in compiled binaries.
+    if a.len() >= 2 && a[0] == a[1] { i = 2 }
+    while i < a.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + a[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── shell-escape one argv element for the `exec` single-quoted form ─
+fn _sh_quote(s: str) -> str {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _join_shell(a: [str]) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    // Skip duplicated argv[0] emitted by hexa_set_args in compiled binaries.
+    if a.len() >= 2 && a[0] == a[1] { i = 2 }
+    while i < a.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + _sh_quote(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+// ─── Resolve real rustc: cargo bin → homebrew → PATH-next ────────────
+// PATH-next: drop the wrapper's own dir from PATH so `which rustc` finds
+// the next entry. In phase-1 we only consult the two well-known paths
+// and then fall back to a bare `rustc` (assumes PATH is already sane at
+// the point this wrapper is invoked — typical for Claude Code harness).
+fn _resolve_rustc() -> str {
+    let cargo_bin = HOME + "/.cargo/bin/rustc"
+    if file_exists(cargo_bin) { return cargo_bin }
+    let brew_bin = "/opt/homebrew/bin/rustc"
+    if file_exists(brew_bin) { return brew_bin }
+    // PATH-next probe — drop wrapper dir from PATH, ask `command -v`.
+    let path = env("PATH")
+    let self_dir = WS + "/hexa-lang/gate/wrappers"
+    let stripped = path.replace(self_dir + ":", "").replace(":" + self_dir, "")
+    let q = "PATH=" + _sh_quote(stripped) + " command -v rustc 2>/dev/null"
+    let r = to_string(exec(q)).trim()  // @allow-bare-exec
+    if r.len() > 0 { return r }
+    return "rustc"
+}
+
+// ─── run real rustc locally, return rc ────────────────────────────────
+// We forward stdin/stdout/stderr inheritedly via the shell, then capture
+// the exit code through $?. `exec` here is the hexa builtin; stdout is
+// emitted directly by the child thanks to the absence of a redirect.
+fn _exec_local(bin: str, argv: [str]) -> i64 {
+    let cmd = _sh_quote(bin) + " " + _join_shell(argv) + "; printf '\\n__RC__%s__' \"$?\""
+    let raw = to_string(exec(cmd))  // @allow-bare-exec
+    // Tail marker __RC__N__ lets us read the child's rc without losing
+    // stdout content. Find it from the right so a payload line that
+    // happens to contain "__RC__" substring doesn't confuse us.
+    let marker = "__RC__"
+    let idx = raw.index_of(marker)
+    if idx < 0 {
+        // Fall back: emit whatever we got, assume rc=0 (best-effort).
+        print(raw)
+        return 0
+    }
+    // Split: payload before marker, rc_str between markers.
+    let payload = raw.substring(0, idx)
+    let tail = raw.substring(idx + marker.len(), raw.len())
+    let end = tail.index_of("__")
+    let rc_str = if end > 0 { tail.substring(0, end) } else { tail }
+    print(payload)
+    let mut rc: i64 = 0
+    try { rc = to_int(rc_str.trim()) } catch e { rc = 0 }
+    return rc
+}
+
+// ─── epoch seconds helper (duplicated from _cache to avoid cross-fn) ─
+fn _now_s() -> i64 {
+    let s = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+    let mut n: i64 = 0
+    try { n = to_int(s) } catch e { n = 0 }
+    return n
+}
+
+fn main() {
+    if WS.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — cannot resolve wrapper paths",
+               "export WS=<repo-root> in shell rc or ~/.claude/settings.json env",
+               "airgenome/rules/airgenome.json#AG10")
+        exit(2)
+    }
+
+    let argv = args()
+    let joined = _join_args(argv)
+    let real_rustc = _resolve_rustc()
+    let t0 = _now_s()
+
+    // ─── Emergency bypass: skip all gating, exec real rustc now. ─────
+    if env("CLAUDX_NO_WRAPPER") == "1" {
+        let rc = _exec_local(real_rustc, argv)
+        // No budget/filter book-keeping in bypass mode — by design.
+        exit(rc)
+    }
+
+    // ─── CARGO-env fast-path (v1 rustc:18–24) ─────────────────────────
+    // When invoked as cargo's rustc child (CARGO set by cargo itself)
+    // AND no entanglement key inherited from a parent cargo call, run
+    // locally with NO filter/decide call — the parent cargo already
+    // chose routing for the whole build graph. This prevents per-crate
+    // wrapper storms during a `cargo build`.
+    let cargo_env = env("CARGO")
+    let entangle_key = env("AG_ENTANGLE_KEY")
+    if entangle_key.len() == 0 && cargo_env.len() > 0 {
+        ag_gate_msg("local", "rustc " + joined + " [no-entangle]")
+        ag_budget_enter()
+        let mut rc: i64 = 0
+        try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+        ag_budget_leave()
+        ag_filter_record("rustc", "local", rc, _now_s() - t0)
+        exit(rc)
+    }
+
+    // ─── Normal path: decide → budget → exec ──────────────────────────
+    ag_budget_enter()
+    let decision = ag_filter_decide("rustc", joined)
+    let target = decision[0]
+    let reason = decision[1]
+
+    if target == "local" {
+        ag_gate_msg("local", "rustc " + joined + " [" + reason + "]")
+        let mut rc: i64 = 0
+        try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+        ag_budget_leave()
+        ag_filter_record("rustc", "local", rc, _now_s() - t0)
+        exit(rc)
+    }
+
+    if target == "ubu" {
+        // Remote routing deferred (phase 2). Fall back to local + log
+        // TODO so the filter trail still captures the intent.
+        ag_gate_msg("local", "rustc " + joined + " [ubu-deferred→local]")
+        ag_filter_record("rustc", "ubu-todo", 0, 0)
+        let mut rc: i64 = 0
+        try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+        ag_budget_leave()
+        ag_filter_record("rustc", "local", rc, _now_s() - t0)
+        exit(rc)
+    }
+
+    // ─── Fallthrough: unknown target, run local, mark unreachable ────
+    ag_gate_msg("unreachable", "rustc " + joined + " target=" + target)
+    let mut rc: i64 = 0
+    try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+    ag_budget_leave()
+    ag_filter_record("rustc", "local", rc, _now_s() - t0)
+    exit(rc)
+}
+
+main()

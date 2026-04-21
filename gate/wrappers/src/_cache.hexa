@@ -1,0 +1,320 @@
+// gate/wrappers/src/_cache.hexa — phase-1 port of archive/v1/gate/wrappers/_cache.sh
+// @allow-bare-exec
+//
+// Scope: minimum-viable reach cache + budget counter + filter decide/record.
+// Full 11-layer filter pipeline, pathogen escalation, entanglement emit, and
+// config-mtime caching are deliberately OUT of scope (see v1 source for
+// reference). This file exposes pub fn's other wrappers will call.
+//
+// Ref: gate/hexa_url.hexa for ai_err / $WS / @allow-bare-exec conventions.
+// Reserved-word guard (gate/HEXA_RESERVED.md): do NOT use spawn/scope/find.
+
+// ─── env + paths ─────────────────────────────────────────────────────
+let WS = env("WS")
+let HOME_DIR = env("HOME")
+let REACH_CACHE = "/tmp/ag_gate_reachable.state"
+let REACH_TTL   = 60
+let BUDGET_FILE = "/tmp/ag_gate_budget.count"
+let FILTER_LOG  = "/tmp/ag_gate_filter.log"
+let SESSION_NOW = HOME_DIR + "/.airgenome/session_now.json"
+
+// Config lives relative to $WS. Guard inside functions since hexa top-level
+// doesn't do early return — callers get a structured error if $WS unset.
+fn _config_path() -> str {
+    if WS.len() == 0 { return "" }
+    return WS + "/hexa-lang/gate/wrappers/config.jsonl"
+}
+
+// ─── ai-native error helper ───────────────────────────────────────────
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[wrapper_cache/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── internal: quick file-exists probe via builtin ────────────────────
+fn _exists(p: str) -> bool {
+    if p.len() == 0 { return false }
+    return file_exists(p)
+}
+
+// ─── internal: epoch seconds ──────────────────────────────────────────
+fn _epoch() -> str {
+    return to_string(exec("date +%s")).trim()  // @allow-bare-exec
+}
+
+// ─── internal: file mtime (epoch seconds) or "0" ─────────────────────
+fn _mtime(p: str) -> str {
+    if _exists(p) == false { return "0" }
+    let raw = to_string(exec("stat -f %m '" + p.replace("'", "'\\''") + "' 2>/dev/null")).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return "0" }
+    return raw
+}
+
+// ─── internal: str → i64 with fallback ────────────────────────────────
+fn _to_i64(s: str, fallback: i64) -> i64 {
+    if s.len() == 0 { return fallback }
+    let mut n: i64 = 0
+    try { n = to_int(s) } catch e { return fallback }
+    return n
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  pub fn ag_load_config(key, fallback) -> str
+//  JSONL shape: each line { "key": "...", "value": "..." }. Creates file
+//  with "{}\n" default stub if absent. Uses jq for line scan.
+// ═════════════════════════════════════════════════════════════════════
+pub fn ag_load_config(key: str, fallback: str) -> str {
+    let cfg = _config_path()
+    if cfg.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — cannot resolve wrappers/config.jsonl",
+               "export WS=<repo-root> in shell rc or ~/.claude/settings.json env",
+               "airgenome/rules/airgenome.json#AG10")
+        return fallback
+    }
+    if _exists(cfg) == false {
+        // Seed with a one-line default object — keeps future jq reads happy.
+        try { write_file(cfg, "{}\n") } catch e {}
+        return fallback
+    }
+    let key_sh = key.replace("'", "'\\''")
+    let cfg_sh = cfg.replace("'", "'\\''")
+    // Match lines where .key == key, print .value. Empty string means miss.
+    let q = "jq -r --arg k '" + key_sh +
+            "' 'select(.key==$k) | .value // empty' '" + cfg_sh +
+            "' 2>/dev/null | head -1"
+    let v = to_string(exec(q)).trim()  // @allow-bare-exec
+    if v.len() == 0 { return fallback }
+    return v
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  pub fn ag_resolve_host() -> str
+//  60s TTL cache at /tmp/ag_gate_reachable.state (HOST|PORT or NONE|PORT).
+//  Probe order: remote_host:remote_port, tailscale_host:remote_port,
+//  hetzner_host:remote_port.
+// ═════════════════════════════════════════════════════════════════════
+fn _nc_ok(host: str, port: str, wait_s: i64) -> bool {
+    if host.len() == 0 || port.len() == 0 { return false }
+    let h = host.replace("'", "'\\''")
+    let p = port.replace("'", "'\\''")
+    let cmd = "nc -z -w " + to_string(wait_s) + " '" + h + "' '" + p +
+              "' >/dev/null 2>&1 && echo y || echo n"
+    let r = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    return r == "y"
+}
+
+pub fn ag_resolve_host() -> str {
+    let port = ag_load_config("remote_port", "22")
+
+    // ── Cache hit path (TTL + port match) ────────────────────────────
+    if _exists(REACH_CACHE) {
+        let mt = _to_i64(_mtime(REACH_CACHE), 0)
+        let nw = _to_i64(_epoch(), 0)
+        let age = nw - mt
+        if age >= 0 && age < REACH_TTL {
+            let mut cached = ""
+            try { cached = read_file(REACH_CACHE).trim() } catch e { cached = "" }
+            if cached.len() > 0 {
+                let bar = cached.index_of("|")
+                if bar > 0 {
+                    let ch = cached.substring(0, bar)
+                    let cp = cached.substring(bar + 1, cached.len())
+                    if cp == port {
+                        if ch == "NONE" { return "" }
+                        if ch.len() > 0 { return ch }
+                    }
+                }
+            }
+        }
+    }
+
+    // ── Live probe: ubu → tailscale → hetzner ────────────────────────
+    let ubu = ag_load_config("remote_host", "")
+    let ts  = ag_load_config("tailscale_host", "")
+    let htz = ag_load_config("hetzner_host", "")
+
+    let mut picked = ""
+    if ubu.len() > 0 && _nc_ok(ubu, port, 1)      { picked = ubu }
+    else if ts.len()  > 0 && _nc_ok(ts,  port, 2) { picked = ts }
+    else if htz.len() > 0 && _nc_ok(htz, port, 2) { picked = htz }
+
+    let payload = if picked.len() > 0 { picked + "|" + port } else { "NONE|" + port }
+    try { write_file(REACH_CACHE, payload) } catch e {}
+    return picked
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  Budget counter — one line per live wrapper instance. v1 used $$ via
+//  bash; in hexa we reconstruct our own pid via `exec("echo $$")` so the
+//  semantic of "this process's row" survives the port.
+// ═════════════════════════════════════════════════════════════════════
+fn _my_pid() -> str {
+    // echo $$ inside exec's subshell yields that subshell's pid (NOT the
+    // interpreter's). Fall back to PPID env for a stable per-wrapper key
+    // if echo $$ somehow returns empty.
+    let sh_pid = to_string(exec("echo $$")).trim()  // @allow-bare-exec
+    if sh_pid.len() > 0 { return sh_pid }
+    let pp = env("PPID")
+    if pp.len() > 0 { return pp }
+    return "0"
+}
+
+pub fn ag_budget_enter() -> void {
+    let pid = _my_pid()
+    let mut cur = ""
+    if _exists(BUDGET_FILE) {
+        try { cur = read_file(BUDGET_FILE) } catch e { cur = "" }
+    }
+    let sep = if cur.len() == 0 || cur.ends_with("\n") { "" } else { "\n" }
+    let nxt = cur + sep + pid + "\n"
+    try { write_file(BUDGET_FILE, nxt) } catch e {
+        ai_err("BUDGET-WRITE",
+               "failed to append pid " + pid + " to " + BUDGET_FILE,
+               "check /tmp permissions",
+               "gate/wrappers/src/_cache.hexa:ag_budget_enter")
+    }
+}
+
+pub fn ag_budget_leave() -> void {
+    if _exists(BUDGET_FILE) == false { return }
+    let pid = _my_pid()
+    let mut body = ""
+    try { body = read_file(BUDGET_FILE) } catch e { return }
+    let lines = body.split("\n")
+    let mut kept = ""
+    let mut i = 0
+    while i < lines.len() {
+        let ln = to_string(lines[i]).trim()
+        if ln.len() > 0 && ln != pid {
+            kept = kept + ln + "\n"
+        }
+        i = i + 1
+    }
+    try { write_file(BUDGET_FILE, kept) } catch e {}
+}
+
+pub fn ag_budget_count() -> i64 {
+    if _exists(BUDGET_FILE) == false { return 0 }
+    let mut body = ""
+    try { body = read_file(BUDGET_FILE) } catch e { return 0 }
+    if body.len() == 0 { return 0 }
+    let lines = body.split("\n")
+    let mut n: i64 = 0
+    let mut i = 0
+    while i < lines.len() {
+        if to_string(lines[i]).trim().len() > 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+pub fn ag_budget_check() -> bool {
+    let cap_s = ag_load_config("max_budget", "4")
+    let cap = _to_i64(cap_s, 4)
+    return ag_budget_count() < cap
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  ag_filter_decide — phase-1 minimum viable (6 rules, no 11-layer).
+//  Returns [target, reason]. target ∈ {local, ubu}. Reason is a short
+//  tag matching v1's `_ag_reason_push` style for grep-ability.
+// ═════════════════════════════════════════════════════════════════════
+
+// Read a top-level string number field from session_now.json without a
+// full json_parse pass — the file may be absent or partial during normal
+// operation and we don't want that to poison the decide path.
+fn _read_mac_load() -> str {
+    if _exists(SESSION_NOW) == false { return "0" }
+    let p_sh = SESSION_NOW.replace("'", "'\\''")
+    // Try jq first; fall back to "0" on any error.
+    let v = to_string(exec("jq -r '.load_avg // \"0\"' '" + p_sh + "' 2>/dev/null")).trim()  // @allow-bare-exec
+    if v.len() == 0 || v == "null" { return "0" }
+    return v
+}
+
+// Convert a float-ish string like "5.23" → integer hundredths (523).
+// Avoids float ops (not all hexa builds route them the same) and lets
+// us stay in integer space for the 5.0 threshold check.
+fn _load_hundredths(s: str) -> i64 {
+    let t = s.trim()
+    if t.len() == 0 { return 0 }
+    let dot = t.index_of(".")
+    if dot < 0 {
+        return _to_i64(t, 0) * 100
+    }
+    let whole = t.substring(0, dot)
+    let mut frac = t.substring(dot + 1, t.len())
+    // Pad / truncate to exactly 2 digits.
+    if frac.len() > 2 { frac = frac.substring(0, 2) }
+    while frac.len() < 2 { frac = frac + "0" }
+    let w = _to_i64(whole, 0)
+    let f = _to_i64(frac, 0)
+    return w * 100 + f
+}
+
+pub fn ag_filter_decide(cmd: str, raw_args: str) -> [str] {
+    // (cmd / raw_args are accepted for v1 parity + future 11-layer use;
+    // phase-1 only keys on env + mac load.)
+    let _c = cmd
+    let _a = raw_args
+
+    if env("CLAUDX_NO_SANDBOX") == "1" {
+        return ["local", "sandbox-bypass"]
+    }
+    if env("AG_GATE_FORCE_LOCAL") == "1" {
+        return ["local", "forced"]
+    }
+    if env("AG_GATE_FORCE_REMOTE") == "1" {
+        return ["ubu", "forced"]
+    }
+
+    let ml_str = _read_mac_load()
+    let ml100  = _load_hundredths(ml_str)
+    if ml100 >= 500 {
+        return ["ubu", "mac-hot"]
+    }
+
+    return ["local", "default"]
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  ag_filter_record — append one JSONL row per dispatch for later replay.
+// ═════════════════════════════════════════════════════════════════════
+fn _jesc(s: str) -> str {
+    // Minimal JSON string escaper — mirrors what post_bash.hexa does.
+    let a = s.replace("\\", "\\\\")
+    let b = a.replace("\"", "\\\"")
+    let c = b.replace("\n", " ")
+    let d = c.replace("\r", " ")
+    return d.replace("\t", " ")
+}
+
+pub fn ag_filter_record(cmd: str, target: str, rc: i64, elapsed_s: i64) -> void {
+    let ts = _epoch()
+    let row = "{\"ts\":" + ts +
+              ",\"cmd\":\""     + _jesc(cmd)    + "\"" +
+              ",\"target\":\""  + _jesc(target) + "\"" +
+              ",\"rc\":"        + to_string(rc) +
+              ",\"elapsed\":"   + to_string(elapsed_s) + "}\n"
+    let mut prev = ""
+    if _exists(FILTER_LOG) {
+        try { prev = read_file(FILTER_LOG) } catch e { prev = "" }
+    }
+    try { write_file(FILTER_LOG, prev + row) } catch e {
+        ai_err("FILTER-WRITE",
+               "failed to append row to " + FILTER_LOG,
+               "check /tmp permissions or disk space",
+               "gate/wrappers/src/_cache.hexa:ag_filter_record")
+    }
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  ag_gate_msg — debug banner, routed to stderr when AG_GATE_DEBUG=1.
+// ═════════════════════════════════════════════════════════════════════
+pub fn ag_gate_msg(target: str, text: str) -> void {
+    if env("AG_GATE_DEBUG") == "1" {
+        eprintln("[gate] " + target + " " + text)
+    }
+}

@@ -1,0 +1,298 @@
+// gate/wrappers/src/hexa_wrap.hexa — phase-1 port of archive/v1/gate/wrappers/hexa (bash, 195L).
+// @allow-bare-exec
+//
+// Role: wrap invocations of `hexa` so airgenome can route between local and
+// remote (ubu) execution based on mac load + budget + filter decision.
+//
+// Filename note: `hexa.hexa` would collide visually with the `hexa` binary;
+// this module is loaded as `hexa_wrap` to keep stack traces readable.
+//
+// Scope (phase 1):
+//   - local exec path fully reproduced (PATH walk to real hexa; fallback to
+//     well-known $WS/hexa-lang/hexa).
+//   - rsync skip-stamp + scp dedup-dir state-file LOCATIONS preserved from
+//     v1 so a later phase-2 completion inherits a warm cache.
+//   - remote (ubu) dispatch is DEFERRED — phase 1 falls back to local exec
+//     and logs a TODO via ai_err so the degrade is visible.
+//   - Emergency bypass: CLAUDX_NO_WRAPPER=1 → exec real hexa, zero overhead.
+//
+// Ref style: gate/hexa_url.hexa.  Reserved-word guard: no spawn/scope/find.
+// SSOT: archive/v1/gate/wrappers/hexa (v1) + airgenome/rules/airgenome.json.
+
+use "_cache"
+
+// ─── env + paths (v1 literals preserved where possible) ──────────────
+let WS          = env("WS")
+let HOME_DIR    = env("HOME")
+let RSYNC_STAMP = "/tmp/ag_gate_rsync.stamp"       // v1 literal — KEEP
+let SCP_DEDUP   = "/tmp/ag_gate_scp_dedup"         // v1 literal — KEEP
+let LATENCY_LOG = "/tmp/ag_gate_latency.log"       // v1 literal — KEEP
+let UBU_SSH     = "ubu"
+let UBU_DIR     = "/tmp/airgenome"
+
+// ─── ai-native error ──────────────────────────────────────────────────
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[hexa_wrap/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── internal: shell-quote a single arg for single-quoted embedding ──
+fn _q(s: str) -> str {
+    return s.replace("'", "'\\''")
+}
+
+// ─── internal: file_exists guard ──────────────────────────────────────
+fn _exists(p: str) -> bool {
+    if p.len() == 0 { return false }
+    return file_exists(p)
+}
+
+// ─── internal: realpath via /bin/ls + readlink fallback ──────────────
+// Use system realpath if present; else python as last resort. Returns "" on
+// failure so callers treat it as "no match" rather than spurious identity.
+fn _realpath(p: str) -> str {
+    if p.len() == 0 { return "" }
+    let q = _q(p)
+    let cmd = "realpath '" + q + "' 2>/dev/null || readlink -f '" + q +
+              "' 2>/dev/null || python3 -c \"import os,sys;print(os.path.realpath(sys.argv[1]))\" '" + q + "' 2>/dev/null"
+    let r = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    return r
+}
+
+// ─── internal: join argv subset with spaces, shell-quoting each ──────
+// Used for ag_filter_decide's raw_args string + for remote command lines.
+fn _join_args_quoted(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        let a = argv[i]
+        if out.len() > 0 { out = out + " " }
+        out = out + "'" + _q(a) + "'"
+        i = i + 1
+    }
+    return out
+}
+
+// ─── internal: join argv subset with spaces, NO quoting ──────────────
+// For filter decide's raw_args (v1 passed "$@" without requoting).
+fn _join_args_plain(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + argv[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── internal: epoch seconds ──────────────────────────────────────────
+fn _epoch() -> str {
+    return to_string(exec("date +%s")).trim()  // @allow-bare-exec
+}
+
+fn _to_i64(s: str, fallback: i64) -> i64 {
+    if s.len() == 0 { return fallback }
+    let mut n: i64 = 0
+    try { n = to_int(s) } catch e { return fallback }
+    return n
+}
+
+// ─── internal: resolve the REAL `hexa` binary by walking $PATH ───────
+// v1's concern: when invoked AS a PATH-earlier shim named `hexa`, we must
+// not exec ourselves. Strategy:
+//   1. Prefer explicit $WS/hexa-lang/hexa (fast path, matches install layout).
+//   2. Else split $PATH manually, skip entries whose realpath(<dir>/hexa)
+//      equals realpath(__file__)'s wrapper parent — pick the first survivor.
+//   3. Absolute last-ditch fallback: /usr/local/bin/hexa.
+// Per task note: DO NOT use `exec("IFS=:; for p in $PATH; do ...")` —
+// single-shell loops can fail silently. Split in hexa, call realpath per
+// candidate.
+fn _resolve_real_hexa(self_realpath: str) -> str {
+    // (a) $WS fast path
+    if WS.len() > 0 {
+        let cand = WS + "/hexa-lang/hexa"
+        if _exists(cand) {
+            let rp = _realpath(cand)
+            if rp.len() > 0 && rp != self_realpath {
+                return cand
+            }
+        }
+    }
+    // (b) PATH walk
+    let path_val = env("PATH")
+    if path_val.len() > 0 {
+        let entries = path_val.split(":")
+        let mut i = 0
+        while i < entries.len() {
+            let dir = entries[i]
+            if dir.len() > 0 {
+                let cand = dir + "/hexa"
+                if _exists(cand) {
+                    let rp = _realpath(cand)
+                    if rp.len() > 0 && rp != self_realpath {
+                        return cand
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    // (c) well-known fallbacks
+    let fallbacks = ["/usr/local/bin/hexa", "/opt/homebrew/bin/hexa", HOME_DIR + "/.hx/bin/hexa"]
+    let mut j = 0
+    while j < fallbacks.len() {
+        let c = fallbacks[j]
+        if _exists(c) {
+            let rp = _realpath(c)
+            if rp.len() > 0 && rp != self_realpath {
+                return c
+            }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// ─── internal: exec real hexa locally with passed args; return rc ────
+fn _exec_local(real: str, argv: [str], start: i64) -> i64 {
+    let args_q = _join_args_quoted(argv, start)
+    let cmd = "'" + _q(real) + "' " + args_q
+    let r = exec_with_status(cmd)  // @allow-bare-exec
+    // exec_with_status returns [stdout, rc] per install.hexa convention.
+    // Echo captured stdout so the caller sees hexa's output unchanged.
+    let out = to_string(r[0])
+    if out.len() > 0 { print(out) }
+    return _to_i64(to_string(r[1]), 1)
+}
+
+// ─── phase-2 hook: remote (ubu) dispatch — DEFERRED ──────────────────
+// When implemented: rsync nexus/shared → ubu:$UBU_DIR/nexus/shared/,
+// scp file-args → ubu:$UBU_DIR/gate_files/ using SCP_DEDUP_DIR cache,
+// then `ssh ubu "cd $UBU_DIR && hexa <remote-args>"`. Also reuse
+// RSYNC_STAMP to skip no-op rsyncs. For now: log TODO + fall back local.
+fn _exec_remote_stub(real: str, argv: [str], start: i64) -> i64 {
+    ai_err("REMOTE-DEFERRED",
+           "ubu remote dispatch not yet ported — falling back to local exec",
+           "implement rsync($NEXUS/shared → ubu:" + UBU_DIR + "/nexus/shared) + scp dedup + ssh hexa; see archive/v1/gate/wrappers/hexa L129-182",
+           "gate/wrappers/src/hexa_wrap.hexa:_exec_remote_stub")
+    // Touch the state-file locations now so phase-2 code inherits a stable
+    // directory (idempotent — won't disturb existing caches).
+    try { exec("mkdir -p '" + _q(SCP_DEDUP) + "' 2>/dev/null") } catch e {}  // @allow-bare-exec
+    return _exec_local(real, argv, start)
+}
+
+fn main() {
+    // $WS guard — the wrapper needs WS to locate the canonical hexa binary
+    // on the fast path. Missing WS is non-fatal (PATH walk still works) but
+    // we surface a warning so AG10 drift is visible.
+    if WS.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — PATH walk only, fast-path disabled",
+               "export WS=<repo-root> in shell rc or ~/.claude/settings.json env",
+               "airgenome/rules/airgenome.json#AG10")
+    }
+
+    // Parse argv. hexa's args() layout varies; for a wrapper script we only
+    // care about USER args (everything after the script path). Reuse the
+    // entry.hexa strategy: locate the .hexa script position in argv, then
+    // slice from there + 1.
+    let argv = args()
+    let mut script_idx: i64 = -1
+    let mut j: i64 = 0
+    while j < argv.len() {
+        let a = argv[j]
+        if a.ends_with("hexa_wrap.hexa") || a.ends_with(".hexa") {
+            script_idx = j
+        }
+        j = j + 1
+    }
+    let user_start: i64 = if script_idx >= 0 {
+        script_idx + 1
+    } else {
+        if argv.len() >= 3 && (argv[1] == "run" || argv[1] == "eval") { 3 } else { 2 }
+    }
+
+    // Emergency bypass — NO filter, NO budget, NO rsync. Just hand off.
+    if env("CLAUDX_NO_WRAPPER") == "1" {
+        // Resolve real hexa with self_realpath="" so we accept any hit.
+        let real = _resolve_real_hexa("")
+        if real.len() == 0 {
+            ai_err("E_NO_HEXA",
+                   "no real hexa binary found on PATH or $WS/hexa-lang/hexa",
+                   "install hexa or export WS=<hexa-lang parent>",
+                   "gate/wrappers/src/hexa_wrap.hexa:main")
+            exit(127)
+        }
+        // _exec_local already prints captured stdout; propagate rc so the
+        // parent shell sees the child's real exit code (H-OUTPUT-PASS).
+        let rc = _exec_local(real, argv, user_start)
+        exit(rc)
+    }
+
+    // Resolve self realpath so PATH walk can reject ourselves.
+    // argv[0] on Mac = interpreter; the script path is the .hexa arg.
+    let self_script = if script_idx >= 0 { argv[script_idx] } else { "" }
+    let self_rp = _realpath(self_script)
+
+    // Resolve real hexa ONCE so both local + remote paths share it.
+    let real = _resolve_real_hexa(self_rp)
+    if real.len() == 0 {
+        ai_err("E_NO_HEXA",
+               "no real hexa binary found on PATH (and not at $WS/hexa-lang/hexa)",
+               "install hexa or export WS so $WS/hexa-lang/hexa exists",
+               "gate/wrappers/src/hexa_wrap.hexa:_resolve_real_hexa")
+        exit(127)
+    }
+
+    // Filter decide — target + reason.
+    let raw_args = _join_args_plain(argv, user_start)
+    let decision = ag_filter_decide("hexa", raw_args)
+    let mut target = decision[0]
+    let reason = decision[1]
+
+    // Budget enter — count this wrapper instance.
+    ag_budget_enter()
+
+    let t0 = _to_i64(_epoch(), 0)
+    let mut rc: i64 = 0
+
+    if target == "local" {
+        ag_gate_msg("local", "hexa " + raw_args + " [filter:" + reason + "]")
+        rc = _exec_local(real, argv, user_start)
+    } else {
+        // target == "ubu" (or any non-local) — phase-1 stub falls back.
+        ag_gate_msg("remote-todo", "hexa " + raw_args + " [filter:" + reason + "]")
+        rc = _exec_remote_stub(real, argv, user_start)
+        // After the stub falls back, re-tag target so the filter record
+        // reflects the actual execution site (not the filter's intent).
+        target = "local-fallback"
+    }
+
+    // Budget leave — always, even on non-zero rc.
+    ag_budget_leave()
+
+    // Latency log (v1 format: ISO ts + load_state + rc + lat_ms + args).
+    let t1 = _to_i64(_epoch(), 0)
+    let elapsed = if t1 >= t0 { t1 - t0 } else { 0 }
+    ag_filter_record("hexa", target, rc, elapsed)
+
+    // v1 wrote a human-readable line too; keep that habit for grep-ability.
+    let ts_cmd = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+    let row = ts_cmd + " target=" + target + " reason=" + reason +
+              " rc=" + to_string(rc) + " lat_s=" + to_string(elapsed) +
+              " argc=" + to_string(argv.len() - user_start) + "\n"
+    let mut prev = ""
+    if _exists(LATENCY_LOG) {
+        try { prev = read_file(LATENCY_LOG) } catch e { prev = "" }
+    }
+    try { write_file(LATENCY_LOG, prev + row) } catch e {}
+
+    if rc != 0 { eprintln("[hexa_wrap] rc=" + to_string(rc)) }
+    // Propagate real rc to parent shell so build tools (cargo, make, etc.)
+    // see the actual child exit code, not a forced 0.
+    exit(rc)
+}
+
+main()

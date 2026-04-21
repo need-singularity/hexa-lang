@@ -1,0 +1,228 @@
+// gate/wrappers/src/sh_run.hexa — phase-1 port of archive/v1/gate/wrappers/sh-run
+// @allow-bare-exec
+//
+// Purpose: airgenome "sh-run" gate wrapper — intercepts /bin/sh-ish calls,
+// routes via filter (local vs ubu remote), records target + rc. Phase-1
+// port drops the ubu/remote scp+nc leg (config/host absent or unused on
+// this host) and falls back to local with a TODO log.
+//
+// v1 flow (sh-run bash, 41 lines):
+//   1. source _cache.sh → ag_load_config, budget enter, filter decide
+//   2. ag_resolve_host → sets $GH (reachable remote or "")
+//   3. if target=local or no $GH → /bin/bash "$@"; record; exit rc
+//   4. if target=ubu         → scp any file-args, nc remote bash; record; exit rc
+//
+// Hexa port: _cache.hexa exposes the same fns (different signatures —
+// ag_load_config(key,fallback) / ag_filter_decide(cmd,raw_args)→[t,r] /
+// ag_resolve_host()→str). Reserved-word guard: no spawn/scope/find.
+//
+// Ref: gate/hexa_url.hexa for ai_err + $WS conventions.
+// Ref: gate/wrappers/src/_cache.hexa for the imported pub fn surface.
+
+use "_cache"
+
+let HOME_DIR = env("HOME")
+let WS = env("WS")
+let UBU_DIR = "/tmp/airgenome"
+let TODO_LOG = "/tmp/ag_sh_run_ubu_todo.log"
+
+// ─── ai-native error helper — prefix is human-readable, uses a dash ──
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[sh-run/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── single-quote escape for shell interpolation ─────────────────────
+fn _shq(s: str) -> str {
+    return s.replace("'", "'\\''")
+}
+
+// ─── last_index_of — hexa codegen doesn't support the method yet ────
+// Manual scan from the right. Returns -1 if not found.
+fn _last_idx(hay: str, needle: str) -> i64 {
+    if needle.len() == 0 { return -1 }
+    if hay.len() < needle.len() { return -1 }
+    let mut i: i64 = hay.len() - needle.len()
+    while i >= 0 {
+        if hay.substring(i, i + needle.len()) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ─── epoch seconds (ints) ────────────────────────────────────────────
+fn _epoch_i() -> i64 {
+    let raw = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    try { n = to_int(raw) } catch e { return 0 }
+    return n
+}
+
+// ─── join argv (sans argv[0]) with spaces for filter_decide input ────
+fn _join_argv(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + argv[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ─── build a single shell command line from argv ─────────────────────
+// Each arg is single-quote-wrapped with embedded quotes escaped.
+fn _build_sh_cmd(argv: [str], start: i64) -> str {
+    let mut out = ""
+    let mut i = start
+    while i < argv.len() {
+        if out.len() > 0 { out = out + " " }
+        out = out + "'" + _shq(argv[i]) + "'"
+        i = i + 1
+    }
+    return out
+}
+
+// ─── CLAUDX_NO_WRAPPER=1 escape hatch — exec real /bin/sh unchanged ──
+fn _bypass_exec(argv: [str]) -> i64 {
+    let cmd = "/bin/sh " + _build_sh_cmd(argv, 1)
+    let out = to_string(exec(cmd + "; echo __AG_RC_$?"))  // @allow-bare-exec
+    print(out)
+    // We can't propagate the real child rc through exec() cleanly without
+    // a wrapper — parse the sentinel we appended and strip it from stdout.
+    return _tail_rc(out)
+}
+
+// Extract trailing __AG_RC_<n> sentinel, returns n or 0 if absent.
+fn _tail_rc(s: str) -> i64 {
+    let marker = "__AG_RC_"
+    let idx = _last_idx(s, marker)
+    if idx < 0 { return 0 }
+    let tail = s.substring(idx + marker.len(), s.len()).trim()
+    let mut n: i64 = 0
+    try { n = to_int(tail) } catch e { return 0 }
+    return n
+}
+
+// ─── local dispatch: /bin/sh "$@" (both Mac + Linux) ─────────────────
+fn _run_local(argv: [str]) -> i64 {
+    let cmd = "/bin/sh " + _build_sh_cmd(argv, 1)
+    // Capture stdout+stderr together; print; harvest rc via sentinel.
+    let out = to_string(exec(cmd + " 2>&1; echo __AG_RC_$?"))  // @allow-bare-exec
+    // Strip sentinel line before printing — it's an internal marker.
+    let marker = "__AG_RC_"
+    let idx = _last_idx(out, marker)
+    if idx >= 0 {
+        // Back up one char to also eat the preceding newline, if present.
+        let mut cut = idx
+        if cut > 0 && out.substring(cut - 1, cut) == "\n" { cut = cut - 1 }
+        print(out.substring(0, cut))
+    } else {
+        print(out)
+    }
+    return _tail_rc(out)
+}
+
+// ─── ubu dispatch: DEFERRED in phase-1 — log + fall back to local ────
+// v1 used scp for file-args + nc to UBU_PORT; phase-1 lacks a verified
+// config path for those pieces, so record the intent and run locally.
+fn _run_ubu_deferred(argv: [str], reason: str) -> i64 {
+    let ts = to_string(_epoch_i())
+    let line = ts + " sh-run ubu-deferred reason=" + reason +
+               " args=" + _join_argv(argv, 1) + "\n"
+    let mut prev = ""
+    if file_exists(TODO_LOG) {
+        try { prev = read_file(TODO_LOG) } catch e { prev = "" }
+    }
+    try { write_file(TODO_LOG, prev + line) } catch e {}
+    ag_gate_msg("ubu-deferred", "sh-run fell back to local — see " + TODO_LOG)
+    return _run_local(argv)
+}
+
+fn main() {
+    let raw_argv = args()
+
+    // Compiled binary duplicates argv[0] (hexa_set_args); drop the dup so
+    // /bin/sh doesn't receive the wrapper name as a positional arg.
+    let mut argv = raw_argv
+    if raw_argv.len() >= 2 && raw_argv[0] == raw_argv[1] {
+        let mut tmp: [str] = [raw_argv[0]]
+        let mut _ri = 2
+        while _ri < raw_argv.len() {
+            tmp = tmp + [raw_argv[_ri]]
+            _ri = _ri + 1
+        }
+        argv = tmp
+    }
+
+    // ── $WS guard — hexa gate convention (AG10) ───────────────────────
+    if WS.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — sh-run gate wrapper cannot locate config",
+               "export WS=<repo-root> in shell rc or ~/.claude/settings.json env",
+               "airgenome/rules/airgenome.json#AG10")
+        exit(2)
+    }
+
+    // ── argv length guard — need at least one real arg ────────────────
+    if argv.len() < 2 {
+        ai_err("USAGE-EMPTY",
+               "no shell command / script path given",
+               "usage: sh-run [-c <cmd>] | sh-run <script> [args...]",
+               "gate/wrappers/src/sh_run.hexa")
+        exit(2)
+    }
+
+    // ── CLAUDX_NO_WRAPPER=1 → exec real sh immediately ────────────────
+    if env("CLAUDX_NO_WRAPPER") == "1" {
+        let rc = _bypass_exec(argv)
+        exit(rc)
+    }
+
+    // ── filter decide — returns [target, reason] ──────────────────────
+    let joined = _join_argv(argv, 1)
+    let decided = ag_filter_decide("sh-run", joined)
+    let mut target = decided[0]
+    let reason = decided[1]
+
+    // ── budget enter — per-wrapper instance row ───────────────────────
+    ag_budget_enter()
+    let t0 = _epoch_i()
+
+    // ── budget cap breach → force local (v1: FILTER_BUDGET_BYPASS!=1) ─
+    if env("FILTER_BUDGET_BYPASS") != "1" {
+        if ag_budget_check() == false {
+            target = "local"
+        }
+    }
+
+    // ── resolve ubu reachability; no host ⇒ force local ───────────────
+    let gh = ag_resolve_host()
+    if target == "ubu" && gh.len() == 0 {
+        target = "local"
+    }
+
+    // ── dispatch ──────────────────────────────────────────────────────
+    let mut rc: i64 = 0
+    if target == "local" {
+        ag_gate_msg("local", "sh-run " + joined + " [filter:" + reason + "]")
+        rc = _run_local(argv)
+    } else {
+        // target == "ubu" — DEFERRED in phase-1 (see _run_ubu_deferred).
+        ag_gate_msg("remote", "sh-run " + joined + " [filter:" + reason +
+                    "] " + gh + " " + UBU_DIR)
+        rc = _run_ubu_deferred(argv, reason)
+        // Normalize target for record — v1 writes the intended target.
+        target = "ubu"
+    }
+
+    // ── record + budget leave ─────────────────────────────────────────
+    let elapsed = _epoch_i() - t0
+    ag_filter_record("sh-run", target, rc, elapsed)
+    ag_budget_leave()
+    exit(rc)
+}
+
+main()
