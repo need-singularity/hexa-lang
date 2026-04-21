@@ -8,8 +8,8 @@
 
 set -uo pipefail
 
-HEXA="/Users/ghost/Dev/hexa-lang/hexa"
-ENTRY="/Users/ghost/Dev/hexa-lang/gate/entry.hexa"
+HEXA="/Users/ghost/core/hexa-lang/hexa"
+ENTRY="/Users/ghost/core/hexa-lang/gate/entry.hexa"
 
 input=$(cat)
 prompt=$(printf '%s' "$input" | jq -r '.prompt // empty' 2>/dev/null)
