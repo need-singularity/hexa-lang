@@ -782,10 +782,11 @@ fn cache_root() {
 }
 
 fn source_key(file) {
-    // Stable key: sha256 of the absolute source path string.
-    // (Same file across edits shares slot; invalidated via meta.json.)
-    let abs_path = exec("cd \"$(dirname '" + file + "')\" 2>/dev/null && printf '%s/%s' \"$(pwd)\" \"$(basename '" + file + "')\"")
-    let h = exec("printf '%s' '" + abs_path + "' | shasum -a 256 | cut -c1-16 | tr -d '\\n'")
+    // Stable key: sha256 of the absolute source path string, first 16 chars.
+    // Same file across edits shares slot; meta fp handles content invalidation.
+    // Single shell fork: resolve abs path + shasum in one pipeline. ~20ms
+    // saved vs the two-fork original on the warm-hit path.
+    let h = exec("cd \"$(dirname '" + file + "')\" 2>/dev/null && printf '%s/%s' \"$(pwd -P)\" \"$(basename '" + file + "')\" | shasum -a 256 | cut -c1-16 | tr -d '\\n'")
     return h
 }
 
@@ -816,7 +817,8 @@ fn cache_hit(slot, fp) {
 // `HEXA_CACHE=0` env gate disables the fast-path globally.
 
 // Bump when fingerprint schema changes — forces global cache flush.
-fn cache_schema_version() { return "v3" }
+// v4: add stage0 .real sibling to fp (covers atomic rebuild target).
+fn cache_schema_version() { return "v4" }
 
 @pure
 fn _cache_dirname(path) {
@@ -957,13 +959,13 @@ fn list_transitive_imports(file) {
 }
 
 fn src_fingerprint_deep(file) {
-    // Single-stat batch over transitive imports + stage0 binary,
-    // piped through shasum in one shell fork. Target <30ms on the
-    // hot path. mtime|size (not content sha): (a) editors always
-    // update mtime on save, (b) atomic mv -f on stage0 rebuild
-    // always changes mtime, (c) spoofed mtime (git-checkout restore)
-    // causes stale hit until next edit — acceptable, user can
-    // `rm -rf .hexa-cache` to reset. 64-char hex; "" on empty.
+    // Single-stat batch over transitive imports + stage0 binary (both
+    // shim and `.real`, since tool/build_stage0.hexa writes to .real
+    // atomically while resolve_stage0 returns the shim path — covering
+    // both catches real rebuilds), piped through shasum in one fork.
+    // Target <30ms. mtime|size (not content sha): editors update mtime
+    // on save; stage0 rebuild's atomic mv -f bumps mtime. `rm -rf
+    // .hexa-cache` is the escape hatch for pathological mtime spoofing.
     let paths = list_transitive_imports(file)
     if len(paths) == 0 { return "" }
     let mut args = ""
@@ -973,7 +975,14 @@ fn src_fingerprint_deep(file) {
         i = i + 1
     }
     let s0 = resolve_stage0()
-    if len(s0) > 0 { args = args + " '" + s0 + "'" }
+    if len(s0) > 0 {
+        args = args + " '" + s0 + "'"
+        // Also cover the .real sibling — the atomic-swap target in
+        // tool/build_stage0.hexa:52. stat of nonexistent file fails
+        // silently via 2>/dev/null; the OR-fallback still produces
+        // output for existing paths.
+        args = args + " '" + s0 + ".real'"
+    }
     // BSD (%N %m %z) first; GNU (%n %Y %s) fallback — both in the
     // same fork via ||. Schema version prepended as invalidation lever.
     let pipeline = "(stat -f '%N|%m|%z'" + args + " 2>/dev/null || stat -c '%n|%Y|%s'" + args + " 2>/dev/null) | (printf 'HXCACHE|" + cache_schema_version() + "\\n'; cat) | shasum -a 256 | cut -c1-64 | tr -d '\\n'"
@@ -986,15 +995,18 @@ fn should_cache(file) {
     // forces argv[1] = argv[0] (self/runtime.c:3432-3433), so tools
     // using argv()[1] / dirname(argv[1]) for repo-root resolution
     // misresolve to .hexa-cache/<hash>/ when run from a cached binary.
+    // Patterns are anchored on directory prefixes to avoid false-
+    // positives on user paths like /tmp/bench_mytest.hexa.
     if file.contains("/test/") { return false }
     if file.contains("/tests/") { return false }
     if file.contains("_regen") { return false }
     if file.contains("/codegen_") { return false }
-    if file.contains("/bench_") { return false }
-    if file.contains("/build_") { return false }
+    if file.contains("/self/bench_") { return false }
+    if file.contains("/tool/bench_") { return false }
+    if file.contains("/tool/build_") { return false }
     if file.contains("/tool/build/") { return false }
+    if file.contains("/tool/rebuild_") { return false }
     if file.contains("selftest") { return false }
-    if file.contains("rebuild_") { return false }
     return true
 }
 
