@@ -87,7 +87,7 @@ SSOT 와 현실이 어긋나면 commit reject.
 | daily fixpoint cron (.loop) | `.loop` entry | ⚠️ planned (18) |
 | fixpoint evidence archive | `tool/fixpoint_archive.hexa` · `tool/fixpoint_bisect.hexa` | ✓ tool 있음, archive 미가동 (17 planned) |
 | raw#12 cherry-pick 금지 (실측 그대로) | 자격강제 | ✓ invariant |
-| own#11 bt-solution-claim-ban | `.own` | ✓ invariant |
+| own 4 bt-solution-claim-ban | `.own` | ✓ invariant |
 | cross-platform fixpoint (arm64↔x86_64) | roadmap 20 | ⚠️ planned |
 
 ### 6. 우회방지 (bypass prevention)
@@ -178,7 +178,7 @@ exec-rule: "SUB progress 는 MAIN phase 로만 흡수, 단독 commit 금지"
 
 ### P3 → AGI 최종 (Criterion C / Mk.X T10-13) · eta +6-9mo
 - main-exec: Mk.X T10-13 ossification (≥10 atoms)
-- **pending**: Mk.VIII L_edu fixpoint · Mk.X atoms ossified (novelty yield ≥3/10) · C5 N=10 recursion · meta-lens M fire (Pearson≥0.6) · Mk.XI twin-engine nexus↔anima · 7대난제 framework (raw#24 + own#11) · self-host P7-7/8/9 (roadmap 12/13/14)
+- **pending**: Mk.VIII L_edu fixpoint · Mk.X atoms ossified (novelty yield ≥3/10) · C5 N=10 recursion · meta-lens M fire (Pearson≥0.6) · Mk.XI twin-engine nexus↔anima · 7대난제 framework (raw#24 + own 4) · self-host P7-7/8/9 (roadmap 12/13/14)
 
 ---
 
@@ -206,7 +206,7 @@ exec-rule: "SUB progress 는 MAIN phase 로만 흡수, 단독 commit 금지"
 
 ### SSOT / 자격강제
 - **.raw + .own = project root SSOT** (raw#0). 파생: .ext / .roadmap / .loop → 총 6 SSOT (+ .workspace).
-- **30 raw rules live** (raw#0–30). raw#9 hexa-only · raw#11 snake_case · raw#1 chflags uchg · raw#10 proof-carrying · raw#12 cherry-pick 금지 · raw#25 concurrent-git-lock · raw#28 gate ordering · raw#29 UNIVERSAL_4 · raw#30 IRREVERSIBILITY · own#11 bt-solution-claim-ban.
+- **30 raw rules live** (raw#0–30). raw#9 hexa-only · raw#11 snake_case · raw#1 chflags uchg · raw#10 proof-carrying · raw#12 cherry-pick 금지 · raw#25 concurrent-git-lock · raw#28 gate ordering · raw#29 UNIVERSAL_4 · raw#30 IRREVERSIBILITY · own 4 bt-solution-claim-ban.
 - **5-layer OS enforcement** — L1 pre-commit · L2 launchd (60s) · L3 chflags uchg/uappnd ✅ · L4 airgenome hook · L5 post-commit auto-ingest.
 - **git hooks deprecated (2026-04-21)** — enforcement 은 chflags EPERM + manual/CI 호출로 일원화.
 - **Meta² cert chain** — 8 breakthrough indexed (`074487cd`).
@@ -256,7 +256,7 @@ Cross-repo deps (Tier 5 #41 미리 사용):
 - ✓ raw#10 proof-carrying hash-chain
 - ✓ raw#28 gate ordering (permission → filter → dispatch)
 - ✓ Meta² cert chain integrity (`074487cd`, 8 entries)
-- ✓ own#11 bt-solution-claim-ban (7대난제 "해결" 주장 금지)
+- ✓ own 4 bt-solution-claim-ban (7대난제 "해결" 주장 금지)
 - ✓ raw#29 UNIVERSAL_4 / raw#30 IRREVERSIBILITY / raw#24 foundation-lock
 
 ## Discipline

@@ -1,0 +1,452 @@
+#!hexa strict
+// tool/llm_verdict_guard.hexa — LLM self-verification claim detector (seed C)
+//
+// Detects "verified/passed/satisfied/…" style self-verdicts that lack an
+// adjacent physics / math / code evidence token within a bounded window,
+// then emits an AI-native English JSON payload carrying a warning AND a
+// guide toward acceptable evidence.
+//
+// Design: seed C (structural co-occurrence). See drill report.
+// Scope : raw#10 proof-carrying + own 4 bt-solution-claim-ban.
+// Deps  : hexa-only, zero external dependency, no git hook usage.
+//
+// Usage:
+//   hexa tool/llm_verdict_guard.hexa <file>           — scan a file
+//   hexa tool/llm_verdict_guard.hexa --stdin          — scan stdin
+//   hexa tool/llm_verdict_guard.hexa --hook <json>    — airgenome post_tool mode
+//   hexa tool/llm_verdict_guard.hexa --explain <file> — dry-run, no exit code
+//   hexa tool/llm_verdict_guard.hexa --severity <warn|block>
+//
+// Exit codes:
+//   0 — no claim, OR all claims have adjacent evidence
+//   2 — at least one claim missing evidence (severity=warn → still 0 unless --strict)
+//
+// IMPORTANT: this tool itself is a claim-making artifact. It therefore emits
+// captured evidence tokens verbatim (seed C §5) so its own output carries
+// proof. A guard that says "warn" without a reason would violate the very
+// rule it enforces.
+
+use "self/core/law_io"
+
+// ─── claim keyword dictionary (EN + KO, Tier A strong tokens) ────────
+
+fn _claim_tokens_en() -> array {
+    return ["verified", "passed", "PASS", "HELD", "satisfied",
+            "confirmed", "complete", "completed", "done", "OK",
+            "LGTM", "fixed", "resolved", "successful", "works", "ready"]
+}
+
+fn _claim_tokens_ko() -> array {
+    return ["검증됨", "검증완료", "통과", "충족", "성공",
+            "완료", "해결됨", "확인됨", "정상", "문제없음", "이상없음"]
+}
+
+// ─── evidence token predicates ───────────────────────────────────────
+// seed C §1 grammar, conservative substring-level checks only.
+
+fn _is_digit(ch: string) -> bool {
+    return ch == "0" || ch == "1" || ch == "2" || ch == "3" || ch == "4"
+        || ch == "5" || ch == "6" || ch == "7" || ch == "8" || ch == "9"
+}
+
+fn _is_hex(ch: string) -> bool {
+    if _is_digit(ch) { return true }
+    return ch == "a" || ch == "b" || ch == "c" || ch == "d" || ch == "e" || ch == "f"
+}
+
+@pure
+fn _find_sha40(line: string) -> string {
+    // 40 consecutive lowercase hex characters
+    let n = len(line)
+    let mut i = 0
+    while i + 40 <= n {
+        let mut k = 0
+        let mut ok = true
+        while k < 40 {
+            let c = line.substring(i + k, i + k + 1)
+            if !_is_hex(c) { ok = false; break }
+            k = k + 1
+        }
+        if ok {
+            // ensure not bounded by hex on either side (word boundary)
+            let left_ok = if i == 0 { true } else {
+                let lc = line.substring(i - 1, i)
+                !_is_hex(lc) && lc != "-" && lc != "_"
+            }
+            let right_i = i + 40
+            let right_ok = if right_i >= n { true } else {
+                let rc = line.substring(right_i, right_i + 1)
+                !_is_hex(rc) && rc != "-" && rc != "_"
+            }
+            if left_ok && right_ok {
+                return line.substring(i, i + 40)
+            }
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _physics_units() -> array {
+    return ["kT·ln2", "kT", "FLOPs", "FLOP", "Watts", "Watt",
+            "ms", "μs", "ns", "eV", "nJ", "pJ", "mJ",
+            " J ", " J.", " J,", " J\n",
+            "Landauer"]
+}
+
+fn _math_markers() -> array {
+    return ["JSD=", "JSD ", "Brent", "Banach", "Shannon-Fano", "Shannon",
+            "Kolmogorov", "Frob>", "Frob ", "Frob=", "cos>", "cos=",
+            "Pearson", "≤", "≥", "<=", ">=",
+            "τ(6)=4", "K(G|S", "inf_π", "Σ_k"]
+}
+
+fn _code_markers() -> array {
+    return ["$ hexa ", "`hexa ", "hexa tool/", "tool/", "commit ",
+            "SHA ", "@ commit"]
+}
+
+@pure
+fn _contains_any(line: string, toks: array) -> string {
+    for t in toks {
+        if line.index_of(t) >= 0 { return t }
+    }
+    return ""
+}
+
+@pure
+fn _has_physics_evidence(line: string) -> string {
+    return _contains_any(line, _physics_units())
+}
+
+@pure
+fn _has_math_evidence(line: string) -> string {
+    let m = _contains_any(line, _math_markers())
+    if m != "" { return m }
+    // bare inequality with number nearby — tolerant fallback
+    let idxs = ["<", ">", "=", "≤", "≥"]
+    for op in idxs {
+        let pos = line.index_of(op)
+        if pos >= 0 {
+            let l = max_of(0, pos - 6)
+            let r = min_of(len(line), pos + 7)
+            let win = line.substring(l, r)
+            let mut j = 0
+            while j < len(win) {
+                if _is_digit(win.substring(j, j + 1)) { return op }
+                j = j + 1
+            }
+        }
+    }
+    return ""
+}
+
+@pure
+fn _has_code_evidence(line: string) -> string {
+    let m = _contains_any(line, _code_markers())
+    if m != "" { return m }
+    let sha = _find_sha40(line)
+    if sha != "" { return sha }
+    // 7–12 char short SHA at word boundary, preceded by "commit "/"@"/"sha"
+    return ""
+}
+
+// ─── helpers ─────────────────────────────────────────────────────────
+
+fn max_of(a: int, b: int) -> int {
+    if a > b { return a }
+    return b
+}
+
+fn min_of(a: int, b: int) -> int {
+    if a < b { return a }
+    return b
+}
+
+// token boundary check: preceding / following char must not be alnum_
+@pure
+fn _is_word_char(c: string) -> bool {
+    if len(c) != 1 { return false }
+    let lower = "abcdefghijklmnopqrstuvwxyz"
+    let upper = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    if lower.index_of(c) >= 0 { return true }
+    if upper.index_of(c) >= 0 { return true }
+    if _is_digit(c) { return true }
+    if c == "_" { return true }
+    return false
+}
+
+@pure
+fn _is_hangul(c: string) -> bool {
+    // Rough Hangul syllable range check via length heuristic only.
+    // hexa substring on UTF-8 may yield multi-byte string — treat any
+    // non-ASCII multi-byte sequence as Hangul-candidate.
+    if len(c) >= 2 { return true }
+    return false
+}
+
+fn _claim_hit_en(line: string, tok: string) -> int {
+    let mut from = 0
+    while true {
+        let pos = line.index_of_from(tok, from)
+        if pos < 0 { return -1 }
+        let left_ok = if pos == 0 { true } else {
+            !_is_word_char(line.substring(pos - 1, pos))
+        }
+        let right_i = pos + len(tok)
+        let right_ok = if right_i >= len(line) { true } else {
+            !_is_word_char(line.substring(right_i, right_i + 1))
+        }
+        if left_ok && right_ok { return pos }
+        from = pos + 1
+    }
+    return -1
+}
+
+fn _claim_hit_ko(line: string, tok: string) -> int {
+    // Hangul runs without whitespace — substring match suffices.
+    return line.index_of(tok)
+}
+
+// ─── region classification (minimal) ─────────────────────────────────
+// Strip fenced code blocks (```…```) before claim scanning so example
+// strings inside code fences don't trip the detector. Seed A/B §3.
+
+fn _strip_fenced(lines: array) -> array {
+    let mut out = []
+    let mut in_fence = false
+    for ln in lines {
+        let s = ln.trim()
+        if s.starts_with("```") { in_fence = !in_fence; out.push(""); continue }
+        if in_fence { out.push(""); continue }
+        out.push(ln)
+    }
+    return out
+}
+
+// ─── scanner core ────────────────────────────────────────────────────
+
+fn _window_evidence(lines: array, idx: int, radius: int) -> array {
+    let n = len(lines)
+    let lo = max_of(0, idx - radius)
+    let hi = min_of(n, idx + radius + 1)
+    let mut phys = ""
+    let mut math = ""
+    let mut code = ""
+    let mut i = lo
+    while i < hi {
+        if phys == "" { phys = _has_physics_evidence(lines[i]) }
+        if math == "" { math = _has_math_evidence(lines[i]) }
+        if code == "" { code = _has_code_evidence(lines[i]) }
+        i = i + 1
+    }
+    return [phys, math, code]
+}
+
+fn _scan_lines(lines: array, window: int) -> array {
+    let cleaned = _strip_fenced(lines)
+    let mut hits = []
+    let en = _claim_tokens_en()
+    let ko = _claim_tokens_ko()
+    let mut i = 0
+    while i < len(cleaned) {
+        let line = cleaned[i]
+        for tok in en {
+            let pos = _claim_hit_en(line, tok)
+            if pos >= 0 {
+                let ev = _window_evidence(cleaned, i, window)
+                // hit = [line_no, col, claim, lang, text, physics, math, code]
+                hits.push([to_string(i + 1), to_string(pos + 1), tok, "en", line, ev[0], ev[1], ev[2]])
+                break
+            }
+        }
+        for tok in ko {
+            let pos = _claim_hit_ko(line, tok)
+            if pos >= 0 {
+                let ev = _window_evidence(cleaned, i, window)
+                hits.push([to_string(i + 1), to_string(pos + 1), tok, "ko", line, ev[0], ev[1], ev[2]])
+                break
+            }
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+// ─── AI-native JSON emit (English per user request) ──────────────────
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// hit indices
+fn _hit_line(h: array) -> string { return h[0] }
+fn _hit_col(h: array)  -> string { return h[1] }
+fn _hit_claim(h: array) -> string { return h[2] }
+fn _hit_lang(h: array)  -> string { return h[3] }
+fn _hit_text(h: array)  -> string { return h[4] }
+fn _hit_phys(h: array)  -> string { return h[5] }
+fn _hit_math(h: array)  -> string { return h[6] }
+fn _hit_code(h: array)  -> string { return h[7] }
+
+fn _render_claim(h: array) -> string {
+    let phys = _hit_phys(h)
+    let math = _hit_math(h)
+    let code = _hit_code(h)
+    let missing_parts = []
+    if phys == "" { missing_parts.push("\"physics\"") }
+    if math == "" { missing_parts.push("\"math\"") }
+    if code == "" { missing_parts.push("\"code\"") }
+    let mut missing = "["
+    let mut j = 0
+    for m in missing_parts {
+        if j > 0 { missing = missing + "," }
+        missing = missing + m
+        j = j + 1
+    }
+    missing = missing + "]"
+    let captured = "{"
+        + "\"physics\":\"" + _esc(phys) + "\","
+        + "\"math\":\"" + _esc(math) + "\","
+        + "\"code\":\"" + _esc(code) + "\""
+        + "}"
+    return "{"
+        + "\"line\":" + _hit_line(h) + ","
+        + "\"col\":" + _hit_col(h) + ","
+        + "\"claim\":\"" + _esc(_hit_claim(h)) + "\","
+        + "\"lang\":\"" + _hit_lang(h) + "\","
+        + "\"text\":\"" + _esc(_hit_text(h)) + "\","
+        + "\"captured_evidence\":" + captured + ","
+        + "\"missing\":" + missing
+        + "}"
+}
+
+fn _guide_block() -> string {
+    return "\"guide\":{"
+        + "\"required\":1,"
+        + "\"physics\":{\"example\":\"Landauer E = K·kT·ln2 = ... J, FLOPs = ..., latency = ... ms\",\"suggest_tool\":\"hexa tool/roadmap_t_star.hexa\"},"
+        + "\"math\":{\"example\":\"Brent: T_p <= T_1/p + T_inf, JSD = 1.000, Frob > tau, cos > 0.5\",\"suggest_tool\":\"hexa tool/roadmap_span_dag.hexa\"},"
+        + "\"code\":{\"example\":\"$ hexa tool/<x>.hexa  ->  output blob @ SHA <40-hex>\",\"suggest_tool\":\"hexa tool/raw_audit.hexa append --evidence=<sha>\"},"
+        + "\"rewrite_template\":\"verified -> verified (evidence: {physics|math|code} @ <sha>)\""
+        + "}"
+}
+
+fn emit_json(source: string, hits: array, severity: string) -> string {
+    let mut warn_items = []
+    let mut missing_any = false
+    for h in hits {
+        if _hit_phys(h) == "" && _hit_math(h) == "" && _hit_code(h) == "" {
+            warn_items.push(h)
+            missing_any = true
+        }
+    }
+    let verdict = if missing_any { "warn" } else { "ok" }
+    let mut s = "{"
+    s = s + "\"rule\":\"raw:llm-no-self-judgment\","
+    s = s + "\"severity\":\"" + severity + "\","
+    s = s + "\"verdict\":\"" + verdict + "\","
+    s = s + "\"source\":\"" + _esc(source) + "\","
+    s = s + "\"message\":\"LLM self-verification is forbidden. A statement is not evidence (raw#10 proof-carrying, own 4 bt-solution-claim-ban).\","
+    s = s + "\"claims_total\":" + to_string(len(hits)) + ","
+    s = s + "\"claims_missing_evidence\":" + to_string(len(warn_items)) + ","
+    s = s + "\"hits\":["
+    let mut j = 0
+    for h in warn_items {
+        if j > 0 { s = s + "," }
+        s = s + _render_claim(h)
+        j = j + 1
+    }
+    s = s + "],"
+    s = s + _guide_block() + ","
+    s = s + "\"why\":\"Verification ≡ physics ∨ math ∨ code. An LLM claim alone is not acceptable.\","
+    s = s + "\"seed\":\"C\","
+    s = s + "\"window_policy\":\"L3 ±8 lines (fenced code stripped)\""
+    s = s + "}"
+    return s
+}
+
+// ─── CLI dispatch ────────────────────────────────────────────────────
+
+fn _read_file_lines(path: string) -> array {
+    let body = to_string(read_file(path))
+    return split(body, "\n")
+}
+
+fn _read_stdin_lines() -> array {
+    let body = to_string(exec("cat"))
+    return split(body, "\n")
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut mode = "file"
+    let mut severity = "warn"
+    let mut strict = false
+    let mut explain = false
+    let mut paths = []
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--stdin" { mode = "stdin" }
+        else if a == "--hook" { mode = "hook"; i = i + 1; paths.push(cli[i]) }
+        else if a == "--explain" { explain = true }
+        else if a == "--strict" { strict = true }
+        else if a == "--severity" { i = i + 1; severity = cli[i] }
+        else { paths.push(a) }
+        i = i + 1
+    }
+
+    let mut all_hits = []
+    let mut sources = []
+    if mode == "stdin" {
+        let lines = _read_stdin_lines()
+        let hits = _scan_lines(lines, 8)
+        all_hits = hits
+        sources.push("<stdin>")
+    } else if mode == "hook" {
+        // paths[0] = event json path from airgenome pre_tool/post_tool
+        let p = paths[0]
+        let body = to_string(read_file(p))
+        let lines = split(body, "\n")
+        let hits = _scan_lines(lines, 8)
+        all_hits = hits
+        sources.push(p)
+    } else {
+        if len(paths) == 0 {
+            eprintln("llm_verdict_guard: no input. Use <file>, --stdin, or --hook <event.json>")
+            exit(1)
+        }
+        for p in paths {
+            let lines = _read_file_lines(p)
+            let hits = _scan_lines(lines, 8)
+            for h in hits { all_hits.push(h) }
+            sources.push(p)
+        }
+    }
+
+    let src_label = if len(sources) == 1 { sources[0] } else { to_string(len(sources)) + " files" }
+    let json = emit_json(src_label, all_hits, severity)
+    println(json)
+
+    // exit policy: nudge = always 0; block + strict = 2 on missing evidence
+    let mut missing = 0
+    for h in all_hits {
+        if _hit_phys(h) == "" && _hit_math(h) == "" && _hit_code(h) == "" {
+            missing = missing + 1
+        }
+    }
+    if missing > 0 && (severity == "block" || strict) { exit(2) }
+    exit(0)
+}
