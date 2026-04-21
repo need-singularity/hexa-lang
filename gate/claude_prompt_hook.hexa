@@ -1,0 +1,107 @@
+// gate/claude_prompt_hook.hexa — UserPromptSubmit hook (native hexa port).
+// Claude Code pipes JSON on stdin with `.prompt` and `.transcript_path`.
+// Extract the prompt, enrich with recent user-turn context if too short
+// for drill auto-dispatch (commands.json D2: ≥30 chars), then forward to
+// gate/entry.hexa. Stdout becomes the hook's additionalContext injected
+// into Claude's context for the turn.
+// Replaces the earlier bash version (claude_prompt_hook.sh); same shape,
+// hexa-native stdin/JSON parse + ai-native error emission.
+// SSOT: airgenome/rules/airgenome.json#AG10.bootstrap_hook
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+
+let HOME = env("HOME")
+let WS = env("WS")
+
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[claude_prompt_hook/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// Pull last 3 user-turn texts from the transcript JSONL. Skips slash-command
+// wrappers (<command-…) so they don't pollute the seed. Returns a single
+// space-joined string or "" if nothing usable.
+fn transcript_ctx(transcript_path: str) -> str {
+    if transcript_path.len() == 0 { return "" }
+    if file_exists(transcript_path) == false { return "" }
+    let tp_sh = transcript_path.replace("'", "'\\''")
+    // jq program mirrors the earlier bash hook — keep tail -40 bound so we
+    // don't scan the whole file.
+    let jq_prog = "[ .[] | select(.type == \"user\") | .message.content | if type == \"string\" then . elif type == \"array\" then (.[] | select(.type == \"text\") | .text) else empty end ] | map(select(startswith(\"<command-\") | not)) | .[-3:] | .[]"
+    let cmd = "tail -40 '" + tp_sh + "' 2>/dev/null | jq -rs '" + jq_prog + "' 2>/dev/null | tr '\\n' ' ' | tr -s ' '"
+    return to_string(exec(cmd)).trim()  // @allow-bare-exec
+}
+
+fn main() {
+    if WS.len() == 0 {
+        ai_err("E_WS_UNSET",
+               "$WS not set — cannot locate hexa-lang tree",
+               "export WS=<workspace-root> (e.g. $HOME/core) in ~/.claude/settings.json env block or shell rc",
+               "airgenome/rules/airgenome.json#AG10 (WS convention)")
+        return
+    }
+
+    let HEXA_BIN = WS + "/hexa-lang/hexa"
+    let ENTRY = WS + "/hexa-lang/gate/entry.hexa"
+
+    if file_exists(HEXA_BIN) == false {
+        ai_err("E_HEXA_MISSING",
+               "hexa binary not found at " + HEXA_BIN,
+               "build hexa (make -C $WS/hexa-lang) or correct $WS",
+               HEXA_BIN)
+        return
+    }
+    if file_exists(ENTRY) == false {
+        ai_err("E_ENTRY_MISSING",
+               "gate/entry.hexa not found at " + ENTRY,
+               "restore gate/entry.hexa under $WS or correct $WS",
+               ENTRY)
+        return
+    }
+
+    // Slurp stdin (Claude Code always pipes JSON). read_stdin() is a hexa
+    // builtin — no subprocess, no cat.
+    let input = read_stdin()
+    if input.len() == 0 { return }
+
+    // Extract .prompt and .transcript_path via jq (hexa's json_parse is a
+    // builtin but jq is already required by other gate paths, so lean on
+    // it here for consistency + robust edge-case handling).
+    let inp_sh = input.replace("'", "'\\''")
+    let prompt = to_string(exec("printf '%s' '" + inp_sh + "' | jq -r '.prompt // empty' 2>/dev/null")).trim()  // @allow-bare-exec
+    if prompt.len() == 0 { return }
+
+    let transcript_path = to_string(exec("printf '%s' '" + inp_sh + "' | jq -r '.transcript_path // empty' 2>/dev/null")).trim()  // @allow-bare-exec
+
+    // Seed enrichment: if prompt < 30 chars, append last 3 user-turn texts
+    // from transcript so short imperatives like "drill!!" still land a
+    // valid seed without relying on Claude's probabilistic inference.
+    let mut enriched = prompt
+    if prompt.len() < 30 {
+        let ctx = transcript_ctx(transcript_path)
+        if ctx.len() > 0 { enriched = prompt + " · ctx: " + ctx }
+    }
+
+    // Dispatch to entry.hexa. Capture stdout → print as additionalContext
+    // (Claude sees this before handling the turn). Per-invocation err_log
+    // so concurrent hooks don't stomp each other.
+    let pid = to_string(exec("echo $$")).trim()  // @allow-bare-exec
+    let err_log = "/tmp/claude_prompt_hook.err." + pid
+    let enriched_sh = enriched.replace("'", "'\\''")
+    let out = to_string(exec(HEXA_BIN + " run " + ENTRY + " prompt '" + enriched_sh + "' 2>'" + err_log + "'"))  // @allow-bare-exec
+    if out.len() > 0 { println(out) }
+    // If stderr has content but stdout is empty, surface a single ai-native
+    // diagnostic — otherwise silently succeed (exit 0 regardless so Claude's
+    // turn isn't blocked by hook failure).
+    let err_size = to_string(exec("[ -s '" + err_log + "' ] && echo 1 || echo 0")).trim()  // @allow-bare-exec
+    if out.len() == 0 && err_size == "1" {
+        ai_err("E_DISPATCH_FAIL",
+               "entry.hexa dispatch produced no stdout; stderr captured",
+               "inspect " + err_log + " then re-run: " + HEXA_BIN + " run " + ENTRY + " prompt '<prompt>'",
+               ENTRY)
+    }
+}
+
+main()
