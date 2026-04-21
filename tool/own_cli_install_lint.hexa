@@ -1,0 +1,216 @@
+#!hexa strict
+// tool/own_cli_install_lint.hexa — enforce own#5 cli-via-hx-install
+//
+// FORBIDS direct invocation of registry-entry paths. Every external CLI
+// MUST arrive via `./hx install <name>` and be invoked as `<name> <cmd>`
+// (the shim installed at $HX_BIN/<name>). Direct invocation breaks
+// update propagation: changes to tool/pkg/registry.tsv won't reach
+// hardcoded path callers, producing silent drift.
+//
+// The rule detects substrings of the form `<name>/<entry>` for every
+// registry entry whose entry column contains a `/` or a file extension
+// (bare entries like `hexa`, `void` are skipped to avoid false positives).
+//
+// USAGE
+//   hexa tool/own_cli_install_lint.hexa             — scan; exit 2 on violations
+//   hexa tool/own_cli_install_lint.hexa --explain   — report, always exit 0
+//   hexa tool/own_cli_install_lint.hexa --json      — JSON findings
+//
+// BYPASS
+//   Put `hx-install-ignore` on the offending line (inline comment) to
+//   suppress a specific finding. Use sparingly — the comment is audited
+//   by raw_all grep for spread.
+//
+// EXIT CODES
+//   0 — no violations (or --explain)
+//   2 — violations found
+
+use "self/core/law_io"
+
+fn _registry_path() -> string { return "tool/pkg/registry.tsv" }
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── registry load ───────────────────────────────────────────────
+
+@pure
+fn _has_slash_or_ext(s: string) -> bool {
+    if s.index_of("/") >= 0 { return true }
+    if s.index_of(".hexa") >= 0 { return true }
+    if s.index_of(".sh")   >= 0 { return true }
+    if s.index_of(".py")   >= 0 { return true }
+    if s.index_of(".js")   >= 0 { return true }
+    if s.index_of(".ts")   >= 0 { return true }
+    return false
+}
+
+fn _load_entries() -> array {
+    // Returns array of [name, entry] for every registry row whose entry
+    // column survives the bare-word filter. Bare entries (e.g. `hexa`,
+    // `void`, `hexa-lang`→`hexa`) are excluded because their distinctive
+    // token is already the package name — matching would false-positive.
+    let raw = to_string(read_file(_registry_path()))
+    let lines = split(raw, "\n")
+    let mut out = []
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        if t.substring(0, 1) == "#" { continue }
+        let cols = split(ln, "\t")
+        if len(cols) < 3 { continue }
+        let name = cols[0].trim()
+        let entry = cols[2].trim()
+        if name == "" || entry == "" { continue }
+        if !_has_slash_or_ext(entry) { continue }
+        out.push([name, entry])
+    }
+    return out
+}
+
+// ─── scan ────────────────────────────────────────────────────────
+
+fn _scan_dirs() -> string {
+    // Dirs within this repo that can harbor script/doc violations. Each
+    // must exist or grep will warn; we test below and only include the
+    // present ones.
+    let mut parts = []
+    let candidates = ["tool", "doc", "launchd", "bin", "config", "scripts", ".roadmap"]
+    for d in candidates {
+        let r = exec_with_status("test -d " + _shell_quote(d))
+        if r[1] == 0 { parts.push(d) }
+    }
+    let mut joined = ""
+    for i in 0..len(parts) {
+        if i > 0 { joined = joined + " " }
+        joined = joined + parts[i]
+    }
+    return joined
+}
+
+@pure
+fn _is_excluded_file(path: string) -> bool {
+    // Files that are ALLOWED to mention registry-entry paths:
+    //   - registry.tsv itself (the source of truth)
+    //   - this lint tool (self-reference)
+    //   - tool/pkg/hx installer (documents them in help/install flow)
+    //   - _site/ generated html mirrors
+    //   - *.bak.* backups
+    if path.index_of("tool/pkg/registry.tsv") >= 0 { return true }
+    if path.index_of("tool/own_cli_install_lint.hexa") >= 0 { return true }
+    if path.index_of("tool/pkg/hx") >= 0 { return true }
+    if path.index_of("docs/_site/") >= 0 { return true }
+    if path.index_of(".bak.") >= 0 { return true }
+    if path.index_of("/_site/") >= 0 { return true }
+    return false
+}
+
+fn _grep_pattern(pattern: string, dirs: string) -> string {
+    // Returns raw grep output (file:line:content) — empty on no match.
+    let cmd = "grep -rn --include='*.hexa' --include='*.sh' --include='*.md' "
+        + "--include='*.json' --include='*.plist' --include='*.yml' "
+        + "--exclude-dir='.git' --exclude-dir='_site' "
+        + "--exclude-dir='packages' "
+        + "-F " + _shell_quote(pattern) + " " + dirs + " 2>/dev/null || true"
+    return to_string(exec(cmd))
+}
+
+// ─── findings ────────────────────────────────────────────────────
+
+fn _format_finding(name: string, entry: string, gline: string) -> string {
+    // gline looks like `tool/foo.hexa:42:   exec("hexa airgenome/run.hexa")`
+    return "  own#5 [" + name + "] " + gline.trim()
+}
+
+fn _scan_one(name: string, entry: string, dirs: string) -> array {
+    let pattern = name + "/" + entry
+    let out = _grep_pattern(pattern, dirs)
+    let mut findings = []
+    if out == "" { return findings }
+    for line in split(out, "\n") {
+        let t = line.trim()
+        if t == "" { continue }
+        // grep file:line:content — extract file path (before first `:`)
+        let col = line.index_of(":")
+        if col < 0 { continue }
+        let path = line.substring(0, col)
+        if _is_excluded_file(path) { continue }
+        // inline bypass
+        if line.index_of("hx-install-ignore") >= 0 { continue }
+        findings.push(_format_finding(name, entry, line))
+    }
+    return findings
+}
+
+// ─── output modes ────────────────────────────────────────────────
+
+fn _emit_text(all_findings: array) {
+    if len(all_findings) == 0 {
+        println("own#5 cli-via-hx-install: OK (0 violations)")
+        return
+    }
+    eprintln("own#5 cli-via-hx-install: " + to_string(len(all_findings))
+             + " violation(s)")
+    eprintln("")
+    for f in all_findings { eprintln(f) }
+    eprintln("")
+    eprintln("FIX   — replace direct path invocation with the hx shim:")
+    eprintln("        ./hx install <name>     # once")
+    eprintln("        <name> <command...>     # from then on")
+    eprintln("BYPASS — add `hx-install-ignore` on the offending line")
+    eprintln("        (audited; use only for registry bootstrap code)")
+}
+
+fn _json_escape(s: string) -> string {
+    return s.replace("\\", "\\\\").replace("\"", "\\\"")
+}
+
+fn _emit_json(all_findings: array) {
+    let n = len(all_findings)
+    let mut out = "{\"rule\":\"own#5\",\"slug\":\"cli-via-hx-install\","
+    out = out + "\"violations\":" + to_string(n) + ",\"findings\":["
+    for i in 0..n {
+        if i > 0 { out = out + "," }
+        out = out + "\"" + _json_escape(all_findings[i]) + "\""
+    }
+    out = out + "]}"
+    println(out)
+}
+
+// ─── main ────────────────────────────────────────────────────────
+
+fn main() -> int {
+    let av = argv()
+    let mut explain = false
+    let mut json_out = false
+    let mut i = 1
+    while i < len(av) {
+        let a = av[i]
+        if a == "--explain" { explain = true }
+        if a == "--json"    { json_out = true }
+        i = i + 1
+    }
+
+    let entries = _load_entries()
+    let dirs = _scan_dirs()
+    if dirs == "" {
+        // Nothing to scan — not a violation
+        if json_out { _emit_json([]) } else { println("own#5: no scan dirs present") }
+        return 0
+    }
+
+    let mut all = []
+    for e in entries {
+        let fs = _scan_one(e[0], e[1], dirs)
+        for f in fs { all.push(f) }
+    }
+
+    if json_out { _emit_json(all) } else { _emit_text(all) }
+
+    if explain { return 0 }
+    if len(all) > 0 { return 2 }
+    return 0
+}
+
+exit(main())
