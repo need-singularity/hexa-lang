@@ -1,0 +1,339 @@
+// tool/own_runner.hexa — unified .own DSL executor
+//
+// Runs the verify / drift / cron fields embedded in .own files (L1
+// governance DSL, same grammar as .raw via self/raw_loader.hexa).
+// Absorbs what was split across .loop and loop-rules.json: rules,
+// cron loops, drift checks, and forward-chain declarations all flow
+// through the one DSL. Legacy .loop and loop-rules.json still exist
+// on disk for pre-migration readers but are shadowed by .own.
+//
+// Run this tool from the project root (PWD = target project). The
+// raw_loader key whitelist is tolerant when there is no local .raw,
+// which lets extended keys (verify / cron / drift_* / step.*) parse
+// without warnings. A project with its own .raw must register these
+// keys in raw:self-format or the runner's new fields are rejected.
+//
+// Usage:
+//   hexa <this>                        == list  (default)
+//   hexa <this> list
+//   hexa <this> schema
+//   hexa <this> verify <slug>
+//   hexa <this> verify-all
+//   hexa <this> drift <slug>
+//   hexa <this> drift-all
+//   hexa <this> cron <schedule>
+//
+// Exit codes:
+//   0  all target rules PASS (or list/schema)
+//   1  at least one FAIL (verify / drift)
+//   2  missing .own, unknown slug, bad subcommand
+
+use "self/raw_loader"
+
+fn _sh(cmd: string) -> string {
+    return to_string(exec(cmd + " 2>/dev/null")).trim()
+}
+
+fn _sh_exit(cmd: string) -> int {
+    // Run cmd, print nothing, return shell exit code.
+    let wrap = "(" + cmd + ") >/dev/null 2>&1; echo $?"
+    let code = to_string(exec(wrap)).trim()
+    // Parse exit code (0-255) defensively.
+    let mut n = 0
+    let mut i = 0
+    while i < len(code) {
+        let c = code.substring(i, i + 1)
+        if c == "0" { n = n * 10 }
+        else if c == "1" { n = n * 10 + 1 }
+        else if c == "2" { n = n * 10 + 2 }
+        else if c == "3" { n = n * 10 + 3 }
+        else if c == "4" { n = n * 10 + 4 }
+        else if c == "5" { n = n * 10 + 5 }
+        else if c == "6" { n = n * 10 + 6 }
+        else if c == "7" { n = n * 10 + 7 }
+        else if c == "8" { n = n * 10 + 8 }
+        else if c == "9" { n = n * 10 + 9 }
+        else { break }
+        i = i + 1
+    }
+    return n
+}
+
+fn _repo() -> string {
+    let envr = env("N6_REPO_ROOT")
+    if envr != "" { return envr }
+    let git = _sh("git rev-parse --show-toplevel")
+    if git != "" { return git }
+    let p = env("PWD")
+    if p != "" { return p }
+    return to_string(exec("pwd")).trim()
+}
+
+fn _own_path() -> string {
+    let r = _repo()
+    return r + "/.own"
+}
+
+// ── rule accessors over raw_loader tuple [id, status, name, keys] ─────
+
+fn _has_field(rule: array, key: string) -> bool {
+    let keys = rule[3]
+    return keys_first(keys, key) != ""
+}
+
+fn _any_step(rule: array) -> bool {
+    let keys = rule[3]
+    for kv in keys {
+        if len(kv[0]) >= 5 && kv[0].substring(0, 5) == "step." { return true }
+    }
+    return false
+}
+
+fn _slug_of(rule: array) -> string {
+    return keys_first(rule[3], "slug")
+}
+
+fn _label_of(rule: array) -> string {
+    let l = keys_first(rule[3], "label")
+    if l != "" { return l }
+    let s = _slug_of(rule)
+    if s != "" { return s }
+    return rule[2]
+}
+
+// ── actions ───────────────────────────────────────────────────────────
+
+fn _run_verify(rule: array, repo: string) -> int {
+    let slug = _slug_of(rule)
+    let cmd = keys_first(rule[3], "verify")
+    let on_fail_raw = keys_first(rule[3], "on_fail")
+    let on_fail = if on_fail_raw != "" { on_fail_raw } else { "warn" }
+    let label = _label_of(rule)
+
+    if cmd == "" {
+        println("  [SKIP] " + slug + " — no verify field")
+        return 0
+    }
+
+    let full = "cd '" + repo + "' && " + cmd
+    let code = _sh_exit(full)
+    if code == 0 {
+        println("  [PASS] " + slug + " — " + label)
+        return 0
+    }
+    println("  [FAIL:" + on_fail + "] " + slug + " — " + label + " (exit=" + to_string(code) + ")")
+    eprintln("N6_OWN_FAIL {\"kind\":\"verify\",\"slug\":\"" + slug
+             + "\",\"exit\":" + to_string(code)
+             + ",\"on_fail\":\"" + on_fail + "\"}")
+    return 1
+}
+
+fn _run_drift(rule: array, repo: string) -> int {
+    let slug = _slug_of(rule)
+    let doc = keys_first(rule[3], "drift_doc")
+    let pat = keys_first(rule[3], "drift_pattern")
+    let actual_cmd = keys_first(rule[3], "drift_actual")
+    let on_fail_raw = keys_first(rule[3], "on_fail")
+    let on_fail = if on_fail_raw != "" { on_fail_raw } else { "warn" }
+    let label = _label_of(rule)
+
+    if doc == "" || pat == "" || actual_cmd == "" {
+        println("  [SKIP] " + slug + " — incomplete drift fields")
+        return 0
+    }
+
+    let doc_path = repo + "/" + doc
+    let exists = _sh("test -f '" + doc_path + "' && echo y || echo n")
+    if exists != "y" {
+        println("  [FAIL:" + on_fail + "] " + slug + " — drift_doc missing: " + doc_path)
+        eprintln("N6_OWN_FAIL {\"kind\":\"drift\",\"slug\":\"" + slug
+                 + "\",\"reason\":\"doc-missing\",\"path\":\"" + doc_path + "\"}")
+        return 1
+    }
+
+    // Extract doc value: grep first regex match, then the leading digit run.
+    let pat_escaped = pat.replace("'", "'\\''")
+    let doc_cmd = "LC_ALL=en_US.UTF-8 grep -oE '" + pat_escaped + "' '" + doc_path
+                  + "' | head -1 | grep -oE '[0-9]+' | head -1"
+    let doc_val = _sh(doc_cmd)
+
+    let actual_full = "cd '" + repo + "' && " + actual_cmd
+    let actual_raw = _sh(actual_full)
+    let actual_first = split(actual_raw, "\n")[0].trim()
+
+    if doc_val != "" && doc_val == actual_first {
+        println("  [PASS] " + slug + " — " + label + " (doc=actual=" + doc_val + ")")
+        return 0
+    }
+    println("  [FAIL:" + on_fail + "] " + slug + " — " + label
+            + " (doc=" + doc_val + ", actual=" + actual_first + ")")
+    eprintln("N6_OWN_FAIL {\"kind\":\"drift\",\"slug\":\"" + slug
+             + "\",\"doc\":\"" + doc_val
+             + "\",\"actual\":\"" + actual_first
+             + "\",\"on_fail\":\"" + on_fail + "\"}")
+    return 1
+}
+
+// ── subcommands ───────────────────────────────────────────────────────
+
+fn cmd_list(rules: array) {
+    println("── .own rules (" + to_string(len(rules)) + ") ──")
+    println("")
+    for rule in rules {
+        let markers = []
+        if _has_field(rule, "verify")    { markers.push("verify") }
+        if _has_field(rule, "drift_doc") { markers.push("drift") }
+        let cron = keys_first(rule[3], "cron")
+        if cron != ""                    { markers.push("cron:" + cron) }
+        if _any_step(rule)               { markers.push("chain") }
+        let mk = if len(markers) > 0 { " [" + markers.join(",") + "]" } else { "" }
+        println("  #" + rule[0] + " " + rule[1] + " " + _slug_of(rule) + mk)
+        println("       " + rule[2])
+    }
+    println("")
+    println("legend: verify=runnable, drift=doc↔fact check, cron=scheduled, chain=forward-chain")
+}
+
+fn cmd_schema() {
+    println("── .own unified DSL schema ──")
+    println("")
+    println("HEADER")
+    println("  own <num> <status> \"<title>\"")
+    println("  status: live | warn | new | deferred | convention")
+    println("")
+    println("DECLARATIVE FIELDS")
+    println("  slug <id>           stable identifier (external ref own:<slug>)")
+    println("  decl <paths...>     declaration / enforcement files")
+    println("  scope <text>        rule coverage")
+    println("  why <text>          motivation")
+    println("  note <text>         supplementary")
+    println("  deps <refs...>      own:<slug> / raw:<slug>")
+    println("")
+    println("VERIFICATION (absorbs .loop)")
+    println("  verify <shell-cmd>  exit 0 = PASS, non-zero = FAIL")
+    println("  cron <sched>        on-commit | pre-push | hourly | daily | weekly | manual")
+    println("  on_fail <action>    block | warn | log")
+    println("  label <text>        runner display")
+    println("")
+    println("DRIFT (absorbs loop-rules.json)")
+    println("  drift_doc <file>")
+    println("  drift_pattern <regex>")
+    println("  drift_actual <cmd>")
+    println("")
+    println("CHAIN (raw#0 forward-chain)")
+    println("  step.<id>.cmd <cmd>")
+    println("  step.<id>.timeout <sec>")
+    println("  mode strict | loose")
+    println("  ttl <sec>")
+}
+
+fn _find_by_slug(rules: array, slug: string) -> int {
+    let mut i = 0
+    while i < len(rules) {
+        if _slug_of(rules[i]) == slug { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── dispatch ──────────────────────────────────────────────────────────
+
+fn main() -> void {
+    let argv = args()
+    let mut sub = "list"
+    let mut arg2 = ""
+    if len(argv) >= 3 { sub = argv[2] }
+    if len(argv) >= 4 { arg2 = argv[3] }
+
+    let path = _own_path()
+    let p_exists = _sh("test -f '" + path + "' && echo y || echo n")
+    if p_exists != "y" {
+        eprintln("own_runner: .own not found at " + path)
+        exit(2)
+    }
+
+    let rules = load_raw_file(path)
+    if len(rules) == 0 {
+        eprintln("own_runner: no rules parsed from " + path)
+        exit(2)
+    }
+
+    let repo = _repo()
+
+    if sub == "list" || sub == "ls" {
+        cmd_list(rules)
+        exit(0)
+    }
+    if sub == "schema" {
+        cmd_schema()
+        exit(0)
+    }
+    if sub == "verify" {
+        if arg2 == "" { eprintln("usage: own_runner verify <slug>"); exit(2) }
+        let idx = _find_by_slug(rules, arg2)
+        if idx < 0 { eprintln("slug not found: " + arg2); exit(2) }
+        exit(_run_verify(rules[idx], repo))
+    }
+    if sub == "verify-all" {
+        println("── verify-all ──")
+        let mut fails = 0
+        for rule in rules {
+            if _has_field(rule, "verify") {
+                let rc = _run_verify(rule, repo)
+                if rc != 0 { fails = fails + 1 }
+            }
+        }
+        println("")
+        println("verify-all: " + to_string(fails) + " FAIL")
+        if fails > 0 { exit(1) }
+        exit(0)
+    }
+    if sub == "drift" {
+        if arg2 == "" { eprintln("usage: own_runner drift <slug>"); exit(2) }
+        let idx = _find_by_slug(rules, arg2)
+        if idx < 0 { eprintln("slug not found: " + arg2); exit(2) }
+        exit(_run_drift(rules[idx], repo))
+    }
+    if sub == "drift-all" {
+        println("── drift-all ──")
+        let mut fails = 0
+        for rule in rules {
+            if _has_field(rule, "drift_doc") {
+                let rc = _run_drift(rule, repo)
+                if rc != 0 { fails = fails + 1 }
+            }
+        }
+        println("")
+        println("drift-all: " + to_string(fails) + " FAIL")
+        if fails > 0 { exit(1) }
+        exit(0)
+    }
+    if sub == "cron" {
+        if arg2 == "" { eprintln("usage: own_runner cron <schedule>"); exit(2) }
+        println("── cron " + arg2 + " ──")
+        let mut ran = 0
+        let mut fails = 0
+        for rule in rules {
+            if keys_first(rule[3], "cron") == arg2 {
+                ran = ran + 1
+                if _has_field(rule, "verify") {
+                    let rc = _run_verify(rule, repo)
+                    if rc != 0 { fails = fails + 1 }
+                } else if _has_field(rule, "drift_doc") {
+                    let rc = _run_drift(rule, repo)
+                    if rc != 0 { fails = fails + 1 }
+                } else {
+                    println("  [NOTE] " + _slug_of(rule) + " — " + _label_of(rule))
+                }
+            }
+        }
+        println("")
+        println("cron " + arg2 + ": " + to_string(ran) + " ran, " + to_string(fails) + " FAIL")
+        if fails > 0 { exit(1) }
+        exit(0)
+    }
+
+    eprintln("unknown subcommand: " + sub)
+    eprintln("valid: list | schema | verify <slug> | verify-all | drift <slug> | drift-all | cron <sched>")
+    exit(2)
+}
