@@ -1,0 +1,828 @@
+// dod_gate.hexa — H-DOD + H-VERIFIER gates for roadmap status promotion
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// PURPOSE
+//   Definition-of-Done 강제 게이트. scaffold_done → wired_done → serving_done
+//   승격 전에 artifact 증거 (파일 존재 + ffprobe wav 검증 + smoke test)
+//   모두 통과해야만 PASS 발행. 실패 시 stdout 마지막 라인 sentinel
+//     __HARNESS_DOD_RESULT__ PASS
+//     __HARNESS_DOD_RESULT__ BLOCK <reason>
+//   으로 결과 방출. hexa `exit()` 가 쉘 $? 로 전파 안 되므로 sentinel 필수
+//   (f-hexa-exit-sentinel 메모리 참조).
+//
+//   직전 세션 voice 트랙 번복 사고 (scaffold 끝난 것을 serving done 으로
+//   과장 보고) 의 재발 방지책. roadmap_cli.hexa mark 승격 전 본 gate 로
+//   사전 검증 권장.
+//
+// DATA SOURCE
+//   shared/roadmaps/<track>_dod.json
+//     {
+//       "track": "voice",
+//       "tiers": {
+//         "scaffold_done": { "required": [...], "smoke": [] },
+//         "wired_done":    { "required": [...], "smoke": [...] },
+//         "serving_done":  {
+//           "artifact_wav": "path/glob*.wav",
+//           "ffprobe_check": {"min_duration_ms": N, "max_duration_ms": M},
+//           "latency_budget_ms": 200,
+//           "blind_score_min": 0.7,
+//           "ground_truth_required": true,
+//           "required": [...], "smoke": [...]
+//         }
+//       }
+//     }
+//
+// VERIFIER
+//   shared/tool/verifier.hexa (본 파일이 exec 로 위임)
+//     ls / ffprobe / smoke 3 프리미티브만. side-effect 금지.
+//
+// CLI
+//   hexa run dod_gate.hexa check   <track>                — 현재 DoD 상태 리포트
+//   hexa run dod_gate.hexa verify  <track> <target_tier>  — 승격 전 강제 검증
+//   hexa run dod_gate.hexa explain <track>                — 필드별 현재 상태 덤프
+//   hexa run dod_gate.hexa --selftest
+//
+// SENTINEL (stdout last line)
+//   __HARNESS_DOD_RESULT__ PASS
+//   __HARNESS_DOD_RESULT__ BLOCK <reason>
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV.len() > 0 { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let VERIFIER = HARNESS + "/verifier.hexa"
+let LOG_PATH = HARNESS + "/dod_gate_log.jsonl"
+let HEXA_BIN = NEXUS + "/bin/hexa"
+
+// Project env tokens (H-NEXUSPATH SSOT) — expand in DoD config path strings.
+// Fallbacks to $HOME/Dev/<proj> if env var not set (matches rule fallback guidance).
+fn _env_or_default(key: string, fallback: string) -> string {
+    let v = env(key)
+    if v.len() > 0 { return v }
+    return fallback
+}
+let ANIMA     = _env_or_default("ANIMA",     HOME + "/Dev/anima")       // @allow-devpath
+let HEXA_LANG = _env_or_default("HEXA_LANG", HOME + "/Dev/hexa-lang")   // @allow-devpath
+let N6_ARCH   = _env_or_default("N6_ARCH",   HOME + "/Dev/n6-architecture")  // @allow-devpath
+let AIRGENOME = _env_or_default("AIRGENOME", HOME + "/Dev/airgenome")   // @allow-devpath
+let VOID      = _env_or_default("VOID",      HOME + "/Dev/void")        // @allow-devpath
+let PAPERS    = _env_or_default("PAPERS",    HOME + "/Dev/papers")      // @allow-devpath
+
+// Expand $NEXUS/$ANIMA/... tokens in a path string. String-based substitution — no shell.
+fn expand_template(s: string) -> string {
+    if s.len() == 0 { return s }
+    let mut r = s
+    r = r.replace("$NEXUS",     NEXUS)
+    r = r.replace("$ANIMA",     ANIMA)
+    r = r.replace("$HEXA_LANG", HEXA_LANG)
+    r = r.replace("$N6_ARCH",   N6_ARCH)
+    r = r.replace("$AIRGENOME", AIRGENOME)
+    r = r.replace("$VOID",      VOID)
+    r = r.replace("$PAPERS",    PAPERS)
+    r = r.replace("$HOME",      HOME)
+    return r
+}
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _i_of(x) -> i64 {
+    let t = type_of(x)
+    if t == "i64" || t == "int" { return x }
+    return 0
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn sh_quote(s: string) -> string {
+    let mut out = "'"
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\"'\"'" } else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ── minimal JSON text helpers (same conventions as roadmap_cli.hexa) ────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    return [body.substring(start, j), to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_bool(body: string, key: string) -> bool {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return false }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i + 4 <= body.len() && body.substring(i, i + 4) == "true" { return true }
+    return false
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// extract object block for a given key (returns body substring including { .. })
+// usage: extract_obj(dod_body, "tiers") → "{ \"scaffold_done\": {...}, ... }"
+fn extract_obj(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "{" { return "" }
+    let start = i
+    let mut depth = 0
+    let mut in_str = false
+    let mut j = i
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if in_str {
+            if c == "\\" { j = j + 2; continue }
+            if c == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if c == "\"" { in_str = true; j = j + 1; continue }
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" {
+            depth = depth - 1
+            if depth == 0 { return body.substring(start, j + 1) }
+        }
+        j = j + 1
+    }
+    return ""
+}
+
+// ── verifier invocation (exec to verifier.hexa) ─────────────────────────
+// Each verifier call runs a sub-hexa. We parse its stdout summary line.
+//   ls output:      "PASS 3 /path"  or  "MISS 0 /path"  or  "ERR ..."
+//   ffprobe output: "PASS duration_ms=1234 codec=pcm_s16le detail=ok"
+//   smoke output:   "PASS last=<line>"  or  "BLOCK last=<line>"
+
+fn call_verifier_ls(path_or_glob: string) -> [string] {
+    let cmd = HEXA_BIN + " run " + VERIFIER + " ls " + sh_quote(path_or_glob) + " 2>&1"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return ["ERR", "verifier silent"] }
+    // first whitespace-separated token is status
+    let lines = raw.split("\n")
+    let last = _str(lines[lines.len() - 1]).trim()
+    let sp = last.index_of(" ")
+    let status = if sp > 0 { last.substring(0, sp) } else { last }
+    return [status, last]
+}
+
+fn call_verifier_ffprobe(wav: string) -> [string] {
+    let cmd = HEXA_BIN + " run " + VERIFIER + " ffprobe " + sh_quote(wav) + " 2>&1"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return ["ERR", "verifier silent", "0", ""] }
+    let lines = raw.split("\n")
+    let last = _str(lines[lines.len() - 1]).trim()
+    let sp = last.index_of(" ")
+    let status = if sp > 0 { last.substring(0, sp) } else { last }
+    // parse duration_ms=N codec=C
+    let mut dur_ms = "0"
+    let di = last.index_of("duration_ms=")
+    if di >= 0 {
+        let start = di + 12
+        let mut end = start
+        while end < last.len() {
+            let c = last.substring(end, end + 1)
+            if c == " " || c == "\t" { break }
+            end = end + 1
+        }
+        dur_ms = last.substring(start, end)
+    }
+    let mut codec = ""
+    let ci = last.index_of("codec=")
+    if ci >= 0 {
+        let start = ci + 6
+        let mut end = start
+        while end < last.len() {
+            let c = last.substring(end, end + 1)
+            if c == " " || c == "\t" { break }
+            end = end + 1
+        }
+        codec = last.substring(start, end)
+    }
+    return [status, last, dur_ms, codec]
+}
+
+fn call_verifier_smoke(smoke_cmd: string) -> [string] {
+    // verifier smoke receives raw command. We shell-quote the whole command string once.
+    let cmd = HEXA_BIN + " run " + VERIFIER + " smoke " + sh_quote(smoke_cmd) + " 2>&1"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return ["ERR", "verifier silent"] }
+    let lines = raw.split("\n")
+    let last = _str(lines[lines.len() - 1]).trim()
+    let sp = last.index_of(" ")
+    let status = if sp > 0 { last.substring(0, sp) } else { last }
+    return [status, last]
+}
+
+// ── DoD tier evaluation ──────────────────────────────────────────────────
+// returns [status, reason, pass_count, fail_count, details...]
+struct TierResult {
+    status: string,
+    reason: string,
+    checks_total: i64,
+    checks_passed: i64,
+    fails: [string]
+}
+
+fn eval_tier(dod_body: string, tier_name: string) -> TierResult {
+    let tiers_obj = extract_obj(dod_body, "tiers")
+    if tiers_obj.len() == 0 {
+        return TierResult {
+            status: "BLOCK", reason: "tiers object missing in dod config",
+            checks_total: 0, checks_passed: 0, fails: ["dod config malformed"]
+        }
+    }
+    let tier_obj = extract_obj(tiers_obj, tier_name)
+    if tier_obj.len() == 0 {
+        return TierResult {
+            status: "BLOCK", reason: "tier not defined: " + tier_name,
+            checks_total: 0, checks_passed: 0, fails: ["unknown tier: " + tier_name]
+        }
+    }
+    let mut total: i64 = 0
+    let mut passed: i64 = 0
+    let mut fails: [string] = []
+
+    // 1) required[] — existence (verifier ls)
+    let required = json_str_array(tier_obj, "required")
+    let mut ri = 0
+    while ri < required.len() {
+        let path = expand_template(_str(required[ri]))
+        total = total + 1
+        let r = call_verifier_ls(path)
+        if _str(r[0]) == "PASS" {
+            passed = passed + 1
+        } else {
+            fails = fails.push("required MISS: " + path)
+        }
+        ri = ri + 1
+    }
+
+    // 2) smoke[] — each cmd must exit OK (sentinel or heuristic)
+    let smokes = json_str_array(tier_obj, "smoke")
+    let mut si = 0
+    while si < smokes.len() {
+        let cmd = expand_template(_str(smokes[si]))
+        total = total + 1
+        let r = call_verifier_smoke(cmd)
+        if _str(r[0]) == "PASS" {
+            passed = passed + 1
+        } else {
+            fails = fails.push("smoke " + _str(r[0]) + ": " + cmd)
+        }
+        si = si + 1
+    }
+
+    // 3) artifact_wav + ffprobe_check (serving_done specific)
+    let wav_glob = expand_template(json_str(tier_obj, "artifact_wav"))
+    if wav_glob.len() > 0 {
+        total = total + 1
+        // first verify at least one wav exists via ls glob
+        let ls_r = call_verifier_ls(wav_glob)
+        if _str(ls_r[0]) != "PASS" {
+            fails = fails.push("artifact_wav MISS: " + wav_glob)
+        } else {
+            // try to locate first matching file (call verifier ls returns detail=first)
+            // detail line format: "PASS <count> <first_match>"
+            let detail = _str(ls_r[1])
+            let mut first_path = ""
+            // parse "PASS <n> <path>"
+            let parts = detail.split(" ")
+            if parts.len() >= 3 {
+                // first two tokens are status + count; concat remainder as path (path may contain spaces)
+                let mut pp = ""
+                let mut k = 2
+                while k < parts.len() {
+                    if pp == "" { pp = _str(parts[k]) } else { pp = pp + " " + _str(parts[k]) }
+                    k = k + 1
+                }
+                first_path = pp
+            }
+            if first_path.len() == 0 {
+                fails = fails.push("artifact_wav detail parse failed: " + detail)
+            } else {
+                let ff_r = call_verifier_ffprobe(first_path)
+                if _str(ff_r[0]) != "PASS" {
+                    fails = fails.push("ffprobe " + _str(ff_r[0]) + ": " + first_path + " :: " + _str(ff_r[1]))
+                } else {
+                    // ffprobe_check range
+                    let dur_ms_s = _str(ff_r[2])
+                    let dur_ms = if dur_ms_s.len() > 0 { to_int(dur_ms_s) } else { 0 }
+                    let ffcheck = extract_obj(tier_obj, "ffprobe_check")
+                    let min_ms_f = if ffcheck.len() > 0 { json_num(ffcheck, "min_duration_ms") } else { 0.0 }
+                    let max_ms_f = if ffcheck.len() > 0 { json_num(ffcheck, "max_duration_ms") } else { 0.0 }
+                    let min_ms = f_to_i(min_ms_f)
+                    let max_ms = f_to_i(max_ms_f)
+                    let dur_ok = (min_ms == 0 || dur_ms >= min_ms) && (max_ms == 0 || dur_ms <= max_ms)
+                    if dur_ok == false {
+                        fails = fails.push("ffprobe duration OOR: " + to_string(dur_ms) + "ms not in [" + to_string(min_ms) + "," + to_string(max_ms) + "]")
+                    } else {
+                        passed = passed + 1
+                    }
+                }
+            }
+        }
+    }
+
+    // 4) latency_budget_ms + blind_score_min — manual fields. We only enforce
+    //    presence of measurement evidence. A blind_score file would be required
+    //    via smoke/required paths; this block just records the declared budget.
+    let lat_budget = json_num(tier_obj, "latency_budget_ms")
+    let blind_min = json_num(tier_obj, "blind_score_min")
+    let gt_req = json_bool(tier_obj, "ground_truth_required")
+    if lat_budget > 0.0 || blind_min > 0.0 || gt_req {
+        // These require external measurement. If no smoke/required covers them → BLOCK.
+        // Heuristic: if tier declares these but has zero smoke entries, we flag.
+        if smokes.len() == 0 && required.len() == 0 && wav_glob.len() == 0 {
+            fails = fails.push("tier declares budgets but has no verifier coverage (required[] / smoke[] / artifact_wav empty)")
+        }
+        // else: verifier coverage is in place — user's smoke scripts must assert budgets internally.
+    }
+
+    let mut status = "PASS"
+    let mut reason = "all checks passed"
+    if total == 0 {
+        // empty tier is not a pass — we refuse to promote with no evidence
+        status = "BLOCK"
+        reason = "no verifier coverage for tier"
+        fails = fails.push("tier has no required/smoke/artifact_wav — refuse to promote")
+    } else if fails.len() > 0 {
+        status = "BLOCK"
+        reason = to_string(fails.len()) + " check(s) failed of " + to_string(total)
+    } else {
+        reason = to_string(passed) + "/" + to_string(total) + " checks passed"
+    }
+    return TierResult {
+        status: status, reason: reason,
+        checks_total: total, checks_passed: passed, fails: fails
+    }
+}
+
+// ── DoD config loader ───────────────────────────────────────────────────
+fn dod_path(track: string) -> string {
+    return ROADMAPS + "/" + track + "_dod.json"
+}
+
+fn load_dod(track: string) -> string {
+    let p = dod_path(track)
+    if file_exists(p) == false {
+        eprintln("REJECT: dod config missing: " + p)
+        eprintln("  expected shape: {\"track\":\"" + track + "\",\"tiers\":{...}}")
+        return ""
+    }
+    let body = _str(read_file(p))
+    if body.len() == 0 {
+        eprintln("REJECT: dod config empty: " + p)
+        return ""
+    }
+    return body
+}
+
+// ── logging ──────────────────────────────────────────────────────────────
+fn escape_jsonl(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn log_event(track: string, op: string, tier: string, result: TierResult) {
+    let mut fails_str = ""
+    let mut i = 0
+    while i < result.fails.len() {
+        if i > 0 { fails_str = fails_str + " | " }
+        fails_str = fails_str + _str(result.fails[i])
+        i = i + 1
+    }
+    let line = "{\"ts\":\"" + _ts_iso() + "\",\"track\":\"" + escape_jsonl(track) + "\",\"op\":\"" + escape_jsonl(op) + "\",\"tier\":\"" + escape_jsonl(tier) + "\",\"status\":\"" + escape_jsonl(result.status) + "\",\"passed\":" + to_string(result.checks_passed) + ",\"total\":" + to_string(result.checks_total) + ",\"reason\":\"" + escape_jsonl(result.reason) + "\",\"fails\":\"" + escape_jsonl(fails_str) + "\"}"
+    append_file(LOG_PATH, line + "\n")
+}
+
+// ── commands ─────────────────────────────────────────────────────────────
+// emit_sentinel: stdout LAST line must be sentinel (f-hexa-exit-sentinel)
+fn emit_sentinel(status: string, reason: string) {
+    println("")
+    println("__HARNESS_DOD_RESULT__ " + status + " " + reason)
+}
+
+fn cmd_check(track: string) -> i64 {
+    let body = load_dod(track)
+    if body.len() == 0 {
+        emit_sentinel("BLOCK", "dod_config_missing")
+        return 1
+    }
+    println("▼DoD check — track=" + track)
+    let tiers = ["scaffold_done", "wired_done", "serving_done"]
+    let mut overall_pass = true
+    let mut last_pass_tier = ""
+    let mut ti = 0
+    while ti < tiers.len() {
+        let tn = _str(tiers[ti])
+        let r = eval_tier(body, tn)
+        let marker = if r.status == "PASS" { "●" } else { "○" }
+        println("  " + marker + " " + tn + ": " + r.status + "  (" + to_string(r.checks_passed) + "/" + to_string(r.checks_total) + " checks)  " + r.reason)
+        let mut fi = 0
+        while fi < r.fails.len() {
+            println("      ✗ " + _str(r.fails[fi]))
+            fi = fi + 1
+        }
+        if r.status == "PASS" { last_pass_tier = tn }
+        else { overall_pass = false }
+        log_event(track, "check", tn, r)
+        ti = ti + 1
+    }
+    println("")
+    if overall_pass {
+        println("highest DoD passed: " + last_pass_tier + " (all 3 tiers green)")
+        emit_sentinel("PASS", "all_tiers")
+        return 0
+    }
+    if last_pass_tier == "" {
+        println("current DoD: NONE passed")
+        emit_sentinel("PASS", "check_only_no_promotion")
+    } else {
+        println("current DoD highest passed: " + last_pass_tier)
+        emit_sentinel("PASS", "check_highest=" + last_pass_tier)
+    }
+    return 0
+}
+
+fn cmd_verify(track: string, target_tier: string) -> i64 {
+    let body = load_dod(track)
+    if body.len() == 0 {
+        emit_sentinel("BLOCK", "dod_config_missing")
+        return 1
+    }
+    // allowed tiers
+    let valid = target_tier == "scaffold_done" || target_tier == "wired_done" || target_tier == "serving_done"
+    if valid == false {
+        println("REJECT: unknown tier: " + target_tier)
+        emit_sentinel("BLOCK", "invalid_tier=" + target_tier)
+        return 2
+    }
+    println("▼DoD verify — track=" + track + "  target=" + target_tier)
+    let r = eval_tier(body, target_tier)
+    println("  status:  " + r.status)
+    println("  passed:  " + to_string(r.checks_passed) + "/" + to_string(r.checks_total))
+    println("  reason:  " + r.reason)
+    let mut fi = 0
+    while fi < r.fails.len() {
+        println("      ✗ " + _str(r.fails[fi]))
+        fi = fi + 1
+    }
+    log_event(track, "verify", target_tier, r)
+    if r.status == "PASS" {
+        emit_sentinel("PASS", "tier=" + target_tier)
+        return 0
+    }
+    emit_sentinel("BLOCK", "tier=" + target_tier + " reason=" + r.reason)
+    return 1
+}
+
+fn cmd_explain(track: string) -> i64 {
+    let body = load_dod(track)
+    if body.len() == 0 {
+        emit_sentinel("BLOCK", "dod_config_missing")
+        return 1
+    }
+    println("▼DoD explain — track=" + track)
+    println("  config: " + dod_path(track))
+    let desc = json_str(body, "description")
+    if desc.len() > 0 { println("  description: " + desc) }
+    let upd = json_str(body, "updated")
+    if upd.len() > 0 { println("  updated: " + upd) }
+    let tiers_obj = extract_obj(body, "tiers")
+    if tiers_obj.len() == 0 {
+        println("  (no tiers)")
+        emit_sentinel("BLOCK", "no_tiers")
+        return 1
+    }
+    let tiers = ["scaffold_done", "wired_done", "serving_done"]
+    let mut ti = 0
+    while ti < tiers.len() {
+        let tn = _str(tiers[ti])
+        let tier_obj = extract_obj(tiers_obj, tn)
+        if tier_obj.len() == 0 {
+            println("  [" + tn + "] (tier not declared)")
+            ti = ti + 1
+            continue
+        }
+        println("  [" + tn + "]")
+        let d = json_str(tier_obj, "description")
+        if d.len() > 0 { println("    description: " + d) }
+        let required = json_str_array(tier_obj, "required")
+        if required.len() > 0 {
+            println("    required (" + to_string(required.len()) + "):")
+            let mut i = 0
+            while i < required.len() {
+                let p = expand_template(_str(required[i]))
+                let r = call_verifier_ls(p)
+                let m = if _str(r[0]) == "PASS" { "●" } else { "○" }
+                println("      " + m + " " + p)
+                i = i + 1
+            }
+        }
+        let smokes = json_str_array(tier_obj, "smoke")
+        if smokes.len() > 0 {
+            println("    smoke (" + to_string(smokes.len()) + "):")
+            let mut i = 0
+            while i < smokes.len() {
+                println("      · " + expand_template(_str(smokes[i])))
+                i = i + 1
+            }
+        }
+        let wav = expand_template(json_str(tier_obj, "artifact_wav"))
+        if wav.len() > 0 {
+            println("    artifact_wav: " + wav)
+            let ls = call_verifier_ls(wav)
+            let m = if _str(ls[0]) == "PASS" { "●" } else { "○" }
+            println("      " + m + " match check")
+        }
+        let ff = extract_obj(tier_obj, "ffprobe_check")
+        if ff.len() > 0 {
+            let mn = f_to_i(json_num(ff, "min_duration_ms"))
+            let mx = f_to_i(json_num(ff, "max_duration_ms"))
+            println("    ffprobe_check: duration_ms in [" + to_string(mn) + "," + to_string(mx) + "]")
+        }
+        let lat = json_num(tier_obj, "latency_budget_ms")
+        if lat > 0.0 { println("    latency_budget_ms: " + to_string(f_to_i(lat))) }
+        let blind = json_num(tier_obj, "blind_score_min")
+        if blind > 0.0 { println("    blind_score_min: " + to_string(blind)) }
+        let gt = json_bool(tier_obj, "ground_truth_required")
+        if gt { println("    ground_truth_required: true") }
+        ti = ti + 1
+    }
+    emit_sentinel("PASS", "explain_complete")
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn selftest() -> i64 {
+    println("[dod_gate selftest]")
+    // verify voice config exists
+    let vp = dod_path("voice")
+    if file_exists(vp) == false {
+        eprintln("FAIL: voice_dod.json missing")
+        return 1
+    }
+    println("  voice_dod.json found")
+    // scaffold_done should PASS (rp_voice_profiles.hexa exists)
+    let body = load_dod("voice")
+    if body.len() == 0 { eprintln("FAIL: load"); return 1 }
+    let r1 = eval_tier(body, "scaffold_done")
+    println("  scaffold_done: " + r1.status + " (" + to_string(r1.checks_passed) + "/" + to_string(r1.checks_total) + ")")
+    if r1.status != "PASS" {
+        eprintln("FAIL: scaffold_done should PASS — rp_voice_profiles.hexa exists on disk")
+        let mut fi = 0
+        while fi < r1.fails.len() { eprintln("  " + _str(r1.fails[fi])); fi = fi + 1 }
+        return 1
+    }
+    // serving_done should BLOCK (no wav)
+    let r3 = eval_tier(body, "serving_done")
+    println("  serving_done:  " + r3.status + " (" + to_string(r3.checks_passed) + "/" + to_string(r3.checks_total) + ")")
+    if r3.status != "BLOCK" {
+        eprintln("FAIL: serving_done should BLOCK — no wav artifact")
+        return 1
+    }
+    // wired_done should BLOCK (synth_probe not created yet)
+    let r2 = eval_tier(body, "wired_done")
+    println("  wired_done:    " + r2.status + " (" + to_string(r2.checks_passed) + "/" + to_string(r2.checks_total) + ")")
+    if r2.status != "BLOCK" {
+        eprintln("FAIL: wired_done should BLOCK — synth_probe.hexa missing")
+        return 1
+    }
+    println("[dod_gate selftest] ALL PASS")
+    return 0
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────
+fn print_usage() {
+    eprintln("usage: dod_gate <subcommand> [args]")
+    eprintln("  check   <track>                   # report DoD tier status")
+    eprintln("  verify  <track> <target_tier>     # enforce before promotion")
+    eprintln("  explain <track>                   # field-by-field current state")
+    eprintln("  --selftest")
+    eprintln("")
+    eprintln("tiers: scaffold_done | wired_done | serving_done")
+    eprintln("sentinel (stdout last line): __HARNESS_DOD_RESULT__ PASS|BLOCK <reason>")
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai = 2
+    while ai < argv.len() { a = a.push(_str(argv[ai])); ai = ai + 1 }
+    if a.len() == 0 { print_usage(); exit(2) }
+    let sub = _str(a[0])
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        if rc == 0 { emit_sentinel("PASS", "selftest") }
+        else { emit_sentinel("BLOCK", "selftest_fail") }
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        print_usage(); exit(0)
+    }
+    if sub == "check" {
+        if a.len() < 2 { eprintln("usage: check <track>"); exit(2) }
+        let rc = cmd_check(_str(a[1]))
+        exit(rc)
+    }
+    if sub == "verify" {
+        if a.len() < 3 { eprintln("usage: verify <track> <target_tier>"); exit(2) }
+        let rc = cmd_verify(_str(a[1]), _str(a[2]))
+        exit(rc)
+    }
+    if sub == "explain" {
+        if a.len() < 2 { eprintln("usage: explain <track>"); exit(2) }
+        let rc = cmd_explain(_str(a[1]))
+        exit(rc)
+    }
+    eprintln("REJECT: unknown subcommand: " + sub)
+    print_usage()
+    emit_sentinel("BLOCK", "unknown_subcommand=" + sub)
+    exit(2)
+}
+
+main()
