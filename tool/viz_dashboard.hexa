@@ -1,0 +1,523 @@
+// tool/viz_dashboard.hexa — Tier 4 #27+#28+#29 : CLI dashboard
+//
+// PURPOSE
+//   Terminal-friendly dashboard that combines:
+//     #27 CLI dashboard (entry + status + deps)
+//     #28 phase progress bar (██░░ 14%)
+//     #29 critical path Day-by-Day visualizer
+//
+//   Parses the 3 repo .roadmap SSOTs (anima / airgenome / hexa-lang),
+//   aggregates entries per phase, renders ASCII progress bars, and
+//   walks the depends-on DAG to show a Day-by-Day critical path.
+//
+// raw#9 STRICT: hexa-only, deterministic, no Python, no LLM.
+//
+// CLI
+//   hexa tool/viz_dashboard.hexa                   — full dashboard
+//   hexa tool/viz_dashboard.hexa --json            — JSON output
+//   hexa tool/viz_dashboard.hexa --repo <name>     — single-repo filter
+//   hexa tool/viz_dashboard.hexa --selftest        — 3-repo verify
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _hdr(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let r1 = line.substring(sp1 + 1, len(line))
+    let sp2 = r1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = r1.substring(0, sp2)
+    let r2 = r1.substring(sp2 + 1, len(r1))
+    let sp3 = r2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let st = r2.substring(0, sp3)
+    let mut nm = r2.substring(sp3 + 1, len(r2)).trim()
+    if len(nm) >= 2 && nm.substring(0, 1) == "\"" { nm = nm.substring(1, len(nm) - 1) }
+    return [id, st, nm]
+}
+
+fn parse_roadmap(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut kind = ""
+    let mut cid = ""; let mut cst = ""; let mut cnm = ""; let mut ck = []
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            kind = ""; ck = []
+            continue
+        }
+        let f = line.substring(0, 1)
+        if f == "#" { continue }
+        if f == " " || f == "\t" {
+            if kind == "" { continue }
+            let s = line.trim_start()
+            let sp = s.index_of(" ")
+            if sp < 0 { continue }
+            ck.push([s.substring(0, sp), s.substring(sp + 1, len(s)).trim()])
+        } else {
+            if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+            ck = []; kind = ""
+            let fs = line.index_of(" ")
+            if fs < 0 { continue }
+            if line.substring(0, fs) == "roadmap" {
+                let h = _hdr(line)
+                if len(h) == 0 { continue }
+                cid = h[0]; cst = h[1]; cnm = h[2]; kind = "r"
+            }
+        }
+    }
+    if kind == "r" { rules.push([cid, cst, cnm, ck]) }
+    return rules
+}
+
+fn _load(path: string) -> array {
+    let r = exec_with_status("test -f '" + path + "'")
+    if r[1] != 0 { return [] }
+    return parse_roadmap(to_string(read_file(path)))
+}
+
+fn _kv(keys: array, k: string) -> string {
+    for kv in keys { if kv[0] == k { return kv[1] } }
+    return ""
+}
+
+fn _is_int(s: string) -> bool {
+    if len(s) == 0 { return false }
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) { if !d.contains(s.substring(i, i + 1)) { return false } i = i + 1 }
+    return true
+}
+
+fn _parse_int(s: string) -> int {
+    let mut n = 0
+    let d = "0123456789"
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if !d.contains(c) { return n }
+        n = n * 10 + d.index_of(c)
+        i = i + 1
+    }
+    return n
+}
+
+// ─── Progress bar (#28) ───────────────────────────────────────────────
+fn _bar(pct: int, width: int) -> string {
+    let mut filled = (pct * width) / 100
+    if filled < 0 { filled = 0 }
+    if filled > width { filled = width }
+    let empty_n = width - filled
+    let mut s = ""
+    let mut i = 0
+    while i < filled { s = s + "█"; i = i + 1 }
+    let mut j = 0
+    while j < empty_n { s = s + "░"; j = j + 1 }
+    return s
+}
+
+// Compute percent done for a set of rules.
+fn _phase_pct(rules: array, phase: string) -> array {
+    let mut total = 0
+    let mut done = 0
+    let mut active = 0
+    let mut planned = 0
+    for r in rules {
+        let ph = _kv(r[3], "phase")
+        if phase != "" && ph != phase { continue }
+        total = total + 1
+        let st = r[1]
+        if st == "done" { done = done + 1 }
+        if st == "active" { active = active + 1 }
+        if st == "planned" || st == "blocked" || st == "deferred" || st == "todo" { planned = planned + 1 }
+    }
+    let mut pct = 0
+    if total > 0 { pct = (done * 100) / total }
+    return [total, done, active, planned, pct]
+}
+
+fn _all_phases(rules: array) -> array {
+    let mut seen = []
+    for r in rules {
+        let ph = _kv(r[3], "phase")
+        if len(ph) == 0 { continue }
+        let mut found = false
+        for s in seen { if s == ph { found = true } }
+        if !found { seen.push(ph) }
+    }
+    return seen
+}
+
+// ─── Dependency tree (#27) ────────────────────────────────────────────
+fn parse_deps(val: string, default_repo: string) -> array {
+    let mut out = []
+    if len(val) == 0 || val == "—" { return out }
+    let cleaned = val.replace(",", " ").replace("+", " ")
+    let toks = split(cleaned, " ")
+    let mut current = default_repo
+    for raw in toks {
+        let t = raw.trim()
+        if len(t) == 0 { continue }
+        let at = t.index_of("@")
+        if at > 0 && at < len(t) - 1 {
+            let repo = t.substring(0, at)
+            let id = t.substring(at + 1, len(t))
+            if _is_int(id) { out.push([repo, id]); current = repo; continue }
+        }
+        if _is_int(t) { out.push([current, t]) }
+    }
+    return out
+}
+
+// Build weighted DAG. Returns [keys, weights, titles, repos, ids, statuses, phases, edges].
+fn build_dag(repos: array) -> array {
+    let mut keys = []
+    let mut weights = []
+    let mut titles = []
+    let mut rnames = []
+    let mut ids = []
+    let mut sts = []
+    let mut phs = []
+    let mut edges = []
+    for rr in repos {
+        let repo = rr[0]
+        for rule in rr[1] {
+            let id = rule[0]
+            keys.push(repo + "#" + id)
+            let dv = _kv(rule[3], "days")
+            if _is_int(dv) && _parse_int(dv) > 0 { weights.push(_parse_int(dv)) } else { weights.push(1) }
+            titles.push(rule[2])
+            rnames.push(repo)
+            ids.push(id)
+            sts.push(rule[1])
+            phs.push(_kv(rule[3], "phase"))
+        }
+    }
+    for rr in repos {
+        let repo = rr[0]
+        for rule in rr[1] {
+            let id = rule[0]
+            let key = repo + "#" + id
+            let dep = _kv(rule[3], "depends-on")
+            for pair in parse_deps(dep, repo) {
+                edges.push([pair[0] + "#" + pair[1], key])
+            }
+        }
+    }
+    return [keys, weights, titles, rnames, ids, sts, phs, edges]
+}
+
+// Critical path via Kahn topo + DP. Returns [earliest, predbest, depth, cycle].
+fn longest_path(keys: array, weights: array, edges: array) -> array {
+    let n = len(keys)
+    let mut pred = []; let mut succ = []
+    let mut i = 0
+    while i < n { pred.push([]); succ.push([]); i = i + 1 }
+    for e in edges {
+        let mut fi = -1; let mut ti = -1
+        let mut k = 0
+        while k < n {
+            if keys[k] == e[0] { fi = k }
+            if keys[k] == e[1] { ti = k }
+            k = k + 1
+        }
+        if fi < 0 || ti < 0 { continue }
+        let pt = pred[ti]; pt.push(fi); pred[ti] = pt
+        let sf = succ[fi]; sf.push(ti); succ[fi] = sf
+    }
+    let mut indeg = []
+    let mut j = 0
+    while j < n { indeg.push(len(pred[j])); j = j + 1 }
+    let mut q = []; let mut qi = 0; let mut topo = []
+    let mut jj = 0
+    while jj < n { if indeg[jj] == 0 { q.push(jj) } jj = jj + 1 }
+    while qi < len(q) {
+        let u = q[qi]; topo.push(u)
+        for v in succ[u] {
+            indeg[v] = indeg[v] - 1
+            if indeg[v] == 0 { q.push(v) }
+        }
+        qi = qi + 1
+    }
+    if len(topo) != n { return [[], [], [], true] }
+    let mut earliest = []; let mut predbest = []; let mut depth = []
+    let mut k2 = 0
+    while k2 < n { earliest.push(weights[k2]); predbest.push(-1); depth.push(0); k2 = k2 + 1 }
+    for u in topo {
+        let ps = pred[u]
+        let mut best = 0; let mut bp = -1; let mut bd = -1
+        for p in ps {
+            if earliest[p] > best { best = earliest[p]; bp = p }
+            if depth[p] > bd { bd = depth[p] }
+        }
+        earliest[u] = best + weights[u]
+        predbest[u] = bp
+        if len(ps) == 0 { depth[u] = 0 } else { depth[u] = bd + 1 }
+    }
+    return [earliest, predbest, depth, false]
+}
+
+fn find_critical(keys: array, earliest: array, predbest: array) -> array {
+    let n = len(keys)
+    let mut best = -1; let mut bi = -1
+    let mut i = 0
+    while i < n {
+        if earliest[i] > best { best = earliest[i]; bi = i }
+        i = i + 1
+    }
+    if bi < 0 { return [[], 0] }
+    let mut path = []
+    let mut cur = bi
+    while cur >= 0 { path.push(keys[cur]); cur = predbest[cur] }
+    let mut rev = []
+    let mut j = len(path) - 1
+    while j >= 0 { rev.push(path[j]); j = j - 1 }
+    return [rev, best]
+}
+
+fn _load_repos(filter: string) -> array {
+    let home = _home()
+    let repos = ["anima", "airgenome", "hexa-lang"]
+    let mut out = []
+    for r in repos {
+        if len(filter) > 0 && filter != r { continue }
+        out.push([r, _load(home + "/core/" + r + "/.roadmap")])
+    }
+    return out
+}
+
+fn _status_color_tag(st: string) -> string {
+    if st == "done" { return "✓" }
+    if st == "active" { return "●" }
+    if st == "blocked" { return "✗" }
+    if st == "deferred" { return "~" }
+    return "□"
+}
+
+// ─── Render dashboard ─────────────────────────────────────────────────
+fn render_dashboard(repos: array) -> string {
+    let mut out = []
+    out.push("╔═══════════════════════════════════════════════════════════════════╗\n")
+    out.push("║  ROADMAP LIVE DASHBOARD — Tier4 #27+#28+#29 (raw#9 strict)        ║\n")
+    out.push("╚═══════════════════════════════════════════════════════════════════╝\n")
+
+    // Per-repo summary with progress bar
+    let mut grand_total = 0
+    let mut grand_done = 0
+    for rr in repos {
+        let repo = rr[0]
+        let rules = rr[1]
+        let agg = _phase_pct(rules, "")
+        grand_total = grand_total + agg[0]
+        grand_done = grand_done + agg[1]
+        out.push("\n")
+        out.push("▶ repo=" + repo + "  " + _bar(agg[4], 28) + " " + to_string(agg[4]) + "%")
+        out.push("  (done=" + to_string(agg[1]) + " active=" + to_string(agg[2]) + " planned=" + to_string(agg[3]) + " total=" + to_string(agg[0]) + ")\n")
+
+        // Per-phase bars
+        let phases = _all_phases(rules)
+        for ph in phases {
+            let a = _phase_pct(rules, ph)
+            out.push("    phase " + ph + "  " + _bar(a[4], 20) + " " + to_string(a[4]) + "%")
+            out.push(" (" + to_string(a[1]) + "/" + to_string(a[0]) + ")\n")
+        }
+    }
+    let mut gp = 0
+    if grand_total > 0 { gp = (grand_done * 100) / grand_total }
+    out.push("\n▶ TOTAL       " + _bar(gp, 40) + " " + to_string(gp) + "% (" + to_string(grand_done) + "/" + to_string(grand_total) + ")\n")
+
+    // Entries overview (top 8 active per repo)
+    out.push("\n─── ACTIVE ENTRIES ─────────────────────────────────────────────────\n")
+    for rr in repos {
+        let repo = rr[0]
+        let rules = rr[1]
+        let mut shown = 0
+        for rule in rules {
+            if rule[1] != "active" { continue }
+            if shown >= 8 { break }
+            let dep = _kv(rule[3], "depends-on")
+            let mut depview = dep
+            if len(depview) > 30 { depview = depview.substring(0, 27) + "..." }
+            let mut title = rule[2]
+            if len(title) > 44 { title = title.substring(0, 41) + "..." }
+            out.push("  " + _status_color_tag(rule[1]) + " [" + repo + "#" + rule[0] + "] " + title)
+            if len(dep) > 0 { out.push("  ← " + depview) }
+            out.push("\n")
+            shown = shown + 1
+        }
+    }
+
+    // Critical path (#29 Day-by-Day)
+    out.push("\n─── CRITICAL PATH — Day-by-Day (#29) ───────────────────────────────\n")
+    let dag = build_dag(repos)
+    let keys = dag[0]; let weights = dag[1]; let titles = dag[2]
+    let rnames = dag[3]; let ids = dag[4]; let sts = dag[5]; let edges = dag[7]
+    let lp = longest_path(keys, weights, edges)
+    if lp[3] {
+        out.push("  [DAG cycle detected — path undefined]\n")
+    } else {
+        let cp = find_critical(keys, lp[0], lp[1])
+        let path = cp[0]; let span = cp[1]
+        out.push("  span(DAG) = " + to_string(span) + "d  (Brent/Graham lower bound)\n")
+        out.push("  critical path = " + to_string(len(path)) + " nodes\n\n")
+        let mut day = 1
+        for k in path {
+            // find weight + title + status
+            let mut idx = -1
+            let mut i = 0
+            while i < len(keys) { if keys[i] == k { idx = i } i = i + 1 }
+            if idx < 0 { continue }
+            let w = weights[idx]
+            let mut title = titles[idx]
+            if len(title) > 48 { title = title.substring(0, 45) + "..." }
+            out.push("  Day " + to_string(day) + "  " + _status_color_tag(sts[idx]) + " " + k + " (+" + to_string(w) + "d)  " + title + "\n")
+            day = day + w
+        }
+    }
+
+    return out.join("")
+}
+
+// ─── JSON output ──────────────────────────────────────────────────────
+fn _je(s: string) -> string {
+    let mut o = s.replace("\\", "\\\\")
+    o = o.replace("\"", "\\\"")
+    o = o.replace("\n", "\\n")
+    return o
+}
+
+fn render_json(repos: array) -> string {
+    let mut p = []
+    p.push("{\"repos\":[")
+    let mut first = true
+    for rr in repos {
+        if !first { p.push(",") }
+        first = false
+        let repo = rr[0]; let rules = rr[1]
+        let agg = _phase_pct(rules, "")
+        p.push("{\"name\":\""); p.push(_je(repo)); p.push("\",")
+        p.push("\"total\":"); p.push(to_string(agg[0])); p.push(",")
+        p.push("\"done\":"); p.push(to_string(agg[1])); p.push(",")
+        p.push("\"active\":"); p.push(to_string(agg[2])); p.push(",")
+        p.push("\"planned\":"); p.push(to_string(agg[3])); p.push(",")
+        p.push("\"pct\":"); p.push(to_string(agg[4]))
+        p.push("}")
+    }
+    p.push("],")
+    // critical path
+    let dag = build_dag(repos)
+    let lp = longest_path(dag[0], dag[1], dag[7])
+    p.push("\"critical_path\":")
+    if lp[3] {
+        p.push("{\"cycle\":true}")
+    } else {
+        let cp = find_critical(dag[0], lp[0], lp[1])
+        let path = cp[0]; let span = cp[1]
+        p.push("{\"span\":"); p.push(to_string(span)); p.push(",\"path\":[")
+        let mut f2 = true
+        for k in path {
+            if !f2 { p.push(",") }
+            f2 = false
+            p.push("\""); p.push(_je(k)); p.push("\"")
+        }
+        p.push("]}")
+    }
+    p.push("}")
+    return p.join("")
+}
+
+// ─── selftest ─────────────────────────────────────────────────────────
+fn _selftest() -> int {
+    println("[viz_dashboard selftest] loading 3 repos...")
+    let repos = _load_repos("")
+    if len(repos) != 3 {
+        eprintln("FAIL: expected 3 repos, got " + to_string(len(repos)))
+        return 1
+    }
+    let mut total = 0
+    for rr in repos { total = total + len(rr[1]) }
+    if total < 80 {
+        eprintln("FAIL: total rules too low: " + to_string(total))
+        return 1
+    }
+    println("  3 repos loaded, total rules=" + to_string(total))
+
+    // Test bar
+    let b = _bar(50, 20)
+    if len(b) == 0 {
+        eprintln("FAIL: empty bar")
+        return 1
+    }
+    println("  progress bar OK: " + b + " (50%)")
+
+    // Render full dashboard
+    let txt = render_dashboard(repos)
+    if len(txt) < 500 {
+        eprintln("FAIL: dashboard too short: " + to_string(len(txt)))
+        return 1
+    }
+    if !txt.contains("critical path") {
+        eprintln("FAIL: missing critical-path section")
+        return 1
+    }
+    println("  dashboard rendered: " + to_string(len(txt)) + " chars")
+
+    // JSON output
+    let js = render_json(repos)
+    if !js.contains("\"pct\":") {
+        eprintln("FAIL: JSON missing pct")
+        return 1
+    }
+    println("  JSON OK: " + to_string(len(js)) + " chars")
+
+    println("selftest PASS — #27 #28 #29 LIVE")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut start = 2
+    let mut j = 0
+    while j < len(av) {
+        let s = av[j]
+        if len(s) >= 18 && s.contains("viz_dashboard.hexa") { start = j + 1 }
+        j = j + 1
+    }
+    let mut args = []
+    let mut i = start
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) > 0 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let mut filter = ""
+    let mut want_json = false
+    let mut k = 0
+    while k < len(args) {
+        if args[k] == "--json" { want_json = true }
+        if args[k] == "--repo" && k + 1 < len(args) { filter = args[k + 1]; k = k + 1 }
+        k = k + 1
+    }
+    let repos = _load_repos(filter)
+    if want_json {
+        println(render_json(repos))
+    } else {
+        println(render_dashboard(repos))
+    }
+    exit(0)
+}
