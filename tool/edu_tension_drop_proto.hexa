@@ -1,0 +1,501 @@
+#!hexa lax
+// tool/edu_tension_drop_proto.hexa — tension-drop 교육 패러다임 raw#0 prototype
+//
+// Spec: docs/new_paradigm_edu_tension_drop_20260421.md
+// Level 1 P1 predicate target:
+//   - 10-node atlas, ≥16 walk steps
+//   - tau(0) > tau(end), exit 0
+//   - same --seed ⇒ byte-identical stdout (deterministic)
+//   - LLM-free (grep passes CI audit)
+//
+// Usage:
+//   hexa tool/edu_tension_drop_proto.hexa [--seed N] [--steps L]
+//
+// Output: stdout jsonl events (init / walk / intervene / outcome / tau / final)
+//
+// Non-goals (raw#0):
+//   - atlas.n6 parser integration (raw#1)
+//   - metric_logger jsonl file output (raw#2)
+//   - discovery (new edges) — Discovery Permission axis = 0 for proto
+//
+// Determinism: LCG RNG seeded from --seed, no wall-clock, no env() reads
+// that vary between runs. Math uses to_float / format_float only.
+
+// ─────────────────────────────── helpers ────────────────────────────
+
+fn _fabs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _fmin(a, b) { if a < b { return a } return b }
+fn _fmax(a, b) { if a > b { return a } return b }
+
+fn _fclip(x, lo, hi) {
+    if x < lo { return lo }
+    if x > hi { return hi }
+    return x
+}
+
+fn _ff(x) { return format_float(x, 4) }
+
+// LCG — numerical recipes params, modulo 2^31 via & mask
+let LCG_A = 1103515245
+let LCG_C = 12345
+let LCG_M = 2147483648   // 2^31
+
+// global RNG state (closure-y via module-level mutable)
+let mut RNG = 42
+
+fn _rng_seed(s) { RNG = s }
+
+fn _rng_next() {
+    RNG = (LCG_A * RNG + LCG_C) % LCG_M
+    if RNG < 0 { RNG = 0 - RNG }
+    return RNG
+}
+
+// uniform [0.0, 1.0)
+fn _rng_uniform() {
+    let v = _rng_next()
+    return to_float(v) / to_float(LCG_M)
+}
+
+// weighted sample: returns index by weight array (deterministic given RNG)
+fn _rng_weighted(weights) {
+    let mut total = 0.0
+    let mut i = 0
+    while i < len(weights) {
+        total = total + weights[i]
+        i = i + 1
+    }
+    if total <= 0.0 { return 0 }
+    let u = _rng_uniform() * total
+    let mut acc = 0.0
+    let mut j = 0
+    while j < len(weights) {
+        acc = acc + weights[j]
+        if u <= acc { return j }
+        j = j + 1
+    }
+    return len(weights) - 1
+}
+
+// ─────────────────────────────── atlas ──────────────────────────────
+//
+// Nodes: fixed 10. Each node = [id, W].
+// Edges: kind ∈ { "prereq", "derives", "dual", "contradicts", "instantiates" }
+// Schema expected_W rules match §2.1 of spec.
+
+fn build_nodes() {
+    let mut ns = []
+    ns.push(["N0_count",         0.90])
+    ns.push(["N1_one_to_one",    0.80])
+    ns.push(["N2_number_line",   0.60])
+    ns.push(["N3_add_single",    0.50])
+    ns.push(["N4_add_carry",     0.20])
+    ns.push(["N5_place_value",   0.30])
+    ns.push(["N6_tens_ones",     0.25])
+    ns.push(["N7_sub_single",    0.40])
+    ns.push(["N8_sub_borrow",    0.05])
+    ns.push(["N9_commutativity", 0.35])
+    return ns
+}
+
+// Edge := [i, j, kind]
+fn build_edges() {
+    let mut es = []
+    es.push([0, 1, "prereq"])
+    es.push([1, 2, "prereq"])
+    es.push([2, 3, "prereq"])
+    es.push([3, 4, "prereq"])          // strong-tension spot
+    es.push([5, 6, "prereq"])
+    es.push([3, 5, "prereq"])
+    es.push([6, 4, "prereq"])
+    es.push([3, 9, "derives"])
+    es.push([3, 7, "dual"])
+    es.push([4, 8, "dual"])
+    es.push([2, 3, "instantiates"])
+    es.push([7, 8, "prereq"])
+    es.push([4, 3, "contradicts"])     // carry contradicts single-digit intuition
+    es.push([5, 2, "derives"])
+    es.push([6, 9, "derives"])
+    return es
+}
+
+// ───────────────────────── schema: expected_W ───────────────────────
+
+fn expected_W(edge, nodes) {
+    let i = edge[0]
+    let j = edge[1]
+    let kind = edge[2]
+    let Wi = nodes[i][1]
+    let Wj = nodes[j][1]
+    if kind == "prereq" {
+        // prereq j for i: expected W_j ≈ min(W_i + 0.15, 1.0)
+        return _fmin(Wi + 0.15, 1.0)
+    }
+    if kind == "derives" {
+        return Wi
+    }
+    if kind == "dual" {
+        return Wi
+    }
+    if kind == "contradicts" {
+        // expected 0: if both high, tension rises = conflict surfacing
+        return 0.0
+    }
+    if kind == "instantiates" {
+        return 0.7 * Wi + 0.3 * Wj
+    }
+    return Wj   // unknown kind: zero tension fallback
+}
+
+// per-edge tension
+fn tension_of(edge, nodes) {
+    let exp = expected_W(edge, nodes)
+    let j = edge[1]
+    let act = nodes[j][1]
+    let kind = edge[2]
+    if kind == "contradicts" {
+        // contradicts tension: product W_i·W_j (both high = hot)
+        let Wi = nodes[edge[0]][1]
+        return Wi * act
+    }
+    return _fabs(exp - act)
+}
+
+// global τ
+fn tau_global(nodes, edges) {
+    let mut s = 0.0
+    let mut k = 0
+    while k < len(edges) {
+        s = s + tension_of(edges[k], nodes)
+        k = k + 1
+    }
+    return s
+}
+
+// degree
+fn _deg(v, edges) {
+    let mut d = 0
+    let mut k = 0
+    while k < len(edges) {
+        if edges[k][0] == v || edges[k][1] == v { d = d + 1 }
+        k = k + 1
+    }
+    if d == 0 { return 1 }
+    return d
+}
+
+// ρ_T(v) = sum over incident edges / deg
+fn rho_T(v, nodes, edges) {
+    let mut s = 0.0
+    let mut k = 0
+    while k < len(edges) {
+        if edges[k][0] == v || edges[k][1] == v {
+            s = s + tension_of(edges[k], nodes)
+        }
+        k = k + 1
+    }
+    return s / to_float(_deg(v, edges))
+}
+
+// neighbors(v): list of (u, edge_idx)
+fn _neighbors(v, edges) {
+    let mut ns = []
+    let mut k = 0
+    while k < len(edges) {
+        if edges[k][0] == v { ns.push([edges[k][1], k]) }
+        else if edges[k][1] == v {
+            // undirected traversal for dual/contradicts/instantiates reverse
+            let kind = edges[k][2]
+            if kind == "dual" || kind == "contradicts" {
+                ns.push([edges[k][0], k])
+            }
+        }
+        k = k + 1
+    }
+    return ns
+}
+
+// ─────────────────────── walk / intervention ────────────────────────
+
+// novelty: penalty if edge visited in last W_novelty walks
+fn _novelty(edge_idx, recent) {
+    let mut i = 0
+    while i < len(recent) {
+        if recent[i] == edge_idx { return 0.3 }
+        i = i + 1
+    }
+    return 1.0
+}
+
+// policy π: weighted choice over neighbors by exp(β·ρ_T) · novelty
+fn pick_next(cur, nodes, edges, recent, beta) {
+    let nbrs = _neighbors(cur, edges)
+    let mut ws = []
+    let mut k = 0
+    while k < len(nbrs) {
+        let nxt = nbrs[k][0]
+        let eidx = nbrs[k][1]
+        let rt = rho_T(nxt, nodes, edges)
+        // exp approximation via truncated series for small args; here ρ_T small,
+        // use 1 + beta*rt + (beta*rt)^2/2 as determ surrogate of exp.
+        let x = beta * rt
+        let ex = 1.0 + x + 0.5 * x * x
+        let w = ex * _novelty(eidx, recent)
+        ws.push(w)
+        k = k + 1
+    }
+    if len(nbrs) == 0 { return [cur, -1] }  // dead-end; stay
+    let idx = _rng_weighted(ws)
+    return [nbrs[idx][0], nbrs[idx][1]]
+}
+
+// argmax tension on walk path's edges (we just pick the last-visited edge,
+// but for L>=1 policy inherently concentrates there — §2.3. For intervention
+// we take the edge just traversed, which by policy is a high-T pick.)
+fn pick_intervention(edge_idx, edges) {
+    if edge_idx < 0 { return "drill" }
+    let kind = edges[edge_idx][2]
+    if kind == "prereq"       { return "drill" }
+    if kind == "derives"      { return "example" }
+    if kind == "dual"         { return "contrast" }
+    if kind == "contradicts"  { return "resolve_conflict" }
+    if kind == "instantiates" { return "visualization" }
+    return "drill"
+}
+
+// outcome sampling: deterministic via RNG. Pass rate depends on current W of
+// the target. Higher W → higher pass prob (intuitive: well-prepared ⇒ pass).
+fn sample_outcome(target_W) {
+    let u = _rng_uniform()
+    // pass  if u < 0.3 + 0.6*W
+    // partial if u < 0.3 + 0.6*W + 0.2*(1-W)
+    // fail otherwise
+    let p_pass = 0.30 + 0.60 * target_W
+    let p_partial = p_pass + 0.20 * (1.0 - target_W)
+    if u < p_pass { return "pass" }
+    if u < p_partial { return "partial" }
+    return "fail"
+}
+
+fn outcome_score(o) {
+    if o == "pass"    { return 1.0 }
+    if o == "partial" { return 0.3 }
+    return 0.0 - 0.4
+}
+
+// Bayesian W update §2.5 — η capped so Δτ ≤ 0 on pass (see M-1).
+fn update_W(W, outcome, edge_T) {
+    let eta_base = 0.15
+    // cap: η < 2·T / K  where K ≈ 1 (Lipschitz bound for our schema). Use K=2.
+    let eta = _fmin(eta_base, edge_T)
+    let s = outcome_score(outcome)
+    let nw = _fclip(W + eta * s, 0.0, 1.0)
+    return nw
+}
+
+// ────────────────────────── mastery detect ──────────────────────────
+
+fn is_mastered(node_idx, nodes, edges) {
+    let eps = 0.05
+    let mut k = 0
+    while k < len(edges) {
+        let e = edges[k]
+        if e[0] == node_idx || e[1] == node_idx {
+            let T = tension_of(e, nodes)
+            if T >= eps { return false }
+        }
+        k = k + 1
+    }
+    return true
+}
+
+// ─────────────────────────────── argv ───────────────────────────────
+
+fn parse_args() {
+    // defaults
+    let mut seed = 42
+    let mut steps = 16
+    let av = argv()
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--seed" && i + 1 < len(av) {
+            seed = to_int(av[i + 1])
+            i = i + 2
+        } else if a == "--steps" && i + 1 < len(av) {
+            steps = to_int(av[i + 1])
+            i = i + 2
+        } else {
+            i = i + 1
+        }
+    }
+    return [seed, steps]
+}
+
+// ─────────────────────────────── json print ─────────────────────────
+
+fn _kv_s(k, v) { return "\"" + k + "\":\"" + v + "\"" }
+fn _kv_n(k, v) { return "\"" + k + "\":" + to_string(v) }
+fn _kv_f(k, v) { return "\"" + k + "\":" + _ff(v) }
+
+// ─────────────────────────────── main ───────────────────────────────
+
+fn main() -> int {
+    let args = parse_args()
+    let seed = args[0]
+    let steps = args[1]
+    _rng_seed(seed)
+
+    let mut nodes = build_nodes()
+    let edges = build_edges()
+    let beta = 2.0
+
+    let tau0 = tau_global(nodes, edges)
+
+    // init event
+    println("{"
+        + _kv_s("evt", "init") + ","
+        + _kv_f("tau0", tau0) + ","
+        + _kv_n("nodes", len(nodes)) + ","
+        + _kv_n("edges", len(edges)) + ","
+        + _kv_n("seed", seed) + ","
+        + _kv_n("steps", steps)
+    + "}")
+
+    // seed walk at N3 (add_single) — middle of atlas, good branching
+    let mut cur = 3
+    let mut recent = []
+    let W_novelty = 3
+    let mut pos_delta_ct = 0
+    let mut tau_prev = tau0
+    let mut t = 1
+    while t <= steps {
+        let pick = pick_next(cur, nodes, edges, recent, beta)
+        let nxt = pick[0]
+        let eidx = pick[1]
+
+        let t_edge = 0.0
+        if eidx >= 0 {
+            let T = tension_of(edges[eidx], nodes)
+            println("{"
+                + _kv_s("evt", "walk") + ","
+                + _kv_n("t", t) + ","
+                + _kv_s("cur", nodes[cur][0]) + ","
+                + _kv_s("next", nodes[nxt][0]) + ","
+                + _kv_f("T_edge", T) + ","
+                + _kv_f("rho_T", rho_T(nxt, nodes, edges))
+            + "}")
+
+            let kind = edges[eidx][2]
+            let action = pick_intervention(eidx, edges)
+            println("{"
+                + _kv_s("evt", "intervene") + ","
+                + _kv_n("t", t) + ","
+                + _kv_s("kind", kind) + ","
+                + _kv_s("e", nodes[edges[eidx][0]][0] + "->" + nodes[edges[eidx][1]][0]) + ","
+                + _kv_s("action", action)
+            + "}")
+
+            // target of update: for most kinds, update nodes[j]; for contradicts,
+            // mild update of both (resolve_conflict lowers the surface product).
+            let j = edges[eidx][1]
+            let i_ = edges[eidx][0]
+            let W_before = nodes[j][1]
+            let outcome = sample_outcome(nodes[j][1])
+            let W_after = update_W(W_before, outcome, T)
+            nodes[j] = [nodes[j][0], W_after]
+            if kind == "contradicts" {
+                // also nudge i: treating conflict resolution as small i-update too
+                let Wi_before = nodes[i_][1]
+                let Wi_after = update_W(Wi_before, outcome, T * 0.5)
+                nodes[i_] = [nodes[i_][0], Wi_after]
+            }
+
+            println("{"
+                + _kv_s("evt", "outcome") + ","
+                + _kv_n("t", t) + ","
+                + _kv_s("outcome", outcome) + ","
+                + _kv_f("W_before", W_before) + ","
+                + _kv_f("W_after", W_after)
+            + "}")
+
+            // novelty recency buffer
+            recent.push(eidx)
+            if len(recent) > W_novelty {
+                let mut nr = []
+                let mut k = len(recent) - W_novelty
+                while k < len(recent) {
+                    nr.push(recent[k])
+                    k = k + 1
+                }
+                recent = nr
+            }
+        } else {
+            // dead-end walk tick (shouldn't happen in our atlas; defensive)
+            println("{"
+                + _kv_s("evt", "walk") + ","
+                + _kv_n("t", t) + ","
+                + _kv_s("cur", nodes[cur][0]) + ","
+                + _kv_s("next", nodes[cur][0]) + ","
+                + _kv_f("T_edge", 0.0) + ","
+                + _kv_f("rho_T", 0.0)
+            + "}")
+        }
+
+        let tau_now = tau_global(nodes, edges)
+        let delta = tau_now - tau_prev
+        if delta > 0.0 { pos_delta_ct = pos_delta_ct + 1 }
+        println("{"
+            + _kv_s("evt", "tau") + ","
+            + _kv_n("t", t) + ","
+            + _kv_f("tau", tau_now) + ","
+            + _kv_f("delta", delta)
+        + "}")
+        tau_prev = tau_now
+
+        cur = nxt
+        t = t + 1
+    }
+
+    // final: mastered node list
+    let mut mastered = []
+    let mut k = 0
+    while k < len(nodes) {
+        if is_mastered(k, nodes, edges) { mastered.push(nodes[k][0]) }
+        k = k + 1
+    }
+
+    let tau_end = tau_global(nodes, edges)
+    let mut mastered_str = "["
+    let mut mi = 0
+    while mi < len(mastered) {
+        if mi > 0 { mastered_str = mastered_str + "," }
+        mastered_str = mastered_str + "\"" + mastered[mi] + "\""
+        mi = mi + 1
+    }
+    mastered_str = mastered_str + "]"
+
+    println("{"
+        + _kv_s("evt", "final") + ","
+        + _kv_f("tau0", tau0) + ","
+        + _kv_f("tau_end", tau_end) + ","
+        + _kv_f("tau_drop", tau0 - tau_end) + ","
+        + "\"mastered\":" + mastered_str + ","
+        + _kv_n("pos_delta_ticks", pos_delta_ct) + ","
+        + "\"new_edges\":[]"
+    + "}")
+
+    // P1 predicate enforcement
+    if tau_end >= tau0 {
+        eprintln("[edu_tension_drop_proto] FAIL: tau did not drop (tau0="
+                 + _ff(tau0) + " tau_end=" + _ff(tau_end) + ")")
+        return 2
+    }
+    return 0
+}
+
+exit(main())
