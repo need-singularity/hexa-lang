@@ -1,0 +1,394 @@
+// entry.hexa — 하네스 단일 진입점 (훅 대체)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// 역할: 훅 시스템 제거 후, Claude가 매 턴 자율 호출하는 dispatcher.
+//       CLAUDE.md 에 "매 <event> 후 hexa run shared/tool/entry.hexa <mode> ..." 규칙 명시 → Claude 준수.
+//
+// usage:
+//   hexa run shared/tool/entry.hexa prompt "<user_text>"    — UserPromptSubmit 대체 (키워드 감지)
+//   hexa run shared/tool/entry.hexa pre_tool <tool> <path>  — PreToolUse 대체 (차단 검증)
+//   hexa run shared/tool/entry.hexa post_bash <exit_code>   — PostToolUse Bash 대체
+//   hexa run shared/tool/entry.hexa post_edit <file_path>   — PostToolUse Write|Edit 대체
+//   hexa run shared/tool/entry.hexa gate <cmd> <seed>       — cmd_gate 라우팅 (alias)
+//   hexa run shared/tool/entry.hexa option_gate <prompt> [transcript] — option_gate 직접 호출 (옵션 자동 선택)
+//   hexa run shared/tool/entry.hexa health [mode] [flags]   — health 라우터 (atlas|nexus|all|list)
+//   hexa run shared/tool/entry.hexa git_fresh [check|force|state] — H-GIT-FRESH 수동 실행
+//   hexa run shared/tool/entry.hexa sync <list|diff|all|id>   — sync 라우터 위임
+//   hexa run shared/tool/entry.hexa errors <route|drain_check|count_open|promote|mark_fixed> ... — H-ERR 라우팅
+//   hexa run shared/tool/entry.hexa agent_ledger <register|complete|list|gc|dup_check> ... — H-AGENT-LEDGER 직접 호출
+//   hexa run shared/tool/entry.hexa broadcast <append|tail|...> ... — H-BROADCAST 전파
+//   hexa run shared/tool/entry.hexa session_lock <acquire|release|status> ... — H-SESSION-LOCK
+//   hexa run shared/tool/entry.hexa session_registry <register|heartbeat|list|peers> ... — H-SESSION-REGISTRY
+//   hexa run shared/tool/entry.hexa session_worktree <init|list|status|merge|prune|gc_branches> ... — H-SESSION-WORKTREE
+//   hexa run shared/tool/entry.hexa session_prompt_gen [args]  — 세션 이어받기 프롬프트 생성
+//   hexa run shared/tool/entry.hexa session <lock|registry|worktree|prompt_gen> [args] — session 통합 라우터
+//   hexa run shared/tool/entry.hexa verify <v-const|sync-diff|atlas|all|list> — verify 통합 검증 라우터
+//   hexa run shared/tool/entry.hexa gauge <tick|status|reset>  — 컨텍스트 게이지 (tool-call 카운터)
+//   hexa run shared/tool/entry.hexa instinct <scan|score|promote|prune|status> — 인스팅트 파이프라인
+//   hexa run shared/tool/entry.hexa audit [full|json|summary]   — 하네스 스코어카드 7 카테고리
+//   hexa run shared/tool/entry.hexa projects [table|list|json|full|names|categories] — H-PROJ-ALL SSOT dump
+//   hexa run shared/tool/entry.hexa roadmap [next|extend|auto|list|verify|status] [--project P] — roadmap 액션 (NEXUS 창발 extend)
+//   hexa run shared/tool/entry.hexa roadmap_guard <verify|artifacts|status|crossref|all> — SCHEMA 정합성 전용
+//   hexa run shared/tool/entry.hexa psi [run|status]         — Φ(IIT) ratchet 검증 (loop_hook 대체, H-NOHOOK 준수)
+//   hexa run shared/tool/entry.hexa bt_promotion_gate <check|scan|dry-scan|status> ... — CONSN-P7-1 BT 승격 게이트
+//   hexa run shared/tool/entry.hexa consensus_bt_gate <verify|drift|status|--selftest> — CONSN-P8-1 BT 승격 정합성 검증
+//   hexa run shared/tool/entry.hexa cdg_verify [status|--help] — CDG-P7-5 cross_domain 매트릭스 검증
+//   hexa run shared/tool/entry.hexa cl_refresh_check [status|help] — INFRA-P8-1 cl-refresh v2 7-project coherence audit
+//   hexa run shared/tool/entry.hexa dse_delta [status|--help]  — DSE-P7-1 sweep 1/2/3 delta 분석
+//   hexa run shared/tool/entry.hexa gap_monitor              — gap 스캔 + breakthrough auto + refresh (loop_hook 대체)
+//   hexa run shared/tool/entry.hexa lint_annot scan <path>   — H-ANNOT-LINT: annot_rules.json kind=alias deprecation 검사 (warn)
+//   hexa run shared/tool/entry.hexa self_check              — 하네스 자가 진단
+//
+// 성공 조용, 실패 시끄럽게 (하네스 H1 원칙).
+
+let HOME = env("HOME")
+let HARNESS = HOME + "/Dev/nexus/tool"
+let GATE = HOME + "/Dev/hexa-lang/gate"
+let HEXA = HOME + "/Dev/nexus/bin/hexa"
+
+// L1 좀비 차단 — sub-module dispatch 기본 timeout (초). 우회: NEXUS_NO_TIMEOUT=1
+let WRAPPER = HARNESS + "/perl_timeout.sh"
+let DISPATCH_TIMEOUT_SEC = 45
+
+// long-running 모듈 화이트리스트 — timeout 면제
+let LONG_RUN_MODULES = ["agent_ledger", "session_worktree", "blowup", "session_prompt_gen", "handoff_write", "parallel_scheduler"]
+
+fn needs_timeout(script: str) -> bool {
+    for m in LONG_RUN_MODULES {
+        if script.contains("/" + m + ".hexa") { return false }
+    }
+    return true
+}
+
+fn wrap_prefix(script: str) -> str {
+    // perl_timeout.sh 가 없으면 fallback to plain (좀비 방지보다 가용성 우선)
+    if file_exists(WRAPPER) == false { return "" }
+    if needs_timeout(script) == false { return "" }
+    return "bash " + WRAPPER + " " + to_string(DISPATCH_TIMEOUT_SEC) + " "
+}
+
+// ─── L0 roadmap sync gate ────────────────────────────────────────
+// 모든 하네스 호출 전 roadmap dirty/unpushed 상태 강제 동기화.
+// self_check, roadmap_sync 자체 호출은 재귀 방지를 위해 skip.
+let ROADMAP_GATE_SKIP = ["self_check"]
+
+fn roadmap_sync_gate(mode: str) {
+    for skip in ROADMAP_GATE_SKIP {
+        if mode == skip { return }
+    }
+    let gate_script = HARNESS + "/roadmap_sync_gate.hexa"
+    if file_exists(gate_script) == false { return }
+    // fast-path: 최근 30s 내 clean 확인 완료됐으면 gate exec 자체 skip.
+    // hexa binary startup ~200ms 절감. 무효화는 gate 내부의 dirty 검출로 자연 만료.
+    // OPT-P8-1: 2 exec → 1 exec (비교를 hexa 내부 산술로)
+    let fresh_age = exec("[ -f /tmp/roadmap_sync_gate.fresh ] && echo $(( $(date +%s) - $(stat -f%m /tmp/roadmap_sync_gate.fresh 2>/dev/null) )) || echo -1").trim()  // @allow-bare-exec
+    if fresh_age != "-1" && fresh_age != "" {
+        let mut age_i = 999
+        try { age_i = to_int(fresh_age) } catch e {}
+        if age_i < 30 { return }
+    }
+    // lockfile 기반 재진입 방지는 gate 내부에서 처리.
+    // 타임아웃 15초 — 네트워크 지연 시 하네스 블로킹 방지.
+    let prefix = ""
+    if file_exists(WRAPPER) { prefix = "bash " + WRAPPER + " 15 " }
+    let _ = exec(prefix + HEXA + " run " + gate_script + " 2>&1")  // @allow-bare-exec
+}
+
+fn route(mode: str, rest: [str]) {
+    roadmap_sync_gate(mode)
+    if mode == "prompt" {
+        // H-GIT-FRESH 는 prompt_scan 이 내부적으로 캐시 포함 실행 — 여기서 중복 호출 제거 (~400ms 절감).
+        dispatch_file(GATE + "/prompt_scan.hexa", rest)
+    } else if mode == "git_fresh" {
+        // 명시적 호출: entry.hexa git_fresh [check|force|state]
+        dispatch_file(HARNESS + "/git_fresh.hexa", rest)
+    } else if mode == "pre_tool" {
+        dispatch_file(GATE + "/pre_tool_guard.hexa", rest)
+    } else if mode == "post_bash" {
+        dispatch_file(GATE + "/post_bash.hexa", rest)
+    } else if mode == "post_edit" {
+        dispatch_file(GATE + "/post_edit.hexa", rest)
+    } else if mode == "gate" {
+        dispatch_file(GATE + "/cmd_gate.hexa", rest)
+    } else if mode == "option_gate" {
+        // option_gate 직접 호출 — 훅 없음, 점수 1위 옵션 추출
+        dispatch_file(HARNESS + "/option_gate.hexa", rest)
+    } else if mode == "guard" {
+        // Agent 호출 전 — agent_ledger.register 위임 (H-AGENT-LEDGER)
+        // rest = [area, prompt_hash]
+        dispatch_agent_guard(rest)
+    } else if mode == "health" {
+        dispatch_file(HARNESS + "/health.hexa", rest)
+    } else if mode == "sync" {
+        dispatch_file(HARNESS + "/sync.hexa", rest)
+    } else if mode == "errors" {
+        dispatch_file(HARNESS + "/errors.hexa", rest)
+    } else if mode == "agent_ledger" {
+        dispatch_file(HARNESS + "/agent_ledger.hexa", rest)
+    } else if mode == "ledger_bi" {
+        // AGL-P7-1 — ledger 통합 BI 대시보드 집계기
+        dispatch_file(HARNESS + "/ledger_bi.hexa", rest)
+    } else if mode == "agent_race" {
+        // AGL-P8-1 — 분산 레이싱 엔진 (plan|start|finish|status|list|simulate)
+        dispatch_file(HARNESS + "/agent_race.hexa", rest)
+    } else if mode == "broadcast" {
+        dispatch_file(HARNESS + "/broadcast.hexa", rest)
+    } else if mode == "session_lock" {
+        dispatch_file(HARNESS + "/session_lock.hexa", rest)
+    } else if mode == "session_registry" {
+        dispatch_file(HARNESS + "/session_registry.hexa", rest)
+    } else if mode == "session_worktree" {
+        dispatch_file(HARNESS + "/session_worktree.hexa", rest)
+    } else if mode == "session_prompt_gen" {
+        dispatch_file(HARNESS + "/session_prompt_gen.hexa", rest)
+    } else if mode == "session" {
+        dispatch_file(HARNESS + "/session.hexa", rest)
+    } else if mode == "verify" {
+        dispatch_file(HARNESS + "/verify.hexa", rest)
+    } else if mode == "gauge" {
+        dispatch_file(HARNESS + "/context_gauge.hexa", rest)
+    } else if mode == "instinct" {
+        dispatch_file(HARNESS + "/instinct.hexa", rest)
+    } else if mode == "audit" {
+        dispatch_file(HARNESS + "/harness_audit.hexa", rest)
+    } else if mode == "sensor" {
+        dispatch_file(HARNESS + "/sensor.hexa", rest)
+    } else if mode == "growth_tick" {
+        dispatch_file(HARNESS + "/growth_tick.hexa", rest)
+    } else if mode == "cross_feed" {
+        dispatch_file(HARNESS + "/cross_feed.hexa", rest)
+    } else if mode == "thinking" {
+        dispatch_file(HARNESS + "/thinking_engine.hexa", rest)
+    } else if mode == "thinking_engine" {
+        dispatch_file(HARNESS + "/thinking_engine.hexa", rest)
+    } else if mode == "bt_metacog" {
+        // THINK-P7-1 — BT-541..547 사전 메타인지 prefetch (list|prefetch|prefetch-all|status)
+        dispatch_file(HARNESS + "/bt_metacog.hexa", rest)
+    } else if mode == "dream" {
+        dispatch_file(HARNESS + "/dream_engine.hexa", rest)
+    } else if mode == "curiosity" {
+        dispatch_file(HARNESS + "/curiosity.hexa", rest)
+    } else if mode == "critique" {
+        dispatch_file(HARNESS + "/critique.hexa", rest)
+    } else if mode == "engine_forge" {
+        dispatch_file(HARNESS + "/engine_forge.hexa", rest)
+    } else if mode == "parallel_scheduler" {
+        // HEXA-P9-1 — DAG 기반 병렬 태스크 스케줄러 (run|plan|status|add|forge_sync|--selftest)
+        dispatch_file(HARNESS + "/parallel_scheduler.hexa", rest)
+    } else if mode == "bt_forge" {
+        // EF-P7-1 — BT-specialized engine factory
+        dispatch_file(HARNESS + "/bt_engine_forge.hexa", rest)
+    } else if mode == "route" {
+        dispatch_file(HARNESS + "/model_route.hexa", rest)
+    } else if mode == "security" {
+        dispatch_file(HARNESS + "/security_scan.hexa", rest)
+    } else if mode == "mcp_health" {
+        dispatch_file(HARNESS + "/mcp_health.hexa", rest)
+    } else if mode == "loop" {
+        dispatch_file(HARNESS + "/loop_controller.hexa", rest)
+    } else if mode == "roadmap" {
+        // user-facing roadmap 액션 (next/extend/auto/list/verify/status)
+        // verify|status|artifacts|crossref|all 은 내부적으로 roadmap_guard 위임.
+        dispatch_file(HARNESS + "/roadmap.hexa", rest)
+    } else if mode == "roadmap_guard" {
+        // SCHEMA 정합성 전용 — CI/gc 에서 직접 사용
+        dispatch_file(HARNESS + "/roadmap_guard.hexa", rest)
+    } else if mode == "psi" {
+        // H-NOHOOK 준수 — loop_hooks/anima_psi.hexa 실구현 대체, Φ(IIT) ratchet
+        dispatch_file(HARNESS + "/psi.hexa", rest)
+    } else if mode == "gap_monitor" {
+        // H-NOHOOK 준수 — gap 스캔 + breakthrough auto + refresh (loop_hook 없이 entry 서브모듈)
+        dispatch_file(HARNESS + "/gap_monitor.hexa", rest)
+    } else if mode == "nexus_atlas" {
+        // H-NOHOOK 준수 — L7_ADD atlas.n6 drift 추적 (loop_hooks/nexus_atlas.hexa stub 대체)
+        dispatch_file(HARNESS + "/nexus_atlas.hexa", rest)
+    } else if mode == "bt_promotion_gate" {
+        // CONSN-P7-1 — consensus <-> BT 승격 게이트 (spec: shared/engine/bt_promotion_gate_spec.json)
+        dispatch_file(HARNESS + "/bt_promotion_gate.hexa", rest)
+    } else if mode == "consensus_bt_gate" {
+        // CONSN-P8-1 — BT 승격 정합성 검증 주기 (verify|drift|status|--selftest)
+        dispatch_file(HARNESS + "/consensus_bt_gate.hexa", rest)
+    } else if mode == "cdg_verify" {
+        // CDG-P7-5 — cross_domain v1_*.jsonl 매트릭스 검증 (read-only audit)
+        dispatch_file(HARNESS + "/cdg_verify.hexa", rest)
+    } else if mode == "cl_refresh_check" {
+        // INFRA-P8-1 — cl-refresh v2 spec coherence audit (7 projects, read-only)
+        dispatch_file(HARNESS + "/cl_refresh_check.hexa", rest)
+    } else if mode == "dse_delta" {
+        // DSE-P7-1 — DSE sweep 1/2/3 delta analysis (read-only, meta-only scan)
+        dispatch_file(HARNESS + "/dse_delta.hexa", rest)
+    } else if mode == "projects" {
+        // H-PROJ-ALL — projects_list.hexa 라우팅 (list|table|json|full|names|categories)
+        dispatch_file(HARNESS + "/projects_list.hexa", rest)
+    } else if mode == "l3_guard" {
+        // LOCK-P8-1 — L3 meta-lockdown 가드 (watch|verify|unlock|status|log)
+        dispatch_file(HARNESS + "/l3_guard.hexa", rest)
+    } else if mode == "evo_progress" {
+        // EVO-P7-1 — 전체 evo 로그 → 2087 target 진척 (N6ARCH cross-ref)
+        dispatch_file(HARNESS + "/evo_progress.hexa", rest)
+    } else if mode == "rule_suggest" {
+        // GOV-P8-1 — AI 자동 룰 제안 엔진 (suggest|encode|status)
+        dispatch_file(HARNESS + "/rule_suggest.hexa", rest)
+    } else if mode == "agent_eval" {
+        // AGL-P9-1 — agent 평가 rubric + 자동 rank (eval|rank|history|summary|--selftest)
+        dispatch_file(HARNESS + "/agent_eval.hexa", rest)
+    } else if mode == "lint_annot" {
+        // H-ANNOT-LINT (active 2026-04-19) — annot_rules.json kind=alias 검사 (warn)
+        dispatch_file(HARNESS + "/lint_annot.hexa", rest)
+    } else if mode == "self_check" {
+        self_check()
+    } else {
+        eprintln("REJECT: unknown mode '" + mode + "' — modes: prompt|pre_tool|post_bash|post_edit|gate|option_gate|guard|health|git_fresh|sync|errors|agent_ledger|ledger_bi|agent_race|agent_eval|broadcast|session_lock|session_registry|session_worktree|session_prompt_gen|gauge|instinct|audit|route|security|mcp_health|loop|roadmap|roadmap_guard|psi|gap_monitor|nexus_atlas|projects|cdg_verify|cl_refresh_check|dse_delta|evo_progress|rule_suggest|parallel_scheduler|lint_annot|self_check")
+    }
+}
+
+fn dispatch_agent_guard(rest: [str]) {
+    // usage: entry.hexa guard <area> [prompt_hash]
+    //        entry.hexa guard complete <agent_id>    — 완료 마감
+    if rest.len() == 0 { return }
+    let script = HARNESS + "/agent_ledger.hexa"
+    if file_exists(script) == false { return }
+    let mut sub = "register"
+    let mut area = rest[0]
+    let mut hash = "na"
+    if rest.len() >= 2 {
+        // complete <agent_id> 특수 라우팅
+        if rest[0] == "complete" {
+            sub = "complete"
+            area = rest[1]
+            hash = ""
+        } else {
+            hash = rest[1]
+        }
+    }
+    let prefix = wrap_prefix(script)
+    let mut cmd = prefix + HEXA + " run " + script + " " + sub + " \"" + area.replace("\"", "\\\"") + "\""
+    if hash.len() > 0 { cmd = cmd + " \"" + hash.replace("\"", "\\\"") + "\"" }
+    let out = to_string(exec(cmd + " 2>&1"))  // @allow-bare-exec
+    if out.trim().len() > 0 { print(out) }
+    // H-NOZOMBIE: register 시점에만 가이드 인젝션 (complete 은 skip)
+    if sub == "register" {
+        eprintln("[H-NOZOMBIE 가이드] Agent 가 .hexa 작성 시 안전 패턴 준수:")
+        eprintln("  - exec(cmd) 대신 safe_exec(cmd, 30) — include lib/safe_exec.hexa.inc")
+        eprintln("  - 장기실행: try_acquire_self_lock(\"name\", 5) — include lib/lock_acquire.hexa.inc")
+        eprintln("  - while true: loop_check(iter, max, started, sec, label) — include lib/loop_guard.hexa.inc")
+        eprintln("  - 시스템콜 wrapper .sh 는 '# @hexa-first-exempt' 헤더 명시")
+        eprintln("  - 룰: R-NOZ-EXEC-TIMEOUT / R-NOZ-WHILE-GUARD / R-NOZ-LOCK-DECL (lint.hexa)")
+    }
+}
+
+fn dispatch_file(script: str, rest: [str]) {
+    if file_exists(script) == false {
+        // silent pass — sub-module 아직 미구현 단계
+        return
+    }
+    let prefix = wrap_prefix(script)
+    let mut cmd = prefix + HEXA + " run " + script
+    for a in rest {
+        let safe = a.replace("\"", "\\\"")
+        cmd = cmd + " \"" + safe + "\""
+    }
+    let out = to_string(exec(cmd + " 2>&1"))  // @allow-bare-exec
+    if out.trim().len() > 0 {
+        print(out)
+    }
+}
+
+fn self_check() {
+    let modules = [
+        ["cmd_gate", GATE + "/cmd_gate.hexa"],
+        ["option_gate", HARNESS + "/option_gate.hexa"],
+        ["prompt_scan", GATE + "/prompt_scan.hexa"],
+        ["pre_tool_guard", GATE + "/pre_tool_guard.hexa"],
+        ["post_bash", GATE + "/post_bash.hexa"],
+        ["post_edit", GATE + "/post_edit.hexa"],
+        ["agent_ledger", HARNESS + "/agent_ledger.hexa"],
+        ["git_fresh", HARNESS + "/git_fresh.hexa"],
+        ["sync", HARNESS + "/sync.hexa"],
+        ["errors", HARNESS + "/errors.hexa"],
+        ["broadcast", HARNESS + "/broadcast.hexa"],
+        ["session_lock", HARNESS + "/session_lock.hexa"],
+        ["session_registry", HARNESS + "/session_registry.hexa"],
+        ["session_worktree", HARNESS + "/session_worktree.hexa"],
+        ["session_prompt_gen", HARNESS + "/session_prompt_gen.hexa"],
+        ["session", HARNESS + "/session.hexa"],
+        ["verify", HARNESS + "/verify.hexa"],
+        ["context_gauge", HARNESS + "/context_gauge.hexa"],
+        ["instinct", HARNESS + "/instinct.hexa"],
+        ["harness_audit", HARNESS + "/harness_audit.hexa"],
+        ["sensor", HARNESS + "/sensor.hexa"],
+        ["growth_tick", HARNESS + "/growth_tick.hexa"],
+        ["cross_feed", HARNESS + "/cross_feed.hexa"],
+        ["thinking_engine", HARNESS + "/thinking_engine.hexa"],
+        ["model_route", HARNESS + "/model_route.hexa"],
+        ["security_scan", HARNESS + "/security_scan.hexa"],
+        ["mcp_health", HARNESS + "/mcp_health.hexa"],
+        ["loop_controller", HARNESS + "/loop_controller.hexa"],
+        ["parallel_scheduler", HARNESS + "/parallel_scheduler.hexa"]
+    ]
+    let mut present = 0
+    let mut missing = []
+    for m in modules {
+        if file_exists(m[1]) {
+            present = present + 1
+        } else {
+            missing = missing.push(m[0])
+        }
+    }
+    println("harness modules: " + to_string(present) + "/" + to_string(modules.len()) + " present")
+    // OPT-P8-2: string concat loop → array join
+    if missing.len() > 0 {
+        println("missing: " + ", ".join(missing))
+    }
+    // cmd_gate 기본 동작 확인
+    let gate_out = to_string(exec(HEXA + " run " + GATE + "/cmd_gate.hexa smash '아이디어' 2>&1")).trim()  // @allow-bare-exec
+    if gate_out.contains("REJECT") {
+        println("gate reject test: PASS (abstract token rejected)")
+    } else {
+        println("gate reject test: FAIL — expected REJECT, got: " + gate_out)
+    }
+    // harness_audit 스코어 요약 (옵셔널 — 매 self_check 마다 점수 표시)
+    let audit_out = to_string(exec(HEXA + " run " + HARNESS + "/harness_audit.hexa summary 2>/dev/null")).trim()  // @allow-bare-exec
+    if audit_out.len() > 0 { println(audit_out) }
+}
+
+fn main() {
+    let argv = args()
+    // argv 런타임 편차 보정 — hexa 배포마다 args() layout 이 다름:
+    //   (A) Mac: [hexa-bin, script, user...]           → 첫 user arg = argv[2]
+    //   (B) Linux stage1: [hexa-bin, "run", script, user...] → 첫 user arg = argv[3]
+    // "argv[2] 고정" 가정이 (B) 에서 script path 를 mode 로 오해석하던 버그 수정.
+    // 해결: argv 안에서 "entry.hexa" 로 끝나는 항목을 찾고, 그 다음 index 를 첫 user arg 로 사용.
+    // Find script position. hexa-lang compiles .hexa → cache exe, so argv[0]/argv[1]
+    // may be hash-named exe (no .hexa suffix). Fallbacks: (a) look for 'entry.hexa' or
+    // '.hexa' suffix; (b) if argv[1] == "run"|"eval", user args start at argv[3];
+    // (c) default to argv[2] as the mode (compiled-exe invocation).
+    let mut script_idx = -1
+    let mut j = 0
+    while j < argv.len() {
+        if argv[j].ends_with("entry.hexa") || argv[j].ends_with(".hexa") {
+            script_idx = j
+        }
+        j = j + 1
+    }
+    let mode_idx = if script_idx >= 0 {
+        script_idx + 1
+    } else {
+        if argv.len() >= 3 && (argv[1] == "run" || argv[1] == "eval") { 3 } else { 2 }
+    }
+    if mode_idx >= argv.len() {
+        eprintln("usage: entry.hexa <mode> [args...]  — modes: prompt|pre_tool|post_bash|post_edit|gate|option_gate|guard|health|git_fresh|sync|errors|agent_ledger|ledger_bi|agent_race|agent_eval|broadcast|session_lock|session_registry|session_worktree|session_prompt_gen|gauge|instinct|audit|projects|self_check")
+        return
+    }
+    let mode = argv[mode_idx]
+    let mut rest = []
+    let mut i = mode_idx + 1
+    while i < argv.len() {
+        rest = rest.push(argv[i])
+        i = i + 1
+    }
+    route(mode, rest)
+}
+
+main()

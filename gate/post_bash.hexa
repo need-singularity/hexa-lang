@@ -1,0 +1,164 @@
+// post_bash.hexa — Bash 호출 후 진단 (PostToolUse Bash 훅 대체)
+// @allow-bare-exec
+// @no-sandbox
+// 역할: hexa-grammar-guard + build-fail-diag + loop-post-commit 훅 핵심 로직 통합
+//       + H-ERR-ROUTE (errors.hexa 라우팅)
+// usage: hexa run shared/tool/post_bash.hexa "<stdout+stderr output>" <exit_code>
+// output: 진단 메시지 systemMessage 형태 stdout. 문제 없으면 무출력.
+
+fn route_err(src: str, file: str, line: i64, code: str, msg: str) {
+    let HARNESS = env("HOME") + "/Dev/nexus/tool"
+    let hexa_bin = env("HOME") + "/Dev/nexus/bin/hexa"
+    let esc_msg = msg.replace("'", "").replace("\n", " ").replace("\r", " ")
+    let esc_file = file.replace("'", "")
+    let cmd = hexa_bin + " run " + HARNESS + "/errors.hexa route " + src +
+              " '" + esc_file + "' " + to_string(line) + " " + code +
+              " '" + esc_msg + "' 2>&1"
+    let out = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    if out.len() > 0 { println(out) }
+}
+
+// S1 관찰 버스 — observations.jsonl append (silent)
+// schema: {ts, tool, path, exit, pattern_key, session_id, project_hash, source}
+fn _observe(tool: str, path_or_cmd: str, exit_str: str, source: str) {
+    let HARNESS = env("HOME") + "/Dev/nexus/tool"
+    let OBS = HARNESS + "/observations.jsonl"
+    let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+    // pattern_key: Bash → 첫 두 토큰
+    let trimmed = path_or_cmd.trim()
+    let mut pattern_key = ""
+    if tool == "Bash" {
+        let toks = trimmed.split(" ")
+        if toks.len() >= 2 {
+            pattern_key = to_string(toks[0]).trim() + ":" + to_string(toks[1]).trim()
+        } else if toks.len() == 1 {
+            pattern_key = to_string(toks[0]).trim()
+        }
+    } else {
+        // Write/Edit: ext 또는 dir 기반
+        if trimmed.contains("/tool/") { pattern_key = "write:dir:shared/tool/" }
+        else if trimmed.contains("/") { pattern_key = "write:dir:shared/" }
+        else {
+            let ext_cmd = "printf '%s' '" + trimmed.replace("'", "") + "' | awk -F. '{if (NF>1) print $NF}'"
+            let ext = to_string(exec(ext_cmd)).trim()  // @allow-bare-exec
+            if ext.len() > 0 { pattern_key = "write:ext:*." + ext }
+            else { pattern_key = "write:other" }
+        }
+    }
+    let tsid_raw = to_string(exec("printf '%s' \"$TERM_SESSION_ID\" 2>/dev/null | /usr/bin/shasum -a 1 2>/dev/null | cut -c1-8")).trim()  // @allow-bare-exec
+    let session_id = if tsid_raw.len() > 0 { tsid_raw } else { "nosess" }
+    let ph_cmd = "git remote get-url origin 2>/dev/null | /usr/bin/shasum -a 1 2>/dev/null | cut -c1-12"
+    let ph_raw = to_string(exec(ph_cmd)).trim()  // @allow-bare-exec
+    let project_hash = if ph_raw.len() > 0 { ph_raw } else { "noremote" }
+    let esc_path = path_or_cmd.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ").replace("\r", " ").replace("\t", " ")
+    let esc_pk = pattern_key.replace("\\", "\\\\").replace("\"", "\\\"")
+    let row = "{\"ts\":\"" + ts + "\"," +
+              "\"tool\":\"" + tool + "\"," +
+              "\"path\":\"" + esc_path + "\"," +
+              "\"exit\":" + exit_str + "," +
+              "\"pattern_key\":\"" + esc_pk + "\"," +
+              "\"session_id\":\"" + session_id + "\"," +
+              "\"project_hash\":\"" + project_hash + "\"," +
+              "\"source\":\"" + source + "\"}"
+    let esc_row = row.replace("'", "'\\''")
+    exec("echo '" + esc_row + "' >> '" + OBS + "' 2>/dev/null")  // @allow-bare-exec
+}
+
+fn main() {
+    // argv 정규화 — Mac/Linux-stage1 prefix 편차 흡수 (shared/blowup/lib/argv.hexa.inc 참조).
+    let _raw_argv = args()
+    let mut _script_idx: i64 = -1
+    let mut _scan_i: i64 = 0
+    while _scan_i < _raw_argv.len() {
+        if to_string(_raw_argv[_scan_i]).ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let _user_start = if _script_idx >= 0 { _script_idx + 1 } else {
+        if _raw_argv.len() >= 3 && (to_string(_raw_argv[1]) == "run" || to_string(_raw_argv[1]) == "eval") { 3 } else { 2 }
+    }
+    let _script_token = if _script_idx >= 0 { _raw_argv[_script_idx] } else { "" }
+    let mut argv = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if argv.len() < 3 { return }
+    let output = argv[2]
+    let mut exit_code = "0"
+    if argv.len() >= 4 { exit_code = argv[3] }
+
+    // 1. hexa 문법 오류 감지 (hexa-grammar-guard 로직)
+    if output.contains("error[Syntax]") || output.contains("error[Type]") || output.contains("error[Parse]") {
+        let lines = output.split("\n")
+        let mut err_line = ""
+        for l in lines {
+            if l.contains("error[") {
+                err_line = l.trim()
+                break
+            }
+        }
+        let mut gid = "?"
+        if err_line.contains("Semicolon") { gid = "G6" }
+        if err_line.contains("RParen") { gid = "G1" }
+        if err_line.contains("expected identifier") { gid = "G2" }
+        if err_line.contains("builtin") { gid = "G7" }
+        println("[HEXA-ERR " + gid + "] " + err_line + " — 참조: shared/hexa/grammar/")
+        route_err("build", "", 0, "parse_error", gid + " " + err_line)
+        return
+    }
+
+    // 2. build 실패 감지 (간략)
+    if exit_code != "0" {
+        if output.contains("ld: symbol") || output.contains("undefined reference") {
+            println("[BUILD-ERR] 링커 에러 감지 — 의존성 확인 필요")
+            route_err("build", "", 0, "build_fail", "linker error")
+            return
+        }
+        if output.contains("Permission denied") {
+            println("[PERM-ERR] 권한 부족 — chmod/sudo 확인")
+            route_err("user", "", 0, "permission_denied", "permission denied")
+            return
+        }
+        // 기타 비0 exit — 일반화 defer 라우팅
+        route_err("build", "", 0, "exit_nonzero", "bash exit=" + exit_code)
+    }
+
+    // 3. git commit 후 loop-guard 힌트
+    if output.contains("commit ") && output.contains("master") == false && output.contains("main") == false {
+        // bypass
+    }
+
+    // 4. H-NOZOMBIE — 매 10회 post_bash 호출마다 reaper sweep (sampling, 비용 절감)
+    let HOME = env("HOME")
+    let counter_file = HOME + "/Dev/nexus/tool/.reaper_counter"
+    let cur_str = to_string(exec("cat " + counter_file + " 2>/dev/null")).trim()  // @allow-bare-exec
+    let cur = to_int(cur_str.split("\n")[0].trim())
+    let nxt = cur + 1
+    exec("echo " + to_string(nxt) + " > " + counter_file + " 2>/dev/null")  // @allow-bare-exec
+    if nxt % 10 == 0 {
+        let reaper = HOME + "/Dev/nexus/tool/reaper.hexa"
+        let hexa_bin = HOME + "/Dev/nexus/bin/hexa"
+        exec(hexa_bin + " run " + reaper + " sweep >/dev/null 2>&1 &")  // @allow-bare-exec
+    }
+
+    // 5. S1 관찰 버스 — observation append (bash command + exit)
+    _observe("Bash", output, exit_code, "post_bash")
+
+    // 6. context_gauge tick (Track C 모듈, 부재 시 silent)
+    let HARNESS = HOME + "/Dev/nexus/tool"
+    let HEXA = HOME + "/Dev/nexus/bin/hexa"
+    exec(HEXA + " run " + HARNESS + "/context_gauge.hexa tick 2>/dev/null")  // @allow-bare-exec
+
+    // 7. H-LOOP-REPORT — loop 실행 감지 시 NEXT_AFTER pending 플래그 생성.
+    //    SKILL (/loop) → HARNESS 강제 이관. Claude 가 보고에 NEXT 포함하도록 집행.
+    if output.contains("===NEXT_AFTER_BEGIN===") && output.contains("===NEXT_AFTER_END===") {
+        // bash 출력 전체를 loop_report check 로 파이프 — 플래그 생성은 loop_report 내부
+        let tmp = "/tmp/loop_report_in." + to_string(exec("date +%s%N")).trim() + ".txt"  // @allow-bare-exec
+        write_file(tmp, output)
+        exec("bash " + HARNESS + "/loop_report check \"$(cat '" + tmp + "')\" 2>/dev/null")  // @allow-bare-exec
+        exec("rm -f '" + tmp + "' 2>/dev/null")  // @allow-bare-exec
+    }
+}
+
+main()
