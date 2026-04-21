@@ -1,0 +1,143 @@
+#!hexa strict
+// tool/llm_verdict_watcher.hexa — L2 launchd watcher for raw 32 / own 4
+//
+// Drains $AIRGENOME_HOOK_ROOT/.hook-verdict-queue.jsonl (append-only queue
+// produced by airgenome/hooks/post_tool.hexa), pipes each entry's
+// response_preview through tool/llm_verdict_guard.hexa, and records any
+// verdict=warn outcomes to .hook-verdict-warnings.jsonl.
+//
+// Decoupling reason: airgenome post_tool is hot-path; stage0 hexa invocation
+// there risks 300s lock (roadmap 42 #16). Watcher batches at 60s cadence.
+//
+// Invocation: launchd com.airgenome.verdict-watcher.plist @ StartInterval=60.
+// Manual run: hexa tool/llm_verdict_watcher.hexa [--queue <path>] [--once]
+//
+// Exit codes:
+//   0 — queue drained (0 or more entries), no fatal errors
+//   1 — queue read error OR guard tool missing
+
+use "self/core/law_io"
+
+fn _now_utc() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _path_exists(path: string) -> bool {
+    let r = to_string(exec("test -e '" + path + "' && echo y || echo n")).trim()
+    return r == "y"
+}
+
+fn _root() -> string {
+    let mut r = env("AIRGENOME_HOOK_ROOT")
+    if r == "" { r = env("CLAUDE_PROJECT_DIR") }
+    if r == "" { r = to_string(exec("pwd")).trim() }
+    return r
+}
+
+fn _hx_lang_root() -> string {
+    let mut r = env("HEXA_LANG_ROOT")
+    if r == "" { r = "/Users/ghost/core/hexa-lang" }
+    return r
+}
+
+fn _queue_path() -> string { return _root() + "/.hook-verdict-queue.jsonl" }
+fn _warn_path()  -> string { return _root() + "/.hook-verdict-warnings.jsonl" }
+fn _guard_tool() -> string { return _hx_lang_root() + "/tool/llm_verdict_guard.hexa" }
+
+// jq per-line extractor: returns field value or "" if missing
+fn _jq_line(line: string, expr: string) -> string {
+    // write line to tmp, jq -r, read result
+    let tmp = to_string(exec("mktemp -t verdict_line.XXXXXX")).trim()
+    write_file(tmp, line)
+    let cmd = "jq -r '" + expr + " // \"\"' '" + tmp + "' 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    let _ = exec("rm -f '" + tmp + "'")
+    return out
+}
+
+fn _scan_entry(line: string) -> string {
+    let preview = _jq_line(line, ".response_preview")
+    if preview == "" { return "" }
+    let ts = _jq_line(line, ".ts")
+    let sess = _jq_line(line, ".session")
+    let tool_name = _jq_line(line, ".tool")
+    // pipe preview to guard via stdin
+    let tmp = to_string(exec("mktemp -t verdict_preview.XXXXXX")).trim()
+    write_file(tmp, preview)
+    let cmd = "cat '" + tmp + "' | hexa '" + _guard_tool() + "' --stdin --severity warn 2>/dev/null || echo '{}'"
+    let guard_json = to_string(exec(cmd)).trim()
+    let _ = exec("rm -f '" + tmp + "'")
+    // check verdict
+    let gtmp = to_string(exec("mktemp -t verdict_out.XXXXXX")).trim()
+    write_file(gtmp, guard_json)
+    let verdict = to_string(exec("jq -r '.verdict // \"\"' '" + gtmp + "' 2>/dev/null")).trim()
+    let missing = to_string(exec("jq -r '.claims_missing_evidence // 0' '" + gtmp + "' 2>/dev/null")).trim()
+    let _ = exec("rm -f '" + gtmp + "'")
+    if verdict != "warn" { return "" }
+    let record = "{\"scanned_at\":\"" + _now_utc() +
+                 "\",\"origin_ts\":\"" + ts +
+                 "\",\"session\":\"" + sess +
+                 "\",\"tool\":\"" + tool_name +
+                 "\",\"missing_count\":" + missing +
+                 ",\"guard\":" + guard_json + "}"
+    return record
+}
+
+fn main() -> void {
+    let raw_args = args()
+    let mut cli = []
+    let mut ai = 2
+    while ai < len(raw_args) {
+        cli.push(raw_args[ai])
+        ai = ai + 1
+    }
+
+    let mut queue = _queue_path()
+    let mut once = false
+    let mut i = 0
+    while i < len(cli) {
+        let a = cli[i]
+        if a == "--queue" { i = i + 1; queue = cli[i] }
+        else if a == "--once" { once = true }
+        i = i + 1
+    }
+
+    if !_path_exists(_guard_tool()) {
+        eprintln("verdict_watcher: guard tool missing — " + _guard_tool())
+        exit(1)
+    }
+
+    if !_path_exists(queue) {
+        // nothing to do
+        println("verdict_watcher: queue empty — " + queue)
+        exit(0)
+    }
+
+    // atomic rotate: rename queue to work file so post_tool can keep appending
+    let work = queue + "." + _now_utc().replace(":", "-") + ".proc"
+    let _ = exec("mv '" + queue + "' '" + work + "' 2>/dev/null || true")
+
+    // read work file lines
+    let body = to_string(read_file(work))
+    let lines = split(body, "\n")
+
+    let mut scanned = 0
+    let mut warned = 0
+    for ln in lines {
+        let line = ln.trim()
+        if line == "" { continue }
+        scanned = scanned + 1
+        let rec = _scan_entry(line)
+        if rec != "" {
+            let _ = exec("printf '%s\\n' '" + rec.replace("'", "'\\''") + "' >> '" + _warn_path() + "'")
+            warned = warned + 1
+        }
+    }
+
+    // archive processed file (keep for audit / rotate externally)
+    let archive_dir = _root() + "/.hook-verdict-archive"
+    let _ = exec("mkdir -p '" + archive_dir + "' && mv '" + work + "' '" + archive_dir + "/' 2>/dev/null || true")
+
+    println("verdict_watcher: scanned=" + to_string(scanned) + " warned=" + to_string(warned) + " archive=" + archive_dir)
+    exit(0)
+}
