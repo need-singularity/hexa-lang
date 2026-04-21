@@ -1,0 +1,306 @@
+// tool/os_l1_pre_commit.hexa — #9 L1 pre-commit gate (deadlock-safe)
+//
+// PURPOSE (raw#9 strict)
+//   Supersedes roadmap_verify_pre_commit.hexa as the Tier-2 canonical entry.
+//   The behavior is a superset:
+//     * Pre-flight: detect a hung/stale hexa_stage0 lock (#16) and either
+//       (a) reap it automatically, or (b) bypass by running stage0.real direct.
+//     * Gate-tag extraction & evidence verification — identical to the
+//       predecessor (same rules, same rejection messages).
+//     * Optional □→✓ marker flip in .roadmap, chflags-aware (raw#11).
+//     * raw_audit append on OK paths.
+//
+// CLI
+//   os_l1_pre_commit.hexa               — runs the gate (wraps pre-commit hook).
+//   os_l1_pre_commit.hexa --selftest    — tag / no-tag / conflict cases.
+//
+// ENV
+//   COMMIT_EDITMSG_PATH     default .git/COMMIT_EDITMSG
+//   ROADMAP_VERIFY_DEBUG    print debug lines
+//   OS_L1_SKIP_HOOK_FIX     set to 1 to skip #16 pre-flight (for benchmarking)
+//
+// EXIT
+//   0 OK  — commit proceeds.
+//   1 REJECT — evidence missing or lock-fix could not complete.
+
+fn _debug(m: string) -> void {
+    if env("ROADMAP_VERIFY_DEBUG") != "" {
+        eprintln("os_l1_pre_commit: " + m)
+    }
+}
+
+// ---- Pre-flight: lock fix (delegates to os_hook_fix.hexa diagnose) ----
+fn _pre_flight_lock_check() -> bool {
+    if env("OS_L1_SKIP_HOOK_FIX") == "1" { return true }
+    let lock = "/tmp/hexa_stage0.lock.d"
+    let has = exec_with_status("test -d '" + lock + "'")
+    if has[1] != 0 { return true }
+    // Read PID and check liveness.
+    let pid_file = lock + "/pid"
+    let chk = exec_with_status("test -f '" + pid_file + "'")
+    if chk[1] != 0 {
+        // Lock dir without PID file → stale.
+        let _ = exec_with_status("rm -rf '" + lock + "' 2>/dev/null")
+        _debug("reaped stale lock (no pid file)")
+        return true
+    }
+    let pid = to_string(read_file(pid_file)).trim()
+    if pid == "" {
+        let _ = exec_with_status("rm -rf '" + lock + "' 2>/dev/null")
+        _debug("reaped stale lock (empty pid)")
+        return true
+    }
+    let alive = exec_with_status("kill -0 " + pid + " 2>/dev/null")
+    if alive[1] != 0 {
+        let _ = exec_with_status("rm -rf '" + lock + "' 2>/dev/null")
+        _debug("reaped stale lock (dead pid=" + pid + ")")
+        return true
+    }
+    // Lock alive. We do NOT force-release here — caller may be a legitimate
+    // concurrent compile. Just note it and let the verify path proceed; since
+    // this file is invoked via stage0.real directly (bypass by construction),
+    // the lock doesn't block us.
+    _debug("lock held by live pid=" + pid + " (non-blocking; stage0.real bypass)")
+    return true
+}
+
+// ---- Commit message + changed-files helpers (same as predecessor) ----
+fn _commit_msg_path() -> string {
+    let p = env("COMMIT_EDITMSG_PATH")
+    if p != "" { return p }
+    return ".git/COMMIT_EDITMSG"
+}
+
+fn _read_commit_msg() -> string {
+    let p = _commit_msg_path()
+    let chk = exec_with_status("test -f '" + p + "'")
+    if chk[1] != 0 { return "" }
+    return to_string(read_file(p))
+}
+
+fn _changed_files() -> array {
+    let out = to_string(exec("git diff --cached --name-only 2>/dev/null"))
+    let mut files = []
+    for ln in split(out, "\n") {
+        let t = ln.trim()
+        if len(t) > 0 { files.push(t) }
+    }
+    return files
+}
+
+fn _looks_gate_tag(s: string) -> bool {
+    if len(s) == 0 { return false }
+    if s.starts_with("CP") { return true }
+    if s.starts_with("raw#") { return true }
+    if s.starts_with("FINAL") { return true }
+    if len(s) >= 2 {
+        let p0 = s.substring(0, 1)
+        let p1 = s.substring(1, 2)
+        if p0 == "P" && p1 >= "0" && p1 <= "9" { return true }
+    }
+    if s.index_of("AN") >= 0 { return true }
+    return false
+}
+
+fn _extract_gate_tags(msg: string) -> array {
+    let mut tags = []
+    let n = len(msg)
+    let mut i = 0
+    while i < n {
+        let c = msg.substring(i, i + 1)
+        if c == "[" {
+            let mut j = i + 1
+            let mut depth = 1
+            while j < n && depth > 0 {
+                let d = msg.substring(j, j + 1)
+                if d == "[" { depth = depth + 1 }
+                else if d == "]" { depth = depth - 1 }
+                if depth > 0 { j = j + 1 }
+            }
+            if j < n && depth == 0 {
+                let inner = msg.substring(i + 1, j)
+                if _looks_gate_tag(inner) { tags.push(inner) }
+                i = j + 1
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return tags
+}
+
+fn _verify_evidence(tag: string, changed: array, msg: string) -> array {
+    if msg.index_of("evidence:") >= 0 { return [true, "evidence-field"] }
+    if msg.index_of("satisfied by") >= 0 { return [true, "satisfied-by"] }
+    if msg.index_of("proof:") >= 0 { return [true, "proof-field"] }
+
+    let low_tag = tag.to_lower()
+    let an_idx = low_tag.index_of("an")
+    if an_idx >= 0 {
+        let tail = low_tag.substring(an_idx, len(low_tag))
+        for f in changed {
+            let fl = f.to_lower()
+            if fl.index_of(tail.replace(".", "_")) >= 0 { return [true, "file-match:" + f] }
+            if fl.index_of(tail.replace(".", "")) >= 0 { return [true, "file-match:" + f] }
+        }
+    }
+
+    if tag.starts_with("CP") || tag.starts_with("raw#") {
+        for f in changed {
+            if f == ".roadmap" { return [true, "roadmap-updated"] }
+        }
+    }
+
+    if len(tag) >= 2 {
+        let p0 = tag.substring(0, 1)
+        let p1 = tag.substring(1, 2)
+        if p0 == "P" && p1 >= "0" && p1 <= "9" {
+            for f in changed {
+                if f.starts_with("shared/") || f.starts_with("tool/") ||
+                   f.starts_with("docs/")   || f.starts_with("core/")  ||
+                   f.starts_with("scripts/") || f == ".roadmap" {
+                    return [true, "scope-match:" + f]
+                }
+            }
+        }
+    }
+
+    return [false, "no evidence detected"]
+}
+
+fn _is_darwin() -> bool { return to_string(exec("uname -s")).trim() == "Darwin" }
+
+fn _maybe_flip_roadmap(tags: array) -> bool {
+    let chk = exec_with_status("test -f .roadmap")
+    if chk[1] != 0 { return false }
+    let src = to_string(read_file(".roadmap"))
+    let mut out = src
+    let mut flipped = false
+    for tag in tags {
+        let needle = "□ [" + tag + "]"
+        if out.index_of(needle) >= 0 {
+            out = out.replace(needle, "✓ [" + tag + "] (commit:PENDING)")
+            flipped = true
+        }
+    }
+    if !flipped { return false }
+    // uchg-aware.
+    let had_uchg = _is_darwin() &&
+        to_string(exec("ls -lO .roadmap 2>/dev/null | awk '{print $5}'")).trim().index_of("uchg") >= 0
+    if had_uchg { let _ = exec_with_status("chflags nouchg .roadmap 2>/dev/null") }
+    let _w = write_file(".roadmap", out)
+    // verify file now contains the new flag
+    let post = to_string(read_file(".roadmap"))
+    if post.index_of("(commit:PENDING)") < 0 { return false }
+    if had_uchg { let _ = exec_with_status("chflags uchg .roadmap 2>/dev/null") }
+    let _g = exec_with_status("git add .roadmap")
+    return true
+}
+
+// ---- Core gate runner ----
+fn _run_gate() -> int {
+    if !_pre_flight_lock_check() {
+        eprintln("os_l1_pre_commit: lock pre-flight failed")
+        return 1
+    }
+    let msg = _read_commit_msg()
+    if msg == "" {
+        _debug("no commit msg — pass-through")
+        return 0
+    }
+    let tags = _extract_gate_tags(msg)
+    if len(tags) == 0 {
+        _debug("no gate tags — pass-through")
+        return 0
+    }
+    _debug("found " + to_string(len(tags)) + " gate tag(s)")
+    let changed = _changed_files()
+
+    let mut failed = []
+    let mut reasons = []
+    for tag in tags {
+        let v = _verify_evidence(tag, changed, msg)
+        if !v[0] {
+            failed.push(tag)
+            reasons.push(v[1])
+        } else {
+            _debug(tag + " → " + v[1])
+        }
+    }
+    if len(failed) > 0 {
+        eprintln("os_l1_pre_commit: REJECT — " + to_string(len(failed)) + " gate(s) missing evidence:")
+        let mut i = 0
+        while i < len(failed) {
+            eprintln("  [" + failed[i] + "] " + reasons[i])
+            i = i + 1
+        }
+        eprintln("")
+        eprintln("To pass: include 'evidence:<path>' or 'satisfied by <sha>' in commit msg,")
+        eprintln("or stage a matching file.")
+        exit(1)
+        return 1
+    }
+    let _f = _maybe_flip_roadmap(tags)
+    println("os_l1_pre_commit: OK (" + to_string(len(tags)) + " gate(s) verified)")
+    return 0
+}
+
+// ---- Selftest: 3 cases ----
+fn _selftest() -> int {
+    println("os_l1_pre_commit: selftest BEGIN")
+    let base = "/tmp/os_l1_selftest_" + to_string(exec("echo $$")).trim()
+    let _ = exec_with_status("rm -rf '" + base + "' && mkdir -p '" + base + "/.git' && mkdir -p '" + base + "/tool'")
+
+    // Case A: commit msg with a valid gate tag + staged file evidence.
+    let _w1 = write_file(base + "/.git/COMMIT_EDITMSG", "feat(tool): os-enforcement [P1.AN11.c] — add test\n\nevidence:tool/an11_c_demo.hexa\n")
+    // simulate git diff --cached by creating a fake path listing — but _run_gate
+    // calls `git diff --cached --name-only`; we can't stub git easily. Instead,
+    // verify evidence-via-message path (no git required).
+    // We use the `evidence:` field in msg which is evaluated WITHOUT git.
+    let _cdA = exec_with_status("cd '" + base + "' && git init -q 2>/dev/null")
+    // Write our own COMMIT_EDITMSG via env var.
+    let res_a = to_string(exec("cd '" + base + "' && COMMIT_EDITMSG_PATH='" + base + "/.git/COMMIT_EDITMSG' HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + env("HOME") + "/.hx/packages/hexa/build/hexa_stage0.real' '" + env("HOME") + "/core/hexa-lang/tool/os_l1_pre_commit.hexa' 2>&1"))
+    if res_a.index_of("OK (") < 0 {
+        eprintln("selftest FAIL (case A=tag+evidence): expected OK, got:")
+        eprintln(res_a)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [1/3] tag + evidence  → OK")
+
+    // Case B: no gate tag → pass-through.
+    let _w2 = write_file(base + "/.git/COMMIT_EDITMSG", "chore: update unrelated file\n")
+    let res_b = to_string(exec("cd '" + base + "' && COMMIT_EDITMSG_PATH='" + base + "/.git/COMMIT_EDITMSG' HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + env("HOME") + "/.hx/packages/hexa/build/hexa_stage0.real' '" + env("HOME") + "/core/hexa-lang/tool/os_l1_pre_commit.hexa' 2>&1; echo EX=$?"))
+    if res_b.index_of("EX=0") < 0 {
+        eprintln("selftest FAIL (case B=no-tag): expected exit 0, got:")
+        eprintln(res_b)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [2/3] no-tag pass-through  → OK")
+
+    // Case C: tag present but no evidence → conflict → reject with exit 1.
+    let _w3 = write_file(base + "/.git/COMMIT_EDITMSG", "feat: [P1.AN99.z] no evidence whatsoever\n")
+    let res_c = to_string(exec("cd '" + base + "' && COMMIT_EDITMSG_PATH='" + base + "/.git/COMMIT_EDITMSG' HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + env("HOME") + "/.hx/packages/hexa/build/hexa_stage0.real' '" + env("HOME") + "/core/hexa-lang/tool/os_l1_pre_commit.hexa' 2>&1; echo EX=$?"))
+    if res_c.index_of("REJECT") < 0 || res_c.index_of("EX=1") < 0 {
+        eprintln("selftest FAIL (case C=conflict): expected REJECT & exit 1, got:")
+        eprintln(res_c)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [3/3] tag-no-evidence reject  → OK")
+
+    let _x = exec_with_status("rm -rf '" + base + "'")
+    println("os_l1_pre_commit: selftest PASS")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    let mut i = 2
+    while i < len(av) {
+        if av[i] == "--selftest" { return _selftest() }
+        i = i + 1
+    }
+    return _run_gate()
+}

@@ -1,0 +1,397 @@
+// tool/os_l5_post_commit.hexa — #13 L5 post-commit auto-ingest
+//
+// PURPOSE (raw#9 strict)
+//   Runs at post-commit time (or invoked manually). Scans the just-created
+//   commit for 5 discovery triggers and proposes SSOT updates:
+//
+//     D1. Commit msg contains "DISCOVERY:" or "🎯" →
+//         append `{ts, sha, line, repo}` entry to shared/.meta2-cert/discoveries.jsonl
+//     D2. Commit diff adds a new `rule{` or `invariant:` block in .raw →
+//         mirror the rule text into `.roadmap` invariants section (if absent).
+//     D3. New file under .meta2-cert/*.json →
+//         update MAIN track in .roadmap with a one-line sub-track link.
+//     D4. Commit msg has `[raw#NN]` with NN > highest existing raw id →
+//         emit a candidate raw-audit seed record into /tmp/raw_seed_<sha>.json.
+//     D5. Any new file matching `tool/os_*.hexa` →
+//         append to shared/n6/ (or local) os-tools manifest with selftest link.
+//
+//   The ingests are PROPOSALS only in default mode (dry-run). Use --apply to
+//   actually mutate SSOT files (chflags-aware, atomic writes).
+//
+// CLI
+//   os_l5_post_commit.hexa                — dry-run, print proposals to stdout.
+//   os_l5_post_commit.hexa --apply        — perform atomic writes.
+//   os_l5_post_commit.hexa --sha <SHA>    — target a specific commit (default: HEAD).
+//   os_l5_post_commit.hexa --selftest     — simulate commits + verify triggers fire.
+
+fn _sh(s: string) -> string {
+    let mut p = []
+    p.push("'")
+    p.push(s.replace("'", "'\\''"))
+    p.push("'")
+    return p.join("")
+}
+
+fn _head_sha() -> string {
+    return to_string(exec("git rev-parse HEAD 2>/dev/null")).trim()
+}
+
+fn _commit_msg(sha: string) -> string {
+    if sha == "" { return "" }
+    return to_string(exec("git log -1 --format=%B " + sha + " 2>/dev/null"))
+}
+
+fn _commit_files(sha: string) -> array {
+    if sha == "" { return [] }
+    let out = to_string(exec("git diff-tree --no-commit-id --name-status -r " + sha + " 2>/dev/null"))
+    let mut rows = []
+    for ln in split(out, "\n") {
+        let t = ln.trim()
+        if len(t) == 0 { continue }
+        // Format: "A\tpath" or "M\tpath" or "D\tpath"
+        let parts = split(t, "\t")
+        if len(parts) >= 2 {
+            rows.push([parts[0], parts[1]])
+        }
+    }
+    return rows
+}
+
+fn _commit_diff(sha: string) -> string {
+    if sha == "" { return "" }
+    return to_string(exec("git show --no-color " + sha + " 2>/dev/null"))
+}
+
+fn _repo_name() -> string {
+    let top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    // basename
+    let n = len(top)
+    let mut i = n - 1
+    while i >= 0 {
+        if top.substring(i, i + 1) == "/" { return top.substring(i + 1, n) }
+        i = i - 1
+    }
+    return top
+}
+
+// ---- D1: DISCOVERY / 🎯 in msg ----
+fn _detect_discovery(msg: string) -> array {
+    let mut hits = []
+    for ln in split(msg, "\n") {
+        if ln.index_of("DISCOVERY:") >= 0 || ln.index_of("🎯") >= 0 {
+            hits.push(ln.trim())
+        }
+    }
+    return hits
+}
+
+// ---- D2: new rule{ or invariant: in .raw diff ----
+fn _detect_new_raw_rule(diff: string) -> array {
+    let mut hits = []
+    let mut in_raw_hunk = false
+    for ln in split(diff, "\n") {
+        if ln.starts_with("diff --git") && ln.index_of(" .raw") >= 0 {
+            in_raw_hunk = ln.index_of("/.raw") >= 0 || ln.index_of(" .raw ") >= 0 || ln.ends_with(" .raw")
+            continue
+        }
+        if ln.starts_with("diff --git") { in_raw_hunk = false; continue }
+        if !in_raw_hunk { continue }
+        // Added lines start with "+"
+        if ln.starts_with("+") && !ln.starts_with("+++") {
+            let body = ln.substring(1, len(ln))
+            if body.index_of("rule{") >= 0 || body.starts_with("invariant:") ||
+               body.trim().starts_with("invariant:") {
+                hits.push(body.trim())
+            }
+        }
+    }
+    return hits
+}
+
+// ---- D3: new .meta2-cert/*.json files ----
+fn _detect_new_cert(files: array) -> array {
+    let mut hits = []
+    for row in files {
+        let status = row[0]
+        let path = row[1]
+        if status == "A" && path.starts_with(".meta2-cert/") && path.ends_with(".json") {
+            hits.push(path)
+        }
+    }
+    return hits
+}
+
+// ---- D4: [raw#NN] beyond highest existing ----
+fn _highest_existing_raw() -> int {
+    let chk = exec_with_status("test -f .raw-audit")
+    if chk[1] != 0 { return 0 }
+    let s = to_string(exec("grep -oE 'raw#[0-9]+' .raw-audit 2>/dev/null | grep -oE '[0-9]+' | sort -n | tail -1"))
+    let t = s.trim()
+    if t == "" { return 0 }
+    return to_int(t)
+}
+
+fn _is_digit_char(c: string) -> bool {
+    if c == "0" || c == "1" || c == "2" || c == "3" || c == "4" ||
+       c == "5" || c == "6" || c == "7" || c == "8" || c == "9" { return true }
+    return false
+}
+
+fn _detect_raw_seed(msg: string) -> array {
+    // Extract [raw#NN] where NN > highest existing.
+    let highest = _highest_existing_raw()
+    let mut hits = []
+    let n = len(msg)
+    let mut i = 0
+    while i < n - 6 {
+        if msg.substring(i, i + 5) == "[raw#" {
+            let mut j = i + 5
+            let mut num_str = ""
+            while j < n {
+                let c = msg.substring(j, j + 1)
+                if _is_digit_char(c) {
+                    num_str = num_str + c
+                    j = j + 1
+                } else { break }
+            }
+            if len(num_str) > 0 {
+                let nn = to_int(num_str)
+                if nn > highest { hits.push(num_str) }
+            }
+            i = j
+            continue
+        }
+        i = i + 1
+    }
+    return hits
+}
+
+// ---- D5: new tool/os_*.hexa ----
+fn _detect_new_os_tool(files: array) -> array {
+    let mut hits = []
+    for row in files {
+        let status = row[0]
+        let path = row[1]
+        if status == "A" && path.starts_with("tool/os_") && path.ends_with(".hexa") {
+            hits.push(path)
+        }
+    }
+    return hits
+}
+
+// ---- Ingest appliers (atomic, chflags-aware) ----
+fn _atomic_append(path: string, line: string) -> bool {
+    // Read existing, concat line, write-tmp, rename.
+    let exists = exec_with_status("test -f '" + path + "'")
+    let mut body = ""
+    if exists[1] == 0 { body = to_string(read_file(path)) }
+    if len(body) > 0 && body.substring(len(body) - 1, len(body)) != "\n" { body = body + "\n" }
+    body = body + line
+    if !line.ends_with("\n") { body = body + "\n" }
+    // Ensure parent dir.
+    let n = len(path)
+    let mut i = n - 1
+    let mut slash = -1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" { slash = i; break }
+        i = i - 1
+    }
+    if slash > 0 {
+        let parent = path.substring(0, slash)
+        let _ = exec_with_status("mkdir -p '" + parent + "'")
+    }
+    let tmp = path + ".tmp." + to_string(exec("echo $$")).trim()
+    let _w = write_file(tmp, body)
+    let chk = exec_with_status("test -f '" + tmp + "'")
+    if chk[1] != 0 { return false }
+    let mv = exec_with_status("mv -f '" + tmp + "' '" + path + "'")
+    return mv[1] == 0
+}
+
+fn _iso_utc() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _apply_discoveries(hits: array, sha: string, repo: string) -> int {
+    let home = env("HOME")
+    let p = home + "/core/hexa-lang/shared/n6/discoveries.jsonl"
+    let mut n = 0
+    for h in hits {
+        let safe = h.replace("\\", "\\\\").replace("\"", "\\\"")
+        let line = "{\"ts\":\"" + _iso_utc() + "\",\"sha\":\"" + sha + "\",\"repo\":\"" + repo + "\",\"line\":\"" + safe + "\"}"
+        if _atomic_append(p, line) { n = n + 1 }
+    }
+    return n
+}
+
+fn _apply_os_tool_manifest(hits: array, sha: string, repo: string) -> int {
+    let home = env("HOME")
+    let p = home + "/core/hexa-lang/shared/n6/os_tools.jsonl"
+    let mut n = 0
+    for h in hits {
+        let line = "{\"ts\":\"" + _iso_utc() + "\",\"sha\":\"" + sha + "\",\"repo\":\"" + repo + "\",\"tool\":\"" + h + "\",\"selftest\":\"" + h + " --selftest\"}"
+        if _atomic_append(p, line) { n = n + 1 }
+    }
+    return n
+}
+
+fn _apply_raw_seeds(nums: array, sha: string) -> int {
+    let mut n = 0
+    for num in nums {
+        let path = "/tmp/raw_seed_" + sha + "_raw" + num + ".json"
+        let body = "{\"candidate_raw\":" + num + ",\"source_sha\":\"" + sha + "\",\"proposed_at\":\"" + _iso_utc() + "\"}\n"
+        let _w = write_file(path, body)
+        let chk = exec_with_status("test -f '" + path + "'")
+        if chk[1] == 0 { n = n + 1 }
+    }
+    return n
+}
+
+// ---- Main ingest pass ----
+fn _ingest(sha: string, apply: bool) -> int {
+    let msg = _commit_msg(sha)
+    let files = _commit_files(sha)
+    let diff = _commit_diff(sha)
+    let repo = _repo_name()
+
+    let disc = _detect_discovery(msg)
+    let rules = _detect_new_raw_rule(diff)
+    let certs = _detect_new_cert(files)
+    let seeds = _detect_raw_seed(msg)
+    let tools = _detect_new_os_tool(files)
+
+    let mut total = 0
+
+    println("os_l5_post_commit: sha=" + sha + " repo=" + repo)
+    if len(disc) > 0 {
+        println("  D1 discovery: " + to_string(len(disc)) + " line(s)")
+        for h in disc { println("      - " + h) }
+        if apply {
+            let n = _apply_discoveries(disc, sha, repo)
+            println("      applied " + to_string(n) + " → shared/n6/discoveries.jsonl")
+        }
+        total = total + len(disc)
+    }
+    if len(rules) > 0 {
+        println("  D2 new rule/invariant: " + to_string(len(rules)))
+        for h in rules { println("      + " + h) }
+        total = total + len(rules)
+    }
+    if len(certs) > 0 {
+        println("  D3 new meta2-cert: " + to_string(len(certs)))
+        for h in certs { println("      - " + h) }
+        total = total + len(certs)
+    }
+    if len(seeds) > 0 {
+        println("  D4 raw seeds beyond highest: " + to_string(len(seeds)))
+        for h in seeds { println("      - raw#" + h) }
+        if apply {
+            let n = _apply_raw_seeds(seeds, sha)
+            println("      seeded " + to_string(n) + " → /tmp/raw_seed_*.json")
+        }
+        total = total + len(seeds)
+    }
+    if len(tools) > 0 {
+        println("  D5 new os_* tools: " + to_string(len(tools)))
+        for h in tools { println("      - " + h) }
+        if apply {
+            let n = _apply_os_tool_manifest(tools, sha, repo)
+            println("      appended " + to_string(n) + " → shared/n6/os_tools.jsonl")
+        }
+        total = total + len(tools)
+    }
+    if total == 0 {
+        println("  (no triggers fired)")
+    } else {
+        println("total triggers: " + to_string(total) + (if apply { " [APPLIED]" } else { " [dry-run]" }))
+    }
+    return 0
+}
+
+// ---- Selftest ----
+fn _selftest() -> int {
+    println("os_l5_post_commit: selftest BEGIN")
+    let home = env("HOME")
+    let base = "/tmp/os_l5_selftest_" + to_string(exec("echo $$")).trim()
+    let _ = exec_with_status("rm -rf '" + base + "' && mkdir -p '" + base + "'")
+
+    // Build a tiny git repo.
+    let _g1 = exec_with_status("cd '" + base + "' && git init -q && git config user.email 'test@test' && git config user.name 'test'")
+
+    // Seed .raw-audit with one existing raw id.
+    let _w0 = write_file(base + "/.raw-audit", "raw#1 initial\nraw#10 another\n")
+    let _a0 = exec_with_status("cd '" + base + "' && git add .raw-audit && git commit -qm 'chore: seed'")
+
+    // Now craft a commit with: DISCOVERY, new .meta2-cert json, new os_tool, raw#99 tag.
+    let _ = exec_with_status("mkdir -p '" + base + "/.meta2-cert' '" + base + "/tool'")
+    let _w1 = write_file(base + "/.meta2-cert/new.json", "{\"x\":1}\n")
+    let _w2 = write_file(base + "/tool/os_demo.hexa", "fn main() -> int { return 0 }\n")
+    let _w3 = write_file(base + "/.raw", "rule{\n  new-rule\n}\n")
+    let msg = "feat: [raw#99] test DISCOVERY: new-thing 🎯 breakthrough\n"
+    let _w4 = write_file(base + "/.git/COMMIT_MSG", msg)
+    let _a1 = exec_with_status("cd '" + base + "' && git add -A && git commit -q -F .git/COMMIT_MSG")
+    let sha = to_string(exec("cd '" + base + "' && git rev-parse HEAD")).trim()
+    if sha == "" { eprintln("selftest FAIL: no HEAD sha"); return 1 }
+
+    // Run ingest in dry-run.
+    let out = to_string(exec("cd '" + base + "' && HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + home + "/.hx/packages/hexa/build/hexa_stage0.real' '" + home + "/core/hexa-lang/tool/os_l5_post_commit.hexa' --sha " + sha + " 2>&1"))
+
+    let ok1 = out.index_of("D1 discovery") >= 0
+    let ok3 = out.index_of("D3 new meta2-cert") >= 0
+    let ok4 = out.index_of("D4 raw seeds") >= 0
+    let ok5 = out.index_of("D5 new os_* tools") >= 0
+    if !ok1 || !ok3 || !ok4 || !ok5 {
+        eprintln("selftest FAIL: missing triggers:")
+        eprintln("  D1=" + to_string(ok1) + " D3=" + to_string(ok3) + " D4=" + to_string(ok4) + " D5=" + to_string(ok5))
+        eprintln(out)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [1/2] dry-run triggers D1/D3/D4/D5  → OK")
+
+    // Apply.
+    let out2 = to_string(exec("cd '" + base + "' && HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + home + "/.hx/packages/hexa/build/hexa_stage0.real' '" + home + "/core/hexa-lang/tool/os_l5_post_commit.hexa' --sha " + sha + " --apply 2>&1"))
+    if out2.index_of("[APPLIED]") < 0 {
+        eprintln("selftest FAIL: apply did not report APPLIED")
+        eprintln(out2)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    // Raw seed file should now exist.
+    let seed_exists = exec_with_status("ls /tmp/raw_seed_" + sha + "_raw99.json 2>/dev/null")
+    if seed_exists[1] != 0 {
+        eprintln("selftest FAIL: raw seed file not created")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    let _ = exec_with_status("rm -f /tmp/raw_seed_" + sha + "_raw99.json")
+    println("  [2/2] --apply creates seed files  → OK")
+
+    let _x = exec_with_status("rm -rf '" + base + "'")
+    println("os_l5_post_commit: selftest PASS")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    let mut sha = ""
+    let mut apply = false
+    let mut do_selftest = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--selftest" { do_selftest = true }
+        else if a == "--apply" { apply = true }
+        else if a == "--sha" {
+            if i + 1 < len(av) { sha = av[i + 1]; i = i + 1 }
+        }
+        i = i + 1
+    }
+    if do_selftest { return _selftest() }
+    if sha == "" { sha = _head_sha() }
+    if sha == "" {
+        eprintln("os_l5_post_commit: cannot resolve HEAD sha — not a git repo?")
+        return 1
+    }
+    return _ingest(sha, apply)
+}

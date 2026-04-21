@@ -1,0 +1,383 @@
+// tool/os_rollback_cli.hexa — #18 rollback CLI for .roadmap backups
+//
+// PURPOSE (raw#9 strict)
+//   The `.roadmap` file accumulates backups alongside it as
+//       .roadmap.bak.<ISO or timestamp label>
+//   This tool lists, inspects, and restores those backups deterministically.
+//   It understands chflags uchg — unlocks the live file, performs an atomic
+//   rename-backed restore (via os_atomic_write.hexa's algorithm, inlined here
+//   to keep this tool hermetic), and re-locks.
+//
+// CLI
+//   os_rollback_cli.hexa list [<repo_path>]
+//       List backups of .roadmap in the given repo (default: cwd).
+//   os_rollback_cli.hexa show <backup_file>
+//       Print a short summary (size, mtime, line-count, head/tail samples).
+//   os_rollback_cli.hexa diff <backup_file> [<live_file>]
+//       `diff -u` between backup and current .roadmap.
+//   os_rollback_cli.hexa apply <backup_file> [<live_file>] [--dry-run]
+//       Atomically restore backup → live. uchg-aware.
+//   os_rollback_cli.hexa --selftest
+//
+// SAFETY
+//   - Before `apply`, automatically snapshot the current live file to
+//     .roadmap.bak.pre-rollback-<epoch> so the operation is reversible.
+//   - The apply sequence uses tmp+rename; crash mid-rename leaves the live
+//     file untouched.
+//   - --dry-run prints the exact actions + diff, makes no changes.
+
+fn _now_epoch() -> int {
+    return to_int(to_string(exec("date +%s 2>/dev/null")).trim())
+}
+fn _pid() -> string { return to_string(exec("echo $$")).trim() }
+fn _is_darwin() -> bool { return to_string(exec("uname -s")).trim() == "Darwin" }
+
+fn _has_uchg(path: string) -> bool {
+    if !_is_darwin() { return false }
+    let chk = exec_with_status("test -e '" + path + "'")
+    if chk[1] != 0 { return false }
+    let out = to_string(exec("ls -lO '" + path + "' 2>/dev/null | awk '{print $5}'")).trim()
+    return out.index_of("uchg") >= 0
+}
+fn _clear_uchg(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags nouchg '" + path + "' 2>/dev/null")
+    return r[1] == 0
+}
+fn _set_uchg(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags uchg '" + path + "' 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _parent_dir(path: string) -> string {
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" {
+            if i == 0 { return "/" }
+            return path.substring(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn _basename(path: string) -> string {
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" { return path.substring(i + 1, n) }
+        i = i - 1
+    }
+    return path
+}
+
+fn _default_live(repo: string) -> string {
+    if repo == "" { return ".roadmap" }
+    return repo + "/.roadmap"
+}
+
+// List all .roadmap.bak.* files sorted by mtime (newest first).
+fn _list_backups(repo_dir: string) -> array {
+    let d = repo_dir
+    // Use find with -printf equivalent via `stat -f` on darwin.
+    let cmd_darwin = "cd '" + d + "' 2>/dev/null && ls -1 .roadmap.bak.* 2>/dev/null"
+    let out = to_string(exec(cmd_darwin))
+    let mut items = []
+    for ln in split(out, "\n") {
+        let t = ln.trim()
+        if len(t) > 0 { items.push(t) }
+    }
+    return items
+}
+
+fn _file_size(p: string) -> int {
+    let chk = exec_with_status("test -f '" + p + "'")
+    if chk[1] != 0 { return 0 }
+    let cmd = "wc -c < '" + p + "' 2>/dev/null | tr -d ' \\n'"
+    let s = to_string(exec(cmd)).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn _file_linecount(p: string) -> int {
+    let chk = exec_with_status("test -f '" + p + "'")
+    if chk[1] != 0 { return 0 }
+    let cmd = "wc -l < '" + p + "' 2>/dev/null | tr -d ' \\n'"
+    let s = to_string(exec(cmd)).trim()
+    if s == "" { return 0 }
+    return to_int(s)
+}
+
+fn _file_sha256(p: string) -> string {
+    let chk = exec_with_status("test -f '" + p + "'")
+    if chk[1] != 0 { return "" }
+    let cmd = "shasum -a 256 '" + p + "' 2>/dev/null | awk '{print $1}'"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _mtime(p: string) -> string {
+    if _is_darwin() {
+        return to_string(exec("stat -f %Sm -t %Y-%m-%dT%H:%M:%SZ '" + p + "' 2>/dev/null")).trim()
+    }
+    return to_string(exec("stat -c %y '" + p + "' 2>/dev/null")).trim()
+}
+
+// ---- Subcommands ----
+
+fn _cmd_list(repo_dir: string) -> int {
+    let bks = _list_backups(repo_dir)
+    if len(bks) == 0 {
+        println("no backups found in " + repo_dir)
+        return 0
+    }
+    println("backups in " + repo_dir + ":")
+    for b in bks {
+        let fp = repo_dir + "/" + b
+        let sz = _file_size(fp)
+        let lc = _file_linecount(fp)
+        let mt = _mtime(fp)
+        let mut p = []
+        p.push("  ")
+        p.push(b)
+        p.push("  size=")
+        p.push(to_string(sz))
+        p.push("B  lines=")
+        p.push(to_string(lc))
+        p.push("  mtime=")
+        p.push(mt)
+        println(p.join(""))
+    }
+    return 0
+}
+
+fn _cmd_show(bk: string) -> int {
+    let chk = exec_with_status("test -f '" + bk + "'")
+    if chk[1] != 0 { eprintln("not a file: " + bk); return 1 }
+    println("backup: " + bk)
+    println("  size:   " + to_string(_file_size(bk)) + "B")
+    println("  lines:  " + to_string(_file_linecount(bk)))
+    println("  mtime:  " + _mtime(bk))
+    println("  sha256: " + _file_sha256(bk))
+    println("")
+    println("--- HEAD 10 lines ---")
+    let _h = exec_with_status("head -n 10 '" + bk + "' 1>&2")
+    let head_out = to_string(exec("head -n 10 '" + bk + "' 2>/dev/null"))
+    print(head_out)
+    println("--- TAIL 10 lines ---")
+    let tail_out = to_string(exec("tail -n 10 '" + bk + "' 2>/dev/null"))
+    print(tail_out)
+    return 0
+}
+
+fn _cmd_diff(bk: string, live: string) -> int {
+    let chkb = exec_with_status("test -f '" + bk + "'")
+    if chkb[1] != 0 { eprintln("no backup: " + bk); return 1 }
+    let chkl = exec_with_status("test -f '" + live + "'")
+    if chkl[1] != 0 { eprintln("no live: " + live); return 1 }
+    let cmd = "diff -u '" + live + "' '" + bk + "' 2>/dev/null"
+    let r = exec_with_status(cmd)
+    print(to_string(r[0]))
+    return 0
+}
+
+fn _cmd_apply(bk: string, live: string, dry: bool) -> int {
+    let chkb = exec_with_status("test -f '" + bk + "'")
+    if chkb[1] != 0 { eprintln("no backup: " + bk); return 1 }
+
+    // 1. Plan.
+    let bk_sha = _file_sha256(bk)
+    let live_exists = exec_with_status("test -f '" + live + "'")
+    let live_sha = ""
+    let mut live_sha_real = ""
+    if live_exists[1] == 0 { live_sha_real = _file_sha256(live) }
+    let was_uchg = _has_uchg(live)
+
+    println("rollback plan:")
+    println("  source: " + bk + " sha256=" + bk_sha)
+    println("  target: " + live)
+    if live_exists[1] == 0 {
+        println("  live current sha256=" + live_sha_real + "  uchg=" + to_string(was_uchg))
+    } else {
+        println("  live currently MISSING (restoration will create)")
+    }
+
+    if bk_sha == live_sha_real && live_sha_real != "" {
+        println("  NO-OP: backup == live (identical sha256).")
+        return 0
+    }
+
+    if dry {
+        println("[dry-run] would:")
+        println("  (a) snapshot live → " + live + ".bak.pre-rollback-" + to_string(_now_epoch()))
+        if was_uchg { println("  (b) chflags nouchg '" + live + "'") }
+        println("  (c) atomic rename tmp → " + live)
+        if was_uchg { println("  (d) chflags uchg '" + live + "'") }
+        return 0
+    }
+
+    // 2. Pre-rollback snapshot.
+    if live_exists[1] == 0 {
+        let snap = live + ".bak.pre-rollback-" + to_string(_now_epoch())
+        let c = exec_with_status("cp '" + live + "' '" + snap + "'")
+        if c[1] != 0 {
+            eprintln("rollback: could not snapshot live → aborting")
+            return 1
+        }
+        println("  pre-rollback snapshot → " + snap)
+    }
+
+    // 3. Unlock if needed.
+    if was_uchg {
+        if !_clear_uchg(live) {
+            eprintln("rollback: chflags nouchg failed — aborting")
+            return 1
+        }
+    }
+
+    // 4. Atomic restore.
+    let tmp = live + ".tmp." + _pid() + "." + to_string(_now_epoch())
+    let cp = exec_with_status("cp '" + bk + "' '" + tmp + "'")
+    if cp[1] != 0 {
+        eprintln("rollback: tmp copy failed")
+        if was_uchg { let _ = _set_uchg(live) }
+        return 1
+    }
+    let mv = exec_with_status("mv -f '" + tmp + "' '" + live + "'")
+    if mv[1] != 0 {
+        eprintln("rollback: rename failed")
+        let _ = exec_with_status("rm -f '" + tmp + "'")
+        if was_uchg { let _ = _set_uchg(live) }
+        return 1
+    }
+
+    // 5. Relock.
+    if was_uchg { let _ = _set_uchg(live) }
+
+    // 6. Verify.
+    let final_sha = _file_sha256(live)
+    if final_sha != bk_sha {
+        eprintln("rollback: POST-CHECK FAILED — sha256 differs after apply")
+        return 1
+    }
+    println("rollback: APPLIED — " + live + " now matches " + bk + " (sha256=" + final_sha + ")")
+    return 0
+}
+
+// ---- Selftest ----
+
+fn _selftest() -> int {
+    println("os_rollback_cli: selftest BEGIN")
+
+    let base = "/tmp/os_rollback_selftest_" + _pid()
+    let _ = exec_with_status("rm -rf '" + base + "' && mkdir -p '" + base + "'")
+
+    // 1. Create a live file + one backup.
+    let live = base + "/.roadmap"
+    let body_a = "line-A1\nline-A2\nline-A3\n"
+    let body_b = "line-B1\nline-B2\nline-B3\nline-B4\n"
+    let _wa = write_file(live, body_a)
+    // Verify written.
+    let chk1 = exec_with_status("test -f '" + live + "'")
+    if chk1[1] != 0 { eprintln("selftest FAIL: initial live missing"); return 1 }
+
+    // Make a backup.
+    let bk = live + ".bak.20260421-000001"
+    let _c = exec_with_status("cp '" + live + "' '" + bk + "'")
+    // Overwrite live with body_b.
+    let _wb = write_file(live, body_b)
+
+    // 2. List backups.
+    let bks = _list_backups(base)
+    if len(bks) != 1 {
+        eprintln("selftest FAIL: expected 1 backup, got " + to_string(len(bks)))
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [1/5] list → OK")
+
+    // 3. Diff should show changes.
+    let r = _cmd_diff(bk, live)
+    if r != 0 {
+        eprintln("selftest FAIL: diff exit!=0")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [2/5] diff → OK")
+
+    // 4. Dry-run apply → live should be unchanged.
+    let _ = _cmd_apply(bk, live, true)
+    let cur_sha = _file_sha256(live)
+    let bk_sha = _file_sha256(bk)
+    if cur_sha == bk_sha {
+        eprintln("selftest FAIL: dry-run changed live!")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [3/5] dry-run no-op → OK")
+
+    // 5. Real apply → live should match backup (byte-identical).
+    let _ap = _cmd_apply(bk, live, false)
+    let after_sha = _file_sha256(live)
+    if after_sha != bk_sha {
+        eprintln("selftest FAIL: live sha differs from backup after apply")
+        eprintln("  live=" + after_sha + " backup=" + bk_sha)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [4/5] apply → byte-identical restore → OK")
+
+    // 6. Pre-rollback snapshot was created. `ls -A` to include dot-files.
+    let listing = to_string(exec("ls -A '" + base + "' 2>/dev/null"))
+    if listing.index_of("bak.pre-rollback") < 0 {
+        eprintln("selftest FAIL: pre-rollback snapshot not created — listing:")
+        eprintln(listing)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [5/5] pre-rollback snapshot created → OK")
+
+    let _x = exec_with_status("rm -rf '" + base + "'")
+    println("os_rollback_cli: selftest PASS")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        eprintln("usage: os_rollback_cli.hexa <list|show|diff|apply|--selftest> [args...]")
+        return 1
+    }
+    let cmd = av[2]
+    if cmd == "--selftest" { return _selftest() }
+    if cmd == "list" {
+        let repo = if len(av) >= 4 { av[3] } else { "." }
+        return _cmd_list(repo)
+    }
+    if cmd == "show" {
+        if len(av) < 4 { eprintln("show needs <backup>"); return 1 }
+        return _cmd_show(av[3])
+    }
+    if cmd == "diff" {
+        if len(av) < 4 { eprintln("diff needs <backup> [<live>]"); return 1 }
+        let live = if len(av) >= 5 { av[4] } else { ".roadmap" }
+        return _cmd_diff(av[3], live)
+    }
+    if cmd == "apply" {
+        if len(av) < 4 { eprintln("apply needs <backup> [<live>] [--dry-run]"); return 1 }
+        let bk = av[3]
+        let mut live = ".roadmap"
+        let mut dry = false
+        let mut i = 4
+        while i < len(av) {
+            let a = av[i]
+            if a == "--dry-run" { dry = true }
+            else if !a.starts_with("-") { live = a }
+            i = i + 1
+        }
+        return _cmd_apply(bk, live, dry)
+    }
+    eprintln("os_rollback_cli: unknown subcommand: " + cmd)
+    return 1
+}

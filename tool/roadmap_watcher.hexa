@@ -1,0 +1,194 @@
+// tool/roadmap_watcher.hexa — launchd-invoked live-roadmap snapshotter (raw#15)
+//
+// PURPOSE
+//   Every 60s (launchd StartInterval), scan each configured repo's .roadmap,
+//   compute verification progress, and append a JSONL snapshot line to
+//   $HOME/.airgenome/roadmap_snapshot.jsonl.
+//
+//   Also enforces chflags uchg on .roadmap and chflags uappnd on .raw-audit,
+//   restoring the lock if it has been broken (OS-level invariant — raw#24).
+//
+// REPO LIST
+//   Hard-coded minimal list (hexa, no external config):
+//     anima, airgenome, hexa-lang
+//   airgenome .roadmap is optional — a missing file is recorded with
+//   status="missing" (not a fault, since the sibling finalize agent is in
+//   the process of creating it).
+//
+// METRICS (per repo)
+//   total_gates      — count of verification gate markers "□" and "✓"
+//   satisfied_gates  — count of "✓"
+//   pending_gates    — count of "□"
+//   percent          — integer 0..100
+//   last_modified    — mtime in ISO-8601
+//   chflags_ok       — whether uchg is currently set on .roadmap
+//   raw_audit_uappnd — whether uappnd is currently set on .raw-audit
+//
+// OUTPUT
+//   appends one line to $HOME/.airgenome/roadmap_snapshot.jsonl
+//
+// INVARIANTS ENFORCED
+//   - .roadmap missing uchg    → re-applied
+//   - .raw-audit missing uappnd → re-applied
+//   (Only on darwin. Linux: no-op.)
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _home() -> string {
+    let h = env("HOME")
+    if h != "" { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _is_darwin() -> bool {
+    return to_string(exec("uname -s")).trim() == "Darwin"
+}
+
+// Count occurrences of a single glyph in a string.
+fn _count_occurrences(s: string, glyph: string) -> int {
+    let n = len(s)
+    let gl = len(glyph)
+    if gl == 0 || n < gl { return 0 }
+    let mut count = 0
+    let mut i = 0
+    while i <= n - gl {
+        if s.substring(i, i + gl) == glyph {
+            count = count + 1
+            i = i + gl
+        } else {
+            i = i + 1
+        }
+    }
+    return count
+}
+
+// Check whether chflags <flag> is set on <path> (darwin only).
+// Returns true on non-darwin (nothing to enforce).
+fn _has_chflag(path: string, flag: string) -> bool {
+    if !_is_darwin() { return true }
+    let cmd = "ls -lO '" + path + "' 2>/dev/null | awk '{print $5}'"
+    let out = to_string(exec(cmd)).trim()
+    return out.index_of(flag) >= 0
+}
+
+fn _restore_chflag(path: string, flag: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags " + flag + " '" + path + "' 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _mtime_iso(path: string) -> string {
+    let chk = exec_with_status("test -e '" + path + "'")
+    if chk[1] != 0 { return "" }
+    // darwin stat: stat -f "%Sm" -t "%Y-%m-%dT%H:%M:%SZ" <path>
+    if _is_darwin() {
+        let cmd = "stat -f \"%Sm\" -t \"%Y-%m-%dT%H:%M:%SZ\" '" + path + "' 2>/dev/null"
+        return to_string(exec(cmd)).trim()
+    }
+    // linux: stat -c "%y" — best-effort
+    let cmd = "stat -c \"%y\" '" + path + "' 2>/dev/null"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _scan_repo(home: string, name: string) -> string {
+    let repo = home + "/core/" + name
+    let rpath = repo + "/.roadmap"
+    let apath = repo + "/.raw-audit"
+
+    let chk = exec_with_status("test -f '" + rpath + "'")
+    if chk[1] != 0 {
+        return "{\"repo\":\"" + name + "\",\"status\":\"missing\"}"
+    }
+
+    let src = to_string(read_file(rpath))
+    let satisfied = _count_occurrences(src, "✓")
+    let pending = _count_occurrences(src, "□")
+    let total = satisfied + pending
+    let mut pct = 0
+    if total > 0 { pct = (satisfied * 100 + total / 2) / total }
+
+    let chflags_ok = _has_chflag(rpath, "uchg")
+    let audit_exists = exec_with_status("test -f '" + apath + "'")
+    let mut raw_audit_ok = true
+    if audit_exists[1] == 0 {
+        raw_audit_ok = _has_chflag(apath, "uchg") || _has_chflag(apath, "uappnd")
+    }
+
+    // Auto-restore — OS-level deterministic invariant.
+    if !chflags_ok {
+        let _ = _restore_chflag(rpath, "uchg")
+    }
+    if audit_exists[1] == 0 && !raw_audit_ok {
+        let _ = _restore_chflag(apath, "uappnd")
+    }
+
+    let mtime = _mtime_iso(rpath)
+
+    let mut parts = []
+    parts.push("{\"repo\":\"")
+    parts.push(name)
+    parts.push("\",\"total_gates\":")
+    parts.push(to_string(total))
+    parts.push(",\"satisfied\":")
+    parts.push(to_string(satisfied))
+    parts.push(",\"pending\":")
+    parts.push(to_string(pending))
+    parts.push(",\"percent\":")
+    parts.push(to_string(pct))
+    parts.push(",\"chflags_ok\":")
+    if chflags_ok { parts.push("true") } else { parts.push("false") }
+    parts.push(",\"raw_audit_ok\":")
+    if raw_audit_ok { parts.push("true") } else { parts.push("false") }
+    parts.push(",\"last_modified\":\"")
+    parts.push(mtime)
+    parts.push("\"}")
+    return parts.join("")
+}
+
+fn main() -> int {
+    let home = _home()
+    let out_dir = home + "/.airgenome"
+    let out_path = out_dir + "/roadmap_snapshot.jsonl"
+
+    let _mkdir = exec_with_status("mkdir -p '" + out_dir + "'")
+
+    let ts = _iso_utc_now()
+    let repos = ["anima", "airgenome", "hexa-lang"]
+
+    let mut repo_jsons = []
+    for r in repos {
+        repo_jsons.push(_scan_repo(home, r))
+    }
+
+    let mut line_parts = []
+    line_parts.push("{\"ts\":\"")
+    line_parts.push(ts)
+    line_parts.push("\",\"repos\":[")
+    let mut first = true
+    for rj in repo_jsons {
+        if !first { line_parts.push(",") }
+        line_parts.push(rj)
+        first = false
+    }
+    line_parts.push("]}\n")
+
+    let line = line_parts.join("")
+    let cmd = "printf '%s' " + _shell_quote(line) + " >> '" + out_path + "'"
+    let _w = exec_with_status(cmd)
+
+    // Echo last line to stdout — useful when invoked manually.
+    print(line)
+    return 0
+}
+
+fn _shell_quote(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    parts.push(s.replace("'", "'\\''"))
+    parts.push("'")
+    return parts.join("")
+}
+
+

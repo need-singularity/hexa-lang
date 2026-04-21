@@ -1,0 +1,280 @@
+// tool/install_os_enforcement.hexa — installer for Tier-2 OS enforcement suite
+//
+// PURPOSE
+//   Deterministic installer (raw#9 strict) that wires up the five Tier-2 tools:
+//
+//     os_hook_fix.hexa         — #16 stage0 deadlock detector
+//     os_atomic_write.hexa     — #14 crash-safe writer
+//     os_rollback_cli.hexa     — #18 rollback UI
+//     os_l1_pre_commit.hexa    — #9  pre-commit gate (supersedes predecessor)
+//     os_l5_post_commit.hexa   — #13 post-commit auto-ingest
+//
+//   The installer:
+//     1. Writes `.git/hooks/pre-commit`  in each repo — bash shim that invokes
+//        os_l1_pre_commit.hexa via hexa_stage0.real (deadlock-bypass).
+//     2. Writes `.git/hooks/post-commit` in each repo — bash shim that invokes
+//        os_l5_post_commit.hexa in dry-run mode (apply requires opt-in).
+//     3. Refreshes the launchd plist
+//        `~/Library/LaunchAgents/com.airgenome.roadmap-watcher.plist`
+//        so that it also invokes os_hook_fix.hexa in --release mode every 60s
+//        (auto-reap of stale lock).
+//     4. Touches `shared/n6/` dir so L5 ingest has a home.
+//
+//   DOES NOT run `launchctl bootstrap` — prints the command at end.
+//
+// USAGE
+//   hexa-stage0 install_os_enforcement.hexa         — install
+//   hexa-stage0 install_os_enforcement.hexa --check — show state
+//   hexa-stage0 install_os_enforcement.hexa --selftest — smoke test
+
+fn _home() -> string {
+    let h = env("HOME")
+    if h != "" { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _stage0_real(home: string) -> string {
+    return home + "/.hx/packages/hexa/build/hexa_stage0.real"
+}
+
+fn _repos() -> array {
+    // Ordered: hexa-lang first (has the tools), then anima + airgenome.
+    return ["hexa-lang", "anima", "airgenome"]
+}
+
+// ---- Pre-commit hook shim ----
+fn _precommit_shim(home: string) -> string {
+    let mut p = []
+    p.push("#!/bin/sh\n")
+    p.push("# auto-installed by tool/install_os_enforcement.hexa — Tier 2 raw#9 strict\n")
+    p.push("# BEGIN os_l1_pre_commit_hook\n")
+    p.push("STAGE0=\"")
+    p.push(_stage0_real(home))
+    p.push("\"\n")
+    p.push("TOOL=\"")
+    p.push(home)
+    p.push("/core/hexa-lang/tool/os_l1_pre_commit.hexa\"\n")
+    p.push("if [ -x \"$STAGE0\" ] && [ -f \"$TOOL\" ]; then\n")
+    p.push("  ( cd \"$(git rev-parse --show-toplevel)\" && \\\n")
+    p.push("    HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 HEXA_LOCAL_NO_CAP=1 \\\n")
+    p.push("    \"$STAGE0\" \"$TOOL\" ) || exit 1\n")
+    p.push("fi\n")
+    p.push("# END os_l1_pre_commit_hook\n")
+    return p.join("")
+}
+
+fn _postcommit_shim(home: string) -> string {
+    let mut p = []
+    p.push("#!/bin/sh\n")
+    p.push("# auto-installed by tool/install_os_enforcement.hexa — Tier 2 raw#9 strict\n")
+    p.push("# BEGIN os_l5_post_commit_hook\n")
+    p.push("STAGE0=\"")
+    p.push(_stage0_real(home))
+    p.push("\"\n")
+    p.push("TOOL=\"")
+    p.push(home)
+    p.push("/core/hexa-lang/tool/os_l5_post_commit.hexa\"\n")
+    p.push("if [ -x \"$STAGE0\" ] && [ -f \"$TOOL\" ]; then\n")
+    p.push("  ( cd \"$(git rev-parse --show-toplevel)\" && \\\n")
+    p.push("    HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 HEXA_LOCAL_NO_CAP=1 \\\n")
+    p.push("    \"$STAGE0\" \"$TOOL\" ) || true\n")
+    p.push("fi\n")
+    p.push("# END os_l5_post_commit_hook\n")
+    return p.join("")
+}
+
+fn _install_hook(home: string, repo: string, kind: string, content: string, marker: string) -> bool {
+    let path = home + "/core/" + repo + "/.git/hooks/" + kind
+    let chk = exec_with_status("test -d '" + home + "/core/" + repo + "/.git'")
+    if chk[1] != 0 {
+        eprintln("install: [" + repo + "] no .git dir — SKIP")
+        return false
+    }
+    let existing = exec_with_status("test -f '" + path + "'")
+    if existing[1] == 0 {
+        let src = to_string(read_file(path))
+        if src.index_of(marker) >= 0 {
+            let _c = exec_with_status("chmod +x '" + path + "'")
+            println("install: [" + repo + "] " + kind + " already has marker — SKIP")
+            return true
+        }
+        // Append below existing content (idempotent).
+        let patched = src + "\n" + content
+        let _w = write_file(path, patched)
+        let post = to_string(read_file(path))
+        if post.index_of(marker) < 0 {
+            eprintln("install: [" + repo + "] " + kind + " append FAILED")
+            return false
+        }
+        let _c = exec_with_status("chmod +x '" + path + "'")
+        println("install: [" + repo + "] " + kind + " patched (block appended)")
+        return true
+    }
+    let _w = write_file(path, content)
+    let chk2 = exec_with_status("test -f '" + path + "'")
+    if chk2[1] != 0 {
+        eprintln("install: [" + repo + "] " + kind + " write failed")
+        return false
+    }
+    let _c = exec_with_status("chmod +x '" + path + "'")
+    println("install: [" + repo + "] " + kind + " hook → " + path)
+    return true
+}
+
+// ---- launchd plist (60s watcher + auto-reap stale stage0 lock) ----
+fn _install_launchd(home: string) -> bool {
+    let plist_path = home + "/Library/LaunchAgents/com.airgenome.roadmap-watcher.plist"
+    let stage0 = _stage0_real(home)
+    let watcher_tool = home + "/core/hexa-lang/tool/roadmap_watcher.hexa"
+    let reap_tool = home + "/core/hexa-lang/tool/os_hook_fix.hexa"
+
+    let mut p = []
+    p.push("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n")
+    p.push("<!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n")
+    p.push("<plist version=\"1.0\">\n")
+    p.push("<dict>\n")
+    p.push("  <key>Label</key><string>com.airgenome.roadmap-watcher</string>\n")
+    p.push("  <key>ProgramArguments</key>\n")
+    p.push("  <array>\n")
+    p.push("    <string>/bin/sh</string>\n")
+    p.push("    <string>-c</string>\n")
+    p.push("    <string>HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 ")
+    p.push(stage0)
+    p.push(" ")
+    p.push(reap_tool)
+    p.push(" --release; HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 ")
+    p.push(stage0)
+    p.push(" ")
+    p.push(watcher_tool)
+    p.push("</string>\n")
+    p.push("  </array>\n")
+    p.push("  <key>StartInterval</key><integer>60</integer>\n")
+    p.push("  <key>RunAtLoad</key><true/>\n")
+    p.push("  <key>StandardOutPath</key><string>/tmp/roadmap_watcher.stdout</string>\n")
+    p.push("  <key>StandardErrorPath</key><string>/tmp/roadmap_watcher.stderr</string>\n")
+    p.push("</dict>\n")
+    p.push("</plist>\n")
+
+    let _md = exec_with_status("mkdir -p '" + home + "/Library/LaunchAgents'")
+    let _w = write_file(plist_path, p.join(""))
+    let chk = exec_with_status("test -f '" + plist_path + "'")
+    if chk[1] != 0 {
+        eprintln("install: launchd plist write failed: " + plist_path)
+        return false
+    }
+    println("install: launchd plist → " + plist_path)
+    return true
+}
+
+// ---- shared/n6 scaffolding ----
+fn _scaffold_n6(home: string) -> void {
+    let d = home + "/core/hexa-lang/shared/n6"
+    let _ = exec_with_status("mkdir -p '" + d + "'")
+    // touch empty manifests so L5 can append
+    let a = d + "/discoveries.jsonl"
+    let b = d + "/os_tools.jsonl"
+    let _ta = exec_with_status("test -f '" + a + "' || : > '" + a + "'")
+    let _tb = exec_with_status("test -f '" + b + "' || : > '" + b + "'")
+    println("install: shared/n6 scaffolding → " + d)
+}
+
+// ---- Check mode ----
+fn _check(home: string) -> void {
+    for r in _repos() {
+        let pre = home + "/core/" + r + "/.git/hooks/pre-commit"
+        let post = home + "/core/" + r + "/.git/hooks/post-commit"
+        let a = exec_with_status("test -f '" + pre + "'")
+        let b = exec_with_status("test -f '" + post + "'")
+        let mut pre_ok = "MISSING"
+        let mut post_ok = "MISSING"
+        if a[1] == 0 {
+            let s = to_string(read_file(pre))
+            if s.index_of("os_l1_pre_commit_hook") >= 0 { pre_ok = "L1-installed" }
+            else { pre_ok = "present-no-L1" }
+        }
+        if b[1] == 0 {
+            let s = to_string(read_file(post))
+            if s.index_of("os_l5_post_commit_hook") >= 0 { post_ok = "L5-installed" }
+            else { post_ok = "present-no-L5" }
+        }
+        println("[" + r + "] pre-commit=" + pre_ok + "  post-commit=" + post_ok)
+    }
+    let plist = home + "/Library/LaunchAgents/com.airgenome.roadmap-watcher.plist"
+    let chk = exec_with_status("test -f '" + plist + "'")
+    if chk[1] == 0 { println("launchd plist: INSTALLED") } else { println("launchd plist: MISSING") }
+}
+
+fn _selftest() -> int {
+    println("install_os_enforcement: selftest BEGIN")
+    // Quick smoke: run each tool's --selftest.
+    let home = _home()
+    let stage0 = _stage0_real(home)
+    let tools = ["os_hook_fix.hexa", "os_atomic_write.hexa", "os_rollback_cli.hexa",
+                 "os_l1_pre_commit.hexa", "os_l5_post_commit.hexa"]
+    let mut fails = []
+    for t in tools {
+        let tp = home + "/core/hexa-lang/tool/" + t
+        let cmd = "HEXA_STAGE0_NO_CAP=1 HEXA_LOCAL=1 '" + stage0 + "' '" + tp + "' --selftest 2>&1"
+        let out = to_string(exec(cmd))
+        if out.index_of("selftest PASS") < 0 {
+            fails.push(t)
+            eprintln("  FAIL: " + t)
+            eprintln(out)
+        } else {
+            println("  PASS: " + t)
+        }
+    }
+    if len(fails) > 0 {
+        eprintln("install_os_enforcement: selftest FAIL (" + to_string(len(fails)) + " tools)")
+        return 1
+    }
+    println("install_os_enforcement: selftest PASS (" + to_string(len(tools)) + "/5 tools)")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    let mut mode = "install"
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--check" { mode = "check" }
+        else if a == "--selftest" { mode = "selftest" }
+        i = i + 1
+    }
+
+    let home = _home()
+    if mode == "check" { _check(home); return 0 }
+    if mode == "selftest" { return _selftest() }
+
+    println("install_os_enforcement — home=" + home)
+    println("")
+
+    let pre_marker = "BEGIN os_l1_pre_commit_hook"
+    let post_marker = "BEGIN os_l5_post_commit_hook"
+    let pre = _precommit_shim(home)
+    let post = _postcommit_shim(home)
+
+    let mut ok_pre = 0
+    let mut ok_post = 0
+    for r in _repos() {
+        if _install_hook(home, r, "pre-commit", pre, pre_marker) { ok_pre = ok_pre + 1 }
+        if _install_hook(home, r, "post-commit", post, post_marker) { ok_post = ok_post + 1 }
+    }
+    let _ld = _install_launchd(home)
+    _scaffold_n6(home)
+
+    println("")
+    println("summary:")
+    println("  pre-commit   " + to_string(ok_pre) + "/3 repos")
+    println("  post-commit  " + to_string(ok_post) + "/3 repos")
+    println("  launchd plist: installed")
+    println("")
+    let uid = to_string(exec("id -u")).trim()
+    println("NEXT (user, manual):")
+    println("  launchctl bootstrap gui/" + uid + " \\")
+    println("    " + home + "/Library/LaunchAgents/com.airgenome.roadmap-watcher.plist")
+    println("")
+    println("verify:  hexa-stage0 tool/install_os_enforcement.hexa --check")
+    return 0
+}

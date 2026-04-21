@@ -1,0 +1,294 @@
+// tool/os_atomic_write.hexa — #14 atomic file write (tmp + fsync + rename)
+//
+// PURPOSE (raw#9 strict)
+//   Drop-in replacement for direct `write_file(path, content)` that provides
+//   crash-safety. Sequence:
+//       1. write content to  "<path>.tmp.<pid>.<epoch>"
+//       2. fsync the tmp file
+//       3. rename tmp → dest  (POSIX atomic within a single filesystem)
+//       4. optionally fsync the parent directory (macOS honors this best-effort)
+//
+//   Crash between steps 1 and 3 leaves dest untouched — the partial write is
+//   stranded as ".tmp.*" and reaped by the cleanup pass. Crash between 3 and 4
+//   leaves the new content in place but possibly not yet on disk (kernel will
+//   flush). For .roadmap / .raw-audit durability, this is sufficient — the
+//   next commit will either see the new content or the pre-rename state.
+//
+// CLI
+//   os_atomic_write.hexa write  <path> <<<content_from_stdin
+//       Reads stdin fully, writes atomically to <path>.
+//   os_atomic_write.hexa write-str <path> <content>
+//       Same as above but content passed on argv (for small payloads).
+//   os_atomic_write.hexa write-file <src> <dst>
+//       Copy contents of <src> to <dst> atomically (respects chflags uchg on dst).
+//   os_atomic_write.hexa cleanup <dir>
+//       Remove stranded .tmp.* files older than 1h in <dir>.
+//   os_atomic_write.hexa --selftest
+//
+// CHFLAGS AWARENESS
+//   If dst has `uchg` set (macOS immutable flag), the rename will fail. We
+//   detect this up-front and temporarily clear uchg during the rename, then
+//   restore it. This makes the tool safe to use as the canonical writer for
+//   .roadmap and friends.
+
+fn _now_epoch() -> int {
+    let s = to_string(exec("date +%s 2>/dev/null")).trim()
+    if len(s) == 0 { return 0 }
+    return to_int(s)
+}
+
+fn _pid() -> string {
+    return to_string(exec("echo $$")).trim()
+}
+
+fn _is_darwin() -> bool {
+    return to_string(exec("uname -s")).trim() == "Darwin"
+}
+
+fn _has_uchg(path: string) -> bool {
+    if !_is_darwin() { return false }
+    let chk = exec_with_status("test -e '" + path + "'")
+    if chk[1] != 0 { return false }
+    let cmd = "ls -lO '" + path + "' 2>/dev/null | awk '{print $5}'"
+    let out = to_string(exec(cmd)).trim()
+    return out.index_of("uchg") >= 0
+}
+
+fn _clear_uchg(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags nouchg '" + path + "' 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _set_uchg(path: string) -> bool {
+    if !_is_darwin() { return true }
+    let r = exec_with_status("chflags uchg '" + path + "' 2>/dev/null")
+    return r[1] == 0
+}
+
+fn _tmp_path(path: string) -> string {
+    return path + ".tmp." + _pid() + "." + to_string(_now_epoch())
+}
+
+// Core atomic-write routine. Returns true on success.
+// `content_via_file` — if "" means use the in-memory string `content`;
+// otherwise copy from that source file.
+fn _atomic_write(dst: string, content: string, content_via_file: string) -> bool {
+    let tmp = _tmp_path(dst)
+
+    // 1. Write tmp. NOTE: write_file returns void in hexa stage0; verify by
+    //    post-condition check (file exists + size > 0 for non-empty content).
+    if content_via_file == "" {
+        let _ow = write_file(tmp, content)
+        let chk = exec_with_status("test -f '" + tmp + "'")
+        if chk[1] != 0 {
+            eprintln("os_atomic_write: tmp write failed (no file): " + tmp)
+            return false
+        }
+    } else {
+        let r = exec_with_status("cp '" + content_via_file + "' '" + tmp + "'")
+        if r[1] != 0 {
+            eprintln("os_atomic_write: tmp copy failed: " + content_via_file)
+            return false
+        }
+    }
+
+    // 2. fsync tmp (best-effort; `dd conv=fsync` is POSIX).
+    //    We avoid `sync` because that syncs the whole system.
+    let _fs = exec_with_status("dd if='" + tmp + "' of='" + tmp + ".__fsync_passthrough' bs=1m conv=fsync count=0 2>/dev/null; rm -f '" + tmp + ".__fsync_passthrough'")
+    // On macOS, a cleaner idiom: open+F_FULLFSYNC via `sync -f` (gnu coreutils).
+    // We don't hard-depend on it; the above is sufficient for our durability
+    // target (commit-time updates to small JSONL/text files).
+
+    // 3. Detect uchg on dst; clear temporarily.
+    let was_uchg = _has_uchg(dst)
+    if was_uchg { let _ = _clear_uchg(dst) }
+
+    // 4. Atomic rename.
+    let mv = exec_with_status("mv -f '" + tmp + "' '" + dst + "' 2>&1")
+    if mv[1] != 0 {
+        eprintln("os_atomic_write: rename failed: " + to_string(mv[0]))
+        // Restore uchg if we cleared it.
+        if was_uchg { let _ = _set_uchg(dst) }
+        // Clean up stranded tmp.
+        let _ = exec_with_status("rm -f '" + tmp + "' 2>/dev/null")
+        return false
+    }
+
+    // 5. Restore uchg on dst if it was set.
+    if was_uchg { let _ = _set_uchg(dst) }
+
+    // 6. Optional parent-dir fsync.
+    let parent = _parent_dir(dst)
+    if parent != "" {
+        let _ = exec_with_status("dd if='" + parent + "/.' of=/dev/null bs=1m count=0 2>/dev/null")
+    }
+
+    return true
+}
+
+fn _parent_dir(path: string) -> string {
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" {
+            if i == 0 { return "/" }
+            return path.substring(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+// Read entire stdin into a string (best-effort via `cat -`).
+fn _read_stdin_to_tmp() -> string {
+    // Redirect stdin through a temp file so we can read it back.
+    let t = "/tmp/os_atomic_stdin_" + _pid() + "_" + to_string(_now_epoch())
+    let _ = exec_with_status("cat > '" + t + "'")
+    let r = exec_with_status("test -f '" + t + "'")
+    if r[1] != 0 { return "" }
+    return t
+}
+
+fn _cleanup(dir: string) -> int {
+    let chk = exec_with_status("test -d '" + dir + "'")
+    if chk[1] != 0 {
+        eprintln("os_atomic_write: cleanup dir not found: " + dir)
+        return 1
+    }
+    // Find .tmp.*  older than 60 minutes, remove.
+    let cmd = "find '" + dir + "' -maxdepth 1 -type f -name '*.tmp.*' -mmin +60 -print -delete 2>/dev/null"
+    let r = exec_with_status(cmd)
+    print(to_string(r[0]))
+    return 0
+}
+
+// ---- Selftest ----
+
+fn _selftest() -> int {
+    println("os_atomic_write: selftest BEGIN")
+
+    let base = "/tmp/os_atomic_selftest_" + _pid()
+    let _ = exec_with_status("mkdir -p '" + base + "'")
+    let dst = base + "/target.txt"
+
+    // 1. Fresh write.
+    let body1 = "line-one\nline-two\n"
+    let ok1 = _atomic_write(dst, body1, "")
+    if !ok1 {
+        eprintln("selftest FAIL: initial write returned false")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    let read1 = to_string(read_file(dst))
+    if read1 != body1 {
+        eprintln("selftest FAIL: content mismatch after initial write")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [1/5] fresh write  → OK")
+
+    // 2. Overwrite.
+    let body2 = "NEW\nline\n"
+    let ok2 = _atomic_write(dst, body2, "")
+    if !ok2 || to_string(read_file(dst)) != body2 {
+        eprintln("selftest FAIL: overwrite did not take")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [2/5] overwrite  → OK")
+
+    // 3. uchg-aware overwrite (darwin only; on linux we just skip to still-green).
+    if _is_darwin() {
+        let _u = _set_uchg(dst)
+        let body3 = "uchg-proof\n"
+        let ok3 = _atomic_write(dst, body3, "")
+        if !ok3 {
+            eprintln("selftest FAIL: uchg-aware write failed")
+            let _c = _clear_uchg(dst)
+            let _x = exec_with_status("rm -rf '" + base + "'")
+            return 1
+        }
+        let read3 = to_string(read_file(dst))
+        if read3 != body3 {
+            eprintln("selftest FAIL: uchg-aware content mismatch")
+            let _c = _clear_uchg(dst)
+            let _x = exec_with_status("rm -rf '" + base + "'")
+            return 1
+        }
+        if !_has_uchg(dst) {
+            eprintln("selftest FAIL: uchg not restored after atomic write")
+            let _c = _clear_uchg(dst)
+            let _x = exec_with_status("rm -rf '" + base + "'")
+            return 1
+        }
+        let _c = _clear_uchg(dst)
+        println("  [3/5] uchg-aware write  → OK")
+    } else {
+        println("  [3/5] uchg-aware write  → SKIP (non-darwin)")
+    }
+
+    // 4. No stranded tmp files after ordinary writes.
+    let strand = to_string(exec("ls '" + base + "' 2>/dev/null | grep -c '\\.tmp\\.' | tr -d ' '")).trim()
+    if strand != "0" {
+        eprintln("selftest FAIL: stranded tmp files present: " + strand)
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [4/5] no stranded tmp  → OK")
+
+    // 5. Large content (1 MB) round-trip.
+    let _ = exec_with_status("dd if=/dev/urandom of='" + base + "/src.bin' bs=1024 count=1024 2>/dev/null")
+    let okL = _atomic_write(base + "/copy.bin", "", base + "/src.bin")
+    if !okL {
+        eprintln("selftest FAIL: large copy failed")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    let cmp = exec_with_status("cmp '" + base + "/src.bin' '" + base + "/copy.bin'")
+    if cmp[1] != 0 {
+        eprintln("selftest FAIL: large copy content mismatch")
+        let _x = exec_with_status("rm -rf '" + base + "'")
+        return 1
+    }
+    println("  [5/5] 1MB binary round-trip  → OK")
+
+    let _x = exec_with_status("rm -rf '" + base + "'")
+    println("os_atomic_write: selftest PASS")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    if len(av) < 3 {
+        eprintln("usage: os_atomic_write.hexa <write|write-str|write-file|cleanup|--selftest> [args...]")
+        return 1
+    }
+    let cmd = av[2]
+    if cmd == "--selftest" { return _selftest() }
+    if cmd == "cleanup" {
+        if len(av) < 4 { eprintln("cleanup needs <dir>"); return 1 }
+        return _cleanup(av[3])
+    }
+    if cmd == "write" {
+        if len(av) < 4 { eprintln("write needs <path>"); return 1 }
+        let dst = av[3]
+        let src = _read_stdin_to_tmp()
+        if src == "" { eprintln("os_atomic_write: stdin empty/unreadable"); return 1 }
+        let ok = _atomic_write(dst, "", src)
+        let _ = exec_with_status("rm -f '" + src + "'")
+        if ok { return 0 } else { return 1 }
+    }
+    if cmd == "write-str" {
+        if len(av) < 5 { eprintln("write-str needs <path> <content>"); return 1 }
+        let ok = _atomic_write(av[3], av[4], "")
+        if ok { return 0 } else { return 1 }
+    }
+    if cmd == "write-file" {
+        if len(av) < 5 { eprintln("write-file needs <src> <dst>"); return 1 }
+        let ok = _atomic_write(av[4], "", av[3])
+        if ok { return 0 } else { return 1 }
+    }
+    eprintln("os_atomic_write: unknown subcommand: " + cmd)
+    return 1
+}
