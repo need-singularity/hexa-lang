@@ -406,8 +406,85 @@ fn ntype_skip(ntype: string) -> bool {
     return ntype == "seed" || ntype == "goal"
 }
 
+// ── critical-path membership cache (loaded once per call-site) ───────────
+// state/critical_path_prev.json format: {"critical_path":["<repo>#<id>", ...]}
+// On missing file or parse failure: returns []; boost is a no-op.
+fn _cp_path() -> string {
+    return STATE_DIR + "/critical_path_prev.json"
+}
+
+fn _cp_extract(js: string) -> [string] {
+    // Mirrors _extract_cp in roadmap_critical_path.hexa: tolerant scan for
+    // "critical_path": [ "key1", "key2", ... ]. Returns [] on absence.
+    let key = "\"critical_path\""
+    let ki = js.index_of(key)
+    if ki < 0 { return [] }
+    let rest = js.substring(ki + key.len(), js.len())
+    let colon = rest.index_of(":")
+    if colon < 0 { return [] }
+    let after = rest.substring(colon + 1, rest.len())
+    let lb = after.index_of("[")
+    if lb < 0 { return [] }
+    let rb = after.index_of("]")
+    if rb < 0 || rb <= lb { return [] }
+    let body = after.substring(lb + 1, rb)
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == "\"" {
+            let mut j: i64 = i + 1
+            while j < body.len() && body.substring(j, j + 1) != "\"" { j = j + 1 }
+            if j >= body.len() { break }
+            out = out.push(body.substring(i + 1, j))
+            i = j + 1
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Public loader. Caller invokes once per dispatch pass and passes the
+// resulting [string] to remaining_cost for per-node membership tests.
+// File-missing path: logs to stderr once (via eprintln) and returns [].
+fn load_cp_members() -> [string] {
+    let p = _cp_path()
+    if file_exists(p) == false {
+        eprintln("cp-boost: " + p + " missing, boost disabled")
+        return []
+    }
+    let body = _str(read_file(p))
+    if body.len() == 0 { return [] }
+    return _cp_extract(body)
+}
+
+// Linear membership test over [string]. n<50 in practice (CP size).
+fn _cp_contains(cp: [string], key: string) -> bool {
+    let mut i: i64 = 0
+    while i < cp.len() {
+        if cp[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Compute the "<project>#<id>" key for CP lookup. Falls back to
+// roadmap.id when node.project is empty so generic roadmaps still
+// participate if the CP file uses the roadmap id as repo-prefix.
+fn _cp_key(rm: Roadmap, n: Node) -> string {
+    let mut repo = n.project
+    if repo == "" { repo = rm.id }
+    return repo + "#" + n.id
+}
+
 // ── priority estimator (effective remaining cost proxy) ──────────────────
-fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+// CP boost: when the node's "<project>#<id>" key appears in `cp_members`,
+// the effective cost is multiplied by 2.0 so CP-head nodes outrank non-CP
+// peers of identical base cost in sort_by_priority_desc.
+// Pass cp_members=[] to disable the boost (e.g. selftest, or callers that
+// have not pre-loaded the CP set).
+fn remaining_cost(n: Node, K: f64, C: f64, cp_members: [string], cp_key: string) -> f64 {
     if is_done(n.status) { return 0.0 }
     let t = n.ntype
     let mut c: f64 = n.cost
@@ -421,7 +498,11 @@ fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
     }
     if n.status == "in_progress" {
         let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
-        return c * (1.0 - p)
+        c = c * (1.0 - p)
+    }
+    // CP boost applied last so it scales the fully-resolved effective cost.
+    if cp_members.len() > 0 && cp_key.len() > 0 && _cp_contains(cp_members, cp_key) {
+        c = c * 2.0
     }
     return c
 }
@@ -492,7 +573,11 @@ fn build_agent_prompt(rm: Roadmap, n: Node) -> string {
     let downstream = downstream_label(rm, n)
     let artifacts = artifacts_hint(n)
     let cost_s = to_string(n.cost)
-    let prio = remaining_cost(n, rm.K_target, rm.C_channel)
+    // Prompt-time priority is informational only; passing [] keeps the
+    // displayed number aligned with raw cost and avoids extra file reads
+    // when the prompt is rendered outside a dispatch loop.
+    let cp_empty: [string] = []
+    let prio = remaining_cost(n, rm.K_target, rm.C_channel, cp_empty, "")
 
     // project/phase 라벨 구성
     let mut proj = n.project
@@ -798,16 +883,19 @@ fn collect_actionable(rm: Roadmap) -> [Node] {
     return out
 }
 
-// priority desc sort (bubble, n<200).
-fn sort_by_priority_desc(rm: Roadmap, nodes: [Node]) -> [Node] {
+// priority desc sort (bubble, n<200). cp_members is loaded once by the
+// caller; pass [] to disable CP boost.
+fn sort_by_priority_desc(rm: Roadmap, nodes: [Node], cp_members: [string]) -> [Node] {
     let mut arr = nodes
     let n = arr.len()
     let mut a: i64 = 0
     while a < n {
         let mut b: i64 = 0
         while b < n - 1 - a {
-            let pa = remaining_cost(arr[b], rm.K_target, rm.C_channel)
-            let pb = remaining_cost(arr[b + 1], rm.K_target, rm.C_channel)
+            let kb0 = _cp_key(rm, arr[b])
+            let kb1 = _cp_key(rm, arr[b + 1])
+            let pa = remaining_cost(arr[b], rm.K_target, rm.C_channel, cp_members, kb0)
+            let pb = remaining_cost(arr[b + 1], rm.K_target, rm.C_channel, cp_members, kb1)
             if pa < pb {
                 let tmp = arr[b]
                 let mut rebuilt: [Node] = []
@@ -835,7 +923,10 @@ fn cmd_emit(path: string, dry: bool, max_slots: i64, emit_target: string) -> i64
         eprintln("WARN: no actionable nodes")
         return 1
     }
-    let sorted = sort_by_priority_desc(rm, actionable)
+    // Load CP set once per dispatch pass so sort + emit share one file read.
+    // Missing file => [] => boost no-op (load_cp_members already logs).
+    let cp_members = load_cp_members()
+    let sorted = sort_by_priority_desc(rm, actionable, cp_members)
 
     // dry-run 일 때는 slot state reset (테스트 격리).
     if dry { reset_slot_state() }
@@ -852,7 +943,7 @@ fn cmd_emit(path: string, dry: bool, max_slots: i64, emit_target: string) -> i64
             continue
         }
         let prompt = build_agent_prompt(rm, n)
-        let pr = remaining_cost(n, rm.K_target, rm.C_channel)
+        let pr = remaining_cost(n, rm.K_target, rm.C_channel, cp_members, _cp_key(rm, n))
         let ev = DispatchEvent {
             node_id: n.id,
             prompt: prompt,
