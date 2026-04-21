@@ -100,6 +100,26 @@ if [ "${HEXA_NO_LAUNCHD:-}" = "1" ]; then
     exec "$REAL" "$@"
 fi
 
+# ---------------- Re-entrance guard ----------------
+# If a parent hexa_stage0 in our ancestry already holds the lock (signaled via
+# inherited HEXA_STAGE0_OWNER env), skip lock acquisition. Prevents self-
+# deadlock when a hook/tool dispatched by `hexa run` recursively invokes
+# `hexa run inner.hexa` — otherwise both serialize on the same global
+# mkdir-lock and hang at the second acquisition (observed 2026-04-21:
+# airgenome hook manifest → re-entrance stall → 300s LOCK_WAIT timeout).
+#
+# Correctness: nested calls still route through Layer 2 wrapper (RSS cap),
+# so the per-job 4GB limit still applies. Only the top-level holder blocks
+# OTHER top-level calls.
+if [ -n "${HEXA_STAGE0_OWNER:-}" ] && kill -0 "$HEXA_STAGE0_OWNER" 2>/dev/null; then
+    if [ "$(uname -s)" = "Darwin" ] && [ -x "$WRAPPER" ]; then
+        HEXA_BIN="$REAL" "$WRAPPER" "$@"
+        exit $?
+    fi
+    watchdog_exec_real "$@"
+    exit $?
+fi
+
 # ---------------- Layer 1: serialize via mkdir lock ----------------
 # mkdir is atomic on POSIX. macOS has no flock(1) by default, and we refuse
 # to depend on Homebrew here. Loop with 0.5s sleep + deadline; stale lock
@@ -112,13 +132,25 @@ acquire_lock() {
             echo "$$" > "$LOCKDIR/pid" 2>/dev/null || true
             return 0
         fi
-        # Reap stale lock: holder PID dead?
+        # Reap stale lock: holder dead OR stuck >30 min.
+        # Second condition defends against long-running holders that themselves
+        # deadlocked before the re-entrance guard was in place (2026-04-21).
         if [ -r "$LOCKDIR/pid" ]; then
             local holder
             holder=$(cat "$LOCKDIR/pid" 2>/dev/null)
             if [ -n "$holder" ] && ! kill -0 "$holder" 2>/dev/null; then
                 rm -rf "$LOCKDIR" 2>/dev/null
                 continue
+            fi
+            if [ -d "$LOCKDIR" ]; then
+                local lock_age
+                lock_age=$(( $(date +%s) - $(stat -f %m "$LOCKDIR" 2>/dev/null || stat -c %Y "$LOCKDIR" 2>/dev/null || date +%s) ))
+                if [ "$lock_age" -gt 1800 ]; then
+                    echo "hexa_stage0 shim: force-reaping stuck lock pid=$holder age=${lock_age}s" >&2
+                    kill -KILL "$holder" 2>/dev/null || true
+                    rm -rf "$LOCKDIR" 2>/dev/null
+                    continue
+                fi
             fi
         fi
         # Deadline exceeded → fail loud so caller sees the problem.
@@ -141,6 +173,10 @@ trap release_lock EXIT INT TERM
 if ! acquire_lock; then
     exit 75   # EX_TEMPFAIL
 fi
+
+# Signal ownership to descendants (re-entrance guard). They'll see this env
+# inherited via exec and skip their own lock acquisition.
+export HEXA_STAGE0_OWNER=$$
 
 # ---------------- Layer 2: route through launchd for RSS cap ----------------
 # 2026-04-18 panic 재발: Darwin 에서 wrapper 부재 = hard fail (panic 리스크).
