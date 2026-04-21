@@ -3722,6 +3722,7 @@ HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
 // Bootstrap shim: hexa-level `join(arr, sep)` free-fn idiom in SSOT modules
 // emits `hexa_call2(join, arr, sep)` via TAG_FN lookup. Once hexa_v2 is rebuilt
 // from codegen_c2.hexa's join-builtin dispatch, this becomes unused.
+// (`split` was retired 2026-04-21 — codegen now emits hexa_str_split directly.)
 static HexaVal join;
 
 HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
@@ -6529,6 +6530,7 @@ static void _hexa_init_net_fn_shims(void);  // fwd decl — body in native/net.c
 static void _hexa_init_fn_shims(void) {
     if (_fn_shims_ready) return;
     // bootstrap free-fn shims (join, char_code, chr, bit_or)
+    // (`split` was retired 2026-04-21 — codegen_c2.hexa now emits hexa_str_split directly.)
     join       = hexa_fn_new((void*)hexa_str_join,        2);
     char_code  = hexa_fn_new((void*)hexa_char_code,       2);
     chr        = hexa_fn_new((void*)hexa_from_char_code,   1);

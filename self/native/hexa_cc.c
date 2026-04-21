@@ -7289,6 +7289,9 @@ static HexaIC __hexa_codegen_c2_ic_336 = {0};
 static HexaIC __hexa_codegen_c2_ic_337 = {0};
 static HexaIC __hexa_codegen_c2_ic_338 = {0};
 static HexaIC __hexa_codegen_c2_ic_339 = {0};
+/* Mirrors codegen_c2.hexa split-builtin 2-arg dispatch (see edit: `if name == "split"`). */
+static HexaIC __hexa_codegen_c2_ic_split_a = {0};
+static HexaIC __hexa_codegen_c2_ic_split_b = {0};
 static HexaIC __hexa_codegen_c2_ic_340 = {0};
 static HexaIC __hexa_codegen_c2_ic_341 = {0};
 static HexaIC __hexa_codegen_c2_ic_342 = {0};
@@ -10361,6 +10364,9 @@ HexaVal gen2_expr(HexaVal node) {
             if (hexa_truthy(hexa_eq(name, hexa_str("type_of")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_type_of("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_339), hexa_int(0)))), hexa_str(")")));
             }
+            if (hexa_truthy(hexa_eq(name, hexa_str("split")))) {
+                return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_str("hexa_str_split("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_split_a), hexa_int(0)))), hexa_str(", ")), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_split_b), hexa_int(1)))), hexa_str(")")));
+            }
             if (hexa_truthy(hexa_eq(name, hexa_str("sqrt")))) {
                 return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_str("hexa_sqrt("), gen2_expr(hexa_index_get(hexa_map_get_ic(node, "args", &__hexa_codegen_c2_ic_340), hexa_int(0)))), hexa_str(")")));
             }
@@ -12532,6 +12538,9 @@ HexaVal _is_builtin_name(HexaVal name) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("type_of")))) {
+        return __hexa_fn_arena_return(hexa_bool(1));
+    }
+    if (hexa_truthy(hexa_eq(name, hexa_str("split")))) {
         return __hexa_fn_arena_return(hexa_bool(1));
     }
     if (hexa_truthy(hexa_eq(name, hexa_str("sqrt")))) {
