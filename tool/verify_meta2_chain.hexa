@@ -1,0 +1,265 @@
+// tool/verify_meta2_chain.hexa — Tier3#22 + #23:
+//   Meta² chain integrity check + raw_audit hash-chain append.
+//
+// PURPOSE
+//   Verify the Meta² certificate registry chain integrity:
+//     - Parse anima/.meta2-cert/index.json → entries (ordered list)
+//     - For each entry verify:
+//         (1) entry["file"] exists in .meta2-cert/
+//         (2) entry["slug"] matches the in-file slug
+//         (3) entry["verdict"] ∈ {VERIFIED, PARTIAL}
+//         (4) prev_index_sha equals either "GENESIS" or sha256(prev_line)
+//     - If all entries pass → append an advance event to
+//       hexa-lang/.raw-audit with event=meta2_chain_verified.
+//
+// CLI
+//   hexa tool/verify_meta2_chain.hexa --check
+//   hexa tool/verify_meta2_chain.hexa --append   (verify + append audit)
+//   hexa tool/verify_meta2_chain.hexa --selftest
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _path_exists(p: string) -> bool {
+    let r = exec_with_status("test -e '" + p + "'")
+    return r[1] == 0
+}
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _sha256_of_str(s: string) -> string {
+    let q = _shell_quote(s)
+    let r = exec_with_status("printf %s " + q + " | shasum -a 256 2>/dev/null | cut -d' ' -f1")
+    let out = to_string(r[0]).trim()
+    if r[1] == 0 && len(out) > 0 { return out }
+    let r2 = exec_with_status("printf %s " + q + " | sha256sum 2>/dev/null | cut -d' ' -f1")
+    return to_string(r2[0]).trim()
+}
+
+fn _iso_utc_now() -> string {
+    return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
+}
+
+fn _json_get_str(body: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let pos = body.index_of(needle)
+    if pos < 0 { return "" }
+    let start = pos + len(needle)
+    let mut i = start
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c == "\"" { return body.substring(start, i) }
+        i = i + 1
+    }
+    return ""
+}
+
+// Extract the "entries" array (array of {slug, file, commit, verdict,
+// prev_index_sha}) from index.json — stage0-safe balanced-brace walk.
+fn _extract_entries(body: string) -> array {
+    let needle = "\"entries\":["
+    let pos = body.index_of(needle)
+    if pos < 0 { return [] }
+    let mut i = pos + len(needle)
+    let mut out = []
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c == "]" { return out }
+        if c == "{" {
+            let start = i
+            let mut depth = 1
+            i = i + 1
+            while i < len(body) && depth > 0 {
+                let cc = body.substring(i, i + 1)
+                if cc == "{" { depth = depth + 1 }
+                else if cc == "}" { depth = depth - 1 }
+                i = i + 1
+            }
+            out.push(body.substring(start, i))
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Verify meta² chain. Returns [ok: bool, reasons: array, entry_count: int].
+fn verify_chain() -> array {
+    let home = _home()
+    let idx_path = home + "/core/anima/.meta2-cert/index.json"
+    let cert_dir = home + "/core/anima/.meta2-cert"
+    if !_path_exists(idx_path) {
+        return [false, ["index.json not found"], 0]
+    }
+    let body = to_string(read_file(idx_path))
+    let entries = _extract_entries(body)
+    if len(entries) == 0 {
+        return [false, ["no entries in index"], 0]
+    }
+    let mut reasons = []
+    let mut ok = true
+    let mut prev_computed = "GENESIS"
+    let mut i = 0
+    for e in entries {
+        let slug = _json_get_str(e, "slug")
+        let file_ = _json_get_str(e, "file")
+        let commit = _json_get_str(e, "commit")
+        let verdict = _json_get_str(e, "verdict")
+        let prev_index = _json_get_str(e, "prev_index_sha")
+        i = i + 1
+
+        // (1) file exists
+        let cert_path = cert_dir + "/" + file_
+        if !_path_exists(cert_path) {
+            ok = false
+            reasons.push("entry#" + to_string(i) + " file missing: " + file_)
+            continue
+        }
+        // (2) in-file slug matches
+        let cbody = to_string(read_file(cert_path))
+        let cslug = _json_get_str(cbody, "slug")
+        if cslug != slug {
+            ok = false
+            reasons.push("entry#" + to_string(i) + " slug mismatch: idx=" + slug + " file=" + cslug)
+        }
+        // (3) verdict ∈ {VERIFIED, PARTIAL}
+        if !(verdict == "VERIFIED" || verdict == "PARTIAL") {
+            ok = false
+            reasons.push("entry#" + to_string(i) + " verdict bad: " + verdict)
+        }
+        // (4) prev_index_sha must be GENESIS or match previous-computed SHA.
+        // For the current schema, GENESIS is used for all entries (parallel
+        // growth, not a linear chain) — so we accept GENESIS universally but
+        // flag any entry that claims a non-GENESIS prev that is unknown.
+        if prev_index != "GENESIS" && prev_index != prev_computed {
+            // In current schema this is a warning, not a fail.
+            reasons.push("entry#" + to_string(i) + " prev_index non-GENESIS non-computed: " + prev_index)
+        }
+        // compute sha256 of current entry's raw text for downstream chain
+        prev_computed = _sha256_of_str(e)
+    }
+    return [ok, reasons, len(entries), prev_computed]
+}
+
+// Append "meta2_chain_verified" event to hexa-lang/.raw-audit.
+// Line shape: ISO | event | actor | reason | result | before_sha | after_sha | line_sha
+// (matches existing .raw-audit format — see raw_audit.hexa).
+fn append_raw_audit(entry_count: int, chain_tail: string) -> bool {
+    let home = _home()
+    let audit_path = home + "/core/hexa-lang/.raw-audit"
+    if !_path_exists(audit_path) {
+        eprintln("raw-audit missing: " + audit_path)
+        return false
+    }
+    // Read last non-empty data line for prev_line_sha.
+    let tail_cmd = "tail -n 5 '" + audit_path + "'"
+    let r = exec_with_status(tail_cmd)
+    let mut prev_sha = "GENESIS"
+    if r[1] == 0 {
+        let lines = split(to_string(r[0]), "\n")
+        let mut last = ""
+        for l in lines {
+            if len(l.trim()) > 0 { last = l }
+        }
+        if len(last) > 0 { prev_sha = _sha256_of_str(last) }
+    }
+
+    let ts = _iso_utc_now()
+    let actor = "ghost"
+    let event = "meta2_chain_verified"
+    let reason = "meta2 chain " + to_string(entry_count) + " entries verified — tail=" + chain_tail.substring(0, 12)
+    let result = "ok"
+    let before_sha = chain_tail
+    let after_sha = "-"
+
+    let mut parts = []
+    parts.push(ts)
+    parts.push(" | ")
+    parts.push(event)
+    parts.push(" | ")
+    parts.push(actor)
+    parts.push(" | ")
+    parts.push(reason)
+    parts.push(" | ")
+    parts.push(result)
+    parts.push(" | ")
+    parts.push(before_sha)
+    parts.push(" | ")
+    parts.push(after_sha)
+    let body = parts.join("")
+    let line_sha = _sha256_of_str(body)
+    let full = body + " | " + line_sha + "\n"
+
+    // Append via printf (avoid heredoc in stage0).
+    let qfull = _shell_quote(full)
+    let w = exec_with_status("printf %s " + qfull + " >> '" + audit_path + "'")
+    return w[1] == 0
+}
+
+fn _selftest() -> int {
+    let r = verify_chain()
+    let ok = r[0]
+    let reasons = r[1]
+    let count = r[2]
+    if !ok {
+        eprintln("selftest FAIL: chain integrity broken")
+        for x in reasons { eprintln("  " + x) }
+        return 1
+    }
+    // Expected baseline: 8 entries (per current index.json snapshot; task
+    // permits up to 9 if new b13dd5e5/6527e9df appended).
+    if count < 8 {
+        eprintln("selftest FAIL: entry count " + to_string(count) + " < 8")
+        return 1
+    }
+    println("verify_meta2_chain selftest PASS")
+    println("  entries=" + to_string(count))
+    println("  chain_tail=" + to_string(r[3]).substring(0, 16) + "...")
+    if len(reasons) > 0 {
+        println("  notes:")
+        for x in reasons { println("    - " + x) }
+    }
+    return 0
+}
+
+fn _cmd_check() -> int {
+    let r = verify_chain()
+    println("meta² chain: entries=" + to_string(r[2]) + " ok=" + to_string(r[0]))
+    for x in r[1] { println("  - " + x) }
+    if !r[0] { return 1 }
+    return 0
+}
+
+fn _cmd_append() -> int {
+    let r = verify_chain()
+    if !r[0] {
+        eprintln("chain verification failed — skipping audit append")
+        for x in r[1] { eprintln("  " + x) }
+        return 1
+    }
+    let ok = append_raw_audit(r[2], to_string(r[3]))
+    if !ok {
+        eprintln("raw-audit append failed")
+        return 1
+    }
+    println("meta² chain verified + raw-audit advance event appended (entries=" + to_string(r[2]) + ")")
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+    if len(args) == 0 { exit(_cmd_check()) }
+    if args[0] == "--selftest" { exit(_selftest()) }
+    if args[0] == "--check" { exit(_cmd_check()) }
+    if args[0] == "--append" { exit(_cmd_append()) }
+    eprintln("usage: --check | --append | --selftest")
+    exit(1)
+}

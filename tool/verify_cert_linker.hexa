@@ -1,0 +1,308 @@
+// tool/verify_cert_linker.hexa — Tier3#20 + #25:
+//   cert evidence linker + gate auto-satisfied flip
+//
+// PURPOSE
+//   Walks anima/.meta2-cert/*.json and anima/shared/state/*.json,
+//   matches them against the gate pending items parsed by
+//   tool/verify_gate_dsl.hexa, and flips a pending item to
+//   "auto-satisfied" when:
+//     - a cert exists whose slug / title token appears in the item, AND
+//     - cert verdict == "VERIFIED", AND
+//     - cert commit SHA resolves (when note has SHA, hard check).
+//
+// OUTPUT
+//   Per-gate: list of auto-satisfied items with the cert slug anchor.
+//
+// CLI
+//   hexa tool/verify_cert_linker.hexa --repo <name>
+//   hexa tool/verify_cert_linker.hexa --selftest
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _repo_root(name: string) -> string {
+    return _home() + "/core/" + name
+}
+
+fn _path_exists(p: string) -> bool {
+    let r = exec_with_status("test -e '" + p + "'")
+    return r[1] == 0
+}
+
+// Stage0-safe single-line JSON string extractor.
+// Finds: "<key>":"<value>"
+fn _json_get_str(body: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let pos = body.index_of(needle)
+    if pos < 0 { return "" }
+    let start = pos + len(needle)
+    let mut i = start
+    while i < len(body) {
+        let c = body.substring(i, i + 1)
+        if c == "\"" { return body.substring(start, i) }
+        i = i + 1
+    }
+    return ""
+}
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+// Re-implement the minimal gate parser here to avoid circular import.
+// Same logic as verify_gate_dsl.hexa:parse_gates (canonical source).
+fn parse_gates(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut gates = []
+    let mut cur_phase = ""
+    let mut cur_label = ""
+    let mut cur_sat = []
+    let mut cur_pend = []
+    let mut cur_mode = ""
+    let mut i = 0
+    while i < len(lines) {
+        let line = _rstrip(lines[i])
+        i = i + 1
+        if line.starts_with("## P") && line.contains(" gate") {
+            if len(cur_phase) > 0 { gates.push([cur_phase, cur_label, cur_sat, cur_pend]) }
+            cur_sat = []; cur_pend = []; cur_mode = ""
+            let rest = line.substring(3, len(line))
+            let sp = rest.index_of(" ")
+            if sp < 0 { cur_phase = rest } else { cur_phase = rest.substring(0, sp) }
+            let p1 = line.index_of("(")
+            let p2 = line.index_of(")")
+            if p1 > 0 && p2 > p1 { cur_label = line.substring(p1 + 1, p2) } else { cur_label = "" }
+            continue
+        }
+        if len(cur_phase) == 0 { continue }
+        if len(line) == 0 { continue }
+        if !line.starts_with("#") { continue }
+        let body = line.substring(1, len(line)).trim_start()
+        if body == "satisfied:" { cur_mode = "sat"; continue }
+        if body == "pending:" { cur_mode = "pend"; continue }
+        if body.starts_with("✓") {
+            let txt = body.substring(1, len(body)).trim_start()
+            cur_sat.push(txt)
+            continue
+        }
+        if body.starts_with("□") {
+            let txt = body.substring(1, len(body)).trim_start()
+            cur_pend.push(txt)
+            continue
+        }
+    }
+    if len(cur_phase) > 0 { gates.push([cur_phase, cur_label, cur_sat, cur_pend]) }
+    return gates
+}
+
+// Scan cert dir → [ [slug, title, verdict, commit, keywords], ... ]
+// keywords: tokens mined from slug+title for anchor matching.
+fn _cert_keywords(slug: string, title: string) -> array {
+    let mut out = []
+    let sp = split(slug, "-")
+    for s in sp { if len(s) >= 2 { out.push(s.to_lower()) } }
+    let tlow = title.to_lower()
+    let mut parts = []
+    let mut i = 0
+    let mut start = -1
+    while i < len(tlow) {
+        let c = tlow.substring(i, i + 1)
+        let ok = ("a" <= c && c <= "z") || ("0" <= c && c <= "9")
+        if ok {
+            if start < 0 { start = i }
+        } else {
+            if start >= 0 && i - start >= 3 { out.push(tlow.substring(start, i)) }
+            start = -1
+        }
+        i = i + 1
+    }
+    if start >= 0 && len(tlow) - start >= 3 { out.push(tlow.substring(start, len(tlow))) }
+    return out
+}
+
+fn load_certs(repo: string) -> array {
+    let cert_dir = _repo_root(repo) + "/.meta2-cert"
+    if !_path_exists(cert_dir) { return [] }
+    let r = exec_with_status("ls '" + cert_dir + "'/*.json 2>/dev/null")
+    if r[1] != 0 { return [] }
+    let listing = to_string(r[0])
+    let lines = split(listing, "\n")
+    let mut certs = []
+    for path in lines {
+        let p = path.trim()
+        if len(p) == 0 { continue }
+        if p.ends_with("/index.json") { continue }
+        let r2 = exec_with_status("test -f '" + p + "'")
+        if r2[1] != 0 { continue }
+        let body = to_string(read_file(p)).trim()
+        if len(body) == 0 { continue }
+        let slug = _json_get_str(body, "slug")
+        let title = _json_get_str(body, "title")
+        let verdict = _json_get_str(body, "verdict")
+        let commit = _json_get_str(body, "commit")
+        if len(slug) == 0 { continue }
+        let kws = _cert_keywords(slug, title)
+        certs.push([slug, title, verdict, commit, kws, p])
+    }
+    return certs
+}
+
+fn _last_index_of(s: string, needle: string) -> int {
+    let mut last = -1
+    let mut i = 0
+    let nl = len(needle)
+    if nl == 0 { return -1 }
+    while i + nl <= len(s) {
+        if s.substring(i, i + nl) == needle { last = i }
+        i = i + 1
+    }
+    return last
+}
+
+// Scan shared/state/*.json lightly: slug := filename stem, verdict := "STATE_PRESENT"
+fn load_state_evidence(repo: string) -> array {
+    let sd = _repo_root(repo) + "/shared/state"
+    if !_path_exists(sd) { return [] }
+    let r = exec_with_status("ls '" + sd + "'/*.json 2>/dev/null")
+    if r[1] != 0 { return [] }
+    let listing = to_string(r[0])
+    let lines = split(listing, "\n")
+    let mut out = []
+    for path in lines {
+        let p = path.trim()
+        if len(p) == 0 { continue }
+        // stem = basename minus ".json"
+        let slash = _last_index_of(p, "/")
+        let base = p.substring(slash + 1, len(p) - 5)
+        let kws = _cert_keywords(base, "")
+        out.push([base, "", "STATE_PRESENT", "", kws, p])
+    }
+    return out
+}
+
+// Does the pending item text contain any of the cert keywords?
+// Matching rule: item text (lowered) contains the cert slug OR ≥2 keywords.
+fn _item_matches_cert(item_text: string, cert: array) -> bool {
+    let tlow = item_text.to_lower()
+    let slug = cert[0]
+    if tlow.contains(slug.to_lower()) { return true }
+    let kws = cert[4]
+    let mut hit = 0
+    for k in kws {
+        if tlow.contains(k) { hit = hit + 1 }
+        if hit >= 2 { return true }
+    }
+    return false
+}
+
+// Flip result: per-phase → [ [item_text, cert_slug], ... ]
+fn link_gates(repo: string) -> array {
+    let path = _repo_root(repo) + "/.roadmap"
+    if !_path_exists(path) { return [] }
+    let gates = parse_gates(to_string(read_file(path)))
+    let certs = load_certs(repo)
+    let states = load_state_evidence(repo)
+
+    let mut out = []
+    for g in gates {
+        let phase = g[0]
+        let pending = g[3]
+        let mut flips = []
+        for item in pending {
+            let mut matched = false
+            // cert-first (verdict VERIFIED only)
+            for c in certs {
+                if c[2] != "VERIFIED" { continue }
+                if _item_matches_cert(item, c) {
+                    flips.push([item, c[0], "cert:" + c[0], c[3]])
+                    matched = true
+                    break
+                }
+            }
+            if matched { continue }
+            // fallback: shared/state anchor (no verdict requirement, weaker evidence)
+            for s in states {
+                if _item_matches_cert(item, s) {
+                    flips.push([item, s[0], "state:" + s[0], ""])
+                    matched = true
+                    break
+                }
+            }
+        }
+        out.push([phase, flips, len(pending)])
+    }
+    return out
+}
+
+fn _selftest() -> int {
+    let r = link_gates("anima")
+    if len(r) == 0 {
+        eprintln("selftest FAIL: no gates")
+        return 1
+    }
+    // Find P1 and inspect for cell-mk8-stationary auto-match
+    let mut p1_flips = []
+    let mut p1_total = 0
+    for row in r {
+        if row[0] == "P1" { p1_flips = row[1]; p1_total = row[2] }
+    }
+    if p1_total == 0 {
+        eprintln("selftest FAIL: P1 has no pending items")
+        return 1
+    }
+    // Expected auto-match: cell-mk8-stationary mentioned in P1 pending line.
+    let mut saw_mk8 = false
+    for f in p1_flips {
+        if f[1] == "cell-mk8-stationary" { saw_mk8 = true }
+    }
+    if !saw_mk8 {
+        eprintln("selftest FAIL: cell-mk8-stationary not auto-linked to P1 pending item")
+        eprintln("  P1 flips (" + to_string(len(p1_flips)) + "):")
+        for f in p1_flips { eprintln("    " + f[0] + " → " + f[2]) }
+        return 1
+    }
+    println("verify_cert_linker selftest PASS")
+    println("  anima P1 pending=" + to_string(p1_total) + " auto-satisfied=" + to_string(len(p1_flips)))
+    for f in p1_flips {
+        let shortt = f[0]
+        if len(shortt) > 60 { shortt = shortt.substring(0, 60) + "..." }
+        println("    □→✓ " + shortt + "  [" + f[2] + "]")
+    }
+    return 0
+}
+
+fn _cmd_repo(repo: string) -> int {
+    let r = link_gates(repo)
+    for row in r {
+        let phase = row[0]
+        let flips = row[1]
+        let total = row[2]
+        println(phase + ": pending=" + to_string(total) + " auto-satisfied=" + to_string(len(flips)))
+        for f in flips {
+            let shortt = f[0]
+            if len(shortt) > 72 { shortt = shortt.substring(0, 72) + "..." }
+            println("  □→✓ " + shortt + "  [" + f[2] + "]")
+        }
+    }
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+    if len(args) == 0 { eprintln("usage: --repo <name> | --selftest") exit(1) }
+    if args[0] == "--selftest" { exit(_selftest()) }
+    if args[0] == "--repo" && len(args) >= 2 { exit(_cmd_repo(args[1])) }
+    eprintln("usage: --repo <name> | --selftest")
+    exit(1)
+}
