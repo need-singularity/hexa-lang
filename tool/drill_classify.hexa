@@ -1,0 +1,282 @@
+#!hexa lax
+// tool/drill_classify.hexa — DRILL absorption/saturation auto-classifier
+//
+// PURPOSE
+//   Given a drill iteration history (jsonl, one state object per line),
+//   emit exactly one verdict on stdout:
+//     saturated — hash(v_n) == hash(v_{n-1})        (fixpoint, real discovery)
+//     absorbed  — overlap(v_n, primitives)/|v_n| > absorption_rate_max
+//                 (folded back into known atlas entries)
+//     ongoing   — neither of the above, keep drilling
+//
+// POLICY
+//   * no LLM judge — hash equality + structural overlap only
+//   * atlas.n6 (shared/n6/atlas.n6) is the SSOT primitive set — no stub
+//   * deterministic over the same (history, atlas) pair
+//
+// USAGE
+//   hexa tool/drill_classify.hexa [--criteria <path>] <history.jsonl>
+//
+// EXIT CODES
+//   0 — verdict emitted on stdout
+//   2 — I/O / arg error
+
+// ─── project root (SSOT locations are relative to repo root) ─────
+fn _project_root() {
+    let av = argv()
+    if len(av) >= 2 {
+        let script = av[1]
+        let r = exec("cd \"$(dirname '" + script + "')/../\" 2>/dev/null && pwd").trim()
+        if r != "" { return r }
+    }
+    return exec("pwd").trim()
+}
+
+let ROOT = _project_root()
+let DEFAULT_ATLAS    = ROOT + "/shared/n6/atlas.n6"
+let DEFAULT_CRITERIA = ROOT + "/shared/config/drill_breakthrough_criteria.json"
+
+// ─── byte-level char helper (stage0-safe, no s[i] subscript) ─────
+fn _ch(s, i) {
+    return s.substring(i, i + 1)
+}
+
+// ─── sha256 helper (shell shasum — idiom shared with fixpoint_v3_v4) ──
+fn _sha_of(text) {
+    let p = "/tmp/.drill_classify_sha_tmp"
+    write_file(p, text)
+    let r = exec_with_status("shasum -a 256 " + p + " 2>/dev/null | cut -d' ' -f1")
+    exec("rm -f " + p)
+    if r[1] != 0 { return "ERR" }
+    return r[0].trim()
+}
+
+// ─── canonicalize: sort "k":v pairs so hash is permutation-invariant ──
+fn _canon_state(state) {
+    let mut s = state.trim()
+    if len(s) >= 2 && _ch(s, 0) == "{" && _ch(s, len(s) - 1) == "}" {
+        s = s.substring(1, len(s) - 1)
+    }
+    let parts = s.split(",")
+    let mut cleaned = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if p != "" { cleaned.push(p) }
+        i = i + 1
+    }
+    // bubble sort — tiny N, stage0-friendly
+    let n = len(cleaned)
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            if cleaned[a] > cleaned[b] {
+                let t = cleaned[a]
+                cleaned[a] = cleaned[b]
+                cleaned[b] = t
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return "{" + cleaned.join(",") + "}"
+}
+
+// ─── is_saturated: hash(v_n) == hash(v_{n-1}) ────────────────────
+fn is_saturated(history) {
+    let n = len(history)
+    if n < 2 { return false }
+    let a = _sha_of(_canon_state(history[n - 1]))
+    let b = _sha_of(_canon_state(history[n - 2]))
+    if a == "ERR" || b == "ERR" { return false }
+    return a == b
+}
+
+// ─── primitives_load: parse atlas.n6 @P/@C/@L identifiers ────────
+fn primitives_load() {
+    let mut p = env("DRILL_ATLAS_PATH")
+    if p == "" { p = DEFAULT_ATLAS }
+    let mut names = []
+    if !file_exists(p) { return names }
+    let raw = to_string(read_file(p))
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if len(ln) >= 3 {
+            let head2 = ln.substring(0, 2)
+            if head2 == "@P" || head2 == "@C" || head2 == "@L" {
+                // "@P name = ... :: ..." — identifier is the first token after "@P "
+                let rest = ln.substring(3, len(ln)).trim()
+                let mut j = 0
+                let m = len(rest)
+                let mut done = false
+                while j < m && !done {
+                    let c = _ch(rest, j)
+                    if c == " " || c == "=" || c == ":" || c == "\t" {
+                        done = true
+                    } else {
+                        j = j + 1
+                    }
+                }
+                if j > 0 {
+                    let name = rest.substring(0, j).trim()
+                    if name != "" { names.push(name) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return names
+}
+
+// ─── extract top-level keys from a flat single-line json object ──
+fn _state_keys(state) {
+    let mut s = state.trim()
+    if len(s) >= 2 && _ch(s, 0) == "{" && _ch(s, len(s) - 1) == "}" {
+        s = s.substring(1, len(s) - 1)
+    }
+    let mut keys = []
+    let parts = s.split(",")
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if len(p) > 2 && _ch(p, 0) == "\"" {
+            let rest = p.substring(1, len(p))
+            let mut j = 0
+            let m = len(rest)
+            let mut done = false
+            while j < m && !done {
+                if _ch(rest, j) == "\"" {
+                    done = true
+                } else {
+                    j = j + 1
+                }
+            }
+            if j > 0 {
+                let k = rest.substring(0, j)
+                if k != "" { keys.push(k) }
+            }
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+// ─── absorption_rate: overlap(state_keys, primitives) / |state_keys|
+fn absorption_rate(state, primitives) {
+    let keys = _state_keys(state)
+    let n = len(keys)
+    if n == 0 { return 0.0 }
+    let mut overlap = 0
+    let mut i = 0
+    while i < n {
+        let k = keys[i]
+        let mut j = 0
+        let m = len(primitives)
+        let mut hit = false
+        while j < m && !hit {
+            if primitives[j] == k { hit = true }
+            j = j + 1
+        }
+        if hit { overlap = overlap + 1 }
+        i = i + 1
+    }
+    return (to_float(overlap)) / (to_float(n))
+}
+
+// ─── criteria loader — minimal: only absorption_rate_max is used ─
+fn _criteria_absorption_max(path) {
+    if !file_exists(path) { return 0.3 }
+    let raw = to_string(read_file(path))
+    let idx = raw.index_of("absorption_rate_max")
+    if idx < 0 { return 0.3 }
+    let tail = raw.substring(idx, len(raw))
+    let colon = tail.index_of(":")
+    if colon < 0 { return 0.3 }
+    let after = tail.substring(colon + 1, len(tail)).trim()
+    let mut j = 0
+    let m = len(after)
+    let mut done = false
+    while j < m && !done {
+        let c = _ch(after, j)
+        if c == "," || c == "}" || c == "\n" || c == " " {
+            done = true
+        } else {
+            j = j + 1
+        }
+    }
+    let num = after.substring(0, j).trim()
+    if num == "" { return 0.3 }
+    return to_float(num)
+}
+
+// ─── main: read history.jsonl → verdict ──────────────────────────
+fn _load_history(path) {
+    let mut out = []
+    if !file_exists(path) { return out }
+    let raw = to_string(read_file(path))
+    let lines = raw.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if ln != "" { out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+fn classify(history_path, criteria_path) {
+    let history = _load_history(history_path)
+    if len(history) == 0 {
+        eprintln("[drill_classify] empty history: " + history_path)
+        return "error"
+    }
+    let abs_max = _criteria_absorption_max(criteria_path)
+    let primitives = primitives_load()
+    let last = history[len(history) - 1]
+    let rate = absorption_rate(last, primitives)
+    let sat  = is_saturated(history)
+
+    // saturation takes precedence — fixpoint is the strongest signal
+    if sat { return "saturated" }
+    if rate > abs_max { return "absorbed" }
+    return "ongoing"
+}
+
+// ─── is_main guard (import-safe) ─────────────────────────────────
+let _av = argv()
+
+fn _is_main() {
+    if len(_av) < 2 { return false }
+    let s = _av[1]
+    if s.ends_with("/drill_classify.hexa") { return true }
+    if s == "drill_classify.hexa" { return true }
+    return false
+}
+
+if _is_main() {
+    let n = len(_av)
+    let mut history_path = ""
+    let mut criteria_path = DEFAULT_CRITERIA
+    let mut i = 2
+    while i < n {
+        let a = _av[i]
+        if a == "--criteria" && i + 1 < n {
+            criteria_path = _av[i + 1]
+            i = i + 2
+        } else {
+            history_path = a
+            i = i + 1
+        }
+    }
+    if history_path == "" {
+        eprintln("usage: hexa tool/drill_classify.hexa [--criteria <path>] <history.jsonl>")
+        exit(2)
+    }
+    let verdict = classify(history_path, criteria_path)
+    if verdict == "error" { exit(2) }
+    println(verdict)
+    exit(0)
+}
