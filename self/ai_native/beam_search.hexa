@@ -1,0 +1,214 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/beam_search.hexa — AI-native ROI #170
+//
+//  @beam_search decoding scaffold — min viable drop.
+//
+//  Purpose:
+//    Carve the semantic surface for a `@beam_search(width=..)` attribute
+//    on decoder fns and provide a dummy runtime hook that future
+//    sampling/decoding paths can plug into. No real model / softmax /
+//    token vocab wiring — that lands in a follow-up ROI.
+//
+//  Semantics of @beam_search:
+//    Annotation on a decoder step fn. At each step the runtime keeps
+//    the top `width` partial hypotheses by cumulative log-prob, expands
+//    each, and prunes back to `width`. A stub is-done predicate and
+//    cumulative score are the only contracts the scaffold exposes.
+//
+//  Public API (scaffold):
+//    beam_meta()                              -> attr metadata record
+//    bs_init(width, start_token)              -> BeamState
+//    bs_step(state, expand_fn)                -> BeamState   (dummy hook)
+//    bs_best(state)                           -> Hypothesis
+//    bs_decode(state, expand_fn, max_steps)   -> Hypothesis  (dummy loop)
+//
+//  Runtime hook:
+//    `expand_fn(hyp)` must return a list of Hypothesis successors.
+//    The scaffold supplies `bs_dummy_expand` as a minimal expander so
+//    tests and downstream stubs can exercise the plumbing before a
+//    real decoder model is wired in.
+//
+//  Hexa grammar notes (G5/HX3 pitfalls):
+//    • struct literal never appears inside `if` head — bind a local.
+//    • slice / arithmetic index: any `a[(i+1)..j]` uses parens.
+//    • @beam_search is a surface-only marker (attr_kind_from_name
+//      returns the identity string for unknown names — see
+//      self/token.hexa). Lowering passes may later recognise it.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Hypothesis + BeamState structs ─────────────────────────────────
+
+struct Hypothesis {
+    tokens: array,   // token id sequence built so far
+    score:  float,   // cumulative log-prob (higher = better)
+    done:   bool     // EOS / length-cap reached
+}
+
+struct BeamState {
+    beams:     array,   // array<Hypothesis>, size <= width
+    width:     int,
+    step_idx:  int
+}
+
+// ── attr metadata (scaffold-level; mirrors attrs/core AttrMeta shape) ─
+//  Kept local — no dependency on self/attrs/* so this file stays
+//  standalone for the stage0 interpreter.
+
+struct BeamAttrMeta {
+    name:        string,
+    category:    string,
+    purpose:     string,
+    requires:    string,
+    implemented: bool
+}
+
+@pure
+fn beam_meta() {
+    return BeamAttrMeta {
+        name:        "beam_search",
+        category:    "ai_native",
+        purpose:     "빔 탐색 디코딩 — top-k partial hypotheses, prune to width per step",
+        requires:    "expand_fn: Hypothesis -> [Hypothesis]; width > 0",
+        implemented: false
+    }
+}
+
+// ── constructor ────────────────────────────────────────────────────
+
+fn bs_init(width, start_token) {
+    let seed = Hypothesis {
+        tokens: [start_token],
+        score:  0.0,
+        done:   false
+    }
+    return BeamState {
+        beams:    [seed],
+        width:    width,
+        step_idx: 0
+    }
+}
+
+// ── internal: insertion sort on small beam list (desc by score) ────
+//  n <= width (scaffold width small); O(n²) is fine.
+
+@pure
+fn bs_sort_desc(hyps) {
+    let n = len(hyps)
+    let mut out = hyps
+    let mut i = 1
+    while i < n {
+        let cur = out[i]
+        let mut j = i
+        let mut stop = false
+        while j > 0 {
+            if stop {
+                // no-op — hexa lacks break in nested guard, use flag
+            } else {
+                let prev = out[j - 1]
+                if prev.score < cur.score {
+                    out[j] = prev
+                    j = j - 1
+                } else {
+                    stop = true
+                }
+            }
+        }
+        out[j] = cur
+        i = i + 1
+    }
+    return out
+}
+
+// ── internal: prune ranked list to width ───────────────────────────
+
+@pure
+fn bs_take(hyps, width) {
+    let n = len(hyps)
+    let mut out = []
+    let mut i = 0
+    let cap = width
+    while i < n {
+        if i < cap { out = out + [hyps[i]] }
+        i = i + 1
+    }
+    return out
+}
+
+// ── dummy expand hook ──────────────────────────────────────────────
+//  Produces two successors per hypothesis:
+//    tok+1 with -0.1   and   tok+2 with -0.3 log-prob.
+//  Purely for scaffold plumbing — not a real LM.
+
+@pure
+fn bs_dummy_expand(hyp) {
+    if hyp.done { return [hyp] }
+    let last = hyp.tokens[len(hyp.tokens) - 1]
+    let a_tokens = hyp.tokens + [last + 1]
+    let b_tokens = hyp.tokens + [last + 2]
+    let a = Hypothesis {
+        tokens: a_tokens,
+        score:  hyp.score - 0.1,
+        done:   false
+    }
+    let b = Hypothesis {
+        tokens: b_tokens,
+        score:  hyp.score - 0.3,
+        done:   false
+    }
+    return [a, b]
+}
+
+// ── one decoding step ──────────────────────────────────────────────
+//  Expand every live beam, merge, sort by score desc, prune to width.
+//  `expand_fn` is the runtime hook — scaffold accepts any fn with
+//  signature  Hypothesis -> [Hypothesis].
+
+@hot
+fn bs_step(state: BeamState, expand_fn) {
+    let mut merged = []
+    let n = len(state.beams)
+    let mut i = 0
+    while i < n {
+        let succ = expand_fn(state.beams[i])
+        let m = len(succ)
+        let mut k = 0
+        while k < m {
+            merged = merged + [succ[k]]
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let ranked = bs_sort_desc(merged)
+    let pruned = bs_take(ranked, state.width)
+    return BeamState {
+        beams:    pruned,
+        width:    state.width,
+        step_idx: state.step_idx + 1
+    }
+}
+
+// ── terminal query: best hypothesis ────────────────────────────────
+
+@pure
+fn bs_best(state: BeamState) {
+    let n = len(state.beams)
+    if n == 0 {
+        return Hypothesis { tokens: [], score: 0.0, done: true }
+    }
+    let ranked = bs_sort_desc(state.beams)
+    return ranked[0]
+}
+
+// ── driving loop (dummy hook orchestrator) ─────────────────────────
+//  Runs up to max_steps; real code would check hyp.done / EOS.
+//  Kept deliberately thin — scaffold level only.
+
+fn bs_decode(state: BeamState, expand_fn, max_steps) {
+    let mut cur = state
+    let mut s = 0
+    while s < max_steps {
+        cur = bs_step(cur, expand_fn)
+        s = s + 1
+    }
+    return bs_best(cur)
+}

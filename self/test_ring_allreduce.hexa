@@ -1,0 +1,431 @@
+// ===================================================================
+//  test_ring_allreduce.hexa — Unit tests for ring allreduce primitive
+//
+//  roi.json #187 — algo_rewrite: ring-allreduce 분산 프리미티브
+//
+//  Validates:
+//    - Ring topology wrap-around (ra_next / ra_prev / ra_mod)
+//    - Chunk partitioning (ra_chunks)
+//    - Ring allreduce sum matches the naive reference for N=2,3,4,5
+//    - All ranks hold the identical reduced tensor (consistency)
+//    - Mean variant divides by N
+//    - Identity: allreduce(zeros) == zeros
+//    - Bandwidth metrics: 2*(N-1)/N * size, total steps = 2*(N-1)
+//
+//  Run (top-level):
+//    PATH=$HOME/.cargo/bin:$PATH ./hexa self/test_ring_allreduce.hexa
+//
+//  Module source inlined below — codegen import not yet wired for
+//  standalone test files (see self/test_collective_comm.hexa precedent).
+// ===================================================================
+
+// -- inlined from self/distributed/ring_allreduce.hexa --
+
+fn ra_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+fn ra_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+fn ra_mod(a, m) {
+    ((a % m) + m) % m
+}
+
+fn ra_next(rank, n_ranks) {
+    (rank + 1) % n_ranks
+}
+
+fn ra_prev(rank, n_ranks) {
+    ra_mod(rank - 1, n_ranks)
+}
+
+fn ra_chunks(n, n_chunks) {
+    let mut out = []
+    let mut c = 0
+    while c < n_chunks {
+        let begin = (n * c) / n_chunks
+        let end = (n * (c + 1)) / n_chunks
+        out.push([begin, end])
+        c = c + 1
+    }
+    out
+}
+
+fn ra_allreduce_sum(tensors, n_ranks) {
+    let n = len(tensors[0])
+    let n_chunks = n_ranks
+    let chunks = ra_chunks(n, n_chunks)
+
+    let mut bufs = []
+    let mut r = 0
+    while r < n_ranks {
+        bufs.push(ra_copy(tensors[r]))
+        r = r + 1
+    }
+
+    // Phase 1: reduce-scatter (N-1 steps)
+    let mut step = 0
+    while step < n_ranks - 1 {
+        let mut nbufs = []
+        let mut rr = 0
+        while rr < n_ranks {
+            nbufs.push(ra_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < n_ranks {
+            let send_chunk = ra_mod(rr - step, n_chunks)
+            let dst = ra_next(rr, n_ranks)
+            let pair = chunks[send_chunk]
+            let cbegin = pair[0]
+            let cend = pair[1]
+            let clen = cend - cbegin
+            let mut i = 0
+            while i < clen {
+                nbufs[dst][cbegin + i] = nbufs[dst][cbegin + i] + bufs[rr][cbegin + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = nbufs
+        step = step + 1
+    }
+
+    // Phase 2: all-gather (N-1 steps)
+    step = 0
+    while step < n_ranks - 1 {
+        let mut nbufs = []
+        let mut rr = 0
+        while rr < n_ranks {
+            nbufs.push(ra_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < n_ranks {
+            let send_chunk = ra_mod(rr - step + 1, n_chunks)
+            let dst = ra_next(rr, n_ranks)
+            let pair = chunks[send_chunk]
+            let cbegin = pair[0]
+            let cend = pair[1]
+            let clen = cend - cbegin
+            let mut i = 0
+            while i < clen {
+                nbufs[dst][cbegin + i] = bufs[rr][cbegin + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = nbufs
+        step = step + 1
+    }
+
+    bufs
+}
+
+fn ra_allreduce_mean(tensors, n_ranks) {
+    let reduced = ra_allreduce_sum(tensors, n_ranks)
+    let n = len(reduced[0])
+    let div = to_float(n_ranks)
+    let mut out = []
+    let mut r = 0
+    while r < n_ranks {
+        let mut v = []
+        let mut i = 0
+        while i < n {
+            v.push(reduced[r][i] / div)
+            i = i + 1
+        }
+        out.push(v)
+        r = r + 1
+    }
+    out
+}
+
+fn ra_allreduce_naive(tensors, n_ranks) {
+    let n = len(tensors[0])
+    let mut sum = ra_zeros(n)
+    let mut r = 0
+    while r < n_ranks {
+        let mut i = 0
+        while i < n {
+            sum[i] = sum[i] + tensors[r][i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    let mut out = []
+    r = 0
+    while r < n_ranks {
+        out.push(ra_copy(sum))
+        r = r + 1
+    }
+    out
+}
+
+fn ra_volume(tensor_size, n_ranks) {
+    let n = to_float(n_ranks)
+    2.0 * (n - 1.0) / n * to_float(tensor_size)
+}
+
+fn ra_total_steps(n_ranks) {
+    2 * (n_ranks - 1)
+}
+
+// -- end inlined --
+
+// ── Test harness ─────────────────────────────────────────────────
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn ra_fabs(x) { if x < 0.0 { return 0.0 - x } return x }
+fn ra_approx(a, b, eps) { return ra_fabs(a - b) < eps }
+
+fn ra_arrays_near(a, b, tol) {
+    if len(a) != len(b) { return false }
+    let n = len(a)
+    let mut i = 0
+    while i < n {
+        if !ra_approx(a[i], b[i], tol) { return false }
+        i = i + 1
+    }
+    true
+}
+
+fn check(idx, name, cond) {
+    if cond {
+        println("[PASS] #" + str(idx) + " " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] #" + str(idx) + " " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// Build per-rank fixture: rank r has tensor [r, r+1, ..., r+len-1] as float.
+fn ra_make_fixture(n_ranks, tensor_len) {
+    let mut out = []
+    let mut r = 0
+    while r < n_ranks {
+        let mut t = []
+        let mut i = 0
+        while i < tensor_len {
+            t.push(to_float(r + i))
+            i = i + 1
+        }
+        out.push(t)
+        r = r + 1
+    }
+    out
+}
+
+// Expected element-wise sum: sum[i] = sum_{r=0..N-1}(r+i) = N*(N-1)/2 + N*i
+fn ra_expected_sum(n_ranks, tensor_len) {
+    let mut out = []
+    let mut i = 0
+    while i < tensor_len {
+        let s = to_float(n_ranks * (n_ranks - 1) / 2 + n_ranks * i)
+        out.push(s)
+        i = i + 1
+    }
+    out
+}
+
+// Are all rank buffers identical? (broadcast consistency)
+fn ra_all_equal(bufs, tol) {
+    let n = len(bufs)
+    if n == 0 { return true }
+    let mut i = 1
+    while i < n {
+        if !ra_arrays_near(bufs[i], bufs[0], tol) { return false }
+        i = i + 1
+    }
+    true
+}
+
+println("=== Ring AllReduce Primitive (roi #187) Tests ===")
+
+// ═══════════════════════════════════════════════════════════════════
+//  #1-#4 — Ring topology primitives
+// ═══════════════════════════════════════════════════════════════════
+
+check(1, "ra_next(0,4)=1", ra_next(0, 4) == 1)
+check(2, "ra_next(3,4)=0 wrap", ra_next(3, 4) == 0)
+check(3, "ra_prev(0,4)=3 wrap", ra_prev(0, 4) == 3)
+check(4, "ra_mod(-1,4)=3", ra_mod(-1, 4) == 3)
+
+// ═══════════════════════════════════════════════════════════════════
+//  #5-#7 — Chunking (exact divide and uneven split)
+// ═══════════════════════════════════════════════════════════════════
+
+let ck_exact = ra_chunks(12, 4)
+check(5, "chunks(12,4) len=4 and partitions fully",
+    len(ck_exact) == 4
+    && ck_exact[0][0] == 0 && ck_exact[0][1] == 3
+    && ck_exact[3][0] == 9 && ck_exact[3][1] == 12)
+
+let ck_uneven = ra_chunks(10, 4)
+check(6, "chunks(10,4) covers [0,10] without gaps",
+    ck_uneven[0][0] == 0
+    && ck_uneven[0][1] == ck_uneven[1][0]
+    && ck_uneven[1][1] == ck_uneven[2][0]
+    && ck_uneven[2][1] == ck_uneven[3][0]
+    && ck_uneven[3][1] == 10)
+
+// Every chunk begin <= end, and all sizes sum to total.
+let mut total_len = 0
+let mut ck_i = 0
+let mut ck_ok = true
+while ck_i < 4 {
+    let p = ck_uneven[ck_i]
+    if p[0] > p[1] { ck_ok = false }
+    total_len = total_len + (p[1] - p[0])
+    ck_i = ck_i + 1
+}
+check(7, "chunks(10,4) sizes sum to 10 and all non-negative",
+    ck_ok && total_len == 10)
+
+// ═══════════════════════════════════════════════════════════════════
+//  #8-#11 — N=4 ring allreduce (primary scaffold per spec)
+// ═══════════════════════════════════════════════════════════════════
+
+let N4 = 4
+let L4 = 8
+let fx4 = ra_make_fixture(N4, L4)
+let exp4 = ra_expected_sum(N4, L4)
+
+let ring4 = ra_allreduce_sum(fx4, N4)
+let naive4 = ra_allreduce_naive(fx4, N4)
+
+check(8, "N=4 ring result count = 4",
+    len(ring4) == N4)
+
+check(9, "N=4 ring rank0 matches expected sum",
+    ra_arrays_near(ring4[0], exp4, 1.0e-6))
+
+check(10, "N=4 ring all ranks hold identical reduced tensor",
+    ra_all_equal(ring4, 1.0e-9))
+
+// Cross-check against naive reference — equality on every rank.
+let mut n4_ok = true
+let mut n4_i = 0
+while n4_i < N4 {
+    if !ra_arrays_near(ring4[n4_i], naive4[n4_i], 1.0e-6) { n4_ok = false }
+    n4_i = n4_i + 1
+}
+check(11, "N=4 ring matches naive reference on every rank", n4_ok)
+
+// ═══════════════════════════════════════════════════════════════════
+//  #12-#14 — Sweep N=2, 3, 5 (even/odd, smaller/larger)
+// ═══════════════════════════════════════════════════════════════════
+
+let fx2 = ra_make_fixture(2, 6)
+let exp2 = ra_expected_sum(2, 6)
+let ring2 = ra_allreduce_sum(fx2, 2)
+check(12, "N=2 ring rank0 matches expected & all ranks equal",
+    ra_arrays_near(ring2[0], exp2, 1.0e-6)
+    && ra_all_equal(ring2, 1.0e-9))
+
+let fx3 = ra_make_fixture(3, 9)
+let exp3 = ra_expected_sum(3, 9)
+let ring3 = ra_allreduce_sum(fx3, 3)
+check(13, "N=3 ring rank0 matches expected & all ranks equal",
+    ra_arrays_near(ring3[0], exp3, 1.0e-6)
+    && ra_all_equal(ring3, 1.0e-9))
+
+let fx5 = ra_make_fixture(5, 15)
+let exp5 = ra_expected_sum(5, 15)
+let ring5 = ra_allreduce_sum(fx5, 5)
+check(14, "N=5 ring rank0 matches expected & all ranks equal",
+    ra_arrays_near(ring5[0], exp5, 1.0e-6)
+    && ra_all_equal(ring5, 1.0e-9))
+
+// ═══════════════════════════════════════════════════════════════════
+//  #15 — Mean variant divides sum by N
+// ═══════════════════════════════════════════════════════════════════
+
+let mean4 = ra_allreduce_mean(fx4, N4)
+let mut exp_mean = []
+let div4 = to_float(N4)
+let mut mi = 0
+while mi < L4 {
+    exp_mean.push(exp4[mi] / div4)
+    mi = mi + 1
+}
+check(15, "N=4 ring mean rank0 = sum/N",
+    ra_arrays_near(mean4[0], exp_mean, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════════
+//  #16 — Identity: allreduce(zeros) == zeros
+// ═══════════════════════════════════════════════════════════════════
+
+let mut zf = []
+let mut zi = 0
+while zi < N4 {
+    zf.push(ra_zeros(L4))
+    zi = zi + 1
+}
+let zr = ra_allreduce_sum(zf, N4)
+let mut zok = true
+let mut zri = 0
+while zri < N4 {
+    let mut zj = 0
+    while zj < L4 {
+        if !ra_approx(zr[zri][zj], 0.0, 1.0e-12) { zok = false }
+        zj = zj + 1
+    }
+    zri = zri + 1
+}
+check(16, "allreduce(zeros) == zeros on every rank", zok)
+
+// ═══════════════════════════════════════════════════════════════════
+//  #17-#19 — Bandwidth / step metrics
+// ═══════════════════════════════════════════════════════════════════
+
+check(17, "ra_total_steps(4)=6 (= 2*(N-1))",
+    ra_total_steps(4) == 6)
+
+check(18, "ra_volume(100,4)=150 (= 2*(N-1)/N * size)",
+    ra_approx(ra_volume(100, 4), 150.0, 1.0e-6))
+
+check(19, "ra_volume(80,5)=128 (= 2*4/5 * 80)",
+    ra_approx(ra_volume(80, 5), 128.0, 1.0e-6))
+
+// ═══════════════════════════════════════════════════════════════════
+//  #20 — Caller tensor buffers unchanged (ra_allreduce_sum is pure wrt input)
+// ═══════════════════════════════════════════════════════════════════
+
+let fx_pure = ra_make_fixture(N4, L4)
+let before0_last = fx_pure[0][L4 - 1]
+let before3_first = fx_pure[N4 - 1][0]
+let discard = ra_allreduce_sum(fx_pure, N4)
+check(20, "input tensors unchanged after allreduce",
+    ra_approx(fx_pure[0][L4 - 1], before0_last, 1.0e-12)
+    && ra_approx(fx_pure[N4 - 1][0], before3_first, 1.0e-12))
+
+// ── Summary ──────────────────────────────────────────────────────
+
+println("")
+println("=== Ring AllReduce test summary ===")
+println("PASS: " + str(pass_count))
+println("FAIL: " + str(fail_count))
+println("TOTAL: " + str(pass_count + fail_count))

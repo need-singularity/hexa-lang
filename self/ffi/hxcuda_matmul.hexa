@@ -1,0 +1,249 @@
+// self/ffi/hxcuda_matmul.hexa — ROI #188 scaffold (CUDA backend, symmetric to #160)
+//
+// CUDA-side counterpart to the hxmetal_matmul PoC (self/runtime/hxmetal_stub.hexa
+// ROI #160 block). Mirrors the exact surface — kernel SOURCE string, dispatch
+// driver, CPU reference, tile + live probes — so that higher-level ML layers
+// can route to either backend (hxm_matmul / hxc_matmul) with identical
+// shape/error contracts.
+//
+// STAGE SCOPE (scaffold-only, per roi.json#188 "접근")
+// ---------------------------------------------------
+//   - PTX kernel SOURCE string (constant, compile-time).
+//   - NVRTC FFI *declarations* (symbol binding level, no runtime call).
+//   - cuBLAS FFI *declarations* (sgemm path; dummy call-shape checks only).
+//   - Dispatch driver routes to CPU reference while HXC_MATMUL_LIVE = 0.
+//   - Matching ABI/version probes: hxc_version, hxc_matmul_tile, hxc_matmul_live.
+//
+// DESIGN MIRROR
+// -------------
+//   hxmetal_matmul                 | hxcuda_matmul
+//   -------------------------------|-------------------------------
+//   MSL string (kernel void matmul)| CUDA C++ source (__global__ matmul)
+//   Metal.framework (obj-c msgSend)| libnvrtc + libcudart + libcublas
+//   hxm_matmul_msl_source()        | hxc_matmul_cuda_source()
+//   hxm_matmul_cpu_ref()           | hxc_matmul_cpu_ref()
+//   hxm_matmul()                   | hxc_matmul()
+//   hxm_matmul_tile()              | hxc_matmul_tile()
+//   hxm_matmul_live()              | hxc_matmul_live()
+//   HXMETAL_ABI_VERSION            | HXCUDA_MATMUL_ABI_VERSION
+//
+// NOTE on coexistence with self/ml/hxcuda.hexa:
+// --------------------------------------------
+// self/ml/hxcuda.hexa (C4 MVP) binds a *pre-built* libhxcuda.so produced by
+// nvcc offline (hxcuda_fused.cu). This file is the *PoC-symmetric* CUDA path:
+// kernel source is carried as a string and would be JIT-compiled at runtime
+// via NVRTC once HXC_MATMUL_LIVE flips to 1 — same staging discipline as the
+// Metal side (#160 stage 1 → stage 2). No overlap with libhxcuda; the symbol
+// namespace here is hxc_* (mirrors hxm_*), not hxcuda_*.
+//
+// PITFALLS HONOURED (CLAUDE.md HX3 + doc/grammar.jsonl)
+// -----------------------------------------------------
+//   P1  — no semicolons
+//   P15 — let mut for reassigned locals
+//   P29 — .push() returns new array (not used on arrays below)
+//
+// AI-NATIVE RULE COMPLIANCE (HX12 default-strict)
+// -----------------------------------------------
+//   L2 literal-ban: tile size is HXC_MATMUL_TILE symbolic.
+//   L3 brace-lock: K&R same-line.
+//   L4 no string-concat in loops.
+
+// ── ABI version ──────────────────────────────────────────────────
+// Bump when any hxc_* signature changes. Tests assert this to trip
+// on silent ABI drift. v1 = #188 scaffold (source + dispatch).
+let HXCUDA_MATMUL_ABI_VERSION = 1
+
+// ── Tile / live knobs (symmetric to hxmetal) ─────────────────────
+// Tile dim shared with the MSL kernel for cross-backend parity.
+let HXC_MATMUL_TILE = 16
+
+// Flip to 1 only once NVRTC + cudart + cuBLAS wiring is smoke-green.
+// Stage 1 keeps 0 so the PoC is deterministic on any host (incl.
+// macOS-CI where no CUDA runtime exists).
+let HXC_MATMUL_LIVE = 0
+
+// ═════════════════════════════════════════════════════════════════
+//  NVRTC FFI declarations — symbol-binding scaffold
+// ═════════════════════════════════════════════════════════════════
+// These are module-scope extern decls so that loading this file on a
+// CUDA-capable host links the symbols lazily via dlopen. They are NOT
+// called while HXC_MATMUL_LIVE=0 — the test harness only asserts the
+// declarations are syntactically valid (parse + symbol-probe level).
+//
+// Signatures follow the NVRTC 12.x public headers:
+//   nvrtcCreateProgram(prog**, src*, name*, numHeaders, headers**, includeNames**)
+//   nvrtcCompileProgram(prog*, numOptions, options**)
+//   nvrtcGetPTXSize(prog*, size*)
+//   nvrtcGetPTX(prog*, ptx*)
+//   nvrtcDestroyProgram(prog**)
+// Return values are nvrtcResult (int; 0 == NVRTC_SUCCESS).
+
+@link("nvrtc")
+extern fn nvrtcCreateProgram(prog: *Void,
+                             src: *Void,
+                             name: *Void,
+                             numHeaders: int,
+                             headers: *Void,
+                             includeNames: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcCompileProgram(prog: *Void,
+                              numOptions: int,
+                              options: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetPTXSize(prog: *Void, size_out: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcGetPTX(prog: *Void, ptx_out: *Void) -> int
+
+@link("nvrtc")
+extern fn nvrtcDestroyProgram(prog: *Void) -> int
+
+// ═════════════════════════════════════════════════════════════════
+//  cuBLAS FFI declarations — symbol-binding scaffold
+// ═════════════════════════════════════════════════════════════════
+// Minimal sgemm surface. cuBLAS lives in libcublas.so.N on Linux.
+// cublasCreate_v2(handle**), cublasDestroy_v2(handle*).
+// cublasSgemm_v2: op_a, op_b, m, n, k, alpha*, A*, lda, B*, ldb,
+//                 beta*, C*, ldc  → returns cublasStatus_t (int; 0=success).
+
+@link("cublas")
+extern fn cublasCreate_v2(handle_out: *Void) -> int
+
+@link("cublas")
+extern fn cublasDestroy_v2(handle: *Void) -> int
+
+@link("cublas")
+extern fn cublasSgemm_v2(handle: *Void,
+                         transa: int,
+                         transb: int,
+                         m: int,
+                         n: int,
+                         k: int,
+                         alpha: *Void,
+                         A: *Void,
+                         lda: int,
+                         B: *Void,
+                         ldb: int,
+                         beta: *Void,
+                         C: *Void,
+                         ldc: int) -> int
+
+// cuBLAS op codes (cublasOperation_t). Symbolic so the kernel-layer
+// call site stays literal-free (HX12 L2).
+let CUBLAS_OP_N = 0
+let CUBLAS_OP_T = 1
+
+// ═════════════════════════════════════════════════════════════════
+//  Kernel source — CUDA C++ (stage 1, naive per-thread)
+// ═════════════════════════════════════════════════════════════════
+// One grid thread owns one C[r,c]. No shared memory; stage-2 would
+// introduce 16×16 tiling matching HXC_MATMUL_TILE. Symmetric to the
+// MSL `kernel void matmul(...)` in hxm_matmul_msl_source().
+pub fn hxc_matmul_cuda_source() -> string {
+    let h0 = "extern \"C\" __global__\n"
+    let h1 = "void matmul(const float* __restrict__ A,\n"
+    let h2 = "            const float* __restrict__ B,\n"
+    let h3 = "            float* __restrict__ C,\n"
+    let h4 = "            unsigned int M,\n"
+    let h5 = "            unsigned int N,\n"
+    let h6 = "            unsigned int K) {\n"
+    let b0 = "  unsigned int row = blockIdx.y * blockDim.y + threadIdx.y;\n"
+    let b1 = "  unsigned int col = blockIdx.x * blockDim.x + threadIdx.x;\n"
+    let b2 = "  if (row >= M || col >= N) { return; }\n"
+    let b3 = "  float acc = 0.0f;\n"
+    let b4 = "  for (unsigned int k = 0; k < K; k++) { acc += A[row*K + k] * B[k*N + col]; }\n"
+    let b5 = "  C[row*N + col] = acc;\n"
+    let t0 = "}\n"
+    let parts = [h0, h1, h2, h3, h4, h5, h6, b0, b1, b2, b3, b4, b5, t0]
+    return parts.join("")
+}
+
+// ── CPU reference ────────────────────────────────────────────────
+// Byte-for-byte identical loop-order to hxm_matmul_cpu_ref so the
+// two backends produce bit-identical results on the CPU fallback
+// path. This is what lets the test harness run on any host.
+pub fn hxc_matmul_cpu_ref(a, b, m: int, n: int, k: int) {
+    let mut c = []
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        c.push(0.0)
+        i = i + 1
+    }
+    let mut row = 0
+    while row < m {
+        let a_row_base = row * k
+        let c_row_base = row * n
+        let mut col = 0
+        while col < n {
+            let mut acc = 0.0
+            let mut kk = 0
+            while kk < k {
+                acc = acc + a[a_row_base + kk] * b[kk * n + col]
+                kk = kk + 1
+            }
+            c[c_row_base + col] = acc
+            col = col + 1
+        }
+        row = row + 1
+    }
+    return c
+}
+
+// ── hxc_matmul ───────────────────────────────────────────────────
+// Dispatch driver. Stage 1 routes to hxc_matmul_cpu_ref until
+// HXC_MATMUL_LIVE flips to 1 AND the host has a working CUDA runtime.
+//
+// When LIVE=1 (future stage 2):
+//   1. NVRTC:  prog = nvrtcCreateProgram(src = hxc_matmul_cuda_source())
+//              nvrtcCompileProgram(prog, [-arch=sm_XX])
+//              ptx_len = nvrtcGetPTXSize(prog) ; nvrtcGetPTX(prog, ptx_buf)
+//              nvrtcDestroyProgram(prog)
+//   2. Driver: cuModuleLoadData(ptx_buf) → cuModuleGetFunction("matmul")
+//              cuLaunchKernel(grid=(N/tile, M/tile), block=(tile, tile))
+//      OR cuBLAS sgemm path (row-major wrapped via op_b swap).
+//   3. Async: cudaMemcpy D2H → return C as hexa array.
+//
+// Shape validation runs BEFORE the live branch so the test harness
+// asserts the same empty-array contract on both paths.
+pub fn hxc_matmul(a, b, m: int, n: int, k: int) {
+    if m <= 0 { return [] }
+    if n <= 0 { return [] }
+    if k <= 0 { return [] }
+    if len(a) != m * k { return [] }
+    if len(b) != k * n { return [] }
+    if HXC_MATMUL_LIVE == 0 {
+        return hxc_matmul_cpu_ref(a, b, m, n, k)
+    }
+    // Live CUDA path would land here once NVRTC wiring is smoke-green.
+    // Until then, fall through to CPU ref so the driver never returns
+    // silent-zeros on a host that claims CUDA but lacks a working stack.
+    return hxc_matmul_cpu_ref(a, b, m, n, k)
+}
+
+// ── Probes ───────────────────────────────────────────────────────
+pub fn hxc_version() -> int {
+    return HXCUDA_MATMUL_ABI_VERSION
+}
+
+pub fn hxc_matmul_tile() -> int {
+    return HXC_MATMUL_TILE
+}
+
+pub fn hxc_matmul_live() -> int {
+    return HXC_MATMUL_LIVE
+}
+
+// ── cuBLAS op-code probes (test-visible symbolic constants) ──────
+// Exposed so the test can assert the literal-ban-friendly op codes
+// agree with cublasOperation_t without the test itself hard-coding
+// magic numbers in an assertion against magic numbers.
+pub fn hxc_cublas_op_n() -> int {
+    return CUBLAS_OP_N
+}
+
+pub fn hxc_cublas_op_t() -> int {
+    return CUBLAS_OP_T
+}

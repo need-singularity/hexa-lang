@@ -1,0 +1,486 @@
+// self/ffi/hxmetal_flashattn.hexa — ROI #181 flash-attention PoC (stage 1)
+//
+// Metal compute-shader Flash-Attention tile scaffold (pure .hexa, no .m shim).
+// Builds on the 9-fn Metal FFI surface + dispatch5 already landed by
+// #147 (scaffold) / #157 (objc_msgSend live wiring) / #160 (matmul PoC) /
+// #168 (fused SiLU matmul). This file is ADDITIVE — it does NOT modify
+// hxmetal_stub.hexa or the Rust interpreter. It re-exports the same
+// idioms:
+//
+//   - MSL source string via string-piece concatenation (L4 ban)
+//   - CPU reference that gates live routing via HXFA_LIVE=0 (default)
+//   - shape contract: Q(seq_q, d), K/V(seq_k, d), O(seq_q, d)
+//   - tile constants exposed via hxfa_tile_q / hxfa_tile_k / hxfa_head_d
+//   - handle-class sentinels via existing hxmetal_stub primitives
+//
+// ALGORITHM (flash-attention forward, block/online softmax)
+// ---------------------------------------------------------
+// For each query tile q_i of size Tq:
+//   m_i  = -inf   (row running max,  length Tq)
+//   l_i  =  0     (row running norm, length Tq)
+//   O_i  =  0     (row output accum,  [Tq, d_head])
+//   For each key tile k_j of size Tk:
+//     S_ij = Q_i @ K_j^T / sqrt(d_head)           [Tq, Tk]
+//     m_ij = rowmax(S_ij)
+//     m_new = max(m_i, m_ij)
+//     p_ij  = exp(S_ij - m_new)                    [Tq, Tk]
+//     l_new = exp(m_i - m_new) * l_i + rowsum(p_ij)
+//     O_new = diag(exp(m_i - m_new)) * O_i + p_ij @ V_j
+//     m_i, l_i, O_i = m_new, l_new, O_new
+//   O_i /= l_i                                     (final normalize)
+//
+// Online softmax is exact in float64 and matches the reference SDPA
+// (Q @ K^T / sqrt(d); softmax; @ V) within <1e-6 on random unit-scale
+// inputs — this is the correctness gate the test file asserts.
+//
+// MSL KERNEL (stage 1: naive per-thread SDPA with online softmax)
+// ---------------------------------------------------------------
+// One threadgroup per query tile; each thread owns one query row.
+// Key/value tiles are streamed through threadgroup memory. The tile
+// constants (Tq=16, Tk=16) are in the MSL source and MUST match
+// HXFA_TILE_Q / HXFA_TILE_K here — tests assert substring presence
+// to trip silent drift. Stage 2 will move to simdgroup_matrix tiles
+// and 2-D query blocking; the kernel text here is purposely simple.
+//
+// LIVE-WIRE ROUTING
+// -----------------
+// Until ROI #157 live path is smoke-validated for this kernel, the
+// dispatch driver routes to hxfa_forward_cpu_ref so correctness is
+// proven today on any host (macOS or Linux CI, no Metal required).
+// HXFA_LIVE flips once the kernel compiles + runs green.
+//
+// PITFALLS HONOURED (CLAUDE.md HX3)
+// ---------------------------------
+//   P1  — no semicolons
+//   P15 — let mut for reassigned locals
+//   P29 — .push() returns new array; we accumulate via indexed assign
+//
+// AI-NATIVE RULE COMPLIANCE (HX12 default-strict)
+// -----------------------------------------------
+//   L2 literal-ban: tile/head constants live in HXFA_* module-scope names.
+//   L3 brace-lock : same-line (K&R) throughout.
+//   L4 concat-ban : MSL source built from fixed pieces, zero loop concat.
+
+use self::runtime::hxmetal_stub
+use self::runtime::math_pure
+
+// ── ABI piggyback ────────────────────────────────────────────────
+// We do NOT bump HXMETAL_ABI_VERSION; this PoC is additive on the
+// existing surface (hxm_buffer / hxm_library_from_source / hxm_pipeline /
+// hxm_dispatch5 / hxm_release). Tests assert the stub version is still
+// in the currently-shipping range [1, 2].
+
+// ── Tile / head dims (module-scope, literal-ban compliant) ───────
+// Stage 1 sizing: Tq=Tk=16 matches the matmul PoC tile (#160) and the
+// fused SiLU kernel (#168), so the MSL block layout is consistent
+// across all three. Stage 2 can retune without touching the Hexa
+// callers — only these constants + the kernel text change.
+let HXFA_TILE_Q  = 16
+let HXFA_TILE_K  = 16
+let HXFA_HEAD_D  = 64
+
+// Flip to 1 once the MSL kernel has smoke-passed on a real M-series
+// device against a CPU reference. Kept at 0 in stage 1 so the PoC is
+// deterministic on any host (including Linux CI without Metal).
+let HXFA_LIVE = 0
+
+pub fn hxfa_tile_q() -> int {
+    return HXFA_TILE_Q
+}
+
+pub fn hxfa_tile_k() -> int {
+    return HXFA_TILE_K
+}
+
+pub fn hxfa_head_d() -> int {
+    return HXFA_HEAD_D
+}
+
+pub fn hxfa_live() -> int {
+    return HXFA_LIVE
+}
+
+// ── MSL source (stage 1 — one thread per query row) ─────────────
+// Each threadgroup handles TILE_Q query rows; threads within a group
+// iterate over all key tiles, maintaining per-row (m, l, O) running
+// statistics. Tile loads for K_j / V_j reuse threadgroup memory.
+// Buffer layout (dispatch5-compatible):
+//   buffer(0) = Q    [seq_q * d]
+//   buffer(1) = K    [seq_k * d]
+//   buffer(2) = V    [seq_k * d]
+//   buffer(3) = O    [seq_q * d]
+//   buffer(4) = uint4 dims = { seq_q, seq_k, d, pad }
+//
+// Stage 1 keeps the kernel naive (no simdgroup matmul, no cp.async).
+// The ONLY invariants the test asserts via substring match are:
+//   - entry "kernel void flash_attn"
+//   - online softmax update "m_new = max("
+//   - 5-buffer signature "[[buffer(0)]]" … "[[buffer(4)]]"
+//   - TILE_Q / TILE_K constants set to HXFA_TILE_Q / HXFA_TILE_K
+//   - threadgroup_barrier used between K/V tile loads
+//
+// The shader text below is a minimal scaffold — live compilation via
+// hxm_library_from_source will exercise the Metal compiler's syntax
+// check once HXFA_LIVE flips.
+pub fn hxfa_msl_source() -> string {
+    let h0 = "#include <metal_stdlib>\n"
+    let h1 = "using namespace metal;\n"
+    let h2 = "constant uint TILE_Q = 16;\n"
+    let h3 = "constant uint TILE_K = 16;\n"
+    let s0 = "kernel void flash_attn(device const float* Q [[buffer(0)]],\n"
+    let s1 = "                       device const float* K [[buffer(1)]],\n"
+    let s2 = "                       device const float* V [[buffer(2)]],\n"
+    let s3 = "                       device       float* O [[buffer(3)]],\n"
+    let s4 = "                       constant uint4& dims  [[buffer(4)]],\n"
+    let s5 = "                       uint2 gid  [[threadgroup_position_in_grid]],\n"
+    let s6 = "                       uint2 tid  [[thread_position_in_threadgroup]]) {\n"
+    let b0 = "  const uint seq_q = dims.x;\n"
+    let b1 = "  const uint seq_k = dims.y;\n"
+    let b2 = "  const uint d     = dims.z;\n"
+    let b3 = "  const uint row   = gid.y * TILE_Q + tid.y;\n"
+    let b4 = "  if (row >= seq_q) { return; }\n"
+    let b5 = "  const float scale = 1.0 / sqrt((float)d);\n"
+    let b6 = "  float m_i = -INFINITY;\n"
+    let b7 = "  float l_i = 0.0;\n"
+    // Output accumulator is carried in a register array; d is bounded
+    // by HXFA_HEAD_D at launch time so the MSL compiler can unroll.
+    let b8 = "  float o_i[64];\n"
+    let b9 = "  for (uint k = 0; k < d; k++) { o_i[k] = 0.0; }\n"
+    let c0 = "  threadgroup float Ks[16][64];\n"
+    let c1 = "  threadgroup float Vs[16][64];\n"
+    let c2 = "  const uint n_kt = (seq_k + TILE_K - 1) / TILE_K;\n"
+    let c3 = "  for (uint jt = 0; jt < n_kt; jt++) {\n"
+    let c4 = "    const uint k_row = jt * TILE_K + tid.y;\n"
+    let c5 = "    for (uint kk = 0; kk < d; kk++) {\n"
+    let c6 = "      Ks[tid.y][kk] = (k_row < seq_k) ? K[k_row * d + kk] : 0.0;\n"
+    let c7 = "      Vs[tid.y][kk] = (k_row < seq_k) ? V[k_row * d + kk] : 0.0;\n"
+    let c8 = "    }\n"
+    let c9 = "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    // Online softmax update over the K-tile.
+    let d0 = "    float m_ij = -INFINITY;\n"
+    let d1 = "    float s_ij[16];\n"
+    let d2 = "    for (uint j = 0; j < TILE_K; j++) {\n"
+    let d3 = "      float s = 0.0;\n"
+    let d4 = "      for (uint kk = 0; kk < d; kk++) { s += Q[row * d + kk] * Ks[j][kk]; }\n"
+    let d5 = "      s = s * scale;\n"
+    let d6 = "      if (jt * TILE_K + j >= seq_k) { s = -INFINITY; }\n"
+    let d7 = "      s_ij[j] = s;\n"
+    let d8 = "      if (s > m_ij) { m_ij = s; }\n"
+    let d9 = "    }\n"
+    let e0 = "    const float m_new = max(m_i, m_ij);\n"
+    let e1 = "    const float alpha = exp(m_i - m_new);\n"
+    let e2 = "    float p_sum = 0.0;\n"
+    let e3 = "    for (uint j = 0; j < TILE_K; j++) {\n"
+    let e4 = "      s_ij[j] = exp(s_ij[j] - m_new);\n"
+    let e5 = "      p_sum += s_ij[j];\n"
+    let e6 = "    }\n"
+    let e7 = "    for (uint kk = 0; kk < d; kk++) {\n"
+    let e8 = "      float acc = o_i[kk] * alpha;\n"
+    let e9 = "      for (uint j = 0; j < TILE_K; j++) { acc += s_ij[j] * Vs[j][kk]; }\n"
+    let f0 = "      o_i[kk] = acc;\n"
+    let f1 = "    }\n"
+    let f2 = "    l_i = alpha * l_i + p_sum;\n"
+    let f3 = "    m_i = m_new;\n"
+    let f4 = "    threadgroup_barrier(mem_flags::mem_threadgroup);\n"
+    let f5 = "  }\n"
+    let f6 = "  const float inv_l = (l_i > 0.0) ? (1.0 / l_i) : 0.0;\n"
+    let f7 = "  for (uint kk = 0; kk < d; kk++) { O[row * d + kk] = o_i[kk] * inv_l; }\n"
+    let t0 = "}\n"
+    let parts = [h0, h1, h2, h3,
+                 s0, s1, s2, s3, s4, s5, s6,
+                 b0, b1, b2, b3, b4, b5, b6, b7, b8, b9,
+                 c0, c1, c2, c3, c4, c5, c6, c7, c8, c9,
+                 d0, d1, d2, d3, d4, d5, d6, d7, d8, d9,
+                 e0, e1, e2, e3, e4, e5, e6, e7, e8, e9,
+                 f0, f1, f2, f3, f4, f5, f6, f7,
+                 t0]
+    return parts.join("")
+}
+
+// ── CPU reference (exact, for both fall-through and correctness gate) ─
+// Reference flash-attention forward using block/online softmax. Matches
+// classical SDPA within <1e-6 on unit-scale random inputs.
+//
+// Inputs  : Q (seq_q*d), K (seq_k*d), V (seq_k*d), all row-major float.
+// Returns : O (seq_q*d) row-major float, []  on shape-mismatch.
+pub fn hxfa_forward_cpu_ref(q, k, v, seq_q: int, seq_k: int, d: int) {
+    // Shape validation (mirror matmul PoC contract).
+    if seq_q <= 0 { return [] }
+    if seq_k <= 0 { return [] }
+    if d <= 0 { return [] }
+    if len(q) != seq_q * d { return [] }
+    if len(k) != seq_k * d { return [] }
+    if len(v) != seq_k * d { return [] }
+
+    // Allocate output (zero-initialised).
+    let mut o = []
+    let total = seq_q * d
+    let mut oi = 0
+    while oi < total {
+        o.push(0.0)
+        oi = oi + 1
+    }
+
+    let scale = 1.0 / sqrt_pure(d * 1.0)
+    // A very negative sentinel for "−∞" in float. Row scores on unit
+    // inputs are bounded by |Q||K| / sqrt(d) ≤ d·1·1/sqrt(d)=sqrt(d),
+    // which for d<=4096 is < 64. -1e30 is safely below the floor so
+    // max(m_i, score) always selects a real score on the first tile.
+    let neg_inf = 0.0 - 1.0e30
+
+    // Per-query-row flash loop.
+    let mut row = 0
+    while row < seq_q {
+        let q_base = row * d
+        let o_base = row * d
+
+        // Running state per row.
+        let mut m_i = neg_inf
+        let mut l_i = 0.0
+        let mut o_row = []
+        let mut init = 0
+        while init < d {
+            o_row.push(0.0)
+            init = init + 1
+        }
+
+        // Iterate over K tiles of width TILE_K.
+        let tk = HXFA_TILE_K
+        let n_kt = (seq_k + tk - 1) / tk
+        let mut jt = 0
+        while jt < n_kt {
+            let k_off = jt * tk
+            let this_tile = if k_off + tk > seq_k { seq_k - k_off } else { tk }
+
+            // 1) Compute scores s_j = (Q[row] · K[k_off+j]) * scale.
+            let mut s_ij = []
+            let mut j = 0
+            let mut m_ij = neg_inf
+            while j < this_tile {
+                let k_base = (k_off + j) * d
+                let mut s = 0.0
+                let mut kk = 0
+                while kk < d {
+                    s = s + q[q_base + kk] * k[k_base + kk]
+                    kk = kk + 1
+                }
+                s = s * scale
+                s_ij.push(s)
+                if s > m_ij { m_ij = s }
+                j = j + 1
+            }
+
+            // 2) Online softmax update: m_new, alpha, p_sum.
+            let m_new = if m_i > m_ij { m_i } else { m_ij }
+            let alpha = exp_pure(m_i - m_new)
+            let mut p_sum = 0.0
+            let mut pj = 0
+            while pj < this_tile {
+                let p = exp_pure(s_ij[pj] - m_new)
+                s_ij[pj] = p
+                p_sum = p_sum + p
+                pj = pj + 1
+            }
+
+            // 3) Rescale O_row and accumulate p_ij @ V_j.
+            let mut kk2 = 0
+            while kk2 < d {
+                let mut acc = o_row[kk2] * alpha
+                let mut jj = 0
+                while jj < this_tile {
+                    let v_base = (k_off + jj) * d
+                    acc = acc + s_ij[jj] * v[v_base + kk2]
+                    jj = jj + 1
+                }
+                o_row[kk2] = acc
+                kk2 = kk2 + 1
+            }
+
+            l_i = alpha * l_i + p_sum
+            m_i = m_new
+            jt = jt + 1
+        }
+
+        // 4) Normalize row by accumulated norm.
+        let inv_l = if l_i > 0.0 { 1.0 / l_i } else { 0.0 }
+        let mut wk = 0
+        while wk < d {
+            o[o_base + wk] = o_row[wk] * inv_l
+            wk = wk + 1
+        }
+        row = row + 1
+    }
+    return o
+}
+
+// ── Classical SDPA reference (unfused) ───────────────────────────
+// Used by the test to prove the flash/block path matches the naive
+// formulation within <1e-6. Separate function so the test can assert
+// equivalence directly rather than trust the block loop to be its
+// own oracle.
+pub fn hxfa_sdpa_reference(q, k, v, seq_q: int, seq_k: int, d: int) {
+    if seq_q <= 0 { return [] }
+    if seq_k <= 0 { return [] }
+    if d <= 0 { return [] }
+    if len(q) != seq_q * d { return [] }
+    if len(k) != seq_k * d { return [] }
+    if len(v) != seq_k * d { return [] }
+
+    let scale = 1.0 / sqrt_pure(d * 1.0)
+    let mut o = []
+    let total = seq_q * d
+    let mut oi = 0
+    while oi < total {
+        o.push(0.0)
+        oi = oi + 1
+    }
+
+    // For each query row: compute full softmax row then weighted sum of V.
+    let mut row = 0
+    while row < seq_q {
+        let q_base = row * d
+        // Full score row.
+        let mut scores = []
+        let mut j = 0
+        let mut row_max = 0.0 - 1.0e30
+        while j < seq_k {
+            let k_base = j * d
+            let mut s = 0.0
+            let mut kk = 0
+            while kk < d {
+                s = s + q[q_base + kk] * k[k_base + kk]
+                kk = kk + 1
+            }
+            s = s * scale
+            scores.push(s)
+            if s > row_max { row_max = s }
+            j = j + 1
+        }
+        // Softmax (max-subtract).
+        let mut denom = 0.0
+        let mut jj = 0
+        while jj < seq_k {
+            let p = exp_pure(scores[jj] - row_max)
+            scores[jj] = p
+            denom = denom + p
+            jj = jj + 1
+        }
+        let inv_d = if denom > 0.0 { 1.0 / denom } else { 0.0 }
+        // Weighted sum.
+        let mut kk2 = 0
+        while kk2 < d {
+            let mut acc = 0.0
+            let mut jv = 0
+            while jv < seq_k {
+                let v_base = jv * d
+                acc = acc + scores[jv] * v[v_base + kk2]
+                jv = jv + 1
+            }
+            o[row * d + kk2] = acc * inv_d
+            kk2 = kk2 + 1
+        }
+        row = row + 1
+    }
+    return o
+}
+
+// ── max abs elementwise diff ─────────────────────────────────────
+pub fn hxfa_max_abs_diff(a, b) {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = a[i] - b[i]
+        let ad = if d < 0.0 { 0.0 - d } else { d }
+        if ad > m { m = ad }
+        i = i + 1
+    }
+    return m
+}
+
+// ── hxfa_forward — dispatch driver ───────────────────────────────
+// Routes to hxfa_forward_cpu_ref while HXFA_LIVE=0 (stage 1). When the
+// live Metal path is smoke-validated and HXFA_LIVE flips to 1, the driver
+// will:
+//   dev   = hxm_device_default()
+//   lib   = hxm_library_from_source(dev, hxfa_msl_source())
+//   pipe  = hxm_pipeline(lib, "flash_attn")
+//   buf_q = hxm_buffer(dev, seq_q * d * 4)
+//   buf_k = hxm_buffer(dev, seq_k * d * 4)
+//   buf_v = hxm_buffer(dev, seq_k * d * 4)
+//   buf_o = hxm_buffer(dev, seq_q * d * 4)
+//   buf_dims = hxm_buffer(dev, 16)
+//   (write_f32 into Q/K/V/dims — stage 2 land once buffer_contents helpers exist)
+//   hxm_dispatch5(pipe, buf_q, buf_k, buf_v, buf_o, buf_dims, TILE_K, TILE_Q,
+//                 1, (seq_q + TILE_Q - 1) / TILE_Q)
+//   (read_f32 out of buf_o)
+//   release all, return o
+//
+// Until that lands we fall through to the CPU reference after exercising
+// the handle setup so even stub-mode runs prove the surface is intact.
+pub fn hxfa_forward(q, k, v, seq_q: int, seq_k: int, d: int) {
+    if seq_q <= 0 { return [] }
+    if seq_k <= 0 { return [] }
+    if d <= 0 { return [] }
+    if len(q) != seq_q * d { return [] }
+    if len(k) != seq_k * d { return [] }
+    if len(v) != seq_k * d { return [] }
+
+    if HXFA_LIVE == 0 {
+        return hxfa_forward_cpu_ref(q, k, v, seq_q, seq_k, d)
+    }
+
+    // ── Live path ────────────────────────────────────────────────
+    // Mirrors the matmul PoC live block: guard with sentinels so a
+    // stub Metal stack still falls through to the CPU reference instead
+    // of silently returning zeros.
+    let dev = hxm_device_default()
+    if dev == 0 { return hxfa_forward_cpu_ref(q, k, v, seq_q, seq_k, d) }
+    let lib = hxm_library_from_source(dev, hxfa_msl_source())
+    if lib == 0 { return hxfa_forward_cpu_ref(q, k, v, seq_q, seq_k, d) }
+    let pipe = hxm_pipeline(lib, "flash_attn")
+    if pipe == 0 {
+        hxm_release(lib)
+        return hxfa_forward_cpu_ref(q, k, v, seq_q, seq_k, d)
+    }
+
+    // Stage 2 will land buffer write/read helpers; today we exercise the
+    // scaffold (alloc buffers in expected sizes, issue dispatch5) and
+    // then fall through to the CPU reference for the returned output.
+    let q_bytes = seq_q * d * 4
+    let k_bytes = seq_k * d * 4
+    let v_bytes = seq_k * d * 4
+    let o_bytes = seq_q * d * 4
+    let d_bytes = 16
+    let buf_q = hxm_buffer(dev, q_bytes)
+    let buf_k = hxm_buffer(dev, k_bytes)
+    let buf_v = hxm_buffer(dev, v_bytes)
+    let buf_o = hxm_buffer(dev, o_bytes)
+    let buf_dims = hxm_buffer(dev, d_bytes)
+    let tgx = HXFA_TILE_K
+    let tgy = HXFA_TILE_Q
+    let gx = 1
+    let gy = (seq_q + HXFA_TILE_Q - 1) / HXFA_TILE_Q
+    let _rc = hxm_dispatch5(pipe, buf_q, buf_k, buf_v, buf_o, buf_dims,
+                            tgx, tgy, gx, gy)
+    hxm_release(buf_dims)
+    hxm_release(buf_o)
+    hxm_release(buf_v)
+    hxm_release(buf_k)
+    hxm_release(buf_q)
+    hxm_release(pipe)
+    hxm_release(lib)
+    return hxfa_forward_cpu_ref(q, k, v, seq_q, seq_k, d)
+}
+
+// ── hxfa_dispatch_shape ──────────────────────────────────────────
+// Returns (tgx, tgy, gx, gy) encoded as a 4-element int array. Pure
+// function — lets tests assert the launch geometry without touching
+// the Metal framework. Matches the grid computed in hxfa_forward.
+pub fn hxfa_dispatch_shape(seq_q: int, seq_k: int) {
+    let tgx = HXFA_TILE_K
+    let tgy = HXFA_TILE_Q
+    let gx = 1
+    let gy = (seq_q + HXFA_TILE_Q - 1) / HXFA_TILE_Q
+    return [tgx, tgy, gx, gy]
+}

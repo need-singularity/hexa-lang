@@ -1,0 +1,374 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/alloc/paged_kv.hexa — Paged-Attention KV Allocator
+//
+//  Fixed-size page pool for attention KV cache (vLLM-style).
+//  A page holds `page_tokens` tokens' worth of KV for one sequence.
+//
+//  Design (pure .hexa, no Rust):
+//    - Pool of fixed-size "pages" identified by page_id (0..num_pages-1).
+//    - `free_list` is a stack of free page_ids (LIFO reuse keeps hot pages warm).
+//    - `used` flags parallel array, length = num_pages.
+//    - Per-sequence page tables: (seq_ids[], page_tables[]).
+//      page_tables[i] is an array of page_ids belonging to seq_ids[i].
+//
+//  Hexa conventions:
+//    - Integer handles, -1 sentinel = failure / not found.
+//    - Immutable-update pattern: ops return a NEW PagedKVAllocator.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Tuning knobs (callers may wrap with different values) ──────
+fn paged_kv_default_num_pages()   { return 64 }
+fn paged_kv_default_page_tokens() { return 16 }   // tokens / page
+fn paged_kv_default_head_dim()    { return 64 }   // floats / token (K or V)
+
+// ── Page metadata (block of KV slots) ──────────────────────────
+//   page_id  : index into pool (stable handle)
+//   tokens   : how many tokens are allocated on this page (0..page_tokens)
+struct KVPage {
+    page_id: int,
+    tokens:  int
+}
+
+fn kv_page_new(page_id) {
+    return KVPage { page_id: page_id, tokens: 0 }
+}
+
+// ── Allocator state ────────────────────────────────────────────
+//   num_pages    : total pool size
+//   page_tokens  : per-page token capacity
+//   head_dim     : floats per token per K/V (for stats only)
+//   free_list    : array of free page_ids (stack; pop from tail)
+//   used         : array of bool parallel to page_id 0..num_pages-1
+//   seq_ids      : array of int, the sequence handles currently live
+//   page_tables  : array of array; page_tables[i] = pages held by seq_ids[i]
+//   stats_*      : monotonic counters
+struct PagedKVAllocator {
+    num_pages:   int,
+    page_tokens: int,
+    head_dim:    int,
+    free_list:   array,
+    used:        array,
+    seq_ids:     array,
+    page_tables: array,
+    stat_alloc:  int,
+    stat_release:int,
+    stat_reuse:  int
+}
+
+fn paged_kv_new(num_pages, page_tokens, head_dim) {
+    // Fill the free_list with page_ids 0..num_pages-1 (pop last = id 0 last).
+    // We push high ids last so early allocations draw low ids first.
+    let mut fl = []
+    let mut ud = []
+    let mut i = num_pages - 1
+    while i >= 0 {
+        fl.push(i)
+        i = i - 1
+    }
+    // fl is now [n-1, n-2, ..., 1, 0] — pop-tail yields 0, 1, 2, ...
+    let mut j = 0
+    while j < num_pages {
+        ud.push(false)
+        j = j + 1
+    }
+    return PagedKVAllocator {
+        num_pages:   num_pages,
+        page_tokens: page_tokens,
+        head_dim:    head_dim,
+        free_list:   fl,
+        used:        ud,
+        seq_ids:     [],
+        page_tables: [],
+        stat_alloc:  0,
+        stat_release:0,
+        stat_reuse:  0
+    }
+}
+
+fn paged_kv_new_default() {
+    return paged_kv_new(
+        paged_kv_default_num_pages(),
+        paged_kv_default_page_tokens(),
+        paged_kv_default_head_dim()
+    )
+}
+
+// ── Inspection helpers ─────────────────────────────────────────
+fn paged_kv_free_count(p: PagedKVAllocator) {
+    return len(p.free_list)
+}
+
+fn paged_kv_used_count(p: PagedKVAllocator) {
+    return p.num_pages - len(p.free_list)
+}
+
+fn paged_kv_seq_count(p: PagedKVAllocator) {
+    return len(p.seq_ids)
+}
+
+// Find index of seq_id in seq_ids array, or -1.
+fn paged_kv_find_seq(p: PagedKVAllocator, seq_id) {
+    let n = len(p.seq_ids)
+    let mut i = 0
+    while i < n {
+        if p.seq_ids[i] == seq_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Return the current page table (array of page_ids) for seq_id,
+// or empty array if seq is unknown.
+fn paged_kv_page_table(p: PagedKVAllocator, seq_id) {
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return [] }
+    return p.page_tables[idx]
+}
+
+fn paged_kv_seq_pages(p: PagedKVAllocator, seq_id) {
+    return len(paged_kv_page_table(p, seq_id))
+}
+
+// ── Internal: copy used array with one slot flipped ────────────
+fn _paged_kv_set_used(used_arr, page_id, value) {
+    let n = len(used_arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == page_id {
+            out.push(value)
+        } else {
+            out.push(used_arr[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Internal: rebuild seq_ids + page_tables with slot idx replaced ──
+fn _paged_kv_replace_table(p: PagedKVAllocator, idx, new_table) {
+    let n = len(p.seq_ids)
+    let mut new_ids = []
+    let mut new_tabs = []
+    let mut i = 0
+    while i < n {
+        new_ids.push(p.seq_ids[i])
+        if i == idx {
+            new_tabs.push(new_table)
+        } else {
+            new_tabs.push(p.page_tables[i])
+        }
+        i = i + 1
+    }
+    return PagedKVAllocator {
+        num_pages:   p.num_pages,
+        page_tokens: p.page_tokens,
+        head_dim:    p.head_dim,
+        free_list:   p.free_list,
+        used:        p.used,
+        seq_ids:     new_ids,
+        page_tables: new_tabs,
+        stat_alloc:  p.stat_alloc,
+        stat_release:p.stat_release,
+        stat_reuse:  p.stat_reuse
+    }
+}
+
+// ── Result types ───────────────────────────────────────────────
+struct PagedKVAllocOut {
+    alloc:   PagedKVAllocator,
+    page_id: int            // -1 on failure (pool exhausted)
+}
+
+struct PagedKVOut {
+    alloc: PagedKVAllocator,
+    ok:    bool
+}
+
+// ── Ensure a seq is registered (adds empty page table if new) ──
+fn paged_kv_register_seq(p: PagedKVAllocator, seq_id) {
+    if paged_kv_find_seq(p, seq_id) >= 0 { return p }
+    let new_ids = p.seq_ids.push(seq_id)
+    let new_tabs = p.page_tables.push([])
+    return PagedKVAllocator {
+        num_pages:   p.num_pages,
+        page_tokens: p.page_tokens,
+        head_dim:    p.head_dim,
+        free_list:   p.free_list,
+        used:        p.used,
+        seq_ids:     new_ids,
+        page_tables: new_tabs,
+        stat_alloc:  p.stat_alloc,
+        stat_release:p.stat_release,
+        stat_reuse:  p.stat_reuse
+    }
+}
+
+// ── Allocate ONE page and attach it to seq_id's page table ─────
+// Returns (new_alloc, page_id). page_id = -1 if pool is empty.
+fn paged_kv_alloc_page(p0: PagedKVAllocator, seq_id) {
+    let p = paged_kv_register_seq(p0, seq_id)
+    let fl = p.free_list
+    let n = len(fl)
+    if n == 0 {
+        return PagedKVAllocOut { alloc: p, page_id: -1 }
+    }
+    // Pop the tail page_id.
+    let pid = fl[n - 1]
+    let mut new_fl = []
+    let mut i = 0
+    while i < n - 1 {
+        new_fl.push(fl[i])
+        i = i + 1
+    }
+    let was_used = p.used[pid]
+    let new_used = _paged_kv_set_used(p.used, pid, true)
+    // Count reuse when this exact page_id was previously released.
+    let mut reuse_inc = 0
+    if was_used == false {
+        // Not currently held. "Reuse" means it had been allocated at least once before.
+        if p.stat_alloc > 0 { reuse_inc = 1 }
+    }
+    // Attach page to seq_id's page table.
+    let idx = paged_kv_find_seq(p, seq_id)
+    let old_table = p.page_tables[idx]
+    let new_table = old_table.push(pid)
+    let mut p2 = _paged_kv_replace_table(p, idx, new_table)
+    let p3 = PagedKVAllocator {
+        num_pages:   p2.num_pages,
+        page_tokens: p2.page_tokens,
+        head_dim:    p2.head_dim,
+        free_list:   new_fl,
+        used:        new_used,
+        seq_ids:     p2.seq_ids,
+        page_tables: p2.page_tables,
+        stat_alloc:  p2.stat_alloc + 1,
+        stat_release:p2.stat_release,
+        stat_reuse:  p2.stat_reuse + reuse_inc
+    }
+    return PagedKVAllocOut { alloc: p3, page_id: pid }
+}
+
+// ── Release ONE page (detach from seq's page table, push to free) ──
+// Returns (new_alloc, ok). ok = false if page_id unknown or not held by seq.
+fn paged_kv_release_page(p: PagedKVAllocator, seq_id, page_id) {
+    if page_id < 0 { return PagedKVOut { alloc: p, ok: false } }
+    if page_id >= p.num_pages { return PagedKVOut { alloc: p, ok: false } }
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return PagedKVOut { alloc: p, ok: false } }
+    let tab = p.page_tables[idx]
+    let tn = len(tab)
+    // Scan to confirm page_id is in seq's table, and rebuild without it.
+    let mut found = false
+    let mut new_tab = []
+    let mut i = 0
+    while i < tn {
+        if tab[i] == page_id {
+            found = true
+        } else {
+            new_tab.push(tab[i])
+        }
+        i = i + 1
+    }
+    if found == false { return PagedKVOut { alloc: p, ok: false } }
+    let new_used = _paged_kv_set_used(p.used, page_id, false)
+    let new_fl = p.free_list.push(page_id)
+    let p2 = _paged_kv_replace_table(p, idx, new_tab)
+    let p3 = PagedKVAllocator {
+        num_pages:   p2.num_pages,
+        page_tokens: p2.page_tokens,
+        head_dim:    p2.head_dim,
+        free_list:   new_fl,
+        used:        new_used,
+        seq_ids:     p2.seq_ids,
+        page_tables: p2.page_tables,
+        stat_alloc:  p2.stat_alloc,
+        stat_release:p2.stat_release + 1,
+        stat_reuse:  p2.stat_reuse
+    }
+    return PagedKVOut { alloc: p3, ok: true }
+}
+
+// Release ALL pages held by seq_id and drop the seq from the table.
+// Returns (new_alloc, ok). ok = false if seq_id unknown.
+fn paged_kv_release_seq(p: PagedKVAllocator, seq_id) {
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return PagedKVOut { alloc: p, ok: false } }
+    let tab = p.page_tables[idx]
+    let tn = len(tab)
+    // Push all held pages back to free_list and mark used=false.
+    let mut new_fl = p.free_list
+    let mut new_used = p.used
+    let mut released = 0
+    let mut i = 0
+    while i < tn {
+        let pid = tab[i]
+        new_fl = new_fl.push(pid)
+        new_used = _paged_kv_set_used(new_used, pid, false)
+        released = released + 1
+        i = i + 1
+    }
+    // Drop seq from seq_ids + page_tables.
+    let n = len(p.seq_ids)
+    let mut new_ids = []
+    let mut new_tabs = []
+    let mut j = 0
+    while j < n {
+        if j != idx {
+            new_ids.push(p.seq_ids[j])
+            new_tabs.push(p.page_tables[j])
+        }
+        j = j + 1
+    }
+    let p2 = PagedKVAllocator {
+        num_pages:   p.num_pages,
+        page_tokens: p.page_tokens,
+        head_dim:    p.head_dim,
+        free_list:   new_fl,
+        used:        new_used,
+        seq_ids:     new_ids,
+        page_tables: new_tabs,
+        stat_alloc:  p.stat_alloc,
+        stat_release:p.stat_release + released,
+        stat_reuse:  p.stat_reuse
+    }
+    return PagedKVOut { alloc: p2, ok: true }
+}
+
+// ── Stats struct for reports ───────────────────────────────────
+struct PagedKVStats {
+    num_pages:   int,
+    page_tokens: int,
+    head_dim:    int,
+    used_pages:  int,
+    free_pages:  int,
+    seq_count:   int,
+    stat_alloc:  int,
+    stat_release:int,
+    stat_reuse:  int
+}
+
+fn paged_kv_stats(p: PagedKVAllocator) {
+    return PagedKVStats {
+        num_pages:   p.num_pages,
+        page_tokens: p.page_tokens,
+        head_dim:    p.head_dim,
+        used_pages:  paged_kv_used_count(p),
+        free_pages:  paged_kv_free_count(p),
+        seq_count:   paged_kv_seq_count(p),
+        stat_alloc:  p.stat_alloc,
+        stat_release:p.stat_release,
+        stat_reuse:  p.stat_reuse
+    }
+}
+
+fn paged_kv_stats_display(s: PagedKVStats) {
+    let mut out = "PagedKVAllocator\n"
+    out = out + "  pool:   " + to_string(s.used_pages) + "/" + to_string(s.num_pages) + " pages used\n"
+    out = out + "  page:   " + to_string(s.page_tokens) + " tokens x " + to_string(s.head_dim) + " floats\n"
+    out = out + "  seqs:   " + to_string(s.seq_count) + "\n"
+    out = out + "  alloc:  " + to_string(s.stat_alloc)
+    out = out + "  release:" + to_string(s.stat_release)
+    out = out + "  reuse:  " + to_string(s.stat_reuse) + "\n"
+    return out
+}

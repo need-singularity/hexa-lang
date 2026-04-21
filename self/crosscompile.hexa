@@ -1,0 +1,301 @@
+#!hexa lax
+// =====================================================================
+//  self/crosscompile.hexa  --  ROI #179
+//
+//  Cross-compile scaffold:  darwin-arm64  →  linux-x86_64
+//
+//  Scope (pure .hexa — no Rust, no codegen changes):
+//    * Target triple parser  (arch-vendor-os[-abi])
+//    * host/target triple constants + validation
+//    * darwin / linux branch helpers (object format, exe prefix, ...)
+//    * Minimal sysroot resolution (env override + default path)
+//    * Dummy linker command builder that composes the pipeline a real
+//      driver would feed to a host→linux cross linker (e.g. lld).
+//
+//  This file is a scaffold: it doesn't perform I/O or spawn processes.
+//  It returns the *plan* (linker argv + sysroot + triple pair) so the
+//  rest of the toolchain — and the accompanying test_crosscompile.hexa
+//  — can assert on concrete strings.
+//
+//  Relation to existing code:
+//    self/codegen/mod.hexa already exposes target_arm64 / target_x86_64
+//    and objformat_macho / objformat_elf plus a HEXA_TARGET env probe.
+//    This file sits one level above that: it speaks in *triples*, which
+//    is the canonical form for cross-compile driver UX.
+// =====================================================================
+
+// ───────────────────────────────────────────────────────────────────
+//  Triple model
+// ───────────────────────────────────────────────────────────────────
+//
+//   <arch> - <vendor> - <os> [ - <abi> ]
+//
+// Examples handled by the scaffold:
+//
+//   arm64-apple-darwin      (canonical host: Apple Silicon Mac)
+//   aarch64-apple-darwin    (alias; normalized → arm64-apple-darwin)
+//   x86_64-unknown-linux-gnu (canonical target: Linux x86_64 glibc)
+//   x86_64-unknown-linux-musl (alt abi)
+//
+// Anything else → triple_is_valid returns false; cross_plan refuses
+// to build a command.
+
+struct Triple {
+    arch: string,
+    vendor: string,
+    os: string,
+    abi: string      // "" when absent
+}
+
+fn triple_make(arch, vendor, os, abi) -> Triple {
+    return Triple{ arch: arch, vendor: vendor, os: os, abi: abi }
+}
+
+// Canonical host for the Hexa self-host dev machine.
+fn host_triple() -> Triple {
+    return triple_make("arm64", "apple", "darwin", "")
+}
+
+// Canonical cross target for ROI #179.
+fn linux_x86_64_triple() -> Triple {
+    return triple_make("x86_64", "unknown", "linux", "gnu")
+}
+
+// Render a triple back to its canonical "a-v-o[-abi]" string.
+fn triple_to_string(t: Triple) -> string {
+    let base = t.arch + "-" + t.vendor + "-" + t.os
+    if len(t.abi) == 0 { return base }
+    return base + "-" + t.abi
+}
+
+// Normalize arch synonyms so the rest of the pipeline only sees the
+// canonical spelling.  Extend here if we pick up more aliases.
+fn _normalize_arch(a) -> string {
+    if a == "aarch64" { return "arm64" }
+    if a == "amd64"   { return "x86_64" }
+    if a == "x64"     { return "x86_64" }
+    return a
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  Parser
+// ───────────────────────────────────────────────────────────────────
+//
+// Grammar (informal):
+//   triple := arch "-" vendor "-" os ( "-" abi )?
+//
+// On malformed input we return a Triple with arch == "" — callers
+// must check via triple_is_valid.
+
+fn parse_triple(s) -> Triple {
+    if type_of(s) != "string" { return triple_make("", "", "", "") }
+    if len(s) == 0             { return triple_make("", "", "", "") }
+    let parts = s.split("-")
+    if len(parts) < 3 { return triple_make("", "", "", "") }
+    let arch   = _normalize_arch(parts[0])
+    let vendor = parts[1]
+    let os     = parts[2]
+    let mut abi = ""
+    // Collect the tail (index 3..) as a single "-"-joined abi blob so
+    // "linux-gnu" and "linux-androideabi-v7a" both round-trip sanely.
+    let mut i = 3
+    let mut abi_parts = []
+    while i < len(parts) {
+        abi_parts.push(parts[i])
+        i = i + 1
+    }
+    if len(abi_parts) > 0 {
+        abi = abi_parts.join("-")
+    }
+    return triple_make(arch, vendor, os, abi)
+}
+
+fn triple_is_valid(t: Triple) -> bool {
+    if len(t.arch)   == 0 { return false }
+    if len(t.vendor) == 0 { return false }
+    if len(t.os)     == 0 { return false }
+    return true
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  OS / arch branch helpers
+// ───────────────────────────────────────────────────────────────────
+
+fn triple_is_darwin(t: Triple) -> bool { return t.os == "darwin" }
+fn triple_is_linux(t: Triple)  -> bool { return t.os == "linux" }
+
+fn triple_is_arm64(t: Triple)  -> bool { return t.arch == "arm64" }
+fn triple_is_x86_64(t: Triple) -> bool { return t.arch == "x86_64" }
+
+// Object format per OS.  Mirrors codegen/mod.hexa objformat_* enum
+// but stays as a string here because the driver prints it verbatim.
+fn triple_obj_format(t: Triple) -> string {
+    if triple_is_darwin(t) { return "macho" }
+    if triple_is_linux(t)  { return "elf" }
+    return "unknown"
+}
+
+// Conventional executable name prefix.  Hexa tooling uses this when
+// laying out build/ artefacts per target.
+fn triple_exe_suffix(t: Triple) -> string {
+    // No OS here produces .exe — kept as an extension point so the
+    // scaffold doesn't need to change when Windows lands later.
+    return ""
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  Sysroot resolution
+// ───────────────────────────────────────────────────────────────────
+//
+// A real cross-compile needs headers + CRT + libc.so for the *target*.
+// We don't ship one; instead the driver reads the path from the
+// environment (HEXA_SYSROOT_<OS>) and falls back to a conventional
+// vendored location under $HOME/.hexa/sysroots/<triple>.
+//
+// The scaffold only returns a string — it does not stat the directory.
+
+fn _env_or(name, dflt) -> string {
+    let v = env(name)
+    if type_of(v) != "string" { return dflt }
+    if len(v) == 0 { return dflt }
+    return v
+}
+
+fn sysroot_env_name(t: Triple) -> string {
+    if triple_is_linux(t)  { return "HEXA_SYSROOT_LINUX" }
+    if triple_is_darwin(t) { return "HEXA_SYSROOT_DARWIN" }
+    return "HEXA_SYSROOT"
+}
+
+fn default_sysroot(t: Triple) -> string {
+    // Host = no sysroot needed.  Returning "" signals "use system".
+    if triple_is_darwin(t) { return "" }
+    // Vendored layout:  ~/.hexa/sysroots/<canonical-triple>
+    let home = _env_or("HOME", "/tmp")
+    return home + "/.hexa/sysroots/" + triple_to_string(t)
+}
+
+fn resolve_sysroot(t: Triple) -> string {
+    let name = sysroot_env_name(t)
+    return _env_or(name, default_sysroot(t))
+}
+
+// ───────────────────────────────────────────────────────────────────
+//  Dummy linker command builder
+// ───────────────────────────────────────────────────────────────────
+//
+// A real driver would pick `ld64` for Mach-O and `lld` / `ld.lld` for
+// ELF.  We return the argv a cross-driver would use for
+// darwin-arm64  →  linux-x86_64 , keyed on the target triple's OS.
+//
+// Host is included purely for introspection (debug prints / tests);
+// it does not change the command on its own.
+
+struct CrossPlan {
+    host: Triple,
+    target: Triple,
+    linker: string,
+    sysroot: string,
+    argv: [string],
+    ok: bool,
+    reason: string   // populated when ok == false
+}
+
+fn _cross_plan_fail(host, target, reason) -> CrossPlan {
+    return CrossPlan{
+        host: host,
+        target: target,
+        linker: "",
+        sysroot: "",
+        argv: [],
+        ok: false,
+        reason: reason
+    }
+}
+
+// Choose the linker binary for a given target OS.
+fn linker_for(t: Triple) -> string {
+    if triple_is_linux(t)  { return "ld.lld" }
+    if triple_is_darwin(t) { return "ld64.lld" }
+    return ""
+}
+
+// Build the linker argv for `input_obj` → `output_exe` under `target`.
+// Pure composition — no file I/O.
+fn build_link_argv(target: Triple, sysroot, input_obj, output_exe) -> [string] {
+    let mut argv = []
+    argv.push(linker_for(target))
+
+    // Emulation / target flag.  `ld.lld` wants -m <emu>; Mach-O lld
+    // wants -arch.  Both are pure-string tokens here.
+    if triple_is_linux(target) && triple_is_x86_64(target) {
+        argv.push("-m")
+        argv.push("elf_x86_64")
+    }
+    if triple_is_linux(target) && triple_is_arm64(target) {
+        argv.push("-m")
+        argv.push("aarch64linux")
+    }
+    if triple_is_darwin(target) {
+        argv.push("-arch")
+        if triple_is_arm64(target)  { argv.push("arm64")  }
+        if triple_is_x86_64(target) { argv.push("x86_64") }
+    }
+
+    // Sysroot — only emitted for non-host targets that declared one.
+    if len(sysroot) > 0 {
+        argv.push("--sysroot=" + sysroot)
+    }
+
+    argv.push("-o")
+    argv.push(output_exe + triple_exe_suffix(target))
+    argv.push(input_obj)
+
+    // Minimal libc / startup.  For linux-gnu we assume the sysroot
+    // provides crt1.o + libc.so; the driver just names them.
+    if triple_is_linux(target) {
+        argv.push("-lc")
+    }
+    return argv
+}
+
+// Build a full CrossPlan.  Validates both triples and the OS pair
+// before composing argv.
+fn cross_plan(host: Triple, target: Triple, input_obj, output_exe) -> CrossPlan {
+    if !triple_is_valid(host) {
+        return _cross_plan_fail(host, target, "invalid host triple")
+    }
+    if !triple_is_valid(target) {
+        return _cross_plan_fail(host, target, "invalid target triple")
+    }
+    let lk = linker_for(target)
+    if len(lk) == 0 {
+        return _cross_plan_fail(host, target, "no linker for target os=" + target.os)
+    }
+    let sr   = resolve_sysroot(target)
+    let argv = build_link_argv(target, sr, input_obj, output_exe)
+    return CrossPlan{
+        host: host,
+        target: target,
+        linker: lk,
+        sysroot: sr,
+        argv: argv,
+        ok: true,
+        reason: ""
+    }
+}
+
+// Canonical ROI #179 entry point: darwin-arm64  →  linux-x86_64.
+fn plan_darwin_arm64_to_linux_x86_64(input_obj, output_exe) -> CrossPlan {
+    return cross_plan(host_triple(), linux_x86_64_triple(), input_obj, output_exe)
+}
+
+// Human-readable one-liner for logs / test asserts.
+fn cross_plan_describe(p: CrossPlan) -> string {
+    if !p.ok {
+        return "cross: FAIL (" + p.reason + ")"
+    }
+    return "cross: " + triple_to_string(p.host) + " -> " + triple_to_string(p.target)
+        + " via " + p.linker
+        + " argc=" + to_string(len(p.argv))
+}

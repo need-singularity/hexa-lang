@@ -1,0 +1,410 @@
+// self/test_specialize_tune.hexa — @specialize IC hit-rate tuning tests (ROI #171)
+//
+// Exercises self/attrs/specialize_tune.hexa:
+//   · ICStats observe / snapshot semantics
+//   · ic_hit_rate_permille — integer hit rate
+//   · BucketConfig shrink / grow / hold with min & max clamp
+//   · tune_hook end-to-end (ICSlot counters → bucket recommendation)
+//
+// Style: mirrors self/test_specialize_ic.hexa — inline the production
+// runtime so we can run under build/hexa_stage0.real without depending
+// on the module loader. Under ./hexa, the canonical module is also
+// loaded via `use` — the inlined copy simply shadows it.
+
+// ═══════════════════════════════════════════════════════════════════
+//  INLINED RUNTIME (mirror of self/attrs/specialize_tune.hexa)
+// ═══════════════════════════════════════════════════════════════════
+
+struct ICStats {
+    site_ids: [int],
+    hits: [int],
+    misses: [int],
+    samples: int
+}
+
+fn ic_stats_new() -> ICStats {
+    return ICStats { site_ids: [], hits: [], misses: [], samples: 0 }
+}
+
+fn ic_stats_index(stats: ICStats, site_id: int) -> int {
+    let mut i = 0
+    while i < len(stats.site_ids) {
+        if stats.site_ids[i] == site_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn ic_stats_observe(stats: ICStats, site_id: int, hit_count: int, miss_count: int) -> ICStats {
+    let idx = ic_stats_index(stats, site_id)
+    if idx >= 0 {
+        let mut new_hits = []
+        let mut new_misses = []
+        let mut k = 0
+        while k < len(stats.hits) {
+            if k == idx {
+                new_hits.push(hit_count)
+                new_misses.push(miss_count)
+            } else {
+                new_hits.push(stats.hits[k])
+                new_misses.push(stats.misses[k])
+            }
+            k = k + 1
+        }
+        return ICStats {
+            site_ids: stats.site_ids,
+            hits: new_hits,
+            misses: new_misses,
+            samples: stats.samples + 1
+        }
+    }
+    let mut ids2 = []
+    let mut h2 = []
+    let mut m2 = []
+    let mut j = 0
+    while j < len(stats.site_ids) {
+        ids2.push(stats.site_ids[j])
+        h2.push(stats.hits[j])
+        m2.push(stats.misses[j])
+        j = j + 1
+    }
+    ids2.push(site_id)
+    h2.push(hit_count)
+    m2.push(miss_count)
+    return ICStats {
+        site_ids: ids2,
+        hits: h2,
+        misses: m2,
+        samples: stats.samples + 1
+    }
+}
+
+fn ic_hit_rate_permille(stats: ICStats, site_id: int) -> int {
+    let idx = ic_stats_index(stats, site_id)
+    if idx < 0 { return -1 }
+    let h = stats.hits[idx]
+    let m = stats.misses[idx]
+    let total = h + m
+    if total <= 0 { return -1 }
+    return (h * 1000) / total
+}
+
+fn ic_hit_rate_total_permille(stats: ICStats) -> int {
+    let mut th = 0
+    let mut tm = 0
+    let mut i = 0
+    while i < len(stats.site_ids) {
+        th = th + stats.hits[i]
+        tm = tm + stats.misses[i]
+        i = i + 1
+    }
+    let total = th + tm
+    if total <= 0 { return -1 }
+    return (th * 1000) / total
+}
+
+struct BucketConfig {
+    min_size: int,
+    max_size: int,
+    current_size: int,
+    shrink_threshold: int,
+    grow_threshold: int,
+    step: int
+}
+
+fn bucket_default() -> BucketConfig {
+    return BucketConfig {
+        min_size: 1,
+        max_size: 8,
+        current_size: 4,
+        shrink_threshold: 950,
+        grow_threshold: 500,
+        step: 1
+    }
+}
+
+fn bucket_from(min_size: int, max_size: int, current: int,
+               shrink_t: int, grow_t: int, step: int) -> BucketConfig {
+    return BucketConfig {
+        min_size: min_size,
+        max_size: max_size,
+        current_size: current,
+        shrink_threshold: shrink_t,
+        grow_threshold: grow_t,
+        step: step
+    }
+}
+
+fn bucket_adjust(cfg: BucketConfig, hit_rate_permille: int) -> BucketConfig {
+    if hit_rate_permille < 0 { return cfg }
+    let mut new_size = cfg.current_size
+    if hit_rate_permille >= cfg.shrink_threshold {
+        new_size = cfg.current_size - cfg.step
+        if new_size < cfg.min_size { new_size = cfg.min_size }
+    } else if hit_rate_permille <= cfg.grow_threshold {
+        new_size = cfg.current_size + cfg.step
+        if new_size > cfg.max_size { new_size = cfg.max_size }
+    }
+    return BucketConfig {
+        min_size: cfg.min_size,
+        max_size: cfg.max_size,
+        current_size: new_size,
+        shrink_threshold: cfg.shrink_threshold,
+        grow_threshold: cfg.grow_threshold,
+        step: cfg.step
+    }
+}
+
+fn bucket_dir_shrink() -> int { return -1 }
+fn bucket_dir_hold()   -> int { return 0 }
+fn bucket_dir_grow()   -> int { return 1 }
+
+fn bucket_direction(cfg: BucketConfig, hit_rate_permille: int) -> int {
+    if hit_rate_permille < 0 { return 0 }
+    if hit_rate_permille >= cfg.shrink_threshold {
+        if cfg.current_size > cfg.min_size { return -1 }
+        return 0
+    }
+    if hit_rate_permille <= cfg.grow_threshold {
+        if cfg.current_size < cfg.max_size { return 1 }
+        return 0
+    }
+    return 0
+}
+
+fn tune_hook(stats: ICStats, cfg: BucketConfig,
+             site_id: int, hit_count: int, miss_count: int) {
+    let new_stats = ic_stats_observe(stats, site_id, hit_count, miss_count)
+    let rate = ic_hit_rate_permille(new_stats, site_id)
+    let new_cfg = bucket_adjust(cfg, rate)
+    return [new_stats, new_cfg]
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  TEST HARNESS
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, actual, expected) {
+    if to_string(actual) == to_string(expected) {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name + " expected: " + to_string(expected) + ", got: " + to_string(actual))
+        fail_count = fail_count + 1
+    }
+}
+
+fn check_true(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+println("=======================================================")
+println("  @specialize hit-rate tuning tests (ROI #171)")
+println("=======================================================")
+println("")
+
+// ─── T1: ICStats construction + observe/lookup ──────────────────────
+
+println("--- T1: ICStats basics ---")
+
+let s0 = ic_stats_new()
+check("stats empty site_ids", len(s0.site_ids), 0)
+check("stats samples=0", s0.samples, 0)
+check("unknown site -> -1", ic_stats_index(s0, 42), -1)
+check("hit_rate unknown = -1", ic_hit_rate_permille(s0, 42), -1)
+check("total_rate empty = -1", ic_hit_rate_total_permille(s0), -1)
+
+let s1 = ic_stats_observe(s0, 100, 99, 1)
+check("stats has 1 site", len(s1.site_ids), 1)
+check("stats samples=1", s1.samples, 1)
+check("site 100 idx=0", ic_stats_index(s1, 100), 0)
+check("site 100 hits=99", s1.hits[0], 99)
+check("site 100 misses=1", s1.misses[0], 1)
+
+// Replace-with-latest: slot counters are monotonic, so a new observation
+// should overwrite rather than accumulate.
+let s2 = ic_stats_observe(s1, 100, 199, 1)
+check("overwrite — still 1 site", len(s2.site_ids), 1)
+check("samples=2", s2.samples, 2)
+check("hits updated to 199", s2.hits[0], 199)
+check("misses stays 1", s2.misses[0], 1)
+
+// New site appends.
+let s3 = ic_stats_observe(s2, 101, 10, 90)
+check("now 2 sites", len(s3.site_ids), 2)
+check("site 101 idx=1", ic_stats_index(s3, 101), 1)
+check("site 101 hits=10", s3.hits[1], 10)
+check("site 101 misses=90", s3.misses[1], 90)
+
+println("")
+
+// ─── T2: hit-rate math (permille) ───────────────────────────────────
+
+println("--- T2: ic_hit_rate_permille ---")
+
+// site 100: 199 hits / 200 total  → 995 permille
+check("site100 rate = 995", ic_hit_rate_permille(s3, 100), 995)
+
+// site 101: 10 hits / 100 total → 100 permille
+check("site101 rate = 100", ic_hit_rate_permille(s3, 101), 100)
+
+// Aggregate: (199 + 10) / (200 + 100) = 209 / 300 = 696 permille
+check("total rate = 696", ic_hit_rate_total_permille(s3), 696)
+
+// Zero-total safety
+let sz = ic_stats_observe(ic_stats_new(), 7, 0, 0)
+check("zero-total -> -1", ic_hit_rate_permille(sz, 7), -1)
+
+println("")
+
+// ─── T3: BucketConfig defaults + bounds ─────────────────────────────
+
+println("--- T3: BucketConfig defaults ---")
+
+let b0 = bucket_default()
+check("default min=1", b0.min_size, 1)
+check("default max=8", b0.max_size, 8)
+check("default current=4", b0.current_size, 4)
+check("default shrink=950", b0.shrink_threshold, 950)
+check("default grow=500", b0.grow_threshold, 500)
+check("default step=1", b0.step, 1)
+
+let bc = bucket_from(2, 16, 8, 900, 400, 2)
+check("bc.current=8", bc.current_size, 8)
+check("bc.step=2", bc.step, 2)
+
+println("")
+
+// ─── T4: bucket_adjust — shrink / grow / hold ───────────────────────
+
+println("--- T4: bucket_adjust ---")
+
+// High hit rate → shrink
+let b_s = bucket_adjust(b0, 980)
+check("980 permille → shrink to 3", b_s.current_size, 3)
+
+// Low hit rate → grow
+let b_g = bucket_adjust(b0, 300)
+check("300 permille → grow to 5", b_g.current_size, 5)
+
+// Middle zone → hold
+let b_h = bucket_adjust(b0, 700)
+check("700 permille → hold at 4", b_h.current_size, 4)
+
+// no-data (-1) → hold
+let b_n = bucket_adjust(b0, -1)
+check("-1 → no-op", b_n.current_size, 4)
+
+// Boundary: exactly at shrink_threshold → shrink
+let b_eq_s = bucket_adjust(b0, 950)
+check("950 (== shrink) → 3", b_eq_s.current_size, 3)
+
+// Boundary: exactly at grow_threshold → grow
+let b_eq_g = bucket_adjust(b0, 500)
+check("500 (== grow) → 5", b_eq_g.current_size, 5)
+
+println("")
+
+// ─── T5: min/max clamp ──────────────────────────────────────────────
+
+println("--- T5: bucket_adjust clamp ---")
+
+// Already at min — shrink should stay at min
+let b_min = bucket_from(1, 8, 1, 950, 500, 1)
+let b_min_after = bucket_adjust(b_min, 1000)
+check("clamp shrink at min=1", b_min_after.current_size, 1)
+
+// Already at max — grow should stay at max
+let b_max = bucket_from(1, 8, 8, 950, 500, 1)
+let b_max_after = bucket_adjust(b_max, 0)
+check("clamp grow at max=8", b_max_after.current_size, 8)
+
+// Step that would overshoot — clamp kicks in
+let b_big = bucket_from(1, 8, 7, 950, 500, 5)
+let b_big_after = bucket_adjust(b_big, 0)
+check("grow step overshoot → clamp max=8", b_big_after.current_size, 8)
+
+let b_big2 = bucket_from(1, 8, 2, 950, 500, 5)
+let b_big2_after = bucket_adjust(b_big2, 1000)
+check("shrink step overshoot → clamp min=1", b_big2_after.current_size, 1)
+
+println("")
+
+// ─── T6: bucket_direction ───────────────────────────────────────────
+
+println("--- T6: bucket_direction ---")
+
+check("dir 980 → shrink(-1)", bucket_direction(b0, 980), bucket_dir_shrink())
+check("dir 300 → grow(+1)",  bucket_direction(b0, 300), bucket_dir_grow())
+check("dir 700 → hold(0)",   bucket_direction(b0, 700), bucket_dir_hold())
+check("dir -1 → hold(0)",    bucket_direction(b0, -1),  bucket_dir_hold())
+
+// At min — shrink signal becomes hold
+check("dir 1000 at min → hold", bucket_direction(b_min, 1000), bucket_dir_hold())
+// At max — grow signal becomes hold
+check("dir 0 at max → hold", bucket_direction(b_max, 0), bucket_dir_hold())
+
+println("")
+
+// ─── T7: tune_hook end-to-end ───────────────────────────────────────
+
+println("--- T7: tune_hook (observe + adjust) ---")
+
+// Mirror of a MONO slot after ic.hexa's 100-lookup path: hit=99, miss=1
+// → hit rate = 990 permille → shrink suggested.
+let r = tune_hook(ic_stats_new(), bucket_default(), 100, 99, 1)
+let th_stats = r[0]
+let th_cfg = r[1]
+check("tune_hook: 1 tracked site", len(th_stats.site_ids), 1)
+check("tune_hook: samples=1", th_stats.samples, 1)
+check("tune_hook: hits=99", th_stats.hits[0], 99)
+check("tune_hook: misses=1", th_stats.misses[0], 1)
+check("tune_hook: MONO → shrink to 3", th_cfg.current_size, 3)
+
+// POLY-leaning slot: hit=10, miss=90 → hit rate = 100 permille → grow.
+let r2 = tune_hook(th_stats, th_cfg, 101, 10, 90)
+let th2_stats = r2[0]
+let th2_cfg = r2[1]
+check("tune_hook2: 2 tracked sites", len(th2_stats.site_ids), 2)
+check("tune_hook2: samples=2", th2_stats.samples, 2)
+// th_cfg.current_size was 3 after first adjust; 100 permille → grow to 4
+check("tune_hook2: POLY → grow to 4", th2_cfg.current_size, 4)
+
+// Middle zone: hit=60, miss=40 → 600 permille → hold
+let r3 = tune_hook(th2_stats, th2_cfg, 102, 60, 40)
+let th3_cfg = r3[1]
+check("tune_hook3: middle → hold at 4", th3_cfg.current_size, 4)
+
+println("")
+
+// ─── T8: @specialize smoke — scaffold remains non-breaking ──────────
+
+println("--- T8: @specialize smoke (tune does not alter behavior) ---")
+
+@specialize fn _tune_demo(x) {
+    return x * 3 + 2
+}
+check("@specialize callable", _tune_demo(5), 17)
+
+println("")
+
+// ─── Summary ────────────────────────────────────────────────────────
+
+println("=======================================================")
+let total = pass_count + fail_count
+println("  specialize_tune: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL / " + to_string(total) + " total")
+if fail_count == 0 {
+    println("  ALL SPECIALIZE-TUNE TESTS PASSED")
+} else {
+    println("  SOME SPECIALIZE-TUNE TESTS FAILED")
+}
+println("=======================================================")

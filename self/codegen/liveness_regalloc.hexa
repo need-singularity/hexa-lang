@@ -1,0 +1,424 @@
+// self/codegen/liveness_regalloc.hexa — ROI #185
+//
+// SSA liveness-driven regalloc (scaffold).
+//
+// Split out from regalloc_linear.hexa / regalloc_graph.hexa as a
+// standalone pure module that:
+//
+//   1. Scans a flat SSA block sequence for def / use positions.
+//   2. Builds [LiveInterval] records (start = first def, end = last use).
+//   3. Runs linear-scan allocation with a use-count-weighted spill
+//      heuristic (the Briggs-style cost = use_count / interval_length,
+//      but applied to linear scan — we pick the *worst* spill candidate,
+//      not the cheapest node).
+//
+// Design deltas vs. regalloc_linear.hexa:
+//
+//   - Takes raw `[[int]]` block_instrs (same shape as count_uses)
+//     instead of pre-computed intervals, so the whole pipeline
+//     (def/use scan → interval → alloc) is exercised in one call.
+//   - Spill heuristic is not just "pick the active interval with the
+//     largest end_pos" (regalloc_linear's behaviour); it picks the
+//     active interval that maximizes `end_pos / (1 + use_count)`, i.e.
+//     prefer spilling a long-lived, rarely-used value. This matches
+//     how the graph allocator scores nodes and keeps hot values in
+//     registers when the live-range end alone would pick a hot one.
+//   - Output is a plain `[int, int, int]` record per VID: (tag, val,
+//     end_pos) — tag 0=REG, 1=STACK, consistent with FuncAlloc's
+//     locations_tag / locations_val layout.
+//
+// Constraints (stage0):
+//   - No array mutation by index: rebuild parallel arrays on every
+//     update. Matches the pattern used by test_regalloc_coverage.hexa.
+//   - No nested-array returns: caller passes in flat block_instrs
+//     and we return a RegallocResult struct of flat arrays.
+//   - Pure .hexa; no Rust side is touched.
+//
+// This module is a scaffold — the production allocator is still
+// regalloc_linear.hexa; this one is intended as the reference for
+// the next pipeline wiring step (compile_pipeline dispatcher swap,
+// tracked separately).
+
+// ──────────────────────────────────────────────────────────────
+// LR — local LiveInterval-like record.
+// We don't import regalloc.hexa's LiveInterval to keep this module
+// self-contained for unit tests (the integration test in
+// test_regalloc_coverage.hexa already covers the shared type).
+// ──────────────────────────────────────────────────────────────
+struct LR {
+    value: int,
+    start: int,
+    end_pos: int,
+    uses: int
+}
+
+fn lr_new(value: int, start: int, end_pos: int, uses: int) -> LR {
+    return LR {
+        value: value,
+        start: start,
+        end_pos: end_pos,
+        uses: uses
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Output: per-VID allocation record packed into parallel flat arrays.
+// ──────────────────────────────────────────────────────────────
+struct RegallocResult {
+    vids: [int],         // VID at index i
+    tags: [int],         // 0 = REG, 1 = STACK
+    vals: [int],         // reg index or stack offset (<= 0)
+    used_regs: [int],    // distinct physical regs assigned
+    stack_bytes: int,    // total spill area (16-byte aligned)
+    spill_count: int     // number of VIDs forced to stack
+}
+
+fn regalloc_loc_reg() -> int { return 0 }
+fn regalloc_loc_stack() -> int { return 1 }
+
+// ──────────────────────────────────────────────────────────────
+// Pass 1: def/use scan.
+//
+// `block_instrs[i]` is a flat row `[result_vid, op_vid_1, op_vid_2, ...]`
+// — the shape produced by flatten_ir_instrs in self/codegen/mod.hexa
+// and also what count_uses / compute_use_def_set consume.
+//
+// Returns parallel arrays so the caller can tune interval
+// construction without re-walking. Negative VIDs (sentinel
+// terminators like ret's -1) are skipped so we never index a counts
+// array at a negative offset.
+// ──────────────────────────────────────────────────────────────
+fn scan_def_use(block_instrs: [[int]]) -> [[int]] {
+    // Returns [def_vids, def_idx, use_vids, use_idx].
+    // All are flat int arrays; callers zip def_vids with def_idx.
+    let mut def_vids = []
+    let mut def_idx = []
+    let mut use_vids = []
+    let mut use_idx = []
+    let mut i = 0
+    while i < len(block_instrs) {
+        let instr = block_instrs[i]
+        if len(instr) > 0 {
+            let result = instr[0]
+            if result >= 0 {
+                def_vids.push(result)
+                def_idx.push(i)
+            }
+            let mut j = 1
+            while j < len(instr) {
+                let op = instr[j]
+                if op >= 0 {
+                    use_vids.push(op)
+                    use_idx.push(i)
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+    return [def_vids, def_idx, use_vids, use_idx]
+}
+
+// ──────────────────────────────────────────────────────────────
+// Pass 2: build live intervals.
+//
+// For each defined VID: start = its def position, end = the last
+// instruction index where it appears as result OR operand. A VID
+// with no uses still gets end_pos = start so linear scan can emit
+// a slot (the value might be consumed by a side-effecting sink
+// invisible to the scan).
+//
+// Uses count is recorded on the interval for the spill heuristic.
+// ──────────────────────────────────────────────────────────────
+fn build_intervals(block_instrs: [[int]]) -> [LR] {
+    let defuse = scan_def_use(block_instrs)
+    let def_vids = defuse[0]
+    let def_idx = defuse[1]
+    let use_vids = defuse[2]
+    let use_idx = defuse[3]
+
+    let mut intervals = []
+    let mut i = 0
+    while i < len(def_vids) {
+        let vid = def_vids[i]
+        let start = def_idx[i]
+        let mut end_pos = start
+        let mut uses = 0
+        let mut j = 0
+        while j < len(use_vids) {
+            if use_vids[j] == vid {
+                if use_idx[j] > end_pos { end_pos = use_idx[j] }
+                uses = uses + 1
+            }
+            j = j + 1
+        }
+        intervals.push(lr_new(vid, start, end_pos, uses))
+        i = i + 1
+    }
+    return intervals
+}
+
+// ──────────────────────────────────────────────────────────────
+// Helper: array membership test.
+// ──────────────────────────────────────────────────────────────
+fn lr_contains(arr: [int], val: int) -> bool {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == val { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Remove element at index `idx` by rebuild (stage0 safe).
+fn lr_remove_at(arr: [int], idx: int) -> [int] {
+    let mut out = []
+    let mut i = 0
+    while i < len(arr) {
+        if i != idx { out.push(arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+// ──────────────────────────────────────────────────────────────
+// Spill heuristic.
+//
+// Score each active interval by end_pos * 100 / (1 + uses) — higher
+// score means "long-lived, rarely-used" = better spill candidate.
+// Returns the active-array index to evict; caller releases its
+// physical register. We compare the incoming interval's score too:
+// if the incoming interval is itself the best spill candidate, it
+// goes straight to stack and no active entry is evicted.
+//
+// Return values:
+//   evict_idx >= 0 — evict active[evict_idx], assign reg to new iv
+//   evict_idx = -1 — spill the new iv directly
+// ──────────────────────────────────────────────────────────────
+fn spill_pick(active_end: [int], active_uses: [int], new_end: int, new_uses: int) -> int {
+    let mut best_score = new_end * 100 / (1 + new_uses)
+    let mut best_idx = -1
+    let mut i = 0
+    while i < len(active_end) {
+        let score = active_end[i] * 100 / (1 + active_uses[i])
+        if score > best_score {
+            best_score = score
+            best_idx = i
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+// ──────────────────────────────────────────────────────────────
+// Pass 3: linear-scan allocation with spill_pick.
+//
+// Invariants (match regalloc_linear.hexa):
+//   - `regs` is the pool of physical register indices.
+//   - Intervals are expected pre-sorted by start (we sort on the fly
+//     with a small selection sort so callers don't have to).
+//   - Output tag 0 = REG, tag 1 = STACK. Stack offsets are negative
+//     and 16-byte aligned at the end.
+// ──────────────────────────────────────────────────────────────
+fn allocate_linear(intervals: [LR], regs: [int]) -> RegallocResult {
+    let k = len(regs)
+
+    // Selection sort intervals by .start — tiny n, stage0-friendly.
+    let mut sorted = []
+    let mut consumed = []
+    let n = len(intervals)
+    let mut t = 0
+    while t < n { consumed.push(0); t = t + 1 }
+    let mut ordered = 0
+    while ordered < n {
+        let mut best = -1
+        let mut s = 0
+        while s < n {
+            if consumed[s] == 0 {
+                if best < 0 { best = s }
+                else if intervals[s].start < intervals[best].start { best = s }
+            }
+            s = s + 1
+        }
+        sorted.push(intervals[best])
+        let mut new_consumed = []
+        let mut cc = 0
+        while cc < n {
+            if cc == best { new_consumed.push(1) }
+            else { new_consumed.push(consumed[cc]) }
+            cc = cc + 1
+        }
+        consumed = new_consumed
+        ordered = ordered + 1
+    }
+
+    // Output parallel arrays.
+    let mut out_vids = []
+    let mut out_tags = []
+    let mut out_vals = []
+    let mut used_regs = []
+    let mut stack_off = 0
+    let mut spill_count = 0
+
+    // Active list: parallel arrays.
+    let mut active_regidx = []   // physical reg index (0..k)
+    let mut active_end = []
+    let mut active_uses = []
+    let mut active_vid = []
+
+    // Free register stack (indices into regs[]).
+    let mut free_regs = []
+    let mut fi = k - 1
+    while fi >= 0 {
+        free_regs.push(fi)
+        fi = fi - 1
+    }
+
+    let mut i = 0
+    while i < len(sorted) {
+        let iv = sorted[i]
+
+        // Expire ended intervals: any active whose end < iv.start.
+        let mut j = 0
+        while j < len(active_end) {
+            if active_end[j] < iv.start {
+                free_regs.push(active_regidx[j])
+                active_regidx = lr_remove_at(active_regidx, j)
+                active_end = lr_remove_at(active_end, j)
+                active_uses = lr_remove_at(active_uses, j)
+                active_vid = lr_remove_at(active_vid, j)
+            } else {
+                j = j + 1
+            }
+        }
+
+        if len(active_regidx) < k {
+            // Regs available — pop free stack.
+            let top = len(free_regs) - 1
+            let reg_idx = free_regs[top]
+            free_regs = lr_remove_at(free_regs, top)
+
+            let reg = regs[reg_idx]
+            out_vids.push(iv.value)
+            out_tags.push(0)
+            out_vals.push(reg)
+            if !lr_contains(used_regs, reg) { used_regs.push(reg) }
+
+            active_regidx.push(reg_idx)
+            active_end.push(iv.end_pos)
+            active_uses.push(iv.uses)
+            active_vid.push(iv.value)
+        } else {
+            // Full — consult spill heuristic.
+            let evict = spill_pick(active_end, active_uses, iv.end_pos, iv.uses)
+            if evict < 0 {
+                // Spill the incoming interval.
+                stack_off = stack_off - 8
+                out_vids.push(iv.value)
+                out_tags.push(1)
+                out_vals.push(stack_off)
+                spill_count = spill_count + 1
+            } else {
+                // Evict active[evict], spill its VID, assign its reg
+                // to the new interval.
+                let victim_vid = active_vid[evict]
+                let victim_regidx = active_regidx[evict]
+                let victim_end = active_end[evict]
+                let victim_uses = active_uses[evict]
+
+                // Rewrite the victim's output entry from REG→STACK.
+                stack_off = stack_off - 8
+                let mut ri = 0
+                let mut new_tags = []
+                let mut new_vals = []
+                while ri < len(out_vids) {
+                    if out_vids[ri] == victim_vid {
+                        new_tags.push(1)
+                        new_vals.push(stack_off)
+                    } else {
+                        new_tags.push(out_tags[ri])
+                        new_vals.push(out_vals[ri])
+                    }
+                    ri = ri + 1
+                }
+                out_tags = new_tags
+                out_vals = new_vals
+                spill_count = spill_count + 1
+
+                // Replace victim slot in active with the new interval.
+                let reg = regs[victim_regidx]
+                out_vids.push(iv.value)
+                out_tags.push(0)
+                out_vals.push(reg)
+                if !lr_contains(used_regs, reg) { used_regs.push(reg) }
+
+                // Rewrite active arrays in place via rebuild.
+                let mut new_ar = []
+                let mut new_ae = []
+                let mut new_au = []
+                let mut new_av = []
+                let mut ai = 0
+                while ai < len(active_regidx) {
+                    if ai == evict {
+                        new_ar.push(victim_regidx)
+                        new_ae.push(iv.end_pos)
+                        new_au.push(iv.uses)
+                        new_av.push(iv.value)
+                    } else {
+                        new_ar.push(active_regidx[ai])
+                        new_ae.push(active_end[ai])
+                        new_au.push(active_uses[ai])
+                        new_av.push(active_vid[ai])
+                    }
+                    ai = ai + 1
+                }
+                active_regidx = new_ar
+                active_end = new_ae
+                active_uses = new_au
+                active_vid = new_av
+                // Suppress unused warnings for victim_end/uses
+                // (kept for debuggability when this scaffold grows).
+                let _ = victim_end
+                let _ = victim_uses
+            }
+        }
+        i = i + 1
+    }
+
+    // 16-byte alignment.
+    let mut stack_bytes = 0
+    if stack_off < 0 {
+        stack_bytes = (0 - stack_off + 15) / 16 * 16
+    }
+
+    return RegallocResult {
+        vids: out_vids,
+        tags: out_tags,
+        vals: out_vals,
+        used_regs: used_regs,
+        stack_bytes: stack_bytes,
+        spill_count: spill_count
+    }
+}
+
+// ──────────────────────────────────────────────────────────────
+// Driver: one-shot pipeline from raw block_instrs.
+// Used by test_liveness_regalloc.hexa.
+// ──────────────────────────────────────────────────────────────
+fn regalloc_from_block(block_instrs: [[int]], regs: [int]) -> RegallocResult {
+    let intervals = build_intervals(block_instrs)
+    return allocate_linear(intervals, regs)
+}
+
+// ──────────────────────────────────────────────────────────────
+// Lookup helper — returns the index in result.vids for a VID,
+// or -1 if not present.
+// ──────────────────────────────────────────────────────────────
+fn regalloc_lookup(result: RegallocResult, vid: int) -> int {
+    let mut i = 0
+    while i < len(result.vids) {
+        if result.vids[i] == vid { return i }
+        i = i + 1
+    }
+    return -1
+}

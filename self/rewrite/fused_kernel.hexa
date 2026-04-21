@@ -1,0 +1,314 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/rewrite/fused_kernel.hexa — ROI #183
+//
+//  @fused_kernel — auto-fusion pass for element-wise op chains.
+//
+//  Motivation:
+//      Element-wise pipelines such as
+//          y = relu(mul(add(x, a), b))
+//      are typically expressed as a chain of pointwise calls. Each
+//      call materialises a fresh tensor the next op has to read back —
+//      one full memory round-trip per op, plus one extra allocation
+//      per intermediate. For a K-op chain this is K+1 allocations and
+//      2·N·K memory round-trips where N is the tensor length.
+//
+//      This pass walks a small AST and recognises maximal chains of
+//      element-wise ops (add, mul, relu, plus a few common friends)
+//      and rewrites them to a single fused-kernel node whose body is
+//      the composed pointwise function. At codegen / interpret time
+//      the fused node runs the whole chain in one pass over the input
+//      with one output allocation — K intermediates eliminated.
+//
+//  Scope (scaffold):
+//      -   AST nodes: var / const / add / mul / relu / fused_kernel
+//      -   2-op chain:   relu(add(x, c))            → fused_kernel([+c, relu], x)
+//                        relu(mul(x, c))            → fused_kernel([*c, relu], x)
+//                        mul(add(x, a), b)          → fused_kernel([+a, *b], x)
+//      -   3-op chain:   relu(mul(add(x, a), b))    → fused_kernel([+a, *b, relu], x)
+//      -   Non-matching trees pass through unchanged.
+//      -   Chain is linear: exactly one element-wise child on the
+//          fusion path (the other operand, if any, is a scalar const).
+//
+//  Public API
+//  ──────────
+//      Constructors:
+//          e_var(name)            leaf  — named tensor input
+//          e_const(value)          leaf  — scalar constant
+//          e_add(a, b)             binary (element-wise)
+//          e_mul(a, b)             binary (element-wise)
+//          e_relu(x)               unary  (element-wise)
+//          e_fused(ops, input)     fused kernel: ops = [Op], input = Expr
+//          op_add_c(c) / op_mul_c(c) / op_relu()
+//              — step records inside a fused kernel
+//
+//      Predicates / walkers:
+//          is_elementwise(e) -> bool      true for add/mul/relu only
+//          chain_length(e)   -> int       longest linear chain from e
+//          fuse_chain(e)     -> Expr      top-level rewrite (recursive)
+//
+//      Semantics:
+//          eval_scalar(e, env) -> float       ref interpreter (pre-rewrite)
+//          eval_fused_scalar(e, env) -> float same interpreter, handles
+//                                          fused_kernel nodes too
+//
+//      Accounting:
+//          alloc_count(e)         -> int      # intermediate tensors
+//          fused_alloc_count(e)   -> int      always 1 for a fused kernel
+//
+//  Numerical contract
+//  ──────────────────
+//      For every env and every expression `e`:
+//          eval_fused_scalar(fuse_chain(e), env)
+//              == eval_scalar(e, env)           within 1e-9
+//      The rewrite is observationally identical to the original
+//      pointwise chain on any scalar input.
+//
+//  Grammar cautions (HX3 pitfalls — mirrored from graph_pattern.hexa)
+//  ─────────────────────────────────────────────────────────────────
+//      - no enum          → use kind-tagged string
+//      - no dict literal  → use struct
+//      - no `and`/`or`    → `&&`/`||`
+//      - slice parens     → arr[(i+1)..j]
+//      - `@attr pub fn` unsupported → bare `fn` ok here
+//      - struct literal forbidden inside `if` head
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Expr struct — kind-tagged AST node ─────────────────────────────
+// kind ∈ { "var", "const", "add", "mul", "relu", "fused_kernel" }
+//
+//   var           lhs = name (string)          rhs = ""
+//   const         lhs = value (float)           rhs = ""
+//   add           lhs = Expr                    rhs = Expr
+//   mul           lhs = Expr                    rhs = Expr
+//   relu          lhs = Expr                    rhs = ""
+//   fused_kernel  lhs = Expr (the input leaf)  rhs = [Op] chain
+struct Expr {
+    kind: string
+    lhs: any
+    rhs: any
+}
+
+// ── Op step inside a fused kernel ──────────────────────────────────
+// op ∈ { "add_c", "mul_c", "relu" }
+//   add_c / mul_c : c is the scalar constant
+//   relu          : c unused (set to 0.0 by convention)
+struct Op {
+    op: string
+    c: float
+}
+
+// ── constructors ───────────────────────────────────────────────────
+fn e_var(name) {
+    return Expr{kind: "var", lhs: name, rhs: ""}
+}
+
+fn e_const(value) {
+    return Expr{kind: "const", lhs: value, rhs: ""}
+}
+
+fn e_add(a, b) {
+    return Expr{kind: "add", lhs: a, rhs: b}
+}
+
+fn e_mul(a, b) {
+    return Expr{kind: "mul", lhs: a, rhs: b}
+}
+
+fn e_relu(x) {
+    return Expr{kind: "relu", lhs: x, rhs: ""}
+}
+
+fn e_fused(input, ops) {
+    return Expr{kind: "fused_kernel", lhs: input, rhs: ops}
+}
+
+fn op_add_c(c) {
+    return Op{op: "add_c", c: c}
+}
+
+fn op_mul_c(c) {
+    return Op{op: "mul_c", c: c}
+}
+
+fn op_relu() {
+    return Op{op: "relu", c: 0.0}
+}
+
+// ── predicates ─────────────────────────────────────────────────────
+// An expression is element-wise if its root is add/mul/relu. Leaves
+// (var/const) are not element-wise ops themselves but are valid
+// termini of a chain.
+fn is_elementwise(e) {
+    if e.kind == "add"  { return true }
+    if e.kind == "mul"  { return true }
+    if e.kind == "relu" { return true }
+    return false
+}
+
+fn is_leaf(e) {
+    if e.kind == "var"   { return true }
+    if e.kind == "const" { return true }
+    return false
+}
+
+// For a binary op node, returns the element-wise child (the fusion
+// path) and the scalar const child. Caller must have already verified
+// that exactly one side is a const leaf and the other is any Expr.
+// Returns struct{ew, c} where `ew` is the non-const Expr and `c` is
+// the float constant.
+struct Split {
+    ew: any
+    c: float
+    ok: bool
+}
+
+fn split_binary(e) {
+    let l = e.lhs
+    let r = e.rhs
+    if l.kind == "const" {
+        return Split{ew: r, c: l.lhs, ok: true}
+    }
+    if r.kind == "const" {
+        return Split{ew: l, c: r.lhs, ok: true}
+    }
+    // Neither operand is a const leaf — cannot fold into an Op step.
+    return Split{ew: l, c: 0.0, ok: false}
+}
+
+// Longest chain of element-wise nodes rooted at e, stopping at the
+// first leaf or non-element-wise node. Leaf itself contributes 0.
+fn chain_length(e) {
+    if is_leaf(e) { return 0 }
+    if e.kind == "relu" {
+        return 1 + chain_length(e.lhs)
+    }
+    if e.kind == "add" || e.kind == "mul" {
+        let s = split_binary(e)
+        if !s.ok { return 0 }
+        return 1 + chain_length(s.ew)
+    }
+    return 0
+}
+
+// ── inner walker ───────────────────────────────────────────────────
+// Collects (in apply-order) the list of Op steps along the fusion
+// path starting at e, and returns {ops, input} where input is the
+// leaf that feeds the chain. If the chain is empty (input is already
+// a leaf), returns the empty ops list and the leaf.
+//
+// Apply-order means the caller can evaluate the fused kernel as
+//     acc = eval(input)
+//     for step in ops: acc = step(acc)
+// and reproduce eval(e).
+struct Collected {
+    ops: any
+    input: any
+}
+
+fn collect_chain(e) {
+    if is_leaf(e) {
+        return Collected{ops: [], input: e}
+    }
+    if e.kind == "relu" {
+        let inner = collect_chain(e.lhs)
+        return Collected{ops: inner.ops + [op_relu()], input: inner.input}
+    }
+    if e.kind == "add" {
+        let s = split_binary(e)
+        if !s.ok { return Collected{ops: [], input: e} }
+        let inner = collect_chain(s.ew)
+        return Collected{ops: inner.ops + [op_add_c(s.c)], input: inner.input}
+    }
+    if e.kind == "mul" {
+        let s = split_binary(e)
+        if !s.ok { return Collected{ops: [], input: e} }
+        let inner = collect_chain(s.ew)
+        return Collected{ops: inner.ops + [op_mul_c(s.c)], input: inner.input}
+    }
+    // non-elementwise node — stop the chain here.
+    return Collected{ops: [], input: e}
+}
+
+// ── top-level rewrite ──────────────────────────────────────────────
+// If the root expression begins an element-wise chain of length ≥ 2,
+// rewrite the whole chain to a single fused_kernel node. Chains of
+// length 0 or 1 are left alone (no fusion benefit).
+fn fuse_chain(e) {
+    let clen = chain_length(e)
+    if clen < 2 { return e }
+    let c = collect_chain(e)
+    return e_fused(c.input, c.ops)
+}
+
+// ── reference evaluator — pre-rewrite semantics ────────────────────
+// env is a list of pairs [name, value] used to resolve e_var.
+fn lookup_env(env, name) {
+    let n = len(env)
+    let mut i = 0
+    while i < n {
+        let pair = env[i]
+        if pair[0] == name { return pair[1] }
+        i = i + 1
+    }
+    return 0.0
+}
+
+fn relu_scalar(x) {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+// eval_scalar handles var/const/add/mul/relu. fused_kernel is
+// intentionally NOT handled here — it is the rewrite output only.
+fn eval_scalar(e, env) {
+    if e.kind == "var"   { return lookup_env(env, e.lhs) }
+    if e.kind == "const" { return e.lhs }
+    if e.kind == "add"   { return eval_scalar(e.lhs, env) + eval_scalar(e.rhs, env) }
+    if e.kind == "mul"   { return eval_scalar(e.lhs, env) * eval_scalar(e.rhs, env) }
+    if e.kind == "relu"  { return relu_scalar(eval_scalar(e.lhs, env)) }
+    return 0.0
+}
+
+// Evaluator that also knows how to run a fused_kernel. Runs the
+// collected op list in apply-order on top of the input value.
+fn eval_fused_scalar(e, env) {
+    if e.kind == "fused_kernel" {
+        let mut acc = eval_fused_scalar(e.lhs, env)
+        let ops = e.rhs
+        let n = len(ops)
+        let mut i = 0
+        while i < n {
+            let step = ops[i]
+            if step.op == "add_c" { acc = acc + step.c }
+            if step.op == "mul_c" { acc = acc * step.c }
+            if step.op == "relu"  { acc = relu_scalar(acc) }
+            i = i + 1
+        }
+        return acc
+    }
+    if e.kind == "var"   { return lookup_env(env, e.lhs) }
+    if e.kind == "const" { return e.lhs }
+    if e.kind == "add"   { return eval_fused_scalar(e.lhs, env) + eval_fused_scalar(e.rhs, env) }
+    if e.kind == "mul"   { return eval_fused_scalar(e.lhs, env) * eval_fused_scalar(e.rhs, env) }
+    if e.kind == "relu"  { return relu_scalar(eval_fused_scalar(e.lhs, env)) }
+    return 0.0
+}
+
+// ── allocation accounting ──────────────────────────────────────────
+// For a pure element-wise chain, every element-wise node in the
+// original AST corresponds to one intermediate tensor. Leaves cost 0.
+// The fused kernel costs exactly 1 regardless of chain length.
+fn alloc_count(e) {
+    if is_leaf(e) { return 0 }
+    if e.kind == "relu" { return 1 + alloc_count(e.lhs) }
+    if e.kind == "add" || e.kind == "mul" {
+        return 1 + alloc_count(e.lhs) + alloc_count(e.rhs)
+    }
+    if e.kind == "fused_kernel" { return 1 }
+    return 0
+}
+
+fn fused_alloc_count(e) {
+    if e.kind == "fused_kernel" { return 1 }
+    return alloc_count(e)
+}

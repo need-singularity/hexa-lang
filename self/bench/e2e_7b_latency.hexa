@@ -1,0 +1,273 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/bench/e2e_7b_latency.hexa — ROI #184
+//
+//  End-to-end LLM 7B inference latency benchmark (scaffold).
+//
+//  Why this exists:
+//    Real-world serving latency has three disjoint stages with very
+//    different dominant costs:
+//      1. load    — read + mmap weights (I/O bound, once per process)
+//      2. prefill — forward pass over prompt_tokens (compute bound,
+//                   O(prompt_len * dim^2))
+//      3. decode  — autoregressive loop (memory-bandwidth bound,
+//                   O(max_new * dim^2) per token + KV read)
+//    Reporting only tok/s hides the load/prefill tail. This harness
+//    measures all three stages separately, emits wall-clock + per-stage
+//    ms + overall tokens/s, and reports TTFT (load + prefill + 1
+//    decode) which is the user-visible metric.
+//
+//  Scaffold semantics:
+//    The interpreter-level bench can't actually load a real 7B model
+//    (no 16GB weight file, no BLAS-linked matmul). Instead, each stage
+//    runs a CALIBRATED amount of pure-hexa work whose cost is
+//    proportional to the real stage's FLOPs/bytes. Knobs:
+//      --load-iter    load-phase stub iterations (mimic mmap+init)
+//      --prompt-len   prefill token count (compute scales linearly)
+//      --max-new      decode token count (compute scales linearly)
+//      --dim          per-step work width (default 128 ≪ 4096 real 7B)
+//    Defaults are deliberately tiny (to finish under the stage0
+//    interpreter in a few seconds) but the SHAPE of the output
+//    (load_ms, prefill_ms, decode_ms, tokens_per_sec, ttft_ms) matches
+//    what you'd emit from a real vLLM/TGI profiler.
+//
+//  Output: single JSON line on stdout. Human lines prefixed with [info].
+//
+//  CLI:
+//    hexa run self/bench/e2e_7b_latency.hexa \
+//        [--load-iter N] [--prompt-len N] [--max-new N] [--dim N]
+//
+//  Notes:
+//    - Pure .hexa. No Rust, no FFI, no external weights.
+//    - Unit pinning (matches memory/feedback_bench_unit_check.md):
+//        tokens_per_sec = max_new / (decode_ms / 1000)  — DECODE only.
+//        ttft_ms        = load_ms + prefill_ms + decode_ms_first_tok.
+//        total_ms       = load_ms + prefill_ms + decode_ms.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Stub workload primitives ────────────────────────────────────────
+// A calibrated float loop that mimics per-stage FLOPs cost without
+// needing real matmul. Chosen so that interpreter ms ≈ stage ordering
+// (load > prefill_per_tok > decode_per_tok) for default knobs.
+
+fn busy_work(n) {
+    // Non-trivial float work so the optimizer can't fold it away.
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + to_float(i) * 0.0001
+        acc = acc - to_float(i) * 0.00009
+        i = i + 1
+    }
+    return acc
+}
+
+fn stage_load(load_iter) {
+    // Dummy "weight load": simulate reading N shards of a 7B model.
+    // Real cost would be mmap + f16→f32 unpack + HBM copy. We
+    // approximate by running load_iter * unit_work float ops.
+    let per_shard = 5000
+    let mut total = 0.0
+    let mut s = 0
+    while s < load_iter {
+        total = total + busy_work(per_shard)
+        s = s + 1
+    }
+    return total
+}
+
+fn stage_prefill_step(dim) {
+    // Dummy per-prompt-token prefill cost. Real cost is a full
+    // forward pass over the current position (dim^2 matmul + attn).
+    // We approximate as O(dim) float ops at the interpreter level
+    // (dim^2 would dominate decode and obscure the ratio).
+    return busy_work(dim * 8)
+}
+
+fn stage_decode_step(dim) {
+    // Dummy per-decode-token cost. Same shape as prefill step but a
+    // bit lighter per-step because the kv-cache reuses prior K/V
+    // projections (the "serving number" scenario from
+    // memory/feedback_kvcache_serving_number.md).
+    return busy_work(dim * 6)
+}
+
+// ── Run stages with wall-clock timing ───────────────────────────────
+fn run_e2e(load_iter, prompt_len, max_new, dim) {
+    // ---- load ----
+    let t_load_0 = timestamp()
+    let _load_acc = stage_load(load_iter)
+    let t_load_1 = timestamp()
+    let load_ms = t_load_1 - t_load_0
+
+    // ---- prefill ----
+    let t_prefill_0 = timestamp()
+    let mut prefill_acc = 0.0
+    let mut p = 0
+    while p < prompt_len {
+        prefill_acc = prefill_acc + stage_prefill_step(dim)
+        p = p + 1
+    }
+    let t_prefill_1 = timestamp()
+    let prefill_ms = t_prefill_1 - t_prefill_0
+
+    // ---- decode ----
+    // Track first-token ms separately so we can compute TTFT.
+    let t_decode_0 = timestamp()
+    let mut first_tok_ms = 0
+    let mut decode_acc = 0.0
+    let mut d = 0
+    while d < max_new {
+        let t_step_0 = timestamp()
+        decode_acc = decode_acc + stage_decode_step(dim)
+        let t_step_1 = timestamp()
+        if d == 0 {
+            first_tok_ms = t_step_1 - t_step_0
+        }
+        d = d + 1
+    }
+    let t_decode_1 = timestamp()
+    let decode_ms = t_decode_1 - t_decode_0
+
+    // ---- derived metrics ----
+    let total_ms = load_ms + prefill_ms + decode_ms
+    let ttft_ms = load_ms + prefill_ms + first_tok_ms
+
+    let mut tokens_per_sec = 0.0
+    if decode_ms > 0 {
+        tokens_per_sec = to_float(max_new) / (to_float(decode_ms) / 1000.0)
+    }
+    let mut latency_ms_per_tok = 0.0
+    if max_new > 0 {
+        latency_ms_per_tok = to_float(decode_ms) / to_float(max_new)
+    }
+
+    let out = #{}
+    out["load_ms"]            = load_ms
+    out["prefill_ms"]         = prefill_ms
+    out["decode_ms"]          = decode_ms
+    out["total_ms"]           = total_ms
+    out["ttft_ms"]            = ttft_ms
+    out["first_tok_ms"]       = first_tok_ms
+    out["tokens_per_sec"]     = tokens_per_sec
+    out["latency_ms_per_tok"] = latency_ms_per_tok
+    out["prompt_len"]         = prompt_len
+    out["max_new"]            = max_new
+    out["dim"]                = dim
+    out["load_iter"]          = load_iter
+    // Prevent DCE of stage accumulators.
+    out["_load_acc"]          = _load_acc
+    out["_prefill_acc"]       = prefill_acc
+    out["_decode_acc"]        = decode_acc
+    return out
+}
+
+// ── JSON encoding (minimal, no json_stringify dep) ──────────────────
+fn jf(x) { return str(x) }
+fn ji(x) { return str(x) }
+
+fn build_json(r) {
+    let mut parts = []
+    parts.push("{")
+    parts.push("\"bench\":\"e2e_7b_latency\"")
+    parts.push(",\"load_ms\":")            parts.push(ji(r["load_ms"]))
+    parts.push(",\"prefill_ms\":")         parts.push(ji(r["prefill_ms"]))
+    parts.push(",\"decode_ms\":")          parts.push(ji(r["decode_ms"]))
+    parts.push(",\"total_ms\":")           parts.push(ji(r["total_ms"]))
+    parts.push(",\"ttft_ms\":")            parts.push(ji(r["ttft_ms"]))
+    parts.push(",\"first_tok_ms\":")       parts.push(ji(r["first_tok_ms"]))
+    parts.push(",\"tokens_per_sec\":")     parts.push(jf(r["tokens_per_sec"]))
+    parts.push(",\"latency_ms_per_tok\":") parts.push(jf(r["latency_ms_per_tok"]))
+    parts.push(",\"prompt_len\":")         parts.push(ji(r["prompt_len"]))
+    parts.push(",\"max_new\":")            parts.push(ji(r["max_new"]))
+    parts.push(",\"dim\":")                parts.push(ji(r["dim"]))
+    parts.push(",\"load_iter\":")          parts.push(ji(r["load_iter"]))
+    parts.push(",\"scaffold\":true")
+    parts.push("}")
+    return parts.join("")
+}
+
+// ── CLI ─────────────────────────────────────────────────────────────
+fn _flag(av, n, key, default_v) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key {
+            if (i + 1) < n {
+                return av[(i + 1)]
+            }
+        }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _has(av, n, key) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _print_help() {
+    println("E2E LLM 7B inference latency benchmark (ROI #184, scaffold)")
+    println("")
+    println("Usage:")
+    println("  hexa run self/bench/e2e_7b_latency.hexa [flags]")
+    println("")
+    println("Flags:")
+    println("  --load-iter N    load-phase stub iters (default: 4)")
+    println("  --prompt-len N   prefill tokens (default: 16)")
+    println("  --max-new N      decode tokens (default: 8)")
+    println("  --dim N          per-step work width (default: 128)")
+    println("  --help           This help")
+    println("")
+    println("Output: one JSON line on stdout.")
+    println("  load_ms        — stage 1 wall clock")
+    println("  prefill_ms     — stage 2 wall clock")
+    println("  decode_ms      — stage 3 wall clock")
+    println("  ttft_ms        — load + prefill + first-token decode")
+    println("  tokens_per_sec — max_new / (decode_ms / 1000)")
+    println("")
+    println("NOTE: scaffold only — no real 7B weights are loaded. The")
+    println("per-stage work is a calibrated stub whose cost is")
+    println("proportional to real-model FLOPs/bytes. For production")
+    println("numbers see docs/bench/ once native+FFI+weights land.")
+}
+
+fn main() {
+    let av = args()
+    let n_av = len(av)
+
+    if _has(av, n_av, "--help") {
+        _print_help()
+        return
+    }
+
+    let load_iter  = to_int(_flag(av, n_av, "--load-iter",  "4"))
+    let prompt_len = to_int(_flag(av, n_av, "--prompt-len", "16"))
+    let max_new    = to_int(_flag(av, n_av, "--max-new",    "8"))
+    let dim        = to_int(_flag(av, n_av, "--dim",        "128"))
+
+    println("[info] e2e_7b_latency scaffold: load_iter=" + str(load_iter)
+        + " prompt_len=" + str(prompt_len)
+        + " max_new=" + str(max_new)
+        + " dim=" + str(dim))
+
+    println("[info] stage 1/3: load (stub)...")
+    println("[info] stage 2/3: prefill (stub)...")
+    println("[info] stage 3/3: decode (stub)...")
+
+    let r = run_e2e(load_iter, prompt_len, max_new, dim)
+
+    println("[info] load_ms="    + str(r["load_ms"])
+        + " prefill_ms="         + str(r["prefill_ms"])
+        + " decode_ms="          + str(r["decode_ms"])
+        + " ttft_ms="            + str(r["ttft_ms"])
+        + " tok/s="              + str(r["tokens_per_sec"]))
+
+    let j = build_json(r)
+    println(j)
+}
+
+// Stage0 auto-calls fn main() at end of file.

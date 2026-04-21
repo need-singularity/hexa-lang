@@ -1,0 +1,194 @@
+// self/test_hxcuda_matmul.hexa — ROI #188 PoC stage 1 (CUDA backend symmetry)
+//
+// Sibling of self/test_hxmetal_matmul.hexa. Verifies the hxc_matmul
+// driver + CUDA C++ kernel source + NVRTC/cuBLAS FFI declarations
+// added on top of the hxmetal symmetric scaffold. Stage 1 asserts:
+//   - shape contract (M*K / K*N / M*N lengths, empty on mismatch)
+//   - CUDA kernel source string is non-empty and references signature
+//   - CPU reference correctness on small fixed operands (identity, 2x3*3x2)
+//   - dispatch driver correctness on 64×64×64 vs CPU reference
+//     (max abs error < 1e-4 — self-consistency check while LIVE=0)
+//   - tile / live / cuBLAS op-code probes behave per stage 1 contract
+//
+// LIVE-WIRE
+//   hxc_matmul today routes to hxc_matmul_cpu_ref when HXC_MATMUL_LIVE=0.
+//   Once NVRTC + cudart + cuBLAS wiring lands and HXC_MATMUL_LIVE flips
+//   to 1 (stage 2), this same test becomes the live GPU vs CPU correctness
+//   gate WITHOUT any assertion change — f32 GEMM tolerance is chosen to
+//   survive reorder-sum rounding at these dims.
+//
+// SYMBOL-BINDING CHECK (not runtime)
+//   The FFI decls (nvrtcCreateProgram / cublasSgemm_v2 / ...) live at
+//   module scope in self/ffi/hxcuda_matmul.hexa. We do NOT call them.
+//   Loading this test file is sufficient to prove the declarations
+//   parse and the symbol-namespace is reserved; the host-FFI resolver
+//   only dlopens libnvrtc / libcublas on first CALL, so non-CUDA hosts
+//   (CI, macOS) remain healthy. This mirrors the hxmetal approach of
+//   carrying Metal.framework decls without invoking them pre-#157.
+//
+// Run:
+//   hexa self/test_hxcuda_matmul.hexa
+// Expected: all checks "ok", exit 0, on any host (Linux, macOS, CI).
+
+use self::ffi::hxcuda_matmul
+use self::runtime::math_pure
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label: string, cond: bool) -> int {
+    if cond {
+        PASS = PASS + 1
+        println("ok: " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("FAIL: " + label)
+    }
+    return 0
+}
+
+// Deterministic PRNG — avoid pulling rng module, strict-safe.
+// Lehmer xorshift; state is a single int. Returns float in [0, 1).
+let mut RNG_STATE = 2463534242
+
+fn rng_next() -> int {
+    let mut x = RNG_STATE
+    x = x * 1103515245 + 12345
+    if x < 0 { x = 0 - x }
+    x = x % 2147483647
+    RNG_STATE = x
+    return x
+}
+
+fn rng_float() -> float {
+    let v = rng_next()
+    return (v * 1.0) / 2147483647.0
+}
+
+// Build a deterministic row-major m×n matrix in [0, 1).
+fn make_matrix(m: int, n: int) {
+    let mut out = []
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        out.push(rng_float())
+        i = i + 1
+    }
+    return out
+}
+
+// Max absolute elementwise diff between two flat arrays.
+fn max_abs_diff(a, b) -> float {
+    let n = len(a)
+    let mut m = 0.0
+    let mut i = 0
+    while i < n {
+        let d = abs_pure(a[i] - b[i])
+        if d > m { m = d }
+        i = i + 1
+    }
+    return m
+}
+
+fn main() -> int {
+    // ── shape contract ─────────────────────────────────────────
+    // Empty inputs: any dim <= 0 → []
+    let e0 = hxc_matmul([], [], 0, 0, 0)
+    check("hxc_matmul zero dims returns []", len(e0) == 0)
+    let e1 = hxc_matmul([], [], 1, 1, 0)
+    check("hxc_matmul k=0 returns []", len(e1) == 0)
+
+    // Mismatched A length → []
+    let bad_a = hxc_matmul([1.0], [1.0, 0.0, 0.0, 1.0], 2, 2, 2)
+    check("hxc_matmul len(A)!=m*k returns []", len(bad_a) == 0)
+    // Mismatched B length → []
+    let bad_b = hxc_matmul([1.0, 0.0, 0.0, 1.0], [1.0], 2, 2, 2)
+    check("hxc_matmul len(B)!=k*n returns []", len(bad_b) == 0)
+
+    // ── CUDA source sanity ─────────────────────────────────────
+    let src = hxc_matmul_cuda_source()
+    check("cuda source non-empty", len(src) > 0)
+    // Must reference kernel signature and grid indexing by substring.
+    check("cuda src contains '__global__'", contains(src, "__global__"))
+    check("cuda src contains 'void matmul'", contains(src, "void matmul"))
+    check("cuda src contains 'blockIdx'", contains(src, "blockIdx"))
+    check("cuda src contains 'threadIdx'", contains(src, "threadIdx"))
+    check("cuda src contains output write 'C[row*N'", contains(src, "C[row*N"))
+    check("cuda src contains extern C linkage", contains(src, "extern \"C\""))
+
+    // ── tile + live + version exposure ─────────────────────────
+    check("hxc_matmul_tile() == 16 (stage 1)", hxc_matmul_tile() == 16)
+    check("hxc_matmul_live() == 0 (stage 1 pre-wiring)", hxc_matmul_live() == 0)
+    check("hxc_version() >= 1 (scaffold intact)", hxc_version() >= 1)
+
+    // ── cuBLAS op-code probes ──────────────────────────────────
+    // Assert the exported symbolic op codes match cublasOperation_t
+    // without forcing the test body to re-hard-code them as magics.
+    check("hxc_cublas_op_n() == 0 (CUBLAS_OP_N)", hxc_cublas_op_n() == 0)
+    check("hxc_cublas_op_t() == 1 (CUBLAS_OP_T)", hxc_cublas_op_t() == 1)
+
+    // ── identity matmul: I * I = I (4x4) ───────────────────────
+    let ident = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    let id_out = hxc_matmul(ident, ident, 4, 4, 4)
+    check("I*I output length == 16", len(id_out) == 16)
+    check("I*I[0,0] == 1", id_out[0] == 1.0)
+    check("I*I[1,1] == 1", id_out[5] == 1.0)
+    check("I*I[2,2] == 1", id_out[10] == 1.0)
+    check("I*I[3,3] == 1", id_out[15] == 1.0)
+    check("I*I[0,1] == 0", id_out[1] == 0.0)
+    check("I*I[3,0] == 0", id_out[12] == 0.0)
+
+    // ── 2x3 * 3x2 = 2x2 by hand ────────────────────────────────
+    //   A = [[1,2,3],[4,5,6]]                row-major [1,2,3,4,5,6]
+    //   B = [[7,8],[9,10],[11,12]]           row-major [7,8,9,10,11,12]
+    //   C = [[58,64],[139,154]]
+    let a23 = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+    let b32 = [7.0, 8.0, 9.0, 10.0, 11.0, 12.0]
+    let c22 = hxc_matmul(a23, b32, 2, 2, 3)
+    check("2x3*3x2 length == 4", len(c22) == 4)
+    check("2x3*3x2 [0,0] == 58", c22[0] == 58.0)
+    check("2x3*3x2 [0,1] == 64", c22[1] == 64.0)
+    check("2x3*3x2 [1,0] == 139", c22[2] == 139.0)
+    check("2x3*3x2 [1,1] == 154", c22[3] == 154.0)
+
+    // ── 64x64x64 driver vs CPU reference (self-consistency) ─────
+    // Mirrors hxmetal's 64^3 probe. In stage 1 the driver IS the CPU
+    // ref so this proves routing is wired (no empty return, no silent
+    // zero). Once stage 2 flips LIVE=1, the same threshold guards
+    // NVRTC-compiled kernel vs CPU f32 drift.
+    let M = 64
+    let N = 64
+    let K = 64
+    let big_a = make_matrix(M, K)
+    let big_b = make_matrix(K, N)
+    let out = hxc_matmul(big_a, big_b, M, N, K)
+    check("64^3 matmul length == M*N", len(out) == M * N)
+    let ref_c = hxc_matmul_cpu_ref(big_a, big_b, M, N, K)
+    let err = max_abs_diff(out, ref_c)
+    check("64^3 max-abs-err < 1e-4", err < 0.0001)
+
+    // First output element sanity: must be sum over K positives.
+    check("64^3 C[0,0] > 0 (routing wired)", out[0] > 0.0)
+    // Some deep element: ensure routing didn't truncate.
+    check("64^3 C[last] > 0 (full dispatch)", out[M * N - 1] > 0.0)
+
+    // ── cross-backend parity handshake ─────────────────────────
+    // Optional symmetry: the CUDA tile must match the Metal tile
+    // constant so any routing layer can assume a single block size.
+    // (Metal side exposes hxm_matmul_tile() == 16; we only assert
+    // our own side here to stay module-local.)
+    check("hxc tile matches symmetric PoC (16)", hxc_matmul_tile() == 16)
+
+    // ── summary ────────────────────────────────────────────────
+    println("")
+    println("hxcuda_matmul: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL))
+    if FAIL == 0 {
+        return 0
+    }
+    return 1
+}

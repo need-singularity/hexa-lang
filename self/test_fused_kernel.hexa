@@ -1,0 +1,384 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_fused_kernel.hexa — ROI #183 correctness suite
+//
+//  Verifies self/rewrite/fused_kernel.hexa:
+//
+//      - chain_length reports the correct linear-chain depth
+//      - fuse_chain leaves non-fusable trees unchanged
+//      - fuse_chain rewrites
+//          relu(add(x, c))             — 2-op
+//          relu(mul(x, c))             — 2-op
+//          mul(add(x, a), b)           — 2-op
+//          relu(mul(add(x, a), b))     — 3-op
+//        into a single fused_kernel node with the right op chain.
+//      - eval_fused_scalar(fuse_chain(e), env) == eval_scalar(e, env)
+//        within 1e-9 for each case above on several representative
+//        inputs (negative / zero / positive regimes so relu fires).
+//      - alloc_count accounting:
+//          original chain alloc count == op-chain length
+//          fused alloc count          == 1 (independent of length)
+// ═══════════════════════════════════════════════════════════════════
+
+// -- inlined from self/rewrite/fused_kernel.hexa --
+// codegen import not wired for test files
+
+struct Expr {
+    kind: string
+    lhs: any
+    rhs: any
+}
+
+struct Op {
+    op: string
+    c: float
+}
+
+fn e_var(name) {
+    return Expr{kind: "var", lhs: name, rhs: ""}
+}
+
+fn e_const(value) {
+    return Expr{kind: "const", lhs: value, rhs: ""}
+}
+
+fn e_add(a, b) {
+    return Expr{kind: "add", lhs: a, rhs: b}
+}
+
+fn e_mul(a, b) {
+    return Expr{kind: "mul", lhs: a, rhs: b}
+}
+
+fn e_relu(x) {
+    return Expr{kind: "relu", lhs: x, rhs: ""}
+}
+
+fn e_fused(input, ops) {
+    return Expr{kind: "fused_kernel", lhs: input, rhs: ops}
+}
+
+fn op_add_c(c) {
+    return Op{op: "add_c", c: c}
+}
+
+fn op_mul_c(c) {
+    return Op{op: "mul_c", c: c}
+}
+
+fn op_relu() {
+    return Op{op: "relu", c: 0.0}
+}
+
+fn is_elementwise(e) {
+    if e.kind == "add"  { return true }
+    if e.kind == "mul"  { return true }
+    if e.kind == "relu" { return true }
+    return false
+}
+
+fn is_leaf(e) {
+    if e.kind == "var"   { return true }
+    if e.kind == "const" { return true }
+    return false
+}
+
+struct Split {
+    ew: any
+    c: float
+    ok: bool
+}
+
+fn split_binary(e) {
+    let l = e.lhs
+    let r = e.rhs
+    if l.kind == "const" {
+        return Split{ew: r, c: l.lhs, ok: true}
+    }
+    if r.kind == "const" {
+        return Split{ew: l, c: r.lhs, ok: true}
+    }
+    return Split{ew: l, c: 0.0, ok: false}
+}
+
+fn chain_length(e) {
+    if is_leaf(e) { return 0 }
+    if e.kind == "relu" {
+        return 1 + chain_length(e.lhs)
+    }
+    if e.kind == "add" || e.kind == "mul" {
+        let s = split_binary(e)
+        if !s.ok { return 0 }
+        return 1 + chain_length(s.ew)
+    }
+    return 0
+}
+
+struct Collected {
+    ops: any
+    input: any
+}
+
+fn collect_chain(e) {
+    if is_leaf(e) {
+        return Collected{ops: [], input: e}
+    }
+    if e.kind == "relu" {
+        let inner = collect_chain(e.lhs)
+        return Collected{ops: inner.ops + [op_relu()], input: inner.input}
+    }
+    if e.kind == "add" {
+        let s = split_binary(e)
+        if !s.ok { return Collected{ops: [], input: e} }
+        let inner = collect_chain(s.ew)
+        return Collected{ops: inner.ops + [op_add_c(s.c)], input: inner.input}
+    }
+    if e.kind == "mul" {
+        let s = split_binary(e)
+        if !s.ok { return Collected{ops: [], input: e} }
+        let inner = collect_chain(s.ew)
+        return Collected{ops: inner.ops + [op_mul_c(s.c)], input: inner.input}
+    }
+    return Collected{ops: [], input: e}
+}
+
+fn fuse_chain(e) {
+    let clen = chain_length(e)
+    if clen < 2 { return e }
+    let c = collect_chain(e)
+    return e_fused(c.input, c.ops)
+}
+
+fn lookup_env(env, name) {
+    let n = len(env)
+    let mut i = 0
+    while i < n {
+        let pair = env[i]
+        if pair[0] == name { return pair[1] }
+        i = i + 1
+    }
+    return 0.0
+}
+
+fn relu_scalar(x) {
+    if x < 0.0 { return 0.0 }
+    return x
+}
+
+fn eval_scalar(e, env) {
+    if e.kind == "var"   { return lookup_env(env, e.lhs) }
+    if e.kind == "const" { return e.lhs }
+    if e.kind == "add"   { return eval_scalar(e.lhs, env) + eval_scalar(e.rhs, env) }
+    if e.kind == "mul"   { return eval_scalar(e.lhs, env) * eval_scalar(e.rhs, env) }
+    if e.kind == "relu"  { return relu_scalar(eval_scalar(e.lhs, env)) }
+    return 0.0
+}
+
+fn eval_fused_scalar(e, env) {
+    if e.kind == "fused_kernel" {
+        let mut acc = eval_fused_scalar(e.lhs, env)
+        let ops = e.rhs
+        let n = len(ops)
+        let mut i = 0
+        while i < n {
+            let step = ops[i]
+            if step.op == "add_c" { acc = acc + step.c }
+            if step.op == "mul_c" { acc = acc * step.c }
+            if step.op == "relu"  { acc = relu_scalar(acc) }
+            i = i + 1
+        }
+        return acc
+    }
+    if e.kind == "var"   { return lookup_env(env, e.lhs) }
+    if e.kind == "const" { return e.lhs }
+    if e.kind == "add"   { return eval_fused_scalar(e.lhs, env) + eval_fused_scalar(e.rhs, env) }
+    if e.kind == "mul"   { return eval_fused_scalar(e.lhs, env) * eval_fused_scalar(e.rhs, env) }
+    if e.kind == "relu"  { return relu_scalar(eval_fused_scalar(e.lhs, env)) }
+    return 0.0
+}
+
+fn alloc_count(e) {
+    if is_leaf(e) { return 0 }
+    if e.kind == "relu" { return 1 + alloc_count(e.lhs) }
+    if e.kind == "add" || e.kind == "mul" {
+        return 1 + alloc_count(e.lhs) + alloc_count(e.rhs)
+    }
+    if e.kind == "fused_kernel" { return 1 }
+    return 0
+}
+
+fn fused_alloc_count(e) {
+    if e.kind == "fused_kernel" { return 1 }
+    return alloc_count(e)
+}
+
+// -- end inlined --
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+fn fabs_local(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn close(a, b) {
+    return fabs_local(a - b) < 1.0e-9
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  ROI #183 @fused_kernel auto-fusion pass — correctness")
+println("═══════════════════════════════════════════════════════")
+
+// ── Test A — chain_length measurements ──────────────────────────
+let x  = e_var("x")
+let c2 = e_const(2.0)
+let c3 = e_const(3.0)
+let cM1 = e_const(0.0 - 1.0)
+
+// length 0 — just a leaf
+check("chain_length(var x) == 0",              chain_length(x) == 0)
+
+// length 1 — single element-wise op over a leaf
+let a1 = e_relu(x)
+check("chain_length(relu x) == 1",             chain_length(a1) == 1)
+
+// length 2 — two ops stacked
+let a2 = e_relu(e_add(x, c3))
+check("chain_length(relu(add(x,3))) == 2",     chain_length(a2) == 2)
+
+// length 3 — three ops stacked, one of each
+let a3 = e_relu(e_mul(e_add(x, c2), c3))
+check("chain_length(relu(mul(add(x,2),3))) == 3", chain_length(a3) == 3)
+
+// non-elementwise on chain path — if both ops are non-const exprs the
+// binary node is not foldable. chain_length should stop at 0.
+let nf = e_add(e_var("a"), e_var("b"))
+check("chain_length(add(var a, var b)) == 0",   chain_length(nf) == 0)
+
+// ── Test B — fuse_chain rewrite shape ───────────────────────────
+// short circuit: chain < 2 → returned unchanged (shape preserved)
+let r0 = fuse_chain(x)
+check("fuse_chain(leaf) is leaf unchanged",     r0.kind == "var")
+
+let r1 = fuse_chain(a1)
+check("fuse_chain(relu x) stays relu (len=1)",  r1.kind == "relu")
+
+// 2-op chain → fused_kernel w/ 2-element op list
+let r2 = fuse_chain(a2)
+check("fuse_chain(relu(add(x,3))).kind == fused_kernel", r2.kind == "fused_kernel")
+let r2_ops = r2.rhs
+check("fused op list length == 2",              len(r2_ops) == 2)
+check("fused op[0] == add_c(3)",                r2_ops[0].op == "add_c" && close(r2_ops[0].c, 3.0))
+check("fused op[1] == relu",                    r2_ops[1].op == "relu")
+let r2_in = r2.lhs
+check("fused input is var x",                   r2_in.kind == "var" && r2_in.lhs == "x")
+
+// 3-op chain → fused_kernel w/ 3-element op list
+let r3 = fuse_chain(a3)
+check("fuse_chain(relu(mul(add(x,2),3))).kind == fused_kernel", r3.kind == "fused_kernel")
+let r3_ops = r3.rhs
+check("3-chain op list length == 3",            len(r3_ops) == 3)
+check("3-chain op[0] == add_c(2)",              r3_ops[0].op == "add_c" && close(r3_ops[0].c, 2.0))
+check("3-chain op[1] == mul_c(3)",              r3_ops[1].op == "mul_c" && close(r3_ops[1].c, 3.0))
+check("3-chain op[2] == relu",                  r3_ops[2].op == "relu")
+
+// ── Test C — semantic equivalence (pre- vs. post-rewrite) ───────
+// Evaluate the ORIGINAL AST with eval_scalar and the REWRITTEN AST
+// with eval_fused_scalar; they must agree bit-for-bit (within 1e-9).
+
+fn make_env(x_val) {
+    return [["x", x_val]]
+}
+
+// Pos input: 4.0  → relu(add(4,3)) = 7
+let env_pos = make_env(4.0)
+let v2_orig = eval_scalar(a2, env_pos)
+let v2_fuse = eval_fused_scalar(fuse_chain(a2), env_pos)
+check("2-chain eq @ x=4   (orig == fused)",    close(v2_orig, v2_fuse))
+check("2-chain eq @ x=4   (fused == 7)",       close(v2_fuse, 7.0))
+
+// Neg input: -5  → relu(add(-5,3)) = relu(-2) = 0
+let env_neg = make_env(0.0 - 5.0)
+let v2_n_orig = eval_scalar(a2, env_neg)
+let v2_n_fuse = eval_fused_scalar(fuse_chain(a2), env_neg)
+check("2-chain eq @ x=-5  (orig == fused)",    close(v2_n_orig, v2_n_fuse))
+check("2-chain eq @ x=-5  (fused == 0)",       close(v2_n_fuse, 0.0))
+
+// Zero input: 0 → relu(add(0,3)) = 3
+let env_zero = make_env(0.0)
+let v2_z_orig = eval_scalar(a2, env_zero)
+let v2_z_fuse = eval_fused_scalar(fuse_chain(a2), env_zero)
+check("2-chain eq @ x=0   (orig == fused)",    close(v2_z_orig, v2_z_fuse))
+check("2-chain eq @ x=0   (fused == 3)",       close(v2_z_fuse, 3.0))
+
+// 3-chain: relu(mul(add(x,2),3))
+//   x=4  : relu(mul(6,3)) = 18
+//   x=-5 : relu(mul(-3,3)) = relu(-9) = 0
+//   x=-2 : relu(mul(0,3)) = 0
+let v3_p_orig = eval_scalar(a3, env_pos)
+let v3_p_fuse = eval_fused_scalar(fuse_chain(a3), env_pos)
+check("3-chain eq @ x=4   (orig == fused)",    close(v3_p_orig, v3_p_fuse))
+check("3-chain eq @ x=4   (fused == 18)",      close(v3_p_fuse, 18.0))
+
+let v3_n_orig = eval_scalar(a3, env_neg)
+let v3_n_fuse = eval_fused_scalar(fuse_chain(a3), env_neg)
+check("3-chain eq @ x=-5  (orig == fused)",    close(v3_n_orig, v3_n_fuse))
+check("3-chain eq @ x=-5  (fused == 0)",       close(v3_n_fuse, 0.0))
+
+let env_m2 = make_env(0.0 - 2.0)
+let v3_m_orig = eval_scalar(a3, env_m2)
+let v3_m_fuse = eval_fused_scalar(fuse_chain(a3), env_m2)
+check("3-chain eq @ x=-2  (orig == fused)",    close(v3_m_orig, v3_m_fuse))
+check("3-chain eq @ x=-2  (fused == 0)",       close(v3_m_fuse, 0.0))
+
+// 2-op mul chain: mul(add(x,2),3). x=4 → (4+2)*3 = 18
+let a2_mul = e_mul(e_add(x, c2), c3)
+let v2m_orig = eval_scalar(a2_mul, env_pos)
+let v2m_fuse = eval_fused_scalar(fuse_chain(a2_mul), env_pos)
+check("mul-2-chain eq @ x=4 (orig == fused)",  close(v2m_orig, v2m_fuse))
+check("mul-2-chain eq @ x=4 (fused == 18)",    close(v2m_fuse, 18.0))
+
+// relu+mul 2-chain: relu(mul(x,-1)). x=4 → relu(-4) = 0; x=-5 → relu(5) = 5
+let a2_rm = e_relu(e_mul(x, cM1))
+let vrm_p = eval_fused_scalar(fuse_chain(a2_rm), env_pos)
+let vrm_n = eval_fused_scalar(fuse_chain(a2_rm), env_neg)
+check("relu(mul(x,-1)) @ x=4  == 0",           close(vrm_p, 0.0))
+check("relu(mul(x,-1)) @ x=-5 == 5",           close(vrm_n, 5.0))
+
+// ── Test D — allocation accounting ──────────────────────────────
+// 2-chain naive alloc = 2 intermediates; 3-chain = 3. Fused = 1.
+check("alloc_count(2-chain naive) == 2",       alloc_count(a2) == 2)
+check("alloc_count(3-chain naive) == 3",       alloc_count(a3) == 3)
+check("fused_alloc_count(2-chain fused) == 1", fused_alloc_count(fuse_chain(a2)) == 1)
+check("fused_alloc_count(3-chain fused) == 1", fused_alloc_count(fuse_chain(a3)) == 1)
+
+// Non-rewritten tree: accounting passes through to alloc_count.
+check("fused_alloc_count(leaf) == 0",          fused_alloc_count(x) == 0)
+
+// ── Test E — non-fusable tree is left intact ────────────────────
+// add(var a, var b) has no const operand on either side → chain=0,
+// fuse_chain returns the input unchanged (same kind).
+let nf_r = fuse_chain(nf)
+check("fuse_chain(non-fusable) leaves kind==add", nf_r.kind == "add")
+
+// ── summary ─────────────────────────────────────────────────────
+println("")
+println("───────────────────────────────────────────────────────")
+println("Tests: " + to_string(pass_count) + " pass, " + to_string(fail_count) + " fail")
+println("───────────────────────────────────────────────────────")
+
+if fail_count > 0 {
+    println("❌ Some tests failed.")
+} else {
+    println("✅ All tests passed — fused_kernel rewrite verified.")
+}

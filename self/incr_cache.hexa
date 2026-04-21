@@ -1,0 +1,154 @@
+// self/build/incr_cache.hexa — ROI#177 incremental compile cache
+//
+// file-hash 기반 재컴파일 스킵. 순수 .hexa 구현.
+//
+// 책임:
+//   1) 입력 소스 → FNV-1a 32-bit hash (cache key)
+//   2) cache map: key → { artifact, hash, hits, misses }
+//   3) lookup → hit 시 artifact 경로 반환 (컴파일 스킵),
+//                miss 시 빌더에 위임 후 저장
+//
+// 의존: self/runtime/hash_pure.hexa (FNV-1a) — 여기선 self-contained 하게
+// 함수를 인라인해 어느 환경에서도 단독 실행되도록 했다.
+//
+// Pitfalls (README):
+//   P15 let mut for reassigned locals
+//   P29 .push() returns new array — use `arr = arr.push(x)` idiom? 여기서는
+//       맵만 쓰므로 비해당
+//   P30 no unsigned int — FNV mod 2^32 masking 필요
+
+// ── FNV-1a 32-bit (inlined from self/runtime/hash_pure.hexa) ──────
+let INCR_FNV_OFFSET_32 = 2166136261
+let INCR_FNV_PRIME_32  = 16777619
+let INCR_FNV_MOD_32    = 4294967296
+
+pub fn incr_hash_source(s) {
+    if type_of(s) != "string" { return INCR_FNV_OFFSET_32 }
+    let mut h = INCR_FNV_OFFSET_32
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let b = ord(s.substring(i, i + 1))
+        h = h ^ b
+        h = (h * INCR_FNV_PRIME_32) % INCR_FNV_MOD_32
+        i = i + 1
+    }
+    h
+}
+
+// ── cache key derivation ──────────────────────────────────────────
+// path + content 모두 반영. 같은 내용이라도 다른 파일이면 다른 아티팩트.
+pub fn incr_cache_key(path, source) {
+    let hp = incr_hash_source(path)
+    let hs = incr_hash_source(source)
+    // 두 해시를 섞어 단일 키 문자열로
+    to_string(hp) + ":" + to_string(hs)
+}
+
+// ── cache 생성 ────────────────────────────────────────────────────
+pub fn incr_cache_new() {
+    #{
+        "entries": #{},
+        "hits":    0,
+        "misses":  0,
+    }
+}
+
+// ── lookup (non-mutating) ─────────────────────────────────────────
+// 반환: #{"hit": bool, "artifact": string}
+pub fn incr_cache_lookup(cache, path, source) {
+    let key = incr_cache_key(path, source)
+    let entries = cache["entries"]
+    if entries.contains_key(key) {
+        let e = entries[key]
+        return #{"hit": true, "artifact": e["artifact"], "key": key}
+    }
+    return #{"hit": false, "artifact": "", "key": key}
+}
+
+// ── artifact 경로 파생 (naive) ────────────────────────────────────
+// <path>.hexa → build/<basename>.<short-key>.o
+pub fn incr_derive_artifact(path, key) {
+    // 마지막 "/" 이후 basename
+    let mut last_slash = 0 - 1
+    let mut i = 0
+    let n = len(path)
+    while i < n {
+        if path.substring(i, i + 1) == "/" { last_slash = i }
+        i = i + 1
+    }
+    let base = if last_slash >= 0 { path.substring(last_slash + 1, n) } else { path }
+    // .hexa 제거
+    let strip = if len(base) > 5 && base.substring(len(base) - 5, len(base)) == ".hexa" {
+        base.substring(0, len(base) - 5)
+    } else {
+        base
+    }
+    // short key (앞 8자)
+    let short = if len(key) > 8 { key.substring(0, 8) } else { key }
+    "build/" + strip + "." + short + ".o"
+}
+
+// ── compile_or_skip: 파이프라인의 캐시 래퍼 ────────────────────────
+// compile_fn 대신, 여기서는 간단히 artifact 경로만 반환한다
+// (실제 컴파일은 build_c.hexa 등 상위에서).
+//
+// 반환: #{"artifact": string, "cache": updated_cache, "skipped": bool}
+pub fn incr_compile_or_skip(cache, path, source) {
+    let key = incr_cache_key(path, source)
+    let entries = cache["entries"]
+
+    if entries.contains_key(key) {
+        let e = entries[key]
+        let mut c2 = cache
+        c2["hits"] = cache["hits"] + 1
+        return #{
+            "artifact": e["artifact"],
+            "cache":    c2,
+            "skipped":  true,
+            "key":      key,
+        }
+    }
+
+    // miss: artifact 경로 파생 + 엔트리 등록
+    let artifact = incr_derive_artifact(path, key)
+    let mut new_entries = entries
+    new_entries[key] = #{
+        "artifact": artifact,
+        "path":     path,
+        "source_hash": incr_hash_source(source),
+    }
+    let mut c2 = cache
+    c2["entries"] = new_entries
+    c2["misses"] = cache["misses"] + 1
+    return #{
+        "artifact": artifact,
+        "cache":    c2,
+        "skipped":  false,
+        "key":      key,
+    }
+}
+
+// ── stats helpers ─────────────────────────────────────────────────
+pub fn incr_cache_stats(cache) {
+    return #{
+        "hits":   cache["hits"],
+        "misses": cache["misses"],
+        "size":   len(cache["entries"]),
+    }
+}
+
+pub fn incr_cache_hit_ratio(cache) {
+    let h = cache["hits"]
+    let m = cache["misses"]
+    let t = h + m
+    if t <= 0 { return 0 }
+    // 백분율 (정수)
+    (h * 100) / t
+}
+
+// ── invalidation ──────────────────────────────────────────────────
+// source 가 바뀌면 key 가 달라지므로 자동으로 miss. 명시적 clear 도 제공.
+pub fn incr_cache_clear(cache) {
+    return incr_cache_new()
+}

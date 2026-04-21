@@ -1,0 +1,244 @@
+// self/rewrite/dce_unused.hexa
+// ROI #176 — @unused DCE (dead code elimination) 확장 pass
+//
+// Extends the baseline DCE (self/dce.hexa + self/ai_native_pass.hexa M975)
+// with WHOLE-PROGRAM reachability:
+//
+//   1. Build a symbol graph: each top-level fn/struct/use collects the
+//      names it references in its body.
+//   2. Starting from a set of entry points (main, exported, roots given
+//      by the caller), BFS through the graph and mark every reachable
+//      symbol.
+//   3. Any symbol NOT reached is @unused → can be safely dropped by a
+//      follow-up rewrite pass.
+//
+// This file is a pure .hexa scaffold — it does not depend on the Rust
+// compiler backend and intentionally has no side-effects beyond
+// returning a report struct that callers can log / consume.
+//
+// ── Data model ────────────────────────────────────────────────────
+//
+// Symbols are keyed by string name. The graph is stored as two parallel
+// arrays (names + adjacency-list strings) so it composes with the
+// existing .hexa struct/array facilities used elsewhere in self/*.
+
+struct SymbolNode {
+    name: string,
+    kind: string,       // "fn" | "struct" | "use" | "const" | "entry"
+    refs: [string],     // names referenced inside this symbol's body
+    is_entry: bool      // true if the symbol is an explicit root
+}
+
+struct SymbolGraph {
+    nodes: [SymbolNode]
+}
+
+struct ReachReport {
+    reachable: [string],
+    unused: [string],
+    total: int,
+    reached: int,
+    dropped: int
+}
+
+// ── Graph construction ────────────────────────────────────────────
+//
+// Helpers build the graph incrementally. Callers typically do:
+//
+//   let mut g = new_symbol_graph()
+//   g = graph_add(g, make_symbol("main", "fn", ["compute", "helper"], true))
+//   g = graph_add(g, make_symbol("compute", "fn", ["helper"], false))
+//   g = graph_add(g, make_symbol("helper",  "fn", [], false))
+//   g = graph_add(g, make_symbol("dead",    "fn", [], false))  // @unused
+//
+//   let report = analyze_reachability(g)
+
+fn new_symbol_graph() -> SymbolGraph {
+    return SymbolGraph { nodes: [] }
+}
+
+fn make_symbol(name: string, kind: string, refs: [string], is_entry: bool) -> SymbolNode {
+    return SymbolNode { name: name, kind: kind, refs: refs, is_entry: is_entry }
+}
+
+fn graph_add(g: SymbolGraph, node: SymbolNode) -> SymbolGraph {
+    let mut ns = g.nodes
+    ns.push(node)
+    return SymbolGraph { nodes: ns }
+}
+
+fn graph_size(g: SymbolGraph) -> int {
+    return len(g.nodes)
+}
+
+fn graph_find(g: SymbolGraph, name: string) -> int {
+    let mut i = 0
+    while i < len(g.nodes) {
+        if g.nodes[i].name == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── Low-level helpers (string-list ops) ───────────────────────────
+
+fn str_list_contains(lst: [string], v: string) -> bool {
+    let mut i = 0
+    while i < len(lst) {
+        if lst[i] == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn str_list_push_unique(lst: [string], v: string) -> [string] {
+    if str_list_contains(lst, v) { return lst }
+    let mut out = lst
+    out.push(v)
+    return out
+}
+
+// ── Entry-point collection ────────────────────────────────────────
+//
+// Roots include:
+//   * every symbol with is_entry = true
+//   * a symbol literally named "main" (if present)
+// Callers that need additional roots (e.g. "@export", "@pub", FFI
+// trampolines) can pre-mark those nodes before calling the analyzer.
+
+fn collect_entry_points(g: SymbolGraph) -> [string] {
+    let mut roots: [string] = []
+    let mut i = 0
+    while i < len(g.nodes) {
+        let n = g.nodes[i]
+        if n.is_entry {
+            roots = str_list_push_unique(roots, n.name)
+        }
+        if n.name == "main" {
+            roots = str_list_push_unique(roots, n.name)
+        }
+        i = i + 1
+    }
+    return roots
+}
+
+// ── BFS reachability ──────────────────────────────────────────────
+//
+// Classic queue BFS using a head pointer into a growing array instead
+// of a shift-based dequeue (shift is O(n) in .hexa's array impl).
+
+fn bfs_reachable(g: SymbolGraph, roots: [string]) -> [string] {
+    let mut visited: [string] = []
+    let mut queue: [string] = []
+    let mut head = 0
+
+    // Seed
+    let mut ri = 0
+    while ri < len(roots) {
+        let r = roots[ri]
+        if !str_list_contains(visited, r) {
+            visited = str_list_push_unique(visited, r)
+            queue.push(r)
+        }
+        ri = ri + 1
+    }
+
+    // Drain
+    while head < len(queue) {
+        let cur = queue[head]
+        head = head + 1
+        let idx = graph_find(g, cur)
+        if idx >= 0 {
+            let refs = g.nodes[idx].refs
+            let mut j = 0
+            while j < len(refs) {
+                let child = refs[j]
+                if !str_list_contains(visited, child) {
+                    visited = str_list_push_unique(visited, child)
+                    queue.push(child)
+                }
+                j = j + 1
+            }
+        }
+    }
+
+    return visited
+}
+
+// ── Reporting ─────────────────────────────────────────────────────
+//
+// Given the graph and the reachable set, produce a ReachReport. Every
+// symbol not in `reachable` is flagged @unused.
+
+fn analyze_reachability(g: SymbolGraph) -> ReachReport {
+    let roots = collect_entry_points(g)
+    let reached = bfs_reachable(g, roots)
+
+    let mut unused: [string] = []
+    let mut i = 0
+    while i < len(g.nodes) {
+        let n = g.nodes[i]
+        if !str_list_contains(reached, n.name) {
+            unused = str_list_push_unique(unused, n.name)
+        }
+        i = i + 1
+    }
+
+    return ReachReport {
+        reachable: reached,
+        unused: unused,
+        total: graph_size(g),
+        reached: len(reached),
+        dropped: len(unused)
+    }
+}
+
+// ── Rewrite (drop @unused nodes from graph) ──────────────────────
+//
+// Produces a new SymbolGraph with every unreachable symbol removed.
+// The returned graph is safe to feed back into downstream passes
+// (register allocator, codegen, etc.) because every remaining edge
+// still lands on a surviving node.
+
+fn prune_unused(g: SymbolGraph, report: ReachReport) -> SymbolGraph {
+    let mut out: [SymbolNode] = []
+    let mut i = 0
+    while i < len(g.nodes) {
+        let n = g.nodes[i]
+        if str_list_contains(report.reachable, n.name) {
+            out.push(n)
+        }
+        i = i + 1
+    }
+    return SymbolGraph { nodes: out }
+}
+
+// ── Pretty printing ───────────────────────────────────────────────
+
+fn report_lines(report: ReachReport) -> [string] {
+    let mut lines: [string] = []
+    lines.push("[dce-unused] total=" + to_string(report.total) +
+               " reached=" + to_string(report.reached) +
+               " dropped=" + to_string(report.dropped))
+    let mut i = 0
+    while i < len(report.unused) {
+        lines.push("[dce-unused] @unused " + report.unused[i])
+        i = i + 1
+    }
+    return lines
+}
+
+// ── Convenience one-shot API ──────────────────────────────────────
+//
+// Callers that just want the unused list:
+//
+//   let names = list_unused_symbols(g)
+//
+
+fn list_unused_symbols(g: SymbolGraph) -> [string] {
+    return analyze_reachability(g).unused
+}
+
+fn pass_dce_unused_name() -> string {
+    return "dce_unused"
+}

@@ -1,0 +1,256 @@
+// self/attrs/specialize_tune.hexa — @specialize IC hit-rate tuning (ROI #171)
+//
+// Scope: pure-Hexa scaffold layered *on top of* self/vm/ic.hexa +
+// self/attrs/_own/specialize.hexa (ROI #167). No Rust, no AST changes.
+//
+// What this module adds (min-viable):
+//   1. ICStats — snapshot of hit/miss counters aggregated across ICSlots.
+//   2. ic_hit_rate_permille — integer-only hit rate (0..1000) so we stay
+//      stage0-safe (no float arithmetic on hot paths).
+//   3. BucketConfig — adaptive poly_cache bucket size with min/max bounds.
+//   4. bucket_adjust — threshold-based shrink/grow hook. Called from a
+//      tune pass after observing a window of lookups.
+//   5. tune_hook_from_slot — thin convenience that observes one slot and
+//      returns [new_stats, new_bucket_cfg] — what follow-up ROIs will
+//      drive from the IC dispatch path.
+//
+// The runtime file self/vm/ic.hexa already records hit_count / miss_count
+// on every ICSlot. This module treats those counters as read-only input
+// and emits a tuning recommendation. Nothing here mutates ICSlot; the
+// existing mono/poly/mega path in ic.hexa is untouched.
+//
+// Follow-up ROIs will:
+//   · wire tune_hook into ic_site_lookup when a site crosses a sample
+//     threshold (e.g. every 1024 observations),
+//   · connect bucket_adjust output to ICSlot.poly_cache allocation.
+
+use "self/attrs/core"
+
+// ─── ICStats — aggregated counters ───────────────────────────────────
+//
+// Parallel-array map: site_id -> (hits, misses). Stage0 has no generic
+// HashMap so we stick with the linear-scan pattern used by ICTable.
+
+struct ICStats {
+    site_ids: [int],
+    hits: [int],
+    misses: [int],
+    samples: int            // total observations fed in (for windowing)
+}
+
+fn ic_stats_new() -> ICStats {
+    return ICStats { site_ids: [], hits: [], misses: [], samples: 0 }
+}
+
+// Find index of site_id or -1.
+fn ic_stats_index(stats: ICStats, site_id: int) -> int {
+    let mut i = 0
+    while i < len(stats.site_ids) {
+        if stats.site_ids[i] == site_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// Observe (hit_count, miss_count) for a site. Returns a *new* stats
+// (immutable-style — matches ic.hexa convention). If the site is already
+// tracked, the recorded counters are overwritten with the latest snapshot
+// (slot counters in ic.hexa are monotonically increasing, so this is
+// equivalent to a replace-with-max).
+fn ic_stats_observe(stats: ICStats, site_id: int, hit_count: int, miss_count: int) -> ICStats {
+    let idx = ic_stats_index(stats, site_id)
+    if idx >= 0 {
+        let mut new_hits = []
+        let mut new_misses = []
+        let mut k = 0
+        while k < len(stats.hits) {
+            if k == idx {
+                new_hits.push(hit_count)
+                new_misses.push(miss_count)
+            } else {
+                new_hits.push(stats.hits[k])
+                new_misses.push(stats.misses[k])
+            }
+            k = k + 1
+        }
+        return ICStats {
+            site_ids: stats.site_ids,
+            hits: new_hits,
+            misses: new_misses,
+            samples: stats.samples + 1
+        }
+    }
+    let mut ids2 = []
+    let mut h2 = []
+    let mut m2 = []
+    let mut j = 0
+    while j < len(stats.site_ids) {
+        ids2.push(stats.site_ids[j])
+        h2.push(stats.hits[j])
+        m2.push(stats.misses[j])
+        j = j + 1
+    }
+    ids2.push(site_id)
+    h2.push(hit_count)
+    m2.push(miss_count)
+    return ICStats {
+        site_ids: ids2,
+        hits: h2,
+        misses: m2,
+        samples: stats.samples + 1
+    }
+}
+
+// Integer hit rate in permille (0..1000) for a given site. Returns -1
+// when the site has no samples or is unknown (caller decides what to do
+// with that — follow-up ROIs will treat it as "not enough data").
+fn ic_hit_rate_permille(stats: ICStats, site_id: int) -> int {
+    let idx = ic_stats_index(stats, site_id)
+    if idx < 0 { return -1 }
+    let h = stats.hits[idx]
+    let m = stats.misses[idx]
+    let total = h + m
+    if total <= 0 { return -1 }
+    return (h * 1000) / total
+}
+
+// Aggregate hit rate across all tracked sites (permille). Useful for
+// process-wide dashboards.
+fn ic_hit_rate_total_permille(stats: ICStats) -> int {
+    let mut th = 0
+    let mut tm = 0
+    let mut i = 0
+    while i < len(stats.site_ids) {
+        th = th + stats.hits[i]
+        tm = tm + stats.misses[i]
+        i = i + 1
+    }
+    let total = th + tm
+    if total <= 0 { return -1 }
+    return (th * 1000) / total
+}
+
+// ─── BucketConfig — adaptive poly_cache bucket size ──────────────────
+//
+// ICSlot.poly_cache is a flat [hc0, off0, hc1, off1, ...] array sized by
+// poly_cache_size from SpecializeRules. #167 defaulted to 4. This module
+// lets the bucket size *float* between min_size and max_size based on the
+// observed hit rate:
+//   · high hit rate  → MONO-dominant, shrink bucket (save memory)
+//   · low hit rate   → POLY-dominant, grow bucket (capture more hcs)
+//
+// Thresholds are permille to avoid floats. Defaults were chosen to match
+// V8's heuristic of collapsing poly→mono at ~95% stable hit.
+
+struct BucketConfig {
+    min_size: int,
+    max_size: int,
+    current_size: int,
+    shrink_threshold: int,   // permille — above this, shrink
+    grow_threshold: int,     // permille — below this, grow
+    step: int                // how many slots to add/remove per adjust
+}
+
+fn bucket_default() -> BucketConfig {
+    return BucketConfig {
+        min_size: 1,
+        max_size: 8,
+        current_size: 4,         // matches SpecializeRules.poly_cache_size
+        shrink_threshold: 950,   // 95.0 %
+        grow_threshold: 500,     // 50.0 %
+        step: 1
+    }
+}
+
+fn bucket_from(min_size: int, max_size: int, current: int,
+               shrink_t: int, grow_t: int, step: int) -> BucketConfig {
+    return BucketConfig {
+        min_size: min_size,
+        max_size: max_size,
+        current_size: current,
+        shrink_threshold: shrink_t,
+        grow_threshold: grow_t,
+        step: step
+    }
+}
+
+// bucket_adjust — returns a new BucketConfig with current_size updated
+// based on the observed hit_rate_permille. -1 (no data) is a no-op.
+//
+// Rules:
+//   hit_rate >= shrink_threshold  → current = max(min_size, current - step)
+//   hit_rate <= grow_threshold    → current = min(max_size, current + step)
+//   otherwise                     → unchanged
+fn bucket_adjust(cfg: BucketConfig, hit_rate_permille: int) -> BucketConfig {
+    if hit_rate_permille < 0 { return cfg }
+    let mut new_size = cfg.current_size
+    if hit_rate_permille >= cfg.shrink_threshold {
+        new_size = cfg.current_size - cfg.step
+        if new_size < cfg.min_size { new_size = cfg.min_size }
+    } else if hit_rate_permille <= cfg.grow_threshold {
+        new_size = cfg.current_size + cfg.step
+        if new_size > cfg.max_size { new_size = cfg.max_size }
+    }
+    return BucketConfig {
+        min_size: cfg.min_size,
+        max_size: cfg.max_size,
+        current_size: new_size,
+        shrink_threshold: cfg.shrink_threshold,
+        grow_threshold: cfg.grow_threshold,
+        step: cfg.step
+    }
+}
+
+// ─── Tuning direction (for lint / dashboard reporting) ───────────────
+
+fn bucket_dir_shrink() -> int { return -1 }
+fn bucket_dir_hold()   -> int { return 0 }
+fn bucket_dir_grow()   -> int { return 1 }
+
+fn bucket_direction(cfg: BucketConfig, hit_rate_permille: int) -> int {
+    if hit_rate_permille < 0 { return 0 }
+    if hit_rate_permille >= cfg.shrink_threshold {
+        if cfg.current_size > cfg.min_size { return -1 }
+        return 0
+    }
+    if hit_rate_permille <= cfg.grow_threshold {
+        if cfg.current_size < cfg.max_size { return 1 }
+        return 0
+    }
+    return 0
+}
+
+// ─── tune_hook — one-shot: observe + adjust ──────────────────────────
+//
+// Returns [new_stats, new_bucket_cfg]. Designed to be dropped into the
+// follow-up ROI that samples ICSlot counters from ic_site_lookup on a
+// fixed cadence.
+
+fn tune_hook(stats: ICStats, cfg: BucketConfig,
+             site_id: int, hit_count: int, miss_count: int) {
+    let new_stats = ic_stats_observe(stats, site_id, hit_count, miss_count)
+    let rate = ic_hit_rate_permille(new_stats, site_id)
+    let new_cfg = bucket_adjust(cfg, rate)
+    return [new_stats, new_cfg]
+}
+
+// ─── meta — @specialize-tune attr descriptor (hint-only) ─────────────
+//
+// `@specialize` remains the sole public attr. This function exposes the
+// tuning module's metadata for the attr registry / doc generator so the
+// scaffold is discoverable without introducing a new public attr name.
+
+fn meta_specialize_tune() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name = "specialize_tune"
+    m.category = "attr_semantics"
+    m.purpose = "IC hit-rate tracking + adaptive poly bucket sizing (ROI #171)"
+    m.cost_rule = "windowed sampling — negligible overhead on MONO fast path"
+    m.side_effect = "none (read-only ICSlot observation; returns new cfg)"
+    m.requires = "self/vm/ic.hexa (ROI #167)"
+    m.auto_test = "self/test_specialize_tune.hexa"
+    m.example = "// follow-up ROI wires this into ic_site_lookup\nlet r = tune_hook(stats, cfg, site_id, slot.hit_count, slot.miss_count)"
+    m.synonym_of = "specialize"
+    m.implemented = true
+    return m
+}

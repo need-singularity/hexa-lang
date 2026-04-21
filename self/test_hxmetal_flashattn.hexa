@@ -1,0 +1,277 @@
+// self/test_hxmetal_flashattn.hexa — ROI #181 flash-attention PoC test
+//
+// Stage 1 scaffold verification (mirrors test_hxmetal_matmul / test_hxmetal_fused):
+//
+//   - shape contract (seq_q/seq_k/d invariants, empty return on mismatch)
+//   - MSL source string is non-empty and references the flash-attn kernel
+//     signature + online-softmax identifiers (drift guard)
+//   - tile + head dims exposed (stage 2 sizing contract)
+//   - dispatch geometry matches the grid computed inside hxfa_forward
+//   - online-softmax block path == classical SDPA within <1e-6 on small
+//     fixed operands (identity + random unit inputs)
+//   - driver agrees with CPU reference (self-consistency today; once
+//     HXFA_LIVE flips to 1 the same tolerance guards GPU vs CPU drift)
+//   - dispatch5 error-path still returns -1 with flash-attn launch shape
+//
+// Does NOT execute any MSL kernel — live Metal compile is blocked on the
+// HXFA_LIVE flip, which requires stage 2 buffer_write/read helpers.
+// In stage 1 (HXFA_LIVE=0) the driver IS the CPU reference, so this
+// becomes a self-consistency check; when live-mode lands the same
+// tolerance (<1e-4) guards GPU vs CPU f32 drift without any edit.
+//
+// Run:
+//   hexa self/test_hxmetal_flashattn.hexa
+// Expected: all checks "ok", exit 0, on any host (macOS or Linux).
+
+use self::ffi::hxmetal_flashattn
+use self::runtime::hxmetal_stub
+use self::runtime::math_pure
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(label: string, cond: bool) -> int {
+    if cond {
+        PASS = PASS + 1
+        println("ok: " + label)
+    } else {
+        FAIL = FAIL + 1
+        println("FAIL: " + label)
+    }
+    return 0
+}
+
+// Deterministic PRNG — Lehmer xorshift, state in a single int.
+let mut RNG_STATE = 123456789
+
+fn rng_next() -> int {
+    let mut x = RNG_STATE
+    x = x * 1103515245 + 12345
+    if x < 0 { x = 0 - x }
+    x = x % 2147483647
+    RNG_STATE = x
+    return x
+}
+
+fn rng_float() -> float {
+    let v = rng_next()
+    return (v * 1.0) / 2147483647.0
+}
+
+// Build a deterministic row-major m×n matrix in [0, 1).
+fn make_matrix(m: int, n: int) {
+    let mut out = []
+    let total = m * n
+    let mut i = 0
+    while i < total {
+        out.push(rng_float())
+        i = i + 1
+    }
+    return out
+}
+
+fn main() -> int {
+    // ── shape contract ─────────────────────────────────────────
+    // Empty / mismatched inputs must return [] on BOTH the driver
+    // and the CPU reference (they share the same validation block).
+    let e0 = hxfa_forward([], [], [], 0, 0, 0)
+    check("hxfa_forward zero dims returns []", len(e0) == 0)
+    let e1 = hxfa_forward([0.0], [0.0], [0.0], 1, 1, 0)
+    check("hxfa_forward d=0 returns []", len(e1) == 0)
+    let bad_q = hxfa_forward([1.0], [1.0, 1.0], [1.0, 1.0], 1, 1, 2)
+    check("hxfa_forward len(Q)!=seq_q*d returns []", len(bad_q) == 0)
+    let bad_k = hxfa_forward([1.0, 1.0], [1.0], [1.0, 1.0], 1, 1, 2)
+    check("hxfa_forward len(K)!=seq_k*d returns []", len(bad_k) == 0)
+    let bad_v = hxfa_forward([1.0, 1.0], [1.0, 1.0], [1.0], 1, 1, 2)
+    check("hxfa_forward len(V)!=seq_k*d returns []", len(bad_v) == 0)
+
+    // Same contract on the CPU reference directly.
+    let cpu_bad = hxfa_forward_cpu_ref([], [], [], 0, 0, 4)
+    check("hxfa_forward_cpu_ref zero dims returns []", len(cpu_bad) == 0)
+
+    // ── MSL source drift guard ─────────────────────────────────
+    let src = hxfa_msl_source()
+    check("msl source non-empty", len(src) > 0)
+    check("msl has kernel entry 'kernel void flash_attn'",
+          src.contains("kernel void flash_attn"))
+    check("msl has TILE_Q = 16 constant", src.contains("constant uint TILE_Q = 16"))
+    check("msl has TILE_K = 16 constant", src.contains("constant uint TILE_K = 16"))
+    check("msl has buffer(0)", src.contains("[[buffer(0)]]"))
+    check("msl has buffer(1)", src.contains("[[buffer(1)]]"))
+    check("msl has buffer(2)", src.contains("[[buffer(2)]]"))
+    check("msl has buffer(3)", src.contains("[[buffer(3)]]"))
+    check("msl has buffer(4)", src.contains("[[buffer(4)]]"))
+    check("msl has online softmax 'max(m_i'", src.contains("max(m_i"))
+    check("msl has alpha rescale 'exp(m_i - m_new)'",
+          src.contains("exp(m_i - m_new)"))
+    check("msl has threadgroup_barrier", src.contains("threadgroup_barrier"))
+    check("msl has scale 1/sqrt(d)", src.contains("1.0 / sqrt((float)d)"))
+    check("msl has inverse-norm final div",
+          src.contains("O[row * d + kk]"))
+
+    // ── tile / head dim exposure ───────────────────────────────
+    check("hxfa_tile_q() == 16", hxfa_tile_q() == 16)
+    check("hxfa_tile_k() == 16", hxfa_tile_k() == 16)
+    check("hxfa_head_d() == 64", hxfa_head_d() == 64)
+    check("hxfa_live() == 0 (stage 1)", hxfa_live() == 0)
+
+    // ── dispatch geometry ──────────────────────────────────────
+    // gy = ceil(seq_q / TILE_Q), tgy = TILE_Q, tgx = TILE_K, gx = 1.
+    let g0 = hxfa_dispatch_shape(16, 32)
+    check("dispatch_shape(16,32).tgx == 16", g0[0] == 16)
+    check("dispatch_shape(16,32).tgy == 16", g0[1] == 16)
+    check("dispatch_shape(16,32).gx == 1", g0[2] == 1)
+    check("dispatch_shape(16,32).gy == 1", g0[3] == 1)
+    let g1 = hxfa_dispatch_shape(33, 48)
+    check("dispatch_shape(33,48).gy == 3 (ceil)", g1[3] == 3)
+
+    // ── flash block == classical SDPA (Q=K=V, seq_q=seq_k=4, d=4) ──
+    // Hand-picked small case: identity-ish Q/K/V so softmax is stable
+    // and the test is independent of the PRNG seed.
+    //   Q = K = V = 4x4 (row_i = e_i)
+    // With scale = 1/sqrt(4) = 0.5, Q·K^T = I, softmax(0.5 * I) picks
+    // the on-diagonal entry for each row. Output O[i] ≈ V[arg] which
+    // is again row_i. Self-attention on an orthonormal basis is a noop.
+    let ident = [
+        1.0, 0.0, 0.0, 0.0,
+        0.0, 1.0, 0.0, 0.0,
+        0.0, 0.0, 1.0, 0.0,
+        0.0, 0.0, 0.0, 1.0,
+    ]
+    let o_fa  = hxfa_forward(ident, ident, ident, 4, 4, 4)
+    let o_sdpa = hxfa_sdpa_reference(ident, ident, ident, 4, 4, 4)
+    check("I-attn output length == 16", len(o_fa) == 16)
+    check("I-attn SDPA length == 16", len(o_sdpa) == 16)
+    let err0 = hxfa_max_abs_diff(o_fa, o_sdpa)
+    check("I-attn flash ≈ SDPA within 1e-6", err0 < 0.000001)
+    // Output diagonal must exceed off-diagonal (self-attention keeps mass on self).
+    check("I-attn O[0,0] > O[0,1]", o_fa[0] > o_fa[1])
+    check("I-attn O[1,1] > O[1,0]", o_fa[5] > o_fa[4])
+
+    // ── zero V → zero O ────────────────────────────────────────
+    let q_rand = make_matrix(4, 4)
+    let k_rand = make_matrix(4, 4)
+    let mut v_zero = []
+    let mut i = 0
+    while i < 16 {
+        v_zero.push(0.0)
+        i = i + 1
+    }
+    let o_zero = hxfa_forward(q_rand, k_rand, v_zero, 4, 4, 4)
+    let mut all_zero = true
+    let mut z = 0
+    while z < 16 {
+        if o_zero[z] != 0.0 { all_zero = false }
+        z = z + 1
+    }
+    check("zero V → zero O", all_zero)
+
+    // ── random 8x12x8 driver vs classical SDPA ─────────────────
+    // Sizes chosen:
+    //   seq_q=8 crosses 2 Tq-tile iterations worth of work within a
+    //   single tile group (Tq=16 covers it), d=8 is < HEAD_D=64 so
+    //   the register array suffices.
+    // Tolerance <1e-5 covers float64 rounding differences between
+    // the block and naive implementations — both run in the same
+    // float precision today, so the gap is negligible.
+    let seq_q = 8
+    let seq_k = 12
+    let d = 8
+    let q_big = make_matrix(seq_q, d)
+    let k_big = make_matrix(seq_k, d)
+    let v_big = make_matrix(seq_k, d)
+    let o_block = hxfa_forward(q_big, k_big, v_big, seq_q, seq_k, d)
+    let o_ref   = hxfa_sdpa_reference(q_big, k_big, v_big, seq_q, seq_k, d)
+    check("random flash output length == seq_q*d", len(o_block) == seq_q * d)
+    check("random SDPA ref length == seq_q*d",    len(o_ref) == seq_q * d)
+    let err1 = hxfa_max_abs_diff(o_block, o_ref)
+    check("random flash ≈ SDPA within 1e-5 (block==classical)", err1 < 0.00001)
+
+    // First and last output entries must be finite and in [0, 1] range
+    // (convex combination of V rows ∈ [0, 1) with probabilities).
+    check("O[0] in [0, 1]", o_block[0] >= 0.0 && o_block[0] <= 1.0)
+    check("O[last] in [0, 1]",
+          o_block[seq_q * d - 1] >= 0.0 && o_block[seq_q * d - 1] <= 1.0)
+
+    // ── multi-tile K — seq_k > TILE_K forces multi-jt loop ─────
+    // seq_q=4, seq_k=20, d=8 → n_kt=ceil(20/16)=2 tile iterations,
+    // second tile partially padded (4 rows of the 16-wide block).
+    // This is the contract that pad-masking + online update handle.
+    let seq_k2 = 20
+    let q_mt = make_matrix(4, d)
+    let k_mt = make_matrix(seq_k2, d)
+    let v_mt = make_matrix(seq_k2, d)
+    let o_mt  = hxfa_forward(q_mt, k_mt, v_mt, 4, seq_k2, d)
+    let o_mtr = hxfa_sdpa_reference(q_mt, k_mt, v_mt, 4, seq_k2, d)
+    let err2 = hxfa_max_abs_diff(o_mt, o_mtr)
+    check("multi-tile K (seq_k=20, Tk=16) within 1e-5", err2 < 0.00001)
+
+    // ── dispatch5 error contract for flash-attn launch shape ────
+    // Mirrors test_hxmetal_fused: ensure handle-null and zero-dim
+    // paths still return -1 under the new kernel's launch geometry.
+    let dev = hxm_device_default()
+    let lib = hxm_library_from_source(dev, hxfa_msl_source())
+    let pipe = hxm_pipeline(lib, "flash_attn")
+    check("device handle non-zero", dev != 0)
+    check("lib handle non-zero", lib != 0)
+    check("pipe handle non-zero", pipe != 0)
+    let buf_q = hxm_buffer(dev, 4 * 4 * 4)
+    let buf_k = hxm_buffer(dev, 4 * 4 * 4)
+    let buf_v = hxm_buffer(dev, 4 * 4 * 4)
+    let buf_o = hxm_buffer(dev, 4 * 4 * 4)
+    let buf_d = hxm_buffer(dev, 16)
+    check("Q buf non-zero",  buf_q != 0)
+    check("K buf non-zero",  buf_k != 0)
+    check("V buf non-zero",  buf_v != 0)
+    check("O buf non-zero",  buf_o != 0)
+    check("dims buf non-zero", buf_d != 0)
+
+    let tgx = hxfa_tile_k()
+    let tgy = hxfa_tile_q()
+    let gx = 1
+    let gy = 1
+    // Success path (stub: 0; live: depends on compile; we only gate under stub).
+    let rc_ok = hxm_dispatch5(pipe, buf_q, buf_k, buf_v, buf_o, buf_d,
+                              tgx, tgy, gx, gy)
+    check("dispatch5 flash-attn success path returns 0", rc_ok == 0)
+    // Error path probes — at least one representative null + one zero-dim.
+    check("dispatch5 null Q → -1",
+          hxm_dispatch5(pipe, 0, buf_k, buf_v, buf_o, buf_d, tgx, tgy, gx, gy) == -1)
+    check("dispatch5 null K → -1",
+          hxm_dispatch5(pipe, buf_q, 0, buf_v, buf_o, buf_d, tgx, tgy, gx, gy) == -1)
+    check("dispatch5 null V → -1",
+          hxm_dispatch5(pipe, buf_q, buf_k, 0, buf_o, buf_d, tgx, tgy, gx, gy) == -1)
+    check("dispatch5 null O → -1",
+          hxm_dispatch5(pipe, buf_q, buf_k, buf_v, 0, buf_d, tgx, tgy, gx, gy) == -1)
+    check("dispatch5 null dims → -1",
+          hxm_dispatch5(pipe, buf_q, buf_k, buf_v, buf_o, 0, tgx, tgy, gx, gy) == -1)
+    check("dispatch5 gy=0 → -1",
+          hxm_dispatch5(pipe, buf_q, buf_k, buf_v, buf_o, buf_d, tgx, tgy, gx, 0) == -1)
+
+    // Release in reverse-alloc order (same discipline as #168).
+    check("release pipe", hxm_release(pipe) == 0)
+    check("release lib",  hxm_release(lib)  == 0)
+    check("release dims", hxm_release(buf_d) == 0)
+    check("release O",    hxm_release(buf_o) == 0)
+    check("release V",    hxm_release(buf_v) == 0)
+    check("release K",    hxm_release(buf_k) == 0)
+    check("release Q",    hxm_release(buf_q) == 0)
+    check("release dev",  hxm_release(dev)  == 0)
+    check("release null-safe", hxm_release(0) == 0)
+
+    // ── ABI drift guard ─────────────────────────────────────────
+    // hxmetal_flashattn is additive on the existing FFI surface; it
+    // MUST NOT bump HXMETAL_ABI_VERSION. Allowed range today is [1, 2].
+    let v = hxm_version()
+    check("HXMETAL_ABI_VERSION >= 1 (surface intact)", v >= 1)
+    check("HXMETAL_ABI_VERSION <= 2 (flash-attn additive, no bump)", v <= 2)
+
+    // ── summary ────────────────────────────────────────────────
+    println("")
+    println("hxmetal_flashattn: PASS=" + to_string(PASS) + " FAIL=" + to_string(FAIL))
+    println("(live-mode PoC blocked on HXFA_LIVE flip + stage 2 buffer helpers)")
+    if FAIL == 0 {
+        return 0
+    }
+    return 1
+}

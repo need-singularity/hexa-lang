@@ -1,0 +1,456 @@
+// test_spec_decode_tokps.hexa — tests for ROI #173 speculative-decode tok/s bench
+//
+// Inlined from self/bench/spec_decode_tokps.hexa (stage0 interpreter does
+// not resolve imports at runtime; this is the same pattern used by
+// test_speculative_decode.hexa for #163).
+//
+// Scope: scaffold-level smoke — verifies the bench harness produces
+// sane tok/s numbers, non-negative timings, acceptance rate in [0,100],
+// and that `run_spec_decode` / `run_baseline` return well-formed dicts.
+
+// ═══════════════════════════════════════════════════════════════════
+//  Inlined: spec_decode_tokps.hexa core
+// ═══════════════════════════════════════════════════════════════════
+
+let mut g_rng_state = 42
+
+fn rng_seed(s) { g_rng_state = s }
+
+fn rng_next_u32() {
+    g_rng_state = (g_rng_state * 1664525 + 1013904223) % 4294967296
+    return g_rng_state
+}
+
+@pure
+fn _ctx_hash(ctx) {
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 7) * 1315423911)
+        i = i + 1
+    }
+    return h
+}
+
+@pure
+fn _pseudo_rand(seed) {
+    let v = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if v < 0 { v + 2147483647 } else { v }
+    return to_float(pos) / 2147483647.0
+}
+
+@pure
+fn softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs.push(e)
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    if sum_e > 0.0 {
+        let inv = 1.0 / sum_e
+        i = 0
+        while i < n {
+            probs[i] = probs[i] * inv
+            i = i + 1
+        }
+    }
+    return probs
+}
+
+@pure
+fn argmax(arr) {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    let mut best_i = 0
+    let mut best_v = arr[0]
+    let mut i = 1
+    while i < n {
+        if arr[i] > best_v {
+            best_v = arr[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+fn _burn_work(cost_units) {
+    let mut acc = 0.0
+    let mut i = 0
+    while i < cost_units {
+        acc = acc + to_float(i) * 0.0001
+        i = i + 1
+    }
+    return acc
+}
+
+fn dummy_draft_logits(prefix, vocab_size, cost_units) {
+    let _burn = _burn_work(cost_units)
+    let h = _ctx_hash(prefix)
+    let peak = ((h % vocab_size) + vocab_size) % vocab_size
+    let mut logits = []
+    let mut i = 0
+    while i < vocab_size {
+        if i == peak {
+            logits.push(5.0 + _burn * 0.0)
+        } else if i == ((peak + 1) % vocab_size) {
+            logits.push(0.5)
+        } else {
+            logits.push(0.1)
+        }
+        i = i + 1
+    }
+    return logits
+}
+
+fn dummy_target_logits(prefix, vocab_size, cost_units) {
+    let _burn = _burn_work(cost_units)
+    let h = _ctx_hash(prefix)
+    let peak = ((h % vocab_size) + vocab_size) % vocab_size
+    let shift_peak = ((peak + 1) % vocab_size)
+    let disagree = (h % 5) == 0
+    let mut logits = []
+    let mut i = 0
+    while i < vocab_size {
+        if i == peak {
+            if disagree {
+                logits.push(1.0 + _burn * 0.0)
+            } else {
+                logits.push(5.0 + _burn * 0.0)
+            }
+        } else if i == shift_peak {
+            if disagree {
+                logits.push(5.0)
+            } else {
+                logits.push(0.5)
+            }
+        } else {
+            logits.push(0.1)
+        }
+        i = i + 1
+    }
+    return logits
+}
+
+fn target_logits_all(prefix, draft_tokens, vocab_size, cost_units) {
+    let k = len(draft_tokens)
+    let mut results = []
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    results.push(dummy_target_logits(cur, vocab_size, cost_units))
+    let mut j = 0
+    while j < k {
+        cur.push(draft_tokens[j])
+        results.push(dummy_target_logits(cur, vocab_size, cost_units))
+        j = j + 1
+    }
+    return results
+}
+
+fn spec_step(prefix, k, vocab_size, draft_cost, target_cost) {
+    let mut draft_tokens = []
+    let mut draft_logits_list = []
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    let mut di = 0
+    while di < k {
+        let logits = dummy_draft_logits(cur, vocab_size, draft_cost)
+        draft_logits_list.push(logits)
+        let probs = softmax(logits)
+        let tok = argmax(probs)
+        draft_tokens.push(tok)
+        cur.push(tok)
+        di = di + 1
+    }
+    let tgt_logits = target_logits_all(prefix, draft_tokens, vocab_size, target_cost)
+
+    let mut accepted = []
+    let mut j = 0
+    let mut rejected = false
+    while j < k && !rejected {
+        let d_probs = softmax(draft_logits_list[j])
+        let t_probs = softmax(tgt_logits[j])
+        let t = draft_tokens[j]
+        let p_d = d_probs[t]
+        let p_t = t_probs[t]
+        if p_t >= p_d {
+            accepted.push(t)
+        } else {
+            let accept_prob = if p_d > 0.0 { p_t / p_d } else { 0.0 }
+            let r = _pseudo_rand(_ctx_hash(prefix) + j * 7919 + t * 131)
+            if r < accept_prob {
+                accepted.push(t)
+            } else {
+                let fallback = argmax(t_probs)
+                accepted.push(fallback)
+                rejected = true
+            }
+        }
+        j = j + 1
+    }
+    if !rejected && len(accepted) == k {
+        let bonus = argmax(softmax(tgt_logits[k]))
+        accepted.push(bonus)
+    }
+    return accepted
+}
+
+fn baseline_step(prefix, vocab_size, target_cost) {
+    let logits = dummy_target_logits(prefix, vocab_size, target_cost)
+    let probs = softmax(logits)
+    return argmax(probs)
+}
+
+fn run_spec_decode(prefix, max_new, k, vocab_size, draft_cost, target_cost) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+
+    let mut n_drafted = 0
+    let mut n_accepted_draft = 0
+    let mut n_bonus = 0
+    let mut n_steps = 0
+    let mut generated = []
+
+    let t0 = timestamp()
+    while len(generated) < max_new {
+        let remain = max_new - len(generated)
+        let kk = if k < remain { k } else { remain }
+        let toks = spec_step(cur, kk, vocab_size, draft_cost, target_cost)
+        n_drafted = n_drafted + kk
+        n_steps = n_steps + 1
+
+        let got = len(toks)
+        if got > kk {
+            n_accepted_draft = n_accepted_draft + kk
+            n_bonus = n_bonus + (got - kk)
+        } else {
+            n_accepted_draft = n_accepted_draft + got
+        }
+
+        let mut ti = 0
+        while ti < got && len(generated) < max_new {
+            cur.push(toks[ti])
+            generated.push(toks[ti])
+            ti = ti + 1
+        }
+        if got == 0 { break }
+    }
+    let t1 = timestamp()
+    let ms = t1 - t0
+
+    let g = len(generated)
+    let mut tok_s = 0.0
+    if ms > 0 {
+        tok_s = to_float(g) / (to_float(ms) / 1000.0)
+    }
+    let mut acc_rate_pct = 0
+    if n_drafted > 0 {
+        acc_rate_pct = (n_accepted_draft * 100) / n_drafted
+    }
+
+    let out = #{}
+    out["tok_s"]             = tok_s
+    out["ms"]                = ms
+    out["generated"]         = g
+    out["n_steps"]           = n_steps
+    out["n_drafted"]         = n_drafted
+    out["n_accepted_draft"]  = n_accepted_draft
+    out["n_bonus"]           = n_bonus
+    out["n_accepted"]        = n_accepted_draft + n_bonus
+    out["acc_rate_pct"]      = acc_rate_pct
+    out["tokens"]            = generated
+    return out
+}
+
+fn run_baseline(prefix, max_new, vocab_size, target_cost) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    let mut generated = []
+
+    let t0 = timestamp()
+    while len(generated) < max_new {
+        let tok = baseline_step(cur, vocab_size, target_cost)
+        cur.push(tok)
+        generated.push(tok)
+    }
+    let t1 = timestamp()
+    let ms = t1 - t0
+
+    let g = len(generated)
+    let mut tok_s = 0.0
+    if ms > 0 {
+        tok_s = to_float(g) / (to_float(ms) / 1000.0)
+    }
+
+    let out = #{}
+    out["tok_s"]     = tok_s
+    out["ms"]        = ms
+    out["generated"] = g
+    out["tokens"]    = generated
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════════
+
+let mut pass = 0
+let mut fail = 0
+
+fn check(name, cond) {
+    if cond {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+        println("[FAIL] " + name)
+    }
+}
+
+fn eq_check(name, a, b) {
+    if a == b {
+        pass = pass + 1
+    } else {
+        fail = fail + 1
+        println("[FAIL] " + name + " got " + to_string(a) + " want " + to_string(b))
+    }
+}
+
+println("=== spec_decode_tokps test suite (ROI #173) ===")
+
+// Small, fast bench knobs so tests run under stage0 in reasonable time.
+let vocab = 16
+let draft_cost = 8
+let target_cost = 32   // 4x ratio, matches default --cost-ratio
+let prefix = [1, 2, 3, 4]
+
+// 1. dummy draft logits shape
+let dl = dummy_draft_logits(prefix, vocab, draft_cost)
+eq_check("draft logits len == vocab", len(dl), vocab)
+
+// 2. dummy target logits shape
+let tl = dummy_target_logits(prefix, vocab, target_cost)
+eq_check("target logits len == vocab", len(tl), vocab)
+
+// 3. softmax correctness on logits
+let dp = softmax(dl)
+eq_check("softmax(draft) len == vocab", len(dp), vocab)
+let mut ssum = 0.0
+let mut i = 0
+while i < vocab {
+    ssum = ssum + dp[i]
+    i = i + 1
+}
+check("softmax sum ~= 1", ssum > 0.999 && ssum < 1.001)
+
+// 4. single spec_step: 1..k+1 tokens, all in [0, vocab)
+let k = 4
+let toks = spec_step(prefix, k, vocab, draft_cost, target_cost)
+check("spec_step len >= 1", len(toks) >= 1)
+check("spec_step len <= k+1", len(toks) <= k + 1)
+
+let mut valid = true
+let mut si = 0
+while si < len(toks) {
+    if toks[si] < 0 || toks[si] >= vocab { valid = false }
+    si = si + 1
+}
+check("spec_step tokens in [0,vocab)", valid)
+
+// 5. baseline_step returns valid token
+let btok = baseline_step(prefix, vocab, target_cost)
+check("baseline_step token in [0,vocab)", btok >= 0 && btok < vocab)
+
+// 6. run_spec_decode: core benchmark harness
+let max_new = 16
+let r_spec = run_spec_decode(prefix, max_new, k, vocab, draft_cost, target_cost)
+eq_check("run_spec generated count", r_spec["generated"], max_new)
+check("run_spec ms >= 0", r_spec["ms"] >= 0)
+check("run_spec tok_s >= 0", r_spec["tok_s"] >= 0.0)
+check("run_spec n_drafted > 0", r_spec["n_drafted"] > 0)
+check("run_spec n_accepted > 0", r_spec["n_accepted"] > 0)
+check("run_spec n_accepted_draft <= n_drafted",
+      r_spec["n_accepted_draft"] <= r_spec["n_drafted"])
+check("run_spec n_bonus <= n_steps",
+      r_spec["n_bonus"] <= r_spec["n_steps"])
+check("run_spec acc_rate in [0,100]",
+      r_spec["acc_rate_pct"] >= 0 && r_spec["acc_rate_pct"] <= 100)
+check("run_spec n_steps > 0", r_spec["n_steps"] > 0)
+eq_check("run_spec tokens array len", len(r_spec["tokens"]), max_new)
+
+// 7. run_baseline: target-only harness
+let r_base = run_baseline(prefix, max_new, vocab, target_cost)
+eq_check("run_baseline generated count", r_base["generated"], max_new)
+check("run_baseline ms >= 0", r_base["ms"] >= 0)
+check("run_baseline tok_s >= 0", r_base["tok_s"] >= 0.0)
+eq_check("run_baseline tokens array len", len(r_base["tokens"]), max_new)
+
+// 8. acceptance rate bound: mock setup agrees ~80%, so >= 50% sanity.
+check("acc_rate >= 50% on mock (80% agree)", r_spec["acc_rate_pct"] >= 50)
+
+// 9. determinism: same inputs -> same accepted sequence
+let d1 = run_spec_decode(prefix, 12, k, vocab, draft_cost, target_cost)
+let d2 = run_spec_decode(prefix, 12, k, vocab, draft_cost, target_cost)
+eq_check("determinism: same generated", d1["generated"], d2["generated"])
+eq_check("determinism: same n_accepted", d1["n_accepted"], d2["n_accepted"])
+let mut tok_match = true
+let mut ti = 0
+while ti < len(d1["tokens"]) && ti < len(d2["tokens"]) {
+    if d1["tokens"][ti] != d2["tokens"][ti] { tok_match = false }
+    ti = ti + 1
+}
+check("determinism: same token sequence", tok_match)
+
+// 10. k=1 edge case: degenerates toward baseline (1 draft + 1 bonus)
+let r_k1 = run_spec_decode(prefix, 8, 1, vocab, draft_cost, target_cost)
+eq_check("k=1 generated", r_k1["generated"], 8)
+check("k=1 n_drafted > 0", r_k1["n_drafted"] > 0)
+
+// 11. scaffold tok/s invariant: both harnesses returned a float number.
+//     Under stage0 interpreter the absolute values are coarse (clock ~1ms
+//     resolution) but the HARNESS must always return non-negative finite
+//     numbers — that's what this scaffold pins.
+check("spec tok_s finite", r_spec["tok_s"] == r_spec["tok_s"])   // NaN-check
+check("baseline tok_s finite", r_base["tok_s"] == r_base["tok_s"])
+
+// Report
+let spec_ms = r_spec["ms"]
+let base_ms = r_base["ms"]
+println("  spec_tok_s=" + to_string(r_spec["tok_s"]) + " ms=" + to_string(spec_ms) +
+        " acc=" + to_string(r_spec["acc_rate_pct"]) + "%")
+println("  baseline_tok_s=" + to_string(r_base["tok_s"]) + " ms=" + to_string(base_ms))
+
+println("")
+println("=== spec_decode_tokps: " + to_string(pass) + " passed, " + to_string(fail) + " failed ===")
+if fail > 0 {
+    exit(1)
+}

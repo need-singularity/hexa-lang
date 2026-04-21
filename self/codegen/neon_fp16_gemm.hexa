@@ -1,0 +1,387 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/codegen/neon_fp16_gemm.hexa — ROI #182
+//  ARM64 NEON fp16 GEMM kernel (scaffold)
+//
+//  Scope: emit machine-code bytes for a tile-blocked fp16 GEMM kernel
+//  built on top of NEON FMLA.8H instructions, and expose a pure-.hexa
+//  "simulator" that runs the same arithmetic on scalar fp16-quantised
+//  doubles so we can validate tile bookkeeping + block layout without
+//  needing a NEON-capable emitter.
+//
+//  The kernel shape mirrors the tile strategy of a classical blocked
+//  GEMM:
+//       C[m×n] += A[m×k] · B[k×n]
+//
+//    m_tile = 4  (4 rows of C held live in accumulators)
+//    n_tile = 8  (one v-register = 8 × fp16 lanes, matches .8h)
+//    k_tile = 1  (outer product update per k step)
+//
+//  Per k step, the kernel broadcasts one A lane and fuses with a 8-lane
+//  B row via FMLA.8H:
+//     Vacc_i.8h = FMLA(Vacc_i.8h, Vb.8h, Va.h[i])
+//
+//  For the scaffold we also expose a machine-code emitter (encode the
+//  FMLA.8H vector-form word) so the caller can splice a kernel prelude
+//  into a binary later. Full outer-loop stitching is out of scope —
+//  this file only produces the inner-tile instructions plus the scalar
+//  oracle used by the companion test.
+//
+//  Sibling to self/codegen/runtime_arm64.hexa (NEON string ops).
+//  No Rust touched — this is pure .hexa codegen tooling.
+// ═══════════════════════════════════════════════════════════════
+
+// ── Tile sizes ──────────────────────────────────────────────────
+// These are the contract the emitter and the oracle share.
+
+fn neon_fp16_m_tile() -> int { return 4 }
+fn neon_fp16_n_tile() -> int { return 8 }
+fn neon_fp16_k_tile() -> int { return 1 }
+
+// ═══════════════════════════════════════════════════════════════
+// Encoders (emit raw little-endian ARM64 instruction bytes)
+// ═══════════════════════════════════════════════════════════════
+
+// Helper: push a 32-bit word as 4 little-endian bytes.
+fn push_word_le(buf: [int], word: int) -> [int] {
+    let mut b = buf
+    b.push(word % 256)
+    b.push((word / 256) % 256)
+    b.push((word / 65536) % 256)
+    b.push((word / 16777216) % 256)
+    return b
+}
+
+// FMLA (vector, FP16): Vd.8H = Vd.8H + Vn.8H * Vm.8H
+//   Encoding (FEAT_FP16):
+//     0100 1110 0100 mmmm 0000 11nn nnnd dddd
+//   Base = 0x4E400C00; Q=1 fixed for .8h form.
+//   Rd/Rn/Rm ∈ [0, 31].
+fn enc_fmla_8h(rd: int, rn: int, rm: int) -> int {
+    let base = 1312820224  // 0x4E400C00
+    return base + rm * 65536 + rn * 32 + rd
+}
+
+// LD1 single-register, post-increment: LD1 {Vt.8H}, [Xn], #16
+//   0Q 001100 110 11111 0111 size Rn Rt  (Q=1, size=01 for .8h)
+//   Word = 0x4CDF7400 | (Rn<<5) | Rt
+fn enc_ld1_8h_post(vt: int, xn: int) -> int {
+    let base = 1289712640  // 0x4CDF7400
+    return base + xn * 32 + vt
+}
+
+// ST1 single-register, post-increment: ST1 {Vt.8H}, [Xn], #16
+//   Word = 0x4C9F7400 | (Rn<<5) | Rt
+fn enc_st1_8h_post(vt: int, xn: int) -> int {
+    let base = 1285518336  // 0x4C9F7400
+    return base + xn * 32 + vt
+}
+
+// DUP (element→vector, halfword): DUP Vd.8H, Vn.H[index]
+//   Encoding (fp16, Q=1):
+//     0100 1110 000 imm5 0000 01 nnnnn ddddd
+//   imm5 = (index << 2) | 0b10   for H lanes (size=H ⇒ low bits 10)
+//   Base = 0x4E000400 with imm5 placed at bits [20:16].
+//   We expose "DUP Vd.8H, Vn.H[i]" for i in [0..7].
+fn enc_dup_8h_from_h_elt(vd: int, vn: int, index: int) -> int {
+    let base = 1308623872  // 0x4E000400
+    let imm5 = index * 4 + 2
+    return base + imm5 * 65536 + vn * 32 + vd
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Inner-tile emitter
+// ═══════════════════════════════════════════════════════════════
+//
+// Produces the instruction bytes for ONE k-step of the inner tile:
+//
+//   load B row   : LD1 {V_B.8h}, [Xb], #16
+//   for i in 0..m_tile:
+//     DUP V_Ai.8h, V_A.h[i]          ; broadcast A[m_row=i, k]
+//     FMLA V_Ci.8h, V_B.8h, V_Ai.8h  ; C_i += B * a_i
+//
+// Register plan (caller is responsible for preloading A into V_A
+// before calling this sequence):
+//   V_A      = v0         (holds up to 8 A lanes — 1 per m row)
+//   V_B      = v1
+//   V_Ai     = v2..v5    (broadcast scratch, 1 per m row)
+//   V_C0..C3 = v6..v9    (accumulators)
+//   Xb       = x1        (B row pointer, post-incremented)
+//
+// Kernel size = 1 (LD1) + m_tile × 2 (DUP + FMLA) = 1 + 4*2 = 9 instrs = 36 bytes.
+fn emit_fp16_tile_k_step() -> [int] {
+    let mt = neon_fp16_m_tile()
+    let mut buf = []
+
+    // LD1 {V1.8H}, [X1], #16
+    buf = push_word_le(buf, enc_ld1_8h_post(1, 1))
+
+    let mut i = 0
+    while i < mt {
+        let v_ai = 2 + i    // v2..v5
+        let v_ci = 6 + i    // v6..v9
+        // DUP V_Ai.8H, V0.H[i]
+        buf = push_word_le(buf, enc_dup_8h_from_h_elt(v_ai, 0, i))
+        // FMLA V_Ci.8H, V1.8H, V_Ai.8H
+        buf = push_word_le(buf, enc_fmla_8h(v_ci, 1, v_ai))
+        i = i + 1
+    }
+
+    return buf
+}
+
+// Final tile epilogue — store 4 accumulator rows out to C.
+//   ST1 {V6.8H}, [X2], #16
+//   ST1 {V7.8H}, [X2], #16
+//   ST1 {V8.8H}, [X2], #16
+//   ST1 {V9.8H}, [X2], #16
+// 4 instrs = 16 bytes.
+fn emit_fp16_tile_epilogue() -> [int] {
+    let mt = neon_fp16_m_tile()
+    let mut buf = []
+    let mut i = 0
+    while i < mt {
+        buf = push_word_le(buf, enc_st1_8h_post(6 + i, 2))
+        i = i + 1
+    }
+    return buf
+}
+
+// Full inner tile emitter: K-step times k_tile (scaffold: k_tile=1)
+// followed by the store epilogue. Returns the raw bytes.
+fn emit_fp16_tile_kernel() -> [int] {
+    let mut buf = []
+    let kt = neon_fp16_k_tile()
+    let mut k = 0
+    while k < kt {
+        let step = emit_fp16_tile_k_step()
+        let mut j = 0
+        let n = len(step)
+        while j < n {
+            buf.push(step[j])
+            j = j + 1
+        }
+        k = k + 1
+    }
+    let ep = emit_fp16_tile_epilogue()
+    let mut j2 = 0
+    let n2 = len(ep)
+    while j2 < n2 {
+        buf.push(ep[j2])
+        j2 = j2 + 1
+    }
+    return buf
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Scalar oracle (dummy fp16 inputs + GEMM verification)
+// ═══════════════════════════════════════════════════════════════
+//
+// The stage0 runtime does not expose an IEEE-754 half-precision type,
+// so we model fp16 values as integers in a small enough range that
+// truncation error vs. scalar double-precision matches what the NEON
+// FMLA.8H kernel would produce (i.e. inputs small enough that no
+// rounding occurs). The kernel contract is: outputs are bit-exact
+// for inputs in [-2^10, 2^10) with integer magnitudes — matching the
+// normal-range subdomain of fp16.
+//
+// This lets us unit-test the tile bookkeeping (strides, broadcast
+// pattern, accumulation order) against a ground-truth scalar GEMM.
+
+// Produce a deterministic m×k "A" matrix (row-major).
+fn make_fp16_A(m: int, k: int) -> [int] {
+    let mut a = []
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < k {
+            // small integer values: (i+1) mod 7, (j+1) mod 5 blend
+            a.push(((i + 1) * 3 + (j + 2)) % 11)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return a
+}
+
+// Produce a deterministic k×n "B" matrix (row-major).
+fn make_fp16_B(k: int, n: int) -> [int] {
+    let mut b = []
+    let mut i = 0
+    while i < k {
+        let mut j = 0
+        while j < n {
+            b.push(((i + 2) + (j + 1) * 2) % 13)
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return b
+}
+
+// Zero-initialised m×n C matrix (row-major).
+fn make_fp16_C(m: int, n: int) -> [int] {
+    let mut c = []
+    let mut i = 0
+    while i < m * n {
+        c.push(0)
+        i = i + 1
+    }
+    return c
+}
+
+// Ground-truth scalar GEMM: C += A·B, row-major.
+fn gemm_fp16_scalar(a: [int], b: [int], c_in: [int], m: int, n: int, k: int) -> [int] {
+    let mut c = c_in
+    let mut i = 0
+    while i < m {
+        let mut j = 0
+        while j < n {
+            let mut acc = c[i * n + j]
+            let mut p = 0
+            while p < k {
+                acc = acc + a[i * k + p] * b[p * n + j]
+                p = p + 1
+            }
+            // replace c[i*n+j] via rebuild
+            let mut out = []
+            let mut q = 0
+            let nn = len(c)
+            let idx = i * n + j
+            while q < nn {
+                if q == idx {
+                    out.push(acc)
+                } else {
+                    out.push(c[q])
+                }
+                q = q + 1
+            }
+            c = out
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return c
+}
+
+// Tile-blocked GEMM oracle — mirrors the register-level dataflow of
+// emit_fp16_tile_kernel so the test suite can confirm the tile walk
+// matches the scalar ground truth bit-for-bit.
+//
+// Constraints (scaffold): m and n must be multiples of m_tile / n_tile.
+fn gemm_fp16_tiled(a: [int], b: [int], c_in: [int], m: int, n: int, k: int) -> [int] {
+    let mt = neon_fp16_m_tile()
+    let nt = neon_fp16_n_tile()
+    let mut c = c_in
+
+    let mut mb = 0
+    while mb < m {
+        let mut nb = 0
+        while nb < n {
+            // 4 rows × 8 columns accumulator — flat length 32.
+            let mut acc = []
+            let mut init_i = 0
+            while init_i < mt {
+                let mut init_j = 0
+                while init_j < nt {
+                    acc.push(c[(mb + init_i) * n + (nb + init_j)])
+                    init_j = init_j + 1
+                }
+                init_i = init_i + 1
+            }
+            // K-loop: for each k, DUP A[m_row, k] and FMLA with B[k, n_col..n_col+8]
+            let mut p = 0
+            while p < k {
+                // Broadcast m_tile lanes of A (one per row).
+                let mut ai = 0
+                while ai < mt {
+                    let a_val = a[(mb + ai) * k + p]
+                    // Fuse against 8 lanes of B.
+                    let mut bj = 0
+                    while bj < nt {
+                        let b_val = b[p * n + (nb + bj)]
+                        let idx = ai * nt + bj
+                        // rebuild acc with updated entry
+                        let mut new_acc = []
+                        let mut s = 0
+                        let ns = len(acc)
+                        while s < ns {
+                            if s == idx {
+                                new_acc.push(acc[s] + a_val * b_val)
+                            } else {
+                                new_acc.push(acc[s])
+                            }
+                            s = s + 1
+                        }
+                        acc = new_acc
+                        bj = bj + 1
+                    }
+                    ai = ai + 1
+                }
+                p = p + 1
+            }
+            // Store tile back to C.
+            let mut si = 0
+            while si < mt {
+                let mut sj = 0
+                while sj < nt {
+                    let idx_full = (mb + si) * n + (nb + sj)
+                    let v = acc[si * nt + sj]
+                    let mut out = []
+                    let mut q = 0
+                    let nn = len(c)
+                    while q < nn {
+                        if q == idx_full {
+                            out.push(v)
+                        } else {
+                            out.push(c[q])
+                        }
+                        q = q + 1
+                    }
+                    c = out
+                    sj = sj + 1
+                }
+                si = si + 1
+            }
+            nb = nb + nt
+        }
+        mb = mb + mt
+    }
+    return c
+}
+
+// ═══════════════════════════════════════════════════════════════
+// Self-test — emit → size/shape/sanity checks
+// ═══════════════════════════════════════════════════════════════
+
+fn test_neon_fp16_gemm_kernel() {
+    let kstep = emit_fp16_tile_k_step()
+    let epi = emit_fp16_tile_epilogue()
+    let full = emit_fp16_tile_kernel()
+
+    println("")
+    println("NEON fp16 GEMM kernel (ARM64, scaffold)")
+    println("  m_tile = " + to_string(neon_fp16_m_tile()))
+    println("  n_tile = " + to_string(neon_fp16_n_tile()))
+    println("  k_tile = " + to_string(neon_fp16_k_tile()))
+    println("  k-step bytes    : " + to_string(len(kstep)))
+    println("  epilogue bytes  : " + to_string(len(epi)))
+    println("  full tile bytes : " + to_string(len(full)))
+
+    let mut ok = true
+
+    // k-step = 1 LD1 + m_tile × (DUP + FMLA) = 1 + 4*2 = 9 instrs = 36 bytes
+    if len(kstep) != 36 { println("  FAIL: k-step expected 36, got " + to_string(len(kstep))); ok = false }
+    // epilogue = m_tile × ST1 = 4 instrs = 16 bytes
+    if len(epi) != 16 { println("  FAIL: epilogue expected 16, got " + to_string(len(epi))); ok = false }
+    // full = kstep × k_tile + epi = 36 + 16 = 52 bytes (k_tile=1)
+    if len(full) != 52 { println("  FAIL: full tile expected 52, got " + to_string(len(full))); ok = false }
+
+    // All sizes must be multiples of 4 (ARM64 fixed-width).
+    if len(kstep) % 4 != 0 { println("  FAIL: k-step not 4-aligned"); ok = false }
+    if len(epi) % 4 != 0 { println("  FAIL: epilogue not 4-aligned"); ok = false }
+    if len(full) % 4 != 0 { println("  FAIL: full not 4-aligned"); ok = false }
+
+    if ok {
+        println("  ALL CHECKS PASS")
+    }
+}

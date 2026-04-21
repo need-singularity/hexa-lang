@@ -1,23 +1,59 @@
-// self/attrs/autograd.hexa — compute gradients via reverse-mode AD
+// self/attrs/autograd.hexa — @grad (autograd) 시맨틱
+// ROI id=189 (attr_semantics): reverse-mode AD attr + tape 기반 미분
+//
+// ──────────────────────────────────────────────────────────────────
+//  왜 @grad + tape 인가
+//  ──────────────────────────────────────────────────────────────
+//  @grad 는 "이 fn 의 출력에 대한 입력 gradient 를 자동 계산해 달라"
+//  는 계약 attr. 수치미분은 정밀도/속도 문제, 순방향 symbolic 은 식
+//  폭발 — reverse-mode AD 가 표준. 구현 방법:
+//
+//    forward pass 시 각 연산을 "tape" (Wengert list) 에 기록:
+//      (op, out_id, lhs_id, rhs_id, fwd_val)
+//    backward 시 tape 를 역순으로 순회하면서 chain rule 적용:
+//      grad[lhs] += ∂out/∂lhs · grad[out]
+//      grad[rhs] += ∂out/∂rhs · grad[out]
+//
+//  본 파일은 linter attr 정의 + 최소 tape 스캐폴드 (add, mul 두 op) 를
+//  함께 제공. parser 훅/codegen 은 후속 ROI 에서.
+//
+//  요구사항:
+//    · @grad 는 @pure 과 함께 써야 — side effect 있으면 tape 가 실제
+//      state 와 엇갈림 (gradient 오류).
+//    · tape 는 caller 소유 (pure 유지) — mk_tape / tape_add / tape_mul /
+//      tape_backward 로 thread.
+//
+// ──────────────────────────────────────────────────────────────────
 
 use "self/attrs/core"
 
+// ═══════════════════════════════════════════════════════════════
+//  Attr metadata (_registry 가 로드)
+// ═══════════════════════════════════════════════════════════════
 fn meta_autograd() -> AttrMeta {
     let mut m = empty_meta()
     m.name = "autograd"
     m.category = "ml"
-    m.purpose = "compute gradients via reverse-mode automatic differentiation"
-    m.requires = "@pure (재현성 필요)"
+    m.purpose = "compute gradients via reverse-mode automatic differentiation (tape-based)"
+    m.cost_rule = "training loop fn_time > tape overhead (~1us per op)"
+    m.requires = "@pure (재현성 필요 — side effect 있으면 tape 오염)"
+    m.side_effect = "tape allocation — caller 가 cache 로 재사용"
+    m.auto_test = "finite-diff vs autograd 일치 (ε=1e-5, tol=1e-3)"
     m.example = "@pure\n@autograd\nfn loss(w, x, y) -> f32 { ... }"
+    m.implemented = true
     return m
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  Linter check — @autograd 는 @pure 필수, 미지원 op 경고
+// ═══════════════════════════════════════════════════════════════
 fn check_autograd(source: string, lines: [string]) {
     let mut out = []
     let pairs = find_attr_fn_pairs(lines, "autograd")
     for pair in pairs {
         let attr_line = pair[0]
         let fn_line = pair[1]
+        // (1) @pure 가 같은 attr 블록에 있어야 — memoize.hexa 패턴 동일
         let mut has_pure = false
         let mut k = attr_line - 3
         if k < 1 { k = 1 }
@@ -29,9 +65,134 @@ fn check_autograd(source: string, lines: [string]) {
             k = k + 1
         }
         if !has_pure {
-            out.push(mk_msg("autograd", "warn", attr_line,
+            out.push(mk_msg4("autograd", "warn", attr_line,
                 "@autograd on non-@pure fn — gradient may be incorrect with side effects"))
         }
     }
     return out
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  TAPE SCAFFOLD — reverse-mode AD (add, mul only)
+//  ──────────────────────────────────────────────────────────────
+//  Value 는 id 로 표현. leaf (입력) 는 tape_leaf 로 생성하면 id 가
+//  tape 의 vals 배열에 위치. binary op 는 새 id 반환.
+//
+//  tape = [op_records, vals]
+//    op_records: [[op_code, out_id, lhs_id, rhs_id], ...]
+//      op_code: 0=leaf, 1=add, 2=mul
+//    vals: [float, ...]   (forward 값, id 순 index)
+//
+//  API:
+//    mk_tape()                       -> tape
+//    tape_leaf(tape, x)              -> [tape', id]
+//    tape_add(tape, a_id, b_id)      -> [tape', out_id]
+//    tape_mul(tape, a_id, b_id)      -> [tape', out_id]
+//    tape_value(tape, id)            -> float
+//    tape_backward(tape, out_id)     -> [dL/d0, dL/d1, ...]   (per leaf id)
+// ═══════════════════════════════════════════════════════════════
+
+fn mk_tape() {
+    // [records, vals]
+    return [[], []]
+}
+
+fn tape_leaf(tape, x) {
+    let records = tape[0]
+    let vals = tape[1]
+    let id = len(vals)
+    let mut new_records = []
+    let mut i = 0
+    while i < len(records) { new_records.push(records[i]); i = i + 1 }
+    new_records.push([0, id, -1, -1])   // op=0 leaf, no deps
+    let mut new_vals = []
+    let mut j = 0
+    while j < len(vals) { new_vals.push(vals[j]); j = j + 1 }
+    new_vals.push(x)
+    return [[new_records, new_vals], id]
+}
+
+fn tape_add(tape, a_id, b_id) {
+    let records = tape[0]
+    let vals = tape[1]
+    let out_id = len(vals)
+    let mut new_records = []
+    let mut i = 0
+    while i < len(records) { new_records.push(records[i]); i = i + 1 }
+    new_records.push([1, out_id, a_id, b_id])   // op=1 add
+    let mut new_vals = []
+    let mut j = 0
+    while j < len(vals) { new_vals.push(vals[j]); j = j + 1 }
+    new_vals.push(vals[a_id] + vals[b_id])
+    return [[new_records, new_vals], out_id]
+}
+
+fn tape_mul(tape, a_id, b_id) {
+    let records = tape[0]
+    let vals = tape[1]
+    let out_id = len(vals)
+    let mut new_records = []
+    let mut i = 0
+    while i < len(records) { new_records.push(records[i]); i = i + 1 }
+    new_records.push([2, out_id, a_id, b_id])   // op=2 mul
+    let mut new_vals = []
+    let mut j = 0
+    while j < len(vals) { new_vals.push(vals[j]); j = j + 1 }
+    new_vals.push(vals[a_id] * vals[b_id])
+    return [[new_records, new_vals], out_id]
+}
+
+fn tape_value(tape, id) {
+    let vals = tape[1]
+    return vals[id]
+}
+
+// ── Backward pass: reverse-mode chain rule ─────────────────────
+// out_id 를 최종 scalar 출력이라고 가정 → dL/d(out_id) = 1.0.
+// grad 배열을 vals 길이만큼 0.0 으로 init 하고, records 를 역순 순회
+// 하면서 chain rule 누산.
+//
+//   add: out = a + b
+//     ∂out/∂a = 1, ∂out/∂b = 1
+//     grad[a] += grad[out]
+//     grad[b] += grad[out]
+//
+//   mul: out = a * b
+//     ∂out/∂a = b, ∂out/∂b = a
+//     grad[a] += vals[b] * grad[out]
+//     grad[b] += vals[a] * grad[out]
+//
+// 반환: grad 전체 (id 순). leaf 의 gradient 만 의미 있음.
+fn tape_backward(tape, out_id) {
+    let records = tape[0]
+    let vals = tape[1]
+    let n = len(vals)
+    let mut grad = []
+    let mut i = 0
+    while i < n { grad.push(0.0); i = i + 1 }
+    grad[out_id] = 1.0
+
+    // records 를 역순으로 순회
+    let nr = len(records)
+    let mut k = nr - 1
+    while k >= 0 {
+        let rec = records[k]
+        let op = rec[0]
+        let oid = rec[1]
+        let a = rec[2]
+        let b = rec[3]
+        let g_out = grad[oid]
+        if op == 1 {
+            // add
+            grad[a] = grad[a] + g_out
+            grad[b] = grad[b] + g_out
+        } else if op == 2 {
+            // mul
+            grad[a] = grad[a] + vals[b] * g_out
+            grad[b] = grad[b] + vals[a] * g_out
+        }
+        // op==0 (leaf) → no children, skip
+        k = k - 1
+    }
+    return grad
 }

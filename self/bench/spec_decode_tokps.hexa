@@ -1,0 +1,546 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/bench/spec_decode_tokps.hexa — ROI #173
+//
+//  Speculative-decode tok/s benchmark (draft + verify throughput).
+//
+//  Why this exists (complements #163 + #164):
+//    #163 @speculative_decode scaffold       — algorithm correctness
+//    #164 kv-cache continuous-decode tok/s   — baseline serving number
+//    #173 (this file)                         — speculative throughput
+//
+//    Speculative decoding pairs a small, cheap DRAFT model with a
+//    larger TARGET (verify) model. Per Leviathan et al., every step:
+//      (1) draft runs autoregressively k times (cheap),
+//      (2) target verifies all k positions in parallel (one target
+//          forward pass equivalent to k sequential target decodes),
+//      (3) accept prefix of draft tokens that pass the probability
+//          test, plus one bonus token on full accept.
+//    Net: speculative_tok_s > baseline_tok_s when the acceptance rate
+//    amortises the draft cost. The point of this bench is to expose
+//    that ratio so tuning (k, draft/target cost split, acceptance
+//    threshold) is measurable, not guessed.
+//
+//  Unit pin (SSOT = memory/feedback_bench_unit_check.md):
+//    1 decode step = 1 accepted output token.
+//    spec_tok_s   = n_accepted / (spec_decode_ms / 1000)
+//    baseline_tok_s = n_tokens / (baseline_decode_ms / 1000)  (target-only)
+//    speedup      = spec_tok_s / baseline_tok_s
+//    acceptance_rate_pct = 100 * n_accepted / n_drafted
+//
+//  Scaffold scope (deliberate):
+//    - Dummy draft/verify token functions with deterministic hash-based
+//      logits (same style as #163's mock_draft_model/mock_target_model).
+//    - Synthetic per-forward-pass cost simulated via a small matmul so
+//      wall-clock timing is non-degenerate under the stage0 interpreter.
+//    - Target cost ~ 4x draft cost (knob: --cost-ratio) to model a
+//      realistic big/small pair.
+//    - Wall-clock tok/s measured for speculative path and baseline
+//      (target-only) path.
+//
+//  Output: single JSON line on stdout; [info] lines for humans.
+//
+//  CLI:
+//    hexa run self/bench/spec_decode_tokps.hexa \
+//        [--max-new 32] [--k 4] [--vocab 16] \
+//        [--dim 32] [--cost-ratio 4] [--seed 42] [--baseline]
+//
+//  Pure .hexa — no Rust, no FFI, no extern.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Deterministic PRNG (LCG) ────────────────────────────────────────
+let mut g_rng_state = 42
+
+fn rng_seed(s) {
+    g_rng_state = s
+}
+
+fn rng_next_u32() {
+    g_rng_state = (g_rng_state * 1664525 + 1013904223) % 4294967296
+    return g_rng_state
+}
+
+fn rng_float() {
+    let u = rng_next_u32()
+    return to_float(u) / 4294967296.0
+}
+
+// ── Pseudo-hash over prefix (style of #163) ─────────────────────────
+@pure
+fn _ctx_hash(ctx) {
+    let n = len(ctx)
+    let start = if n < 4 { 0 } else { n - 4 }
+    let mut h = 2654435761
+    let mut i = start
+    while i < n {
+        h = h ^ ((ctx[i] + 1) * (i + 7) * 1315423911)
+        i = i + 1
+    }
+    return h
+}
+
+@pure
+fn _pseudo_rand(seed) {
+    let v = ((seed * 1103515245 + 12345) % 2147483647)
+    let pos = if v < 0 { v + 2147483647 } else { v }
+    return to_float(pos) / 2147483647.0
+}
+
+// ── softmax + argmax (same as #163 for consistency) ─────────────────
+@pure
+fn softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut probs = []
+    let mut sum_e = 0.0
+    i = 0
+    while i < n {
+        let e = exp(logits[i] - mx)
+        probs.push(e)
+        sum_e = sum_e + e
+        i = i + 1
+    }
+    if sum_e > 0.0 {
+        let inv = 1.0 / sum_e
+        i = 0
+        while i < n {
+            probs[i] = probs[i] * inv
+            i = i + 1
+        }
+    }
+    return probs
+}
+
+@pure
+fn argmax(arr) {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    let mut best_i = 0
+    let mut best_v = arr[0]
+    let mut i = 1
+    while i < n {
+        if arr[i] > best_v {
+            best_v = arr[i]
+            best_i = i
+        }
+        i = i + 1
+    }
+    return best_i
+}
+
+// ── Synthetic forward-pass work (arithmetic burn) ───────────────────
+// Target & draft both do a fixed-size dot-product sweep so tok/s is
+// dominated by arithmetic, not interpreter overhead. cost_units scales
+// the sweep: draft = cost_units * 1, target = cost_units * cost_ratio.
+fn _burn_work(cost_units) {
+    let mut acc = 0.0
+    let mut i = 0
+    while i < cost_units {
+        // Cheap deterministic arithmetic — the loop bound is the knob.
+        acc = acc + to_float(i) * 0.0001
+        i = i + 1
+    }
+    return acc
+}
+
+// ── Dummy DRAFT model: peaked logits over vocab, low cost ───────────
+fn dummy_draft_logits(prefix, vocab_size, cost_units) {
+    // Simulate the (small, cheap) draft forward pass.
+    let _burn = _burn_work(cost_units)
+    let h = _ctx_hash(prefix)
+    let peak = ((h % vocab_size) + vocab_size) % vocab_size
+    let mut logits = []
+    let mut i = 0
+    while i < vocab_size {
+        if i == peak {
+            logits.push(5.0 + _burn * 0.0)  // keep _burn observed
+        } else if i == ((peak + 1) % vocab_size) {
+            logits.push(0.5)
+        } else {
+            logits.push(0.1)
+        }
+        i = i + 1
+    }
+    return logits
+}
+
+// ── Dummy TARGET (verify) model: peaked logits, higher cost ─────────
+// Agrees with draft ~80% (when (h%5)!=0); shifts peak when (h%5)==0.
+fn dummy_target_logits(prefix, vocab_size, cost_units) {
+    let _burn = _burn_work(cost_units)
+    let h = _ctx_hash(prefix)
+    let peak = ((h % vocab_size) + vocab_size) % vocab_size
+    let shift_peak = ((peak + 1) % vocab_size)
+    let disagree = (h % 5) == 0
+    let mut logits = []
+    let mut i = 0
+    while i < vocab_size {
+        if i == peak {
+            if disagree {
+                logits.push(1.0 + _burn * 0.0)
+            } else {
+                logits.push(5.0 + _burn * 0.0)
+            }
+        } else if i == shift_peak {
+            if disagree {
+                logits.push(5.0)
+            } else {
+                logits.push(0.5)
+            }
+        } else {
+            logits.push(0.1)
+        }
+        i = i + 1
+    }
+    return logits
+}
+
+// ── Target logits across k+1 positions (same shape as #163) ─────────
+fn target_logits_all(prefix, draft_tokens, vocab_size, cost_units) {
+    let k = len(draft_tokens)
+    let mut results = []
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    results.push(dummy_target_logits(cur, vocab_size, cost_units))
+    let mut j = 0
+    while j < k {
+        cur.push(draft_tokens[j])
+        results.push(dummy_target_logits(cur, vocab_size, cost_units))
+        j = j + 1
+    }
+    return results
+}
+
+// ── Single speculative step: draft k tokens, target verifies, ──────
+//    return accepted-tokens array (length 1..k+1).
+fn spec_step(prefix, k, vocab_size, draft_cost, target_cost) {
+    // 1. k autoregressive draft forwards
+    let mut draft_tokens = []
+    let mut draft_logits_list = []
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    let mut di = 0
+    while di < k {
+        let logits = dummy_draft_logits(cur, vocab_size, draft_cost)
+        draft_logits_list.push(logits)
+        let probs = softmax(logits)
+        let tok = argmax(probs)
+        draft_tokens.push(tok)
+        cur.push(tok)
+        di = di + 1
+    }
+
+    // 2. Target forward (in reality batched; here we still burn the
+    //    cost at each of k+1 positions, which is an upper bound — the
+    //    relative tok/s story still holds).
+    let tgt_logits = target_logits_all(prefix, draft_tokens, vocab_size, target_cost)
+
+    // 3. Probability-based accept/reject (simplified from #163:
+    //    deterministic argmax compare; good enough for a throughput
+    //    scaffold — the correctness test lives in #163).
+    let mut accepted = []
+    let mut j = 0
+    let mut rejected = false
+    while j < k && !rejected {
+        let d_probs = softmax(draft_logits_list[j])
+        let t_probs = softmax(tgt_logits[j])
+        let t = draft_tokens[j]
+        let p_d = d_probs[t]
+        let p_t = t_probs[t]
+        if p_t >= p_d {
+            accepted.push(t)
+        } else {
+            let accept_prob = if p_d > 0.0 { p_t / p_d } else { 0.0 }
+            let r = _pseudo_rand(_ctx_hash(prefix) + j * 7919 + t * 131)
+            if r < accept_prob {
+                accepted.push(t)
+            } else {
+                // Resample from target distribution on reject.
+                let fallback = argmax(t_probs)
+                accepted.push(fallback)
+                rejected = true
+            }
+        }
+        j = j + 1
+    }
+
+    // 4. Bonus token from target on full accept
+    if !rejected && len(accepted) == k {
+        let bonus = argmax(softmax(tgt_logits[k]))
+        accepted.push(bonus)
+    }
+
+    return accepted
+}
+
+// ── Baseline: target-only autoregressive decode (one tok per fwd) ──
+fn baseline_step(prefix, vocab_size, target_cost) {
+    let logits = dummy_target_logits(prefix, vocab_size, target_cost)
+    let probs = softmax(logits)
+    return argmax(probs)
+}
+
+// ══════════════════════════════════════════════════════════════════
+//  Public API (reused by tests)
+//
+//    run_spec_decode(prefix, max_new, k, vocab, draft_cost, target_cost)
+//      -> dict with tok_s / ms / n_accepted / n_drafted / generated[]
+//
+//    run_baseline(prefix, max_new, vocab, target_cost)
+//      -> dict with tok_s / ms / generated[]
+// ══════════════════════════════════════════════════════════════════
+fn run_spec_decode(prefix, max_new, k, vocab_size, draft_cost, target_cost) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+
+    // n_drafted:        draft tokens proposed (sum of per-step kk)
+    // n_accepted_draft: draft tokens that passed verify (<= n_drafted)
+    // n_bonus:          bonus tokens emitted on full-accept steps
+    // n_emitted:        n_accepted_draft + n_bonus  (== len(generated))
+    // acc_rate_pct:     100 * n_accepted_draft / n_drafted   (in [0, 100])
+    let mut n_drafted = 0
+    let mut n_accepted_draft = 0
+    let mut n_bonus = 0
+    let mut n_steps = 0
+    let mut generated = []
+
+    let t0 = timestamp()
+    while len(generated) < max_new {
+        let remain = max_new - len(generated)
+        let kk = if k < remain { k } else { remain }
+        let toks = spec_step(cur, kk, vocab_size, draft_cost, target_cost)
+        n_drafted = n_drafted + kk
+        n_steps = n_steps + 1
+
+        // Full-accept step: spec_step emits k draft-accept + 1 bonus.
+        // Reject/partial step: spec_step emits <=k tokens, no bonus.
+        let got = len(toks)
+        if got > kk {
+            n_accepted_draft = n_accepted_draft + kk
+            n_bonus = n_bonus + (got - kk)
+        } else {
+            n_accepted_draft = n_accepted_draft + got
+        }
+
+        let mut ti = 0
+        while ti < got && len(generated) < max_new {
+            cur.push(toks[ti])
+            generated.push(toks[ti])
+            ti = ti + 1
+        }
+        if got == 0 { break }
+    }
+    let t1 = timestamp()
+    let ms = t1 - t0
+
+    let g = len(generated)
+    let mut tok_s = 0.0
+    if ms > 0 {
+        tok_s = to_float(g) / (to_float(ms) / 1000.0)
+    }
+    let mut acc_rate_pct = 0
+    if n_drafted > 0 {
+        acc_rate_pct = (n_accepted_draft * 100) / n_drafted
+    }
+
+    let out = #{}
+    out["tok_s"]             = tok_s
+    out["ms"]                = ms
+    out["generated"]         = g
+    out["n_steps"]           = n_steps
+    out["n_drafted"]         = n_drafted
+    out["n_accepted_draft"]  = n_accepted_draft
+    out["n_bonus"]           = n_bonus
+    // Back-compat alias: total emitted from verify pipeline (draft+bonus).
+    out["n_accepted"]        = n_accepted_draft + n_bonus
+    out["acc_rate_pct"]      = acc_rate_pct
+    out["tokens"]            = generated
+    return out
+}
+
+fn run_baseline(prefix, max_new, vocab_size, target_cost) {
+    let mut cur = []
+    let mut i = 0
+    while i < len(prefix) {
+        cur.push(prefix[i])
+        i = i + 1
+    }
+    let mut generated = []
+
+    let t0 = timestamp()
+    while len(generated) < max_new {
+        let tok = baseline_step(cur, vocab_size, target_cost)
+        cur.push(tok)
+        generated.push(tok)
+    }
+    let t1 = timestamp()
+    let ms = t1 - t0
+
+    let g = len(generated)
+    let mut tok_s = 0.0
+    if ms > 0 {
+        tok_s = to_float(g) / (to_float(ms) / 1000.0)
+    }
+
+    let out = #{}
+    out["tok_s"]     = tok_s
+    out["ms"]        = ms
+    out["generated"] = g
+    out["tokens"]    = generated
+    return out
+}
+
+// ── JSON helpers ────────────────────────────────────────────────────
+fn jf(x) { return str(x) }
+fn ji(x) { return str(x) }
+
+fn jarr_ints(a) {
+    let n = len(a)
+    let mut parts = []
+    parts.push("[")
+    let mut i = 0
+    while i < n {
+        if i > 0 { parts.push(",") }
+        parts.push(str(a[i]))
+        i = i + 1
+    }
+    parts.push("]")
+    return parts.join("")
+}
+
+fn build_json(r_spec, r_base, k, vocab, draft_cost, target_cost, seed, with_baseline) {
+    let mut parts = []
+    parts.push("{")
+    parts.push("\"tok_s\":")              parts.push(jf(r_spec["tok_s"]))
+    parts.push(",\"ms\":")                parts.push(ji(r_spec["ms"]))
+    parts.push(",\"generated\":")         parts.push(ji(r_spec["generated"]))
+    parts.push(",\"n_steps\":")           parts.push(ji(r_spec["n_steps"]))
+    parts.push(",\"n_drafted\":")         parts.push(ji(r_spec["n_drafted"]))
+    parts.push(",\"n_accepted_draft\":")  parts.push(ji(r_spec["n_accepted_draft"]))
+    parts.push(",\"n_bonus\":")           parts.push(ji(r_spec["n_bonus"]))
+    parts.push(",\"n_accepted\":")        parts.push(ji(r_spec["n_accepted"]))
+    parts.push(",\"acc_rate_pct\":")      parts.push(ji(r_spec["acc_rate_pct"]))
+    parts.push(",\"tokens\":")            parts.push(jarr_ints(r_spec["tokens"]))
+
+    if with_baseline {
+        parts.push(",\"baseline_tok_s\":") parts.push(jf(r_base["tok_s"]))
+        parts.push(",\"baseline_ms\":")    parts.push(ji(r_base["ms"]))
+        let mut speedup = 0.0
+        if r_base["tok_s"] > 0.0 {
+            speedup = r_spec["tok_s"] / r_base["tok_s"]
+        }
+        parts.push(",\"speedup_vs_baseline\":") parts.push(jf(speedup))
+    }
+
+    parts.push(",\"cfg\":{\"k\":") parts.push(ji(k))
+    parts.push(",\"vocab\":")      parts.push(ji(vocab))
+    parts.push(",\"draft_cost\":") parts.push(ji(draft_cost))
+    parts.push(",\"target_cost\":") parts.push(ji(target_cost))
+    parts.push(",\"seed\":")       parts.push(ji(seed))
+    parts.push("}")
+    parts.push("}")
+    return parts.join("")
+}
+
+// ── CLI flag helpers ────────────────────────────────────────────────
+fn _flag(av, n, key, default_v) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key {
+            if (i + 1) < n { return av[(i + 1)] }
+        }
+        i = i + 1
+    }
+    return default_v
+}
+
+fn _has(av, n, key) {
+    let mut i = 0
+    while i < n {
+        if av[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _print_help() {
+    println("speculative-decode tok/s benchmark (ROI #173)")
+    println("")
+    println("Usage:")
+    println("  hexa run self/bench/spec_decode_tokps.hexa [flags]")
+    println("")
+    println("Flags:")
+    println("  --max-new <N>     Tokens to generate (default: 32)")
+    println("  --k <K>           Draft lookahead (default: 4)")
+    println("  --vocab <V>       Vocab size (default: 16)")
+    println("  --draft-cost <C>  Arithmetic work units per draft fwd (default: 256)")
+    println("  --cost-ratio <R>  target_cost = draft_cost * R (default: 4)")
+    println("  --seed <S>        RNG seed (default: 42)")
+    println("  --baseline        ALSO run target-only baseline for comparison")
+    println("  --help            This help")
+    println("")
+    println("Unit: tok_s = n_accepted / (spec_decode_ms / 1000)")
+    println("Output: one JSON line on stdout.")
+}
+
+fn main() {
+    let av = args()
+    let n_av = len(av)
+
+    if _has(av, n_av, "--help") {
+        _print_help()
+        return
+    }
+
+    let max_new    = to_int(_flag(av, n_av, "--max-new",   "32"))
+    let k          = to_int(_flag(av, n_av, "--k",         "4"))
+    let vocab      = to_int(_flag(av, n_av, "--vocab",     "16"))
+    let draft_cost = to_int(_flag(av, n_av, "--draft-cost","256"))
+    let cost_ratio = to_int(_flag(av, n_av, "--cost-ratio","4"))
+    let seed       = to_int(_flag(av, n_av, "--seed",      "42"))
+    let with_baseline = _has(av, n_av, "--baseline")
+
+    let target_cost = draft_cost * cost_ratio
+
+    rng_seed(seed)
+
+    println("[info] spec-decode bench: max_new=" + str(max_new) + " k=" + str(k) + " vocab=" + str(vocab))
+    println("[info] draft_cost=" + str(draft_cost) + " target_cost=" + str(target_cost) + " (ratio=" + str(cost_ratio) + ")")
+
+    let prefix = [1, 2, 3, 4]
+
+    println("[info] running speculative decode...")
+    let r_spec = run_spec_decode(prefix, max_new, k, vocab, draft_cost, target_cost)
+
+    let mut r_base = #{}
+    r_base["tok_s"] = 0.0
+    r_base["ms"] = 0
+    r_base["generated"] = 0
+    r_base["tokens"] = []
+    if with_baseline {
+        println("[info] running target-only baseline...")
+        r_base = run_baseline(prefix, max_new, vocab, target_cost)
+    }
+
+    let j = build_json(r_spec, r_base, k, vocab, draft_cost, target_cost, seed, with_baseline)
+    println(j)
+}
+
+// Stage0 auto-calls main() at end of file.

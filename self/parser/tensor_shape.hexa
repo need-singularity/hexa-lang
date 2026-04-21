@@ -1,0 +1,347 @@
+// self/parser/tensor_shape.hexa — @tensor<N,D,...> shape-annotation parser
+// ROI #175 (parser / scaffold)
+//
+// Goal: parse shape annotations of the form
+//
+//     @tensor<N, D>           // rank-2 with symbolic/numeric dims
+//     @tensor<3, 4>           // fully concrete
+//     @tensor<B, S, D>        // rank-3
+//     @tensor<N, ?>           // ? = unknown / dynamic
+//
+// ...into a TensorShape AST node (dict-style, matching the convention used
+// elsewhere in self/parser.hexa), then expose a minimal type-checker entry
+// (tensor_shape_check) that validates rank + per-dim well-formedness.
+//
+// Scope (scaffold):
+//   * Tokenize the `@tensor<...>` head from a source string (no lexer pull-in —
+//     string-level scan is sufficient for this annotation).
+//   * Produce a TensorShape node.
+//   * Verify shape: rank >= 1, each dim is either a positive int literal,
+//     a non-empty ident, or the wildcard '?'.
+//   * Pure, no side effects, no Rust changes.
+//
+// Non-goals (deferred):
+//   * Integration with self/parser.hexa's full token stream (that lives in
+//     parse_attribute_prefix — this module is the building block the parser
+//     will call once we wire it in).
+//   * Codegen / runtime lowering.
+//   * Cross-op rank inference.
+
+// ── TensorShape AST node ─────────────────────────────────────────────
+// A "node" here is a dict to match the style of the existing parser.hexa
+// return-sites (search for `"kind": "..."` in self/parser.hexa).
+//
+//   kind       : "TensorShape"
+//   rank       : int                     (== len(dims))
+//   dims       : [string]                canonical dim tokens
+//   dim_kinds  : [string]                parallel: "int" | "ident" | "dyn"
+//   raw        : string                  original "N,D" text (pre-split)
+//   errors     : [string]                accumulated parse/verify errors
+//   ok         : bool                    len(errors) == 0 && rank >= 1
+//
+// NOTE: we build the dict in one shot at each return-site rather than
+// mutating fields post-hoc — the hexa interpreter in this tree does not
+// reliably persist `node.field = arr` mutations across function returns.
+
+fn tensor_shape_new() {
+    return #{
+        "kind": "TensorShape",
+        "rank": 0,
+        "dims": [],
+        "dim_kinds": [],
+        "raw": "",
+        "errors": [],
+        "ok": false
+    }
+}
+
+fn _ts_make(raw: string, dims, dim_kinds, errors) {
+    let rank = len(dims)
+    let ok = len(errors) == 0 && rank >= 1
+    return #{
+        "kind": "TensorShape",
+        "rank": rank,
+        "dims": dims,
+        "dim_kinds": dim_kinds,
+        "raw": raw,
+        "errors": errors,
+        "ok": ok
+    }
+}
+
+fn _ts_err(msg: string) {
+    let errs = [msg]
+    let empty_dims = []
+    let empty_kinds = []
+    return #{
+        "kind": "TensorShape",
+        "rank": 0,
+        "dims": empty_dims,
+        "dim_kinds": empty_kinds,
+        "raw": "",
+        "errors": errs,
+        "ok": false
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────
+
+// NOTE: the hexa interpreter in this tree does not support string ordering
+// comparisons (<, <=, >, >=) on single-character strings — only `==`. So
+// classification uses explicit membership tests.
+
+fn _ts_is_digit(c) -> bool {
+    if c == "0" { return true }
+    if c == "1" { return true }
+    if c == "2" { return true }
+    if c == "3" { return true }
+    if c == "4" { return true }
+    if c == "5" { return true }
+    if c == "6" { return true }
+    if c == "7" { return true }
+    if c == "8" { return true }
+    if c == "9" { return true }
+    return false
+}
+
+fn _ts_is_lower(c) -> bool {
+    if c == "a" { return true } if c == "b" { return true } if c == "c" { return true }
+    if c == "d" { return true } if c == "e" { return true } if c == "f" { return true }
+    if c == "g" { return true } if c == "h" { return true } if c == "i" { return true }
+    if c == "j" { return true } if c == "k" { return true } if c == "l" { return true }
+    if c == "m" { return true } if c == "n" { return true } if c == "o" { return true }
+    if c == "p" { return true } if c == "q" { return true } if c == "r" { return true }
+    if c == "s" { return true } if c == "t" { return true } if c == "u" { return true }
+    if c == "v" { return true } if c == "w" { return true } if c == "x" { return true }
+    if c == "y" { return true } if c == "z" { return true }
+    return false
+}
+
+fn _ts_is_upper(c) -> bool {
+    if c == "A" { return true } if c == "B" { return true } if c == "C" { return true }
+    if c == "D" { return true } if c == "E" { return true } if c == "F" { return true }
+    if c == "G" { return true } if c == "H" { return true } if c == "I" { return true }
+    if c == "J" { return true } if c == "K" { return true } if c == "L" { return true }
+    if c == "M" { return true } if c == "N" { return true } if c == "O" { return true }
+    if c == "P" { return true } if c == "Q" { return true } if c == "R" { return true }
+    if c == "S" { return true } if c == "T" { return true } if c == "U" { return true }
+    if c == "V" { return true } if c == "W" { return true } if c == "X" { return true }
+    if c == "Y" { return true } if c == "Z" { return true }
+    return false
+}
+
+fn _ts_is_ident_start(c) -> bool {
+    return _ts_is_lower(c) || _ts_is_upper(c) || c == "_"
+}
+
+fn _ts_is_ident_cont(c) -> bool {
+    return _ts_is_ident_start(c) || _ts_is_digit(c)
+}
+
+// Trim leading/trailing ASCII whitespace from a dim token.
+fn _ts_trim(s: string) -> string {
+    let chars = s.chars()
+    let n = len(chars)
+    let mut i = 0
+    while i < n {
+        let c = chars[i]
+        if c == " " || c == "\t" { i = i + 1 } else { break }
+    }
+    let mut j = n
+    while j > i {
+        let c = chars[j - 1]
+        if c == " " || c == "\t" { j = j - 1 } else { break }
+    }
+    let mut out = ""
+    let mut k = i
+    while k < j {
+        out = out + to_string(chars[k])
+        k = k + 1
+    }
+    return out
+}
+
+// Classify one dim token:
+//   "int"   — all digits, value > 0 (no leading zeros)
+//   "dyn"   — literally "?"
+//   "ident" — valid identifier
+//   ""      — invalid (caller records error)
+fn _ts_classify_dim(tok: string) -> string {
+    if tok == "" { return "" }
+    if tok == "?" { return "dyn" }  // literal wildcard (OK as multi-char string)
+    let chars = tok.chars()
+    let n = len(chars)
+
+    // Integer literal?
+    let mut all_digits = true
+    let mut i = 0
+    while i < n {
+        if !_ts_is_digit(chars[i]) { all_digits = false; break }
+        i = i + 1
+    }
+    if all_digits {
+        // Reject literal "0" and multi-digit with leading zero.
+        if n == 1 && chars[0] == "0" { return "" }
+        if n > 1 && chars[0] == "0" { return "" }
+        return "int"
+    }
+
+    // Identifier?
+    if !_ts_is_ident_start(chars[0]) { return "" }
+    let mut j = 1
+    while j < n {
+        if !_ts_is_ident_cont(chars[j]) { return "" }
+        j = j + 1
+    }
+    return "ident"
+}
+
+// ── core entry points ────────────────────────────────────────────────
+//
+// tensor_shape_parse(inner) — `inner` is the raw text between '<' and '>',
+// e.g. "N, D" or "3, 4" or "B, S, D". Returns a TensorShape node.
+fn tensor_shape_parse(inner: string) {
+    // Split on top-level commas.
+    let chars = inner.chars()
+    let n = len(chars)
+    let mut parts = []
+    let mut buf = ""
+    let mut i = 0
+    while i < n {
+        let c = chars[i]
+        if c == "," {
+            parts.push(buf)
+            buf = ""
+        } else {
+            buf = buf + to_string(c)
+        }
+        i = i + 1
+    }
+    parts.push(buf)
+
+    let mut dims = []
+    let mut dim_kinds = []
+    let mut errors = []
+
+    let mut k = 0
+    while k < len(parts) {
+        let raw_part = parts[k]
+        let tok = _ts_trim(raw_part)
+        if tok == "" {
+            errors.push("dim[" + to_string(k) + "]: empty dim")
+            dims.push("")
+            dim_kinds.push("")
+        } else {
+            let kind = _ts_classify_dim(tok)
+            if kind == "" {
+                errors.push("dim[" + to_string(k) + "]: invalid token '" + tok + "'")
+            }
+            dims.push(tok)
+            dim_kinds.push(kind)
+        }
+        k = k + 1
+    }
+
+    return _ts_make(inner, dims, dim_kinds, errors)
+}
+
+// tensor_shape_parse_head(src) — accept a source snippet beginning with
+// `@tensor<...>` (optionally followed by more tokens) and extract the inner
+// angle-bracket body, then delegate to tensor_shape_parse.
+//
+// Returns a TensorShape node; on malformed head (missing `<`/`>`) the node
+// carries a descriptive error and ok=false.
+fn tensor_shape_parse_head(src: string) {
+    let chars = src.chars()
+    let n = len(chars)
+    let mut i = 0
+    while i < n {
+        let c = chars[i]
+        if c == " " || c == "\t" || c == "\n" { i = i + 1 } else { break }
+    }
+    let head = "@tensor"
+    let head_chars = head.chars()
+    let hn = len(head_chars)
+    if i + hn > n {
+        return _ts_err("expected '@tensor' head")
+    }
+    let mut h = 0
+    while h < hn {
+        if chars[i + h] != head_chars[h] {
+            return _ts_err("expected '@tensor' head")
+        }
+        h = h + 1
+    }
+    i = i + hn
+    if i >= n || chars[i] != "<" {
+        return _ts_err("expected '<' after @tensor")
+    }
+    i = i + 1
+    let mut inner = ""
+    let mut depth = 1
+    while i < n {
+        let c = chars[i]
+        if c == "<" { depth = depth + 1 }
+        if c == ">" {
+            depth = depth - 1
+            if depth == 0 { break }
+        }
+        inner = inner + to_string(c)
+        i = i + 1
+    }
+    if depth != 0 {
+        return _ts_err("unterminated '<...>' in @tensor head")
+    }
+    return tensor_shape_parse(inner)
+}
+
+// ── "type-checker" pass ──────────────────────────────────────────────
+//
+// tensor_shape_check(node) — minimal verifier:
+//   * rank >= 1
+//   * every dim has a recognized kind (int|ident|dyn)
+//
+// Returns a possibly-augmented TensorShape node (errors appended,
+// ok re-evaluated). Rebuilds the dict rather than mutating fields.
+fn tensor_shape_check(node) {
+    let mut errors = []
+    let mut e = 0
+    while e < len(node.errors) {
+        errors.push(node.errors[e])
+        e = e + 1
+    }
+    if node.rank < 1 {
+        errors.push("rank must be >= 1")
+    }
+    let mut i = 0
+    while i < len(node.dim_kinds) {
+        let k = node.dim_kinds[i]
+        if k != "int" && k != "ident" && k != "dyn" {
+            errors.push("dim[" + to_string(i) + "]: unknown kind")
+        }
+        i = i + 1
+    }
+    return _ts_make(node.raw, node.dims, node.dim_kinds, errors)
+}
+
+// tensor_shape_rank_eq(a, b) — convenience predicate for the future
+// op-level rank checker: returns true iff both TensorShape nodes validate
+// and share the same rank.
+fn tensor_shape_rank_eq(a, b) -> bool {
+    if !a.ok { return false }
+    if !b.ok { return false }
+    return a.rank == b.rank
+}
+
+// tensor_shape_to_string(node) — canonical display form, e.g. "@tensor<N,D>".
+fn tensor_shape_to_string(node) -> string {
+    let mut s = "@tensor<"
+    let mut i = 0
+    while i < len(node.dims) {
+        if i > 0 { s = s + "," }
+        s = s + node.dims[i]
+        i = i + 1
+    }
+    s = s + ">"
+    return s
+}

@@ -1,0 +1,357 @@
+// ═══════════════════════════════════════════════════════════════════
+//  test_quant_int4.hexa — ROI #180 verification
+//
+//  Exercises self/ai_native/quant_int4.hexa: asymmetric per-group int4
+//  weight-only quantize → pack → unpack → dequant round-trip.
+//
+//  Coverage:
+//    T01  helpers (abs, round, clamp)
+//    T02  pack / unpack exact layout (lo nibble / hi nibble)
+//    T03  small vector round-trip ([0.1, 0.3, 0.5, 0.7])
+//    T04  symmetric vector round-trip (Gaussian-like)
+//    T05  skewed positive vector round-trip (all > 0)
+//    T06  flat / zero group — scale fallback + exact recovery
+//    T07  odd-length vector round-trip (pack padding)
+//    T08  group boundary (n == group_size, n == 2*group_size)
+//    T09  nibble range check — every q ∈ [0..15]
+//    T10  packed bytes count == (n+1)/2
+//    T11  L2 relative error bound (< 0.11) on synthetic Gaussian
+//    T12  compression ratio ≈ 8x vs fp32 (4 bytes / 0.5 bytes)
+//
+//  Run:  ./hexa run self/test_quant_int4.hexa
+// ═══════════════════════════════════════════════════════════════════
+
+// -- inlined from self/ai_native/quant_int4.hexa --
+// (codegen import not wired for test files — matches sibling convention)
+
+fn _q4_abs(x) {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn _q4_clamp_int(v, lo, hi) {
+    if v < lo { return lo }
+    if v > hi { return hi }
+    return v
+}
+
+fn _q4_round(x) {
+    if x >= 0.0 {
+        return floor(x + 0.5)
+    }
+    return 0 - floor((0 - x) + 0.5)
+}
+
+fn q4_pack_nibbles(q4) {
+    let n = len(q4)
+    let packed_len = (n + 1) / 2
+    let mut out = []
+    let mut i = 0
+    while i < packed_len {
+        let lo_idx = i * 2
+        let hi_idx = lo_idx + 1
+        let lo = q4[lo_idx] & 15
+        let mut hi = 0
+        if hi_idx < n {
+            hi = q4[hi_idx] & 15
+        }
+        let byte_val = (hi * 16) + lo
+        out = out + [byte_val]
+        i = i + 1
+    }
+    return out
+}
+
+fn q4_unpack_nibbles(bytes, n) {
+    let mut out = []
+    let mut idx = 0
+    let mut i = 0
+    let mb = len(bytes)
+    while i < mb {
+        let b = bytes[i]
+        let lo = b & 15
+        let hi = (b / 16) & 15
+        if idx < n {
+            out = out + [lo]
+            idx = idx + 1
+        }
+        if idx < n {
+            out = out + [hi]
+            idx = idx + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn q4_quantize_group(w, group_size) {
+    let n = len(w)
+    let mut q = []
+    let mut scales = []
+    let mut zeros = []
+    let mut g_start = 0
+    while g_start < n {
+        let mut g_end = g_start + group_size
+        if g_end > n { g_end = n }
+        let mut wmin = w[g_start]
+        let mut wmax = w[g_start]
+        let mut j = g_start + 1
+        while j < g_end {
+            let v = w[j]
+            if v < wmin { wmin = v }
+            if v > wmax { wmax = v }
+            j = j + 1
+        }
+        let span = wmax - wmin
+        let mut scale = span / 15.0
+        let mut zero_i = 0
+        if scale == 0.0 {
+            scale = 1.0
+            zero_i = _q4_round(0.0 - wmin)
+        } else {
+            zero_i = _q4_round((0.0 - wmin) / scale)
+        }
+        scales = scales + [scale]
+        zeros = zeros + [zero_i]
+        let mut k = g_start
+        while k < g_end {
+            let qv = _q4_round(w[k] / scale) + zero_i
+            let clamped = _q4_clamp_int(qv, 0, 15)
+            q = q + [clamped]
+            k = k + 1
+        }
+        g_start = g_end
+    }
+    let packed = q4_pack_nibbles(q)
+    return [packed, scales, zeros, group_size, n]
+}
+
+fn q4_dequantize(pk) {
+    let packed = pk[0]
+    let scales = pk[1]
+    let zeros = pk[2]
+    let group_size = pk[3]
+    let n = pk[4]
+    let q = q4_unpack_nibbles(packed, n)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let g = i / group_size
+        let s = scales[g]
+        let z = zeros[g]
+        let v = (q[i] - z) * s
+        out = out + [v]
+        i = i + 1
+    }
+    return out
+}
+
+fn q4_l2_rel_err(w, w_hat) {
+    let n = len(w)
+    let mut num = 0.0
+    let mut den = 0.0
+    let mut i = 0
+    while i < n {
+        let d = w[i] - w_hat[i]
+        num = num + d * d
+        den = den + w[i] * w[i]
+        i = i + 1
+    }
+    if den == 0.0 { return 0.0 }
+    return sqrt(num) / sqrt(den)
+}
+
+fn q4_packed_bytes(n) {
+    return (n + 1) / 2
+}
+
+fn q4_compression_vs_fp32(n) {
+    if n == 0 { return 0.0 }
+    let raw = n * 4
+    let packed = q4_packed_bytes(n)
+    return to_float(raw) / to_float(packed)
+}
+
+// -- end inlined --
+
+let mut PASS = 0
+let mut FAIL = 0
+
+fn check(name, cond) {
+    if cond {
+        PASS = PASS + 1
+        println("[PASS] " + name)
+    } else {
+        FAIL = FAIL + 1
+        println("[FAIL] " + name)
+    }
+}
+
+fn approx(a, b, tol) {
+    let d = a - b
+    if d < 0.0 { return (0.0 - d) < tol }
+    return d < tol
+}
+
+// --- Deterministic LCG PRNG used to build a pseudo-Gaussian vec ---
+let mut _RNG = 20260421
+
+fn rand_uniform() {
+    _RNG = (_RNG * 1664525 + 1013904223) % 2147483648
+    return to_float(_RNG) / 2147483648.0
+}
+
+// CLT-style 12-uniform mean-0 vec (matches test_quantize.hexa trick).
+fn gen_gaussian(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        let mut s = 0.0
+        let mut k = 0
+        while k < 12 {
+            s = s + (rand_uniform() - 0.5)
+            k = k + 1
+        }
+        out = out + [s]
+        i = i + 1
+    }
+    return out
+}
+
+println("═══════════════════════════════════════════════════════")
+println("  quant_int4 (ROI #180) — asymmetric int4 + pack + dequant")
+println("═══════════════════════════════════════════════════════")
+println("")
+
+// ── T01: helpers ────────────────────────────────────────────────
+check("T01a _q4_abs(-2.5) == 2.5",   _q4_abs(0.0 - 2.5) == 2.5)
+check("T01b _q4_abs(3.0)  == 3.0",   _q4_abs(3.0) == 3.0)
+check("T01c _q4_round(2.6)  == 3",   _q4_round(2.6) == 3)
+check("T01d _q4_round(-2.6) == -3",  _q4_round(0.0 - 2.6) == 0 - 3)
+check("T01e clamp low",              _q4_clamp_int(0 - 5, 0, 15) == 0)
+check("T01f clamp high",             _q4_clamp_int(99, 0, 15) == 15)
+check("T01g clamp mid",              _q4_clamp_int(8, 0, 15) == 8)
+
+// ── T02: explicit pack layout ───────────────────────────────────
+// nibbles = [5, 11] → byte = 11*16 + 5 = 181
+let p_lay = q4_pack_nibbles([5, 11])
+check("T02a single-byte layout", p_lay[0] == 181)
+let u_lay = q4_unpack_nibbles(p_lay, 2)
+check("T02b unpack n=2 lo",      u_lay[0] == 5)
+check("T02c unpack n=2 hi",      u_lay[1] == 11)
+// odd length drops the pad
+let p_odd = q4_pack_nibbles([3, 9, 14])
+let u_odd = q4_unpack_nibbles(p_odd, 3)
+check("T02d odd packed bytes == 2", len(p_odd) == 2)
+check("T02e odd unpack n=3 length", len(u_odd) == 3)
+check("T02f odd unpack values",     u_odd[0] == 3 && u_odd[1] == 9 && u_odd[2] == 14)
+
+// ── T03: small symmetric vector round-trip ──────────────────────
+let w3 = [0.1, 0.3, 0.5, 0.7]
+let pk3 = q4_quantize_group(w3, 4)
+let dw3 = q4_dequantize(pk3)
+check("T03a shape preserved", len(dw3) == 4)
+check("T03b err < 0.06",      q4_l2_rel_err(w3, dw3) < 0.06)
+
+// ── T04: Gaussian-like vector round-trip ────────────────────────
+let w4 = [0.0 - 1.5, 0.0 - 0.3, 0.0, 0.2, 1.1, 0.4, 0.0 - 0.8, 0.9]
+let pk4 = q4_quantize_group(w4, 8)
+let dw4 = q4_dequantize(pk4)
+check("T04a shape preserved", len(dw4) == 8)
+let err4 = q4_l2_rel_err(w4, dw4)
+println("  gaussian8 L2 rel err = " + to_string(err4))
+check("T04b err < 0.11", err4 < 0.11)
+
+// ── T05: skewed positive vector (asymmetric helps) ──────────────
+// Pure positive values — zero point captures the bias.
+let w5 = [1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6, 1.7]
+let pk5 = q4_quantize_group(w5, 8)
+let dw5 = q4_dequantize(pk5)
+let err5 = q4_l2_rel_err(w5, dw5)
+println("  skewed+ L2 rel err = " + to_string(err5))
+check("T05a shape preserved", len(dw5) == 8)
+check("T05b err < 0.05",      err5 < 0.05)
+
+// ── T06: flat group (all equal) ─────────────────────────────────
+let w6 = [2.0, 2.0, 2.0, 2.0]
+let pk6 = q4_quantize_group(w6, 4)
+let dw6 = q4_dequantize(pk6)
+// Flat group: scale=1, zero=round(-w_min)=-2 clamped to 0; w_hat = (q - 0)*1
+// But q = round(2 / 1) + 0 = 2, so w_hat = 2 exactly.
+check("T06a flat shape", len(dw6) == 4)
+check("T06b flat exact recovery 0", approx(dw6[0], 2.0, 1e-9))
+check("T06c flat exact recovery 3", approx(dw6[3], 2.0, 1e-9))
+
+// ── T07: odd-length vector round-trip ───────────────────────────
+let w7 = [0.0 - 0.5, 0.25, 0.75, 1.0, 0.0 - 1.25]
+let pk7 = q4_quantize_group(w7, 8)  // one group
+let dw7 = q4_dequantize(pk7)
+check("T07a odd shape == 5", len(dw7) == 5)
+let err7 = q4_l2_rel_err(w7, dw7)
+println("  odd-len L2 rel err = " + to_string(err7))
+check("T07b err < 0.1", err7 < 0.1)
+
+// ── T08: group boundary alignment ───────────────────────────────
+// n == group_size
+let w8a = gen_gaussian(16)
+let pk8a = q4_quantize_group(w8a, 16)
+// scales length should be 1
+check("T08a single group: scales len == 1", len(pk8a[1]) == 1)
+let dw8a = q4_dequantize(pk8a)
+check("T08b single-group shape", len(dw8a) == 16)
+// n == 2*group_size
+let w8b = gen_gaussian(32)
+let pk8b = q4_quantize_group(w8b, 16)
+check("T08c double group: scales len == 2", len(pk8b[1]) == 2)
+check("T08d double group: zeros len == 2",  len(pk8b[2]) == 2)
+
+// ── T09: nibble range check ─────────────────────────────────────
+// After unpack, every nibble must lie in [0..15].
+let w9 = gen_gaussian(64)
+let pk9 = q4_quantize_group(w9, 16)
+let q9 = q4_unpack_nibbles(pk9[0], 64)
+let mut rng_ok = true
+let mut rj = 0
+while rj < 64 {
+    let v = q9[rj]
+    if v < 0  { rng_ok = false }
+    if v > 15 { rng_ok = false }
+    rj = rj + 1
+}
+check("T09 all nibbles in [0..15]", rng_ok)
+
+// ── T10: packed byte count ──────────────────────────────────────
+check("T10a packed_bytes(64) == 32",  q4_packed_bytes(64) == 32)
+check("T10b packed_bytes(5)  == 3",   q4_packed_bytes(5) == 3)
+check("T10c packed_bytes(0)  == 0",   q4_packed_bytes(0) == 0)
+check("T10d actual length matches",   len(pk9[0]) == 32)
+
+// ── T11: L2 error on larger Gaussian vector ─────────────────────
+let w11 = gen_gaussian(1024)
+let pk11 = q4_quantize_group(w11, 32)
+let dw11 = q4_dequantize(pk11)
+let err11 = q4_l2_rel_err(w11, dw11)
+println("  n=1024 g=32 L2 rel err = " + to_string(err11))
+check("T11a shape preserved", len(dw11) == 1024)
+// Asymmetric int4 at group=32 on Gaussians: empirical floor ~0.08.
+check("T11b err < 0.11",      err11 < 0.11)
+// And meaningfully non-trivial reconstruction.
+check("T11c err > 0.0",       err11 > 0.0)
+
+// ── T12: compression ratio vs fp32 ──────────────────────────────
+let ratio = q4_compression_vs_fp32(1024)
+// 1024 * 4 = 4096 bytes fp32 ; packed = 512 bytes ; ratio = 8.0
+println("  fp32 / int4_packed ratio = " + to_string(ratio))
+check("T12a ratio ≈ 8.0", ratio > 7.9 && ratio < 8.1)
+
+// ── Summary ─────────────────────────────────────────────────────
+println("")
+println("═══════════════════════════════════════════════════════")
+println("  quant_int4: " + to_string(PASS) + " passed, " + to_string(FAIL) + " failed")
+if FAIL == 0 {
+    println("  ALL GREEN — ROI #180 PoC verified")
+    println("  Packing: fp32 → int4+scale+zero → " + to_string(ratio) + "x smaller")
+} else {
+    println("  FAIL — see log above")
+}
+println("═══════════════════════════════════════════════════════")

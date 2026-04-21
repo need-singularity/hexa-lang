@@ -1,0 +1,333 @@
+// ═══════════════════════════════════════════════════════════════
+//  test_paged_kv.hexa — Paged-Attention KV Allocator scaffold test
+//
+//  검증:
+//    1. new(64) -> 64 free pages, 0 used
+//    2. alloc 1 page -> used=1, free=63
+//    3. release 1 page -> used=0, free=64, reuse counter increments next alloc
+//    4. 두 시퀀스 교차 할당 — page tables 분리
+//    5. release_seq -> 모든 페이지 free list 로 반환
+//    6. 풀 고갈 (65번째 alloc) -> -1 sentinel
+//
+//  실행: ./hexa self/test_paged_kv.hexa
+// ═══════════════════════════════════════════════════════════════
+
+let mut pass_count = 0
+let mut fail_count = 0
+
+fn check(name, cond) {
+    if cond {
+        println("[PASS] " + name)
+        pass_count = pass_count + 1
+    } else {
+        println("[FAIL] " + name)
+        fail_count = fail_count + 1
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Inline module code (self/alloc/paged_kv.hexa)
+//  — hexa 인터프리터의 안정적 단일-파일 실행을 위해 인라인.
+// ═══════════════════════════════════════════════════════════════
+
+fn paged_kv_default_num_pages()   { return 64 }
+fn paged_kv_default_page_tokens() { return 16 }
+fn paged_kv_default_head_dim()    { return 64 }
+
+struct KVPage { page_id: int, tokens: int }
+
+fn kv_page_new(page_id) { return KVPage { page_id: page_id, tokens: 0 } }
+
+struct PagedKVAllocator {
+    num_pages:   int,
+    page_tokens: int,
+    head_dim:    int,
+    free_list:   array,
+    used:        array,
+    seq_ids:     array,
+    page_tables: array,
+    stat_alloc:  int,
+    stat_release:int,
+    stat_reuse:  int
+}
+
+fn paged_kv_new(num_pages, page_tokens, head_dim) {
+    let mut fl = []
+    let mut ud = []
+    let mut i = num_pages - 1
+    while i >= 0 {
+        fl.push(i)
+        i = i - 1
+    }
+    let mut j = 0
+    while j < num_pages {
+        ud.push(false)
+        j = j + 1
+    }
+    return PagedKVAllocator {
+        num_pages: num_pages, page_tokens: page_tokens, head_dim: head_dim,
+        free_list: fl, used: ud, seq_ids: [], page_tables: [],
+        stat_alloc: 0, stat_release: 0, stat_reuse: 0
+    }
+}
+
+fn paged_kv_new_default() {
+    return paged_kv_new(paged_kv_default_num_pages(), paged_kv_default_page_tokens(), paged_kv_default_head_dim())
+}
+
+fn paged_kv_free_count(p: PagedKVAllocator) { return len(p.free_list) }
+fn paged_kv_used_count(p: PagedKVAllocator) { return p.num_pages - len(p.free_list) }
+fn paged_kv_seq_count(p: PagedKVAllocator)  { return len(p.seq_ids) }
+
+fn paged_kv_find_seq(p: PagedKVAllocator, seq_id) {
+    let n = len(p.seq_ids)
+    let mut i = 0
+    while i < n {
+        if p.seq_ids[i] == seq_id { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn paged_kv_page_table(p: PagedKVAllocator, seq_id) {
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return [] }
+    return p.page_tables[idx]
+}
+
+fn paged_kv_seq_pages(p: PagedKVAllocator, seq_id) {
+    return len(paged_kv_page_table(p, seq_id))
+}
+
+fn _paged_kv_set_used(used_arr, page_id, value) {
+    let n = len(used_arr)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        if i == page_id { out.push(value) } else { out.push(used_arr[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _paged_kv_replace_table(p: PagedKVAllocator, idx, new_table) {
+    let n = len(p.seq_ids)
+    let mut new_ids = []
+    let mut new_tabs = []
+    let mut i = 0
+    while i < n {
+        new_ids.push(p.seq_ids[i])
+        if i == idx { new_tabs.push(new_table) } else { new_tabs.push(p.page_tables[i]) }
+        i = i + 1
+    }
+    return PagedKVAllocator {
+        num_pages: p.num_pages, page_tokens: p.page_tokens, head_dim: p.head_dim,
+        free_list: p.free_list, used: p.used, seq_ids: new_ids, page_tables: new_tabs,
+        stat_alloc: p.stat_alloc, stat_release: p.stat_release, stat_reuse: p.stat_reuse
+    }
+}
+
+struct PagedKVAllocOut { alloc: PagedKVAllocator, page_id: int }
+struct PagedKVOut      { alloc: PagedKVAllocator, ok: bool }
+
+fn paged_kv_register_seq(p: PagedKVAllocator, seq_id) {
+    if paged_kv_find_seq(p, seq_id) >= 0 { return p }
+    let new_ids = p.seq_ids.push(seq_id)
+    let new_tabs = p.page_tables.push([])
+    return PagedKVAllocator {
+        num_pages: p.num_pages, page_tokens: p.page_tokens, head_dim: p.head_dim,
+        free_list: p.free_list, used: p.used, seq_ids: new_ids, page_tables: new_tabs,
+        stat_alloc: p.stat_alloc, stat_release: p.stat_release, stat_reuse: p.stat_reuse
+    }
+}
+
+fn paged_kv_alloc_page(p0: PagedKVAllocator, seq_id) {
+    let p = paged_kv_register_seq(p0, seq_id)
+    let fl = p.free_list
+    let n = len(fl)
+    if n == 0 { return PagedKVAllocOut { alloc: p, page_id: -1 } }
+    let pid = fl[n - 1]
+    let mut new_fl = []
+    let mut i = 0
+    while i < n - 1 { new_fl.push(fl[i]); i = i + 1 }
+    let was_used = p.used[pid]
+    let new_used = _paged_kv_set_used(p.used, pid, true)
+    let mut reuse_inc = 0
+    if was_used == false {
+        if p.stat_alloc > 0 { reuse_inc = 1 }
+    }
+    let idx = paged_kv_find_seq(p, seq_id)
+    let old_table = p.page_tables[idx]
+    let new_table = old_table.push(pid)
+    let p2 = _paged_kv_replace_table(p, idx, new_table)
+    let p3 = PagedKVAllocator {
+        num_pages: p2.num_pages, page_tokens: p2.page_tokens, head_dim: p2.head_dim,
+        free_list: new_fl, used: new_used, seq_ids: p2.seq_ids, page_tables: p2.page_tables,
+        stat_alloc: p2.stat_alloc + 1, stat_release: p2.stat_release, stat_reuse: p2.stat_reuse + reuse_inc
+    }
+    return PagedKVAllocOut { alloc: p3, page_id: pid }
+}
+
+fn paged_kv_release_page(p: PagedKVAllocator, seq_id, page_id) {
+    if page_id < 0 { return PagedKVOut { alloc: p, ok: false } }
+    if page_id >= p.num_pages { return PagedKVOut { alloc: p, ok: false } }
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return PagedKVOut { alloc: p, ok: false } }
+    let tab = p.page_tables[idx]
+    let tn = len(tab)
+    let mut found = false
+    let mut new_tab = []
+    let mut i = 0
+    while i < tn {
+        if tab[i] == page_id { found = true } else { new_tab.push(tab[i]) }
+        i = i + 1
+    }
+    if found == false { return PagedKVOut { alloc: p, ok: false } }
+    let new_used = _paged_kv_set_used(p.used, page_id, false)
+    let new_fl = p.free_list.push(page_id)
+    let p2 = _paged_kv_replace_table(p, idx, new_tab)
+    let p3 = PagedKVAllocator {
+        num_pages: p2.num_pages, page_tokens: p2.page_tokens, head_dim: p2.head_dim,
+        free_list: new_fl, used: new_used, seq_ids: p2.seq_ids, page_tables: p2.page_tables,
+        stat_alloc: p2.stat_alloc, stat_release: p2.stat_release + 1, stat_reuse: p2.stat_reuse
+    }
+    return PagedKVOut { alloc: p3, ok: true }
+}
+
+fn paged_kv_release_seq(p: PagedKVAllocator, seq_id) {
+    let idx = paged_kv_find_seq(p, seq_id)
+    if idx < 0 { return PagedKVOut { alloc: p, ok: false } }
+    let tab = p.page_tables[idx]
+    let tn = len(tab)
+    let mut new_fl = p.free_list
+    let mut new_used = p.used
+    let mut released = 0
+    let mut i = 0
+    while i < tn {
+        let pid = tab[i]
+        new_fl = new_fl.push(pid)
+        new_used = _paged_kv_set_used(new_used, pid, false)
+        released = released + 1
+        i = i + 1
+    }
+    let n = len(p.seq_ids)
+    let mut new_ids = []
+    let mut new_tabs = []
+    let mut j = 0
+    while j < n {
+        if j != idx { new_ids.push(p.seq_ids[j]); new_tabs.push(p.page_tables[j]) }
+        j = j + 1
+    }
+    let p2 = PagedKVAllocator {
+        num_pages: p.num_pages, page_tokens: p.page_tokens, head_dim: p.head_dim,
+        free_list: new_fl, used: new_used, seq_ids: new_ids, page_tables: new_tabs,
+        stat_alloc: p.stat_alloc, stat_release: p.stat_release + released, stat_reuse: p.stat_reuse
+    }
+    return PagedKVOut { alloc: p2, ok: true }
+}
+
+// ═══════════════════════════════════════════════════════════════
+//  Tests
+// ═══════════════════════════════════════════════════════════════
+
+// #1 초기 풀 — 64 페이지 전부 free
+let a0 = paged_kv_new_default()
+check("#1 num_pages==64",   a0.num_pages == 64)
+check("#2 free==64",        paged_kv_free_count(a0) == 64)
+check("#3 used==0",         paged_kv_used_count(a0) == 0)
+check("#4 seqs==0",         paged_kv_seq_count(a0) == 0)
+
+// #5 첫 할당 — seq=1
+let r1 = paged_kv_alloc_page(a0, 1)
+check("#5 alloc#1 success", r1.page_id >= 0)
+check("#6 free==63",        paged_kv_free_count(r1.alloc) == 63)
+check("#7 used==1",         paged_kv_used_count(r1.alloc) == 1)
+check("#8 seq=1 has 1 pg",  paged_kv_seq_pages(r1.alloc, 1) == 1)
+
+// #9 두 번째 할당 — seq=1 다른 페이지
+let r2 = paged_kv_alloc_page(r1.alloc, 1)
+check("#9 alloc#2 success",  r2.page_id >= 0)
+check("#10 pid distinct",    r2.page_id != r1.page_id)
+check("#11 seq=1 has 2 pg",  paged_kv_seq_pages(r2.alloc, 1) == 2)
+
+// #12 두 시퀀스 교차 — seq=2 할당
+let r3 = paged_kv_alloc_page(r2.alloc, 2)
+check("#12 alloc seq2",      r3.page_id >= 0)
+check("#13 seqs==2",         paged_kv_seq_count(r3.alloc) == 2)
+check("#14 seq=1 has 2 pg",  paged_kv_seq_pages(r3.alloc, 1) == 2)
+check("#15 seq=2 has 1 pg",  paged_kv_seq_pages(r3.alloc, 2) == 1)
+
+// #16 교차 할당 — seq=1 한 장 더, seq=2 한 장 더
+let r4 = paged_kv_alloc_page(r3.alloc, 1)
+let r5 = paged_kv_alloc_page(r4.alloc, 2)
+check("#16 seq=1 has 3 pg",  paged_kv_seq_pages(r5.alloc, 1) == 3)
+check("#17 seq=2 has 2 pg",  paged_kv_seq_pages(r5.alloc, 2) == 2)
+check("#18 total used==5",   paged_kv_used_count(r5.alloc) == 5)
+
+// #19 page_tables 분리 확인 — seq=1 과 seq=2 는 서로 다른 page_id
+let t1 = paged_kv_page_table(r5.alloc, 1)
+let t2 = paged_kv_page_table(r5.alloc, 2)
+let mut overlap = false
+let mut i = 0
+while i < len(t1) {
+    let mut k = 0
+    while k < len(t2) {
+        if t1[i] == t2[k] { overlap = true }
+        k = k + 1
+    }
+    i = i + 1
+}
+check("#19 seq page tables disjoint", overlap == false)
+
+// #20 release 단일 페이지
+let free_before = paged_kv_free_count(r5.alloc)
+let release_pid = t1[0]
+let rr = paged_kv_release_page(r5.alloc, 1, release_pid)
+check("#20 release ok",          rr.ok)
+check("#21 free==before+1",      paged_kv_free_count(rr.alloc) == free_before + 1)
+check("#22 seq=1 has 2 pg",      paged_kv_seq_pages(rr.alloc, 1) == 2)
+
+// #23 재할당 시 release 한 페이지 재사용 — reuse 카운터 증가 기대
+let reuse_before = rr.alloc.stat_reuse
+let r6 = paged_kv_alloc_page(rr.alloc, 1)
+check("#23 realloc success",     r6.page_id >= 0)
+check("#24 reuse inc",           r6.alloc.stat_reuse >= reuse_before + 1)
+
+// #25 release_seq — seq=2 전체 해제
+let used_before = paged_kv_used_count(r6.alloc)
+let seq2_pages  = paged_kv_seq_pages(r6.alloc, 2)
+let rs = paged_kv_release_seq(r6.alloc, 2)
+check("#25 release_seq ok",      rs.ok)
+check("#26 seqs==1",             paged_kv_seq_count(rs.alloc) == 1)
+check("#27 used reduced",        paged_kv_used_count(rs.alloc) == used_before - seq2_pages)
+
+// #28 잘못된 release — 미등록 seq
+let bad = paged_kv_release_page(rs.alloc, 999, 0)
+check("#28 bad release returns ok=false", bad.ok == false)
+
+// #29 풀 고갈 — 남은 페이지 전부 소진 후 한 번 더
+let mut cur = paged_kv_new_default()
+let mut ok_all = true
+let mut n = 0
+while n < 64 {
+    let out = paged_kv_alloc_page(cur, 7)
+    if out.page_id < 0 { ok_all = false }
+    cur = out.alloc
+    n = n + 1
+}
+check("#29 64 allocs succeed", ok_all)
+check("#30 free==0 exhausted", paged_kv_free_count(cur) == 0)
+
+let oob = paged_kv_alloc_page(cur, 7)
+check("#31 65th alloc -> -1",  oob.page_id == -1)
+check("#32 seq=7 has 64 pg",   paged_kv_seq_pages(oob.alloc, 7) == 64)
+
+// #33 release_seq 로 전부 되돌리기
+let rst = paged_kv_release_seq(oob.alloc, 7)
+check("#33 mass release ok",   rst.ok)
+check("#34 free==64 restored", paged_kv_free_count(rst.alloc) == 64)
+check("#35 used==0 restored",  paged_kv_used_count(rst.alloc) == 0)
+
+// ═══════════════════════════════════════════════════════════════
+println("")
+println("test_paged_kv: " + to_string(pass_count) + " PASS / " + to_string(fail_count) + " FAIL")

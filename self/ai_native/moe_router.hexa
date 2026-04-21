@@ -1,0 +1,297 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/ai_native/moe_router.hexa — AI-native ROI #186
+//
+//  @mixture_of_experts — top-k expert routing scaffold.
+//
+//  Motivation: Mixture-of-Experts (MoE) layers (Mixtral, DeepSeek,
+//  Grok, Qwen-MoE) route each token to only k of N experts, so FLOPs
+//  scale with k/N rather than full N. Pure-Hexa scaffold provides:
+//      1. gating logits    : linear score per expert
+//      2. softmax          : convert logits → routing probabilities
+//      3. top-k selection  : pick k highest-probability experts
+//      4. renormalisation  : rescale selected weights to sum to 1
+//      5. dummy dispatch   : call dummy expert fn per selected id
+//
+//  Scaffold targets 4 experts, top-k = 2 (Mixtral-8x7B default shape
+//  scaled down). Dummy experts return deterministic scalar tags so
+//  the test harness can verify routing hit the right index without a
+//  real FFN implementation.
+//
+//  Public API:
+//      moe_gate_scores(gate_w, x)          -> [logit per expert]
+//      moe_softmax(logits)                 -> [prob per expert] (sum=1)
+//      moe_topk(probs, k)                  -> [expert_id per slot]
+//      moe_route(gate_w, x, k)             -> #{"ids": [...], "weights": [...]}
+//      moe_dummy_expert(eid, x)            -> deterministic tag vector
+//      moe_dispatch(router_out, x, expert_fn) -> combined output
+//
+//  Contract (scaffold-level):
+//      - len(ids) == len(weights) == k
+//      - sum(weights) ≈ 1.0  (renormalised)
+//      - ids are distinct, each in [0, num_experts)
+//      - probs before/after top-k are non-negative
+//      - @mixture_of_experts marks the routing attr surface so later
+//        passes can hook dispatch / load-balance losses.
+//
+//  AI-native attrs:
+//      @pure                 — deterministic gating math
+//      @mixture_of_experts   — routing surface (scaffold declaration)
+// ═══════════════════════════════════════════════════════════════════
+
+// ── numeric helpers (file-local to avoid clobbering other modules) ──
+
+@pure
+pub fn moer_exp(x) {
+    let mut c = x
+    if c >  20.0 { c =  20.0 }
+    if c < -20.0 { c = -20.0 }
+    let mut result = 1.0
+    let mut term   = 1.0
+    let mut i = 1
+    while i < 25 {
+        term   = term * c / to_float(i)
+        result = result + term
+        i = i + 1
+    }
+    if result < 1.0e-30 { return 1.0e-30 }
+    return result
+}
+
+@pure
+pub fn moer_zeros(n) {
+    let mut v = []
+    let mut i = 0
+    while i < n {
+        v = v + [0.0]
+        i = i + 1
+    }
+    return v
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Gating — logits = gate_w · x       gate_w : [E, D],  x : [D]
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_gate_scores(gate_w, x) {
+    let E = len(gate_w)
+    if E == 0 { return [] }
+    let D = len(x)
+    let mut logits = moer_zeros(E)
+    let mut e = 0
+    while e < E {
+        let mut s = 0.0
+        let mut d = 0
+        while d < D {
+            s = s + gate_w[e][d] * x[d]
+            d = d + 1
+        }
+        logits[e] = s
+        e = e + 1
+    }
+    return logits
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Softmax — numerically stable (subtract row max before exp).
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_softmax(logits) {
+    let n = len(logits)
+    if n == 0 { return [] }
+    let mut mx = logits[0]
+    let mut i = 1
+    while i < n {
+        if logits[i] > mx { mx = logits[i] }
+        i = i + 1
+    }
+    let mut exps = moer_zeros(n)
+    let mut total = 0.0
+    let mut j = 0
+    while j < n {
+        let e = moer_exp(logits[j] - mx)
+        exps[j] = e
+        total = total + e
+        j = j + 1
+    }
+    if total <= 0.0 { total = 1.0e-30 }
+    let mut out = moer_zeros(n)
+    let mut k = 0
+    while k < n {
+        out[k] = exps[k] / total
+        k = k + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Top-k — returns indices of k largest elements in descending order.
+//  Partial-selection sort (O(n·k)); fine for small E / k.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_topk(arr, k) {
+    let n = len(arr)
+    let mut kk = k
+    if kk > n { kk = n }
+    if kk <= 0 { return [] }
+
+    // build index list [0, 1, ..., n-1]
+    let mut idx = []
+    let mut i = 0
+    while i < n {
+        idx = idx + [i]
+        i = i + 1
+    }
+
+    // swap the max of the remaining slice into position s
+    let mut s = 0
+    while s < kk {
+        let mut best = s
+        let mut j = s + 1
+        while j < n {
+            if arr[idx[j]] > arr[idx[best]] {
+                best = j
+            }
+            j = j + 1
+        }
+        if best != s {
+            let tmp = idx[s]
+            idx[s] = idx[best]
+            idx[best] = tmp
+        }
+        s = s + 1
+    }
+
+    let mut out = []
+    let mut t = 0
+    while t < kk {
+        out = out + [idx[t]]
+        t = t + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  moe_route — end-to-end routing.
+//
+//  Returns dict:
+//      "ids"     : [int]   selected expert indices (len = k)
+//      "weights" : [float] normalised weights      (sum ≈ 1.0)
+//      "probs"   : [float] full softmax            (len = E, debug)
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+@mixture_of_experts
+pub fn moe_route(gate_w, x, k) {
+    let logits = moe_gate_scores(gate_w, x)
+    let probs  = moe_softmax(logits)
+    let ids    = moe_topk(probs, k)
+
+    // gather + renormalise selected weights so they sum to 1.
+    let mut raw = []
+    let mut sumw = 0.0
+    let mut i = 0
+    while i < len(ids) {
+        let w = probs[ids[i]]
+        raw = raw + [w]
+        sumw = sumw + w
+        i = i + 1
+    }
+    if sumw <= 0.0 { sumw = 1.0e-30 }
+
+    let mut weights = []
+    let mut j = 0
+    while j < len(raw) {
+        weights = weights + [raw[j] / sumw]
+        j = j + 1
+    }
+
+    return #{
+        "ids": ids,
+        "weights": weights,
+        "probs": probs
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Dummy expert — deterministic stand-in for a real FFN.
+//
+//  moe_dummy_expert(eid, x) returns a vector of length len(x) where
+//  every element is (to_float(eid) + 1.0) · x[i]. Choosing a linear
+//  tag keeps the combiner simple to reason about: the weighted sum
+//  of dummy outputs is itself a linear function of the weights, so
+//  tests can check exact equality against an analytic expectation.
+// ═══════════════════════════════════════════════════════════════════
+
+@pure
+pub fn moe_dummy_expert(eid, x) {
+    let tag = to_float(eid) + 1.0
+    let n = len(x)
+    let mut out = moer_zeros(n)
+    let mut i = 0
+    while i < n {
+        out[i] = tag * x[i]
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  moe_dispatch — call dummy expert per selected id, weighted sum.
+//
+//  router_out : dict from moe_route
+//  x          : input vector (re-used as expert input for the scaffold)
+//
+//  y = Σ_i  weights[i] · dummy_expert(ids[i], x)
+// ═══════════════════════════════════════════════════════════════════
+
+@mixture_of_experts
+pub fn moe_dispatch(router_out, x) {
+    let ids = router_out["ids"]
+    let weights = router_out["weights"]
+    let n = len(x)
+    let mut y = moer_zeros(n)
+    let mut slot = 0
+    while slot < len(ids) {
+        let eid = ids[slot]
+        let w = weights[slot]
+        let ey = moe_dummy_expert(eid, x)
+        let mut i = 0
+        while i < n {
+            y[i] = y[i] + w * ey[i]
+            i = i + 1
+        }
+        slot = slot + 1
+    }
+    return y
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  Convenience constructor — 4-expert gate with hand-picked weights
+//  so the test suite can predict top-2 without solving a matmul.
+//
+//  Returns a [4][D] gate_w matrix. Each expert row is a canonical
+//  unit-ish direction so score(e, x) = gate_w[e]·x roughly isolates
+//  one component of x:
+//      expert 0 → x[0]       expert 1 → x[1]
+//      expert 2 → x[2]       expert 3 → x[3]
+//  (Works as long as D >= 4; for smaller D, rows wrap modulo D.)
+// ═══════════════════════════════════════════════════════════════════
+
+pub fn moe_demo_gate(D) {
+    let E = 4
+    let mut W = []
+    let mut e = 0
+    while e < E {
+        let mut row = moer_zeros(D)
+        if D > 0 {
+            let axis = e % D
+            row[axis] = 1.0
+        }
+        W = W + [row]
+        e = e + 1
+    }
+    return W
+}

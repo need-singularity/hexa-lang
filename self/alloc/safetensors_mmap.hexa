@@ -1,0 +1,408 @@
+// ═══════════════════════════════════════════════════════════════
+//  self/alloc/safetensors_mmap.hexa — zero-copy safetensors loader
+//                                     (roi.json #172)
+//
+//  Design goal — avoid the "slurp-all" copy path that
+//  `read_file_bytes(path)` forces upon every caller in
+//  self/tools/safetensors_to_hexaw.hexa / self/ml/hexaw.hexa.
+//
+//  Instead of materialising N GB of tensor bytes into a hexa `array`
+//  (where each byte is a boxed int — ~40x bloat), we:
+//
+//    1.  fs_mmap_ro(path)                  -> (base_addr, file_size)
+//    2.  Parse the 8-byte header_len + JSON header *through the mapping*
+//        using hexa_ptr_read_byte(addr, off) — one syscall per tensor
+//        metadata, but zero bulk copy.
+//    3.  Build an array of TensorView records: each view is just a
+//        triple (addr, size, dtype/shape) — so a 56 GB weight file
+//        never appears in the Val heap; it stays in the OS page cache
+//        and gets page-faulted in as tensors are touched.
+//
+//  Surface (re-exported by self/alloc/mod.hexa once wired):
+//
+//    struct TensorView { addr, nbytes, dtype, shape }
+//    struct SafetensorsMmap { base_addr, size, header_end, names, views }
+//
+//    safetensors_mmap_open(path)    -> SafetensorsMmap
+//    safetensors_mmap_close(m)      -> int            (munmap rc)
+//    safetensors_mmap_tensor(m,nm)  -> TensorView     (or TensorView{addr:0})
+//    safetensors_mmap_count(m)      -> int
+//    safetensors_view_u8(v, i)      -> int            (byte at v.addr+i)
+//    safetensors_view_f32(v, i)     -> float          (wip — needs f32 load intrinsic)
+//
+//  Constraints respected per roi.json #172:
+//    - Pure .hexa (no Rust/C edits).
+//    - Uses fs_mmap_ro / fs_munmap from self/rt/fs.hexa (already landed).
+//    - hexa_ptr_read_byte / __mem_load16 / __mem_load64 are existing
+//      codegen intrinsics (see self/rt/fs.hexa, self/rt/proc.hexa).
+//
+//  Scaffold status — header parse + view enumeration work on real
+//  safetensors files; bulk f32 read is a TODO waiting on a
+//  __mem_load_f32 intrinsic (current codegen has only int loads).
+//  That keeps the tensor *bytes* zero-copy; only the ~KB header JSON
+//  is materialised into a byte-array so the existing pure-hexa JSON
+//  scanner can run over it.
+// ═══════════════════════════════════════════════════════════════
+
+use self::rt::fs
+
+// ── Structs ────────────────────────────────────────────────────
+
+// A zero-copy view into the mmap region.
+//   addr    : absolute byte pointer into the mmap (base + data_off + t.beg)
+//   nbytes  : tensor byte length (data_offsets[1] - data_offsets[0])
+//   dtype   : "F32" | "BF16" | "F16" | "I8" | ...
+//   shape   : [int] dimensions
+struct TensorView {
+    addr: int,
+    nbytes: int,
+    dtype: string,
+    shape: array
+}
+
+fn tensor_view_null() {
+    return TensorView { addr: 0, nbytes: 0, dtype: "", shape: [] }
+}
+
+fn tensor_view_is_null(v: TensorView) {
+    return v.addr == 0 && v.nbytes == 0
+}
+
+// Handle returned by safetensors_mmap_open. The heavy state — the
+// mmap base address — lives here; callers keep it alive, touch
+// views, then call safetensors_mmap_close.
+//
+//   base_addr   : mmap'd file start (byte pointer as int)
+//   size        : full file size in bytes (for munmap)
+//   header_end  : byte offset of data region start (= 8 + header_len)
+//   names       : [string]       tensor names in JSON order
+//   views       : [TensorView]   parallel to names
+struct SafetensorsMmap {
+    base_addr: int,
+    size: int,
+    header_end: int,
+    names: array,
+    views: array
+}
+
+fn safetensors_mmap_null() {
+    return SafetensorsMmap {
+        base_addr: 0,
+        size: 0,
+        header_end: 0,
+        names: [],
+        views: []
+    }
+}
+
+fn safetensors_mmap_is_null(m: SafetensorsMmap) {
+    return m.base_addr == 0
+}
+
+// ── Header read helpers ────────────────────────────────────────
+// The first 8 bytes of every safetensors file are a little-endian
+// u64 encoding the JSON header length (see format spec linked in
+// self/tools/safetensors_to_hexaw.hexa).
+//
+// We could use __mem_load64 directly, but hexa doesn't yet promise
+// LE byte order on all targets for that intrinsic, so assemble by
+// hand from 8 bytes — same pattern as u64_le_from_bytes in the
+// streaming converter.
+
+fn read_u64_le_at(addr: int, off: int) {
+    let mut v = 0
+    let mut i = 0
+    let mut mul = 1
+    while i < 8 {
+        v = v + hexa_ptr_read_byte(addr, off + i) * mul
+        mul = mul * 256
+        i = i + 1
+    }
+    return v
+}
+
+// Materialise the header JSON (bytes [8..8+header_len)) into a
+// regular byte array so we can reuse the JSON scanner from
+// self/tools/safetensors_to_hexaw.hexa. The header is always in the
+// low-KB to low-MB range (a few hundred tensor records); this is
+// the ONE copy we accept, because the scanner has no view-layer
+// API yet.
+fn header_bytes_from_mmap(addr: int, header_len: int) {
+    let mut out = []
+    let mut i = 0
+    while i < header_len {
+        out = out + [hexa_ptr_read_byte(addr, 8 + i)]
+        i = i + 1
+    }
+    return out
+}
+
+// ── JSON scanner (subset — forked from safetensors_to_hexaw.hexa) ─
+// Duplicated here on purpose: the tool file lives under self/tools/
+// and `use` across that boundary would drag in f32_to_bytes and the
+// HEXAW2 emitter. This scaffold keeps alloc/ self-contained.
+
+fn jc_skip_ws(b, p) {
+    let n = len(b)
+    let mut i = p
+    while i < n {
+        let c = b[i]
+        if c == 32 || c == 9 || c == 10 || c == 13 { i = i + 1 }
+        else { return i }
+    }
+    return i
+}
+
+fn jc_parse_string(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut out = ""
+    while i < n {
+        let c = b[i]
+        if c == 34 { return [out, i + 1] }
+        if c == 92 {
+            if i + 1 < n {
+                out = out + to_string(from_char_code(b[i + 1]))
+                i = i + 2
+            } else { i = i + 1 }
+        } else {
+            out = out + to_string(from_char_code(c))
+            i = i + 1
+        }
+    }
+    return [out, i]
+}
+
+fn jc_parse_int(b, p) {
+    let mut i = p
+    let n = len(b)
+    let mut sign = 1
+    if i < n && b[i] == 45 { sign = -1; i = i + 1 }
+    let mut v = 0
+    while i < n {
+        let c = b[i]
+        if c >= 48 && c <= 57 { v = v * 10 + (c - 48); i = i + 1 }
+        else { return [v * sign, i] }
+    }
+    return [v * sign, i]
+}
+
+fn jc_parse_int_array(b, p) {
+    let mut i = p + 1
+    let n = len(b)
+    let mut arr = []
+    i = jc_skip_ws(b, i)
+    if i < n && b[i] == 93 { return [arr, i + 1] }
+    while i < n {
+        i = jc_skip_ws(b, i)
+        let pr = jc_parse_int(b, i)
+        arr = arr + [pr[0]]
+        i = pr[1]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+        else if i < n && b[i] == 93 { return [arr, i + 1] }
+    }
+    return [arr, i]
+}
+
+fn jc_skip_value(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    if i >= n { return i }
+    let c = b[i]
+    if c == 34 { let pr = jc_parse_string(b, i); return pr[1] }
+    if c == 91 {
+        let mut depth = 1
+        i = i + 1
+        while i < n && depth > 0 {
+            let cc = b[i]
+            if cc == 34 { let pr = jc_parse_string(b, i); i = pr[1] }
+            else if cc == 91 || cc == 123 { depth = depth + 1; i = i + 1 }
+            else if cc == 93 || cc == 125 { depth = depth - 1; i = i + 1 }
+            else { i = i + 1 }
+        }
+        return i
+    }
+    if c == 123 {
+        let mut depth = 1
+        i = i + 1
+        while i < n && depth > 0 {
+            let cc = b[i]
+            if cc == 34 { let pr = jc_parse_string(b, i); i = pr[1] }
+            else if cc == 123 || cc == 91 { depth = depth + 1; i = i + 1 }
+            else if cc == 125 || cc == 93 { depth = depth - 1; i = i + 1 }
+            else { i = i + 1 }
+        }
+        return i
+    }
+    while i < n {
+        let cc = b[i]
+        if cc == 44 || cc == 125 || cc == 93 { return i }
+        i = i + 1
+    }
+    return i
+}
+
+// Parse one tensor record: returns [dtype, shape, beg, end, next_pos].
+fn jc_parse_tensor_record(b, p) {
+    let mut i = jc_skip_ws(b, p)
+    let n = len(b)
+    let mut dtype = ""
+    let mut shape = []
+    let mut beg = 0
+    let mut end = 0
+    if i >= n || b[i] != 123 { return [dtype, shape, beg, end, i] }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { return [dtype, shape, beg, end, i + 1] }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(b, i)
+        if key == "dtype" {
+            let vpr = jc_parse_string(b, i); i = vpr[1]
+            dtype = vpr[0]
+        } else if key == "shape" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            shape = vpr[0]
+        } else if key == "data_offsets" {
+            let vpr = jc_parse_int_array(b, i); i = vpr[1]
+            if len(vpr[0]) >= 2 { beg = vpr[0][0]; end = vpr[0][1] }
+        } else {
+            i = jc_skip_value(b, i)
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [dtype, shape, beg, end, i]
+}
+
+// Parse the whole header. Returns [names, views] where views are
+// TensorView records bound to the supplied mmap base (so addr is
+// absolute and can be read without the handle).
+fn parse_header_views(b, base_addr: int, header_end: int) {
+    let n = len(b)
+    let mut names = []
+    let mut views = []
+    let mut i = jc_skip_ws(b, 0)
+    if i >= n || b[i] != 123 { return [names, views] }
+    i = i + 1
+    while i < n {
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 125 { break }
+        let kpr = jc_parse_string(b, i); i = kpr[1]
+        let key = kpr[0]
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 58 { i = i + 1 }
+        i = jc_skip_ws(b, i)
+        if key == "__metadata__" {
+            i = jc_skip_value(b, i)
+        } else {
+            let rec = jc_parse_tensor_record(b, i)
+            i = rec[4]
+            let dtype = rec[0]
+            let shape = rec[1]
+            let beg = rec[2]
+            let end_ = rec[3]
+            names = names + [key]
+            views = views + [TensorView {
+                addr: base_addr + header_end + beg,
+                nbytes: end_ - beg,
+                dtype: dtype,
+                shape: shape
+            }]
+        }
+        i = jc_skip_ws(b, i)
+        if i < n && b[i] == 44 { i = i + 1 }
+    }
+    return [names, views]
+}
+
+// ── Public API ─────────────────────────────────────────────────
+
+// Open a safetensors file as a zero-copy mmap. Returns a handle
+// whose base_addr == 0 on failure (bad path / empty file / header
+// corruption).
+fn safetensors_mmap_open(path: string) {
+    let pair = fs_mmap_ro(path)
+    let addr = pair[0]
+    let size = pair[1]
+    if addr == 0 || size < 8 { return safetensors_mmap_null() }
+
+    let header_len = read_u64_le_at(addr, 0)
+    if header_len <= 0 { fs_munmap(addr, size); return safetensors_mmap_null() }
+    if 8 + header_len > size { fs_munmap(addr, size); return safetensors_mmap_null() }
+
+    let header_end = 8 + header_len
+    let hbytes = header_bytes_from_mmap(addr, header_len)
+    let parsed = parse_header_views(hbytes, addr, header_end)
+    let names = parsed[0]
+    let views = parsed[1]
+
+    return SafetensorsMmap {
+        base_addr: addr,
+        size: size,
+        header_end: header_end,
+        names: names,
+        views: views
+    }
+}
+
+// Release the mapping. Returns sys_munmap rc (0 on success, <0 errno).
+// Safe to call on a null handle (no-op).
+fn safetensors_mmap_close(m: SafetensorsMmap) {
+    if safetensors_mmap_is_null(m) { return 0 }
+    return fs_munmap(m.base_addr, m.size)
+}
+
+// Number of parsed tensors.
+fn safetensors_mmap_count(m: SafetensorsMmap) {
+    return len(m.views)
+}
+
+// Linear-scan lookup by name. Returns a null TensorView when absent.
+fn safetensors_mmap_tensor(m: SafetensorsMmap, name: string) {
+    let n = len(m.names)
+    let mut i = 0
+    while i < n {
+        if m.names[i] == name { return m.views[i] }
+        i = i + 1
+    }
+    return tensor_view_null()
+}
+
+// Return the i-th view in JSON/file order.
+fn safetensors_mmap_view_at(m: SafetensorsMmap, idx: int) {
+    if idx < 0 || idx >= len(m.views) { return tensor_view_null() }
+    return m.views[idx]
+}
+
+// Return the i-th tensor name.
+fn safetensors_mmap_name_at(m: SafetensorsMmap, idx: int) {
+    if idx < 0 || idx >= len(m.names) { return "" }
+    return m.names[idx]
+}
+
+// Zero-copy byte accessor. i is 0-based within the tensor.
+// Intentionally returns an int (0..255) so this file compiles
+// against the current codegen — no f32 intrinsic yet.
+fn safetensors_view_u8(v: TensorView, i: int) {
+    if i < 0 || i >= v.nbytes { return 0 }
+    return hexa_ptr_read_byte(v.addr, i)
+}
+
+// Total byte size of all tensor payloads. Useful for sanity-
+// checking that we did NOT materialise the payload into the heap
+// (callers can compare against egyptian_report().total).
+fn safetensors_mmap_total_bytes(m: SafetensorsMmap) {
+    let n = len(m.views)
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + m.views[i].nbytes
+        i = i + 1
+    }
+    return sum
+}

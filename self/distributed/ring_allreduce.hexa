@@ -1,0 +1,226 @@
+// ===================================================================
+//  ring_allreduce.hexa — Bandwidth-optimal ring allreduce primitive
+//
+//  roi.json #187 — algo_rewrite: ring-allreduce 분산 프리미티브
+//
+//  Pure .hexa CPU simulation of the Baidu ring allreduce algorithm.
+//  N ranks are laid out in a logical ring; each rank owns a full-length
+//  tensor. After N-1 reduce-scatter steps followed by N-1 all-gather
+//  steps, every rank holds the element-wise sum of the original tensors.
+//
+//  Total data volume moved: 2 * (N-1)/N * tensor_size  (bandwidth-optimal)
+//  Total communication steps: 2 * (N-1)
+//
+//  This module intentionally re-implements the primitive with its own
+//  namespace (ra_*) and a narrower, inlined API — meant for focused
+//  rewrite/experimentation rather than the general-purpose suite in
+//  self/ml/collective_comm.hexa.
+//
+//  Everything runs in a single process; "ranks" are indices into an
+//  array of per-rank tensor buffers. No NCCL, no MPI, no CUDA.
+// ===================================================================
+
+// ── Array helpers ────────────────────────────────────────────────
+
+fn ra_zeros(n) {
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(0.0)
+        i = i + 1
+    }
+    out
+}
+
+fn ra_copy(src) {
+    let n = len(src)
+    let mut out = []
+    let mut i = 0
+    while i < n {
+        out.push(src[i])
+        i = i + 1
+    }
+    out
+}
+
+// Non-negative modulo (a mod m) for possibly negative a.
+fn ra_mod(a, m) {
+    ((a % m) + m) % m
+}
+
+// ── Ring topology ────────────────────────────────────────────────
+
+fn ra_next(rank, n_ranks) {
+    (rank + 1) % n_ranks
+}
+
+fn ra_prev(rank, n_ranks) {
+    ra_mod(rank - 1, n_ranks)
+}
+
+// ── Chunking: split length-n tensor into N roughly-equal pieces ──
+
+fn ra_chunks(n, n_chunks) {
+    let mut out = []
+    let mut c = 0
+    while c < n_chunks {
+        let begin = (n * c) / n_chunks
+        let end = (n * (c + 1)) / n_chunks
+        out.push([begin, end])
+        c = c + 1
+    }
+    out
+}
+
+// ═══════════════════════════════════════════════════════════════════
+//  ra_allreduce_sum(tensors, n_ranks)
+//
+//  Input:  tensors — array of N equal-length float arrays, one per rank.
+//  Output: array of N arrays; each is the element-wise sum of all inputs.
+//
+//  Algorithm: bandwidth-optimal ring.
+//    Phase 1 (reduce-scatter, N-1 steps):
+//      In step s, rank r sends chunk c_send = (r - s) mod N to rank
+//      (r+1) mod N, which accumulates it into its local buffer.
+//      After N-1 steps, rank r owns the fully-reduced chunk
+//      (r + 1) mod N.
+//    Phase 2 (all-gather, N-1 steps):
+//      In step s, rank r sends chunk c_send = (r - s + 1) mod N to
+//      rank (r+1) mod N, which overwrites its local copy.
+//      After N-1 steps, every rank holds all fully-reduced chunks.
+// ═══════════════════════════════════════════════════════════════════
+
+fn ra_allreduce_sum(tensors, n_ranks) {
+    let n = len(tensors[0])
+    let n_chunks = n_ranks
+    let chunks = ra_chunks(n, n_chunks)
+
+    // Per-rank mutable buffers (deep copy so caller tensors stay intact)
+    let mut bufs = []
+    let mut r = 0
+    while r < n_ranks {
+        bufs.push(ra_copy(tensors[r]))
+        r = r + 1
+    }
+
+    // ── Phase 1: reduce-scatter ──
+    let mut step = 0
+    while step < n_ranks - 1 {
+        // Snapshot bufs before the step; receivers accumulate into fresh copy.
+        let mut nbufs = []
+        let mut rr = 0
+        while rr < n_ranks {
+            nbufs.push(ra_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < n_ranks {
+            let send_chunk = ra_mod(rr - step, n_chunks)
+            let dst = ra_next(rr, n_ranks)
+            let pair = chunks[send_chunk]
+            let cbegin = pair[0]
+            let cend = pair[1]
+            let clen = cend - cbegin
+            let mut i = 0
+            while i < clen {
+                nbufs[dst][cbegin + i] = nbufs[dst][cbegin + i] + bufs[rr][cbegin + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = nbufs
+        step = step + 1
+    }
+
+    // ── Phase 2: all-gather ──
+    step = 0
+    while step < n_ranks - 1 {
+        let mut nbufs = []
+        let mut rr = 0
+        while rr < n_ranks {
+            nbufs.push(ra_copy(bufs[rr]))
+            rr = rr + 1
+        }
+
+        rr = 0
+        while rr < n_ranks {
+            let send_chunk = ra_mod(rr - step + 1, n_chunks)
+            let dst = ra_next(rr, n_ranks)
+            let pair = chunks[send_chunk]
+            let cbegin = pair[0]
+            let cend = pair[1]
+            let clen = cend - cbegin
+            let mut i = 0
+            while i < clen {
+                nbufs[dst][cbegin + i] = bufs[rr][cbegin + i]
+                i = i + 1
+            }
+            rr = rr + 1
+        }
+
+        bufs = nbufs
+        step = step + 1
+    }
+
+    bufs
+}
+
+// AllReduce with mean (sum / N) semantics.
+fn ra_allreduce_mean(tensors, n_ranks) {
+    let reduced = ra_allreduce_sum(tensors, n_ranks)
+    let n = len(reduced[0])
+    let div = to_float(n_ranks)
+    let mut out = []
+    let mut r = 0
+    while r < n_ranks {
+        let mut v = []
+        let mut i = 0
+        while i < n {
+            v.push(reduced[r][i] / div)
+            i = i + 1
+        }
+        out.push(v)
+        r = r + 1
+    }
+    out
+}
+
+// ── Reference implementation (non-ring) for cross-check ──────────
+
+fn ra_allreduce_naive(tensors, n_ranks) {
+    let n = len(tensors[0])
+    let mut sum = ra_zeros(n)
+    let mut r = 0
+    while r < n_ranks {
+        let mut i = 0
+        while i < n {
+            sum[i] = sum[i] + tensors[r][i]
+            i = i + 1
+        }
+        r = r + 1
+    }
+    let mut out = []
+    r = 0
+    while r < n_ranks {
+        out.push(ra_copy(sum))
+        r = r + 1
+    }
+    out
+}
+
+// ── Bandwidth / step metrics ─────────────────────────────────────
+
+// Bytes (or elements) moved in a full ring allreduce.
+fn ra_volume(tensor_size, n_ranks) {
+    let n = to_float(n_ranks)
+    2.0 * (n - 1.0) / n * to_float(tensor_size)
+}
+
+// Total communication steps for ring allreduce.
+fn ra_total_steps(n_ranks) {
+    2 * (n_ranks - 1)
+}
+
+println("[ring_allreduce] module loaded — ra_allreduce_sum / ra_allreduce_mean ready (roi #187)")

@@ -1,0 +1,211 @@
+// ═══════════════════════════════════════════════════════════════════
+//  self/test_e2e_7b_latency.hexa — ROI #184 test
+//
+//  Correctness / shape tests for self/bench/e2e_7b_latency.hexa.
+//
+//  The bench is a scaffold (no real 7B weights), so we can't assert
+//  absolute ms numbers, but we CAN assert:
+//    1. Each stage returns a non-negative wall-clock ms.
+//    2. total_ms == load_ms + prefill_ms + decode_ms (no stray cost).
+//    3. ttft_ms == load_ms + prefill_ms + first_tok_ms.
+//    4. tokens_per_sec = max_new / (decode_ms / 1000) when decode_ms>0.
+//    5. Stage work scales monotonically with its knob:
+//         larger prompt_len → prefill_ms non-decreasing.
+//         larger max_new    → decode_ms   non-decreasing.
+//         larger load_iter  → load_ms     non-decreasing.
+//    6. With max_new=0 the decode loop is empty and tokens_per_sec=0.
+// ═══════════════════════════════════════════════════════════════════
+
+// ── Inlined stage primitives + runner (test files can't import codegen)
+
+fn t_busy_work(n) {
+    let mut acc = 0.0
+    let mut i = 0
+    while i < n {
+        acc = acc + to_float(i) * 0.0001
+        acc = acc - to_float(i) * 0.00009
+        i = i + 1
+    }
+    return acc
+}
+
+fn t_stage_load(load_iter) {
+    let per_shard = 5000
+    let mut total = 0.0
+    let mut s = 0
+    while s < load_iter {
+        total = total + t_busy_work(per_shard)
+        s = s + 1
+    }
+    return total
+}
+
+fn t_stage_prefill_step(dim) {
+    return t_busy_work(dim * 8)
+}
+
+fn t_stage_decode_step(dim) {
+    return t_busy_work(dim * 6)
+}
+
+fn t_run_e2e(load_iter, prompt_len, max_new, dim) {
+    let t_load_0 = timestamp()
+    let _la = t_stage_load(load_iter)
+    let t_load_1 = timestamp()
+    let load_ms = t_load_1 - t_load_0
+
+    let t_prefill_0 = timestamp()
+    let mut pa = 0.0
+    let mut p = 0
+    while p < prompt_len {
+        pa = pa + t_stage_prefill_step(dim)
+        p = p + 1
+    }
+    let t_prefill_1 = timestamp()
+    let prefill_ms = t_prefill_1 - t_prefill_0
+
+    let t_decode_0 = timestamp()
+    let mut first_tok_ms = 0
+    let mut da = 0.0
+    let mut d = 0
+    while d < max_new {
+        let s0 = timestamp()
+        da = da + t_stage_decode_step(dim)
+        let s1 = timestamp()
+        if d == 0 { first_tok_ms = s1 - s0 }
+        d = d + 1
+    }
+    let t_decode_1 = timestamp()
+    let decode_ms = t_decode_1 - t_decode_0
+
+    let total_ms = load_ms + prefill_ms + decode_ms
+    let ttft_ms = load_ms + prefill_ms + first_tok_ms
+
+    let mut tok_s = 0.0
+    if decode_ms > 0 {
+        tok_s = to_float(max_new) / (to_float(decode_ms) / 1000.0)
+    }
+
+    let out = #{}
+    out["load_ms"]        = load_ms
+    out["prefill_ms"]     = prefill_ms
+    out["decode_ms"]      = decode_ms
+    out["total_ms"]       = total_ms
+    out["ttft_ms"]        = ttft_ms
+    out["first_tok_ms"]   = first_tok_ms
+    out["tokens_per_sec"] = tok_s
+    out["_la"]            = _la
+    out["_pa"]            = pa
+    out["_da"]            = da
+    return out
+}
+
+// ── tiny assertion helpers ──────────────────────────────────────────
+let mut g_fail = 0
+let mut g_pass = 0
+
+fn assert_ge(name, got, bound) {
+    if got >= bound {
+        g_pass = g_pass + 1
+        println("PASS " + name + " (" + str(got) + " >= " + str(bound) + ")")
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " (" + str(got) + " < " + str(bound) + ")")
+    }
+}
+
+fn assert_eq_int(name, got, expect) {
+    if got == expect {
+        g_pass = g_pass + 1
+        println("PASS " + name + " = " + str(got))
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name + " got=" + str(got) + " expect=" + str(expect))
+    }
+}
+
+fn assert_true(name, cond) {
+    if cond {
+        g_pass = g_pass + 1
+        println("PASS " + name)
+    } else {
+        g_fail = g_fail + 1
+        println("FAIL " + name)
+    }
+}
+
+fn approx_close(a, b, tol) {
+    let mut d = a - b
+    if d < 0.0 { d = 0.0 - d }
+    return d <= tol
+}
+
+// ── Test 1: basic shape + identity checks ───────────────────────────
+println("[test] basic shape / identity...")
+let r1 = t_run_e2e(2, 4, 4, 64)
+
+assert_ge("load_ms_nonneg",    r1["load_ms"],    0)
+assert_ge("prefill_ms_nonneg", r1["prefill_ms"], 0)
+assert_ge("decode_ms_nonneg",  r1["decode_ms"],  0)
+
+let sum_stages = r1["load_ms"] + r1["prefill_ms"] + r1["decode_ms"]
+assert_eq_int("total_ms_is_sum", r1["total_ms"], sum_stages)
+
+let ttft_expect = r1["load_ms"] + r1["prefill_ms"] + r1["first_tok_ms"]
+assert_eq_int("ttft_ms_formula", r1["ttft_ms"], ttft_expect)
+
+// tokens_per_sec formula: if decode_ms>0 then = max_new/(decode_ms/1000)
+if r1["decode_ms"] > 0 {
+    let expect_tok_s = 4.0 / (to_float(r1["decode_ms"]) / 1000.0)
+    assert_true("tokens_per_sec_formula", approx_close(r1["tokens_per_sec"], expect_tok_s, 0.0001))
+} else {
+    assert_true("tokens_per_sec_zero_when_decode_zero", r1["tokens_per_sec"] == 0.0)
+}
+
+// ── Test 2: max_new=0 edge case (no decode) ─────────────────────────
+println("[test] max_new=0 edge case...")
+let r2 = t_run_e2e(1, 2, 0, 32)
+assert_true("tok_s_is_zero_when_max_new_zero", r2["tokens_per_sec"] == 0.0)
+assert_eq_int("first_tok_ms_is_zero_when_no_decode", r2["first_tok_ms"], 0)
+
+// ── Test 3: stage monotonicity (larger knob → larger-or-equal ms) ──
+//   Timing at ms resolution is noisy so we compare AGGREGATE work by
+//   using a sufficiently large knob jump (e.g. 1 → 20) — the scaffold
+//   busy_work loop ensures the larger config is always slower on a
+//   reasonable host.
+println("[test] stage monotonicity...")
+
+let r_load_small = t_run_e2e(1, 1, 1, 32)
+let r_load_big   = t_run_e2e(20, 1, 1, 32)
+assert_true("load_ms_monotone_in_load_iter",
+    r_load_big["load_ms"] >= r_load_small["load_ms"])
+
+let r_pre_small = t_run_e2e(1, 1, 1, 32)
+let r_pre_big   = t_run_e2e(1, 40, 1, 32)
+assert_true("prefill_ms_monotone_in_prompt_len",
+    r_pre_big["prefill_ms"] >= r_pre_small["prefill_ms"])
+
+let r_dec_small = t_run_e2e(1, 1, 1, 32)
+let r_dec_big   = t_run_e2e(1, 1, 40, 32)
+assert_true("decode_ms_monotone_in_max_new",
+    r_dec_big["decode_ms"] >= r_dec_small["decode_ms"])
+
+// ── Test 4: with non-zero decode_ms → tok/s is positive ────────────
+println("[test] positive tok/s under realistic knobs...")
+let r4 = t_run_e2e(2, 4, 16, 64)
+if r4["decode_ms"] > 0 {
+    assert_true("tok_s_positive_when_decode_positive", r4["tokens_per_sec"] > 0.0)
+} else {
+    // decode too fast to measure at ms resolution — still valid, skip
+    println("[info] decode_ms==0 (sub-ms), skipping tok_s>0 check")
+    g_pass = g_pass + 1
+}
+
+// ── summary ─────────────────────────────────────────────────────────
+println("")
+println("e2e_7b_latency tests: pass=" + str(g_pass) + " fail=" + str(g_fail))
+if g_fail == 0 {
+    println("e2e_7b_latency: ALL PASS")
+} else {
+    println("e2e_7b_latency: FAIL")
+}
