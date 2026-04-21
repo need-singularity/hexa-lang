@@ -4,7 +4,7 @@
 //   hexa://gate/drill?seed=<text>            → drill_bg_spawn.sh <seed>
 //   hexa://gate/entry?mode=<m>&text=<t>      → entry.hexa <mode> <text>
 //   hexa://cmd/<name>?seed=<text>            → commands.json must_invoke (or cli_equivalent)
-//   hexa://active                            → cat <git-root>/.hook-commands/active.json
+//   hexa://active                            → read <git-root>/.hook-commands/active.json
 //   hexa://statusline                        → claude_statusline.hexa
 //
 // usage:
@@ -15,17 +15,56 @@
 // phase 2 (hexa://remote/<host>/...).
 
 let HOME = env("HOME")
-let GATE = HOME + "/core/hexa-lang/gate"
+let WS = env("WS")
+let GATE = WS + "/hexa-lang/gate"
 let CMDS_JSON = GATE + "/commands.json"
 
-// ─── URL decoding (percent-encoded) ──────────────────────────────────
-// Supports ASCII + UTF-8 multi-byte (jq does the work — avoids per-byte loop).
+// ─── ai-native error helper — structured diagnostic to stderr ────────
+// Every failure path emits 3 lines: what happened, how to fix, SSOT pointer.
+// This keeps Claude's response deterministic when gate refuses a request.
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[hexa-url/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── URL decoding — pure hexa, no subprocess ─────────────────────────
+// RFC 3986 percent-decode + '+' → ' ' (form-style). Byte-level; UTF-8
+// sequences pass through unchanged because %XX just yields raw bytes.
+fn _hex_to_int(c: str) -> i64 {
+    let o = ord(c)
+    if o >= 48 && o <= 57  { return o - 48 }
+    if o >= 65 && o <= 70  { return o - 65 + 10 }
+    if o >= 97 && o <= 102 { return o - 97 + 10 }
+    return -1
+}
+
 fn url_decode(s: str) -> str {
     if s.contains("%") == false && s.contains("+") == false { return s }
-    // jq --arg s "<input>" -n '$s | gsub("\\+"; " ") | @uri' undoes + but not %; use python one-liner instead.
-    let cmd = "printf '%s' '" + s.replace("'", "'\\''") + "' | python3 -c 'import sys,urllib.parse;sys.stdout.write(urllib.parse.unquote_plus(sys.stdin.read()))' 2>/dev/null"
-    let out = to_string(exec(cmd))  // @allow-bare-exec
-    if out.len() == 0 { return s }
+    let mut out = ""
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "+" {
+            out = out + " "
+            i = i + 1
+        } else if ch == "%" && i + 2 < n {
+            let h1 = _hex_to_int(s.substring(i + 1, i + 2))
+            let h2 = _hex_to_int(s.substring(i + 2, i + 3))
+            if h1 >= 0 && h2 >= 0 {
+                out = out + chr(h1 * 16 + h2)
+                i = i + 3
+            } else {
+                // malformed %-escape — emit literal, continue.
+                out = out + ch
+                i = i + 1
+            }
+        } else {
+            out = out + ch
+            i = i + 1
+        }
+    }
     return out
 }
 
@@ -100,7 +139,10 @@ fn strip_optional_flags(s: str) -> str {
 fn dispatch_cmd(name: str, seed: str) -> void {
     let tmpl_raw = cmd_must_invoke(name)
     if tmpl_raw.len() == 0 {
-        eprintln("[hexa-url] no execution.entry / cli_equivalent / must_invoke for cmd '" + name + "' — check " + CMDS_JSON)
+        ai_err("CMD-NO-TEMPLATE",
+               "command '" + name + "' has no execution.entry / cli_equivalent / must_invoke",
+               "add one of those fields under .commands[\"" + name + "\"] in commands.json",
+               CMDS_JSON)
         return
     }
     let tmpl = strip_optional_flags(tmpl_raw)
@@ -122,12 +164,20 @@ fn dispatch_cmd(name: str, seed: str) -> void {
 fn dispatch_active() -> void {
     let root = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()  // @allow-bare-exec
     if root.len() == 0 {
-        eprintln("[hexa-url] not in a git repo — no active.json")
+        ai_err("GIT-NO-ROOT",
+               "not in a git repo — no active.json to read",
+               "cd into a repo with .hook-commands/active.json, or initialize one",
+               "git rev-parse --show-toplevel")
         return
     }
     let p = root + "/.hook-commands/active.json"
-    let out = to_string(exec("cat '" + p + "' 2>/dev/null"))  // @allow-bare-exec
-    if out.len() == 0 { println("{\"stack\":[]}") } else { println(out.trim()) }
+    if !file_exists(p) {
+        println("{\"stack\":[]}")
+        return
+    }
+    let mut content = ""
+    try { content = read_file(p) } catch e {}
+    if content.len() == 0 { println("{\"stack\":[]}") } else { println(content.trim()) }
 }
 
 fn dispatch_statusline() -> void {
@@ -145,7 +195,10 @@ fn dispatch_statusline() -> void {
 fn dispatch_remote(remote_path: str, query: str) -> void {
     let slash = remote_path.index_of("/")
     if slash < 0 {
-        eprintln("[hexa-url] remote URL needs <host>/<inner-scope>/...")
+        ai_err("REMOTE-BAD-HOST",
+               "remote URL missing inner scope: got '" + remote_path + "'",
+               "use hexa://remote/<host>/<inner-scope>/<resource>?<query>",
+               "gate/hexa_url.hexa:dispatch_remote")
         return
     }
     let host = remote_path.substring(0, slash)
@@ -171,8 +224,10 @@ fn main() {
         i = i + 1
     }
     if url.len() == 0 {
-        eprintln("usage: hexa run gate/hexa_url.hexa \"hexa://<scope>/<resource>?<args>\"")
-        eprintln("       scopes: gate/{drill,entry}  cmd/<name>  active  statusline")
+        ai_err("USAGE-EMPTY",
+               "no hexa:// URL argument given",
+               "pass one of: gate/{drill,entry}  cmd/<name>  active  statusline  remote/<host>/...",
+               "gate/hexa_url.hexa")
         return
     }
 
@@ -187,7 +242,7 @@ fn main() {
         let md = get_param(query, "mode")
         let tx = get_param(query, "text")
         let ent = HOME + "/core/hexa-lang/gate/entry.hexa"
-        let hx = HOME + "/core/hexa-lang/hexa"
+        let hx = WS + "/hexa-lang/hexa"
         let tx_sh = tx.replace("'", "'\\''")
         let cmd = hx + " run " + ent + " " + md + " '" + tx_sh + "' 2>&1"
         println(to_string(exec(cmd)))  // @allow-bare-exec
@@ -200,7 +255,10 @@ fn main() {
     } else if sc == "remote" {
         dispatch_remote(res, query)
     } else {
-        eprintln("[hexa-url] unknown scope/resource: " + sc + "/" + res)
+        ai_err("SCOPE-UNKNOWN",
+               "unknown scope/resource: '" + sc + "/" + res + "'",
+               "use one of: gate/{drill,entry}  cmd/<name>  active  statusline  remote/<host>/...",
+               "gate/hexa_url.hexa:main")
     }
 }
 
