@@ -1,0 +1,949 @@
+// roadmap_dod_bridge.hexa — bridge between roadmap node status and DoD gate
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// PURPOSE
+//   roadmap_cli.hexa mark <node> done 은 수동 마킹이라 검증 없이 done 표시
+//   가능 → 허위 완료 위험. 본 모듈은
+//     (a) 노드 → track 추출 → dod_gate verify 결과를 노드 promotion 게이트로 사용
+//     (b) DoD PASS 인 ready 노드를 auto-done 마킹 (autopromote)
+//     (c) 현재 done 으로 마킹된 노드 일괄 감사 (audit) — DoD FAIL 인 것 flag
+//
+//   shared/tool/dod_gate.hexa (기존, 수정 금지) 를 exec 로 위임.
+//   sentinel "__HARNESS_DOD_RESULT__ <PASS|BLOCK> <reason>" stdout 마지막 줄
+//   파싱으로 PASS/FAIL 결정. dod_gate.hexa 자체가 없으면 NO_SPEC.
+//
+//   roadmap_cli.hexa mark 도 exec 위임. 본 모듈은 read-only + 위임만.
+//
+// TRACK 추출 heuristic (Node 에 track 필드 없을 때):
+//   1) node.track JSON 필드 (있으면 우선)
+//   2) node.id prefix 패턴: TALM/ZALM/ALM-* → ALM, TCLM/ZCLM/CLM-* → CLM,
+//      TSRV/ZSRV/SERV/SERVING-* → SERVING, ZPHY/PHY/PHYSICS-* → PHYSICS,
+//      BENCH/EVAL/VERIFY-* → VERIFY
+//   3) node.type fallback: build|boot → "" (NO_SPEC), verify → VERIFY,
+//      learn → ALM
+//
+// CLI
+//   hexa run roadmap_dod_bridge.hexa check       <rm> <node>
+//   hexa run roadmap_dod_bridge.hexa promote     <rm> <node>
+//   hexa run roadmap_dod_bridge.hexa audit       <rm>
+//   hexa run roadmap_dod_bridge.hexa autopromote <rm> [--track=<t>] [--limit=N] [--apply]
+//   hexa run roadmap_dod_bridge.hexa --selftest
+//
+// EXIT (check)   0 PASS / 1 FAIL / 2 NO_SPEC / 3 usage|parse
+// EXIT (promote) 0 marked done / 1 dod fail / 2 NO_SPEC | mark fail / 3 usage|parse
+// EXIT (audit)   0 all PASS or NO_SPEC only / 1 ≥1 FAIL / 3 usage|parse
+// EXIT (autopromote) 0 ok / 3 usage|parse
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV.len() > 0 { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let HEXA_BIN = NEXUS + "/bin/hexa"
+let DOD_GATE = HARNESS + "/dod_gate.hexa"
+let ROADMAP_CLI = HARNESS + "/roadmap_cli.hexa"
+let LOG_PATH = HARNESS + "/roadmap_dod_bridge_log.jsonl"
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _i_of(x) -> i64 {
+    let t = type_of(x)
+    if t == "i64" || t == "int" { return x }
+    return 0
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn pad_r(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = r + " " }
+    return r
+}
+
+fn pad_l(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = " " + r }
+    return r
+}
+
+// last-occurrence scan (no rfind in stage1)
+fn _rfind(hay: string, needle: string) -> i64 {
+    let nl = needle.len()
+    if nl == 0 { return -1 }
+    let mut i = hay.len() - nl
+    while i >= 0 {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn sh_quote(s: string) -> string {
+    let mut out = "'"
+    let mut i = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\"'\"'" } else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ── minimal JSON text helpers (mirror dod_gate / roadmap_cli) ───────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    return [body.substring(start, j), to_string(j + 1)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── object-block split ───────────────────────────────────────────────────
+fn _key_array_pos(body: string, key: string) -> i64 {
+    let tag = "\"" + key + "\""
+    let mut from: i64 = 0
+    while from < body.len() {
+        let ti = _find_after(body, tag, from)
+        if ti < 0 { return -1 }
+        let mut i = ti + tag.len()
+        while i < body.len() {
+            let c = body.substring(i, i + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+            else { break }
+        }
+        if i < body.len() && body.substring(i, i + 1) == ":" {
+            i = i + 1
+            while i < body.len() {
+                let c = body.substring(i, i + 1)
+                if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+                else { break }
+            }
+            if i < body.len() && body.substring(i, i + 1) == "[" {
+                return i
+            }
+        }
+        from = ti + tag.len()
+    }
+    return -1
+}
+
+fn split_objects(body: string, key: string) -> [string] {
+    let lb = _key_array_pos(body, key)
+    if lb < 0 { return [] }
+    let mut i = lb + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── unified Node abstraction (read-only) ────────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    track: string,
+    status: string,
+    deps: [string],
+    phase: string
+}
+
+fn parse_engine_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let track = json_str(raw, "track")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let deps = json_str_array(raw, "deps")
+    return Node {
+        id: id, name: name, ntype: ntype, track: track,
+        status: st, deps: deps, phase: ""
+    }
+}
+
+fn parse_task_node(raw: string, phase_id: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "task")
+    if name == "" { name = json_str(raw, "name") }
+    if name == "" { name = id }
+    let track = json_str(raw, "track")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let deps = json_str_array(raw, "depends_on")
+    return Node {
+        id: id, name: name, ntype: "build", track: track,
+        status: st, deps: deps, phase: phase_id
+    }
+}
+
+struct Roadmap {
+    id: string,
+    file: string,
+    nodes: [Node],
+    body: string
+}
+
+fn detect_schema(body: string) -> string {
+    let has_phases = _key_array_pos(body, "phases") >= 0
+    let has_nodes  = _key_array_pos(body, "nodes")  >= 0
+    let has_tracks = _find_after(body, "\"tracks\"", 0) >= 0
+    if has_phases && has_tracks { return "tracks_phases" }
+    if has_nodes  { return "engine_v1" }
+    if has_phases { return "tracks_phases" }
+    return "unknown"
+}
+
+fn extract_meta(body: string) -> string {
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    if meta_idx < 0 { return "" }
+    let mut mi = meta_idx
+    while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+    if mi >= body.len() { return "" }
+    let start = mi
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut end = mi
+    while end < body.len() {
+        let c = body.substring(end, end + 1)
+        if in_str {
+            if c == "\\" { end = end + 2; continue }
+            if c == "\"" { in_str = false }
+            end = end + 1
+            continue
+        }
+        if c == "\"" { in_str = true; end = end + 1; continue }
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+        end = end + 1
+    }
+    return body.substring(start, end)
+}
+
+fn resolve_path(rm_name: string) -> string {
+    if rm_name.contains("/") { return rm_name }
+    let p1 = ROADMAPS + "/" + rm_name + ".json"
+    if file_exists(p1) { return p1 }
+    let p2 = ROADMAPS + "/" + rm_name
+    if file_exists(p2) { return p2 }
+    return p1
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    let meta_body = extract_meta(body)
+    let mut rid = json_str(meta_body, "id")
+    if rid == "" { rid = json_str(meta_body, "project") }
+    if rid == "" { rid = json_str(meta_body, "name") }
+    let schema = detect_schema(body)
+    let mut nodes: [Node] = []
+    if schema == "engine_v1" {
+        let blocks = split_objects(body, "nodes")
+        let mut i: i64 = 0
+        while i < blocks.len() {
+            let n = parse_engine_node(_str(blocks[i]))
+            if n.id.len() > 0 { nodes = nodes.push(n) }
+            i = i + 1
+        }
+    } else if schema == "tracks_phases" {
+        let phase_blocks = split_objects(body, "phases")
+        let mut pi: i64 = 0
+        while pi < phase_blocks.len() {
+            let pb = _str(phase_blocks[pi])
+            let phase_id = json_str(pb, "id")
+            let parallels = split_objects(pb, "parallel")
+            if parallels.len() > 0 {
+                let mut qi: i64 = 0
+                while qi < parallels.len() {
+                    let qb = _str(parallels[qi])
+                    let task_blocks = split_objects(qb, "tasks")
+                    let mut ti: i64 = 0
+                    while ti < task_blocks.len() {
+                        let n = parse_task_node(_str(task_blocks[ti]), phase_id)
+                        if n.id.len() > 0 { nodes = nodes.push(n) }
+                        ti = ti + 1
+                    }
+                    qi = qi + 1
+                }
+            } else {
+                let task_blocks = split_objects(pb, "tasks")
+                let mut ti: i64 = 0
+                while ti < task_blocks.len() {
+                    let n = parse_task_node(_str(task_blocks[ti]), phase_id)
+                    if n.id.len() > 0 { nodes = nodes.push(n) }
+                    ti = ti + 1
+                }
+            }
+            pi = pi + 1
+        }
+    }
+    return Roadmap { id: rid, file: path, nodes: nodes, body: body }
+}
+
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete"
+}
+
+// ── track extraction heuristic ──────────────────────────────────────────
+// String startswith — substring 으로 우회 (== 비교만 사용, < / > 비교 회피)
+fn _starts_with(s: string, prefix: string) -> bool {
+    let pl = prefix.len()
+    if pl == 0 { return true }
+    if s.len() < pl { return false }
+    return s.substring(0, pl) == prefix
+}
+
+fn extract_track(n: Node) -> string {
+    // 1) explicit JSON field
+    if n.track.len() > 0 { return n.track }
+
+    // 2) id prefix patterns — 가장 긴 prefix 부터 (TALM > ALM)
+    let id = n.id
+    if id.len() > 0 {
+        // ALM family
+        if _starts_with(id, "TALM") { return "ALM" }
+        if _starts_with(id, "ZALM") { return "ALM" }
+        if _starts_with(id, "ALM")  { return "ALM" }
+        // CLM family
+        if _starts_with(id, "TCLM") { return "CLM" }
+        if _starts_with(id, "ZCLM") { return "CLM" }
+        if _starts_with(id, "CLM")  { return "CLM" }
+        // SERVING family
+        if _starts_with(id, "TSRV")    { return "SERVING" }
+        if _starts_with(id, "ZSRV")    { return "SERVING" }
+        if _starts_with(id, "SERVING") { return "SERVING" }
+        if _starts_with(id, "SERV")    { return "SERVING" }
+        // PHYSICS family
+        if _starts_with(id, "ZPHY")    { return "PHYSICS" }
+        if _starts_with(id, "PHYSICS") { return "PHYSICS" }
+        if _starts_with(id, "PHY")     { return "PHYSICS" }
+        // VERIFY family
+        if _starts_with(id, "BENCH")  { return "VERIFY" }
+        if _starts_with(id, "EVAL")   { return "VERIFY" }
+        if _starts_with(id, "VERIFY") { return "VERIFY" }
+    }
+
+    // 3) ntype fallback
+    let t = n.ntype
+    if t == "verify" { return "VERIFY" }
+    if t == "learn"  { return "ALM" }
+    // build / boot / seed / goal / exp → no DoD concept
+    return ""
+}
+
+// track string for dod_gate: lowercase the track name (voice, alm, clm, ...)
+fn track_to_dod_key(track: string) -> string {
+    return track.to_lower()
+}
+
+// ── dod_gate sentinel parser ────────────────────────────────────────────
+// Returns [status, reason] where status ∈ "PASS"|"FAIL"|"NO_SPEC"|"ERR"
+//
+// dod_gate.hexa stdout last line:
+//   __HARNESS_DOD_RESULT__ PASS  <reason>
+//   __HARNESS_DOD_RESULT__ BLOCK <reason>
+//
+// For our bridge:
+//   PASS + reason "all_tiers" or "check_highest=<tier>" or "tier=<tier>" → PASS
+//   PASS + reason "check_only_no_promotion"                              → FAIL
+//   BLOCK <reason>                                                       → FAIL
+//   BLOCK + reason starts "dod_config_missing"                           → NO_SPEC
+//   no sentinel / dod_gate absent                                        → NO_SPEC
+
+fn _last_nonempty_line(raw: string) -> string {
+    let lines = raw.split("\n")
+    let mut i = lines.len() - 1
+    while i >= 0 {
+        let ln = _str(lines[i]).trim()
+        if ln.len() > 0 { return ln }
+        i = i - 1
+    }
+    return ""
+}
+
+fn parse_dod_sentinel(stdout_text: string) -> [string] {
+    let last = _last_nonempty_line(stdout_text)
+    let marker = "__HARNESS_DOD_RESULT__"
+    let mi = last.index_of(marker)
+    if mi < 0 { return ["NO_SPEC", "no_sentinel"] }
+    let rest = last.substring(mi + marker.len(), last.len()).trim()
+    // split first token = PASS|BLOCK ; remainder = reason
+    let sp = rest.index_of(" ")
+    let head = if sp > 0 { rest.substring(0, sp) } else { rest }
+    let reason = if sp > 0 { rest.substring(sp + 1, rest.len()).trim() } else { "" }
+    if head == "PASS" {
+        // distinguish check_only_no_promotion as FAIL
+        if reason == "check_only_no_promotion" { return ["FAIL", reason] }
+        return ["PASS", reason]
+    }
+    if head == "BLOCK" {
+        if _starts_with(reason, "dod_config_missing") { return ["NO_SPEC", reason] }
+        return ["FAIL", reason]
+    }
+    return ["ERR", "bad_sentinel:" + head]
+}
+
+// Invoke dod_gate check <track>. Returns [status, reason].
+//   if dod_gate.hexa absent → NO_SPEC
+//   if voice_dod.json (or <track>_dod.json) absent → NO_SPEC (sentinel says so)
+fn call_dod_gate_check(track: string) -> [string] {
+    if file_exists(DOD_GATE) == false {
+        return ["NO_SPEC", "dod_gate_absent"]
+    }
+    let dod_key = track_to_dod_key(track)
+    let dod_cfg = ROADMAPS + "/" + dod_key + "_dod.json"
+    if file_exists(dod_cfg) == false {
+        return ["NO_SPEC", "dod_config_missing:" + dod_key]
+    }
+    let cmd = HEXA_BIN + " run " + DOD_GATE + " check " + sh_quote(dod_key) + " 2>&1"
+    let raw = _str(exec(cmd))  // @allow-bare-exec
+    return parse_dod_sentinel(raw)
+}
+
+// Invoke roadmap_cli mark <rm> <node> done. Returns true if OK.
+fn call_roadmap_cli_mark_done(rm_name: string, node_id: string) -> [string] {
+    if file_exists(ROADMAP_CLI) == false {
+        return ["FAIL", "roadmap_cli_absent"]
+    }
+    let cmd = HEXA_BIN + " run " + ROADMAP_CLI + " mark " + sh_quote(rm_name) + " " + sh_quote(node_id) + " done 2>&1"
+    let raw = _str(exec(cmd))  // @allow-bare-exec
+    let last = _last_nonempty_line(raw)
+    // roadmap_cli.cmd_mark prints "OK: ..." on success (no sentinel). REJECT on failure.
+    if _starts_with(last, "OK: mark") || raw.index_of("\nOK: mark") >= 0 || _starts_with(raw.trim(), "OK: mark") {
+        return ["OK", last]
+    }
+    if raw.index_of("REJECT") >= 0 {
+        return ["FAIL", "reject:" + last]
+    }
+    return ["FAIL", "no_ok_marker:" + last]
+}
+
+// ── logging ──────────────────────────────────────────────────────────────
+fn escape_jsonl(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn log_event(rm: string, op: string, node: string, track: string, dod_status: string, reason: string, applied: bool) {
+    let ap = if applied { "true" } else { "false" }
+    let line = "{\"ts\":\"" + _ts_iso()
+        + "\",\"rm\":\"" + escape_jsonl(rm)
+        + "\",\"op\":\"" + escape_jsonl(op)
+        + "\",\"node\":\"" + escape_jsonl(node)
+        + "\",\"track\":\"" + escape_jsonl(track)
+        + "\",\"dod_status\":\"" + escape_jsonl(dod_status)
+        + "\",\"reason\":\"" + escape_jsonl(reason)
+        + "\",\"applied\":" + ap + "}"
+    append_file(LOG_PATH, line + "\n")
+}
+
+// ── commands ─────────────────────────────────────────────────────────────
+fn cmd_check(rm_name: string, node_id: string) -> i64 {
+    let path = resolve_path(rm_name)
+    let rm = load_roadmap(path)
+    let i = idx_of(rm.nodes, node_id)
+    if i < 0 {
+        eprintln("REJECT: node not found: " + rm_name + "/" + node_id)
+        return 3
+    }
+    let n = rm.nodes[i]
+    let track = extract_track(n)
+    let mut status = "NO_SPEC"
+    let mut reason = "no_track"
+    if track.len() > 0 {
+        let r = call_dod_gate_check(track)
+        status = _str(r[0])
+        reason = _str(r[1])
+    }
+    println("track=" + track + "  dod_status=" + status + "  (" + reason + ")")
+    log_event(rm.id, "check", node_id, track, status, reason, false)
+    if status == "PASS" { return 0 }
+    if status == "FAIL" { return 1 }
+    return 2
+}
+
+fn cmd_promote(rm_name: string, node_id: string) -> i64 {
+    let path = resolve_path(rm_name)
+    let rm = load_roadmap(path)
+    let i = idx_of(rm.nodes, node_id)
+    if i < 0 {
+        eprintln("REJECT: node not found: " + rm_name + "/" + node_id)
+        return 3
+    }
+    let n = rm.nodes[i]
+    if is_done(n.status) {
+        println("noop: already done — " + rm.id + "/" + node_id)
+        log_event(rm.id, "promote", node_id, extract_track(n), "ALREADY_DONE", "noop", false)
+        return 0
+    }
+    let track = extract_track(n)
+    if track.len() == 0 {
+        eprintln("REJECT: cannot extract track for node " + node_id + " (id/type heuristic both empty)")
+        log_event(rm.id, "promote", node_id, "", "NO_SPEC", "no_track", false)
+        return 2
+    }
+    let r = call_dod_gate_check(track)
+    let status = _str(r[0])
+    let reason = _str(r[1])
+    if status != "PASS" {
+        eprintln("REJECT: dod_status=" + status + " for track=" + track + " (" + reason + ")")
+        log_event(rm.id, "promote", node_id, track, status, reason, false)
+        if status == "NO_SPEC" { return 2 }
+        return 1
+    }
+    let m = call_roadmap_cli_mark_done(rm_name, node_id)
+    let mres = _str(m[0])
+    let mdetail = _str(m[1])
+    if mres != "OK" {
+        eprintln("REJECT: roadmap_cli mark failed: " + mdetail)
+        log_event(rm.id, "promote", node_id, track, "MARK_FAIL", mdetail, false)
+        return 2
+    }
+    println("OK: promoted " + rm.id + "/" + node_id + " (track=" + track + " dod=PASS)")
+    log_event(rm.id, "promote", node_id, track, "PASS", reason, true)
+    return 0
+}
+
+struct AuditRow {
+    node: string,
+    track: string,
+    dod_status: string,
+    reason: string
+}
+
+fn cmd_audit(rm_name: string) -> i64 {
+    let path = resolve_path(rm_name)
+    let rm = load_roadmap(path)
+    let mut rows: [AuditRow] = []
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        let n = rm.nodes[i]
+        if is_done(n.status) {
+            let track = extract_track(n)
+            let mut st = "NO_SPEC"
+            let mut rs = "no_track"
+            if track.len() > 0 {
+                let r = call_dod_gate_check(track)
+                st = _str(r[0])
+                rs = _str(r[1])
+            }
+            rows = rows.push(AuditRow { node: n.id, track: track, dod_status: st, reason: rs })
+            log_event(rm.id, "audit", n.id, track, st, rs, false)
+        }
+        i = i + 1
+    }
+    println(pad_r("NODE", 20) + pad_r("TRACK", 10) + pad_r("DOD_STATUS", 12) + "DETAIL")
+    println("─────────────────────────────────────────────────────────────────────")
+    let mut k: i64 = 0
+    let mut pass_n: i64 = 0
+    let mut fail_n: i64 = 0
+    let mut nospec_n: i64 = 0
+    while k < rows.len() {
+        let r = rows[k]
+        println(pad_r(r.node, 20) + pad_r(r.track, 10) + pad_r(r.dod_status, 12) + r.reason)
+        if r.dod_status == "PASS" { pass_n = pass_n + 1 }
+        else if r.dod_status == "FAIL" { fail_n = fail_n + 1 }
+        else { nospec_n = nospec_n + 1 }
+        k = k + 1
+    }
+    println("")
+    println("done=" + to_string(rows.len()) + "  pass=" + to_string(pass_n) + "  fail=" + to_string(fail_n) + "  no_spec=" + to_string(nospec_n))
+    if fail_n > 0 { return 1 }
+    return 0
+}
+
+fn cmd_autopromote(rm_name: string, track_filter: string, limit: i64, apply: bool) -> i64 {
+    let path = resolve_path(rm_name)
+    let rm = load_roadmap(path)
+    // collect ready nodes (status=todo|planned, all deps done)
+    let mut ready_ids: [string] = []
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        let n = rm.nodes[i]
+        if n.status == "todo" || n.status == "planned" {
+            let mut all_done: bool = true
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let pi = idx_of(rm.nodes, _str(n.deps[j]))
+                if pi < 0 { all_done = false; break }
+                if is_done(rm.nodes[pi].status) == false { all_done = false; break }
+                j = j + 1
+            }
+            if all_done {
+                if track_filter.len() == 0 {
+                    ready_ids = ready_ids.push(n.id)
+                } else {
+                    let nt = extract_track(n)
+                    if nt == track_filter { ready_ids = ready_ids.push(n.id) }
+                }
+            }
+        }
+        i = i + 1
+    }
+    let mode = if apply { "APPLY" } else { "DRY-RUN" }
+    println("▼autopromote " + rm.id + "  ready=" + to_string(ready_ids.len()) + "  limit=" + to_string(limit) + "  mode=" + mode)
+    let mut promoted: i64 = 0
+    let mut considered: i64 = 0
+    let mut k: i64 = 0
+    while k < ready_ids.len() && promoted < limit {
+        let nid = _str(ready_ids[k])
+        let ni = idx_of(rm.nodes, nid)
+        let n = rm.nodes[ni]
+        let track = extract_track(n)
+        considered = considered + 1
+        if track.len() == 0 {
+            println("  · " + nid + "  track=?  → SKIP (no_track)")
+            log_event(rm.id, "autopromote", nid, "", "NO_SPEC", "no_track", false)
+            k = k + 1
+            continue
+        }
+        let r = call_dod_gate_check(track)
+        let status = _str(r[0])
+        let reason = _str(r[1])
+        if status != "PASS" {
+            println("  · " + nid + "  track=" + track + "  dod=" + status + "  → SKIP (" + reason + ")")
+            log_event(rm.id, "autopromote", nid, track, status, reason, false)
+            k = k + 1
+            continue
+        }
+        if apply {
+            let m = call_roadmap_cli_mark_done(rm_name, nid)
+            let mres = _str(m[0])
+            if mres == "OK" {
+                println("  ● " + nid + "  track=" + track + "  → DONE")
+                log_event(rm.id, "autopromote", nid, track, "PASS", reason, true)
+                promoted = promoted + 1
+            } else {
+                println("  · " + nid + "  track=" + track + "  → MARK_FAIL (" + _str(m[1]) + ")")
+                log_event(rm.id, "autopromote", nid, track, "MARK_FAIL", _str(m[1]), false)
+            }
+        } else {
+            println("  ◯ " + nid + "  track=" + track + "  dod=PASS  → would mark done")
+            log_event(rm.id, "autopromote", nid, track, "PASS", reason + ":dry_run", false)
+            promoted = promoted + 1
+        }
+        k = k + 1
+    }
+    println("")
+    let verb = if apply { "promoted" } else { "would_promote" }
+    println(verb + "=" + to_string(promoted) + "  considered=" + to_string(considered))
+    if apply == false {
+        println("(dry run — pass --apply to mark done)")
+    }
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn _assert(cond: bool, label: string) -> i64 {
+    if cond {
+        println("  PASS " + label)
+        return 0
+    }
+    eprintln("  FAIL " + label)
+    return 1
+}
+
+fn selftest() -> i64 {
+    println("[roadmap_dod_bridge selftest]")
+    let mut fails: i64 = 0
+
+    // 1) track extraction heuristic on synthetic nodes
+    let n_alm = Node { id: "TALM-P2-2", name: "x", ntype: "build", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_alm) == "ALM", "extract_track TALM-P2-2 → ALM")
+    let n_clm = Node { id: "TCLM-P1-1", name: "x", ntype: "build", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_clm) == "CLM", "extract_track TCLM-P1-1 → CLM")
+    let n_srv = Node { id: "TSRV-P3-1", name: "x", ntype: "build", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_srv) == "SERVING", "extract_track TSRV-P3-1 → SERVING")
+    let n_phy = Node { id: "ZPHY-9", name: "x", ntype: "build", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_phy) == "PHYSICS", "extract_track ZPHY-9 → PHYSICS")
+    let n_ver = Node { id: "BENCH-1", name: "x", ntype: "build", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_ver) == "VERIFY", "extract_track BENCH-1 → VERIFY")
+    let n_explicit = Node { id: "foo", name: "x", ntype: "build", track: "voice", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_explicit) == "voice", "extract_track explicit field → voice")
+    let n_seed = Node { id: "seed", name: "S0", ntype: "seed", track: "", status: "done", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_seed) == "", "extract_track seed → NO_SPEC")
+    let n_verify = Node { id: "lint_pass", name: "L", ntype: "verify", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_verify) == "VERIFY", "extract_track ntype=verify → VERIFY")
+    let n_learn = Node { id: "learn_x", name: "L", ntype: "learn", track: "", status: "todo", deps: [], phase: "" }
+    fails = fails + _assert(extract_track(n_learn) == "ALM", "extract_track ntype=learn → ALM")
+
+    // 2) sentinel parser
+    let r1 = parse_dod_sentinel("first line\n__HARNESS_DOD_RESULT__ PASS check_highest=scaffold_done\n")
+    fails = fails + _assert(_str(r1[0]) == "PASS", "sentinel PASS check_highest")
+    let r2 = parse_dod_sentinel("__HARNESS_DOD_RESULT__ PASS check_only_no_promotion")
+    fails = fails + _assert(_str(r2[0]) == "FAIL", "sentinel PASS check_only_no_promotion → FAIL")
+    let r3 = parse_dod_sentinel("__HARNESS_DOD_RESULT__ BLOCK dod_config_missing")
+    fails = fails + _assert(_str(r3[0]) == "NO_SPEC", "sentinel BLOCK dod_config_missing → NO_SPEC")
+    let r4 = parse_dod_sentinel("__HARNESS_DOD_RESULT__ BLOCK tier=wired_done reason=foo")
+    fails = fails + _assert(_str(r4[0]) == "FAIL", "sentinel BLOCK tier=wired → FAIL")
+    let r5 = parse_dod_sentinel("garbage with no sentinel")
+    fails = fails + _assert(_str(r5[0]) == "NO_SPEC", "no sentinel → NO_SPEC")
+    let r6 = parse_dod_sentinel("__HARNESS_DOD_RESULT__ PASS all_tiers")
+    fails = fails + _assert(_str(r6[0]) == "PASS", "sentinel PASS all_tiers")
+
+    // 3) track_to_dod_key lowercase
+    fails = fails + _assert(track_to_dod_key("ALM") == "alm", "track_to_dod_key ALM → alm")
+    fails = fails + _assert(track_to_dod_key("voice") == "voice", "track_to_dod_key voice → voice")
+
+    // 4) example roadmap loads + 4 done nodes
+    let ex_path = ROADMAPS + "/example.json"
+    if file_exists(ex_path) {
+        let rm = load_roadmap(ex_path)
+        let mut dn: i64 = 0
+        let mut i: i64 = 0
+        while i < rm.nodes.len() { if is_done(rm.nodes[i].status) { dn = dn + 1 }; i = i + 1 }
+        fails = fails + _assert(dn == 4, "example roadmap done count = 4 (got " + to_string(dn) + ")")
+    } else {
+        println("  SKIP example roadmap not found")
+    }
+
+    if fails == 0 {
+        println("[roadmap_dod_bridge selftest] ALL PASS")
+        return 0
+    }
+    eprintln("[roadmap_dod_bridge selftest] " + to_string(fails) + " FAIL(s)")
+    return 1
+}
+
+// ── CLI ──────────────────────────────────────────────────────────────────
+fn print_usage() {
+    eprintln("usage: roadmap_dod_bridge <subcommand> [args]")
+    eprintln("  check       <rm> <node>                            # report dod_status for node's track")
+    eprintln("  promote     <rm> <node>                            # mark done iff dod PASS")
+    eprintln("  audit       <rm>                                   # check all done nodes")
+    eprintln("  autopromote <rm> [--track=T] [--limit=N] [--apply] # auto mark ready+PASS")
+    eprintln("  --selftest")
+    eprintln("")
+    eprintln("dod_status: PASS | FAIL | NO_SPEC")
+    eprintln("track heuristic: node.track > id-prefix > ntype fallback")
+}
+
+fn _arg_value(arg: string, prefix: string) -> string {
+    let pl = prefix.len()
+    if arg.len() < pl { return "" }
+    if arg.substring(0, pl) != prefix { return "" }
+    return arg.substring(pl, arg.len())
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai = 2
+    while ai < argv.len() { a = a.push(_str(argv[ai])); ai = ai + 1 }
+    if a.len() == 0 { print_usage(); exit(3) }
+    let sub = _str(a[0])
+
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        print_usage(); exit(0)
+    }
+    if sub == "check" {
+        if a.len() < 3 { eprintln("usage: check <rm> <node>"); exit(3) }
+        let rc = cmd_check(_str(a[1]), _str(a[2])); exit(rc)
+    }
+    if sub == "promote" {
+        if a.len() < 3 { eprintln("usage: promote <rm> <node>"); exit(3) }
+        let rc = cmd_promote(_str(a[1]), _str(a[2])); exit(rc)
+    }
+    if sub == "audit" {
+        if a.len() < 2 { eprintln("usage: audit <rm>"); exit(3) }
+        let rc = cmd_audit(_str(a[1])); exit(rc)
+    }
+    if sub == "autopromote" {
+        if a.len() < 2 { eprintln("usage: autopromote <rm> [--track=T] [--limit=N] [--apply]"); exit(3) }
+        let rm_name = _str(a[1])
+        let mut track_filter = ""
+        let mut limit: i64 = 5
+        let mut apply: bool = false
+        let mut k = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            let tv = _arg_value(arg, "--track=")
+            if tv.len() > 0 { track_filter = tv }
+            else {
+                let lv = _arg_value(arg, "--limit=")
+                if lv.len() > 0 { limit = to_int(lv) }
+                else if arg == "--apply" { apply = true }
+            }
+            k = k + 1
+        }
+        let rc = cmd_autopromote(rm_name, track_filter, limit, apply); exit(rc)
+    }
+    eprintln("REJECT: unknown subcommand: " + sub)
+    print_usage()
+    exit(3)
+}
+
+main()

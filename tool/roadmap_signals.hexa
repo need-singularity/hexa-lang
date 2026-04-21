@@ -1,0 +1,927 @@
+// roadmap_signals.hexa — calibration source for roadmap_engine effective_cost()
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_engine.hexa 의 c_i(S) 계수 (build/exp/learn/boot/verify) 를
+//   외부 로그에서 학습/추정하여 calibration 파일로 굳힌다.
+//   engine 은 이 파일을 override multiplier 로 사용 가능 (현재 read 는 별도).
+//
+//   v2 확장 모듈 #1 (signal coupling) + #6 (η/b 학습) 의 결합 구현.
+//
+// SOURCES
+//   build  → shared/n6/atlas.signals.n6.stats         (mtime/size/lines 증분)
+//   exp    → shared/tool/growth_tick_log.jsonl     (kind=tick_ok/* 비율)
+//   learn  → shared/bt/bt_keywords.jsonl              (일간 추가 count → η)
+//   boot   → shared/discovery/atlas_drift_log.jsonl   (있으면 amortize)
+//   verify → shared/tool/roadmap_sync.jsonl        (result=ok 비율)
+//
+// CLI
+//   hexa roadmap_signals.hexa calibrate [--window=100]
+//   hexa roadmap_signals.hexa query <ntype>
+//   hexa roadmap_signals.hexa --selftest
+//
+// OUTPUT
+//   shared/tool/roadmap_calibration.json
+//
+// exit: 0 success / 1 calibration fail / 2 usage / 3 source missing
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let N6 = NEXUS + "/n6"
+let BT = NEXUS + "/bt"
+let DISCOVERY = NEXUS + "/discovery"
+
+let CALIB_PATH = HARNESS + "/roadmap_calibration.json"
+let DEFAULT_ALPHA = 0.2
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _now_ms() -> i64 {
+    let s = _str(exec("date +%s%N 2>/dev/null || date +%s000000000")).trim()  // @allow-bare-exec
+    if s.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if is_digit(c) { n = n * 10 + (to_int(c)) }
+        else { return n / 1000000 }
+        i = i + 1
+    }
+    return n / 1000000
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+// f64 → i64 truncate
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+// safe parse float (empty/garbage → 0.0)
+fn _to_f64(s: string) -> f64 {
+    if s.len() == 0 { return 0.0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if is_num_char(c) { clean = clean + c }
+        else { break }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" || clean == "." { return 0.0 }
+    return to_float(clean)
+}
+
+// last-index-of single char (hexa stage1 'last_index_of' missing)
+fn _rfind(s: string, ch: string) -> i64 {
+    let mut i: i64 = s.len() - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ── JSON field extract (string-search 기반, json_parse 회피) ──────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return "" }
+    if body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return 0.0 }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return 0.0 }
+    return _to_f64(body.substring(start, i))
+}
+
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// f64 → i64 truncate (handles scientific-notation to_string for large floats).
+// hexa stage1 'as i64' returns void → 안전한 string-based parser.
+// 입력 형태: "262" / "262.5" / "1e+06" / "1.23457e+06" / "-12.5"
+fn _f_floor_to_i(x: f64) -> i64 {
+    if x == 0.0 { return 0 }
+    let neg = x < 0.0
+    let a = if neg { 0.0 - x } else { x }
+    let s = to_string(a)
+    // detect 'e' (scientific). e position 부터 exponent.
+    let mut e_pos: i64 = -1
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "e" || c == "E" { e_pos = i; break }
+        i = i + 1
+    }
+    let mantissa = if e_pos < 0 { s } else { s.substring(0, e_pos) }
+    let exp_s = if e_pos < 0 { "" } else { s.substring(e_pos + 1, s.len()) }
+    let mut exp_v: i64 = 0
+    if exp_s.len() > 0 {
+        // strip leading + or -
+        let sign_c = exp_s.substring(0, 1)
+        let body = if sign_c == "+" || sign_c == "-" { exp_s.substring(1, exp_s.len()) } else { exp_s }
+        if body.len() > 0 { exp_v = to_int(body) }
+        if sign_c == "-" { exp_v = 0 - exp_v }
+    }
+    // mantissa: "262" or "1.23457"
+    let dot = mantissa.index_of(".")
+    let int_part = if dot < 0 { mantissa } else { mantissa.substring(0, dot) }
+    let dec_part = if dot < 0 { "" } else { mantissa.substring(dot + 1, mantissa.len()) }
+    // 정수부 자리수 + exp_v 적용해 새 정수부 만들기
+    // 예: int="1", dec="23457", exp=6 → "1234570" (dec 5자, exp 6 → 6-5=1 zero pad)
+    let mut combined = int_part + dec_part
+    let dec_len: i64 = dec_part.len()
+    let shift = exp_v - dec_len
+    if shift > 0 {
+        let mut p: i64 = 0
+        while p < shift { combined = combined + "0"; p = p + 1 }
+    } else if shift < 0 {
+        // truncate from end
+        let cut = combined.len() + shift
+        if cut <= 0 { combined = "0" }
+        else { combined = combined.substring(0, cut) }
+    }
+    if combined.len() == 0 || combined == "-" { combined = "0" }
+    let n = to_int(combined)
+    if neg { return 0 - n }
+    return n
+}
+
+// f64 → string with up to 4 decimal places
+fn fmt_f4(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let whole_i = _f_floor_to_i(v)
+    let whole_f = to_float(to_string(whole_i))
+    let frac_part = v - whole_f
+    let frac_scaled = (frac_part * 10000.0) + 0.5
+    let mut frac_i = _f_floor_to_i(frac_scaled)
+    let mut whole_out = whole_i
+    if frac_i >= 10000 { whole_out = whole_out + 1; frac_i = frac_i - 10000 }
+    if frac_i < 0 { frac_i = 0 }
+    let mut fs = to_string(frac_i)
+    while fs.len() < 4 { fs = "0" + fs }
+    // trim trailing zeros
+    let mut end = fs.len()
+    while end > 1 && fs.substring(end - 1, end) == "0" { end = end - 1 }
+    let body = if end == 0 { "0" } else { fs.substring(0, end) }
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole_out) + "." + body
+}
+
+// ── tail N lines of a file (window bound) ─────────────────────────────────
+fn tail_lines(path: string, window: i64) -> [string] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let all = body.split("\n")
+    // drop trailing empty
+    let mut clean: [string] = []
+    let mut i: i64 = 0
+    while i < all.len() {
+        let s = _str(all[i])
+        if s.len() > 0 { clean = clean.push(s) }
+        i = i + 1
+    }
+    if window <= 0 || clean.len() <= window { return clean }
+    let start = clean.len() - window
+    let mut out: [string] = []
+    let mut j = start
+    while j < clean.len() {
+        out = out.push(_str(clean[j]))
+        j = j + 1
+    }
+    return out
+}
+
+// ── statistical primitives ────────────────────────────────────────────────
+struct Stats {
+    mean: f64,
+    ewma: f64,
+    samples: i64,
+    residual_std: f64
+}
+
+fn compute_stats(xs: [f64], alpha: f64) -> Stats {
+    let n = xs.len()
+    if n == 0 {
+        return Stats { mean: 0.0, ewma: 0.0, samples: 0, residual_std: 0.0 }
+    }
+    // mean
+    let mut sum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < n { sum = sum + xs[i]; i = i + 1 }
+    let m = sum / to_float(to_string(n))
+    // ewma (oldest → newest)
+    let mut e = xs[0]
+    let one_minus_a = 1.0 - alpha
+    let mut k: i64 = 1
+    while k < n {
+        e = (alpha * xs[k]) + (one_minus_a * e)
+        k = k + 1
+    }
+    // residual std (population)
+    let mut sq: f64 = 0.0
+    let mut j: i64 = 0
+    while j < n {
+        let d = xs[j] - m
+        sq = sq + (d * d)
+        j = j + 1
+    }
+    let var = sq / to_float(to_string(n))
+    // sqrt via Newton (var >= 0)
+    let mut s = if var > 0.0 { var } else { 0.0 }
+    if s > 0.0 {
+        let mut g = s
+        let mut t: i64 = 0
+        while t < 12 {
+            g = 0.5 * (g + (s / g))
+            t = t + 1
+        }
+        s = g
+    }
+    return Stats { mean: m, ewma: e, samples: n, residual_std: s }
+}
+
+// ── per-source extractors ─────────────────────────────────────────────────
+// build proxy: atlas.signals.n6.stats (single-line JSON) — size/line_count
+// 본 파일은 단일 스냅샷이므로 mean=ewma=현재값, samples=1.
+struct BuildSig {
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    residual_std: f64,
+    nodes_total: f64,
+    size_kb: f64
+}
+
+fn extract_build() -> BuildSig {
+    let path = N6 + "/atlas.signals.n6.stats"
+    if file_exists(path) == false {
+        return BuildSig {
+            mean_cost: 0.0, ewma_cost: 0.0, samples: 0, residual_std: 0.0,
+            nodes_total: 0.0, size_kb: 0.0
+        }
+    }
+    let body = _str(read_file(path))
+    let signals_total = json_num(body, "signals_total")
+    let line_count = json_num(body, "line_count")
+    let size = json_num(body, "size")
+    // build cost proxy: (line_count + signals_total) / 100  → 분 단위 가상 비용
+    let cost_proxy = (line_count + signals_total) / 100.0
+    let size_kb = size / 1024.0
+    return BuildSig {
+        mean_cost: cost_proxy,
+        ewma_cost: cost_proxy,
+        samples: 1,
+        residual_std: 0.0,
+        nodes_total: signals_total,
+        size_kb: size_kb
+    }
+}
+
+// exp proxy: growth_tick_log.jsonl — kind 분류
+// cost = age (note 의 age=N), p_success = (kind=tick_ok / 전체)
+struct ExpSig {
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    residual_std: f64,
+    p_success_mean: f64
+}
+
+fn _extract_age(note: string) -> f64 {
+    // note 예: "age=151460 stale=0"  또는 "age=26 stale=0"
+    let key = "age="
+    let ki = _find_after(note, key, 0)
+    if ki < 0 { return 0.0 }
+    let mut i = ki + key.len()
+    let start = i
+    while i < note.len() {
+        let c = note.substring(i, i + 1)
+        if is_digit(c) { i = i + 1 } else { break }
+    }
+    if i == start { return 0.0 }
+    return _to_f64(note.substring(start, i))
+}
+
+fn extract_exp(window: i64) -> ExpSig {
+    let path = HARNESS + "/growth_tick_log.jsonl"
+    let lines = tail_lines(path, window)
+    if lines.len() == 0 {
+        return ExpSig { mean_cost: 0.0, ewma_cost: 0.0, samples: 0, residual_std: 0.0, p_success_mean: 0.0 }
+    }
+    let mut costs: [f64] = []
+    let mut ok_n: i64 = 0
+    let mut total: i64 = 0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        let kind = json_str(ln, "kind")
+        let note = json_str(ln, "note")
+        if kind != "" && kind != "init" {
+            total = total + 1
+            if kind == "tick_ok" || kind == "ok" { ok_n = ok_n + 1 }
+            let age = _extract_age(note)
+            // age 분 단위 변환 (sec→min)
+            costs = costs.push(age / 60.0)
+        }
+        i = i + 1
+    }
+    let s = compute_stats(costs, DEFAULT_ALPHA)
+    let p = if total > 0 { to_float(to_string(ok_n)) / to_float(to_string(total)) } else { 0.0 }
+    return ExpSig {
+        mean_cost: s.mean,
+        ewma_cost: s.ewma,
+        samples: s.samples,
+        residual_std: s.residual_std,
+        p_success_mean: p
+    }
+}
+
+// learn proxy: bt_keywords.jsonl — 일간 추가 count (b_t).
+// η = mean( 1 - b_cur/b_prev ).  단일 스냅샷이면 1 sample = total count.
+// 여기선 keyword 라인을 chunk 로 나누어 b_chunk 시계열 만든다 (window 단위).
+struct LearnSig {
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    residual_std: f64,
+    eta_ewma: f64
+}
+
+fn extract_learn(window: i64) -> LearnSig {
+    let path = BT + "/bt_keywords.jsonl"
+    let lines = tail_lines(path, 99999)
+    if lines.len() == 0 {
+        return LearnSig { mean_cost: 0.0, ewma_cost: 0.0, samples: 0, residual_std: 0.0, eta_ewma: 0.0 }
+    }
+    // 청크 크기: max(5, total/10) — η 시계열 만들기 위한 최소 분할
+    let total = lines.len()
+    let mut chunk: i64 = total / 10
+    if chunk < 5 { chunk = 5 }
+    if chunk < 1 { chunk = 1 }
+    // 각 청크의 keyword 카운트 (= chunk 자체 길이; uniform). 대신 line 길이 합을 cost 로.
+    let mut bs: [f64] = []
+    let mut costs: [f64] = []
+    let mut idx: i64 = 0
+    while idx < total {
+        let mut end = idx + chunk
+        if end > total { end = total }
+        let mut sum_len: i64 = 0
+        let mut j = idx
+        while j < end {
+            sum_len = sum_len + _str(lines[j]).len()
+            j = j + 1
+        }
+        let b_t = to_float(to_string(end - idx))
+        bs = bs.push(b_t)
+        // cost ≈ avg keyword line length / 10 (분 가상)
+        let avg = if (end - idx) > 0 { to_float(to_string(sum_len)) / to_float(to_string(end - idx)) } else { 0.0 }
+        costs = costs.push(avg / 10.0)
+        idx = end
+    }
+    // η_k = 1 - b_k / b_{k-1}
+    let mut etas: [f64] = []
+    let mut k: i64 = 1
+    while k < bs.len() {
+        let prev = bs[k - 1]
+        let cur = bs[k]
+        if prev > 0.0 {
+            let e = 1.0 - (cur / prev)
+            etas = etas.push(e)
+        }
+        k = k + 1
+    }
+    let cs = compute_stats(costs, DEFAULT_ALPHA)
+    let es = compute_stats(etas, DEFAULT_ALPHA)
+    // window 적용: 마지막 N 청크만으로 stats 재계산 (필요시)
+    return LearnSig {
+        mean_cost: cs.mean,
+        ewma_cost: cs.ewma,
+        samples: cs.samples,
+        residual_std: cs.residual_std,
+        eta_ewma: es.ewma
+    }
+}
+
+// boot proxy: discovery/atlas_drift_log.jsonl → amortize_ratio = 1 / mean(gap).
+// 없으면 samples=0, null-equivalent (mean=0, ratio=0).
+struct BootSig {
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    residual_std: f64,
+    amortize_ratio: f64,
+    has_source: bool
+}
+
+fn extract_boot(window: i64) -> BootSig {
+    let path = DISCOVERY + "/atlas_drift_log.jsonl"
+    if file_exists(path) == false {
+        return BootSig {
+            mean_cost: 0.0, ewma_cost: 0.0, samples: 0,
+            residual_std: 0.0, amortize_ratio: 0.0, has_source: false
+        }
+    }
+    let lines = tail_lines(path, window)
+    if lines.len() == 0 {
+        return BootSig {
+            mean_cost: 0.0, ewma_cost: 0.0, samples: 0,
+            residual_std: 0.0, amortize_ratio: 0.0, has_source: true
+        }
+    }
+    // ts 차이로 gap 계산
+    let mut prev_ts: f64 = 0.0
+    let mut gaps: [f64] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        // ts 가 epoch (숫자) 또는 ISO 일 수 있음. 숫자 우선 시도.
+        let ts_n = json_num(ln, "ts")
+        if ts_n > 0.0 && prev_ts > 0.0 {
+            let g = ts_n - prev_ts
+            if g > 0.0 { gaps = gaps.push(g / 60.0) }  // sec → min
+        }
+        if ts_n > 0.0 { prev_ts = ts_n }
+        i = i + 1
+    }
+    let s = compute_stats(gaps, DEFAULT_ALPHA)
+    let amort = if s.mean > 0.0 { 1.0 / s.mean } else { 0.0 }
+    return BootSig {
+        mean_cost: s.mean,
+        ewma_cost: s.ewma,
+        samples: s.samples,
+        residual_std: s.residual_std,
+        amortize_ratio: amort,
+        has_source: true
+    }
+}
+
+// verify proxy: roadmap_sync.jsonl → result=ok 비율 + channel_cap_est = 1 / mean_cost
+// cost = ts gap (분) — 두 sync event 사이 시간.
+struct VerifySig {
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    residual_std: f64,
+    p_success_mean: f64,
+    channel_cap_est: f64
+}
+
+// ISO ts → epoch sec (date 명령 위임). 실패 시 0.
+fn _iso_to_epoch(iso: string) -> f64 {
+    if iso.len() == 0 { return 0.0 }
+    // mac date 와 gnu date 둘다 -d/-j 차이 — 간단히 date -j -f 시도
+    let safe = iso.replace("'", "")
+    let cmd = "date -j -u -f '%Y-%m-%dT%H:%M:%SZ' '" + safe + "' +%s 2>/dev/null || date -u -d '" + safe + "' +%s 2>/dev/null"
+    let out = _str(exec(cmd)).trim()  // @allow-bare-exec
+    return _to_f64(out)
+}
+
+fn extract_verify(window: i64) -> VerifySig {
+    let path = HARNESS + "/roadmap_sync.jsonl"
+    let lines = tail_lines(path, window)
+    if lines.len() == 0 {
+        return VerifySig {
+            mean_cost: 0.0, ewma_cost: 0.0, samples: 0, residual_std: 0.0,
+            p_success_mean: 0.0, channel_cap_est: 0.0
+        }
+    }
+    let mut ok_n: i64 = 0
+    let mut total: i64 = 0
+    let mut prev_ep: f64 = 0.0
+    let mut gaps: [f64] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        let result = json_str(ln, "result")
+        let ts = json_str(ln, "ts")
+        if result != "" {
+            total = total + 1
+            if result == "ok" { ok_n = ok_n + 1 }
+        }
+        if ts.len() > 0 {
+            let ep = _iso_to_epoch(ts)
+            if ep > 0.0 && prev_ep > 0.0 {
+                let g = ep - prev_ep
+                if g > 0.0 { gaps = gaps.push(g / 60.0) }
+            }
+            if ep > 0.0 { prev_ep = ep }
+        }
+        i = i + 1
+    }
+    let s = compute_stats(gaps, DEFAULT_ALPHA)
+    let p = if total > 0 { to_float(to_string(ok_n)) / to_float(to_string(total)) } else { 0.0 }
+    let cap = if s.mean > 0.0 { 1.0 / s.mean } else { 0.0 }
+    return VerifySig {
+        mean_cost: s.mean,
+        ewma_cost: s.ewma,
+        samples: s.samples,
+        residual_std: s.residual_std,
+        p_success_mean: p,
+        channel_cap_est: cap
+    }
+}
+
+// ── render JSON output ────────────────────────────────────────────────────
+fn render_calibration(window: i64, b: BuildSig, e: ExpSig, l: LearnSig, bo: BootSig, v: VerifySig) -> string {
+    let ts = _ts_iso()
+    let alpha_s = fmt_f4(DEFAULT_ALPHA)
+
+    let build_blk = "    \"build\": { \"mean_cost\": " + fmt_f4(b.mean_cost)
+        + ", \"ewma_cost\": " + fmt_f4(b.ewma_cost)
+        + ", \"samples\": " + to_string(b.samples)
+        + ", \"alpha\": " + alpha_s
+        + ", \"residual_std\": " + fmt_f4(b.residual_std)
+        + ", \"nodes_total\": " + fmt_f4(b.nodes_total)
+        + ", \"size_kb\": " + fmt_f4(b.size_kb) + " }"
+
+    let exp_blk = "    \"exp\":   { \"mean_cost\": " + fmt_f4(e.mean_cost)
+        + ", \"ewma_cost\": " + fmt_f4(e.ewma_cost)
+        + ", \"samples\": " + to_string(e.samples)
+        + ", \"alpha\": " + alpha_s
+        + ", \"residual_std\": " + fmt_f4(e.residual_std)
+        + ", \"p_success_mean\": " + fmt_f4(e.p_success_mean) + " }"
+
+    let learn_blk = "    \"learn\": { \"mean_cost\": " + fmt_f4(l.mean_cost)
+        + ", \"ewma_cost\": " + fmt_f4(l.ewma_cost)
+        + ", \"samples\": " + to_string(l.samples)
+        + ", \"alpha\": " + alpha_s
+        + ", \"residual_std\": " + fmt_f4(l.residual_std)
+        + ", \"eta_ewma\": " + fmt_f4(l.eta_ewma) + " }"
+
+    let amort_v = if bo.has_source { fmt_f4(bo.amortize_ratio) } else { "null" }
+    let mean_v = if bo.has_source { fmt_f4(bo.mean_cost) } else { "null" }
+    let ewma_v = if bo.has_source { fmt_f4(bo.ewma_cost) } else { "null" }
+    let std_v = if bo.has_source { fmt_f4(bo.residual_std) } else { "null" }
+
+    let boot_blk = "    \"boot\":  { \"mean_cost\": " + mean_v
+        + ", \"ewma_cost\": " + ewma_v
+        + ", \"samples\": " + to_string(bo.samples)
+        + ", \"alpha\": " + alpha_s
+        + ", \"residual_std\": " + std_v
+        + ", \"amortize_ratio\": " + amort_v
+        + ", \"has_source\": " + to_string(bo.has_source) + " }"
+
+    let verify_blk = "    \"verify\": { \"mean_cost\": " + fmt_f4(v.mean_cost)
+        + ", \"ewma_cost\": " + fmt_f4(v.ewma_cost)
+        + ", \"samples\": " + to_string(v.samples)
+        + ", \"alpha\": " + alpha_s
+        + ", \"residual_std\": " + fmt_f4(v.residual_std)
+        + ", \"p_success_mean\": " + fmt_f4(v.p_success_mean)
+        + ", \"channel_cap_est\": " + fmt_f4(v.channel_cap_est) + " }"
+
+    let sources = "[\"atlas.signals.n6.stats\", \"growth_tick_log.jsonl\", \"bt_keywords.jsonl\", \"atlas_drift_log.jsonl\", \"roadmap_sync.jsonl\"]"
+
+    let body = "{\n  \"updated\": \"" + escape_json(ts) + "\",\n"
+        + "  \"window\": " + to_string(window) + ",\n"
+        + "  \"alpha\": " + alpha_s + ",\n"
+        + "  \"ntypes\": {\n"
+        + build_blk + ",\n"
+        + exp_blk + ",\n"
+        + learn_blk + ",\n"
+        + boot_blk + ",\n"
+        + verify_blk + "\n"
+        + "  },\n"
+        + "  \"source_files\": " + sources + "\n"
+        + "}\n"
+    return body
+}
+
+// ── calibrate command ─────────────────────────────────────────────────────
+fn cmd_calibrate(window: i64) -> i64 {
+    let b = extract_build()
+    let e = extract_exp(window)
+    let l = extract_learn(window)
+    let bo = extract_boot(window)
+    let v = extract_verify(window)
+    let json_body = render_calibration(window, b, e, l, bo, v)
+    let _ = exec("mkdir -p '" + HARNESS + "' 2>/dev/null")  // @allow-bare-exec
+    try { write_file(CALIB_PATH, json_body) } catch err {
+        eprintln("REJECT: write_file failed: " + CALIB_PATH)
+        return 1
+    }
+    let total_samples = b.samples + e.samples + l.samples + bo.samples + v.samples
+    println("[calibrate] OK window=" + to_string(window)
+        + " total_samples=" + to_string(total_samples)
+        + " out=" + CALIB_PATH)
+    return 0
+}
+
+// ── query command ────────────────────────────────────────────────────────
+fn cmd_query(ntype: string) -> i64 {
+    if file_exists(CALIB_PATH) == false {
+        eprintln("REJECT: calibration file not found — run `calibrate` first: " + CALIB_PATH)
+        return 1
+    }
+    let body = _str(read_file(CALIB_PATH))
+    if body.len() == 0 {
+        eprintln("REJECT: empty calibration file")
+        return 1
+    }
+    // 해당 ntype 블록만 추출 ("ntype": { ... })
+    let key = "\"" + ntype + "\""
+    let ki = _find_after(body, key, 0)
+    if ki < 0 {
+        eprintln("REJECT: ntype not found: " + ntype)
+        return 1
+    }
+    // brace match
+    let mut bi = ki
+    while bi < body.len() && body.substring(bi, bi + 1) != "{" { bi = bi + 1 }
+    if bi >= body.len() {
+        eprintln("REJECT: ntype block malformed")
+        return 1
+    }
+    let mut depth: i64 = 0
+    let mut end = bi
+    while end < body.len() {
+        let c = body.substring(end, end + 1)
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+        end = end + 1
+    }
+    let blk = body.substring(bi, end)
+    let updated = json_str(body, "updated")
+    println("ntype=" + ntype)
+    println("  mean_cost: " + fmt_f4(json_num(blk, "mean_cost")))
+    println("  ewma_cost: " + fmt_f4(json_num(blk, "ewma_cost")))
+    println("  samples:   " + to_string(_f_floor_to_i(json_num(blk, "samples"))))
+    println("  last_update: " + updated)
+    return 0
+}
+
+// ── selftest ──────────────────────────────────────────────────────────────
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    let d = a - b
+    let abs_d = if d < 0.0 { 0.0 - d } else { d }
+    return abs_d <= tol
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_signals.hexa")
+    // 1) compute_stats — known input
+    let xs: [f64] = [10.0, 12.0, 11.0, 13.0, 14.0]
+    let s = compute_stats(xs, 0.2)
+    // mean = 60/5 = 12.0
+    if approx_eq(s.mean, 12.0, 0.001) == false {
+        eprintln("[selftest] FAIL: mean expected 12.0 got " + fmt_f4(s.mean))
+        return 1
+    }
+    // ewma manual: e0=10, e1=0.2*12+0.8*10=10.4, e2=0.2*11+0.8*10.4=10.52,
+    //              e3=0.2*13+0.8*10.52=11.016, e4=0.2*14+0.8*11.016=11.6128
+    if approx_eq(s.ewma, 11.6128, 0.001) == false {
+        eprintln("[selftest] FAIL: ewma expected 11.6128 got " + fmt_f4(s.ewma))
+        return 1
+    }
+    if s.samples != 5 {
+        eprintln("[selftest] FAIL: samples expected 5 got " + to_string(s.samples))
+        return 1
+    }
+    println("[selftest]   compute_stats: mean=" + fmt_f4(s.mean) + " ewma=" + fmt_f4(s.ewma)
+        + " std=" + fmt_f4(s.residual_std) + " n=" + to_string(s.samples) + " — OK")
+
+    // 2) tail_lines — temp file with 7 lines, window=3 → last 3
+    let tmp = "/tmp/roadmap_signals_selftest.jsonl"
+    let _ = exec("rm -f " + tmp)  // @allow-bare-exec
+    let payload = "a\nb\nc\nd\ne\nf\ng\n"
+    try { write_file(tmp, payload) } catch e {
+        eprintln("[selftest] FAIL: cannot write tmp: " + tmp)
+        return 1
+    }
+    let last3 = tail_lines(tmp, 3)
+    if last3.len() != 3 || _str(last3[0]) != "e" || _str(last3[2]) != "g" {
+        eprintln("[selftest] FAIL: tail_lines window=3 mismatch")
+        return 1
+    }
+    println("[selftest]   tail_lines: last3=[e,f,g] — OK")
+
+    // 3) json_str / json_num — synthetic
+    let row = "{\"ts\":\"2026-04-16T01:00:00Z\",\"kind\":\"tick_ok\",\"note\":\"age=42 stale=0\",\"score\":0.73}"
+    if json_str(row, "kind") != "tick_ok" {
+        eprintln("[selftest] FAIL: json_str kind mismatch: " + json_str(row, "kind"))
+        return 1
+    }
+    let sc = json_num(row, "score")
+    if approx_eq(sc, 0.73, 0.001) == false {
+        eprintln("[selftest] FAIL: json_num score mismatch: " + fmt_f4(sc))
+        return 1
+    }
+    let age = _extract_age(json_str(row, "note"))
+    if approx_eq(age, 42.0, 0.001) == false {
+        eprintln("[selftest] FAIL: _extract_age mismatch: " + fmt_f4(age))
+        return 1
+    }
+    println("[selftest]   json_str/num/extract_age — OK")
+
+    // 4) end-to-end calibrate + query (smoke)
+    let r = cmd_calibrate(20)
+    if r != 0 {
+        eprintln("[selftest] FAIL: cmd_calibrate non-zero")
+        return 1
+    }
+    if file_exists(CALIB_PATH) == false {
+        eprintln("[selftest] FAIL: calibration file not produced")
+        return 1
+    }
+    let body = _str(read_file(CALIB_PATH))
+    if body.len() < 100 {
+        eprintln("[selftest] FAIL: calibration too small: " + to_string(body.len()))
+        return 1
+    }
+    if body.len() > 102400 {
+        eprintln("[selftest] FAIL: calibration > 100KB: " + to_string(body.len()))
+        return 1
+    }
+    if json_str(body, "updated") == "" {
+        eprintln("[selftest] FAIL: missing updated")
+        return 1
+    }
+    println("[selftest]   calibrate produced " + to_string(body.len()) + " bytes")
+
+    let q = cmd_query("exp")
+    if q != 0 {
+        eprintln("[selftest] FAIL: cmd_query exp")
+        return 1
+    }
+    println("[selftest] OK — all 4 checks passed")
+    return 0
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        eprintln("usage: roadmap_signals.hexa <calibrate|query|--selftest> [args...]")
+        eprintln("  calibrate [--window=N]   — write " + CALIB_PATH)
+        eprintln("  query <ntype>            — print build|exp|learn|boot|verify summary")
+        eprintln("  --selftest               — internal sanity")
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let r = selftest()
+        exit(r)
+    }
+
+    if cmd == "calibrate" {
+        let mut window: i64 = 100
+        let mut k: i64 = 1
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg.starts_with("--window=") {
+                let s = arg.substring(9, arg.len())
+                let n = to_int(s)
+                if n > 0 { window = n }
+            }
+            else if arg.starts_with("--") {
+                eprintln("WARN: unknown flag: " + arg)
+            }
+            k = k + 1
+        }
+        let r = cmd_calibrate(window)
+        exit(r)
+    }
+
+    if cmd == "query" {
+        if a.len() < 2 {
+            eprintln("usage: roadmap_signals.hexa query <ntype>")
+            exit(2)
+        }
+        let ntype = _str(a[1])
+        let r = cmd_query(ntype)
+        exit(r)
+    }
+
+    eprintln("REJECT: unknown command: " + cmd)
+    exit(2)
+}
+
+main()

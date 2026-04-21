@@ -1,0 +1,1457 @@
+// roadmap_cli.hexa — multi-roadmap dashboard + safe state-mutation CLI
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_engine.hexa 가 단일 로드맵 plan/watch/dispatch 만 제공하는 한계 보강.
+//   shared/roadmaps/*.json 전체를 스캔하여 dashboard + 상태 변경 CLI 제공.
+//
+//   roadmap_engine 의 schedule()/render_flowchart() 는 engine_v1 (flat nodes[]) 만
+//   처리. 본 CLI 는 두 포맷(engine_v1 + 3-track phases) 양쪽에서 동작:
+//     - engine_v1   nodes[] 평면 노드. roadmap_engine.hexa 위임 가능.
+//     - 3-track    phases[].parallel[].tasks[]  → 평탄화하여 tasks 를 노드처럼 처리.
+//
+//   상태 변경(abort/resume/mark)은 raw JSON body 를 substring 교체로 진행
+//   (parse → mutate → serialize 왕복 회피).  변경 전 .bak.<ts> 자동 생성 +
+//   roadmap_cli_log.jsonl 에 기록.
+//
+// CLI
+//   hexa run roadmap_cli.hexa list
+//   hexa run roadmap_cli.hexa status <rm>
+//   hexa run roadmap_cli.hexa abort   <rm> <node_id> [--cascade]
+//   hexa run roadmap_cli.hexa resume  <rm> <node_id>
+//   hexa run roadmap_cli.hexa mark    <rm> <node_id> <status>
+//   hexa run roadmap_cli.hexa replan  <rm> [--apply]
+//   hexa run roadmap_cli.hexa explain <rm> <node_id>
+//   hexa run roadmap_cli.hexa --selftest
+//
+// exit: 0 ok / 1 mutation fail / 2 usage / 3 parse error
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let LOG_PATH = HARNESS + "/roadmap_cli_log.jsonl"
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _i_of(x) -> i64 {
+    let t = type_of(x)
+    if t == "i64" || t == "int" { return x }
+    return 0
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn _ts_compact() -> string {
+    return _str(exec("date -u +%Y%m%d_%H%M%S")).trim()  // @allow-bare-exec
+}
+
+// last-index-of (hexa stage1 lacks rfind on string)
+fn _rfind(hay: string, needle: string) -> i64 {
+    let nl = needle.len()
+    if nl == 0 { return -1 }
+    let mut i = hay.len() - nl
+    while i >= 0 {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// pad right to width w
+fn pad_r(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = r + " " }
+    return r
+}
+
+fn pad_l(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = " " + r }
+    return r
+}
+
+// ── JSON text helpers (no real parser; substring scanning) ──────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── object-block split (handles "nodes" or "tasks" arrays of objects) ───
+// Robust: skips occurrences whose value is not an array (e.g. "phases": 18 in _meta)
+// by retrying past the bad match.
+fn _key_array_pos(body: string, key: string) -> i64 {
+    // returns position of '[' for "key": [ ... ] OR -1
+    let tag = "\"" + key + "\""
+    let mut from: i64 = 0
+    while from < body.len() {
+        let ti = _find_after(body, tag, from)
+        if ti < 0 { return -1 }
+        let mut i = ti + tag.len()
+        // require ':' after possible whitespace
+        while i < body.len() {
+            let c = body.substring(i, i + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+            else { break }
+        }
+        if i < body.len() && body.substring(i, i + 1) == ":" {
+            i = i + 1
+            while i < body.len() {
+                let c = body.substring(i, i + 1)
+                if c == " " || c == "\t" || c == "\n" || c == "\r" { i = i + 1 }
+                else { break }
+            }
+            if i < body.len() && body.substring(i, i + 1) == "[" {
+                return i
+            }
+        }
+        from = ti + tag.len()
+    }
+    return -1
+}
+
+fn split_objects(body: string, key: string) -> [string] {
+    let lb = _key_array_pos(body, key)
+    if lb < 0 { return [] }
+    let mut i = lb + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── unified Node abstraction (engine_v1 nodes OR phase tasks) ───────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64,
+    phase: string         // empty for engine_v1; phase id (e.g. "P0") for 3-track
+}
+
+fn parse_engine_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { f_to_i(nu) }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps, soft_deps: soft,
+        status: st, progress: pg, phase: ""
+    }
+}
+
+fn parse_task_node(raw: string, phase_id: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "task")
+    if name == "" { name = json_str(raw, "name") }
+    if name == "" { name = id }
+    let deps = json_str_array(raw, "depends_on")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    return Node {
+        id: id, name: name, ntype: "build",
+        cost: 1.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: deps, soft_deps: [],
+        status: st, progress: 0.0, phase: phase_id
+    }
+}
+
+struct Roadmap {
+    id: string,
+    file: string,
+    goal: string,
+    start: string,
+    K_target: f64,
+    C_channel: f64,
+    updated: string,
+    description: string,
+    schema: string,        // "engine_v1" | "tracks_phases" | "unknown"
+    nodes: [Node],
+    body: string           // raw JSON kept for mutation
+}
+
+// detect schema by signature (must be an array, not a scalar count)
+fn detect_schema(body: string) -> string {
+    let has_phases = _key_array_pos(body, "phases") >= 0
+    let has_nodes  = _key_array_pos(body, "nodes")  >= 0
+    let has_tracks = _find_after(body, "\"tracks\"", 0) >= 0
+    if has_phases && has_tracks { return "tracks_phases" }
+    if has_nodes  { return "engine_v1" }
+    if has_phases { return "tracks_phases" }
+    return "unknown"
+}
+
+// extract _meta block
+fn extract_meta(body: string) -> string {
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    if meta_idx < 0 { return "" }
+    let mut mi = meta_idx
+    while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+    if mi >= body.len() { return "" }
+    let start = mi
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut end = mi
+    while end < body.len() {
+        let c = body.substring(end, end + 1)
+        if in_str {
+            if c == "\\" { end = end + 2; continue }
+            if c == "\"" { in_str = false }
+            end = end + 1
+            continue
+        }
+        if c == "\"" { in_str = true; end = end + 1; continue }
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+        end = end + 1
+    }
+    return body.substring(start, end)
+}
+
+// extract phases blocks (each phase object) → return list of (phase_id, phase_body)
+fn split_phases(body: string) -> [string] {
+    return split_objects(body, "phases")
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    let meta_body = extract_meta(body)
+    let mut rid = json_str(meta_body, "id")
+    if rid == "" { rid = json_str(meta_body, "project") }
+    if rid == "" { rid = json_str(meta_body, "name") }
+    let goal = json_str(meta_body, "goal")
+    let start = json_str(meta_body, "start")
+    let K = json_num(meta_body, "K_target")
+    let C = json_num(meta_body, "C_channel")
+    let updated = json_str(meta_body, "updated")
+    let desc = json_str(meta_body, "description")
+    let schema = detect_schema(body)
+
+    let mut nodes: [Node] = []
+    if schema == "engine_v1" {
+        let blocks = split_objects(body, "nodes")
+        let mut i: i64 = 0
+        while i < blocks.len() {
+            let n = parse_engine_node(_str(blocks[i]))
+            if n.id.len() > 0 { nodes = nodes.push(n) }
+            i = i + 1
+        }
+    } else if schema == "tracks_phases" {
+        // for each phase object, look for parallel[].tasks[] OR direct tasks
+        let phase_blocks = split_phases(body)
+        let mut pi: i64 = 0
+        while pi < phase_blocks.len() {
+            let pb = _str(phase_blocks[pi])
+            let phase_id = json_str(pb, "id")
+            // tasks[] under each parallel[] entry
+            let parallels = split_objects(pb, "parallel")
+            if parallels.len() > 0 {
+                let mut qi: i64 = 0
+                while qi < parallels.len() {
+                    let qb = _str(parallels[qi])
+                    let task_blocks = split_objects(qb, "tasks")
+                    let mut ti: i64 = 0
+                    while ti < task_blocks.len() {
+                        let n = parse_task_node(_str(task_blocks[ti]), phase_id)
+                        if n.id.len() > 0 { nodes = nodes.push(n) }
+                        ti = ti + 1
+                    }
+                    qi = qi + 1
+                }
+            } else {
+                // phase itself may have tasks[] (rare)
+                let task_blocks = split_objects(pb, "tasks")
+                let mut ti: i64 = 0
+                while ti < task_blocks.len() {
+                    let n = parse_task_node(_str(task_blocks[ti]), phase_id)
+                    if n.id.len() > 0 { nodes = nodes.push(n) }
+                    ti = ti + 1
+                }
+            }
+            pi = pi + 1
+        }
+    }
+
+    return Roadmap {
+        id: rid, file: path, goal: goal, start: start,
+        K_target: K, C_channel: C, updated: updated, description: desc,
+        schema: schema, nodes: nodes, body: body
+    }
+}
+
+// ── status helpers ───────────────────────────────────────────────────────
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn effective_cost(n: Node, K: f64, C: f64) -> f64 {
+    let t = n.ntype
+    if t == "seed" { return 0.0 }
+    if t == "goal" { return n.cost }
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        return n.cost / p
+    }
+    if t == "learn" {
+        let e = if n.eta < 0.0 { 0.0 } else { n.eta }
+        let f = 1.0 - e
+        return n.cost * f
+    }
+    if t == "boot" {
+        let nu = if n.n_uses < 1 { 1 } else { n.n_uses }
+        return n.cost / to_float(to_string(nu))
+    }
+    if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let c = if C <= 0.0 { 1.0 } else { C }
+        return (k / c) + (n.cost * 0.25)
+    }
+    return n.cost
+}
+
+fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+    if is_done(n.status) { return 0.0 }
+    let c = effective_cost(n, K, C)
+    if n.status == "in_progress" {
+        let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+        return c * (1.0 - p)
+    }
+    return c
+}
+
+fn children_of(nodes: [Node], nid: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        let mut j: i64 = 0
+        while j < n.deps.len() {
+            if _str(n.deps[j]) == nid { out = out.push(n.id); break }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn vstar_at(nodes: [Node], nid: string, K: f64, C: f64, depth: i64) -> f64 {
+    if depth > 256 { return 0.0 }
+    let ni = idx_of(nodes, nid)
+    if ni < 0 { return 0.0 }
+    let n = nodes[ni]
+    let self_cost = remaining_cost(n, K, C)
+    let kids = children_of(nodes, nid)
+    let mut best: f64 = 0.0
+    let mut ci: i64 = 0
+    while ci < kids.len() {
+        let v = vstar_at(nodes, _str(kids[ci]), K, C, depth + 1)
+        if v > best { best = v }
+        ci = ci + 1
+    }
+    return self_cost + best
+}
+
+// ── compact schedule summary (ratio + buckets) ──────────────────────────
+struct Summary {
+    nodes: i64,
+    done: i64,
+    inp: i64,
+    ready: i64,
+    todo: i64,
+    blocked: i64,
+    eta: f64,
+    t_star: f64,
+    status: string
+}
+
+fn summarize(rm: Roadmap) -> Summary {
+    let K = rm.K_target
+    let C = rm.C_channel
+    let nodes = rm.nodes
+    let mut done_n: i64 = 0
+    let mut inp_n: i64 = 0
+    let mut ready_n: i64 = 0
+    let mut todo_n: i64 = 0
+    let mut blocked_n: i64 = 0
+    let mut sum_done_cost: f64 = 0.0
+    let mut cnt_done_cost: f64 = 0.0
+    let mut bn_cost: f64 = -1.0
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        if is_done(n.status) {
+            done_n = done_n + 1
+            let c = effective_cost(n, K, C)
+            if c > 0.0 { sum_done_cost = sum_done_cost + c; cnt_done_cost = cnt_done_cost + 1.0 }
+        }
+        else if n.status == "in_progress" {
+            inp_n = inp_n + 1
+            let c = remaining_cost(n, K, C)
+            if c > bn_cost { bn_cost = c }
+        }
+        else if n.status == "blocked" || n.status == "failed" { blocked_n = blocked_n + 1 }
+        else { todo_n = todo_n + 1 }
+        if n.status == "todo" || n.status == "planned" {
+            let mut all_done: bool = true
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let pi = idx_of(nodes, _str(n.deps[j]))
+                if pi < 0 { all_done = false; break }
+                if is_done(nodes[pi].status) == false { all_done = false; break }
+                j = j + 1
+            }
+            if all_done {
+                ready_n = ready_n + 1
+                let c = remaining_cost(n, K, C)
+                if c > bn_cost { bn_cost = c }
+            }
+        }
+        i = i + 1
+    }
+
+    let mut eta: f64 = 0.0
+    if cnt_done_cost > 0.0 && bn_cost > 0.0 {
+        let avg = sum_done_cost / cnt_done_cost
+        if avg > 0.0 { eta = 1.0 - (bn_cost / avg) }
+    }
+
+    // T*: critical path from start (engine_v1) or from any indeg=0 node max
+    let mut t: f64 = 0.0
+    let mut start_id = rm.start
+    if start_id == "" {
+        let mut k: i64 = 0
+        while k < nodes.len() {
+            if nodes[k].deps.len() == 0 {
+                let v = vstar_at(nodes, nodes[k].id, K, C, 0)
+                if v > t { t = v }
+                if start_id == "" { start_id = nodes[k].id }
+            }
+            k = k + 1
+        }
+    } else {
+        t = vstar_at(nodes, start_id, K, C, 0)
+    }
+
+    let mut status = "active"
+    if nodes.len() == 0 { status = "empty" }
+    else if done_n == nodes.len() { status = "complete" }
+    else if blocked_n > 0 && (inp_n + ready_n) == 0 { status = "blocked" }
+    else if (inp_n + ready_n) == 0 && todo_n > 0 { status = "stalled" }
+
+    return Summary {
+        nodes: nodes.len(), done: done_n, inp: inp_n,
+        ready: ready_n, todo: todo_n, blocked: blocked_n,
+        eta: eta, t_star: t, status: status
+    }
+}
+
+// ── format helpers ─────────────────────────────────────────────────────
+fn fmt_min(x: f64) -> string {
+    let scaled = x * 10.0
+    let r = f_to_i(scaled + 0.5)
+    let whole = r / 10
+    let frac = r - (whole * 10)
+    if frac == 0 { return to_string(whole) + "m" }
+    return to_string(whole) + "." + to_string(frac) + "m"
+}
+
+fn fmt_eta(e: f64) -> string {
+    let sign = if e < 0.0 { "-" } else { "+" }
+    let v = if e < 0.0 { 0.0 - e } else { e }
+    let scaled = (v * 100.0) + 0.5
+    let r = f_to_i(scaled)
+    let whole = r / 100
+    let frac = r - (whole * 100)
+    let mut fs = to_string(frac)
+    if frac < 10 { fs = "0" + fs }
+    return sign + to_string(whole) + "." + fs
+}
+
+fn pct(f: f64) -> string {
+    let r = f_to_i((f * 100.0) + 0.5)
+    return to_string(r) + "%"
+}
+
+// ── enumerate roadmap files (excludes .bak.*) ───────────────────────────
+fn list_roadmap_files() -> [string] {
+    let raw = _str(exec("ls " + ROADMAPS + "/*.json 2>/dev/null"))  // @allow-bare-exec
+    let lines = raw.split("\n")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let f = _str(lines[i]).trim()
+        if f.len() == 0 { i = i + 1; continue }
+        // skip backups & schema files
+        if f.contains(".bak") { i = i + 1; continue }
+        if f.ends_with("/SCHEMA.json") { i = i + 1; continue }
+        if f.ends_with("/engine_schema.json") { i = i + 1; continue }
+        out = out.push(f)
+        i = i + 1
+    }
+    return out
+}
+
+// derive short id from path (basename minus .json)
+fn rm_short(path: string) -> string {
+    let last = _rfind(path, "/")
+    let base = if last >= 0 { path.substring(last + 1, path.len()) } else { path }
+    if base.ends_with(".json") {
+        return base.substring(0, base.len() - 5)
+    }
+    return base
+}
+
+// ── list command ───────────────────────────────────────────────────────
+struct Row {
+    id: string,
+    sm: Summary,
+    ratio: f64
+}
+
+fn cmd_list() -> i64 {
+    let files = list_roadmap_files()
+    if files.len() == 0 {
+        eprintln("REJECT: no roadmaps under " + ROADMAPS)
+        return 1
+    }
+    let mut rows: [Row] = []
+    let mut i: i64 = 0
+    while i < files.len() {
+        let path = _str(files[i])
+        let rm = load_roadmap(path)
+        let sm = summarize(rm)
+        let mut ratio: f64 = 0.0
+        if sm.nodes > 0 {
+            ratio = to_float(to_string(sm.done)) / to_float(to_string(sm.nodes))
+        }
+        let id = rm_short(path)
+        rows = rows.push(Row { id: id, sm: sm, ratio: ratio })
+        i = i + 1
+    }
+    // sort by ratio desc (insertion sort — list small)
+    let mut sorted: [Row] = []
+    let mut k: i64 = 0
+    while k < rows.len() {
+        let r = rows[k]
+        let mut inserted: bool = false
+        let mut j: i64 = 0
+        let mut acc: [Row] = []
+        while j < sorted.len() {
+            let s = sorted[j]
+            if inserted == false && r.ratio > s.ratio {
+                acc = acc.push(r)
+                inserted = true
+            }
+            acc = acc.push(s)
+            j = j + 1
+        }
+        if inserted == false { acc = acc.push(r) }
+        sorted = acc
+        k = k + 1
+    }
+    // print header
+    println(pad_r("ID", 18) + pad_l("NODES", 7) + pad_l("DONE", 6) + pad_l("INP", 5) + pad_l("READY", 7) + pad_l("TODO", 6) + pad_l("BLOCK", 7) + "  " + pad_r("eta", 8) + pad_r("T*", 10) + "status")
+    println("─────────────────────────────────────────────────────────────────────────────────────")
+    let mut p: i64 = 0
+    while p < sorted.len() {
+        let r = sorted[p]
+        let line = pad_r(r.id, 18)
+            + pad_l(to_string(r.sm.nodes), 7)
+            + pad_l(to_string(r.sm.done), 6)
+            + pad_l(to_string(r.sm.inp), 5)
+            + pad_l(to_string(r.sm.ready), 7)
+            + pad_l(to_string(r.sm.todo), 6)
+            + pad_l(to_string(r.sm.blocked), 7)
+            + "  "
+            + pad_r(fmt_eta(r.sm.eta), 8)
+            + pad_r(fmt_min(r.sm.t_star), 10)
+            + r.sm.status
+        println(line)
+        p = p + 1
+    }
+    return 0
+}
+
+// ── status command ─────────────────────────────────────────────────────
+fn resolve_path(rm_name: string) -> string {
+    if rm_name.contains("/") { return rm_name }
+    let p1 = ROADMAPS + "/" + rm_name + ".json"
+    if file_exists(p1) { return p1 }
+    let p2 = ROADMAPS + "/" + rm_name
+    if file_exists(p2) { return p2 }
+    return p1
+}
+
+fn cmd_status(rm_name: string) -> i64 {
+    let path = resolve_path(rm_name)
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        return 3
+    }
+    let rm = load_roadmap(path)
+    let sm = summarize(rm)
+    if rm.schema == "engine_v1" {
+        // delegate to engine
+        let engine = HARNESS + "/roadmap_engine.hexa"
+        let hexa = NEXUS + "/bin/hexa"
+        let cmd = hexa + " run " + engine + " " + path + " 2>&1"
+        let out = _str(exec(cmd))  // @allow-bare-exec
+        print(out)
+    } else {
+        // 3-track phases — compact view
+        println("▼Roadmap (tracks_phases) " + rm.id + "  file=" + rm.file)
+        println("nodes=" + to_string(sm.nodes) + "  done=" + to_string(sm.done) + "  inp=" + to_string(sm.inp) + "  ready=" + to_string(sm.ready) + "  todo=" + to_string(sm.todo) + "  blocked=" + to_string(sm.blocked))
+        println("T*=" + fmt_min(sm.t_star) + "  eta=" + fmt_eta(sm.eta) + "  status=" + sm.status)
+        println("──────────────────────────────────────────")
+        // emit rows by phase
+        let mut cur_phase = ""
+        let mut i: i64 = 0
+        while i < rm.nodes.len() {
+            let n = rm.nodes[i]
+            if n.phase != cur_phase {
+                cur_phase = n.phase
+                println("[" + cur_phase + "]")
+            }
+            let mark = if is_done(n.status) { "●" }
+                else if n.status == "in_progress" { "▶" }
+                else if n.status == "blocked" || n.status == "failed" { "⊘" }
+                else { "○" }
+            let nm = if n.name.len() > 60 { n.name.substring(0, 57) + "..." } else { n.name }
+            println("  " + mark + " " + pad_r(n.id, 24) + " " + n.status + "  " + nm)
+            i = i + 1
+        }
+    }
+    println("")
+    println("updated: " + rm.updated + "  file: " + rm.file)
+    return 0
+}
+
+// ── snapshot helpers ────────────────────────────────────────────────────
+fn snapshot(path: string) -> string {
+    let ts = _ts_compact()
+    let bak = path + ".bak." + ts
+    let cmd = "cp -p '" + path + "' '" + bak + "' 2>&1"
+    let r = _str(exec(cmd))  // @allow-bare-exec
+    if r.len() > 0 && r.contains("cp:") { return "" }
+    return bak
+}
+
+fn escape_jsonl(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+fn log_change(rm_name: string, op: string, node_id: string, before: string, after: string, bak: string, file: string) {
+    let line = "{\"ts\":\"" + _ts_iso() + "\",\"rm\":\"" + escape_jsonl(rm_name) + "\",\"op\":\"" + escape_jsonl(op) + "\",\"node\":\"" + escape_jsonl(node_id) + "\",\"before\":\"" + escape_jsonl(before) + "\",\"after\":\"" + escape_jsonl(after) + "\",\"bak\":\"" + escape_jsonl(bak) + "\",\"file\":\"" + escape_jsonl(file) + "\"}"
+    append_file(LOG_PATH, line + "\n")
+}
+
+// ── locate node-block in raw body (returns [start, end] of object braces)
+// finds an object containing  "id":"<node_id>"  within an array context.
+fn find_node_block(body: string, node_id: string) -> [i64] {
+    // scan for "id":"<node_id>"  with quote semantics
+    let probe = "\"id\":"
+    let mut from: i64 = 0
+    while from < body.len() {
+        let pos = _find_after(body, probe, from)
+        if pos < 0 { return [-1, -1] }
+        // skip ws after
+        let mut j = pos + probe.len()
+        while j < body.len() {
+            let c = body.substring(j, j + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 }
+            else { break }
+        }
+        if j < body.len() && body.substring(j, j + 1) == "\"" {
+            let vstart = j + 1
+            let mut vend = vstart
+            while vend < body.len() {
+                let c = body.substring(vend, vend + 1)
+                if c == "\\" { vend = vend + 2; continue }
+                if c == "\"" { break }
+                vend = vend + 1
+            }
+            if vend < body.len() {
+                let val = body.substring(vstart, vend)
+                if val == node_id {
+                    // walk back to find enclosing '{'
+                    let mut depth: i64 = 1
+                    let mut bi = pos - 1
+                    while bi >= 0 {
+                        let c = body.substring(bi, bi + 1)
+                        if c == "}" { depth = depth + 1 }
+                        else if c == "{" { depth = depth - 1; if depth == 0 { break } }
+                        bi = bi - 1
+                    }
+                    if bi < 0 { return [-1, -1] }
+                    // walk forward to matching '}'
+                    let mut depth2: i64 = 1
+                    let mut ei = bi + 1
+                    let mut in_str: bool = false
+                    while ei < body.len() {
+                        let c = body.substring(ei, ei + 1)
+                        if in_str {
+                            if c == "\\" { ei = ei + 2; continue }
+                            if c == "\"" { in_str = false }
+                            ei = ei + 1
+                            continue
+                        }
+                        if c == "\"" { in_str = true; ei = ei + 1; continue }
+                        if c == "{" { depth2 = depth2 + 1 }
+                        else if c == "}" { depth2 = depth2 - 1; if depth2 == 0 { break } }
+                        ei = ei + 1
+                    }
+                    if ei >= body.len() { return [-1, -1] }
+                    return [bi, ei + 1]
+                }
+            }
+        }
+        from = pos + probe.len()
+    }
+    return [-1, -1]
+}
+
+// within a node block, replace status field value (or insert if absent)
+fn replace_status_in_block(block: string, new_status: string) -> [string] {
+    // returns [new_block, before_status]
+    let kp = "\"status\":"
+    let ki = _find_after(block, kp, 0)
+    if ki >= 0 {
+        let mut j = ki + kp.len()
+        while j < block.len() {
+            let c = block.substring(j, j + 1)
+            if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 }
+            else { break }
+        }
+        if j < block.len() && block.substring(j, j + 1) == "\"" {
+            let vstart = j + 1
+            let mut vend = vstart
+            while vend < block.len() {
+                let c = block.substring(vend, vend + 1)
+                if c == "\\" { vend = vend + 2; continue }
+                if c == "\"" { break }
+                vend = vend + 1
+            }
+            if vend < block.len() {
+                let before = block.substring(vstart, vend)
+                let new_block = block.substring(0, vstart) + new_status + block.substring(vend, block.len())
+                return [new_block, before]
+            }
+        }
+    }
+    // insert: place "status":"<new_status>", after first "id":"..." pair
+    let probe = "\"id\":"
+    let pi = _find_after(block, probe, 0)
+    if pi < 0 { return [block, "ABSENT"] }
+    let mut k = pi + probe.len()
+    while k < block.len() {
+        let c = block.substring(k, k + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { k = k + 1 }
+        else { break }
+    }
+    if k < block.len() && block.substring(k, k + 1) == "\"" {
+        let vs = k + 1
+        let mut ve = vs
+        while ve < block.len() {
+            let c = block.substring(ve, ve + 1)
+            if c == "\\" { ve = ve + 2; continue }
+            if c == "\"" { break }
+            ve = ve + 1
+        }
+        if ve < block.len() {
+            let after_quote = ve + 1
+            let insert = ", \"status\": \"" + new_status + "\""
+            let new_block = block.substring(0, after_quote) + insert + block.substring(after_quote, block.len())
+            return [new_block, "ABSENT"]
+        }
+    }
+    return [block, "ABSENT"]
+}
+
+// update _meta.updated in body (replaces or inserts)
+fn touch_updated(body: string) -> string {
+    let today = _str(exec("date -u +%Y-%m-%d")).trim()  // @allow-bare-exec
+    let kp = "\"updated\":"
+    let ki = _find_after(body, kp, 0)
+    if ki < 0 { return body }
+    let mut j = ki + kp.len()
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 }
+        else { break }
+    }
+    if j < body.len() && body.substring(j, j + 1) == "\"" {
+        let vstart = j + 1
+        let mut vend = vstart
+        while vend < body.len() {
+            let c = body.substring(vend, vend + 1)
+            if c == "\\" { vend = vend + 2; continue }
+            if c == "\"" { break }
+            vend = vend + 1
+        }
+        if vend < body.len() {
+            return body.substring(0, vstart) + today + body.substring(vend, body.len())
+        }
+    }
+    return body
+}
+
+// core mutation primitive: change one node's status
+fn apply_status_change(rm: Roadmap, node_id: string, new_status: string) -> [string] {
+    // returns [old_status, "OK" | error_string, new_body]
+    let span = find_node_block(rm.body, node_id)
+    if span[0] < 0 { return ["", "node not found: " + node_id, rm.body] }
+    let s = _i_of(span[0])
+    let e = _i_of(span[1])
+    let block = rm.body.substring(s, e)
+    let r = replace_status_in_block(block, new_status)
+    let new_block = _str(r[0])
+    let before = _str(r[1])
+    let new_body0 = rm.body.substring(0, s) + new_block + rm.body.substring(e, rm.body.len())
+    let new_body = touch_updated(new_body0)
+    return [before, "OK", new_body]
+}
+
+// ── mark / abort / resume CLI ───────────────────────────────────────────
+fn cmd_mark(rm_name: string, node_id: string, new_status: string, op_label: string) -> i64 {
+    let path = resolve_path(rm_name)
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        return 2
+    }
+    let rm = load_roadmap(path)
+    let r = apply_status_change(rm, node_id, new_status)
+    let before = _str(r[0])
+    let res = _str(r[1])
+    if res != "OK" {
+        eprintln("REJECT: " + res)
+        return 1
+    }
+    let new_body = _str(r[2])
+    let bak = snapshot(path)
+    if bak == "" {
+        eprintln("REJECT: snapshot failed")
+        return 1
+    }
+    try { write_file(path, new_body) } catch e {
+        eprintln("REJECT: write failed: " + e)
+        return 1
+    }
+    log_change(rm.id, op_label, node_id, before, new_status, bak, path)
+    println("OK: " + op_label + "  " + rm.id + "/" + node_id + "  " + before + " → " + new_status)
+    println("snapshot: " + bak)
+    return 0
+}
+
+fn cmd_abort(rm_name: string, node_id: string, cascade: bool) -> i64 {
+    let rc = cmd_mark(rm_name, node_id, "blocked", "abort")
+    if rc != 0 { return rc }
+    // cascade proposal/apply
+    let path = resolve_path(rm_name)
+    let rm = load_roadmap(path)
+    let kids = children_of(rm.nodes, node_id)
+    if kids.len() == 0 { return 0 }
+    if cascade {
+        let mut i: i64 = 0
+        while i < kids.len() {
+            let ki = _str(kids[i])
+            let r = cmd_mark(rm_name, ki, "blocked", "abort_cascade")
+            if r != 0 { eprintln("WARN: cascade fail on " + ki) }
+            i = i + 1
+        }
+    } else {
+        println("cascade candidates (children, not applied — pass --cascade):")
+        let mut i: i64 = 0
+        while i < kids.len() {
+            println("  · " + _str(kids[i]))
+            i = i + 1
+        }
+    }
+    return 0
+}
+
+fn cmd_resume(rm_name: string, node_id: string) -> i64 {
+    return cmd_mark(rm_name, node_id, "todo", "resume")
+}
+
+// ── replan command ────────────────────────────────────────────────────
+fn cmd_replan(rm_name: string, apply: bool) -> i64 {
+    let path = resolve_path(rm_name)
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        return 2
+    }
+    let rm = load_roadmap(path)
+    let sm = summarize(rm)
+    println("▼Replan analysis  " + rm.id + "  T*=" + fmt_min(sm.t_star) + "  eta=" + fmt_eta(sm.eta))
+    if sm.eta > 0.0 {
+        println("eta > 0 — convergent, no replan required")
+        return 0
+    }
+    // collect soft_deps drop candidates
+    let mut drops: [string] = []     // "node_id:soft_dep"
+    let mut soft_targets: [string] = []
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        let n = rm.nodes[i]
+        let mut j: i64 = 0
+        while j < n.soft_deps.len() {
+            let sd = _str(n.soft_deps[j])
+            drops = drops.push(n.id + ":" + sd)
+            // dedup target
+            let mut exists: bool = false
+            let mut k: i64 = 0
+            while k < soft_targets.len() {
+                if _str(soft_targets[k]) == sd { exists = true; break }
+                k = k + 1
+            }
+            if exists == false { soft_targets = soft_targets.push(sd) }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if drops.len() == 0 {
+        println("no soft_deps found — nothing to drop")
+        return 0
+    }
+    println("soft_deps drop candidates:")
+    let mut p: i64 = 0
+    while p < drops.len() {
+        println("  · " + _str(drops[p]))
+        p = p + 1
+    }
+    if apply == false {
+        println("(dry run — pass --apply to drop all soft_deps)")
+        return 0
+    }
+    // apply: rewrite body — remove `"soft_deps":[...]` arrays inside affected node blocks
+    let bak = snapshot(path)
+    if bak == "" { eprintln("REJECT: snapshot failed"); return 1 }
+    let mut body = rm.body
+    let mut changed: i64 = 0
+    let mut q: i64 = 0
+    while q < rm.nodes.len() {
+        let n = rm.nodes[q]
+        if n.soft_deps.len() > 0 {
+            let span = find_node_block(body, n.id)
+            if span[0] >= 0 {
+                let s = _i_of(span[0])
+                let e = _i_of(span[1])
+                let block = body.substring(s, e)
+                // remove `"soft_deps":[...]` entry (with optional preceding comma/whitespace)
+                let kpos = _find_after(block, "\"soft_deps\":", 0)
+                if kpos >= 0 {
+                    // find array close
+                    let mut j2 = kpos + 12
+                    while j2 < block.len() && block.substring(j2, j2 + 1) != "[" { j2 = j2 + 1 }
+                    if j2 < block.len() {
+                        let mut depth: i64 = 1
+                        let mut e2 = j2 + 1
+                        while e2 < block.len() && depth > 0 {
+                            let c = block.substring(e2, e2 + 1)
+                            if c == "[" { depth = depth + 1 }
+                            else if c == "]" { depth = depth - 1; if depth == 0 { e2 = e2 + 1; break } }
+                            e2 = e2 + 1
+                        }
+                        // also strip trailing comma + whitespace
+                        let mut tail = e2
+                        while tail < block.len() {
+                            let c = block.substring(tail, tail + 1)
+                            if c == "," { tail = tail + 1; break }
+                            if c == " " || c == "\t" || c == "\n" || c == "\r" { tail = tail + 1; continue }
+                            break
+                        }
+                        // and strip preceding comma
+                        let mut head = kpos
+                        let mut h2 = head - 1
+                        while h2 >= 0 {
+                            let c = block.substring(h2, h2 + 1)
+                            if c == " " || c == "\t" || c == "\n" || c == "\r" { h2 = h2 - 1; continue }
+                            if c == "," { head = h2; break }
+                            break
+                        }
+                        let new_block = block.substring(0, head) + block.substring(tail, block.len())
+                        body = body.substring(0, s) + new_block + body.substring(e, body.len())
+                        changed = changed + 1
+                    }
+                }
+            }
+        }
+        q = q + 1
+    }
+    body = touch_updated(body)
+    try { write_file(path, body) } catch e {
+        eprintln("REJECT: write failed: " + e)
+        return 1
+    }
+    log_change(rm.id, "replan_apply", "*", "soft_deps:" + to_string(drops.len()), "dropped:" + to_string(changed), bak, path)
+    println("OK: replan applied — " + to_string(changed) + " node(s) had soft_deps stripped")
+    println("snapshot: " + bak)
+    return 0
+}
+
+// ── explain command ───────────────────────────────────────────────────
+fn parents_of_id(nodes: [Node], nid: string) -> [string] {
+    let i = idx_of(nodes, nid)
+    if i < 0 { return [] }
+    return nodes[i].deps
+}
+
+fn cmd_explain(rm_name: string, node_id: string) -> i64 {
+    let path = resolve_path(rm_name)
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        return 2
+    }
+    let rm = load_roadmap(path)
+    let i = idx_of(rm.nodes, node_id)
+    if i < 0 { eprintln("REJECT: node not found: " + node_id); return 1 }
+    let n = rm.nodes[i]
+    println("▼Explain  " + rm.id + " / " + n.id)
+    println("  name        : " + n.name)
+    println("  type        : " + n.ntype)
+    println("  status      : " + n.status)
+    println("  progress    : " + pct(n.progress))
+    println("  cost        : " + to_string(n.cost))
+    println("  eff_cost    : " + fmt_min(effective_cost(n, rm.K_target, rm.C_channel)))
+    println("  rem_cost    : " + fmt_min(remaining_cost(n, rm.K_target, rm.C_channel)))
+    println("  p_success   : " + to_string(n.p_success))
+    println("  eta         : " + to_string(n.eta))
+    println("  n_uses      : " + to_string(n.n_uses))
+    if n.phase != "" { println("  phase       : " + n.phase) }
+    let parents = parents_of_id(rm.nodes, node_id)
+    let kids = children_of(rm.nodes, node_id)
+    println("  parents (deps): " + parents.join(", "))
+    println("  children     : " + kids.join(", "))
+    if n.soft_deps.len() > 0 { println("  soft_deps    : " + n.soft_deps.join(", ")) }
+    // critical path: V*(node) and whether node is on critical path from start
+    let v_self = vstar_at(rm.nodes, node_id, rm.K_target, rm.C_channel, 0)
+    println("  V*(node)     : " + fmt_min(v_self))
+    let mut start_id = rm.start
+    if start_id == "" && rm.nodes.len() > 0 {
+        let mut k: i64 = 0
+        while k < rm.nodes.len() {
+            if rm.nodes[k].deps.len() == 0 { start_id = rm.nodes[k].id; break }
+            k = k + 1
+        }
+    }
+    let v_total = if start_id != "" { vstar_at(rm.nodes, start_id, rm.K_target, rm.C_channel, 0) } else { 0.0 }
+    println("  V*(start)    : " + fmt_min(v_total))
+    // critical-path share: V*(node) / V*(start). ≥0.5 ⟹ on critical chain.
+    let mut share = 0.0
+    if v_total > 0.0 { share = v_self / v_total }
+    let pct_share = pct(share)
+    let on_cp = if share >= 0.5 { "yes (share=" + pct_share + ")" } else { "no (share=" + pct_share + ")" }
+    println("  on critical path: " + on_cp)
+    return 0
+}
+
+// ── selftest ───────────────────────────────────────────────────────────
+fn write_sample(path: string, content: string) {
+    try { write_file(path, content) } catch e {
+        eprintln("selftest write fail: " + e)
+        exit(1)
+    }
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_cli")
+    let dir = "/tmp/rm_cli_selftest"
+    let _ = exec("mkdir -p " + dir)  // @allow-bare-exec
+    let _ = exec("rm -f " + dir + "/*.json " + dir + "/*.bak.* 2>/dev/null")  // @allow-bare-exec
+    let p1 = dir + "/sample_a.json"
+    let p2 = dir + "/sample_b.json"
+
+    let sample_a = "{\n  \"_meta\": {\n    \"id\": \"sample_a\",\n    \"goal\": \"G\",\n    \"start\": \"s0\",\n    \"K_target\": 100,\n    \"C_channel\": 20,\n    \"updated\": \"2026-04-16\",\n    \"schema_version\": \"engine_v1\"\n  },\n  \"nodes\": [\n    {\"id\": \"s0\",  \"name\": \"seed\",   \"type\": \"seed\",  \"cost\": 0, \"status\": \"done\",        \"progress\": 1.0, \"deps\": []},\n    {\"id\": \"a\",   \"name\": \"work A\", \"type\": \"build\", \"cost\": 5, \"status\": \"in_progress\", \"progress\": 0.4, \"deps\": [\"s0\"]},\n    {\"id\": \"b\",   \"name\": \"work B\", \"type\": \"build\", \"cost\": 8, \"status\": \"todo\",        \"deps\": [\"s0\"], \"soft_deps\": [\"x\"]},\n    {\"id\": \"x\",   \"name\": \"opt\",    \"type\": \"verify\",\"cost\": 2, \"status\": \"todo\",        \"deps\": [\"s0\"]},\n    {\"id\": \"G\",   \"name\": \"goal\",   \"type\": \"goal\",  \"cost\": 1, \"status\": \"todo\",        \"deps\": [\"a\",\"b\"]}\n  ]\n}\n"
+
+    let sample_b = "{\n  \"_meta\": {\n    \"id\": \"sample_b\",\n    \"goal\": \"H\",\n    \"start\": \"i\",\n    \"K_target\": 50,\n    \"C_channel\": 10,\n    \"updated\": \"2026-04-16\",\n    \"schema_version\": \"engine_v1\"\n  },\n  \"nodes\": [\n    {\"id\": \"i\", \"name\": \"init\", \"type\": \"seed\",  \"cost\": 0, \"status\": \"done\",     \"progress\": 1.0, \"deps\": []},\n    {\"id\": \"j\", \"name\": \"j\",    \"type\": \"build\", \"cost\": 4, \"status\": \"todo\",     \"deps\": [\"i\"]},\n    {\"id\": \"H\", \"name\": \"H\",    \"type\": \"goal\",  \"cost\": 1, \"status\": \"blocked\",  \"deps\": [\"j\"]}\n  ]\n}\n"
+
+    write_sample(p1, sample_a)
+    write_sample(p2, sample_b)
+    println("[selftest] wrote " + p1)
+    println("[selftest] wrote " + p2)
+
+    // load & summarize
+    let ra = load_roadmap(p1)
+    let sa = summarize(ra)
+    println("[selftest] sample_a nodes=" + to_string(sa.nodes) + " done=" + to_string(sa.done) + " inp=" + to_string(sa.inp) + " ready=" + to_string(sa.ready) + " todo=" + to_string(sa.todo) + " blocked=" + to_string(sa.blocked))
+    if sa.nodes != 5 { eprintln("FAIL: sample_a node count expected 5"); return 1 }
+    if sa.done != 1 { eprintln("FAIL: sample_a done expected 1"); return 1 }
+    if sa.inp != 1 { eprintln("FAIL: sample_a inp expected 1"); return 1 }
+
+    // mark: in_progress → done on node 'a'
+    let r1 = apply_status_change(ra, "a", "done")
+    let res1 = _str(r1[1])
+    if res1 != "OK" { eprintln("FAIL: mark res = " + res1); return 1 }
+    let body1 = _str(r1[2])
+    try { write_file(p1, body1) } catch e { eprintln("FAIL: write1 " + e); return 1 }
+    let ra2 = load_roadmap(p1)
+    let sa2 = summarize(ra2)
+    if sa2.done != 2 { eprintln("FAIL: post-mark done expected 2 got " + to_string(sa2.done)); return 1 }
+    println("[selftest] mark a→done OK")
+
+    // resume: set 'H' (blocked) → 'todo' on sample_b
+    let rb = load_roadmap(p2)
+    let r2 = apply_status_change(rb, "H", "todo")
+    let res2 = _str(r2[1])
+    if res2 != "OK" { eprintln("FAIL: resume res = " + res2); return 1 }
+    let body2 = _str(r2[2])
+    try { write_file(p2, body2) } catch e { eprintln("FAIL: write2 " + e); return 1 }
+    let rb2 = load_roadmap(p2)
+    let sb2 = summarize(rb2)
+    if sb2.blocked != 0 { eprintln("FAIL: post-resume blocked expected 0 got " + to_string(sb2.blocked)); return 1 }
+    println("[selftest] resume H→todo OK")
+
+    // find_node_block on missing id → -1
+    let miss = find_node_block(ra.body, "nope")
+    if miss[0] != -1 { eprintln("FAIL: missing node should be -1"); return 1 }
+    println("[selftest] missing-node guard OK")
+
+    // verify list-style helpers (sort) — emulate cmd_list w/o printing dataset
+    let mut rows: [Row] = []
+    let ratio_a = to_float(to_string(sa2.done)) / to_float(to_string(sa2.nodes))
+    let ratio_b = to_float(to_string(sb2.done)) / to_float(to_string(sb2.nodes))
+    rows = rows.push(Row { id: "sample_b", sm: sb2, ratio: ratio_b })
+    rows = rows.push(Row { id: "sample_a", sm: sa2, ratio: ratio_a })
+    // ratio_a > ratio_b expected
+    if ratio_a <= ratio_b { eprintln("FAIL: ratio_a should exceed ratio_b"); return 1 }
+    println("[selftest] ratio sort precondition OK (a=" + to_string(ratio_a) + " b=" + to_string(ratio_b) + ")")
+
+    // touch_updated should rewrite "updated":"..." with today
+    let touched = touch_updated(ra.body)
+    let updated_v = json_str(touched, "updated")
+    if updated_v.len() < 8 { eprintln("FAIL: updated empty"); return 1 }
+    println("[selftest] touch_updated OK (" + updated_v + ")")
+
+    // cleanup samples
+    let _ = exec("rm -f " + p1 + " " + p2)  // @allow-bare-exec
+    let _ = exec("rm -f " + dir + "/*.bak.* 2>/dev/null")  // @allow-bare-exec
+    println("[selftest] PASS")
+    return 0
+}
+
+// ── arg helper ─────────────────────────────────────────────────────────
+fn has_flag(a: [string], flag: string) -> bool {
+    let mut i: i64 = 0
+    while i < a.len() {
+        if _str(a[i]) == flag { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn print_usage() {
+    eprintln("usage: roadmap_cli <subcommand> [args]")
+    eprintln("  list                                    # all roadmaps under shared/roadmaps/")
+    eprintln("  status  <rm>                            # render flowchart + meta")
+    eprintln("  abort   <rm> <node> [--cascade]         # mark blocked")
+    eprintln("  resume  <rm> <node>                     # blocked/failed → todo")
+    eprintln("  mark    <rm> <node> <status>            # arbitrary status")
+    eprintln("  replan  <rm> [--apply]                  # propose/apply soft_deps drop")
+    eprintln("  explain <rm> <node>                     # node detail + critical path")
+    eprintln("  --selftest")
+}
+
+// ── main ───────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() { a = a.push(_str(argv[ai])); ai = ai + 1 }
+    if a.len() == 0 { print_usage(); exit(2) }
+
+    let sub = _str(a[0])
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        print_usage(); exit(0)
+    }
+    if sub == "list" {
+        let rc = cmd_list()
+        exit(rc)
+    }
+    if sub == "status" {
+        if a.len() < 2 { eprintln("usage: status <rm>"); exit(2) }
+        let rc = cmd_status(_str(a[1])); exit(rc)
+    }
+    if sub == "abort" {
+        if a.len() < 3 { eprintln("usage: abort <rm> <node> [--cascade]"); exit(2) }
+        let cascade = has_flag(a, "--cascade")
+        let rc = cmd_abort(_str(a[1]), _str(a[2]), cascade); exit(rc)
+    }
+    if sub == "resume" {
+        if a.len() < 3 { eprintln("usage: resume <rm> <node>"); exit(2) }
+        let rc = cmd_resume(_str(a[1]), _str(a[2])); exit(rc)
+    }
+    if sub == "mark" {
+        if a.len() < 4 { eprintln("usage: mark <rm> <node> <status>"); exit(2) }
+        let st = _str(a[3])
+        // validate status
+        let valid = (st == "todo" || st == "in_progress" || st == "done"
+                  || st == "blocked" || st == "failed" || st == "planned"
+                  || st == "aborted" || st == "skipped" || st == "complete")
+        if valid == false {
+            eprintln("REJECT: invalid status: " + st)
+            eprintln("  allowed: todo|in_progress|done|blocked|failed|planned|aborted|skipped|complete")
+            exit(2)
+        }
+        let rc = cmd_mark(_str(a[1]), _str(a[2]), st, "mark"); exit(rc)
+    }
+    if sub == "replan" {
+        if a.len() < 2 { eprintln("usage: replan <rm> [--apply]"); exit(2) }
+        let apply = has_flag(a, "--apply")
+        let rc = cmd_replan(_str(a[1]), apply); exit(rc)
+    }
+    if sub == "explain" {
+        if a.len() < 3 { eprintln("usage: explain <rm> <node>"); exit(2) }
+        let rc = cmd_explain(_str(a[1]), _str(a[2])); exit(rc)
+    }
+    eprintln("REJECT: unknown subcommand: " + sub)
+    print_usage()
+    exit(2)
+}
+
+main()

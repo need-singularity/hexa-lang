@@ -1,0 +1,813 @@
+// roadmap_observe.hexa — signal aggregator for roadmap engine v2
+// @no-lock-needed
+// @allow-bare-exec
+// @allow-atlas-direct
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   nexus 의 관측 로그/atlas 스냅샷에서 c_i (build/exp/learn/boot/verify)
+//   추정에 필요한 원시 신호를 하나의 JSONL 스트림으로 aggregate.
+//
+//   v2 확장 #1 Signal Coupling — roadmap_engine 의 고정 cost 상수를
+//   실측 신호로 갱신하기 위한 "observation tape".
+//
+//   roadmap_signals.hexa 와 역할 분리:
+//     roadmap_signals.hexa → 통계적 calibration (mean/ewma/std)
+//     roadmap_observe.hexa → raw point-in-time 관측 tape (히스토리)
+//     roadmap_cost.hexa    → tape + graph → c_i 값 추정 (pure fns)
+//
+// SOURCES (read-only scan)
+//   atlas_nodes    ← shared/n6/atlas.n6.stats          (nodes/edges/mtime)
+//   sync_events    ← shared/tool/roadmap_sync.jsonl (last 100)
+//   growth_ticks   ← shared/tool/growth_tick_log.jsonl (last 100)
+//   bt_score       ← shared/bt/bt_audit_result.json (_meta + summary)
+//   gap_count      ← shared/tool/roadmap_gaps.jsonl (line count)
+//   drift_log      ← shared/discovery/atlas_drift_log.jsonl (last 30)
+//   self_improve   ← shared/discovery/self_improve_log.jsonl (last 30)
+//
+// OUTPUT
+//   shared/tool/roadmap_signals.jsonl   (append one line per invocation)
+//     {"ts":"...","kind":"observation","atlas":{...},"sync":{...},...}
+//
+// CLI
+//   hexa roadmap_observe.hexa emit                  append 1 line
+//   hexa roadmap_observe.hexa emit --out=/tmp/x.jsonl
+//   hexa roadmap_observe.hexa tail [N=5]            show last N
+//   hexa roadmap_observe.hexa show                  print current snapshot (no append)
+//   hexa roadmap_observe.hexa --selftest            internal sanity
+//
+// exit: 0 success / 1 write fail / 2 usage / 3 selftest fail
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let N6 = NEXUS + "/n6"
+let BT = NEXUS + "/bt"
+let DISCOVERY = NEXUS + "/discovery"
+
+let DEFAULT_OUT = HARNESS + "/roadmap_signals.jsonl"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+// f64 → i64 via integer chunks (avoids stage0 to_string scientific notation
+// which starts at ~7.7e5 for floats, loses precision for 6+ sig figs).
+// Chunk by 1e5 (well below scientific threshold 7e5).
+fn f_to_i(x: f64) -> i64 {
+    if x >= 0.0 {
+        let mut r: f64 = x
+        let mut out: i64 = 0
+        let chunk_f: f64 = 100000.0
+        let chunk_i: i64 = 100000
+        while r >= chunk_f {
+            r = r - chunk_f
+            out = out + chunk_i
+        }
+        let s = to_string(r)
+        // now r < 1e5 and to_string should be pure-digit with optional .xxx
+        let dot = s.index_of(".")
+        let body = if dot >= 0 { s.substring(0, dot) } else { s }
+        let ei = body.index_of("e")
+        let body_clean = if ei >= 0 { body.substring(0, ei) } else { body }
+        if body_clean == "" || body_clean == "-" { return out }
+        return out + to_int(body_clean)
+    }
+    let neg_r = 0.0 - x
+    return 0 - f_to_i(neg_r)
+}
+
+// whole-part string, large-safe (threshold well below scientific 7e5)
+fn _whole_str(v: f64) -> string {
+    if v < 100000.0 {
+        let s = to_string(v)
+        let dot = s.index_of(".")
+        if dot >= 0 { return s.substring(0, dot) }
+        let ei = s.index_of("e")
+        if ei >= 0 { return s.substring(0, ei) }
+        return s
+    }
+    let i_whole = f_to_i(v)
+    return to_string(i_whole)
+}
+
+fn _to_f64(s: string) -> f64 {
+    if s.len() == 0 { return 0.0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if is_num_char(c) { clean = clean + c }
+        else { break }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" || clean == "." { return 0.0 }
+    return to_float(clean)
+}
+
+// f64 → up to 4 decimal places; large values handled via whole-int + frac
+fn fmt_f4(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let sign = if neg { "-" } else { "" }
+    let whole_s = _whole_str(v)
+    let whole_f = to_float(whole_s)
+    let frac_f = v - whole_f
+    let frac_scaled = (frac_f * 10000.0) + 0.5
+    let mut frac_i: i64 = 0
+    if frac_scaled >= 0.0 && frac_scaled < 20000.0 {
+        let fs_str = to_string(frac_scaled)
+        let fs_dot = fs_str.index_of(".")
+        let fs_body = if fs_dot >= 0 { fs_str.substring(0, fs_dot) } else { fs_str }
+        if fs_body != "" && fs_body != "-" {
+            frac_i = to_int(fs_body)
+        }
+    }
+    if frac_i >= 10000 {
+        let w_i = to_int(whole_s) + 1
+        frac_i = frac_i - 10000
+        let mut fs2 = to_string(frac_i)
+        while fs2.len() < 4 { fs2 = "0" + fs2 }
+        let mut e2 = fs2.len()
+        while e2 > 1 && fs2.substring(e2 - 1, e2) == "0" { e2 = e2 - 1 }
+        let body2 = fs2.substring(0, e2)
+        return sign + to_string(w_i) + "." + body2
+    }
+    let mut fs = to_string(frac_i)
+    while fs.len() < 4 { fs = "0" + fs }
+    let mut end = fs.len()
+    while end > 1 && fs.substring(end - 1, end) == "0" { end = end - 1 }
+    let body = if end == 0 { "0" } else { fs.substring(0, end) }
+    return sign + whole_s + "." + body
+}
+
+// ── JSON field extract (text-search, json_parse 회피) ─────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return "" }
+    if body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return 0.0 }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return 0.0 }
+    return _to_f64(body.substring(start, i))
+}
+
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ── tail N lines (window bound, empty-safe) ───────────────────────────────
+fn tail_lines(path: string, window: i64) -> [string] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let all = body.split("\n")
+    let mut clean: [string] = []
+    let mut i: i64 = 0
+    while i < all.len() {
+        let s = _str(all[i])
+        if s.len() > 0 { clean = clean.push(s) }
+        i = i + 1
+    }
+    if window <= 0 || clean.len() <= window { return clean }
+    let start = clean.len() - window
+    let mut out: [string] = []
+    let mut j = start
+    while j < clean.len() {
+        out = out.push(_str(clean[j]))
+        j = j + 1
+    }
+    return out
+}
+
+fn line_count(path: string) -> i64 {
+    if file_exists(path) == false { return 0 }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return 0 }
+    let all = body.split("\n")
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < all.len() {
+        if _str(all[i]).len() > 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ── observation structs ──────────────────────────────────────────────────
+struct AtlasObs {
+    nodes: f64,
+    edges: f64,
+    lines: f64,
+    size_kb: f64,
+    mtime: f64,
+    has_source: bool
+}
+
+struct SignalsObs {
+    signals_total: f64,
+    lines: f64,
+    has_source: bool
+}
+
+struct SyncObs {
+    window: i64,
+    total: i64,
+    ok: i64,
+    p_success: f64,
+    has_source: bool
+}
+
+struct GrowthObs {
+    window: i64,
+    total: i64,
+    ok: i64,
+    p_success: f64,
+    has_source: bool
+}
+
+struct BtObs {
+    total_bts: f64,
+    accuracy_pct: f64,
+    mismatch: f64,
+    skip: f64,
+    has_source: bool
+}
+
+struct GapObs {
+    count: f64,
+    has_source: bool
+}
+
+struct DriftObs {
+    window: i64,
+    samples: i64,
+    last_drift_pct: f64,
+    last_exact_pct: f64,
+    total_nodes: f64,
+    has_source: bool
+}
+
+struct SelfImproveObs {
+    window: i64,
+    samples: i64,
+    last_closed: f64,
+    last_exact: f64,
+    has_source: bool
+}
+
+// ── extractors ───────────────────────────────────────────────────────────
+fn obs_atlas() -> AtlasObs {
+    let path = N6 + "/atlas.n6.stats"
+    if file_exists(path) == false {
+        return AtlasObs { nodes: 0.0, edges: 0.0, lines: 0.0, size_kb: 0.0, mtime: 0.0, has_source: false }
+    }
+    let body = _str(read_file(path))
+    let nodes = json_num(body, "nodes")
+    let edges = json_num(body, "edges")
+    let lines = json_num(body, "line_count")
+    let size = json_num(body, "size")
+    let mtime = json_num(body, "mtime")
+    return AtlasObs {
+        nodes: nodes,
+        edges: edges,
+        lines: lines,
+        size_kb: size / 1024.0,
+        mtime: mtime,
+        has_source: true
+    }
+}
+
+fn obs_signals() -> SignalsObs {
+    let path = N6 + "/atlas.signals.n6.stats"
+    if file_exists(path) == false {
+        return SignalsObs { signals_total: 0.0, lines: 0.0, has_source: false }
+    }
+    let body = _str(read_file(path))
+    return SignalsObs {
+        signals_total: json_num(body, "signals_total"),
+        lines: json_num(body, "line_count"),
+        has_source: true
+    }
+}
+
+fn obs_sync(window: i64) -> SyncObs {
+    let path = HARNESS + "/roadmap_sync.jsonl"
+    if file_exists(path) == false {
+        return SyncObs { window: window, total: 0, ok: 0, p_success: 0.0, has_source: false }
+    }
+    let lines = tail_lines(path, window)
+    let mut total: i64 = 0
+    let mut ok_n: i64 = 0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        let result = json_str(ln, "result")
+        if result != "" {
+            total = total + 1
+            if result == "ok" { ok_n = ok_n + 1 }
+        }
+        i = i + 1
+    }
+    let p = if total > 0 { to_float(to_string(ok_n)) / to_float(to_string(total)) } else { 0.0 }
+    return SyncObs {
+        window: window,
+        total: total,
+        ok: ok_n,
+        p_success: p,
+        has_source: true
+    }
+}
+
+fn obs_growth(window: i64) -> GrowthObs {
+    let path = HARNESS + "/growth_tick_log.jsonl"
+    if file_exists(path) == false {
+        return GrowthObs { window: window, total: 0, ok: 0, p_success: 0.0, has_source: false }
+    }
+    let lines = tail_lines(path, window)
+    let mut total: i64 = 0
+    let mut ok_n: i64 = 0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i])
+        let kind = json_str(ln, "kind")
+        if kind != "" && kind != "init" {
+            total = total + 1
+            if kind == "tick_ok" || kind == "ok" { ok_n = ok_n + 1 }
+        }
+        i = i + 1
+    }
+    let p = if total > 0 { to_float(to_string(ok_n)) / to_float(to_string(total)) } else { 0.0 }
+    return GrowthObs {
+        window: window,
+        total: total,
+        ok: ok_n,
+        p_success: p,
+        has_source: true
+    }
+}
+
+fn obs_bt() -> BtObs {
+    let path = BT + "/bt_audit_result.json"
+    if file_exists(path) == false {
+        return BtObs { total_bts: 0.0, accuracy_pct: 0.0, mismatch: 0.0, skip: 0.0, has_source: false }
+    }
+    let body = _str(read_file(path))
+    // _meta block has total_bts, summary block has accuracy_pct + mismatch + skip
+    let total = json_num(body, "total_bts")
+    let acc = json_num(body, "accuracy_pct")
+    let mm = json_num(body, "mismatch")
+    let sk = json_num(body, "skip")
+    return BtObs {
+        total_bts: total,
+        accuracy_pct: acc,
+        mismatch: mm,
+        skip: sk,
+        has_source: true
+    }
+}
+
+fn obs_gap() -> GapObs {
+    let path = HARNESS + "/roadmap_gaps.jsonl"
+    if file_exists(path) == false {
+        return GapObs { count: 0.0, has_source: false }
+    }
+    let n = line_count(path)
+    return GapObs { count: to_float(to_string(n)), has_source: true }
+}
+
+fn obs_drift(window: i64) -> DriftObs {
+    let path = DISCOVERY + "/atlas_drift_log.jsonl"
+    if file_exists(path) == false {
+        return DriftObs {
+            window: window, samples: 0, last_drift_pct: 0.0,
+            last_exact_pct: 0.0, total_nodes: 0.0, has_source: false
+        }
+    }
+    let lines = tail_lines(path, window)
+    if lines.len() == 0 {
+        return DriftObs {
+            window: window, samples: 0, last_drift_pct: 0.0,
+            last_exact_pct: 0.0, total_nodes: 0.0, has_source: true
+        }
+    }
+    let last = _str(lines[lines.len() - 1])
+    return DriftObs {
+        window: window,
+        samples: lines.len(),
+        last_drift_pct: json_num(last, "drift_pct"),
+        last_exact_pct: json_num(last, "exact_pct"),
+        total_nodes: json_num(last, "total_all"),
+        has_source: true
+    }
+}
+
+fn obs_self_improve(window: i64) -> SelfImproveObs {
+    let path = DISCOVERY + "/self_improve_log.jsonl"
+    if file_exists(path) == false {
+        return SelfImproveObs {
+            window: window, samples: 0, last_closed: 0.0, last_exact: 0.0, has_source: false
+        }
+    }
+    let lines = tail_lines(path, window)
+    if lines.len() == 0 {
+        return SelfImproveObs {
+            window: window, samples: 0, last_closed: 0.0, last_exact: 0.0, has_source: true
+        }
+    }
+    let last = _str(lines[lines.len() - 1])
+    return SelfImproveObs {
+        window: window,
+        samples: lines.len(),
+        last_closed: json_num(last, "closed"),
+        last_exact: json_num(last, "exact"),
+        has_source: true
+    }
+}
+
+// ── render one observation JSONL line ────────────────────────────────────
+fn render_line(atlas: AtlasObs, sig: SignalsObs, sync: SyncObs, growth: GrowthObs,
+               bt: BtObs, gap: GapObs, drift: DriftObs, si: SelfImproveObs) -> string {
+    let ts = _ts_iso()
+    let atlas_blk = "{\"nodes\":" + fmt_f4(atlas.nodes)
+        + ",\"edges\":" + fmt_f4(atlas.edges)
+        + ",\"lines\":" + fmt_f4(atlas.lines)
+        + ",\"size_kb\":" + fmt_f4(atlas.size_kb)
+        + ",\"mtime\":" + fmt_f4(atlas.mtime)
+        + ",\"has_source\":" + to_string(atlas.has_source) + "}"
+
+    let sig_blk = "{\"signals_total\":" + fmt_f4(sig.signals_total)
+        + ",\"lines\":" + fmt_f4(sig.lines)
+        + ",\"has_source\":" + to_string(sig.has_source) + "}"
+
+    let sync_blk = "{\"window\":" + to_string(sync.window)
+        + ",\"total\":" + to_string(sync.total)
+        + ",\"ok\":" + to_string(sync.ok)
+        + ",\"p_success\":" + fmt_f4(sync.p_success)
+        + ",\"has_source\":" + to_string(sync.has_source) + "}"
+
+    let growth_blk = "{\"window\":" + to_string(growth.window)
+        + ",\"total\":" + to_string(growth.total)
+        + ",\"ok\":" + to_string(growth.ok)
+        + ",\"p_success\":" + fmt_f4(growth.p_success)
+        + ",\"has_source\":" + to_string(growth.has_source) + "}"
+
+    let bt_blk = "{\"total_bts\":" + fmt_f4(bt.total_bts)
+        + ",\"accuracy_pct\":" + fmt_f4(bt.accuracy_pct)
+        + ",\"mismatch\":" + fmt_f4(bt.mismatch)
+        + ",\"skip\":" + fmt_f4(bt.skip)
+        + ",\"has_source\":" + to_string(bt.has_source) + "}"
+
+    let gap_blk = "{\"count\":" + fmt_f4(gap.count)
+        + ",\"has_source\":" + to_string(gap.has_source) + "}"
+
+    let drift_blk = "{\"window\":" + to_string(drift.window)
+        + ",\"samples\":" + to_string(drift.samples)
+        + ",\"last_drift_pct\":" + fmt_f4(drift.last_drift_pct)
+        + ",\"last_exact_pct\":" + fmt_f4(drift.last_exact_pct)
+        + ",\"total_nodes\":" + fmt_f4(drift.total_nodes)
+        + ",\"has_source\":" + to_string(drift.has_source) + "}"
+
+    let si_blk = "{\"window\":" + to_string(si.window)
+        + ",\"samples\":" + to_string(si.samples)
+        + ",\"last_closed\":" + fmt_f4(si.last_closed)
+        + ",\"last_exact\":" + fmt_f4(si.last_exact)
+        + ",\"has_source\":" + to_string(si.has_source) + "}"
+
+    return "{\"ts\":\"" + escape_json(ts) + "\""
+        + ",\"kind\":\"observation\""
+        + ",\"atlas\":" + atlas_blk
+        + ",\"signals\":" + sig_blk
+        + ",\"sync\":" + sync_blk
+        + ",\"growth\":" + growth_blk
+        + ",\"bt\":" + bt_blk
+        + ",\"gap\":" + gap_blk
+        + ",\"drift\":" + drift_blk
+        + ",\"self_improve\":" + si_blk
+        + "}"
+}
+
+// ── main commands ────────────────────────────────────────────────────────
+fn gather_all(window: i64) -> string {
+    let atlas = obs_atlas()
+    let sig = obs_signals()
+    let sync = obs_sync(window)
+    let growth = obs_growth(window)
+    let bt = obs_bt()
+    let gap = obs_gap()
+    let drift = obs_drift(window)
+    let si = obs_self_improve(window)
+    return render_line(atlas, sig, sync, growth, bt, gap, drift, si)
+}
+
+fn cmd_emit(out_path: string, window: i64) -> i64 {
+    let line = gather_all(window)
+    // ensure parent dir
+    let last_slash_i = out_path.len() - 1
+    let mut s: i64 = last_slash_i
+    while s >= 0 && out_path.substring(s, s + 1) != "/" { s = s - 1 }
+    if s > 0 {
+        let parent = out_path.substring(0, s)
+        let _ = exec("mkdir -p '" + parent + "' 2>/dev/null")  // @allow-bare-exec
+    }
+    // append
+    let mut body = ""
+    if file_exists(out_path) {
+        body = _str(read_file(out_path))
+    }
+    let newbody = body + line + "\n"
+    try { write_file(out_path, newbody) } catch err {
+        eprintln("REJECT: write_file failed: " + out_path)
+        return 1
+    }
+    println("[emit] OK → " + out_path + " (+1 line, total_bytes=" + to_string(newbody.len()) + ")")
+    return 0
+}
+
+fn cmd_show(window: i64) -> i64 {
+    let line = gather_all(window)
+    println(line)
+    return 0
+}
+
+fn cmd_tail(out_path: string, n: i64) -> i64 {
+    if file_exists(out_path) == false {
+        eprintln("REJECT: observation file not found: " + out_path)
+        return 1
+    }
+    let lines = tail_lines(out_path, n)
+    let mut i: i64 = 0
+    while i < lines.len() {
+        println(_str(lines[i]))
+        i = i + 1
+    }
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn selftest() -> i64 {
+    println("[selftest] roadmap_observe.hexa")
+
+    // 1) tmp tail_lines
+    let tmp = "/tmp/roadmap_observe_selftest.jsonl"
+    let _ = exec("rm -f " + tmp)  // @allow-bare-exec
+    try { write_file(tmp, "a\nb\nc\nd\ne\n") } catch e {
+        eprintln("[selftest] FAIL: cannot write tmp")
+        return 1
+    }
+    let last3 = tail_lines(tmp, 3)
+    if last3.len() != 3 || _str(last3[0]) != "c" || _str(last3[2]) != "e" {
+        eprintln("[selftest] FAIL: tail_lines(3) mismatch")
+        return 1
+    }
+    println("[selftest]   tail_lines OK")
+
+    // 2) line_count
+    if line_count(tmp) != 5 {
+        eprintln("[selftest] FAIL: line_count expected 5 got " + to_string(line_count(tmp)))
+        return 1
+    }
+    println("[selftest]   line_count OK")
+
+    // 3) json_str / json_num
+    let row = "{\"ts\":\"2026-04-16T01:00:00Z\",\"nodes\":20510,\"edges\":54332}"
+    if json_str(row, "ts") != "2026-04-16T01:00:00Z" {
+        eprintln("[selftest] FAIL: json_str ts")
+        return 1
+    }
+    let n = json_num(row, "nodes")
+    if n < 20509.5 || n > 20510.5 {
+        eprintln("[selftest] FAIL: json_num nodes")
+        return 1
+    }
+    println("[selftest]   json_str/num OK")
+
+    // 4) gather_all returns non-empty line (even with missing sources)
+    let line = gather_all(20)
+    if line.len() < 50 {
+        eprintln("[selftest] FAIL: gather_all too short: " + to_string(line.len()))
+        return 1
+    }
+    if line.len() > 8192 {
+        eprintln("[selftest] FAIL: gather_all too big: " + to_string(line.len()))
+        return 1
+    }
+    // sanity: must contain key fields
+    if _find_after(line, "\"kind\":\"observation\"", 0) < 0 {
+        eprintln("[selftest] FAIL: missing kind")
+        return 1
+    }
+    if _find_after(line, "\"atlas\"", 0) < 0 {
+        eprintln("[selftest] FAIL: missing atlas")
+        return 1
+    }
+    if _find_after(line, "\"self_improve\"", 0) < 0 {
+        eprintln("[selftest] FAIL: missing self_improve")
+        return 1
+    }
+    println("[selftest]   gather_all produced " + to_string(line.len()) + " bytes")
+
+    // 5) emit to tmp, then tail
+    let tmp_out = "/tmp/roadmap_observe_emit_selftest.jsonl"
+    let _ = exec("rm -f " + tmp_out)  // @allow-bare-exec
+    let r = cmd_emit(tmp_out, 20)
+    if r != 0 {
+        eprintln("[selftest] FAIL: cmd_emit rc=" + to_string(r))
+        return 1
+    }
+    if file_exists(tmp_out) == false {
+        eprintln("[selftest] FAIL: tmp_out not produced")
+        return 1
+    }
+    let got = tail_lines(tmp_out, 5)
+    if got.len() != 1 {
+        eprintln("[selftest] FAIL: expected 1 line got " + to_string(got.len()))
+        return 1
+    }
+    // emit twice more; expect 3 lines
+    let _ = cmd_emit(tmp_out, 20)
+    let _ = cmd_emit(tmp_out, 20)
+    let got3 = tail_lines(tmp_out, 10)
+    if got3.len() != 3 {
+        eprintln("[selftest] FAIL: expected 3 lines got " + to_string(got3.len()))
+        return 1
+    }
+    println("[selftest]   emit + append OK (3 lines)")
+
+    println("[selftest] OK — all 5 checks passed")
+    return 0
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        eprintln("usage: roadmap_observe.hexa <emit|tail|show|--selftest> [args]")
+        eprintln("  emit [--out=PATH] [--window=N]   append 1 observation line")
+        eprintln("  tail [N]                         show last N of default out")
+        eprintln("  show [--window=N]                print current snapshot (no append)")
+        eprintln("  --selftest                       internal sanity")
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let r = selftest()
+        exit(r)
+    }
+
+    // parse common flags
+    let mut out_path = DEFAULT_OUT
+    let mut window: i64 = 100
+    let mut k: i64 = 1
+    while k < a.len() {
+        let arg = _str(a[k])
+        if arg.starts_with("--out=") {
+            out_path = arg.substring(6, arg.len())
+        } else if arg.starts_with("--window=") {
+            let s = arg.substring(9, arg.len())
+            let n = to_int(s)
+            if n > 0 { window = n }
+        }
+        k = k + 1
+    }
+
+    if cmd == "emit" {
+        let r = cmd_emit(out_path, window)
+        exit(r)
+    }
+
+    if cmd == "show" {
+        let r = cmd_show(window)
+        exit(r)
+    }
+
+    if cmd == "tail" {
+        let mut n: i64 = 5
+        if a.len() >= 2 {
+            let s = _str(a[1])
+            if s.len() > 0 && is_digit(s.substring(0, 1)) { n = to_int(s) }
+        }
+        let r = cmd_tail(out_path, n)
+        exit(r)
+    }
+
+    eprintln("REJECT: unknown command: " + cmd)
+    exit(2)
+}
+
+main()

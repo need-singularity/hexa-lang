@@ -1,0 +1,1171 @@
+// roadmap_vi.hexa — Bellman value iteration (true V* DP) for small DAGs
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_engine.hexa 의 vstar() 는 critical-path heuristic (parallel attack
+//   semantics — max over children). 이 모듈은 *진짜* Value Iteration:
+//
+//     V*(S) = min_a [ b_a(S) + V*(f(S,a)) ],   V*(G_state) = 0
+//     π*(S) = argmin_a [...]
+//     state S = sorted set of completed node ids
+//     action a ∈ ready(S) = { n : deps(n) ⊆ S, n ∉ S }
+//     transition: f(S,a) = S ∪ {a}
+//     b_a(S)    = effective_cost(a, K, C)        (sum semantics)
+//
+// SCOPE
+//   nodes ≤ 20 (state space ≤ 2^20). nodes>20 ⇒ exit 1 (또는 --force).
+//   reachable state 는 topological 제약으로 훨씬 작음.
+//
+// CLI
+//   hexa run roadmap_vi.hexa plan <roadmap.json> [--start-state=id1,id2] [--force]
+//   hexa run roadmap_vi.hexa compare <roadmap.json>
+//   hexa run roadmap_vi.hexa --selftest
+//
+// exit: 0 success / 1 nodes>20 w/o --force / 2 deadlock / 3 parse / 9 usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV != "" { NEXUS_ENV } else { HOME + "/Dev/nexus" }
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+// last_index_of 미지원 → manual rfind
+fn _rfind(hay: string, needle: string) -> i64 {
+    let nl = needle.len()
+    let hl = hay.len()
+    if nl == 0 || nl > hl { return -1 }
+    let mut i: i64 = hl - nl
+    while i >= 0 {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// linear-search helper for parallel-list maps (hashmap 회피 P1)
+fn _idx_of(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// hexa stage1 string `<`/`>` 연산자 미동작 — 코드포인트 lexicographic compare
+// returns -1 if a<b, 0 if a==b, +1 if a>b
+fn _strcmp(a: string, b: string) -> i64 {
+    let la = a.len()
+    let lb = b.len()
+    let lim = if la < lb { la } else { lb }
+    let mut i: i64 = 0
+    while i < lim {
+        let ca = a.substring(i, i + 1)
+        let cb = b.substring(i, i + 1)
+        if ca == cb { i = i + 1; continue }
+        // compare via to_int trick won't work for letters → use code map
+        let codes = " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_`abcdefghijklmnopqrstuvwxyz{|}~"
+        let ia = codes.index_of(ca)
+        let ib = codes.index_of(cb)
+        if ia < 0 || ib < 0 {
+            // unknown char — fallback to length compare
+            if la < lb { return -1 }
+            if la > lb { return 1 }
+            return 0
+        }
+        if ia < ib { return -1 }
+        if ia > ib { return 1 }
+        i = i + 1
+    }
+    if la < lb { return -1 }
+    if la > lb { return 1 }
+    return 0
+}
+
+fn _str_lt(a: string, b: string) -> bool {
+    return _strcmp(a, b) < 0
+}
+
+// ── text-based JSON helpers (json_parse void trap 회피) ───────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node + Roadmap (engine 와 동일 스키마) ────────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64
+}
+
+fn parse_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { f_to_i(nu) }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps, soft_deps: soft,
+        status: st, progress: pg
+    }
+}
+
+struct Roadmap {
+    id: string,
+    goal: string,
+    start: string,
+    K_target: f64,
+    C_channel: f64,
+    nodes: [Node]
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let rid = json_str(meta_body, "id")
+    let goal = json_str(meta_body, "goal")
+    let start = json_str(meta_body, "start")
+    let K = json_num(meta_body, "K_target")
+    let C = json_num(meta_body, "C_channel")
+    let node_blocks = split_nodes(body)
+    let mut nodes: [Node] = []
+    let mut i: i64 = 0
+    while i < node_blocks.len() {
+        let n = parse_node(_str(node_blocks[i]))
+        if n.id.len() > 0 { nodes = nodes.push(n) }
+        i = i + 1
+    }
+    return Roadmap {
+        id: rid, goal: goal, start: start,
+        K_target: K, C_channel: C,
+        nodes: nodes
+    }
+}
+
+fn idx_of_node(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+// ── effective cost (engine 와 동일 공식, sum semantics) ───────────────────
+fn effective_cost(n: Node, K: f64, C: f64) -> f64 {
+    let t = n.ntype
+    if t == "seed" { return 0.0 }
+    if t == "goal" { return n.cost }
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        return n.cost / p
+    }
+    if t == "learn" {
+        let e = if n.eta < 0.0 { 0.0 } else { n.eta }
+        let f = 1.0 - e
+        return n.cost * f
+    }
+    if t == "boot" {
+        let nu = if n.n_uses < 1 { 1 } else { n.n_uses }
+        return n.cost / to_float(to_string(nu))
+    }
+    if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let c = if C <= 0.0 { 1.0 } else { C }
+        return (k / c) + (n.cost * 0.25)
+    }
+    return n.cost
+}
+
+// ── critical-path heuristic (engine 와 동일 — max over children, parallel) ─
+fn children_of(nodes: [Node], nid: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        let mut j: i64 = 0
+        while j < n.deps.len() {
+            if _str(n.deps[j]) == nid { out = out.push(n.id); break }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn vstar_heuristic(nodes: [Node], nid: string, K: f64, C: f64) -> f64 {
+    let ni = idx_of_node(nodes, nid)
+    if ni < 0 { return 0.0 }
+    let n = nodes[ni]
+    let self_cost = if is_done(n.status) { 0.0 } else { effective_cost(n, K, C) }
+    let kids = children_of(nodes, nid)
+    let mut best: f64 = 0.0
+    let mut ci: i64 = 0
+    while ci < kids.len() {
+        let v = vstar_heuristic(nodes, _str(kids[ci]), K, C)
+        if v > best { best = v }
+        ci = ci + 1
+    }
+    return self_cost + best
+}
+
+// ── state encoding ────────────────────────────────────────────────────────
+// state = sorted list of completed node ids (engine 의 ordering 과 무관 hash 용)
+// key = "id1|id2|id3" (sorted ascending by sort_state)
+
+fn sort_state(ids: [string]) -> [string] {
+    // selection sort via rebuild — pick min, append, mark consumed
+    // NOTE: hexa stage1 `||` short-circuit broken — split conditions explicitly.
+    let n = ids.len()
+    let mut consumed: [bool] = []
+    let mut zi: i64 = 0
+    while zi < n {
+        consumed = consumed.push(false)
+        zi = zi + 1
+    }
+    let mut out: [string] = []
+    let mut k: i64 = 0
+    while k < n {
+        // find min unconsumed
+        let mut best_idx: i64 = -1
+        let mut best_val: string = ""
+        let mut i: i64 = 0
+        while i < n {
+            if consumed[i] == false {
+                let v = _str(ids[i])
+                let mut do_update: bool = false
+                if best_idx < 0 { do_update = true }
+                else { if _str_lt(v, best_val) { do_update = true } }
+                if do_update {
+                    best_idx = i
+                    best_val = v
+                }
+            }
+            i = i + 1
+        }
+        if best_idx < 0 { break }
+        out = out.push(best_val)
+        // mark consumed via rebuild (list[i]=v no-op P3)
+        let mut nc: [bool] = []
+        let mut q: i64 = 0
+        while q < n {
+            if q == best_idx { nc = nc.push(true) }
+            else { nc = nc.push(consumed[q]) }
+            q = q + 1
+        }
+        consumed = nc
+        k = k + 1
+    }
+    return out
+}
+
+fn state_key(ids: [string]) -> string {
+    let s = sort_state(ids)
+    let mut k = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        if i > 0 { k = k + "|" }
+        k = k + _str(s[i])
+        i = i + 1
+    }
+    return k
+}
+
+// state ∪ {a}
+fn state_add(ids: [string], a: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < ids.len() {
+        out = out.push(_str(ids[i]))
+        i = i + 1
+    }
+    out = out.push(a)
+    return sort_state(out)
+}
+
+// ready(S) = { n : status not done && deps ⊆ S && n ∉ S }
+fn ready_set(nodes: [Node], state: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        // skip if already in state
+        if _idx_of(state, n.id) >= 0 { i = i + 1; continue }
+        // deps ⊆ state ?
+        let mut all_in: bool = true
+        let mut j: i64 = 0
+        while j < n.deps.len() {
+            let dep = _str(n.deps[j])
+            if _idx_of(state, dep) < 0 { all_in = false; break }
+            j = j + 1
+        }
+        if all_in { out = out.push(n.id) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Value Iteration (memoized DP) ─────────────────────────────────────────
+// parallel-list memo: state_keys[k] → state_v[k] / state_pi[k]
+// V_INF sentinel
+<<<<<<< Updated upstream
+let V_INF: f64 = 999999999999.0
+=======
+let V_INF: f64 = 1.0e18
+>>>>>>> Stashed changes
+
+// 26-bucket prefix index for faster lookup (a-z|0-9|other)
+fn _bucket(key: string) -> i64 {
+    if key.len() == 0 { return 36 }
+    let c = key.substring(0, 1)
+    if is_digit(c) { return 26 + to_int(c) }
+    // lowercase a-z
+    let codes = "abcdefghijklmnopqrstuvwxyz"
+    let idx = codes.index_of(c)
+    if idx >= 0 { return idx }
+    return 36
+}
+
+// 37 buckets (a-z, 0-9, other)
+struct Memo {
+    keys_buckets: [[string]],   // 37 lists of state keys
+    v_buckets: [[f64]],         // 37 lists of V*(S)
+    pi_buckets: [[string]]      // 37 lists of π*(S)
+}
+
+fn new_memo() -> Memo {
+    let mut kb: [[string]] = []
+    let mut vb: [[f64]] = []
+    let mut pb: [[string]] = []
+    let mut i: i64 = 0
+    while i < 37 {
+        kb = kb.push([])
+        vb = vb.push([])
+        pb = pb.push([])
+        i = i + 1
+    }
+    return Memo { keys_buckets: kb, v_buckets: vb, pi_buckets: pb }
+}
+
+fn memo_get(m: Memo, key: string) -> [string] {
+    // returns ["found"|"miss", v_str, pi]
+    let b = _bucket(key)
+    let bucket_keys = m.keys_buckets[b]
+    let idx = _idx_of(bucket_keys, key)
+    if idx < 0 { return ["miss", "0", ""] }
+    let v = m.v_buckets[b][idx]
+    let pi = _str(m.pi_buckets[b][idx])
+    return ["found", to_string(v), pi]
+}
+
+fn memo_put(m: Memo, key: string, v: f64, pi: string) -> Memo {
+    let b = _bucket(key)
+    // append to bucket b — slice rebuild for [[x]] (P3 회피)
+    let mut new_kb: [[string]] = []
+    let mut new_vb: [[f64]] = []
+    let mut new_pb: [[string]] = []
+    let mut i: i64 = 0
+    while i < 37 {
+        if i == b {
+            let mut nk = m.keys_buckets[i]
+            let mut nv = m.v_buckets[i]
+            let mut np = m.pi_buckets[i]
+            nk = nk.push(key)
+            nv = nv.push(v)
+            np = np.push(pi)
+            new_kb = new_kb.push(nk)
+            new_vb = new_vb.push(nv)
+            new_pb = new_pb.push(np)
+        } else {
+            new_kb = new_kb.push(m.keys_buckets[i])
+            new_vb = new_vb.push(m.v_buckets[i])
+            new_pb = new_pb.push(m.pi_buckets[i])
+        }
+        i = i + 1
+    }
+    return Memo { keys_buckets: new_kb, v_buckets: new_vb, pi_buckets: new_pb }
+}
+
+// full_set = sorted ids of all non-skipped nodes
+fn full_set(nodes: [Node]) -> [string] {
+    let mut ids: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        ids = ids.push(nodes[i].id)
+        i = i + 1
+    }
+    return sort_state(ids)
+}
+
+// VI core. iterative postorder over reachable states (stack).
+// returns memo with V*+π* for every reachable S.
+struct ViResult {
+    memo: Memo,
+    full_key: string,
+    deadlock: bool
+}
+
+fn run_vi(nodes: [Node], start_state: [string], K: f64, C: f64) -> ViResult {
+    let full = full_set(nodes)
+    let full_k = state_key(full)
+    let mut memo = new_memo()
+    // base case: V*(full) = 0
+    memo = memo_put(memo, full_k, 0.0, "")
+
+    // iterative DFS — stack of state-lists (sorted)
+    // we encode stack states as keys + parallel state-content list
+    let mut stack_keys: [string] = []
+    let mut stack_states: [[string]] = []
+    let s0_key = state_key(start_state)
+    let s0_sorted = sort_state(start_state)
+    stack_keys = stack_keys.push(s0_key)
+    stack_states = stack_states.push(s0_sorted)
+
+    let mut deadlock: bool = false
+
+    while stack_keys.len() > 0 {
+        let top_idx = stack_keys.len() - 1
+        let cur_key = _str(stack_keys[top_idx])
+        let cur_state = stack_states[top_idx]
+        // already memoized?
+        let g = memo_get(memo, cur_key)
+        if _str(g[0]) == "found" {
+            // pop
+            let mut nk: [string] = []
+            let mut ns: [[string]] = []
+            let mut p: i64 = 0
+            while p < top_idx {
+                nk = nk.push(_str(stack_keys[p]))
+                ns = ns.push(stack_states[p])
+                p = p + 1
+            }
+            stack_keys = nk
+            stack_states = ns
+            continue
+        }
+        // ready actions
+        let ready = ready_set(nodes, cur_state)
+        if ready.len() == 0 {
+            // deadlock: no actions but state ≠ full
+            // mark with V_INF and empty π
+            memo = memo_put(memo, cur_key, V_INF, "")
+            deadlock = true
+            // pop
+            let mut nk: [string] = []
+            let mut ns: [[string]] = []
+            let mut p: i64 = 0
+            while p < top_idx {
+                nk = nk.push(_str(stack_keys[p]))
+                ns = ns.push(stack_states[p])
+                p = p + 1
+            }
+            stack_keys = nk
+            stack_states = ns
+            continue
+        }
+        // check successors all memoized?
+        let mut all_memo: bool = true
+        let mut ri: i64 = 0
+        let mut next_keys: [string] = []
+        let mut next_states: [[string]] = []
+        while ri < ready.len() {
+            let a = _str(ready[ri])
+            let ns_state = state_add(cur_state, a)
+            let nk = state_key(ns_state)
+            let g2 = memo_get(memo, nk)
+            if _str(g2[0]) != "found" {
+                all_memo = false
+                next_keys = next_keys.push(nk)
+                next_states = next_states.push(ns_state)
+            }
+            ri = ri + 1
+        }
+        if all_memo == false {
+            // push successors first; cur stays on stack
+            let mut nk2: [string] = []
+            let mut ns2: [[string]] = []
+            let mut p2: i64 = 0
+            while p2 < next_keys.len() {
+                nk2 = nk2.push(_str(next_keys[p2]))
+                ns2 = ns2.push(next_states[p2])
+                p2 = p2 + 1
+            }
+            // append to stack
+            let mut p3: i64 = 0
+            while p3 < nk2.len() {
+                stack_keys = stack_keys.push(_str(nk2[p3]))
+                stack_states = stack_states.push(ns2[p3])
+                p3 = p3 + 1
+            }
+            continue
+        }
+        // all successors memoized — compute V*(cur) = min over a
+        let mut best_v: f64 = V_INF
+        let mut best_a: string = ""
+        let mut ri2: i64 = 0
+        while ri2 < ready.len() {
+            let a = _str(ready[ri2])
+            let ai = idx_of_node(nodes, a)
+            let mut bcost: f64 = 0.0
+            if ai >= 0 {
+                let nd = nodes[ai]
+                if is_done(nd.status) == false {
+                    bcost = effective_cost(nd, K, C)
+                }
+            }
+            let ns_state = state_add(cur_state, a)
+            let nk = state_key(ns_state)
+            let g3 = memo_get(memo, nk)
+            let succ_v = to_float(_str(g3[1]))
+            let total = bcost + succ_v
+            if total < best_v {
+                best_v = total
+                best_a = a
+            }
+            ri2 = ri2 + 1
+        }
+        memo = memo_put(memo, cur_key, best_v, best_a)
+        // pop
+        let mut nk4: [string] = []
+        let mut ns4: [[string]] = []
+        let mut p4: i64 = 0
+        while p4 < top_idx {
+            nk4 = nk4.push(_str(stack_keys[p4]))
+            ns4 = ns4.push(stack_states[p4])
+            p4 = p4 + 1
+        }
+        stack_keys = nk4
+        stack_states = ns4
+    }
+
+    return ViResult { memo: memo, full_key: full_k, deadlock: deadlock }
+}
+
+// ── policy recovery: trace π* from S0 to full ────────────────────────────
+struct PolicyStep {
+    action: string,
+    cost: f64,
+    cum_cost: f64
+}
+
+fn recover_path(memo: Memo, nodes: [Node], start_state: [string], K: f64, C: f64) -> [PolicyStep] {
+    let mut trace: [PolicyStep] = []
+    let mut cur = sort_state(start_state)
+    let mut cum: f64 = 0.0
+    let mut full_k = state_key(full_set(nodes))
+    let mut steps: i64 = 0
+    let max_steps: i64 = 1024
+    while state_key(cur) != full_k && steps < max_steps {
+        let cur_k = state_key(cur)
+        let g = memo_get(memo, cur_k)
+        if _str(g[0]) != "found" { break }
+        let pi = _str(g[2])
+        if pi == "" { break }
+        let ai = idx_of_node(nodes, pi)
+        let mut bcost: f64 = 0.0
+        if ai >= 0 {
+            let nd = nodes[ai]
+            if is_done(nd.status) == false {
+                bcost = effective_cost(nd, K, C)
+            }
+        }
+        cum = cum + bcost
+        trace = trace.push(PolicyStep { action: pi, cost: bcost, cum_cost: cum })
+        cur = state_add(cur, pi)
+        steps = steps + 1
+    }
+    return trace
+}
+
+// ── critical-path action sequence (heuristic compare) ────────────────────
+// engine vstar 의 의미는 "max over children" — 직접 sequence 가 아니라
+// T*(start) 만 출력. 비교를 위해 서수 기준 (deps 만족하면 ready 중 vstar 큰 순)
+// "topological-greedy" sequence 를 만들어 길이 비교 정도만.
+fn heuristic_sequence(nodes: [Node], start_state: [string], K: f64, C: f64) -> [string] {
+    let mut state = sort_state(start_state)
+    let full = full_set(nodes)
+    let full_k = state_key(full)
+    let mut trace: [string] = []
+    let mut steps: i64 = 0
+    let max_steps: i64 = 1024
+    while state_key(state) != full_k && steps < max_steps {
+        let ready = ready_set(nodes, state)
+        if ready.len() == 0 { break }
+        // pick action with max vstar_heuristic (greedy biggest first)
+        let mut best_a = _str(ready[0])
+        let mut best_v: f64 = -1.0
+        let mut ri: i64 = 0
+        while ri < ready.len() {
+            let a = _str(ready[ri])
+            let v = vstar_heuristic(nodes, a, K, C)
+            if v > best_v { best_v = v; best_a = a }
+            ri = ri + 1
+        }
+        trace = trace.push(best_a)
+        state = state_add(state, best_a)
+        steps = steps + 1
+    }
+    return trace
+}
+
+// ── pretty print helpers ──────────────────────────────────────────────────
+fn fmt_min(x: f64) -> string {
+    let scaled = x * 10.0
+    let r = f_to_i(scaled + 0.5)
+    let whole = r / 10
+    let frac = r - (whole * 10)
+    if frac == 0 { return to_string(whole) + "m" }
+    return to_string(whole) + "." + to_string(frac) + "m"
+}
+
+// ── done set from current statuses ────────────────────────────────────────
+fn initial_done_state(nodes: [Node]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if is_done(nodes[i].status) { out = out.push(nodes[i].id) }
+        i = i + 1
+    }
+    return sort_state(out)
+}
+
+fn parse_csv(s: string) -> [string] {
+    if s.len() == 0 { return [] }
+    let parts = s.split(",")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < parts.len() {
+        let t = _str(parts[i]).trim()
+        if t.len() > 0 { out = out.push(t) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── plan command ──────────────────────────────────────────────────────────
+fn cmd_plan(rm: Roadmap, start_csv: string, force: bool) {
+    let n_nodes = rm.nodes.len()
+    if n_nodes > 20 && force == false {
+        eprintln("REJECT: nodes=" + to_string(n_nodes) + " > 20 (state space too large). Use --force to override.")
+        exit(1)
+    }
+    let mut start_state: [string] = []
+    if start_csv.len() > 0 {
+        start_state = parse_csv(start_csv)
+    } else {
+        start_state = initial_done_state(rm.nodes)
+    }
+    let res = run_vi(rm.nodes, start_state, rm.K_target, rm.C_channel)
+    if res.deadlock {
+        eprintln("REJECT: deadlock detected — some state has no ready actions but is not full set.")
+        exit(2)
+    }
+    let s0_k = state_key(start_state)
+    let g = memo_get(res.memo, s0_k)
+    if _str(g[0]) != "found" {
+        eprintln("REJECT: V*(S0) not in memo (internal)")
+        exit(2)
+    }
+    let v0 = to_float(_str(g[1]))
+    let trace = recover_path(res.memo, rm.nodes, start_state, rm.K_target, rm.C_channel)
+
+    println("VI plan: V*(S0)=" + fmt_min(v0))
+    println("policy:")
+    let mut i: i64 = 0
+    while i < trace.len() {
+        let step = trace[i]
+        let n_idx = i + 1
+        let line = "  " + to_string(n_idx) + ". " + step.action
+            + "  (cost=" + fmt_min(step.cost) + "  cum=" + fmt_min(step.cum_cost) + ")"
+        println(line)
+        i = i + 1
+    }
+
+    // critical-path comparison via heuristic_sequence length & cost-sum
+    let hseq = heuristic_sequence(rm.nodes, start_state, rm.K_target, rm.C_channel)
+    let mut h_sum: f64 = 0.0
+    let mut hi: i64 = 0
+    while hi < hseq.len() {
+        let aid = _str(hseq[hi])
+        let ai = idx_of_node(rm.nodes, aid)
+        if ai >= 0 {
+            let nd = rm.nodes[ai]
+            if is_done(nd.status) == false {
+                h_sum = h_sum + effective_cost(nd, rm.K_target, rm.C_channel)
+            }
+        }
+        hi = hi + 1
+    }
+    // match: same set of actions in same order ?
+    let mut same: bool = true
+    if hseq.len() != trace.len() { same = false }
+    if same {
+        let mut k: i64 = 0
+        while k < trace.len() {
+            if _str(hseq[k]) != trace[k].action { same = false; break }
+            k = k + 1
+        }
+    }
+    let diff = if hseq.len() > trace.len() { hseq.len() - trace.len() } else { trace.len() - hseq.len() }
+    let yn = if same { "yes" } else { "no" }
+    println("match with critical path: " + yn + " (diff=" + to_string(diff) + ")")
+    exit(0)
+}
+
+// ── compare command ──────────────────────────────────────────────────────
+fn cmd_compare(rm: Roadmap) {
+    let n_nodes = rm.nodes.len()
+    if n_nodes > 20 {
+        eprintln("REJECT: nodes=" + to_string(n_nodes) + " > 20")
+        exit(1)
+    }
+    let start_state = initial_done_state(rm.nodes)
+    // heuristic critical path: from start node (engine 와 동일)
+    let mut start_id = rm.start
+    if start_id == "" {
+        let mut i: i64 = 0
+        while i < rm.nodes.len() {
+            if rm.nodes[i].deps.len() == 0 { start_id = rm.nodes[i].id; break }
+            i = i + 1
+        }
+    }
+    let h_t = vstar_heuristic(rm.nodes, start_id, rm.K_target, rm.C_channel)
+    // VI optimum
+    let res = run_vi(rm.nodes, start_state, rm.K_target, rm.C_channel)
+    let s0_k = state_key(start_state)
+    let g = memo_get(res.memo, s0_k)
+    let v0 = if _str(g[0]) == "found" { to_float(_str(g[1])) } else { -1.0 }
+    let gap = h_t - v0
+    println("heuristic T* = " + fmt_min(h_t) + "  (critical path, max-over-children)")
+    println("VI       T* = " + fmt_min(v0) + "  (true optimum, sum semantics)")
+    let sign = if gap >= 0.0 { "+" } else { "-" }
+    let ag = if gap >= 0.0 { gap } else { 0.0 - gap }
+    println("gap = " + sign + fmt_min(ag) + "  (heuristic - VI; positive ⇒ heuristic over-estimates serial sum)")
+    exit(0)
+}
+
+// ── selftest (built-in 5-node mocks) ─────────────────────────────────────
+fn make_node(id: string, ntype: string, cost: f64, deps: [string]) -> Node {
+    return Node {
+        id: id, name: id, ntype: ntype,
+        cost: cost, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: deps, soft_deps: [],
+        status: "todo", progress: 0.0
+    }
+}
+
+fn approx_eq(a: f64, b: f64) -> bool {
+    let d = if a > b { a - b } else { b - a }
+    return d < 0.001
+}
+
+fn selftest() {
+    // Test 1 — linear A→B→C→D→E costs 1,2,3,4,0, expect V*=10 (sum)
+    println("[selftest] T1 linear A→B→C→D→E (1,2,3,4,0)")
+    let n_a = make_node("A", "build", 1.0, [])
+    let n_b = make_node("B", "build", 2.0, ["A"])
+    let n_c = make_node("C", "build", 3.0, ["B"])
+    let n_d = make_node("D", "build", 4.0, ["C"])
+    let n_e = make_node("E", "goal", 0.0, ["D"])
+    let nodes_t1: [Node] = [n_a, n_b, n_c, n_d, n_e]
+    let res1 = run_vi(nodes_t1, [], 0.0, 1.0)
+    let g1 = memo_get(res1.memo, state_key([]))
+    if _str(g1[0]) != "found" {
+        eprintln("[selftest] T1 FAIL: V*(∅) not in memo")
+        exit(1)
+    }
+    let v1 = to_float(_str(g1[1]))
+    println("[selftest] T1 V*(∅) = " + fmt_min(v1) + "  expect 10m")
+    if approx_eq(v1, 10.0) == false {
+        eprintln("[selftest] T1 FAIL: expected 10.0, got " + to_string(v1))
+        exit(1)
+    }
+    let trace1 = recover_path(res1.memo, nodes_t1, [], 0.0, 1.0)
+    let mut tr1 = "  policy: "
+    let mut i1: i64 = 0
+    while i1 < trace1.len() {
+        if i1 > 0 { tr1 = tr1 + " → " }
+        tr1 = tr1 + trace1[i1].action
+        i1 = i1 + 1
+    }
+    println(tr1)
+    println("[selftest] T1 PASS")
+
+    // Test 2 — branched A→{B,C}→D, costs 1,3,2,0 → sum-semantics V*=6
+    //   any order satisfying deps: A first, then {B,C} in any order, then D.
+    //   Total = 1 + 3 + 2 + 0 = 6.
+    println("[selftest] T2 branched A→{B,C}→D (1,3,2,0)")
+    let m_a = make_node("A", "build", 1.0, [])
+    let m_b = make_node("B", "build", 3.0, ["A"])
+    let m_c = make_node("C", "build", 2.0, ["A"])
+    let m_d = make_node("D", "goal", 0.0, ["B", "C"])
+    let nodes_t2: [Node] = [m_a, m_b, m_c, m_d]
+    let res2 = run_vi(nodes_t2, [], 0.0, 1.0)
+    let g2 = memo_get(res2.memo, state_key([]))
+    if _str(g2[0]) != "found" {
+        eprintln("[selftest] T2 FAIL: V*(∅) not in memo")
+        exit(1)
+    }
+    let v2 = to_float(_str(g2[1]))
+    println("[selftest] T2 V*(∅) = " + fmt_min(v2) + "  expect 6m")
+    if approx_eq(v2, 6.0) == false {
+        eprintln("[selftest] T2 FAIL: expected 6.0, got " + to_string(v2))
+        exit(1)
+    }
+    let trace2 = recover_path(res2.memo, nodes_t2, [], 0.0, 1.0)
+    let mut tr2 = "  policy: "
+    let mut i2: i64 = 0
+    while i2 < trace2.len() {
+        if i2 > 0 { tr2 = tr2 + " → " }
+        tr2 = tr2 + trace2[i2].action
+        i2 = i2 + 1
+    }
+    println(tr2)
+    println("[selftest] T2 PASS")
+
+    // Test 3 — heuristic-vs-VI parity on linear chain (same)
+    println("[selftest] T3 linear heuristic-vs-VI parity")
+    let h_t1 = vstar_heuristic(nodes_t1, "A", 0.0, 1.0)
+    println("[selftest] T3 heuristic = " + fmt_min(h_t1) + "  VI = " + fmt_min(v1))
+    if approx_eq(h_t1, v1) == false {
+        eprintln("[selftest] T3 FAIL: linear heuristic should equal VI")
+        exit(1)
+    }
+    println("[selftest] T3 PASS")
+
+    println("[selftest] OK — all 3 cases passed")
+    exit(0)
+}
+
+// ── usage ─────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa run roadmap_vi.hexa plan <roadmap.json> [--start-state=id1,id2] [--force]")
+    eprintln("  hexa run roadmap_vi.hexa compare <roadmap.json>")
+    eprintln("  hexa run roadmap_vi.hexa --selftest")
+    exit(9)
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 { usage() }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        selftest()
+    }
+
+    if cmd == "plan" {
+        if a.len() < 2 { usage() }
+        let path = _str(a[1])
+        let mut start_csv = ""
+        let mut force: bool = false
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg.starts_with("--start-state=") {
+                start_csv = arg.substring(14, arg.len())
+            } else if arg == "--force" {
+                force = true
+            }
+            k = k + 1
+        }
+        let rm = load_roadmap(path)
+        cmd_plan(rm, start_csv, force)
+    }
+
+    if cmd == "compare" {
+        if a.len() < 2 { usage() }
+        let path = _str(a[1])
+        let rm = load_roadmap(path)
+        cmd_compare(rm)
+    }
+
+    usage()
+}
+
+main()

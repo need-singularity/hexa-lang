@@ -1,0 +1,175 @@
+// parallel_dispatch_guard.hexa — AN10 강제: 병렬 가능 작업 무조건 서브에이전트 병렬 백그라운드
+// @no-lock-needed
+// @allow-bare-exec
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   AN10 (shared/rules/anima.json) 강제 — "병렬 가능한 작업은 무조건
+//   서브에이전트 병렬 백그라운드 최우선" 위반 감지.
+//   HEXA-P9-1 연동: parallel_scheduler.hexa DAG 기반 병렬 스케줄링 지원.
+//
+// LOGIC
+//   prompt_scan 시 trigger keyword (go/keep/loop/병렬/동시/백그라운드) 감지 →
+//   최근 N 분 내 active Agent count 가 1 이하면 안티패턴 (순차 dispatch).
+//   stderr WARN — Claude 가 메시지 보고 추가 병렬 dispatch 실행.
+//   sched_status: parallel_scheduler 최근 실행 상태 조회.
+//
+// SSOT
+//   shared/rules/anima.json::rules[?id=="AN10"]      규칙 본문
+//   shared/tool/work_registry.jsonl                agent_ledger active count
+//   shared/tool/parallel_scheduler.hexa            DAG 기반 병렬 스케줄러 (HEXA-P9-1)
+//   shared/tool/parallel_sched_log.jsonl           스케줄러 실행 로그
+//
+// CLI
+//   hexa parallel_dispatch_guard.hexa check [seed]    prompt 검사 (기본)
+//   hexa parallel_dispatch_guard.hexa status          현재 active count + AN10 요약
+//   hexa parallel_dispatch_guard.hexa sched_status    parallel_scheduler 최근 결과 요약
+//   hexa parallel_dispatch_guard.hexa --selftest      jq + rule presence + scheduler 존재
+//
+// exit: 0 ok / 1 violation detected / 2 usage / 3 selftest fail
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let RULES = NEXUS + "/rules/anima.json"
+let REGISTRY = NEXUS + "/tool/work_registry.jsonl"
+let LOG = NEXUS + "/tool/parallel_guard.jsonl"
+let SCHEDULER = NEXUS + "/tool/parallel_scheduler.hexa"
+let SCHED_LOG = NEXUS + "/tool/parallel_sched_log.jsonl"
+let HEXA_BIN = NEXUS + "/bin/hexa"
+
+fn _ts_iso() -> string {
+    return exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+}
+
+fn _epoch() -> i64 {
+    return to_int(exec("date -u +%s").trim())
+}
+
+fn file_exists(p: string) -> bool {
+    return exec("test -f " + p + " ; echo $?").trim() == "0"
+}
+
+// active agent count (within last 30 min, status==active)
+fn active_agent_count() -> i64 {
+    if !file_exists(REGISTRY) { return 0 }
+    let now = _epoch()
+    let cutoff = now - 1800  // 30 min
+    let cmd = "awk -F'\"' -v c=" + to_string(cutoff)
+        + " 'BEGIN{n=0} /\"status\":\"active\"/ {"
+        + "  for(i=1;i<=NF;i++) if($i==\"ts_start\") { ts=$(i+2); gsub(/[^0-9]/, \"\", ts); if(ts==\"\") next; if(length(ts)>=10) ts=substr(ts,1,10); if(ts+0 >= c) n++ }"
+        + "} END{print n}' " + REGISTRY + " 2>/dev/null"
+    let out = exec(cmd).trim()
+    if out == "" || out == "null" { return 0 }
+    return to_int(out)
+}
+
+// trigger keywords from AN10
+fn has_trigger_keyword(seed: string) -> bool {
+    let kws: list = ["go", "keep", "loop", "병렬", "동시", "백그라운드", "가자", "루프"]
+    let mut i: i64 = 0
+    while i < kws.len() {
+        if seed.index_of(kws[i]) >= 0 { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn append_log(action: string, seed: string, active: i64, ts: string) {
+    let line = "{\"ts\":\"" + ts + "\",\"action\":\"" + action
+        + "\",\"seed\":\"" + seed.replace("\"", "'").replace("\n", " ")
+        + "\",\"active_agents\":" + to_string(active) + "}\n"
+    exec("printf '%s' '" + line.replace("'", "\"") + "' >> " + LOG)
+}
+
+// ── commands ────────────────────────────────────────────────────────────
+fn cmd_check(seed: string) -> i64 {
+    let ts = _ts_iso()
+    let trig = has_trigger_keyword(seed)
+    if !trig {
+        // no trigger keyword — silent OK
+        return 0
+    }
+    let active = active_agent_count()
+    if active >= 2 {
+        append_log("ok_parallel", seed, active, ts)
+        return 0  // already parallel
+    }
+    eprintln("AN10 WARN: '" + seed + "' is a parallel-capable trigger but only " + to_string(active) + " active agent(s) detected.")
+    eprintln("  → Dispatch additional independent subagents in a single message (run_in_background=true).")
+    eprintln("  rule: shared/rules/anima.json#AN10")
+    append_log("warn_sequential", seed, active, ts)
+    return 1
+}
+
+fn cmd_status() -> i64 {
+    let active = active_agent_count()
+    let an10 = exec("jq -r '.rules[] | select(.id==\"AN10\") | .rule' " + RULES + " 2>/dev/null").trim()
+    println("AN10 active agents (last 30min): " + to_string(active))
+    println("AN10 rule: " + an10.substring(0, if an10.len() > 80 { 80 } else { an10.len() }) + "...")
+    return 0
+}
+
+// ─── sched_status: parallel_scheduler 최근 결과 (HEXA-P9-1) ───
+fn cmd_sched_status() -> i64 {
+    if !file_exists(SCHEDULER) {
+        eprintln("parallel_scheduler.hexa not found — HEXA-P9-1 미설치")
+        return 1
+    }
+    let out = exec(HEXA_BIN + " run " + SCHEDULER + " status 2>&1").trim()
+    if out != "" { println(out) }
+    return 0
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    if exec("command -v jq 2>/dev/null").trim() == "" {
+        eprintln("selftest FAIL: jq missing"); fails = fails + 1
+    }
+    if !file_exists(RULES) { eprintln("selftest FAIL: missing " + RULES); fails = fails + 1 }
+    let an10_present = exec("jq -r '.rules[] | select(.id==\"AN10\") | .id' " + RULES + " 2>/dev/null").trim()
+    if an10_present != "AN10" { eprintln("selftest FAIL: AN10 not found in rules"); fails = fails + 1 }
+    // HEXA-P9-1: parallel_scheduler.hexa 존재 확인
+    if !file_exists(SCHEDULER) { eprintln("selftest FAIL: missing " + SCHEDULER); fails = fails + 1 }
+    if fails > 0 { return 3 }
+    println("parallel_dispatch_guard selftest OK · AN10 present · jq ready · scheduler present")
+    return 0
+}
+
+fn usage() {
+    eprintln("usage: hexa parallel_dispatch_guard.hexa <check|status|sched_status|--selftest> [seed]")
+}
+
+fn _arg_at(args: list, i: i64) -> string {
+    if i < args.len() { return args[i] }
+    return ""
+}
+
+fn main() -> i64 {
+    let args = argv()
+    let n = args.len()
+    let cmds: list = ["check", "status", "sched_status", "--selftest"]
+    let mut cmd = ""
+    let mut idx: i64 = -1
+    let mut i: i64 = 0
+    while i < n {
+        let a = args[i]
+        let mut j: i64 = 0
+        while j < cmds.len() {
+            if a == cmds[j] { cmd = a; idx = i; break }
+            j = j + 1
+        }
+        if cmd != "" { break }
+        i = i + 1
+    }
+    if cmd == "" { cmd = "check"; idx = n - 1 }
+    let seed = _arg_at(args, idx + 1)
+    if cmd == "check" { return cmd_check(seed) }
+    if cmd == "status" { return cmd_status() }
+    if cmd == "sched_status" { return cmd_sched_status() }
+    if cmd == "--selftest" { return cmd_selftest() }
+    usage()
+    return 2
+}
+
+exit(main())

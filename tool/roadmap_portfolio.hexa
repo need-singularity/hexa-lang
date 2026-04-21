@@ -1,0 +1,1394 @@
+// roadmap_portfolio.hexa — NEXUS-6 roadmap_engine v2 #5 multi-project portfolio scheduler
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   shared/roadmaps/*.json (백업 .bak.* 제외) 전체를 동시에 고려.
+//   각 로드맵의 ready ∪ in_progress 노드에 대해 marginal BT value /
+//   resource cost 를 계산하고 priority desc 로 rank.
+//   상위 K 개를 portfolio 추천.
+//
+// 알고리즘
+//   bt_value(n, R)     = w(R) · (progress(n) + 1/|R.nodes|)
+//                          w(R) = 1.5  if R.description 에 "핵심"|"마스터" 포함
+//                                 1.0  otherwise
+//   resource_cost(n)   = effective_cost(n, R.K_target, R.C_channel)
+//                          ≥ 0.01 floor (divide-by-zero guard)
+//   marginal           = bt_value / resource_cost
+//   priority           = marginal · (1 + 0.2 · η_current(R))
+//                          η_current = (avg done cost − bn cost) / avg done cost
+//                                       (간이 schedule.eta 와 동일)
+//   resource cap       = ntype 별 동시 실행 한도 (build=2, exp=3, learn=1, boot=2, verify=4)
+//                          fill-greedy by priority desc 로 cap 적용 후 skip
+//
+// CLI
+//   rank      [--k=10] [--cap-build=2] [--cap-exp=3] [--cap-learn=1] [--cap-boot=2] [--cap-verify=4]
+//                테이블 출력 (RANK PROJECT NODE TYPE COST η MARGINAL PRIORITY)
+//   summary   포트폴리오 요약 (projects/total_nodes/in_progress/ready/done + critical/blocked)
+//   dispatch  [--k=5]   roadmap_dispatch JSONL spec 호환 출력 (자체 생성)
+//   --selftest          /tmp 에 mock 로드맵 2-3개 만들어 검증
+//
+// SSOT input  : shared/roadmaps/*.json   (.bak.* 제외)
+// SSOT output : stdout
+//
+// EXIT
+//   0 success / 1 no actionable / 2 usage / 3 parse error
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let NEXUS_ROOT = if NEXUS != "" { NEXUS } else { HOME + "/Dev/nexus" }
+let HARNESS = NEXUS_ROOT + "/harness"
+let ROADMAPS = NEXUS_ROOT + "/roadmaps"
+
+// ── void-safe coercion (hexa stage1 함정 #7,#8 대응) ──────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+// f64 → i64 truncate (to_int invalid-literal trap 회피)
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+// ── _idx_of (missing-key void → -1 sentinel) ─────────────────────────────
+fn _idx_of_s(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── text-based JSON field extract (engine 과 동일) ──────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node + Roadmap (engine 과 동일 골격) ──────────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64
+}
+
+fn parse_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { f_to_i(nu) }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps, soft_deps: soft,
+        status: st, progress: pg
+    }
+}
+
+struct Roadmap {
+    id: string,
+    project: string,
+    goal: string,
+    start: string,
+    K_target: f64,
+    C_channel: f64,
+    description: string,
+    nodes: [Node]
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        return Roadmap {
+            id: "", project: "", goal: "", start: "",
+            K_target: 1.0, C_channel: 1.0, description: "", nodes: []
+        }
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        return Roadmap {
+            id: "", project: "", goal: "", start: "",
+            K_target: 1.0, C_channel: 1.0, description: "", nodes: []
+        }
+    }
+    // _meta sub-block 만 추출 (필드명 충돌 회피)
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let mut rid = json_str(meta_body, "id")
+    let proj = json_str(meta_body, "project")
+    if rid == "" { rid = proj }
+    let goal = json_str(meta_body, "goal")
+    let start = json_str(meta_body, "start")
+    let mut K = json_num(meta_body, "K_target")
+    if K <= 0.0 { K = 1.0 }
+    let mut C = json_num(meta_body, "C_channel")
+    if C <= 0.0 { C = 1.0 }
+    let desc = json_str(meta_body, "description")
+    let node_blocks = split_nodes(body)
+    let mut nodes: [Node] = []
+    let mut i: i64 = 0
+    while i < node_blocks.len() {
+        let n = parse_node(_str(node_blocks[i]))
+        if n.id.len() > 0 { nodes = nodes.push(n) }
+        i = i + 1
+    }
+    return Roadmap {
+        id: rid, project: proj, goal: goal, start: start,
+        K_target: K, C_channel: C, description: desc, nodes: nodes
+    }
+}
+
+// ── helpers ──────────────────────────────────────────────────────────────
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn effective_cost(n: Node, K: f64, C: f64) -> f64 {
+    let t = n.ntype
+    if t == "seed" { return 0.0 }
+    if t == "goal" { return n.cost }
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        return n.cost / p
+    }
+    if t == "learn" {
+        let e = if n.eta < 0.0 { 0.0 } else { n.eta }
+        let f = 1.0 - e
+        return n.cost * f
+    }
+    if t == "boot" {
+        let nu = if n.n_uses < 1 { 1 } else { n.n_uses }
+        return n.cost / to_float(to_string(nu))
+    }
+    if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let c = if C <= 0.0 { 1.0 } else { C }
+        return (k / c) + (n.cost * 0.25)
+    }
+    return n.cost
+}
+
+fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+    if is_done(n.status) { return 0.0 }
+    let c = effective_cost(n, K, C)
+    if n.status == "in_progress" {
+        let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+        return c * (1.0 - p)
+    }
+    return c
+}
+
+// ── ready/in_progress/done classification ─────────────────────────────────
+struct Buckets {
+    ready: [string],
+    in_progress: [string],
+    done: [string],
+    todo: [string],
+    blocked: [string]
+}
+
+fn classify(rm: Roadmap) -> Buckets {
+    let nodes = rm.nodes
+    let mut ready: [string] = []
+    let mut inp: [string] = []
+    let mut done_l: [string] = []
+    let mut todo_l: [string] = []
+    let mut blocked_l: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        if is_done(n.status) { done_l = done_l.push(n.id) }
+        else if n.status == "in_progress" { inp = inp.push(n.id) }
+        else if n.status == "blocked" || n.status == "failed" { blocked_l = blocked_l.push(n.id) }
+        else { todo_l = todo_l.push(n.id) }
+        if n.status == "todo" || n.status == "planned" {
+            let mut all_done: bool = true
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let pi = idx_of(nodes, _str(n.deps[j]))
+                if pi < 0 { all_done = false; break }
+                if is_done(nodes[pi].status) == false { all_done = false; break }
+                j = j + 1
+            }
+            if all_done { ready = ready.push(n.id) }
+        }
+        i = i + 1
+    }
+    return Buckets {
+        ready: ready, in_progress: inp,
+        done: done_l, todo: todo_l, blocked: blocked_l
+    }
+}
+
+// ── η_current(R) — schedule.eta 와 동일 공식 (직전 done 평균 vs bn cost) ──
+fn eta_current(rm: Roadmap, bk: Buckets) -> f64 {
+    let nodes = rm.nodes
+    let K = rm.K_target
+    let C = rm.C_channel
+    // bottleneck = max remaining_cost over (ready ∪ in_progress)
+    let mut bn_cost: f64 = -1.0
+    let mut k1: i64 = 0
+    while k1 < bk.in_progress.len() {
+        let ni = idx_of(nodes, _str(bk.in_progress[k1]))
+        if ni >= 0 {
+            let c = remaining_cost(nodes[ni], K, C)
+            if c > bn_cost { bn_cost = c }
+        }
+        k1 = k1 + 1
+    }
+    let mut k2: i64 = 0
+    while k2 < bk.ready.len() {
+        let ni = idx_of(nodes, _str(bk.ready[k2]))
+        if ni >= 0 {
+            let c = remaining_cost(nodes[ni], K, C)
+            if c > bn_cost { bn_cost = c }
+        }
+        k2 = k2 + 1
+    }
+    let mut sum_prev: f64 = 0.0
+    let mut cnt_prev: f64 = 0.0
+    let mut k3: i64 = 0
+    while k3 < bk.done.len() {
+        let ni = idx_of(nodes, _str(bk.done[k3]))
+        if ni >= 0 {
+            let c = effective_cost(nodes[ni], K, C)
+            if c > 0.0 { sum_prev = sum_prev + c; cnt_prev = cnt_prev + 1.0 }
+        }
+        k3 = k3 + 1
+    }
+    if cnt_prev <= 0.0 || bn_cost <= 0.0 { return 0.0 }
+    let avg = sum_prev / cnt_prev
+    if avg <= 0.0 { return 0.0 }
+    return 1.0 - (bn_cost / avg)
+}
+
+// ── T*(R) — DAG critical path (간이; 노드 < 200 안정) ─────────────────────
+fn children_of(nodes: [Node], nid: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        let mut j: i64 = 0
+        while j < n.deps.len() {
+            if _str(n.deps[j]) == nid { out = out.push(n.id); break }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn vstar(nodes: [Node], nid: string, K: f64, C: f64) -> f64 {
+    let ni = idx_of(nodes, nid)
+    if ni < 0 { return 0.0 }
+    let n = nodes[ni]
+    let self_cost = remaining_cost(n, K, C)
+    let kids = children_of(nodes, nid)
+    let mut best: f64 = 0.0
+    let mut ci: i64 = 0
+    while ci < kids.len() {
+        let v = vstar(nodes, _str(kids[ci]), K, C)
+        if v > best { best = v }
+        ci = ci + 1
+    }
+    return self_cost + best
+}
+
+fn t_star(rm: Roadmap) -> f64 {
+    if rm.nodes.len() == 0 { return 0.0 }
+    let mut start_id = rm.start
+    if start_id == "" {
+        let mut i: i64 = 0
+        while i < rm.nodes.len() {
+            if rm.nodes[i].deps.len() == 0 { start_id = rm.nodes[i].id; break }
+            i = i + 1
+        }
+    }
+    if start_id == "" { return 0.0 }
+    return vstar(rm.nodes, start_id, rm.K_target, rm.C_channel)
+}
+
+// ── project weight (description 키워드 매치) ─────────────────────────────
+// 기본 1.0. "핵심" 또는 "마스터" 포함 시 1.5
+fn project_weight(rm: Roadmap) -> f64 {
+    let d = rm.description
+    if d.len() == 0 { return 1.0 }
+    if d.contains("핵심") { return 1.5 }
+    if d.contains("마스터") { return 1.5 }
+    return 1.0
+}
+
+// ── bt_value / priority 계산 ─────────────────────────────────────────────
+fn bt_value(n: Node, rm: Roadmap) -> f64 {
+    let w = project_weight(rm)
+    let total = if rm.nodes.len() <= 0 { 1.0 } else { to_float(to_string(rm.nodes.len())) }
+    let inv = 1.0 / total
+    let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+    return w * (p + inv)
+}
+
+// resource_cost 는 effective_cost (≥0.01 floor 적용)
+fn resource_cost(n: Node, K: f64, C: f64) -> f64 {
+    let c = effective_cost(n, K, C)
+    if c < 0.01 { return 0.01 }
+    return c
+}
+
+fn priority_of(n: Node, rm: Roadmap, eta: f64) -> f64 {
+    let bv = bt_value(n, rm)
+    let rc = resource_cost(n, rm.K_target, rm.C_channel)
+    let marg = bv / rc
+    let boost = 1.0 + (0.2 * eta)
+    return marg * boost
+}
+
+// ── Candidate ────────────────────────────────────────────────────────────
+struct Candidate {
+    project: string,
+    rm_path: string,
+    rm_desc: string,
+    K_target: f64,
+    C_channel: f64,
+    node_id: string,
+    node_name: string,
+    ntype: string,
+    cost: f64,
+    eta: f64,
+    bt_value: f64,
+    marginal: f64,
+    priority: f64,
+    is_in_progress: bool
+}
+
+// ── parallel-list Roadmap struct holder ──────────────────────────────────
+// hexa 에서 [Roadmap] 도 가능하나, struct 안에 nested struct list 는 stage1
+// 검증 위해 path/Roadmap 를 분리 보유
+struct LoadedSet {
+    roadmaps: [Roadmap],
+    paths: [string]
+}
+
+// ── shared/roadmaps 디렉토리 스캔 ────────────────────────────────────────
+// .json 파일만, .bak.* 제외
+fn list_roadmap_files(dir: string) -> [string] {
+    let cmd = "ls -1 " + dir + "/*.json 2>/dev/null"
+    let out = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if out.len() == 0 { return [] }
+    let lines = out.split("\n")
+    let mut keep: [string] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let p = _str(lines[i]).trim()
+        if p.len() == 0 { i = i + 1; continue }
+        // .bak.* 제외 (filename 안에 ".bak" 포함되면 skip)
+        if p.contains(".bak") { i = i + 1; continue }
+        // _meta block 없는 파일도 일단 시도; load_roadmap 이 fallback
+        keep = keep.push(p)
+        i = i + 1
+    }
+    return keep
+}
+
+fn load_all(dir: string) -> LoadedSet {
+    let paths = list_roadmap_files(dir)
+    let mut rms: [Roadmap] = []
+    let mut keep_paths: [string] = []
+    let mut i: i64 = 0
+    while i < paths.len() {
+        let p = _str(paths[i])
+        let rm = load_roadmap(p)
+        // project id 가 비었거나 nodes 0 이면 분석 대상 X (그러나 summary 에는 카운트)
+        rms = rms.push(rm)
+        keep_paths = keep_paths.push(p)
+        i = i + 1
+    }
+    return LoadedSet { roadmaps: rms, paths: keep_paths }
+}
+
+// ── candidate 수집 (전 로드맵 × ready ∪ in_progress) ─────────────────────
+fn collect_candidates(set: LoadedSet) -> [Candidate] {
+    let mut out: [Candidate] = []
+    let mut i: i64 = 0
+    while i < set.roadmaps.len() {
+        let rm = set.roadmaps[i]
+        if rm.nodes.len() == 0 { i = i + 1; continue }
+        let bk = classify(rm)
+        let eta = eta_current(rm, bk)
+        // in_progress 우선
+        let mut k: i64 = 0
+        while k < bk.in_progress.len() {
+            let nid = _str(bk.in_progress[k])
+            let ni = idx_of(rm.nodes, nid)
+            if ni >= 0 {
+                let n = rm.nodes[ni]
+                let bv = bt_value(n, rm)
+                let rc = resource_cost(n, rm.K_target, rm.C_channel)
+                let marg = bv / rc
+                let pri = priority_of(n, rm, eta)
+                let proj_id = if rm.project != "" { rm.project } else { rm.id }
+                out = out.push(Candidate {
+                    project: proj_id,
+                    rm_path: _str(set.paths[i]),
+                    rm_desc: rm.description,
+                    K_target: rm.K_target,
+                    C_channel: rm.C_channel,
+                    node_id: n.id,
+                    node_name: n.name,
+                    ntype: n.ntype,
+                    cost: rc,
+                    eta: eta,
+                    bt_value: bv,
+                    marginal: marg,
+                    priority: pri,
+                    is_in_progress: true
+                })
+            }
+            k = k + 1
+        }
+        // ready
+        let mut m: i64 = 0
+        while m < bk.ready.len() {
+            let nid = _str(bk.ready[m])
+            let ni = idx_of(rm.nodes, nid)
+            if ni >= 0 {
+                let n = rm.nodes[ni]
+                let bv = bt_value(n, rm)
+                let rc = resource_cost(n, rm.K_target, rm.C_channel)
+                let marg = bv / rc
+                let pri = priority_of(n, rm, eta)
+                let proj_id = if rm.project != "" { rm.project } else { rm.id }
+                out = out.push(Candidate {
+                    project: proj_id,
+                    rm_path: _str(set.paths[i]),
+                    rm_desc: rm.description,
+                    K_target: rm.K_target,
+                    C_channel: rm.C_channel,
+                    node_id: n.id,
+                    node_name: n.name,
+                    ntype: n.ntype,
+                    cost: rc,
+                    eta: eta,
+                    bt_value: bv,
+                    marginal: marg,
+                    priority: pri,
+                    is_in_progress: false
+                })
+            }
+            m = m + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── bubble sort priority desc (n < 200 OK) ──────────────────────────────
+// hexa stage1 함정 #3 list[i]=v no-op 회피 → slice + concat 패턴
+fn sort_candidates(xs: [Candidate]) -> [Candidate] {
+    let mut a = xs
+    let n = a.len()
+    let mut i: i64 = 0
+    while i < n {
+        let mut j: i64 = 0
+        while j < n - 1 - i {
+            if a[j].priority < a[j + 1].priority {
+                let tmp = a[j]
+                let mut rebuilt: [Candidate] = []
+                let mut z: i64 = 0
+                while z < a.len() {
+                    if z == j { rebuilt = rebuilt.push(a[j + 1]) }
+                    else if z == j + 1 { rebuilt = rebuilt.push(tmp) }
+                    else { rebuilt = rebuilt.push(a[z]) }
+                    z = z + 1
+                }
+                a = rebuilt
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return a
+}
+
+// ── resource cap 적용 (greedy by priority desc) ──────────────────────────
+struct CapState {
+    cap_build: i64,
+    cap_exp: i64,
+    cap_learn: i64,
+    cap_boot: i64,
+    cap_verify: i64
+}
+
+fn default_caps() -> CapState {
+    return CapState {
+        cap_build: 2, cap_exp: 3, cap_learn: 1, cap_boot: 2, cap_verify: 4
+    }
+}
+
+fn apply_caps(sorted: [Candidate], caps: CapState) -> [Candidate] {
+    let mut out: [Candidate] = []
+    let mut used_build: i64 = 0
+    let mut used_exp: i64 = 0
+    let mut used_learn: i64 = 0
+    let mut used_boot: i64 = 0
+    let mut used_verify: i64 = 0
+    let mut i: i64 = 0
+    while i < sorted.len() {
+        let c = sorted[i]
+        let t = c.ntype
+        let mut take: bool = true
+        if t == "build" {
+            if used_build >= caps.cap_build { take = false } else { used_build = used_build + 1 }
+        } else if t == "exp" {
+            if used_exp >= caps.cap_exp { take = false } else { used_exp = used_exp + 1 }
+        } else if t == "learn" {
+            if used_learn >= caps.cap_learn { take = false } else { used_learn = used_learn + 1 }
+        } else if t == "boot" {
+            if used_boot >= caps.cap_boot { take = false } else { used_boot = used_boot + 1 }
+        } else if t == "verify" {
+            if used_verify >= caps.cap_verify { take = false } else { used_verify = used_verify + 1 }
+        }
+        // seed/goal 등 cap 적용 X
+        if take { out = out.push(c) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── pretty print helpers ─────────────────────────────────────────────────
+fn pad_right(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = r + " " }
+    if r.len() > w { r = r.substring(0, w) }
+    return r
+}
+
+fn pad_left(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = " " + r }
+    return r
+}
+
+fn fmt_f1(x: f64) -> string {
+    let scaled = x * 10.0
+    let r = f_to_i(scaled + (if x >= 0.0 { 0.5 } else { -0.5 }))
+    let neg = r < 0
+    let ar = if neg { 0 - r } else { r }
+    let whole = ar / 10
+    let frac = ar - (whole * 10)
+    let body = to_string(whole) + "." + to_string(frac)
+    if neg { return "-" + body }
+    return body
+}
+
+fn fmt_f3(x: f64) -> string {
+    let scaled = x * 1000.0
+    let r = f_to_i(scaled + (if x >= 0.0 { 0.5 } else { -0.5 }))
+    let neg = r < 0
+    let ar = if neg { 0 - r } else { r }
+    let whole = ar / 1000
+    let frac = ar - (whole * 1000)
+    let mut fs = to_string(frac)
+    while fs.len() < 3 { fs = "0" + fs }
+    let body = to_string(whole) + "." + fs
+    if neg { return "-" + body }
+    return body
+}
+
+fn fmt_f3_signed(x: f64) -> string {
+    if x >= 0.0 { return "+" + fmt_f3(x) }
+    return fmt_f3(x)
+}
+
+// ── escape JSON ──────────────────────────────────────────────────────────
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ── command: rank ────────────────────────────────────────────────────────
+fn cmd_rank(k: i64, caps: CapState) -> i64 {
+    let set = load_all(ROADMAPS)
+    let cands = collect_candidates(set)
+    if cands.len() == 0 {
+        eprintln("WARN: no actionable nodes across portfolio (" + to_string(set.roadmaps.len()) + " roadmaps scanned)")
+        return 1
+    }
+    let sorted = sort_candidates(cands)
+    let capped = apply_caps(sorted, caps)
+    let limit = if k > capped.len() { capped.len() } else { k }
+    if limit <= 0 {
+        eprintln("WARN: cap-filtered to 0 candidates")
+        return 1
+    }
+    // header
+    let h_rank = pad_left("RANK", 4)
+    let h_proj = pad_right("PROJECT", 16)
+    let h_node = pad_right("NODE", 22)
+    let h_type = pad_right("TYPE", 7)
+    let h_cost = pad_left("COST", 8)
+    let h_eta = pad_left("η", 8)
+    let h_marg = pad_left("MARGINAL", 10)
+    let h_pri = pad_left("PRIORITY", 10)
+    println(h_rank + "  " + h_proj + "  " + h_node + "  " + h_type + "  " + h_cost + "  " + h_eta + "  " + h_marg + "  " + h_pri)
+    let mut i: i64 = 0
+    while i < limit {
+        let c = capped[i]
+        let r = pad_left(to_string(i + 1), 4)
+        let p = pad_right(c.project, 16)
+        let nid = pad_right(c.node_id, 22)
+        let t = pad_right(c.ntype, 7)
+        let cost = pad_left(fmt_f1(c.cost), 8)
+        let eta = pad_left(fmt_f3_signed(c.eta), 8)
+        let mar = pad_left(fmt_f3(c.marginal), 10)
+        let pri = pad_left(fmt_f3(c.priority), 10)
+        println(r + "  " + p + "  " + nid + "  " + t + "  " + cost + "  " + eta + "  " + mar + "  " + pri)
+        i = i + 1
+    }
+    return 0
+}
+
+// ── command: summary ─────────────────────────────────────────────────────
+fn cmd_summary() -> i64 {
+    let set = load_all(ROADMAPS)
+    let mut total_nodes: i64 = 0
+    let mut total_inp: i64 = 0
+    let mut total_ready: i64 = 0
+    let mut total_done: i64 = 0
+    let mut crit_id: string = ""
+    let mut crit_T: f64 = -1.0
+    let mut blocked_id: string = ""
+    let mut blocked_count: i64 = 0
+    let mut active_proj: i64 = 0
+    let mut i: i64 = 0
+    while i < set.roadmaps.len() {
+        let rm = set.roadmaps[i]
+        if rm.nodes.len() == 0 { i = i + 1; continue }
+        active_proj = active_proj + 1
+        let bk = classify(rm)
+        total_nodes = total_nodes + rm.nodes.len()
+        total_inp = total_inp + bk.in_progress.len()
+        total_ready = total_ready + bk.ready.len()
+        total_done = total_done + bk.done.len()
+        let T = t_star(rm)
+        let proj_id = if rm.project != "" { rm.project } else { rm.id }
+        if T > crit_T { crit_T = T; crit_id = proj_id }
+        // blocked: ready=0 && in_progress=0 && todo>0 → replan needed
+        if bk.ready.len() == 0 && bk.in_progress.len() == 0 && bk.todo.len() > 0 {
+            // pick first such project (ties: largest todo)
+            if bk.todo.len() > blocked_count {
+                blocked_count = bk.todo.len()
+                blocked_id = proj_id
+            }
+        }
+        i = i + 1
+    }
+    println("projects: " + to_string(active_proj) + "  total_nodes: " + to_string(total_nodes) + "  in_progress: " + to_string(total_inp) + "  ready: " + to_string(total_ready) + "  done: " + to_string(total_done))
+    if crit_id != "" {
+        println("critical project: " + crit_id + "  (largest T* = " + fmt_f1(crit_T) + ")")
+    } else {
+        println("critical project: (none)")
+    }
+    if blocked_id != "" {
+        println("blocked project: " + blocked_id + "  (replan needed)")
+    } else {
+        println("blocked project: (none)")
+    }
+    return 0
+}
+
+// ── command: dispatch ────────────────────────────────────────────────────
+// roadmap_dispatch JSONL spec 호환: ts/rm/node/subagent_type/description/prompt/priority/deps_met/dry_run
+fn map_subagent(ntype: string) -> string {
+    if ntype == "learn" { return "Explore" }
+    if ntype == "verify" { return "code-reviewer" }
+    return "general-purpose"
+}
+
+fn map_template(ntype: string, name: string) -> string {
+    if ntype == "build"  { return "build 구현 — " + name }
+    if ntype == "exp"    { return "실험 설계+1회 실행 — " + name }
+    if ntype == "learn"  { return "코드/문서 학습 — " + name }
+    if ntype == "boot"   { return "boot 작업 — " + name }
+    if ntype == "verify" { return "검증 — " + name }
+    return "수행 — " + name
+}
+
+fn build_prompt_inline(c: Candidate) -> string {
+    let p1 = "TASK: portfolio 노드 " + c.node_id + " 수행 (project=" + c.project + ")."
+    let p2 = "목표: " + c.node_name
+    let p3 = "타입: " + c.ntype + " cost=" + fmt_f1(c.cost) + " priority=" + fmt_f3(c.priority)
+    let p4 = "보고: 200단어 이내. ntype=" + c.ntype + " 과제 결과 + cost 실측."
+    return p1 + "\\n" + p2 + "\\n" + p3 + "\\n" + p4
+}
+
+fn cmd_dispatch(k: i64, caps: CapState) -> i64 {
+    let set = load_all(ROADMAPS)
+    let cands = collect_candidates(set)
+    if cands.len() == 0 {
+        eprintln("WARN: no actionable nodes")
+        return 1
+    }
+    let sorted = sort_candidates(cands)
+    let capped = apply_caps(sorted, caps)
+    let limit = if k > capped.len() { capped.len() } else { k }
+    let ts = _ts_iso()
+    let mut i: i64 = 0
+    while i < limit {
+        let c = capped[i]
+        let sub = map_subagent(c.ntype)
+        let desc = map_template(c.ntype, c.node_name)
+        let prm = build_prompt_inline(c)
+        let line = "{\"ts\":\"" + ts
+            + "\",\"rm\":\"" + escape_json(c.project)
+            + "\",\"node\":\"" + escape_json(c.node_id)
+            + "\",\"subagent_type\":\"" + escape_json(sub)
+            + "\",\"description\":\"" + escape_json(desc)
+            + "\",\"prompt\":\"" + escape_json(prm)
+            + "\",\"priority\":" + fmt_f3(c.priority)
+            + ",\"deps_met\":true,\"dry_run\":false}"
+        println(line)
+        i = i + 1
+    }
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+// /tmp 에 mock roadmap 2-3 개 생성 → load → rank/summary 실행
+fn write_tmp_roadmap(path: string, body: string) {
+    // 단순 write
+    let _ = exec("rm -f '" + path + "' 2>/dev/null")  // @allow-bare-exec
+    write_file(path, body)
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_portfolio")
+    let dir = "/tmp/nexus_portfolio_st"
+    let _ = exec("rm -rf " + dir + " && mkdir -p " + dir)  // @allow-bare-exec
+
+    // mock 1: alpha (nodes 4, project=alpha, description "핵심" → weight 1.5)
+    let m1 = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"alpha\",\n"
+        + "    \"project\": \"alpha\",\n"
+        + "    \"goal\": \"G\",\n"
+        + "    \"start\": \"s\",\n"
+        + "    \"K_target\": 100,\n"
+        + "    \"C_channel\": 20,\n"
+        + "    \"description\": \"alpha 핵심 트랙\"\n"
+        + "  },\n"
+        + "  \"nodes\": [\n"
+        + "    { \"id\": \"s\",  \"type\": \"seed\",  \"cost\": 0,  \"status\": \"done\",        \"progress\": 1.0, \"deps\": [] },\n"
+        + "    { \"id\": \"b1\", \"type\": \"build\", \"cost\": 12, \"status\": \"in_progress\", \"progress\": 0.3, \"deps\": [\"s\"] },\n"
+        + "    { \"id\": \"b2\", \"type\": \"build\", \"cost\": 8,  \"status\": \"todo\",        \"deps\": [\"s\"] },\n"
+        + "    { \"id\": \"g\",  \"type\": \"goal\",  \"cost\": 2,  \"status\": \"todo\",        \"deps\": [\"b1\",\"b2\"] }\n"
+        + "  ]\n"
+        + "}\n"
+    write_tmp_roadmap(dir + "/alpha.json", m1)
+
+    // mock 2: beta (nodes 3, plain weight 1.0)
+    let m2 = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"beta\",\n"
+        + "    \"project\": \"beta\",\n"
+        + "    \"goal\": \"G\",\n"
+        + "    \"start\": \"s\",\n"
+        + "    \"K_target\": 50,\n"
+        + "    \"C_channel\": 10,\n"
+        + "    \"description\": \"beta basic\"\n"
+        + "  },\n"
+        + "  \"nodes\": [\n"
+        + "    { \"id\": \"s\",  \"type\": \"seed\",  \"cost\": 0, \"status\": \"done\", \"progress\": 1.0, \"deps\": [] },\n"
+        + "    { \"id\": \"l1\", \"type\": \"learn\", \"cost\": 6, \"status\": \"todo\", \"deps\": [\"s\"] },\n"
+        + "    { \"id\": \"v1\", \"type\": \"verify\",\"cost\": 4, \"status\": \"todo\", \"deps\": [\"l1\"] }\n"
+        + "  ]\n"
+        + "}\n"
+    write_tmp_roadmap(dir + "/beta.json", m2)
+
+    // mock 3: gamma (blocked — todo deps 미완)
+    let m3 = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"gamma\",\n"
+        + "    \"project\": \"gamma\",\n"
+        + "    \"goal\": \"G\",\n"
+        + "    \"start\": \"s\",\n"
+        + "    \"K_target\": 10,\n"
+        + "    \"C_channel\": 5,\n"
+        + "    \"description\": \"gamma blocked\"\n"
+        + "  },\n"
+        + "  \"nodes\": [\n"
+        + "    { \"id\": \"s\",  \"type\": \"seed\",  \"cost\": 0, \"status\": \"done\", \"progress\": 1.0, \"deps\": [] },\n"
+        + "    { \"id\": \"x1\", \"type\": \"build\", \"cost\": 9, \"status\": \"todo\", \"deps\": [\"missing\"] }\n"
+        + "  ]\n"
+        + "}\n"
+    write_tmp_roadmap(dir + "/gamma.json", m3)
+
+    // .bak.* 파일도 작성 → 제외 검증
+    write_tmp_roadmap(dir + "/alpha.json.bak.20260416", m1)
+
+    // list_roadmap_files 검증
+    let files = list_roadmap_files(dir)
+    println("[selftest] scanned files: " + to_string(files.len()))
+    if files.len() != 3 {
+        eprintln("REJECT: expected 3 files (.bak excluded), got " + to_string(files.len()))
+        let mut fi: i64 = 0
+        while fi < files.len() {
+            eprintln("  - " + _str(files[fi]))
+            fi = fi + 1
+        }
+        return 1
+    }
+    // .bak 제외 확인
+    let mut k1: i64 = 0
+    while k1 < files.len() {
+        if _str(files[k1]).contains(".bak") {
+            eprintln("REJECT: .bak file leaked: " + _str(files[k1]))
+            return 1
+        }
+        k1 = k1 + 1
+    }
+    println("[selftest] .bak.* exclusion OK")
+
+    // load + classify
+    let set = LoadedSet { roadmaps: [], paths: [] }
+    let loaded = load_all(dir)
+    println("[selftest] loaded roadmaps: " + to_string(loaded.roadmaps.len()))
+    if loaded.roadmaps.len() != 3 {
+        eprintln("REJECT: load_all should return 3 roadmaps")
+        return 1
+    }
+
+    // candidate 수집
+    let cands = collect_candidates(loaded)
+    println("[selftest] candidates: " + to_string(cands.len()))
+    // alpha: in_progress=b1, ready=b2 → 2
+    // beta: ready=l1 → 1   (v1 deps unmet)
+    // gamma: 0 (deps unmet)
+    if cands.len() != 3 {
+        eprintln("REJECT: expected 3 candidates, got " + to_string(cands.len()))
+        let mut ci: i64 = 0
+        while ci < cands.len() {
+            eprintln("  - " + cands[ci].project + ":" + cands[ci].node_id + " " + cands[ci].ntype)
+            ci = ci + 1
+        }
+        return 1
+    }
+    println("[selftest] candidate count OK (alpha:2, beta:1, gamma:0)")
+
+    // alpha weight = 1.5 검증
+    let mut alpha_b1_idx: i64 = -1
+    let mut beta_l1_idx: i64 = -1
+    let mut k2: i64 = 0
+    while k2 < cands.len() {
+        let c = cands[k2]
+        if c.project == "alpha" && c.node_id == "b1" { alpha_b1_idx = k2 }
+        if c.project == "beta" && c.node_id == "l1" { beta_l1_idx = k2 }
+        k2 = k2 + 1
+    }
+    if alpha_b1_idx < 0 || beta_l1_idx < 0 {
+        eprintln("REJECT: alpha/b1 or beta/l1 not in candidates")
+        return 1
+    }
+    // alpha desc 에 "핵심" → weight 1.5
+    // bt = 1.5 * (0.3 + 1/4) = 1.5 * 0.55 = 0.825
+    let alpha_bv = cands[alpha_b1_idx].bt_value
+    if alpha_bv < 0.8 || alpha_bv > 0.85 {
+        eprintln("REJECT: alpha b1 bt_value expected ~0.825, got " + fmt_f3(alpha_bv))
+        return 1
+    }
+    println("[selftest] alpha weight 1.5 OK (bt_value=" + fmt_f3(alpha_bv) + ")")
+    // beta plain → weight 1.0; bt = 1.0 * (0 + 1/3) = 0.333
+    let beta_bv = cands[beta_l1_idx].bt_value
+    if beta_bv < 0.32 || beta_bv > 0.35 {
+        eprintln("REJECT: beta l1 bt_value expected ~0.333, got " + fmt_f3(beta_bv))
+        return 1
+    }
+    println("[selftest] beta weight 1.0 OK (bt_value=" + fmt_f3(beta_bv) + ")")
+
+    // sort
+    let sorted = sort_candidates(cands)
+<<<<<<< Updated upstream
+    let mut prev: f64 = 999999999.0
+=======
+    let mut prev: f64 = 9.99e30
+>>>>>>> Stashed changes
+    let mut k3: i64 = 0
+    while k3 < sorted.len() {
+        let p = sorted[k3].priority
+        if p > prev {
+            eprintln("REJECT: not sorted desc @ " + sorted[k3].node_id + " p=" + fmt_f3(p) + " prev=" + fmt_f3(prev))
+            return 1
+        }
+        prev = p
+        k3 = k3 + 1
+    }
+    println("[selftest] sort desc OK")
+
+    // cap test: cap_build=1 → alpha 의 build 후보 2개 중 1개만 통과
+    let caps_strict = CapState { cap_build: 1, cap_exp: 3, cap_learn: 1, cap_boot: 2, cap_verify: 4 }
+    let capped = apply_caps(sorted, caps_strict)
+    let mut build_count: i64 = 0
+    let mut k4: i64 = 0
+    while k4 < capped.len() {
+        if capped[k4].ntype == "build" { build_count = build_count + 1 }
+        k4 = k4 + 1
+    }
+    if build_count != 1 {
+        eprintln("REJECT: cap_build=1 expected 1 build, got " + to_string(build_count))
+        return 1
+    }
+    println("[selftest] cap_build=1 OK (1 build retained)")
+
+    // rank table 출력 (k=10, default caps)
+    println("[selftest] --- rank output ---")
+    // ROADMAPS 를 임시로 dir 로 swap 불가; cmd_rank 직접 호출 대신 인라인 출력
+    let caps = default_caps()
+    let capped2 = apply_caps(sorted, caps)
+    let limit = if 10 > capped2.len() { capped2.len() } else { 10 }
+    let h_rank = pad_left("RANK", 4)
+    let h_proj = pad_right("PROJECT", 12)
+    let h_node = pad_right("NODE", 16)
+    let h_type = pad_right("TYPE", 7)
+    let h_cost = pad_left("COST", 8)
+    let h_eta = pad_left("η", 8)
+    let h_marg = pad_left("MARGINAL", 10)
+    let h_pri = pad_left("PRIORITY", 10)
+    println(h_rank + "  " + h_proj + "  " + h_node + "  " + h_type + "  " + h_cost + "  " + h_eta + "  " + h_marg + "  " + h_pri)
+    let mut k5: i64 = 0
+    while k5 < limit {
+        let c = capped2[k5]
+        let r = pad_left(to_string(k5 + 1), 4)
+        let p = pad_right(c.project, 12)
+        let nid = pad_right(c.node_id, 16)
+        let t = pad_right(c.ntype, 7)
+        let cost = pad_left(fmt_f1(c.cost), 8)
+        let eta = pad_left(fmt_f3_signed(c.eta), 8)
+        let mar = pad_left(fmt_f3(c.marginal), 10)
+        let pri = pad_left(fmt_f3(c.priority), 10)
+        println(r + "  " + p + "  " + nid + "  " + t + "  " + cost + "  " + eta + "  " + mar + "  " + pri)
+        k5 = k5 + 1
+    }
+
+    // summary stat 인라인 검증
+    let mut total_nodes: i64 = 0
+    let mut total_done: i64 = 0
+    let mut k6: i64 = 0
+    while k6 < loaded.roadmaps.len() {
+        let rm = loaded.roadmaps[k6]
+        let bk = classify(rm)
+        total_nodes = total_nodes + rm.nodes.len()
+        total_done = total_done + bk.done.len()
+        k6 = k6 + 1
+    }
+    // 4+3+2 = 9 nodes, 3 done (각 seed)
+    if total_nodes != 9 {
+        eprintln("REJECT: total_nodes expected 9, got " + to_string(total_nodes))
+        return 1
+    }
+    if total_done != 3 {
+        eprintln("REJECT: total_done expected 3, got " + to_string(total_done))
+        return 1
+    }
+    println("[selftest] summary stats OK (nodes=9 done=3)")
+
+    // dispatch JSONL 라인 1개 sanity
+    let top = capped2[0]
+    let sub = map_subagent(top.ntype)
+    let line = "{\"ts\":\"" + _ts_iso() + "\",\"rm\":\"" + escape_json(top.project) + "\",\"node\":\"" + escape_json(top.node_id) + "\",\"subagent_type\":\"" + escape_json(sub) + "\"}"
+    if line.contains("subagent_type") == false {
+        eprintln("REJECT: dispatch line missing subagent_type")
+        return 1
+    }
+    println("[selftest] dispatch sample: " + line)
+
+    println("[selftest] OK")
+    return 0
+}
+
+// ── usage ────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage: roadmap_portfolio <subcommand> [flags]")
+    eprintln("  rank      [--k=10] [--cap-build=2] [--cap-exp=3] [--cap-learn=1] [--cap-boot=2] [--cap-verify=4]")
+    eprintln("  summary")
+    eprintln("  dispatch  [--k=5]")
+    eprintln("  --selftest")
+}
+
+// ── flag parsing ─────────────────────────────────────────────────────────
+fn parse_int_flag(arg: string, prefix: string, default_v: i64) -> i64 {
+    if arg.starts_with(prefix) {
+        let s = arg.substring(prefix.len(), arg.len())
+        if s.len() == 0 { return default_v }
+        // safe to_int (digits only)
+        let mut i: i64 = 0
+        let mut neg: bool = false
+        if s.substring(0, 1) == "-" { neg = true; i = 1 }
+        let mut v: i64 = 0
+        while i < s.len() {
+            let c = s.substring(i, i + 1)
+            if is_digit(c) == false { return default_v }
+            v = v * 10 + to_int(c)
+            i = i + 1
+        }
+        if neg { return 0 - v }
+        return v
+    }
+    return default_v
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        usage()
+        exit(2)
+    }
+
+    let sub = _str(a[0])
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        usage()
+        exit(0)
+    }
+
+    // parse common flags after sub
+    let mut k_val: i64 = if sub == "dispatch" { 5 } else { 10 }
+    let mut caps = default_caps()
+    let mut idx: i64 = 1
+    while idx < a.len() {
+        let arg = _str(a[idx])
+        if arg.starts_with("--k=") {
+            k_val = parse_int_flag(arg, "--k=", k_val)
+        } else if arg.starts_with("--cap-build=") {
+            caps = CapState {
+                cap_build: parse_int_flag(arg, "--cap-build=", caps.cap_build),
+                cap_exp: caps.cap_exp, cap_learn: caps.cap_learn,
+                cap_boot: caps.cap_boot, cap_verify: caps.cap_verify
+            }
+        } else if arg.starts_with("--cap-exp=") {
+            caps = CapState {
+                cap_build: caps.cap_build,
+                cap_exp: parse_int_flag(arg, "--cap-exp=", caps.cap_exp),
+                cap_learn: caps.cap_learn,
+                cap_boot: caps.cap_boot, cap_verify: caps.cap_verify
+            }
+        } else if arg.starts_with("--cap-learn=") {
+            caps = CapState {
+                cap_build: caps.cap_build, cap_exp: caps.cap_exp,
+                cap_learn: parse_int_flag(arg, "--cap-learn=", caps.cap_learn),
+                cap_boot: caps.cap_boot, cap_verify: caps.cap_verify
+            }
+        } else if arg.starts_with("--cap-boot=") {
+            caps = CapState {
+                cap_build: caps.cap_build, cap_exp: caps.cap_exp,
+                cap_learn: caps.cap_learn,
+                cap_boot: parse_int_flag(arg, "--cap-boot=", caps.cap_boot),
+                cap_verify: caps.cap_verify
+            }
+        } else if arg.starts_with("--cap-verify=") {
+            caps = CapState {
+                cap_build: caps.cap_build, cap_exp: caps.cap_exp,
+                cap_learn: caps.cap_learn, cap_boot: caps.cap_boot,
+                cap_verify: parse_int_flag(arg, "--cap-verify=", caps.cap_verify)
+            }
+        } else if arg.starts_with("--") {
+            eprintln("WARN: unknown flag: " + arg)
+        }
+        idx = idx + 1
+    }
+
+    if sub == "rank" {
+        let rc = cmd_rank(k_val, caps)
+        exit(rc)
+    }
+    if sub == "summary" {
+        let rc = cmd_summary()
+        exit(rc)
+    }
+    if sub == "dispatch" {
+        let rc = cmd_dispatch(k_val, caps)
+        exit(rc)
+    }
+    eprintln("REJECT: unknown subcommand: " + sub)
+    usage()
+    exit(2)
+}
+
+main()

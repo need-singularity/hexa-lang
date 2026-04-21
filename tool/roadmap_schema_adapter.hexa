@@ -1,0 +1,1097 @@
+// roadmap_schema_adapter.hexa — NEXUS-6 roadmap v2 schema adapter
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   shared/roadmaps/ 두 스키마를 양방향(현재는 v2→v1) 변환:
+//     A) v1 flat   : { _meta:{...}, nodes:[{id,type,cost,deps,...}] }   (engine_schema.json)
+//     B) v2 tracks : { _meta:{...}, tracks:{...}, phases:[{parallel:[{track,tasks:[{id,task,status,...}]}]}] }
+//   roadmap_engine.hexa 는 A 만 이해 → B 로드맵을 A 로 변환해 cache 에 저장.
+//
+// 알고리즘 (B → A)
+//   1) phases[] 순회 → parallel[] 순회 → tasks[] 순회. 각 task = 1 Node.
+//   2) Node 매핑:
+//        id        = task.id
+//        name      = task.task | task.name | id
+//        type      = derive_type(track, task.type) — track-name 기반 build/exp/learn/boot/verify
+//        cost      = task.cost(num) | 10.0
+//        p_success = task.p_success | 1.0
+//        eta       = task.eta | 0.0
+//        n_uses    = task.n_uses | 1
+//        deps      = task.deps + task.dependencies + task.depends_on (병합) +
+//                    phase[k-1] gate_node 자동 주입 (sequential phase chain)
+//        soft_deps = task.soft_deps
+//        status    = task.status | "todo"
+//        progress  = task.progress | 0.0
+//   3) parallel block 내부 task 들은 동일 track 내에서 순차(deps chain), 다른 track 과 독립.
+//      ⟹ task[i+1].deps += [task[i].id]   (intra-track sequential)
+//   4) Synthetic 노드:
+//        _seed   : type=seed, cost=0, deps=[], status=done
+//        _goal   : type=goal, cost=0, deps=[<last phase 의 leaf 들>]
+//      첫 phase 의 첫 task 들 deps 에 _seed 주입.
+//      phase[k+1] 의 첫 task 들 deps 에 phase[k] 마지막 task(들) 주입 (cross-phase serial).
+//   5) JSON 직렬화: {id, goal, start, K_target, C_channel, updated, description, nodes:[...]}.
+//
+// CLI
+//   hexa shared/tool/roadmap_schema_adapter.hexa detect <path>
+//       exit: 0=v1_flat / 1=v2_tracks / 2=unknown
+//   hexa shared/tool/roadmap_schema_adapter.hexa to-flat <path> [--out=<out.json>]
+//       v2→v1 변환. stdout(default) 또는 --out 파일.
+//   hexa shared/tool/roadmap_schema_adapter.hexa batch
+//       shared/roadmaps/*.json 전수 → roadmap_flat_cache/<id>.json (mtime skip).
+//   hexa shared/tool/roadmap_schema_adapter.hexa --selftest
+//       내장 mini v2/v1 샘플 — 변환 후 roadmap_engine load 가능 검증.
+//
+// exit (수렴):
+//   detect    0 v1 / 1 v2 / 2 unknown
+//   to-flat   0 OK / 2 usage / 3 parse / 4 write fail
+//   batch     0 OK / 5 partial fail (failed > 0)
+//   selftest  0 OK / 6 PASS-FAIL
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_BASE = HOME + "/Dev/nexus"
+let HARNESS_DIR = NEXUS_BASE + "/harness"
+let ROADMAPS_DIR = NEXUS_BASE + "/roadmaps"
+let CACHE_DIR = HARNESS_DIR + "/roadmap_flat_cache"
+
+// ── void-safe coercion (hexa pitfalls) ───────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = s.split("\n")[0].trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _idx_of_str(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _contains_str(xs: [string], v: string) -> bool {
+    return _idx_of_str(xs, v) >= 0
+}
+
+// ── shell-quote (for exec) ───────────────────────────────────────────────
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ── stat-based mtime (no native builtin) ─────────────────────────────────
+fn _mtime(path: string) -> i64 {
+    let s = _str(exec("stat -f %m " + _shq(path) + " 2>/dev/null || stat -c %Y " + _shq(path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    return _to_int0(s)
+}
+
+// ── JSON text-extract (cloned from roadmap_engine.hexa) ──────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+// "key":[ "a", "b", ... ]  → [string]   (단순 string array)
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── 일반화된 object/array 블록 split (depth-aware, 문자열 안 무시) ────────
+// 입력 body 의 from 위치에서 시작해 다음 [ 또는 { 의 매칭 종료까지의 (start,end] index.
+// 반환: [start_idx, end_idx_exclusive]   (없으면 [-1,-1])
+fn _scan_balanced(body: string, from: i64, open: string, close: string) -> [i64] {
+    let mut i: i64 = from
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == open { break }
+        i = i + 1
+    }
+    if i >= body.len() { return [-1, -1] }
+    let start = i
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" { in_str = false; i = i + 1; handled = true }
+            else { i = i + 1; handled = true }
+        }
+        if handled == false {
+            if c == "\"" { in_str = true; i = i + 1 }
+            else if c == open { depth = depth + 1; i = i + 1 }
+            else if c == close {
+                depth = depth - 1
+                if depth == 0 { return [start, i + 1] }
+                i = i + 1
+            }
+            else { i = i + 1 }
+        }
+    }
+    return [-1, -1]
+}
+
+// "<key>" 이후의 [ 배열 본체 본문 = 내부 첫 [ 와 매칭 ] 사이.
+// 반환: 배열 안쪽 시작 idx (inclusive) + 끝 idx (exclusive of ])
+fn _array_body_after_key(body: string, key: string, from: i64) -> [i64] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return [-1, -1] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [-1, -1] }
+    let arr = _scan_balanced(body, i, "[", "]")
+    if arr[0] < 0 { return [-1, -1] }
+    // 배열 안쪽 (open '[' 직후 ~ close ']' 직전)
+    return [arr[0] + 1, arr[1] - 1]
+}
+
+// 배열 본문에서 top-level {object} 들의 (start,end_exclusive) 목록.
+fn _split_objects(body: string, lo: i64, hi: i64) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = lo
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < hi {
+        let c = body.substring(i, i + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" { in_str = false; i = i + 1; handled = true }
+            else { i = i + 1; handled = true }
+        }
+        if handled == false {
+            if c == "\"" { in_str = true; i = i + 1 }
+            else if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+                i = i + 1
+            }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out.push(body.substring(start, i + 1))
+                    start = -1
+                }
+                i = i + 1
+            }
+            else { i = i + 1 }
+        }
+    }
+    return out
+}
+
+// ── _meta 블록 추출 ─────────────────────────────────────────────────────
+fn extract_meta_body(body: string) -> string {
+    let mi = _find_after(body, "\"_meta\"", 0)
+    if mi < 0 { return "" }
+    // _meta 키 직후의 { 매칭 끝까지
+    let mut i: i64 = mi
+    while i < body.len() && body.substring(i, i + 1) != "{" { i = i + 1 }
+    if i >= body.len() { return "" }
+    let r = _scan_balanced(body, i, "{", "}")
+    if r[0] < 0 { return "" }
+    return body.substring(r[0], r[1])
+}
+
+// ── Schema detection ────────────────────────────────────────────────────
+// v1 if top-level has "nodes":[{...}] AND no top-level "tracks"
+// v2 if top-level has "phases":[...] OR "tracks":{...} AND objects with "parallel"
+// unknown otherwise.
+fn detect_schema(body: string) -> string {
+    if body.len() == 0 { return "unknown" }
+    // Strict: scan top-level keys only (depth==1 inside outer {})
+    // 단순화: 최상위 _meta 블록 제외 후 "nodes" 또는 "tracks"/"phases" 검색.
+    // _meta 안에도 description 텍스트 매칭 위험 → top-level scan 강제.
+    let outer = _scan_balanced(body, 0, "{", "}")
+    if outer[0] < 0 { return "unknown" }
+    let lo = outer[0] + 1
+    let hi = outer[1] - 1
+    // 깊이 1 키 위치 찾기 helper
+    let mut i = lo
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut has_nodes_top: bool = false
+    let mut has_tracks_top: bool = false
+    let mut has_phases_top: bool = false
+    while i < hi {
+        let c = body.substring(i, i + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" {
+                in_str = false
+                // 종료 직전이 key 였을 가능성 — depth==0 일 때만 (배열/객체 안 X)
+                i = i + 1
+                handled = true
+            }
+            else { i = i + 1; handled = true }
+        }
+        if handled == false {
+            if c == "{" { depth = depth + 1; i = i + 1 }
+            else if c == "}" { depth = depth - 1; i = i + 1 }
+            else if c == "[" { depth = depth + 1; i = i + 1 }
+            else if c == "]" { depth = depth - 1; i = i + 1 }
+            else if c == "\"" && depth == 0 {
+                // key candidate: read until next quote (not inside nested)
+                let start = i + 1
+                let mut j = start
+                while j < hi {
+                    let cj = body.substring(j, j + 1)
+                    if cj == "\\" { j = j + 2; continue }
+                    if cj == "\"" { break }
+                    j = j + 1
+                }
+                if j < hi {
+                    let key = body.substring(start, j)
+                    if key == "nodes" { has_nodes_top = true }
+                    else if key == "tracks" { has_tracks_top = true }
+                    else if key == "phases" { has_phases_top = true }
+                    i = j + 1
+                } else { break }
+            }
+            else if c == "\"" {
+                in_str = true
+                i = i + 1
+            }
+            else { i = i + 1 }
+        }
+    }
+    if has_phases_top || has_tracks_top { return "v2_tracks" }
+    if has_nodes_top { return "v1_flat" }
+    return "unknown"
+}
+
+// ── JSON string escaper for output ───────────────────────────────────────
+fn jstr(s: string) -> string {
+    let mut out: string = "\""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { out = out + "\\\\" }
+        else if c == "\"" { out = out + "\\\"" }
+        else if c == "\n" { out = out + "\\n" }
+        else if c == "\r" { out = out + "\\r" }
+        else if c == "\t" { out = out + "\\t" }
+        else { out = out + c }
+        i = i + 1
+    }
+    return out + "\""
+}
+
+fn jnum_f(x: f64) -> string {
+    // 단순 to_string. integer-like 면 .0 trim.
+    let s = to_string(x)
+    return s
+}
+
+fn jnum_i(x: i64) -> string {
+    return to_string(x)
+}
+
+fn jarr_str(xs: [string]) -> string {
+    if xs.len() == 0 { return "[]" }
+    let mut out: string = "["
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if i > 0 { out = out + ", " }
+        out = out + jstr(_str(xs[i]))
+        i = i + 1
+    }
+    return out + "]"
+}
+
+// ── Track-name → ntype 매핑 ─────────────────────────────────────────────
+fn derive_type(track: string, task_type: string) -> string {
+    if task_type != "" { return task_type }
+    let t = track
+    // 우선순위: 명시적 BENCH/EVAL → verify, DATA/ING → boot, LEARN → learn, EXP → exp,
+    // ALM/CLM/PHYSICS/SERVING/build/HARNESS/SYS/TERM/APP → build (default)
+    if t == "" { return "build" }
+    let up = t.to_upper()
+    // 부분 문자열 매칭 (대문자화)
+    if up.index_of("BENCH") >= 0 { return "verify" }
+    if up.index_of("EVAL") >= 0 { return "verify" }
+    if up.index_of("VERIFY") >= 0 { return "verify" }
+    if up.index_of("DATA") >= 0 { return "boot" }
+    if up.index_of("ING") == 0 { return "boot" }
+    if up.index_of("BOOT") >= 0 { return "boot" }
+    if up.index_of("LEARN") >= 0 { return "learn" }
+    if up.index_of("EXP") >= 0 { return "exp" }
+    return "build"
+}
+
+// ── FlatNode (v1) ───────────────────────────────────────────────────────
+struct FlatNode {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64,
+    synthetic: bool
+}
+
+// 빈 deps 병합
+fn _merge_deps(a: [string], b: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < a.len() {
+        let v = _str(a[i])
+        if v != "" && _contains_str(out, v) == false { out = out.push(v) }
+        i = i + 1
+    }
+    let mut j: i64 = 0
+    while j < b.len() {
+        let v = _str(b[j])
+        if v != "" && _contains_str(out, v) == false { out = out.push(v) }
+        j = j + 1
+    }
+    return out
+}
+
+// task object body (raw JSON) → FlatNode
+fn parse_task(raw: string, default_track: string, gate_deps: [string], synthetic: bool) -> FlatNode {
+    let id = json_str(raw, "id")
+    // name candidates: name, task, title
+    let mut name = json_str(raw, "name")
+    if name == "" { name = json_str(raw, "task") }
+    if name == "" { name = json_str(raw, "title") }
+    if name == "" { name = id }
+    let task_type = json_str(raw, "type")
+    let ntype = derive_type(default_track, task_type)
+    // cost: numeric only. text "S"/"M"/"L" → fallback 10.0
+    let cost_raw = json_num(raw, "cost")
+    let cost: f64 = if cost_raw <= 0.0 { 10.0 } else { cost_raw }
+    let p = json_num(raw, "p_success")
+    let p2: f64 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { to_int(to_string(nu).split(".")[0]) }
+    // deps merge: deps + dependencies + depends_on + gate_deps
+    let d1 = json_str_array(raw, "deps")
+    let d2 = json_str_array(raw, "dependencies")
+    let d3 = json_str_array(raw, "depends_on")
+    let m1 = _merge_deps(d1, d2)
+    let m2 = _merge_deps(m1, d3)
+    let deps_all = _merge_deps(m2, gate_deps)
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    return FlatNode {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps_all, soft_deps: soft,
+        status: st, progress: pg,
+        synthetic: synthetic
+    }
+}
+
+// ── v2 → flat 변환 핵심 ─────────────────────────────────────────────────
+struct ConvertResult {
+    nodes: [FlatNode],
+    synthetic_count: i64,
+    task_count: i64,
+    phase_count: i64
+}
+
+fn convert_v2_to_flat(body: string) -> ConvertResult {
+    let mut nodes: [FlatNode] = []
+    let mut synth: i64 = 0
+    let mut task_n: i64 = 0
+    let mut phase_n: i64 = 0
+
+    // _seed 추가 (synthetic)
+    let seed = FlatNode {
+        id: "_seed", name: "synthetic seed",
+        ntype: "seed", cost: 0.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: [], soft_deps: [],
+        status: "done", progress: 1.0,
+        synthetic: true
+    }
+    nodes = nodes.push(seed)
+    synth = synth + 1
+
+    // top-level "phases" 배열 위치 — _meta 블록에 "phases":<int> 가 있을 수 있으니
+    // 첫 시도가 실패(scalar 만남)면 이후 위치에서 재시도.
+    let mut search_from: i64 = 0
+    // _meta 블록 끝 이후로 시작 위치 점프 (있으면)
+    let mi0 = _find_after(body, "\"_meta\"", 0)
+    if mi0 >= 0 {
+        let mut j: i64 = mi0
+        while j < body.len() && body.substring(j, j + 1) != "{" { j = j + 1 }
+        if j < body.len() {
+            let r = _scan_balanced(body, j, "{", "}")
+            if r[1] > 0 { search_from = r[1] }
+        }
+    }
+    let mut pa = _array_body_after_key(body, "phases", search_from)
+    if pa[0] < 0 {
+        // fallback: search from 0 (혹시 _meta 가 phases 뒤에 오는 경우)
+        pa = _array_body_after_key(body, "phases", 0)
+    }
+    if pa[0] < 0 {
+        // phases 없음 — _seed 만 (caller 에 빈 결과 통보)
+        let goal = FlatNode {
+            id: "_goal", name: "synthetic goal",
+            ntype: "goal", cost: 0.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+            deps: ["_seed"], soft_deps: [],
+            status: "todo", progress: 0.0,
+            synthetic: true
+        }
+        nodes = nodes.push(goal)
+        synth = synth + 1
+        return ConvertResult { nodes: nodes, synthetic_count: synth, task_count: task_n, phase_count: phase_n }
+    }
+
+    let phase_objs = _split_objects(body, pa[0], pa[1])
+    phase_n = phase_objs.len()
+
+    // 직전 phase 의 leaf id 들 (다음 phase 의 첫 task gate_deps)
+    let mut prev_phase_leaves: [string] = ["_seed"]
+
+    let mut p_idx: i64 = 0
+    while p_idx < phase_objs.len() {
+        let phase_raw = _str(phase_objs[p_idx])
+        // phase 내 "parallel" 배열
+        let par = _array_body_after_key(phase_raw, "parallel", 0)
+        let mut current_phase_leaves: [string] = []
+        if par[0] < 0 {
+            // parallel 없는 phase — phase 자체를 단일 task 로
+            let pid = json_str(phase_raw, "id")
+            let pname = json_str(phase_raw, "name")
+            let pst = json_str(phase_raw, "status")
+            let nm = if pname == "" { pid } else { pname }
+            let st2 = if pst == "" { "todo" } else { pst }
+            let synth_phase_id = "_phase_" + (if pid == "" { to_string(p_idx) } else { pid })
+            let n = FlatNode {
+                id: synth_phase_id,
+                name: nm,
+                ntype: "build",
+                cost: 10.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+                deps: prev_phase_leaves, soft_deps: [],
+                status: st2, progress: 0.0,
+                synthetic: true
+            }
+            nodes = nodes.push(n)
+            synth = synth + 1
+            current_phase_leaves = [synth_phase_id]
+        } else {
+            let par_blocks = _split_objects(phase_raw, par[0], par[1])
+            let mut b_idx: i64 = 0
+            while b_idx < par_blocks.len() {
+                let blk_raw = _str(par_blocks[b_idx])
+                let track = json_str(blk_raw, "track")
+                let ta = _array_body_after_key(blk_raw, "tasks", 0)
+                if ta[0] >= 0 {
+                    let task_objs = _split_objects(blk_raw, ta[0], ta[1])
+                    // intra-track sequential chain
+                    let mut prev_id_in_track: string = ""
+                    let mut t_idx: i64 = 0
+                    while t_idx < task_objs.len() {
+                        let task_raw = _str(task_objs[t_idx])
+                        let mut gate: [string] = []
+                        if t_idx == 0 {
+                            gate = prev_phase_leaves
+                        } else {
+                            if prev_id_in_track != "" { gate = [prev_id_in_track] }
+                        }
+                        let n = parse_task(task_raw, track, gate, false)
+                        if n.id != "" {
+                            nodes = nodes.push(n)
+                            task_n = task_n + 1
+                            prev_id_in_track = n.id
+                        }
+                        t_idx = t_idx + 1
+                    }
+                    if prev_id_in_track != "" {
+                        current_phase_leaves = current_phase_leaves.push(prev_id_in_track)
+                    }
+                }
+                b_idx = b_idx + 1
+            }
+            // parallel 있지만 leaf 하나도 못 모은 경우 (빈 tasks 등) → prev 그대로 보존
+            if current_phase_leaves.len() == 0 {
+                current_phase_leaves = prev_phase_leaves
+            }
+        }
+        prev_phase_leaves = current_phase_leaves
+        p_idx = p_idx + 1
+    }
+
+    // _goal — 마지막 phase leaves 에 연결
+    let goal = FlatNode {
+        id: "_goal", name: "synthetic goal",
+        ntype: "goal", cost: 0.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: prev_phase_leaves, soft_deps: [],
+        status: "todo", progress: 0.0,
+        synthetic: true
+    }
+    nodes = nodes.push(goal)
+    synth = synth + 1
+
+    return ConvertResult { nodes: nodes, synthetic_count: synth, task_count: task_n, phase_count: phase_n }
+}
+
+// ── flat node 들을 v1 JSON 으로 직렬화 ────────────────────────────────────
+fn render_flat_json(meta_id: string, meta_updated: string, meta_desc: string, nodes: [FlatNode]) -> string {
+    let mut out: string = "{\n"
+    out = out + "  \"_meta\": {\n"
+    out = out + "    \"id\": " + jstr(meta_id) + ",\n"
+    out = out + "    \"goal\": \"_goal\",\n"
+    out = out + "    \"start\": \"_seed\",\n"
+    out = out + "    \"K_target\": 0.0,\n"
+    out = out + "    \"C_channel\": 1.0,\n"
+    out = out + "    \"updated\": " + jstr(meta_updated) + ",\n"
+    out = out + "    \"schema_version\": \"engine_v1_synthetic\",\n"
+    out = out + "    \"description\": " + jstr(meta_desc) + "\n"
+    out = out + "  },\n"
+    out = out + "  \"nodes\": [\n"
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        // multi-line per node — roadmap_engine split_nodes 가 single-line 으로
+        // 패킹된 객체를 잘 못 자르는 경우가 있어 newline 분리.
+        out = out + "    {\n"
+        out = out + "      \"id\": " + jstr(n.id) + ",\n"
+        out = out + "      \"name\": " + jstr(n.name) + ",\n"
+        out = out + "      \"type\": " + jstr(n.ntype) + ",\n"
+        out = out + "      \"cost\": " + jnum_f(n.cost) + ",\n"
+        if n.ntype == "exp" { out = out + "      \"p_success\": " + jnum_f(n.p_success) + ",\n" }
+        if n.ntype == "learn" { out = out + "      \"eta\": " + jnum_f(n.eta) + ",\n" }
+        if n.ntype == "boot" { out = out + "      \"n_uses\": " + jnum_i(n.n_uses) + ",\n" }
+        out = out + "      \"deps\": " + jarr_str(n.deps) + ",\n"
+        if n.soft_deps.len() > 0 { out = out + "      \"soft_deps\": " + jarr_str(n.soft_deps) + ",\n" }
+        out = out + "      \"status\": " + jstr(n.status)
+        if n.progress > 0.0 { out = out + ",\n      \"progress\": " + jnum_f(n.progress) }
+        if n.synthetic { out = out + ",\n      \"synthetic\": true" }
+        out = out + "\n    }"
+        if i + 1 < nodes.len() { out = out + "," }
+        out = out + "\n"
+        i = i + 1
+    }
+    out = out + "  ]\n"
+    out = out + "}\n"
+    return out
+}
+
+// ── 메인 변환 함수 ─────────────────────────────────────────────────────
+struct ConvertedDoc {
+    json: string,
+    nodes: i64,
+    synth: i64,
+    tasks: i64,
+    phases: i64
+}
+
+fn convert_file(body: string, fallback_id: string) -> ConvertedDoc {
+    let meta_body = extract_meta_body(body)
+    let mut id = json_str(meta_body, "id")
+    if id == "" { id = json_str(meta_body, "project") }
+    if id == "" { id = fallback_id }
+    let updated = json_str(meta_body, "updated")
+    let desc = json_str(meta_body, "name")
+    let res = convert_v2_to_flat(body)
+    let json = render_flat_json(id, updated, desc, res.nodes)
+    return ConvertedDoc {
+        json: json,
+        nodes: res.nodes.len(),
+        synth: res.synthetic_count,
+        tasks: res.task_count,
+        phases: res.phase_count
+    }
+}
+
+// ── Subcommands ─────────────────────────────────────────────────────────
+fn cmd_detect(path: string) -> i64 {
+    if file_exists(path) == false {
+        eprintln("REJECT: not found: " + path)
+        println("unknown")
+        return 2
+    }
+    let body = _str(read_file(path))
+    let s = detect_schema(body)
+    println(s)
+    if s == "v1_flat" { return 0 }
+    if s == "v2_tracks" { return 1 }
+    return 2
+}
+
+fn _basename_no_ext(path: string) -> string {
+    let parts = path.split("/")
+    let name = _str(parts[parts.len() - 1])
+    let dot = name.index_of(".")
+    if dot < 0 { return name }
+    return name.substring(0, dot)
+}
+
+fn cmd_to_flat(path: string, out_path: string) -> i64 {
+    if file_exists(path) == false {
+        eprintln("REJECT: not found: " + path)
+        return 3
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty: " + path)
+        return 3
+    }
+    let schema = detect_schema(body)
+    if schema == "v1_flat" {
+        // 이미 v1 — passthrough
+        if out_path == "" {
+            print(body)
+        } else {
+            write_file(out_path, body)
+            eprintln("[to-flat] passthrough v1 → " + out_path)
+        }
+        eprintln("[to-flat] schema=v1_flat (no conversion needed)")
+        return 0
+    }
+    if schema != "v2_tracks" {
+        eprintln("REJECT: unknown schema for " + path)
+        return 3
+    }
+    let fallback = _basename_no_ext(path)
+    let cd = convert_file(body, fallback)
+    if out_path == "" {
+        print(cd.json)
+    } else {
+        write_file(out_path, cd.json)
+        eprintln("[to-flat] " + path + " → " + out_path)
+    }
+    eprintln("[to-flat] phases=" + to_string(cd.phases)
+        + " tasks=" + to_string(cd.tasks)
+        + " synthetic=" + to_string(cd.synth)
+        + " nodes_total=" + to_string(cd.nodes))
+    return 0
+}
+
+fn cmd_batch() -> i64 {
+    // 디렉토리 보장
+    if dir_exists(CACHE_DIR) == false { mkdir(CACHE_DIR) }
+    if dir_exists(CACHE_DIR) == false {
+        eprintln("REJECT: cache dir create fail: " + CACHE_DIR)
+        return 5
+    }
+    let files = list_dir(ROADMAPS_DIR)
+    let mut scanned: i64 = 0
+    let mut converted: i64 = 0
+    let mut skipped: i64 = 0
+    let mut failed: i64 = 0
+    let mut i: i64 = 0
+    while i < files.len() {
+        let fname = _str(files[i])
+        // *.json only, *.bak* exclude
+        let endjson = fname.len() >= 5 && fname.substring(fname.len() - 5, fname.len()) == ".json"
+        let has_bak = fname.index_of(".bak") >= 0
+        if endjson == false || has_bak {
+            i = i + 1
+            continue
+        }
+        scanned = scanned + 1
+        let path = ROADMAPS_DIR + "/" + fname
+        let base = _basename_no_ext(fname)
+        let out = CACHE_DIR + "/" + base + ".json"
+        // mtime skip
+        let in_mt = _mtime(path)
+        let out_mt = if file_exists(out) { _mtime(out) } else { 0 }
+        if out_mt >= in_mt && out_mt > 0 {
+            skipped = skipped + 1
+            i = i + 1
+            continue
+        }
+        let body = _str(read_file(path))
+        if body.len() == 0 {
+            failed = failed + 1
+            i = i + 1
+            continue
+        }
+        let schema = detect_schema(body)
+        if schema == "unknown" {
+            failed = failed + 1
+            eprintln("[batch] unknown schema, skip: " + fname)
+            i = i + 1
+            continue
+        }
+        if schema == "v1_flat" {
+            // passthrough copy
+            write_file(out, body)
+            converted = converted + 1
+            i = i + 1
+            continue
+        }
+        // v2 → convert
+        let cd = convert_file(body, base)
+        if cd.nodes <= 2 {
+            // _seed + _goal 만 → 실패로 계수
+            failed = failed + 1
+            eprintln("[batch] empty conversion (no tasks): " + fname)
+            i = i + 1
+            continue
+        }
+        write_file(out, cd.json)
+        converted = converted + 1
+        eprintln("[batch] " + fname + " → " + base + ".json"
+            + " (phases=" + to_string(cd.phases)
+            + " tasks=" + to_string(cd.tasks)
+            + " synthetic=" + to_string(cd.synth) + ")")
+        i = i + 1
+    }
+    println("scanned: " + to_string(scanned)
+        + "  converted: " + to_string(converted)
+        + "  skipped: " + to_string(skipped)
+        + "  failed: " + to_string(failed))
+    if failed > 0 { return 5 }
+    return 0
+}
+
+// ── Selftest ────────────────────────────────────────────────────────────
+fn _selftest_v2_sample() -> string {
+    let mut s: string = "{\n"
+    s = s + "  \"_meta\": { \"id\": \"st_sample\", \"updated\": \"2026-04-16\", \"name\": \"selftest\" },\n"
+    s = s + "  \"tracks\": { \"BUILD\": {\"owner\":\"x\"}, \"BENCH\": {\"owner\":\"y\"} },\n"
+    s = s + "  \"phases\": [\n"
+    s = s + "    { \"id\": \"P0\", \"name\": \"phase 0\", \"status\": \"done\", \"parallel\": [\n"
+    s = s + "      { \"track\": \"BUILD\", \"tasks\": [\n"
+    s = s + "        { \"id\": \"B-1\", \"task\": \"build one\", \"status\": \"done\" },\n"
+    s = s + "        { \"id\": \"B-2\", \"task\": \"build two\", \"status\": \"done\", \"deps\": [\"B-1\"] }\n"
+    s = s + "      ] },\n"
+    s = s + "      { \"track\": \"BENCH\", \"tasks\": [\n"
+    s = s + "        { \"id\": \"V-1\", \"task\": \"verify one\", \"status\": \"done\" }\n"
+    s = s + "      ] }\n"
+    s = s + "    ] },\n"
+    s = s + "    { \"id\": \"P1\", \"name\": \"phase 1\", \"parallel\": [\n"
+    s = s + "      { \"track\": \"BUILD\", \"tasks\": [\n"
+    s = s + "        { \"id\": \"B-3\", \"task\": \"build three\", \"status\": \"todo\" }\n"
+    s = s + "      ] }\n"
+    s = s + "    ] }\n"
+    s = s + "  ]\n"
+    s = s + "}\n"
+    return s
+}
+
+fn _selftest_v1_sample() -> string {
+    let mut s: string = "{\n"
+    s = s + "  \"_meta\": { \"id\": \"st_v1\", \"goal\": \"G\", \"start\": \"S\", \"updated\": \"2026-04-16\" },\n"
+    s = s + "  \"nodes\": [\n"
+    s = s + "    { \"id\": \"S\", \"type\": \"seed\", \"cost\": 0, \"deps\": [], \"status\": \"done\" },\n"
+    s = s + "    { \"id\": \"G\", \"type\": \"goal\", \"cost\": 0, \"deps\": [\"S\"], \"status\": \"todo\" }\n"
+    s = s + "  ]\n"
+    s = s + "}\n"
+    return s
+}
+
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    println("[selftest] roadmap_schema_adapter")
+
+    // 1. detect v2
+    let v2 = _selftest_v2_sample()
+    let s_v2 = detect_schema(v2)
+    if s_v2 != "v2_tracks" {
+        eprintln("FAIL: detect v2 returned " + s_v2)
+        fails = fails + 1
+    } else {
+        println("  detect v2 → v2_tracks  OK")
+    }
+
+    // 2. detect v1
+    let v1 = _selftest_v1_sample()
+    let s_v1 = detect_schema(v1)
+    if s_v1 != "v1_flat" {
+        eprintln("FAIL: detect v1 returned " + s_v1)
+        fails = fails + 1
+    } else {
+        println("  detect v1 → v1_flat   OK")
+    }
+
+    // 3. convert v2 → flat → check basic shape
+    let cd = convert_file(v2, "st_sample")
+    // _seed + 3 tasks (B-1,B-2,V-1) + 1 task (B-3) + _goal = 6
+    let expected_min: i64 = 6
+    if cd.nodes < expected_min {
+        eprintln("FAIL: convert v2 nodes=" + to_string(cd.nodes) + " expected>=" + to_string(expected_min))
+        fails = fails + 1
+    } else {
+        println("  convert v2 → " + to_string(cd.nodes) + " nodes (phases=" + to_string(cd.phases)
+            + " tasks=" + to_string(cd.tasks) + " synth=" + to_string(cd.synth) + ")  OK")
+    }
+
+    // 4. converted JSON 을 임시 파일에 쓰고 detect 다시 → v1_flat
+    let tmp = "/tmp/.selftest_adapter_" + to_string(_to_int0(_str(exec("date +%s")).trim())) + ".json"
+    write_file(tmp, cd.json)
+    let body2 = _str(read_file(tmp))
+    let s_back = detect_schema(body2)
+    if s_back != "v1_flat" {
+        eprintln("FAIL: round-trip detect=" + s_back + " (expected v1_flat)")
+        fails = fails + 1
+    } else {
+        println("  round-trip detect → v1_flat  OK")
+    }
+
+    // 5. roadmap_engine 이 로드 가능한지: --dispatch 호출 후 exit 0 확인
+    let engine = HARNESS_DIR + "/roadmap_engine.hexa"
+    if file_exists(engine) {
+        let cmd = "hexa run " + _shq(engine) + " " + _shq(tmp) + " --dispatch 2>&1"
+        let rc_out = _str(exec(cmd + "; echo __EXIT__:$?"))  // @allow-bare-exec
+        let mark = "__EXIT__:"
+        let mi = rc_out.index_of(mark)
+        let rc_str = if mi >= 0 { rc_out.substring(mi + mark.len(), rc_out.len()).trim() } else { "?" }
+        let rc = _to_int0(rc_str)
+        if rc == 0 {
+            println("  engine load --dispatch  OK (rc=0)")
+        } else {
+            eprintln("FAIL: engine load returned rc=" + rc_str)
+            // print last 10 lines for debug
+            eprintln("---- engine output tail ----")
+            let lines = rc_out.split("\n")
+            let mut start: i64 = lines.len() - 12
+            if start < 0 { start = 0 }
+            let mut k: i64 = start
+            while k < lines.len() {
+                eprintln(_str(lines[k]))
+                k = k + 1
+            }
+            eprintln("----------------------------")
+            fails = fails + 1
+        }
+    } else {
+        eprintln("WARN: roadmap_engine.hexa not found, skip engine load test")
+    }
+
+    // cleanup
+    exec("rm -f " + _shq(tmp))  // @allow-bare-exec
+
+    if fails == 0 {
+        println("[selftest] PASS — 0 failures")
+        return 0
+    }
+    println("[selftest] FAIL — " + to_string(fails) + " failure(s)")
+    return 6
+}
+
+// ── Usage ───────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa shared/tool/roadmap_schema_adapter.hexa detect <path>")
+    eprintln("  hexa shared/tool/roadmap_schema_adapter.hexa to-flat <path> [--out=<out.json>]")
+    eprintln("  hexa shared/tool/roadmap_schema_adapter.hexa batch")
+    eprintln("  hexa shared/tool/roadmap_schema_adapter.hexa --selftest")
+    exit(2)
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 { usage() }
+    let first = _str(a[0])
+
+    if first == "--selftest" || first == "selftest" {
+        let rc = cmd_selftest()
+        exit(rc)
+    }
+    if first == "--help" || first == "-h" || first == "help" { usage() }
+
+    if first == "detect" {
+        if a.len() < 2 { usage() }
+        let rc = cmd_detect(_str(a[1]))
+        exit(rc)
+    }
+    if first == "to-flat" {
+        if a.len() < 2 { usage() }
+        let path = _str(a[1])
+        let mut out_path: string = ""
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg.starts_with("--out=") {
+                out_path = arg.substring(6, arg.len())
+            } else if arg.starts_with("--") {
+                eprintln("WARN: unknown flag: " + arg)
+            }
+            k = k + 1
+        }
+        let rc = cmd_to_flat(path, out_path)
+        exit(rc)
+    }
+    if first == "batch" {
+        let rc = cmd_batch()
+        exit(rc)
+    }
+
+    eprintln("REJECT: unknown subcommand: " + first)
+    usage()
+}
+
+main()

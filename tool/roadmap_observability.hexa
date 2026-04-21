@@ -1,0 +1,857 @@
+// roadmap_observability.hexa — NEXUS-6 roadmap_engine v2 #14 unified dashboard
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   v2 모듈들(signals/kahn/checkpoint/portfolio/dispatch/explain) 출력을
+//   aggregate 한 텍스트 dashboard. "전체 상태 한눈에" SSOT.
+//
+//   각 v2 모듈 무수정 — exec("hexa <module> <subcmd>") stdout 파싱.
+//   exec 실패 시 "(module unavailable)" 으로 graceful fallback.
+//
+// CLI
+//   dashboard [--rm=<one>] [--compact]    — 전체 대시보드 (--rm 단일 / --compact 요약)
+//   health                                — single-line: "OK"|"WARN: ..."|"CRIT: ..."
+//                                              η ≤ 0           → WARN
+//                                              kahn gaps > 0   → WARN
+//                                              |blocked| > 0   → CRIT
+//   watch [--interval=30] [--forever]     — 30s 주기 dashboard, max 5 ticks (forever 무한)
+//   --selftest                            — 각 섹션 null/exception-free 렌더 검증
+//
+// SSOT input  : shared/roadmaps/*.json (.bak.* 제외)
+//               shared/tool/roadmap_calibration.json
+//               shared/tool/roadmap_sync.jsonl
+//               shared/tool/roadmap_cli_log.jsonl
+//               shared/tool/dispatch_log.jsonl (있으면)
+//               shared/tool/roadmap_checkpoints/*/
+// SSOT output : stdout
+// EXIT  : 0 success / 1 health WARN / 2 health CRIT / 3 usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let NEXUS_ROOT = if NEXUS != "" { NEXUS } else { HOME + "/Dev/nexus" }
+let HARNESS = NEXUS_ROOT + "/harness"
+let ROADMAPS = NEXUS_ROOT + "/roadmaps"
+let CALIB_PATH = HARNESS + "/roadmap_calibration.json"
+let SYNC_LOG = HARNESS + "/roadmap_sync.jsonl"
+let CLI_LOG = HARNESS + "/roadmap_cli_log.jsonl"
+let DISPATCH_LOG = HARNESS + "/dispatch_log.jsonl"
+let CHECKPOINTS_DIR = HARNESS + "/roadmap_checkpoints"
+
+// ── stage1 함정 회피 helpers ──────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = s.split("\n")[0].trim()
+    if first == "" { return 0 }
+    // dot-trim
+    let dot = first.index_of(".")
+    let body = if dot >= 0 { first.substring(0, dot) } else { first }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _to_float0(s: string) -> f64 {
+    if s == "" { return 0.0 }
+    let t = s.trim()
+    if t == "" || t == "-" { return 0.0 }
+    return to_float(t)
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn _ts_short() -> string {
+    return _str(exec("date -u +%H:%M:%S")).trim()  // @allow-bare-exec
+}
+
+// strcmp: a<b → -1, a==b → 0, a>b → 1   (`<` `>` 문자열에서 항상 false 회피)
+fn _strcmp(a: string, b: string) -> i64 {
+    let na = a.len()
+    let nb = b.len()
+    let n = if na < nb { na } else { nb }
+    let mut i: i64 = 0
+    while i < n {
+        let ca = byte_of(a, i)
+        let cb = byte_of(b, i)
+        if ca < cb { return -1 }
+        if ca > cb { return 1 }
+        i = i + 1
+    }
+    if na < nb { return -1 }
+    if na > nb { return 1 }
+    return 0
+}
+
+fn _has_suffix(s: string, suf: string) -> bool {
+    let ns = s.len()
+    let nsf = suf.len()
+    if nsf > ns { return false }
+    return s.substring(ns - nsf, ns) == suf
+}
+
+// f64 → fixed-2 string  (floor 기반 단순 포맷)
+fn _fmt2(x: f64) -> string {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    if dot < 0 { return s + ".00" }
+    let n = s.len()
+    let frac = s.substring(dot + 1, n)
+    let pad = if frac.len() >= 2 { frac.substring(0, 2) } else {
+        if frac.len() == 1 { frac + "0" } else { "00" }
+    }
+    return s.substring(0, dot) + "." + pad
+}
+
+// i64 → padded right (width)
+fn _padr(s: string, w: i64) -> string {
+    let mut out = s
+    while out.len() < w { out = out + " " }
+    return out
+}
+
+fn _padl(s: string, w: i64) -> string {
+    let mut out = s
+    while out.len() < w { out = " " + out }
+    return out
+}
+
+fn _truncate(s: string, w: i64) -> string {
+    if s.len() <= w { return _padr(s, w) }
+    return s.substring(0, w - 1) + "…"
+}
+
+// ── exec wrapper — graceful fallback ──────────────────────────────────────
+fn run_module(cmd: string) -> string {
+    let full = cmd + " 2>&1"
+    let out = _str(exec(full))  // @allow-bare-exec
+    return out
+}
+
+fn run_module_clean(cmd: string) -> string {
+    let raw = run_module(cmd)
+    if raw.len() == 0 { return "" }
+    // hexa resolver noise filter
+    let lines = raw.split("\n")
+    let mut keep: [string] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        let skip1 = line.index_of("hexa_remote:") == 0
+        let skip2 = line.index_of("hexa resolver:") == 0
+        if skip1 == false && skip2 == false {
+            keep = keep.push(line)
+        }
+        i = i + 1
+    }
+    let mut out = ""
+    let mut k: i64 = 0
+    while k < keep.len() {
+        if k > 0 { out = out + "\n" }
+        out = out + _str(keep[k])
+        k = k + 1
+    }
+    return out
+}
+
+// ── JSON 단순 파서 (calibration.json 용) ──────────────────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    return [body.substring(start, j), to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str_g(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num_g(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+// extract sub-block by key (e.g. "build" : { ... })
+fn json_subblock(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() && body.substring(i, i + 1) != "{" { i = i + 1 }
+    if i >= body.len() { return "" }
+    let start = i
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut end = i
+    while end < body.len() {
+        let c = body.substring(end, end + 1)
+        if in_str {
+            if c == "\\" { end = end + 2; continue }
+            if c == "\"" { in_str = false }
+            end = end + 1
+            continue
+        }
+        if c == "\"" { in_str = true; end = end + 1; continue }
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" {
+            depth = depth - 1
+            if depth == 0 { end = end + 1; break }
+        }
+        end = end + 1
+    }
+    return body.substring(start, end)
+}
+
+// ── list roadmaps (.bak* 제외) ────────────────────────────────────────────
+fn list_roadmap_files() -> [string] {
+    let cmd = "ls -1 " + ROADMAPS + "/*.json 2>/dev/null"
+    let out = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if out.len() == 0 { return [] }
+    let lines = out.split("\n")
+    let mut keep: [string] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let p = _str(lines[i]).trim()
+        if p.len() == 0 { i = i + 1; continue }
+        if p.contains(".bak") { i = i + 1; continue }
+        if _has_suffix(p, "SCHEMA.json") { i = i + 1; continue }
+        if _has_suffix(p, "engine_schema.json") { i = i + 1; continue }
+        if _has_suffix(p, "v2_backlog.json") { i = i + 1; continue }
+        keep = keep.push(p)
+        i = i + 1
+    }
+    return keep
+}
+
+fn basename_no_ext(p: string) -> string {
+    let mut i: i64 = p.len() - 1
+    while i >= 0 && p.substring(i, i + 1) != "/" { i = i - 1 }
+    let nm = p.substring(i + 1, p.len())
+    let dot = nm.index_of(".")
+    if dot < 0 { return nm }
+    return nm.substring(0, dot)
+}
+
+// ── SECTION renderers ────────────────────────────────────────────────────
+
+fn render_header(now: string) -> string {
+    let title = "NEXUS roadmap observability — " + now
+    let bar = "═══════════════════════════════════════════════════════════════════"
+    let mut s = "╔" + bar + "╗\n"
+    s = s + "║ " + _padr(title, 65) + " ║\n"
+    s = s + "╚" + bar + "╝\n"
+    return s
+}
+
+fn render_portfolio() -> string {
+    let raw = run_module_clean("hexa " + HARNESS + "/roadmap_portfolio.hexa summary")
+    let mut s = "# PORTFOLIO SUMMARY\n"
+    if raw.len() == 0 {
+        s = s + "(module unavailable)\n"
+        return s
+    }
+    s = s + raw
+    if _has_suffix(raw, "\n") == false { s = s + "\n" }
+    return s
+}
+
+fn render_top_ready(k: i64) -> string {
+    let cmd = "hexa " + HARNESS + "/roadmap_portfolio.hexa rank --k=" + to_string(k)
+    let raw = run_module_clean(cmd)
+    let mut s = "# TOP " + to_string(k) + " READY NODES (priority desc)\n"
+    if raw.len() == 0 {
+        s = s + "(module unavailable)\n"
+        return s
+    }
+    s = s + raw
+    if _has_suffix(raw, "\n") == false { s = s + "\n" }
+    return s
+}
+
+fn render_calibration() -> string {
+    let mut s = "# CALIBRATION"
+    if file_exists(CALIB_PATH) == false {
+        s = s + "\n(calibration file missing)\n"
+        return s
+    }
+    let body = _str(read_file(CALIB_PATH))
+    let updated = json_str_g(body, "updated")
+    if updated.len() > 0 {
+        s = s + " (last update: " + updated + ")"
+    }
+    s = s + "\n"
+    let header = _padr("ntype", 8) + _padr("mean", 12) + _padr("ewma", 12)
+              + _padr("samples", 10) + _padr("p_succ", 10) + "eta\n"
+    s = s + header
+    let ntypes = ["build", "exp", "learn", "boot", "verify"]
+    let mut i: i64 = 0
+    while i < ntypes.len() {
+        let nt = _str(ntypes[i])
+        let blk = json_subblock(body, nt)
+        if blk.len() == 0 {
+            s = s + _padr(nt, 8) + "(absent)\n"
+        } else {
+            let mean = json_num_g(blk, "mean_cost")
+            let ewma = json_num_g(blk, "ewma_cost")
+            let samp = json_num_g(blk, "samples")
+            let p_s = json_num_g(blk, "p_success_mean")
+            let eta = json_num_g(blk, "eta_ewma")
+            let p_str = if p_s > 0.0 { _fmt2(p_s) } else { "-" }
+            let e_str = if eta > 0.0 { _fmt2(eta) } else { "-" }
+            let row = _padr(nt, 8)
+                    + _padr(_fmt2(mean), 12)
+                    + _padr(_fmt2(ewma), 12)
+                    + _padr(to_string(f_to_i_safe(samp)), 10)
+                    + _padr(p_str, 10)
+                    + e_str + "\n"
+            s = s + row
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn f_to_i_safe(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn render_kahn(rm_filter: string) -> string {
+    let mut s = "# KAHN INVARIANT"
+    let target = if rm_filter.len() > 0 {
+        ROADMAPS + "/" + rm_filter + ".json"
+    } else {
+        ROADMAPS + "/example.json"
+    }
+    let nm = basename_no_ext(target)
+    s = s + " (" + nm + ".json)\n"
+    if file_exists(target) == false {
+        s = s + "(roadmap missing)\n"
+        return s
+    }
+    let cmd = "hexa " + HARNESS + "/roadmap_kahn.hexa verify " + target
+    let raw = run_module_clean(cmd)
+    if raw.len() == 0 {
+        s = s + "(module unavailable)\n"
+        return s
+    }
+    s = s + raw
+    if _has_suffix(raw, "\n") == false { s = s + "\n" }
+    return s
+}
+
+fn render_recent(n: i64) -> string {
+    let mut s = "# RECENT ACTIVITY (last " + to_string(n) + " from roadmap_sync.jsonl)\n"
+    if file_exists(SYNC_LOG) == false {
+        s = s + "(no sync log)\n"
+        return s
+    }
+    let cmd = "tail -" + to_string(n) + " " + SYNC_LOG + " 2>/dev/null"
+    let out = _str(exec(cmd))  // @allow-bare-exec
+    if out.len() == 0 {
+        s = s + "(empty log)\n"
+        return s
+    }
+    let lines = out.split("\n")
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i]).trim()
+        if line.len() > 0 {
+            let ts = json_str_g(line, "ts")
+            let repo = json_str_g(line, "repo")
+            let result = json_str_g(line, "result")
+            let detail = json_str_g(line, "detail")
+            let row = _padr(ts, 22) + _padr(repo, 18)
+                    + _padr(result, 8) + _truncate(detail, 35) + "\n"
+            s = s + row
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn render_checkpoints() -> string {
+    let mut s = "# CHECKPOINTS\n"
+    if dir_exists(CHECKPOINTS_DIR) == false {
+        s = s + "(no checkpoints dir)\n"
+        return s
+    }
+    let dirs = list_dir(CHECKPOINTS_DIR)
+    if dirs.len() == 0 {
+        s = s + "(empty)\n"
+        return s
+    }
+    let mut i: i64 = 0
+    let mut total_projects: i64 = 0
+    while i < dirs.len() {
+        let d = _str(dirs[i])
+        if d == "." || d == ".." { i = i + 1; continue }
+        let dpath = CHECKPOINTS_DIR + "/" + d
+        if dir_exists(dpath) == false { i = i + 1; continue }
+        let snaps = list_dir(dpath)
+        let mut count: i64 = 0
+        let mut latest = ""
+        let mut j: i64 = 0
+        while j < snaps.len() {
+            let snm = _str(snaps[j])
+            if _has_suffix(snm, ".json") {
+                count = count + 1
+                if _strcmp(snm, latest) > 0 { latest = snm }
+            }
+            j = j + 1
+        }
+        if count > 0 {
+            // strip ".json"
+            let base = if _has_suffix(latest, ".json") {
+                latest.substring(0, latest.len() - 5)
+            } else { latest }
+            s = s + d + ": " + to_string(count)
+                  + " snapshots (latest: " + base + ")\n"
+            total_projects = total_projects + 1
+        }
+        i = i + 1
+    }
+    if total_projects == 0 { s = s + "(no snapshots)\n" }
+    return s
+}
+
+fn render_dispatch_queue() -> string {
+    let mut s = "# DISPATCH QUEUE (ready + in_progress per project)\n"
+    let files = list_roadmap_files()
+    if files.len() == 0 {
+        s = s + "(no roadmaps)\n"
+        return s
+    }
+    let mut shown: i64 = 0
+    let mut i: i64 = 0
+    while i < files.len() {
+        let p = _str(files[i])
+        let nm = basename_no_ext(p)
+        let cmd = "hexa " + HARNESS + "/roadmap_dispatch.hexa plan " + p + " 2>/dev/null"
+        let raw = run_module_clean(cmd)
+        if raw.len() > 0 {
+            // count non-empty lines (each = 1 dispatched node)
+            let lines = raw.split("\n")
+            let mut count: i64 = 0
+            let mut node_ids: [string] = []
+            let mut k: i64 = 0
+            while k < lines.len() {
+                let line = _str(lines[k]).trim()
+                if line.len() > 0 && line.substring(0, 1) == "{" {
+                    count = count + 1
+                    let nid = json_str_g(line, "node")
+                    if nid.len() > 0 && node_ids.len() < 3 {
+                        node_ids = node_ids.push(nid)
+                    }
+                }
+                k = k + 1
+            }
+            if count > 0 {
+                let mut id_str = ""
+                let mut m: i64 = 0
+                while m < node_ids.len() {
+                    if m > 0 { id_str = id_str + ", " }
+                    id_str = id_str + _str(node_ids[m])
+                    m = m + 1
+                }
+                let suffix = if count > node_ids.len() {
+                    " ... +" + to_string(count - node_ids.len())
+                } else { "" }
+                s = s + nm + ": " + to_string(count)
+                      + " queued (" + id_str + suffix + ")\n"
+                shown = shown + 1
+            }
+        }
+        i = i + 1
+    }
+    if shown == 0 { s = s + "(no actionable dispatch)\n" }
+    return s
+}
+
+// ── HEALTH check (single-line + exit code) ────────────────────────────────
+struct HealthState {
+    eta_min: f64,           // smallest eta across calibration ntypes
+    kahn_gaps: i64,         // total blocking gaps (example.json)
+    blocked_projects: i64,  // portfolio-reported count
+    portfolio_ok: bool      // portfolio module reachable
+}
+
+fn collect_health() -> HealthState {
+    // calibration eta_ewma (learn 만 노출되는 형태가 일반적)
+    let mut eta_min: f64 = 1.0
+    if file_exists(CALIB_PATH) {
+        let body = _str(read_file(CALIB_PATH))
+        let ntypes = ["build", "exp", "learn", "boot", "verify"]
+        let mut i: i64 = 0
+        while i < ntypes.len() {
+            let blk = json_subblock(body, _str(ntypes[i]))
+            if blk.len() > 0 {
+                let eta = json_num_g(blk, "eta_ewma")
+                // eta 키 부재 시 0.0 → 무시. 존재할 때만 비교
+                if blk.index_of("\"eta_ewma\"") >= 0 {
+                    if eta < eta_min { eta_min = eta }
+                }
+            }
+            i = i + 1
+        }
+    }
+    // kahn gaps on example.json
+    let mut gaps: i64 = 0
+    let target = ROADMAPS + "/example.json"
+    if file_exists(target) {
+        let raw = run_module_clean("hexa " + HARNESS + "/roadmap_kahn.hexa verify " + target)
+        let idx = raw.index_of("blocking gaps:")
+        if idx >= 0 {
+            // parse next number
+            let mut j = idx + 14
+            while j < raw.len() {
+                let c = raw.substring(j, j + 1)
+                if c == " " { j = j + 1; continue }
+                if is_digit(c) { break }
+                j = j + 1
+            }
+            let mut k = j
+            while k < raw.len() && is_digit(raw.substring(k, k + 1)) { k = k + 1 }
+            if k > j { gaps = _to_int0(raw.substring(j, k)) }
+        }
+    }
+    // portfolio summary blocked-count
+    let mut blk_cnt: i64 = 0
+    let mut portfolio_ok: bool = false
+    let raw = run_module_clean("hexa " + HARNESS + "/roadmap_portfolio.hexa summary")
+    if raw.len() > 0 {
+        portfolio_ok = true
+        let bidx = raw.index_of("blocked project")
+        if bidx >= 0 {
+            // "blocked project: (none)" or "blocked project: <name> (...)"
+            let rest = raw.substring(bidx, raw.len())
+            let nidx = rest.index_of("(none)")
+            if nidx < 0 || nidx > 30 {
+                // not (none) within 30 chars → probably has blocked
+                // count comma-separated entries in rest until newline
+                let nl = rest.index_of("\n")
+                let chunk = if nl < 0 { rest } else { rest.substring(0, nl) }
+                if chunk.index_of("(none)") < 0 {
+                    blk_cnt = 1
+                    let mut p: i64 = 0
+                    while p < chunk.len() {
+                        if chunk.substring(p, p + 1) == "," { blk_cnt = blk_cnt + 1 }
+                        p = p + 1
+                    }
+                }
+            }
+        }
+    }
+    return HealthState {
+        eta_min: eta_min,
+        kahn_gaps: gaps,
+        blocked_projects: blk_cnt,
+        portfolio_ok: portfolio_ok
+    }
+}
+
+fn health_line(h: HealthState) -> [string] {
+    // CRIT 가 WARN 보다 우선
+    if h.blocked_projects > 0 {
+        return ["CRIT", "blocked_projects=" + to_string(h.blocked_projects)]
+    }
+    let mut warns: [string] = []
+    if h.eta_min <= 0.0 {
+        warns = warns.push("eta_min=" + _fmt2(h.eta_min))
+    }
+    if h.kahn_gaps > 0 {
+        warns = warns.push("kahn_gaps=" + to_string(h.kahn_gaps))
+    }
+    if h.portfolio_ok == false {
+        warns = warns.push("portfolio_unreachable")
+    }
+    if warns.len() == 0 { return ["OK", ""] }
+    let mut msg = ""
+    let mut i: i64 = 0
+    while i < warns.len() {
+        if i > 0 { msg = msg + "; " }
+        msg = msg + _str(warns[i])
+        i = i + 1
+    }
+    return ["WARN", msg]
+}
+
+// ── DASHBOARD orchestrator ────────────────────────────────────────────────
+fn render_dashboard(rm_filter: string, compact: bool) -> string {
+    let now = _ts_iso()
+    let mut s = render_header(now)
+    s = s + "\n" + render_portfolio() + "\n"
+    s = s + render_calibration() + "\n"
+    if compact == false {
+        s = s + render_top_ready(5) + "\n"
+        s = s + render_kahn(rm_filter) + "\n"
+        s = s + render_recent(10) + "\n"
+        s = s + render_checkpoints() + "\n"
+        s = s + render_dispatch_queue() + "\n"
+    }
+    let h = collect_health()
+    let res = health_line(h)
+    let kind = _str(res[0])
+    let msg = _str(res[1])
+    let bar = "═══════════════════════════════════════════════════════════════════"
+    let status_msg = if kind == "OK" { "이상 없음" } else { msg }
+    s = s + bar + "\n"
+    s = s + "overall status: " + kind + " | " + status_msg + "\n"
+    s = s + bar + "\n"
+    return s
+}
+
+// ── WATCH ─────────────────────────────────────────────────────────────────
+fn cmd_watch(interval: i64, forever: bool) -> i64 {
+    let max_ticks: i64 = if forever { -1 } else { 5 }
+    let mut tick: i64 = 0
+    while true {
+        // clear-screen substitute (50 newlines)
+        let mut nl = ""
+        let mut i: i64 = 0
+        while i < 50 { nl = nl + "\n"; i = i + 1 }
+        print(nl)
+        print(render_dashboard("", false))
+        tick = tick + 1
+        if max_ticks > 0 && tick >= max_ticks { break }
+        let _ = exec("sleep " + to_string(interval))  // @allow-bare-exec
+    }
+    return 0
+}
+
+// ── SELFTEST ──────────────────────────────────────────────────────────────
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+    // 1) header non-empty
+    let h = render_header(_ts_iso())
+    if h.len() == 0 { eprintln("[selftest] FAIL header empty"); fails = fails + 1 }
+    else { println("[selftest] header OK (" + to_string(h.len()) + " chars)") }
+    // 2) portfolio render
+    let p = render_portfolio()
+    if p.len() == 0 { eprintln("[selftest] FAIL portfolio empty"); fails = fails + 1 }
+    else { println("[selftest] portfolio OK") }
+    // 3) calibration
+    let c = render_calibration()
+    if c.len() == 0 { eprintln("[selftest] FAIL calibration empty"); fails = fails + 1 }
+    else { println("[selftest] calibration OK") }
+    // 4) top ready
+    let t = render_top_ready(3)
+    if t.len() == 0 { eprintln("[selftest] FAIL top_ready empty"); fails = fails + 1 }
+    else { println("[selftest] top_ready OK") }
+    // 5) kahn
+    let k = render_kahn("")
+    if k.len() == 0 { eprintln("[selftest] FAIL kahn empty"); fails = fails + 1 }
+    else { println("[selftest] kahn OK") }
+    // 6) recent
+    let r = render_recent(3)
+    if r.len() == 0 { eprintln("[selftest] FAIL recent empty"); fails = fails + 1 }
+    else { println("[selftest] recent OK") }
+    // 7) checkpoints
+    let cp = render_checkpoints()
+    if cp.len() == 0 { eprintln("[selftest] FAIL checkpoints empty"); fails = fails + 1 }
+    else { println("[selftest] checkpoints OK") }
+    // 8) dispatch queue
+    let dq = render_dispatch_queue()
+    if dq.len() == 0 { eprintln("[selftest] FAIL dispatch_queue empty"); fails = fails + 1 }
+    else { println("[selftest] dispatch_queue OK") }
+    // 9) health
+    let hs = collect_health()
+    let hr = health_line(hs)
+    let kind = _str(hr[0])
+    if kind != "OK" && kind != "WARN" && kind != "CRIT" {
+        eprintln("[selftest] FAIL health_kind=" + kind); fails = fails + 1
+    } else { println("[selftest] health=" + kind + " " + _str(hr[1])) }
+    // 10) full dashboard
+    let dash = render_dashboard("", false)
+    if dash.len() < 200 {
+        eprintln("[selftest] FAIL dashboard too short=" + to_string(dash.len()))
+        fails = fails + 1
+    } else { println("[selftest] dashboard OK (" + to_string(dash.len()) + " chars)") }
+    if fails > 0 { eprintln("[selftest] " + to_string(fails) + " failure(s)"); return 1 }
+    println("[selftest] OK")
+    return 0
+}
+
+// ── CLI dispatch ──────────────────────────────────────────────────────────
+fn print_usage() {
+    eprintln("usage:")
+    eprintln("  hexa shared/tool/roadmap_observability.hexa dashboard [--rm=<one>] [--compact]")
+    eprintln("  hexa shared/tool/roadmap_observability.hexa health")
+    eprintln("  hexa shared/tool/roadmap_observability.hexa watch [--interval=30] [--forever]")
+    eprintln("  hexa shared/tool/roadmap_observability.hexa --selftest")
+}
+
+fn parse_flag(args: [string], prefix: string) -> string {
+    let mut i: i64 = 0
+    while i < args.len() {
+        let a = _str(args[i])
+        if a.len() >= prefix.len() && a.substring(0, prefix.len()) == prefix {
+            return a.substring(prefix.len(), a.len())
+        }
+        i = i + 1
+    }
+    return ""
+}
+
+fn has_flag(args: [string], name: string) -> bool {
+    let mut i: i64 = 0
+    while i < args.len() {
+        if _str(args[i]) == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() -> i64 {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only raw[2] 가정 → Linux 에서 raw[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut raw: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        raw = raw + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && raw.len() >= 3 {
+        if raw[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < raw.len() {
+                _a2 = _a2 + [raw[_j2]]
+                _j2 = _j2 + 1
+            }
+            raw = _a2
+        }
+    }
+    let mut argv: [string] = []
+    let mut ai: i64 = 2
+    while ai < raw.len() {
+        argv = argv.push(_str(raw[ai]))
+        ai = ai + 1
+    }
+    if argv.len() == 0 { print_usage(); return 3 }
+    let sub = _str(argv[0])
+    if sub == "--selftest" { return cmd_selftest() }
+    if sub == "dashboard" {
+        let mut rest: [string] = []
+        let mut ri: i64 = 1
+        while ri < argv.len() { rest = rest.push(_str(argv[ri])); ri = ri + 1 }
+        let rm = parse_flag(rest, "--rm=")
+        let compact = has_flag(rest, "--compact")
+        print(render_dashboard(rm, compact))
+        return 0
+    }
+    if sub == "health" {
+        let h = collect_health()
+        let r = health_line(h)
+        let kind = _str(r[0])
+        let msg = _str(r[1])
+        if kind == "OK" { println("OK"); return 0 }
+        if kind == "WARN" { println("WARN: " + msg); return 1 }
+        println("CRIT: " + msg)
+        return 2
+    }
+    if sub == "watch" {
+        let mut rest: [string] = []
+        let mut ri: i64 = 1
+        while ri < argv.len() { rest = rest.push(_str(argv[ri])); ri = ri + 1 }
+        let iv_s = parse_flag(rest, "--interval=")
+        let iv = if iv_s.len() > 0 { _to_int0(iv_s) } else { 30 }
+        let forever = has_flag(rest, "--forever")
+        return cmd_watch(iv, forever)
+    }
+    print_usage()
+    return 3
+}
+
+main()

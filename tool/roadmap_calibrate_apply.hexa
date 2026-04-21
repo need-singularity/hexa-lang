@@ -1,0 +1,1071 @@
+// roadmap_calibrate_apply.hexa — apply roadmap_calibration.json onto roadmap.json
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_signals.hexa 가 생산한 ntype 별 calibration 통계
+//   (mean_cost, ewma_cost, p_success_mean, eta_ewma, amortize_ratio) 를
+//   roadmap JSON 의 각 노드 cost / p_success / eta / n_uses 에 1차 적용.
+//   적용 결과는 별도 파일로 emit (원본 보존). engine 은 이 calibrated 파일을 로드.
+//
+//   calibrate_apply 는 roadmap_engine 을 수정하지 않는다. 전처리 모듈.
+//
+// ALGORITHM (per node, status != done)
+//   C = calibration.ntypes[node.type]
+//   mode (--mode=ewma|mean|blend) → mode_cost (calibration 기준 비용)
+//     ewma:  C.ewma_cost
+//     mean:  C.mean_cost
+//     blend: 0.5·mean + 0.5·ewma   (default)
+//
+//   ratio = mode_cost / max(0.001, C.mean_cost)
+//   adjusted.cost = max(0.1, node.cost · ratio)
+//                   if node.cost == 0 → adjusted.cost = mode_cost
+//   adjusted.p_success (ntype=exp 만): C.p_success_mean
+//   adjusted.eta       (ntype=learn 만): C.eta_ewma
+//   adjusted.n_uses    (ntype=boot 만, C.amortize_ratio < 1): max(1, round(1/amortize_ratio))
+//
+//   done 노드는 cost/p/eta/n_uses 모두 불변 (과거 비용 동결).
+//
+// JSON WRITE STRATEGY
+//   substring-replace per node: "cost": X.Y → "cost": X'.Y' (+ p_success/eta/n_uses)
+//   _meta.updated 만 ISO 갱신.
+//   원본 들여쓰기/순서 보존.
+//
+// CLI
+//   hexa run roadmap_calibrate_apply.hexa apply <rm-path> [--cal=<path>] [--mode=blend|ewma|mean] [--out=<path>]
+//   hexa run roadmap_calibrate_apply.hexa diff  <rm-path> [--cal=<path>] [--mode=blend|ewma|mean]
+//   hexa run roadmap_calibrate_apply.hexa pipeline <rm-path>
+//   hexa run roadmap_calibrate_apply.hexa --selftest
+//
+// exit: 0 OK / 1 apply fail / 2 usage / 3 parse error
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let DEFAULT_CAL = HARNESS + "/roadmap_calibration.json"
+let DEFAULT_OUT_DIR = HARNESS + "/roadmap_calibrated"
+let SCHEMA_ADAPTER = HARNESS + "/roadmap_schema_adapter.hexa"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+// f64 → i64 truncate (P9: to_int 가 과학표기/literal 에 약함)
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _round(x: f64) -> i64 {
+    if x >= 0.0 { return f_to_i(x + 0.5) }
+    let neg = 0.0 - x
+    return 0 - f_to_i(neg + 0.5)
+}
+
+// f64 → "X.YYYY" 4-decimal (signals 와 동일 포맷)
+fn fmt_f4(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = (v * 10000.0) + 0.5
+    let r = f_to_i(scaled)
+    let whole = r / 10000
+    let frac = r - (whole * 10000)
+    let mut fs = to_string(frac)
+    while fs.len() < 4 { fs = "0" + fs }
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + fs
+}
+
+// 1-decimal (diff 표시)
+fn fmt_f1(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = (v * 10.0) + 0.5
+    let r = f_to_i(scaled)
+    let whole = r / 10
+    let frac = r - (whole * 10)
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + to_string(frac)
+}
+
+fn pad_right(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = r + " " }
+    return r
+}
+
+fn pad_left(s: string, w: i64) -> string {
+    let mut r = s
+    while r.len() < w { r = " " + r }
+    return r
+}
+
+// ── JSON field extract (engine 과 동일 패턴) ─────────────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return "" }
+    if body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+fn json_num_in(body: string, key: string, from: i64) -> f64 {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return 0.0 }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return 0.0 }
+    let s = body.substring(start, i)
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    return json_num_in(body, key, 0)
+}
+
+// ── ntype calibration block extract ───────────────────────────────────────
+// returns the substring covering the {...} block of "ntypes":{ ... "<ntype>": { ... } ... }
+fn extract_ntype_block(cal: string, ntype: string) -> string {
+    // find the ntypes object first
+    let nt_idx = _find_after(cal, "\"ntypes\"", 0)
+    if nt_idx < 0 { return "" }
+    // find the ntype key after ntypes
+    let key = "\"" + ntype + "\""
+    let ki = _find_after(cal, key, nt_idx)
+    if ki < 0 { return "" }
+    // skip ":" and ws
+    let mut i = ki + key.len()
+    while i < cal.len() && cal.substring(i, i + 1) != "{" { i = i + 1 }
+    if i >= cal.len() { return "" }
+    let start = i
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut end = i
+    let mut done_block: bool = false
+    while end < cal.len() && done_block == false {
+        let c = cal.substring(end, end + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { end = end + 2; handled = true }
+            else if c == "\"" { in_str = false; end = end + 1; handled = true }
+            else { end = end + 1; handled = true }
+        }
+        if handled == false {
+            if c == "\"" { in_str = true; end = end + 1 }
+            else if c == "{" { depth = depth + 1; end = end + 1 }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 { end = end + 1; done_block = true }
+                else { end = end + 1 }
+            }
+            else { end = end + 1 }
+        }
+    }
+    return cal.substring(start, end)
+}
+
+// ── Calibration record per ntype ─────────────────────────────────────────
+struct NTypeCal {
+    found: bool,
+    mean_cost: f64,
+    ewma_cost: f64,
+    samples: i64,
+    p_success_mean: f64,
+    eta_ewma: f64,
+    amortize_ratio: f64,
+    has_amortize: bool
+}
+
+fn load_ntype_cal(cal_body: string, ntype: string) -> NTypeCal {
+    let blk = extract_ntype_block(cal_body, ntype)
+    if blk.len() == 0 {
+        return NTypeCal {
+            found: false, mean_cost: 0.0, ewma_cost: 0.0, samples: 0,
+            p_success_mean: 0.0, eta_ewma: 0.0,
+            amortize_ratio: 0.0, has_amortize: false
+        }
+    }
+    let mc = json_num(blk, "mean_cost")
+    let ec = json_num(blk, "ewma_cost")
+    let smp = f_to_i(json_num(blk, "samples"))
+    let pm = json_num(blk, "p_success_mean")
+    let eta = json_num(blk, "eta_ewma")
+    // amortize_ratio: presence + nonzero check (boot may emit "null")
+    let amort_idx = _find_after(blk, "\"amortize_ratio\"", 0)
+    let mut has_a: bool = false
+    let mut amort: f64 = 0.0
+    if amort_idx >= 0 {
+        // check if value is "null"
+        let mut p = amort_idx + 16   // len("\"amortize_ratio\"")
+        while p < blk.len() {
+            let c = blk.substring(p, p + 1)
+            if c == " " || c == "\t" || c == ":" { p = p + 1 }
+            else { break }
+        }
+        if p + 4 <= blk.len() && blk.substring(p, p + 4) == "null" {
+            has_a = false
+        } else {
+            amort = json_num_in(blk, "amortize_ratio", 0)
+            has_a = true
+        }
+    }
+    return NTypeCal {
+        found: true,
+        mean_cost: mc, ewma_cost: ec, samples: smp,
+        p_success_mean: pm, eta_ewma: eta,
+        amortize_ratio: amort, has_amortize: has_a
+    }
+}
+
+// ── adjusted value calculations ──────────────────────────────────────────
+fn select_mode_cost(c: NTypeCal, mode: string) -> f64 {
+    if mode == "ewma" { return c.ewma_cost }
+    if mode == "mean" { return c.mean_cost }
+    // blend default
+    return 0.5 * c.mean_cost + 0.5 * c.ewma_cost
+}
+
+fn adjust_cost(node_cost: f64, c: NTypeCal, mode: string) -> f64 {
+    let mc = select_mode_cost(c, mode)
+    if node_cost <= 0.0 {
+        if mc < 0.1 { return 0.1 }
+        return mc
+    }
+    let base = if c.mean_cost > 0.001 { c.mean_cost } else { 1.0 }
+    let ratio = mc / base
+    let adj = node_cost * ratio
+    if adj < 0.1 { return 0.1 }
+    return adj
+}
+
+// ── node block split (engine pattern, simplified) ────────────────────────
+// returns array of [start, end_exclusive] index pairs for each node object literal
+struct NodeRange {
+    start: i64,
+    end: i64
+}
+
+fn nodes_ranges(body: string) -> [NodeRange] {
+    let mut out: [NodeRange] = []
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return out }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return out }
+    i = i + 1
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" { in_str = false; i = i + 1; handled = true }
+            else { i = i + 1; handled = true }
+        }
+        if handled == false {
+            if c == "\"" { in_str = true; i = i + 1; handled = true }
+            else if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+                i = i + 1
+                handled = true
+            }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out.push(NodeRange { start: start, end: i + 1 })
+                    start = -1
+                }
+                i = i + 1
+                handled = true
+            }
+            else if c == "]" && depth == 0 { break }
+            else { i = i + 1 }
+        }
+    }
+    return out
+}
+
+// ── numeric field replacement inside a single node block ─────────────────
+// finds  "<key>":  <num>  and replaces num with new_str.
+// returns replaced block (or original on miss).
+fn replace_num_field(blk: string, key: string, new_str: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(blk, k, 0)
+    if ki < 0 { return blk }
+    let mut i = ki + k.len()
+    while i < blk.len() {
+        let c = blk.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let val_start = i
+    while i < blk.len() {
+        let c = blk.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == val_start { return blk }
+    return blk.substring(0, val_start) + new_str + blk.substring(i, blk.len())
+}
+
+// ── insert numeric field after "type":"X" if missing ─────────────────────
+// pattern: insert "<key>": <num>, after the type field comma. Used for adding
+// p_success / eta / n_uses on nodes that didn't declare them.
+fn insert_num_field_after_type(blk: string, key: string, num_str: string) -> string {
+    // already present? skip
+    let probe = "\"" + key + "\""
+    if _find_after(blk, probe, 0) >= 0 { return blk }
+    // anchor on "type"
+    let ti = _find_after(blk, "\"type\"", 0)
+    if ti < 0 { return blk }
+    // skip past "type":"<value>"
+    let mut i = ti + 6   // len("\"type\"")
+    while i < blk.len() {
+        let c = blk.substring(i, i + 1)
+        if c == " " || c == "\t" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    // expect opening quote of value
+    if i >= blk.len() || blk.substring(i, i + 1) != "\"" { return blk }
+    i = i + 1
+    // skip until closing quote
+    while i < blk.len() {
+        let c = blk.substring(i, i + 1)
+        if c == "\\" { i = i + 2; continue }
+        if c == "\"" { i = i + 1; break }
+        i = i + 1
+    }
+    // find next non-ws — expect "," or "}"
+    let mut j = i
+    while j < blk.len() {
+        let c = blk.substring(j, j + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" { j = j + 1 }
+        else { break }
+    }
+    if j >= blk.len() { return blk }
+    // determine indentation prefix from original: walk back from i to last newline
+    let mut nl = i - 1
+    while nl > 0 {
+        if blk.substring(nl, nl + 1) == "\n" { break }
+        nl = nl - 1
+    }
+    let mut indent = ""
+    let mut p = nl + 1
+    while p < blk.len() {
+        let c = blk.substring(p, p + 1)
+        if c == " " || c == "\t" { indent = indent + c; p = p + 1 }
+        else { break }
+    }
+    // build inserted fragment: ",\n<indent>\"<key>\": <num>"
+    let frag = ",\n" + indent + "\"" + key + "\": " + num_str
+    // insert after position i (after closing quote of type value)
+    return blk.substring(0, i) + frag + blk.substring(i, blk.len())
+}
+
+// ── replace _meta.updated to current ISO ─────────────────────────────────
+fn update_meta_ts(body: string, ts: string) -> string {
+    // pattern: "updated": "<old>"   inside _meta
+    let mi = _find_after(body, "\"_meta\"", 0)
+    if mi < 0 { return body }
+    let ui = _find_after(body, "\"updated\"", mi)
+    if ui < 0 { return body }
+    let mut i = ui + 9   // len("\"updated\"")
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "\"" { return body }
+    let q1 = i + 1
+    let mut j = q1
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return body }
+    return body.substring(0, q1) + ts + body.substring(j, body.len())
+}
+
+// ── basename (last_index_of 없음 P14 우회) ───────────────────────────────
+fn last_idx_slash(s: string) -> i64 {
+    let mut i: i64 = s.len() - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == "/" { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn basename(p: string) -> string {
+    let li = last_idx_slash(p)
+    if li < 0 { return p }
+    return p.substring(li + 1, p.len())
+}
+
+// ── ApplyResult counters ─────────────────────────────────────────────────
+struct ApplyResult {
+    out_path: string,
+    applied: i64,
+    untouched: i64,
+    by_type_keys: [string],
+    by_type_vals: [i64]
+}
+
+fn _bt_inc(keys: [string], vals: [i64], k: string) -> [i64] {
+    let mut i: i64 = 0
+    while i < keys.len() {
+        if _str(keys[i]) == k {
+            let mut nv: [i64] = []
+            let mut j: i64 = 0
+            while j < vals.len() {
+                if j == i { nv = nv.push(vals[j] + 1) } else { nv = nv.push(vals[j]) }
+                j = j + 1
+            }
+            return nv
+        }
+        i = i + 1
+    }
+    return vals
+}
+
+fn _bt_ensure(keys: [string], vals: [i64], k: string) -> [string] {
+    let mut i: i64 = 0
+    while i < keys.len() {
+        if _str(keys[i]) == k { return keys }
+        i = i + 1
+    }
+    return keys.push(k)
+}
+
+// Per-node mutation result
+struct NodeApply {
+    new_block: string,
+    changed: bool,
+    ntype: string,
+    old_cost: f64,
+    new_cost: f64,
+    old_p: f64,
+    new_p: f64,
+    old_eta: f64,
+    new_eta: f64,
+    old_n_uses: i64,
+    new_n_uses: i64,
+    reason: string   // "done"|"no-cal"|"applied"|"seed-or-goal"
+}
+
+fn apply_one_node(blk: string, cal_body: string, mode: string) -> NodeApply {
+    let id = json_str(blk, "id")
+    let ntype = json_str(blk, "type")
+    let status = json_str(blk, "status")
+    let cost = json_num(blk, "cost")
+    let pv = json_num(blk, "p_success")
+    let etav = json_num(blk, "eta")
+    let nuv = json_num(blk, "n_uses")
+
+    if status == "done" || status == "complete" || status == "aborted" || status == "skipped" {
+        return NodeApply {
+            new_block: blk, changed: false, ntype: ntype,
+            old_cost: cost, new_cost: cost,
+            old_p: pv, new_p: pv,
+            old_eta: etav, new_eta: etav,
+            old_n_uses: f_to_i(nuv), new_n_uses: f_to_i(nuv),
+            reason: "done"
+        }
+    }
+    if ntype == "seed" || ntype == "goal" {
+        return NodeApply {
+            new_block: blk, changed: false, ntype: ntype,
+            old_cost: cost, new_cost: cost,
+            old_p: pv, new_p: pv,
+            old_eta: etav, new_eta: etav,
+            old_n_uses: f_to_i(nuv), new_n_uses: f_to_i(nuv),
+            reason: "seed-or-goal"
+        }
+    }
+    let cal = load_ntype_cal(cal_body, ntype)
+    if cal.found == false {
+        return NodeApply {
+            new_block: blk, changed: false, ntype: ntype,
+            old_cost: cost, new_cost: cost,
+            old_p: pv, new_p: pv,
+            old_eta: etav, new_eta: etav,
+            old_n_uses: f_to_i(nuv), new_n_uses: f_to_i(nuv),
+            reason: "no-cal"
+        }
+    }
+
+    let new_cost = adjust_cost(cost, cal, mode)
+    let mut nb = replace_num_field(blk, "cost", fmt_f4(new_cost))
+
+    let mut new_p = pv
+    let mut new_eta = etav
+    let mut new_nu_i = f_to_i(nuv)
+
+    if ntype == "exp" && cal.p_success_mean > 0.0 {
+        new_p = cal.p_success_mean
+        let p_str = fmt_f4(new_p)
+        if _find_after(nb, "\"p_success\"", 0) >= 0 {
+            nb = replace_num_field(nb, "p_success", p_str)
+        } else {
+            nb = insert_num_field_after_type(nb, "p_success", p_str)
+        }
+    }
+
+    if ntype == "learn" && cal.eta_ewma > 0.0 {
+        new_eta = cal.eta_ewma
+        let e_str = fmt_f4(new_eta)
+        if _find_after(nb, "\"eta\"", 0) >= 0 {
+            nb = replace_num_field(nb, "eta", e_str)
+        } else {
+            nb = insert_num_field_after_type(nb, "eta", e_str)
+        }
+    }
+
+    if ntype == "boot" && cal.has_amortize && cal.amortize_ratio > 0.0 && cal.amortize_ratio < 1.0 {
+        let inv = 1.0 / cal.amortize_ratio
+        let r = _round(inv)
+        new_nu_i = if r < 1 { 1 } else { r }
+        let nu_str = to_string(new_nu_i)
+        if _find_after(nb, "\"n_uses\"", 0) >= 0 {
+            nb = replace_num_field(nb, "n_uses", nu_str)
+        } else {
+            nb = insert_num_field_after_type(nb, "n_uses", nu_str)
+        }
+    }
+
+    return NodeApply {
+        new_block: nb, changed: true, ntype: ntype,
+        old_cost: cost, new_cost: new_cost,
+        old_p: pv, new_p: new_p,
+        old_eta: etav, new_eta: new_eta,
+        old_n_uses: f_to_i(nuv), new_n_uses: new_nu_i,
+        reason: "applied"
+    }
+}
+
+// ── full body reassembly ─────────────────────────────────────────────────
+// walks node ranges and stitches replaced node blocks back in place.
+struct AssembleResult {
+    body: string,
+    applied: i64,
+    untouched: i64,
+    by_keys: [string],
+    by_vals: [i64]
+}
+
+fn apply_to_body(body: string, cal_body: string, mode: string) -> AssembleResult {
+    let ranges = nodes_ranges(body)
+    if ranges.len() == 0 {
+        return AssembleResult { body: body, applied: 0, untouched: 0, by_keys: [], by_vals: [] }
+    }
+    let mut out = ""
+    let mut cursor: i64 = 0
+    let mut applied: i64 = 0
+    let mut untouched: i64 = 0
+    let mut by_keys: [string] = []
+    let mut by_vals: [i64] = []
+    let mut i: i64 = 0
+    while i < ranges.len() {
+        let r = ranges[i]
+        let original = body.substring(r.start, r.end)
+        let na = apply_one_node(original, cal_body, mode)
+        if na.changed {
+            applied = applied + 1
+            by_keys = _bt_ensure(by_keys, by_vals, na.ntype)
+            // ensure vals length matches keys (after potential push)
+            while by_vals.len() < by_keys.len() { by_vals = by_vals.push(0) }
+            by_vals = _bt_inc(by_keys, by_vals, na.ntype)
+        } else {
+            untouched = untouched + 1
+        }
+        // append [cursor..r.start) original + new_block
+        if r.start > cursor {
+            out = out + body.substring(cursor, r.start)
+        }
+        out = out + na.new_block
+        cursor = r.end
+        i = i + 1
+    }
+    if cursor < body.len() {
+        out = out + body.substring(cursor, body.len())
+    }
+    return AssembleResult { body: out, applied: applied, untouched: untouched, by_keys: by_keys, by_vals: by_vals }
+}
+
+// ── CLI: apply ───────────────────────────────────────────────────────────
+fn cmd_apply(rm_path: string, cal_path: string, mode: string, out_path: string) -> i64 {
+    if file_exists(rm_path) == false {
+        eprintln("REJECT: roadmap not found: " + rm_path)
+        return 3
+    }
+    if file_exists(cal_path) == false {
+        eprintln("REJECT: calibration not found: " + cal_path)
+        return 3
+    }
+    let body = _str(read_file(rm_path))
+    let cal_body = _str(read_file(cal_path))
+    if body.len() == 0 || cal_body.len() == 0 {
+        eprintln("REJECT: empty roadmap or calibration")
+        return 3
+    }
+    let ar = apply_to_body(body, cal_body, mode)
+    let ts = _ts_iso()
+    let stamped = update_meta_ts(ar.body, ts)
+    let final_out = if out_path == "" { DEFAULT_OUT_DIR + "/" + basename(rm_path) } else { out_path }
+    let _ = exec("mkdir -p '" + DEFAULT_OUT_DIR + "' 2>/dev/null")  // @allow-bare-exec
+    // ensure parent dir exists for arbitrary out_path
+    let li = last_idx_slash(final_out)
+    if li > 0 {
+        let dir = final_out.substring(0, li)
+        let _ = exec("mkdir -p '" + dir + "' 2>/dev/null")  // @allow-bare-exec
+    }
+    try { write_file(final_out, stamped) } catch err {
+        eprintln("REJECT: write_file failed: " + final_out)
+        return 1
+    }
+    // build summary
+    let mut by_str = ""
+    let mut k: i64 = 0
+    while k < ar.by_keys.len() {
+        if k > 0 { by_str = by_str + ", " }
+        by_str = by_str + _str(ar.by_keys[k]) + "=" + to_string(ar.by_vals[k])
+        k = k + 1
+    }
+    println("applied: " + to_string(ar.applied) + " nodes (" + by_str + "), untouched: "
+        + to_string(ar.untouched) + " (done/no-ntype-cal)")
+    println("out: " + final_out)
+    return 0
+}
+
+// ── CLI: diff ────────────────────────────────────────────────────────────
+fn cmd_diff(rm_path: string, cal_path: string, mode: string) -> i64 {
+    if file_exists(rm_path) == false {
+        eprintln("REJECT: roadmap not found: " + rm_path)
+        return 3
+    }
+    if file_exists(cal_path) == false {
+        eprintln("REJECT: calibration not found: " + cal_path)
+        return 3
+    }
+    let body = _str(read_file(rm_path))
+    let cal_body = _str(read_file(cal_path))
+    if body.len() == 0 || cal_body.len() == 0 {
+        eprintln("REJECT: empty roadmap or calibration")
+        return 3
+    }
+    println(pad_right("NODE", 12) + pad_right("TYPE", 8)
+        + pad_right("OLD_COST", 10) + pad_right("NEW_COST", 10)
+        + pad_right("DELTA", 9)
+        + pad_right("OLD_P", 8) + pad_right("NEW_P", 8)
+        + pad_right("OLD_ETA", 9) + pad_right("NEW_ETA", 9)
+        + pad_right("REASON", 12))
+    let ranges = nodes_ranges(body)
+    let mut i: i64 = 0
+    while i < ranges.len() {
+        let r = ranges[i]
+        let blk = body.substring(r.start, r.end)
+        let na = apply_one_node(blk, cal_body, mode)
+        let id = json_str(blk, "id")
+        let id_short = if id.len() > 11 { id.substring(0, 11) } else { id }
+        let dlt = na.new_cost - na.old_cost
+        let dlt_s = (if dlt >= 0.0 { "+" } else { "" }) + fmt_f1(dlt)
+        println(pad_right(id_short, 12)
+            + pad_right(na.ntype, 8)
+            + pad_right(fmt_f1(na.old_cost), 10)
+            + pad_right(fmt_f1(na.new_cost), 10)
+            + pad_right(dlt_s, 9)
+            + pad_right(fmt_f1(na.old_p), 8)
+            + pad_right(fmt_f1(na.new_p), 8)
+            + pad_right(fmt_f1(na.old_eta), 9)
+            + pad_right(fmt_f1(na.new_eta), 9)
+            + pad_right(na.reason, 12))
+        i = i + 1
+    }
+    return 0
+}
+
+// ── CLI: pipeline ────────────────────────────────────────────────────────
+// detect → adapt (if adapter exists and roadmap looks v2) → calibrate apply → emit path
+fn cmd_pipeline(rm_path: string) -> i64 {
+    if file_exists(rm_path) == false {
+        eprintln("REJECT: roadmap not found: " + rm_path)
+        return 3
+    }
+    let body = _str(read_file(rm_path))
+    let sv = json_str(body, "schema_version")
+    let mut active_path = rm_path
+    if sv != "" && sv != "engine_v1" && file_exists(SCHEMA_ADAPTER) {
+        // Try adapt: assume adapter accepts (in,out); we route to /tmp
+        let tmp_adapted = "/tmp/roadmap_adapted_" + _str(exec("date +%s")).trim() + ".json"  // @allow-bare-exec
+        let cmd = "hexa run '" + SCHEMA_ADAPTER + "' '" + rm_path + "' '" + tmp_adapted + "' 2>&1"
+        let _ = exec(cmd)  // @allow-bare-exec
+        if file_exists(tmp_adapted) { active_path = tmp_adapted }
+    }
+    let out_path = DEFAULT_OUT_DIR + "/" + basename(rm_path)
+    let r = cmd_apply(active_path, DEFAULT_CAL, "blend", out_path)
+    if r != 0 { return r }
+    // pipeline 의 stdout 마지막 라인 = 산출 경로 (caller 가 grep 가능)
+    println(out_path)
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn write_tmp(path: string, content: string) -> bool {
+    try { write_file(path, content) } catch e { return false }
+    return true
+}
+
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    let d = a - b
+    let ad = if d < 0.0 { 0.0 - d } else { d }
+    return ad <= tol
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_calibrate_apply.hexa")
+    let tmp_rm = "/tmp/rm_apply_selftest.json"
+    let tmp_cal = "/tmp/cal_apply_selftest.json"
+    let tmp_out = "/tmp/rm_apply_selftest_out.json"
+
+    let mini_rm = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"st\",\n"
+        + "    \"goal\": \"G\",\n"
+        + "    \"start\": \"seed\",\n"
+        + "    \"K_target\": 100,\n"
+        + "    \"C_channel\": 10,\n"
+        + "    \"updated\": \"1970-01-01\",\n"
+        + "    \"schema_version\": \"engine_v1\"\n"
+        + "  },\n"
+        + "  \"nodes\": [\n"
+        + "    {\"id\": \"seed\", \"name\": \"S0\", \"type\": \"seed\", \"cost\": 0, \"status\": \"done\", \"deps\": []},\n"
+        + "    {\"id\": \"B1\", \"name\": \"build1\", \"type\": \"build\", \"cost\": 10.0, \"status\": \"done\", \"deps\": [\"seed\"]},\n"
+        + "    {\"id\": \"B2\", \"name\": \"build2\", \"type\": \"build\", \"cost\": 10.0, \"status\": \"todo\", \"deps\": [\"seed\"]},\n"
+        + "    {\"id\": \"E1\", \"name\": \"exp1\", \"type\": \"exp\", \"cost\": 20.0, \"p_success\": 1.0, \"status\": \"todo\", \"deps\": [\"B2\"]},\n"
+        + "    {\"id\": \"L1\", \"name\": \"learn1\", \"type\": \"learn\", \"cost\": 5.0, \"status\": \"todo\", \"deps\": [\"E1\"]},\n"
+        + "    {\"id\": \"BO1\", \"name\": \"boot1\", \"type\": \"boot\", \"cost\": 50.0, \"status\": \"todo\", \"deps\": [\"L1\"]},\n"
+        + "    {\"id\": \"G\", \"name\": \"goal\", \"type\": \"goal\", \"cost\": 0, \"status\": \"todo\", \"deps\": [\"BO1\"]}\n"
+        + "  ]\n"
+        + "}\n"
+
+    // mini calibration: build ewma 2x mean, exp p=0.5, learn eta=0.3, boot amortize=0.25 → 4 uses
+    let mini_cal = "{\n"
+        + "  \"updated\": \"1970-01-01\",\n"
+        + "  \"window\": 100,\n"
+        + "  \"ntypes\": {\n"
+        + "    \"build\": { \"mean_cost\": 10.0, \"ewma_cost\": 20.0, \"samples\": 5 },\n"
+        + "    \"exp\":   { \"mean_cost\": 20.0, \"ewma_cost\": 20.0, \"samples\": 4, \"p_success_mean\": 0.5 },\n"
+        + "    \"learn\": { \"mean_cost\": 5.0, \"ewma_cost\": 5.0, \"samples\": 3, \"eta_ewma\": 0.3 },\n"
+        + "    \"boot\":  { \"mean_cost\": 50.0, \"ewma_cost\": 50.0, \"samples\": 2, \"amortize_ratio\": 0.25, \"has_source\": true }\n"
+        + "  }\n"
+        + "}\n"
+
+    if write_tmp(tmp_rm, mini_rm) == false {
+        eprintln("[selftest] FAIL: cannot write mini roadmap")
+        return 1
+    }
+    if write_tmp(tmp_cal, mini_cal) == false {
+        eprintln("[selftest] FAIL: cannot write mini calibration")
+        return 1
+    }
+
+    // apply (blend): build ratio = (10+20)/2 / 10 = 1.5 → B2 cost: 10 → 15
+    let r = cmd_apply(tmp_rm, tmp_cal, "blend", tmp_out)
+    if r != 0 {
+        eprintln("[selftest] FAIL: cmd_apply non-zero")
+        return 1
+    }
+    if file_exists(tmp_out) == false {
+        eprintln("[selftest] FAIL: out file not produced")
+        return 1
+    }
+    let out_body = _str(read_file(tmp_out))
+
+    // assertion 1: B2 cost is now 15.0 (within tol)
+    let b2_idx = _find_after(out_body, "\"B2\"", 0)
+    if b2_idx < 0 {
+        eprintln("[selftest] FAIL: B2 not found in output")
+        return 1
+    }
+    // extract block by walking braces
+    let mut bs = b2_idx
+    while bs > 0 && out_body.substring(bs, bs + 1) != "{" { bs = bs - 1 }
+    let mut be = bs
+    let mut depth: i64 = 0
+    while be < out_body.len() {
+        let c = out_body.substring(be, be + 1)
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { be = be + 1; break } }
+        be = be + 1
+    }
+    let b2_blk = out_body.substring(bs, be)
+    let b2_cost = json_num(b2_blk, "cost")
+    if approx_eq(b2_cost, 15.0, 0.01) == false {
+        eprintln("[selftest] FAIL: B2 cost expected ~15.0 got " + fmt_f4(b2_cost))
+        return 1
+    }
+    println("[selftest]   B2 cost 10.0 → " + fmt_f4(b2_cost) + " (build ratio 1.5) — OK")
+
+    // assertion 2: B1 (done) cost UNCHANGED at 10.0
+    let b1_idx = _find_after(out_body, "\"B1\"", 0)
+    let mut b1s = b1_idx
+    while b1s > 0 && out_body.substring(b1s, b1s + 1) != "{" { b1s = b1s - 1 }
+    let mut b1e = b1s
+    let mut d2: i64 = 0
+    while b1e < out_body.len() {
+        let c = out_body.substring(b1e, b1e + 1)
+        if c == "{" { d2 = d2 + 1 }
+        else if c == "}" { d2 = d2 - 1; if d2 == 0 { b1e = b1e + 1; break } }
+        b1e = b1e + 1
+    }
+    let b1_blk = out_body.substring(b1s, b1e)
+    let b1_cost = json_num(b1_blk, "cost")
+    if approx_eq(b1_cost, 10.0, 0.001) == false {
+        eprintln("[selftest] FAIL: B1 (done) cost should be 10.0 got " + fmt_f4(b1_cost))
+        return 1
+    }
+    println("[selftest]   B1 (done) cost preserved 10.0 — OK")
+
+    // assertion 3: E1 p_success now 0.5 (override)
+    let e1_idx = _find_after(out_body, "\"E1\"", 0)
+    let mut e1s = e1_idx
+    while e1s > 0 && out_body.substring(e1s, e1s + 1) != "{" { e1s = e1s - 1 }
+    let mut e1e = e1s
+    let mut d3: i64 = 0
+    while e1e < out_body.len() {
+        let c = out_body.substring(e1e, e1e + 1)
+        if c == "{" { d3 = d3 + 1 }
+        else if c == "}" { d3 = d3 - 1; if d3 == 0 { e1e = e1e + 1; break } }
+        e1e = e1e + 1
+    }
+    let e1_blk = out_body.substring(e1s, e1e)
+    let e1_p = json_num(e1_blk, "p_success")
+    if approx_eq(e1_p, 0.5, 0.01) == false {
+        eprintln("[selftest] FAIL: E1 p_success expected 0.5 got " + fmt_f4(e1_p))
+        return 1
+    }
+    println("[selftest]   E1 p_success 1.0 → " + fmt_f4(e1_p) + " — OK")
+
+    // assertion 4: BO1 n_uses now 4 (1/0.25)
+    let bo_idx = _find_after(out_body, "\"BO1\"", 0)
+    let mut bos = bo_idx
+    while bos > 0 && out_body.substring(bos, bos + 1) != "{" { bos = bos - 1 }
+    let mut boe = bos
+    let mut d4: i64 = 0
+    while boe < out_body.len() {
+        let c = out_body.substring(boe, boe + 1)
+        if c == "{" { d4 = d4 + 1 }
+        else if c == "}" { d4 = d4 - 1; if d4 == 0 { boe = boe + 1; break } }
+        boe = boe + 1
+    }
+    let bo_blk = out_body.substring(bos, boe)
+    let bo_nu = json_num(bo_blk, "n_uses")
+    if approx_eq(bo_nu, 4.0, 0.5) == false {
+        eprintln("[selftest] FAIL: BO1 n_uses expected 4 got " + fmt_f4(bo_nu))
+        return 1
+    }
+    println("[selftest]   BO1 n_uses inserted = " + fmt_f4(bo_nu) + " (1/0.25=4) — OK")
+
+    // assertion 5: diff command runs (just non-error)
+    let dr = cmd_diff(tmp_rm, tmp_cal, "blend")
+    if dr != 0 {
+        eprintln("[selftest] FAIL: diff non-zero")
+        return 1
+    }
+    println("[selftest]   diff render OK")
+
+    // assertion 6: out is parseable JSON-ish (contains _meta + nodes + closing brace)
+    if _find_after(out_body, "\"_meta\"", 0) < 0 || _find_after(out_body, "\"nodes\"", 0) < 0 {
+        eprintln("[selftest] FAIL: out missing _meta or nodes")
+        return 1
+    }
+    println("[selftest] OK — all 6 checks passed")
+    return 0
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        eprintln("usage: roadmap_calibrate_apply.hexa <apply|diff|pipeline|--selftest> [args...]")
+        eprintln("  apply <rm-path> [--cal=<path>] [--mode=blend|ewma|mean] [--out=<path>]")
+        eprintln("  diff  <rm-path> [--cal=<path>] [--mode=blend|ewma|mean]")
+        eprintln("  pipeline <rm-path>")
+        eprintln("  --selftest")
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let r = selftest()
+        exit(r)
+    }
+
+    // shared flag parse (--cal/--mode/--out + first positional = rm-path)
+    let mut rm_path = ""
+    let mut cal_path = DEFAULT_CAL
+    let mut mode = "blend"
+    let mut out_path = ""
+    let mut k: i64 = 1
+    while k < a.len() {
+        let arg = _str(a[k])
+        if arg.starts_with("--cal=") { cal_path = arg.substring(6, arg.len()) }
+        else if arg.starts_with("--mode=") { mode = arg.substring(7, arg.len()) }
+        else if arg.starts_with("--out=") { out_path = arg.substring(6, arg.len()) }
+        else if arg.starts_with("--") {
+            eprintln("WARN: unknown flag: " + arg)
+        }
+        else {
+            if rm_path == "" { rm_path = arg }
+        }
+        k = k + 1
+    }
+
+    if mode != "blend" && mode != "ewma" && mode != "mean" {
+        eprintln("REJECT: unknown mode: " + mode + " (use blend|ewma|mean)")
+        exit(2)
+    }
+
+    if cmd == "apply" {
+        if rm_path == "" {
+            eprintln("REJECT: apply requires <rm-path>")
+            exit(2)
+        }
+        exit(cmd_apply(rm_path, cal_path, mode, out_path))
+    }
+    if cmd == "diff" {
+        if rm_path == "" {
+            eprintln("REJECT: diff requires <rm-path>")
+            exit(2)
+        }
+        exit(cmd_diff(rm_path, cal_path, mode))
+    }
+    if cmd == "pipeline" {
+        if rm_path == "" {
+            eprintln("REJECT: pipeline requires <rm-path>")
+            exit(2)
+        }
+        exit(cmd_pipeline(rm_path))
+    }
+
+    eprintln("REJECT: unknown subcommand: " + cmd)
+    exit(2)
+}
+
+main()

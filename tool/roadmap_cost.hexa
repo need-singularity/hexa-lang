@@ -1,0 +1,834 @@
+// roadmap_cost.hexa — c_i estimators for roadmap engine v2
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_observe.hexa 의 JSONL tape + roadmap graph 를 읽어 c_i 값을 추정.
+//   pure functional — 모든 estimate_* 가 graph/signals 만 받아 단일 f64 반환.
+//
+//   교체 전략 (plugin 금지): estimate_c_<kind> 함수를 이 파일에서 직접 수정.
+//
+// 이론 mapping (user-agreed):
+//   c_build  ← roadmap_sync completion span (분)
+//             signals.sync.p_success 가 낮을수록 cost 증가
+//             span = (1 + (1 - p_success)) * base_span
+//   c_exp    ← growth_tick success/fail rate
+//             c_exp = T_trial / p_success
+//             기본 T_trial = 5 min, p_success <= 0 → cap 10x
+//   c_learn  ← atlas node growth rate
+//             η = (Δnodes / nodes_prev)  between prev/curr observation
+//             c_learn = T0 * (1 - η)^k   (여기 k=1; 엔진이 k 제공하면 override)
+//             η 계산 불가 시 → 1.0 (no learning discount)
+//   c_boot   ← roadmap_gaps line count (gap closing 속도)
+//             gap ↓ → boot cost ↓ (amortize)
+//             c_boot = T_gap / max(1, N_uses), N_uses = 1 / (1 + gap_count/100)
+//   c_verify ← bt_audit coverage gap = (1 - accuracy/100)
+//             c_verify = K(G|S) / C_channel
+//             K(G|S) ≈ coverage_gap * verify_weight (def 10)
+//             C_channel ≈ sync.p_success (0..1) + epsilon
+//
+// η_k:       η = 1 - b_{k+1} / b_k   (prev/curr bottleneck)
+//            b_k < 0 이거나 b_prev == 0 → 반환 0 (divergence)
+//
+// CLI
+//   hexa roadmap_cost.hexa estimate <kind> [--obs=PATH]
+//      kind ∈ {build, exp, learn, boot, verify}
+//   hexa roadmap_cost.hexa all [--obs=PATH]        print all 5 costs
+//   hexa roadmap_cost.hexa eta --prev=N --curr=N
+//   hexa roadmap_cost.hexa --selftest
+//
+// exit: 0 success / 1 fail / 2 usage
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+
+let DEFAULT_OBS = HARNESS + "/roadmap_signals.jsonl"
+
+// Defaults — tunable constants (replace inline, no config file)
+let T_TRIAL_MIN: f64 = 5.0     // c_exp base trial minutes
+let T_LEARN_MIN: f64 = 10.0    // c_learn T0
+let T_GAP_MIN: f64 = 15.0      // c_boot T_gap
+let VERIFY_WEIGHT: f64 = 10.0  // c_verify K scaling
+let BASE_BUILD_MIN: f64 = 20.0 // c_build base span
+let CHANNEL_EPS: f64 = 0.05    // c_verify C_channel floor
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _to_f64(s: string) -> f64 {
+    if s.len() == 0 { return 0.0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if is_num_char(c) { clean = clean + c }
+        else { break }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" || clean == "." { return 0.0 }
+    return to_float(clean)
+}
+
+// f64 → i64 via 1e5 chunks (stage0 to_string(float) uses scientific ~7e5+,
+// losing precision at 6+ sig figs). Chunk below threshold.
+fn f_to_i(x: f64) -> i64 {
+    if x >= 0.0 {
+        let mut r: f64 = x
+        let mut out: i64 = 0
+        let chunk_f: f64 = 100000.0
+        let chunk_i: i64 = 100000
+        while r >= chunk_f {
+            r = r - chunk_f
+            out = out + chunk_i
+        }
+        let s = to_string(r)
+        let dot = s.index_of(".")
+        let body = if dot >= 0 { s.substring(0, dot) } else { s }
+        let ei = body.index_of("e")
+        let body_clean = if ei >= 0 { body.substring(0, ei) } else { body }
+        if body_clean == "" || body_clean == "-" { return out }
+        return out + to_int(body_clean)
+    }
+    let neg_r = 0.0 - x
+    return 0 - f_to_i(neg_r)
+}
+
+// whole-part string, large-safe
+fn _whole_str(v: f64) -> string {
+    if v < 100000.0 {
+        let s = to_string(v)
+        let dot = s.index_of(".")
+        if dot >= 0 { return s.substring(0, dot) }
+        let ei = s.index_of("e")
+        if ei >= 0 { return s.substring(0, ei) }
+        return s
+    }
+    let i_whole = f_to_i(v)
+    return to_string(i_whole)
+}
+
+// f64 → up to 4 decimal places; large values handled via whole-int + frac
+fn fmt_f4(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let sign = if neg { "-" } else { "" }
+    // extract whole (safe for any size)
+    let whole_s = _whole_str(v)
+    // fractional: multiply frac-only by 10000 (stays small)
+    let whole_f = to_float(whole_s)
+    let frac_f = v - whole_f
+    let frac_scaled = (frac_f * 10000.0) + 0.5
+    // frac_scaled now in [0, 10000]
+    let mut frac_i: i64 = 0
+    if frac_scaled >= 0.0 && frac_scaled < 20000.0 {
+        // small — to_string safe
+        let fs_str = to_string(frac_scaled)
+        let fs_dot = fs_str.index_of(".")
+        let fs_body = if fs_dot >= 0 { fs_str.substring(0, fs_dot) } else { fs_str }
+        if fs_body != "" && fs_body != "-" {
+            frac_i = to_int(fs_body)
+        }
+    }
+    // carry: frac_i could be 10000 (e.g., from 0.99999 rounding)
+    if frac_i >= 10000 {
+        // bump whole by 1
+        let w_i = to_int(whole_s) + 1
+        frac_i = frac_i - 10000
+        let mut fs2 = to_string(frac_i)
+        while fs2.len() < 4 { fs2 = "0" + fs2 }
+        let mut e2 = fs2.len()
+        while e2 > 1 && fs2.substring(e2 - 1, e2) == "0" { e2 = e2 - 1 }
+        let body2 = fs2.substring(0, e2)
+        return sign + to_string(w_i) + "." + body2
+    }
+    let mut fs = to_string(frac_i)
+    while fs.len() < 4 { fs = "0" + fs }
+    let mut end = fs.len()
+    while end > 1 && fs.substring(end - 1, end) == "0" { end = end - 1 }
+    let body = if end == 0 { "0" } else { fs.substring(0, end) }
+    return sign + whole_s + "." + body
+}
+
+fn abs_f(x: f64) -> f64 {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+fn max_f(a: f64, b: f64) -> f64 {
+    if a >= b { return a }
+    return b
+}
+
+fn min_f(a: f64, b: f64) -> f64 {
+    if a <= b { return a }
+    return b
+}
+
+// integer power via repeated mul (k>=0 small); non-integer k → 1.0 fallback
+fn pow_int(base: f64, k: i64) -> f64 {
+    if k <= 0 { return 1.0 }
+    let mut r: f64 = 1.0
+    let mut i: i64 = 0
+    while i < k {
+        r = r * base
+        i = i + 1
+    }
+    return r
+}
+
+// ── JSON extraction (text-scan) ──────────────────────────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return 0.0 }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return 0.0 }
+    return _to_f64(body.substring(start, i))
+}
+
+fn json_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return "" }
+    if body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+// json boolean parse — returns "true"|"false"|"" for missing/non-bool
+fn json_bool(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i + 4 <= body.len() && body.substring(i, i + 4) == "true" { return "true" }
+    if i + 5 <= body.len() && body.substring(i, i + 5) == "false" { return "false" }
+    return ""
+}
+
+// extract nested block after "key" until balanced { }; returns sub-body or "".
+fn json_sub(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() && body.substring(i, i + 1) != "{" { i = i + 1 }
+    if i >= body.len() { return "" }
+    let start = i
+    let mut depth: i64 = 0
+    let mut end = i
+    while end < body.len() {
+        let c = body.substring(end, end + 1)
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+        end = end + 1
+    }
+    return body.substring(start, end)
+}
+
+fn tail_lines(path: string, window: i64) -> [string] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let all = body.split("\n")
+    let mut clean: [string] = []
+    let mut i: i64 = 0
+    while i < all.len() {
+        let s = _str(all[i])
+        if s.len() > 0 { clean = clean.push(s) }
+        i = i + 1
+    }
+    if window <= 0 || clean.len() <= window { return clean }
+    let start = clean.len() - window
+    let mut out: [string] = []
+    let mut j = start
+    while j < clean.len() {
+        out = out.push(_str(clean[j]))
+        j = j + 1
+    }
+    return out
+}
+
+// ── signals container (lightweight; subset of observe schema) ─────────────
+struct Signals {
+    has_prev: bool,
+    has_curr: bool,
+
+    atlas_nodes_prev: f64,
+    atlas_nodes_curr: f64,
+    atlas_edges_curr: f64,
+
+    sync_p_success: f64,
+    sync_total: f64,
+
+    growth_p_success: f64,
+    growth_total: f64,
+
+    bt_accuracy_pct: f64,
+    bt_has_source: bool,
+
+    gap_count: f64,
+    drift_pct: f64,
+    si_closed: f64
+}
+
+// Read last 2 observations from tape. Missing/empty → sensible defaults.
+// @allow-atlas-direct
+fn load_signals(path: string) -> Signals {
+    let empty = Signals {
+        has_prev: false, has_curr: false,
+        atlas_nodes_prev: 0.0, atlas_nodes_curr: 0.0, atlas_edges_curr: 0.0,
+        sync_p_success: 0.0, sync_total: 0.0,
+        growth_p_success: 0.0, growth_total: 0.0,
+        bt_accuracy_pct: 0.0, bt_has_source: false,
+        gap_count: 0.0, drift_pct: 0.0, si_closed: 0.0
+    }
+    if file_exists(path) == false { return empty }
+    let lines = tail_lines(path, 2)
+    if lines.len() == 0 { return empty }
+
+    // parse latest (curr)
+    let curr = _str(lines[lines.len() - 1])
+    let atlas_blk = json_sub(curr, "atlas")
+    let sync_blk = json_sub(curr, "sync")
+    let growth_blk = json_sub(curr, "growth")
+    let bt_blk = json_sub(curr, "bt")
+    let gap_blk = json_sub(curr, "gap")
+    let drift_blk = json_sub(curr, "drift")
+    let si_blk = json_sub(curr, "self_improve")
+
+    let atlas_nodes_c = json_num(atlas_blk, "nodes")
+    let atlas_edges_c = json_num(atlas_blk, "edges")
+    let sync_p = json_num(sync_blk, "p_success")
+    let sync_t = json_num(sync_blk, "total")
+    let growth_p = json_num(growth_blk, "p_success")
+    let growth_t = json_num(growth_blk, "total")
+    let bt_acc = json_num(bt_blk, "accuracy_pct")
+    let bt_hs = json_bool(bt_blk, "has_source") == "true"
+    let gap_n = json_num(gap_blk, "count")
+    let drift_p = json_num(drift_blk, "last_drift_pct")
+    let si_c = json_num(si_blk, "last_closed")
+
+    // parse prev (if exists)
+    let mut has_prev = false
+    let mut atlas_nodes_p: f64 = 0.0
+    if lines.len() >= 2 {
+        let prev = _str(lines[lines.len() - 2])
+        let atlas_blk_p = json_sub(prev, "atlas")
+        atlas_nodes_p = json_num(atlas_blk_p, "nodes")
+        has_prev = atlas_nodes_p > 0.0
+    }
+
+    return Signals {
+        has_prev: has_prev,
+        has_curr: true,
+        atlas_nodes_prev: atlas_nodes_p,
+        atlas_nodes_curr: atlas_nodes_c,
+        atlas_edges_curr: atlas_edges_c,
+        sync_p_success: sync_p,
+        sync_total: sync_t,
+        growth_p_success: growth_p,
+        growth_total: growth_t,
+        bt_accuracy_pct: bt_acc,
+        bt_has_source: bt_hs,
+        gap_count: gap_n,
+        drift_pct: drift_p,
+        si_closed: si_c
+    }
+}
+
+// ── c_i estimators ───────────────────────────────────────────────────────
+// 모두 "pure" — Signals 입력, f64 출력. graph 노드 cost override 는
+// 엔진이 이 값을 기본 상수로 잡고 노드별 cost 가 있으면 곱하는 식 (후속).
+
+// c_build = BASE * (1 + (1 - sync.p_success))
+//   p_success=1 → BASE*1 (no penalty)
+//   p_success=0 → BASE*2 (double cost)
+//   no data → BASE (neutral)
+fn estimate_c_build(sig: Signals) -> f64 {
+    if sig.has_curr == false { return BASE_BUILD_MIN }
+    if sig.sync_total <= 0.0 { return BASE_BUILD_MIN }
+    let p = if sig.sync_p_success > 1.0 { 1.0 } else { sig.sync_p_success }
+    let penalty = 1.0 + (1.0 - p)
+    return BASE_BUILD_MIN * penalty
+}
+
+// c_exp = T_TRIAL / max(0.01, growth.p_success)
+//   p=1 → 5
+//   p=0.5 → 10
+//   p→0 → capped at 10x (T_TRIAL * 100)
+//   no data → T_TRIAL
+fn estimate_c_exp(sig: Signals) -> f64 {
+    if sig.has_curr == false || sig.growth_total <= 0.0 { return T_TRIAL_MIN }
+    let p = max_f(0.01, sig.growth_p_success)
+    let raw = T_TRIAL_MIN / p
+    return min_f(raw, T_TRIAL_MIN * 100.0)
+}
+
+// c_learn = T_LEARN * (1 - η)
+//   η = (curr - prev) / prev  (nodes growth ratio)
+//   η high → learning fast → low cost
+//   η low/0 → learning slow → T_LEARN (no discount)
+//   no prev → T_LEARN (neutral)
+fn estimate_c_learn(sig: Signals) -> f64 {
+    if sig.has_prev == false || sig.atlas_nodes_prev <= 0.0 {
+        return T_LEARN_MIN
+    }
+    let delta = sig.atlas_nodes_curr - sig.atlas_nodes_prev
+    let eta_raw = delta / sig.atlas_nodes_prev
+    // clamp η to [0, 1)
+    let eta = if eta_raw < 0.0 { 0.0 } else if eta_raw >= 1.0 { 0.99 } else { eta_raw }
+    let factor = 1.0 - eta
+    return T_LEARN_MIN * factor
+}
+
+// c_boot = T_GAP / max(1, N_uses)
+//   N_uses = 1 + gap_count / 100    (more gaps closed → more reuse)
+//   gap_count=0 → N_uses=1 → T_GAP
+//   gap_count=100 → N_uses=2 → T_GAP/2
+//   no data → T_GAP
+fn estimate_c_boot(sig: Signals) -> f64 {
+    if sig.has_curr == false { return T_GAP_MIN }
+    let n_uses = 1.0 + (sig.gap_count / 100.0)
+    return T_GAP_MIN / max_f(1.0, n_uses)
+}
+
+// c_verify = K(G|S) / C_channel
+//   K(G|S) = (1 - accuracy_pct/100) * VERIFY_WEIGHT
+//   C_channel = max(CHANNEL_EPS, sync.p_success)
+//   accuracy=100 → K=0 → c_verify=0   (perfect)
+//   accuracy=0 or no bt source → fallback K = VERIFY_WEIGHT (max)
+fn estimate_c_verify(sig: Signals) -> f64 {
+    let acc = if sig.bt_has_source {
+        let a = sig.bt_accuracy_pct
+        if a < 0.0 { 0.0 } else if a > 100.0 { 100.0 } else { a }
+    } else { 0.0 }
+    let kgs = if sig.bt_has_source {
+        (1.0 - acc / 100.0) * VERIFY_WEIGHT
+    } else {
+        VERIFY_WEIGHT  // no data → assume worst
+    }
+    let c_ch = max_f(CHANNEL_EPS, sig.sync_p_success)
+    return kgs / c_ch
+}
+
+// η_k = 1 - b_{k+1} / b_k
+//   prev_b <= 0 → return 0 (undefined)
+//   curr_b > prev_b → negative η (divergence)
+fn estimate_eta(prev_b: f64, curr_b: f64) -> f64 {
+    if prev_b <= 0.0 { return 0.0 }
+    return 1.0 - (curr_b / prev_b)
+}
+
+// ── CLI commands ─────────────────────────────────────────────────────────
+fn dispatch_estimate(kind: string, sig: Signals) -> f64 {
+    if kind == "build" { return estimate_c_build(sig) }
+    if kind == "exp" { return estimate_c_exp(sig) }
+    if kind == "learn" { return estimate_c_learn(sig) }
+    if kind == "boot" { return estimate_c_boot(sig) }
+    if kind == "verify" { return estimate_c_verify(sig) }
+    return -1.0
+}
+
+fn cmd_estimate(kind: string, obs_path: string) -> i64 {
+    let sig = load_signals(obs_path)
+    let v = dispatch_estimate(kind, sig)
+    if v < 0.0 {
+        eprintln("REJECT: unknown kind: " + kind + " (expected build|exp|learn|boot|verify)")
+        return 2
+    }
+    println(fmt_f4(v))
+    return 0
+}
+
+fn cmd_all(obs_path: string) -> i64 {
+    let sig = load_signals(obs_path)
+    let body = "{"
+        + "\"c_build\":" + fmt_f4(estimate_c_build(sig))
+        + ",\"c_exp\":" + fmt_f4(estimate_c_exp(sig))
+        + ",\"c_learn\":" + fmt_f4(estimate_c_learn(sig))
+        + ",\"c_boot\":" + fmt_f4(estimate_c_boot(sig))
+        + ",\"c_verify\":" + fmt_f4(estimate_c_verify(sig))
+        + ",\"has_prev\":" + to_string(sig.has_prev)
+        + ",\"has_curr\":" + to_string(sig.has_curr)
+        + ",\"source\":\"" + obs_path + "\""
+        + "}"
+    println(body)
+    return 0
+}
+
+fn cmd_eta(prev_b: f64, curr_b: f64) -> i64 {
+    let e = estimate_eta(prev_b, curr_b)
+    println(fmt_f4(e))
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    let d = abs_f(a - b)
+    return d <= tol
+}
+
+fn make_empty_signals() -> Signals {
+    return Signals {
+        has_prev: false, has_curr: false,
+        atlas_nodes_prev: 0.0, atlas_nodes_curr: 0.0, atlas_edges_curr: 0.0,
+        sync_p_success: 0.0, sync_total: 0.0,
+        growth_p_success: 0.0, growth_total: 0.0,
+        bt_accuracy_pct: 0.0, bt_has_source: false,
+        gap_count: 0.0, drift_pct: 0.0, si_closed: 0.0
+    }
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_cost.hexa")
+
+    // 1) empty signals → defaults
+    let e = make_empty_signals()
+    let cb = estimate_c_build(e)
+    if approx_eq(cb, BASE_BUILD_MIN, 0.001) == false {
+        eprintln("[selftest] FAIL: empty c_build expected " + fmt_f4(BASE_BUILD_MIN) + " got " + fmt_f4(cb))
+        return 1
+    }
+    let ce = estimate_c_exp(e)
+    if approx_eq(ce, T_TRIAL_MIN, 0.001) == false {
+        eprintln("[selftest] FAIL: empty c_exp expected " + fmt_f4(T_TRIAL_MIN) + " got " + fmt_f4(ce))
+        return 1
+    }
+    let cl = estimate_c_learn(e)
+    if approx_eq(cl, T_LEARN_MIN, 0.001) == false {
+        eprintln("[selftest] FAIL: empty c_learn expected " + fmt_f4(T_LEARN_MIN) + " got " + fmt_f4(cl))
+        return 1
+    }
+    let cbo = estimate_c_boot(e)
+    if approx_eq(cbo, T_GAP_MIN, 0.001) == false {
+        eprintln("[selftest] FAIL: empty c_boot expected " + fmt_f4(T_GAP_MIN) + " got " + fmt_f4(cbo))
+        return 1
+    }
+    // verify with no bt source and zero sync → K=VERIFY_WEIGHT, C=CHANNEL_EPS
+    let cv = estimate_c_verify(e)
+    let expected_cv = VERIFY_WEIGHT / CHANNEL_EPS
+    if approx_eq(cv, expected_cv, 0.01) == false {
+        eprintln("[selftest] FAIL: empty c_verify expected " + fmt_f4(expected_cv) + " got " + fmt_f4(cv))
+        return 1
+    }
+    println("[selftest]   defaults: build=" + fmt_f4(cb) + " exp=" + fmt_f4(ce)
+        + " learn=" + fmt_f4(cl) + " boot=" + fmt_f4(cbo) + " verify=" + fmt_f4(cv) + " OK")
+
+    // 2) known signals → specific values
+    let good = Signals {
+        has_prev: true, has_curr: true,
+        atlas_nodes_prev: 20000.0, atlas_nodes_curr: 20200.0, atlas_edges_curr: 54000.0,
+        sync_p_success: 0.8, sync_total: 100.0,
+        growth_p_success: 0.5, growth_total: 40.0,
+        bt_accuracy_pct: 100.0, bt_has_source: true,
+        gap_count: 100.0, drift_pct: 0.5, si_closed: 35976.0
+    }
+    // c_build = 20 * (1 + 0.2) = 24
+    let b2 = estimate_c_build(good)
+    if approx_eq(b2, 24.0, 0.01) == false {
+        eprintln("[selftest] FAIL: good c_build expected 24.0 got " + fmt_f4(b2))
+        return 1
+    }
+    // c_exp = 5 / 0.5 = 10
+    let e2 = estimate_c_exp(good)
+    if approx_eq(e2, 10.0, 0.01) == false {
+        eprintln("[selftest] FAIL: good c_exp expected 10.0 got " + fmt_f4(e2))
+        return 1
+    }
+    // c_learn: η = 200/20000 = 0.01 → T_LEARN * 0.99 = 9.9
+    let l2 = estimate_c_learn(good)
+    if approx_eq(l2, 9.9, 0.01) == false {
+        eprintln("[selftest] FAIL: good c_learn expected 9.9 got " + fmt_f4(l2))
+        return 1
+    }
+    // c_boot: N_uses = 1 + 100/100 = 2 → T_GAP / 2 = 7.5
+    let bo2 = estimate_c_boot(good)
+    if approx_eq(bo2, 7.5, 0.01) == false {
+        eprintln("[selftest] FAIL: good c_boot expected 7.5 got " + fmt_f4(bo2))
+        return 1
+    }
+    // c_verify: acc=100 → K=0 → c_verify=0
+    let v2 = estimate_c_verify(good)
+    if approx_eq(v2, 0.0, 0.01) == false {
+        eprintln("[selftest] FAIL: good c_verify expected 0.0 got " + fmt_f4(v2))
+        return 1
+    }
+    println("[selftest]   known: build=24 exp=10 learn=9.9 boot=7.5 verify=0 — OK")
+
+    // 3) edge: exp cap — p_success very small
+    let tiny_p = Signals {
+        has_prev: false, has_curr: true,
+        atlas_nodes_prev: 0.0, atlas_nodes_curr: 1.0, atlas_edges_curr: 1.0,
+        sync_p_success: 0.0, sync_total: 1.0,
+        growth_p_success: 0.00001, growth_total: 10.0,
+        bt_accuracy_pct: 0.0, bt_has_source: false,
+        gap_count: 0.0, drift_pct: 0.0, si_closed: 0.0
+    }
+    let et = estimate_c_exp(tiny_p)
+    // should cap at T_TRIAL_MIN * 100 = 500
+    if approx_eq(et, 500.0, 0.01) == false {
+        eprintln("[selftest] FAIL: tiny_p c_exp cap expected 500.0 got " + fmt_f4(et))
+        return 1
+    }
+    println("[selftest]   exp cap at " + fmt_f4(et) + " — OK")
+
+    // 4) estimate_eta
+    // prev=10, curr=8 → η=1-8/10=0.2
+    if approx_eq(estimate_eta(10.0, 8.0), 0.2, 0.001) == false {
+        eprintln("[selftest] FAIL: eta(10,8) expected 0.2")
+        return 1
+    }
+    // prev=10, curr=12 → η=-0.2 (divergence)
+    if approx_eq(estimate_eta(10.0, 12.0), -0.2, 0.001) == false {
+        eprintln("[selftest] FAIL: eta(10,12) expected -0.2")
+        return 1
+    }
+    // prev=0 → 0
+    if approx_eq(estimate_eta(0.0, 5.0), 0.0, 0.001) == false {
+        eprintln("[selftest] FAIL: eta(0,5) expected 0.0")
+        return 1
+    }
+    println("[selftest]   estimate_eta: 0.2 / -0.2 / 0.0 — OK")
+
+    // 5) dispatch: all 5 kinds addressable
+    let kinds: [string] = ["build", "exp", "learn", "boot", "verify"]
+    let mut i: i64 = 0
+    while i < kinds.len() {
+        let v = dispatch_estimate(_str(kinds[i]), good)
+        if v < 0.0 {
+            eprintln("[selftest] FAIL: dispatch " + _str(kinds[i]) + " returned " + fmt_f4(v))
+            return 1
+        }
+        i = i + 1
+    }
+    if dispatch_estimate("unknown", good) >= 0.0 {
+        eprintln("[selftest] FAIL: dispatch unknown did not return -1")
+        return 1
+    }
+    println("[selftest]   dispatch all 5 kinds — OK")
+
+    // 6) load_signals from synthetic tape
+    let tmp = "/tmp/roadmap_cost_selftest.jsonl"
+    let _ = exec("rm -f " + tmp)  // @allow-bare-exec
+    // write 2 observation lines
+    let l1 = "{\"ts\":\"2026-04-16T00:00:00Z\",\"kind\":\"observation\""
+        + ",\"atlas\":{\"nodes\":20000,\"edges\":50000}"
+        + ",\"sync\":{\"total\":10,\"ok\":8,\"p_success\":0.8}"
+        + ",\"growth\":{\"total\":10,\"ok\":5,\"p_success\":0.5}"
+        + ",\"bt\":{\"accuracy_pct\":100,\"has_source\":true}"
+        + ",\"gap\":{\"count\":50}"
+        + ",\"drift\":{\"last_drift_pct\":0.5}"
+        + ",\"self_improve\":{\"last_closed\":35000}"
+        + "}\n"
+    let l2txt = "{\"ts\":\"2026-04-16T01:00:00Z\",\"kind\":\"observation\""
+        + ",\"atlas\":{\"nodes\":20100,\"edges\":50100}"
+        + ",\"sync\":{\"total\":12,\"ok\":10,\"p_success\":0.8333}"
+        + ",\"growth\":{\"total\":12,\"ok\":6,\"p_success\":0.5}"
+        + ",\"bt\":{\"accuracy_pct\":100,\"has_source\":true}"
+        + ",\"gap\":{\"count\":45}"
+        + ",\"drift\":{\"last_drift_pct\":0.48}"
+        + ",\"self_improve\":{\"last_closed\":35100}"
+        + "}\n"
+    try { write_file(tmp, l1 + l2txt) } catch err {
+        eprintln("[selftest] FAIL: cannot write tmp tape")
+        return 1
+    }
+    let loaded = load_signals(tmp)
+    if loaded.has_prev == false || loaded.has_curr == false {
+        eprintln("[selftest] FAIL: load_signals missing prev/curr")
+        return 1
+    }
+    if approx_eq(loaded.atlas_nodes_curr, 20100.0, 1.0) == false {
+        eprintln("[selftest] FAIL: loaded atlas_nodes_curr expected 20100 got " + fmt_f4(loaded.atlas_nodes_curr))
+        return 1
+    }
+    if approx_eq(loaded.atlas_nodes_prev, 20000.0, 1.0) == false {
+        eprintln("[selftest] FAIL: loaded atlas_nodes_prev expected 20000 got " + fmt_f4(loaded.atlas_nodes_prev))
+        return 1
+    }
+    // η from this: (20100-20000)/20000 = 0.005 → c_learn = 10 * 0.995 = 9.95
+    let cl_from_tape = estimate_c_learn(loaded)
+    if approx_eq(cl_from_tape, 9.95, 0.02) == false {
+        eprintln("[selftest] FAIL: c_learn from tape expected 9.95 got " + fmt_f4(cl_from_tape))
+        return 1
+    }
+    println("[selftest]   load_signals tape → c_learn=" + fmt_f4(cl_from_tape) + " — OK")
+
+    // 7) pure: same input → same output (determinism)
+    let v_a = estimate_c_build(good)
+    let v_b = estimate_c_build(good)
+    if approx_eq(v_a, v_b, 0.0001) == false {
+        eprintln("[selftest] FAIL: estimate_c_build not deterministic")
+        return 1
+    }
+    println("[selftest]   purity/determinism — OK")
+
+    println("[selftest] OK — all 7 checks passed")
+    return 0
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        eprintln("usage: roadmap_cost.hexa <estimate|all|eta|--selftest> [args]")
+        eprintln("  estimate <kind> [--obs=PATH]       kind in {build,exp,learn,boot,verify}")
+        eprintln("  all [--obs=PATH]                   JSON: all 5 c_i values")
+        eprintln("  eta --prev=N --curr=N              print η = 1 - curr/prev")
+        eprintln("  --selftest                         internal sanity")
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let r = selftest()
+        exit(r)
+    }
+
+    // flags
+    let mut obs_path = DEFAULT_OBS
+    let mut prev_b: f64 = 0.0
+    let mut curr_b: f64 = 0.0
+    let mut k: i64 = 1
+    while k < a.len() {
+        let arg = _str(a[k])
+        if arg.starts_with("--obs=") {
+            obs_path = arg.substring(6, arg.len())
+        } else if arg.starts_with("--prev=") {
+            prev_b = _to_f64(arg.substring(7, arg.len()))
+        } else if arg.starts_with("--curr=") {
+            curr_b = _to_f64(arg.substring(7, arg.len()))
+        }
+        k = k + 1
+    }
+
+    if cmd == "estimate" {
+        if a.len() < 2 {
+            eprintln("usage: roadmap_cost.hexa estimate <kind> [--obs=PATH]")
+            exit(2)
+        }
+        let kind = _str(a[1])
+        let r = cmd_estimate(kind, obs_path)
+        exit(r)
+    }
+
+    if cmd == "all" {
+        let r = cmd_all(obs_path)
+        exit(r)
+    }
+
+    if cmd == "eta" {
+        let r = cmd_eta(prev_b, curr_b)
+        exit(r)
+    }
+
+    eprintln("REJECT: unknown command: " + cmd)
+    exit(2)
+}
+
+main()

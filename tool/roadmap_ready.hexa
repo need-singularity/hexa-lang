@@ -1,0 +1,592 @@
+// roadmap_ready.hexa — Blocking Minimization #12 (ready-set invariant library)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   T_wall* = Σ b(S_k) + Σ max(0, τ_wait_k − r_k)
+//     waiting 중 ready_set (r_k) 를 drain 하면 τ_wait 가 wall-clock 에서 상쇄.
+//   Invariant: ∀t  |R(t)| ≥ 1   (ready 가 비면 τ_wait 그대로 wall 진행)
+//
+// EXPORTS (library-style — hexa CLI 로도 호출 가능):
+//   compute_ready_set(graph, done_set, excluded=[])   → [node]
+//     hard_deps 전원 done && status=todo && not excluded
+//     soft_deps 는 status hint 로만 (ready 판정 영향 없음)
+//   can_drain_during_wait(ready_set, waiting_node)    → [node]
+//     ready ∩ independent(waiting) — deps 겹침 없음
+//   optimistic_merge_plan(graph, concurrent_writes)   → plan string (line-per-write)
+//     파일 단위 write 충돌 검사 — 다른 파일이면 parallel, 같으면 sequential
+//
+// backward compat: hard_deps[] 우선, 없으면 deps[] 로 폴백.
+// soft_deps 는 status hint 전용 (예: "lint_pass" — 통과 권장이나 drop 가능).
+//
+// CLI
+//   hexa run roadmap_ready.hexa ready  <roadmap.json>
+//   hexa run roadmap_ready.hexa drain  <roadmap.json> <waiting_id>
+//   hexa run roadmap_ready.hexa merge  <file1> <file2> ...
+//   hexa run roadmap_ready.hexa --selftest
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV.len() > 0 { NEXUS_ENV } else { HOME + "/Dev/nexus" } // @allow-devpath
+let ROADMAPS = NEXUS + "/roadmaps"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+// ── minimal JSON reader (schema-specific, mirrors roadmap_engine conventions) ─
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    return [body.substring(start, j), to_string(j + 1)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    // hexa stage0 nested-continue fall-through guard (see engine split_nodes)
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        let mut handled: bool = false
+        if in_str {
+            if c == "\\" { i = i + 2; handled = true }
+            else if c == "\"" { in_str = false; i = i + 1; handled = true }
+            else { i = i + 1; handled = true }
+        }
+        if handled == false {
+            if c == "\"" { in_str = true; i = i + 1 }
+            else if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+                i = i + 1
+            }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 && start >= 0 {
+                    out = out.push(body.substring(start, i + 1))
+                    start = -1
+                }
+                i = i + 1
+            }
+            else if c == "]" && depth == 0 { break }
+            else { i = i + 1 }
+        }
+    }
+    return out
+}
+
+// ── Node-lite (engine compat, 필요 필드만) ──────────────────────────────
+struct RNode {
+    id: string,
+    status: string,          // todo|in_progress|done|blocked|failed
+    hard_deps: [string],     // primary — backward: empty면 deps[] 로 채움
+    soft_deps: [string],     // drop-able hints only
+    write_target: string     // optional — optimistic_merge 판정용
+}
+
+fn parse_rnode(raw: string) -> RNode {
+    let id = json_str(raw, "id")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    // hard_deps[] 우선, 없으면 deps[] (backward compat)
+    let hard = json_str_array(raw, "hard_deps")
+    let deps = json_str_array(raw, "deps")
+    let h = if hard.len() > 0 { hard } else { deps }
+    let soft = json_str_array(raw, "soft_deps")
+    let wt = json_str(raw, "write_target")  // optional
+    return RNode {
+        id: id, status: st,
+        hard_deps: h, soft_deps: soft,
+        write_target: wt
+    }
+}
+
+fn load_rgraph(path: string) -> [RNode] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let blocks = split_nodes(body)
+    let mut out: [RNode] = []
+    let mut i: i64 = 0
+    while i < blocks.len() {
+        let n = parse_rnode(_str(blocks[i]))
+        if n.id.len() > 0 { out = out.push(n) }
+        i = i + 1
+    }
+    return out
+}
+
+fn idx_of_rnode(graph: [RNode], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < graph.len() {
+        if graph[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn list_contains(xs: [string], v: string) -> bool {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORT 1: compute_ready_set
+//   hard_deps 전원 done + status=todo + not excluded (in_progress/blocked 제외)
+//   soft_deps 는 status hint 로만 (ready 영향 없음)
+// ═══════════════════════════════════════════════════════════════════════════
+fn compute_ready_set(graph: [RNode], done_set: [string], excluded: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < graph.len() {
+        let n = graph[i]
+        // status filter: status==todo 만 ready 후보 (in_progress/done/blocked 제외)
+        if n.status != "todo" && n.status != "planned" { i = i + 1; continue }
+        // excluded?
+        if list_contains(excluded, n.id) { i = i + 1; continue }
+        // hard_deps 전원 done_set 에 포함?
+        let mut all_hard_done: bool = true
+        let mut j: i64 = 0
+        while j < n.hard_deps.len() {
+            let dep = _str(n.hard_deps[j])
+            if list_contains(done_set, dep) == false {
+                all_hard_done = false
+                break
+            }
+            j = j + 1
+        }
+        if all_hard_done { out = out.push(n.id) }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORT 2: can_drain_during_wait
+//   ready_set 중 waiting_node 와 dep-independent 만 반환.
+//   independent: 상호 reachability 없음 + unfinished 공통 ancestor 없음
+//   (done 된 공통 ancestor 는 이미 경로에서 제거되어 영향 없음)
+// ═══════════════════════════════════════════════════════════════════════════
+
+// unfinished transitive deps (done 은 skip, 실제 wait 유발하는 deps 만)
+fn _unfinished_tdeps(graph: [RNode], nid: string) -> [string] {
+    let mut acc: [string] = []
+    let mut stack: [string] = [nid]
+    let mut steps: i64 = 0
+    while stack.len() > 0 && steps < 1000 {
+        steps = steps + 1
+        let cur = _str(stack[stack.len() - 1])
+        // pop
+        let mut ns: [string] = []
+        let mut k: i64 = 0
+        while k < stack.len() - 1 { ns = ns.push(_str(stack[k])); k = k + 1 }
+        stack = ns
+        let ci = idx_of_rnode(graph, cur)
+        if ci < 0 { continue }
+        let n = graph[ci]
+        let mut j: i64 = 0
+        while j < n.hard_deps.len() {
+            let dep = _str(n.hard_deps[j])
+            let di = idx_of_rnode(graph, dep)
+            if di >= 0 {
+                let dn = graph[di]
+                // skip done deps (경로 제거됨)
+                if is_done(dn.status) == false {
+                    if list_contains(acc, dep) == false {
+                        acc = acc.push(dep)
+                        stack = stack.push(dep)
+                    }
+                }
+            }
+            j = j + 1
+        }
+    }
+    return acc
+}
+
+fn _deps_intersect(a: [string], b: [string]) -> bool {
+    let mut i: i64 = 0
+    while i < a.len() {
+        let av = _str(a[i])
+        let mut j: i64 = 0
+        while j < b.len() {
+            if av == _str(b[j]) { return true }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn can_drain_during_wait(graph: [RNode], ready_set: [string], waiting_node: string) -> [string] {
+    let wi = idx_of_rnode(graph, waiting_node)
+    if wi < 0 { return ready_set }  // unknown waiting → 전부 drain 가능 가정
+    // unfinished transitive deps of waiting
+    let w_tdeps = _unfinished_tdeps(graph, waiting_node)
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < ready_set.len() {
+        let rid = _str(ready_set[i])
+        let ri = idx_of_rnode(graph, rid)
+        if ri < 0 { i = i + 1; continue }
+        // 1) bidirectional reachability (unfinished path)
+        //    ready 가 waiting 의 unfinished dep? (waiting 이 ready 를 기다림)
+        if list_contains(w_tdeps, rid) { i = i + 1; continue }
+        //    waiting 이 ready 의 unfinished dep? (ready 가 waiting 을 기다림 — 즉 ready 가 아님)
+        let r_tdeps = _unfinished_tdeps(graph, rid)
+        if list_contains(r_tdeps, waiting_node) { i = i + 1; continue }
+        // 2) unfinished 공통 ancestor — 둘 다 기다림 중인 공통 dep
+        if _deps_intersect(w_tdeps, r_tdeps) { i = i + 1; continue }
+        out = out.push(rid)
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORT 3: optimistic_merge_plan
+//   concurrent_writes: [file paths]
+//   다른 파일 → parallel, 같은 파일 → sequential (temp → merge gate 권장)
+//   반환: 실행 계획 문자열 (lines: "parallel:<file>" / "sequential:<file>:<n>")
+// ═══════════════════════════════════════════════════════════════════════════
+fn optimistic_merge_plan(concurrent_writes: [string]) -> string {
+    // group by file
+    let mut files: [string] = []
+    let mut counts: [i64] = []
+    let mut i: i64 = 0
+    while i < concurrent_writes.len() {
+        let w = _str(concurrent_writes[i])
+        // find existing
+        let mut found: i64 = -1
+        let mut k: i64 = 0
+        while k < files.len() {
+            if _str(files[k]) == w { found = k; break }
+            k = k + 1
+        }
+        if found < 0 {
+            files = files.push(w)
+            counts = counts.push(1)
+        } else {
+            let mut nc: [i64] = []
+            let mut kk: i64 = 0
+            while kk < counts.len() {
+                if kk == found { nc = nc.push(counts[kk] + 1) }
+                else { nc = nc.push(counts[kk]) }
+                kk = kk + 1
+            }
+            counts = nc
+        }
+        i = i + 1
+    }
+    // render
+    let mut out = ""
+    let mut j: i64 = 0
+    while j < files.len() {
+        let f = _str(files[j])
+        let c = counts[j]
+        if c == 1 {
+            out = out + "parallel:" + f + "\n"
+        } else {
+            out = out + "sequential:" + f + ":" + to_string(c) + "\n"
+        }
+        j = j + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// EXPORT 4: try_drain_while_wait (convenience — multi-waiting)
+//   engine hook 용 — waiting_set 전체에 대해 drain-safe 노드 반환
+//   공백 충돌 없도록 waiting_set 모든 원소와 independent 만 선택
+// ═══════════════════════════════════════════════════════════════════════════
+fn try_drain_while_wait(graph: [RNode], waiting_set: [string], ready_set: [string]) -> [string] {
+    if waiting_set.len() == 0 { return ready_set }
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < ready_set.len() {
+        let rid = _str(ready_set[i])
+        let mut ok: bool = true
+        let mut j: i64 = 0
+        while j < waiting_set.len() {
+            let w = _str(waiting_set[j])
+            let dr = can_drain_during_wait(graph, [rid], w)
+            if dr.len() == 0 { ok = false; break }
+            j = j + 1
+        }
+        if ok { out = out.push(rid) }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// Helper: compute done_set from graph
+// ═══════════════════════════════════════════════════════════════════════════
+fn done_set_of(graph: [RNode]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < graph.len() {
+        if is_done(graph[i].status) { out = out.push(graph[i].id) }
+        i = i + 1
+    }
+    return out
+}
+
+fn inprogress_set_of(graph: [RNode]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < graph.len() {
+        if graph[i].status == "in_progress" { out = out.push(graph[i].id) }
+        i = i + 1
+    }
+    return out
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// CLI
+// ═══════════════════════════════════════════════════════════════════════════
+fn cmd_ready(path: string) {
+    let g = load_rgraph(path)
+    if g.len() == 0 {
+        eprintln("REJECT: empty graph: " + path)
+        exit(3)
+    }
+    let ds = done_set_of(g)
+    let ips = inprogress_set_of(g)
+    let ready = compute_ready_set(g, ds, ips)
+    println("done: " + to_string(ds.len()) + "  in_progress: " + to_string(ips.len()) + "  ready: " + to_string(ready.len()))
+    println("ready_set: " + ready.join(", "))
+    let invariant_ok = (ready.len() >= 1) || (ips.len() >= 1) || (ds.len() == g.len())
+    if invariant_ok { println("invariant |R(t)| ≥ 1: PASS") }
+    else { println("invariant |R(t)| ≥ 1: FAIL (0 ready, 0 in_progress, todos remain)") }
+    exit(0)
+}
+
+fn cmd_drain(path: string, waiting: string) {
+    let g = load_rgraph(path)
+    if g.len() == 0 {
+        eprintln("REJECT: empty graph: " + path)
+        exit(3)
+    }
+    let ds = done_set_of(g)
+    let ips = inprogress_set_of(g)
+    let ready = compute_ready_set(g, ds, ips)
+    let drain = can_drain_during_wait(g, ready, waiting)
+    println("waiting: " + waiting)
+    println("ready: " + to_string(ready.len()))
+    println("drain_candidates: " + drain.join(", "))
+    println("count: " + to_string(drain.len()))
+    exit(0)
+}
+
+fn cmd_merge(writes: [string]) {
+    let plan = optimistic_merge_plan(writes)
+    print(plan)
+    exit(0)
+}
+
+fn cmd_selftest() {
+    println("[selftest] loading example.json")
+    let path = ROADMAPS + "/example.json"
+    if file_exists(path) == false {
+        eprintln("REJECT: example missing: " + path)
+        exit(3)
+    }
+    let g = load_rgraph(path)
+    println("[selftest] nodes=" + to_string(g.len()))
+    let ds = done_set_of(g)
+    let ips = inprogress_set_of(g)
+    let ready = compute_ready_set(g, ds, ips)
+    println("[selftest] done=" + to_string(ds.len()) + " ip=" + to_string(ips.len()) + " ready=" + to_string(ready.len()))
+    // waiting = first in_progress (if any)
+    if ips.len() > 0 {
+        let w = _str(ips[0])
+        let dr = can_drain_during_wait(g, ready, w)
+        println("[selftest] drain(" + w + "): " + to_string(dr.len()) + " → " + dr.join(", "))
+    }
+    // merge plan demo
+    let demo = ["a.txt", "b.txt", "a.txt", "c.txt"]
+    println("[selftest] merge_plan demo:")
+    print(optimistic_merge_plan(demo))
+    println("[selftest] OK")
+    exit(0)
+}
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() { a = a.push(_str(argv[ai])); ai = ai + 1 }
+
+    if a.len() == 0 {
+        eprintln("usage: roadmap_ready <ready|drain|merge|--selftest> ...")
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+    if cmd == "--selftest" { cmd_selftest() }
+    if cmd == "ready" {
+        if a.len() < 2 { eprintln("usage: roadmap_ready ready <roadmap.json>"); exit(2) }
+        cmd_ready(_str(a[1]))
+    }
+    if cmd == "drain" {
+        if a.len() < 3 { eprintln("usage: roadmap_ready drain <roadmap.json> <waiting_id>"); exit(2) }
+        cmd_drain(_str(a[1]), _str(a[2]))
+    }
+    if cmd == "merge" {
+        if a.len() < 2 { eprintln("usage: roadmap_ready merge <file1> <file2> ..."); exit(2) }
+        let mut writes: [string] = []
+        let mut k: i64 = 1
+        while k < a.len() { writes = writes.push(_str(a[k])); k = k + 1 }
+        cmd_merge(writes)
+    }
+    eprintln("unknown cmd: " + cmd)
+    exit(2)
+}
+
+main()

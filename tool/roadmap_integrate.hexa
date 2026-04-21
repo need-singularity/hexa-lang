@@ -1,0 +1,465 @@
+// roadmap_integrate.hexa — NEXUS-6 roadmap v2 메타 디스패처
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+// @allow-hexa-exit  // child hexa exit code 를 stdout sentinel 로 명시 캡처
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   11개 v2 모듈에 대한 단일 진입점.
+//   사용자 짧은 서브커맨드 → 해당 roadmap_<mod>.hexa 위임 + argv 그대로 전달.
+//
+//   내부적으로 exec("hexa shared/tool/roadmap_<mod>.hexa ...") 로 호출,
+//   stdout/stderr/exit code 모두 투명하게 전파.
+//
+// CLI
+//   hexa roadmap_integrate.hexa help                — 전체 서브커맨드 리스트
+//   hexa roadmap_integrate.hexa <cmd> [args...]    — 매핑된 모듈로 위임
+//   hexa roadmap_integrate.hexa --selftest          — 주요 10 subcommand 검증
+//
+// EXIT CODES
+//   투명 전파 — 위임된 모듈의 exit code 그대로
+//   2 = usage / 모듈 미존재
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let HEXA = NEXUS + "/bin/hexa"
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s.len() == 0 { return 0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    let mut started: bool = false
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "-" {
+            if started == false { clean = clean + c; started = true }
+            else { break }
+        }
+        else if is_digit(c) { clean = clean + c; started = true }
+        else {
+            if started { break }
+        }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" { return 0 }
+    return to_int(clean)
+}
+
+// shell-quote single arg for bash -c
+fn _shq(s: string) -> string {
+    // wrap in single quotes, escape internal '
+    let mut out = "'"
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" }
+        else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ── parallel-list 매핑 (hashmap 회피, f-hexa-pitfalls.md) ─────────────────
+//   cmd_names[i]   : 사용자가 입력하는 서브커맨드
+//   cmd_modules[i] : 위임할 roadmap_<mod>.hexa 의 mod (확장자 제외)
+//   cmd_subs[i]    : 모듈 호출 시 앞에 붙일 서브커맨드 ("" 면 없음)
+//   cmd_takes_rm[i]: <rm> 인자(첫번째) 를 받는지 여부 ("y"/"n")
+//                    "y" 면 첫 positional 을 _resolve_rm() 거쳐서 전달
+//   cmd_help[i]    : 한 줄 요약
+
+fn _names() -> [string] {
+    return [
+        "help", "list", "status", "plan", "watch",
+        "dispatch", "next", "vi", "vi-compare", "explain",
+        "critical", "what-if", "kahn", "suggest", "levels",
+        "edges-audit", "edges-apply", "snap", "snaps", "restore",
+        "calibrate", "query-cal", "apply-cal", "pipeline",
+        "portfolio", "portfolio-summary",
+        "schema", "to-flat", "batch-flat",
+        "abort", "resume", "mark", "replan"
+    ]
+}
+
+fn _modules() -> [string] {
+    return [
+        "_internal", "cli", "cli", "engine", "engine",
+        "dispatch", "dispatch", "vi", "vi", "explain",
+        "explain", "explain", "kahn", "kahn", "kahn",
+        "edges", "edges", "checkpoint", "checkpoint", "checkpoint",
+        "signals", "signals", "calibrate_apply", "calibrate_apply",
+        "portfolio", "portfolio",
+        "schema_adapter", "schema_adapter", "schema_adapter",
+        "cli", "cli", "cli", "cli"
+    ]
+}
+
+fn _subs() -> [string] {
+    return [
+        "", "list", "status", "", "",
+        "plan", "next", "plan", "compare", "why",
+        "critical", "what-if", "verify", "suggest", "levels",
+        "audit", "apply", "snap", "list", "restore",
+        "calibrate", "query", "apply", "pipeline",
+        "rank", "summary",
+        "detect", "to-flat", "batch",
+        "abort", "resume", "mark", "replan"
+    ]
+}
+
+fn _takes_rm() -> [string] {
+    // y = 첫 positional 을 rm 으로 자동 확장. n = 그대로 통과.
+    return [
+        "n", "n", "y", "y", "y",
+        "y", "y", "y", "y", "y",
+        "y", "y", "y", "y", "y",
+        "y", "y", "y", "y", "y",
+        "n", "n", "y", "y",
+        "n", "n",
+        "y", "y", "n",
+        "y", "y", "y", "y"
+    ]
+}
+
+fn _help_lines() -> [string] {
+    return [
+        "help                       — 이 리스트",
+        "list                       → roadmap_cli list",
+        "status <rm>                → roadmap_cli status <rm>",
+        "plan <rm>                  → roadmap_engine <rm>",
+        "watch <rm> [--i=N]         → roadmap_engine <rm> --watch [--interval=N]",
+        "dispatch <rm>              → roadmap_dispatch plan <rm>",
+        "next <rm>                  → roadmap_dispatch next <rm>",
+        "vi <rm>                    → roadmap_vi plan <rm>",
+        "vi-compare <rm>            → roadmap_vi compare <rm>",
+        "explain <rm> <node>        → roadmap_explain why <rm> <node>",
+        "critical <rm>              → roadmap_explain critical <rm>",
+        "what-if <rm> --drop=...    → roadmap_explain what-if <rm> --drop=...",
+        "kahn <rm>                  → roadmap_kahn verify <rm>",
+        "suggest <rm>               → roadmap_kahn suggest <rm>",
+        "levels <rm>                → roadmap_kahn levels <rm>",
+        "edges-audit <rm>           → roadmap_edges audit <rm>",
+        "edges-apply <rm>           → roadmap_edges apply <rm>",
+        "snap <rm>                  → roadmap_checkpoint snap <rm>",
+        "snaps <rm>                 → roadmap_checkpoint list <rm>",
+        "restore <rm> <ts>          → roadmap_checkpoint restore <rm> <ts>",
+        "calibrate                  → roadmap_signals calibrate",
+        "query-cal <ntype>          → roadmap_signals query <ntype>",
+        "apply-cal <rm>             → roadmap_calibrate_apply apply <rm>",
+        "pipeline <rm>              → roadmap_calibrate_apply pipeline <rm>",
+        "portfolio                  → roadmap_portfolio rank",
+        "portfolio-summary          → roadmap_portfolio summary",
+        "schema <rm>                → roadmap_schema_adapter detect <rm>",
+        "to-flat <rm>               → roadmap_schema_adapter to-flat <rm>",
+        "batch-flat                 → roadmap_schema_adapter batch",
+        "abort <rm> <node>          → roadmap_cli abort <rm> <node>",
+        "resume <rm> <node>         → roadmap_cli resume <rm> <node>",
+        "mark <rm> <node> <status>  → roadmap_cli mark <rm> <node> <status>",
+        "replan <rm>                → roadmap_cli replan <rm>"
+    ]
+}
+
+// ── 인덱스 조회 ──────────────────────────────────────────────────────────
+fn _find_cmd(name: string) -> i64 {
+    let names = _names()
+    let mut i: i64 = 0
+    while i < names.len() {
+        if _str(names[i]) == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── <rm> 인자 확장 ──────────────────────────────────────────────────────
+//   "nexus" → /Users/.../config/roadmaps/nexus.json
+//   "/abs/path.json" → 그대로
+//   "./rel/path.json" → 그대로 (cwd 기준은 호출자 책임)
+fn _resolve_rm(rm: string) -> string {
+    if rm.len() == 0 { return rm }
+    if rm.index_of("/") >= 0 { return rm }
+    return ROADMAPS + "/" + rm + ".json"
+}
+
+// ── help 출력 ───────────────────────────────────────────────────────────
+fn print_help() {
+    println("roadmap_integrate.hexa — NEXUS-6 roadmap v2 메타 디스패처")
+    println("")
+    println("usage:")
+    println("  hexa shared/tool/roadmap_integrate.hexa <cmd> [args...]")
+    println("")
+    println("subcommands:")
+    let lines = _help_lines()
+    let mut i: i64 = 0
+    while i < lines.len() {
+        println("  " + _str(lines[i]))
+        i = i + 1
+    }
+    println("")
+    println("notes:")
+    println("  <rm> 단축명 (예: 'nexus') → shared/roadmaps/nexus.json 자동 전개")
+    println("  <rm> 가 '/' 포함 시 경로로 그대로 사용")
+    println("  --selftest 로 모듈 존재 + help 호출 검증")
+}
+
+// ── 위임 빌드: 인자 → 풀 hexa 명령 문자열 ────────────────────────────────
+fn _build_argv(idx: i64, rest: [string]) -> string {
+    // module path
+    let module = _str(_modules()[idx])
+    let module_path = HARNESS + "/roadmap_" + module + ".hexa"
+    let sub = _str(_subs()[idx])
+    let takes_rm = _str(_takes_rm()[idx]) == "y"
+
+    let mut cmd = _shq(HEXA) + " " + _shq(module_path)
+    if sub.len() > 0 {
+        cmd = cmd + " " + _shq(sub)
+    }
+
+    // rest 처리
+    let mut k: i64 = 0
+    let mut rm_consumed: bool = (takes_rm == false)
+    while k < rest.len() {
+        let a = _str(rest[k])
+        if rm_consumed == false {
+            // 첫 positional → rm 확장
+            if a.starts_with("--") {
+                // rm 자리에 flag 가 들어옴 → 그대로 통과 (engine 등은 path 생략 시 ROADMAP env 사용)
+                cmd = cmd + " " + _shq(a)
+            } else {
+                cmd = cmd + " " + _shq(_resolve_rm(a))
+                rm_consumed = true
+            }
+        } else {
+            cmd = cmd + " " + _shq(a)
+        }
+        k = k + 1
+    }
+    return cmd
+}
+
+// 직접 last_index_of 구현 (hexa.real 미지원, f-hexa-real-interpreter-quirks.md)
+fn _rfind(s: string, needle: string) -> i64 {
+    if needle.len() == 0 { return s.len() }
+    if s.len() < needle.len() { return -1 }
+    let mut i: i64 = s.len() - needle.len()
+    while i >= 0 {
+        if s.substring(i, i + needle.len()) == needle { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// hexa.real 의 exec() 는 자동으로 "__HEXA_RC=N" suffix 를 stdout 끝에 append 한다.
+// 우리 자체 sentinel "__RC__:N" 와 함께 두면 그 사이에 RC 가 들어있다.
+// 출력 시 두 marker 모두 제거.
+fn _strip_hexa_rc_suffix(s: string) -> string {
+    let m = "__HEXA_RC="
+    let pos = _rfind(s, m)
+    if pos < 0 { return s }
+    return s.substring(0, pos)
+}
+
+// ── exec passthrough — stdout/stderr 표시 + exit code 반환 ──────────────
+fn _exec_passthrough(cmd: string) -> i64 {
+    // 자식 stdout/stderr 합쳐서 캡처 후 println
+    // exit code 는 마지막 줄 __RC__:N 으로 회수
+    let wrapped = "{ " + cmd + "; } 2>&1; echo; echo \"__RC__:$?\""
+    let out = _str(exec(wrapped))  // @allow-bare-exec
+    // __RC__:N 추출 (last occurrence — 모듈 내부 echo 와 충돌 회피)
+    let marker = "__RC__:"
+    let pos = _rfind(out, marker)
+    if pos < 0 {
+        // sentinel 누락 — 출력만 표시 후 0
+        let cleaned = _strip_hexa_rc_suffix(out)
+        if cleaned.len() > 0 { print(cleaned) }
+        return 0
+    }
+    let body = out.substring(0, pos)
+    let tail = out.substring(pos + marker.len(), out.len())
+    // tail 끝에서 __HEXA_RC=N 도 제거 후 첫 numeric 토큰만 사용
+    let cleaned_tail = _strip_hexa_rc_suffix(tail).trim()
+    let cleaned_body = _strip_hexa_rc_suffix(body)
+    if cleaned_body.len() > 0 { print(cleaned_body) }
+    return _to_int0(cleaned_tail)
+}
+
+// ── 모듈 존재 검증 ──────────────────────────────────────────────────────
+fn _module_exists(idx: i64) -> bool {
+    let module = _str(_modules()[idx])
+    if module == "_internal" { return true }
+    let p = HARNESS + "/roadmap_" + module + ".hexa"
+    return file_exists(p)
+}
+
+// ── 라우팅 ──────────────────────────────────────────────────────────────
+fn route(cmd: string, rest: [string]) -> i64 {
+    if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        print_help()
+        return 0
+    }
+    let idx = _find_cmd(cmd)
+    if idx < 0 {
+        eprintln("REJECT: unknown subcommand: " + cmd)
+        eprintln("hint: hexa shared/tool/roadmap_integrate.hexa help")
+        return 2
+    }
+    if _module_exists(idx) == false {
+        let module = _str(_modules()[idx])
+        let p = HARNESS + "/roadmap_" + module + ".hexa"
+        eprintln("module missing: " + p)
+        return 2
+    }
+    let full = _build_argv(idx, rest)
+    return _exec_passthrough(full)
+}
+
+// ── selftest — 주요 10 서브커맨드 검증 ───────────────────────────────────
+fn selftest() -> i64 {
+    let probes = [
+        "list", "status", "plan", "dispatch", "next",
+        "vi", "explain", "kahn", "calibrate", "portfolio"
+    ]
+    let mut fails: i64 = 0
+    let mut idx: i64 = 0
+    while idx < probes.len() {
+        let p = _str(probes[idx])
+        let ci = _find_cmd(p)
+        if ci < 0 {
+            eprintln("[selftest] FAIL: cmd not registered: " + p)
+            fails = fails + 1
+        } else {
+            if _module_exists(ci) == false {
+                let module = _str(_modules()[ci])
+                eprintln("[selftest] FAIL: module missing for " + p + " → roadmap_" + module + ".hexa")
+                fails = fails + 1
+            } else {
+                println("[selftest] OK module: " + p + " → roadmap_" + _str(_modules()[ci]) + ".hexa")
+            }
+        }
+        idx = idx + 1
+    }
+
+    // 추가: integrate help 자체 호출 가능 검증 (사이드이펙트 없는 단순 분기)
+    let names = _names()
+    if names.len() != _modules().len() {
+        eprintln("[selftest] FAIL: names/modules length mismatch")
+        fails = fails + 1
+    }
+    if names.len() != _subs().len() {
+        eprintln("[selftest] FAIL: names/subs length mismatch")
+        fails = fails + 1
+    }
+    if names.len() != _takes_rm().len() {
+        eprintln("[selftest] FAIL: names/takes_rm length mismatch")
+        fails = fails + 1
+    }
+    if names.len() != _help_lines().len() {
+        eprintln("[selftest] FAIL: names/help_lines length mismatch")
+        fails = fails + 1
+    }
+
+    // _resolve_rm 검증
+    let r1 = _resolve_rm("nexus")
+    if r1 != ROADMAPS + "/nexus.json" {
+        eprintln("[selftest] FAIL: _resolve_rm('nexus')=" + r1)
+        fails = fails + 1
+    }
+    let r2 = _resolve_rm("/tmp/foo.json")
+    if r2 != "/tmp/foo.json" {
+        eprintln("[selftest] FAIL: _resolve_rm('/tmp/foo.json')=" + r2)
+        fails = fails + 1
+    }
+
+    if fails > 0 {
+        eprintln("[selftest] FAIL — " + to_string(fails) + " checks failed")
+        return 1
+    }
+    println("[selftest] OK — 10 modules + parallel-list integrity + _resolve_rm verified")
+    return 0
+}
+
+// ── main ────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        print_help()
+        exit(2)
+    }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+
+    let mut rest: [string] = []
+    let mut k: i64 = 1
+    while k < a.len() {
+        rest = rest.push(_str(a[k]))
+        k = k + 1
+    }
+
+    let rc = route(cmd, rest)
+    exit(rc)
+}
+
+main()

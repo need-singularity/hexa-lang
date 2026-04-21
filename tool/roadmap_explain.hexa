@@ -1,0 +1,1042 @@
+// roadmap_explain.hexa — counterfactual explainer for roadmap_engine v2 (#8)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   "Why is this path the shortest?" / "If this edge were dropped, what is T*?"
+//   Bellman V*(S) recomputed under variants and compared against baseline.
+//
+// THEORY (mirrors roadmap_engine.hexa)
+//   V*(n)        = c_eff(n) + max_{child} V*(child) ,  V*(goal)=0
+//   D_u(n)       = max_{p in deps}( D_u(p) + c_eff(p) ) ,  D_u(start)=0
+//   T*           = V*(start)                           (also D_u(goal))
+//   on_critical  = c_eff(n) == bottleneck@level(n) AND D_u(n)+V*(n) == T*
+//
+// CLI
+//   hexa run roadmap_explain.hexa why <roadmap> <node_id>
+//   hexa run roadmap_explain.hexa what-if <roadmap> --drop=<parent→child>
+//   hexa run roadmap_explain.hexa what-if <roadmap> --drop-soft
+//   hexa run roadmap_explain.hexa compare <rmA> <rmB>
+//   hexa run roadmap_explain.hexa critical <roadmap>
+//   hexa run roadmap_explain.hexa --selftest
+//
+// exit: 0 ok / 1 not-found(edge|node) / 2 usage / 3 parse
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+let NEXUS_ROOT = if NEXUS == "" { HOME + "/Dev/nexus" } else { NEXUS }  // @allow-devpath
+let HARNESS = NEXUS_ROOT + "/harness"
+let ROADMAPS = NEXUS_ROOT + "/roadmaps"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+// ── text-based JSON field extract (replicated from roadmap_engine) ────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node struct (mirror roadmap_engine.Node) ──────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64
+}
+
+fn parse_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { f_to_i(nu) }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps, soft_deps: soft,
+        status: st, progress: pg
+    }
+}
+
+struct Roadmap {
+    id: string,
+    goal: string,
+    start: string,
+    K_target: f64,
+    C_channel: f64,
+    updated: string,
+    description: string,
+    nodes: [Node]
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let rid = json_str(meta_body, "id")
+    let goal = json_str(meta_body, "goal")
+    let start = json_str(meta_body, "start")
+    let K = json_num(meta_body, "K_target")
+    let C = json_num(meta_body, "C_channel")
+    let updated = json_str(meta_body, "updated")
+    let desc = json_str(meta_body, "description")
+    let node_blocks = split_nodes(body)
+    let mut nodes: [Node] = []
+    let mut i: i64 = 0
+    while i < node_blocks.len() {
+        let n = parse_node(_str(node_blocks[i]))
+        if n.id.len() > 0 { nodes = nodes.push(n) }
+        i = i + 1
+    }
+    return Roadmap {
+        id: rid, goal: goal, start: start,
+        K_target: K, C_channel: C, updated: updated, description: desc,
+        nodes: nodes
+    }
+}
+
+// ── helpers ───────────────────────────────────────────────────────────────
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _idx_of_str(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn effective_cost(n: Node, K: f64, C: f64) -> f64 {
+    let t = n.ntype
+    if t == "seed" { return 0.0 }
+    if t == "goal" { return n.cost }
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        return n.cost / p
+    }
+    if t == "learn" {
+        let e = if n.eta < 0.0 { 0.0 } else { n.eta }
+        let f = 1.0 - e
+        return n.cost * f
+    }
+    if t == "boot" {
+        let nu = if n.n_uses < 1 { 1 } else { n.n_uses }
+        return n.cost / to_float(to_string(nu))
+    }
+    if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let c = if C <= 0.0 { 1.0 } else { C }
+        return (k / c) + (n.cost * 0.25)
+    }
+    return n.cost
+}
+
+fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+    if is_done(n.status) { return 0.0 }
+    let c = effective_cost(n, K, C)
+    if n.status == "in_progress" {
+        let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+        return c * (1.0 - p)
+    }
+    return c
+}
+
+fn children_of(nodes: [Node], nid: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        let mut j: i64 = 0
+        while j < n.deps.len() {
+            if _str(n.deps[j]) == nid { out = out.push(n.id); break }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── memoized V*(n) — parallel list cache (no hashmap) ─────────────────────
+// callers must reset cache between graph mutations.
+fn vstar_calc(nodes: [Node], nid: string, K: f64, C: f64,
+              cache_ids: [string], cache_vals: [f64], cache_done: [bool]) -> [f64] {
+    // returns [val, ...] — mutates cache via copy-and-return pattern would be expensive,
+    // so we recompute on-demand. For the explainer's small graphs this is fine.
+    let ni = idx_of(nodes, nid)
+    if ni < 0 { return [0.0] }
+    let n = nodes[ni]
+    let self_cost = remaining_cost(n, K, C)
+    let kids = children_of(nodes, nid)
+    let mut best: f64 = 0.0
+    let mut ci: i64 = 0
+    while ci < kids.len() {
+        let r = vstar_calc(nodes, _str(kids[ci]), K, C, cache_ids, cache_vals, cache_done)
+        let v = r[0]
+        if v > best { best = v }
+        ci = ci + 1
+    }
+    return [self_cost + best]
+}
+
+fn vstar(nodes: [Node], nid: string, K: f64, C: f64) -> f64 {
+    let cache_ids: [string] = []
+    let cache_vals: [f64] = []
+    let cache_done: [bool] = []
+    let r = vstar_calc(nodes, nid, K, C, cache_ids, cache_vals, cache_done)
+    return r[0]
+}
+
+// upstream distance D_u(n) = max(D_u(p) + c_eff(p)) over deps; D_u(start)=0
+fn d_upstream(nodes: [Node], nid: string, K: f64, C: f64) -> f64 {
+    let ni = idx_of(nodes, nid)
+    if ni < 0 { return 0.0 }
+    let n = nodes[ni]
+    if n.deps.len() == 0 { return 0.0 }
+    let mut best: f64 = 0.0
+    let mut i: i64 = 0
+    while i < n.deps.len() {
+        let pid = _str(n.deps[i])
+        let pi = idx_of(nodes, pid)
+        if pi >= 0 {
+            let p = nodes[pi]
+            let pc = remaining_cost(p, K, C)
+            let pd = d_upstream(nodes, pid, K, C)
+            let total = pd + pc
+            if total > best { best = total }
+        }
+        i = i + 1
+    }
+    return best
+}
+
+// resolve start: explicit rm.start or first indeg=0 node
+fn resolve_start(rm: Roadmap) -> string {
+    if rm.start.len() > 0 { return rm.start }
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        if rm.nodes[i].deps.len() == 0 { return rm.nodes[i].id }
+        i = i + 1
+    }
+    return ""
+}
+
+// resolve goal: explicit rm.goal or first ntype="goal" or last node
+fn resolve_goal(rm: Roadmap) -> string {
+    if rm.goal.len() > 0 {
+        let gi = idx_of(rm.nodes, rm.goal)
+        if gi >= 0 { return rm.goal }
+    }
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        if rm.nodes[i].ntype == "goal" { return rm.nodes[i].id }
+        i = i + 1
+    }
+    if rm.nodes.len() > 0 { return rm.nodes[rm.nodes.len() - 1].id }
+    return ""
+}
+
+// ── critical-path reconstruction ──────────────────────────────────────────
+// from start, repeatedly pick child maximizing V*(child); stop at goal/leaf.
+fn critical_path(rm: Roadmap) -> [string] {
+    let start_id = resolve_start(rm)
+    let goal_id = resolve_goal(rm)
+    let mut path: [string] = []
+    if start_id == "" { return path }
+    let mut cur = start_id
+    let mut steps: i64 = 0
+    let max_steps = rm.nodes.len() * 2 + 4
+    while steps < max_steps {
+        path = path.push(cur)
+        if cur == goal_id { return path }
+        let kids = children_of(rm.nodes, cur)
+        if kids.len() == 0 { return path }
+        // pick child with max V* (tie-break by listing order)
+        let mut best_id = ""
+        let mut best_v: f64 = -1.0
+        let mut i: i64 = 0
+        while i < kids.len() {
+            let kid = _str(kids[i])
+            let v = vstar(rm.nodes, kid, rm.K_target, rm.C_channel)
+            if v > best_v { best_v = v; best_id = kid }
+            i = i + 1
+        }
+        if best_id == "" { return path }
+        cur = best_id
+        steps = steps + 1
+    }
+    return path
+}
+
+fn path_in(path: [string], nid: string) -> bool {
+    return _idx_of_str(path, nid) >= 0
+}
+
+// ── graph mutation helpers (return modified copies) ───────────────────────
+fn nodes_with_zero_cost(nodes: [Node], nid: string) -> [Node] {
+    let mut out: [Node] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        if n.id == nid {
+            let nn = Node {
+                id: n.id, name: n.name, ntype: n.ntype,
+                cost: 0.0, p_success: 1.0, eta: n.eta, n_uses: n.n_uses,
+                deps: n.deps, soft_deps: n.soft_deps,
+                status: "done", progress: 1.0
+            }
+            out = out.push(nn)
+        } else {
+            out = out.push(n)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// drop edge parent→child : remove parent_id from child.deps (and soft_deps)
+// returns [new_nodes, found_flag(0|1)]
+struct DropResult {
+    nodes: [Node],
+    found: bool
+}
+
+fn nodes_drop_edge(nodes: [Node], parent_id: string, child_id: string) -> DropResult {
+    let mut out: [Node] = []
+    let mut found: bool = false
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        if n.id == child_id {
+            let mut nd: [string] = []
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let d = _str(n.deps[j])
+                if d == parent_id { found = true }
+                else { nd = nd.push(d) }
+                j = j + 1
+            }
+            let mut ns: [string] = []
+            let mut k: i64 = 0
+            while k < n.soft_deps.len() {
+                let d = _str(n.soft_deps[k])
+                if d == parent_id { found = true }
+                else { ns = ns.push(d) }
+                k = k + 1
+            }
+            let nn = Node {
+                id: n.id, name: n.name, ntype: n.ntype,
+                cost: n.cost, p_success: n.p_success, eta: n.eta, n_uses: n.n_uses,
+                deps: nd, soft_deps: ns,
+                status: n.status, progress: n.progress
+            }
+            out = out.push(nn)
+        } else {
+            out = out.push(n)
+        }
+        i = i + 1
+    }
+    return DropResult { nodes: out, found: found }
+}
+
+// drop ALL soft edges (clear soft_deps; also remove from deps if present in soft_deps mirror — schema treats them separate).
+fn nodes_drop_all_soft(nodes: [Node]) -> [Node] {
+    let mut out: [Node] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        let nn = Node {
+            id: n.id, name: n.name, ntype: n.ntype,
+            cost: n.cost, p_success: n.p_success, eta: n.eta, n_uses: n.n_uses,
+            deps: n.deps, soft_deps: [],
+            status: n.status, progress: n.progress
+        }
+        out = out.push(nn)
+        i = i + 1
+    }
+    return out
+}
+
+// ── formatting ────────────────────────────────────────────────────────────
+fn fmt_min(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = v * 10.0
+    let r = f_to_i(scaled + 0.5)
+    let whole = r / 10
+    let frac = r - (whole * 10)
+    let body = if frac == 0 { to_string(whole) + "m" }
+               else { to_string(whole) + "." + to_string(frac) + "m" }
+    if neg { return "-" + body }
+    return body
+}
+
+fn fmt_pct1(f: f64) -> string {
+    let scaled = (f * 1000.0) + 0.5
+    let r = f_to_i(scaled)
+    let whole = r / 10
+    let frac = r - (whole * 10)
+    return to_string(whole) + "." + to_string(frac) + "%"
+}
+
+fn fmt_signed(x: f64) -> string {
+    if x >= 0.0 { return "+" + fmt_min(x) }
+    return fmt_min(x)  // already includes leading '-'
+}
+
+fn pad_right(s: string, n: i64) -> string {
+    let mut r = s
+    while r.len() < n { r = r + " " }
+    return r
+}
+
+// ── η = 1 - V*(start)_after / V*(start)_before ────────────────────────────
+fn calc_eta(t_old: f64, t_new: f64) -> f64 {
+    if t_old <= 0.0 { return 0.0 }
+    return 1.0 - (t_new / t_old)
+}
+
+// ── subcommand: critical ──────────────────────────────────────────────────
+fn cmd_critical(rm: Roadmap) {
+    let path = critical_path(rm)
+    let T = vstar(rm.nodes, resolve_start(rm), rm.K_target, rm.C_channel)
+    println("critical path  T*=" + fmt_min(T) + "  rm=" + rm.id)
+    let mut cum: f64 = 0.0
+    let mut i: i64 = 0
+    while i < path.len() {
+        let nid = _str(path[i])
+        let ni = idx_of(rm.nodes, nid)
+        if ni >= 0 {
+            let n = rm.nodes[ni]
+            let c = remaining_cost(n, rm.K_target, rm.C_channel)
+            cum = cum + c
+            let tag = "P" + to_string(i)
+            let name = if n.name.len() > 18 { n.name.substring(0, 15) + "..." } else { n.name }
+            let id_disp = pad_right(nid, 12)
+            let nm_disp = pad_right(name, 20)
+            println(tag + ": " + id_disp + " " + nm_disp + " cost=" + pad_right(fmt_min(c), 8) + " cum=" + fmt_min(cum))
+        }
+        i = i + 1
+    }
+    exit(0)
+}
+
+// ── subcommand: why <node> ────────────────────────────────────────────────
+fn cmd_why(rm: Roadmap, nid: string) {
+    let ni = idx_of(rm.nodes, nid)
+    if ni < 0 {
+        eprintln("REJECT: node not found: " + nid)
+        exit(1)
+    }
+    let n = rm.nodes[ni]
+    let K = rm.K_target
+    let C = rm.C_channel
+    let start_id = resolve_start(rm)
+    let goal_id = resolve_goal(rm)
+    let T = vstar(rm.nodes, start_id, K, C)
+    let c_eff = effective_cost(n, K, C)
+    let c_rem = remaining_cost(n, K, C)
+    let v_d = vstar(rm.nodes, nid, K, C)            // T*(this→goal)
+    let d_u = d_upstream(rm.nodes, nid, K, C)       // upstream distance
+    let path = critical_path(rm)
+    let on_cp = path_in(path, nid) && (T > 0.0)
+
+    let share = if T > 0.0 { c_eff / T } else { 0.0 }
+
+    // counterfactual: this node instant
+    let mut_nodes = nodes_with_zero_cost(rm.nodes, nid)
+    let T_new = vstar(mut_nodes, start_id, K, C)
+    let dT = T_new - T
+
+    println("node: " + nid + " (" + n.name + ")")
+    println("  type=" + n.ntype + "  status=" + n.status + "  cost=" + fmt_min(n.cost))
+    println("  effective=" + fmt_min(c_eff) + "  remaining=" + fmt_min(c_rem))
+    let cp_tag = if on_cp { "yes" } else { "no" }
+    println("  on_critical_path: " + cp_tag)
+    println("  downstream T*(this->" + goal_id + ") = " + fmt_min(v_d))
+    println("  upstream distance from " + start_id + " = " + fmt_min(d_u))
+    println("  share_of_T*: " + fmt_pct1(share) + "  (c_eff / T*)")
+    println("  if this were instant (cost=0), new T* = " + fmt_min(T_new) + "  (delta=" + fmt_signed(dT) + ")")
+    if on_cp {
+        println("  >> bottleneck candidate (on critical path)")
+    }
+    exit(0)
+}
+
+// ── subcommand: what-if --drop=<edge> ─────────────────────────────────────
+fn cmd_what_if_drop(rm: Roadmap, edge: string) {
+    // edge: "parent→child" — split on "→" (3-byte UTF-8) or fallback "->"
+    let mut sep = "→"
+    let mut idx = edge.index_of(sep)
+    if idx < 0 {
+        sep = "->"
+        idx = edge.index_of(sep)
+    }
+    if idx < 0 {
+        eprintln("REJECT: edge format must be 'parent->child' or 'parent" + "→" + "child'")
+        exit(2)
+    }
+    let parent_id = edge.substring(0, idx)
+    let child_id = edge.substring(idx + sep.len(), edge.len())
+    if parent_id == "" || child_id == "" {
+        eprintln("REJECT: empty endpoint in edge: " + edge)
+        exit(2)
+    }
+    let dr = nodes_drop_edge(rm.nodes, parent_id, child_id)
+    if dr.found == false {
+        eprintln("REJECT: edge not found: " + parent_id + "->" + child_id)
+        exit(1)
+    }
+    let start_id = resolve_start(rm)
+    let K = rm.K_target
+    let C = rm.C_channel
+    let T0 = vstar(rm.nodes, start_id, K, C)
+    let T1 = vstar(dr.nodes, start_id, K, C)
+    let cp0 = critical_path(rm)
+    let new_rm = Roadmap {
+        id: rm.id, goal: rm.goal, start: rm.start,
+        K_target: rm.K_target, C_channel: rm.C_channel,
+        updated: rm.updated, description: rm.description,
+        nodes: dr.nodes
+    }
+    let cp1 = critical_path(new_rm)
+    println("original: T* = " + fmt_min(T0) + "  critical path = " + cp0.join("->"))
+    println("after drop " + parent_id + "->" + child_id + ": T* = " + fmt_min(T1) + "  critical path = " + cp1.join("->"))
+    let dT = T1 - T0
+    let tail = if dT < 0.0 { "  (shortened)" }
+               else { if dT > 0.0 { "  (worse — likely soft-only edge irrelevant)" } else { "  (no change — edge not on critical path)" } }
+    println("delta T* = " + fmt_signed(dT) + tail)
+    exit(0)
+}
+
+// ── subcommand: what-if --drop-soft ───────────────────────────────────────
+fn cmd_what_if_drop_soft(rm: Roadmap) {
+    let start_id = resolve_start(rm)
+    let K = rm.K_target
+    let C = rm.C_channel
+    let T0 = vstar(rm.nodes, start_id, K, C)
+    let cp0 = critical_path(rm)
+    // count softs
+    let mut soft_total: i64 = 0
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        soft_total = soft_total + rm.nodes[i].soft_deps.len()
+        i = i + 1
+    }
+    let new_nodes = nodes_drop_all_soft(rm.nodes)
+    let new_rm = Roadmap {
+        id: rm.id, goal: rm.goal, start: rm.start,
+        K_target: rm.K_target, C_channel: rm.C_channel,
+        updated: rm.updated, description: rm.description,
+        nodes: new_nodes
+    }
+    let T1 = vstar(new_nodes, start_id, K, C)
+    let cp1 = critical_path(new_rm)
+    println("original: T* = " + fmt_min(T0) + "  critical path = " + cp0.join("->"))
+    println("after drop ALL soft_deps (cleared " + to_string(soft_total) + " links): T* = " + fmt_min(T1) + "  critical path = " + cp1.join("->"))
+    println("delta T* = " + fmt_signed(T1 - T0))
+    exit(0)
+}
+
+// ── subcommand: compare <rmA> <rmB> ───────────────────────────────────────
+fn cmd_compare(rmA: Roadmap, rmB: Roadmap) {
+    let sa = resolve_start(rmA)
+    let sb = resolve_start(rmB)
+    let Ta = vstar(rmA.nodes, sa, rmA.K_target, rmA.C_channel)
+    let Tb = vstar(rmB.nodes, sb, rmB.K_target, rmB.C_channel)
+    let cpa = critical_path(rmA)
+    let cpb = critical_path(rmB)
+    // η: viewing B as "after" A — gain
+    let eta = calc_eta(Ta, Tb)
+
+    println("┌──────────────┬────────────────────┬────────────────────┐")
+    println("│ metric       │ " + pad_right(rmA.id, 18) + " │ " + pad_right(rmB.id, 18) + " │")
+    println("├──────────────┼────────────────────┼────────────────────┤")
+    println("│ T*           │ " + pad_right(fmt_min(Ta), 18) + " │ " + pad_right(fmt_min(Tb), 18) + " │")
+    println("│ nodes        │ " + pad_right(to_string(rmA.nodes.len()), 18) + " │ " + pad_right(to_string(rmB.nodes.len()), 18) + " │")
+    println("│ critical_len │ " + pad_right(to_string(cpa.len()), 18) + " │ " + pad_right(to_string(cpb.len()), 18) + " │")
+    println("│ start        │ " + pad_right(sa, 18) + " │ " + pad_right(sb, 18) + " │")
+    println("│ goal         │ " + pad_right(resolve_goal(rmA), 18) + " │ " + pad_right(resolve_goal(rmB), 18) + " │")
+    println("└──────────────┴────────────────────┴────────────────────┘")
+    println("delta T*  (B - A) = " + fmt_signed(Tb - Ta))
+    println("eta       (1 - Tb/Ta) = " + fmt_pct1(eta))
+    println("path A: " + cpa.join("->"))
+    println("path B: " + cpb.join("->"))
+    exit(0)
+}
+
+// ── selftest (in-memory + example.json) ───────────────────────────────────
+fn build_sample() -> Roadmap {
+    // Simple 4-node DAG: s -> a -> b -> g  (a=5, b=10, g=0)  → T* = 15
+    // plus parallel s -> c -> g (c=4)  → still 15 because branch a->b is heavier
+    let s = Node { id: "s", name: "seed", ntype: "seed",
+        cost: 0.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: [], soft_deps: [], status: "todo", progress: 0.0 }
+    let a = Node { id: "a", name: "a", ntype: "build",
+        cost: 5.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: ["s"], soft_deps: [], status: "todo", progress: 0.0 }
+    let b = Node { id: "b", name: "b", ntype: "build",
+        cost: 10.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: ["a"], soft_deps: [], status: "todo", progress: 0.0 }
+    let c = Node { id: "c", name: "c", ntype: "build",
+        cost: 4.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: ["s"], soft_deps: [], status: "todo", progress: 0.0 }
+    let g = Node { id: "g", name: "goal", ntype: "goal",
+        cost: 0.0, p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: ["b", "c"], soft_deps: [], status: "todo", progress: 0.0 }
+    return Roadmap {
+        id: "selftest_sample", goal: "g", start: "s",
+        K_target: 1.0, C_channel: 1.0,
+        updated: "2026-04-16", description: "in-memory selftest",
+        nodes: [s, a, b, c, g]
+    }
+}
+
+fn assert_eq_f(label: string, got: f64, want: f64) -> bool {
+    let d = if got > want { got - want } else { want - got }
+    if d < 0.001 {
+        println("  PASS  " + label + " = " + fmt_min(got))
+        return true
+    }
+    eprintln("  FAIL  " + label + "  got=" + fmt_min(got) + "  want=" + fmt_min(want))
+    return false
+}
+
+fn assert_eq_str(label: string, got: string, want: string) -> bool {
+    if got == want {
+        println("  PASS  " + label + " = " + got)
+        return true
+    }
+    eprintln("  FAIL  " + label + "  got='" + got + "'  want='" + want + "'")
+    return false
+}
+
+fn selftest() {
+    println("[selftest] roadmap_explain")
+    let mut ok: bool = true
+
+    // 1) sample DAG
+    let rm = build_sample()
+    let T = vstar(rm.nodes, "s", rm.K_target, rm.C_channel)
+    if assert_eq_f("vstar(s) == a+b = 15", T, 15.0) == false { ok = false }
+
+    let v_b = vstar(rm.nodes, "b", rm.K_target, rm.C_channel)
+    if assert_eq_f("vstar(b) == 10", v_b, 10.0) == false { ok = false }
+
+    let v_c = vstar(rm.nodes, "c", rm.K_target, rm.C_channel)
+    if assert_eq_f("vstar(c) == 4", v_c, 4.0) == false { ok = false }
+
+    let d_b = d_upstream(rm.nodes, "b", rm.K_target, rm.C_channel)
+    if assert_eq_f("d_upstream(b) == 5", d_b, 5.0) == false { ok = false }
+
+    let cp = critical_path(rm)
+    let path_str = cp.join("->")
+    if assert_eq_str("critical path == s->a->b->g", path_str, "s->a->b->g") == false { ok = false }
+
+    // counterfactual: drop a->b ⇒ b loses dep, but b still in goal.deps so we get
+    // c branch active for sure. T* should drop to max(b alone via no-deps?, c). Since
+    // dropping a->b makes b an indep starter (deps=[]) — its V* still 10 + 0 = 10.
+    // Goal still depends on [b,c], so V*(s) = max( V*(a)=5+0=5 (a has no children now since b's parent removed),
+    //                                              V*(c)=4 ) = 5. Wait — kid_of(s) = [a, c]; V*(a)=5; V*(c)=4 → V*(s)=5.
+    // b becomes orphan from s perspective.
+    let dr = nodes_drop_edge(rm.nodes, "a", "b")
+    if dr.found == false { eprintln("  FAIL  drop a->b not found"); ok = false }
+    let T_drop = vstar(dr.nodes, "s", rm.K_target, rm.C_channel)
+    if assert_eq_f("after drop a->b: V*(s) == 5", T_drop, 5.0) == false { ok = false }
+
+    // counterfactual: zero-cost on b ⇒ V*(b)=0, V*(a)=5+0=5, V*(s)=max(5,4)=5
+    let z = nodes_with_zero_cost(rm.nodes, "b")
+    let Tz = vstar(z, "s", rm.K_target, rm.C_channel)
+    if assert_eq_f("zero-cost(b): V*(s) == 5", Tz, 5.0) == false { ok = false }
+
+    // edge not found
+    let dn = nodes_drop_edge(rm.nodes, "x", "y")
+    if dn.found == true { eprintln("  FAIL  bogus edge reported found"); ok = false }
+    else { println("  PASS  bogus edge correctly not-found") }
+
+    // 2) example.json (real roadmap) — basic sanity
+    let path = ROADMAPS + "/example.json"
+    if file_exists(path) {
+        let rm2 = load_roadmap(path)
+        let T2 = vstar(rm2.nodes, resolve_start(rm2), rm2.K_target, rm2.C_channel)
+        // example.json description claims T* ≈ 81m. After done-discount it's smaller (most done).
+        // We just assert T2 > 0 and critical path includes goal G.
+        if T2 > 0.0 {
+            println("  PASS  example.json T* = " + fmt_min(T2) + " (>0)")
+        } else {
+            eprintln("  FAIL  example.json T* = 0"); ok = false
+        }
+        let cp2 = critical_path(rm2)
+        if path_in(cp2, "G") {
+            println("  PASS  example.json critical path reaches G")
+        } else {
+            eprintln("  FAIL  example.json critical path missing G"); ok = false
+        }
+        // soft drop
+        let cleared = nodes_drop_all_soft(rm2.nodes)
+        let T2_soft = vstar(cleared, resolve_start(rm2), rm2.K_target, rm2.C_channel)
+        // dropping soft must not increase T*
+        if T2_soft <= T2 + 0.001 {
+            println("  PASS  drop-soft monotonic: T*=" + fmt_min(T2_soft) + " <= " + fmt_min(T2))
+        } else {
+            eprintln("  FAIL  drop-soft made T* worse: " + fmt_min(T2_soft) + " > " + fmt_min(T2)); ok = false
+        }
+    } else {
+        println("  SKIP  example.json missing — synthetic only")
+    }
+
+    if ok {
+        println("[selftest] OK")
+        exit(0)
+    }
+    eprintln("[selftest] FAIL")
+    exit(1)
+}
+
+// ── main ──────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa run roadmap_explain.hexa why <roadmap> <node_id>")
+    eprintln("  hexa run roadmap_explain.hexa what-if <roadmap> --drop=<parent->child>")
+    eprintln("  hexa run roadmap_explain.hexa what-if <roadmap> --drop-soft")
+    eprintln("  hexa run roadmap_explain.hexa compare <rmA> <rmB>")
+    eprintln("  hexa run roadmap_explain.hexa critical <roadmap>")
+    eprintln("  hexa run roadmap_explain.hexa --selftest")
+}
+
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 { usage(); exit(2) }
+
+    let cmd = _str(a[0])
+
+    if cmd == "--selftest" || cmd == "selftest" { selftest() }
+
+    if cmd == "--help" || cmd == "-h" || cmd == "help" { usage(); exit(0) }
+
+    if cmd == "why" {
+        if a.len() < 3 { eprintln("REJECT: why <roadmap> <node_id>"); exit(2) }
+        let path = _str(a[1])
+        let nid = _str(a[2])
+        let rm = load_roadmap(path)
+        cmd_why(rm, nid)
+    }
+
+    if cmd == "what-if" {
+        if a.len() < 3 { eprintln("REJECT: what-if <roadmap> --drop=<edge>|--drop-soft"); exit(2) }
+        let path = _str(a[1])
+        let rm = load_roadmap(path)
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg == "--drop-soft" { cmd_what_if_drop_soft(rm) }
+            if arg.starts_with("--drop=") {
+                let edge = arg.substring(7, arg.len())
+                cmd_what_if_drop(rm, edge)
+            }
+            k = k + 1
+        }
+        eprintln("REJECT: what-if needs --drop=<edge> or --drop-soft")
+        exit(2)
+    }
+
+    if cmd == "compare" {
+        if a.len() < 3 { eprintln("REJECT: compare <rmA> <rmB>"); exit(2) }
+        let rmA = load_roadmap(_str(a[1]))
+        let rmB = load_roadmap(_str(a[2]))
+        cmd_compare(rmA, rmB)
+    }
+
+    if cmd == "critical" {
+        if a.len() < 2 { eprintln("REJECT: critical <roadmap>"); exit(2) }
+        let rm = load_roadmap(_str(a[1]))
+        cmd_critical(rm)
+    }
+
+    eprintln("REJECT: unknown subcommand: " + cmd)
+    usage()
+    exit(2)
+}
+
+main()

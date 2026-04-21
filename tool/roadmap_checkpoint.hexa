@@ -1,0 +1,823 @@
+// roadmap_checkpoint.hexa — NEXUS-6 roadmap_engine v2 #9 (checkpoint + rollback)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// 목적
+//   replan 트리거(η ≤ 0) 또는 사용자 실수 시 roadmap JSON 을 복구할 수 있게
+//   timestamped 스냅샷 저장. CLI 로 list/diff/restore/snap/gc/--selftest.
+//
+// SSOT
+//   src      shared/roadmaps/<rm>.json
+//   snap     shared/tool/roadmap_checkpoints/<rm>/<ISO8601>.json
+//   gc log   shared/tool/roadmap_checkpoints/.gc_log.jsonl
+//
+// CLI
+//   hexa run shared/tool/roadmap_checkpoint.hexa snap <rm-name>
+//   hexa run shared/tool/roadmap_checkpoint.hexa list <rm-name>
+//   hexa run shared/tool/roadmap_checkpoint.hexa restore <rm-name> <ts>
+//   hexa run shared/tool/roadmap_checkpoint.hexa diff <rm-name> <ts>
+//   hexa run shared/tool/roadmap_checkpoint.hexa gc [--keep=N]
+//   hexa run shared/tool/roadmap_checkpoint.hexa --selftest
+//
+// exit: 0 success / 1 logical fail / 2 usage error / 3 missing src
+//
+// hexa stage1 함정 회피:
+//   #{} 미사용 — parallel list (keys+vals)
+//   슬라이스 a[x+1..y] — 임시 변수 n=x+1; a[n..y]
+//   list[i]=v no-op — slice+concat
+//   if-식 slice — if-stmt 분해
+//   args() 빈 가드 / xs.push(v) → xs = xs.push(v)
+//   "".split("\n") 첫 void → _str() 감쌈
+
+let HOME = env("HOME")
+let NEXUS = env("NEXUS")
+fn _nexus_root() -> string {
+    let n = _str(NEXUS).trim()
+    if n.len() > 0 { return n }
+    return _str(HOME) + "/Dev/nexus"
+}
+let ROOT = _nexus_root()
+let ROADMAPS = ROOT + "/roadmaps"
+let SNAP_ROOT = ROOT + "/tool/roadmap_checkpoints"
+let GC_LOG = SNAP_ROOT + "/.gc_log.jsonl"
+
+// ─── void-safe coercion ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let parts = _str(s).split("\n")
+    if parts.len() == 0 { return 0 }
+    let first = _str(parts[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+// ─── shell quote ───
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// ─── time helpers ───
+fn now_iso_safe() -> string {
+    // ISO8601 UTC 인데 ':' 를 '-' 로 치환 (파일명 안전)
+    let raw = _str(exec("date -u +%Y-%m-%dT%H-%M-%SZ")).trim()  // @allow-bare-exec
+    if raw.len() > 0 { return raw }
+    let n = _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+    return "ts" + to_string(n)
+}
+
+// ─── fs helpers ───
+fn dir_exists(path: string) -> bool {
+    let out = _str(exec("test -d " + _shq(path) + " && echo ok")).trim()  // @allow-bare-exec
+    return out == "ok"
+}
+
+fn ensure_dir(path: string) {
+    if dir_exists(path) { return }
+    exec("mkdir -p " + _shq(path) + " 2>/dev/null")  // @allow-bare-exec
+}
+
+fn list_snapshot_files(rm_dir: string) -> [string] {
+    if dir_exists(rm_dir) == false { return [] }
+    // ls -t = mtime 내림차순. 파일명도 ISO8601 이라 정렬 결과 동등.
+    let cmd = "ls -1t " + _shq(rm_dir) + "/*.json 2>/dev/null"
+    let raw = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if raw.len() == 0 { return [] }
+    let lines = _str(raw).split("\n")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i]).trim()
+        if ln.len() > 0 { out = out.push(ln) }
+        i = i + 1
+    }
+    return out
+}
+
+fn basename_no_ext(path: string) -> string {
+    // /a/b/2026-04-16T14-35-22Z.json → 2026-04-16T14-35-22Z
+    let mut last_slash: i64 = -1
+    let mut i: i64 = 0
+    while i < path.len() {
+        if path.substring(i, i + 1) == "/" { last_slash = i }
+        i = i + 1
+    }
+    let n = last_slash + 1
+    let base = if last_slash >= 0 { path.substring(n, path.len()) } else { path }
+    let ext = ".json"
+    if base.len() > ext.len() {
+        let m = base.len() - ext.len()
+        if base.substring(m, base.len()) == ext {
+            return base.substring(0, m)
+        }
+    }
+    return base
+}
+
+fn file_size(path: string) -> i64 {
+    if file_exists(path) == false { return 0 }
+    // BSD stat -f%z / GNU stat -c%s 둘 다 시도
+    let r1 = _str(exec("stat -f%z " + _shq(path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    if r1.len() > 0 { return _to_int0(r1) }
+    let r2 = _str(exec("stat -c%s " + _shq(path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    return _to_int0(r2)
+}
+
+// ─── JSON parsing helpers (roadmap_engine.hexa 패턴 일관) ───
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn split_node_blocks(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+fn json_str_field(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+// roadmap 노드 파싱 → 평행 리스트 (id, status). hashmap 회피.
+fn parse_node_pairs(body: string) -> [[string]] {
+    let blocks = split_node_blocks(body)
+    let mut ids: [string] = []
+    let mut sts: [string] = []
+    let mut i: i64 = 0
+    while i < blocks.len() {
+        let blk = _str(blocks[i])
+        let id = json_str_field(blk, "id")
+        if id.len() > 0 {
+            ids = ids.push(id)
+            let mut st = json_str_field(blk, "status")
+            if st == "" { st = "todo" }
+            sts = sts.push(st)
+        }
+        i = i + 1
+    }
+    return [ids, sts]
+}
+
+fn count_done(sts: [string]) -> i64 {
+    let mut k: i64 = 0
+    let mut i: i64 = 0
+    while i < sts.len() {
+        let s = _str(sts[i])
+        if s == "done" || s == "complete" || s == "aborted" || s == "skipped" {
+            k = k + 1
+        }
+        i = i + 1
+    }
+    return k
+}
+
+fn idx_in_ids(ids: [string], target: string) -> i64 {
+    let mut i: i64 = 0
+    while i < ids.len() {
+        if _str(ids[i]) == target { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── core ops ───
+fn rm_src_path(rm: string) -> string {
+    return ROADMAPS + "/" + rm + ".json"
+}
+
+fn rm_snap_dir(rm: string) -> string {
+    return SNAP_ROOT + "/" + rm
+}
+
+// 실제 스냅 1회. 반환: [ts, snap_path] 또는 ["",""] on fail.
+fn do_snap(rm: string, src: string) -> [string] {
+    if file_exists(src) == false {
+        eprintln("REJECT: roadmap not found: " + src)
+        return ["", ""]
+    }
+    let body = _str(read_file(src))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + src)
+        return ["", ""]
+    }
+    ensure_dir(SNAP_ROOT)
+    let dir = rm_snap_dir(rm)
+    ensure_dir(dir)
+    // ts 충돌 회피: 동일 ts 면 suffix _2, _3, ...
+    let mut ts = now_iso_safe()
+    let mut snap = dir + "/" + ts + ".json"
+    let mut suf: i64 = 2
+    while file_exists(snap) {
+        snap = dir + "/" + ts + "_" + to_string(suf) + ".json"
+        suf = suf + 1
+        if suf > 99 { break }
+    }
+    let stamped_ts = basename_no_ext(snap)
+    try { write_file(snap, body) } catch e {
+        eprintln("FAIL: write_file " + snap)
+        return ["", ""]
+    }
+    return [stamped_ts, snap]
+}
+
+// 매칭: exact == 또는 prefix. 매치 정확 1개면 path, 모호/0이면 후보 list.
+// 반환 [matched_path, "" ] 성공 / ["", "cand1\ncand2\ncand3"] 실패.
+fn match_snapshot(rm: string, ts: string) -> [string] {
+    let dir = rm_snap_dir(rm)
+    let files = list_snapshot_files(dir)
+    if files.len() == 0 { return ["", ""] }
+    let mut exact: [string] = []
+    let mut prefix: [string] = []
+    let mut i: i64 = 0
+    while i < files.len() {
+        let p = _str(files[i])
+        let bn = basename_no_ext(p)
+        if bn == ts { exact = exact.push(p) }
+        else if bn.len() >= ts.len() {
+            let head = bn.substring(0, ts.len())
+            if head == ts { prefix = prefix.push(p) }
+        }
+        i = i + 1
+    }
+    if exact.len() == 1 { return [_str(exact[0]), ""] }
+    if exact.len() == 0 && prefix.len() == 1 { return [_str(prefix[0]), ""] }
+    // 후보 합쳐서 최대 3개 출력
+    let mut cand: [string] = []
+    let mut k: i64 = 0
+    while k < exact.len() && cand.len() < 3 {
+        cand = cand.push(basename_no_ext(_str(exact[k])))
+        k = k + 1
+    }
+    let mut k2: i64 = 0
+    while k2 < prefix.len() && cand.len() < 3 {
+        cand = cand.push(basename_no_ext(_str(prefix[k2])))
+        k2 = k2 + 1
+    }
+    if cand.len() == 0 {
+        // 그냥 최근 3개
+        let mut k3: i64 = 0
+        while k3 < files.len() && cand.len() < 3 {
+            cand = cand.push(basename_no_ext(_str(files[k3])))
+            k3 = k3 + 1
+        }
+    }
+    let mut joined = ""
+    let mut ji: i64 = 0
+    while ji < cand.len() {
+        if ji > 0 { joined = joined + "\n" }
+        joined = joined + _str(cand[ji])
+        ji = ji + 1
+    }
+    return ["", joined]
+}
+
+// ─── commands ───
+fn cmd_snap(rm: string) -> i64 {
+    let src = rm_src_path(rm)
+    let r = do_snap(rm, src)
+    let ts = _str(r[0])
+    let snap = _str(r[1])
+    if ts == "" { return 1 }
+    let body = _str(read_file(snap))
+    let pair = parse_node_pairs(body)
+    let ids = pair[0]
+    let sz = file_size(snap)
+    println("snap: " + rm + " @ " + ts + " (" + to_string(ids.len()) + " nodes, " + to_string(sz) + " B)")
+    return 0
+}
+
+fn cmd_list(rm: string) -> i64 {
+    let dir = rm_snap_dir(rm)
+    let files = list_snapshot_files(dir)
+    if files.len() == 0 {
+        println("(no checkpoints)")
+        return 0
+    }
+    let mut i: i64 = 0
+    while i < files.len() && i < 20 {
+        let p = _str(files[i])
+        let ts = basename_no_ext(p)
+        let body = _str(read_file(p))
+        let pair = parse_node_pairs(body)
+        let ids = pair[0]
+        let sts = pair[1]
+        let total = ids.len()
+        let done = count_done(sts)
+        let sz = file_size(p)
+        println(ts + "  " + to_string(total) + "  " + to_string(sz) + "B  done=" + to_string(done) + "/" + to_string(total))
+        i = i + 1
+    }
+    return 0
+}
+
+fn cmd_restore(rm: string, ts: string) -> i64 {
+    let src = rm_src_path(rm)
+    if file_exists(src) == false {
+        eprintln("REJECT: roadmap not found: " + src)
+        return 3
+    }
+    let m = match_snapshot(rm, ts)
+    let path = _str(m[0])
+    if path == "" {
+        let cand = _str(m[1])
+        eprintln("REJECT: no match for ts='" + ts + "'")
+        if cand.len() > 0 {
+            eprintln("candidates:")
+            let cs = cand.split("\n")
+            let mut ci: i64 = 0
+            while ci < cs.len() {
+                eprintln("  " + _str(cs[ci]))
+                ci = ci + 1
+            }
+        } else {
+            eprintln("(no checkpoints in " + rm_snap_dir(rm) + ")")
+        }
+        return 1
+    }
+    // 1) 현재 상태 자동 백업
+    let bak = do_snap(rm, src)
+    let bak_ts = _str(bak[0])
+    if bak_ts == "" {
+        eprintln("FAIL: pre-restore snapshot failed")
+        return 1
+    }
+    // 2) 스냅 → src 덮어쓰기 (atomic via tmp + mv)
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("FAIL: snapshot empty: " + path)
+        return 1
+    }
+    let tmp = src + ".restore.tmp"
+    try { write_file(tmp, body) } catch e {
+        eprintln("FAIL: write_file " + tmp)
+        return 1
+    }
+    let mv = _str(exec("mv " + _shq(tmp) + " " + _shq(src) + " 2>&1")).trim()  // @allow-bare-exec
+    if mv.len() > 0 {
+        eprintln("FAIL: mv " + tmp + " → " + src + ": " + mv)
+        return 1
+    }
+    let restored_ts = basename_no_ext(path)
+    println("restore: " + rm + " <- " + restored_ts + " (backup=" + bak_ts + ")")
+    return 0
+}
+
+fn cmd_diff(rm: string, ts: string) -> i64 {
+    let src = rm_src_path(rm)
+    if file_exists(src) == false {
+        eprintln("REJECT: roadmap not found: " + src)
+        return 3
+    }
+    let m = match_snapshot(rm, ts)
+    let snap_path = _str(m[0])
+    if snap_path == "" {
+        let cand = _str(m[1])
+        eprintln("REJECT: no match for ts='" + ts + "'")
+        if cand.len() > 0 {
+            eprintln("candidates:")
+            let cs = cand.split("\n")
+            let mut ci: i64 = 0
+            while ci < cs.len() {
+                eprintln("  " + _str(cs[ci]))
+                ci = ci + 1
+            }
+        }
+        return 1
+    }
+    let cur = _str(read_file(src))
+    let snp = _str(read_file(snap_path))
+    let p_cur = parse_node_pairs(cur)
+    let p_snp = parse_node_pairs(snp)
+    let cur_ids = p_cur[0]
+    let cur_sts = p_cur[1]
+    let snp_ids = p_snp[0]
+    let snp_sts = p_snp[1]
+
+    let mut changed: i64 = 0
+
+    // 1) 공통 노드 status diff (snap 기준 순회)
+    let mut i: i64 = 0
+    while i < snp_ids.len() {
+        let sid = _str(snp_ids[i])
+        let s_old = _str(snp_sts[i])
+        let ci = idx_in_ids(cur_ids, sid)
+        if ci >= 0 {
+            let s_new = _str(cur_sts[ci])
+            if s_old != s_new {
+                println(sid + ": " + s_old + " -> " + s_new)
+                changed = changed + 1
+            }
+        } else {
+            println("- " + sid)
+            changed = changed + 1
+        }
+        i = i + 1
+    }
+    // 2) 새로 추가된 노드 (cur 에만 있음)
+    let mut j: i64 = 0
+    while j < cur_ids.len() {
+        let cid = _str(cur_ids[j])
+        let si = idx_in_ids(snp_ids, cid)
+        if si < 0 {
+            let cs = _str(cur_sts[j])
+            println("+ " + cid + " (" + cs + ")")
+            changed = changed + 1
+        }
+        j = j + 1
+    }
+    if changed == 0 { println("(no changes)") }
+    return 0
+}
+
+// gc: 각 <rm>/ 별로 최근 keep 개만 남기고 나머지 unlink.
+fn cmd_gc(keep: i64) -> i64 {
+    if dir_exists(SNAP_ROOT) == false {
+        println("(no snapshot root)")
+        return 0
+    }
+    // <rm> 디렉토리 목록 (숨김 .gc_log.jsonl 제외)
+    let dirs_raw = _str(exec("ls -1 " + _shq(SNAP_ROOT) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    if dirs_raw.len() == 0 {
+        println("gc: 0 dirs")
+        return 0
+    }
+    let dirs = _str(dirs_raw).split("\n")
+    let mut total_removed: i64 = 0
+    let mut dirs_seen: i64 = 0
+    let ts_now = _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+    let mut i: i64 = 0
+    while i < dirs.len() {
+        let nm = _str(dirs[i]).trim()
+        if nm.len() == 0 || nm.substring(0, 1) == "." {
+            i = i + 1
+            continue
+        }
+        let dpath = SNAP_ROOT + "/" + nm
+        if dir_exists(dpath) == false {
+            i = i + 1
+            continue
+        }
+        dirs_seen = dirs_seen + 1
+        let files = list_snapshot_files(dpath)
+        if files.len() <= keep {
+            i = i + 1
+            continue
+        }
+        let mut k: i64 = keep
+        let mut removed_here: i64 = 0
+        while k < files.len() {
+            let target = _str(files[k])
+            let _ = exec("rm -f " + _shq(target) + " 2>/dev/null")  // @allow-bare-exec
+            removed_here = removed_here + 1
+            k = k + 1
+        }
+        total_removed = total_removed + removed_here
+        // gc 이벤트 append
+        let line = "{\"ts\":\"" + ts_now + "\",\"rm\":\"" + nm + "\",\"removed\":" + to_string(removed_here) + ",\"keep\":" + to_string(keep) + "}\n"
+        try { append_file(GC_LOG, line) } catch e {}
+        i = i + 1
+    }
+    println("gc: " + to_string(dirs_seen) + " dirs, removed=" + to_string(total_removed) + " (keep=" + to_string(keep) + ")")
+    return 0
+}
+
+// ─── selftest ───
+// /tmp/rm_test.json 만들어서 snap → list → diff → restore 전 파이프 검증.
+// shared/roadmaps/*.json 절대 건드리지 않음. tmp dir 사용.
+fn write_tmp_roadmap(path: string, status_p7: string) {
+    let body = "{\n"
+        + "  \"_meta\": {\n"
+        + "    \"id\": \"rm_test\",\n"
+        + "    \"goal\": \"G\",\n"
+        + "    \"start\": \"seed\",\n"
+        + "    \"K_target\": 100,\n"
+        + "    \"C_channel\": 20,\n"
+        + "    \"updated\": \"2026-04-16\",\n"
+        + "    \"description\": \"selftest\"\n"
+        + "  },\n"
+        + "  \"nodes\": [\n"
+        + "    {\"id\":\"seed\",\"type\":\"seed\",\"status\":\"done\",\"deps\":[]},\n"
+        + "    {\"id\":\"P5\",\"type\":\"build\",\"cost\":15,\"status\":\"done\",\"deps\":[\"seed\"]},\n"
+        + "    {\"id\":\"P6\",\"type\":\"build\",\"cost\":16,\"status\":\"done\",\"deps\":[\"seed\"]},\n"
+        + "    {\"id\":\"P7\",\"type\":\"build\",\"cost\":18,\"status\":\"" + status_p7 + "\",\"deps\":[\"seed\"]},\n"
+        + "    {\"id\":\"G\",\"type\":\"goal\",\"cost\":6,\"status\":\"todo\",\"deps\":[\"P5\",\"P6\",\"P7\"]}\n"
+        + "  ]\n"
+        + "}\n"
+    try { write_file(path, body) } catch e {
+        eprintln("FAIL: write tmp roadmap " + path)
+    }
+}
+
+fn st_assert(cond: bool, msg: string) -> i64 {
+    if cond { return 0 }
+    eprintln("ASSERT FAIL: " + msg)
+    return 1
+}
+
+fn cmd_selftest() -> i64 {
+    // 격리: tmp 영역에 mock layout 구축
+    let tmp_root = "/tmp/rm_test_" + to_string(_to_int0(_str(exec("date +%s")).trim()))  // @allow-bare-exec
+    let tmp_roadmaps = tmp_root + "/roadmaps"
+    let tmp_snaps = tmp_root + "/snapshots"
+    ensure_dir(tmp_roadmaps)
+    ensure_dir(tmp_snaps)
+    let rm = "rm_test"
+    let src = tmp_roadmaps + "/" + rm + ".json"
+    let snap_dir = tmp_snaps + "/" + rm
+
+    // 1) initial roadmap (P7=in_progress)
+    write_tmp_roadmap(src, "in_progress")
+    if file_exists(src) == false {
+        eprintln("SELFTEST FAIL: src not written")
+        return 1
+    }
+
+    // ── (a) snap (수동 호출 — cmd_snap 은 SNAP_ROOT 쓰므로 do_snap 직접 사용 회피하고 path 주입)
+    // local helper: snap into tmp_snaps/rm/<ts>.json
+    ensure_dir(snap_dir)
+    let body0 = _str(read_file(src))
+    let ts0 = now_iso_safe()
+    let snap0 = snap_dir + "/" + ts0 + ".json"
+    try { write_file(snap0, body0) } catch e {
+        eprintln("SELFTEST FAIL: snap0 write")
+        return 1
+    }
+    let mut errs: i64 = 0
+    errs = errs + st_assert(file_exists(snap0), "snap0 not exist")
+    let pair0 = parse_node_pairs(body0)
+    errs = errs + st_assert(pair0[0].len() == 5, "node count != 5 (got " + to_string(pair0[0].len()) + ")")
+
+    // ── (b) modify src: P7 done 으로 진행
+    write_tmp_roadmap(src, "done")
+
+    // ── (c) diff: P7 in_progress -> done 1건
+    let cur1 = _str(read_file(src))
+    let p_cur = parse_node_pairs(cur1)
+    let p_snp = parse_node_pairs(body0)
+    let mut changed: i64 = 0
+    let mut p7_old = ""
+    let mut p7_new = ""
+    let mut i: i64 = 0
+    while i < p_snp[0].len() {
+        let sid = _str(p_snp[0][i])
+        let s_old = _str(p_snp[1][i])
+        let ci = idx_in_ids(p_cur[0], sid)
+        if ci >= 0 {
+            let s_new = _str(p_cur[1][ci])
+            if s_old != s_new {
+                changed = changed + 1
+                if sid == "P7" { p7_old = s_old; p7_new = s_new }
+            }
+        }
+        i = i + 1
+    }
+    errs = errs + st_assert(changed == 1, "expected 1 status change, got " + to_string(changed))
+    errs = errs + st_assert(p7_old == "in_progress", "P7 old != in_progress (got " + p7_old + ")")
+    errs = errs + st_assert(p7_new == "done", "P7 new != done (got " + p7_new + ")")
+
+    // ── (d) list: 1개 스냅
+    let files = list_snapshot_files(snap_dir)
+    errs = errs + st_assert(files.len() == 1, "snap count != 1 (got " + to_string(files.len()) + ")")
+
+    // ── (e) restore snap0 → src 복귀
+    let body_snap = _str(read_file(snap0))
+    let tmp_mv = src + ".restore.tmp"
+    try { write_file(tmp_mv, body_snap) } catch e {
+        eprintln("SELFTEST FAIL: write_file tmp")
+        return 1
+    }
+    let mv = _str(exec("mv " + _shq(tmp_mv) + " " + _shq(src) + " 2>&1")).trim()  // @allow-bare-exec
+    errs = errs + st_assert(mv.len() == 0, "mv error: " + mv)
+    let cur2 = _str(read_file(src))
+    let p_cur2 = parse_node_pairs(cur2)
+    let ci_p7 = idx_in_ids(p_cur2[0], "P7")
+    errs = errs + st_assert(ci_p7 >= 0, "P7 missing after restore")
+    if ci_p7 >= 0 {
+        let st_p7 = _str(p_cur2[1][ci_p7])
+        errs = errs + st_assert(st_p7 == "in_progress", "P7 post-restore != in_progress (got " + st_p7 + ")")
+    }
+
+    // ── (f) match_snapshot exact / prefix 검증 (격리 dir 직접 조회)
+    let mut exact_ok = false
+    let bn0 = basename_no_ext(snap0)
+    if bn0 == ts0 { exact_ok = true }
+    errs = errs + st_assert(exact_ok, "basename mismatch ('" + bn0 + "' vs '" + ts0 + "')")
+
+    // cleanup
+    let _ = exec("rm -rf " + _shq(tmp_root) + " 2>/dev/null")  // @allow-bare-exec
+
+    if errs == 0 {
+        println("SELFTEST PASS — snap+list+diff+restore (5 nodes, 6 assertions)")
+        return 0
+    }
+    eprintln("SELFTEST FAIL — " + to_string(errs) + " assertion(s)")
+    return 1
+}
+
+// ─── usage ───
+fn print_usage() {
+    println("usage:")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa snap <rm-name>")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa list <rm-name>")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa restore <rm-name> <ts>")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa diff <rm-name> <ts>")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa gc [--keep=N]")
+    println("  hexa run shared/tool/roadmap_checkpoint.hexa --selftest")
+}
+
+fn parse_keep(rest: [string]) -> i64 {
+    let mut i: i64 = 0
+    while i < rest.len() {
+        let a = _str(rest[i])
+        let pfx = "--keep="
+        if a.len() > pfx.len() {
+            let head = a.substring(0, pfx.len())
+            if head == pfx {
+                let n = pfx.len()
+                let v = a.substring(n, a.len())
+                let kv = _to_int0(v)
+                if kv > 0 { return kv }
+            }
+        }
+        i = i + 1
+    }
+    return 20
+}
+
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    if argv.len() < 3 {
+        print_usage()
+        exit(2)
+    }
+    let cmd = _str(argv[2]).trim()
+
+    if cmd == "--selftest" || cmd == "selftest" {
+        let c = cmd_selftest()
+        exit(c)
+    }
+
+    if cmd == "gc" {
+        let mut rest: [string] = []
+        let mut i = 3
+        while i < argv.len() {
+            rest = rest.push(_str(argv[i]))
+            i = i + 1
+        }
+        let keep = parse_keep(rest)
+        let c = cmd_gc(keep)
+        exit(c)
+    }
+
+    if cmd == "snap" {
+        if argv.len() < 4 { eprintln("usage: snap <rm-name>"); exit(2) }
+        let rm = _str(argv[3]).trim()
+        if rm.len() == 0 { eprintln("REJECT: empty rm-name"); exit(2) }
+        let c = cmd_snap(rm)
+        exit(c)
+    }
+
+    if cmd == "list" {
+        if argv.len() < 4 { eprintln("usage: list <rm-name>"); exit(2) }
+        let rm = _str(argv[3]).trim()
+        if rm.len() == 0 { eprintln("REJECT: empty rm-name"); exit(2) }
+        let c = cmd_list(rm)
+        exit(c)
+    }
+
+    if cmd == "restore" {
+        if argv.len() < 5 { eprintln("usage: restore <rm-name> <ts>"); exit(2) }
+        let rm = _str(argv[3]).trim()
+        let ts = _str(argv[4]).trim()
+        if rm.len() == 0 || ts.len() == 0 { eprintln("REJECT: empty arg"); exit(2) }
+        let c = cmd_restore(rm, ts)
+        exit(c)
+    }
+
+    if cmd == "diff" {
+        if argv.len() < 5 { eprintln("usage: diff <rm-name> <ts>"); exit(2) }
+        let rm = _str(argv[3]).trim()
+        let ts = _str(argv[4]).trim()
+        if rm.len() == 0 || ts.len() == 0 { eprintln("REJECT: empty arg"); exit(2) }
+        let c = cmd_diff(rm, ts)
+        exit(c)
+    }
+
+    eprintln("REJECT: unknown command '" + cmd + "'")
+    print_usage()
+    exit(2)
+}
+
+main()

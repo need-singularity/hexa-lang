@@ -1,0 +1,1423 @@
+// roadmap_edges.hexa — NEXUS-6 roadmap_engine v2 #10 soft/hard edge auto-classifier
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   로드맵 노드의 deps(hard) vs soft_deps 분류는 현재 수동.
+//   실제 실행 로그(roadmap_sync / dispatch / growth_tick)에서 co-occurrence
+//   신호가 약한 edge 는 soft 로 강등 제안, 강한 edge 는 hard 로 승격 제안.
+//   simplified MI(parent,child) 기반:
+//
+//       count(p)        : log line 수 중 parent_id 토큰 언급
+//       count(c)        : log line 수 중 child_id  토큰 언급
+//       count(both)     : 동일 line 에 parent + child 모두 언급
+//       score = count(both) / sqrt(count(p) * count(c))      (cosine-like)
+//
+//   1시간 윈도우 timestamp 파싱은 단순화: 동일 log line 에서의 co-occurrence
+//   로 대체 (P9 timestamp parse 함정 회피, 라인=1이벤트 단위로 가정).
+//   주석으로 명시. count(p)=0 또는 count(c)=0 → "insufficient data".
+//
+// THRESHOLDS
+//   score < min_score (default 0.10) && current=hard && type ∉ critical_whitelist
+//       → 권고: soft
+//   score > max_score (default 0.50) && current=soft
+//       → 권고: hard
+//   critical_whitelist: edge 의 child Node.ntype ∈ {"verify","goal"}
+//       → 항상 hard 유지 (안전 기본). 강등 제안 X.
+//
+// SOURCES
+//   shared/tool/roadmap_sync.jsonl
+//   shared/tool/dispatch_log.jsonl   (있으면)
+//   shared/tool/growth_tick_log.jsonl
+//
+// CLI
+//   hexa roadmap_edges.hexa audit <roadmap-path> [--json] [--min-score=0.10] [--max-score=0.50]
+//   hexa roadmap_edges.hexa apply <roadmap-path> [--min-score=0.10] [--max-score=0.50]
+//   hexa roadmap_edges.hexa dry-run <roadmap-path> [--min-score=0.10] [--max-score=0.50]
+//   hexa roadmap_edges.hexa --selftest
+//
+// SSOT (apply 시)
+//   backup       <roadmap-path>.bak.<unix-ts>
+//   change log   shared/tool/roadmap_edges_log.jsonl   (append)
+//   updated 필드 갱신 (_meta.updated)
+//
+// EXIT
+//   0 success / 1 logical fail / 2 usage / 3 source missing
+//
+// hexa stage1 함정 회피:
+//   #{} 미사용 — parallel list (edge_keys/parent_ids/child_ids/scores/...)
+//   슬라이스 a[x+1..y] — 임시 변수
+//   list[i]=v no-op — slice+concat
+//   if-식 slice 첫글자 — if-stmt 분해
+//   missing key void → _idx_of_s
+//   args() 빈 가드
+//   "".split 첫 void → _str() 감쌈
+//   type_of "str"/"string" 둘 다
+//   last_index_of 없음 → _rfind
+//   xs.push(v) → xs = xs.push(v)
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+fn _nexus_root() -> string {
+    let n = _str(NEXUS_ENV).trim()
+    if n.len() > 0 { return n }
+    return _str(HOME) + "/Dev/nexus"
+}
+let ROOT = _nexus_root()
+let HARNESS = ROOT + "/harness"
+let LOG_SYNC = HARNESS + "/roadmap_sync.jsonl"
+let LOG_DISPATCH = HARNESS + "/dispatch_log.jsonl"
+let LOG_GROWTH = HARNESS + "/growth_tick_log.jsonl"
+let CHANGE_LOG = HARNESS + "/roadmap_edges_log.jsonl"
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn is_alnum_us(c: string) -> bool {
+    // 식별자 토큰 boundary 판정용 (영숫자 + _)
+    if is_digit(c) { return true }
+    if c == "_" { return true }
+    if c.len() != 1 { return false }
+    // ASCII letter
+    let cc = to_int(c) // 단일문자 to_int 는 한국어/특수문자에서 throw 우려 → wrap
+    return false
+}
+
+// 더 안전한 alnum 판정 (catch 안 쓰고 letter set 명시)
+fn _is_letter_or_digit_or_us(c: string) -> bool {
+    if c == "_" { return true }
+    if is_digit(c) { return true }
+    if c == "a" || c == "b" || c == "c" || c == "d" || c == "e" || c == "f"
+        || c == "g" || c == "h" || c == "i" || c == "j" || c == "k" || c == "l"
+        || c == "m" || c == "n" || c == "o" || c == "p" || c == "q" || c == "r"
+        || c == "s" || c == "t" || c == "u" || c == "v" || c == "w" || c == "x"
+        || c == "y" || c == "z" { return true }
+    if c == "A" || c == "B" || c == "C" || c == "D" || c == "E" || c == "F"
+        || c == "G" || c == "H" || c == "I" || c == "J" || c == "K" || c == "L"
+        || c == "M" || c == "N" || c == "O" || c == "P" || c == "Q" || c == "R"
+        || c == "S" || c == "T" || c == "U" || c == "V" || c == "W" || c == "X"
+        || c == "Y" || c == "Z" { return true }
+    return false
+}
+
+// f64 → i64 truncate (to_int invalid-literal trap 회피)
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s.len() == 0 { return 0 }
+    let parts = _str(s).split("\n")
+    if parts.len() == 0 { return 0 }
+    let first = _str(parts[0]).trim()
+    if first.len() == 0 { return 0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    while i < first.len() {
+        let c = first.substring(i, i + 1)
+        if is_digit(c) || c == "-" { clean = clean + c }
+        else { break }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" { return 0 }
+    return to_int(clean)
+}
+
+// safe parse float
+fn _to_f64(s: string) -> f64 {
+    if s.len() == 0 { return 0.0 }
+    let mut clean = ""
+    let mut i: i64 = 0
+    while i < s.len() {
+        let c = s.substring(i, i + 1)
+        if is_num_char(c) { clean = clean + c }
+        else { break }
+        i = i + 1
+    }
+    if clean.len() == 0 || clean == "-" || clean == "." { return 0.0 }
+    return to_float(clean)
+}
+
+// last-index-of single char (hexa stage1 last_index_of missing → _rfind)
+fn _rfind(s: string, ch: string) -> i64 {
+    let mut i: i64 = s.len() - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _idx_of_s(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn _now_unix() -> i64 {
+    return _to_int0(_str(exec("date +%s")).trim())  // @allow-bare-exec
+}
+
+fn _shq(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+// sqrt via Newton (var ≥ 0)
+fn _sqrt(x: f64) -> f64 {
+    if x <= 0.0 { return 0.0 }
+    let mut g = x
+    let mut t: i64 = 0
+    while t < 16 {
+        g = 0.5 * (g + (x / g))
+        t = t + 1
+    }
+    return g
+}
+
+// f64 → string with up to 4 decimal places
+fn fmt_f4(x: f64) -> string {
+    let neg = x < 0.0
+    let v = if neg { 0.0 - x } else { x }
+    let scaled = (v * 10000.0) + 0.5
+    let r = f_to_i(scaled)
+    let whole = r / 10000
+    let frac = r - (whole * 10000)
+    let mut fs = to_string(frac)
+    while fs.len() < 4 { fs = "0" + fs }
+    let mut end = fs.len()
+    while end > 1 && fs.substring(end - 1, end) == "0" { end = end - 1 }
+    let body = if end == 0 { "0" } else { fs.substring(0, end) }
+    let sign = if neg { "-" } else { "" }
+    return sign + to_string(whole) + "." + body
+}
+
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ── JSON field extract (string-search 기반, json_parse 회피) ──────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str(body: string, key: string) -> string {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return "" }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return "" }
+    if body.substring(i, i + 1) != "\"" { return "" }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return "" }
+    return body.substring(start, j)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// nodes[] split (roadmap_engine 패턴)
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node lite (id + type + deps + soft_deps) ─────────────────────────────
+struct ENode {
+    id: string,
+    ntype: string,
+    deps: [string],
+    soft_deps: [string]
+}
+
+fn parse_enode(raw: string) -> ENode {
+    let id = json_str(raw, "id")
+    let mut t = json_str(raw, "type")
+    if t == "" { t = "build" }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    return ENode { id: id, ntype: t, deps: deps, soft_deps: soft }
+}
+
+fn load_enodes(path: string) -> [ENode] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let blocks = split_nodes(body)
+    let mut out: [ENode] = []
+    let mut i: i64 = 0
+    while i < blocks.len() {
+        let n = parse_enode(_str(blocks[i]))
+        if n.id.len() > 0 { out = out.push(n) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── token search: log line 에 id 가 단어 경계로 나타나는지 ─────────────
+// 1) id 가 line 안 어디에든 substring 으로 보이고
+// 2) 양쪽 boundary 가 alnum/_ 가 아님 (word boundary)
+// 단, id 길이 < 2 면 false (잡음 회피).
+fn line_has_token(line: string, tok: string) -> bool {
+    let n = tok.len()
+    if n < 2 { return false }
+    let L = line.len()
+    if n > L { return false }
+    let mut i: i64 = 0
+    while i + n <= L {
+        if line.substring(i, i + n) == tok {
+            let left_ok = if i == 0 {
+                true
+            } else {
+                let lc = line.substring(i - 1, i)
+                _is_letter_or_digit_or_us(lc) == false
+            }
+            let right_ok = if (i + n) >= L {
+                true
+            } else {
+                let rc = line.substring(i + n, i + n + 1)
+                _is_letter_or_digit_or_us(rc) == false
+            }
+            if left_ok && right_ok { return true }
+        }
+        i = i + 1
+    }
+    return false
+}
+
+// ── load all log lines from configured sources ───────────────────────────
+// 한 line = 한 event. timestamp window 는 단순화 (1라인 = 1윈도우 기본).
+fn _read_lines(path: string) -> [string] {
+    if file_exists(path) == false { return [] }
+    let body = _str(read_file(path))
+    if body.len() == 0 { return [] }
+    let parts = _str(body).split("\n")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < parts.len() {
+        let s = _str(parts[i])
+        if s.len() > 0 { out = out.push(s) }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_event_lines() -> [string] {
+    let mut out: [string] = []
+    let s1 = _read_lines(LOG_SYNC)
+    let mut i: i64 = 0
+    while i < s1.len() { out = out.push(_str(s1[i])); i = i + 1 }
+    let s2 = _read_lines(LOG_DISPATCH)
+    let mut j: i64 = 0
+    while j < s2.len() { out = out.push(_str(s2[j])); j = j + 1 }
+    let s3 = _read_lines(LOG_GROWTH)
+    let mut k: i64 = 0
+    while k < s3.len() { out = out.push(_str(s3[k])); k = k + 1 }
+    return out
+}
+
+// ── per-id mention count + (parent,child) co-mention count ───────────────
+//   parallel lists:
+//     ids[i]            : node id
+//     counts[i]         : line 수 (mention >=1)
+//     edge_keys[e]      : "p→c"
+//     edge_parents[e]   : p
+//     edge_children[e]  : c
+//     edge_co[e]        : co-mention 카운트
+struct EdgeStats {
+    ids: [string],
+    counts: [i64],
+    edge_keys: [string],
+    edge_parents: [string],
+    edge_children: [string],
+    edge_co: [i64]
+}
+
+fn build_edge_stats(nodes: [ENode], lines: [string]) -> EdgeStats {
+    // ids list (모든 노드 id 수집)
+    let mut ids: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        ids = ids.push(nodes[i].id)
+        i = i + 1
+    }
+    // edge keys (hard deps + soft deps 모두)
+    let mut ek: [string] = []
+    let mut ep: [string] = []
+    let mut ec: [string] = []
+    let mut e_idx: i64 = 0
+    while e_idx < nodes.len() {
+        let n = nodes[e_idx]
+        // hard
+        let mut d: i64 = 0
+        while d < n.deps.len() {
+            let p = _str(n.deps[d])
+            let key = p + "→" + n.id
+            if _idx_of_s(ek, key) < 0 {
+                ek = ek.push(key)
+                ep = ep.push(p)
+                ec = ec.push(n.id)
+            }
+            d = d + 1
+        }
+        // soft
+        let mut s: i64 = 0
+        while s < n.soft_deps.len() {
+            let p = _str(n.soft_deps[s])
+            let key = p + "→" + n.id
+            if _idx_of_s(ek, key) < 0 {
+                ek = ek.push(key)
+                ep = ep.push(p)
+                ec = ec.push(n.id)
+            }
+            s = s + 1
+        }
+        e_idx = e_idx + 1
+    }
+    // counts per id (line 수)
+    let mut counts: [i64] = []
+    let mut ii: i64 = 0
+    while ii < ids.len() { counts = counts.push(0); ii = ii + 1 }
+    // co per edge
+    let mut co: [i64] = []
+    let mut ej: i64 = 0
+    while ej < ek.len() { co = co.push(0); ej = ej + 1 }
+
+    // 한 라인씩 스캔 → mention vec 생성 → counts/co 갱신
+    let mut li: i64 = 0
+    while li < lines.len() {
+        let line = _str(lines[li])
+        // 라인당 mention 셋
+        let mut hit: [bool] = []
+        let mut m: i64 = 0
+        while m < ids.len() {
+            let tok = _str(ids[m])
+            let h = line_has_token(line, tok)
+            hit = hit.push(h)
+            m = m + 1
+        }
+        // counts 업데이트 (slice+concat 패턴; list[i]=v no-op 회피)
+        let mut new_counts: [i64] = []
+        let mut nc: i64 = 0
+        while nc < counts.len() {
+            let cur = counts[nc]
+            let add = if nc < hit.len() && hit[nc] { 1 } else { 0 }
+            new_counts = new_counts.push(cur + add)
+            nc = nc + 1
+        }
+        counts = new_counts
+        // co 업데이트
+        let mut new_co: [i64] = []
+        let mut ce: i64 = 0
+        while ce < co.len() {
+            let pi = _idx_of_s(ids, _str(ep[ce]))
+            let ci = _idx_of_s(ids, _str(ec[ce]))
+            let mut bump = 0
+            if pi >= 0 && ci >= 0 && pi < hit.len() && ci < hit.len() {
+                if hit[pi] && hit[ci] { bump = 1 }
+            }
+            new_co = new_co.push(co[ce] + bump)
+            ce = ce + 1
+        }
+        co = new_co
+        li = li + 1
+    }
+    return EdgeStats {
+        ids: ids, counts: counts,
+        edge_keys: ek, edge_parents: ep, edge_children: ec, edge_co: co
+    }
+}
+
+// ── score 계산 (cosine-like) ─────────────────────────────────────────────
+// 반환 [-1.0] = insufficient data (count(p)=0 or count(c)=0)
+fn edge_score(stats: EdgeStats, e_idx: i64) -> f64 {
+    let pi = _idx_of_s(stats.ids, _str(stats.edge_parents[e_idx]))
+    let ci = _idx_of_s(stats.ids, _str(stats.edge_children[e_idx]))
+    if pi < 0 || ci < 0 { return -1.0 }
+    let cp = stats.counts[pi]
+    let cc = stats.counts[ci]
+    if cp == 0 || cc == 0 { return -1.0 }
+    let co = stats.edge_co[e_idx]
+    let denom = _sqrt(to_float(to_string(cp)) * to_float(to_string(cc)))
+    if denom <= 0.0 { return -1.0 }
+    return to_float(to_string(co)) / denom
+}
+
+// ── edge 현재 분류 (hard|soft) ───────────────────────────────────────────
+fn current_class(nodes: [ENode], parent: string, child: string) -> string {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == child {
+            if _idx_of_s(nodes[i].deps, parent) >= 0 { return "hard" }
+            if _idx_of_s(nodes[i].soft_deps, parent) >= 0 { return "soft" }
+            return "unknown"
+        }
+        i = i + 1
+    }
+    return "unknown"
+}
+
+// ── child node ntype lookup (whitelist 판정) ─────────────────────────────
+fn child_ntype(nodes: [ENode], child: string) -> string {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == child { return nodes[i].ntype }
+        i = i + 1
+    }
+    return ""
+}
+
+fn is_critical(nodes: [ENode], child: string) -> bool {
+    let t = child_ntype(nodes, child)
+    return t == "verify" || t == "goal"
+}
+
+// ── Audit result struct (parallel lists) ─────────────────────────────────
+struct AuditOut {
+    edge_keys: [string],
+    parents: [string],
+    children: [string],
+    scores: [f64],     // -1 = insufficient
+    cur_class: [string],
+    recommend: [string], // "soft" | "hard" | "keep"
+    notes: [string]
+}
+
+fn run_audit(roadmap_path: string, min_score: f64, max_score: f64) -> AuditOut {
+    let nodes = load_enodes(roadmap_path)
+    let lines = load_event_lines()
+    let stats = build_edge_stats(nodes, lines)
+    let mut out_keys: [string] = []
+    let mut out_par: [string] = []
+    let mut out_chi: [string] = []
+    let mut out_sc: [f64] = []
+    let mut out_cc: [string] = []
+    let mut out_rec: [string] = []
+    let mut out_note: [string] = []
+    let mut e: i64 = 0
+    while e < stats.edge_keys.len() {
+        let key = _str(stats.edge_keys[e])
+        let p = _str(stats.edge_parents[e])
+        let c = _str(stats.edge_children[e])
+        let sc = edge_score(stats, e)
+        let cur = current_class(nodes, p, c)
+        let mut rec = "keep"
+        let mut note = ""
+        if sc < 0.0 {
+            note = "insufficient data (count(p)=" + to_string(stats.counts[_idx_of_s(stats.ids, p)])
+                + " count(c)=" + to_string(stats.counts[_idx_of_s(stats.ids, c)]) + ")"
+        }
+        else {
+            if cur == "hard" && sc < min_score && is_critical(nodes, c) == false {
+                rec = "soft"
+            }
+            else if cur == "soft" && sc > max_score {
+                rec = "hard"
+            }
+            if is_critical(nodes, c) && cur == "hard" {
+                note = "critical_whitelist (child ntype=" + child_ntype(nodes, c) + ")"
+            }
+        }
+        out_keys = out_keys.push(key)
+        out_par = out_par.push(p)
+        out_chi = out_chi.push(c)
+        out_sc = out_sc.push(sc)
+        out_cc = out_cc.push(cur)
+        out_rec = out_rec.push(rec)
+        out_note = out_note.push(note)
+        e = e + 1
+    }
+    return AuditOut {
+        edge_keys: out_keys, parents: out_par, children: out_chi,
+        scores: out_sc, cur_class: out_cc, recommend: out_rec, notes: out_note
+    }
+}
+
+// ── pretty-print summary ─────────────────────────────────────────────────
+fn _summarize(au: AuditOut) -> [i64] {
+    // returns [total, hard, soft, suggest_soften, suggest_harden, insufficient]
+    let mut total: i64 = au.edge_keys.len()
+    let mut hard: i64 = 0
+    let mut soft: i64 = 0
+    let mut soften: i64 = 0
+    let mut harden: i64 = 0
+    let mut insuf: i64 = 0
+    let mut i: i64 = 0
+    while i < total {
+        let cur = _str(au.cur_class[i])
+        if cur == "hard" { hard = hard + 1 }
+        else if cur == "soft" { soft = soft + 1 }
+        let rec = _str(au.recommend[i])
+        if rec == "soft" { soften = soften + 1 }
+        else if rec == "hard" { harden = harden + 1 }
+        if au.scores[i] < 0.0 { insuf = insuf + 1 }
+        i = i + 1
+    }
+    return [total, hard, soft, soften, harden, insuf]
+}
+
+fn print_audit_human(au: AuditOut) {
+    let mut i: i64 = 0
+    while i < au.edge_keys.len() {
+        let key = _str(au.edge_keys[i])
+        let cur = _str(au.cur_class[i])
+        let rec = _str(au.recommend[i])
+        let sc = au.scores[i]
+        let sc_s = if sc < 0.0 { "n/a" } else { fmt_f4(sc) }
+        let prefix = "edge: " + key
+        let mut tail = "  score=" + sc_s + "  cur=" + cur
+        if rec == "keep" || rec == cur {
+            tail = tail + "  recommend: keep"
+        } else {
+            tail = tail + "  recommend: " + rec + " (now " + cur + ")"
+        }
+        let nt = _str(au.notes[i])
+        if nt.len() > 0 { tail = tail + "  [" + nt + "]" }
+        println(prefix + tail)
+        i = i + 1
+    }
+    let s = _summarize(au)
+    println("---")
+    println("total edges: " + to_string(s[0])
+        + "  hard=" + to_string(s[1])
+        + "  soft=" + to_string(s[2])
+        + "  suggest_soften=" + to_string(s[3])
+        + "  suggest_harden=" + to_string(s[4])
+        + "  insufficient_data=" + to_string(s[5]))
+}
+
+fn print_audit_jsonl(au: AuditOut) {
+    let mut i: i64 = 0
+    while i < au.edge_keys.len() {
+        let key = _str(au.edge_keys[i])
+        let p = _str(au.parents[i])
+        let c = _str(au.children[i])
+        let sc = au.scores[i]
+        let sc_s = if sc < 0.0 { "null" } else { fmt_f4(sc) }
+        let cur = _str(au.cur_class[i])
+        let rec = _str(au.recommend[i])
+        let nt = _str(au.notes[i])
+        let line = "{\"edge\":\"" + escape_json(key) + "\","
+            + "\"parent\":\"" + escape_json(p) + "\","
+            + "\"child\":\"" + escape_json(c) + "\","
+            + "\"score\":" + sc_s + ","
+            + "\"current\":\"" + cur + "\","
+            + "\"recommend\":\"" + rec + "\","
+            + "\"note\":\"" + escape_json(nt) + "\"}"
+        println(line)
+        i = i + 1
+    }
+    let s = _summarize(au)
+    let summary = "{\"summary\":true,"
+        + "\"total\":" + to_string(s[0])
+        + ",\"hard\":" + to_string(s[1])
+        + ",\"soft\":" + to_string(s[2])
+        + ",\"suggest_soften\":" + to_string(s[3])
+        + ",\"suggest_harden\":" + to_string(s[4])
+        + ",\"insufficient_data\":" + to_string(s[5]) + "}"
+    println(summary)
+}
+
+// ── apply: 실제 JSON 수정 (deps↔soft_deps 교차 이동) ─────────────────────
+// 노드 단위 교체: 한 child 의 deps/soft_deps 를 새 list 로 대체.
+// 단순 텍스트 패치는 깨지기 쉬워, 노드 raw 를 정규화 다시 emit (정규 schema).
+//
+// 알고리즘:
+//   1) load body (raw text)
+//   2) parse all node blocks via split_nodes
+//   3) per child, 새 hard/soft 리스트 계산
+//   4) 노드 raw 를 그대로 두되, "deps":[..], "soft_deps":[..] 부분만 교체
+//      (없으면 node block 끝쪽에 삽입)
+//   5) _meta.updated 갱신
+//
+// JSON 안전: 변경할 array 는 항상 inline 한 줄 (newline 없음) 로 교체 → 줄바꿈
+// 손상 회피.
+fn _replace_or_insert_array(node_raw: string, key: string, items: [string]) -> string {
+    let mut arr_body = "["
+    let mut i: i64 = 0
+    while i < items.len() {
+        if i > 0 { arr_body = arr_body + ", " }
+        arr_body = arr_body + "\"" + escape_json(_str(items[i])) + "\""
+        i = i + 1
+    }
+    arr_body = arr_body + "]"
+    let key_q = "\"" + key + "\""
+    let ki = _find_after(node_raw, key_q, 0)
+    if ki < 0 {
+        // insert before final '}'
+        let last_brace = _rfind(node_raw, "}")
+        if last_brace < 0 { return node_raw }
+        let head = node_raw.substring(0, last_brace)
+        let tail = node_raw.substring(last_brace, node_raw.len())
+        // trailing whitespace trim
+        let mut h = head
+        while h.len() > 0 {
+            let lc = h.substring(h.len() - 1, h.len())
+            if lc == " " || lc == "\n" || lc == "\r" || lc == "\t" { h = h.substring(0, h.len() - 1) }
+            else { break }
+        }
+        let need_comma = if h.len() == 0 { false } else {
+            let lc2 = h.substring(h.len() - 1, h.len())
+            lc2 != "{" && lc2 != ","
+        }
+        let sep = if need_comma { "," } else { "" }
+        return h + sep + "\n      " + key_q + ": " + arr_body + "\n    " + tail
+    }
+    // 기존 위치: ':' 다음 '[' 부터 매칭되는 ']' 까지 교체
+    let mut i2 = ki + key_q.len()
+    while i2 < node_raw.len() {
+        let c = node_raw.substring(i2, i2 + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i2 = i2 + 1 }
+        else { break }
+    }
+    if i2 >= node_raw.len() || node_raw.substring(i2, i2 + 1) != "[" {
+        return node_raw
+    }
+    let arr_start = i2
+    let mut depth: i64 = 1
+    let mut j = i2 + 1
+    let mut in_str: bool = false
+    while j < node_raw.len() && depth > 0 {
+        let c = node_raw.substring(j, j + 1)
+        if in_str {
+            if c == "\\" { j = j + 2; continue }
+            if c == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if c == "\"" { in_str = true; j = j + 1; continue }
+        if c == "[" { depth = depth + 1 }
+        else if c == "]" { depth = depth - 1 }
+        j = j + 1
+    }
+    if depth != 0 { return node_raw }
+    let arr_end = j  // exclusive of last ']'  (j is position right after ']')
+    let head = node_raw.substring(0, arr_start)
+    let tail = node_raw.substring(arr_end, node_raw.len())
+    return head + arr_body + tail
+}
+
+// id 추출 후 raw block 교체
+fn _replace_node_block(body: string, old_block: string, new_block: string) -> string {
+    let pos = _find_after(body, old_block, 0)
+    if pos < 0 { return body }
+    let head = body.substring(0, pos)
+    let tail_start = pos + old_block.len()
+    let tail = body.substring(tail_start, body.len())
+    return head + new_block + tail
+}
+
+// _meta.updated 갱신
+fn _update_meta_updated(body: string, new_ts: string) -> string {
+    let key = "\"updated\""
+    let ki = _find_after(body, key, 0)
+    if ki < 0 { return body }
+    let mut i = ki + key.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "\"" { return body }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return body }
+    let head = body.substring(0, start)
+    let tail = body.substring(j, body.len())
+    return head + new_ts + tail
+}
+
+// dry-run/apply 공통: 변경 plan 계산
+struct ChangePlan {
+    child_ids: [string],
+    new_hard_keys: [string],   // "child:::p1,p2,..."
+    new_soft_keys: [string],
+    moves: [string]            // "edge p→c hard→soft" 등 사람가독 라벨
+}
+
+fn compute_plan(au: AuditOut, nodes: [ENode]) -> ChangePlan {
+    // 변경이 발생한 child 만 새 deps/soft_deps 를 emit
+    let mut changed_children: [string] = []
+    let mut moves: [string] = []
+    let mut i: i64 = 0
+    while i < au.edge_keys.len() {
+        let cur = _str(au.cur_class[i])
+        let rec = _str(au.recommend[i])
+        if rec != "keep" && rec != cur {
+            let c = _str(au.children[i])
+            if _idx_of_s(changed_children, c) < 0 {
+                changed_children = changed_children.push(c)
+            }
+            moves = moves.push(_str(au.edge_keys[i]) + "  " + cur + "→" + rec
+                + "  score=" + (if au.scores[i] < 0.0 { "n/a" } else { fmt_f4(au.scores[i]) }))
+        }
+        i = i + 1
+    }
+    // 각 changed child 에 대해 new hard/soft 생성
+    let mut new_hard: [string] = []
+    let mut new_soft: [string] = []
+    let mut k: i64 = 0
+    while k < changed_children.len() {
+        let cid = _str(changed_children[k])
+        // 기존 노드 deps/soft_deps 를 base 로
+        let mut base_hard: [string] = []
+        let mut base_soft: [string] = []
+        let mut nx: i64 = 0
+        while nx < nodes.len() {
+            if nodes[nx].id == cid {
+                let mut a: i64 = 0
+                while a < nodes[nx].deps.len() {
+                    base_hard = base_hard.push(_str(nodes[nx].deps[a]))
+                    a = a + 1
+                }
+                let mut b: i64 = 0
+                while b < nodes[nx].soft_deps.len() {
+                    base_soft = base_soft.push(_str(nodes[nx].soft_deps[b]))
+                    b = b + 1
+                }
+                break
+            }
+            nx = nx + 1
+        }
+        // 권고 적용
+        let mut a2: i64 = 0
+        while a2 < au.edge_keys.len() {
+            let c2 = _str(au.children[a2])
+            if c2 == cid {
+                let p = _str(au.parents[a2])
+                let cur = _str(au.cur_class[a2])
+                let rec = _str(au.recommend[a2])
+                if rec != "keep" && rec != cur {
+                    if rec == "soft" {
+                        // remove from base_hard, add to base_soft
+                        let pi = _idx_of_s(base_hard, p)
+                        if pi >= 0 {
+                            let mut nh: [string] = []
+                            let mut bi: i64 = 0
+                            while bi < base_hard.len() {
+                                if bi != pi { nh = nh.push(_str(base_hard[bi])) }
+                                bi = bi + 1
+                            }
+                            base_hard = nh
+                        }
+                        if _idx_of_s(base_soft, p) < 0 {
+                            base_soft = base_soft.push(p)
+                        }
+                    }
+                    else if rec == "hard" {
+                        let pi = _idx_of_s(base_soft, p)
+                        if pi >= 0 {
+                            let mut ns: [string] = []
+                            let mut bj: i64 = 0
+                            while bj < base_soft.len() {
+                                if bj != pi { ns = ns.push(_str(base_soft[bj])) }
+                                bj = bj + 1
+                            }
+                            base_soft = ns
+                        }
+                        if _idx_of_s(base_hard, p) < 0 {
+                            base_hard = base_hard.push(p)
+                        }
+                    }
+                }
+            }
+            a2 = a2 + 1
+        }
+        // serialize as comma list
+        let mut hs = ""
+        let mut hi: i64 = 0
+        while hi < base_hard.len() {
+            if hi > 0 { hs = hs + "," }
+            hs = hs + _str(base_hard[hi])
+            hi = hi + 1
+        }
+        let mut ss = ""
+        let mut si: i64 = 0
+        while si < base_soft.len() {
+            if si > 0 { ss = ss + "," }
+            ss = ss + _str(base_soft[si])
+            si = si + 1
+        }
+        new_hard = new_hard.push(cid + ":::" + hs)
+        new_soft = new_soft.push(cid + ":::" + ss)
+        k = k + 1
+    }
+    return ChangePlan {
+        child_ids: changed_children,
+        new_hard_keys: new_hard,
+        new_soft_keys: new_soft,
+        moves: moves
+    }
+}
+
+fn _split_csv(s: string) -> [string] {
+    let mut out: [string] = []
+    if s.len() == 0 { return out }
+    let parts = _str(s).split(",")
+    let mut i: i64 = 0
+    while i < parts.len() {
+        let v = _str(parts[i]).trim()
+        if v.len() > 0 { out = out.push(v) }
+        i = i + 1
+    }
+    return out
+}
+
+fn _payload_after(prefix: string, k: string) -> string {
+    // k = "cid:::hs"
+    let pos = k.index_of(":::")
+    if pos < 0 { return "" }
+    let n = pos + 3
+    return k.substring(n, k.len())
+}
+
+fn _key_before(k: string) -> string {
+    let pos = k.index_of(":::")
+    if pos < 0 { return k }
+    return k.substring(0, pos)
+}
+
+// dry-run/apply 핵심: body 패치 수행 → new body 반환
+fn patch_body(roadmap_path: string, plan: ChangePlan) -> string {
+    let body = _str(read_file(roadmap_path))
+    if body.len() == 0 { return "" }
+    let blocks = split_nodes(body)
+    let mut new_body = body
+    // 각 changed child 의 raw block 찾기 → 두 array 교체 → new_body 패치
+    let mut k: i64 = 0
+    while k < plan.child_ids.len() {
+        let cid = _str(plan.child_ids[k])
+        // 기존 block 찾기 (id match)
+        let mut bi: i64 = 0
+        let mut old_block = ""
+        while bi < blocks.len() {
+            let raw = _str(blocks[bi])
+            if json_str(raw, "id") == cid { old_block = raw; break }
+            bi = bi + 1
+        }
+        if old_block.len() == 0 { k = k + 1; continue }
+        // new hard/soft list
+        let hard_csv = _payload_after("hard", _str(plan.new_hard_keys[k]))
+        let soft_csv = _payload_after("soft", _str(plan.new_soft_keys[k]))
+        let hard_list = _split_csv(hard_csv)
+        let soft_list = _split_csv(soft_csv)
+        let mut new_block = old_block
+        new_block = _replace_or_insert_array(new_block, "deps", hard_list)
+        // soft_deps 는 빈 list 면 굳이 추가 안 함 (단, 기존에 있었으면 빈 list 로 교체)
+        let had_soft = _find_after(old_block, "\"soft_deps\"", 0) >= 0
+        if soft_list.len() > 0 || had_soft {
+            new_block = _replace_or_insert_array(new_block, "soft_deps", soft_list)
+        }
+        // 본 body 에서 old → new 교체
+        new_body = _replace_node_block(new_body, old_block, new_block)
+        k = k + 1
+    }
+    // updated 갱신
+    let new_ts = _ts_iso()
+    new_body = _update_meta_updated(new_body, new_ts)
+    return new_body
+}
+
+fn write_change_log(roadmap_path: string, plan: ChangePlan, applied: bool, backup_path: string) {
+    if plan.moves.len() == 0 { return }
+    let _ = exec("mkdir -p " + _shq(HARNESS) + " 2>/dev/null")  // @allow-bare-exec
+    let mut moves_arr = "["
+    let mut i: i64 = 0
+    while i < plan.moves.len() {
+        if i > 0 { moves_arr = moves_arr + "," }
+        moves_arr = moves_arr + "\"" + escape_json(_str(plan.moves[i])) + "\""
+        i = i + 1
+    }
+    moves_arr = moves_arr + "]"
+    let line = "{\"ts\":\"" + _ts_iso() + "\","
+        + "\"rule\":\"R-EDGE-AUDIT\","
+        + "\"roadmap\":\"" + escape_json(roadmap_path) + "\","
+        + "\"applied\":" + (if applied { "true" } else { "false" }) + ","
+        + "\"backup\":\"" + escape_json(backup_path) + "\","
+        + "\"changes\":" + to_string(plan.moves.len()) + ","
+        + "\"moves\":" + moves_arr + "}\n"
+    // append
+    let prev = if file_exists(CHANGE_LOG) { _str(read_file(CHANGE_LOG)) } else { "" }
+    try { write_file(CHANGE_LOG, prev + line) } catch e {
+        eprintln("WARN: write_change_log failed: " + CHANGE_LOG)
+    }
+}
+
+// ── commands ─────────────────────────────────────────────────────────────
+fn cmd_audit(roadmap_path: string, as_json: bool, min_score: f64, max_score: f64) -> i64 {
+    if file_exists(roadmap_path) == false {
+        eprintln("REJECT: roadmap not found: " + roadmap_path)
+        return 3
+    }
+    let au = run_audit(roadmap_path, min_score, max_score)
+    if as_json { print_audit_jsonl(au) } else { print_audit_human(au) }
+    return 0
+}
+
+fn cmd_dry_run(roadmap_path: string, min_score: f64, max_score: f64) -> i64 {
+    if file_exists(roadmap_path) == false {
+        eprintln("REJECT: roadmap not found: " + roadmap_path)
+        return 3
+    }
+    let au = run_audit(roadmap_path, min_score, max_score)
+    let nodes = load_enodes(roadmap_path)
+    let plan = compute_plan(au, nodes)
+    if plan.moves.len() == 0 {
+        println("[dry-run] no changes (all edges within thresholds or insufficient data)")
+        return 0
+    }
+    println("[dry-run] " + to_string(plan.moves.len()) + " edge(s) would change:")
+    let mut i: i64 = 0
+    while i < plan.moves.len() {
+        println("  " + _str(plan.moves[i]))
+        i = i + 1
+    }
+    let new_body = patch_body(roadmap_path, plan)
+    if new_body.len() == 0 {
+        eprintln("REJECT: patch produced empty body")
+        return 1
+    }
+    println("[dry-run] new body size: " + to_string(new_body.len()) + " bytes (file unchanged)")
+    return 0
+}
+
+fn cmd_apply(roadmap_path: string, min_score: f64, max_score: f64) -> i64 {
+    if file_exists(roadmap_path) == false {
+        eprintln("REJECT: roadmap not found: " + roadmap_path)
+        return 3
+    }
+    let au = run_audit(roadmap_path, min_score, max_score)
+    let nodes = load_enodes(roadmap_path)
+    let plan = compute_plan(au, nodes)
+    if plan.moves.len() == 0 {
+        println("[apply] no changes (all edges within thresholds or insufficient data)")
+        return 0
+    }
+    let new_body = patch_body(roadmap_path, plan)
+    if new_body.len() == 0 {
+        eprintln("REJECT: patch produced empty body")
+        return 1
+    }
+    let ts = to_string(_now_unix())
+    let bak = roadmap_path + ".bak." + ts
+    let orig = _str(read_file(roadmap_path))
+    try { write_file(bak, orig) } catch e1 {
+        eprintln("REJECT: backup write failed: " + bak)
+        return 1
+    }
+    try { write_file(roadmap_path, new_body) } catch e2 {
+        eprintln("REJECT: write failed: " + roadmap_path)
+        return 1
+    }
+    write_change_log(roadmap_path, plan, true, bak)
+    println("[apply] OK " + to_string(plan.moves.len()) + " edge(s) updated")
+    println("  backup: " + bak)
+    println("  log:    " + CHANGE_LOG)
+    let mut i: i64 = 0
+    while i < plan.moves.len() {
+        println("  " + _str(plan.moves[i]))
+        i = i + 1
+    }
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn approx_eq(a: f64, b: f64, tol: f64) -> bool {
+    let d = a - b
+    let abs_d = if d < 0.0 { 0.0 - d } else { d }
+    return abs_d <= tol
+}
+
+fn selftest() -> i64 {
+    println("[selftest] roadmap_edges.hexa")
+
+    // --- 1) line_has_token boundary check ---
+    if line_has_token("hello world", "world") == false {
+        eprintln("[selftest] FAIL: line_has_token plain"); return 1
+    }
+    if line_has_token("foo_bar baz", "foo") == true {
+        eprintln("[selftest] FAIL: line_has_token boundary (foo inside foo_bar)"); return 1
+    }
+    if line_has_token("seed→diagnose", "seed") == false {
+        eprintln("[selftest] FAIL: line_has_token arrow neighbor"); return 1
+    }
+    println("[selftest]   line_has_token boundary — OK")
+
+    // --- 2) sample roadmap + sample log ---
+    let tmp_root = "/tmp/roadmap_edges_st_" + to_string(_now_unix())
+    let _ = exec("mkdir -p " + _shq(tmp_root) + " 2>/dev/null")  // @allow-bare-exec
+    let rm_path = tmp_root + "/sample.json"
+    let log_path = tmp_root + "/events.jsonl"
+    let sample_rm = "{\n  \"_meta\": {\"id\":\"st\", \"goal\":\"G\", \"start\":\"A\","
+        + " \"K_target\":1.0, \"C_channel\":1.0, \"updated\":\"2026-04-16\"},\n"
+        + "  \"nodes\": [\n"
+        + "    {\"id\":\"A\",\"type\":\"seed\",\"cost\":0,\"deps\":[]},\n"
+        + "    {\"id\":\"BB\",\"type\":\"build\",\"cost\":1,\"deps\":[\"A\"]},\n"
+        + "    {\"id\":\"CC\",\"type\":\"build\",\"cost\":1,\"deps\":[\"A\",\"BB\"]},\n"
+        + "    {\"id\":\"VV\",\"type\":\"verify\",\"cost\":1,\"deps\":[\"CC\"]},\n"
+        + "    {\"id\":\"GG\",\"type\":\"goal\",\"cost\":0,\"deps\":[\"VV\"],\"soft_deps\":[\"BB\"]}\n"
+        + "  ]\n}\n"
+    try { write_file(rm_path, sample_rm) } catch e1 {
+        eprintln("[selftest] FAIL: cannot write sample roadmap"); return 1
+    }
+    // build log: BB+CC 자주 같이 나옴 (high score), A 와 BB 는 안 같이, GG/BB co-mention 매우 적음
+    // CC 와 VV 같이 자주 → soft (만약 있었다면) hard 로 승격 추천이지만 hard 라 keep
+    // BB → CC (hard) 강한 신호 (keep)
+    // A → BB (hard) 약함 → 하지만 BB ntype=build ≠ verify/goal 이라 soften 추천 가능
+    // BB → GG (soft) co 적음 → keep (또는 insufficient)
+    let log_body = "{\"node\":\"BB\",\"detail\":\"touched CC also\"}\n"
+        + "{\"node\":\"BB\",\"detail\":\"with CC step\"}\n"
+        + "{\"node\":\"BB\",\"detail\":\"alone\"}\n"
+        + "{\"node\":\"CC\",\"detail\":\"only CC\"}\n"
+        + "{\"node\":\"CC\",\"detail\":\"BB and CC fired\"}\n"
+        + "{\"node\":\"BB\",\"detail\":\"BB CC pair\"}\n"
+        + "{\"node\":\"VV\",\"detail\":\"CC verify VV done\"}\n"
+        + "{\"node\":\"VV\",\"detail\":\"VV alone\"}\n"
+        + "{\"node\":\"A\",\"detail\":\"A bootstrap event\"}\n"
+        + "{\"node\":\"GG\",\"detail\":\"GG complete\"}\n"
+    try { write_file(log_path, log_body) } catch e2 {
+        eprintln("[selftest] FAIL: cannot write sample log"); return 1
+    }
+
+    // 임시 LOG_SYNC override: read_file 직접 호출 대신 source path swap 은
+    // 불가하므로, 본 selftest 는 build_edge_stats 를 직접 호출.
+    let nodes = load_enodes(rm_path)
+    if nodes.len() != 5 {
+        eprintln("[selftest] FAIL: parsed nodes != 5 (got " + to_string(nodes.len()) + ")")
+        return 1
+    }
+    let lines = _read_lines(log_path)
+    if lines.len() != 10 {
+        eprintln("[selftest] FAIL: read lines != 10 (got " + to_string(lines.len()) + ")")
+        return 1
+    }
+    let stats = build_edge_stats(nodes, lines)
+    // edge BB→CC co-mention 기대 ≥ 3 (라인에 BB,CC 둘 다 있음)
+    let bbcc = _idx_of_s(stats.edge_keys, "BB→CC")
+    if bbcc < 0 {
+        eprintln("[selftest] FAIL: edge BB→CC missing")
+        return 1
+    }
+    if stats.edge_co[bbcc] < 3 {
+        eprintln("[selftest] FAIL: BB→CC co expected >=3 got " + to_string(stats.edge_co[bbcc]))
+        return 1
+    }
+    println("[selftest]   BB→CC co=" + to_string(stats.edge_co[bbcc])
+        + " count(BB)=" + to_string(stats.counts[_idx_of_s(stats.ids, "BB")])
+        + " count(CC)=" + to_string(stats.counts[_idx_of_s(stats.ids, "CC")]))
+    // edge A→BB count(A)=1, count(BB)=4, co=0 → score=0
+    let abb = _idx_of_s(stats.edge_keys, "A→BB")
+    if abb < 0 { eprintln("[selftest] FAIL: edge A→BB missing"); return 1 }
+    if stats.edge_co[abb] != 0 {
+        eprintln("[selftest] FAIL: A→BB co expected 0 got " + to_string(stats.edge_co[abb]))
+        return 1
+    }
+    println("[selftest]   A→BB co=0 (expected) — OK")
+
+    // --- 3) AuditOut on patched stats ---
+    // run_audit 는 LOG_SYNC 등 globals 를 읽으니 직접 stats 로 fake 어디라우트 불가.
+    // 대신 BB→CC score 를 직접 계산:
+    let sc = edge_score(stats, bbcc)
+    if sc <= 0.0 {
+        eprintln("[selftest] FAIL: BB→CC score <= 0 (" + fmt_f4(sc) + ")")
+        return 1
+    }
+    println("[selftest]   edge_score BB→CC = " + fmt_f4(sc))
+
+    // --- 4) JSON patching: A→BB 강제 soften → patch ---
+    // 합성 audit 결과 만들어 plan 계산
+    let mut au = AuditOut {
+        edge_keys: ["A→BB", "BB→CC", "A→CC", "BB→CC", "CC→VV", "VV→GG", "BB→GG"],
+        parents: ["A", "BB", "A", "BB", "CC", "VV", "BB"],
+        children: ["BB", "CC", "CC", "CC", "VV", "GG", "GG"],
+        scores: [0.05, 0.65, 0.0, 0.65, 0.30, 0.20, 0.10],
+        cur_class: ["hard", "hard", "hard", "hard", "hard", "hard", "soft"],
+        recommend: ["soft", "keep", "keep", "keep", "keep", "keep", "keep"],
+        notes: ["", "", "", "", "", "", ""]
+    }
+    let plan = compute_plan(au, nodes)
+    if plan.moves.len() == 0 {
+        eprintln("[selftest] FAIL: plan moves expected >=1 got 0")
+        return 1
+    }
+    if _idx_of_s(plan.child_ids, "BB") < 0 {
+        eprintln("[selftest] FAIL: child BB missing from plan")
+        return 1
+    }
+    let new_body = patch_body(rm_path, plan)
+    if new_body.len() == 0 {
+        eprintln("[selftest] FAIL: patch_body empty")
+        return 1
+    }
+    // BB 노드의 deps 가 이제 [] 이고 soft_deps 에 A 가 있어야
+    let bb_after = _find_after(new_body, "\"id\":\"BB\"", 0)
+    if bb_after < 0 { eprintln("[selftest] FAIL: BB node missing in new body"); return 1 }
+    // BB 노드 블록만 떼서 검증 (간단: BB 시작부터 다음 '}' 까지)
+    // split_nodes 로 다시 파싱
+    let new_nodes_blocks = split_nodes(new_body)
+    let mut bb_block = ""
+    let mut q: i64 = 0
+    while q < new_nodes_blocks.len() {
+        let raw = _str(new_nodes_blocks[q])
+        if json_str(raw, "id") == "BB" { bb_block = raw; break }
+        q = q + 1
+    }
+    if bb_block.len() == 0 { eprintln("[selftest] FAIL: BB block missing"); return 1 }
+    let bb_deps = json_str_array(bb_block, "deps")
+    let bb_soft = json_str_array(bb_block, "soft_deps")
+    if bb_deps.len() != 0 {
+        eprintln("[selftest] FAIL: BB.deps expected [] got len=" + to_string(bb_deps.len()))
+        return 1
+    }
+    if bb_soft.len() != 1 || _str(bb_soft[0]) != "A" {
+        eprintln("[selftest] FAIL: BB.soft_deps expected [A] got len=" + to_string(bb_soft.len()))
+        return 1
+    }
+    println("[selftest]   patch_body: BB.deps=[] BB.soft_deps=[A] — OK")
+
+    // --- 5) cleanup ---
+    let _ = exec("rm -rf " + _shq(tmp_root) + " 2>/dev/null")  // @allow-bare-exec
+    println("[selftest] OK — all 5 checks passed")
+    return 0
+}
+
+// ── flag parsing ─────────────────────────────────────────────────────────
+fn _parse_score_flag(arg: string, key: string, cur: f64) -> f64 {
+    if arg.starts_with(key) == false { return cur }
+    let n = key.len()
+    let s = arg.substring(n, arg.len())
+    let v = _to_f64(s)
+    if v <= 0.0 || v > 1.0 { return cur }
+    return v
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+    if a.len() == 0 {
+        eprintln("usage: roadmap_edges.hexa <audit|apply|dry-run|--selftest> [args]")
+        eprintln("  audit   <roadmap-path> [--json] [--min-score=0.10] [--max-score=0.50]")
+        eprintln("  apply   <roadmap-path> [--min-score=0.10] [--max-score=0.50]")
+        eprintln("  dry-run <roadmap-path> [--min-score=0.10] [--max-score=0.50]")
+        eprintln("  --selftest")
+        exit(2)
+    }
+    let cmd = _str(a[0])
+    if cmd == "--selftest" || cmd == "selftest" {
+        let r = selftest()
+        exit(r)
+    }
+    if cmd == "audit" || cmd == "apply" || cmd == "dry-run" {
+        if a.len() < 2 {
+            eprintln("usage: roadmap_edges.hexa " + cmd + " <roadmap-path> [flags]")
+            exit(2)
+        }
+        let path = _str(a[1])
+        let mut as_json = false
+        let mut min_s: f64 = 0.10
+        let mut max_s: f64 = 0.50
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg == "--json" { as_json = true }
+            else if arg.starts_with("--min-score=") { min_s = _parse_score_flag(arg, "--min-score=", min_s) }
+            else if arg.starts_with("--max-score=") { max_s = _parse_score_flag(arg, "--max-score=", max_s) }
+            else if arg.starts_with("--") { eprintln("WARN: unknown flag: " + arg) }
+            k = k + 1
+        }
+        let r = if cmd == "audit" {
+            cmd_audit(path, as_json, min_s, max_s)
+        } else {
+            if cmd == "apply" {
+                cmd_apply(path, min_s, max_s)
+            } else {
+                cmd_dry_run(path, min_s, max_s)
+            }
+        }
+        exit(r)
+    }
+    eprintln("REJECT: unknown command: " + cmd)
+    exit(2)
+}
+
+main()

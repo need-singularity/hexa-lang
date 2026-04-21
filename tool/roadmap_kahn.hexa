@@ -1,0 +1,1274 @@
+// roadmap_kahn.hexa — Kahn process invariant + blocking minimization (roadmap_engine v2 #12)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_engine v2 확장 모듈 — Kahn 토폴로지 process invariant 검증.
+//   T_wall* = Σ b(S_k)  ⟺  ∀t  |R(t)| ≥ 1   (ready set 항상 non-empty)
+//   현재 스케줄이 invariant 위반 (R(t)=∅ while todo>0) 시 wall time 증가.
+//   위반 구간 검출 + split / parallelize / soft-promote 제안 출력.
+//
+// algorithm
+//   1) topological level: level(n) = 1 + max(level(p) for p in deps), 없으면 0
+//      iterative 수렴 (max_iter=100, no recursion)
+//   2) parallel-bound 시뮬레이션:
+//      각 step t 마다 ready_set + in_progress 크기 측정 (max_parallelism, 기본 4)
+//      한 step 처리 가능 노드 = max_parallelism 만큼 pop
+//   3) blocking gap = R(t)=∅ ∧ todo>0 인 스텝
+//   4) 각 gap 별 split / promote 제안
+//   5) critical path = level 별 bottleneck 노드 체인, T_crit = sum(cost)
+//      T_wall / T_crit ≥ 1, 비율 클수록 blocking 심각
+//
+// CLI
+//   hexa shared/tool/roadmap_kahn.hexa verify  <roadmap.json> [--p=N]
+//   hexa shared/tool/roadmap_kahn.hexa suggest <roadmap.json> [--p=N] [--json]
+//   hexa shared/tool/roadmap_kahn.hexa levels  <roadmap.json>
+//   hexa shared/tool/roadmap_kahn.hexa --selftest
+//
+// exit:
+//   verify   PASS=0 / FAIL=1 (gaps>0)
+//   suggest  always 0 (informational)
+//   levels   always 0
+//   usage    2
+//   parse    3
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_BASE = HOME + "/Dev/nexus"
+let HARNESS_DIR = NEXUS_BASE + "/harness"
+let ROADMAPS_DIR = NEXUS_BASE + "/roadmaps"
+
+let DEFAULT_PARALLELISM: i64 = 4
+let MAX_TOPO_ITER: i64 = 100
+let MAX_SIM_STEPS: i64 = 10000
+
+// ── void-safe coercion helpers (hexa-pitfalls 회피) ──────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = s.split("\n")[0].trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn _rfind(s: string, ch: string) -> i64 {
+    let n = len(s)
+    let mut i: i64 = n - 1
+    while i >= 0 {
+        if s.substring(i, i + 1) == ch { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+fn _idx_of(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _contains(xs: [string], v: string) -> bool {
+    return _idx_of(xs, v) >= 0
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+fn _max_i(a: i64, b: i64) -> i64 { if a > b { return a } else { return b } }
+fn _min_i(a: i64, b: i64) -> i64 { if a < b { return a } else { return b } }
+
+// ── pure-push list helpers (no .slice/.concat in hexa stage1) ───────────
+// rebuild list with one element replaced
+fn list_set_i64(xs: [i64], idx: i64, v: i64) -> [i64] {
+    let mut out: [i64] = []
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if i == idx { out = out.push(v) } else { out = out.push(xs[i]) }
+        i = i + 1
+    }
+    return out
+}
+
+fn list_set_str(xs: [string], idx: i64, v: string) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if i == idx { out = out.push(v) } else { out = out.push(_str(xs[i])) }
+        i = i + 1
+    }
+    return out
+}
+
+// remove single element at idx (returns new list)
+fn list_remove_at_str(xs: [string], idx: i64) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if i != idx { out = out.push(_str(xs[i])) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── JSON text-extract helpers (cloned semantics from roadmap_engine.hexa) ─
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Roadmap parallel-list model (no hashmap; #{} 함정 회피) ──────────────
+struct RoadmapPL {
+    rid: string,
+    goal_id: string,
+    start_id: string,
+    ids: [string],
+    names: [string],
+    types: [string],
+    statuses: [string],
+    costs: [f64],
+    deps_csv: [string],       // 노드 i 의 deps 를 "|" 로 join
+    soft_csv: [string]
+}
+
+fn _csv_join(xs: [string]) -> string {
+    let mut s: string = ""
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if i > 0 { s = s + "|" }
+        s = s + _str(xs[i])
+        i = i + 1
+    }
+    return s
+}
+
+fn _csv_split(s: string) -> [string] {
+    if s == "" { return [] }
+    let raw = s.split("|")
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < raw.len() {
+        let v = _str(raw[i])
+        if v != "" { out = out.push(v) }
+        i = i + 1
+    }
+    return out
+}
+
+fn load_roadmap_pl(path: string) -> RoadmapPL {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    // _meta 블록 추출
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let rid = json_str(meta_body, "id")
+    let goal_id = json_str(meta_body, "goal")
+    let start_id = json_str(meta_body, "start")
+
+    let blocks = split_nodes(body)
+    let mut ids: [string] = []
+    let mut names: [string] = []
+    let mut types: [string] = []
+    let mut statuses: [string] = []
+    let mut costs: [f64] = []
+    let mut deps_csv: [string] = []
+    let mut soft_csv: [string] = []
+
+    let mut i: i64 = 0
+    while i < blocks.len() {
+        let raw = _str(blocks[i])
+        let id = json_str(raw, "id")
+        if id != "" {
+            let mut nm = json_str(raw, "name")
+            if nm == "" { nm = id }
+            let mut ty = json_str(raw, "type")
+            if ty == "" { ty = "build" }
+            let mut st = json_str(raw, "status")
+            if st == "" { st = "todo" }
+            let cs = json_num(raw, "cost")
+            let dps = json_str_array(raw, "deps")
+            let sds = json_str_array(raw, "soft_deps")
+            ids = ids.push(id)
+            names = names.push(nm)
+            types = types.push(ty)
+            statuses = statuses.push(st)
+            costs = costs.push(cs)
+            deps_csv = deps_csv.push(_csv_join(dps))
+            soft_csv = soft_csv.push(_csv_join(sds))
+        }
+        i = i + 1
+    }
+
+    return RoadmapPL {
+        rid: rid, goal_id: goal_id, start_id: start_id,
+        ids: ids, names: names, types: types, statuses: statuses,
+        costs: costs, deps_csv: deps_csv, soft_csv: soft_csv
+    }
+}
+
+// ── status helpers ──────────────────────────────────────────────────────
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+// ── topological level computation (iterative; no recursion) ─────────────
+// level(i) = -1 if unresolved (cycle / missing dep)
+// returns parallel list of levels indexed by ids
+fn compute_levels(rm: RoadmapPL) -> [i64] {
+    let n = rm.ids.len()
+    let mut levels: [i64] = []
+    let mut i: i64 = 0
+    while i < n {
+        let deps = _csv_split(_str(rm.deps_csv[i]))
+        if deps.len() == 0 { levels = levels.push(0) }
+        else { levels = levels.push(-1) }
+        i = i + 1
+    }
+    let mut iter: i64 = 0
+    let mut changed: bool = true
+    while iter < MAX_TOPO_ITER && changed {
+        changed = false
+        let mut k: i64 = 0
+        while k < n {
+            let cur = levels[k]
+            if cur < 0 {
+                // try resolve: all deps must have non-negative level
+                let deps = _csv_split(_str(rm.deps_csv[k]))
+                let mut ok: bool = true
+                let mut mx: i64 = -1
+                let mut j: i64 = 0
+                while j < deps.len() {
+                    let did = _str(deps[j])
+                    let pi = _idx_of(rm.ids, did)
+                    if pi < 0 {
+                        // missing dep — treat as level 0 baseline (don't block forever)
+                        // but mark via mx=0 leaving level=1
+                        j = j + 1
+                        continue
+                    }
+                    let pl = levels[pi]
+                    if pl < 0 { ok = false; break }
+                    if pl > mx { mx = pl }
+                    j = j + 1
+                }
+                if ok {
+                    let new_lvl = mx + 1
+                    levels = list_set_i64(levels, k, new_lvl)
+                    changed = true
+                }
+            }
+            k = k + 1
+        }
+        iter = iter + 1
+    }
+    return levels
+}
+
+fn max_level(levels: [i64]) -> i64 {
+    let mut mx: i64 = -1
+    let mut i: i64 = 0
+    while i < levels.len() {
+        if levels[i] > mx { mx = levels[i] }
+        i = i + 1
+    }
+    return mx
+}
+
+// ── ready computation @ time t ──────────────────────────────────────────
+// node ready ⟺ status == todo ∧ all hard deps in `done_set`
+fn compute_ready(rm: RoadmapPL, done_set: [string], todo_set: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < todo_set.len() {
+        let id = _str(todo_set[i])
+        let ni = _idx_of(rm.ids, id)
+        if ni >= 0 {
+            let deps = _csv_split(_str(rm.deps_csv[ni]))
+            let mut all_ok: bool = true
+            let mut j: i64 = 0
+            while j < deps.len() {
+                let did = _str(deps[j])
+                if _contains(done_set, did) == false {
+                    all_ok = false; break
+                }
+                j = j + 1
+            }
+            if all_ok { out = out.push(id) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── simulation result ──────────────────────────────────────────────────
+struct SimResult {
+    t_steps: i64,                  // total wall steps used
+    gaps: [i64],                   // step indices where ready=∅ ∧ todo>0
+    gap_levels: [i64],             // level ceiling at each gap (max level among todo)
+    gap_ready_size: [i64],         // |R(t)| (always 0 for blocking gaps; kept for parity)
+    gap_todo_size: [i64],
+    gap_todo_csv: [string],        // "|"-joined snapshot of todo at each gap
+    crit_path_ids: [string],
+    crit_path_cost: f64,
+    t_wall: f64,                   // sum of bottleneck-stage costs (sequential approx)
+    parallelism: i64
+}
+
+// pick top-k ready by cost (parallel pop)
+fn pop_top_k(rm: RoadmapPL, ready: [string], k: i64) -> [string] {
+    if ready.len() == 0 || k <= 0 { return [] }
+    // simple selection: copy + repeated argmax
+    let mut pool: [string] = ready
+    let mut picked: [string] = []
+    let mut i: i64 = 0
+    while i < k && pool.len() > 0 {
+        let mut best_idx: i64 = 0
+        let mut best_cost: f64 = -1.0
+        let mut p: i64 = 0
+        while p < pool.len() {
+            let id = _str(pool[p])
+            let ni = _idx_of(rm.ids, id)
+            let c = if ni >= 0 { rm.costs[ni] } else { 0.0 }
+            if c > best_cost { best_cost = c; best_idx = p }
+            p = p + 1
+        }
+        picked = picked.push(_str(pool[best_idx]))
+        pool = list_remove_at_str(pool, best_idx)
+        i = i + 1
+    }
+    return picked
+}
+
+// remove ids from list
+fn remove_ids(xs: [string], rm_ids: [string]) -> [string] {
+    let mut out: [string] = []
+    let mut i: i64 = 0
+    while i < xs.len() {
+        let v = _str(xs[i])
+        if _contains(rm_ids, v) == false { out = out.push(v) }
+        i = i + 1
+    }
+    return out
+}
+
+// ── critical path: per level pick max-cost remaining node, sum costs ─────
+fn critical_path(rm: RoadmapPL, levels: [i64]) -> [string] {
+    let lmax = max_level(levels)
+    if lmax < 0 { return [] }
+    let mut chain: [string] = []
+    let mut l: i64 = 0
+    while l <= lmax {
+        let mut best_id: string = ""
+        let mut best_cost: f64 = -1.0
+        let mut i: i64 = 0
+        while i < rm.ids.len() {
+            if levels[i] == l {
+                let st = _str(rm.statuses[i])
+                if is_done(st) == false {
+                    let c = rm.costs[i]
+                    if c > best_cost { best_cost = c; best_id = _str(rm.ids[i]) }
+                }
+            }
+            i = i + 1
+        }
+        if best_id != "" { chain = chain.push(best_id) }
+        l = l + 1
+    }
+    // if everything done at some level, fallback to picking max cost regardless
+    if chain.len() == 0 {
+        let mut l2: i64 = 0
+        while l2 <= lmax {
+            let mut best_id2: string = ""
+            let mut best_cost2: f64 = -1.0
+            let mut i2: i64 = 0
+            while i2 < rm.ids.len() {
+                if levels[i2] == l2 {
+                    let c = rm.costs[i2]
+                    if c > best_cost2 { best_cost2 = c; best_id2 = _str(rm.ids[i2]) }
+                }
+                i2 = i2 + 1
+            }
+            if best_id2 != "" { chain = chain.push(best_id2) }
+            l2 = l2 + 1
+        }
+    }
+    return chain
+}
+
+fn sum_chain_cost(rm: RoadmapPL, chain: [string]) -> f64 {
+    let mut s: f64 = 0.0
+    let mut i: i64 = 0
+    while i < chain.len() {
+        let id = _str(chain[i])
+        let ni = _idx_of(rm.ids, id)
+        if ni >= 0 { s = s + rm.costs[ni] }
+        i = i + 1
+    }
+    return s
+}
+
+// ── max level among todo set ─────────────────────────────────────────────
+fn max_level_of_set(rm: RoadmapPL, levels: [i64], todo_set: [string]) -> i64 {
+    let mut mx: i64 = -1
+    let mut i: i64 = 0
+    while i < todo_set.len() {
+        let id = _str(todo_set[i])
+        let ni = _idx_of(rm.ids, id)
+        if ni >= 0 {
+            let lv = levels[ni]
+            if lv > mx { mx = lv }
+        }
+        i = i + 1
+    }
+    return mx
+}
+
+// ── core simulation (event-driven) ──────────────────────────────────────
+// invariant: |R(t)| >= 1 at every "decision point" (finish event).
+//   decision point = right after one or more inflight tasks complete.
+//   at that moment we check: is there any ready task to pick up?
+//   gap iff ready=∅ ∧ todo>0 ∧ inflight=∅  → workers fully idle, work pending
+//                                            but graph forces wait (impossible in
+//                                            DAG; signals broken graph).
+//   gap iff ready=∅ ∧ todo>0 ∧ inflight>0 ∧ idle_cap>0 → pipeline stall:
+//     workers idle, work queued, but DAG forces serial wait. T_wall > T_crit.
+// linear DAG (p>=1): at every finish, the next chain node is ready → R=1 always.
+//   no gap, T_wall == T_crit.
+// fan-in DAG: after long bottleneck finishes, multiple ready → no gap.
+// pathological gap: bottleneck is short but downstream all blocked on it.
+fn simulate(rm: RoadmapPL, levels: [i64], parallelism: i64) -> SimResult {
+    let mut done_set: [string] = []
+    let mut todo_set: [string] = []
+    let mut inflight_ids: [string] = []
+    let mut inflight_fin: [i64] = []
+    let mut t_wall: f64 = 0.0
+    let mut i: i64 = 0
+    while i < rm.ids.len() {
+        let id = _str(rm.ids[i])
+        let st = _str(rm.statuses[i])
+        if is_done(st) { done_set = done_set.push(id) }
+        else { todo_set = todo_set.push(id) }
+        i = i + 1
+    }
+    let p_eff = if parallelism <= 0 { DEFAULT_PARALLELISM } else { parallelism }
+
+    let mut gaps: [i64] = []
+    let mut gap_lvls: [i64] = []
+    let mut gap_rs: [i64] = []
+    let mut gap_ts: [i64] = []
+    let mut gap_csv: [string] = []
+    let mut t: i64 = 0
+    let mut steps_taken: i64 = 0
+
+    // initial dispatch at t=0
+    let ready0 = compute_ready(rm, done_set, todo_set)
+    let mut ready_pool: [string] = ready0
+    while inflight_ids.len() < p_eff && ready_pool.len() > 0 {
+        let mut best_idx: i64 = 0
+        let mut best_cost: f64 = -1.0
+        let mut p: i64 = 0
+        while p < ready_pool.len() {
+            let id = _str(ready_pool[p])
+            let ni = _idx_of(rm.ids, id)
+            let c = if ni >= 0 { rm.costs[ni] } else { 0.0 }
+            if c > best_cost { best_cost = c; best_idx = p }
+            p = p + 1
+        }
+        let pick_id = _str(ready_pool[best_idx])
+        let pi = _idx_of(rm.ids, pick_id)
+        let pcost = if pi >= 0 { rm.costs[pi] } else { 0.0 }
+        let dur = if pcost <= 0.0 { 1 } else { f_to_i(pcost + 0.5) }
+        let dur2 = if dur < 1 { 1 } else { dur }
+        inflight_ids = inflight_ids.push(pick_id)
+        inflight_fin = inflight_fin.push(t + dur2)
+        todo_set = remove_ids(todo_set, [pick_id])
+        ready_pool = list_remove_at_str(ready_pool, best_idx)
+    }
+
+    // event loop: advance to next finish, reap, recheck invariant, dispatch
+    while inflight_ids.len() > 0 && steps_taken < MAX_SIM_STEPS {
+        // advance time to earliest finish
+        let mut min_fin: i64 = -1
+        let mut q: i64 = 0
+        while q < inflight_fin.len() {
+            let f = inflight_fin[q]
+            if min_fin < 0 || f < min_fin { min_fin = f }
+            q = q + 1
+        }
+        if min_fin <= t { min_fin = t + 1 }
+        t = min_fin
+
+        // reap all inflight finishing at t
+        let mut new_inf_ids: [string] = []
+        let mut new_inf_fin: [i64] = []
+        let mut k: i64 = 0
+        while k < inflight_ids.len() {
+            if inflight_fin[k] <= t {
+                done_set = done_set.push(_str(inflight_ids[k]))
+            } else {
+                new_inf_ids = new_inf_ids.push(_str(inflight_ids[k]))
+                new_inf_fin = new_inf_fin.push(inflight_fin[k])
+            }
+            k = k + 1
+        }
+        inflight_ids = new_inf_ids
+        inflight_fin = new_inf_fin
+
+        // INVARIANT CHECK at decision point t:
+        //   |R(t)| = |ready ∪ inflight|. If 0 and todo>0 → gap.
+        let ready_now = compute_ready(rm, done_set, todo_set)
+        let r_size = ready_now.len() + inflight_ids.len()
+        if r_size == 0 && todo_set.len() > 0 {
+            gaps = gaps.push(t)
+            gap_lvls = gap_lvls.push(max_level_of_set(rm, levels, todo_set))
+            gap_rs = gap_rs.push(0)
+            gap_ts = gap_ts.push(todo_set.len())
+            gap_csv = gap_csv.push(_csv_join(todo_set))
+            // force-progress
+            let mut best_id: string = ""
+            let mut best_lvl: i64 = 999999999
+            let mut best_cost: f64 = 0.0
+            let mut kk: i64 = 0
+            while kk < todo_set.len() {
+                let id = _str(todo_set[kk])
+                let ni = _idx_of(rm.ids, id)
+                if ni >= 0 {
+                    let lv = levels[ni]
+                    if lv < best_lvl || (lv == best_lvl && rm.costs[ni] > best_cost) {
+                        best_lvl = lv; best_id = id; best_cost = rm.costs[ni]
+                    }
+                }
+                kk = kk + 1
+            }
+            if best_id != "" {
+                done_set = done_set.push(best_id)
+                todo_set = remove_ids(todo_set, [best_id])
+            } else {
+                break
+            }
+        }
+
+        // dispatch newly-ready
+        let mut pool: [string] = ready_now
+        while inflight_ids.len() < p_eff && pool.len() > 0 {
+            let mut best_idx2: i64 = 0
+            let mut best_cost2: f64 = -1.0
+            let mut p2: i64 = 0
+            while p2 < pool.len() {
+                let id = _str(pool[p2])
+                let ni = _idx_of(rm.ids, id)
+                let c = if ni >= 0 { rm.costs[ni] } else { 0.0 }
+                if c > best_cost2 { best_cost2 = c; best_idx2 = p2 }
+                p2 = p2 + 1
+            }
+            let pick_id = _str(pool[best_idx2])
+            let pi = _idx_of(rm.ids, pick_id)
+            let pcost = if pi >= 0 { rm.costs[pi] } else { 0.0 }
+            let dur = if pcost <= 0.0 { 1 } else { f_to_i(pcost + 0.5) }
+            let dur2 = if dur < 1 { 1 } else { dur }
+            inflight_ids = inflight_ids.push(pick_id)
+            inflight_fin = inflight_fin.push(t + dur2)
+            todo_set = remove_ids(todo_set, [pick_id])
+            pool = list_remove_at_str(pool, best_idx2)
+        }
+
+        steps_taken = steps_taken + 1
+    }
+
+    t_wall = to_float(to_string(t))
+
+    let chain = critical_path(rm, levels)
+    let crit_cost = sum_chain_cost(rm, chain)
+
+    return SimResult {
+        t_steps: t,
+        gaps: gaps,
+        gap_levels: gap_lvls,
+        gap_ready_size: gap_rs,
+        gap_todo_size: gap_ts,
+        gap_todo_csv: gap_csv,
+        crit_path_ids: chain,
+        crit_path_cost: crit_cost,
+        t_wall: t_wall,
+        parallelism: p_eff
+    }
+}
+
+// ── float formatting helper ─────────────────────────────────────────────
+fn fmt_f(x: f64) -> string {
+    let xx = if x < 0.0 { 0.0 } else { x }
+    let scaled = xx * 100.0
+    let r = f_to_i(scaled + 0.5)
+    let whole = r / 100
+    let frac = r - (whole * 100)
+    let mut fs = to_string(frac)
+    if fs.len() < 2 { fs = "0" + fs }
+    return to_string(whole) + "." + fs
+}
+
+fn fmt_ratio(num: f64, den: f64) -> string {
+    if den <= 0.0 { return "inf" }
+    return fmt_f(num / den)
+}
+
+// ── ASCII levels table ──────────────────────────────────────────────────
+fn pad_right(s: string, w: i64) -> string {
+    let mut out = s
+    while out.len() < w { out = out + " " }
+    return out
+}
+
+fn render_levels(rm: RoadmapPL, levels: [i64]) -> string {
+    let mut out: string = "id" + " " + pad_right("", 18) + " level   cost   status     deps\n"
+    out = out + "─────────────────────────────────────────────────────────────\n"
+    let lmax = max_level(levels)
+    let mut l: i64 = 0
+    while l <= lmax {
+        let mut i: i64 = 0
+        while i < rm.ids.len() {
+            if levels[i] == l {
+                let id = _str(rm.ids[i])
+                let st = _str(rm.statuses[i])
+                let cs = fmt_f(rm.costs[i])
+                let dps = _str(rm.deps_csv[i])
+                let dps2 = if dps == "" { "—" } else { dps }
+                out = out + pad_right(id, 20) + " "
+                    + pad_right(to_string(l), 5) + " "
+                    + pad_right(cs, 6) + " "
+                    + pad_right(st, 10) + " "
+                    + dps2 + "\n"
+            }
+            i = i + 1
+        }
+        l = l + 1
+    }
+    // any unresolved (level=-1) — print at end
+    let mut shown_unres: bool = false
+    let mut i2: i64 = 0
+    while i2 < rm.ids.len() {
+        if levels[i2] < 0 {
+            if shown_unres == false {
+                out = out + "─── unresolved (cycle / missing dep) ───\n"
+                shown_unres = true
+            }
+            let id = _str(rm.ids[i2])
+            let st = _str(rm.statuses[i2])
+            let cs = fmt_f(rm.costs[i2])
+            let dps = _str(rm.deps_csv[i2])
+            let dps2 = if dps == "" { "—" } else { dps }
+            out = out + pad_right(id, 20) + " "
+                + pad_right("?", 5) + " "
+                + pad_right(cs, 6) + " "
+                + pad_right(st, 10) + " "
+                + dps2 + "\n"
+        }
+        i2 = i2 + 1
+    }
+    return out
+}
+
+// ── suggestion generation ──────────────────────────────────────────────
+// for each gap:
+//   1) split: among todo nodes at same level, pick max-cost → suggest split into
+//      two halves
+//   2) promote: any todo node whose only blockers are in soft_deps of some other
+//      node (loose linkage) → suggest moving that dep to soft
+struct Suggest {
+    gap_t: i64,
+    gap_lvl: i64,
+    todo_count: i64,
+    split_id: string,
+    split_cost: f64,
+    promote_id: string,
+    promote_dep: string
+}
+
+fn pick_split_candidate(rm: RoadmapPL, levels: [i64], lvl: i64, todo_now: [string]) -> [string] {
+    // returns [id, cost_str]
+    let mut best_id: string = ""
+    let mut best_cost: f64 = -1.0
+    let mut i: i64 = 0
+    while i < todo_now.len() {
+        let id = _str(todo_now[i])
+        let ni = _idx_of(rm.ids, id)
+        if ni >= 0 {
+            let lv = levels[ni]
+            if lv == lvl - 1 || lv == lvl {
+                let c = rm.costs[ni]
+                if c > best_cost { best_cost = c; best_id = id }
+            }
+        }
+        i = i + 1
+    }
+    // fallback: any todo, max cost
+    if best_id == "" {
+        let mut k: i64 = 0
+        while k < todo_now.len() {
+            let id = _str(todo_now[k])
+            let ni = _idx_of(rm.ids, id)
+            if ni >= 0 {
+                let c = rm.costs[ni]
+                if c > best_cost { best_cost = c; best_id = id }
+            }
+            k = k + 1
+        }
+    }
+    return [best_id, fmt_f(best_cost)]
+}
+
+// For a given gap, find a node where moving one of its hard deps to soft would
+// make it ready earlier. Heuristic: pick a todo node at the gap's level whose
+// soft_deps is non-empty and at least one hard dep is also listed as soft elsewhere.
+fn pick_promote_candidate(rm: RoadmapPL, levels: [i64], lvl: i64, todo_now: [string]) -> [string] {
+    // returns [node_id, dep_to_drop]
+    let mut i: i64 = 0
+    while i < todo_now.len() {
+        let id = _str(todo_now[i])
+        let ni = _idx_of(rm.ids, id)
+        if ni >= 0 {
+            let lv = levels[ni]
+            if lv >= lvl - 1 && lv <= lvl + 1 {
+                let soft = _csv_split(_str(rm.soft_csv[ni]))
+                if soft.len() > 0 {
+                    return [id, _str(soft[0])]
+                }
+                // check if any hard dep appears as soft elsewhere
+                let deps = _csv_split(_str(rm.deps_csv[ni]))
+                let mut j: i64 = 0
+                while j < deps.len() {
+                    let d = _str(deps[j])
+                    // scan for other node listing `d` in soft_deps
+                    let mut k: i64 = 0
+                    while k < rm.ids.len() {
+                        if k != ni {
+                            let other_soft = _csv_split(_str(rm.soft_csv[k]))
+                            if _contains(other_soft, d) {
+                                return [id, d]
+                            }
+                        }
+                        k = k + 1
+                    }
+                    j = j + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return ["", ""]
+}
+
+fn build_suggestions(rm: RoadmapPL, levels: [i64], sim: SimResult) -> [Suggest] {
+    let mut out: [Suggest] = []
+    let mut g: i64 = 0
+    while g < sim.gaps.len() {
+        let target_t = sim.gaps[g]
+        let lvl = sim.gap_levels[g]
+        let snap_todo = _csv_split(_str(sim.gap_todo_csv[g]))
+        let split_pair = pick_split_candidate(rm, levels, lvl, snap_todo)
+        let promote_pair = pick_promote_candidate(rm, levels, lvl, snap_todo)
+        let split_id = _str(split_pair[0])
+        let split_cost = if split_id == "" {
+            0.0
+        } else {
+            let pi = _idx_of(rm.ids, split_id)
+            if pi >= 0 { rm.costs[pi] } else { 0.0 }
+        }
+        out = out.push(Suggest {
+            gap_t: target_t,
+            gap_lvl: lvl,
+            todo_count: sim.gap_todo_size[g],
+            split_id: split_id,
+            split_cost: split_cost,
+            promote_id: _str(promote_pair[0]),
+            promote_dep: _str(promote_pair[1])
+        })
+        g = g + 1
+    }
+    return out
+}
+
+// ── verify command ─────────────────────────────────────────────────────
+fn cmd_verify(path: string, parallelism: i64) -> i64 {
+    let rm = load_roadmap_pl(path)
+    let levels = compute_levels(rm)
+    let lmax = max_level(levels)
+    let sim = simulate(rm, levels, parallelism)
+
+    let chain_str = _csv_join(sim.crit_path_ids).replace("|", " -> ")
+    let chain_len = sim.crit_path_ids.len()
+    let n_str = to_string(rm.ids.len())
+    let l_str = to_string(lmax + 1)
+    let gaps_n = sim.gaps.len()
+
+    println("roadmap: " + rm.rid + "  nodes=" + n_str + "  levels=" + l_str + "  parallelism=" + to_string(sim.parallelism))
+    println("critical path: " + chain_str + "  (len=" + to_string(chain_len) + ", cost=" + fmt_f(sim.crit_path_cost) + ")")
+    println("wall estimate: T_wall=" + fmt_f(sim.t_wall) + "  T_crit=" + fmt_f(sim.crit_path_cost) + "  ratio=" + fmt_ratio(sim.t_wall, sim.crit_path_cost))
+    println("blocking gaps: " + to_string(gaps_n) + " (threshold=R<1)")
+
+    if gaps_n > 0 {
+        println("VERIFY: FAIL")
+        return 1
+    }
+    println("VERIFY: PASS")
+    return 0
+}
+
+// ── suggest command ────────────────────────────────────────────────────
+fn cmd_suggest(path: string, parallelism: i64, json_mode: bool) -> i64 {
+    let rm = load_roadmap_pl(path)
+    let levels = compute_levels(rm)
+    let sim = simulate(rm, levels, parallelism)
+    let suggestions = build_suggestions(rm, levels, sim)
+
+    if suggestions.len() == 0 {
+        if json_mode {
+            println("{\"roadmap\":\"" + rm.rid + "\",\"gaps\":0,\"suggestions\":[]}")
+        } else {
+            println("no blocking gaps detected — invariant satisfied (R(t)>=1 ∀t)")
+        }
+        return 0
+    }
+
+    let mut i: i64 = 0
+    while i < suggestions.len() {
+        let s = suggestions[i]
+        let half = s.split_cost / 2.0
+        if json_mode {
+            let mut line = "{\"roadmap\":\"" + rm.rid + "\""
+            line = line + ",\"gap_t\":" + to_string(s.gap_t)
+            line = line + ",\"gap_level\":" + to_string(s.gap_lvl)
+            line = line + ",\"ready\":0"
+            line = line + ",\"todo\":" + to_string(s.todo_count)
+            if s.split_id != "" {
+                line = line + ",\"split\":{\"node\":\"" + s.split_id + "\",\"cost\":" + fmt_f(s.split_cost)
+                line = line + ",\"a\":\"" + s.split_id + ".a\",\"b\":\"" + s.split_id + ".b\",\"each\":" + fmt_f(half) + "}"
+            }
+            if s.promote_id != "" {
+                line = line + ",\"promote\":{\"node\":\"" + s.promote_id + "\",\"drop_dep\":\"" + s.promote_dep + "\"}"
+            }
+            line = line + "}"
+            println(line)
+        } else {
+            println("gap@t=" + to_string(s.gap_t) + " (level=" + to_string(s.gap_lvl) + "): ready=∅ todo=" + to_string(s.todo_count))
+            if s.split_id != "" {
+                println("  suggest split: node=" + s.split_id + " cost=" + fmt_f(s.split_cost)
+                    + " -> " + s.split_id + ".a cost=" + fmt_f(half)
+                    + " + " + s.split_id + ".b cost=" + fmt_f(half))
+            }
+            if s.promote_id != "" {
+                println("  suggest promote: node=" + s.promote_id + " soft_dep=[" + s.promote_dep + "] -> drop hard, ready earlier")
+            }
+            if s.split_id == "" && s.promote_id == "" {
+                println("  (no automatic suggestion — consider adding parallel attack lanes)")
+            }
+            println("---")
+        }
+        i = i + 1
+    }
+    return 0
+}
+
+// ── levels command ─────────────────────────────────────────────────────
+fn cmd_levels(path: string) -> i64 {
+    let rm = load_roadmap_pl(path)
+    let levels = compute_levels(rm)
+    println("roadmap: " + rm.rid + "  nodes=" + to_string(rm.ids.len()) + "  max_level=" + to_string(max_level(levels)))
+    print(render_levels(rm, levels))
+    return 0
+}
+
+// ── selftest ───────────────────────────────────────────────────────────
+fn write_file_safe(path: string, body: string) {
+    let _ = exec("mkdir -p $(dirname '" + path + "')")  // @allow-bare-exec
+    write_file(path, body)
+}
+
+fn make_linear_roadmap() -> string {
+    return "{\n"
+        + "  \"_meta\": {\"id\": \"linear-test\", \"goal\": \"G\", \"start\": \"s\"},\n"
+        + "  \"nodes\": [\n"
+        + "    {\"id\": \"s\", \"type\": \"seed\", \"cost\": 0, \"status\": \"todo\", \"deps\": []},\n"
+        + "    {\"id\": \"a\", \"type\": \"build\", \"cost\": 5, \"status\": \"todo\", \"deps\": [\"s\"]},\n"
+        + "    {\"id\": \"b\", \"type\": \"build\", \"cost\": 5, \"status\": \"todo\", \"deps\": [\"a\"]},\n"
+        + "    {\"id\": \"c\", \"type\": \"build\", \"cost\": 5, \"status\": \"todo\", \"deps\": [\"b\"]},\n"
+        + "    {\"id\": \"G\", \"type\": \"goal\", \"cost\": 1, \"status\": \"todo\", \"deps\": [\"c\"]}\n"
+        + "  ]\n"
+        + "}\n"
+}
+
+// gap case: a "phantom" hard dep that no node satisfies — at some point
+// the remaining todo set has no member with all hard deps in done_set,
+// so R(t) drops to 0 while inflight clears. This models a stale roadmap where
+// a referenced dep was renamed/dropped without updating dependents.
+fn make_gap_roadmap() -> string {
+    return "{\n"
+        + "  \"_meta\": {\"id\": \"gap-test\", \"goal\": \"G\", \"start\": \"s\"},\n"
+        + "  \"nodes\": [\n"
+        + "    {\"id\": \"s\", \"type\": \"seed\", \"cost\": 0, \"status\": \"todo\", \"deps\": []},\n"
+        + "    {\"id\": \"A\", \"type\": \"build\", \"cost\": 4, \"status\": \"todo\", \"deps\": [\"s\"]},\n"
+        + "    {\"id\": \"B\", \"type\": \"build\", \"cost\": 24, \"status\": \"todo\", \"deps\": [\"A\", \"phantom\"], \"soft_deps\": [\"lint\"]},\n"
+        + "    {\"id\": \"C\", \"type\": \"build\", \"cost\": 4, \"status\": \"todo\", \"deps\": [\"B\"]},\n"
+        + "    {\"id\": \"D\", \"type\": \"build\", \"cost\": 4, \"status\": \"todo\", \"deps\": [\"B\"]},\n"
+        + "    {\"id\": \"E\", \"type\": \"build\", \"cost\": 4, \"status\": \"todo\", \"deps\": [\"B\"]},\n"
+        + "    {\"id\": \"lint\", \"type\": \"verify\", \"cost\": 2, \"status\": \"todo\", \"deps\": [\"A\"]},\n"
+        + "    {\"id\": \"G\", \"type\": \"goal\", \"cost\": 1, \"status\": \"todo\", \"deps\": [\"C\", \"D\", \"E\"]}\n"
+        + "  ]\n"
+        + "}\n"
+}
+
+fn selftest() {
+    println("=== roadmap_kahn selftest ===")
+    let lin_path = "/tmp/roadmap_kahn_linear.json"
+    let gap_path = "/tmp/roadmap_kahn_gap.json"
+    write_file_safe(lin_path, make_linear_roadmap())
+    write_file_safe(gap_path, make_gap_roadmap())
+
+    println("")
+    println("[1] linear (expect PASS, R(t)>=1 always):")
+    let rc1 = cmd_verify(lin_path, 4)
+    println("[1] exit=" + to_string(rc1))
+    if rc1 != 0 {
+        eprintln("SELFTEST FAIL: linear case should PASS but got FAIL")
+        exit(1)
+    }
+
+    println("")
+    println("[2] gap roadmap (expect FAIL with gaps):")
+    let rc2 = cmd_verify(gap_path, 4)
+    println("[2] exit=" + to_string(rc2))
+    println("")
+    println("[2] suggestions:")
+    let _ = cmd_suggest(gap_path, 4, false)
+
+    // gap case must produce at least one gap
+    let rm_g = load_roadmap_pl(gap_path)
+    let lv_g = compute_levels(rm_g)
+    let sim_g = simulate(rm_g, lv_g, 4)
+    if sim_g.gaps.len() == 0 {
+        // try lower parallelism to surface gaps for selftest robustness
+        let sim_g2 = simulate(rm_g, lv_g, 2)
+        if sim_g2.gaps.len() == 0 {
+            eprintln("SELFTEST FAIL: gap roadmap produced no gaps even at p=2")
+            exit(1)
+        } else {
+            println("(note: gaps surfaced at parallelism=2)")
+        }
+    }
+
+    println("")
+    println("[3] levels on linear:")
+    let _ = cmd_levels(lin_path)
+
+    println("")
+    println("=== selftest PASS ===")
+    exit(0)
+}
+
+// ── main ───────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage:")
+    eprintln("  hexa shared/tool/roadmap_kahn.hexa verify  <roadmap.json> [--p=N]")
+    eprintln("  hexa shared/tool/roadmap_kahn.hexa suggest <roadmap.json> [--p=N] [--json]")
+    eprintln("  hexa shared/tool/roadmap_kahn.hexa levels  <roadmap.json>")
+    eprintln("  hexa shared/tool/roadmap_kahn.hexa --selftest")
+    exit(2)
+}
+
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 { usage() }
+
+    let first = _str(a[0])
+    if first == "--selftest" || first == "selftest" { selftest() }
+
+    if first == "--help" || first == "-h" {
+        usage()
+    }
+
+    let mut path: string = ""
+    let mut p_arg: i64 = DEFAULT_PARALLELISM
+    let mut json_flag: bool = false
+    let mut k: i64 = 1
+    while k < a.len() {
+        let arg = _str(a[k])
+        if arg.starts_with("--p=") {
+            let s = arg.substring(4, arg.len())
+            let v = _to_int0(s)
+            if v > 0 { p_arg = v }
+        } else if arg == "--json" {
+            json_flag = true
+        } else if arg.starts_with("--") {
+            eprintln("WARN: unknown flag: " + arg)
+        } else {
+            if path == "" { path = arg }
+        }
+        k = k + 1
+    }
+
+    if path == "" { path = ROADMAPS_DIR + "/example.json" }
+
+    if first == "verify" {
+        let rc = cmd_verify(path, p_arg)
+        exit(rc)
+    } else if first == "suggest" {
+        let rc = cmd_suggest(path, p_arg, json_flag)
+        exit(rc)
+    } else if first == "levels" {
+        let rc = cmd_levels(path)
+        exit(rc)
+    } else {
+        eprintln("REJECT: unknown subcommand: " + first)
+        usage()
+    }
+}
+
+main()

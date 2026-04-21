@@ -1,0 +1,988 @@
+// parallel_scheduler.hexa — HEXA-P9-1: dependency graph 기반 병렬 태스크 스케줄러
+// @no-lock-needed
+// @allow-bare-exec
+//
+// PURPOSE
+//   복수 hexa 태스크를 dependency graph 기반으로 병렬 스케줄링.
+//   토폴로지 정렬 → 의존성 없는 태스크 동시 실행 (slot 제한).
+//   engine_forge.hexa 연동 — forge 산출 엔진을 DAG 스케줄링 가능.
+//
+// LOGIC
+//   1. manifest (JSONL) 에서 태스크 로드: {id, script, deps:[], timeout_sec}
+//   2. 토폴로지 정렬 — cycle 감지 시 REJECT
+//   3. ready queue (deps 전부 done) 에서 max_parallel 슬롯만큼 동시 dispatch
+//   4. 완료/실패 추적 → progress (done/total/failed) stdout 보고
+//   5. sentinel: __PARALLEL_SCHED_RESULT__ PASS|FAIL
+//
+// SSOT
+//   shared/tool/parallel_manifest.jsonl    태스크 정의 (append-only)
+//   shared/tool/parallel_sched_log.jsonl   실행 로그 (append-only)
+//   shared/config/engine_registry.json        forge 연동 (read-only)
+//
+// CLI
+//   hexa parallel_scheduler.hexa run [manifest_path]   — DAG 실행 (기본: parallel_manifest.jsonl)
+//   hexa parallel_scheduler.hexa plan [manifest_path]   — dry-run: 토폴로지 정렬 + 단계 표시 (실행 없음)
+//   hexa parallel_scheduler.hexa status                 — 마지막 실행 결과 요약
+//   hexa parallel_scheduler.hexa add <id> <script> [dep1,dep2,...] [timeout]  — manifest 에 태스크 추가
+//   hexa parallel_scheduler.hexa forge_sync             — engine_forge registry → manifest 동기화
+//   hexa parallel_scheduler.hexa --selftest             — 내부 검증
+//
+// exit: 0 ok / 1 execution failure / 2 usage / 3 selftest fail / 4 cycle detected
+
+import "safe_hexa_enforce.hexa"
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let HEXA_BIN = NEXUS + "/bin/hexa"
+let DEFAULT_MANIFEST = HARNESS + "/parallel_manifest.jsonl"
+let SCHED_LOG = HARNESS + "/parallel_sched_log.jsonl"
+let REGISTRY = NEXUS + "/config/engine_registry.json"
+let GUARD_LOG = HARNESS + "/parallel_guard.jsonl"
+
+let MAX_PARALLEL_DEFAULT: i64 = 4
+let DEFAULT_TIMEOUT: i64 = 120  // seconds
+
+// ─── void-safe coercion (cross_feed.hexa pattern) ───
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn now_unix() -> i64 {
+    return timestamp()  // OPT-P8-11: builtin, no exec
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// ─── JSON field extractor (cross_feed.hexa pattern) ───
+fn json_field(line: string, key: string) -> string {
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return "" }
+    let after = line.split(tag)[1]
+    let parts = after.split(":")
+    if parts.len() < 2 { return "" }
+    let mut rest = parts[1]
+    let mut i: i64 = 2
+    while i < parts.len() {
+        rest = rest + ":" + parts[i]
+        i = i + 1
+    }
+    let s = rest.trim()
+    if s.len() == 0 { return "" }
+    if s.substring(0, 1) == "\"" {
+        let inner = s.substring(1, s.len())
+        let ep = inner.split("\"")
+        if ep.len() < 1 { return "" }
+        return ep[0]
+    }
+    let mut end: i64 = 0
+    while end < s.len() {
+        let c = s.substring(end, end + 1)
+        if c == "," || c == "}" || c == "]" || c == "\n" || c == " " { break }
+        end = end + 1
+    }
+    return s.substring(0, end).trim()
+}
+
+// ─── JSON array field extractor (deps:[...]) ───
+fn json_array_field(line: string, key: string) -> [string] {
+    let mut result: [string] = []
+    let tag = "\"" + key + "\""
+    if line.contains(tag) == false { return result }
+    let after = line.split(tag)[1]
+    let colon_idx = after.index_of(":")
+    if colon_idx < 0 { return result }
+    let rest = after.substring(colon_idx + 1, after.len()).trim()
+    let bracket_start = rest.index_of("[")
+    if bracket_start < 0 { return result }
+    let bracket_end = rest.index_of("]")
+    if bracket_end < 0 { return result }
+    let inner = rest.substring(bracket_start + 1, bracket_end).trim()
+    if inner == "" { return result }
+    let items = inner.split(",")
+    let mut i: i64 = 0
+    while i < items.len() {
+        let raw = _str(items[i]).trim()
+        // strip quotes
+        let mut val = raw
+        if val.len() >= 2 && val.substring(0, 1) == "\"" {
+            val = val.substring(1, val.len() - 1)
+        }
+        if val != "" {
+            result = result.push(val)
+        }
+        i = i + 1
+    }
+    return result
+}
+
+fn log_append(action: string, detail: string) {
+    let ts = now_unix()
+    let line = "{\"ts\":" + to_string(ts) + ",\"action\":\"" + json_escape(action) +
+               "\",\"detail\":\"" + json_escape(detail) + "\"}\n"
+    try { append_file(SCHED_LOG, line) } catch e {}
+}
+
+// ─── Task struct (via parallel lists — hexa-lang has no struct) ───
+// task_ids[i], task_scripts[i], task_deps[i] (comma-separated), task_timeouts[i]
+// status: "pending" | "running" | "done" | "failed"
+
+fn load_manifest(path: string) -> [string] {
+    // Returns raw lines from manifest JSONL
+    let mut lines: [string] = []
+    if file_exists(path) == false { return lines }
+    let raw = _str(read_file(path)).trim()
+    if raw == "" { return lines }
+    let splits = raw.split("\n")
+    let mut i: i64 = 0
+    while i < splits.len() {
+        let line = _str(splits[i]).trim()
+        if line != "" && line.substring(0, 1) != "#" {
+            lines = lines.push(line)
+        }
+        i = i + 1
+    }
+    return lines
+}
+
+// ─── Topological sort (Kahn's algorithm) ───
+// Returns ordered list of task indices, or empty list if cycle detected.
+fn topo_sort(ids: [string], dep_lists: [string]) -> [i64] {
+    let n = ids.len()
+    // Build in-degree count and adjacency (parallel arrays)
+    // in_deg[i] = number of deps for task i
+    // Using string-encoded int arrays (hexa-lang list[i]=v workaround)
+    let mut in_deg: [i64] = []
+    let mut i: i64 = 0
+    while i < n {
+        in_deg = in_deg.push(0)
+        i = i + 1
+    }
+
+    // For each task, count how many of its deps are in the task set
+    i = 0
+    while i < n {
+        let deps_str = _str(dep_lists[i])
+        if deps_str != "" {
+            let deps = deps_str.split(",")
+            let mut j: i64 = 0
+            while j < deps.len() {
+                let dep = _str(deps[j]).trim()
+                // check if dep is in our id set
+                let mut k: i64 = 0
+                while k < n {
+                    if _str(ids[k]) == dep {
+                        // task i depends on task k — increment in_deg[i]
+                        // hexa-lang: rebuild list to update index
+                        let mut new_deg: [i64] = []
+                        let mut m: i64 = 0
+                        while m < n {
+                            if m == i {
+                                new_deg = new_deg.push(in_deg[m] + 1)
+                            } else {
+                                new_deg = new_deg.push(in_deg[m])
+                            }
+                            m = m + 1
+                        }
+                        in_deg = new_deg
+                        break
+                    }
+                    k = k + 1
+                }
+                j = j + 1
+            }
+        }
+        i = i + 1
+    }
+
+    // Kahn's: start with in_deg == 0 nodes
+    let mut queue: [i64] = []
+    let mut order: [i64] = []
+    i = 0
+    while i < n {
+        if in_deg[i] == 0 {
+            queue = queue.push(i)
+        }
+        i = i + 1
+    }
+
+    while queue.len() > 0 {
+        // dequeue first element
+        let cur = queue[0]
+        let mut new_queue: [i64] = []
+        let mut qi: i64 = 1
+        while qi < queue.len() {
+            new_queue = new_queue.push(queue[qi])
+            qi = qi + 1
+        }
+        queue = new_queue
+        order = order.push(cur)
+
+        // For each task that depends on cur, decrement in_deg
+        let cur_id = _str(ids[cur])
+        let mut t: i64 = 0
+        while t < n {
+            let deps_str = _str(dep_lists[t])
+            if deps_str != "" {
+                let deps = deps_str.split(",")
+                let mut found = false
+                let mut d: i64 = 0
+                while d < deps.len() {
+                    if _str(deps[d]).trim() == cur_id { found = true; break }
+                    d = d + 1
+                }
+                if found {
+                    // decrement in_deg[t]
+                    let mut new_deg: [i64] = []
+                    let mut m: i64 = 0
+                    while m < n {
+                        if m == t {
+                            new_deg = new_deg.push(in_deg[m] - 1)
+                        } else {
+                            new_deg = new_deg.push(in_deg[m])
+                        }
+                        m = m + 1
+                    }
+                    in_deg = new_deg
+                    if in_deg[t] == 0 {
+                        queue = queue.push(t)
+                    }
+                }
+            }
+            t = t + 1
+        }
+    }
+
+    // cycle detection: if order.len() < n, cycle exists
+    if order.len() < n {
+        return []  // empty = cycle
+    }
+    return order
+}
+
+// ─── Execute a single task with timeout ───
+fn exec_task(script: string, timeout: i64) -> i64 {
+    // Returns 0 = success, nonzero = failure
+    if file_exists(script) == false { return 1 }
+    let wrapper = HARNESS + "/perl_timeout.sh"
+    let mut cmd = ""
+    if file_exists(wrapper) && timeout > 0 {
+        cmd = "bash " + wrapper + " " + to_string(timeout) + " " + HEXA_BIN + " run " + script + " 2>&1"
+    } else {
+        cmd = HEXA_BIN + " run " + script + " 2>&1"
+    }
+    let out = _str(exec(cmd)).trim()  // @allow-bare-exec
+    if out != "" { println("  " + out) }
+    // Check for sentinel failure markers
+    if out.contains("FAIL") || out.contains("REJECT") || out.contains("ERROR") {
+        return 1
+    }
+    return 0
+}
+
+// ─── Check if task deps are all done ───
+fn deps_satisfied(dep_str: string, done_ids: [string]) -> bool {
+    if dep_str == "" { return true }
+    let deps = dep_str.split(",")
+    let mut i: i64 = 0
+    while i < deps.len() {
+        let dep = _str(deps[i]).trim()
+        if dep == "" { i = i + 1; continue }
+        let mut found = false
+        let mut j: i64 = 0
+        while j < done_ids.len() {
+            if _str(done_ids[j]) == dep { found = true; break }
+            j = j + 1
+        }
+        if found == false { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ─── Wait for background PIDs to finish ───
+fn wait_for_pids(pids: [string]) -> [i64] {
+    // Returns exit codes for each pid (0=ok, 1=fail)
+    let mut results: [i64] = []
+    let mut i: i64 = 0
+    while i < pids.len() {
+        let pid = _str(pids[i]).trim()
+        if pid == "" {
+            results = results.push(1)
+            i = i + 1
+            continue
+        }
+        // wait for pid — poll with very short sleep to avoid blocking harness
+        let wait_cmd = "wait " + pid + " 2>/dev/null; echo $?"
+        let rc = _to_int0(_str(exec(wait_cmd)).trim())  // @allow-bare-exec
+        results = results.push(rc)
+        i = i + 1
+    }
+    return results
+}
+
+// ─── Dispatch task in background, return PID ───
+fn dispatch_bg(script: string, timeout: i64) -> string {
+    if file_exists(script) == false { return "" }
+    let wrapper = HARNESS + "/perl_timeout.sh"
+    let mut cmd = ""
+    if file_exists(wrapper) && timeout > 0 {
+        cmd = "bash " + wrapper + " " + to_string(timeout) + " " + HEXA_BIN + " run " + script + " > /tmp/psched_" + to_string(now_unix()) + "_$$.log 2>&1 & echo $!"
+    } else {
+        cmd = HEXA_BIN + " run " + script + " > /tmp/psched_" + to_string(now_unix()) + "_$$.log 2>&1 & echo $!"
+    }
+    let pid = _str(exec(cmd)).trim()  // @allow-bare-exec
+    return pid
+}
+
+// ─── Check if PID is still running ───
+fn pid_alive(pid: string) -> bool {
+    if pid == "" { return false }
+    let out = _str(exec("kill -0 " + pid + " 2>/dev/null; echo $?")).trim()  // @allow-bare-exec
+    return out == "0"
+}
+
+// ─── cmd: run ─────────────────────────────────────────────────────
+fn cmd_run(manifest_path: string) -> i64 {
+    let max_par_env = _str(env("PARALLEL_MAX")).trim()
+    let max_parallel = if max_par_env != "" { _to_int0(max_par_env) } else { MAX_PARALLEL_DEFAULT }
+
+    let lines = load_manifest(manifest_path)
+    if lines.len() == 0 {
+        eprintln("REJECT: empty or missing manifest — " + manifest_path)
+        return 2
+    }
+
+    // Parse tasks into parallel arrays
+    let mut ids: [string] = []
+    let mut scripts: [string] = []
+    let mut dep_lists: [string] = []  // comma-separated deps
+    let mut timeouts: [i64] = []
+
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        let id = json_field(line, "id")
+        let script = json_field(line, "script")
+        if id == "" || script == "" { i = i + 1; continue }
+        let deps_arr = json_array_field(line, "deps")
+        let mut dep_str = ""
+        let mut d: i64 = 0
+        while d < deps_arr.len() {
+            if d > 0 { dep_str = dep_str + "," }
+            dep_str = dep_str + _str(deps_arr[d])
+            d = d + 1
+        }
+        let timeout_s = json_field(line, "timeout_sec")
+        let timeout = if timeout_s != "" { _to_int0(timeout_s) } else { DEFAULT_TIMEOUT }
+
+        ids = ids.push(id)
+        scripts = scripts.push(script)
+        dep_lists = dep_lists.push(dep_str)
+        timeouts = timeouts.push(timeout)
+        i = i + 1
+    }
+
+    let total = ids.len()
+    if total == 0 {
+        eprintln("REJECT: no valid tasks in manifest")
+        return 2
+    }
+
+    // Topological sort
+    let order = topo_sort(ids, dep_lists)
+    if order.len() == 0 {
+        eprintln("REJECT: cycle detected in dependency graph")
+        log_append("cycle_detected", "manifest=" + manifest_path + " tasks=" + to_string(total))
+        return 4
+    }
+
+    println("parallel_scheduler: " + to_string(total) + " tasks, max_parallel=" + to_string(max_parallel))
+    log_append("run_start", "tasks=" + to_string(total) + " max_parallel=" + to_string(max_parallel))
+
+    // Execution loop: wave-based parallel dispatch
+    let mut done_ids: [string] = []
+    let mut failed_ids: [string] = []
+    let mut statuses: [string] = []  // "pending" | "done" | "failed"
+    i = 0
+    while i < total {
+        statuses = statuses.push("pending")
+        i = i + 1
+    }
+
+    let mut wave: i64 = 0
+    while done_ids.len() + failed_ids.len() < total {
+        wave = wave + 1
+        // Find ready tasks (pending + deps satisfied)
+        let mut ready: [i64] = []
+        i = 0
+        while i < total {
+            if _str(statuses[i]) == "pending" {
+                if deps_satisfied(_str(dep_lists[i]), done_ids) {
+                    ready = ready.push(i)
+                }
+            }
+            i = i + 1
+        }
+
+        if ready.len() == 0 {
+            // No ready tasks but not all done — blocked by failures
+            eprintln("BLOCKED: no ready tasks, " + to_string(total - done_ids.len() - failed_ids.len()) + " tasks stuck (dep failure cascade)")
+            break
+        }
+
+        // Cap at max_parallel
+        let batch_size = if ready.len() > max_parallel { max_parallel } else { ready.len() }
+        let mut batch_indices: [i64] = []
+        let mut batch_pids: [string] = []
+        let mut batch_scripts: [string] = []
+
+        let mut b: i64 = 0
+        while b < batch_size {
+            let idx = ready[b]
+            let tid = _str(ids[idx])
+            let script = _str(scripts[idx])
+            let timeout = timeouts[idx]
+
+            println("  [wave " + to_string(wave) + "] dispatch: " + tid + " (" + script + ")")
+
+            // Mark as running (rebuild statuses)
+            let mut new_statuses: [string] = []
+            let mut si: i64 = 0
+            while si < total {
+                if si == idx {
+                    new_statuses = new_statuses.push("running")
+                } else {
+                    new_statuses = new_statuses.push(_str(statuses[si]))
+                }
+                si = si + 1
+            }
+            statuses = new_statuses
+
+            if batch_size == 1 {
+                // Single task — run synchronously (simpler, no zombie risk)
+                let rc = exec_task(script, timeout)
+                let mut ns: [string] = []
+                si = 0
+                while si < total {
+                    if si == idx {
+                        if rc == 0 {
+                            ns = ns.push("done")
+                        } else {
+                            ns = ns.push("failed")
+                        }
+                    } else {
+                        ns = ns.push(_str(statuses[si]))
+                    }
+                    si = si + 1
+                }
+                statuses = ns
+                if rc == 0 {
+                    done_ids = done_ids.push(tid)
+                    log_append("task_done", tid)
+                } else {
+                    failed_ids = failed_ids.push(tid)
+                    log_append("task_failed", tid)
+                    eprintln("  FAIL: " + tid)
+                }
+            } else {
+                // Multiple ready — dispatch in background
+                let pid = dispatch_bg(script, timeout)
+                batch_indices = batch_indices.push(idx)
+                batch_pids = batch_pids.push(pid)
+                batch_scripts = batch_scripts.push(script)
+            }
+            b = b + 1
+        }
+
+        // Wait for parallel batch if dispatched
+        if batch_pids.len() > 0 {
+            // Poll until all done (timeout-safe via perl_timeout.sh per task)
+            let mut remaining = batch_pids.len()
+            let mut checked: [bool] = []
+            let mut ci: i64 = 0
+            while ci < batch_pids.len() {
+                checked = checked.push(false)
+                ci = ci + 1
+            }
+
+            let poll_start = now_unix()
+            let max_wait: i64 = 600  // 10 min hard cap for entire wave
+
+            while remaining > 0 {
+                let elapsed = now_unix() - poll_start
+                if elapsed > max_wait {
+                    eprintln("  TIMEOUT: wave " + to_string(wave) + " exceeded " + to_string(max_wait) + "s")
+                    break
+                }
+
+                let mut pi: i64 = 0
+                while pi < batch_pids.len() {
+                    if checked[pi] == false {
+                        let pid = _str(batch_pids[pi])
+                        if pid_alive(pid) == false {
+                            // Process finished — check exit code
+                            let rc_str = _str(exec("wait " + pid + " 2>/dev/null; echo $?")).trim()  // @allow-bare-exec
+                            let rc = _to_int0(rc_str)
+                            let idx = batch_indices[pi]
+                            let tid = _str(ids[idx])
+
+                            // Update checked (rebuild)
+                            let mut new_checked: [bool] = []
+                            let mut cj: i64 = 0
+                            while cj < checked.len() {
+                                if cj == pi { new_checked = new_checked.push(true) }
+                                else { new_checked = new_checked.push(checked[cj]) }
+                                cj = cj + 1
+                            }
+                            checked = new_checked
+
+                            // Update statuses
+                            let mut ns: [string] = []
+                            let mut si: i64 = 0
+                            while si < total {
+                                if si == idx {
+                                    if rc == 0 { ns = ns.push("done") }
+                                    else { ns = ns.push("failed") }
+                                } else {
+                                    ns = ns.push(_str(statuses[si]))
+                                }
+                                si = si + 1
+                            }
+                            statuses = ns
+
+                            if rc == 0 {
+                                done_ids = done_ids.push(tid)
+                                log_append("task_done", tid)
+                            } else {
+                                failed_ids = failed_ids.push(tid)
+                                log_append("task_failed", tid)
+                                eprintln("  FAIL: " + tid)
+                            }
+                            remaining = remaining - 1
+                        }
+                    }
+                    pi = pi + 1
+                }
+
+                if remaining > 0 {
+                    // Brief sleep to avoid busy-wait
+                    exec("sleep 0.5")  // @allow-bare-exec
+                }
+            }
+        }
+
+        // Progress report
+        println("  progress: done=" + to_string(done_ids.len()) + "/" + to_string(total) + " failed=" + to_string(failed_ids.len()))
+    }
+
+    // Final summary
+    let success = failed_ids.len() == 0 && done_ids.len() == total
+    println("parallel_scheduler: " + (if success { "ALL PASS" } else { "PARTIAL" }) +
+            " done=" + to_string(done_ids.len()) + " failed=" + to_string(failed_ids.len()) + " total=" + to_string(total))
+    log_append("run_end", "done=" + to_string(done_ids.len()) + " failed=" + to_string(failed_ids.len()) + " total=" + to_string(total))
+
+    if success {
+        println("__PARALLEL_SCHED_RESULT__ PASS")
+        return 0
+    } else {
+        println("__PARALLEL_SCHED_RESULT__ FAIL")
+        return 1
+    }
+}
+
+// ─── cmd: plan (dry-run) ──────────────────────────────────────────
+fn cmd_plan(manifest_path: string) -> i64 {
+    let lines = load_manifest(manifest_path)
+    if lines.len() == 0 {
+        eprintln("REJECT: empty or missing manifest — " + manifest_path)
+        return 2
+    }
+
+    let mut ids: [string] = []
+    let mut scripts: [string] = []
+    let mut dep_lists: [string] = []
+
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let line = _str(lines[i])
+        let id = json_field(line, "id")
+        let script = json_field(line, "script")
+        if id == "" || script == "" { i = i + 1; continue }
+        let deps_arr = json_array_field(line, "deps")
+        let mut dep_str = ""
+        let mut d: i64 = 0
+        while d < deps_arr.len() {
+            if d > 0 { dep_str = dep_str + "," }
+            dep_str = dep_str + _str(deps_arr[d])
+            d = d + 1
+        }
+        ids = ids.push(id)
+        scripts = scripts.push(script)
+        dep_lists = dep_lists.push(dep_str)
+        i = i + 1
+    }
+
+    let order = topo_sort(ids, dep_lists)
+    if order.len() == 0 {
+        eprintln("REJECT: cycle detected in dependency graph")
+        return 4
+    }
+
+    // Group into waves (each wave = parallel-eligible tasks)
+    let total = ids.len()
+    let mut done_set: [string] = []
+    let mut wave: i64 = 0
+
+    println("plan: " + to_string(total) + " tasks, topological order:")
+    while done_set.len() < total {
+        wave = wave + 1
+        let mut wave_tasks: [string] = []
+        i = 0
+        while i < total {
+            let id = _str(ids[i])
+            // skip already done
+            let mut already = false
+            let mut j: i64 = 0
+            while j < done_set.len() {
+                if _str(done_set[j]) == id { already = true; break }
+                j = j + 1
+            }
+            if already { i = i + 1; continue }
+            if deps_satisfied(_str(dep_lists[i]), done_set) {
+                wave_tasks = wave_tasks.push(id)
+            }
+            i = i + 1
+        }
+        if wave_tasks.len() == 0 { break }  // safety
+
+        let task_list = ", ".join(wave_tasks)
+        println("  wave " + to_string(wave) + " (" + to_string(wave_tasks.len()) + " parallel): " + task_list)
+
+        // Mark wave as done
+        let mut w: i64 = 0
+        while w < wave_tasks.len() {
+            done_set = done_set.push(_str(wave_tasks[w]))
+            w = w + 1
+        }
+    }
+    println("total waves: " + to_string(wave))
+    return 0
+}
+
+// ─── cmd: status ──────────────────────────────────────────────────
+fn cmd_status() -> i64 {
+    if file_exists(SCHED_LOG) == false {
+        println("parallel_scheduler: no execution log")
+        return 0
+    }
+    // Read last 50 lines for recent activity
+    let raw = _str(read_file(SCHED_LOG)).trim()
+    if raw == "" {
+        println("parallel_scheduler: empty log")
+        return 0
+    }
+    let lines = raw.split("\n")
+    let mut last_run_start = ""
+    let mut last_run_end = ""
+    let mut last_done: i64 = 0
+    let mut last_failed: i64 = 0
+    let mut last_total: i64 = 0
+
+    // scan from end
+    let mut i = lines.len() - 1
+    while i >= 0 {
+        let line = _str(lines[i]).trim()
+        if line == "" { i = i - 1; continue }
+        let action = json_field(line, "action")
+        if action == "run_end" && last_run_end == "" {
+            last_run_end = json_field(line, "ts")
+            let detail = json_field(line, "detail")
+            // parse "done=X failed=Y total=Z" from detail
+            let parts = detail.split(" ")
+            let mut p: i64 = 0
+            while p < parts.len() {
+                let part = _str(parts[p])
+                if part.contains("done=") { last_done = _to_int0(part.split("=")[1]) }
+                if part.contains("failed=") { last_failed = _to_int0(part.split("=")[1]) }
+                if part.contains("total=") { last_total = _to_int0(part.split("=")[1]) }
+                p = p + 1
+            }
+        }
+        if action == "run_start" && last_run_start == "" {
+            last_run_start = json_field(line, "ts")
+        }
+        if last_run_end != "" && last_run_start != "" { break }
+        i = i - 1
+    }
+
+    if last_run_end == "" {
+        println("parallel_scheduler: no completed runs in log")
+    } else {
+        println("last_run: done=" + to_string(last_done) + " failed=" + to_string(last_failed) + " total=" + to_string(last_total))
+    }
+    return 0
+}
+
+// ─── cmd: add ─────────────────────────────────────────────────────
+fn cmd_add(id: string, script: string, deps: string, timeout: i64) -> i64 {
+    if id == "" || script == "" {
+        eprintln("usage: add <id> <script> [dep1,dep2,...] [timeout]")
+        return 2
+    }
+    let mut deps_json = "[]"
+    if deps != "" {
+        let parts = deps.split(",")
+        let mut arr: [string] = []
+        let mut i: i64 = 0
+        while i < parts.len() {
+            let d = _str(parts[i]).trim()
+            if d != "" { arr = arr.push("\"" + json_escape(d) + "\"") }
+            i = i + 1
+        }
+        deps_json = "[" + ",".join(arr) + "]"
+    }
+    let row = "{\"id\":\"" + json_escape(id) + "\",\"script\":\"" + json_escape(script) +
+              "\",\"deps\":" + deps_json + ",\"timeout_sec\":" + to_string(timeout) + "}\n"
+    try { append_file(DEFAULT_MANIFEST, row) } catch e {
+        eprintln("FAIL: append to manifest")
+        return 1
+    }
+    println("added: " + id + " -> " + script + " deps=[" + deps + "] timeout=" + to_string(timeout))
+    log_append("task_added", id + " script=" + script)
+    return 0
+}
+
+// ─── cmd: forge_sync ──────────────────────────────────────────────
+// Read engine_registry.json, add registered engines as tasks to manifest
+fn cmd_forge_sync() -> i64 {
+    if file_exists(REGISTRY) == false {
+        eprintln("REJECT: engine_registry.json missing")
+        return 1
+    }
+    let reg = _str(read_file(REGISTRY))
+    let marker = "\"engines\": {"
+    let idx = reg.index_of(marker)
+    if idx < 0 {
+        eprintln("REJECT: engines marker not found in registry")
+        return 1
+    }
+    let after = reg.substring(idx + marker.len(), reg.len())
+    let eng_lines = after.split("\n")
+    let mut added: i64 = 0
+    let mut i: i64 = 0
+    while i < eng_lines.len() {
+        let line = _str(eng_lines[i]).trim()
+        if line == "" || line.substring(0, 1) == "}" { i = i + 1; continue }
+        if line.substring(0, 1) == "\"" {
+            let after_q = line.substring(1, line.len())
+            let ep = after_q.split("\"")
+            if ep.len() >= 1 {
+                let name = _str(ep[0])
+                if name != "" && name != "note" && name != "schema" && name != "updated" && name != "engines" {
+                    // Extract path from registry entry
+                    let path_field = json_field(line, "path")
+                    let script_path = if path_field != "" { NEXUS + "/" + path_field } else { "" }
+                    if script_path != "" {
+                        let row = "{\"id\":\"forge_" + json_escape(name) + "\",\"script\":\"" + json_escape(script_path) +
+                                  "\",\"deps\":[],\"timeout_sec\":" + to_string(DEFAULT_TIMEOUT) + ",\"source\":\"forge_sync\"}\n"
+                        try { append_file(DEFAULT_MANIFEST, row) } catch e {}
+                        added = added + 1
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    println("forge_sync: " + to_string(added) + " engines synced to manifest")
+    log_append("forge_sync", "added=" + to_string(added))
+    return 0
+}
+
+// ─── cmd: selftest ────────────────────────────────────────────────
+fn cmd_selftest() -> i64 {
+    let mut fails: i64 = 0
+
+    // Test 1: topo_sort with no cycle
+    let ids1: [string] = ["A", "B", "C"]
+    let deps1: [string] = ["", "A", "A,B"]
+    let order1 = topo_sort(ids1, deps1)
+    if order1.len() != 3 {
+        eprintln("selftest FAIL: topo_sort linear — expected 3, got " + to_string(order1.len()))
+        fails = fails + 1
+    } else {
+        // A must come before B, B before C
+        if order1[0] != 0 {
+            eprintln("selftest FAIL: topo_sort — A not first")
+            fails = fails + 1
+        }
+        println("selftest: topo_sort linear OK")
+    }
+
+    // Test 2: topo_sort with cycle
+    let ids2: [string] = ["X", "Y"]
+    let deps2: [string] = ["Y", "X"]
+    let order2 = topo_sort(ids2, deps2)
+    if order2.len() != 0 {
+        eprintln("selftest FAIL: topo_sort cycle — expected empty, got " + to_string(order2.len()))
+        fails = fails + 1
+    } else {
+        println("selftest: topo_sort cycle detection OK")
+    }
+
+    // Test 3: topo_sort parallel (no deps)
+    let ids3: [string] = ["P", "Q", "R"]
+    let deps3: [string] = ["", "", ""]
+    let order3 = topo_sort(ids3, deps3)
+    if order3.len() != 3 {
+        eprintln("selftest FAIL: topo_sort parallel — expected 3, got " + to_string(order3.len()))
+        fails = fails + 1
+    } else {
+        println("selftest: topo_sort parallel OK")
+    }
+
+    // Test 4: deps_satisfied
+    let done_set: [string] = ["A", "B"]
+    if deps_satisfied("A,B", done_set) == false {
+        eprintln("selftest FAIL: deps_satisfied should be true")
+        fails = fails + 1
+    }
+    if deps_satisfied("A,C", done_set) == true {
+        eprintln("selftest FAIL: deps_satisfied should be false (C missing)")
+        fails = fails + 1
+    }
+    println("selftest: deps_satisfied OK")
+
+    // Test 5: json_array_field
+    let test_line = "{\"id\":\"T1\",\"deps\":[\"A\",\"B\"],\"timeout_sec\":60}"
+    let arr = json_array_field(test_line, "deps")
+    if arr.len() != 2 {
+        eprintln("selftest FAIL: json_array_field — expected 2 deps, got " + to_string(arr.len()))
+        fails = fails + 1
+    } else {
+        println("selftest: json_array_field OK")
+    }
+
+    // Test 6: file accessibility
+    if file_exists(HARNESS + "/entry.hexa") == false {
+        eprintln("selftest FAIL: entry.hexa not found")
+        fails = fails + 1
+    }
+
+    if fails > 0 {
+        eprintln("selftest: " + to_string(fails) + " FAIL")
+        return 3
+    }
+    println("parallel_scheduler selftest OK (" + to_string(6 - fails) + "/6)")
+    return 0
+}
+
+// ─── usage ────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage: hexa parallel_scheduler.hexa <run|plan|status|add|forge_sync|--selftest> [args...]")
+    eprintln("  run [manifest]       — execute DAG (default: parallel_manifest.jsonl)")
+    eprintln("  plan [manifest]      — dry-run topological plan")
+    eprintln("  status               — last execution summary")
+    eprintln("  add <id> <script> [deps] [timeout]  — add task to manifest")
+    eprintln("  forge_sync           — sync engine_registry → manifest")
+    eprintln("  --selftest           — internal verification")
+    eprintln("env: PARALLEL_MAX=N (default 4)")
+}
+
+fn _arg_at(a: [string], i: i64) -> string {
+    if i < a.len() { return _str(a[i]) }
+    return ""
+}
+
+fn main() -> i64 {
+    ensure_launchd_sandbox()
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only a[2] 가정 → Linux 에서 a[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut a: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        a = a + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && a.len() >= 3 {
+        if a[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < a.len() {
+                _a2 = _a2 + [a[_j2]]
+                _j2 = _j2 + 1
+            }
+            a = _a2
+        }
+    }
+    let n = a.len()
+    if n < 3 {
+        usage()
+        return 2
+    }
+    let cmd = _str(a[2]).trim()
+
+    if cmd == "run" {
+        let manifest = if n >= 4 { _str(a[3]).trim() } else { DEFAULT_MANIFEST }
+        return cmd_run(manifest)
+    } else if cmd == "plan" {
+        let manifest = if n >= 4 { _str(a[3]).trim() } else { DEFAULT_MANIFEST }
+        return cmd_plan(manifest)
+    } else if cmd == "status" {
+        return cmd_status()
+    } else if cmd == "add" {
+        if n < 5 {
+            eprintln("usage: add <id> <script> [dep1,dep2,...] [timeout]")
+            return 2
+        }
+        let id = _str(a[3]).trim()
+        let script = _str(a[4]).trim()
+        let deps = if n >= 6 { _str(a[5]).trim() } else { "" }
+        let timeout = if n >= 7 { _to_int0(_str(a[6]).trim()) } else { DEFAULT_TIMEOUT }
+        return cmd_add(id, script, deps, timeout)
+    } else if cmd == "forge_sync" {
+        return cmd_forge_sync()
+    } else if cmd == "--selftest" {
+        return cmd_selftest()
+    } else {
+        usage()
+        return 2
+    }
+}
+
+exit(main())

@@ -1,0 +1,558 @@
+// bt_compute_scheduler.hexa — BT-dedicated compute slot scheduler (REM-P8-1)
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   BT-541..547 공격 7종을 reserved slot 4개(runpod 1 + hetzner 2 + ubu 1)에
+//   매핑하는 scheduler. 실제 원격 실행은 하지 않고 정책 + state file 기록만.
+//
+// SSOT
+//   shared/engine/bt_compute_allocation.json — host 매핑 + 예산 cap + 정책
+//   shared/state/bt_compute_slots.jsonl      — claim/release 이력 (append-only)
+//   shared/tool/engines_usage.jsonl       — ROI 집계용 bench score 소스
+//
+// FUNCTIONS (4)
+//   claim_slot(bt_id)   — 가용 slot 확인 + 예약 + state append
+//   release_slot(bt_id) — 보유 slot 해제 + state append
+//   report()            — 현 slot 상태 + 예산 잔여 + ROI
+//   scheduler_pick()    — ROI-based next BT (round-robin fallback)
+//
+// CLI
+//   hexa run bt_compute_scheduler.hexa claim   <BT-id>
+//   hexa run bt_compute_scheduler.hexa release <BT-id>
+//   hexa run bt_compute_scheduler.hexa report
+//   hexa run bt_compute_scheduler.hexa pick
+//   hexa run bt_compute_scheduler.hexa dry-run    [claim/release 전체 7 BT 시뮬레이션]
+//
+// 성공 조용, 실패 시끄럽게 (H1). 실제 원격 실행 금지 (spec + dry-run only).
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ALLOC_JSON = NEXUS + "/engine/bt_compute_allocation.json"
+let STATE_JSONL = NEXUS + "/state/bt_compute_slots.jsonl"
+let USAGE_JSONL = NEXUS + "/tool/engines_usage.jsonl"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn _to_int0(s: string) -> i64 {
+    if s == "" { return 0 }
+    let first = _str(s.split("\n")[0]).trim()
+    if first == "" { return 0 }
+    return to_int(first)
+}
+
+fn sh(cmd: string) -> string {
+    return _str(exec(cmd + " 2>/dev/null")).trim()  // @allow-bare-exec
+}
+
+fn now_unix() -> i64 {
+    return _to_int0(sh("date +%s"))
+}
+
+fn json_escape(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", " ")
+    r = r.replace("\r", " ")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn file_append_line(path: string, line: string) {
+    let esc = line.replace("'", "'\\''")
+    try { exec("printf '%s\\n' '" + esc + "' >> '" + path + "'") } catch e {  // @allow-bare-exec
+        eprintln("FAIL: append — " + path)
+    }
+}
+
+fn ensure_parent_dir(path: string) {
+    let idx = path.index_of("/")
+    if idx < 0 { return }
+    // find last '/'
+    let mut last: i64 = -1
+    let mut i: i64 = 0
+    while i < path.len() {
+        if path.substring(i, i + 1) == "/" { last = i }
+        i = i + 1
+    }
+    if last <= 0 { return }
+    let dir = path.substring(0, last)
+    try { exec("mkdir -p '" + dir + "'") } catch e {}  // @allow-bare-exec
+}
+
+// ── valid BT id list (allocation.json 소스) ──────────────────────────────
+let BT_IDS: [string] = ["BT-541", "BT-542", "BT-543", "BT-544", "BT-545", "BT-546", "BT-547"]
+
+// allocation.json 에서 추출한 정적 매핑 (실제 파일 파싱은 생략 — hexa json_parse 가 void
+// 반환 함정 있어 보수적으로 in-file 미러 유지. 변경 시 allocation.json 동기 갱신.)
+fn bt_primary_slot(bt_id: string) -> string {
+    if bt_id == "BT-541" { return "runpod-bt-0" }
+    if bt_id == "BT-542" { return "hetzner-bt-0" }
+    if bt_id == "BT-543" { return "runpod-bt-0" }
+    if bt_id == "BT-544" { return "ubu-bt-0" }
+    if bt_id == "BT-545" { return "hetzner-bt-1" }
+    if bt_id == "BT-546" { return "hetzner-bt-0" }
+    if bt_id == "BT-547" { return "ubu-bt-0" }
+    return ""
+}
+
+fn bt_fallback_slot(bt_id: string) -> string {
+    if bt_id == "BT-541" { return "hetzner-bt-0" }
+    if bt_id == "BT-542" { return "hetzner-bt-1" }
+    if bt_id == "BT-543" { return "hetzner-bt-0" }
+    if bt_id == "BT-544" { return "runpod-bt-0" }
+    if bt_id == "BT-545" { return "hetzner-bt-0" }
+    if bt_id == "BT-546" { return "hetzner-bt-1" }
+    if bt_id == "BT-547" { return "hetzner-bt-1" }
+    return ""
+}
+
+fn bt_budget_cap(bt_id: string) -> f64 {
+    if bt_id == "BT-541" { return 30.0 }
+    if bt_id == "BT-542" { return 35.0 }
+    if bt_id == "BT-543" { return 35.0 }
+    if bt_id == "BT-544" { return 15.0 }
+    if bt_id == "BT-545" { return 12.0 }
+    if bt_id == "BT-546" { return 30.0 }
+    if bt_id == "BT-547" { return 10.0 }
+    return 0.0
+}
+
+fn bt_expected_hours(bt_id: string) -> f64 {
+    if bt_id == "BT-541" { return 8.0 }
+    if bt_id == "BT-542" { return 120.0 }
+    if bt_id == "BT-543" { return 10.0 }
+    if bt_id == "BT-544" { return 60.0 }
+    if bt_id == "BT-545" { return 80.0 }
+    if bt_id == "BT-546" { return 100.0 }
+    if bt_id == "BT-547" { return 40.0 }
+    return 0.0
+}
+
+fn slot_cost_per_hour(slot_id: string) -> f64 {
+    if slot_id == "runpod-bt-0"  { return 2.99 }
+    if slot_id == "hetzner-bt-0" { return 0.278 }
+    if slot_id == "hetzner-bt-1" { return 0.139 }
+    if slot_id == "ubu-bt-0"     { return 0.014 }
+    return 0.0
+}
+
+fn is_valid_bt(bt_id: string) -> bool {
+    let mut i: i64 = 0
+    while i < BT_IDS.len() {
+        if _str(BT_IDS[i]) == bt_id { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ── state file reader: 각 slot 의 현 holder 계산 ─────────────────────────
+// last action 기준: claim -> held; release/expire -> free. 동일 slot 의 마지막
+// 이벤트만 반영.
+fn slot_holder(slot_id: string) -> string {
+    if file_exists(STATE_JSONL) == false { return "" }
+    let esc_slot = slot_id.replace("'", "'\\''")
+    let cmd = "grep '\"slot_id\":\"" + esc_slot + "\"' '" + STATE_JSONL + "' 2>/dev/null | tail -1"
+    let raw = sh(cmd)
+    if raw == "" { return "" }
+    // parse action + bt_id
+    let act_tag = "\"action\":\""
+    let ai = raw.index_of(act_tag)
+    if ai < 0 { return "" }
+    let at = raw.substring(ai + act_tag.len(), raw.len())
+    let ae = at.index_of("\"")
+    if ae < 0 { return "" }
+    let action = at.substring(0, ae)
+    if action != "claim" { return "" }
+    // find bt_id
+    let bt_tag = "\"bt_id\":\""
+    let bi = raw.index_of(bt_tag)
+    if bi < 0 { return "" }
+    let bt = raw.substring(bi + bt_tag.len(), raw.len())
+    let be = bt.index_of("\"")
+    if be < 0 { return "" }
+    return bt.substring(0, be)
+}
+
+// BT 가 현재 어느 slot 을 보유? (없으면 "")
+fn bt_current_slot(bt_id: string) -> string {
+    let slots: [string] = ["runpod-bt-0", "hetzner-bt-0", "hetzner-bt-1", "ubu-bt-0"]
+    let mut i: i64 = 0
+    while i < slots.len() {
+        let s = _str(slots[i])
+        if slot_holder(s) == bt_id { return s }
+        i = i + 1
+    }
+    return ""
+}
+
+// BT 누적 예산 (state file 에서 budget_spent_usd 합산)
+fn bt_cumulative_spend(bt_id: string) -> f64 {
+    if file_exists(STATE_JSONL) == false { return 0.0 }
+    let esc_bt = bt_id.replace("'", "'\\''")
+    let cmd = "grep '\"bt_id\":\"" + esc_bt + "\"' '" + STATE_JSONL + "' 2>/dev/null"
+    let raw = sh(cmd)
+    if raw == "" { return 0.0 }
+    let lines = raw.split("\n")
+    let mut total: f64 = 0.0
+    let mut i: i64 = 0
+    while i < lines.len() {
+        let ln = _str(lines[i]).trim()
+        if ln == "" { i = i + 1; continue }
+        let tag = "\"budget_spent_usd\":"
+        let ti = ln.index_of(tag)
+        if ti < 0 { i = i + 1; continue }
+        let tail = ln.substring(ti + tag.len(), ln.len())
+        let mut end: i64 = 0
+        while end < tail.len() {
+            let c = tail.substring(end, end + 1)
+            if c == "," || c == "}" || c == " " { break }
+            end = end + 1
+        }
+        let num_s = tail.substring(0, end).trim()
+        if num_s != "" {
+            // only count claim actions? release appends 0 so sum is fine either way
+            let act_tag = "\"action\":\""
+            let ai = ln.index_of(act_tag)
+            let mut action = ""
+            if ai >= 0 {
+                let at = ln.substring(ai + act_tag.len(), ln.len())
+                let ae = at.index_of("\"")
+                if ae >= 0 { action = at.substring(0, ae) }
+            }
+            if action == "claim" {
+                // numeric parse via to_float
+                let mut f: f64 = 0.0
+                try { f = to_float(num_s) } catch e { f = 0.0 }
+                total = total + f
+            }
+        }
+        i = i + 1
+    }
+    return total
+}
+
+// ── action: claim ────────────────────────────────────────────────────────
+// 우선순위: primary_slot 가용 → fallback_slot 가용 → REJECT(no_slot).
+// 예산 cap 초과면 REJECT(budget_exhausted).
+// BT 가 이미 slot 보유면 REJECT(already_holding).
+fn claim_slot(bt_id: string, dry: bool) -> bool {
+    if is_valid_bt(bt_id) == false {
+        println("REJECT: invalid bt_id " + bt_id)
+        return false
+    }
+    let cur = bt_current_slot(bt_id)
+    if cur != "" {
+        println("REJECT: " + bt_id + " already holds " + cur)
+        return false
+    }
+    let cap = bt_budget_cap(bt_id)
+    let spent = bt_cumulative_spend(bt_id)
+    if spent >= cap {
+        println("REJECT: " + bt_id + " budget exhausted (spent=$" + to_string(spent) +
+                " / cap=$" + to_string(cap) + ")")
+        return false
+    }
+
+    let primary = bt_primary_slot(bt_id)
+    let fallback = bt_fallback_slot(bt_id)
+
+    let mut chosen = ""
+    let p_holder = slot_holder(primary)
+    if p_holder == "" {
+        chosen = primary
+    } else {
+        let f_holder = slot_holder(fallback)
+        if f_holder == "" {
+            chosen = fallback
+        } else {
+            println("REJECT: no_slot — primary " + primary + " held by " + p_holder +
+                    ", fallback " + fallback + " held by " + f_holder)
+            return false
+        }
+    }
+
+    // 1 시간 청구 가정 (실제 wall-time 은 release 시 정확히 계산해야 하나,
+    //  scheduler 는 slot-hour 단위로 cap 만 추적).
+    let rate = slot_cost_per_hour(chosen)
+    let spend_delta = rate * 1.0
+    let remaining = cap - spent - spend_delta
+    if remaining < 0.0 {
+        println("REJECT: " + bt_id + " budget short — need $" + to_string(spend_delta) +
+                " but only $" + to_string(cap - spent) + " left")
+        return false
+    }
+
+    let ts = now_unix()
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"action\":\"claim\"" +
+              ",\"slot_id\":\"" + json_escape(chosen) + "\"" +
+              ",\"bt_id\":\"" + json_escape(bt_id) + "\"" +
+              ",\"budget_spent_usd\":" + to_string(spend_delta) +
+              ",\"rate_per_hour_usd\":" + to_string(rate) +
+              ",\"notes\":\"" + (if dry { "dry-run" } else { "claim" }) + "\"}"
+
+    if dry == false {
+        ensure_parent_dir(STATE_JSONL)
+        file_append_line(STATE_JSONL, row)
+    }
+
+    let tag = if dry { "[dry] " } else { "" }
+    println(tag + "CLAIM: " + bt_id + " → " + chosen +
+            " rate=$" + to_string(rate) + "/hr" +
+            " spent+=$" + to_string(spend_delta) +
+            " remaining=$" + to_string(remaining))
+    return true
+}
+
+// ── action: release ──────────────────────────────────────────────────────
+fn release_slot(bt_id: string, dry: bool) -> bool {
+    if is_valid_bt(bt_id) == false {
+        println("REJECT: invalid bt_id " + bt_id)
+        return false
+    }
+    let cur = bt_current_slot(bt_id)
+    if cur == "" {
+        println("REJECT: " + bt_id + " holds no slot")
+        return false
+    }
+
+    let ts = now_unix()
+    let row = "{\"ts\":" + to_string(ts) +
+              ",\"action\":\"release\"" +
+              ",\"slot_id\":\"" + json_escape(cur) + "\"" +
+              ",\"bt_id\":\"" + json_escape(bt_id) + "\"" +
+              ",\"budget_spent_usd\":0.0" +
+              ",\"notes\":\"" + (if dry { "dry-run" } else { "release" }) + "\"}"
+
+    if dry == false {
+        ensure_parent_dir(STATE_JSONL)
+        file_append_line(STATE_JSONL, row)
+    }
+
+    let tag = if dry { "[dry] " } else { "" }
+    println(tag + "RELEASE: " + bt_id + " ← " + cur)
+    return true
+}
+
+// ── action: report ───────────────────────────────────────────────────────
+fn report() {
+    println("")
+    println("═══ BT COMPUTE ALLOCATION — REPORT ════════════════════════════════════")
+    println("  allocation: " + ALLOC_JSON)
+    println("  state:      " + STATE_JSONL)
+    println("")
+    println("  SLOTS (4 reserved):")
+    let slots: [string] = ["runpod-bt-0", "hetzner-bt-0", "hetzner-bt-1", "ubu-bt-0"]
+    let mut i: i64 = 0
+    while i < slots.len() {
+        let s = _str(slots[i])
+        let h = slot_holder(s)
+        let rate = slot_cost_per_hour(s)
+        let status = if h == "" { "FREE" } else { "HELD by " + h }
+        println("    " + s + "  rate=$" + to_string(rate) + "/hr  " + status)
+        i = i + 1
+    }
+
+    println("")
+    println("  BT BUDGETS (7 attacks):")
+    let mut j: i64 = 0
+    while j < BT_IDS.len() {
+        let b = _str(BT_IDS[j])
+        let cap = bt_budget_cap(b)
+        let spent = bt_cumulative_spend(b)
+        let rem = cap - spent
+        let cur = bt_current_slot(b)
+        let hold = if cur == "" { "-" } else { cur }
+        println("    " + b +
+                "  cap=$" + to_string(cap) +
+                "  spent=$" + to_string(spent) +
+                "  remaining=$" + to_string(rem) +
+                "  slot=" + hold)
+        j = j + 1
+    }
+    println("═══════════════════════════════════════════════════════════════════════")
+}
+
+// ── action: scheduler_pick ────────────────────────────────────────────────
+// ROI = score / (rate * expected_hours). bench score 없으면 0 → round-robin.
+fn latest_bench_score(bt_id: string) -> i64 {
+    if file_exists(USAGE_JSONL) == false { return 0 }
+    let esc_bt = bt_id.replace("'", "'\\''")
+    let cmd = "grep '\"bt_parent\":\"" + esc_bt + "\"' '" + USAGE_JSONL +
+              "' 2>/dev/null | grep '\"kind\":\"bench\"' | tail -1"
+    let raw = sh(cmd)
+    if raw == "" { return 0 }
+    let tag = "\"score\":"
+    let ti = raw.index_of(tag)
+    if ti < 0 { return 0 }
+    let tail = raw.substring(ti + tag.len(), raw.len())
+    let mut end: i64 = 0
+    while end < tail.len() {
+        let c = tail.substring(end, end + 1)
+        if c == "," || c == "}" || c == " " { break }
+        end = end + 1
+    }
+    return _to_int0(tail.substring(0, end))
+}
+
+fn scheduler_pick() {
+    let mut best_bt = ""
+    let mut best_roi: f64 = -1.0
+    let mut has_roi = false
+    let mut i: i64 = 0
+    while i < BT_IDS.len() {
+        let b = _str(BT_IDS[i])
+        // skip BT 가 이미 slot 보유
+        if bt_current_slot(b) != "" { i = i + 1; continue }
+        let cap = bt_budget_cap(b)
+        let spent = bt_cumulative_spend(b)
+        if spent >= cap { i = i + 1; continue }
+
+        let score = latest_bench_score(b)
+        let hours = bt_expected_hours(b)
+        let primary = bt_primary_slot(b)
+        let rate = slot_cost_per_hour(primary)
+        let denom = rate * hours
+        if score > 0 && denom > 0.0 {
+            has_roi = true
+            let roi: f64 = (to_float(score)) / denom
+            if roi > best_roi {
+                best_roi = roi
+                best_bt = b
+            }
+        }
+        i = i + 1
+    }
+
+    if has_roi {
+        println("PICK (ROI): " + best_bt + "  roi=" + to_string(best_roi))
+        return
+    }
+
+    // fallback: round-robin — claim 안 된 첫 BT
+    let mut j: i64 = 0
+    while j < BT_IDS.len() {
+        let b = _str(BT_IDS[j])
+        if bt_current_slot(b) == "" && bt_cumulative_spend(b) < bt_budget_cap(b) {
+            println("PICK (round-robin): " + b)
+            return
+        }
+        j = j + 1
+    }
+    println("PICK: none — all BT claimed or exhausted")
+}
+
+// ── action: dry-run ──────────────────────────────────────────────────────
+// 7 BT 각각 claim + release 시뮬레이션 (state file 변경 없음).
+fn dry_run_all() {
+    println("")
+    println("═══ DRY-RUN: claim/release all 7 BT ═══════════════════════════════════")
+    let mut pass: i64 = 0
+    let mut fail: i64 = 0
+    let mut i: i64 = 0
+    while i < BT_IDS.len() {
+        let b = _str(BT_IDS[i])
+        println("")
+        println("-- " + b + " --")
+        let ok_c = claim_slot(b, true)
+        let ok_r = release_slot(b, true)
+        // dry 에서는 claim 이 state 안 건드리므로 release 는 "holds no slot" REJECT.
+        // 이 패턴이 정답 — dry flag 에서는 claim success, release expected REJECT.
+        if ok_c { pass = pass + 1 } else { fail = fail + 1 }
+        i = i + 1
+    }
+    println("")
+    println("═══ dry-run complete: claim_pass=" + to_string(pass) +
+            " claim_fail=" + to_string(fail) + " / " + to_string(BT_IDS.len()) + " ═══")
+}
+
+// ── main ──────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    if argv.len() < 3 {
+        eprintln("usage: bt_compute_scheduler <claim|release|report|pick|dry-run> [BT-id]")
+        exit(2)
+    }
+    let mode = _str(argv[2]).trim()
+
+    if mode == "report" {
+        report()
+        return
+    }
+    if mode == "pick" {
+        scheduler_pick()
+        return
+    }
+    if mode == "dry-run" {
+        dry_run_all()
+        return
+    }
+    if mode == "claim" {
+        if argv.len() < 4 {
+            eprintln("usage: claim <BT-id>")
+            exit(2)
+        }
+        let bt = _str(argv[3]).trim()
+        let ok = claim_slot(bt, false)
+        if ok == false { exit(1) }
+        return
+    }
+    if mode == "release" {
+        if argv.len() < 4 {
+            eprintln("usage: release <BT-id>")
+            exit(2)
+        }
+        let bt = _str(argv[3]).trim()
+        let ok = release_slot(bt, false)
+        if ok == false { exit(1) }
+        return
+    }
+    eprintln("REJECT: unknown mode '" + mode + "' — modes: claim|release|report|pick|dry-run")
+    exit(2)
+}

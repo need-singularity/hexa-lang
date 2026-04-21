@@ -1,0 +1,605 @@
+// roadmap_guard.hexa — 4-프로젝트 로드맵 하네스 강제관리
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// 대상 (SPA 동기 = 단일 진실):
+//   shared/roadmaps/anima.json
+//   shared/roadmaps/nexus.json
+//   shared/roadmaps/n6-architecture.json
+//   shared/roadmaps/zeta-surpass.json   (anima 서브로드맵 — 제타 추월)
+//
+// 서브커맨드:
+//   verify     SCHEMA.json 정합성 (enum/required/pattern) — hard-fail
+//   artifacts  task.artifact 파일 존재 확인 — warn (work-in-progress OK)
+//   status     phase/task 진척도 테이블
+//   gap        stub/미구현 artifact + loop hook 탐지 → roadmap_gaps.jsonl
+//   all        verify + artifacts + status (리포트 생성)
+//
+// 플래그:
+//   --project <anima|nexus|n6-architecture|zeta-surpass>  단일 프로젝트만 실행
+//   --report                                               shared/roadmaps/_report.md 쓰기
+//
+// exit codes:
+//   0  PASS (verify 통과, artifacts/gap 은 경고만)
+//   1  verify 실패 (schema 위반)
+//   2  usage 에러
+//   3  gap 발견 (gap 서브커맨드 전용, --strict 플래그로만 활성화)
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let ROADMAPS = NEXUS + "/roadmaps"
+let SCHEMA_PATH = ROADMAPS + "/SCHEMA.json"
+let REPORT_PATH = ROADMAPS + "/_report.md"
+
+fn print_usage() {
+    println("roadmap_guard — 4-project roadmap enforcement")
+    println("")
+    println("  verify     SCHEMA 정합성 + parent_project/parent_roadmap 존재 (hard-fail)")
+    println("  artifacts  task.artifact 파일 존재 확인 (warn)")
+    println("  status     phase/task 진척도 테이블")
+    println("  crossref   부모↔자식 의존 맵 + 선행조건 경고 (zeta-surpass ← anima)")
+    println("  gap        stub/미구현 artifact + loop hook 탐지 → roadmap_gaps.jsonl")
+    println("  all        verify + artifacts + status + crossref")
+    println("")
+    println("flags:")
+    println("  --project <anima|nexus|n6-architecture|zeta-surpass>")
+    println("  --report  (all 모드에서 shared/roadmaps/_report.md 생성)")
+    println("  --strict  (gap 모드에서 gap 발견 시 exit 3)")
+}
+
+// ─── hexa-native JSON helpers (jq + exec) ────────────────────────
+// python3 / R37/AN13/L3-PY 의존 제거 (2026-04-18 smash).
+// 모든 JSON query 는 jq passthrough. shell metachar 경고는 @allow-bare-exec 로 허용.
+
+fn jq(query: str, path: str) -> str {
+    // @allow-bare-exec
+    let cmd = "jq -r " + shq(query) + " " + shq(path) + " 2>/dev/null"
+    return to_string(exec(cmd)).trim()
+}
+
+fn jq_raw(query: str, path: str) -> str {
+    // non-trim 변형 (multi-line 출력 보존)
+    // @allow-bare-exec
+    let cmd = "jq -r " + shq(query) + " " + shq(path) + " 2>/dev/null"
+    return to_string(exec(cmd))
+}
+
+fn shq(s: str) -> str {
+    // single-quote shell escape
+    let mut r = "'"
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { r = r + "'\\''" } else { r = r + c }
+        i = i + 1
+    }
+    return r + "'"
+}
+
+fn file_exists_path(p: str) -> bool {
+    // @allow-bare-exec
+    let out = to_string(exec("test -e " + shq(p) + " && echo Y || echo N")).trim()
+    return out == "Y"
+}
+
+// verify_project — hexa-native 정합성 검사. jq 로 각 필드 조회.
+// 반환: "PASS ... (N phases)" 또는 "FAIL ...\n  · <err>\n..."
+fn verify_project(project: str) -> str {
+    let p = ROADMAPS + "/" + project + ".json"
+    if file_exists_path(p) == false {
+        return "SKIP " + p + " (file absent — project registered but roadmap not yet created)"
+    }
+    let mut errors: [str] = []
+    // _meta.project
+    let mp = jq("._meta.project // \"\"", p)
+    if mp.len() == 0 { errors = errors + ["_meta.project missing"] }
+    // _meta.updated — YYYY-MM-DD pattern (first 10 chars)
+    let mu = jq("._meta.updated // \"\"", p)
+    if mu.len() > 0 {
+        if is_ymd(mu) == false {
+            errors = errors + ["_meta.updated not YYYY-MM-DD format: " + mu]
+        }
+    }
+    // parent_project
+    let pp = jq("._meta.parent_project // \"\"", p)
+    if pp.len() > 0 {
+        let parent_path = ROADMAPS + "/" + pp + ".json"
+        if file_exists_path(parent_path) == false {
+            errors = errors + ["parent roadmap missing: " + parent_path]
+        }
+    }
+    // parent_roadmap
+    let pr = jq("._meta.parent_roadmap // \"\"", p)
+    if pr.len() > 0 {
+        let full = NEXUS + "/" + pr
+        if file_exists_path(full) == false {
+            errors = errors + ["parent_roadmap path missing: " + pr]
+        }
+    }
+    // phases structure
+    let phase_count_s = jq("(.phases // []) | length", p)
+    if phase_count_s.len() == 0 || phase_count_s == "null" {
+        errors = errors + ["phases must be list"]
+    }
+    // phase id / status 검사 — jq 로 한번에 invalid 리스트 추출
+    let bad_ids_raw = jq_raw(
+        "(.phases // []) | to_entries[] | select(.value.id // \"\" | test(\"^P[0-9]+$\") | not) | \"phases[\" + (.key|tostring) + \"].id invalid: \" + (.value.id // \"?\"|tostring)",
+        p)
+    let bad_lines = bad_ids_raw.split("\n")
+    for bl in bad_lines {
+        let t = bl.trim()
+        if t.len() > 0 { errors = errors + [t] }
+    }
+    let bad_st_raw = jq_raw(
+        "(.phases // []) | to_entries[] | select((.value.status // \"\") as $s | [\"planned\",\"in_progress\",\"done\",\"blocked\",\"aborted\",\"complete\"] | index($s) | not) | \"phases[\" + (.key|tostring) + \"].status invalid: \" + (.value.status // \"?\"|tostring)",
+        p)
+    let bad_st_lines = bad_st_raw.split("\n")
+    for bl in bad_st_lines {
+        let t = bl.trim()
+        if t.len() > 0 { errors = errors + [t] }
+    }
+
+    if len(errors) > 0 {
+        let mut out = "FAIL " + p
+        for e in errors { out = out + "\n  · " + e }
+        return out
+    }
+    let parent_hint = if pp.len() > 0 { " [parent: " + pp + "]" } else { "" }
+    return "PASS " + p + "  (" + phase_count_s + " phases)" + parent_hint
+}
+
+fn is_ymd(s: str) -> bool {
+    if s.len() < 10 { return false }
+    let mut i = 0
+    while i < 10 {
+        let c = s.substring(i, i + 1)
+        if i == 4 || i == 7 {
+            if c != "-" { return false }
+        } else {
+            if c < "0" || c > "9" { return false }
+        }
+        i = i + 1
+    }
+    return true
+}
+
+fn project_base(project: str) -> str {
+    if project == "anima" { return HOME + "/Dev/anima" }
+    if project == "nexus" { return NEXUS }
+    if project == "n6-architecture" { return HOME + "/Dev/n6-architecture" }
+    if project == "zeta-surpass" { return HOME + "/Dev/anima" }
+    if project == "anima-train" { return HOME + "/Dev/anima" }
+    if project == "hexa-lang" { return HOME + "/Dev/hexa-lang" }
+    if project == "papers" { return HOME + "/Dev/papers" }
+    if project == "void" { return HOME + "/Dev/void" }
+    if project == "airgenome" { return HOME + "/Dev/airgenome" }
+    if project == "hive" { return HOME + "/Dev/hive" }
+    if project == "millennium" { return HOME + "/Dev/millennium" }
+    return ""
+}
+
+fn run_artifacts_project(project: str) -> str {
+    let p = ROADMAPS + "/" + project + ".json"
+    if file_exists_path(p) == false {
+        return "[" + project + "] SKIP — roadmap absent"
+    }
+    let base = project_base(project)
+    // jq 로 모든 (phase_id, track, task_id, artifact, status) 튜플 추출.
+    // parallel tasks + ph.tasks[] 동시 수집. 필드구분자 = '|'.
+    let q = "(.phases // []) | .[] as $ph | " +
+            "(($ph.parallel // []) | .[] as $tr | ($tr.tasks // []) | .[] as $t | " +
+            "  [($ph.id//\"?\"), ($tr.track//\"?\"), ($t.id//\"?\"), ($t.artifact//\"\"), ($t.status//\"?\")] | join(\"|\")), " +
+            "(($ph.tasks // []) | .[] as $t | " +
+            "  [($ph.id//\"?\"), \"_\", ($t.id//\"?\"), ($t.artifact//\"\"), ($t.status//\"?\")] | join(\"|\"))"
+    let raw = jq_raw(q, p)
+    let lines = raw.split("\n")
+    let mut total: i64 = 0
+    let mut found: i64 = 0
+    let mut missing_lines: [str] = []
+    for ln in lines {
+        let t = ln.trim()
+        if t.len() == 0 { continue }
+        let parts = t.split("|")
+        if len(parts) < 5 { continue }
+        let art = parts[3]
+        if art.len() == 0 { continue }
+        total = total + 1
+        let full = base + "/" + art
+        if file_exists_path(full) {
+            found = found + 1
+        } else {
+            missing_lines = missing_lines + ["  MISSING  " + parts[0] + "/" + parts[1] + "/" + pad_to(parts[2], 12) + " [" + parts[4] + "]  " + art]
+        }
+    }
+    let mut body = "[" + project + "] artifacts " + to_string(found) + "/" + to_string(total) + " present"
+    for ml in missing_lines { body = body + "\n" + ml }
+    return body
+}
+
+fn pad_to(s: str, n: i64) -> str {
+    let mut r = s
+    while r.len() < n { r = r + " " }
+    return r
+}
+
+fn run_status_project(project: str) -> str {
+    let p = ROADMAPS + "/" + project + ".json"
+    if file_exists_path(p) == false {
+        return "=== " + project + " ===\n  SKIP — roadmap absent"
+    }
+    // 1) phase status counts
+    let pc_raw = jq_raw("[(.phases // [])[] | .status // \"other\"] | sort | group_by(.) | map(\"\\(.[0])=\\(length)\") | join(\",\")", p)
+    let pc = pc_raw.trim()
+    // 2) task status counts (parallel + inline tasks)
+    let tc_raw = jq_raw("[(.phases // [])[] | (.parallel // [])[] | (.tasks // [])[] | (.status // \"todo\")] + [(.phases // [])[] | (.tasks // [])[] | (.status // \"todo\")] | sort | group_by(.) | map(\"\\(.[0])=\\(length)\") | join(\",\")", p)
+    let tc = tc_raw.trim()
+    // 3) 각 phase 한 줄 요약
+    let ph_raw = jq_raw("(.phases // []) | .[] | [(.id // \"?\"), (.status // \"?\"), ((.name // \"?\")[0:50])] | join(\"|\")", p)
+    let ph_lines = ph_raw.split("\n")
+    let mut body = "=== " + project + " ===\n"
+    body = body + "  phases: " + pc + "\n"
+    body = body + "  tasks:  " + tc
+    for ln in ph_lines {
+        let t = ln.trim()
+        if t.len() == 0 { continue }
+        let parts = t.split("|")
+        if len(parts) < 3 { continue }
+        let st = parts[1]
+        let mark = status_mark(st)
+        body = body + "\n  [" + mark + "] " + parts[0] + " [" + pad_to(st, 12) + "] " + parts[2]
+    }
+    return body
+}
+
+fn status_mark(st: str) -> str {
+    if st == "done" { return "+" }
+    if st == "complete" { return "+" }
+    if st == "in_progress" { return ">" }
+    if st == "planned" { return "." }
+    if st == "blocked" { return "!" }
+    if st == "aborted" { return "x" }
+    return "?"
+}
+
+// ─── Subcommand runners ────────────────────────────────────────
+
+fn run_verify(projects: [str]) -> i64 {
+    println("=== verify ===")
+    let mut any_fail = false
+    for p in projects {
+        let out = verify_project(p)
+        println(out)
+        if out.starts_with("FAIL") { any_fail = true }
+    }
+    if any_fail { return 1 }
+    return 0
+}
+
+fn run_artifacts(projects: [str]) -> i64 {
+    println("=== artifacts ===")
+    for p in projects {
+        let out = run_artifacts_project(p)
+        println(out)
+    }
+    return 0
+}
+
+fn run_status(projects: [str]) -> i64 {
+    println("=== status ===")
+    for p in projects {
+        let out = run_status_project(p)
+        println(out)
+    }
+    return 0
+}
+
+// ─── crossref: 부모↔자식 의존 관계 맵 (hexa-native) ──────────
+fn run_crossref() -> i64 {
+    println("=== crossref ===")
+    let candidates = ["anima", "nexus", "n6-architecture", "zeta-surpass", "anima-train", "hexa-lang", "papers", "void", "airgenome"]
+    // 1st pass: 각 프로젝트의 parent_project 수집
+    let mut child_of_anima: [str] = []
+    let mut child_of_nexus: [str] = []
+    let mut child_of_n6: [str] = []
+    for proj in candidates {
+        let fp = ROADMAPS + "/" + proj + ".json"
+        if file_exists_path(fp) == false { continue }
+        let pp = jq("._meta.parent_project // \"\"", fp)
+        if pp == "anima" { child_of_anima = child_of_anima + [proj] }
+        else if pp == "nexus" { child_of_nexus = child_of_nexus + [proj] }
+        else if pp == "n6-architecture" { child_of_n6 = child_of_n6 + [proj] }
+    }
+    print_crossref_branch("anima", child_of_anima)
+    print_crossref_branch("nexus", child_of_nexus)
+    print_crossref_branch("n6-architecture", child_of_n6)
+    return 0
+}
+
+fn print_crossref_branch(parent: str, kids: [str]) {
+    if len(kids) == 0 { return }
+    println(parent + ":")
+    for k in kids {
+        let fp = ROADMAPS + "/" + k + ".json"
+        let pr = jq("._meta.parent_roadmap // \"—\"", fp)
+        println("  └─ " + k + "  parent_roadmap=" + pr)
+        let phase_raw = jq_raw("(.phases // []) | map(\"\\(.id // \"?\"):\\(.status // \"?\")\") | join(\" \")", fp)
+        println("     phases: " + phase_raw.trim())
+    }
+}
+
+// ─── gap: stub/미구현 artifact + loop hook 탐지 (hexa-native) ──
+// 출력 SSOT: shared/tool/roadmap_gaps.jsonl (append-only)
+// 스캔 소스 (간소화 native 버전):
+//   1) shared/roadmaps/{project}.json task.artifact .hexa 파일만
+// 분류:
+//   MISSING  참조되는데 파일 부재
+//   STUB     파일 존재하나 본문이 stub 패턴
+fn run_gap_project(project: str) -> [str] {
+    // returns [body_text, blocking_count_str]
+    let rp = ROADMAPS + "/" + project + ".json"
+    if file_exists_path(rp) == false {
+        return ["[" + project + "] SKIP — roadmap absent", "0"]
+    }
+    let base = project_base(project)
+    // artifact + phase_status + task_status 추출
+    let q = "(.phases // []) | .[] as $ph | " +
+            "(($ph.parallel // []) | .[] as $tr | ($tr.tasks // []) | .[] as $t | " +
+            "  [($ph.id//\"?\"), ($ph.status//\"planned\"), ($tr.track//\"?\"), ($t.id//\"?\"), ($t.artifact//\"\"), ($t.status//\"todo\")] | join(\"|\")), " +
+            "(($ph.tasks // []) | .[] as $t | " +
+            "  [($ph.id//\"?\"), ($ph.status//\"planned\"), \"_\", ($t.id//\"?\"), ($t.artifact//\"\"), ($t.status//\"todo\")] | join(\"|\"))"
+    let raw = jq_raw(q, rp)
+    let lines = raw.split("\n")
+    let mut blocking: i64 = 0
+    let mut future: i64 = 0
+    let mut block_lines: [str] = []
+    let mut jsonl_gaps: [str] = []
+    let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+    for ln in lines {
+        let t = ln.trim()
+        if t.len() == 0 { continue }
+        let parts = t.split("|")
+        if len(parts) < 6 { continue }
+        let pid = parts[0]; let pst = parts[1]; let tr = parts[2]; let tid = parts[3]; let art = parts[4]; let tst = parts[5]
+        if art.len() == 0 { continue }
+        if art.ends_with(".hexa") == false { continue }
+        let full = base + "/" + art
+        let cls = classify_hexa(full)
+        let kind = cls[0]; let detail = cls[1]
+        if kind != "STUB" && kind != "MISSING" { continue }
+        let is_block = (pst == "in_progress") || (tst == "in_progress") || (tst == "done")
+        if is_block {
+            blocking = blocking + 1
+            block_lines = block_lines + ["  [BLOCK] " + pad_to(kind, 8) + " roadmap       " + pad_to(pid + "/" + tr + "/" + tid, 40) + " " + art]
+            block_lines = block_lines + ["          └─ " + detail]
+        } else {
+            future = future + 1
+        }
+        // JSONL record
+        let rec = "{\"ts\":\"" + ts + "\",\"project\":\"" + project + "\",\"source\":\"roadmap\"," +
+                  "\"key\":\"" + pid + "/" + tr + "/" + tid + "\",\"file\":\"" + art + "\"," +
+                  "\"kind\":\"" + kind + "\",\"detail\":\"" + json_esc(detail) + "\"," +
+                  "\"task_status\":\"" + tst + "\",\"phase_status\":\"" + pst + "\"," +
+                  "\"blocking\":" + (if is_block { "true" } else { "false" }) + "}"
+        jsonl_gaps = jsonl_gaps + [rec]
+    }
+    let total = blocking + future
+    let mut body = "[" + project + "] gap scan: " + to_string(blocking) + " blocking + " + to_string(future) + " future = " + to_string(total) + " total"
+    for bl in block_lines { body = body + "\n" + bl }
+    if future > 0 { body = body + "\n  + " + to_string(future) + " future-phase gaps (planned tasks) — not blocking" }
+    // JSONL append
+    if len(jsonl_gaps) > 0 {
+        let gaps_path = NEXUS + "/tool/roadmap_gaps.jsonl"
+        let mut buf = ""
+        for g in jsonl_gaps { buf = buf + g + "\n" }
+        // append via shell redirect
+        let tmp = "/tmp/roadmap_gaps_append_" + project + ".jsonl"
+        let _ = write_file(tmp, buf)
+        let _ = exec("cat " + shq(tmp) + " >> " + shq(gaps_path) + " && rm -f " + shq(tmp))  // @allow-bare-exec
+        body = body + "\n  -> " + to_string(len(jsonl_gaps)) + " gaps appended to " + gaps_path
+    }
+    return [body, to_string(blocking)]
+}
+
+fn classify_hexa(full_path: str) -> [str] {
+    if file_exists_path(full_path) == false { return ["MISSING", "file not found"] }
+    // 파일을 읽는 대신 grep 으로 패턴 스캔 (read_file 안전성 + lower 의존 회피).
+    // @allow-bare-exec
+    let grep_cmd = "grep -ciE 'not yet implemented|stub only|TODO:?[[:space:]]*implement|FIXME:?[[:space:]]*implement|unimplemented|// PLACEHOLDER|// STUB' " + shq(full_path) + " 2>/dev/null"
+    let hits = to_string(exec(grep_cmd)).trim()
+    if hits.len() > 0 && hits != "0" {
+        // 어떤 마커인지 상세 추출 (첫 1건)
+        let first = to_string(exec("grep -iEo 'not yet implemented|stub only|TODO:?[[:space:]]*implement|FIXME:?[[:space:]]*implement|unimplemented|// PLACEHOLDER|// STUB' " + shq(full_path) + " 2>/dev/null | head -1")).trim()  // @allow-bare-exec
+        return ["STUB", "marker: " + first]
+    }
+    // 본문 non-comment non-blank 라인 수 ≥ 5 체크
+    let nl_s = to_string(exec("grep -cvE '^[[:space:]]*(//|$)' " + shq(full_path) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    let nlines = str_to_i64_local(nl_s)
+    if nlines < 5 { return ["STUB", "total non-comment lines: " + to_string(nlines)] }
+    return ["OK", ""]
+}
+
+fn str_to_i64_local(s: str) -> i64 {
+    if s.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "0" { n = n * 10 }
+        else if c == "1" { n = n * 10 + 1 }
+        else if c == "2" { n = n * 10 + 2 }
+        else if c == "3" { n = n * 10 + 3 }
+        else if c == "4" { n = n * 10 + 4 }
+        else if c == "5" { n = n * 10 + 5 }
+        else if c == "6" { n = n * 10 + 6 }
+        else if c == "7" { n = n * 10 + 7 }
+        else if c == "8" { n = n * 10 + 8 }
+        else if c == "9" { n = n * 10 + 9 }
+        else { return n }
+        i = i + 1
+    }
+    return n
+}
+
+fn json_esc(s: str) -> str {
+    let mut r = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\\" { r = r + "\\\\" }
+        else if c == "\"" { r = r + "\\\"" }
+        else if c == "\n" { r = r + "\\n" }
+        else if c == "\r" { r = r + "\\r" }
+        else if c == "\t" { r = r + "\\t" }
+        else { r = r + c }
+        i = i + 1
+    }
+    return r
+}
+
+fn run_gap(projects: [str], strict: bool) -> i64 {
+    println("=== gap ===")
+    let mut total_str = ""
+    for p in projects {
+        let r = run_gap_project(p)
+        println(r[0])
+        let num_str = r[1]
+        if num_str != "0" { total_str = total_str + num_str + " " }
+    }
+    println("")
+    let strict_tag = if strict { " (strict)" } else { "" }
+    let have_gap = len(total_str) > 0
+    let gap_mark = if have_gap { total_str } else { "0" }
+    println("=== gap summary: " + gap_mark + strict_tag + " ===")
+    if strict && have_gap { return 3 }
+    return 0
+}
+
+fn write_report(projects: [str]) {
+    let mut body = "# Roadmap Report\n\n"
+    body = body + "Generated by shared/tool/roadmap_guard.hexa\n\n"
+    for p in projects {
+        let v = verify_project(p)
+        let a = run_artifacts_project(p)
+        let s = run_status_project(p)
+        body = body + "## " + p + "\n\n"
+        body = body + "### verify\n\n```\n" + v + "\n```\n\n"
+        body = body + "### artifacts\n\n```\n" + a + "\n```\n\n"
+        body = body + "### status\n\n```\n" + s + "\n```\n\n"
+    }
+    let _ = write_file(REPORT_PATH, body)
+    println("report: " + REPORT_PATH)
+}
+
+// ─── CLI entry ─────────────────────────────────────────────────
+
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only a[2] 가정 → Linux 에서 a[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut a: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        a = a + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && a.len() >= 3 {
+        if a[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < a.len() {
+                _a2 = _a2 + [a[_j2]]
+                _j2 = _j2 + 1
+            }
+            a = _a2
+        }
+    }
+    if len(a) < 3 {
+        print_usage()
+        exit(2)
+    }
+    let cmd = a[2]
+
+    // Parse optional flags
+    let mut project_filter = ""
+    let mut want_report = false
+    let mut strict = false
+    let mut i = 3
+    while i < len(a) {
+        if a[i] == "--project" {
+            if i + 1 < len(a) { project_filter = a[i+1] }
+            i = i + 2
+        } else if a[i] == "--report" {
+            want_report = true
+            i = i + 1
+        } else if a[i] == "--strict" {
+            strict = true
+            i = i + 1
+        } else {
+            i = i + 1
+        }
+    }
+
+    let all_projects = ["anima", "nexus", "n6-architecture", "zeta-surpass", "anima-train", "hexa-lang", "papers", "void", "airgenome"]
+    let mut projects: [str] = []
+    if len(project_filter) > 0 {
+        let mut ok = false
+        for p in all_projects {
+            if p == project_filter { projects = projects + [p]; ok = true }
+        }
+        if ok == false {
+            eprintln("invalid --project: " + project_filter)
+            exit(2)
+        }
+    } else {
+        projects = all_projects
+    }
+
+    let mut rc: i64 = 0
+
+    if cmd == "verify" {
+        rc = run_verify(projects)
+    } else if cmd == "artifacts" {
+        rc = run_artifacts(projects)
+    } else if cmd == "status" {
+        rc = run_status(projects)
+    } else if cmd == "crossref" {
+        rc = run_crossref()
+    } else if cmd == "gap" {
+        rc = run_gap(projects, strict)
+    } else if cmd == "all" {
+        let v = run_verify(projects)
+        let _ = run_artifacts(projects)
+        let _ = run_status(projects)
+        let _ = run_crossref()
+        if want_report { write_report(projects) }
+        rc = v
+    } else if cmd == "help" || cmd == "--help" || cmd == "-h" {
+        print_usage()
+        rc = 0
+    } else {
+        eprintln("unknown command: " + cmd)
+        print_usage()
+        rc = 2
+    }
+    exit(rc)
+}
+
+main()

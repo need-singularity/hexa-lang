@@ -1,0 +1,1198 @@
+// roadmap_auto_dispatch.hexa — NEXUS-6 roadmap_engine v2 #11 Agent 자동 dispatch
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   rmengine 이 schedule 로 계산한 ready/in_progress 노드를 Claude Code 의
+//   Agent() 호출로 "자동 발사"하기 위한 event-driven 2-tier 프로토콜.
+//
+//   hexa 로 Agent() 직접 호출 불가 → JSONL append-only 이벤트로 통신.
+//
+//     rmengine (hexa)
+//       ↓ emit dispatch events
+//     shared/tool/roadmap_dispatch.jsonl           ← 이 모듈이 append
+//       ↓ tail -f
+//     Claude Code / hive-chat loop watcher
+//       ↓ Agent() spawn per {action:"spawn_agent", node_id, prompt, slot_id}
+//       ↓ agent complete → emit reverse event
+//     shared/tool/roadmap_completions.jsonl        ← 이 모듈이 poll
+//       ↓ poll_completion() 이 match
+//     rmengine 이 graph update (후속 통합 pass)
+//
+// 관계
+//   기존 roadmap_dispatch.hexa (plan/next/explain) 와 orthogonal.
+//   기존 모듈은 "spec emit" (한 번에 plan JSONL 출력),
+//   본 모듈은 "event stream" (개별 이벤트 append + completion roundtrip).
+//   engine read-only: engine 은 본 모듈을 호출하지 않음 (후속 통합에서 연결).
+//
+// CLI
+//   emit      <roadmap.json> [--dry] [--max-slots=N] [--emit=<path>]
+//             ready/in_progress 각 노드에 대해 dispatch 이벤트 append.
+//             --dry: Agent 안 부름 (경로에 event JSONL 만 기록).
+//             --max-slots=N: 동시 활성 슬롯 제한 (기본 3).
+//
+//   poll      <node_id> [--timeout=SEC] [--completions=<path>]
+//             completions.jsonl 를 tail 하며 node_id match 찾을 때까지 대기.
+//             return: stdout=status(ok|fail|timeout), exit 0/1/2.
+//
+//   status                       현재 active slots, pending queue, 최근 events 요약.
+//
+//   prompt    <roadmap.json> <node_id>
+//             해당 노드의 agent prompt 를 stdout 에 출력 (사전 검사용).
+//
+//   --selftest                   example.json + 임시 completion 파일 검증.
+//
+// SSOT
+//   default dispatch emit:  shared/tool/roadmap_dispatch.jsonl   (append)
+//   default completions:    shared/tool/roadmap_completions.jsonl (append)
+//   slot state:             shared/tool/roadmap_slots.json        (mutate, not append)
+//
+// EVENT SCHEMAS
+//   dispatch:  {ts, action:"spawn_agent", node_id, prompt, slot_id,
+//               roadmap, ntype, subagent_hint, priority, dry_run}
+//   completion:{ts, node_id, status:"ok"|"fail"|"timeout", duration_s, slot_id?,
+//               message?}
+//
+// EXIT
+//   0 success / 1 bounded-slot cap hit (some deferred) / 2 usage
+//   3 parse / 4 timeout (poll) / 5 slot-state corruption
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS_ENV = env("NEXUS")
+let NEXUS = if NEXUS_ENV == "" { HOME + "/Dev/nexus" } else { NEXUS_ENV }  // @allow-devpath
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let GO_TRACKS = HARNESS + "/go_tracks"
+let DEFAULT_DISPATCH = HARNESS + "/roadmap_dispatch.jsonl"
+let DEFAULT_COMPLETIONS = HARNESS + "/roadmap_completions.jsonl"
+let SLOT_STATE = HARNESS + "/roadmap_slots.json"
+let DEFAULT_MAX_SLOTS: i64 = 3
+
+// ── void-safe coercion ───────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+fn _epoch() -> i64 {
+    let s = _str(exec("date +%s")).trim()  // @allow-bare-exec
+    if s.len() == 0 { return 0 }
+    return to_int(s)
+}
+
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+// ── ensure parent dir ────────────────────────────────────────────────────
+fn ensure_parent_dir(path: string) {
+    let mut last: i64 = -1
+    let mut i: i64 = 0
+    while i < path.len() {
+        if path.substring(i, i + 1) == "/" { last = i }
+        i = i + 1
+    }
+    if last > 0 {
+        let dir = path.substring(0, last)
+        let _ = exec("mkdir -p '" + dir + "' 2>/dev/null")  // @allow-bare-exec
+    }
+}
+
+// ── escape JSON string ───────────────────────────────────────────────────
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ── JSON field extractors (text-based, for local reuse) ──────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    return [body.substring(start, j), to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node / Roadmap lightweight model ─────────────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    description: string,
+    cost: f64,
+    p_success: f64,
+    progress: f64,
+    status: string,
+    deps: [string],
+    soft_deps: [string],
+    project: string,
+    phase: string
+}
+
+fn parse_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let desc = json_str(raw, "description")
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let pg = json_num(raw, "progress")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let project = json_str(raw, "project")
+    let phase = json_str(raw, "phase")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        description: desc, cost: cost, p_success: p2,
+        progress: pg, status: st,
+        deps: deps, soft_deps: soft,
+        project: project, phase: phase
+    }
+}
+
+struct Roadmap {
+    id: string,
+    goal: string,
+    description: string,
+    K_target: f64,
+    C_channel: f64,
+    nodes: [Node]
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    // meta body 분리
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let rid = json_str(meta_body, "id")
+    let goal = json_str(meta_body, "goal")
+    let desc = json_str(meta_body, "description")
+    let K = json_num(meta_body, "K_target")
+    let C = json_num(meta_body, "C_channel")
+    let blocks = split_nodes(body)
+    let mut nodes: [Node] = []
+    let mut i: i64 = 0
+    while i < blocks.len() {
+        let n = parse_node(_str(blocks[i]))
+        if n.id.len() > 0 { nodes = nodes.push(n) }
+        i = i + 1
+    }
+    return Roadmap {
+        id: rid, goal: goal, description: desc,
+        K_target: K, C_channel: C, nodes: nodes
+    }
+}
+
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn ntype_skip(ntype: string) -> bool {
+    return ntype == "seed" || ntype == "goal"
+}
+
+// ── priority estimator (effective remaining cost proxy) ──────────────────
+fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+    if is_done(n.status) { return 0.0 }
+    let t = n.ntype
+    let mut c: f64 = n.cost
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        c = n.cost / p
+    } else if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let cc = if C <= 0.0 { 1.0 } else { C }
+        c = (k / cc) + (n.cost * 0.25)
+    }
+    if n.status == "in_progress" {
+        let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+        return c * (1.0 - p)
+    }
+    return c
+}
+
+// ── upstream (done deps) / downstream labels ─────────────────────────────
+fn done_deps_label(rm: Roadmap, n: Node) -> string {
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < n.deps.len() {
+        let did = _str(n.deps[i])
+        let di = idx_of(rm.nodes, did)
+        if di >= 0 && is_done(rm.nodes[di].status) {
+            if out.len() > 0 { out = out + ", " }
+            out = out + did
+        }
+        i = i + 1
+    }
+    if out == "" { out = "(none)" }
+    return out
+}
+
+fn downstream_label(rm: Roadmap, n: Node) -> string {
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        let m = rm.nodes[i]
+        let mut j: i64 = 0
+        while j < m.deps.len() {
+            if _str(m.deps[j]) == n.id {
+                if out.len() > 0 { out = out + ", " }
+                out = out + m.id
+                break
+            }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    if out == "" { out = "(terminal)" }
+    return out
+}
+
+// ── expected artifacts hint by ntype ─────────────────────────────────────
+fn artifacts_hint(n: Node) -> string {
+    let t = n.ntype
+    if t == "build"  { return "- 구현 파일 (새/수정), selftest PASS, atlas.n6 업데이트 (해당 시)" }
+    if t == "exp"    { return "- 실험 1회 실행 결과, observations JSONL, p_success 보고" }
+    if t == "learn"  { return "- 학습 요약 + 핵심 3요점, 후속 research 후보" }
+    if t == "boot"   { return "- bootstrap 완료, n_uses 증가, reusable asset" }
+    if t == "verify" { return "- 검증 리포트 (PASS/FAIL + 근거), lint/test 결과" }
+    return "- 작업 완료, 산출 파일 또는 commit, 결과 보고"
+}
+
+// ── template fallback lookup (nexus go_tracks/*.md 패턴) ─────────────────
+// example.json 같은 generic roadmap 에는 track 파일 없음 — built-in template 사용.
+// project 필드가 있으면 go_tracks/<project>.md 우선 확인.
+fn track_template_body(project: string) -> string {
+    if project == "" { return "" }
+    let p = GO_TRACKS + "/" + project + ".md"
+    if file_exists(p) == false { return "" }
+    let body = _str(read_file(p))
+    return body
+}
+
+// ── CORE: build_agent_prompt(node, roadmap, extra context) ───────────────
+// 반환: Agent 에게 전달할 full prompt (markdown-ish, 한 블록).
+fn build_agent_prompt(rm: Roadmap, n: Node) -> string {
+    let done_deps = done_deps_label(rm, n)
+    let downstream = downstream_label(rm, n)
+    let artifacts = artifacts_hint(n)
+    let cost_s = to_string(n.cost)
+    let prio = remaining_cost(n, rm.K_target, rm.C_channel)
+
+    // project/phase 라벨 구성
+    let mut proj = n.project
+    if proj == "" { proj = rm.id }
+    let mut phase = n.phase
+    if phase == "" { phase = n.ntype }
+
+    // description fallback
+    let mut desc = n.description
+    if desc == "" { desc = n.name }
+
+    // phase context — go_tracks/*.md 있으면 앞쪽 50 lines 만 inject (context budget)
+    let mut phase_ctx = ""
+    let track_body = track_template_body(n.project)
+    if track_body.len() > 0 {
+        let lines = track_body.split("\n")
+        let limit = if lines.len() > 50 { 50 } else { lines.len() }
+        let mut li: i64 = 0
+        while li < limit {
+            if phase_ctx.len() > 0 { phase_ctx = phase_ctx + "\n" }
+            phase_ctx = phase_ctx + _str(lines[li])
+            li = li + 1
+        }
+        phase_ctx = "## Phase context (from go_tracks/" + n.project + ".md)\n"
+            + phase_ctx + "\n"
+    }
+
+    // assembly — markdown, 직접 Agent().prompt 으로 전달 가능
+    let mut p = ""
+    p = p + "# " + n.id + " (" + proj + "/" + phase + ")\n\n"
+    p = p + "## Context\n"
+    p = p + "- roadmap: " + rm.id + "\n"
+    p = p + "- ntype: " + n.ntype + " (cost=" + cost_s + ", priority=" + to_string(prio) + ")\n"
+    p = p + "- status: " + n.status + "\n"
+    p = p + "- upstream done: " + done_deps + "\n"
+    p = p + "- downstream waiting: " + downstream + "\n"
+    if rm.description != "" {
+        p = p + "- roadmap goal: " + rm.description + "\n"
+    }
+    p = p + "\n"
+    if phase_ctx.len() > 0 { p = p + phase_ctx + "\n" }
+    p = p + "## Task\n"
+    p = p + desc + "\n\n"
+    p = p + "## Expected output\n"
+    p = p + artifacts + "\n\n"
+    p = p + "## Tool restrictions\n"
+    p = p + "- default: 모든 tool 허용\n"
+    p = p + "- L0 보호파일 수정 금지 (CLAUDE.md 참조)\n"
+    p = p + "- git push 는 사용자 명시 요청 시만\n\n"
+    p = p + "## Completion signal (MANDATORY)\n"
+    p = p + "작업 끝나면 반드시 아래 명령으로 completion event 를 append:\n"
+    p = p + "```\n"
+    p = p + "hexa " + HARNESS + "/roadmap_auto_dispatch.hexa "
+    p = p + "_emit_completion " + n.id + " <ok|fail> <duration_s> \"<message>\"\n"
+    p = p + "```\n"
+    p = p + "또는 직접 JSONL append:\n"
+    p = p + "```\n"
+    p = p + "{\"ts\":\"<iso8601>\",\"node_id\":\"" + n.id + "\",\"status\":\"ok\","
+    p = p + "\"duration_s\":<N>,\"message\":\"...\"} >> "
+    p = p + DEFAULT_COMPLETIONS + "\n"
+    p = p + "```\n"
+    return p
+}
+
+// ── CORE: emit_dispatch_event(node_id, prompt, slot) ─────────────────────
+// JSONL append to DEFAULT_DISPATCH (또는 target).
+// slot_id 는 bounded_worker_slots() 에서 할당된 번호 (1..max).
+struct DispatchEvent {
+    node_id: string,
+    prompt: string,
+    slot_id: i64,
+    roadmap: string,
+    ntype: string,
+    priority: f64,
+    dry_run: bool
+}
+
+fn make_dispatch_line(ev: DispatchEvent) -> string {
+    let mut s = "{"
+    s = s + "\"ts\":\"" + _ts_iso() + "\""
+    s = s + ",\"action\":\"spawn_agent\""
+    s = s + ",\"node_id\":\"" + escape_json(ev.node_id) + "\""
+    s = s + ",\"roadmap\":\"" + escape_json(ev.roadmap) + "\""
+    s = s + ",\"ntype\":\"" + escape_json(ev.ntype) + "\""
+    s = s + ",\"priority\":" + to_string(ev.priority)
+    s = s + ",\"slot_id\":" + to_string(ev.slot_id)
+    s = s + ",\"subagent_hint\":\"general-purpose\""
+    s = s + ",\"dry_run\":" + to_string(ev.dry_run)
+    s = s + ",\"prompt\":\"" + escape_json(ev.prompt) + "\""
+    s = s + "}"
+    return s
+}
+
+fn emit_dispatch_event(target_path: string, ev: DispatchEvent) -> bool {
+    let path = if target_path == "" { DEFAULT_DISPATCH } else { target_path }
+    ensure_parent_dir(path)
+    let line = make_dispatch_line(ev) + "\n"
+    append_file(path, line)
+    return true
+}
+
+// ── CORE: poll_completion(node_id, timeout_s) ────────────────────────────
+// completions.jsonl 를 tail 하여 해당 node_id 의 status 반환.
+// timeout 내 찾지 못하면 "timeout".
+// 단순 polling: 1초 sleep + 매번 전체 파일 grep (파일 크기 제한 시 OK).
+// 대용량 파일이면 byte offset 추적이 필요하지만, event JSONL 은 roll-over 권장.
+fn poll_completion(comp_path: string, node_id: string, timeout_s: i64) -> string {
+    let path = if comp_path == "" { DEFAULT_COMPLETIONS } else { comp_path }
+    let start = _epoch()
+    let mut elapsed: i64 = 0
+    while elapsed <= timeout_s {
+        if file_exists(path) {
+            let raw = _str(read_file(path))
+            let lines = raw.split("\n")
+            // reverse scan (가장 최근 match 채택)
+            let mut li: i64 = lines.len() - 1
+            while li >= 0 {
+                let ln = _str(lines[li])
+                if ln.len() > 0 && ln.contains("\"node_id\":\"" + node_id + "\"") {
+                    let st = json_str(ln, "status")
+                    if st != "" { return st }
+                }
+                li = li - 1
+            }
+        }
+        // exec sleep 1 (hexa sleep() 있지만 exec 로 통일)
+        let _ = exec("sleep 1")  // @allow-bare-exec
+        elapsed = _epoch() - start
+    }
+    return "timeout"
+}
+
+// ── CORE: bounded_worker_slots — slot 할당/해제 ──────────────────────────
+// SLOT_STATE JSON: {"max": N, "active": [{"slot_id":1, "node_id":"X", "ts":"..."}]}
+// 반환: 할당된 slot_id (1..max) 또는 -1 (포화).
+fn read_slot_state() -> string {
+    if file_exists(SLOT_STATE) == false { return "" }
+    return _str(read_file(SLOT_STATE))
+}
+
+fn write_slot_state(body: string) {
+    ensure_parent_dir(SLOT_STATE)
+    write_file(SLOT_STATE, body)
+}
+
+// active slot count 계산 (JSON 배열 요소 수 = "slot_id" 등장 횟수).
+fn count_active_slots(state: string) -> i64 {
+    if state.len() == 0 { return 0 }
+    let mut c: i64 = 0
+    let mut i: i64 = 0
+    let key = "\"slot_id\""
+    while i < state.len() {
+        let j = _find_after(state, key, i)
+        if j < 0 { break }
+        c = c + 1
+        i = j + key.len()
+    }
+    return c
+}
+
+fn slot_in_use(state: string, slot_id: i64) -> bool {
+    if state.len() == 0 { return false }
+    let tag = "\"slot_id\":" + to_string(slot_id)
+    return _find_after(state, tag, 0) >= 0
+}
+
+// active 한 slot 중 가장 작은 미사용 번호 반환 (-1 = 포화).
+fn bounded_worker_slots(max_slots: i64) -> i64 {
+    let mx = if max_slots <= 0 { DEFAULT_MAX_SLOTS } else { max_slots }
+    let state = read_slot_state()
+    let used = count_active_slots(state)
+    if used >= mx { return -1 }
+    let mut s: i64 = 1
+    while s <= mx {
+        if slot_in_use(state, s) == false { return s }
+        s = s + 1
+    }
+    return -1
+}
+
+// slot 추가 (append-ish JSON rewrite — active 배열 끝에 요소 추가).
+fn allocate_slot(slot_id: i64, node_id: string) {
+    let state = read_slot_state()
+    let entry = "{\"slot_id\":" + to_string(slot_id)
+        + ",\"node_id\":\"" + escape_json(node_id) + "\""
+        + ",\"ts\":\"" + _ts_iso() + "\"}"
+    let mut body = state
+    if body.len() == 0 {
+        body = "{\"max\":" + to_string(DEFAULT_MAX_SLOTS)
+            + ",\"active\":[" + entry + "]}"
+        write_slot_state(body)
+        return
+    }
+    // find "active":[ and insert before closing ]
+    let key = "\"active\""
+    let ki = _find_after(body, key, 0)
+    if ki < 0 {
+        // malformed — reset
+        body = "{\"max\":" + to_string(DEFAULT_MAX_SLOTS)
+            + ",\"active\":[" + entry + "]}"
+        write_slot_state(body)
+        return
+    }
+    // 찾기: [
+    let mut i = ki + key.len()
+    while i < body.len() && body.substring(i, i + 1) != "[" { i = i + 1 }
+    if i >= body.len() {
+        body = "{\"max\":" + to_string(DEFAULT_MAX_SLOTS)
+            + ",\"active\":[" + entry + "]}"
+        write_slot_state(body)
+        return
+    }
+    // depth 카운트로 배열 끝 ] 찾기
+    let arr_start = i + 1
+    let mut depth: i64 = 1
+    let mut j = arr_start
+    let mut in_str: bool = false
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if in_str {
+            if c == "\\" { j = j + 2; continue }
+            if c == "\"" { in_str = false }
+            j = j + 1
+            continue
+        }
+        if c == "\"" { in_str = true; j = j + 1; continue }
+        if c == "[" { depth = depth + 1 }
+        else if c == "]" { depth = depth - 1; if depth == 0 { break } }
+        j = j + 1
+    }
+    if j >= body.len() {
+        // malformed — reset
+        body = "{\"max\":" + to_string(DEFAULT_MAX_SLOTS)
+            + ",\"active\":[" + entry + "]}"
+        write_slot_state(body)
+        return
+    }
+    let before = body.substring(0, j)
+    let after = body.substring(j, body.len())
+    let sep = if before.substring(before.len() - 1, before.len()) == "[" { "" } else { "," }
+    let new_body = before + sep + entry + after
+    write_slot_state(new_body)
+}
+
+// slot 해제 — node_id 매칭되는 entry 제거.
+fn release_slot_by_node(node_id: string) {
+    let state = read_slot_state()
+    if state.len() == 0 { return }
+    let target = "\"node_id\":\"" + escape_json(node_id) + "\""
+    let ti = _find_after(state, target, 0)
+    if ti < 0 { return }
+    // entry 시작 { 찾기 (ti 로부터 역방향)
+    let mut s = ti
+    while s > 0 && state.substring(s, s + 1) != "{" { s = s - 1 }
+    // entry 끝 } 찾기
+    let mut e = ti
+    let mut depth: i64 = 0
+    while e < state.len() {
+        let c = state.substring(e, e + 1)
+        if c == "{" { depth = depth + 1 }
+        else if c == "}" { depth = depth - 1; if depth == 0 { e = e + 1; break } }
+        e = e + 1
+    }
+    // 선행/후행 콤마 정리
+    let mut cut_start = s
+    let mut cut_end = e
+    if cut_start > 0 && state.substring(cut_start - 1, cut_start) == "," {
+        cut_start = cut_start - 1
+    } else if cut_end < state.len() && state.substring(cut_end, cut_end + 1) == "," {
+        cut_end = cut_end + 1
+    }
+    let new_body = state.substring(0, cut_start) + state.substring(cut_end, state.len())
+    write_slot_state(new_body)
+}
+
+// reset slot state (selftest 용).
+fn reset_slot_state() {
+    let body = "{\"max\":" + to_string(DEFAULT_MAX_SLOTS) + ",\"active\":[]}"
+    write_slot_state(body)
+}
+
+// ── actionable nodes (ready ∪ in_progress, skipped 제외) ─────────────────
+fn collect_actionable(rm: Roadmap) -> [Node] {
+    let mut out: [Node] = []
+    let mut i: i64 = 0
+    while i < rm.nodes.len() {
+        let n = rm.nodes[i]
+        if ntype_skip(n.ntype) { i = i + 1; continue }
+        if n.status == "in_progress" { out = out.push(n); i = i + 1; continue }
+        if n.status == "todo" || n.status == "planned" {
+            let mut all_done: bool = true
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let pi = idx_of(rm.nodes, _str(n.deps[j]))
+                if pi < 0 { all_done = false; break }
+                if is_done(rm.nodes[pi].status) == false { all_done = false; break }
+                j = j + 1
+            }
+            if all_done { out = out.push(n) }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// priority desc sort (bubble, n<200).
+fn sort_by_priority_desc(rm: Roadmap, nodes: [Node]) -> [Node] {
+    let mut arr = nodes
+    let n = arr.len()
+    let mut a: i64 = 0
+    while a < n {
+        let mut b: i64 = 0
+        while b < n - 1 - a {
+            let pa = remaining_cost(arr[b], rm.K_target, rm.C_channel)
+            let pb = remaining_cost(arr[b + 1], rm.K_target, rm.C_channel)
+            if pa < pb {
+                let tmp = arr[b]
+                let mut rebuilt: [Node] = []
+                let mut z: i64 = 0
+                while z < arr.len() {
+                    if z == b { rebuilt = rebuilt.push(arr[b + 1]) }
+                    else if z == b + 1 { rebuilt = rebuilt.push(tmp) }
+                    else { rebuilt = rebuilt.push(arr[z]) }
+                    z = z + 1
+                }
+                arr = rebuilt
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return arr
+}
+
+// ── command: emit ────────────────────────────────────────────────────────
+fn cmd_emit(path: string, dry: bool, max_slots: i64, emit_target: string) -> i64 {
+    let rm = load_roadmap(path)
+    let actionable = collect_actionable(rm)
+    if actionable.len() == 0 {
+        eprintln("WARN: no actionable nodes")
+        return 1
+    }
+    let sorted = sort_by_priority_desc(rm, actionable)
+
+    // dry-run 일 때는 slot state reset (테스트 격리).
+    if dry { reset_slot_state() }
+
+    let mut emitted: i64 = 0
+    let mut deferred: i64 = 0
+    let mut i: i64 = 0
+    while i < sorted.len() {
+        let n = sorted[i]
+        let slot = bounded_worker_slots(max_slots)
+        if slot < 0 {
+            deferred = deferred + 1
+            i = i + 1
+            continue
+        }
+        let prompt = build_agent_prompt(rm, n)
+        let pr = remaining_cost(n, rm.K_target, rm.C_channel)
+        let ev = DispatchEvent {
+            node_id: n.id,
+            prompt: prompt,
+            slot_id: slot,
+            roadmap: rm.id,
+            ntype: n.ntype,
+            priority: pr,
+            dry_run: dry
+        }
+        let target = if emit_target == "" { DEFAULT_DISPATCH } else { emit_target }
+        let _ = emit_dispatch_event(target, ev)
+        allocate_slot(slot, n.id)
+        emitted = emitted + 1
+        i = i + 1
+    }
+
+    eprintln("dispatch: emitted=" + to_string(emitted)
+        + " deferred=" + to_string(deferred)
+        + " dry=" + to_string(dry)
+        + " max_slots=" + to_string(max_slots))
+    // dry-run 끝나면 slot state 다시 reset (clean 상태 남김).
+    if dry { reset_slot_state() }
+    if deferred > 0 { return 1 }
+    return 0
+}
+
+// ── command: poll ────────────────────────────────────────────────────────
+fn cmd_poll(node_id: string, timeout_s: i64, comp_path: string) -> i64 {
+    let st = poll_completion(comp_path, node_id, timeout_s)
+    println(st)
+    if st == "ok" { return 0 }
+    if st == "fail" { return 1 }
+    return 4   // timeout
+}
+
+// ── command: status ──────────────────────────────────────────────────────
+fn cmd_status() -> i64 {
+    let state = read_slot_state()
+    let active = count_active_slots(state)
+    println("=== roadmap_auto_dispatch status ===")
+    println("slot state    : " + SLOT_STATE)
+    println("active slots  : " + to_string(active))
+    if state.len() > 0 { println("state body    : " + state) }
+    let dcount = _str(exec("wc -l < " + DEFAULT_DISPATCH + " 2>/dev/null")).trim()  // @allow-bare-exec
+    let ccount = _str(exec("wc -l < " + DEFAULT_COMPLETIONS + " 2>/dev/null")).trim()  // @allow-bare-exec
+    println("dispatch log  : " + DEFAULT_DISPATCH + "  (lines=" + dcount + ")")
+    println("completions   : " + DEFAULT_COMPLETIONS + "  (lines=" + ccount + ")")
+    return 0
+}
+
+// ── command: prompt ──────────────────────────────────────────────────────
+fn cmd_prompt(path: string, nid: string) -> i64 {
+    let rm = load_roadmap(path)
+    let ni = idx_of(rm.nodes, nid)
+    if ni < 0 {
+        eprintln("REJECT: node not found: " + nid)
+        return 3
+    }
+    let n = rm.nodes[ni]
+    if ntype_skip(n.ntype) {
+        eprintln("REJECT: ntype=" + n.ntype + " skipped (seed/goal)")
+        return 1
+    }
+    let p = build_agent_prompt(rm, n)
+    println(p)
+    return 0
+}
+
+// ── internal: emit_completion (agent 가 호출하는 헬퍼) ───────────────────
+fn cmd_emit_completion(nid: string, status: string, duration_s: string, message: string) -> i64 {
+    let comp = DEFAULT_COMPLETIONS
+    ensure_parent_dir(comp)
+    let mut line = "{"
+    line = line + "\"ts\":\"" + _ts_iso() + "\""
+    line = line + ",\"node_id\":\"" + escape_json(nid) + "\""
+    line = line + ",\"status\":\"" + escape_json(status) + "\""
+    line = line + ",\"duration_s\":" + duration_s
+    line = line + ",\"message\":\"" + escape_json(message) + "\""
+    line = line + "}"
+    append_file(comp, line + "\n")
+    // slot 해제
+    release_slot_by_node(nid)
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn selftest() -> i64 {
+    println("[selftest] using example.json")
+    let path = ROADMAPS + "/example.json"
+    if file_exists(path) == false {
+        eprintln("REJECT: example missing: " + path); return 3
+    }
+    let rm = load_roadmap(path)
+    println("[selftest] nodes=" + to_string(rm.nodes.len()))
+    let act = collect_actionable(rm)
+    println("[selftest] actionable=" + to_string(act.len()))
+    if act.len() == 0 {
+        eprintln("REJECT: expected ≥1 actionable"); return 1
+    }
+
+    // 1) build_agent_prompt non-empty 검증
+    let mut i: i64 = 0
+    while i < act.len() {
+        let n = act[i]
+        let p = build_agent_prompt(rm, n)
+        if p.len() == 0 {
+            eprintln("REJECT: empty prompt @ " + n.id); return 1
+        }
+        if p.contains(n.id) == false {
+            eprintln("REJECT: prompt missing node id @ " + n.id); return 1
+        }
+        if p.contains("## Task") == false {
+            eprintln("REJECT: prompt missing Task section @ " + n.id); return 1
+        }
+        if p.contains("roadmap_completions.jsonl") == false {
+            eprintln("REJECT: prompt missing completion hint @ " + n.id); return 1
+        }
+        i = i + 1
+    }
+    println("[selftest] prompt template OK for " + to_string(act.len()) + " nodes")
+
+    // 2) bounded_worker_slots 검증 — reset 후 3회 할당 후 포화 확인
+    reset_slot_state()
+    let s1 = bounded_worker_slots(3)
+    allocate_slot(s1, "t_a")
+    let s2 = bounded_worker_slots(3)
+    allocate_slot(s2, "t_b")
+    let s3 = bounded_worker_slots(3)
+    allocate_slot(s3, "t_c")
+    let s4 = bounded_worker_slots(3)
+    if s1 != 1 || s2 != 2 || s3 != 3 {
+        eprintln("REJECT: slot allocation order unexpected: "
+            + to_string(s1) + "/" + to_string(s2) + "/" + to_string(s3))
+        return 1
+    }
+    if s4 != -1 {
+        eprintln("REJECT: bounded cap failed — got slot " + to_string(s4) + " (expected -1)")
+        return 1
+    }
+    println("[selftest] bounded slots cap works (1,2,3 then -1)")
+
+    // 3) release + realloc 검증
+    release_slot_by_node("t_b")
+    let s5 = bounded_worker_slots(3)
+    if s5 != 2 {
+        eprintln("REJECT: release_slot_by_node failed — got " + to_string(s5) + " expected 2")
+        return 1
+    }
+    println("[selftest] slot release + realloc OK")
+    reset_slot_state()
+
+    // 4) emit_dispatch_event round-trip to /tmp
+    let out = "/tmp/roadmap_auto_dispatch_selftest.jsonl"
+    let _ = exec("rm -f " + out)  // @allow-bare-exec
+    let rc = cmd_emit(path, true, 3, out)
+    if rc > 1 {
+        eprintln("REJECT: cmd_emit rc=" + to_string(rc) + " >1")
+        return 1
+    }
+    let cnt = _str(exec("wc -l < " + out + " 2>/dev/null")).trim()  // @allow-bare-exec
+    println("[selftest] emitted lines: " + cnt + " → " + out)
+    if to_int(cnt) < 1 {
+        eprintln("REJECT: no events emitted"); return 1
+    }
+    // 샘플 이벤트 검증 (첫 라인 파싱)
+    let body = _str(read_file(out))
+    let first_nl = body.index_of("\n")
+    let sample = if first_nl > 0 { body.substring(0, first_nl) } else { body }
+    if sample.contains("\"action\":\"spawn_agent\"") == false {
+        eprintln("REJECT: sample missing action=spawn_agent: " + sample)
+        return 1
+    }
+    if sample.contains("\"dry_run\":true") == false {
+        eprintln("REJECT: sample missing dry_run=true (dry mode)"); return 1
+    }
+    println("[selftest] sample event verified: spawn_agent + dry_run=true")
+
+    // 5) poll_completion round-trip — /tmp completions 에 미리 write 후 poll.
+    let comp_tmp = "/tmp/roadmap_auto_dispatch_selftest_comp.jsonl"
+    let _ = exec("rm -f " + comp_tmp)  // @allow-bare-exec
+    let fake = "{\"ts\":\"" + _ts_iso() + "\",\"node_id\":\"P7\",\"status\":\"ok\",\"duration_s\":42,\"message\":\"test\"}\n"
+    append_file(comp_tmp, fake)
+    let st = poll_completion(comp_tmp, "P7", 2)
+    if st != "ok" {
+        eprintln("REJECT: poll_completion expected ok, got " + st)
+        return 1
+    }
+    println("[selftest] poll_completion match OK (status=ok)")
+
+    // 6) poll_completion timeout (짧은 타임아웃, 존재하지 않는 node_id)
+    let st2 = poll_completion(comp_tmp, "nonexistent_XYZ", 1)
+    if st2 != "timeout" {
+        eprintln("REJECT: expected timeout, got " + st2)
+        return 1
+    }
+    println("[selftest] poll_completion timeout OK")
+
+    println("[selftest] ALL OK")
+    return 0
+}
+
+// ── usage ────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage: roadmap_auto_dispatch <subcommand> [args]")
+    eprintln("  emit    <roadmap.json> [--dry] [--max-slots=N] [--emit=<path>]")
+    eprintln("  poll    <node_id> [--timeout=SEC] [--completions=<path>]")
+    eprintln("  status")
+    eprintln("  prompt  <roadmap.json> <node_id>")
+    eprintln("  _emit_completion <node_id> <ok|fail> <dur_s> <msg>   (agent internal)")
+    eprintln("  --selftest")
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 { usage(); exit(2) }
+
+    let sub = _str(a[0])
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        usage(); exit(0)
+    }
+
+    if sub == "emit" {
+        if a.len() < 2 { usage(); exit(2) }
+        let path = _str(a[1])
+        let mut dry: bool = false
+        let mut mx: i64 = DEFAULT_MAX_SLOTS
+        let mut emit_target = ""
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg == "--dry" { dry = true }
+            else if arg.starts_with("--max-slots=") {
+                let v = arg.substring(12, arg.len())
+                if v.len() > 0 { mx = to_int(v) }
+            }
+            else if arg.starts_with("--emit=") {
+                emit_target = arg.substring(7, arg.len())
+            }
+            k = k + 1
+        }
+        let rc = cmd_emit(path, dry, mx, emit_target)
+        exit(rc)
+    }
+
+    if sub == "poll" {
+        if a.len() < 2 { usage(); exit(2) }
+        let nid = _str(a[1])
+        let mut timeout_s: i64 = 300
+        let mut comp = ""
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg.starts_with("--timeout=") {
+                let v = arg.substring(10, arg.len())
+                if v.len() > 0 { timeout_s = to_int(v) }
+            }
+            else if arg.starts_with("--completions=") {
+                comp = arg.substring(14, arg.len())
+            }
+            k = k + 1
+        }
+        let rc = cmd_poll(nid, timeout_s, comp)
+        exit(rc)
+    }
+
+    if sub == "status" {
+        let rc = cmd_status()
+        exit(rc)
+    }
+
+    if sub == "prompt" {
+        if a.len() < 3 { usage(); exit(2) }
+        let path = _str(a[1])
+        let nid = _str(a[2])
+        let rc = cmd_prompt(path, nid)
+        exit(rc)
+    }
+
+    if sub == "_emit_completion" {
+        if a.len() < 5 { usage(); exit(2) }
+        let nid = _str(a[1])
+        let status = _str(a[2])
+        let dur = _str(a[3])
+        let msg = _str(a[4])
+        let rc = cmd_emit_completion(nid, status, dur, msg)
+        exit(rc)
+    }
+
+    eprintln("REJECT: unknown subcommand: " + sub)
+    usage()
+    exit(2)
+}
+
+main()

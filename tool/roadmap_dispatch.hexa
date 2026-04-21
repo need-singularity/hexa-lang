@@ -1,0 +1,940 @@
+// roadmap_dispatch.hexa — NEXUS-6 roadmap_engine v2 #11 Agent dispatch adapter
+// @no-lock-needed
+// @allow-bare-exec
+// @no-sandbox
+//
+// ═══════════════════════════════════════════════════════════════════════════
+// PURPOSE
+//   roadmap_engine --dispatch 의 plan JSON 출력만으로는 Claude Code 가
+//   subagent_type/prompt 를 알 수 없다. 본 어댑터는 ready ∪ in_progress 노드
+//   에 대해 dispatch_spec 을 JSONL 로 emit, Agent tool 호출을 위한 self-
+//   contained prompt 를 자동 생성한다.
+//
+// MAPPING (ntype → subagent_type, template)
+//   build  → general-purpose / "build 구현"
+//   exp    → general-purpose / "실험 설계 + 1회 실행"
+//   learn  → Explore         / "코드/문서 학습"
+//   boot   → general-purpose / "boot 작업"
+//   verify → code-reviewer   / "검증"        (없으면 general-purpose)
+//   seed   → skip (사람 handoff)
+//   goal   → skip
+//
+//   각 Node 에 선택적 필드 "action_agent" 가 있으면 mapping override.
+//
+// CLI
+//   plan    <roadmap.json> [--emit=<out.jsonl>]   ready+in_progress 전체 JSONL
+//   next    <roadmap.json>                          최우선 1개 tab-구분 한줄
+//   explain <roadmap.json> <node_id>                상세 spec (prompt full)
+//   --selftest                                      example.json 검증
+//
+// SSOT
+//   default emit log: shared/tool/dispatch_log.jsonl  (append)
+//
+// EXIT
+//   0 success / 1 no actionable nodes (plan/next) / 2 usage / 3 parse / 4 not-found (explain)
+// ═══════════════════════════════════════════════════════════════════════════
+
+let HOME = env("HOME")
+let NEXUS = HOME + "/Dev/nexus"
+let HARNESS = NEXUS + "/harness"
+let ROADMAPS = NEXUS + "/roadmaps"
+let DEFAULT_LOG = HARNESS + "/dispatch_log.jsonl"
+
+// ── void-safe coercion ────────────────────────────────────────────────────
+fn _str(x) -> string {
+    let t = type_of(x)
+    if t == "str" || t == "string" { return x }
+    return ""
+}
+
+fn is_digit(c: string) -> bool {
+    return c == "0" || c == "1" || c == "2" || c == "3" || c == "4"
+        || c == "5" || c == "6" || c == "7" || c == "8" || c == "9"
+}
+
+fn is_num_char(c: string) -> bool {
+    if is_digit(c) { return true }
+    return c == "." || c == "-" || c == "+" || c == "e" || c == "E"
+}
+
+fn _ts_iso() -> string {
+    return _str(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()  // @allow-bare-exec
+}
+
+// f64 → i64 truncate (to_int 함정 회피)
+fn f_to_i(x: f64) -> i64 {
+    let s = to_string(x)
+    let dot = s.index_of(".")
+    let body = if dot >= 0 { s.substring(0, dot) } else { s }
+    if body == "" || body == "-" { return 0 }
+    return to_int(body)
+}
+
+// ── _idx_of for [string] (missing-key void 회피) ─────────────────────────
+fn _idx_of_s(xs: [string], v: string) -> i64 {
+    let mut i: i64 = 0
+    while i < xs.len() {
+        if _str(xs[i]) == v { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ── text-based JSON field extract ────────────────────────────────────────
+fn _find_after(hay: string, needle: string, from: i64) -> i64 {
+    let mut i = from
+    let nl = needle.len()
+    let hl = hay.len()
+    while i + nl <= hl {
+        if hay.substring(i, i + nl) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn json_str_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() { return ["", "-1"] }
+    if body.substring(i, i + 1) != "\"" { return ["", "-1"] }
+    let start = i + 1
+    let mut j = start
+    while j < body.len() {
+        let c = body.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { break }
+        j = j + 1
+    }
+    if j >= body.len() { return ["", "-1"] }
+    let v = body.substring(start, j)
+    return [v, to_string(j + 1)]
+}
+
+fn json_num_at(body: string, key: string, from: i64) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, from)
+    if ki < 0 { return ["", "-1"] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    let start = i
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if is_num_char(c) { i = i + 1 }
+        else { break }
+    }
+    if i == start { return ["", "-1"] }
+    return [body.substring(start, i), to_string(i)]
+}
+
+fn json_str(body: string, key: string) -> string {
+    let r = json_str_at(body, key, 0)
+    return _str(r[0])
+}
+
+fn json_num(body: string, key: string) -> f64 {
+    let r = json_num_at(body, key, 0)
+    let s = _str(r[0])
+    if s.len() == 0 { return 0.0 }
+    return to_float(s)
+}
+
+fn json_str_array(body: string, key: string) -> [string] {
+    let k = "\"" + key + "\""
+    let ki = _find_after(body, k, 0)
+    if ki < 0 { return [] }
+    let mut i = ki + k.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 1
+    while i < body.len() && depth > 0 {
+        let c = body.substring(i, i + 1)
+        if c == "]" { depth = depth - 1; if depth == 0 { break }; i = i + 1; continue }
+        if c == "[" { depth = depth + 1; i = i + 1; continue }
+        if c == "\"" {
+            let start = i + 1
+            let mut j = start
+            while j < body.len() {
+                let cj = body.substring(j, j + 1)
+                if cj == "\\" { j = j + 2; continue }
+                if cj == "\"" { break }
+                j = j + 1
+            }
+            if j < body.len() {
+                out = out.push(body.substring(start, j))
+                i = j + 1
+                continue
+            } else { break }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn split_nodes(body: string) -> [string] {
+    let tag = "\"nodes\""
+    let ti = _find_after(body, tag, 0)
+    if ti < 0 { return [] }
+    let mut i = ti + tag.len()
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if c == " " || c == "\t" || c == "\n" || c == "\r" || c == ":" { i = i + 1 }
+        else { break }
+    }
+    if i >= body.len() || body.substring(i, i + 1) != "[" { return [] }
+    i = i + 1
+    let mut out: [string] = []
+    let mut depth: i64 = 0
+    let mut start: i64 = -1
+    let mut in_str: bool = false
+    while i < body.len() {
+        let c = body.substring(i, i + 1)
+        if in_str {
+            if c == "\\" { i = i + 2; continue }
+            if c == "\"" { in_str = false; i = i + 1; continue }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == "{" {
+            if depth == 0 { start = i }
+            depth = depth + 1
+            i = i + 1
+            continue
+        }
+        if c == "}" {
+            depth = depth - 1
+            if depth == 0 && start >= 0 {
+                out = out.push(body.substring(start, i + 1))
+                start = -1
+            }
+            i = i + 1
+            continue
+        }
+        if c == "]" && depth == 0 { break }
+        i = i + 1
+    }
+    return out
+}
+
+// ── Node (action_agent 추가) ─────────────────────────────────────────────
+struct Node {
+    id: string,
+    name: string,
+    ntype: string,
+    cost: f64,
+    p_success: f64,
+    eta: f64,
+    n_uses: i64,
+    deps: [string],
+    soft_deps: [string],
+    status: string,
+    progress: f64,
+    action_agent: string   // override mapping if set
+}
+
+fn parse_node(raw: string) -> Node {
+    let id = json_str(raw, "id")
+    let mut name = json_str(raw, "name")
+    if name == "" { name = id }
+    let mut ntype = json_str(raw, "type")
+    if ntype == "" { ntype = "build" }
+    let cost = json_num(raw, "cost")
+    let p = json_num(raw, "p_success")
+    let p2 = if p <= 0.0 { 1.0 } else { p }
+    let eta = json_num(raw, "eta")
+    let nu = json_num(raw, "n_uses")
+    let nu_i: i64 = if nu <= 0.0 { 1 } else { f_to_i(nu) }
+    let deps = json_str_array(raw, "deps")
+    let soft = json_str_array(raw, "soft_deps")
+    let mut st = json_str(raw, "status")
+    if st == "" { st = "todo" }
+    let pg = json_num(raw, "progress")
+    let aa = json_str(raw, "action_agent")
+    return Node {
+        id: id, name: name, ntype: ntype,
+        cost: cost, p_success: p2, eta: eta, n_uses: nu_i,
+        deps: deps, soft_deps: soft,
+        status: st, progress: pg,
+        action_agent: aa
+    }
+}
+
+struct Roadmap {
+    id: string,
+    goal: string,
+    start: string,
+    K_target: f64,
+    C_channel: f64,
+    nodes: [Node]
+}
+
+fn load_roadmap(path: string) -> Roadmap {
+    if file_exists(path) == false {
+        eprintln("REJECT: roadmap not found: " + path)
+        exit(3)
+    }
+    let body = _str(read_file(path))
+    if body.len() == 0 {
+        eprintln("REJECT: empty roadmap: " + path)
+        exit(3)
+    }
+    let meta_idx = _find_after(body, "\"_meta\"", 0)
+    let mut meta_body = body
+    if meta_idx >= 0 {
+        let mut mi = meta_idx
+        while mi < body.len() && body.substring(mi, mi + 1) != "{" { mi = mi + 1 }
+        if mi < body.len() {
+            let start = mi
+            let mut depth: i64 = 0
+            let mut in_str: bool = false
+            let mut end = mi
+            while end < body.len() {
+                let c = body.substring(end, end + 1)
+                if in_str {
+                    if c == "\\" { end = end + 2; continue }
+                    if c == "\"" { in_str = false }
+                    end = end + 1
+                    continue
+                }
+                if c == "\"" { in_str = true; end = end + 1; continue }
+                if c == "{" { depth = depth + 1 }
+                else if c == "}" { depth = depth - 1; if depth == 0 { end = end + 1; break } }
+                end = end + 1
+            }
+            meta_body = body.substring(start, end)
+        }
+    }
+    let rid = json_str(meta_body, "id")
+    let goal = json_str(meta_body, "goal")
+    let start = json_str(meta_body, "start")
+    let K = json_num(meta_body, "K_target")
+    let C = json_num(meta_body, "C_channel")
+    let node_blocks = split_nodes(body)
+    let mut nodes: [Node] = []
+    let mut i: i64 = 0
+    while i < node_blocks.len() {
+        let n = parse_node(_str(node_blocks[i]))
+        if n.id.len() > 0 { nodes = nodes.push(n) }
+        i = i + 1
+    }
+    return Roadmap {
+        id: rid, goal: goal, start: start,
+        K_target: K, C_channel: C, nodes: nodes
+    }
+}
+
+// ── status helpers ───────────────────────────────────────────────────────
+fn idx_of(nodes: [Node], nid: string) -> i64 {
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        if nodes[i].id == nid { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn is_done(st: string) -> bool {
+    return st == "done" || st == "complete" || st == "aborted" || st == "skipped"
+}
+
+fn effective_cost(n: Node, K: f64, C: f64) -> f64 {
+    let t = n.ntype
+    if t == "seed" { return 0.0 }
+    if t == "goal" { return n.cost }
+    if t == "exp" {
+        let p = if n.p_success <= 0.0 { 1.0 } else { n.p_success }
+        return n.cost / p
+    }
+    if t == "learn" {
+        let e = if n.eta < 0.0 { 0.0 } else { n.eta }
+        let f = 1.0 - e
+        return n.cost * f
+    }
+    if t == "boot" {
+        let nu = if n.n_uses < 1 { 1 } else { n.n_uses }
+        return n.cost / to_float(to_string(nu))
+    }
+    if t == "verify" {
+        let k = if K <= 0.0 { 1.0 } else { K }
+        let c = if C <= 0.0 { 1.0 } else { C }
+        return (k / c) + (n.cost * 0.25)
+    }
+    return n.cost
+}
+
+fn remaining_cost(n: Node, K: f64, C: f64) -> f64 {
+    if is_done(n.status) { return 0.0 }
+    let c = effective_cost(n, K, C)
+    if n.status == "in_progress" {
+        let p = if n.progress < 0.0 { 0.0 } else { if n.progress > 1.0 { 1.0 } else { n.progress } }
+        return c * (1.0 - p)
+    }
+    return c
+}
+
+// ── ready/in_progress 산출 (roadmap_engine.schedule 의 핵심부 inline) ─
+struct Actionable {
+    ready: [string],
+    in_progress: [string]
+}
+
+fn compute_actionable(rm: Roadmap) -> Actionable {
+    let nodes = rm.nodes
+    let mut ready: [string] = []
+    let mut inp: [string] = []
+    let mut i: i64 = 0
+    while i < nodes.len() {
+        let n = nodes[i]
+        if n.status == "in_progress" { inp = inp.push(n.id) }
+        else if n.status == "todo" || n.status == "planned" {
+            let mut all_done: bool = true
+            let mut j: i64 = 0
+            while j < n.deps.len() {
+                let pi = idx_of(nodes, _str(n.deps[j]))
+                if pi < 0 { all_done = false; break }
+                if is_done(nodes[pi].status) == false { all_done = false; break }
+                j = j + 1
+            }
+            if all_done { ready = ready.push(n.id) }
+        }
+        i = i + 1
+    }
+    return Actionable { ready: ready, in_progress: inp }
+}
+
+// ── ntype → mapping 기본값 ───────────────────────────────────────────────
+fn map_subagent(ntype: string, override_aa: string) -> string {
+    if override_aa != "" { return override_aa }
+    if ntype == "learn" { return "Explore" }
+    if ntype == "verify" { return "code-reviewer" }
+    return "general-purpose"
+}
+
+fn map_template(ntype: string) -> string {
+    if ntype == "build"  { return "build 구현" }
+    if ntype == "exp"    { return "실험 설계 + 1회 실행" }
+    if ntype == "learn"  { return "코드/문서 학습" }
+    if ntype == "boot"   { return "boot 작업" }
+    if ntype == "verify" { return "검증" }
+    return "수행"
+}
+
+fn map_completion_criteria(ntype: string, name: string) -> string {
+    if ntype == "build"  { return "  - " + name + " 구현 파일 작성, selftest PASS" }
+    if ntype == "exp"    { return "  - 실험 1회 실행, 결과 JSONL 기록, p_success 보고" }
+    if ntype == "learn"  { return "  - 학습 요약 + 핵심 요점 3가지" }
+    if ntype == "boot"   { return "  - boot 작업 완료, n_uses 증가분 보고" }
+    if ntype == "verify" { return "  - 검증 리포트 (PASS/FAIL + 근거)" }
+    return "  - 작업 완료, 결과 보고"
+}
+
+fn ntype_skip(ntype: string) -> bool {
+    return ntype == "seed" || ntype == "goal"
+}
+
+// ── prompt template 생성 ─────────────────────────────────────────────────
+fn build_prompt(rm: Roadmap, n: Node) -> string {
+    // deps done 라벨
+    let mut dep_str = ""
+    let mut i: i64 = 0
+    while i < n.deps.len() {
+        if i > 0 { dep_str = dep_str + ", " }
+        dep_str = dep_str + _str(n.deps[i])
+        i = i + 1
+    }
+    if dep_str == "" { dep_str = "(none)" }
+    let ccrit = map_completion_criteria(n.ntype, n.name)
+    let cost_s = to_string(n.cost)
+    let p1 = "TASK: roadmap 노드 " + n.id + " 수행."
+    let p2 = "목표: " + n.name
+    let p3 = "타입: " + n.ntype + " (cost=" + cost_s + ")"
+    let p4 = "전제 (deps done): " + dep_str
+    let p5 = "완료 기준:"
+    let p6 = ccrit
+    let p7 = "보고: 200단어 이내. 로드맵 " + rm.id + " 의 ntype=" + n.ntype + " 과제."
+    return p1 + "\n" + p2 + "\n" + p3 + "\n" + p4 + "\n" + p5 + "\n" + p6 + "\n" + p7
+}
+
+fn build_description(n: Node) -> string {
+    // 5단어 가량 — "<ntype>: <name first 4 words>"
+    let parts = n.name.split(" ")
+    let mut head = ""
+    let mut i: i64 = 0
+    let lim = if parts.len() > 4 { 4 } else { parts.len() }
+    while i < lim {
+        if i > 0 { head = head + " " }
+        head = head + _str(parts[i])
+        i = i + 1
+    }
+    if head == "" { head = n.id }
+    return n.ntype + ": " + head
+}
+
+// ── escape JSON ──────────────────────────────────────────────────────────
+fn escape_json(s: string) -> string {
+    let mut r = s
+    r = r.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "\\r")
+    r = r.replace("\t", "\\t")
+    return r
+}
+
+// ── DispatchSpec ─────────────────────────────────────────────────────────
+struct DispatchSpec {
+    node_id: string,
+    subagent_type: string,
+    description: string,
+    prompt: string,
+    priority: f64,
+    deps_met: bool,
+    skipped: bool,
+    skip_reason: string
+}
+
+fn make_spec(rm: Roadmap, n: Node, deps_met: bool) -> DispatchSpec {
+    if ntype_skip(n.ntype) {
+        return DispatchSpec {
+            node_id: n.id,
+            subagent_type: "",
+            description: "",
+            prompt: "",
+            priority: 0.0,
+            deps_met: deps_met,
+            skipped: true,
+            skip_reason: "ntype=" + n.ntype + " (사람 handoff)"
+        }
+    }
+    let sub = map_subagent(n.ntype, n.action_agent)
+    let desc = build_description(n)
+    let prm = build_prompt(rm, n)
+    let pr = remaining_cost(n, rm.K_target, rm.C_channel)
+    return DispatchSpec {
+        node_id: n.id,
+        subagent_type: sub,
+        description: desc,
+        prompt: prm,
+        priority: pr,
+        deps_met: deps_met,
+        skipped: false,
+        skip_reason: ""
+    }
+}
+
+fn spec_to_jsonl(rm: Roadmap, sp: DispatchSpec) -> string {
+    return "{\"ts\":\"" + _ts_iso() + "\",\"rm\":\"" + escape_json(rm.id)
+        + "\",\"node\":\"" + escape_json(sp.node_id)
+        + "\",\"subagent_type\":\"" + escape_json(sp.subagent_type)
+        + "\",\"description\":\"" + escape_json(sp.description)
+        + "\",\"prompt\":\"" + escape_json(sp.prompt)
+        + "\",\"priority\":" + to_string(sp.priority)
+        + ",\"deps_met\":" + to_string(sp.deps_met)
+        + ",\"dry_run\":false}"
+}
+
+// ── collect + sort by priority desc (bubble; n<200) ──────────────────────
+fn collect_specs(rm: Roadmap) -> [DispatchSpec] {
+    let act = compute_actionable(rm)
+    let mut specs: [DispatchSpec] = []
+    let mut i: i64 = 0
+    while i < act.in_progress.len() {
+        let nid = _str(act.in_progress[i])
+        let ni = idx_of(rm.nodes, nid)
+        if ni >= 0 {
+            let sp = make_spec(rm, rm.nodes[ni], true)
+            if sp.skipped == false { specs = specs.push(sp) }
+        }
+        i = i + 1
+    }
+    let mut j: i64 = 0
+    while j < act.ready.len() {
+        let nid = _str(act.ready[j])
+        // dedupe with in_progress
+        let mut dup: bool = false
+        let mut k: i64 = 0
+        while k < specs.len() {
+            if specs[k].node_id == nid { dup = true; break }
+            k = k + 1
+        }
+        if dup == false {
+            let ni = idx_of(rm.nodes, nid)
+            if ni >= 0 {
+                let sp = make_spec(rm, rm.nodes[ni], true)
+                if sp.skipped == false { specs = specs.push(sp) }
+            }
+        }
+        j = j + 1
+    }
+    // bubble sort priority desc
+    let n = specs.len()
+    let mut a: i64 = 0
+    while a < n {
+        let mut b: i64 = 0
+        while b < n - 1 - a {
+            if specs[b].priority < specs[b + 1].priority {
+                let tmp = specs[b]
+                // list[i]=v no-op 회피 — slice + concat
+                let mut rebuilt: [DispatchSpec] = []
+                let mut z: i64 = 0
+                while z < specs.len() {
+                    if z == b { rebuilt = rebuilt.push(specs[b + 1]) }
+                    else if z == b + 1 { rebuilt = rebuilt.push(tmp) }
+                    else { rebuilt = rebuilt.push(specs[z]) }
+                    z = z + 1
+                }
+                specs = rebuilt
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return specs
+}
+
+// ── ensure dir for emit path ─────────────────────────────────────────────
+fn ensure_parent_dir(path: string) {
+    let mut last: i64 = -1
+    let mut i: i64 = 0
+    while i < path.len() {
+        if path.substring(i, i + 1) == "/" { last = i }
+        i = i + 1
+    }
+    if last > 0 {
+        let dir = path.substring(0, last)
+        let _ = exec("mkdir -p '" + dir + "' 2>/dev/null")  // @allow-bare-exec
+    }
+}
+
+// ── command: plan ────────────────────────────────────────────────────────
+fn cmd_plan(path: string, emit: string) -> i64 {
+    let rm = load_roadmap(path)
+    let specs = collect_specs(rm)
+    if specs.len() == 0 {
+        eprintln("WARN: no actionable nodes (ready ∪ in_progress empty after skip)")
+        return 1
+    }
+    let target = if emit == "" { "" } else { emit }
+    if target != "" { ensure_parent_dir(target) }
+    let mut i: i64 = 0
+    while i < specs.len() {
+        let line = spec_to_jsonl(rm, specs[i])
+        if target == "" { println(line) }
+        else { append_file(target, line + "\n") }
+        i = i + 1
+    }
+    if target != "" {
+        eprintln("dispatch_plan: " + to_string(specs.len()) + " specs → " + target)
+    }
+    return 0
+}
+
+// ── command: next ────────────────────────────────────────────────────────
+// 출력: <subagent_type>\t<description>\t<prompt-oneline-escaped>
+fn cmd_next(path: string) -> i64 {
+    let rm = load_roadmap(path)
+    let specs = collect_specs(rm)
+    if specs.len() == 0 {
+        eprintln("WARN: no actionable node")
+        return 1
+    }
+    let top = specs[0]
+    let one = top.prompt.replace("\n", "\\n").replace("\t", "\\t")
+    println(top.subagent_type + "\t" + top.description + "\t" + one)
+    return 0
+}
+
+// ── command: explain ─────────────────────────────────────────────────────
+fn cmd_explain(path: string, node_id: string) -> i64 {
+    let rm = load_roadmap(path)
+    let ni = idx_of(rm.nodes, node_id)
+    if ni < 0 {
+        eprintln("REJECT: node not found: " + node_id)
+        return 4
+    }
+    let n = rm.nodes[ni]
+    // deps_met 계산
+    let mut all_done: bool = true
+    let mut j: i64 = 0
+    while j < n.deps.len() {
+        let pi = idx_of(rm.nodes, _str(n.deps[j]))
+        if pi < 0 { all_done = false; break }
+        if is_done(rm.nodes[pi].status) == false { all_done = false; break }
+        j = j + 1
+    }
+    let sp = make_spec(rm, n, all_done)
+    println("=== dispatch_spec: " + n.id + " ===")
+    println("roadmap         : " + rm.id)
+    println("status          : " + n.status)
+    println("ntype           : " + n.ntype)
+    println("cost            : " + to_string(n.cost))
+    println("deps_met        : " + to_string(sp.deps_met))
+    if sp.skipped {
+        println("SKIPPED         : " + sp.skip_reason)
+        return 0
+    }
+    println("subagent_type   : " + sp.subagent_type)
+    println("description     : " + sp.description)
+    println("priority        : " + to_string(sp.priority))
+    println("--- prompt ---")
+    println(sp.prompt)
+    println("--- jsonl ---")
+    println(spec_to_jsonl(rm, sp))
+    return 0
+}
+
+// ── selftest ─────────────────────────────────────────────────────────────
+fn selftest() -> i64 {
+    println("[selftest] using example.json")
+    let path = ROADMAPS + "/example.json"
+    if file_exists(path) == false {
+        eprintln("REJECT: example missing: " + path)
+        return 3
+    }
+    let rm = load_roadmap(path)
+    println("[selftest] nodes=" + to_string(rm.nodes.len()))
+    let specs = collect_specs(rm)
+    println("[selftest] actionable specs=" + to_string(specs.len()))
+    if specs.len() == 0 {
+        eprintln("REJECT: selftest expected ≥1 actionable")
+        return 1
+    }
+    // priority desc 검증 + 핵심 필드 비어있지 않음
+<<<<<<< Updated upstream
+    let mut prev: f64 = 999999999.0
+=======
+    let mut prev: f64 = 9.99e30
+>>>>>>> Stashed changes
+    let mut i: i64 = 0
+    while i < specs.len() {
+        let sp = specs[i]
+        if sp.subagent_type == "" {
+            eprintln("REJECT: empty subagent_type @ " + sp.node_id); return 1
+        }
+        if sp.prompt == "" {
+            eprintln("REJECT: empty prompt @ " + sp.node_id); return 1
+        }
+        if sp.description == "" {
+            eprintln("REJECT: empty description @ " + sp.node_id); return 1
+        }
+        if sp.priority > prev {
+            eprintln("REJECT: priority not desc-sorted @ " + sp.node_id); return 1
+        }
+        prev = sp.priority
+        i = i + 1
+    }
+    println("[selftest] sort verified (desc by priority)")
+
+    // mapping 검증 — example.json: rollup(build), P7(build) → general-purpose
+    let mut found_build: bool = false
+    let mut k: i64 = 0
+    while k < specs.len() {
+        let sp = specs[k]
+        if sp.node_id == "rollup" || sp.node_id == "P7" {
+            if sp.subagent_type != "general-purpose" {
+                eprintln("REJECT: build expected general-purpose, got " + sp.subagent_type)
+                return 1
+            }
+            found_build = true
+        }
+        k = k + 1
+    }
+    if found_build == false {
+        eprintln("REJECT: no build spec found")
+        return 1
+    }
+    println("[selftest] mapping verified (build → general-purpose)")
+
+    // verify mapping (synthetic node)
+    let vn = Node {
+        id: "_v", name: "verify check", ntype: "verify", cost: 4.0,
+        p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: [], soft_deps: [], status: "todo", progress: 0.0,
+        action_agent: ""
+    }
+    let vs = make_spec(rm, vn, true)
+    if vs.subagent_type != "code-reviewer" {
+        eprintln("REJECT: verify expected code-reviewer, got " + vs.subagent_type)
+        return 1
+    }
+    println("[selftest] mapping verified (verify → code-reviewer)")
+
+    // action_agent override
+    let on = Node {
+        id: "_o", name: "override n", ntype: "build", cost: 1.0,
+        p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: [], soft_deps: [], status: "todo", progress: 0.0,
+        action_agent: "Explore"
+    }
+    let os = make_spec(rm, on, true)
+    if os.subagent_type != "Explore" {
+        eprintln("REJECT: action_agent override failed, got " + os.subagent_type)
+        return 1
+    }
+    println("[selftest] action_agent override OK")
+
+    // skip ntype=seed/goal
+    let sn = Node {
+        id: "_s", name: "seed n", ntype: "seed", cost: 0.0,
+        p_success: 1.0, eta: 0.0, n_uses: 1,
+        deps: [], soft_deps: [], status: "todo", progress: 0.0,
+        action_agent: ""
+    }
+    let ss = make_spec(rm, sn, true)
+    if ss.skipped == false {
+        eprintln("REJECT: seed should be skipped"); return 1
+    }
+    println("[selftest] skip seed/goal OK")
+
+    // emit JSONL to /tmp/dispatch_selftest.jsonl
+    let out = "/tmp/roadmap_dispatch_selftest.jsonl"
+    let _ = exec("rm -f " + out)  // @allow-bare-exec
+    let rc = cmd_plan(path, out)
+    if rc != 0 {
+        eprintln("REJECT: cmd_plan rc=" + to_string(rc)); return 1
+    }
+    let cnt = _str(exec("wc -l < " + out + " 2>/dev/null")).trim()  // @allow-bare-exec
+    println("[selftest] emit lines: " + cnt + " → " + out)
+
+    // cmd_next stdout test (capture via shell? — 본 selftest 는 동작만 확인)
+    println("[selftest] cmd_next sample:")
+    let _ = cmd_next(path)
+
+    // cmd_explain on top spec
+    let top_id = specs[0].node_id
+    println("[selftest] cmd_explain " + top_id + ":")
+    let _ = cmd_explain(path, top_id)
+
+    println("[selftest] OK")
+    return 0
+}
+
+// ── usage ────────────────────────────────────────────────────────────────
+fn usage() {
+    eprintln("usage: roadmap_dispatch <subcommand> [args]")
+    eprintln("  plan    <roadmap.json> [--emit=<out.jsonl>]")
+    eprintln("  next    <roadmap.json>")
+    eprintln("  explain <roadmap.json> <node_id>")
+    eprintln("  --selftest")
+}
+
+// ── main ─────────────────────────────────────────────────────────────────
+fn main() {
+<<<<<<< Updated upstream
+    // argv 정규화 (2026-04-19): Mac=[hexa, script, user...] Linux-stage1=[hexa, "run", script, user...]
+    // 이전까지 Mac-only argv[2] 가정 → Linux 에서 argv[2] = script path 로 dispatch 실패.
+    let _raw_argv = args()
+    let mut _script_idx = -1
+    let mut _scan_i = 0
+    while _scan_i < _raw_argv.len() {
+        if _raw_argv[_scan_i].ends_with(".hexa") { _script_idx = _scan_i; break }
+        _scan_i = _scan_i + 1
+    }
+    let mut _user_start = 2
+    let mut _script_token = ""
+    if _script_idx >= 0 {
+        _user_start = _script_idx + 1
+        _script_token = _raw_argv[_script_idx]
+    } else {
+        if _raw_argv.len() >= 3 {
+            if _raw_argv[1] == "run" { _user_start = 3 }
+            if _raw_argv[1] == "eval" { _user_start = 3 }
+        }
+    }
+    let mut argv: [str] = [_raw_argv[0], _script_token]
+    let mut _ua_i = _user_start
+    while _ua_i < _raw_argv.len() {
+        argv = argv + [_raw_argv[_ua_i]]
+        _ua_i = _ua_i + 1
+    }
+    if _script_token.len() > 0 && argv.len() >= 3 {
+        if argv[2] == _script_token {
+            let mut _a2: [str] = [_raw_argv[0], _script_token]
+            let mut _j2 = 3
+            while _j2 < argv.len() {
+                _a2 = _a2 + [argv[_j2]]
+                _j2 = _j2 + 1
+            }
+            argv = _a2
+        }
+    }
+=======
+    let argv = args()
+>>>>>>> Stashed changes
+    let mut a: [string] = []
+    let mut ai: i64 = 2
+    while ai < argv.len() {
+        a = a.push(_str(argv[ai]))
+        ai = ai + 1
+    }
+
+    if a.len() == 0 {
+        usage()
+        exit(2)
+    }
+
+    let sub = _str(a[0])
+    if sub == "--selftest" || sub == "selftest" {
+        let rc = selftest()
+        exit(rc)
+    }
+    if sub == "--help" || sub == "-h" || sub == "help" {
+        usage()
+        exit(0)
+    }
+
+    if sub == "plan" {
+        if a.len() < 2 { usage(); exit(2) }
+        let path = _str(a[1])
+        let mut emit = ""
+        let mut k: i64 = 2
+        while k < a.len() {
+            let arg = _str(a[k])
+            if arg.starts_with("--emit=") { emit = arg.substring(7, arg.len()) }
+            else if arg == "--emit" {
+                if k + 1 < a.len() { emit = _str(a[k + 1]); k = k + 1 }
+            }
+            k = k + 1
+        }
+        let rc = cmd_plan(path, emit)
+        exit(rc)
+    }
+
+    if sub == "next" {
+        if a.len() < 2 { usage(); exit(2) }
+        let path = _str(a[1])
+        let rc = cmd_next(path)
+        exit(rc)
+    }
+
+    if sub == "explain" {
+        if a.len() < 3 { usage(); exit(2) }
+        let path = _str(a[1])
+        let nid = _str(a[2])
+        let rc = cmd_explain(path, nid)
+        exit(rc)
+    }
+
+    eprintln("REJECT: unknown subcommand: " + sub)
+    usage()
+    exit(2)
+}
+
+main()
