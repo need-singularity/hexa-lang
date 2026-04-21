@@ -44,6 +44,41 @@
 
 static const char *BANNED_SUFFIXES[] = { ".py", ".rs", ".sh", ".toml", NULL };
 
+// raw#8 filename taxonomy (F1 version / F2 stage / F3 temp + no-backup)
+static const char *RAW8_SUFFIXES[] = {
+    ".bak", ".orig", NULL
+};
+static const char *RAW8_CONTAINS[] = {
+    "_v2.", "_v3.", "_v4.", "_v5.", "_v6.", "_v7.", "_v8.", "_v9.", "_v10.",
+    "_mk2.", "_mk3.", "_mk4.", "_mk5.",
+    "_new.", "_copy.", "_old.", "_backup.",
+    "_phase", "_stage", "_Phase",
+    ".bak.", ".legacy-", ".pre-",
+    "-backup", "/TMP-", "/TIMESTAMP-",
+    NULL
+};
+
+// raw#13 ai/git config paths (path-substring match)
+static const char *RAW13_PATHS[] = {
+    "/.github/workflows/",
+    "/.githooks/",
+    "/.husky/",
+    "/husky.config.",
+    "/.pre-commit-config.yaml",
+    "/.pre-commit-config.yml",
+    "/lefthook.yaml",
+    "/lefthook.yml",
+    "/.cursorrules",
+    "/.continue/",
+    "/.aider.conf.yaml",
+    "/.aider.conf.yml",
+    "/.windsurfrules",
+    "/CLAUDE.md",
+    "/.claude/hooks/",
+    "/.claude/skills/",
+    NULL
+};
+
 static int ends_with(const char *s, const char *suf) {
     if (!s || !suf) return 0;
     size_t ls = strlen(s), lf = strlen(suf);
@@ -81,6 +116,32 @@ static int is_write_flag(int flags) {
     return (flags & (O_WRONLY | O_RDWR | O_CREAT | O_TRUNC | O_APPEND)) != 0;
 }
 
+static int refuse_raw8(const char *path) {
+    for (int i = 0; RAW8_SUFFIXES[i]; i++) {
+        if (ends_with(path, RAW8_SUFFIXES[i])) return 1;
+    }
+    for (int i = 0; RAW8_CONTAINS[i]; i++) {
+        if (strstr(path, RAW8_CONTAINS[i])) return 1;
+    }
+    return 0;
+}
+
+static int refuse_raw13(const char *path) {
+    for (int i = 0; RAW13_PATHS[i]; i++) {
+        if (strstr(path, RAW13_PATHS[i])) return 1;
+    }
+    return 0;
+}
+
+// raw#20 — .own append-only: O_TRUNC on path ending in /.own = EPERM.
+static int refuse_raw20(const char *path, int flags) {
+    if (!(flags & O_TRUNC)) return 0;
+    if (!path) return 0;
+    size_t n = strlen(path);
+    if (n >= 5 && strcmp(path + n - 5, "/.own") == 0) return 1;
+    return 0;
+}
+
 static int refuse(const char *path, int flags) {
     if (opt_out()) return 0;
     if (!path || !is_write_flag(flags)) return 0;
@@ -88,6 +149,9 @@ static int refuse(const char *path, int flags) {
     for (int i = 0; BANNED_SUFFIXES[i]; i++) {
         if (ends_with(path, BANNED_SUFFIXES[i])) return 1;
     }
+    if (refuse_raw8(path)) return 1;
+    if (refuse_raw13(path)) return 1;
+    if (refuse_raw20(path, flags)) return 1;
     return 0;
 }
 
@@ -152,4 +216,33 @@ int renameat(int olddfd, const char *oldpath, int newdfd, const char *newpath) {
     if (!real) real = (renameat_fn)dlsym(RTLD_NEXT, "renameat");
     if (refuse_rename(newpath)) { errno = EPERM; return -1; }
     return real(olddfd, oldpath, newdfd, newpath);
+}
+
+// ── symlink / symlinkat (raw#21) ─────────────────────────────────────
+
+typedef int (*symlink_fn)(const char *, const char *);
+typedef int (*symlinkat_fn)(const char *, int, const char *);
+
+static int refuse_symlink(const char *linkpath) {
+    if (opt_out()) return 0;
+    if (!linkpath) return 0;
+    if (strstr(linkpath, "/archive/deprecated/")) return 0;  // allowlist
+    if (strstr(linkpath, "/tmp/")) return 0;
+    // All other symlink creates are blocked (raw#21 conservative).
+    // Allowlist can be widened later if false positives emerge.
+    return 1;
+}
+
+int symlink(const char *target, const char *linkpath) {
+    static symlink_fn real = NULL;
+    if (!real) real = (symlink_fn)dlsym(RTLD_NEXT, "symlink");
+    if (refuse_symlink(linkpath)) { errno = EPERM; return -1; }
+    return real(target, linkpath);
+}
+
+int symlinkat(const char *target, int newdirfd, const char *linkpath) {
+    static symlinkat_fn real = NULL;
+    if (!real) real = (symlinkat_fn)dlsym(RTLD_NEXT, "symlinkat");
+    if (refuse_symlink(linkpath)) { errno = EPERM; return -1; }
+    return real(target, newdirfd, linkpath);
 }
