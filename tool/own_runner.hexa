@@ -34,11 +34,8 @@ fn _sh(cmd: string) -> string {
     return to_string(exec(cmd + " 2>/dev/null")).trim()
 }
 
-fn _sh_exit(cmd: string) -> int {
-    // Run cmd, print nothing, return shell exit code.
-    let wrap = "(" + cmd + ") >/dev/null 2>&1; echo $?"
-    let code = to_string(exec(wrap)).trim()
-    // Parse exit code (0-255) defensively.
+fn _parse_exit(code: string) -> int {
+    // Parse leading digit run (0-255 defensively).
     let mut n = 0
     let mut i = 0
     while i < len(code) {
@@ -57,6 +54,23 @@ fn _sh_exit(cmd: string) -> int {
         i = i + 1
     }
     return n
+}
+
+fn _sh_exit(cmd: string) -> int {
+    // Run cmd, print nothing, return shell exit code.
+    let wrap = "(" + cmd + ") >/dev/null 2>&1; echo $?"
+    return _parse_exit(to_string(exec(wrap)).trim())
+}
+
+fn _jobs() -> int {
+    // Concurrency cap for -all runners.
+    // Override via OWN_RUNNER_JOBS; default 8 (own#6 fork-storm guard).
+    let j_env = env("OWN_RUNNER_JOBS")
+    if j_env != "" {
+        let n = _parse_exit(j_env)
+        if n > 0 { return n }
+    }
+    return 8
 }
 
 fn _repo() -> string {
@@ -183,6 +197,190 @@ fn _run_drift(rule: array, repo: string) -> int {
     return 1
 }
 
+// ── batch runners (parallel via xargs -P, own#6 fork-storm bounded) ───
+
+fn _run_verify_all(rules: array, repo: string) -> int {
+    // Collect runnable verify rules in declaration order.
+    let mut todos = []  // each = [slug, label, on_fail, cmd]
+    for rule in rules {
+        if _is_runnable(rule) && _has_field(rule, "verify") {
+            let cmd = keys_first(rule[3], "verify")
+            if cmd == "" { continue }
+            let slug = _slug_of(rule)
+            let label = _label_of(rule)
+            let on_fail_raw = keys_first(rule[3], "on_fail")
+            let on_fail = if on_fail_raw != "" { on_fail_raw } else { "warn" }
+            todos.push([slug, label, on_fail, cmd])
+        }
+    }
+    if len(todos) == 0 { return 0 }
+
+    // Escape hatch: force serial via env.
+    let serial = env("OWN_RUNNER_SERIAL") == "1" || len(todos) == 1
+
+    if serial {
+        let mut fails = 0
+        for rule in rules {
+            if _is_runnable(rule) && _has_field(rule, "verify") {
+                if _run_verify(rule, repo) != 0 { fails = fails + 1 }
+            }
+        }
+        return fails
+    }
+
+    let tmp = _sh("mktemp -d -t own_runner.XXXXXX")
+    if tmp == "" {
+        // mktemp failed — fall back to serial path.
+        let mut fails = 0
+        for rule in rules {
+            if _is_runnable(rule) && _has_field(rule, "verify") {
+                if _run_verify(rule, repo) != 0 { fails = fails + 1 }
+            }
+        }
+        return fails
+    }
+
+    // Write each cmd to its own file so shell escaping stays contained.
+    // raw#7 HEXA-ONLY blocks .sh writes, so we inline the runner via bash -c.
+    let mut j = 0
+    while j < len(todos) {
+        safe_write_file(tmp + "/" + to_string(j) + ".cmd", todos[j][3])
+        j = j + 1
+    }
+
+    let n_last = to_string(len(todos) - 1)
+    let jobs = to_string(_jobs())
+    let dispatch = "seq 0 " + n_last
+                   + " | TMPDIR_OWN='" + tmp + "' REPO='" + repo + "'"
+                   + " xargs -P " + jobs + " -I@IDX@"
+                   + " bash -c 'idx=\"@IDX@\"; cd \"$REPO\" && bash \"$TMPDIR_OWN/$idx.cmd\" >/dev/null 2>&1; echo $? > \"$TMPDIR_OWN/$idx.rc\"'"
+    exec(dispatch + " >/dev/null 2>&1")
+
+    // Collect + print in declaration order (preserves serial output shape).
+    let mut fails = 0
+    let mut k = 0
+    while k < len(todos) {
+        let t = todos[k]
+        let slug = t[0]
+        let label = t[1]
+        let on_fail = t[2]
+        let rc_raw = _sh("cat '" + tmp + "/" + to_string(k) + ".rc' 2>/dev/null")
+        let code = _parse_exit(rc_raw)
+        if code == 0 {
+            println("  [PASS] " + slug + " — " + label)
+        } else {
+            println("  [FAIL:" + on_fail + "] " + slug + " — " + label + " (exit=" + to_string(code) + ")")
+            eprintln("N6_OWN_FAIL {\"kind\":\"verify\",\"slug\":\"" + slug
+                     + "\",\"exit\":" + to_string(code)
+                     + ",\"on_fail\":\"" + on_fail + "\"}")
+            fails = fails + 1
+        }
+        k = k + 1
+    }
+    exec("rm -rf '" + tmp + "'")
+    return fails
+}
+
+fn _run_drift_all(rules: array, repo: string) -> int {
+    // Only the `drift_actual` shell is parallelised; doc existence +
+    // grep + comparison stay serial (each is ~instant).
+    let mut todos = []  // each = [slug, label, on_fail, doc, pat, actual_cmd]
+    for rule in rules {
+        if !(_is_runnable(rule) && _has_field(rule, "drift_doc")) { continue }
+        let doc = keys_first(rule[3], "drift_doc")
+        let pat = keys_first(rule[3], "drift_pattern")
+        let actual_cmd = keys_first(rule[3], "drift_actual")
+        let slug = _slug_of(rule)
+        let label = _label_of(rule)
+        let on_fail_raw = keys_first(rule[3], "on_fail")
+        let on_fail = if on_fail_raw != "" { on_fail_raw } else { "warn" }
+        todos.push([slug, label, on_fail, doc, pat, actual_cmd])
+    }
+    if len(todos) == 0 { return 0 }
+
+    let serial = env("OWN_RUNNER_SERIAL") == "1" || len(todos) == 1
+
+    if serial {
+        let mut fails = 0
+        for rule in rules {
+            if _is_runnable(rule) && _has_field(rule, "drift_doc") {
+                if _run_drift(rule, repo) != 0 { fails = fails + 1 }
+            }
+        }
+        return fails
+    }
+
+    let tmp = _sh("mktemp -d -t own_runner.XXXXXX")
+    if tmp == "" {
+        let mut fails = 0
+        for rule in rules {
+            if _is_runnable(rule) && _has_field(rule, "drift_doc") {
+                if _run_drift(rule, repo) != 0 { fails = fails + 1 }
+            }
+        }
+        return fails
+    }
+
+    // Write each actual_cmd into its own file; runner captures stdout.
+    // raw#7 HEXA-ONLY blocks .sh writes, so we inline the runner via bash -c.
+    let mut j = 0
+    while j < len(todos) {
+        safe_write_file(tmp + "/" + to_string(j) + ".cmd", todos[j][5])
+        j = j + 1
+    }
+
+    let n_last = to_string(len(todos) - 1)
+    let jobs = to_string(_jobs())
+    let dispatch = "seq 0 " + n_last
+                   + " | TMPDIR_OWN='" + tmp + "' REPO='" + repo + "'"
+                   + " xargs -P " + jobs + " -I@IDX@"
+                   + " bash -c 'idx=\"@IDX@\"; cd \"$REPO\" && bash \"$TMPDIR_OWN/$idx.cmd\" 2>/dev/null > \"$TMPDIR_OWN/$idx.out\"'"
+    exec(dispatch + " >/dev/null 2>&1")
+
+    // Per-rule: verify doc exists, grep doc value, compare to actual[0].
+    let mut fails = 0
+    let mut k = 0
+    while k < len(todos) {
+        let t = todos[k]
+        let slug = t[0]
+        let label = t[1]
+        let on_fail = t[2]
+        let doc = t[3]
+        let pat = t[4]
+        let doc_path = repo + "/" + doc
+        let exists = _sh("test -f '" + doc_path + "' && echo y || echo n")
+        if exists != "y" {
+            println("  [FAIL:" + on_fail + "] " + slug + " — drift_doc missing: " + doc_path)
+            eprintln("N6_OWN_FAIL {\"kind\":\"drift\",\"slug\":\"" + slug
+                     + "\",\"reason\":\"doc-missing\",\"path\":\"" + doc_path + "\"}")
+            fails = fails + 1
+            k = k + 1
+            continue
+        }
+        let pat_escaped = pat.replace("'", "'\\''")
+        let doc_cmd = "LC_ALL=en_US.UTF-8 grep -oE '" + pat_escaped + "' '" + doc_path
+                      + "' | head -1 | grep -oE '[0-9]+' | head -1"
+        let doc_val = _sh(doc_cmd)
+        let actual_raw = to_string(exec("cat '" + tmp + "/" + to_string(k) + ".out' 2>/dev/null"))
+        let actual_first = split(actual_raw, "\n")[0].trim()
+
+        if doc_val != "" && doc_val == actual_first {
+            println("  [PASS] " + slug + " — " + label + " (doc=actual=" + doc_val + ")")
+        } else {
+            println("  [FAIL:" + on_fail + "] " + slug + " — " + label
+                    + " (doc=" + doc_val + ", actual=" + actual_first + ")")
+            eprintln("N6_OWN_FAIL {\"kind\":\"drift\",\"slug\":\"" + slug
+                     + "\",\"doc\":\"" + doc_val
+                     + "\",\"actual\":\"" + actual_first
+                     + "\",\"on_fail\":\"" + on_fail + "\"}")
+            fails = fails + 1
+        }
+        k = k + 1
+    }
+    exec("rm -rf '" + tmp + "'")
+    return fails
+}
+
 // ── subcommands ───────────────────────────────────────────────────────
 
 fn cmd_list(rules: array) {
@@ -285,13 +483,7 @@ fn main() -> void {
     }
     if sub == "verify-all" {
         println("── verify-all ──")
-        let mut fails = 0
-        for rule in rules {
-            if _is_runnable(rule) && _has_field(rule, "verify") {
-                let rc = _run_verify(rule, repo)
-                if rc != 0 { fails = fails + 1 }
-            }
-        }
+        let fails = _run_verify_all(rules, repo)
         println("")
         println("verify-all: " + to_string(fails) + " FAIL")
         if fails > 0 { exit(1) }
@@ -305,13 +497,7 @@ fn main() -> void {
     }
     if sub == "drift-all" {
         println("── drift-all ──")
-        let mut fails = 0
-        for rule in rules {
-            if _is_runnable(rule) && _has_field(rule, "drift_doc") {
-                let rc = _run_drift(rule, repo)
-                if rc != 0 { fails = fails + 1 }
-            }
-        }
+        let fails = _run_drift_all(rules, repo)
         println("")
         println("drift-all: " + to_string(fails) + " FAIL")
         if fails > 0 { exit(1) }
