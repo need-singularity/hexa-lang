@@ -318,3 +318,270 @@ pub fn ag_gate_msg(target: str, text: str) -> void {
         eprintln("[gate] " + target + " " + text)
     }
 }
+
+// ═════════════════════════════════════════════════════════════════════
+//  Phase 2 — remote dispatch primitives (ssh / rsync / scp)
+//
+//  Hostname resolution fallback chain (v1 parity):
+//     ssh_alias (default "ubu")  →  hetzner_host  →  ""
+//  Caller decides what to do on empty return. v1 used "ubu" as the
+//  canonical alias in ~/.ssh/config; hetzner is the WAN backup.
+//
+//  Shared ssh flags (v1 gate/wrappers/hexa L64, L86, L100):
+//     -o BatchMode=yes          fail fast on auth prompt
+//     -o ConnectTimeout=5       bounded wait
+//     -o ServerAliveInterval=30 hold long rsync/scp open
+//
+//  Stamp files (v1 L26-28): /tmp/ag_gate_rsync.stamp  +
+//     /tmp/ag_gate_scp_dedup/<basename>.mtime — reused so Phase 1 cache
+//     state doesn't get invalidated by the port.
+// ═════════════════════════════════════════════════════════════════════
+
+let RSYNC_STAMP   = "/tmp/ag_gate_rsync.stamp"
+let SCP_DEDUP_DIR = "/tmp/ag_gate_scp_dedup"
+
+// Resolve the effective remote host. If `host` arg is non-empty, caller
+// pinned the target → return as-is. Else walk the fallback chain.
+fn _resolve_remote(host: str) -> str {
+    if host.len() > 0 { return host }
+    let alias = ag_load_config("ssh_alias", "ubu")
+    if alias.len() > 0 { return alias }
+    let htz = ag_load_config("hetzner_host", "")
+    return htz
+}
+
+// Standard ssh flags used by all three fns — keeps v1 semantics.
+fn _ssh_flags() -> str {
+    return "-o BatchMode=yes -o ConnectTimeout=5 -o ServerAliveInterval=30"
+}
+
+// basename — last path segment. Avoids shelling out to `basename(1)`.
+fn _basename(p: str) -> str {
+    if p.len() == 0 { return "" }
+    let mut last = 0
+    let mut i = 0
+    while i < p.len() {
+        if p.substring(i, i + 1) == "/" { last = i + 1 }
+        i = i + 1
+    }
+    return p.substring(last, p.len())
+}
+
+// Directory signature = `find <dir> -type f -exec stat -f %m {} +` piped
+// through `cksum`. Cheap, stable, and captures any mtime change without
+// needing a full manifest. Returns "" on failure (treat as "changed").
+fn _dir_mtime_hash(d: str) -> str {
+    if d.len() == 0 { return "" }
+    let d_sh = d.replace("'", "'\\''")
+    let cmd = "find '" + d_sh + "' -type f -exec stat -f %m {} + 2>/dev/null" +
+              " | sort | cksum | awk '{print $1}'"
+    let h = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    return h
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  pub fn ag_remote_exec(host, cmd) -> [stdout_plus_stderr, rc_str]
+//
+//  v1 parity: ssh -o BatchMode=yes -o ConnectTimeout=5
+//             -o ServerAliveInterval=30 <host> "<cmd>" 2>&1
+//  Uses exec_with_status so we capture rc alongside the combined stream.
+//  Caller prints — we return so chain callers (dispatcher) can parse.
+//  Failure modes:
+//     - unresolvable host (empty after fallback) → E_SSH_FAIL, rc "255"
+//     - rc != 0 from remote                      → E_SSH_FAIL, rc passthrough
+//     - ssh timeout / auth fail                  → rc 255 with hint
+// ═════════════════════════════════════════════════════════════════════
+pub fn ag_remote_exec(host: str, cmd: str) -> [str] {
+    let h = _resolve_remote(host)
+    if h.len() == 0 {
+        ai_err("E_SSH_FAIL",
+               "no reachable remote host (ssh_alias + hetzner_host both empty/down)",
+               "fix: add ssh_alias to wrappers/config.jsonl, or `ssh ubu true` to verify",
+               "gate/wrappers/src/_cache.hexa:ag_remote_exec")
+        return ["", "255"]
+    }
+    let h_sh = h.replace("'", "'\\''")
+    let cmd_sh = cmd.replace("'", "'\\''")
+    let ssh_cmd = "ssh " + _ssh_flags() + " '" + h_sh + "' '" + cmd_sh + "' 2>&1"
+    let r = exec_with_status(ssh_cmd)  // @allow-bare-exec
+    let out = to_string(r[0])
+    let rc: i64 = to_int(to_string(r[1]))
+    if rc != 0 {
+        ai_err("E_SSH_FAIL",
+               "ssh to '" + h + "' exited rc=" + to_string(rc),
+               "fix: " + ssh_cmd,
+               "gate/wrappers/src/_cache.hexa:ag_remote_exec")
+    }
+    return [out, to_string(rc)]
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  pub fn ag_rsync(host, local_src) -> rc
+//
+//  rsync -az --delete [--exclude-from=<src>/.gitignore] <src>/
+//      <host>:/tmp/ag_gate/<basename>/
+//  Skip-fast: compute dir mtime hash; if it equals the cached stamp,
+//  return 0 (no-op). Otherwise rsync + update stamp on success.
+//  Failure modes:
+//     - src missing              → E_RSYNC_FAIL, rc 2
+//     - unresolvable host        → E_RSYNC_FAIL, rc 255
+//     - rsync rc != 0            → E_RSYNC_FAIL, rc passthrough
+// ═════════════════════════════════════════════════════════════════════
+pub fn ag_rsync(host: str, local_src: str) -> i64 {
+    if _exists(local_src) == false {
+        ai_err("E_RSYNC_FAIL",
+               "local_src does not exist: " + local_src,
+               "fix: verify path before call — `ls -ld '" + local_src + "'`",
+               "gate/wrappers/src/_cache.hexa:ag_rsync")
+        return 2
+    }
+    let h = _resolve_remote(host)
+    if h.len() == 0 {
+        ai_err("E_RSYNC_FAIL",
+               "no reachable remote host for rsync",
+               "fix: add ssh_alias to wrappers/config.jsonl, or `ssh ubu true` to verify",
+               "gate/wrappers/src/_cache.hexa:ag_rsync")
+        return 255
+    }
+
+    let bn = _basename(local_src)
+    let sig_key = local_src + "|" + bn
+    let cur_hash = _dir_mtime_hash(local_src)
+
+    // Stamp payload format: "<sig_key>\t<hash>\n". Skip only on exact match.
+    if _exists(RSYNC_STAMP) && cur_hash.len() > 0 {
+        let mut prev = ""
+        try { prev = read_file(RSYNC_STAMP) } catch e { prev = "" }
+        let want = sig_key + "\t" + cur_hash
+        let lines = prev.split("\n")
+        let mut i = 0
+        while i < lines.len() {
+            if to_string(lines[i]).trim() == want { return 0 }
+            i = i + 1
+        }
+    }
+
+    // Build rsync cmd. --exclude-from is only added when .gitignore exists.
+    let gi = local_src + "/.gitignore"
+    let mut excl = ""
+    if _exists(gi) {
+        excl = " --exclude-from='" + gi.replace("'", "'\\''") + "'"
+    }
+    let src_sh  = local_src.replace("'", "'\\''")
+    let h_sh    = h.replace("'", "'\\''")
+    let bn_sh   = bn.replace("'", "'\\''")
+    let dest    = "/tmp/ag_gate/" + bn_sh + "/"
+    // Ensure remote parent exists (rsync -a creates the trailing dir).
+    let mk_cmd  = "ssh " + _ssh_flags() + " '" + h_sh + "' 'mkdir -p " + dest + "' 2>&1"
+    let _mk = exec_with_status(mk_cmd)  // @allow-bare-exec
+
+    let rsync_cmd = "rsync -az --delete" + excl +
+                    " -e 'ssh " + _ssh_flags() + "'" +
+                    " '" + src_sh + "/' '" + h_sh + ":" + dest + "' 2>&1"
+    let r = exec_with_status(rsync_cmd)  // @allow-bare-exec
+    let rc: i64 = to_int(to_string(r[1]))
+    if rc != 0 {
+        ai_err("E_RSYNC_FAIL",
+               "rsync to '" + h + ":" + dest + "' rc=" + to_string(rc),
+               "fix: " + rsync_cmd,
+               "gate/wrappers/src/_cache.hexa:ag_rsync")
+        return rc
+    }
+
+    // Update stamp (append-or-replace policy: simple rewrite keeps latest
+    // hash per sig_key, trims stale entries by keeping only non-matching
+    // prior rows unchanged).
+    let mut prev = ""
+    if _exists(RSYNC_STAMP) {
+        try { prev = read_file(RSYNC_STAMP) } catch e { prev = "" }
+    }
+    let mut kept = ""
+    let prior = prev.split("\n")
+    let mut j = 0
+    while j < prior.len() {
+        let ln = to_string(prior[j])
+        if ln.len() > 0 && ln.starts_with(sig_key + "\t") == false {
+            kept = kept + ln + "\n"
+        }
+        j = j + 1
+    }
+    kept = kept + sig_key + "\t" + cur_hash + "\n"
+    try { write_file(RSYNC_STAMP, kept) } catch e {}
+    return 0
+}
+
+// ═════════════════════════════════════════════════════════════════════
+//  pub fn ag_scp_files(host, files) -> rc
+//
+//  For each file: compare local mtime to cached stamp at
+//  /tmp/ag_gate_scp_dedup/<basename>.mtime. If equal → skip. Else scp
+//  into <host>:/tmp/ag_gate/files/ and refresh stamp.
+//  Returns 0 if every file either skipped or copied OK; otherwise the
+//  first non-zero rc encountered.
+//  Failure modes:
+//     - unresolvable host        → E_SCP_FAIL, rc 255
+//     - missing local file       → E_SCP_FAIL, rc 2 (continues list)
+//     - scp rc != 0              → E_SCP_FAIL, rc passthrough
+// ═════════════════════════════════════════════════════════════════════
+pub fn ag_scp_files(host: str, files: [str]) -> i64 {
+    if files.len() == 0 { return 0 }
+    let h = _resolve_remote(host)
+    if h.len() == 0 {
+        ai_err("E_SCP_FAIL",
+               "no reachable remote host for scp",
+               "fix: add ssh_alias to wrappers/config.jsonl, or `ssh ubu true` to verify",
+               "gate/wrappers/src/_cache.hexa:ag_scp_files")
+        return 255
+    }
+
+    // Make sure dedup dir + remote dest exist up front — once per call.
+    let _mkl = exec_with_status("mkdir -p '" + SCP_DEDUP_DIR + "' 2>/dev/null")  // @allow-bare-exec
+    let h_sh = h.replace("'", "'\\''")
+    let dest = "/tmp/ag_gate/files/"
+    let mk_remote = "ssh " + _ssh_flags() + " '" + h_sh + "' 'mkdir -p " + dest + "' 2>&1"
+    let _mkr = exec_with_status(mk_remote)  // @allow-bare-exec
+
+    let mut first_err: i64 = 0
+    let mut i = 0
+    while i < files.len() {
+        let f = to_string(files[i])
+        i = i + 1
+        if _exists(f) == false {
+            ai_err("E_SCP_FAIL",
+                   "local file missing: " + f,
+                   "fix: verify path before call — `ls -l '" + f + "'`",
+                   "gate/wrappers/src/_cache.hexa:ag_scp_files")
+            if first_err == 0 { first_err = 2 }
+            continue
+        }
+
+        let bn = _basename(f)
+        let mt = _mtime(f)
+        let stamp = SCP_DEDUP_DIR + "/" + bn + ".mtime"
+        let mut cached = "0"
+        if _exists(stamp) {
+            try { cached = read_file(stamp).trim() } catch e { cached = "0" }
+        }
+        if mt == cached && mt != "0" {
+            // skip — remote already has same mtime.
+            continue
+        }
+
+        let f_sh  = f.replace("'", "'\\''")
+        let scp_cmd = "scp -q -o BatchMode=yes -o ConnectTimeout=5" +
+                      " -o ServerAliveInterval=30" +
+                      " '" + f_sh + "' '" + h_sh + ":" + dest + "' 2>&1"
+        let r = exec_with_status(scp_cmd)  // @allow-bare-exec
+        let rc: i64 = to_int(to_string(r[1]))
+        if rc != 0 {
+            ai_err("E_SCP_FAIL",
+                   "scp '" + bn + "' to '" + h + ":" + dest + "' rc=" + to_string(rc),
+                   "fix: " + scp_cmd,
+                   "gate/wrappers/src/_cache.hexa:ag_scp_files")
+            if first_err == 0 { first_err = rc }
+            continue
+        }
+        try { write_file(stamp, mt) } catch e {}
+    }
+    return first_err
+}

@@ -125,20 +125,105 @@ fn _run_local(argv: [str]) -> i64 {
     return _tail_rc(out)
 }
 
-// ─── ubu dispatch: DEFERRED in phase-1 — log + fall back to local ────
-// v1 used scp for file-args + nc to UBU_PORT; phase-1 lacks a verified
-// config path for those pieces, so record the intent and run locally.
-fn _run_ubu_deferred(argv: [str], reason: str) -> i64 {
+// ─── ubu dispatch TODO log (stdin-piped fallback + error trail) ──────
+fn _log_ubu_todo(reason: str, argv: [str]) -> void {
     let ts = to_string(_epoch_i())
-    let line = ts + " sh-run ubu-deferred reason=" + reason +
+    let line = ts + " sh-run ubu-fallback reason=" + reason +
                " args=" + _join_argv(argv, 1) + "\n"
     let mut prev = ""
     if file_exists(TODO_LOG) {
         try { prev = read_file(TODO_LOG) } catch e { prev = "" }
     }
     try { write_file(TODO_LOG, prev + line) } catch e {}
-    ag_gate_msg("ubu-deferred", "sh-run fell back to local — see " + TODO_LOG)
-    return _run_local(argv)
+}
+
+// ─── stdin-piped probe — `[ -t 0 ]` returns rc=0 when stdin is a tty.
+// If stdin is NOT a tty, something is piped/redirected in; remote exec
+// via ssh subshell won't carry that forward. Remote stdin forwarding is
+// deferred as TODO; caller falls back to local.
+fn _stdin_piped() -> bool {
+    let r = exec_with_status("[ -t 0 ] && echo y || echo n")  // @allow-bare-exec
+    let out = to_string(r[0]).trim()
+    // `y` → tty (not piped); `n` → piped (no tty).
+    return out == "n"
+}
+
+// ─── basename — last path segment after final '/'; empty → input ─────
+fn _basename(p: str) -> str {
+    let idx = _last_idx(p, "/")
+    if idx < 0 { return p }
+    return p.substring(idx + 1, p.len())
+}
+
+// ═════════════════════════════════════════════════════════════════════
+// Remote primitives — ag_remote_exec / ag_scp_files are pub in
+// _cache.hexa; see _cache.hexa:382+ for contracts. No inline stubs here.
+// ═════════════════════════════════════════════════════════════════════
+
+// Helper: str → i64 with 0 fallback (local to sh_run — avoids name clash).
+fn _tail_rc_str(s: str) -> i64 {
+    let t = s.trim()
+    if t.len() == 0 { return 0 }
+    let mut n: i64 = 0
+    try { n = to_int(t) } catch e { return 0 }
+    return n
+}
+
+// ─── ubu dispatch: ssh exec via ag_remote_exec + scp file-args ───────
+// Shape A  : argv = [prog, "-c", "<cmd>"]        → ssh direct
+// Shape B  : argv = [prog, "<script>", args...]  → scp script → ssh sh
+// Any other unsupported shape → local fallback.
+fn _run_ubu(argv: [str], reason: str, host: str) -> i64 {
+    // Stdin piped? remote ssh can't forward piped stdin without PTY work.
+    // Document as TODO + fall back local.
+    if _stdin_piped() {
+        _log_ubu_todo("stdin-piped-todo", argv)
+        ag_gate_msg("ubu-fallback", "stdin piped — remote forwarding TODO; see " + TODO_LOG)
+        return _run_local(argv)
+    }
+
+    let mut remote_cmd = ""
+
+    // Shape A: `-c "<cmd>"` — argv[1] == "-c", argv[2] is the payload.
+    if argv.len() >= 3 && argv[1] == "-c" {
+        let quoted_cmd = "'" + _shq(argv[2]) + "'"
+        remote_cmd = "sh -c " + quoted_cmd
+        // Any trailing args after the -c payload become $0, $1, ... for sh.
+        // Preserve them quoted.
+        let mut k = 3
+        while k < argv.len() {
+            remote_cmd = remote_cmd + " '" + _shq(argv[k]) + "'"
+            k = k + 1
+        }
+    } else if argv.len() >= 2 {
+        // Shape B: <script.sh> [args...]
+        let script = argv[1]
+        let scp_rc = ag_scp_files(host, [script])
+        if scp_rc != 0 {
+            _log_ubu_todo("scp-failed-rc=" + to_string(scp_rc), argv)
+            ag_gate_msg("ubu-fallback", "scp failed rc=" + to_string(scp_rc) +
+                        " — falling back local; see " + TODO_LOG)
+            return _run_local(argv)
+        }
+        let base = _basename(script)
+        // Build trailing args (from argv[2..]) quoted for shell.
+        let rest = _build_sh_cmd(argv, 2)
+        remote_cmd = "sh /tmp/ag_gate/files/" + _shq(base)
+        if rest.len() > 0 {
+            remote_cmd = remote_cmd + " " + rest
+        }
+    } else {
+        // Shouldn't reach here — argv length was guarded in main().
+        _log_ubu_todo("unknown-shape", argv)
+        return _run_local(argv)
+    }
+
+    let result = ag_remote_exec(host, remote_cmd)
+    let stdout = result[0]
+    let rc_str = result[1]
+    print(stdout)
+    let rc = _tail_rc_str(rc_str)
+    return rc
 }
 
 fn main() {
@@ -210,10 +295,10 @@ fn main() {
         ag_gate_msg("local", "sh-run " + joined + " [filter:" + reason + "]")
         rc = _run_local(argv)
     } else {
-        // target == "ubu" — DEFERRED in phase-1 (see _run_ubu_deferred).
+        // target == "ubu" — ssh exec via ag_remote_exec + scp file-args.
         ag_gate_msg("remote", "sh-run " + joined + " [filter:" + reason +
                     "] " + gh + " " + UBU_DIR)
-        rc = _run_ubu_deferred(argv, reason)
+        rc = _run_ubu(argv, reason, gh)
         // Normalize target for record — v1 writes the intended target.
         target = "ubu"
     }

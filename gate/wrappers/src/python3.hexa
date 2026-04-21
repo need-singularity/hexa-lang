@@ -1,20 +1,33 @@
 // gate/wrappers/src/python3.hexa — phase-1 port of archive/v1/gate/wrappers/python3
 // @allow-bare-exec
 //
-// Mirrors v1 semantics with two narrowings:
+// Mirrors v1 semantics with one narrowing:
 //   1. REPL / `-c <code>` fast-path is preserved *exactly* (exec local,
 //      no filter, no budget). This keeps interactive python3 latency
 //      identical to un-wrapped python3.
-//   2. Remote (ubu) dispatch is DEFERRED — v1's rsync + scp + nc pipeline
-//      needs proper host-sync primitives that aren't in _cache.hexa yet.
-//      When ag_filter_decide returns "ubu", we log a TODO row and fall
-//      back to the local python3 so callers never block on remote gaps.
+//   2. Remote (ubu) dispatch is ACTIVE: scp each .py arg to the host under
+//      /tmp/ag_gate/files/, rewrite argv, and run `python3` remotely via
+//      `ssh`. On any stage failure we degrade to local so the user's
+//      command still runs.
 //
 // Ref style: gate/hexa_url.hexa (ai_err, $WS guard, @allow-bare-exec).
 // Reserved-word guard: no `spawn`/`scope`/`find` — local names use
 // `bg_cmd`, `sc`, `index_of` instead (gate/HEXA_RESERVED.md §3).
+//
+// TODO (sibling-import / venv limitations):
+//   * Remote cwd is /tmp/ag_gate/files — sibling module imports only work
+//     if those siblings were also passed on argv (or pre-staged). No auto
+//     package graph walk yet.
+//   * `-m <module>` is NOT supported: we would have to rsync site-packages
+//     or resolve the importable path to a file. Fall back local today.
+//   * No virtualenv / pyenv resolution on the remote side — the host's
+//     plain `python3` is invoked.
 
 use "_cache"
+
+// ─── Remote primitives ────────────────────────────────────────────────
+// ag_remote_exec / ag_rsync / ag_scp_files are pub in _cache.hexa;
+// see _cache.hexa:382+ for contracts. No inline stubs here.
 
 // ─── ai-native error helper — every failure: what/fix/ssot ────────────
 fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
@@ -69,6 +82,28 @@ fn _join_raw(items: [str]) -> str {
         i = i + 1
     }
     return out
+}
+
+// ─── .py arg detection + basename ─────────────────────────────────────
+// Heuristic: any argv item that ends with ".py" AND does not start with "-"
+// is treated as a script path to ship. Simple by design — `-m foo.py` is
+// rare enough to punt to local (see TODO block at top of file).
+fn _is_py_arg(s: str) -> bool {
+    if s.len() == 0 { return false }
+    if s.starts_with("-") { return false }
+    return s.ends_with(".py")
+}
+
+fn _basename(path: str) -> str {
+    let parts = path.split("/")
+    let mut last = ""
+    let mut i = 0
+    while i < parts.len() {
+        let p = to_string(parts[i])
+        if p.len() > 0 { last = p }
+        i = i + 1
+    }
+    return last
 }
 
 // ─── Epoch seconds as i64 (for elapsed calc) ──────────────────────────
@@ -192,31 +227,97 @@ fn main() {
         exit(rc)
     }
 
-    // ─── target = ubu (DEFERRED) ─────────────────────────────────────
-    // v1 rsyncs $NEXUS/shared, scps arg-files, pipes `cd <dir> && python3 ...`
-    // through `nc <GH>:<port>` and strips the ---END--- sentinel. That whole
-    // pipeline depends on primitives _cache.hexa doesn't expose yet
-    // (remote_exec, file_sync, nc_pipe). Rather than silently produce a
-    // half-working ubu path, we:
-    //   1. log a TODO row via ag_filter_record (target="ubu-deferred") so
-    //      the deferral is visible in /tmp/ag_gate_filter.log.
-    //   2. fall back to local python3 so the user's command still runs.
-    //   3. emit a one-line TODO on stderr (only when AG_GATE_DEBUG=1 to
-    //      avoid polluting normal output).
-    ag_gate_msg("local", "python3 " + joined + " [filter:" + reason + " ubu-deferred→local]")
-    if env("AG_GATE_DEBUG") == "1" {
-        eprintln("[python3/TODO-REMOTE] ubu dispatch deferred (rsync/scp/nc not yet in _cache.hexa) — running local")
+    // ─── target = ubu (ACTIVE remote dispatch) ───────────────────────
+    // Flow:
+    //   1. Collect .py args (argv items ending .py, not starting with `-`).
+    //   2. `-m <module>` → fall back local (TODO: site-packages sync).
+    //   3. scp each .py to host:/tmp/ag_gate/files/ ; on any scp failure
+    //      degrade to local.
+    //   4. Rewrite argv — each .py path becomes /tmp/ag_gate/files/<base>.
+    //   5. ssh `cd /tmp/ag_gate/files && python3 <rewritten>` and relay.
+    //
+    // Limitation (documented): remote cwd is /tmp/ag_gate/files, so sibling
+    // imports only resolve if those siblings were also on argv. Pre-staging
+    // whole packages is not handled yet (TODO: ag_rsync dir sync).
+
+    // Detect `-m` early — no support yet, fall back local.
+    let mut has_dash_m = false
+    let mut mi = 0
+    while mi < uargs.len() {
+        if to_string(uargs[mi]) == "-m" { has_dash_m = true; break }
+        mi = mi + 1
     }
-    let ex2 = _sh_quote(real_py) + " " + _join_quoted(uargs) + " 2>&1"
-    // @allow-bare-exec
-    let r2 = exec_with_status(ex2)
-    let out2 = to_string(r2[0])
-    let rc2 = to_int(to_string(r2[1]))
-    if out2.len() > 0 { print(out2) }
-    let t2 = _epoch_i()
-    ag_filter_record("python3", "ubu-deferred", rc2, t2 - t0)
+
+    // Collect .py files from argv.
+    let mut py_files: [str] = []
+    let mut pi = 0
+    while pi < uargs.len() {
+        let arg = to_string(uargs[pi])
+        if _is_py_arg(arg) { py_files = py_files + [arg] }
+        pi = pi + 1
+    }
+
+    // TODO: venv / pyenv resolution on host — we invoke plain `python3`.
+    if has_dash_m {
+        ag_gate_msg("local", "python3 " + joined + " [filter:" + reason + " -m→local (TODO:site-packages)]")
+        if env("AG_GATE_DEBUG") == "1" {
+            eprintln("[python3/TODO-REMOTE] -m module dispatch unsupported remotely — running local")
+        }
+        let ex_m = _sh_quote(real_py) + " " + _join_quoted(uargs) + " 2>&1"
+        // @allow-bare-exec
+        let r_m = exec_with_status(ex_m)
+        let out_m = to_string(r_m[0])
+        let rc_m = to_int(to_string(r_m[1]))
+        if out_m.len() > 0 { print(out_m) }
+        let t_m = _epoch_i()
+        ag_filter_record("python3", "local", rc_m, t_m - t0)
+        ag_budget_leave()
+        exit(rc_m)
+    }
+
+    // Stage files on host.
+    let scp_rc = ag_scp_files(gh, py_files)
+    if scp_rc != 0 {
+        ag_gate_msg("local", "python3 " + joined + " [filter:" + reason + " scp-fail→local]")
+        if env("AG_GATE_DEBUG") == "1" {
+            eprintln("[python3/E_SCP] scp rc=" + to_string(scp_rc) + " → local fallback")
+        }
+        let ex_f = _sh_quote(real_py) + " " + _join_quoted(uargs) + " 2>&1"
+        // @allow-bare-exec
+        let r_f = exec_with_status(ex_f)
+        let out_f = to_string(r_f[0])
+        let rc_f = to_int(to_string(r_f[1]))
+        if out_f.len() > 0 { print(out_f) }
+        let t_f = _epoch_i()
+        ag_filter_record("python3", "local", rc_f, t_f - t0)
+        ag_budget_leave()
+        exit(rc_f)
+    }
+
+    // Rewrite argv: each .py path → /tmp/ag_gate/files/<basename>. Other
+    // args (flags, `-`, non-.py positionals) pass through verbatim.
+    let mut rargs: [str] = []
+    let mut ri = 0
+    while ri < uargs.len() {
+        let a = to_string(uargs[ri])
+        if _is_py_arg(a) {
+            rargs = rargs + ["/tmp/ag_gate/files/" + _basename(a)]
+        } else {
+            rargs = rargs + [a]
+        }
+        ri = ri + 1
+    }
+
+    let remote_cmd = "cd /tmp/ag_gate/files && python3 " + _join_quoted(rargs)
+    ag_gate_msg("ubu", "python3 " + joined + " [filter:" + reason + " host=" + gh + "]")
+    let result = ag_remote_exec(gh, remote_cmd)
+    let out_r = to_string(result[0])
+    let rc_r = to_int(to_string(result[1]))
+    if out_r.len() > 0 { print(out_r) }
+    let t_r = _epoch_i()
+    ag_filter_record("python3", "ubu", rc_r, t_r - t0)
     ag_budget_leave()
-    exit(rc2)
+    exit(rc_r)
 }
 
 main()

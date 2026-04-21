@@ -1,18 +1,33 @@
 // gate/wrappers/src/rustc.hexa — phase-1 port of archive/v1/gate/wrappers/rustc.
 // @allow-bare-exec
 //
-// Scope: local-exec fast-path + budget enter/leave + filter decide/record.
-// v1's remote dispatch (htz scp+ssh, ubu nc+rsync, host probe fallback) is
-// DEFERRED to phase 2 — a target=="ubu" decision currently degrades to local
-// and logs a TODO marker in the filter log. The CARGO-env fast-path is
-// preserved exactly: when AG_ENTANGLE_KEY is unset AND CARGO is set, the
-// wrapper runs rustc locally without going through the decide path, because
-// a cargo parent's entanglement already chose routing for the whole build.
+// Scope: local-exec fast-path + budget enter/leave + filter decide/record +
+// ACTIVE remote (ubu) dispatch. The CARGO-env fast-path is preserved exactly:
+// when AG_ENTANGLE_KEY is unset AND CARGO is set, the wrapper runs rustc
+// locally without going through the decide path, because a cargo parent's
+// entanglement already chose routing for the whole build.
+//
+// Remote flow mirrors python3.hexa:
+//   1. ag_resolve_host() → pick reachable host (empty = local fallback + warn).
+//   2. Collect argv items ending in ".rs" (v1 parity: bare .rs + `--crate-name
+//      foo src/foo.rs` — any positional path ending .rs is staged).
+//   3. scp each .rs to host:/tmp/ag_gate/files/; scp fail → local fallback.
+//   4. Rewrite argv — each .rs path becomes /tmp/ag_gate/files/<basename>.
+//   5. ssh `rustc <rewritten>` and relay stdout + rc.
+//
+// Phase-1 limitation (documented): output binaries (.a, .rlib, .so, exe) are
+// left on the remote at /tmp/ag_gate/files/ — we DO NOT fetch build artifacts
+// back. TODO: E_REMOTE_ARTIFACT_UNFETCHED. Workflows that expect local output
+// files must run under CLAUDX_NO_WRAPPER=1 or AG_GATE_FORCE_LOCAL=1.
 //
 // Ref: gate/hexa_url.hexa for ai_err / $WS / @allow-bare-exec conventions.
 // Reserved-word guard (gate/HEXA_RESERVED.md): no spawn / scope / find.
 
 use "_cache"
+
+// ─── Remote primitives ────────────────────────────────────────────────
+// ag_remote_exec / ag_rsync / ag_scp_files are pub in _cache.hexa;
+// see _cache.hexa:382+ for contracts. No inline stubs here.
 
 let HOME = env("HOME")
 let WS = env("WS")
@@ -51,6 +66,18 @@ fn _join_shell(a: [str]) -> str {
     while i < a.len() {
         if out.len() > 0 { out = out + " " }
         out = out + _sh_quote(a[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Shell-join a pre-normalized argv (no argv[0] dedup, every item quoted).
+fn _join_quoted(items: [str]) -> str {
+    let mut out = ""
+    let mut i: i64 = 0
+    while i < items.len() {
+        if i > 0 { out = out + " " }
+        out = out + _sh_quote(to_string(items[i]))
         i = i + 1
     }
     return out
@@ -104,12 +131,51 @@ fn _exec_local(bin: str, argv: [str]) -> i64 {
     return rc
 }
 
+// ─── .rs arg detection + basename ────────────────────────────────────
+// Heuristic: any argv item ending in ".rs" AND not starting with "-" is a
+// source path to stage. This matches v1's `[[ -f "$a" && "$a" == *.rs ]]`
+// for both bare positionals (`rustc foo.rs`) and path-valued flags where
+// the path follows as the next argv item (`--crate-name foo src/foo.rs`).
+// Flags like `--edition=2021` have `=` so they don't end in `.rs`.
+fn _is_rs_arg(s: str) -> bool {
+    if s.len() == 0 { return false }
+    if s.starts_with("-") { return false }
+    return s.ends_with(".rs")
+}
+
+fn _basename(path: str) -> str {
+    let parts = path.split("/")
+    let mut last = ""
+    let mut i = 0
+    while i < parts.len() {
+        let p = to_string(parts[i])
+        if p.len() > 0 { last = p }
+        i = i + 1
+    }
+    return last
+}
+
 // ─── epoch seconds helper (duplicated from _cache to avoid cross-fn) ─
 fn _now_s() -> i64 {
     let s = to_string(exec("date +%s")).trim()  // @allow-bare-exec
     let mut n: i64 = 0
     try { n = to_int(s) } catch e { n = 0 }
     return n
+}
+
+// ─── Normalize argv (skip compiled-binary argv[0] dup) ───────────────
+// Returns the user-facing argv without the `self == self` duplicate that
+// hexa_set_args emits in compiled-binary mode. Used for the remote path
+// where we need a clean list to scan + rewrite.
+fn _norm_argv(a: [str]) -> [str] {
+    let mut i: i64 = 0
+    if a.len() >= 2 && a[0] == a[1] { i = 2 }
+    let mut out: [str] = []
+    while i < a.len() {
+        out = out + [to_string(a[i])]
+        i = i + 1
+    }
+    return out
 }
 
 fn main() {
@@ -167,15 +233,83 @@ fn main() {
     }
 
     if target == "ubu" {
-        // Remote routing deferred (phase 2). Fall back to local + log
-        // TODO so the filter trail still captures the intent.
-        ag_gate_msg("local", "rustc " + joined + " [ubu-deferred→local]")
-        ag_filter_record("rustc", "ubu-todo", 0, 0)
-        let mut rc: i64 = 0
-        try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+        // ─── ACTIVE remote dispatch ──────────────────────────────────
+        // Resolve reachable host; empty = no host reachable → local.
+        let host = ag_resolve_host()
+        if host.len() == 0 {
+            ag_gate_msg("local", "rustc " + joined + " [ubu:no-host→local]")
+            if env("AG_GATE_DEBUG") == "1" {
+                eprintln("[rustc/W_NO_HOST] ag_resolve_host() returned empty — local fallback")
+            }
+            let mut rc: i64 = 0
+            try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+            ag_budget_leave()
+            ag_filter_record("rustc", "local", rc, _now_s() - t0)
+            exit(rc)
+        }
+
+        // Collect .rs files from a normalized (no argv[0] dup) argv.
+        let uargv = _norm_argv(argv)
+        let mut rs_files: [str] = []
+        let mut pi = 0
+        while pi < uargv.len() {
+            let a = to_string(uargv[pi])
+            if _is_rs_arg(a) { rs_files = rs_files + [a] }
+            pi = pi + 1
+        }
+
+        // Stage sources. If scp fails at any step → local fallback.
+        let scp_rc = ag_scp_files(host, rs_files)
+        if scp_rc != 0 {
+            ag_gate_msg("local", "rustc " + joined + " [ubu:scp-fail→local rc=" + to_string(scp_rc) + "]")
+            if env("AG_GATE_DEBUG") == "1" {
+                eprintln("[rustc/E_SCP] scp rc=" + to_string(scp_rc) + " → local fallback")
+            }
+            let mut rc: i64 = 0
+            try { rc = _exec_local(real_rustc, argv) } catch e { rc = 1 }
+            ag_budget_leave()
+            ag_filter_record("rustc", "local", rc, _now_s() - t0)
+            exit(rc)
+        }
+
+        // Rewrite argv: every .rs path → /tmp/ag_gate/files/<basename>.
+        // Flags, crate names, and non-.rs positionals pass through verbatim.
+        // This covers both `rustc foo.rs` and `rustc --crate-name foo src/foo.rs`
+        // — `--crate-name` sits in its own argv slot, followed by `foo` (no dot),
+        // then `src/foo.rs` (matched + rewritten). `--edition=2021` does not end
+        // in .rs so it passes through.
+        let mut rargs: [str] = []
+        let mut ri = 0
+        while ri < uargv.len() {
+            let a = to_string(uargv[ri])
+            if _is_rs_arg(a) {
+                rargs = rargs + ["/tmp/ag_gate/files/" + _basename(a)]
+            } else {
+                rargs = rargs + [a]
+            }
+            ri = ri + 1
+        }
+
+        let remote_cmd = "rustc " + _join_quoted(rargs)
+        ag_gate_msg("ubu", "rustc " + joined + " [filter:" + reason + " host=" + host + "]")
+        let result = ag_remote_exec(host, remote_cmd)
+        let out_r = to_string(result[0])
+        let rc_r = to_int(to_string(result[1]))
+        if out_r.len() > 0 { print(out_r) }
+
+        // TODO E_REMOTE_ARTIFACT_UNFETCHED: output binaries (.a, .rlib, .so,
+        // exe) remain on remote at /tmp/ag_gate/files/. Fetching them back is
+        // phase-2 work — needs crate_type detection, basename inference, and
+        // scp round-trip. For now, log the limitation when debug is on.
+        if env("AG_GATE_DEBUG") == "1" && rs_files.len() > 0 {
+            eprintln("[rustc/TODO E_REMOTE_ARTIFACT_UNFETCHED] build outputs left on " +
+                     host + ":/tmp/ag_gate/files/ — phase-1 limitation")
+        }
+        ag_gate_msg("ubu", "rustc artifacts at " + host + ":/tmp/ag_gate/files/ (TODO E_REMOTE_ARTIFACT_UNFETCHED)")
+
         ag_budget_leave()
-        ag_filter_record("rustc", "local", rc, _now_s() - t0)
-        exit(rc)
+        ag_filter_record("rustc", "ubu", rc_r, _now_s() - t0)
+        exit(rc_r)
     }
 
     // ─── Fallthrough: unknown target, run local, mark unreachable ────

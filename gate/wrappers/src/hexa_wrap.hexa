@@ -167,20 +167,183 @@ fn _exec_local(real: str, argv: [str], start: i64) -> i64 {
     return _to_i64(to_string(r[1]), 1)
 }
 
-// ─── phase-2 hook: remote (ubu) dispatch — DEFERRED ──────────────────
-// When implemented: rsync nexus/shared → ubu:$UBU_DIR/nexus/shared/,
-// scp file-args → ubu:$UBU_DIR/gate_files/ using SCP_DEDUP_DIR cache,
-// then `ssh ubu "cd $UBU_DIR && hexa <remote-args>"`. Also reuse
-// RSYNC_STAMP to skip no-op rsyncs. For now: log TODO + fall back local.
-fn _exec_remote_stub(real: str, argv: [str], start: i64) -> i64 {
-    ai_err("REMOTE-DEFERRED",
-           "ubu remote dispatch not yet ported — falling back to local exec",
-           "implement rsync($NEXUS/shared → ubu:" + UBU_DIR + "/nexus/shared) + scp dedup + ssh hexa; see archive/v1/gate/wrappers/hexa L129-182",
-           "gate/wrappers/src/hexa_wrap.hexa:_exec_remote_stub")
-    // Touch the state-file locations now so phase-2 code inherits a stable
-    // directory (idempotent — won't disturb existing caches).
-    try { exec("mkdir -p '" + _q(SCP_DEDUP) + "' 2>/dev/null") } catch e {}  // @allow-bare-exec
-    return _exec_local(real, argv, start)
+// ─── remote helpers ───────────────────────────────────────────────────
+// ag_remote_exec / ag_rsync / ag_scp_files are pub in _cache.hexa;
+// see _cache.hexa:382+ for contracts. No inline stubs here.
+
+// ─── classify: run/build/parse/test/flag + collect .hexa paths ───────
+// Returns a map-ish tuple as [str]:
+//   [0] mode:   "run"|"build"|"parse"|"test"|"flag"|"other"
+//   [1..]      each .hexa file path seen in argv (absolute-ized)
+fn _classify(argv: [str], start: i64) -> [str] {
+    let mut out: [str] = []
+    let mut mode = "other"
+    if start < argv.len() {
+        let first = argv[start]
+        if first.starts_with("--") || first.starts_with("-") {
+            mode = "flag"
+        } else if first == "run"   { mode = "run" }
+          else if first == "build" { mode = "build" }
+          else if first == "parse" { mode = "parse" }
+          else if first == "test"  { mode = "test" }
+    }
+    out = out + [mode]
+    let mut i = start
+    while i < argv.len() {
+        let a = argv[i]
+        if a.ends_with(".hexa") && _exists(a) {
+            let abs = _realpath(a)
+            if abs.len() > 0 { out = out + [abs] } else { out = out + [a] }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── detect git workspace root for a given absolute path ─────────────
+// Returns "" if not inside a git repo.
+fn _git_root_for(p: str) -> str {
+    if p.len() == 0 { return "" }
+    // If p is a file, use its dirname; if directory, use as-is.
+    let q = _q(p)
+    let cmd = "dir=$(dirname '" + q + "' 2>/dev/null); " +
+              "git -C \"$dir\" rev-parse --show-toplevel 2>/dev/null"
+    let r = to_string(exec(cmd)).trim()  // @allow-bare-exec
+    return r
+}
+
+// ─── rewrite an argv entry for remote execution ──────────────────────
+// If the entry is a .hexa path under `repo_root`, rewrite it to
+//   /tmp/ag_gate/<repo_base>/<rel>.
+// Else if the entry is a standalone .hexa file we scp'd, rewrite to
+//   /tmp/ag_gate/files/<basename>.
+// Else return as-is (quoted later by caller).
+fn _rewrite_arg(a: str, repo_root: str, repo_base: str) -> str {
+    if a.ends_with(".hexa") && _exists(a) {
+        let abs = _realpath(a)
+        let use_abs = if abs.len() > 0 { abs } else { a }
+        if repo_root.len() > 0 && use_abs.starts_with(repo_root + "/") {
+            let rel = use_abs.substring(repo_root.len() + 1, use_abs.len())
+            return "/tmp/ag_gate/" + repo_base + "/" + rel
+        }
+        // Standalone file → files/ landing.
+        let bn = to_string(exec("basename '" + _q(use_abs) + "' 2>/dev/null")).trim()  // @allow-bare-exec
+        if bn.len() > 0 { return "/tmp/ag_gate/files/" + bn }
+    }
+    return a
+}
+
+// ─── stdin-is-tty guard (best-effort) ────────────────────────────────
+// `test -t 0` exits 0 when stdin is a terminal. We don't stream stdin to
+// the remote, so any interactive invocation falls back to local.
+fn _stdin_is_tty() -> bool {
+    let r = to_string(exec("test -t 0 && echo y || echo n")).trim()  // @allow-bare-exec
+    return r == "y"
+}
+
+// ─── remote (ubu) dispatch — phase-2 activation ──────────────────────
+// Strategy per mode:
+//   flag   → no sync, direct ssh with same argv.
+//   run    → scp_files(<file>) + rsync(repo_root if any).
+//   build|parse|test → rsync(repo_root).
+//   other  → fall back local (safe default).
+fn _exec_remote(real: str, argv: [str], start: i64) -> i64 {
+    let host = ag_resolve_host()
+    if host.len() == 0 {
+        ai_err("REMOTE-UNREACHABLE",
+               "ag_resolve_host() returned empty — no reachable remote; running local",
+               "check ~/.ssh/config alias, config.jsonl remote_host/tailscale_host/hetzner_host, or unset AG_GATE_FORCE_REMOTE",
+               "gate/wrappers/src/_cache.hexa:ag_resolve_host")
+        return _exec_local(real, argv, start)
+    }
+
+    // TODO(stdin): we don't stream stdin to remote hexa. Interactive
+    // `hexa run` (REPL-ish) must stay local. Pipes also fall back —
+    // documented here, enforced by the tty check below.
+    if _stdin_is_tty() {
+        // interactive terminal → stay local.
+        return _exec_local(real, argv, start)
+    }
+
+    // Classify argv.
+    let cls = _classify(argv, start)
+    let mode = cls[0]
+
+    // Pick a primary .hexa path (if any) to derive repo root.
+    let mut primary = ""
+    if cls.len() >= 2 { primary = cls[1] }
+    // If no .hexa in argv but $PWD is a repo (build/test from inside),
+    // still use $PWD for repo detection.
+    let pwd = to_string(exec("pwd")).trim()  // @allow-bare-exec
+    let probe = if primary.len() > 0 { primary } else { pwd + "/." }
+    let repo_root = _git_root_for(probe)
+    let repo_base = if repo_root.len() > 0 {
+        to_string(exec("basename '" + _q(repo_root) + "' 2>/dev/null")).trim()  // @allow-bare-exec
+    } else { "" }
+
+    // Sync step.
+    if mode == "flag" {
+        // nothing to sync
+    } else if mode == "run" {
+        if primary.len() > 0 {
+            let sc = ag_scp_files(host, [primary])
+            if sc != 0 {
+                ai_err("REMOTE-SCP-FAIL",
+                       "scp of " + primary + " to " + host + " failed (rc=" + to_string(sc) + ") — falling back to local",
+                       "check ssh auth (BatchMode=yes) and remote /tmp/ag_gate/files perms",
+                       "gate/wrappers/src/_cache.hexa:ag_scp_files")
+                return _exec_local(real, argv, start)
+            }
+        }
+        if repo_root.len() > 0 {
+            let rs = ag_rsync(host, repo_root)
+            if rs != 0 {
+                ai_err("REMOTE-RSYNC-WARN",
+                       "rsync of " + repo_root + " to " + host + " failed (rc=" + to_string(rs) + ") — attempting remote exec anyway",
+                       "check ssh auth and remote /tmp/ag_gate perms",
+                       "gate/wrappers/src/_cache.hexa:ag_rsync")
+            }
+        }
+    } else if mode == "build" || mode == "parse" || mode == "test" {
+        if repo_root.len() > 0 {
+            let rs = ag_rsync(host, repo_root)
+            if rs != 0 {
+                ai_err("REMOTE-RSYNC-FAIL",
+                       "rsync of " + repo_root + " to " + host + " failed (rc=" + to_string(rs) + ") — falling back to local",
+                       "check ssh auth and remote /tmp/ag_gate perms",
+                       "gate/wrappers/src/_cache.hexa:ag_rsync")
+                return _exec_local(real, argv, start)
+            }
+        }
+    } else {
+        // "other" — unknown subcommand; safer to run local.
+        return _exec_local(real, argv, start)
+    }
+
+    // Rewrite argv for remote.
+    let mut rewritten = ""
+    let mut i = start
+    while i < argv.len() {
+        let a0 = argv[i]
+        let a1 = _rewrite_arg(a0, repo_root, repo_base)
+        if rewritten.len() > 0 { rewritten = rewritten + " " }
+        rewritten = rewritten + "'" + _q(a1) + "'"
+        i = i + 1
+    }
+
+    let remote_cd = if repo_root.len() > 0 {
+        "/tmp/ag_gate/" + repo_base
+    } else {
+        "/tmp/ag_gate/files"
+    }
+    let remote_cmd = "cd '" + remote_cd + "' && hexa " + rewritten
+    let result = ag_remote_exec(host, remote_cmd)
+    let stdout = to_string(result[0])
+    let rc = _to_i64(to_string(result[1]), 1)
+    // TODO(writeback): remote file writes (hexa build -o ...) are NOT
+    // relayed back to the local disk. User sees stdout only. Document.
+    if stdout.len() > 0 { print(stdout) }
+    return rc
 }
 
 fn main() {
@@ -262,12 +425,12 @@ fn main() {
         ag_gate_msg("local", "hexa " + raw_args + " [filter:" + reason + "]")
         rc = _exec_local(real, argv, user_start)
     } else {
-        // target == "ubu" (or any non-local) — phase-1 stub falls back.
-        ag_gate_msg("remote-todo", "hexa " + raw_args + " [filter:" + reason + "]")
-        rc = _exec_remote_stub(real, argv, user_start)
-        // After the stub falls back, re-tag target so the filter record
-        // reflects the actual execution site (not the filter's intent).
-        target = "local-fallback"
+        // target == "ubu" — phase-2 remote dispatch. _exec_remote itself
+        // may fall back to local (unreachable host, tty stdin, unknown
+        // subcommand, scp failure); we can't cheaply distinguish here so
+        // the filter record keeps target="ubu" as the dispatch *intent*.
+        ag_gate_msg("remote", "hexa " + raw_args + " [filter:" + reason + "]")
+        rc = _exec_remote(real, argv, user_start)
     }
 
     // Budget leave — always, even on non-zero rc.
