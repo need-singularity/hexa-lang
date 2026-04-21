@@ -55,6 +55,8 @@ fn cmd_help() {
     println("                                    --compare <other_bin> (A/B vs second binary)")
     println("    cc                      Rebuild the transpiler (hexa_cc)")
     println("    gc [--dry-run]          Prune .hexa-cache slots older than 30d")
+    println("                              Env: HEXA_CACHE=0 disables AOT cache")
+    println("                              fast-path (forces stage0 interpreter).")
     println("    lsp                     Start LSP server (stdin/stdout, JSON-RPC)")
     println("    status                  Show toolchain status")
     println("    version                 Print version")
@@ -799,6 +801,263 @@ fn cache_hit(slot, fp) {
     return chk == fp
 }
 
+// ── stage0 AOT cache reactivation (bt 36 revival, 2026-04-21) ─
+// The original AOT path was disabled for two reasons:
+//   (a) stale hits — src_fingerprint covered only the main file's
+//       mtime|size; imports / stage0 rebuild didn't invalidate.
+//       FIX: src_fingerprint_deep walks transitive imports + stage0
+//       binary in a single stat invocation.
+//   (b) cold-miss penalty for one-shot hooks. FIX: cmd_run falls
+//       through to stage0 on any build failure — first-call latency
+//       never regresses.
+// Denylist (should_cache) excludes tests / regen / bench / selftests
+// and tools that derive repo root from argv()[1] (build_*, tool/build/*)
+// since native runtime forces argv[1] = argv[0] (self/runtime.c:3432).
+// `HEXA_CACHE=0` env gate disables the fast-path globally.
+
+// Bump when fingerprint schema changes — forces global cache flush.
+fn cache_schema_version() { return "v3" }
+
+@pure
+fn _cache_dirname(path) {
+    let n = len(path)
+    let mut i = n - 1
+    while i >= 0 {
+        if path.substring(i, i + 1) == "/" {
+            return path.substring(0, i)
+        }
+        i = i - 1
+    }
+    return "."
+}
+
+fn _cache_abs_path(p) {
+    let r = exec("cd \"$(dirname '" + p + "')\" 2>/dev/null && printf '%s/%s' \"$(pwd -P)\" \"$(basename '" + p + "')\"")
+    return r
+}
+
+fn _cache_resolve_import(imp, caller_dir) {
+    // Mirror of module_loader.ml_resolve_full — simplified, dep-list-only
+    // (no preprocessor side-effect). Empty string on unresolvable — the
+    // scanner is conservative: over-invalidation preferred to under.
+    let raw = caller_dir + "/" + imp
+    if file_exists(raw) { return raw }
+    let raw_ext = raw + ".hexa"
+    if file_exists(raw_ext) { return raw_ext }
+    let hl = env_var("HEXA_LANG")
+    if len(hl) > 0 {
+        if imp.starts_with("stdlib/") {
+            let rest = imp.substring(7, len(imp))
+            let cand = hl + "/self/" + rest + ".hexa"
+            if file_exists(cand) { return cand }
+        }
+        let pr = hl + "/" + imp
+        if file_exists(pr) { return pr }
+        let pr_ext = pr + ".hexa"
+        if file_exists(pr_ext) { return pr_ext }
+    }
+    let inst = install_dir_from_argv0()
+    if len(inst) > 0 {
+        if imp.starts_with("stdlib/") {
+            let rest = imp.substring(7, len(imp))
+            let cand = inst + "/self/" + rest + ".hexa"
+            if file_exists(cand) { return cand }
+        }
+        let pr = inst + "/" + imp
+        if file_exists(pr) { return pr }
+        let pr_ext = pr + ".hexa"
+        if file_exists(pr_ext) { return pr_ext }
+    }
+    return ""
+}
+
+fn _cache_extract_imports(src) {
+    // One-quote-pair scan. Malformed lines silently skipped.
+    let mut out = []
+    let lines = src.split("\n")
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i]
+        let mut imp = ""
+        if line.starts_with("use \"") {
+            imp = line.substring(5, len(line))
+        } else if line.starts_with("import \"") {
+            imp = line.substring(8, len(line))
+        }
+        if len(imp) > 0 {
+            let mut j = 0
+            let mut end = -1
+            while j < len(imp) {
+                if imp.substring(j, j + 1) == "\"" {
+                    if end < 0 { end = j }
+                }
+                j = j + 1
+            }
+            if end > 0 {
+                out.push(imp.substring(0, end))
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+@pure
+fn _cache_arr_contains(arr, s) {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == s { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn list_transitive_imports(file) {
+    // BFS walk over use/import directives starting at `file`.
+    // Order is source-determined (deterministic across runs of same
+    // repo state) → safe fingerprint input without needing sort.
+    // Depth cap 32 prevents pathological loops. Unresolvable imports
+    // skipped (conservative).
+    let abs_start = _cache_abs_path(file)
+    let start = if len(abs_start) > 0 { abs_start } else { file }
+    let mut seen = [start]
+    let mut queue = [start]
+    let mut depth = 0
+    while len(queue) > 0 {
+        if depth >= 32 { return seen }
+        let mut next_queue = []
+        let mut qi = 0
+        while qi < len(queue) {
+            let cur = queue[qi]
+            if file_exists(cur) {
+                let src = read_file(cur)
+                let caller_dir = _cache_dirname(cur)
+                let imps = _cache_extract_imports(src)
+                let mut ii = 0
+                while ii < len(imps) {
+                    let imp = imps[ii]
+                    let resolved = _cache_resolve_import(imp, caller_dir)
+                    if len(resolved) > 0 {
+                        let abs = _cache_abs_path(resolved)
+                        let use_abs = if len(abs) > 0 { abs } else { resolved }
+                        if !_cache_arr_contains(seen, use_abs) {
+                            seen.push(use_abs)
+                            next_queue.push(use_abs)
+                        }
+                    }
+                    ii = ii + 1
+                }
+            }
+            qi = qi + 1
+        }
+        queue = next_queue
+        depth = depth + 1
+    }
+    return seen
+}
+
+fn src_fingerprint_deep(file) {
+    // Single-stat batch over transitive imports + stage0 binary,
+    // piped through shasum in one shell fork. Target <30ms on the
+    // hot path. mtime|size (not content sha): (a) editors always
+    // update mtime on save, (b) atomic mv -f on stage0 rebuild
+    // always changes mtime, (c) spoofed mtime (git-checkout restore)
+    // causes stale hit until next edit — acceptable, user can
+    // `rm -rf .hexa-cache` to reset. 64-char hex; "" on empty.
+    let paths = list_transitive_imports(file)
+    if len(paths) == 0 { return "" }
+    let mut args = ""
+    let mut i = 0
+    while i < len(paths) {
+        args = args + " '" + paths[i] + "'"
+        i = i + 1
+    }
+    let s0 = resolve_stage0()
+    if len(s0) > 0 { args = args + " '" + s0 + "'" }
+    // BSD (%N %m %z) first; GNU (%n %Y %s) fallback — both in the
+    // same fork via ||. Schema version prepended as invalidation lever.
+    let pipeline = "(stat -f '%N|%m|%z'" + args + " 2>/dev/null || stat -c '%n|%Y|%s'" + args + " 2>/dev/null) | (printf 'HXCACHE|" + cache_schema_version() + "\\n'; cat) | shasum -a 256 | cut -c1-64 | tr -d '\\n'"
+    return exec(pipeline)
+}
+
+fn should_cache(file) {
+    if env_var("HEXA_CACHE") == "0" { return false }
+    // Denylist: one-shot or argv[1]-dependent tools. Native runtime
+    // forces argv[1] = argv[0] (self/runtime.c:3432-3433), so tools
+    // using argv()[1] / dirname(argv[1]) for repo-root resolution
+    // misresolve to .hexa-cache/<hash>/ when run from a cached binary.
+    if file.contains("/test/") { return false }
+    if file.contains("/tests/") { return false }
+    if file.contains("_regen") { return false }
+    if file.contains("/codegen_") { return false }
+    if file.contains("/bench_") { return false }
+    if file.contains("/build_") { return false }
+    if file.contains("/tool/build/") { return false }
+    if file.contains("selftest") { return false }
+    if file.contains("rebuild_") { return false }
+    return true
+}
+
+fn try_cache_exec(file, extra_args) {
+    // Returns exit-code on cache hit (child fully executed + collected),
+    // -1 on miss. Mirrors the shell-watch construction in cmd_run
+    // (fd3 stdin dup, __HEXA_RC sentinel, stderr tmp, parent-death
+    // watch loop) — the runtime-critical contract from rt 34/35/36
+    // + 2026-04-20 silent-stderr-fallback fix. KEEP IN SYNC with the
+    // cmd_run stage0 path below.
+    let root = cache_root()
+    let key = source_key(file)
+    let slot = root + "/" + key
+    let fp = src_fingerprint_deep(file)
+    if len(fp) == 0 { return -1 }
+    if !cache_hit(slot, fp) { return -1 }
+    let cached = slot + "/exe"
+    // Native runtime auto-duplicates argv[0] into slot 1 to mirror the
+    // interpreter layout (self/runtime.c:3429-3436). Do NOT pass `file`
+    // as argv[1] — that would double-shift args()[2..] in hook tools.
+    let arg_tail = join_shell_args(extra_args)
+    let dyld_pass = env_var("DYLD_LIBRARY_PATH")
+    let ld_pass = env_var("LD_LIBRARY_PATH")
+    let mut ffi_env = ""
+    if len(dyld_pass) > 0 { ffi_env = ffi_env + "DYLD_LIBRARY_PATH='" + dyld_pass + "' " }
+    if len(ld_pass) > 0 { ffi_env = ffi_env + "LD_LIBRARY_PATH='" + ld_pass + "' " }
+    let vm_env = if cmd_run_vm_mode { "HEXA_VM=1 " } else { "" }
+    let watch = " ) & C=$!; ( while kill -0 $C 2>/dev/null; do [ $PPID -eq 1 ] && { kill -9 $C 2>/dev/null; exit; }; kill -0 $PPID 2>/dev/null || { kill -9 $C 2>/dev/null; exit; }; sleep 0.05; done ) & wait $C"
+    let stderr_tmp = "/tmp/hexa_cache_err." + to_string(clock()) + ".log"
+    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + "; echo __HEXA_RC=$?"
+    let out = exec(cmd)
+    let lines = out.split("\n")
+    let n = len(lines)
+    let mut rc = 0
+    let mut print_out = out
+    if n >= 1 {
+        let mut last_idx = n - 1
+        if last_idx >= 0 && lines[last_idx] == "" { last_idx = last_idx - 1 }
+        if last_idx >= 0 {
+            let last = lines[last_idx]
+            let mark = "__HEXA_RC="
+            if last.starts_with(mark) {
+                rc = to_int(last.substring(len(mark), len(last)))
+                let mut rebuilt = ""
+                let mut ri = 0
+                while ri < last_idx {
+                    if ri > 0 { rebuilt = rebuilt + "\n" }
+                    rebuilt = rebuilt + lines[ri]
+                    ri = ri + 1
+                }
+                print_out = rebuilt
+            }
+        }
+    }
+    print(print_out)
+    if file_exists(stderr_tmp) {
+        let err_buf = read_file(stderr_tmp)
+        if len(err_buf) > 0 { eprint(err_buf) }
+        exec("rm -f '" + stderr_tmp + "'")
+    }
+    return rc
+}
+
 // ── bt 40: AOT 캐시 슬롯 빌드 + codesign ──────────────────
 // file → .hexa-cache/<hash>/exe (ad-hoc 서명 완료) 생성.
 // 반환: exe 절대경로 (성공) 또는 "" (실패 — 호출자는 stage0 fallback).
@@ -808,23 +1067,42 @@ fn aot_build_slot(file) {
     let root = cache_root()
     let key = source_key(file)
     let slot = root + "/" + key
-    let fp = src_fingerprint(file)
+    // bt 36 revival: deep fp covers transitive imports + stage0 binary,
+    // closing the staleness gap that originally disabled this path.
+    let fp = src_fingerprint_deep(file)
+    if len(fp) == 0 {
+        return ""
+    }
     // 캐시 히트 — 이미 서명된 exe 재사용.
     if cache_hit(slot, fp) {
         return slot + "/exe"
     }
     // 슬롯 디렉토리 준비.
     let _mk = exec("mkdir -p '" + slot + "' 2>/dev/null")
+    // Build lock — prevents parallel redundant builds during touch
+    // chain bursts. mkdir is POSIX-atomic (macOS + Linux). Contender
+    // polls up to 10s, then re-checks cache; still miss = proceed
+    // (atomic mv -f makes race-clobber safe, bt 37 pattern).
+    let lock = slot + "/.build.lock"
+    let got_lock = exec("mkdir '" + lock + "' 2>/dev/null && printf yes || printf no")
+    if got_lock != "yes" {
+        exec("for i in $(seq 1 50); do test ! -d '" + lock + "' && break; sleep 0.2; done")
+        if cache_hit(slot, fp) {
+            return slot + "/exe"
+        }
+    }
     // 1) 트랜스파일: file.hexa → slot/src.c
     //    buglist#5: resolve_hexa_v2() 경유 — cwd 무관하게 install_dir 기반 탐색.
     let v2 = resolve_hexa_v2()
     if len(v2) == 0 {
+        exec("rmdir '" + lock + "' 2>/dev/null")
         return ""
     }
     let c_file = slot + "/src.c"
     let _trans = exec(v2 + " '" + file + "' '" + c_file + "' 2>&1")
     let ok_c = exec("test -f '" + c_file + "' && printf yes || printf no")
     if ok_c != "yes" {
+        exec("rmdir '" + lock + "' 2>/dev/null")
         return ""
     }
     // 2) clang → slot/exe.tmp.$$ (atomic rename 준비, bt 37 패턴)
@@ -837,6 +1115,7 @@ fn aot_build_slot(file) {
     let compile = exec("clang -O2 " + os_clang_cflags() + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
     let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
     if ok_tmp != "yes" {
+        exec("rmdir '" + lock + "' 2>/dev/null")
         return ""
     }
     // 3) bt 40: codesign (macOS 한정, 실패 시 warning only)
@@ -844,6 +1123,7 @@ fn aot_build_slot(file) {
     // 4) atomic rename tmp → exe, meta 기록.
     let _mv = exec("mv -f '" + tmp + "' '" + slot + "/exe' 2>&1")
     let _meta = exec("printf '%s' '" + fp + "' > '" + slot + "/meta'")
+    exec("rmdir '" + lock + "' 2>/dev/null")
     return slot + "/exe"
 }
 
@@ -882,15 +1162,10 @@ fn cmd_run_dispatch(file, extra_args, want_vm) {
 }
 
 fn cmd_run(file, extra_args) {
-    // 단순 stage0 위임 — hook 성능/정합성을 위해 AOT 캐시 경로 제거.
-    // (AOT 빌드는 `hexa build` 명시적으로 호출할 때만 수행. rt item 36은
-    // 별도 하위 커맨드 `hexa cache` 로 복원 예정.)
-    //
-    // bt 39: extra_args (av[4..]) 를 stage0 뒤에 붙여 스크립트 args() 로 전달.
-    //   알려진 한계: self-host stage0 의 host_args() 는 현재 [] 반환 스텁
-    //   (self/interpreter.hexa:697). 네이티브 바이너리(AOT/stage1~3)는
-    //   hexa_set_args(argc,argv) 로 정상 전달됨 (self/runtime.c:883).
-    //   stage0 가 host_args 실제 구현을 갖출 때 이 경로가 자동 활성화된다.
+    // bt 36 revival (2026-04-21): AOT cache reactivated with deep
+    // fingerprint + fall-through safety. See helpers above (line ~800)
+    // for the rationale. Any cache failure → fall through to stage0
+    // unchanged, so first-call latency never regresses.
     //
     // B1 Linux portability: resolve_stage0() 로 argv[0]/cwd/$HOME 3-단 fallback.
     // 이전 $HOME 하드코딩은 $HEXA_LANG 외 위치에서 silent fail.
@@ -906,6 +1181,25 @@ fn cmd_run(file, extra_args) {
         println("         $HEXA_LANG/build/hexa_stage0  (dev fallback)")
         println("       rebuild with: hexa tool/build_stage0.hexa")
         return
+    }
+    // ── AOT cache fast-path ─────────────────────────────────
+    // Hit: exec cached native binary. Miss: sync build then retry.
+    // Any failure → fall through to stage0 (never crash/regress).
+    if should_cache(file) {
+        let rc = try_cache_exec(file, extra_args)
+        if rc >= 0 {
+            if rc != 0 { exit(rc) }
+            return
+        }
+        let built = aot_build_slot(file)
+        if len(built) > 0 {
+            let rc2 = try_cache_exec(file, extra_args)
+            if rc2 >= 0 {
+                if rc2 != 0 { exit(rc2) }
+                return
+            }
+        }
+        // build failed — continue to stage0 path below
     }
     // Phase2 C1 wiring — module_loader 전처리기로 `import "path"` / `use "path"`
     // 라인을 재귀적으로 인라인 전개. 대상 파일에 해당 지시문이 없으면 로더가
