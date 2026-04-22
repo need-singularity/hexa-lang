@@ -1,0 +1,244 @@
+#!hexa strict
+// test/regression/roadmap_with_unlock.hexa — smoke test for
+// tool/roadmap_with_unlock.hexa
+//
+// STRATEGY
+//   The real .roadmap is raw-enforced and would be disruptive to toggle in
+//   a test. Instead we create a fixture file in a temp dir, apply
+//   chflags uchg to it, then run the helper against it with four
+//   scenarios:
+//
+//     1. SUCCESS       → relock applied, file is uchg again
+//     2. NON-ZERO EXIT → relock STILL applied (cmd exits 7); trap fired
+//     3. DRY-RUN       → no flag mutation (file remains uchg)
+//     4. UNLOCKED-IN   → helper does not over-lock a file it found clean
+//
+//   SIGINT is not exercised directly (needs a subprocess we can signal
+//   while stage0's exec_with_status is synchronous). Coverage of the
+//   EXIT path — via both normal and non-zero exits — exercises the same
+//   `trap ... EXIT` handler the INT/TERM paths route through.
+//
+// Run: ./build/hexa_stage0 test/regression/roadmap_with_unlock.hexa
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _has_uchg(path: string) -> bool {
+    let r = exec_with_status("ls -lOd '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    if line.contains(" uchg ") { return true }
+    if line.contains(" uchg,") { return true }
+    if line.contains(",uchg ") { return true }
+    if line.contains(",uchg,") { return true }
+    return false
+}
+
+fn _has_immutable_linux(path: string) -> bool {
+    let r = exec_with_status("lsattr -d '" + path + "' 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    let mut i = 0
+    while i < len(line) {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        if c == "i" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_locked(path: string) -> bool {
+    if _is_darwin() { return _has_uchg(path) }
+    if _is_linux()  { return _has_immutable_linux(path) }
+    return false
+}
+
+fn _apply_lock(path: string) -> int {
+    if _is_darwin() { return exec_with_status("chflags uchg '" + path + "'")[1] }
+    if _is_linux() {
+        let r = exec_with_status("chattr +i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        return exec_with_status("sudo -n chattr +i '" + path + "' 2>&1")[1]
+    }
+    return 0
+}
+
+fn _remove_lock(path: string) -> int {
+    if _is_darwin() { return exec_with_status("chflags nouchg '" + path + "'")[1] }
+    if _is_linux() {
+        let r = exec_with_status("chattr -i '" + path + "' 2>/dev/null")
+        if r[1] == 0 { return 0 }
+        return exec_with_status("sudo -n chattr -i '" + path + "' 2>&1")[1]
+    }
+    return 0
+}
+
+fn _mktemp_dir() -> string {
+    let r = exec_with_status("mktemp -d /tmp/rwu_test.XXXXXX")
+    return to_string(r[0]).trim()
+}
+
+// ─── test harness ──────────────────────────────────────────────
+
+let mut _passed = 0
+let mut _failed = 0
+
+fn _assert(cond: bool, label: string) {
+    if cond {
+        _passed = _passed + 1
+        println("  PASS  " + label)
+    } else {
+        _failed = _failed + 1
+        println("  FAIL  " + label)
+    }
+}
+
+fn _run_helper(fixture: string, extra_flags: string, user_cmd: string) -> array {
+    // Invokes the helper with the given fixture + user cmd. Returns
+    // [stdout, rc]. user_cmd is whatever arg-sequence goes after `--`.
+    let cmd = "./build/hexa_stage0 tool/roadmap_with_unlock.hexa"
+              + " --file '" + fixture + "'"
+              + extra_flags
+              + " -- " + user_cmd
+              + " 2>&1"
+    let r = exec_with_status(cmd)
+    return [to_string(r[0]), r[1]]
+}
+
+// ─── scenarios ─────────────────────────────────────────────────
+
+fn test_success(tmp_dir: string) {
+    println("── test 1: success path ──")
+    let fixture = tmp_dir + "/rm_ok"
+    exec("echo 'fixture line' > '" + fixture + "'")
+    let lock_rc = _apply_lock(fixture)
+    _assert(lock_rc == 0, "fixture locked (setup)")
+    _assert(_is_locked(fixture), "fixture is locked before run")
+
+    // User cmd appends a line. This only succeeds if unlock took effect.
+    let result = _run_helper(fixture, "",
+        "sh -c \"echo added >> " + fixture + "\"")
+    let rc = result[1]
+    _assert(rc == 0, "helper exit=0 on success (got " + to_string(rc) + ")")
+
+    let body = to_string(exec("cat '" + fixture + "'")).trim()
+    _assert(body.contains("added"), "edit actually took effect")
+
+    _assert(_is_locked(fixture), "file is RELOCKED after success")
+
+    _remove_lock(fixture)
+}
+
+fn test_nonzero_exit(tmp_dir: string) {
+    println("")
+    println("── test 2: non-zero exit (RELOCK STILL REQUIRED) ──")
+    let fixture = tmp_dir + "/rm_fail"
+    exec("echo 'fixture line' > '" + fixture + "'")
+    let lock_rc = _apply_lock(fixture)
+    _assert(lock_rc == 0, "fixture locked (setup)")
+    _assert(_is_locked(fixture), "fixture is locked before run")
+
+    // Cmd writes partial content then exits 7. Relock MUST still happen.
+    let result = _run_helper(fixture, "",
+        "sh -c \"echo partial >> " + fixture + "; exit 7\"")
+    let rc = result[1]
+
+    _assert(rc == 7, "helper propagates user rc=7 (got " + to_string(rc) + ")")
+
+    let body = to_string(exec("cat '" + fixture + "'")).trim()
+    _assert(body.contains("partial"), "partial edit applied before failure")
+
+    // KEY ASSERTION: file is relocked even though cmd failed.
+    _assert(_is_locked(fixture), "file RELOCKED after non-zero exit (trap fired)")
+
+    _remove_lock(fixture)
+}
+
+fn test_dry_run(tmp_dir: string) {
+    println("")
+    println("── test 3: dry-run (no mutation) ──")
+    let fixture = tmp_dir + "/rm_dry"
+    exec("echo 'fixture line' > '" + fixture + "'")
+    _apply_lock(fixture)
+    _assert(_is_locked(fixture), "fixture is locked before run")
+
+    let result = _run_helper(fixture, " --dry-run", "echo should-not-run")
+    let rc = result[1]
+    let out = result[0]
+
+    _assert(rc == 0, "dry-run exit=0")
+    _assert(out.contains("dry-run"), "dry-run output mentions 'dry-run'")
+    _assert(_is_locked(fixture), "file still locked after dry-run (no mutation)")
+
+    let body = to_string(exec("cat '" + fixture + "'")).trim()
+    _assert(!body.contains("should-not-run"), "dry-run did not execute user cmd")
+
+    _remove_lock(fixture)
+}
+
+fn test_already_unlocked(tmp_dir: string) {
+    println("")
+    println("── test 4: file unlocked to begin with ──")
+    // Helper should mirror starting state — no over-locking.
+    let fixture = tmp_dir + "/rm_unlocked"
+    exec("echo 'fixture line' > '" + fixture + "'")
+    _assert(!_is_locked(fixture), "fixture starts unlocked")
+
+    let result = _run_helper(fixture, "", "true")
+    let rc = result[1]
+    _assert(rc == 0, "helper exit=0")
+    _assert(!_is_locked(fixture), "file stays unlocked (we didn't over-lock)")
+}
+
+// ─── main ──────────────────────────────────────────────────────
+
+fn _is_main() -> bool {
+    let av = argv()
+    if len(av) < 2 { return false }
+    let s = av[1]
+    if s.ends_with("/roadmap_with_unlock.hexa") {
+        // also matches the tool path — guard against running the tool
+        // itself as the test. The test lives under test/regression/.
+        return s.contains("test/regression/")
+    }
+    return false
+}
+
+if _is_main() {
+    if !_is_darwin() && !_is_linux() {
+        println("roadmap_with_unlock test: unsupported platform; skipping")
+        exit(0)
+    }
+
+    let tmp_dir = _mktemp_dir()
+    if tmp_dir == "" {
+        eprintln("roadmap_with_unlock test: mktemp failed")
+        exit(1)
+    }
+    println("tmp_dir: " + tmp_dir)
+    println("")
+
+    test_success(tmp_dir)
+    test_nonzero_exit(tmp_dir)
+    test_dry_run(tmp_dir)
+    test_already_unlocked(tmp_dir)
+
+    // cleanup: clear any lingering fixture locks, then rm -rf
+    exec("chflags -R nouchg '" + tmp_dir + "' 2>/dev/null")
+    exec("rm -rf '" + tmp_dir + "' 2>/dev/null")
+
+    println("")
+    println("── results ──")
+    println("  passed: " + to_string(_passed))
+    println("  failed: " + to_string(_failed))
+    if _failed > 0 { exit(1) }
+    exit(0)
+}

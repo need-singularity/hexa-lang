@@ -1,0 +1,386 @@
+#!hexa strict
+// tool/roadmap_with_unlock.hexa — atomic unlock/run/relock wrapper (raw#0-lite)
+//
+// PURPOSE
+//   Agents (and humans) editing .roadmap currently do a 3-step dance:
+//
+//       chflags nouchg .roadmap
+//       <edit...>
+//       chflags uchg .roadmap
+//
+//   Easy to forget the relock, especially if the edit step is interrupted
+//   (SIGINT, crashed process, assistant context-switch). This helper
+//   wraps the dance atomically: the relock is pushed into a shell `trap`
+//   so even a hard kill of THIS process still leaves the file relocked.
+//
+//   This is a LOW-CEREMONY path — it does NOT run raw_all, does NOT write
+//   to .raw-audit, and is NOT a replacement for tool/hx_unlock.hexa.
+//   Use it when:
+//     · the edit is a single contained command (sed / python / script)
+//     · ceremony would be heavier than the edit itself
+//     · you're willing to trust the command's own correctness
+//
+//   For anything weightier (multi-file SSOT edits, raw rule changes,
+//   anything requiring the gate), use `./hexa tool/hx_unlock.hexa`.
+//
+// USAGE
+//   hexa tool/roadmap_with_unlock.hexa -- <cmd...>
+//     default --file=.roadmap
+//
+//   hexa tool/roadmap_with_unlock.hexa --file <path> -- <cmd...>
+//     explicit target (any single file). Path is passed to chflags/chattr
+//     verbatim, so only use paths you control.
+//
+//   hexa tool/roadmap_with_unlock.hexa --dry-run -- <cmd...>
+//     print the plan, do not touch flags or run cmd.
+//
+//   hexa tool/roadmap_with_unlock.hexa --no-relock -- <cmd...>
+//     skip the relock (debugging; prints a warning on exit).
+//
+// EXIT
+//   Exit code mirrors the wrapped command's exit code. Relock happens
+//   regardless of that exit code.
+//
+// PLATFORM
+//   macOS  — chflags uchg/nouchg (owner-removable, no sudo).
+//   Linux  — chattr +i/-i (requires sudo on Linux; will try bare first,
+//            then fall back to `sudo -n`).
+//   Other  — no-op with warning (cmd still runs; no lock mutation).
+
+// ─── platform helpers ──────────────────────────────────────────
+
+fn _is_darwin() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Darwin"
+}
+
+fn _is_linux() -> bool {
+    let uname = to_string(exec("uname -s")).trim()
+    return uname == "Linux"
+}
+
+fn _path_exists(path: string) -> bool {
+    return file_exists(path)
+}
+
+// ─── arg parsing ───────────────────────────────────────────────
+//
+// Layout:  [hexa, script, <helper flags>..., --, <user cmd>...]
+//
+// Helper flags stop at `--`; everything after is the user command. We
+// reconstruct the user command as a single shell string by joining with
+// spaces — the user can quote arguments themselves if they need
+// whitespace inside a single token.
+
+fn _parse_args() -> array {
+    // returns [file, dry_run, no_relock, cmd_parts, parse_ok, err]
+    let av = argv()
+    let mut file = ".roadmap"
+    let mut dry = false
+    let mut no_relock = false
+    let mut cmd_parts = []
+    let mut saw_sep = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if saw_sep {
+            cmd_parts.push(a)
+            i = i + 1
+            continue
+        }
+        if a == "--" {
+            saw_sep = true
+            i = i + 1
+            continue
+        }
+        if a == "--file" {
+            if i + 1 >= len(av) {
+                return ["", false, false, [], false, "--file needs a value"]
+            }
+            file = av[i + 1]
+            i = i + 2
+            continue
+        }
+        if a == "--dry-run" {
+            dry = true
+            i = i + 1
+            continue
+        }
+        if a == "--no-relock" {
+            no_relock = true
+            i = i + 1
+            continue
+        }
+        if a == "-h" || a == "--help" {
+            return ["", false, false, [], false, "help"]
+        }
+        return ["", false, false, [], false, "unknown arg: " + a]
+    }
+    if !saw_sep {
+        return ["", false, false, [], false, "missing `--` separator before command"]
+    }
+    if len(cmd_parts) == 0 {
+        return ["", false, false, [], false, "no command after `--`"]
+    }
+    return [file, dry, no_relock, cmd_parts, true, ""]
+}
+
+fn _usage() {
+    eprintln("usage: hexa tool/roadmap_with_unlock.hexa [--file PATH] [--dry-run] [--no-relock] -- <cmd...>")
+    eprintln("")
+    eprintln("  --file PATH    target file (default: .roadmap)")
+    eprintln("  --dry-run      print plan, skip unlock/cmd/relock")
+    eprintln("  --no-relock    skip relock (debugging; warns on exit)")
+    eprintln("  --             separator; required before the user command")
+    eprintln("")
+    eprintln("Wraps <cmd> in an unlock/run/relock sandwich. Relock is pushed")
+    eprintln("into a shell trap so it fires even if the wrapped command or")
+    eprintln("this helper is interrupted.")
+    eprintln("")
+    eprintln("Low-ceremony path. Does NOT run raw_all / write audit log.")
+    eprintln("For SSOT-scoped edits with full gate, use tool/hx_unlock.hexa.")
+}
+
+// ─── shell-safety helpers ──────────────────────────────────────
+//
+// The file path is passed into three shell commands (unlock / trap-relock /
+// fallback-relock). We defensively single-quote it and escape any embedded
+// `'` by the standard `'\''` trick. No path we control should contain
+// quotes, but since this is a general helper, treat the path as untrusted.
+
+fn _shq(s: string) -> string {
+    // single-quote wrap, replacing embedded ' with '\''
+    let escaped = s.replace("'", "'\\''")
+    return "'" + escaped + "'"
+}
+
+// ─── flag state inspection (for skip-if-already-unlocked) ──────
+
+fn _darwin_has_uchg(path: string) -> bool {
+    let r = exec_with_status("ls -lOd " + _shq(path) + " 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    if line.contains(" uchg ") { return true }
+    if line.contains(" uchg,") { return true }
+    if line.contains(",uchg ") { return true }
+    if line.contains(",uchg,") { return true }
+    return false
+}
+
+fn _linux_has_immutable(path: string) -> bool {
+    let r = exec_with_status("lsattr -d " + _shq(path) + " 2>/dev/null")
+    if r[1] != 0 { return false }
+    let line = to_string(r[0])
+    // scan up to first whitespace for flag letters
+    let mut i = 0
+    while i < len(line) {
+        let c = line.substring(i, i + 1)
+        if c == " " || c == "\t" { break }
+        if c == "i" { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _is_locked(path: string) -> bool {
+    if _is_darwin() { return _darwin_has_uchg(path) }
+    if _is_linux()  { return _linux_has_immutable(path) }
+    return false
+}
+
+// ─── flag mutation primitives ──────────────────────────────────
+//
+// Returns the shell command string that unlocks / relocks the file. We
+// emit the string (rather than running it directly) so it can be
+// inlined into the bash trap wrapper.
+
+fn _unlock_shcmd(path: string) -> string {
+    if _is_darwin() {
+        return "chflags nouchg " + _shq(path)
+    }
+    if _is_linux() {
+        // bare chattr first, then sudo -n fallback. `|| true` on sudo so
+        // unavailable sudo doesn't abort the trap chain.
+        return "chattr -i " + _shq(path) + " 2>/dev/null || sudo -n chattr -i " + _shq(path)
+    }
+    return "true"  // unsupported platform — no-op
+}
+
+fn _relock_shcmd(path: string) -> string {
+    if _is_darwin() {
+        return "chflags uchg " + _shq(path)
+    }
+    if _is_linux() {
+        return "chattr +i " + _shq(path) + " 2>/dev/null || sudo -n chattr +i " + _shq(path)
+    }
+    return "true"
+}
+
+// ─── command assembly ──────────────────────────────────────────
+
+fn _join(parts: array, sep: string) -> string {
+    let mut s = ""
+    let mut first = true
+    for p in parts {
+        if first { s = p; first = false }
+        else     { s = s + sep + p }
+    }
+    return s
+}
+
+// Join argv parts into a shell-safe single-line command. Each part is
+// single-quoted so whitespace / metachars inside a single argv token
+// (e.g. `sh -c "echo a >> b"` → ["sh","-c","echo a >> b"]) are preserved
+// as one argument instead of being reshattered by the shell.
+fn _join_shq(parts: array) -> string {
+    let mut s = ""
+    let mut first = true
+    for p in parts {
+        let q = _shq(p)
+        if first { s = q; first = false }
+        else     { s = s + " " + q }
+    }
+    return s
+}
+
+// Build the bash wrapper that:
+//   1. sets `trap 'relock' EXIT INT TERM`
+//   2. runs the user's command
+//   3. exits with the user command's exit code
+// The trap fires regardless of how the shell exits — clean, SIGINT, or
+// SIGTERM. SIGKILL bypasses it (nothing survives SIGKILL), but the
+// helper's parent process cannot send SIGKILL via normal exec.
+fn _build_wrapped(user_cmd: string, relock_cmd: string) -> string {
+    // Double-quote the outer bash -c body so our trap string stays literal.
+    // Inside, we single-quote the trap payload; the `relock_cmd` itself is
+    // already shell-escaped by _shq() on the path.
+    //
+    // Structure:
+    //   bash -c 'trap "<relock>" EXIT INT TERM; <user cmd>'
+    //
+    // We use double-quotes for the trap payload and outer single-quote
+    // for the bash -c body. Escape any " in relock_cmd (none in practice
+    // since chflags/chattr paths are single-quoted already).
+    let relock_dq = relock_cmd.replace("\"", "\\\"")
+    let body = "trap \"" + relock_dq + "\" EXIT INT TERM; " + user_cmd
+    // Outer: bash -c '<body>' — escape embedded ' in body.
+    let body_esc = body.replace("'", "'\\''")
+    return "bash -c '" + body_esc + "'"
+}
+
+// ─── main ──────────────────────────────────────────────────────
+
+fn main() -> int {
+    let parsed = _parse_args()
+    let file = parsed[0]
+    let dry = parsed[1]
+    let no_relock = parsed[2]
+    let cmd_parts = parsed[3]
+    let ok = parsed[4]
+    let err = parsed[5]
+
+    if !ok {
+        if err != "help" { eprintln("roadmap_with_unlock: " + err) }
+        _usage()
+        if err == "help" { return 0 }
+        return 2
+    }
+
+    if !_path_exists(file) {
+        eprintln("roadmap_with_unlock: target not found: " + file)
+        return 2
+    }
+
+    let user_cmd = _join_shq(cmd_parts)
+
+    let platform_supported = _is_darwin() || _is_linux()
+    if !platform_supported {
+        eprintln("roadmap_with_unlock: WARN — unsupported platform (uname != Darwin|Linux)")
+        eprintln("roadmap_with_unlock: running command without flag mutation")
+        let r = exec_with_status(user_cmd + " 2>&1")
+        let out = to_string(r[0])
+        print(out)
+        return r[1]
+    }
+
+    let was_locked = _is_locked(file)
+
+    if dry {
+        println("── roadmap_with_unlock (dry-run) ──")
+        println("  file:        " + file)
+        println("  was-locked:  " + (if was_locked { "yes" } else { "no" }))
+        println("  platform:    " + (if _is_darwin() { "darwin" } else { "linux" }))
+        println("  unlock:      " + _unlock_shcmd(file))
+        println("  user-cmd:    " + user_cmd)
+        println("  relock:      " + (if no_relock { "(skipped)" } else { _relock_shcmd(file) }))
+        return 0
+    }
+
+    // Step 1: unlock (only if currently locked — avoids chflags error on
+    // already-unlocked files, and avoids a spurious relock on files that
+    // were unlocked before we started).
+    if was_locked {
+        let urc = exec_with_status(_unlock_shcmd(file) + " 2>&1")
+        if urc[1] != 0 {
+            eprintln("roadmap_with_unlock: unlock failed (exit " + to_string(urc[1]) + ")")
+            eprintln(to_string(urc[0]))
+            return 1
+        }
+    }
+
+    // Step 2+3: run user cmd wrapped in bash trap that relocks on ANY exit.
+    // We only install the relock trap if we actually need to relock:
+    //   · was_locked && !no_relock  → relock via trap
+    //   · otherwise                 → run cmd bare
+    //
+    // Running via trap rather than "exec cmd; then relock" is load-bearing:
+    // if THIS helper process is killed (SIGINT, SIGTERM), the bash child
+    // is orphaned to init but its trap still fires before the shell exits,
+    // guaranteeing relock.
+    let should_trap_relock = was_locked && !no_relock
+    let mut cmd_line = user_cmd + " 2>&1"
+    if should_trap_relock {
+        cmd_line = _build_wrapped(user_cmd, _relock_shcmd(file)) + " 2>&1"
+    }
+
+    let rcs = exec_with_status(cmd_line)
+    print(to_string(rcs[0]))
+    let user_rc = rcs[1]
+
+    // Post-hoc relock safety net: the bash trap above SHOULD have already
+    // relocked. But stage0's exec_with_status synchronously captures the
+    // child's output via a pipe, so by the time we get here the trap has
+    // fired. We verify and re-apply if somehow the file is still unlocked.
+    if was_locked && !no_relock {
+        if !_is_locked(file) {
+            eprintln("roadmap_with_unlock: WARN — trap relock did not take effect; applying fallback relock")
+            let rrc = exec_with_status(_relock_shcmd(file) + " 2>&1")
+            if rrc[1] != 0 {
+                eprintln("roadmap_with_unlock: fallback relock FAILED (exit " + to_string(rrc[1]) + ")")
+                eprintln(to_string(rrc[0]))
+                // preserve user exit code but flag failure
+                if user_rc == 0 { return 1 }
+            }
+        }
+    }
+
+    if no_relock && was_locked {
+        eprintln("roadmap_with_unlock: WARN — --no-relock set; " + file + " is still unlocked")
+    }
+
+    return user_rc
+}
+
+// ─── is_main guard ─────────────────────────────────────────────
+
+let _av = argv()
+
+fn _is_main() -> bool {
+    if len(_av) < 2 { return false }
+    let script = _av[1]
+    if script.ends_with("/roadmap_with_unlock.hexa") { return true }
+    if script == "roadmap_with_unlock.hexa" { return true }
+    return false
+}
+
+if _is_main() { exit(main()) }
