@@ -1,0 +1,158 @@
+// HEXA Standard Library — policy/dual_track
+// Deterministic blind A/B routing for benchmarks and rollouts.
+//
+// Motivation: bench/zeta_likert and similar blind-comparison harnesses
+// need a reproducible assignment of request-keys to tracks without
+// leaking which track served which request. Hashing a (salt || key)
+// tuple with xxh32 gives a byte-stable bucket across substrates and
+// survives the strict_fp determinism budget (no float ops in the hot
+// path).
+//
+// Public API:
+//   pub fn make_router(tracks: [TrackWeight], salt: int) -> Router
+//   pub fn route(r: Router, key: string)               -> string
+//   pub fn route_bucket(r: Router, key: string, n: int) -> int     // 0 .. n-1
+//   pub fn router_tracks(r: Router)                     -> [string]
+//   pub fn bump_count(r: Router, name: string)          -> Router  // returns updated router
+//   pub fn count_for(r: Router, name: string)           -> int
+//
+// Construction:
+//   make_router([TrackWeight{"A", 50}, TrackWeight{"B", 50}], 0)
+//   # 50/50 split, salt=0
+//   make_router([TrackWeight{"beta", 70}, TrackWeight{"alpha", 30}], 42)
+//   # weighted split, salt=42 so two deployments with different salts
+//   # get uncorrelated assignments even on identical keys.
+//
+// Determinism:
+//   route(r, key) is a pure function of (tracks, salt, key). Same
+//   inputs ⇒ same output across runs / processes / substrates.
+
+import "../hash/xxhash.hexa"
+
+pub struct TrackWeight {
+    name: string,
+    weight: int
+}
+
+pub struct Router {
+    tracks: [TrackWeight],
+    total_weight: int,
+    salt: int,
+    counts: [int]   // parallel to tracks — per-track seen count
+}
+
+fn _sum_weights(tracks: [TrackWeight]) -> int {
+    let mut s = 0
+    let mut i = 0
+    while i < len(tracks) {
+        let w = tracks[i].weight
+        if w > 0 { s = s + w }
+        i = i + 1
+    }
+    return s
+}
+
+pub fn make_router(tracks: [TrackWeight], salt: int) -> Router {
+    let mut zeros = []
+    let mut i = 0
+    while i < len(tracks) {
+        zeros.push(0)
+        i = i + 1
+    }
+    return Router {
+        tracks:       tracks,
+        total_weight: _sum_weights(tracks),
+        salt:         salt,
+        counts:       zeros
+    }
+}
+
+// Convert key string to byte array for xxh32.
+fn _key_bytes(key: string) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(key) {
+        out.push(ord(key.substring(i, i + 1)))
+        i = i + 1
+    }
+    return out
+}
+
+// Salted xxh32 hash: treat salt as seed.
+fn _hash(r: Router, key: string) -> int {
+    let bytes = _key_bytes(key)
+    return xxh32(bytes, r.salt)
+}
+
+// Bucket the hash into [0, n) using unsigned modular reduction.
+// xxh32 returns a 32-bit value already masked; n > 0 by caller contract.
+pub fn route_bucket(r: Router, key: string, n: int) -> int {
+    if n <= 0 { return 0 }
+    let h = _hash(r, key)
+    // `h` is already non-negative (masked & 0xFFFFFFFF in xxh32).
+    return h - (h / n) * n
+}
+
+pub fn route(r: Router, key: string) -> string {
+    if len(r.tracks) == 0 { return "" }
+    if r.total_weight <= 0 { return r.tracks[0].name }
+    let bucket = route_bucket(r, key, r.total_weight)
+    let mut acc = 0
+    let mut i = 0
+    while i < len(r.tracks) {
+        let w = r.tracks[i].weight
+        if w > 0 {
+            acc = acc + w
+            if bucket < acc { return r.tracks[i].name }
+        }
+        i = i + 1
+    }
+    // Fall-through: weights mutated underfoot; return last track.
+    return r.tracks[len(r.tracks) - 1].name
+}
+
+pub fn router_tracks(r: Router) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(r.tracks) {
+        out.push(r.tracks[i].name)
+        i = i + 1
+    }
+    return out
+}
+
+fn _index_of_track(r: Router, name: string) -> int {
+    let mut i = 0
+    while i < len(r.tracks) {
+        if r.tracks[i].name == name { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+pub fn bump_count(r: Router, name: string) -> Router {
+    let idx = _index_of_track(r, name)
+    if idx < 0 { return r }
+    let mut new_counts = []
+    let mut i = 0
+    while i < len(r.counts) {
+        if i == idx {
+            new_counts.push(r.counts[i] + 1)
+        } else {
+            new_counts.push(r.counts[i])
+        }
+        i = i + 1
+    }
+    return Router {
+        tracks:       r.tracks,
+        total_weight: r.total_weight,
+        salt:         r.salt,
+        counts:       new_counts
+    }
+}
+
+pub fn count_for(r: Router, name: string) -> int {
+    let idx = _index_of_track(r, name)
+    if idx < 0 { return 0 }
+    return r.counts[idx]
+}
