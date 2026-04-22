@@ -1,0 +1,194 @@
+// HEXA Standard Library — optim/cpgd_test
+// Tests for Constraint-Projected Gradient Descent primitives.
+//
+//   1. Idempotence:            P_S·P_S ≈ P_S (random 16×4 V).
+//   2. Init on-manifold:       row_cosines(W_0) ≥ 1 − 1e-8 when
+//                              the init matrix is span-aligned.
+//   3. Projection preservation: 10 CPGD steps keep min row cos ≥ 0.5.
+//   4. Callback equivalence:   cpgd_step_fn with an explicit
+//                              projection fn matches cpgd_step within
+//                              1e-10.
+//   5. Determinism:            cpgd_init + 10 steps produces an
+//                              identical "canonical hash" (concat of
+//                              values) across 3 runs from same seed.
+//
+// Emits:  PASS: cpgd N/N  |  FAIL <which>
+
+import "cpgd.hexa"
+import "projector.hexa"
+import "../math/rng.hexa"
+
+let mut pass_count = 0
+let mut total_count = 0
+let mut failed_name = ""
+
+fn check(name, cond) {
+    total_count = total_count + 1
+    if cond {
+        pass_count = pass_count + 1
+    } else {
+        if failed_name == "" { failed_name = name }
+        println("FAIL " + name)
+    }
+}
+
+fn fabs(x: float) -> float {
+    if x < 0.0 { return 0.0 - x }
+    return x
+}
+
+// Build a deterministic 4-orthonormal-row V of dim 16 for tests.
+// We pick the 4 canonical axes e_0, e_4, e_8, e_12 — trivially
+// orthonormal, and yields an idempotent projector with rank 4.
+fn make_test_eigenvecs_16x4() -> array {
+    let mut E = []
+    let mut k = 0
+    while k < 4 {
+        let mut v = []
+        let mut j = 0
+        while j < 16 {
+            if j == k * 4 {
+                v.push(1.0)
+            } else {
+                v.push(0.0)
+            }
+            j = j + 1
+        }
+        E.push(v)
+        k = k + 1
+    }
+    return E
+}
+
+let TEST_N = 16
+let TEST_K = 4
+let EIGENVECS = make_test_eigenvecs_16x4()
+let P_S = build_projector(EIGENVECS)
+
+// ── Test 1: idempotence ──────────────────────────────────────
+let idem_ok = verify_projector_idempotent(P_S, 0.00001)
+check("1_idempotent", idem_ok)
+
+// Also spot-check P_S shape
+check("1_projector_size", len(P_S) == TEST_N * TEST_N)
+
+// ── Test 2: init on-manifold ─────────────────────────────────
+// We build W_0 as a 4×16 row-major matrix where row i = eigenvec_i.
+// Then row_cosines(W_0, EIGENVECS) must be [1, 1, 1, 1] (± 1e-8).
+let mut W0 = []
+let mut r = 0
+while r < TEST_K {
+    let v = EIGENVECS[r]
+    let mut j = 0
+    while j < TEST_N {
+        W0.push(to_float(v[j]))
+        j = j + 1
+    }
+    r = r + 1
+}
+let cos0 = row_cosines(W0, EIGENVECS)
+let mut all_unit = true
+let mut ii = 0
+while ii < TEST_K {
+    let c = to_float(cos0[ii])
+    if fabs(c - 1.0) > 0.00000001 { all_unit = false }
+    ii = ii + 1
+}
+check("2_init_on_manifold", all_unit)
+
+// ── Test 3: projection preservation (10 steps) ───────────────
+// W starts on-manifold; random grads, projected step; min row cos ≥ 0.5.
+let LR = 0.001
+let GRAD_SEED = 20260421
+
+// Fresh W copy (the one from test 2 was not mutated but be explicit)
+let mut W3 = []
+let mut r3 = 0
+while r3 < TEST_K {
+    let v = EIGENVECS[r3]
+    let mut j = 0
+    while j < TEST_N {
+        W3.push(to_float(v[j]))
+        j = j + 1
+    }
+    r3 = r3 + 1
+}
+let mut grad_seed_state = GRAD_SEED
+let mut min_cos = 1.0
+let mut step = 0
+while step < 10 {
+    // Fresh gaussian grad per step; advance seed deterministically.
+    let grad = randn_matrix(TEST_K, TEST_N, grad_seed_state + step)
+    cpgd_step(W3, grad, P_S, LR)
+    let cs = row_cosines(W3, EIGENVECS)
+    let mut i = 0
+    while i < TEST_K {
+        let c = to_float(cs[i])
+        if c < min_cos { min_cos = c }
+        i = i + 1
+    }
+    step = step + 1
+}
+check("3_projection_preservation", min_cos >= 0.5)
+
+// ── Test 4: callback form equivalence ────────────────────────
+// A named projection function that captures P_S at top level.
+fn my_project(g) {
+    return matmul_right(g, P_S)
+}
+
+let mut Wa = cpgd_init(P_S, TEST_K, TEST_N, 42)
+let mut Wb = cpgd_init(P_S, TEST_K, TEST_N, 42)
+
+let mut s4 = 0
+let mut max_diff = 0.0
+while s4 < 5 {
+    let grad = randn_matrix(TEST_K, TEST_N, 1000 + s4)
+    // cpgd_step uses concrete P_S; cpgd_step_fn uses callback.
+    cpgd_step(Wa, grad, P_S, LR)
+    cpgd_step_fn(Wb, grad, my_project, LR)
+    // Compare element-wise.
+    let mut i = 0
+    while i < len(Wa) {
+        let d = fabs(to_float(Wa[i]) - to_float(Wb[i]))
+        if d > max_diff { max_diff = d }
+        i = i + 1
+    }
+    s4 = s4 + 1
+}
+check("4_callback_equivalence", max_diff < 0.0000000001)
+
+// ── Test 5: determinism (3 runs same seed → same values) ─────
+// Hash: concatenate to_string of all W values, compare strings.
+fn run_and_hash(seed: int) -> string {
+    let mut W = cpgd_init(P_S, TEST_K, TEST_N, seed)
+    let mut s = 0
+    while s < 10 {
+        let grad = randn_matrix(TEST_K, TEST_N, seed + s + 1)
+        cpgd_step(W, grad, P_S, LR)
+        s = s + 1
+    }
+    let mut h = ""
+    let mut i = 0
+    while i < len(W) {
+        h = h + to_string(to_float(W[i])) + ","
+        i = i + 1
+    }
+    return h
+}
+
+let h1 = run_and_hash(777)
+let h2 = run_and_hash(777)
+let h3 = run_and_hash(777)
+check("5_determinism_run1_eq_run2", h1 == h2)
+check("5_determinism_run2_eq_run3", h2 == h3)
+check("5_determinism_hash_nonempty", len(h1) > 0)
+
+// ── summary ──────────────────────────────────────────────────
+if pass_count == total_count {
+    println("PASS: cpgd " + to_string(pass_count) + "/" + to_string(total_count))
+    exit(0)
+} else {
+    println("FAIL " + failed_name + " (" + to_string(pass_count) + "/" + to_string(total_count) + ")")
+    exit(1)
+}
