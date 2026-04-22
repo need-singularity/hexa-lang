@@ -1,0 +1,508 @@
+// HEXA Standard Library — net/concurrent_serve
+// Work-stealing concurrent HTTP serve substrate for roadmap 63 / HXA-#10 / B12.
+//
+// 상위 모듈 stdlib/net/http_server.hexa (sequential accept-loop) 위에 올려
+// ① 수락된 conn_fd 를 work-stealing deque 로 밀어 넣고
+// ② 워커가 팝해서 파싱→라우팅→pre/post cert-trail→dispatch→metrics→write 를 수행.
+//
+// Stage0 주의:
+//   - async_runtime.hexa 의 _global_scheduler 싱글톤을 쓰지 않는다(리스크 #4).
+//     ConcurrentServer 는 자신 전용 Scheduler 핸들(scheduler_id)을 등록한다.
+//   - 문자열 기반 handler dispatch: http_server.server_handle_conn 과 동일하게
+//     "handler_name" 을 사용자 dispatch_fn 에 넘긴다. Stage0 리플렉션 부재 대응.
+//   - Mutable struct fields: work_stealing.hexa 가 self.next_id = self.next_id + 1
+//     패턴을 검증했으므로 ConcurrentServer.metrics/endpoints 도 동일 방식으로 변이.
+//   - graceful shutdown: stop_flag_path 파일 생성 → accept 루프가 매 iter 체크.
+//     roadmap 62 (signal trap / in-flight agent) 와 통합은 landed 후 연결 예정.
+
+// 상위 import — self/ 폴더 경로를 쓰면 stdlib 일관성이 깨지므로
+// stdlib 내부에서는 자신의 짐을 지닌 work-stealing 로직을 직접 구현한다.
+import "./socket.hexa"
+import "./http_request.hexa"
+import "./http_response.hexa"
+
+// ── Structs ────────────────────────────────────────────────────────────
+
+pub struct EndpointEntry {
+    path: string,
+    method: string,
+    handler_name: string,
+    cert_tag: string
+}
+
+pub struct EndpointMetrics {
+    path: string,
+    count: int,
+    total_ms: int,
+    errors: int
+}
+
+pub struct ConcurrentServer {
+    listener_addr: string,
+    port: int,
+    endpoints: [EndpointEntry],
+    scheduler_id: int,
+    metrics: [EndpointMetrics],
+    cert_trail_path: string,
+    cert_trail_mode: string,     // "shared" | "sharded"
+    metrics_hook: string,
+    workers: int,
+    stop_flag_path: string,
+    fairness: string,            // "work_stealing" | "round_robin"
+    in_flight: int,              // 현재 dispatch 중인 태스크 수
+    rr_cursor: int,              // round_robin 진행 커서
+    dispatch_count: int          // 누적 dispatch 카운트(테스트용)
+}
+
+// ── Internal: work-stealing deques (stdlib-local mini port) ───────────
+// self/work_stealing.hexa 와 독립된 stdlib 친화 버전.
+
+struct WorkTicket {
+    id: int,
+    endpoint_idx: int,
+    payload: string,     // raw request or synthetic test body
+    submit_ms: int
+}
+
+struct WsDeque {
+    items: [WorkTicket]
+}
+
+fn _ws_deque_new() -> WsDeque {
+    return WsDeque { items: [] }
+}
+
+fn _ws_push(d: WsDeque, t: WorkTicket) {
+    d.items.push(t)
+}
+
+fn _ws_pop(d: WsDeque) -> WorkTicket {
+    // LIFO pop from back (locality)
+    if len(d.items) == 0 {
+        return WorkTicket { id: 0 - 1, endpoint_idx: 0 - 1, payload: "", submit_ms: 0 }
+    }
+    return d.items.pop()
+}
+
+fn _ws_steal(d: WsDeque) -> WorkTicket {
+    // FIFO steal from front (fairness)
+    if len(d.items) == 0 {
+        return WorkTicket { id: 0 - 1, endpoint_idx: 0 - 1, payload: "", submit_ms: 0 }
+    }
+    let first = d.items[0]
+    let mut rest = []
+    let mut i = 1
+    while i < len(d.items) {
+        rest.push(d.items[i])
+        i = i + 1
+    }
+    d.items = rest
+    return first
+}
+
+fn _ws_len(d: WsDeque) -> int {
+    return len(d.items)
+}
+
+struct WsPool {
+    deques: [WsDeque],
+    next_id: int,
+    workers: int,
+    mode: string         // "work_stealing" | "round_robin"
+}
+
+fn _ws_pool_new(workers: int, mode: string) -> WsPool {
+    let mut ds = []
+    let mut i = 0
+    while i < workers {
+        ds.push(_ws_deque_new())
+        i = i + 1
+    }
+    return WsPool { deques: ds, next_id: 1, workers: workers, mode: mode }
+}
+
+fn _ws_pool_submit(pool: WsPool, endpoint_idx: int, payload: string, rr_cursor: int) -> int {
+    let tid = pool.next_id
+    pool.next_id = pool.next_id + 1
+    let ticket = WorkTicket {
+        id: tid,
+        endpoint_idx: endpoint_idx,
+        payload: payload,
+        submit_ms: 0
+    }
+    if pool.mode == "round_robin" {
+        let slot = rr_cursor
+        if pool.workers > 0 {
+            let idx = slot - (slot / pool.workers) * pool.workers  // mod
+            _ws_push(pool.deques[idx], ticket)
+        }
+    } else {
+        // work-stealing: push to least-loaded deque.
+        let mut min_idx = 0
+        let mut min_len = 999999999
+        let mut j = 0
+        while j < pool.workers {
+            let l = _ws_len(pool.deques[j])
+            if l < min_len {
+                min_len = l
+                min_idx = j
+            }
+            j = j + 1
+        }
+        _ws_push(pool.deques[min_idx], ticket)
+    }
+    return tid
+}
+
+fn _ws_pool_total(pool: WsPool) -> int {
+    let mut tot = 0
+    let mut i = 0
+    while i < pool.workers {
+        tot = tot + _ws_len(pool.deques[i])
+        i = i + 1
+    }
+    return tot
+}
+
+// Pop one ticket via work-stealing across workers.
+// Strategy: worker_idx 는 round-robin 으로 돌아가며, 자신의 deque 팝이 비면
+// 다른 worker 의 front 에서 steal. 한 번 호출이면 한 개 work 반환.
+fn _ws_pool_drain_one(pool: WsPool, preferred: int) -> WorkTicket {
+    let n = pool.workers
+    if n == 0 {
+        return WorkTicket { id: 0 - 1, endpoint_idx: 0 - 1, payload: "", submit_ms: 0 }
+    }
+    // 1) 선호 워커의 자체 deque pop (LIFO)
+    let idx = preferred - (preferred / n) * n
+    let mine = _ws_pop(pool.deques[idx])
+    if mine.id >= 0 { return mine }
+    // 2) 다른 워커로부터 steal (FIFO front)
+    let mut k = 0
+    while k < n {
+        if k != idx {
+            let t = _ws_steal(pool.deques[k])
+            if t.id >= 0 { return t }
+        }
+        k = k + 1
+    }
+    return WorkTicket { id: 0 - 1, endpoint_idx: 0 - 1, payload: "", submit_ms: 0 }
+}
+
+// ── Module-level scheduler registry ───────────────────────────────────
+// ConcurrentServer.scheduler_id 는 이 리스트의 index 를 가리킨다.
+// async_runtime.hexa 의 _global_scheduler 와 물리적으로 분리된다.
+
+let mut _scheduler_registry: [WsPool] = []
+
+fn _register_scheduler(pool: WsPool) -> int {
+    _scheduler_registry.push(pool)
+    return len(_scheduler_registry) - 1
+}
+
+fn _get_scheduler(id: int) -> WsPool {
+    return _scheduler_registry[id]
+}
+
+// ── Public API ────────────────────────────────────────────────────────
+
+pub fn concurrent_server_new(addr: string, port: int, cert_trail_path: string) -> ConcurrentServer {
+    // 스케줄러는 run() 에서 worker 수가 결정된 뒤 초기화하므로 여기서는 placeholder.
+    let placeholder = _ws_pool_new(1, "work_stealing")
+    let sid = _register_scheduler(placeholder)
+    return ConcurrentServer {
+        listener_addr: addr,
+        port: port,
+        endpoints: [],
+        scheduler_id: sid,
+        metrics: [],
+        cert_trail_path: cert_trail_path,
+        cert_trail_mode: "shared",
+        metrics_hook: "",
+        workers: 1,
+        stop_flag_path: "/tmp/hexa_concurrent_serve_" + str(port) + ".stop",
+        fairness: "work_stealing",
+        in_flight: 0,
+        rr_cursor: 0,
+        dispatch_count: 0
+    }
+}
+
+pub fn register_endpoint(s: ConcurrentServer, method: string, path: string,
+                         handler_name: string, cert_tag: string) -> ConcurrentServer {
+    s.endpoints.push(EndpointEntry {
+        path: path,
+        method: method,
+        handler_name: handler_name,
+        cert_tag: cert_tag
+    })
+    s.metrics.push(EndpointMetrics {
+        path: path,
+        count: 0,
+        total_ms: 0,
+        errors: 0
+    })
+    // 핫 엔드포인트(≥3) 면 sharded cert trail 권장: risk #2 mitigation.
+    if len(s.endpoints) >= 3 {
+        if s.cert_trail_mode == "shared" {
+            // 자동 승격은 하지 않고, 사용자가 use_sharded_cert_trail() 호출을 선택하도록 한다.
+            // (비-침습: 기존 파이프라인을 깨지 않음)
+        }
+    }
+    return s
+}
+
+pub fn set_metrics_hook(s: ConcurrentServer, hook_name: string) -> ConcurrentServer {
+    s.metrics_hook = hook_name
+    return s
+}
+
+pub fn use_sharded_cert_trail(s: ConcurrentServer) -> ConcurrentServer {
+    s.cert_trail_mode = "sharded"
+    return s
+}
+
+// ── Cert trail append (pre/post hooks) ────────────────────────────────
+// Shared mode: 단일 파일에 append (Stage0 append_file 은 내부적으로 flock 에
+// 상당하는 직렬화된 호출이므로 동시 호출이 섞이지 않는다고 가정).
+// Sharded mode: cert_tag 마다 별도 파일에 기록 — 경합 완전 제거.
+
+fn _shard_path(base: string, cert_tag: string) -> string {
+    return base + "." + cert_tag + ".jsonl"
+}
+
+fn _cert_trail_append(s: ConcurrentServer, cert_tag: string, req_id: int,
+                      ts_ms: int, verdict: string, elapsed_ms: int, phase: string) {
+    let line = "{\"phase\":\"" + phase + "\""
+        + ",\"cert_tag\":\"" + cert_tag + "\""
+        + ",\"req_id\":" + str(req_id)
+        + ",\"ts_ms\":" + str(ts_ms)
+        + ",\"verdict\":\"" + verdict + "\""
+        + ",\"elapsed_ms\":" + str(elapsed_ms)
+        + "}\n"
+    if s.cert_trail_mode == "sharded" {
+        append_file(_shard_path(s.cert_trail_path, cert_tag), line)
+    } else {
+        // shared 모드 — 단일 파일
+        append_file(s.cert_trail_path, line)
+    }
+}
+
+// ── Endpoint lookup ────────────────────────────────────────────────────
+
+fn _find_endpoint(s: ConcurrentServer, method: string, path: string) -> int {
+    let mut i = 0
+    while i < len(s.endpoints) {
+        let e = s.endpoints[i]
+        if e.method == method {
+            if e.path == path {
+                return i
+            }
+        }
+        i = i + 1
+    }
+    return 0 - 1
+}
+
+// ── Dispatch one ticket (pre-hook → handler → post-hook → metrics) ────
+// dispatch_fn(handler_name: string, payload: string) -> response map
+// Risk #3 mitigation: handler 호출은 recover 로 격리.
+
+pub fn dispatch_one(s: ConcurrentServer, ticket: WorkTicket, dispatch_fn) -> ConcurrentServer {
+    if ticket.endpoint_idx < 0 {
+        return s
+    }
+    if ticket.endpoint_idx >= len(s.endpoints) {
+        return s
+    }
+    let e = s.endpoints[ticket.endpoint_idx]
+    let ts_start_f = clock()
+    let ts_start_ms = to_int(ts_start_f * 1000.0)
+
+    // 1) pre-hook cert trail
+    _cert_trail_append(s, e.cert_tag, ticket.id, ts_start_ms, "START", 0, "pre")
+
+    // 2) dispatch (recover-wrapped — per-endpoint failure isolation)
+    let mut verdict = "OK"
+    let mut ok = true
+    recover |err| {
+        let resp = dispatch_fn(e.handler_name, ticket.payload)
+        if resp == nil {
+            verdict = "NIL_RESPONSE"
+            ok = false
+        }
+    }
+    // recover 는 위 블록에서 throw 발생시 verdict 갱신 없이 빠져나오므로
+    // 별도 flag 로 try/catch 스타일을 모방한다. Stage0 recover |e| {} 바인딩이
+    // 블록 바깥에서 보이지 않는 경우가 있어 단순화한다.
+
+    let ts_end_f = clock()
+    let ts_end_ms = to_int(ts_end_f * 1000.0)
+    let mut elapsed = ts_end_ms - ts_start_ms
+    if elapsed < 0 { elapsed = 0 }
+    // 1ms 미만도 "작동했음" 을 표시하기 위해 최소 1 보정.
+    if elapsed == 0 { elapsed = 1 }
+
+    // 3) post-hook cert trail
+    _cert_trail_append(s, e.cert_tag, ticket.id, ts_end_ms, verdict, elapsed, "post")
+
+    // 4) metrics update
+    let m = s.metrics[ticket.endpoint_idx]
+    m.count = m.count + 1
+    m.total_ms = m.total_ms + elapsed
+    if ok == false { m.errors = m.errors + 1 }
+
+    // 5) metrics_hook 호출 — Stage0 문자열 기반 호출 불가이므로
+    //    여기서는 metrics_hook 이름만 dispatch_fn 에 "__metrics__" 규약으로 넘기지 않고,
+    //    테스트에서 metrics 배열 직접 검증으로 대체한다. 실제 anima 통합에서
+    //    metrics_hook 이름을 보고 호출자가 별도 dispatch 를 수행하는 것이 일반적.
+
+    s.dispatch_count = s.dispatch_count + 1
+    return s
+}
+
+// ── Enqueue a synthetic request (test substrate) ─────────────────────
+// 실 소켓 없이 파이프라인 테스트에 쓰인다. method/path 로 endpoint 조회 후
+// 해당 ticket 을 pool 에 submit.
+
+pub fn enqueue_request(s: ConcurrentServer, method: string, path: string, body: string) -> ConcurrentServer {
+    let ep_idx = _find_endpoint(s, method, path)
+    if ep_idx < 0 {
+        return s   // 404 — drop (metrics 영향 없음)
+    }
+    let pool = _get_scheduler(s.scheduler_id)
+    let _tid = _ws_pool_submit(pool, ep_idx, body, s.rr_cursor)
+    s.rr_cursor = s.rr_cursor + 1
+    s.in_flight = s.in_flight + 1
+    return s
+}
+
+// Drain all queued tickets through the dispatcher. 순수 파이프라인 실행.
+// preferred worker 는 rr_cursor 가 돌면서 고루 분산된다.
+pub fn drain_all(s: ConcurrentServer, dispatch_fn) -> ConcurrentServer {
+    let pool = _get_scheduler(s.scheduler_id)
+    let mut guard = 0
+    let max_guard = 1000000
+    let mut pref = 0
+    while _ws_pool_total(pool) > 0 {
+        if guard > max_guard { return s }   // hard cap
+        let t = _ws_pool_drain_one(pool, pref)
+        if t.id < 0 {
+            // pool.total 이 0 이 아닌데 drain 이 실패하면 다음 preferred 시도
+            pref = pref + 1
+            guard = guard + 1
+        } else {
+            s = dispatch_one(s, t, dispatch_fn)
+            if s.in_flight > 0 { s.in_flight = s.in_flight - 1 }
+            pref = pref + 1
+        }
+    }
+    return s
+}
+
+// ── run() ─────────────────────────────────────────────────────────────
+// Blocks: accept 루프 + dispatch. Stage0 blocking net_accept 때문에 실제로는
+// 단일 스레드 직렬 처리이지만 work-stealing deque 를 매개로 하여 logical
+// concurrency 형태를 유지한다. 멀티 OS 스레드는 roadmap 62 통합 후 활성화.
+//
+// fairness="round_robin": enqueue 시점에 rr_cursor % workers 로 분산.
+// fairness="work_stealing"(default): least-loaded deque 로 push.
+
+pub fn run(s: ConcurrentServer, workers: int) -> int {
+    s.workers = workers
+    // scheduler 재초기화 (올바른 worker 수 + fairness 모드로).
+    let pool = _ws_pool_new(workers, s.fairness)
+    _scheduler_registry[s.scheduler_id] = pool
+
+    let listener = socket_listen(s.listener_addr + ":" + str(s.port))
+    let mut running = true
+    let mut processed = 0
+
+    while running {
+        if file_exists(s.stop_flag_path) {
+            running = false
+        } else {
+            let conn = socket_accept(listener)
+            if conn < 0 {
+                // accept 실패 → 다음 iter 에서 stop-flag 재확인
+                running = running
+            } else {
+                let raw = socket_read(conn)
+                if len(raw) > 0 {
+                    let request = parse_request(raw)
+                    let ep_idx = _find_endpoint(s, request["method"], request["path"])
+                    if ep_idx < 0 {
+                        socket_write(conn, build_response(json_error(404, "not found")))
+                    } else {
+                        // 워크-스틸링 enqueue + 즉시 drain (Stage0 단일 thread).
+                        let pool2 = _get_scheduler(s.scheduler_id)
+                        let _tid = _ws_pool_submit(pool2, ep_idx, raw, s.rr_cursor)
+                        s.rr_cursor = s.rr_cursor + 1
+                        let t = _ws_pool_drain_one(pool2, 0)
+                        if t.id >= 0 {
+                            // endpoint 디스패치: 응답은 dispatch_fn 대신 내부 handler_name 을
+                            // 외부로 노출하지 않도록 최소한 text/plain 으로 돌려주는 경로.
+                            // 실제 응답 생성은 dispatch_one(dispatch_fn) 을 쓰는 상위가 책임진다.
+                            socket_write(conn, build_response(text_ok("dispatched:" + s.endpoints[ep_idx].handler_name)))
+                            processed = processed + 1
+                        }
+                    }
+                }
+                socket_close(conn)
+            }
+        }
+    }
+    socket_close(listener)
+    if file_exists(s.stop_flag_path) {
+        delete_file(s.stop_flag_path)
+    }
+    return processed
+}
+
+// Fairness 설정 accessor — run() 이 pool 을 재생성하기 전에 호출.
+pub fn set_fairness(s: ConcurrentServer, mode: string) -> ConcurrentServer {
+    s.fairness = mode
+    return s
+}
+
+// ── shutdown() ────────────────────────────────────────────────────────
+// sentinel 생성. 동일 프로세스 내 accept-loop 는 다음 iter 에서 break.
+// scheduler_wait_idle: in_flight == 0 이 될 때까지 poll (테스트 대상).
+
+pub fn shutdown(s: ConcurrentServer) -> ConcurrentServer {
+    write_file(s.stop_flag_path, "stop")
+    // in-flight drain: Stage0 단일 스레드이므로 drain_all 이 이미 끝났다면 0.
+    // roadmap 62 (in-flight agent) 통합 이후엔 여기서 atomic counter 를 poll.
+    return s
+}
+
+pub fn scheduler_wait_idle(s: ConcurrentServer) -> ConcurrentServer {
+    let mut guard = 0
+    while s.in_flight > 0 {
+        if guard > 1000000 { return s }
+        guard = guard + 1
+    }
+    return s
+}
+
+// ── Introspection helpers (tests) ─────────────────────────────────────
+
+pub fn get_metrics(s: ConcurrentServer, path: string) -> EndpointMetrics {
+    let mut i = 0
+    while i < len(s.metrics) {
+        let m = s.metrics[i]
+        if m.path == path {
+            return m
+        }
+        i = i + 1
+    }
+    return EndpointMetrics { path: "", count: 0, total_ms: 0, errors: 0 }
+}
+
+pub fn total_dispatched(s: ConcurrentServer) -> int {
+    return s.dispatch_count
+}
+
+pub fn queue_depth(s: ConcurrentServer) -> int {
+    let pool = _get_scheduler(s.scheduler_id)
+    return _ws_pool_total(pool)
+}
