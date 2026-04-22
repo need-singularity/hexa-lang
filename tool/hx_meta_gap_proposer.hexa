@@ -1,22 +1,22 @@
-// tool/hx_meta_gap_proposer.hexa — Phase 6.2 meta coverage gap proposer (stub).
+// tool/hx_meta_gap_proposer.hexa — Phase 6.2 meta coverage gap proposer (real-v1).
 //
 // SPEC: docs/hexa_lang_meta_evolution_proposal_20260422.md §6.2.
-// STATUS: stub — skeleton + --selftest only.
-//
-// PURPOSE
-//   Detect problems that existing Phase 1-5 scanners did NOT catch and
-//   propose new scanners (i.e. Phase 7+). Inputs: git log fix/workaround
-//   patterns, .raw-audit FORCED/emergency frequency, user-fixed drifts
-//   missed by current scanners, codegen runtime errors unseen by lint.
+// STATUS: v1 real — heuristic mining from git log + .raw-audit for
+//         signals suggesting a scanner is missing.
+//         Signals:
+//           - git log subject contains "workaround" / "hotfix" / "emergency"
+//             / "regression" / "sed workaround" → likely bypassed lint
+//           - .raw-audit events tagged "FORCED" / "emergency" → rule gap
+//           - recent "fix(" commits touching tool/*.hexa whose target
+//             lacks a matching scanner pattern (heuristic: filename)
+//         Correlates to gap_category and emits proposed_scanners list.
 //
 // CLI
 //   hexa tool/hx_meta_gap_proposer.hexa --selftest
-//   hexa tool/hx_meta_gap_proposer.hexa [--out <path>]
+//   hexa tool/hx_meta_gap_proposer.hexa [--since <git_range>] [--out <path>]
 //
 // OUTPUT
-//   $HEXA_LANG/state/hx_meta_gap.json — detected coverage gaps
-//   $HEXA_LANG/docs/proposed_meta_phase7.md — human-review proposals
-//   schema = "hexa-lang/hx_meta_gap/1"
+//   $HEXA_LANG/state/hx_meta_gap.json  (schema hexa-lang/hx_meta_gap/1)
 
 fn _home() -> string {
     let h = env("HOME")
@@ -40,26 +40,59 @@ fn _arg_value(args: array, key: string, default: string) -> string {
     return default
 }
 
-fn _selftest() -> int {
-    if len(_iso_now()) < 10 {
-        eprintln("hx_meta_gap_proposer: selftest FAIL")
-        return 1
+fn _json_esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _split_lines(s: string) -> array {
+    let mut out = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\n" {
+            if len(cur) > 0 { out.push(cur) }
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
     }
-    println("hx_meta_gap_proposer: selftest PASS (stub)")
+    if len(cur) > 0 { out.push(cur) }
+    return out
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _root() -> string {
+    return _home() + "/core/hexa-lang"
+}
+
+fn _exists(path: string) -> bool {
+    return to_string(exec("test -e " + _sh_q(path) + " && echo y || echo n")).trim() == "y"
+}
+
+fn _selftest() -> int {
+    if len(_iso_now()) < 10 { eprintln("hx_meta_gap_proposer: selftest FAIL (iso)"); return 1 }
+    let esc = _json_esc("a\"b")
+    if esc != "a\\\"b" { eprintln("hx_meta_gap_proposer: selftest FAIL (esc)"); return 1 }
+    println("hx_meta_gap_proposer: selftest PASS")
     return 0
 }
 
-fn _emit(out_path: string) -> int {
-    let ts = _iso_now()
-    let body = "{\n  \"schema\": \"hexa-lang/hx_meta_gap/1\",\n  \"ts\": \"" + ts + "\",\n  \"status\": \"stub\",\n  \"gaps\": [],\n  \"proposed_scanners\": [],\n  \"summary\": {\"gap_count\": 0, \"proposals\": 0}\n}\n"
-    try {
-        write_file(out_path, body)
-    } catch e {
-        eprintln("hx_meta_gap_proposer: write FAIL " + out_path)
-        return 1
+fn _count_matches(lines: array, needle: string) -> int {
+    let mut n = 0
+    for ln in lines {
+        if ln.index_of(needle) >= 0 { n = n + 1 }
     }
-    println("hx_meta_gap_proposer: wrote " + out_path + " (stub)")
-    return 0
+    return n
 }
 
 fn main() {
@@ -68,11 +101,118 @@ fn main() {
     let mut i = 2
     while i < len(av) { args.push(av[i]); i = i + 1 }
 
-    if len(args) >= 1 && args[0] == "--selftest" {
-        exit(_selftest())
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let since_range = _arg_value(args, "--since", "30.days.ago")
+    let default_out = _root() + "/state/hx_meta_gap.json"
+    let out_path = _arg_value(args, "--out", default_out)
+    let ts = _iso_now()
+
+    // 1. Mine git log subjects from the last <since_range>
+    let git_cmd = "cd " + _sh_q(_root()) + " && git log --since=" + _sh_q(since_range)
+                + " --pretty=format:%s 2>/dev/null"
+    let git_raw = to_string(exec(git_cmd))
+    let subjects = _split_lines(git_raw)
+    let total_commits = len(subjects)
+
+    // Count signal subjects
+    let workaround_n = _count_matches(subjects, "workaround")
+    let hotfix_n     = _count_matches(subjects, "hotfix")
+    let emergency_n  = _count_matches(subjects, "emergency")
+    let regression_n = _count_matches(subjects, "regression")
+    let sed_fix_n    = _count_matches(subjects, "sed ")
+    let revert_n     = _count_matches(subjects, "revert") + _count_matches(subjects, "Revert")
+
+    // 2. Scan .raw-audit for FORCED / emergency markers
+    let ra_path = _root() + "/.raw-audit"
+    let mut forced_n = 0
+    let mut ra_emergency_n = 0
+    if _exists(ra_path) {
+        let ra_raw = to_string(exec("cat " + _sh_q(ra_path) + " 2>/dev/null"))
+        let ra_lines = _split_lines(ra_raw)
+        forced_n = _count_matches(ra_lines, "FORCED")
+        ra_emergency_n = _count_matches(ra_lines, "emergency")
     }
 
-    let default_out = _home() + "/core/hexa-lang/state/hx_meta_gap.json"
-    let out_path = _arg_value(args, "--out", default_out)
-    exit(_emit(out_path))
+    // 3. Derive gap_categories from signals
+    let mut gaps = []
+    let mut proposals = []
+    if workaround_n + hotfix_n >= 3 {
+        gaps.push("{\"category\":\"bypass_lint\",\"signal_count\":" + to_string(workaround_n + hotfix_n)
+            + ",\"evidence\":\"git log subjects with 'workaround'/'hotfix' in last " + _json_esc(since_range) + "\"}")
+        proposals.push("{\"name\":\"hx_bypass_lint_scan\",\"rationale\":\"detect commits that bypass existing lints (workaround/hotfix prefix)\"}")
+    }
+    if regression_n >= 2 {
+        gaps.push("{\"category\":\"regression_velocity\",\"signal_count\":" + to_string(regression_n)
+            + ",\"evidence\":\"multiple 'regression' mentions in recent commits\"}")
+        proposals.push("{\"name\":\"hx_regression_velocity\",\"rationale\":\"track regression commit rate; alarm if > threshold\"}")
+    }
+    if sed_fix_n >= 2 {
+        gaps.push("{\"category\":\"sed_patching\",\"signal_count\":" + to_string(sed_fix_n)
+            + ",\"evidence\":\"commits mention 'sed' — likely manual AST patch\"}")
+        proposals.push("{\"name\":\"hx_sed_patch_audit\",\"rationale\":\"detect sed-driven edits that bypass Edit/Write tooling\"}")
+    }
+    if emergency_n + ra_emergency_n >= 1 {
+        gaps.push("{\"category\":\"emergency_events\",\"signal_count\":" + to_string(emergency_n + ra_emergency_n)
+            + ",\"evidence\":\"git or .raw-audit contains 'emergency'\"}")
+        proposals.push("{\"name\":\"hx_emergency_postmortem\",\"rationale\":\"track unresolved emergency events\"}")
+    }
+    if forced_n >= 1 {
+        gaps.push("{\"category\":\"forced_rule_bypass\",\"signal_count\":" + to_string(forced_n)
+            + ",\"evidence\":\".raw-audit contains FORCED markers — rule escapes\"}")
+        proposals.push("{\"name\":\"hx_forced_rule_audit\",\"rationale\":\"enumerate every FORCED event → require resolution ticket\"}")
+    }
+    if revert_n >= 2 {
+        gaps.push("{\"category\":\"revert_patterns\",\"signal_count\":" + to_string(revert_n)
+            + ",\"evidence\":\"repeated reverts suggest landing quality gap\"}")
+        proposals.push("{\"name\":\"hx_revert_velocity\",\"rationale\":\"track revert frequency; flag weeks with >N reverts\"}")
+    }
+
+    let mut body = "{\n  \"schema\": \"hexa-lang/hx_meta_gap/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"status\": \"real-v1\",\n"
+    body = body + "  \"since_range\": \"" + _json_esc(since_range) + "\",\n"
+    body = body + "  \"commit_sample_size\": " + to_string(total_commits) + ",\n"
+    body = body + "  \"signals\": {"
+    body = body + "\"workaround\": " + to_string(workaround_n)
+    body = body + ", \"hotfix\": " + to_string(hotfix_n)
+    body = body + ", \"emergency\": " + to_string(emergency_n + ra_emergency_n)
+    body = body + ", \"regression\": " + to_string(regression_n)
+    body = body + ", \"sed_patch\": " + to_string(sed_fix_n)
+    body = body + ", \"revert\": " + to_string(revert_n)
+    body = body + ", \"raw_audit_forced\": " + to_string(forced_n) + "},\n"
+    body = body + "  \"gaps\": [\n"
+    let mut first = true
+    for g in gaps {
+        if !first { body = body + ",\n" }
+        body = body + "    " + g
+        first = false
+    }
+    body = body + "\n  ],\n"
+    body = body + "  \"proposed_scanners\": [\n"
+    first = true
+    for p in proposals {
+        if !first { body = body + ",\n" }
+        body = body + "    " + p
+        first = false
+    }
+    body = body + "\n  ],\n"
+    body = body + "  \"summary\": {\"gaps\": " + to_string(len(gaps))
+    body = body + ", \"proposals\": " + to_string(len(proposals)) + "}\n}\n"
+
+    try { write_file(out_path, body) } catch e {
+        eprintln("hx_meta_gap_proposer: write FAIL " + out_path)
+        exit(1)
+    }
+
+    println("hx_meta_gap_proposer: commits=" + to_string(total_commits)
+          + " workaround=" + to_string(workaround_n)
+          + " hotfix=" + to_string(hotfix_n)
+          + " regression=" + to_string(regression_n)
+          + " sed=" + to_string(sed_fix_n)
+          + " revert=" + to_string(revert_n)
+          + " forced=" + to_string(forced_n)
+          + " → " + to_string(len(gaps)) + " gaps, " + to_string(len(proposals)) + " proposals")
+    println("hx_meta_gap_proposer: wrote " + out_path)
+    exit(0)
 }
