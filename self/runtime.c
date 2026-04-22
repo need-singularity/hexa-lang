@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/wait.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
 #endif
@@ -5711,6 +5712,122 @@ HexaVal hexa_env_var(HexaVal name) {
     return hexa_str(v ? v : "");
 }
 
+// setenv(name, value): POSIX setenv wrapper with overwrite=1. Empty / non-STR
+// name is a no-op. Returns the stored value on success, "" on failure — so
+// callers can treat it like env() in a set-then-read idiom without a second
+// getenv round-trip. anima/serve_alm-style bash bridges previously used
+// `env BAR=baz hexa run …` because the language had no setter; this closes
+// the gap so .hexa contracts can configure child env directly before exec.
+HexaVal hexa_setenv(HexaVal name, HexaVal value) {
+    if (!HX_IS_STR(name) || !HX_STR(name) || HX_STR(name)[0] == '\0') return hexa_str("");
+    const char* v = (HX_IS_STR(value) && HX_STR(value)) ? HX_STR(value) : "";
+    if (setenv(HX_STR(name), v, 1) != 0) return hexa_str("");
+    return hexa_str(v);
+}
+
+// exec_capture(cmd): spawn `/bin/sh -c cmd` and return
+// [stdout_str, stderr_str, exit_code] with stderr split from stdout. Uses
+// pipe/fork/execvp (not popen, which merges 2>&1 when you redirect it).
+// Closes the anima bash-bridge pattern of `tool/serve_alm_persona.bash`
+// (333 lines) that existed solely to separate stderr capture.
+HexaVal hexa_exec_capture(HexaVal cmd) {
+    HexaVal arr = hexa_array_new();
+    if (!HX_IS_STR(cmd) || !HX_STR(cmd)) {
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    int out_pipe[2], err_pipe[2];
+    if (pipe(out_pipe) != 0) {
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_str("pipe: stdout"));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    if (pipe(err_pipe) != 0) {
+        close(out_pipe[0]); close(out_pipe[1]);
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_str("pipe: stderr"));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    pid_t pid = fork();
+    if (pid < 0) {
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        arr = hexa_array_push(arr, hexa_str(""));
+        arr = hexa_array_push(arr, hexa_str("fork failed"));
+        arr = hexa_array_push(arr, hexa_int(127));
+        return arr;
+    }
+    if (pid == 0) {
+        // child: rewire stdout/stderr then exec shell
+        dup2(out_pipe[1], 1);
+        dup2(err_pipe[1], 2);
+        close(out_pipe[0]); close(out_pipe[1]);
+        close(err_pipe[0]); close(err_pipe[1]);
+        execl("/bin/sh", "sh", "-c", HX_STR(cmd), (char*)NULL);
+        _exit(127);
+    }
+    // parent: close write ends, drain both pipes.
+    // Simple drain loop: alternate non-blocking would be better but for
+    // typical build-script command sizes (sub-MB) sequential is fine —
+    // we close(write) immediately so EOF propagates once child exits.
+    close(out_pipe[1]);
+    close(err_pipe[1]);
+    char buf[4096];
+    size_t ocap = 4096, olen = 0;
+    char* obuf = (char*)malloc(ocap);
+    if (obuf) obuf[0] = '\0';
+    size_t ecap = 4096, elen = 0;
+    char* ebuf = (char*)malloc(ecap);
+    if (ebuf) ebuf[0] = '\0';
+    int of = out_pipe[0], ef = err_pipe[0];
+    int open_mask = 3; // bit 0 = stdout, bit 1 = stderr
+    while (open_mask) {
+        if (open_mask & 1) {
+            ssize_t n = read(of, buf, sizeof(buf));
+            if (n > 0 && obuf) {
+                while (olen + (size_t)n + 1 > ocap) {
+                    ocap *= 2;
+                    char* nb = (char*)realloc(obuf, ocap);
+                    if (!nb) { free(obuf); obuf = NULL; break; }
+                    obuf = nb;
+                }
+                if (obuf) { memcpy(obuf + olen, buf, (size_t)n); olen += (size_t)n; obuf[olen] = '\0'; }
+            } else if (n == 0 || (n < 0)) {
+                open_mask &= ~1;
+            }
+        }
+        if (open_mask & 2) {
+            ssize_t n = read(ef, buf, sizeof(buf));
+            if (n > 0 && ebuf) {
+                while (elen + (size_t)n + 1 > ecap) {
+                    ecap *= 2;
+                    char* nb = (char*)realloc(ebuf, ecap);
+                    if (!nb) { free(ebuf); ebuf = NULL; break; }
+                    ebuf = nb;
+                }
+                if (ebuf) { memcpy(ebuf + elen, buf, (size_t)n); elen += (size_t)n; ebuf[elen] = '\0'; }
+            } else if (n == 0 || (n < 0)) {
+                open_mask &= ~2;
+            }
+        }
+    }
+    close(of); close(ef);
+    int status = 0;
+    waitpid(pid, &status, 0);
+    int exit_code;
+    if (WIFEXITED(status))         exit_code = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status))  exit_code = 128 + WTERMSIG(status);
+    else                           exit_code = -1;
+    arr = hexa_array_push(arr, obuf ? hexa_str_own(obuf) : hexa_str(""));
+    arr = hexa_array_push(arr, ebuf ? hexa_str_own(ebuf) : hexa_str(""));
+    arr = hexa_array_push(arr, hexa_int(exit_code));
+    return arr;
+}
+
 HexaVal hexa_delete_file(HexaVal path) {
     if (!HX_IS_STR(path) || !HX_STR(path)) return hexa_void();
     (void)unlink(HX_STR(path));
@@ -5745,7 +5862,28 @@ HexaVal hexa_hex(HexaVal n) {
     return hexa_str_own(out);
 }
 
+// Reproducible-emit pin. When SOURCE_DATE_EPOCH is set (GNU/Debian
+// convention, unix-seconds int) or HEXA_REPRODUCIBLE=1, wall-clock
+// primitives return a fixed value so emitted artifacts (codegen output,
+// manifests with embedded `now()`, chain-hash folds) are byte-identical
+// across runs. Returns -1 when no pin is active.
+// HEXA_REPRODUCIBLE=1 alone pins to 0 (epoch); SOURCE_DATE_EPOCH wins.
+static int64_t hexa_pinned_epoch(void) {
+    const char* sde = getenv("SOURCE_DATE_EPOCH");
+    if (sde && *sde) {
+        // strtoll tolerates leading whitespace and stops at first non-digit
+        char* endp = NULL;
+        long long v = strtoll(sde, &endp, 10);
+        if (endp != sde && v >= 0) return (int64_t)v;
+    }
+    const char* repro = getenv("HEXA_REPRODUCIBLE");
+    if (repro && repro[0] == '1' && repro[1] == '\0') return 0;
+    return -1;
+}
+
 HexaVal hexa_timestamp(void) {
+    int64_t pin = hexa_pinned_epoch();
+    if (pin >= 0) return hexa_int(pin);
     struct timespec ts;
     clock_gettime(CLOCK_REALTIME, &ts);
     return hexa_int((int64_t)ts.tv_sec);
@@ -5756,6 +5894,8 @@ HexaVal hexa_timestamp(void) {
 // train_logger.hexa / eval_harness.hexa / train_7b_integrated.hexa for
 // elapsed-time measurement (tok/s, save/load latency, per-step timing).
 HexaVal hexa_time_ms(void) {
+    int64_t pin = hexa_pinned_epoch();
+    if (pin >= 0) return hexa_int(pin * 1000);
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     int64_t ms = (int64_t)ts.tv_sec * 1000
@@ -5832,6 +5972,8 @@ HexaVal hexa_sleep_s(HexaVal n) {
 // elapsed, immune to system clock adjustment). Paired with time_ms()
 // for finer-grained benchmarks.
 HexaVal hexa_now_monotonic_s(void) {
+    int64_t pin = hexa_pinned_epoch();
+    if (pin >= 0) return hexa_float((double)pin);
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return hexa_float((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
@@ -5839,7 +5981,8 @@ HexaVal hexa_now_monotonic_s(void) {
 
 // utc_iso_now(): RFC-3339 / ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ".
 HexaVal hexa_utc_iso_now(void) {
-    time_t t = time(NULL);
+    int64_t pin = hexa_pinned_epoch();
+    time_t t = (pin >= 0) ? (time_t)pin : time(NULL);
     struct tm g;
     gmtime_r(&t, &g);
     char buf[32];
@@ -5849,7 +5992,8 @@ HexaVal hexa_utc_iso_now(void) {
 
 // utc_compact_now(): compact "YYYYMMDDHHMMSS" UTC (checkpoint filename).
 HexaVal hexa_utc_compact_now(void) {
-    time_t t = time(NULL);
+    int64_t pin = hexa_pinned_epoch();
+    time_t t = (pin >= 0) ? (time_t)pin : time(NULL);
     struct tm g;
     gmtime_r(&t, &g);
     char buf[32];
@@ -6517,10 +6661,20 @@ HexaVal hexa_base64_decode(HexaVal s) {
 static HexaVal _bt73_timestamp_w(void) { return hexa_timestamp(); }
 static HexaVal _bt73_base64_encode_w(HexaVal s) { return hexa_base64_encode(s); }
 static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); }
+// stage0 bootstrap gap: hexa_v2 (already-baked transpiler) doesn't know
+// about setenv / exec_capture, so the interpreter dispatch in hexa_full.hexa
+// resolves bare `setenv(...)` through hexa_call2 / `exec_capture(...)` via
+// hexa_call1. Shim these as TAG_FN globals so the linker finds them.
+static HexaVal _w_setenv(HexaVal n, HexaVal v) { return hexa_setenv(n, v); }
+static HexaVal _w_exec_capture(HexaVal c) { return hexa_exec_capture(c); }
 
 HexaVal timestamp;
 HexaVal base64_encode;
 HexaVal base64_decode;
+// Names intentionally prefixed — plain `setenv` would clobber the libc
+// prototype from <stdlib.h>, and `exec_capture` is new surface.
+HexaVal hx_setenv;
+HexaVal hx_exec_capture;
 
 // S1-D2 Blocker C: runtime init for TAG_FN shim variables.
 // NaN-boxing makes HexaVal a uint64_t — designated initializers for the
@@ -6539,6 +6693,9 @@ static void _hexa_init_fn_shims(void) {
     timestamp     = hexa_fn_new((void*)_bt73_timestamp_w,     0);
     base64_encode = hexa_fn_new((void*)_bt73_base64_encode_w, 1);
     base64_decode = hexa_fn_new((void*)_bt73_base64_decode_w, 1);
+    // stage0 exec/env primitives — bootstrap-gap bridge
+    hx_setenv       = hexa_fn_new((void*)_w_setenv,       2);
+    hx_exec_capture = hexa_fn_new((void*)_w_exec_capture, 1);
     // std::net free-fn shims — bridges transpiler bootstrap gap for
     // net_connect / net_read / net_write until hexa_v2 learns the
     // direct-lowering for these names (see native/net.c comment).
