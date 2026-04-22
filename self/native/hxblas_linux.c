@@ -1,6 +1,6 @@
 // hxblas_linux.c — hexa FFI ↔ OpenBLAS/libm ABI shim (Linux x86_64)
 //
-// Port of /Users/ghost/Dev/anima/training/hxblas_wrapper.c from macOS
+// Port of /Users/ghost/core/anima/training/hxblas_wrapper.c from macOS
 // Accelerate → Linux OpenBLAS (cblas.h). ABI matches bit-for-bit so the
 // same hexa-side extern declarations (same function names, same
 // int64/double/pointer-as-int64 signature) resolve to this .so on Linux

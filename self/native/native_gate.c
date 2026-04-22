@@ -58,7 +58,10 @@ static const char *RAW8_CONTAINS[] = {
     NULL
 };
 
-// raw#13 ai/git config paths (path-substring match)
+// raw#13 ai/git config paths (path-substring match).
+// raw#13 expansion 2026-04-22 — per-repo .claude/settings*.json + agents/ + commands/
+// added (AG10 purge 후 project-local 금지 확정).
+// user-global ~/.claude/ is whitelisted via is_user_global_claude() below.
 static const char *RAW13_PATHS[] = {
     "/.github/workflows/",
     "/.githooks/",
@@ -76,6 +79,10 @@ static const char *RAW13_PATHS[] = {
     "/CLAUDE.md",
     "/.claude/hooks/",
     "/.claude/skills/",
+    "/.claude/settings.json",
+    "/.claude/settings.local.json",
+    "/.claude/agents/",
+    "/.claude/commands/",
     NULL
 };
 
@@ -126,7 +133,28 @@ static int refuse_raw8(const char *path) {
     return 0;
 }
 
+// user-global ~/.claude/ is always allowed (raw#13 exception — AG10 purge 후
+// user-global AI 도구 설정은 유지). Detect "/Users/<user>/.claude/" (macOS) or
+// "/home/<user>/.claude/" (Linux) by finding "/.claude/" and looking for a
+// $HOME-prefix match.
+static int is_user_global_claude(const char *path) {
+    if (!path) return 0;
+    const char *hit = strstr(path, "/.claude/");
+    if (!hit) return 0;
+    const char *home = getenv("HOME");
+    if (home && home[0]) {
+        size_t hn = strlen(home);
+        if (strncmp(path, home, hn) == 0 && path[hn] == '/') {
+            // Only the top-level $HOME/.claude/ counts as user-global;
+            // $HOME/core/hexa-lang/.claude/ is per-repo (still banned).
+            if (strncmp(path + hn, "/.claude/", 9) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
 static int refuse_raw13(const char *path) {
+    if (is_user_global_claude(path)) return 0;
     for (int i = 0; RAW13_PATHS[i]; i++) {
         if (strstr(path, RAW13_PATHS[i])) return 1;
     }

@@ -64,7 +64,7 @@ HX11 은 **AI-native self-format** 이 목표였다. 그러나 JSON 은 "AI 가 
 ## §3. REQUIRES — hexa-lang 현재 상태 (2026-04-18)
 
 ### 3-1. 기존 attr 파일
-`/Users/ghost/Dev/hexa-lang/self/attrs/` 하위 49개 `.hexa` 파일. 전부 `fn meta_<name>()` + `fn check_<name>(source, lines)` 구조로 통일.
+`/Users/ghost/core/hexa-lang/self/attrs/` 하위 49개 `.hexa` 파일. 전부 `fn meta_<name>()` + `fn check_<name>(source, lines)` 구조로 통일.
 
 attr 선언 문법 (실제 사용례):
 ```hexa
@@ -186,7 +186,7 @@ precedence: file > project.hexa > global default.
 @project(
     name = "n6-architecture",
     version = "1.0",
-    hexa_lang = "/Users/ghost/Dev/hexa-lang"
+    hexa_lang = "/Users/ghost/core/hexa-lang"
 )
 
 @doc_rules(type="paper") {

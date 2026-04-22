@@ -214,9 +214,9 @@ exec-rule: "SUB progress 는 MAIN phase 로만 흡수, 단독 commit 금지"
 - **raw_audit hash-chain** — append-only attestation.
 
 ### Core workspace
-- **~/core super-project + .workspace SSOT** · per-project `cli/` convention · ~/shared decommission in progress.
-- **atlas SSOT = ~/core/n6-architecture/atlas/** (owner n6-architecture, 2026-04-21 재결정). `data/n6/` = backward-compat symlink.
-- **nexus canonical** — `~/core/nexus/cli/run.hexa` (`079bc12d`). shim: `~/.hx/bin/nexus` → `.hx/packages/nexus/cli/run.hexa`.
+- **$WS super-project + .workspace SSOT** · per-project `cli/` convention · ~/shared decommission in progress.
+- **atlas SSOT = $WS/n6-architecture/atlas/** (owner n6-architecture, 2026-04-21 재결정). `data/n6/` = backward-compat symlink.
+- **nexus canonical** — `$WS/nexus/cli/run.hexa` (`079bc12d`). shim: `~/.hx/bin/nexus` → `.hx/packages/nexus/cli/run.hexa`.
 
 ### Brand
 - **need-singularity** org — 🧬 (2026-04-21, 🌀 deprecated). Avatar = hexagon gravitational well SVG. 보조: ⬢ / ⌬.

@@ -1,0 +1,117 @@
+// self/attrs/native.hexa — @native raw safety attr
+// 선언: 이 저장소(및 해당 attr 를 상속하는 프로젝트)의 소스는 hexa-native 만 허용.
+// `.py`, `.rs`, `.sh` 를 신규 생성/수정하는 행위는 raw 규칙 위반.
+// (C 는 `self/native/` 한정 — native FFI shim 용 기존 예외. 이 룰은 확장 불가.)
+//
+// 동기 (2026-04-22):
+//   · LLM 이 작업 편의상 foreign 확장자로 분기하려는 관성이 관측됨
+//   · memory/preference 만으로는 enforcement 실패 — 파일이 실제 생성됨
+//   · OS-level raw gate 가 유일한 실효 경계 (sealed.hexa 의 fs_seal 전례)
+//
+// 감지 (check_native):
+//   · 프로젝트 트리에서 .py/.rs/.sh 존재 여부 스캔 → error LintMsg
+//   · _publish_registry / tool/pkg 하위 등 외부 배포 캐시는 allow 목록으로 제외
+//
+// OS-level 강제 (fs_reject_foreign):
+//   · launchd(darwin) / systemd-path(linux) watcher 가 상시 trigger
+//   · foreign 확장자 파일 등장 즉시 `rm -f` + log → 생성 자체 차단에 준함
+//   · Claude Write/Edit 이 파일 생성에 성공해도 수 ms 내 제거 → "없는 것과 동일"
+//
+// 등록 이름: "native" (단일 lowercase, _naming 규칙 준수)
+
+use "self/attrs/core"
+
+fn meta_native() -> AttrMeta {
+    let mut m = empty_meta()
+    m.name        = "native"
+    m.category    = "safety"
+    m.purpose     = "hexa-native 소스만 허용 — .py/.rs/.sh 생성/수정 raw 금지 (OS-level gate 전제)"
+    m.cost_rule   = "tree scan O(n) (n=파일수). launchd watcher trigger 당 단일 stat+rm."
+    m.side_effect = "감지 레벨 + 옵션 OS-level rm. 선언 파일 없으면 no-op."
+    m.requires    = "launchd plist (darwin) 또는 inotify script (linux) 로 fs_reject_foreign 상시 발사"
+    m.auto_test   = "touch foo.py → check_native 1 error. watcher 구동 시 foo.py 2s 내 소멸."
+    m.example     = "// 프로젝트 root 에 이 attr 등록만으로 활성\n// foreign 확장자 생성 시도 → error + launchd 로 즉시 제거"
+    m.implemented = true
+    return m
+}
+
+// ─── 금지 확장자 ────────────────────────────────────────────────
+fn _forbidden_exts() {
+    return [".py", ".rs", ".sh"]
+}
+
+// 예외 경로 prefix — 배포/외부 캐시, tool/pkg 바이너리 wrapper 등
+// 프로젝트별 override 는 향후 find_native_rules(source) 로 HX11 주입 예정.
+fn _exempt_prefixes() {
+    return [
+        "tool/pkg/",              // 외부 배포 shim
+        "docs/_site/",            // 생성물
+        ".git/",                  // VCS
+        "hexa.pre-cc-backup-",    // 백업 스냅샷
+        "launchd/"                // launchd plist 참조 스크립트 (plist 내 inline)
+    ]
+}
+
+fn _is_exempt(path: string) -> bool {
+    let prefixes = _exempt_prefixes()
+    for p in prefixes {
+        if path.contains("/" + p) { return true }
+        if path.starts_with(p) { return true }
+    }
+    return false
+}
+
+fn _has_forbidden_ext(path: string) -> bool {
+    let exts = _forbidden_exts()
+    for e in exts {
+        if path.ends_with(e) { return true }
+    }
+    return false
+}
+
+// ─── 감지 ────────────────────────────────────────────────────────
+// 프로젝트 트리 scan → foreign 확장자 전체 목록 (error LintMsg 배열).
+// `root` = 스캔 시작점. exempt prefix 는 _is_exempt 로 skip.
+pub fn check_native(root: string) {
+    let mut out = []
+    let cmd = "find '" + root + "' -type f \\( -name '*.py' -o -name '*.rs' -o -name '*.sh' \\) 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let lines = split(raw, "\n")
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        if _is_exempt(t) { continue }
+        if !_has_forbidden_ext(t) { continue }
+        out.push(mk_msg(
+            "native", "error", t, 1, 0,
+            "foreign 확장자 생성/존재 — @native raw 규칙 위반",
+            "파일을 `.hexa` 로 포팅하거나 `_exempt_prefixes()` 에 경로 등록",
+            "rm '" + t + "' && <작업>.hexa 로 재작성",
+            "self/attrs/native.hexa"))
+    }
+    return out
+}
+
+// Registry adapter — _registry.hexa 는 check_*(source, lines) 시그니처로
+// 디스패치하지만 @native 는 파일이 아니라 프로젝트 전체 트리를 스캔한다.
+// source/lines 는 무시하고 현재 작업 디렉터리를 root 로 사용.
+pub fn check_native_attr(source: string, lines: [string]) {
+    let root = exec("pwd").trim()
+    return check_native(root)
+}
+
+// ─── OS-level raw gate (reactive rm) ────────────────────────────
+// 2026-04-22: sealed.hexa 의 fs_seal 전례와 달리, 생성 차단은 사전 chmod 불가
+// (존재 안 하는 파일 chmod 불가). 대신 launchd/inotify watcher 로 **감지 즉시 제거**.
+// watcher latency ≤ 2s 기준 — Claude Write/Edit 성공해도 tool 반환 전에 소멸.
+// 외부 hook / settings.json / CLI 의존 없음 (hexa-lang 자체해결).
+pub fn fs_reject_foreign(root: string) {
+    let msgs = check_native(root)
+    for m in msgs {
+        // LintMsg.path 필드에 offending path 보관됨
+        let p = m.path
+        if p == "" { continue }
+        exec("rm -f '" + p + "' 2>/dev/null")
+    }
+    return len(msgs)
+}
