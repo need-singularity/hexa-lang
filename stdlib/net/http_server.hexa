@@ -1,0 +1,208 @@
+// HEXA Standard Library — net/http_server
+// 순수 HEXA 로 작성된 최소 HTTP/1.1 서버. self/serve/http_server.hexa 의
+// 사용자 패키징 사본. 컴파일러 내부 파일은 수정하지 않는다.
+//
+// 설계:
+//   - Route 테이블(exact + prefix).
+//   - handler_name: string 으로 보관(async_runtime.scheduler_spawn_task 관례).
+//   - 실제 함수 호출은 server_serve/handle_conn 에 넘긴 dispatch_fn 이 담당.
+//     dispatch_fn(handler_name: string, request: map) -> response map.
+//   - Stage0 에 문자열로 함수를 찾아 호출하는 리플렉션 빌트인이 없기에,
+//     호출측에서 switch/if 로 handler_name 을 분기한다.
+//
+// 종료:
+//   server_serve 는 매 루프마다 file_exists(stop_flag_path) 를 확인해
+//   파일이 생기면 정상 종료한다. server_shutdown 이 해당 파일을 생성한다.
+
+import "./socket.hexa"
+import "./http_request.hexa"
+import "./http_response.hexa"
+
+// -- Route --
+
+pub fn route_new(method, pattern, handler_name, prefix) {
+    let r = #{}
+    r["method"] = method
+    r["pattern"] = pattern
+    r["handler_name"] = handler_name
+    r["prefix"] = prefix
+    return r
+}
+
+// -- Server struct (as map for Stage0 portability) --
+
+pub fn server_new(host, port) {
+    let s = #{}
+    s["host"] = host
+    s["port"] = port
+    s["routes"] = []
+    s["listener"] = 0 - 1
+    s["stop_flag_path"] = "/tmp/hexa_http_server_" + str(port) + ".stop"
+    s["max_body_bytes"] = 1048576            // 1 MiB
+    s["read_timeout_ms"] = 5000
+    return s
+}
+
+// -- Route registration (exact match) --
+// 반환: 갱신된 서버 맵. 기존 맵을 변이 후 그대로 돌려준다.
+
+pub fn server_route(s, method, pattern, handler_name) {
+    let rt = s["routes"]
+    rt.push(route_new(method, pattern, handler_name, false))
+    s["routes"] = rt
+    return s
+}
+
+// -- Mount (prefix match) --
+
+pub fn server_mount(s, method, prefix, handler_name) {
+    let rt = s["routes"]
+    rt.push(route_new(method, prefix, handler_name, true))
+    s["routes"] = rt
+    return s
+}
+
+// -- Listener bind --
+
+pub fn server_listen(s) {
+    let addr = s["host"] + ":" + str(s["port"])
+    let fd = socket_listen(addr)
+    s["listener"] = fd
+    return s
+}
+
+// -- Accept one connection (returns conn_fd; -1 on error) --
+
+pub fn server_accept_once(s) {
+    return socket_accept(s["listener"])
+}
+
+// -- Internal: find matching route --
+// 반환: route 맵 자체, 또는 못 찾으면 r["handler_name"] = "" 인 빈 맵.
+// Stage0 nil 추적 회피를 위해 sentinel 맵을 돌려준다.
+
+fn _route_match(routes, method, path) {
+    let mut found_idx = 0 - 1
+    // 1차: exact match + method match
+    let mut i = 0
+    while i < len(routes) {
+        let r = routes[i]
+        if r["prefix"] == false {
+            if r["method"] == method {
+                if r["pattern"] == path {
+                    found_idx = i
+                    i = len(routes)
+                }
+            }
+        }
+        i = i + 1
+    }
+    // 2차: prefix match
+    if found_idx < 0 {
+        i = 0
+        while i < len(routes) {
+            let r = routes[i]
+            if r["prefix"] == true {
+                if r["method"] == method {
+                    let pat = r["pattern"]
+                    if len(path) >= len(pat) {
+                        if path.substring(0, len(pat)) == pat {
+                            found_idx = i
+                            i = len(routes)
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+    if found_idx < 0 {
+        let empty = #{}
+        empty["handler_name"] = ""
+        return empty
+    }
+    return routes[found_idx]
+}
+
+// -- Handle one connection --
+// dispatch_fn(handler_name: string, request: map) -> response map.
+// 반환값: 서버를 계속 돌릴지 여부. dispatch_fn 결과의
+// response["__stop__"] == true 이면 false 를 돌려준다.
+
+pub fn server_handle_conn(s, conn_fd, dispatch_fn) {
+    let raw = socket_read(conn_fd)
+    let mut keep_running = true
+    if len(raw) > 0 {
+        let request = parse_request(raw)
+
+        // Content-Length 기반 bodystream 보완 (net_read_n 미등록 시 best-effort).
+        let clen = content_length_of(request)
+        if clen > 0 {
+            let have = len(request["body"])
+            if have < clen {
+                if clen <= s["max_body_bytes"] {
+                    let more_body = read_body_best_effort(conn_fd, request["body"], clen, 32)
+                    request["body"] = more_body
+                }
+            }
+        }
+
+        // CORS preflight 자동 처리.
+        if request["method"] == "OPTIONS" {
+            let resp = cors_preflight()
+            socket_write(conn_fd, build_response(resp))
+        } else {
+            let route = _route_match(s["routes"], request["method"], request["path"])
+            if route["handler_name"] == "" {
+                let resp = json_error(404, "not found: " + request["path"])
+                socket_write(conn_fd, build_response(resp))
+            } else {
+                let response = dispatch_fn(route["handler_name"], request)
+                if response["status"] == nil {
+                    let resp = json_error(500, "handler returned invalid response")
+                    socket_write(conn_fd, build_response(resp))
+                } else {
+                    if response["__stop__"] == true {
+                        keep_running = false
+                    } else {
+                        socket_write(conn_fd, build_response(response))
+                    }
+                }
+            }
+        }
+    }
+    socket_close(conn_fd)
+    return keep_running
+}
+
+// -- Accept loop with graceful shutdown sentinel --
+
+pub fn server_serve(s, dispatch_fn) {
+    let mut running = true
+    while running {
+        // stop_flag 체크
+        if file_exists(s["stop_flag_path"]) {
+            running = false
+        } else {
+            let conn = server_accept_once(s)
+            if conn < 0 {
+                // 어더프론트 발생 시 루프 재진입(다음 iter 에서 stop-flag 재확인).
+                running = running
+            } else {
+                let keep = server_handle_conn(s, conn, dispatch_fn)
+                if keep == false { running = false }
+            }
+        }
+    }
+    socket_close(s["listener"])
+    // sentinel 정리 시도(존재할 경우).
+    if file_exists(s["stop_flag_path"]) {
+        delete_file(s["stop_flag_path"])
+    }
+}
+
+// -- Shutdown: create sentinel file so server_serve exits on next iteration --
+
+pub fn server_shutdown(s) {
+    write_file(s["stop_flag_path"], "stop")
+}

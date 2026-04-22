@@ -1,0 +1,170 @@
+// HEXA Standard Library — net/test/http_smoke
+// 서버 데이터 경로(parse + route + build) 스모크 테스트.
+//
+// Stage0 인터프리터는 소켓에 대한 동일 프로세스 accept/connect 동시성을 보장하지
+// 못한다(네트워크 빌트인은 블로킹). 따라서 소켓 왕복 대신 HTTP 와이어 문자열을
+// 서버 파이프라인에 직접 흘려 넣어 의도한 응답이 생성되는지 검증한다.
+//
+// 검증:
+//   1. GET /ping        → 200 OK + body 매칭
+//   2. POST /echo       → 200 OK + Content-Length 기반 body echo
+//   3. GET /notfound    → 404
+//   4. 종료 sentinel    → server_shutdown 이 file_exists(stop_flag) 를 true 로 만든다
+//
+// 출력:
+//   PASS: http smoke 4/4
+//   (실패 시) FAIL <which>
+
+import "../http_request.hexa"
+import "../http_response.hexa"
+import "../http_server.hexa"
+
+// 테스트용 dispatch: handler_name 문자열을 보고 응답 생성.
+fn test_dispatch(handler_name, request) {
+    if handler_name == "ping_handler" {
+        return text_ok("pong")
+    }
+    if handler_name == "echo_handler" {
+        let resp = #{}
+        resp["status"] = 200
+        resp["content_type"] = "text/plain"
+        resp["body"] = request["body"]
+        return resp
+    }
+    return json_error(500, "unknown handler: " + handler_name)
+}
+
+// 서버의 _route_match + dispatch 경로를 외부에서 재현(헬퍼).
+// server_handle_conn 은 실제 소켓 fd 를 요구하므로 네트워크 없는 경로로 분리.
+fn simulate_serve(s, raw) {
+    let request = parse_request(raw)
+
+    if request["method"] == "OPTIONS" {
+        return build_response(cors_preflight())
+    }
+
+    // route 조회 재현 (Stage0 nil 추적 회피 — index + found flag 패턴)
+    let routes = s["routes"]
+    let method = request["method"]
+    let path = request["path"]
+    let mut found_idx = 0 - 1
+    let mut i = 0
+    while i < len(routes) {
+        let r = routes[i]
+        if r["prefix"] == false {
+            if r["method"] == method {
+                if r["pattern"] == path {
+                    found_idx = i
+                    i = len(routes)
+                }
+            }
+        }
+        i = i + 1
+    }
+    if found_idx < 0 {
+        i = 0
+        while i < len(routes) {
+            let r = routes[i]
+            if r["prefix"] == true {
+                if r["method"] == method {
+                    let pat = r["pattern"]
+                    if len(path) >= len(pat) {
+                        if path.substring(0, len(pat)) == pat {
+                            found_idx = i
+                            i = len(routes)
+                        }
+                    }
+                }
+            }
+            i = i + 1
+        }
+    }
+
+    if found_idx < 0 {
+        return build_response(json_error(404, "not found: " + path))
+    }
+    let matched = routes[found_idx]
+    let response = test_dispatch(matched["handler_name"], request)
+    return build_response(response)
+}
+
+// -- 아주 단순한 substring containment 헬퍼 --
+fn contains_s(haystack, needle) {
+    if len(needle) == 0 { return true }
+    if len(needle) > len(haystack) { return false }
+    let max = len(haystack) - len(needle)
+    let mut i = 0
+    while i <= max {
+        if haystack.substring(i, i + len(needle)) == needle {
+            return true
+        }
+        i = i + 1
+    }
+    return false
+}
+
+fn main() {
+    let mut passed = 0
+    let mut failed = ""
+
+    // 0. 서버 구성 (실제 bind 는 하지 않는다)
+    let mut s = server_new("127.0.0.1", 0)
+    s = server_route(s, "GET",  "/ping", "ping_handler")
+    s = server_route(s, "POST", "/echo", "echo_handler")
+
+    // 1. GET /ping
+    let req1 = "GET /ping HTTP/1.1\r\nHost: x\r\n\r\n"
+    let resp1 = simulate_serve(s, req1)
+    if contains_s(resp1, "HTTP/1.1 200 OK") {
+        if contains_s(resp1, "pong") {
+            passed = passed + 1
+        } else {
+            failed = failed + " body1"
+        }
+    } else {
+        failed = failed + " status1"
+    }
+
+    // 2. POST /echo with Content-Length: 11
+    let req2 = "POST /echo HTTP/1.1\r\nHost: x\r\nContent-Length: 11\r\n\r\nhello world"
+    let resp2 = simulate_serve(s, req2)
+    if contains_s(resp2, "HTTP/1.1 200 OK") {
+        if contains_s(resp2, "hello world") {
+            passed = passed + 1
+        } else {
+            failed = failed + " body2"
+        }
+    } else {
+        failed = failed + " status2"
+    }
+
+    // 3. GET /notfound
+    let req3 = "GET /notfound HTTP/1.1\r\nHost: x\r\n\r\n"
+    let resp3 = simulate_serve(s, req3)
+    if contains_s(resp3, "HTTP/1.1 404 Not Found") {
+        passed = passed + 1
+    } else {
+        failed = failed + " nf"
+    }
+
+    // 4. Shutdown sentinel via server_shutdown (경로 격리용 포트 사용)
+    let s2 = server_new("127.0.0.1", 65432)
+    // 기존 sentinel 잔류 정리
+    if file_exists(s2["stop_flag_path"]) {
+        delete_file(s2["stop_flag_path"])
+    }
+    server_shutdown(s2)
+    if file_exists(s2["stop_flag_path"]) {
+        passed = passed + 1
+        // 정리
+        delete_file(s2["stop_flag_path"])
+    } else {
+        failed = failed + " stop"
+    }
+
+    if passed == 4 {
+        println("PASS: http smoke 4/4")
+    } else {
+        println("FAIL" + failed + " (" + str(passed) + "/4)")
+    }
+}
