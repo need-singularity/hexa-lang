@@ -1,0 +1,194 @@
+// tool/roadmap_banner.hexa — .roadmap 상단 banner add/remove/sync.
+//
+// user 요구 (2026-04-23):
+//   ".roadmap 만으로는 진행상황 알 수 없지"
+//   "hexa cli 로 전달사항 add, remove 등 → .roadmap 상단"
+//
+// BANNER FORMAT
+//   .roadmap 첫 헤더 주석 블록 (# …) 바로 아래에 다음 블록을 유지:
+//
+//     # ─── banner (auto, do not edit by hand) ─────────────
+//     # <line 1>
+//     # <line 2>
+//     # ─── end banner ──────────────────────────────────────
+//
+//   자동 생성 / 자동 제거 구간. 사람이 편집하면 sync 시 overwrite.
+//
+// CLI
+//   hexa tool/roadmap_banner.hexa add "<text>"
+//   hexa tool/roadmap_banner.hexa remove <index|--all>
+//   hexa tool/roadmap_banner.hexa sync            — inventory prio>=95 자동 pin
+//   hexa tool/roadmap_banner.hexa show            — 현재 banner 영역 표시
+//
+// uchg 처리: .roadmap 은 uchg 락. 편집 필요 시 tool/roadmap_with_unlock.hexa 경유.
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _root() -> string {
+    return _home() + "/core/hexa-lang"
+}
+
+fn _roadmap_path() -> string {
+    // 현재 cwd 의 git root 기준 .roadmap. 없으면 hexa-lang/.roadmap.
+    let git_top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    if len(git_top) > 0 {
+        let rp = git_top + "/.roadmap"
+        let ok = to_string(exec("test -f '" + rp + "' && echo y || echo n")).trim()
+        if ok == "y" { return rp }
+    }
+    return _root() + "/.roadmap"
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _show() -> int {
+    let path = _roadmap_path()
+    let cmd = "awk '/^# ─── banner/,/^# ─── end banner/' " + _sh_q(path) + " 2>/dev/null"
+    let out = to_string(exec(cmd)).trim()
+    if len(out) == 0 {
+        println("roadmap_banner: (no banner section in " + path + ")")
+    } else {
+        println(out)
+    }
+    return 0
+}
+
+fn _build_synced_banner(path: string) -> string {
+    // inventory 의 prio>=95 non-done entry 를 한 줄씩 # <id> ... 형식으로.
+    // repo 는 .roadmap 소속 git root 의 basename.
+    let git_top = to_string(exec("git rev-parse --show-toplevel 2>/dev/null")).trim()
+    let repo = if len(git_top) > 0 {
+        to_string(exec("basename '" + git_top + "'")).trim()
+    } else {
+        "hexa-lang"
+    }
+    let inv = _home() + "/core/" + repo + "/state/proposals/inventory.json"
+    let have = to_string(exec("test -f '" + inv + "' && echo y || echo n")).trim()
+    if have != "y" { return "" }
+
+    let py_cmd = "python3 - <<'PY'\n"
+        + "import json\n"
+        + "d=json.load(open('" + inv + "'))\n"
+        + "top=[e for e in d.get('entries', [])\n"
+        + "     if (e.get('user_status','pending') != 'done')\n"
+        + "     and int(e.get('score_priority',0)) >= 95]\n"
+        + "top.sort(key=lambda e: -int(e.get('score_priority',0)))\n"
+        + "for e in top[:10]:\n"
+        + "    tag = e.get('category','-')\n"
+        + "    print(f\"# {e['id']} [{tag}] prio={e['score_priority']} {e['title'][:72]}\")\n"
+        + "PY"
+    let lines = to_string(exec(py_cmd)).trim()
+    if len(lines) == 0 {
+        return "# (no cross_repo_blocker prio>=95 pending — all clear)"
+    }
+    return lines
+}
+
+fn _write_banner_via_unlock(path: string, banner_lines: string) -> int {
+    // 전략: awk 로 banner section 제외한 content 추출 → banner 준비 → 결합.
+    //      uchg 해제는 roadmap_with_unlock.hexa 로 atomic.
+    let tmp = "/tmp/roadmap_banner_" + to_string(exec("date +%s")).trim() + ".tmp"
+
+    // 1. non-banner content 추출 (첫 header block 직후 banner 영역 제외)
+    //    간단 구현: 기존 banner 줄 전부 제거 → 맨 위 공백 라인 뒤 새 banner 주입.
+    let extract_cmd = "awk '"
+        + "/^# ─── banner/{skip=1;next}"
+        + "/^# ─── end banner/{skip=0;next}"
+        + "!skip' "
+        + _sh_q(path) + " > " + _sh_q(tmp)
+    let _e = exec(extract_cmd)
+
+    // 2. 새 banner 주입 위치 찾기 — 첫 non-comment, non-blank 라인 직전.
+    //    간단: content 맨 위에 banner 블록 prepend.
+    let final_tmp = tmp + ".final"
+    let new_banner =
+        "# ─── banner (auto, do not edit by hand) ─────────────\n"
+        + banner_lines + "\n"
+        + "# ─── end banner ──────────────────────────────────────\n"
+    let write_banner = "printf '%s' " + _sh_q(new_banner) + " > " + _sh_q(final_tmp)
+    let _w = exec(write_banner)
+    let concat = "cat " + _sh_q(tmp) + " >> " + _sh_q(final_tmp)
+    let _c = exec(concat)
+
+    // 3. roadmap_with_unlock 으로 대체 기록
+    let unlock_tool = _root() + "/tool/roadmap_with_unlock.hexa"
+    let replace_cmd = "hexa " + _sh_q(unlock_tool) + " --file " + _sh_q(path)
+        + " -- cp " + _sh_q(final_tmp) + " " + _sh_q(path)
+    let r = exec_with_status(replace_cmd)
+    let _rm1 = exec("rm -f " + _sh_q(tmp))
+    let _rm2 = exec("rm -f " + _sh_q(final_tmp))
+    if r[1] != 0 {
+        eprintln("roadmap_banner: write FAIL via unlock (rc=" + to_string(r[1]) + ")")
+        eprintln(to_string(r[0]))
+        return r[1]
+    }
+    println("roadmap_banner: updated " + path)
+    return 0
+}
+
+fn _sync() -> int {
+    let path = _roadmap_path()
+    let banner = _build_synced_banner(path)
+    if len(banner) == 0 {
+        println("roadmap_banner: sync — no inventory for this repo, skip")
+        return 0
+    }
+    return _write_banner_via_unlock(path, banner)
+}
+
+fn _add(text: string) -> int {
+    let path = _roadmap_path()
+    // 기존 banner 에서 custom 영역 추출 + 이 text append
+    let cur = to_string(exec("awk '/^# ─── banner/,/^# ─── end banner/' " + _sh_q(path))).trim()
+    let mut existing = ""
+    if cur.len() > 0 {
+        // banner block 에서 header/footer 제거
+        let clean = to_string(exec("awk '/^# ─── banner/{skip=1;next} /^# ─── end banner/{skip=0;next} skip' " + _sh_q(path))).trim()
+        existing = clean
+    }
+    let line = "# " + text
+    let combined = if len(existing) > 0 { existing + "\n" + line } else { line }
+    return _write_banner_via_unlock(path, combined)
+}
+
+fn _remove_all() -> int {
+    return _write_banner_via_unlock(_roadmap_path(), "# (banner cleared)")
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) == 0 {
+        exit(_show())
+    }
+    let cmd = args[0]
+    if cmd == "show"   { exit(_show()) }
+    if cmd == "sync"   { exit(_sync()) }
+    if cmd == "remove" {
+        if len(args) >= 2 && args[1] == "--all" { exit(_remove_all()) }
+        eprintln("roadmap_banner remove: use --all (개별 index remove 는 v2)")
+        exit(2)
+    }
+    if cmd == "add" {
+        if len(args) < 2 {
+            eprintln("roadmap_banner add: text required")
+            exit(2)
+        }
+        exit(_add(args[1]))
+    }
+    if cmd == "--selftest" || cmd == "selftest" {
+        println("roadmap_banner: selftest PASS (no-op; banner ops require unlock)")
+        exit(0)
+    }
+    eprintln("usage: roadmap_banner {show|sync|add <text>|remove --all|selftest}")
+    exit(2)
+}
