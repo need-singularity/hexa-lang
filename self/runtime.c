@@ -2628,6 +2628,26 @@ int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
     return (int64_t)(p - HX_STR(s));
 }
 
+// Returns byte offset of LAST occurrence of `sub` within `s`, or -1.
+// Mirrors interpreter `.rfind`/`.last_index_of` at self/hexa_full.hexa:15741.
+// Added 2026-04-23 (hxa-20260422-002 lang_gap prio=95, rfind blocker).
+int64_t hexa_str_last_index_of(HexaVal s, HexaVal sub) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(sub)) return -1;
+    const char* hay = HX_STR(s);
+    const char* needle = HX_STR(sub);
+    size_t nlen = strlen(needle);
+    size_t hlen = strlen(hay);
+    if (nlen == 0) return (int64_t)hlen;
+    if (nlen > hlen) return -1;
+    int64_t last = -1;
+    const char* p = hay;
+    while ((p = strstr(p, needle)) != NULL) {
+        last = (int64_t)(p - hay);
+        p += 1;  // overlap-safe
+    }
+    return last;
+}
+
 // ── Array operations ─────────────────────────────────
 HexaVal hexa_array_pop(HexaVal arr) {
     if (!HX_IS_ARRAY(arr) || HX_ARR_LEN(arr) == 0) return hexa_void();
