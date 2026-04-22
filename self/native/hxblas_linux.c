@@ -86,6 +86,42 @@ void hxblas_sscal(int64_t N, double alpha, int64_t x, int64_t incx) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// cblas_snrm2 shim — Euclidean (L2) norm: sqrt(sum(x[i]^2))
+// Pure passthrough. Returns double to match hexa FFI convention.
+// Roadmap 57 / B16 prereq.
+// ─────────────────────────────────────────────────────────────
+double hxblas_snrm2(int64_t N, int64_t x, int64_t incx) {
+    float r = cblas_snrm2((int)N, (const float*)(uintptr_t)x, (int)incx);
+    return (double)r;
+}
+
+// ─────────────────────────────────────────────────────────────
+// cblas_sgemv shim — y := alpha * op(A) * x + beta * y
+// `trans` uses CBLAS enum values: 111 = CblasNoTrans, 112 = CblasTrans,
+// 113 = CblasConjTrans. Matrix A is row-major (CblasRowMajor=101) per
+// the hexa-side convention established by sgemm.
+// Roadmap 57 / B16 prereq.
+// ─────────────────────────────────────────────────────────────
+void hxblas_sgemv(int64_t trans,
+                  int64_t M, int64_t N,
+                  double alpha,
+                  int64_t A, int64_t lda,
+                  int64_t x, int64_t incx,
+                  double beta,
+                  int64_t y, int64_t incy) {
+    enum CBLAS_TRANSPOSE ctrans = (trans == 112) ? CblasTrans
+                                 : (trans == 113) ? CblasConjTrans
+                                 : CblasNoTrans;
+    cblas_sgemv(CblasRowMajor, ctrans,
+                (int)M, (int)N,
+                (float)alpha,
+                (const float*)(uintptr_t)A, (int)lda,
+                (const float*)(uintptr_t)x, (int)incx,
+                (float)beta,
+                (float*)(uintptr_t)y, (int)incy);
+}
+
+// ─────────────────────────────────────────────────────────────
 // Reference kernels for benchmark triangulation (identical to Mac)
 // ─────────────────────────────────────────────────────────────
 void hxblas_matmul_scalar(int64_t M, int64_t K, int64_t N,
@@ -322,11 +358,10 @@ void hxblas_embed_scatter(int64_t S, int64_t D, int64_t dembed_p, int64_t dh_p, 
 #include <stddef.h>
 #include <string.h>
 #include <stdlib.h>
-#include <math.h>
 #endif
 
 int64_t hxblas_version(void) {
-    return 3;  // bumped 2026-04-20: + hxckpt_* binary ckpt FFI
+    return 4;  // bumped 2026-04-22: + hxblas_snrm2, hxblas_sgemv (roadmap 57 / B16)
 }
 
 // =============================================================
