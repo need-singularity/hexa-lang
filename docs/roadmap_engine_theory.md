@@ -81,7 +81,7 @@ T_p = parallel time on p processors
 - T_∞ = 6 (critical path: 22 → 25 → 26 → 27 → 28 → 30)
 - T_2 ≥ max(6, 4.5) = **6 days** ← span bound 결정적
 
-→ `eta` 필드를 sequential 11일로 적었던 이전 .roadmap 은 **span(DAG) 위배**. 수정 (commit `33fa0388`) 후 6 days critical path.
+→ `eta` 필드를 sequential 11일로 적었던 이전 .roadmap 은 **span(DAG) 위배**. 6-day critical path 검증은 commit `ba3c6eff` (roadmap-engine #36) 참조. (주: 이전 판의 `33fa0388` 참조는 resolve 불가 — squashed/rebased 추정, 동등 검증이 `ba3c6eff` 에 남아 있음.)
 
 ---
 
