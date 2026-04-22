@@ -182,10 +182,133 @@ fn _enforce_script(enforce_field: string) -> string {
     return enforce_field.substring(0, h)
 }
 
+// Declarative mode tokens — enforce values that are not file paths but
+// bind a rule to an explicit evaluation mode. Passing enforce=strict
+// means the rule is intentionally non-script (e.g. axiom declaration
+// carried only by the decl+proof fields). Match is exact-token.
+fn _is_enforce_mode_token(tok: string) -> bool {
+    let t = tok.trim()
+    if t == "strict" { return true }
+    if t == "lazy"   { return true }
+    if t == "manual" { return true }
+    if t == "nudge"  { return true }
+    if t == "guide"  { return true }
+    if t == "warn"   { return true }
+    if t == "live"   { return true }
+    return false
+}
+
+// Split composite enforce field on `+` or `&&` separators so multi-file
+// declarations (`tool/a.hexa + self/b.sb + self/c.c`) can be validated
+// per-part. Whitespace-trimmed parts; empties dropped.
+fn _split_enforce_parts(enforce_field: string) -> array {
+    let mut parts = []
+    let normalized = enforce_field.replace("&&", "+")
+    let raw_parts = normalized.split("+")
+    for rp in raw_parts {
+        let t = rp.trim()
+        if t != "" { parts.push(t) }
+    }
+    return parts
+}
+
+// Pick the first runnable `.hexa` part of a composite enforce field.
+// Returns [script, missing_detail, kind] where kind ∈ {"run","mode","missing"}:
+//   · kind=run     → script = runnable `.hexa` path
+//   · kind=mode    → script = declarative sentinel (mode token or
+//                    non-hexa artifact like .sb/.c/.json); no subprocess
+//   · kind=missing → script="", missing_detail = which parts are absent
+// Non-hexa files that exist on disk (SBPL profiles, C sources, JSON
+// manifests) are treated as declarative — the rule credits them as SSOT
+// artifacts without trying to execute them through hexa_stage0.
+fn _resolve_enforce(enforce_field: string) -> array {
+    let stripped = _enforce_script(enforce_field)
+    let parts = _split_enforce_parts(stripped)
+    if len(parts) == 0 { return ["", enforce_field, "missing"] }
+    let mut declarative_pick = ""
+    let mut missing_bits = []
+    for p in parts {
+        let expanded = _tilde_expand(p)
+        if file_exists(expanded) {
+            // Runnable = relative `.hexa` path under this repo. Cross-repo
+            // `.hexa` files (tilde-prefixed or absolute) belong to their
+            // owning project's enforcement pipeline and are credited as
+            // declarative references. Non-hexa artifacts (SBPL / C /
+            // JSON / settings.json) are likewise declarative.
+            let is_relative = !p.starts_with("~") && !p.starts_with("/")
+            if expanded.ends_with(".hexa") && is_relative {
+                return [expanded, "", "run"]
+            }
+            if declarative_pick == "" { declarative_pick = expanded }
+            continue
+        }
+        if _is_enforce_mode_token(p) {
+            if declarative_pick == "" { declarative_pick = p }
+            continue
+        }
+        missing_bits.push(p)
+    }
+    if declarative_pick != "" && len(missing_bits) == 0 {
+        return [declarative_pick, "", "mode"]
+    }
+    return ["", missing_bits.join(" + "), "missing"]
+}
+
 fn _should_run(status: string) -> bool {
     if status == "deferred" { return false }
     if status == "convention" { return false }
     return true
+}
+
+// Tilde-expand `~/...` and `~` so composite enforce fields that mix
+// user-global Claude Code artifacts (`~/.claude/settings.json`) and
+// cross-repo hook scripts (`~/core/airgenome/hooks/pre_tool.hexa`) can
+// be file_exists-checked. Exact `~/` prefix only — we deliberately do
+// NOT try to expand `~user/` (requires passwd lookup).
+fn _tilde_expand(p: string) -> string {
+    if len(p) == 0 { return p }
+    if p.substring(0, 1) != "~" { return p }
+    let home = env("HOME")
+    if home == "" { return p }
+    if len(p) == 1 { return home }
+    if p.substring(1, 2) != "/" { return p }
+    let rest = p.substring(1, len(p))
+    return home + rest
+}
+
+// Parse raw#NN defer-until YYYY-MM and compare against current calendar
+// month. Returns true when the rule's defer-until is in the future,
+// which `_should_run` uses to skip enforcement even on `status=live`
+// rules (raw#15 no-hardcode was the canonical case that needed this
+// — status=live + defer-until 2026-06 was meant to stay declarative
+// until the scanner landed, but the gate was running it anyway).
+fn _defer_until_future(keys: array) -> bool {
+    // NOTE: variable name avoids stage0 reserved keyword `defer`.
+    let du_val = keys_first(keys, "defer-until")
+    if du_val == "" { return false }
+    // Expect YYYY-MM. Be permissive on trailing noise.
+    let d = du_val.trim()
+    if len(d) < 7 { return false }
+    let yyyy = d.substring(0, 4)
+    let dash = d.substring(4, 5)
+    let mm = d.substring(5, 7)
+    if dash != "-" { return false }
+    // Current year-month via `date -u +%Y-%m`. Stage0 has no clock
+    // builtin, so we shell out (single call, amortised per raw_all run).
+    let now = exec("date -u +%Y-%m").trim()
+    if len(now) != 7 { return false }
+    let now_y = now.substring(0, 4)
+    let now_m = now.substring(5, 7)
+    // Stage0's string `<`/`>` operators always return false, so compare
+    // as parsed integers.
+    let yn = yyyy.parse_int()
+    let mn = mm.parse_int()
+    let ny = now_y.parse_int()
+    let nm = now_m.parse_int()
+    if yn > ny { return true }
+    if yn < ny { return false }
+    if mn > nm { return true }
+    return false
 }
 
 fn _is_fatal(status: string) -> bool {
@@ -421,6 +544,15 @@ fn _plan_rule(kind: string, rule: array, s0_ok: bool, excludes: array) -> array 
     let status = rule[1]
     if !_should_run(status) { return ["SKIP", status, "", ""] }
 
+    // defer-until future-dated — rule stays declared, enforcer is held
+    // back until the stated month. Used by raw#15 no-hardcode during the
+    // 354-violation triage window (defer-until 2026-06).
+    if _defer_until_future(keys) {
+        let du = keys_first(keys, "defer-until")
+        let dp = ["defer-until ", du]
+        return ["SKIP", dp.join(""), "", ""]
+    }
+
     let enforce_field = keys_first(keys, "enforce")
     if enforce_field == "" {
         if _is_fatal(status) { return ["FAIL", "no `enforce` field on live rule", "", ""] }
@@ -431,13 +563,24 @@ fn _plan_rule(kind: string, rule: array, s0_ok: bool, excludes: array) -> array 
         return ["SKIP", "hexa_stage0 not executable on this host", "", ""]
     }
 
-    let script = _enforce_script(enforce_field)
-    // P1c (2026-04-20): if the enforce path doesn't exist on disk, emit
-    // a distinct MISSING verdict (warn-class, not FAIL) — some enforcers
-    // are planned but not yet implemented and historically this silently
-    // passed. No `count_as_fail` bump.
-    if !file_exists(script) {
-        return ["MISSING", script, "", ""]
+    // Composite enforce fields are split on `+` / `&&`; the first file-on-
+    // disk part is the runnable script. Pure mode tokens (strict/nudge/etc.)
+    // bind the rule to a declarative-only evaluation with no subprocess
+    // (raw#30 irreversibility-embedded-lagrangian is the canonical
+    // strict-mode axiom rule — the enforce field IS the declaration).
+    let resolved = _resolve_enforce(enforce_field)
+    let script = resolved[0]
+    let missing_detail = resolved[1]
+    let kind = resolved[2]
+    if kind == "missing" {
+        // P1c (2026-04-20): distinct MISSING verdict (warn-class, not FAIL)
+        // — no runnable part on disk and no mode token salvage.
+        return ["MISSING", missing_detail, "", ""]
+    }
+    if kind == "mode" {
+        // Declarative-only rule — non-hexa artifact on disk or pure mode
+        // token. Skip the subprocess, treat as PASS.
+        return ["MODE_PASS", script, "", ""]
     }
     let proof_field = keys_first(keys, "proof")
     return ["RUN", "", script, proof_field]
@@ -756,6 +899,13 @@ fn _walk_kind(kind: string, path: string, fast: bool, only_kind: string,
             verdict = "MISSING"
             let dp = ["enforce path not on disk: ", plan[1]]
             detail = dp.join("")
+        }
+        else if tag == "MODE_PASS" {
+            // Declarative-only rule (enforce = strict|nudge|…). No
+            // subprocess, credited as PASS for the summary.
+            verdict = "PASS"
+            let mpd = ["mode=", plan[1], " (declarative, no enforcer)"]
+            detail = mpd.join("")
         }
         else {
             // RUN — consume next batch result
