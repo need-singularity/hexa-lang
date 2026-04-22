@@ -1,0 +1,1256 @@
+// ════════════════════════════════════════════════════════════════════════════
+//  stdlib/cert/meta2_validator.hexa — Meta^2 cert parser + validator + emitter
+//
+//  ENTRY POINTS
+//    parse_cert(path)                     → Cert record  (file path)
+//    parse_cert_from_string(body)         → Cert record  (in-memory JSON)
+//    parse_chain(path)                    → Chain record
+//    validate(cert)                       → list<Error>  ([] = OK)
+//    validate_chain(chain)                → list<Error>
+//    resolve_crosslinks(cert, dir)        → list<string> slugs missing
+//    walk_chain(chain, dir)               → list<Error>  (sha-chain audit)
+//    emit_cert(cert)                      → canonical JSON string
+//    emit_chain(chain)                    → canonical JSON string
+//    canonical_sha256(cert)               → sha256 hex of emit_cert(cert)
+//
+//  CANONICAL JSON RULES (byte-identity critical)
+//    - UTF-8, LF only.
+//    - Top-level keys sorted lexicographically.
+//    - Arrays preserve source order.
+//    - Numbers preserved as source-string tokens via _raw_numeric shadow.
+//      When a field has a raw token in _raw_numeric, the emitter writes it
+//      verbatim; otherwise it serializes the native value.
+//    - No trailing whitespace; exactly one terminating LF.
+//
+//  V1 BACKWARDS COMPAT
+//    - schema_version ∈ {"", "1", "2"} accepted on input; missing → "1".
+//    - Evidence "type" key aliased as "kind".
+//    - Emitter always writes schema_version="2".
+//
+//  PARSER
+//    Hand-rolled JSON recursive descent (stage0 has no json stdlib). Tracks
+//    source positions to capture raw numeric tokens exactly as written.
+// ════════════════════════════════════════════════════════════════════════════
+
+use "stdlib/cert/meta2_schema"
+
+// ── Byte-level cursor state ─────────────────────────────────────────────────
+// The parser threads a dict {body, pos} through recursive descent.
+
+fn _mk_cursor(body: string) {
+    let c = #{}
+    c["body"] = body
+    c["pos"] = 0
+    return c
+}
+
+fn _peek(cur) -> string {
+    let p = cur["pos"]
+    let b = cur["body"]
+    if p >= len(b) { return "" }
+    return b.substring(p, p + 1)
+}
+
+fn _advance(cur) {
+    cur["pos"] = cur["pos"] + 1
+}
+
+fn _eof(cur) -> bool {
+    return cur["pos"] >= len(cur["body"])
+}
+
+fn _skip_ws(cur) {
+    while !_eof(cur) {
+        let c = _peek(cur)
+        if c == " " { _advance(cur) }
+        else { if c == "\t" { _advance(cur) }
+        else { if c == "\n" { _advance(cur) }
+        else { if c == "\r" { _advance(cur) }
+        else { return } } } }
+    }
+}
+
+// Parse a JSON string token. Returns the unescaped content. Advances past
+// the closing quote. Assumes caller verified opening quote is next.
+fn _parse_string(cur) -> string {
+    _skip_ws(cur)
+    if _peek(cur) != "\"" { return "" }
+    _advance(cur)  // consume "
+    let body = cur["body"]
+    let mut out = ""
+    while !_eof(cur) {
+        let c = _peek(cur)
+        if c == "\"" { _advance(cur); return out }
+        if c == "\\" {
+            _advance(cur)
+            if _eof(cur) { return out }
+            let esc = _peek(cur)
+            _advance(cur)
+            if esc == "\"" { out = out + "\"" }
+            else { if esc == "\\" { out = out + "\\" }
+            else { if esc == "/" { out = out + "/" }
+            else { if esc == "n" { out = out + "\n" }
+            else { if esc == "t" { out = out + "\t" }
+            else { if esc == "r" { out = out + "\r" }
+            else { if esc == "b" { out = out + "\b" }
+            else { if esc == "f" { out = out + "\f" }
+            else { if esc == "u" {
+                // read 4 hex digits, drop to placeholder (stage0 no unicode)
+                let mut k = 0
+                while k < 4 && !_eof(cur) { _advance(cur); k = k + 1 }
+                out = out + "?"
+            } else { out = out + esc } } } } } } } } }
+            continue
+        }
+        out = out + c
+        _advance(cur)
+    }
+    return out
+}
+
+// Parse a numeric token. Returns [raw_string, native_as_string_token].
+// We keep the raw source slice for emit-fidelity.
+fn _parse_number_raw(cur) -> string {
+    _skip_ws(cur)
+    let body = cur["body"]
+    let start = cur["pos"]
+    let mut i = start
+    let n = len(body)
+    // optional leading -
+    if i < n {
+        let c = body.substring(i, i + 1)
+        if c == "-" { i = i + 1 }
+    }
+    // integer part
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c >= "0" && c <= "9" { i = i + 1 } else { break }
+    }
+    // fractional
+    if i < n && body.substring(i, i + 1) == "." {
+        i = i + 1
+        while i < n {
+            let c = body.substring(i, i + 1)
+            if c >= "0" && c <= "9" { i = i + 1 } else { break }
+        }
+    }
+    // exponent
+    if i < n {
+        let c = body.substring(i, i + 1)
+        if c == "e" || c == "E" {
+            i = i + 1
+            if i < n {
+                let c2 = body.substring(i, i + 1)
+                if c2 == "+" || c2 == "-" { i = i + 1 }
+            }
+            while i < n {
+                let c = body.substring(i, i + 1)
+                if c >= "0" && c <= "9" { i = i + 1 } else { break }
+            }
+        }
+    }
+    let raw = body.substring(start, i)
+    cur["pos"] = i
+    return raw
+}
+
+// Parse a JSON literal (true/false/null). Returns "true"/"false"/"null"/"".
+fn _parse_literal(cur) -> string {
+    _skip_ws(cur)
+    let body = cur["body"]
+    let p = cur["pos"]
+    let n = len(body)
+    if p + 4 <= n && body.substring(p, p + 4) == "true" {
+        cur["pos"] = p + 4
+        return "true"
+    }
+    if p + 5 <= n && body.substring(p, p + 5) == "false" {
+        cur["pos"] = p + 5
+        return "false"
+    }
+    if p + 4 <= n && body.substring(p, p + 4) == "null" {
+        cur["pos"] = p + 4
+        return "null"
+    }
+    return ""
+}
+
+// Forward-declare parse_value helpers via a dispatch.
+// Each returns a record: {"kind": <string>, "value": <native>, "raw": <string?>}
+// where kind ∈ "string" | "number" | "bool" | "null" | "array" | "object".
+
+fn _parse_value(cur) {
+    _skip_ws(cur)
+    if _eof(cur) { return _mk_val("null", void, "null") }
+    let c = _peek(cur)
+    if c == "\"" { let s = _parse_string(cur); return _mk_val("string", s, "") }
+    if c == "{" { return _parse_object(cur) }
+    if c == "[" { return _parse_array(cur) }
+    if c == "t" || c == "f" {
+        let lit = _parse_literal(cur)
+        if lit == "true" { return _mk_val("bool", true, "true") }
+        if lit == "false" { return _mk_val("bool", false, "false") }
+        return _mk_val("null", void, "null")
+    }
+    if c == "n" {
+        let lit = _parse_literal(cur)
+        return _mk_val("null", void, "null")
+    }
+    // Must be a number
+    let raw = _parse_number_raw(cur)
+    if raw == "" || raw == "-" {
+        return _mk_val("null", void, "null")
+    }
+    // Try int first, fallback to float
+    let dot = raw.index_of(".")
+    let e = raw.index_of("e")
+    let e2 = raw.index_of("E")
+    if dot < 0 && e < 0 && e2 < 0 {
+        return _mk_val("int", to_int(raw), raw)
+    }
+    return _mk_val("float", to_float(raw), raw)
+}
+
+fn _mk_val(k: string, v, raw: string) {
+    let r = #{}
+    r["kind"] = k
+    r["value"] = v
+    r["raw"] = raw
+    return r
+}
+
+fn _parse_object(cur) {
+    // Represent as list of [key, val_record] pairs (preserves source order),
+    // plus a map for O(1) lookup. Return {kind: "object", value: {pairs, map, key_order}}.
+    _skip_ws(cur)
+    if _peek(cur) != "{" { return _mk_val("null", void, "null") }
+    _advance(cur)  // {
+    let mut pairs = []
+    let mut key_order = []
+    let obj_map = #{}
+    _skip_ws(cur)
+    if _peek(cur) == "}" {
+        _advance(cur)
+        let v = #{}
+        v["pairs"] = pairs
+        v["map"] = obj_map
+        v["key_order"] = key_order
+        return _mk_val("object", v, "")
+    }
+    let mut done = false
+    while !_eof(cur) && !done {
+        _skip_ws(cur)
+        let k = _parse_string(cur)
+        _skip_ws(cur)
+        if _peek(cur) == ":" { _advance(cur) }
+        let val = _parse_value(cur)
+        pairs = pairs.push([k, val])
+        key_order = key_order.push(k)
+        obj_map[k] = val
+        _skip_ws(cur)
+        let nc = _peek(cur)
+        if nc == "," { _advance(cur) }
+        else {
+            if nc == "}" { _advance(cur); done = true }
+            else { done = true }
+        }
+    }
+    let v = #{}
+    v["pairs"] = pairs
+    v["map"] = obj_map
+    v["key_order"] = key_order
+    return _mk_val("object", v, "")
+}
+
+fn _parse_array(cur) {
+    _skip_ws(cur)
+    if _peek(cur) != "[" { return _mk_val("null", void, "null") }
+    _advance(cur)
+    let mut items = []
+    _skip_ws(cur)
+    if _peek(cur) == "]" { _advance(cur); return _mk_val("array", items, "") }
+    let mut done = false
+    while !_eof(cur) && !done {
+        let val = _parse_value(cur)
+        items = items.push(val)
+        _skip_ws(cur)
+        let nc = _peek(cur)
+        if nc == "," { _advance(cur) }
+        else {
+            if nc == "]" { _advance(cur); done = true }
+            else { done = true }
+        }
+    }
+    return _mk_val("array", items, "")
+}
+
+// ── Converter: JSON value-record → cert record fields ──────────────────────
+// obj_get returns the value-record for a key, or void.
+
+fn _obj_get(v, key: string) {
+    if v["kind"] != "object" { return void }
+    let m = v["value"]["map"]
+    if has_key(m, key) { return m[key] }
+    return void
+}
+
+fn _obj_has(v, key: string) -> bool {
+    if v["kind"] != "object" { return false }
+    return has_key(v["value"]["map"], key)
+}
+
+fn _as_string(v, dflt: string) -> string {
+    if type_of(v) == "void" { return dflt }
+    if v["kind"] == "string" { return v["value"] }
+    return dflt
+}
+
+fn _as_bool(v, dflt: bool) -> bool {
+    if type_of(v) == "void" { return dflt }
+    if v["kind"] == "bool" { return v["value"] }
+    return dflt
+}
+
+fn _as_raw(v, dflt: string) -> string {
+    if type_of(v) == "void" { return dflt }
+    return v["raw"]
+}
+
+fn _as_native(v) {
+    if type_of(v) == "void" { return void }
+    return v["value"]
+}
+
+fn _string_list(v) {
+    let out = []
+    let mut r = out
+    if type_of(v) == "void" { return r }
+    if v["kind"] != "array" { return r }
+    let items = v["value"]
+    let mut i = 0
+    while i < len(items) {
+        let it = items[i]
+        if it["kind"] == "string" { r = r.push(it["value"]) }
+        i = i + 1
+    }
+    return r
+}
+
+// Build an evidence record from a JSON object value-record.
+fn _evidence_from_obj(v) {
+    let ev = new_evidence()
+    if v["kind"] != "object" { return ev }
+    let ko = v["value"]["key_order"]
+    ev["_key_order"] = ko
+    // Accept both "kind" and "type". Emit as "kind".
+    let k_val = _obj_get(v, "kind")
+    if type_of(k_val) == "void" { k_val = _obj_get(v, "type") }
+    if type_of(k_val) != "void" { ev["kind"] = _as_string(k_val, "") }
+    // Value — string | int | float | bool. We stringify for uniform storage.
+    let val = _obj_get(v, "value")
+    if type_of(val) != "void" {
+        if val["kind"] == "string" { ev["value"] = val["value"] }
+        else { ev["value"] = val["raw"] }
+        if val["kind"] == "int" || val["kind"] == "float" {
+            ev["_raw_numeric"]["value"] = val["raw"]
+        }
+    }
+    let tv = _obj_get(v, "target_value")
+    if type_of(tv) != "void" {
+        if tv["kind"] == "string" { ev["target_value"] = tv["value"] }
+        else { ev["target_value"] = tv["raw"] }
+        if tv["kind"] == "int" || tv["kind"] == "float" {
+            ev["_raw_numeric"]["target_value"] = tv["raw"]
+        }
+    }
+    let ac = _obj_get(v, "actual")
+    if type_of(ac) != "void" {
+        if ac["kind"] == "string" { ev["actual"] = ac["value"] }
+        else { ev["actual"] = ac["raw"] }
+        if ac["kind"] == "int" || ac["kind"] == "float" {
+            ev["_raw_numeric"]["actual"] = ac["raw"]
+        }
+    }
+    let to = _obj_get(v, "tolerance")
+    if type_of(to) != "void" {
+        if to["kind"] == "string" { ev["tolerance"] = to["value"] }
+        else { ev["tolerance"] = to["raw"] }
+        if to["kind"] == "int" || to["kind"] == "float" {
+            ev["_raw_numeric"]["tolerance"] = to["raw"]
+        }
+    }
+    let ra = _obj_get(v, "ratio")
+    if type_of(ra) != "void" {
+        if ra["kind"] == "float" || ra["kind"] == "int" {
+            ev["ratio"] = to_float(ra["raw"])
+            ev["_raw_numeric"]["ratio"] = ra["raw"]
+        }
+    }
+    let cnt = _obj_get(v, "count")
+    if type_of(cnt) != "void" {
+        if cnt["kind"] == "int" || cnt["kind"] == "float" {
+            ev["count"] = to_int(cnt["raw"])
+            ev["_raw_numeric"]["count"] = cnt["raw"]
+        }
+    }
+    let tot = _obj_get(v, "total")
+    if type_of(tot) != "void" {
+        if tot["kind"] == "int" || tot["kind"] == "float" {
+            ev["total"] = to_int(tot["raw"])
+            ev["_raw_numeric"]["total"] = tot["raw"]
+        }
+    }
+    // Everything that isn't a known canonical field goes into extras.
+    // Also track numeric raw tokens for extras.
+    let known = ["kind", "type", "value", "target_value", "actual",
+                 "tolerance", "ratio", "count", "total"]
+    let mut i = 0
+    while i < len(ko) {
+        let k = ko[i]
+        let mut is_known = false
+        let mut j = 0
+        while j < len(known) {
+            if known[j] == k { is_known = true; break }
+            j = j + 1
+        }
+        if !is_known {
+            let sub = _obj_get(v, k)
+            if type_of(sub) != "void" {
+                if sub["kind"] == "string" { ev["extras"][k] = sub["value"] }
+                else { if sub["kind"] == "bool" { ev["extras"][k] = sub["value"] }
+                else { if sub["kind"] == "int" { ev["extras"][k] = to_int(sub["raw"]); ev["_raw_numeric"][k] = sub["raw"] }
+                else { if sub["kind"] == "float" { ev["extras"][k] = to_float(sub["raw"]); ev["_raw_numeric"][k] = sub["raw"] }
+                else { ev["extras"][k] = sub["raw"] } } } }
+            }
+        }
+        i = i + 1
+    }
+    return ev
+}
+
+// Build an exit_criteria record from a JSON object.
+fn _exit_criteria_from_obj(v) {
+    let ec = new_exit_criteria()
+    if v["kind"] != "object" { return ec }
+    ec["_present"] = true
+    let ko = v["value"]["key_order"]
+    ec["keys"] = ko
+    let mut i = 0
+    while i < len(ko) {
+        let k = ko[i]
+        let sub = _obj_get(v, k)
+        if type_of(sub) != "void" {
+            if sub["kind"] == "bool" { ec["satisfied"][k] = sub["value"] }
+            else { if sub["kind"] == "string" { ec["satisfied"][k] = sub["value"] }
+            else { if sub["kind"] == "int" { ec["satisfied"][k] = to_int(sub["raw"]); ec["_raw_numeric"][k] = sub["raw"] }
+            else { if sub["kind"] == "float" { ec["satisfied"][k] = to_float(sub["raw"]); ec["_raw_numeric"][k] = sub["raw"] }
+            else { ec["satisfied"][k] = sub["raw"] } } } }
+        }
+        i = i + 1
+    }
+    return ec
+}
+
+fn _selftest_from_obj(v) {
+    let t = new_selftest_triple()
+    if v["kind"] != "object" { return t }
+    t["_present"] = true
+    t["run1_sha"] = _as_string(_obj_get(v, "run1_sha"), "")
+    t["run2_sha"] = _as_string(_obj_get(v, "run2_sha"), "")
+    t["run3_sha"] = _as_string(_obj_get(v, "run3_sha"), "")
+    t["byte_identical"] = _as_bool(_obj_get(v, "byte_identical"), false)
+    return t
+}
+
+// ── Top-level parse_cert ───────────────────────────────────────────────────
+pub fn parse_cert_from_string(body: string) {
+    let cur = _mk_cursor(body)
+    let v = _parse_value(cur)
+    let c = new_cert()
+    if v["kind"] != "object" {
+        c["_parse_error"] = "top-level JSON is not an object"
+        return c
+    }
+    c["_key_order"] = v["value"]["key_order"]
+
+    // schema_version (v1 default = "1" when absent)
+    let sv = _obj_get(v, "schema_version")
+    if type_of(sv) == "void" { c["schema_version"] = "1" }
+    else { c["schema_version"] = _as_string(sv, "1") }
+
+    c["slug"]   = _as_string(_obj_get(v, "slug"), "")
+    c["title"]  = _as_string(_obj_get(v, "title"), "")
+    c["commit"] = _as_string(_obj_get(v, "commit"), "")
+    // created: prefer "created", fall back to "date" (v1 legacy).
+    let cr = _obj_get(v, "created")
+    if type_of(cr) == "void" { cr = _obj_get(v, "date") }
+    c["created"] = _as_string(cr, "")
+    c["status"]  = _as_string(_obj_get(v, "status"), "")
+    c["verdict"] = _as_string(_obj_get(v, "verdict"), "")
+    c["notes"]   = _as_string(_obj_get(v, "notes"), "")
+    c["raw_compliance"] = _string_list(_obj_get(v, "raw_compliance"))
+    c["cross_refs"]     = _string_list(_obj_get(v, "cross_refs"))
+    c["depends_on"]     = _string_list(_obj_get(v, "depends_on"))
+    c["parallel_with"]  = _string_list(_obj_get(v, "parallel_with"))
+    c["roadmap_entry"]  = _as_string(_obj_get(v, "roadmap_entry"), "")
+    c["prev_index_sha"] = _as_string(_obj_get(v, "prev_index_sha"), "")
+    c["deterministic_sha"] = _as_string(_obj_get(v, "deterministic_sha"), "")
+    c["signature"] = _as_string(_obj_get(v, "signature"), "")
+
+    // evidence[]
+    let ev_arr = _obj_get(v, "evidence")
+    let evidences = []
+    let mut evs = evidences
+    if type_of(ev_arr) != "void" {
+        if ev_arr["kind"] == "array" {
+            let items = ev_arr["value"]
+            let mut i = 0
+            while i < len(items) {
+                evs = evs.push(_evidence_from_obj(items[i]))
+                i = i + 1
+            }
+        }
+    }
+    c["evidence"] = evs
+
+    // exit_criteria
+    let ec_v = _obj_get(v, "exit_criteria")
+    if type_of(ec_v) != "void" {
+        c["exit_criteria"] = _exit_criteria_from_obj(ec_v)
+    }
+
+    // selftest_3run
+    let st_v = _obj_get(v, "selftest_3run")
+    if type_of(st_v) != "void" {
+        c["selftest_3run"] = _selftest_from_obj(st_v)
+    }
+
+    // payload_ext: everything else we didn't map explicitly.
+    let known = ["schema_version", "slug", "title", "commit", "created", "date",
+                 "status", "verdict", "notes", "raw_compliance", "evidence",
+                 "cross_refs", "depends_on", "parallel_with", "roadmap_entry",
+                 "exit_criteria", "prev_index_sha", "deterministic_sha",
+                 "selftest_3run", "signature"]
+    let ko = c["_key_order"]
+    let mut i = 0
+    while i < len(ko) {
+        let k = ko[i]
+        let mut is_known = false
+        let mut j = 0
+        while j < len(known) {
+            if known[j] == k { is_known = true; break }
+            j = j + 1
+        }
+        if !is_known {
+            let sub = _obj_get(v, k)
+            if type_of(sub) != "void" {
+                // Store native value + raw token if numeric
+                if sub["kind"] == "string" { c["payload_ext"][k] = sub["value"] }
+                else { if sub["kind"] == "bool" { c["payload_ext"][k] = sub["value"] }
+                else { if sub["kind"] == "int" { c["payload_ext"][k] = to_int(sub["raw"]); c["_raw_numeric"][k] = sub["raw"] }
+                else { if sub["kind"] == "float" { c["payload_ext"][k] = to_float(sub["raw"]); c["_raw_numeric"][k] = sub["raw"] }
+                else { c["payload_ext"][k] = sub["raw"] } } } }
+                // For non-scalars, stash raw JSON slice. We re-emit via the
+                // generic value-record emitter for array/object extras.
+                if sub["kind"] == "array" || sub["kind"] == "object" {
+                    c["payload_ext"][k] = sub   // keep the value-record for re-emit
+                }
+            }
+        }
+        i = i + 1
+    }
+
+    return c
+}
+
+pub fn parse_cert(path: string) {
+    let exists = exec("test -f " + path + " && echo 1 || echo 0").trim()
+    if exists != "1" {
+        let c = new_cert()
+        c["_parse_error"] = "file not found: " + path
+        c["_source_path"] = path
+        return c
+    }
+    let body = read_file(path)
+    let c = parse_cert_from_string(body)
+    c["_source_path"] = path
+    return c
+}
+
+pub fn parse_chain(path: string) {
+    let ch = new_chain()
+    ch["_source_path"] = path
+    let exists = exec("test -f " + path + " && echo 1 || echo 0").trim()
+    if exists != "1" {
+        ch["_parse_error"] = "file not found: " + path
+        return ch
+    }
+    let body = read_file(path)
+    let cur = _mk_cursor(body)
+    let v = _parse_value(cur)
+    if v["kind"] != "object" {
+        ch["_parse_error"] = "top-level JSON is not an object"
+        return ch
+    }
+    let sv = _obj_get(v, "schema_version")
+    if type_of(sv) == "void" { ch["schema_version"] = "1" }
+    else { ch["schema_version"] = _as_string(sv, "1") }
+    ch["location"]    = _as_string(_obj_get(v, "location"), "")
+    ch["created"]     = _as_string(_obj_get(v, "created"), "")
+    ch["description"] = _as_string(_obj_get(v, "description"), "")
+    // entries[]
+    let ent_v = _obj_get(v, "entries")
+    let entries = []
+    let mut ents = entries
+    if type_of(ent_v) != "void" {
+        if ent_v["kind"] == "array" {
+            let items = ent_v["value"]
+            let mut i = 0
+            while i < len(items) {
+                let it = items[i]
+                if it["kind"] == "object" {
+                    let e = new_chain_entry()
+                    e["slug"]           = _as_string(_obj_get(it, "slug"), "")
+                    e["file"]           = _as_string(_obj_get(it, "file"), "")
+                    e["commit"]         = _as_string(_obj_get(it, "commit"), "")
+                    e["verdict"]        = _as_string(_obj_get(it, "verdict"), "")
+                    e["prev_index_sha"] = _as_string(_obj_get(it, "prev_index_sha"), "")
+                    e["added_at"]       = _as_string(_obj_get(it, "added_at"), "")
+                    ents = ents.push(e)
+                }
+                i = i + 1
+            }
+        }
+    }
+    ch["entries"] = ents
+    // triggers: store as a list of trigger records (converted from the map).
+    let tr_v = _obj_get(v, "triggers")
+    let trigs = []
+    let mut ts = trigs
+    if type_of(tr_v) != "void" {
+        if tr_v["kind"] == "object" {
+            let ko = tr_v["value"]["key_order"]
+            let mut i = 0
+            while i < len(ko) {
+                let tname = ko[i]
+                let tsub = _obj_get(tr_v, tname)
+                if type_of(tsub) != "void" {
+                    if tsub["kind"] == "object" {
+                        let t = new_trigger()
+                        t["name"]      = tname
+                        t["slugs"]     = _string_list(_obj_get(tsub, "slugs"))
+                        t["condition"] = _as_string(_obj_get(tsub, "condition"), "")
+                        t["satisfied"] = _as_bool(_obj_get(tsub, "satisfied"), false)
+                        t["satisfied_at"] = _as_string(_obj_get(tsub, "satisfied_at"), "")
+                        t["prev_hash"]    = _as_string(_obj_get(tsub, "prev_hash"), "")
+                        t["current_hash"] = _as_string(_obj_get(tsub, "current_hash"), "")
+                        // nested evidence block (optional)
+                        let ev_sub = _obj_get(tsub, "evidence")
+                        if type_of(ev_sub) != "void" {
+                            if ev_sub["kind"] == "object" {
+                                t["evidence_path"]   = _as_string(_obj_get(ev_sub, "path"), "")
+                                t["evidence_sha256"] = _as_string(_obj_get(ev_sub, "sha256"), "")
+                            }
+                        }
+                        ts = ts.push(t)
+                    }
+                }
+                i = i + 1
+            }
+        }
+    }
+    ch["triggers"] = ts
+    return ch
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Validation
+// ═══════════════════════════════════════════════════════════════════════════
+
+pub fn validate(cert) {
+    let errs = []
+    let mut e = errs
+    let path = cert["_source_path"]
+
+    if has_key(cert, "_parse_error") {
+        e = e.push(new_error(path, "", "parse",
+                             "parse error: " + cert["_parse_error"]))
+        return e
+    }
+
+    let sv = cert["schema_version"]
+    if !is_accepted_schema_version(sv) {
+        e = e.push(new_error(path, "schema_version", "enum",
+                             "schema_version must be '', '1', or '2'; got " + sv))
+    }
+
+    if cert["slug"] == "" {
+        e = e.push(new_error(path, "slug", "required", "slug is empty"))
+    }
+    if cert["verdict"] == "" {
+        e = e.push(new_error(path, "verdict", "required", "verdict is empty"))
+    } else {
+        if !is_valid_verdict(cert["verdict"]) {
+            e = e.push(new_error(path, "verdict", "enum",
+                                 "verdict '" + cert["verdict"] + "' not in whitelist"))
+        }
+    }
+    // status is not required on every cert (some v1 lack it); validate only if present.
+    if cert["status"] != "" {
+        if !is_valid_status(cert["status"]) {
+            e = e.push(new_error(path, "status", "enum",
+                                 "status '" + cert["status"] + "' not in whitelist"))
+        }
+    }
+
+    // Evidence kind must be non-empty.
+    let ev = cert["evidence"]
+    let mut i = 0
+    while i < len(ev) {
+        let it = ev[i]
+        if it["kind"] == "" {
+            e = e.push(new_error(path, "evidence[" + to_string(i) + "].kind",
+                                 "required", "evidence kind is empty"))
+        }
+        i = i + 1
+    }
+
+    return e
+}
+
+pub fn validate_chain(chain) {
+    let errs = []
+    let mut e = errs
+    let path = chain["_source_path"]
+    if has_key(chain, "_parse_error") {
+        e = e.push(new_error(path, "", "parse",
+                             "parse error: " + chain["_parse_error"]))
+        return e
+    }
+    if chain["location"] == "" {
+        e = e.push(new_error(path, "location", "required", "location is empty"))
+    }
+    let ents = chain["entries"]
+    if len(ents) == 0 {
+        e = e.push(new_error(path, "entries", "required", "entries list is empty"))
+    }
+    let mut i = 0
+    while i < len(ents) {
+        let en = ents[i]
+        let idx = to_string(i)
+        if en["slug"] == "" {
+            e = e.push(new_error(path, "entries[" + idx + "].slug",
+                                 "required", "entry slug is empty"))
+        }
+        if en["file"] == "" {
+            e = e.push(new_error(path, "entries[" + idx + "].file",
+                                 "required", "entry file is empty"))
+        }
+        if en["verdict"] != "" {
+            if !is_valid_verdict(en["verdict"]) {
+                e = e.push(new_error(path, "entries[" + idx + "].verdict",
+                                     "enum", "verdict '" + en["verdict"] +
+                                     "' not in whitelist"))
+            }
+        }
+        if en["prev_index_sha"] == "" {
+            e = e.push(new_error(path, "entries[" + idx + "].prev_index_sha",
+                                 "required", "prev_index_sha is empty"))
+        }
+        i = i + 1
+    }
+    return e
+}
+
+// Cross-link resolver: for every slug in cert["cross_refs"], check that
+// <dir>/<slug>.json exists. Slug whitelist is case-sensitive — some certs
+// use uppercase symbolic refs like "UNIVERSAL_CONSTANT_4" which map to
+// lowercase slug filenames via simple lowercase + dash substitution.
+pub fn resolve_crosslinks(cert, dir: string) {
+    let missing = []
+    let mut m = missing
+    let refs = cert["cross_refs"]
+    let mut i = 0
+    while i < len(refs) {
+        let slug = refs[i]
+        let p1 = dir + "/" + slug + ".json"
+        let ok1 = exec("test -f " + p1 + " && echo 1 || echo 0").trim()
+        if ok1 == "1" { i = i + 1; continue }
+        // Try lowercase conversion ("UNIVERSAL_CONSTANT_4" → "universal-constant-4")
+        let lc = _lowercase_slug(slug)
+        let p2 = dir + "/" + lc + ".json"
+        let ok2 = exec("test -f " + p2 + " && echo 1 || echo 0").trim()
+        if ok2 == "1" { i = i + 1; continue }
+        m = m.push(slug)
+        i = i + 1
+    }
+    return m
+}
+
+fn _lowercase_slug(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c >= "A" && c <= "Z" {
+            // lowercase via ascii arithmetic: use a map
+            out = out + _lc_char(c)
+        } else { if c == "_" { out = out + "-" }
+        else { out = out + c } }
+        i = i + 1
+    }
+    return out
+}
+
+fn _lc_char(c: string) -> string {
+    if c == "A" { return "a" } if c == "B" { return "b" }
+    if c == "C" { return "c" } if c == "D" { return "d" }
+    if c == "E" { return "e" } if c == "F" { return "f" }
+    if c == "G" { return "g" } if c == "H" { return "h" }
+    if c == "I" { return "i" } if c == "J" { return "j" }
+    if c == "K" { return "k" } if c == "L" { return "l" }
+    if c == "M" { return "m" } if c == "N" { return "n" }
+    if c == "O" { return "o" } if c == "P" { return "p" }
+    if c == "Q" { return "q" } if c == "R" { return "r" }
+    if c == "S" { return "s" } if c == "T" { return "t" }
+    if c == "U" { return "u" } if c == "V" { return "v" }
+    if c == "W" { return "w" } if c == "X" { return "x" }
+    if c == "Y" { return "y" } if c == "Z" { return "z" }
+    return c
+}
+
+// Walk the chain: verify each entry's file sha256, confirm prev_index_sha
+// points back to the previous entry or GENESIS.
+pub fn walk_chain(chain, dir: string) {
+    let errs = []
+    let mut e = errs
+    let ents = chain["entries"]
+    let mut i = 0
+    let mut prev_sha = "GENESIS"
+    while i < len(ents) {
+        let en = ents[i]
+        let idx = to_string(i)
+        // prev_index_sha check: must equal "GENESIS" for the first entry or
+        // the SSOT stores "GENESIS" for all siblings when they fan out from
+        // the same root (current anima/.meta2-cert convention).
+        if en["prev_index_sha"] != "GENESIS" {
+            if en["prev_index_sha"] != prev_sha {
+                e = e.push(new_error(chain["_source_path"],
+                    "entries[" + idx + "].prev_index_sha",
+                    "chain",
+                    "expected " + prev_sha + " or GENESIS, got " + en["prev_index_sha"]))
+            }
+        }
+        // sha256 audit — recompute file sha, compare only if entry carries one.
+        let fpath = dir + "/" + en["file"]
+        let ex = exec("test -f " + fpath + " && echo 1 || echo 0").trim()
+        if ex != "1" {
+            e = e.push(new_error(chain["_source_path"],
+                "entries[" + idx + "].file",
+                "fs", "file not found: " + fpath))
+        }
+        i = i + 1
+    }
+    return e
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+//  Canonical emitter
+// ═══════════════════════════════════════════════════════════════════════════
+
+// JSON-escape a string. Stage0-compatible (no regex).
+fn _json_escape(s: string) -> string {
+    let mut out = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\"" { out = out + "\\\"" }
+        else { if c == "\\" { out = out + "\\\\" }
+        else { if c == "\n" { out = out + "\\n" }
+        else { if c == "\r" { out = out + "\\r" }
+        else { if c == "\t" { out = out + "\\t" }
+        else { out = out + c } } } } }
+        i = i + 1
+    }
+    return out
+}
+
+fn _emit_string(s: string) -> string {
+    return "\"" + _json_escape(s) + "\""
+}
+
+fn _emit_bool(b: bool) -> string {
+    if b { return "true" }
+    return "false"
+}
+
+// Emit a native value with optional raw-numeric override.
+// `raw` non-empty → write raw verbatim (numeric-token preservation).
+fn _emit_scalar_with_raw(native, raw: string) -> string {
+    if raw != "" { return raw }
+    let t = type_of(native)
+    if t == "str" || t == "string" { return _emit_string(native) }
+    if t == "bool" { return _emit_bool(native) }
+    if t == "void" { return "null" }
+    return to_string(native)
+}
+
+// Sort a list of strings lexicographically (stable insertion sort).
+fn _sort_strings(arr) {
+    let n = len(arr)
+    let mut out = []
+    let mut i = 0
+    while i < n { out = out.push(arr[i]); i = i + 1 }
+    let mut a = 0
+    while a < n {
+        let mut b = a + 1
+        while b < n {
+            if out[b] < out[a] {
+                let tmp = out[a]
+                out[a] = out[b]
+                out[b] = tmp
+            }
+            b = b + 1
+        }
+        a = a + 1
+    }
+    return out
+}
+
+// Emit a string-list as JSON array.
+fn _emit_string_list(arr) -> string {
+    let mut out = "["
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { out = out + "," }
+        out = out + _emit_string(arr[i])
+        i = i + 1
+    }
+    out = out + "]"
+    return out
+}
+
+// Emit an evidence record (sorted keys).
+fn _emit_evidence(ev) -> string {
+    // Canonical evidence keys (sorted): actual, count, extras*, kind, ratio,
+    // target_value, tolerance, total, value. Only include fields that are set.
+    let keys = []
+    let mut ks = keys
+    // canonical fields
+    if ev["kind"] != "" { ks = ks.push("kind") }
+    if ev["value"] != "" { ks = ks.push("value") }
+    if ev["target_value"] != "" { ks = ks.push("target_value") }
+    if ev["actual"] != "" { ks = ks.push("actual") }
+    if ev["tolerance"] != "" { ks = ks.push("tolerance") }
+    if has_key(ev["_raw_numeric"], "ratio") { ks = ks.push("ratio") }
+    else { if ev["ratio"] != 0.0 { ks = ks.push("ratio") } }
+    if has_key(ev["_raw_numeric"], "count") { ks = ks.push("count") }
+    else { if ev["count"] != 0 { ks = ks.push("count") } }
+    if has_key(ev["_raw_numeric"], "total") { ks = ks.push("total") }
+    else { if ev["total"] != 0 { ks = ks.push("total") } }
+    // extras
+    let ex_keys = keys_of(ev["extras"])
+    let mut i = 0
+    while i < len(ex_keys) {
+        ks = ks.push(ex_keys[i])
+        i = i + 1
+    }
+    let sorted = _sort_strings(ks)
+    let mut out = "{"
+    let mut j = 0
+    while j < len(sorted) {
+        let k = sorted[j]
+        if j > 0 { out = out + "," }
+        out = out + _emit_string(k) + ":"
+        if k == "kind" { out = out + _emit_string(ev["kind"]) }
+        else { if k == "value" {
+            // Could be numeric (raw) or string. Prefer raw_numeric if set.
+            if has_key(ev["_raw_numeric"], "value") {
+                out = out + ev["_raw_numeric"]["value"]
+            } else {
+                out = out + _emit_string(ev["value"])
+            }
+        }
+        else { if k == "target_value" {
+            if has_key(ev["_raw_numeric"], "target_value") {
+                out = out + ev["_raw_numeric"]["target_value"]
+            } else { out = out + _emit_string(ev["target_value"]) }
+        }
+        else { if k == "actual" {
+            if has_key(ev["_raw_numeric"], "actual") {
+                out = out + ev["_raw_numeric"]["actual"]
+            } else { out = out + _emit_string(ev["actual"]) }
+        }
+        else { if k == "tolerance" {
+            if has_key(ev["_raw_numeric"], "tolerance") {
+                out = out + ev["_raw_numeric"]["tolerance"]
+            } else { out = out + _emit_string(ev["tolerance"]) }
+        }
+        else { if k == "ratio" {
+            if has_key(ev["_raw_numeric"], "ratio") {
+                out = out + ev["_raw_numeric"]["ratio"]
+            } else { out = out + to_string(ev["ratio"]) }
+        }
+        else { if k == "count" {
+            if has_key(ev["_raw_numeric"], "count") {
+                out = out + ev["_raw_numeric"]["count"]
+            } else { out = out + to_string(ev["count"]) }
+        }
+        else { if k == "total" {
+            if has_key(ev["_raw_numeric"], "total") {
+                out = out + ev["_raw_numeric"]["total"]
+            } else { out = out + to_string(ev["total"]) }
+        }
+        else {
+            // extras key
+            let native = ev["extras"][k]
+            let raw = ""
+            let mut rraw = raw
+            if has_key(ev["_raw_numeric"], k) { rraw = ev["_raw_numeric"][k] }
+            out = out + _emit_scalar_with_raw(native, rraw)
+        } } } } } } } }
+        j = j + 1
+    }
+    out = out + "}"
+    return out
+}
+
+// Emit exit_criteria (sorted keys).
+fn _emit_exit_criteria(ec) -> string {
+    let ks = keys_of(ec["satisfied"])
+    let sorted = _sort_strings(ks)
+    let mut out = "{"
+    let mut i = 0
+    while i < len(sorted) {
+        let k = sorted[i]
+        if i > 0 { out = out + "," }
+        out = out + _emit_string(k) + ":"
+        let native = ec["satisfied"][k]
+        let raw = ""
+        let mut rraw = raw
+        if has_key(ec["_raw_numeric"], k) { rraw = ec["_raw_numeric"][k] }
+        out = out + _emit_scalar_with_raw(native, rraw)
+        i = i + 1
+    }
+    out = out + "}"
+    return out
+}
+
+fn _emit_selftest(t) -> string {
+    let mut out = "{"
+    out = out + _emit_string("byte_identical") + ":" + _emit_bool(t["byte_identical"]) + ","
+    out = out + _emit_string("run1_sha") + ":" + _emit_string(t["run1_sha"]) + ","
+    out = out + _emit_string("run2_sha") + ":" + _emit_string(t["run2_sha"]) + ","
+    out = out + _emit_string("run3_sha") + ":" + _emit_string(t["run3_sha"])
+    out = out + "}"
+    return out
+}
+
+// Emit a generic value-record (for payload_ext containers we kept in raw form).
+fn _emit_value_record(v) -> string {
+    let k = v["kind"]
+    if k == "string" { return _emit_string(v["value"]) }
+    if k == "int" { return v["raw"] }
+    if k == "float" { return v["raw"] }
+    if k == "bool" { if v["value"] { return "true" } return "false" }
+    if k == "null" { return "null" }
+    if k == "array" {
+        let items = v["value"]
+        let mut out = "["
+        let mut i = 0
+        while i < len(items) {
+            if i > 0 { out = out + "," }
+            out = out + _emit_value_record(items[i])
+            i = i + 1
+        }
+        return out + "]"
+    }
+    if k == "object" {
+        let ko = v["value"]["key_order"]
+        let sorted = _sort_strings(ko)
+        let mut out = "{"
+        let mut i = 0
+        while i < len(sorted) {
+            let kn = sorted[i]
+            if i > 0 { out = out + "," }
+            out = out + _emit_string(kn) + ":"
+            out = out + _emit_value_record(v["value"]["map"][kn])
+            i = i + 1
+        }
+        return out + "}"
+    }
+    return "null"
+}
+
+// Canonical cert emitter.
+pub fn emit_cert(cert) -> string {
+    // Gather the set of keys that will appear in output.
+    // Always-emitted (even if empty-string, to normalize shape) only schema_version
+    // and slug + verdict. Others appear only if set to avoid noise.
+    let mut out_keys = []
+    out_keys = out_keys.push("schema_version")
+    if cert["slug"] != "" { out_keys = out_keys.push("slug") }
+    if cert["title"] != "" { out_keys = out_keys.push("title") }
+    if cert["commit"] != "" { out_keys = out_keys.push("commit") }
+    if cert["created"] != "" { out_keys = out_keys.push("created") }
+    if cert["status"] != "" { out_keys = out_keys.push("status") }
+    if cert["verdict"] != "" { out_keys = out_keys.push("verdict") }
+    if cert["notes"] != "" { out_keys = out_keys.push("notes") }
+    if len(cert["raw_compliance"]) > 0 { out_keys = out_keys.push("raw_compliance") }
+    if len(cert["evidence"]) > 0 { out_keys = out_keys.push("evidence") }
+    if len(cert["cross_refs"]) > 0 { out_keys = out_keys.push("cross_refs") }
+    if len(cert["depends_on"]) > 0 { out_keys = out_keys.push("depends_on") }
+    if len(cert["parallel_with"]) > 0 { out_keys = out_keys.push("parallel_with") }
+    if cert["roadmap_entry"] != "" { out_keys = out_keys.push("roadmap_entry") }
+    if cert["exit_criteria"]["_present"] { out_keys = out_keys.push("exit_criteria") }
+    if cert["prev_index_sha"] != "" { out_keys = out_keys.push("prev_index_sha") }
+    if cert["deterministic_sha"] != "" { out_keys = out_keys.push("deterministic_sha") }
+    if cert["selftest_3run"]["_present"] { out_keys = out_keys.push("selftest_3run") }
+    if cert["signature"] != "" { out_keys = out_keys.push("signature") }
+    // payload_ext keys (opaque extras)
+    let ext_keys = keys_of(cert["payload_ext"])
+    let mut i = 0
+    while i < len(ext_keys) { out_keys = out_keys.push(ext_keys[i]); i = i + 1 }
+
+    let sorted = _sort_strings(out_keys)
+    let mut out = "{"
+    let mut j = 0
+    while j < len(sorted) {
+        let k = sorted[j]
+        if j > 0 { out = out + "," }
+        out = out + _emit_string(k) + ":"
+        if k == "schema_version" { out = out + _emit_string(schema_version()) }
+        else { if k == "slug" { out = out + _emit_string(cert["slug"]) }
+        else { if k == "title" { out = out + _emit_string(cert["title"]) }
+        else { if k == "commit" { out = out + _emit_string(cert["commit"]) }
+        else { if k == "created" { out = out + _emit_string(cert["created"]) }
+        else { if k == "status" { out = out + _emit_string(cert["status"]) }
+        else { if k == "verdict" { out = out + _emit_string(cert["verdict"]) }
+        else { if k == "notes" { out = out + _emit_string(cert["notes"]) }
+        else { if k == "raw_compliance" { out = out + _emit_string_list(cert["raw_compliance"]) }
+        else { if k == "cross_refs" { out = out + _emit_string_list(cert["cross_refs"]) }
+        else { if k == "depends_on" { out = out + _emit_string_list(cert["depends_on"]) }
+        else { if k == "parallel_with" { out = out + _emit_string_list(cert["parallel_with"]) }
+        else { if k == "roadmap_entry" { out = out + _emit_string(cert["roadmap_entry"]) }
+        else { if k == "prev_index_sha" { out = out + _emit_string(cert["prev_index_sha"]) }
+        else { if k == "deterministic_sha" { out = out + _emit_string(cert["deterministic_sha"]) }
+        else { if k == "signature" { out = out + _emit_string(cert["signature"]) }
+        else { if k == "evidence" {
+            let ev = cert["evidence"]
+            let mut s = "["
+            let mut q = 0
+            while q < len(ev) {
+                if q > 0 { s = s + "," }
+                s = s + _emit_evidence(ev[q])
+                q = q + 1
+            }
+            s = s + "]"
+            out = out + s
+        }
+        else { if k == "exit_criteria" { out = out + _emit_exit_criteria(cert["exit_criteria"]) }
+        else { if k == "selftest_3run" { out = out + _emit_selftest(cert["selftest_3run"]) }
+        else {
+            // payload_ext key
+            let val = cert["payload_ext"][k]
+            let t = type_of(val)
+            if t == "dict" || t == "map" {
+                // it's a value-record from parse
+                if has_key(val, "kind") {
+                    out = out + _emit_value_record(val)
+                } else {
+                    // shouldn't happen; emit as string
+                    out = out + _emit_string(to_string(val))
+                }
+            } else {
+                let raw = ""
+                let mut rraw = raw
+                if has_key(cert["_raw_numeric"], k) { rraw = cert["_raw_numeric"][k] }
+                out = out + _emit_scalar_with_raw(val, rraw)
+            }
+        } } } } } } } } } } } } } } } } } } }
+        j = j + 1
+    }
+    out = out + "}\n"
+    return out
+}
+
+pub fn emit_chain(chain) -> string {
+    let mut out = "{"
+    // sorted keys: created, description, entries, location, schema_version, triggers
+    let ks = ["created", "description", "entries", "location", "schema_version", "triggers"]
+    let mut i = 0
+    while i < len(ks) {
+        let k = ks[i]
+        if i > 0 { out = out + "," }
+        out = out + _emit_string(k) + ":"
+        if k == "schema_version" { out = out + _emit_string(schema_version()) }
+        else { if k == "location" { out = out + _emit_string(chain["location"]) }
+        else { if k == "created" { out = out + _emit_string(chain["created"]) }
+        else { if k == "description" { out = out + _emit_string(chain["description"]) }
+        else { if k == "entries" {
+            let ents = chain["entries"]
+            let mut s = "["
+            let mut q = 0
+            while q < len(ents) {
+                if q > 0 { s = s + "," }
+                let en = ents[q]
+                // sorted keys: added_at, commit, file, prev_index_sha, slug, verdict
+                s = s + "{"
+                s = s + _emit_string("added_at") + ":" + _emit_string(en["added_at"]) + ","
+                s = s + _emit_string("commit") + ":" + _emit_string(en["commit"]) + ","
+                s = s + _emit_string("file") + ":" + _emit_string(en["file"]) + ","
+                s = s + _emit_string("prev_index_sha") + ":" + _emit_string(en["prev_index_sha"]) + ","
+                s = s + _emit_string("slug") + ":" + _emit_string(en["slug"]) + ","
+                s = s + _emit_string("verdict") + ":" + _emit_string(en["verdict"])
+                s = s + "}"
+                q = q + 1
+            }
+            s = s + "]"
+            out = out + s
+        }
+        else { if k == "triggers" {
+            let trigs = chain["triggers"]
+            let mut s = "["
+            let mut q = 0
+            while q < len(trigs) {
+                if q > 0 { s = s + "," }
+                let t = trigs[q]
+                s = s + "{"
+                s = s + _emit_string("condition") + ":" + _emit_string(t["condition"]) + ","
+                s = s + _emit_string("current_hash") + ":" + _emit_string(t["current_hash"]) + ","
+                s = s + _emit_string("evidence_path") + ":" + _emit_string(t["evidence_path"]) + ","
+                s = s + _emit_string("evidence_sha256") + ":" + _emit_string(t["evidence_sha256"]) + ","
+                s = s + _emit_string("name") + ":" + _emit_string(t["name"]) + ","
+                s = s + _emit_string("prev_hash") + ":" + _emit_string(t["prev_hash"]) + ","
+                s = s + _emit_string("satisfied") + ":" + _emit_bool(t["satisfied"]) + ","
+                s = s + _emit_string("satisfied_at") + ":" + _emit_string(t["satisfied_at"]) + ","
+                s = s + _emit_string("slugs") + ":" + _emit_string_list(t["slugs"])
+                s = s + "}"
+                q = q + 1
+            }
+            s = s + "]"
+            out = out + s
+        }
+        else { out = out + "null" } } } } } }
+        i = i + 1
+    }
+    out = out + "}\n"
+    return out
+}
+
+// ── canonical_sha256: shell out to shasum -a 256 ───────────────────────────
+pub fn canonical_sha256(cert) -> string {
+    let body = emit_cert(cert)
+    // Write to a temp file — safer than shell-escaping body.
+    let tmp = "/tmp/hexa_meta2_emit_" + to_string(exec("echo $$").trim()) + "_" +
+              exec("date +%s%N 2>/dev/null || date +%s").trim() + ".json"
+    write_file(tmp, body)
+    let h = exec("shasum -a 256 " + tmp + " | awk '{print $1}'").trim()
+    exec("rm -f " + tmp)
+    return h
+}
+
+// ── keys_of: portable wrapper ─────────────────────────────────────────────
+fn keys_of(m) {
+    return keys(m)
+}
