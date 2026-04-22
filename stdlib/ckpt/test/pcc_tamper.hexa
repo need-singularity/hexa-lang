@@ -1,0 +1,212 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  stdlib/ckpt/test/pcc_tamper.hexa — five distinct tamper scenarios
+//
+//  Produces a good .pcc, then for each of the five tamper classes:
+//    1. copies the good file,
+//    2. flips / overwrites the minimum bytes needed to trigger *only* the
+//       target error code,
+//    3. re-verifies and asserts the returned code matches the expected one.
+//
+//  CODE → MUTATION  (every test is a ONE-BYTE change except tamper 4, which
+//                    swaps a 20-byte dir-entry tuple with another)
+//    ERR_MAGIC_MISMATCH       flip byte 0 ("H" → 0xFF)
+//    ERR_HEADER_CORRUPT       overwrite version field with 0xFFFF
+//                             (also: any wrong file size would trip this)
+//    ERR_CHUNK_HASH_MISMATCH  flip one byte in the middle of chunk 2
+//                             (payload_start + 2*chunk_sz + 5)
+//    ERR_MERKLE_MISMATCH      swap dir[1] and dir[2] — each declared
+//                             xxh64 still matches the chunk its entry now
+//                             points at (the whole tuple moved), but the
+//                             leaf order fed to the Merkle tree changes →
+//                             root differs.
+//    ERR_CERT_SIG_INVALID     replace the first byte of the CERT block
+//                             with '[' so JSON top-level-object check fails.
+//
+//  Run:
+//      ./hexa run stdlib/ckpt/test/pcc_tamper.hexa
+//  Exits 0 on success, 1 on any failure.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use "stdlib/ckpt/writer"
+use "stdlib/ckpt/verifier"
+use "stdlib/ckpt/format"
+
+fn _gen_payload(n) {
+    // .push avoids the O(n²) cost of `arr + [byte]` in a loop.
+    let mut out = []
+    let mut s = 0x12345678
+    let mut i = 0
+    while i < n {
+        s = (s * 1103515245 + 12345) & 0x7FFFFFFF
+        out.push((s / 0x10000) & 0xFF)
+        i = i + 1
+    }
+    return out
+}
+
+// Copy `src_path` to `dst_path` using read_file_bytes + write_bytes —
+// pure binary copy, survives nulls.
+fn _copy(src_path, dst_path) {
+    let bs = read_file_bytes(src_path)
+    write_bytes(dst_path, bs)
+}
+
+// Mutate one byte at `off` in `path` to `new_val` (0..255). Rewrites the
+// whole file — fine at test scales. Returns true on success.
+fn _mutate_byte(path, off, new_val) {
+    let bs = read_file_bytes(path)
+    if off < 0 || off >= len(bs) { return false }
+    bs[off] = new_val & 0xFF
+    return write_bytes(path, bs)
+}
+
+// Write a specific byte sequence at `off`.
+fn _mutate_range(path, off, new_bytes) {
+    let bs = read_file_bytes(path)
+    let n = len(new_bytes)
+    if off < 0 || off + n > len(bs) { return false }
+    let mut i = 0
+    while i < n {
+        bs[off + i] = new_bytes[i] & 0xFF
+        i = i + 1
+    }
+    return write_bytes(path, bs)
+}
+
+// Swap two chunk-directory entries (each pcc_dir_entry_size bytes) at
+// `path`. `idx_a` and `idx_b` are directory indices. Needed for the
+// Merkle-mismatch test — swapping leaf order changes the tree root but
+// leaves every chunk's hash still matching its (now relocated) directory
+// entry's declared xxh64 (because each entry also moved), so
+// ERR_CHUNK_HASH_MISMATCH does NOT trigger. Only the Merkle check
+// catches the tampering.
+//
+// Note: after swap, both directory entries still point to their *original*
+// chunk locations — because we swap the entry tuples wholesale, the
+// (offset, len, xxh64) triples move together. chunk data at physical
+// offset X still has the hash it always had; directory[i] now describes
+// what used to be directory[j]'s chunk. Re-hashing that chunk at the
+// new entry's declared offset yields the still-matching old hash. Merkle
+// leaves order = directory order, so root mutates. ✓
+fn _swap_dir_entries(path, dir_base_off, idx_a, idx_b) {
+    let bs = read_file_bytes(path)
+    let es = pcc_dir_entry_size()
+    let off_a = dir_base_off + idx_a * es
+    let off_b = dir_base_off + idx_b * es
+    let mut i = 0
+    while i < es {
+        let tmp = bs[off_a + i] & 0xFF
+        bs[off_a + i] = bs[off_b + i] & 0xFF
+        bs[off_b + i] = tmp
+        i = i + 1
+    }
+    return write_bytes(path, bs)
+}
+
+fn _assert_code(label, got_code, want_code, tracker) {
+    if got_code == want_code {
+        println("  PASS " + label + " — " + got_code)
+        tracker["pass"] = tracker["pass"] + 1
+    } else {
+        println("  FAIL " + label + " — want " + want_code + " got " + got_code)
+        tracker["fail"] = tracker["fail"] + 1
+    }
+}
+
+fn main() {
+    let pid = exec("echo $$").trim()
+    let good = "/tmp/hexa_pcc_tamper_good_" + pid + ".pcc"
+
+    // 7 chunks × 256 B = 1792 B — odd chunk count exercises the
+    // duplicate-last Merkle level; 256 B keeps the interpreter happy.
+    let chunk_sz = 256
+    let n_chunks = 7
+    let payload = _gen_payload(chunk_sz * n_chunks)
+    let cert_json = "{\"schema_version\":\"2\",\"slug\":\"pcc_tamper_fixture\",\"verdict\":\"VERIFIED\"}\n"
+
+    let opts = #{}
+    opts["chunk_size"] = chunk_sz
+    let w = write_pcc(good, payload, cert_json, opts)
+    if !w["ok"] {
+        println("FAIL: baseline write_pcc did not succeed")
+        exit(1)
+    }
+
+    // Sanity: baseline verifies clean.
+    let v0 = verify_pcc(good)
+    if !v0["ok"] {
+        println("FAIL: baseline verify returned " + v0["code"] + " — " + v0["reason"])
+        exit(1)
+    }
+
+    let tracker = #{}
+    tracker["pass"] = 0
+    tracker["fail"] = 0
+
+    // Layout offsets we need (mirrors verifier.hexa):
+    let cert_block_len = len(cert_json)
+    let header_end     = pcc_header_size()                 // 36
+    let cert_end       = header_end + cert_block_len
+    let dir_base_off   = cert_end
+    let payload_start  = cert_end + n_chunks * pcc_dir_entry_size()
+
+    // ── 1. ERR_MAGIC_MISMATCH — flip byte 0 of MAGIC_HEAD ────────────────
+    let p1 = "/tmp/hexa_pcc_tamper_magic_" + pid + ".pcc"
+    _copy(good, p1)
+    _mutate_byte(p1, 0, 0xFF)
+    let v1 = verify_pcc(p1)
+    _assert_code("tamper 1 MAGIC", v1["code"], err_magic_mismatch(), tracker)
+
+    // ── 2. ERR_HEADER_CORRUPT — set version u16 to 0xFFFF (offset 8-9) ──
+    let p2 = "/tmp/hexa_pcc_tamper_header_" + pid + ".pcc"
+    _copy(good, p2)
+    _mutate_range(p2, 8, [0xFF, 0xFF])
+    let v2 = verify_pcc(p2)
+    _assert_code("tamper 2 HEADER", v2["code"], err_header_corrupt(), tracker)
+
+    // ── 3. ERR_CHUNK_HASH_MISMATCH — flip one byte mid-chunk-2 ───────────
+    //  Chunk 2 starts at payload_start + 2*chunk_sz. Flipping byte
+    //  payload_start + 2*chunk_sz + 5 modifies chunk 2's content but
+    //  leaves its declared xxh64 in the directory unchanged.
+    let p3 = "/tmp/hexa_pcc_tamper_chunk_" + pid + ".pcc"
+    _copy(good, p3)
+    let off3 = payload_start + 2 * chunk_sz + 5
+    // Flip to whatever value differs — xor with 0xFF.
+    let cur_bs = read_file_bytes(p3)
+    let new_v = (cur_bs[off3] ^ 0xFF) & 0xFF
+    _mutate_byte(p3, off3, new_v)
+    let v3 = verify_pcc(p3)
+    _assert_code("tamper 3 CHUNK", v3["code"], err_chunk_hash_mismatch(), tracker)
+
+    // ── 4. ERR_MERKLE_MISMATCH — swap chunk directory entries 1 and 2 ───
+    //  Both entries move wholesale (offset+len+xxh64), so each declared
+    //  xxh64 still matches the chunk its entry now points at. But the
+    //  leaf order fed to the Merkle tree changes → root differs.
+    let p4 = "/tmp/hexa_pcc_tamper_merkle_" + pid + ".pcc"
+    _copy(good, p4)
+    _swap_dir_entries(p4, dir_base_off, 1, 2)
+    let v4 = verify_pcc(p4)
+    _assert_code("tamper 4 MERKLE", v4["code"], err_merkle_mismatch(), tracker)
+
+    // ── 5. ERR_CERT_SIG_INVALID — replace first cert-block byte with '[' ─
+    //  The cert block begins at offset header_end. Overwriting the first
+    //  byte (which is '{' in the good file) with '[' turns the top-level
+    //  JSON into an array → parser fails top-level object check → error.
+    let p5 = "/tmp/hexa_pcc_tamper_cert_" + pid + ".pcc"
+    _copy(good, p5)
+    _mutate_byte(p5, header_end, 0x5B)   // '['
+    let v5 = verify_pcc(p5)
+    _assert_code("tamper 5 CERT", v5["code"], err_cert_sig_invalid(), tracker)
+
+    // ── Cleanup ───────────────────────────────────────────────────────────
+    exec("rm -f " + good + " " + p1 + " " + p2 + " " + p3 + " " + p4 + " " + p5)
+
+    let pass = tracker["pass"]
+    let fail = tracker["fail"]
+    if fail == 0 {
+        println("PASS: pcc tamper " + to_string(pass) + "/5")
+        return 0
+    }
+    println("FAIL: pcc tamper " + to_string(pass) + "/5")
+    exit(1)
+}

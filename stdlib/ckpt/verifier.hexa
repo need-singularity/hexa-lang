@@ -1,0 +1,229 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  stdlib/ckpt/verifier.hexa — load-time tamper-aware .pcc verification
+//
+//  PUBLIC API
+//    verify_pcc(path) -> dict
+//      path    : .pcc file
+//      returns : dict {
+//          "ok": bool, "code": str, "reason": str,
+//          "cert_json": str (when parseable; "" otherwise),
+//          "payload": array<int> (when ok; [] otherwise),
+//          "merkle_root": [hi, lo],
+//          "chunk_count": int, "payload_len": int
+//        }
+//
+//  FIVE TAMPER CODES — DISTINCT BY DESIGN
+//      ERR_MAGIC_MISMATCH     MAGIC differs at offset 0 or in trailer
+//      ERR_HEADER_CORRUPT     header fields run past file size, version
+//                             unknown, or chunk_size * chunk_count < payload_len
+//      ERR_CHUNK_HASH_MISMATCH  re-hashed chunk ≠ directory xxh64
+//      ERR_MERKLE_MISMATCH    chunk hashes match but reconstructed root
+//                             ≠ trailer's declared merkle_root
+//      ERR_CERT_SIG_INVALID   CERT block fails to parse OR validate OR the
+//                             cert's verdict is not a PASS-class value
+//                             (delegates to stdlib/cert/meta2_validator).
+//
+//  ORDERING
+//    The checks MUST execute in the order above: a tampered byte in one
+//    region should not cascade into a distant error code. For example, a
+//    flipped byte in the payload only manifests as chunk-hash mismatch
+//    even though the Merkle root derived from those leaves is also
+//    "wrong" — we never get that far because chunk hashing fails first.
+// ═══════════════════════════════════════════════════════════════════════════
+
+use "stdlib/hash/xxhash"
+use "stdlib/ckpt/format"
+use "stdlib/ckpt/merkle"
+use "stdlib/cert/meta2_validator"
+
+fn _mk_result(ok: bool, code: string, reason: string) {
+    let r = #{}
+    r["ok"] = ok
+    r["code"] = code
+    r["reason"] = reason
+    r["cert_json"] = ""
+    r["payload"] = []
+    r["merkle_root"] = [0, 0]
+    r["chunk_count"] = 0
+    r["payload_len"] = 0
+    return r
+}
+
+// Collapse a u64 [hi,lo] pair into a stage0 int where possible (for sizes
+// < 2^31 — beyond that we switch to float fallback, but all our tests stay
+// safely under).
+fn _u64_to_int(pair) {
+    // pair is [hi, lo]; both are int (u32). For payloads < 2 GiB, hi == 0
+    // and we return lo directly. For larger files we fall back to hi*2^32 +
+    // lo; stage0 ints are i63 so this stays precise up to ~9.2 EiB.
+    let hi = pair[0] & 0xFFFFFFFF
+    let lo = pair[1] & 0xFFFFFFFF
+    if hi == 0 { return lo }
+    return hi * 0x100000000 + lo
+}
+
+pub fn verify_pcc(path: string) {
+    if !file_exists(path) {
+        return _mk_result(false, err_magic_mismatch(), "file not found: " + path)
+    }
+    let buf = read_file_bytes(path)
+    let total_bytes = len(buf)
+
+    // ── 1. MAGIC at offset 0 ──────────────────────────────────────────────
+    if total_bytes < pcc_header_size() {
+        return _mk_result(false, err_magic_mismatch(),
+            "file too short for header (" + to_string(total_bytes) + " < " +
+            to_string(pcc_header_size()) + ")")
+    }
+    let h = decode_header(buf)
+    if !h["magic_ok"] {
+        return _mk_result(false, err_magic_mismatch(), "HEAD magic mismatch")
+    }
+
+    // ── 2. Header structural sanity ──────────────────────────────────────
+    if h["version"] != pcc_version() {
+        return _mk_result(false, err_header_corrupt(),
+            "unknown version: " + to_string(h["version"]))
+    }
+    let chunk_count_64 = h["chunk_count"]
+    let payload_len_64 = h["payload_len"]
+    let chunk_count = _u64_to_int(chunk_count_64)
+    let payload_len = _u64_to_int(payload_len_64)
+    let cert_block_len = h["cert_block_len"]
+    let chunk_size = h["chunk_size"]
+    if chunk_size <= 0 {
+        return _mk_result(false, err_header_corrupt(),
+            "non-positive chunk_size: " + to_string(chunk_size))
+    }
+    if cert_block_len < 0 {
+        return _mk_result(false, err_header_corrupt(),
+            "negative cert_block_len")
+    }
+    // Consistency: if chunk_count > 0 then (chunk_count - 1) * chunk_size
+    // must be strictly less than payload_len, AND chunk_count * chunk_size
+    // must be >= payload_len. Otherwise the declared counts contradict.
+    if chunk_count > 0 {
+        let upper = chunk_count * chunk_size
+        let lower = (chunk_count - 1) * chunk_size
+        if upper < payload_len {
+            return _mk_result(false, err_header_corrupt(),
+                "chunk_count*chunk_size < payload_len")
+        }
+        if lower >= payload_len {
+            return _mk_result(false, err_header_corrupt(),
+                "(chunk_count-1)*chunk_size >= payload_len — count too large")
+        }
+    } else {
+        if payload_len != 0 {
+            return _mk_result(false, err_header_corrupt(),
+                "chunk_count=0 but payload_len>0")
+        }
+    }
+    // Layout spans must fit within the file.
+    let header_end = pcc_header_size()
+    let cert_end   = header_end + cert_block_len
+    let dir_size   = chunk_count * pcc_dir_entry_size()
+    let dir_end    = cert_end + dir_size
+    let payload_start = dir_end
+    let payload_end   = payload_start + payload_len
+    let trailer_start = payload_end
+    let expected_total = trailer_start + pcc_trailer_size()
+    if expected_total != total_bytes {
+        return _mk_result(false, err_header_corrupt(),
+            "expected total=" + to_string(expected_total) +
+            " but file=" + to_string(total_bytes))
+    }
+
+    // ── Trailer: MAGIC_TAIL + total_len ──────────────────────────────────
+    let tr = decode_trailer(buf)
+    if !tr["valid"] {
+        return _mk_result(false, err_magic_mismatch(), "trailer too short")
+    }
+    if !tr["magic_ok"] {
+        return _mk_result(false, err_magic_mismatch(), "TAIL magic mismatch")
+    }
+    let total_len_declared = _u64_to_int(tr["total_len"])
+    if total_len_declared != total_bytes {
+        return _mk_result(false, err_header_corrupt(),
+            "trailer total_len=" + to_string(total_len_declared) +
+            " file=" + to_string(total_bytes))
+    }
+    let merkle_root_declared = tr["merkle_root"]
+
+    // ── 3. Chunk hash verification ───────────────────────────────────────
+    let mut leaves = []
+    let mut ci = 0
+    while ci < chunk_count {
+        let de_off = cert_end + ci * pcc_dir_entry_size()
+        let e = decode_dir_entry(buf, de_off)
+        let declared_offset = _u64_to_int(e["offset"])
+        let declared_len    = e["len"]
+        let declared_xxh    = e["xxh64"]
+        // Bounds-check the chunk into the payload region.
+        if declared_offset < payload_start {
+            return _mk_result(false, err_header_corrupt(),
+                "chunk " + to_string(ci) + " offset < payload_start")
+        }
+        if declared_offset + declared_len > payload_end {
+            return _mk_result(false, err_header_corrupt(),
+                "chunk " + to_string(ci) + " runs past payload_end")
+        }
+        // Re-hash.
+        let slice = bytes_slice(buf, declared_offset, declared_offset + declared_len)
+        let actual = xxh64(slice, 0)
+        if !u64_eq(actual, declared_xxh) {
+            return _mk_result(false, err_chunk_hash_mismatch(),
+                "chunk " + to_string(ci) + " hash mismatch")
+        }
+        leaves = leaves + [declared_xxh]
+        ci = ci + 1
+    }
+
+    // ── 4. Merkle root ───────────────────────────────────────────────────
+    let m_actual = merkle_root(leaves)
+    if !u64_eq(m_actual, merkle_root_declared) {
+        return _mk_result(false, err_merkle_mismatch(),
+            "merkle root mismatch (directory-swap attack?)")
+    }
+
+    // ── 5. CERT block (delegate signature logic to meta2_validator) ──────
+    let cert_bytes = bytes_slice(buf, header_end, cert_end)
+    let cert_json = bytes_to_str(cert_bytes)
+    // parse — any parse error → ERR_CERT_SIG_INVALID
+    let cert = parse_cert_from_string(cert_json)
+    if has_key(cert, "_parse_error") {
+        if cert["_parse_error"] != "" {
+            return _mk_result(false, err_cert_sig_invalid(),
+                "cert parse: " + cert["_parse_error"])
+        }
+    }
+    cert["_source_path"] = path
+    let errs = validate(cert)
+    if len(errs) > 0 {
+        let first = errs[0]
+        let fmsg = "cert invalid: " + first["message"]
+        return _mk_result(false, err_cert_sig_invalid(), fmsg)
+    }
+    // verdict must be a "pass-class" value. We accept the meta2 whitelist
+    // PASS-side set: VERIFIED, PASS, PARTIAL — matches anima's reward
+    // gate (stdlib/cert/verdict.hexa keeps the same semantics). HELD,
+    // CONDITIONAL, FAIL → reject as "not trustworthy for checkpoint load".
+    let v = cert["verdict"]
+    let mut verdict_ok = false
+    if v == "VERIFIED" { verdict_ok = true }
+    if v == "PASS" { verdict_ok = true }
+    if v == "PARTIAL" { verdict_ok = true }
+    if !verdict_ok {
+        return _mk_result(false, err_cert_sig_invalid(),
+            "cert verdict not pass-class: '" + v + "'")
+    }
+
+    // ── All five gates passed ────────────────────────────────────────────
+    let r = _mk_result(true, err_ok(), "verified")
+    r["cert_json"] = cert_json
+    r["payload"] = bytes_slice(buf, payload_start, payload_end)
+    r["merkle_root"] = merkle_root_declared
+    r["chunk_count"] = chunk_count
+    r["payload_len"] = payload_len
+    return r
+}
