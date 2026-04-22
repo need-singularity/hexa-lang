@@ -6746,6 +6746,20 @@ static void _hexa_init_fn_shims(void) {
 #include "native/net.c"
 
 /* ═══════════════════════════════════════════════════════════════════
+ * B20 / roadmap 55 Phase 1 — deterministic FP control-word init.
+ *
+ * Exposes void hexa_fp_init(void). codegen_c2.hexa emits a call to it
+ * as the first statement of generated main(). Implementation in
+ * self/native/fp_init.c normalizes MXCSR (x86_64) or FPCR (aarch64)
+ * to IEEE-default behavior (no FTZ/DAZ/FZ, round-to-nearest-even) so
+ * @strict_fp functions can rely on bit-exact FP semantics.
+ *
+ * Phase 2 scope: crlibm vendoring for cross-substrate transcendental
+ * identity; pthread_create trampoline. Not shipped in Phase 1.
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/fp_init.c"
+
+/* ═══════════════════════════════════════════════════════════════════
  * stdlib/os — signal + flock builtins (roadmap 62, 2026-04-22)
  *
  * Exposes hexa_os_sig_* (install / raise / drain / block / …) and

@@ -662,6 +662,10 @@ fn codegen_c2(ast) {
     // ComptimeConst const-fold table — must reset per codegen invocation.
     _comptime_const_names = []
     _comptime_const_nodes = []
+    // B20 / roadmap 55: reset @strict_fp TU flag per codegen invocation so
+    // a second compilation in the same process doesn't inherit the first.
+    _gen2_tu_has_strict_fp = 0
+    _gen2_current_fn_strict_fp = 0
     let mut _gi = 0
     while _gi < len(ast) {
         let _gk = ast[_gi].kind
@@ -899,11 +903,25 @@ fn codegen_c2(ast) {
         _ldp_i = _ldp_i + 1
     }
     parts.push(fn_parts.join(""))
+    // B20 / roadmap 55: emit a sentinel comment the build driver
+    // (self/main.hexa) greps to decide whether to inject IEEE-strict clang
+    // flags (-ffp-contract=off, -fno-fast-math, -fno-associative-math,
+    // -fno-reciprocal-math, -fsignaling-nans). Emitted even without
+    // @strict_fp so the driver can unambiguously detect "not strict" too.
+    if _gen2_tu_has_strict_fp == 1 {
+        parts.push("/* HEXA_STRICT_FP_TU: 1 */\n")
+    } else {
+        parts.push("/* HEXA_STRICT_FP_TU: 0 */\n")
+    }
     // T3 fix: emit `int main(int argc, char** argv)` + hexa_set_args(argc, argv)
     // 이전 구현은 `int main()` 으로 argv 를 받지 않아 args() 가 항상 빈 배열을
     // 반환했다. main.hexa 의 dispatch (av[2] 등) 가 동작하려면 필수.
     parts.push("int main(int argc, char** argv) {\n")
     parts.push("    hexa_set_args(argc, argv);\n")
+    // B20: per-thread FP control word init. Always safe to call — zero-op on
+    // substrates without MXCSR/FPCR. Placing before any user init ensures
+    // constexpr float computation in globals sees IEEE defaults.
+    parts.push("    hexa_fp_init();\n")
     // M4: initialize deduplicated string literals before any user init code
     if len(_strlit_keys) > 0 {
         parts.push("    __hexa_strlit_init();\n")
@@ -1170,6 +1188,17 @@ fn gen2_fn_decl(node) {
     if _ret_type == "Void" || _ret_type == "void" || _ret_type == "()" {
         _wants_tail_return = false
     }
+    // B20 / roadmap 55: @strict_fp fn scope — gate FMA fusion sites below.
+    //   TU sticky flag feeds the `/* HEXA_STRICT_FP_TU */` marker emitted at
+    //   the header boundary (see gen2_emit_file) which self/main.hexa greps
+    //   to inject IEEE-strict clang flags.
+    let _was_strict_fp = _gen2_current_fn_strict_fp
+    if gen2_has_attr(node, "strict_fp") {
+        _gen2_current_fn_strict_fp = 1
+        _gen2_tu_has_strict_fp = 1
+    } else {
+        _gen2_current_fn_strict_fp = 0
+    }
     let body_len = len(node.body)
     let mut bi = 0
     while bi < body_len {
@@ -1240,6 +1269,8 @@ fn gen2_fn_decl(node) {
         chunks.push("    return __thunk_result_" + _fn_name_real + ";\n")
         chunks.push("}\n")
     }
+    // B20: restore @strict_fp scope on fn exit.
+    _gen2_current_fn_strict_fp = _was_strict_fp
     return chunks.join("")
 }
 
@@ -1603,6 +1634,17 @@ fn gen2_indent(n) {
 let mut _gen2_declared_names = []
 let mut _gen2_arena_wrap = 0
 
+// B20 / roadmap 55 — @strict_fp state.
+//   `_gen2_current_fn_strict_fp`: 1 while emitting a fn body decorated with
+//     @strict_fp; 0 otherwise. Read by the two FMA-fusion sites (compound
+//     `x += a*b` at ~line 1722 and `(a*b)+c` at ~line 2502) to suppress
+//     hexa_fma emission — strict_fp fns must preserve two roundings.
+//   `_gen2_tu_has_strict_fp`: sticky 1 once any fn in the TU is @strict_fp.
+//     Emitted as a `/* HEXA_STRICT_FP_TU */` marker at top of generated C so
+//     the build driver (self/main.hexa) can inject IEEE-strict clang flags.
+let mut _gen2_current_fn_strict_fp = 0
+let mut _gen2_tu_has_strict_fp = 0
+
 fn _gen2_has_decl(name) {
     let n = len(_gen2_declared_names)
     let mut i = 0
@@ -1720,8 +1762,10 @@ fn gen2_stmt(node, depth) {
     if k == "CompoundAssign" {
         let op = node.op
         // FMA for compound assign: x += a * b  →  x = fma(a, b, x)
+        // B20: suppressed inside @strict_fp fns (two roundings must be
+        //      preserved for IEEE 754 bit-exactness).
         if op == "+=" {
-            if type_of(node.right) != "string" && node.right.kind == "BinaryOp" && node.right.op == "*" {
+            if _gen2_current_fn_strict_fp == 0 && type_of(node.right) != "string" && node.right.kind == "BinaryOp" && node.right.op == "*" {
                 let lhs = gen2_expr(node.left)
                 let fa = gen2_expr(node.right.left)
                 let fb = gen2_expr(node.right.right)
@@ -2504,7 +2548,8 @@ fn gen2_expr(node) {
         // Saves one runtime dispatch call; on floats uses hardware fma()
         // (single rounding). Checks AST structure before gen2_expr to
         // avoid generating the inner mul twice.
-        if op == "+" || op == "-" {
+        // B20: suppressed inside @strict_fp fns — two roundings preserved.
+        if _gen2_current_fn_strict_fp == 0 && (op == "+" || op == "-") {
             if type_of(node.left) != "string" && node.left.kind == "BinaryOp" && node.left.op == "*" {
                 let fa = gen2_expr(node.left.left)
                 let fb = gen2_expr(node.left.right)
