@@ -1,20 +1,20 @@
-// tool/hx_cert_chain.hexa — Phase 3.7 self-host cert chain verifier (stub).
+// tool/hx_cert_chain.hexa — Phase 3.7 self-host cert chain verifier (real-v1).
 //
 // SPEC: docs/hexa_lang_meta_evolution_proposal_20260422.md §3.7.
-// STATUS: stub — skeleton + --selftest only.
+// STATUS: v1 real — enumerate .meta2-cert/*.json, parse required fields,
+//         compute each cert's own sha256 as identity, then verify each
+//         cert's prev_cert_sha references an existing cert (or "GENESIS").
+//         Flag orphan (unreachable from head) and dangling_prev (points
+//         to non-existent cert).
 //
-// PURPOSE
-//   Traverse .meta2-cert/ DAG: verify Stage0 → Stage1 → Stage2 self-host
-//   cert chain, classify orphan / missing / expired cert. Honors
-//   ed25519 signatures once HXA-#04 / B4 lands.
+//         ed25519 signature verification deferred to v2 (HXA-#04 / B4).
 //
 // CLI
 //   hexa tool/hx_cert_chain.hexa --selftest
 //   hexa tool/hx_cert_chain.hexa [--out <path>]
 //
 // OUTPUT
-//   $HEXA_LANG/state/hx_cert_chain.json + docs/hx_cert_chain.md
-//   schema = "hexa-lang/hx_cert_chain/1"
+//   $HEXA_LANG/state/hx_cert_chain.json  (schema hexa-lang/hx_cert_chain/1)
 
 fn _home() -> string {
     let h = env("HOME")
@@ -38,25 +38,77 @@ fn _arg_value(args: array, key: string, default: string) -> string {
     return default
 }
 
-fn _selftest() -> int {
-    if len(_iso_now()) < 10 {
-        eprintln("hx_cert_chain: selftest FAIL")
-        return 1
-    }
-    println("hx_cert_chain: selftest PASS (stub)")
-    return 0
+fn _json_esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
 }
 
-fn _emit(out_path: string) -> int {
-    let ts = _iso_now()
-    let body = "{\n  \"schema\": \"hexa-lang/hx_cert_chain/1\",\n  \"ts\": \"" + ts + "\",\n  \"status\": \"stub\",\n  \"certs\": [],\n  \"orphans\": [],\n  \"missing\": [],\n  \"expired\": [],\n  \"chain_valid\": null\n}\n"
-    try {
-        write_file(out_path, body)
-    } catch e {
-        eprintln("hx_cert_chain: write FAIL " + out_path)
-        return 1
+fn _split_lines(s: string) -> array {
+    let mut out = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\n" {
+            if len(cur) > 0 { out.push(cur) }
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
     }
-    println("hx_cert_chain: wrote " + out_path + " (stub)")
+    if len(cur) > 0 { out.push(cur) }
+    return out
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _root() -> string {
+    return _home() + "/core/hexa-lang"
+}
+
+fn _exists(path: string) -> bool {
+    return to_string(exec("test -e " + _sh_q(path) + " && echo y || echo n")).trim() == "y"
+}
+
+fn _sha256(path: string) -> string {
+    let raw = to_string(exec("shasum -a 256 " + _sh_q(path) + " 2>/dev/null")).trim()
+    let sp = raw.index_of(" ")
+    if sp < 0 { return raw }
+    return raw.substring(0, sp)
+}
+
+fn _get_str(s: string, key: string) -> string {
+    let tag = "\"" + key + "\":\""
+    let p = s.index_of(tag)
+    if p < 0 { return "" }
+    let after = s.substring(p + len(tag), len(s))
+    let q = after.index_of("\"")
+    if q < 0 { return "" }
+    return after.substring(0, q)
+}
+
+fn _index_of_str(arr: array, s: string) -> int {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _selftest() -> int {
+    if len(_iso_now()) < 10 { eprintln("hx_cert_chain: selftest FAIL (iso)"); return 1 }
+    let s = "{\"a\":\"hello\",\"b\":\"world\"}"
+    if _get_str(s, "a") != "hello" { eprintln("hx_cert_chain: selftest FAIL (get_str a)"); return 1 }
+    if _get_str(s, "missing") != "" { eprintln("hx_cert_chain: selftest FAIL (missing)"); return 1 }
+    println("hx_cert_chain: selftest PASS")
     return 0
 }
 
@@ -66,11 +118,141 @@ fn main() {
     let mut i = 2
     while i < len(av) { args.push(av[i]); i = i + 1 }
 
-    if len(args) >= 1 && args[0] == "--selftest" {
-        exit(_selftest())
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let default_out = _root() + "/state/hx_cert_chain.json"
+    let out_path = _arg_value(args, "--out", default_out)
+    let ts = _iso_now()
+
+    let cert_dir = _root() + "/.meta2-cert"
+    if !_exists(cert_dir) {
+        let body = "{\n  \"schema\": \"hexa-lang/hx_cert_chain/1\",\n"
+            + "  \"ts\": \"" + ts + "\",\n"
+            + "  \"status\": \"no_cert_dir\",\n"
+            + "  \"cert_count\": 0,\n"
+            + "  \"summary\": {\"total\": 0, \"ok\": 0, \"missing_fields\": 0, \"dangling_prev\": 0, \"orphans\": 0}\n}\n"
+        try { write_file(out_path, body) } catch e {
+            eprintln("hx_cert_chain: write FAIL " + out_path); exit(1)
+        }
+        println("hx_cert_chain: no .meta2-cert dir; wrote " + out_path)
+        exit(0)
     }
 
-    let default_out = _home() + "/core/hexa-lang/state/hx_cert_chain.json"
-    let out_path = _arg_value(args, "--out", default_out)
-    exit(_emit(out_path))
+    let raw_ls = to_string(exec("ls " + _sh_q(cert_dir) + " 2>/dev/null | grep '\\.json$'"))
+    let files = _split_lines(raw_ls)
+
+    let mut names = []
+    let mut own_shas = []
+    let mut prev_shas = []
+    let mut fplevels = []
+    let mut statuses = []
+    let mut missing_flag = []
+    let mut latest_name = ""
+    let mut latest_ts = ""
+
+    for name in files {
+        let path = cert_dir + "/" + name
+        let body = to_string(exec("cat " + _sh_q(path) + " 2>/dev/null"))
+        let fp = _get_str(body, "fixpoint_level")
+        let prev = _get_str(body, "prev_cert_sha")
+        let status = _get_str(body, "status")
+        let ts_u = _get_str(body, "ts_utc")
+        let own_sha = _sha256(path)
+
+        let missing = (len(fp) == 0) || (len(prev) == 0) || (len(status) == 0)
+
+        names.push(name)
+        own_shas.push(own_sha)
+        prev_shas.push(prev)
+        fplevels.push(fp)
+        statuses.push(status)
+        missing_flag.push(if missing { 1 } else { 0 })
+
+        if ts_u > latest_ts {
+            latest_ts = ts_u
+            latest_name = name
+        }
+    }
+
+    let mut ok_count = 0
+    let mut missing_count = 0
+    let mut dangling_count = 0
+    let mut entries_json = []
+
+    let mut j = 0
+    while j < len(names) {
+        let mut kind = "ok"
+        if missing_flag[j] == 1 { kind = "missing_fields" }
+        else if prev_shas[j] != "GENESIS" {
+            if _index_of_str(own_shas, prev_shas[j]) < 0 {
+                kind = "dangling_prev"
+            }
+        }
+
+        if kind == "ok" { ok_count = ok_count + 1 }
+        else if kind == "missing_fields" { missing_count = missing_count + 1 }
+        else if kind == "dangling_prev" { dangling_count = dangling_count + 1 }
+
+        let entry = "{\"name\":\"" + _json_esc(names[j])
+            + "\",\"own_sha\":\"" + own_shas[j]
+            + "\",\"prev_cert_sha\":\"" + _json_esc(prev_shas[j])
+            + "\",\"fixpoint_level\":\"" + _json_esc(fplevels[j])
+            + "\",\"status\":\"" + _json_esc(statuses[j])
+            + "\",\"classification\":\"" + kind + "\"}"
+        entries_json.push(entry)
+        j = j + 1
+    }
+
+    let mut reached = []
+    if len(names) > 0 && len(latest_name) > 0 {
+        let start_idx = _index_of_str(names, latest_name)
+        if start_idx >= 0 {
+            reached.push(names[start_idx])
+            let mut cur_prev = prev_shas[start_idx]
+            let mut hops = 0
+            while cur_prev != "GENESIS" && hops < 10000 {
+                let parent_idx = _index_of_str(own_shas, cur_prev)
+                if parent_idx < 0 { break }
+                reached.push(names[parent_idx])
+                cur_prev = prev_shas[parent_idx]
+                hops = hops + 1
+            }
+        }
+    }
+    let orphan_count = len(names) - len(reached)
+
+    let mut body = "{\n  \"schema\": \"hexa-lang/hx_cert_chain/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"status\": \"real-v1\",\n"
+    body = body + "  \"cert_count\": " + to_string(len(names)) + ",\n"
+    body = body + "  \"latest\": \"" + _json_esc(latest_name) + "\",\n"
+    body = body + "  \"chain_depth_from_head\": " + to_string(len(reached)) + ",\n"
+    body = body + "  \"orphan_count\": " + to_string(orphan_count) + ",\n"
+    body = body + "  \"entries\": [\n"
+    let mut first = true
+    for e in entries_json {
+        if !first { body = body + ",\n" }
+        body = body + "    " + e
+        first = false
+    }
+    body = body + "\n  ],\n"
+    body = body + "  \"summary\": {\"total\": " + to_string(len(names))
+    body = body + ", \"ok\": " + to_string(ok_count)
+    body = body + ", \"missing_fields\": " + to_string(missing_count)
+    body = body + ", \"dangling_prev\": " + to_string(dangling_count)
+    body = body + ", \"orphans\": " + to_string(orphan_count) + "}\n}\n"
+
+    try { write_file(out_path, body) } catch e {
+        eprintln("hx_cert_chain: write FAIL " + out_path)
+        exit(1)
+    }
+
+    println("hx_cert_chain: total=" + to_string(len(names))
+          + " ok=" + to_string(ok_count)
+          + " missing=" + to_string(missing_count)
+          + " dangling=" + to_string(dangling_count)
+          + " orphan=" + to_string(orphan_count)
+          + " chain_depth=" + to_string(len(reached)))
+    println("hx_cert_chain: wrote " + out_path)
+    exit(0)
 }
