@@ -26,12 +26,21 @@
  */
 
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <errno.h>
 #include <unistd.h>
 #include <string.h>
 #include <stdlib.h>
+
+/* This file is a partial translation unit: it is #include'd into
+ * self/runtime.c (see the `#include "native/net.c"` near the bottom of
+ * runtime.c) after the full `struct HexaVal_ { ... }` definition has
+ * landed. Standalone IDE linting of net.c will surface "unknown type
+ * HexaVal / implicit declaration" noise — those are not real build
+ * errors. The real compile path produces a single TU with all types
+ * already defined before net.c is expanded. */
 
 /* Parse "host:port" into sockaddr_in. Accepts:
  *   - dotted-quad (127.0.0.1), "localhost" → INADDR_LOOPBACK,
@@ -129,6 +138,69 @@ HexaVal hexa_net_read(HexaVal fd_val) {
     return hexa_str(buf);
 }
 
+/* Looping read that accumulates up to `n` bytes before returning.
+ *
+ * Semantics (roadmap 56 / B7 HTTP POST body prereq):
+ *   - Calls recv() repeatedly until either (a) we have received exactly
+ *     `n` bytes, (b) the peer closed the connection (recv returns 0 —
+ *     treated as EOF), or (c) a non-retryable error occurs. Returns a
+ *     hexa string whose length is therefore in [0, n].
+ *   - EINTR is retried transparently (POSIX-normal during signal arrival).
+ *   - EAGAIN / EWOULDBLOCK is treated as EOF rather than retried. The
+ *     blocking model for this call assumes the caller has not set any
+ *     socket timeout; if they did (see hexa_net_set_timeout), the timeout
+ *     also surfaces as EAGAIN/EWOULDBLOCK and we stop here so the caller
+ *     can observe a short read — this is the intended "timeout -> partial"
+ *     behaviour for HTTP POST bodies that span TCP packets.
+ *   - n <= 0 returns "".
+ *
+ * Memory: uses heap (malloc) when n > 65536, else stack, to avoid large
+ * stack frames on deep call chains in the interpreter. */
+HexaVal hexa_net_read_n(HexaVal fd_val, HexaVal n_val) {
+    int64_t fd = hexa_as_num(fd_val);
+    int64_t want = hexa_as_num(n_val);
+    if (fd < 0 || want <= 0) return hexa_str("");
+    char stackbuf[65536];
+    char* buf = (want <= (int64_t)sizeof(stackbuf)) ? stackbuf : (char*)malloc((size_t)want + 1);
+    if (!buf) return hexa_str("");
+    size_t got = 0;
+    while ((int64_t)got < want) {
+        ssize_t r = recv((int)fd, buf + got, (size_t)(want - (int64_t)got), 0);
+        if (r > 0) { got += (size_t)r; continue; }
+        if (r == 0) break;                /* EOF */
+        if (errno == EINTR) continue;     /* retry */
+        if (errno == EAGAIN || errno == EWOULDBLOCK) break;  /* treat as EOF */
+        break;                            /* other error: return what we have */
+    }
+    buf[got] = '\0';
+    /* Note: hexa_str() uses strlen under the hood (like hexa_net_read above),
+     * so embedded NULs in the payload are not preserved. This matches the
+     * existing net_read contract. HTTP/1.1 bodies are text or chunked-
+     * framed binary and do not embed NULs in the headers/body segments
+     * that .hexa parses. If a future caller needs raw byte passthrough,
+     * extend the runtime with hexa_str_n(buf, len). */
+    HexaVal out = hexa_str(buf);
+    if (buf != stackbuf) free(buf);
+    return out;
+}
+
+/* Apply a recv() timeout on the socket via SO_RCVTIMEO. Returns 0 on
+ * success, -errno on failure. ms <= 0 disables the timeout. Follow-on
+ * hexa_net_read / hexa_net_read_n calls that would block beyond the
+ * timeout surface EAGAIN/EWOULDBLOCK (read_n treats as EOF). */
+HexaVal hexa_net_set_timeout(HexaVal fd_val, HexaVal ms_val) {
+    int64_t fd = hexa_as_num(fd_val);
+    int64_t ms = hexa_as_num(ms_val);
+    if (fd < 0) return hexa_int(-EINVAL);
+    struct timeval tv;
+    if (ms <= 0) { tv.tv_sec = 0; tv.tv_usec = 0; }
+    else { tv.tv_sec = (time_t)(ms / 1000); tv.tv_usec = (suseconds_t)((ms % 1000) * 1000); }
+    if (setsockopt((int)fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
+        return hexa_int(-errno);
+    }
+    return hexa_int(0);
+}
+
 HexaVal hexa_net_write(HexaVal fd_val, HexaVal data_val) {
     int64_t fd = hexa_as_num(fd_val);
     if (fd < 0) return hexa_int(-EINVAL);
@@ -163,13 +235,17 @@ HexaVal net_accept;
 HexaVal net_close;
 HexaVal net_connect;
 HexaVal net_read;
+HexaVal net_read_n;
+HexaVal net_set_timeout;
 HexaVal net_write;
 
 static void _hexa_init_net_fn_shims(void) {
-    net_listen  = hexa_fn_new((void*)hexa_net_listen,  1);
-    net_accept  = hexa_fn_new((void*)hexa_net_accept,  1);
-    net_close   = hexa_fn_new((void*)hexa_net_close,   1);
-    net_connect = hexa_fn_new((void*)hexa_net_connect, 1);
-    net_read    = hexa_fn_new((void*)hexa_net_read,    1);
-    net_write   = hexa_fn_new((void*)hexa_net_write,   2);
+    net_listen      = hexa_fn_new((void*)hexa_net_listen,      1);
+    net_accept      = hexa_fn_new((void*)hexa_net_accept,      1);
+    net_close       = hexa_fn_new((void*)hexa_net_close,       1);
+    net_connect     = hexa_fn_new((void*)hexa_net_connect,     1);
+    net_read        = hexa_fn_new((void*)hexa_net_read,        1);
+    net_read_n      = hexa_fn_new((void*)hexa_net_read_n,      2);
+    net_set_timeout = hexa_fn_new((void*)hexa_net_set_timeout, 2);
+    net_write       = hexa_fn_new((void*)hexa_net_write,       2);
 }
