@@ -257,6 +257,7 @@ fn _submit_one(to_repo: string, from_repo: string, kind: string, category: strin
 fn _cmd_list(args: array) -> int {
     let repo = _arg_value(args, "--repo", _detect_self_repo())
     let status_filter = _arg_value(args, "--status", "")
+    let category_filter = _arg_value(args, "--category", "")
     let inv = _inventory_path(repo)
     if !_exists(inv) {
         eprintln("proposal_inbox list: no inventory at " + inv)
@@ -266,15 +267,21 @@ fn _cmd_list(args: array) -> int {
            + "import json\n"
            + "d = json.load(open(" + _sh_q(inv) + "))\n"
            + "st = " + _sh_q(status_filter) + "\n"
+           + "cat = " + _sh_q(category_filter) + "\n"
            + "entries = d.get('entries', [])\n"
            + "if st:\n"
            + "    entries = [e for e in entries if e.get('user_status','') == st]\n"
+           + "if cat:\n"
+           + "    cats = cat.split(',')\n"
+           + "    entries = [e for e in entries if e.get('category','') in cats]\n"
            + "for e in entries:\n"
            + "    prio = e.get('score_priority', '?')\n"
            + "    status = e.get('user_status','?')\n"
            + "    frm = e.get('from_repo','?')\n"
-           + "    print(f\"  {e.get('id','?'):24s} [{status:12s}] prio={prio:>3} from={frm:14s} {e.get('kind',''):10s} {e.get('title','')}\")\n"
-           + "print(f'total: {len(entries)}' + (f' (status={st})' if st else ''))\n"
+           + "    ct  = e.get('category','-')\n"
+           + "    print(f\"  {e.get('id','?'):24s} [{status:12s}] prio={prio:>3} cat={ct:16s} {e.get('title','')[:80]}\")\n"
+           + "filt_descr = ', '.join(filter(None, [f'status={st}' if st else '', f'category={cat}' if cat else '']))\n"
+           + "print(f'total: {len(entries)}' + (f' ({filt_descr})' if filt_descr else ''))\n"
            + "PY\n"
     let r = exec_with_status(py)
     println(to_string(r[0]))
@@ -395,6 +402,152 @@ fn _cmd_stale(args: array) -> int {
     return r[1]
 }
 
+// Shared commit/push helper — 모든 repo 의 meta engine / roadmap engine 이
+// 공통으로 쓰는 최종 봉합 단계.
+//
+// CLI
+//   proposal_inbox commit-push --repo <r> --msg "<m>"
+//                              [--push] [--paths p1,p2,...]
+//   default paths = state/proposals/inventory.json
+//
+// 동작
+//   1. cd $HOME/core/<repo>
+//   2. git add -f <paths...>  (state/ gitignored 여도 force-add)
+//   3. 변경 없으면 "no changes" 출력 후 rc=0
+//   4. 있으면 git commit -m "<m>"; --push 면 git push
+//
+// 원칙
+//   - 실패 시 비-zero rc (상위 scanner 에 전파)
+//   - stderr 는 그대로 보여주고, stdout 은 요약만
+//   - push 인자 없으면 local commit 만 (safe default)
+fn _cmd_commit_push(args: array) -> int {
+    let repo = _arg_value(args, "--repo", _detect_self_repo())
+    let msg  = _arg_value(args, "--msg", "")
+    let paths_csv = _arg_value(args, "--paths", "state/proposals/inventory.json")
+    let do_push   = _has_flag(args, "--push")
+    if len(msg) == 0 {
+        eprintln("proposal_inbox commit-push: --msg required")
+        return 2
+    }
+    let repo_root = _repo_root(repo)
+    if !_exists(repo_root + "/.git") {
+        // .git 이 있을 수도 있고 worktree 로 걸려있을 수도 — test -e 로 확인
+        let have = to_string(exec("test -e " + _sh_q(repo_root + "/.git") + " && echo y || echo n")).trim()
+        if have != "y" {
+            eprintln("proposal_inbox commit-push: " + repo_root + " is not a git repo")
+            return 2
+        }
+    }
+
+    // git add -f <paths>
+    let add_cmd = "cd " + _sh_q(repo_root)
+        + " && git add -f " + paths_csv.replace(",", " ")
+        + " 2>&1"
+    let _add = exec(add_cmd)
+
+    // any staged diff?
+    let any = exec_with_status("cd " + _sh_q(repo_root) + " && git diff --cached --quiet")
+    if any[1] == 0 {
+        println("proposal_inbox commit-push: " + repo + " — no changes")
+        return 0
+    }
+
+    // commit
+    let commit_cmd = "cd " + _sh_q(repo_root)
+        + " && git commit -m " + _sh_q(msg) + " 2>&1 | tail -3"
+    let cr = exec_with_status(commit_cmd)
+    println("proposal_inbox commit-push: " + repo + " commit → " + to_string(cr[0]).trim())
+    if cr[1] != 0 { return cr[1] }
+
+    if do_push {
+        let push_cmd = "cd " + _sh_q(repo_root) + " && git push 2>&1 | tail -2"
+        let pr = exec_with_status(push_cmd)
+        println("proposal_inbox commit-push: " + repo + " push → " + to_string(pr[0]).trim())
+        return pr[1]
+    }
+    return 0
+}
+
+// ROI 요약 — 카테고리별 box-drawing 표 + TOP-N 요약.
+// 양식 SSOT: commands.json todo.format_rules (box-drawing ┌├│┤└, markdown 표 금지).
+// 전 프로젝트 통일 ROI 출력용. 'roi' 키워드 preflight 에서 호출.
+//
+// CLI
+//   proposal_inbox roi-summary [--repo <r>] [--top N] [--categories c1,c2,...]
+//
+// 기본 categories (cross_repo_blocker sub + loss_free_roi):
+//   lang_gap / resource_gap / infra_gap / atlas_gap / data_gap / loss_free_roi
+fn _cmd_roi_summary(args: array) -> int {
+    let repo = _arg_value(args, "--repo", _detect_self_repo())
+    let top_n = _arg_value(args, "--top", "10")
+    let cats_csv = _arg_value(args, "--categories",
+        "lang_gap,resource_gap,infra_gap,atlas_gap,data_gap,loss_free_roi")
+    let inv = _inventory_path(repo)
+    if !_exists(inv) {
+        eprintln("proposal_inbox roi-summary: no inventory at " + inv)
+        return 2
+    }
+    let py = "python3 - <<'PY'\n"
+           + "import json\n"
+           + "d = json.load(open(" + _sh_q(inv) + "))\n"
+           + "cats = " + _sh_q(cats_csv) + ".split(',')\n"
+           + "top_n = int(" + _sh_q(top_n) + ")\n"
+           + "repo = " + _sh_q(repo) + "\n"
+           + "entries = [e for e in d.get('entries', [])\n"
+           + "           if e.get('user_status','pending') != 'done'\n"
+           + "           and e.get('category','') in cats]\n"
+           + "# group by category\n"
+           + "from collections import defaultdict\n"
+           + "groups = defaultdict(list)\n"
+           + "for e in entries:\n"
+           + "    groups[e['category']].append(e)\n"
+           + "\n"
+           + "def box_table(rows, headers, widths):\n"
+           + "    def line(c1,c2,c3,c4):\n"
+           + "        return c1 + c2.join([c3*w for w in widths]) + c4\n"
+           + "    def cell(vals):\n"
+           + "        return '│' + '│'.join([f' {str(v):<{w-2}} ' for v,w in zip(vals, widths)]) + '│'\n"
+           + "    out = [line('┌','┬','─','┐'), cell(headers), line('├','┼','─','┤')]\n"
+           + "    for i,r in enumerate(rows):\n"
+           + "        out.append(cell(r))\n"
+           + "        if i < len(rows) - 1:\n"
+           + "            out.append(line('├','┼','─','┤'))\n"
+           + "    out.append(line('└','┴','─','┘'))\n"
+           + "    return '\\n'.join(out)\n"
+           + "\n"
+           + "print(f'# ROI 요약 — {repo} (non-done, category ∈ {cats})')\n"
+           + "print()\n"
+           + "cat_order = [c for c in cats if c in groups]\n"
+           + "for cat in cat_order:\n"
+           + "    items = sorted(groups[cat], key=lambda e: -int(e.get('score_priority',50)))\n"
+           + "    print(f'## {cat}  ({len(items)} items)')\n"
+           + "    rows = []\n"
+           + "    for e in items:\n"
+           + "        id_short = e.get('id','?')\n"
+           + "        prio = e.get('score_priority','?')\n"
+           + "        title = e.get('title','')\n"
+           + "        if len(title) > 80: title = title[:77] + '...'\n"
+           + "        rows.append([id_short, prio, title])\n"
+           + "    print(box_table(rows, ['id','prio','title'], [22, 6, 82]))\n"
+           + "    print()\n"
+           + "\n"
+           + "# TOP-N across all categories\n"
+           + "all_items = sorted(entries, key=lambda e: -int(e.get('score_priority',50)))[:top_n]\n"
+           + "print(f'## TOP {len(all_items)} (전 카테고리, priority 내림차순)')\n"
+           + "rows = []\n"
+           + "for i,e in enumerate(all_items, 1):\n"
+           + "    rows.append([str(i), e.get('id','?'), e.get('score_priority','?'),\n"
+           + "                 e.get('category','?'), e.get('title','')[:60]])\n"
+           + "print(box_table(rows, ['순위','id','prio','cat','title'], [4,22,6,16,62]))\n"
+           + "\n"
+           + "total = len(entries)\n"
+           + "print(f'\\ntotal non-done (ROI-relevant categories): {total}')\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    println(to_string(r[0]))
+    return r[1]
+}
+
 fn main() {
     let av = argv()
     let mut args = []
@@ -429,6 +582,8 @@ fn main() {
     if cmd == "ack"    { exit(_cmd_status_change(rest, "in_progress")) }
     if cmd == "done"   { exit(_cmd_status_change(rest, "done")) }
     if cmd == "stale"  { exit(_cmd_stale(rest)) }
+    if cmd == "commit-push" { exit(_cmd_commit_push(rest)) }
+    if cmd == "roi-summary" { exit(_cmd_roi_summary(rest)) }
 
     eprintln("proposal_inbox: unknown subcommand '" + cmd + "'")
     exit(2)
