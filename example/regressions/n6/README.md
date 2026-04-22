@@ -21,11 +21,11 @@ n6-architecture 프로젝트의 P1~P3 작업 산출 .hexa 파일 13건 심볼릭
 ## 재현
 
 ```bash
-for f in ~/Dev/hexa-lang/examples/regressions/n6/*.hexa; do
+for f in $WS/hexa-lang/examples/regressions/n6/*.hexa; do
   echo "=== $(basename $f) ===" && hexa "$f" 2>&1 | tail -5
 done
 ```
 
-n6-architecture 수정 시 자동으로 반영됨 (심볼릭). 원본 프로젝트: `/Users/ghost/Dev/n6-architecture/`
+n6-architecture 수정 시 자동으로 반영됨 (심볼릭). 원본 프로젝트: `/Users/ghost/core/n6-architecture/`
 
 생성: 2026-04-14 (n6-architecture → hexa-lang 역요청 #5 회신)

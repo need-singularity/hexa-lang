@@ -1,6 +1,6 @@
 // hxvdsp_linux.c — Linux port of Apple vDSP RMSNorm/SoftMax/SwiGLU shim
 //
-// Port of /Users/ghost/Dev/anima/training/hxvdsp_wrapper.c from macOS
+// Port of /Users/ghost/core/anima/training/hxvdsp_wrapper.c from macOS
 // Accelerate vDSP → Linux scalar+OpenBLAS replacement.
 //
 // Strategy:

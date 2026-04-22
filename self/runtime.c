@@ -4009,7 +4009,7 @@ static void* hexa_ffi_dlopen(const char* lib_name) {
         const char* nld = getenv("HEXA_NATIVE_LIB_DIR");
         if (nld && nld[0]) search_prefixes[sp_n++] = nld;
         search_prefixes[sp_n++] = ".";
-        search_prefixes[sp_n++] = "/Users/ghost/Dev/hexa-lang";
+        search_prefixes[sp_n++] = "/Users/ghost/core/hexa-lang";
         search_prefixes[sp_n++] = "/Users/ghost/dev/hexa-lang";
         // Try <prefix>/self/native/build/lib<name>.dylib for each prefix.
         const char* rel_patterns[] = {
