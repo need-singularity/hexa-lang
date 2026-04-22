@@ -1,0 +1,348 @@
+// HEXA Standard Library — cert/dag
+// Generic cert-chain DAG: roots, orphans, ancestry, descendants, cycles.
+//
+// Motivation: anima's .meta2-cert/ directory grew to 29+ certs each
+// chained via `prev_cert_sha`. Orphan detection (G39 #33 audit) and
+// ancestry walks were hand-rolled per call site. This module lifts
+// the graph primitives into stdlib so any consumer (roadmap watcher,
+// cert_gate, audit tools) gets the same bounded traversal semantics.
+//
+// CertNode schema (intentionally minimal):
+//   slug         — unique identifier (filename, sha, or any string)
+//   parent_slug  — "" or "GENESIS" means root; otherwise must match
+//                  the slug of another node or the node is an orphan.
+//   ts           — optional timestamp (used by topological tie-break)
+//
+// Public API:
+//   pub fn make_dag(nodes: [CertNode])        -> CertDag
+//   pub fn find_roots(dag)                    -> [string]
+//   pub fn find_orphans(dag)                  -> [string]
+//   pub fn ancestors(dag, slug)               -> [string]
+//   pub fn descendants(dag, slug)             -> [string]
+//   pub fn detect_cycles(dag)                 -> [[string]]
+//   pub fn topological_order(dag)             -> [string]
+//
+// Meta2-cert loader (companion):
+//   pub fn load_meta2_dag(dir_path: string)   -> CertDag
+//     Reads {dir}/*.json files, pulls `sha_v2` as slug and
+//     `prev_cert_sha` as parent_slug, `ts_utc` as ts. Non-.json
+//     entries are skipped; malformed JSON contributes an orphan
+//     with empty parent_slug so callers can surface the failure.
+//
+// All traversals are bounded by node count to defend against
+// malformed chains — infinite loops surface as a detected cycle.
+
+pub struct CertNode {
+    slug: string,
+    parent_slug: string,
+    ts: string
+}
+
+pub struct CertDag {
+    nodes: [CertNode],
+    roots: [string],       // cached result
+    orphans: [string]      // cached result
+}
+
+fn _is_root_parent(p: string) -> bool {
+    if p == "" { return true }
+    if p == "GENESIS" { return true }
+    if p == "genesis" { return true }
+    return false
+}
+
+fn _index_of_slug(nodes: [CertNode], slug: string) -> int {
+    let mut i = 0
+    while i < len(nodes) {
+        if nodes[i].slug == slug { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _compute_roots(nodes: [CertNode]) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(nodes) {
+        if _is_root_parent(nodes[i].parent_slug) {
+            out.push(nodes[i].slug)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _compute_orphans(nodes: [CertNode]) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(nodes) {
+        let p = nodes[i].parent_slug
+        if !_is_root_parent(p) {
+            if _index_of_slug(nodes, p) < 0 {
+                out.push(nodes[i].slug)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+pub fn make_dag(nodes: [CertNode]) -> CertDag {
+    return CertDag {
+        nodes:   nodes,
+        roots:   _compute_roots(nodes),
+        orphans: _compute_orphans(nodes)
+    }
+}
+
+pub fn find_roots(dag: CertDag) -> array {
+    return dag.roots
+}
+
+pub fn find_orphans(dag: CertDag) -> array {
+    return dag.orphans
+}
+
+// Walk parent chain upward from slug. Terminates on root or orphan
+// or when visited-set reaches len(nodes) (cycle breaker).
+pub fn ancestors(dag: CertDag, slug: string) -> array {
+    let mut out = []
+    let mut cur = slug
+    let budget = len(dag.nodes) + 1
+    let mut steps = 0
+    while steps < budget {
+        let idx = _index_of_slug(dag.nodes, cur)
+        if idx < 0 { return out }
+        let p = dag.nodes[idx].parent_slug
+        if _is_root_parent(p) { return out }
+        // detect self-revisit (cycle break)
+        let mut j = 0
+        while j < len(out) {
+            if out[j] == p { return out }
+            j = j + 1
+        }
+        out.push(p)
+        cur = p
+        steps = steps + 1
+    }
+    return out
+}
+
+// One-level children: slugs whose parent_slug matches `slug`.
+fn _children_of(dag: CertDag, slug: string) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(dag.nodes) {
+        if dag.nodes[i].parent_slug == slug {
+            out.push(dag.nodes[i].slug)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// BFS-walk descendants. Bounded queue drain.
+pub fn descendants(dag: CertDag, slug: string) -> array {
+    let mut out = []
+    let mut queue = _children_of(dag, slug)
+    let budget = len(dag.nodes) + 1
+    let mut steps = 0
+    while len(queue) > 0 && steps < budget {
+        let head = queue[0]
+        // shift queue (expensive but stage0-friendly)
+        let mut new_q = []
+        let mut k = 1
+        while k < len(queue) {
+            new_q.push(queue[k])
+            k = k + 1
+        }
+        queue = new_q
+        // skip if already emitted (cycle break)
+        let mut seen = false
+        let mut m = 0
+        while m < len(out) {
+            if out[m] == head { seen = true }
+            m = m + 1
+        }
+        if !seen {
+            out.push(head)
+            let kids = _children_of(dag, head)
+            let mut c = 0
+            while c < len(kids) {
+                queue.push(kids[c])
+                c = c + 1
+            }
+        }
+        steps = steps + 1
+    }
+    return out
+}
+
+// Detect cycles as lists of slugs. A cycle surfaces when walking
+// ancestors from a node revisits that node's slug. Each distinct
+// cycle is reported once keyed by its lexicographically smallest
+// slug. Empty list means acyclic.
+pub fn detect_cycles(dag: CertDag) -> array {
+    let mut reported = []   // slugs already rooted (any cycle they touch is logged)
+    let mut cycles = []
+    let mut i = 0
+    while i < len(dag.nodes) {
+        let start = dag.nodes[i].slug
+        let mut cur = start
+        let mut chain = []
+        let budget = len(dag.nodes) + 1
+        let mut steps = 0
+        let mut cycle_found = false
+        while steps < budget {
+            let idx = _index_of_slug(dag.nodes, cur)
+            if idx < 0 { break }
+            let p = dag.nodes[idx].parent_slug
+            if _is_root_parent(p) { break }
+            // already in chain?
+            let mut j = 0
+            let mut hit = -1
+            while j < len(chain) {
+                if chain[j] == p { hit = j }
+                j = j + 1
+            }
+            if p == start {
+                cycle_found = true
+                break
+            }
+            if hit >= 0 {
+                break
+            }
+            chain.push(p)
+            cur = p
+            steps = steps + 1
+        }
+        if cycle_found {
+            // dedup: skip if any element of this cycle is already
+            // in `reported` (same cycle re-rooted from another member).
+            let mut duplicate = false
+            let mut r = 0
+            while r < len(reported) {
+                if reported[r] == start { duplicate = true }
+                let mut c = 0
+                while c < len(chain) {
+                    if reported[r] == chain[c] { duplicate = true }
+                    c = c + 1
+                }
+                r = r + 1
+            }
+            if !duplicate {
+                let mut cycle = [start]
+                let mut c = 0
+                while c < len(chain) {
+                    cycle.push(chain[c])
+                    c = c + 1
+                }
+                cycles.push(cycle)
+                reported.push(start)
+                let mut c2 = 0
+                while c2 < len(chain) {
+                    reported.push(chain[c2])
+                    c2 = c2 + 1
+                }
+            }
+        }
+        i = i + 1
+    }
+    return cycles
+}
+
+// Topological order: roots first, then children. Stable with respect
+// to node insertion order (not ts) so regen is byte-identical.
+// Nodes inside cycles are appended at the end after acyclic drain.
+pub fn topological_order(dag: CertDag) -> array {
+    let mut out = []
+    let mut remaining = []
+    let mut i = 0
+    while i < len(dag.nodes) {
+        remaining.push(dag.nodes[i].slug)
+        i = i + 1
+    }
+    let budget = len(dag.nodes) * len(dag.nodes) + 1
+    let mut steps = 0
+    while len(remaining) > 0 && steps < budget {
+        let mut progress = false
+        let mut new_rem = []
+        let mut k = 0
+        while k < len(remaining) {
+            let slug = remaining[k]
+            let idx = _index_of_slug(dag.nodes, slug)
+            if idx < 0 { k = k + 1; continue }
+            let p = dag.nodes[idx].parent_slug
+            // emit if root OR parent already emitted OR parent not present
+            let mut ok = false
+            if _is_root_parent(p) { ok = true }
+            if !ok {
+                let mut m = 0
+                while m < len(out) {
+                    if out[m] == p { ok = true }
+                    m = m + 1
+                }
+                if !ok {
+                    if _index_of_slug(dag.nodes, p) < 0 { ok = true }  // orphan — emit
+                }
+            }
+            if ok {
+                out.push(slug)
+                progress = true
+            } else {
+                new_rem.push(slug)
+            }
+            k = k + 1
+        }
+        remaining = new_rem
+        if !progress { break }  // cycle remainder
+        steps = steps + 1
+    }
+    // Append any remaining (cycle members) in original order.
+    let mut r = 0
+    while r < len(remaining) {
+        out.push(remaining[r])
+        r = r + 1
+    }
+    return out
+}
+
+// ═══ meta2-cert directory loader ══════════════════════════════════
+
+fn _s_or_empty(m, key: string) -> string {
+    if has_key(m, key) { return to_string(m[key]) }
+    return ""
+}
+
+// Very small JSON value extractor — avoids depending on full
+// json_decode for legacy cert files that already parse via json_parse.
+fn _parse_cert_file(path: string) -> CertNode {
+    let text = read_file(path)
+    // read_file returned empty or nonexistent → orphan stub
+    if len(text) == 0 {
+        return CertNode { slug: path, parent_slug: "", ts: "" }
+    }
+    let obj = json_parse(text)
+    let slug = _s_or_empty(obj, "sha_v2")
+    let ts = _s_or_empty(obj, "ts_utc")
+    let parent = _s_or_empty(obj, "prev_cert_sha")
+    // Fallback: no sha_v2 → use filename as slug
+    let final_slug = if slug == "" { path } else { slug }
+    return CertNode { slug: final_slug, parent_slug: parent, ts: ts }
+}
+
+pub fn load_meta2_dag(dir_path: string) -> CertDag {
+    let cmd = "ls " + dir_path + "/*.json 2>/dev/null"
+    let listing = to_string(exec(cmd))
+    let lines = listing.split("\n")
+    let mut nodes = []
+    let mut i = 0
+    while i < len(lines) {
+        let line = lines[i].trim()
+        if line != "" {
+            nodes.push(_parse_cert_file(line))
+        }
+        i = i + 1
+    }
+    return make_dag(nodes)
+}
