@@ -1,0 +1,324 @@
+// tool/proposal_inbox.hexa — cross-repo proposal inbox (shared SSOT).
+//
+// PURPOSE
+//   Each repo maintains `state/proposals/inventory.json` as its inbox.
+//   When hexa-lang session finds something anima / airgenome / etc. should
+//   do, it SUBMITs a proposal entry into the target repo's inventory.
+//   The target's maintainer on `go` picks it up from own inbox.
+//
+//   Designed to live in hexa-lang/ as SSOT; other repos invoke by absolute
+//   path:  hexa $HEXA_LANG/tool/proposal_inbox.hexa <subcommand> ...
+//
+//   무손실 ROI 원칙: ROI 항목은 category="loss_free_roi" 로 등록.
+//
+// CLI
+//   hexa tool/proposal_inbox.hexa --selftest
+//   hexa tool/proposal_inbox.hexa submit \
+//     --to <repo> --from <repo> --kind <tool|cluster|fix|roi|docs|cert|other> \
+//     [--category loss_free_roi] --title "<...>" [--prompt-ref <path>]
+//     [--priority N]
+//   hexa tool/proposal_inbox.hexa list [--repo <repo>] [--status pending|in_progress|done]
+//   hexa tool/proposal_inbox.hexa next [--repo <repo>]
+//   hexa tool/proposal_inbox.hexa ack  <id> [--repo <repo>]
+//   hexa tool/proposal_inbox.hexa done <id> [--repo <repo>] [--note "..."]
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _iso_now() -> string {
+    return to_string(exec("date -u +'%Y-%m-%dT%H:%M:%SZ'")).trim()
+}
+
+fn _date_compact() -> string {
+    return to_string(exec("date -u +'%Y%m%d'")).trim()
+}
+
+fn _arg_value(args: array, key: string, default: string) -> string {
+    let mut i = 0
+    while i < len(args) {
+        if args[i] == key {
+            let j = i + 1
+            if j < len(args) { return args[j] }
+        }
+        i = i + 1
+    }
+    return default
+}
+
+fn _has_flag(args: array, key: string) -> bool {
+    let mut i = 0
+    while i < len(args) {
+        if args[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _json_esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _atoi(s: string) -> int {
+    if s == "" { return 0 }
+    return s.parse_int()
+}
+
+fn _exists(path: string) -> bool {
+    return to_string(exec("test -f " + _sh_q(path) + " && echo y || echo n")).trim() == "y"
+}
+
+fn _repo_root(repo: string) -> string {
+    return _home() + "/core/" + repo
+}
+
+fn _inventory_path(repo: string) -> string {
+    return _repo_root(repo) + "/state/proposals/inventory.json"
+}
+
+fn _repo_prefix(repo: string) -> string {
+    if repo == "anima"           { return "anima" }
+    if repo == "nexus"           { return "nxs" }
+    if repo == "hexa-lang"       { return "hxa" }
+    if repo == "airgenome"       { return "agm" }
+    if repo == "n6-architecture" { return "n6a" }
+    return repo
+}
+
+fn _detect_self_repo() -> string {
+    // pwd-based detection; fall back to hexa-lang
+    let cwd = to_string(exec("pwd")).trim()
+    let home = _home()
+    let root = home + "/core/"
+    if cwd.index_of(root) < 0 { return "hexa-lang" }
+    let tail = cwd.substring(len(root), len(cwd))
+    let slash = tail.index_of("/")
+    if slash < 0 { return tail }
+    return tail.substring(0, slash)
+}
+
+fn _selftest() -> int {
+    if _json_esc("a\"b") != "a\\\"b" { eprintln("proposal_inbox: selftest FAIL (esc)"); return 1 }
+    if _repo_prefix("anima") != "anima" { eprintln("proposal_inbox: selftest FAIL (prefix anima)"); return 1 }
+    if _repo_prefix("hexa-lang") != "hxa" { eprintln("proposal_inbox: selftest FAIL (prefix hxa)"); return 1 }
+    if _atoi("12") != 12 { eprintln("proposal_inbox: selftest FAIL (atoi)"); return 1 }
+    println("proposal_inbox: selftest PASS")
+    return 0
+}
+
+fn _next_id(repo: string) -> string {
+    // Format: <prefix>-<YYYYMMDD>-<3-digit seq>.
+    // Seq derived from grep of existing ids matching today's date.
+    let prefix = _repo_prefix(repo)
+    let date = _date_compact()
+    let path = _inventory_path(repo)
+    if !_exists(path) { return prefix + "-" + date + "-001" }
+    // ERE form: {3} (not BRE \{3\}); -o prints each match on its own line
+    let pattern = "\"" + prefix + "-" + date + "-[0-9]{3}\""
+    let cmd = "grep -oE '" + pattern + "' " + _sh_q(path) + " 2>/dev/null | sort -u | wc -l"
+    let n = _atoi(to_string(exec(cmd)).trim())
+    let seq = n + 1
+    let mut s = to_string(seq)
+    while len(s) < 3 { s = "0" + s }
+    return prefix + "-" + date + "-" + s
+}
+
+fn _cmd_submit(args: array) -> int {
+    let to_repo   = _arg_value(args, "--to", "")
+    let from_repo = _arg_value(args, "--from", _detect_self_repo())
+    let kind      = _arg_value(args, "--kind", "other")
+    let category  = _arg_value(args, "--category", "")
+    let title     = _arg_value(args, "--title", "")
+    let prompt    = _arg_value(args, "--prompt-ref", "")
+    let prio      = _arg_value(args, "--priority", "50")
+
+    if len(to_repo) == 0 || len(title) == 0 {
+        eprintln("proposal_inbox submit: --to <repo> and --title required")
+        return 2
+    }
+
+    let inv = _inventory_path(to_repo)
+    if !_exists(inv) {
+        eprintln("proposal_inbox submit: target inventory not found: " + inv)
+        eprintln("  create it first with: hexa tool/proposal_inbox.hexa init --repo " + to_repo)
+        return 2
+    }
+
+    let id = _next_id(to_repo)
+    let ts = _iso_now()
+
+    // Build entry JSON (compact one-line for jq-free append).
+    let mut entry = "{\"id\":\"" + id + "\""
+        + ",\"kind\":\"" + _json_esc(kind) + "\""
+        + ",\"title\":\"" + _json_esc(title) + "\""
+        + ",\"from_repo\":\"" + _json_esc(from_repo) + "\""
+        + ",\"user_status\":\"pending\""
+        + ",\"score_priority\":" + prio
+        + ",\"submitted_ts\":\"" + ts + "\""
+    if len(category) > 0 {
+        entry = entry + ",\"category\":\"" + _json_esc(category) + "\""
+    }
+    if len(prompt) > 0 {
+        entry = entry + ",\"prompt_ref\":\"" + _json_esc(prompt) + "\""
+    }
+    entry = entry + "}"
+
+    // Insert into "entries" array — use python3 for reliable JSON edit
+    // (hexa side-effect free; python3 is harness-standard).
+    let py = "python3 - <<'PY'\n"
+           + "import json\n"
+           + "p = " + _sh_q(inv) + "\n"
+           + "d = json.load(open(p))\n"
+           + "d.setdefault('entries', []).append(" + entry + ")\n"
+           + "d['updated_ts'] = " + _sh_q(ts) + "\n"
+           + "json.dump(d, open(p, 'w'), indent=2, ensure_ascii=False)\n"
+           + "print('ok', " + _sh_q(id) + ")\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    if r[1] != 0 {
+        eprintln("proposal_inbox submit: python write FAIL rc=" + to_string(r[1]))
+        eprintln(to_string(r[0]))
+        return 1
+    }
+    println("proposal_inbox submit: " + id + " → " + to_repo + "  (" + kind + "/" + title + ")")
+    return 0
+}
+
+fn _cmd_list(args: array) -> int {
+    let repo = _arg_value(args, "--repo", _detect_self_repo())
+    let status_filter = _arg_value(args, "--status", "")
+    let inv = _inventory_path(repo)
+    if !_exists(inv) {
+        eprintln("proposal_inbox list: no inventory at " + inv)
+        return 2
+    }
+    let py = "python3 - <<'PY'\n"
+           + "import json\n"
+           + "d = json.load(open(" + _sh_q(inv) + "))\n"
+           + "st = " + _sh_q(status_filter) + "\n"
+           + "entries = d.get('entries', [])\n"
+           + "if st:\n"
+           + "    entries = [e for e in entries if e.get('user_status','') == st]\n"
+           + "for e in entries:\n"
+           + "    prio = e.get('score_priority', '?')\n"
+           + "    status = e.get('user_status','?')\n"
+           + "    frm = e.get('from_repo','?')\n"
+           + "    print(f\"  {e.get('id','?'):24s} [{status:12s}] prio={prio:>3} from={frm:14s} {e.get('kind',''):10s} {e.get('title','')}\")\n"
+           + "print(f'total: {len(entries)}' + (f' (status={st})' if st else ''))\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    println(to_string(r[0]))
+    return r[1]
+}
+
+fn _cmd_next(args: array) -> int {
+    let repo = _arg_value(args, "--repo", _detect_self_repo())
+    let inv = _inventory_path(repo)
+    if !_exists(inv) {
+        eprintln("proposal_inbox next: no inventory at " + inv)
+        return 2
+    }
+    let py = "python3 - <<'PY'\n"
+           + "import json\n"
+           + "d = json.load(open(" + _sh_q(inv) + "))\n"
+           + "pending = [e for e in d.get('entries', [])\n"
+           + "    if e.get('user_status','pending') == 'pending']\n"
+           + "if not pending:\n"
+           + "    print('  (inbox empty — nothing pending)')\n"
+           + "else:\n"
+           + "    pending.sort(key=lambda e: -int(e.get('score_priority', 50)))\n"
+           + "    e = pending[0]\n"
+           + "    print(f\"next proposal for {d.get('_meta',{}).get('owner_repo','?')}:\\n\")\n"
+           + "    print(f\"  id       : {e.get('id','?')}\")\n"
+           + "    print(f\"  from     : {e.get('from_repo','?')}\")\n"
+           + "    print(f\"  kind     : {e.get('kind','?')}\")\n"
+           + "    print(f\"  title    : {e.get('title','')}\")\n"
+           + "    if 'category' in e: print(f\"  category : {e['category']}\")\n"
+           + "    if 'prompt_ref' in e: print(f\"  prompt   : {e['prompt_ref']}\")\n"
+           + "    print(f\"  priority : {e.get('score_priority','?')}\")\n"
+           + "    print(f\"  submitted: {e.get('submitted_ts','?')}\")\n"
+           + "    print()\n"
+           + "    print(f\"  ack cmd  : hexa $HEXA_LANG/tool/proposal_inbox.hexa ack {e.get('id','?')} --repo {d.get('_meta',{}).get('owner_repo','?')}\")\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    println(to_string(r[0]))
+    return r[1]
+}
+
+fn _cmd_status_change(args: array, new_status: string) -> int {
+    if len(args) < 1 {
+        eprintln("proposal_inbox " + new_status + ": id required")
+        return 2
+    }
+    let id = args[0]
+    let mut rest = []
+    let mut i = 1
+    while i < len(args) { rest.push(args[i]); i = i + 1 }
+    let repo = _arg_value(rest, "--repo", _detect_self_repo())
+    let note = _arg_value(rest, "--note", "")
+    let inv = _inventory_path(repo)
+    let ts = _iso_now()
+
+    let py = "python3 - <<'PY'\n"
+           + "import json\n"
+           + "p = " + _sh_q(inv) + "\n"
+           + "d = json.load(open(p))\n"
+           + "target = " + _sh_q(id) + "\n"
+           + "new_st = " + _sh_q(new_status) + "\n"
+           + "note = " + _sh_q(note) + "\n"
+           + "ts = " + _sh_q(ts) + "\n"
+           + "found = False\n"
+           + "for e in d.get('entries', []):\n"
+           + "    if e.get('id') == target:\n"
+           + "        e['user_status'] = new_st\n"
+           + "        e[new_st + '_ts'] = ts\n"
+           + "        if note: e[new_st + '_note'] = note\n"
+           + "        found = True\n"
+           + "        break\n"
+           + "if not found:\n"
+           + "    print('not found'); raise SystemExit(3)\n"
+           + "d['updated_ts'] = ts\n"
+           + "json.dump(d, open(p, 'w'), indent=2, ensure_ascii=False)\n"
+           + "print(f'ok {target} → {new_st}')\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    println(to_string(r[0]))
+    return r[1]
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if len(args) == 0 {
+        eprintln("usage: proposal_inbox {selftest|submit|list|next|ack|done} [args]")
+        exit(2)
+    }
+    let cmd = args[0]
+    let mut rest = []
+    let mut k = 1
+    while k < len(args) { rest.push(args[k]); k = k + 1 }
+
+    if cmd == "--selftest" || cmd == "selftest" { exit(_selftest()) }
+    if cmd == "submit" { exit(_cmd_submit(rest)) }
+    if cmd == "list"   { exit(_cmd_list(rest)) }
+    if cmd == "next"   { exit(_cmd_next(rest)) }
+    if cmd == "ack"    { exit(_cmd_status_change(rest, "in_progress")) }
+    if cmd == "done"   { exit(_cmd_status_change(rest, "done")) }
+
+    eprintln("proposal_inbox: unknown subcommand '" + cmd + "'")
+    exit(2)
+}
