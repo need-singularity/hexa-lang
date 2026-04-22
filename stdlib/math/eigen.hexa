@@ -1,0 +1,279 @@
+// HEXA Standard Library — math/eigen
+// Symmetric eigendecomposition via cyclic Jacobi rotations (roadmap 58).
+//
+// Public API:
+//   pub fn eigh(A: array, n: int) -> array
+//     Symmetric n x n matrix given row-major flat (length n*n).
+//     Returns [values, vectors] where values is a length-n array of
+//     eigenvalues sorted descending, vectors is an array-of-rows so
+//     vectors[k] is the k-th eigenvector (length n). Eigenvectors are
+//     sign-canonicalized: first entry with |v| > 1e-10 is positive.
+//
+//   pub fn eigvalsh(A: array, n: int) -> array
+//     Values only (sorted descending).
+//
+//   pub fn eigh_jacobi(A: array, n: int, max_sweeps: int, tol: float) -> array
+//     Returns [values, vectors, actual_sweeps].
+//
+// Algorithm: classical cyclic Jacobi. Each sweep visits every super-
+// diagonal pair (i, j). A pair is rotated by angle theta so that the
+// off-diagonal M[i,j] is zeroed. Iteration converges quadratically for
+// symmetric matrices. Convergence test: off-diagonal sum below
+// tol * frobenius_norm(M).
+//
+// All functions avoid BLAS dependencies — the (i,j) plane rotation is
+// applied inline with six floating-point multiplies per affected entry.
+
+let EIGEN_TOL_CELL = 1.0e-14
+let EIGEN_SIGN_THRESHOLD = 1.0e-10
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn eigen_sign(x) {
+    if x >= 0.0 { return 1.0 } else { return -1.0 }
+}
+
+// Build 2D working matrix (array of rows) from flat row-major input.
+fn eigen_to_2d(A, n) {
+    let mut M = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            row.push(A[i * n + j])
+            j = j + 1
+        }
+        M.push(row)
+        i = i + 1
+    }
+    return M
+}
+
+fn eigen_identity(n) {
+    let mut V = []
+    let mut i = 0
+    while i < n {
+        let mut row = []
+        let mut j = 0
+        while j < n {
+            if i == j { row.push(1.0) } else { row.push(0.0) }
+            j = j + 1
+        }
+        V.push(row)
+        i = i + 1
+    }
+    return V
+}
+
+fn eigen_off_diag_sum(M, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n - 1 {
+        let mut j = i + 1
+        while j < n {
+            let v = M[i][j]
+            if v < 0.0 { s = s - v } else { s = s + v }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return s
+}
+
+fn eigen_frob(M, n) {
+    let mut s = 0.0
+    let mut i = 0
+    while i < n {
+        let mut j = 0
+        while j < n {
+            s = s + M[i][j] * M[i][j]
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return sqrt(s)
+}
+
+// Symmetry check: |A[i,j] - A[j,i]| < eps for all i,j.
+fn sym_check(A: array, n: int, eps: float) -> bool {
+    let mut i = 0
+    while i < n {
+        let mut j = i + 1
+        while j < n {
+            let a = A[i * n + j]
+            let b = A[j * n + i]
+            let d = if a > b { a - b } else { b - a }
+            if d > eps { return false }
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return true
+}
+
+// Sign-canonicalize: each row (eigenvector) scanned left-to-right for
+// first |entry| > threshold; if that entry is negative flip whole row.
+fn canonicalize_sign(V: array, n: int) {
+    let mut k = 0
+    while k < n {
+        let mut idx = 0
+        let mut found = false
+        while idx < n {
+            let av = if V[k][idx] < 0.0 { 0.0 - V[k][idx] } else { V[k][idx] }
+            if av > EIGEN_SIGN_THRESHOLD {
+                found = true
+                if V[k][idx] < 0.0 {
+                    let mut t = 0
+                    while t < n {
+                        V[k][t] = 0.0 - V[k][t]
+                        t = t + 1
+                    }
+                }
+                idx = n
+            } else {
+                idx = idx + 1
+            }
+        }
+        if found == false {
+            // all zero eigenvector (degenerate); skip
+        }
+        k = k + 1
+    }
+}
+
+// ── Core Jacobi driver ──────────────────────────────────────────
+
+pub fn eigh_jacobi(A: array, n: int, max_sweeps: int, tol: float) -> array {
+    let mut M = eigen_to_2d(A, n)
+    let mut V = eigen_identity(n)
+
+    let mut sweep = 0
+    let mut done_sweeps = 0
+    while sweep < max_sweeps {
+        done_sweeps = sweep + 1
+        let off = eigen_off_diag_sum(M, n)
+        let frob = eigen_frob(M, n)
+        if off < tol * frob { sweep = max_sweeps } else {
+            let mut i = 0
+            while i < n - 1 {
+                let mut j = i + 1
+                while j < n {
+                    let mij = M[i][j]
+                    let amij = if mij < 0.0 { 0.0 - mij } else { mij }
+                    if amij >= EIGEN_TOL_CELL {
+                        let mii = M[i][i]
+                        let mjj = M[j][j]
+                        let tau = (mjj - mii) / (2.0 * mij)
+                        let atau = if tau < 0.0 { 0.0 - tau } else { tau }
+                        let t = eigen_sign(tau) / (atau + sqrt(1.0 + tau * tau))
+                        let c = 1.0 / sqrt(1.0 + t * t)
+                        let s = t * c
+
+                        // Apply Jᵀ M J — update rows i, j and columns i, j.
+                        // New diagonals:
+                        let new_ii = mii - t * mij
+                        let new_jj = mjj + t * mij
+                        M[i][i] = new_ii
+                        M[j][j] = new_jj
+                        M[i][j] = 0.0
+                        M[j][i] = 0.0
+
+                        // Off-diagonals not in {i,j}×{i,j}: mix rows i, j
+                        // (columns i, j follow by symmetry).
+                        let mut k = 0
+                        while k < n {
+                            if k != i {
+                                if k != j {
+                                    let mik = M[i][k]
+                                    let mjk = M[j][k]
+                                    let nik = c * mik - s * mjk
+                                    let njk = s * mik + c * mjk
+                                    M[i][k] = nik
+                                    M[j][k] = njk
+                                    M[k][i] = nik
+                                    M[k][j] = njk
+                                }
+                            }
+                            k = k + 1
+                        }
+
+                        // Update eigenvector matrix: V' = V J.
+                        // Columns i and j of V mix: V[:,i] = c*V[:,i] - s*V[:,j],
+                        // V[:,j] = s*V[:,i] + c*V[:,j].
+                        let mut r = 0
+                        while r < n {
+                            let vri = V[r][i]
+                            let vrj = V[r][j]
+                            V[r][i] = c * vri - s * vrj
+                            V[r][j] = s * vri + c * vrj
+                            r = r + 1
+                        }
+                    }
+                    j = j + 1
+                }
+                i = i + 1
+            }
+            sweep = sweep + 1
+        }
+    }
+
+    // Extract eigenvalues (diagonal of M).
+    let mut vals = []
+    let mut d = 0
+    while d < n {
+        vals.push(M[d][d])
+        d = d + 1
+    }
+
+    // Sort descending — selection sort (n small for Jacobi use cases).
+    let mut perm = []
+    let mut pidx = 0
+    while pidx < n {
+        perm.push(pidx)
+        pidx = pidx + 1
+    }
+    let mut a = 0
+    while a < n {
+        let mut best = a
+        let mut b = a + 1
+        while b < n {
+            if vals[b] > vals[best] { best = b }
+            b = b + 1
+        }
+        if best != a {
+            let tv = vals[a]; vals[a] = vals[best]; vals[best] = tv
+            let tp = perm[a]; perm[a] = perm[best]; perm[best] = tp
+        }
+        a = a + 1
+    }
+
+    // Build output vectors: out_vectors[k][row] = V[row][perm[k]].
+    let mut out_vectors = []
+    let mut k = 0
+    while k < n {
+        let src = perm[k]
+        let mut row = []
+        let mut r = 0
+        while r < n {
+            row.push(V[r][src])
+            r = r + 1
+        }
+        out_vectors.push(row)
+        k = k + 1
+    }
+
+    canonicalize_sign(out_vectors, n)
+
+    return [vals, out_vectors, done_sweeps]
+}
+
+pub fn eigh(A: array, n: int) -> array {
+    let result = eigh_jacobi(A, n, 100, 1.0e-12)
+    return [result[0], result[1]]
+}
+
+pub fn eigvalsh(A: array, n: int) -> array {
+    let result = eigh_jacobi(A, n, 100, 1.0e-12)
+    return result[0]
+}
