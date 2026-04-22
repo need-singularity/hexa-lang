@@ -1,22 +1,17 @@
-// tool/hx_pattern_mine.hexa — Phase 3.10 AST subtree pattern miner (stub).
+// tool/hx_pattern_mine.hexa — Phase 3.10 line n-gram pattern miner (real-v1).
 //
 // SPEC: docs/hexa_lang_meta_evolution_proposal_20260422.md §3.10.
-// STATUS: stub — skeleton + --selftest only.
-//
-// PURPOSE
-//   Hash AST subtrees across tool/*.hexa, count occurrences. Patterns
-//   with ≥5 occurrences and ≥3 LOC savings potential become macro /
-//   stdlib candidates. Feeds Phase 6 meta-evolution (emergent stdlib
-//   API design from actual usage).
+// STATUS: v1 real — line-level n-gram (default N=5) across tool/*.hexa,
+//         normalized (strip leading ws + // trailing comments + blank
+//         filter). Group identical windows, report occurrences ≥ min.
+//         True AST-subtree hashing deferred to v2.
 //
 // CLI
 //   hexa tool/hx_pattern_mine.hexa --selftest
-//   hexa tool/hx_pattern_mine.hexa [--min-occurrences N] [--out <path>]
+//   hexa tool/hx_pattern_mine.hexa [--n N] [--min M] [--top T] [--out <path>]
 //
 // OUTPUT
-//   $HEXA_LANG/state/hx_pattern_mine.json
-//   $HEXA_LANG/docs/pattern_mine_candidates.md
-//   schema = "hexa-lang/hx_pattern_mine/1"
+//   $HEXA_LANG/state/hx_pattern_mine.json  (schema hexa-lang/hx_pattern_mine/1)
 
 fn _home() -> string {
     let h = env("HOME")
@@ -40,25 +35,78 @@ fn _arg_value(args: array, key: string, default: string) -> string {
     return default
 }
 
-fn _selftest() -> int {
-    if len(_iso_now()) < 10 {
-        eprintln("hx_pattern_mine: selftest FAIL")
-        return 1
-    }
-    println("hx_pattern_mine: selftest PASS (stub)")
-    return 0
+fn _json_esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
 }
 
-fn _emit(min_occ: string, out_path: string) -> int {
-    let ts = _iso_now()
-    let body = "{\n  \"schema\": \"hexa-lang/hx_pattern_mine/1\",\n  \"ts\": \"" + ts + "\",\n  \"status\": \"stub\",\n  \"min_occurrences\": " + min_occ + ",\n  \"patterns\": [],\n  \"summary\": {\"total_patterns\": 0, \"macro_candidates\": 0, \"stdlib_candidates\": 0}\n}\n"
-    try {
-        write_file(out_path, body)
-    } catch e {
-        eprintln("hx_pattern_mine: write FAIL " + out_path)
+fn _split_lines(s: string) -> array {
+    let mut out = []
+    let mut cur = ""
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "\n" {
+            out.push(cur)
+            cur = ""
+        } else {
+            cur = cur + c
+        }
+        i = i + 1
+    }
+    if len(cur) > 0 { out.push(cur) }
+    return out
+}
+
+fn _atoi(s: string) -> int {
+    if s == "" { return 0 }
+    return s.parse_int()
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _root() -> string {
+    return _home() + "/core/hexa-lang"
+}
+
+fn _index_of_str(arr: array, s: string) -> int {
+    let mut i = 0
+    while i < len(arr) {
+        if arr[i] == s { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _normalize(raw: string) -> string {
+    let mut s = raw
+    while len(s) > 0 {
+        let c = s.substring(0, 1)
+        if c == " " || c == "\t" { s = s.substring(1, len(s)) } else { break }
+    }
+    let sl = s.index_of("//")
+    if sl >= 0 { s = s.substring(0, sl) }
+    while len(s) > 0 {
+        let last = s.substring(len(s) - 1, len(s))
+        if last == " " || last == "\t" { s = s.substring(0, len(s) - 1) } else { break }
+    }
+    return s
+}
+
+fn _selftest() -> int {
+    let norm_out = _normalize("    let x = 1 // comment")
+    if norm_out != "let x = 1" {
+        eprintln("hx_pattern_mine: selftest FAIL (normalize: '" + norm_out + "')")
         return 1
     }
-    println("hx_pattern_mine: wrote " + out_path + " (stub)")
+    if _atoi("7") != 7 { eprintln("hx_pattern_mine: selftest FAIL (atoi)"); return 1 }
+    println("hx_pattern_mine: selftest PASS")
     return 0
 }
 
@@ -68,12 +116,125 @@ fn main() {
     let mut i = 2
     while i < len(av) { args.push(av[i]); i = i + 1 }
 
-    if len(args) >= 1 && args[0] == "--selftest" {
-        exit(_selftest())
+    if len(args) >= 1 && args[0] == "--selftest" { exit(_selftest()) }
+
+    let n_window = _atoi(_arg_value(args, "--n", "5"))
+    let min_occ  = _atoi(_arg_value(args, "--min", "5"))
+    let top_k    = _atoi(_arg_value(args, "--top", "20"))
+    let default_out = _root() + "/state/hx_pattern_mine.json"
+    let out_path = _arg_value(args, "--out", default_out)
+    let ts = _iso_now()
+
+    let tool_dir = _root() + "/tool"
+    let raw_ls = to_string(exec("ls " + _sh_q(tool_dir) + " 2>/dev/null | grep '\\.hexa$'"))
+    let files = _split_lines(raw_ls)
+
+    let mut keys = []
+    let mut counts = []
+    let mut samples = []
+
+    let mut total_ngrams = 0
+    let mut files_scanned = 0
+
+    for fname in files {
+        if len(fname) == 0 { continue }
+        let path = tool_dir + "/" + fname
+        let raw = to_string(exec("cat " + _sh_q(path) + " 2>/dev/null"))
+        let lines_all = _split_lines(raw)
+        let mut norm = []
+        for ln in lines_all {
+            let nn = _normalize(ln)
+            if len(nn) == 0 { continue }
+            norm.push(nn)
+        }
+        if len(norm) < n_window { continue }
+        files_scanned = files_scanned + 1
+
+        let mut j = 0
+        while j + n_window <= len(norm) {
+            let mut key = ""
+            let mut k = 0
+            while k < n_window {
+                if k > 0 { key = key + "|" }
+                key = key + norm[j + k]
+                k = k + 1
+            }
+            total_ngrams = total_ngrams + 1
+
+            let idx = _index_of_str(keys, key)
+            if idx < 0 {
+                keys.push(key)
+                counts.push(1)
+                let disp = if len(norm[j]) > 80 { norm[j].substring(0, 77) + "..." } else { norm[j] }
+                samples.push(disp)
+            } else {
+                counts[idx] = counts[idx] + 1
+            }
+            j = j + 1
+        }
     }
 
-    let min_occ = _arg_value(args, "--min-occurrences", "5")
-    let default_out = _home() + "/core/hexa-lang/state/hx_pattern_mine.json"
-    let out_path = _arg_value(args, "--out", default_out)
-    exit(_emit(min_occ, out_path))
+    // Collect indices with count >= min_occ, sort desc by count
+    let mut candidates = []
+    let mut p = 0
+    while p < len(counts) {
+        if counts[p] >= min_occ { candidates.push(p) }
+        p = p + 1
+    }
+    // insertion sort (small N expected — only candidates kept)
+    let mut s = 1
+    while s < len(candidates) {
+        let cur = candidates[s]
+        let cur_c = counts[cur]
+        let mut t = s - 1
+        while t >= 0 && counts[candidates[t]] < cur_c {
+            candidates[t + 1] = candidates[t]
+            t = t - 1
+        }
+        candidates[t + 1] = cur
+        s = s + 1
+    }
+
+    let mut top_entries = []
+    let mut e = 0
+    while e < len(candidates) && e < top_k {
+        let ix = candidates[e]
+        let entry = "{\"first_line\":\"" + _json_esc(samples[ix])
+            + "\",\"occurrences\":" + to_string(counts[ix])
+            + ",\"savings\":" + to_string((counts[ix] - 1) * n_window) + "}"
+        top_entries.push(entry)
+        e = e + 1
+    }
+
+    let mut body = "{\n  \"schema\": \"hexa-lang/hx_pattern_mine/1\",\n"
+    body = body + "  \"ts\": \"" + ts + "\",\n"
+    body = body + "  \"status\": \"real-v1\",\n"
+    body = body + "  \"n_window\": " + to_string(n_window) + ",\n"
+    body = body + "  \"min_occ\": " + to_string(min_occ) + ",\n"
+    body = body + "  \"files_scanned\": " + to_string(files_scanned) + ",\n"
+    body = body + "  \"distinct_ngrams\": " + to_string(len(keys)) + ",\n"
+    body = body + "  \"total_ngrams\": " + to_string(total_ngrams) + ",\n"
+    body = body + "  \"candidates_ge_min\": " + to_string(len(candidates)) + ",\n"
+    body = body + "  \"top\": [\n"
+    let mut first = true
+    for ent in top_entries {
+        if !first { body = body + ",\n" }
+        body = body + "    " + ent
+        first = false
+    }
+    body = body + "\n  ],\n"
+    body = body + "  \"summary\": {\"distinct\": " + to_string(len(keys))
+    body = body + ", \"ge_min\": " + to_string(len(candidates)) + "}\n}\n"
+
+    try { write_file(out_path, body) } catch e {
+        eprintln("hx_pattern_mine: write FAIL " + out_path)
+        exit(1)
+    }
+
+    println("hx_pattern_mine: files=" + to_string(files_scanned)
+          + " ngrams=" + to_string(total_ngrams)
+          + " distinct=" + to_string(len(keys))
+          + " >=" + to_string(min_occ) + ":" + to_string(len(candidates)))
+    println("hx_pattern_mine: wrote " + out_path)
+    exit(0)
 }
