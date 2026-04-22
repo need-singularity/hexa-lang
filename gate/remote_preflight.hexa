@@ -1,0 +1,355 @@
+// gate/remote_preflight.hexa — fast parallel TCP probe for remote-dispatch hosts.
+//
+// Problem (2026-04-22, evidence from ~/core/anima session log):
+//   `nexus drill` serially TCP-dials each configured host with ConnectTimeout=5.
+//   When both hosts are down, the user waits 10+ s per invocation before the
+//   resolver emits `NEXUS_REMOTE_ERROR` and aborts. The resolver message is
+//   rich, but it arrives too late — the user paid the full timeout thrice in
+//   one session before realizing the hosts were unreachable.
+//
+// This tool:
+//   • Probes N hosts in parallel over TCP (default port 22).
+//   • Sub-second per-host connect timeout (default 300 ms via `timeout`
+//     + bash /dev/tcp, fallback nc -G 1 if gnu timeout unavailable).
+//   • Short-TTL cache at $HOME/.hx/cache/remote_preflight.json (default 30 s)
+//     so back-to-back invocations share the probe result and cost ~0 s on hit.
+//   • Exit codes match the existing resolver contract:
+//       0  — at least one host reachable (prints first OK host to stdout)
+//       64 — no hosts configured  (resolver `all_unreachable` / tried=[])
+//       74 — all hosts unreachable on Darwin (heavy-compute abort)
+//   • stderr JSON lines match the existing resolver contract so downstream
+//     log parsers don't need changes:
+//       NEXUS_REMOTE_PREFLIGHT {"verdict":"ok|all_unreachable","hosts":[...]}
+//       (on all_unreachable) NEXUS_REMOTE_ERROR {"hosts_tried":[...],"reason":"all_unreachable","exit_code":74}
+//
+// usage:
+//   hexa run gate/remote_preflight.hexa [--hosts ubu,ubu2] [--port 22]
+//                                       [--timeout-ms 300] [--ttl-s 30]
+//                                       [--no-cache] [--json-only]
+//
+// Falls back to env when flags absent:
+//   HEXA_REMOTE_HOSTS=ubu,ubu2  HEXA_REMOTE_PORT=22
+//   HEXA_REMOTE_PREFLIGHT_TIMEOUT_MS=300  HEXA_REMOTE_PREFLIGHT_TTL_S=30
+//
+// Integration:
+//   • gate/hexa_url.hexa :: dispatch_remote — calls this before ssh,
+//     shortcircuits to ai_err on all-unreachable.
+//   • nexus drill resolver (out-of-tree in ~/core/nexus/cli/run.hexa) —
+//     intended to call this before `hexa_remote` dispatch. That patch
+//     lives with nexus; this repo owns the primitive.
+//
+// @allow-bare-exec
+// @no-sandbox (TCP probe is a read-only network op; respects raw:os-lock)
+
+let HOME_ = env("HOME")
+let CACHE_DIR = HOME_ + "/.hx/cache"
+let CACHE_PATH = CACHE_DIR + "/remote_preflight.json"
+
+// ─── ai-native error helper (matches gate/hexa_url.hexa style) ──────────
+fn ai_err(code: str, what: str, fix: str, ssot: str) -> void {
+    eprintln("[remote-preflight/" + code + "] " + what)
+    eprintln("  fix: " + fix)
+    eprintln("  ssot: " + ssot)
+}
+
+// ─── darwin detection ──────────────────────────────────────────────────
+// Reuse existing convention (stage0 Gatekeeper + 4GB RSS cap guard triggers
+// heavy-compute abort only on Darwin). On Linux we WARN instead of exit 74
+// — Linux hosts can still fall back to local without OOM risk.
+fn is_darwin() -> bool {
+    let u = to_string(exec("uname -s 2>/dev/null")).trim()  // @allow-bare-exec
+    return u == "Darwin"
+}
+
+// ─── shell quoting (avoid shell injection on host names) ────────────────
+fn sh_q(s: str) -> str {
+    let mut out = "'"
+    let n = s.len()
+    let mut i = 0
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if c == "'" { out = out + "'\\''" } else { out = out + c }
+        i = i + 1
+    }
+    out = out + "'"
+    return out
+}
+
+// ─── CSV split → trimmed non-empty list ────────────────────────────────
+fn split_hosts(csv: str) -> [str] {
+    let mut out = []
+    if csv.len() == 0 { return out }
+    let parts = csv.split(",")
+    let mut i = 0
+    while i < parts.len() {
+        let t = parts[i].trim()
+        if t.len() > 0 { out = out + [t] }
+        i = i + 1
+    }
+    return out
+}
+
+// ─── argv parsing (small, no dependency on an arg-parser lib) ───────────
+fn get_flag(argv: [str], name: str, dflt: str) -> str {
+    let mut i = 0
+    while i < argv.len() {
+        if argv[i] == name && i + 1 < argv.len() { return argv[i + 1] }
+        if argv[i].starts_with(name + "=") {
+            return argv[i].substring(name.len() + 1, argv[i].len())
+        }
+        i = i + 1
+    }
+    return dflt
+}
+
+fn has_flag(argv: [str], name: str) -> bool {
+    let mut i = 0
+    while i < argv.len() {
+        if argv[i] == name { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// ─── cache — 30 s TTL JSON blob, best-effort ───────────────────────────
+// Shape:
+//   {"ts":<unix>,"hosts":["ubu","ubu2"],"port":22,"ok":["ubu"]}
+// Hit semantics: same hosts+port set, age <= ttl, at least one OK host.
+// On miss or stale, caller re-probes. Cache is fire-and-forget — corrupt
+// or missing file just returns a miss.
+fn _now_s() -> i64 {
+    let s = to_string(exec("date +%s")).trim()  // @allow-bare-exec
+    let mut n: i64 = 0
+    try { n = to_int(s) } catch e {}
+    return n
+}
+
+fn _hosts_key(hosts: [str], port: i64) -> str {
+    // Hosts are already order-preserved by caller. Key = "h1,h2|port".
+    let mut k = ""
+    let mut i = 0
+    while i < hosts.len() {
+        if i > 0 { k = k + "," }
+        k = k + hosts[i]
+        i = i + 1
+    }
+    return k + "|" + to_string(port)
+}
+
+fn cache_read(hosts: [str], port: i64, ttl_s: i64) -> [str] {
+    // Return OK-host list on hit, [] on miss/stale/corrupt.
+    if !file_exists(CACHE_PATH) { return [] }
+    let mut raw = ""
+    try { raw = read_file(CACHE_PATH) } catch e { return [] }
+    if raw.len() == 0 { return [] }
+    // Coarse JSON parse via jq — we're OK requiring jq for cache only (miss
+    // path still works without it).
+    let jq_ok = to_string(exec("command -v jq >/dev/null 2>&1 && echo y || echo n")).trim()  // @allow-bare-exec
+    if jq_ok != "y" { return [] }
+    let key = _hosts_key(hosts, port)
+    // Two-step jq query (simpler/more robust than one composite expression):
+    //   1. read timestamp       — "0" if absent
+    //   2. read hosts+port key  — compare to caller's key, miss if mismatch
+    //   3. read ok list         — returned on hit
+    let ts_s = to_string(exec("jq -r '.ts // 0' " + sh_q(CACHE_PATH) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    let cached_key = to_string(exec("jq -r '((.hosts//[])|join(\",\")) + \"|\" + ((.port//0)|tostring)' " + sh_q(CACHE_PATH) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    if cached_key != key { return [] }
+    let mut ts: i64 = 0
+    try { ts = to_int(ts_s) } catch e {}
+    let now = _now_s()
+    if now - ts > ttl_s { return [] }
+    let ok_csv = to_string(exec("jq -r '(.ok//[])|join(\",\")' " + sh_q(CACHE_PATH) + " 2>/dev/null")).trim()  // @allow-bare-exec
+    return split_hosts(ok_csv)
+}
+
+fn cache_write(hosts: [str], port: i64, ok: [str]) -> void {
+    // Best-effort — never fail the caller on cache write error.
+    exec_with_status("mkdir -p " + sh_q(CACHE_DIR))
+    let mut hs_json = "["
+    let mut i = 0
+    while i < hosts.len() {
+        if i > 0 { hs_json = hs_json + "," }
+        hs_json = hs_json + "\"" + hosts[i] + "\""
+        i = i + 1
+    }
+    hs_json = hs_json + "]"
+    let mut ok_json = "["
+    i = 0
+    while i < ok.len() {
+        if i > 0 { ok_json = ok_json + "," }
+        ok_json = ok_json + "\"" + ok[i] + "\""
+        i = i + 1
+    }
+    ok_json = ok_json + "]"
+    let now = _now_s()
+    let blob = "{\"ts\":" + to_string(now) + ",\"hosts\":" + hs_json +
+               ",\"port\":" + to_string(port) + ",\"ok\":" + ok_json + "}"
+    let quoted = sh_q(blob)
+    exec_with_status("printf '%s' " + quoted + " > " + sh_q(CACHE_PATH))
+}
+
+// ─── probe — one parallel shell round, sub-second per host ─────────────
+// Strategy:
+//   For each host, launch:
+//     timeout <secs> bash -c 'exec 3<>/dev/tcp/<host>/<port>' &
+//   Collect PIDs, wait, harvest exit codes. Exit 0 = connect succeeded.
+//   Total wall time ≈ max(per-host timeout) regardless of host count.
+//
+// Fallback: if `timeout` not found (rare on fresh boxes) use `nc -G 1 -z`
+//   which is 1 s minimum — still fast enough for UX.
+fn probe_parallel(hosts: [str], port: i64, timeout_ms: i64) -> [str] {
+    if hosts.len() == 0 { return [] }
+    let has_to = to_string(exec("command -v timeout >/dev/null 2>&1 && echo y || echo n")).trim()  // @allow-bare-exec
+    // Build a shell script that launches all probes, waits, and prints
+    // "<host> <rc>" per line. hexa side splits on ' ' + '\n'.
+    let port_s = to_string(port)
+    // timeout accepts fractional seconds in GNU coreutils; fall back to
+    // integer seconds (1s floor) for BSD nc path.
+    let secs = if timeout_ms < 1000 {
+        // Convert e.g. 300 → "0.3"
+        let ms_str = to_string(timeout_ms)
+        let pad = if ms_str.len() == 1 { "00" + ms_str }
+                  else if ms_str.len() == 2 { "0" + ms_str }
+                  else { ms_str }
+        let whole = if pad.len() <= 3 { "0" } else { pad.substring(0, pad.len() - 3) }
+        let frac = pad.substring(pad.len() - 3, pad.len())
+        whole + "." + frac
+    } else {
+        let s = timeout_ms / 1000
+        to_string(s)
+    }
+    let mut parts = []
+    let mut i = 0
+    while i < hosts.len() {
+        let h = hosts[i]
+        let slot = to_string(i)
+        // Probe one host — exit 0 if TCP connect succeeds, non-zero otherwise.
+        // Redirect stderr to /dev/null; we only care about the exit code.
+        let probe = if has_to == "y" {
+            // GNU timeout path — fractional seconds OK
+            "timeout " + secs + " bash -c 'exec 3<>/dev/tcp/" + h + "/" + port_s + "' >/dev/null 2>&1"
+        } else {
+            // BSD nc fallback — 1 s floor.
+            "nc -z -G 1 " + sh_q(h) + " " + port_s + " >/dev/null 2>&1"
+        }
+        parts.push("( " + probe + "; echo " + sh_q(h) + " $? > /tmp/.hexa_preflight_" + slot + " ) &\n")
+        i = i + 1
+    }
+    parts.push("wait\n")
+    i = 0
+    while i < hosts.len() {
+        let slot = to_string(i)
+        parts.push("cat /tmp/.hexa_preflight_" + slot + "; rm -f /tmp/.hexa_preflight_" + slot + "\n")
+        i = i + 1
+    }
+    let script = parts.join("")
+    let raw = to_string(exec("bash -c " + sh_q(script)))  // @allow-bare-exec
+    // Parse "<host> <rc>\n" lines
+    let mut ok: [str] = []
+    let lines = raw.split("\n")
+    let mut j = 0
+    while j < lines.len() {
+        let line = lines[j].trim()
+        if line.len() > 0 {
+            let sp = line.index_of(" ")
+            if sp > 0 {
+                let host = line.substring(0, sp)
+                let rc = line.substring(sp + 1, line.len()).trim()
+                if rc == "0" { ok = ok + [host] }
+            }
+        }
+        j = j + 1
+    }
+    return ok
+}
+
+// ─── JSON emitter (keep identical shape to existing resolver logs) ─────
+fn _json_host_array(hosts: [str]) -> str {
+    let mut s = "["
+    let mut i = 0
+    while i < hosts.len() {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + hosts[i] + "\""
+        i = i + 1
+    }
+    return s + "]"
+}
+
+fn emit_verdict(hosts: [str], ok: [str], verdict: str) -> void {
+    let j = "NEXUS_REMOTE_PREFLIGHT {\"verdict\":\"" + verdict +
+            "\",\"hosts\":" + _json_host_array(hosts) +
+            ",\"ok\":" + _json_host_array(ok) + "}"
+    eprintln(j)
+}
+
+fn emit_error_compat(hosts: [str], exit_code: i64) -> void {
+    // Match the existing NEXUS_REMOTE_ERROR format so downstream parsers
+    // (loop harness, ~/core/anima log ingest) don't need changes.
+    let j = "NEXUS_REMOTE_ERROR {\"hosts_tried\":" + _json_host_array(hosts) +
+            ",\"reason\":\"all_unreachable\",\"exit_code\":" + to_string(exit_code) + "}"
+    eprintln(j)
+}
+
+// ─── main ───────────────────────────────────────────────────────────────
+fn main() -> i64 {
+    let argv = args()
+    // Flags
+    let hosts_csv = get_flag(argv, "--hosts", env("HEXA_REMOTE_HOSTS"))
+    let port_s = get_flag(argv, "--port",
+                          if env("HEXA_REMOTE_PORT").len() > 0 { env("HEXA_REMOTE_PORT") } else { "22" })
+    let tmo_s = get_flag(argv, "--timeout-ms",
+                         if env("HEXA_REMOTE_PREFLIGHT_TIMEOUT_MS").len() > 0 { env("HEXA_REMOTE_PREFLIGHT_TIMEOUT_MS") } else { "300" })
+    let ttl_s = get_flag(argv, "--ttl-s",
+                         if env("HEXA_REMOTE_PREFLIGHT_TTL_S").len() > 0 { env("HEXA_REMOTE_PREFLIGHT_TTL_S") } else { "30" })
+    let no_cache = has_flag(argv, "--no-cache")
+    let json_only = has_flag(argv, "--json-only")
+
+    let hosts = split_hosts(hosts_csv)
+    if hosts.len() == 0 {
+        ai_err("NO-HOSTS",
+               "no hosts configured — pass --hosts ubu,ubu2 or set HEXA_REMOTE_HOSTS",
+               "hexa run gate/remote_preflight.hexa --hosts ubu,ubu2",
+               "gate/remote_preflight.hexa")
+        // exit 64 matches existing resolver — "tried=[]" empty-hosts path.
+        emit_error_compat([], 64)
+        return 64
+    }
+
+    let mut port: i64 = 22
+    try { port = to_int(port_s) } catch e { port = 22 }
+    let mut timeout_ms: i64 = 300
+    try { timeout_ms = to_int(tmo_s) } catch e { timeout_ms = 300 }
+    let mut ttl: i64 = 30
+    try { ttl = to_int(ttl_s) } catch e { ttl = 30 }
+
+    // Cache hit fast-path.
+    if !no_cache {
+        let cached = cache_read(hosts, port, ttl)
+        if cached.len() > 0 {
+            if !json_only { println(cached[0]) }
+            emit_verdict(hosts, cached, "ok")
+            return 0
+        }
+    }
+
+    // Cold probe.
+    let ok = probe_parallel(hosts, port, timeout_ms)
+    if !no_cache { cache_write(hosts, port, ok) }
+
+    if ok.len() == 0 {
+        emit_verdict(hosts, ok, "all_unreachable")
+        // Preserve existing resolver exit-code semantics:
+        //   Darwin → 74 (heavy-compute abort, matches stage0 Gatekeeper guard)
+        //   else   → 64 (generic unreachable, caller may fallback to local)
+        let code: i64 = if is_darwin() { 74 } else { 64 }
+        emit_error_compat(hosts, code)
+        return code
+    }
+
+    // At least one host reachable.
+    if !json_only { println(ok[0]) }
+    emit_verdict(hosts, ok, "ok")
+    return 0
+}
+
+exit(main())
