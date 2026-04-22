@@ -6681,6 +6681,7 @@ HexaVal hx_exec_capture;
 // struct layout are illegal.  Lazy-init mirrors _hexa_init_cached_strs().
 static int _fn_shims_ready = 0;
 static void _hexa_init_net_fn_shims(void);  // fwd decl — body in native/net.c
+static void _hexa_init_os_fn_shims(void);   // fwd decl — body in native/signal_flock.c
 static void _hexa_init_fn_shims(void) {
     if (_fn_shims_ready) return;
     // bootstrap free-fn shims (join, char_code, chr, bit_or)
@@ -6700,6 +6701,8 @@ static void _hexa_init_fn_shims(void) {
     // net_connect / net_read / net_write until hexa_v2 learns the
     // direct-lowering for these names (see native/net.c comment).
     _hexa_init_net_fn_shims();
+    // stdlib/os signal + flock free-fn shims (roadmap 62, 2026-04-22)
+    _hexa_init_os_fn_shims();
     _fn_shims_ready = 1;
 }
 
@@ -6741,4 +6744,17 @@ static void _hexa_init_fn_shims(void) {
  * file analogous to native/tensor_kernels.c for the hot kernel path.
  * ═══════════════════════════════════════════════════════════════════ */
 #include "native/net.c"
+
+/* ═══════════════════════════════════════════════════════════════════
+ * stdlib/os — signal + flock builtins (roadmap 62, 2026-04-22)
+ *
+ * Exposes hexa_os_sig_* (install / raise / drain / block / …) and
+ * hexa_os_flock_* (open / close) for the stdlib/os/{signal,flock}.hexa
+ * modules. Async-signal-safe self-pipe trampoline; O_CLOEXEC on flock
+ * fds so execve(3) does not leak locks into children.
+ *
+ * Implementation: native/signal_flock.c (see header comment for full
+ * contract + semantics).
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/signal_flock.c"
 
