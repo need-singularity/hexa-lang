@@ -6,7 +6,8 @@
 //   $HOME/.airgenome/roadmap_snapshot.jsonl.
 //
 //   Also enforces chflags uchg on .roadmap and chflags uappnd on .raw-audit,
-//   restoring the lock if it has been broken (OS-level invariant — raw#24).
+//   restoring the lock if it has been broken (OS-level invariant — raw#24),
+//   UNLESS a bounded hx_unlock window is currently active (see below).
 //
 // REPO LIST
 //   Hard-coded minimal list (hexa, no external config):
@@ -23,14 +24,24 @@
 //   last_modified    — mtime in ISO-8601
 //   chflags_ok       — whether uchg is currently set on .roadmap
 //   raw_audit_uappnd — whether uappnd is currently set on .raw-audit
+//   unlock_active    — true when hx_unlock's grace window is in effect
 //
 // OUTPUT
 //   appends one line to $HOME/.airgenome/roadmap_snapshot.jsonl
 //
 // INVARIANTS ENFORCED
-//   - .roadmap missing uchg    → re-applied
+//   - .roadmap missing uchg    → re-applied (unless unlock window active)
 //   - .raw-audit missing uappnd → re-applied
 //   (Only on darwin. Linux: no-op.)
+//
+// UNLOCK-WINDOW AWARENESS (2026-04-22)
+//   Reads the repo's .raw-audit for the most recent `| unlock | ok |` entry
+//   and compares it with the most recent `| lock |` / `| relock-auto |`.
+//   If the latest terminal event is an unlock that occurred within
+//   HEXA_RELOCK_GRACE_SEC seconds (default 300, matches hx_unlock default
+//   --window), chflags restoration is skipped so the operator's bounded
+//   edit window survives. Before this guard existed, the 60s watcher tick
+//   killed hx_unlock's 300s window after the first minute.
 
 fn _iso_utc_now() -> string {
     return to_string(exec("date -u +\"%Y-%m-%dT%H:%M:%SZ\"")).trim()
@@ -79,6 +90,104 @@ fn _restore_chflag(path: string, flag: string) -> bool {
     return r[1] == 0
 }
 
+// ─── unlock-window awareness (2026-04-22) ────────────────────────
+//
+// hx_unlock opens a bounded write window (default 300s) by clearing uchg
+// and scheduling a relock_daemon child. Without this guard, the 60s
+// watcher tick clobbered the window after ~60s by re-applying uchg
+// unconditionally. We now read .raw-audit to determine whether an
+// unlock grace is currently in effect per repo.
+
+fn _parse_int_digits(s: string) -> int {
+    let digits = "0123456789"
+    let mut n = 0
+    let mut j = 0
+    while j < len(s) {
+        let c = s.substring(j, j + 1)
+        if !digits.contains(c) { break }
+        n = n * 10 + (ord(c) - ord("0"))
+        j = j + 1
+    }
+    return n
+}
+
+fn _iso_to_epoch(iso: string) -> int {
+    if iso == "" { return 0 }
+    let mut cmd = ""
+    if _is_darwin() {
+        cmd = "date -u -j -f '%Y-%m-%dT%H:%M:%SZ' '" + iso + "' +%s 2>/dev/null"
+    } else {
+        cmd = "date -u -d '" + iso + "' +%s 2>/dev/null"
+    }
+    let out = to_string(exec(cmd)).trim()
+    return _parse_int_digits(out)
+}
+
+fn _now_epoch() -> int {
+    return _parse_int_digits(to_string(exec("date -u +%s")).trim())
+}
+
+fn _grace_seconds() -> int {
+    // HEXA_RELOCK_GRACE_SEC override (default 300, max 3600 — matches hx_unlock).
+    let raw = env("HEXA_RELOCK_GRACE_SEC")
+    if raw == "" { return 300 }
+    let n = _parse_int_digits(raw)
+    if n <= 0 { return 300 }
+    if n > 3600 { return 3600 }
+    return n
+}
+
+// Scan the tail of .raw-audit for the most recent unlock/lock/relock-auto
+// event. Returns ["kind", "iso_ts"] or ["", ""] if none found.
+// We only read the tail (last 200 lines) to bound work — all recent edits
+// live there for any realistic audit rotation cadence.
+fn _last_lock_event(audit_path: string) -> array {
+    let chk = exec_with_status("test -f '" + audit_path + "'")
+    if chk[1] != 0 { return ["", ""] }
+    let cmd = "tail -n 200 '" + audit_path
+              + "' | grep -E '\\| (unlock|lock|relock-auto) \\|' | tail -n 1"
+    let line = to_string(exec(cmd)).trim()
+    if line == "" { return ["", ""] }
+    // format: ISO_TS | KIND | ACTOR | reason | result | ...
+    let p1 = line.index_of(" | ")
+    if p1 <= 0 { return ["", ""] }
+    let ts = line.substring(0, p1).trim()
+    let rest = line.substring(p1 + 3, len(line))
+    let p2 = rest.index_of(" | ")
+    if p2 <= 0 { return ["", ""] }
+    let kind = rest.substring(0, p2).trim()
+    // Only accept unlock when result is ok (reject blocked/fail).
+    if kind == "unlock" {
+        // peek at field 4 (result)
+        let after_kind = rest.substring(p2 + 3, len(rest))  // after "KIND | "
+        let p3 = after_kind.index_of(" | ")                  // end of ACTOR
+        if p3 <= 0 { return ["", ""] }
+        let after_actor = after_kind.substring(p3 + 3, len(after_kind))
+        let p4 = after_actor.index_of(" | ")                 // end of REASON
+        if p4 <= 0 { return ["", ""] }
+        let after_reason = after_actor.substring(p4 + 3, len(after_actor))
+        let p5 = after_reason.index_of(" | ")
+        let mut result = after_reason
+        if p5 > 0 { result = after_reason.substring(0, p5).trim() }
+        else { result = after_reason.trim() }
+        if result != "ok" { return ["", ""] }
+    }
+    return [kind, ts]
+}
+
+fn _unlock_window_active(audit_path: string, grace_sec: int) -> bool {
+    let ev = _last_lock_event(audit_path)
+    let kind = ev[0]
+    let ts = ev[1]
+    if kind != "unlock" { return false }
+    let unlock_epoch = _iso_to_epoch(ts)
+    if unlock_epoch <= 0 { return false }
+    let now = _now_epoch()
+    if now <= 0 { return false }
+    let elapsed = now - unlock_epoch
+    return elapsed < grace_sec
+}
+
 fn _mtime_iso(path: string) -> string {
     let chk = exec_with_status("test -e '" + path + "'")
     if chk[1] != 0 { return "" }
@@ -116,10 +225,21 @@ fn _scan_repo(home: string, name: string) -> string {
         raw_audit_ok = _has_chflag(apath, "uchg") || _has_chflag(apath, "uappnd")
     }
 
+    // Honour active hx_unlock grace window — skip chflags restoration
+    // while the operator's bounded edit window is in effect. Without
+    // this guard, the 60s watcher tick killed hx_unlock's 300s window.
+    let grace = _grace_seconds()
+    let mut unlock_active = false
+    if audit_exists[1] == 0 {
+        unlock_active = _unlock_window_active(apath, grace)
+    }
+
     // Auto-restore — OS-level deterministic invariant.
-    if !chflags_ok {
+    if !chflags_ok && !unlock_active {
         let _ = _restore_chflag(rpath, "uchg")
     }
+    // .raw-audit uappnd is separate from unlock window semantics (hx_unlock
+    // does not clear it); always restore if missing.
     if audit_exists[1] == 0 && !raw_audit_ok {
         let _ = _restore_chflag(apath, "uappnd")
     }
@@ -141,6 +261,8 @@ fn _scan_repo(home: string, name: string) -> string {
     if chflags_ok { parts.push("true") } else { parts.push("false") }
     parts.push(",\"raw_audit_ok\":")
     if raw_audit_ok { parts.push("true") } else { parts.push("false") }
+    parts.push(",\"unlock_active\":")
+    if unlock_active { parts.push("true") } else { parts.push("false") }
     parts.push(",\"last_modified\":\"")
     parts.push(mtime)
     parts.push("\"}")
