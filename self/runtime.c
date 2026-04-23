@@ -6108,6 +6108,17 @@ HexaVal hexa_now_monotonic_s(void) {
     return hexa_float((double)ts.tv_sec + (double)ts.tv_nsec / 1e9);
 }
 
+// mono_ns(): TAG_INT nanoseconds from CLOCK_MONOTONIC. Exposed because
+// to_string(clock()) truncates sub-second precision via double→string
+// formatting, which caused stderr_tmp collisions (fix 1472b62d). Callers
+// building unique filenames should use to_string(mono_ns()) directly
+// and skip the mktemp fork in runtime_tmpname fallback (perf).
+HexaVal hexa_mono_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return hexa_int((int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec);
+}
+
 // utc_iso_now(): RFC-3339 / ISO-8601 UTC "YYYY-MM-DDTHH:MM:SSZ".
 HexaVal hexa_utc_iso_now(void) {
     int64_t pin = hexa_pinned_epoch();
