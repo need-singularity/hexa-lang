@@ -1,4 +1,4 @@
-[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19365284-blue?logo=zenodo&logoColor=white)](https://doi.org/10.5281/zenodo.19365284)
+[![DOI](https://img.shields.io/badge/DOI-10.5281%2Fzenodo.19404817-blue?logo=zenodo&logoColor=white)](https://doi.org/10.5281/zenodo.19404817)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Self-hosted](https://img.shields.io/badge/self--hosted-100%25%20.hexa-blue.svg)](#)
 [![DSE](https://img.shields.io/badge/DSE--v2-21%2C952%20combos%20·%20100%25%20EXACT-brightgreen.svg)](#)
