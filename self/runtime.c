@@ -3465,6 +3465,28 @@ HexaVal hexa_args() {
     return arr;
 }
 
+// Canonical argv API (roadmap 65 / M3, anima hxa-20260423-003 §3 M3).
+// Additive on top of args() — hexa_args()/hexa_set_args() untouched because
+// 40+ call sites across self/ + tool/ + bench/ read args()[2..] assuming the
+// current [driver, driver, user...] layout. Full contract flip requires a
+// repo-wide migration (separate follow-on). These new APIs let new
+// consumers (incl. anima tool/an11_a_verifier skip0 path) get clean
+// semantics today: script_path() = the thing that was launched,
+// real_args() = user arguments only, identical across interp/AOT/stage0.
+HexaVal hexa_script_path() {
+    if (_hexa_argc < 2 || _hexa_argv[1] == NULL) return hexa_str("");
+    return hexa_str(_hexa_argv[1]);
+}
+
+HexaVal hexa_real_args() {
+    HexaVal arr = hexa_array_new();
+    int start = (_hexa_argc >= 2) ? 2 : _hexa_argc;
+    for (int i = start; i < _hexa_argc; i++) {
+        arr = hexa_array_push(arr, hexa_str(_hexa_argv[i]));
+    }
+    return arr;
+}
+
 // ── Float operations ─────────────────────────────────
 
 #include <math.h>
