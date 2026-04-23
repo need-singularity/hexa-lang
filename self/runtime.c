@@ -5196,6 +5196,15 @@ HexaVal hexa_array_find(HexaVal arr, HexaVal fn) {
     return hexa_void();
 }
 
+// Polymorphic `.find()` dispatch — .find() 이 string `.find(needle)` 과
+// array `.find(pred)` 에서 의미/반환 타입이 달라 codegen 단일 사이트에서
+// 정적 dispatch 불가 (이전엔 모든 경우 str_index_of 로 라우팅 → array
+// 시 -1 반환). 런타임에서 receiver 타입 보고 양쪽에 위임.
+HexaVal hexa_find_poly(HexaVal obj, HexaVal arg) {
+    if (HX_IS_ARRAY(obj)) return hexa_array_find(obj, arg);
+    return hexa_int(hexa_str_index_of(obj, arg));
+}
+
 // flat_map: map then flatten one level. Non-array callback results
 // are pushed as-is (matches interpreter fallback at hexa_full.hexa:15211).
 HexaVal hexa_array_flat_map(HexaVal arr, HexaVal fn) {
