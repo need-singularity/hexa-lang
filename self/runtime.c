@@ -157,6 +157,8 @@ HexaVal hexa_abs(HexaVal v);
 HexaVal hexa_pad_left(HexaVal s, HexaVal width);
 HexaVal hexa_pad_right(HexaVal s, HexaVal width);
 HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
+HexaVal hexa_str_char_at(HexaVal s, HexaVal idx);
+HexaVal hexa_str_char_code_at(HexaVal s, HexaVal idx);
 HexaVal hexa_read_file(HexaVal path);
 HexaVal hexa_write_file(HexaVal path, HexaVal content);
 HexaVal hexa_file_exists(HexaVal path);
@@ -2646,6 +2648,32 @@ int64_t hexa_str_last_index_of(HexaVal s, HexaVal sub) {
         p += 1;  // overlap-safe
     }
     return last;
+}
+
+// Byte-indexed single-char extraction. `.char_at(i)` → 1-byte string at
+// offset i, empty string if out-of-range. Matches the byte-orientation
+// of every other hexa_str_* helper (runtime has no UTF-8 codepoint iter
+// — strings are treated as uninterpreted byte sequences, with the
+// exception of UTF-8-safe display in hexa_println).
+HexaVal hexa_str_char_at(HexaVal s, HexaVal idx) {
+    if (!HX_IS_STR(s)) return hexa_str("");
+    int64_t i = HX_INT(idx);
+    int64_t n = (int64_t)strlen(HX_STR(s));
+    if (i < 0 || i >= n) return hexa_str("");
+    char buf[2] = { HX_STR(s)[i], '\0' };
+    return hexa_str(buf);
+}
+
+// Byte value at offset i (0..255), or -1 if out-of-range. JS-analog
+// `.char_code_at` expects UTF-16 code units; we expose raw byte
+// values since hexa strings are byte-sequenced. A later UTF-8
+// codepoint API (`.code_point_at`) can layer on if needed.
+HexaVal hexa_str_char_code_at(HexaVal s, HexaVal idx) {
+    if (!HX_IS_STR(s)) return hexa_int(-1);
+    int64_t i = HX_INT(idx);
+    int64_t n = (int64_t)strlen(HX_STR(s));
+    if (i < 0 || i >= n) return hexa_int(-1);
+    return hexa_int((int64_t)(unsigned char)HX_STR(s)[i]);
 }
 
 // ── Array operations ─────────────────────────────────
