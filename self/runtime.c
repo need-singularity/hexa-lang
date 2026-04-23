@@ -5205,6 +5205,25 @@ HexaVal hexa_find_poly(HexaVal obj, HexaVal arg) {
     return hexa_int(hexa_str_index_of(obj, arg));
 }
 
+// `0..5` / `1..=10` / `0..10 step 2` — evaluates a Range at expression
+// position to an int array. 이전엔 ForStmt 경로에만 Range codegen 이 있어
+// `let r = 0..5` 같은 일반 expr 사용 시 "CODEGEN ERROR: unhandled expr
+// kind: Range" 발생. Interp 의 NK_RANGE 분기 (hexa_full.hexa:7425) 의
+// AOT counterpart.
+HexaVal hexa_range_array(HexaVal start, HexaVal end, HexaVal step, int inclusive) {
+    HexaVal result = hexa_array_new();
+    int64_t s = HX_INT(start);
+    int64_t e = HX_INT(end);
+    int64_t st = HX_IS_VOID(step) ? 1 : HX_INT(step);
+    if (st <= 0) st = 1;
+    if (inclusive) {
+        for (int64_t i = s; i <= e; i += st) result = hexa_array_push(result, hexa_int(i));
+    } else {
+        for (int64_t i = s; i < e; i += st) result = hexa_array_push(result, hexa_int(i));
+    }
+    return result;
+}
+
 // flat_map: map then flatten one level. Non-array callback results
 // are pushed as-is (matches interpreter fallback at hexa_full.hexa:15211).
 HexaVal hexa_array_flat_map(HexaVal arr, HexaVal fn) {
