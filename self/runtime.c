@@ -2848,7 +2848,14 @@ void hexa_throw(HexaVal err) {
         __hexa_try_top--;
         longjmp(*__hexa_try_stack[__hexa_try_top], 1);
     }
-    fprintf(stderr, "Unhandled throw\n");
+    // hxa-20260423-013: print the error value on uncaught throw so tests
+    // (T34) and users can see what failed. Falls back to generic label
+    // when the value can't be rendered as a short scalar.
+    if (HX_IS_STR(err) && HX_STR(err)) {
+        fprintf(stderr, "%s\n", HX_STR(err));
+    } else {
+        fprintf(stderr, "Unhandled throw\n");
+    }
     exit(1);
 }
 
@@ -4941,13 +4948,38 @@ static HexaVal bit_or;
 HexaVal hexa_str_parse_int(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_int(0);
     const char* cs = HX_STR(s);
+    // hxa-20260423-013: throw on non-integer input so `try/catch` around
+    // to_int("abc") (T24) and uncaught to_int("1.01") (T34) behave as
+    // the language documents. Empty / whitespace-only input still
+    // returns 0 — 812 callsites (env-var + optional-argv parsing)
+    // depend on that defensive-fallback shape.
+    const char* p = cs;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p == 0) return hexa_int(0);
     // P39 fix: auto-detect hex prefix (0x/0X) while preserving decimal
     // semantics for leading-zero inputs ("0777" -> 777, not octal 511).
-    const char* p = cs;
-    if (*p == '+' || *p == '-') p++;
+    const char* digit_start = p;
+    if (*digit_start == '+' || *digit_start == '-') digit_start++;
     int base = 10;
-    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) base = 16;
-    return hexa_int((int64_t)strtoll(cs, NULL, base));
+    if (digit_start[0] == '0' && (digit_start[1] == 'x' || digit_start[1] == 'X')) base = 16;
+    char* endptr = NULL;
+    long long v = strtoll(p, &endptr, base);
+    if (endptr == p) {
+        // no digits consumed — "abc", "--", "" after trim handled above
+        char msg[256];
+        snprintf(msg, sizeof(msg), "error: to_int: not an integer: \"%s\"", cs);
+        hexa_throw(hexa_str(msg));
+        return hexa_int(0);
+    }
+    // Reject trailing non-whitespace garbage ("1.01", "123abc", "5 six").
+    while (*endptr == ' ' || *endptr == '\t' || *endptr == '\n' || *endptr == '\r') endptr++;
+    if (*endptr != 0) {
+        char msg[256];
+        snprintf(msg, sizeof(msg), "error: to_int: trailing garbage in \"%s\"", cs);
+        hexa_throw(hexa_str(msg));
+        return hexa_int(0);
+    }
+    return hexa_int((int64_t)v);
 }
 
 HexaVal hexa_str_parse_float(HexaVal s) {
