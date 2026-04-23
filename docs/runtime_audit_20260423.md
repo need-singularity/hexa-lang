@@ -100,6 +100,14 @@
 - (B) `hexa_v2` 가 `extern fn` 을 잘 해석 못 할 경우 → parser/type_checker 측 `extern` 처리 리그레션 가능성. 이미 작동 중인 `use` 경로 재활용 가능.
 - (C) 성능 −15% 이상 드리프트 시 → `static inline` + LTO 실험, 혹은 특정 함수 rollback.
 
+### 3.2 진행 상황 (2026-04-23 후속 세션)
+
+- **Step 1 landed** — `self/runtime_hi.hexa` 생성, 5 함수 + 의존 `rt_str_split` 구현. `runtime_hi_selftest()` 내장 (pad_left/right/repeat/center/lines 결과 검증).
+- **Step 2 landed** — `./self/native/hexa_v2 self/runtime_hi.hexa build/runtime_hi.c` 으로 정상 transpile. stage0 interpreter (`./hexa run self/runtime_hi.hexa`) 및 AOT (clang → build/runtime_hi_probe) 양경로 selftest PASS.
+- **Debug trap 발견 & 해결** — `build/runtime.c` 에 4/16 stale 복사본이 남아있어 `#include "runtime.c"` 가 `build/` 근처 파일을 먼저 잡는 현상이 M1-lite 초기 빌드를 전부 깨뜨렸음 (pad_left 등이 빈 문자열 반환). 해당 stale 파일 삭제. 향후 build chain 은 `#include` 경로 명시 혹은 cwd 분리 필요.
+- **Step 3 보류** — runtime.c 의 5 정의 제거는 전체 codegen 이 아직 `hexa_str_*` 을 호출하고 있어 심볼 재매핑 필요. 다음 세션 작업 (`cg_string_sym` 플립 또는 함수 리네임 `rt_str_* → hexa_str_*`).
+- **Step 4~6 보류** — build_stage1 수정 / 벤치마크 / size diff 는 Step 3 이후.
+
 ## 4. M2 builtin mangling — 현재 진행상황
 
 `runtime.c` 끝자리 `#define setenv hx_setenv` / `#define exec_capture hx_exec_capture` / `#define now timestamp` / `#define push hx_push` 총 **4 건** 의 임시 셔림이 남음 (line 6868·6869·6873·6874).
