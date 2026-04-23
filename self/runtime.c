@@ -6687,6 +6687,7 @@ static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); 
 // hexa_call1. Shim these as TAG_FN globals so the linker finds them.
 static HexaVal _w_setenv(HexaVal n, HexaVal v) { return hexa_setenv(n, v); }
 static HexaVal _w_exec_capture(HexaVal c) { return hexa_exec_capture(c); }
+static HexaVal _w_push(HexaVal a, HexaVal v) { return hexa_array_push(a, v); }
 
 HexaVal timestamp;
 HexaVal base64_encode;
@@ -6695,6 +6696,7 @@ HexaVal base64_decode;
 // prototype from <stdlib.h>, and `exec_capture` is new surface.
 HexaVal hx_setenv;
 HexaVal hx_exec_capture;
+HexaVal hx_push;
 
 // S1-D2 Blocker C: runtime init for TAG_FN shim variables.
 // NaN-boxing makes HexaVal a uint64_t — designated initializers for the
@@ -6717,6 +6719,8 @@ static void _hexa_init_fn_shims(void) {
     // stage0 exec/env primitives — bootstrap-gap bridge
     hx_setenv       = hexa_fn_new((void*)_w_setenv,       2);
     hx_exec_capture = hexa_fn_new((void*)_w_exec_capture, 1);
+    // hxa-004 ext: bare `push(arr, v)` emitted by legacy hexa_v2 as hexa_call2
+    hx_push         = hexa_fn_new((void*)_w_push,         2);
     // std::net free-fn shims — bridges transpiler bootstrap gap for
     // net_connect / net_read / net_write until hexa_v2 learns the
     // direct-lowering for these names (see native/net.c comment).
@@ -6813,4 +6817,9 @@ static void _hexa_init_fn_shims(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 #define setenv       hx_setenv
 #define exec_capture hx_exec_capture
+// hxa-004 ext (2026-04-23): `now()` → `timestamp` (identical 0-arg TAG_FN);
+// bare `push(arr, v)` → hx_push (hexa_array_push wrapper). Both leaked
+// through legacy hexa_v2 codegen as hexa_call0(now) / hexa_call2(push, …).
+#define now          timestamp
+#define push         hx_push
 
