@@ -2699,6 +2699,8 @@ HexaVal hexa_str_char_at(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_str("");
     int64_t i = HX_INT(idx);
     int64_t n = (int64_t)strlen(HX_STR(s));
+    // Python-style negative index — align interp `s[-1]` 지원 (`c` 반환).
+    if (i < 0) i += n;
     if (i < 0 || i >= n) return hexa_str("");
     char buf[2] = { HX_STR(s)[i], '\0' };
     return hexa_str(buf);
