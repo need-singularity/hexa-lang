@@ -3892,6 +3892,7 @@ HexaVal parse_let(void) {
         typ = parse_type_annotation();
     }
     p_expect(__hexa_parser_sl_157);
+    p_skip_newlines();
     expr = parse_expr();
     HexaVal kind_str = __hexa_parser_sl_184;
     if (hexa_truthy(is_mut)) {
