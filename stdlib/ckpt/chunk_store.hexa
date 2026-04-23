@@ -1,0 +1,160 @@
+// HEXA Standard Library — ckpt/chunk_store
+// Content-addressable chunk dedup for checkpoint packing (B6).
+//
+// Motivation: ckpt workflows (G36) repeatedly write near-identical byte
+// ranges — weight shards, activation caches, lineage blobs — saving
+// duplicates costs 18+ GiB in practice. This module wraps the
+// xxh32-keyed content-addressable pattern so any ckpt writer can call
+// `put_chunk` and get dedup "for free", with dedup_ratio reported as
+// a PerMille for `@strict_fp` compatibility (no float division).
+//
+// xxh32 is used (not SHA-256) deliberately — this store serves local
+// dedup during a ckpt pack, not cross-host trust. pcc-verify (B5)
+// still owns cryptographic chunk hashing for the manifest.
+//
+// Public API:
+//   pub fn make_store()                                -> ChunkStore
+//   pub fn put_chunk(store, bytes)                     -> string   (hex hash)
+//   pub fn get_chunk(store, hex)                       -> array    ([] if absent)
+//   pub fn has_chunk(store, hex)                       -> bool
+//   pub fn chunk_count(store)                          -> int
+//   pub fn total_input_bytes(store)                    -> int
+//   pub fn total_stored_bytes(store)                   -> int
+//   pub fn dedup_ratio(store)                          -> PerMille
+//   pub fn put_stream(store, bytes, chunk_size)        -> array<string>
+//   pub fn reassemble(store, hex_hashes)               -> array
+
+import "../hash/xxhash.hexa"
+import "../math/permille.hexa"
+
+pub struct ChunkStore {
+    chunks: map,              // hex_hash -> array<int>  (bytes)
+    sizes: map,               // hex_hash -> int         (byte count, O(1) size queries)
+    total_input_bytes: int,
+    total_stored_bytes: int
+}
+
+pub fn make_store() -> ChunkStore {
+    return ChunkStore {
+        chunks:             json_parse("{}"),
+        sizes:              json_parse("{}"),
+        total_input_bytes:  0,
+        total_stored_bytes: 0
+    }
+}
+
+fn _hex_nib(n: int) -> string {
+    if n == 0  { return "0" } if n == 1  { return "1" } if n == 2  { return "2" } if n == 3  { return "3" }
+    if n == 4  { return "4" } if n == 5  { return "5" } if n == 6  { return "6" } if n == 7  { return "7" }
+    if n == 8  { return "8" } if n == 9  { return "9" } if n == 10 { return "a" } if n == 11 { return "b" }
+    if n == 12 { return "c" } if n == 13 { return "d" } if n == 14 { return "e" }
+    return "f"
+}
+
+fn _u32_hex(v: int) -> string {
+    let mut out = ""
+    let mut i = 7
+    while i >= 0 {
+        let shift = i * 4
+        let nib = (v / (1 << shift)) % 16
+        out = out + _hex_nib(nib)
+        i = i - 1
+    }
+    return out
+}
+
+fn _slice(bytes: array, start: int, end: int) -> array {
+    let mut out = []
+    let mut i = start
+    while i < end {
+        out.push(bytes[i])
+        i = i + 1
+    }
+    return out
+}
+
+// Insert a chunk; returns the xxh32-hex content address. If the same
+// content was already stored, the store is left unchanged (dedup).
+pub fn put_chunk(store: ChunkStore, bytes: array) -> string {
+    let n = len(bytes)
+    let h = xxh32(bytes, 0)
+    let hex = _u32_hex(h)
+    store.total_input_bytes = store.total_input_bytes + n
+    if !has_key(store.chunks, hex) {
+        // Copy bytes so caller can reuse the array without aliasing.
+        store.chunks[hex] = _slice(bytes, 0, n)
+        store.sizes[hex] = n
+        store.total_stored_bytes = store.total_stored_bytes + n
+    }
+    return hex
+}
+
+pub fn get_chunk(store: ChunkStore, hex: string) -> array {
+    if !has_key(store.chunks, hex) { return [] }
+    return store.chunks[hex]
+}
+
+pub fn has_chunk(store: ChunkStore, hex: string) -> bool {
+    return has_key(store.chunks, hex)
+}
+
+pub fn chunk_count(store: ChunkStore) -> int {
+    return len(map_keys(store.chunks))
+}
+
+pub fn total_input_bytes(store: ChunkStore) -> int {
+    return store.total_input_bytes
+}
+
+pub fn total_stored_bytes(store: ChunkStore) -> int {
+    return store.total_stored_bytes
+}
+
+// Dedup ratio as a PerMille (scale=1000) — no float ops, strict_fp-safe.
+//   0   ‰  → no dedup savings (unique input)
+//   500 ‰  → half of input bytes were duplicates
+//  1000 ‰  → all bytes duplicated (degenerate)
+pub fn dedup_ratio(store: ChunkStore) -> PerMille {
+    let inp = store.total_input_bytes
+    if inp == 0 { return pm_of_permille(0) }
+    let saved = inp - store.total_stored_bytes
+    return pm_of_ratio(saved, inp)
+}
+
+// Split `bytes` into fixed-size chunks (last chunk may be smaller),
+// store each via put_chunk, return the hash sequence in-order. The
+// sequence is enough to recover the original stream byte-for-byte.
+pub fn put_stream(store: ChunkStore, bytes: array, chunk_size: int) -> array {
+    let mut out = []
+    let n = len(bytes)
+    if chunk_size <= 0 {
+        out.push(put_chunk(store, bytes))
+        return out
+    }
+    let mut off = 0
+    while off < n {
+        let mut end_ = off + chunk_size
+        if end_ > n { end_ = n }
+        let slice = _slice(bytes, off, end_)
+        out.push(put_chunk(store, slice))
+        off = end_
+    }
+    return out
+}
+
+pub fn reassemble(store: ChunkStore, hex_hashes: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(hex_hashes) {
+        let hex = to_string(hex_hashes[i])
+        if !has_key(store.chunks, hex) { return [] }
+        let chunk = store.chunks[hex]
+        let mut j = 0
+        while j < len(chunk) {
+            out.push(chunk[j])
+            j = j + 1
+        }
+        i = i + 1
+    }
+    return out
+}
