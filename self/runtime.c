@@ -2710,6 +2710,18 @@ HexaVal hexa_array_pop(HexaVal arr) {
 }
 
 HexaVal hexa_array_reverse(HexaVal arr) {
+    // Polymorphic — string.reverse() / array.reverse() share codegen emit.
+    // Previously fell through for strings ("abc".reverse() → "abc" no-op)
+    // because the `!HX_IS_ARRAY` guard returned early. Interp handled it
+    // via Val-level byte reverse; AOT was silently wrong.
+    if (HX_IS_STR(arr)) {
+        const char* s = HX_STR(arr);
+        size_t n = strlen(s);
+        char* buf = (char*)malloc(n + 1);
+        for (size_t i = 0; i < n; i++) buf[i] = s[n - 1 - i];
+        buf[n] = '\0';
+        return hexa_str_own(buf);
+    }
     if (!HX_IS_ARRAY(arr)) return arr;
     HexaVal result = hexa_array_new();
     for (int i = HX_ARR_LEN(arr) - 1; i >= 0; i--)
