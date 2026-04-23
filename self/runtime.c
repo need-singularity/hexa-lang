@@ -3901,17 +3901,26 @@ HexaVal hexa_fma(HexaVal a, HexaVal b, HexaVal c) {
 }
 HexaVal hexa_div(HexaVal a, HexaVal b) {
     if (HX_IS_INT(a) && HX_IS_INT(b)) {
-        if (HX_INT(b) == 0) return hexa_int(0);
+        // 이전엔 silent 0 반환 → 버그 은폐. interp 는 이미 throw + void.
+        // hexa_throw 는 try-stack 이 있으면 longjmp, 없으면 stderr + exit.
+        if (HX_INT(b) == 0) { hexa_throw(hexa_str("division by zero")); return hexa_int(0); }
         return hexa_int(HX_INT(a) / HX_INT(b));
     }
-    if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) return hexa_float(HX_FLOAT(b) == 0.0 ? 0.0 : HX_FLOAT(a) / HX_FLOAT(b));
+    if (HX_IS_FLOAT(a) && HX_IS_FLOAT(b)) {
+        if (HX_FLOAT(b) == 0.0) { hexa_throw(hexa_str("division by zero")); return hexa_float(0.0); }
+        return hexa_float(HX_FLOAT(a) / HX_FLOAT(b));
+    }
     double fb = __hx_to_double(b);
+    if (fb == 0.0) { hexa_throw(hexa_str("division by zero")); return hexa_float(0.0); }
     return hexa_float(__hx_to_double(a) / fb);
 }
 HexaVal hexa_mod(HexaVal a, HexaVal b) {
-    if (HX_IS_INT(a) && HX_IS_INT(b)) return hexa_int(HX_INT(b) ? HX_INT(a) % HX_INT(b) : 0);
+    if (HX_IS_INT(a) && HX_IS_INT(b)) {
+        if (HX_INT(b) == 0) { hexa_throw(hexa_str("modulo by zero")); return hexa_int(0); }
+        return hexa_int(HX_INT(a) % HX_INT(b));
+    }
     double fb = __hx_to_double(b);
-    if (fb == 0.0) return hexa_float(0.0);
+    if (fb == 0.0) { hexa_throw(hexa_str("modulo by zero")); return hexa_float(0.0); }
     return hexa_float(fmod(__hx_to_double(a), fb));
 }
 
