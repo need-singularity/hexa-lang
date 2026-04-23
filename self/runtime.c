@@ -2737,10 +2737,20 @@ static int hexa_sort_cmp(const void* a, const void* b) {
 }
 
 HexaVal hexa_array_sort(HexaVal arr) {
+    // Previously `result = arr` copied the HexaVal struct — but both still
+    // alias array_store[arr.int_val]. `HX_SET_ARR_ITEMS(result, malloc(...))`
+    // therefore also replaced arr's items pointer → the following
+    // `memcpy(HX_ARR_ITEMS(result), HX_ARR_ITEMS(arr), ...)` memcpy'd the
+    // brand-new empty buf onto itself. qsort'd that garbage → caller saw
+    // [0,0,0]. **Both** `r` and original `arr` came out zeroed.
+    // Fix: build a fresh result via hexa_array_new + push (mirrors
+    // hexa_array_reverse), then qsort the fresh buffer.
     if (!HX_IS_ARRAY(arr)) return arr;
-    HexaVal result = arr;
-    HX_SET_ARR_ITEMS(result, (HexaVal*)malloc(sizeof(HexaVal) * HX_ARR_LEN(arr)));
-    memcpy(HX_ARR_ITEMS(result), HX_ARR_ITEMS(arr), sizeof(HexaVal) * HX_ARR_LEN(arr));
+    HexaVal result = hexa_array_new();
+    int n = HX_ARR_LEN(arr);
+    for (int i = 0; i < n; i++) {
+        result = hexa_array_push(result, HX_ARR_ITEMS(arr)[i]);
+    }
     qsort(HX_ARR_ITEMS(result), HX_ARR_LEN(result), sizeof(HexaVal), hexa_sort_cmp);
     return result;
 }
