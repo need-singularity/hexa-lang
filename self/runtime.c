@@ -3253,6 +3253,12 @@ HexaVal hexa_concat_many(int n, HexaVal* parts) {
 // ── Polymorphic equality ─────────────────────────────────
 
 HexaVal hexa_eq(HexaVal a, HexaVal b) {
+    // Cross-type numeric equality (int ↔ float) — matches interp
+    // eval_binop float-coerce path (hexa_full.hexa:7867). 이전엔
+    // tag 불일치 즉시 false → `2 == 2.0` AOT=false / interp=true
+    // divergence 를 유발.
+    if (HX_IS_INT(a) && HX_IS_FLOAT(b)) return hexa_bool((double)HX_INT(a) == HX_FLOAT(b));
+    if (HX_IS_FLOAT(a) && HX_IS_INT(b)) return hexa_bool(HX_FLOAT(a) == (double)HX_INT(b));
     if (HX_TAG(a) != HX_TAG(b)) return hexa_bool(0);
     switch (HX_TAG(a)) {
         case TAG_INT: return hexa_bool(HX_INT(a) == HX_INT(b));
