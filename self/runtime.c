@@ -3916,22 +3916,33 @@ HexaVal hexa_mod(HexaVal a, HexaVal b) {
 // `let x = 5; let z = 1 + x` returned 0xA00000005 because val_int's cache
 // range check `n < __VAL_INT_CACHE_LEN` mis-evaluated when one side was
 // a wrapped Val from the cached singleton table.
+// String comparisons via strcmp — 이전 경로는 __hx_to_double("abc") = atof
+// 으로 fallthrough 해서 대부분 0.0 으로 수렴 + intern pointer 비교로 떨어져
+// 의미 없는 순서 (abc>abb=false 같은 오류).
 HexaVal hexa_cmp_lt(HexaVal a, HexaVal b) {
+    if (HX_IS_STR(a) && HX_IS_STR(b))
+        return hexa_bool(strcmp(HX_STR(a), HX_STR(b)) < 0);
     if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) < __hx_to_double(b));
     return hexa_bool(HX_INT(a) < HX_INT(b));
 }
 HexaVal hexa_cmp_gt(HexaVal a, HexaVal b) {
+    if (HX_IS_STR(a) && HX_IS_STR(b))
+        return hexa_bool(strcmp(HX_STR(a), HX_STR(b)) > 0);
     if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) > __hx_to_double(b));
     return hexa_bool(HX_INT(a) > HX_INT(b));
 }
 HexaVal hexa_cmp_le(HexaVal a, HexaVal b) {
+    if (HX_IS_STR(a) && HX_IS_STR(b))
+        return hexa_bool(strcmp(HX_STR(a), HX_STR(b)) <= 0);
     if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) <= __hx_to_double(b));
     return hexa_bool(HX_INT(a) <= HX_INT(b));
 }
 HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
+    if (HX_IS_STR(a) && HX_IS_STR(b))
+        return hexa_bool(strcmp(HX_STR(a), HX_STR(b)) >= 0);
     if (HX_IS_FLOAT(a) || HX_IS_FLOAT(b) || HX_IS_VALSTRUCT(a) || HX_IS_VALSTRUCT(b))
         return hexa_bool(__hx_to_double(a) >= __hx_to_double(b));
     return hexa_bool(HX_INT(a) >= HX_INT(b));
