@@ -1793,6 +1793,15 @@ HexaVal hexa_index_get(HexaVal container, HexaVal key) {
     } else {
         idx = HX_INT(key);
     }
+    // hxa-20260423-015: str[i] support. The AOT codegen lowers every
+    // IndexGet to hexa_index_get(), so without this branch a `path[i]`
+    // on a string (e.g. self/module_loader.hexa:ml_dirname) reached
+    // hexa_array_get() and aborted with "array[N]: container is not
+    // an array (tag=3)". The stage0 interpreter has its own string-
+    // index path; this mirrors it for the AOT path.
+    if (HX_IS_STR(container)) {
+        return hexa_str_char_at(container, hexa_int(idx));
+    }
     return hexa_array_get(container, idx);
 }
 
