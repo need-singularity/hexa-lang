@@ -1134,31 +1134,44 @@ HexaVal hexa_array_slice_fast(HexaVal arr, HexaVal start, HexaVal end) {
     return out;
 }
 
+// Forward decl — hexa_throw 본체는 line ~2903. OOB throw routing 을 위해
+// 여기서 일찍 선언.
+void hexa_throw(HexaVal err);
+
 HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     // B13: tag guard — without this, a TAG_STR (from hexa_add fallthrough)
     // reaches here and we read .arr.len from an unrelated union slot
-    // (uninitialized stack residue). Explicit panic instead of silent OOB.
+    // (uninitialized stack residue). 이전 exit(1) 대신 hexa_throw 로 라우팅
+    // 해서 try/catch 로 recovery 가능.
     if (!HX_IS_ARRAY(arr)) {
-        fprintf(stderr, "array[%lld]: container is not an array (tag=%d)\n", (long long)idx, (int)HX_TAG(arr));
-        exit(1);
+        char _buf[128];
+        snprintf(_buf, sizeof(_buf), "array[%lld]: container is not an array (tag=%d)", (long long)idx, (int)HX_TAG(arr));
+        hexa_throw(hexa_str(_buf));
+        return hexa_void();
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
-        exit(1);
+        char _buf[128];
+        snprintf(_buf, sizeof(_buf), "index %lld out of bounds (len %d)", (long long)idx, HX_ARR_LEN(arr));
+        hexa_throw(hexa_str(_buf));
+        return hexa_void();
     }
     return HX_ARR_ITEMS(arr)[idx];
 }
 
 HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     if (!HX_IS_ARRAY(arr)) {
-        fprintf(stderr, "array_set[%lld]: container is not an array (tag=%d)\n", (long long)idx, (int)HX_TAG(arr));
-        exit(1);
+        char _buf[128];
+        snprintf(_buf, sizeof(_buf), "array_set[%lld]: container is not an array (tag=%d)", (long long)idx, (int)HX_TAG(arr));
+        hexa_throw(hexa_str(_buf));
+        return arr;
     }
     if (idx < 0) idx += HX_ARR_LEN(arr);
     if (idx < 0 || idx >= HX_ARR_LEN(arr)) {
-        fprintf(stderr, "index %lld out of bounds (len %d)\n", (long long)idx, HX_ARR_LEN(arr));
-        exit(1);
+        char _buf[128];
+        snprintf(_buf, sizeof(_buf), "index %lld out of bounds (len %d)", (long long)idx, HX_ARR_LEN(arr));
+        hexa_throw(hexa_str(_buf));
+        return arr;
     }
     // In-place mutate (no copy — caller reassigns)
     HX_ARR_ITEMS(arr)[idx] = val;
