@@ -2639,6 +2639,24 @@ int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
     return (int64_t)(p - HX_STR(s));
 }
 
+// `.index_of(sub, start)` — first occurrence at-or-after byte offset `start`.
+// hxa-20260423-012: the 2-arg form was silently dropping `start`, forcing
+// anima to emit fields in a hack order (rank BEFORE weights) to dodge the
+// miscompare. Semantics: clamp start to [0,len]; empty needle → start.
+int64_t hexa_str_index_of_from(HexaVal s, HexaVal sub, HexaVal start) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(sub)) return -1;
+    const char* hay = HX_STR(s);
+    size_t hlen = strlen(hay);
+    int64_t st = HX_INT(start);
+    if (st < 0) st = 0;
+    if ((size_t)st > hlen) return -1;
+    const char* needle = HX_STR(sub);
+    if (*needle == '\0') return st;
+    const char* p = strstr(hay + st, needle);
+    if (!p) return -1;
+    return (int64_t)(p - hay);
+}
+
 // Returns byte offset of LAST occurrence of `sub` within `s`, or -1.
 // Mirrors interpreter `.rfind`/`.last_index_of` at self/hexa_full.hexa:15741.
 // Added 2026-04-23 (hxa-20260422-002 lang_gap prio=95, rfind blocker).
