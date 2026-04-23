@@ -3,6 +3,7 @@
 [![Self-hosted](https://img.shields.io/badge/self--hosted-100%25%20.hexa-blue.svg)](#)
 [![DSE](https://img.shields.io/badge/DSE--v2-21%2C952%20combos%20·%20100%25%20EXACT-brightgreen.svg)](#)
 [![Targets](https://img.shields.io/badge/targets-ARM64%20·%20x86__64%20·%20VM%20·%20ESP32%20·%20FPGA%20·%20WGSL-orange.svg)](#)
+[![Discord](https://img.shields.io/badge/discord-join-5865F2.svg?logo=discord&logoColor=white)](https://discord.gg/u2spd3wwU)
 
 # 💎 HEXA-LANG — The Perfect Number Programming Language
 
