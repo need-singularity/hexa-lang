@@ -2714,6 +2714,7 @@ HexaVal hexa_str_char_code_at(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_int(-1);
     int64_t i = HX_INT(idx);
     int64_t n = (int64_t)strlen(HX_STR(s));
+    if (i < 0) i += n;  // 음수 wraparound — char_at 과 align
     if (i < 0 || i >= n) return hexa_int(-1);
     return hexa_int((int64_t)(unsigned char)HX_STR(s)[i]);
 }
