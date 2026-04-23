@@ -3270,13 +3270,20 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
         // TAG_MAP semantics — two separately constructed maps never compare
         // equal by value).
         case TAG_VALSTRUCT: return hexa_bool(HX_VS(a) == HX_VS(b));
-        // 2026-04-20 silent-fallback audit: reference types used to fall to
-        // `default: false`, so `let a = [1,2]; a == a` returned false in the
-        // native path (interpreter's val_eq handles them correctly via
-        // get_array identity). Switch to reference (pointer) equality — value
-        // equality for arrays/maps would require deep comparison and is not
-        // the interpreter's contract either.
-        case TAG_ARRAY: return hexa_bool(a.arr_ptr == b.arr_ptr);
+        // Array deep equality — interp eval_binop (hexa_full.hexa:7939) 가
+        // 요소별 vals_equal 로 비교하므로 AOT 도 요소 재귀 비교로 정렬.
+        // 이전 comment 는 interp 가 ref eq 이라고 기록했지만 실제 코드는
+        // value eq. 같은 포인터 shortcut 으로 빠른 경로 유지.
+        case TAG_ARRAY: {
+            if (a.arr_ptr == b.arr_ptr) return hexa_bool(1);
+            int __na = HX_ARR_LEN(a); int __nb = HX_ARR_LEN(b);
+            if (__na != __nb) return hexa_bool(0);
+            HexaVal* __xa = HX_ARR_ITEMS(a); HexaVal* __xb = HX_ARR_ITEMS(b);
+            for (int __i = 0; __i < __na; __i++) {
+                if (!hexa_truthy(hexa_eq(__xa[__i], __xb[__i]))) return hexa_bool(0);
+            }
+            return hexa_bool(1);
+        }
         case TAG_MAP: return hexa_bool(HX_MAP_TBL(a) == HX_MAP_TBL(b));
         // TAG_FN: compare underlying C function pointer (descriptor indirection
         // may differ for two separately-constructed wrappers of the same fn).
