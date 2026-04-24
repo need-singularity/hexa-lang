@@ -9,9 +9,10 @@
 
 ## 0. 한 줄 상태
 
-M3 (argv) + M4 (codegen 메서드 완성) 완료. M2 (builtin mangling) 는 데몬이 평행 진행 중
-(roadmap-68, 커밋 `2361bc25`/`94b4aa66` 참조). **남은 두 축**: **M1 런타임 2-레이어 분할** ·
-**M5 self-hosted driver** (`hexa_driver.hexa` Rust 탈피).
+**M2 / M3 / M4 / M5 전부 완료.** M1-lite Step 1-5 전원 CLOSED (2026-04-24 세션) —
+runtime.c 7018 → 6943 줄 (−75 net), `runtime_hi_gen.c` 182 줄 신규, coverage 187/187 (100.0%).
+**남은 축**: (a) **M1 full split** — 260 fn 도메인별 incremental 이관, (b) 소수 minor
+(interp regression 추적 · `.raw` dispatch_tag main 병합 ceremony).
 
 ---
 
@@ -132,14 +133,14 @@ anima 프롬프트 §3 M5:
 
 ---
 
-## 4. 다음 세션 우선순위 (H-MINPATH 권장 순서)
+## 4. 다음 세션 우선순위 (H-MINPATH 권장 순서) — 2026-04-24 종결 상태
 
-1. **M5 Linux ./hexa 빌드** — `tool/build_hexa_cli_linux.hexa` 추가 (약 50 줄, `build_hexa_v2_linux.hexa` 복사-수정). anima pod 배포 즉시 anima `tool/hexa_linux_shim.bash` 제거 가능 → 교차 저장소 블로커 해제.
-2. **M5 implicit run** — 10 줄 edit + probe. 즉시 가치.
-3. **M1-lite 5-fn 스플릿** — M1 의 "실증" 단계. 회귀 안전망 (`bench/snapshots/string_method_coverage.hexa`) 이미 있음. `hexa_str_pad_*` 등이 `runtime_hi.hexa` 에서 작동하면 큰 분할에 신뢰 확보.
-4. **M1 full audit 문서화** — `docs/runtime_audit_20260423.md`. 의사결정 근거 남김.
-5. **M5 execvp primitive** — runtime.c 변경 (primitive 1 개 추가 + codegen entry). 순수 성능/UX 이슈.
-6. **M5 CI 매트릭스** — 3-플랫폼 러너. 다른 모든 것이 닫힌 뒤.
+1. ~~**M5 Linux ./hexa 빌드**~~ — **DONE** (`build/hexa_cli_linux.hexa` 작동, Linux x86_64 배포 경로 열림).
+2. ~~**M5 implicit run**~~ — **DONE** (`self/main.hexa:2331` 에서 `.hexa` positional auto-promote 구현).
+3. ~~**M1-lite 5-fn 스플릿**~~ — **DONE** (Step 1-5 all CLOSED — commits `52e22e45 … 9165a540`, `17dcafd9` / `8892686a`, `5b172ff5` + `b4c5a260`).
+4. ~~**M1 full audit 문서화**~~ — **DONE** (`docs/runtime_audit_20260423.md` §3.2 업데이트 포함).
+5. ~~**M5 execvp primitive**~~ — **DONE** (`self/runtime.c:2848` 에 `hexa_execvp` 진입).
+6. ~~**M5 CI 매트릭스**~~ — **DONE** (`.github/workflows/bootstrap.yml`, 10/10 runs green).
 
 각 단계 후 anima `docs/upstream_notes/hexa_lang_full_selfhost_prompt_20260423.md` 의 해당 체크리스트 항목 update, `state/proposals/inventory.json:hxa-20260423-003` 의 done_note 누적.
 
@@ -153,3 +154,39 @@ anima 프롬프트 §3 M5:
 - roadmap-68 (M2 builtin mangling, 데몬 진행 중): 커밋 `2361bc25` · `94b4aa66`
 - 이번 세션 M4 커밋: `388eece8` · `9fef570b`
 - probe: `bench/snapshots/string_method_coverage.hexa`
+
+---
+
+## 6. 다음 세션 권장 (2026-04-25+)
+
+M1-lite 가 완전히 닫힌 상태에서, 남은 사항은 전부 **incremental / ceremony** 성격:
+
+### 6.1 M1 full split — 도메인별 이관 (P0, 장기)
+
+Audit (`docs/runtime_audit_20260423.md` §1) 기준 `hi` 후보 ≈ 260 fn. 도메인 단위 순차 PR 권장:
+
+| 순서 | 도메인 | fn 수 | 이유 |
+|---|---|---:|---|
+| 1 | `file_*` | 12 | **가장 작음** — `read_file` / `write_file` / `append_file` / `file_exists` 등 libc glue. M1-lite 패턴 (runtime_hi.hexa + runtime_hi_gen.c include) 첫 확장 증명. |
+| 2 | `exec_*` | 7 | fork / popen 얇은 래퍼. file_* 과 비슷한 난이도. |
+| 3 | base64 / hex | ~6 | 순수 비트 조작. 외부 상태 없음 — 재이식 안전. |
+| 4 | JSON | ~8 | 문자열 조작 + 재귀. runtime_hi.hexa 에서 str_* 의존만 주입. |
+| 5 | `map_*` 고차 | ~10 | `keys` / `values` / `has_key` / `contains_key` / `remove` — 해시셀 core 유지, enumerate/조회만 hi. |
+| 6 | `array_*` 고차 | ~40 | `map` / `filter` / `sort` / `find` / `flat_map` / `reverse`. 가장 크지만 마지막이면 패턴 완숙. |
+| 7 | `str_*` 잔여 | 43 | M1-lite 가 처리한 5 개 이외 `split` / `concat` / `substring` / `char_*` 등. 가장 뜨거운 path 이므로 주의 + 벤치. |
+
+각 도메인 PR 형식: `self/runtime_hi.hexa` 추가 + `tool/extract_runtime_hi.sh` 재생성 + `self/runtime.c` 해당 블록 제거 + codegen flip + regression (snapshot + coverage scan).
+
+### 6.2 interp regression 추적
+
+현재 AOT PASS / interp FAIL 상태의 두 method:
+- `.pad_start` (pre-existing — M1-lite 이전부터)
+- `.u_floor` (pre-existing)
+
+M1-lite Step 5 codegen flip 이후에도 상태 그대로. interp 경로 `cg_string_sym` / gen2_expr dispatch table 점검 필요. 단발성 10-20줄 edit 추정.
+
+### 6.3 `.raw` dispatch_tag worktree commit 병합
+
+Worktree commit `4a5dc42c` 의 `.raw` dispatch_tag 변경사항을 main 으로 cherry-pick / ceremony 병합. 내용 검토 후 회귀 probe 있으면 skip 가능 — 단순 ceremony.
+
+---
