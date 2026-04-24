@@ -156,7 +156,6 @@ HexaVal hexa_str_concat(HexaVal a, HexaVal b);
 HexaVal hexa_abs(HexaVal v);
 HexaVal hexa_pad_left(HexaVal s, HexaVal width);
 HexaVal hexa_pad_right(HexaVal s, HexaVal width);
-HexaVal hexa_str_repeat(HexaVal s, HexaVal n);
 HexaVal hexa_str_char_at(HexaVal s, HexaVal idx);
 HexaVal hexa_str_char_code_at(HexaVal s, HexaVal idx);
 HexaVal hexa_read_file(HexaVal path);
@@ -3864,31 +3863,10 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
 // rt_str_* implementations.
 // ─────────────────────────────────────────────────────────────────────
 #include "runtime_hi_gen.c"
-
-HexaVal hexa_str_lines(HexaVal s) {
-    if (!HX_IS_STR(s)) return hexa_array_new();
-    return rt_str_lines(s);
-}
-
-HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
-    if (!HX_IS_STR(s)) return s;
-    return rt_str_repeat(s, n);
-}
-
-HexaVal hexa_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    return rt_str_pad_left(s, wv, padv);
-}
-
-HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    return rt_str_pad_right(s, wv, padv);
-}
-
-HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    return rt_str_center(s, wv, padv);
-}
+// Step 5 (hxa-20260423-003): hexa_str_lines/repeat/pad_left/pad_right/center
+// shims removed — codegen now dispatches directly to rt_str_* from
+// runtime_hi_gen.c (SSOT: self/runtime_hi.hexa). See self/codegen_c2.hexa
+// cg_string_sym "c" branch (lines 250-272).
 
 static int utf8_cpcount(const char* s) {
     int n = 0;
