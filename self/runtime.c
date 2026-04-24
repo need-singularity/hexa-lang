@@ -4079,7 +4079,8 @@ HexaVal hexa_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
     return rt_str_pad_left(s, wv, padv);
 }
 
-HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
+// rt_str_pad_right: SSOT self/runtime_hi.hexa:61-77. 대칭.
+static HexaVal rt_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
     if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
     int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
     const char* src = HX_STR(s);
@@ -4099,6 +4100,11 @@ HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
     }
     out[pos] = 0;
     return hexa_str_own(out);
+}
+
+// hexa_str_pad_right: M1-lite delegate shim (hxa-20260423-003 Step 3).
+HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
+    return rt_str_pad_right(s, wv, padv);
 }
 
 HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
