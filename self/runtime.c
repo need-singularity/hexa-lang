@@ -172,6 +172,25 @@ HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes);
 HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr);
 HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr);
 HexaVal hexa_file_size(HexaVal path);
+// M1 full · file layer (hxa-20260423-003 Step 3): rt_file_* hand-port
+// in runtime.c; hexa_* wrappers become shims forwarding to rt_file_*.
+// SSOT rationale: file I/O is libc-level (fopen/fread/fwrite/access/unlink),
+// so .hexa composition is not meaningful for the raw primitives. The
+// `.hexa` source of truth (runtime_hi.hexa) contains only the composable
+// layer (`rt_read_lines` = `rt_split("\n")`); raw libc wrappers stay in C.
+HexaVal rt_read_file(HexaVal path);
+HexaVal rt_write_file(HexaVal path, HexaVal content);
+HexaVal rt_file_exists(HexaVal path);
+HexaVal rt_write_bytes(HexaVal path, HexaVal arr);
+HexaVal rt_write_bytes_v(HexaVal path, HexaVal arr);
+HexaVal rt_read_file_bytes(HexaVal path);
+HexaVal rt_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes);
+HexaVal rt_write_bytes_append(HexaVal path, HexaVal arr);
+HexaVal rt_write_bytes_append_v(HexaVal path, HexaVal arr);
+HexaVal rt_file_size(HexaVal path);
+HexaVal rt_read_lines(HexaVal path);
+HexaVal rt_delete_file(HexaVal path);
+HexaVal rt_append_file(HexaVal path, HexaVal content);
 HexaVal hexa_str_split(HexaVal s, HexaVal delim);
 HexaVal hexa_str_trim(HexaVal s);
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s);
@@ -3319,7 +3338,14 @@ HexaVal hexa_eq(HexaVal a, HexaVal b) {
 
 // ── File I/O ─────────────────────────────────────────────
 
-HexaVal hexa_read_file(HexaVal path) {
+// ─────────────────────────────────────────────────────────────────────
+// M1 full · file layer (hxa-20260423-003 Step 3)
+// rt_file_* hand-port — authoritative implementations for file I/O.
+// hexa_* wrappers below are shims forwarding to rt_* (preserves external
+// ABI: self/bootstrap_compiler.c, build_c.hexa emit, codegen emit).
+// ─────────────────────────────────────────────────────────────────────
+
+HexaVal rt_read_file(HexaVal path) {
     FILE* f = fopen(HX_STR(path), "rb");
     if (!f) return hexa_str("");
     fseek(f, 0, SEEK_END);
@@ -3331,8 +3357,9 @@ HexaVal hexa_read_file(HexaVal path) {
     fclose(f);
     return hexa_str_own(buf);
 }
+HexaVal hexa_read_file(HexaVal path) { return rt_read_file(path); }
 
-HexaVal hexa_write_file(HexaVal path, HexaVal content) {
+HexaVal rt_write_file(HexaVal path, HexaVal content) {
     FILE* f = fopen(HX_STR(path), "wb");
     if (!f) return hexa_bool(0);
     const char* s = HX_STR(content);
@@ -3341,21 +3368,23 @@ HexaVal hexa_write_file(HexaVal path, HexaVal content) {
     fclose(f);
     return hexa_bool(1);
 }
+HexaVal hexa_write_file(HexaVal path, HexaVal content) { return rt_write_file(path, content); }
 
 // P7-6 builtin (2026-04-18): boolean existence probe. Used by native_build
 // and other self-hosting scripts to gate optional inputs without a
 // full read_file round-trip. Returns hexa_bool(1) when access(path, F_OK)
 // succeeds, else hexa_bool(0). Null/non-string paths → false.
-HexaVal hexa_file_exists(HexaVal path) {
+HexaVal rt_file_exists(HexaVal path) {
     const char* p = HX_STR(path);
     if (!p) return hexa_bool(0);
     return hexa_bool(access(p, F_OK) == 0);
 }
+HexaVal hexa_file_exists(HexaVal path) { return rt_file_exists(path); }
 
 // ── Binary file I/O — write_bytes / read_file_bytes ─────
 // write_bytes: takes a path and a TAG_ARRAY of integers (0-255),
 // writes raw bytes. Null bytes survive — true binary I/O.
-HexaVal hexa_write_bytes(HexaVal path, HexaVal arr) {
+HexaVal rt_write_bytes(HexaVal path, HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
     int len = HX_ARR_LEN(arr);
     FILE* f = fopen(HX_STR(path), "wb");
@@ -3373,14 +3402,15 @@ HexaVal hexa_write_bytes(HexaVal path, HexaVal arr) {
     fclose(f);
     return hexa_bool(1);
 }
+HexaVal hexa_write_bytes(HexaVal path, HexaVal arr) { return rt_write_bytes(path, arr); }
 
-// hexa_write_bytes_v: variant called from the interpreter dispatch where each
+// rt_write_bytes_v: variant called from the interpreter dispatch where each
 // array item is a TAG_VALSTRUCT (Val) rather than a raw HexaVal int. Reads
 // the inner `int_val` field from each Val and writes the low byte. Without
 // this, write_bytes from interpreted user code silently no-ops (HX_IS_INT
 // fails on TAG_VALSTRUCT items) or — with the historical fputs path — UTF-8
 // encodes each byte > 0x7F to two bytes. (2026-04-17)
-HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr) {
+HexaVal rt_write_bytes_v(HexaVal path, HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
     int len = HX_ARR_LEN(arr);
     FILE* f = fopen(HX_STR(path), "wb");
@@ -3411,10 +3441,11 @@ HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr) {
     fclose(f);
     return hexa_bool(1);
 }
+HexaVal hexa_write_bytes_v(HexaVal path, HexaVal arr) { return rt_write_bytes_v(path, arr); }
 
 // read_file_bytes: reads a file in binary mode and returns
 // a TAG_ARRAY of integers (0-255), one per byte.
-HexaVal hexa_read_file_bytes(HexaVal path) {
+HexaVal rt_read_file_bytes(HexaVal path) {
     FILE* f = fopen(HX_STR(path), "rb");
     if (!f) return hexa_array_new();
     fseek(f, 0, SEEK_END);
@@ -3437,6 +3468,7 @@ HexaVal hexa_read_file_bytes(HexaVal path) {
     free(buf);
     return arr;
 }
+HexaVal hexa_read_file_bytes(HexaVal path) { return rt_read_file_bytes(path); }
 
 // ── P4 streaming builtins — read_bytes_at / write_bytes_append ─────
 // Required for multi-GB safetensors→hexaw conversion on 14B Qwen2.5
@@ -3445,7 +3477,7 @@ HexaVal hexa_read_file_bytes(HexaVal path) {
 // read_bytes_at(path, offset, nbytes): pread-style ranged read.
 // Returns a TAG_ARRAY of at most `nbytes` ints (shorter if EOF reached
 // or offset is past EOF). Empty array on fopen failure.
-HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes) {
+HexaVal rt_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes) {
     int64_t off = HX_IS_INT(offset) ? HX_INT(offset)
                 : (HX_TAG(offset) == TAG_FLOAT ? (int64_t)HX_FLOAT(offset) : 0);
     int64_t req = HX_IS_INT(nbytes) ? HX_INT(nbytes)
@@ -3475,11 +3507,12 @@ HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes) {
     free(buf);
     return arr;
 }
+HexaVal hexa_read_bytes_at(HexaVal path, HexaVal offset, HexaVal nbytes) { return rt_read_bytes_at(path, offset, nbytes); }
 
 // write_bytes_append(path, arr): append raw bytes from an int array
 // to `path` (fopen "ab"), creating the file if needed. Returns bool.
-// Mirrors hexa_write_bytes (raw HexaVal int array path).
-HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr) {
+// Mirrors rt_write_bytes (raw HexaVal int array path).
+HexaVal rt_write_bytes_append(HexaVal path, HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
     int len = HX_ARR_LEN(arr);
     FILE* f = fopen(HX_STR(path), "ab");
@@ -3497,10 +3530,11 @@ HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr) {
     fclose(f);
     return hexa_bool(1);
 }
+HexaVal hexa_write_bytes_append(HexaVal path, HexaVal arr) { return rt_write_bytes_append(path, arr); }
 
 // write_bytes_append_v(path, arr): variant for the interpreter dispatch
 // where each array item is a TAG_VALSTRUCT (Val). Mirrors write_bytes_v.
-HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr) {
+HexaVal rt_write_bytes_append_v(HexaVal path, HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return hexa_bool(0);
     int len = HX_ARR_LEN(arr);
     FILE* f = fopen(HX_STR(path), "ab");
@@ -3531,11 +3565,12 @@ HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr) {
     fclose(f);
     return hexa_bool(1);
 }
+HexaVal hexa_write_bytes_append_v(HexaVal path, HexaVal arr) { return rt_write_bytes_append_v(path, arr); }
 
 // file_size(path): native 64-bit file size without loading contents.
 // Existing hexa_full dispatch read the whole file to count length — not
 // viable for multi-GB safetensors shards. Returns -1 on failure.
-HexaVal hexa_file_size(HexaVal path) {
+HexaVal rt_file_size(HexaVal path) {
     FILE* f = fopen(HX_STR(path), "rb");
     if (!f) return hexa_int(-1);
 #if defined(_WIN32)
@@ -3548,6 +3583,7 @@ HexaVal hexa_file_size(HexaVal path) {
     fclose(f);
     return hexa_int((int64_t)sz);
 }
+HexaVal hexa_file_size(HexaVal path) { return rt_file_size(path); }
 
 // ── Command line arguments ───────────────────────────
 
@@ -5777,8 +5813,8 @@ HexaVal hexa_is_error(HexaVal v) {
     return hexa_bool(0);
 }
 
-HexaVal hexa_read_lines(HexaVal path) {
-    HexaVal content = hexa_read_file(path);
+HexaVal rt_read_lines(HexaVal path) {
+    HexaVal content = rt_read_file(path);
     if (!HX_IS_STR(content)) return hexa_array_new();
     HexaVal out = hexa_array_new();
     const char* p = HX_STR(content);
@@ -5803,6 +5839,7 @@ HexaVal hexa_read_lines(HexaVal path) {
     }
     return out;
 }
+HexaVal hexa_read_lines(HexaVal path) { return rt_read_lines(path); }
 
 HexaVal hexa_from_char_code(HexaVal n) {
     int64_t code = HX_IS_INT(n) ? HX_INT(n) : (int64_t)_hexa_f(n);
@@ -5981,13 +6018,14 @@ HexaVal hexa_exec_capture(HexaVal cmd) {
     return arr;
 }
 
-HexaVal hexa_delete_file(HexaVal path) {
+HexaVal rt_delete_file(HexaVal path) {
     if (!HX_IS_STR(path) || !HX_STR(path)) return hexa_void();
     (void)unlink(HX_STR(path));
     return hexa_void();
 }
+HexaVal hexa_delete_file(HexaVal path) { return rt_delete_file(path); }
 
-HexaVal hexa_append_file(HexaVal path, HexaVal content) {
+HexaVal rt_append_file(HexaVal path, HexaVal content) {
     if (!HX_IS_STR(path) || !HX_STR(path)) return hexa_void();
     const char* data = (HX_IS_STR(content) && HX_STR(content)) ? HX_STR(content) : "";
     FILE* f = fopen(HX_STR(path), "ab");
@@ -5996,6 +6034,7 @@ HexaVal hexa_append_file(HexaVal path, HexaVal content) {
     fclose(f);
     return hexa_void();
 }
+HexaVal hexa_append_file(HexaVal path, HexaVal content) { return rt_append_file(path, content); }
 
 HexaVal hexa_bin(HexaVal n) {
     uint64_t v = HX_IS_INT(n) ? (uint64_t)HX_INT(n) : (uint64_t)_hexa_f(n);
