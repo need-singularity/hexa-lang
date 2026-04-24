@@ -10688,9 +10688,9 @@ static void __hexa_codegen_c2_strlit_init(void) {
     __hexa_codegen_c2_sl_221 = hexa_str("hexa_str_trim_start");
     __hexa_codegen_c2_sl_222 = hexa_str("hexa_str_trim_end");
     __hexa_codegen_c2_sl_223 = hexa_str("hexa_str_replace");
-    __hexa_codegen_c2_sl_224 = hexa_str("hexa_str_pad_left");
-    __hexa_codegen_c2_sl_225 = hexa_str("hexa_str_pad_right");
-    __hexa_codegen_c2_sl_226 = hexa_str("hexa_str_repeat");
+    __hexa_codegen_c2_sl_224 = hexa_str("rt_str_pad_left");
+    __hexa_codegen_c2_sl_225 = hexa_str("rt_str_pad_right");
+    __hexa_codegen_c2_sl_226 = hexa_str("rt_str_repeat");
     __hexa_codegen_c2_sl_227 = hexa_str("hexa_str_index_of");
     __hexa_codegen_c2_sl_228 = hexa_str("hexa_str_index_of_from");
     __hexa_codegen_c2_sl_229 = hexa_str("hexa_str_last_index_of");
@@ -10705,11 +10705,11 @@ static void __hexa_codegen_c2_strlit_init(void) {
     __hexa_codegen_c2_sl_238 = hexa_str("hexa_str_parse_float");
     __hexa_codegen_c2_sl_239 = hexa_str("hexa_str_bytes");
     __hexa_codegen_c2_sl_240 = hexa_str("hexa_str_from_chars");
-    __hexa_codegen_c2_sl_241 = hexa_str("hexa_str_center");
+    __hexa_codegen_c2_sl_241 = hexa_str("rt_str_center");
     __hexa_codegen_c2_sl_242 = hexa_str("hexa_str_chars");
     __hexa_codegen_c2_sl_243 = hexa_str("hexa_str_ends_with");
     __hexa_codegen_c2_sl_244 = hexa_str("hexa_str_len");
-    __hexa_codegen_c2_sl_245 = hexa_str("hexa_str_lines");
+    __hexa_codegen_c2_sl_245 = hexa_str("rt_str_lines");
     __hexa_codegen_c2_sl_246 = hexa_str("hexa_str_starts_with");
     __hexa_codegen_c2_sl_247 = hexa_str("hexa_str_substr");
     __hexa_codegen_c2_sl_248 = hexa_str(".");
