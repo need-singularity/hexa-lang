@@ -10236,6 +10236,70 @@ fn call_builtin(name, args) {
             return val_array([val_str(e.to_string()), val_int(1)])
         }
     }
+    // ── hxa-20260424-005 #1: exec_argv(argv) / exec_argv_with_status(argv) ──
+    // Direct fork/execvp. No /bin/sh -c. argv[0] is searched via PATH.
+    // Routes to runtime.c hexa_exec_argv{,_with_status} via the
+    // hx_exec_argv* bt-73 TAG_FN shims. Expects args[0] to be a Val
+    // TAG_ARRAY of Val TAG_STR elements; we unwrap to a native HexaVal
+    // array (same pattern as os_sig_block at 10323) of raw HexaVal strs.
+    if name == "exec_argv" {
+        if len(args) == 0 { return val_str("") }
+        let src = args[0]
+        if src.tag != TAG_ARRAY { return val_str("") }
+        let items = get_array(src)
+        let mut native = []
+        let mut _ei = 0
+        while _ei < len(items) {
+            native.push(items[_ei].str_val)
+            _ei = _ei + 1
+        }
+        try {
+            let r = hx_exec_argv(native)
+            return val_str(to_string(r))
+        } catch e {
+            return val_str("")
+        }
+    }
+    if name == "exec_argv_with_status" {
+        if len(args) == 0 { return val_array([val_str(""), val_int(127)]) }
+        let src = args[0]
+        if src.tag != TAG_ARRAY { return val_array([val_str(""), val_int(127)]) }
+        let items = get_array(src)
+        let mut native = []
+        let mut _ei2 = 0
+        while _ei2 < len(items) {
+            native.push(items[_ei2].str_val)
+            _ei2 = _ei2 + 1
+        }
+        try {
+            let r = hx_exec_argv_with_status(native)
+            // r is a host HexaVal array [stdout, exit_code]; rewrap.
+            return val_array([val_str(to_string(r[0])), val_int(to_int(r[1]))])
+        } catch e {
+            return val_array([val_str(e.to_string()), val_int(127)])
+        }
+    }
+    // ── hxa-20260424-005 #7: sha256(s) / sha256_file(path) ──
+    // Lowercase hex digest (64 chars). Routes to runtime.c hexa_sha256
+    // via the hx_sha256 / hx_sha256_file bt-73 TAG_FN shims.
+    if name == "sha256" {
+        if len(args) == 0 { return val_str("") }
+        try {
+            let r = hx_sha256(args[0].str_val)
+            return val_str(to_string(r))
+        } catch e {
+            return val_str("")
+        }
+    }
+    if name == "sha256_file" {
+        if len(args) == 0 { return val_str("") }
+        try {
+            let r = hx_sha256_file(args[0].str_val)
+            return val_str(to_string(r))
+        } catch e {
+            return val_str("")
+        }
+    }
     // ── std::net — POSIX TCP builtins (Day-1 triad, 2026-04-16) ──
     //   net_listen/accept/close route to hexa_net_* in runtime.c via
     //   codegen_c2 builtin name recognition. Return TAG_INT fd / errno.
@@ -17074,18 +17138,24 @@ fn val_to_json(v) {
 }
 
 fn json_to_val(s) {
+    // hxa-20260424-005 #3: scope-down strict-JSON parse with full escape
+    // coverage (\", \\, \/, \b, \f, \n, \r, \t, \uXXXX) and proper
+    // int/float distinction (`.` / `e` / `E` → float). Preserves the
+    // existing split-and-recurse structure at the top level (\_top_split
+    // / \_top_colon ignore quoted strings + respect bracket/brace depth)
+    // but unescapes JSON string literals via char-indexed scan so
+    // \uXXXX round-trips and `{"k":"v$weird"}` survives without shell
+    // escape collisions. Rationale: nexus tool/proposal_archive.hexa,
+    // tool/proposal_sweep.py, tool/cross_repo_floor_check.hexa currently
+    // subprocess `jq` or python3 per entry — O(spawn · entries) gone.
     let s = s.trim()
     if s == "null" { return val_void() }
     if s == "true" { return val_bool(true) }
     if s == "false" { return val_bool(false) }
     // String
-    if s.starts_with("\"") && s.ends_with("\"") {
+    if s.starts_with("\"") && s.ends_with("\"") && len(s) >= 2 {
         let inner = s.substring(1, len(s) - 1)
-        let inner = inner.replace("\\n", "\n")
-        let inner = inner.replace("\\t", "\t")
-        let inner = inner.replace("\\\"", "\"")
-        let inner = inner.replace("\\\\", "\\")
-        return val_str(inner)
+        return val_str(json_unescape(inner))
     }
     // Array
     if s.starts_with("[") && s.ends_with("]") {
@@ -17114,9 +17184,80 @@ fn json_to_val(s) {
         }
         return val_map(keys, values)
     }
-    // Number
-    if s.contains(".") { return val_float(to_float(s)) }
+    // Number — distinguish int vs float via `.`/`e`/`E` in token.
+    // Handles 1e10, -0.5, 1.0e-3 etc. Fallback: bare digits → int.
+    if s.contains(".") || s.contains("e") || s.contains("E") {
+        return val_float(to_float(s))
+    }
     return val_int(to_int(s))
+}
+
+// Unescape a JSON string body (without surrounding quotes). Strict-JSON
+// escapes: \" \\ \/ \b \f \n \r \t \uXXXX. Unknown escape → passthrough
+// the backslashed char (lenient — matches python's json.loads on
+// well-formed input and nothing worse on malformed).
+fn json_unescape(body) {
+    let cs = body.chars()
+    let n = len(cs)
+    let mut out = ""
+    let mut i = 0
+    while i < n {
+        let ch = to_string(cs[i])
+        if ch == "\\" && i + 1 < n {
+            let nx = to_string(cs[i + 1])
+            if nx == "\"" { out = out + "\""; i = i + 2 }
+            else if nx == "\\" { out = out + "\\"; i = i + 2 }
+            else if nx == "/" { out = out + "/"; i = i + 2 }
+            else if nx == "b" { out = out + from_char_code(8); i = i + 2 }
+            else if nx == "f" { out = out + from_char_code(12); i = i + 2 }
+            else if nx == "n" { out = out + "\n"; i = i + 2 }
+            else if nx == "r" { out = out + "\r"; i = i + 2 }
+            else if nx == "t" { out = out + "\t"; i = i + 2 }
+            else if nx == "u" && i + 5 < n {
+                // Parse 4 hex digits, emit as UTF-8 via from_char_code.
+                // Does not handle surrogate pairs (BMP-only). Adequate
+                // for nexus JSON content which is ASCII + occasional
+                // non-BMP rare-case (falls through to 3-byte UTF-8).
+                let hex = ""
+                    + to_string(cs[i + 2])
+                    + to_string(cs[i + 3])
+                    + to_string(cs[i + 4])
+                    + to_string(cs[i + 5])
+                let cp = json_hex4_to_int(hex)
+                out = out + from_char_code(cp)
+                i = i + 6
+            }
+            else {
+                // Unknown escape: pass through the literal char.
+                out = out + nx
+                i = i + 2
+            }
+        } else {
+            out = out + ch
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Parse a 4-char hex string into an int. 0 on malformed.
+fn json_hex4_to_int(hex) {
+    let cs = hex.chars()
+    let n = len(cs)
+    let mut v = 0
+    let mut i = 0
+    while i < n {
+        let c = to_string(cs[i])
+        let code = char_code(c, 0)
+        let mut d = 0
+        if code >= 48 && code <= 57 { d = code - 48 }
+        else if code >= 97 && code <= 102 { d = code - 87 }
+        else if code >= 65 && code <= 70 { d = code - 55 }
+        else { return 0 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
 }
 
 // Split a JSON string at top-level commas (not inside [] {} or "")

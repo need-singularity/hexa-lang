@@ -6859,6 +6859,7 @@ HexaVal hx_push;
 static int _fn_shims_ready = 0;
 static void _hexa_init_net_fn_shims(void);  // fwd decl — body in native/net.c
 static void _hexa_init_os_fn_shims(void);   // fwd decl — body in native/signal_flock.c
+static void _hexa_init_exec_sha_fn_shims(void); // fwd decl — body in native/exec_argv_sha256.c
 static void _hexa_init_fn_shims(void) {
     if (_fn_shims_ready) return;
     // bootstrap free-fn shims (join, char_code, chr, bit_or)
@@ -6882,6 +6883,8 @@ static void _hexa_init_fn_shims(void) {
     _hexa_init_net_fn_shims();
     // stdlib/os signal + flock free-fn shims (roadmap 62, 2026-04-22)
     _hexa_init_os_fn_shims();
+    // hxa-20260424-005 items #1 + #7: exec_argv + sha256 shims
+    _hexa_init_exec_sha_fn_shims();
     _fn_shims_ready = 1;
 }
 
@@ -6950,5 +6953,21 @@ static void _hexa_init_fn_shims(void) {
  * contract + semantics).
  * ═══════════════════════════════════════════════════════════════════ */
 #include "native/signal_flock.c"
+
+/* ═══════════════════════════════════════════════════════════════════
+ * hxa-20260424-005 items #1 + #7 — exec_argv + sha256 (2026-04-24)
+ *
+ * Exposes:
+ *   hexa_exec_argv(argv_arr)             : fork/execvp, no /bin/sh -c
+ *   hexa_exec_argv_with_status(argv_arr) : same + exit code
+ *   hexa_sha256(s)                       : lowercase hex digest
+ *   hexa_sha256_file(path)               : lowercase hex digest of file
+ *
+ * Implementation: native/exec_argv_sha256.c (pure libc + FIPS 180-4
+ * reference sha256). TAG_FN shims registered from _hexa_init_fn_shims
+ * so the interpreter path resolves `exec_argv`/`sha256` names before
+ * the transpiler learns direct-lowering.
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/exec_argv_sha256.c"
 
 
