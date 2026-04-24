@@ -100,13 +100,27 @@
 - (B) `hexa_v2` 가 `extern fn` 을 잘 해석 못 할 경우 → parser/type_checker 측 `extern` 처리 리그레션 가능성. 이미 작동 중인 `use` 경로 재활용 가능.
 - (C) 성능 −15% 이상 드리프트 시 → `static inline` + LTO 실험, 혹은 특정 함수 rollback.
 
-### 3.2 진행 상황 (2026-04-23 후속 세션)
+### 3.2 진행 상황 (2026-04-23 후속 + 2026-04-24 세션 — **전원 CLOSED**)
 
 - **Step 1 landed** — `self/runtime_hi.hexa` 생성, 5 함수 + 의존 `rt_str_split` 구현. `runtime_hi_selftest()` 내장 (pad_left/right/repeat/center/lines 결과 검증).
 - **Step 2 landed** — `./self/native/hexa_v2 self/runtime_hi.hexa build/runtime_hi.c` 으로 정상 transpile. stage0 interpreter (`./hexa run self/runtime_hi.hexa`) 및 AOT (clang → build/runtime_hi_probe) 양경로 selftest PASS.
 - **Debug trap 발견 & 해결** — `build/runtime.c` 에 4/16 stale 복사본이 남아있어 `#include "runtime.c"` 가 `build/` 근처 파일을 먼저 잡는 현상이 M1-lite 초기 빌드를 전부 깨뜨렸음 (pad_left 등이 빈 문자열 반환). 해당 stale 파일 삭제. 향후 build chain 은 `#include` 경로 명시 혹은 cwd 분리 필요.
-- **Step 3 보류** — runtime.c 의 5 정의 제거는 전체 codegen 이 아직 `hexa_str_*` 을 호출하고 있어 심볼 재매핑 필요. 다음 세션 작업 (`cg_string_sym` 플립 또는 함수 리네임 `rt_str_* → hexa_str_*`).
-- **Step 4~6 보류** — build_stage1 수정 / 벤치마크 / size diff 는 Step 3 이후.
+- **Step 3 LANDED** (2026-04-24, commits `52e22e45` · `e3cc0041` · `ad84a8a8` · `fbe677ce` · `9165a540`) — 5 개 `hexa_str_*` 함수를 `rt_str_*` 로 위임하는 **delegate shim** 구조로 runtime.c 안에 직접 구현 (`lines` / `repeat` / `pad_left` / `pad_right` / `center`). `runtime.c` +61 줄 순증 (shim 추가 > 기존 내용 감소) — 이 단계는 아키텍처 준비용, 실제 감소는 Step 4 에서 확보.
+- **Step 4 LANDED** (2026-04-24, commits `17dcafd9` + `8892686a` 포함) — `tool/extract_runtime_hi.sh` 로 `self/runtime_hi.hexa` → `self/runtime_hi_gen.c` (182 줄 신규) 외부 추출. `runtime.c` 의 hand-port `rt_str_*` 6 개 static 블록 (split + lines + repeat + pad_left + pad_right + center) 을 `#include "runtime_hi_gen.c"` 한 줄로 치환. Net on runtime.c: **−153 / +39 = −114 줄 (7079 → 6965)**. 공개 shim 5 개는 유지 (호출자 불변). SSOT 는 이제 `self/runtime_hi.hexa`.
+- **Step 5 LANDED** (2026-04-24, commits `5b172ff5` + `b4c5a260`) — **codegen flip**: `self/codegen_c2.hexa` 의 5 string method 디스패치 심볼을 `hexa_str_*` → `rt_str_*` 로 전환 (10줄). 이후 `hexa_str_{lines,repeat,pad_left,pad_right,center}` 5 shim 제거 가능 → **runtime.c 6965 → 6943 (−22 추가)**. 바이너리 `./hexa` 383 424 → 366 496 B (−16 928 B, ~4.4%). `hexa_cc.c` regen + `hexa_v2` 재빌드.
+
+**최종 메트릭 (Step 1-5 누적)**:
+
+| 지표 | Before | After | Δ |
+|---|---:|---:|---:|
+| `self/runtime.c` | 7 018 | **6 943** | **−75** |
+| `self/runtime_hi_gen.c` | — | **182** | **+182 (new SSOT extract)** |
+| `./hexa` 바이너리 | — | 366 496 B | Step 5 직후 −16 928 B |
+| coverage | — | **187/187 (100.0%)** | — |
+| regression | string_method_coverage.hexa | **15/15** | — |
+| regression | builtin_mangling.hexa | **12/12** | — |
+
+SSOT 흐름: `self/runtime_hi.hexa` → `tool/extract_runtime_hi.sh` → `self/runtime_hi_gen.c` → `#include` in `self/runtime.c`. M1 full split 시 이 패턴을 도메인별 반복.
 
 ## 4. M2 builtin mangling — 현재 진행상황
 
@@ -118,15 +132,34 @@
 
 M2 종료 시 위 4 `#define` 전원 제거 가능. `grep -c '^#define.*hx_' self/runtime_core.c` == 0 이 anima M2 통과 기준.
 
-## 5. 다음 세션 착수 권장
+## 5. 다음 세션 착수 권장 (2026-04-24 갱신)
 
-본 audit 자료를 기반으로:
+**M1-lite 완전 CLOSED** — §3.2 참조. M2 / M3 / M4 / M5 도 이미 done.
+본 audit 자료는 이제 **M1 full split** 의 설계 근거로 사용.
 
-- 신규 작업: §3.1 실증 절차 (M1-lite 5 함수). 범위 작고 회귀 안전망 있음.
-- 데몬 평행: M2 builtin mangling 마감 — `#define` 4 건 제거 PR.
-- 병행 가능: M5 execvp primitive + 3-플랫폼 CI.
+### 5.1 M1 full — 도메인별 incremental 이관 (권장 순서)
 
-M1 본 분할 (≈ 265 hi 함수 전량 이관) 은 실증 단계 통과 후 다단계 PR 로 진행 권장.
+M1-lite 가 세운 패턴 (`self/runtime_hi.hexa` → `extract_runtime_hi.sh` → `runtime_hi_gen.c` → `#include`) 을 그대로 확장. 도메인당 1 PR:
+
+1. **`file_*` (12 fn)** — **가장 작고 안전** (`read_file` / `write_file` / `append_file` / `file_exists` 등 libc glue). 첫 도메인 확장 증명으로 최적.
+2. **`exec_*` (7 fn)** — fork / popen 얇은 래퍼. file_* 패턴 그대로.
+3. **base64 / hex (~6 fn)** — 순수 비트 조작, 외부 상태 없음.
+4. **JSON (~8 fn)** — 문자열 조작 + 재귀. `str_*` primitive 의존만 extern 주입.
+5. **`map_*` 고차 (~10 fn)** — `keys` / `values` / `has_key` / `contains_key` / `remove`. 해시셀 core 유지.
+6. **`array_*` 고차 (~40 fn)** — `map` / `filter` / `sort` / `find` / `flat_map` / `reverse`. 가장 크지만 마지막이면 패턴 완숙.
+7. **`str_*` 잔여 (~43 fn)** — M1-lite 이외 전부. 가장 뜨거운 path 이므로 벤치 필수.
+
+도메인당 표준 PR: (a) `self/runtime_hi.hexa` 함수 블록 추가, (b) `tool/extract_runtime_hi.sh` 재실행으로 `runtime_hi_gen.c` 재생성, (c) `self/runtime.c` 에서 구 정의 블록 제거, (d) codegen flip (`cg_string_sym` 혹은 도메인 등가), (e) snapshot + coverage 회귀, (f) 바이너리 size diff 기록.
+
+### 5.2 M2 / M5 잔여
+
+- **M2 builtin mangling** — 이미 종결. `#define` 4 건 제거 완료 (별도 PR 로 확인).
+- **M5 execvp / Linux ./hexa / CI** — 전부 done (`self/runtime.c:2848` · `build/hexa_cli_linux.hexa` · `.github/workflows/bootstrap.yml` 10/10 green).
+
+### 5.3 비-M1 minor
+
+- interp regression 추적: `pad_start` / `u_floor` 가 AOT PASS 이나 interp FAIL (pre-existing). `cg_string_sym` / gen2_expr dispatch table 점검.
+- `.raw` dispatch_tag worktree commit `4a5dc42c` main 병합 ceremony.
 
 ---
 
