@@ -118,6 +118,107 @@ fn _install_pre_commit(home: string, repo: string) -> bool {
     return true
 }
 
+// Dry-run verification that the hook (a) contains the expected marker block
+// pointing at roadmap_verify_pre_commit.hexa, AND (b) is actually executable.
+// Additionally invokes the hook script with COMMIT_EDITMSG_PATH=/dev/null so
+// it does a no-op pass; captures stdout+stderr+exit code and looks for
+// expected markers. Returns true on pass.
+//
+// Rationale: prior incident — hooks "installed" (file present) but the
+// underlying tool call was silently missing/mis-chained, so the hook
+// no-op'd on every commit. This routine catches that at install time by
+// exercising the actual invocation path once.
+fn _verify_hook_selfrun(home: string, repo: string) -> bool {
+    let path = home + "/core/" + repo + "/.git/hooks/pre-commit"
+    let tool = home + "/core/hexa-lang/tool/roadmap_verify_pre_commit.hexa"
+
+    // (1) file exists + executable
+    let chk = exec_with_status("test -x '" + path + "'")
+    if chk[1] != 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] pre-commit not executable: " + path)
+        return false
+    }
+
+    // (2) marker + tool-path references present
+    let src = to_string(read_file(path))
+    let marker = "# BEGIN roadmap_verify_hook"
+    if src.index_of(marker) < 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] hook missing marker: " + marker)
+        return false
+    }
+    if src.index_of("roadmap_verify_pre_commit.hexa") < 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] hook missing tool ref: roadmap_verify_pre_commit.hexa")
+        return false
+    }
+
+    // (3) the referenced tool actually exists on disk
+    let tchk = exec_with_status("test -f '" + tool + "'")
+    if tchk[1] != 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] tool file absent: " + tool)
+        return false
+    }
+
+    // (4) dry-run the hook — empty COMMIT_EDITMSG simulates a pass-through
+    // (no gate tags → exit 0, no side-effects). Capture both streams +
+    // exit code. A non-zero exit with our marker grammar is tolerated
+    // (hook legitimately rejects), but a bootstrap failure (e.g. 127
+    // "command not found" or "hexa: not found") is a hard fail.
+    let tmpout = "/tmp/.irh_hookrun." + to_string(exec("echo $$")).trim()
+    let shcmd = "( cd '" + home + "/core/" + repo + "' && "
+              + "COMMIT_EDITMSG_PATH=/dev/null '" + path + "' ) "
+              + ">'" + tmpout + ".out' 2>'" + tmpout + ".err'; "
+              + "echo exit=$? >>'" + tmpout + ".err'"
+    let _r = exec_with_status(shcmd)
+    let combined = to_string(exec("cat '" + tmpout + ".out' '" + tmpout + ".err' 2>/dev/null"))
+    let _cleanup = exec_with_status("rm -f '" + tmpout + ".out' '" + tmpout + ".err'")
+
+    // Expected failure modes we must catch (bootstrap collapse):
+    if combined.index_of("command not found") >= 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] dry-run: command not found")
+        eprintln(combined)
+        return false
+    }
+    if combined.index_of("No such file") >= 0 && combined.index_of("roadmap_verify_pre_commit") >= 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] dry-run: tool path unreachable")
+        eprintln(combined)
+        return false
+    }
+    if combined.index_of("exit=127") >= 0 {
+        eprintln("[INSTALL-FAIL] [" + repo + "] dry-run exit=127 (bootstrap collapse)")
+        eprintln(combined)
+        return false
+    }
+
+    // (5) probe roadmap_progress_check.hexa in isolation — its stdout
+    // carries the schema marker (stable across versions). This confirms
+    // the sibling tool the hook indirectly relies on is callable.
+    let hx = home + "/.hx/bin/hexa"
+    let hx_exists = exec_with_status("test -x '" + hx + "'")
+    let mut hexa_cmd = "hexa"
+    if hx_exists[1] == 0 { hexa_cmd = hx }
+    let prog_tool = home + "/core/hexa-lang/tool/roadmap_progress_check.hexa"
+    let prog_chk = exec_with_status("test -f '" + prog_tool + "'")
+    if prog_chk[1] == 0 {
+        // run from target repo cwd so it scans the repo's local .roadmap
+        let pcmd = "cd '" + home + "/core/" + repo + "' && '"
+                 + hexa_cmd + "' run '" + prog_tool + "' 2>/dev/null"
+        let pout = to_string(exec(pcmd))
+        // Expected stdout marker — JSON schema tag or the plain [PROGRESS]
+        // line that future versions may emit. Tolerate either.
+        let has_schema = pout.index_of("anima.roadmap_progress.v1") >= 0
+        let has_tag = pout.index_of("[PROGRESS]") >= 0
+        let has_tool = pout.index_of("tool/roadmap_progress_check.hexa") >= 0
+        if !has_schema && !has_tag && !has_tool {
+            eprintln("[INSTALL-FAIL] [" + repo + "] progress_check dry-run: no marker in stdout")
+            eprintln("  head: " + pout.substring(0, 120))
+            return false
+        }
+    }
+
+    println("[INSTALL-OK] [" + repo + "] hook self-verified (marker + dry-run + progress probe)")
+    return true
+}
+
 fn _install_launchd(home: string) -> bool {
     let plist_path = home + "/Library/LaunchAgents/com.airgenome.roadmap-watcher.plist"
     let tool = home + "/core/hexa-lang/tool/roadmap_watcher.hexa"
@@ -221,6 +322,10 @@ fn _selftest_irh() -> int {
     // We can't easily fake argv; just assert the function is callable.
     let cm = _check_mode()
     if cm != true && cm != false { eprintln("FAIL: _check_mode non-bool"); return 1 }
+    // 3) _verify_hook_selfrun detects missing hook (negative path)
+    //    — repo name deliberately unused to force the test-x check to fail.
+    let v = _verify_hook_selfrun(_home(), "__irh_selftest_nonexistent__")
+    if v != false { eprintln("FAIL: verify_hook_selfrun false-positive"); return 1 }
     println("[install_roadmap_hooks selftest] OK")
     return 0
 }
@@ -247,8 +352,21 @@ fn main() -> int {
 
     let repos = ["anima", "airgenome", "hexa-lang"]
     let mut installed = 0
+    let mut verified = 0
+    let mut verify_failures = []
     for r in repos {
-        if _install_pre_commit(home, r) { installed = installed + 1 }
+        if _install_pre_commit(home, r) {
+            installed = installed + 1
+            // Self-verify IMMEDIATELY after writing. Prior incident (hxa-20260424-005 #8):
+            // hooks were "installed" but silently no-op'd because the downstream call
+            // chain was missing. Catch that class of bug at install time, not on the
+            // next real commit (which would silently skip enforcement).
+            if _verify_hook_selfrun(home, r) {
+                verified = verified + 1
+            } else {
+                verify_failures.push(r)
+            }
+        }
     }
 
     let _l = _install_launchd(home)
@@ -256,6 +374,18 @@ fn main() -> int {
 
     println("")
     println("installed hooks: " + to_string(installed) + "/3")
+    println("self-verified : " + to_string(verified) + "/" + to_string(installed))
+    if len(verify_failures) > 0 {
+        let mut fl = ""
+        let mut fi = 0
+        while fi < len(verify_failures) {
+            if fi == 0 { fl = verify_failures[fi] }
+            else { fl = fl + "," + verify_failures[fi] }
+            fi = fi + 1
+        }
+        eprintln("[INSTALL-FAIL] hook verification failed for: " + fl)
+        exit(2)
+    }
     println("")
     println("NEXT STEP (user, manual):")
     let uid = to_string(exec("id -u")).trim()
