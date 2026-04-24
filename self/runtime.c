@@ -3770,49 +3770,11 @@ HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// M1-lite (hxa-20260423-003 Step 3): rt_str_* layer — .hexa 로직을 C 로
-// hand-port 한 thin layer. 원본 구현은 self/runtime_hi.hexa (SSOT).
-// hexa_str_* 공용 심볼은 rt_str_* 로 얇게 위임 → codegen remap 불필요.
-// 목적: runtime.c 내부에서 "2-layer 분리" 실증 (composable → primitive).
+// M1-lite (hxa-20260423-003 Step 4): rt_str_* layer — GENERATED from
+// self/runtime_hi.hexa via tool/extract_runtime_hi.sh. Included below
+// in the hexa_str_join region (where rt_str_* dependencies are ready).
+// hexa_str_* shims forward to rt_str_* after the include.
 // ─────────────────────────────────────────────────────────────────────
-
-// rt_str_split: SSOT self/runtime_hi.hexa:13-33. substring-scan O(n*m).
-// hexa_str_split 이 이미 존재하지만 독립 구현 유지 (circular dep 차단).
-static HexaVal rt_str_split(HexaVal s, HexaVal delim) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(delim)) return hexa_array_new();
-    HexaVal out = hexa_array_new();
-    int dlen = (int)strlen(HX_STR(delim));
-    if (dlen == 0) { hexa_array_push(out, s); return out; }
-    const char* src = HX_STR(s);
-    int slen = (int)strlen(src);
-    int start = 0;
-    int i = 0;
-    while (i <= slen - dlen) {
-        if (memcmp(src + i, HX_STR(delim), (size_t)dlen) == 0) {
-            char* seg = strndup(src + start, (size_t)(i - start));
-            hexa_array_push(out, hexa_str_own(seg));
-            start = i + dlen;
-            i = start;
-        } else {
-            i++;
-        }
-    }
-    char* tail = strndup(src + start, (size_t)(slen - start));
-    hexa_array_push(out, hexa_str_own(tail));
-    return out;
-}
-
-// rt_str_lines: SSOT self/runtime_hi.hexa:36-38. "\n" delimiter wrapper.
-static HexaVal rt_str_lines(HexaVal s) {
-    if (!HX_IS_STR(s)) return hexa_array_new();
-    return rt_str_split(s, hexa_str("\n"));
-}
-
-// hexa_str_lines: M1-lite delegate shim (hxa-20260423-003 Step 3).
-// 원본 구현은 rt_str_lines 로 이관. 호출자 코드(codegen)는 변경 없음.
-HexaVal hexa_str_lines(HexaVal s) {
-    return rt_str_lines(s);
-}
 
 HexaVal hexa_str_trim(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
@@ -3893,6 +3855,41 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     result[total] = 0;
     return hexa_str_own(result);
 }
+
+// ─────────────────────────────────────────────────────────────────────
+// M1-lite (hxa-20260423-003 Step 4): rt_str_* layer from runtime_hi.hexa
+// SSOT. Must appear AFTER hexa_str_join (depended on by pad_left/pad_right/
+// repeat/center) and AFTER hexa_str_substring (depended on by rt_str_split).
+// Shims below forward the public hexa_str_* symbols to the generated
+// rt_str_* implementations.
+// ─────────────────────────────────────────────────────────────────────
+#include "runtime_hi_gen.c"
+
+HexaVal hexa_str_lines(HexaVal s) {
+    if (!HX_IS_STR(s)) return hexa_array_new();
+    return rt_str_lines(s);
+}
+
+HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
+    if (!HX_IS_STR(s)) return s;
+    return rt_str_repeat(s, n);
+}
+
+HexaVal hexa_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    return rt_str_pad_left(s, wv, padv);
+}
+
+HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    return rt_str_pad_right(s, wv, padv);
+}
+
+HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
+    return rt_str_center(s, wv, padv);
+}
+
 static int utf8_cpcount(const char* s) {
     int n = 0;
     for (int i = 0; s[i]; i++) if ((s[i] & 0xC0) != 0x80) n++;
@@ -4017,123 +4014,12 @@ HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
     return hexa_bool(HX_INT(a) >= HX_INT(b));
 }
 
-// rt_str_repeat: SSOT self/runtime_hi.hexa:80-89. count<=0 → "".
-static HexaVal rt_str_repeat(HexaVal s, HexaVal n) {
-    if (!HX_IS_STR(s)) return s;
-    int count = HX_IS_INT(n) ? (int)HX_INT(n) : (int)__hx_to_double(n);
-    if (count <= 0) return hexa_str("");
-    size_t slen = strlen(HX_STR(s));
-    char* result = malloc(slen * (size_t)count + 1);
-    size_t total = 0;
-    for (int i = 0; i < count; i++) {
-        memcpy(result + total, HX_STR(s), slen);
-        total += slen;
-    }
-    result[total] = 0;
-    return hexa_str_own(result);
-}
-
-// hexa_str_repeat: M1-lite delegate shim (hxa-20260423-003 Step 3).
-HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
-    return rt_str_repeat(s, n);
-}
-
 int hexa_array_contains(HexaVal arr, HexaVal item) {
     if (!HX_IS_ARRAY(arr)) return 0;
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         if (hexa_truthy(hexa_eq(HX_ARR_ITEMS(arr)[i], item))) return 1;
     }
     return 0;
-}
-
-// pad_left / pad_right / center: fill to `width` with pad-char.
-// pad may be multi-char — interpreter prepends/appends the whole token
-// each iteration; we match that semantics (hexa_full.hexa:14975-15003).
-// Returns s unchanged if already ≥ width.
-// rt_str_pad_left: SSOT self/runtime_hi.hexa:43-59. ceil((w-slen)/plen) repeats.
-static HexaVal rt_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
-    const char* src = HX_STR(s);
-    const char* pad = HX_STR(padv);
-    int slen = (int)strlen(src);
-    int plen = (int)strlen(pad);
-    if (slen >= width || plen == 0) return s;
-    int pad_total = width - slen;
-    int pad_iters = (pad_total + plen - 1) / plen; // ceil
-    int out_cap = slen + pad_iters * plen + 1;
-    char* out = (char*)malloc((size_t)out_cap);
-    int pos = 0;
-    for (int i = 0; i < pad_iters; i++) {
-        memcpy(out + pos, pad, (size_t)plen);
-        pos += plen;
-    }
-    memcpy(out + pos, src, (size_t)slen);
-    pos += slen;
-    out[pos] = 0;
-    return hexa_str_own(out);
-}
-
-// hexa_str_pad_left: M1-lite delegate shim (hxa-20260423-003 Step 3).
-HexaVal hexa_str_pad_left(HexaVal s, HexaVal wv, HexaVal padv) {
-    return rt_str_pad_left(s, wv, padv);
-}
-
-// rt_str_pad_right: SSOT self/runtime_hi.hexa:61-77. 대칭.
-static HexaVal rt_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
-    const char* src = HX_STR(s);
-    const char* pad = HX_STR(padv);
-    int slen = (int)strlen(src);
-    int plen = (int)strlen(pad);
-    if (slen >= width || plen == 0) return s;
-    int pad_total = width - slen;
-    int pad_iters = (pad_total + plen - 1) / plen;
-    int out_cap = slen + pad_iters * plen + 1;
-    char* out = (char*)malloc((size_t)out_cap);
-    memcpy(out, src, (size_t)slen);
-    int pos = slen;
-    for (int i = 0; i < pad_iters; i++) {
-        memcpy(out + pos, pad, (size_t)plen);
-        pos += plen;
-    }
-    out[pos] = 0;
-    return hexa_str_own(out);
-}
-
-// hexa_str_pad_right: M1-lite delegate shim (hxa-20260423-003 Step 3).
-HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
-    return rt_str_pad_right(s, wv, padv);
-}
-
-// rt_str_center: SSOT self/runtime_hi.hexa:92-117. odd-remainder → right.
-static HexaVal rt_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
-    if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
-    int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
-    const char* src = HX_STR(s);
-    const char* pad = HX_STR(padv);
-    int slen = (int)strlen(src);
-    int plen = (int)strlen(pad);
-    if (slen >= width || plen == 0) return s;
-    int total_pad = width - slen;
-    int left_pad = total_pad / 2;
-    int right_pad = total_pad - left_pad;
-    int li = (left_pad + plen - 1) / plen;
-    int ri = (right_pad + plen - 1) / plen;
-    int out_cap = slen + (li + ri) * plen + 1;
-    char* out = (char*)malloc((size_t)out_cap);
-    int pos = 0;
-    for (int i = 0; i < li; i++) { memcpy(out + pos, pad, (size_t)plen); pos += plen; }
-    memcpy(out + pos, src, (size_t)slen); pos += slen;
-    for (int i = 0; i < ri; i++) { memcpy(out + pos, pad, (size_t)plen); pos += plen; }
-    out[pos] = 0;
-    return hexa_str_own(out);
-}
-
-// hexa_str_center: M1-lite delegate shim (hxa-20260423-003 Step 3).
-HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
-    return rt_str_center(s, wv, padv);
 }
 
 // count_substr(s, substr): number of non-overlapping occurrences.
