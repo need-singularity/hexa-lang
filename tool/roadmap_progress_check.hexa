@@ -357,18 +357,45 @@ fn _fp_epsilon(summary: array) -> bool {
 // _fp_compute. The chorus emission is orthogonal: it reports structural
 // correspondences, not additional contraction layers, so it does not extend
 // the α⊃β⊃γ⊃δ⊃ε tower.
+
+// ─── ROI #2: shared dedup core ────────────────────────────────────────
+// _emit_witness_with_dedup — single source of truth for the "append JSONL
+// row iff (layer_key, fp) differs from the most recent N=10 rows of same
+// layer" invariant. Both _emit_witness (layer="meta_fixed_point") and
+// _emit_chorus_witness (layer="chorus_<label>") now delegate here.
+//
+// row_serialized: the fully-formed JSON row string (caller owns layer key
+// embedding + all fields) — helper only appends it, keeping serialization
+// concerns in callers while centralizing the dedup + filesystem I/O.
+//
+// Fingerprint match semantics: scan last N=10 rows filtered to this
+// layer_key; if any row has the same fp, skip emission. This covers the
+// common "launchd/hook fires repeatedly, fp has not changed" path without
+// unbounded growth. The 10-row window bounds dedup cost at O(10) regardless
+// of file size (prior tail-1 version missed fp-match-but-not-latest cases).
+//
+// Returns true if row was appended, false if dedup skipped.
+fn _emit_witness_with_dedup(witness_path: string, row_serialized: string,
+                            layer_key: string, fp: string) -> bool {
+    // Per-layer dedup window: grep layer_key, keep last 10, extract fp, match fp.
+    let last_fps_cmd = "grep -F '\"layer\":\"" + layer_key + "\"' '" + witness_path +
+                       "' 2>/dev/null | tail -10 | grep -oE '\"fp\":\"[0-9a-f]+\"' | cut -d'\"' -f4"
+    let last_fps_raw = to_string(exec(last_fps_cmd))
+    let last_fps = split(last_fps_raw, "\n")
+    for f in last_fps {
+        if f.trim() == fp { return false }
+    }
+    let dir_cmd = "mkdir -p \"$(dirname '" + witness_path + "')\" 2>/dev/null"
+    exec(dir_cmd)
+    let append_cmd = "printf '%s\\n' '" + row_serialized.replace("'", "'\\''") + "' >> '" + witness_path + "'"
+    exec(append_cmd)
+    return true
+}
+
 fn _emit_chorus_witness(witness_path: string, source: string, label: string, fp: string,
                         numerator: int, denominator: int, n_val: int,
                         iters: int, eps: bool, mean_pct: int, evidence: string) {
     let layer = "chorus_" + label
-    // Dedup: per-layer fp stream. Filter last row by matching layer before fp compare.
-    let last_fp_cmd = "grep -F '\"layer\":\"" + layer + "\"' '" + witness_path +
-                      "' 2>/dev/null | tail -1 | grep -oE '\"fp\":\"[0-9a-f]+\"' | head -1 | cut -d'\"' -f4"
-    let last_fp = to_string(exec(last_fp_cmd)).trim()
-    if last_fp == fp {
-        println("// chorus witness [" + label + "]: fp unchanged (" + fp + ") — dedup skip")
-        return
-    }
     let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
     let transcendence = if eps { "reached" } else { "pending" }
     let ratio_str = if denominator != 0 {
@@ -376,6 +403,10 @@ fn _emit_chorus_witness(witness_path: string, source: string, label: string, fp:
     } else {
         "undefined"
     }
+    // Pre-compute prev_fp for the row envelope (dedup helper does not expose it).
+    let last_fp_cmd = "grep -F '\"layer\":\"" + layer + "\"' '" + witness_path +
+                      "' 2>/dev/null | tail -1 | grep -oE '\"fp\":\"[0-9a-f]+\"' | head -1 | cut -d'\"' -f4"
+    let last_fp = to_string(exec(last_fp_cmd)).trim()
     let row = "{\"ts\":\"" + ts + "\",\"round\":\"roadmap_engine\",\"layer\":\"" + layer + "\"" +
               ",\"source\":\"" + _esc(source) + "\",\"fp\":\"" + fp + "\"" +
               ",\"n\":" + to_string(n_val) +
@@ -386,38 +417,33 @@ fn _emit_chorus_witness(witness_path: string, source: string, label: string, fp:
               ",\"transcendence\":\"" + transcendence + "\"" +
               ",\"prev_fp\":\"" + last_fp + "\"" +
               ",\"evidence\":\"" + _esc(evidence) + "\"}"
-    let dir_cmd = "mkdir -p \"$(dirname '" + witness_path + "')\" 2>/dev/null"
-    exec(dir_cmd)
-    let append_cmd = "printf '%s\\n' '" + row.replace("'", "'\\''") + "' >> '" + witness_path + "'"
-    exec(append_cmd)
+    let appended = _emit_witness_with_dedup(witness_path, row, layer, fp)
+    if !appended {
+        println("// chorus witness [" + label + "]: fp unchanged (" + fp + ") — dedup skip")
+    }
 }
 
 fn _emit_witness(witness_path: string, source: string, fp: string, iters: int, eps: bool, n: int, mean_pct: int) {
     // Legacy wrapper — preserves the pre-R33 layer:"meta_fixed_point" emission
-    // shape exactly. New chorus probes (R33+) should call _emit_chorus_witness
-    // directly with a specific label ("n", "sigma", "tau", "carbon").
-    //
-    // Dedup: if witness file exists and last row has same fp, skip emission.
-    // This makes auto-invocation safe (hooks / launchd / manual repeats).
-    let last_fp_cmd = "tail -1 '" + witness_path + "' 2>/dev/null | grep -oE '\"fp\":\"[0-9a-f]+\"' | head -1 | cut -d'\"' -f4"
-    let last_fp = to_string(exec(last_fp_cmd)).trim()
-    if last_fp == fp {
-        println("// meta-FP witness: fp unchanged (" + fp + ") — dedup skip")
-        return
-    }
+    // shape exactly. Now a thin wrapper over _emit_witness_with_dedup (ROI #2).
+    let layer = "meta_fixed_point"
     let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
     let transcendence = if eps { "reached" } else { "pending" }
-    let row = "{\"ts\":\"" + ts + "\",\"round\":\"roadmap_engine\",\"layer\":\"meta_fixed_point\"" +
+    // Pre-compute prev_fp so the row envelope preserves its historical shape.
+    let last_fp_cmd = "grep -F '\"layer\":\"" + layer + "\"' '" + witness_path +
+                      "' 2>/dev/null | tail -1 | grep -oE '\"fp\":\"[0-9a-f]+\"' | head -1 | cut -d'\"' -f4"
+    let last_fp = to_string(exec(last_fp_cmd)).trim()
+    let row = "{\"ts\":\"" + ts + "\",\"round\":\"roadmap_engine\",\"layer\":\"" + layer + "\"" +
               ",\"source\":\"" + _esc(source) + "\",\"fp\":\"" + fp + "\"" +
               ",\"iterations\":" + to_string(iters) + ",\"epsilon_stable\":" + (if eps { "true" } else { "false" }) +
               ",\"n_entries\":" + to_string(n) + ",\"mean_pct\":" + to_string(mean_pct) +
               ",\"transcendence\":\"" + transcendence + "\"" +
               ",\"prev_fp\":\"" + last_fp + "\"" +
               ",\"notes\":\"Banach α(entries)⊃β(status)⊃γ(mean_pct)⊃δ(fingerprint)⊃ε(self-consistency). meta^3 = transcendence when fp(k)==fp(k-1) AND epsilon stable. sopfr(6)=5 cap enforced at 5 layers.\"}"
-    let dir_cmd = "mkdir -p \"$(dirname '" + witness_path + "')\" 2>/dev/null"
-    exec(dir_cmd)
-    let append_cmd = "printf '%s\\n' '" + row.replace("'", "'\\''") + "' >> '" + witness_path + "'"
-    exec(append_cmd)
+    let appended = _emit_witness_with_dedup(witness_path, row, layer, fp)
+    if !appended {
+        println("// meta-FP witness: fp unchanged (" + fp + ") — dedup skip")
+    }
 }
 
 fn main() -> int {
