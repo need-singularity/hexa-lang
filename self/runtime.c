@@ -3769,12 +3769,49 @@ HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
     return arr;
 }
 
-// lines: split on '\n'. Thin wrapper around hexa_str_split matching the
-// interpreter shape `s.split("\n")`. Non-str receiver returns empty
-// array (TAG_ERROR safety fallback at self/hexa_full.hexa:14926-14928).
-HexaVal hexa_str_lines(HexaVal s) {
+// ─────────────────────────────────────────────────────────────────────
+// M1-lite (hxa-20260423-003 Step 3): rt_str_* layer — .hexa 로직을 C 로
+// hand-port 한 thin layer. 원본 구현은 self/runtime_hi.hexa (SSOT).
+// hexa_str_* 공용 심볼은 rt_str_* 로 얇게 위임 → codegen remap 불필요.
+// 목적: runtime.c 내부에서 "2-layer 분리" 실증 (composable → primitive).
+// ─────────────────────────────────────────────────────────────────────
+
+// rt_str_split: SSOT self/runtime_hi.hexa:13-33. substring-scan O(n*m).
+// hexa_str_split 이 이미 존재하지만 독립 구현 유지 (circular dep 차단).
+static HexaVal rt_str_split(HexaVal s, HexaVal delim) {
+    if (!HX_IS_STR(s) || !HX_IS_STR(delim)) return hexa_array_new();
+    HexaVal out = hexa_array_new();
+    int dlen = (int)strlen(HX_STR(delim));
+    if (dlen == 0) { hexa_array_push(out, s); return out; }
+    const char* src = HX_STR(s);
+    int slen = (int)strlen(src);
+    int start = 0;
+    int i = 0;
+    while (i <= slen - dlen) {
+        if (memcmp(src + i, HX_STR(delim), (size_t)dlen) == 0) {
+            char* seg = strndup(src + start, (size_t)(i - start));
+            hexa_array_push(out, hexa_str_own(seg));
+            start = i + dlen;
+            i = start;
+        } else {
+            i++;
+        }
+    }
+    char* tail = strndup(src + start, (size_t)(slen - start));
+    hexa_array_push(out, hexa_str_own(tail));
+    return out;
+}
+
+// rt_str_lines: SSOT self/runtime_hi.hexa:36-38. "\n" delimiter wrapper.
+static HexaVal rt_str_lines(HexaVal s) {
     if (!HX_IS_STR(s)) return hexa_array_new();
-    return hexa_str_split(s, hexa_str("\n"));
+    return rt_str_split(s, hexa_str("\n"));
+}
+
+// hexa_str_lines: M1-lite delegate shim (hxa-20260423-003 Step 3).
+// 원본 구현은 rt_str_lines 로 이관. 호출자 코드(codegen)는 변경 없음.
+HexaVal hexa_str_lines(HexaVal s) {
+    return rt_str_lines(s);
 }
 
 HexaVal hexa_str_trim(HexaVal s) {
