@@ -448,6 +448,92 @@ fn _emit_witness(witness_path: string, source: string, fp: string, iters: int, e
     }
 }
 
+// ─── ROI #4: mtime-keyed output cache ─────────────────────────────────
+// Goal: post_tool hooks fire this engine per commit (3-5s per call). On
+// unchanged .roadmap (mtime equal to cached value), skip the full scan
+// and re-print the cached output. Cache: {mtime, head_sha, output_json,
+// emitted_witnesses:[layer_keys]}.
+//
+// Runtime dependency: stat(1). macOS → `stat -f %m`, linux → `stat -c %Y`.
+// We probe `stat -f` first (darwin), fall back to `-c` (GNU coreutils).
+// NOTE: a native primitive mtime() in hexa_full.hexa runtime would be
+// cleaner; agent A owns that file so we shell out here (ROI #4 deferred
+// runtime primitive — acceptable since stat is POSIX ubiquitous).
+
+fn _mtime(path: string) -> string {
+    // Returns mtime as epoch-seconds string; empty on failure.
+    let cmd = "(stat -f %m '" + path + "' 2>/dev/null || stat -c %Y '" + path + "' 2>/dev/null) | head -1"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _git_head_sha(root: string) -> string {
+    let cmd = "git -C '" + root + "' rev-parse --short=12 HEAD 2>/dev/null"
+    return to_string(exec(cmd)).trim()
+}
+
+// Naive JSON-string literal extractor for one top-level key. Uses our own
+// format (flat object emitted by _cache_write below) — not a general parser.
+// Returns the unquoted string value of `"<key>":"<value>"`, or "" on miss.
+// Stops at first unescaped closing quote.
+fn _cache_extract_str(src: string, key: string) -> string {
+    let needle = "\"" + key + "\":\""
+    let idx = src.index_of(needle)
+    if idx < 0 { return "" }
+    let start = idx + len(needle)
+    let rest = src.substring(start, len(src))
+    // Find first unescaped quote. Our writer only emits _esc-safe content
+    // (backslashes doubled, quotes escaped), so we walk char-by-char.
+    let mut j = 0
+    while j < len(rest) {
+        let c = rest.substring(j, j + 1)
+        if c == "\\" { j = j + 2; continue }
+        if c == "\"" { return rest.substring(0, j) }
+        j = j + 1
+    }
+    return ""
+}
+
+// Unescape the _esc counterpart: \\ → \, \" → ", \n → newline (rare in
+// output JSON rendered by _render, but handle them for safety).
+fn _cache_unesc(s: string) -> string {
+    let mut r = s.replace("\\n", "\n")
+    r = r.replace("\\\"", "\"")
+    r = r.replace("\\\\", "\\")
+    return r
+}
+
+fn _cache_read(cache_path: string) -> array {
+    // Returns [mtime, head_sha, output_json] (empty strings on miss/parse fail).
+    if !_file_exists(cache_path) { return ["", "", ""] }
+    let raw = to_string(read_file(cache_path))
+    let m = _cache_extract_str(raw, "mtime")
+    let h = _cache_extract_str(raw, "head_sha")
+    let o = _cache_unesc(_cache_extract_str(raw, "output_json"))
+    return [m, h, o]
+}
+
+fn _cache_write(cache_path: string, mtime: string, head_sha: string,
+                output_json: string, emitted_layers: array) {
+    let mut layers_str = "["
+    let mut i = 0
+    while i < len(emitted_layers) {
+        if i > 0 { layers_str = layers_str + "," }
+        layers_str = layers_str + "\"" + emitted_layers[i] + "\""
+        i = i + 1
+    }
+    layers_str = layers_str + "]"
+    let body = "{\"schema\":\"roadmap_progress_cache.v1\"" +
+               ",\"mtime\":\"" + mtime + "\"" +
+               ",\"head_sha\":\"" + head_sha + "\"" +
+               ",\"emitted_witnesses\":" + layers_str +
+               ",\"output_json\":\"" + _esc(output_json) + "\"}"
+    let dir_cmd = "mkdir -p \"$(dirname '" + cache_path + "')\" 2>/dev/null"
+    exec(dir_cmd)
+    let tmp = cache_path + ".tmp"
+    write_file(tmp, body)
+    exec("mv '" + tmp + "' '" + cache_path + "'")
+}
+
 fn main() -> int {
     let argv = args()
     // --selftest / selftest dispatch (hermetic — no roadmap file access)
@@ -468,6 +554,9 @@ fn main() -> int {
     let mut meta_fp = true
     let mut meta_fp_max_iter = 3
     let mut witness_path = "state/atlas_convergence_witness.jsonl"
+    // ROI #4: cache keyed on .roadmap mtime + HEAD sha. `--no-cache` bypasses.
+    let mut use_cache = true
+    let mut cache_path = "state/roadmap_progress_cache.json"
     let mut i = 0
     while i < len(argv) {
         let a = argv[i]
@@ -478,6 +567,8 @@ fn main() -> int {
         if a == "--no-meta-fp" { meta_fp = false; i = i + 1; continue }
         if a == "--meta-fp-max-iter" && i + 1 < len(argv) { meta_fp_max_iter = to_int(argv[i+1]); i = i + 2; continue }
         if a == "--witness-out" && i + 1 < len(argv) { witness_path = argv[i+1]; i = i + 2; continue }
+        if a == "--no-cache" { use_cache = false; i = i + 1; continue }
+        if a == "--cache-path" && i + 1 < len(argv) { cache_path = argv[i + 1]; i = i + 2; continue }
         i = i + 1
     }
 
@@ -487,6 +578,28 @@ fn main() -> int {
     if !_file_exists(roadmap_file) {
         println("{\"error\":\"roadmap_file_not_found\",\"path\":\"" + _esc(roadmap_file) + "\"}")
         return 2
+    }
+
+    // ─── ROI #4: cache check (before parse) ──────────────────────────────
+    // Hit iff cache file exists, mtime matches, AND head_sha matches. On
+    // hit: print cached output, skip witness emission (witness rows for
+    // this state already landed on the miss that populated the cache),
+    // return 0. Strict-mode is incompatible with cache hits (it would
+    // need per-entry data that the cache elides) — bypass cache under
+    // --strict to keep that exit-1 path exact.
+    let cache_full = root + "/" + cache_path
+    let cur_mtime = _mtime(roadmap_file)
+    let cur_head = _git_head_sha(root)
+    if use_cache && !strict {
+        let cached = _cache_read(cache_full)
+        let cached_mtime = cached[0]
+        let cached_head = cached[1]
+        let cached_output = cached[2]
+        if cached_mtime != "" && cached_mtime == cur_mtime && cached_head == cur_head && cached_output != "" {
+            println("[CACHE-HIT mtime=" + cur_mtime + " head=" + cur_head + "]")
+            println(cached_output)
+            return 0
+        }
     }
 
     let raw_entries = _load_roadmap(roadmap_file)
@@ -642,6 +755,19 @@ fn main() -> int {
                 }
             }
         }
+    }
+
+    // ─── ROI #4: cache write (after full scan) ──────────────────────────
+    // Persist (mtime, head_sha, output_json, emitted_witnesses) so the next
+    // invocation with unchanged .roadmap + HEAD can short-circuit at the
+    // cache-check above. Skip under --strict (cache bypassed there).
+    if use_cache && !strict {
+        let mut emitted_layers = []
+        if meta_fp {
+            emitted_layers.push("meta_fixed_point")
+            emitted_layers.push("chorus_n")
+        }
+        _cache_write(cache_full, cur_mtime, cur_head, body, emitted_layers)
     }
 
     if strict {
