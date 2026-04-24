@@ -1,0 +1,297 @@
+// tool/doc_lint.hexa — .doc enforcer (docs organization SSOT)
+//
+// usage:
+//   hexa tool/doc_lint.hexa         — validate /.doc + run declared scans, exit 1 on violation
+//   hexa tool/doc_lint.hexa --list  — dump parsed entries for debug
+//
+// rule: .doc canonical format — docs organization rules (folder layout,
+// file naming, content shape) for the project's docs/ tree. See
+// docs/formats/doc.md (in any consuming project) for the spec.
+//
+// Pattern mirrors raw#13 ext_lint.hexa: same raw-format DSL parser,
+// same status whitelist, same kind-specific check dispatch.
+
+// ─── inlined raw_loader (seed-freeze: stage0 module loader unavailable) ───
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+// parse `doc <id> <status> "<name>"` → [id, status, name] (empty on failure)
+fn _parse_doc_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "doc" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_doc(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_doc_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _doc_path() -> string { return _pwd() + "/.doc" }
+
+// ─── scans ─────────────────────────────────────────────────────────
+
+// Walks `docs/**/*.md` and returns array of file paths.
+fn _list_doc_md_files() -> array {
+    let docs_dir = _pwd() + "/docs"
+    let exists = to_string(exec("test -d '" + docs_dir + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let cmd = "find '" + docs_dir + "' -type f -name '*.md' 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut files = []
+    for ln in lines {
+        let f = ln.trim()
+        if len(f) > 0 { files.push(f) }
+    }
+    return files
+}
+
+// Frontmatter starts with "---" on first line and has matching close.
+fn _has_frontmatter(content: string) -> bool {
+    if len(content) < 8 { return false }
+    let first = content.substring(0, 4)
+    if first != "---\n" && first != "---\r" { return false }
+    let rest = content.substring(4, len(content))
+    let close = rest.index_of("\n---")
+    if close < 0 { return false }
+    return true
+}
+
+// File naming: ban patterns _v\d+ _mk\d+ stage _old _new _bak _tmp + leading date prefixes
+fn _name_violation(basename: string) -> string {
+    // strip extension
+    let dot = basename.last_index_of(".")
+    let stem = if dot > 0 { basename.substring(0, dot) } else { basename }
+
+    // banned suffix patterns
+    let bans = ["_old", "_new", "_bak", "_tmp"]
+    for b in bans {
+        let bl = len(b)
+        if len(stem) >= bl {
+            let tail = stem.substring(len(stem) - bl, len(stem))
+            if tail == b { return "banned suffix '" + b + "'" }
+        }
+    }
+
+    // _v\d / _mk\d patterns (heuristic: contains _v then digit, or _mk then digit)
+    let i_v = stem.last_index_of("_v")
+    if i_v >= 0 && i_v + 2 < len(stem) {
+        let nxt = stem.substring(i_v + 2, i_v + 3)
+        if nxt >= "0" && nxt <= "9" { return "banned suffix '_v<n>'" }
+    }
+    let i_mk = stem.last_index_of("_mk")
+    if i_mk >= 0 && i_mk + 3 < len(stem) {
+        let nxt = stem.substring(i_mk + 3, i_mk + 4)
+        if nxt >= "0" && nxt <= "9" { return "banned suffix '_mk<n>'" }
+    }
+
+    // banned: leading date YYYY-MM-DD-
+    if len(stem) >= 11 {
+        let head = stem.substring(0, 11)
+        // crude: 4 digits + - + 2 digits + - + 2 digits + -
+        let d1 = head.substring(0, 4)
+        let d2 = head.substring(5, 7)
+        let d3 = head.substring(8, 10)
+        let s1 = head.substring(4, 5)
+        let s2 = head.substring(7, 8)
+        let s3 = head.substring(10, 11)
+        if s1 == "-" && s2 == "-" && s3 == "-" {
+            // verify digit-ness of d1/d2/d3 (rough — first char digit suffices for heuristic)
+            let c1 = d1.substring(0, 1)
+            let c2 = d2.substring(0, 1)
+            let c3 = d3.substring(0, 1)
+            if c1 >= "0" && c1 <= "9" && c2 >= "0" && c2 <= "9" && c3 >= "0" && c3 <= "9" {
+                return "banned leading date prefix YYYY-MM-DD-"
+            }
+        }
+    }
+    return ""
+}
+
+fn _basename(path: string) -> string {
+    let i = path.last_index_of("/")
+    if i < 0 { return path }
+    return path.substring(i + 1, len(path))
+}
+
+// ─── main ──────────────────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut list_mode = false
+for a in cli {
+    if a == "--list" { list_mode = true }
+}
+
+let path = _doc_path()
+let rules = _load_doc(path)
+
+if list_mode {
+    println("── .doc entries (" + to_string(len(rules)) + ") ──")
+    for r in rules {
+        let slug = _keys_first(r[3], "slug")
+        let scope_v = _keys_first(r[3], "scope")
+        println("  #" + r[0] + " [" + r[1] + "] slug=" + slug + " scope=" + scope_v + " — " + r[2])
+    }
+    exit(0)
+}
+
+let mut errs = []
+
+// .doc parse-level validation (entries well-formed)
+for r in rules {
+    let id = r[0]
+    let status = r[1]
+    let keys = r[3]
+    let tag = "[doc #" + id + "] "
+
+    let slug = _keys_first(keys, "slug")
+    if slug == "" { errs.push(tag + "missing required key: slug") }
+
+    if status == "live" || status == "warn" || status == "new" || status == "convention" {
+        if _keys_first(keys, "enforce") == "" {
+            errs.push(tag + "active rule requires 'enforce'")
+        }
+    } else if status == "deferred" {
+        if _keys_first(keys, "defer-until") == "" {
+            errs.push(tag + "deferred rule requires 'defer-until'")
+        }
+        if _keys_first(keys, "why") == "" {
+            errs.push(tag + "deferred rule requires 'why'")
+        }
+    }
+}
+
+// Always-on scans (run regardless of .doc declarations — these are the
+// baseline expectations for any project under hexa-lang governance):
+//   1. frontmatter presence on every docs/**/*.md
+//   2. file naming bans
+let md_files = _list_doc_md_files()
+
+for f in md_files {
+    let bn = _basename(f)
+    let nv = _name_violation(bn)
+    if nv != "" {
+        errs.push("[naming] " + f + " — " + nv)
+    }
+    let content = to_string(read_file(f))
+    if !_has_frontmatter(content) {
+        errs.push("[frontmatter] " + f + " — missing leading '---' YAML frontmatter")
+    }
+}
+
+println("── doc_lint ──")
+println("rules   : " + to_string(len(rules)))
+println("md files: " + to_string(len(md_files)))
+
+if len(errs) == 0 {
+    println("✅ PASS")
+    exit(0)
+}
+
+println("🚫 FAIL — " + to_string(len(errs)) + " violations")
+for e in errs {
+    eprintln("  " + e)
+}
+exit(1)
