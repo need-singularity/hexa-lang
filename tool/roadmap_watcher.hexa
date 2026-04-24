@@ -137,6 +137,32 @@ fn _grace_seconds() -> int {
     return n
 }
 
+// Short-window grace for in-flight user edits — independent of hx_unlock's
+// audit-driven window (_grace_seconds). If the target file has been
+// modified within this many seconds, SKIP chflags restore so the editor
+// session isn't interrupted mid-keystroke. Configurable via
+// NEXUS_WATCHER_GRACE_SEC (default 30, max 600).
+fn _fresh_edit_grace_seconds() -> int {
+    let raw = env("NEXUS_WATCHER_GRACE_SEC")
+    if raw == "" { return 30 }
+    let n = _parse_int_digits(raw)
+    if n <= 0 { return 30 }
+    if n > 600 { return 600 }
+    return n
+}
+
+// Epoch-seconds mtime for <path>, or 0 if absent / stat failed.
+fn _mtime_epoch(path: string) -> int {
+    let chk = exec_with_status("test -e '" + path + "'")
+    if chk[1] != 0 { return 0 }
+    if _is_darwin() {
+        let cmd = "stat -f %m '" + path + "' 2>/dev/null"
+        return _parse_int_digits(to_string(exec(cmd)).trim())
+    }
+    let cmd = "stat -c %Y '" + path + "' 2>/dev/null"
+    return _parse_int_digits(to_string(exec(cmd)).trim())
+}
+
 // Scan the tail of .raw-audit for the most recent unlock/lock/relock-auto
 // event. Returns ["kind", "iso_ts"] or ["", ""] if none found.
 // We only read the tail (last 200 lines) to bound work — all recent edits
@@ -234,9 +260,25 @@ fn _scan_repo(home: string, name: string) -> string {
         unlock_active = _unlock_window_active(apath, grace)
     }
 
+    // Short-window fresh-edit grace (mtime-based, independent of hx_unlock).
+    // If .roadmap was edited within NEXUS_WATCHER_GRACE_SEC seconds (default
+    // 30s), skip the uchg restore so an in-flight editor session isn't
+    // interrupted mid-keystroke. Emits a [SKIP-FRESH-EDIT mtime=<X>]
+    // breadcrumb so operators can correlate tick runs with live edits.
+    let fresh_grace = _fresh_edit_grace_seconds()
+    let rm_mtime = _mtime_epoch(rpath)
+    let now_epoch = _now_epoch()
+    let mut fresh_edit = false
+    if rm_mtime > 0 && now_epoch > 0 {
+        let age = now_epoch - rm_mtime
+        if age >= 0 && age < fresh_grace { fresh_edit = true }
+    }
+
     // Auto-restore — OS-level deterministic invariant.
-    if !chflags_ok && !unlock_active {
+    if !chflags_ok && !unlock_active && !fresh_edit {
         let _ = _restore_chflag(rpath, "uchg")
+    } else if !chflags_ok && fresh_edit {
+        eprintln("[SKIP-FRESH-EDIT mtime=" + to_string(rm_mtime) + "] " + rpath + " (age=" + to_string(now_epoch - rm_mtime) + "s < " + to_string(fresh_grace) + "s)")
     }
     // .raw-audit uappnd is separate from unlock window semantics (hx_unlock
     // does not clear it); always restore if missing.
@@ -263,6 +305,8 @@ fn _scan_repo(home: string, name: string) -> string {
     if raw_audit_ok { parts.push("true") } else { parts.push("false") }
     parts.push(",\"unlock_active\":")
     if unlock_active { parts.push("true") } else { parts.push("false") }
+    parts.push(",\"fresh_edit\":")
+    if fresh_edit { parts.push("true") } else { parts.push("false") }
     parts.push(",\"last_modified\":\"")
     parts.push(mtime)
     parts.push("\"}")
@@ -291,6 +335,14 @@ fn _cmd_selftest() -> int {
     // 5) _shell_quote wraps + escapes embedded '
     let q = _shell_quote("a'b")
     if q != "'a'\\''b'" { eprintln("FAIL: _shell_quote: " + q); return 1 }
+    // 6) _fresh_edit_grace_seconds default + bounds (NEXUS_WATCHER_GRACE_SEC)
+    let fg = _fresh_edit_grace_seconds()
+    if fg < 1 || fg > 600 { eprintln("FAIL: fresh grace out of range: " + to_string(fg)); return 1 }
+    // 7) _mtime_epoch on /tmp (always exists) yields a sane epoch, 0 on junk.
+    let mtime_ok = _mtime_epoch("/tmp")
+    if mtime_ok <= 0 { eprintln("FAIL: _mtime_epoch /tmp not > 0"); return 1 }
+    let mtime_none = _mtime_epoch("/tmp/__irh_mtime_never__")
+    if mtime_none != 0 { eprintln("FAIL: _mtime_epoch absent != 0: " + to_string(mtime_none)); return 1 }
     println("[roadmap_watcher selftest] OK")
     return 0
 }
