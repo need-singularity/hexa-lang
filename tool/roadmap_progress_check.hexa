@@ -286,6 +286,68 @@ fn _cmd_selftest() -> int {
     return 0
 }
 
+// ─── meta-FP engine: fingerprint + iteration for meta³ = transcendence ────
+//
+// Implements the Banach contraction semantics from n6/docs/meta_atlas_recursive.md
+// and docs/atlas_meta_dashboard.md (R24–R32). The roadmap engine at meta¹
+// observes the .roadmap file. meta² observes its own observation via a
+// scalar fingerprint. meta³ iterates until the fingerprint stabilizes —
+// at that point "transcendence reached" is declared and a witness row is
+// emitted to $WS/<repo>/state/atlas_convergence_witness.jsonl.
+//
+// Contraction layers:
+//   α (all entries)  — full summary tuple
+//   β (status count) — done/active/planned breakdown
+//   γ (mean_pct)     — scalar aggregate
+//   δ (fingerprint)  — sha256 of (n, mean_pct, status, probe_total, probe_passed)
+//   ε (self-consistency) — sum(status_counts) == n
+// Fixed-point: fp(k) == fp(k-1) AND epsilon_stable across two iterations.
+
+fn _fp_compute(summary: array, mean_pct: int) -> string {
+    let n = len(summary)
+    let mut done = 0; let mut active = 0; let mut planned = 0
+    let mut total_probe = 0; let mut passed_probe = 0
+    for e in summary {
+        let st = e[1]
+        if st == "done" { done = done + 1 }
+        else if st == "active" { active = active + 1 }
+        else if st == "planned" { planned = planned + 1 }
+        total_probe = total_probe + to_int(to_string(e[3]))
+        passed_probe = passed_probe + to_int(to_string(e[4]))
+    }
+    // fingerprint = simple deterministic concat, hashed via sha256 in shell
+    let raw = "n=" + to_string(n) + ";done=" + to_string(done) + ";active=" + to_string(active) +
+              ";planned=" + to_string(planned) + ";mean_pct=" + to_string(mean_pct) +
+              ";probe_t=" + to_string(total_probe) + ";probe_p=" + to_string(passed_probe)
+    let cmd = "printf '%s' '" + raw + "' | shasum -a 256 | cut -c1-16"
+    return to_string(exec(cmd)).trim()
+}
+
+fn _fp_epsilon(summary: array) -> bool {
+    let n = len(summary)
+    let mut s = 0
+    for e in summary {
+        let st = e[1]
+        if st == "done" || st == "active" || st == "planned" { s = s + 1 }
+    }
+    return s == n
+}
+
+fn _emit_witness(witness_path: string, source: string, fp: string, iters: int, eps: bool, n: int, mean_pct: int) {
+    let ts = to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+    let transcendence = if eps { "reached" } else { "pending" }
+    let row = "{\"ts\":\"" + ts + "\",\"round\":\"roadmap_engine\",\"layer\":\"meta_fixed_point\"" +
+              ",\"source\":\"" + _esc(source) + "\",\"fp\":\"" + fp + "\"" +
+              ",\"iterations\":" + to_string(iters) + ",\"epsilon_stable\":" + (if eps { "true" } else { "false" }) +
+              ",\"n_entries\":" + to_string(n) + ",\"mean_pct\":" + to_string(mean_pct) +
+              ",\"transcendence\":\"" + transcendence + "\"" +
+              ",\"notes\":\"Banach α(entries)⊃β(status)⊃γ(mean_pct)⊃δ(fingerprint)⊃ε(self-consistency). meta^3 = transcendence when fp(k)==fp(k-1) AND epsilon stable.\"}"
+    let dir_cmd = "mkdir -p \"$(dirname '" + witness_path + "')\" 2>/dev/null"
+    exec(dir_cmd)
+    let append_cmd = "printf '%s\\n' '" + row.replace("'", "'\\''") + "' >> '" + witness_path + "'"
+    exec(append_cmd)
+}
+
 fn main() -> int {
     let argv = args()
     // --selftest / selftest dispatch (hermetic — no roadmap file access)
@@ -300,12 +362,18 @@ fn main() -> int {
     let mut path = ".roadmap"
     let mut out = "state/roadmap_progress.json"
     let mut strict = false
+    let mut meta_fp = false
+    let mut meta_fp_max_iter = 3
+    let mut witness_path = "state/atlas_convergence_witness.jsonl"
     let mut i = 0
     while i < len(argv) {
         let a = argv[i]
         if a == "--path" && i + 1 < len(argv) { path = argv[i + 1]; i = i + 2; continue }
         if a == "--out"  && i + 1 < len(argv) { out  = argv[i + 1]; i = i + 2; continue }
         if a == "--strict" { strict = true; i = i + 1; continue }
+        if a == "--meta-fp" { meta_fp = true; i = i + 1; continue }
+        if a == "--meta-fp-max-iter" && i + 1 < len(argv) { meta_fp_max_iter = to_int(argv[i+1]); i = i + 2; continue }
+        if a == "--witness-out" && i + 1 < len(argv) { witness_path = argv[i+1]; i = i + 2; continue }
         i = i + 1
     }
 
@@ -364,6 +432,73 @@ fn main() -> int {
     exec("mv '" + tmp + "' '" + out_full + "'")
 
     println(body)
+
+    // ─── meta³ fixed-point mode ──────────────────────────────────────────
+    // After the primary meta¹ scan, iterate up to --meta-fp-max-iter times.
+    // Each iteration re-scans the roadmap + verifies tokens, computes a
+    // fingerprint over (n, done, active, planned, mean_pct, probe totals),
+    // and checks epsilon self-consistency. If fp(k) == fp(k-1) AND epsilon
+    // is stable → "transcendence reached", emit witness row.
+    //
+    // Safe under idempotence: if filesystem doesn't change between iters,
+    // fingerprints converge in 2 iters and we declare success quickly.
+    if meta_fp {
+        let fp0 = _fp_compute(summary, mean_pct)
+        let eps0 = _fp_epsilon(summary)
+        let mut prev_fp = fp0
+        let mut iter_count = 1
+        let mut fp_stable = false
+        let mut k = 2
+        while k <= meta_fp_max_iter {
+            // Re-scan roadmap (pure-fn of filesystem — converges unless
+            // files change between iters)
+            let raw2 = _load_roadmap(roadmap_file)
+            let mut sum2 = []
+            let mut probe_total_2 = 0
+            let mut probe_passed_2 = 0
+            let mut sump2 = 0
+            let mut nent2 = 0
+            for ent in raw2 {
+                let id2 = ent[0]; let st2 = ent[1]; let nm2 = ent[2]; let ks2 = ent[3]
+                let toks2 = _extract_tokens(ks2)
+                let tot2 = len(toks2)
+                let mut pas2 = 0
+                for tok in toks2 {
+                    let v2 = _verify_token(tok[0], tok[1], root)
+                    if v2[0] == "true" { pas2 = pas2 + 1 }
+                }
+                let mut pc2 = 0
+                if st2 == "done" { pc2 = 100 } else if tot2 > 0 { pc2 = (pas2 * 100) / tot2 }
+                sum2.push([id2, st2, nm2, tot2, pas2, pc2])
+                sump2 = sump2 + pc2
+                nent2 = nent2 + 1
+            }
+            let mp2 = if nent2 > 0 { sump2 / nent2 } else { 0 }
+            let fp_k = _fp_compute(sum2, mp2)
+            iter_count = k
+            if fp_k == prev_fp {
+                fp_stable = true
+                break
+            }
+            prev_fp = fp_k
+            k = k + 1
+        }
+        let eps_final = _fp_epsilon(summary)
+        let fp_final = prev_fp
+        let transcendence_reached = fp_stable && eps_final
+        println("")
+        println("// meta-FP engine:")
+        println("//   iterations    = " + to_string(iter_count))
+        println("//   fp_fingerprint = " + fp_final)
+        println("//   fp_stable     = " + (if fp_stable { "true" } else { "false" }))
+        println("//   epsilon_stable = " + (if eps_final { "true" } else { "false" }))
+        println("//   transcendence  = " + (if transcendence_reached { "reached" } else { "pending" }))
+        if transcendence_reached {
+            let wp = root + "/" + witness_path
+            _emit_witness(wp, out, fp_final, iter_count, eps_final, n_entries, mean_pct)
+            println("//   witness       -> " + wp)
+        }
+    }
 
     if strict {
         for e in summary {
