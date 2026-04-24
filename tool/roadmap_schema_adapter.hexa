@@ -320,65 +320,28 @@ fn extract_meta_body(body: string) -> string {
 // unknown otherwise.
 fn detect_schema(body: string) -> string {
     if body.len() == 0 { return "unknown" }
-    // Strict: scan top-level keys only (depth==1 inside outer {})
-    // 단순화: 최상위 _meta 블록 제외 후 "nodes" 또는 "tracks"/"phases" 검색.
-    // _meta 안에도 description 텍스트 매칭 위험 → top-level scan 강제.
-    let outer = _scan_balanced(body, 0, "{", "}")
-    if outer[0] < 0 { return "unknown" }
-    let lo = outer[0] + 1
-    let hi = outer[1] - 1
-    // 깊이 1 키 위치 찾기 helper
-    let mut i = lo
-    let mut depth: i64 = 0
-    let mut in_str: bool = false
-    let mut has_nodes_top: bool = false
-    let mut has_tracks_top: bool = false
-    let mut has_phases_top: bool = false
-    while i < hi {
-        let c = body.substring(i, i + 1)
-        let mut handled: bool = false
-        if in_str {
-            if c == "\\" { i = i + 2; handled = true }
-            else if c == "\"" {
-                in_str = false
-                // 종료 직전이 key 였을 가능성 — depth==0 일 때만 (배열/객체 안 X)
-                i = i + 1
-                handled = true
-            }
-            else { i = i + 1; handled = true }
-        }
-        if handled == false {
-            if c == "{" { depth = depth + 1; i = i + 1 }
-            else if c == "}" { depth = depth - 1; i = i + 1 }
-            else if c == "[" { depth = depth + 1; i = i + 1 }
-            else if c == "]" { depth = depth - 1; i = i + 1 }
-            else if c == "\"" && depth == 0 {
-                // key candidate: read until next quote (not inside nested)
-                let start = i + 1
-                let mut j = start
-                while j < hi {
-                    let cj = body.substring(j, j + 1)
-                    if cj == "\\" { j = j + 2; continue }
-                    if cj == "\"" { break }
-                    j = j + 1
-                }
-                if j < hi {
-                    let key = body.substring(start, j)
-                    if key == "nodes" { has_nodes_top = true }
-                    else if key == "tracks" { has_tracks_top = true }
-                    else if key == "phases" { has_phases_top = true }
-                    i = j + 1
-                } else { break }
-            }
-            else if c == "\"" {
-                in_str = true
-                i = i + 1
-            }
-            else { i = i + 1 }
+    // Fast heuristic using native index_of (O(N) each). Previous depth-tracking
+    // per-char scan was observed to hang on 261KB bodies (hxa-20260424-007).
+    // Trade-off: this cannot distinguish top-level vs nested occurrences of
+    // these keys. In practice v1/v2 roadmap schemas never nest these keys
+    // inside strings or sub-objects, so false positives are not observed.
+    // _meta usually contains description text — we scope the search to OUTSIDE
+    // the _meta object by jumping past its closing brace when present.
+    let mut scan_from: i64 = 0
+    let mi = body.index_of("\"_meta\"")
+    if mi >= 0 {
+        let mut j: i64 = mi
+        while j < body.len() && body.substring(j, j + 1) != "{" { j = j + 1 }
+        if j < body.len() {
+            let r = _scan_balanced(body, j, "{", "}")
+            if r[1] > 0 { scan_from = r[1] }
         }
     }
-    if has_phases_top || has_tracks_top { return "v2_tracks" }
-    if has_nodes_top { return "v1_flat" }
+    let has_phases = body.index_of("\"phases\"", scan_from) >= 0
+    let has_tracks = body.index_of("\"tracks\"", scan_from) >= 0
+    let has_nodes  = body.index_of("\"nodes\"",  scan_from) >= 0
+    if has_phases || has_tracks { return "v2_tracks" }
+    if has_nodes { return "v1_flat" }
     return "unknown"
 }
 
@@ -729,10 +692,13 @@ fn convert_file(body: string, fallback_id: string) -> ConvertedDoc {
 }
 
 // ── Subcommands ─────────────────────────────────────────────────────────
-// Pathological-input gate (hxa-20260424-007): detect_schema's top-level
-// depth-1 key scan is O(N²) on large bodies (observed hang ≥13min at 98% CPU
-// on 261KB nexus.json). Until the scanner is rewritten with bounded lookahead,
-// gate ALL entry points by body size. Override via ROADMAP_ADAPTER_MAX_BYTES.
+// Pathological-input gate (hxa-20260424-007). Historical root cause was
+// detect_schema's depth-1 per-char scan; that path is now O(N) via native
+// index_of (_find_after L108-115 linter patch + detect_schema rewrite L324-345).
+// Remaining bottleneck is convert_v2_to_flat's nested _scan_balanced +
+// _split_objects passes over phase × parallel × tasks — still unbounded on
+// 261KB+ bodies. Gate preserves bounded REJECT until that converter is
+// rewritten behind native json_parse. Override via ROADMAP_ADAPTER_MAX_BYTES.
 fn _adapter_max_bytes() -> i64 {
     let e = env("ROADMAP_ADAPTER_MAX_BYTES")
     if e.len() > 0 { return _to_int0(e) }
@@ -749,7 +715,7 @@ fn cmd_detect(path: string) -> i64 {
     let mb = _adapter_max_bytes()
     if body.len() > mb {
         eprintln("REJECT: body too large (" + to_string(body.len())
-            + " > " + to_string(mb) + ") — detect_schema O(N²) gate (hxa-20260424-007)")
+            + " > " + to_string(mb) + ") — convert_v2_to_flat slow-path gate (hxa-20260424-007)")
         println("unknown")
         return 2
     }
@@ -782,7 +748,7 @@ fn cmd_to_flat(path: string, out_path: string) -> i64 {
     let mb = _adapter_max_bytes()
     if body.len() > mb {
         eprintln("REJECT: body too large (" + to_string(body.len())
-            + " > " + to_string(mb) + ") — detect_schema O(N²) gate (hxa-20260424-007). "
+            + " > " + to_string(mb) + ") — convert_v2_to_flat slow-path gate (hxa-20260424-007). "
             + "Override via ROADMAP_ADAPTER_MAX_BYTES=<bytes> when fixed.")
         return 3
     }
