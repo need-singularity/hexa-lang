@@ -1,0 +1,430 @@
+// tool/roadmap_schema_lint.hexa — schema lint for .roadmap SSOT
+//
+// Validates the three-shape grammar and reports line-tagged violations:
+//
+//   1. checkpoint/phase shorthand line (column 0 starts with "- "):
+//      `- {done|active|todo|partial} [<ID>] <name>`
+//      where ID is either Cx (checkpoint) or Px (phase) with digit suffix.
+//
+//   2. phase block (`- {status} [P<N>] <name>`):
+//      requires indented keys: eta, why.
+//
+//   3. roadmap block (`roadmap <N> <status> "<name>"`):
+//      requires indented keys: track, phase, why, reaches.
+//
+// CLI:
+//   hexa run tool/roadmap_schema_lint.hexa [path] [--format human|summary|jsonl]
+//   hexa run tool/roadmap_schema_lint.hexa --selftest
+//
+// EXIT:
+//   0 → clean ([LINT-OK <N> entries])
+//   1 → one or more violations ([LINT-ERROR line=N ...])
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" { end = end - 1 } else { break }
+    }
+    return s.substring(0, end)
+}
+
+fn _is_digit(c: string) -> bool {
+    let d = "0123456789"
+    return d.contains(c)
+}
+
+// Parse a bracketed ID like "[C0]" or "[P12]" → returns "C0" / "P12", or "" if malformed.
+fn _parse_bracket_id(tok: string) -> string {
+    let n = len(tok)
+    if n < 4 { return "" }
+    if tok.substring(0, 1) != "[" { return "" }
+    if tok.substring(n - 1, n) != "]" { return "" }
+    let inner = tok.substring(1, n - 1)
+    if len(inner) < 2 { return "" }
+    let prefix = inner.substring(0, 1)
+    if prefix != "C" && prefix != "P" { return "" }
+    let mut i = 1
+    while i < len(inner) {
+        if !_is_digit(inner.substring(i, i + 1)) { return "" }
+        i = i + 1
+    }
+    return inner
+}
+
+fn _valid_short_status(s: string) -> bool {
+    if s == "done" || s == "active" || s == "todo" || s == "partial" { return true }
+    return false
+}
+
+fn _valid_roadmap_status(s: string) -> bool {
+    if s == "planned" || s == "active" || s == "done" || s == "blocked" || s == "deferred" || s == "running" { return true }
+    return false
+}
+
+// Parse `- STATUS [ID] NAME` — returns [status, id, name] or [] on fail.
+fn _parse_short_line(body: string) -> array {
+    // body: text AFTER the leading "- "
+    let sp1 = body.index_of(" ")
+    if sp1 < 0 { return [] }
+    let status = body.substring(0, sp1)
+    let rest = body.substring(sp1 + 1, len(body)).trim()
+    if len(rest) == 0 { return [] }
+    // expect bracketed id token next
+    if rest.substring(0, 1) != "[" { return [] }
+    let close = rest.index_of("]")
+    if close < 0 { return [] }
+    let idtok = rest.substring(0, close + 1)
+    let id = _parse_bracket_id(idtok)
+    if id == "" { return [] }
+    let mut name = ""
+    if close + 1 < len(rest) {
+        name = rest.substring(close + 1, len(rest)).trim()
+    }
+    return [status, id, name]
+}
+
+fn _parse_roadmap_hdr(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    if line.substring(0, sp1) != "roadmap" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    // id must be numeric
+    let mut i = 0
+    while i < len(id) {
+        if !_is_digit(id.substring(i, i + 1)) { return [] }
+        i = i + 1
+    }
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    let mut status = rest2
+    let mut name = ""
+    if sp3 >= 0 {
+        status = rest2.substring(0, sp3)
+        name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    }
+    return [id, status, name]
+}
+
+fn _keys_has(keys: array, k: string) -> bool {
+    for kv in keys {
+        if kv[0] == k { return true }
+    }
+    return false
+}
+
+// Block kinds:
+//   "short-phase" — `- active [P1] ...` → requires eta + why
+//   "short-cp"    — `- done   [C0] ...` → no key requirements
+//   "roadmap"     — full roadmap N ...  → requires track + phase + why + reaches
+fn _required_keys(kind: string) -> array {
+    if kind == "short-phase" { return ["eta", "why"] }
+    if kind == "roadmap"     { return ["track", "phase", "why", "reaches"] }
+    return []
+}
+
+// _lint: returns [errors, entry_count] where errors = [[line, msg], ...]
+fn _lint(src: string) -> array {
+    let lines = split(src, "\n")
+
+    let mut errors = []
+    let mut entry_count = 0
+
+    // block-open state
+    let mut kind = ""
+    let mut open_line = 0
+    let mut open_id = ""
+    let mut keys = []
+
+    let mut ln = 0
+    while ln < len(lines) {
+        let raw = lines[ln]
+        let line = _rstrip(raw)
+        let lineno = ln + 1
+
+        // blank line closes current block
+        if len(line) == 0 {
+            if kind != "" {
+                let need = _required_keys(kind)
+                for k in need {
+                    if !_keys_has(keys, k) {
+                        errors.push([open_line, "missing required key '" + k + "' in " + kind + " block [" + open_id + "]"])
+                    }
+                }
+                kind = ""
+                open_id = ""
+                keys = []
+            }
+            ln = ln + 1
+            continue
+        }
+
+        let first = line.substring(0, 1)
+        if first == "#" {
+            ln = ln + 1
+            continue
+        }
+
+        // indented key line
+        if first == " " || first == "\t" {
+            if kind == "" {
+                // stray indentation — ignored (not hard error; matches parser leniency)
+                ln = ln + 1
+                continue
+            }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 {
+                ln = ln + 1
+                continue
+            }
+            let k = stripped.substring(0, sp)
+            let v = stripped.substring(sp + 1, len(stripped)).trim()
+            keys.push([k, v])
+            ln = ln + 1
+            continue
+        }
+
+        // column-0 header: flush previous block then open new one
+        if kind != "" {
+            let need = _required_keys(kind)
+            for k in need {
+                if !_keys_has(keys, k) {
+                    errors.push([open_line, "missing required key '" + k + "' in " + kind + " block [" + open_id + "]"])
+                }
+            }
+            kind = ""
+            open_id = ""
+            keys = []
+        }
+
+        // dispatch by first token
+        if len(line) >= 2 && line.substring(0, 2) == "- " {
+            let body = line.substring(2, len(line)).trim()
+            let parsed = _parse_short_line(body)
+            if len(parsed) == 0 {
+                errors.push([lineno, "malformed checkpoint/phase line — expected `- {done|active|todo|partial} [Cx|Px] <name>`"])
+                ln = ln + 1
+                continue
+            }
+            let st = parsed[0]
+            let id = parsed[1]
+            let nm = parsed[2]
+            if !_valid_short_status(st) {
+                errors.push([lineno, "invalid status '" + st + "' — whitelist: done|active|todo|partial"])
+            }
+            if len(nm) == 0 {
+                errors.push([lineno, "empty name in shorthand entry [" + id + "]"])
+            }
+            entry_count = entry_count + 1
+            let prefix = id.substring(0, 1)
+            if prefix == "P" {
+                kind = "short-phase"
+                open_line = lineno
+                open_id = id
+            } else {
+                kind = "short-cp"
+                open_line = lineno
+                open_id = id
+            }
+            ln = ln + 1
+            continue
+        }
+
+        let sp = line.index_of(" ")
+        if sp < 0 {
+            errors.push([lineno, "unrecognized header line"])
+            ln = ln + 1
+            continue
+        }
+        let tok = line.substring(0, sp)
+        if tok == "roadmap" {
+            let hdr = _parse_roadmap_hdr(line)
+            if len(hdr) == 0 {
+                errors.push([lineno, "malformed roadmap header — expected `roadmap <N> <status> \"<name>\"`"])
+                ln = ln + 1
+                continue
+            }
+            let rid = hdr[0]
+            let rst = hdr[1]
+            if !_valid_roadmap_status(rst) {
+                errors.push([lineno, "invalid roadmap status '" + rst + "' — whitelist: planned|active|done|blocked|deferred|running"])
+            }
+            entry_count = entry_count + 1
+            kind = "roadmap"
+            open_line = lineno
+            open_id = rid
+            ln = ln + 1
+            continue
+        }
+        if tok == "checkpoint" {
+            // full-form checkpoint (raw#15 DSL) — not schema-required but accept
+            entry_count = entry_count + 1
+            kind = "cp-full"
+            open_line = lineno
+            open_id = ""
+            ln = ln + 1
+            continue
+        }
+
+        errors.push([lineno, "unknown header token '" + tok + "'"])
+        ln = ln + 1
+    }
+
+    // EOF flush
+    if kind != "" {
+        let need = _required_keys(kind)
+        for k in need {
+            if !_keys_has(keys, k) {
+                errors.push([open_line, "missing required key '" + k + "' in " + kind + " block [" + open_id + "]"])
+            }
+        }
+    }
+
+    return [errors, entry_count]
+}
+
+fn _pwd() -> string {
+    let p = env("PWD")
+    if p != "" { return p }
+    return to_string(exec("pwd")).trim()
+}
+
+fn _selftest() -> int {
+    println("[roadmap_schema_lint selftest]")
+    // 1. valid shorthand + phase block
+    let ok_src = "- done [C0] init\n\n- active [P1] bootstrap\n  eta 2026-05-01\n  why \"establish SSOT\"\n"
+    let r1 = _lint(ok_src)
+    let errs1 = r1[0]
+    if len(errs1) != 0 {
+        eprintln("FAIL: valid src produced errors: " + to_string(len(errs1)))
+        return 1
+    }
+    if r1[1] != 2 { eprintln("FAIL: entry_count != 2: " + to_string(r1[1])); return 1 }
+    // 2. phase block missing why
+    let bad_phase = "- active [P1] bootstrap\n  eta 2026-05-01\n"
+    let r2 = _lint(bad_phase)
+    if len(r2[0]) == 0 { eprintln("FAIL: missing why not detected"); return 1 }
+    // 3. malformed shorthand status
+    let bad_status = "- doing [C1] foo\n"
+    let r3 = _lint(bad_status)
+    if len(r3[0]) == 0 { eprintln("FAIL: invalid status not detected"); return 1 }
+    // 4. full roadmap block missing reaches
+    let bad_rm = "roadmap 100 done \"test\"\n  track meta\n  phase P3\n  why because\n"
+    let r4 = _lint(bad_rm)
+    if len(r4[0]) == 0 { eprintln("FAIL: missing reaches not detected"); return 1 }
+    // 5. full roadmap complete
+    let ok_rm = "roadmap 100 done \"test\"\n  track meta\n  phase P3\n  why because\n  reaches P3\n"
+    let r5 = _lint(ok_rm)
+    if len(r5[0]) != 0 { eprintln("FAIL: complete roadmap errored: " + to_string(len(r5[0]))); return 1 }
+    // 6. bracket-id parser
+    if _parse_bracket_id("[C0]") != "C0"   { eprintln("FAIL: [C0]"); return 1 }
+    if _parse_bracket_id("[P12]") != "P12" { eprintln("FAIL: [P12]"); return 1 }
+    if _parse_bracket_id("[X1]") != ""     { eprintln("FAIL: [X1] rej"); return 1 }
+    if _parse_bracket_id("C0") != ""       { eprintln("FAIL: bare rej"); return 1 }
+    println("[roadmap_schema_lint selftest] OK")
+    return 0
+}
+
+fn _format_errors_human(errors: array, path: string) -> void {
+    for e in errors {
+        eprintln("[LINT-ERROR line=" + to_string(e[0]) + "] " + e[1])
+    }
+}
+
+fn _format_errors_jsonl(errors: array, path: string) -> void {
+    for e in errors {
+        let mut parts = []
+        parts.push("{\"lint\":\"error\",\"path\":\"")
+        parts.push(path)
+        parts.push("\",\"line\":")
+        parts.push(to_string(e[0]))
+        parts.push(",\"msg\":\"")
+        parts.push(e[1].replace("\\", "\\\\").replace("\"", "\\\""))
+        parts.push("\"}")
+        println(parts.join(""))
+    }
+}
+
+fn main() -> int {
+    let av = args()
+    let mut cli = []
+    let mut i = 2
+    while i < len(av) {
+        cli.push(av[i])
+        i = i + 1
+    }
+
+    let mut format = "human"
+    let mut path = ""
+    let mut do_selftest = false
+    let mut j = 0
+    while j < len(cli) {
+        let a = cli[j]
+        if a == "--selftest" || a == "selftest" {
+            do_selftest = true
+        } else if a == "--format" {
+            if j + 1 < len(cli) {
+                format = cli[j + 1]
+                j = j + 1
+            }
+        } else if len(a) >= 9 && a.substring(0, 9) == "--format=" {
+            format = a.substring(9, len(a))
+        } else if a == "--help" || a == "-h" {
+            println("usage: hexa run tool/roadmap_schema_lint.hexa [path] [--format human|summary|jsonl]")
+            return 0
+        } else {
+            if path == "" { path = a }
+        }
+        j = j + 1
+    }
+
+    if do_selftest { exit(_selftest()) }
+
+    if format != "human" && format != "summary" && format != "jsonl" {
+        eprintln("[LINT-ERROR line=0] invalid --format '" + format + "' (expected: human|summary|jsonl)")
+        exit(1)
+    }
+
+    if path == "" { path = _pwd() + "/.roadmap" }
+
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        eprintln("[LINT-ERROR line=0] file not found: " + path)
+        exit(1)
+    }
+
+    let src = to_string(read_file(path))
+    let res = _lint(src)
+    let errors = res[0]
+    let entry_count = res[1]
+
+    if len(errors) == 0 {
+        if format == "jsonl" {
+            println("{\"lint\":\"ok\",\"path\":\"" + path + "\",\"entries\":" + to_string(entry_count) + "}")
+        } else if format == "summary" {
+            println("LINT-OK entries=" + to_string(entry_count) + " errors=0")
+        } else {
+            println("[LINT-OK " + to_string(entry_count) + " entries]")
+        }
+        exit(0)
+    }
+
+    if format == "jsonl" {
+        _format_errors_jsonl(errors, path)
+        println("{\"lint\":\"fail\",\"path\":\"" + path + "\",\"entries\":" + to_string(entry_count) + ",\"errors\":" + to_string(len(errors)) + "}")
+    } else if format == "summary" {
+        for e in errors {
+            eprintln("[LINT-ERROR line=" + to_string(e[0]) + "] " + e[1])
+        }
+        println("LINT-FAIL entries=" + to_string(entry_count) + " errors=" + to_string(len(errors)))
+    } else {
+        _format_errors_human(errors, path)
+        eprintln("[LINT-FAIL] " + to_string(len(errors)) + " violation(s) across " + to_string(entry_count) + " entries")
+    }
+    exit(1)
+    return 1
+}
