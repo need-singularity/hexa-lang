@@ -64,7 +64,6 @@ None currently in gate/. However, `hexa_url.hexa` (line 41–67) already impleme
 
 | File | Line | Pattern | Replacement |
 |------|------|---------|-------------|
-| `claude_statusline.hexa` | 14 | `exec("basename '" + root + "'")` | `basename_pure(root)` |
 | `lint.hexa` | 359 | `exec("basename '" + path + "' 2>/dev/null")` | `basename_pure(path)` |
 | `lint.hexa` | 572 | `exec("basename '" + path + "' 2>/dev/null")` | `basename_pure(path)` |
 | `lint.hexa` | 592 | `exec("basename '" + root + "' 2>/dev/null")` | `basename_pure(root)` |
@@ -97,7 +96,6 @@ None currently in gate/. However, `hexa_url.hexa` (line 41–67) already impleme
 
 | File | Line | Pattern | Complexity | Replacement |
 |------|------|---------|-----------|-------------|
-| `claude_statusline.hexa` | 19 | `jq -r -f '<jq_prog_file>' '<json_file>'` | jq script file (external) | No pure equivalent (need jq interpreter) |
 | `lint.hexa` | 393 | `jq -r '.commands \| keys[]'` | Simple key extraction | Could use manual parsing if JSON structure known |
 | `lint.hexa` | 450 | `jq -r --arg p '<val>' '(.format_presets // {}) \| has($p) \| tostring'` | Conditional lookup | No pure equivalent (complex jq syntax) |
 | `lint.hexa` | 469 | `jq -r '.updated // ""'` | Default value selection | Simple field extraction |
@@ -137,7 +135,6 @@ None currently in gate/. However, `hexa_url.hexa` (line 41–67) already impleme
 | `lint.hexa` | 2362 | `exec("cat '" + rulefile + "' 2>/dev/null")` | `read_file_pure(rulefile)` |
 | `lint.hexa` | 3250 | `exec("cat '" + ps + "' 2>/dev/null")` | `read_file_pure(ps)` |
 | `lint.hexa` | 3310, 3359 | `exec("cat '" + tb + "' 2>/dev/null")` | `read_file_pure(tb)` |
-| `claude_statusline.hexa` | 16 | `exec("test -f '" + active + "' && echo y || echo n")` | `file_exists_pure(active)` – **but returns bool, not "y"/"n" string** |
 | `post_edit.hexa` | 81, 115 | `exec("test -f '" + lint + "' && echo y || echo n")` | `file_exists_pure(lint)` – **adjust comparison** |
 
 **Risk/Benefit:**
@@ -217,7 +214,6 @@ Relevant exports:
 
 | pure module | export | gate file : line | replaces | impact |
 |-------------|--------|------------------|----------|--------|
-| path_pure | `basename_pure(path)` | claude_statusline.hexa : 14 | `exec("basename '" + root + "'")` | 1 subprocess saved |
 | path_pure | `basename_pure(path)` | lint.hexa : 359 | `exec("basename '" + path + "' 2>/dev/null")` | 1 subprocess saved |
 | path_pure | `basename_pure(path)` | lint.hexa : 572 | `exec("basename '" + path + "' 2>/dev/null")` | 1 subprocess saved |
 | path_pure | `basename_pure(path)` | lint.hexa : 592 | `exec("basename '" + root + "' 2>/dev/null")` | 1 subprocess saved |
@@ -228,26 +224,25 @@ Relevant exports:
 | file_pure | `read_file_pure(path)` | lint.hexa : 3310 | `exec("cat '" + tb + "' 2>/dev/null")` | 1 subprocess saved |
 | file_pure | `read_file_pure(path)` | lint.hexa : 3359 | `exec("cat '" + tb + "' 2>/dev/null")` | 1 subprocess saved |
 
-**Total Immediate Savings:** 10 subprocesses.
+**Total Immediate Savings:** 9 subprocesses.
 
 ### Medium Priority (With Refactoring)
 
 | pure module | export | gate file : line | replaces | caveat |
 |-------------|--------|------------------|----------|--------|
-| file_pure | `file_exists_pure(path)` | claude_statusline.hexa : 16 | `exec("test -f '" + active + "' && echo y")` | Change `== "y"` to `if file_exists_pure(active)` |
 | file_pure | `file_exists_pure(path)` | post_edit.hexa : 81 | `exec("test -f '" + lint + "' && echo y")` | Change comparison style |
 | file_pure | `file_exists_pure(path)` | post_edit.hexa : 115 | `exec("test -f '" + lint + "' && echo y")` | Change comparison style |
 
-**Total Medium Priority:** 3 subprocesses (3 refactoring sites).
+**Total Medium Priority:** 2 subprocesses (2 refactoring sites).
 
 ### Deferred (No Pure Equivalent Yet)
 
 | pattern | gate files | reason |
 |---------|-----------|--------|
-| `exec("jq ...")` (complex queries) | claude_statusline.hexa:19, lint.hexa:393,450,469,528,1280 + 12 more | jq requires full JSON parser; json_mini_pure is encoding-only. Hand-rolled parser would be 100+ lines. |
+| `exec("jq ...")` (complex queries) | lint.hexa:393,450,469,528,1280 + 12 more | jq requires full JSON parser; json_mini_pure is encoding-only. Hand-rolled parser would be 100+ lines. |
 | `exec("grep -c ...")` (counting) | lint.hexa: 15+ uses | string_pure has `str_contains_pure` (bool), not `str_count_matches`. Need new function. |
 | `exec("tail -n ... \| jq ...")` (JSONL read + query) | lint.hexa:3328,3345 | Requires JSONL line iteration + jq equivalent. Deferred to phase 2. |
-| `exec("git rev-parse --show-toplevel")` | lint.hexa:12, claude_statusline.hexa:11, hexa_url.hexa:164 | No git equivalent in pure hexa. Keep shell call. |
+| `exec("git rev-parse --show-toplevel")` | lint.hexa:12, hexa_url.hexa:164 | No git equivalent in pure hexa. Keep shell call. |
 | `exec("nohup ... &")` (background spawn) | hexa_url.hexa:116 | spawn_pure is cooperative (sync), not async. No replacement. Keep shell call. |
 
 **Pattern:** jq, grep -c, and git-root have no pure equivalents. Likely won't change in phase 2/3.
