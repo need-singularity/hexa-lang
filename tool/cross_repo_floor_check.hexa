@@ -1,0 +1,200 @@
+// tool/cross_repo_floor_check.hexa — cross_repo_blocker priority floor validator.
+//
+// PURPOSE
+//   Enforces convention nxs-20260422-008 (registered in each sister repo's
+//   `state/proposals/inventory.json::_meta.convention_cross_repo_blocker`):
+//
+//     Any inventory entry whose user_status != "done" AND
+//       (category ∈ {lang_gap, infra_gap, resource_gap, atlas_gap, data_gap}
+//        OR priority_reason contains "cross_repo_blocker")
+//     MUST have score_priority >= 95.
+//
+//   The floor is registered in all 6 active sister repos' _meta but was
+//   previously nowhere enforced — this tool is the missing validator.
+//
+// CLI
+//   hexa tool/cross_repo_floor_check.hexa --selftest
+//   hexa tool/cross_repo_floor_check.hexa --report        # scan + emit JSONL drift to stdout
+//   hexa tool/cross_repo_floor_check.hexa --strict        # same as --report, exit 1 on any drift
+//
+// OUTPUT (one JSONL line per drift entry on stdout):
+//   {"drift":true,"repo":"nexus","id":"nxs-...","score_priority":80,"reason":"category=lang_gap"}
+//
+// Exit codes:
+//   0  no drift (or --report with drift but non-strict — still prints lines, rc=0)
+//   1  --strict AND drift detected
+//   2  usage / internal error
+//
+// IMPORTANT: read-only. Does NOT mutate inventories. Auto-bump is handled
+//            at ingress time in tool/proposal_inbox.hexa (_submit_one).
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _arg_value(args: array, key: string, default: string) -> string {
+    let mut i = 0
+    while i < len(args) {
+        if args[i] == key {
+            let j = i + 1
+            if j < len(args) { return args[j] }
+        }
+        i = i + 1
+    }
+    return default
+}
+
+fn _has_flag(args: array, key: string) -> bool {
+    let mut i = 0
+    while i < len(args) {
+        if args[i] == key { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn _sh_q(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _exists(path: string) -> bool {
+    return to_string(exec("test -f " + _sh_q(path) + " && echo y || echo n")).trim() == "y"
+}
+
+fn _inventory_path(repo: string) -> string {
+    return _home() + "/core/" + repo + "/state/proposals/inventory.json"
+}
+
+// Blocker sub-categories per convention nxs-20260422-008.
+// "generic" is the residual bucket — NOT automatically floored by category
+// alone (it trips only when priority_reason contains "cross_repo_blocker").
+fn _blocker_sub_cats() -> array {
+    return ["lang_gap", "infra_gap", "resource_gap", "atlas_gap", "data_gap"]
+}
+
+// 6 sister repos that actually carry inventories (per .workspace — hexa-os,
+// papers, secret, contact are consumers without inbox SSOT yet).
+fn _repos() -> array {
+    return ["nexus", "anima", "hexa-lang", "airgenome", "n6-architecture", "void"]
+}
+
+fn _selftest() -> int {
+    let sc = _blocker_sub_cats()
+    if len(sc) != 5 {
+        eprintln("cross_repo_floor_check: selftest FAIL (sub_cats count)")
+        return 1
+    }
+    if len(_repos()) != 6 {
+        eprintln("cross_repo_floor_check: selftest FAIL (repo count)")
+        return 1
+    }
+    if len(_home()) < 1 {
+        eprintln("cross_repo_floor_check: selftest FAIL (HOME empty)")
+        return 1
+    }
+    println("cross_repo_floor_check: selftest PASS")
+    return 0
+}
+
+// Python3 heredoc does the JSON parse + filter + JSONL emit.
+// Match convention: use python3 for JSON (same as proposal_inbox).
+// Stdout = one JSONL line per drift entry; stderr = summary.
+// Returns [stdout, rc] where rc=0 if no drift; rc=10 if drift found.
+fn _scan_repo(repo: string) -> array {
+    let inv = _inventory_path(repo)
+    if !_exists(inv) {
+        // Missing inventory is not drift — just skip.
+        return ["", 0]
+    }
+    let py = "python3 - <<'PY'\n"
+           + "import json, sys\n"
+           + "p = " + _sh_q(inv) + "\n"
+           + "repo = " + _sh_q(repo) + "\n"
+           + "FLOOR = 95\n"
+           + "CATS = {'lang_gap','infra_gap','resource_gap','atlas_gap','data_gap'}\n"
+           + "try:\n"
+           + "    d = json.load(open(p))\n"
+           + "except Exception as e:\n"
+           + "    sys.stderr.write(f'cross_repo_floor_check: parse FAIL {repo}: {e}\\n')\n"
+           + "    raise SystemExit(2)\n"
+           + "drift_count = 0\n"
+           + "for e in d.get('entries', []):\n"
+           + "    st = e.get('user_status', 'pending')\n"
+           + "    if st == 'done': continue\n"
+           + "    cat = e.get('category', '') or ''\n"
+           + "    pr  = e.get('priority_reason', '') or ''\n"
+           + "    hit_cat = cat in CATS\n"
+           + "    hit_pr  = 'cross_repo_blocker' in pr\n"
+           + "    if not (hit_cat or hit_pr): continue\n"
+           + "    try: sp = int(e.get('score_priority', 0))\n"
+           + "    except: sp = 0\n"
+           + "    if sp >= FLOOR: continue\n"
+           + "    reason_parts = []\n"
+           + "    if hit_cat: reason_parts.append(f'category={cat}')\n"
+           + "    if hit_pr:  reason_parts.append('priority_reason~cross_repo_blocker')\n"
+           + "    reason = ','.join(reason_parts)\n"
+           + "    line = {\n"
+           + "        'drift': True,\n"
+           + "        'repo': repo,\n"
+           + "        'id': e.get('id','?'),\n"
+           + "        'score_priority': sp,\n"
+           + "        'reason': reason,\n"
+           + "    }\n"
+           + "    print(json.dumps(line, ensure_ascii=False))\n"
+           + "    drift_count += 1\n"
+           + "raise SystemExit(10 if drift_count > 0 else 0)\n"
+           + "PY\n"
+    let r = exec_with_status(py)
+    return [to_string(r[0]), r[1]]
+}
+
+fn _cmd_report(strict: bool) -> int {
+    let repos = _repos()
+    let mut total_drift = 0
+    let mut had_err = 0
+    for repo in repos {
+        let res = _scan_repo(repo)
+        let out = res[0]
+        let rc  = res[1]
+        // out may contain multiple JSONL lines; pass through verbatim.
+        let trimmed = to_string(out).trim()
+        if len(trimmed) > 0 { println(trimmed) }
+        if rc == 10 {
+            // Count drift lines by splitting output.
+            let lines = trimmed.split("\n")
+            total_drift = total_drift + lines.len()
+        } else if rc != 0 {
+            had_err = 1
+        }
+    }
+    eprintln("cross_repo_floor_check: scanned " + to_string(len(repos))
+             + " repos, drift=" + to_string(total_drift))
+    if had_err != 0 { return 2 }
+    if strict && total_drift > 0 { return 1 }
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut args = []
+    let mut i = 2
+    while i < len(av) { args.push(av[i]); i = i + 1 }
+
+    if _has_flag(args, "--selftest") || _has_flag(args, "selftest") {
+        exit(_selftest())
+    }
+
+    let strict = _has_flag(args, "--strict")
+    let report = _has_flag(args, "--report") || strict
+
+    if !report {
+        eprintln("usage: cross_repo_floor_check.hexa {--selftest|--report|--strict}")
+        eprintln("  --report    scan 6 sister repos, emit JSONL drift to stdout (rc=0)")
+        eprintln("  --strict    same as --report but rc=1 on any drift")
+        exit(2)
+    }
+
+    exit(_cmd_report(strict))
+}
