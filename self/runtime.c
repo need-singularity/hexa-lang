@@ -4107,7 +4107,8 @@ HexaVal hexa_str_pad_right(HexaVal s, HexaVal wv, HexaVal padv) {
     return rt_str_pad_right(s, wv, padv);
 }
 
-HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
+// rt_str_center: SSOT self/runtime_hi.hexa:92-117. odd-remainder → right.
+static HexaVal rt_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
     if (!HX_IS_STR(s) || !HX_IS_STR(padv)) return s;
     int width = HX_IS_INT(wv) ? (int)HX_INT(wv) : (int)__hx_to_double(wv);
     const char* src = HX_STR(s);
@@ -4128,6 +4129,11 @@ HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
     for (int i = 0; i < ri; i++) { memcpy(out + pos, pad, (size_t)plen); pos += plen; }
     out[pos] = 0;
     return hexa_str_own(out);
+}
+
+// hexa_str_center: M1-lite delegate shim (hxa-20260423-003 Step 3).
+HexaVal hexa_str_center(HexaVal s, HexaVal wv, HexaVal padv) {
+    return rt_str_center(s, wv, padv);
 }
 
 // count_substr(s, substr): number of non-overlapping occurrences.
