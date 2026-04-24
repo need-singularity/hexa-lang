@@ -4017,9 +4017,10 @@ HexaVal hexa_cmp_ge(HexaVal a, HexaVal b) {
     return hexa_bool(HX_INT(a) >= HX_INT(b));
 }
 
-HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
+// rt_str_repeat: SSOT self/runtime_hi.hexa:80-89. count<=0 → "".
+static HexaVal rt_str_repeat(HexaVal s, HexaVal n) {
     if (!HX_IS_STR(s)) return s;
-    int count = HX_INT(n);
+    int count = HX_IS_INT(n) ? (int)HX_INT(n) : (int)__hx_to_double(n);
     if (count <= 0) return hexa_str("");
     size_t slen = strlen(HX_STR(s));
     char* result = malloc(slen * (size_t)count + 1);
@@ -4030,6 +4031,11 @@ HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
     }
     result[total] = 0;
     return hexa_str_own(result);
+}
+
+// hexa_str_repeat: M1-lite delegate shim (hxa-20260423-003 Step 3).
+HexaVal hexa_str_repeat(HexaVal s, HexaVal n) {
+    return rt_str_repeat(s, n);
 }
 
 int hexa_array_contains(HexaVal arr, HexaVal item) {
