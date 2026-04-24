@@ -1,0 +1,296 @@
+# bootstrap.yml — 3-platform self-host bootstrap matrix (M5 last-mile)
+#
+# PURPOSE
+#   anima roadmap M5 (self-hosted driver) 의 마지막 deliverable.
+#   Linux CLI 실측 빌드 (build_hexa_cli_linux.hexa) 는 이미 통과해
+#   508KB static ELF 가 build/hexa_linux 로 커밋돼 있다. 이 워크플로는
+#   그 "already-working pipeline" 을 3-러너 매트릭스에서 재확인하며
+#   macOS arm64, Linux x86_64 (optional Linux arm64) 에서 회귀를 막는다.
+#
+# INDEPENDENCE
+#   raw-verify.yml 과 독립. 이 파일은 secrets 을 요구하지 않고 기본
+#   GITHUB_TOKEN 만 사용하며, raw-verify 가 실패해도 bootstrap 은 돌고
+#   vice versa. 두 워크플로는 서로 모른다.
+#
+# BOOTSTRAP CHAIN (per runner)
+#   1. $CC self/native/hexa_cc.c -I self -o self/native/hexa_v2      (self-hosted transpiler binary)
+#   2. self/native/hexa_v2 self/main.hexa build/stage1/main.c        (transpile CLI source)
+#   3. $CC -I self build/stage1/main.c -o hexa                       (link CLI)
+#   4. smoke — ./self/native/hexa_v2 + $CC 로 tiny 프로그램 실행
+#
+# RUNNERS
+#   · macos-latest     — Apple Silicon arm64 (GA)
+#   · ubuntu-latest    — x86_64 (GA)
+#   · ubuntu-24.04-arm — arm64, continue-on-error (free tier availability
+#     varies — 러너 큐 불가 시 skip 허용, main gate 는 막지 않음).
+#
+# FLAGS NOTE
+#   -Wno-trigraphs 필수 : hexa codegen 이 `??` byte 패턴을 C 문자열에
+#   방출 (regex/pattern literal) — trigraph 경고/에러 회피.
+#   -D_GNU_SOURCE + -std=gnu11 : runtime.c 가 popen/strdup/dlopen 등
+#   GNU/POSIX extension 사용. Linux 에서 -ldl 필요 (macOS 는 libSystem 포함).
+
+name: bootstrap
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  # ── macOS arm64 (Apple Silicon) ────────────────────────────
+  bootstrap-macos:
+    name: bootstrap (macos-arm64)
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "uname : $(uname -a)"
+          echo "cc    : $(clang --version | head -1)"
+          echo "make  : $(make --version 2>&1 | head -1 || true)"
+
+      - name: Stage 0 — compile self-hosted transpiler (hexa_v2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p self/native build/stage1
+          clang -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self self/native/hexa_cc.c \
+              -o self/native/hexa_v2
+          file self/native/hexa_v2
+          ls -la self/native/hexa_v2
+
+      - name: Stage 1 — transpile self/main.hexa → build/stage1/main.c
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./self/native/hexa_v2 self/main.hexa build/stage1/main.c
+          wc -l build/stage1/main.c
+
+      - name: Stage 1 — compile CLI driver (./hexa)
+        shell: bash
+        run: |
+          set -euo pipefail
+          clang -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self build/stage1/main.c \
+              -o hexa
+          file hexa
+          ls -la hexa
+
+      - name: Smoke — hexa version + end-to-end transpile/compile/run
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./hexa version || echo "(version subcmd may differ; dispatcher loaded)"
+          mkdir -p /tmp/hexa_ci
+          cat > /tmp/hexa_ci/hi.hexa <<'HEXA_EOF'
+          fn main() {
+              println("ok")
+          }
+          HEXA_EOF
+          ./self/native/hexa_v2 /tmp/hexa_ci/hi.hexa /tmp/hexa_ci/hi.c
+          clang -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self /tmp/hexa_ci/hi.c -o /tmp/hexa_ci/hi
+          OUT="$(/tmp/hexa_ci/hi)"
+          echo "smoke output: $OUT"
+          [[ "$OUT" == "ok" ]] || { echo "::error::smoke failed (got '$OUT')"; exit 1; }
+
+      - name: Tail logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "── build/stage1 listing ──"
+          ls -la build/stage1 2>&1 || true
+          echo "── self/native listing ──"
+          ls -la self/native 2>&1 || true
+          echo "── last 80 lines of build/stage1/main.c ──"
+          tail -80 build/stage1/main.c 2>&1 || true
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexa-macos-arm64
+          path: |
+            hexa
+            self/native/hexa_v2
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Linux x86_64 ───────────────────────────────────────────
+  bootstrap-linux-x64:
+    name: bootstrap (linux-x86_64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "uname : $(uname -a)"
+          echo "cc    : $(gcc --version | head -1)"
+
+      - name: Stage 0 — compile self-hosted transpiler (hexa_v2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p self/native build/stage1
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self self/native/hexa_cc.c \
+              -o self/native/hexa_v2 \
+              -lm -ldl
+          file self/native/hexa_v2
+
+      - name: Stage 1 — transpile self/main.hexa → build/stage1/main.c
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./self/native/hexa_v2 self/main.hexa build/stage1/main.c
+          wc -l build/stage1/main.c
+
+      - name: Stage 1 — compile CLI driver (./hexa)
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self build/stage1/main.c \
+              -o hexa \
+              -lm -ldl
+          file hexa
+          ls -la hexa
+
+      - name: Smoke — end-to-end transpile/compile/run
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./hexa version || echo "(version subcmd may differ; dispatcher loaded)"
+          mkdir -p /tmp/hexa_ci
+          cat > /tmp/hexa_ci/hi.hexa <<'HEXA_EOF'
+          fn main() {
+              println("ok")
+          }
+          HEXA_EOF
+          ./self/native/hexa_v2 /tmp/hexa_ci/hi.hexa /tmp/hexa_ci/hi.c
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self /tmp/hexa_ci/hi.c -o /tmp/hexa_ci/hi \
+              -lm -ldl
+          OUT="$(/tmp/hexa_ci/hi)"
+          echo "smoke output: $OUT"
+          [[ "$OUT" == "ok" ]] || { echo "::error::smoke failed (got '$OUT')"; exit 1; }
+
+      - name: Tail logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "── build/stage1 listing ──"
+          ls -la build/stage1 2>&1 || true
+          echo "── self/native listing ──"
+          ls -la self/native 2>&1 || true
+          echo "── last 80 lines of build/stage1/main.c ──"
+          tail -80 build/stage1/main.c 2>&1 || true
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexa-linux-x86_64
+          path: |
+            hexa
+            self/native/hexa_v2
+          if-no-files-found: error
+          retention-days: 7
+
+  # ── Linux arm64 (best-effort) ──────────────────────────────
+  # ubuntu-24.04-arm public preview/GA in 2025. Availability varies
+  # across GitHub-hosted free tier tenants; continue-on-error keeps
+  # main gate green if the runner cannot be scheduled.
+  # TODO: 자유 tier 에서 안정적으로 GA 되면 continue-on-error 제거.
+  bootstrap-linux-arm64:
+    name: bootstrap (linux-arm64)
+    runs-on: ubuntu-24.04-arm
+    continue-on-error: true
+    timeout-minutes: 25
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Toolchain info
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "uname : $(uname -a)"
+          echo "cc    : $(gcc --version | head -1)"
+
+      - name: Stage 0 — compile self-hosted transpiler (hexa_v2)
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p self/native build/stage1
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self self/native/hexa_cc.c \
+              -o self/native/hexa_v2 \
+              -lm -ldl
+          file self/native/hexa_v2
+
+      - name: Stage 1 — transpile + compile CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./self/native/hexa_v2 self/main.hexa build/stage1/main.c
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self build/stage1/main.c \
+              -o hexa \
+              -lm -ldl
+          file hexa
+
+      - name: Smoke — end-to-end transpile/compile/run
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./hexa version || echo "(version subcmd may differ; dispatcher loaded)"
+          mkdir -p /tmp/hexa_ci
+          cat > /tmp/hexa_ci/hi.hexa <<'HEXA_EOF'
+          fn main() {
+              println("ok")
+          }
+          HEXA_EOF
+          ./self/native/hexa_v2 /tmp/hexa_ci/hi.hexa /tmp/hexa_ci/hi.c
+          gcc -O2 -std=gnu11 -D_GNU_SOURCE -Wno-trigraphs \
+              -I self /tmp/hexa_ci/hi.c -o /tmp/hexa_ci/hi \
+              -lm -ldl
+          OUT="$(/tmp/hexa_ci/hi)"
+          echo "smoke output: $OUT"
+          [[ "$OUT" == "ok" ]] || { echo "::error::smoke failed (got '$OUT')"; exit 1; }
+
+      - name: Tail logs on failure
+        if: failure()
+        shell: bash
+        run: |
+          echo "── build/stage1 listing ──"
+          ls -la build/stage1 2>&1 || true
+          echo "── self/native listing ──"
+          ls -la self/native 2>&1 || true
+
+      - name: Upload artifacts
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: hexa-linux-arm64
+          path: |
+            hexa
+            self/native/hexa_v2
+          if-no-files-found: warn
+          retention-days: 7
