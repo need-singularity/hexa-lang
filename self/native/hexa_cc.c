@@ -665,7 +665,7 @@ HexaVal keyword_kind(HexaVal word) {
         return __hexa_fn_arena_return(__hexa_lexer_sl_69);
     }
     if (hexa_truthy(is_keyword(word))) {
-        HexaVal first = hexa_str_to_upper(hexa_to_string(hexa_index_get(hexa_str_chars(word), hexa_int(0))));
+        HexaVal first = rt_str_to_upper(hexa_to_string(hexa_index_get(hexa_str_chars(word), hexa_int(0))));
         HexaVal rest_parts = hexa_array_new();
         HexaVal chars = hexa_str_chars(word);
         HexaVal i = hexa_int(1);
@@ -5138,7 +5138,7 @@ HexaVal parse_primary(void) {
             chars = hexa_str_chars(name);
             if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(chars)), hexa_int(0)))) {
                 first_ch = hexa_index_get(chars, hexa_int(0));
-                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((HX_IS_STR(first_ch) && HX_STR(first_ch) && isalpha((unsigned char)HX_STR(first_ch)[0])) || (HX_TAG(first_ch)==TAG_CHAR && isalpha((unsigned char)HX_INT(first_ch))))) && hexa_truthy(hexa_eq(hexa_to_string(first_ch), hexa_str_to_upper(hexa_to_string(first_ch))))))) {
+                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((HX_IS_STR(first_ch) && HX_STR(first_ch) && isalpha((unsigned char)HX_STR(first_ch)[0])) || (HX_TAG(first_ch)==TAG_CHAR && isalpha((unsigned char)HX_INT(first_ch))))) && hexa_truthy(hexa_eq(hexa_to_string(first_ch), rt_str_to_upper(hexa_to_string(first_ch))))))) {
                     type_args = parse_type_params();
                 }
             }
@@ -5147,7 +5147,7 @@ HexaVal parse_primary(void) {
             chars = hexa_str_chars(name);
             if (hexa_truthy(hexa_cmp_gt(hexa_int(hexa_len(chars)), hexa_int(0)))) {
                 first_ch = hexa_index_get(chars, hexa_int(0));
-                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((HX_IS_STR(first_ch) && HX_STR(first_ch) && isalpha((unsigned char)HX_STR(first_ch)[0])) || (HX_TAG(first_ch)==TAG_CHAR && isalpha((unsigned char)HX_INT(first_ch))))) && hexa_truthy(hexa_eq(hexa_to_string(first_ch), hexa_str_to_upper(hexa_to_string(first_ch))))))) {
+                if (hexa_truthy(hexa_bool(hexa_truthy(hexa_bool((HX_IS_STR(first_ch) && HX_STR(first_ch) && isalpha((unsigned char)HX_STR(first_ch)[0])) || (HX_TAG(first_ch)==TAG_CHAR && isalpha((unsigned char)HX_INT(first_ch))))) && hexa_truthy(hexa_eq(hexa_to_string(first_ch), rt_str_to_upper(hexa_to_string(first_ch))))))) {
                     p_advance();
                     p_skip_newlines();
                     HexaVal fields = hexa_array_new();
@@ -10683,9 +10683,9 @@ static void __hexa_codegen_c2_strlit_init(void) {
     __hexa_codegen_c2_sl_217 = hexa_str("hexa_str_eq");
     __hexa_codegen_c2_sl_218 = hexa_str("hexa_str_substring");
     __hexa_codegen_c2_sl_219 = hexa_str("hexa_str_slice");
-    __hexa_codegen_c2_sl_220 = hexa_str("hexa_str_trim");
-    __hexa_codegen_c2_sl_221 = hexa_str("hexa_str_trim_start");
-    __hexa_codegen_c2_sl_222 = hexa_str("hexa_str_trim_end");
+    __hexa_codegen_c2_sl_220 = hexa_str("rt_str_trim");
+    __hexa_codegen_c2_sl_221 = hexa_str("rt_str_trim_start");
+    __hexa_codegen_c2_sl_222 = hexa_str("rt_str_trim_end");
     __hexa_codegen_c2_sl_223 = hexa_str("hexa_str_replace");
     __hexa_codegen_c2_sl_224 = hexa_str("rt_str_pad_left");
     __hexa_codegen_c2_sl_225 = hexa_str("rt_str_pad_right");
@@ -10696,8 +10696,8 @@ static void __hexa_codegen_c2_strlit_init(void) {
     __hexa_codegen_c2_sl_230 = hexa_str("hexa_str_reverse");
     __hexa_codegen_c2_sl_231 = hexa_str("hexa_str_split");
     __hexa_codegen_c2_sl_232 = hexa_str("hexa_str_join");
-    __hexa_codegen_c2_sl_233 = hexa_str("hexa_str_to_upper");
-    __hexa_codegen_c2_sl_234 = hexa_str("hexa_str_to_lower");
+    __hexa_codegen_c2_sl_233 = hexa_str("rt_str_to_upper");
+    __hexa_codegen_c2_sl_234 = hexa_str("rt_str_to_lower");
     __hexa_codegen_c2_sl_235 = hexa_str("hexa_str_char_at");
     __hexa_codegen_c2_sl_236 = hexa_str("hexa_str_char_code_at");
     __hexa_codegen_c2_sl_237 = hexa_str("hexa_str_parse_int");
@@ -10706,10 +10706,10 @@ static void __hexa_codegen_c2_strlit_init(void) {
     __hexa_codegen_c2_sl_240 = hexa_str("hexa_str_from_chars");
     __hexa_codegen_c2_sl_241 = hexa_str("rt_str_center");
     __hexa_codegen_c2_sl_242 = hexa_str("hexa_str_chars");
-    __hexa_codegen_c2_sl_243 = hexa_str("hexa_str_ends_with");
+    __hexa_codegen_c2_sl_243 = hexa_str("rt_str_ends_with");
     __hexa_codegen_c2_sl_244 = hexa_str("hexa_str_len");
     __hexa_codegen_c2_sl_245 = hexa_str("rt_str_lines");
-    __hexa_codegen_c2_sl_246 = hexa_str("hexa_str_starts_with");
+    __hexa_codegen_c2_sl_246 = hexa_str("rt_str_starts_with");
     __hexa_codegen_c2_sl_247 = hexa_str("hexa_str_substr");
     __hexa_codegen_c2_sl_248 = hexa_str(".");
     __hexa_codegen_c2_sl_249 = hexa_str("/");
@@ -13610,7 +13610,7 @@ HexaVal _resolve_param_arity(HexaVal body) {
     if (hexa_truthy(hexa_bool(!hexa_truthy(hexa_eq(hexa_type_of(body), __hexa_codegen_c2_sl_106))))) {
         return __hexa_fn_arena_return(hexa_int(0));
     }
-    HexaVal t = hexa_str_trim(body);
+    HexaVal t = rt_str_trim(body);
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(t)), hexa_int(0)))) {
         return __hexa_fn_arena_return(hexa_int(0));
     }
@@ -13649,8 +13649,8 @@ HexaVal _resolve_parse_fn_sig(HexaVal line) {
     if (hexa_truthy(hexa_cmp_ge(brace, hexa_int(0)))) {
         sig = hexa_str_substring(raw, hexa_int(0), brace);
     }
-    sig = hexa_str_trim(sig);
-    if (hexa_truthy(hexa_bool(hexa_str_starts_with(sig, __hexa_codegen_c2_sl_263)))) {
+    sig = rt_str_trim(sig);
+    if (hexa_truthy(hexa_bool(rt_str_starts_with(sig, __hexa_codegen_c2_sl_263)))) {
         HexaVal pfn = hexa_int(hexa_str_index_of(sig, __hexa_codegen_c2_sl_264));
         HexaVal fnsp = hexa_int(hexa_str_index_of(sig, __hexa_codegen_c2_sl_265));
         HexaVal cut = hexa_sub(hexa_int(0), hexa_int(1));
@@ -13666,10 +13666,10 @@ HexaVal _resolve_parse_fn_sig(HexaVal line) {
         }
         sig = hexa_str_substring(sig, cut, hexa_int(hexa_len(sig)));
     }
-    if (hexa_truthy(hexa_bool(hexa_str_starts_with(sig, __hexa_codegen_c2_sl_266)))) {
+    if (hexa_truthy(hexa_bool(rt_str_starts_with(sig, __hexa_codegen_c2_sl_266)))) {
         sig = hexa_str_substring(sig, hexa_int(7), hexa_int(hexa_len(sig)));
     } else {
-        if (hexa_truthy(hexa_bool(hexa_str_starts_with(sig, __hexa_codegen_c2_sl_267)))) {
+        if (hexa_truthy(hexa_bool(rt_str_starts_with(sig, __hexa_codegen_c2_sl_267)))) {
             sig = hexa_str_substring(sig, hexa_int(3), hexa_int(hexa_len(sig)));
         } else {
             return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
@@ -13679,7 +13679,7 @@ HexaVal _resolve_parse_fn_sig(HexaVal line) {
     if (hexa_truthy(hexa_cmp_lt(lp, hexa_int(0)))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
     }
-    HexaVal name = hexa_str_trim(hexa_str_substring(sig, hexa_int(0), lp));
+    HexaVal name = rt_str_trim(hexa_str_substring(sig, hexa_int(0), lp));
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(name)), hexa_int(0)))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
     }
@@ -13700,12 +13700,12 @@ HexaVal _resolve_parse_struct_start(HexaVal line) {
     if (hexa_truthy(hexa_bool(!hexa_truthy(_resolve_line_col0(line))))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
     }
-    HexaVal t = hexa_str_trim(line);
+    HexaVal t = rt_str_trim(line);
     HexaVal body = t;
-    if (hexa_truthy(hexa_bool(hexa_str_starts_with(body, __hexa_codegen_c2_sl_269)))) {
+    if (hexa_truthy(hexa_bool(rt_str_starts_with(body, __hexa_codegen_c2_sl_269)))) {
         body = hexa_str_substring(body, hexa_int(11), hexa_int(hexa_len(body)));
     } else {
-        if (hexa_truthy(hexa_bool(hexa_str_starts_with(body, __hexa_codegen_c2_sl_270)))) {
+        if (hexa_truthy(hexa_bool(rt_str_starts_with(body, __hexa_codegen_c2_sl_270)))) {
             body = hexa_str_substring(body, hexa_int(7), hexa_int(hexa_len(body)));
         } else {
             return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
@@ -13713,7 +13713,7 @@ HexaVal _resolve_parse_struct_start(HexaVal line) {
     }
     HexaVal lb = hexa_int(hexa_str_index_of(body, __hexa_codegen_c2_sl_258));
     HexaVal namepart = (hexa_truthy(hexa_cmp_ge(lb, hexa_int(0))) ? hexa_str_substring(body, hexa_int(0), lb) : body);
-    HexaVal name = hexa_str_trim(namepart);
+    HexaVal name = rt_str_trim(namepart);
     if (hexa_truthy(hexa_eq(hexa_int(hexa_len(name)), hexa_int(0)))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_130);
     }

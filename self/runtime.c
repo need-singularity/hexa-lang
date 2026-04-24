@@ -176,18 +176,24 @@ HexaVal rt_file_size(HexaVal path);
 HexaVal rt_read_lines(HexaVal path);
 HexaVal rt_delete_file(HexaVal path);
 HexaVal rt_append_file(HexaVal path, HexaVal content);
+// M1 full · str_ext layer (hxa-20260423-003 Step 3/5): rt_str_* hand-port
+// in runtime.c; hexa_str_* wrappers removed — codegen emits rt_str_*
+// directly. ABI: rt_str_trim/trim_start/trim_end/to_upper/to_lower return
+// HexaVal; rt_str_starts_with/ends_with return int (same as hexa_*).
+HexaVal rt_str_trim(HexaVal s);
+HexaVal rt_str_trim_start(HexaVal s);
+HexaVal rt_str_trim_end(HexaVal s);
+HexaVal rt_str_to_upper(HexaVal s);
+HexaVal rt_str_to_lower(HexaVal s);
+int rt_str_starts_with(HexaVal s, HexaVal prefix);
+int rt_str_ends_with(HexaVal s, HexaVal suffix);
 HexaVal hexa_str_split(HexaVal s, HexaVal delim);
-HexaVal hexa_str_trim(HexaVal s);
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s);
 HexaVal hexa_str_join(HexaVal arr, HexaVal sep);
-HexaVal hexa_str_to_upper(HexaVal s);
-HexaVal hexa_str_to_lower(HexaVal s);
 HexaVal hexa_str_chars(HexaVal s);
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args);
 HexaVal hexa_str_parse_int(HexaVal s);
 HexaVal hexa_str_parse_float(HexaVal s);
-HexaVal hexa_str_trim_start(HexaVal s);
-HexaVal hexa_str_trim_end(HexaVal s);
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end);
 HexaVal hexa_str_bytes(HexaVal s);
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end);
@@ -2621,13 +2627,15 @@ int hexa_str_eq(HexaVal a, HexaVal b) {
     return strcmp(HX_STR(a), HX_STR(b)) == 0;
 }
 
-int hexa_str_starts_with(HexaVal s, HexaVal prefix) {
+// M1 full · str_ext Step 5 (hxa-20260423-003): rt_str_starts_with/ends_with —
+// codegen emits rt_str_* directly; hexa_str_starts_with/ends_with shims retired.
+int rt_str_starts_with(HexaVal s, HexaVal prefix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(prefix)) return 0;
     size_t plen = strlen(HX_STR(prefix));
     return strncmp(HX_STR(s), HX_STR(prefix), plen) == 0;
 }
 
-int hexa_str_ends_with(HexaVal s, HexaVal suffix) {
+int rt_str_ends_with(HexaVal s, HexaVal suffix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(suffix)) return 0;
     size_t slen = strlen(HX_STR(s));
     size_t sfxlen = strlen(HX_STR(suffix));
@@ -3786,7 +3794,9 @@ HexaVal hexa_str_split(HexaVal s, HexaVal delim) {
 // hexa_str_* shims forward to rt_str_* after the include.
 // ─────────────────────────────────────────────────────────────────────
 
-HexaVal hexa_str_trim(HexaVal s) {
+// M1 full · str_ext Step 5 (hxa-20260423-003): rt_str_trim — codegen
+// emits rt_str_* directly; hexa_str_trim shim retired.
+HexaVal rt_str_trim(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     char* str = HX_STR(s);
     while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
@@ -3827,14 +3837,16 @@ HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
     return hexa_str_own(result);
 }
 
-HexaVal hexa_str_to_upper(HexaVal s) {
+// M1 full · str_ext Step 5 (hxa-20260423-003): rt_str_to_upper/lower —
+// codegen emits rt_str_* directly; hexa_str_to_upper/lower shims retired.
+HexaVal rt_str_to_upper(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     char* r = strdup(HX_STR(s));
     for (int i = 0; r[i]; i++) if (r[i] >= 'a' && r[i] <= 'z') r[i] -= 32;
     return hexa_str_own(r);
 }
 
-HexaVal hexa_str_to_lower(HexaVal s) {
+HexaVal rt_str_to_lower(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     char* r = strdup(HX_STR(s));
     for (int i = 0; r[i]; i++) if (r[i] >= 'A' && r[i] <= 'Z') r[i] += 32;
@@ -5021,14 +5033,16 @@ HexaVal hexa_str_parse_float(HexaVal s) {
     return hexa_float(strtod(HX_STR(s), NULL));
 }
 
-HexaVal hexa_str_trim_start(HexaVal s) {
+// M1 full · str_ext Step 5 (hxa-20260423-003): rt_str_trim_start/end —
+// codegen emits rt_str_* directly; hexa_str_trim_start/end shims retired.
+HexaVal rt_str_trim_start(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     char* p = HX_STR(s);
     while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
     return hexa_str_own(strdup(p));
 }
 
-HexaVal hexa_str_trim_end(HexaVal s) {
+HexaVal rt_str_trim_end(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
     int len = strlen(HX_STR(s));
     while (len > 0 && (HX_STR(s)[len-1] == ' ' || HX_STR(s)[len-1] == '\t' || HX_STR(s)[len-1] == '\n' || HX_STR(s)[len-1] == '\r')) len--;
