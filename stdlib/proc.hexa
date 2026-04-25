@@ -1,0 +1,345 @@
+// stdlib/proc.hexa — supervised OS-process spawn + .resource registration
+//
+// @module(slug="proc", desc="spawn long-running OS processes with auto-register + lease-TTL supervision")
+// @usage(import stdlib/proc; let pid = proc_spawn_supervised("long_cmd", 600, "why this process exists"))
+//
+// PROBLEM (2026-04-25 convergence event)
+//   Hexa's builtin `exec()` is synchronous (popen). Long-running spawns
+//   happen via `&` backgrounding in shell — when the hexa parent exits,
+//   the child becomes an orphan parented to launchd. Three concrete
+//   accidents this pattern produced:
+//     · vitest worker pools (2 × 9 procs each) hung after the parent
+//       claude session moved on — 18 orphaned workers.
+//     · hexa_stage0 compiles stuck, parented to nothing.
+//     · 11h hive coding-agent on /dev/ttys007 long after session close.
+//
+// STRATEGY (lease-based supervision, Phase 2 of Plan B 2026-04-25)
+//   Every supervised spawn:
+//     1. Runs through `setsid` so the child + its worker tree sit in a
+//        fresh process-group (pgid == child pid).
+//     2. Is registered in the project's `.resource` SSOT with a short
+//        `lease-ttl` (default 300s). Owner renews via `proc_lease_renew`
+//        while alive; dies silently if owner crashes.
+//     3. The reaper (`tool/resource_reaper.hexa`) running on a cron or
+//        launchd timer SIGTERMs any entry whose lease expired. Because
+//        we recorded `pgid`, killpg wipes the whole worker tree in one
+//        signal — vitest-style fanout can't leak.
+//
+// WHY NOT PDEATHSIG / kqueue NOTE_EXIT
+//   Would be tighter (zero-lag parent-death detection) but requires a
+//   new hexa builtin + runtime.c change. Phase 2 stays pure-hexa. A
+//   future enhancement can swap the shell launcher for a C-level
+//   spawn_supervised() builtin without changing this module's API.
+
+// ── config / env ────────────────────────────────────────────────
+// Path to the .resource file to register/renew against. Defaults to
+// $PWD/.resource so hexa scripts inherit the project's SSOT. Override
+// with $HEXA_PROC_RESOURCE for non-cwd scripts (CI runners, launchd).
+fn _resource_path() -> string {
+    let explicit = env("HEXA_PROC_RESOURCE")
+    if len(explicit) > 0 { return explicit }
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p + "/.resource"
+}
+
+// Default lease — 5 minutes. Balances reaper latency vs renewal chatter.
+// Long-running supervised workers renew every lease/3 (~100s) as a rule.
+let PROC_DEFAULT_LEASE_TTL = 300
+
+// ── id helpers ──────────────────────────────────────────────────
+fn _now_epoch() -> int {
+    return to_int(to_string(exec("date +%s")).trim())
+}
+
+// Scan the file for the next free `resource N ...` id. O(N) but .resource
+// files are small (tens of entries); acceptable for register churn.
+fn _next_resource_id(path: string) -> int {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return 0 }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut max_id = -1
+    for raw in lines {
+        let line = raw.trim()
+        if len(line) == 0 { continue }
+        if line.substring(0, 1) == "#" { continue }
+        if !line.starts_with("resource ") { continue }
+        let rest = line.substring(9, len(line))
+        let sp = rest.index_of(" ")
+        if sp < 0 { continue }
+        let id_str = rest.substring(0, sp)
+        let id = to_int(id_str)
+        if id > max_id { max_id = id }
+    }
+    return max_id + 1
+}
+
+// Serialize a process entry as a `.resource` block. Keep keys in the
+// order the docs canon shows — reads better for humans skimming diffs.
+fn _serialize_process_entry(
+    id: int, slug: string, pid: int, pgid: int, cmd: string,
+    started: int, lease_ttl: int, why: string, owner_scope: string
+) -> string {
+    let mut s = "\n"
+    s = s + "resource " + to_string(id) + " live \"supervised process — " + slug + "\"\n"
+    s = s + "  slug " + slug + "\n"
+    s = s + "  kind process\n"
+    s = s + "  pid " + to_string(pid) + "\n"
+    if pgid > 0 {
+        s = s + "  pgid " + to_string(pgid) + "\n"
+    }
+    s = s + "  cmd " + cmd + "\n"
+    s = s + "  started " + to_string(started) + "\n"
+    s = s + "  lease-ttl " + to_string(lease_ttl) + "\n"
+    if len(owner_scope) > 0 {
+        s = s + "  owner-scope " + owner_scope + "\n"
+    }
+    s = s + "  why " + why + "\n"
+    return s
+}
+
+// ── spawn / register / renew / deregister ───────────────────────
+
+// _has_setsid() — probe for GNU setsid binary.
+//
+// Linux distros ship it in util-linux; macOS does not (only the syscall,
+// no CLI wrapper). Every spawn branches on this to decide whether the
+// child can safely land in a fresh pgrp (= killpg-safe reaps) or must
+// fall back to nohup (= kill-by-pid only, no worker-tree sweep).
+fn _has_setsid() -> bool {
+    let out = to_string(exec("command -v setsid >/dev/null 2>&1 && echo y || echo n")).trim()
+    return out == "y"
+}
+
+// proc_spawn_supervised(cmd, lease_ttl, why) -> pid
+//
+// Spawns `cmd` detached from the hexa parent, registers it in .resource
+// with the given lease-ttl (0 = indefinite, no auto-reap — use only for
+// daemons with independent heartbeat), returns the child pid.
+//
+// Detachment strategy is platform-branched:
+//   · setsid present (Linux) → child sits in a fresh pgrp; pgid = pid;
+//     reaper uses killpg to sweep worker trees together (the vitest
+//     9-proc fanout case).
+//   · no setsid (macOS default) → child launched via `nohup` + `&`;
+//     inherits parent's pgrp. We do NOT record pgid in this case —
+//     reaper falls back to `kill pid`. Safe but won't cascade-kill
+//     descendants. A future C-level `spawn_detached` runtime builtin
+//     closes this gap without a module API change.
+//
+// Common to both: stdin/stdout/stderr redirect to /dev/null so the
+// child can't block on a pipe the parent later closes.
+fn proc_spawn_supervised(cmd: string, lease_ttl: int, why: string) -> int {
+    let use_setsid = _has_setsid()
+    let mut launch = ""
+    if use_setsid {
+        launch = "setsid sh -c '" + cmd + "' </dev/null >/dev/null 2>&1 & echo $!"
+    } else {
+        launch = "nohup sh -c '" + cmd + "' </dev/null >/dev/null 2>&1 & echo $!"
+    }
+    let pid_str = to_string(exec(launch)).trim()
+    let pid = to_int(pid_str)
+    if pid <= 0 {
+        eprintln("proc.spawn_supervised: failed to launch — cmd=" + cmd)
+        return 0
+    }
+    // Only record pgid when we know the child is a pgrp leader.
+    let recorded_pgid = if use_setsid { pid } else { 0 }
+    let started = _now_epoch()
+    let path = _resource_path()
+    let id = _next_resource_id(path)
+    let slug = "supervised-" + to_string(pid)
+    let entry = _serialize_process_entry(
+        id, slug, pid, recorded_pgid, cmd, started, lease_ttl, why, ""
+    )
+    let _touch = exec("test -e '" + path + "' || touch '" + path + "'")
+    append_file(path, entry)
+    return pid
+}
+
+// proc_lease_renew(pid) -> bool
+//
+// Bumps the `heartbeat` field on the entry whose pid matches. Owners
+// call this periodically (lease_ttl / 3 is a safe rule). Returns true
+// on success, false if pid not found.
+//
+// Implementation: rewrite the file with an updated heartbeat line for
+// the matching entry. Small-file-at-a-time is fine; we accept one
+// rewrite per renew call because the alternative (sidecar index file)
+// is a divergence-prone extra SSOT.
+fn proc_lease_renew(pid: int) -> bool {
+    let path = _resource_path()
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return false }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let now = _now_epoch()
+    // Match on the trimmed line — raw lines carry the 2-space indent
+    // but .trim() strips it, so target needs to follow suit.
+    let target = "pid " + to_string(pid)
+
+    let mut out = ""
+    let mut in_target_block = false
+    let mut wrote_heartbeat = false
+    let mut saw_blank = false
+    let mut changed = false
+
+    for raw in lines {
+        let line = raw
+        if line.trim() == target {
+            in_target_block = true
+            saw_blank = false
+        }
+        // When we leave the block (blank line or new `resource`) and
+        // still owe a heartbeat, emit it before the separator.
+        let is_sep = line.trim() == "" || line.starts_with("resource ")
+        if in_target_block && is_sep && !wrote_heartbeat {
+            out = out + "  heartbeat " + to_string(now) + "\n"
+            wrote_heartbeat = true
+            in_target_block = false
+            changed = true
+        }
+        // Replace existing heartbeat within the target block instead of
+        // appending a duplicate.
+        if in_target_block && line.trim().starts_with("heartbeat ") {
+            out = out + "  heartbeat " + to_string(now) + "\n"
+            wrote_heartbeat = true
+            changed = true
+            continue
+        }
+        out = out + line + "\n"
+    }
+    // Trailing block case (no blank line after target):
+    if in_target_block && !wrote_heartbeat {
+        out = out + "  heartbeat " + to_string(now) + "\n"
+        changed = true
+    }
+    // read_file+split adds a trailing empty element if src ended in "\n";
+    // strip the extra "\n" we appended for that sentinel.
+    if len(out) > 0 && out.substring(len(out) - 1, len(out)) == "\n" {
+        // one newline too many if original had none at EOF — rare, skip normalize
+    }
+    if changed {
+        write_file(path, out)
+    }
+    return changed
+}
+
+// proc_deregister(pid) -> bool
+//
+// Removes the matching entry from .resource. Called via `defer` after
+// the owner has killed or joined the child. Does NOT send any signal —
+// caller is responsible for actual process cleanup.
+fn proc_deregister(pid: int) -> bool {
+    let path = _resource_path()
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return false }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    // Match on the trimmed line — raw lines carry the 2-space indent
+    // but .trim() strips it, so target needs to follow suit.
+    let target = "pid " + to_string(pid)
+
+    let mut blocks = []
+    let mut cur_block = []
+    for raw in lines {
+        let line = raw
+        if line.trim() == "" {
+            if len(cur_block) > 0 {
+                blocks.push(cur_block)
+                cur_block = []
+            }
+            blocks.push([""])
+            continue
+        }
+        if line.starts_with("resource ") && len(cur_block) > 0 {
+            blocks.push(cur_block)
+            cur_block = []
+        }
+        cur_block.push(line)
+    }
+    if len(cur_block) > 0 { blocks.push(cur_block) }
+
+    let mut out = ""
+    let mut dropped = false
+    for block in blocks {
+        let mut is_target = false
+        for line in block {
+            if line.trim() == target { is_target = true }
+        }
+        if is_target {
+            dropped = true
+            continue
+        }
+        for line in block {
+            out = out + line + "\n"
+        }
+    }
+    if dropped {
+        write_file(path, out)
+    }
+    return dropped
+}
+
+// proc_kill(pid) -> bool
+//
+// Tries `kill -TERM -PID` (pgrp) first to cascade-kill worker trees
+// spawned under the setsid path, then `kill -TERM PID` as the always-
+// applicable fallback. Returns true once the exec shell completes.
+//
+// Idempotent: safe to call on a dead pid (both kills silently no-op).
+fn proc_kill(pid: int) -> bool {
+    let out = to_string(exec("kill -TERM -" + to_string(pid) + " 2>/dev/null; kill -TERM " + to_string(pid) + " 2>/dev/null; echo done")).trim()
+    return out == "done"
+}
+
+// proc_alive(pid) -> bool — POSIX kill -0 probe.
+fn proc_alive(pid: int) -> bool {
+    let out = to_string(exec("kill -0 " + to_string(pid) + " 2>/dev/null && echo y || echo n")).trim()
+    return out == "y"
+}
+
+// proc_reap(pid) -> bool
+//
+// Convenience: kill + deregister. Intended idiom is:
+//   let pid = proc_spawn_supervised(cmd, 300, "...")
+//   defer { proc_reap(pid) }
+// Combined with hexa's existing `scope { }` / `defer`, scope exit
+// guarantees the process is gone from both the OS and .resource.
+fn proc_reap(pid: int) -> bool {
+    let killed = proc_kill(pid)
+    let unregistered = proc_deregister(pid)
+    return killed && unregistered
+}
+
+// ── structured-concurrency pattern (interpreter today, codegen TODO) ──
+//
+// Hexa has `scope { }` and `defer { }` keywords parsed by the compiler.
+// Their runtime semantics are implemented in the stage0 interpreter
+// (HEXA_CACHE=0 or explicit interpreter mode) — `defer` is function-
+// scoped, LIFO, and runs on function return; `scope { }` is a nested
+// block that shares the enclosing function's defer stack.
+//
+// AOT codegen (default hexa run / hexa build path) does NOT yet emit
+// cleanup code for DeferStmt / ScopeStmt — it errors with "unhandled
+// stmt kind: DeferStmt". Tracked as Phase 3 codegen follow-up of the
+// 2026-04-25 Plan B spawn-safety initiative.
+//
+// Recommended pattern (interpreter-mode today):
+//
+//   fn run_workload() {
+//       let pid = proc_spawn_supervised("long_cmd", 300, "why this exists")
+//       defer { proc_reap(pid) }
+//       // ... do work while the spawned process runs ...
+//   } // defer fires → pid SIGTERMed + .resource entry removed
+//
+// Codegen-mode fallback (until Phase 3 codegen lands):
+//
+//   let pid = proc_spawn_supervised("long_cmd", 300, "why")
+//   do_work_using(pid)
+//   proc_reap(pid)
+//
+// Even without defer, the Phase 1 reaper (`tool/resource_reaper.hexa`)
+// running on a cron / launchd timer is the backstop — lease-TTL
+// expiration SIGTERMs any entry whose owner forgot to reap.
