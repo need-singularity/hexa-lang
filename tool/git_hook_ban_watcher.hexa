@@ -8,15 +8,34 @@
 // Also scans for project-level hook dirs (.githooks, .husky, .git-hooks)
 // and treats their presence as a block-level violation.
 //
+// OS-LEVEL ENFORCEMENT (2026-04-25 user mandate "git hooks 모두 폐기, 작성 금지처리 os-level"):
+//   On every pass, after sweeping any violation files, this tool applies
+//   `chflags uchg` to every `.git/hooks/` directory it finds. The kernel
+//   VFS layer then refuses `creat`/`open(O_CREAT)`/`rename` into the dir
+//   with EPERM — `touch .git/hooks/pre-commit` fails before any hexa /
+//   Claude / settings.json hook runs. Sweep-then-relock is idempotent.
+//
+// AI-NATIVE ERROR (raw#66): on violation, appends a JSONL trailer to
+//   /tmp/hexa_error_ainative/raw13-<yyyy-mm-dd>.jsonl
+//   schema: {ts, rule:"raw#13", action, actual, expected, reason, fix:[]}
+//
 // usage:
 //   hexa tool/git_hook_ban_watcher.hexa [<root>]            — warn mode
-//   hexa tool/git_hook_ban_watcher.hexa --sweep [<root>]    — delete
+//   hexa tool/git_hook_ban_watcher.hexa --sweep [<root>]    — delete + lock
 //   hexa tool/git_hook_ban_watcher.hexa --strict [<root>]   — exit 1 on any match
 //
 // Output: AI-native JSON on stdout (schema: hexa.git_hook_ban.v1).
 
 fn _default_root() -> string {
     return to_string(exec("pwd")).trim()
+}
+
+fn _iso_now() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _today_utc() -> string {
+    return to_string(exec("date -u +%Y-%m-%d")).trim()
 }
 
 fn _scan_git_hook_files(root: string) -> array {
@@ -48,11 +67,15 @@ fn _scan_project_hook_dirs(root: string) -> array {
 }
 
 fn _sweep_files(hits: array) -> int {
+    // Files inside a chflags-uchg'd parent dir cannot be unlinked even with
+    // per-file `chflags nouchg`. We unlock the parent dir, rm the file, then
+    // the post-sweep _lock_all_git_hooks_dirs re-applies the lock.
     let mut removed = 0
     let mut i = 0
     while i < len(hits) {
         let p = hits[i]
-        let cmd = "chflags nouchg '" + p + "' 2>/dev/null; rm -f '" + p + "' 2>/dev/null && echo ok || echo fail"
+        let parent = to_string(exec("dirname '" + p + "' 2>/dev/null")).trim()
+        let cmd = "chflags nouchg '" + parent + "' 2>/dev/null; chflags nouchg '" + p + "' 2>/dev/null; rm -f '" + p + "' 2>/dev/null && echo ok || echo fail"
         let r = to_string(exec(cmd)).trim()
         if r == "ok" { removed = removed + 1 }
         i = i + 1
@@ -73,13 +96,83 @@ fn _sweep_dirs(hits: array) -> int {
     return removed
 }
 
+// raw:os-lock — chflags uchg on every .git/hooks directory under root so
+// `touch`/`cp`/`mv` of new hook files into them yields EPERM at the kernel
+// VFS layer (no Claude / hexa-runtime in the loop). .sample files inside
+// the dir are unaffected. Idempotent — re-applying is a no-op.
+fn _lock_all_git_hooks_dirs(root: string) -> array {
+    // Returns [total, locked] — caller decides what to log.
+    let cmd = "find " + root + " -path '*/.git/hooks' -type d -print 2>/dev/null"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut locked = 0
+    let mut total = 0
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        total = total + 1
+        let r = to_string(exec("chflags uchg '" + t + "' 2>/dev/null && echo ok || echo fail")).trim()
+        if r == "ok" { locked = locked + 1 }
+    }
+    return [total, locked]
+}
+
 fn _esc(s: string) -> string {
     let mut r = s.replace("\\", "\\\\")
     r = r.replace("\"", "\\\"")
     return r
 }
 
-fn _render(hook_files: array, hook_dirs: array, mode: string, root: string, removed_f: int, removed_d: int) -> string {
+fn _join_quoted(arr: array) -> string {
+    let mut s = ""
+    let mut i = 0
+    while i < len(arr) {
+        if i > 0 { s = s + "," }
+        s = s + "\"" + _esc(to_string(arr[i])) + "\""
+        i = i + 1
+    }
+    return s
+}
+
+// raw#66 ai-native error trailer — append a JSONL line to
+// /tmp/hexa_error_ainative/raw13-<yyyy-mm-dd>.jsonl when violations found.
+// Format mirrors raw81_default_model_lock.hexa for consistency with other
+// raw#66 producers (sandbox_deny_enrich, raw81, etc.).
+fn _emit_raw66_trailer(hook_files: array, hook_dirs: array, mode: string, root: string, removed_f: int, removed_d: int) {
+    let dir = "/tmp/hexa_error_ainative"
+    let _mk = exec("mkdir -p '" + dir + "'")
+    let day = _today_utc()
+    let path = dir + "/raw13-" + day + ".jsonl"
+
+    let mut actual = "[" + _join_quoted(hook_files)
+    if len(hook_files) > 0 && len(hook_dirs) > 0 { actual = actual + "," }
+    actual = actual + _join_quoted(hook_dirs) + "]"
+
+    let fixes = [
+        "hexa run /Users/ghost/core/hexa-lang/tool/git_hook_ban_watcher.hexa --sweep /Users/ghost/core",
+        "chflags uchg <repo>/.git/hooks  # OS-level creation block",
+        "remove any .githooks/.husky/.git-hooks dir at the project root",
+        "route validation through tool/*.hexa invoked from CI or manual run, not via .git/hooks/*"
+    ]
+
+    let payload = "{\"ts\":\"" + _iso_now() + "\""
+                + ",\"rule\":\"raw#13\""
+                + ",\"rule_slug\":\"ai-tool-ban\""
+                + ",\"subset\":\"git-hook\""
+                + ",\"action\":\"" + mode + "\""
+                + ",\"root\":\"" + _esc(root) + "\""
+                + ",\"actual\":" + actual
+                + ",\"expected\":\"empty .git/hooks/* (only .sample files), no .githooks/.husky/.git-hooks dirs\""
+                + ",\"removed_files\":" + to_string(removed_f)
+                + ",\"removed_dirs\":" + to_string(removed_d)
+                + ",\"reason\":\"git-hook-ban: hooks bypass raw-family governance, run outside SSOT (.raw + .own), and are not visible to abstraction-ladder telemetry\""
+                + ",\"fix\":[" + _join_quoted(fixes) + "]"
+                + ",\"enforce_layer\":\"os-level (chflags uchg .git/hooks/) + launchd watcher (this tool)\""
+                + "}\n"
+    let _r = exec("printf '%s' " + "'" + payload.replace("'", "'\\''") + "'" + " >> '" + path + "'")
+}
+
+fn _render(hook_files: array, hook_dirs: array, mode: string, root: string, removed_f: int, removed_d: int, locked_total: int, locked_ok: int) -> string {
     let total = len(hook_files) + len(hook_dirs)
     let mut s = "{\"schema\":\"hexa.git_hook_ban.v1\""
     s = s + ",\"tool\":\"tool/git_hook_ban_watcher.hexa\""
@@ -91,14 +184,15 @@ fn _render(hook_files: array, hook_dirs: array, mode: string, root: string, remo
     s = s + ",\"violation_count\":" + to_string(total)
     s = s + ",\"removed_files\":" + to_string(removed_f)
     s = s + ",\"removed_dirs\":" + to_string(removed_d)
+    s = s + ",\"locked_dirs\":{\"total\":" + to_string(locked_total) + ",\"locked\":" + to_string(locked_ok) + "}"
     if total > 0 {
         s = s + ",\"severity\":\"block\""
         s = s + ",\"error\":{"
         s = s + "\"code\":\"GIT_HOOK_OR_AI_TOOL_CONFIG_DETECTED\""
-        s = s + ",\"message\":\"Git hooks and AI-tool hook dirs are banned. SSOT = .raw + .own only. Pre-commit scripts, husky, githooks, and .husky-style wrappers are bypassable and live outside the raw-family governance surface.\""
-        s = s + ",\"canonical_enforcement\":\"raw:os-lock chflags uchg + launchd 60s watcher (this tool)\""
-        s = s + ",\"how_to_avoid\":\"do not install pre-commit, husky, or githooks; run validation through tool/*.hexa invoked manually or from CI\""
-        s = s + ",\"auto_sweep_cmd\":\"hexa tool/git_hook_ban_watcher.hexa --sweep\""
+        s = s + ",\"reason\":\"git-hook-ban: hooks bypass raw-family governance and live outside SSOT enforcement (raw#13)\""
+        s = s + ",\"fix\":[\"hexa tool/git_hook_ban_watcher.hexa --sweep\",\"chflags uchg <repo>/.git/hooks\",\"remove any .githooks/.husky/.git-hooks at project root\"]"
+        s = s + ",\"canonical_enforcement\":\"raw:os-lock chflags uchg .git/hooks/ + launchd watcher (this tool)\""
+        s = s + ",\"trailer_jsonl\":\"/tmp/hexa_error_ainative/raw13-" + _today_utc() + ".jsonl\""
         s = s + "}"
     } else {
         s = s + ",\"severity\":\"pass\""
@@ -154,7 +248,23 @@ fn main() -> int {
         rd = _sweep_dirs(hook_dirs)
     }
 
-    println(_render(hook_files, hook_dirs, mode, root, rf, rd))
+    // OS-level enforcement: lock .git/hooks dirs every pass (idempotent).
+    // We do this for sweep AND warn modes — strict mode skips the side-effect
+    // since strict is a CI-style read-only check.
+    let mut lock_total = 0
+    let mut lock_ok = 0
+    if mode != "strict" {
+        let r = _lock_all_git_hooks_dirs(root)
+        lock_total = r[0]
+        lock_ok = r[1]
+    }
+
+    println(_render(hook_files, hook_dirs, mode, root, rf, rd, lock_total, lock_ok))
+
+    // raw#66 ai-native trailer when violations found.
+    if (len(hook_files) + len(hook_dirs)) > 0 {
+        _emit_raw66_trailer(hook_files, hook_dirs, mode, root, rf, rd)
+    }
 
     if mode == "strict" {
         if (len(hook_files) + len(hook_dirs)) > 0 { return 1 }
