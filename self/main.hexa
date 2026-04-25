@@ -306,47 +306,142 @@ fn cmd_nexus_proxy(subcmd, extra_args) {
 //   - find -mindepth 1 -maxdepth 1 로 최상위 슬롯 디렉토리만 열거(파일 제외).
 //   - I1 pass-by-value: 리스트를 직접 변이하지 않고 split 한 번 + 인덱스 순회.
 //   - POSIX 호환: macOS BSD find / GNU find 모두 -mtime +N 지원.
-fn cmd_gc(dry_run, days_str) {
+//
+// L7 omega-cycle (2026-04-25):
+//   - touch on access (cache_touch_slot) protects warm entries.
+//   - probabilistic trigger via maybe_aot_gc (1% per cmd_run invocation).
+//   - audit ledger: state/aot_cache_gc.jsonl per raw 77 cross-repo schema.
+//   - quiet mode suppresses per-slot stdout (used by prob trigger).
+fn cmd_gc_impl(dry_run, days_str, quiet) {
     let root = cache_root()
     let exists = exec("test -d '" + root + "' && printf yes || printf no")
     if exists != "yes" {
-        println("hexa gc: cache directory does not exist (" + root + ")")
-        println("  0 slots removed")
-        return
+        if !quiet {
+            println("hexa gc: cache directory does not exist (" + root + ")")
+            println("  0 slots removed")
+        }
+        return 0
     }
+    // Pre-sweep root size (single `du`) for freed_kb accounting via diff.
+    // Avoids per-slot fork (would cost ~10ms/entry × N candidates).
+    let pre_total_str = exec("du -sk '" + root + "' 2>/dev/null | awk '{print $1}' | tr -d '\\n'")
+    let pre_total = if len(pre_total_str) > 0 { to_int(pre_total_str) } else { 0 }
+    let t0 = mono_ns()
     // mindepth 1 / maxdepth 1: 최상위 슬롯 디렉토리만 대상.
     // -mtime +N: mtime 이 N일 이전(초과). BSD/GNU find 동일.
+    // L7 perf: dry-run uses find-only (no per-slot delete) to keep
+    // sweep ≤ 50ms; live mode batches rm -rf via xargs to amortize fork.
     let list_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d -mtime +" + days_str + " 2>/dev/null"
     let listing = exec(list_cmd)
     let candidates = listing.split("\n")
     let mut removed = 0
     let mut i = 0
     let tag = if dry_run { "  (dry-run)" } else { "" }
-    println("hexa gc: root=" + root + " threshold=" + days_str + "d" + tag)
-    while i < len(candidates) {
-        let slot = candidates[i]
-        if len(slot) > 0 {
-            if dry_run {
-                println("  [dry-run] would remove: " + slot)
-                removed = removed + 1
-            } else {
-                // rm -rf 는 슬롯 단위만 — root 자체는 건드리지 않음.
-                let rm = exec("rm -rf '" + slot + "' 2>&1")
-                if len(rm) > 0 {
-                    println("  ERR removing " + slot + ": " + rm)
-                } else {
-                    println("  removed: " + slot)
-                    removed = removed + 1
-                }
-            }
-        }
-        i = i + 1
+    if !quiet {
+        println("hexa gc: root=" + root + " threshold=" + days_str + "d" + tag)
     }
     if dry_run {
-        println("  " + removed + " slot(s) would be removed (dry-run)")
+        // Dry-run: just count + log. No fork per slot.
+        while i < len(candidates) {
+            let slot = candidates[i]
+            if len(slot) > 0 {
+                if !quiet { println("  [dry-run] would remove: " + slot) }
+                removed = removed + 1
+            }
+            i = i + 1
+        }
     } else {
-        println("  " + removed + " slot(s) removed")
+        // Live sweep: single batched `find -delete` is the fastest path
+        // (no spawn-per-slot). Equivalent to find ... -exec rm -rf but
+        // POSIX -delete is in-process to find. Re-runs `find` since
+        // listing was already consumed for counting; mtime is monotonic
+        // so the second pass sees the same set.
+        let del_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d -mtime +" + days_str + " -exec rm -rf {} + 2>/dev/null"
+        let _del = exec(del_cmd)
+        // Count of removed = original candidate count.
+        let mut ci = 0
+        while ci < len(candidates) {
+            if len(candidates[ci]) > 0 { removed = removed + 1 }
+            ci = ci + 1
+        }
+        if !quiet && removed > 0 {
+            println("  removed " + to_string(removed) + " slot(s) (batched)")
+        }
     }
+    let dt_ns = mono_ns() - t0
+    let sweep_ms = dt_ns / 1000000
+    // Kept-side accounting: post-sweep totals for audit ledger.
+    let kept_count_str = exec("find '" + root + "' -mindepth 1 -maxdepth 1 -type d 2>/dev/null | wc -l | tr -d ' \\n'")
+    let kept_total_str = exec("du -sk '" + root + "' 2>/dev/null | awk '{print $1}' | tr -d '\\n'")
+    let kept_count = if len(kept_count_str) > 0 { to_int(kept_count_str) } else { 0 }
+    let kept_total = if len(kept_total_str) > 0 { to_int(kept_total_str) } else { 0 }
+    let freed_kb = if dry_run { 0 } else {
+        if pre_total > kept_total { pre_total - kept_total } else { 0 }
+    }
+    if !quiet {
+        if dry_run {
+            println("  " + to_string(removed) + " slot(s) would be removed (dry-run)")
+        } else {
+            println("  " + to_string(removed) + " slot(s) removed")
+        }
+        println("  sweep_ms=" + to_string(sweep_ms) + " freed_kb=" + to_string(freed_kb) + " kept_count=" + to_string(kept_count) + " kept_total_kb=" + to_string(kept_total))
+    }
+    // Audit ledger — raw 77 cross-repo schema. JSONL into state/aot_cache_gc.jsonl
+    // colocated with the source tree (HEXA_LANG, falls back to argv0 install).
+    aot_gc_audit_log(removed, freed_kb, kept_count, kept_total, sweep_ms, dry_run, days_str)
+    return removed
+}
+
+fn cmd_gc(dry_run, days_str) {
+    let _ = cmd_gc_impl(dry_run, days_str, false)
+}
+
+// Touch on access: protects warm entries from eviction. Single utime
+// syscall via `touch`. Cheap (~1ms shell fork; future: native utimes
+// builtin). Called from try_cache_exec on hit before child exec.
+fn cache_touch_slot(slot) {
+    exec("touch '" + slot + "' 2>/dev/null")
+}
+
+// Probabilistic GC — ~1% per cmd_run invocation.
+// Caveat: macOS CLOCK_MONOTONIC rounds to 1000ns boundaries, so
+// `mono_ns() % 100 == 0` would fire 100% of the time. Divide by
+// 1000 first to get microsecond grain, then mod 100. Verified
+// uniform spread on darwin via runtime probe (2026-04-25).
+// Runs cmd_gc_impl in quiet mode so cmd_run output is not polluted.
+// HEXA_AOT_GC_DISABLE=1 escape hatch for hot-path benchmarks.
+fn maybe_aot_gc() {
+    if env_var("HEXA_AOT_GC_DISABLE") == "1" { return }
+    let r = (mono_ns() / 1000) % 100
+    if r != 0 { return }
+    let _ = cmd_gc_impl(false, "30", true)
+}
+
+// Audit ledger writer. Resolves install root (HEXA_LANG / argv0) and
+// appends a JSONL line per raw 77 schema. Failure is silent — audit
+// logging must never break the AOT path.
+fn aot_gc_audit_log(evicted, freed_kb, kept_count, kept_total_kb, sweep_ms, dry_run, days_str) {
+    let mut root = env_var("HEXA_LANG")
+    if len(root) == 0 {
+        let inst = install_dir_from_argv0()
+        // install_dir_from_argv0 returns the dir containing the exe;
+        // hexa.real lives in <repo>/build/, so strip a trailing /build.
+        if len(inst) > 6 && inst.substring(len(inst) - 6, len(inst)) == "/build" {
+            root = inst.substring(0, len(inst) - 6)
+        } else {
+            root = inst
+        }
+    }
+    if len(root) == 0 { return }
+    let dir = root + "/state"
+    exec("mkdir -p '" + dir + "' 2>/dev/null")
+    let path = dir + "/aot_cache_gc.jsonl"
+    let ts = exec("date -u +%Y-%m-%dT%H:%M:%SZ").trim()
+    let dr = if dry_run { "true" } else { "false" }
+    // No quotes inside JSON values that need escaping for /bin/sh single-quote.
+    // ts is ISO-8601 (alnum+hyphen+colon+T+Z), days_str is digits.
+    let line = "{\\\"schema\\\":\\\"hexa-lang/aot_cache_gc/1\\\",\\\"ts\\\":\\\"" + ts + "\\\",\\\"days_threshold\\\":" + days_str + ",\\\"dry_run\\\":" + dr + ",\\\"evicted_count\\\":" + to_string(evicted) + ",\\\"freed_kb\\\":" + to_string(freed_kb) + ",\\\"kept_count\\\":" + to_string(kept_count) + ",\\\"kept_total_kb\\\":" + to_string(kept_total_kb) + ",\\\"sweep_ms\\\":" + to_string(sweep_ms) + "}"
+    exec("printf \"%s\\n\" \"" + line + "\" >> '" + path + "' 2>/dev/null")
 }
 
 // ── bt 50 Phase C: cmd_regen_cc — 자동 재생성 파이프라인 ──────
@@ -1272,6 +1367,10 @@ fn try_cache_exec(file, extra_args) {
     let fp = src_fingerprint_deep(file)
     if len(fp) == 0 { return -1 }
     if !cache_hit(slot, fp) { return -1 }
+    // L7 omega-cycle (2026-04-25): touch on access — single utime to
+    // bump mtime so the GC sweep does NOT evict warm entries. Cheap
+    // (~1ms shell fork; bounded by single-stat in cache_hit above).
+    cache_touch_slot(slot)
     let cached = slot + "/exe"
     // Native runtime auto-duplicates argv[0] into slot 1 to mirror the
     // interpreter layout (self/runtime.c:3429-3436). Do NOT pass `file`
@@ -1430,6 +1529,10 @@ fn cmd_run(file, extra_args) {
     // Hit: exec cached native binary. Miss: sync build then retry.
     // Any failure → fall through to interp (never crash/regress).
     if should_cache(file) {
+        // L7 omega-cycle: probabilistic GC trigger (1%) before lookup.
+        // Amortizes the sweep cost across invocations. Quiet, never
+        // affects rc/output.
+        maybe_aot_gc()
         let rc = try_cache_exec(file, extra_args)
         if rc >= 0 {
             if rc != 0 { exit(rc) }
@@ -2122,8 +2225,10 @@ if len(av) < 3 {
         } else {
             cmd_cc()
         }
-    } else if sub == "gc" {
+    } else if sub == "gc" || sub == "aot-gc" || sub == "--aot-gc" {
         // bt 38: .hexa-cache GC — mtime > 30일 슬롯 정리
+        // L7 omega-cycle: `aot-gc` / `--aot-gc` aliases for explicit
+        // sweep (matches design spec). Same behavior as `gc`.
         //   hexa gc               실제 삭제 (기본 30일)
         //   hexa gc --dry-run     후보만 나열 (삭제 없음)
         //   hexa gc --days N      임계 일수 오버라이드 (테스트용)
