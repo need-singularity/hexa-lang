@@ -1161,6 +1161,76 @@ fn runtime_tmpname(prefix) {
     return dir + "/" + prefix + "." + to_string(mono_ns()) + ".tmp"
 }
 
+// ── Streaming popen helper for cmd_run / try_cache_exec ──────
+//
+// Background (2026-04-25): cmd_run used `let out = exec(cmd)` which
+// popen-reads the entire child stdout into one buffer before parent
+// emits anything, breaking sub-200ms event latency for tools like
+// hive/tool/subagent_dispatch.hexa that depend on incremental output.
+//
+// Replacement uses runtime.c's `hexa_exec_stream` (registered as the
+// `exec_stream(cmd, on_line)` builtin) which invokes the callback per
+// fgets() iteration. Each line retains its trailing `\n`, and the
+// runtime sets `setvbuf(stdout, _IOLBF)` so `print(line)` flushes
+// per-newline when stdout is piped. End-to-end: child writes a line →
+// kernel pipe → parent fgets → on_line callback → printf(%s) → flush.
+//
+// Sentinel handling: every cmd_run/try_cache_exec shell command ends
+// with `; echo __HEXA_RC=$?` so the FINAL line is always
+// `__HEXA_RC=N\n`. We keep a 1-line lookahead buffer:
+//   - on each callback: print the previously-buffered line, then
+//     buffer the new one (the buffered line cannot be the sentinel
+//     because we just received another line after it)
+//   - after exec_stream returns: inspect the residual buffered line,
+//     parse the sentinel rc if matched (and drop it from output), else
+//     flush as ordinary trailing output (no-newline edge case)
+//
+// Mutable state lives at module scope because hexa-v2 transpiler maps
+// `exec_stream(cmd, on_line)` with a top-level fn ident → C function
+// pointer. Closure capture across the popen-read boundary is not
+// available through this codepath, so the callback writes to module
+// globals which the post-call cleanup consumes.
+let mut __hexa_run_stream_buf = ""
+
+fn __hexa_run_stream_on_line(s) {
+    // Flush the previously-buffered line — it cannot be the sentinel
+    // since another line followed. Use print() (printf %s) to preserve
+    // the trailing \n that fgets keeps; this triggers _IOLBF flush when
+    // stdout is a pipe, achieving the streaming property.
+    if len(__hexa_run_stream_buf) > 0 {
+        print(__hexa_run_stream_buf)
+    }
+    __hexa_run_stream_buf = s
+}
+
+// run_stream_with_sentinel: popen-streams `cmd`, forwards stdout
+// line-by-line, extracts and returns the trailing __HEXA_RC=N exit
+// code. Used by cmd_run + try_cache_exec; both must invoke this with
+// identical post-conditions (stderr_tmp captured separately, sentinel
+// stripped from forwarded output, byte-for-byte streaming parity).
+fn run_stream_with_sentinel(cmd) {
+    __hexa_run_stream_buf = ""
+    let _ = exec_stream(cmd, __hexa_run_stream_on_line)
+    let last = __hexa_run_stream_buf
+    __hexa_run_stream_buf = ""
+    let mark = "__HEXA_RC="
+    let mut rc = 0
+    if last.starts_with(mark) {
+        // Strip trailing \n (fgets retained it) before to_int parse.
+        let mut s = last
+        let sl = len(s)
+        if sl > 0 && s.substring(sl - 1, sl) == "\n" {
+            s = s.substring(0, sl - 1)
+        }
+        rc = to_int(s.substring(len(mark), len(s)))
+    } else {
+        // No sentinel — surface the trailing partial as ordinary
+        // output (matches legacy exec()→split fallback behavior).
+        if len(last) > 0 { print(last) }
+    }
+    return rc
+}
+
 fn try_cache_exec(file, extra_args) {
     // Returns exit-code on cache hit (child fully executed + collected),
     // -1 on miss. Mirrors the shell-watch construction in cmd_run
@@ -1188,34 +1258,13 @@ fn try_cache_exec(file, extra_args) {
     let watch = " ) & C=$!; ( while kill -0 $C 2>/dev/null; do [ $PPID -eq 1 ] && { kill -9 $C 2>/dev/null; exit; }; kill -0 $PPID 2>/dev/null || { kill -9 $C 2>/dev/null; exit; }; sleep 0.05; done ) & wait $C"
     let stderr_tmp = runtime_tmpname("cache_err")
     let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + "; echo __HEXA_RC=$?"
-    let out = exec(cmd)
-    let lines = out.split("\n")
-    let n = len(lines)
-    let mut rc = 0
-    let mut print_out = out
-    if n >= 1 {
-        let mut last_idx = n - 1
-        if last_idx >= 0 && lines[last_idx] == "" { last_idx = last_idx - 1 }
-        if last_idx >= 0 {
-            let last = lines[last_idx]
-            let mark = "__HEXA_RC="
-            if last.starts_with(mark) {
-                rc = to_int(last.substring(len(mark), len(last)))
-                // Re-terminate each retained line with \n. The original
-                // "line\n__HEXA_RC=N\n" splits into ["line", "__HEXA_RC", ""];
-                // the prior rebuild "line1 + \n + line2" dropped the trailing
-                // \n → shell prompt glued to last output char.
-                let mut rebuilt = ""
-                let mut ri = 0
-                while ri < last_idx {
-                    rebuilt = rebuilt + lines[ri] + "\n"
-                    ri = ri + 1
-                }
-                print_out = rebuilt
-            }
-        }
-    }
-    print(print_out)
+    // 2026-04-25 streaming refactor: popen-read line-by-line via
+    // exec_stream() instead of exec()-then-split. Forwarded lines flush
+    // per-newline (runtime.c _IOLBF stdout) so children that emit
+    // progress incrementally surface to the grandparent without the
+    // legacy "all output appears at process exit" stall.
+    // AOT-cache parity: identical helper used in cmd_run below.
+    let rc = run_stream_with_sentinel(cmd)
     if file_exists(stderr_tmp) {
         let err_buf = read_file(stderr_tmp)
         if len(err_buf) > 0 { eprint(err_buf) }
@@ -1462,39 +1511,22 @@ fn cmd_run(file, extra_args) {
     //   stderr temp 파일은 exec 완료 후 eprint() 로 부모 stderr 로 재방출.
     let stderr_tmp = runtime_tmpname("run_err")
     let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + interp + "' '" + script + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + "; echo __HEXA_RC=$?"
-    let out = exec(cmd)
-    // 마지막 라인에서 __HEXA_RC=N 추출
-    let lines = out.split("\n")
-    let n = len(lines)
-    let mut rc = 0
-    let mut print_out = out
-    if n >= 1 {
-        let mut last_idx = n - 1
-        if last_idx >= 0 && lines[last_idx] == "" { last_idx = last_idx - 1 }
-        if last_idx >= 0 {
-            let last = lines[last_idx]
-            let mark = "__HEXA_RC="
-            if last.starts_with(mark) {
-                rc = to_int(last.substring(len(mark), len(last)))
-                // 출력에서 샌티넬 라인 제거. 기존 rebuild 는 마지막 "\n" 을
-                // drop 해서 `hello\n__HEXA_RC=0\n` → `hello` (개행 없이) 가
-                // 출력되어 쉘 프롬프트가 글자 끝에 붙어보였음. 각 라인을
-                // "\n" 으로 재종결해 원본 줄바꿈 유지.
-                let mut rebuilt = ""
-                let mut ri = 0
-                while ri < last_idx {
-                    rebuilt = rebuilt + lines[ri] + "\n"
-                    ri = ri + 1
-                }
-                print_out = rebuilt
-            }
-        }
-    }
-    print(print_out)
+    // 2026-04-25 streaming refactor:
+    //   was `let out = exec(cmd)` (popen → full-buffer → split → print),
+    //   which forced sub-200ms-event-latency tools (hive subagent
+    //   dispatcher, hooks emitting progress) to wait for child exit.
+    //   Replaced with run_stream_with_sentinel() — popen-read per
+    //   fgets() line via exec_stream(), forward immediately through
+    //   line-buffered stdout (runtime.c setvbuf _IOLBF), strip the
+    //   trailing __HEXA_RC=N sentinel, return the parsed rc.
+    //   Stderr-temp + parent-death watchdog + rc propagation contract
+    //   unchanged. AOT-cache parity: try_cache_exec uses the same
+    //   helper byte-for-byte.
+    let rc = run_stream_with_sentinel(cmd)
     // 2026-04-20: stderr 재방출 — temp 파일을 read_file 로 읽어 eprint().
-    // print(stdout) 이후 eprint(stderr) 순서는 popen 캡처 모델에서 이미
-    // 보장되지 않던 interleaving 을 크게 변경하지 않음(기존도 배치 출력).
-    // 순서를 보존할 수 없어도 "stderr=stderr / stdout=stdout" 라우팅은 복원.
+    // 순서를 완벽히 보존할 수는 없어도 "stderr=stderr / stdout=stdout"
+    // 라우팅은 복원. (스트리밍 전환 후에도 stderr 는 여전히 temp 파일에
+    // 누적되었다가 자식 종료 후 일괄 방출 — interleaving 강화는 별건.)
     if file_exists(stderr_tmp) {
         let err_buf = read_file(stderr_tmp)
         if len(err_buf) > 0 { eprint(err_buf) }
