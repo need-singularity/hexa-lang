@@ -1,0 +1,579 @@
+// tool/load_balancer.hexa — pick one host slug from a ranked candidate list
+//
+// @tool(slug="load_balancer", desc="pick one host from a ranked candidate list using a chosen LB strategy (weighted-rr|least-loaded|sticky)")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/load_balancer.hexa <strategy> <slug_csv> [<weight_csv>] [--state <path>] [--fingerprint <fp>])
+// @example(load_balancer.hexa weighted-rr ubu1,ubu2,hetzner 1.0,0.8,0.6 → emits chosen slug + updates ~/.hive/resource-lb-state)
+// @exit_codes(0=ok+slug on stdout, 1=empty candidate list, 2=parse error, 3=state write fail)
+//
+// PROBLEM
+//   Given a ranked candidate list (top-N from resource_scorer) plus tiny
+//   per-host live state (running-count + last-pick timestamp), pick ONE
+//   host slug. Caller dispatches the actual workload over the channel
+//   identified by `<channelPrefix>:<picked-slug>` on the integration hub.
+//
+// REDUCTION (per raw.problem_solving_triad)
+//   weighted-rr  ─ BRACKET. Ternary pruning over the candidate list:
+//                  cut off any candidate whose decayed running-count >=
+//                  its scoring weight (saturation pruning), then pick
+//                  the highest-weight survivor. Falls back to highest
+//                  weight overall when every candidate is saturated.
+//   least-loaded ─ ATOMIZE. Decompose to per-host (running-count) read,
+//                  pick min, tie-break by weight. No global search.
+//   sticky       ─ TABLE LOOKUP (not search). Fingerprint → last-pick
+//                  for matching fingerprint within STICKY_WINDOW_SECONDS;
+//                  fall through to weighted-rr otherwise.
+//
+// HOT PATH
+//   Called per dispatch. Stays in hexa-lang per raw.ai_native_algo: the
+//   strategy choice + decay arithmetic + state mutation are the
+//   optimization-hot pieces. TS dispatcher is a thin glue.
+//
+// STATE FORMAT (raw-format DSL — matches .resource family)
+//   ~/.hive/resource-lb-state, one entry per host slug:
+//     lb 0 live "running counts per host, decayed lazily on read"
+//       slug host-ubu1
+//       running-count 3.4              # decayed float
+//       last-pick-ts 1745568500
+//       last-fingerprint sha256-...    # optional
+//
+//   Format is canonical raw-format DSL (NOT JSON) per BASELINE — the
+//   .resource family invariant: persistent host state lives in raw DSL.
+//
+// LAYOUT INVARIANT
+//   running-count is a decayed float. Decay is computed lazily on READ
+//   (compute current value as: stored * 0.5^((now - last-pick-ts)/halflife))
+//   so writers never need to update unread entries.
+
+// ─── tunables (raw.ai_native_algo: optimization-friendly layout) ──────
+//
+// DECAY_HALFLIFE_SECONDS — running-count half-life. Lower = more aggressive
+//   round-robin (a 1-pick burst decays away in seconds). Higher = stickier
+//   load balance (sustained traffic stays pinned). 60 s is the
+//   compromise for hive-scale workloads (compaction + drill).
+//
+// STICKY_WINDOW_SECONDS — sticky strategy: how recent the previous pick
+//   for this fingerprint must be to count. Longer = more cache hits but
+//   weaker load distribution. 300 s matches the typical interactive
+//   slash-command sequence.
+//
+// LEAST_LOAD_PROBE_TIMEOUT_MS — placeholder for future live-capacity
+//   probe (channel ping). Today only governs the static read; preserved
+//   so the optimization path stays open without an API churn.
+
+let DECAY_HALFLIFE_SECONDS = 60
+let STICKY_WINDOW_SECONDS = 300
+let LEAST_LOAD_PROBE_TIMEOUT_MS = 200
+
+// ─── inlined raw_loader (seed-freeze: stage0 module loader unavailable) ───
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+fn _parse_lb_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "lb" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_state(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_lb_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _parse_num(s: string) -> float {
+    let t = s.trim()
+    if len(t) == 0 { return 0.0 }
+    let n = to_float(t)
+    return n
+}
+
+fn _parse_int(s: string) -> int {
+    let t = s.trim()
+    if len(t) == 0 { return 0 }
+    return to_int(t)
+}
+
+fn _split_csv(s: string) -> array {
+    let mut out = []
+    if len(s) == 0 { return out }
+    let parts = split(s, ",")
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn _now_seconds() -> int {
+    let s = to_string(exec("date +%s")).trim()
+    return to_int(s)
+}
+
+fn _home() -> string {
+    let mut h = env("HOME")
+    if h == "" { h = to_string(exec("echo $HOME")).trim() }
+    return h
+}
+
+fn _state_path(explicit: string) -> string {
+    if len(explicit) > 0 { return explicit }
+    let envp = env("HIVE_LB_STATE_FILE")
+    if envp != "" { return envp }
+    return _home() + "/.hive/resource-lb-state"
+}
+
+// ─── decay ────────────────────────────────────────────────────────────
+//
+// running_count(now) = stored * 0.5^((now - last_pick_ts) / halflife)
+//
+// Implemented without pow() — repeated halving is enough for the
+// resolution we need (single-digit error after ~16 halvings, well under
+// the float precision floor for our floor-at-zero purposes).
+fn _decay(stored: float, last_ts: int, now: int) -> float {
+    if stored <= 0.0 { return 0.0 }
+    if last_ts <= 0 { return stored }
+    let dt = now - last_ts
+    if dt <= 0 { return stored }
+    let mut steps = dt / DECAY_HALFLIFE_SECONDS
+    if steps > 32 { return 0.0 }   // anything older than 32 halflives is effectively zero
+    let mut v = stored
+    let mut i = 0
+    while i < steps {
+        v = v * 0.5
+        i = i + 1
+    }
+    // Sub-halflife linear interpolation for the residual fraction.
+    let residual_dt = dt - steps * DECAY_HALFLIFE_SECONDS
+    if residual_dt > 0 {
+        let frac = to_float(residual_dt) / to_float(DECAY_HALFLIFE_SECONDS)
+        // 0.5^frac ≈ 1 - 0.5*frac for small frac (linear approx, conservative).
+        let mult = 1.0 - 0.5 * frac
+        v = v * mult
+    }
+    return v
+}
+
+// Look up state for a slug. Returns [running_count_float, last_ts_int,
+// fingerprint_str] or empty list if not present.
+fn _lookup(state: array, slug: string) -> array {
+    for r in state {
+        let keys = r[3]
+        let s = _keys_first(keys, "slug")
+        if s == slug {
+            let rc = _parse_num(_keys_first(keys, "running-count"))
+            let ts = _parse_int(_keys_first(keys, "last-pick-ts"))
+            let fp = _keys_first(keys, "last-fingerprint")
+            return [rc, ts, fp]
+        }
+    }
+    return []
+}
+
+// ─── strategies ───────────────────────────────────────────────────────
+
+// weighted-rr — bracket pruning over (running-count >= weight) saturation.
+// Returns the index in `slugs` of the picked candidate.
+fn _pick_weighted_rr(slugs: array, weights: array, decayed_counts: array) -> int {
+    // Bracket pruning: drop saturated candidates whose decayed count
+    // already exceeds their scoring weight. Pick highest weight among
+    // survivors. If everyone is saturated, fall back to the highest
+    // weight overall (the bracket has collapsed — pick the boundary).
+    let mut best_idx = -1
+    let mut best_score = -1.0
+    let mut i = 0
+    while i < len(slugs) {
+        let w = weights[i]
+        let rc = decayed_counts[i]
+        if rc < w {
+            // surviving candidate: score = weight - decayed-count (higher = more headroom)
+            let sc = w - rc
+            if sc > best_score {
+                best_score = sc
+                best_idx = i
+            }
+        }
+        i = i + 1
+    }
+    if best_idx >= 0 { return best_idx }
+    // Fallback: every candidate saturated. Pick highest weight (or first
+    // candidate if weights are tied — preserves ranked input order).
+    let mut max_w = -1.0
+    let mut max_idx = 0
+    let mut j = 0
+    while j < len(slugs) {
+        if weights[j] > max_w {
+            max_w = weights[j]
+            max_idx = j
+        }
+        j = j + 1
+    }
+    return max_idx
+}
+
+// least-loaded — atomize: per-host running-count compare. Tie-break by weight.
+fn _pick_least_loaded(slugs: array, weights: array, decayed_counts: array) -> int {
+    let mut best_idx = 0
+    let mut best_rc = decayed_counts[0]
+    let mut best_w = weights[0]
+    let mut i = 1
+    while i < len(slugs) {
+        let rc = decayed_counts[i]
+        let w = weights[i]
+        let take = if rc < best_rc {
+            true
+        } else if rc == best_rc && w > best_w {
+            true
+        } else {
+            false
+        }
+        if take {
+            best_idx = i
+            best_rc = rc
+            best_w = w
+        }
+        i = i + 1
+    }
+    return best_idx
+}
+
+// sticky — fingerprint table lookup. Returns -1 if no recent match.
+fn _pick_sticky(slugs: array, state: array, fingerprint: string, now: int) -> int {
+    if len(fingerprint) == 0 { return -1 }
+    let mut i = 0
+    while i < len(slugs) {
+        let s = slugs[i]
+        for r in state {
+            let keys = r[3]
+            let st_slug = _keys_first(keys, "slug")
+            if st_slug == s {
+                let st_fp = _keys_first(keys, "last-fingerprint")
+                let st_ts = _parse_int(_keys_first(keys, "last-pick-ts"))
+                if st_fp == fingerprint && (now - st_ts) <= STICKY_WINDOW_SECONDS {
+                    return i
+                }
+            }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── state write ──────────────────────────────────────────────────────
+//
+// Serialise the merged state map back to raw-format DSL. We re-emit ALL
+// known slugs (existing + the freshly-picked one), preserving fingerprint
+// when present.
+fn _f_to_s(f: float) -> string {
+    // Round to 4 decimals for stable on-disk representation.
+    let scaled = f * 10000.0
+    let rounded = to_int(scaled + 0.5)
+    let whole = rounded / 10000
+    let frac = rounded - whole * 10000
+    let mut frac_s = to_string(frac)
+    while len(frac_s) < 4 { frac_s = "0" + frac_s }
+    return to_string(whole) + "." + frac_s
+}
+
+fn _emit_state(merged_slugs: array, merged_counts: array, merged_ts: array, merged_fps: array) -> string {
+    let mut parts = []
+    parts.push("# ~/.hive/resource-lb-state — load balancer running state (raw-format DSL)")
+    parts.push("# Spec : docs/formats/resource.md (Load balancing section)")
+    parts.push("# Lint : hexa ~/core/hexa-lang/tool/lb_state_lint.hexa")
+    parts.push("#")
+    parts.push("# running-count is a decayed float (halflife=" + to_string(DECAY_HALFLIFE_SECONDS) + "s).")
+    parts.push("# last-pick-ts is unix epoch seconds.")
+    parts.push("")
+    let mut i = 0
+    while i < len(merged_slugs) {
+        let slug = merged_slugs[i]
+        let rc = merged_counts[i]
+        let ts = merged_ts[i]
+        let fp = merged_fps[i]
+        parts.push("lb " + to_string(i) + " live \"running count for " + slug + "\"")
+        parts.push("  slug " + slug)
+        parts.push("  running-count " + _f_to_s(rc))
+        parts.push("  last-pick-ts " + to_string(ts))
+        if len(fp) > 0 {
+            parts.push("  last-fingerprint " + fp)
+        }
+        parts.push("")
+        i = i + 1
+    }
+    return parts.join("\n")
+}
+
+fn _ensure_parent(path: string) {
+    let slash = path.last_index_of("/")
+    if slash <= 0 { return }
+    let parent = path.substring(0, slash)
+    let _ = exec("mkdir -p '" + parent + "'")
+}
+
+// ─── main ─────────────────────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut state_path_arg = ""
+let mut fingerprint_arg = ""
+let mut positional = []
+let mut k = 0
+while k < len(cli) {
+    let a = cli[k]
+    if a == "--state" {
+        if k + 1 < len(cli) { state_path_arg = cli[k + 1]; k = k + 1 }
+    } else if a == "--fingerprint" {
+        if k + 1 < len(cli) { fingerprint_arg = cli[k + 1]; k = k + 1 }
+    } else {
+        positional.push(a)
+    }
+    k = k + 1
+}
+
+if len(positional) < 2 {
+    eprintln("load_balancer: usage — <strategy> <slug_csv> [<weight_csv>] [--state <path>] [--fingerprint <fp>]")
+    eprintln("                try: load_balancer.hexa weighted-rr ubu1,ubu2,hetzner 1.0,0.8,0.6")
+    exit(2)
+}
+
+let strategy = positional[0]
+if strategy != "weighted-rr" && strategy != "least-loaded" && strategy != "sticky" {
+    eprintln("load_balancer: unknown strategy '" + strategy + "' — try: weighted-rr | least-loaded | sticky")
+    exit(2)
+}
+
+let slug_csv = positional[1]
+let slugs = _split_csv(slug_csv)
+if len(slugs) == 0 {
+    eprintln("load_balancer: empty candidate list — try: pass at least one slug, e.g. ubu1,ubu2,hetzner")
+    eprintln("                                              (upstream resource_scorer may have pruned all hosts)")
+    exit(1)
+}
+
+// Parse weights (default to 1.0 each if not provided).
+let mut weights = []
+if len(positional) >= 3 {
+    let w_toks = _split_csv(positional[2])
+    if len(w_toks) != len(slugs) {
+        eprintln("load_balancer: weight count " + to_string(len(w_toks)) +
+                 " mismatches slug count " + to_string(len(slugs)) +
+                 " — try: provide same number of comma-separated weights, or omit for default 1.0 each")
+        exit(2)
+    }
+    for w in w_toks {
+        weights.push(_parse_num(w))
+    }
+} else {
+    let mut wi = 0
+    while wi < len(slugs) {
+        weights.push(1.0)
+        wi = wi + 1
+    }
+}
+
+let state_path = _state_path(state_path_arg)
+let state = _load_state(state_path)
+let now = _now_seconds()
+
+// Compute decayed running-counts for every candidate.
+let mut decayed = []
+let mut existing_fp = []   // preserve per-candidate fingerprint (sticky write-through)
+let mut s_idx = 0
+while s_idx < len(slugs) {
+    let lookup = _lookup(state, slugs[s_idx])
+    if len(lookup) == 0 {
+        decayed.push(0.0)
+        existing_fp.push("")
+    } else {
+        let rc = _decay(lookup[0], lookup[1], now)
+        decayed.push(rc)
+        existing_fp.push(lookup[2])
+    }
+    s_idx = s_idx + 1
+}
+
+// Strategy dispatch.
+let mut picked = -1
+
+if strategy == "sticky" {
+    if len(fingerprint_arg) == 0 {
+        eprintln("load_balancer: sticky strategy requires --fingerprint <fp> — try: --fingerprint sha256-abc...")
+        exit(2)
+    }
+    picked = _pick_sticky(slugs, state, fingerprint_arg, now)
+    if picked < 0 {
+        // Sticky miss — fall through to weighted-rr.
+        picked = _pick_weighted_rr(slugs, weights, decayed)
+    }
+} else if strategy == "least-loaded" {
+    picked = _pick_least_loaded(slugs, weights, decayed)
+} else {
+    picked = _pick_weighted_rr(slugs, weights, decayed)
+}
+
+if picked < 0 || picked >= len(slugs) {
+    eprintln("load_balancer: strategy returned invalid index " + to_string(picked) +
+             " — try: file a bug + rerun with weighted-rr")
+    exit(2)
+}
+
+let picked_slug = slugs[picked]
+
+// ─── state update — increment + write ────────────────────────────────
+//
+// Build merged state map: every previously-known slug + every candidate
+// (so first-time candidates get a zero entry written). The picked slug
+// gets +1 to its decayed count and a fresh last-pick-ts.
+
+let mut merged_slugs = []
+let mut merged_counts = []
+let mut merged_ts = []
+let mut merged_fps = []
+
+// First, every slug already in state (preserve unrelated entries).
+for r in state {
+    let keys = r[3]
+    let s = _keys_first(keys, "slug")
+    if len(s) == 0 { continue }
+    // skip if also a candidate — we'll re-add from the candidate sweep
+    let mut is_candidate = false
+    for cs in slugs {
+        if cs == s { is_candidate = true; break }
+    }
+    if is_candidate { continue }
+    let stored_rc = _parse_num(_keys_first(keys, "running-count"))
+    let stored_ts = _parse_int(_keys_first(keys, "last-pick-ts"))
+    let stored_fp = _keys_first(keys, "last-fingerprint")
+    let cur = _decay(stored_rc, stored_ts, now)
+    merged_slugs.push(s)
+    merged_counts.push(cur)
+    merged_ts.push(stored_ts)
+    merged_fps.push(stored_fp)
+}
+
+// Then, every candidate slug (with the picked one bumped).
+let mut ci = 0
+while ci < len(slugs) {
+    let s = slugs[ci]
+    let rc = decayed[ci]
+    let prev_fp = existing_fp[ci]
+    if ci == picked {
+        merged_slugs.push(s)
+        merged_counts.push(rc + 1.0)
+        merged_ts.push(now)
+        let new_fp = if strategy == "sticky" { fingerprint_arg } else { prev_fp }
+        merged_fps.push(new_fp)
+    } else {
+        // Preserve last-pick-ts of non-picked candidates so their decay
+        // calculation stays accurate next time. If this is a brand-new
+        // candidate (rc == 0 and never seen), use 0 as the ts so the
+        // next decay step is a no-op.
+        let prev_ts = _lookup(state, s)
+        let kept_ts = if len(prev_ts) > 0 { prev_ts[1] } else { 0 }
+        merged_slugs.push(s)
+        merged_counts.push(rc)
+        merged_ts.push(kept_ts)
+        merged_fps.push(prev_fp)
+    }
+    ci = ci + 1
+}
+
+let serialised = _emit_state(merged_slugs, merged_counts, merged_ts, merged_fps)
+_ensure_parent(state_path)
+try {
+    write_file(state_path, serialised + "\n")
+} catch e {
+    eprintln("load_balancer: failed to write state to " + state_path +
+             " — try: ensure $HOME/.hive is writable, or set HIVE_LB_STATE_FILE to an alternate path")
+    exit(3)
+}
+
+println(picked_slug)
+exit(0)
