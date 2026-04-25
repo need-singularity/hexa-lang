@@ -181,7 +181,7 @@ HexaVal hexa_exec_argv_with_status(HexaVal argv_val) {
  * sha256 — FIPS 180-4 reference implementation
  *
  * Pure-C; independent of OpenSSL / CommonCrypto / libsodium so the
- * hexa_stage0 binary stays dependency-free across macOS/Linux.
+ * hexa_interp binary stays dependency-free across macOS/Linux.
  * ══════════════════════════════════════════════════════════════════ */
 
 typedef struct {

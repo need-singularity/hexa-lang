@@ -19,7 +19,7 @@
  * in self/std_net.hexa convert errnos back to structured errors.
  *
  * Historical note: listen/accept/close were originally inlined into
- * self/runtime.c (stage0 resurrection block, 2026-04-16). Extracted
+ * self/runtime.c (interp resurrection block, 2026-04-16). Extracted
  * here alongside connect/read/write so the net subsystem lives in
  * a single C file — analogous to tensor_kernels.c for the hot kernel
  * path.
@@ -46,7 +46,7 @@
  *   - dotted-quad (127.0.0.1), "localhost" → INADDR_LOOPBACK,
  *   - "0.0.0.0" or "*"                      → INADDR_ANY,
  *   - port range 1..65535.
- * DNS + IPv6 intentionally deferred (stage0 narrow surface). */
+ * DNS + IPv6 intentionally deferred (interp narrow surface). */
 static int _hexa_net_parse_addr(const char* addr, struct sockaddr_in* sa_out) {
     if (!addr || !*addr || !sa_out) return -EINVAL;
     const char* colon = strrchr(addr, ':');

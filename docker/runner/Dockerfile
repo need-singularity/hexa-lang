@@ -28,29 +28,57 @@ LABEL org.opencontainers.image.title="hexa-runner" \
       org.opencontainers.image.source="https://github.com/dancinlife/hexa-lang" \
       org.opencontainers.image.licenses="MIT"
 
-# Minimal apt layer: ca-certificates only (TLS for fetch tools).
+# Minimal apt layer:
+#   ca-certificates : TLS for fetch tools.
+#   perl            : provides /usr/bin/shasum — used by main.hexa AOT
+#                     cache + source fingerprinting.  Without it, every
+#                     `hexa run` prints `sh: shasum: not found` cascades.
+#   tini            : reaping-aware init for PID 1.  cmd_run() forks a
+#                     `( watcher ) &` subshell that uses [ $PPID -eq 1 ]
+#                     to detect orphaning; without proper init the
+#                     orphan-of-PID-1 detection fires prematurely and
+#                     SIGKILL's the workload (exit 137) before output
+#                     flushes.  See 2026-04-25 hexa-runner triage.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates \
+ && apt-get install -y --no-install-recommends ca-certificates perl tini \
  && rm -rf /var/lib/apt/lists/*
 
-# Stage both binaries into /tmp; the conditional move below picks
-# the right one based on TARGETARCH.  Buildx will only ever invoke
-# the COPY for the platform it is currently building, but we keep
-# both paths explicit for clarity / single-arch fallback.
-COPY build/hexa_linux_arm64  /tmp/hexa_linux_arm64
-COPY build/hexa_linux_x86_64 /tmp/hexa_linux_x86_64
+# Stage all four binaries (CLI dispatcher + interp interpreter, ×2 arches)
+# into /tmp; the conditional move below picks the right pair based on
+# TARGETARCH.  Buildx will only ever invoke the COPY for the platform it
+# is currently building, but we keep both paths explicit for clarity /
+# single-arch fallback.
+#
+# The interp ELF is installed at /usr/local/bin/build/hexa_interp — the
+# canonical post-rename target that resolve_interp() in self/main.hexa
+# searches for via argv[0]-derived install_dir + "/build/hexa_interp".
+# With /usr/local/bin/hexa as argv[0], the sibling build/ dir is the
+# canonical location.
+COPY build/hexa_linux_arm64           /tmp/hexa_linux_arm64
+COPY build/hexa_linux_x86_64          /tmp/hexa_linux_x86_64
+COPY build/hexa_interp_linux_arm64    /tmp/hexa_interp_linux_arm64
+COPY build/hexa_interp_linux_x86_64   /tmp/hexa_interp_linux_x86_64
 
 RUN set -eux; \
+    mkdir -p /usr/local/bin/build; \
     case "${TARGETARCH}" in \
-      arm64) install -m 0755 /tmp/hexa_linux_arm64  /usr/local/bin/hexa ;; \
-      amd64) install -m 0755 /tmp/hexa_linux_x86_64 /usr/local/bin/hexa ;; \
+      arm64) install -m 0755 /tmp/hexa_linux_arm64        /usr/local/bin/hexa; \
+             install -m 0755 /tmp/hexa_interp_linux_arm64 /usr/local/bin/build/hexa_interp ;; \
+      amd64) install -m 0755 /tmp/hexa_linux_x86_64        /usr/local/bin/hexa; \
+             install -m 0755 /tmp/hexa_interp_linux_x86_64 /usr/local/bin/build/hexa_interp ;; \
       *)     echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
     esac; \
-    rm -f /tmp/hexa_linux_arm64 /tmp/hexa_linux_x86_64; \
-    /usr/local/bin/hexa --version || true
+    rm -f /tmp/hexa_linux_arm64 /tmp/hexa_linux_x86_64 \
+          /tmp/hexa_interp_linux_arm64 /tmp/hexa_interp_linux_x86_64; \
+    /usr/local/bin/hexa --version || true; \
+    /usr/local/bin/build/hexa_interp --help >/dev/null 2>&1 || true
 
 # Default workdir for user-mounted .hexa source.
 WORKDIR /work
 
-ENTRYPOINT ["/usr/local/bin/hexa"]
+# Use tini as PID 1 so the dispatcher's watchdog subshells are reaped
+# correctly.  Without an init-aware PID 1 the `( watcher ) &` orphan
+# detection in cmd_run() fires and SIGKILL's the workload before its
+# output can flush — see the apt comment block above.
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hexa"]
 CMD ["help"]

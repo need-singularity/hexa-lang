@@ -1819,7 +1819,7 @@ HexaVal hexa_index_get(HexaVal container, HexaVal key) {
     // IndexGet to hexa_index_get(), so without this branch a `path[i]`
     // on a string (e.g. self/module_loader.hexa:ml_dirname) reached
     // hexa_array_get() and aborted with "array[N]: container is not
-    // an array (tag=3)". The stage0 interpreter has its own string-
+    // an array (tag=3)". The interp interpreter has its own string-
     // index path; this mirrors it for the AOT path.
     if (HX_IS_STR(container)) {
         return hexa_str_char_at(container, hexa_int(idx));
@@ -2068,7 +2068,7 @@ HexaVal hexa_valstruct_set_by_key(HexaVal v, const char* key, HexaVal val) {
 //
 // P2 scope (accepted partial): mark/rewind API + opt-in gate only. Hexa-level
 // wiring into env_push_scope/env_pop_scope is a follow-up (requires
-// hexa_full.hexa edits + stage0 rebuild, deferred per task description).
+// hexa_full.hexa edits + interp rebuild, deferred per task description).
 
 #define HEXA_ARENA_BLOCK_SIZE (4 * 1024 * 1024)   // 4MB default block
 
@@ -2211,7 +2211,7 @@ void hexa_arena_reset(void) {
 // reclaimed (array_store[K] = []) even though `l` and `z` still hold it —
 // consistent with a missed env_pop_scope decref path that operates on a
 // stale-tag HexaValStruct after arena rewind. Canary test: T33b-on in
-// tests/regression.hexa. Fix is blocked on the stage0 rebuild
+// tests/regression.hexa. Fix is blocked on the interp rebuild
 // regression (codegen_c2 FnDecl + forward-decl issue; see task tracker).
 // Keep default OFF until both the canary flips PASS and the module_loader
 // use-path smoke (see ml_resolve heapify discussion above) goes green.
@@ -2237,7 +2237,7 @@ static int hexa_val_arena_on(void) {
         const char* e = getenv("HEXA_VAL_ARENA");
         // S7-B: default ON (2026-04-16). Phase A wired codegen_c2
         // __hexa_fn_arena_enter/return; T33 corruption fixed; full 236-example
-        // + 16-case stage1 regression suite passed 0-regression under ARENA=1.
+        // + 16-case dispatch regression suite passed 0-regression under ARENA=1.
         // Opt-out: HEXA_VAL_ARENA=0.
         if (!e || !e[0]) {
             __hexa_val_arena_enabled = 1;
@@ -2801,6 +2801,69 @@ HexaVal hexa_exec(HexaVal cmd) {
     return hexa_str_own(result);
 }
 
+// hexa_exec_stream — like hexa_exec, but invokes `on_line(line)` for each
+// stdout line as it is read instead of buffering the entire output. Returns
+// the child's exit code (same convention as hexa_exec_with_status[1]: 0..255
+// for normal exit, 128+sig for signal, -1 for unknown).
+//
+// Rationale (2026-04-25): hexa_exec / hexa_exec_with_status both popen() the
+// command and only return after pclose(). For long-running build/test
+// commands that emit progress on stdout (npm test, cargo build, hexa-lang's
+// own dispatch self-compile) the agent layer sees zero output until the child
+// exits, which surfaces to the user as a multi-minute silent stall. Adding
+// streaming lets the calling hexa code emit progress in real time without
+// the runtime buffering multi-megabyte transcripts.
+//
+// Each line passed to the callback retains its trailing newline (as fgets
+// returns it), except the final partial line if the child exited mid-line.
+// Callback is invoked inline on the hexa runtime stack via hexa_call1 — the
+// caller's hexa function executes synchronously between fgets() iterations.
+HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line) {
+    if (!HX_IS_STR(cmd)) return hexa_int(127);
+    if (!HX_IS_FN(on_line) && !HX_IS_CLOSURE(on_line)) return hexa_int(127);
+    FILE* fp = popen(HX_STR(cmd), "r");
+    if (!fp) return hexa_int(127);
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), fp)) {
+        // Construct a fresh hexa string per line (the buffer is reused).
+        // hexa_str() copies, so this is safe across iterations.
+        hexa_call1(on_line, hexa_str(buf));
+    }
+    int rc = pclose(fp);
+    int exit_code;
+    if (WIFEXITED(rc))      exit_code = WEXITSTATUS(rc);
+    else if (WIFSIGNALED(rc)) exit_code = 128 + WTERMSIG(rc);
+    else                     exit_code = -1;
+    return hexa_int(exit_code);
+}
+
+// Forward decl + auto-wrap macro shim. The current hexa_v2 codegen emits
+// `hexa_exec_stream(cmd, ident)` where `ident` is a raw C function symbol
+// (e.g. `on_line`) rather than a HexaVal. To bridge that without rebuilding
+// hexa_v2, we redirect the user-visible call through a wrapping macro that
+// invokes hexa_exec_stream_impl with a freshly-constructed TAG_FN HexaVal.
+// After a dispatch self-rebuild activates the codegen_c2 lowering with proper
+// gen2_expr wrapping, this macro becomes a no-op (the second arg will
+// already be a HexaVal — _Generic could choose impl directly, but the
+// double-wrap path remains safe for HexaVal too via a passthrough).
+//
+// We keep both names: hexa_exec_stream (callable from hexa) and
+// hexa_exec_stream_impl (the actual C function). The macro picks based on
+// whether the second argument is a function pointer or a HexaVal.
+extern HexaVal hexa_exec_stream_impl(HexaVal cmd, HexaVal on_line);
+extern HexaVal hexa_fn_new(void* fp, int arity);
+static inline HexaVal __hexa_exec_stream_wrap_fp(HexaVal cmd, HexaVal (*fp)(HexaVal)) {
+    return hexa_exec_stream_impl(cmd, hexa_fn_new((void*)fp, 1));
+}
+static inline HexaVal __hexa_exec_stream_wrap_hv(HexaVal cmd, HexaVal cb) {
+    return hexa_exec_stream_impl(cmd, cb);
+}
+// _Generic dispatch — selects the function-pointer wrapper for raw symbols
+// or the HexaVal passthrough when the lowering path supplies a value.
+#define hexa_exec_stream(cmd, cb) _Generic((cb), \
+    HexaVal: __hexa_exec_stream_wrap_hv, \
+    default: __hexa_exec_stream_wrap_fp)((cmd), (cb))
+
 // hexa_exec_with_status: like hexa_exec but returns [stdout_str, exit_code].
 // 2026-04-17: needed because the interpreter's exec_with_status dispatch in
 // hexa_full.hexa silently always returns exit=0 (popen output without
@@ -2843,7 +2906,7 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
 
 // exec_replace — replace current process via execvp("/bin/sh", "-c", cmd).
 // Does not return on success. Used by `hexa lsp` to hand stdin/stdout fully
-// to the stage0 interpreter so bidirectional streaming (JSON-RPC) works
+// to the interp interpreter so bidirectional streaming (JSON-RPC) works
 // without popen buffering or the __HEXA_RC sentinel interleaving into the
 // response body. On failure, returns empty string and the caller falls
 // back to regular hexa_exec().
@@ -2943,7 +3006,7 @@ void hexa_throw(HexaVal err) {
 // branch rendered "<value>" — correct-ish but lossy for the common
 // string path (if true { println("inside") } inside a fn body).
 // Unwrap the inner tag here so the user-visible output matches the
-// intent even when Val-boxing sneaks through the stage0 boundary.
+// intent even when Val-boxing sneaks through the interp boundary.
 // See: handoff 2026-04-18 bug #6, feedback_val_corruption_class_2026_04_17.md
 void hexa_print_val(HexaVal v) {
     // One-hop TAG_VALSTRUCT unwrap. Not recursive — a VS wrapping a VS is
@@ -4122,7 +4185,7 @@ static void* hexa_ffi_dlopen(const char* lib_name) {
     if (h) return h;
     // ── C2 Step 3 (2026-04-16): macOS SIP strips DYLD_LIBRARY_PATH
     //    when crossing any system-signed binary (/bin/sh, etc). So
-    //    `./hexa run` → popen → sh -c → stage0 loses DYLD. Work around
+    //    `./hexa run` → popen → sh -c → interp loses DYLD. Work around
     //    by searching a few known repo-relative install dirs for the
     //    hexa-lang native build output before giving up. ──
     {
@@ -6850,7 +6913,7 @@ HexaVal hexa_base64_decode(HexaVal s) {
 static HexaVal _bt73_timestamp_w(void) { return hexa_timestamp(); }
 static HexaVal _bt73_base64_encode_w(HexaVal s) { return hexa_base64_encode(s); }
 static HexaVal _bt73_base64_decode_w(HexaVal s) { return hexa_base64_decode(s); }
-// stage0 bootstrap gap: hexa_v2 (already-baked transpiler) doesn't know
+// interp bootstrap gap: hexa_v2 (already-baked transpiler) doesn't know
 // about setenv / exec_capture, so the interpreter dispatch in hexa_full.hexa
 // resolves bare `setenv(...)` through hexa_call2 / `exec_capture(...)` via
 // hexa_call1. Shim these as TAG_FN globals so the linker finds them.
@@ -6886,7 +6949,7 @@ static void _hexa_init_fn_shims(void) {
     timestamp     = hexa_fn_new((void*)_bt73_timestamp_w,     0);
     base64_encode = hexa_fn_new((void*)_bt73_base64_encode_w, 1);
     base64_decode = hexa_fn_new((void*)_bt73_base64_decode_w, 1);
-    // stage0 exec/env primitives — bootstrap-gap bridge
+    // interp exec/env primitives — bootstrap-gap bridge
     hx_setenv       = hexa_fn_new((void*)_w_setenv,       2);
     hx_exec_capture = hexa_fn_new((void*)_w_exec_capture, 1);
     // hxa-004 ext: bare `push(arr, v)` emitted by legacy hexa_v2 as hexa_call2
@@ -6920,7 +6983,7 @@ static void _hexa_init_fn_shims(void) {
 #include "native/tensor_kernels.c"
 
 /* ═══════════════════════════════════════════════════════════════════
- * std::net — POSIX TCP socket builtins (stage0 resurrection, 2026-04-16)
+ * std::net — POSIX TCP socket builtins (interp resurrection, 2026-04-16)
  *
  * Ports the networking surface from the deleted Rust src/std_net.rs
  * (recovered from commit ef92fc6). 6 primitives; http_get / http_serve
