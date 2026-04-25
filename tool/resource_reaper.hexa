@@ -1,0 +1,286 @@
+// tool/resource_reaper.hexa — .resource kind=process lease-TTL enforcer
+//
+// @tool(slug="resource_reaper", desc="SIGTERM kind=process entries whose lease-ttl has expired")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/resource_reaper.hexa [--dry-run] [--path <file>] [--list])
+// @example(nightly reap: any `kind=process` entry with `lease-ttl > 0` whose `now - max(started, heartbeat) > lease-ttl` gets SIGTERM; dry-run prints the plan without killing)
+// @exit_codes(0=no action needed / successful reap, 1=at least one reap failed, 2=path / parse error)
+//
+// PROBLEM
+//   hexa spawn primitive registers every child process in .resource as
+//   `kind=process`. Some owners die without cleaning up — vitest worker
+//   pools, hung hexa stage compilers, interactive coding-agent sessions
+//   left on idle TTYs. Without a ground-truth reaper the registry drifts
+//   and orphans pile up (2026-04-25 mac near-death was the direct cause).
+//
+// REDUCTION (per raw.problem_solving_triad)
+//   ATOMIZE — every entry is independent. Read the file once, iterate,
+//   act per-entry. No cross-entry state. Failure of one reap does not
+//   block another. Final exit code is OR of per-entry failures.
+//
+// POLICY
+//   - `lease-ttl == 0` → indefinite, never reaped (standalone daemons)
+//   - `lease-ttl > 0` → reap when `now - max(started, heartbeat) > lease-ttl`
+//   - SIGTERM only (never SIGKILL here) — give owner a chance to flush.
+//     Operators escalate manually if SIGTERM ignored.
+//   - `pgid` present → `killpg(pgid, SIGTERM)` so the whole tree dies
+//     together. Absent → `kill(pid, SIGTERM)`.
+//   - NEVER rewrites .resource — operator removes stale entries after
+//     confirming death. Avoids races vs concurrent spawn registrations.
+//
+// DRY RUN
+//   --dry-run prints the action plan without sending any signals.
+//   Use before a wide reap to spot entries you didn't mean to kill.
+
+// ─── inlined raw_loader (seed-freeze: stage0 module loader unavailable) ───
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+fn _parse_resource_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "resource" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_resource(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_resource_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _parse_int_or(s: string, default: int) -> int {
+    let t = s.trim()
+    if len(t) == 0 { return default }
+    let n = to_int(t)
+    return n
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _resource_path(explicit: string) -> string {
+    if len(explicit) > 0 { return explicit }
+    return _pwd() + "/.resource"
+}
+
+fn _now_epoch() -> int {
+    return to_int(to_string(exec("date +%s")).trim())
+}
+
+fn _alive(pid: int) -> bool {
+    // POSIX: `kill -0 PID` returns 0 iff the pid exists and we may signal it.
+    let out = to_string(exec("kill -0 " + to_string(pid) + " 2>/dev/null && echo y || echo n")).trim()
+    return out == "y"
+}
+
+fn _signal(pid: int, pgid: int, dry: bool) -> array {
+    // Returns [ok_bool, description_string]. Uses killpg path when
+    // pgid > 0 so worker trees die together.
+    if pgid > 0 {
+        if dry {
+            return [true, "DRY killpg " + to_string(pgid) + " SIGTERM (pid=" + to_string(pid) + ")"]
+        }
+        let out = to_string(exec("kill -TERM -" + to_string(pgid) + " 2>&1 && echo OK || echo FAIL")).trim()
+        if out.ends_with("OK") {
+            return [true, "killpg " + to_string(pgid) + " SIGTERM ok"]
+        }
+        return [false, "killpg " + to_string(pgid) + " SIGTERM failed — " + out]
+    }
+    if dry {
+        return [true, "DRY kill " + to_string(pid) + " SIGTERM"]
+    }
+    let out = to_string(exec("kill -TERM " + to_string(pid) + " 2>&1 && echo OK || echo FAIL")).trim()
+    if out.ends_with("OK") {
+        return [true, "kill " + to_string(pid) + " SIGTERM ok"]
+    }
+    return [false, "kill " + to_string(pid) + " SIGTERM failed — " + out]
+}
+
+// ─── CLI ───────────────────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut dry = false
+let mut list_mode = false
+let mut path_arg = ""
+let mut i = 0
+while i < len(cli) {
+    let a = cli[i]
+    if a == "--dry-run" { dry = true }
+    else if a == "--list" { list_mode = true }
+    else if a == "--path" {
+        if i + 1 < len(cli) { path_arg = cli[i + 1]; i = i + 1 }
+    }
+    i = i + 1
+}
+
+let path = _resource_path(path_arg)
+let rules = _load_resource(path)
+
+let now = _now_epoch()
+let _dry_tag = if dry { " DRY" } else { "" }
+println("── resource_reaper ── " + path + " (now=" + to_string(now) + _dry_tag + ")")
+
+if len(rules) == 0 {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        eprintln("resource_reaper: file not found at " + path)
+        exit(2)
+    }
+    println("no entries — nothing to reap")
+    exit(0)
+}
+
+let mut actions = 0
+let mut failures = 0
+
+for r in rules {
+    let id = r[0]
+    let keys = r[3]
+    let kind = _keys_first(keys, "kind")
+    if kind != "process" { continue }
+
+    let tag = "[#" + id + " " + r[2] + "]"
+    let pid = _parse_int_or(_keys_first(keys, "pid"), 0)
+    let pgid = _parse_int_or(_keys_first(keys, "pgid"), 0)
+    let started = _parse_int_or(_keys_first(keys, "started"), 0)
+    let heartbeat = _parse_int_or(_keys_first(keys, "heartbeat"), 0)
+    let ttl = _parse_int_or(_keys_first(keys, "lease-ttl"), 0)
+
+    if pid <= 0 || started <= 0 {
+        eprintln(tag + " skipped — malformed pid/started (lint the file)")
+        continue
+    }
+
+    if ttl == 0 {
+        if list_mode {
+            println(tag + " pid=" + to_string(pid) + " lease=∞ — skip")
+        }
+        continue
+    }
+
+    let anchor = if heartbeat > started { heartbeat } else { started }
+    let age = now - anchor
+    let expired = age > ttl
+
+    if !expired {
+        if list_mode {
+            println(tag + " pid=" + to_string(pid) + " age=" + to_string(age) + "s ≤ ttl=" + to_string(ttl) + "s — skip")
+        }
+        continue
+    }
+
+    if !_alive(pid) {
+        println(tag + " pid=" + to_string(pid) + " already dead — skip (operator should remove entry)")
+        continue
+    }
+
+    let res = _signal(pid, pgid, dry)
+    actions = actions + 1
+    if res[0] {
+        println(tag + " age=" + to_string(age) + "s > ttl=" + to_string(ttl) + "s → " + res[1])
+    } else {
+        eprintln(tag + " age=" + to_string(age) + "s > ttl=" + to_string(ttl) + "s → " + res[1])
+        failures = failures + 1
+    }
+}
+
+println("── done: actions=" + to_string(actions) + " failures=" + to_string(failures))
+
+if failures > 0 { exit(1) }
+exit(0)
