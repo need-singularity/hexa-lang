@@ -15,8 +15,8 @@ Violations → `eprintln` + `exit(1)` (fail-closed).
 | Layer | File                              | Scope                 |
 | ----- | --------------------------------- | --------------------- |
 | L0    | `.git/hooks/pre-commit`           | VCS safety net (live) |
-| L1    | `self/core/law_io.hexa`         | runtime write gate    |
-| **L2** | `self/core/module_gate.hexa`   | **load-time gate**    |
+| L1    | `self/stdlib/law_io.hexa`         | runtime write gate    |
+| **L2** | `self/stdlib/module_gate.hexa`   | **load-time gate**    |
 
 L2 calls into L1's `law_check(path, content)` on the *source bytes* the
 compiler is about to consume — blocking forbidden extensions, temp-suffix
@@ -73,9 +73,9 @@ Option A is recommended for Layer 2 v1.
 
 ## Dependency
 
-- `self/core/law_io.hexa::law_check(path, content) -> [bool, reason]`
+- `self/stdlib/law_io.hexa::law_check(path, content) -> [bool, reason]`
   (Layer 1, already live)
-- `self/core/module_gate.hexa::module_gate_check(path) -> bool`
+- `self/stdlib/module_gate.hexa::module_gate_check(path) -> bool`
   (this patch — reads file, delegates to `law_check`, eprintln+exit(1)
   on violation)
 

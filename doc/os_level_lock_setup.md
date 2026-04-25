@@ -2,7 +2,7 @@
 
 This 1-page guide covers the real, user-unbypassable defense for the raw:os-lock SSOT set (`.raw`, `.own`, `.ext`, `.roadmap`, `.loop` + the raw#12 grandfather list).
 
-The previous `chflags uchg` (user-immutable) is trivially bypassable — the same account that set it can clear it. Real protection needs three cooperating tiers. All error/ok output from these tools follows the ai-native format in `self/core/ai_err.hexa` so agents can parse results.
+The previous `chflags uchg` (user-immutable) is trivially bypassable — the same account that set it can clear it. Real protection needs three cooperating tiers. All error/ok output from these tools follows the ai-native format in `self/stdlib/ai_err.hexa` so agents can parse results.
 
 ## Threat model
 
@@ -89,7 +89,7 @@ Flags:
 - `--list-scope` — dump the allowed-file list (agent introspection).
 - `--dry-run` — print the plan; do not touch sudo or the editor.
 
-Every error path emits through `self/core/ai_err.hexa`. A representative failure:
+Every error path emits through `self/stdlib/ai_err.hexa`. A representative failure:
 
 ```
 err hx-edit/sudo-aborted
@@ -137,4 +137,4 @@ Run all three checks:
 ./hexa tool/hx_edit.hexa --list-scope
 ```
 
-Agents parse the stdout/stderr of each of these with the `self/core/ai_err` grammar. A `remedy:` block is always actionable; a missing `remedy:` in an `err` payload is itself a bug in the emitter.
+Agents parse the stdout/stderr of each of these with the `self/stdlib/ai_err` grammar. A `remedy:` block is always actionable; a missing `remedy:` in an `err` payload is itself a bug in the emitter.

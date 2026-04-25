@@ -76,6 +76,33 @@ RUN set -eux; \
 # Default workdir for user-mounted .hexa source.
 WORKDIR /work
 
+# ─────────────────────────────────────────────────────────────────
+# Optional: bind-mount nexus (or other sister repos) at runtime so
+# gate/entry.hexa, gate/prompt_scan.hexa, gate/cmd_gate.hexa can
+# resolve cross-repo dispatch (HARNESS = NEXUS_HOME + "/tool",
+# HEXA = NEXUS_HOME + "/bin/hexa").
+#
+#   docker run --rm \
+#     --platform linux/arm64 \
+#     --cpus=4 --memory=4g \
+#     -v "$HOME/core/nexus:/nexus:ro" \
+#     -e NEXUS_HOME=/nexus \
+#     -v /tmp/foo.hexa:/work/foo.hexa:ro \
+#     -w /work \
+#     hexa-runner:latest run /work/foo.hexa
+#
+# When /nexus is absent, gate/entry.hexa degrades gracefully:
+#   1) NEXUS_HOME env (explicit override; default /nexus when WS+HOME unset)
+#   2) WS + "/nexus"
+#   3) HOME + "/core/nexus"
+#   4) "/nexus"
+# Each dispatch site checks file_exists(NEXUS_HEXA) and silently
+# skips when the binary isn't present (no `sh: hexa: not found`
+# noise). The hive resolver (~/.hx/bin/hexa) should add the -v
+# flag and -e NEXUS_HOME to its `docker exec` invocation when
+# nexus-dependent commands (omega/drill/canon/etc) are issued.
+# ─────────────────────────────────────────────────────────────────
+
 # Use tini as PID 1 so the dispatcher's watchdog subshells are reaped
 # correctly.  Without an init-aware PID 1 the `( watcher ) &` orphan
 # detection in cmd_run() fires and SIGKILL's the workload before its

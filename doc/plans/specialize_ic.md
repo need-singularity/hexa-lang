@@ -152,7 +152,7 @@ Test contract (self/test_specialize_ic.hexa):
 | Role               | Path                                       | Role    |
 |--------------------|--------------------------------------------|---------|
 | Design (this)      | doc/plans/specialize_ic.md                 | plan    |
-| Data structs       | self/vm/ic.hexa                            | runtime |
+| Data structs       | self/vm_ic.hexa                            | runtime |
 | @specialize impl   | self/attrs/_own/specialize.hexa            | attr    |
 | @specialize meta   | self/attrs/specialize.hexa                 | attr    |
 | Registry           | self/attrs/_registry.hexa                  | SSOT    |

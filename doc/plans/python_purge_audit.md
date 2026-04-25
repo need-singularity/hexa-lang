@@ -25,7 +25,7 @@ Grep `python3?` on repo (대소문자 무시, .hexa/.json/.md):
 | 4 | `loop-rules.json:15` (operators) | **실 호출** — 동일 | **PURGE** (#3 과 같은 스크립트, 인자만 다름) |
 | 5 | `doc/emergence_patterns.json:168` | **실 호출** — `$N6_ARCH/tools/nexus` import (외부 리포) | **보류** — n6-architecture 툴 의존, hexa-lang 범위 밖 |
 | 6 | `pkg/packages/token-forge/forge.hexa` 주석 3곳 | 역사 주석 (`python3 의존 0` 기록) | **유지** |
-| 7 | `self/raws/hexa_only.hexa`, `self/core/law_io.hexa`, `self/core/module_gate.hexa` | **가드** — `.py` 확장자 금지 목록 | **유지** (언어 순도 강제) |
+| 7 | `self/raws/hexa_only.hexa`, `self/stdlib/law_io.hexa`, `self/stdlib/module_gate.hexa` | **가드** — `.py` 확장자 금지 목록 | **유지** (언어 순도 강제) |
 | 8 | `self/test_checksum_pure.hexa` 외 16개 테스트/주석 | Reference value 산출 기록 (`python3 -c "..."` 로 계산) | **유지** — 재현 가능성 주석 |
 | 9 | `docs/*.md`, `training/deploy/*.md` | 히스토리/설계 문서 | **유지** |
 | 10 | `doc/grammar.jsonl`, `tool/config/commands.json`, `doc/ml_pipeline.json` | 벤치 비교값/설명 | **유지** |

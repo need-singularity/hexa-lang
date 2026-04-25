@@ -371,8 +371,8 @@ CI 에는 `ubuntu-latest` 가 아니라 pinned image (`ubuntu-22.04` 등) 사용
 - `.raw` raw#17                   — self-host fixpoint convergence rule
 - `.roadmap#12 / #15 / #16 / #18 / #20` — fixpoint, promotions, cron, cross-arch
 - `tool/verify_fixpoint.hexa`     — v2→v3→v4 SHA256 verifier
-- `tool/p7_7_fixpoint_check.hexa` — raw#17 proof carrier
-- `tool/fixpoint_v3_v4.hexa`      — declarative fixpoint spec
+- `tool/fixpoint_check.hexa` — raw#17 proof carrier
+- `tool/fixpoint_compare.hexa`      — declarative fixpoint spec
 - `tool/native_build.hexa`        — C codegen (clang wrapper)
 - `tool/build_stage0.hexa`        — stage0 rebuild entry
 - `doc/runbook/raw_rebootstrap.md`— 의도적 fixpoint 변경 ceremony

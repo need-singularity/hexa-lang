@@ -1,7 +1,7 @@
 # raw#17 — self-host fixpoint convergence 추가 패치
 
 **Date**: 2026-04-20
-**Reason**: `.roadmap 9 active "P7 self-hosting fixpoint"` 은 목표만 선언. 도구 (`verify_fixpoint.hexa`, `fixpoint_v3_v4.hexa`, `p7_7_fixpoint_check.hexa`) 는 있지만 `.raw` 에 강제 rule 없어 실패해도 block 불가. 본 패치로 enforcer 연결.
+**Reason**: `.roadmap 9 active "P7 self-hosting fixpoint"` 은 목표만 선언. 도구 (`verify_fixpoint.hexa`, `fixpoint_compare.hexa`, `fixpoint_check.hexa`) 는 있지만 `.raw` 에 강제 rule 없어 실패해도 block 불가. 본 패치로 enforcer 연결.
 
 ## 적용 절차 (Mac 에서)
 
@@ -34,10 +34,10 @@
 ```
 raw 17 new "self-host fixpoint convergence"
   enforce tool/verify_fixpoint.hexa
-  decl tool/fixpoint_v3_v4.hexa
+  decl tool/fixpoint_compare.hexa
   scope v2→v3 byte-identical + v3→v4 stable
   why bootstrap 폐쇄 (Rust/C 의존 제거) 궁극 목표. fixpoint 없이 self-host 미완결. .roadmap#9 active 를 실제 enforce 로 묶는다.
-  proof tool/p7_7_fixpoint_check.hexa
+  proof tool/fixpoint_check.hexa
   follow-up status new → live 승격은 v4 달성 후 (ROI #153 close 후)
   follow-up ROI #152 (hexa_v2 circular rebuild regression) close 전까지는 --live 모드 불가. 기본 scaffold 보고만.
 ```
@@ -52,10 +52,10 @@ cat >> .raw <<'EOF'
 
 raw 17 new "self-host fixpoint convergence"
   enforce tool/verify_fixpoint.hexa
-  decl tool/fixpoint_v3_v4.hexa
+  decl tool/fixpoint_compare.hexa
   scope v2→v3 byte-identical + v3→v4 stable
   why bootstrap 폐쇄 (Rust/C 의존 제거) 궁극 목표. fixpoint 없이 self-host 미완결. .roadmap#9 active 를 실제 enforce 로 묶는다.
-  proof tool/p7_7_fixpoint_check.hexa
+  proof tool/fixpoint_check.hexa
   follow-up status new → live 승격은 v4 달성 후 (ROI #153 close 후)
   follow-up ROI #152 (hexa_v2 circular rebuild regression) close 전까지는 --live 모드 불가. 기본 scaffold 보고만.
 EOF

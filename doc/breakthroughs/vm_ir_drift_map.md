@@ -1,8 +1,8 @@
 # VM ↔ IR Drift Map — opcode unification blueprint
 
 **Status:** design doc (2026-04-20)
-**Scope:** compare `self/vm.hexa` bytecode opcodes (stack VM, P3 ossified 2026-04-10) against `self/ir/opcodes.hexa` (HEXA-IR J₂=24, n=6 spec) and sketch the reduction required for a future `self/vm_v2.hexa` to reach opcode parity.
-**Constraint:** `self/vm.hexa` is frozen. This document does NOT propose changes to it. `self/vm_v2.hexa` is a parallel, non-active design skeleton.
+**Scope:** compare `self/vm.hexa` bytecode opcodes (stack VM, P3 ossified 2026-04-10) against `self/ir/opcodes.hexa` (HEXA-IR J₂=24, n=6 spec) and sketch the reduction required for a future `self/vm_opcode_unified.hexa` to reach opcode parity.
+**Constraint:** `self/vm.hexa` is frozen. This document does NOT propose changes to it. `self/vm_opcode_unified.hexa` is a parallel, non-active design skeleton.
 
 ---
 
@@ -232,5 +232,5 @@ Target file `shared/config/roadmap/airgenome.json` does not exist in this worktr
 
 - `self/vm.hexa` — P3 ossified stack VM (2026-04-10, `self/ossified_manifest.hexa`).
 - `self/ir/opcodes.hexa` — HEXA-IR J₂=24 opcode enum (Rust port, 1:1 with `src/ir/opcode.rs`).
-- `self/vm_v2.hexa` — design skeleton (this milestone). Not active.
+- `self/vm_opcode_unified.hexa` — design skeleton (this milestone). Not active.
 - Memory: `project_bt_hexa.md`, `n6_hexa_ir_spec.md`, `n6_implementation_gaps.md`.

@@ -258,7 +258,7 @@
 
 ## 3. 1st-wave 10 leaf 심볼 (즉시 drop 가능)
 
-이 10개는 **ext=0 이고 내부 refcount 도 낮거나 trivial 포팅 대상**. Sketch 는 `self/purge/runtime_sketches.hexa`.
+이 10개는 **ext=0 이고 내부 refcount 도 낮거나 trivial 포팅 대상**. Sketch 는 `self/purge_runtime_sketches.hexa`.
 
 | # | 심볼 | runtime.c 위치 | ext/int | 현 역할 | .hexa 대체 전략 |
 |---:|---|---:|:---:|---|---|

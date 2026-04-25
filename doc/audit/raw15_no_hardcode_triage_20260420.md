@@ -43,7 +43,7 @@
 | tool/build_stage0.hexa:84,88 | /tmp/ | BAKE | log-path string referencing build artifact default under `/tmp/` |
 | tool/build_stage0.hexa:114 | /tmp/ | BAKE | env-override fallback (`HEXA_STAGE0_FLAT`); `/tmp/hexa_full_flat.hexa` default |
 | tool/build_stage0.hexa:143 | /tmp/ | BAKE | paired flat-flow scratch path |
-| tool/fixpoint_v3_v4.hexa:66,100 | /tmp/ | BAKE | `/tmp/hexa_v4_fixpoint` workdir — ephemeral fixpoint scratch |
+| tool/fixpoint_compare.hexa:66,100 | /tmp/ | BAKE | `/tmp/hexa_v4_fixpoint` workdir — ephemeral fixpoint scratch |
 | tool/install_os.hexa:212 | http:// | BAKE | Apple PList DTD URL `http://www.apple.com/DTDs/PropertyList-1.0.dtd` — Apple-defined external schema, cannot be moved to SSOT |
 | tool/pam_tid_check.hexa:30,112,133,141,144,145 | /etc/ | BAKE | macOS PAM config paths `/etc/pam.d/sudo`, `/etc/pam.d/sudo_local` — OS-defined, not a hexa SSOT concern |
 | tool/raw_all.hexa:162,167 | /tmp/ | BAKE | `/tmp/raw_all_tmp/` ephemeral orchestrator workdir |
