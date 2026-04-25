@@ -161,6 +161,39 @@ static int refuse_raw13(const char *path) {
     return 0;
 }
 
+// raw#6 — folder-name F4 (banned basenames). Hive-only initial deployment
+// 2026-04-25; other repos still pending raw_6.list expansion. Allowlist
+// mirrors self/sbpl/native.sb raw#6 block + on_allowlist short-circuits.
+static const char *RAW6_BANNED[] = {
+    "/utils/", "/helpers/", "/common/", "/lib/",
+    "/misc/", "/stuff/", "/base/",
+    NULL
+};
+static const char *RAW6_ALLOW[] = {
+    "/node_modules/",
+    "/packages/",
+    "/infrastructure/",
+    "/libs/",
+    "/archive/",
+    NULL
+};
+
+static int is_under_hive_repo(const char *path) {
+    if (!path) return 0;
+    return strstr(path, "/core/hive/") != NULL;
+}
+
+static int refuse_raw6(const char *path) {
+    if (!is_under_hive_repo(path)) return 0;
+    for (int i = 0; RAW6_ALLOW[i]; i++) {
+        if (strstr(path, RAW6_ALLOW[i])) return 0;
+    }
+    for (int i = 0; RAW6_BANNED[i]; i++) {
+        if (strstr(path, RAW6_BANNED[i])) return 1;
+    }
+    return 0;
+}
+
 // raw#20 — .own append-only: O_TRUNC on path ending in /.own = EPERM.
 static int refuse_raw20(const char *path, int flags) {
     if (!(flags & O_TRUNC)) return 0;
@@ -180,6 +213,7 @@ static int refuse(const char *path, int flags) {
     if (refuse_raw8(path)) return 1;
     if (refuse_raw13(path)) return 1;
     if (refuse_raw20(path, flags)) return 1;
+    if (refuse_raw6(path)) return 1;
     return 0;
 }
 
