@@ -2606,12 +2606,48 @@ HexaVal hexa_str_concat(HexaVal a, HexaVal b) {
     return hexa_str_own(result);
 }
 
+// L4 ω-cycle (lossless) — byte-index scan ASCII fast-path.
+//
+// Original: 1 hexa_str(buf) intern call per byte → FNV1a hash + linear probe
+// + (first-time) strdup. For an N-byte source the lexer's hot path
+// (`chars = source.chars()`) does N intern lookups even when all 256 single-
+// byte values are already cached. On 842KB ai_native_pass.hexa baseline that
+// is ~840k FNV1a calls + ~840k array_push calls inside parse phase.
+//
+// New: lazy-init a 256-entry HexaVal cache for single-byte strings, and have
+// hexa_str_chars do a direct table lookup per byte. Output is byte-equivalent
+// (same interned pointer that hexa_str(buf) would have returned anyway, since
+// 1-byte strings hash into the intern table the same way), so token stream is
+// preserved bitwise.
+//
+// Lossless axes:
+//   performance: hexa_str(buf) result identity is preserved (same intern
+//                pointer → same hexa_eq behavior).
+//   resource:    +256*sizeof(HexaVal) static = ~4KB BSS one-shot.
+//   speed:       O(1) table lookup vs hash + probe.
+static HexaVal _cached_byte_str[256];
+static int     _cached_byte_str_ready = 0;
+
+static void _hexa_init_byte_str_cache(void) {
+    if (_cached_byte_str_ready) return;
+    char buf[2];
+    buf[1] = '\0';
+    for (int i = 0; i < 256; i++) {
+        buf[0] = (char)(unsigned char)i;
+        // For NUL byte we still produce the canonical empty-string interned
+        // value so hexa_eq matches whatever hexa_str("") returns elsewhere.
+        _cached_byte_str[i] = hexa_str(buf);
+    }
+    _cached_byte_str_ready = 1;
+}
+
 HexaVal hexa_str_chars(HexaVal s) {
     HexaVal arr = hexa_array_new();
     if (!HX_IS_STR(s)) return arr;
-    for (int i = 0; HX_STR(s)[i]; i++) {
-        char buf[2] = {HX_STR(s)[i], 0};
-        arr = hexa_array_push(arr, hexa_str(buf));
+    if (!_cached_byte_str_ready) _hexa_init_byte_str_cache();
+    const unsigned char* p = (const unsigned char*)HX_STR(s);
+    for (; *p; p++) {
+        arr = hexa_array_push(arr, _cached_byte_str[*p]);
     }
     return arr;
 }
