@@ -1,0 +1,321 @@
+// tool/manifest_scan.hexa — extract @tool/@usage/@example/@exit_codes from tool/*.hexa
+//
+// @tool(slug="manifest_scan", desc="extract @tool annotations from tool/*.hexa, emit hive HEXA_TOOLS manifest JSON")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/manifest_scan.hexa [--write])
+// @example(generate ~/core/hexa-lang/tool/manifest.json so hive HEXA_TOOLS no longer needs hand-maintenance)
+// @exit_codes(0=PASS / manifest emitted, 1=FAIL (read error, write error, no annotated tools found))
+//
+// PURPOSE
+//   Replaces the hand-maintained HEXA_TOOLS list in
+//   packages/coding-agent/src/core/raw-rules.ts. Each tool/*.hexa script
+//   self-describes via @tool / @usage / (optional) @example / @exit_codes
+//   annotations placed near the top of the file. This scanner walks the
+//   tool/ directory, regex-extracts the annotations, and emits a JSON
+//   manifest the hive runtime reads.
+//
+// MODES
+//   default          — emit manifest JSON to stdout
+//   --write          — emit to /Users/ghost/core/hexa-lang/tool/manifest.json
+//
+// FALLBACK NOTE
+//   The hexa parser does not currently enforce these attrs at parse time;
+//   they are recognized as documentation markers (line-comment-prefixed)
+//   and parsed via regex below. First occurrence per script wins.
+//
+// SCHEMA
+//   { "tools": [
+//       { "slug": "...", "desc": "...", "usage": "...",
+//         "example": "...", "exit_codes": "..." },
+//       ...
+//   ] }
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+// Resolve the tool/ directory. Stage0 hexa interp does not expose the
+// invoked script path (args[1] resolves to .hexa-cache/<hash>/exe under
+// AOT). So we try, in order:
+//   1. $HEXA_LANG_ROOT env var override (for non-default checkouts)
+//   2. $PWD/tool — when invoked from the hexa-lang repo root
+//   3. /Users/ghost/core/hexa-lang/tool — canonical install (BASELINE
+//      no_hardcoded_refs: this fallback is the documented canonical path
+//      and also matches the existing hive HEXA_TOOLS hard-coded entries
+//      in raw-rules.ts; it is the SSOT location, not a magic constant).
+fn _tool_dir() -> string {
+    let mut env_root = ""
+    try { env_root = env_var("HEXA_LANG_ROOT") } catch e { env_root = "" }
+    if env_root != "" {
+        let cand = env_root + "/tool"
+        let ok = to_string(exec("test -d '" + cand + "' && echo y || echo n")).trim()
+        if ok == "y" { return cand }
+    }
+    let pwd = _pwd()
+    let pwd_cand = pwd + "/tool"
+    let pwd_ok = to_string(exec("test -d '" + pwd_cand + "' && echo y || echo n")).trim()
+    if pwd_ok == "y" {
+        // Confirm this is the hexa-lang repo (look for self/attrs/_registry.hexa).
+        let marker = pwd + "/self/attrs/_registry.hexa"
+        let marker_ok = to_string(exec("test -f '" + marker + "' && echo y || echo n")).trim()
+        if marker_ok == "y" { return pwd_cand }
+    }
+    return "/Users/ghost/core/hexa-lang/tool"
+}
+
+// list `tool/*.hexa` (top-level only — no recursion into tool/_init/ etc.)
+fn _list_tool_files(tool_dir: string) -> array {
+    let exists = to_string(exec("test -d '" + tool_dir + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        eprintln("manifest_scan: tool directory not found — " + tool_dir +
+                 " — try: run from /Users/ghost/core/hexa-lang or pass via absolute path")
+        return []
+    }
+    let cmd = "find '" + tool_dir + "' -maxdepth 1 -type f -name '*.hexa' 2>/dev/null | sort"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut files = []
+    for ln in lines {
+        let f = ln.trim()
+        if len(f) > 0 { files.push(f) }
+    }
+    return files
+}
+
+// JSON-escape a string (mirrors self/attrs/core.hexa _json_escape).
+fn _json_escape(s: string) -> string {
+    let mut parts = []
+    let chars = s.chars()
+    for ch in chars {
+        let c = to_string(ch)
+        if c == "\\" { parts.push("\\\\") }
+        else if c == "\"" { parts.push("\\\"") }
+        else if c == "\n" { parts.push("\\n") }
+        else if c == "\r" { parts.push("\\r") }
+        else if c == "\t" { parts.push("\\t") }
+        else { parts.push(c) }
+    }
+    return parts.join("")
+}
+
+// Strip leading `// ` comment marker from a line, if present.
+fn _strip_comment(line: string) -> string {
+    let t = line.trim_start()
+    if t.starts_with("// ") { return t.substring(3, len(t)).trim() }
+    if t.starts_with("//") { return t.substring(2, len(t)).trim() }
+    return t.trim()
+}
+
+// Parse `key="value"` from a paren-payload chunk like
+//   slug="doc_lint", desc="validate ..."
+// Returns "" if the key is absent.
+fn _parse_kv(payload: string, key: string) -> string {
+    let pat = key + "="
+    let i = payload.index_of(pat)
+    if i < 0 { return "" }
+    let after = payload.substring(i + len(pat), len(payload))
+    let trimmed = after.trim_start()
+    if len(trimmed) == 0 { return "" }
+    let first = trimmed.substring(0, 1)
+    if first == "\"" {
+        // quoted — read until next unescaped quote
+        let mut j = 1
+        let mut buf = ""
+        while j < len(trimmed) {
+            let ch = trimmed.substring(j, j + 1)
+            if ch == "\\" && j + 1 < len(trimmed) {
+                let nxt = trimmed.substring(j + 1, j + 2)
+                buf = buf + nxt
+                j = j + 2
+                continue
+            }
+            if ch == "\"" { return buf }
+            buf = buf + ch
+            j = j + 1
+        }
+        return buf
+    }
+    // unquoted — read until comma or end
+    let comma = trimmed.index_of(",")
+    if comma < 0 { return trimmed.trim() }
+    return trimmed.substring(0, comma).trim()
+}
+
+// Find `@<name>(...)` payload in a single line. Returns the inner text
+// (between matching parens, balanced) or "" if not found.
+fn _extract_attr_payload(line: string, name: string) -> string {
+    let marker = "@" + name + "("
+    let i = line.index_of(marker)
+    if i < 0 { return "" }
+    let start = i + len(marker)
+    // Walk forward to find balanced close paren.
+    let mut depth = 1
+    let mut j = start
+    while j < len(line) {
+        let ch = line.substring(j, j + 1)
+        if ch == "(" { depth = depth + 1 }
+        else if ch == ")" {
+            depth = depth - 1
+            if depth == 0 { return line.substring(start, j) }
+        }
+        j = j + 1
+    }
+    // unbalanced — surface readably (no_silent_errors baseline).
+    eprintln("manifest_scan: unbalanced parens in @" + name + " on line: " + line.trim())
+    return ""
+}
+
+// Scan a single hexa file's lines for @tool/@usage/@example/@exit_codes.
+// Returns [slug, desc, usage, example, exit_codes] or [] if @tool absent.
+// First occurrence wins (per spec).
+fn _scan_file(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        eprintln("manifest_scan: cannot read " + path + " — file missing")
+        return []
+    }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut slug = ""
+    let mut desc = ""
+    let mut usage = ""
+    let mut example = ""
+    let mut exitcodes = ""
+
+    // Only scan the first ~80 lines — annotations belong at the top.
+    let scan_limit = if len(lines) < 80 { len(lines) } else { 80 }
+    let mut i = 0
+    while i < scan_limit {
+        let raw = lines[i]
+        let line = _strip_comment(raw)
+
+        if slug == "" {
+            let payload = _extract_attr_payload(line, "tool")
+            if payload != "" {
+                slug = _parse_kv(payload, "slug")
+                desc = _parse_kv(payload, "desc")
+            }
+        }
+        if usage == "" {
+            let p = _extract_attr_payload(line, "usage")
+            if p != "" { usage = p.trim() }
+        }
+        if example == "" {
+            let p = _extract_attr_payload(line, "example")
+            if p != "" { example = p.trim() }
+        }
+        if exitcodes == "" {
+            // accept both `exit_codes` (canonical) and `exitcodes` (no-underscore variant)
+            let p1 = _extract_attr_payload(line, "exit_codes")
+            if p1 != "" { exitcodes = p1.trim() }
+            else {
+                let p2 = _extract_attr_payload(line, "exitcodes")
+                if p2 != "" { exitcodes = p2.trim() }
+            }
+        }
+        i = i + 1
+    }
+
+    if slug == "" { return [] }
+    return [slug, desc, usage, example, exitcodes]
+}
+
+fn _emit_json(entries: array) -> string {
+    if len(entries) == 0 { return "{\"tools\":[]}" }
+    let mut parts = []
+    parts.push("{\n  \"tools\": [")
+    let mut k = 0
+    while k < len(entries) {
+        let e = entries[k]
+        let mut row = "    {"
+        row = row + "\"slug\": \"" + _json_escape(e[0]) + "\""
+        row = row + ", \"desc\": \"" + _json_escape(e[1]) + "\""
+        row = row + ", \"usage\": \"" + _json_escape(e[2]) + "\""
+        row = row + ", \"example\": \"" + _json_escape(e[3]) + "\""
+        row = row + ", \"exit_codes\": \"" + _json_escape(e[4]) + "\""
+        row = row + "}"
+        if k < len(entries) - 1 { row = row + "," }
+        parts.push(row)
+        k = k + 1
+    }
+    parts.push("  ]\n}")
+    return parts.join("\n")
+}
+
+// ─── main ──────────────────────────────────────────────────────────
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut write_mode = false
+for a in cli {
+    if a == "--write" { write_mode = true }
+}
+
+let tool_dir = _tool_dir()
+let files = _list_tool_files(tool_dir)
+if len(files) == 0 {
+    eprintln("manifest_scan: no tool/*.hexa files found under " + tool_dir +
+             " — try: invoke as `hexa /Users/ghost/core/hexa-lang/tool/manifest_scan.hexa`")
+    exit(1)
+}
+
+let mut entries = []
+for f in files {
+    // Skip the scanner itself — it's a tool but the manifest is for governance
+    // tools, not the scanner. (Self-listing creates a recursive surface no
+    // consumer wants.)
+    let bn_idx = f.last_index_of("/")
+    let bn = if bn_idx >= 0 { f.substring(bn_idx + 1, len(f)) } else { f }
+    if bn == "manifest_scan.hexa" { continue }
+
+    let row = _scan_file(f)
+    if len(row) > 0 { entries.push(row) }
+}
+
+// FALLBACK: os_level_lock.hexa is uchg-locked at L0 and cannot be edited
+// without explicit user approval (per BASELINE — L0 lock/unlock gating).
+// Inject a synthesized entry so downstream hive HEXA_TOOLS retains the
+// canonical lock manager pointer until the file is unlocked + annotated.
+let mut has_lock_entry = false
+for e in entries {
+    if e[0] == "os_level_lock" { has_lock_entry = true }
+}
+if !has_lock_entry {
+    let lock_path = tool_dir + "/os_level_lock.hexa"
+    let lock_exists = to_string(exec("test -f '" + lock_path + "' && echo y || echo n")).trim()
+    if lock_exists == "y" {
+        entries.push([
+            "os_level_lock",
+            "L0 chflags uchg / chattr +i lock manager (canonical lock/unlock path per BASELINE)",
+            "hexa " + lock_path + " lock|unlock|verify",
+            "",
+            "0=PASS / lock state as expected, 1=verify failed (any SSOT < L1)"
+        ])
+    }
+}
+
+if len(entries) == 0 {
+    eprintln("manifest_scan: scanned " + to_string(len(files)) +
+             " files but found no @tool annotations — try: add `@tool(slug=..., desc=...)` near the top of a tool/*.hexa")
+    exit(1)
+}
+
+let json = _emit_json(entries)
+
+if write_mode {
+    let out_path = tool_dir + "/manifest.json"
+    write_file(out_path, json + "\n")
+    println("manifest_scan: wrote " + to_string(len(entries)) + " entries → " + out_path)
+    exit(0)
+}
+
+println(json)
+exit(0)
