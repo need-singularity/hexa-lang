@@ -1170,6 +1170,25 @@ fn gen2_fn_decl(node) {
         _gen2_arena_wrap = 1
         chunks.push("    __hexa_fn_arena_enter();\n")
     }
+    // Plan B Phase 3: defer/scope/spawn codegen entry.
+    //   Save previous fn's state (enables nested FnDecl emission to
+    //   recurse without clobbering this fn's defer list), reset to
+    //   empty, then pre-scan the body to declare __defer_N_active +
+    //   __ret_val at the top. No defers in body → zero emission, C
+    //   stays identical to the pre-Phase-3 codegen.
+    let _prev_defer_bodies = _gen2_defer_bodies
+    let _prev_defer_flag_count = _gen2_defer_flag_count
+    _gen2_defer_bodies = []
+    _gen2_defer_flag_count = 0
+    let _defer_total = _gen2_count_defers(node.body)
+    if _defer_total > 0 {
+        chunks.push("    HexaVal __ret_val = hexa_void();\n")
+        let mut _df = 0
+        while _df < _defer_total {
+            chunks.push("    int __defer_" + to_string(_df) + "_active = 0;\n")
+            _df = _df + 1
+        }
+    }
     // bt 74: implicit tail-return. Previously emitted every fn body stmt
     // verbatim then appended `return hexa_void();`. That silently dropped
     // value-returning functions written in the idiomatic trailing-expr
@@ -1239,7 +1258,14 @@ fn gen2_fn_decl(node) {
                         }
                     }
                     if !_skip {
-                        if has_no_arena {
+                        // Plan B Phase 3: if this fn has defers, route
+                        // the implicit tail-return through __fn_exit
+                        // so the drain runs before the arena-wrapped
+                        // return. Same shape as the explicit ReturnStmt
+                        // branch in gen2_stmt.
+                        if _gen2_defer_flag_count > 0 {
+                            chunks.push("    __ret_val = " + gen2_expr(stmt.left) + "; goto __fn_exit;\n")
+                        } else if has_no_arena {
                             chunks.push("    return " + gen2_expr(stmt.left) + ";\n")
                         } else {
                             chunks.push("    return __hexa_fn_arena_return(" + gen2_expr(stmt.left) + ");\n")
@@ -1258,11 +1284,48 @@ fn gen2_fn_decl(node) {
         }
         bi = bi + 1
     }
-    if has_no_arena {
+    // Plan B Phase 3: emit __fn_exit drain before the safety footer
+    // when this fn registered any defers. The drain runs each defer
+    // body in reverse-registration order (LIFO — matches Go + the
+    // stage0 interpreter) under its activation flag, then flows into
+    // the arena-wrapped __ret_val return.
+    if _gen2_defer_flag_count > 0 {
+        // Fall-through path (body ran to the closing brace without
+        // hitting a return or a tail-return) needs to reach __fn_exit
+        // too — force the jump. Also prevents "label declared but not
+        // referenced" warnings when the only references are explicit
+        // returns in conditional branches.
+        chunks.push("    goto __fn_exit;\n")
+        chunks.push("__fn_exit:;\n")
+        let mut _dd = len(_gen2_defer_bodies) - 1
+        while _dd >= 0 {
+            let entry = _gen2_defer_bodies[_dd]
+            let flag_id = entry[0]
+            let body = entry[1]
+            chunks.push("    if (__defer_" + to_string(flag_id) + "_active) {\n")
+            if type_of(body) == "array" {
+                let mut _bj = 0
+                while _bj < len(body) {
+                    chunks.push(gen2_stmt(body[_bj], 2))
+                    _bj = _bj + 1
+                }
+            }
+            chunks.push("    }\n")
+            _dd = _dd - 1
+        }
+        if has_no_arena {
+            chunks.push("    return __ret_val;\n}\n")
+        } else {
+            chunks.push("    return __hexa_fn_arena_return(__ret_val);\n}\n")
+        }
+    } else if has_no_arena {
         chunks.push("    return hexa_void();\n}\n")
     } else {
         chunks.push("    return __hexa_fn_arena_return(hexa_void());\n}\n")
     }
+    // Plan B Phase 3: restore outer fn's defer state (nested FnDecl case).
+    _gen2_defer_bodies = _prev_defer_bodies
+    _gen2_defer_flag_count = _prev_defer_flag_count
     // @lazy thunk wrapper: emit a second fn with the original name that
     // guards the body via a static `computed` flag. One-shot; zero-arg only.
     // Wrapper is NOT @hot/@cold/@restrict-decorated — it's a trivial cache
@@ -1654,6 +1717,66 @@ let mut _gen2_arena_wrap = 0
 let mut _gen2_current_fn_strict_fp = 0
 let mut _gen2_tu_has_strict_fp = 0
 
+// Plan B Phase 3 — defer/scope/spawn codegen state (per-function).
+//
+// gen2_fn_decl saves + resets these at entry, restores at exit. The
+// stage0 interpreter implements defer fully (self/hexa_full.hexa line
+// 8391: DeferStmt pushes body onto a per-call defer_stack that drains
+// on function return). AOT codegen previously errored with "unhandled
+// stmt kind: DeferStmt"; this state + the gen2_stmt DeferStmt branch
+// below mirror that semantics via static C flags + goto __fn_exit.
+//
+//   `_gen2_defer_bodies`: list of [flag_id, body_stmts] pairs,
+//     populated in textual order as DeferStmt is encountered during
+//     body emission. Drained at __fn_exit in LIFO order.
+//   `_gen2_defer_flag_count`: next unused __defer_N_active id for
+//     this function. Resets to 0 at every fn entry.
+//
+// Zero-cost when absent: functions without defer emit unchanged C —
+// no flag vars, no __fn_exit label, no goto rewrites.
+let mut _gen2_defer_bodies = []
+let mut _gen2_defer_flag_count = 0
+
+// _gen2_count_defers — pre-scan the fn body to count DeferStmt nodes
+// so gen2_fn_decl can emit the right number of `__defer_N_active`
+// declarations at the top BEFORE body codegen assigns flag ids. The
+// count also drives whether the fn needs the __fn_exit scaffold at
+// all (len==0 → no scaffold, original codegen preserved).
+//
+// Recurses into all nested statement containers (.body / .then_body /
+// .else_body / .arms[].body) but NEVER into nested FnDecl / PureFnDecl
+// — those are separate call frames with their own defer stacks.
+fn _gen2_count_defers(stmts) {
+    if type_of(stmts) != "array" { return 0 }
+    let mut n = 0
+    let mut i = 0
+    while i < len(stmts) {
+        let s = stmts[i]
+        i = i + 1
+        if type_of(s) == "string" { continue }
+        let k = s.kind
+        // Nested fn decls carry their own defer scope — skip.
+        if k == "FnDecl" || k == "PureFnDecl" || k == "ExternFnDecl" { continue }
+        if k == "DeferStmt" { n = n + 1 }
+        // Recurse into every statement-array-shaped field. Not all
+        // nodes carry these; type_of guards the no-op case.
+        if type_of(s.body) == "array" { n = n + _gen2_count_defers(s.body) }
+        if type_of(s.then_body) == "array" { n = n + _gen2_count_defers(s.then_body) }
+        if type_of(s.else_body) == "array" { n = n + _gen2_count_defers(s.else_body) }
+        if type_of(s.arms) == "array" {
+            let mut j = 0
+            while j < len(s.arms) {
+                let arm = s.arms[j]
+                if type_of(arm) != "string" && type_of(arm.body) == "array" {
+                    n = n + _gen2_count_defers(arm.body)
+                }
+                j = j + 1
+            }
+        }
+    }
+    return n
+}
+
 fn _gen2_has_decl(name) {
     let n = len(_gen2_declared_names)
     let mut i = 0
@@ -1827,6 +1950,15 @@ fn gen2_stmt(node, depth) {
     }
 
     if k == "ReturnStmt" {
+        // Plan B Phase 3: when this fn registered at least one defer,
+        // route through __fn_exit so the drain + arena return run in
+        // order. Non-defer fns keep the original zero-overhead path.
+        if _gen2_defer_flag_count > 0 {
+            if type_of(node.left) != "string" {
+                return pad + "__ret_val = " + gen2_expr(node.left) + "; goto __fn_exit;\n"
+            }
+            return pad + "__ret_val = hexa_void(); goto __fn_exit;\n"
+        }
         if type_of(node.left) != "string" {
             if _gen2_arena_wrap == 1 {
                 return pad + "return __hexa_fn_arena_return(" + gen2_expr(node.left) + ");\n"
@@ -1837,6 +1969,41 @@ fn gen2_stmt(node, depth) {
             return pad + "return __hexa_fn_arena_return(hexa_void());\n"
         }
         return pad + "return hexa_void();\n"
+    }
+
+    // Plan B Phase 3: defer { body } — queue cleanup onto the fn's
+    // defer list and set the runtime activation flag. Emission only
+    // flips the flag to 1; the actual body is emitted by gen2_fn_decl
+    // at the __fn_exit drain site. Dynamic semantics preserved: if a
+    // defer stmt is never reached (early return before it), its flag
+    // stays 0 and the body doesn't execute — matches the stage0
+    // interpreter's defer_stack.push behavior.
+    if k == "DeferStmt" {
+        let flag_id = _gen2_defer_flag_count
+        _gen2_defer_flag_count = _gen2_defer_flag_count + 1
+        _gen2_defer_bodies.push([flag_id, node.body])
+        return pad + "__defer_" + to_string(flag_id) + "_active = 1;\n"
+    }
+
+    // Plan B Phase 3: scope { body } — a nested C block. Unlike some
+    // Go-style scope primitives, hexa's scope does NOT create a new
+    // defer stack; defers inside still fire at enclosing fn exit
+    // (matches stage0 interpreter, self/hexa_full.hexa line 8763).
+    // We emit as `{ ... }` so local `let` declarations stay scoped
+    // per C semantics. `spawn { body }` has identical single-threaded
+    // eval semantics in the interpreter, so it shares this codegen.
+    if k == "ScopeStmt" || k == "SpawnStmt" {
+        let mut chunks = []
+        chunks.push(pad + "{\n")
+        if type_of(node.body) == "array" {
+            let mut si = 0
+            while si < len(node.body) {
+                chunks.push(gen2_stmt(node.body[si], depth + 1))
+                si = si + 1
+            }
+        }
+        chunks.push(pad + "}\n")
+        return chunks.join("")
     }
 
     if k == "ExprStmt" {
