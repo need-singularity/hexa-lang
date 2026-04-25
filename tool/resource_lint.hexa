@@ -1,0 +1,281 @@
+// tool/resource_lint.hexa — .resource canonical SSOT validator
+//
+// @tool(slug="resource_lint", desc="validate .resource entries (kind whitelist + required fields + scoring-weight range + capabilities non-empty)")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/resource_lint.hexa [--list] [--path <file>])
+// @example(verify ~/core/hive/.resource is well-formed before the workload router consumes it — required fields per kind, scoring-weight in [0..1], capabilities non-empty)
+// @exit_codes(0=PASS, 1=violations found, 2=path not found / read error)
+//
+// usage:
+//   hexa tool/resource_lint.hexa                 — validate $PWD/.resource
+//   hexa tool/resource_lint.hexa --list          — dump parsed entries for debug
+//   hexa tool/resource_lint.hexa --path <file>   — validate explicit path
+//
+// rule: every <project>/.resource entry must have:
+//   - directive `resource <num> <status> "<name>"`
+//   - status ∈ {live, warn, new, deferred, convention}
+//   - kind ∈ {host, container, service}  (only `host` enforced today;
+//     container/service accepted as future placeholders)
+//   - kind=host required keys: slug, ssh-alias, capabilities,
+//     memory-budget, container, scoring-weight, why
+//   - scoring-weight numeric, in [0.0, 1.0] inclusive
+//   - capabilities non-empty (csv-string)
+//
+// Pattern mirrors raw#13 ext_lint.hexa: same raw-format DSL parser,
+// same status whitelist, same kind-specific check dispatch.
+
+// ─── inlined raw_loader (seed-freeze: stage0 module loader unavailable) ───
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+// parse `resource <id> <status> "<name>"` → [id, status, name] (empty on failure)
+fn _parse_resource_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "resource" { return [] }
+
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_resource(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_resource_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _valid_kind(k: string) -> bool {
+    if k == "host" || k == "container" || k == "service" { return true }
+    return false
+}
+
+// Parse a numeric string into float (best-effort). Returns NaN sentinel
+// (we use -1.0 as sentinel since scoring-weight is constrained ≥ 0).
+fn _parse_num(s: string) -> float {
+    let t = s.trim()
+    if len(t) == 0 { return -1.0 }
+    // Allow optional unit suffix (GiB/g/G) for memory-budget — we trim
+    // it here so this helper doubles for memory and scoring-weight.
+    let mut v = t
+    let suffixes = ["GiB", "MiB", "gib", "mib", "GB", "MB", "gb", "mb", "g", "G", "m", "M"]
+    for suf in suffixes {
+        if v.ends_with(suf) {
+            v = v.substring(0, len(v) - len(suf)).trim()
+            break
+        }
+    }
+    let n = to_float(v)
+    return n
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _resource_path(explicit: string) -> string {
+    if len(explicit) > 0 { return explicit }
+    return _pwd() + "/.resource"
+}
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut list_mode = false
+let mut path_arg = ""
+let mut i = 0
+while i < len(cli) {
+    let a = cli[i]
+    if a == "--list" { list_mode = true }
+    else if a == "--path" {
+        if i + 1 < len(cli) { path_arg = cli[i + 1]; i = i + 1 }
+    }
+    i = i + 1
+}
+
+let path = _resource_path(path_arg)
+let rules = _load_resource(path)
+
+if list_mode {
+    println("── .resource entries (" + to_string(len(rules)) + ") at " + path + " ──")
+    for r in rules {
+        let kind = _keys_first(r[3], "kind")
+        let slug = _keys_first(r[3], "slug")
+        println("  #" + r[0] + " [" + r[1] + "] kind=" + kind + " slug=" + slug + " — " + r[2])
+    }
+    exit(0)
+}
+
+if len(rules) == 0 {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" {
+        eprintln("resource_lint: file not found at " + path +
+                 " — try: place a .resource at $PWD or pass --path <file>")
+        exit(2)
+    }
+    println("resource_lint: .resource empty — pass")
+    exit(0)
+}
+
+let mut errs = []
+
+for r in rules {
+    let id = r[0]
+    let keys = r[3]
+    let tag = "[resource #" + id + "] "
+
+    let kind = _keys_first(keys, "kind")
+    if kind == "" {
+        errs.push(tag + "missing required key: kind")
+    } else if !_valid_kind(kind) {
+        errs.push(tag + "invalid kind '" + kind + "' — whitelist: host container service")
+    }
+
+    let why = _keys_first(keys, "why")
+    if why == "" {
+        errs.push(tag + "missing required key: why")
+    }
+
+    if kind == "host" {
+        let slug = _keys_first(keys, "slug")
+        if slug == "" { errs.push(tag + "host kind requires 'slug'") }
+
+        let ssh_alias = _keys_first(keys, "ssh-alias")
+        if ssh_alias == "" { errs.push(tag + "host kind requires 'ssh-alias'") }
+
+        let caps = _keys_first(keys, "capabilities")
+        if caps == "" {
+            errs.push(tag + "host kind requires 'capabilities' (csv-string of capability tokens)")
+        } else if caps.trim() == "" {
+            errs.push(tag + "capabilities must be non-empty")
+        }
+
+        let mem = _keys_first(keys, "memory-budget")
+        if mem == "" {
+            errs.push(tag + "host kind requires 'memory-budget' (positive integer GiB)")
+        } else {
+            let mn = _parse_num(mem)
+            if mn <= 0.0 {
+                errs.push(tag + "memory-budget must be a positive number — got '" + mem + "'")
+            }
+        }
+
+        let container = _keys_first(keys, "container")
+        if container == "" {
+            errs.push(tag + "host kind requires 'container' (already-running container name)")
+        }
+
+        let sw = _keys_first(keys, "scoring-weight")
+        if sw == "" {
+            errs.push(tag + "host kind requires 'scoring-weight' (float in [0.0, 1.0])")
+        } else {
+            let swn = _parse_num(sw)
+            if swn < 0.0 || swn > 1.0 {
+                errs.push(tag + "scoring-weight must be in [0.0, 1.0] — got '" + sw + "'")
+            }
+        }
+    }
+}
+
+println("── resource_lint ── " + path)
+println("entries : " + to_string(len(rules)))
+
+if len(errs) == 0 {
+    println("PASS")
+    exit(0)
+}
+
+println("FAIL — " + to_string(len(errs)) + " violations")
+for e in errs {
+    eprintln("  " + e)
+}
+exit(1)

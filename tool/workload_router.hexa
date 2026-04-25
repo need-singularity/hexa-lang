@@ -1,0 +1,256 @@
+// tool/workload_router.hexa — emit docker-exec command for the top-ranked host
+//
+// @tool(slug="workload_router", desc="emit docker exec command line for the top-ranked host given a workload spec")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/workload_router.hexa <capability_csv> <memory_hint_gib> [--path <file>] -- <workload_cmd...>)
+// @example(workload_router.hexa gpu,cuda13 8 -- hexa nexus drill --seed foo → emits: docker -H ssh://ubu exec -i airgenome-claude hexa nexus drill --seed foo)
+// @exit_codes(0=ok+command on stdout, 1=no host matches, 2=parse error, 3=top host unreachable / lookup failed)
+//
+// PROBLEM
+//   Take a workload spec (required-capabilities, memory-hint, command +
+//   args) and an inventory (.resource) and produce the canonical
+//   `docker [-H ssh://<alias>] exec -i <container> <cmd...>` line for
+//   the highest-scoring host. This is the hot-path entry point; the
+//   docker-exec channel adapter (TS, control-plane glue) consumes the
+//   tokens this script emits.
+//
+// HOT PATH BOUNDARY
+//   Per raw.ai_native_algo: the algorithm core (scoring + selection) is
+//   hexa-lang. TS only spawns docker. This script is the seam. Calling
+//   convention: `--` separates router args from workload tokens so the
+//   router never has to escape inner quoting.
+//
+// FALLBACK
+//   resource_scorer is invoked via _exec_scorer rather than module
+//   import (stage0 hexa-lang has no module loader at top-level user
+//   scripts). Cost: one fork per dispatch; amortised by the docker-exec
+//   channel reusing the resulting container connection across many
+//   send() calls.
+
+// ─── inlined raw_loader (same as resource_scorer.hexa / resource_lint.hexa) ───
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+fn _parse_resource_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "resource" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_resource(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_resource_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+// Invoke resource_scorer.hexa, capture top slug. Forks one hexa
+// subprocess per dispatch; the docker-exec channel amortises this by
+// reusing the container connection across send() calls.
+fn _top_slug(cap_csv: string, mem_hint_s: string, path: string) -> array {
+    let scorer = "/Users/ghost/core/hexa-lang/tool/resource_scorer.hexa"
+    let cmd = "hexa " + scorer + " '" + cap_csv + "' '" + mem_hint_s + "' --path '" + path + "'"
+    let raw = to_string(exec(cmd))
+    let out = _rstrip(raw)
+    if len(out) == 0 { return [] }
+    let lines = split(out, "\n")
+    if len(lines) == 0 { return [] }
+    let first = lines[0].trim()
+    if len(first) == 0 { return [] }
+    let sp = first.index_of(" ")
+    if sp < 0 { return [first, ""] }
+    let score = first.substring(0, sp)
+    let slug = first.substring(sp + 1, len(first)).trim()
+    return [slug, score]
+}
+
+// Lookup a host entry by slug. Returns the keys array or [] on miss.
+fn _lookup_host(rules: array, slug: string) -> array {
+    for r in rules {
+        let keys = r[3]
+        let kind = _keys_first(keys, "kind")
+        if kind != "host" { continue }
+        let s = _keys_first(keys, "slug")
+        if s == slug { return keys }
+    }
+    return []
+}
+
+// ─── argv parsing ────────────────────────────────────────────────
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut router_args = []
+let mut workload_args = []
+let mut seen_sep = false
+let mut path_arg = ""
+let mut k = 0
+while k < len(cli) {
+    let a = cli[k]
+    if !seen_sep && a == "--" { seen_sep = true; k = k + 1; continue }
+    if seen_sep { workload_args.push(a); k = k + 1; continue }
+    if a == "--path" {
+        if k + 1 < len(cli) { path_arg = cli[k + 1]; k = k + 2; continue }
+    }
+    router_args.push(a)
+    k = k + 1
+}
+
+if len(router_args) < 2 {
+    eprintln("workload_router: usage — <capability_csv> <memory_hint_gib> [--path <file>] -- <cmd...>")
+    eprintln("                 try: workload_router.hexa gpu,cuda13 8 -- hexa nexus drill")
+    exit(2)
+}
+if len(workload_args) == 0 {
+    eprintln("workload_router: missing workload command after `--`")
+    eprintln("                 try: workload_router.hexa gpu,cuda13 8 -- echo hello")
+    exit(2)
+}
+
+let cap_csv = router_args[0]
+let mem_hint_s = router_args[1]
+let path = if len(path_arg) > 0 { path_arg } else { _pwd() + "/.resource" }
+
+let rules = _load_resource(path)
+if len(rules) == 0 {
+    eprintln("workload_router: no .resource entries at " + path +
+             " — try: place a .resource at $PWD or pass --path <file>")
+    exit(2)
+}
+
+let pick = _top_slug(cap_csv, mem_hint_s, path)
+if len(pick) == 0 {
+    eprintln("workload_router: scorer returned no candidate for caps='" + cap_csv +
+             "' mem=" + mem_hint_s + " — try: hexa resource_scorer.hexa " + cap_csv +
+             " " + mem_hint_s + " --path " + path)
+    exit(1)
+}
+
+let slug = pick[0]
+let host = _lookup_host(rules, slug)
+if len(host) == 0 {
+    eprintln("workload_router: top slug '" + slug + "' not present in " + path +
+             " — try: re-run resource_lint to verify SSOT integrity")
+    exit(3)
+}
+
+let ssh_alias = _keys_first(host, "ssh-alias")
+let container = _keys_first(host, "container")
+let mem_cap = _keys_first(host, "container-memory-cap")
+
+if container == "" {
+    eprintln("workload_router: host '" + slug + "' missing container — try: hexa resource_lint.hexa")
+    exit(3)
+}
+
+// ─── emit docker exec command line ────────────────────────────────
+//
+// Form:
+//   docker [-H ssh://<alias>] exec -i [-m <cap>g] <container> <cmd...>
+//
+// `-i` keeps stdin attached so the docker-exec channel can write
+// frames. `-m <cap>g` enforces the cgroup memory cap from .resource
+// (bare-host fork was banned post-2026-04-20 ubu2 OOM event).
+let mut argv = ["docker"]
+if ssh_alias != "" && ssh_alias != "localhost" {
+    argv.push("-H"); argv.push("ssh://" + ssh_alias)
+}
+argv.push("exec"); argv.push("-i")
+if len(mem_cap) > 0 {
+    argv.push("-m"); argv.push(mem_cap + "g")
+}
+argv.push(container)
+for w in workload_args { argv.push(w) }
+
+println(argv.join(" "))
+exit(0)

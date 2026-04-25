@@ -1,0 +1,343 @@
+// tool/resource_scorer.hexa — workload-to-host scorer (hot path, ai-native)
+//
+// @tool(slug="resource_scorer", desc="rank hosts in .resource for a workload by capability + free capacity + scoring-weight")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/resource_scorer.hexa <capability_csv> <memory_hint_gib> [--path <file>])
+// @example(resource_scorer.hexa gpu,cuda13 8 → ranked list: host-ubu1 1.000, host-ubu2 0.840, ... — discards hosts that fail capability bracket pruning)
+// @exit_codes(0=ok, 1=no host matches required capabilities, 2=parse error)
+//
+// PROBLEM
+//   Given a workload spec (required-capabilities + memory-hint), pick the
+//   docker host most suited to run it. Inputs come from
+//   <project>/.resource (canonical SSOT). Output is a ranked list of
+//   host slugs printed to stdout, one per line: `<score> <slug>`.
+//
+// REDUCTION (per raw.problem_solving_triad)
+//   This problem reduces to BRACKET — unimodal pruning over the
+//   composite score function. Bracket interpretation here:
+//     • capability check is the "left wall" — hosts that fail it have
+//       no candidate score and are pruned outright (cheapest cut first,
+//       per ternary/golden-section "discard a third" intuition).
+//     • among survivors, the score is unimodal in the (memory headroom,
+//       historical preference) plane: more headroom + higher weight =
+//       higher score, with diminishing return shaped by the linear blend.
+//     • we do NOT need to find a global optimum — we need a total order,
+//       so this is bracket-pruning + linear sort, not iterative bracket
+//       narrowing. The reduction documents the family relationship.
+//
+// HOT PATH
+//   Called per dispatch by the workload router. Two pieces stay in
+//   hexa-lang per raw.ai_native_algo: (1) the score formula and (2)
+//   the capability-check pruner. TS only orchestrates docker exec.
+//
+// LAYOUT INVARIANT
+//   Capabilities stored as csv-string (NOT JS / hexa array). Future
+//   optimization path: string-intern the tokens once + back hosts
+//   with a fixed-width bitset, replace per-comparison string scan
+//   with bitwise AND. Format-level migration NOT required — the
+//   .resource file already keeps the csv-string shape.
+
+// ─── tunables (exposed for downstream optimization) ────────────────
+//
+// Invariant: CAPABILITY_WEIGHT + CAPACITY_WEIGHT + HISTORICAL_WEIGHT == 1.0
+//            within rounding error.
+//
+// Score formula:
+//   score(host, workload) =
+//       w_cap  * (matched_caps / required_caps)
+//     + w_mem  * max(0, (host.memory_budget - workload.memory_hint) / host.memory_budget)
+//     + w_hist * host.scoring_weight
+//
+// Default 0.5 / 0.3 / 0.2 reflects: capability fit dominates (you can't
+// run cuda on a cpu-only host), free capacity is the second-largest
+// signal (don't pile on a host already drowning), historical/operator
+// preference is the tie-breaker (de-prioritize a host with a recent OOM).
+
+let CAPABILITY_WEIGHT = 0.5
+let CAPACITY_WEIGHT = 0.3
+let HISTORICAL_WEIGHT = 0.2
+
+// ─── inlined raw_loader (seed-freeze: stage0 module loader unavailable) ───
+
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _valid_status(s: string) -> bool {
+    if s == "live" || s == "warn" || s == "new" || s == "deferred" || s == "convention" { return true }
+    return false
+}
+
+fn _parse_resource_header(line: string) -> array {
+    let sp1 = line.index_of(" ")
+    if sp1 < 0 { return [] }
+    let kind = line.substring(0, sp1)
+    if kind != "resource" { return [] }
+    let rest1 = line.substring(sp1 + 1, len(line))
+    let sp2 = rest1.index_of(" ")
+    if sp2 < 0 { return [] }
+    let id = rest1.substring(0, sp2)
+    let rest2 = rest1.substring(sp2 + 1, len(rest1))
+    let sp3 = rest2.index_of(" ")
+    if sp3 < 0 { return [] }
+    let status = rest2.substring(0, sp3)
+    if !_valid_status(status) { return [] }
+    let mut name = rest2.substring(sp3 + 1, len(rest2)).trim()
+    if len(name) >= 2 && name.substring(0, 1) == "\"" {
+        name = name.substring(1, len(name) - 1)
+    }
+    return [id, status, name]
+}
+
+fn _load_resource(path: string) -> array {
+    let exists = to_string(exec("test -f '" + path + "' && echo y || echo n")).trim()
+    if exists != "y" { return [] }
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut rules = []
+    let mut cur_id = ""
+    let mut cur_status = ""
+    let mut cur_name = ""
+    let mut cur_keys = []
+    let mut has_rule = false
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if len(line) == 0 {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                has_rule = false
+                cur_keys = []
+            }
+            continue
+        }
+        let first = line.substring(0, 1)
+        if first == "#" { continue }
+        if first == " " || first == "\t" {
+            if !has_rule { continue }
+            let stripped = line.trim_start()
+            let sp = stripped.index_of(" ")
+            if sp < 0 { continue }
+            let key = stripped.substring(0, sp)
+            let val = stripped.substring(sp + 1, len(stripped)).trim()
+            cur_keys.push([key, val])
+        } else {
+            if has_rule {
+                rules.push([cur_id, cur_status, cur_name, cur_keys])
+                cur_keys = []
+            }
+            let hdr = _parse_resource_header(line)
+            if len(hdr) == 0 { has_rule = false; continue }
+            cur_id = hdr[0]
+            cur_status = hdr[1]
+            cur_name = hdr[2]
+            has_rule = true
+        }
+    }
+    if has_rule {
+        rules.push([cur_id, cur_status, cur_name, cur_keys])
+    }
+    return rules
+}
+
+fn _keys_first(keys: array, k: string) -> string {
+    for kv in keys {
+        if kv[0] == k { return kv[1] }
+    }
+    return ""
+}
+
+fn _parse_num(s: string) -> float {
+    let t = s.trim()
+    if len(t) == 0 { return -1.0 }
+    let mut v = t
+    let suffixes = ["GiB", "MiB", "gib", "mib", "GB", "MB", "gb", "mb", "g", "G", "m", "M"]
+    for suf in suffixes {
+        if v.ends_with(suf) {
+            v = v.substring(0, len(v) - len(suf)).trim()
+            break
+        }
+    }
+    let n = to_float(v)
+    return n
+}
+
+// Split csv-string on `,` and trim each token. Returns empty array on
+// empty input. NOT array-typed in .resource — we parse on demand here.
+fn _split_csv(s: string) -> array {
+    let mut out = []
+    if len(s) == 0 { return out }
+    let parts = split(s, ",")
+    for p in parts {
+        let t = p.trim()
+        if len(t) > 0 { out.push(t) }
+    }
+    return out
+}
+
+fn _csv_contains(haystack_csv: string, needle: string) -> bool {
+    let toks = _split_csv(haystack_csv)
+    for t in toks {
+        if t == needle { return true }
+    }
+    return false
+}
+
+// Bracket pruning step: returns true iff the host carries every
+// required capability. Cheapest filter, applied first per the
+// problem-solving-triad bracket reduction documented at the top.
+fn _matches_all_caps(host_caps: string, required_caps: array) -> bool {
+    for r in required_caps {
+        if !_csv_contains(host_caps, r) { return false }
+    }
+    return true
+}
+
+fn _max(a: float, b: float) -> float {
+    if a > b { return a }
+    return b
+}
+
+// Score one (already-bracket-passed) host. All inputs are pre-validated.
+fn _score_host(host_keys: array, required_caps: array, mem_hint: float) -> float {
+    let host_caps = _keys_first(host_keys, "capabilities")
+    let host_mem_s = _keys_first(host_keys, "memory-budget")
+    let host_sw_s = _keys_first(host_keys, "scoring-weight")
+
+    let host_mem = _parse_num(host_mem_s)
+    let host_sw = _parse_num(host_sw_s)
+
+    // capability score: matched / required (always 1.0 here since the
+    // bracket pruner already passed; kept as a factor so future
+    // multi-tier capability scoring slots in cleanly).
+    let mut matched = 0.0
+    for r in required_caps {
+        if _csv_contains(host_caps, r) { matched = matched + 1.0 }
+    }
+    let cap_score = if len(required_caps) > 0 { matched / to_float(len(required_caps)) } else { 1.0 }
+
+    // capacity score: free headroom fraction, floored at 0 (negative means
+    // workload memory_hint > host memory_budget — penalty, not a hard fail
+    // here because the bracket already pruned outright impossibles by
+    // capability; a slight memory mismatch is downranked, not banned).
+    let mem_score = if host_mem > 0.0 { _max(0.0, (host_mem - mem_hint) / host_mem) } else { 0.0 }
+
+    // historical: scoring-weight directly (already in [0, 1]).
+    let hist_score = if host_sw >= 0.0 { host_sw } else { 0.0 }
+
+    return CAPABILITY_WEIGHT * cap_score
+         + CAPACITY_WEIGHT * mem_score
+         + HISTORICAL_WEIGHT * hist_score
+}
+
+// Sort [score, slug] pairs descending by score (insertion sort — N is
+// always small, host count is bounded by physical fleet size).
+fn _sort_desc(pairs: array) -> array {
+    let mut a = pairs
+    let mut i = 1
+    while i < len(a) {
+        let cur = a[i]
+        let mut j = i - 1
+        while j >= 0 && a[j][0] < cur[0] {
+            a[j + 1] = a[j]
+            j = j - 1
+        }
+        a[j + 1] = cur
+        i = i + 1
+    }
+    return a
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+// pub API — used by workload_router.hexa via re-parse (no module loader).
+// External callers should `exec` this script and consume stdout.
+
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut path_arg = ""
+let mut positional = []
+let mut k = 0
+while k < len(cli) {
+    let a = cli[k]
+    if a == "--path" {
+        if k + 1 < len(cli) { path_arg = cli[k + 1]; k = k + 1 }
+    } else {
+        positional.push(a)
+    }
+    k = k + 1
+}
+
+if len(positional) < 2 {
+    eprintln("resource_scorer: usage — <capability_csv> <memory_hint_gib> [--path <file>]")
+    eprintln("                 try: resource_scorer.hexa gpu,cuda13 8")
+    exit(2)
+}
+
+let cap_csv = positional[0]
+let mem_hint = _parse_num(positional[1])
+if mem_hint < 0.0 {
+    eprintln("resource_scorer: memory_hint must be a non-negative number — got '" + positional[1] + "'")
+    exit(2)
+}
+
+let path = if len(path_arg) > 0 { path_arg } else { _pwd() + "/.resource" }
+let rules = _load_resource(path)
+if len(rules) == 0 {
+    eprintln("resource_scorer: no entries in " + path + " — try: hexa resource_lint.hexa --path " + path)
+    exit(2)
+}
+
+let required_caps = _split_csv(cap_csv)
+
+// ─── bracket pruning: drop hosts that fail capability check ──────
+let mut survivors = []
+for r in rules {
+    let keys = r[3]
+    let kind = _keys_first(keys, "kind")
+    if kind != "host" { continue }       // only score host kind today
+    if r[1] != "live" { continue }        // only live hosts
+    let host_caps = _keys_first(keys, "capabilities")
+    if !_matches_all_caps(host_caps, required_caps) { continue }
+    survivors.push(r)
+}
+
+if len(survivors) == 0 {
+    eprintln("resource_scorer: no host matches required capabilities '" + cap_csv +
+             "' — try: relax capabilities, or check .resource at " + path)
+    exit(1)
+}
+
+// ─── score + sort ────────────────────────────────────────────────
+let mut scored = []
+for r in survivors {
+    let keys = r[3]
+    let slug = _keys_first(keys, "slug")
+    let s = _score_host(keys, required_caps, mem_hint)
+    scored.push([s, slug])
+}
+
+let sorted = _sort_desc(scored)
+
+// Output: one ranked entry per line, score then slug. Stable, parseable.
+for row in sorted {
+    println(to_string(row[0]) + " " + row[1])
+}
+exit(0)
