@@ -1,0 +1,181 @@
+// tool/spawn_lint.hexa — forbidden-idiom scanner for orphan-prone spawn patterns
+//
+// @tool(slug="spawn_lint", desc="flag shell idioms that create orphan/unsupervised processes (nohup, disown, silent backgrounding)")
+// @usage(hexa /Users/ghost/core/hexa-lang/tool/spawn_lint.hexa [--path <dir>] [--ext <csv>])
+// @example(nightly scan: any `.hexa` / `.sh` file containing `>/dev/null 2>&1 &` gets flagged — the pattern forces H-SILENT violations and defeats supervised spawn)
+// @exit_codes(0=no violations, 1=violations found, 2=scan error)
+//
+// PROBLEM (Phase 4 of Plan B 2026-04-25)
+//   The 2026-04-25 mac near-death had three specific orphan shapes —
+//   each one started with a shell command that detaches a child without
+//   registering it anywhere the reaper can find. Patterns to flag:
+//
+//     1. `nohup <cmd> ... &`  — explicit "survive my death" with no
+//        .resource registration. Use `proc_spawn_supervised` instead.
+//     2. `disown`             — explicit orphaning; defeats all hexa
+//        supervision machinery.
+//     3. `>/dev/null 2>&1 &`  — the H-SILENT pattern: silent background
+//        with no exit check. Banned outright by the hook; enforcing in
+//        lint too so code reviews catch what the hook can't (e.g.,
+//        strings embedded in .hexa source not yet executed).
+//     4. bare trailing ` &`   — same as (3) minus redirection; a
+//        fire-and-forget background. Flag with a weaker warning because
+//        legitimate uses exist (interactive notes, comments).
+//
+// POLICY
+//   - Scans `.hexa`, `.sh`, `.bash` files under the given path (default
+//     cwd). Extension set overridable via --ext.
+//   - One-line allow-listing: a line ending with `# spawn_lint: allow`
+//     (or `// spawn_lint: allow` for .hexa) is skipped. Put the reason
+//     next to the allow.
+//   - Comment lines (leading `#` / `//`) are skipped — lint is about
+//     executable code, not prose.
+//   - Lines inside fenced code blocks of `.md` files: NOT scanned
+//     (spawn_lint does not process markdown).
+//
+// OUTPUT
+//   `file:line: <severity> <pattern> — <suggestion>`
+//   Severity is `ERROR` for nohup/disown/silent-bg; `WARN` for bare `&`.
+//   Exit 1 only on ERROR (WARN does not break CI by default).
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+// _scan_path(root, exts) -> array of absolute paths
+fn _scan_path(root: string, exts: array) -> array {
+    let mut name_filter = ""
+    let mut i = 0
+    while i < len(exts) {
+        if i > 0 { name_filter = name_filter + " -o " }
+        name_filter = name_filter + "-name '*." + exts[i] + "'"
+        i = i + 1
+    }
+    // Skip common build / dist / cache dirs to keep scan fast.
+    let prune = "-name node_modules -o -name dist -o -name build -o -name '.hexa-cache' -o -name '.git'"
+    let cmd = "find '" + root + "' \\( " + prune + " \\) -prune -o \\( " + name_filter + " \\) -print"
+    let out = to_string(exec(cmd))
+    let lines = split(out, "\n")
+    let mut files = []
+    for l in lines {
+        let t = l.trim()
+        if len(t) > 0 { files.push(t) }
+    }
+    return files
+}
+
+fn _is_comment_line(line: string, ext: string) -> bool {
+    let t = line.trim_start()
+    if ext == "hexa" {
+        return t.starts_with("//")
+    }
+    // sh / bash / default
+    return t.starts_with("#")
+}
+
+fn _file_ext(path: string) -> string {
+    let dot = path.last_index_of(".")
+    if dot < 0 { return "" }
+    return path.substring(dot + 1, len(path))
+}
+
+// A violation is [severity, pattern, suggestion].
+fn _patterns() -> array {
+    return [
+        ["ERROR", "nohup",              "use proc_spawn_supervised() with a lease-ttl instead"],
+        ["ERROR", "disown",             "use proc_spawn_supervised() — disown defeats the reaper"],
+        ["ERROR", ">/dev/null 2>&1 &",  "banned by H-SILENT — capture exit + verify artifact, or use proc_spawn_supervised()"],
+        ["ERROR", "2>&1 >/dev/null &",  "banned by H-SILENT — same as >/dev/null 2>&1 &"],
+    ]
+}
+
+// bare trailing ` &` — line ends with whitespace + `&` + optional trailing whitespace.
+// Not a pattern table entry since it needs positional logic, not substring.
+fn _has_trailing_ampersand(line: string) -> bool {
+    let t = line.trim()
+    if len(t) == 0 { return false }
+    if t.substring(len(t) - 1, len(t)) != "&" { return false }
+    // Skip `&&` (logical-and) — last two chars would be "&&".
+    if len(t) >= 2 && t.substring(len(t) - 2, len(t)) == "&&" { return false }
+    return true
+}
+
+fn _scan_file(path: string) -> array {
+    let ext = _file_ext(path)
+    let patterns = _patterns()
+    let src = to_string(read_file(path))
+    let lines = split(src, "\n")
+    let mut violations = []
+    let mut lineno = 0
+    for raw in lines {
+        lineno = lineno + 1
+        if _is_comment_line(raw, ext) { continue }
+        let allow_marker_hexa = "// spawn_lint: allow"
+        let allow_marker_sh = "# spawn_lint: allow"
+        if raw.index_of(allow_marker_hexa) >= 0 { continue }
+        if raw.index_of(allow_marker_sh) >= 0 { continue }
+
+        for pat in patterns {
+            let needle = pat[1]
+            if raw.index_of(needle) >= 0 {
+                violations.push([path, to_string(lineno), pat[0], needle, pat[2]])
+            }
+        }
+        if _has_trailing_ampersand(raw) {
+            violations.push([path, to_string(lineno), "WARN", "bare trailing &",
+                            "fire-and-forget background; prefer proc_spawn_supervised() + lease-ttl"])
+        }
+    }
+    return violations
+}
+
+// ── CLI ────────────────────────────────────────────────────────
+let _raw_args = args()
+let mut cli = []
+let mut _ai = 2
+while _ai < len(_raw_args) {
+    cli.push(_raw_args[_ai])
+    _ai = _ai + 1
+}
+
+let mut root = ""
+let mut ext_arg = ""
+let mut i = 0
+while i < len(cli) {
+    let a = cli[i]
+    if a == "--path" {
+        if i + 1 < len(cli) { root = cli[i + 1]; i = i + 1 }
+    } else if a == "--ext" {
+        if i + 1 < len(cli) { ext_arg = cli[i + 1]; i = i + 1 }
+    }
+    i = i + 1
+}
+if len(root) == 0 { root = _pwd() }
+let exts = if len(ext_arg) > 0 { split(ext_arg, ",") } else { ["hexa", "sh", "bash"] }
+
+let files = _scan_path(root, exts)
+println("── spawn_lint ── scanning " + root + " (" + to_string(len(files)) + " files, ext=" + ext_arg + ")")
+
+let mut all_errors = 0
+let mut all_warns = 0
+for f in files {
+    let vs = _scan_file(f)
+    for v in vs {
+        let severity = v[2]
+        let line = "  " + v[0] + ":" + v[1] + ": " + severity + " `" + v[3] + "` — " + v[4]
+        if severity == "ERROR" {
+            eprintln(line)
+            all_errors = all_errors + 1
+        } else {
+            println(line)
+            all_warns = all_warns + 1
+        }
+    }
+}
+
+println("── done: errors=" + to_string(all_errors) + " warns=" + to_string(all_warns))
+
+if all_errors > 0 { exit(1) }
+exit(0)
