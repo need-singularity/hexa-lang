@@ -4,6 +4,13 @@
 범위: 10 core repo (anima · nexus · hexa-lang · airgenome · n6-architecture · void · hexa-os · papers · secret · contact).
 방법: read-only grep/stat, DESIGNATED_PROJECTS 전체 열거 하에 수집.
 
+> **HISTORICAL NOTE (2026-04-25)**: airgenome hooks (post_tool / pre_tool /
+> gap_breakthrough / gap_detector) 폐기됨 — mac-only pivot per
+> resource_management_pivot. 본 문서의 §7 (gap_breakthrough.hexa wrapper)
+> 및 §9 (gap_detector.hexa) 의 airgenome hook 통합 항목은 더 이상 추진하지
+> 않음. ag_* 18 개 meta tool 언급은 시점 사실 보존용 — airgenome repo 자체는
+> mac-only local mgmt scope 으로 축소.
+
 ---
 
 ## 1. 메타 엔진 tool 현황 (prefix 별)

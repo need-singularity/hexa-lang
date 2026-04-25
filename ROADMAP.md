@@ -70,7 +70,6 @@ L1–L5 layer 가 매 commit/60s/tool-call 마다 동기화.
 | L1 pre-commit gate | `tool/roadmap_verify_pre_commit.hexa` | ⚠️ tool 있음, **.git/hooks/pre-commit 미설치** |
 | L2 launchd watcher 60s | `tool/roadmap_watcher.hexa` + `com.airgenome.roadmap-watcher.plist` | ✓ plist 설치됨 |
 | L3 chflags uchg/uappnd | raw#1 | ✓ live |
-| L4 airgenome hook | `airgenome/hooks/post_tool.hexa` | ✓ live (`d81c0fde`) |
 | L5 post-commit auto-ingest (discovery) | Tier2 #13 | ⚠️ **.git/hooks/post-commit 미설치** |
 | status auto flip (planned→active→done) | `tool/roadmap_status_flip.hexa` | ⚠️ planned (38) |
 | cross-repo sync daemon | Tier5 #49/50 | ⚠️ planned (45) |
@@ -215,10 +214,9 @@ Parent roadmap **64** → 5 children **65–69**. 상세 정의 `.roadmap` 64–
 ### SSOT / 자격강제
 - **.raw + .own = project root SSOT** (raw#0). 파생: .ext / .roadmap / .loop → 총 6 SSOT (+ .workspace).
 - **30 raw rules live** (raw#0–30). raw#9 hexa-only · raw#11 snake_case · raw#1 chflags uchg · raw#10 proof-carrying · raw#12 cherry-pick 금지 · raw#25 concurrent-git-lock · raw#28 gate ordering · raw#29 UNIVERSAL_4 · raw#30 IRREVERSIBILITY · own 4 bt-solution-claim-ban.
-- **5-layer OS enforcement** — L1 pre-commit · L2 launchd (60s) · L3 chflags uchg/uappnd ✅ · L4 airgenome hook · L5 post-commit auto-ingest.
+- **4-layer OS enforcement** — L1 pre-commit · L2 launchd (60s) · L3 chflags uchg/uappnd ✅ · L5 post-commit auto-ingest.
 - **git hooks deprecated (2026-04-21)** — enforcement 은 chflags EPERM + manual/CI 호출로 일원화.
 - **Meta² cert chain** — 8 breakthrough indexed (`074487cd`).
-- **airgenome hook framework** — self-hosted event bus (`7af142fb` → main `d81c0fde`).
 - **raw_audit hash-chain** — append-only attestation.
 
 ### Core workspace
