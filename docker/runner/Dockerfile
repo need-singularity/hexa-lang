@@ -39,8 +39,15 @@ LABEL org.opencontainers.image.title="hexa-runner" \
 #                     orphan-of-PID-1 detection fires prematurely and
 #                     SIGKILL's the workload (exit 137) before output
 #                     flushes.  See 2026-04-25 hexa-runner triage.
+#   curl, wget      : required by nexus bridges (oeis/gw/arxiv/simbad/
+#                     wikipedia/openalex/uniprot) which exec("curl …") for
+#                     HTTPS API fetches.  Absent → 7/16 bridge health FAIL
+#                     with `sh: 1: curl: not found` (2026-04-26 bridge
+#                     health check).  raw 73 admissibility: minimum-add
+#                     only, no feature creep.
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates perl tini \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates perl tini curl wget \
  && rm -rf /var/lib/apt/lists/*
 
 # Stage all four binaries (CLI dispatcher + interp interpreter, ×2 arches)
