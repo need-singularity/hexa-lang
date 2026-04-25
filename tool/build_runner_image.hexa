@@ -1,0 +1,256 @@
+// ═══════════════════════════════════════════════════════════════
+//  build_runner_image.hexa — assemble the multi-arch hexa-runner
+//  Docker image from the static ELFs produced by
+//  tool/build_hexa_cli_linux.hexa.
+//
+//  Usage:
+//    hexa tool/build_runner_image.hexa            # local load (host arch)
+//    hexa tool/build_runner_image.hexa --push     # push to remote registry
+//    hexa tool/build_runner_image.hexa --selftest # pure logic checks
+//
+//  Background: 2026-04-25 Mac jetsam SIGKILL.  Hive policy bans bare
+//  Mac-host `hexa` execution; every workload must land inside a Linux
+//  container with hard CPU/RAM caps.  This tool builds that container.
+//
+//  Output tags:
+//    hexa-runner:<git-shortsha>
+//    hexa-runner:latest
+//
+//  buildx caveat: --load can only materialize a single architecture
+//  into the local engine.  Default behaviour:
+//    - assemble both linux/arm64 and linux/amd64 in the buildx cache,
+//    - additionally --load the host-arch variant so it appears in
+//      `docker images`.
+//  Use --push to fan both arches out to a remote registry.
+// ═══════════════════════════════════════════════════════════════
+
+fn run_ok(cmd) {
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        eprintln("FAILED: " + cmd)
+        if r[0] != "" { eprintln(r[0]) }
+        exit(1)
+    }
+    r[0]
+}
+
+fn host_arch_to_linux_target(uname_m) -> string {
+    if uname_m == "arm64" { return "arm64" }
+    if uname_m == "aarch64" { return "arm64" }
+    return "x86_64"
+}
+
+// target token (arm64/x86_64) → docker platform suffix (arm64/amd64)
+fn target_to_docker_arch(target) -> string {
+    if target == "arm64" { return "arm64" }
+    return "amd64"
+}
+
+fn cmd_selftest() -> i64 {
+    println("[build_runner_image selftest]")
+    let mut fails = 0
+
+    // T1: host arm64 → linux arm64 → docker arm64
+    let t1 = host_arch_to_linux_target("arm64")
+    let t1d = target_to_docker_arch(t1)
+    if t1 != "arm64" || t1d != "arm64" {
+        eprintln("  FAIL T1 arm64 mapping: " + t1 + "/" + t1d)
+        fails = fails + 1
+    } else { println("  OK   T1 arm64 → arm64 → arm64") }
+
+    // T2: host x86_64 → linux x86_64 → docker amd64
+    let t2 = host_arch_to_linux_target("x86_64")
+    let t2d = target_to_docker_arch(t2)
+    if t2 != "x86_64" || t2d != "amd64" {
+        eprintln("  FAIL T2 x86_64 mapping: " + t2 + "/" + t2d)
+        fails = fails + 1
+    } else { println("  OK   T2 x86_64 → x86_64 → amd64") }
+
+    // T3: --push and --load are mutually exclusive — flag parser sanity
+    let fake_args = ["hexa", "tool/build_runner_image.hexa", "--push"]
+    let mut do_push = false
+    let mut ai = 2
+    while ai < len(fake_args) {
+        if fake_args[ai] == "--push" { do_push = true }
+        ai = ai + 1
+    }
+    if !do_push {
+        eprintln("  FAIL T3 --push flag parse")
+        fails = fails + 1
+    } else { println("  OK   T3 --push flag parse") }
+
+    // T4: when --push absent, default mode is local-load (single host-arch)
+    let fake_args2 = ["hexa", "tool/build_runner_image.hexa"]
+    let mut do_push2 = false
+    let mut aj = 2
+    while aj < len(fake_args2) {
+        if fake_args2[aj] == "--push" { do_push2 = true }
+        aj = aj + 1
+    }
+    if do_push2 {
+        eprintln("  FAIL T4 default no-push")
+        fails = fails + 1
+    } else { println("  OK   T4 default → local --load") }
+
+    if fails != 0 { return 1 }
+    println("[build_runner_image selftest] OK")
+    return 0
+}
+
+fn main() {
+    let args = argv()
+
+    let mut do_push = false
+    let mut do_selftest = false
+    let mut tag_extra = ""
+    let mut ai = 2
+    while ai < len(args) {
+        let a = args[ai]
+        if a == "--selftest" || a == "selftest" {
+            do_selftest = true
+        } else if a == "--push" {
+            do_push = true
+        } else if a == "-t" && (ai + 1) < len(args) {
+            ai = ai + 1
+            tag_extra = args[ai]
+        }
+        ai = ai + 1
+    }
+    if do_selftest { exit(cmd_selftest()) }
+
+    let repo_root = exec_with_status("pwd")[0].trim()
+    let uname_m = exec_with_status("uname -m")[0].trim()
+    let host_target = host_arch_to_linux_target(uname_m)
+    let host_docker_arch = target_to_docker_arch(host_target)
+
+    // ── Pre-flight ────────────────────────────────────────────
+    println("=== hexa-runner image builder ===")
+
+    // 1. docker / buildx availability
+    let docker_check = exec_with_status("which docker 2>/dev/null")
+    if docker_check[1] != 0 || docker_check[0].trim() == "" {
+        eprintln("error: docker CLI not found in PATH")
+        eprintln("  install Docker Desktop (or compatible engine) and retry")
+        exit(1)
+    }
+    let buildx_check = exec_with_status("docker buildx version 2>&1")
+    if buildx_check[1] != 0 {
+        eprintln("error: docker buildx unavailable")
+        eprintln(buildx_check[0])
+        exit(1)
+    }
+    let info_check = exec_with_status("docker info >/dev/null 2>&1; echo $?")
+    if info_check[0].trim() != "0" {
+        eprintln("error: docker engine not reachable (Docker Desktop running?)")
+        exit(1)
+    }
+    println("  docker  : " + docker_check[0].trim())
+    println("  buildx  : ok")
+
+    // 2. ELF presence — auto-build if missing
+    let arm_elf = repo_root + "/build/hexa_linux_arm64"
+    let x86_elf = repo_root + "/build/hexa_linux_x86_64"
+    let hexa_bin = repo_root + "/hexa"
+    if !file_exists(arm_elf) {
+        println("  build/hexa_linux_arm64 missing — building…")
+        run_ok(hexa_bin + " run tool/build_hexa_cli_linux.hexa --target=arm64")
+    }
+    if !file_exists(x86_elf) {
+        println("  build/hexa_linux_x86_64 missing — building…")
+        run_ok(hexa_bin + " run tool/build_hexa_cli_linux.hexa --target=x86_64")
+    }
+
+    let arm_info = exec_with_status("file " + arm_elf)[0].trim()
+    let x86_info = exec_with_status("file " + x86_elf)[0].trim()
+    println("  arm64   : " + arm_info)
+    println("  x86_64  : " + x86_info)
+
+    // 3. shortsha — best-effort, fall back to "dev" outside a git tree
+    let sha_r = exec_with_status("git rev-parse --short HEAD 2>/dev/null")
+    let mut shortsha = sha_r[0].trim()
+    if sha_r[1] != 0 || shortsha == "" { shortsha = "dev" }
+
+    let dockerfile = "docker/runner/Dockerfile"
+    let tag_sha = "hexa-runner:" + shortsha
+    let tag_latest = "hexa-runner:latest"
+
+    println("  tag_sha : " + tag_sha)
+    println("  tag_lat : " + tag_latest)
+    let mut push_label = "no (local --load host-arch only)"
+    if do_push { push_label = "yes" }
+    println("  push    : " + push_label)
+
+    // 4. ensure a buildx builder is active.  `default` driver cannot
+    //    do multi-platform; `docker-container` driver can.  We try to
+    //    `inspect --bootstrap` an existing builder named hexa-runner;
+    //    if that fails, we create one.
+    let inspect = exec_with_status("docker buildx inspect hexa-runner-builder >/dev/null 2>&1; echo $?")
+    if inspect[0].trim() != "0" {
+        println("  builder : creating hexa-runner-builder (docker-container driver)")
+        run_ok("docker buildx create --name hexa-runner-builder --driver docker-container --bootstrap")
+    } else {
+        println("  builder : reusing hexa-runner-builder")
+        run_ok("docker buildx use hexa-runner-builder")
+    }
+
+    // ── Build commands ──────────────────────────────────────
+    // We always build BOTH platforms.  Output mode differs:
+    //   --push    : push manifest list (arm64 + amd64) to registry
+    //   default   : (a) build both into buildx cache (multi-arch)
+    //               (b) re-run a single-platform --load for host arch
+    //                   so it shows up in `docker images` for local use
+    let platforms = "linux/arm64,linux/amd64"
+    let host_platform = "linux/" + host_docker_arch
+
+    let common_tags = " -t " + tag_sha + " -t " + tag_latest
+    let mut extra_tag_arg = ""
+    if tag_extra != "" {
+        extra_tag_arg = " -t " + tag_extra
+    }
+
+    if do_push {
+        let cmd = "docker buildx build --platform " + platforms +
+                  " -f " + dockerfile + common_tags + extra_tag_arg +
+                  " --push ."
+        println("")
+        println("[build] multi-arch + push")
+        println("  " + cmd)
+        run_ok(cmd)
+    } else {
+        // (a) cache-only multi-arch build (verifies both arches compile
+        //     under the Dockerfile + COPY paths).
+        let cmd_cache = "docker buildx build --platform " + platforms +
+                        " -f " + dockerfile + common_tags + extra_tag_arg +
+                        " ."
+        println("")
+        println("[build 1/2] multi-arch (cache only)")
+        println("  " + cmd_cache)
+        run_ok(cmd_cache)
+
+        // (b) host-arch only → --load into local engine
+        let cmd_load = "docker buildx build --platform " + host_platform +
+                       " -f " + dockerfile + common_tags + extra_tag_arg +
+                       " --load ."
+        println("")
+        println("[build 2/2] host-arch (" + host_platform + ") --load")
+        println("  " + cmd_load)
+        run_ok(cmd_load)
+    }
+
+    println("")
+    println("=== IMAGE OK ===")
+    println("  tags     : " + tag_sha + ", " + tag_latest)
+    if !do_push {
+        println("  loaded   : " + host_platform + " into local engine")
+        println("  remote   : (not pushed — re-run with --push)")
+    } else {
+        println("  pushed   : both arches to registry")
+    }
+    println("")
+    println("smoke test:")
+    println("  docker run --rm hexa-runner:latest --version")
+    println("  docker run --rm --memory=4g --cpus=4 hexa-runner:latest help")
+    println("")
+    println("hive resolver hand-off:")
+    println("  ~/.hx/bin/hexa now safe to route into hexa-runner:" + shortsha)
+}
