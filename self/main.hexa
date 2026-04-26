@@ -331,7 +331,13 @@ fn cmd_gc_impl(dry_run, days_str, quiet) {
     // -mtime +N: mtime 이 N일 이전(초과). BSD/GNU find 동일.
     // L7 perf: dry-run uses find-only (no per-slot delete) to keep
     // sweep ≤ 50ms; live mode batches rm -rf via xargs to amortize fork.
-    let list_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d -mtime +" + days_str + " 2>/dev/null"
+    // perf-32: exclude `_layers/` (shared layer cache namespace, NOT a
+    // per-source slot). Without this, an idle `_layers` dir would be
+    // GC'd after `days_str` days and force a full-pipeline rebuild on
+    // the next invocation across ALL scripts. `! -name _layers` short-
+    // circuits before the `-mtime` test so the per-layer subdirs are
+    // never even examined.
+    let list_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d ! -name _layers -mtime +" + days_str + " 2>/dev/null"
     let listing = exec(list_cmd)
     let candidates = listing.split("\n")
     let mut removed = 0
@@ -356,7 +362,7 @@ fn cmd_gc_impl(dry_run, days_str, quiet) {
         // POSIX -delete is in-process to find. Re-runs `find` since
         // listing was already consumed for counting; mtime is monotonic
         // so the second pass sees the same set.
-        let del_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d -mtime +" + days_str + " -exec rm -rf {} + 2>/dev/null"
+        let del_cmd = "find '" + root + "' -mindepth 1 -maxdepth 1 -type d ! -name _layers -mtime +" + days_str + " -exec rm -rf {} + 2>/dev/null"
         let _del = exec(del_cmd)
         // Count of removed = original candidate count.
         let mut ci = 0
@@ -1025,7 +1031,11 @@ fn src_fingerprint(file) {
 
 fn cache_hit(slot, fp) {
     // slot dir must exist with exe + meta matching fp.
-    let chk = exec("test -x '" + slot + "/exe' && test -f '" + slot + "/meta' && cat '" + slot + "/meta' 2>/dev/null | tr -d '\\n'")
+    // Meta is multi-line as of perf-32 layered cache (line 1 = legacy fp,
+    // lines 2-4 = flatten/transpile/link layer keys for audit). Pull only
+    // the FIRST line via `head -n1` so the equality check against the
+    // single-line fp still works for both legacy and layered slots.
+    let chk = exec("test -x '" + slot + "/exe' && test -f '" + slot + "/meta' && head -n1 '" + slot + "/meta' 2>/dev/null | tr -d '\\n'")
     return chk == fp
 }
 
@@ -1221,6 +1231,19 @@ fn src_fingerprint_deep(file) {
     let ml = resolve_module_loader()
     if len(ml) > 0 {
         args = args + " '" + ml + "'"
+    }
+    // perf-32: bind runtime.c into fp so an edit to the runtime
+    // properly invalidates AOT slots (runtime.c is statically linked
+    // into every cached exe). Pre-perf-32 the file was excluded → a
+    // runtime.c bugfix would silently NOT propagate to warm AOT
+    // binaries until the script itself changed. The layered link
+    // cache then re-uses any matching `link/<key>.bin` so the rebuild
+    // is sub-second; without this fp bind, no rebuild would happen.
+    let inst_for_rt = install_dir_from_argv0()
+    if len(inst_for_rt) > 0 {
+        let rt_path = inst_for_rt + "/self/runtime.c"
+        // stat tolerates missing files (2>/dev/null) → defensive omit.
+        args = args + " '" + rt_path + "'"
     }
     // BSD (%N %m %z) first; GNU (%n %Y %s) fallback — both in the
     // same fork via ||. Schema version prepended as invalidation lever.
@@ -1418,11 +1441,84 @@ fn try_cache_exec(file, extra_args) {
     return rc
 }
 
-// ── bt 40: AOT 캐시 슬롯 빌드 + codesign ──────────────────
+// ── bt 40 + perf-32 layered: AOT 캐시 슬롯 빌드 ────────────
 // file → .hexa-cache/<hash>/exe (ad-hoc 서명 완료) 생성.
 // 반환: exe 절대경로 (성공) 또는 "" (실패 — 호출자는 interp fallback).
-// 호출처: 향후 cmd_run AOT 경로 복원 시 또는 `hexa cache build` 전용 커맨드.
+// 호출처: cmd_run AOT 경로 + 향후 `hexa cache build` 전용 커맨드.
 // bt 37 패턴 답습: `exe.tmp.$$` + codesign + mv -f (atomic rename).
+//
+// LAYERED CONTENT CACHE (2026-04-26 perf-32 follow-up to 72eb8367)
+// ----------------------------------------------------------------
+// Pre-flatten via module_loader fixed correctness (use-imports link)
+// but tripled cold compile to ~3-4s wall:
+//   module_loader ~500ms · hexa_v2 ~2.5s · clang ~1s
+// Each phase output is content-addressable, so we add a shared
+// namespace `<cache_root>/_layers/{flatten,transpile,link}/<hash>.*`.
+//
+// Keys (each is the sha256 of the conceptual content of the stage's
+// inputs, computed cheaply via `cat | sha256sum` on file paths):
+//   flatten_key   = sha256(script + every transitive `use` file +
+//                          module_loader.hexa + cache_schema_version)
+//   transpile_key = sha256(flatten_key + hexa_v2 binary content)
+//   link_key      = sha256(transpile_key + runtime.c content +
+//                          uname + clang flag set)
+//
+// Hit vs. miss matrix (typical edits):
+//   - script unchanged                   → flatten + transpile + link hit
+//   - script body edit, no use-graph delta → flatten miss, transpile
+//                                            usually miss (any AST edit),
+//                                            link miss (new exe)
+//   - comment-only edit                  → flatten miss but identical
+//                                          bundle bytes → transpile reuses
+//                                          via secondary content-hash on
+//                                          the bundle (see _aot_layer_*)
+//   - runtime.c edit                     → flatten + transpile hit, only
+//                                          link re-runs
+//   - hexa_v2 binary updated             → flatten hit, transpile + link miss
+//
+// The slot meta records BOTH the legacy fp (for cmd_run's cache_hit
+// fast path) and the three layer keys (for debug / future audit).
+
+// _aot_layer_root: shared layer cache namespace under cache_root.
+fn _aot_layer_root() {
+    let root = cache_root()
+    let lr = root + "/_layers"
+    exec("mkdir -p '" + lr + "/flatten' '" + lr + "/transpile' '" + lr + "/link' 2>/dev/null")
+    return lr
+}
+
+// _aot_hash_files: sha256 of concatenated file contents (in order).
+// Empty paths skipped so callers can pass conditionally-absent files
+// without branching. Returns "" if no readable input → caller treats
+// as cache-disable signal (conservative: rebuild rather than collide).
+fn _aot_hash_files(paths) {
+    if len(paths) == 0 { return "" }
+    let mut args = ""
+    let mut i = 0
+    while i < len(paths) {
+        let p = paths[i]
+        if len(p) > 0 { args = args + " '" + p + "'" }
+        i = i + 1
+    }
+    if len(args) == 0 { return "" }
+    // Portable sha256 (matches source_key/src_fingerprint_deep).
+    // `cat` of 0-byte inputs produces empty stream → sha256 of empty.
+    // Cap output at 64 hex chars (full sha256) for cross-collision safety.
+    let h = exec("cat" + args + " 2>/dev/null | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-64 | tr -d '\\n'")
+    return h
+}
+
+// _aot_hash_str: sha256 of an ad-hoc string. Used to mix non-file
+// inputs (cache schema version, uname, CFLAG set) into a layer key
+// without a temp-file dance.
+fn _aot_hash_str(s) {
+    // POSIX printf %s — no shell interpretation of `s` beyond single-quote.
+    // Caller is responsible for passing already-escape-safe strings; all
+    // our internal inputs are alnum/. only.
+    let h = exec("printf '%s' '" + s + "' | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-64 | tr -d '\\n'")
+    return h
+}
+
 fn aot_build_slot(file) {
     let root = cache_root()
     let key = source_key(file)
@@ -1451,13 +1547,14 @@ fn aot_build_slot(file) {
             return slot + "/exe"
         }
     }
-    // 1) 트랜스파일: file.hexa → slot/src.c
-    //    buglist#5: resolve_hexa_v2() 경유 — cwd 무관하게 install_dir 기반 탐색.
+    // 1) 트랜스파일 prep: resolve_hexa_v2() (cwd 무관 install_dir base).
     let v2 = resolve_hexa_v2()
     if len(v2) == 0 {
         exec("rmdir '" + lock + "' 2>/dev/null")
         return ""
     }
+
+    // ── Layer 1: FLATTEN ────────────────────────────────────
     // 2026-04-26 perf-32: pre-flatten `use "..."` / `import "..."` via
     // module_loader BEFORE hexa_v2 — same loader as cmd_run's interp path
     // (line 1582-1627). Without this step, codegen_c2._resolve_use_emit
@@ -1472,56 +1569,167 @@ fn aot_build_slot(file) {
     // the transpiler reads `#!hexa strict` as `!hexa` + bare `strict` ids
     // and clang fails parse). interp tolerated shebangs as pragma comments
     // so the cmd_run path was unaffected.
-    let mut __aot_actual_src = file
+    let layer_root = _aot_layer_root()
     let __aot_src_probe = read_file(file)
     let __aot_has_directive =
         __aot_src_probe.contains("\nuse \"") || __aot_src_probe.starts_with("use \"") ||
         __aot_src_probe.contains("\nimport \"") || __aot_src_probe.starts_with("import \"")
+    let __aot_bundle = slot + "/bundle.hexa"
+    let mut __aot_actual_src = file
+    let mut flatten_key = ""
     if __aot_has_directive {
         let __aot_ml = resolve_module_loader()
         if len(__aot_ml) > 0 {
-            let __aot_interp = resolve_interp()
-            if len(__aot_interp) > 0 {
-                let __aot_bundle = slot + "/bundle.hexa"
-                let __aot_preproc = "'" + __aot_interp + "' '" + __aot_ml + "' '" + file + "' '" + __aot_bundle + "' 2>&1"
-                let __aot_pp = exec_with_status(__aot_preproc)
-                let __aot_pp_rc = __aot_pp[1]
-                if __aot_pp_rc == 2 && __aot_pp[0].contains("[module_loader] FATAL") {
-                    exec("rmdir '" + lock + "' 2>/dev/null")
-                    return ""
-                }
+            // flatten_key inputs: every file whose CONTENT shapes the
+            // flattened bundle — script + every transitive `use`/`import`
+            // target + module_loader.hexa itself (loader edits change
+            // inlining behavior). schema_version is mixed in via the
+            // wrapper script string so a global cache flush is one-flag
+            // (bump cache_schema_version → all keys diverge).
+            let imp_paths = list_transitive_imports(file)
+            let mut hash_inputs = []
+            let mut hi = 0
+            while hi < len(imp_paths) {
+                hash_inputs.push(imp_paths[hi])
+                hi = hi + 1
+            }
+            hash_inputs.push(__aot_ml)
+            let content_h = _aot_hash_files(hash_inputs)
+            // Mix schema version + a fixed prefix to namespace this
+            // family of keys away from any future layer-cache refactor.
+            flatten_key = _aot_hash_str("flatten|" + cache_schema_version() + "|" + content_h)
+        }
+        if len(flatten_key) > 0 {
+            let cache_bundle = layer_root + "/flatten/" + flatten_key + ".hexa"
+            if file_exists(cache_bundle) {
+                // HIT: copy cached bundle into slot for downstream reuse.
+                exec("cp -f '" + cache_bundle + "' '" + __aot_bundle + "' 2>/dev/null")
                 if file_exists(__aot_bundle) {
                     __aot_actual_src = __aot_bundle
                 }
+            } else {
+                // MISS: run module_loader, then promote to layer cache.
+                let __aot_interp = resolve_interp()
+                if len(__aot_interp) > 0 {
+                    let __aot_preproc = "'" + __aot_interp + "' '" + __aot_ml + "' '" + file + "' '" + __aot_bundle + "' 2>&1"
+                    let __aot_pp = exec_with_status(__aot_preproc)
+                    let __aot_pp_rc = __aot_pp[1]
+                    if __aot_pp_rc == 2 && __aot_pp[0].contains("[module_loader] FATAL") {
+                        exec("rmdir '" + lock + "' 2>/dev/null")
+                        return ""
+                    }
+                    if file_exists(__aot_bundle) {
+                        __aot_actual_src = __aot_bundle
+                        // Atomic promote via tmp+mv so a concurrent
+                        // builder can't observe a half-written layer.
+                        let tmp_b = cache_bundle + ".tmp." + str(mono_ns())
+                        exec("cp -f '" + __aot_bundle + "' '" + tmp_b + "' 2>/dev/null && mv -f '" + tmp_b + "' '" + cache_bundle + "' 2>/dev/null")
+                    }
+                }
+            }
+        }
+        // If ml didn't resolve OR flatten_key empty, we leave
+        // __aot_actual_src = file. Matches pre-perf-32 behavior:
+        // hexa_v2 will either resolve `use` itself (limited) or fail,
+        // and on failure aot_build_slot returns "" → cmd_run falls
+        // through to interp. No regression vs. the original code path.
+    }
+
+    // ── Layer 2: TRANSPILE ──────────────────────────────────
+    // Key on the SECONDARY content hash of the actual transpile input
+    // (bundle for use/import scripts, raw file otherwise) so a comment-
+    // only flatten that produces identical bundle bytes still hits.
+    // Mix in the hexa_v2 binary content — transpiler upgrades naturally
+    // invalidate.
+    let c_file = slot + "/src.c"
+    let bundle_h = _aot_hash_files([__aot_actual_src])
+    let v2_h = _aot_hash_files([v2])
+    let mut transpile_key = ""
+    if len(bundle_h) > 0 && len(v2_h) > 0 {
+        transpile_key = _aot_hash_str("transpile|" + cache_schema_version() + "|" + bundle_h + "|" + v2_h)
+    }
+    let mut transpile_hit = false
+    if len(transpile_key) > 0 {
+        let cache_c = layer_root + "/transpile/" + transpile_key + ".c"
+        if file_exists(cache_c) {
+            exec("cp -f '" + cache_c + "' '" + c_file + "' 2>/dev/null")
+            if file_exists(c_file) { transpile_hit = true }
+        }
+    }
+    if !transpile_hit {
+        let _trans = exec(v2 + " '" + __aot_actual_src + "' '" + c_file + "' 2>&1")
+        let ok_c = exec("test -f '" + c_file + "' && printf yes || printf no")
+        if ok_c != "yes" {
+            exec("rmdir '" + lock + "' 2>/dev/null")
+            return ""
+        }
+        if len(transpile_key) > 0 {
+            let cache_c = layer_root + "/transpile/" + transpile_key + ".c"
+            let tmp_c = cache_c + ".tmp." + str(mono_ns())
+            exec("cp -f '" + c_file + "' '" + tmp_c + "' 2>/dev/null && mv -f '" + tmp_c + "' '" + cache_c + "' 2>/dev/null")
+        }
+    }
+
+    // ── Layer 3: LINK ───────────────────────────────────────
+    // Key on the C-source content hash + runtime.c content + uname +
+    // clang flag set. -O2 / -fbracket-depth=4096 / strict-FP all bake
+    // into the same flag string so a flag refactor invalidates cleanly.
+    let __inst_a = install_dir_from_argv0()
+    let runtime_c = __inst_a + "/self/runtime.c"
+    let _strict_a = strict_fp_cflags(c_file)
+    let cflag_str = "clang|-O2|" + os_clang_cflags() + _strict_a + "-Wno-trigraphs|-fbracket-depth=4096|-I" + __inst_a + "/self" + os_clang_ldflags()
+    let uname_str = exec("uname 2>/dev/null | tr -d ' \\n\\t'")
+    let c_h = _aot_hash_files([c_file])
+    let rt_h = _aot_hash_files([runtime_c])
+    let mut link_key = ""
+    if len(c_h) > 0 && len(rt_h) > 0 {
+        link_key = _aot_hash_str("link|" + cache_schema_version() + "|" + c_h + "|" + rt_h + "|" + uname_str + "|" + cflag_str)
+    }
+    let tmp = exec("printf '%s/exe.tmp.%s' '" + slot + "' \"$$\"")
+    let mut link_hit = false
+    if len(link_key) > 0 {
+        let cache_bin = layer_root + "/link/" + link_key + ".bin"
+        if file_exists(cache_bin) {
+            exec("cp -f '" + cache_bin + "' '" + tmp + "' 2>/dev/null && chmod +x '" + tmp + "' 2>/dev/null")
+            let ok_t = exec("test -x '" + tmp + "' && printf yes || printf no")
+            if ok_t == "yes" {
+                // Re-codesign the per-slot copy. The cached blob is
+                // already signed, but the inode identity changes on
+                // copy → macOS Gatekeeper requires re-sign. No-op on
+                // Linux. Cheap (~20ms) vs. a full clang re-link.
+                codesign_if_macos(tmp)
+                link_hit = true
             }
         }
     }
-    let c_file = slot + "/src.c"
-    let _trans = exec(v2 + " '" + __aot_actual_src + "' '" + c_file + "' 2>&1")
-    let ok_c = exec("test -f '" + c_file + "' && printf yes || printf no")
-    if ok_c != "yes" {
-        exec("rmdir '" + lock + "' 2>/dev/null")
-        return ""
+    if !link_hit {
+        // bt 54 + buglist#5 + bt 74+ (-fbracket-depth=4096) — see callers
+        // upstream for the rationale on each flag. KEEP cflag_str above
+        // in sync with this exec line; the link cache key derives from it.
+        let compile = exec("clang -O2 " + os_clang_cflags() + _strict_a + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
+        let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
+        if ok_tmp != "yes" {
+            exec("rmdir '" + lock + "' 2>/dev/null")
+            return ""
+        }
+        // bt 40: codesign (macOS 한정, 실패 시 warning only)
+        codesign_if_macos(tmp)
+        // Promote signed binary to layer cache (post-codesign so warm
+        // copies skip the sign step too — though we re-sign on copy
+        // for inode-identity safety above).
+        if len(link_key) > 0 {
+            let cache_bin = layer_root + "/link/" + link_key + ".bin"
+            let tmp_b = cache_bin + ".tmp." + str(mono_ns())
+            exec("cp -f '" + tmp + "' '" + tmp_b + "' 2>/dev/null && chmod +x '" + tmp_b + "' 2>/dev/null && mv -f '" + tmp_b + "' '" + cache_bin + "' 2>/dev/null")
+        }
     }
-    // 2) clang → slot/exe.tmp.$$ (atomic rename 준비, bt 37 패턴)
-    let tmp = exec("printf '%s/exe.tmp.%s' '" + slot + "' \"$$\"")
-    // bt 54: int→ptr / implicit-fn 근본 해소 — 플래그 제거.
-    // buglist#5: -I self 도 install_dir 절대경로로.
-    // bt 74+ (20260415): -fbracket-depth=4096 for deep concat chains; mirror
-    //   of the other compile site above. Both sites must be kept in sync.
-    let __inst_a = install_dir_from_argv0()
-    let _strict_a = strict_fp_cflags(c_file)
-    let compile = exec("clang -O2 " + os_clang_cflags() + _strict_a + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
-    let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
-    if ok_tmp != "yes" {
-        exec("rmdir '" + lock + "' 2>/dev/null")
-        return ""
-    }
-    // 3) bt 40: codesign (macOS 한정, 실패 시 warning only)
-    codesign_if_macos(tmp)
-    // 4) atomic rename tmp → exe, meta 기록.
+    // 4) atomic rename tmp → exe, meta 기록 (legacy fp + layer keys for audit).
     let _mv = exec("mv -f '" + tmp + "' '" + slot + "/exe' 2>&1")
-    let _meta = exec("printf '%s' '" + fp + "' > '" + slot + "/meta'")
+    // Meta line 1 = legacy fp (cache_hit reads cat+trim → only first
+    // line matters for the existing fast path). Lines 2-4 = layer keys
+    // for `hexa cache inspect` / future debug. printf %s\n keeps the
+    // record self-describing without bloating warm-hit syscalls.
+    let _meta = exec("printf '%s\\n%s\\n%s\\n%s\\n' '" + fp + "' 'flatten=" + flatten_key + "' 'transpile=" + transpile_key + "' 'link=" + link_key + "' > '" + slot + "/meta'")
     exec("rmdir '" + lock + "' 2>/dev/null")
     return slot + "/exe"
 }
