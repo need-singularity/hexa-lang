@@ -205,6 +205,15 @@ ENV HEXA_STDLIB_ROOT=/usr/local/bin/self/stdlib
 # on darwin hosts (macOS SIP blocks DYLD_INSERT_LIBRARIES on signed bins,
 # so the host shim is advisory; Linux containers carry the real teeth).
 # Opt-out (emergency only): docker run -e CLAUDX_NO_SANDBOX=1 ...
+#
+# LIMITATION: LD_PRELOAD applies to *dynamically-linked* child processes only.
+# The hexa CLI itself ships as a static musl ELF (see Stage 0 above —
+# build/hexa_linux_{arm64,x86_64} report `statically linked, stripped`), so
+# its direct file IO (raw_loader, codegen output) bypasses this shim.  hexa's
+# own write paths are covered by L0 agent-layer pre_tool_guard and the CLI's
+# in-process raw_loader assertions; this LD_PRELOAD layer is L1 — the dynamic
+# child enforcer (curl/wget/busybox sh).  Full ladder:
+# doc/security/os-level-enforcement-limits.md §11.
 COPY --from=builder /opt/hexa/native_gate.so /opt/hexa/native_gate.so
 ENV LD_PRELOAD=/opt/hexa/native_gate.so
 
