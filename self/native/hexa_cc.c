@@ -15269,7 +15269,7 @@ HexaVal _gen2_arm_is_trivial(HexaVal body) {
 }
 
 
-HexaVal _gen2_if_arm_block_expr(HexaVal body) {
+HexaVal _gen2_arm_block_expr(HexaVal body) {
     __hexa_fn_arena_enter();
     if (hexa_truthy(hexa_eq(hexa_type_of(body), __hexa_codegen_c2_sl_119))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_438);
@@ -17366,8 +17366,8 @@ HexaVal gen2_expr(HexaVal node) {
             }
             return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(__hexa_codegen_c2_sl_1177, c), __hexa_codegen_c2_sl_545), t_val), __hexa_codegen_c2_sl_546), e_val), __hexa_codegen_c2_sl_272));
         }
-        HexaVal _t_arm = _gen2_if_arm_block_expr(hexa_map_get_ic(node, "then_body", &__hexa_codegen_c2_ic_686));
-        HexaVal _e_arm = _gen2_if_arm_block_expr(hexa_map_get_ic(node, "else_body", &__hexa_codegen_c2_ic_687));
+        HexaVal _t_arm = _gen2_arm_block_expr(hexa_map_get_ic(node, "then_body", &__hexa_codegen_c2_ic_686));
+        HexaVal _e_arm = _gen2_arm_block_expr(hexa_map_get_ic(node, "else_body", &__hexa_codegen_c2_ic_687));
         return __hexa_fn_arena_return(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(hexa_add(__hexa_codegen_c2_sl_1177, c), __hexa_codegen_c2_sl_545), _t_arm), __hexa_codegen_c2_sl_546), _e_arm), __hexa_codegen_c2_sl_272));
     }
     if (hexa_truthy(hexa_eq(k, __hexa_codegen_c2_sl_384))) {
@@ -17809,6 +17809,9 @@ HexaVal gen2_arm_value(HexaVal body) {
     __hexa_fn_arena_enter();
     if (hexa_truthy(hexa_bool(hexa_truthy(hexa_eq(hexa_type_of(body), __hexa_codegen_c2_sl_119)) || hexa_truthy(hexa_eq(hexa_int(hexa_len(body)), hexa_int(0)))))) {
         return __hexa_fn_arena_return(__hexa_codegen_c2_sl_438);
+    }
+    if (hexa_truthy(hexa_bool(!hexa_truthy(_gen2_arm_is_trivial(body))))) {
+        return __hexa_fn_arena_return(_gen2_arm_block_expr(body));
     }
     HexaVal last = hexa_index_get(body, hexa_sub(hexa_int(hexa_len(body)), hexa_int(1)));
     if (hexa_truthy(hexa_eq(hexa_map_get_ic(last, "kind", &__hexa_codegen_c2_ic_753), __hexa_codegen_c2_sl_326))) {
