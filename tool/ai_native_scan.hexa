@@ -1,14 +1,29 @@
 // ai_native_scan — scan repo for ai-native naming violations (report-only)
 //
 // Rules checked:
-//   F1  version suffix  _v\d+ _\d+ \d+$      codegen_v2.hexa   codegen2.hexa
+//   F1  version suffix  _v\d+ _mk\d+ \d+$    codegen_v2.hexa   codegen_mk3.hexa
 //   F2  stage/phase #   stage\d phase\d p\d  rebuild_interp    phase1.hexa
 //   F3  temp suffix     _old _new _bak _tmp  foo_old.hexa
 //   F4  generic dir     utils/ helpers/ common/ lib/ misc/ core/
 //   F5  loner dir       folder with only 1 file  → flatten
-//   F6  parent-child    parser/parser_*.hexa redundant
+//   F6  parent-child    parser/parser.hexa or parser/parser_*.hexa redundant
+//                       (basename stem == parent dir name)
 //
 // Pure report. Exit 0 always. Does not modify anything.
+//
+// flags:
+//   --selftest          run pure-fn assertions, exit 0/1
+//   --root <path>       additional scan root (absolute path); may repeat.
+//                       The hardcoded candidate list (self/scripts/tests/
+//                       bench/tool/gate, cwd-relative) is still tried as
+//                       the default. --root scans those paths in addition
+//                       to (not instead of) the defaults. If the only
+//                       defaults that exist are absent, --root alone
+//                       still drives the scan.
+//   --all-ext           relax F1/F2/F3 .hexa-only filter — scan every
+//                       regular file (after the prune list). F4/F5/F6
+//                       directory + stem checks are unaffected. Default
+//                       behavior unchanged for raw#9 selftest compat.
 //
 // 2026-04-20 RSS fix: the old recursive `list_dir` + per-entry `test -d`
 // walk plus pure-hexa helpers (substring/split) leaked ~2.2GB of
@@ -17,11 +32,16 @@
 // The scan logic is now delegated to a single shell pipeline per rule:
 // hexa only sees the violation lines (≤ a handful) instead of walking
 // ~1800 files in-interpreter. Post-fix RSS: ~600MB standalone.
+//
+// 2026-04-26 scope fix: --root + --all-ext flags added so hive's
+// packages/ tree can be linted from any cwd. Default flow unchanged.
 
 fn _prune_args() -> string {
-    // Shell-level prune: hidden dirs, node_modules, target, build,
+    // Shell-level prune: hidden dirs, node_modules, target, build, dist,
     // tool/pkg (vendored packages), tool/bin (hx install hook convention).
-    return "\\( -path '*/.*' -o -path '*/node_modules/*' -o -path '*/target/*' -o -path '*/build/*' -o -path 'tool/pkg' -o -path 'tool/bin' -o -path '*/tool/pkg' -o -path '*/tool/bin' \\) -prune -o"
+    // dist/ added 2026-04-26 — TS build output (packages/*/dist/) is
+    // regenerated on every build, so flagging dist/utils etc. is noise.
+    return "\\( -path '*/.*' -o -path '*/node_modules/*' -o -path '*/target/*' -o -path '*/build/*' -o -path '*/dist/*' -o -path 'tool/pkg' -o -path 'tool/bin' -o -path '*/tool/pkg' -o -path '*/tool/bin' \\) -prune -o"
 }
 
 fn _roots_str() -> string {
@@ -38,6 +58,30 @@ fn _roots_str() -> string {
         i = i + 1
     }
     return out
+}
+
+fn _extra_roots_str(extras: array) -> string {
+    // Filter --root-supplied paths to ones that exist as directories.
+    // Each path is single-quoted to survive whitespace; absolute paths
+    // recommended so find's prune patterns (`*/.*` etc.) still work.
+    let mut out = ""
+    let mut i = 0
+    while i < len(extras) {
+        let p = extras[i]
+        let ok = exec("test -d '" + p + "' && echo D || echo F").trim()
+        if ok == "D" {
+            if out != "" { out = out + " " }
+            out = out + "'" + p + "'"
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn _join_roots(default_roots: string, extra_roots: string) -> string {
+    if default_roots == "" { return extra_roots }
+    if extra_roots == "" { return default_roots }
+    return default_roots + " " + extra_roots
 }
 
 fn _run_rule(cmd: string) -> array {
@@ -69,6 +113,51 @@ fn cmd_selftest() -> i64 {
     // _run_rule with a single-line echo returns 1 element.
     let one = _run_rule("echo hello")
     if len(one) != 1 { println("[ai_native_scan selftest] FAIL _run_rule single"); return 1 }
+
+    // _join_roots merges with single space, handles empty sides.
+    if _join_roots("a b", "c") != "a b c" { println("[ai_native_scan selftest] FAIL _join_roots both"); return 1 }
+    if _join_roots("", "c") != "c" { println("[ai_native_scan selftest] FAIL _join_roots empty default"); return 1 }
+    if _join_roots("a", "") != "a" { println("[ai_native_scan selftest] FAIL _join_roots empty extra"); return 1 }
+    if _join_roots("", "") != "" { println("[ai_native_scan selftest] FAIL _join_roots both empty"); return 1 }
+
+    // _extra_roots_str: synthetic temp dir round-trip.
+    let tmp_setup = exec("d=\"/tmp/ai_native_scan_st_$$\"; mkdir -p \"$d/utils\"; echo \"$d\"").trim()
+    if tmp_setup == "" { println("[ai_native_scan selftest] FAIL tmp setup"); return 1 }
+    let extras = [tmp_setup]
+    let er = _extra_roots_str(extras)
+    let want = "'" + tmp_setup + "'"
+    if er != want { println("[ai_native_scan selftest] FAIL _extra_roots_str real path: got=" + er + " want=" + want); exec("rm -rf '" + tmp_setup + "' 2>/dev/null"); return 1 }
+
+    // Missing path is silently dropped.
+    let missing = "/tmp/ai_native_scan_st_does_not_exist_xyz"
+    let er2 = _extra_roots_str([missing])
+    if er2 != "" { println("[ai_native_scan selftest] FAIL _extra_roots_str missing not dropped: " + er2); exec("rm -rf '" + tmp_setup + "' 2>/dev/null"); return 1 }
+
+    // End-to-end: F4 generic-dir lint should flag the synthetic utils/ dir
+    // when scanned with --root semantics applied to a path containing only
+    // the violation. We piggyback on the live awk pipeline by simulating
+    // _join_roots + _run_rule against `find`-quoted root.
+    let prune2 = _prune_args()
+    let f4_cmd = "find " + er + " " + prune2 + " -type d -print 2>/dev/null | awk -F/ '{ b=$NF; if (b == \"utils\" || b == \"helpers\" || b == \"common\" || b == \"lib\" || b == \"misc\" || b == \"stuff\" || b == \"core\" || b == \"base\") print $0 }'"
+    let f4_hits = _run_rule(f4_cmd)
+    if len(f4_hits) < 1 { exec("rm -rf '" + tmp_setup + "' 2>/dev/null"); println("[ai_native_scan selftest] FAIL synthetic F4 utils not detected"); return 1 }
+
+    // --all-ext: drop a synthetic `.hxc` _v1 file + a `.txt.tmp` file in
+    // the temp tree, run the F1 and F3 pipelines with the all-ext stem
+    // strip, and confirm both register. Mirrors the hive audit-found
+    // violations (sample_v1.hxc, *.txt.tmp) so a regression here means
+    // the audit-target hits would silently disappear again.
+    exec("touch '" + tmp_setup + "/sample_v1.hxc'")
+    exec("touch '" + tmp_setup + "/crash.txt.tmp'")
+    let strip_all = "sub(/\\.[^.]+$/, \"\", f);"
+    let f1_cmd = "find " + er + " " + prune2 + " -type f -print 2>/dev/null | awk -F/ '{ f=$NF; " + strip_all + " if (f ~ /_v[0-9]+$/ || f ~ /_mk[0-9]+$/) print $0 }'"
+    let f1_hits = _run_rule(f1_cmd)
+    let f3_cmd = "find " + er + " " + prune2 + " -type f -print 2>/dev/null | awk -F/ '{ raw=$NF; f=raw; " + strip_all + " if (f ~ /(_old|_new|_bak|_tmp|_copy|_backup|_save)$/ || raw ~ /\\.(tmp|bak|old|new)$/) print $0 }'"
+    let f3_hits = _run_rule(f3_cmd)
+    exec("rm -rf '" + tmp_setup + "' 2>/dev/null")
+    if len(f1_hits) < 1 { println("[ai_native_scan selftest] FAIL --all-ext F1 _v1.hxc not detected"); return 1 }
+    if len(f3_hits) < 1 { println("[ai_native_scan selftest] FAIL --all-ext F3 .txt.tmp not detected"); return 1 }
+
     println("[ai_native_scan selftest] OK")
     return 0
 }
@@ -76,18 +165,53 @@ fn cmd_selftest() -> i64 {
 fn main() {
     let argv = args()
     if len(argv) > 2 && (argv[2] == "--selftest" || argv[2] == "selftest") { exit(cmd_selftest()) }
-    let roots = _roots_str()
+
+    // Parse --root <path> (repeatable) + --all-ext flags. Defensive walk
+    // so unknown args silently pass through (legacy compat).
+    let mut extra_roots = []
+    let mut all_ext = false
+    let mut ai = 2
+    while ai < len(argv) {
+        let a = argv[ai]
+        if a == "--root" {
+            if ai + 1 < len(argv) {
+                extra_roots.push(argv[ai + 1])
+                ai = ai + 2
+                continue
+            }
+        }
+        if a == "--all-ext" { all_ext = true }
+        ai = ai + 1
+    }
+
+    let default_roots = _roots_str()
+    let extra_str = _extra_roots_str(extra_roots)
+    let roots = _join_roots(default_roots, extra_str)
     if roots == "" {
         println("ai-native-scan: CLEAN — 0 violations")
         return
     }
 
     let prune = _prune_args()
-    let find_files = "find " + roots + " " + prune + " -type f -name '*.hexa' -print 2>/dev/null"
+    // --all-ext flips the F1/F2/F3/F5/F6 file filter from `.hexa`-only to
+    // every regular file. F4 is dir-only so it is unaffected.
+    //
+    // Stem extraction strategies:
+    //   default  → strip exactly `.hexa` (legacy semantic).
+    //   all-ext  → strip the final dotted extension once (e.g. `_v1.hxc`
+    //             → `_v1`, `foo.txt.tmp` → `foo.txt`). Then the regex
+    //             tests the stripped stem AND, separately, the F3 awk
+    //             also consults the *unstripped* basename so `.tmp` /
+    //             `.bak` extension-as-suffix patterns register too.
+    let name_filter = if all_ext { "" } else { " -name '*.hexa'" }
+    let strip_ext = if all_ext { "sub(/\\.[^.]+$/, \"\", f);" } else { "sub(/\\.hexa$/, \"\", f);" }
+    let find_files = "find " + roots + " " + prune + " -type f" + name_filter + " -print 2>/dev/null"
     let find_dirs  = "find " + roots + " " + prune + " -type d -print 2>/dev/null"
 
-    // F1 — _v\d+ suffix in stem (excluding .hexa extension).
-    let f1 = _run_rule(find_files + " | awk -F/ '{ f=$NF; sub(/\\.hexa$/, \"\", f); if (f ~ /_v[0-9]+$/) print $0 }'")
+    // F1 — _v\d+ or _mk\d+ suffix in stem (excluding final extension).
+    // 2026-04-26: extended to catch _mk\d+ variant (e.g. codegen_mk3.hexa) per
+    // hive audit raw_file_naming_2026-04-26 — was missing this Mk-revision idiom.
+    let f1 = _run_rule(find_files + " | awk -F/ '{ f=$NF; " + strip_ext + " if (f ~ /_v[0-9]+$/ || f ~ /_mk[0-9]+$/) print $0 }'")
 
     // F2 — stage[0-3] / phase[0-3] / p\d{1,2} segment.
     // No whitelist exceptions — all stage/phase/p-prefixed segments are
@@ -95,7 +219,7 @@ fn main() {
     let f2 = _run_rule(
         find_files +
         " | awk -F/ '{" +
-        " f=$NF; sub(/\\.hexa$/, \"\", f);" +
+        " f=$NF; " + strip_ext +
         " n=split(f, parts, \"_\");" +
         " for (i=1; i<=n; i++) { p=parts[i];" +
         "   if (p ~ /^stage[0-3]$/ || p ~ /^phase[0-3]$/ || p ~ /^p[0-9][0-9]?$/) { print $0; break }" +
@@ -103,7 +227,11 @@ fn main() {
     )
 
     // F3 — _old / _new / _bak / _tmp / _copy / _backup / _save suffix.
-    let f3 = _run_rule(find_files + " | awk -F/ '{ f=$NF; sub(/\\.hexa$/, \"\", f); if (f ~ /(_old|_new|_bak|_tmp|_copy|_backup|_save)$/) print $0 }'")
+    // Under --all-ext also flag literal `.tmp` / `.bak` / `.old` / `.new`
+    // extension-as-suffix on the *unstripped* basename — these are write
+    // crash residues that escape the stem-only regex.
+    let f3_extra = if all_ext { " || raw ~ /\\.(tmp|bak|old|new)$/" } else { "" }
+    let f3 = _run_rule(find_files + " | awk -F/ '{ raw=$NF; f=raw; " + strip_ext + " if (f ~ /(_old|_new|_bak|_tmp|_copy|_backup|_save)$/" + f3_extra + ") print $0 }'")
 
     // F4 — generic directory basenames.
     let f4 = _run_rule(find_dirs + " | awk -F/ '{ b=$NF; if (b == \"utils\" || b == \"helpers\" || b == \"common\" || b == \"lib\" || b == \"misc\" || b == \"stuff\" || b == \"core\" || b == \"base\") print $0 }'")
@@ -126,6 +254,26 @@ fn main() {
         "} }'"
     )
 
+    // F6 — file basename stem equals parent dir basename (e.g. parser/parser.hexa).
+    // Also flags parent/parent_child.hexa prefix-match (basename stem starts with
+    // \"parent_\"). Whitelist: index/mod/main/lib stems are intentional entry-points
+    // and never flagged. Top-level files (NF<2) skipped — no parent dir.
+    // F6 still uses `.hexa`-only strip — parent-child semantics only meaningful
+    // for source modules. Under --all-ext we leave the legacy strip so binary
+    // assets (e.g. dist/dist.js, foo/foo.png) don't flood the output.
+    let f6 = _run_rule(
+        find_files +
+        " | awk -F/ '" +
+        "{ if (NF < 2) next;" +
+        "  fname=$NF; pdir=$(NF-1);" +
+        "  stem=fname; sub(/\\.hexa$/, \"\", stem);" +
+        "  if (stem == \"index\" || stem == \"mod\" || stem == \"main\" || stem == \"lib\") next;" +
+        "  if (stem == pdir) { print $0; next }" +
+        "  pfx = pdir \"_\";" +
+        "  if (index(stem, pfx) == 1) { print $0 }" +
+        "}'"
+    )
+
     // Collect in original ordering (F4 before F1..F3 before F5 matches the
     // legacy output sequence for stable diffing).
     let mut violations = []
@@ -139,6 +287,8 @@ fn main() {
     while i < len(f3) { violations.push(["F3-temp", f3[i]]); i = i + 1 }
     i = 0
     while i < len(f5) { violations.push(["F5-loner", f5[i]]); i = i + 1 }
+    i = 0
+    while i < len(f6) { violations.push(["F6-parent-child", f6[i]]); i = i + 1 }
 
     if len(violations) == 0 {
         println("ai-native-scan: CLEAN — 0 violations")
@@ -154,9 +304,10 @@ fn main() {
     }
     println("")
     println("Legend:")
-    println("  F1  version suffix    _v\\d+ or _\\d+ at stem end")
+    println("  F1  version suffix    _v\\d+ or _mk\\d+ at stem end")
     println("  F2  stage/phase #     stage0/phase1/p\\d segments")
     println("  F3  temp suffix       _old/_new/_bak/_tmp/_copy")
     println("  F4  generic dir       utils/helpers/common/lib/misc/core")
     println("  F5  loner dir         dir with single .hexa — flatten")
+    println("  F6  parent-child      stem == parent dir (or stem startswith parent_)")
 }
