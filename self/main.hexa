@@ -1677,7 +1677,13 @@ fn aot_build_slot(file) {
     let __inst_a = install_dir_from_argv0()
     let runtime_c = __inst_a + "/self/runtime.c"
     let _strict_a = strict_fp_cflags(c_file)
-    let cflag_str = "clang|-O2|" + os_clang_cflags() + _strict_a + "-Wno-trigraphs|-fbracket-depth=4096|-I" + __inst_a + "/self" + os_clang_ldflags()
+    // SH1-W1: HEXA_AOT_CC overrides the C compiler invocation. Default
+    // "clang" preserves baseline behavior (zero regression). Backend
+    // identity is folded into cflag_str → link_key, so swapping the
+    // backend invalidates the link layer cleanly.
+    let mut __aot_cc = env_var("HEXA_AOT_CC")
+    if __aot_cc == "" { __aot_cc = "clang" }
+    let cflag_str = __aot_cc + "|-O2|" + os_clang_cflags() + _strict_a + "-Wno-trigraphs|-fbracket-depth=4096|-I" + __inst_a + "/self" + os_clang_ldflags()
     let uname_str = exec("uname 2>/dev/null | tr -d ' \\n\\t'")
     let c_h = _aot_hash_files([c_file])
     let rt_h = _aot_hash_files([runtime_c])
@@ -1706,7 +1712,7 @@ fn aot_build_slot(file) {
         // bt 54 + buglist#5 + bt 74+ (-fbracket-depth=4096) — see callers
         // upstream for the rationale on each flag. KEEP cflag_str above
         // in sync with this exec line; the link cache key derives from it.
-        let compile = exec("clang -O2 " + os_clang_cflags() + _strict_a + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
+        let compile = exec(__aot_cc + " -O2 " + os_clang_cflags() + _strict_a + "-Wno-trigraphs -fbracket-depth=4096 -I '" + __inst_a + "/self' '" + c_file + "' -o '" + tmp + "'" + os_clang_ldflags() + " 2>&1")
         let ok_tmp = exec("test -x '" + tmp + "' && printf yes || printf no")
         if ok_tmp != "yes" {
             exec("rmdir '" + lock + "' 2>/dev/null")
@@ -1799,6 +1805,10 @@ fn cmd_run(file, extra_args) {
         maybe_aot_gc()
         let rc = try_cache_exec(file, extra_args)
         if rc >= 0 {
+            // ω-hexa-batch: under batch mode, surface rc to driver
+            // instead of exit(); driver continues to next script.
+            cmd_run_last_rc = rc
+            if cmd_run_no_exit_mode { return }
             if rc != 0 { exit(rc) }
             return
         }
@@ -1806,6 +1816,8 @@ fn cmd_run(file, extra_args) {
         if len(built) > 0 {
             let rc2 = try_cache_exec(file, extra_args)
             if rc2 >= 0 {
+                cmd_run_last_rc = rc2
+                if cmd_run_no_exit_mode { return }
                 if rc2 != 0 { exit(rc2) }
                 return
             }
@@ -1945,7 +1957,72 @@ fn cmd_run(file, extra_args) {
         if len(err_buf) > 0 { eprint(err_buf) }
         exec("rm -f '" + stderr_tmp + "'")
     }
+    // ω-hexa-batch (2026-04-26): when running under `hexa batch ...`,
+    // a non-zero rc must NOT abort the dispatcher — the batch driver
+    // continues to the next script and reports failures in the final
+    // summary. Mode is set/cleared by cmd_batch around each cmd_run
+    // invocation; default behavior (interactive `hexa run X`) preserves
+    // exit-on-failure so shell pipelines and CI gates still propagate rc.
+    cmd_run_last_rc = rc
+    if cmd_run_no_exit_mode {
+        return
+    }
     if rc != 0 { exit(rc) }
+}
+
+// ─── ω-hexa-batch: phase A `hexa batch` ───────────────────
+// `hexa batch <f1> <f2> ...` runs N .hexa scripts back-to-back inside
+// ONE dispatcher process. Each script still gets its own interp child
+// (full state isolation, unchanged cmd_run contract), but the host
+// dispatcher's startup cost (~2-3s wall on macOS, dominated by Mach-O
+// load + main.hexa boot) is paid ONCE rather than N times.
+//
+// Framing:
+//   - Per-script:  "===BATCH_RESULT=== file=<path> rc=<n>"  (stderr)
+//     (stdout/stderr of each script is forwarded as usual; the marker
+//      lives on stderr so callers parsing stdout JSON aren't polluted.)
+//   - Final:       "__HEXA_BATCH__ scripts=N succeeded=S failed=F wall_ms=W"
+//
+// Failures don't abort: cmd_run's exit-on-rc is suppressed via
+// cmd_run_no_exit_mode while iterating. Final exit code = 0 if all
+// succeeded, else 1 (non-zero rc summary, but specific rc values are
+// in the per-script frames so callers can recover detail).
+//
+// Phase A scope (deferred to Phase B): manifest file format, parallel
+// scheduling, per-script env isolation, in-interp script chaining.
+let mut cmd_run_no_exit_mode = false
+let mut cmd_run_last_rc = 0
+
+fn cmd_batch(files) {
+    let n = len(files)
+    if n == 0 {
+        eprintln("error: 'batch' requires one or more <file> arguments")
+        exit(2)
+    }
+    let t0 = clock()
+    let mut succeeded = 0
+    let mut failed = 0
+    let mut bi = 0
+    cmd_run_no_exit_mode = true
+    while bi < n {
+        let f = files[bi]
+        cmd_run_last_rc = 0
+        cmd_run(f, [])
+        let rc = cmd_run_last_rc
+        // Per-script frame on stderr — keeps stdout clean for JSON-emitting scripts.
+        eprintln("===BATCH_RESULT=== file=" + f + " rc=" + to_string(rc))
+        if rc == 0 {
+            succeeded = succeeded + 1
+        } else {
+            failed = failed + 1
+        }
+        bi = bi + 1
+    }
+    cmd_run_no_exit_mode = false
+    let wall_ms = (clock() - t0) * 1000.0
+    // Final sentinel (stderr) — bridge_health.sh-style callers can parse.
+    eprintln("__HEXA_BATCH__ scripts=" + to_string(n) + " succeeded=" + to_string(succeeded) + " failed=" + to_string(failed) + " wall_ms=" + to_string(wall_ms))
+    if failed > 0 { exit(1) }
 }
 
 // ─── bt 81: hexa bench harness ────────────────────────────
@@ -2576,6 +2653,22 @@ if len(av) < 3 {
             } else {
                 cmd_run_dispatch(file_arg, run_args, want_vm)
             }
+        }
+    } else if sub == "batch" {
+        // ω-hexa-batch (2026-04-26 phase A): N scripts, ONE dispatcher
+        // boot. av[3..] = list of .hexa file paths (Phase A: positional
+        // only; manifest-file / stdin-list deferred to Phase B).
+        if len(av) < 4 {
+            println("error: 'batch' requires one or more <file> arguments")
+            cmd_help()
+        } else {
+            let mut batch_files = []
+            let mut bi2 = 3
+            while bi2 < len(av) {
+                batch_files.push(av[bi2])
+                bi2 = bi2 + 1
+            }
+            cmd_batch(batch_files)
         }
     } else if sub == "bench" {
         // bt 81: hexa bench <file> [--runs N] [--json] [--compare <other_bin>]
