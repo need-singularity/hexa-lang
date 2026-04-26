@@ -86,6 +86,19 @@ RUN set -eux; \
     /usr/local/bin/hexa --version || true; \
     /usr/local/bin/build/hexa_interp --help >/dev/null 2>&1 || true
 
+# Bake module_loader + stdlib so containers WITHOUT a $HEXA_LANG bind-mount
+# (cron, launchd-in-container, isolated CI runners) can still resolve
+# `use "stdlib/X"` and `use "self/stdlib/X"` imports loud-fail-correctly.
+# Layout matches resolve_module_loader()'s argv0-relative probe (self/main.hexa
+# line 778-794): install_dir = dirname(argv[0]) = /usr/local/bin, so
+# /usr/local/bin/self/module_loader.hexa is auto-discovered without env.
+# HEXA_STDLIB_ROOT is the env-hygiene-friendly fallback (module_loader.hexa
+# lines 133-153, 173-183) — set explicitly so cron/launchd contexts that
+# inherit no env still resolve stdlib paths.
+COPY self/module_loader.hexa /usr/local/bin/self/module_loader.hexa
+COPY self/stdlib              /usr/local/bin/self/stdlib
+ENV HEXA_STDLIB_ROOT=/usr/local/bin/self/stdlib
+
 # Default workdir for user-mounted .hexa source.
 WORKDIR /work
 
