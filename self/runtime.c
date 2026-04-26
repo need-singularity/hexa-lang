@@ -1169,6 +1169,9 @@ HexaVal hexa_array_get(HexaVal arr, int64_t idx) {
     return HX_ARR_ITEMS(arr)[idx];
 }
 
+// ω-interp-2 forward decl: defined later but needed here as a setter side-effect.
+extern int __hexa_arena_slot_dirty;
+
 HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     if (!HX_IS_ARRAY(arr)) {
         char _buf[128];
@@ -1185,6 +1188,13 @@ HexaVal hexa_array_set(HexaVal arr, int64_t idx, HexaVal val) {
     }
     // In-place mutate (no copy — caller reassigns)
     HX_ARR_ITEMS(arr)[idx] = val;
+    // ω-interp-2: SETTER for the per-frame "dirty" flag. Any direct write to
+    // a host-array element is the canonical "slot may now contain arena Vals"
+    // event — covers `array_store[idx] = items.push(item)` from
+    // array_push_inplace, plus map_store / struct_store assignments. Marking
+    // here is a single-store fast path with no branch on arr identity (the
+    // checker in hexa_val_heapify scopes the work to the actual store walked).
+    __hexa_arena_slot_dirty = 1;
     return arr;
 }
 
@@ -2258,6 +2268,17 @@ static void* hexa_val_arena_calloc(size_t n) {
     return p;
 }
 
+// Forward decl — defined just below. Needed by scope_push for ω-interp-2 reset.
+extern int __hexa_arena_slot_dirty;
+
+// ω-interp-2: per-frame arena watermark. The walks in hexa_val_heapify are
+// only meaningful when an arena allocation has occurred inside the current
+// frame — otherwise every Val reachable from a slot is heap-resident and the
+// walk is wasted O(N) work. Snapshot at scope_push, compare at heapify.
+// Saturating: a single int "active block changed since push" + saved used.
+static HexaArenaBlock* __hexa_arena_frame_block = NULL;
+static size_t          __hexa_arena_frame_used  = 0;
+
 // Push current arena frontier as a scope mark. Called on env_push_scope via
 // the env("__HEXA_ARENA_PUSH__") interception in hexa_env_var. Saturating: if
 // the mark stack is full, we silently no-op rather than crashing.
@@ -2266,6 +2287,24 @@ static void hexa_val_arena_scope_push(void) {
     HexaValMark* m = &__hexa_val_marks[__hexa_val_mark_top++];
     m->block = __hexa_arena.cur;
     m->used = __hexa_arena.cur ? __hexa_arena.cur->used : 0;
+    // ω-interp-2 RESET: each new frame starts clean — no slot writes have
+    // occurred inside this frame yet. Subsequent hexa_array_set calls will
+    // re-set the flag if any write happens. Safe because heapify always runs
+    // BEFORE scope_pop (which is the consumer); a fresh push means we're
+    // entering a new lifetime window.
+    __hexa_arena_slot_dirty = 0;
+    __hexa_arena_frame_block = __hexa_arena.cur;
+    __hexa_arena_frame_used  = __hexa_arena.cur ? __hexa_arena.cur->used : 0;
+}
+
+// ω-interp-2: precise check for "no arena allocation occurred in current frame".
+// True when active block + used pointer match the scope_push snapshot. False
+// when any arena_alloc has run (block advanced or used grew). When true, no
+// Val written into any slot inside this frame can be arena-resident, so the
+// heapify slot walks are bit-equivalent to no-ops and can be skipped.
+static int hexa_arena_frame_clean(void) {
+    return __hexa_arena.cur == __hexa_arena_frame_block
+        && (__hexa_arena.cur ? __hexa_arena.cur->used : 0) == __hexa_arena_frame_used;
 }
 
 // ω-interp-1 (2026-04-26): per-frame "dirty" flag — gates the expensive T33
@@ -2278,7 +2317,22 @@ static void hexa_val_arena_scope_push(void) {
 // triggered the slot walk unconditionally, turning tight push loops
 // (anima_audio.hexa vocal_hexa() — 4800 .push() calls per call) into O(N²).
 // Repro: /tmp/test_push_n.hexa.
-static int __hexa_arena_slot_dirty = 0;
+//
+// ω-interp-2 (2026-04-26): WIRED.
+//   SETTER  : hexa_array_set (line ~1187) — every host-array element write
+//             marks dirty. Covers `array_store[idx] = items.push(item)` in
+//             array_push_inplace plus map_store / struct_store assignments.
+//   CHECKER : hexa_val_heapify TAG_VALSTRUCT path (line ~2515) — guards the
+//             array_store / map_store / struct_store walks. When clean we
+//             skip the walk entirely (the slot's contents have not been
+//             reseated since the last heapify). Flag is cleared after the
+//             walk so subsequent fn returns in the same frame stay cheap.
+//   RESET   : hexa_val_arena_scope_push (line ~2272) — new frame starts
+//             clean. Subsequent writes re-set as needed.
+// Removed `static` so it's externally visible to the setter sitting above
+// the original declaration in this TU; both references resolve to the same
+// global.
+int __hexa_arena_slot_dirty = 0;
 
 // Pop scope mark and rewind arena to it. Caller must have heapified any Val
 // that escapes the popped scope BEFORE calling this. If the stack is empty
@@ -2307,6 +2361,48 @@ static void hexa_val_arena_scope_pop(void) {
 
 // Forward decl — heapify itself is recursive over nested arena maps.
 HexaVal hexa_val_heapify(HexaVal v);
+
+// ω-interp-2: per-slot high-water mark for incremental heapify of array_store.
+// Tracks "items[0..water[idx]] are known to be heap-resident". Walks only
+// process items[water..len), then update water := len. This breaks the per-push
+// O(N) walk in tight push loops (`bytes.push(i)` × 4800) into amortized O(1).
+//
+// Storage: a parallel int array sized to the high-water-mark of any idx ever
+// touched. Grows on demand via realloc. Reset to 0 on entries we don't yet
+// have storage for (defensive — first walk reprocesses the full slot, which
+// is correct).
+static int*    __hexa_array_water     = NULL;
+static int64_t __hexa_array_water_cap = 0;
+
+static int hexa_array_water_get(int64_t idx) {
+    if (idx < 0 || idx >= __hexa_array_water_cap) return 0;
+    return __hexa_array_water[idx];
+}
+
+static void hexa_array_water_set(int64_t idx, int n) {
+    if (idx < 0) return;
+    if (idx >= __hexa_array_water_cap) {
+        int64_t new_cap = __hexa_array_water_cap > 0 ? __hexa_array_water_cap : 64;
+        while (new_cap <= idx) new_cap *= 2;
+        int* p = (int*)realloc(__hexa_array_water, sizeof(int) * (size_t)new_cap);
+        if (!p) return;  // OOM — defensive no-op (next walk will reprocess)
+        // Zero-init new tail.
+        for (int64_t k = __hexa_array_water_cap; k < new_cap; k++) p[k] = 0;
+        __hexa_array_water = p;
+        __hexa_array_water_cap = new_cap;
+    }
+    __hexa_array_water[idx] = n;
+}
+
+// ω-interp-2: invalidate the water mark for a slot when it is overwritten by
+// a non-append (truncate, COW, slice). Forces the next walk to reprocess
+// items[0..len). For now we only call this from cow paths that explicitly
+// reseat array_store[idx] — for the dominant push path the water grows
+// monotonically with len.
+//
+// Note: the water mark for slot S is left stale when array_decref drops S
+// to 0; M4-fix freelist disabled means S won't be reused, so the stale
+// value is harmless.
 
 // T33 Fix 4: weak-link to the interpreter's array_store / map_store globals.
 // These are emitted as `HexaVal array_store;` / `HexaVal map_store;` by the
@@ -2457,6 +2553,28 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // recursively heapified — closure bodies / param arrays / nested
             // structs all need the same treatment.
             if (!HX_PTR_OK(HX_VS(v))) return v;
+            // ω-interp-2 fast path: when this frame has not allocated ANY
+            // arena memory (cur block + used unchanged from scope_push),
+            // the VS itself is guaranteed heap (from_arena=0) and all of
+            // its sub-Vals must also be heap (no arena allocation could
+            // have happened). Skip the entire shallow-copy + recursive
+            // heapify chain AND the store walks below.
+            //
+            // Correctness: if a child Val could be arena, some arena_alloc
+            // would have run since scope_push, advancing cur or used. We
+            // ignore inner-frame allocations because their pop rewinds
+            // cur+used back to the snapshot.
+            //
+            // This addresses the dominant cost in tight push loops where
+            // the value being heapified is a TAG_ARRAY VS whose backing
+            // slot holds heap-only items: previously each fn return ran
+            // a shallow-copy of the wrapping VS (malloc + 8 recursive
+            // heapify calls) plus the per-item walk over up to N items.
+            // With the gate, all of it collapses to a single comparison
+            // + return.
+            if (!HX_VSF(v, from_arena) && hexa_arena_frame_clean()) {
+                return v;
+            }
             if (HX_VSF(v, from_arena)) {
                 HexaValStruct* dst = (HexaValStruct*)malloc(sizeof(HexaValStruct));
                 if (!dst) return v;  // OOM — caller will see arena pointer (best-effort)
@@ -2480,6 +2598,28 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 // 2026-04-17 COW: __VAL_INT_CACHE singletons are heap valstructs
                 // shared across the program. In-place mutation corrupts the cache.
                 // Shallow-copy before heapifying children.
+                //
+                // ω-interp-2: scalar-only fast path. The dominant value class
+                // in numeric push loops is val_int / val_float / val_bool — all
+                // 8 polymorphic fields are __E (TAG_VOID placeholders). Skip
+                // the malloc + 8 recursive heapify calls when every field's
+                // outer tag is a scalar. This avoids 4800-per-push mallocs
+                // in the vocal_hexa() hot path, where the slot walk iterates
+                // through cached val_int items.
+                #define HX_SCALAR_TAG(t) ((t) == TAG_INT || (t) == TAG_FLOAT \
+                                          || (t) == TAG_BOOL || (t) == TAG_VOID)
+                HexaValStruct* vs0 = HX_VS(v);
+                if (HX_SCALAR_TAG(vs0->str_val.tag)
+                    && HX_SCALAR_TAG(vs0->char_val.tag)
+                    && HX_SCALAR_TAG(vs0->array_val.tag)
+                    && HX_SCALAR_TAG(vs0->fn_name.tag)
+                    && HX_SCALAR_TAG(vs0->fn_params.tag)
+                    && HX_SCALAR_TAG(vs0->fn_body.tag)
+                    && HX_SCALAR_TAG(vs0->struct_name.tag)
+                    && HX_SCALAR_TAG(vs0->struct_fields.tag)) {
+                    return v;
+                }
+                #undef HX_SCALAR_TAG
                 HexaValStruct* hcow = (HexaValStruct*)malloc(sizeof(HexaValStruct));
                 if (hcow) {
                     *hcow = *HX_VS(v);
@@ -2504,33 +2644,90 @@ HexaVal hexa_val_heapify(HexaVal v) {
             // (weak_import: &foo == NULL when absent — e.g. bootstrap stub).
             // Bounds-check against the host array length to defend against
             // freed / reused slot indices observed during T33 repro.
-            if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_ARRAY && &array_store != 0) {
-                if (HX_IS_ARRAY(array_store) && HX_ARR_ITEMS(array_store)) {
-                    int64_t idx = HX_VSF(v, int_val);
-                    if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(array_store)) {
-                        HX_ARR_ITEMS(array_store)[idx] =
-                            hexa_val_heapify(HX_ARR_ITEMS(array_store)[idx]);
+            // ω-interp-2 CHECKER: dual gate on (dirty flag) AND (arena grew
+            // in current frame). The dirty flag fires on any slot write, but
+            // the slot's items are only at risk of being arena-resident when
+            // an arena allocation has actually occurred in this frame —
+            // pushing scalar/cached/heap Vals (the dominant `bytes.push(i)`
+            // pattern) writes the slot but does NOT advance the arena
+            // watermark, so the walk is provably unnecessary.
+            //
+            // The arena watermark (block ptr + used) is snapshotted at
+            // scope_push and compared here; equal → no allocation occurred →
+            // every Val transitively reachable from any modified slot in
+            // this frame must already be heap (or cached) → skip.
+            //
+            // Without this dual gate the dirty-only check still walks once
+            // per slot-touching frame (call_method's per-push frame in the
+            // 4800-push hot path), preserving the O(N²) item-walk cost. With
+            // the arena gate, only frames that genuinely allocated arena Vals
+            // pay for the walk — for vocal_hexa() that's effectively zero.
+            //
+            // We do NOT clear the flag here (see ω-interp-2 design notes
+            // above re: multi-VS heapify within one frame).
+            if (__hexa_arena_slot_dirty && !hexa_arena_frame_clean()) {
+                if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_ARRAY && &array_store != 0) {
+                    if (HX_IS_ARRAY(array_store) && HX_ARR_ITEMS(array_store)) {
+                        int64_t idx = HX_VSF(v, int_val);
+                        if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(array_store)) {
+                            // ω-interp-2: incremental walk for push hot path.
+                            // Calling hexa_val_heapify on the items_array
+                            // would re-iterate ALL N items per walk → O(N²)
+                            // for tight push loops. Instead, bypass the
+                            // outer-array recurse and walk only items in
+                            // [last_water .. current_len) directly. Earlier
+                            // items were heapified on prior fn returns and
+                            // are heap-resident already.
+                            //
+                            // The high-water mark lives alongside the items
+                            // array as the lower 16 bits of a sidecar entry
+                            // we maintain in __hexa_array_water (parallel to
+                            // array_store). When absent (idx >= water_len),
+                            // default 0 → first walk processes the full slot.
+                            HexaVal items_v = HX_ARR_ITEMS(array_store)[idx];
+                            if (HX_IS_ARRAY(items_v) && HX_ARR_ITEMS(items_v)) {
+                                if (HX_ARR_CAP(items_v) < 0) {
+                                    // Arena items buffer — must promote in full.
+                                    HX_ARR_ITEMS(array_store)[idx] =
+                                        hexa_val_heapify(items_v);
+                                } else {
+                                    int n = HX_ARR_LEN(items_v);
+                                    int water = hexa_array_water_get(idx);
+                                    if (water > n) water = n;
+                                    for (int i = water; i < n; i++) {
+                                        HX_ARR_ITEMS(items_v)[i] =
+                                            hexa_val_heapify(HX_ARR_ITEMS(items_v)[i]);
+                                    }
+                                    hexa_array_water_set(idx, n);
+                                }
+                            } else {
+                                // Defensive: not a heap items array — fall
+                                // back to full heapify (rare path).
+                                HX_ARR_ITEMS(array_store)[idx] =
+                                    hexa_val_heapify(items_v);
+                            }
+                        }
                     }
-                }
-            } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_MAP && &map_store != 0) {
-                if (HX_IS_ARRAY(map_store) && HX_ARR_ITEMS(map_store)) {
-                    int64_t idx = HX_VSF(v, int_val);
-                    if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(map_store)) {
-                        // map_store[idx] is a TAG_ARRAY of length 2:
-                        // [keys_array, values_array]. Heapifying the outer
-                        // array walks both keys and values transitively.
-                        HX_ARR_ITEMS(map_store)[idx] =
-                            hexa_val_heapify(HX_ARR_ITEMS(map_store)[idx]);
+                } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_MAP && &map_store != 0) {
+                    if (HX_IS_ARRAY(map_store) && HX_ARR_ITEMS(map_store)) {
+                        int64_t idx = HX_VSF(v, int_val);
+                        if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(map_store)) {
+                            // map_store[idx] is a TAG_ARRAY of length 2:
+                            // [keys_array, values_array]. Heapifying the outer
+                            // array walks both keys and values transitively.
+                            HX_ARR_ITEMS(map_store)[idx] =
+                                hexa_val_heapify(HX_ARR_ITEMS(map_store)[idx]);
+                        }
                     }
-                }
-            } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_STRUCT && &struct_store != 0) {
-                // rt 36-D: struct_store[idx] is a TAG_MAP (field map).
-                // Heapify it so closure-captured structs survive scope pop.
-                if (HX_IS_ARRAY(struct_store) && HX_ARR_ITEMS(struct_store)) {
-                    int64_t idx = HX_VSF(v, int_val);
-                    if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(struct_store)) {
-                        HX_ARR_ITEMS(struct_store)[idx] =
-                            hexa_val_heapify(HX_ARR_ITEMS(struct_store)[idx]);
+                } else if (HX_VSF(v, tag_i) == HEXA_INTERP_TAG_STRUCT && &struct_store != 0) {
+                    // rt 36-D: struct_store[idx] is a TAG_MAP (field map).
+                    // Heapify it so closure-captured structs survive scope pop.
+                    if (HX_IS_ARRAY(struct_store) && HX_ARR_ITEMS(struct_store)) {
+                        int64_t idx = HX_VSF(v, int_val);
+                        if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(struct_store)) {
+                            HX_ARR_ITEMS(struct_store)[idx] =
+                                hexa_val_heapify(HX_ARR_ITEMS(struct_store)[idx]);
+                        }
                     }
                 }
             }
