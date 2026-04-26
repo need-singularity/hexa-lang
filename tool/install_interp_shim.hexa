@@ -2,9 +2,15 @@
 //
 // WHY (2026-04-18): rebuild_interp.hexa (and the underlying clang in
 // build_interp.hexa) overwrites build/hexa_interp with a fresh Mach-O
-// native binary. That removes the layered-defense shim introduced in
-// commit ca46279 (flock + RSS cap + jetsam — the defense against the
-// 2026-04-18 13:22 Mac panic / 16:23 load=376 / compressor 12.72 GB).
+// native binary. That removes the shim layer.
+//
+// 2026-04-26 redesign: the shim is now a non-blocking fork-storm cap (no
+// global mutex). Previous design used a 300s mkdir-based serialization
+// lock (commit ca46279) which produced 1-30s+ stalls under normal load.
+// The lock had been deprecated upstream in commit 8a2eab30 but the rename
+// in e075b3e8 (stage0→interp) lost that fix because build/hexa_interp is
+// gitignored — this file is the actual SSOT for shim content. RSS protection
+// now lives at @watchdog (commit 031e18f3) and Linux container path.
 //
 // This module is called by rebuild_interp.hexa and build_interp.hexa
 // immediately after a successful build (post sanity-check). It:
@@ -51,17 +57,21 @@ fn iss_is_shim(path) {
 }
 
 fn iss_fallback_shim_content() {
-    // Minimal fallback when git SSOT is unreachable. Implements layer 1
-    // (mkdir lock) + layer 2 (safe_hexa_launchd re-entry) equivalent to
-    // build/hexa_interp in commit ca46279. Kept short for readability; the
-    // canonical copy is in git.
+    // 2026-04-26 REDESIGN — replaced the mkdir-lock + safe_hexa_launchd
+    // wrapper from commit ca46279 with a non-blocking fork-storm cap.
+    // The mkdir lock had been deprecated upstream in commit 8a2eab30
+    // ("stage0 lock deprecation"); the rename in e075b3e8 (stage0→interp)
+    // lost that fix because build/hexa_interp is gitignored and the SSOT
+    // lives here in iss_fallback_shim_content(). The launchd wrapper at
+    // $HOME/Dev/nexus/harness/safe_hexa_launchd.sh has been decommissioned.
+    // RSS protection now lives at workload layer (@watchdog/@monitor — see
+    // commit 031e18f3) and at the Linux container path (cgroup hard limits).
+    // See build/hexa_interp header for the full design rationale.
     "#!/bin/bash\n" +
-    "# hexa_interp shim (fallback) — serialize + RSS cap\n" +
+    "# hexa_interp shim — non-blocking fork-storm cap (no global mutex)\n" +
+    "# See tool/install_interp_shim.hexa::iss_fallback_shim_content for full design notes.\n" +
     "set -u\n" +
     "DIR=\"$(cd \"$(dirname \"$0\")\" && pwd)\"\n" +
-    "# 2026-04-18: REAL resolution — SSOT absolute path preferred over $DIR-relative.\n" +
-    "# Override via HEXA_STAGE0_REAL env. Falls back to $DIR/hexa_interp.real for\n" +
-    "# Dev checkout where SSOT layout (.hx/packages) is absent.\n" +
     "if [ -n \"${HEXA_STAGE0_REAL:-}\" ] && [ -x \"$HEXA_STAGE0_REAL\" ]; then\n" +
     "    REAL=\"$HEXA_STAGE0_REAL\"\n" +
     "elif [ -x \"/Users/ghost/.hx/packages/hexa/build/hexa_interp.real\" ]; then\n" +
@@ -69,29 +79,19 @@ fn iss_fallback_shim_content() {
     "else\n" +
     "    REAL=\"$DIR/hexa_interp.real\"\n" +
     "fi\n" +
-    "WRAPPER=\"$HOME/Dev/nexus/harness/safe_hexa_launchd.sh\"\n" +
-    "LOCKDIR=\"/tmp/hexa_interp.lock.d\"\n" +
-    "LOCK_WAIT_SECS=\"${HEXA_STAGE0_LOCK_WAIT:-300}\"\n" +
     "if [ \"${HEXA_LOCAL_NO_CAP:-}\" = \"1\" ] || [ \"${HEXA_LOCAL:-}\" = \"1\" ] || [ \"${HEXA_STAGE0_NO_CAP:-}\" = \"1\" ]; then exec \"$REAL\" \"$@\"; fi\n" +
     "if [ \"${HEXA_NO_LAUNCHD:-}\" = \"1\" ]; then exec \"$REAL\" \"$@\"; fi\n" +
-    "acquire_lock() {\n" +
-    "    local deadline=$(( $(date +%s) + LOCK_WAIT_SECS ))\n" +
-    "    while true; do\n" +
-    "        if mkdir \"$LOCKDIR\" 2>/dev/null; then echo \"$$\" > \"$LOCKDIR/pid\" 2>/dev/null || true; return 0; fi\n" +
-    "        if [ -r \"$LOCKDIR/pid\" ]; then\n" +
-    "            local holder; holder=$(cat \"$LOCKDIR/pid\" 2>/dev/null)\n" +
-    "            if [ -n \"$holder\" ] && ! kill -0 \"$holder\" 2>/dev/null; then rm -rf \"$LOCKDIR\" 2>/dev/null; continue; fi\n" +
-    "        fi\n" +
-    "        if [ \"$(date +%s)\" -ge \"$deadline\" ]; then echo \"hexa_interp shim: lock timeout\" >&2; return 1; fi\n" +
-    "        sleep 0.5\n" +
-    "    done\n" +
-    "}\n" +
-    "release_lock() { if [ -r \"$LOCKDIR/pid\" ] && [ \"$(cat \"$LOCKDIR/pid\" 2>/dev/null)\" = \"$$\" ]; then rm -rf \"$LOCKDIR\" 2>/dev/null; fi; }\n" +
-    "trap release_lock EXIT INT TERM\n" +
-    "if ! acquire_lock; then exit 75; fi\n" +
-    "if [ ! -x \"$WRAPPER\" ]; then exec \"$REAL\" \"$@\"; fi\n" +
-    "HEXA_BIN=\"$REAL\" \"$WRAPPER\" \"$@\"\n" +
-    "exit $?\n"
+    "if [ \"${HEXA_IN_CONTAINER:-}\" = \"1\" ] || [ -f \"/.dockerenv\" ]; then exec \"$REAL\" \"$@\"; fi\n" +
+    "HEXA_FORK_CAP=\"${HEXA_FORK_CAP:-32}\"\n" +
+    "if [ \"$HEXA_FORK_CAP\" != \"0\" ]; then\n" +
+    "    running=$(pgrep -f 'hexa_interp\\.real' 2>/dev/null | wc -l | tr -d ' ')\n" +
+    "    : \"${running:=0}\"\n" +
+    "    if [ \"$running\" -ge \"$HEXA_FORK_CAP\" ]; then\n" +
+    "        echo \"hexa_interp shim: fork-storm cap reached (${running} >= ${HEXA_FORK_CAP}). Set HEXA_FORK_CAP=<N> or =0 to override.\" >&2\n" +
+    "        exit 75\n" +
+    "    fi\n" +
+    "fi\n" +
+    "exec \"$REAL\" \"$@\"\n"
 }
 
 // Core entry. hexa_dir = root of hexa-lang checkout. uname = "Darwin"/"Linux"/etc.
