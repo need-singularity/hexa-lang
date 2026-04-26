@@ -7,7 +7,7 @@
 # Requires: sudo (to override chflags uchg on Darwin)
 #
 # Scope: this script operates ONLY on the 5 tracked SSOT files
-#   .raw  .own  .ext  .roadmap  .loop
+#   .raw  .own  .ext  .roadmap
 # It does NOT touch .raw-audit (append-only — preserved across resets).
 #
 # raw#8 exception: this is a bash script in a HEXA-ONLY repo. The
@@ -30,7 +30,7 @@
 
 set -euo pipefail
 
-SSOT_FILES=(.raw .own .ext .roadmap .loop)
+SSOT_FILES=(.raw .own .ext .roadmap)
 AUDIT_FILE=".raw-audit"
 
 if [ ! -f .raw ]; then

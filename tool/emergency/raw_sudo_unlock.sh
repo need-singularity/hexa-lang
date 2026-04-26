@@ -24,7 +24,7 @@
 
 set -euo pipefail
 
-SSOT_FILES=(.raw .own .ext .roadmap .loop)
+SSOT_FILES=(.raw .own .ext .roadmap)
 AUDIT_FILE=".raw-audit"
 
 if [ ! -f .raw ]; then
