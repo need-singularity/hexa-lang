@@ -122,6 +122,22 @@ fn _esc(s: string) -> string {
     return r
 }
 
+// _is_uchg_locked — macOS-only: returns true iff `path` has the BSD uchg
+// (user-immutable) flag set via chflags. Used by --witness mode to skip
+// gracefully when the target shim is uchg-locked (raw#9 hardens
+// build/hexa_interp this way to prevent silent overwrites).
+//
+// Mechanism: `stat -f "%Sf" PATH` prints the comma-separated symbolic flag
+// list ("-" if no flags, "uchg" / "uchg,uappnd" / etc. if flagged). Grep
+// for the literal "uchg" token. Non-macOS hosts return false (the chflags
+// uchg mechanism doesn't exist there; raw#9 is macOS-specific).
+fn _is_uchg_locked(path: string) -> bool {
+    let kernel = exec("uname -s").trim()
+    if kernel != "Darwin" { return false }
+    let r = exec_with_status("stat -f \"%Sf\" " + path + " 2>/dev/null | grep -q uchg")
+    return r[1] == 0
+}
+
 // _scan_pair returns [missing_good, found_bad] arrays of patterns. Empty
 // arrays = clean. Non-empty = drift.
 fn _scan_pair(content: string, label: string, bad_pats: array, good_pats: array) -> array {
@@ -310,6 +326,24 @@ fn _witness(repo_root: string) -> int {
         return 3
     }
 
+    // Step 0: uchg gate (ω-toolchain-3, 2026-04-26).
+    //
+    // Pre-fix defect: the witness's injection write (safe_write_file) and the
+    // post-witness recovery cp both silently no-op / fail on uchg-locked
+    // targets. raw#9 hardens build/hexa_interp with chflags uchg precisely to
+    // prevent silent overwrites — which means the witness's deliberate
+    // self-corruption stunt cannot run against the live shim. The detector's
+    // PRODUCTION capabilities (default audit + --json + --selftest) are
+    // unaffected because they only READ the shim. We skip the witness
+    // gracefully with a sentinel so callers can distinguish "audit broken"
+    // from "audit's self-test refused to run because the target is hardened".
+    if _is_uchg_locked(live_path) {
+        println("[witness] SKIP — target uchg-locked (path=" + live_path + ")")
+        println("[witness] rationale: chflags uchg (raw#9) blocks injection write + recovery cp.")
+        println("[witness] to exercise the witness, run against an unlocked fixture or chflags nouchg first.")
+        return 0
+    }
+
     // Step 1: backup the live shim verbatim.
     let cp1 = exec_with_status("cp " + live_path + " " + backup)
     if cp1[1] != 0 {
@@ -351,7 +385,19 @@ fn _witness(repo_root: string) -> int {
     // production the recovery is `hexa tool/install_interp_shim.hexa`).
     let restore = exec_with_status("cp " + backup + " " + live_path)
     if restore[1] != 0 {
-        eprintln("[witness] FAIL: restore cp from backup")
+        // Parallel safeguard (ω-toolchain-3): distinguish uchg-induced cp
+        // failure from generic cp errors. The Step 0 gate should have
+        // prevented this branch entirely, but if a concurrent process
+        // chflags-locked the target between Step 0 and Step 4, surface the
+        // root cause distinctly so the operator knows to chflags nouchg
+        // before retrying (don't swallow it as a generic restore failure).
+        if _is_uchg_locked(live_path) {
+            eprintln("[witness] FAIL: restore cp blocked by uchg flag on " + live_path)
+            eprintln("[witness] (target became uchg-locked between Step 0 and Step 4 — race?)")
+            eprintln("[witness] recovery: chflags nouchg " + live_path + " && cp " + backup + " " + live_path)
+        } else {
+            eprintln("[witness] FAIL: restore cp from backup")
+        }
         return 3
     }
     let _rm = exec_with_status("rm -f " + backup)
