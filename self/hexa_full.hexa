@@ -7498,21 +7498,16 @@ fn eval_expr_inner(node) {
             let arr = eval_expr(node.left.left)
             let idx = eval_expr(node.left.right)
             if arr.tag == TAG_ARRAY {
-                // C3 PBV leak fix (2026-04-16): drop the rebuild-via-push
-                // pattern that allocated a fresh N-element items buffer per
-                // IndexAssign and orphaned the old slot buffer. The host
-                // hexa_array_set is O(1) in-place at the C runtime layer
-                // (runtime.c:854), and PBV semantics are already enforced at
-                // the array_store slot level by array_refcounts /
-                // array_push_inplace. We mutate the same backing buffer in
-                // place; the array_store write is a defensive no-op (same
-                // handle) kept for clarity.
-                let items = get_array(arr)
+                // ω-interp-4 (2026-04-26): O(1) inplace fast path. Drops the
+                // redundant `array_store[arr.int_val] = items` write-back
+                // (items pointer didn't move; host hexa_array_set already
+                // mutated the buffer in place) and skips fn-arena heapify via
+                // @no_arena on the helper. ~1.9× speedup on indexed-write
+                // hot loops (vocal_hexa class). See array_set_inplace_idx.
                 // 2026-04-17: guard — idx.int_val on non-INT Val reads
                 // stale/garbage from the int_val slot (pointer-as-index).
                 let safe_idx = if idx.tag == TAG_INT { idx.int_val } else { to_int(idx) }
-                items[safe_idx] = val
-                array_store[arr.int_val] = items
+                array_set_inplace_idx(arr, safe_idx, val)
             }
             // Fix 2026-04-14 — map IndexAssign 누락 버그 (dispatch map["new_key"] = v no-op)
             // NEXUS-6 DISC-P1-1 NDJSON parser blocker. map_set 으로 새 payload 만든 뒤
@@ -8251,12 +8246,10 @@ fn exec_stmt_at(stmts, idx) {
             let idx = eval_expr(node.left.right)
             let _si2 = if idx.tag == TAG_INT { idx.int_val } else { to_int(idx) }
             if arr.tag == TAG_ARRAY {
-                // C3 PBV leak fix (2026-04-16): in-place index write via host
-                // hexa_array_set instead of rebuild-via-push. See the
-                // matching comment block in NK_ASSIGN above for rationale.
-                let items = get_array(arr)
-                items[_si2] = val
-                array_store[arr.int_val] = items
+                // ω-interp-4 (2026-04-26): see NK_ASSIGN block above for fast
+                // path rationale (drops redundant array_store write-back +
+                // skips fn-arena heapify).
+                array_set_inplace_idx(arr, _si2, val)
             }
             if arr.tag == TAG_MAP {
                 let new_map = map_set(arr, idx, val)
@@ -8363,12 +8356,10 @@ fn exec_stmt_at(stmts, idx) {
             let idx = eval_expr(node.left.right)
             let _si3 = if idx.tag == TAG_INT { idx.int_val } else { to_int(idx) }
             if arr.tag == "array" || arr.tag == TAG_ARRAY {
-                // C3 PBV leak fix (2026-04-16): in-place index write via host
-                // hexa_array_set instead of rebuild-via-push. See the
-                // NK_ASSIGN block above for full rationale.
-                let items = get_array(arr)
-                items[_si3] = result
-                array_store[arr.int_val] = items
+                // ω-interp-4 (2026-04-26): see NK_ASSIGN block above for fast
+                // path rationale (drops redundant array_store write-back +
+                // skips fn-arena heapify).
+                array_set_inplace_idx(arr, _si3, result)
             }
             if arr.tag == "map" {
                 let new_map = map_set(arr, idx, result)
@@ -17613,6 +17604,34 @@ fn array_push_inplace(arr_val, item) {
     let new_items = items.push(item)
     array_decref(idx)
     return val_array(new_items)
+}
+
+// ω-interp-4 (2026-04-26): array_set_inplace_idx — O(1) indexed write fast path.
+//
+// Background: ω-audio-6 found that `arr[i] = v` ran 2.6× SLOWER than `arr.push(v)`
+// in the interpreter (vocal_hexa: 401ms alloc-indexed vs 155ms push). Microbench
+// confirmed: indexed-write was ~11.3μs vs push ~5.8μs per element (1.93× slower).
+//
+// Diagnosis: the indexed-assign code path at AssignStmt/CompoundAssign/NK_ASSIGN
+// did THREE host-array operations per write:
+//   let items = get_array(arr)        // 1× hexa_array_get on array_store
+//   items[_si2] = val                 // 1× hexa_array_set on items (in-place)
+//   array_store[arr.int_val] = items  // 1× hexa_array_set on array_store (NO-OP write-back —
+//                                     //   `items` is the SAME pointer hexa_array_set just mutated;
+//                                     //   the host runtime mutates items->arr_ptr in-place)
+//
+// Fix: collapse to one host-array_set on the items buffer; skip the redundant
+// write-back. Also @no_arena to suppress __hexa_fn_arena_return → hexa_val_heapify
+// walk on every call (mirrors array_push_inplace pattern).
+//
+// Sole-owner check is NOT needed for indexed assign (unlike push): writes mutate
+// in place at the same logical index — no aliasing change, no slot reallocation.
+// COW is irrelevant: the items pointer doesn't move, and refcount is unchanged.
+@no_arena
+fn array_set_inplace_idx(arr_val, idx_int, val) {
+    let items = array_store[arr_val.int_val]
+    items[idx_int] = val
+    return val
 }
 
 fn get_array(v) {
