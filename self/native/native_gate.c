@@ -39,10 +39,13 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <time.h>
+#include <unistd.h>
 
 static const char *BANNED_SUFFIXES[] = { ".py", ".rs", ".sh", ".toml", NULL };
 
@@ -217,6 +220,11 @@ static const char *RAW7_F6_ENTRY_STEMS[] = {
 // raw#7 path-substring exemptions (vendor / test-fixtures / generated trees).
 // Mirrors raw_7.list intent: tests/integration/*/test.sh is the canonical
 // F5-loner exemption; vendor + node_modules are universal grandfather paths.
+//
+// This is the STATIC FALLBACK — always consulted first (cheap), and used
+// when the per-repo `.raw-exemptions/raw_7.list` file is missing or empty.
+// The dynamic, file-based reader below augments this list (cross-port from
+// `hive/tool/ai_native_scan.hexa#load_raw_7_exemptions`).
 static const char *RAW7_ALLOW[] = {
     "/node_modules/",
     "/vendor/",
@@ -239,13 +247,317 @@ static int is_under_managed_repo(const char *path) {
         || strstr(path, "/core/hexa-lang/") != NULL;
 }
 
-static int raw7_path_exempt(const char *path) {
-    if (!path) return 0;
-    for (int i = 0; RAW7_ALLOW[i]; i++) {
-        if (strstr(path, RAW7_ALLOW[i])) return 1;
+// ─── raw_7.list file-based reader ────────────────────────────────────
+//
+// Cross-port from `hive/tool/ai_native_scan.hexa` (commit 1f54f8dfc).
+// Reads `<repo_root>/.raw-exemptions/raw_7.list` once per process (lazy
+// load on first refuse_raw7_* call), parses each non-comment line, and
+// substring-matches candidate paths against the assembled pattern array.
+//
+// Two file formats are auto-detected per line:
+//   (a) pipe-separated  — hexa-lang style:
+//       <pattern> | <line_range> | <reason> | <expiry YYYY-MM-DD>
+//   (b) bare pattern    — hive style; metadata supplied by preceding
+//                          `#` comment block (reason/expiry/owner/jurisdiction).
+//
+// Both paths populate `raw7_exemption_t` rows uniformly; downstream match
+// logic only consults `pattern` + `expiry_unix` (debug-build expiry warner).
+//
+// Self-recursion safety: this reader uses fopen/fgets which will hit our
+// own `open()` shim. That call passes `O_RDONLY`, so `is_write_flag(flags)
+// == 0` short-circuits `refuse()` to allow before any raw#7 logic runs.
+// The static `g_raw7_loading` guard adds a second layer (paranoia: if a
+// future code path triggered raw7 check on read, the guard prevents
+// infinite recursion during the load itself).
+
+#define RAW7_PATTERN_MAX     256
+#define RAW7_META_MAX         64
+#define RAW7_MAX_ENTRIES     128
+#define RAW7_LINE_MAX       1024
+
+typedef struct {
+    char pattern[RAW7_PATTERN_MAX];
+    long expiry_unix;                       // 0 = no expiry parsed
+    char expiry_iso[16];                    // YYYY-MM-DD (cached, for warner)
+    char owner[RAW7_META_MAX];
+    char jurisdiction[RAW7_META_MAX];
+    char reason[RAW7_PATTERN_MAX];
+} raw7_exemption_t;
+
+// Per-repo cache. Each repo we encounter gets one cache slot. In practice
+// we only ever hit hive + hexa-lang here, but the fixed array is cheap.
+typedef struct {
+    char repo_root[256];                    // "/Users/<u>/core/<repo>" or ""
+    int  loaded;                            // 0 = unloaded, 1 = loaded, -1 = file missing
+    int  count;
+    raw7_exemption_t entries[RAW7_MAX_ENTRIES];
+} raw7_cache_t;
+
+#define RAW7_CACHE_SLOTS 4
+static raw7_cache_t g_raw7_cache[RAW7_CACHE_SLOTS];
+static int g_raw7_loading = 0;              // re-entrancy guard
+
+// Strip leading + trailing whitespace in-place; returns the (mutated) buffer.
+static char *raw7_trim(char *s) {
+    if (!s) return s;
+    while (*s == ' ' || *s == '\t' || *s == '\r' || *s == '\n') s++;
+    size_t n = strlen(s);
+    while (n > 0 && (s[n-1] == ' ' || s[n-1] == '\t' ||
+                     s[n-1] == '\r' || s[n-1] == '\n')) {
+        s[--n] = '\0';
+    }
+    return s;
+}
+
+// Parse YYYY-MM-DD into unix-ts (UTC, 00:00:00). Returns 0 on parse failure.
+static long raw7_parse_iso_date(const char *s) {
+    if (!s || strlen(s) < 10) return 0;
+    int y = 0, m = 0, d = 0;
+    if (sscanf(s, "%4d-%2d-%2d", &y, &m, &d) != 3) return 0;
+    if (y < 1970 || m < 1 || m > 12 || d < 1 || d > 31) return 0;
+    struct tm tm;
+    memset(&tm, 0, sizeof(tm));
+    tm.tm_year = y - 1900;
+    tm.tm_mon  = m - 1;
+    tm.tm_mday = d;
+    return (long)timegm(&tm);
+}
+
+// Determine the repo-root prefix for a path.
+// Returns 1 + writes prefix into out (caller-sized) on hit, 0 if path is
+// outside known managed repos.
+static int raw7_repo_root_for(const char *path, char *out, size_t out_sz) {
+    if (!path || !out || out_sz < 32) return 0;
+    static const char *repos[] = {
+        "/core/hive/",
+        "/core/hexa-lang/",
+        NULL
+    };
+    for (int i = 0; repos[i]; i++) {
+        const char *hit = strstr(path, repos[i]);
+        if (!hit) continue;
+        // Root = path[0..end-of-repo-segment] without trailing slash.
+        size_t end = (size_t)(hit - path) + strlen(repos[i]) - 1; // omit '/'
+        if (end >= out_sz) return 0;
+        memcpy(out, path, end);
+        out[end] = '\0';
+        return 1;
     }
     return 0;
 }
+
+// Build "<root>/.raw-exemptions/raw_7.list" into out. Returns 0 on overflow.
+static int raw7_list_path(const char *repo_root, char *out, size_t out_sz) {
+    static const char *suffix = "/.raw-exemptions/raw_7.list";
+    size_t rl = strlen(repo_root), sl = strlen(suffix);
+    if (rl + sl + 1 > out_sz) return 0;
+    memcpy(out, repo_root, rl);
+    memcpy(out + rl, suffix, sl);
+    out[rl + sl] = '\0';
+    return 1;
+}
+
+// Parse a pipe-separated entry "<pat> | <range> | <reason> | <expiry>".
+// Returns 1 on parse-as-pipe, 0 if line lacks pipes (caller treats as bare).
+static int raw7_parse_pipe_entry(char *line, raw7_exemption_t *out) {
+    char *first = strchr(line, '|');
+    if (!first) return 0;
+    *first = '\0';
+    char *pat = raw7_trim(line);
+    if (!*pat) return 0;
+    strncpy(out->pattern, pat, RAW7_PATTERN_MAX - 1);
+    out->pattern[RAW7_PATTERN_MAX - 1] = '\0';
+
+    // Skip line_range field.
+    char *cur = first + 1;
+    char *p2 = strchr(cur, '|');
+    if (p2) { *p2 = '\0'; cur = p2 + 1; } else { return 1; }
+
+    // reason
+    char *p3 = strchr(cur, '|');
+    if (p3) {
+        *p3 = '\0';
+        char *r = raw7_trim(cur);
+        strncpy(out->reason, r, RAW7_PATTERN_MAX - 1);
+        out->reason[RAW7_PATTERN_MAX - 1] = '\0';
+        cur = p3 + 1;
+    } else {
+        return 1;
+    }
+
+    // expiry
+    char *exp = raw7_trim(cur);
+    strncpy(out->expiry_iso, exp, sizeof(out->expiry_iso) - 1);
+    out->expiry_iso[sizeof(out->expiry_iso) - 1] = '\0';
+    out->expiry_unix = raw7_parse_iso_date(exp);
+    return 1;
+}
+
+// Apply a metadata field captured from a preceding `# key: value` line.
+static void raw7_apply_meta(raw7_exemption_t *e,
+                             const char *key,
+                             const char *val) {
+    if (strcmp(key, "reason") == 0) {
+        strncpy(e->reason, val, RAW7_PATTERN_MAX - 1);
+        e->reason[RAW7_PATTERN_MAX - 1] = '\0';
+    } else if (strcmp(key, "expiry") == 0) {
+        strncpy(e->expiry_iso, val, sizeof(e->expiry_iso) - 1);
+        e->expiry_iso[sizeof(e->expiry_iso) - 1] = '\0';
+        e->expiry_unix = raw7_parse_iso_date(val);
+    } else if (strcmp(key, "owner") == 0) {
+        strncpy(e->owner, val, RAW7_META_MAX - 1);
+        e->owner[RAW7_META_MAX - 1] = '\0';
+    } else if (strcmp(key, "jurisdiction") == 0) {
+        strncpy(e->jurisdiction, val, RAW7_META_MAX - 1);
+        e->jurisdiction[RAW7_META_MAX - 1] = '\0';
+    }
+}
+
+// Parse a comment-block accumulator. Mirrors hive's reader:
+// each blank line resets the pending-meta buffer; each non-comment line
+// becomes a new entry inheriting the accumulator's metadata.
+static int load_raw_7_exemptions(const char *repo_root,
+                                  raw7_exemption_t *out_arr,
+                                  int max_entries) {
+    if (!repo_root || !out_arr || max_entries <= 0) return 0;
+
+    char list_path[512];
+    if (!raw7_list_path(repo_root, list_path, sizeof(list_path))) return 0;
+
+    FILE *f = fopen(list_path, "r");
+    if (!f) return -1;                          // file missing → caller falls back to static
+
+    raw7_exemption_t pending;                   // accumulator for comment-block metadata
+    memset(&pending, 0, sizeof(pending));
+
+    int count = 0;
+    char line[RAW7_LINE_MAX];
+    while (fgets(line, sizeof(line), f) != NULL && count < max_entries) {
+        char *t = raw7_trim(line);
+        if (!*t) {
+            // blank → reset pending metadata block
+            memset(&pending, 0, sizeof(pending));
+            continue;
+        }
+        if (t[0] == '#') {
+            // strip leading '#' and any whitespace, then look for "key: value"
+            char *body = raw7_trim(t + 1);
+            char *colon = strchr(body, ':');
+            if (colon) {
+                *colon = '\0';
+                char *key = raw7_trim(body);
+                char *val = raw7_trim(colon + 1);
+                raw7_apply_meta(&pending, key, val);
+            }
+            continue;
+        }
+        // Pattern line. Defensive: refuse double-quote (matches hive reader).
+        if (strchr(t, '"')) continue;
+
+        raw7_exemption_t entry = pending;       // inherit comment-block metadata
+        if (raw7_parse_pipe_entry(t, &entry) == 0) {
+            // bare-pattern form (hive style)
+            strncpy(entry.pattern, t, RAW7_PATTERN_MAX - 1);
+            entry.pattern[RAW7_PATTERN_MAX - 1] = '\0';
+        }
+        if (entry.pattern[0] == '\0') continue;
+        out_arr[count++] = entry;
+    }
+    fclose(f);
+    return count;
+}
+
+// Get-or-load the cache slot for `repo_root`. Returns slot ptr, or NULL if
+// the cache is full (degenerate case — only 2 repos in practice).
+static raw7_cache_t *raw7_get_cache(const char *repo_root) {
+    if (g_raw7_loading) return NULL;            // re-entrancy: fail closed (use static)
+    for (int i = 0; i < RAW7_CACHE_SLOTS; i++) {
+        if (g_raw7_cache[i].loaded != 0
+            && strcmp(g_raw7_cache[i].repo_root, repo_root) == 0) {
+            return &g_raw7_cache[i];
+        }
+    }
+    // Find empty slot.
+    for (int i = 0; i < RAW7_CACHE_SLOTS; i++) {
+        if (g_raw7_cache[i].loaded == 0) {
+            g_raw7_loading = 1;
+            strncpy(g_raw7_cache[i].repo_root, repo_root,
+                    sizeof(g_raw7_cache[i].repo_root) - 1);
+            g_raw7_cache[i].repo_root[
+                sizeof(g_raw7_cache[i].repo_root) - 1] = '\0';
+            int n = load_raw_7_exemptions(repo_root,
+                                          g_raw7_cache[i].entries,
+                                          RAW7_MAX_ENTRIES);
+            if (n < 0) {
+                g_raw7_cache[i].count = 0;
+                g_raw7_cache[i].loaded = -1;     // file missing
+            } else {
+                g_raw7_cache[i].count = n;
+                g_raw7_cache[i].loaded = 1;
+            }
+            g_raw7_loading = 0;
+            return &g_raw7_cache[i];
+        }
+    }
+    return NULL;                                // cache full
+}
+
+// Substring + dir-prefix glob match (mirrors hive `_path_matches_exemption`).
+// Pattern semantics:
+//   - empty pattern: never matches.
+//   - all other patterns: free substring match (covers both `bin/hive`
+//     exact-file form AND `packages/foo/test/fixtures/` dir-prefix form;
+//     the trailing `/` distinguishes intent at authoring time, not match time).
+static int path_matches_raw7_exemption(const char *path,
+                                        const raw7_exemption_t *arr,
+                                        int count) {
+    if (!path || !arr || count <= 0) return 0;
+    for (int i = 0; i < count; i++) {
+        const char *pat = arr[i].pattern;
+        if (!pat || !*pat) continue;
+        if (strstr(path, pat)) return 1;
+    }
+    return 0;
+}
+
+// Combined check: static RAW7_ALLOW (cheap path), then dynamic file list.
+static int raw7_path_exempt(const char *path) {
+    if (!path) return 0;
+    // Cheap static-list pass first.
+    for (int i = 0; RAW7_ALLOW[i]; i++) {
+        if (strstr(path, RAW7_ALLOW[i])) return 1;
+    }
+    // Dynamic file-based list (per-repo).
+    char repo_root[256];
+    if (!raw7_repo_root_for(path, repo_root, sizeof(repo_root))) return 0;
+    raw7_cache_t *c = raw7_get_cache(repo_root);
+    if (!c || c->loaded != 1 || c->count == 0) return 0;
+    return path_matches_raw7_exemption(path, c->entries, c->count);
+}
+
+// Debug-build expiry warner — emits stderr line for any expired or
+// soon-to-expire entries on first cache load. Compile with
+// `-DRAW7_DEBUG_EXPIRY` to enable; off by default to keep the shim quiet.
+#ifdef RAW7_DEBUG_EXPIRY
+__attribute__((unused))
+static void expiry_warn_raw7(const raw7_cache_t *c) {
+    if (!c || c->count == 0) return;
+    long now = (long)time(NULL);
+    long soon = now + (30L * 24L * 3600L);      // within 30 days
+    for (int i = 0; i < c->count; i++) {
+        const raw7_exemption_t *e = &c->entries[i];
+        if (e->expiry_unix <= 0) continue;
+        if (e->expiry_unix < now) {
+            fprintf(stderr, "[raw_7.list expiry-warn] EXPIRED  %s  pattern=%s\n",
+                    e->expiry_iso, e->pattern);
+        } else if (e->expiry_unix < soon) {
+            long days = (e->expiry_unix - now) / (24L * 3600L);
+            fprintf(stderr, "[raw_7.list expiry-warn] %ldd  %s  pattern=%s\n",
+                    days, e->expiry_iso, e->pattern);
+        }
+    }
+}
+#endif
 
 // Find the last '/' in path. Returns NULL if none.
 static const char *raw7_last_slash(const char *path) {
