@@ -95,6 +95,68 @@ static void hexa_intern_grow(void) {
     __hexa_intern.cap = new_cap;
 }
 
+// ═══════════════════════════════════════════════════════════
+//  String length-header (perf-31, 2026-04-26)
+//
+//  Embed an 8-byte size_t length immediately before each owned
+//  string buffer. HX_STR(v) still returns the data pointer (no
+//  caller change), but HX_STRLEN(v) reads the cached length in
+//  O(1) — eliminating the per-call strlen() that turned every
+//  hot string fn (substring, char_at, replace, …) into O(n²).
+//
+//  Magic-byte guard lets HX_STRLEN safely fall back to strlen()
+//  when called with a pointer that did NOT come from a header
+//  allocator (e.g. arena-allocated map keys at runtime.c:1364
+//  which can't reasonably grow a header — those are short type
+//  names where strlen is cheap anyway).
+// ═══════════════════════════════════════════════════════════
+
+#define HEXA_STR_MAGIC ((uint64_t)0xC0DECAFE0F58A7E1ULL)
+
+typedef struct {
+    uint64_t magic;
+    size_t   len;
+    char     data[];   // C99 flexible array — actual bytes follow
+} HexaStrHdr;
+
+// Allocate a string buffer with embedded length header. Returns the
+// data pointer (caller stores in HexaVal.s); the header sits at
+// (data - sizeof(HexaStrHdr)). data[len] is pre-NUL-terminated so
+// callers can fill bytes 0..len-1 and immediately treat as C string.
+static inline char* hexa_strbuf_alloc(size_t len) {
+    HexaStrHdr* hdr = (HexaStrHdr*)malloc(sizeof(HexaStrHdr) + len + 1);
+    if (!hdr) return NULL;
+    hdr->magic = HEXA_STR_MAGIC;
+    hdr->len = len;
+    hdr->data[len] = '\0';
+    return hdr->data;
+}
+
+// Allocate header buffer + memcpy from src. src may be NULL when len==0.
+static inline char* hexa_strbuf_dup_n(const char* src, size_t len) {
+    char* buf = hexa_strbuf_alloc(len);
+    if (!buf) return NULL;
+    if (len > 0 && src) memcpy(buf, src, len);
+    return buf;
+}
+
+// O(1) length read. Reads 16 bytes before s and matches HEXA_STR_MAGIC
+// to confirm header presence; falls back to strlen otherwise. Reading
+// before s is safe in practice because every code path that puts a
+// pointer into HexaVal.s uses heap-allocated memory (malloc / strdup /
+// arena_alloc), all of which sit on heap chunks with ≥16 bytes of
+// allocator metadata in front, so the load won't fault.
+static inline size_t hexa_strlen_v_inline(const char* s) {
+    if (!s) return 0;
+    // sizeof(struct{...; char data[]}) == offset of flex array → header size
+    HexaStrHdr* hdr = (HexaStrHdr*)((const char*)s - sizeof(HexaStrHdr));
+    if (hdr->magic == HEXA_STR_MAGIC) return hdr->len;
+    return strlen(s);
+}
+
+#define HX_STRLEN(v)    hexa_strlen_v_inline(HX_STR(v))
+#define HX_STRLEN_S(s)  hexa_strlen_v_inline(s)
+
 // Intern a string: returns a canonical pointer.
 // If the string is already interned, returns the existing pointer.
 // Only interns strings shorter than INTERN_MAX_LEN.
@@ -119,7 +181,7 @@ static const char* hexa_intern(const char* s) {
         idx = (idx + 1) & mask;
     }
 
-    // Not found -- insert
+    // Not found -- insert (header-allocated so HX_STRLEN works on interned strings)
     if (__hexa_intern.count * 100 / __hexa_intern.cap >= INTERN_LOAD_MAX) {
         hexa_intern_grow();
         // Recompute slot after grow
@@ -128,7 +190,7 @@ static const char* hexa_intern(const char* s) {
         while (__hexa_intern.buckets[idx]) idx = (idx + 1) & mask;
     }
 
-    char* dup = strdup(s);
+    char* dup = hexa_strbuf_dup_n(s, slen);
     __hexa_intern.buckets[idx] = dup;
     __hexa_intern.hashes[idx]  = h;
     __hexa_intern.count++;
@@ -668,13 +730,40 @@ HexaVal hexa_str(const char* s) {
     if (interned) {
         HX_SET_STR(v, (char*)interned);  // owned by intern table, not caller
     } else {
-        HX_SET_STR(v, strdup(s));        // long/unique strings: traditional copy
+        // Long/unique strings: header-allocate so HX_STRLEN is O(1) instead of strlen.
+        size_t slen = strlen(s);
+        HX_SET_STR(v, hexa_strbuf_dup_n(s, slen));
     }
     return v;
 }
 
+// Take ownership of a malloc'd-or-arena'd C string. Backward-compat shim
+// that transparently rewraps `s` into a header-allocated buffer so
+// HX_STRLEN is O(1) on the resulting value. The input `s` is intentionally
+// NOT freed — callers (notably hexa_concat under arena_on) may pass arena-
+// allocated buffers where free() would be UB, and the wider runtime leaks
+// strings by design (zero free(HX_STR(...)) call sites repo-wide). Hot
+// allocators that know `len` upfront should call hexa_str_own_with_len()
+// to skip the input strlen.
 HexaVal hexa_str_own(char* s) {
-    return (HexaVal){.tag=TAG_STR, .s=s};
+    if (!s) return (HexaVal){.tag=TAG_STR, .s=NULL};
+    size_t len = strlen(s);
+    char* buf = hexa_strbuf_dup_n(s, len);
+    return (HexaVal){.tag=TAG_STR, .s=buf};
+}
+
+// Length-known fast path. Same leak semantics as hexa_str_own.
+HexaVal hexa_str_own_with_len(char* s, size_t len) {
+    if (!s) return (HexaVal){.tag=TAG_STR, .s=NULL};
+    char* buf = hexa_strbuf_dup_n(s, len);
+    return (HexaVal){.tag=TAG_STR, .s=buf};
+}
+
+// Even faster path: skip the input copy entirely. Caller writes directly
+// into the returned data buffer (size `len`), then wraps via hexa_str_own_buf.
+// `data` MUST be a pointer returned by hexa_strbuf_alloc(len).
+static inline HexaVal hexa_str_own_buf(char* data) {
+    return (HexaVal){.tag=TAG_STR, .s=data};
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -1214,7 +1303,7 @@ HexaVal hexa_array_truncate(HexaVal arr, HexaVal new_len_v) {
 }
 
 int hexa_len(HexaVal v) {
-    if (HX_IS_STR(v)) return strlen(HX_STR(v));
+    if (HX_IS_STR(v)) return (int)HX_STRLEN(v);
     if (HX_IS_ARRAY(v)) return HX_ARR_LEN(v);
     if (HX_IS_MAP(v)) return HX_MAP_LEN(v);
     return 0;
@@ -1364,11 +1453,14 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             char* kdup = (char*)hexa_arena_alloc(strlen("__type__") + 1);
             memcpy(kdup, "__type__", 9);
             t->slots[idx].key = kdup;
-            HexaVal tv = {.tag=TAG_STR};
+            // perf-31: even on the arena path, the VALUE string must use the
+            // heap header allocator — HX_STRLEN reads bytes [-16] before the
+            // data pointer, and arena memory has no allocator-metadata pad
+            // (could segfault at the start of a fresh arena block). Map keys
+            // stay in arena since they're never read via HX_STRLEN (slot.key
+            // is a raw char* used only for strcmp during lookup).
             size_t tnl = strlen(type_name);
-            char* tdup = (char*)hexa_arena_alloc(tnl + 1);
-            memcpy(tdup, type_name, tnl + 1);
-            HX_SET_STR(tv, tdup);
+            HexaVal tv = {.tag=TAG_STR, .s=hexa_strbuf_dup_n(type_name, tnl)};
             t->slots[idx].hash = h;
             t->slots[idx].order_idx = t->len;  // ROI-24
             t->vals[idx] = tv;
@@ -1378,8 +1470,9 @@ HexaVal hexa_struct_pack_map(const char* type_name, int n,
             t->slots[idx].key = strdup("__type__");
             t->slots[idx].hash = h;
             t->slots[idx].order_idx = t->len;  // ROI-24
-            HexaVal tv = {.tag=TAG_STR};
-            HX_SET_STR(tv, strdup(type_name));
+            // perf-31: header-alloc replaces strdup so HX_STRLEN is O(1).
+            size_t tnl = strlen(type_name);
+            HexaVal tv = {.tag=TAG_STR, .s=hexa_strbuf_dup_n(type_name, tnl)};
             t->vals[idx] = tv;
             t->order_keys[t->len] = t->slots[idx].key;
             t->order_vals[t->len] = tv;
@@ -2531,7 +2624,10 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 char* base = b->data;
                 char* end = base + b->cap;
                 if (HX_STR(v) >= base && HX_STR(v) < end) {
-                    HX_SET_STR(v, strdup(HX_STR(v)));
+                    // perf-31: heapify into header-allocated buffer so the
+                    // surviving HexaVal supports O(1) HX_STRLEN.
+                    size_t arena_len = strlen(HX_STR(v));
+                    HX_SET_STR(v, hexa_strbuf_dup_n(HX_STR(v), arena_len));
                     if (_hx_stats_on()) _hx_stats_str_arena_heapify++;
                     break;
                 }
@@ -2875,29 +2971,30 @@ int hexa_str_eq(HexaVal a, HexaVal b) {
 // codegen emits rt_str_* directly; hexa_str_starts_with/ends_with shims retired.
 int rt_str_starts_with(HexaVal s, HexaVal prefix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(prefix)) return 0;
-    size_t plen = strlen(HX_STR(prefix));
+    size_t plen = HX_STRLEN(prefix);
     return strncmp(HX_STR(s), HX_STR(prefix), plen) == 0;
 }
 
 int rt_str_ends_with(HexaVal s, HexaVal suffix) {
     if (!HX_IS_STR(s) || !HX_IS_STR(suffix)) return 0;
-    size_t slen = strlen(HX_STR(s));
-    size_t sfxlen = strlen(HX_STR(suffix));
+    size_t slen = HX_STRLEN(s);
+    size_t sfxlen = HX_STRLEN(suffix);
     if (sfxlen > slen) return 0;
     return strcmp(HX_STR(s) + slen - sfxlen, HX_STR(suffix)) == 0;
 }
 
 HexaVal hexa_str_substring(HexaVal s, HexaVal start, HexaVal end) {
     if (!HX_IS_STR(s)) return hexa_str("");
-    int64_t slen = strlen(HX_STR(s));
+    int64_t slen = (int64_t)HX_STRLEN(s);
     int64_t a = HX_INT(start), b = HX_INT(end);
     if (a < 0) a = 0;
     if (b > slen) b = slen;
     if (a >= b) return hexa_str("");
-    char* buf = (char*)malloc(b - a + 1);
-    memcpy(buf, HX_STR(s) + a, b - a);
-    buf[b - a] = '\0';
-    return hexa_str_own(buf);
+    // perf-31: write straight into header-allocated buffer — eliminates the
+    // hexa_str_own copy that would otherwise re-strlen + re-malloc + memcpy.
+    char* buf = hexa_strbuf_alloc((size_t)(b - a));
+    memcpy(buf, HX_STR(s) + a, (size_t)(b - a));
+    return (HexaVal){.tag=TAG_STR, .s=buf};
 }
 
 int64_t hexa_str_index_of(HexaVal s, HexaVal sub) {
@@ -2953,7 +3050,7 @@ int64_t hexa_str_last_index_of(HexaVal s, HexaVal sub) {
 HexaVal hexa_str_char_at(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_str("");
     int64_t i = HX_INT(idx);
-    int64_t n = (int64_t)strlen(HX_STR(s));
+    int64_t n = (int64_t)HX_STRLEN(s);
     // Python-style negative index — align interp `s[-1]` 지원 (`c` 반환).
     if (i < 0) i += n;
     if (i < 0 || i >= n) return hexa_str("");
@@ -2968,7 +3065,7 @@ HexaVal hexa_str_char_at(HexaVal s, HexaVal idx) {
 HexaVal hexa_str_char_code_at(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_int(-1);
     int64_t i = HX_INT(idx);
-    int64_t n = (int64_t)strlen(HX_STR(s));
+    int64_t n = (int64_t)HX_STRLEN(s);
     if (i < 0) i += n;  // 음수 wraparound — char_at 과 align
     if (i < 0 || i >= n) return hexa_int(-1);
     return hexa_int((int64_t)(unsigned char)HX_STR(s)[i]);
@@ -4047,7 +4144,7 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
     HexaVal sarg = hexa_to_string(arg);
     int before = pos - HX_STR(fmt);
     int after_len = strlen(pos + 2);
-    char* result = malloc(before + strlen(HX_STR(sarg)) + after_len + 1);
+    char* result = malloc(before + (int)HX_STRLEN(sarg) + after_len + 1);
     strncpy(result, HX_STR(fmt), before);
     result[before] = 0;
     strcat(result, HX_STR(sarg));
@@ -4058,7 +4155,7 @@ HexaVal hexa_format(HexaVal fmt, HexaVal arg) {
 HexaVal hexa_format_n(HexaVal fmt, HexaVal args) {
     // Multi-arg: replace {} and {:.N} with successive args
     if (!HX_IS_STR(fmt) || !HX_IS_ARRAY(args)) return fmt;
-    size_t cap = strlen(HX_STR(fmt)) * 4 + HX_ARR_LEN(args) * 64 + 256;
+    size_t cap = HX_STRLEN(fmt) * 4 + HX_ARR_LEN(args) * 64 + 256;
     char* result = malloc(cap);
     size_t total = 0;
     result[0] = 0;
@@ -4150,13 +4247,13 @@ HexaVal rt_str_trim(HexaVal s) {
 
 HexaVal hexa_str_replace(HexaVal s, HexaVal old, HexaVal new_s) {
     if (!HX_IS_STR(s)) return s;
-    size_t cap = strlen(HX_STR(s)) * 2 + 1;
+    size_t cap = HX_STRLEN(s) * 2 + 1;
     char* result = malloc(cap);
     size_t total = 0;
     result[0] = 0;
     char* pos = HX_STR(s);
-    int oldlen = strlen(HX_STR(old));
-    size_t newlen = strlen(HX_STR(new_s));
+    int oldlen = (int)HX_STRLEN(old);
+    size_t newlen = HX_STRLEN(new_s);
     while (1) {
         char* found = strstr(pos, HX_STR(old));
         if (!found) {
@@ -4200,9 +4297,9 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
     size_t total_size = 0;
     for (int i = 0; i < HX_ARR_LEN(arr); i++) {
         HexaVal s = hexa_to_string(HX_ARR_ITEMS(arr)[i]);
-        total_size += strlen(HX_STR(s));
+        total_size += HX_STRLEN(s);
     }
-    size_t seplen = strlen(HX_STR(sep));
+    size_t seplen = HX_STRLEN(sep);
     total_size += (HX_ARR_LEN(arr) - 1) * seplen;
     char* result = malloc(total_size + 1);
     size_t total = 0;
@@ -4212,7 +4309,7 @@ HexaVal hexa_str_join(HexaVal arr, HexaVal sep) {
             total += seplen;
         }
         HexaVal s = hexa_to_string(HX_ARR_ITEMS(arr)[i]);
-        size_t slen = strlen(HX_STR(s));
+        size_t slen = HX_STRLEN(s);
         memcpy(result + total, HX_STR(s), slen);
         total += slen;
     }
@@ -4242,7 +4339,7 @@ HexaVal hexa_pad_left(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
     int w = HX_INT(width);
     int cplen = utf8_cpcount(HX_STR(str));
-    int bytelen = strlen(HX_STR(str));
+    int bytelen = (int)HX_STRLEN(str);
     if (cplen >= w) return str;
     int pad = w - cplen;
     char* result = malloc(bytelen + pad + 1);
@@ -4262,7 +4359,7 @@ HexaVal hexa_pad_right(HexaVal s, HexaVal width) {
     HexaVal str = hexa_to_string(s);
     int w = HX_INT(width);
     int cplen = utf8_cpcount(HX_STR(str));
-    int bytelen = strlen(HX_STR(str));
+    int bytelen = (int)HX_STRLEN(str);
     if (cplen >= w) return str;
     int pad = w - cplen;
     char* result = malloc(bytelen + pad + 1);
@@ -5313,7 +5410,7 @@ static HexaVal char_code;
 HexaVal hexa_char_code(HexaVal s, HexaVal idx) {
     if (!HX_IS_STR(s)) return hexa_int(0);
     int i = HX_INT(idx);
-    if (i < 0 || i >= (int)strlen(HX_STR(s))) return hexa_int(0);
+    if (i < 0 || i >= (int)HX_STRLEN(s)) return hexa_int(0);
     return hexa_int((unsigned char)HX_STR(s)[i]);
 }
 
@@ -5386,20 +5483,20 @@ HexaVal rt_str_trim_start(HexaVal s) {
 
 HexaVal rt_str_trim_end(HexaVal s) {
     if (!HX_IS_STR(s)) return s;
-    int len = strlen(HX_STR(s));
+    int len = (int)HX_STRLEN(s);
     while (len > 0 && (HX_STR(s)[len-1] == ' ' || HX_STR(s)[len-1] == '\t' || HX_STR(s)[len-1] == '\n' || HX_STR(s)[len-1] == '\r')) len--;
-    return hexa_str_own(strndup(HX_STR(s), len));
+    return hexa_str_own_with_len(strndup(HX_STR(s), len), (size_t)len);
 }
 
 // Byte-based slice: [start, end) clamped to length
 HexaVal hexa_str_slice(HexaVal s, HexaVal start, HexaVal end) {
     if (!HX_IS_STR(s)) return hexa_str("");
-    int len = (int)strlen(HX_STR(s));
+    int len = (int)HX_STRLEN(s);
     int a = (int)HX_INT(start), b = (int)HX_INT(end);
     if (a < 0) a = 0;
     if (b > len) b = len;
     if (a > b) a = b;
-    return hexa_str_own(strndup(HX_STR(s) + a, b - a));
+    return hexa_str_own_with_len(strndup(HX_STR(s) + a, b - a), (size_t)(b - a));
 }
 
 HexaVal hexa_array_slice(HexaVal arr, HexaVal start, HexaVal end) {
@@ -6031,7 +6128,7 @@ HexaVal hexa_array_sample(HexaVal arr, HexaVal nv) {
 // self/hexa_full.hexa:14959-14972.
 HexaVal hexa_str_substr(HexaVal s, HexaVal start_v, HexaVal len_v) {
     if (!HX_IS_STR(s)) return hexa_str("");
-    int64_t slen = (int64_t)strlen(HX_STR(s));
+    int64_t slen = (int64_t)HX_STRLEN(s);
     int64_t start = HX_IS_INT(start_v) ? HX_INT(start_v) : (int64_t)__hx_to_double(start_v);
     if (start < 0) start = 0;
     if (start > slen) start = slen;
@@ -6451,7 +6548,7 @@ HexaVal hexa_time_ms(void) {
 // anything without a measurable length. checkpoint.hexa uses it on byte
 // arrays returned by read_file_bytes.
 HexaVal hexa_byte_len(HexaVal v) {
-    if (HX_IS_STR(v))   return hexa_int(HX_STR(v) ? (int64_t)strlen(HX_STR(v)) : 0);
+    if (HX_IS_STR(v))   return hexa_int(HX_STR(v) ? (int64_t)HX_STRLEN(v) : 0);
     if (HX_IS_ARRAY(v)) return hexa_int((int64_t)HX_ARR_LEN(v));
     if (HX_IS_MAP(v)) {
         HexaMapTable* t = HX_MAP_TBL(v);
@@ -7144,7 +7241,7 @@ static const char _b64_enc[] =
 HexaVal hexa_base64_encode(HexaVal s) {
     if (!HX_IS_STR(s) || !HX_STR(s)) return hexa_str("");
     const unsigned char* in = (const unsigned char*)HX_STR(s);
-    size_t n = strlen(HX_STR(s));
+    size_t n = HX_STRLEN(s);
     size_t olen = 4 * ((n + 2) / 3);
     char* out = (char*)malloc(olen + 1);
     size_t i = 0, j = 0;
@@ -7179,7 +7276,7 @@ HexaVal hexa_base64_decode(HexaVal s) {
         dec_init = 1;
     }
     const unsigned char* in = (const unsigned char*)HX_STR(s);
-    size_t n = strlen(HX_STR(s));
+    size_t n = HX_STRLEN(s);
     char* out = (char*)malloc(n + 1);
     size_t j = 0;
     int bits = 0, vbits = 0;
