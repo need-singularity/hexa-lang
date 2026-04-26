@@ -182,6 +182,14 @@ iteration. fixpoint-convergence 의 well-foundedness 는 residual cardinal
 ```sh
 chflags nouchg /Users/ghost/core/hexa-lang/.roadmap   # if checking roadmap
 
+# Full enumeration (attempt 3 well-foundedness check)
+grep -n '\bclang\b' self/main.hexa
+# expect: 33 hits total. functional literals = 5
+#   (232, 236, 625 in Cat C; 1021 in Cat B; 1761 in Cat A).
+#   smoke-build-blocking subset = 2 (1761, 1021).
+#   28 other hits are comments / println status strings — none
+#   are clang spawn sites.
+
 # Category A (aot_build_slot residual)
 sed -n '1580,1822p' self/main.hexa | grep -n '\bclang\b'
 
@@ -197,3 +205,41 @@ grep -rn '\bclang\b' tool/ | wc -l
 
 검증 명령어 결과 == 본 문서 표 와 일치해야 함. 일치하지 않으면 audit
 재실행.
+
+## attempt 3 — audit completeness verification (2026-04-27)
+
+이전 audit (attempt 1) 의 reproduction list 는 self/main.hexa 의 세 line
+range (Cat A 1580-1822, Cat B 878-1047, Cat C 230-640) 만 검사 — "그 외
+lines 에 clang literal 0건" 은 implicit 가정이었다. attempt 3 는 그
+가정을 grep 전수 검사로 verify.
+
+전체 분류 (33 hits):
+
+| 범위                  | 라인                                   | functional       | comment / status |
+|-----------------------|----------------------------------------|------------------|------------------|
+| header (0-230)        | 15, 182, 199, 202                      | 0                | 4                |
+| Cat C (230-640)       | 232, 236, 457, 541, 613, 615, 621, 625 | **3** (232, 236, 625) | 5           |
+| 640-878 (uncategorized) | 737                                  | 0                | 1                |
+| Cat B (878-1047)      | 880, 891, 976, 997, 998, 1012, 1019, 1021, 1025, 1029, 1039 | **1** (1021) | 10 |
+| 1047-1580 (uncategorized) | 1512, 1522                          | 0                | 2                |
+| Cat A (1580-1822)     | 1601, 1638, 1646, 1751, 1757, 1761, 1781 | **1** (1761)   | 6                |
+| 1822-end              | (none)                                 | 0                | 0                |
+
+핵심 결과:
+- **Total functional literals = 5** (Cat A:1, B:1, C:3). Smoke-build-
+  blocking subset = 2 (lines 1761, 1021). Cat C 3 건은 bootstrap path —
+  smoke-build acceptance 와 무관 (per attempt 1 결정).
+- **Uncategorized ranges (0-230, 640-878, 1047-1580, 1822-end) 의 7 hits
+  모두 comment-equivalent**: file header 의 dispatch description, OS flag
+  section 코멘트, perf measurement 코멘트, codesign 노트. 0 functional.
+- **Attempt 1 의 Cat A 표 누락 보정**: 1601, 1638, 1646 (3 코멘트) 가
+  attempt 1 에서 list 안 됐음. 모두 cosmetic — `clang link fails`,
+  `Undefined symbol`, `fails parse` 류 explanatory note. cardinal 영향 0,
+  W-α 후 cosmetic cleanup batch 시 일괄 정리 가능.
+
+omega-stop progress: fixpoint-convergence iteration 3. residual cardinal
+은 여전히 2 (변화 없음). 그러나 well-foundedness 의 grounding 강화 —
+"residual 집합이 finite + enumerable" 의 enumeration 이 file-wide grep
+으로 verified, attempt 1 의 implicit "그 외 lines 0건" 가정 제거.
+convergence-loop 의 progress measure 는 redundant assumption count
+(strictly decreasing) 으로도 카운트 — attempt 3 가 그 measure 를 1 감소.
