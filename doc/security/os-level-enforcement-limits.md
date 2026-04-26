@@ -348,3 +348,60 @@ hexa CLI 호출
 - `Mac→docker hard-landing policy 2026-04-25` — Linux 컨테이너만이 darwin 의 cgroup 등가물.
 - `self/native/native_gate.c` 헤더 LIMITATION 블록 — 본 §11 의 in-source mirror.
 - `docker/runner/Dockerfile` `ENV LD_PRELOAD` 위 주석 — container 빌드 시 same caveat.
+
+---
+
+## 12. macOS Host Enforcement 강화 Alternatives (raw#7 후속, 2026-04-26)
+
+### §12.1 — 갭 정의
+
+§11 의 ladder 에서 macOS host 의 L1 (dynamic 자식 process file IO interception) 은 **부재 상태**:
+
+- macOS 의 LD_PRELOAD 등가물은 `DYLD_INSERT_LIBRARIES` 인데, **System Integrity Protection (SIP)** 가 SIP-protected binary (`/usr/bin/curl`, `/usr/bin/wget`, `/bin/sh`, `/usr/bin/python3` 등) 에 inject 를 차단한다.
+- 따라서 `native_gate.dylib` 를 `DYLD_INSERT_LIBRARIES` 로 hexa subprocess 환경에 주입해도, hexa 가 spawn 하는 SIP-protected 자식 (curl, wget, npm scripts 가 호출하는 system binary 등) 에 **shim 이 적용되지 않는다**.
+- 결과: hexa-runner Linux 컨테이너 외 native macOS 환경에서 hexa run 시 dynamic 자식의 enforce 갭.
+
+### §12.2 — 후보 alternatives
+
+| 옵션 | 메커니즘 | 진입 비용 | 효과 | 평가 |
+|---|---|---|---|---|
+| **A** | `sandbox-exec` wrapper for hexa-spawned processes | 낮음 (hexa 의 popen/exec 코드를 sandbox-exec wrap) | self/sbpl/native.sb deny rules 가 자식에도 적용 → L1 등가 | transitional, sandbox-exec 자체가 Apple deprecated API |
+| **B** | EndpointSecurity Framework | 높음 (code signing + `com.apple.developer.endpoint-security.client` entitlement) | kernel-level event delivery, LD_PRELOAD 보다 강력 + 안정 | enterprise grade, 단발 dev 환경 overkill |
+| **C** | 문서화 + Mac→docker 정책 의존 (status quo) | 0 | enforcement 없음, 정책으로 대체 (hard-landing policy 가 hexa 실행을 컨테이너로 강제) | 현재 선택 |
+| **D** | dtrace file open intercept (legacy) | 중간 | SIP-protected on modern macOS → 무력 | reject |
+| **E** | MacFUSE filesystem-level intercept | 매우 높음 | overkill | reject |
+
+### §12.3 — 본 사이클 결정 (2026-04-26)
+
+**옵션 C (status quo + 문서화)** 채택. 사유:
+
+1. **Mac→docker hard-landing 정책** (memory: `project_mac_hard_landing_policy.md`) 이 이미 Mac bare hexa 실행을 금지하고 Linux 컨테이너 (`cpus=4/mem=4g`) 만 허용 — macOS host enforce 갭의 실제 노출 면적은 정책으로 mitigate 됨.
+2. 옵션 A (sandbox-exec wrapper) 는 hexa spawn 코드 (popen/posix_spawn 호출 지점) 의 invasive 변경 + sandbox-exec deprecated → transitional 가치 낮음.
+3. 옵션 B (EndpointSecurity) 는 signing infra + Apple entitlement approval (장기) → 본 cycle 외.
+
+### §12.4 — 향후 promotion 경로
+
+future task 후보 (우선순위 순):
+
+1. **EndpointSecurity prototype** — Apple Developer entitlement 신청 + minimal client (file open / exec event subscribe + raw#13 정책 적용). hive ROI 랭킹에서 검토 후 promote 여부 결정.
+2. **sandbox-exec wrapper opt-in** — `HEXA_SANDBOX_CHILD=1` 환경변수 활성 시 hexa 의 spawn helper 가 자식 cmd 를 `sandbox-exec -f self/sbpl/native.sb <child-cmd>` 으로 wrap. transitional 경로 (deprecated API 인지 명시).
+3. **launchd plist ProgramArguments wrapping** — 일부 hexa 진입점 (특히 daemon) 의 plist 가 직접 hexa 를 호출하는 대신 sandbox-exec 으로 감싼 형태로 변경. 영향 범위가 plist 단위라 invasive less.
+
+### §12.5 — Mac→docker 정책 정합
+
+- 본 §12 의 갭 인정은 `Mac→docker hard-landing policy 2026-04-25` 의 존재 이유와 직접 정합한다. 정책이 macOS host 의 enforce 약화를 인정하고, hard-50% cap 컨테이너로 hard-landing 시키는 것이 곧 **L1 갭의 정책 레벨 mitigation**.
+- 따라서 §11.3 의 defense-in-depth 지도에 macOS host 항목을 추가:
+
+```
+macOS host (bare hexa 금지 - 정책 레벨)
+  └─ hexa run → docker hexa-runner 강제 (Mac→docker hard-landing)
+       └─ Linux container 안에서 §11.3 ladder 전체 활성
+            (L0 + L0' + L1 LD_PRELOAD + L2)
+```
+
+### §12.6 — 관련 SSOT
+
+- `hive/.raw` raw#7 OS-enforce — 본 §12 가 raw#7 의 macOS-specific 후속.
+- `project_mac_hard_landing_policy.md` (hive memory) — Mac bare hexa 금지 정책.
+- `self/native/native_gate.c` LIMITATION 블록 — DYLD_INSERT_LIBRARIES SIP 차단 명시 (line 38-40).
+- `self/sbpl/native.sb` — 옵션 A (sandbox-exec wrapper) 의 정책 source.

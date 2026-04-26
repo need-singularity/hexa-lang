@@ -59,6 +59,14 @@
 // (Linux container) 으로 cover; 본 .so 의 책임 범위가 아님을 명시한다.
 // 자세한 ladder rationale: hive .raw raw#7 entry + Mac→docker hard-landing
 // policy 2026-04-25 + doc/security/os-level-enforcement-limits.md §11.
+//
+// MACOS HOST L1 GAP (2026-04-26, doc §12): macOS 의 DYLD_INSERT_LIBRARIES
+// 는 SIP-protected binary (curl/wget/sh 등) 에 inject 차단 → host 의 L1
+// 등가 enforce 가 부재. 본 cycle 결정: Mac→docker hard-landing 정책으로
+// 정책 레벨 mitigate (macOS host 에서 hexa run 자체가 컨테이너로 강제됨).
+// 향후 옵션: (A) sandbox-exec wrapper for spawn (transitional, deprecated
+// API), (B) EndpointSecurity Framework (signing+entitlement, 장기). 상세
+// trade-off 표는 doc/security/os-level-enforcement-limits.md §12 참조.
 
 // NOTE: build with -D_GNU_SOURCE on the command line (see BUILD above).
 // Compiling without that define exposes a POSIX-only signature; dlsym
