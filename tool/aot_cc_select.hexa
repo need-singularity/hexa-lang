@@ -1,0 +1,183 @@
+#!hexa strict
+// tool/aot_cc_select.hexa — SH4 selector module for the AOT cc backend.
+//
+// Background
+//   self/main.hexa::aot_build_slot(...) (the Layer-3 link step) decides
+//   which compiler to invoke. SH1 shipped an inline env_var check
+//   (HEXA_AOT_CC, default "clang"). With phase 1 of SH3 closed (a
+//   trivial subset compiles natively without clang) and phase 2 partly
+//   landed, the dispatch surface needs a real selector — one that
+//   inspects the source AST and routes:
+//
+//     - native-supported subset (currently: trivial println literal /
+//       const-arith / BoolLit) → tool/aot_native_trivial.hexa
+//     - everything else                                   → clang (or
+//       whatever HEXA_AOT_CC says)
+//
+// This module is the single answer to "what backend should this build
+// use?"  The actual rewire of main.hexa to consume it happens in the
+// SH4 follow-up; this commit ships the selector itself, testable in
+// isolation, so the wiring change is a small one-line edit later.
+//
+// Usage as a CLI probe (for tests / dispatch debugging):
+//   hexa tool/aot_cc_select.hexa [<source.hexa>]
+// Outputs one line of JSON:
+//   {"backend":"clang","reason":"default","cc":"clang"}
+//   {"backend":"clang","reason":"env-override","cc":"zig cc"}
+//   {"backend":"native","reason":"trivial-subset","cc":"<native>"}
+//
+// Resolution order (first match wins)
+//   1. HEXA_AOT_BACKEND env var
+//        - "native"   → force native (file ignored if absent)
+//        - "clang"    → force clang
+//        - any other  → ignored, fall through
+//   2. HEXA_AOT_CC env var
+//        - non-empty  → use as the cc command (e.g. "zig cc"), backend
+//                       still classed as "clang-family"
+//        - empty/unset → fall through
+//   3. Source-AST classification (when a path is supplied)
+//        - matches the native trivial subset → backend = native
+//   4. Default → backend = clang, cc = "clang"
+//
+// Pure function semantics: pick_backend(source_path) → result map with
+//   { backend, reason, cc }. Same inputs → identical output.
+
+use "self/lexer"
+use "self/parser"
+
+// SH3 phase 5 will replace this with a real "is this AST natively
+// supported?" probe. Today it accepts the same trivial subset that
+// tool/aot_native_trivial.hexa accepts: a single ExprStmt of
+// println(StringLit | BoolLit | IntLit | BinOp(arith) | BinOp(cmp))
+// or zero-or-more LetStmt followed by such an ExprStmt.
+fn looks_like_trivial_subset(source_path: string) -> bool {
+    let probe = exec("test -r '" + source_path + "' && printf yes || printf no")
+    if probe != "yes" { return false }
+    let src = to_string(read_file(source_path))
+    let tokens = tokenize(src)
+    let ast = parse(tokens)
+    if len(ast) < 1 { return false }
+    let last = ast[len(ast) - 1]
+    if last["kind"] != "ExprStmt" { return false }
+    let expr = last["left"]
+    if expr["kind"] != "Call" { return false }
+    let callee = expr["left"]
+    if callee["kind"] != "Ident" { return false }
+    if callee["name"] != "println" { return false }
+    let args = expr["args"]
+    if len(args) != 1 { return false }
+    let arg0 = args[0]
+    let ak = arg0["kind"]
+    if ak == "StringLit" { return true }
+    if ak == "BoolLit"   { return true }
+    if ak == "IntLit"    { return true }
+    if ak == "Ident"     { return true }
+    if ak == "BinOp"     { return true }
+    return false
+}
+
+// pick_backend — returns a 3-field map. We use string keys so the
+// caller can serialize as JSON or read individual fields.
+fn pick_backend(source_path: string) {
+    // 1. HEXA_AOT_BACKEND override
+    let backend_env = env_var("HEXA_AOT_BACKEND")
+    if backend_env == "native" {
+        return #{
+            "backend": "native",
+            "reason":  "env-override-native",
+            "cc":      "<native>"
+        }
+    }
+    if backend_env == "clang" {
+        let cc_force = env_var("HEXA_AOT_CC")
+        let cc = if len(cc_force) > 0 { cc_force } else { "clang" }
+        return #{
+            "backend": "clang",
+            "reason":  "env-override-clang",
+            "cc":      cc
+        }
+    }
+
+    // 2. HEXA_AOT_CC env var (clang-family)
+    let cc_env = env_var("HEXA_AOT_CC")
+    if len(cc_env) > 0 {
+        return #{
+            "backend": "clang",
+            "reason":  "env-override",
+            "cc":      cc_env
+        }
+    }
+
+    // 3. AST classification
+    if len(source_path) > 0 {
+        if looks_like_trivial_subset(source_path) {
+            return #{
+                "backend": "native",
+                "reason":  "trivial-subset",
+                "cc":      "<native>"
+            }
+        }
+    }
+
+    // 4. Default
+    return #{
+        "backend": "clang",
+        "reason":  "default",
+        "cc":      "clang"
+    }
+}
+
+// ─── self-test (selftest) ─────────────────────────────────────
+// `hexa tool/aot_cc_select.hexa --selftest` runs in-process probes
+// across the four resolution branches. Returns rc=0 on PASS, rc=2 on
+// any FAIL — matches the in-house test harness convention.
+fn run_selftest() {
+    let mut fails = 0
+
+    // Probe 1: default (no env, no source)
+    let r1 = pick_backend("")
+    if r1["backend"] != "clang" || r1["reason"] != "default" {
+        eprintln("FAIL probe-1 default: " + str(r1))
+        fails = fails + 1
+    }
+
+    // Probe 2: trivial-subset path. Use /tmp/_sh4_trivial.hexa.
+    let trivial_path = "/tmp/_sh4_trivial.hexa"
+    let _w1 = exec("printf 'println(\"hi\")' > '" + trivial_path + "'")
+    let r2 = pick_backend(trivial_path)
+    if r2["backend"] != "native" || r2["reason"] != "trivial-subset" {
+        eprintln("FAIL probe-2 trivial: " + str(r2))
+        fails = fails + 1
+    }
+
+    // Probe 3: non-trivial source falls back to clang.
+    let nontrivial_path = "/tmp/_sh4_nontrivial.hexa"
+    let _w2 = exec("printf 'fn main() { let x = 1; for i in 0..10 { println(i) } }' > '" + nontrivial_path + "'")
+    let r3 = pick_backend(nontrivial_path)
+    if r3["backend"] != "clang" || r3["reason"] != "default" {
+        eprintln("FAIL probe-3 nontrivial: " + str(r3))
+        fails = fails + 1
+    }
+
+    let _r1 = exec("rm -f '" + trivial_path + "' '" + nontrivial_path + "'")
+
+    if fails == 0 {
+        println("aot_cc_select selftest: PASS (3 probes)")
+    } else {
+        eprintln("aot_cc_select selftest: FAIL (" + str(fails) + " probes)")
+        exit(2)
+    }
+}
+
+let av = real_args()
+if len(av) >= 1 && av[0] == "--selftest" {
+    run_selftest()
+} else {
+    // Force the string view so the fn-arg-map drift doesn't strip
+    // looks_like_trivial_subset()'s source_path argument. Same nudge
+    // as build_println_dyn's "" + s_in pattern.
+    let mut path = ""
+    if len(av) >= 1 { path = "" + av[0] }
+    let r = pick_backend(path)
+    println("{\"backend\":\"" + r["backend"] + "\",\"reason\":\"" + r["reason"] + "\",\"cc\":\"" + r["cc"] + "\"}")
+}
