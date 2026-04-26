@@ -40,7 +40,16 @@ FROM debian:12-slim AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates tini curl wget busybox-static \
+        gcc libc6-dev \
  && rm -rf /var/lib/apt/lists/*
+# ω-runner-7 (2026-04-26): gcc + libc6-dev added so the builder stage can
+# compile self/native/native_gate.c → /opt/hexa/native_gate.so.  The
+# distroless runtime stage then COPY's just the .so (no toolchain bloat
+# in the shipped image) and ENV LD_PRELOAD activates it for every
+# containerized hexa invocation.  This is the actual enforcement layer
+# for raw#7 F5/F6 + raw#6 F4 + raw#8 file-naming + raw#13 git-hook-ban
+# on Linux — macOS host stays advisory due to SIP per Mac→docker
+# hard-landing policy 2026-04-25.
 
 # ω-runner-5 (2026-04-26): unblock B3 (no GNU coreutils on distroless).
 # busybox-static (~1 MB) ships dirname/basename/printf/test/cat/awk/grep/sed/
@@ -101,6 +110,23 @@ RUN set -eux; \
     done; \
     ls /opt/runtime-libs/aarch64-linux-gnu/ | wc -l; \
     ls /opt/runtime-libs/x86_64-linux-gnu/ | wc -l
+
+# ω-runner-7 (2026-04-26): compile native_gate.so for LD_PRELOAD enforce.
+# The builder stage runs per buildx platform (arm64 / amd64), so the
+# resulting .so naturally matches TARGETARCH — no cross-compile gymnastics.
+# Build flags mirror the macOS .dylib path documented in native_gate.c
+# (cc -shared -fPIC -O2 -D_GNU_SOURCE … -ldl).  -ldl is required for
+# dlsym(RTLD_NEXT) lookups of the libc syscall wrappers we shim
+# (open/openat/creat/rename/renameat/renameat2).
+COPY self/native/native_gate.c /opt/hexa/native_gate.c
+RUN set -eux; \
+    mkdir -p /opt/hexa; \
+    cc -shared -fPIC -O2 -D_GNU_SOURCE \
+       -o /opt/hexa/native_gate.so \
+       /opt/hexa/native_gate.c \
+       -ldl; \
+    ls -la /opt/hexa/native_gate.so; \
+    test -s /opt/hexa/native_gate.so
 
 # ─────────────────────────────────────────────────────────────────
 # Stage 2: runtime.  gcr.io/distroless/cc-debian12 ships libc + libgcc +
@@ -167,6 +193,20 @@ COPY --from=elf-selected /interp /usr/local/bin/build/hexa_interp
 COPY self/module_loader.hexa /usr/local/bin/self/module_loader.hexa
 COPY self/stdlib              /usr/local/bin/self/stdlib
 ENV HEXA_STDLIB_ROOT=/usr/local/bin/self/stdlib
+
+# ω-runner-7 (2026-04-26): native_gate.so + LD_PRELOAD (raw#7 OS enforce).
+# The .so was compiled in the builder stage from self/native/native_gate.c
+# matching this platform's TARGETARCH.  ENV LD_PRELOAD makes every process
+# spawned in the container — hexa CLI, tini-wrapped child, popen("sh -c …")
+# subshells via busybox — inherit the shim.  EPERM is returned at the VFS
+# syscall boundary for raw#7 F5/F6 + raw#6 F4 + raw#8 file-naming +
+# raw#13 git-hook-ban deny rules before any byte hits disk.  Per
+# Mac→docker hard-landing policy 2026-04-25 this is the *actual* enforcer
+# on darwin hosts (macOS SIP blocks DYLD_INSERT_LIBRARIES on signed bins,
+# so the host shim is advisory; Linux containers carry the real teeth).
+# Opt-out (emergency only): docker run -e CLAUDX_NO_SANDBOX=1 ...
+COPY --from=builder /opt/hexa/native_gate.so /opt/hexa/native_gate.so
+ENV LD_PRELOAD=/opt/hexa/native_gate.so
 
 WORKDIR /work
 
