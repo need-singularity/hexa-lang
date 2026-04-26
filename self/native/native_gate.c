@@ -194,6 +194,37 @@ static int refuse_raw6(const char *path) {
     return 0;
 }
 
+// raw#7 — tree-structure F5 (loner-dir) + F6 (parent-child stem repeat).
+//
+// STATUS: not yet implemented in this shim. raw#7 currently enforces at
+// enforce-layer = hive-agent (tool/ai_native_scan.hexa lint). macOS SBPL
+// (self/sbpl/native.sb) cannot promote because the kernel regex engine
+// lacks both dir-content introspection (F5) and backreferences (F6 silently
+// fail-opens on backref patterns — smoke-tested 2026-04-26 /tmp probe).
+//
+// The Linux LD_PRELOAD shim CAN promote raw#7 to os-level: at write time
+// we have the full path string + the FS, so both F5 and F6 reduce to
+// straightforward C. This is the next concrete promotion target for raw#7;
+// see self/sbpl/native.sb raw#7 block, "PROMOTION ROADMAP (C-linux)".
+//
+// TODO raw#7 F5: refuse_raw7_loner_dir(path)
+//   On a CREATE-class write, stat(dirname(path)). If the parent dir would
+//   end up with exactly one entry (this file), and the parent is not on a
+//   raw#7 exemption list (mirrors tool/ai_native_scan.hexa exemptions —
+//   lib/, tests/integration/, archive/, .git/, .hexa-cache/, etc.), refuse
+//   with EPERM. Cost: one opendir+readdir on each first-write — keep behind
+//   an O_CREAT + ENOENT(path) check so steady-state writes pay zero.
+//
+// TODO raw#7 F6: refuse_raw7_parent_child_stem(path)
+//   String-compare basename-without-ext(path) against basename(dirname(path)).
+//   If equal AND dirname(path) is not a known root dir (e.g. tool/, test/,
+//   self/, raw#6 allowlist), refuse with EPERM. Cheap — pure pointer math
+//   on the path string, no syscalls.
+//
+// Both helpers gate behind on_allowlist() + an is_under_managed_repo() check
+// (mirroring refuse_raw6's is_under_hive_repo) so the cross-repo expansion
+// follows the raw_6.list precedent.
+
 // raw#20 — .own append-only: O_TRUNC on path ending in /.own = EPERM.
 static int refuse_raw20(const char *path, int flags) {
     if (!(flags & O_TRUNC)) return 0;
