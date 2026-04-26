@@ -24,10 +24,37 @@
 //
 // NOTES:
 //   - Intercepts `open`, `openat`, `creat`, `rename`, `renameat`, `renameat2`.
-//   - `fopen` goes through `open` internally on glibc; no separate shim.
+//   - LFS aliases: `open64`, `__open64`, `openat64`, `__openat64` also
+//     hooked (Phase 11 fix — curl/wget go fopen → __open64 on glibc and
+//     bypassed the plain `open` shim). All four route through the same
+//     `refuse()` policy; LFS path semantics are identical (off64_t only
+//     affects pread/pwrite, not the gate decision).
+//   - `fopen` goes through `open`/`__open64` internally on glibc; no
+//     separate shim needed once both are hooked.
 //   - macOS `DYLD_INSERT_LIBRARIES` is blocked on SIP-protected binaries;
 //     for Mac, sandbox-exec is the primary path (self/sbpl/native.sb).
 //     This shim is for unprivileged Linux (and unsigned mac executables).
+//
+// LIMITATION: hexa CLI 자체는 static musl link (build/hexa_linux_*: ELF …
+// statically linked, stripped) 라 LD_PRELOAD 무영향.  본 .so 는 hexa 가
+// spawn 하는 *dynamic 자식 프로세스* (curl, wget, busybox sh -c 서브셸,
+// popen 으로 띄운 외부 툴 etc.) 만 enforce 한다.  hexa 자신의 직접 file
+// IO (raw_loader 의 .raw open, codegen 산출물 write 등) 는 본 레이어를
+// **우회** — 그 경로는 다음 두 레이어로 cover:
+//   - L0 agent-layer pre_tool_guard: 모든 hexa subprocess 진입 직전에
+//     pretool hook 이 정책 검사 (cross-platform, hexa 자체 static 여부와
+//     무관).
+//   - L0' macOS sandbox-exec + self/sbpl/native.sb: darwin host 에서 hexa
+//     binary 자체를 sandbox profile 로 감싼다 (LD_PRELOAD 등가물).
+// 따라서 enforcement layer ladder 는:
+//   L0  agent-layer pre_tool_guard      — 모든 hexa subprocess (cross-platform)
+//   L0' sandbox-exec native.sb (macOS)  — hexa 자체 file IO (darwin)
+//   L1  본 .so + LD_PRELOAD (Linux)     — dynamic 자식 process (이 파일)
+//   L2  chflags uchg / launchd sweep    — filesystem-level (raw#1 os-lock)
+// hexa CLI 자체는 L0 + L0' (macOS) 또는 L0 + 자체 raw_loader assertion
+// (Linux container) 으로 cover; 본 .so 의 책임 범위가 아님을 명시한다.
+// 자세한 ladder rationale: hive .raw raw#7 entry + Mac→docker hard-landing
+// policy 2026-04-25 + doc/security/os-level-enforcement-limits.md §11.
 
 // NOTE: build with -D_GNU_SOURCE on the command line (see BUILD above).
 // Compiling without that define exposes a POSIX-only signature; dlsym
@@ -842,6 +869,69 @@ int creat(const char *pathname, mode_t mode) {
     if (!real) real = (creat_fn)dlsym(RTLD_NEXT, "creat");
     if (refuse(pathname, O_WRONLY | O_CREAT | O_TRUNC)) { errno = EPERM; return -1; }
     return real(pathname, mode);
+}
+
+// ── LFS aliases: open64 / __open64 / openat64 / __openat64 ───────────
+//
+// glibc exposes Large-File-Support variants of the open family; on 64-bit
+// Linux these are functionally identical to plain open/openat (off_t is
+// already 64-bit), but stdio (fopen) and several dynamically-linked tools
+// (curl, wget) call __open64 directly via the LFS-redirect macro. Without
+// dedicated dlsym shims those calls bypass our `open` interposer entirely
+// — Phase 11 verification caught curl writing through this gap.
+//
+// All four route through the same `refuse()` policy used by `open` so
+// raw#8/13/20/6/7 + hexa-lang scope checks are identical. The signatures
+// match glibc's prototypes (varargs `mode_t` only on O_CREAT).
+typedef int (*open64_fn)(const char *, int, ...);
+typedef int (*openat64_fn)(int, const char *, int, ...);
+
+int open64(const char *pathname, int flags, ...) {
+    static open64_fn real = NULL;
+    if (!real) real = (open64_fn)dlsym(RTLD_NEXT, "open64");
+    if (refuse(pathname, flags)) { errno = EPERM; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+        return real(pathname, flags, mode);
+    }
+    return real(pathname, flags);
+}
+
+int __open64(const char *pathname, int flags, ...) {
+    static open64_fn real = NULL;
+    if (!real) real = (open64_fn)dlsym(RTLD_NEXT, "__open64");
+    if (refuse(pathname, flags)) { errno = EPERM; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+        return real(pathname, flags, mode);
+    }
+    return real(pathname, flags);
+}
+
+int openat64(int dirfd, const char *pathname, int flags, ...) {
+    static openat64_fn real = NULL;
+    if (!real) real = (openat64_fn)dlsym(RTLD_NEXT, "openat64");
+    if (refuse(pathname, flags)) { errno = EPERM; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+        return real(dirfd, pathname, flags, mode);
+    }
+    return real(dirfd, pathname, flags);
+}
+
+int __openat64(int dirfd, const char *pathname, int flags, ...) {
+    static openat64_fn real = NULL;
+    if (!real) real = (openat64_fn)dlsym(RTLD_NEXT, "__openat64");
+    if (refuse(pathname, flags)) { errno = EPERM; return -1; }
+    mode_t mode = 0;
+    if (flags & O_CREAT) {
+        va_list ap; va_start(ap, flags); mode = va_arg(ap, int); va_end(ap);
+        return real(dirfd, pathname, flags, mode);
+    }
+    return real(dirfd, pathname, flags);
 }
 
 int rename(const char *oldpath, const char *newpath) {
