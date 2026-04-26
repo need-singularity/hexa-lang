@@ -30,9 +30,6 @@ LABEL org.opencontainers.image.title="hexa-runner" \
 
 # Minimal apt layer:
 #   ca-certificates : TLS for fetch tools.
-#   perl            : provides /usr/bin/shasum — used by main.hexa AOT
-#                     cache + source fingerprinting.  Without it, every
-#                     `hexa run` prints `sh: shasum: not found` cascades.
 #   tini            : reaping-aware init for PID 1.  cmd_run() forks a
 #                     `( watcher ) &` subshell that uses [ $PPID -eq 1 ]
 #                     to detect orphaning; without proper init the
@@ -45,9 +42,18 @@ LABEL org.opencontainers.image.title="hexa-runner" \
 #                     with `sh: 1: curl: not found` (2026-04-26 bridge
 #                     health check).  raw 73 admissibility: minimum-add
 #                     only, no feature creep.
+#
+# perl (REMOVED 2026-04-26 ω-runner-2):  Previously installed solely to
+# provide /usr/bin/shasum for main.hexa AOT cache + source fingerprinting
+# (~50MB layer cost: perl + libperl5.36 + perl-modules-5.36).  self/main.hexa
+# source_key() and src_fingerprint_deep() now prefer `sha256sum` (coreutils,
+# present in debian:12-slim base) and fall back to `shasum -a 256` only when
+# sha256sum is missing — so the macOS host build retains its perl-shasum
+# code path while the Linux runner uses the coreutils path that's already
+# in the base image.  See state/omega_runner_2_perl_removal.json.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
-        ca-certificates perl tini curl wget \
+        ca-certificates tini curl wget \
  && rm -rf /var/lib/apt/lists/*
 
 # Stage all four binaries (CLI dispatcher + interp interpreter, ×2 arches)
