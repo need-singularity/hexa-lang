@@ -2,12 +2,20 @@
 # anima_audio_worker.py — persistent python worker for anima_audio.hexa
 #
 # Design ref: /Users/ghost/core/anima/state/omega_audio_2_persistent_worker_design.json
+# Phase B (2026-04-26): rewired from FIFO+keepalive shim to direct stdin/stdout
+# IPC via the ω-runtime-1 pipe_spawn primitive. The worker code itself was
+# already line-protocol-friendly (it reads NDJSON from stdin and writes NDJSON
+# to stdout), so no protocol change was required here. Two adjustments:
+#   (1) PARENT_PID under pipe_spawn is hexa_interp directly (sh -c execs in place).
+#   (2) The "ready" event on stdout is still emitted; the hexa caller now
+#       consumes it explicitly via pipe_recv_line() right after pipe_spawn().
 #
 # Lifecycle:
-#   - spawned lazily by hexa _run_py() on first call when ANIMA_AUDIO_WORKER=1
+#   - spawned lazily by hexa _run_py_worker() on first call (ANIMA_AUDIO_WORKER!="0")
 #   - reads NDJSON requests on stdin, writes NDJSON responses on stdout
 #   - on idle > IDLE_TIMEOUT_S, exits cleanly
-#   - inherits process group from hexa parent => SIGHUP cascades on parent exit
+#   - parent watchdog: polls kill(parent_pid,0) every ≤5s; exits if parent dies
+#     (this also makes the runtime atexit SIGTERM cascade fully reliable).
 #
 # Protocol (one line per message, NDJSON):
 #   request : {"id": <int>, "kind": "exec"|"ping"|"shutdown",

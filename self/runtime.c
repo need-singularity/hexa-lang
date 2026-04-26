@@ -6973,6 +6973,7 @@ static int _fn_shims_ready = 0;
 static void _hexa_init_net_fn_shims(void);  // fwd decl — body in native/net.c
 static void _hexa_init_os_fn_shims(void);   // fwd decl — body in native/signal_flock.c
 static void _hexa_init_exec_sha_fn_shims(void); // fwd decl — body in native/exec_argv_sha256.c
+static void _hexa_init_persistent_pipe_fn_shims(void); // fwd decl — body in native/persistent_pipe.c
 static void _hexa_init_fn_shims(void) {
     if (_fn_shims_ready) return;
     // bootstrap free-fn shims (join, char_code, chr, bit_or)
@@ -6998,6 +6999,8 @@ static void _hexa_init_fn_shims(void) {
     _hexa_init_os_fn_shims();
     // hxa-20260424-005 items #1 + #7: exec_argv + sha256 shims
     _hexa_init_exec_sha_fn_shims();
+    // ω-runtime-1 Phase A (2026-04-26): persistent-pipe primitive shims
+    _hexa_init_persistent_pipe_fn_shims();
     _fn_shims_ready = 1;
 }
 
@@ -7083,4 +7086,17 @@ static void _hexa_init_fn_shims(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 #include "native/exec_argv_sha256.c"
 
+/* ═══════════════════════════════════════════════════════════════════
+ * persistent_pipe — ω-runtime-1 Phase A (2026-04-26)
+ *
+ * Handle-based bidirectional child-process API. Five new builtins:
+ *   pipe_spawn(cmd) -> int
+ *   pipe_send_line(h, payload) -> bool
+ *   pipe_recv_line(h, timeout_ms) -> string
+ *   pipe_close(h) -> bool
+ *   pipe_alive(h) -> bool
+ * Powers ω-audio-2 60× chain target (replaces _audio_worker_call.sh
+ * 133-line bash shim with sub-ms send/recv via persistent fork).
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/persistent_pipe.c"
 
