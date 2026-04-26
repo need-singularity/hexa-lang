@@ -7,12 +7,16 @@
 # directly (skipping any shell or hexa indirection) so the test is independent
 # of busybox-static / hexa-cli static-musl bypass surfaces.
 #
-# Test matrix (5 cases):
+# Test matrix (6 cases):
 #   T1  raw#9/raw#8  /work/banned.py            → expect EPERM (errno=1)
 #   T2  raw#7 F5     /work/core/hexa-lang/foo/loner.txt    → expect EPERM
 #   T3  raw#7 F6     /work/core/hexa-lang/foo/foo.txt      → expect EPERM
 #   T4  allowlist    /work/legitimate.txt       → expect OK
 #   T5  opt-out      CLAUDX_NO_SANDBOX=1 + .py  → expect OK
+#   T6  fopen("w")   /work/banned_fopen.py      → expect EPERM
+#                    Phase 13 — closes libc-internal __open64 hidden-alias
+#                    bypass that allowed curl/wget fopen to elide our
+#                    open-family interposers. fopen itself is now hooked.
 #
 # Skip rules:
 #   - rc=77 if docker unavailable on this host
@@ -51,6 +55,9 @@ WORK="$(mktemp -d -t hexa_smoke_e2e.XXXXXX)"
 trap 'rm -rf "$WORK"' EXIT
 
 # Compile diag.c via debian:12-slim (matches runner libc, glibc-aarch64).
+# diag accepts an optional first arg "fopen" to switch from open(2) to
+# fopen(3) — Phase 13 added a fopen-family interposer to close the libc-
+# internal __open64 hidden-alias bypass that curl/wget were exploiting.
 cat > "$WORK/diag.c" <<'EOF'
 #include <stdio.h>
 #include <fcntl.h>
@@ -59,15 +66,36 @@ cat > "$WORK/diag.c" <<'EOF'
 #include <string.h>
 
 int main(int argc, char **argv) {
-    if (argc < 2) { fprintf(stderr, "usage: %s PATH\n", argv[0]); return 2; }
-    int fd = open(argv[1], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (argc < 2) {
+        fprintf(stderr, "usage: %s [fopen] PATH\n", argv[0]);
+        return 2;
+    }
+    int via_fopen = 0;
+    const char *path = argv[1];
+    if (argc >= 3 && strcmp(argv[1], "fopen") == 0) {
+        via_fopen = 1;
+        path = argv[2];
+    }
+    if (via_fopen) {
+        FILE *f = fopen(path, "w");
+        if (!f) {
+            fprintf(stderr, "fopen(%s) FAIL errno=%d (%s)\n",
+                    path, errno, strerror(errno));
+            return 1;
+        }
+        fprintf(f, "hi\n");
+        fclose(f);
+        fprintf(stderr, "fopen(%s) OK\n", path);
+        return 0;
+    }
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (fd < 0) {
-        fprintf(stderr, "open(%s) FAIL errno=%d (%s)\n", argv[1], errno, strerror(errno));
+        fprintf(stderr, "open(%s) FAIL errno=%d (%s)\n", path, errno, strerror(errno));
         return 1;
     }
     write(fd, "hi\n", 3);
     close(fd);
-    fprintf(stderr, "open(%s) OK\n", argv[1]);
+    fprintf(stderr, "open(%s) OK\n", path);
     return 0;
 }
 EOF
@@ -96,11 +124,15 @@ FAIL=0
 results=""
 
 run_case() {
-    local label="$1" expect="$2" path="$3" extra_env="${4:-}"
+    local label="$1" expect="$2" path="$3" extra_env="${4:-}" mode="${5:-open}"
     rm -f "$path" 2>/dev/null
     local docker_args="--rm -v $WORK:/work --entrypoint /work/diag $extra_env $TAG"
     local out rc
-    out="$(docker run $docker_args "$path" 2>&1)"; rc=$?
+    if [ "$mode" = "fopen" ]; then
+        out="$(docker run $docker_args fopen "$path" 2>&1)"; rc=$?
+    else
+        out="$(docker run $docker_args "$path" 2>&1)"; rc=$?
+    fi
     local got_eperm=0
     case "$out" in *"FAIL errno=1"*) got_eperm=1 ;; esac
     local got_ok=0
@@ -125,16 +157,17 @@ run_case() {
     fi
 }
 
-echo "[12_ld_preload_e2e] running 5-case matrix"
+echo "[12_ld_preload_e2e] running 6-case matrix"
 run_case "T1_raw9_py"      EPERM "/work/banned.py"
 run_case "T2_raw7_F5"      EPERM "/work/core/hexa-lang/foo/loner.txt"
 run_case "T3_raw7_F6"      EPERM "/work/core/hexa-lang/foo/foo.txt"
 run_case "T4_allowlist"    OK    "/work/legitimate.txt"
 run_case "T5_optout"       OK    "/work/optout.py" "-e CLAUDX_NO_SANDBOX=1"
+run_case "T6_fopen_py"     EPERM "/work/banned_fopen.py" "" fopen
 
 echo "[12_ld_preload_e2e] results: PASS=$PASS FAIL=$FAIL ($results)"
 if [ $FAIL -ne 0 ]; then
     exit 1
 fi
-echo "PASS: 5/5 LD_PRELOAD enforce surfaces verified"
+echo "PASS: 6/6 LD_PRELOAD enforce surfaces verified"
 exit 0

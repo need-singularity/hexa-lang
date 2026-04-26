@@ -29,8 +29,12 @@
 //     bypassed the plain `open` shim). All four route through the same
 //     `refuse()` policy; LFS path semantics are identical (off64_t only
 //     affects pread/pwrite, not the gate decision).
-//   - `fopen` goes through `open`/`__open64` internally on glibc; no
-//     separate shim needed once both are hooked.
+//   - `fopen` family (fopen/fopen64/freopen/freopen64) is ALSO hooked
+//     directly (Phase 13 fix — verification in Phase 12 caught curl
+//     calling `fopen` whose internal `__open64` resolves through libc
+//     hidden alias / PLT-bypass, sidestepping our `__open64` interposer
+//     entirely). Hooking `fopen` itself closes the libc-internal gap;
+//     `fdopen` (already-open fd) and `tmpfile` (anonymous) need no shim.
 //   - macOS `DYLD_INSERT_LIBRARIES` is blocked on SIP-protected binaries;
 //     for Mac, sandbox-exec is the primary path (self/sbpl/native.sb).
 //     This shim is for unprivileged Linux (and unsigned mac executables).
@@ -932,6 +936,99 @@ int __openat64(int dirfd, const char *pathname, int flags, ...) {
         return real(dirfd, pathname, flags, mode);
     }
     return real(dirfd, pathname, flags);
+}
+
+// ── fopen / fopen64 / freopen / freopen64 (Phase 13 PLT-bypass close) ──
+//
+// Phase 12 verification caught a libc-internal gap: glibc's `fopen` routes
+// through `__open64` via a HIDDEN ALIAS / direct-call inside libc.so itself,
+// not via the public PLT. LD_PRELOAD's symbol-interposition only redirects
+// calls that go through the PLT/GOT lookup — calls inside libc to its own
+// hidden aliases bind directly to the libc-internal implementation, bypassing
+// our `__open64` shim entirely. curl/wget exhibited this: their `fopen` for
+// the output file appeared to "succeed" (fopen returned non-NULL) even with
+// the open shim in place, because the underlying syscall used libc's private
+// `__open64` slot.
+//
+// Fix = hook `fopen` itself. dlsym(RTLD_NEXT, "fopen") finds glibc's public
+// `fopen`, but we get to inspect path + mode and gate BEFORE the libc-
+// internal `__open64` is invoked. Once we decide to allow, we hand off to
+// real_fopen; libc's internal alias path is fine downstream because the
+// policy decision already happened here.
+//
+// Mode parsing semantics (POSIX/C99 fopen mode):
+//   "r"      — read-only.            writes=0 → enforce skipped.
+//   "rb"     — read-only binary.     writes=0.
+//   "w","wb" — write/truncate.       writes=1 → enforce.
+//   "a","ab" — append.               writes=1 → enforce.
+//   "r+"     — read + write.         writes=1 → enforce.
+//   "w+"     — read + write + trunc. writes=1 → enforce.
+//   "a+"     — read + append.        writes=1 → enforce.
+//   "...e"   — O_CLOEXEC modifier.   ignored for policy.
+//   "...x"   — O_EXCL on create.     write-implying ('w' or 'a' present).
+// Detection: any of {'w','a','+'} in the mode string ⇒ a write may occur.
+//
+// Self-recursion safety: the raw7 reader (load_raw_7_exemptions) calls
+// fopen(list_path, "r"). Mode "r" → writes=0 → enforce skipped → real_fopen
+// runs without entering refuse(). The pre-existing `g_raw7_loading` flag
+// remains as defense-in-depth (paranoia: a future code path that read-mode-
+// opens a write-mode-cached file would still be guarded by re-entrancy).
+//
+// `fdopen(fd, mode)` and `tmpfile()` need no shims:
+//   fdopen — fd was opened earlier; that open() was already gated.
+//   tmpfile — anonymous + auto-deleted; outside policy scope.
+//
+// Refuse signal mode for fopen: synthesize O_WRONLY|O_CREAT to mirror what
+// the underlying open would have used. refuse() consults is_write_flag()
+// which only checks for any write bit, so this is sufficient.
+
+typedef FILE *(*fopen_fn)(const char *, const char *);
+typedef FILE *(*freopen_fn)(const char *, const char *, FILE *);
+
+static int fopen_mode_writes(const char *mode) {
+    if (!mode) return 0;
+    // 'r' alone (with optional 'b','e','x' modifiers) is read-only;
+    // any 'w', 'a', or '+' anywhere in the string implies write capability.
+    return (strchr(mode, 'w') != NULL)
+        || (strchr(mode, 'a') != NULL)
+        || (strchr(mode, '+') != NULL);
+}
+
+FILE *fopen(const char *path, const char *mode) {
+    static fopen_fn real = NULL;
+    if (!real) real = (fopen_fn)dlsym(RTLD_NEXT, "fopen");
+    if (path && fopen_mode_writes(mode)) {
+        if (refuse(path, O_WRONLY | O_CREAT)) { errno = EPERM; return NULL; }
+    }
+    return real(path, mode);
+}
+
+FILE *fopen64(const char *path, const char *mode) {
+    static fopen_fn real = NULL;
+    if (!real) real = (fopen_fn)dlsym(RTLD_NEXT, "fopen64");
+    if (path && fopen_mode_writes(mode)) {
+        if (refuse(path, O_WRONLY | O_CREAT)) { errno = EPERM; return NULL; }
+    }
+    return real(path, mode);
+}
+
+FILE *freopen(const char *path, const char *mode, FILE *stream) {
+    static freopen_fn real = NULL;
+    if (!real) real = (freopen_fn)dlsym(RTLD_NEXT, "freopen");
+    // freopen with NULL path = mode-change on existing fd; no path to gate.
+    if (path && fopen_mode_writes(mode)) {
+        if (refuse(path, O_WRONLY | O_CREAT)) { errno = EPERM; return NULL; }
+    }
+    return real(path, mode, stream);
+}
+
+FILE *freopen64(const char *path, const char *mode, FILE *stream) {
+    static freopen_fn real = NULL;
+    if (!real) real = (freopen_fn)dlsym(RTLD_NEXT, "freopen64");
+    if (path && fopen_mode_writes(mode)) {
+        if (refuse(path, O_WRONLY | O_CREAT)) { errno = EPERM; return NULL; }
+    }
+    return real(path, mode, stream);
 }
 
 int rename(const char *oldpath, const char *newpath) {
