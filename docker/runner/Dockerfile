@@ -143,7 +143,7 @@ ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="hexa-runner-distroless" \
       org.opencontainers.image.description="POC: hexa CLI on distroless/cc-debian12" \
-      org.opencontainers.image.source="https://github.com/dancinlife/hexa-lang" \
+      org.opencontainers.image.source="https://github.com/need-singularity/hexa-lang" \
       org.opencontainers.image.licenses="MIT"
 
 # ω-runner-5 (2026-04-26): busybox-static unblocks B3.
