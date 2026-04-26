@@ -1,0 +1,386 @@
+#!hexa strict
+// tool/parser_format_stability_lint.hexa — own#1 enforcer
+//
+// PURPOSE
+//   own#1 (slug `parser-format-stability`) declares self/raw_loader.hexa
+//   as the API contract that hive + nexus + airgenome + (self) consume.
+//   Backward-incompatible changes to the public surface MUST be paired
+//   with a SemVer major bump or the rule is violated.
+//
+// PUBLIC SURFACE DEFINITION (assumption — documented here)
+//   The export style of self/raw_loader.hexa is the `pub` keyword on
+//   `fn` / `type` / `const`. Lines beginning with one of:
+//     `pub fn `   `pub type `   `pub const `
+//   are taken verbatim (after _rstrip) as the surface contract. Helpers
+//   prefixed `_` and unprefixed `fn` are private and ignored — they may
+//   change freely without semver implication.
+//
+// VERSION DETECTION
+//   Looks for either of (in priority order):
+//     1. top-of-file comment `// version: <x.y.z>` (SemVer triple)
+//     2. file-scope `let PARSER_VERSION = "<x.y.z>"` constant
+//   If neither exists, the lint REPORTS the absence rather than fabricate
+//   a version. (own#1 cannot enforce semver if no semver is declared.)
+//
+// ALGORITHM
+//   1. Extract current public surface from working-tree raw_loader.hexa
+//   2. Extract baseline surface from `git show <ref>:self/raw_loader.hexa`
+//      (default ref = HEAD, override via `--baseline <ref>`)
+//   3. Diff the two surface lists (set difference, both directions)
+//   4. Read SemVer from current + baseline files (best-effort)
+//   5. Apply rules:
+//        surface IDENTICAL → PASS regardless of version
+//        surface DIFFERS, version unchanged → FAIL (breaking w/o bump)
+//        surface DIFFERS, major-bumped → PASS
+//        surface DIFFERS, minor/patch + diff is purely additive → PASS
+//        surface DIFFERS, minor/patch + non-additive diff → FAIL (req major)
+//
+// CLI
+//   hexa tool/parser_format_stability_lint.hexa
+//   hexa tool/parser_format_stability_lint.hexa --baseline <git-ref>
+//
+// EXIT
+//   0 — PASS (surface stable, or version bump matches diff kind)
+//   1 — FAIL (breaking change without proper semver bump)
+//
+// OUTPUT
+//   [PASS] own#1 parser-format-stability — <reason>
+//   [FAIL] own#1 parser-format-stability — <reason>
+//
+// SUBPROCESS PATTERN
+//   Uses `git show <ref>:self/raw_loader.hexa` — established pattern from
+//   tool/roadmap_lint.hexa (commit-baseline transition check) and
+//   tool/install_interp_shim.hexa (HEAD-baseline file restore).
+
+use "self/stdlib/law_io"
+
+// ─── shell helpers ──────────────────────────────────────────────
+
+fn _shell_quote(s: string) -> string {
+    return "'" + s.replace("'", "'\\''") + "'"
+}
+
+fn _pwd() -> string {
+    let mut p = env("PWD")
+    if p == "" { p = to_string(exec("pwd")).trim() }
+    return p
+}
+
+fn _file_exists(path: string) -> bool {
+    let r = exec_with_status("test -f " + _shell_quote(path))
+    return r[1] == 0
+}
+
+fn _epoch_now() -> string {
+    return to_string(exec("date -u +%s")).trim()
+}
+
+// ─── argv parsing ───────────────────────────────────────────────
+
+fn _parse_baseline() -> string {
+    let av = args()
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--baseline" {
+            if i + 1 < len(av) { return av[i + 1] }
+        }
+        i = i + 1
+    }
+    return "HEAD"
+}
+
+// ─── surface extraction ────────────────────────────────────────
+
+// Returns array of strings — each a `pub fn|type|const ...` line, rstripped.
+// Order preserved (later steps treat as a set, but order helps debug output).
+fn _rstrip(s: string) -> string {
+    let mut end = len(s)
+    while end > 0 {
+        let c = s.substring(end - 1, end)
+        if c == " " || c == "\t" || c == "\r" {
+            end = end - 1
+        } else {
+            break
+        }
+    }
+    return s.substring(0, end)
+}
+
+fn _is_pub_decl(line: string) -> bool {
+    if line.index_of("pub fn ")    == 0 { return true }
+    if line.index_of("pub type ")  == 0 { return true }
+    if line.index_of("pub const ") == 0 { return true }
+    return false
+}
+
+// Strip trailing ` {` body opener so identical signatures across whitespace
+// drift compare equal. Keeps the signature canonical: `pub fn foo(x: int) -> bool`
+fn _canon_decl(line: string) -> string {
+    let s = _rstrip(line)
+    let n = len(s)
+    if n >= 2 && s.substring(n - 2, n) == " {" {
+        return _rstrip(s.substring(0, n - 2))
+    }
+    if n >= 1 && s.substring(n - 1, n) == "{" {
+        return _rstrip(s.substring(0, n - 1))
+    }
+    return s
+}
+
+fn _extract_surface_from_text(src: string) -> array {
+    let lines = split(src, "\n")
+    let mut out = []
+    for raw_line in lines {
+        let line = _rstrip(raw_line)
+        if _is_pub_decl(line) {
+            out.push(_canon_decl(line))
+        }
+    }
+    return out
+}
+
+// ─── version detection ─────────────────────────────────────────
+
+// Returns "" when no version directive is found.
+// Recognises either:
+//   `// version: 1.2.3`        (top-of-file comment, first 30 lines)
+//   `let PARSER_VERSION = "1.2.3"`  (anywhere)
+fn _extract_version_from_text(src: string) -> string {
+    let lines = split(src, "\n")
+    let mut i = 0
+    let scan_limit = 30
+    while i < len(lines) && i < scan_limit {
+        let line = lines[i].trim()
+        let needle = "// version:"
+        if line.index_of(needle) == 0 {
+            let v = line.substring(len(needle), len(line)).trim()
+            if v != "" { return v }
+        }
+        i = i + 1
+    }
+    // fallback: PARSER_VERSION constant anywhere in file
+    for raw_line in lines {
+        let line = raw_line.trim()
+        if line.index_of("let PARSER_VERSION") == 0 {
+            let eq = line.index_of("=")
+            if eq < 0 { continue }
+            let rest = line.substring(eq + 1, len(line)).trim()
+            // strip surrounding quotes if present
+            let rn = len(rest)
+            if rn >= 2 {
+                let f = rest.substring(0, 1)
+                let l = rest.substring(rn - 1, rn)
+                if (f == "\"" && l == "\"") || (f == "'" && l == "'") {
+                    return rest.substring(1, rn - 1)
+                }
+            }
+            return rest
+        }
+    }
+    return ""
+}
+
+// Parse SemVer "x.y.z" — returns [major, minor, patch] as ints, or [] on parse fail.
+fn _parse_semver(v: string) -> array {
+    if v == "" { return [] }
+    // strip leading 'v' if present
+    let mut s = v
+    if len(s) >= 1 && s.substring(0, 1) == "v" {
+        s = s.substring(1, len(s))
+    }
+    let parts = split(s, ".")
+    if len(parts) < 3 { return [] }
+    // ensure each of the 3 parts is digits-only
+    let digits = "0123456789"
+    let mut out = []
+    let mut i = 0
+    while i < 3 {
+        let p = parts[i].trim()
+        if len(p) == 0 { return [] }
+        let mut j = 0
+        while j < len(p) {
+            let c = p.substring(j, j + 1)
+            if !digits.contains(c) { return [] }
+            j = j + 1
+        }
+        out.push(to_int(p))
+        i = i + 1
+    }
+    return out
+}
+
+// ─── git baseline retrieval ────────────────────────────────────
+
+// Returns [content, status]. status: 0 ok, 1 = git show failed
+fn _git_show_raw_loader(ref: string) -> array {
+    let ts = _epoch_now()
+    let dst = "/tmp/.raw_loader_baseline." + ts
+    let cmd = "git show " + _shell_quote(ref + ":self/raw_loader.hexa")
+            + " > " + _shell_quote(dst) + " 2>/dev/null"
+    let r = exec_with_status(cmd)
+    if r[1] != 0 {
+        exec("rm -f " + _shell_quote(dst) + " 2>/dev/null")
+        return ["", 1]
+    }
+    if !_file_exists(dst) {
+        return ["", 1]
+    }
+    let src = to_string(read_file(dst))
+    exec("rm -f " + _shell_quote(dst) + " 2>/dev/null")
+    return [src, 0]
+}
+
+// ─── set diff over surface arrays ──────────────────────────────
+
+fn _contains(arr: array, s: string) -> bool {
+    for v in arr { if v == s { return true } }
+    return false
+}
+
+// Returns [added, removed]:
+//   added   = entries in cur but not in base
+//   removed = entries in base but not in cur
+fn _surface_diff(base: array, cur: array) -> array {
+    let mut added = []
+    let mut removed = []
+    for c in cur {
+        if !_contains(base, c) { added.push(c) }
+    }
+    for b in base {
+        if !_contains(cur, b) { removed.push(b) }
+    }
+    return [added, removed]
+}
+
+// ─── verdict assembly ─────────────────────────────────────────
+
+fn _emit_pass(reason: string) -> int {
+    println("[PASS] own#1 parser-format-stability — " + reason)
+    return 0
+}
+
+fn _emit_fail(reason: string) -> int {
+    eprintln("[FAIL] own#1 parser-format-stability — " + reason)
+    return 1
+}
+
+fn _join(arr: array, sep: string) -> string {
+    let mut parts = []
+    for v in arr { parts.push(v) }
+    return parts.join(sep)
+}
+
+fn _summarise_diff(added: array, removed: array) -> string {
+    let parts = ["+", to_string(len(added)), " / -", to_string(len(removed))]
+    return parts.join("")
+}
+
+fn _print_diff_detail(added: array, removed: array) {
+    if len(added) > 0 {
+        eprintln("  added (" + to_string(len(added)) + "):")
+        for s in added { eprintln("    + " + s) }
+    }
+    if len(removed) > 0 {
+        eprintln("  removed (" + to_string(len(removed)) + "):")
+        for s in removed { eprintln("    - " + s) }
+    }
+}
+
+// ─── main ──────────────────────────────────────────────────────
+
+fn main() -> int {
+    let baseline_ref = _parse_baseline()
+    let cur_path = _pwd() + "/self/raw_loader.hexa"
+
+    if !_file_exists(cur_path) {
+        return _emit_fail("self/raw_loader.hexa not found at " + cur_path)
+    }
+
+    let cur_src = to_string(read_file(cur_path))
+    let cur_surface = _extract_surface_from_text(cur_src)
+    let cur_ver = _extract_version_from_text(cur_src)
+
+    let baseline = _git_show_raw_loader(baseline_ref)
+    if baseline[1] != 0 {
+        // No baseline available — first commit, untracked, or detached.
+        // Self-host bootstrap: cannot diff, but cannot fabricate failure either.
+        return _emit_pass("baseline `" + baseline_ref + "` unavailable (untracked or initial commit) — surface size " + to_string(len(cur_surface)))
+    }
+    let base_src = baseline[0]
+    let base_surface = _extract_surface_from_text(base_src)
+    let base_ver = _extract_version_from_text(base_src)
+
+    let diff = _surface_diff(base_surface, cur_surface)
+    let added = diff[0]
+    let removed = diff[1]
+
+    if len(added) == 0 && len(removed) == 0 {
+        let parts = ["surface identical vs ", baseline_ref, " (", to_string(len(cur_surface)), " pub symbols)"]
+        return _emit_pass(parts.join(""))
+    }
+
+    // surface DIFFERS — version analysis required
+    if cur_ver == "" {
+        _print_diff_detail(added, removed)
+        return _emit_fail("surface diff vs " + baseline_ref + " (" + _summarise_diff(added, removed) + ") but no version directive in self/raw_loader.hexa — declare `// version: x.y.z` at top of file or `let PARSER_VERSION = \"x.y.z\"` so semver bumps are checkable")
+    }
+
+    let cur_sv = _parse_semver(cur_ver)
+    if len(cur_sv) == 0 {
+        _print_diff_detail(added, removed)
+        return _emit_fail("current version `" + cur_ver + "` is not parseable as SemVer (expect x.y.z) — surface diff " + _summarise_diff(added, removed))
+    }
+
+    // baseline version may be missing (first version landing). Treat that as
+    // the same case as "no version" — diff requires explicit declaration to
+    // be honest; if baseline had no version, current MUST declare it but we
+    // don't know what to compare against. Emit FAIL with guidance.
+    if base_ver == "" {
+        _print_diff_detail(added, removed)
+        return _emit_fail("current declares version `" + cur_ver + "` but baseline `" + baseline_ref + "` has no version directive — first semver landing must coincide with no surface diff (record version, then evolve)")
+    }
+
+    let base_sv = _parse_semver(base_ver)
+    if len(base_sv) == 0 {
+        _print_diff_detail(added, removed)
+        return _emit_fail("baseline version `" + base_ver + "` is not parseable as SemVer — fix baseline declaration first")
+    }
+
+    let cur_major = cur_sv[0]
+    let cur_minor = cur_sv[1]
+    let cur_patch = cur_sv[2]
+    let base_major = base_sv[0]
+    let base_minor = base_sv[1]
+    let base_patch = base_sv[2]
+
+    // version unchanged
+    if cur_major == base_major && cur_minor == base_minor && cur_patch == base_patch {
+        _print_diff_detail(added, removed)
+        return _emit_fail("breaking change without semver bump — version=" + cur_ver + " matches baseline, but surface diff " + _summarise_diff(added, removed))
+    }
+
+    // major bumped — any diff allowed
+    if cur_major > base_major {
+        let parts = ["surface diff vs ", baseline_ref, " (", _summarise_diff(added, removed), ") + major bump ", base_ver, " -> ", cur_ver]
+        return _emit_pass(parts.join(""))
+    }
+
+    // major regressed — that's its own kind of broken
+    if cur_major < base_major {
+        _print_diff_detail(added, removed)
+        return _emit_fail("major version regressed: " + base_ver + " -> " + cur_ver + " (surface diff " + _summarise_diff(added, removed) + ")")
+    }
+
+    // major equal, minor/patch bump — additive only
+    if len(removed) > 0 {
+        _print_diff_detail(added, removed)
+        return _emit_fail("breaking change requires major bump — surface removed " + to_string(len(removed)) + " symbol(s) but version went " + base_ver + " -> " + cur_ver + " (only major bump permits removals)")
+    }
+
+    // additive minor/patch
+    let parts2 = ["additive surface diff vs ", baseline_ref, " (", _summarise_diff(added, removed), ") + minor/patch bump ", base_ver, " -> ", cur_ver]
+    return _emit_pass(parts2.join(""))
+}
+
+exit(main())
