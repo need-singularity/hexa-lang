@@ -159,6 +159,75 @@ pub fn _non_critical_targets() -> array {
     return [".ext", ".roadmap"]
 }
 
+// ─── canonical .raw resolution + follower-repo detection ────────
+//
+// 2026-04-26 hive 마이그레이션 이후, follower repo (hexa-lang/anima/
+// airgenome/n6-architecture/...) 의 로컬 `.raw` 는 retired 되고 canonical
+// L0 SSOT 는 `/Users/ghost/core/hive/.raw` 한 곳에만 존재한다. Follower
+// 들은 `.raw-ref` 로 hive 를 추종한다.
+//
+// `verify` 가 tier1 SSOT 의 chflags 상태를 점검할 때:
+//   1) cwd `.raw` 존재 → 그대로 사용 (hive 자신, 또는 legacy repo)
+//   2) cwd `.raw` 없음 + cwd `.raw-ref` 존재 → `.raw-ref` 의 `source`
+//      필드를 파싱하여 sister-repo 경로
+//      (`/Users/ghost/core/<repo>/.raw`) 로 resolve, hive `.raw` 의
+//      chflags 를 검사
+//   3) `.ext` / `.roadmap` 은 follower 가 소유하지 않으므로 missing 시
+//      SKIP-with-reason (FAIL 아님)
+//   4) `.raw-ref` 도 없으면 canonical owner 로 간주, missing = FAIL
+//      (기존 동작 유지)
+//
+// raw#8 HEXA-ONLY self-host bootstrap 제약상 tool 간 import 를 늘리지
+// 않고, tool/raw_all.hexa 의 _resolve_canonical_raw_path() 와 동일한
+// 로직을 인라인으로 복제한다. 두 사본이 분기되면 raw_all 의 그것이
+// canonical 이다 (이 파일은 tier2 enforcer side).
+// — inlined from tool/raw_all.hexa (lines 175-231, 2026-04-26)
+
+fn _resolve_canonical_raw_path() -> string {
+    if file_exists(".raw") { return ".raw" }
+    if !file_exists(".raw-ref") { return "" }
+    let src_text = to_string(read_file(".raw-ref"))
+    let lines = split(src_text, "\n")
+    let mut source = ""
+    for ln in lines {
+        let s = ln.trim()
+        if len(s) == 0 { continue }
+        if s.substring(0, 1) == "#" { continue }
+        // raw_sync `.raw-ref` grammar: 2-space indented `source <url>`.
+        // After trim() the leading indent is gone, so we match the
+        // bare `source ` prefix.
+        if len(s) >= 7 && s.substring(0, 7) == "source " {
+            source = s.substring(7, len(s)).trim()
+            break
+        }
+    }
+    if source == "" { return "" }
+    // Strip optional `protocol://` prefix.
+    if source.index_of("://") >= 0 {
+        let p = source.index_of("://")
+        source = source.substring(p + 3, len(source))
+    }
+    // Map github.com/<org>/<repo> → /Users/ghost/core/<repo>/.raw —
+    // matches the sister-repo monorepo convention. Last `/` segment
+    // is the repo name.
+    let slash = source.last_index_of("/")
+    if slash < 0 { return "" }
+    let repo = source.substring(slash + 1, len(source))
+    if repo == "" { return "" }
+    let candidate_parts = ["/Users/ghost/core/", repo, "/.raw"]
+    let candidate = candidate_parts.join("")
+    if file_exists(candidate) { return candidate }
+    return ""
+}
+
+fn _is_follower_repo() -> bool {
+    // A repo is a "follower" iff it has no local `.raw` SSOT but does
+    // carry a `.raw-ref` pointer to the hive canonical. Hive itself
+    // (canonical owner) has `.raw` and no `.raw-ref` → not a follower.
+    if file_exists(".raw") { return false }
+    return file_exists(".raw-ref")
+}
+
 // ─── environment helpers ────────────────────────────────────────
 
 fn _pwd() -> string {
@@ -876,9 +945,53 @@ fn cmd_verify() -> int {
     }
     let root = _pwd()
     let mut fails = []
+    let mut follower_skips = []
 
-    // tier1 + tier2_required — missing = hard fail
+    // 2026-04-26 hive-migration follower-repo handling:
+    //   `.raw`      → resolve via `.raw-ref` to hive canonical, check
+    //                 chflags there. Empty resolve = FAIL.
+    //   `.ext` /
+    //   `.roadmap`  → on follower repos (no local `.raw`, has
+    //                 `.raw-ref`), missing = SKIP (not owned locally).
+    //                 On canonical owner (hive), missing = FAIL
+    //                 (existing behavior).
+    let follower = _is_follower_repo()
+
+    // tier1 + tier2_required — missing = hard fail (with follower exceptions)
     for rel in _tier1_required() {
+        if rel == ".raw" {
+            let canon = _resolve_canonical_raw_path()
+            if canon == "" {
+                fails.push(rel + " (missing)")
+            } else {
+                // canon is ".raw" (relative, cwd of canonical owner) or
+                // absolute path to hive's `.raw` (follower repo).
+                if canon.substring(0, 1) != "/" {
+                    let abs_local = root + "/" + canon
+                    if _detect_level(abs_local) < 1 {
+                        fails.push(rel + " (unlocked, < L1)")
+                    }
+                } else {
+                    if _detect_level(canon) < 1 {
+                        fails.push(rel + " (unlocked, < L1 @ " + canon + ")")
+                    }
+                }
+            }
+            continue
+        }
+        let is_ext_or_roadmap = rel == ".ext" || rel == ".roadmap"
+        if is_ext_or_roadmap && follower {
+            let abs = root + "/" + rel
+            let pe = _path_exists(abs)
+            if !pe {
+                follower_skips.push(rel + " (follower-repo, no local " + rel + ")")
+            } else {
+                if _detect_level(abs) < 1 {
+                    fails.push(rel + " (unlocked, < L1)")
+                }
+            }
+            continue
+        }
         let abs = root + "/" + rel
         if !_path_exists(abs) {
             fails.push(rel + " (missing)")
@@ -916,9 +1029,22 @@ fn cmd_verify() -> int {
         }
     }
 
-    if len(fails) == 0 { return 0 }
+    if len(fails) == 0 {
+        // Surface follower-repo skips so the operator sees what was
+        // intentionally bypassed (silent skip would obscure migration
+        // state). PASS exit regardless.
+        if len(follower_skips) > 0 {
+            for s in follower_skips { eprintln("  [skip] " + s) }
+        }
+        return 0
+    }
     eprintln("raw#0 verify FAILED — the following targets are below Level 1:")
     for f in fails { eprintln("  - " + f) }
+    if len(follower_skips) > 0 {
+        eprintln("")
+        eprintln("(skipped — follower repo, hive-migration 2026-04-26):")
+        for s in follower_skips { eprintln("  - " + s) }
+    }
     eprintln("")
     eprintln("Remedy: ./hexa tool/os_level_lock.hexa lock")
     return 1
