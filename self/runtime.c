@@ -5707,6 +5707,29 @@ HexaVal hexa_array_zeros_float(HexaVal nv) {
     return out;
 }
 
+// ω-interp-3 (2026-04-26): array_alloc(n) — pre-allocate N-element int array,
+// all slots = 0. Counterpart to hexa_array_zeros_float for int buffers.
+// O(n) once + O(1) per element via indexed assign.
+//
+// Use case: ω-audio-3 vocal_hexa knows N=4800 bytes upfront; replacing N×
+// hexa_array_push with array_alloc(N) + indexed assign drops per-element
+// dispatch overhead 2-4× (single store vs method-call + env_set rebind).
+HexaVal hexa_array_alloc(HexaVal nv) {
+    if (_hx_stats_on()) _hx_stats_array_new++;
+    HexaVal out = {.tag=TAG_ARRAY};
+    HX_SET_ARR_PTR(out, (HexaArr*)calloc(1, sizeof(HexaArr)));
+    int64_t n = HX_IS_INT(nv) ? HX_INT(nv) : (int64_t)__hx_to_double(nv);
+    if (n <= 0) return out;
+    HexaVal* items = (HexaVal*)malloc(sizeof(HexaVal) * (size_t)n);
+    if (!items) { fprintf(stderr, "OOM in array_alloc n=%lld\n", (long long)n); exit(1); }
+    HexaVal zero = {.tag=TAG_INT, .i=0};
+    for (int64_t i = 0; i < n; i++) items[i] = zero;
+    HX_SET_ARR_ITEMS(out, items);
+    HX_SET_ARR_LEN(out, (int)n);
+    HX_SET_ARR_CAP(out, (int)n);  // positive → heap
+    return out;
+}
+
 HexaVal hexa_array_free(HexaVal arr) {
     if (!HX_IS_ARRAY(arr)) return hexa_void();
     HexaArr* p = arr.arr_ptr;
