@@ -1,32 +1,25 @@
 # syntax=docker/dockerfile:1.7
 # ─────────────────────────────────────────────────────────────────
-# hexa-runner — minimal Linux container that hosts the static
-# musl-built hexa CLI (self/main.hexa → build/hexa_linux_<arch>).
+# hexa-runner DISTROLESS POC (ω-runner-4, 2026-04-26)
 #
-# Background: 2026-04-25 Mac jetsam SIGKILL incident.  Hive policy
-# now forbids bare `hexa` execution on the macOS host and routes
-# every workload through a Linux container with hard CPU/RAM caps.
-# This image is the single landing pad.
+# Goal: shrink runtime image from ~166MB → ~91MB virtual by switching
+# the runtime base from debian:12-slim → gcr.io/distroless/cc-debian12.
+# Distroless ships libc + libssl (cc variant) but no shell / apt / tini /
+# busybox. We must:
+#   1) Build apt-installed binaries (tini, curl, wget) in a debian:12-slim
+#      builder stage, then COPY just the binaries + their dynamic libs +
+#      ca-cert bundle into the distroless runtime stage.
+#   2) Mirror the production multi-arch ELF layout (per-arch scratch
+#      bridge → final stage) so wrong-arch ELFs never land.
+#   3) Keep the same ENTRYPOINT shape (/usr/bin/tini -- /usr/local/bin/hexa)
+#      so the orphan-reaper watchdog still works (PPID==1 detection).
 #
-# Build (multi-arch via buildx):
-#   docker buildx build \
-#     --platform linux/arm64,linux/amd64 \
-#     -f docker/runner/Dockerfile \
-#     -t hexa-runner:<shortsha> -t hexa-runner:latest .
-#
-# Both pre-built static ELFs must exist beneath build/ before the
-# image is assembled — see tool/build_runner_image.hexa.
+# DO NOT replace the production Dockerfile from this file. POC only.
+# Cutover (if smoke passes) happens in a separate ω-runner-5 cycle.
 # ─────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────
-# Stage 0: arch-token bridge.  Our build artefacts use the tokens
-# `arm64` / `x86_64` (matching the host `uname -m` lineage), but
-# buildx injects TARGETARCH as `arm64` / `amd64`.  We use two tiny
-# scratch stages — one per docker-arch — that COPY only the correct
-# pair of ELFs into a normalized layout (/cli + /interp).  The
-# final stage then `COPY --from=elf-${TARGETARCH}` pulls just the
-# right pair, so wrong-arch ELFs never land as layer bytes in the
-# shipped image (saves ~2.3MB per arch — see ω-runner-1).
+# Stage 0: arch-token bridge (identical to production).
 # ─────────────────────────────────────────────────────────────────
 FROM scratch AS elf-arm64
 COPY build/hexa_linux_arm64        /cli
@@ -36,123 +29,147 @@ FROM scratch AS elf-amd64
 COPY build/hexa_linux_x86_64        /cli
 COPY build/hexa_interp_linux_x86_64 /interp
 
-# Indirection: FROM-with-ARG-interpolation IS supported (buildkit
-# resolves it at graph build time), whereas `COPY --from=elf-${TARGETARCH}`
-# is NOT (the ARG isn't visible at COPY-stage-name parse).  So we
-# alias the matching arch stage as `elf-selected` here, and the
-# runtime stage below references the alias unconditionally.
 FROM elf-${TARGETARCH} AS elf-selected
 
 # ─────────────────────────────────────────────────────────────────
-# Stage 1: final runtime image.
+# Stage 1: builder.  Has apt + shell.  We install the same packages
+# the production image gets, then in the runtime stage we cherry-pick
+# just the binaries + their .so dependencies.
 # ─────────────────────────────────────────────────────────────────
-FROM debian:12-slim
+FROM debian:12-slim AS builder
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        ca-certificates tini curl wget busybox-static \
+ && rm -rf /var/lib/apt/lists/*
 
-# TARGETARCH is auto-injected by buildx ("arm64" or "amd64").  Re-export
-# as ARG inside this stage so any subsequent ARG-driven step can see it.
+# ω-runner-5 (2026-04-26): unblock B3 (no GNU coreutils on distroless).
+# busybox-static (~1 MB) ships dirname/basename/printf/test/cat/awk/grep/sed/
+# date/sh/ln/mkdir/rm/ls/cp/mv/cut/tr/head/tail/wc/chmod/etc as a single
+# self-contained ELF + applet symlinks.  The hexa CLI's exec()/popen("sh -c")
+# paths (resolve_interp, etc.) need these.  Stage applet symlinks here
+# (in the builder where /bin/sh exists) so the runtime stage just COPYs
+# the resulting symlink farm.  Use a dedicated /opt/bb staging dir to
+# avoid colliding with debian's own /usr/bin contents.
+RUN mkdir -p /opt/bb/bin /opt/bb/usr/bin \
+ && cp /bin/busybox /opt/bb/bin/busybox \
+ && for applet in sh dirname basename printf test cat awk grep sed date \
+                  ln mkdir rm ls cp mv cut tr head tail wc chmod \
+                  env echo true false sleep find xargs sort uniq tee \
+                  which mktemp readlink dd stat touch expr; do \
+        ln -sf /bin/busybox /opt/bb/usr/bin/$applet; \
+    done \
+ && ln -sf /bin/busybox /opt/bb/bin/sh \
+ && ln -sf /bin/busybox /opt/bb/bin/sleep
+# ω-runner-6 (2026-04-26): /bin/sleep symlink required by ~/.hx/bin/hexa
+# resolver — `_ensure_hexa_exec_container` invokes `docker run … --entrypoint
+# /bin/sleep "$DOCKER_IMAGE" infinity` to keep the container long-lived.
+# busybox's sleep applet otherwise only lands at /usr/bin/sleep, which makes
+# the resolver-spawned container exit "Created" (no-op rather than running).
+
+# ω-runner-6 (2026-04-26): multi-arch lib staging for the production cutover.
+# The runtime stage needs curl/wget transitive .so deps under either
+# /usr/lib/aarch64-linux-gnu/ (arm64) or /usr/lib/x86_64-linux-gnu/ (amd64).
+# COPY --from cannot use shell vars/globs across architectures, so we stage
+# the right arch's libs into a generic /opt/runtime-libs/ here in the
+# builder (which IS arch-specific per buildx platform), preserving the arch
+# subdir so the runtime stage can do a single fixed-path COPY for each
+# arch (with on-disk overlap being fine — only one arch's COPY actually
+# matches files at build time per platform).
+RUN set -eux; \
+    arch_dir="$(dpkg-architecture -qDEB_HOST_MULTIARCH 2>/dev/null \
+                || gcc -print-multiarch 2>/dev/null \
+                || (uname -m | sed 's|aarch64|aarch64-linux-gnu|;s|x86_64|x86_64-linux-gnu|'))"; \
+    echo "staging libs for arch_dir=$arch_dir"; \
+    mkdir -p /opt/runtime-libs/aarch64-linux-gnu /opt/runtime-libs/x86_64-linux-gnu; \
+    dest="/opt/runtime-libs/$arch_dir"; \
+    for lib in libcurl.so.4 libnghttp2.so.14 libidn2.so.0 librtmp.so.1 \
+               libssh2.so.1 libpsl.so.5 libgssapi_krb5.so.2 libkrb5.so.3 \
+               libk5crypto.so.3 libcom_err.so.2 libkrb5support.so.0 \
+               libldap-2.5.so.0 liblber-2.5.so.0 libsasl2.so.2 \
+               libgnutls.so.30 libhogweed.so.6 libnettle.so.8 libgmp.so.10 \
+               libp11-kit.so.0 libtasn1.so.6 libffi.so.8 libunistring.so.2 \
+               libkeyutils.so.1 libgcrypt.so.20 libgpg-error.so.0 \
+               libzstd.so.1 libbrotlidec.so.1 libbrotlicommon.so.1; do \
+        for src in /usr/lib/$arch_dir/$lib*; do \
+            [ -e "$src" ] && cp -a "$src" "$dest/" || true; \
+        done; \
+    done; \
+    for lib in libz.so.1 libpcre2-8.so.0 libuuid.so.1; do \
+        for src in /lib/$arch_dir/$lib* /usr/lib/$arch_dir/$lib*; do \
+            [ -e "$src" ] && cp -a "$src" "$dest/" || true; \
+        done; \
+    done; \
+    ls /opt/runtime-libs/aarch64-linux-gnu/ | wc -l; \
+    ls /opt/runtime-libs/x86_64-linux-gnu/ | wc -l
+
+# ─────────────────────────────────────────────────────────────────
+# Stage 2: runtime.  gcr.io/distroless/cc-debian12 ships libc + libgcc +
+# libssl + libcrypto (cc variant), so curl/wget should mostly Just Work
+# once we COPY their binaries + a few transitive libs (libcurl4, libnghttp2,
+# libpsl, libidn2, libldap, etc.).  Architecture-specific lib paths
+# (/usr/lib/aarch64-linux-gnu vs /usr/lib/x86_64-linux-gnu) are handled
+# by COPY-ing the whole arch dir wholesale — distroless ships an empty
+# version of these dirs, so the COPY just fills them in.
+# ─────────────────────────────────────────────────────────────────
+FROM gcr.io/distroless/cc-debian12
+
 ARG TARGETARCH
 
-LABEL org.opencontainers.image.title="hexa-runner" \
-      org.opencontainers.image.description="Static musl hexa CLI on Debian 12 slim" \
+LABEL org.opencontainers.image.title="hexa-runner-distroless" \
+      org.opencontainers.image.description="POC: hexa CLI on distroless/cc-debian12" \
       org.opencontainers.image.source="https://github.com/dancinlife/hexa-lang" \
       org.opencontainers.image.licenses="MIT"
 
-# Minimal apt layer:
-#   ca-certificates : TLS for fetch tools.
-#   tini            : reaping-aware init for PID 1.  cmd_run() forks a
-#                     `( watcher ) &` subshell that uses [ $PPID -eq 1 ]
-#                     to detect orphaning; without proper init the
-#                     orphan-of-PID-1 detection fires prematurely and
-#                     SIGKILL's the workload (exit 137) before output
-#                     flushes.  See 2026-04-25 hexa-runner triage.
-#   curl, wget      : required by nexus bridges (oeis/gw/arxiv/simbad/
-#                     wikipedia/openalex/uniprot) which exec("curl …") for
-#                     HTTPS API fetches.  Absent → 7/16 bridge health FAIL
-#                     with `sh: 1: curl: not found` (2026-04-26 bridge
-#                     health check).  raw 73 admissibility: minimum-add
-#                     only, no feature creep.
-#
-# perl (REMOVED 2026-04-26 ω-runner-2):  Previously installed solely to
-# provide /usr/bin/shasum for main.hexa AOT cache + source fingerprinting
-# (~50MB layer cost: perl + libperl5.36 + perl-modules-5.36).  self/main.hexa
-# source_key() and src_fingerprint_deep() now prefer `sha256sum` (coreutils,
-# present in debian:12-slim base) and fall back to `shasum -a 256` only when
-# sha256sum is missing — so the macOS host build retains its perl-shasum
-# code path while the Linux runner uses the coreutils path that's already
-# in the base image.  See state/omega_runner_2_perl_removal.json.
-RUN apt-get update \
- && apt-get install -y --no-install-recommends \
-        ca-certificates tini curl wget \
- && rm -rf /var/lib/apt/lists/*
+# ω-runner-5 (2026-04-26): busybox-static unblocks B3.
+# Round-3 used /bin/dash (just sh, no coreutils) — smoke (e) BLOCKED because
+# `hexa run` shells out via popen("sh -c …") and needs dirname/basename/etc.
+# busybox-static is a single ~1 MB ELF that provides all common applets via
+# argv[0] dispatch.  Builder stage already staged /opt/bb/{bin,usr/bin} with
+# the busybox binary + applet symlinks.  Two wholesale COPYs land them at
+# /bin/* and /usr/bin/* in the runtime, including /bin/sh -> /bin/busybox.
+COPY --from=builder /opt/bb/bin/     /bin/
+COPY --from=builder /opt/bb/usr/bin/ /usr/bin/
 
-# Stage in just the matching arch's pair of ELFs from the per-arch
-# scratch bridge stage above.  buildx resolves `${TARGETARCH}` →
-# `arm64`|`amd64` per platform, so only the correct pair lands in this
-# image — no wrong-arch waste (~2.3MB saved per arch vs. the previous
-# COPY-both-then-rm-wrong-arch pattern).  See ω-runner-1 image opt.
+# tini for PID-1 reaping.
+COPY --from=builder /usr/bin/tini /usr/bin/tini
+
+# curl + wget binaries (used by nexus bridges).
+COPY --from=builder /usr/bin/curl /usr/bin/curl
+COPY --from=builder /usr/bin/wget /usr/bin/wget
+
+# CA cert bundle (TLS verification).
+COPY --from=builder /etc/ssl/certs              /etc/ssl/certs
+COPY --from=builder /usr/share/ca-certificates  /usr/share/ca-certificates
+COPY --from=builder /etc/ca-certificates.conf   /etc/ca-certificates.conf
+
+# Transitive .so dependencies of curl/wget.  Distroless/cc ships libc,
+# libssl, libcrypto, libgcc, libstdc++ — we add the rest.
 #
-# The interp ELF is installed at /usr/local/bin/build/hexa_interp — the
-# canonical post-rename target that resolve_interp() in self/main.hexa
-# searches for via argv[0]-derived install_dir + "/build/hexa_interp".
-# With /usr/local/bin/hexa as argv[0], the sibling build/ dir is the
-# canonical location.
+# ω-runner-6 (2026-04-26): builder stage stages the per-arch .so deps into
+# /opt/runtime-libs/<arch_dir>/ (a fixed two-arch tree where only the
+# matching arch's subdir is populated per buildx platform pass).  Two
+# wholesale COPYs land them at /usr/lib/<arch>/ in the runtime — the
+# arch that doesn't match is empty, so the COPY is a no-op for it.
+COPY --from=builder /opt/runtime-libs/aarch64-linux-gnu/ /usr/lib/aarch64-linux-gnu/
+COPY --from=builder /opt/runtime-libs/x86_64-linux-gnu/  /usr/lib/x86_64-linux-gnu/
+
+# ELFs from the arch-bridge stage.  Same install layout as production.
 COPY --from=elf-selected /cli    /tmp/hexa_cli
 COPY --from=elf-selected /interp /tmp/hexa_interp
 
-RUN set -eux; \
-    mkdir -p /usr/local/bin/build; \
-    install -m 0755 /tmp/hexa_cli    /usr/local/bin/hexa; \
-    install -m 0755 /tmp/hexa_interp /usr/local/bin/build/hexa_interp; \
-    rm -f /tmp/hexa_cli /tmp/hexa_interp; \
-    /usr/local/bin/hexa --version || true; \
-    /usr/local/bin/build/hexa_interp --help >/dev/null 2>&1 || true
+# Distroless has no shell and no `install` / `mkdir` / `rm`.  But the
+# hexa CLI is a static musl ELF — we don't need to chmod it (COPY
+# preserves +x from the source file's mode bits).  Place it directly:
+COPY --from=elf-selected /cli    /usr/local/bin/hexa
+COPY --from=elf-selected /interp /usr/local/bin/build/hexa_interp
 
-# Bake module_loader + stdlib so containers WITHOUT a $HEXA_LANG bind-mount
-# (cron, launchd-in-container, isolated CI runners) can still resolve
-# `use "stdlib/X"` and `use "self/stdlib/X"` imports loud-fail-correctly.
-# Layout matches resolve_module_loader()'s argv0-relative probe (self/main.hexa
-# line 778-794): install_dir = dirname(argv[0]) = /usr/local/bin, so
-# /usr/local/bin/self/module_loader.hexa is auto-discovered without env.
-# HEXA_STDLIB_ROOT is the env-hygiene-friendly fallback (module_loader.hexa
-# lines 133-153, 173-183) — set explicitly so cron/launchd contexts that
-# inherit no env still resolve stdlib paths.
+# Bake module_loader + stdlib for env-less stdlib resolution.
 COPY self/module_loader.hexa /usr/local/bin/self/module_loader.hexa
 COPY self/stdlib              /usr/local/bin/self/stdlib
 ENV HEXA_STDLIB_ROOT=/usr/local/bin/self/stdlib
 
-# Default workdir for user-mounted .hexa source.
 WORKDIR /work
 
-# ─────────────────────────────────────────────────────────────────
-# Optional: bind-mount nexus (or other sister repos) at runtime so
-# gate/entry.hexa, gate/prompt_scan.hexa, gate/cmd_gate.hexa can
-# resolve cross-repo dispatch (HARNESS = NEXUS_HOME + "/tool",
-# HEXA = NEXUS_HOME + "/bin/hexa").
-#
-#   docker run --rm \
-#     --platform linux/arm64 \
-#     --cpus=4 --memory=4g \
-#     -v "$HOME/core/nexus:/nexus:ro" \
-#     -e NEXUS_HOME=/nexus \
-#     -v /tmp/foo.hexa:/work/foo.hexa:ro \
-#     -w /work \
-#     hexa-runner:latest run /work/foo.hexa
-#
-# When /nexus is absent, gate/entry.hexa degrades gracefully:
-#   1) NEXUS_HOME env (explicit override; default /nexus when WS+HOME unset)
-#   2) WS + "/nexus"
-#   3) HOME + "/core/nexus"
-#   4) "/nexus"
-# Each dispatch site checks file_exists(NEXUS_HEXA) and silently
-# skips when the binary isn't present (no `sh: hexa: not found`
-# noise). The hive resolver (~/.hx/bin/hexa) should add the -v
-# flag and -e NEXUS_HOME to its `docker exec` invocation when
-# nexus-dependent commands (omega/drill/canon/etc) are issued.
-# ─────────────────────────────────────────────────────────────────
-
-# Use tini as PID 1 so the dispatcher's watchdog subshells are reaped
-# correctly.  Without an init-aware PID 1 the `( watcher ) &` orphan
-# detection in cmd_run() fires and SIGKILL's the workload before its
-# output can flush — see the apt comment block above.
+# Same ENTRYPOINT shape as production: tini -> hexa.
 ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/hexa"]
 CMD ["help"]
