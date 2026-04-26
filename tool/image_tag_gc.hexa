@@ -1,0 +1,405 @@
+// ═══════════════════════════════════════════════════════════════
+//  image_tag_gc.hexa — bound the local hexa-runner:* tag set.
+//
+//  Native .hexa re-derivation of the ω-runner-7 design that twice
+//  perished as image_tag_gc.sh under the foreign_ext_sweep launchd
+//  janitor (untracked .sh in /Users/ghost/core gets rm'd within
+//  ~30s). The sweeper bans .py/.rs/.sh/.toml only — .hexa survives.
+//
+//  Usage:
+//    hexa tool/image_tag_gc.hexa dry-run        # report keep/delete
+//    hexa tool/image_tag_gc.hexa prune          # actually delete
+//    hexa tool/image_tag_gc.hexa keep <tag>     # append to pin file
+//    hexa tool/image_tag_gc.hexa --selftest     # pure-fn checks
+//
+//  Environment:
+//    HEXA_RUNNER_REPO       repository name           (default hexa-runner)
+//    HEXA_RUNNER_KEEP_N     # most-recent to keep     (default 3)
+//                           in addition to :latest + pinned tags
+//    HEXA_RUNNER_PIN_FILE   pin-list path             (default ~/.hx/runner-tag-pins)
+//
+//  Sentinel (single line, grep-friendly for atlas ingestion):
+//    __IMAGE_TAG_GC__ mode=<dry-run|prune> kept=<N> deleted=<M> freed_mb=<X>
+//
+//  Default keep policy:
+//    - always retain :latest
+//    - always retain tags listed in the pin file (one per line, '#' = comment)
+//    - retain HEXA_RUNNER_KEEP_N most-recent additional tags by Created desc
+//    - everything else is deletable
+//
+//  Internal data model: parallel arrays (hexa parser does not accept
+//  object literals).  Rows: tags[], ids[], sizes_mb[].  Partition output:
+//  keep_tags[], drop_tags[], drop_ids[], drop_sizes[].
+//
+//  ω-runner-9 origin: ω-runner-7 designed the .sh, ω-runner-8 wired the
+//  build-hook to it, ω-janitor-2 found the launchd janitor reaped both
+//  .sh re-derivations. This .hexa port preserves the entire functional
+//  spec (subcommands, env, sentinel, default policy) but is no longer
+//  sweeper-eligible.
+// ═══════════════════════════════════════════════════════════════
+
+fn _env_or(name: string, fallback: string) -> string {
+    let v = env(name)
+    if len(v) > 0 { return v }
+    return fallback
+}
+
+fn _home() -> string {
+    let h = env("HOME")
+    if len(h) > 0 { return h }
+    return to_string(exec("echo $HOME")).trim()
+}
+
+fn _repo() -> string {
+    return _env_or("HEXA_RUNNER_REPO", "hexa-runner")
+}
+
+fn _keep_n() -> i64 {
+    let raw = _env_or("HEXA_RUNNER_KEEP_N", "3")
+    let n = to_int(raw)
+    if n < 0 { return 0 }
+    return n
+}
+
+fn _pin_file() -> string {
+    let custom = env("HEXA_RUNNER_PIN_FILE")
+    if len(custom) > 0 { return custom }
+    return _home() + "/.hx/runner-tag-pins"
+}
+
+// Parse pin file → array of pinned tag tokens (strip comments + blanks).
+fn _read_pins() -> array {
+    let path = _pin_file()
+    let pins = []
+    if !file_exists(path) { return pins }
+    let body = read_file(path)
+    let lines = split(body, "\n")
+    let mut i = 0
+    while i < len(lines) {
+        let raw = lines[i].trim()
+        if len(raw) > 0 && !raw.starts_with("#") {
+            pins.push(raw)
+        }
+        i = i + 1
+    }
+    return pins
+}
+
+fn _array_contains(haystack: array, needle: string) -> bool {
+    let mut i = 0
+    while i < len(haystack) {
+        if haystack[i] == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// Convert docker `Size` strings ("78MB", "166MB", "1.2GB", "950kB") → integer MB.
+// We deliberately avoid float arithmetic — the hexa AOT path aborts on
+// to_string(float) round-trips.  Instead, parse the integer part and fold
+// any fractional portion through string-multiplied integer math:
+//   "1.2GB"  →  whole=1, frac="2", scale=GB→1024 →  1*1024 + (2 * 1024)/10 = 1228
+//   "950kB"  →  whole=950, no frac, scale=kB →  950/1024 = 0
+//   "78MB"   →  whole=78, scale=MB → 78
+// Sentinel-grade resolution; no byte exactness required.
+fn _size_to_mb(s: string) -> i64 {
+    let t = s.trim()
+    if len(t) == 0 { return 0 }
+    let mut whole_s = ""
+    let mut frac_s = ""
+    let mut unit = ""
+    let mut i = 0
+    let mut phase = 0  // 0=whole, 1=frac, 2=unit
+    while i < len(t) {
+        let c = t.substring(i, i + 1)
+        if phase == 0 {
+            if c >= "0" && c <= "9" { whole_s = whole_s + c }
+            else if c == "." { phase = 1 }
+            else { unit = t.substring(i, len(t)); i = len(t); phase = 2 }
+        } else if phase == 1 {
+            if c >= "0" && c <= "9" { frac_s = frac_s + c }
+            else { unit = t.substring(i, len(t)); i = len(t); phase = 2 }
+        }
+        i = i + 1
+    }
+    if len(whole_s) == 0 { return 0 }
+    let whole = to_int(whole_s)
+    let mut frac_num = 0
+    let mut frac_den = 1
+    if len(frac_s) > 0 {
+        frac_num = to_int(frac_s)
+        let mut k = 0
+        while k < len(frac_s) { frac_den = frac_den * 10; k = k + 1 }
+    }
+    let u = unit.trim()
+    // scale_num / scale_den — scale per unit, expressed as ratio.
+    let mut scale_num = 1
+    let mut scale_den = 1
+    if u == "GB" || u == "gb" { scale_num = 1024 }
+    else if u == "MB" || u == "mb" { scale_num = 1 }
+    else if u == "kB" || u == "KB" || u == "kb" { scale_den = 1024 }
+    else if u == "B" || u == "b" { scale_den = 1024 * 1024 }
+    // result = (whole + frac_num/frac_den) * scale_num/scale_den
+    //        = (whole * frac_den + frac_num) * scale_num / (frac_den * scale_den)
+    let num = (whole * frac_den + frac_num) * scale_num
+    let den = frac_den * scale_den
+    return num / den
+}
+
+// Query docker for current rows of <repo>:* and populate three parallel
+// arrays: tags, ids, sizes_mb.  Order preserved (docker default = Created
+// desc).  Returns [tags, ids, sizes_mb].
+fn _docker_rows() -> array {
+    let repo = _repo()
+    let fmt = "{{.Tag}}\t{{.ID}}\t{{.Size}}"
+    let cmd = "docker images " + repo + " --format '" + fmt + "' 2>/dev/null"
+    let raw = to_string(exec(cmd))
+    let lines = split(raw, "\n")
+    let tags = []
+    let ids = []
+    let sizes_mb = []
+    let mut i = 0
+    while i < len(lines) {
+        let ln = lines[i].trim()
+        if len(ln) > 0 {
+            let parts = split(ln, "\t")
+            if len(parts) >= 3 {
+                let tag = parts[0].trim()
+                let id  = parts[1].trim()
+                let size = parts[2].trim()
+                if tag != "<none>" && id != "<none>" {
+                    tags.push(tag)
+                    ids.push(id)
+                    sizes_mb.push(_size_to_mb(size))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return [tags, ids, sizes_mb]
+}
+
+// Compute keep / delete sets from parallel rows + pins + keep_n.
+// Returns [keep_tags, drop_tags, drop_ids, drop_sizes_mb].
+fn _partition(tags: array, ids: array, sizes_mb: array, pins: array, keep_n: i64) -> array {
+    let keep_tags = []
+    let drop_tags = []
+    let drop_ids = []
+    let drop_sizes = []
+    let mut kept_recent = 0
+    let mut i = 0
+    while i < len(tags) {
+        let tag = tags[i]
+        let mut keep = false
+        if tag == "latest" {
+            keep = true
+        } else if _array_contains(pins, tag) {
+            keep = true
+        } else if kept_recent < keep_n {
+            keep = true
+            kept_recent = kept_recent + 1
+        }
+        if keep {
+            keep_tags.push(tag)
+        } else {
+            drop_tags.push(tag)
+            drop_ids.push(ids[i])
+            drop_sizes.push(sizes_mb[i])
+        }
+        i = i + 1
+    }
+    return [keep_tags, drop_tags, drop_ids, drop_sizes]
+}
+
+// dry-run: print partition, emit sentinel, return 0.
+fn cmd_dry_run() -> i64 {
+    let rows = _docker_rows()
+    let tags = rows[0]
+    let ids = rows[1]
+    let sizes = rows[2]
+    let pins = _read_pins()
+    let keep_n = _keep_n()
+    let part = _partition(tags, ids, sizes, pins, keep_n)
+    let keep_tags = part[0]
+    let drop_tags = part[1]
+    let drop_ids = part[2]
+    let drop_sizes = part[3]
+    let repo = _repo()
+
+    println("[image_tag_gc dry-run]")
+    println("  repo    : " + repo)
+    println("  keep_n  : " + to_string(keep_n) + " (in addition to :latest + pins)")
+    println("  pins    : " + to_string(len(pins)))
+    println("  total   : " + to_string(len(tags)) + " tag(s)")
+    println("  keep    : " + to_string(len(keep_tags)))
+    let mut i = 0
+    while i < len(keep_tags) {
+        println("    + " + keep_tags[i])
+        i = i + 1
+    }
+    println("  delete  : " + to_string(len(drop_tags)))
+    let mut total_mb = 0
+    let mut j = 0
+    while j < len(drop_tags) {
+        println("    - " + drop_tags[j] + " (" + drop_ids[j] + ", " + to_string(drop_sizes[j]) + "MB)")
+        total_mb = total_mb + drop_sizes[j]
+        j = j + 1
+    }
+    println("__IMAGE_TAG_GC__ mode=dry-run kept=" + to_string(len(keep_tags)) +
+            " deleted=" + to_string(len(drop_tags)) +
+            " freed_mb=" + to_string(total_mb))
+    return 0
+}
+
+// prune: delete the partition's drop set, sum freed bytes, sentinel.
+fn cmd_prune() -> i64 {
+    let rows = _docker_rows()
+    let tags = rows[0]
+    let ids = rows[1]
+    let sizes = rows[2]
+    let pins = _read_pins()
+    let keep_n = _keep_n()
+    let part = _partition(tags, ids, sizes, pins, keep_n)
+    let keep_tags = part[0]
+    let drop_tags = part[1]
+    let drop_sizes = part[3]
+    let repo = _repo()
+
+    println("[image_tag_gc prune]")
+    println("  repo    : " + repo)
+    println("  keep    : " + to_string(len(keep_tags)))
+    println("  delete  : " + to_string(len(drop_tags)))
+
+    let mut deleted = 0
+    let mut total_mb = 0
+    let mut i = 0
+    while i < len(drop_tags) {
+        // Use repo:tag (not bare ID) so we only untag — other repos sharing
+        // underlying image layers are not affected.
+        let target = repo + ":" + drop_tags[i]
+        let cmd = "docker image rm " + target + " 2>&1"
+        let r = exec_with_status(cmd)
+        if r[1] == 0 {
+            deleted = deleted + 1
+            total_mb = total_mb + drop_sizes[i]
+            println("  - " + target + " removed (" + to_string(drop_sizes[i]) + "MB)")
+        } else {
+            eprintln("  - " + target + " FAILED: " + r[0].trim())
+        }
+        i = i + 1
+    }
+    println("__IMAGE_TAG_GC__ mode=prune kept=" + to_string(len(keep_tags)) +
+            " deleted=" + to_string(deleted) +
+            " freed_mb=" + to_string(total_mb))
+    return 0
+}
+
+// keep <tag>: append tag to pin file (mkdir -p, dedupe).
+fn cmd_keep(tag: string) -> i64 {
+    let path = _pin_file()
+    let dirpath = exec_with_status("dirname '" + path + "'")[0].trim()
+    exec("mkdir -p '" + dirpath + "' 2>/dev/null")
+    let pins = _read_pins()
+    if _array_contains(pins, tag) {
+        println("[image_tag_gc keep] '" + tag + "' already pinned in " + path)
+        return 0
+    }
+    let mut body = ""
+    if file_exists(path) {
+        body = read_file(path)
+        if len(body) > 0 && !body.ends_with("\n") {
+            body = body + "\n"
+        }
+    }
+    body = body + tag + "\n"
+    write_file(path, body)
+    println("[image_tag_gc keep] pinned '" + tag + "' → " + path)
+    return 0
+}
+
+fn cmd_selftest() -> i64 {
+    println("[image_tag_gc selftest]")
+    let mut fails = 0
+
+    // T1: _size_to_mb cases (integer MB)
+    let cases_in  = ["78MB", "1.2GB", "950kB", "166MB", "", "2GB"]
+    let cases_exp = [78,    1228,    0,       166,     0,  2048]
+    let mut i = 0
+    while i < len(cases_in) {
+        let got = _size_to_mb(cases_in[i])
+        let want = cases_exp[i]
+        if got != want {
+            eprintln("  FAIL T1 size(" + cases_in[i] + ") got " + to_string(got) +
+                     " want " + to_string(want))
+            fails = fails + 1
+        }
+        i = i + 1
+    }
+    if fails == 0 { println("  OK   T1 size parser") }
+
+    // T2: _array_contains
+    let arr = ["a", "b", "c"]
+    if !_array_contains(arr, "b") || _array_contains(arr, "z") {
+        eprintln("  FAIL T2 _array_contains")
+        fails = fails + 1
+    } else { println("  OK   T2 _array_contains") }
+
+    // T3: _partition logic — synthetic rows, no pins, keep_n=2
+    let s_tags  = ["latest", "newest", "middle", "old", "ancient"]
+    let s_ids   = ["id0", "id1", "id2", "id3", "id4"]
+    let s_sizes = [78, 80, 90, 100, 110]
+    let part = _partition(s_tags, s_ids, s_sizes, [], 2)
+    let keep = part[0]
+    let dropset = part[1]
+    if len(keep) != 3 || len(dropset) != 2 {
+        eprintln("  FAIL T3 partition counts: keep=" + to_string(len(keep)) +
+                 " drop=" + to_string(len(dropset)))
+        fails = fails + 1
+    } else { println("  OK   T3 partition (latest + 2 recent → 3 keep, 2 drop)") }
+
+    // T4: pin honors
+    let part2 = _partition(s_tags, s_ids, s_sizes, ["ancient"], 1)
+    let keep2 = part2[0]
+    if len(keep2) != 3 || !_array_contains(keep2, "ancient") {
+        eprintln("  FAIL T4 pin honor: keep=" + to_string(len(keep2)))
+        fails = fails + 1
+    } else { println("  OK   T4 pin honored (ancient kept, middle+old dropped)") }
+
+    if fails != 0 {
+        eprintln("[image_tag_gc selftest] " + to_string(fails) + " failure(s)")
+        return 1
+    }
+    println("[image_tag_gc selftest] OK")
+    return 0
+}
+
+fn _usage() {
+    eprintln("usage:")
+    eprintln("  hexa tool/image_tag_gc.hexa dry-run")
+    eprintln("  hexa tool/image_tag_gc.hexa prune")
+    eprintln("  hexa tool/image_tag_gc.hexa keep <tag>")
+    eprintln("  hexa tool/image_tag_gc.hexa --selftest")
+}
+
+fn main() -> i64 {
+    let av = argv()
+    if len(av) < 3 {
+        _usage()
+        return 2
+    }
+    let sub = av[2]
+    if sub == "--selftest" || sub == "selftest" { return cmd_selftest() }
+    if sub == "dry-run" || sub == "--dry-run" { return cmd_dry_run() }
+    if sub == "prune"   || sub == "--prune"   { return cmd_prune() }
+    if sub == "keep"    || sub == "--keep"    {
+        if len(av) < 4 {
+            eprintln("error: 'keep' requires <tag>")
+            _usage()
+            return 2
+        }
+        return cmd_keep(av[3])
+    }
+    eprintln("error: unknown subcommand '" + sub + "'")
+    _usage()
+    return 2
+}
