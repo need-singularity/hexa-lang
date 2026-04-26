@@ -17,10 +17,39 @@
 # Both pre-built static ELFs must exist beneath build/ before the
 # image is assembled — see tool/build_runner_image.hexa.
 # ─────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────
+# Stage 0: arch-token bridge.  Our build artefacts use the tokens
+# `arm64` / `x86_64` (matching the host `uname -m` lineage), but
+# buildx injects TARGETARCH as `arm64` / `amd64`.  We use two tiny
+# scratch stages — one per docker-arch — that COPY only the correct
+# pair of ELFs into a normalized layout (/cli + /interp).  The
+# final stage then `COPY --from=elf-${TARGETARCH}` pulls just the
+# right pair, so wrong-arch ELFs never land as layer bytes in the
+# shipped image (saves ~2.3MB per arch — see ω-runner-1).
+# ─────────────────────────────────────────────────────────────────
+FROM scratch AS elf-arm64
+COPY build/hexa_linux_arm64        /cli
+COPY build/hexa_interp_linux_arm64 /interp
+
+FROM scratch AS elf-amd64
+COPY build/hexa_linux_x86_64        /cli
+COPY build/hexa_interp_linux_x86_64 /interp
+
+# Indirection: FROM-with-ARG-interpolation IS supported (buildkit
+# resolves it at graph build time), whereas `COPY --from=elf-${TARGETARCH}`
+# is NOT (the ARG isn't visible at COPY-stage-name parse).  So we
+# alias the matching arch stage as `elf-selected` here, and the
+# runtime stage below references the alias unconditionally.
+FROM elf-${TARGETARCH} AS elf-selected
+
+# ─────────────────────────────────────────────────────────────────
+# Stage 1: final runtime image.
+# ─────────────────────────────────────────────────────────────────
 FROM debian:12-slim
 
-# TARGETARCH is auto-injected by buildx ("arm64" or "amd64").
-# We re-export it as ARG so the COPY step can branch on it.
+# TARGETARCH is auto-injected by buildx ("arm64" or "amd64").  Re-export
+# as ARG inside this stage so any subsequent ARG-driven step can see it.
 ARG TARGETARCH
 
 LABEL org.opencontainers.image.title="hexa-runner" \
@@ -56,33 +85,25 @@ RUN apt-get update \
         ca-certificates tini curl wget \
  && rm -rf /var/lib/apt/lists/*
 
-# Stage all four binaries (CLI dispatcher + interp interpreter, ×2 arches)
-# into /tmp; the conditional move below picks the right pair based on
-# TARGETARCH.  Buildx will only ever invoke the COPY for the platform it
-# is currently building, but we keep both paths explicit for clarity /
-# single-arch fallback.
+# Stage in just the matching arch's pair of ELFs from the per-arch
+# scratch bridge stage above.  buildx resolves `${TARGETARCH}` →
+# `arm64`|`amd64` per platform, so only the correct pair lands in this
+# image — no wrong-arch waste (~2.3MB saved per arch vs. the previous
+# COPY-both-then-rm-wrong-arch pattern).  See ω-runner-1 image opt.
 #
 # The interp ELF is installed at /usr/local/bin/build/hexa_interp — the
 # canonical post-rename target that resolve_interp() in self/main.hexa
 # searches for via argv[0]-derived install_dir + "/build/hexa_interp".
 # With /usr/local/bin/hexa as argv[0], the sibling build/ dir is the
 # canonical location.
-COPY build/hexa_linux_arm64           /tmp/hexa_linux_arm64
-COPY build/hexa_linux_x86_64          /tmp/hexa_linux_x86_64
-COPY build/hexa_interp_linux_arm64    /tmp/hexa_interp_linux_arm64
-COPY build/hexa_interp_linux_x86_64   /tmp/hexa_interp_linux_x86_64
+COPY --from=elf-selected /cli    /tmp/hexa_cli
+COPY --from=elf-selected /interp /tmp/hexa_interp
 
 RUN set -eux; \
     mkdir -p /usr/local/bin/build; \
-    case "${TARGETARCH}" in \
-      arm64) install -m 0755 /tmp/hexa_linux_arm64        /usr/local/bin/hexa; \
-             install -m 0755 /tmp/hexa_interp_linux_arm64 /usr/local/bin/build/hexa_interp ;; \
-      amd64) install -m 0755 /tmp/hexa_linux_x86_64        /usr/local/bin/hexa; \
-             install -m 0755 /tmp/hexa_interp_linux_x86_64 /usr/local/bin/build/hexa_interp ;; \
-      *)     echo "unsupported TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
-    esac; \
-    rm -f /tmp/hexa_linux_arm64 /tmp/hexa_linux_x86_64 \
-          /tmp/hexa_interp_linux_arm64 /tmp/hexa_interp_linux_x86_64; \
+    install -m 0755 /tmp/hexa_cli    /usr/local/bin/hexa; \
+    install -m 0755 /tmp/hexa_interp /usr/local/bin/build/hexa_interp; \
+    rm -f /tmp/hexa_cli /tmp/hexa_interp; \
     /usr/local/bin/hexa --version || true; \
     /usr/local/bin/build/hexa_interp --help >/dev/null 2>&1 || true
 
