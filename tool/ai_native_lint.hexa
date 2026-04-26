@@ -14,9 +14,23 @@
 //                                `next_line` (Allman: `fn f()\n{`)
 //                        Mixing the two triggers a violation.
 //
+// TS extension (2026-04-26 cross-language SSOT):
+//   Scope expanded to .ts/.tsx via lint_ts_file (e.g. packages/coding-agent).
+//   Activation marker on TS side:
+//     // @ai-native: strict      → strict (block)
+//     // @ai-native: lax         → lax (warn only)
+//     (no marker)                → lax  (until --default-strict flips it)
+//   TS-side rules:
+//     L4 O(n^2)-concat — same `name = name + X` inside for/while body.
+//                         strip_comments handles // and /* — works as-is.
+//     T1 ai-native-error-trailer (raw 66 cross-language) — `throw new Error(...)`
+//                         with ≥30-char message MUST contain `reason:` or
+//                         `cause:` plus `fix:` or `remedy:` trailer keywords.
+//                         Re-throws (`throw e`, `throw err`) are exempt.
+//
 // Usage:
-//   hexa tool/ai_native_lint.hexa <file.hexa>              # single file
-//   hexa tool/ai_native_lint.hexa --staged                  # all git-staged .hexa
+//   hexa tool/ai_native_lint.hexa <file.hexa|file.ts|file.tsx>  # auto-dispatch
+//   hexa tool/ai_native_lint.hexa --staged                       # all git-staged
 //
 // Exit:
 //   0 — no blocking violations (or only warnings without strict header)
@@ -397,9 +411,156 @@ fn lint_file_ex2(path, default_strict, baseline) {
     return [violations, warnings]
 }
 
+// ── TS extension (2026-04-26) ──────────────────────────────────────────
+// TS files use a different activation marker: `// @ai-native: strict|lax`.
+// If absent we default to lax until --default-strict promotes the file.
+
+fn ts_has_strict_marker(src) {
+    let n = len(src)
+    let mut i = 0
+    let mut line = 1
+    while i < n && line <= 50 {
+        if src[i] == "\n" { line = line + 1; i = i + 1; continue }
+        // Match `// @ai-native: strict` (with flexible spacing)
+        if i + 22 < n {
+            let head = src.substring(i, i + 22)
+            if head == "// @ai-native: strict " || head == "// @ai-native:strict  " { return true }
+        }
+        if i + 21 < n {
+            let head = src.substring(i, i + 21)
+            if head == "// @ai-native: strict" || head == "// @ai-native:strict " { return true }
+        }
+        if i + 20 < n {
+            let head = src.substring(i, i + 20)
+            if head == "// @ai-native:strict" { return true }
+        }
+        while i < n && src[i] != "\n" { i = i + 1 }
+    }
+    return false
+}
+
+fn ts_has_lax_marker(src) {
+    let n = len(src)
+    let mut i = 0
+    let mut line = 1
+    while i < n && line <= 50 {
+        if src[i] == "\n" { line = line + 1; i = i + 1; continue }
+        if i + 18 < n {
+            let head = src.substring(i, i + 18)
+            if head == "// @ai-native: lax" { return true }
+        }
+        if i + 17 < n {
+            let head = src.substring(i, i + 17)
+            if head == "// @ai-native:lax" { return true }
+        }
+        while i < n && src[i] != "\n" { i = i + 1 }
+    }
+    return false
+}
+
+// T1 — ai-native error trailer (raw 66 cross-language port).
+// Detect `throw new Error("<message>")` where <message> has ≥30 chars
+// of body and lacks any of (`reason:`, `cause:`, `fix:`, `remedy:`).
+// Re-throws (`throw e` / `throw err` / `throw new Error()` empty) are exempt.
+// Returns [[line, col, preview]].
+fn find_ts_error_trailer_violations(clean_src) {
+    let n = len(clean_src)
+    let mut out = []
+    let mut i = 0
+    let mut line = 1
+    let mut line_start = 0
+    let needle = "throw new Error("
+    let nl = len(needle)
+    while i < n {
+        if clean_src[i] == "\n" { line = line + 1; line_start = i + 1; i = i + 1; continue }
+        if i + nl <= n && clean_src.substring(i, i + nl) == needle {
+            // word-boundary on left
+            let left_ok = i == 0 || !is_alnum(clean_src[i - 1])
+            if left_ok {
+                let mut j = i + nl
+                // skip ws
+                while j < n && (clean_src[j] == " " || clean_src[j] == "\t") { j = j + 1 }
+                // expect string literal — `"`, `'`, or backtick template
+                if j < n && (clean_src[j] == "\"" || clean_src[j] == "'" || clean_src[j] == "`") {
+                    let quote = clean_src[j]
+                    let str_start = j + 1
+                    let mut k = str_start
+                    // find matching close quote (skip escapes)
+                    while k < n && clean_src[k] != quote {
+                        if clean_src[k] == "\\" && k + 1 < n { k = k + 1 }
+                        if clean_src[k] == "\n" { break }
+                        k = k + 1
+                    }
+                    if k < n && clean_src[k] == quote {
+                        let body = clean_src.substring(str_start, k)
+                        let blen = len(body)
+                        if blen >= 30 {
+                            let has_trailer = body.index_of("reason:") >= 0
+                                            || body.index_of("cause:") >= 0
+                                            || body.index_of("fix:") >= 0
+                                            || body.index_of("remedy:") >= 0
+                            if !has_trailer {
+                                let mut preview_len = blen
+                                if preview_len > 60 { preview_len = 60 }
+                                let preview = body.substring(0, preview_len)
+                                out.push([line, i - line_start + 1, preview])
+                            }
+                        }
+                        i = k + 1
+                        continue
+                    }
+                }
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+fn lint_ts_file(path, default_strict) {
+    let src = read_file(path)
+    let has_strict = ts_has_strict_marker(src)
+    let has_lax = ts_has_lax_marker(src)
+    // Early short-circuit: lax-marker and not default-strict → no blocking
+    if !has_strict && (has_lax || !default_strict) {
+        // We still do warn-pass for visibility, but need stripped src
+    }
+    let strict = if has_strict { true }
+                 else if has_lax { false }
+                 else { default_strict }
+    let clean = strip_comments(src)
+    let mut violations = 0
+    let mut warnings = 0
+
+    // L4 — O(n^2) concat (works on TS source as-is: same loop syntax,
+    // same `name = name + X` pattern, comments already stripped)
+    let on2 = find_on2_concat(clean)
+    let mut k = 0
+    while k < len(on2) {
+        let v = on2[k]
+        let tag = if strict { "BLOCK" } else { "warn " }
+        println(path + ":" + to_string(v[0]) + ":" + to_string(v[1]) + ": [" + tag + " L4 O(n^2)-concat] `" + v[2] + "` inside loop — use .push() + .join() instead")
+        if strict { violations = violations + 1 } else { warnings = warnings + 1 }
+        k = k + 1
+    }
+
+    // T1 — ai-native error trailer (TS-specific)
+    let t1 = find_ts_error_trailer_violations(clean)
+    let mut m = 0
+    while m < len(t1) {
+        let v = t1[m]
+        let tag = if strict { "BLOCK" } else { "warn " }
+        println(path + ":" + to_string(v[0]) + ":" + to_string(v[1]) + ": [" + tag + " T1 ai-native-error-trailer] `throw new Error(\"" + v[2] + "...\")` lacks reason:/fix: trailer (raw 66)")
+        if strict { violations = violations + 1 } else { warnings = warnings + 1 }
+        m = m + 1
+    }
+
+    return [violations, warnings]
+}
+
 fn staged_files() {
     try {
-        let raw = exec("git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep '\\.hexa$'").trim()
+        let raw = exec("git diff --cached --name-only --diff-filter=ACMR 2>/dev/null | grep -E '\\.(hexa|ts|tsx)$'").trim()
         if raw == "" { return [] }
         return raw.split("\n")
     } catch e { return [] }
@@ -416,6 +577,44 @@ fn cmd_selftest() -> i64 {
     let stripped = strip_comments("a // hello\nb")
     // Newline is preserved; "// hello" becomes spaces → length unchanged.
     if len(stripped) != len("a // hello\nb") { println("[ai_native_lint selftest] FAIL strip_comments length"); return 1 }
+
+    // ── TS extension fixtures (2026-04-26) ──
+    // T1 fixture: long-message Error without trailer → 1 violation
+    let ts_bad = "function f() { throw new Error(\"something went wrong with the connection state\") }"
+    let bad_clean = strip_comments(ts_bad)
+    let v_bad = find_ts_error_trailer_violations(bad_clean)
+    if len(v_bad) != 1 {
+        println("[ai_native_lint selftest] FAIL T1 bad: expected 1 violation, got " + to_string(len(v_bad)))
+        return 1
+    }
+    // T1 fixture: same long message WITH trailer → 0 violations
+    let ts_good = "function f() { throw new Error(\"something went wrong reason: x fix: y\") }"
+    let good_clean = strip_comments(ts_good)
+    let v_good = find_ts_error_trailer_violations(good_clean)
+    if len(v_good) != 0 {
+        println("[ai_native_lint selftest] FAIL T1 good: expected 0 violations, got " + to_string(len(v_good)))
+        return 1
+    }
+    // T1 fixture: short message (<30) → exempt
+    let ts_short = "throw new Error(\"oops\")"
+    let v_short = find_ts_error_trailer_violations(strip_comments(ts_short))
+    if len(v_short) != 0 {
+        println("[ai_native_lint selftest] FAIL T1 short: expected 0 violations, got " + to_string(len(v_short)))
+        return 1
+    }
+    // ts_has_strict_marker / ts_has_lax_marker
+    if !ts_has_strict_marker("// @ai-native: strict\nconst x = 1\n") {
+        println("[ai_native_lint selftest] FAIL ts_has_strict_marker positive")
+        return 1
+    }
+    if ts_has_strict_marker("const x = 1\n") {
+        println("[ai_native_lint selftest] FAIL ts_has_strict_marker negative")
+        return 1
+    }
+    if !ts_has_lax_marker("// @ai-native: lax\n") {
+        println("[ai_native_lint selftest] FAIL ts_has_lax_marker positive")
+        return 1
+    }
     println("[ai_native_lint selftest] OK")
     return 0
 }
@@ -437,8 +636,9 @@ fn main() {
         i = i + 1
     }
     if len(files) == 0 {
-        println("usage: ai_native_lint.hexa [--staged | --default-strict | <file.hexa> ...]")
-        println("  --default-strict : #!hexa lax 없는 파일도 strict 적용 (rule #9)")
+        println("usage: ai_native_lint.hexa [--staged | --default-strict | <file.hexa|file.ts|file.tsx> ...]")
+        println("  --default-strict : 활성화 마커 없는 파일도 strict 적용 (rule #9)")
+        println("  TS files use marker `// @ai-native: strict|lax` (cf. .hexa header)")
         return
     }
     let baseline = load_lax_baseline()
@@ -447,9 +647,21 @@ fn main() {
     let mut k = 0
     while k < len(files) {
         let f = files[k]
-        if len(f) >= 5 && f.substring(len(f) - 5, len(f)) == ".hexa" {
+        let flen = len(f)
+        let is_hexa = flen >= 5 && f.substring(flen - 5, flen) == ".hexa"
+        let is_ts = flen >= 3 && f.substring(flen - 3, flen) == ".ts"
+        let is_tsx = flen >= 4 && f.substring(flen - 4, flen) == ".tsx"
+        if is_hexa {
             try {
                 let r = lint_file_ex2(f, default_strict, baseline)
+                total_viol = total_viol + r[0]
+                total_warn = total_warn + r[1]
+            } catch e {
+                println(f + ": [lint error] " + e)
+            }
+        } else if is_ts || is_tsx {
+            try {
+                let r = lint_ts_file(f, default_strict)
                 total_viol = total_viol + r[0]
                 total_warn = total_warn + r[1]
             } catch e {
