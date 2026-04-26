@@ -2820,20 +2820,40 @@ HexaVal hexa_array_sort(HexaVal arr) {
 }
 
 // ── Exec ────────────────────────────────────────────
+// 2026-04-26 cross-repo upstream (hive→hexa-lang): switched the read primitive
+// from fgets()+strlen(buf) to fread(). Old loop computed chunk length via
+// strlen() on the buffer fgets() filled — when the child wrote an embedded
+// NUL byte (e.g. `git log --format=...%x00` for record boundaries),
+// strlen(buf) returned 0 for that chunk's tail and every byte from the NUL
+// onward inside that 4 KiB read window was silently dropped. The new loop
+// uses fread() which reports the actual byte count, so the captured buffer
+// faithfully retains every byte including embedded NULs.
+//
+// Caveat (string ABI): HexaVal strings are stored as a bare `char*` (see the
+// HX_STR macro) and most downstream consumers (hexa_len → strlen, the intern
+// table, str_eq → strcmp) still treat them as C-NUL-terminated. Hexa-source
+// code that calls len() / == on the captured string still sees the C-string
+// view (i.e. truncation at the first NUL). Callers that need full byte-level
+// access to popen output with embedded NULs should use a byte-array variant
+// modeled after rt_read_file_bytes (planned: `exec_bytes`). This fix is the
+// read-loop slice of the problem — the buffer itself is now correct end-to-
+// end, removing the runtime-layer truncation cliff.
 HexaVal hexa_exec(HexaVal cmd) {
     if (!HX_IS_STR(cmd)) return hexa_str("");
     FILE* fp = popen(HX_STR(cmd), "r");
     if (!fp) return hexa_str("");
     char buf[4096]; size_t total = 0;
-    char* result = (char*)malloc(4096); result[0] = '\0';
     size_t cap = 4096;
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t len = strlen(buf);
-        while (total + len + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
-        memcpy(result + total, buf, len);
-        total += len;
-        result[total] = '\0';
+    char* result = (char*)malloc(cap); result[0] = '\0';
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        // +1 for the trailing NUL we always append so HX_STR() remains a
+        // valid C-string for ABI consumers (see caveat above).
+        while (total + n + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
+        memcpy(result + total, buf, n);
+        total += n;
     }
+    result[total] = '\0';
     pclose(fp);
     return hexa_str_own(result);
 }
@@ -2921,16 +2941,19 @@ HexaVal hexa_exec_with_status(HexaVal cmd) {
         arr = hexa_array_push(arr, hexa_int(127));
         return arr;
     }
+    // 2026-04-26 cross-repo upstream: same fgets→fread switch as hexa_exec
+    // above (see that function's comment for the embedded-NUL truncation
+    // root cause and the residual string-ABI caveat).
     char buf[4096]; size_t total = 0;
-    char* result = (char*)malloc(4096); result[0] = '\0';
     size_t cap = 4096;
-    while (fgets(buf, sizeof(buf), fp)) {
-        size_t len = strlen(buf);
-        while (total + len + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
-        memcpy(result + total, buf, len);
-        total += len;
-        result[total] = '\0';
+    char* result = (char*)malloc(cap); result[0] = '\0';
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        while (total + n + 1 > cap) { cap *= 2; result = (char*)realloc(result, cap); }
+        memcpy(result + total, buf, n);
+        total += n;
     }
+    result[total] = '\0';
     int rc = pclose(fp);
     int exit_code;
     if (WIFEXITED(rc))      exit_code = WEXITSTATUS(rc);
