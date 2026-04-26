@@ -13,6 +13,7 @@
 #include <time.h>
 #include <unistd.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #if defined(__APPLE__)
 #include <execinfo.h>
@@ -3462,12 +3463,20 @@ HexaVal rt_write_file(HexaVal path, HexaVal content) {
 
 // P7-6 builtin (2026-04-18): boolean existence probe. Used by native_build
 // and other self-hosting scripts to gate optional inputs without a
-// full read_file round-trip. Returns hexa_bool(1) when access(path, F_OK)
-// succeeds, else hexa_bool(0). Null/non-string paths → false.
+// full read_file round-trip.
+//
+// ω-stdlib-2 (2026-04-26): refined to S_ISREG semantics, matching the
+// portable_fs.hexa POSIX-wc contract that consumers were forced to alias
+// around (pfs_file_exists). Previously used access(p, F_OK) which returns
+// true for ANY path entry incl. directories / symlinks-to-dirs / sockets.
+// Now: stat() + S_ISREG → true only for regular files. Null/missing/non-
+// regular → false. No errno propagation.
 HexaVal rt_file_exists(HexaVal path) {
     const char* p = HX_STR(path);
     if (!p) return hexa_bool(0);
-    return hexa_bool(access(p, F_OK) == 0);
+    struct stat st;
+    if (stat(p, &st) != 0) return hexa_bool(0);
+    return hexa_bool(S_ISREG(st.st_mode) ? 1 : 0);
 }
 
 // ── Binary file I/O — write_bytes / read_file_bytes ─────
@@ -3652,19 +3661,23 @@ HexaVal rt_write_bytes_append_v(HexaVal path, HexaVal arr) {
 
 // file_size(path): native 64-bit file size without loading contents.
 // Existing hexa_full dispatch read the whole file to count length — not
-// viable for multi-GB safetensors shards. Returns -1 on failure.
+// viable for multi-GB safetensors shards.
+//
+// ω-stdlib-2 (2026-04-26): switched from fopen+fseeko/ftello to stat()
+// for two reasons: (1) avoids opening the file at all — pure metadata
+// query, no FD pressure, no platform-dependent fopen-on-directory
+// behaviour; (2) aligns the missing-file convention with portable_fs.hexa
+// (`pfs_file_size`, POSIX `wc -c`-based) which returns 0 for missing
+// rather than -1. Consumers can now stop maintaining the pfs_* alias
+// shadow layer. Directories / non-regular files also return 0 (size is
+// only meaningful for regular files; callers needing dir-size must walk).
 HexaVal rt_file_size(HexaVal path) {
-    FILE* f = fopen(HX_STR(path), "rb");
-    if (!f) return hexa_int(-1);
-#if defined(_WIN32)
-    if (_fseeki64(f, 0, SEEK_END) != 0) { fclose(f); return hexa_int(-1); }
-    long long sz = _ftelli64(f);
-#else
-    if (fseeko(f, 0, SEEK_END) != 0) { fclose(f); return hexa_int(-1); }
-    off_t sz = ftello(f);
-#endif
-    fclose(f);
-    return hexa_int((int64_t)sz);
+    const char* p = HX_STR(path);
+    if (!p) return hexa_int(0);
+    struct stat st;
+    if (stat(p, &st) != 0) return hexa_int(0);
+    if (!S_ISREG(st.st_mode)) return hexa_int(0);
+    return hexa_int((int64_t)st.st_size);
 }
 
 // ── Command line arguments ───────────────────────────
