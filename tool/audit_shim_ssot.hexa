@@ -1,0 +1,499 @@
+// tool/audit_shim_ssot.hexa — drift detector for gitignored build/ shims
+//
+// PURPOSE
+//   Catch the class of regression that bit us on 2026-04-25 (commit e075b3e8
+//   stage0→interp rename silently restoring a deprecated 300s mkdir mutex
+//   in build/hexa_interp). The root cause: build/hexa_interp is gitignored,
+//   so the upstream deprecation in 8a2eab30 only touched the SSOT generator
+//   at tool/install_interp_shim.hexa::iss_fallback_shim_content() — the
+//   rename never re-ran the generator, so the live shim drifted to old code.
+//
+// MECHANISM
+//   For each registered (live shim, SSOT generator) pair, scan the LIVE
+//   shim for known-bad signatures (deprecated patterns that must NOT come
+//   back) and known-good signatures (current design markers that MUST be
+//   present). Byte-equality is NOT possible because the live shim has a
+//   richer documentation header than the minimal fallback the generator
+//   emits, but signature-equality on the load-bearing logic IS feasible
+//   and is exactly what would have caught the Apr 25 regression.
+//
+//   The same checks are applied to the GENERATOR SOURCE (so a future
+//   regression cannot pass via the fallback path either).
+//
+// USAGE
+//   hexa tool/audit_shim_ssot.hexa             — run audit, exit 0 OK / 1 drift
+//   hexa tool/audit_shim_ssot.hexa --json      — JSON output (raw#33 AI-native)
+//   hexa tool/audit_shim_ssot.hexa --witness   — deliberately corrupt then
+//                                                 verify the audit catches it,
+//                                                 then restore. Exit 0 only if
+//                                                 the corrupted state was
+//                                                 detected and the restore
+//                                                 succeeded (omega cycle).
+//   hexa tool/audit_shim_ssot.hexa --selftest  — pure-fn unit tests
+//
+// EXIT CODES
+//   0  no drift in any registered pair
+//   1  at least one pair has drift (deprecated pattern found OR required
+//      pattern missing, in either the live shim or the SSOT source)
+//   2  registry mis-configuration (file missing, etc.)
+//   3  --witness mode failed (audit did NOT detect the deliberate corruption,
+//      OR the restore left the tree in a bad state)
+//
+// CADENCE
+//   Designed to run cheaply (~50ms) on every:
+//     * git pre-push (manual install — no .git/hooks per raw#13)
+//     * launchd 60s sweep (com.hexa-lang.foreign-ext-sweep style)
+//     * manual `hexa audit-shim` slot once dispatched
+
+use "self/stdlib/law_io"
+
+// ─── registry ─────────────────────────────────────────────────
+//
+// One row per (live_path, ssot_path) pair. Each row carries:
+//   live_path  — the gitignored build artifact whose content is generated
+//   ssot_path  — the .hexa source containing the generator function
+//   bad_pats   — substrings that MUST NOT appear in live_path or ssot_path
+//                (deprecated designs whose return must be detected)
+//   good_pats  — substrings that MUST appear in live_path AND ssot_path
+//                (current design markers; their absence is also drift)
+//   notes      — free-form context for AI-native diagnosis
+//
+// The registry is the SSOT for the audit itself. To add a new generator,
+// add one row here.
+
+fn _registry() -> array {
+    return [
+        [
+            "build/hexa_interp",
+            "tool/install_interp_shim.hexa",
+            // bad_pats — patterns from the deprecated design (commit ca46279
+            // mkdir-mutex + safe_hexa_launchd wrapper). If any of these come
+            // back to the live shim or to iss_fallback_shim_content, the
+            // Apr 25 silent-restore class regression has recurred.
+            ["safe_hexa_launchd", "hexa_interp.lock.d", "hexa_stage0.lock.d",
+             "/tmp/hexa_interp.lock", "/tmp/hexa_stage0.lock"],
+            // good_pats — current design markers (non-blocking fork-storm cap,
+            // commit 5401409e). Plain substring match (NOT regex). All MUST
+            // appear in BOTH live and ssot.
+            ["HEXA_FORK_CAP", "hexa_interp.real", "fork-storm cap"],
+            "hexa_interp shim — see commit 5401409e for the redesign rationale"
+        ]
+    ]
+}
+
+// ─── helpers ──────────────────────────────────────────────────
+
+fn _read_or_empty(path: string) -> string {
+    let r = exec_with_status("test -f " + path)
+    if r[1] != 0 { return "" }
+    return to_string(read_file(path))
+}
+
+// _strip_comments — drop lines that are pure comments. Active code lines
+// (including `code  # trailing comment`) are kept verbatim. Recognised
+// comment leaders: `#` (shell), `//` (hexa/c), `--` (sql/lua).
+//
+// WHY this matters: documentation headers in both the live shim and the
+// SSOT generator legitimately MENTION deprecated patterns to record the
+// failure mode (so future readers know not to bring them back). Plain
+// substring search would false-flag those mentions. Stripping pure
+// comment lines isolates active code, which is the only place a
+// deprecated pattern would actually re-execute.
+fn _strip_comments(content: string) -> string {
+    let lines = split(content, "\n")
+    let mut kept = []
+    for ln in lines {
+        let t = ln.trim()
+        if t == "" { continue }
+        if t.index_of("#") == 0 { continue }
+        if t.index_of("//") == 0 { continue }
+        if t.index_of("--") == 0 { continue }
+        kept.push(ln)
+    }
+    return kept.join("\n")
+}
+
+fn _esc(s: string) -> string {
+    let mut r = s.replace("\\", "\\\\")
+    r = r.replace("\"", "\\\"")
+    r = r.replace("\n", "\\n")
+    r = r.replace("\r", "")
+    r = r.replace("\t", " ")
+    return r
+}
+
+// _scan_pair returns [missing_good, found_bad] arrays of patterns. Empty
+// arrays = clean. Non-empty = drift.
+fn _scan_pair(content: string, label: string, bad_pats: array, good_pats: array) -> array {
+    let mut missing_good = []
+    let mut found_bad = []
+    if content == "" {
+        // Treat missing file as missing all good_pats (worst case).
+        for g in good_pats { missing_good.push([label, g]) }
+        return [missing_good, found_bad]
+    }
+    for g in good_pats {
+        if content.index_of(g) < 0 {
+            missing_good.push([label, g])
+        }
+    }
+    for b in bad_pats {
+        if content.index_of(b) >= 0 {
+            found_bad.push([label, b])
+        }
+    }
+    return [missing_good, found_bad]
+}
+
+// ─── core audit ───────────────────────────────────────────────
+
+fn _audit_one(repo_root: string, row: array) -> array {
+    let live_rel = row[0]
+    let ssot_rel = row[1]
+    let bad_pats = row[2]
+    let good_pats = row[3]
+
+    let live_path = repo_root + "/" + live_rel
+    let ssot_path = repo_root + "/" + ssot_rel
+
+    let live_raw = _read_or_empty(live_path)
+    let ssot_raw = _read_or_empty(ssot_path)
+
+    // Bad-pattern scan: code-only (drop comment lines so doc references to
+    // historical bad designs are not flagged).
+    //
+    // Good-pattern scan: full content (good patterns may legitimately appear
+    // in either code or documentation; we just need them present somewhere).
+    let live_code = _strip_comments(live_raw)
+    let ssot_code = _strip_comments(ssot_raw)
+
+    let live_good_scan = _scan_pair(live_raw, "live", [], good_pats)
+    let ssot_good_scan = _scan_pair(ssot_raw, "ssot", [], good_pats)
+    let live_bad_scan = _scan_pair(live_code, "live", bad_pats, [])
+    let ssot_bad_scan = _scan_pair(ssot_code, "ssot", bad_pats, [])
+    let live_scan = [live_good_scan[0], live_bad_scan[1]]
+    let ssot_scan = [ssot_good_scan[0], ssot_bad_scan[1]]
+
+    // Combine missing+found across live+ssot.
+    let mut missing = []
+    for m in live_scan[0] { missing.push(m) }
+    for m in ssot_scan[0] { missing.push(m) }
+    let mut found = []
+    for f in live_scan[1] { found.push(f) }
+    for f in ssot_scan[1] { found.push(f) }
+
+    let live_exists = if live_content != "" { 1 } else { 0 }
+    let ssot_exists = if ssot_content != "" { 1 } else { 0 }
+    let drift = if (len(missing) + len(found)) > 0 { 1 } else { 0 }
+
+    return [live_rel, ssot_rel, live_exists, ssot_exists, missing, found, drift]
+}
+
+fn _audit_all(repo_root: string) -> array {
+    let mut rows = []
+    let reg = _registry()
+    for r in reg {
+        rows.push(_audit_one(repo_root, r))
+    }
+    return rows
+}
+
+// ─── render ───────────────────────────────────────────────────
+
+fn _render_text(rows: array) -> string {
+    let mut out = []
+    out.push("audit-shim-ssot — registered pairs: " + to_string(len(rows)) + "\n")
+    let mut total_drift = 0
+    for row in rows {
+        let live_rel = row[0]
+        let ssot_rel = row[1]
+        let live_exists = row[2]
+        let ssot_exists = row[3]
+        let missing = row[4]
+        let found = row[5]
+        let drift = row[6]
+        let status = if drift == 1 { "DRIFT" } else { "ok" }
+        out.push("  [" + status + "] " + live_rel + " <- " + ssot_rel + "\n")
+        if live_exists == 0 { out.push("    live MISSING\n") }
+        if ssot_exists == 0 { out.push("    ssot MISSING\n") }
+        for m in missing {
+            out.push("    " + m[0] + " missing required pattern: " + m[1] + "\n")
+        }
+        for f in found {
+            out.push("    " + f[0] + " contains deprecated pattern: " + f[1] + "\n")
+        }
+        if drift == 1 { total_drift = total_drift + 1 }
+    }
+    out.push("\n")
+    if total_drift == 0 {
+        out.push("RESULT: clean (no drift in " + to_string(len(rows)) + " pair(s))\n")
+    } else {
+        out.push("RESULT: DRIFT in " + to_string(total_drift) + "/" + to_string(len(rows)) + " pair(s) — fix before proceeding.\n")
+        out.push("Likely cause: deprecation landed in SSOT generator but live build artifact (gitignored) was never regenerated.\n")
+        out.push("See tool/install_interp_shim.hexa for the canonical regeneration entry point.\n")
+    }
+    return out.join("")
+}
+
+fn _render_json(rows: array) -> string {
+    let mut total_drift = 0
+    let parts = []
+    parts.push("{\"rule\":\"shim-ssot-drift\",\"pairs\":[")
+    let mut first = true
+    for row in rows {
+        if !first { parts.push(",") }
+        first = false
+        parts.push("{\"live\":\"")
+        parts.push(_esc(row[0]))
+        parts.push("\",\"ssot\":\"")
+        parts.push(_esc(row[1]))
+        parts.push("\",\"live_exists\":")
+        parts.push(to_string(row[2]))
+        parts.push(",\"ssot_exists\":")
+        parts.push(to_string(row[3]))
+        parts.push(",\"missing\":[")
+        let mut mfirst = true
+        for m in row[4] {
+            if !mfirst { parts.push(",") }
+            mfirst = false
+            parts.push("{\"side\":\"")
+            parts.push(_esc(m[0]))
+            parts.push("\",\"pattern\":\"")
+            parts.push(_esc(m[1]))
+            parts.push("\"}")
+        }
+        parts.push("],\"found_deprecated\":[")
+        let mut ffirst = true
+        for f in row[5] {
+            if !ffirst { parts.push(",") }
+            ffirst = false
+            parts.push("{\"side\":\"")
+            parts.push(_esc(f[0]))
+            parts.push("\",\"pattern\":\"")
+            parts.push(_esc(f[1]))
+            parts.push("\"}")
+        }
+        parts.push("],\"drift\":")
+        parts.push(to_string(row[6]))
+        parts.push("}")
+        if row[6] == 1 { total_drift = total_drift + 1 }
+    }
+    parts.push("],\"total_drift\":")
+    parts.push(to_string(total_drift))
+    parts.push(",\"verdict\":\"")
+    parts.push(if total_drift == 0 { "ok" } else { "drift" })
+    parts.push("\",\"why\":\"Catches the silent-restore-of-deprecated-design failure mode (e.g. e075b3e8 stage0→interp rename that lost the 8a2eab30 mutex deprecation).\"")
+    parts.push(",\"guide\":{\"action\":\"regenerate live artifact via SSOT generator (e.g. hexa tool/install_interp_shim.hexa); if SSOT itself drifted, restore current design markers from the latest perf/redesign commit\"}}")
+    return parts.join("")
+}
+
+// ─── witness mode ─────────────────────────────────────────────
+//
+// Omega-cycle witness: deliberately introduce a known-bad pattern into the
+// LIVE shim (NOT the SSOT — the SSOT is committed source we shouldn't
+// mutate even temporarily). Verify the audit catches it. Restore the live
+// shim from the SSOT generator. Exit 0 only if both succeeded.
+//
+// This is the falsifier — without this, "the audit passes" doesn't tell us
+// whether the audit can detect anything.
+
+fn _witness(repo_root: string) -> int {
+    println("[witness] BEGIN")
+
+    let live_path = repo_root + "/build/hexa_interp"
+    let backup = "/tmp/audit_shim_ssot.witness.backup"
+
+    let exists = exec_with_status("test -f " + live_path)
+    if exists[1] != 0 {
+        eprintln("[witness] FAIL: live shim missing at " + live_path)
+        eprintln("[witness] (cannot run witness without a live target)")
+        return 3
+    }
+
+    // Step 1: backup the live shim verbatim.
+    let cp1 = exec_with_status("cp " + live_path + " " + backup)
+    if cp1[1] != 0 {
+        eprintln("[witness] FAIL: backup cp -> " + backup)
+        return 3
+    }
+    println("[witness] backed up live shim -> " + backup)
+
+    // Step 2: inject a deprecated pattern (simulates the Apr 25 regression
+    // where the rename silently brought back the old mutex). The injection
+    // must look like ACTIVE CODE (not a pure-comment line), because the
+    // bad-pattern scanner intentionally strips comments to avoid false-
+    // flagging documentation references to the deprecated design.
+    //
+    // We append a `:` no-op shell builtin that mentions the bad pattern as
+    // a quoted argument — semantically a no-op (`:` ignores all args), but
+    // syntactically active code that survives _strip_comments. The script's
+    // executable behaviour is unchanged so the witness is non-destructive
+    // even if the audit aborts mid-flight before the restore step.
+    let inject_line = "\n: REGRESSION_WITNESS \"safe_hexa_launchd\"\n"
+    let live_content = to_string(read_file(live_path))
+    let mutated = live_content + inject_line
+    let _w = safe_write_file(live_path, mutated)
+    println("[witness] injected deprecated pattern (safe_hexa_launchd) into live shim as active code")
+
+    // Step 3: run the audit. We expect drift detection (verdict drift, exit 1).
+    let rows = _audit_all(repo_root)
+    let mut total_drift = 0
+    let mut caught_bad = false
+    for row in rows {
+        if row[6] == 1 { total_drift = total_drift + 1 }
+        for f in row[5] {
+            if f[1].index_of("safe_hexa_launchd") >= 0 { caught_bad = true }
+        }
+    }
+    println("[witness] audit run: drift_pairs=" + to_string(total_drift) + " caught_pattern=" + (if caught_bad { "yes" } else { "no" }))
+
+    // Step 4: restore live shim from backup (the audit-side recovery; in
+    // production the recovery is `hexa tool/install_interp_shim.hexa`).
+    let restore = exec_with_status("cp " + backup + " " + live_path)
+    if restore[1] != 0 {
+        eprintln("[witness] FAIL: restore cp from backup")
+        return 3
+    }
+    let _rm = exec_with_status("rm -f " + backup)
+    println("[witness] restored live shim from backup")
+
+    // Step 5: re-run audit to confirm restore left the tree clean.
+    let rows2 = _audit_all(repo_root)
+    let mut post_drift = 0
+    for row in rows2 {
+        if row[6] == 1 { post_drift = post_drift + 1 }
+    }
+    println("[witness] post-restore audit: drift_pairs=" + to_string(post_drift))
+
+    if !caught_bad {
+        eprintln("[witness] FAIL: audit did NOT detect the injected deprecated pattern")
+        return 3
+    }
+    if total_drift == 0 {
+        eprintln("[witness] FAIL: audit total_drift was 0 despite injection")
+        return 3
+    }
+    if post_drift != 0 {
+        eprintln("[witness] FAIL: post-restore drift was non-zero (" + to_string(post_drift) + ")")
+        return 3
+    }
+    println("[witness] OK — audit caught injection, restore returned tree to clean state")
+    return 0
+}
+
+// ─── selftest ─────────────────────────────────────────────────
+
+fn _selftest() -> int {
+    println("[audit_shim_ssot selftest]")
+
+    // T1: registry is non-empty.
+    let reg = _registry()
+    if len(reg) == 0 { eprintln("FAIL T1 registry empty"); return 1 }
+    println("  OK T1 registry has " + to_string(len(reg)) + " row(s)")
+
+    // T2: each row has 5 fields and the array fields are non-empty.
+    for row in reg {
+        if len(row) != 5 { eprintln("FAIL T2 row arity != 5"); return 1 }
+        if len(row[2]) == 0 { eprintln("FAIL T2 bad_pats empty: " + row[0]); return 1 }
+        if len(row[3]) == 0 { eprintln("FAIL T2 good_pats empty: " + row[0]); return 1 }
+    }
+    println("  OK T2 row schema")
+
+    // T3: _scan_pair on a clean string returns [empty, empty].
+    let clean = "HEXA_FORK_CAP=32\nexec hexa_interp.real \"$@\"\n# fork-storm cap\n"
+    let bad = ["safe_hexa_launchd", "hexa_interp.lock.d"]
+    let good = ["HEXA_FORK_CAP", "hexa_interp.real", "fork-storm cap"]
+    let s1 = _scan_pair(clean, "test", bad, good)
+    if len(s1[0]) != 0 { eprintln("FAIL T3a missing != []: " + to_string(len(s1[0]))); return 1 }
+    if len(s1[1]) != 0 { eprintln("FAIL T3b found != []: " + to_string(len(s1[1]))); return 1 }
+    println("  OK T3 scan_pair clean")
+
+    // T4: _scan_pair on a content with deprecated pattern flags it.
+    let dirty = clean + "# regression: safe_hexa_launchd snuck back\n"
+    let s2 = _scan_pair(dirty, "test", bad, good)
+    if len(s2[1]) != 1 { eprintln("FAIL T4 found != 1: " + to_string(len(s2[1]))); return 1 }
+    println("  OK T4 scan_pair flags deprecated")
+
+    // T5: _scan_pair on a content missing required pattern flags it.
+    let stripped = "exec hexa_interp.real \"$@\"\n# fork-storm cap\n"
+    let s3 = _scan_pair(stripped, "test", bad, good)
+    if len(s3[0]) != 1 { eprintln("FAIL T5 missing != 1: " + to_string(len(s3[0]))); return 1 }
+    println("  OK T5 scan_pair flags missing-good")
+
+    // T6: _strip_comments drops pure-comment lines but keeps active code.
+    let mixed = "# header comment about safe_hexa_launchd\nexec foo\n// hexa comment about lock.d\nactive code\n"
+    let stripped_c = _strip_comments(mixed)
+    if stripped_c.index_of("safe_hexa_launchd") >= 0 { eprintln("FAIL T6a leaked comment: " + stripped_c); return 1 }
+    if stripped_c.index_of("lock.d") >= 0 { eprintln("FAIL T6b leaked hexa comment"); return 1 }
+    if stripped_c.index_of("exec foo") < 0 { eprintln("FAIL T6c lost active code"); return 1 }
+    if stripped_c.index_of("active code") < 0 { eprintln("FAIL T6d lost active code 2"); return 1 }
+    println("  OK T6 strip_comments")
+
+    // T7: _strip_comments + _scan_pair on a doc-only mention of bad pattern
+    // does NOT flag (proves the false-positive fix from the first audit run).
+    let docs_only = "# REDESIGN — replaces old safe_hexa_launchd wrapper\nexec hexa_interp.real \"$@\"\n# uses HEXA_FORK_CAP, fork-storm cap\n"
+    let docs_code = _strip_comments(docs_only)
+    let s_bad = _scan_pair(docs_code, "test", bad, [])
+    if len(s_bad[1]) != 0 { eprintln("FAIL T7 doc-only mention false-flagged: " + to_string(len(s_bad[1]))); return 1 }
+    println("  OK T7 doc-only bad mention not flagged")
+
+    // T8: _strip_comments + _scan_pair on actual code with bad pattern DOES flag.
+    let code_bad = "exec safe_hexa_launchd.sh \"$@\"\n# comment\n"
+    let code_bad_stripped = _strip_comments(code_bad)
+    let s_bad2 = _scan_pair(code_bad_stripped, "test", bad, [])
+    if len(s_bad2[1]) != 1 { eprintln("FAIL T8 code bad pattern not flagged: " + to_string(len(s_bad2[1]))); return 1 }
+    println("  OK T8 code bad pattern flagged")
+
+    println("[audit_shim_ssot selftest] OK")
+    return 0
+}
+
+// ─── main ─────────────────────────────────────────────────────
+
+fn _resolve_repo_root(av: array) -> string {
+    let hl = env("HEXA_LANG")
+    if hl != "" {
+        let chk = exec_with_status("test -d " + hl + "/tool")
+        if chk[1] == 0 { return hl }
+    }
+    let pwd = exec("pwd").trim()
+    let chk2 = exec_with_status("test -d " + pwd + "/tool && test -f " + pwd + "/tool/install_interp_shim.hexa")
+    if chk2[1] == 0 { return pwd }
+    let script_path = av[1]
+    let legacy = exec("cd \"$(dirname '" + script_path + "')/../\" && pwd").trim()
+    return legacy
+}
+
+fn main() -> int {
+    let av = argv()
+    let mut json_mode = false
+    let mut witness_mode = false
+    let mut selftest_mode = false
+    let mut i = 2
+    while i < len(av) {
+        let a = av[i]
+        if a == "--json" { json_mode = true }
+        else if a == "--witness" { witness_mode = true }
+        else if a == "--selftest" || a == "selftest" { selftest_mode = true }
+        i = i + 1
+    }
+
+    if selftest_mode { return _selftest() }
+
+    let repo_root = _resolve_repo_root(av)
+    if witness_mode { return _witness(repo_root) }
+
+    let rows = _audit_all(repo_root)
+    if json_mode {
+        println(_render_json(rows))
+    } else {
+        print(_render_text(rows))
+    }
+
+    let mut drift = 0
+    for r in rows { if r[6] == 1 { drift = drift + 1 } }
+    if drift > 0 { return 1 }
+    return 0
+}
+
+exit(main())
