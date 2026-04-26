@@ -35,11 +35,13 @@
 // be visible from the glibc headers.
 
 #include <dlfcn.h>
+#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 
 static const char *BANNED_SUFFIXES[] = { ".py", ".rs", ".sh", ".toml", NULL };
@@ -196,34 +198,158 @@ static int refuse_raw6(const char *path) {
 
 // raw#7 — tree-structure F5 (loner-dir) + F6 (parent-child stem repeat).
 //
-// STATUS: not yet implemented in this shim. raw#7 currently enforces at
-// enforce-layer = hive-agent (tool/ai_native_scan.hexa lint). macOS SBPL
-// (self/sbpl/native.sb) cannot promote because the kernel regex engine
-// lacks both dir-content introspection (F5) and backreferences (F6 silently
-// fail-opens on backref patterns — smoke-tested 2026-04-26 /tmp probe).
+// Promoted 2026-04-26 from agent-layer (tool/ai_native_scan.hexa) to
+// os-level on Linux LD_PRELOAD. macOS SBPL still cannot enforce — kernel
+// regex lacks dir-content introspection (F5) and backreferences (F6
+// fail-opens on backref patterns). On Linux the shim sees full paths +
+// has FS access, so both F5 + F6 are straightforward C.
 //
-// The Linux LD_PRELOAD shim CAN promote raw#7 to os-level: at write time
-// we have the full path string + the FS, so both F5 and F6 reduce to
-// straightforward C. This is the next concrete promotion target for raw#7;
-// see self/sbpl/native.sb raw#7 block, "PROMOTION ROADMAP (C-linux)".
+// Both helpers gate behind on_allowlist() (in refuse() flow) plus an
+// is_under_managed_repo() check (mirrors refuse_raw6's is_under_hive_repo)
+// so cross-repo expansion follows the raw_6.list precedent.
+
+// F6 entry-point stem whitelist — mirrors ai_native_scan.hexa#L612.
+// `index/mod/main/lib/init` are conventional entry-point names; never flagged.
+static const char *RAW7_F6_ENTRY_STEMS[] = {
+    "index", "mod", "main", "lib", "init", NULL
+};
+
+// raw#7 path-substring exemptions (vendor / test-fixtures / generated trees).
+// Mirrors raw_7.list intent: tests/integration/*/test.sh is the canonical
+// F5-loner exemption; vendor + node_modules are universal grandfather paths.
+static const char *RAW7_ALLOW[] = {
+    "/node_modules/",
+    "/vendor/",
+    "/archive/",
+    "/.git/",
+    "/.hexa-cache/",
+    "/.claude-cache/",
+    "/.claude/worktrees/",
+    "/tests/integration/",   // raw_7.list: per-test isolation by design
+    "/tests/fixtures/",
+    "/test/fixtures/",
+    "/testdata/",
+    "/.raw-exemptions/",
+    NULL
+};
+
+static int is_under_managed_repo(const char *path) {
+    if (!path) return 0;
+    return strstr(path, "/core/hive/") != NULL
+        || strstr(path, "/core/hexa-lang/") != NULL;
+}
+
+static int raw7_path_exempt(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; RAW7_ALLOW[i]; i++) {
+        if (strstr(path, RAW7_ALLOW[i])) return 1;
+    }
+    return 0;
+}
+
+// Find the last '/' in path. Returns NULL if none.
+static const char *raw7_last_slash(const char *path) {
+    return strrchr(path, '/');
+}
+
+// raw#7 F6: parent_dir_name == file_stem (or stem starts with "<parent>_").
+// Pure pointer-math, zero syscalls. Returns 1 to refuse.
+static int refuse_raw7_parent_child_stem(const char *path) {
+    if (!path) return 0;
+    if (!is_under_managed_repo(path)) return 0;
+    if (raw7_path_exempt(path)) return 0;
+
+    const char *slash1 = raw7_last_slash(path);
+    if (!slash1 || slash1 == path) return 0;     // no parent component
+    const char *basename = slash1 + 1;
+    if (!*basename) return 0;
+
+    // Locate parent-dir component: scan back for second-to-last slash.
+    const char *p = slash1 - 1;
+    while (p > path && *p != '/') p--;
+    if (*p != '/') return 0;                      // path had only one '/'
+    const char *pdir = p + 1;
+    size_t pdir_len = (size_t)(slash1 - pdir);
+    if (pdir_len == 0) return 0;
+
+    // Compute stem length: basename up to last '.'.
+    const char *dot = strrchr(basename, '.');
+    size_t stem_len = dot ? (size_t)(dot - basename) : strlen(basename);
+    if (stem_len == 0) return 0;
+
+    // Whitelist conventional entry-point stems (index/mod/main/lib/init).
+    for (int i = 0; RAW7_F6_ENTRY_STEMS[i]; i++) {
+        size_t en = strlen(RAW7_F6_ENTRY_STEMS[i]);
+        if (en == stem_len
+            && strncmp(basename, RAW7_F6_ENTRY_STEMS[i], en) == 0) {
+            return 0;
+        }
+    }
+
+    // Exact-match: parent == stem.
+    if (stem_len == pdir_len && strncmp(basename, pdir, pdir_len) == 0) {
+        return 1;
+    }
+    // Prefix-match: stem starts with "<parent>_".
+    if (stem_len > pdir_len + 1
+        && strncmp(basename, pdir, pdir_len) == 0
+        && basename[pdir_len] == '_') {
+        return 1;
+    }
+    return 0;
+}
+
+// raw#7 F5: refuse if creating this file would leave the parent dir as a
+// "loner" (this file is the sole regular-file entry). Gate behind O_CREAT
+// + ENOENT(path) in caller so steady-state writes pay zero. Cost on first-
+// write: one opendir + a bounded readdir scan (early-exit at 2 entries).
 //
-// TODO raw#7 F5: refuse_raw7_loner_dir(path)
-//   On a CREATE-class write, stat(dirname(path)). If the parent dir would
-//   end up with exactly one entry (this file), and the parent is not on a
-//   raw#7 exemption list (mirrors tool/ai_native_scan.hexa exemptions —
-//   lib/, tests/integration/, archive/, .git/, .hexa-cache/, etc.), refuse
-//   with EPERM. Cost: one opendir+readdir on each first-write — keep behind
-//   an O_CREAT + ENOENT(path) check so steady-state writes pay zero.
-//
-// TODO raw#7 F6: refuse_raw7_parent_child_stem(path)
-//   String-compare basename-without-ext(path) against basename(dirname(path)).
-//   If equal AND dirname(path) is not a known root dir (e.g. tool/, test/,
-//   self/, raw#6 allowlist), refuse with EPERM. Cheap — pure pointer math
-//   on the path string, no syscalls.
-//
-// Both helpers gate behind on_allowlist() + an is_under_managed_repo() check
-// (mirroring refuse_raw6's is_under_hive_repo) so the cross-repo expansion
-// follows the raw_6.list precedent.
+// Algorithm: open parent dir; iterate dirent until we either:
+//   (a) see a second non-{".",".."} entry that's not the file we're about
+//       to create — return 0 (allow, dir is not a loner)
+//   (b) exhaust the iterator — return 1 (would-be loner, refuse)
+// We accept that the create itself is racing dir contents; the lint-layer
+// already provides eventual consistency. This shim's job is to catch the
+// 95% "first file in fresh dir" pattern, not be perfectly atomic.
+static int refuse_raw7_loner_dir(const char *path) {
+    if (!path) return 0;
+    if (!is_under_managed_repo(path)) return 0;
+    if (raw7_path_exempt(path)) return 0;
+
+    const char *slash = raw7_last_slash(path);
+    if (!slash || slash == path) return 0;
+    size_t plen = (size_t)(slash - path);
+    if (plen == 0 || plen >= 4096) return 0;
+
+    char parent[4096];
+    memcpy(parent, path, plen);
+    parent[plen] = '\0';
+
+    DIR *d = opendir(parent);
+    if (!d) return 0;                             // parent missing → let real open() set ENOENT
+
+    const char *new_basename = slash + 1;
+    int seen_other = 0;
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        const char *n = de->d_name;
+        if (n[0] == '.' && (n[1] == '\0' || (n[1] == '.' && n[2] == '\0'))) {
+            continue;                             // skip "." and ".."
+        }
+        if (strcmp(n, new_basename) == 0) {
+            // Already exists — not a fresh-create loner case; let real call decide.
+            closedir(d);
+            return 0;
+        }
+        // Any other entry → not a loner-to-be.
+        seen_other = 1;
+        break;
+    }
+    closedir(d);
+
+    // Empty parent + we are about to add 1 entry → would-be loner. Refuse.
+    return seen_other ? 0 : 1;
+}
 
 // raw#20 — .own append-only: O_TRUNC on path ending in /.own = EPERM.
 static int refuse_raw20(const char *path, int flags) {
@@ -341,6 +467,8 @@ static int refuse(const char *path, int flags) {
         if (refuse_raw13(path)) return 1;        // raw#13 still applies
         if (refuse_raw20(path, flags)) return 1; // raw#20 .own gate
         if (refuse_raw6(path)) return 1;         // raw#6 folder-naming
+        if (refuse_raw7_parent_child_stem(path)) return 1;       // raw#7 F6
+        if ((flags & O_CREAT) && refuse_raw7_loner_dir(path)) return 1; // raw#7 F5
         return 0;
     }
     for (int i = 0; BANNED_SUFFIXES[i]; i++) {
@@ -350,6 +478,8 @@ static int refuse(const char *path, int flags) {
     if (refuse_raw13(path)) return 1;
     if (refuse_raw20(path, flags)) return 1;
     if (refuse_raw6(path)) return 1;
+    if (refuse_raw7_parent_child_stem(path)) return 1;           // raw#7 F6
+    if ((flags & O_CREAT) && refuse_raw7_loner_dir(path)) return 1;   // raw#7 F5
     return 0;
 }
 
