@@ -130,23 +130,73 @@ fn ml_parse_import(line) {
 
 // ── resolution (3-way: caller-relative, stdlib, project-root) ──
 
+// Env hygiene helpers — 2026-04-26 Option B (raw#92 silent-no-op fix).
+//
+// Two independent env vars, two distinct roles:
+//   * HEXA_LANG          = project root containing self/  (canonical)
+//                          maps `stdlib/X` → $HEXA_LANG/self/stdlib/X.hexa
+//                          maps `self/stdlib/X` → $HEXA_LANG/self/stdlib/X.hexa
+//   * HEXA_STDLIB_ROOT   = stdlib-only root  (deterministic override)
+//                          maps `stdlib/X`      → $HEXA_STDLIB_ROOT/X.hexa
+//                          maps `self/stdlib/X` → $HEXA_STDLIB_ROOT/X.hexa
+//
+// HEXA_STDLIB_ROOT is the cron/launchd/subagent-friendly fallback: those
+// contexts commonly inherit no env, so HEXA_LANG=unset → silent no-op was
+// the bug. Resolution failure now aborts loudly (see ml_iter_walk below)
+// instead of silently dropping `use "self/stdlib/…"` imports.
+fn env_hexa_lang() {
+    return env_var("HEXA_LANG")
+}
+
+fn env_hexa_stdlib_root() {
+    return env_var("HEXA_STDLIB_ROOT")
+}
+
+// Strip a known stdlib prefix from `imp`. Returns "" if no prefix matches.
+//   "stdlib/ai_err"      → "ai_err"
+//   "self/stdlib/ai_err" → "ai_err"
+//   anything else        → ""
+@pure
+fn ml_strip_stdlib_prefix(imp) {
+    if ml_starts_with(imp, "self/stdlib/") {
+        return imp.substring(12, len(imp))
+    }
+    if ml_starts_with(imp, "stdlib/") {
+        return imp.substring(7, len(imp))
+    }
+    return ""
+}
+
 fn ml_resolve_stdlib(imp) {
-    if !ml_starts_with(imp, "stdlib/") { return "" }
-    let hl = env_var("HEXA_LANG")
-    if len(hl) == 0 { return "" }
-    // `hl + "/self/" + imp + ".hexa"` — 3 concats, trips 101-gate in hot loop.
-    let mut p = []
-    p.push(hl)
-    p.push("/self/")
-    p.push(imp)
-    p.push(".hexa")
-    let cand = p.join("")
-    if file_exists(cand) { return cand }
+    let rest = ml_strip_stdlib_prefix(imp)
+    if len(rest) == 0 { return "" }
+    // 1. HEXA_STDLIB_ROOT override (deterministic, env-hygiene-friendly).
+    let sr = env_hexa_stdlib_root()
+    if len(sr) > 0 {
+        let mut p = []
+        p.push(sr)
+        p.push("/")
+        p.push(rest)
+        p.push(".hexa")
+        let cand = p.join("")
+        if file_exists(cand) { return cand }
+    }
+    // 2. HEXA_LANG canonical resolution.
+    let hl = env_hexa_lang()
+    if len(hl) > 0 {
+        let mut p = []
+        p.push(hl)
+        p.push("/self/stdlib/")
+        p.push(rest)
+        p.push(".hexa")
+        let cand = p.join("")
+        if file_exists(cand) { return cand }
+    }
     return ""
 }
 
 fn ml_resolve_project_root(imp) {
-    let hl = env_var("HEXA_LANG")
+    let hl = env_hexa_lang()
     if len(hl) > 0 {
         let cand = ml_join_path(hl, imp)
         if file_exists(cand) { return cand }
@@ -377,13 +427,39 @@ fn ml_iter_walk(start_file) {
                             stack.push(full)
                         }
                     } else {
+                        // raw#92 no_silent_errors: fail loud. Was a stdout WARN
+                        // → import silently dropped → downstream `Runtime error:
+                        // undefined function`. Now: stderr diagnostic with env
+                        // state + ghost-path detection, then exit(2).
+                        let hl_now = env_var("HEXA_LANG")
+                        let sr_now = env_var("HEXA_STDLIB_ROOT")
+                        let cwd_now = env_var("PWD")
                         let mut wp = []
-                        wp.push("[module_loader] WARN dep not found: ")
+                        wp.push("[module_loader] FATAL module not found: ")
                         wp.push(imp)
                         wp.push(" (from ")
                         wp.push(top)
-                        wp.push(")")
-                        println(wp.join(""))
+                        wp.push(")\n  searched:")
+                        wp.push("\n    HEXA_LANG=")
+                        if len(hl_now) > 0 { wp.push(hl_now) } else { wp.push("<unset>") }
+                        wp.push("\n    HEXA_STDLIB_ROOT=")
+                        if len(sr_now) > 0 { wp.push(sr_now) } else { wp.push("<unset>") }
+                        wp.push("\n    project_root=")
+                        if len(hl_now) > 0 { wp.push(hl_now) } else { wp.push("<none>") }
+                        wp.push("\n    caller_dir=")
+                        wp.push(caller_dir)
+                        wp.push("\n    cwd=")
+                        if len(cwd_now) > 0 { wp.push(cwd_now) } else { wp.push("<unset>") }
+                        // Ghost-path hint: `self/core/...` was a 36-callsite typo
+                        // for `self/stdlib/...` (see hive raw#92 ghost-import fix).
+                        if ml_starts_with(imp, "self/core/") {
+                            wp.push("\n  hint: imports under self/core/ do not exist in hexa-lang stdlib;")
+                            wp.push("\n        did you mean self/stdlib/")
+                            wp.push(imp.substring(10, len(imp)))
+                            wp.push("?")
+                        }
+                        eprintln(wp.join(""))
+                        exit(2)
                     }
                     di = di - 1
                 }
