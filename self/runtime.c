@@ -2268,6 +2268,18 @@ static void hexa_val_arena_scope_push(void) {
     m->used = __hexa_arena.cur ? __hexa_arena.cur->used : 0;
 }
 
+// ω-interp-1 (2026-04-26): per-frame "dirty" flag — gates the expensive T33
+// Fix 4 walk over array_store[idx] in hexa_val_heapify. Set whenever a push
+// (or any other path that may store an arena-allocated child Val into a
+// slot's items buffer) occurs inside an active arena frame. Cleared on
+// scope_push so each frame starts clean.
+//
+// Without this, every fn-arena return for a TAG_ARRAY interpreter Val
+// triggered the slot walk unconditionally, turning tight push loops
+// (anima_audio.hexa vocal_hexa() — 4800 .push() calls per call) into O(N²).
+// Repro: /tmp/test_push_n.hexa.
+static int __hexa_arena_slot_dirty = 0;
+
 // Pop scope mark and rewind arena to it. Caller must have heapified any Val
 // that escapes the popped scope BEFORE calling this. If the stack is empty
 // (under-pop), no-op (defensive).
@@ -2496,8 +2508,6 @@ HexaVal hexa_val_heapify(HexaVal v) {
                 if (HX_IS_ARRAY(array_store) && HX_ARR_ITEMS(array_store)) {
                     int64_t idx = HX_VSF(v, int_val);
                     if (idx >= 0 && idx < (int64_t)HX_ARR_LEN(array_store)) {
-                        // The slot itself is a TAG_ARRAY HexaVal (host array
-                        // of element Vals). Heapifying it walks each element.
                         HX_ARR_ITEMS(array_store)[idx] =
                             hexa_val_heapify(HX_ARR_ITEMS(array_store)[idx]);
                     }

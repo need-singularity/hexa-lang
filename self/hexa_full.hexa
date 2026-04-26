@@ -17526,11 +17526,56 @@ fn array_is_sole_owner(idx) {
     return true
 }
 
+// ω-interp-1 (2026-04-26): single-binding-owner predicate for push.
+//
+// Background: env_define always increments the array refcount by 1 when a
+// TAG_ARRAY value is bound to a name. So a freshly allocated `let mut x = []`
+// has refcount = 2 (val_array=1 + env_define=2), not 1. The original
+// `array_is_sole_owner` (refcount <= 1) therefore NEVER fires for env-bound
+// arrays — every push allocates a fresh array_store slot via COW. Combined
+// with M4-fix (freelist disabled), this caused monotonic array_store growth:
+// 4800 .push() calls inside vocal_hexa() leaked 4800 dead slots per call,
+// hanging on the 2nd+ invocation when host array_store realloc/COW costs
+// dominated. Repro: see /tmp/test_push_small.hexa (500 push x 5 calls
+// showed 99→103→118→137→161ms scaling without this fix).
+//
+// Fix: treat refcount <= 2 as "single binding holds it" — the binding-owner
+// is the caller, no other Val handle exists, push can mutate in-place.
+//
+// Aliasing-safety: `let y = x` (or fn-arg passing) goes through env_define
+// which increments to >=3, so `x.push(1)` afterward correctly hits the COW
+// path. Shared structs (set_struct_field) also incref via array_incref,
+// pushing the count past the threshold. Truncated to push only — truncate
+// and cow_copy_on_write keep the strict <=1 check (those paths must NOT
+// mutate even an env-bound array if any other handle could observe it).
+//
+// M4-fix invariant preserved: freelist remains disabled (array_decref does
+// not push to array_free_list). This fix only changes WHEN we mutate vs
+// allocate — not whether reclaimed slots get reused.
+fn array_is_push_sole_owner(idx) {
+    if idx >= 0 && idx < len(array_refcounts) {
+        return array_refcounts[idx] <= 2
+    }
+    return true
+}
+
 // array_push_inplace: O(1) amortized push when sole owner, else COW.
 // Returns a Val pointing to the (possibly new) array slot.
+//
+// ω-interp-1 (2026-04-26): @no_arena suppresses __hexa_fn_arena_enter/return
+// emission. Without it, every call to array_push_inplace fires
+// __hexa_fn_arena_return → hexa_val_heapify(arr_val) → T33 Fix 4 walk over
+// array_store[idx] (the entire current samples buffer). For 4800 .push()
+// calls in vocal_hexa() that's O(N²) heapify work per call (~11M ops at
+// N=4800), and accumulates across calls because previously-bound TAG_VALSTRUCT
+// fields keep pointing at heap targets that still get re-walked. The push
+// fast path returns its INPUT arr_val (already heap-side, no arena Vals
+// allocated by this fn) — no escape analysis is needed, so skipping the
+// fn-arena machinery is correctness-safe here.
+@no_arena
 fn array_push_inplace(arr_val, item) {
     let idx = arr_val.int_val
-    if array_is_sole_owner(idx) {
+    if array_is_push_sole_owner(idx) {
         // Sole owner: mutate the backing store directly (host .push is O(1) amortized)
         let items = array_store[idx]
         array_store[idx] = items.push(item)
