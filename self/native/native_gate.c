@@ -234,10 +234,115 @@ static int refuse_raw20(const char *path, int flags) {
     return 0;
 }
 
+// ─── hexa-lang self-edit allowance — raw.hexa_lang_improvement gate ──
+//
+// Background mirrors self/sbpl/native.sb#hexa-lang block. Universal
+// raw#8 already blocks .py/.rs/.sh/.toml everywhere; the 19 grand-
+// fathered foreign-ext files in /Users/<u>/core/hexa-lang/ would
+// therefore be unwritable in production sessions. SBPL cannot read
+// env so it relies on agent-layer pre_tool_guard.hexa as primary; on
+// Linux LD_PRELOAD we CAN read env, so the dev toggle gates here
+// directly:
+//
+//   HIVE_HEXA_LANG_IMPROVEMENT=1  → hexa-lang foreign-ext writes
+//                                    permitted (full 19-file allow +
+//                                    new files). Production sessions
+//                                    never set this — hive/coding-agent
+//                                    propagates only when the user
+//                                    enables raw.hexa_lang_improvement
+//                                    in /hive selector (defaultOn=false).
+//
+//   unset / 0                      → grandfather-list-only allow:
+//                                    only the 19 audited files match
+//                                    is_grandfathered_hexa_lang_path();
+//                                    new foreign-ext writes get EPERM.
+//
+// Detection. We compare path against $HOME/core/hexa-lang/ prefix.
+// $HOME may be unset (boot, daemons) — fall back to scanning the path
+// for "/core/hexa-lang/" substring (matches refuse_raw6 style).
+static int is_under_hexa_lang(const char *path) {
+    if (!path) return 0;
+    return strstr(path, "/core/hexa-lang/") != NULL;
+}
+
+static int dev_toggle_on(void) {
+    const char *v = getenv("HIVE_HEXA_LANG_IMPROVEMENT");
+    return v && v[0] && strcmp(v, "0") != 0;
+}
+
+// 19 grandfathered files (audited 2026-04-26). Match by suffix from
+// the hexa-lang root segment so /Users/<any>/core/hexa-lang/<rel>
+// works regardless of $HOME. The trailing $ in the SBPL regex is
+// equivalent to ends_with() here.
+static const char *HEXA_LANG_GRANDFATHER_SUFFIXES[] = {
+    "/core/hexa-lang/hexa.toml",
+    "/core/hexa-lang/tool/install_darwin_marker.sh",
+    "/core/hexa-lang/tool/extract_runtime_hi.sh",
+    "/core/hexa-lang/scripts/safe_hexa_launchd.sh",
+    "/core/hexa-lang/stdlib/anima_audio_worker.py",
+    "/core/hexa-lang/tool/emergency/raw_reset.sh",
+    "/core/hexa-lang/tool/emergency/raw_sudo_unlock.sh",
+    "/core/hexa-lang/tests/integration/run_all.sh",
+    NULL
+};
+
+static int is_grandfathered_hexa_lang_path(const char *path) {
+    if (!path) return 0;
+    for (int i = 0; HEXA_LANG_GRANDFATHER_SUFFIXES[i]; i++) {
+        if (ends_with(path, HEXA_LANG_GRANDFATHER_SUFFIXES[i])) return 1;
+    }
+    // 11 numbered integration test scripts: tests/integration/<NN>_<name>/test.sh
+    // Match suffix /test.sh under /tests/integration/<digit-prefixed>_<...>/
+    const char *hit = strstr(path, "/core/hexa-lang/tests/integration/");
+    if (hit) {
+        const char *rest = hit + strlen("/core/hexa-lang/tests/integration/");
+        // first char must be digit (01_..11_)
+        if (rest[0] >= '0' && rest[0] <= '9') {
+            if (ends_with(path, "/test.sh")) return 1;
+        }
+    }
+    return 0;
+}
+
+// Returns 1 if the path is a hexa-lang foreign-ext file we should
+// gate. Returns 0 if the path is outside hexa-lang or not a foreign
+// ext (let the universal rules decide).
+static int hexa_lang_foreign_ext(const char *path) {
+    if (!is_under_hexa_lang(path)) return 0;
+    return ends_with(path, ".py") || ends_with(path, ".rs")
+        || ends_with(path, ".sh") || ends_with(path, ".toml");
+}
+
+// Decision for hexa-lang scope:
+//   dev toggle ON  → never refuse here (universal raw#8 still applies
+//                    elsewhere; we let the toggle owner do all writes
+//                    inside hexa-lang including new files).
+//   toggle OFF     → grandfather-list-only allow; everything else under
+//                    hexa-lang foreign-ext refuses with EPERM.
+static int refuse_hexa_lang_scope(const char *path) {
+    if (!hexa_lang_foreign_ext(path)) return 0;
+    if (dev_toggle_on()) return 0;
+    if (is_grandfathered_hexa_lang_path(path)) return 0;
+    return 1;
+}
+
 static int refuse(const char *path, int flags) {
     if (opt_out()) return 0;
     if (!path || !is_write_flag(flags)) return 0;
     if (on_allowlist(path)) return 0;
+    // hexa-lang scope check runs BEFORE universal raw#8 so the dev
+    // toggle can rescue grandfathered files that would otherwise be
+    // caught by the universal foreign-ext deny. When toggle is OFF
+    // and the file is non-grandfathered, refuse here; when toggle is
+    // ON, let the path through (skip raw#8 for hexa-lang scope).
+    if (refuse_hexa_lang_scope(path)) return 1;
+    if (is_under_hexa_lang(path) && hexa_lang_foreign_ext(path)) {
+        // either dev_toggle_on or grandfathered — explicit allow.
+        if (refuse_raw13(path)) return 1;        // raw#13 still applies
+        if (refuse_raw20(path, flags)) return 1; // raw#20 .own gate
+        if (refuse_raw6(path)) return 1;         // raw#6 folder-naming
+        return 0;
+    }
     for (int i = 0; BANNED_SUFFIXES[i]; i++) {
         if (ends_with(path, BANNED_SUFFIXES[i])) return 1;
     }
