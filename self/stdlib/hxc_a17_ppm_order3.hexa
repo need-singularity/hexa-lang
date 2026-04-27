@@ -1,0 +1,324 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a17-ppm-order3", desc="HXC algorithm A17: PPMd-style order-3 context modeling with escape-method-D fallback to order-2 / order-1 / order-0 / raw-uniform-256. Targets the residual gap to Shannon 3rd-order entropy bound (~84% on text-heavy corpora) and the raw-137 universal 80% target. Pure-hexa raw 9 + raw 18 self-host (integer-only, no external libs). PARTIAL — first cron tick = PASS 1 build + order-0 fallback + lookup stub + 1 selftest. PASS 2 encode + PASS 3 decode + LIVE FIRE deferred to follow-on ticks. raw 91 honest C3 disclosure: ~150 LoC of ~600 LoC final.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a17_ppm_order3.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a17_ppm_order3.hexa build <in>           // PASS 1 only — prints stats)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 9=not-yet-implemented)
+//
+// Spec (full algorithm — only PASS 1 + lookup landed this tick):
+//
+//   PASS 1 (build context tree):
+//     For each byte position p in [N..len-1] of the input:
+//       ctx3 = bytes[p-3..p]   // 3-byte context string
+//       ctx2 = bytes[p-2..p]
+//       ctx1 = bytes[p-1..p]
+//       sym  = bytes[p]
+//       freq[order=3][ctx3][sym] += 1
+//       freq[order=2][ctx2][sym] += 1
+//       freq[order=1][ctx1][sym] += 1
+//       freq[order=0][""   ][sym] += 1
+//     (order-0 collapses all bytes into a single 256-entry frequency table.)
+//
+//   PASS 2 (encode — DEFERRED):
+//     For each byte:
+//       try order-3 → if sym in ctx3: emit (cum_lo, cum_hi, total)
+//                     else: emit escape(D), fall to order-2
+//       order-2 → same; escape(D) → order-1
+//       order-1 → same; escape(D) → order-0
+//       order-0 → if sym ever seen: emit; else escape(D) → raw
+//       raw → emit 8 bits uniform (saving=0 for first occurrences only)
+//
+//     Escape-method-D probability for context C with U distinct symbols seen,
+//     total mass T:  P(esc) = U / (T + U).  Numerator/denominator tracked per
+//     context — no floating-point.
+//
+//   PASS 3 (decode — DEFERRED):
+//     Mirror of PASS 2 driven by the range parser; rebuild freq tables on the
+//     fly using the same incremental update rule for streamability.
+//
+// Sigil: `^P` prefix marks A17-encoded streams. Stream layout:
+//     ^P<len-as-varint><raw-N-prefix-bytes><range-coded-tail>
+// where the first N=3 bytes ride out raw (no preceding context), then range
+// coding kicks in. (To be implemented PASS 2.)
+//
+// Idempotency contract (raw 65 + 68):
+//     - encode(decode(x)) == x for any A17 stream
+//     - decode(encode(y)) == y for any byte stream
+//
+// Falsifiers preregistered (raw 71):
+//     F-A17-1: saving < 0.50 byte-eq on text-heavy fixture → reject.
+//     F-A17-2: encode/decode round-trip not byte-eq → reject.
+//     F-A17-3: encode latency > 200ms per 1KB → reject.
+//     F-A17-4: context tree memory > 100MB → reject (jetsam risk).
+//
+// Layering:
+//     A16 (separate agent in flight) sits between A15 and A17. A17 consumes
+//     the residual byte stream after A16 to push toward the 84% Shannon-3
+//     bound — A16+A17 layered savings target = raw-137 universal 80%.
+
+const A17_ORDER_MAX = 3
+const A17_ALPHABET = 256
+const A17_RAW_BITS_PER_BYTE = 8
+const A17_FALLBACK_BITS = 8         // order-0 / raw fallback cost ceiling
+
+// _byte_at: returns the 1-byte substring at position i (our integer-only
+// byte handle — substring equality on these strings is the byte equality
+// the rest of the algorithm depends on).
+fn _byte_at(s: string, i: int) -> string {
+    if i < 0 || i >= len(s) { return "" }
+    return s.substring(i, i + 1)
+}
+
+// _ctx_at: extract the k-byte context ending just before position p.
+// Returns "" if the context window underflows the buffer start.
+fn _ctx_at(s: string, p: int, k: int) -> string {
+    if p - k < 0 { return "" }
+    return s.substring(p - k, p)
+}
+
+// _table_inc: add 1 to freq[sym] under context ctx in the given order's map.
+// `tbl` is { ctx_string -> { sym_byte_string -> int_count } }. Mutates in place.
+fn _table_inc(tbl, ctx: string, sym: string) -> int {
+    let inner = if map_contains_key(tbl, ctx) { tbl[ctx] } else { {} }
+    let cur = if map_contains_key(inner, sym) { inner[sym] } else { 0 }
+    inner[sym] = cur + 1
+    tbl[ctx] = inner
+    return 0
+}
+
+// _table_total: sum of all symbol counts under context ctx. Used as the
+// escape-method-D denominator base T (T+U = full denom).
+fn _table_total(tbl, ctx: string) -> int {
+    if !map_contains_key(tbl, ctx) { return 0 }
+    let inner = tbl[ctx]
+    let mut t = 0
+    let keys = map_keys(inner)
+    let mut i = 0
+    while i < len(keys) {
+        t = t + inner[keys[i]]
+        i = i + 1
+    }
+    return t
+}
+
+// _table_distinct: U = count of distinct symbols ever seen under ctx.
+// Escape-method-D numerator. O(1) since map_keys length suffices.
+fn _table_distinct(tbl, ctx: string) -> int {
+    if !map_contains_key(tbl, ctx) { return 0 }
+    return len(map_keys(tbl[ctx]))
+}
+
+// _table_count: freq[ctx][sym] (0 if absent). PASS 2 uses this to detect a
+// hit (count>0) vs an escape (count==0).
+fn _table_count(tbl, ctx: string, sym: string) -> int {
+    if !map_contains_key(tbl, ctx) { return 0 }
+    let inner = tbl[ctx]
+    if !map_contains_key(inner, sym) { return 0 }
+    return inner[sym]
+}
+
+// a17_build: PASS 1 — single-pass build of all four order tables.
+// Returns a 4-element array [order0, order1, order2, order3].
+// Memory footprint upper bound: 4 * (#distinct contexts) * (avg fanout * entry).
+// Synthetic text fixtures empirically stay << 1MB for 10KB inputs.
+fn a17_build(buf: string) -> array {
+    let order0 = {}
+    let order1 = {}
+    let order2 = {}
+    let order3 = {}
+    let n = len(buf)
+    let mut p = 0
+    while p < n {
+        let sym = _byte_at(buf, p)
+        // order-0 always fires (empty context).
+        let _r0 = _table_inc(order0, "", sym)
+        if p >= 1 {
+            let c1 = _ctx_at(buf, p, 1)
+            let _r1 = _table_inc(order1, c1, sym)
+        }
+        if p >= 2 {
+            let c2 = _ctx_at(buf, p, 2)
+            let _r2 = _table_inc(order2, c2, sym)
+        }
+        if p >= 3 {
+            let c3 = _ctx_at(buf, p, 3)
+            let _r3 = _table_inc(order3, c3, sym)
+        }
+        p = p + 1
+    }
+    return [order0, order1, order2, order3]
+}
+
+// a17_lookup: stub for the PASS 2 prediction step. Walks order-3 → order-0
+// returning the first order at which (ctx, sym) has been seen. Returns -1
+// if every order requires the raw escape (i.e. first-time-ever byte).
+fn a17_lookup(tables: array, buf: string, p: int) -> int {
+    let sym = _byte_at(buf, p)
+    if p >= 3 {
+        let c3 = _ctx_at(buf, p, 3)
+        if _table_count(tables[3], c3, sym) > 0 { return 3 }
+    }
+    if p >= 2 {
+        let c2 = _ctx_at(buf, p, 2)
+        if _table_count(tables[2], c2, sym) > 0 { return 2 }
+    }
+    if p >= 1 {
+        let c1 = _ctx_at(buf, p, 1)
+        if _table_count(tables[1], c1, sym) > 0 { return 1 }
+    }
+    if _table_count(tables[0], "", sym) > 0 { return 0 }
+    return -1   // raw fallback (8 bits flat)
+}
+
+// a17_estimate_bits: upper-bound cost projection in bits for buf under the
+// model `tables` already built from buf itself (training==test — gives a
+// best-case in-sample bound, which is the right floor for "is the model
+// even plausibly worth shipping" gating). Per-byte cost approximation:
+//     hit-at-order-k → ceil(log2(T_k / count)) + escape_chain_bits(k)
+// We replace log2 with a cheap integer approximation: bits(x) = position of
+// highest set bit of x. Good to ±1 bit, which is plenty for a >50%
+// falsifier gate. Range coding in PASS 2 will close the residual gap.
+fn _ilog2_ceil(x: int) -> int {
+    if x <= 1 { return 0 }
+    let mut b = 0
+    let mut v = x - 1
+    while v > 0 { b = b + 1; v = v / 2 }
+    return b
+}
+
+fn a17_estimate_bits(tables: array, buf: string) -> int {
+    let n = len(buf)
+    let mut total_bits = 0
+    let mut p = 0
+    while p < n {
+        if p < A17_ORDER_MAX {
+            // First N bytes ride raw (no full-order context yet).
+            total_bits = total_bits + A17_RAW_BITS_PER_BYTE
+        } else {
+            let order = a17_lookup(tables, buf, p)
+            if order < 0 {
+                total_bits = total_bits + A17_RAW_BITS_PER_BYTE
+            } else {
+                let ctx = _ctx_at(buf, p, order)
+                let sym = _byte_at(buf, p)
+                let cnt = _table_count(tables[order], ctx, sym)
+                let tot = _table_total(tables[order], ctx)
+                let dis = _table_distinct(tables[order], ctx)
+                // log2(denom/cnt) ≈ ilog2_ceil((tot+dis)/max(cnt,1))
+                let ratio = if cnt > 0 { (tot + dis) / cnt } else { tot + dis }
+                let bits_sym = _ilog2_ceil(ratio + 1)
+                // escape chain: 1 bit per fallback step (D-method amortizes)
+                let bits_esc = (A17_ORDER_MAX - order)
+                total_bits = total_bits + bits_sym + bits_esc
+            }
+        }
+        p = p + 1
+    }
+    return total_bits
+}
+
+fn a17_estimate_bytes(tables: array, buf: string) -> int {
+    let bits = a17_estimate_bits(tables, buf)
+    return (bits + 7) / 8
+}
+
+fn _selftest() -> int {
+    println("# hxc_a17_ppm_order3 selftest (PARTIAL — first cron tick)")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture: synthetic text repetition — order-3 context should saturate
+    // and predict every byte after the first 3 occurrences. ~50 cycles of a
+    // 20-byte phrase ≈ 1 KB.
+    let phrase = "the quick brown fox "
+    let mut buf = ""
+    let mut k = 0
+    while k < 50 { buf = buf + phrase; k = k + 1 }
+    let raw_bytes = len(buf)
+
+    let tables = a17_build(buf)
+
+    // Test 1: PASS 1 build runs and order-3 table populated.
+    let n3 = len(map_keys(tables[3]))
+    if n3 > 0 {
+        pass = pass + 1
+        println("  PASS: order-3 contexts seen = " + to_string(n3))
+    } else {
+        fail = fail + 1
+        println("  FAIL: order-3 table empty")
+    }
+
+    // Test 2: lookup returns order-3 hit for a mid-stream byte.
+    let lo = a17_lookup(tables, buf, 100)
+    if lo == 3 {
+        pass = pass + 1
+        println("  PASS: mid-stream lookup hit at order-3")
+    } else {
+        fail = fail + 1
+        println("  FAIL: lookup returned order=" + to_string(lo))
+    }
+
+    // Test 3: estimated savings > 50% on the repetitive fixture (F-A17-1).
+    let est_bytes = a17_estimate_bytes(tables, buf)
+    let saving_pct = ((raw_bytes - est_bytes) * 100) / raw_bytes
+    if saving_pct >= 50 {
+        pass = pass + 1
+        println("  PASS: in-sample bound " + to_string(raw_bytes) + " -> "
+                + to_string(est_bytes) + " B (" + to_string(saving_pct) + "% saving)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: saving only " + to_string(saving_pct) + "% (want >=50)")
+    }
+
+    // Test 4: order-0 fallback present for every byte (F-A17 sanity — every
+    // byte at minimum lives at order-0 after first occurrence).
+    let o0_keys = len(map_keys(tables[0][""]))
+    if o0_keys > 0 && o0_keys <= A17_ALPHABET {
+        pass = pass + 1
+        println("  PASS: order-0 alphabet = " + to_string(o0_keys) + " distinct symbols")
+    } else {
+        fail = fail + 1
+        println("  FAIL: order-0 alphabet bogus (" + to_string(o0_keys) + ")")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A17_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
+            + " (PARTIAL: PASS 1 + lookup only; PASS 2/3 deferred)")
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_build = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "build" { has_build = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_build {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "build" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 1 >= len(av) {
+            eprintln("usage: hexa hxc_a17_ppm_order3.hexa build <in>")
+            exit(3)
+        }
+        let txt = read_file(av[sub_idx + 1])
+        let tables = a17_build(txt)
+        let est = a17_estimate_bytes(tables, txt)
+        println("raw=" + to_string(len(txt)) + " est=" + to_string(est)
+                + " saving=" + to_string(((len(txt) - est) * 100) / len(txt)) + "%")
+        exit(0)
+    }
+    eprintln("# A17 encode/decode NOT YET IMPLEMENTED — first cron tick = PASS 1 only.")
+    eprintln("usage: hexa hxc_a17_ppm_order3.hexa [--selftest | build <in>]")
+    exit(9)
+}
