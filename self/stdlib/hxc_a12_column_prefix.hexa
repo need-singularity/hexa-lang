@@ -95,17 +95,18 @@ fn _split_top_level_pipes(s: string) -> array {
 
 // ───────────────────── detect prefix per column ─────────────────────
 
-// Returns array of [col_id, prefix_string] entries for eligible columns.
+// Phase 8 P2: multi-prefix-per-column extension.
+// Returns array of [col_id, prefix_string] entries — multiple entries per col_id allowed
+// when top-K prefixes at the same length combine to ≥THRESHOLD% coverage.
+// Each prefix gets its own symbol; encode chooses best-matching prefix per row.
 fn _detect_prefix_columns(rows: array) -> array {
     let mut out = []
     if len(rows) < A12_MIN_ROWS { return out }
-    // Find column count from first row
     let first_cols = _split_top_level_pipes(rows[0])
     let n_cols = len(first_cols)
     let mut col_id = 0
     let mut col_count = 0
     while col_id < n_cols && col_count < A12_MAX_COLS {
-        // Collect all values in this column
         let mut vals = []
         let mut r = 0
         while r < len(rows) {
@@ -114,12 +115,15 @@ fn _detect_prefix_columns(rows: array) -> array {
             r = r + 1
         }
         if len(vals) < A12_MIN_ROWS { col_id = col_id + 1; continue }
-        // Find best prefix: greedy starting from longest possible
-        let mut best_prefix = ""
-        let mut best_count = 0
+
+        // Phase 8 P2 multi-prefix scan: try LONGEST p_len first.
+        // At each p_len, find top-K most frequent prefixes whose combined coverage
+        // ≥THRESHOLD% — that p_len wins. K bounded by A12_MAX_DICT_PER_COL.
+        let mut best_p_len = 0
+        let mut best_prefixes = []
+        let mut best_coverage = 0
         let mut p_len = A12_MAX_PREFIX_LEN
         while p_len >= A12_MIN_PREFIX_LEN {
-            // Build prefix freq map
             let mut prefixes = []
             let mut counts = []
             let mut v = 0
@@ -136,34 +140,60 @@ fn _detect_prefix_columns(rows: array) -> array {
                     if found >= 0 {
                         counts[found] = counts[found] + 1
                     } else {
-                        if len(prefixes) < A12_MAX_DICT_PER_COL {
-                            prefixes.push(prefix)
-                            counts.push(1)
-                        }
+                        prefixes.push(prefix)
+                        counts.push(1)
                     }
                 }
                 v = v + 1
             }
-            // Find max count
-            let mut max_idx = -1
-            let mut max_cnt = 0
-            let mut k = 0
-            while k < len(prefixes) {
-                if counts[k] > max_cnt { max_cnt = counts[k]; max_idx = k }
-                k = k + 1
+            // Sort prefixes by count desc, take top-K
+            let mut top_prefixes = []
+            let mut covered = 0
+            let mut k_count = 0
+            while k_count < A12_MAX_DICT_PER_COL && len(prefixes) > 0 {
+                let mut max_idx = -1
+                let mut max_cnt = 0
+                let mut k = 0
+                while k < len(prefixes) {
+                    if counts[k] > max_cnt { max_cnt = counts[k]; max_idx = k }
+                    k = k + 1
+                }
+                if max_idx < 0 { break }
+                if max_cnt == 0 { break }
+                top_prefixes.push(prefixes[max_idx])
+                covered = covered + max_cnt
+                counts[max_idx] = 0  // mark consumed
+                k_count = k_count + 1
             }
-            let pct_x100 = (max_cnt * 100) / len(vals)
-            if pct_x100 >= A12_THRESHOLD_X100 {
-                best_prefix = prefixes[max_idx]
-                best_count = max_cnt
-                break  // longest acceptable prefix wins
+            let coverage_x100 = (covered * 100) / len(vals)
+            // Phase 8 P2: net savings calc INCLUDES dict header overhead.
+            //   covered_bytes_saved = covered * (p_len - 3)  // per-row save: p_len chars → 3-byte symbol
+            //   header_overhead = K_prefixes * (~25 byte_format + p_len)
+            //   net = covered_bytes_saved - header_overhead
+            // Threshold gate: coverage ≥80% AND net savings > 0.
+            if coverage_x100 >= A12_THRESHOLD_X100 {
+                let saved_per_row = if p_len > 3 { p_len - 3 } else { 0 }
+                let total_saved = covered * saved_per_row
+                let header_overhead = len(top_prefixes) * (25 + p_len)
+                let net_savings = total_saved - header_overhead
+                let best_total = best_coverage * (if best_p_len > 3 { best_p_len - 3 } else { 0 })
+                let best_header = len(best_prefixes) * (25 + best_p_len)
+                let best_net = best_total - best_header
+                if net_savings > best_net && net_savings > 0 {
+                    best_p_len = p_len
+                    best_prefixes = top_prefixes
+                    best_coverage = covered
+                }
             }
             p_len = p_len - 1
         }
-        if len(best_prefix) >= A12_MIN_PREFIX_LEN {
-            out.push([to_string(col_id), best_prefix])
-            col_count = col_count + 1
+        // Emit all detected prefixes for this column
+        let mut bp = 0
+        while bp < len(best_prefixes) {
+            out.push([to_string(col_id), best_prefixes[bp]])
+            bp = bp + 1
         }
+        if len(best_prefixes) > 0 { col_count = col_count + 1 }
         col_id = col_id + 1
     }
     return out
@@ -244,18 +274,21 @@ fn a12_encode(v1_text: string) -> string {
     while s < len(schema_rows) {
         let rows = schema_rows[s]
         let detected = _detect_prefix_columns(rows)
-        // Emit dict declarations + build sym table
+        // Emit dict declarations + build sym table — bound to alphabet length (16).
         let mut d = 0
-        while d < len(detected) {
+        while d < len(detected) && d < len(A12_SYMBOL_ALPHABET) {
             let col_id = detected[d][0]
             let prefix = detected[d][1]
             let symbol = A12_SYMBOL_ALPHABET.substring(d, d + 1)
             out.push("# col-prefix:s" + to_string(s + 1) + " " + col_id + " " + symbol + "=" + prefix)
-            // store symbol back into detected for use during encode
             detected[d].push(symbol)
             d = d + 1
         }
-        // Phase 8 P1 IMPL: per-row prefix-symbol replacement on eligible columns.
+        // Truncate detected to assigned-symbol entries only
+        while len(detected) > d {
+            detected.pop()
+        }
+        // Phase 8 P2: per-row encoding picks BEST matching prefix from multi-prefix dict.
         let mut r = 0
         while r < len(rows) {
             let parts = _split_top_level_pipes(rows[r])
@@ -263,19 +296,25 @@ fn a12_encode(v1_text: string) -> string {
             let mut p = 0
             while p < len(parts) {
                 let mut val = parts[p]
-                // Check if this column has a detected prefix
+                // Find best matching detected entry: longest prefix that val starts with
+                let mut best_match = -1
+                let mut best_match_len = 0
                 let mut dd = 0
-                let mut hit = false
                 while dd < len(detected) {
                     if parse_int(detected[dd][0]) == p {
-                        val = _replace_prefix(val, detected[dd][1], detected[dd][2])
-                        hit = true
-                        break
+                        let pref = detected[dd][1]
+                        let pl = len(pref)
+                        if len(val) >= pl && val.substring(0, pl) == pref && pl > best_match_len {
+                            best_match = dd
+                            best_match_len = pl
+                        }
                     }
                     dd = dd + 1
                 }
-                if !hit {
-                    // Even non-eligible columns need disambiguation if they start with `^P`
+                if best_match >= 0 {
+                    val = _replace_prefix(val, detected[best_match][1], detected[best_match][2])
+                } else {
+                    // Disambiguation only — column has prefix dict but this row doesn't match
                     if len(val) >= 2 && val.substring(0, 2) == "^P" {
                         val = "^P^" + val
                     }
