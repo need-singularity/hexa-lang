@@ -1,0 +1,624 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a15-nested-subschema", desc="HXC algorithm A15: nested-array subschema dedup. Detects column values matching JSON array-of-objects pattern [{k1:v1,...},{k1:v1,...}] where inner objects share keys. Emits keys-once declaration + replaces each object with (v1|v2|...) tuple. Targets triad_audit/audit.jsonl violations[] residual after A4 identical-subtree dedup (similar-shape vs byte-identical orthogonal axes). Pure-hexa raw 9.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a15_nested_subschema.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a15_nested_subschema.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a15_nested_subschema.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// Spec:
+//   PASS 1 (detect): scan first row's columns for JSON array-of-objects pattern.
+//     Column eligible if val starts with `[{` and ends with `}]` and contains `},{` separator.
+//     Parse first object's keys from `"key":value` pairs. Verify ≥80% subsequent rows
+//     have same column with same key set.
+//
+//   PASS 2 (encode): emit `# subschema:s<N> <col_id> keys=k1|k2|...|kN` declaration.
+//     For each row's eligible column:
+//       - Strip outer `[]`
+//       - Split inner by `},{`
+//       - For each object, extract values in declared key order
+//       - Re-emit as `^[(v1|v2|...|vN);(v1|v2|...|vN);...]`
+//     Sigil `^[` marks A15-encoded array (disambiguates from natural `[`).
+//
+//   PASS 3 (decode): parse `# subschema:` headers into per-schema map.
+//     For `^[...]` cells, split by `;`, re-expand tuples to objects.
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) == x for any A15 stream
+//   - decode(encode(y)) == y for any HXC v1 stream
+//
+// Falsifiers (raw 71):
+//   F-A15-1: saving < 0.05 byte-eq → reject (need amortization).
+//   F-A15-2: encode/decode round-trip not byte-eq → reject.
+//   F-A15-3: detect false-positive on non-array-of-objects → reject.
+
+const A15_MIN_OBJECTS = 3   // need ≥3 objects per array for dict overhead amortization
+const A15_MIN_ROWS = 4
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _read_file(p: string) -> string { return read_file(p) }
+fn _write_file(p: string, c: string) -> int {
+    let _r = write_file(p, c)
+    return 0
+}
+
+// _split_top_level_pipes — quote-aware (preserves JSON within quotes)
+fn _split_top_level_pipes(s: string) -> array {
+    let mut segs = []
+    let mut depth_brace = 0
+    let mut depth_bracket = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut start = 0
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if in_str {
+            if c == "\\" { esc = true }
+            else if c == "\"" { in_str = false }
+        } else {
+            if c == "\"" { in_str = true }
+            else if c == "{" { depth_brace = depth_brace + 1 }
+            else if c == "}" { depth_brace = depth_brace - 1 }
+            else if c == "[" { depth_bracket = depth_bracket + 1 }
+            else if c == "]" { depth_bracket = depth_bracket - 1 }
+            else if c == "|" && depth_brace == 0 && depth_bracket == 0 {
+                segs.push(s.substring(start, i))
+                start = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if start <= len(s) { segs.push(s.substring(start, len(s))) }
+    return segs
+}
+
+// _split_objects_in_array: given `{...},{...},{...}` (no outer []),
+// split into individual `{...}` objects respecting nested braces + strings.
+fn _split_objects_in_array(s: string) -> array {
+    let mut objs = []
+    let mut depth = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut start = 0
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if in_str {
+            if c == "\\" { esc = true }
+            else if c == "\"" { in_str = false }
+        } else {
+            if c == "\"" { in_str = true }
+            else if c == "{" {
+                if depth == 0 { start = i }
+                depth = depth + 1
+            }
+            else if c == "}" {
+                depth = depth - 1
+                if depth == 0 {
+                    objs.push(s.substring(start, i + 1))
+                }
+            }
+        }
+        i = i + 1
+    }
+    return objs
+}
+
+// _parse_object_keys: given `{"k1":v1,"k2":v2,...}` extract array of keys.
+fn _parse_object_keys(obj: string) -> array {
+    let mut keys = []
+    if len(obj) < 2 || obj.substring(0, 1) != "{" { return keys }
+    let inner = obj.substring(1, len(obj) - 1)
+    // Walk char by char, find `"key":` patterns at top level
+    let mut depth = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut key_start = -1
+    let mut i = 0
+    while i < len(inner) {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if in_str {
+            if c == "\\" { esc = true }
+            else if c == "\"" {
+                in_str = false
+                if key_start >= 0 {
+                    // Check if next non-space char is ':'
+                    let mut j = i + 1
+                    while j < len(inner) && (inner.substring(j, j + 1) == " " || inner.substring(j, j + 1) == "\t") { j = j + 1 }
+                    if j < len(inner) && inner.substring(j, j + 1) == ":" {
+                        keys.push(inner.substring(key_start + 1, i))
+                    }
+                    key_start = -1
+                }
+            }
+        } else {
+            if c == "{" || c == "[" { depth = depth + 1 }
+            else if c == "}" || c == "]" { depth = depth - 1 }
+            else if c == "\"" && depth == 0 {
+                in_str = true
+                key_start = i
+            }
+        }
+        i = i + 1
+    }
+    return keys
+}
+
+// _parse_object_values: given `{"k1":v1,"k2":v2,...}` extract array of values
+// in source order.
+fn _parse_object_values(obj: string) -> array {
+    let mut vals = []
+    if len(obj) < 2 || obj.substring(0, 1) != "{" { return vals }
+    let inner = obj.substring(1, len(obj) - 1)
+    // Find each `"key":<value>` and extract value
+    let mut depth = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut state = 0  // 0=expect-key-quote, 1=in-key, 2=expect-colon, 3=in-value
+    let mut value_start = -1
+    let mut i = 0
+    while i < len(inner) {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if state == 0 {
+            // Looking for opening quote of key
+            if c == "\"" { state = 1 }
+        } else if state == 1 {
+            // In key string
+            if c == "\\" { esc = true }
+            else if c == "\"" { state = 2 }
+        } else if state == 2 {
+            // After key, expecting colon
+            if c == ":" {
+                state = 3
+                value_start = i + 1
+            }
+        } else if state == 3 {
+            // In value — track depth + strings
+            if in_str {
+                if c == "\\" { esc = true }
+                else if c == "\"" { in_str = false }
+            } else {
+                if c == "\"" { in_str = true }
+                else if c == "{" || c == "[" { depth = depth + 1 }
+                else if c == "}" || c == "]" { depth = depth - 1 }
+                else if c == "," && depth == 0 {
+                    vals.push(inner.substring(value_start, i).trim())
+                    state = 0
+                    value_start = -1
+                }
+            }
+        }
+        i = i + 1
+    }
+    if state == 3 && value_start >= 0 {
+        vals.push(inner.substring(value_start, len(inner)).trim())
+    }
+    return vals
+}
+
+fn _is_array_of_objects(val: string) -> bool {
+    let t = val.trim()
+    if len(t) < 4 { return false }
+    if t.substring(0, 2) != "[{" { return false }
+    if t.substring(len(t) - 2, len(t)) != "}]" { return false }
+    return true
+}
+
+// Returns array of [col_id, keys_csv] for eligible columns.
+fn _detect_subschema_columns(rows: array) -> array {
+    let mut out = []
+    if len(rows) < A15_MIN_ROWS { return out }
+    let first_cols = _split_top_level_pipes(rows[0])
+    let mut col_id = 0
+    while col_id < len(first_cols) {
+        let v = first_cols[col_id]
+        if !_is_array_of_objects(v) { col_id = col_id + 1; continue }
+        // Extract keys from first object in first row's array
+        let inner = v.substring(1, len(v) - 1)  // strip outer []
+        let objs = _split_objects_in_array(inner)
+        if len(objs) < A15_MIN_OBJECTS { col_id = col_id + 1; continue }
+        let keys = _parse_object_keys(objs[0])
+        if len(keys) < 2 { col_id = col_id + 1; continue }
+        // Verify ≥80% of subsequent rows have matching key set in same col
+        let mut match_count = 1
+        let mut total = 1
+        let mut r = 1
+        while r < len(rows) {
+            let parts = _split_top_level_pipes(rows[r])
+            if col_id < len(parts) {
+                let rv = parts[col_id]
+                if _is_array_of_objects(rv) {
+                    let rinner = rv.substring(1, len(rv) - 1)
+                    let robjs = _split_objects_in_array(rinner)
+                    if len(robjs) >= 1 {
+                        let rkeys = _parse_object_keys(robjs[0])
+                        if len(rkeys) == len(keys) {
+                            let mut all_match = true
+                            let mut k = 0
+                            while k < len(keys) {
+                                if rkeys[k] != keys[k] { all_match = false; break }
+                                k = k + 1
+                            }
+                            if all_match { match_count = match_count + 1 }
+                        }
+                    }
+                }
+                total = total + 1
+            }
+            r = r + 1
+        }
+        let pct_x100 = (match_count * 100) / total
+        if pct_x100 >= 80 {
+            out.push([to_string(col_id), keys.join("|")])
+        }
+        col_id = col_id + 1
+    }
+    return out
+}
+
+fn _encode_array_value(val: string) -> string {
+    // val is `[{...},{...},...]` — re-emit as `^[t1;t2;t3]`
+    // No inner parens to confuse depth tracking; tuples joined by `;` at top level.
+    let inner = val.substring(1, len(val) - 1)
+    let objs = _split_objects_in_array(inner)
+    let mut tuples = []
+    let mut i = 0
+    while i < len(objs) {
+        let vals = _parse_object_values(objs[i])
+        tuples.push(vals.join("|"))
+        i = i + 1
+    }
+    return "^[" + tuples.join(";") + "]"
+}
+
+fn _decode_array_value(val: string, keys: array) -> string {
+    // val is `^[t1;t2;t3]` — re-expand to JSON array
+    if len(val) < 3 { return val }
+    if val.substring(0, 2) != "^[" { return val }
+    if val.substring(len(val) - 1, len(val)) != "]" { return val }
+    let inner = val.substring(2, len(val) - 1)  // strip ^[ and ]
+    // Split by `;` at top level (track strings to ignore `;` inside quoted values)
+    let mut tuples = []
+    let mut start = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut i = 0
+    while i < len(inner) {
+        let c = inner.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if in_str {
+            if c == "\\" { esc = true }
+            else if c == "\"" { in_str = false }
+        } else {
+            if c == "\"" { in_str = true }
+            else if c == ";" {
+                tuples.push(inner.substring(start, i))
+                start = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if start < len(inner) { tuples.push(inner.substring(start, len(inner))) }
+    // Re-emit as JSON array
+    let mut objs = []
+    let mut t = 0
+    while t < len(tuples) {
+        let vals_str = tuples[t]
+        // Split tuple by `|` at top level (track strings)
+        let mut vals = []
+        let mut vs_start = 0
+        let mut vin_str = false
+        let mut vesc = false
+        let mut j = 0
+        while j < len(vals_str) {
+            let vc = vals_str.substring(j, j + 1)
+            if vesc { vesc = false; j = j + 1; continue }
+            if vin_str {
+                if vc == "\\" { vesc = true }
+                else if vc == "\"" { vin_str = false }
+            } else {
+                if vc == "\"" { vin_str = true }
+                else if vc == "|" {
+                    vals.push(vals_str.substring(vs_start, j))
+                    vs_start = j + 1
+                }
+            }
+            j = j + 1
+        }
+        if vs_start <= len(vals_str) { vals.push(vals_str.substring(vs_start, len(vals_str))) }
+        let mut pairs = []
+        let mut k = 0
+        while k < len(keys) && k < len(vals) {
+            pairs.push("\"" + keys[k] + "\":" + vals[k])
+            k = k + 1
+        }
+        objs.push("{" + pairs.join(",") + "}")
+        t = t + 1
+    }
+    return "[" + objs.join(",") + "]"
+}
+
+fn a15_encode(v1_text: string) -> string {
+    let lines = v1_text.split("\n")
+    let mut schema_rows = []
+    let mut header_lines = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            header_lines.push(l)
+            schema_rows.push([])
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            if len(schema_rows) > 0 {
+                let last_idx = len(schema_rows) - 1
+                let body_start = l.find(" ")
+                let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+                schema_rows[last_idx].push(body)
+            }
+        } else if len(l) > 0 {
+            header_lines.push(l)
+        }
+        i = i + 1
+    }
+
+    let mut out = []
+    let mut h = 0
+    while h < len(header_lines) {
+        out.push(header_lines[h])
+        h = h + 1
+    }
+
+    let mut s = 0
+    while s < len(schema_rows) {
+        let rows = schema_rows[s]
+        let detected = _detect_subschema_columns(rows)
+        // Emit subschema declarations
+        let mut d = 0
+        while d < len(detected) {
+            let col_id = detected[d][0]
+            let keys = detected[d][1]
+            out.push("# subschema:s" + to_string(s + 1) + " " + col_id + " keys=" + keys)
+            d = d + 1
+        }
+        // Re-emit rows with eligible cols replaced
+        let mut r = 0
+        while r < len(rows) {
+            let parts = _split_top_level_pipes(rows[r])
+            let mut new_parts = []
+            let mut p = 0
+            while p < len(parts) {
+                let mut val = parts[p]
+                let mut is_eligible = false
+                let mut dd = 0
+                while dd < len(detected) {
+                    if parse_int(detected[dd][0]) == p {
+                        is_eligible = true
+                        break
+                    }
+                    dd = dd + 1
+                }
+                if is_eligible && _is_array_of_objects(val) {
+                    val = _encode_array_value(val)
+                }
+                new_parts.push(val)
+                p = p + 1
+            }
+            out.push("@s" + to_string(s + 1) + " " + new_parts.join("|"))
+            r = r + 1
+        }
+        s = s + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn a15_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    let mut schema_subs = []  // per-schema array of [col_id, keys_array]
+    let mut current_schema = -1
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            schema_subs.push([])
+            current_schema = len(schema_subs) - 1
+            out.push(l)
+        } else if len(l) >= 13 && l.substring(0, 13) == "# subschema:s" {
+            // Parse `# subschema:s<N> <col_id> keys=k1|k2|...`
+            let after = l.substring(13, len(l)).trim()
+            let sp = after.find(" ")
+            if sp > 0 {
+                let s_num = parse_int(after.substring(0, sp)) - 1
+                let rest = after.substring(sp + 1, len(after))
+                let sp2 = rest.find(" ")
+                if sp2 > 0 {
+                    let col_id = rest.substring(0, sp2)
+                    let keys_part = rest.substring(sp2 + 1, len(rest))
+                    if len(keys_part) >= 5 && keys_part.substring(0, 5) == "keys=" {
+                        let keys_csv = keys_part.substring(5, len(keys_part))
+                        let keys = keys_csv.split("|")
+                        if s_num >= 0 && s_num < len(schema_subs) {
+                            schema_subs[s_num].push([col_id, keys])
+                        }
+                    }
+                }
+            }
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let s_num = if len(head) > 2 { parse_int(head.substring(2, len(head))) - 1 } else { 0 }
+            if s_num < 0 || s_num >= len(schema_subs) {
+                out.push(l)
+                i = i + 1
+                continue
+            }
+            let subs = schema_subs[s_num]
+            if len(subs) == 0 {
+                out.push(l)
+                i = i + 1
+                continue
+            }
+            let parts = _split_top_level_pipes(body)
+            let mut new_parts = []
+            let mut p = 0
+            while p < len(parts) {
+                let mut val = parts[p]
+                let mut k = 0
+                while k < len(subs) {
+                    if parse_int(subs[k][0]) == p {
+                        val = _decode_array_value(val, subs[k][1])
+                        break
+                    }
+                    k = k + 1
+                }
+                new_parts.push(val)
+                p = p + 1
+            }
+            out.push(head + " " + new_parts.join("|"))
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn _selftest() -> int {
+    println("# hxc_a15_nested_subschema selftest")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture: 5 rows, col 0=ts, col 1=violations array
+    let mut rows = []
+    let mut i = 0
+    while i < 5 {
+        let arr = "[{\"rule\":\"raw " + to_string(i) + "\",\"kind\":\"missing-X\",\"detail\":\"bla " + to_string(i) + "\",\"hard\":false},{\"rule\":\"raw " + to_string(i + 100) + "\",\"kind\":\"insufficient-Y\",\"detail\":\"foo " + to_string(i) + "\",\"hard\":true},{\"rule\":\"raw " + to_string(i + 200) + "\",\"kind\":\"other-Z\",\"detail\":\"baz " + to_string(i) + "\",\"hard\":false}]"
+        rows.push("@s1 \"2026-04-26T14:00:0" + to_string(i) + "Z\"|" + arr)
+        i = i + 1
+    }
+    let fixture = "# schema:s1 ts violations\n" + rows.join("\n") + "\n"
+    let encoded = a15_encode(fixture)
+    let decoded = a15_decode(encoded)
+
+    // Test 1: subschema header emitted
+    let lines = encoded.split("\n")
+    let mut sub_count = 0
+    let mut k = 0
+    while k < len(lines) {
+        if len(lines[k]) >= 13 && lines[k].substring(0, 13) == "# subschema:s" { sub_count = sub_count + 1 }
+        k = k + 1
+    }
+    if sub_count == 1 { pass = pass + 1; println("  PASS: 1 subschema header emitted") } else { fail = fail + 1; println("  FAIL: subschema headers got " + to_string(sub_count)) }
+
+    // Test 2: encoded smaller
+    if len(encoded) < len(fixture) {
+        pass = pass + 1
+        println("  PASS: bytes saved " + to_string(len(fixture)) + " -> " + to_string(len(encoded)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: no saving " + to_string(len(fixture)) + " -> " + to_string(len(encoded)))
+    }
+
+    // Test 3: round-trip byte-eq
+    if decoded == fixture {
+        pass = pass + 1
+        println("  PASS: round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: round-trip lost bytes orig=" + to_string(len(fixture)) + " got=" + to_string(len(decoded)))
+        // print first diff
+        let mut d = 0
+        while d < len(fixture) && d < len(decoded) {
+            if fixture.substring(d, d + 1) != decoded.substring(d, d + 1) {
+                println("    diff at " + to_string(d) + ": orig='" + fixture.substring(d, d + 20) + "' got='" + decoded.substring(d, d + 20) + "'")
+                break
+            }
+            d = d + 1
+        }
+    }
+
+    // Test 4: small fixture (<MIN_ROWS) skipped
+    let small = "# schema:s1 a b\n@s1 1|[{\"x\":1}]\n@s1 2|[{\"x\":2}]\n"
+    let small_enc = a15_encode(small)
+    if small_enc == small {
+        pass = pass + 1
+        println("  PASS: small fixture passthrough (MIN_ROWS=4)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: small fixture wrongly fired")
+    }
+
+    // Test 5: non-array-of-objects col passthrough
+    let plain = "# schema:s1 a b\n"
+    let mut prows = []
+    let mut p = 0
+    while p < 6 { prows.push("@s1 " + to_string(p) + "|simple_string"); p = p + 1 }
+    let plain_full = plain + prows.join("\n") + "\n"
+    let plain_enc = a15_encode(plain_full)
+    if plain_enc == plain_full {
+        pass = pass + 1
+        println("  PASS: non-array-of-objects col passthrough")
+    } else {
+        fail = fail + 1
+        println("  FAIL: non-array-of-objects wrongly fired")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A15_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a15_nested_subschema.hexa <encode|decode> <in> <out>")
+            exit(3)
+        }
+        let in_path = av[sub_idx + 1]
+        let out_path = av[sub_idx + 2]
+        let txt = _read_file(in_path)
+        let res = if has_encode { a15_encode(txt) } else { a15_decode(txt) }
+        let _w = _write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a15_nested_subschema.hexa [--selftest | encode <in> <out> | decode <in> <out>]")
+    exit(3)
+}
