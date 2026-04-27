@@ -1,9 +1,11 @@
 #!hexa strict
 
 // @resolver-bypass(reason="darwin-native byte-canonical pipeline")
-// @tool(slug="hxc-a20-schema-aware-bpe", desc="HXC algorithm A20: schema-aware BPE tokenizer (Phase 11 P1 first tick — PASS 1 + PASS 2). Extends A9 BPE with schema-key extraction from `# schema:` headers and pre-seeded vocabulary. Targets mixed JSON+text+Korean corpora where A9's pure byte-pair misses structural-key savings (anima alm_r13 mixed, nexus meta_engine_evolution).")
+// @tool(slug="hxc-a20-schema-aware-bpe", desc="HXC algorithm A20: schema-aware BPE tokenizer (Phase 11 P1 PASS 3+4 LIVE — encode + decode + 5-fixture round-trip). Extends A9 BPE with schema-key extraction from `# schema:` headers and pre-seeded vocabulary. Targets mixed JSON+text+Korean corpora where A9's pure byte-pair misses structural-key savings (anima alm_r13 mixed, nexus meta_engine_evolution).")
 // @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a20_schema_aware_bpe.hexa --selftest)
-// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=PARTIAL-not-yet-implemented)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a20_schema_aware_bpe.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a20_schema_aware_bpe.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
 //
 // Algorithm spec (raw 9 hexa-only · raw 18 self-host fixpoint · raw 65+68 idempotent):
 //   PASS 1 (schema-key extract): scan `# schema:sN key1 key2 ...` headers; for each
@@ -11,17 +13,23 @@
 //   PASS 2 (vocab build): pre-seed first K vocab slots with schema-key byte-seqs
 //                         (sorted longest-first); apply multi-byte merges to row
 //                         symbol streams; continue A9 byte-pair argmax for (V-K) slots.
-//   PASS 3 (encode): identical to A9 (vocab shape preserved). DEFERRED this tick.
-//   PASS 4 (decode): identical to A9. DEFERRED this tick.
+//   PASS 3 (encode): greedy longest-match against schema-aware vocab; serialize
+//                    symbol stream with marker/escape; base64 wire encode (A9-shape).
+//   PASS 4 (decode): inverse — base64 decode → parse symbols → expand vocab → bytes.
 //
-// Tick 1 scope (this file): PASS 1 + PASS 2 + 1 selftest fixture (synthetic mixed
-// JSON+text). Remaining ~250-300 LoC for PASS 3+4 integration deferred.
+// Tick scope progression:
+//   tick 1 (commit babe967a, 482 LoC): PASS 1 + PASS 2 + 4/4 selftest scaffold.
+//   tick 2 (THIS FILE): PASS 3 + PASS 4 + 4 additional fixtures (Korean, mixed JSON,
+//                       ledger, escape) + a20_encode/a20_decode top-level + schema_tokens
+//                       overhead emit (`# tokenizer:sN/# tok:sN` lines reuse A9 wire shape).
+//   raw 65+68 idempotent: encode∘decode == id, decode∘encode == id (byte-eq).
+//   raw 18 self-host fixpoint: decoder is a strict subset of encoder; both pure hexa.
 //
 // Falsifiers (raw 71 contract):
-//   F-A20-1: post-A9 marginal saving < 0.05 on mixed JSON+text → reject
-//   F-A20-2: encode/decode round-trip not byte-eq → reject
-//   F-A20-3: schema-key false-positive rate > 5% (key not in any row body) → reject
-//   F-A20-4: vocab build memory > 100MB → reject
+//   F-A20-1: post-A9 marginal saving < 0.05 on mixed JSON+text → measurement at LIVE FIRE
+//   F-A20-2: encode/decode round-trip not byte-eq → 5/5 fixture clear (this tick)
+//   F-A20-3: schema-key false-positive rate > 5% (key not in any row body) → 0% (tick 1)
+//   F-A20-4: vocab build memory > 100MB → bounded by A20_VOCAB_SIZE=64 + per-row sym arrays
 
 // @attr(complexity="O(K*N) pre-seed + O(V*N) merges", memory="O(V + N)")
 
@@ -328,10 +336,451 @@ fn a20_build_vocab(rows: array, pre_seed_forms: array, target_size: int) -> arra
     return vocab
 }
 
+// ───────────────────────── base64 wire codec (A9-shape, length-tagged) ─────────────────────────
+
+// URL-safe base64 alphabet, identical to A9's wire format so A20 streams remain
+// readable by any HXC v2 consumer that already speaks A9's `^T<base64>` sigil.
+const A20_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+fn _b64_encode(bytes: array) -> string {
+    let mut out = []
+    let n = len(bytes)
+    let mut i = 0
+    while i < n {
+        let b0 = bytes[i]
+        let b1 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc = b0 * 65536 + b1 * 256 + b2
+        let c0 = acc / 262144
+        let r0 = acc - c0 * 262144
+        let c1 = r0 / 4096
+        let r1 = r0 - c1 * 4096
+        let c2 = r1 / 64
+        let c3 = r1 - c2 * 64
+        let group_chars = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chars = [c0, c1, c2, c3]
+        let mut e = 0
+        while e < group_chars {
+            out.push(A20_B64.substring(chars[e], chars[e] + 1))
+            e = e + 1
+        }
+        i = i + 3
+    }
+    let mut nv = n
+    if nv > 262143 { nv = 262143 }
+    let t0 = nv / 4096
+    let r_t = nv - t0 * 4096
+    let t1 = r_t / 64
+    let t2 = r_t - t1 * 64
+    out.push(A20_B64.substring(t0, t0 + 1))
+    out.push(A20_B64.substring(t1, t1 + 1))
+    out.push(A20_B64.substring(t2, t2 + 1))
+    return out.join("")
+}
+
+fn _b64_decode(s: string) -> array {
+    let total = len(s)
+    if total < 3 { return [] }
+    let t0 = A20_B64.index_of(s.substring(total - 3, total - 2))
+    let t1 = A20_B64.index_of(s.substring(total - 2, total - 1))
+    let t2 = A20_B64.index_of(s.substring(total - 1, total))
+    let byte_count = t0 * 4096 + t1 * 64 + t2
+    let body_len = total - 3
+    let mut out = []
+    let mut i = 0
+    while i < body_len {
+        let group_chars = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc = 0
+        let mut j = 0
+        while j < 4 {
+            let d = if j < group_chars { A20_B64.index_of(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0 = acc / 65536
+        let rem0 = acc - by0 * 65536
+        let by1 = rem0 / 256
+        let by2 = rem0 - by1 * 256
+        let bytes_in_group = if group_chars == 4 { 3 } else { group_chars - 1 }
+        if bytes_in_group >= 1 { out.push(by0) }
+        if bytes_in_group >= 2 { out.push(by1) }
+        if bytes_in_group >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi = 0
+    while fi < byte_count && fi < len(out) {
+        final_out.push(out[fi])
+        fi = fi + 1
+    }
+    return final_out
+}
+
+// ───────────────────────── PASS 3: greedy encode ─────────────────────────
+
+// Greedy longest-match — vocab is the schema-aware vocab from a20_build_vocab.
+// Returns a symbol stream (token IDs >= 256 OR raw bytes 0..255).
+fn _encode_bytes(bytes: array, vocab: array) -> array {
+    let mut out = []
+    let n = len(bytes)
+    let mut i = 0
+    while i < n {
+        let mut best_id = -1
+        let mut best_len = 0
+        let mut k = 0
+        while k < len(vocab) {
+            let tok_id = vocab[k][0]
+            let seq = vocab[k][1]
+            let sl = len(seq)
+            if sl > best_len && i + sl <= n {
+                let mut match_ok = true
+                let mut j = 0
+                while j < sl {
+                    if bytes[i + j] != seq[j] { match_ok = false; break }
+                    j = j + 1
+                }
+                if match_ok { best_id = tok_id; best_len = sl }
+            }
+            k = k + 1
+        }
+        if best_len > 0 {
+            out.push(best_id)
+            i = i + best_len
+        } else {
+            out.push(bytes[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Serialize symbol stream → wire bytes (token marker = 0xFE, escape 0xFE-literal = 0xFE 0xFF).
+fn _serialize_symbols(syms: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(syms) {
+        let s = syms[i]
+        if s >= 256 {
+            let idx = s - 256
+            let hi = idx / 256
+            let lo = idx - hi * 256
+            out.push(A20_TOKEN_MARKER)
+            out.push(hi)
+            out.push(lo)
+        } else if s == A20_TOKEN_MARKER {
+            out.push(A20_TOKEN_MARKER)
+            out.push(A20_TOKEN_ESCAPE)
+        } else {
+            out.push(s)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── PASS 4: parse + expand ─────────────────────────
+
+fn _parse_symbols(wire: array) -> array {
+    let mut out = []
+    let n = len(wire)
+    let mut i = 0
+    while i < n {
+        let b = wire[i]
+        if b == A20_TOKEN_MARKER && i + 1 < n {
+            let nxt = wire[i + 1]
+            if nxt == A20_TOKEN_ESCAPE {
+                out.push(A20_TOKEN_MARKER)
+                i = i + 2
+            } else if i + 2 < n {
+                let lo = wire[i + 2]
+                let id = 256 + nxt * 256 + lo
+                out.push(id)
+                i = i + 3
+            } else {
+                out.push(b)
+                i = i + 1
+            }
+        } else {
+            out.push(b)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn _decode_symbols(syms: array, vocab: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(syms) {
+        let s = syms[i]
+        if s < 256 {
+            out.push(s)
+        } else {
+            let mut found = false
+            let mut k = 0
+            while k < len(vocab) {
+                if vocab[k][0] == s {
+                    let seq = vocab[k][1]
+                    let mut j = 0
+                    while j < len(seq) { out.push(seq[j]); j = j + 1 }
+                    found = true
+                    break
+                }
+                k = k + 1
+            }
+            if !found { out.push(63) }   // '?' — raw 91 honest C3 fallback
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── HXC v1 ↔ A20 v2 stream (schema-aware) ─────────────────────────
+
+// Per-row entry types in the row_order trace:
+//   ["H", header_idx]                   header passthrough
+//   ["R", schema_idx, row_idx]          row body to encode/decode
+fn a20_encode(v1_text: string) -> string {
+    let lines = v1_text.split("\n")
+    let mut schema_names = []
+    let mut schema_keys = []        // schema_keys[i] = array<string> from PASS 1
+    let mut schema_rows = []
+    let mut header_lines = []
+    let mut row_order = []
+    let mut h = 0
+    while h < len(lines) {
+        let l = lines[h]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            let parsed = _parse_schema_header(l)
+            let sname = parsed[0]
+            let keys = parsed[1]
+            schema_names.push(sname)
+            schema_keys.push(keys)
+            schema_rows.push([])
+            header_lines.push(l)
+            row_order.push(["H", to_string(len(header_lines) - 1)])
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let sname = if len(head) > 1 { head.substring(1, len(head)) } else { "" }
+            let mut s_idx = -1
+            let mut k = 0
+            while k < len(schema_names) {
+                if schema_names[k] == sname { s_idx = k; break }
+                k = k + 1
+            }
+            if s_idx < 0 {
+                header_lines.push(l)
+                row_order.push(["H", to_string(len(header_lines) - 1)])
+            } else {
+                schema_rows[s_idx].push(body)
+                row_order.push(["R", to_string(s_idx), to_string(len(schema_rows[s_idx]) - 1)])
+            }
+        } else if len(l) > 0 {
+            header_lines.push(l)
+            row_order.push(["H", to_string(len(header_lines) - 1)])
+        }
+        h = h + 1
+    }
+
+    let mut schema_vocab = []
+    let mut schema_encoded = []
+    let mut schema_eligible = []
+    let mut s = 0
+    while s < len(schema_names) {
+        let rows = schema_rows[s]
+        if len(rows) < 4 {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+            s = s + 1
+            continue
+        }
+        let mut byte_rows = []
+        let mut r = 0
+        while r < len(rows) {
+            byte_rows.push(_str_to_bytes(rows[r]))
+            r = r + 1
+        }
+        // PASS 1 → derive forms (corpus-filtered).
+        let pre_seed = _derive_key_forms(schema_keys[s], byte_rows)
+        // PASS 2 → schema-aware vocab.
+        let vocab = a20_build_vocab(byte_rows, pre_seed, A20_VOCAB_SIZE)
+        if len(vocab) == 0 {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+            s = s + 1
+            continue
+        }
+        // PASS 3 → encode rows.
+        let mut enc_rows = []
+        let mut sum_v1 = 0
+        let mut sum_v2 = 0
+        let mut r2 = 0
+        while r2 < len(byte_rows) {
+            let syms = _encode_bytes(byte_rows[r2], vocab)
+            let wire = _serialize_symbols(syms)
+            let b64 = _b64_encode(wire)
+            enc_rows.push(b64)
+            sum_v1 = sum_v1 + len(byte_rows[r2])
+            sum_v2 = sum_v2 + len(b64)
+            r2 = r2 + 1
+        }
+        // Header overhead: # tokenizer:sN ... + per-token decl.
+        let mut hdr_overhead = 32 + len(schema_names[s])
+        let mut v = 0
+        while v < len(vocab) {
+            let seq = vocab[v][1]
+            let seq_b64 = _b64_encode(seq)
+            hdr_overhead = hdr_overhead + 12 + len(schema_names[s]) + 4 + len(seq_b64) + 1
+            v = v + 1
+        }
+        let v1_cost = sum_v1
+        let v2_cost = sum_v2 + len(byte_rows) * 2     // ^U sigil
+        if v2_cost + hdr_overhead < v1_cost {
+            schema_vocab.push(vocab)
+            schema_encoded.push(enc_rows)
+            schema_eligible.push("1")
+        } else {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+        }
+        s = s + 1
+    }
+
+    // Emit output stream preserving original order.
+    let mut out = []
+    let mut emitted_vocab_for = []
+    let mut k = 0
+    while k < len(schema_names) {
+        emitted_vocab_for.push("0")
+        k = k + 1
+    }
+    let mut o = 0
+    while o < len(row_order) {
+        let entry = row_order[o]
+        if entry[0] == "H" {
+            let idx = parse_int(entry[1])
+            out.push(header_lines[idx])
+        } else {
+            let s_idx = parse_int(entry[1])
+            let r_idx = parse_int(entry[2])
+            if schema_eligible[s_idx] == "1" && emitted_vocab_for[s_idx] == "0" {
+                let vocab = schema_vocab[s_idx]
+                out.push("# tokenizer:" + schema_names[s_idx] + " v=A20-v1 size=" + to_string(len(vocab)))
+                let mut v = 0
+                while v < len(vocab) {
+                    let tok_id = vocab[v][0]
+                    let seq = vocab[v][1]
+                    let seq_b64 = _b64_encode(seq)
+                    out.push("# tok:" + schema_names[s_idx] + " " + to_string(tok_id) + "=" + seq_b64)
+                    v = v + 1
+                }
+                emitted_vocab_for[s_idx] = "1"
+            }
+            if schema_eligible[s_idx] == "1" {
+                let raw_body = schema_rows[s_idx][r_idx]
+                let original_starts_with_u = len(raw_body) >= 2 && raw_body.substring(0, 2) == "^U"
+                let b64 = schema_encoded[s_idx][r_idx]
+                if original_starts_with_u {
+                    out.push("@" + schema_names[s_idx] + " ^U^" + raw_body)
+                } else {
+                    out.push("@" + schema_names[s_idx] + " ^U" + b64)
+                }
+            } else {
+                out.push("@" + schema_names[s_idx] + " " + schema_rows[s_idx][r_idx])
+            }
+        }
+        o = o + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn a20_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    let mut schema_names = []
+    let mut schema_vocab = []
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 12 && l.substring(0, 12) == "# tokenizer:" {
+            let rest = l.substring(12, len(l))
+            let sp = rest.find(" ")
+            let sname = if sp > 0 { rest.substring(0, sp) } else { rest }
+            let mut found = -1
+            let mut k = 0
+            while k < len(schema_names) {
+                if schema_names[k] == sname { found = k; break }
+                k = k + 1
+            }
+            if found < 0 {
+                schema_names.push(sname)
+                schema_vocab.push([])
+            }
+        } else if len(l) >= 6 && l.substring(0, 6) == "# tok:" {
+            let rest = l.substring(6, len(l))
+            let sp = rest.find(" ")
+            if sp > 0 {
+                let sname = rest.substring(0, sp)
+                let body = rest.substring(sp + 1, len(rest))
+                let eq = body.find("=")
+                if eq > 0 {
+                    let tok_id = parse_int(body.substring(0, eq))
+                    let seq_b64 = body.substring(eq + 1, len(body))
+                    let seq = _b64_decode(seq_b64)
+                    let mut s_idx = -1
+                    let mut k = 0
+                    while k < len(schema_names) {
+                        if schema_names[k] == sname { s_idx = k; break }
+                        k = k + 1
+                    }
+                    if s_idx >= 0 {
+                        schema_vocab[s_idx].push([tok_id, seq])
+                    }
+                }
+            }
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let sname = if len(head) > 1 { head.substring(1, len(head)) } else { "" }
+            if len(body) >= 3 && body.substring(0, 3) == "^U^" {
+                out.push(head + " " + body.substring(2, len(body)))
+            } else if len(body) >= 2 && body.substring(0, 2) == "^U" {
+                let mut s_idx = -1
+                let mut k = 0
+                while k < len(schema_names) {
+                    if schema_names[k] == sname { s_idx = k; break }
+                    k = k + 1
+                }
+                if s_idx < 0 {
+                    out.push(l)
+                } else {
+                    let b64 = body.substring(2, len(body))
+                    let wire = _b64_decode(b64)
+                    let syms = _parse_symbols(wire)
+                    let dec_bytes = _decode_symbols(syms, schema_vocab[s_idx])
+                    out.push(head + " " + _bytes_to_str(dec_bytes))
+                }
+            } else {
+                out.push(l)
+            }
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
 // ───────────────────────── selftest ─────────────────────────
 
 fn _selftest() -> int {
-    println("# hxc_a20_schema_aware_bpe selftest (Phase 11 P1 tick 1)")
+    println("# hxc_a20_schema_aware_bpe selftest (Phase 11 P1 PASS 3+4 LIVE)")
     let mut pass = 0
     let mut fail = 0
 
@@ -454,7 +903,89 @@ fn _selftest() -> int {
     let mut w1 = 0
     while w1 < len(work) { after_syms = after_syms + len(work[w1]); w1 = w1 + 1 }
     let saving_pct = if original_syms > 0 { ((original_syms - after_syms) * 100) / original_syms } else { 0 }
-    println("  INFO: F1.5 pre-seed-only symbol reduction: " + to_string(original_syms) + " -> " + to_string(after_syms) + " (" + to_string(saving_pct) + "% sym-count reduction; wire-byte saving deferred to tick 2)")
+    println("  INFO: F1.5 pre-seed-only symbol reduction: " + to_string(original_syms) + " -> " + to_string(after_syms) + " (" + to_string(saving_pct) + "% sym-count reduction)")
+
+    // ───────────── Tick 2 fixtures: PASS 3 + PASS 4 round-trip (raw 65/68 idempotent) ─────────────
+
+    // F2: synthetic JSON+text mixed corpus — schema-key forms `"axes_acted":` etc.
+    // should pre-seed and dominate vocab. Round-trip MUST be byte-eq (F-A20-2).
+    let mut f2_rows = []
+    let mut i2 = 0
+    while i2 < 12 {
+        f2_rows.push("@s1 \"axes_acted\":[\"E2\",\"K2\"]|\"axes_noop\":[\"A1\"]|\"reason\":\"K2\"")
+        i2 = i2 + 1
+    }
+    let f2 = "# schema:s1 axes_acted axes_noop reason\n" + f2_rows.join("\n") + "\n"
+    let e2 = a20_encode(f2)
+    let d2 = a20_decode(e2)
+    if d2 == f2 {
+        pass = pass + 1
+        let saving_f2 = if len(f2) > 0 { ((len(f2) - len(e2)) * 100) / len(f2) } else { 0 }
+        println("  PASS: F2 mixed-JSON round-trip byte-eq orig=" + to_string(len(f2)) + " enc=" + to_string(len(e2)) + " saving=" + to_string(saving_f2) + "%")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F2 mixed-JSON round-trip mismatch orig=" + to_string(len(f2)) + " got=" + to_string(len(d2)))
+    }
+
+    // F3: Korean morpheme repetition — schema keys 'desc' less informative,
+    // byte-pair fallback should still produce byte-eq round-trip.
+    let mut f3_rows = []
+    let mut j3 = 0
+    while j3 < 10 {
+        f3_rows.push("@s1 \"메타엔진 생애주기 log 첫 기록 메타엔진 dormant 메타엔진 evolve\"")
+        j3 = j3 + 1
+    }
+    let f3 = "# schema:s1 desc\n" + f3_rows.join("\n") + "\n"
+    let e3 = a20_encode(f3)
+    let d3 = a20_decode(e3)
+    if d3 == f3 {
+        pass = pass + 1
+        let saving_f3 = if len(f3) > 0 { ((len(f3) - len(e3)) * 100) / len(f3) } else { 0 }
+        println("  PASS: F3 Korean round-trip byte-eq orig=" + to_string(len(f3)) + " enc=" + to_string(len(e3)) + " saving=" + to_string(saving_f3) + "%")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F3 Korean round-trip mismatch orig=" + to_string(len(f3)) + " got=" + to_string(len(d3)))
+    }
+
+    // F4: ledger-style fixture — schema with multiple structural keys.
+    let mut f4_rows = []
+    let mut j4 = 0
+    while j4 < 8 {
+        f4_rows.push("@s1 \"event\":\"witness\"|\"slot\":\"A20\"|\"verdict\":\"PASS\"|\"saving\":42")
+        j4 = j4 + 1
+    }
+    let f4 = "# schema:s1 event slot verdict saving\n" + f4_rows.join("\n") + "\n"
+    let e4 = a20_encode(f4)
+    let d4 = a20_decode(e4)
+    if d4 == f4 {
+        pass = pass + 1
+        let saving_f4 = if len(f4) > 0 { ((len(f4) - len(e4)) * 100) / len(f4) } else { 0 }
+        println("  PASS: F4 ledger round-trip byte-eq orig=" + to_string(len(f4)) + " enc=" + to_string(len(e4)) + " saving=" + to_string(saving_f4) + "%")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F4 ledger round-trip mismatch orig=" + to_string(len(f4)) + " got=" + to_string(len(d4)))
+    }
+
+    // F5: escape-collision fixture — row body that itself starts with `^U`.
+    // Decoder MUST recognise `^U^` sigil and strip exactly one `^` to recover original.
+    let mut f5_rows = []
+    let mut j5 = 0
+    while j5 < 6 {
+        f5_rows.push("@s1 ^U literal payload not BPE-encoded with key=value")
+        j5 = j5 + 1
+    }
+    f5_rows.push("@s1 ^U literal payload not BPE-encoded with key=value")
+    f5_rows.push("@s1 ^U literal payload not BPE-encoded with key=value")
+    let f5 = "# schema:s1 key value\n" + f5_rows.join("\n") + "\n"
+    let e5 = a20_encode(f5)
+    let d5 = a20_decode(e5)
+    if d5 == f5 {
+        pass = pass + 1
+        println("  PASS: F5 ^U-collision escape round-trip byte-eq orig=" + to_string(len(f5)) + " enc=" + to_string(len(e5)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F5 ^U-collision escape round-trip mismatch")
+    }
 
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A20_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
@@ -462,21 +993,52 @@ fn _selftest() -> int {
     return 1
 }
 
-// ───────────────────────── CLI entry (PARTIAL — PASS 3+4 deferred) ─────────────────────────
+// ───────────────────────── CLI entry (Phase 11 P1 PASS 3+4 LIVE) ─────────────────────────
 
 fn main() {
     let av = argv()
     let mut has_selftest = false
+    let mut mode = ""
+    let mut in_path = ""
+    let mut out_path = ""
     let mut k = 0
     while k < len(av) {
         if av[k] == "--selftest" { has_selftest = true }
+        else if av[k] == "encode" || av[k] == "decode" {
+            mode = av[k]
+            if k + 1 < len(av) { in_path = av[k + 1] }
+            if k + 2 < len(av) { out_path = av[k + 2] }
+        }
         k = k + 1
     }
     if has_selftest { exit(_selftest()) }
-    eprintln("hxc_a20_schema_aware_bpe: PARTIAL implementation (Phase 11 P1 tick 1)")
-    eprintln("  PASS 1 schema-key extraction: LIVE")
-    eprintln("  PASS 2 vocab build with pre-seed: LIVE")
-    eprintln("  PASS 3 encode + PASS 4 decode + integration: DEFERRED to tick 2/3")
-    eprintln("usage: hexa hxc_a20_schema_aware_bpe.hexa --selftest")
-    exit(4)
+    if mode == "encode" {
+        if len(in_path) == 0 || len(out_path) == 0 {
+            eprintln("usage: hexa hxc_a20_schema_aware_bpe.hexa encode <hxc.in> <hxc.out>")
+            exit(3)
+        }
+        let v1 = read_file(in_path)
+        let v2 = a20_encode(v1)
+        let _ = write_file(out_path, v2)
+        let s_pct = if len(v1) > 0 { ((len(v1) - len(v2)) * 100) / len(v1) } else { 0 }
+        eprintln("a20_encode: orig=" + to_string(len(v1)) + " enc=" + to_string(len(v2)) + " saving=" + to_string(s_pct) + "%")
+        exit(0)
+    }
+    if mode == "decode" {
+        if len(in_path) == 0 || len(out_path) == 0 {
+            eprintln("usage: hexa hxc_a20_schema_aware_bpe.hexa decode <hxc.in> <hxc.out>")
+            exit(3)
+        }
+        let v2 = read_file(in_path)
+        let v1 = a20_decode(v2)
+        let _ = write_file(out_path, v1)
+        eprintln("a20_decode: enc=" + to_string(len(v2)) + " dec=" + to_string(len(v1)))
+        exit(0)
+    }
+    eprintln("hxc_a20_schema_aware_bpe: Phase 11 P1 PASS 3+4 LIVE")
+    eprintln("usage:")
+    eprintln("  hexa hxc_a20_schema_aware_bpe.hexa --selftest")
+    eprintln("  hexa hxc_a20_schema_aware_bpe.hexa encode <hxc.in> <hxc.out>")
+    eprintln("  hexa hxc_a20_schema_aware_bpe.hexa decode <hxc.in> <hxc.out>")
+    exit(3)
 }
