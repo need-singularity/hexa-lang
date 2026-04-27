@@ -7463,3 +7463,65 @@ static void _hexa_init_fn_shims(void) {
  * ═══════════════════════════════════════════════════════════════════ */
 #include "native/persistent_pipe.c"
 
+/* ═══════════════════════════════════════════════════════════════════
+ * TUI-PRIM L1 FFI shim — POSIX termios + ioctl + signal
+ *
+ * Source: self/native/term_ffi.c — 12 raw POSIX symbols (no HexaVal).
+ * Wrappers below bridge to HexaVal for hexa source dispatch.
+ *
+ * Builtin names exposed to hexa (codegen_c2.hexa + env.hexa + hexa_full.hexa):
+ *   term_raw_enter()         -> Int (rc 0/-1)
+ *   term_raw_restore()       -> Int (rc 0/-1)
+ *   term_winsize_rows()      -> Int (rows or -1)
+ *   term_winsize_cols()      -> Int (cols or -1)
+ *   term_poll_stdin(ms)      -> Int (1/0/-1)
+ *   term_read_byte()         -> Int (byte 0..255 or -1)
+ *   term_write_str(s)        -> Int (bytes-written or -1)
+ *   term_install_sigwinch()  -> Int
+ *   term_sigwinch_pending()  -> Int (1/0)
+ *   term_install_sigint()    -> Int
+ *   term_sigint_pending()    -> Int (1/0)
+ *   term_isatty_stdin()      -> Int
+ *   term_isatty_stdout()     -> Int
+ *
+ * Kick witness:
+ *   state/design_strategy_trawl/2026-04-27_hexa-native-tui-implementation-plan_KICK_omega_cycle.json
+ * ═══════════════════════════════════════════════════════════════════ */
+#include "native/term_ffi.c"
+
+HexaVal hexa_term_raw_enter(void) { return hexa_int((int64_t)term_raw_enter()); }
+HexaVal hexa_term_raw_restore(void) { return hexa_int((int64_t)term_raw_restore()); }
+
+HexaVal hexa_term_winsize_rows(void) {
+    int r = -1, c = -1;
+    if (term_get_winsize(&r, &c) != 0) return hexa_int(-1);
+    return hexa_int((int64_t)r);
+}
+HexaVal hexa_term_winsize_cols(void) {
+    int r = -1, c = -1;
+    if (term_get_winsize(&r, &c) != 0) return hexa_int(-1);
+    return hexa_int((int64_t)c);
+}
+
+HexaVal hexa_term_poll_stdin(HexaVal ms) {
+    int t = (int)__hx_to_double(ms);
+    return hexa_int((int64_t)term_poll_stdin(t));
+}
+HexaVal hexa_term_read_byte(void) { return hexa_int((int64_t)term_read_byte()); }
+
+HexaVal hexa_term_write_str(HexaVal s) {
+    if (!HX_IS_STR(s) || HX_STR(s) == NULL) {
+        return hexa_int(-1);
+    }
+    const char *buf = HX_STR(s);
+    int n = (int)strlen(buf);
+    return hexa_int((int64_t)term_write(buf, n));
+}
+
+HexaVal hexa_term_install_sigwinch(void) { return hexa_int((int64_t)term_install_sigwinch()); }
+HexaVal hexa_term_sigwinch_pending(void) { return hexa_int((int64_t)term_sigwinch_pending()); }
+HexaVal hexa_term_install_sigint(void) { return hexa_int((int64_t)term_install_sigint()); }
+HexaVal hexa_term_sigint_pending(void) { return hexa_int((int64_t)term_sigint_pending()); }
+HexaVal hexa_term_isatty_stdin(void) { return hexa_int((int64_t)term_isatty_stdin()); }
+HexaVal hexa_term_isatty_stdout(void) { return hexa_int((int64_t)term_isatty_stdout()); }
+
