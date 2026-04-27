@@ -1,0 +1,590 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a16-arithmetic-coder", desc="HXC algorithm A16: order-0 byte-frequency arithmetic (range) coder. Pure-hexa raw 9. Closes Shannon H_0 floor — n6 atlas-convergence verdict (a201a6cc) shows H_0=5.755 bit/byte → 28% saving lower bound. Targets the entropy-coder gap NOT addressable by structural algos A1-A15.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a16_arithmetic_coder.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a16_arithmetic_coder.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a16_arithmetic_coder.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// Algorithm spec (Witten-Neal-Cleary 1987 byte-emitting range coder, integer-only):
+//   PASS 1 (frequency build): count byte frequencies (256 entries) over input.
+//                             Build cumulative table (257 entries; [256] = total).
+//   PASS 2 (encode): byte-emitting range coder with 32-bit registers. For each
+//                    input byte b: low += range/total * cum[b]; range = range/total * freq[b].
+//                    Renormalize: while (low XOR high) top byte == 0, emit top byte.
+//   PASS 3 (header): emit `# arith:s<id> v=range-v1 n=<input_bytes> freq=<base64url-256-entry>`
+//                    Body emitted as `^A<base64url-bytestream>` line.
+//   PASS 4 (decode): rebuild cum table from freq header; reverse the range narrowing
+//                    by reading code register from input byte stream.
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) byte-eq for any A16 stream
+//   - decode(encode(y)) byte-eq y for any HXC v1 stream
+//
+// Falsifiers (raw 71 preregistered):
+//   F-A16-1: saving < 0.10 byte-eq on synthetic English-text → reject (entropy not realized).
+//   F-A16-2: encode/decode round-trip not byte-eq → reject.
+//   F-A16-3: encode latency > 100ms per 1KB → reject (perf budget).
+//   F-A16-4: 32-bit overflow on int operations → reject (range/low/high must stay in [0, 2^32)).
+//
+// raw 91 honest C3: precision is 32-bit (TOP=2^32, BOT=2^16). For inputs >> 1MB
+// frequencies should fit (i64 used internally for products to avoid overflow).
+// Order-0 only — context-mixing reserved for A17 PPMd. Wire payload sigil "^A" is
+// HXC-safe (no clash with #/@/space/quote/pipe/~/!).
+
+const A16_MIN_BYTES = 64
+const A16_TOP = 4294967296   // 2^32
+const A16_BOT = 16777216     // 2^24
+const A16_MAX_FREQ_TOTAL = 16777215  // 2^24 - 1, keeps range/total in 32-bit
+
+const A16_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+fn _read_file(p: string) -> string { return read_file(p) }
+fn _write_file(p: string, c: string) -> int { let _r = write_file(p, c); return 0 }
+
+// ───────────────── base64url byte<->char (no padding) ─────────────────
+
+fn _b64_enc_bytes(bytes: array) -> string {
+    let mut out = []
+    let n: i64 = len(bytes)
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = bytes[i]
+        let b1: i64 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2: i64 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chs = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group { out.push(A16_B64_ALPHA.substring(chs[e], chs[e] + 1)); e = e + 1 }
+        i = i + 3
+    }
+    // Trailing 3-char tail = byte count as u18 (max 262143 — large header-paths split into multi-line if exceeded).
+    let mut nv: i64 = n
+    if nv > 262143 { nv = 262143 }
+    let t0: i64 = nv / 4096
+    let rt: i64 = nv - t0 * 4096
+    let t1: i64 = rt / 64
+    let t2: i64 = rt - t1 * 64
+    out.push(A16_B64_ALPHA.substring(t0, t0 + 1))
+    out.push(A16_B64_ALPHA.substring(t1, t1 + 1))
+    out.push(A16_B64_ALPHA.substring(t2, t2 + 1))
+    return out.join("")
+}
+
+fn _b64_char_idx(c: string) -> i64 { return A16_B64_ALPHA.index_of(c) }
+
+fn _b64_dec_bytes(s: string) -> array {
+    let total: i64 = len(s)
+    if total < 3 { return [] }
+    let t0: i64 = _b64_char_idx(s.substring(total - 3, total - 2))
+    let t1: i64 = _b64_char_idx(s.substring(total - 2, total - 1))
+    let t2: i64 = _b64_char_idx(s.substring(total - 1, total))
+    let bcount: i64 = t0 * 4096 + t1 * 64 + t2
+    let body_len: i64 = total - 3
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group { _b64_char_idx(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem: i64 = acc - by0 * 65536
+        let by1: i64 = rem / 256
+        let by2: i64 = rem - by1 * 256
+        let bg: i64 = if group == 4 { 3 } else { group - 1 }
+        if bg >= 1 { out.push(by0) }
+        if bg >= 2 { out.push(by1) }
+        if bg >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi: i64 = 0
+    while fi < bcount && fi < len(out) { final_out.push(out[fi]); fi = fi + 1 }
+    return final_out
+}
+
+// ───────────────── frequency model ─────────────────
+
+fn _count_byte_frequency(content: string) -> array {
+    let mut freq = []
+    let mut i = 0
+    while i < 256 { freq.push(0); i = i + 1 }
+    let n = len(content)
+    let mut k: i64 = 0
+    while k < n {
+        let b: i64 = ord(content.substring(k, k + 1))
+        freq[b] = freq[b] + 1
+        k = k + 1
+    }
+    // Floor each freq to 1 to avoid divide-by-zero in decode lookup AND
+    // to ensure all 256 symbols have nonzero range (we do not transmit which
+    // bytes are absent — simpler header at small overhead). Then scale total
+    // down to <= MAX_FREQ_TOTAL to keep range/total products in 32-bit.
+    let mut s: i64 = 0
+    let mut j = 0
+    while j < 256 {
+        if freq[j] == 0 { freq[j] = 1 }
+        s = s + freq[j]
+        j = j + 1
+    }
+    if s > A16_MAX_FREQ_TOTAL {
+        let scale: i64 = (s + A16_MAX_FREQ_TOTAL - 1) / A16_MAX_FREQ_TOTAL
+        let mut q = 0
+        while q < 256 {
+            let v: i64 = freq[q] / scale
+            freq[q] = if v < 1 { 1 } else { v }
+            q = q + 1
+        }
+    }
+    return freq
+}
+
+fn _build_cumulative_freq(freq: array) -> array {
+    let mut cum = []
+    let mut s: i64 = 0
+    let mut i = 0
+    while i < 256 { cum.push(s); s = s + freq[i]; i = i + 1 }
+    cum.push(s)  // [256] = total
+    return cum
+}
+
+// ───────────────── header serialization (256 freqs as base64url u24-stream) ─────────────────
+
+fn _freq_to_b64(freq: array) -> string {
+    // Pack each freq as 3 bytes (u24, max 2^24-1 = 16777215 — equals our MAX_FREQ_TOTAL bound).
+    let mut bytes = []
+    let mut i = 0
+    while i < 256 {
+        let v: i64 = freq[i]
+        let b0: i64 = v / 65536
+        let r: i64 = v - b0 * 65536
+        let b1: i64 = r / 256
+        let b2: i64 = r - b1 * 256
+        bytes.push(b0); bytes.push(b1); bytes.push(b2)
+        i = i + 1
+    }
+    return _b64_enc_bytes(bytes)
+}
+
+fn _b64_to_freq(s: string) -> array {
+    let bytes = _b64_dec_bytes(s)
+    let mut freq = []
+    let mut i = 0
+    while i < 256 {
+        let b0: i64 = if i * 3 < len(bytes) { bytes[i * 3] } else { 0 }
+        let b1: i64 = if i * 3 + 1 < len(bytes) { bytes[i * 3 + 1] } else { 0 }
+        let b2: i64 = if i * 3 + 2 < len(bytes) { bytes[i * 3 + 2] } else { 0 }
+        freq.push(b0 * 65536 + b1 * 256 + b2)
+        i = i + 1
+    }
+    return freq
+}
+
+// ───────────────── range coder (byte-emitting, 32-bit registers) ─────────────────
+
+// Encode: returns array of output bytes (the compressed payload).
+// State semantics (Subbotin / WNC1987):
+//   low: lower bound of current interval, 32-bit
+//   range: width of current interval, 32-bit (kept >= BOT)
+//   For each input byte b with cum_freq cum[b]..cum[b+1] (total = cum[256]):
+//     range = range / total
+//     low = low + cum[b] * range
+//     range = range * freq[b]
+//   Renormalize: while (low XOR high) top byte (>>24) == 0 OR range < BOT after carry-fix:
+//     emit (low >> 24); low = (low << 8) & 0xFFFFFFFF; range = range << 8
+fn _range_encode(content: string, cum: array) -> array {
+    let total: i64 = cum[256]
+    let mut low: i64 = 0
+    let mut range: i64 = A16_TOP - 1   // 2^32 - 1, fits i64
+    let mut out_bytes = []
+    let n = len(content)
+    let mut k: i64 = 0
+    while k < n {
+        let b: i64 = ord(content.substring(k, k + 1))
+        // narrow
+        range = range / total
+        low = low + cum[b] * range
+        range = range * (cum[b + 1] - cum[b])
+        // mask low to 32-bit (carry handled below in renormalize)
+        // honest C3: simpler "no-carry" variant — we accept that low may overflow
+        // BY ONE BIT during narrow, then renormalize shifts top byte out before
+        // it grows further. Because cum[b]*range < 2^32 (range/total * total <= 2^32),
+        // and low < 2^32, low can grow up to (2^32 - 1) + (2^32 - 1) ≈ 2^33. We
+        // truncate low to 32 bits BEFORE renormalize to handle the carry by-byte:
+        // any carry into bit 32 propagates into ALREADY-emitted output — which we
+        // guarantee by ensuring top byte of low and (low+range) agree before we
+        // emit. Specifically: while ((low XOR (low+range)) & 0xFF000000) == 0,
+        // safe to emit top byte.
+        // Renormalize loop:
+        let mut renorm = true
+        while renorm {
+            let high: i64 = low + range
+            let low_top: i64 = low / 16777216           // (low >> 24)
+            let high_top: i64 = high / 16777216         // (high >> 24)
+            // Mask both into byte range — high may exceed 2^32 by carry but
+            // we compare top-byte equality which is invariant to that.
+            let lt: i64 = low_top - (low_top / 256) * 256       // low_top & 0xFF... wait
+            let _ = lt
+            if low_top == high_top {
+                // safe: emit top byte
+                out_bytes.push(low_top - (low_top / 256) * 256)
+                low = (low - (low_top * 16777216)) * 256
+                range = range * 256
+                if low < 0 { low = low + A16_TOP * 256 }
+            } else if range < A16_BOT {
+                // underflow rescue: force range up by aligning low to high boundary
+                range = (16777216 - (low - (low / 16777216) * 16777216)) * 256
+                out_bytes.push(low / 16777216 - (low / 16777216 / 256) * 256)
+                low = (low - (low / 16777216) * 16777216) * 256
+            } else {
+                renorm = false
+            }
+            // Safety: keep low in [0, 2^32)
+            if low >= A16_TOP {
+                // carry into already-emitted byte — propagate
+                let mut idx: i64 = len(out_bytes) - 1
+                low = low - A16_TOP
+                while idx >= 0 {
+                    let v: i64 = out_bytes[idx] + 1
+                    if v < 256 { out_bytes[idx] = v; idx = -1 }
+                    else { out_bytes[idx] = 0; idx = idx - 1 }
+                }
+            }
+        }
+        k = k + 1
+    }
+    // Flush: emit final 4 bytes of low (canonical termination).
+    let mut f = 0
+    while f < 4 {
+        let lt: i64 = low / 16777216
+        out_bytes.push(lt - (lt / 256) * 256)
+        low = (low - lt * 16777216) * 256
+        f = f + 1
+    }
+    return out_bytes
+}
+
+// Decode: returns reconstructed bytes ARRAY of `n_bytes` from compressed payload.
+// We return array<int> rather than string because hexa's chr(b>=128) produces
+// 2-byte UTF-8 — corrupts byte-canonical output. CLI path writes via write_bytes.
+fn _range_decode_bytes(payload: array, cum: array, n_bytes: i64) -> array {
+    let total: i64 = cum[256]
+    let mut low: i64 = 0
+    let mut range: i64 = A16_TOP - 1
+    // prime code register with first 4 bytes
+    let mut code: i64 = 0
+    let mut p: i64 = 0
+    let mut pi = 0
+    while pi < 4 {
+        let b: i64 = if p < len(payload) { payload[p] } else { 0 }
+        code = code * 256 + b
+        p = p + 1
+        pi = pi + 1
+    }
+    let mut out = []
+    let mut produced: i64 = 0
+    while produced < n_bytes {
+        // Find symbol b such that cum[b] <= ((code - low) * total + total - 1) / range < cum[b+1]
+        // Use the "frequency" derived index trick — linear search is fine for 256 symbols.
+        range = range / total
+        let target: i64 = (code - low) / range
+        // clamp
+        let mut tgt: i64 = target
+        if tgt >= total { tgt = total - 1 }
+        // linear scan cum table
+        let mut b: i64 = 0
+        while b < 256 {
+            if cum[b + 1] > tgt { break }
+            b = b + 1
+        }
+        if b >= 256 { b = 255 }
+        out.push(b)
+        // narrow
+        low = low + cum[b] * range
+        range = range * (cum[b + 1] - cum[b])
+        // renormalize (mirror of encode)
+        let mut renorm = true
+        while renorm {
+            let high: i64 = low + range
+            let low_top: i64 = low / 16777216
+            let high_top: i64 = high / 16777216
+            if low_top == high_top {
+                let nb: i64 = if p < len(payload) { payload[p] } else { 0 }
+                code = (code - low_top * 16777216) * 256 + nb
+                low = (low - low_top * 16777216) * 256
+                range = range * 256
+                p = p + 1
+            } else if range < A16_BOT {
+                let nb: i64 = if p < len(payload) { payload[p] } else { 0 }
+                range = (16777216 - (low - (low / 16777216) * 16777216)) * 256
+                code = (code - (low / 16777216) * 16777216) * 256 + nb
+                low = (low - (low / 16777216) * 16777216) * 256
+                p = p + 1
+            } else {
+                renorm = false
+            }
+            if low >= A16_TOP { low = low - A16_TOP }
+            if code >= A16_TOP * 256 { code = code - A16_TOP * 256 }
+        }
+        produced = produced + 1
+    }
+    return out
+}
+
+// String wrapper for ASCII-only paths (selftest fixtures < 128). For real
+// data containing UTF-8 multi-byte, use _range_decode_bytes + write_bytes.
+fn _range_decode_string_ascii(payload: array, cum: array, n_bytes: i64) -> string {
+    let bytes = _range_decode_bytes(payload, cum, n_bytes)
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        let b: i64 = bytes[i]
+        // chr() is UTF-8 safe for b < 128; for b >= 128 we WOULD double-encode.
+        // ASCII-only fast path.
+        parts.push(chr(b))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────── HXC stream wrapper ─────────────────
+
+fn _a16_encode_force(v1_text: string) -> string {
+    let n: i64 = len(v1_text)
+    if n >= 9 && v1_text.substring(0, 9) == "# arith:s" { return v1_text }
+    let freq = _count_byte_frequency(v1_text)
+    let cum = _build_cumulative_freq(freq)
+    let payload_bytes = _range_encode(v1_text, cum)
+    let payload_b64 = _b64_enc_bytes(payload_bytes)
+    let freq_b64 = _freq_to_b64(freq)
+    let header = "# arith:s1 v=range-v1 n=" + to_string(n) + " freq=" + freq_b64
+    let body = "^A" + payload_b64
+    return header + "\n" + body + "\n"
+}
+
+fn a16_encode(v1_text: string) -> string {
+    let n: i64 = len(v1_text)
+    if n < A16_MIN_BYTES { return v1_text }
+    // Reject already-A16 streams (raw 65 idempotency).
+    if n >= 9 && v1_text.substring(0, 9) == "# arith:s" { return v1_text }
+    let result = _a16_encode_force(v1_text)
+    // No-regression invariant: only return A16 if smaller (raw 91 honest).
+    if len(result) >= n { return v1_text }
+    return result
+}
+
+// Returns [bytes_array, n_bytes] — byte-canonical decode path for CLI/file I/O.
+fn _a16_decode_to_bytes(v2_text: string) -> array {
+    let lines = v2_text.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 9 || header.substring(0, 9) != "# arith:s" { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let f_pos: i64 = header.index_of(" freq=")
+    if n_pos < 0 || f_pos < 0 { return [] }
+    let n_str = header.substring(n_pos + 3, f_pos)
+    let n_bytes: i64 = parse_int(n_str)
+    let freq_b64 = header.substring(f_pos + 6, len(header))
+    let freq = _b64_to_freq(freq_b64)
+    let cum = _build_cumulative_freq(freq)
+    let mut body_b64 = ""
+    let mut i = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^A" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload_bytes = _b64_dec_bytes(body_b64)
+    return _range_decode_bytes(payload_bytes, cum, n_bytes)
+}
+
+// String-returning decode — for ASCII content only. For UTF-8/binary use
+// the CLI path which writes bytes via write_bytes.
+fn a16_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    if len(lines) < 2 { return v2_text }
+    let header = lines[0]
+    if len(header) < 9 || header.substring(0, 9) != "# arith:s" { return v2_text }
+    let bytes = _a16_decode_to_bytes(v2_text)
+    if len(bytes) == 0 { return v2_text }
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts.push(chr(bytes[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────── selftest ─────────────────
+
+fn _selftest() -> int {
+    println("# hxc_a16_arithmetic_coder selftest")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture 1: heavily skewed distribution (90% one byte). Use _a16_encode_force
+    // to test codec correctness independent of regression check. Skewed input has
+    // entropy ~0.47 bit/byte → expected payload_bytes ~6% × n; with header + base64
+    // overhead ~1KB on n=1000 net result may be larger. Focus: round-trip correctness.
+    let mut skewed_parts = []
+    let mut i = 0
+    while i < 900 { skewed_parts.push("a"); i = i + 1 }
+    let mut j = 0
+    while j < 100 { skewed_parts.push("b"); j = j + 1 }
+    let skewed = skewed_parts.join("")
+    let enc1 = _a16_encode_force(skewed)
+    let dec1 = a16_decode(enc1)
+    if dec1 == skewed {
+        pass = pass + 1
+        println("  PASS: fixture-1 skewed CODEC round-trip byte-eq " + to_string(len(skewed)) + " -> " + to_string(len(enc1)))
+    } else {
+        fail = fail + 1
+        let lim = if len(dec1) < 80 { len(dec1) } else { 80 }
+        let lim2 = if len(skewed) < 80 { len(skewed) } else { 80 }
+        println("  FAIL: fixture-1 skewed CODEC round-trip lost orig_len=" + to_string(len(skewed)) + " got_len=" + to_string(len(dec1)))
+        println("        orig[0:80]=" + skewed.substring(0, lim2))
+        println("        got [0:80]=" + dec1.substring(0, lim))
+    }
+
+    // Fixture 2: JSON-like text CODEC round-trip
+    let json_like = "{\"ts\":\"2026-04-28T00:00:00Z\",\"event\":\"convergence\",\"value\":1.0}\n{\"ts\":\"2026-04-28T00:01:00Z\",\"event\":\"convergence\",\"value\":2.0}\n{\"ts\":\"2026-04-28T00:02:00Z\",\"event\":\"convergence\",\"value\":3.0}\n"
+    let enc2 = _a16_encode_force(json_like)
+    let dec2 = a16_decode(enc2)
+    if dec2 == json_like {
+        pass = pass + 1
+        println("  PASS: fixture-2 JSON-like CODEC round-trip " + to_string(len(json_like)) + " -> " + to_string(len(enc2)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-2 JSON-like CODEC round-trip lost")
+    }
+
+    // Fixture 3: short input below MIN_BYTES → identity passthrough
+    let tiny = "abc"
+    let enc3 = a16_encode(tiny)
+    if enc3 == tiny {
+        pass = pass + 1
+        println("  PASS: fixture-3 short-input passthrough")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-3 short-input wrongly fired")
+    }
+
+    // Fixture 4: 200-byte English CODEC round-trip
+    let mut eng_parts = []
+    let mut k = 0
+    while k < 5 {
+        eng_parts.push("the quick brown fox jumps over the lazy dog ")
+        k = k + 1
+    }
+    let eng = eng_parts.join("")
+    let enc4 = _a16_encode_force(eng)
+    let dec4 = a16_decode(enc4)
+    if dec4 == eng {
+        pass = pass + 1
+        println("  PASS: fixture-4 English CODEC round-trip " + to_string(len(eng)) + " -> " + to_string(len(enc4)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-4 English CODEC round-trip lost orig_len=" + to_string(len(eng)) + " got_len=" + to_string(len(dec4)))
+    }
+
+    // Fixture 5: idempotency — re-encoding A16 stream is passthrough
+    let enc5 = _a16_encode_force(skewed)
+    let enc5b = a16_encode(enc5)
+    if enc5 == enc5b {
+        pass = pass + 1
+        println("  PASS: fixture-5 idempotent re-encode (raw 65 + 68)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-5 re-encode not idempotent")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A16_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut has_force = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        if av[k] == "--force" { has_force = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a16_arithmetic_coder.hexa <encode|decode> [--force] <in> <out>")
+            exit(3)
+        }
+        // After the sub-command, scan for non-flag args.
+        let mut paths = []
+        let mut q2 = sub_idx + 1
+        while q2 < len(av) {
+            let a = av[q2]
+            if len(a) >= 2 && a.substring(0, 2) == "--" { q2 = q2 + 1; continue }
+            paths.push(a)
+            q2 = q2 + 1
+        }
+        if len(paths) < 2 {
+            eprintln("usage: hexa hxc_a16_arithmetic_coder.hexa <encode|decode> [--force] <in> <out>")
+            exit(3)
+        }
+        let in_path = paths[0]
+        let out_path = paths[1]
+        if has_encode {
+            // Read input as raw bytes to preserve binary integrity. Convert to
+            // hexa string via byte-by-byte concat using ord-safe path. Actually
+            // simpler: read_file (string mode) — input is already a hexa string
+            // whose len() is the byte count. UTF-8 multi-byte sequences are
+            // preserved as multi-byte substrings which our byte-level scan handles.
+            let txt = _read_file(in_path)
+            let res = if has_force { _a16_encode_force(txt) } else { a16_encode(txt) }
+            let _w = _write_file(out_path, res)
+        } else {
+            // Decode: use _a16_decode_to_bytes + write_bytes for byte-canonical I/O.
+            let txt = _read_file(in_path)
+            let bytes = _a16_decode_to_bytes(txt)
+            if len(bytes) == 0 {
+                // Fallback: not an A16 stream, write input as-is.
+                let _w = _write_file(out_path, txt)
+            } else {
+                let _w = write_bytes(out_path, bytes)
+            }
+        }
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a16_arithmetic_coder.hexa [--selftest | encode [--force] <in> <out> | decode <in> <out>]")
+    exit(3)
+}
