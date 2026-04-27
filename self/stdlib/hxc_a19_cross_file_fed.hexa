@@ -217,6 +217,198 @@ fn _canonical_key(tag: string, key: string, body: string) -> string {
     return tag + "\x1f" + key + "\x1f" + body
 }
 
+// ───────────────────────── F9 fix: schema-id normalization (PASS 0) ─────────────────────────
+//
+// Problem (F-A19-1 root cause, raw 91 honest C3):
+//   A1 emits per-file auto-incrementing schema IDs (s1, s2, ...). When the SAME
+//   logical schema (same field list, same name) appears in different files
+//   under different per-file IDs, the canonical key `(tag, key=s1, body=fields)`
+//   in file A and `(tag, key=s2, body=fields)` in file B treats them as DISTINCT
+//   patterns. Result: cross-file census understates true repetition; PASS 2 dict
+//   builder misses fed-eligible candidates; on adversarial corpora this also
+//   inflates the per-file dictionary with collision-polluted singletons.
+//
+// Fix (PASS 0 — runs ahead of PASS 1 scanner):
+//   For tag == "schema", derive a canonical-id from the schema fingerprint
+//   (sorted field list). Two schemas with the same fingerprint share the
+//   canonical-id, regardless of per-file s<N> assignment. Other tags whose key
+//   embeds a schema reference (e.g., "<id>.<col>" for dict/enum/colprefix/const,
+//   or "<id>" for rowprefix) get their schema-id portion remapped to the
+//   canonical-id derived from the in-scope schema entry.
+//
+// Algorithm:
+//   1. Collect all `schema` headers across the corpus → list of (file, id, fields)
+//   2. For each, compute fingerprint = djb2(sorted-by-name(fields))
+//   3. Map (file, id) → canonical-id = "S" + hex(fingerprint)
+//   4. PASS 1 reads the map — when classify_header returns tag=schema,
+//      replace the per-file s<N> in the `key` slot with the canonical-id;
+//      for `<id>.<col>` style keys, split, normalize the id half, rejoin.
+//
+// Idempotency contract (raw 65 + 68):
+//   - PASS 0 is read-only over inputs (only mutates the in-memory id map)
+//   - canonical-id is deterministic given fingerprint → re-running PASS 0 on
+//     normalized inputs gives the same map (canonical-id is its own fingerprint)
+//   - encode/decode round-trip unchanged: per-file streams keep their s<N>
+//     IDs verbatim; only the cross-file census uses canonical-id internally.
+//
+// Falsifier (preregistered, F9 follow-up):
+//   F-A19-5: PASS 0 normalization on adversarial corpus (≥2 files with same
+//            field-list under different s<N>) does NOT reduce census key count
+//            below pre-fix → schema-id-norm hypothesis falsified.
+
+// _djb2 — classic djb2 hash returning a 32-bit unsigned-equivalent integer.
+fn _djb2(s: string) -> int {
+    let mut h = 5381
+    let mut i = 0
+    while i < len(s) {
+        let c = _byte_at(s, i)
+        let cv = if len(c) == 0 { 0 } else { _char_code(c) }
+        // h = h * 33 + cv  (mask to 32-bit positive range)
+        h = ((h * 33) + cv) % 4294967296
+        if h < 0 { h = h + 4294967296 }
+        i = i + 1
+    }
+    return h
+}
+
+// _char_code — minimal ASCII char-to-int (raw 9: hexa-only fallback via
+// substring-equality scan; we only need stable hashing, so naive is fine).
+fn _char_code(c: string) -> int {
+    if len(c) == 0 { return 0 }
+    // Compress to ordinal via string compare against an ASCII alphabet.
+    let alphabet = "\x00\x01\x02\x03\x04\x05\x06\x07\x08\x09\x0a\x0b\x0c\x0d\x0e\x0f"
+                 + "\x10\x11\x12\x13\x14\x15\x16\x17\x18\x19\x1a\x1b\x1c\x1d\x1e\x1f"
+                 + " !\"#$%&'()*+,-./0123456789:;<=>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[\\]^_"
+                 + "`abcdefghijklmnopqrstuvwxyz{|}~\x7f"
+    let idx = alphabet.index_of(c)
+    if idx < 0 { return 128 }   // any non-ASCII collapses to a sentinel
+    return idx
+}
+
+// _hex8 — 8-char zero-padded lowercase hex of an int (32-bit positive range).
+fn _hex8(n: int) -> string {
+    let digits = "0123456789abcdef"
+    let mut out = ""
+    let mut v = n
+    if v < 0 { v = -v }
+    let mut i = 0
+    while i < 8 {
+        let nib = v % 16
+        out = digits.substring(nib, nib + 1) + out
+        v = v / 16
+        i = i + 1
+    }
+    return out
+}
+
+// _sort_tokens — split a body on whitespace, sort lexicographically, rejoin.
+// Used to canonicalize a field list — order-independent fingerprinting.
+fn _sort_tokens(body: string) -> string {
+    let parts = split(body, " ")
+    let mut clean = []
+    let mut i = 0
+    while i < len(parts) {
+        let t = parts[i].trim()
+        if len(t) > 0 { clean.push(t) }
+        i = i + 1
+    }
+    // Insertion sort (small N — schemas have <30 fields typical).
+    let mut j = 1
+    while j < len(clean) {
+        let key = clean[j]
+        let mut k = j - 1
+        while k >= 0 && clean[k] > key {
+            clean[k + 1] = clean[k]
+            k = k - 1
+        }
+        clean[k + 1] = key
+        j = j + 1
+    }
+    return clean.join(" ")
+}
+
+// a19_schema_fingerprint — canonical fingerprint for a schema field-list body.
+// Sorted-token djb2 → "S" + 8-hex. Stable across files: identical field set
+// (regardless of declaration order or per-file s<N> assignment) → identical id.
+fn a19_schema_fingerprint(body: string) -> string {
+    let canonical = _sort_tokens(body)
+    return "S" + _hex8(_djb2(canonical))
+}
+
+// a19_build_id_map — PASS 0: for a list of file paths, scan all schema
+// headers and produce a per-file (s<N> → canonical-id) lookup table.
+//
+// Returns parallel arrays [file_paths, per_file_maps] where per_file_maps[i]
+// is itself a [keys, values] pair (parallel arrays of s<N> → canonical-id).
+//
+// For files with no schema headers, the map is [[], []] (empty).
+//
+// Pure read-only over inputs. Deterministic (canonical-id is a hash).
+fn a19_build_id_map(file_paths: array) -> array {
+    let mut files_out = []
+    let mut maps_out = []
+    let mut fi = 0
+    while fi < len(file_paths) {
+        let path = file_paths[fi]
+        let txt = to_string(read_file(path))
+        let entries = _scan_one_file(txt)
+        let mut keys = []
+        let mut vals = []
+        let mut ei = 0
+        while ei < len(entries) {
+            let e = entries[ei]
+            if e[0] == A19_TAG_SCHEMA {
+                let s_id = e[1]      // e.g., "s1"
+                let body = e[2]
+                let canon = a19_schema_fingerprint(body)
+                // Avoid duplicate insertion within the same file.
+                let mut already = false
+                let mut k = 0
+                while k < len(keys) {
+                    if keys[k] == s_id { already = true; break }
+                    k = k + 1
+                }
+                if !already { keys.push(s_id); vals.push(canon) }
+            }
+            ei = ei + 1
+        }
+        files_out.push(path)
+        maps_out.push([keys, vals])
+        fi = fi + 1
+    }
+    return [files_out, maps_out]
+}
+
+// _normalize_id_in_key — given a key like "s1" or "s1.col_x" and a
+// (s_id → canonical-id) map (parallel arrays [keys, vals]), produce the
+// id-normalized variant. Returns input unchanged if no mapping applies.
+fn _normalize_id_in_key(key: string, id_map: array) -> string {
+    if len(key) == 0 { return key }
+    let dot = key.index_of(".")
+    let id_part = if dot < 0 { key } else { key.substring(0, dot) }
+    let tail = if dot < 0 { "" } else { key.substring(dot, len(key)) }
+    let keys = id_map[0]
+    let vals = id_map[1]
+    let mut k = 0
+    while k < len(keys) {
+        if keys[k] == id_part { return vals[k] + tail }
+        k = k + 1
+    }
+    return key
+}
+
+// a19_canonical_key_normalized — canonical key with PASS 0 schema-id norm
+// applied to the `key` slot. Equivalent to _canonical_key when id_map is empty.
+fn a19_canonical_key_normalized(tag: string, key: string, body: string,
+                                 id_map: array) -> string {
+    let needs_norm = (tag == A19_TAG_SCHEMA || tag == A19_TAG_DICT
+                  || tag == A19_TAG_ENUM || tag == A19_TAG_COLPREFIX
+                  || tag == A19_TAG_CONST || tag == A19_TAG_ROWPREFIX)
+    if !needs_norm { return _canonical_key(tag, key, body) }
+    let nk = _normalize_id_in_key(key, id_map)
+    return _canonical_key(tag, nk, body)
+}
+
 // a19_scan_corpus — PASS 1: walk corpus root + aggregate header patterns.
 //
 // Returns: array of [tag, key, body, occ_count, file_count, total_bytes]
@@ -235,6 +427,12 @@ fn _canonical_key(tag: string, key: string, body: string) -> string {
 //     hot patterns. Scanner returns the full census.
 fn a19_scan_corpus(root: string, exts: array) -> array {
     let files = _list_files(root, exts)
+    // PASS 0 (F9 fix): build per-file (s<N> → canonical-id) map for
+    // cross-file schema-id normalization. Keys for tags whose key embeds a
+    // schema reference get the s<N> portion remapped to its canonical-id.
+    // Idempotent + order-independent (sorted-token djb2 fingerprint).
+    let id_map_pair = a19_build_id_map(files)
+    let per_file_maps = id_map_pair[1]
     // Parallel arrays for the dedup map (map_keys preserves insertion order in
     // hexa runtime; using arrays for explicit deterministic iteration ordering).
     let mut keys = []           // canonical_key strings
@@ -250,6 +448,7 @@ fn a19_scan_corpus(root: string, exts: array) -> array {
         let path = files[fi]
         let txt = to_string(read_file(path))
         let entries = _scan_one_file(txt)
+        let id_map = per_file_maps[fi]
         let mut ei = 0
         while ei < len(entries) {
             let e = entries[ei]
@@ -262,7 +461,8 @@ fn a19_scan_corpus(root: string, exts: array) -> array {
                 ei = ei + 1
                 continue
             }
-            let ck = _canonical_key(tag, key, body)
+            // F9 fix: canonical key uses id-normalized variant (PASS 0 output).
+            let ck = a19_canonical_key_normalized(tag, key, body, id_map)
             // Linear search the keys array (corpus pattern count is bounded by
             // total header lines; for nexus 96-file ~12 schemas + ~80 enums
             // → O(few hundred) entries — linear is fine. PASS 2 builds an
@@ -309,7 +509,10 @@ fn a19_scan_corpus(root: string, exts: array) -> array {
 
 // a19_scan_files — PASS 1 variant taking explicit file path array (testable
 // without a real directory). Same return shape as a19_scan_corpus.
+// PASS 0 (F9 fix) applied identically: schema-id normalization on canonical key.
 fn a19_scan_files(file_paths: array) -> array {
+    let id_map_pair = a19_build_id_map(file_paths)
+    let per_file_maps = id_map_pair[1]
     let mut keys = []
     let mut tags = []
     let mut pat_keys = []
@@ -323,6 +526,7 @@ fn a19_scan_files(file_paths: array) -> array {
         let path = file_paths[fi]
         let txt = to_string(read_file(path))
         let entries = _scan_one_file(txt)
+        let id_map = per_file_maps[fi]
         let mut ei = 0
         while ei < len(entries) {
             let e = entries[ei]
@@ -334,7 +538,7 @@ fn a19_scan_files(file_paths: array) -> array {
                 ei = ei + 1
                 continue
             }
-            let ck = _canonical_key(tag, key, body)
+            let ck = a19_canonical_key_normalized(tag, key, body, id_map)
             let mut found = -1
             let mut k = 0
             while k < len(keys) {
@@ -1100,6 +1304,106 @@ fn _selftest() -> int {
                 + to_string(len(solo_text)) + " → " + to_string(len(solo_enc)) + ")")
     }
 
+    // ───── F9 fix: schema-id normalization PASS 0 fixtures (raw 71 retire) ─────
+    //
+    // Five fixtures exercise the canonical-id derivation:
+    //   F9-1: collision detection — two files using s1/s2 for same fields → same canonical-id
+    //   F9-2: canonical-id stability — repeated calls return identical hash
+    //   F9-3: round-trip byte-eq — normalization is a pre-pass; encode/decode unchanged
+    //   F9-4: multi-file consistency — three files, three different s<N>, same fields → 1 group
+    //   F9-5: corruption recovery — empty body / malformed → returns sentinel canonical-id
+    let f9_root = "/tmp/hxc_a19_f9_norm_corpus"
+    let _f9_mkdir = exec("mkdir -p " + _shell_escape(f9_root))
+
+    // F9-1: collision detection
+    let f9_a = "# schema:s1 ts foo bar baz\n@s1 \"2026-01-01\"|1|2|3\n"
+    let f9_b = "# schema:s2 ts foo bar baz\n@s2 \"2026-01-02\"|4|5|6\n"
+    let p9a = f9_root + "/f9_a.hxc"
+    let p9b = f9_root + "/f9_b.hxc"
+    write_file(p9a, f9_a)
+    write_file(p9b, f9_b)
+    let id_map_pair = a19_build_id_map([p9a, p9b])
+    let maps = id_map_pair[1]
+    let map_a = maps[0]   // [[s1], [Sxxxx]]
+    let map_b = maps[1]   // [[s2], [Syyyy]]
+    let canon_a = if len(map_a[1]) > 0 { map_a[1][0] } else { "" }
+    let canon_b = if len(map_b[1]) > 0 { map_b[1][0] } else { "" }
+    if canon_a != "" && canon_a == canon_b {
+        pass = pass + 1
+        println("  PASS: F9-1 collision detection — s1/s2 same fields → " + canon_a)
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-1 mismatch a=" + canon_a + " b=" + canon_b)
+    }
+
+    // F9-2: canonical-id stability
+    let fp1 = a19_schema_fingerprint("ts foo bar baz")
+    let fp2 = a19_schema_fingerprint("ts foo bar baz")
+    let fp3 = a19_schema_fingerprint("baz bar foo ts")     // different order, same set
+    if fp1 == fp2 && fp1 == fp3 {
+        pass = pass + 1
+        println("  PASS: F9-2 fingerprint stable + order-independent (" + fp1 + ")")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-2 fp1=" + fp1 + " fp2=" + fp2 + " fp3=" + fp3)
+    }
+
+    // F9-3: round-trip byte-eq — encoding f9_a unchanged after PASS 0 (passthrough)
+    let f9_a_enc = a19_encode_file(f9_a, parsed, dict_path_test)
+    if f9_a_enc == f9_a {
+        pass = pass + 1
+        println("  PASS: F9-3 round-trip byte-eq (encode unchanged by PASS 0)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-3 byte-eq broken (" + to_string(len(f9_a))
+                + " → " + to_string(len(f9_a_enc)) + ")")
+    }
+
+    // F9-4: multi-file consistency — 3 files, 3 different s<N>, same fields
+    let f9_c = "# schema:s7 ts foo bar baz\n@s7 \"2026-01-03\"|7|8|9\n"
+    let p9c = f9_root + "/f9_c.hxc"
+    write_file(p9c, f9_c)
+    let id_map_pair2 = a19_build_id_map([p9a, p9b, p9c])
+    let maps2 = id_map_pair2[1]
+    let canon_set = []
+    let mut s_idx = 0
+    let mut consistent = true
+    let mut canon_ref = ""
+    while s_idx < len(maps2) {
+        let m = maps2[s_idx]
+        if len(m[1]) > 0 {
+            let v = m[1][0]
+            if canon_ref == "" { canon_ref = v }
+            else if v != canon_ref { consistent = false; break }
+        }
+        s_idx = s_idx + 1
+    }
+    if consistent && canon_ref != "" {
+        pass = pass + 1
+        println("  PASS: F9-4 multi-file consistency — 3 files / 3 ids → 1 canonical (" + canon_ref + ")")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-4 inconsistent canonical ids across files")
+    }
+
+    // F9-5: corruption recovery — empty body, malformed key
+    let fp_empty = a19_schema_fingerprint("")
+    let fp_ws_only = a19_schema_fingerprint("   ")
+    let nk_unmapped = _normalize_id_in_key("s99", [["s1"], ["Sabcdef00"]])   // s99 not in map
+    if len(fp_empty) == 9 && len(fp_ws_only) == 9 && nk_unmapped == "s99" {
+        pass = pass + 1
+        println("  PASS: F9-5 corruption recovery — empty/ws fingerprint stable, unmapped passthrough")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F9-5 fp_empty=" + fp_empty + " fp_ws=" + fp_ws_only
+                + " unmapped=" + nk_unmapped)
+    }
+
+    // Cleanup F9 fixture.
+    if fail == 0 {
+        let _rm9 = exec("rm -rf " + _shell_escape(f9_root))
+    }
+
     // Cleanup fixture (best effort — leave on failure for inspection).
     if fail == 0 {
         let _rm = exec("rm -rf " + _shell_escape(tmp_root))
@@ -1107,7 +1411,7 @@ fn _selftest() -> int {
 
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A19_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (FULL: PASS 1 scanner + PASS 2 dict + PASS 3 encode + PASS 4 decode + 5 fixture round-trip)")
+            + " (FULL+F9: PASS 0 schema-id-norm + PASS 1..4 + 5 fixture round-trip + 5 F9 fixtures)")
     if fail == 0 { return 0 }
     return 1
 }
