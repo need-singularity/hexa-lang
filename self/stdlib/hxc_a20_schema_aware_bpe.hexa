@@ -1,0 +1,482 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a20-schema-aware-bpe", desc="HXC algorithm A20: schema-aware BPE tokenizer (Phase 11 P1 first tick — PASS 1 + PASS 2). Extends A9 BPE with schema-key extraction from `# schema:` headers and pre-seeded vocabulary. Targets mixed JSON+text+Korean corpora where A9's pure byte-pair misses structural-key savings (anima alm_r13 mixed, nexus meta_engine_evolution).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a20_schema_aware_bpe.hexa --selftest)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=PARTIAL-not-yet-implemented)
+//
+// Algorithm spec (raw 9 hexa-only · raw 18 self-host fixpoint · raw 65+68 idempotent):
+//   PASS 1 (schema-key extract): scan `# schema:sN key1 key2 ...` headers; for each
+//                                key emit byte-seq forms ("key", "\"key\":", "|\"key\":").
+//   PASS 2 (vocab build): pre-seed first K vocab slots with schema-key byte-seqs
+//                         (sorted longest-first); apply multi-byte merges to row
+//                         symbol streams; continue A9 byte-pair argmax for (V-K) slots.
+//   PASS 3 (encode): identical to A9 (vocab shape preserved). DEFERRED this tick.
+//   PASS 4 (decode): identical to A9. DEFERRED this tick.
+//
+// Tick 1 scope (this file): PASS 1 + PASS 2 + 1 selftest fixture (synthetic mixed
+// JSON+text). Remaining ~250-300 LoC for PASS 3+4 integration deferred.
+//
+// Falsifiers (raw 71 contract):
+//   F-A20-1: post-A9 marginal saving < 0.05 on mixed JSON+text → reject
+//   F-A20-2: encode/decode round-trip not byte-eq → reject
+//   F-A20-3: schema-key false-positive rate > 5% (key not in any row body) → reject
+//   F-A20-4: vocab build memory > 100MB → reject
+
+// @attr(complexity="O(K*N) pre-seed + O(V*N) merges", memory="O(V + N)")
+
+const A20_VOCAB_SIZE = 64        // total slots, same as A9 default
+const A20_MIN_KEY_LEN = 2        // skip 1-char keys (no compression value)
+const A20_MAX_KEYS = 24          // bound pre-seed slots; A9 byte-pair gets remainder
+const A20_TOKEN_MARKER = 254
+const A20_TOKEN_ESCAPE = 255
+
+// ───────────────────────── byte/string helpers ─────────────────────────
+
+fn _str_to_bytes(s: string) -> array {
+    let mut out = []
+    let mut i = 0
+    let n = len(s)
+    while i < n { out.push(char_code(s, i)); i = i + 1 }
+    return out
+}
+
+fn _bytes_to_str(b: array) -> string {
+    let mut parts = []
+    let mut i = 0
+    while i < len(b) { parts.push(chr(b[i])); i = i + 1 }
+    return parts.join("")
+}
+
+fn _bytes_eq(a: array, b: array) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ───────────────────────── PASS 1: schema-key extraction ─────────────────────────
+
+// Parse a `# schema:sN key1 key2 ...` header line. Returns array of [s_name, [keys]]
+// or null-equivalent (empty schema name) if line is not a schema header.
+fn _parse_schema_header(line: string) -> array {
+    if len(line) < 9 { return ["", []] }
+    if line.substring(0, 9) != "# schema:" { return ["", []] }
+    let rest = line.substring(9, len(line))
+    let sp = rest.find(" ")
+    if sp <= 0 { return [rest, []] }
+    let sname = rest.substring(0, sp)
+    let body = rest.substring(sp + 1, len(rest))
+    // Split on whitespace.
+    let mut keys = []
+    let mut start = 0
+    let mut i = 0
+    while i < len(body) {
+        if body.substring(i, i + 1) == " " {
+            if i > start {
+                let k = body.substring(start, i)
+                if len(k) >= A20_MIN_KEY_LEN { keys.push(k) }
+            }
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start < len(body) {
+        let k = body.substring(start, len(body))
+        if len(k) >= A20_MIN_KEY_LEN { keys.push(k) }
+    }
+    return [sname, keys]
+}
+
+// Helper: true if seq appears as contiguous substring in any of rows (each row =
+// array<int> of bytes).
+fn _seq_in_any_row(seq: array, rows: array) -> bool {
+    let sl = len(seq)
+    if sl == 0 { return false }
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut i = 0
+        while i + sl <= nr {
+            let mut ok = true
+            let mut j = 0
+            while j < sl {
+                if row[i + j] != seq[j] { ok = false; break }
+                j = j + 1
+            }
+            if ok { return true }
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return false
+}
+
+// For each key, emit byte-seq derivative forms used in JSON/HXC bodies:
+//   form 0 = "<key>"           (bare identifier)
+//   form 1 = "\"<key>\":"      (JSON-quoted-key with colon)
+//   form 2 = "|\"<key>\":"     (HXC pipe-delim nested key)
+// Sorted longest-first for greedy match determinism. Deduped.
+// If `corpus_rows` non-empty, filters out forms not present in any row
+// (controls F-A20-3 false-positive rate).
+fn _derive_key_forms(keys: array, corpus_rows: array) -> array {
+    let mut forms = []  // each = array<int> byte-seq
+    let mut k = 0
+    while k < len(keys) {
+        let kk = keys[k]
+        let f0 = _str_to_bytes(kk)
+        let f1 = _str_to_bytes("\"" + kk + "\":")
+        let f2 = _str_to_bytes("|\"" + kk + "\":")
+        forms.push(f1)
+        forms.push(f2)
+        forms.push(f0)
+        k = k + 1
+    }
+    // Dedupe + corpus filter (when corpus provided, drop forms not in any row).
+    let mut uniq = []
+    let mut i = 0
+    let do_filter = len(corpus_rows) > 0
+    while i < len(forms) {
+        let mut dup = false
+        let mut j = 0
+        while j < len(uniq) {
+            if _bytes_eq(forms[i], uniq[j]) { dup = true; break }
+            j = j + 1
+        }
+        if !dup {
+            if do_filter {
+                if _seq_in_any_row(forms[i], corpus_rows) { uniq.push(forms[i]) }
+            } else {
+                uniq.push(forms[i])
+            }
+        }
+        i = i + 1
+    }
+    // Sort longest-first via insertion sort (small N, raw 9 pure-hexa).
+    let mut sorted = []
+    let mut s = 0
+    while s < len(uniq) {
+        let cur = uniq[s]
+        let mut pos = len(sorted)
+        let mut t = 0
+        while t < len(sorted) {
+            if len(cur) > len(sorted[t]) { pos = t; break }
+            t = t + 1
+        }
+        // Insert at pos.
+        let mut new_sorted = []
+        let mut q = 0
+        while q < pos { new_sorted.push(sorted[q]); q = q + 1 }
+        new_sorted.push(cur)
+        let mut q2 = pos
+        while q2 < len(sorted) { new_sorted.push(sorted[q2]); q2 = q2 + 1 }
+        sorted = new_sorted
+        s = s + 1
+    }
+    // Cap at MAX_KEYS.
+    let mut capped = []
+    let mut c = 0
+    while c < len(sorted) && c < A20_MAX_KEYS {
+        capped.push(sorted[c])
+        c = c + 1
+    }
+    return capped
+}
+
+// ───────────────────────── PASS 2: vocab build with pre-seed ─────────────────────────
+
+// Apply multi-byte merge: replace every contiguous occurrence of seq[] in row
+// streams with new_sym. Multi-byte generalisation of A9's pair-merge.
+fn _apply_multibyte_merge(rows: array, seq: array, new_sym: int) -> array {
+    let sl = len(seq)
+    let mut out = []
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut new_row = []
+        let mut i = 0
+        while i < nr {
+            // Try match seq starting at i.
+            let mut match_ok = false
+            if i + sl <= nr && sl > 0 {
+                match_ok = true
+                let mut j = 0
+                while j < sl {
+                    if row[i + j] != seq[j] { match_ok = false; break }
+                    j = j + 1
+                }
+            }
+            if match_ok {
+                new_row.push(new_sym)
+                i = i + sl
+            } else {
+                new_row.push(row[i])
+                i = i + 1
+            }
+        }
+        out.push(new_row)
+        r = r + 1
+    }
+    return out
+}
+
+// Build vocab with K pre-seed entries first, then (V-K) byte-pair merges.
+// Returns array of [token_id, byte_seq] entries.  Byte-pair merges share
+// helpers with A9 in spirit but inlined here for tick-1 self-containment.
+fn _count_byte_pairs(rows: array) -> array {
+    let mut entries = []
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut i = 0
+        while i + 1 < nr {
+            let a = row[i]
+            let b = row[i + 1]
+            let mut found = -1
+            let mut k = 0
+            while k < len(entries) {
+                if entries[k][0] == a && entries[k][1] == b { found = k; break }
+                k = k + 1
+            }
+            if found >= 0 { entries[found][2] = entries[found][2] + 1 }
+            else { entries.push([a, b, 1]) }
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return entries
+}
+
+fn _find_max_pair(pairs: array) -> array {
+    if len(pairs) == 0 { return [-1, -1, 0] }
+    let mut best = pairs[0]
+    let mut k = 1
+    while k < len(pairs) {
+        let p = pairs[k]
+        if p[2] > best[2] { best = p }
+        else if p[2] == best[2] {
+            if p[0] < best[0] || (p[0] == best[0] && p[1] < best[1]) { best = p }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+fn _apply_pair_merge(rows: array, a: int, b: int, new_sym: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut new_row = []
+        let mut i = 0
+        while i < nr {
+            if i + 1 < nr && row[i] == a && row[i + 1] == b {
+                new_row.push(new_sym); i = i + 2
+            } else {
+                new_row.push(row[i]); i = i + 1
+            }
+        }
+        out.push(new_row)
+        r = r + 1
+    }
+    return out
+}
+
+// PASS 2 main: pre-seed pre_seed_forms first, then fill (V-K) slots via A9 byte-pair.
+fn a20_build_vocab(rows: array, pre_seed_forms: array, target_size: int) -> array {
+    let mut vocab = []
+    let mut sym_expand = []
+    let mut work = rows
+    // Phase A: pre-seed.
+    let mut k = 0
+    while k < len(pre_seed_forms) && k < target_size {
+        let seq = pre_seed_forms[k]
+        let new_sym = 256 + k
+        sym_expand.push(seq)
+        vocab.push([new_sym, seq])
+        work = _apply_multibyte_merge(work, seq, new_sym)
+        k = k + 1
+    }
+    // Phase B: byte-pair argmax for remaining slots.
+    while k < target_size {
+        let pairs = _count_byte_pairs(work)
+        if len(pairs) == 0 { break }
+        let best = _find_max_pair(pairs)
+        if best[2] < 2 { break }
+        let new_sym = 256 + k
+        let a = best[0]
+        let b = best[1]
+        let exp_a = if a < 256 { [a] } else { sym_expand[a - 256] }
+        let exp_b = if b < 256 { [b] } else { sym_expand[b - 256] }
+        let mut combined = []
+        let mut x = 0
+        while x < len(exp_a) { combined.push(exp_a[x]); x = x + 1 }
+        let mut y = 0
+        while y < len(exp_b) { combined.push(exp_b[y]); y = y + 1 }
+        sym_expand.push(combined)
+        vocab.push([new_sym, combined])
+        work = _apply_pair_merge(work, a, b, new_sym)
+        k = k + 1
+    }
+    return vocab
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _selftest() -> int {
+    println("# hxc_a20_schema_aware_bpe selftest (Phase 11 P1 tick 1)")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture 1: PASS 1 schema-key extraction + PASS 2 pre-seed on synthetic
+    // mixed JSON+text fixture.  Goal: confirm schema-keys pre-seeded, BPE
+    // continues normally, vocab size <= target.
+    let header = "# schema:s1 axes_acted axes_noop reason"
+    let parsed = _parse_schema_header(header)
+    let sname = parsed[0]
+    let keys = parsed[1]
+    if sname == "s1" && len(keys) == 3 {
+        pass = pass + 1
+        println("  PASS: F1.1 schema-header parse sname=" + sname + " keys=" + to_string(len(keys)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.1 schema-header parse sname=" + sname + " keys=" + to_string(len(keys)))
+    }
+
+    // Build synthetic corpus FIRST so derive can corpus-filter forms.
+    let row_text = "\"axes_acted\":[\"E2\"]|\"axes_noop\":[\"A1\"]|\"reason\":\"K2\""
+    let mut rows = []
+    let mut i = 0
+    while i < 8 {
+        rows.push(_str_to_bytes(row_text))
+        i = i + 1
+    }
+
+    let pre_seed = _derive_key_forms(keys, rows)
+    // 3 keys × 3 forms = 9 candidates; corpus-filter drops forms not present.
+    // Expected: form 1 ("<k>":) for all 3 keys, form 2 (|"<k>":) for axes_noop
+    // and reason (axes_acted is row-leading, no preceding pipe), form 0 (<k>) for
+    // all 3 keys → 3 + 2 + 3 = 8 forms.
+    if len(pre_seed) == 8 && len(pre_seed[0]) >= len(pre_seed[len(pre_seed) - 1]) {
+        pass = pass + 1
+        println("  PASS: F1.2 pre-seed forms count=" + to_string(len(pre_seed)) + " longest-first + corpus-filtered OK")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.2 pre-seed forms count=" + to_string(len(pre_seed)) + " expected 8 (sort/dedup/filter)")
+    }
+
+    let vocab = a20_build_vocab(rows, pre_seed, A20_VOCAB_SIZE)
+    // First N entries should be pre-seed forms (token IDs 256..256+N-1).
+    let preseed_n = if len(pre_seed) < A20_VOCAB_SIZE { len(pre_seed) } else { A20_VOCAB_SIZE }
+    let mut preseed_match = true
+    let mut p = 0
+    while p < preseed_n {
+        if vocab[p][0] != 256 + p { preseed_match = false; break }
+        if !_bytes_eq(vocab[p][1], pre_seed[p]) { preseed_match = false; break }
+        p = p + 1
+    }
+    if preseed_match && len(vocab) <= A20_VOCAB_SIZE {
+        pass = pass + 1
+        println("  PASS: F1.3 vocab pre-seed first " + to_string(preseed_n) + " entries match; total=" + to_string(len(vocab)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.3 vocab pre-seed mismatch or oversized total=" + to_string(len(vocab)))
+    }
+
+    // F-A20-3 false-positive check: every pre-seed form should appear as a
+    // substring in at least one row body (else PASS 1 noisy).
+    let mut fp = 0
+    let mut k = 0
+    while k < len(pre_seed) {
+        let seq = pre_seed[k]
+        let mut seen = false
+        let mut r = 0
+        while r < len(rows) {
+            let row = rows[r]
+            let nr = len(row)
+            let sl = len(seq)
+            let mut ii = 0
+            while ii + sl <= nr {
+                let mut ok = true
+                let mut jj = 0
+                while jj < sl {
+                    if row[ii + jj] != seq[jj] { ok = false; break }
+                    jj = jj + 1
+                }
+                if ok { seen = true; break }
+                ii = ii + 1
+            }
+            if seen { break }
+            r = r + 1
+        }
+        if !seen { fp = fp + 1 }
+        k = k + 1
+    }
+    let fp_rate = if len(pre_seed) > 0 { (fp * 100) / len(pre_seed) } else { 0 }
+    if fp_rate <= 5 {
+        pass = pass + 1
+        println("  PASS: F1.4 schema-key false-positive rate " + to_string(fp_rate) + "% <= 5% (F-A20-3)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.4 false-positive rate " + to_string(fp_rate) + "% > 5% (F-A20-3 fires)")
+    }
+
+    // F1.5: rough saving signal — count of pre-seed merges applied to row symbol
+    // streams should reduce symbol count substantially. Compare pre-merge byte
+    // count vs post-pre-seed-merge symbol count (informational; not a falsifier
+    // since PASS 3 encode + wire format deferred to tick 2).
+    let mut work = []
+    let mut rr = 0
+    while rr < len(rows) {
+        let mut copy = []
+        let mut cc = 0
+        while cc < len(rows[rr]) { copy.push(rows[rr][cc]); cc = cc + 1 }
+        work.push(copy)
+        rr = rr + 1
+    }
+    let mut original_syms = 0
+    let mut w0 = 0
+    while w0 < len(work) { original_syms = original_syms + len(work[w0]); w0 = w0 + 1 }
+    // Apply pre-seed merges only.
+    let mut ps = 0
+    while ps < len(pre_seed) {
+        work = _apply_multibyte_merge(work, pre_seed[ps], 256 + ps)
+        ps = ps + 1
+    }
+    let mut after_syms = 0
+    let mut w1 = 0
+    while w1 < len(work) { after_syms = after_syms + len(work[w1]); w1 = w1 + 1 }
+    let saving_pct = if original_syms > 0 { ((original_syms - after_syms) * 100) / original_syms } else { 0 }
+    println("  INFO: F1.5 pre-seed-only symbol reduction: " + to_string(original_syms) + " -> " + to_string(after_syms) + " (" + to_string(saving_pct) + "% sym-count reduction; wire-byte saving deferred to tick 2)")
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A20_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────────────── CLI entry (PARTIAL — PASS 3+4 deferred) ─────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    eprintln("hxc_a20_schema_aware_bpe: PARTIAL implementation (Phase 11 P1 tick 1)")
+    eprintln("  PASS 1 schema-key extraction: LIVE")
+    eprintln("  PASS 2 vocab build with pre-seed: LIVE")
+    eprintln("  PASS 3 encode + PASS 4 decode + integration: DEFERRED to tick 2/3")
+    eprintln("usage: hexa hxc_a20_schema_aware_bpe.hexa --selftest")
+    exit(4)
+}
