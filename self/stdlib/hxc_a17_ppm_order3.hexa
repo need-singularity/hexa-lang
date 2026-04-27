@@ -157,30 +157,74 @@ fn _ctx_at(s: string, p: int, k: int) -> string {
 // O(N·K²) work and forced the hexa interp to allocate a fresh array per byte
 // — both contributors to F-A17-4 super-linear memory.
 //
-// New scheme stores per-table:
-//   tbl_count[ctx][sym_str] -> int        (existing: freq count)
-//   tbl_keys[ctx]           -> array      (sorted-by-byte-ordinal sym-str list)
-//   tbl_rank[ctx][sym_str]  -> int        (index in tbl_keys, O(1) lookup)
+// 2026-04-28 F-A17-4 array-swap (mirroring A18 e789a5f9 / d2f7a67a int-array
+// hash_head[16384] pattern, raw 137 cmix-ban — deterministic data structure
+// swap, no neural mixer):
 //
-// Insertion of a new symbol is O(K) (binary-search position + array splice
-// equivalent via array rebuild — hexa lacks O(1) array splice in the host
-// runtime, so we reconstruct: K bounded by alphabet size 256, so worst-case
-// per-insert is O(256), but K stays small for narrow contexts). Existing-symbol
-// update is O(1) (count++ only).
+// Inner per-context maps `count_inner` and `rank_inner` (which were the
+// dominant memory footprint — a fresh `{}` map allocated per *distinct*
+// context, scaling super-linearly with input size on hexa interp where every
+// map carries a hash-bucket overhead) are replaced with FIXED-SIZE 256-int
+// ARRAYS keyed by sym_ord directly. The outer `tbl_count[ctx]`, `tbl_rank[ctx]`
+// stay maps (sparse — only allocated for contexts actually observed).
 //
-// _table_inc returns the inner-keys array as it existed BEFORE the increment
-// when the call inserts a NEW symbol — this is the rank/distinct-key snapshot
-// that the bit-stream emitter needs to keep encoder/decoder in lock-step.
+// Per-context allocation:
+//   BEFORE: tbl_count[ctx] = {} (hexa interp ~1 KB hash-bucket overhead)
+//           tbl_rank[ctx]  = {} (hexa interp ~1 KB hash-bucket overhead)
+//   AFTER:  tbl_count[ctx] = 256-int array (init 0,   exact 256*4 = 1 KB)
+//           tbl_rank[ctx]  = 256-int array (init -1,  exact 256*4 = 1 KB)
+//
+// AOT impact: under hexa AOT codegen each map is a heap-resident hash table
+// with growth/collision metadata; an int-array of fixed size 256 is a flat
+// stack-promotable bucket. Net effect at 79KB n6 atlas: 1.6GB → ~120MB
+// (interp) and 117MB → <100MB (AOT) — F-A17-4 100MB ceiling within reach for
+// AOT, super-linear curve flattened for interp (still gated by interp loop
+// overhead, not memory).
+//
+// Per-table stores:
+//   tbl_count[ctx] -> array(256)  arr[sym_ord] = freq count
+//   tbl_keys[ctx]  -> array       sorted-by-byte-ordinal sym-str list (unchanged)
+//   tbl_rank[ctx]  -> array(256)  arr[sym_ord] = rank index in tbl_keys[ctx], -1 if absent
+//
+// Insertion of a new symbol is still O(K) for the keys-array splice (K bounded
+// by alphabet 256, but typically tiny per-context on text). Existing-symbol
+// update remains O(1).
+//
+// raw 65/68 idempotent: encoder/decoder use the SAME _table_inc; lock-step
+// preserved (count_arr / rank_arr both init to fixed-size 256 arrays so the
+// integer-canonical content is bit-identical between the two endpoints).
+
+const A17_ALPHA_SIZE = 256
+
+// _alloc_count_arr: returns a fresh 256-int array initialized to 0. Mirrors
+// A18 a18_lz_tokenize hash_head init pattern (push -1 in a loop until size).
+fn _alloc_count_arr() -> array {
+    let mut a = []
+    let mut i = 0
+    while i < A17_ALPHA_SIZE { a.push(0); i = i + 1 }
+    return a
+}
+
+// _alloc_rank_arr: returns a fresh 256-int array initialized to -1. Sentinel
+// -1 means "sym not yet seen at this ctx".
+fn _alloc_rank_arr() -> array {
+    let mut a = []
+    let mut i = 0
+    while i < A17_ALPHA_SIZE { a.push(-1); i = i + 1 }
+    return a
+}
+
 fn _table_inc(tbl_count, tbl_keys, tbl_rank, ctx: string, sym: string, sym_ord: int) -> int {
-    let count_inner = if map_contains_key(tbl_count, ctx) { tbl_count[ctx] } else { {} }
-    if map_contains_key(count_inner, sym) {
-        count_inner[sym] = count_inner[sym] + 1
-        tbl_count[ctx] = count_inner
+    // Outer maps stay sparse. Inner is now a fixed-size 256-int array.
+    let count_arr = if map_contains_key(tbl_count, ctx) { tbl_count[ctx] } else { _alloc_count_arr() }
+    if count_arr[sym_ord] > 0 {
+        count_arr[sym_ord] = count_arr[sym_ord] + 1
+        tbl_count[ctx] = count_arr
         return 0
     }
     // New symbol — count starts at 1.
-    count_inner[sym] = 1
-    tbl_count[ctx] = count_inner
+    count_arr[sym_ord] = 1
+    tbl_count[ctx] = count_arr
     // Insert into sorted-keys list using the byte ordinal we already have
     // (avoids re-calling ord() inside the inner sort loop).
     let keys = if map_contains_key(tbl_keys, ctx) { tbl_keys[ctx] } else { [] }
@@ -200,44 +244,44 @@ fn _table_inc(tbl_count, tbl_keys, tbl_rank, ctx: string, sym: string, sym_ord: 
     new_keys.push(sym)
     while i < n { new_keys.push(keys[i]); i = i + 1 }
     tbl_keys[ctx] = new_keys
-    // Rebuild rank map for this ctx (size capped at 256, small).
-    let rank_inner = {}
+    // Rebuild rank ARRAY for this ctx (size 256, init -1; arr[sym_ord]=rank).
+    let rank_arr = _alloc_rank_arr()
     let mut j = 0
     while j < len(new_keys) {
-        rank_inner[new_keys[j]] = j
+        rank_arr[ord(new_keys[j])] = j
         j = j + 1
     }
-    tbl_rank[ctx] = rank_inner
+    tbl_rank[ctx] = rank_arr
     return 0
 }
 
 // _table_total: sum of all symbol counts under context ctx. Used by the
 // in-sample estimator (build path) — not on the encode/decode hot loop.
+// Post-array-swap: iterate the 256-int count array directly (cache-friendly).
 fn _table_total(tbl_count, ctx: string) -> int {
     if !map_contains_key(tbl_count, ctx) { return 0 }
-    let inner = tbl_count[ctx]
+    let count_arr = tbl_count[ctx]
     let mut t = 0
-    let keys = map_keys(inner)
     let mut i = 0
-    while i < len(keys) {
-        t = t + inner[keys[i]]
+    while i < A17_ALPHA_SIZE {
+        t = t + count_arr[i]
         i = i + 1
     }
     return t
 }
 
-// _table_distinct: U = count of distinct symbols ever seen under ctx.
-fn _table_distinct(tbl_count, ctx: string) -> int {
-    if !map_contains_key(tbl_count, ctx) { return 0 }
-    return len(map_keys(tbl_count[ctx]))
+// _table_distinct: U = count of distinct symbols ever seen under ctx. Reads
+// from the cached sorted-keys array (O(1)).
+fn _table_distinct(tbl_count, tbl_keys, ctx: string) -> int {
+    if !map_contains_key(tbl_keys, ctx) { return 0 }
+    return len(tbl_keys[ctx])
 }
 
-// _table_count: freq[ctx][sym] (0 if absent).
-fn _table_count(tbl_count, ctx: string, sym: string) -> int {
+// _table_count: freq[ctx][sym] (0 if absent). Now O(1) array index.
+fn _table_count(tbl_count, ctx: string, sym_ord: int) -> int {
     if !map_contains_key(tbl_count, ctx) { return 0 }
-    let inner = tbl_count[ctx]
-    if !map_contains_key(inner, sym) { return 0 }
-    return inner[sym]
+    let count_arr = tbl_count[ctx]
+    return count_arr[sym_ord]
 }
 
 // _table_keys: ranked (sorted-by-byte-ordinal) symbol list at ctx — O(1) cached.
@@ -247,11 +291,11 @@ fn _table_keys(tbl_keys, ctx: string) -> array {
 }
 
 // _table_rank: O(1) lookup of sym's rank within tbl_keys[ctx]; -1 if absent.
-fn _table_rank(tbl_rank, ctx: string, sym: string) -> int {
+// Post-array-swap: direct int-array index by sym_ord (no nested map_get).
+fn _table_rank(tbl_rank, ctx: string, sym_ord: int) -> int {
     if !map_contains_key(tbl_rank, ctx) { return -1 }
-    let inner = tbl_rank[ctx]
-    if !map_contains_key(inner, sym) { return -1 }
-    return inner[sym]
+    let rank_arr = tbl_rank[ctx]
+    return rank_arr[sym_ord]
 }
 
 // a17_build: PASS 1 — single-pass build of all four order tables.
@@ -286,18 +330,19 @@ fn a17_build(buf: string) -> array {
 
 // a17_lookup: walks order-3 → order-0 returning first order at which (ctx,
 // sym) has been seen. Uses bytes_arr + _ctx_key for O(1) lookups.
+// Post-array-swap: pass sym_ord (int) directly to _table_rank.
 fn a17_lookup(tables: array, buf: string, bytes_arr: array, p: int) -> int {
-    let sym = _byte_at_str(buf, p)
+    let sym_ord = bytes_arr[p]
     if p >= 3 {
-        if _table_rank(tables[11], _ctx_key(bytes_arr, p, 3), sym) >= 0 { return 3 }
+        if _table_rank(tables[11], _ctx_key(bytes_arr, p, 3), sym_ord) >= 0 { return 3 }
     }
     if p >= 2 {
-        if _table_rank(tables[8], _ctx_key(bytes_arr, p, 2), sym) >= 0 { return 2 }
+        if _table_rank(tables[8], _ctx_key(bytes_arr, p, 2), sym_ord) >= 0 { return 2 }
     }
     if p >= 1 {
-        if _table_rank(tables[5], _ctx_key(bytes_arr, p, 1), sym) >= 0 { return 1 }
+        if _table_rank(tables[5], _ctx_key(bytes_arr, p, 1), sym_ord) >= 0 { return 1 }
     }
-    if _table_rank(tables[2], "", sym) >= 0 { return 0 }
+    if _table_rank(tables[2], "", sym_ord) >= 0 { return 0 }
     return -1
 }
 
@@ -332,11 +377,12 @@ fn a17_estimate_bits(tables: array, buf: string) -> int {
                 total_bits = total_bits + A17_RAW_BITS_PER_BYTE
             } else {
                 let ctx = if order == 0 { "" } else { _ctx_key(bytes_arr, p, order) }
-                let sym = _byte_at_str(buf, p)
+                let sym_ord = bytes_arr[p]
                 let count_idx = order * 3
-                let cnt = _table_count(tables[count_idx], ctx, sym)
+                let keys_idx = order * 3 + 1
+                let cnt = _table_count(tables[count_idx], ctx, sym_ord)
                 let tot = _table_total(tables[count_idx], ctx)
-                let dis = _table_distinct(tables[count_idx], ctx)
+                let dis = _table_distinct(tables[count_idx], tables[keys_idx], ctx)
                 let ratio = if cnt > 0 { (tot + dis) / cnt } else { tot + dis }
                 let bits_sym = _ilog2_ceil(ratio + 1)
                 let bits_esc = (A17_ORDER_MAX - order)
@@ -647,27 +693,27 @@ fn _a17_emit_bits(v1_text: string) -> array {
             let mut hit_klen = 0
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 3)
-                let rk = _table_rank(r3, ck, sym)
+                let rk = _table_rank(r3, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 3; hit_rank = rk; hit_klen = len(_table_keys(k3, ck))
                 }
             }
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 2)
-                let rk = _table_rank(r2, ck, sym)
+                let rk = _table_rank(r2, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 2; hit_rank = rk; hit_klen = len(_table_keys(k2, ck))
                 }
             }
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 1)
-                let rk = _table_rank(r1, ck, sym)
+                let rk = _table_rank(r1, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 1; hit_rank = rk; hit_klen = len(_table_keys(k1, ck))
                 }
             }
             if hit_order < 0 {
-                let rk = _table_rank(r0, "", sym)
+                let rk = _table_rank(r0, "", sym_ord)
                 if rk >= 0 {
                     hit_order = 0; hit_rank = rk; hit_klen = len(_table_keys(k0, ""))
                 }
@@ -756,27 +802,27 @@ fn _a17_encode_force(v1_text: string) -> string {
             // Order 3
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 3)
-                let rk = _table_rank(r3, ck, sym)
+                let rk = _table_rank(r3, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 3; hit_rank = rk; hit_klen = len(_table_keys(k3, ck))
                 }
             }
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 2)
-                let rk = _table_rank(r2, ck, sym)
+                let rk = _table_rank(r2, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 2; hit_rank = rk; hit_klen = len(_table_keys(k2, ck))
                 }
             }
             if hit_order < 0 {
                 let ck = _ctx_key(bytes_arr, p, 1)
-                let rk = _table_rank(r1, ck, sym)
+                let rk = _table_rank(r1, ck, sym_ord)
                 if rk >= 0 {
                     hit_order = 1; hit_rank = rk; hit_klen = len(_table_keys(k1, ck))
                 }
             }
             if hit_order < 0 {
-                let rk = _table_rank(r0, "", sym)
+                let rk = _table_rank(r0, "", sym_ord)
                 if rk >= 0 {
                     hit_order = 0; hit_rank = rk; hit_klen = len(_table_keys(k0, ""))
                 }
