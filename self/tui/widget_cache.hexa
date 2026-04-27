@@ -1,0 +1,167 @@
+#!hexa strict
+// self/tui/widget_cache.hexa — TUI-PRIM L4+ widget render cache
+//
+// Memoize widget render output by state hash. When a widget is asked
+// to render with the same state as last frame, the back buffer is
+// already in the rendered state (L3 in-place buffer reuse, commit
+// fca43e81), so we can SKIP the widget's render_put calls entirely.
+//
+// Saves the per-cell render_put overhead (~100ns/cell on Mac arm64)
+// for widgets whose state didn't change. For a 10-widget UI where 1
+// widget changes per frame, saves 9×N_cells × 100ns of work.
+//
+// USAGE
+//   let hash = widget_state_hash(["arg1", to_string(num), more])
+//   if widget_should_render("my-widget", hash) {
+//       box_draw(...)
+//       text_label(...)
+//   }
+//
+// API (single-pass cache; one entry per widget id):
+//   widget_should_render(id, hash) -> bool   (true = state changed, render
+//                                             needed; false = same as last
+//                                             frame, skip)
+//   widget_cache_clear()                     (reset all entries)
+//   widget_cache_size() -> int               (entries tracked)
+//
+// IMPLEMENTATION
+//   Two parallel arrays: _ids[] and _hashes[]. On widget_should_render,
+//   linear scan _ids[] to find matching id; if hash matches, return
+//   false (skip); else update hash + return true.
+//   For typical UIs (<20 widgets), linear scan is faster than hash-
+//   table overhead. Switch to a real map when entry count > 50.
+
+let mut _ids = []
+let mut _hashes = []
+
+// State hash: simple FNV-1a over concatenated string args. Fast +
+// good enough collision resistance for widget state (we only need to
+// distinguish "same as last frame" from "different").
+pub fn widget_state_hash(args: array) -> string {
+    let mut h = 2166136261
+    let mut i = 0
+    while i < len(args) {
+        let s = args[i]
+        let n = len(s)
+        let mut j = 0
+        while j < n {
+            let cp = char_code(s, j)
+            h = (h ^ cp) * 16777619
+            // Mask to 32 bits to keep within int range
+            h = h & 4294967295
+            j = j + 1
+        }
+        // Separator between args so ["ab", "c"] != ["a", "bc"]
+        h = (h ^ 31) * 16777619
+        h = h & 4294967295
+        i = i + 1
+    }
+    return to_string(h)
+}
+
+pub fn widget_should_render(id: string, hash: string) -> bool {
+    let mut i = 0
+    while i < len(_ids) {
+        if _ids[i] == id {
+            if _hashes[i] == hash { return false }   // same — skip
+            _hashes[i] = hash
+            return true
+        }
+        i = i + 1
+    }
+    // First-time render — record + indicate render needed.
+    // Use rebuild-and-reassign instead of .push() (same toolchain bug
+    // workaround as self/tui/input.hexa:input_inject_bytes — top-level
+    // mut array .push() from inside a fn SIGSEGVs in this hexa build).
+    let mut new_ids = []
+    let mut new_hashes = []
+    let mut k = 0
+    while k < len(_ids) {
+        new_ids.push(_ids[k])
+        new_hashes.push(_hashes[k])
+        k = k + 1
+    }
+    new_ids.push(id)
+    new_hashes.push(hash)
+    _ids = new_ids
+    _hashes = new_hashes
+    return true
+}
+
+pub fn widget_cache_clear() {
+    _ids = []
+    _hashes = []
+}
+
+pub fn widget_cache_size() -> int { return len(_ids) }
+
+// Batch-clear: drop all entries whose id is NOT in the keep_set. Used
+// at frame end to GC widgets that disappeared from the tree.
+pub fn widget_cache_retain(keep_set: array) -> int {
+    let mut new_ids = []
+    let mut new_hashes = []
+    let mut i = 0
+    while i < len(_ids) {
+        let id = _ids[i]
+        let mut keep = false
+        let mut j = 0
+        while j < len(keep_set) {
+            if keep_set[j] == id { keep = true; break }
+            j = j + 1
+        }
+        if keep {
+            new_ids.push(id)
+            new_hashes.push(_hashes[i])
+        }
+        i = i + 1
+    }
+    let dropped = len(_ids) - len(new_ids)
+    _ids = new_ids
+    _hashes = new_hashes
+    return dropped
+}
+
+// ─── selftest ────────────────────────────────────────────────
+
+pub fn widget_cache_selftest() -> int {
+    println("self/tui/widget_cache — selftest")
+    widget_cache_clear()
+
+    // First render — should return true (render needed)
+    let h1 = widget_state_hash(["foo", "1"])
+    if !widget_should_render("a", h1) { return 1 }
+    if widget_cache_size() != 1 { return 2 }
+
+    // Second call with same id + same hash — should return false (skip)
+    if widget_should_render("a", h1) { return 3 }
+
+    // Different hash for same id — should return true (render needed)
+    let h2 = widget_state_hash(["foo", "2"])
+    if !widget_should_render("a", h2) { return 4 }
+    if widget_cache_size() != 1 { return 5 }   // still 1 entry
+
+    // New id — render needed
+    let hb = widget_state_hash(["bar"])
+    if !widget_should_render("b", hb) { return 6 }
+    if widget_cache_size() != 2 { return 7 }
+
+    // Hash determinism
+    let hx1 = widget_state_hash(["x", "y"])
+    let hx2 = widget_state_hash(["x", "y"])
+    if hx1 != hx2 { return 8 }
+
+    // Hash separates concatenations differently
+    let hab1 = widget_state_hash(["ab", "c"])
+    let hab2 = widget_state_hash(["a", "bc"])
+    if hab1 == hab2 { return 9 }
+
+    // Retain — drop "a", keep "b"
+    let dropped = widget_cache_retain(["b"])
+    if dropped != 1 { return 10 }
+    if widget_cache_size() != 1 { return 11 }
+    if !widget_should_render("a", h1) { return 12 }   // "a" was dropped, re-render
+    if widget_should_render("b", hb) { return 13 }    // "b" still cached, skip
+
+    println("widget_cache selftest OK")
+    return 0
+}
