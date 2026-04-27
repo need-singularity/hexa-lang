@@ -1,0 +1,274 @@
+#!hexa strict
+// self/tui/wire/editor_bridge.hexa — TUI-PRIM T1.C Surface 4 real impl
+//
+// JSON-RPC dispatcher for editor (jetbrains/vscode) plugins driving a
+// hexa-native L1-L5 widget tree. Counterpart of Surface 2 (line-array,
+// pi TUI Component) — same back-buffer source, different wire format.
+//
+// METHODS
+//   render        params=null               result={"lines":["row0",...,"rowN-1"],"rows":N,"cols":M}
+//   key           params=[byte0, byte1, …]  result={"ok":true}
+//   resize        params={"rows":R,"cols":C} result={"ok":true,"rows":R,"cols":C}
+//   quit          params=null               result={"ok":true}  (and exits)
+//
+// PROTOCOL
+//   stdin/stdout : line-delimited JSON-RPC 2.0 envelopes (one per line).
+//   Request shape  : {"jsonrpc":"2.0","id":<int>,"method":<str>,"params":<any>}
+//   Response shape : {"jsonrpc":"2.0","id":<int>,"result":<any>}
+//   Error shape    : {"jsonrpc":"2.0","id":<int>,"error":{"code":<int>,"message":<str>}}
+//
+// SCOPE
+//   Spec helpers + envelope construction live in self/tui/wire.hexa.
+//   This module is the dispatch loop driver — call run_editor_bridge()
+//   from a tool/* binary that wraps the hexa TUI.
+//
+// NOT IN SCOPE FOR T1.C
+//   - Streaming notifications (server-pushed events without id)
+//   - Token-streaming responses
+//   - Authentication / session tokens
+//   - Multi-client multiplexing
+
+use "self/tui/render"
+use "self/tui/wire"
+
+// ─── minimal JSON parser (line-delimited single-object envelopes) ───
+//
+// We only parse one envelope per stdin line. The envelope is JSON but
+// we accept a SUBSET — top-level object with string keys whose values
+// are: string, integer, null, or simple array. No nested objects beyond
+// the params/result/error keys. This is sufficient for the 4 supported
+// methods. A full JSON parser would be future work.
+
+fn _parse_envelope(line: string) -> array {
+    // Returns [method_str, id_int, params_str_subset_or_null]
+    // Best-effort: scans for "method":"<x>", "id":<n>, "params":<...>.
+    let method = _extract_string_value(line, "\"method\":\"")
+    let id_str = _extract_int_value(line, "\"id\":")
+    let id = if id_str == "" { -1 } else { _atoi(id_str) }
+    return [method, id, ""]   // params unused by current methods
+}
+
+fn _extract_string_value(line: string, key: string) -> string {
+    let idx = _find_substring(line, key)
+    if idx < 0 { return "" }
+    let start = idx + len(key)
+    let n = len(line)
+    // Scan for closing quote (no escape handling yet)
+    let mut i = start
+    while i < n {
+        if line.substring(i, i + 1) == "\"" { break }
+        i = i + 1
+    }
+    return line.substring(start, i)
+}
+
+fn _extract_int_value(line: string, key: string) -> string {
+    let idx = _find_substring(line, key)
+    if idx < 0 { return "" }
+    let start = idx + len(key)
+    let n = len(line)
+    let mut i = start
+    // Skip optional leading whitespace
+    while i < n {
+        let ch = line.substring(i, i + 1)
+        if ch != " " && ch != "\t" { break }
+        i = i + 1
+    }
+    let mut digits_start = i
+    if i < n && line.substring(i, i + 1) == "-" { i = i + 1 }
+    while i < n {
+        let ch = line.substring(i, i + 1)
+        let cp = char_code(ch, 0)
+        if cp < 48 || cp > 57 { break }
+        i = i + 1
+    }
+    return line.substring(digits_start, i)
+}
+
+fn _find_substring(haystack: string, needle: string) -> int {
+    let nh = len(haystack)
+    let nn = len(needle)
+    if nn > nh { return -1 }
+    let mut i = 0
+    while i + nn <= nh {
+        if haystack.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+fn _atoi(s: string) -> int {
+    let mut acc = 0
+    let mut i = 0
+    let n = len(s)
+    if n == 0 { return 0 }
+    let mut neg = 0
+    if s.substring(0, 1) == "-" { neg = 1; i = 1 }
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let cp = char_code(ch, 0)
+        if cp < 48 || cp > 57 { return 0 }
+        acc = acc * 10 + (cp - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - acc }
+    return acc
+}
+
+// ─── method handlers ────────────────────────────────────────────
+
+fn _build_render_result_json() -> string {
+    let lines = wire_pi_render_lines()
+    let mut parts = []
+    parts.push("{\"rows\":")
+    parts.push(to_string(render_rows()))
+    parts.push(",\"cols\":")
+    parts.push(to_string(render_cols()))
+    parts.push(",\"lines\":[")
+    let mut i = 0
+    while i < len(lines) {
+        if i > 0 { parts.push(",") }
+        parts.push("\"")
+        parts.push(_json_escape(lines[i]))
+        parts.push("\"")
+        i = i + 1
+    }
+    parts.push("]}")
+    return parts.join("")
+}
+
+fn _json_escape(s: string) -> string {
+    let n = len(s)
+    let mut parts = []
+    let mut i = 0
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let cp = char_code(ch, 0)
+        if ch == "\"" {
+            parts.push("\\\"")
+        } else if ch == "\\" {
+            parts.push("\\\\")
+        } else if cp < 32 {
+            // Control char — emit \uXXXX
+            parts.push("\\u00")
+            parts.push(_hex2(cp))
+        } else {
+            parts.push(ch)
+        }
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+fn _hex2(n: int) -> string {
+    let hi = (n / 16) & 15
+    let lo = n & 15
+    return _hex_char(hi) + _hex_char(lo)
+}
+
+fn _hex_char(n: int) -> string {
+    if n < 10 { return chr(48 + n) }      // '0'..'9'
+    return chr(87 + n)                     // 'a'..'f'
+}
+
+// Read a single \n-terminated line from stdin via L1 term_read_byte.
+// Returns the line WITHOUT the trailing newline. Returns "" on EOF.
+fn _read_line_from_stdin() -> string {
+    let mut parts = []
+    while true {
+        let b = term_read_byte()
+        if b < 0 { break }
+        if b == 10 { break }
+        if b == 13 { break }
+        parts.push(chr(b))
+    }
+    return parts.join("")
+}
+
+// ─── public entry ──────────────────────────────────────────────
+
+pub fn run_editor_bridge() -> int {
+    // Initialize render so wire_pi_render_lines() returns valid data.
+    let r = render_init()
+    if r != 0 { return -1 }
+
+    let mut running = 1
+    while running == 1 {
+        let line = _read_line_from_stdin()
+        if line == "" { running = 0; break }
+
+        let parsed = _parse_envelope(line)
+        let method = parsed[0]
+        let id = parsed[1]
+
+        let mut response = ""
+        if method == "render" {
+            let result = _build_render_result_json()
+            response = wire_jsonrpc_response(id, result)
+        } else if method == "key" {
+            // key forwarding — for T1.C real impl we accept the request
+            // but the actual byte injection into the L2 input pipeline
+            // is forward (term_read_byte reads from real stdin which is
+            // already consumed by us). We acknowledge the request.
+            response = wire_jsonrpc_response(id, "{\"ok\":true,\"note\":\"forward-deferred\"}")
+        } else if method == "resize" {
+            let _r = render_resize()
+            response = wire_jsonrpc_response(id, "{\"ok\":true,\"rows\":" +
+                                                 to_string(render_rows()) +
+                                                 ",\"cols\":" +
+                                                 to_string(render_cols()) + "}")
+        } else if method == "quit" {
+            response = wire_jsonrpc_response(id, "{\"ok\":true}")
+            running = 0
+        } else {
+            response = wire_jsonrpc_error(id, -32601, "method not found: " + method)
+        }
+        let _w = term_write_str(response)
+    }
+    let _c = render_close()
+    return 0
+}
+
+// ─── selftest ─────────────────────────────────────────────────
+
+pub fn editor_bridge_selftest() -> int {
+    println("self/tui/wire/editor_bridge — selftest")
+
+    // Parser tests
+    let env1 = _parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"render\"}")
+    if env1[0] != "render" { return 1 }
+    if env1[1] != 1 { return 2 }
+
+    let env2 = _parse_envelope("{\"jsonrpc\":\"2.0\",\"id\":42,\"method\":\"key\",\"params\":[97,98,99]}")
+    if env2[0] != "key" { return 3 }
+    if env2[1] != 42 { return 4 }
+
+    let env3 = _parse_envelope("not-a-valid-envelope")
+    if env3[0] != "" { return 5 }
+
+    // JSON escape
+    if _json_escape("hello") != "hello" { return 6 }
+    if _json_escape("a\"b") != "a\\\"b" { return 7 }
+    if _json_escape("a\\b") != "a\\\\b" { return 8 }
+
+    // Hex helper
+    if _hex2(0) != "00" { return 9 }
+    if _hex2(15) != "0f" { return 10 }
+    if _hex2(255) != "ff" { return 11 }
+
+    // Render result envelope shape (after render_init)
+    let _r = render_init()
+    let _p = render_put(0, 0, "Z", -1, -1, 0)
+    let result_json = _build_render_result_json()
+    if !_str_contains(result_json, "\"rows\":") { return 12 }
+    if !_str_contains(result_json, "\"cols\":") { return 13 }
+    if !_str_contains(result_json, "\"lines\":[") { return 14 }
+    if !_str_contains(result_json, "Z") { return 15 }
+
+    println("editor_bridge selftest OK")
+    return 0
+}
+
+fn _str_contains(haystack: string, needle: string) -> bool {
+    return _find_substring(haystack, needle) >= 0
+}
