@@ -337,6 +337,20 @@ int term_pty_reap(int pid, int *out_status) {
 #endif
 }
 
+/* Convenience wrapper: spawn `/bin/sh -c <cmd>` in pty. Used by the
+ * hexa builtin layer where passing argv arrays through the HexaVal
+ * boundary is awkward — sh -c gives shell glob/quote handling for free. */
+int term_pty_spawn_sh(const char *cmd, int rows, int cols, int *out_pid) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (!cmd) return -1;
+    const char *argv[] = {"/bin/sh", "-c", cmd, NULL};
+    return term_pty_spawn(argv, rows, cols, out_pid);
+#else
+    (void)cmd; (void)rows; (void)cols; (void)out_pid;
+    return -1;
+#endif
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * SMOKE TEST — compile with -DTERM_FFI_SMOKE
  *

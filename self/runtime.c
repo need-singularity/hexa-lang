@@ -7525,3 +7525,79 @@ HexaVal hexa_term_sigint_pending(void) { return hexa_int((int64_t)term_sigint_pe
 HexaVal hexa_term_isatty_stdin(void) { return hexa_int((int64_t)term_isatty_stdin()); }
 HexaVal hexa_term_isatty_stdout(void) { return hexa_int((int64_t)term_isatty_stdout()); }
 
+/* PTY harness builtins (forward-only "real PTY" closure, commit 43bec17b). */
+
+extern int term_pty_spawn_sh(const char *cmd, int rows, int cols, int *out_pid);
+extern int term_fd_read(int fd, unsigned char *buf, int max_bytes);
+extern int term_fd_write(int fd, const unsigned char *buf, int n);
+extern int term_fd_close(int fd);
+extern int term_fd_poll(int fd, int timeout_ms);
+extern int term_pty_reap(int pid, int *out_status);
+
+/* Returns [mfd, pid] as a 2-element int array. mfd=-1 on error. */
+HexaVal hexa_term_pty_spawn_sh(HexaVal cmd, HexaVal rows, HexaVal cols) {
+    if (!HX_IS_STR(cmd) || HX_STR(cmd) == NULL) {
+        HexaVal arr = hexa_array_new();
+        hexa_array_push(arr, hexa_int(-1));
+        hexa_array_push(arr, hexa_int(-1));
+        return arr;
+    }
+    const char *c = HX_STR(cmd);
+    int r = (int)__hx_to_double(rows);
+    int co = (int)__hx_to_double(cols);
+    int pid = -1;
+    int mfd = term_pty_spawn_sh(c, r, co, &pid);
+    HexaVal arr = hexa_array_new();
+    hexa_array_push(arr, hexa_int((int64_t)mfd));
+    hexa_array_push(arr, hexa_int((int64_t)pid));
+    return arr;
+}
+
+/* Read up to max_bytes from fd. Returns the bytes as a Hexa string
+ * (raw byte concat — caller may need to decode if utf-8 boundary). */
+HexaVal hexa_term_fd_read(HexaVal fd, HexaVal max_bytes) {
+    int f = (int)__hx_to_double(fd);
+    int m = (int)__hx_to_double(max_bytes);
+    if (m <= 0 || m > 65536) m = 4096;
+    unsigned char buf[65536];
+    if (m > 65536) m = 65536;
+    int n = term_fd_read(f, buf, m);
+    if (n <= 0) return hexa_str("");
+    /* hexa_str_n if available; otherwise null-terminate after copy */
+    char tmp[65537];
+    memcpy(tmp, buf, (size_t)n);
+    tmp[n] = '\0';
+    return hexa_str(tmp);
+}
+
+HexaVal hexa_term_fd_write(HexaVal fd, HexaVal data) {
+    int f = (int)__hx_to_double(fd);
+    if (!HX_IS_STR(data) || HX_STR(data) == NULL) return hexa_int(-1);
+    const char *s = HX_STR(data);
+    int n = (int)strlen(s);
+    int w = term_fd_write(f, (const unsigned char *)s, n);
+    return hexa_int((int64_t)w);
+}
+
+HexaVal hexa_term_fd_close(HexaVal fd) {
+    int f = (int)__hx_to_double(fd);
+    return hexa_int((int64_t)term_fd_close(f));
+}
+
+HexaVal hexa_term_fd_poll(HexaVal fd, HexaVal timeout_ms) {
+    int f = (int)__hx_to_double(fd);
+    int t = (int)__hx_to_double(timeout_ms);
+    return hexa_int((int64_t)term_fd_poll(f, t));
+}
+
+/* Returns [exited_flag, status]. exited_flag: 1 done, 0 running, -1 err */
+HexaVal hexa_term_pty_reap(HexaVal pid) {
+    int p = (int)__hx_to_double(pid);
+    int st = 0;
+    int r = term_pty_reap(p, &st);
+    HexaVal arr = hexa_array_new();
+    hexa_array_push(arr, hexa_int((int64_t)r));
+    hexa_array_push(arr, hexa_int((int64_t)st));
+    return arr;
+}
+
