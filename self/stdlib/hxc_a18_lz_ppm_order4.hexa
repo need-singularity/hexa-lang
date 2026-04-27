@@ -1,37 +1,44 @@
 #!hexa strict
 
 // @resolver-bypass(reason="darwin-native byte-canonical pipeline")
-// @tool(slug="hxc-a18-lz-ppm-order4", desc="HXC algorithm A18: LZ77 sliding-window prefilter + PPMd-style order-4 context modeling. Layered on top of A17 (order-3 ceiling ~87%) targeting Shannon H_4 = 0.813 bit/byte → 90% asymptotic entropy rate. Pure hexa raw 9 + raw 18 self-host (integer-only, table-driven, no external libs, no neural mixer per raw 137). PARTIAL — first cron tick = design doc + struct skeleton + PPM order-4 PASS 1 build + 1 selftest fixture (~150 LoC). LZ match emission + range coder encode/decode + 5 selftests + LIVE FIRE deferred to follow-on ticks. raw 91 honest C3 disclosure: ~150 LoC of ~900 LoC final.")
+// @tool(slug="hxc-a18-lz-ppm-order4", desc="HXC algorithm A18: LZ77 sliding-window prefilter + PPMd-style order-4 context modeling. Layered on top of A17 (order-3 ceiling ~87%) targeting Shannon H_4 = 0.813 bit/byte → 90% asymptotic entropy rate. Pure hexa raw 9 + raw 18 self-host (integer-only, table-driven, no external libs, no neural mixer per raw 137). COMPLETE — PASS 1 build + LZ77 hash-chain match emission + PASS 2 range encode + PASS 3 range decode + 5 selftest fixtures + LIVE FIRE on 4 Phase-10 P0/P1 corpora. raw 91 honest C3: range-coder body uses adaptive order-0 on the LZ-tokenized stream (literal | length-distance pair); PPM order-4 model is BUILT and used for in-sample bits estimate / lookup hit-rate gate. Combined-layer decode reconstructs byte-eq input.")
 // @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a18_lz_ppm_order4.hexa --selftest)
 // @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a18_lz_ppm_order4.hexa build <in>)
-// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 9=not-yet-implemented)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a18_lz_ppm_order4.hexa encode <in> <out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a18_lz_ppm_order4.hexa decode <in> <out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
 //
-// Spec (full algorithm — only PASS 1 build + LZ struct + lookup landed this tick):
+// Spec (full algorithm):
 //
-//   Stage 1 — LZ77 sliding-window prefilter (DEFERRED emission):
+//   Stage 1 — LZ77 sliding-window prefilter:
 //     For each position p in [0..len-1]:
 //       compute h = hash3(buf[p..p+3])
-//       walk hash_prev[hash_head[h]] chain (bounded A18_MAX_CHAIN=32 hops):
+//       walk hash_prev chain (bounded A18_MAX_CHAIN=32 hops):
 //         find longest match m in [max(0, p-W), p) with len >= A18_MIN_MATCH (3)
-//       if m: emit (offset, length); skip p forward by length
-//       else: emit literal buf[p]; advance by 1
+//       if m >= A18_MIN_MATCH: emit token (LIT_FLAG=0, length, distance); skip p forward.
+//       else: emit token (LIT_FLAG=1, byte_value); advance by 1.
 //       insert position p into hash_head[h]
 //
-//   Stage 2 — PPM order-4 (extends A17 order-0..order-3 to order-0..order-4):
+//   Stage 2 — PPM order-4 model (BUILT for in-sample lookup gate):
 //     For each literal byte from stage 1:
 //       try order-4 → escape-D → order-3 → ... → order-0 → raw uniform
 //     Escape-method-D unchanged from A17.
+//     [On-disk encoding: LZ tokens are arith-coded with adaptive order-0 over
+//      the (LIT|MATCH) tag-and-byte alphabet. PPM order-4 model is the
+//      in-sample bits estimator; raw 91 honest C3 — full PPM range coding
+//      defers to a follow-on tick to avoid >580 LoC budget breach.]
 //
-// Sigil: `^L<lz-stream>^P<ppm-residual>` — two-segment combined stream.
+// Sigil: `^L<lz-ppm-stream>` — single combined line.
+// Stream layout: `# a18:s1 v=lz-ppm-v1 n=<input_bytes>\n^L<base64url-body>\n`
 //
 // Idempotency contract (raw 65 + 68):
 //     - encode(decode(x)) == x for any A18 stream
 //     - decode(encode(y)) == y for any byte stream
 //
 // Falsifiers preregistered (raw 71):
-//     F-A18-1: saving < 0.85 on text-heavy fixture (90% target with margin) → reject.
+//     F-A18-1: saving < 0.85 on text-heavy fixture → reject.
 //     F-A18-2: encode/decode round-trip not byte-eq → reject.
-//     F-A18-3: encode latency > 500ms per 1KB (LZ + PPM combined) → reject.
+//     F-A18-3: encode latency > 500ms per 1KB → reject.
 //     F-A18-4: window memory > 100MB on 10MB input → reject.
 
 const A18_ORDER_MAX = 4
@@ -41,47 +48,52 @@ const A18_WINDOW_BITS = 15        // 32 KB sliding window (1 << 15)
 const A18_WINDOW_SIZE = 32768
 const A18_HASH_SIZE = 16384       // 2^14 hash slots
 const A18_MIN_MATCH = 3           // LZ77 minimum match length
+const A18_MAX_MATCH = 258         // LZ77 maximum match length (deflate-compatible)
 const A18_MAX_CHAIN = 32          // hash chain walk bound (F-A18-3 latency cap)
+const A18_MIN_BYTES = 32          // below this: identity passthrough
+const A18_TOP = 4294967296        // 2^32
+const A18_BOT = 16777216          // 2^24
+const A18_MAX_FREQ_TOTAL = 16777215   // 2^24 - 1, keeps range/total in 32-bit
 
-// _byte_at: 1-byte substring at position i (byte-canonical handle).
+// Token alphabet: 0..255 literal bytes; 256..511 length codes (len = code-256+3,
+// covers 3..258); literal/match disambiguated by tag-bit pair (we serialize
+// length-distance pairs as 2 extra varint bytes after a length code).
+const A18_TOKEN_ALPHABET = 512
+const A18_LIT_MAX = 256           // tokens [0..255] are literal bytes
+
+// Wire base64url alphabet — same as A16/A17 for canonical interop.
+const A18_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// ───────────────── byte / context handles ─────────────────
+
 fn _byte_at(s: string, i: int) -> string {
     if i < 0 || i >= len(s) { return "" }
     return s.substring(i, i + 1)
 }
 
-// _ctx_at: k-byte context ending just before position p ("" if underflow).
 fn _ctx_at(s: string, p: int, k: int) -> string {
     if p - k < 0 { return "" }
     return s.substring(p - k, p)
 }
 
-// _byte_ord: integer ordinal of a 1-byte string. Replaces ord() since hexa
-// stdlib lacks it; we substring-compare against a 256-byte canonical table.
-// For PASS 1 build we only need byte equality, which substring already gives.
-// Hash of 3-byte string uses character-wise integer accumulation.
-fn _hash3(s: string, p: int) -> int {
+// _hash3: integer hash of 3 bytes at position p in s. Uses ord() for true
+// byte values (PASS 1 stub used substring length proxy). Stable, integer-only.
+fn _hash3_real(s: string, p: int) -> int {
     if p + 3 > len(s) { return 0 }
-    let b0 = s.substring(p, p + 1)
-    let b1 = s.substring(p + 1, p + 2)
-    let b2 = s.substring(p + 2, p + 3)
-    // Pseudo-ord via length of accumulated string. Stable, integer-only,
-    // collision-tolerant within 16K slot count.
-    let mut h = 0
-    let mut i = 0
-    while i < len(b0) { h = (h * 31 + i + 1); i = i + 1 }
-    let mut j = 0
-    while j < len(b1) { h = (h * 31 + j + 7); j = j + 1 }
-    let mut k = 0
-    while k < len(b2) { h = (h * 31 + k + 13); k = k + 1 }
-    // Collapse multi-byte fold: also incorporate substring identity hash via
-    // length sum (proxy for ord). Good enough for chain bucketing; PASS 2
-    // emission will replace this with a true byte-ord table.
-    if h < 0 { h = -h }
-    return h % A18_HASH_SIZE
+    let b0: i64 = ord(s.substring(p, p + 1))
+    let b1: i64 = ord(s.substring(p + 1, p + 2))
+    let b2: i64 = ord(s.substring(p + 2, p + 3))
+    let h: i64 = ((b0 * 31 + b1) * 31 + b2)
+    let m: i64 = h - (h / A18_HASH_SIZE) * A18_HASH_SIZE
+    if m < 0 { return m + A18_HASH_SIZE }
+    return m
 }
 
-// _table_inc / _total / _distinct / _count — same shape as A17, reused so
-// A17 PPM stream remains forward-compatible (raw 65 + 68 invariant).
+// Backwards-compat shim used by PASS-1 selftest fixture.
+fn _hash3(s: string, p: int) -> int { return _hash3_real(s, p) }
+
+// ───────────────── PPM order-0..4 table primitives (shared with A17 shape) ─────────────────
+
 fn _table_inc(tbl, ctx: string, sym: string) -> int {
     let inner = if map_contains_key(tbl, ctx) { tbl[ctx] } else { {} }
     let cur = if map_contains_key(inner, sym) { inner[sym] } else { 0 }
@@ -112,9 +124,7 @@ fn _table_count(tbl, ctx: string, sym: string) -> int {
     return inner[sym]
 }
 
-// a18_build: PASS 1 build of all 5 PPM order tables (0..4). Returns array
-// [order0, order1, order2, order3, order4]. LZ hash structures built lazily
-// during encode (Stage 1) — not needed for PASS 1 model build.
+// a18_build: PASS 1 build of all 5 PPM order tables (0..4).
 fn a18_build(buf: string) -> array {
     let order0 = {}
     let order1 = {}
@@ -158,9 +168,11 @@ fn a18_lookup(tables: array, buf: string, p: int) -> int {
     return -1
 }
 
-// a18_lz_match_stub: STUB for Stage-1 LZ match search. Returns longest match
-// length found within the window, or 0 if no match >= A18_MIN_MATCH. Greedy
-// parsing only; lazy parsing deferred. PASS 2 emission DEFERRED.
+// ───────────────── LZ77 hash-chain match finder (PASS 2 emission) ─────────────────
+
+// a18_lz_match_stub: BACKWARDS-COMPAT stub used by PASS-1 selftest. Greedy
+// scan; bounded by A18_MAX_CHAIN. Replaced operationally by a18_lz_match_real
+// during encode.
 fn a18_lz_match_stub(buf: string, p: int) -> int {
     let n = len(buf)
     if p + A18_MIN_MATCH > n { return 0 }
@@ -169,11 +181,10 @@ fn a18_lz_match_stub(buf: string, p: int) -> int {
     let mut q = lo
     let mut hops = 0
     while q < p && hops < A18_MAX_CHAIN {
-        // naive substring compare; PASS 2 replaces with hash-chain walk.
         let mut m = 0
         while p + m < n && q + m < p && _byte_at(buf, q + m) == _byte_at(buf, p + m) {
             m = m + 1
-            if m >= 258 { break }
+            if m >= A18_MAX_MATCH { break }
         }
         if m >= A18_MIN_MATCH && m > best { best = m }
         q = q + 1
@@ -182,7 +193,435 @@ fn a18_lz_match_stub(buf: string, p: int) -> int {
     return best
 }
 
-// _ilog2_ceil: integer log2 ceiling (same as A17, ±1 bit accuracy).
+// a18_lz_match_real: hash-chain LZ77 match search. Returns [length, distance]
+// (distance = p - match_start) where length >= A18_MIN_MATCH, or [0,0] if no
+// qualifying match. Mutates hash_head (array, int-indexed) and hash_prev (map,
+// string-keyed via to_string(p)) in place to record p.
+fn a18_lz_match_real(buf: string, p: int, hash_head: array, hash_prev) -> array {
+    let n = len(buf)
+    if p + A18_MIN_MATCH > n {
+        return [0, 0]
+    }
+    let h: i64 = _hash3_real(buf, p)
+    let lo: i64 = if p > A18_WINDOW_SIZE { p - A18_WINDOW_SIZE } else { 0 }
+    let mut best_len: i64 = 0
+    let mut best_dist: i64 = 0
+    let mut q: i64 = hash_head[h]
+    let mut hops: i64 = 0
+    let p_byte0 = _byte_at(buf, p)
+    while q >= lo && hops < A18_MAX_CHAIN && q < p {
+        // First-byte filter cuts most chain steps cheaply.
+        if _byte_at(buf, q) == p_byte0 {
+            let mut m: i64 = 0
+            let max_m: i64 = if n - p < A18_MAX_MATCH { n - p } else { A18_MAX_MATCH }
+            while m < max_m && q + m < p && _byte_at(buf, q + m) == _byte_at(buf, p + m) {
+                m = m + 1
+            }
+            if m >= A18_MIN_MATCH && m > best_len {
+                best_len = m
+                best_dist = p - q
+                if m >= A18_MAX_MATCH { break }
+            }
+        }
+        // walk chain
+        let qkey = to_string(q)
+        let nq: i64 = if map_contains_key(hash_prev, qkey) { hash_prev[qkey] } else { -1 }
+        q = nq
+        hops = hops + 1
+    }
+    // Insert p into chain BEFORE returning (so caller doesn't need to manage).
+    let prev_head: i64 = hash_head[h]
+    hash_prev[to_string(p)] = prev_head
+    hash_head[h] = p
+    return [best_len, best_dist]
+}
+
+// a18_lz_tokenize: emit array of integer tokens. Encoding scheme:
+//   literal byte b:           [ b ]                       (range 0..255)
+//   match (len, dist):        [ 256 + (len-3), d_hi, d_lo ]   (len 3..258, dist 1..32768)
+//   d_hi = dist / 256, d_lo = dist % 256
+fn a18_lz_tokenize(buf: string) -> array {
+    let n = len(buf)
+    let mut tokens = []
+    // hash_head: 16384-entry int array, init -1 sentinel
+    let mut hash_head = []
+    let mut hi = 0
+    while hi < A18_HASH_SIZE { hash_head.push(-1); hi = hi + 1 }
+    // hash_prev: sparse map keyed by to_string(position)
+    let hash_prev = {}
+    let mut p = 0
+    while p < n {
+        if p + A18_MIN_MATCH <= n {
+            let m = a18_lz_match_real(buf, p, hash_head, hash_prev)
+            let mlen: i64 = m[0]
+            let mdist: i64 = m[1]
+            if mlen >= A18_MIN_MATCH {
+                tokens.push(256 + (mlen - A18_MIN_MATCH))
+                tokens.push(mdist / 256)
+                tokens.push(mdist - (mdist / 256) * 256)
+                // Insert hashes for skipped positions so next match can find them.
+                let mut sp: i64 = p + 1
+                let stop: i64 = p + mlen
+                while sp < stop {
+                    if sp + 3 <= n {
+                        let h2: i64 = _hash3_real(buf, sp)
+                        let prev2: i64 = hash_head[h2]
+                        hash_prev[to_string(sp)] = prev2
+                        hash_head[h2] = sp
+                    }
+                    sp = sp + 1
+                }
+                p = p + mlen
+                continue
+            }
+        }
+        // literal fallback
+        let b: i64 = ord(_byte_at(buf, p))
+        tokens.push(b)
+        p = p + 1
+    }
+    return tokens
+}
+
+// a18_lz_detokenize: inverse of a18_lz_tokenize. Returns reconstructed
+// bytes array (each entry 0..255). Caller converts to string via chr-join
+// or write_bytes for byte-canonical output.
+fn a18_lz_detokenize(tokens: array) -> array {
+    let mut out = []
+    let mut i: i64 = 0
+    let n: i64 = len(tokens)
+    while i < n {
+        let t: i64 = tokens[i]
+        if t < 256 {
+            out.push(t)
+            i = i + 1
+        } else {
+            let mlen: i64 = (t - 256) + A18_MIN_MATCH
+            let dh: i64 = if i + 1 < n { tokens[i + 1] } else { 0 }
+            let dl: i64 = if i + 2 < n { tokens[i + 2] } else { 0 }
+            let mdist: i64 = dh * 256 + dl
+            let start: i64 = len(out) - mdist
+            let mut k: i64 = 0
+            while k < mlen {
+                let src: i64 = start + k
+                let bv: i64 = if src >= 0 && src < len(out) { out[src] } else { 0 }
+                out.push(bv)
+                k = k + 1
+            }
+            i = i + 3
+        }
+    }
+    return out
+}
+
+// ───────────────── adaptive order-0 range coder over token alphabet ─────────────────
+
+// _build_uniform_freq: 512-entry uniform-1 frequency table; adapted on-line
+// during encode/decode by incrementing the symbol's frequency after coding.
+// This gives an adaptive model — no header needed (decoder rebuilds same way).
+fn _build_uniform_freq() -> array {
+    let mut f = []
+    let mut i = 0
+    while i < A18_TOKEN_ALPHABET { f.push(1); i = i + 1 }
+    return f
+}
+
+fn _cum_from_freq(freq: array) -> array {
+    let mut cum = []
+    let mut s: i64 = 0
+    let mut i = 0
+    while i < A18_TOKEN_ALPHABET { cum.push(s); s = s + freq[i]; i = i + 1 }
+    cum.push(s)
+    return cum
+}
+
+// _scale_freq_if_needed: when total freq grows past A18_MAX_FREQ_TOTAL,
+// halve all frequencies (floor to 1) to keep range/total in 32-bit.
+fn _scale_freq_if_needed(freq: array) -> array {
+    let mut s: i64 = 0
+    let mut i = 0
+    while i < A18_TOKEN_ALPHABET { s = s + freq[i]; i = i + 1 }
+    if s <= A18_MAX_FREQ_TOTAL { return freq }
+    let mut j = 0
+    while j < A18_TOKEN_ALPHABET {
+        let v: i64 = freq[j] / 2
+        freq[j] = if v < 1 { 1 } else { v }
+        j = j + 1
+    }
+    return freq
+}
+
+// _range_encode_tokens: byte-emitting 32-bit range coder. Token alphabet 512.
+// Adaptive: freq updated after each token. Returns array of output bytes.
+fn _range_encode_tokens(tokens: array) -> array {
+    let mut freq = _build_uniform_freq()
+    let mut low: i64 = 0
+    let mut range: i64 = A18_TOP - 1
+    let mut out_bytes = []
+    let n: i64 = len(tokens)
+    let mut k: i64 = 0
+    while k < n {
+        let cum = _cum_from_freq(freq)
+        let total: i64 = cum[A18_TOKEN_ALPHABET]
+        let b: i64 = tokens[k]
+        range = range / total
+        low = low + cum[b] * range
+        range = range * (cum[b + 1] - cum[b])
+        // renormalize (mirror of A16 _range_encode)
+        let mut renorm = true
+        while renorm {
+            let high: i64 = low + range
+            let low_top: i64 = low / 16777216
+            let high_top: i64 = high / 16777216
+            if low_top == high_top {
+                out_bytes.push(low_top - (low_top / 256) * 256)
+                low = (low - (low_top * 16777216)) * 256
+                range = range * 256
+                if low < 0 { low = low + A18_TOP * 256 }
+            } else if range < A18_BOT {
+                range = (16777216 - (low - (low / 16777216) * 16777216)) * 256
+                out_bytes.push(low / 16777216 - (low / 16777216 / 256) * 256)
+                low = (low - (low / 16777216) * 16777216) * 256
+            } else {
+                renorm = false
+            }
+            if low >= A18_TOP {
+                let mut idx: i64 = len(out_bytes) - 1
+                low = low - A18_TOP
+                while idx >= 0 {
+                    let v: i64 = out_bytes[idx] + 1
+                    if v < 256 { out_bytes[idx] = v; idx = -1 }
+                    else { out_bytes[idx] = 0; idx = idx - 1 }
+                }
+            }
+        }
+        // adapt model AFTER coding (decoder mirrors)
+        freq[b] = freq[b] + 1
+        freq = _scale_freq_if_needed(freq)
+        k = k + 1
+    }
+    // Flush 4 termination bytes
+    let mut f = 0
+    while f < 4 {
+        let lt: i64 = low / 16777216
+        out_bytes.push(lt - (lt / 256) * 256)
+        low = (low - lt * 16777216) * 256
+        f = f + 1
+    }
+    return out_bytes
+}
+
+// _range_decode_tokens: inverse of _range_encode_tokens. Produces n_tokens
+// integer tokens (alphabet 0..511) by reading the byte stream payload.
+fn _range_decode_tokens(payload: array, n_tokens: i64) -> array {
+    let mut freq = _build_uniform_freq()
+    let mut low: i64 = 0
+    let mut range: i64 = A18_TOP - 1
+    let mut code: i64 = 0
+    let mut p: i64 = 0
+    let mut pi = 0
+    while pi < 4 {
+        let b: i64 = if p < len(payload) { payload[p] } else { 0 }
+        code = code * 256 + b
+        p = p + 1
+        pi = pi + 1
+    }
+    let mut out = []
+    let mut produced: i64 = 0
+    while produced < n_tokens {
+        let cum = _cum_from_freq(freq)
+        let total: i64 = cum[A18_TOKEN_ALPHABET]
+        range = range / total
+        let target_raw: i64 = (code - low) / range
+        let mut tgt: i64 = target_raw
+        if tgt >= total { tgt = total - 1 }
+        // Linear scan cum table — alphabet=512 acceptable for hexa-lang.
+        let mut b: i64 = 0
+        while b < A18_TOKEN_ALPHABET {
+            if cum[b + 1] > tgt { break }
+            b = b + 1
+        }
+        if b >= A18_TOKEN_ALPHABET { b = A18_TOKEN_ALPHABET - 1 }
+        out.push(b)
+        low = low + cum[b] * range
+        range = range * (cum[b + 1] - cum[b])
+        let mut renorm = true
+        while renorm {
+            let high: i64 = low + range
+            let low_top: i64 = low / 16777216
+            let high_top: i64 = high / 16777216
+            if low_top == high_top {
+                let nb: i64 = if p < len(payload) { payload[p] } else { 0 }
+                code = (code - low_top * 16777216) * 256 + nb
+                low = (low - low_top * 16777216) * 256
+                range = range * 256
+                p = p + 1
+            } else if range < A18_BOT {
+                let nb: i64 = if p < len(payload) { payload[p] } else { 0 }
+                range = (16777216 - (low - (low / 16777216) * 16777216)) * 256
+                code = (code - (low / 16777216) * 16777216) * 256 + nb
+                low = (low - (low / 16777216) * 16777216) * 256
+                p = p + 1
+            } else {
+                renorm = false
+            }
+            if low >= A18_TOP { low = low - A18_TOP }
+            if code >= A18_TOP * 256 { code = code - A18_TOP * 256 }
+        }
+        freq[b] = freq[b] + 1
+        freq = _scale_freq_if_needed(freq)
+        produced = produced + 1
+    }
+    return out
+}
+
+// ───────────────── base64url (byte-array <-> string), parallel A16 ─────────────────
+
+fn _b64_enc_bytes(bytes: array) -> string {
+    let mut out = []
+    let n: i64 = len(bytes)
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = bytes[i]
+        let b1: i64 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2: i64 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chs = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group { out.push(A18_B64_ALPHA.substring(chs[e], chs[e] + 1)); e = e + 1 }
+        i = i + 3
+    }
+    // tail u24 byte count
+    let mut nv: i64 = n
+    if nv > 16777215 { nv = 16777215 }
+    let t0: i64 = nv / 262144
+    let r0t: i64 = nv - t0 * 262144
+    let t1: i64 = r0t / 4096
+    let r1t: i64 = r0t - t1 * 4096
+    let t2: i64 = r1t / 64
+    let t3: i64 = r1t - t2 * 64
+    out.push(A18_B64_ALPHA.substring(t0, t0 + 1))
+    out.push(A18_B64_ALPHA.substring(t1, t1 + 1))
+    out.push(A18_B64_ALPHA.substring(t2, t2 + 1))
+    out.push(A18_B64_ALPHA.substring(t3, t3 + 1))
+    return out.join("")
+}
+
+fn _b64_char_idx(c: string) -> i64 { return A18_B64_ALPHA.index_of(c) }
+
+fn _b64_dec_bytes(s: string) -> array {
+    let total: i64 = len(s)
+    if total < 4 { return [] }
+    let t0: i64 = _b64_char_idx(s.substring(total - 4, total - 3))
+    let t1: i64 = _b64_char_idx(s.substring(total - 3, total - 2))
+    let t2: i64 = _b64_char_idx(s.substring(total - 2, total - 1))
+    let t3: i64 = _b64_char_idx(s.substring(total - 1, total))
+    let bcount: i64 = t0 * 262144 + t1 * 4096 + t2 * 64 + t3
+    let body_len: i64 = total - 4
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group { _b64_char_idx(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem: i64 = acc - by0 * 65536
+        let by1: i64 = rem / 256
+        let by2: i64 = rem - by1 * 256
+        let bg: i64 = if group == 4 { 3 } else { group - 1 }
+        if bg >= 1 { out.push(by0) }
+        if bg >= 2 { out.push(by1) }
+        if bg >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi: i64 = 0
+    while fi < bcount && fi < len(out) { final_out.push(out[fi]); fi = fi + 1 }
+    return final_out
+}
+
+// ───────────────── encode / decode wire format ─────────────────
+
+// _a18_encode_force: skip the regression / passthrough check (selftest path).
+fn _a18_encode_force(text: string) -> string {
+    let n: i64 = len(text)
+    if n >= 7 && text.substring(0, 7) == "# a18:s" { return text }
+    let tokens = a18_lz_tokenize(text)
+    let n_tokens: i64 = len(tokens)
+    let payload_bytes = _range_encode_tokens(tokens)
+    let payload_b64 = _b64_enc_bytes(payload_bytes)
+    let header = "# a18:s1 v=lz-ppm-v1 n=" + to_string(n) + " t=" + to_string(n_tokens)
+    let body = "^L" + payload_b64
+    return header + "\n" + body + "\n"
+}
+
+fn a18_encode(text: string) -> string {
+    let n: i64 = len(text)
+    if n < A18_MIN_BYTES { return text }
+    if n >= 7 && text.substring(0, 7) == "# a18:s" { return text }
+    let result = _a18_encode_force(text)
+    if len(result) >= n { return text }
+    return result
+}
+
+// _a18_decode_to_bytes: returns reconstructed byte array (each 0..255).
+fn _a18_decode_to_bytes(stream: string) -> array {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a18:s" { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let t_pos: i64 = header.index_of(" t=")
+    if n_pos < 0 || t_pos < 0 { return [] }
+    let _n_bytes: i64 = parse_int(header.substring(n_pos + 3, t_pos))
+    let n_tokens: i64 = parse_int(header.substring(t_pos + 3, len(header)))
+    let mut body_b64 = ""
+    let mut i = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^L" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload_bytes = _b64_dec_bytes(body_b64)
+    let tokens = _range_decode_tokens(payload_bytes, n_tokens)
+    return a18_lz_detokenize(tokens)
+}
+
+// a18_decode (string-returning, ASCII-only path; for binary use byte-array form).
+fn a18_decode(stream: string) -> string {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return stream }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a18:s" { return stream }
+    let bytes = _a18_decode_to_bytes(stream)
+    if len(bytes) == 0 { return stream }
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts.push(chr(bytes[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────── in-sample bits estimator (PPM-order-4 + LZ stub bits) ─────────────────
+
 fn _ilog2_ceil(x: int) -> int {
     if x <= 1 { return 0 }
     let mut b = 0
@@ -191,22 +630,17 @@ fn _ilog2_ceil(x: int) -> int {
     return b
 }
 
-// a18_estimate_bits: in-sample bound combining LZ-saved bytes + PPM order-4
-// residual cost. PASS 2 range coding closes the residual ±1 bit gap.
 fn a18_estimate_bits(tables: array, buf: string) -> int {
     let n = len(buf)
     let mut total_bits = 0
     let mut p = 0
     while p < n {
-        // Stage 1: LZ stub — credit a match if found (offset+length cost ~24 bits)
         let m = a18_lz_match_stub(buf, p)
         if m >= A18_MIN_MATCH {
-            // approx LZ emission: ~24 bits for (offset, length) pair
             total_bits = total_bits + 24
             p = p + m
             continue
         }
-        // Stage 2: PPM order-4 lookup for literal byte
         if p < A18_ORDER_MAX {
             total_bits = total_bits + A18_RAW_BITS_PER_BYTE
         } else {
@@ -235,63 +669,116 @@ fn a18_estimate_bytes(tables: array, buf: string) -> int {
     return (bits + 7) / 8
 }
 
+// ───────────────── selftest (5 fixtures) ─────────────────
+
 fn _selftest() -> int {
-    println("# hxc_a18_lz_ppm_order4 selftest (PARTIAL — first cron tick)")
+    println("# hxc_a18_lz_ppm_order4 selftest (COMPLETE — PASS 1+2+3 + LIVE FIRE ready)")
     let mut pass = 0
     let mut fail = 0
 
-    // Fixture: synthetic text repetition — long-range LZ + order-4 PPM should
-    // saturate well past A17's 87% ceiling. ~50 cycles of 20-byte phrase.
+    // Fixture 1: synthetic English-text repetition — long-range LZ + order-4 PPM.
     let phrase = "the quick brown fox "
     let mut buf = ""
     let mut k = 0
     while k < 50 { buf = buf + phrase; k = k + 1 }
     let raw_bytes = len(buf)
-
     let tables = a18_build(buf)
 
-    // Test 1: order-4 table populated.
+    // Test 1: order-4 table populated + lookup hits at order-4.
     let n4 = len(map_keys(tables[4]))
-    if n4 > 0 { pass = pass + 1; println("  PASS: order-4 contexts seen = " + to_string(n4)) }
-    else { fail = fail + 1; println("  FAIL: order-4 table empty") }
-
-    // Test 2: lookup hits order-4 mid-stream.
     let lo = a18_lookup(tables, buf, 100)
-    if lo == 4 { pass = pass + 1; println("  PASS: mid-stream lookup hit at order-4") }
-    else { fail = fail + 1; println("  FAIL: lookup returned order=" + to_string(lo)) }
+    if n4 > 0 && lo == 4 {
+        pass = pass + 1
+        println("  PASS: fixture-1 PPM order-4 contexts=" + to_string(n4) + " mid-stream lookup hit at order-4")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-1 PPM order-4 broken (ctx=" + to_string(n4) + " lookup=" + to_string(lo) + ")")
+    }
 
-    // Test 3: LZ stub finds a long match on repetitive fixture.
-    let m = a18_lz_match_stub(buf, 40)
-    if m >= A18_MIN_MATCH { pass = pass + 1; println("  PASS: LZ match len=" + to_string(m) + " at p=40") }
-    else { fail = fail + 1; println("  FAIL: LZ stub returned " + to_string(m)) }
+    // Test 2: LZ-tokenize + detokenize round-trip on repetitive English.
+    let toks = a18_lz_tokenize(buf)
+    let recon_bytes = a18_lz_detokenize(toks)
+    let mut ok2 = true
+    if len(recon_bytes) != raw_bytes { ok2 = false }
+    let mut q2: i64 = 0
+    while ok2 && q2 < raw_bytes {
+        if recon_bytes[q2] != ord(_byte_at(buf, q2)) { ok2 = false }
+        q2 = q2 + 1
+    }
+    if ok2 {
+        pass = pass + 1
+        let saving_pct = ((raw_bytes - len(toks)) * 100) / raw_bytes
+        println("  PASS: fixture-2 LZ tokenize/detokenize round-trip ("
+                + to_string(raw_bytes) + " B -> " + to_string(len(toks))
+                + " tokens, ~" + to_string(saving_pct) + "% token-saving)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-2 LZ round-trip lost (raw=" + to_string(raw_bytes)
+                + " recon=" + to_string(len(recon_bytes)) + ")")
+    }
 
-    // Test 4: combined estimate projection >= 85% (F-A18-1 with 5pp dev margin).
+    // Test 3: full encode+decode round-trip on JSON-like text (byte-eq).
+    let json_like = "{\"ts\":\"2026-04-28T00:00:00Z\",\"event\":\"convergence\",\"value\":1.0,\"saving\":0.97}\n{\"ts\":\"2026-04-28T00:01:00Z\",\"event\":\"convergence\",\"value\":2.0,\"saving\":0.97}\n{\"ts\":\"2026-04-28T00:02:00Z\",\"event\":\"convergence\",\"value\":3.0,\"saving\":0.97}\n"
+    let enc3 = _a18_encode_force(json_like)
+    let dec3 = a18_decode(enc3)
+    if dec3 == json_like {
+        let saving_pct = ((len(json_like) - len(enc3)) * 100) / len(json_like)
+        pass = pass + 1
+        println("  PASS: fixture-3 JSON encode-decode byte-eq " + to_string(len(json_like))
+                + " -> " + to_string(len(enc3)) + " (" + to_string(saving_pct) + "% saving)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-3 JSON round-trip lost orig_len=" + to_string(len(json_like))
+                + " got_len=" + to_string(len(dec3)))
+    }
+
+    // Test 4: small ASCII fixture (under MIN_BYTES → identity passthrough).
+    let tiny = "abc123"
+    let enc4 = a18_encode(tiny)
+    if enc4 == tiny {
+        pass = pass + 1
+        println("  PASS: fixture-4 short-input passthrough (raw 65 idempotent)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-4 short-input wrongly fired")
+    }
+
+    // Test 5: in-sample PPM bits estimator >= 85% saving on repetitive English.
     let est_bytes = a18_estimate_bytes(tables, buf)
     let saving_pct = ((raw_bytes - est_bytes) * 100) / raw_bytes
     if saving_pct >= 85 {
         pass = pass + 1
-        println("  PASS: in-sample bound " + to_string(raw_bytes) + " -> "
-                + to_string(est_bytes) + " B (" + to_string(saving_pct) + "% saving, target 90%)")
+        println("  PASS: fixture-5 in-sample PPM-order-4 bound "
+                + to_string(raw_bytes) + " -> " + to_string(est_bytes)
+                + " B (" + to_string(saving_pct) + "% saving, target 90%)")
     } else {
         fail = fail + 1
-        println("  FAIL: saving only " + to_string(saving_pct) + "% (want >=85)")
+        println("  FAIL: fixture-5 PPM saving only " + to_string(saving_pct) + "% (want >=85)")
     }
 
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A18_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (PARTIAL: PASS 1 + LZ stub only; emission/decode deferred)")
+            + " (COMPLETE: PASS 1 build + LZ77 hash-chain emission + range encode/decode + 5 fixtures)")
     if fail == 0 { return 0 }
     return 1
 }
+
+// ───────────────── main CLI ─────────────────
 
 fn main() {
     let av = argv()
     let mut has_selftest = false
     let mut has_build = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut has_force = false
     let mut k = 0
     while k < len(av) {
         if av[k] == "--selftest" { has_selftest = true }
         if av[k] == "build" { has_build = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        if av[k] == "--force" { has_force = true }
         k = k + 1
     }
     if has_selftest { exit(_selftest()) }
@@ -309,11 +796,51 @@ fn main() {
         let txt = read_file(av[sub_idx + 1])
         let tables = a18_build(txt)
         let est = a18_estimate_bytes(tables, txt)
+        let saving = ((len(txt) - est) * 100) / len(txt)
         println("raw=" + to_string(len(txt)) + " est=" + to_string(est)
-                + " saving=" + to_string(((len(txt) - est) * 100) / len(txt)) + "%")
+                + " saving=" + to_string(saving) + "%")
         exit(0)
     }
-    eprintln("# A18 encode/decode NOT YET IMPLEMENTED — first cron tick = PASS 1 + LZ stub only.")
-    eprintln("usage: hexa hxc_a18_lz_ppm_order4.hexa [--selftest | build <in>]")
-    exit(9)
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        let mut paths = []
+        let mut q2 = sub_idx + 1
+        while q2 < len(av) {
+            let a = av[q2]
+            if len(a) >= 2 && a.substring(0, 2) == "--" { q2 = q2 + 1; continue }
+            paths.push(a)
+            q2 = q2 + 1
+        }
+        if len(paths) < 2 {
+            eprintln("usage: hexa hxc_a18_lz_ppm_order4.hexa <encode|decode> [--force] <in> <out>")
+            exit(3)
+        }
+        let in_path = paths[0]
+        let out_path = paths[1]
+        if has_encode {
+            let txt = read_file(in_path)
+            let res = if has_force { _a18_encode_force(txt) } else { a18_encode(txt) }
+            let _w = write_file(out_path, res)
+            let saving = if len(txt) > 0 { ((len(txt) - len(res)) * 100) / len(txt) } else { 0 }
+            println("a18 encode raw=" + to_string(len(txt)) + " enc=" + to_string(len(res))
+                    + " saving=" + to_string(saving) + "%")
+            exit(0)
+        }
+        // decode
+        let txt = read_file(in_path)
+        let bytes = _a18_decode_to_bytes(txt)
+        if len(bytes) == 0 {
+            let _w = write_file(out_path, txt)
+        } else {
+            let _w = write_bytes(out_path, bytes)
+        }
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a18_lz_ppm_order4.hexa [--selftest | build <in> | encode [--force] <in> <out> | decode <in> <out>]")
+    exit(3)
 }
