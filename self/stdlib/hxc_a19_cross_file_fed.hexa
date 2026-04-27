@@ -1,0 +1,610 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a19-cross-file-fed", desc="HXC algorithm A19: cross-file federation shared dictionary. Many-small-files saturation unblock — promote schema/header/enum/prefix patterns from per-file dictionaries to ONE repo-level shared dictionary (state/hxc/_shared_dict.hxc). Per-file streams reference shared entries via ^D<id> sigil. Companion to A9 BPE single-file (which closed 0pp delta on small files — agent aafff73d verdict); cross-file vocabulary fusion is the effective unblock per design doc d6cbb81c. Pure hexa raw 9 + raw 18 self-host (no external libs, no neural mixer, integer-only). PARTIAL — first cron tick = PASS 1 corpus scanner + dict file format + 1 selftest fixture (5-file synthetic mini-corpus) (~200 LoC). PASS 2 dict builder, PASS 3 per-file encode, PASS 4 decode, hxc_migrate --corpus-mode integration DEFERRED to follow-on ticks. raw 91 honest C3 disclosure: ~200 LoC of ~680 LoC final per design d6cbb81c.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a19_cross_file_fed.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a19_cross_file_fed.hexa scan <corpus-root>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 9=not-yet-implemented)
+//
+// Spec (full algorithm — only PASS 1 scanner + dict format + selftest landed this tick):
+//
+//   PASS 1 — corpus scanner (THIS TICK):
+//     - walk corpus root, enumerate files matching glob (default *.hxc / *.jsonl)
+//     - for each file extract candidate patterns:
+//         schema headers   (`# schema:<id> ...`)
+//         dict headers     (`# dict:<id>.<col> ...` from existing A7 streams)
+//         enum tables      (`# enum:<id>.<col> ...` from A8)
+//         column prefix    (`# colprefix:<id>.<col> ...` from A12)
+//         constant cols    (`# const:<id>.<col> ...` from A13)
+//         row prefix       (`# rowprefix:<id> ...` from A14)
+//     - aggregate union — each pattern keyed by canonical-string,
+//       tracking (occurrence_count, file_count, total_bytes_savings_potential)
+//
+//   PASS 2 — dict builder (DEFERRED):
+//     - score each candidate by total_bytes_saved = (occ × pat_len) - ref_overhead
+//     - retain only candidates with file_count >= 2 (singletons stay per-file)
+//     - emit `state/hxc/_shared_dict.hxc` with stable id assignment
+//
+//   PASS 3 — per-file encode (DEFERRED):
+//     - load `_shared_dict.hxc`, build pattern → id map
+//     - on encode, replace shared pattern occurrences with `^D<id>` sigil
+//     - patterns NOT in shared dict fall back to per-file inline (legacy path)
+//     - per-file footer: `# shared-dict-ref: <path> checksum=<sha>`
+//
+//   PASS 4 — decode (DEFERRED):
+//     - read footer, load + checksum-validate `_shared_dict.hxc`
+//     - build id → pattern reverse map; substitute `^D<id>` with pattern
+//
+// Sigil: `^D<dict_id>` — shared-dict reference. Cells starting literal `^D`
+// get escape `^D^` prefix (PASS 3 detail).
+//
+// Idempotency contract (raw 65 + 68):
+//     encode(decode(x)) == x for any A19 stream
+//     decode(encode(y)) == y for any byte stream
+//     PASS 1 scanner is read-only — idempotent by construction
+//
+// Falsifiers preregistered (raw 71, raw 91 honest C3):
+//     F-A19-1: byte-weighted saving < 0.05 on multi-file corpus → reject A19
+//              (per-file dict was already optimal; cross-file overhead waste)
+//     F-A19-2: shared dict missing/checksum-mismatch at decode → fallback to
+//              embed mode OR hard fail (configurable; PASS 4 detail)
+//     F-A19-3: encode latency > 100ms per 1KB content → reject (would block
+//              hxc_migrate single-pass throughput)
+//     F-A19-4: round-trip byte-eq fail on multi-file corpus → reject (raw 65/68)
+
+const A19_SIGIL = "^D"
+const A19_DICT_FORMAT_VERSION = "v1"
+const A19_DEFAULT_DICT_PATH = "state/hxc/_shared_dict.hxc"
+const A19_MIN_FILE_COUNT = 2          // pattern must appear in ≥ 2 files
+const A19_MIN_PATTERN_BYTES = 8        // patterns shorter than ref overhead skipped
+const A19_MAX_PATTERN_BYTES = 4096     // cap per-pattern size for dict body sanity
+
+// Pattern category tags — used as prefix in dict body to disambiguate.
+const A19_TAG_SCHEMA = "schema"
+const A19_TAG_DICT = "dict"
+const A19_TAG_ENUM = "enum"
+const A19_TAG_COLPREFIX = "colprefix"
+const A19_TAG_CONST = "const"
+const A19_TAG_ROWPREFIX = "rowprefix"
+
+// ───────────────────────── shared dict file format ─────────────────────────
+//
+// `state/hxc/_shared_dict.hxc` text layout (raw 9 hexa-only readable):
+//
+//   # hxc-shared-dict v1
+//   # corpus: <root_path>
+//   # built: <iso8601>
+//   # algo: A19 v1
+//   # n_entries: <N>
+//   D0 <tag> <key> <body_len> <body_b64_or_escape>
+//   D1 <tag> <key> <body_len> <body>
+//   ...
+//   Dn <tag> <key> <body_len> <body>
+//   # checksum: <sha256-of-body-lines>
+//
+// Tag values: schema | dict | enum | colprefix | const | rowprefix
+// Key values: schema_id, "<schema_id>.<col>", or "" (rowprefix is global)
+// body_len:   integer byte count of body field (lets decoder slice safely)
+// body:       canonical-string of pattern; LF/CR/| escaped via \xHH (A7 style)
+//
+// Inline reference sigil from per-file streams: `^D<id>` where <id> matches Dn.
+
+// ───────────────────────── helpers ─────────────────────────
+
+fn _byte_at(s: string, i: int) -> string {
+    if i < 0 || i >= len(s) { return "" }
+    return s.substring(i, i + 1)
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+// _shell_escape — minimal POSIX single-quote escape for find / paths.
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+// _list_files — enumerate files under root matching glob extensions.
+// exts: array of bare extensions (e.g. ["hxc", "jsonl"]). Empty → no filter.
+// Uses POSIX `find` (raw 9 hexa-only allows shell exec; consistent with A7 _ts_iso).
+fn _list_files(root: string, exts: array) -> array {
+    if len(root) == 0 { return [] }
+    let mut cmd = "find " + _shell_escape(root) + " -type f"
+    if len(exts) > 0 {
+        cmd = cmd + " \\( "
+        let mut i = 0
+        while i < len(exts) {
+            if i > 0 { cmd = cmd + " -o " }
+            cmd = cmd + "-name '*." + exts[i] + "'"
+            i = i + 1
+        }
+        cmd = cmd + " \\)"
+    }
+    let raw_out = to_string(exec(cmd))
+    if len(raw_out) == 0 { return [] }
+    let lines = split(raw_out, "\n")
+    let mut out = []
+    let mut k = 0
+    while k < len(lines) {
+        let l = lines[k].trim()
+        if len(l) > 0 { out.push(l) }
+        k = k + 1
+    }
+    return out
+}
+
+// ───────────────────────── pattern extraction (per-file) ─────────────────────────
+
+// _classify_header — given a `# ...` header line, return [tag, key, body] or [].
+// Recognized headers (consistent with A7/A8/A12/A13/A14 emit syntax):
+//   # schema:<id> col1 col2 ...           → [schema, <id>, "<col1 col2 ...>"]
+//   # dict:<id>.<col> v1|v2|...           → [dict, "<id>.<col>", "<v1|v2|...>"]
+//   # enum:<id>.<col> v1|v2|...           → [enum, "<id>.<col>", "<v1|v2|...>"]
+//   # colprefix:<id>.<col> <prefix>       → [colprefix, "<id>.<col>", "<prefix>"]
+//   # const:<id>.<col> <value>            → [const, "<id>.<col>", "<value>"]
+//   # rowprefix:<id> <prefix>             → [rowprefix, "<id>", "<prefix>"]
+fn _classify_header(line: string) -> array {
+    if len(line) < 3 { return [] }
+    if _byte_at(line, 0) != "#" { return [] }
+    // Strip leading "# " (or "#" + space).
+    let mut p = 1
+    while p < len(line) && _byte_at(line, p) == " " { p = p + 1 }
+    let body = line.substring(p, len(line))
+    let colon = body.index_of(":")
+    if colon < 0 { return [] }
+    let tag = body.substring(0, colon)
+    // Validate tag against known set.
+    if !(tag == A19_TAG_SCHEMA || tag == A19_TAG_DICT || tag == A19_TAG_ENUM
+         || tag == A19_TAG_COLPREFIX || tag == A19_TAG_CONST
+         || tag == A19_TAG_ROWPREFIX) {
+        return []
+    }
+    let rest = body.substring(colon + 1, len(body))
+    // First whitespace splits key from body content.
+    let sp = rest.index_of(" ")
+    if sp < 0 {
+        // Header with key only, no body (degenerate but accept).
+        return [tag, rest, ""]
+    }
+    let key = rest.substring(0, sp)
+    let pat_body = rest.substring(sp + 1, len(rest))
+    return [tag, key, pat_body]
+}
+
+// _scan_one_file — extract all classifiable headers from one file's text.
+// Returns array of [tag, key, body, byte_len] entries (one per header line).
+fn _scan_one_file(text: string) -> array {
+    let lines = split(text, "\n")
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) > 0 && _byte_at(l, 0) == "#" {
+            let cls = _classify_header(l)
+            if len(cls) == 3 {
+                let blen = len(l) + 1   // include trailing LF
+                out.push([cls[0], cls[1], cls[2], to_string(blen)])
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── corpus aggregation (PASS 1) ─────────────────────────
+
+// _canonical_key — combine tag + key + body into a stable dedup key.
+// Format: "<tag>\x1f<key>\x1f<body>" (US separator avoids natural collisions).
+fn _canonical_key(tag: string, key: string, body: string) -> string {
+    return tag + "\x1f" + key + "\x1f" + body
+}
+
+// a19_scan_corpus — PASS 1: walk corpus root + aggregate header patterns.
+//
+// Returns: array of [tag, key, body, occ_count, file_count, total_bytes]
+//   tag         pattern category (one of A19_TAG_* constants)
+//   key         pattern key (schema id, "<id>.<col>", or "")
+//   body        canonical pattern bytes (string)
+//   occ_count   total occurrences across corpus (string-of-int)
+//   file_count  distinct files containing pattern (string-of-int)
+//   total_bytes sum of pattern byte costs across occurrences (string-of-int)
+//
+// Filtering:
+//   - patterns shorter than A19_MIN_PATTERN_BYTES skipped
+//   - patterns longer than A19_MAX_PATTERN_BYTES skipped
+//   - file_count threshold (A19_MIN_FILE_COUNT) applied in PASS 2 — NOT here,
+//     because PASS 2 may also score by occurrence-density even for single-file
+//     hot patterns. Scanner returns the full census.
+fn a19_scan_corpus(root: string, exts: array) -> array {
+    let files = _list_files(root, exts)
+    // Parallel arrays for the dedup map (map_keys preserves insertion order in
+    // hexa runtime; using arrays for explicit deterministic iteration ordering).
+    let mut keys = []           // canonical_key strings
+    let mut tags = []
+    let mut pat_keys = []
+    let mut bodies = []
+    let mut occ_counts = []     // int counters
+    let mut file_counts = []    // int counters
+    let mut total_bytes = []    // int counters
+    let mut last_file_idx = []  // last file index to detect cross-file occurrences
+    let mut fi = 0
+    while fi < len(files) {
+        let path = files[fi]
+        let txt = to_string(read_file(path))
+        let entries = _scan_one_file(txt)
+        let mut ei = 0
+        while ei < len(entries) {
+            let e = entries[ei]
+            let tag = e[0]
+            let key = e[1]
+            let body = e[2]
+            let blen = parse_int(e[3])
+            // Filter by size.
+            if blen < A19_MIN_PATTERN_BYTES || blen > A19_MAX_PATTERN_BYTES {
+                ei = ei + 1
+                continue
+            }
+            let ck = _canonical_key(tag, key, body)
+            // Linear search the keys array (corpus pattern count is bounded by
+            // total header lines; for nexus 96-file ~12 schemas + ~80 enums
+            // → O(few hundred) entries — linear is fine. PASS 2 builds an
+            // explicit map for scoring.)
+            let mut found = -1
+            let mut k = 0
+            while k < len(keys) {
+                if keys[k] == ck { found = k; break }
+                k = k + 1
+            }
+            if found < 0 {
+                keys.push(ck)
+                tags.push(tag)
+                pat_keys.push(key)
+                bodies.push(body)
+                occ_counts.push(1)
+                file_counts.push(1)
+                total_bytes.push(blen)
+                last_file_idx.push(fi)
+            } else {
+                occ_counts[found] = occ_counts[found] + 1
+                total_bytes[found] = total_bytes[found] + blen
+                if last_file_idx[found] != fi {
+                    file_counts[found] = file_counts[found] + 1
+                    last_file_idx[found] = fi
+                }
+            }
+            ei = ei + 1
+        }
+        fi = fi + 1
+    }
+    // Materialize into return shape.
+    let mut out = []
+    let mut k2 = 0
+    while k2 < len(keys) {
+        out.push([tags[k2], pat_keys[k2], bodies[k2],
+                  to_string(occ_counts[k2]),
+                  to_string(file_counts[k2]),
+                  to_string(total_bytes[k2])])
+        k2 = k2 + 1
+    }
+    return out
+}
+
+// a19_scan_files — PASS 1 variant taking explicit file path array (testable
+// without a real directory). Same return shape as a19_scan_corpus.
+fn a19_scan_files(file_paths: array) -> array {
+    let mut keys = []
+    let mut tags = []
+    let mut pat_keys = []
+    let mut bodies = []
+    let mut occ_counts = []
+    let mut file_counts = []
+    let mut total_bytes = []
+    let mut last_file_idx = []
+    let mut fi = 0
+    while fi < len(file_paths) {
+        let path = file_paths[fi]
+        let txt = to_string(read_file(path))
+        let entries = _scan_one_file(txt)
+        let mut ei = 0
+        while ei < len(entries) {
+            let e = entries[ei]
+            let tag = e[0]
+            let key = e[1]
+            let body = e[2]
+            let blen = parse_int(e[3])
+            if blen < A19_MIN_PATTERN_BYTES || blen > A19_MAX_PATTERN_BYTES {
+                ei = ei + 1
+                continue
+            }
+            let ck = _canonical_key(tag, key, body)
+            let mut found = -1
+            let mut k = 0
+            while k < len(keys) {
+                if keys[k] == ck { found = k; break }
+                k = k + 1
+            }
+            if found < 0 {
+                keys.push(ck)
+                tags.push(tag)
+                pat_keys.push(key)
+                bodies.push(body)
+                occ_counts.push(1)
+                file_counts.push(1)
+                total_bytes.push(blen)
+                last_file_idx.push(fi)
+            } else {
+                occ_counts[found] = occ_counts[found] + 1
+                total_bytes[found] = total_bytes[found] + blen
+                if last_file_idx[found] != fi {
+                    file_counts[found] = file_counts[found] + 1
+                    last_file_idx[found] = fi
+                }
+            }
+            ei = ei + 1
+        }
+        fi = fi + 1
+    }
+    let mut out = []
+    let mut k2 = 0
+    while k2 < len(keys) {
+        out.push([tags[k2], pat_keys[k2], bodies[k2],
+                  to_string(occ_counts[k2]),
+                  to_string(file_counts[k2]),
+                  to_string(total_bytes[k2])])
+        k2 = k2 + 1
+    }
+    return out
+}
+
+// a19_filter_cross_file — return only patterns with file_count ≥ A19_MIN_FILE_COUNT.
+// Used by PASS 2 dict builder; exposed here for selftest verification.
+fn a19_filter_cross_file(scan_out: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(scan_out) {
+        let row = scan_out[i]
+        let fc = parse_int(row[4])
+        if fc >= A19_MIN_FILE_COUNT { out.push(row) }
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _write_fixture_file(path: string, content: string) -> int {
+    write_file(path, content)
+    return 0
+}
+
+fn _selftest() -> int {
+    println("# hxc_a19_cross_file_fed selftest (PARTIAL — first cron tick)")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Synthetic 5-file mini-corpus. Common patterns (expected cross-file):
+    //   schema:audit + schema:cycle + enum:audit.2 (verdict)
+    // Singleton patterns (expected per-file only):
+    //   schema:fileN-only (one per file, never repeated)
+    let tmp_root = "/tmp/hxc_a19_selftest_corpus"
+    let mkdir_rc = exec("mkdir -p " + _shell_escape(tmp_root))
+
+    // Common headers — appear in MOST files (cross-file shared candidates).
+    let h_audit = "# schema:audit ts actor cmd verdict"
+    let h_cycle = "# schema:cycle ts cycle id verdict"
+    let h_enum_verdict = "# enum:audit.3 PASS|FAIL|SKIP|RETRY"
+    let h_const_actor = "# const:audit.1 hive"
+
+    // Fixture file 1 — has audit + cycle + verdict enum + actor const (4 shared)
+    let f1 = h_audit + "\n" + h_cycle + "\n" + h_enum_verdict + "\n" + h_const_actor
+            + "\n@audit 2026-04-28T00:00:00Z|hive|raw148|PASS\n"
+    // Fixture file 2 — same 4 shared + 1 unique (file2-only schema)
+    let f2 = h_audit + "\n" + h_cycle + "\n" + h_enum_verdict + "\n# schema:file2only x y z\n"
+            + "@audit 2026-04-28T00:01:00Z|hive|raw149|FAIL\n"
+    // Fixture file 3 — audit + verdict enum (3 shared)
+    let f3 = h_audit + "\n" + h_enum_verdict + "\n" + h_const_actor
+            + "\n@audit 2026-04-28T00:02:00Z|hive|raw150|PASS\n"
+    // Fixture file 4 — cycle only + 1 unique
+    let f4 = h_cycle + "\n# schema:file4only a b\n"
+            + "@cycle 2026-04-28T00:03:00Z|omega|raw151|MET\n"
+    // Fixture file 5 — all 4 common + 1 unique
+    let f5 = h_audit + "\n" + h_cycle + "\n" + h_enum_verdict + "\n" + h_const_actor
+            + "\n# schema:file5only p q\n@audit 2026-04-28T00:04:00Z|hive|raw152|SKIP\n"
+
+    let p1 = tmp_root + "/file1.hxc"
+    let p2 = tmp_root + "/file2.hxc"
+    let p3 = tmp_root + "/file3.hxc"
+    let p4 = tmp_root + "/file4.hxc"
+    let p5 = tmp_root + "/file5.hxc"
+    let _w1 = _write_fixture_file(p1, f1)
+    let _w2 = _write_fixture_file(p2, f2)
+    let _w3 = _write_fixture_file(p3, f3)
+    let _w4 = _write_fixture_file(p4, f4)
+    let _w5 = _write_fixture_file(p5, f5)
+
+    // Test 1: classify_header parses each header type correctly.
+    let c1 = _classify_header(h_audit)
+    if len(c1) == 3 && c1[0] == "schema" && c1[1] == "audit" {
+        pass = pass + 1
+        println("  PASS: classify schema header tag=" + c1[0] + " key=" + c1[1])
+    } else {
+        fail = fail + 1
+        println("  FAIL: classify schema returned " + to_string(len(c1)) + " parts")
+    }
+    let c2 = _classify_header(h_enum_verdict)
+    if len(c2) == 3 && c2[0] == "enum" && c2[1] == "audit.3" {
+        pass = pass + 1
+        println("  PASS: classify enum header tag=" + c2[0] + " key=" + c2[1])
+    } else {
+        fail = fail + 1
+        println("  FAIL: classify enum returned " + to_string(len(c2)) + " parts")
+    }
+    let c3 = _classify_header(h_const_actor)
+    if len(c3) == 3 && c3[0] == "const" && c3[1] == "audit.1" {
+        pass = pass + 1
+        println("  PASS: classify const header tag=" + c3[0] + " key=" + c3[1])
+    } else {
+        fail = fail + 1
+        println("  FAIL: classify const returned " + to_string(len(c3)) + " parts")
+    }
+
+    // Test 2: scan_files aggregates correctly across the 5-file fixture.
+    let paths = [p1, p2, p3, p4, p5]
+    let scan = a19_scan_files(paths)
+    if len(scan) > 0 {
+        pass = pass + 1
+        println("  PASS: scan_files returned " + to_string(len(scan)) + " distinct patterns")
+    } else {
+        fail = fail + 1
+        println("  FAIL: scan_files returned 0 patterns")
+    }
+
+    // Test 3: schema:audit appears in 4 files (1, 2, 3, 5) with file_count == 4.
+    let mut found_audit = false
+    let mut audit_fc = 0
+    let mut audit_occ = 0
+    let mut si = 0
+    while si < len(scan) {
+        let r = scan[si]
+        if r[0] == "schema" && r[1] == "audit" {
+            found_audit = true
+            audit_fc = parse_int(r[4])
+            audit_occ = parse_int(r[3])
+            break
+        }
+        si = si + 1
+    }
+    if found_audit && audit_fc == 4 && audit_occ == 4 {
+        pass = pass + 1
+        println("  PASS: schema:audit aggregated file_count=" + to_string(audit_fc)
+                + " occ=" + to_string(audit_occ))
+    } else {
+        fail = fail + 1
+        println("  FAIL: schema:audit found=" + to_string(found_audit)
+                + " fc=" + to_string(audit_fc) + " occ=" + to_string(audit_occ)
+                + " (want fc=4 occ=4)")
+    }
+
+    // Test 4: file2only / file4only / file5only have file_count == 1 (singletons).
+    let mut singletons = 0
+    let mut sj = 0
+    while sj < len(scan) {
+        let r = scan[sj]
+        if r[1] == "file2only" || r[1] == "file4only" || r[1] == "file5only" {
+            if parse_int(r[4]) == 1 { singletons = singletons + 1 }
+        }
+        sj = sj + 1
+    }
+    if singletons == 3 {
+        pass = pass + 1
+        println("  PASS: 3 singleton schemas correctly tagged file_count=1")
+    } else {
+        fail = fail + 1
+        println("  FAIL: expected 3 singletons, got " + to_string(singletons))
+    }
+
+    // Test 5: filter_cross_file drops singletons; retains only file_count >= 2.
+    let cross = a19_filter_cross_file(scan)
+    let mut all_cross = true
+    let mut ck = 0
+    while ck < len(cross) {
+        if parse_int(cross[ck][4]) < A19_MIN_FILE_COUNT { all_cross = false; break }
+        ck = ck + 1
+    }
+    if all_cross && len(cross) >= 3 && len(cross) < len(scan) {
+        pass = pass + 1
+        println("  PASS: filter_cross_file kept " + to_string(len(cross)) + "/"
+                + to_string(len(scan)) + " (singletons dropped)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: filter_cross_file kept " + to_string(len(cross)) + "/"
+                + to_string(len(scan)) + " all_cross=" + to_string(all_cross))
+    }
+
+    // Test 6: total_bytes for shared schema:audit equals 4× pattern byte length.
+    // Pattern body length = len(h_audit) + 1 (LF) = 33 bytes per occurrence.
+    let mut audit_tb = 0
+    let mut ti = 0
+    while ti < len(scan) {
+        if scan[ti][0] == "schema" && scan[ti][1] == "audit" {
+            audit_tb = parse_int(scan[ti][5])
+            break
+        }
+        ti = ti + 1
+    }
+    let expected_tb = (len(h_audit) + 1) * 4
+    if audit_tb == expected_tb {
+        pass = pass + 1
+        println("  PASS: schema:audit total_bytes=" + to_string(audit_tb)
+                + " (4× " + to_string(len(h_audit) + 1) + ")")
+    } else {
+        fail = fail + 1
+        println("  FAIL: schema:audit total_bytes=" + to_string(audit_tb)
+                + " (want " + to_string(expected_tb) + ")")
+    }
+
+    // Cleanup fixture (best effort — leave on failure for inspection).
+    if fail == 0 {
+        let _rm = exec("rm -rf " + _shell_escape(tmp_root))
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A19_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
+            + " (PARTIAL: PASS 1 scanner + dict format + 1 fixture; PASS 2/3/4 + integration deferred)")
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────────────── main ─────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_scan = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "scan" { has_scan = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_scan {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "scan" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 1 >= len(av) {
+            eprintln("usage: hexa hxc_a19_cross_file_fed.hexa scan <corpus-root>")
+            exit(3)
+        }
+        let root = av[sub_idx + 1]
+        let scan = a19_scan_corpus(root, ["hxc", "jsonl"])
+        let cross = a19_filter_cross_file(scan)
+        println("# hxc-a19 PASS 1 census")
+        println("# corpus: " + root)
+        println("# total patterns: " + to_string(len(scan)))
+        println("# cross-file patterns (file_count >= " + to_string(A19_MIN_FILE_COUNT) + "): " + to_string(len(cross)))
+        let mut i = 0
+        while i < len(cross) {
+            let r = cross[i]
+            println(r[0] + "\t" + r[1] + "\tocc=" + r[3] + "\tfc=" + r[4] + "\ttb=" + r[5])
+            i = i + 1
+        }
+        exit(0)
+    }
+    eprintln("# A19 PASS 2 dict builder / PASS 3 encode / PASS 4 decode NOT YET IMPLEMENTED — first cron tick = PASS 1 scanner only.")
+    eprintln("usage: hexa hxc_a19_cross_file_fed.hexa [--selftest | scan <corpus-root>]")
+    exit(9)
+}
