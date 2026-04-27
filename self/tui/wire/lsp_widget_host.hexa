@@ -1,0 +1,315 @@
+#!hexa strict
+// self/tui/wire/lsp_widget_host.hexa — TUI-PRIM T1.C Surface 3 real impl
+//
+// LSP server response → widget mapping. Counterpart of Surface 4 (editor
+// JSON-RPC bridge), but specialized for LSP semantics: server-pushed
+// notifications + structured response shapes.
+//
+// LSP method → widget mapping (per kick verdict):
+//   textDocument/hover           → modal widget (markdown content)
+//   textDocument/publishDiagnostics → list widget (severity-sorted items)
+//   textDocument/completion      → text widget (completion menu)
+//
+// USAGE
+//   Caller invokes lsp_handle_response(method, params_json) per LSP
+//   message received from the server. The host renders the appropriate
+//   widget into the L3 back buffer. After dispatching responses,
+//   caller calls render_flush() (or wire_pi_render_lines()) to emit.
+//
+// CONTRACT-FORWARD vs IMPLEMENTATION-REAL
+//   The LSP server (hexa-lang Phase 7) does not exist yet. This module
+//   ships the WIDGET HOST side — the consumer of LSP responses, with
+//   widget rendering. It accepts hand-synthesized JSON-RPC envelopes
+//   (in tests) so the dispatch + render path is exercisable today.
+//
+//   When the LSP server lands, the only addition is a thin client that
+//   sends requests + receives responses; this module already handles
+//   the RECEIVE side per kick T1.C.
+
+use "self/tui/render"
+use "self/tui/widget/box"
+use "self/tui/widget/text"
+use "self/tui/widget/list"
+
+// Response type counters (for telemetry / testing)
+let mut _lsp_hover_count = 0
+let mut _lsp_diag_count = 0
+let mut _lsp_completion_count = 0
+
+// ─── public API ─────────────────────────────────────────────────
+
+// Dispatch an LSP response to its widget renderer. Returns:
+//   "modal"         — hover content rendered as modal
+//   "list"          — diagnostics rendered as list
+//   "text"          — completion items rendered as text menu
+//   "unknown"       — method not in supported set
+//   "error"         — params parse failed
+pub fn lsp_handle_response(method: string, params_json: string) -> string {
+    if method == "textDocument/hover" {
+        let content = _extract_string_field(params_json, "\"contents\":\"")
+        if content == "" { return "error" }
+        _lsp_hover_count = _lsp_hover_count + 1
+        let _r = _render_hover_modal(content)
+        return "modal"
+    }
+    if method == "textDocument/publishDiagnostics" {
+        let items = _extract_diagnostics_items(params_json)
+        _lsp_diag_count = _lsp_diag_count + 1
+        let _r = _render_diagnostics_list(items)
+        return "list"
+    }
+    if method == "textDocument/completion" {
+        let labels = _extract_completion_labels(params_json)
+        _lsp_completion_count = _lsp_completion_count + 1
+        let _r = _render_completion_text(labels)
+        return "text"
+    }
+    return "unknown"
+}
+
+pub fn lsp_hover_count() -> int { return _lsp_hover_count }
+pub fn lsp_diag_count() -> int { return _lsp_diag_count }
+pub fn lsp_completion_count() -> int { return _lsp_completion_count }
+
+pub fn lsp_reset_counts() {
+    _lsp_hover_count = 0
+    _lsp_diag_count = 0
+    _lsp_completion_count = 0
+}
+
+// ─── widget renderers ──────────────────────────────────────────
+
+// Render hover content as a modal box centered horizontally. Box is
+// drawn at top of screen with content text inside. Single-line content
+// only (multi-line markdown rendering is forward).
+fn _render_hover_modal(content: string) -> int {
+    let dims = render_dims()
+    let cols = dims[0]
+    let _ = dims[1]
+    let inner_w = if len(content) + 4 < 40 { 40 } else { len(content) + 4 }
+    let w = if inner_w > 76 { 76 } else { inner_w }
+    let x = 2
+    let y = 1
+    let _b = box_draw(x, y, w, 4, 196, -1, 0, 1)
+    let _t = text_label(x + 2, y + 1, "[hover]", 220, -1, 1)
+    let truncated = if len(content) > w - 4 { content.substring(0, w - 4) } else { content }
+    let _c = text_label(x + 2, y + 2, truncated, -1, -1, 0)
+    return 0
+}
+
+// Render diagnostics as a vertical list. Each item is a string already
+// formatted as "<severity>: <message>" by _extract_diagnostics_items.
+fn _render_diagnostics_list(items: array) -> int {
+    let dims = render_dims()
+    let rows = dims[0]
+    let cols = dims[1]
+    let _b = box_draw(0, 6, cols, 8, 33, -1, 0, 1)
+    let _t = text_label(2, 6, "[diagnostics]", 220, -1, 1)
+    let _l = list_draw(1, 7, cols - 2, 6, items, -1, 0, -1, -1, 0)
+    return len(items)
+}
+
+// Render completion items as a vertical text menu in the lower half.
+fn _render_completion_text(labels: array) -> int {
+    let dims = render_dims()
+    let rows = dims[0]
+    let cols = dims[1]
+    let start_y = rows - 8
+    let _b = box_draw(0, start_y, cols, 7, 75, -1, 0, 1)
+    let _t = text_label(2, start_y, "[completion]", 220, -1, 1)
+    let mut i = 0
+    while i < len(labels) && i < 5 {
+        let _x = text_label(2, start_y + 1 + i, labels[i], 230, -1, 0)
+        i = i + 1
+    }
+    return len(labels)
+}
+
+// ─── parsers (subset JSON, similar style to editor_bridge) ─────
+
+// Extract an integer-valued field as its string form (e.g. "1", "42").
+// Returns "" on miss.
+fn _extract_int_field(s: string, key: string) -> string {
+    let idx = _find_substring(s, key)
+    if idx < 0 { return "" }
+    let start = idx + len(key)
+    let n = len(s)
+    let mut i = start
+    // Skip optional whitespace
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch != " " && ch != "\t" { break }
+        i = i + 1
+    }
+    let mut digits_start = i
+    if i < n && s.substring(i, i + 1) == "-" { i = i + 1 }
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let cp = char_code(ch, 0)
+        if cp < 48 || cp > 57 { break }
+        i = i + 1
+    }
+    return s.substring(digits_start, i)
+}
+
+// Extract a single quoted string field. Returns "" on miss.
+fn _extract_string_field(s: string, key: string) -> string {
+    let idx = _find_substring(s, key)
+    if idx < 0 { return "" }
+    let start = idx + len(key)
+    let n = len(s)
+    let mut i = start
+    while i < n {
+        if s.substring(i, i + 1) == "\"" { break }
+        i = i + 1
+    }
+    return s.substring(start, i)
+}
+
+// Extract diagnostics items as ["severity:message", ...] strings.
+// Looks for "diagnostics":[ ... ] then iterates objects with severity
+// + message fields.
+fn _extract_diagnostics_items(s: string) -> array {
+    let mut out = []
+    let needle = "\"diagnostics\":["
+    let arr_start = _find_substring(s, needle)
+    if arr_start < 0 { return out }
+    // Naive: split by "{" and extract per-item severity + message.
+    let mut i = arr_start + len(needle)
+    let n = len(s)
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "]" { break }
+        if ch == "{" {
+            // Find matching "}"
+            let mut j = i + 1
+            let mut depth = 1
+            while j < n && depth > 0 {
+                let cj = s.substring(j, j + 1)
+                if cj == "{" { depth = depth + 1 }
+                if cj == "}" { depth = depth - 1 }
+                j = j + 1
+            }
+            let obj = s.substring(i + 1, j - 1)
+            let sev_str = _extract_int_field(obj, "\"severity\":")
+            let msg = _extract_string_field(obj, "\"message\":\"")
+            // sev: 1=Error, 2=Warning, 3=Info, 4=Hint (LSP convention)
+            let sev_label = _severity_label(sev_str)
+            let mut line = sev_label
+            if len(msg) > 0 { line = line + ": " + msg }
+            out.push(line)
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn _severity_label(s: string) -> string {
+    if s == "1" { return "ERR" }
+    if s == "2" { return "WARN" }
+    if s == "3" { return "INFO" }
+    if s == "4" { return "HINT" }
+    return "?"
+}
+
+// Extract completion labels as array of strings. Looks for
+// "items":[{"label":"x"}, ...]
+fn _extract_completion_labels(s: string) -> array {
+    let mut out = []
+    let needle = "\"items\":["
+    let arr_start = _find_substring(s, needle)
+    if arr_start < 0 { return out }
+    let mut i = arr_start + len(needle)
+    let n = len(s)
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == "]" { break }
+        if ch == "{" {
+            let mut j = i + 1
+            let mut depth = 1
+            while j < n && depth > 0 {
+                let cj = s.substring(j, j + 1)
+                if cj == "{" { depth = depth + 1 }
+                if cj == "}" { depth = depth - 1 }
+                j = j + 1
+            }
+            let obj = s.substring(i + 1, j - 1)
+            let label = _extract_string_field(obj, "\"label\":\"")
+            if len(label) > 0 { out.push(label) }
+            i = j
+        } else {
+            i = i + 1
+        }
+    }
+    return out
+}
+
+fn _find_substring(haystack: string, needle: string) -> int {
+    let nh = len(haystack)
+    let nn = len(needle)
+    if nn > nh { return -1 }
+    let mut i = 0
+    while i + nn <= nh {
+        if haystack.substring(i, i + nn) == needle { return i }
+        i = i + 1
+    }
+    return -1
+}
+
+// ─── selftest ─────────────────────────────────────────────────
+
+pub fn lsp_widget_host_selftest() -> int {
+    println("self/tui/wire/lsp_widget_host — T1.C Surface 3 selftest")
+    let _r = render_init()
+    lsp_reset_counts()
+
+    // Hover
+    let h_res = lsp_handle_response("textDocument/hover", "{\"contents\":\"hello world\"}")
+    if h_res != "modal" { return 1 }
+    if lsp_hover_count() != 1 { return 2 }
+
+    // Diagnostics — 2 items
+    let d_params = "{\"uri\":\"file://x\",\"diagnostics\":[{\"severity\":1,\"message\":\"unused var\"},{\"severity\":2,\"message\":\"deprecated api\"}]}"
+    let d_res = lsp_handle_response("textDocument/publishDiagnostics", d_params)
+    if d_res != "list" { return 3 }
+    if lsp_diag_count() != 1 { return 4 }
+
+    // Completion — 3 items
+    let c_params = "{\"items\":[{\"label\":\"foo\"},{\"label\":\"bar\"},{\"label\":\"baz\"}]}"
+    let c_res = lsp_handle_response("textDocument/completion", c_params)
+    if c_res != "text" { return 5 }
+    if lsp_completion_count() != 1 { return 6 }
+
+    // Unknown method
+    let u_res = lsp_handle_response("textDocument/foo", "{}")
+    if u_res != "unknown" { return 7 }
+
+    // Hover error (no contents field)
+    let e_res = lsp_handle_response("textDocument/hover", "{\"x\":1}")
+    if e_res != "error" { return 8 }
+
+    // Diagnostics extractor — verify items
+    let items = _extract_diagnostics_items(d_params)
+    if len(items) != 2 { return 9 }
+    if items[0] != "ERR: unused var" { return 10 }
+    if items[1] != "WARN: deprecated api" { return 11 }
+
+    // Completion extractor
+    let labels = _extract_completion_labels(c_params)
+    if len(labels) != 3 { return 12 }
+    if labels[0] != "foo" { return 13 }
+    if labels[1] != "bar" { return 14 }
+    if labels[2] != "baz" { return 15 }
+
+    // Severity labels
+    if _severity_label("1") != "ERR" { return 16 }
+    if _severity_label("2") != "WARN" { return 17 }
+    if _severity_label("3") != "INFO" { return 18 }
+    if _severity_label("4") != "HINT" { return 19 }
+    if _severity_label("99") != "?" { return 20 }
+
+    println("lsp_widget_host selftest OK")
+    return 0
+}
