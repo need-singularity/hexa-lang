@@ -356,6 +356,86 @@ fn _decode_array_value(val: string, keys: array) -> string {
     return "[" + objs.join(",") + "]"
 }
 
+// Phase 8 P8: process `# tree:` declarations from A4. Tree values often contain
+// array-of-objects ([{...},{...}]) that A15 can compress in-place.
+// Format: `# tree:<id>.<sym> <hash>:<json_value>`
+// Returns: [transformed_line, optional_subschema_header_or_empty]
+fn _process_tree_decl(line: string) -> array {
+    let mut result = []
+    if !(len(line) >= 7 && line.substring(0, 7) == "# tree:") {
+        result.push(line); result.push(""); return result
+    }
+    // Format: `# tree:<id>.<sym> <hash>:<value>`
+    // Skip past `# tree:` prefix (8 chars), then find the FIRST space (after id.sym).
+    let mut space_idx = -1
+    let mut sk = 7
+    while sk < len(line) {
+        if line.substring(sk, sk + 1) == " " { space_idx = sk; break }
+        sk = sk + 1
+    }
+    if space_idx < 0 { result.push(line); result.push(""); return result }
+    // Look for ':' after space (the hash:value separator)
+    let mut colon_idx = -1
+    let mut k = space_idx + 1
+    while k < len(line) {
+        if line.substring(k, k + 1) == ":" { colon_idx = k; break }
+        k = k + 1
+    }
+    if colon_idx < 0 { result.push(line); result.push(""); return result }
+    let prefix = line.substring(0, colon_idx + 1)  // include the ':'
+    let value = line.substring(colon_idx + 1, len(line))
+    // Check if value is array-of-objects
+    if !_is_array_of_objects(value) {
+        result.push(line); result.push(""); return result
+    }
+    let inner = value.substring(1, len(value) - 1)
+    let objs = _split_objects_in_array(inner)
+    if len(objs) < A15_MIN_OBJECTS {
+        result.push(line); result.push(""); return result
+    }
+    // Extract keys from first object
+    let keys = _parse_object_keys(objs[0])
+    if len(keys) < 2 { result.push(line); result.push(""); return result }
+    // Verify ≥80% subsequent objects share key set
+    let mut match_count = 1
+    let mut o = 1
+    while o < len(objs) {
+        let okeys = _parse_object_keys(objs[o])
+        if len(okeys) == len(keys) {
+            let mut all_match = true
+            let mut kk = 0
+            while kk < len(keys) {
+                if okeys[kk] != keys[kk] { all_match = false; break }
+                kk = kk + 1
+            }
+            if all_match { match_count = match_count + 1 }
+        }
+        o = o + 1
+    }
+    let pct_x100 = (match_count * 100) / len(objs)
+    if pct_x100 < 80 { result.push(line); result.push(""); return result }
+    // Eligible — encode array, emit subschema header for this tree
+    let encoded = _encode_array_value(value)
+    let net_savings = len(value) - len(encoded)
+    if net_savings <= 50 {
+        // Not worth it for this small tree (header overhead exceeds saving)
+        result.push(line); result.push(""); return result
+    }
+    // Use the tree's id as subschema marker (extract from prefix, e.g. "0.A" from "# tree:0.A ...")
+    // Subschema header: `# tree-subschema:<id> keys=k1|k2|...`
+    let tree_id_start = 7  // after "# tree:"
+    let mut tree_id_end = tree_id_start
+    while tree_id_end < space_idx {
+        tree_id_end = tree_id_end + 1
+    }
+    let tree_id = line.substring(tree_id_start, space_idx)
+    let new_line = prefix + encoded
+    let sub_header = "# tree-subschema:" + tree_id + " keys=" + keys.join("|")
+    result.push(new_line)
+    result.push(sub_header)
+    return result
+}
+
 fn a15_encode(v1_text: string) -> string {
     let lines = v1_text.split("\n")
     let mut schema_rows = []
@@ -382,7 +462,10 @@ fn a15_encode(v1_text: string) -> string {
     let mut out = []
     let mut h = 0
     while h < len(header_lines) {
-        out.push(header_lines[h])
+        // Phase 8 P8: process tree declarations to compress inner array-of-objects.
+        let processed = _process_tree_decl(header_lines[h])
+        out.push(processed[0])
+        if len(processed[1]) > 0 { out.push(processed[1]) }
         h = h + 1
     }
 
@@ -499,7 +582,75 @@ fn a15_decode(v2_text: string) -> string {
         }
         i = i + 1
     }
-    return out.join("\n") + "\n"
+    // Phase 8 P8 second pass: handle tree-subschema decompression.
+    // Build tree_subs map from `# tree-subschema:<id> keys=...` lines (NOT yet emitted).
+    // Then walk out[] looking for `# tree:<id>.<sym> ...^[...]` and decode value.
+    // Strategy: 2-pass post-processing of output.
+    let mut tree_subs = []  // array of [tree_id, keys_array]
+    let mut filtered = []
+    let mut q = 0
+    while q < len(out) {
+        let l = out[q]
+        if len(l) >= 18 && l.substring(0, 18) == "# tree-subschema:" {
+            let after = l.substring(18, len(l)).trim()
+            let sp = after.find(" ")
+            if sp > 0 {
+                let tid = after.substring(0, sp)
+                let keys_part = after.substring(sp + 1, len(after))
+                if len(keys_part) >= 5 && keys_part.substring(0, 5) == "keys=" {
+                    let keys_csv = keys_part.substring(5, len(keys_part))
+                    let keys = keys_csv.split("|")
+                    tree_subs.push([tid, keys])
+                }
+            }
+            // Don't emit subschema headers in decoded output
+        } else {
+            filtered.push(l)
+        }
+        q = q + 1
+    }
+    let mut final_out = []
+    let mut z = 0
+    while z < len(filtered) {
+        let mut l = filtered[z]
+        if len(l) >= 7 && l.substring(0, 7) == "# tree:" {
+            // Find tree id and value: skip past `# tree:` (7 chars), find first space.
+            let mut space_idx = -1
+            let mut sk = 7
+            while sk < len(l) {
+                if l.substring(sk, sk + 1) == " " { space_idx = sk; break }
+                sk = sk + 1
+            }
+            if space_idx > 7 {
+                let tid = l.substring(7, space_idx)
+                let mut colon = -1
+                let mut k = space_idx + 1
+                while k < len(l) {
+                    if l.substring(k, k + 1) == ":" { colon = k; break }
+                    k = k + 1
+                }
+                if colon > 0 {
+                    let prefix = l.substring(0, colon + 1)
+                    let value = l.substring(colon + 1, len(l))
+                    if len(value) >= 2 && value.substring(0, 2) == "^[" {
+                        // Look up tree_id in tree_subs
+                        let mut t = 0
+                        while t < len(tree_subs) {
+                            if tree_subs[t][0] == tid {
+                                let decoded_val = _decode_array_value(value, tree_subs[t][1])
+                                l = prefix + decoded_val
+                                break
+                            }
+                            t = t + 1
+                        }
+                    }
+                }
+            }
+        }
+        final_out.push(l)
+        z = z + 1
+    }
+    return final_out.join("\n") + "\n"
 }
 
 fn _selftest() -> int {
