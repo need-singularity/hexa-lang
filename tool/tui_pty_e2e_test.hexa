@@ -1,0 +1,184 @@
+// tool/tui_pty_e2e_test.hexa — hexa drives hexa via real PTY harness
+//
+// Self-host integration test: a hexa script spawns the editor_bridge
+// demo binary as a child process through a real PTY, sends JSON-RPC
+// requests, reads responses, verifies expected output. Closes the
+// "self-host testing" loop — hexa can now test hexa without depending
+// on the TS bridge layer.
+//
+// Build prereq:
+//   ./hexa build tool/tui_demo_editor_bridge.hexa -o /tmp/tui_eb_demo
+//
+// Run:
+//   ./hexa build tool/tui_pty_e2e_test.hexa -o /tmp/_pty_e2e
+//   /tmp/_pty_e2e
+
+let mut _passed = 0
+let mut _failed = 0
+
+fn _expect(label: string, cond: bool, detail: string) {
+    if cond {
+        _passed = _passed + 1
+        println("  PASS  " + label)
+    } else {
+        _failed = _failed + 1
+        println("  FAIL  " + label + " — " + detail)
+    }
+}
+
+// Read until pattern found OR timeout. Returns accumulated bytes.
+// Patterns ending in newline match line-end; otherwise the read keeps
+// going until 100ms of silence after the first match (assuming the
+// rest of the response is on its way).
+fn _read_until(mfd: int, pattern: string, timeout_ms: int) -> string {
+    let mut total = ""
+    let mut elapsed = 0
+    let mut found_at = -1
+    let mut quiet_since_match = 0
+    while elapsed < timeout_ms {
+        let p = term_fd_poll(mfd, 50)
+        if p == 1 {
+            let chunk = term_fd_read(mfd, 4096)
+            if len(chunk) > 0 {
+                total = total + chunk
+                if found_at < 0 && _contains(total, pattern) {
+                    found_at = elapsed
+                }
+                quiet_since_match = 0
+            }
+        } else {
+            if found_at >= 0 {
+                quiet_since_match = quiet_since_match + 50
+                // Once pattern is found, return after 150ms of silence
+                if quiet_since_match >= 150 { return total }
+            }
+        }
+        elapsed = elapsed + 50
+    }
+    return total
+}
+
+fn _contains(s: string, needle: string) -> bool {
+    let nh = len(s)
+    let nn = len(needle)
+    if nn > nh { return false }
+    let mut i = 0
+    while i + nn <= nh {
+        if s.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+fn run_test() -> int {
+    println("=== hexa→hexa PTY e2e test ===")
+
+    // Verify the demo binary exists. If not, skip.
+    let exists = exec("test -x /tmp/tui_eb_demo && printf yes || printf no").trim()
+    if exists != "yes" {
+        println("  SKIP  /tmp/tui_eb_demo missing — build first:")
+        println("        ./hexa build tool/tui_demo_editor_bridge.hexa -o /tmp/tui_eb_demo")
+        return 2
+    }
+
+    let r = term_pty_spawn_sh("/tmp/tui_eb_demo", 24, 80)
+    let mfd = r[0]
+    let pid = r[1]
+    _expect("PTY spawn", mfd >= 0 && pid > 0,
+            "mfd=" + to_string(mfd) + " pid=" + to_string(pid))
+    if mfd < 0 { return 1 }
+
+    // Wait for child's startup banner ("mode":"raw") before sending
+    // requests — without this, the first request reaches the slave PTY
+    // before tcsetattr completes, and the kernel echoes it back.
+    let banner = _read_until(mfd, "$startup", 2000)
+    _expect("startup banner received", _contains(banner, "$startup"),
+            "no banner in: " + banner.substring(0, 80))
+    _expect("child entered raw mode", _contains(banner, "\"mode\":\"raw\""),
+            "no raw mode in: " + banner.substring(0, 200))
+
+    // Test 1: send render request, expect a JSON-RPC response with
+    // "result" and "rows":24
+    let req1 = "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"render\"}\n"
+    let _w1 = term_fd_write(mfd, req1)
+    let resp1 = _read_until(mfd, "\"id\":1", 1000)
+    _expect("render response received", _contains(resp1, "\"result\""),
+            "no result key in: " + resp1.substring(0, 80))
+    _expect("render response has rows:24",
+            _contains(resp1, "\"rows\":24"),
+            "missing rows:24")
+    _expect("render response has cols:80",
+            _contains(resp1, "\"cols\":80"),
+            "missing cols:80")
+    _expect("render response has lines array",
+            _contains(resp1, "\"lines\":["),
+            "missing lines array")
+
+    // Test 2: send key request with bytes, expect "injected" in result
+    let req2 = "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"key\",\"params\":[97,98,99]}\n"
+    let _w2 = term_fd_write(mfd, req2)
+    let resp2 = _read_until(mfd, "\"id\":2", 1000)
+    _expect("key response received", _contains(resp2, "\"result\""),
+            resp2.substring(0, 80))
+    _expect("key inject count = 3",
+            _contains(resp2, "\"injected\":3"),
+            "missing injected:3")
+
+    // Test 3: render again, expect events array with 3 key events
+    let req3 = "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"render\"}\n"
+    let _w3 = term_fd_write(mfd, req3)
+    let resp3 = _read_until(mfd, "\"id\":3", 1000)
+    _expect("post-key render decodes 3 events",
+            _contains(resp3, "[\"key\",97,0,0,0,\"a\"]"),
+            "missing key event for 'a'")
+    _expect("event 'b' decoded",
+            _contains(resp3, "[\"key\",98,0,0,0,\"b\"]"),
+            "missing key event for 'b'")
+    _expect("event 'c' decoded",
+            _contains(resp3, "[\"key\",99,0,0,0,\"c\"]"),
+            "missing key event for 'c'")
+
+    // Test 4: unknown method → -32601 error
+    let req4 = "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"nonexistent\"}\n"
+    let _w4 = term_fd_write(mfd, req4)
+    let resp4 = _read_until(mfd, "\"id\":4", 1000)
+    _expect("method-not-found returns -32601",
+            _contains(resp4, "\"code\":-32601"),
+            "missing -32601 error code")
+
+    // Test 5: quit + reap
+    let req5 = "{\"jsonrpc\":\"2.0\",\"id\":5,\"method\":\"quit\"}\n"
+    let _w5 = term_fd_write(mfd, req5)
+    let resp5 = _read_until(mfd, "\"id\":5", 1000)
+    _expect("quit ack received",
+            _contains(resp5, "\"ok\":true"),
+            "missing quit ack")
+
+    // Reap with 1s deadline
+    let mut waited = 0
+    let mut reap_done = 0
+    while waited < 30 && reap_done == 0 {
+        let reap = term_pty_reap(pid)
+        if reap[0] == 1 { reap_done = 1; break }
+        sleep_s(0.05)
+        waited = waited + 1
+    }
+    _expect("child reaped cleanly", reap_done == 1, "child still running after 1.5s")
+
+    let _ = term_fd_close(mfd)
+
+    println("")
+    println("=== Aggregate ===")
+    println("PASS: " + to_string(_passed))
+    println("FAIL: " + to_string(_failed))
+    if _failed == 0 {
+        println("=== hexa→hexa PTY e2e test: ALL PASS ===")
+        return 0
+    } else {
+        println("=== hexa→hexa PTY e2e test: " + to_string(_failed) + " FAIL ===")
+        return 1
+    }
+}
+
+let _entry_rc = run_test()
+exit(_entry_rc)
