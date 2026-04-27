@@ -1,0 +1,382 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a13-constant-column", desc="HXC algorithm A13: constant-column elimination. Detects columns where ALL rows share identical value (any type: int/string/bool). Emits constant in schema header, removes column from per-row data + corresponding pipe separator. Pure-hexa, raw 9. Targets aot_cache_gc.jsonl int-constant cols (days_threshold=30, evicted_count=0, freed_kb=0) that A8 missed (A8 string-categorical only).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a13_constant_column.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a13_constant_column.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a13_constant_column.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// Algorithm spec:
+//   PASS 1 (detect):
+//     For each column c, check if val[0] == val[r] for all r in 1..N. If yes, c is constant.
+//     Bound: row_count >= MIN_ROWS for header overhead amortization.
+//
+//   PASS 2 (encode):
+//     Emit `# const:s<schema> <col_id>=<value>` per constant col.
+//     Per row: remove constant cols + corresponding pipe separator.
+//
+//   PASS 3 (decode):
+//     Parse `# const:` headers into per-schema const map.
+//     Per row: insert constant values at correct col positions.
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) == x for any A13 stream
+//   - decode(encode(y)) == y for any HXC v1 stream
+//
+// Falsifiers (raw 71 contract):
+//   F-A13-1: saving < 0.02 byte-eq on synthetic constant-col fixture → reject.
+//   F-A13-2: encode/decode round-trip not byte-eq → reject.
+
+// @attr(complexity="O(N*C) detect + O(N) encode", memory="O(C)")
+
+const A13_MIN_ROWS = 4
+
+fn _split_top_level_pipes(s: string) -> array {
+    let mut segs = []
+    let mut depth_brace = 0
+    let mut depth_bracket = 0
+    let mut in_str = false
+    let mut esc = false
+    let mut start = 0
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if esc { esc = false; i = i + 1; continue }
+        if in_str {
+            if c == "\\" { esc = true }
+            else if c == "\"" { in_str = false }
+        } else {
+            if c == "\"" { in_str = true }
+            else if c == "{" { depth_brace = depth_brace + 1 }
+            else if c == "}" { depth_brace = depth_brace - 1 }
+            else if c == "[" { depth_bracket = depth_bracket + 1 }
+            else if c == "]" { depth_bracket = depth_bracket - 1 }
+            else if c == "|" && depth_brace == 0 && depth_bracket == 0 {
+                segs.push(s.substring(start, i))
+                start = i + 1
+            }
+        }
+        i = i + 1
+    }
+    if start <= len(s) { segs.push(s.substring(start, len(s))) }
+    return segs
+}
+
+// Returns array of [col_id, constant_value] for constant columns in this row-batch.
+fn _detect_constant_columns(rows: array) -> array {
+    let mut out = []
+    if len(rows) < A13_MIN_ROWS { return out }
+    let first_cols = _split_top_level_pipes(rows[0])
+    let n_cols = len(first_cols)
+    let mut col_id = 0
+    while col_id < n_cols {
+        let ref_val = first_cols[col_id]
+        let mut all_same = true
+        let mut r = 1
+        while r < len(rows) {
+            let parts = _split_top_level_pipes(rows[r])
+            if col_id >= len(parts) || parts[col_id] != ref_val {
+                all_same = false
+                break
+            }
+            r = r + 1
+        }
+        if all_same {
+            out.push([to_string(col_id), ref_val])
+        }
+        col_id = col_id + 1
+    }
+    return out
+}
+
+fn _encode_row_strip_constants(row_body: string, const_col_ids: array) -> string {
+    let parts = _split_top_level_pipes(row_body)
+    let mut new_parts = []
+    let mut p = 0
+    while p < len(parts) {
+        let mut is_const = false
+        let mut k = 0
+        while k < len(const_col_ids) {
+            if parse_int(const_col_ids[k]) == p { is_const = true; break }
+            k = k + 1
+        }
+        if !is_const {
+            new_parts.push(parts[p])
+        }
+        p = p + 1
+    }
+    return new_parts.join("|")
+}
+
+fn _decode_row_insert_constants(row_body: string, const_pairs: array) -> string {
+    // const_pairs: array of [col_id, value], must be sorted by col_id ascending
+    let parts = _split_top_level_pipes(row_body)
+    let mut new_parts = []
+    // Reconstruct: walk col_id from 0 to max, inserting constant where applicable, else next part
+    let mut p_idx = 0
+    let mut col_id = 0
+    let total_cols = len(parts) + len(const_pairs)
+    while col_id < total_cols {
+        let mut is_const = false
+        let mut k = 0
+        while k < len(const_pairs) {
+            if parse_int(const_pairs[k][0]) == col_id {
+                new_parts.push(const_pairs[k][1])
+                is_const = true
+                break
+            }
+            k = k + 1
+        }
+        if !is_const {
+            if p_idx < len(parts) {
+                new_parts.push(parts[p_idx])
+                p_idx = p_idx + 1
+            }
+        }
+        col_id = col_id + 1
+    }
+    return new_parts.join("|")
+}
+
+fn a13_encode(v1_text: string) -> string {
+    let lines = v1_text.split("\n")
+    let mut schema_rows = []
+    let mut header_lines = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            header_lines.push(l)
+            schema_rows.push([])
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            if len(schema_rows) > 0 {
+                let last_idx = len(schema_rows) - 1
+                let body_start = l.find(" ")
+                let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+                schema_rows[last_idx].push(body)
+            } else {
+                header_lines.push(l)
+            }
+        } else if len(l) > 0 {
+            header_lines.push(l)
+        }
+        i = i + 1
+    }
+
+    let mut out = []
+    let mut h = 0
+    while h < len(header_lines) {
+        out.push(header_lines[h])
+        h = h + 1
+    }
+
+    let mut s = 0
+    while s < len(schema_rows) {
+        let rows = schema_rows[s]
+        let detected = _detect_constant_columns(rows)
+        // Emit const declarations
+        let mut d = 0
+        let mut const_col_ids = []
+        while d < len(detected) {
+            let col_id = detected[d][0]
+            let val = detected[d][1]
+            out.push("# const:s" + to_string(s + 1) + " " + col_id + "=" + val)
+            const_col_ids.push(col_id)
+            d = d + 1
+        }
+        // Re-emit rows with constants stripped
+        let mut r = 0
+        while r < len(rows) {
+            let stripped = _encode_row_strip_constants(rows[r], const_col_ids)
+            out.push("@s" + to_string(s + 1) + " " + stripped)
+            r = r + 1
+        }
+        s = s + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn a13_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    let mut schema_consts = []  // per-schema array of [col_id, val] sorted
+    let mut current_schema = -1
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            schema_consts.push([])
+            current_schema = len(schema_consts) - 1
+            out.push(l)
+        } else if len(l) >= 9 && l.substring(0, 9) == "# const:s" {
+            // Parse `# const:s<N> <col_id>=<value>`
+            let after = l.substring(9, len(l)).trim()
+            let sp = after.find(" ")
+            if sp > 0 {
+                let s_num = parse_int(after.substring(0, sp)) - 1
+                let rest = after.substring(sp + 1, len(after))
+                let eq = rest.find("=")
+                if eq > 0 {
+                    let col_id = rest.substring(0, eq)
+                    let val = rest.substring(eq + 1, len(rest))
+                    if s_num >= 0 && s_num < len(schema_consts) {
+                        schema_consts[s_num].push([col_id, val])
+                    }
+                }
+            }
+            // Skip dict header (consumed by decoder)
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let s_num = if len(head) > 2 { parse_int(head.substring(2, len(head))) - 1 } else { 0 }
+            if s_num < 0 || s_num >= len(schema_consts) {
+                out.push(l)
+                i = i + 1
+                continue
+            }
+            let consts = schema_consts[s_num]
+            if len(consts) == 0 {
+                out.push(l)
+            } else {
+                out.push(head + " " + _decode_row_insert_constants(body, consts))
+            }
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn _selftest() -> int {
+    println("# hxc_a13_constant_column selftest")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture 1: 8 rows, col 1 constant = "30", col 3 constant = "0"
+    let mut rows = []
+    let mut i = 0
+    while i < 8 {
+        rows.push("@s1 \"row" + to_string(i) + "\"|30|" + to_string(i * 2) + "|0")
+        i = i + 1
+    }
+    let fixture = "# schema:s1 a b c d\n" + rows.join("\n") + "\n"
+    let encoded = a13_encode(fixture)
+    let decoded = a13_decode(encoded)
+
+    // Test 1: dict header for cols 1 + 3 emitted
+    let lines = encoded.split("\n")
+    let mut const_count = 0
+    let mut k = 0
+    while k < len(lines) {
+        if len(lines[k]) >= 9 && lines[k].substring(0, 9) == "# const:s" { const_count = const_count + 1 }
+        k = k + 1
+    }
+    if const_count == 2 { pass = pass + 1; println("  PASS: 2 const headers emitted") } else { fail = fail + 1; println("  FAIL: const headers " + to_string(const_count)) }
+
+    // Test 2: encoded smaller than original
+    let nb = len(fixture)
+    let hb = len(encoded)
+    if hb < nb { pass = pass + 1; println("  PASS: bytes saved " + to_string(nb) + " -> " + to_string(hb)) } else { fail = fail + 1; println("  FAIL: no saving " + to_string(nb) + " -> " + to_string(hb)) }
+
+    // Test 3: round-trip byte-eq
+    if decoded == fixture {
+        pass = pass + 1
+        println("  PASS: round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: round-trip lost bytes orig=" + to_string(len(fixture)) + " got=" + to_string(len(decoded)))
+    }
+
+    // Test 4: small fixture (<MIN_ROWS) skipped
+    let small = "# schema:s1 a b\n@s1 1|2\n"
+    let small_enc = a13_encode(small)
+    let small_lines = small_enc.split("\n")
+    let mut sc = 0
+    let mut sk = 0
+    while sk < len(small_lines) {
+        if len(small_lines[sk]) >= 9 && small_lines[sk].substring(0, 9) == "# const:s" { sc = sc + 1 }
+        sk = sk + 1
+    }
+    if sc == 0 { pass = pass + 1; println("  PASS: small fixture skipped (MIN_ROWS=4)") } else { fail = fail + 1; println("  FAIL: small fixture wrongly emitted const") }
+
+    // Test 5: no constants (all unique) → no header, body unchanged
+    let mut uniq_rows = []
+    let mut u = 0
+    while u < 6 {
+        uniq_rows.push("@s1 " + to_string(u) + "|" + to_string(u + 100) + "|" + to_string(u * 7))
+        u = u + 1
+    }
+    let uniq_fix = "# schema:s1 a b c\n" + uniq_rows.join("\n") + "\n"
+    let uniq_enc = a13_encode(uniq_fix)
+    let uniq_dec = a13_decode(uniq_enc)
+    if uniq_dec == uniq_fix {
+        pass = pass + 1
+        println("  PASS: all-unique fixture passthrough byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: all-unique passthrough broken")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A13_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _read_file(p: string) -> string { return exec("cat " + _shell_escape(p)) }
+fn _write_file(p: string, c: string) -> int {
+    let cmd = "mkdir -p $(dirname " + _shell_escape(p) + ") && cat > " + _shell_escape(p) + " <<'__A13_EOF__'\n" + c + "__A13_EOF__\n"
+    let _r = exec(cmd)
+    return 0
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a13_constant_column.hexa <encode|decode> <in> <out>")
+            exit(3)
+        }
+        let in_path = av[sub_idx + 1]
+        let out_path = av[sub_idx + 2]
+        let txt = _read_file(in_path)
+        let res = if has_encode { a13_encode(txt) } else { a13_decode(txt) }
+        let _w = _write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a13_constant_column.hexa [--selftest | encode <in> <out> | decode <in> <out>]")
+    exit(3)
+}
