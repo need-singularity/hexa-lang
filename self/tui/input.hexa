@@ -61,6 +61,11 @@ use "self/stdlib/law_io"
 let mut _input_initialized = 0
 let mut _paste_active = 0
 let mut _paste_buf = ""
+// Bytes injected from outside the L1 stdin pipeline (e.g. T1.C Surface 4
+// JSON-RPC `key` method) — drained before falling through to
+// term_read_byte. Used by editor bridges that drive the hexa TUI as a
+// passive renderer + send keystrokes via JSON-RPC params.
+let mut _pending_bytes = []
 
 // Init: enter raw mode, install signal handlers. Idempotent — second
 // call is no-op (returns 0 on success, -1 if L1 raw_enter fails).
@@ -87,6 +92,61 @@ pub fn input_init_no_raw() -> int {
     return 0
 }
 
+// Inject raw bytes into the L2 input pipeline. Called by T1.C Surface 4
+// JSON-RPC `key` method (self/tui/wire/editor_bridge.hexa) and similar
+// adapters that drive the hexa TUI as a child process and forward
+// keystrokes via structured RPC instead of real stdin bytes.
+//
+// `bytes` is an array of int (each 0..255). Appended to a FIFO queue
+// drained before the L1 term_read_byte fallback.
+//
+// Implementation note: rebuild-and-reassign pattern instead of in-place
+// .push() — top-level mut array .push() inside a fn was triggering a
+// crash in this hexa toolchain version (likely closure-capture related).
+// The rebuild form is O(N+M) per call but N is typically <50 bytes.
+pub fn input_inject_bytes(bytes: array) -> int {
+    let mut new_buf = []
+    let mut i = 0
+    while i < len(_pending_bytes) {
+        new_buf.push(_pending_bytes[i])
+        i = i + 1
+    }
+    let mut j = 0
+    while j < len(bytes) {
+        new_buf.push(bytes[j])
+        j = j + 1
+    }
+    _pending_bytes = new_buf
+    return len(bytes)
+}
+
+pub fn input_pending_count() -> int { return len(_pending_bytes) }
+
+// Internal byte reader: drain injected queue first, then fall through
+// to L1 term_read_byte. Returns -1 on read error / EOF.
+fn _read_byte() -> int {
+    if len(_pending_bytes) > 0 {
+        let b = _pending_bytes[0]
+        // shift left by 1 (slow O(n) but queue is typically <100 bytes)
+        let mut new_buf = []
+        let mut i = 1
+        while i < len(_pending_bytes) {
+            new_buf.push(_pending_bytes[i])
+            i = i + 1
+        }
+        _pending_bytes = new_buf
+        return b
+    }
+    return term_read_byte()
+}
+
+// Internal poll wrapper: queue takes priority. Returns 1 if injected
+// bytes are pending, else delegates to L1 term_poll_stdin.
+fn _poll_stdin(ms: int) -> int {
+    if len(_pending_bytes) > 0 { return 1 }
+    return term_poll_stdin(ms)
+}
+
 // Restore: leave raw mode. Idempotent.
 pub fn input_close() -> int {
     if _input_initialized == 0 { return 0 }
@@ -110,7 +170,7 @@ pub fn input_drain_one(ms_timeout: int) -> array {
         let c = term_winsize_cols()
         return ["winsize", r, c]
     }
-    let p = term_poll_stdin(ms_timeout)
+    let p = _poll_stdin(ms_timeout)
     if p == 0 { return ["none"] }
     if p < 0 {
         // EINTR or fatal poll error — re-check signals once.
@@ -132,7 +192,7 @@ pub fn input_drain_one(ms_timeout: int) -> array {
 //   0x80+       → utf-8 multibyte continuation
 //   else        → ASCII printable
 fn _decode_one() -> array {
-    let b = term_read_byte()
+    let b = _read_byte()
     if b < 0 { return ["err", "read-failed"] }
 
     // Bracketed paste continuation
@@ -144,12 +204,12 @@ fn _decode_one() -> array {
         // ESC — could be CSI / SS3 / esc-bare. Race condition: if next
         // byte arrives within ~50ms, treat as escape sequence; otherwise
         // bare ESC. We use a 50ms poll for the discriminator.
-        let p = term_poll_stdin(50)
+        let p = _poll_stdin(50)
         if p <= 0 {
             // No follow-up byte → bare ESC
             return ["key", -4, 0, 0, 0, ""]
         }
-        let b2 = term_read_byte()
+        let b2 = _read_byte()
         if b2 < 0 { return ["err", "read-failed-after-esc"] }
         if b2 == 91 {
             // ESC [ — CSI sequence
@@ -191,7 +251,7 @@ fn _decode_one() -> array {
         let mut acc = _byte_to_str(b)
         let mut i = 0
         while i < cont {
-            let nb = term_read_byte()
+            let nb = _read_byte()
             if nb < 0 { return ["err", "utf8-truncated"] }
             if (nb & 192) != 128 { return ["err", "utf8-bad-continuation"] }
             codepoint = (codepoint * 64) | (nb & 63)
@@ -218,13 +278,13 @@ fn _decode_one() -> array {
 //     M/m        → mouse (mode 1006 SGR: ESC [ < b ; x ; y M|m)
 fn _decode_csi() -> array {
     // Special-case the SGR mouse leading '<' before normal param parsing.
-    let p = term_poll_stdin(20)
+    let p = _poll_stdin(20)
     if p < 0 { return ["err", "csi-poll-failed"] }
     if p == 0 {
         // Lone ESC [ — treat as bare ESC for now (rare standalone case).
         return ["key", -4, 0, 0, 0, ""]
     }
-    let peek = term_read_byte()
+    let peek = _read_byte()
     if peek < 0 { return ["err", "csi-read-failed"] }
 
     if peek == 60 {
@@ -253,9 +313,9 @@ fn _decode_csi() -> array {
     // CAN/SUB/digits/';'). Limit iterations to avoid runaway.
     let mut i = 0
     while i < 16 {
-        let np = term_poll_stdin(20)
+        let np = _poll_stdin(20)
         if np <= 0 { return ["err", "csi-truncated"] }
-        let nb = term_read_byte()
+        let nb = _read_byte()
         if nb < 0 { return ["err", "csi-read-failed-mid"] }
         if (nb >= 48 && nb <= 57) || nb == 59 {
             params = params + _byte_to_str(nb)
@@ -277,9 +337,9 @@ fn _decode_sgr_mouse() -> array {
     let mut buf = ""
     let mut i = 0
     while i < 32 {
-        let p = term_poll_stdin(20)
+        let p = _poll_stdin(20)
         if p <= 0 { return ["err", "sgr-truncated"] }
-        let b = term_read_byte()
+        let b = _read_byte()
         if b < 0 { return ["err", "sgr-read-failed"] }
         if b == 77 || b == 109 {
             // M or m → final
@@ -347,9 +407,9 @@ fn _csi_final_to_event(params: string, final_byte: int) -> array {
 
 // SS3 (ESC O X) — older F1..F4 + some emacs/screen mappings.
 fn _decode_ss3() -> array {
-    let p = term_poll_stdin(20)
+    let p = _poll_stdin(20)
     if p <= 0 { return ["err", "ss3-truncated"] }
-    let b = term_read_byte()
+    let b = _read_byte()
     if b < 0 { return ["err", "ss3-read-failed"] }
     if b == 80 { return ["key", -30, 0, 0, 0, ""] }   // P → F1
     if b == 81 { return ["key", -31, 0, 0, 0, ""] }   // Q → F2
@@ -372,28 +432,28 @@ fn _decode_in_paste(first_byte: int) -> array {
     while true {
         if b == 27 {
             // Could be the closing ESC [ 201 ~. Buffer it and check.
-            let p = term_poll_stdin(50)
+            let p = _poll_stdin(50)
             if p <= 0 {
                 _paste_buf = _paste_buf + _byte_to_str(b)
                 return ["none"]
             }
-            let b2 = term_read_byte()
+            let b2 = _read_byte()
             if b2 < 0 { return ["err", "paste-read-failed"] }
             if b2 == 91 {
                 // ESC [ — could be the close marker. Read the next 4 bytes
                 // (2,0,1,~) and decide.
-                let p3 = term_poll_stdin(50)
+                let p3 = _poll_stdin(50)
                 if p3 <= 0 {
                     _paste_buf = _paste_buf + _byte_to_str(b) + _byte_to_str(b2)
                     return ["none"]
                 }
-                let b3 = term_read_byte()
+                let b3 = _read_byte()
                 if b3 < 0 { return ["err", "paste-read-failed"] }
                 if b3 == 50 {
                     // Could be 201 — read 0, 1, ~
-                    let b4 = term_read_byte()
-                    let b5 = term_read_byte()
-                    let b6 = term_read_byte()
+                    let b4 = _read_byte()
+                    let b5 = _read_byte()
+                    let b6 = _read_byte()
                     if b4 == 48 && b5 == 49 && b6 == 126 {
                         // Closed paste
                         let payload = _paste_buf
@@ -413,9 +473,9 @@ fn _decode_in_paste(first_byte: int) -> array {
         }
         // Regular paste byte
         _paste_buf = _paste_buf + _byte_to_str(b)
-        let np = term_poll_stdin(0)
+        let np = _poll_stdin(0)
         if np <= 0 { return ["none"] }
-        let nb = term_read_byte()
+        let nb = _read_byte()
         if nb < 0 { return ["err", "paste-read-failed"] }
         b = nb
     }
