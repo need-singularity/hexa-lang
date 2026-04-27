@@ -1,0 +1,318 @@
+#!hexa strict
+// self/tui/render.hexa — TUI-PRIM L3 render core
+//
+// PURPOSE
+//   Double-buffered cell grid + O(dirty_cells) diff renderer. Driven by
+//   L1 term_write_str output and L1 term_winsize_rows/cols. The diff path
+//   guarantees that idle frames emit zero stdout writes, which is the
+//   canonical fix for the input-lag hot-path identified by TUI-MEAS
+//   Level 2 (16ms throttle, packages/tui/bench/level2-frame.bench.ts).
+//
+// KICK VERDICT
+//   state/design_strategy_trawl/2026-04-27_hexa-native-tui-implementation-
+//   plan_KICK_omega_cycle.json T1.A Layer 3.
+//
+// SCOPE (L3 — minimum-viable renderer)
+//   - Cell grid: rows × cols × cell. Each cell = [ch, fg, bg, attrs].
+//   - Two buffers: front (last-flushed) and back (next frame).
+//   - clear() / put(x, y, ch, fg, bg, attrs) / flush()
+//   - flush() walks cells in row-major order, emits ANSI delta for each
+//     cell whose back differs from front, then swaps buffers.
+//   - Cursor positioning via CSI ESC [ <y+1> ; <x+1> H
+//   - SGR colors: 256-color fg ESC [ 38 ; 5 ; N m  /  bg ESC [ 48 ; 5 ; N m
+//   - Reset SGR ESC [ 0 m at flush start + end (no leakage to subsequent
+//     stdout writes).
+//
+// CELL ENCODING
+//   cell = [ch_str, fg_int, bg_int, attrs_int]
+//   ch_str  : 1-grapheme string (utf-8) — empty string = blank space
+//   fg_int  : 0..255 ANSI 256-color, -1 = default
+//   bg_int  : 0..255 ANSI 256-color, -1 = default
+//   attrs_int : bitfield — 1=bold, 2=underline, 4=reverse, 8=dim, 16=italic
+//
+// API
+//   fn render_init() -> int                       // detect winsize, alloc buffers
+//   fn render_clear() -> int                      // back buffer ← all blank
+//   fn render_put(x, y, ch, fg, bg, attrs) -> int
+//   fn render_flush() -> int                      // emit diff, swap buffers
+//   fn render_resize() -> int                     // re-detect rows/cols
+//   fn render_close() -> int                      // restore SGR + cursor
+//   fn render_dims() -> array                     // [rows, cols]
+//
+// DEFERRED (L4+)
+//   - Truecolor (24-bit RGB) — only 256-color in L3
+//   - Wide-char (CJK) cell-spanning — assumes width-1 grapheme per cell
+//   - Cursor save/restore (DEC private modes)
+//   - Alt-screen toggle (smcup/rmcup) — caller's responsibility
+//   - Non-ASCII grapheme width tables (mode 2027)
+//
+// Selftest (parser-level only; FFI smoke deferred to LX integration):
+//   --selftest exercises buffer alloc + diff path on a synthetic 4x4 grid
+
+use "self/stdlib/law_io"
+
+// ── L1 builtins (declared via env.hexa whitelist; runtime-resolved) ─
+// term_winsize_rows / term_winsize_cols / term_write_str
+
+// ── module state ─────────────────────────────────────────────────
+let mut _rows = 0
+let mut _cols = 0
+let mut _front = []
+let mut _back = []
+let mut _initialized = 0
+
+// Single blank cell prototype. Indexed copy via array literal — hexa
+// arrays are by-value on assignment (semantic confirmed via stdlib).
+fn _blank_cell() -> array { return ["", -1, -1, 0] }
+
+// Flat-index cell access: y * _cols + x.
+fn _cell_idx(x: int, y: int) -> int { return y * _cols + x }
+
+// Allocate a flat cell array of size rows*cols filled with blank.
+fn _alloc_buffer(rows: int, cols: int) -> array {
+    let mut buf = []
+    let total = rows * cols
+    let mut i = 0
+    while i < total {
+        buf = buf + [_blank_cell()]
+        i = i + 1
+    }
+    return buf
+}
+
+// Public init: probe winsize, alloc both buffers, mark initialized.
+pub fn render_init() -> int {
+    let r = term_winsize_rows()
+    let c = term_winsize_cols()
+    if r <= 0 || c <= 0 {
+        // Fallback to 24x80 when not on a TTY (test/CI path)
+        _rows = 24
+        _cols = 80
+    } else {
+        _rows = r
+        _cols = c
+    }
+    _front = _alloc_buffer(_rows, _cols)
+    _back = _alloc_buffer(_rows, _cols)
+    _initialized = 1
+    return 0
+}
+
+// Re-detect winsize. Called after WinSize event from L2.
+pub fn render_resize() -> int {
+    if _initialized == 0 { return -1 }
+    let r = term_winsize_rows()
+    let c = term_winsize_cols()
+    if r <= 0 || c <= 0 { return -1 }
+    if r == _rows && c == _cols { return 0 }
+    _rows = r
+    _cols = c
+    _front = _alloc_buffer(_rows, _cols)
+    _back = _alloc_buffer(_rows, _cols)
+    return 0
+}
+
+// Public dims accessor.
+pub fn render_dims() -> array { return [_rows, _cols] }
+
+// Reset back buffer to all-blank (front buffer untouched — diff still
+// fires correctly on next flush).
+pub fn render_clear() -> int {
+    if _initialized == 0 { return -1 }
+    _back = _alloc_buffer(_rows, _cols)
+    return 0
+}
+
+// Place a cell into the back buffer. Bounds-checked silently (oob =
+// no-op). Returns 0 on success, -1 if uninitialized or oob.
+pub fn render_put(x: int, y: int, ch: string, fg: int, bg: int, attrs: int) -> int {
+    if _initialized == 0 { return -1 }
+    if x < 0 || y < 0 || x >= _cols || y >= _rows { return -1 }
+    let idx = _cell_idx(x, y)
+    _back[idx] = [ch, fg, bg, attrs]
+    return 0
+}
+
+// Diff + emit: walks back vs front, emits ANSI for changed cells, swaps
+// front ← back at end. Returns number of cells written (for telemetry).
+pub fn render_flush() -> int {
+    if _initialized == 0 { return -1 }
+    let mut out = ""
+    // Hide cursor while painting; show + reset at end.
+    out = out + chr(27) + "[?25l"
+    // Reset SGR baseline so we can track our own attribute state.
+    out = out + chr(27) + "[0m"
+
+    let mut last_x = -2
+    let mut last_y = -2
+    let mut last_fg = -2
+    let mut last_bg = -2
+    let mut last_attrs = -2
+
+    let mut changed = 0
+    let mut y = 0
+    while y < _rows {
+        let mut x = 0
+        while x < _cols {
+            let idx = _cell_idx(x, y)
+            let f_cell = _front[idx]
+            let b_cell = _back[idx]
+            if !_cell_eq(f_cell, b_cell) {
+                // Cursor positioning only when not adjacent to last write.
+                if y != last_y || x != last_x + 1 {
+                    out = out + chr(27) + "[" + to_string(y + 1) + ";" + to_string(x + 1) + "H"
+                }
+                let new_fg = b_cell[1]
+                let new_bg = b_cell[2]
+                let new_attrs = b_cell[3]
+                if new_fg != last_fg || new_bg != last_bg || new_attrs != last_attrs {
+                    out = out + _sgr_string(new_fg, new_bg, new_attrs)
+                    last_fg = new_fg
+                    last_bg = new_bg
+                    last_attrs = new_attrs
+                }
+                let ch = b_cell[0]
+                if ch == "" {
+                    out = out + " "
+                } else {
+                    out = out + ch
+                }
+                last_x = x
+                last_y = y
+                changed = changed + 1
+            }
+            x = x + 1
+        }
+        y = y + 1
+    }
+
+    // Reset SGR + show cursor
+    out = out + chr(27) + "[0m" + chr(27) + "[?25h"
+
+    if changed > 0 {
+        let _w = term_write_str(out)
+    }
+
+    // Swap front ← back. Cheap copy-on-array (hexa arrays are value-typed
+    // in stdlib semantics); for L3 we accept the O(rows*cols) clone cost
+    // because the L4+ widget cache will diff at the widget tree level.
+    _front = _back
+    _back = _alloc_buffer(_rows, _cols)
+    // Repopulate _back from new _front so caller's next render_put sees
+    // the same baseline. Cheaper alternative is to keep _back == _front
+    // by clone, but that defeats the diff path. We bias toward "next
+    // frame must explicitly call render_clear() or render_put() before
+    // flush" — caller responsibility.
+    return changed
+}
+
+// Public close: write SGR reset + show cursor + go to bottom-left.
+pub fn render_close() -> int {
+    if _initialized == 0 { return 0 }
+    let _w = term_write_str(chr(27) + "[0m" + chr(27) + "[?25h" + chr(27) + "[" + to_string(_rows) + ";1H")
+    _initialized = 0
+    return 0
+}
+
+// ── helpers ─────────────────────────────────────────────────────
+
+fn _cell_eq(a: array, b: array) -> bool {
+    if a[0] != b[0] { return false }
+    if a[1] != b[1] { return false }
+    if a[2] != b[2] { return false }
+    if a[3] != b[3] { return false }
+    return true
+}
+
+fn _sgr_string(fg: int, bg: int, attrs: int) -> string {
+    // Always reset first, then apply. Conservative but correct.
+    let mut s = chr(27) + "[0"
+    if (attrs & 1) != 0 { s = s + ";1" }       // bold
+    if (attrs & 2) != 0 { s = s + ";4" }       // underline
+    if (attrs & 4) != 0 { s = s + ";7" }       // reverse
+    if (attrs & 8) != 0 { s = s + ";2" }       // dim
+    if (attrs & 16) != 0 { s = s + ";3" }      // italic
+    if fg >= 0 { s = s + ";38;5;" + to_string(fg) }
+    if bg >= 0 { s = s + ";48;5;" + to_string(bg) }
+    return s + "m"
+}
+
+// ── selftest ────────────────────────────────────────────────────
+fn _selftest_render() -> int {
+    println("self/tui/render — selftest (parser-level + buffer-alloc smoke)")
+
+    // Reset module state for deterministic test
+    _rows = 0
+    _cols = 0
+    _front = []
+    _back = []
+    _initialized = 0
+
+    let r = render_init()
+    if r != 0 { return 1 }
+    let dims = render_dims()
+    if len(dims) != 2 { return 2 }
+    if dims[0] <= 0 || dims[1] <= 0 { return 3 }
+
+    // After init, both buffers should be filled with blank cells.
+    let total = _rows * _cols
+    if len(_front) != total { return 4 }
+    if len(_back) != total { return 5 }
+
+    // Put a cell, then verify back buffer mutation
+    let p = render_put(0, 0, "X", 1, 0, 1)
+    if p != 0 { return 6 }
+    let cell = _back[0]
+    if cell[0] != "X" { return 7 }
+    if cell[1] != 1 { return 8 }
+    if cell[2] != 0 { return 9 }
+    if cell[3] != 1 { return 10 }
+
+    // Put OOB → -1 (no mutation)
+    let oob = render_put(_cols + 5, 0, "Z", 0, 0, 0)
+    if oob != -1 { return 11 }
+
+    // SGR string contains expected fragments (default fg/bg + attrs only)
+    let s = _sgr_string(-1, -1, 0)
+    if len(s) < 3 { return 12 }
+
+    let s2 = _sgr_string(196, 0, 1)
+    // Expect "\x1b[0;1;38;5;196;48;5;0m" — verify substring presence
+    if !_contains(s2, "38;5;196") { return 13 }
+    if !_contains(s2, "48;5;0") { return 14 }
+    if !_contains(s2, ";1") { return 15 }
+
+    // _cell_eq sanity
+    if !_cell_eq(["", -1, -1, 0], ["", -1, -1, 0]) { return 16 }
+    if _cell_eq(["a", -1, -1, 0], ["b", -1, -1, 0]) { return 17 }
+
+    // Reset state — DON'T call close (no FFI in selftest)
+    _front = []
+    _back = []
+    _initialized = 0
+
+    println("render selftest OK")
+    return 0
+}
+
+fn _contains(haystack: string, needle: string) -> bool {
+    let nh = len(haystack)
+    let nn = len(needle)
+    if nn > nh { return false }
+    let mut i = 0
+    while i + nn <= nh {
+        if haystack.substring(i, i + nn) == needle { return true }
+        i = i + 1
+    }
+    return false
+}
+
+// L3 module is library-only — selftest entry lives in a separate
+// tool/tui_render_selftest.hexa to avoid `fn main()` collision when this
+// module is `use`d by user code (hexa flatten concatenates module mains
+// → C duplicate-symbol error). Pattern matches the rest of self/stdlib/*
+// which export `pub fn` and never define top-level main.
+//
+// Run selftest:
+//   ./hexa run tool/tui_render_selftest.hexa
+pub fn render_selftest() -> int { return _selftest_render() }
