@@ -1,0 +1,176 @@
+// tool/tui_bench_l3_flush.hexa — TUI-PRIM L3 render_flush() latency bench
+//
+// PURPOSE
+//   Direct apples-to-apples counterpart to packages/tui Level 2 bench
+//   (packages/tui/bench/level2-frame.bench.ts rapid back-to-back case).
+//   Measures the time between "back buffer mutated + render_flush() call"
+//   and "term_write_str returns" for a single-cell change scenario.
+//
+//   Comparable to:
+//     packages/tui rapid p50 = 16.33ms  (Ink / React, MIN_RENDER_INTERVAL_MS=16 throttle)
+//   This bench:
+//     hexa-native L3        = ?         (no throttle, diff path direct)
+//
+// METHOD
+//   1. render_init() — fallback dims 24x80 when not a TTY (subprocess pipe)
+//   2. Warm: 100 iterations of put + flush (JIT-equivalent for V8 — but
+//      AOT-compiled C has no warmup, included for parity)
+//   3. Measure: N iterations
+//        a. mutate cell (x, y, ch) — different glyph each iter to force diff
+//        b. t0 = mono_ns()
+//        c. render_flush()
+//        d. t1 = mono_ns()
+//        e. record (t1 - t0)
+//   4. Compute p50, p95, p99, mean
+//   5. Emit JSONL row to state/perf/<date>_l3_flush.jsonl
+//
+// RUNTIME NOTE
+//   render_flush() writes to stdout via term_write_str. When the binary's
+//   stdout is a pipe (subprocess), the write hits kernel buffer instantly.
+//   When it's a real TTY, the kernel-side cost includes terminal scroll/
+//   refresh which is OS+VTE dependent. We measure the pipe case to
+//   isolate the L3 algorithmic cost (cell diff + ANSI emit). The real
+//   TTY case is bounded by the slower of (this number) and (terminal
+//   redraw rate).
+
+use "self/stdlib/law_io"
+use "self/tui/render"
+
+let mut _samples = []
+let mut _N = 1000
+
+fn _ns_to_ms_str(ns: int) -> string {
+    let ms_int = ns / 1000000
+    let frac_ns = ns - ms_int * 1000000
+    let frac_us = frac_ns / 1000
+    return to_string(ms_int) + "." + _pad3(to_string(frac_us)) + "ms"
+}
+
+fn _pad3(s: string) -> string {
+    let n = len(s)
+    if n >= 3 { return s }
+    if n == 2 { return "0" + s }
+    if n == 1 { return "00" + s }
+    return "000"
+}
+
+// Insertion sort for small N. We have N=1000 max — O(N^2) = 1M ops is
+// fast in AOT-compiled hexa (sub-100ms).
+fn _sort_int_array(arr: array) -> array {
+    let n = len(arr)
+    let mut i = 1
+    while i < n {
+        let key = arr[i]
+        let mut j = i - 1
+        while j >= 0 && arr[j] > key {
+            arr[j + 1] = arr[j]
+            j = j - 1
+        }
+        arr[j + 1] = key
+        i = i + 1
+    }
+    return arr
+}
+
+fn _percentile(sorted: array, pct: int) -> int {
+    let n = len(sorted)
+    if n == 0 { return 0 }
+    let idx = (n * pct) / 100
+    let i = if idx >= n { n - 1 } else { idx }
+    return sorted[i]
+}
+
+fn _mean(arr: array) -> int {
+    let n = len(arr)
+    if n == 0 { return 0 }
+    let mut sum = 0
+    let mut i = 0
+    while i < n {
+        sum = sum + arr[i]
+        i = i + 1
+    }
+    return sum / n
+}
+
+fn _bench_iter(iter: int) -> int {
+    // Different glyph each iter forces diff. Use ASCII cycle 33-126.
+    let cp = 33 + (iter % 94)
+    let _r = render_put(0, 0, chr(cp), -1, -1, 0)
+    let t0 = mono_ns()
+    let _f = render_flush()
+    let t1 = mono_ns()
+    return t1 - t0
+}
+
+fn run_bench() -> int {
+    println("=== TUI-PRIM L3 render_flush() latency bench ===")
+    println("scenario: rapid back-to-back single-cell change")
+    println("comparable: packages/tui Level 2 rapid p50=16.33ms (Ink, 16ms throttle)")
+    println("")
+
+    let r = render_init()
+    if r != 0 {
+        eprintln("render_init failed")
+        return 1
+    }
+    let dims = render_dims()
+    println("dims: " + to_string(dims[0]) + "x" + to_string(dims[1]))
+
+    // Warm: 100 iterations (parity with V8 JIT warm; AOT no-op but
+    // keeps cell-reuse + buffer paths warm in CPU cache).
+    let mut w = 0
+    while w < 100 {
+        let _ = _bench_iter(w)
+        w = w + 1
+    }
+
+    // Measure
+    let mut samples = []
+    let mut i = 0
+    while i < _N {
+        let dt = _bench_iter(i)
+        samples = samples + [dt]
+        i = i + 1
+    }
+
+    // Restore terminal to clean state (no SGR leakage)
+    let _c = render_close()
+
+    let sorted = _sort_int_array(samples)
+    let p50 = _percentile(sorted, 50)
+    let p95 = _percentile(sorted, 95)
+    let p99 = _percentile(sorted, 99)
+    let mu = _mean(samples)
+    let mn = sorted[0]
+    let mx = sorted[len(sorted) - 1]
+
+    // Re-emit to stderr so stdout is the JSONL ledger row only
+    eprintln("")
+    eprintln("samples: " + to_string(_N))
+    eprintln("mean:    " + _ns_to_ms_str(mu))
+    eprintln("min:     " + _ns_to_ms_str(mn))
+    eprintln("p50:     " + _ns_to_ms_str(p50))
+    eprintln("p95:     " + _ns_to_ms_str(p95))
+    eprintln("p99:     " + _ns_to_ms_str(p99))
+    eprintln("max:     " + _ns_to_ms_str(mx))
+    eprintln("")
+    eprintln("vs packages/tui Level 2 rapid p50 = 16.33ms (Ink + React)")
+    let speedup_int = if p50 > 0 { 16330000 / p50 } else { 0 }
+    eprintln("speedup: ~" + to_string(speedup_int) + "x faster on p50")
+
+    // JSONL ledger row
+    let stamp = utc_iso_now()
+    let row = "{\"ts\":\"" + stamp + "\",\"bench\":\"l3_flush_rapid\",\"samples\":" + to_string(_N) +
+              ",\"p50_ns\":" + to_string(p50) +
+              ",\"p95_ns\":" + to_string(p95) +
+              ",\"p99_ns\":" + to_string(p99) +
+              ",\"mean_ns\":" + to_string(mu) +
+              ",\"min_ns\":" + to_string(mn) +
+              ",\"max_ns\":" + to_string(mx) +
+              ",\"baseline\":\"packages/tui rapid p50=16.33ms\",\"baseline_p50_ms\":16.33}"
+    println(row)
+    return 0
+}
+
+let _entry_rc = run_bench()
+exit(_entry_rc)
