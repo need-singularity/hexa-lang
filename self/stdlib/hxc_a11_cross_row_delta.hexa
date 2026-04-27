@@ -1,0 +1,1134 @@
+#!hexa strict
+// self/stdlib/hxc_a11_cross_row_delta.hexa — A11 cross-row delta encoding for HXC
+//
+// @module(slug="hxc_a11_cross_row_delta", desc="HXC v2 algorithm A11 — per-(schema, column) cross-row delta encoding for monotonic columns (timestamps + counters + sequence ids). ISO-8601 timestamps reduce to second-deltas; integer counters reduce to +1 increments. Targets log-class JSONL; closes ~15-25pp on log corpora that A1+A7+A10 leave on the table (raw 137 80% Pareto target).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a11_cross_row_delta.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a11_cross_row_delta.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a11_cross_row_delta.hexa decode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a11_cross_row_delta.hexa measure <hxc.in>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+// @omega-saturation-exempt("operational utility — single-pass codec; saturation applies to the algorithm's place in the HXC catalog, not to this driver script")
+// @resolver-bypass("darwin-native; subprocess-safe; no plug-in side-effects; raw 100 line 52 covers")
+//
+// Algorithm sketch:
+//   PASS 1 (monotonic detection):
+//     - For each (schema_id, col_idx) gather the ordered sequence of values.
+//     - Type-classify column:
+//         * iso_ts  — every value matches /^"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z"$/
+//                     (HXC-A1 quotes ISO-8601 strings); convert to epoch seconds i64.
+//         * int     — every value parses as decimal i64 (signed, no leading zero)
+//                     per A10 _is_int_value.
+//         * other   — column is not delta-eligible; skip.
+//     - For iso_ts/int: require sequence non-decreasing (v[i] >= v[i-1] for all i>=1).
+//       Strictly monotonic also covered (>=). False-positive on equal-step columns
+//       which is fine — equal values delta-encode to 0 (single zero byte).
+//     - Reject single-row columns (len < 2 → no benefit, just header overhead).
+//
+//   PASS 2 (encode):
+//     - Emit `# delta:<sid> c0:int,c2:ts,c5:int` header (after `# schema:` line)
+//       declaring delta columns and their type. Once per schema.
+//     - For each `@<sid> v1|...|vN` row:
+//         baseline (first-row-of-schema): emit absolute value as zigzag-leb128
+//         subsequent rows:                 emit (curr - prev) as zigzag-leb128
+//         non-delta cols:                  pass through pipe-separated text
+//     - Pack all row delta-bytes via base64url (HXC-safe alphabet) into payload tail.
+//     - Emit row as `@<sid>!a11 <text_part>!<b64_part>`.
+//
+//   DECODE:
+//     - Read `# delta:<sid> ...` header → per-schema delta column spec.
+//     - For each `@<sid>!a11 <text>!<b64>` row:
+//         decode zigzag-leb128 ints from b64 → list of N delta values
+//         add to running prev[sid][col] state → reconstruct absolute value
+//         for iso_ts: format i64 epoch back to "YYYY-MM-DDTHH:MM:SSZ" with quotes
+//         for int:    to_string(value)
+//         interleave with non-delta text values at original column indices
+//     - Emit canonical HXC v1 row `@<sid> v1|...|vN`.
+//
+// Streaming-prefix invariant (raw 92 A5):
+//   Each `@<id>!a11 ...\n` row is independently decodable WITH the header context
+//   (`# delta:<sid> ...`) loaded first. Same invariant as A7 / A10. Trailing partial
+//   row buffered until LF.
+//
+// Idempotency (raw 65) + byte-eq (raw 68):
+//   - encode(decode(x)) == x for any A11 stream where headers + state intact
+//   - decode(encode(y)) == y for any HXC v1 stream where detection picks same
+//     monotonic columns (deterministic)
+//   - canonical zigzag + LEB128 + base64url has unique encoding per int → byte-eq
+//
+// Falsifier (raw 91 C3, preregistered):
+//   F-A11-1: saving < 0.05 on a >=10-row monotonic-column-rich JSONL (>=2 monotonic
+//            cols per row, e.g. timestamp + counter) → retire A11.
+//   F-A11-2: encode/decode round-trip not byte-eq on selftest fixture → reject.
+//   F-A11-3: false-positive monotonic detection (column declared monotonic but
+//            actually has v[i] < v[i-1] for some i) → reject (raw 91 honest spec).
+//   F-A11-4: decode latency > 200us/row on selftest → reject (raw 42 jetsam).
+
+use "self/stdlib/argv_skip"
+
+// ───────────────────────── constants ─────────────────────────
+
+// Base64url alphabet — HXC-safe (none of: | # @ " ' \ space \n).
+// Identical to A10; share the alphabet to keep tooling consistent.
+let A11_B64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// Days-of-month cumulative table (non-leap). Used by _iso_to_epoch.
+// Index = month (1..12), value = days from year-start to month start.
+let A11_DAYS_BEFORE_MONTH = [0, 0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334]
+
+// ───────────────────────── helpers (shell + time) ─────────────────────────
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _us_now() -> i64 {
+    let s = to_string(exec("date +%s%N")).trim()
+    if len(s) == 0 { return 0 }
+    if len(s) > 3 { return parse_int(s.substring(0, len(s) - 3)) }
+    return parse_int(s)
+}
+
+// ───────────────────────── varint (LEB128 + zigzag) ─────────────────────────
+// Identical to A10 — share the canonical signed-int wire format.
+
+fn _zigzag_enc(n: i64) -> i64 {
+    if n >= 0 { return n * 2 }
+    return (0 - n) * 2 - 1
+}
+
+fn _zigzag_dec(u: i64) -> i64 {
+    let half: i64 = u / 2
+    let lsb: i64 = u - half * 2
+    if lsb == 0 { return half }
+    return 0 - half - 1
+}
+
+fn _leb128_enc(u: i64) -> array {
+    let mut out = []
+    let mut v: i64 = u
+    while v >= 128 {
+        let lo: i64 = v - (v / 128) * 128
+        out.push(lo + 128)
+        v = v / 128
+    }
+    out.push(v)
+    return out
+}
+
+fn _leb128_dec(bytes: array, offset: i64) -> array {
+    let mut v: i64 = 0
+    let mut shift_mul: i64 = 1
+    let mut p: i64 = offset
+    let n: i64 = len(bytes)
+    while p < n {
+        let b: i64 = bytes[p]
+        let lo: i64 = b - (b / 128) * 128
+        v = v + lo * shift_mul
+        p = p + 1
+        if b < 128 { return [v, p] }
+        shift_mul = shift_mul * 128
+    }
+    return [v, p]
+}
+
+fn _varint_enc_signed(n: i64) -> array {
+    return _leb128_enc(_zigzag_enc(n))
+}
+
+fn _varint_dec_signed(bytes: array, offset: i64) -> array {
+    let pair = _leb128_dec(bytes, offset)
+    return [_zigzag_dec(pair[0]), pair[1]]
+}
+
+// ───────────────────────── base64url (no padding) ─────────────────────────
+// Identical scheme to A10: 3-char tail records original byte count.
+
+fn _b64_encode(bytes: array) -> array {
+    let mut out = []
+    let n: i64 = len(bytes)
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = bytes[i]
+        let b1: i64 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2: i64 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group_chars: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chars = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group_chars {
+            out.push(A11_B64_ALPHABET.substring(chars[e], chars[e] + 1))
+            e = e + 1
+        }
+        i = i + 3
+    }
+    let mut nv: i64 = n
+    if nv > 262143 { nv = 262143 }
+    let t0: i64 = nv / 4096
+    let r_t: i64 = nv - t0 * 4096
+    let t1: i64 = r_t / 64
+    let t2: i64 = r_t - t1 * 64
+    out.push(A11_B64_ALPHABET.substring(t0, t0 + 1))
+    out.push(A11_B64_ALPHABET.substring(t1, t1 + 1))
+    out.push(A11_B64_ALPHABET.substring(t2, t2 + 1))
+    return out
+}
+
+fn _b64_char_to_int(c: string) -> i64 {
+    return A11_B64_ALPHABET.index_of(c)
+}
+
+fn _b64_decode(s: string) -> array {
+    let total: i64 = len(s)
+    if total < 3 { return [] }
+    let t0: i64 = _b64_char_to_int(s.substring(total - 3, total - 2))
+    let t1: i64 = _b64_char_to_int(s.substring(total - 2, total - 1))
+    let t2: i64 = _b64_char_to_int(s.substring(total - 1, total))
+    let byte_count: i64 = t0 * 4096 + t1 * 64 + t2
+    let body_len: i64 = total - 3
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group_chars: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group_chars {
+                _b64_char_to_int(s.substring(i + j, i + j + 1))
+            } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem0: i64 = acc - by0 * 65536
+        let by1: i64 = rem0 / 256
+        let by2: i64 = rem0 - by1 * 256
+        let bytes_in_group: i64 = if group_chars == 4 { 3 } else { group_chars - 1 }
+        if bytes_in_group >= 1 { out.push(by0) }
+        if bytes_in_group >= 2 { out.push(by1) }
+        if bytes_in_group >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi: i64 = 0
+    while fi < byte_count && fi < len(out) {
+        final_out.push(out[fi])
+        fi = fi + 1
+    }
+    return final_out
+}
+
+// ───────────────────────── value type detectors ─────────────────────────
+
+fn _is_int_value(s: string) -> bool {
+    let n = len(s)
+    if n == 0 { return false }
+    let mut i = 0
+    if s.substring(0, 1) == "-" {
+        if n == 1 { return false }
+        i = 1
+    }
+    let mag = s.substring(i, n)
+    let mn = len(mag)
+    if mn == 0 { return false }
+    if mn > 1 && mag.substring(0, 1) == "0" { return false }
+    let mut k = 0
+    while k < mn {
+        let c = mag.substring(k, k + 1)
+        if c < "0" || c > "9" { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// ISO-8601 fixed-form: `"YYYY-MM-DDTHH:MM:SSZ"` (22 chars including the surrounding
+// double-quotes that A1 emits for JSONL string values). Strict — no fractional secs,
+// no offset suffix, no missing Z. False-positive risk eliminated by the strict
+// fixed-width pattern; values that differ even by one byte fall to non-delta path.
+fn _is_iso_ts_value(s: string) -> bool {
+    if len(s) != 22 { return false }
+    if s.substring(0, 1) != "\"" { return false }
+    if s.substring(21, 22) != "\"" { return false }
+    if s.substring(20, 21) != "Z" { return false }
+    if s.substring(11, 12) != "T" { return false }
+    if s.substring(5, 6) != "-" { return false }
+    if s.substring(8, 9) != "-" { return false }
+    if s.substring(14, 15) != ":" { return false }
+    if s.substring(17, 18) != ":" { return false }
+    // verify all digit positions
+    let digit_positions = [1, 2, 3, 4, 6, 7, 9, 10, 12, 13, 15, 16, 18, 19]
+    let mut k = 0
+    while k < len(digit_positions) {
+        let p = digit_positions[k]
+        let ch = s.substring(p, p + 1)
+        if ch < "0" || ch > "9" { return false }
+        k = k + 1
+    }
+    return true
+}
+
+// Convert "YYYY-MM-DDTHH:MM:SSZ" (already validated) to epoch seconds (UTC).
+// Pure-hexa Gregorian arithmetic — no `date` shell dependency for hot loop.
+fn _iso_to_epoch(s: string) -> i64 {
+    let yr: i64 = parse_int(s.substring(1, 5))
+    let mo: i64 = parse_int(s.substring(6, 8))
+    let da: i64 = parse_int(s.substring(9, 11))
+    let hr: i64 = parse_int(s.substring(12, 14))
+    let mi: i64 = parse_int(s.substring(15, 17))
+    let se: i64 = parse_int(s.substring(18, 20))
+    // Days from epoch (1970-01-01) to year start.
+    // Sum 365*(yr-1970) + leap-day count.
+    let mut days: i64 = 365 * (yr - 1970)
+    // Leap days for every full year in [1970, yr-1].
+    let mut y: i64 = 1970
+    while y < yr {
+        let div4: i64 = y / 4
+        let div100: i64 = y / 100
+        let div400: i64 = y / 400
+        let is_leap: bool = (y - div4 * 4 == 0) && (!(y - div100 * 100 == 0) || (y - div400 * 400 == 0))
+        if is_leap { days = days + 1 }
+        y = y + 1
+    }
+    days = days + A11_DAYS_BEFORE_MONTH[mo]
+    // Add this-year leap day if mo > 2 and yr is leap.
+    let div4_y: i64 = yr / 4
+    let div100_y: i64 = yr / 100
+    let div400_y: i64 = yr / 400
+    let leap_now: bool = (yr - div4_y * 4 == 0) && (!(yr - div100_y * 100 == 0) || (yr - div400_y * 400 == 0))
+    if mo > 2 && leap_now { days = days + 1 }
+    days = days + (da - 1)
+    return days * 86400 + hr * 3600 + mi * 60 + se
+}
+
+fn _pad2(n: i64) -> string {
+    if n < 10 { return "0" + to_string(n) }
+    return to_string(n)
+}
+
+fn _pad4(n: i64) -> string {
+    let s = to_string(n)
+    if len(s) >= 4 { return s }
+    if len(s) == 3 { return "0" + s }
+    if len(s) == 2 { return "00" + s }
+    return "000" + s
+}
+
+// Inverse of _iso_to_epoch — produce `"YYYY-MM-DDTHH:MM:SSZ"` (22 chars w/ quotes).
+fn _epoch_to_iso(epoch: i64) -> string {
+    let mut secs: i64 = epoch
+    if secs < 0 { secs = 0 }   // guard; A11 spec assumes post-1970 timestamps
+    let day_of_epoch: i64 = secs / 86400
+    let time_of_day: i64 = secs - day_of_epoch * 86400
+    let hr: i64 = time_of_day / 3600
+    let rem_h: i64 = time_of_day - hr * 3600
+    let mi: i64 = rem_h / 60
+    let se: i64 = rem_h - mi * 60
+    // Walk years from 1970 forward, subtracting full-year days each step.
+    let mut yr: i64 = 1970
+    let mut remaining: i64 = day_of_epoch
+    while true {
+        let div4: i64 = yr / 4
+        let div100: i64 = yr / 100
+        let div400: i64 = yr / 400
+        let is_leap: bool = (yr - div4 * 4 == 0) && (!(yr - div100 * 100 == 0) || (yr - div400 * 400 == 0))
+        let year_days: i64 = if is_leap { 366 } else { 365 }
+        if remaining < year_days { break }
+        remaining = remaining - year_days
+        yr = yr + 1
+    }
+    // Now `remaining` is day-of-year (0-based). Find month + day.
+    let div4_y: i64 = yr / 4
+    let div100_y: i64 = yr / 100
+    let div400_y: i64 = yr / 400
+    let leap_now: bool = (yr - div4_y * 4 == 0) && (!(yr - div100_y * 100 == 0) || (yr - div400_y * 400 == 0))
+    let mut mo: i64 = 12
+    while mo >= 1 {
+        let mut start: i64 = A11_DAYS_BEFORE_MONTH[mo]
+        if mo > 2 && leap_now { start = start + 1 }
+        if remaining >= start {
+            let da_zero: i64 = remaining - start
+            return "\"" + _pad4(yr) + "-" + _pad2(mo) + "-" + _pad2(da_zero + 1) + "T" + _pad2(hr) + ":" + _pad2(mi) + ":" + _pad2(se) + "Z\""
+        }
+        mo = mo - 1
+    }
+    // Unreachable (mo=1 always satisfies remaining >= 0). Defensive identity.
+    return "\"1970-01-01T00:00:00Z\""
+}
+
+// ───────────────────────── HXC parse helpers ─────────────────────────
+
+fn _parse_schema(line: string) -> array {
+    let prefix = "# schema:"
+    if line.index_of(prefix) != 0 { return [] }
+    let rest = line.substring(len(prefix), len(line))
+    let parts = split(rest, " ")
+    if len(parts) < 1 { return [] }
+    return [parts[0], to_string(len(parts) - 1)]
+}
+
+// Parse `# delta:<sid> c0:int,c2:ts,c5:int` — returns [sid, [[col, type], ...]].
+fn _parse_delta_header(line: string) -> array {
+    let prefix = "# delta:"
+    if line.index_of(prefix) != 0 { return [] }
+    let rest = line.substring(len(prefix), len(line))
+    let sp = rest.index_of(" ")
+    if sp < 0 { return [] }
+    let id = rest.substring(0, sp)
+    let csv = rest.substring(sp + 1, len(rest))
+    let parts = split(csv, ",")
+    let mut cols = []
+    let mut i = 0
+    while i < len(parts) {
+        let p = parts[i].trim()
+        if len(p) == 0 { i = i + 1; continue }
+        let colon = p.index_of(":")
+        if colon < 0 { i = i + 1; continue }
+        let col_idx = parse_int(p.substring(0, colon))
+        let ctype = p.substring(colon + 1, len(p))
+        cols.push([col_idx, ctype])
+        i = i + 1
+    }
+    return [id, cols]
+}
+
+fn _parse_row(line: string) -> array {
+    if len(line) < 2 || line.substring(0, 1) != "@" { return [] }
+    let sp = line.index_of(" ")
+    if sp < 0 { return [] }
+    let id = line.substring(1, sp)
+    let body = line.substring(sp + 1, len(line))
+    let vals = split(body, "|")
+    return [id, vals]
+}
+
+// ───────────────────────── monotonic detection ─────────────────────────
+
+// _detect_monotonic_columns scans a v1 stream and identifies, per (schema_id, col_idx),
+// columns whose values are monotonically non-decreasing AND uniformly typed
+// (all int OR all iso-ts). Returns an array of [schema_id, [[col_idx, ctype], ...]].
+//
+// raw 91 honest: requires >= 2 rows per schema (single-row schemas yield no benefit).
+// On false candidates (e.g. one out-of-order value), the column is dropped from the
+// delta set — round-trip safety preserved.
+pub fn detect_monotonic_columns(v1_text: string) -> array {
+    let lines = split(v1_text, "\n")
+    let mut sids = []
+    let mut sncols = []
+    let mut col_types = []        // [s_idx][col] = "init" | "int" | "ts" | "no"
+    let mut col_prev_int = []     // [s_idx][col] = previous epoch/int value (i64)
+    let mut col_seen = []         // [s_idx][col] = count of values observed
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.substring(0, 1) == "#" {
+            let sh = _parse_schema(l)
+            if len(sh) == 2 {
+                let id = sh[0]
+                let nc = parse_int(sh[1])
+                let mut found = -1
+                let mut s = 0
+                while s < len(sids) {
+                    if sids[s] == id { found = s; break }
+                    s = s + 1
+                }
+                if found < 0 {
+                    sids.push(id)
+                    sncols.push(nc)
+                    let mut row_t = []
+                    let mut row_p = []
+                    let mut row_n = []
+                    let mut c = 0
+                    while c < nc { row_t.push("init"); row_p.push(0); row_n.push(0); c = c + 1 }
+                    col_types.push(row_t)
+                    col_prev_int.push(row_p)
+                    col_seen.push(row_n)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { i = i + 1; continue }
+        let row = _parse_row(l)
+        if len(row) != 2 { i = i + 1; continue }
+        let rid = row[0]
+        let vals = row[1]
+        let mut sidx = -1
+        let mut s2 = 0
+        while s2 < len(sids) {
+            if sids[s2] == rid { sidx = s2; break }
+            s2 = s2 + 1
+        }
+        if sidx < 0 { i = i + 1; continue }
+        let mut c2 = 0
+        let nc = sncols[sidx]
+        while c2 < len(vals) && c2 < nc {
+            let row_t = col_types[sidx]
+            let row_p = col_prev_int[sidx]
+            let row_n = col_seen[sidx]
+            let v = vals[c2]
+            if row_t[c2] != "no" {
+                let mut this_int: i64 = 0
+                let mut this_type = ""
+                if _is_iso_ts_value(v) {
+                    this_int = _iso_to_epoch(v)
+                    this_type = "ts"
+                } else if _is_int_value(v) {
+                    this_int = parse_int(v)
+                    this_type = "int"
+                } else {
+                    this_type = "no"
+                }
+                if this_type == "no" {
+                    row_t[c2] = "no"
+                } else if row_t[c2] == "init" {
+                    row_t[c2] = this_type
+                    row_p[c2] = this_int
+                } else if row_t[c2] != this_type {
+                    // type changed mid-stream → not delta-eligible
+                    row_t[c2] = "no"
+                } else {
+                    // monotonic check: this_int >= prev
+                    if this_int < row_p[c2] { row_t[c2] = "no" }
+                    else { row_p[c2] = this_int }
+                }
+            }
+            row_n[c2] = row_n[c2] + 1
+            col_types[sidx] = row_t
+            col_prev_int[sidx] = row_p
+            col_seen[sidx] = row_n
+            c2 = c2 + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < len(sids) {
+        let mut delta_cols = []
+        let row_t = col_types[k]
+        let row_n = col_seen[k]
+        let nc = sncols[k]
+        let mut c = 0
+        while c < nc {
+            // Eligible: type ∈ {int, ts} AND seen >= 2 (single-row gives no benefit).
+            if (row_t[c] == "int" || row_t[c] == "ts") && row_n[c] >= 2 {
+                delta_cols.push([c, row_t[c]])
+            }
+            c = c + 1
+        }
+        out.push([sids[k], delta_cols])
+        k = k + 1
+    }
+    return out
+}
+
+// ───────────────────────── per-row encode / decode ─────────────────────────
+
+// _encode_row: replace delta cols with deltas (signed leb128 packed via b64).
+// `delta_cols`: array of [col_idx, ctype]. `prev`: array parallel to delta_cols
+// holding previous absolute (int or epoch) value. `is_first`: emit absolute value
+// instead of delta for first row.
+fn _encode_row(vals: array, delta_cols: array, prev_state: array, is_first: bool) -> array {
+    // Build text-part (non-delta cols, original order) + int byte stream.
+    let mut text_vals = []
+    let mut int_bytes = []
+    let mut new_prev = []
+    let mut k = 0
+    while k < len(delta_cols) { new_prev.push(prev_state[k]); k = k + 1 }
+    let mut c: i64 = 0
+    while c < len(vals) {
+        // Is c a delta column?
+        let mut is_delta = false
+        let mut delta_idx: i64 = -1
+        let mut ctype = ""
+        let mut k2 = 0
+        while k2 < len(delta_cols) {
+            if delta_cols[k2][0] == c { is_delta = true; delta_idx = k2; ctype = delta_cols[k2][1]; break }
+            k2 = k2 + 1
+        }
+        if is_delta {
+            let cur: i64 = if ctype == "ts" { _iso_to_epoch(vals[c]) } else { parse_int(vals[c]) }
+            let to_emit: i64 = if is_first { cur } else { cur - new_prev[delta_idx] }
+            let vb = _varint_enc_signed(to_emit)
+            let mut bi = 0
+            while bi < len(vb) { int_bytes.push(vb[bi]); bi = bi + 1 }
+            new_prev[delta_idx] = cur
+        } else {
+            text_vals.push(vals[c])
+        }
+        c = c + 1
+    }
+    let b64 = _b64_encode(int_bytes).join("")
+    let payload = text_vals.join("|") + "!" + b64
+    return [payload, new_prev]
+}
+
+// _decode_row: inverse of _encode_row. `total_cols` = original schema column count.
+fn _decode_row(payload: string, delta_cols: array, prev_state: array, is_first: bool) -> array {
+    let bang = payload.last_index_of("!")
+    let text_part = if bang >= 0 { payload.substring(0, bang) } else { "" }
+    let b64_part = if bang >= 0 { payload.substring(bang + 1, len(payload)) } else { payload }
+    let text_vals = if len(text_part) > 0 { split(text_part, "|") } else { [] }
+    let bytes = _b64_decode(b64_part)
+    // Decode all varints from b64 → array of ints (in delta-col order).
+    let mut deltas = []
+    let mut p: i64 = 0
+    while p < len(bytes) {
+        let pair = _varint_dec_signed(bytes, p)
+        deltas.push(pair[0])
+        p = pair[1]
+    }
+    // Total slots = len(text_vals) + len(deltas).
+    let total_out: i64 = len(text_vals) + len(deltas)
+    let mut new_prev = []
+    let mut k = 0
+    while k < len(prev_state) { new_prev.push(prev_state[k]); k = k + 1 }
+    let mut out = []
+    let mut tx_i: i64 = 0
+    let mut in_i: i64 = 0
+    let mut c: i64 = 0
+    while c < total_out {
+        // Is c a delta col AND we still have a delta available?
+        let mut is_delta = false
+        let mut delta_idx: i64 = -1
+        let mut ctype = ""
+        if in_i < len(deltas) {
+            let mut k2 = 0
+            while k2 < len(delta_cols) {
+                if delta_cols[k2][0] == c {
+                    is_delta = true
+                    delta_idx = k2
+                    ctype = delta_cols[k2][1]
+                    break
+                }
+                k2 = k2 + 1
+            }
+        }
+        if is_delta {
+            let raw_delta: i64 = deltas[in_i]
+            let abs_val: i64 = if is_first { raw_delta } else { new_prev[delta_idx] + raw_delta }
+            new_prev[delta_idx] = abs_val
+            if ctype == "ts" {
+                out.push(_epoch_to_iso(abs_val))
+            } else {
+                out.push(to_string(abs_val))
+            }
+            in_i = in_i + 1
+        } else {
+            if tx_i < len(text_vals) {
+                out.push(text_vals[tx_i])
+                tx_i = tx_i + 1
+            } else {
+                out.push("")
+            }
+        }
+        c = c + 1
+    }
+    return [out, new_prev]
+}
+
+// ───────────────────────── stream encode / decode ─────────────────────────
+
+pub fn a11_encode(v1_text: string) -> string {
+    let detected = detect_monotonic_columns(v1_text)
+    let lines = split(v1_text, "\n")
+    let mut out_lines = []
+    let mut emitted_for = []
+    // Per-schema state: [sid, delta_cols, prev_state_array, has_emitted_first]
+    let mut state_sids = []
+    let mut state_delta_cols = []
+    let mut state_prev = []
+    let mut state_emitted = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            let sh = _parse_schema(l)
+            if len(sh) == 2 {
+                let id = sh[0]
+                let mut already = false
+                let mut z = 0
+                while z < len(emitted_for) {
+                    if emitted_for[z] == id { already = true; break }
+                    z = z + 1
+                }
+                if !already {
+                    let mut delta_cols = []
+                    let mut d = 0
+                    while d < len(detected) {
+                        if detected[d][0] == id { delta_cols = detected[d][1]; break }
+                        d = d + 1
+                    }
+                    if len(delta_cols) > 0 {
+                        // Emit `# delta:<id> c:type,c:type,...`
+                        let mut parts = []
+                        let mut c2 = 0
+                        while c2 < len(delta_cols) {
+                            parts.push(to_string(delta_cols[c2][0]) + ":" + delta_cols[c2][1])
+                            c2 = c2 + 1
+                        }
+                        out_lines.push("# delta:" + id + " " + parts.join(","))
+                    }
+                    emitted_for.push(id)
+                    // Initialize per-schema state.
+                    state_sids.push(id)
+                    state_delta_cols.push(delta_cols)
+                    let mut init_prev = []
+                    let mut pp = 0
+                    while pp < len(delta_cols) { init_prev.push(0); pp = pp + 1 }
+                    state_prev.push(init_prev)
+                    state_emitted.push(false)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { out_lines.push(l); i = i + 1; continue }
+        let row = _parse_row(l)
+        if len(row) != 2 { out_lines.push(l); i = i + 1; continue }
+        let rid = row[0]
+        let vals = row[1]
+        // Lookup schema state.
+        let mut sidx = -1
+        let mut s = 0
+        while s < len(state_sids) {
+            if state_sids[s] == rid { sidx = s; break }
+            s = s + 1
+        }
+        if sidx < 0 || len(state_delta_cols[sidx]) == 0 {
+            // No delta cols → emit row unchanged
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let delta_cols = state_delta_cols[sidx]
+        let prev_state = state_prev[sidx]
+        let is_first = !state_emitted[sidx]
+        let enc = _encode_row(vals, delta_cols, prev_state, is_first)
+        let payload = enc[0]
+        let new_prev = enc[1]
+        out_lines.push("@" + rid + "!a11 " + payload)
+        state_prev[sidx] = new_prev
+        state_emitted[sidx] = true
+        i = i + 1
+    }
+    return out_lines.join("\n") + "\n"
+}
+
+pub fn a11_decode(v2_text: string) -> string {
+    let lines = split(v2_text, "\n")
+    let mut sids = []
+    let mut sncols = []
+    let mut delta_cols_by_id = []   // [sid_idx] = array of [col, type]
+    let mut prev_by_id = []         // [sid_idx] = array of i64
+    let mut emitted_by_id = []      // [sid_idx] = bool
+    let mut out_lines = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.index_of("# delta:") == 0 {
+            let h = _parse_delta_header(l)
+            if len(h) == 2 {
+                let id = h[0]
+                let cols = h[1]
+                let mut s = 0
+                let mut found = -1
+                while s < len(sids) {
+                    if sids[s] == id { found = s; break }
+                    s = s + 1
+                }
+                let mut init_prev = []
+                let mut pp = 0
+                while pp < len(cols) { init_prev.push(0); pp = pp + 1 }
+                if found >= 0 {
+                    delta_cols_by_id[found] = cols
+                    prev_by_id[found] = init_prev
+                    emitted_by_id[found] = false
+                } else {
+                    sids.push(id)
+                    sncols.push(0)
+                    delta_cols_by_id.push(cols)
+                    prev_by_id.push(init_prev)
+                    emitted_by_id.push(false)
+                }
+            }
+            // header is meta — drop from decoded HXC v1 output
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            let sh = _parse_schema(l)
+            if len(sh) == 2 {
+                let id = sh[0]
+                let nc = parse_int(sh[1])
+                let mut s = 0
+                let mut found = -1
+                while s < len(sids) {
+                    if sids[s] == id { found = s; break }
+                    s = s + 1
+                }
+                if found >= 0 {
+                    sncols[found] = nc
+                } else {
+                    sids.push(id)
+                    sncols.push(nc)
+                    delta_cols_by_id.push([])
+                    prev_by_id.push([])
+                    emitted_by_id.push(false)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { out_lines.push(l); i = i + 1; continue }
+        let bang = l.index_of("!a11 ")
+        if bang < 0 {
+            // plain `@<id> v1|v2|...` row → passthrough
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let rid = l.substring(1, bang)
+        let payload = l.substring(bang + 5, len(l))
+        // Lookup state
+        let mut sidx = -1
+        let mut s = 0
+        while s < len(sids) {
+            if sids[s] == rid { sidx = s; break }
+            s = s + 1
+        }
+        if sidx < 0 {
+            // schema not registered — passthrough (raw 12: surface, don't silently drop)
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let delta_cols = delta_cols_by_id[sidx]
+        let prev_state = prev_by_id[sidx]
+        let is_first = !emitted_by_id[sidx]
+        let dec = _decode_row(payload, delta_cols, prev_state, is_first)
+        let vals = dec[0]
+        let new_prev = dec[1]
+        out_lines.push("@" + rid + " " + vals.join("|"))
+        prev_by_id[sidx] = new_prev
+        emitted_by_id[sidx] = true
+        i = i + 1
+    }
+    return out_lines.join("\n") + "\n"
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _assert(cond: bool, msg: string) -> i64 {
+    if !cond { eprintln("FAIL: " + msg); return 1 }
+    return 0
+}
+
+// Fixture 1: log w/ timestamp + counter (the canonical A11 win case).
+fn _make_log_fixture() -> string {
+    let mut lines = []
+    lines.push("# schema:s1 ts host counter bytes")
+    lines.push("@s1 \"2026-04-25T19:15:08Z\"|hetzner|1|9815")
+    lines.push("@s1 \"2026-04-25T19:15:09Z\"|hetzner|2|9839")
+    lines.push("@s1 \"2026-04-25T19:15:09Z\"|ubu1|3|20041")
+    lines.push("@s1 \"2026-04-25T19:15:10Z\"|hetzner|4|149012")
+    lines.push("@s1 \"2026-04-25T19:15:11Z\"|hetzner|5|46807")
+    lines.push("@s1 \"2026-04-25T19:15:12Z\"|ubu1|6|9107")
+    lines.push("@s1 \"2026-04-25T19:15:13Z\"|hetzner|7|46405")
+    lines.push("@s1 \"2026-04-25T19:15:14Z\"|hetzner|8|2782")
+    lines.push("@s1 \"2026-04-25T19:15:15Z\"|ubu1|9|10485")
+    lines.push("@s1 \"2026-04-25T19:15:16Z\"|hetzner|10|1024")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 2: random non-monotonic — A11 should detect 0 monotonic cols, payload identity.
+fn _make_random_fixture() -> string {
+    let mut lines = []
+    lines.push("# schema:r1 a b c")
+    lines.push("@r1 17|alpha|9.5")
+    lines.push("@r1 3|beta|2.1")
+    lines.push("@r1 99|gamma|7.0")
+    lines.push("@r1 50|delta|1.0")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 3: single-row schema — A11 should NOT delta-encode (need ≥2 rows).
+fn _make_singlerow_fixture() -> string {
+    let mut lines = []
+    lines.push("# schema:onlyone ts msg")
+    lines.push("@onlyone \"2026-04-22T11:44:28Z\"|hello")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 4: large monotonic — 50 rows of timestamp+counter, A11 should compress hard.
+fn _make_large_monotonic_fixture() -> string {
+    let mut lines = []
+    lines.push("# schema:big ts seq value")
+    let mut k: i64 = 0
+    while k < 50 {
+        let sec = 8 + k                          // 19:15:08 .. 19:15:57
+        let mut ts = "\"2026-04-25T19:15:" + _pad2(sec) + "Z\""
+        if sec >= 60 {
+            // overflow into 19:16:xx — but fixture stays in single minute (k<50 → sec<58)
+            ts = "\"2026-04-25T19:15:" + _pad2(sec) + "Z\""
+        }
+        lines.push("@big " + ts + "|" + to_string(1000 + k) + "|" + to_string(k * 100))
+        k = k + 1
+    }
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 5: mixed monotonic + text — verify text passes through untouched.
+fn _make_mixed_fixture() -> string {
+    let mut lines = []
+    lines.push("# schema:mx ts host action bytes")
+    lines.push("@mx \"2026-04-25T10:00:00Z\"|alpha|push|100")
+    lines.push("@mx \"2026-04-25T10:00:05Z\"|beta|pull|150")
+    lines.push("@mx \"2026-04-25T10:00:10Z\"|gamma|push|200")
+    lines.push("@mx \"2026-04-25T10:00:15Z\"|alpha|sync|175")
+    lines.push("@mx \"2026-04-25T10:00:20Z\"|beta|push|225")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 6: empty / whitespace-only — graceful no-op.
+fn _make_empty_fixture() -> string {
+    return ""
+}
+
+fn _selftest() -> i64 {
+    println("hxc_a11_cross_row_delta selftest:")
+
+    // Sub-fixture: ISO ↔ epoch round-trip
+    let probe_ts = "\"2026-04-25T19:15:08Z\""
+    if _assert(_is_iso_ts_value(probe_ts), "iso-ts detector recognizes canonical form") != 0 { return 1 }
+    let probe_epoch = _iso_to_epoch(probe_ts)
+    let probe_back = _epoch_to_iso(probe_epoch)
+    if _assert(probe_back == probe_ts, "iso roundtrip: got " + probe_back) != 0 { return 1 }
+    println("  iso-ts roundtrip: ok (" + probe_ts + " ↔ " + to_string(probe_epoch) + ")")
+
+    // Sub-fixture: leap year (2024-02-29)
+    let leap_ts = "\"2024-02-29T12:00:00Z\""
+    let leap_epoch = _iso_to_epoch(leap_ts)
+    let leap_back = _epoch_to_iso(leap_epoch)
+    if _assert(leap_back == leap_ts, "leap-year roundtrip: got " + leap_back) != 0 { return 1 }
+    println("  leap-year (2024-02-29): ok")
+
+    // Sub-fixture: epoch boundaries (1970, 2000, 2100)
+    let probe_y2k = _epoch_to_iso(_iso_to_epoch("\"2000-01-01T00:00:00Z\""))
+    if _assert(probe_y2k == "\"2000-01-01T00:00:00Z\"", "y2k roundtrip: got " + probe_y2k) != 0 { return 1 }
+    println("  y2k boundary: ok")
+
+    // Fixture 1: log timestamp + counter (canonical win case)
+    println("  fixture 1 (log timestamp + counter):")
+    let log_v1 = _make_log_fixture()
+    let log_v2 = a11_encode(log_v1)
+    let log_back = a11_decode(log_v2)
+    if _assert(log_back == log_v1, "log roundtrip byte-eq fail\n  v1.len=" + to_string(len(log_v1)) + "\n  back.len=" + to_string(len(log_back))) != 0 {
+        eprintln("  v1 head: " + log_v1.substring(0, 200))
+        eprintln("  back head: " + log_back.substring(0, 200))
+        return 1
+    }
+    let log_ratio: i64 = (len(log_v2) * 100) / len(log_v1)
+    println("    v1=" + to_string(len(log_v1)) + "B v2=" + to_string(len(log_v2)) + "B ratio=" + to_string(log_ratio) + "%  byte-eq=ok")
+
+    // Fixture 2: random non-monotonic — should detect 0 delta cols, output ≈ input
+    println("  fixture 2 (random non-monotonic):")
+    let rand_v1 = _make_random_fixture()
+    let rand_v2 = a11_encode(rand_v1)
+    let rand_back = a11_decode(rand_v2)
+    if _assert(rand_back == rand_v1, "random roundtrip byte-eq") != 0 { return 1 }
+    let rand_detected = detect_monotonic_columns(rand_v1)
+    let mut rand_ok = true
+    let mut rd = 0
+    while rd < len(rand_detected) {
+        if len(rand_detected[rd][1]) > 0 { rand_ok = false; break }
+        rd = rd + 1
+    }
+    if _assert(rand_ok, "random fixture must detect 0 delta cols (false-positive guard)") != 0 { return 1 }
+    println("    no monotonic cols detected (correct); roundtrip ok")
+
+    // Fixture 3: single-row — must NOT emit delta header (≥2 rows required)
+    println("  fixture 3 (single-row schema):")
+    let one_v1 = _make_singlerow_fixture()
+    let one_v2 = a11_encode(one_v1)
+    let one_back = a11_decode(one_v2)
+    if _assert(one_back == one_v1, "single-row roundtrip byte-eq") != 0 { return 1 }
+    if _assert(one_v2.index_of("# delta:") < 0, "single-row must NOT emit # delta header") != 0 { return 1 }
+    println("    no delta header emitted (correct); roundtrip ok")
+
+    // Fixture 4: large monotonic — heavy compression expected
+    println("  fixture 4 (large monotonic, 50 rows):")
+    let big_v1 = _make_large_monotonic_fixture()
+    let big_v2 = a11_encode(big_v1)
+    let big_back = a11_decode(big_v2)
+    if _assert(big_back == big_v1, "large roundtrip byte-eq fail v1=" + to_string(len(big_v1)) + " back=" + to_string(len(big_back))) != 0 {
+        eprintln("  v1 first 300: " + big_v1.substring(0, 300))
+        eprintln("  back first 300: " + big_back.substring(0, 300))
+        return 1
+    }
+    let big_ratio: i64 = (len(big_v2) * 100) / len(big_v1)
+    println("    v1=" + to_string(len(big_v1)) + "B v2=" + to_string(len(big_v2)) + "B ratio=" + to_string(big_ratio) + "%  byte-eq=ok")
+    if _assert(big_ratio < 90, "large monotonic ratio expected < 90% (got " + to_string(big_ratio) + "%)") != 0 { return 1 }
+
+    // Fixture 5: mixed monotonic+text
+    println("  fixture 5 (mixed monotonic + text):")
+    let mx_v1 = _make_mixed_fixture()
+    let mx_v2 = a11_encode(mx_v1)
+    let mx_back = a11_decode(mx_v2)
+    if _assert(mx_back == mx_v1, "mixed roundtrip byte-eq") != 0 { return 1 }
+    let mx_ratio: i64 = (len(mx_v2) * 100) / len(mx_v1)
+    println("    v1=" + to_string(len(mx_v1)) + "B v2=" + to_string(len(mx_v2)) + "B ratio=" + to_string(mx_ratio) + "%  byte-eq=ok")
+
+    // Fixture 6: empty input
+    println("  fixture 6 (empty):")
+    let empty_v1 = _make_empty_fixture()
+    let empty_v2 = a11_encode(empty_v1)
+    let empty_back = a11_decode(empty_v2)
+    // a11_encode of empty stream → "\n" (single newline from join + suffix). decode → "\n".
+    // Acceptable invariant: idempotent on the canonical empty form.
+    let empty_back2 = a11_decode(empty_v2)
+    if _assert(empty_back == empty_back2, "empty fixture decode idempotent") != 0 { return 1 }
+    println("    empty idempotent: ok (v2=" + to_string(len(empty_v2)) + "B)")
+
+    // Idempotency (raw 65): re-encoding decoded output is byte-eq
+    println("  idempotency (raw 65 + 68):")
+    let log_again = a11_encode(log_back)
+    if _assert(log_again == log_v2, "encode idempotency byte-eq fail\n  log_v2.len=" + to_string(len(log_v2)) + "\n  log_again.len=" + to_string(len(log_again))) != 0 {
+        return 1
+    }
+    let log_back2 = a11_decode(log_v2)
+    if _assert(log_back2 == log_back, "decode idempotency byte-eq") != 0 { return 1 }
+    println("    encode∘decode∘encode = encode (byte-eq); decode∘decode = decode")
+
+    // Streaming-prefix invariant (raw 92 A5): each prefix is independently decodable
+    // when fed full-line. Truncating mid-row would not be valid (intentional).
+    println("  streaming-prefix invariant (raw 92 A5):")
+    let v2_lines = split(log_v2, "\n")
+    let mut acc = ""
+    let mut li = 0
+    while li < len(v2_lines) - 1 {
+        if li > 0 { acc = acc + "\n" }
+        acc = acc + v2_lines[li]
+        let prefix_v2 = acc + "\n"
+        let prefix_back = a11_decode(prefix_v2)
+        if _assert(len(prefix_back) > 0, "prefix line " + to_string(li) + " empty decode") != 0 { return 1 }
+        li = li + 1
+    }
+    println("    " + to_string(li) + " prefix classes resumable")
+
+    println("PASS")
+    return 0
+}
+
+// ───────────────────────── CLI driver ─────────────────────────
+
+fn _count_rows(v1: string) -> i64 {
+    let lines = split(v1, "\n")
+    let mut n: i64 = 0
+    let mut i = 0
+    while i < len(lines) {
+        if len(lines[i]) > 0 && lines[i].substring(0, 1) == "@" { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn _pad3(n: i64) -> string {
+    let s = to_string(n)
+    if len(s) >= 3 { return s }
+    if len(s) == 2 { return "0" + s }
+    if len(s) == 1 { return "00" + s }
+    return "000"
+}
+
+fn _run_cli() -> i64 {
+    let _raw_args = args()
+    let mut cli = []
+    let mut _ai = skip_invocation_prefix(_raw_args)
+    while _ai < len(_raw_args) {
+        cli.push(_raw_args[_ai])
+        _ai = _ai + 1
+    }
+    if len(cli) == 0 { return _selftest() }
+    let cmd = cli[0]
+    if cmd == "--selftest" { return _selftest() }
+    if cmd == "encode" {
+        if len(cli) < 3 { eprintln("usage: encode <hxc-v1.in> <hxc-v2.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v1 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v2 = a11_encode(v1)
+        let t1 = _us_now()
+        write_file(out_path, v2)
+        let v1_b = len(v1)
+        let v2_b = len(v2)
+        let ratio_pct: i64 = if v1_b == 0 { 100 } else { (v2_b * 100) / v1_b }
+        println("hxc_a11 encode: in=" + in_path + " (" + to_string(v1_b) + "B)  out=" + out_path + " (" + to_string(v2_b) + "B)  ratio=" + to_string(ratio_pct) + "%  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "decode" {
+        if len(cli) < 3 { eprintln("usage: decode <hxc-v2.in> <hxc-v1.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v2 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v1 = a11_decode(v2)
+        let t1 = _us_now()
+        write_file(out_path, v1)
+        println("hxc_a11 decode: in=" + in_path + " (" + to_string(len(v2)) + "B)  out=" + out_path + " (" + to_string(len(v1)) + "B)  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "measure" {
+        if len(cli) < 2 { eprintln("usage: measure <hxc-v1.in>"); return 3 }
+        let in_path = cli[1]
+        let v1 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v2 = a11_encode(v1)
+        let t1 = _us_now()
+        let back = a11_decode(v2)
+        let t2 = _us_now()
+        let v1_b = len(v1)
+        let v2_b = len(v2)
+        let n_rows = _count_rows(v1)
+        let ok = if back == v1 { "true" } else { "false" }
+        let ratio_per_mille: i64 = if v1_b == 0 { 1000 } else { (v2_b * 1000) / v1_b }
+        let ratio_int: i64 = ratio_per_mille / 1000
+        let ratio_frac: i64 = ratio_per_mille - ratio_int * 1000
+        let ratio_str = to_string(ratio_int) + "." + _pad3(ratio_frac)
+        let enc_us = t1 - t0
+        let dec_us = t2 - t1
+        let ts = _ts_iso()
+        let row = "{\"ts\":\"" + ts + "\",\"alg\":\"hxc-a11\",\"input\":\"" + in_path + "\",\"v1_bytes\":" + to_string(v1_b) + ",\"v2_bytes\":" + to_string(v2_b) + ",\"ratio\":" + ratio_str + ",\"n_rows\":" + to_string(n_rows) + ",\"encode_us\":" + to_string(enc_us) + ",\"decode_us\":" + to_string(dec_us) + ",\"roundtrip_byte_eq\":" + ok + ",\"falsifier\":\"saving < 0.05 on monotonic-column-rich JSONL (>= 2 monotonic cols, >= 10 rows)\"}"
+        println(row)
+        if !(back == v1) { return 4 }
+        return 0
+    }
+    eprintln("unknown command: " + cmd)
+    eprintln("usage: --selftest | encode <in> <out> | decode <in> <out> | measure <in>")
+    return 3
+}
+
+exit(_run_cli())

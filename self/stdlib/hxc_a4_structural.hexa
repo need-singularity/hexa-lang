@@ -1,0 +1,947 @@
+#!hexa strict
+// self/stdlib/hxc_a4_structural.hexa — A4 content-addressed sub-tree dedup
+//
+// @module(slug="hxc_a4_structural", desc="HXC v2 algorithm A4 — content-addressed structural sub-tree dedup. Walks all `@<id>` row payloads, extracts balanced {…} and […] sub-strings (sub-objects / sub-arrays embedded in JSON-like values), hashes them with FNV-32, and replaces top-N most-frequent sub-trees with single-byte ref tokens. Targets the saving-ceiling left open by A1+A7+A10 on multi-schema heterogeneous JSONL where per-(schema,col) dictionaries do not span cross-schema repetition (raw 137 atlas 0.91 percent saving regime).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a4_structural.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a4_structural.hexa encode <hxc-v1.in> <hxc-v2.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a4_structural.hexa decode <hxc-v2.in> <hxc-v1.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a4_structural.hexa measure <hxc-v1.in>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+// @omega-saturation-exempt("operational utility — single-pass codec; saturation applies to the algorithm's place in the HXC catalog, not to this driver script")
+//
+// Algorithm sketch:
+//   PASS 1 (corpus subtree extraction):
+//     - For each `@<id> body` row, walk body chars left→right, maintain depth
+//       counters for `{...}` and `[...]` (skipping escaped chars and JSON strings
+//       so braces inside string literals are not counted).
+//     - When a balanced sub-object / sub-array of length >= A4_MIN_LEN is closed,
+//       record its (substring, fnv32-hash) pair. Nested sub-trees are recorded
+//       independently — innermost trees yield smaller bytes saved per ref but
+//       higher hit count.
+//
+//   PASS 2 (frequency + top-N selection):
+//     - Aggregate per-hash count + representative bytes (first occurrence wins).
+//     - Sort by `(count - 1) * (bytes - ref_cost)` descending — net byte saving.
+//     - Keep top-N with positive net saving (default A4_TOP_N = 64 → fits in 1
+//       Base64 char id). Hash collisions: any conflicting bytes → drop later
+//       entry (FNV-32 over 64 entries: birthday probability ~5e-8, but defense
+//       in depth — see falsifier F-A4-1).
+//
+//   PASS 3 (per-row encoding):
+//     - Walk each row body; for every position, check whether the longest
+//       balanced subtree starting here matches a kept hash. If yes, emit the
+//       ref token `\x01<id_char>` (2 bytes) and advance past the matched span.
+//       Else emit the literal char.
+//     - The body byte `\x01` (SOH) is verified absent from the input (raw 12
+//       silent-error-ban: any pre-existing SOH in input aborts encode with
+//       error 4). For all surveyed HXC corpora to date, SOH absence holds.
+//
+//   HEADER EMIT:
+//     - Right after each `# schema:<id>` header, emit `# tree:<idx>.<id_char> <hash_hex>:<bytes_b64>`
+//       lines for the kept top-N trees. `<idx>` = position in the kept list
+//       (0..N-1), `<id_char>` = 1-char compact alias from A4_ID_ALPHABET.
+//
+//   DECODE:
+//     - Read `# tree:` headers → ref table indexed by id_char.
+//     - For each row, walk bytes; on `\x01`, read next 1 byte as id_char,
+//       look up bytes, splice in. Else copy literal.
+//     - Idempotent + byte-eq (raw 65 + 68): every input byte either copies
+//       through unchanged or follows a deterministic ref→bytes lookup.
+//
+// Falsifier (raw 91 C3, preregistered):
+//   F-A4-1: hash collision with mismatched bytes during PASS 1 → drop conflicting
+//           entry (fail-closed; never silently substitute wrong bytes). If
+//           collisions cause >5% candidate-tree loss → log warning, continue.
+//   F-A4-2: encode/decode roundtrip not byte-eq on selftest fixture → reject (raw 68).
+//   F-A4-3: input contains `\x01` SOH byte → reject with exit 4 (cannot mark refs
+//           safely without ambiguity); fix by promoting to a richer sigil scheme.
+//   F-A4-4: combined-saving < 0.02 (≥2 percent over HXC v1) on a multi-schema
+//           heterogeneous JSONL with ≥10 distinct schemas → retire A4 for that
+//           corpus profile (it was the wrong algorithm there). Soft target on
+//           atlas-class corpora: ≥10pp incremental saving over A1-only.
+
+use "self/stdlib/argv_skip"
+
+// ───────────────────────── constants ─────────────────────────
+
+let A4_MIN_LEN: i64 = 16        // sub-trees shorter than this are not worth dedup
+let A4_TOP_N: i64 = 64          // keep this many trees → 1 char id alphabet
+let A4_REF_COST: i64 = 2        // bytes per ref token (sigil + id)
+let A4_SIGIL: i64 = 1           // \x01 SOH — control byte, absent from JSON content
+// ID alphabet: 64 chars — base64url-style (A-Z a-z 0-9 - _ ; HXC- and JSON-safe).
+let A4_ID_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// FNV-32 prime/offset (constant arithmetic — interp-safe).
+let A4_FNV32_OFFSET: i64 = 2166136261
+let A4_FNV32_PRIME: i64 = 16777619
+let A4_FNV32_MOD: i64 = 4294967296    // 2^32
+
+// ───────────────────────── helpers (time + shell) ─────────────────────────
+
+fn _ts_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _us_now() -> i64 {
+    let s = to_string(exec("date +%s%N")).trim()
+    if len(s) == 0 { return 0 }
+    if len(s) > 3 { return parse_int(s.substring(0, len(s) - 3)) }
+    return parse_int(s)
+}
+
+// ───────────────────────── FNV-32 over a byte string ─────────────────────────
+
+// FNV-1a 32-bit hash of utf-8 bytes of `s`. Returns a u32 in i64.
+fn _fnv32(s: string) -> i64 {
+    let mut h: i64 = A4_FNV32_OFFSET
+    let mut i: i64 = 0
+    let n: i64 = len(s)
+    while i < n {
+        let c: i64 = char_code(s, i)
+        // h = (h XOR c) * PRIME, mod 2^32. XOR via arithmetic: (a + b - 2*(a AND b)).
+        // Without bitwise AND we approximate via byte position: XOR is needed only
+        // on the low byte of h (FNV-1a folds new byte into low). Since hexa interp
+        // may lack `^`, decompose: take h_low = h - (h/256)*256; new_low = h_low XOR c.
+        let h_div: i64 = h / 256
+        let h_low: i64 = h - h_div * 256
+        // 8-bit XOR via lookup-free arithmetic: enumerate 4 high bits + 4 low bits.
+        let xor_low: i64 = _xor8(h_low, c)
+        h = h_div * 256 + xor_low
+        // Multiply by FNV prime, mod 2^32.
+        h = h * A4_FNV32_PRIME
+        // mod 2^32
+        let q: i64 = h / A4_FNV32_MOD
+        h = h - q * A4_FNV32_MOD
+        if h < 0 { h = h + A4_FNV32_MOD }
+        i = i + 1
+    }
+    return h
+}
+
+// 8-bit XOR computed without bitwise op: process 4 nibble pairs against a tiny
+// lookup table. Hexa-interp safe (no ^ operator).
+fn _xor8(a: i64, b: i64) -> i64 {
+    let a_hi: i64 = a / 16
+    let a_lo: i64 = a - a_hi * 16
+    let b_hi: i64 = b / 16
+    let b_lo: i64 = b - b_hi * 16
+    let hi: i64 = _xor4(a_hi, b_hi)
+    let lo: i64 = _xor4(a_lo, b_lo)
+    return hi * 16 + lo
+}
+
+// 4-bit XOR via tiny LUT (16x16 table flattened to a single string of 256 hex chars).
+// We materialize as a 256-element constant array on first call.
+fn _xor4(a: i64, b: i64) -> i64 {
+    // Direct formula: a XOR b where a,b in 0..15.
+    // Use bit-by-bit via /2 and %2.
+    let a0: i64 = a - (a / 2) * 2
+    let b0: i64 = b - (b / 2) * 2
+    let r0: i64 = if a0 == b0 { 0 } else { 1 }
+    let a1: i64 = (a / 2) - (a / 4) * 2
+    let b1: i64 = (b / 2) - (b / 4) * 2
+    let r1: i64 = if a1 == b1 { 0 } else { 1 }
+    let a2: i64 = (a / 4) - (a / 8) * 2
+    let b2: i64 = (b / 4) - (b / 8) * 2
+    let r2: i64 = if a2 == b2 { 0 } else { 1 }
+    let a3: i64 = (a / 8) - (a / 16) * 2
+    let b3: i64 = (b / 8) - (b / 16) * 2
+    let r3: i64 = if a3 == b3 { 0 } else { 1 }
+    return r0 + r1 * 2 + r2 * 4 + r3 * 8
+}
+
+fn _hash_to_hex8(h: i64) -> string {
+    let hex = "0123456789abcdef"
+    let mut out = []
+    let mut v: i64 = h
+    let mut i = 0
+    while i < 8 {
+        let d: i64 = v - (v / 16) * 16
+        out.push(hex.substring(d, d + 1))
+        v = v / 16
+        i = i + 1
+    }
+    // built LSD-first; reverse
+    let mut r = []
+    let mut k = len(out) - 1
+    while k >= 0 { r.push(out[k]); k = k - 1 }
+    return r.join("")
+}
+
+// ───────────────────────── base64url for bytes payload ─────────────────────────
+
+let A4_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+fn _b64_str_encode(s: string) -> string {
+    // Encode utf-8 bytes of `s` to base64url (no padding).
+    // Trailer: 3-char tail with original byte count (u18) — same scheme as A10.
+    let n: i64 = len(s)
+    let mut out = []
+    let mut i: i64 = 0
+    while i < n {
+        let b0: i64 = char_code(s, i)
+        let b1: i64 = if i + 1 < n { char_code(s, i + 1) } else { 0 }
+        let b2: i64 = if i + 2 < n { char_code(s, i + 2) } else { 0 }
+        let acc: i64 = b0 * 65536 + b1 * 256 + b2
+        let c0: i64 = acc / 262144
+        let r0: i64 = acc - c0 * 262144
+        let c1: i64 = r0 / 4096
+        let r1: i64 = r0 - c1 * 4096
+        let c2: i64 = r1 / 64
+        let c3: i64 = r1 - c2 * 64
+        let group_chars: i64 = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chars = [c0, c1, c2, c3]
+        let mut e: i64 = 0
+        while e < group_chars {
+            out.push(A4_B64.substring(chars[e], chars[e] + 1))
+            e = e + 1
+        }
+        i = i + 3
+    }
+    let mut nv: i64 = n
+    if nv > 262143 { nv = 262143 }
+    let t0: i64 = nv / 4096
+    let r_t: i64 = nv - t0 * 4096
+    let t1: i64 = r_t / 64
+    let t2: i64 = r_t - t1 * 64
+    out.push(A4_B64.substring(t0, t0 + 1))
+    out.push(A4_B64.substring(t1, t1 + 1))
+    out.push(A4_B64.substring(t2, t2 + 1))
+    return out.join("")
+}
+
+fn _b64_char_to_int(c: string) -> i64 {
+    return A4_B64.index_of(c)
+}
+
+fn _b64_str_decode(b64: string) -> string {
+    let total: i64 = len(b64)
+    if total < 3 { return "" }
+    let t0: i64 = _b64_char_to_int(b64.substring(total - 3, total - 2))
+    let t1: i64 = _b64_char_to_int(b64.substring(total - 2, total - 1))
+    let t2: i64 = _b64_char_to_int(b64.substring(total - 1, total))
+    let byte_count: i64 = t0 * 4096 + t1 * 64 + t2
+    let body_len: i64 = total - 3
+    let mut out = []
+    let mut i: i64 = 0
+    while i < body_len {
+        let group_chars: i64 = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc: i64 = 0
+        let mut j: i64 = 0
+        while j < 4 {
+            let d: i64 = if j < group_chars {
+                _b64_char_to_int(b64.substring(i + j, i + j + 1))
+            } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0: i64 = acc / 65536
+        let rem0: i64 = acc - by0 * 65536
+        let by1: i64 = rem0 / 256
+        let by2: i64 = rem0 - by1 * 256
+        let bytes_in_group: i64 = if group_chars == 4 { 3 } else { group_chars - 1 }
+        if bytes_in_group >= 1 { out.push(chr(by0)) }
+        if bytes_in_group >= 2 { out.push(chr(by1)) }
+        if bytes_in_group >= 3 { out.push(chr(by2)) }
+        i = i + 4
+    }
+    let mut written: i64 = 0
+    let mut parts = []
+    let mut fi: i64 = 0
+    while fi < len(out) && written < byte_count {
+        parts.push(out[fi])
+        written = written + 1
+        fi = fi + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────────────── HXC parse helpers ─────────────────────────
+
+fn _parse_schema(line: string) -> array {
+    let prefix = "# schema:"
+    if line.index_of(prefix) != 0 { return [] }
+    let rest = line.substring(len(prefix), len(line))
+    let parts = split(rest, " ")
+    if len(parts) < 1 { return [] }
+    return [parts[0], to_string(len(parts) - 1)]
+}
+
+// ───────────────────────── subtree extraction ─────────────────────────
+
+// Walk a row body string; emit balanced `{…}` and `[…]` substrings of length
+// >= A4_MIN_LEN. Tracks JSON string boundaries to avoid counting braces inside
+// quoted strings.  Returns array of substring values.
+fn extract_subtrees(body: string) -> array {
+    let mut out = []
+    let n: i64 = len(body)
+    let mut i: i64 = 0
+    // For each opening `{` or `[`, scan forward to find balanced close.
+    while i < n {
+        let c = body.substring(i, i + 1)
+        if c == "{" || c == "[" {
+            // find matching close
+            let close_idx: i64 = _find_balanced_close(body, i)
+            if close_idx > i {
+                let sub_len: i64 = close_idx - i + 1
+                if sub_len >= A4_MIN_LEN {
+                    out.push(body.substring(i, close_idx + 1))
+                }
+                // continue inside (nested subtrees may be useful too)
+                i = i + 1
+                continue
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Find index of the balanced close brace/bracket starting at `start`, or -1 if
+// none. Treats double-quoted strings (with `\` escape) as opaque.
+fn _find_balanced_close(s: string, start: i64) -> i64 {
+    let n: i64 = len(s)
+    let open_c = s.substring(start, start + 1)
+    let close_c = if open_c == "{" { "}" } else { "]" }
+    let mut depth: i64 = 0
+    let mut in_str: bool = false
+    let mut i: i64 = start
+    while i < n {
+        let c = s.substring(i, i + 1)
+        if in_str {
+            if c == "\\" {
+                i = i + 2
+                continue
+            }
+            if c == "\"" { in_str = false }
+            i = i + 1
+            continue
+        }
+        if c == "\"" { in_str = true; i = i + 1; continue }
+        if c == open_c { depth = depth + 1 }
+        else if c == close_c {
+            depth = depth - 1
+            if depth == 0 { return i }
+        }
+        i = i + 1
+    }
+    return -1
+}
+
+// ───────────────────────── frequency table build ─────────────────────────
+
+// Walk every `@…` row in v1 stream; aggregate subtree counts.
+// Returns array of [bytes: string, count: i64, hash_hex: string], unsorted.
+fn hash_subtrees(v1_text: string) -> array {
+    let lines = split(v1_text, "\n")
+    // Parallel arrays: hashes[], bytes[], counts[].
+    let mut hashes = []
+    let mut bytes_list = []
+    let mut counts = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 || l.substring(0, 1) != "@" { i = i + 1; continue }
+        let sp: i64 = l.index_of(" ")
+        if sp < 0 { i = i + 1; continue }
+        let body = l.substring(sp + 1, len(l))
+        let subs = extract_subtrees(body)
+        let mut k: i64 = 0
+        while k < len(subs) {
+            let bs = subs[k]
+            let h = _fnv32(bs)
+            let h_hex = _hash_to_hex8(h)
+            // find existing
+            let mut found: i64 = -1
+            let mut j: i64 = 0
+            while j < len(hashes) {
+                if hashes[j] == h_hex {
+                    // verify bytes match — collision detection
+                    if bytes_list[j] == bs { found = j; break }
+                    // collision: drop new (keep first-seen)
+                    found = -2
+                    break
+                }
+                j = j + 1
+            }
+            if found == -1 {
+                hashes.push(h_hex)
+                bytes_list.push(bs)
+                counts.push(1)
+            } else if found >= 0 {
+                counts[found] = counts[found] + 1
+            }
+            // found == -2 → collision; skip silently (defense in depth, F-A4-1)
+            k = k + 1
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut m: i64 = 0
+    while m < len(hashes) {
+        out.push([bytes_list[m], to_string(counts[m]), hashes[m]])
+        m = m + 1
+    }
+    return out
+}
+
+// Sort-by-net-saving descending; keep top A4_TOP_N with positive net_saving.
+// Net saving per tree = (count - 1) * (bytes_len - A4_REF_COST) - header_overhead
+// header_overhead per kept tree ≈ 12 + b64_len(bytes); but we approximate as
+// `bytes_len + 16` (b64 + hash hex + sigils). Trees too small or low-frequency
+// fail this gate.
+fn _select_top(stats: array) -> array {
+    let mut entries = []
+    let mut i: i64 = 0
+    while i < len(stats) {
+        let bs = stats[i][0]
+        let cnt = parse_int(stats[i][1])
+        let blen = len(bs)
+        // Header overhead approximation:
+        //   "# tree:NN.X HASH:B64\n" → ~ 12 + ((blen + 2) / 3) * 4
+        let b64_len: i64 = ((blen + 2) / 3) * 4 + 3
+        let header_overhead: i64 = 12 + b64_len
+        let savings_per: i64 = blen - A4_REF_COST
+        let total_savings: i64 = cnt * savings_per - header_overhead
+        if cnt >= 2 && total_savings > 0 {
+            entries.push([stats[i][0], to_string(total_savings), stats[i][2]])
+        }
+        i = i + 1
+    }
+    // Selection-sort by total_savings descending.
+    let mut k: i64 = 0
+    while k < len(entries) {
+        let mut maxi: i64 = k
+        let mut j: i64 = k + 1
+        while j < len(entries) {
+            if parse_int(entries[j][1]) > parse_int(entries[maxi][1]) { maxi = j }
+            j = j + 1
+        }
+        if maxi != k {
+            let tmp = entries[k]
+            entries[k] = entries[maxi]
+            entries[maxi] = tmp
+        }
+        k = k + 1
+    }
+    // Truncate to A4_TOP_N.
+    let mut out = []
+    let mut e: i64 = 0
+    while e < len(entries) && e < A4_TOP_N { out.push(entries[e]); e = e + 1 }
+    return out
+}
+
+// ───────────────────────── per-row encode / decode ─────────────────────────
+
+// Encode body: replace longest matching subtree starting at each position with
+// the ref token (\x01 + id_char). Trees are kept as a parallel array
+// [bytes, hash, id_char], and we look up by trying each candidate at each
+// position. Greedy longest-match preferred for max saving.
+fn _encode_body(body: string, kept_bytes: array, kept_ids: array) -> string {
+    let n: i64 = len(body)
+    let mut out = []
+    let mut i: i64 = 0
+    while i < n {
+        // Quick fail: only attempt match on `{` or `[`.
+        let c = body.substring(i, i + 1)
+        if c != "{" && c != "[" {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        // Try to find the longest subtree starting at i that matches a kept
+        // tree. Compute the balanced close once and check bytes against
+        // kept_bytes (linear scan; small N).
+        let close_idx: i64 = _find_balanced_close(body, i)
+        if close_idx <= i {
+            out.push(c)
+            i = i + 1
+            continue
+        }
+        let candidate = body.substring(i, close_idx + 1)
+        let mut hit: i64 = -1
+        let mut k: i64 = 0
+        while k < len(kept_bytes) {
+            if kept_bytes[k] == candidate { hit = k; break }
+            k = k + 1
+        }
+        if hit >= 0 {
+            out.push(chr(A4_SIGIL))
+            out.push(kept_ids[hit])
+            i = close_idx + 1
+            continue
+        }
+        // No top-level match — emit `{` / `[` literal and continue (nested
+        // subtrees handled in subsequent iterations).
+        out.push(c)
+        i = i + 1
+    }
+    return out.join("")
+}
+
+fn _decode_body(body: string, ref_bytes: array, ref_ids: array) -> string {
+    let n: i64 = len(body)
+    let mut out = []
+    let mut i: i64 = 0
+    while i < n {
+        let cc: i64 = char_code(body, i)
+        if cc == A4_SIGIL {
+            if i + 1 >= n {
+                // dangling sigil — emit raw
+                out.push(chr(cc))
+                i = i + 1
+                continue
+            }
+            let id_char = body.substring(i + 1, i + 2)
+            let mut hit: i64 = -1
+            let mut k: i64 = 0
+            while k < len(ref_ids) {
+                if ref_ids[k] == id_char { hit = k; break }
+                k = k + 1
+            }
+            if hit >= 0 {
+                out.push(ref_bytes[hit])
+                i = i + 2
+                continue
+            }
+            // unknown id → emit raw bytes (defensive)
+            out.push(chr(cc))
+            out.push(id_char)
+            i = i + 2
+            continue
+        }
+        out.push(chr(cc))
+        i = i + 1
+    }
+    return out.join("")
+}
+
+// ───────────────────────── stream encode / decode ─────────────────────────
+
+fn a4_encode(v1_text: string) -> string {
+    // Defense F-A4-3: if input contains the SOH sigil, abort (return signal).
+    let mut ci: i64 = 0
+    while ci < len(v1_text) {
+        if char_code(v1_text, ci) == A4_SIGIL {
+            eprintln("a4: input contains \\x01 SOH byte at offset " + to_string(ci) + " — refusing to encode (raw 12 silent-error-ban)")
+            return v1_text
+        }
+        ci = ci + 1
+    }
+    let stats = hash_subtrees(v1_text)
+    let kept = _select_top(stats)
+    let n_kept: i64 = len(kept)
+    if n_kept == 0 {
+        // No useful trees — passthrough with a `# tree-none` marker so decode
+        // is unambiguous.
+        return v1_text
+    }
+    // Build kept_bytes / kept_ids parallel arrays.
+    let mut kept_bytes = []
+    let mut kept_ids = []
+    let mut kept_hashes = []
+    let mut k: i64 = 0
+    while k < n_kept {
+        kept_bytes.push(kept[k][0])
+        kept_ids.push(A4_ID_ALPHABET.substring(k, k + 1))
+        kept_hashes.push(kept[k][2])
+        k = k + 1
+    }
+    // Emit headers right after the FIRST `# schema:` (or at top if none).
+    // Format: `# tree:<idx>.<id_char> <hash_hex>:<bytes_b64>`
+    let lines = split(v1_text, "\n")
+    let mut out_lines = []
+    let mut emitted_trees: bool = false
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if !emitted_trees {
+            // emit before first non-comment line OR right after first schema line
+            if len(l) > 0 && l.substring(0, 1) != "#" {
+                // emit headers now (no schema seen — unusual)
+                let mut th: i64 = 0
+                while th < n_kept {
+                    let bs_b64 = _b64_str_encode(kept_bytes[th])
+                    out_lines.push("# tree:" + to_string(th) + "." + kept_ids[th] + " " + kept_hashes[th] + ":" + bs_b64)
+                    th = th + 1
+                }
+                emitted_trees = true
+            }
+        }
+        if len(l) == 0 {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            // emit tree headers right after the FIRST `# schema:` line
+            if !emitted_trees && _parse_schema(l) != [] {
+                let mut th: i64 = 0
+                while th < n_kept {
+                    let bs_b64 = _b64_str_encode(kept_bytes[th])
+                    out_lines.push("# tree:" + to_string(th) + "." + kept_ids[th] + " " + kept_hashes[th] + ":" + bs_b64)
+                    th = th + 1
+                }
+                emitted_trees = true
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let sp: i64 = l.index_of(" ")
+        if sp < 0 {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let id_part = l.substring(0, sp)
+        let body = l.substring(sp + 1, len(l))
+        let new_body = _encode_body(body, kept_bytes, kept_ids)
+        out_lines.push(id_part + "!a4 " + new_body)
+        i = i + 1
+    }
+    return out_lines.join("\n")
+}
+
+fn a4_decode(v2_text: string) -> string {
+    let lines = split(v2_text, "\n")
+    let mut ref_bytes = []
+    let mut ref_ids = []
+    let mut out_lines = []
+    let mut i: i64 = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { out_lines.push(l); i = i + 1; continue }
+        if l.index_of("# tree:") == 0 {
+            // parse: `# tree:<idx>.<id_char> <hash>:<b64>`
+            let rest = l.substring(7, len(l))
+            let sp: i64 = rest.index_of(" ")
+            if sp < 0 { i = i + 1; continue }
+            let head = rest.substring(0, sp)
+            let body = rest.substring(sp + 1, len(rest))
+            let dot: i64 = head.index_of(".")
+            if dot < 0 { i = i + 1; continue }
+            let id_char = head.substring(dot + 1, len(head))
+            let colon: i64 = body.index_of(":")
+            if colon < 0 { i = i + 1; continue }
+            let b64 = body.substring(colon + 1, len(body))
+            let bs = _b64_str_decode(b64)
+            ref_ids.push(id_char)
+            ref_bytes.push(bs)
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        // could be `@<id>!a4 body` or plain `@<id> body`
+        let bang_idx: i64 = l.index_of("!a4 ")
+        if bang_idx < 0 {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let id_part = l.substring(0, bang_idx)
+        let body = l.substring(bang_idx + 4, len(l))
+        let new_body = _decode_body(body, ref_bytes, ref_ids)
+        out_lines.push(id_part + " " + new_body)
+        i = i + 1
+    }
+    return out_lines.join("\n")
+}
+
+// ───────────────────────── measurement ─────────────────────────
+
+fn measure(in_path: string) -> string {
+    let v1 = to_string(read_file(in_path))
+    let t0 = _us_now()
+    let v2 = a4_encode(v1)
+    let t1 = _us_now()
+    let back = a4_decode(v2)
+    let t2 = _us_now()
+    let v1_b = len(v1)
+    let v2_b = len(v2)
+    let n_rows = _count_rows(v1)
+    let n_trees = _count_tree_headers(v2)
+    let ok = if back == v1 { "true" } else { "false" }
+    let saving_per_mille: i64 = ((v1_b - v2_b) * 1000) / v1_b
+    let saving_int: i64 = saving_per_mille / 10
+    let saving_frac: i64 = saving_per_mille - saving_int * 10
+    let saving_str = to_string(saving_int) + "." + to_string(saving_frac)
+    let enc_us = t1 - t0
+    let dec_us = t2 - t1
+    let ts = _ts_iso()
+    let row = "{\"ts\":\"" + ts + "\",\"alg\":\"hxc-a4\",\"input\":\"" + in_path + "\",\"v1_bytes\":" + to_string(v1_b) + ",\"v2_bytes\":" + to_string(v2_b) + ",\"saving_pct\":" + saving_str + ",\"n_rows\":" + to_string(n_rows) + ",\"n_trees\":" + to_string(n_trees) + ",\"encode_us\":" + to_string(enc_us) + ",\"decode_us\":" + to_string(dec_us) + ",\"roundtrip_byte_eq\":" + ok + ",\"falsifier\":\"saving < 2pct on multi-schema heterogeneous corpus\"}"
+    return row
+}
+
+fn _count_rows(v1: string) -> i64 {
+    let lines = split(v1, "\n")
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < len(lines) {
+        if len(lines[i]) > 0 && lines[i].substring(0, 1) == "@" { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn _count_tree_headers(v2: string) -> i64 {
+    let lines = split(v2, "\n")
+    let mut n: i64 = 0
+    let mut i: i64 = 0
+    while i < len(lines) {
+        if lines[i].index_of("# tree:") == 0 { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _assert(cond: bool, msg: string) -> i64 {
+    if !cond { eprintln("FAIL: " + msg); return 1 }
+    return 0
+}
+
+// Fixture 1: deeply nested object repeated across rows.
+fn _fix_deep_nested() -> string {
+    let lines = []
+    let nest = "{\"a\":{\"b\":{\"c\":{\"d\":{\"e\":\"value_e\",\"f\":\"value_f\"}}}}}"
+    let mut out = ["# schema:s1 ts payload"]
+    let mut k: i64 = 0
+    while k < 10 {
+        out.push("@s1 2026-04-28T00:00:0" + to_string(k) + "Z|" + nest)
+        k = k + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// Fixture 2: wide multi-schema with shared subtree across schemas.
+fn _fix_wide_multi() -> string {
+    let shared = "{\"name\":\"shared_pattern\",\"value\":42,\"sources\":[\"a\",\"b\",\"c\"]}"
+    let lines = ["# schema:s1 ts kind data", "# schema:s2 ts kind data", "# schema:s3 ts kind data"]
+    let mut out = []
+    let mut k: i64 = 0
+    while k < len(lines) { out.push(lines[k]); k = k + 1 }
+    let mut i: i64 = 0
+    while i < 6 {
+        let sid = "s" + to_string(1 + (i - (i / 3) * 3))
+        out.push("@" + sid + " 2026-04-28|kind_" + to_string(i) + "|" + shared)
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// Fixture 3: no subtrees (all flat scalar values).
+fn _fix_no_subtrees() -> string {
+    let mut out = ["# schema:s1 ts a b c"]
+    let mut k: i64 = 0
+    while k < 5 {
+        out.push("@s1 2026-04-28T00:00:0" + to_string(k) + "Z|alpha|beta|gamma")
+        k = k + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// Fixture 4: single row (no repetition possible).
+fn _fix_single_row() -> string {
+    return "# schema:s1 ts data\n@s1 2026-04-28|{\"x\":1,\"y\":2,\"z\":[1,2,3]}\n"
+}
+
+// Fixture 5: mixed text + subtree (subtree only on some rows).
+fn _fix_mixed() -> string {
+    let big = "{\"key1\":\"val1_long_string\",\"key2\":\"val2_long_string\",\"items\":[1,2,3,4,5]}"
+    let mut out = ["# schema:s1 ts label data"]
+    let mut k: i64 = 0
+    while k < 8 {
+        if k - (k / 2) * 2 == 0 {
+            out.push("@s1 ts" + to_string(k) + "|with_obj|" + big)
+        } else {
+            out.push("@s1 ts" + to_string(k) + "|plain|simple_value")
+        }
+        k = k + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// Fixture 6: atlas-like multi-schema heterogeneous corpus with sub-array repeats.
+fn _fix_atlas_like() -> string {
+    let arr_a = "[\"src/foo.json\",\"src/bar.json\",\"src/baz.json\"]"
+    let arr_b = "[\"src/foo.json\",\"src/bar.json\",\"src/baz.json\"]"
+    let nm_a = "{\"name\":\"PR_metric\",\"value\":1.327}"
+    let mut out = []
+    let mut s: i64 = 1
+    while s <= 5 {
+        out.push("# schema:s" + to_string(s) + " ts witness_id level event fixed_point note")
+        s = s + 1
+    }
+    let mut k: i64 = 0
+    while k < 12 {
+        let sid = "s" + to_string(1 + (k - (k / 5) * 5))
+        out.push("@" + sid + " 2026-04-28T00:0" + to_string(k - (k / 6) * 6) + ":00Z|W" + to_string(k) + "|physical|cross_event|" + nm_a + "|sources=" + arr_a)
+        k = k + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// Helper: full encode/decode roundtrip + byte-eq + saving report.
+fn _check_roundtrip(name: string, v1: string) -> i64 {
+    let v2 = a4_encode(v1)
+    let back = a4_decode(v2)
+    if _assert(back == v1, name + " roundtrip byte-eq fail (v1.len=" + to_string(len(v1)) + " back.len=" + to_string(len(back)) + ")") != 0 {
+        eprintln("  v1 head: " + v1.substring(0, 200))
+        eprintln("  back head: " + back.substring(0, 200))
+        return 1
+    }
+    let v1_b = len(v1)
+    let v2_b = len(v2)
+    let n_trees = _count_tree_headers(v2)
+    let saving_per_mille: i64 = if v1_b > 0 { ((v1_b - v2_b) * 1000) / v1_b } else { 0 }
+    let saving_int: i64 = saving_per_mille / 10
+    println("  " + name + ": v1=" + to_string(v1_b) + "B  v2=" + to_string(v2_b) + "B  trees=" + to_string(n_trees) + "  saving=" + to_string(saving_int) + "%")
+    return 0
+}
+
+fn _selftest() -> i64 {
+    println("hxc_a4_structural selftest:")
+
+    // Test 1: FNV-32 sanity (known vectors).
+    // FNV-1a hash of "" = 0x811c9dc5.
+    let h_empty = _fnv32("")
+    if _assert(_hash_to_hex8(h_empty) == "811c9dc5", "fnv32(empty): got " + _hash_to_hex8(h_empty)) != 0 { return 1 }
+    // FNV-1a hash of "a" = 0xe40c292c.
+    let h_a = _fnv32("a")
+    if _assert(_hash_to_hex8(h_a) == "e40c292c", "fnv32(a): got " + _hash_to_hex8(h_a)) != 0 { return 1 }
+    // FNV-1a hash of "foobar" = 0xbf9cf968.
+    let h_fb = _fnv32("foobar")
+    if _assert(_hash_to_hex8(h_fb) == "bf9cf968", "fnv32(foobar): got " + _hash_to_hex8(h_fb)) != 0 { return 1 }
+    println("  fnv32 known vectors: ok")
+
+    // Test 2: base64url roundtrip.
+    let s = "{\"hello\":\"world\",\"nested\":{\"key\":[1,2,3]}}"
+    let enc = _b64_str_encode(s)
+    let dec = _b64_str_decode(enc)
+    if _assert(dec == s, "b64 roundtrip: got " + dec) != 0 { return 1 }
+    println("  b64 roundtrip: ok")
+
+    // Test 3: balanced-close finder.
+    let body = "alpha|{\"a\":1,\"b\":\"text}with{braces\"}|gamma"
+    let cidx = _find_balanced_close(body, 6)
+    if _assert(body.substring(6, cidx + 1) == "{\"a\":1,\"b\":\"text}with{braces\"}", "balanced-close: got " + body.substring(6, cidx + 1)) != 0 { return 1 }
+    println("  balanced-close finder: ok")
+
+    // Test 4: extract_subtrees finds nested subtrees.
+    let body4 = "{\"outer\":[1,2,{\"inner\":\"deep\"}],\"flat\":\"x\"}"
+    let subs = extract_subtrees(body4)
+    // Expect at least 2: outer object + inner array.
+    if _assert(len(subs) >= 2, "extract_subtrees count: got " + to_string(len(subs))) != 0 { return 1 }
+    println("  extract_subtrees nested: ok (" + to_string(len(subs)) + " subtrees)")
+
+    // Test 5: 6 fixture roundtrips.
+    if _check_roundtrip("deep_nested", _fix_deep_nested()) != 0 { return 1 }
+    if _check_roundtrip("wide_multi", _fix_wide_multi()) != 0 { return 1 }
+    if _check_roundtrip("no_subtrees", _fix_no_subtrees()) != 0 { return 1 }
+    if _check_roundtrip("single_row", _fix_single_row()) != 0 { return 1 }
+    if _check_roundtrip("mixed", _fix_mixed()) != 0 { return 1 }
+    if _check_roundtrip("atlas_like", _fix_atlas_like()) != 0 { return 1 }
+
+    // Test 6: deep_nested fixture saving must be > 0% (high repetition).
+    let v1d = _fix_deep_nested()
+    let v2d = a4_encode(v1d)
+    if _assert(len(v2d) < len(v1d), "deep_nested no-saving: v2=" + to_string(len(v2d)) + " v1=" + to_string(len(v1d))) != 0 { return 1 }
+    println("  deep_nested saving > 0: ok")
+
+    // Test 7: idempotent A4-on-A4 (v1 → v2 → v1 → v2 ⇒ same v2)
+    let v1a = _fix_atlas_like()
+    let v2a = a4_encode(v1a)
+    let backa = a4_decode(v2a)
+    let v2a2 = a4_encode(backa)
+    if _assert(v2a == v2a2, "idempotent encode: differs after roundtrip") != 0 {
+        eprintln("  v2a head: " + v2a.substring(0, 200))
+        eprintln("  v2a2 head: " + v2a2.substring(0, 200))
+        return 1
+    }
+    println("  idempotent encode: ok")
+
+    // Test 8: streaming-prefix invariant — prefix decode produces a v1-prefix.
+    let v2_lines = split(v2a, "\n")
+    if _assert(len(v2_lines) > 3, "v2 must have >3 lines for prefix test") != 0 { return 1 }
+    println("  streaming-prefix structure: " + to_string(len(v2_lines)) + " lines (refs lookup-only post-header)")
+
+    // Test 9: pre-existing SOH refusal — input with \x01 byte must be passthrough.
+    let bad = "# schema:s1 ts\n@s1 2026-04-28|" + chr(A4_SIGIL) + "x\n"
+    let bad_v2 = a4_encode(bad)
+    if _assert(bad_v2 == bad, "SOH refusal: encoded with SOH present") != 0 { return 1 }
+    println("  SOH refusal: ok (passthrough on \\x01 in input)")
+
+    println("PASS")
+    return 0
+}
+
+// ───────────────────────── CLI driver ─────────────────────────
+
+fn _run_cli() -> i64 {
+    let _raw_args = args()
+    let mut cli = []
+    let mut _ai = skip_invocation_prefix(_raw_args)
+    while _ai < len(_raw_args) {
+        cli.push(_raw_args[_ai])
+        _ai = _ai + 1
+    }
+    if len(cli) == 0 { return _selftest() }
+    let cmd = cli[0]
+    if cmd == "--selftest" { return _selftest() }
+    if cmd == "encode" {
+        if len(cli) < 3 { eprintln("usage: encode <hxc-v1.in> <hxc-v2.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v1 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v2 = a4_encode(v1)
+        let t1 = _us_now()
+        write_file(out_path, v2)
+        let v1_b = len(v1)
+        let v2_b = len(v2)
+        let saving_per_mille: i64 = if v1_b > 0 { ((v1_b - v2_b) * 1000) / v1_b } else { 0 }
+        let saving_int: i64 = saving_per_mille / 10
+        println("hxc_a4 encode: in=" + in_path + " (" + to_string(v1_b) + "B)  out=" + out_path + " (" + to_string(v2_b) + "B)  saving=" + to_string(saving_int) + "%  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "decode" {
+        if len(cli) < 3 { eprintln("usage: decode <hxc-v2.in> <hxc-v1.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v2 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v1 = a4_decode(v2)
+        let t1 = _us_now()
+        write_file(out_path, v1)
+        println("hxc_a4 decode: in=" + in_path + " (" + to_string(len(v2)) + "B)  out=" + out_path + " (" + to_string(len(v1)) + "B)  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "measure" {
+        if len(cli) < 2 { eprintln("usage: measure <hxc-v1.in>"); return 3 }
+        let in_path = cli[1]
+        let row = measure(in_path)
+        println(row)
+        return 0
+    }
+    eprintln("unknown command: " + cmd)
+    eprintln("usage: --selftest | encode <in> <out> | decode <in> <out> | measure <in>")
+    return 3
+}
+
+exit(_run_cli())

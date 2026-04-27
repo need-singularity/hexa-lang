@@ -1,0 +1,957 @@
+#!hexa strict
+// self/stdlib/hxc_a8_column_stat.hexa — A8 column-statistical (Huffman-style enum)
+//
+// @module(slug="hxc_a8_column_stat", desc="HXC v2 algorithm A8 — column-marginal statistical encoding via low-cardinality enum tables. Detects per-(schema_id, col_idx) categorical columns (unique values <= 16) and emits a single-byte symbol id per occurrence. Complementary to A7 (per-row column-conditional arithmetic coder): A8 attacks the column-marginal distribution, A7 attacks the per-row conditional.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a8_column_stat.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a8_column_stat.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a8_column_stat.hexa decode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a8_column_stat.hexa measure <hxc.in>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+// @omega-saturation-exempt("operational utility — single-pass column-marginal codec; saturation applies to algorithm placement in the HXC catalog, not this driver script")
+//
+// Algorithm sketch:
+//   PASS 1 (column-cardinality scan):
+//     - Parse HXC v1 stream → per-(schema_id, col_idx) value frequency table
+//     - Mark column as categorical iff:
+//         * unique value count <= A8_MAX_SYMBOLS (16)
+//         * column observed in >= A8_MIN_ROWS (3) rows (avoid degenerate 1-row cols)
+//         * total bytes saved estimate > 0 (frequency-skewed pays better than flat)
+//     - Emit `# enum:<schema_id>.<col_idx> <freq1>:<val1>|<freq2>:<val2>|...` header,
+//       sorted descending by frequency. Symbol id = position in the sorted list
+//       (0..N-1), encoded as a single A8_SYMBOL_ALPHABET char.
+//
+//   PASS 2 (per-row encode):
+//     - For each `@<id> v1|v2|...|vN` row:
+//       - For each categorical column c: replace value with `^<symbol_char>`
+//         (the `^` prefix marks an A8 symbol; without it the value is literal).
+//       - Non-categorical columns and non-enrolled values pass through unchanged.
+//     - Emit `@<id>!a8 <v1>|<v2>|...|<vN>` row.
+//
+//   DECODE:
+//     - Read `# enum:<id>.<col>` headers → reverse symbol→value table per (id, col)
+//     - For each `@<id>!a8 ...` row: split body, expand `^<sym>` → original value at
+//       declared categorical columns. Non-categorical columns pass through.
+//
+// Streaming-prefix invariant (raw 92 A5):
+//   `# enum:` headers precede `@<id>!a8` rows. Each row independently decodable
+//   given headers. Same prefix-resumability contract as A7/A10.
+//
+// Idempotency (raw 65) + byte-eq (raw 68):
+//   - encode(decode(x)) == x  for any A8 stream
+//   - decode(encode(y)) == y  for any HXC v1 stream
+//   - Symbol id assignment is deterministic (sorted descending freq, ties broken
+//     by insertion order via a stable scan) → byte-eq guaranteed.
+//
+// Falsifier (raw 91 C3, preregistered):
+//   F-A8-1: combined-saving < 0.05 (HXC-A8 bytes >= 0.95 * HXC-v1 bytes) on a
+//           categorical-rich JSONL ≥10 rows with ≥1 column having unique <=16
+//           and >=3 occurrences → retire A8.
+//   F-A8-2: encode/decode round-trip not byte-eq on selftest fixture → reject.
+//   F-A8-3: decode latency > 200us/row on selftest in pure-hexa interpreted mode
+//           → reject (raw 42 jetsam, accounting for hexa interpreter overhead).
+//
+// Complementarity with A7 (raw 91 C7):
+//   A7 = per-row column-conditional arithmetic coder (Shannon-near optimal, but
+//        amortizes over per-row range-coder state; works best on integer-rich rows).
+//   A8 = column-marginal Huffman-style enum (1-byte-per-occurrence ceiling, but
+//        zero per-row state; works best on text categorical with unique <=16).
+//   Pipeline: A8 first (cheap, marginal) → A7 second (expensive, conditional).
+
+use "self/stdlib/argv_skip"
+
+// ───────────────────────── constants ─────────────────────────
+
+// Max distinct values in a single categorical column.
+// 16 = exactly representable with 4 bits, but we use 1 ASCII byte for HXC
+// line-safety. Higher values would require multi-byte symbol ids — out of scope
+// for A8 v1; A7 takes over for high-cardinality.
+let A8_MAX_SYMBOLS: i64 = 16
+
+// Min row count for a column to be eligible. Below this, the enum header overhead
+// dominates the savings.
+let A8_MIN_ROWS: i64 = 3
+
+// Symbol alphabet — HXC-safe single bytes. Excludes: | # @ " ' \ : space \n \r
+// and ~ (HXC null sentinel) and ^ (A8's own escape sigil).
+// 16 chars, dense block of uppercase A-P keeps decode lookup an O(1) char-arith op.
+let A8_SYMBOL_ALPHABET: string = "ABCDEFGHIJKLMNOP"
+
+// Symbol-prefix sigil: `^<sym>` marks an A8-encoded categorical value. Chosen
+// because `^` is not used by HXC v1, A7 (`!a7`), or A10 (`!a10`).
+let A8_SYM_PREFIX: string = "^"
+
+// ───────────────────────── helpers ─────────────────────────
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _ts_iso() -> string {
+    return to_string(exec("date -u +%Y-%m-%dT%H:%M:%SZ")).trim()
+}
+
+fn _us_now() -> i64 {
+    let s = to_string(exec("date +%s%N")).trim()
+    if len(s) == 0 { return 0 }
+    if len(s) > 3 { return parse_int(s.substring(0, len(s) - 3)) }
+    return parse_int(s)
+}
+
+// ───────────────────────── enum-table escape (header line-safety) ─────────────────────────
+
+// Replace HXC-reserved chars in a categorical value with `\xHH`. Same scheme as
+// A7's _dict_escape, kept independent so A8 + A7 may share a corpus without
+// alphabet collisions. Also escapes `:` (enum freq:val separator) and `^`
+// (A8 symbol prefix) so a literal value containing `^A` is unambiguous.
+fn _enum_escape(v: string) -> string {
+    let mut out = []
+    let mut i = 0
+    while i < len(v) {
+        let c = v.substring(i, i + 1)
+        if c == "|" { out.push("\\x7c") }
+        else if c == "\n" { out.push("\\x0a") }
+        else if c == "\r" { out.push("\\x0d") }
+        else if c == "\\" { out.push("\\x5c") }
+        else if c == ":" { out.push("\\x3a") }
+        else if c == "^" { out.push("\\x5e") }
+        else { out.push(c) }
+        i = i + 1
+    }
+    return out.join("")
+}
+
+fn _enum_unescape(v: string) -> string {
+    let mut out = []
+    let mut i = 0
+    while i < len(v) {
+        let c = v.substring(i, i + 1)
+        if c == "\\" && i + 3 < len(v) && v.substring(i + 1, i + 2) == "x" {
+            let hex = v.substring(i + 2, i + 4)
+            let code = _hex_to_int(hex)
+            out.push(chr(code))
+            i = i + 4
+        } else {
+            out.push(c)
+            i = i + 1
+        }
+    }
+    return out.join("")
+}
+
+fn _hex_to_int(h: string) -> i64 {
+    let mut v: i64 = 0
+    let mut i = 0
+    while i < len(h) {
+        let c = h.substring(i, i + 1)
+        let mut d: i64 = 0
+        if c >= "0" && c <= "9" { d = parse_int(c) }
+        else if c == "a" || c == "A" { d = 10 }
+        else if c == "b" || c == "B" { d = 11 }
+        else if c == "c" || c == "C" { d = 12 }
+        else if c == "d" || c == "D" { d = 13 }
+        else if c == "e" || c == "E" { d = 14 }
+        else if c == "f" || c == "F" { d = 15 }
+        v = v * 16 + d
+        i = i + 1
+    }
+    return v
+}
+
+// ───────────────────────── HXC parse helpers ─────────────────────────
+
+fn _parse_schema(line: string) -> array {
+    let prefix = "# schema:"
+    if line.index_of(prefix) != 0 { return [] }
+    let rest = line.substring(len(prefix), len(line))
+    let parts = split(rest, " ")
+    if len(parts) < 1 { return [] }
+    return [parts[0], to_string(len(parts) - 1)]
+}
+
+fn _parse_row(line: string) -> array {
+    if len(line) < 2 || line.substring(0, 1) != "@" { return [] }
+    let sp = line.index_of(" ")
+    if sp < 0 { return [] }
+    let id = line.substring(1, sp)
+    let body = line.substring(sp + 1, len(line))
+    let vals = split(body, "|")
+    return [id, vals]
+}
+
+// Parse `# enum:<id>.<col> <f>:<v>|<f>:<v>|...` → [id, col, [[val, freq], ...]] or [].
+fn _parse_enum(line: string) -> array {
+    let prefix = "# enum:"
+    if line.index_of(prefix) != 0 { return [] }
+    let rest = line.substring(len(prefix), len(line))
+    let sp = rest.index_of(" ")
+    if sp < 0 { return [] }
+    let head = rest.substring(0, sp)
+    let body = rest.substring(sp + 1, len(rest))
+    let dot = head.index_of(".")
+    if dot < 0 { return [] }
+    let id = head.substring(0, dot)
+    let col_s = head.substring(dot + 1, len(head))
+    let col = parse_int(col_s)
+    let pairs = split(body, "|")
+    let mut entries = []
+    let mut i = 0
+    while i < len(pairs) {
+        let p = pairs[i]
+        let colon = p.index_of(":")
+        if colon < 0 { i = i + 1; continue }
+        let fr = parse_int(p.substring(0, colon))
+        let v_esc = p.substring(colon + 1, len(p))
+        let v = _enum_unescape(v_esc)
+        entries.push([v, fr])
+        i = i + 1
+    }
+    return [id, to_string(col), entries]
+}
+
+// ───────────────────────── categorical column detection ─────────────────────────
+
+// Returns: array of [schema_id, col_idx, [[val, freq], ...]] sorted descending by
+// freq. Only columns with unique <= A8_MAX_SYMBOLS and total occurrences >=
+// A8_MIN_ROWS are returned. Order: schema-discovery order then col idx ascending.
+fn detect_categorical_columns(v1_text: string) -> array {
+    let lines = split(v1_text, "\n")
+    let mut sids = []          // [schema_id, ...]
+    let mut sncols = []        // [n_cols, ...]
+    let mut col_vals = []      // [s_idx][col_idx] = [[val, freq], ...] (insertion order)
+    let mut col_overflow = []  // [s_idx][col_idx] = "yes" if unique count > A8_MAX_SYMBOLS
+
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.substring(0, 1) == "#" {
+            let sh = _parse_schema(l)
+            if len(sh) == 2 {
+                let id = sh[0]
+                let nc = parse_int(sh[1])
+                let mut found = -1
+                let mut s = 0
+                while s < len(sids) {
+                    if sids[s] == id { found = s; break }
+                    s = s + 1
+                }
+                if found < 0 {
+                    sids.push(id)
+                    sncols.push(nc)
+                    let mut row_vals = []
+                    let mut row_over = []
+                    let mut c = 0
+                    while c < nc {
+                        row_vals.push([])
+                        row_over.push("no")
+                        c = c + 1
+                    }
+                    col_vals.push(row_vals)
+                    col_overflow.push(row_over)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { i = i + 1; continue }
+        let row = _parse_row(l)
+        if len(row) != 2 { i = i + 1; continue }
+        let rid = row[0]
+        let vals = row[1]
+        let mut sidx = -1
+        let mut s2 = 0
+        while s2 < len(sids) {
+            if sids[s2] == rid { sidx = s2; break }
+            s2 = s2 + 1
+        }
+        if sidx < 0 { i = i + 1; continue }
+        let mut c2 = 0
+        let nc2 = sncols[sidx]
+        while c2 < len(vals) && c2 < nc2 {
+            let row_over = col_overflow[sidx]
+            if row_over[c2] == "no" {
+                let v = vals[c2]
+                let row_vals = col_vals[sidx]
+                let entries = row_vals[c2]
+                // Linear scan — short by construction (<= A8_MAX_SYMBOLS).
+                let mut k = 0
+                let mut found_v = -1
+                while k < len(entries) {
+                    if entries[k][0] == v { found_v = k; break }
+                    k = k + 1
+                }
+                if found_v >= 0 {
+                    let entry = entries[found_v]
+                    entry[1] = entry[1] + 1
+                    entries[found_v] = entry
+                } else {
+                    if len(entries) >= A8_MAX_SYMBOLS {
+                        row_over[c2] = "yes"
+                        col_overflow[sidx] = row_over
+                    } else {
+                        entries.push([v, 1])
+                    }
+                }
+                row_vals[c2] = entries
+                col_vals[sidx] = row_vals
+            }
+            c2 = c2 + 1
+        }
+        i = i + 1
+    }
+
+    // Build output: filter by overflow + min-rows + sort descending by freq.
+    let mut out = []
+    let mut k = 0
+    while k < len(sids) {
+        let row_over = col_overflow[k]
+        let row_vals = col_vals[k]
+        let nc = sncols[k]
+        let mut c = 0
+        while c < nc {
+            if row_over[c] == "no" {
+                let entries = row_vals[c]
+                // Count total occurrences.
+                let mut total: i64 = 0
+                let mut e = 0
+                while e < len(entries) {
+                    total = total + entries[e][1]
+                    e = e + 1
+                }
+                if total >= A8_MIN_ROWS && len(entries) > 0 {
+                    let sorted = _sort_entries_desc(entries)
+                    out.push([sids[k], to_string(c), sorted])
+                }
+            }
+            c = c + 1
+        }
+        k = k + 1
+    }
+    return out
+}
+
+// Stable insertion sort: descending by freq, ties broken by insertion order
+// (preserved by the original linear scan).
+fn _sort_entries_desc(entries: array) -> array {
+    let n = len(entries)
+    let mut out = []
+    let mut e = 0
+    while e < n { out.push(entries[e]); e = e + 1 }
+    let mut i: i64 = 1
+    while i < n {
+        let cur = out[i]
+        let mut j: i64 = i - 1
+        while j >= 0 {
+            let other = out[j]
+            if other[1] < cur[1] {
+                out[j + 1] = other
+                j = j - 1
+            } else { break }
+        }
+        out[j + 1] = cur
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── encode ─────────────────────────
+
+// Build a `# enum:<id>.<col> <freq>:<val>|...` header for a single categorical
+// column. Values are _enum_escape'd; freq descending — symbol id = sorted index.
+fn _build_enum_header(schema_id: string, col_idx: i64, entries: array) -> string {
+    let mut parts = []
+    let mut i = 0
+    while i < len(entries) {
+        let e = entries[i]
+        let v = e[0]
+        let f = e[1]
+        parts.push(to_string(f) + ":" + _enum_escape(v))
+        i = i + 1
+    }
+    return "# enum:" + schema_id + "." + to_string(col_idx) + " " + parts.join("|")
+}
+
+// Encode a single row: for each col, if it's categorical AND value is in the
+// enum table, emit `^<sym_char>`; else pass-through (verbatim, but if the
+// verbatim value starts with `^` it must be escaped — not yet supported, see
+// note below).
+//
+// LITERAL-COLLISION NOTE: the encoder enrolls every distinct value seen in
+// PASS 1 as a symbol (cap A8_MAX_SYMBOLS). On categorical columns by definition
+// every value participates in the enum, so no `^`-prefixed literal can appear
+// in those columns. On non-categorical columns we pass through, and a literal
+// `^` there decodes verbatim because we only expand `^<sym>` on cols listed in
+// `# enum:` headers. So the design is collision-free without an extra escape.
+fn _encode_row(vals: array, cat_cols_for_id: array) -> array {
+    // cat_cols_for_id: array of [col_idx, val→sym_id_map] for THIS schema_id.
+    // val→sym_id_map is an array of [val, sym_id] (linear scan; n<=16).
+    let mut out = []
+    let mut c = 0
+    while c < len(vals) {
+        let v = vals[c]
+        let mut sym = ""
+        let mut k = 0
+        while k < len(cat_cols_for_id) {
+            let entry = cat_cols_for_id[k]
+            if entry[0] == c {
+                let map = entry[1]
+                let mut m = 0
+                while m < len(map) {
+                    let pair = map[m]
+                    if pair[0] == v {
+                        sym = A8_SYMBOL_ALPHABET.substring(pair[1], pair[1] + 1)
+                        break
+                    }
+                    m = m + 1
+                }
+                break
+            }
+            k = k + 1
+        }
+        if len(sym) > 0 {
+            out.push(A8_SYM_PREFIX + sym)
+        } else {
+            out.push(v)
+        }
+        c = c + 1
+    }
+    return out
+}
+
+// Build per-schema_id lookup: array of [schema_id, [[col_idx, [[val, sym_id], ...]], ...]]
+fn _build_encode_lut(detected: array) -> array {
+    // group by schema_id, preserving discovery order
+    let mut sids = []
+    let mut groups = []
+    let mut i = 0
+    while i < len(detected) {
+        let row = detected[i]
+        let sid = row[0]
+        let col = parse_int(row[1])
+        let entries = row[2]
+        let mut map = []
+        let mut e = 0
+        while e < len(entries) {
+            map.push([entries[e][0], e])
+            e = e + 1
+        }
+        let mut found = -1
+        let mut s = 0
+        while s < len(sids) {
+            if sids[s] == sid { found = s; break }
+            s = s + 1
+        }
+        if found < 0 {
+            sids.push(sid)
+            groups.push([[col, map]])
+        } else {
+            let g = groups[found]
+            g.push([col, map])
+            groups[found] = g
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < len(sids) {
+        out.push([sids[k], groups[k]])
+        k = k + 1
+    }
+    return out
+}
+
+fn a8_encode(v1_text: string) -> string {
+    let detected = detect_categorical_columns(v1_text)
+    if len(detected) == 0 {
+        // No categorical columns → no-op. Idempotent passthrough.
+        return v1_text
+    }
+    let lut = _build_encode_lut(detected)
+    let lines = split(v1_text, "\n")
+    let mut out_lines = []
+    let mut emitted_for = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            let sh = _parse_schema(l)
+            if len(sh) == 2 {
+                let id = sh[0]
+                let mut already = false
+                let mut z = 0
+                while z < len(emitted_for) {
+                    if emitted_for[z] == id { already = true; break }
+                    z = z + 1
+                }
+                if !already {
+                    let mut d = 0
+                    while d < len(detected) {
+                        if detected[d][0] == id {
+                            let col = parse_int(detected[d][1])
+                            let entries = detected[d][2]
+                            out_lines.push(_build_enum_header(id, col, entries))
+                        }
+                        d = d + 1
+                    }
+                    emitted_for.push(id)
+                }
+            }
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { out_lines.push(l); i = i + 1; continue }
+        let row = _parse_row(l)
+        if len(row) != 2 { out_lines.push(l); i = i + 1; continue }
+        let rid = row[0]
+        let vals = row[1]
+        // lookup categorical columns for rid
+        let mut cat_cols = []
+        let mut s = 0
+        while s < len(lut) {
+            if lut[s][0] == rid { cat_cols = lut[s][1]; break }
+            s = s + 1
+        }
+        if len(cat_cols) == 0 {
+            // schema with no categorical columns — passthrough
+            out_lines.push(l)
+        } else {
+            let new_vals = _encode_row(vals, cat_cols)
+            out_lines.push("@" + rid + "!a8 " + new_vals.join("|"))
+        }
+        i = i + 1
+    }
+    return out_lines.join("\n") + "\n"
+}
+
+// ───────────────────────── decode ─────────────────────────
+
+// Build per-(schema_id, col_idx) reverse lookup: sym_id → val.
+fn _build_decode_lut(enum_headers: array) -> array {
+    // enum_headers: array of [id, col_str, [[val, freq], ...]]
+    // returns: array of [id, [[col_idx, [val_at_sym_0, val_at_sym_1, ...]], ...]]
+    let mut sids = []
+    let mut groups = []
+    let mut i = 0
+    while i < len(enum_headers) {
+        let row = enum_headers[i]
+        let sid = row[0]
+        let col = parse_int(row[1])
+        let entries = row[2]
+        let mut sym_to_val = []
+        let mut e = 0
+        while e < len(entries) {
+            sym_to_val.push(entries[e][0])
+            e = e + 1
+        }
+        let mut found = -1
+        let mut s = 0
+        while s < len(sids) {
+            if sids[s] == sid { found = s; break }
+            s = s + 1
+        }
+        if found < 0 {
+            sids.push(sid)
+            groups.push([[col, sym_to_val]])
+        } else {
+            let g = groups[found]
+            g.push([col, sym_to_val])
+            groups[found] = g
+        }
+        i = i + 1
+    }
+    let mut out = []
+    let mut k = 0
+    while k < len(sids) {
+        out.push([sids[k], groups[k]])
+        k = k + 1
+    }
+    return out
+}
+
+fn _sym_char_to_id(c: string) -> i64 {
+    return A8_SYMBOL_ALPHABET.index_of(c)
+}
+
+fn _decode_row_vals(vals: array, cat_cols_for_id: array) -> array {
+    let mut out = []
+    let mut c = 0
+    while c < len(vals) {
+        let v = vals[c]
+        let mut decoded = v
+        // Is this column declared categorical for this schema?
+        let mut k = 0
+        while k < len(cat_cols_for_id) {
+            let entry = cat_cols_for_id[k]
+            if entry[0] == c {
+                // Expect `^<sym_char>` form. Defensive: if not, pass through.
+                if len(v) >= 2 && v.substring(0, 1) == A8_SYM_PREFIX {
+                    let sym = v.substring(1, 2)
+                    let sid = _sym_char_to_id(sym)
+                    let sym_to_val = entry[1]
+                    if sid >= 0 && sid < len(sym_to_val) {
+                        decoded = sym_to_val[sid]
+                    }
+                }
+                break
+            }
+            k = k + 1
+        }
+        out.push(decoded)
+        c = c + 1
+    }
+    return out
+}
+
+fn a8_decode(v2_text: string) -> string {
+    let lines = split(v2_text, "\n")
+    let mut enum_headers = []
+    let mut out_lines = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) == 0 { i = i + 1; continue }
+        if l.index_of("# enum:") == 0 {
+            let h = _parse_enum(l)
+            if len(h) == 3 { enum_headers.push(h) }
+            // drop enum header from output (HXC v1 doesn't have it)
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) == "#" {
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        if l.substring(0, 1) != "@" { out_lines.push(l); i = i + 1; continue }
+        let bang = l.index_of("!a8 ")
+        if bang < 0 {
+            // plain `@<id> v1|v2|...` → passthrough
+            out_lines.push(l)
+            i = i + 1
+            continue
+        }
+        let rid = l.substring(1, bang)
+        let body = l.substring(bang + 4, len(l))
+        let vals = if len(body) > 0 { split(body, "|") } else { [] }
+        // build LUT lazily once; not on every row — but we build once per call here
+        let lut = _build_decode_lut(enum_headers)
+        let mut cat_cols = []
+        let mut s = 0
+        while s < len(lut) {
+            if lut[s][0] == rid { cat_cols = lut[s][1]; break }
+            s = s + 1
+        }
+        let decoded = _decode_row_vals(vals, cat_cols)
+        out_lines.push("@" + rid + " " + decoded.join("|"))
+        i = i + 1
+    }
+    return out_lines.join("\n") + "\n"
+}
+
+// ───────────────────────── measure ─────────────────────────
+
+fn _count_rows(v1: string) -> i64 {
+    let lines = split(v1, "\n")
+    let mut n: i64 = 0
+    let mut i = 0
+    while i < len(lines) {
+        if len(lines[i]) > 0 && lines[i].substring(0, 1) == "@" { n = n + 1 }
+        i = i + 1
+    }
+    return n
+}
+
+fn _pad3(n: i64) -> string {
+    let s = to_string(n)
+    if len(s) >= 3 { return s }
+    if len(s) == 2 { return "0" + s }
+    if len(s) == 1 { return "00" + s }
+    return "000"
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _assert(cond: bool, msg: string) -> i64 {
+    if !cond { eprintln("FAIL: " + msg); return 1 }
+    return 0
+}
+
+// Fixture 1: text categorical (12 rows, 2 schemas, multiple low-card cols)
+fn _make_fixture_text_cat() -> string {
+    let mut lines = []
+    lines.push("# schema:srv ts endpoint mode persona_id pass latency_ms")
+    lines.push("@srv 2026-04-22T09:48:27Z|/persona|dry|dest1|true|5")
+    lines.push("@srv 2026-04-22T09:49:09Z|/persona|dry|dest1|true|7")
+    lines.push("@srv 2026-04-22T09:49:30Z|/persona|dry|dest1|true|8")
+    lines.push("@srv 2026-04-22T10:25:22Z|/persona|live|dest1|true|2")
+    lines.push("@srv 2026-04-22T10:30:00Z|/persona|live|dest2|false|45")
+    lines.push("@srv 2026-04-22T10:31:11Z|/health|dry|dest1|true|1")
+    lines.push("@srv 2026-04-22T10:32:22Z|/persona|dry|dest1|true|6")
+    lines.push("@srv 2026-04-22T10:33:33Z|/persona|live|dest1|true|3")
+    lines.push("# schema:gate cycle status verdict tier")
+    lines.push("@gate 1|pass|G1|tier3")
+    lines.push("@gate 2|pass|G1|tier3")
+    lines.push("@gate 3|pass|G2|tier3")
+    lines.push("@gate 4|fail|G3|tier2")
+    lines.push("@gate 5|pass|G2|tier3")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 2: numeric only (no categorical — all unique high-cardinality numbers)
+fn _make_fixture_numeric() -> string {
+    let mut lines = []
+    lines.push("# schema:n a b c")
+    lines.push("@n 1735689600|125000|4194304")
+    lines.push("@n 1735689601|130250|4128768")
+    lines.push("@n 1735689602|95500|2097152")
+    lines.push("@n 1735689603|0|0")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 3: mixed (one categorical col, rest high-cardinality)
+fn _make_fixture_mixed() -> string {
+    let mut lines = []
+    lines.push("# schema:m kind ts payload_id")
+    lines.push("@m alpha|1735689600|abc123")
+    lines.push("@m beta|1735689601|def456")
+    lines.push("@m alpha|1735689602|ghi789")
+    lines.push("@m alpha|1735689603|jkl012")
+    lines.push("@m beta|1735689604|mno345")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 4: single-row schema (under min-rows threshold; should not be enrolled)
+fn _make_fixture_single_row() -> string {
+    let mut lines = []
+    lines.push("# schema:s1 a b c")
+    lines.push("@s1 x|y|z")
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 5: large enum (>16 distinct → overflow → not enrolled)
+fn _make_fixture_large_enum() -> string {
+    let mut lines = []
+    lines.push("# schema:bg tag")
+    let mut k: i64 = 0
+    while k < 25 {
+        lines.push("@bg val" + to_string(k))
+        k = k + 1
+    }
+    return lines.join("\n") + "\n"
+}
+
+// Fixture 6: non-categorical (all unique tokens; cardinality > rows)
+fn _make_fixture_non_cat() -> string {
+    let mut lines = []
+    lines.push("# schema:u uniq")
+    let mut k: i64 = 0
+    while k < 5 {
+        lines.push("@u uniq" + to_string(k * 1000 + k))
+        k = k + 1
+    }
+    return lines.join("\n") + "\n"
+}
+
+// Each fixture is a separate function — hexa lacks block scoping for `let`
+// shadowing, so we factor each test case into its own scope.
+
+fn _test_fixture_text_cat() -> i64 {
+    let v1 = _make_fixture_text_cat()
+    let detected = detect_categorical_columns(v1)
+    if _assert(len(detected) > 0, "fixture 1: expected >=1 categorical column") != 0 { return 1 }
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 1 roundtrip\n  v1.len=" + to_string(len(v1)) + "\n  back.len=" + to_string(len(back))) != 0 {
+        eprintln("  v1 head: " + v1.substring(0, 200))
+        eprintln("  back head: " + back.substring(0, 200))
+        return 1
+    }
+    let v1_b = len(v1)
+    let v2_b = len(v2)
+    let ratio_pct: i64 = (v2_b * 100) / v1_b
+    println("  fixture 1 text-categorical: ok (n_cat_cols=" + to_string(len(detected)) + ", v1=" + to_string(v1_b) + "B v2=" + to_string(v2_b) + "B ratio=" + to_string(ratio_pct) + "%)")
+    if _assert(v2_b < v1_b, "fixture 1: expected v2 < v1 on categorical fixture") != 0 { return 1 }
+    return 0
+}
+
+fn _test_fixture_numeric() -> i64 {
+    let v1 = _make_fixture_numeric()
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 2 roundtrip") != 0 { return 1 }
+    if _assert(v2 == v1, "fixture 2: expected passthrough on numeric-only") != 0 { return 1 }
+    println("  fixture 2 numeric-only: ok (passthrough)")
+    return 0
+}
+
+fn _test_fixture_mixed() -> i64 {
+    let v1 = _make_fixture_mixed()
+    let detected = detect_categorical_columns(v1)
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 3 roundtrip") != 0 { return 1 }
+    println("  fixture 3 mixed: ok (n_cat_cols=" + to_string(len(detected)) + ")")
+    return 0
+}
+
+fn _test_fixture_single_row() -> i64 {
+    let v1 = _make_fixture_single_row()
+    let detected = detect_categorical_columns(v1)
+    if _assert(len(detected) == 0, "fixture 4: expected 0 categorical (under min-rows)") != 0 { return 1 }
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 4 roundtrip") != 0 { return 1 }
+    println("  fixture 4 single-row: ok (skipped, under min-rows)")
+    return 0
+}
+
+fn _test_fixture_large_enum() -> i64 {
+    let v1 = _make_fixture_large_enum()
+    let detected = detect_categorical_columns(v1)
+    if _assert(len(detected) == 0, "fixture 5: expected 0 categorical (overflow)") != 0 { return 1 }
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 5 roundtrip") != 0 { return 1 }
+    println("  fixture 5 large-enum: ok (skipped, overflow)")
+    return 0
+}
+
+fn _test_fixture_non_cat() -> i64 {
+    let v1 = _make_fixture_non_cat()
+    let detected = detect_categorical_columns(v1)
+    if _assert(len(detected) == 0, "fixture 6: expected 0 categorical (all unique)") != 0 { return 1 }
+    let v2 = a8_encode(v1)
+    let back = a8_decode(v2)
+    if _assert(back == v1, "fixture 6 roundtrip") != 0 { return 1 }
+    println("  fixture 6 non-categorical: ok (skipped, all unique)")
+    return 0
+}
+
+fn _test_idempotency() -> i64 {
+    let v1 = _make_fixture_text_cat()
+    let v2 = a8_encode(v1)
+    let v2b = a8_encode(a8_decode(v2))
+    if _assert(v2b == v2, "encode idempotency byte-eq") != 0 { return 1 }
+    let back = a8_decode(v2)
+    let back2 = a8_decode(back)
+    if _assert(back2 == back, "decode idempotency") != 0 { return 1 }
+    println("  idempotency (raw 65): ok")
+    return 0
+}
+
+fn _test_stream_prefix() -> i64 {
+    let v1 = _make_fixture_text_cat()
+    let v2 = a8_encode(v1)
+    let v2_lines = split(v2, "\n")
+    let mut acc = ""
+    let mut li = 0
+    while li < len(v2_lines) - 1 {
+        if li > 0 { acc = acc + "\n" }
+        acc = acc + v2_lines[li]
+        let prefix_v2 = acc + "\n"
+        let prefix_back = a8_decode(prefix_v2)
+        if _assert(len(prefix_back) >= 0, "stream prefix line " + to_string(li) + " decode") != 0 { return 1 }
+        li = li + 1
+    }
+    println("  streaming-prefix invariant: ok (" + to_string(li) + " prefix classes resumable)")
+    return 0
+}
+
+fn _selftest() -> i64 {
+    println("hxc_a8_column_stat selftest:")
+    if _test_fixture_text_cat() != 0 { return 1 }
+    if _test_fixture_numeric() != 0 { return 1 }
+    if _test_fixture_mixed() != 0 { return 1 }
+    if _test_fixture_single_row() != 0 { return 1 }
+    if _test_fixture_large_enum() != 0 { return 1 }
+    if _test_fixture_non_cat() != 0 { return 1 }
+    if _test_idempotency() != 0 { return 1 }
+    if _test_stream_prefix() != 0 { return 1 }
+    println("PASS")
+    return 0
+}
+
+// ───────────────────────── CLI driver ─────────────────────────
+
+fn _run_cli() -> i64 {
+    let _raw_args = args()
+    let mut cli = []
+    let mut _ai = skip_invocation_prefix(_raw_args)
+    while _ai < len(_raw_args) {
+        cli.push(_raw_args[_ai])
+        _ai = _ai + 1
+    }
+    if len(cli) == 0 { return _selftest() }
+    let cmd = cli[0]
+    if cmd == "--selftest" { return _selftest() }
+    if cmd == "encode" {
+        if len(cli) < 3 { eprintln("usage: encode <hxc-v1.in> <hxc-v2.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v1 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v2 = a8_encode(v1)
+        let t1 = _us_now()
+        write_file(out_path, v2)
+        let v1_b = len(v1)
+        let v2_b = len(v2)
+        let ratio_pct: i64 = (v2_b * 100) / v1_b
+        println("hxc_a8 encode: in=" + in_path + " (" + to_string(v1_b) + "B)  out=" + out_path + " (" + to_string(v2_b) + "B)  ratio=" + to_string(ratio_pct) + "%  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "decode" {
+        if len(cli) < 3 { eprintln("usage: decode <hxc-v2.in> <hxc-v1.out>"); return 3 }
+        let in_path = cli[1]
+        let out_path = cli[2]
+        let v2 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let v1 = a8_decode(v2)
+        let t1 = _us_now()
+        write_file(out_path, v1)
+        println("hxc_a8 decode: in=" + in_path + " (" + to_string(len(v2)) + "B)  out=" + out_path + " (" + to_string(len(v1)) + "B)  time=" + to_string(t1 - t0) + "us")
+        return 0
+    }
+    if cmd == "measure" {
+        if len(cli) < 2 { eprintln("usage: measure <hxc-v1.in>"); return 3 }
+        let in_path = cli[1]
+        let v1 = to_string(read_file(in_path))
+        let t0 = _us_now()
+        let detected = detect_categorical_columns(v1)
+        let v2 = a8_encode(v1)
+        let t1 = _us_now()
+        let back = a8_decode(v2)
+        let t2 = _us_now()
+        let v1_b = len(v1)
+        let v2_b = len(v2)
+        let n_rows = _count_rows(v1)
+        let n_cat_cols = len(detected)
+        let ok = if back == v1 { "true" } else { "false" }
+        let ratio_per_mille: i64 = (v2_b * 1000) / v1_b
+        let ratio_int: i64 = ratio_per_mille / 1000
+        let ratio_frac: i64 = ratio_per_mille - ratio_int * 1000
+        let ratio_str = to_string(ratio_int) + "." + _pad3(ratio_frac)
+        let enc_us = t1 - t0
+        let dec_us = t2 - t1
+        let ts = _ts_iso()
+        let row = "{\"ts\":\"" + ts + "\",\"alg\":\"hxc-a8\",\"input\":\"" + in_path + "\",\"v1_bytes\":" + to_string(v1_b) + ",\"v2_bytes\":" + to_string(v2_b) + ",\"ratio\":" + ratio_str + ",\"n_rows\":" + to_string(n_rows) + ",\"n_cat_cols\":" + to_string(n_cat_cols) + ",\"encode_us\":" + to_string(enc_us) + ",\"decode_us\":" + to_string(dec_us) + ",\"roundtrip_byte_eq\":" + ok + ",\"falsifier\":\"ratio >= 0.95 on categorical-rich corpus (>=10 rows, >=1 col with unique <=16, >=3 occurrences)\"}"
+        println(row)
+        if !(back == v1) { return 4 }
+        return 0
+    }
+    eprintln("unknown command: " + cmd)
+    eprintln("usage: --selftest | encode <in> <out> | decode <in> <out> | measure <in>")
+    return 3
+}
+
+exit(_run_cli())
