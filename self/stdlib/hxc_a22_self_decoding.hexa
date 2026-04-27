@@ -1,0 +1,369 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a22-self-decoding", desc="HXC algorithm A22: self-decoding artifact format (Phase 11 P3 first tick — PASS 1 footer emitter + parser + VM stub). Embeds decoder bytecode in artifact footer; consumers run a generic mini-VM (~50 LoC bootstrap) to decode. Closes raw 18 self-host fixpoint at the artifact level. PARTIAL: PASS 2 mini-VM full decode + LIVE FIRE round-trip deferred to tick 2.")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a22_self_decoding.hexa --selftest)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=PARTIAL-not-yet-implemented)
+//
+// Algorithm spec (raw 9 hexa-only · raw 18 self-host fixpoint · raw 65+68 idempotent):
+//   PASS 1 (footer emit): given a chain of (algo_id, param_blob) tuples, build mini-VM
+//                         bytecode (PUSH_ALGO/PUSH_PARAM/DECODE/EMIT/HALT), base94-encode,
+//                         emit "# decoder-spec v=A22-v1 size=N sha256=H\n<base94>\n# eof\n".
+//   PASS 1.5 (parse):     scan an artifact tail; locate "# decoder-spec" line; extract
+//                         size + sha256 + base94 line; (decode of base94 deferred — stub
+//                         returns size+sha verification only).
+//   PASS 2 (mini-VM):     execute bytecode against artifact body. STUB this tick.
+//
+// Tick 1 scope (this file): footer emitter + footer parser + mini-VM dispatch stub +
+// 1 selftest fixture (synthetic A1+A12+A14 chain footer round-trip). Remaining
+// ~250-300 LoC for full mini-VM decode + base94 decoder + LIVE FIRE deferred.
+//
+// Falsifiers (raw 71 contract; see docs/hxc_phase11_a22_design_20260428.md §6):
+//   F-A22-1: bytecode + footer overhead > 50% of compressed body on 1 KB fixture → reject
+//   F-A22-2: external decoder dependency residue at read time → reject
+//   F-A22-3: self-decode latency > 200ms / KB → reject
+//   F-A22-4: raw 18 fixpoint violated (bootstrap > 100 LoC OR non-hexa dep) → reject
+
+// @attr(complexity="O(N) emit + O(N) parse", memory="O(N) bytecode")
+
+const A22_FOOTER_VERSION = "A22-v1"
+const A22_OP_PUSH_ALGO  = 0x01
+const A22_OP_PUSH_PARAM = 0x02
+const A22_OP_DECODE     = 0x03
+const A22_OP_POP        = 0x04
+const A22_OP_EMIT       = 0x05
+const A22_OP_CHK        = 0x06
+const A22_OP_MARK       = 0x07
+const A22_OP_HALT       = 0x08
+
+// base94 alphabet: printable ASCII 33..126 minus '#' (35), space (32 implicit).
+// 94 chars total. Index = byte - 33 with skip on '#'.
+const A22_BASE94_LO = 33
+const A22_BASE94_HI = 126
+
+// ───────────────────────── byte/string helpers ─────────────────────────
+
+fn _str_to_bytes(s: string) -> array {
+    let mut out = []
+    let mut i = 0
+    let n = len(s)
+    while i < n { out.push(char_code(s, i)); i = i + 1 }
+    return out
+}
+
+fn _bytes_to_str(b: array) -> string {
+    let mut parts = []
+    let mut i = 0
+    while i < len(b) { parts.push(chr(b[i])); i = i + 1 }
+    return parts.join("")
+}
+
+fn _bytes_eq(a: array, b: array) -> bool {
+    if len(a) != len(b) { return false }
+    let mut i = 0
+    while i < len(a) {
+        if a[i] != b[i] { return false }
+        i = i + 1
+    }
+    return true
+}
+
+// ───────────────────────── base94 codec (encode only this tick) ─────────────────────────
+
+// Map base94 idx (0..93) to printable char code, skipping '#' (35).
+fn _b94_idx_to_char(idx: int) -> int {
+    let mut c = A22_BASE94_LO + idx
+    if c >= 35 { c = c + 1 }   // skip '#'
+    return c
+}
+
+// Encode a byte sequence as base94 ASCII line (no internal newlines).
+// Group of 4 base94 chars carries ~3.27 bytes; we pack pairwise: 2 bytes -> 3 base94
+// chars (94^3 = 830584 > 65536). This is a simple non-optimal mapping that keeps
+// emitter trivially under 30 LoC; tick-2 may switch to denser packing.
+fn _b94_encode(bytes: array) -> string {
+    let mut out = []
+    let mut i = 0
+    let n = len(bytes)
+    while i + 1 < n {
+        let v = bytes[i] * 256 + bytes[i + 1]   // 0..65535
+        let d2 = v / (94 * 94)
+        let d1 = (v / 94) % 94
+        let d0 = v % 94
+        out.push(_b94_idx_to_char(d2))
+        out.push(_b94_idx_to_char(d1))
+        out.push(_b94_idx_to_char(d0))
+        i = i + 2
+    }
+    if i < n {
+        // single trailing byte: 2 base94 chars (94^2 = 8836 > 256), MSB always 0.
+        let v = bytes[i]
+        let d1 = v / 94
+        let d0 = v % 94
+        out.push(_b94_idx_to_char(d1))
+        out.push(_b94_idx_to_char(d0))
+    }
+    return _bytes_to_str(out)
+}
+
+// ───────────────────────── SHA-256 stub (raw 9 — pure hexa hashing deferred) ─────────────
+
+// raw 91 honest C3: cron-host darwin shasum is invoked at LIVE FIRE; this tick uses a
+// 64-char placeholder so footer format remains byte-canonical. F-A22-2 measurement at
+// tick 2 will swap in a pure-hexa SHA-256 implementation (raw 9 + raw 18 mandate).
+fn _sha256_placeholder(bytes: array) -> string {
+    // Deterministic placeholder: hex of length-mod ladder (NOT cryptographic; tick 2 swap).
+    let n = len(bytes)
+    let mut acc = []
+    let hexd = "0123456789abcdef"
+    let mut i = 0
+    while i < 64 {
+        let m = (n + i * 31) % 16
+        acc.push(char_code(hexd, m))
+        i = i + 1
+    }
+    return _bytes_to_str(acc)
+}
+
+// ───────────────────────── PASS 1: footer emitter ─────────────────────────
+
+// Build mini-VM bytecode from a chain of (algo_id, param_bytes) tuples.
+// Returns array<int> of opcodes + operands.
+fn a22_build_bytecode(chain: array) -> array {
+    let mut bc = []
+    let mut i = 0
+    while i < len(chain) {
+        let step = chain[i]
+        let algo_id = step[0]
+        let param   = step[1]
+        // PUSH_ALGO algo_id
+        bc.push(A22_OP_PUSH_ALGO); bc.push(algo_id)
+        // PUSH_PARAM len_hi len_lo bytes...
+        let pl = len(param)
+        bc.push(A22_OP_PUSH_PARAM)
+        bc.push((pl / 256) % 256)
+        bc.push(pl % 256)
+        let mut j = 0
+        while j < pl { bc.push(param[j]); j = j + 1 }
+        // DECODE
+        bc.push(A22_OP_DECODE)
+        i = i + 1
+    }
+    bc.push(A22_OP_EMIT)
+    bc.push(A22_OP_HALT)
+    return bc
+}
+
+// Given bytecode bytes, emit the footer text (3 lines: header + base94 line + eof).
+fn a22_emit_footer(bytecode: array) -> string {
+    let n = len(bytecode)
+    let sha = _sha256_placeholder(bytecode)
+    let b94 = _b94_encode(bytecode)
+    let header = "# decoder-spec v=" + A22_FOOTER_VERSION + " size=" + to_string(n) + " sha256=" + sha
+    return "\n" + header + "\n" + b94 + "\n# eof\n"
+}
+
+// ───────────────────────── PASS 1.5: footer parser ─────────────────────────
+
+// Locate the "# decoder-spec" line in tail of artifact (last 8KB scanned).
+// Returns [header_line, base94_line, eof_present_bool] or ["", "", false] if absent.
+fn a22_parse_footer(artifact: string) -> array {
+    let needle = "\n# decoder-spec v=" + A22_FOOTER_VERSION
+    // Scan from rightmost occurrence (single-spec invariant — multiple = error).
+    let mut hit = -1
+    let mut count = 0
+    let nl = len(artifact)
+    let nn = len(needle)
+    let mut i = 0
+    while i + nn <= nl {
+        if artifact.substring(i, i + nn) == needle {
+            hit = i
+            count = count + 1
+        }
+        i = i + 1
+    }
+    if hit < 0 || count != 1 { return ["", "", false] }
+    // header line: from hit+1 (skip leading \n) to next \n
+    let header_start = hit + 1
+    let mut header_end = header_start
+    while header_end < nl && artifact.substring(header_end, header_end + 1) != "\n" {
+        header_end = header_end + 1
+    }
+    let header_line = artifact.substring(header_start, header_end)
+    // base94 line: from header_end+1 to next \n
+    let b94_start = header_end + 1
+    let mut b94_end = b94_start
+    while b94_end < nl && artifact.substring(b94_end, b94_end + 1) != "\n" {
+        b94_end = b94_end + 1
+    }
+    let b94_line = artifact.substring(b94_start, b94_end)
+    // eof check
+    let eof_marker = "# eof"
+    let mut eof_present = false
+    let tail_start = b94_end + 1
+    if tail_start + 5 <= nl && artifact.substring(tail_start, tail_start + 5) == eof_marker {
+        eof_present = true
+    }
+    return [header_line, b94_line, eof_present]
+}
+
+// Extract size + sha from header line "# decoder-spec v=A22-v1 size=N sha256=H".
+// Returns [size_int, sha_string] or [-1, ""] if malformed.
+fn a22_parse_header(header_line: string) -> array {
+    let sz_marker = "size="
+    let sh_marker = "sha256="
+    let sz_idx = header_line.find(sz_marker)
+    let sh_idx = header_line.find(sh_marker)
+    if sz_idx < 0 || sh_idx < 0 { return [-1, ""] }
+    let sz_start = sz_idx + len(sz_marker)
+    let mut sz_end = sz_start
+    while sz_end < len(header_line) && header_line.substring(sz_end, sz_end + 1) != " " {
+        sz_end = sz_end + 1
+    }
+    let sz_str = header_line.substring(sz_start, sz_end)
+    // parse decimal
+    let mut n = 0
+    let mut k = 0
+    while k < len(sz_str) {
+        let c = char_code(sz_str, k)
+        if c < 48 || c > 57 { return [-1, ""] }
+        n = n * 10 + (c - 48)
+        k = k + 1
+    }
+    let sh_start = sh_idx + len(sh_marker)
+    let sh_str = header_line.substring(sh_start, len(header_line))
+    if len(sh_str) != 64 { return [-1, ""] }
+    return [n, sh_str]
+}
+
+// ───────────────────────── PASS 2: mini-VM execution stub ─────────────────────────
+
+// Dispatch stub. Returns NOT_IMPLEMENTED sentinel string this tick.
+// Tick 2 will: (1) base94-decode bytecode, (2) iterate opcodes, (3) call into
+// hxc_a1_baseline / hxc_a12_column_prefix / hxc_a14_row_prefix decoders by algo_id.
+fn a22_vm_decode_stub(footer_parsed: array, body: string) -> string {
+    if len(footer_parsed) != 3 { return "__A22_VM_BAD_FOOTER__" }
+    if !footer_parsed[2] { return "__A22_VM_NO_EOF__" }
+    return "__A22_VM_STUB_TICK1__"
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _selftest() -> int {
+    println("# hxc_a22_self_decoding selftest (Phase 11 P3 tick 1)")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture 1: synthetic A1+A12+A14 chain → bytecode → footer → parse round-trip.
+    let chain = [
+        [0x01, []],                          // A1 baseline, no params
+        [0x0c, [0x01, 0x02, 0x03, 0x04]],    // A12 column-prefix, 4-byte param blob
+        [0x0e, [0xaa, 0xbb]]                 // A14 row-prefix, 2-byte param blob
+    ]
+    let bc = a22_build_bytecode(chain)
+    // Expected layout: 3 × (PUSH_ALGO + algo_id + PUSH_PARAM + lh + ll + param) + DECODE
+    //                  + EMIT + HALT
+    //   step1: 1+1 + 1+1+1 + 0       + 1 = 6
+    //   step2: 1+1 + 1+1+1 + 4       + 1 = 10
+    //   step3: 1+1 + 1+1+1 + 2       + 1 = 8
+    //   tail:  1 (EMIT) + 1 (HALT)        = 2
+    //   total = 26
+    if len(bc) == 26 && bc[0] == A22_OP_PUSH_ALGO && bc[1] == 0x01 &&
+       bc[len(bc) - 2] == A22_OP_EMIT && bc[len(bc) - 1] == A22_OP_HALT {
+        pass = pass + 1
+        println("  PASS: F1.1 bytecode build len=" + to_string(len(bc)) + " head/tail opcodes OK")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.1 bytecode build len=" + to_string(len(bc)) + " (expected 26)")
+    }
+
+    let footer = a22_emit_footer(bc)
+    // Footer must contain "# decoder-spec", a base94 line, "# eof".
+    let has_hdr = footer.find("# decoder-spec v=A22-v1") >= 0
+    let has_eof = footer.find("# eof") >= 0
+    let has_size = footer.find("size=" + to_string(len(bc))) >= 0
+    if has_hdr && has_eof && has_size {
+        pass = pass + 1
+        println("  PASS: F1.2 footer emit hdr+eof+size markers all present (footer_len=" + to_string(len(footer)) + ")")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.2 footer markers missing hdr=" + to_string(has_hdr) + " eof=" + to_string(has_eof) + " size=" + to_string(has_size))
+    }
+
+    // Fixture 2: parser round-trip — embed footer in synthetic body, parse back.
+    let body = "# schema:s1 a b c\n@s1|1|2|3\n@s1|4|5|6\n^Ddata\n"
+    let artifact = body + footer
+    let parsed = a22_parse_footer(artifact)
+    let header_line = parsed[0]
+    let b94_line = parsed[1]
+    let eof_ok = parsed[2]
+    if len(header_line) > 0 && len(b94_line) > 0 && eof_ok {
+        pass = pass + 1
+        println("  PASS: F1.3 footer parse hdr_len=" + to_string(len(header_line)) + " b94_len=" + to_string(len(b94_line)) + " eof=true")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.3 footer parse hdr_len=" + to_string(len(header_line)) + " b94_len=" + to_string(len(b94_line)) + " eof=" + to_string(eof_ok))
+    }
+
+    // Fixture 3: header decode (size + sha extraction).
+    let hdr_decoded = a22_parse_header(header_line)
+    let n_decoded = hdr_decoded[0]
+    let sha_decoded = hdr_decoded[1]
+    if n_decoded == len(bc) && len(sha_decoded) == 64 {
+        pass = pass + 1
+        println("  PASS: F1.4 header decode size=" + to_string(n_decoded) + " sha_len=" + to_string(len(sha_decoded)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.4 header decode size=" + to_string(n_decoded) + " (expected " + to_string(len(bc)) + ") sha_len=" + to_string(len(sha_decoded)))
+    }
+
+    // Fixture 4: F-A22-1 overhead measurement (informational this tick).
+    // For the synthetic 26-byte bytecode chain on a 1 KB body, footer overhead must
+    // be < 50% of body for non-tiny artifacts. Smaller fixtures are EXPECTED to
+    // regress (and that is the whole reason A22 lands as architecture seal, not
+    // compression candidate — see design doc §4 Pareto shift).
+    let kb_body_size = 1024
+    let overhead_pct = (len(footer) * 100) / kb_body_size
+    println("  INFO: F1.5 overhead 1KB body: footer=" + to_string(len(footer)) + "B = " + to_string(overhead_pct) + "% (F-A22-1 fires only on overhead > 50% of body)")
+    if overhead_pct < 50 {
+        pass = pass + 1
+        println("  PASS: F1.5 F-A22-1 clear on 1KB-body fixture (" + to_string(overhead_pct) + "% < 50%)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.5 F-A22-1 fires (" + to_string(overhead_pct) + "% >= 50%)")
+    }
+
+    // Fixture 5: mini-VM stub call (ensure stub returns sentinel, not crash).
+    let vm_out = a22_vm_decode_stub(parsed, body)
+    if vm_out == "__A22_VM_STUB_TICK1__" {
+        pass = pass + 1
+        println("  PASS: F1.6 mini-VM stub dispatch returns expected sentinel (tick 2 will replace with full decode)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1.6 mini-VM stub returned unexpected: " + vm_out)
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A22_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────────────── CLI entry (PARTIAL — PASS 2 mini-VM full decode deferred) ─────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    eprintln("hxc_a22_self_decoding: PARTIAL implementation (Phase 11 P3 tick 1)")
+    eprintln("  PASS 1 footer emitter: LIVE")
+    eprintln("  PASS 1.5 footer parser: LIVE")
+    eprintln("  PASS 2 mini-VM full decode + LIVE FIRE round-trip: DEFERRED to tick 2/3")
+    eprintln("usage: hexa hxc_a22_self_decoding.hexa --selftest")
+    exit(4)
+}
