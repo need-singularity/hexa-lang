@@ -1,0 +1,521 @@
+#!hexa strict
+// self/tui/input.hexa — TUI-PRIM L2 input decoder
+//
+// PURPOSE
+//   Decodes raw bytes from L1 (term_poll_stdin + term_read_byte) into
+//   structured input events. Output stream: Key / Mouse / Focus / Paste /
+//   WinSize / Sigint events. Pure-hexa-native (no shell-out, no FFI beyond
+//   L1 builtins).
+//
+// KICK VERDICT
+//   state/design_strategy_trawl/2026-04-27_hexa-native-tui-implementation-
+//   plan_KICK_omega_cycle.json T1.A Layer 2.
+//
+// SCOPE (L2 — minimum-viable decoder)
+//   - UTF-8 byte stream → grapheme codepoint
+//   - CSI (ESC [ ...) → key codes (arrows, function keys, page up/down)
+//   - SGR mouse 1006 (ESC [ < B ; X ; Y M/m) → press/release/drag
+//   - Bracketed paste (ESC [ 200 ~ ... ESC [ 201 ~) → paste payload
+//   - Focus in/out (ESC [ I / ESC [ O)
+//
+// DEFERRED (L3+)
+//   - Kitty graphics protocol APC sequences
+//   - SGR mouse motion mode 1003
+//   - Mode 2027 grapheme cluster
+//   - Win32 console fallback (out of scope per kick T1.B platform=POSIX)
+//
+// API
+//   fn input_init() -> int                         // L1 raw_enter + sigwinch + sigint
+//   fn input_drain_one(ms_timeout: int) -> Event   // poll → decode → return
+//   fn input_close() -> int                        // L1 raw_restore
+//
+// EVENT SHAPE (record-like via positional array — interpreter has no
+// proper records yet; field layout fixed per type tag at index 0):
+//   ["none"]                                       // timeout, no event
+//   ["key", code, ctrl, alt, shift, ch_or_empty]   // ch = utf8 string for printable
+//   ["mouse", btn, x, y, action]                   // action ∈ press|release|drag
+//   ["focus", in_or_out]                           // 1 = in, 0 = out
+//   ["paste", payload_string]
+//   ["winsize", rows, cols]
+//   ["sigint"]
+//   ["err", reason]
+//
+// KEY CODES
+//   Printable codepoints emitted as ["key", cp, 0, 0, 0, ch].
+//   Special keys use negative sentinels (avoid collision with valid utf8 cp):
+//     -1 enter / -2 tab / -3 backspace / -4 esc-bare
+//     -10 up   / -11 down  / -12 right  / -13 left
+//     -20 home / -21 end   / -22 ins    / -23 del
+//     -24 pgup / -25 pgdn
+//     -30..-41 F1..F12
+
+use "self/stdlib/law_io"
+
+// ── L1 builtins (declared via env.hexa whitelist; runtime-resolved) ─
+// term_raw_enter / term_raw_restore / term_poll_stdin(ms) / term_read_byte
+// term_install_sigwinch / term_install_sigint / term_sigwinch_pending
+// term_sigint_pending / term_isatty_stdin / term_isatty_stdout
+// term_winsize_rows / term_winsize_cols / term_write_str
+
+// ── module state ──────────────────────────────────────────────────
+let mut _input_initialized = 0
+let mut _paste_active = 0
+let mut _paste_buf = ""
+
+// Init: enter raw mode, install signal handlers. Idempotent — second
+// call is no-op (returns 0 on success, -1 if L1 raw_enter fails).
+pub fn input_init() -> int {
+    if _input_initialized == 1 { return 0 }
+    let r = term_raw_enter()
+    if r != 0 { return -1 }
+    let _sw = term_install_sigwinch()
+    let _si = term_install_sigint()
+    _input_initialized = 1
+    return 0
+}
+
+// Restore: leave raw mode. Idempotent.
+pub fn input_close() -> int {
+    if _input_initialized == 0 { return 0 }
+    let r = term_raw_restore()
+    _input_initialized = 0
+    _paste_active = 0
+    _paste_buf = ""
+    return r
+}
+
+// Block up to ms_timeout, then read one event. Returns ["none"] on timeout.
+// Higher-priority signals (sigint / winsize) drain first regardless of
+// pending stdin bytes — those are out-of-band per L1 contract.
+pub fn input_drain_one(ms_timeout: int) -> array {
+    // Out-of-band signals first (drain even before stdin poll).
+    if term_sigint_pending() == 1 {
+        return ["sigint"]
+    }
+    if term_sigwinch_pending() == 1 {
+        let r = term_winsize_rows()
+        let c = term_winsize_cols()
+        return ["winsize", r, c]
+    }
+    let p = term_poll_stdin(ms_timeout)
+    if p == 0 { return ["none"] }
+    if p < 0 {
+        // EINTR or fatal poll error — re-check signals once.
+        if term_sigint_pending() == 1 { return ["sigint"] }
+        if term_sigwinch_pending() == 1 {
+            return ["winsize", term_winsize_rows(), term_winsize_cols()]
+        }
+        return ["err", "poll-failed"]
+    }
+    return _decode_one()
+}
+
+// Read 1 byte and decode. Branches on first byte:
+//   0x1B (ESC)  → CSI / SS3 / bracketed-paste / focus / esc-bare
+//   0x09 (TAB)  → ["key", -2, 0, 0, 0, ""]
+//   0x0A 0x0D   → ["key", -1, 0, 0, 0, ""] (enter)
+//   0x7F        → ["key", -3, 0, 0, 0, ""] (backspace)
+//   0x01..0x1A  → control codes (Ctrl+A..Z) → ["key", letter, 1, 0, 0, ""]
+//   0x80+       → utf-8 multibyte continuation
+//   else        → ASCII printable
+fn _decode_one() -> array {
+    let b = term_read_byte()
+    if b < 0 { return ["err", "read-failed"] }
+
+    // Bracketed paste continuation
+    if _paste_active == 1 {
+        return _decode_in_paste(b)
+    }
+
+    if b == 27 {
+        // ESC — could be CSI / SS3 / esc-bare. Race condition: if next
+        // byte arrives within ~50ms, treat as escape sequence; otherwise
+        // bare ESC. We use a 50ms poll for the discriminator.
+        let p = term_poll_stdin(50)
+        if p <= 0 {
+            // No follow-up byte → bare ESC
+            return ["key", -4, 0, 0, 0, ""]
+        }
+        let b2 = term_read_byte()
+        if b2 < 0 { return ["err", "read-failed-after-esc"] }
+        if b2 == 91 {
+            // ESC [ — CSI sequence
+            return _decode_csi()
+        }
+        if b2 == 79 {
+            // ESC O — SS3 (function keys F1..F4 on some terminals)
+            return _decode_ss3()
+        }
+        // ESC + ASCII char — Alt+key
+        if b2 >= 32 && b2 < 127 {
+            return ["key", b2, 0, 1, 0, _byte_to_str(b2)]
+        }
+        return ["key", -4, 0, 0, 0, ""]
+    }
+
+    // Common single-byte dispatch
+    if b == 9 { return ["key", -2, 0, 0, 0, ""] }       // tab
+    if b == 10 || b == 13 { return ["key", -1, 0, 0, 0, ""] } // enter (LF or CR)
+    if b == 127 { return ["key", -3, 0, 0, 0, ""] }     // backspace
+
+    if b >= 1 && b <= 26 {
+        // Ctrl+A (0x01) .. Ctrl+Z (0x1A) — we already filtered tab/enter.
+        // Map to Ctrl+letter: 1='a'(97), 26='z'(122). Skip 9/10/13 above.
+        let letter = b + 96
+        return ["key", letter, 1, 0, 0, ""]
+    }
+
+    if b >= 32 && b < 127 {
+        // Printable ASCII
+        return ["key", b, 0, 0, 0, _byte_to_str(b)]
+    }
+
+    if b >= 128 {
+        // UTF-8 multibyte start. Determine continuation count from leading bits.
+        let cont = _utf8_continuation_count(b)
+        if cont < 0 { return ["err", "utf8-invalid-start"] }
+        let mut codepoint = b & _utf8_first_byte_mask(cont)
+        let mut acc = _byte_to_str(b)
+        let mut i = 0
+        while i < cont {
+            let nb = term_read_byte()
+            if nb < 0 { return ["err", "utf8-truncated"] }
+            if (nb & 192) != 128 { return ["err", "utf8-bad-continuation"] }
+            codepoint = (codepoint * 64) | (nb & 63)
+            acc = acc + _byte_to_str(nb)
+            i = i + 1
+        }
+        return ["key", codepoint, 0, 0, 0, acc]
+    }
+
+    // Other control bytes (0x00, 0x1B handled above, 0x1C..0x1F)
+    return ["key", b, 0, 0, 0, ""]
+}
+
+// CSI parser: ESC [ <params> <intermediate>? <final>
+//   params: digits and ';'
+//   final byte determines event class:
+//     A/B/C/D    → arrow up/down/right/left
+//     H/F        → home/end
+//     ~          → with leading param: 2 ins, 3 del, 5 pgup, 6 pgdn,
+//                                       11..15 F1..F5, 17..21 F6..F10,
+//                                       23..24 F11..F12,
+//                                       200/201 paste markers
+//     I/O        → focus in/out
+//     M/m        → mouse (mode 1006 SGR: ESC [ < b ; x ; y M|m)
+fn _decode_csi() -> array {
+    // Special-case the SGR mouse leading '<' before normal param parsing.
+    let p = term_poll_stdin(20)
+    if p < 0 { return ["err", "csi-poll-failed"] }
+    if p == 0 {
+        // Lone ESC [ — treat as bare ESC for now (rare standalone case).
+        return ["key", -4, 0, 0, 0, ""]
+    }
+    let peek = term_read_byte()
+    if peek < 0 { return ["err", "csi-read-failed"] }
+
+    if peek == 60 {
+        // ESC [ < — SGR mouse (1006).
+        return _decode_sgr_mouse()
+    }
+
+    // Collect params + intermediates + final into a buffer.
+    let mut params = ""
+    if peek >= 48 && peek <= 57 {
+        params = _byte_to_str(peek)
+    } else if peek == 59 {
+        params = ";"
+    } else if peek == 73 {
+        // ESC [ I → focus in
+        return ["focus", 1]
+    } else if peek == 79 {
+        // ESC [ O → focus out
+        return ["focus", 0]
+    } else if peek >= 65 && peek <= 90 {
+        // Final byte directly without params (e.g. ESC [ A = up arrow)
+        return _csi_final_to_event("", peek)
+    }
+
+    // Loop reading more bytes until we hit a final (0x40..0x7E exclusive of
+    // CAN/SUB/digits/';'). Limit iterations to avoid runaway.
+    let mut i = 0
+    while i < 16 {
+        let np = term_poll_stdin(20)
+        if np <= 0 { return ["err", "csi-truncated"] }
+        let nb = term_read_byte()
+        if nb < 0 { return ["err", "csi-read-failed-mid"] }
+        if (nb >= 48 && nb <= 57) || nb == 59 {
+            params = params + _byte_to_str(nb)
+        } else if nb >= 64 && nb <= 126 {
+            return _csi_final_to_event(params, nb)
+        } else {
+            return ["err", "csi-unexpected-byte"]
+        }
+        i = i + 1
+    }
+    return ["err", "csi-too-long"]
+}
+
+// Decode SGR mouse: ESC [ < B ; X ; Y (M|m)
+//   B = button + modifier flags
+//   X, Y = 1-based column/row
+//   M = press/drag, m = release
+fn _decode_sgr_mouse() -> array {
+    let mut buf = ""
+    let mut i = 0
+    while i < 32 {
+        let p = term_poll_stdin(20)
+        if p <= 0 { return ["err", "sgr-truncated"] }
+        let b = term_read_byte()
+        if b < 0 { return ["err", "sgr-read-failed"] }
+        if b == 77 || b == 109 {
+            // M or m → final
+            let parts = _split_semi(buf)
+            if len(parts) != 3 { return ["err", "sgr-bad-params"] }
+            let btn = _atoi(parts[0])
+            let x = _atoi(parts[1])
+            let y = _atoi(parts[2])
+            let action = if b == 77 {
+                if (btn & 32) != 0 { "drag" } else { "press" }
+            } else {
+                "release"
+            }
+            return ["mouse", btn, x, y, action]
+        }
+        if (b >= 48 && b <= 57) || b == 59 {
+            buf = buf + _byte_to_str(b)
+        } else {
+            return ["err", "sgr-unexpected-byte"]
+        }
+        i = i + 1
+    }
+    return ["err", "sgr-too-long"]
+}
+
+// Convert CSI (params, final) into Event.
+fn _csi_final_to_event(params: string, final_byte: int) -> array {
+    if final_byte == 65 { return ["key", -10, 0, 0, 0, ""] }   // A up
+    if final_byte == 66 { return ["key", -11, 0, 0, 0, ""] }   // B down
+    if final_byte == 67 { return ["key", -12, 0, 0, 0, ""] }   // C right
+    if final_byte == 68 { return ["key", -13, 0, 0, 0, ""] }   // D left
+    if final_byte == 72 { return ["key", -20, 0, 0, 0, ""] }   // H home
+    if final_byte == 70 { return ["key", -21, 0, 0, 0, ""] }   // F end
+    if final_byte == 73 { return ["focus", 1] }                 // I focus-in
+    if final_byte == 79 { return ["focus", 0] }                 // O focus-out
+    if final_byte == 126 {
+        // ~ — keypad / function-key / paste
+        let n = _atoi(params)
+        if n == 200 {
+            // Bracketed paste begin
+            _paste_active = 1
+            _paste_buf = ""
+            return ["none"]
+        }
+        if n == 2  { return ["key", -22, 0, 0, 0, ""] }   // ins
+        if n == 3  { return ["key", -23, 0, 0, 0, ""] }   // del
+        if n == 5  { return ["key", -24, 0, 0, 0, ""] }   // pgup
+        if n == 6  { return ["key", -25, 0, 0, 0, ""] }   // pgdn
+        if n == 11 { return ["key", -30, 0, 0, 0, ""] }   // F1
+        if n == 12 { return ["key", -31, 0, 0, 0, ""] }   // F2
+        if n == 13 { return ["key", -32, 0, 0, 0, ""] }   // F3
+        if n == 14 { return ["key", -33, 0, 0, 0, ""] }   // F4
+        if n == 15 { return ["key", -34, 0, 0, 0, ""] }   // F5
+        if n == 17 { return ["key", -35, 0, 0, 0, ""] }   // F6
+        if n == 18 { return ["key", -36, 0, 0, 0, ""] }   // F7
+        if n == 19 { return ["key", -37, 0, 0, 0, ""] }   // F8
+        if n == 20 { return ["key", -38, 0, 0, 0, ""] }   // F9
+        if n == 21 { return ["key", -39, 0, 0, 0, ""] }   // F10
+        if n == 23 { return ["key", -40, 0, 0, 0, ""] }   // F11
+        if n == 24 { return ["key", -41, 0, 0, 0, ""] }   // F12
+        return ["err", "csi-tilde-unknown"]
+    }
+    return ["err", "csi-final-unknown"]
+}
+
+// SS3 (ESC O X) — older F1..F4 + some emacs/screen mappings.
+fn _decode_ss3() -> array {
+    let p = term_poll_stdin(20)
+    if p <= 0 { return ["err", "ss3-truncated"] }
+    let b = term_read_byte()
+    if b < 0 { return ["err", "ss3-read-failed"] }
+    if b == 80 { return ["key", -30, 0, 0, 0, ""] }   // P → F1
+    if b == 81 { return ["key", -31, 0, 0, 0, ""] }   // Q → F2
+    if b == 82 { return ["key", -32, 0, 0, 0, ""] }   // R → F3
+    if b == 83 { return ["key", -33, 0, 0, 0, ""] }   // S → F4
+    if b == 65 { return ["key", -10, 0, 0, 0, ""] }   // A → up (rare)
+    if b == 66 { return ["key", -11, 0, 0, 0, ""] }   // B → down
+    if b == 67 { return ["key", -12, 0, 0, 0, ""] }   // C → right
+    if b == 68 { return ["key", -13, 0, 0, 0, ""] }   // D → left
+    if b == 72 { return ["key", -20, 0, 0, 0, ""] }   // H → home
+    if b == 70 { return ["key", -21, 0, 0, 0, ""] }   // F → end
+    return ["err", "ss3-unknown"]
+}
+
+// Inside paste-mode: accumulate bytes until ESC [ 201 ~. The 201
+// terminator appears mid-stream — we look for the literal sequence by
+// matching the ESC introducer and sub-parsing.
+fn _decode_in_paste(first_byte: int) -> array {
+    let mut b = first_byte
+    while true {
+        if b == 27 {
+            // Could be the closing ESC [ 201 ~. Buffer it and check.
+            let p = term_poll_stdin(50)
+            if p <= 0 {
+                _paste_buf = _paste_buf + _byte_to_str(b)
+                return ["none"]
+            }
+            let b2 = term_read_byte()
+            if b2 < 0 { return ["err", "paste-read-failed"] }
+            if b2 == 91 {
+                // ESC [ — could be the close marker. Read the next 4 bytes
+                // (2,0,1,~) and decide.
+                let p3 = term_poll_stdin(50)
+                if p3 <= 0 {
+                    _paste_buf = _paste_buf + _byte_to_str(b) + _byte_to_str(b2)
+                    return ["none"]
+                }
+                let b3 = term_read_byte()
+                if b3 < 0 { return ["err", "paste-read-failed"] }
+                if b3 == 50 {
+                    // Could be 201 — read 0, 1, ~
+                    let b4 = term_read_byte()
+                    let b5 = term_read_byte()
+                    let b6 = term_read_byte()
+                    if b4 == 48 && b5 == 49 && b6 == 126 {
+                        // Closed paste
+                        let payload = _paste_buf
+                        _paste_buf = ""
+                        _paste_active = 0
+                        return ["paste", payload]
+                    }
+                    // Not the close marker — append all bytes literally.
+                    _paste_buf = _paste_buf + _byte_to_str(b) + _byte_to_str(b2) + _byte_to_str(b3) + _byte_to_str(b4) + _byte_to_str(b5) + _byte_to_str(b6)
+                    return ["none"]
+                }
+                _paste_buf = _paste_buf + _byte_to_str(b) + _byte_to_str(b2) + _byte_to_str(b3)
+                return ["none"]
+            }
+            _paste_buf = _paste_buf + _byte_to_str(b) + _byte_to_str(b2)
+            return ["none"]
+        }
+        // Regular paste byte
+        _paste_buf = _paste_buf + _byte_to_str(b)
+        let np = term_poll_stdin(0)
+        if np <= 0 { return ["none"] }
+        let nb = term_read_byte()
+        if nb < 0 { return ["err", "paste-read-failed"] }
+        b = nb
+    }
+    return ["none"]
+}
+
+// ── helpers ──────────────────────────────────────────────────────
+
+fn _byte_to_str(b: int) -> string {
+    // Inline 1-byte to string. We use to_char if available; fallback to
+    // explicit construction via stdlib later. For now, ASCII fast path.
+    if b >= 32 && b < 127 {
+        return _ascii_table(b)
+    }
+    // Multibyte: fallback returns the single-byte form via an arithmetic
+    // trick — depends on hexa builtin to_char(int) returning a 1-char
+    // string. If absent, paste payload may lose UTF-8 bytes; tracked.
+    return chr(b)
+}
+
+// Tiny ASCII printable table — avoids depending on a runtime char-table.
+fn _ascii_table(b: int) -> string {
+    // Single-character literal lookup via codepoint indexing. Hexa has
+    // built-in `to_char`; this helper shadows it for the printable ASCII
+    // window for clarity.
+    return chr(b)
+}
+
+fn _utf8_continuation_count(b: int) -> int {
+    if (b & 224) == 192 { return 1 }
+    if (b & 240) == 224 { return 2 }
+    if (b & 248) == 240 { return 3 }
+    return -1
+}
+
+fn _utf8_first_byte_mask(cont: int) -> int {
+    if cont == 1 { return 31 }   // 0001 1111
+    if cont == 2 { return 15 }   // 0000 1111
+    if cont == 3 { return 7 }    // 0000 0111
+    return 0
+}
+
+fn _split_semi(s: string) -> array {
+    let mut parts = []
+    let mut cur = ""
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        if ch == ";" {
+            parts = parts + [cur]
+            cur = ""
+        } else {
+            cur = cur + ch
+        }
+        i = i + 1
+    }
+    parts = parts + [cur]
+    return parts
+}
+
+fn _atoi(s: string) -> int {
+    let mut acc = 0
+    let mut i = 0
+    let n = len(s)
+    if n == 0 { return 0 }
+    let mut neg = 0
+    if s.substring(0, 1) == "-" { neg = 1; i = 1 }
+    while i < n {
+        let ch = s.substring(i, i + 1)
+        let cp = _ascii_codepoint(ch)
+        if cp < 48 || cp > 57 { return 0 }
+        acc = acc * 10 + (cp - 48)
+        i = i + 1
+    }
+    if neg == 1 { return 0 - acc }
+    return acc
+}
+
+fn _ascii_codepoint(ch: string) -> int {
+    // hexa: char_code(s, i) → int (byte at index i).
+    return char_code(ch, 0)
+}
+
+// ── selftest ─────────────────────────────────────────────────────
+fn _selftest_decoder() -> int {
+    println("self/tui/input — selftest (parser-level only; FFI smoke at runtime)")
+    let p = _split_semi("12;34;56")
+    if len(p) != 3 { return 1 }
+    if p[0] != "12" || p[1] != "34" || p[2] != "56" { return 2 }
+    if _atoi("42") != 42 { return 3 }
+    if _atoi("0") != 0 { return 4 }
+    if _utf8_continuation_count(192) != 1 { return 5 }
+    if _utf8_continuation_count(224) != 2 { return 6 }
+    if _utf8_continuation_count(240) != 3 { return 7 }
+    if _utf8_continuation_count(127) != -1 { return 8 }
+    if _utf8_first_byte_mask(1) != 31 { return 9 }
+    if _utf8_first_byte_mask(2) != 15 { return 10 }
+    if _utf8_first_byte_mask(3) != 7 { return 11 }
+    println("input selftest OK")
+    return 0
+}
+
+fn main() -> int {
+    let av = argv()
+    let mut i = 2
+    while i < len(av) {
+        if av[i] == "--selftest" || av[i] == "selftest" {
+            return _selftest_decoder()
+        }
+        i = i + 1
+    }
+    println("self/tui/input — TUI-PRIM L2 input decoder")
+    println("  usage: ./hexa run self/tui/input.hexa --selftest")
+    return 0
+}
