@@ -238,6 +238,105 @@ int term_isatty_stdout(void) {
     return isatty(STDOUT_FILENO) ? 1 : 0;
 }
 
+/* ─── PTY harness primitives (forward-only "real PTY harness" closure) ─── */
+
+#if defined(__APPLE__) || defined(__linux__)
+#  if defined(__APPLE__)
+#    include <util.h>          /* forkpty */
+#  else
+#    include <pty.h>           /* forkpty (libutil) on Linux */
+#  endif
+#  include <sys/wait.h>
+#endif
+
+/* Spawn a command in a pseudo-terminal slave. Returns master fd; child
+ * runs argv via execvp. On error returns -1. The pid is stored in
+ * *out_pid. The slave terminal has the requested winsize.
+ *
+ * Caller flow:
+ *   int pid = 0;
+ *   int mfd = term_pty_spawn(["/bin/sh", "-c", "echo hi", NULL], 24, 80, &pid);
+ *   // write to mfd to drive child stdin; read mfd to consume stdout/err
+ *   waitpid(pid, &status, 0);
+ *   close(mfd);
+ *
+ * Caller is responsible for closing mfd + reaping the child.
+ */
+int term_pty_spawn(const char *const argv[], int rows, int cols, int *out_pid) {
+#if defined(__APPLE__) || defined(__linux__)
+    if (out_pid) *out_pid = -1;
+    if (!argv || !argv[0]) return -1;
+    struct winsize ws = {0};
+    ws.ws_row = (unsigned short)(rows > 0 ? rows : 24);
+    ws.ws_col = (unsigned short)(cols > 0 ? cols : 80);
+    int mfd = -1;
+    pid_t pid = forkpty(&mfd, NULL, NULL, &ws);
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        /* child: execvp into argv. cast to char *const * for execvp signature. */
+        execvp(argv[0], (char *const *)argv);
+        /* if exec fails, exit immediately */
+        _exit(127);
+    }
+    if (out_pid) *out_pid = (int)pid;
+    return mfd;
+#else
+    (void)argv; (void)rows; (void)cols; (void)out_pid;
+    return -1;
+#endif
+}
+
+/* Read up to max_bytes from an fd. Returns count read, 0 on EOF, -1
+ * on error. Non-blocking when fd is set O_NONBLOCK. */
+int term_fd_read(int fd, unsigned char *buf, int max_bytes) {
+    if (fd < 0 || !buf || max_bytes <= 0) return -1;
+    ssize_t n = read(fd, buf, (size_t)max_bytes);
+    if (n < 0) return -1;
+    return (int)n;
+}
+
+/* Write n bytes to fd. Returns count written, -1 on error. */
+int term_fd_write(int fd, const unsigned char *buf, int n) {
+    if (fd < 0 || !buf || n < 0) return -1;
+    ssize_t w = write(fd, buf, (size_t)n);
+    if (w < 0) return -1;
+    return (int)w;
+}
+
+int term_fd_close(int fd) {
+    return close(fd);
+}
+
+/* Non-blocking poll on fd — returns 1 if readable, 0 on timeout, -1 on error. */
+int term_fd_poll(int fd, int timeout_ms) {
+    if (fd < 0) return -1;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN, .revents = 0 };
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc < 0) return -1;
+    if (rc == 0) return 0;
+    if (pfd.revents & (POLLIN | POLLHUP)) return 1;
+    return 0;
+}
+
+/* Reap a child non-blockingly. Returns:
+ *   1  if child exited (status stored in *out_status)
+ *   0  if still running
+ *  -1  on error (pid invalid, etc.)
+ */
+int term_pty_reap(int pid, int *out_status) {
+#if defined(__APPLE__) || defined(__linux__)
+    int st = 0;
+    pid_t r = waitpid((pid_t)pid, &st, WNOHANG);
+    if (r < 0) return -1;
+    if (r == 0) return 0;
+    if (out_status) *out_status = st;
+    return 1;
+#else
+    (void)pid; (void)out_status;
+    return -1;
+#endif
+}
+
 /* ═══════════════════════════════════════════════════════════════════
  * SMOKE TEST — compile with -DTERM_FFI_SMOKE
  *
