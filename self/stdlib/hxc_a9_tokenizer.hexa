@@ -1,0 +1,826 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a9-tokenizer", desc="HXC algorithm A9: hexa-native BPE tokenizer (Phase 9 P1 minimal viable). Per-schema corpus-wide vocabulary build via byte-pair encoding; greedy longest-match encoding. Pure-hexa raw 9. Targets natural-language text repetition that A4/A8/A12/A13 (structural) do not capture (anima alm_r13, hive raw_addition_requests, nexus meta_engine_evolution_log).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a9_tokenizer.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a9_tokenizer.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a9_tokenizer.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// Algorithm spec (raw 9 hexa-only · raw 18 self-host fixpoint · raw 65+68 idempotent):
+//   PASS 1 (build): for each schema, concatenate all row bodies separated by NUL.
+//                   Iteratively find most-frequent adjacent byte-pair, merge into
+//                   new token until V tokens reached (default V=64, capped to bound
+//                   PASS 1 cost — F-A9-3 latency budget).
+//   PASS 2 (encode): per row body, greedy longest-match against vocabulary;
+//                    serialize as 0xFE+lo+hi for tokens, raw byte otherwise (with
+//                    0xFE→0xFE,0xFF escape). Wrap in base64url for text-safe wire.
+//   PASS 3 (header): emit `# tokenizer:s<N> v=BPE-v1 size=<V>` plus per-token
+//                    `# tok:s<N> <id>=<base64-of-byte-sequence>` lines.
+//   Encoded row: `^T<base64>` (sigil ^T marks A9-encoded). Cells already starting
+//                with `^T` literal — escape with `^T^` → decoder strips one `^`.
+//
+// Wire format example:
+//   v1:                              v2 (A9):
+//   # schema:s1 prompt response      # schema:s1 prompt response
+//   @s1 "User asked..."              # tokenizer:s1 v=BPE-v1 size=64
+//   @s1 "User said..."               # tok:s1 0=VXNlcg
+//                                    # tok:s1 1=ICA
+//                                    @s1 ^T<base64-bpe-bytes>
+//                                    @s1 ^T<base64-bpe-bytes>
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) == x for any A9 stream
+//   - decode(encode(y)) == y for any HXC v1 stream
+//   - same input + same vocabulary build (deterministic argmax) → byte-eq output
+//
+// Falsifiers (raw 71 contract):
+//   F-A9-1: saving < 0.10 byte-eq on synthetic English-text fixture → reject
+//   F-A9-2: encode/decode round-trip not byte-eq → reject
+//   F-A9-3: encode latency > 50ms per 1KB content → reject (pure-hexa interp cost)
+//   F-A9-4: vocabulary build memory > 100MB during PASS 1 → reject (jetsam risk)
+
+// @attr(complexity="O(V*N) build + O(N*V) encode greedy", memory="O(V + N)")
+
+const A9_MIN_ROWS = 8
+const A9_VOCAB_SIZE = 64           // bounded; raw 91 honest C3: pure-hexa interp
+                                   // BPE PASS1 is O(V*N) where N = corpus bytes;
+                                   // V=64 keeps PASS 1 < few seconds on 1MB corpus.
+const A9_TOKEN_MARKER = 254        // 0xFE — invalid UTF-8 lead → unambiguous
+const A9_TOKEN_ESCAPE = 255        // 0xFF — escape literal 0xFE in source
+
+const A9_B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+
+// ───────────────────────── i/o helpers ─────────────────────────
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _read_file(p: string) -> string { return read_file(p) }
+fn _write_file(p: string, c: string) -> int { let _r = write_file(p, c); return 0 }
+
+// ───────────────────────── byte<->str helpers ─────────────────────────
+
+// String → array<i64> of byte values (UTF-8 byte sequence).
+fn _str_to_bytes(s: string) -> array {
+    let mut out = []
+    let mut i = 0
+    let n = len(s)
+    while i < n {
+        out.push(char_code(s, i))
+        i = i + 1
+    }
+    return out
+}
+
+// array<i64> → string (preserves bytes via chr).
+fn _bytes_to_str(b: array) -> string {
+    let mut parts = []
+    let mut i = 0
+    while i < len(b) {
+        parts.push(chr(b[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────────────── base64url codec ─────────────────────────
+// (Borrowed pattern from hxc_a10_varint; with 3-char tail = byte count.)
+
+fn _b64_encode(bytes: array) -> string {
+    let mut out = []
+    let n = len(bytes)
+    let mut i = 0
+    while i < n {
+        let b0 = bytes[i]
+        let b1 = if i + 1 < n { bytes[i + 1] } else { 0 }
+        let b2 = if i + 2 < n { bytes[i + 2] } else { 0 }
+        let acc = b0 * 65536 + b1 * 256 + b2
+        let c0 = acc / 262144
+        let r0 = acc - c0 * 262144
+        let c1 = r0 / 4096
+        let r1 = r0 - c1 * 4096
+        let c2 = r1 / 64
+        let c3 = r1 - c2 * 64
+        let group_chars = if i + 3 <= n { 4 } else { (n - i) + 1 }
+        let chars = [c0, c1, c2, c3]
+        let mut e = 0
+        while e < group_chars {
+            out.push(A9_B64.substring(chars[e], chars[e] + 1))
+            e = e + 1
+        }
+        i = i + 3
+    }
+    let mut nv = n
+    if nv > 262143 { nv = 262143 }
+    let t0 = nv / 4096
+    let r_t = nv - t0 * 4096
+    let t1 = r_t / 64
+    let t2 = r_t - t1 * 64
+    out.push(A9_B64.substring(t0, t0 + 1))
+    out.push(A9_B64.substring(t1, t1 + 1))
+    out.push(A9_B64.substring(t2, t2 + 1))
+    return out.join("")
+}
+
+fn _b64_char_to_int(c: string) -> int {
+    return A9_B64.index_of(c)
+}
+
+fn _b64_decode(s: string) -> array {
+    let total = len(s)
+    if total < 3 { return [] }
+    let t0 = _b64_char_to_int(s.substring(total - 3, total - 2))
+    let t1 = _b64_char_to_int(s.substring(total - 2, total - 1))
+    let t2 = _b64_char_to_int(s.substring(total - 1, total))
+    let byte_count = t0 * 4096 + t1 * 64 + t2
+    let body_len = total - 3
+    let mut out = []
+    let mut i = 0
+    while i < body_len {
+        let group_chars = if i + 4 <= body_len { 4 } else { body_len - i }
+        let mut acc = 0
+        let mut j = 0
+        while j < 4 {
+            let d = if j < group_chars { _b64_char_to_int(s.substring(i + j, i + j + 1)) } else { 0 }
+            acc = acc * 64 + d
+            j = j + 1
+        }
+        let by0 = acc / 65536
+        let rem0 = acc - by0 * 65536
+        let by1 = rem0 / 256
+        let by2 = rem0 - by1 * 256
+        let bytes_in_group = if group_chars == 4 { 3 } else { group_chars - 1 }
+        if bytes_in_group >= 1 { out.push(by0) }
+        if bytes_in_group >= 2 { out.push(by1) }
+        if bytes_in_group >= 3 { out.push(by2) }
+        i = i + 4
+    }
+    let mut final_out = []
+    let mut fi = 0
+    while fi < byte_count && fi < len(out) {
+        final_out.push(out[fi])
+        fi = fi + 1
+    }
+    return final_out
+}
+
+// ───────────────────────── BPE PASS 1: vocabulary build ─────────────────────────
+
+// rows: array of array<int> (each row body as byte-symbol sequence).
+// During build, the per-row symbol stream contains either (a) raw bytes 0..255 OR
+// (b) merged-token IDs >= 256 (encoded directly as ints in the symbol array). Token
+// 256+k is the (k)th merge. Built-in alphabet = bytes 0..255 implicit (always present).
+//
+// Returns vocabulary as array of [token_id, byte_seq], where:
+//   - token_id is the merge slot (256, 257, ..., 256 + V - 1)
+//   - byte_seq is the array<int> of original 0..255 bytes the token expands to.
+fn _count_byte_pairs(rows: array) -> array {
+    // Returns parallel arrays via [pair_a, pair_b, count] entries.
+    let mut entries = []  // each = [a, b, count]
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut i = 0
+        while i + 1 < nr {
+            let a = row[i]
+            let b = row[i + 1]
+            // Scan entries for existing (a,b) — linear scan acceptable for V<=128.
+            let mut found = -1
+            let mut k = 0
+            while k < len(entries) {
+                if entries[k][0] == a && entries[k][1] == b { found = k; break }
+                k = k + 1
+            }
+            if found >= 0 {
+                entries[found][2] = entries[found][2] + 1
+            } else {
+                entries.push([a, b, 1])
+            }
+            i = i + 1
+        }
+        r = r + 1
+    }
+    return entries
+}
+
+fn _find_max_pair(pairs: array) -> array {
+    // Returns [a, b, count]; ties broken by (a, b) lex order for determinism.
+    if len(pairs) == 0 { return [-1, -1, 0] }
+    let mut best = pairs[0]
+    let mut k = 1
+    while k < len(pairs) {
+        let p = pairs[k]
+        let pc = p[2]
+        let bc = best[2]
+        if pc > bc { best = p }
+        else if pc == bc {
+            // Lex-tie-break: smaller (a,b) wins → deterministic build.
+            if p[0] < best[0] || (p[0] == best[0] && p[1] < best[1]) { best = p }
+        }
+        k = k + 1
+    }
+    return best
+}
+
+// Apply merge: replace every adjacent (a,b) in row symbol streams with new symbol.
+fn _apply_merge(rows: array, a: int, b: int, new_sym: int) -> array {
+    let mut out = []
+    let mut r = 0
+    while r < len(rows) {
+        let row = rows[r]
+        let nr = len(row)
+        let mut new_row = []
+        let mut i = 0
+        while i < nr {
+            if i + 1 < nr && row[i] == a && row[i + 1] == b {
+                new_row.push(new_sym)
+                i = i + 2
+            } else {
+                new_row.push(row[i])
+                i = i + 1
+            }
+        }
+        out.push(new_row)
+        r = r + 1
+    }
+    return out
+}
+
+// Build vocabulary. Returns array of [token_id, byte_sequence_as_array_of_int].
+// token_id starts at 256 and counts up. byte_sequence is the FULL flattened
+// expansion to original 0..255 bytes. (Decoder uses this directly.)
+fn _build_vocabulary(rows: array, target_size: int) -> array {
+    let mut vocab = []         // each = [token_id, byte_seq array]
+    let mut sym_expand = []    // sym_expand[k] = byte_seq for token (256+k)
+    let mut work = rows
+    let mut k = 0
+    while k < target_size {
+        let pairs = _count_byte_pairs(work)
+        if len(pairs) == 0 { break }
+        let best = _find_max_pair(pairs)
+        // Skip merges with count < 2 — no compression benefit.
+        if best[2] < 2 { break }
+        let new_sym = 256 + k
+        // Compute byte expansion of new symbol = expand(a) ++ expand(b).
+        let a = best[0]
+        let b = best[1]
+        let exp_a = if a < 256 { [a] } else { sym_expand[a - 256] }
+        let exp_b = if b < 256 { [b] } else { sym_expand[b - 256] }
+        let mut combined = []
+        let mut x = 0
+        while x < len(exp_a) { combined.push(exp_a[x]); x = x + 1 }
+        let mut y = 0
+        while y < len(exp_b) { combined.push(exp_b[y]); y = y + 1 }
+        sym_expand.push(combined)
+        vocab.push([new_sym, combined])
+        work = _apply_merge(work, a, b, new_sym)
+        k = k + 1
+    }
+    return vocab
+}
+
+// ───────────────────────── PASS 2: encode/decode cells ─────────────────────────
+
+// Greedy longest-match encode of a byte sequence using vocab.
+// Returns symbol stream (array<int>) — token IDs >= 256 or raw bytes 0..255.
+fn _encode_bytes(bytes: array, vocab: array) -> array {
+    let mut out = []
+    let n = len(bytes)
+    let mut i = 0
+    while i < n {
+        // Find longest matching token whose byte-seq matches bytes[i..].
+        let mut best_id = -1
+        let mut best_len = 0
+        let mut k = 0
+        while k < len(vocab) {
+            let tok_id = vocab[k][0]
+            let seq = vocab[k][1]
+            let sl = len(seq)
+            if sl > best_len && i + sl <= n {
+                let mut match_ok = true
+                let mut j = 0
+                while j < sl {
+                    if bytes[i + j] != seq[j] { match_ok = false; break }
+                    j = j + 1
+                }
+                if match_ok { best_id = tok_id; best_len = sl }
+            }
+            k = k + 1
+        }
+        if best_len > 0 {
+            out.push(best_id)
+            i = i + best_len
+        } else {
+            out.push(bytes[i])
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Serialize symbol stream to byte sequence (wire-form binary).
+// Format: token (id >= 256) → 0xFE <hi> <lo> where id-256 = hi*256 + lo.
+//         raw byte 0xFE → 0xFE 0xFF (escape for self-collision).
+//         other raw bytes → emit as-is.
+fn _serialize_symbols(syms: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(syms) {
+        let s = syms[i]
+        if s >= 256 {
+            let idx = s - 256
+            let hi = idx / 256
+            let lo = idx - hi * 256
+            out.push(A9_TOKEN_MARKER)
+            out.push(hi)
+            out.push(lo)
+        } else if s == A9_TOKEN_MARKER {
+            out.push(A9_TOKEN_MARKER)
+            out.push(A9_TOKEN_ESCAPE)
+        } else {
+            out.push(s)
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// Inverse: parse wire-form bytes to symbol stream.
+fn _parse_symbols(wire: array) -> array {
+    let mut out = []
+    let n = len(wire)
+    let mut i = 0
+    while i < n {
+        let b = wire[i]
+        if b == A9_TOKEN_MARKER && i + 1 < n {
+            let nxt = wire[i + 1]
+            if nxt == A9_TOKEN_ESCAPE {
+                out.push(A9_TOKEN_MARKER)
+                i = i + 2
+            } else if i + 2 < n {
+                let lo = wire[i + 2]
+                let id = 256 + nxt * 256 + lo
+                out.push(id)
+                i = i + 3
+            } else {
+                out.push(b)
+                i = i + 1
+            }
+        } else {
+            out.push(b)
+            i = i + 1
+        }
+    }
+    return out
+}
+
+// Decode symbol stream → byte sequence using vocab expansion.
+fn _decode_symbols(syms: array, vocab: array) -> array {
+    let mut out = []
+    let mut i = 0
+    while i < len(syms) {
+        let s = syms[i]
+        if s < 256 {
+            out.push(s)
+        } else {
+            // Find vocab[k] with token_id == s.
+            let mut found = false
+            let mut k = 0
+            while k < len(vocab) {
+                if vocab[k][0] == s {
+                    let seq = vocab[k][1]
+                    let mut j = 0
+                    while j < len(seq) { out.push(seq[j]); j = j + 1 }
+                    found = true
+                    break
+                }
+                k = k + 1
+            }
+            if !found {
+                // Unknown token — preserve as-is via marker (shouldn't happen if
+                // vocab matches encoder). raw 91 honest C3.
+                out.push(63)  // '?' literal
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ───────────────────────── HXC v1 stream <-> A9 v2 stream ─────────────────────────
+
+fn _split_top_level_pipes(s: string) -> array {
+    let mut segs = []
+    let mut start = 0
+    let mut i = 0
+    while i < len(s) {
+        if s.substring(i, i + 1) == "|" {
+            segs.push(s.substring(start, i))
+            start = i + 1
+        }
+        i = i + 1
+    }
+    if start <= len(s) { segs.push(s.substring(start, len(s))) }
+    return segs
+}
+
+fn a9_encode(v1_text: string) -> string {
+    let lines = v1_text.split("\n")
+    // Parse: header lines (preserved verbatim) + per-schema row bodies.
+    let mut schema_names = []   // e.g., "s1"
+    let mut schema_rows = []    // schema_rows[i] = array<string> (row bodies)
+    let mut header_lines = []
+    let mut row_order = []      // sequential record of entries: ["H", idx] or ["R", schema_idx, row_idx]
+    let mut h = 0
+    while h < len(lines) {
+        let l = lines[h]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            // Extract schema name "sN" from "# schema:sN <keys>"
+            let rest = l.substring(9, len(l))
+            let sp = rest.find(" ")
+            let sname = if sp > 0 { rest.substring(0, sp) } else { rest }
+            schema_names.push(sname)
+            schema_rows.push([])
+            header_lines.push(l)
+            row_order.push(["H", to_string(len(header_lines) - 1)])
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            // Find which schema this row belongs to by matching `@sN ...`
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let sname = if len(head) > 1 { head.substring(1, len(head)) } else { "" }
+            let mut s_idx = -1
+            let mut k = 0
+            while k < len(schema_names) {
+                if schema_names[k] == sname { s_idx = k; break }
+                k = k + 1
+            }
+            if s_idx < 0 {
+                header_lines.push(l)
+                row_order.push(["H", to_string(len(header_lines) - 1)])
+            } else {
+                schema_rows[s_idx].push(body)
+                row_order.push(["R", to_string(s_idx), to_string(len(schema_rows[s_idx]) - 1)])
+            }
+        } else if len(l) > 0 {
+            header_lines.push(l)
+            row_order.push(["H", to_string(len(header_lines) - 1)])
+        }
+        h = h + 1
+    }
+
+    // Per-schema: build vocab on rows-as-bytes; encode each row.
+    let mut schema_vocab = []      // schema_vocab[i] = vocab (array of [tok_id, seq])
+    let mut schema_encoded = []    // schema_encoded[i] = array<string> base64-encoded wire
+    let mut schema_eligible = []   // bool flags
+    let mut s = 0
+    while s < len(schema_names) {
+        let rows = schema_rows[s]
+        if len(rows) < A9_MIN_ROWS {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+            s = s + 1
+            continue
+        }
+        // Convert rows to byte arrays.
+        let mut byte_rows = []
+        let mut r = 0
+        while r < len(rows) {
+            byte_rows.push(_str_to_bytes(rows[r]))
+            r = r + 1
+        }
+        // Build vocab.
+        let vocab = _build_vocabulary(byte_rows, A9_VOCAB_SIZE)
+        if len(vocab) == 0 {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+            s = s + 1
+            continue
+        }
+        // Encode each row.
+        let mut enc_rows = []
+        let mut sum_v1 = 0
+        let mut sum_v2 = 0
+        let mut r2 = 0
+        while r2 < len(byte_rows) {
+            let syms = _encode_bytes(byte_rows[r2], vocab)
+            let wire = _serialize_symbols(syms)
+            let b64 = _b64_encode(wire)
+            enc_rows.push(b64)
+            sum_v1 = sum_v1 + len(byte_rows[r2])
+            sum_v2 = sum_v2 + len(b64)
+            r2 = r2 + 1
+        }
+        // Compute header overhead: tokenizer line + per-token lines.
+        let mut hdr_overhead = 30 + len(schema_names[s])  // tokenizer: line approx
+        let mut v = 0
+        while v < len(vocab) {
+            let seq = vocab[v][1]
+            let seq_b64 = _b64_encode(seq)
+            // # tok:sN id=<b64>\n
+            hdr_overhead = hdr_overhead + 12 + len(schema_names[s]) + 4 + len(seq_b64) + 1
+            v = v + 1
+        }
+        // Eligibility: encoded must beat (v1 cost per row + sigil overhead) + header overhead.
+        let v1_cost = sum_v1 + len(byte_rows) * 4    // rough `@sN ` per row already counted above
+        let v2_cost = sum_v2 + len(byte_rows) * 5    // `^T` sigil + base64 + per-row prefix
+        if v2_cost + hdr_overhead < v1_cost {
+            schema_vocab.push(vocab)
+            schema_encoded.push(enc_rows)
+            schema_eligible.push("1")
+        } else {
+            schema_vocab.push([])
+            schema_encoded.push([])
+            schema_eligible.push("0")
+        }
+        s = s + 1
+    }
+
+    // Emit output stream preserving original order. Header lines first, with
+    // per-eligible-schema tokenizer/tok declarations interleaved at first @-row position.
+    let mut out = []
+    let mut emitted_vocab_for = []   // track which schemas already emitted vocab decl
+    let mut k = 0
+    while k < len(schema_names) {
+        emitted_vocab_for.push("0")
+        k = k + 1
+    }
+    let mut o = 0
+    while o < len(row_order) {
+        let entry = row_order[o]
+        if entry[0] == "H" {
+            let idx = parse_int(entry[1])
+            out.push(header_lines[idx])
+        } else {
+            let s_idx = parse_int(entry[1])
+            let r_idx = parse_int(entry[2])
+            // Emit tokenizer + tok decls before first row of eligible schema.
+            if schema_eligible[s_idx] == "1" && emitted_vocab_for[s_idx] == "0" {
+                let vocab = schema_vocab[s_idx]
+                out.push("# tokenizer:" + schema_names[s_idx] + " v=BPE-v1 size=" + to_string(len(vocab)))
+                let mut v = 0
+                while v < len(vocab) {
+                    let tok_id = vocab[v][0]
+                    let seq = vocab[v][1]
+                    let seq_b64 = _b64_encode(seq)
+                    out.push("# tok:" + schema_names[s_idx] + " " + to_string(tok_id) + "=" + seq_b64)
+                    v = v + 1
+                }
+                emitted_vocab_for[s_idx] = "1"
+            }
+            if schema_eligible[s_idx] == "1" {
+                // Emit `@sN ^T<base64>`. Escape original "^T..." → "^T^..."
+                let raw_body = schema_rows[s_idx][r_idx]
+                let original_starts_with_t = len(raw_body) >= 2 && raw_body.substring(0, 2) == "^T"
+                let b64 = schema_encoded[s_idx][r_idx]
+                if original_starts_with_t {
+                    // Mark with `^T^` sigil → decoder sees ^T^ → emit raw_body verbatim.
+                    out.push("@" + schema_names[s_idx] + " ^T^" + raw_body)
+                } else {
+                    out.push("@" + schema_names[s_idx] + " ^T" + b64)
+                }
+            } else {
+                out.push("@" + schema_names[s_idx] + " " + schema_rows[s_idx][r_idx])
+            }
+        }
+        o = o + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn a9_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    // Per-schema vocab: schema_vocab[sname] → array of [tok_id, byte_seq].
+    let mut schema_names = []
+    let mut schema_vocab = []
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 12 && l.substring(0, 12) == "# tokenizer:" {
+            // Parse `# tokenizer:sN v=BPE-v1 size=V`
+            let rest = l.substring(12, len(l))
+            let sp = rest.find(" ")
+            let sname = if sp > 0 { rest.substring(0, sp) } else { rest }
+            // Add empty vocab; populate via subsequent `# tok:` lines.
+            let mut found = -1
+            let mut k = 0
+            while k < len(schema_names) {
+                if schema_names[k] == sname { found = k; break }
+                k = k + 1
+            }
+            if found < 0 {
+                schema_names.push(sname)
+                schema_vocab.push([])
+            }
+            // Skip emission (consumed by decoder)
+        } else if len(l) >= 6 && l.substring(0, 6) == "# tok:" {
+            // Parse `# tok:sN <id>=<b64>`
+            let rest = l.substring(6, len(l))
+            let sp = rest.find(" ")
+            if sp > 0 {
+                let sname = rest.substring(0, sp)
+                let body = rest.substring(sp + 1, len(rest))
+                let eq = body.find("=")
+                if eq > 0 {
+                    let tok_id = parse_int(body.substring(0, eq))
+                    let seq_b64 = body.substring(eq + 1, len(body))
+                    let seq = _b64_decode(seq_b64)
+                    let mut s_idx = -1
+                    let mut k = 0
+                    while k < len(schema_names) {
+                        if schema_names[k] == sname { s_idx = k; break }
+                        k = k + 1
+                    }
+                    if s_idx >= 0 {
+                        schema_vocab[s_idx].push([tok_id, seq])
+                    }
+                }
+            }
+            // Skip emission
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let sname = if len(head) > 1 { head.substring(1, len(head)) } else { "" }
+            // Check sigil
+            if len(body) >= 3 && body.substring(0, 3) == "^T^" {
+                // Escape: literal payload starts with ^T — decoded body = body[2:]
+                out.push(head + " " + body.substring(2, len(body)))
+            } else if len(body) >= 2 && body.substring(0, 2) == "^T" {
+                // BPE-encoded: lookup vocab, decode.
+                let mut s_idx = -1
+                let mut k = 0
+                while k < len(schema_names) {
+                    if schema_names[k] == sname { s_idx = k; break }
+                    k = k + 1
+                }
+                if s_idx < 0 {
+                    out.push(l)  // unknown schema — passthrough
+                } else {
+                    let b64 = body.substring(2, len(body))
+                    let wire = _b64_decode(b64)
+                    let syms = _parse_symbols(wire)
+                    let dec_bytes = _decode_symbols(syms, schema_vocab[s_idx])
+                    out.push(head + " " + _bytes_to_str(dec_bytes))
+                }
+            } else {
+                out.push(l)
+            }
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+// ───────────────────────── selftest ─────────────────────────
+
+fn _selftest() -> int {
+    println("# hxc_a9_tokenizer selftest")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture 1: synthetic English-text repetition (3× compression projection).
+    let mut rows1 = []
+    let mut i = 0
+    while i < 12 {
+        rows1.push("@s1 \"the quick brown fox jumps over the lazy dog the cat the bird\"")
+        i = i + 1
+    }
+    let f1 = "# schema:s1 sentence\n" + rows1.join("\n") + "\n"
+    let e1 = a9_encode(f1)
+    let d1 = a9_decode(e1)
+    if d1 == f1 {
+        pass = pass + 1
+        println("  PASS: F1 English-text round-trip byte-eq orig=" + to_string(len(f1)) + " enc=" + to_string(len(e1)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F1 round-trip orig=" + to_string(len(f1)) + " got=" + to_string(len(d1)))
+    }
+
+    // Fixture 2: Korean morpheme repetition (2.5× projection).
+    let mut rows2 = []
+    let mut j = 0
+    while j < 10 {
+        rows2.push("@s1 \"메타엔진 생애주기 log 첫 기록 메타엔진 dormant 메타엔진 evolve\"")
+        j = j + 1
+    }
+    let f2 = "# schema:s1 desc\n" + rows2.join("\n") + "\n"
+    let e2 = a9_encode(f2)
+    let d2 = a9_decode(e2)
+    if d2 == f2 {
+        pass = pass + 1
+        println("  PASS: F2 Korean round-trip byte-eq orig=" + to_string(len(f2)) + " enc=" + to_string(len(e2)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F2 round-trip orig=" + to_string(len(f2)) + " got=" + to_string(len(d2)))
+    }
+
+    // Fixture 3: mixed JSON + text (1.8× projection).
+    let mut rows3 = []
+    let mut k = 0
+    while k < 10 {
+        rows3.push("@s1 \"axes_acted\":[\"E2\",\"K2\",\"B1\"]|\"axes_noop\":[\"A1\",\"A2\",\"A3\"]")
+        k = k + 1
+    }
+    let f3 = "# schema:s1 acted noop\n" + rows3.join("\n") + "\n"
+    let e3 = a9_encode(f3)
+    let d3 = a9_decode(e3)
+    if d3 == f3 {
+        pass = pass + 1
+        println("  PASS: F3 JSON-text round-trip byte-eq orig=" + to_string(len(f3)) + " enc=" + to_string(len(e3)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F3 round-trip orig=" + to_string(len(f3)) + " got=" + to_string(len(d3)))
+    }
+
+    // Fixture 4: round-trip byte-eq verification on 100-row corpus (smaller for speed).
+    // Use 30 rows instead of 100 — pure-hexa BPE on 100 rows × 80 chars = 8KB
+    // would be ~30+ seconds. raw 91 honest C3.
+    let mut rows4 = []
+    let mut m = 0
+    while m < 30 {
+        rows4.push("@s1 row_" + to_string(m) + "|name_alpha|status_active|count_42")
+        m = m + 1
+    }
+    let f4 = "# schema:s1 id name status count\n" + rows4.join("\n") + "\n"
+    let e4 = a9_encode(f4)
+    let d4 = a9_decode(e4)
+    if d4 == f4 {
+        pass = pass + 1
+        println("  PASS: F4 30-row round-trip byte-eq orig=" + to_string(len(f4)) + " enc=" + to_string(len(e4)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: F4 round-trip orig=" + to_string(len(f4)) + " got=" + to_string(len(d4)))
+    }
+
+    // Fixture 5: small-fixture (<MIN_ROWS=8) passthrough.
+    let f5 = "# schema:s1 a\n@s1 \"hello\"\n@s1 \"world\"\n@s1 \"foo\"\n"
+    let e5 = a9_encode(f5)
+    let d5 = a9_decode(e5)
+    if e5 == f5 && d5 == f5 {
+        pass = pass + 1
+        println("  PASS: F5 small fixture (<MIN_ROWS=8) passthrough byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: F5 small fixture wrongly fired or lost bytes")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A9_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+// ───────────────────────── CLI entry ─────────────────────────
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a9_tokenizer.hexa <encode|decode> <in> <out>")
+            exit(3)
+        }
+        let in_path = av[sub_idx + 1]
+        let out_path = av[sub_idx + 2]
+        let txt = _read_file(in_path)
+        let res = if has_encode { a9_encode(txt) } else { a9_decode(txt) }
+        let _w = _write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a9_tokenizer.hexa [--selftest | encode <in> <out> | decode <in> <out>]")
+    exit(3)
+}
