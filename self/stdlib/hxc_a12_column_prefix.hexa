@@ -171,6 +171,40 @@ fn _detect_prefix_columns(rows: array) -> array {
 
 // ───────────────────── encode / decode ─────────────────────
 
+// Phase 8 P1 helper: replace prefix in a column-value with token `^P<sym>suffix`.
+// Disambiguation: cell starting with `^P` literal gets escape `^P^` prefix.
+fn _replace_prefix(val: string, prefix: string, sym: string) -> string {
+    let pl = len(prefix)
+    let vl = len(val)
+    if vl >= pl && val.substring(0, pl) == prefix {
+        return "^P" + sym + val.substring(pl, vl)
+    }
+    // Disambiguation: cell that naturally starts with `^P` needs escape
+    if vl >= 2 && val.substring(0, 2) == "^P" {
+        return "^P^" + val
+    }
+    return val
+}
+
+fn _restore_prefix(val: string, prefix_map: array) -> string {
+    // prefix_map: array of [col_id, prefix, sym] (we only get sym here, lookup by sym)
+    // val format: `^P<sym>suffix` OR `^P^<orig>` OR verbatim
+    if len(val) < 3 { return val }
+    if val.substring(0, 2) != "^P" { return val }
+    if val.substring(0, 3) == "^P^" {
+        return val.substring(3, len(val))  // strip escape
+    }
+    let sym = val.substring(2, 3)
+    let mut k = 0
+    while k < len(prefix_map) {
+        if prefix_map[k][2] == sym {
+            return prefix_map[k][1] + val.substring(3, len(val))
+        }
+        k = k + 1
+    }
+    return val
+}
+
 fn a12_encode(v1_text: string) -> string {
     let lines = v1_text.split("\n")
     // Group rows by schema (lines starting with `@<schema>`)
@@ -182,11 +216,9 @@ fn a12_encode(v1_text: string) -> string {
         let l = lines[i]
         if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
             header_lines.push(l)
-            // Extract schema key (everything before first space after `# schema:`)
             schema_keys.push(l)
             schema_rows.push([])
         } else if len(l) >= 1 && l.substring(0, 1) == "@" {
-            // Find which schema this belongs to (last seen schema)
             if len(schema_rows) > 0 {
                 let last_idx = len(schema_rows) - 1
                 let body_start = l.find(" ")
@@ -208,29 +240,50 @@ fn a12_encode(v1_text: string) -> string {
         h = h + 1
     }
 
-    // Per-schema detect + encode
     let mut s = 0
     while s < len(schema_rows) {
         let rows = schema_rows[s]
         let detected = _detect_prefix_columns(rows)
-        // Emit dict declarations
+        // Emit dict declarations + build sym table
         let mut d = 0
         while d < len(detected) {
             let col_id = detected[d][0]
             let prefix = detected[d][1]
             let symbol = A12_SYMBOL_ALPHABET.substring(d, d + 1)
             out.push("# col-prefix:s" + to_string(s + 1) + " " + col_id + " " + symbol + "=" + prefix)
+            // store symbol back into detected for use during encode
+            detected[d].push(symbol)
             d = d + 1
         }
-        // Re-emit data rows (using schema marker @s<n>)
-        // For now, simplified: pass through (full encode would replace prefix with `^P<sym>`).
-        // PROVISIONAL IMPL: detection + dict header only, body unchanged. Phase 8 follow-up
-        // wires in per-row prefix replacement once selftest validates the dict approach.
+        // Phase 8 P1 IMPL: per-row prefix-symbol replacement on eligible columns.
         let mut r = 0
         while r < len(rows) {
-            // TODO: replace prefix with ^P<symbol> in eligible columns
-            // For now emit unchanged for raw 91 honest scaffold validation
-            out.push("@s" + to_string(s + 1) + " " + rows[r])
+            let parts = _split_top_level_pipes(rows[r])
+            let mut new_parts = []
+            let mut p = 0
+            while p < len(parts) {
+                let mut val = parts[p]
+                // Check if this column has a detected prefix
+                let mut dd = 0
+                let mut hit = false
+                while dd < len(detected) {
+                    if parse_int(detected[dd][0]) == p {
+                        val = _replace_prefix(val, detected[dd][1], detected[dd][2])
+                        hit = true
+                        break
+                    }
+                    dd = dd + 1
+                }
+                if !hit {
+                    // Even non-eligible columns need disambiguation if they start with `^P`
+                    if len(val) >= 2 && val.substring(0, 2) == "^P" {
+                        val = "^P^" + val
+                    }
+                }
+                new_parts.push(val)
+                p = p + 1
+            }
+            out.push("@s" + to_string(s + 1) + " " + new_parts.join("|"))
             r = r + 1
         }
         s = s + 1
@@ -239,18 +292,66 @@ fn a12_encode(v1_text: string) -> string {
 }
 
 fn a12_decode(v2_text: string) -> string {
-    // Inverse: strip `# col-prefix:` headers, restore prefix in cells
+    // Inverse: parse `# col-prefix:` headers into per-schema dict, restore prefix in cells.
     let lines = v2_text.split("\n")
+    // schema_dicts: array of array of [col_id, prefix, sym]
+    let mut schema_dicts = []
+    let mut current_schema = -1
     let mut out = []
     let mut i = 0
     while i < len(lines) {
         let l = lines[i]
-        if len(l) >= 14 && l.substring(0, 14) == "# col-prefix:s" {
-            // Skip dict declarations
-            i = i + 1
-            continue
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            schema_dicts.push([])
+            current_schema = len(schema_dicts) - 1
+            out.push(l)
+        } else if len(l) >= 14 && l.substring(0, 14) == "# col-prefix:s" {
+            // Parse: `# col-prefix:s<N> <col_id> <sym>=<prefix>`
+            // Find schema number
+            let after = l.substring(14, len(l)).trim()
+            let sp1 = after.find(" ")
+            if sp1 > 0 {
+                let s_num = parse_int(after.substring(0, sp1)) - 1
+                let rest = after.substring(sp1 + 1, len(after))
+                let sp2 = rest.find(" ")
+                if sp2 > 0 {
+                    let col_id = rest.substring(0, sp2)
+                    let sym_pref = rest.substring(sp2 + 1, len(rest))
+                    let eq = sym_pref.find("=")
+                    if eq > 0 {
+                        let sym = sym_pref.substring(0, eq)
+                        let prefix = sym_pref.substring(eq + 1, len(sym_pref))
+                        if s_num >= 0 && s_num < len(schema_dicts) {
+                            schema_dicts[s_num].push([col_id, prefix, sym])
+                        }
+                    }
+                }
+            }
+            // Skip emission (dict header is consumed by decoder)
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            // Determine schema from `@s<N>`
+            let body_start = l.find(" ")
+            let head = if body_start > 0 { l.substring(0, body_start) } else { l }
+            let body = if body_start > 0 { l.substring(body_start + 1, len(l)) } else { "" }
+            let s_num = if len(head) > 2 { parse_int(head.substring(2, len(head))) - 1 } else { 0 }
+            if s_num < 0 || s_num >= len(schema_dicts) {
+                out.push(l)
+                i = i + 1
+                continue
+            }
+            let dict = schema_dicts[s_num]
+            let parts = _split_top_level_pipes(body)
+            let mut new_parts = []
+            let mut p = 0
+            while p < len(parts) {
+                new_parts.push(_restore_prefix(parts[p], dict))
+                p = p + 1
+            }
+            out.push(head + " " + new_parts.join("|"))
+        } else if len(l) > 0 {
+            // Symmetric to encoder: skip empty lines (encoder filters via len > 0 gate).
+            out.push(l)
         }
-        out.push(l)
         i = i + 1
     }
     return out.join("\n") + "\n"
@@ -318,6 +419,50 @@ fn _selftest() -> int {
         sk = sk + 1
     }
     if !small_has_dict { pass = pass + 1; println("  PASS: small fixture (1 row) skipped (MIN_ROWS=16)") } else { fail = fail + 1; println("  FAIL: small fixture incorrectly emitted dict") }
+
+    // Test 5: Phase 8 P1 — body replacement actually shrinks bytes
+    let nb = len(fixture)
+    let hb = len(encoded)
+    if hb < nb {
+        pass = pass + 1
+        println("  PASS: P1 body replacement saves bytes " + to_string(nb) + " -> " + to_string(hb))
+    } else {
+        fail = fail + 1
+        println("  FAIL: P1 body replacement did not save bytes " + to_string(nb) + " -> " + to_string(hb))
+    }
+
+    // Test 6: Phase 8 P1 — round-trip byte-eq (encode → decode == original)
+    let encoded_p1 = a12_encode(fixture)
+    let decoded_p1 = a12_decode(encoded_p1)
+    if decoded_p1 == fixture {
+        pass = pass + 1
+        println("  PASS: P1 round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: P1 round-trip lost bytes")
+        println("    expected len=" + to_string(len(fixture)))
+        println("    got      len=" + to_string(len(decoded_p1)))
+    }
+
+    // Test 7: Phase 8 P1 — disambiguation (cells starting with ^P get escaped)
+    let amb_fixture = "# schema:s1 ts text\n"
+    let mut amb_rows = []
+    let mut a = 0
+    while a < 16 {
+        let mn = if a < 10 { "0" + to_string(a) } else { to_string(a) }
+        amb_rows.push("@s1 \"2026-04-25T14:" + mn + ":00Z\"|^Pliteral")
+        a = a + 1
+    }
+    let amb_full = amb_fixture + amb_rows.join("\n") + "\n"
+    let amb_encoded = a12_encode(amb_full)
+    let amb_decoded = a12_decode(amb_encoded)
+    if amb_decoded == amb_full {
+        pass = pass + 1
+        println("  PASS: P1 disambiguation escape preserves ^P-literal cells")
+    } else {
+        fail = fail + 1
+        println("  FAIL: P1 disambiguation broken")
+    }
 
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A12_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
