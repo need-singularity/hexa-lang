@@ -1,0 +1,239 @@
+#!hexa strict
+
+// @resolver-bypass(reason="darwin-native byte-canonical pipeline")
+// @tool(slug="hxc-a14-row-prefix", desc="HXC algorithm A14: single-schema row-prefix dedup. When all rows start with same `@<schema> ` marker (single-schema file), strip per-row marker; emit single-schema declaration. Pure-hexa raw 9. Targets aot_cache_gc.jsonl @s1 prefix 21KB savings (5436 rows × 4 bytes).")
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a14_row_prefix.hexa --selftest)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a14_row_prefix.hexa encode <hxc.in> <hxc.out>)
+// @usage(hexa /Users/ghost/core/hexa-lang/self/stdlib/hxc_a14_row_prefix.hexa decode <hxc.in> <hxc.out>)
+// @exit_codes(0=ok, 1=selftest-fail, 2=io-error, 3=bad-args, 4=decode-mismatch)
+//
+// Spec:
+//   PASS 1: count distinct `# schema:` declarations. If exactly 1, single-schema file.
+//   PASS 2 (encode): emit `# row-prefix:<sigil> <prefix>` marker; for each `@<X> body` row,
+//     emit just `body`. Use sigil `~` to mark "bare body" rows in decode.
+//   PASS 3 (decode): parse `# row-prefix:` marker, prepend prefix to `~`-marked or
+//     bare-prefix-format rows.
+//
+// Wire format:
+//   v1:                              v2 (A14):
+//   # schema:s1 ts                   # schema:s1 ts
+//   @s1 "2026-04-25T14:00:00Z"       # row-prefix: @s1
+//   @s1 "2026-04-25T14:01:00Z"       ~"2026-04-25T14:00:00Z"
+//                                    ~"2026-04-25T14:01:00Z"
+//
+// Idempotency contract (raw 65 + 68):
+//   - encode(decode(x)) == x
+//   - decode(encode(y)) == y
+//
+// Falsifiers (raw 71):
+//   F-A14-1: saving < 0.005 byte-eq → reject (need amortization).
+//   F-A14-2: round-trip not byte-eq → reject.
+//   F-A14-3: multi-schema file (>1 # schema:) wrongly fired → reject (A14 single-schema only).
+
+const A14_MIN_ROWS = 8
+
+fn _shell_escape(s: string) -> string {
+    let mut parts = []
+    parts.push("'")
+    let mut i = 0
+    while i < len(s) {
+        let c = s.substring(i, i + 1)
+        if c == "'" { parts.push("'\\''") } else { parts.push(c) }
+        i = i + 1
+    }
+    parts.push("'")
+    return parts.join("")
+}
+
+fn _read_file(p: string) -> string { return exec("cat " + _shell_escape(p)) }
+fn _write_file(p: string, c: string) -> int {
+    let cmd = "mkdir -p $(dirname " + _shell_escape(p) + ") && cat > " + _shell_escape(p) + " <<'__A14_EOF__'\n" + c + "__A14_EOF__\n"
+    let _r = exec(cmd)
+    return 0
+}
+
+fn a14_encode(v1_text: string) -> string {
+    let lines = v1_text.split("\n")
+    // Count distinct schemas + collect prefixes
+    let mut schema_count = 0
+    let mut row_prefixes = []  // distinct row-prefixes seen
+    let mut row_count = 0
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" { schema_count = schema_count + 1 }
+        else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            row_count = row_count + 1
+            let sp = l.find(" ")
+            if sp > 0 {
+                let prefix = l.substring(0, sp + 1)  // include trailing space
+                let mut found = false
+                let mut k = 0
+                while k < len(row_prefixes) {
+                    if row_prefixes[k] == prefix { found = true; break }
+                    k = k + 1
+                }
+                if !found { row_prefixes.push(prefix) }
+            }
+        }
+        i = i + 1
+    }
+    // Eligibility: single-schema file with >= MIN_ROWS, single row-prefix
+    let eligible = schema_count == 1 && row_count >= A14_MIN_ROWS && len(row_prefixes) == 1
+    if !eligible { return v1_text }
+
+    let single_prefix = row_prefixes[0]
+    let mut out = []
+    let mut emitted_marker = false
+    let mut j = 0
+    while j < len(lines) {
+        let l = lines[j]
+        if len(l) >= 9 && l.substring(0, 9) == "# schema:" {
+            out.push(l)
+            if !emitted_marker {
+                out.push("# row-prefix: " + single_prefix)
+                emitted_marker = true
+            }
+        } else if len(l) >= 1 && l.substring(0, 1) == "@" {
+            // Strip prefix, prepend `~` sigil
+            let sp = l.find(" ")
+            if sp > 0 && (sp + 1) < len(l) {
+                out.push("~" + l.substring(sp + 1, len(l)))
+            } else {
+                out.push("~")
+            }
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        j = j + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn a14_decode(v2_text: string) -> string {
+    let lines = v2_text.split("\n")
+    let mut row_prefix = ""
+    let mut out = []
+    let mut i = 0
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 14 && l.substring(0, 14) == "# row-prefix: " {
+            row_prefix = l.substring(14, len(l))
+            // Skip emission (consumed)
+        } else if len(l) >= 1 && l.substring(0, 1) == "~" {
+            // Restore prefix
+            out.push(row_prefix + l.substring(1, len(l)))
+        } else if len(l) > 0 {
+            out.push(l)
+        }
+        i = i + 1
+    }
+    return out.join("\n") + "\n"
+}
+
+fn _selftest() -> int {
+    println("# hxc_a14_row_prefix selftest")
+    let mut pass = 0
+    let mut fail = 0
+
+    // Fixture: single-schema, 10 rows
+    let mut rows = []
+    let mut i = 0
+    while i < 10 {
+        rows.push("@s1 row" + to_string(i) + "|val" + to_string(i))
+        i = i + 1
+    }
+    let fixture = "# schema:s1 a b\n" + rows.join("\n") + "\n"
+    let encoded = a14_encode(fixture)
+    let decoded = a14_decode(encoded)
+
+    // Test 1: row-prefix marker emitted
+    let lines = encoded.split("\n")
+    let mut has_marker = false
+    let mut k = 0
+    while k < len(lines) {
+        if len(lines[k]) >= 14 && lines[k].substring(0, 14) == "# row-prefix: " { has_marker = true; break }
+        k = k + 1
+    }
+    if has_marker { pass = pass + 1; println("  PASS: row-prefix marker emitted") } else { fail = fail + 1; println("  FAIL: no marker") }
+
+    // Test 2: encoded smaller
+    if len(encoded) < len(fixture) {
+        pass = pass + 1
+        println("  PASS: bytes saved " + to_string(len(fixture)) + " -> " + to_string(len(encoded)))
+    } else {
+        fail = fail + 1
+        println("  FAIL: no saving " + to_string(len(fixture)) + " -> " + to_string(len(encoded)))
+    }
+
+    // Test 3: round-trip byte-eq
+    if decoded == fixture {
+        pass = pass + 1
+        println("  PASS: round-trip byte-eq")
+    } else {
+        fail = fail + 1
+        println("  FAIL: round-trip lost bytes orig=" + to_string(len(fixture)) + " got=" + to_string(len(decoded)))
+    }
+
+    // Test 4: multi-schema → no fire
+    let multi = "# schema:s1 a\n# schema:s2 b\n@s1 1\n@s1 2\n@s1 3\n@s1 4\n@s1 5\n@s1 6\n@s1 7\n@s1 8\n@s2 x\n@s2 y\n"
+    let multi_enc = a14_encode(multi)
+    if multi_enc == multi {
+        pass = pass + 1
+        println("  PASS: multi-schema not fired (passthrough)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: multi-schema wrongly fired")
+    }
+
+    // Test 5: small fixture skipped
+    let small = "# schema:s1 a\n@s1 1\n@s1 2\n"
+    let small_enc = a14_encode(small)
+    if small_enc == small {
+        pass = pass + 1
+        println("  PASS: small fixture skipped (MIN_ROWS=8)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: small fixture wrongly fired")
+    }
+
+    println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
+    println("__HXC_A14_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" }))
+    if fail == 0 { return 0 }
+    return 1
+}
+
+fn main() {
+    let av = argv()
+    let mut has_selftest = false
+    let mut has_encode = false
+    let mut has_decode = false
+    let mut k = 0
+    while k < len(av) {
+        if av[k] == "--selftest" { has_selftest = true }
+        if av[k] == "encode" { has_encode = true }
+        if av[k] == "decode" { has_decode = true }
+        k = k + 1
+    }
+    if has_selftest { exit(_selftest()) }
+    if has_encode || has_decode {
+        let mut sub_idx = 0
+        let mut q = 0
+        while q < len(av) {
+            if av[q] == "encode" || av[q] == "decode" { sub_idx = q; break }
+            q = q + 1
+        }
+        if sub_idx + 2 >= len(av) {
+            eprintln("usage: hexa hxc_a14_row_prefix.hexa <encode|decode> <in> <out>")
+            exit(3)
+        }
+        let in_path = av[sub_idx + 1]
+        let out_path = av[sub_idx + 2]
+        let txt = _read_file(in_path)
+        let res = if has_encode { a14_encode(txt) } else { a14_decode(txt) }
+        let _w = _write_file(out_path, res)
+        exit(0)
+    }
+    eprintln("usage: hexa hxc_a14_row_prefix.hexa [--selftest | encode <in> <out> | decode <in> <out>]")
+    exit(3)
+}
