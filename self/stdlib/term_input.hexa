@@ -1,0 +1,445 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  self/stdlib/term_input.hexa — keypress/mouse/paste/CSI/OSC decoder
+//
+//  PURPOSE
+//      Pure-string decoder for VT100/xterm input byte streams. Replaces
+//      hive packages/tui/src/keys.ts (1400 LoC) keyboard parser. Takes
+//      a buffer of bytes (utf-8 string) and emits an array of typed
+//      events. Stateless: caller hands accumulated buffer per chunk
+//      and gets back consumed-prefix-length + event list. Pure (no
+//      I/O) so it composes with stdin.hexa and any byte source.
+//
+//  EVENT TYPES (each an array tuple):
+//      ["key", name, mods]    name: "Up"/"Down"/"Enter"/"Backspace"/...
+//      ["char", utf8_str]     printable char (not a control sequence)
+//      ["paste_start"]
+//      ["paste_end"]
+//      ["focus_in"]
+//      ["focus_out"]
+//      ["mouse", btn, col, row, ev]   ev = "press"/"release"/"motion"
+//      ["unknown", raw_bytes]         unparsed sequence
+//
+//  EXPORTS
+//      decode_input(buf: string) -> [consumed: i64, events: array]
+//
+//  CAVEATS (raw 91 honest)
+//      * Subset of xterm/VT recognized — covers common keys: arrows,
+//        Home/End/PageUp/PageDown, F1-F12, Tab, Enter, Backspace,
+//        Escape (alone), Ctrl+A..Z, bracketed paste (CSI 200~/201~),
+//        focus events (CSI I/O), SGR mouse (CSI <…M / <…m).
+//      * Kitty keyboard protocol u-form (CSI codepoint;mods u) is
+//        recognized but reported as ["key", name, mods] with same
+//        name vocabulary. Release events are not distinguished.
+//      * If buffer ends mid-sequence, returns consumed=N covering
+//        complete events only; caller should wait for more bytes.
+//      * Modifier bits: 1=none, 2=Shift, 3=Alt, 4=Shift+Alt,
+//        5=Ctrl, 6=Shift+Ctrl, 7=Alt+Ctrl, 8=Shift+Alt+Ctrl
+//        (xterm modifyOtherKeys convention; kitty offsets by -1).
+//
+//  RAW 159 UPSTREAM GAP
+//      No native UTF-8 codepoint iterator in hexa string yet.
+//      Multi-byte chars are passed through as raw bytes assuming
+//      caller's source is utf-8 clean (which stdin in raw mode is).
+//
+//  USAGE
+//      use "self/stdlib/term_input"
+//      let r = decode_input(buf)
+//      let consumed = r[0]
+//      let events = r[1]
+//      let i = 0
+//      while i < len(events) {
+//          let e = events[i]
+//          if e[0] == "key" { /* handle */ }
+//          i = i + 1
+//      }
+//      // remove first `consumed` bytes from buf, accumulate more
+//
+//  --selftest:
+//      hexa run self/stdlib/term_input.hexa --selftest
+//        → __TERM_INPUT_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+// ═══════════════════════════════════════════════════════════════════════
+
+fn _ti_esc() -> string { return from_char_code(27) }
+
+// Returns true iff char code c is a CSI-final byte (0x40..0x7E).
+fn _ti_is_csi_final(c: i64) -> bool {
+    return c >= 64 && c <= 126
+}
+
+// Map a single CSI sequence body (between '[' and final byte) to
+// either a recognized event tuple or null (caller emits "unknown").
+//   final  = single char (string of length 1)
+//   params = parameter string (digits, ';' separators, may be empty)
+//   inter  = intermediate chars (rare, e.g. '?' '<' '>') prefix on params
+// Returns: array event, or [] if unrecognized.
+fn _ti_csi_event(inter: string, params: string, final_b: string) -> array {
+    // Bracketed paste: ESC [ 200~ / 201~
+    if final_b == "~" && (params == "200" || params == "201") {
+        if params == "200" { return ["paste_start"] }
+        return ["paste_end"]
+    }
+    // Focus: ESC [ I / ESC [ O
+    if inter == "" && params == "" && final_b == "I" { return ["focus_in"] }
+    if inter == "" && params == "" && final_b == "O" { return ["focus_out"] }
+
+    // Arrows / Home / End: ESC [ A/B/C/D/H/F (with optional 1;mods prefix)
+    let mut mods = 1
+    if final_b == "A" || final_b == "B" || final_b == "C" || final_b == "D"
+       || final_b == "H" || final_b == "F" {
+        if len(params) > 0 {
+            // params shape "1;3" → mods=3
+            let parts = params.split(";")
+            if len(parts) == 2 { mods = _ti_atoi(parts[1]) }
+        }
+        let name = if final_b == "A" { "Up" }
+            else if final_b == "B" { "Down" }
+            else if final_b == "C" { "Right" }
+            else if final_b == "D" { "Left" }
+            else if final_b == "H" { "Home" }
+            else { "End" }
+        return ["key", name, mods]
+    }
+
+    // Function & nav keys: ESC [ <num>~  (or <num>;<mods>~)
+    if final_b == "~" {
+        let mut nstr = params
+        let mut mm = 1
+        let parts = params.split(";")
+        if len(parts) == 2 {
+            nstr = parts[0]
+            mm = _ti_atoi(parts[1])
+        }
+        let nv = _ti_atoi(nstr)
+        // 1=Home(legacy) 2=Insert 3=Delete 4=End(legacy) 5=PageUp 6=PageDown
+        // 11..15 = F1..F5  17..21 = F6..F10  23..24 = F11..F12
+        let name = _ti_tilde_name(nv)
+        if name != "" { return ["key", name, mm] }
+    }
+
+    // SGR mouse: ESC [ < btn ; col ; row M/m
+    if inter == "<" && (final_b == "M" || final_b == "m") {
+        let parts = params.split(";")
+        if len(parts) == 3 {
+            let btn = _ti_atoi(parts[0])
+            let col = _ti_atoi(parts[1])
+            let row = _ti_atoi(parts[2])
+            let ev = if final_b == "M" { "press" } else { "release" }
+            return ["mouse", btn, col, row, ev]
+        }
+    }
+
+    // Kitty keyboard u-form: ESC [ codepoint ; mods u
+    if final_b == "u" && inter == "" {
+        let parts = params.split(";")
+        if len(parts) >= 1 {
+            let cp = _ti_atoi(parts[0])
+            let mm2 = if len(parts) >= 2 { _ti_atoi(parts[1]) } else { 1 }
+            // Map a few common codepoints to names (printable left as char).
+            let nm = _ti_kitty_name(cp)
+            if nm != "" { return ["key", nm, mm2] }
+            // Otherwise emit as char.
+            return ["char", from_char_code(cp)]
+        }
+    }
+
+    return []
+}
+
+fn _ti_tilde_name(n: i64) -> string {
+    if n == 1 { return "Home" }
+    if n == 2 { return "Insert" }
+    if n == 3 { return "Delete" }
+    if n == 4 { return "End" }
+    if n == 5 { return "PageUp" }
+    if n == 6 { return "PageDown" }
+    if n == 11 { return "F1" }
+    if n == 12 { return "F2" }
+    if n == 13 { return "F3" }
+    if n == 14 { return "F4" }
+    if n == 15 { return "F5" }
+    if n == 17 { return "F6" }
+    if n == 18 { return "F7" }
+    if n == 19 { return "F8" }
+    if n == 20 { return "F9" }
+    if n == 21 { return "F10" }
+    if n == 23 { return "F11" }
+    if n == 24 { return "F12" }
+    return ""
+}
+
+fn _ti_kitty_name(cp: i64) -> string {
+    if cp == 13 || cp == 10 { return "Enter" }
+    if cp == 9 { return "Tab" }
+    if cp == 127 || cp == 8 { return "Backspace" }
+    if cp == 27 { return "Escape" }
+    if cp == 32 { return "Space" }
+    return ""
+}
+
+// Parse one CSI sequence starting at i (pointing at '[' after ESC).
+// Returns [next_i, event_or_empty]. Caller already consumed ESC.
+fn _ti_parse_csi(buf: string, i: i64) -> array {
+    // i is index of '[' character. We're past the ESC.
+    let n = len(buf)
+    if i >= n { return [-1, []] }   // incomplete
+    let mut j = i + 1
+    // Optional intermediate prefix: '<', '>', '?', '!'
+    let mut inter = ""
+    if j < n {
+        let c0 = buf.substring(j, j + 1)
+        if c0 == "<" || c0 == ">" || c0 == "?" || c0 == "!" {
+            inter = c0
+            j = j + 1
+        }
+    }
+    // Parameters: digits and ';'
+    let mut params = ""
+    while j < n {
+        let c = buf.substring(j, j + 1)
+        let cc = char_code(c)
+        if (cc >= 48 && cc <= 57) || c == ";" {
+            params = params + c
+            j = j + 1
+        } else {
+            break
+        }
+    }
+    // Final byte (0x40..0x7E)
+    if j >= n { return [-1, []] } // incomplete
+    let final_b = buf.substring(j, j + 1)
+    let fc = char_code(final_b)
+    if !_ti_is_csi_final(fc) {
+        // Malformed CSI — consume up to here as "unknown".
+        return [j + 1, ["unknown", buf.substring(i - 1, j + 1)]]
+    }
+    let ev = _ti_csi_event(inter, params, final_b)
+    let raw = buf.substring(i - 1, j + 1)
+    if len(ev) == 0 { return [j + 1, ["unknown", raw]] }
+    return [j + 1, ev]
+}
+
+// atoi for CSI param strings.
+fn _ti_atoi(s: string) -> i64 {
+    let t = s.trim()
+    if len(t) == 0 { return 0 }
+    let mut acc = 0
+    let mut i = 0
+    while i < len(t) {
+        let ch = t.substring(i, i + 1)
+        let cc = char_code(ch)
+        if cc < 48 || cc > 57 { return acc }
+        acc = acc * 10 + (cc - 48)
+        i = i + 1
+    }
+    return acc
+}
+
+// Map a single Ctrl-* control byte (1..26) to key name "Ctrl+<letter>".
+// Returns "" if byte is not a Ctrl letter.
+fn _ti_ctrl_name(c: i64) -> string {
+    if c == 13 || c == 10 { return "Enter" }
+    if c == 9 { return "Tab" }
+    if c == 8 || c == 127 { return "Backspace" }
+    if c == 32 { return "Space" }
+    if c >= 1 && c <= 26 {
+        // 1=A, 2=B, ...; skip 8/9/10/13 already handled above.
+        let letter = from_char_code(c + 64)  // 'A' is 65
+        return "Ctrl+" + letter
+    }
+    return ""
+}
+
+// MAIN: decode_input — see header for return contract.
+pub fn decode_input(buf: string) -> array {
+    let n = len(buf)
+    let mut events = []
+    let mut i = 0
+    let esc = _ti_esc()
+    while i < n {
+        let c = buf.substring(i, i + 1)
+        let cc = char_code(c)
+        if c == esc {
+            // ESC alone (end of buffer) → wait for more.
+            if i + 1 >= n {
+                // Treat as "Escape" key only if buffer ENDS with ESC and
+                // no more data is coming. We return events up to here
+                // (consumed = i) and let caller decide. To keep API
+                // simple we DO emit Escape if it's the only byte left
+                // and the buffer is exactly that.
+                if n == 1 { events.push(["key", "Escape", 1]); return [1, events] }
+                return [i, events]
+            }
+            let nx = buf.substring(i + 1, i + 2)
+            if nx == "[" {
+                let r = _ti_parse_csi(buf, i + 1)
+                let next_i = r[0]
+                if next_i < 0 { return [i, events] }   // incomplete
+                let ev = r[1]
+                if len(ev) > 0 { events.push(ev) }
+                i = next_i
+            } else if nx == "O" {
+                // SS3: ESC O <P/Q/R/S> = F1..F4 (legacy)
+                if i + 2 >= n { return [i, events] }
+                let f = buf.substring(i + 2, i + 3)
+                let name = if f == "P" { "F1" }
+                    else if f == "Q" { "F2" }
+                    else if f == "R" { "F3" }
+                    else if f == "S" { "F4" }
+                    else { "" }
+                if len(name) > 0 {
+                    events.push(["key", name, 1])
+                } else {
+                    events.push(["unknown", esc + "O" + f])
+                }
+                i = i + 3
+            } else {
+                // ESC + char → Alt+<char> (xterm meta convention).
+                events.push(["key", "Alt+" + nx, 3])
+                i = i + 2
+            }
+        } else if cc < 32 || cc == 127 {
+            // Control byte → named key or Ctrl+<letter>.
+            let nm = _ti_ctrl_name(cc)
+            if len(nm) > 0 {
+                events.push(["key", nm, if nm.starts_with("Ctrl+") { 5 } else { 1 }])
+            } else {
+                events.push(["unknown", c])
+            }
+            i = i + 1
+        } else {
+            // Printable char (single byte for ASCII; multibyte UTF-8
+            // passes through as raw bytes — caller normalizes).
+            events.push(["char", c])
+            i = i + 1
+        }
+    }
+    return [n, events]
+}
+
+// ── --selftest ─────────────────────────────────────────────────────
+fn _tinput_selftest() {
+    let mut fail = 0
+    let mut n = 0
+    let esc = _ti_esc()
+
+    // 1. printable ASCII → char
+    n = n + 1
+    let r1 = decode_input("a")
+    if r1[0] != 1 || len(r1[1]) != 1 { eprintln("FAIL 1a"); fail = fail + 1 }
+    if r1[1][0][0] != "char" || r1[1][0][1] != "a" { eprintln("FAIL 1b"); fail = fail + 1 }
+
+    // 2. arrow up
+    n = n + 1
+    let r2 = decode_input(esc + "[A")
+    if r2[0] != 3 { eprintln("FAIL 2a got=" + to_string(r2[0])); fail = fail + 1 }
+    if len(r2[1]) != 1 || r2[1][0][0] != "key" || r2[1][0][1] != "Up" {
+        eprintln("FAIL 2b"); fail = fail + 1
+    }
+
+    // 3. F5 = ESC [ 15 ~
+    n = n + 1
+    let r3 = decode_input(esc + "[15~")
+    if r3[1][0][1] != "F5" { eprintln("FAIL 3 got=" + r3[1][0][1]); fail = fail + 1 }
+
+    // 4. SS3 F1 = ESC O P
+    n = n + 1
+    let r4 = decode_input(esc + "OP")
+    if r4[1][0][1] != "F1" { eprintln("FAIL 4"); fail = fail + 1 }
+
+    // 5. bracketed paste markers
+    n = n + 1
+    let r5 = decode_input(esc + "[200~hi" + esc + "[201~")
+    let evs5 = r5[1]
+    if len(evs5) != 4 { eprintln("FAIL 5a count=" + to_string(len(evs5))); fail = fail + 1 }
+    if evs5[0][0] != "paste_start" { eprintln("FAIL 5b"); fail = fail + 1 }
+    if evs5[3][0] != "paste_end" { eprintln("FAIL 5c"); fail = fail + 1 }
+
+    // 6. focus events
+    n = n + 1
+    let r6 = decode_input(esc + "[I" + esc + "[O")
+    if r6[1][0][0] != "focus_in" || r6[1][1][0] != "focus_out" {
+        eprintln("FAIL 6"); fail = fail + 1
+    }
+
+    // 7. SGR mouse press
+    n = n + 1
+    let r7 = decode_input(esc + "[<0;10;5M")
+    let m = r7[1][0]
+    if m[0] != "mouse" || m[1] != 0 || m[2] != 10 || m[3] != 5 || m[4] != "press" {
+        eprintln("FAIL 7"); fail = fail + 1
+    }
+
+    // 8. Ctrl+A
+    n = n + 1
+    let r8 = decode_input(from_char_code(1))
+    if r8[1][0][0] != "key" || r8[1][0][1] != "Ctrl+A" {
+        eprintln("FAIL 8"); fail = fail + 1
+    }
+
+    // 9. Enter (CR)
+    n = n + 1
+    let r9 = decode_input(from_char_code(13))
+    if r9[1][0][1] != "Enter" { eprintln("FAIL 9"); fail = fail + 1 }
+
+    // 10. Backspace (DEL=127)
+    n = n + 1
+    let r10 = decode_input(from_char_code(127))
+    if r10[1][0][1] != "Backspace" { eprintln("FAIL 10"); fail = fail + 1 }
+
+    // 11. Tab
+    n = n + 1
+    let r11 = decode_input(from_char_code(9))
+    if r11[1][0][1] != "Tab" { eprintln("FAIL 11"); fail = fail + 1 }
+
+    // 12. lone ESC byte → Escape key
+    n = n + 1
+    let r12 = decode_input(esc)
+    if r12[1][0][1] != "Escape" { eprintln("FAIL 12"); fail = fail + 1 }
+
+    // 13. Alt+a = ESC + a
+    n = n + 1
+    let r13 = decode_input(esc + "a")
+    if r13[1][0][1] != "Alt+a" { eprintln("FAIL 13"); fail = fail + 1 }
+
+    // 14. shift+arrow: ESC [ 1;2A → Up with mods=2
+    n = n + 1
+    let r14 = decode_input(esc + "[1;2A")
+    if r14[1][0][1] != "Up" || r14[1][0][2] != 2 {
+        eprintln("FAIL 14"); fail = fail + 1
+    }
+
+    // 15. incomplete sequence → consumed=0
+    n = n + 1
+    let r15 = decode_input(esc + "[")
+    if r15[0] != 0 { eprintln("FAIL 15 got consumed=" + to_string(r15[0])); fail = fail + 1 }
+
+    // 16. _ti_atoi
+    n = n + 1
+    if _ti_atoi("42") != 42 { eprintln("FAIL 16a"); fail = fail + 1 }
+    n = n + 1
+    if _ti_atoi("") != 0 { eprintln("FAIL 16b"); fail = fail + 1 }
+
+    if fail == 0 {
+        println("__TERM_INPUT_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__TERM_INPUT_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _tinput_argv = args()
+let mut _tinput_st = false
+let mut _tinput_ai = 0
+while _tinput_ai < len(_tinput_argv) {
+    if _tinput_argv[_tinput_ai] == "--selftest-term-input" { _tinput_st = true }
+    if _tinput_argv[_tinput_ai] == "--selftest" {
+        let mut _tinput_aj = 0
+        while _tinput_aj < len(_tinput_argv) {
+            if _tinput_argv[_tinput_aj].ends_with("/stdlib/term_input.hexa") { _tinput_st = true }
+            _tinput_aj = _tinput_aj + 1
+        }
+    }
+    _tinput_ai = _tinput_ai + 1
+}
+if _tinput_st {
+    _tinput_selftest()
+}
