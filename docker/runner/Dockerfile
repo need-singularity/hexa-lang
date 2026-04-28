@@ -40,8 +40,24 @@ FROM debian:12-slim AS builder
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
         ca-certificates tini curl wget busybox-static \
-        gcc libc6-dev \
+        gcc libc6-dev gnupg \
  && rm -rf /var/lib/apt/lists/*
+# ω-runner-8 (2026-04-28): node 20 added to unblock B3 P0 (F-MX-3-c).
+# The hive-cli child process (`node /Users/ghost/.../hive-cli`) needs a node
+# binary inside the container; without it subagent_dispatch.hexa hits
+# `container-no-node` rc=76 and the entire kick infra fails. We install
+# nodejs in the builder stage where apt is available, then COPY just the
+# /usr/bin/node binary + transitive deps into the distroless runtime stage.
+# nodejs deb installs node at /usr/bin/node and depends only on libc/libstdc++
+# (which distroless/cc-debian12 already ships), so the COPY footprint is
+# small (~80 MB statically-linked node + minimal deps).
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+ && apt-get install -y --no-install-recommends nodejs \
+ && rm -rf /var/lib/apt/lists/* \
+ && node --version \
+ && npm --version \
+ && which node \
+ && ls -la /usr/bin/node
 # ω-runner-7 (2026-04-26): gcc + libc6-dev added so the builder stage can
 # compile self/native/native_gate.c → /opt/hexa/native_gate.so.  The
 # distroless runtime stage then COPY's just the .so (no toolchain bloat
@@ -127,6 +143,23 @@ RUN set -eux; \
        -ldl; \
     ls -la /opt/hexa/native_gate.so; \
     test -s /opt/hexa/native_gate.so
+
+# ω-runner-8 (2026-04-28): build npm/npx wrapper scripts for runtime stage.
+# Why a wrapper instead of a symlink: docker buildkit's `COPY --from=builder`
+# DEREFERENCES symlinks across stages (turns them into regular files), which
+# breaks the relative `require('../lib/cli.js')` resolution baked into the
+# upstream npm-cli.js stub.  A small sh wrapper that invokes node with the
+# canonical absolute path of the cli script side-steps the issue entirely:
+# node receives `/usr/lib/node_modules/npm/bin/npm-cli.js` as argv[1], so
+# __dirname inside that script is `/usr/lib/node_modules/npm/bin`, and
+# `require('../lib/cli.js')` resolves correctly to the bundled npm sources.
+# /bin/sh in runtime is busybox (staged earlier), so the wrapper runs there.
+RUN mkdir -p /opt/npm-bin \
+ && printf '#!/bin/sh\nexec /usr/bin/node /usr/lib/node_modules/npm/bin/npm-cli.js "$@"\n' > /opt/npm-bin/npm \
+ && printf '#!/bin/sh\nexec /usr/bin/node /usr/lib/node_modules/npm/bin/npx-cli.js "$@"\n' > /opt/npm-bin/npx \
+ && chmod +x /opt/npm-bin/npm /opt/npm-bin/npx \
+ && ls -la /opt/npm-bin/ \
+ && cat /opt/npm-bin/npm
 
 # ─────────────────────────────────────────────────────────────────
 # Stage 2: runtime.  gcr.io/distroless/cc-debian12 ships libc + libgcc +
@@ -216,6 +249,28 @@ ENV HEXA_STDLIB_ROOT=/usr/local/bin/self/stdlib
 # doc/security/os-level-enforcement-limits.md §11.
 COPY --from=builder /opt/hexa/native_gate.so /opt/hexa/native_gate.so
 ENV LD_PRELOAD=/opt/hexa/native_gate.so
+
+# ω-runner-8 (2026-04-28): node 20 binary + npm for hive-cli child process.
+# Unblocks B3 P0 (F-MX-3-c) container-no-node rc=76 fault that's been
+# repeating for 6 cycles. The nodesource deb installs:
+#   /usr/bin/node              (~99 MB v8 runtime, dyn-linked against
+#                               libstdc++/libgcc_s/libc — all in distroless/cc)
+#   /usr/lib/node_modules/npm  (~10 MB pure-JS npm CLI)
+#   /usr/bin/npm + /usr/bin/npx (symlinks → ../lib/node_modules/npm/bin/*)
+# No /usr/share/nodejs in the deb (probed 2026-04-28 from builder stage).
+# npm/npx are symlinks: `COPY` follows them so the runtime gets the actual
+# JS file, not the dangling symlink — we recreate the symlinks at runtime.
+COPY --from=builder /usr/bin/node /usr/bin/node
+COPY --from=builder /usr/lib/node_modules /usr/lib/node_modules
+# npm/npx in /usr/bin are originally symlinks (../lib/node_modules/npm/bin/*-cli.js).
+# The cli.js scripts do `require('../lib/cli.js')`, which only resolves
+# correctly when the script is invoked via a symlink whose target is the
+# real bin dir (node resolves symlinks before computing __dirname for
+# require()).  Builder stage already staged /opt/npm-bin/{npm,npx} as
+# symlinks pointing at /usr/lib/node_modules/npm/bin/*-cli.js — COPY those
+# symlinks into /usr/bin/ here.
+COPY --from=builder /opt/npm-bin/npm /usr/bin/npm
+COPY --from=builder /opt/npm-bin/npx /usr/bin/npx
 
 WORKDIR /work
 
