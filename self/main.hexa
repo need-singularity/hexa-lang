@@ -32,7 +32,10 @@ fn cmd_help() {
     println("    hexa <SUBCOMMAND> [ARGS...]")
     println("")
     println("SUBCOMMANDS:")
-    println("    run <file> [args...]    Execute a .hexa script (interpreter)")
+    println("    run [--no-sentinel] <file> [args...]")
+    println("                            Execute a .hexa script (interpreter)")
+    println("                              --no-sentinel: stdout 청정 — trailing")
+    println("                                __HEXA_RC=N 미출력 (HEXA_NO_SENTINEL=1 동등)")
     println("    batch <f1> <f2> ...     Run N scripts sharing one CLI dispatch")
     println("                              Each result delimited by ===BATCH_RESULT===")
     println("    parse <file>            Parse-only check (no exec, no codegen)")
@@ -1462,6 +1465,66 @@ fn run_stream_with_sentinel(cmd) {
     return rc
 }
 
+// raw 159 (2026-04-28): `--no-sentinel` / HEXA_NO_SENTINEL=1 mode.
+//
+// Background: cmd_run / try_cache_exec inject `; echo __HEXA_RC=$?`
+// into the shell wrapper so the parent dispatcher can recover the
+// child rc from a popen()-captured stdout buffer. The streaming
+// variant (run_stream_with_sentinel) strips that trailing line on
+// EOF — but the strip is only correct when the child's last stdout
+// emit ENDED in `\n`. For children that emit `print("hello")` (no
+// trailing newline), fgets concatenates `hello__HEXA_RC=0\n` into a
+// SINGLE trailing line; `last.starts_with("__HEXA_RC=")` then fails
+// and the sentinel leaks through to the user's stdout — breaking
+// `JSON.parse(stdout)` callers (hive `fake-{anima,hexa,pi-rpc}.mjs`
+// fixtures spawned from .ts tests).
+//
+// Two ergonomic opt-outs:
+//   * CLI flag:  `hexa run --no-sentinel <script>`
+//   * env var:   `HEXA_NO_SENTINEL=1 hexa run <script>`
+//
+// In no-sentinel mode the wrapper redirects rc to a sidechannel file
+// (`; echo $? > <rc_tmp>`) instead of stdout. Stdout stays byte-clean.
+// After exec_stream returns we read the rc file, propagate as before.
+//
+// Backward compatibility: default behavior (no flag, no env) keeps
+// the legacy `__HEXA_RC=N` stdout sentinel (callers that already
+// strip it — e.g. tool/roadmap_integrate.hexa — see no change).
+let mut cmd_run_no_sentinel_mode = false
+
+// Lazily resolved by cmd_run / try_cache_exec — env var check is per
+// invocation so a parent script can scope `HEXA_NO_SENTINEL=1` to a
+// single child without restarting the dispatcher.
+fn no_sentinel_active() {
+    if cmd_run_no_sentinel_mode { return true }
+    if env_var("HEXA_NO_SENTINEL") == "1" { return true }
+    return false
+}
+
+// Streaming forwarder for no-sentinel mode: every fgets() line goes
+// straight to stdout — there is no tail-line speculation because the
+// child shell does NOT emit any trailing __HEXA_RC sentinel into the
+// stream. rc lives in `rc_tmp` (sidechannel file).
+fn __hexa_run_stream_passthrough(s) {
+    print(s)
+}
+
+fn run_stream_no_sentinel(cmd, rc_tmp) {
+    let _ = exec_stream(cmd, __hexa_run_stream_passthrough)
+    let mut rc = 0
+    if file_exists(rc_tmp) {
+        let raw = read_file(rc_tmp)
+        let mut s = raw
+        let sl = len(s)
+        if sl > 0 && s.substring(sl - 1, sl) == "\n" {
+            s = s.substring(0, sl - 1)
+        }
+        if len(s) > 0 { rc = to_int(s) }
+        exec("rm -f '" + rc_tmp + "'")
+    }
+    return rc
+}
+
 fn try_cache_exec(file, extra_args) {
     // Returns exit-code on cache hit (child fully executed + collected),
     // -1 on miss. Mirrors the shell-watch construction in cmd_run
@@ -1492,14 +1555,20 @@ fn try_cache_exec(file, extra_args) {
     let vm_env = if cmd_run_vm_mode { "HEXA_VM=1 " } else { "" }
     let watch = " ) & C=$!; ( while kill -0 $C 2>/dev/null; do [ $PPID -eq 1 ] && { kill -9 $C 2>/dev/null; exit; }; kill -0 $PPID 2>/dev/null || { kill -9 $C 2>/dev/null; exit; }; sleep 0.05; done ) & wait $C"
     let stderr_tmp = runtime_tmpname("cache_err")
-    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + "; echo __HEXA_RC=$?"
+    // raw 159: --no-sentinel / HEXA_NO_SENTINEL=1 splits the rc out of
+    // stdout into a sidechannel file. Default keeps legacy stdout
+    // sentinel for backward compatibility.
+    let no_sent = no_sentinel_active()
+    let rc_tmp = if no_sent { runtime_tmpname("cache_rc") } else { "" }
+    let rc_inject = if no_sent { "; echo $? > '" + rc_tmp + "'" } else { "; echo __HEXA_RC=$?" }
+    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + cached + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + rc_inject
     // 2026-04-25 streaming refactor: popen-read line-by-line via
     // exec_stream() instead of exec()-then-split. Forwarded lines flush
     // per-newline (runtime.c _IOLBF stdout) so children that emit
     // progress incrementally surface to the grandparent without the
     // legacy "all output appears at process exit" stall.
     // AOT-cache parity: identical helper used in cmd_run below.
-    let rc = run_stream_with_sentinel(cmd)
+    let rc = if no_sent { run_stream_no_sentinel(cmd, rc_tmp) } else { run_stream_with_sentinel(cmd) }
     if file_exists(stderr_tmp) {
         let err_buf = read_file(stderr_tmp)
         if len(err_buf) > 0 { eprint(err_buf) }
@@ -2036,7 +2105,15 @@ fn cmd_run(file, extra_args) {
     //   stdout 만 popen 으로 캡처 → __HEXA_RC 샌티넬 복원.
     //   stderr temp 파일은 exec 완료 후 eprint() 로 부모 stderr 로 재방출.
     let stderr_tmp = runtime_tmpname("run_err")
-    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + interp + "' '" + script + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + "; echo __HEXA_RC=$?"
+    // raw 159: --no-sentinel / HEXA_NO_SENTINEL=1 keeps stdout byte-clean
+    // by routing rc through a sidechannel file. Default behavior
+    // preserves the legacy `__HEXA_RC=N` stdout sentinel (backward
+    // compat for callers that already strip it on their end, e.g.
+    // tool/roadmap_integrate.hexa).
+    let no_sent = no_sentinel_active()
+    let rc_tmp = if no_sent { runtime_tmpname("run_rc") } else { "" }
+    let rc_inject = if no_sent { "; echo $? > '" + rc_tmp + "'" } else { "; echo __HEXA_RC=$?" }
+    let cmd = "exec 3<&0; ( " + ffi_env + vm_env + "'" + interp + "' '" + script + "'" + arg_tail + " <&3 2>'" + stderr_tmp + "'" + watch + rc_inject
     // 2026-04-25 streaming refactor:
     //   was `let out = exec(cmd)` (popen → full-buffer → split → print),
     //   which forced sub-200ms-event-latency tools (hive subagent
@@ -2048,7 +2125,7 @@ fn cmd_run(file, extra_args) {
     //   Stderr-temp + parent-death watchdog + rc propagation contract
     //   unchanged. AOT-cache parity: try_cache_exec uses the same
     //   helper byte-for-byte.
-    let rc = run_stream_with_sentinel(cmd)
+    let rc = if no_sent { run_stream_no_sentinel(cmd, rc_tmp) } else { run_stream_with_sentinel(cmd) }
     // 2026-04-20: stderr 재방출 — temp 파일을 read_file 로 읽어 eprint().
     // 순서를 완벽히 보존할 수는 없어도 "stderr=stderr / stdout=stdout"
     // 라우팅은 복원. (스트리밍 전환 후에도 stderr 는 여전히 temp 파일에
@@ -2736,15 +2813,26 @@ if len(av) < 3 {
             //     bc_vm_run() call) execute identically with or without
             //     the flag — the env var is purely advisory until the
             //     AST→bc bridge exists.
+            // raw 159 (2026-04-28): `--no-sentinel` opt-in flag — same
+            //   accepted positions and flag-strip semantics as `--vm`.
+            //   Suppresses the trailing `__HEXA_RC=N` stdout sentinel
+            //   (rc routed through a sidechannel file instead). Equivalent
+            //   to setting HEXA_NO_SENTINEL=1 in the environment.
+            //   Use case: callers parse the child's stdout directly
+            //   (e.g. `hexa run script.hexa | jq`, JSON.parse pipelines,
+            //   hive fake-* test fixtures spawned from .ts via spawn).
             // bt 39: av[4..] = 스크립트 전달 인자 (argv forwarding)
             let mut run_args = []
             let mut want_vm = false
+            let mut want_no_sentinel = false
             let mut file_arg = ""
             let mut ri = 3
             while ri < len(av) {
                 let a = av[ri]
                 if a == "--vm" {
                     want_vm = true
+                } else if a == "--no-sentinel" {
+                    want_no_sentinel = true
                 } else if len(file_arg) == 0 {
                     file_arg = a
                 } else {
@@ -2756,7 +2844,9 @@ if len(av) < 3 {
                 println("error: 'run' requires <file>")
                 cmd_help()
             } else {
+                cmd_run_no_sentinel_mode = want_no_sentinel
                 cmd_run_dispatch(file_arg, run_args, want_vm)
+                cmd_run_no_sentinel_mode = false
             }
         }
     } else if sub == "batch" {
