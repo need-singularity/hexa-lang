@@ -114,6 +114,14 @@
 //       a29_encode_v2 try-and-revert returns shortest of {v2, v1, identity}.
 //       LIVE FIRE on v2 wire deferred to next tick (let ac4001ea v1 LIVE FIRE
 //       finish first). NO A25 dispatcher integration this tick.
+//     - V3 Length-code extra-bits IMPLEMENTED (a197c555 caveat #5 resolution,
+//       2026-04-28 v3 first-tick): RFC 1951 §3.2.5 29-symbol length alphabet
+//       + 0..5 extra-bit ranges replaces v2's 256 distinct length codes.
+//       Token alphabet shrinks 514→285 (-44.6%). Code-length table shrinks
+//       514×4=2056 bits → 285×4=1140 bits (-44.6%, saves 114.5 bytes header).
+//       Header `# a29:s3 v=deflate-v3`. a29_encode_v3 try-and-revert returns
+//       shortest of {v3, v2, v1, identity}. LIVE FIRE deferred (let a2c50860
+//       v2 LIVE FIRE finish first). NO A25 dispatcher integration this tick.
 //     - Length-limited Huffman (cap=15 bits) uses iterative re-balance with
 //       worst-case 256 iterations; production-grade is package-merge algorithm
 //       (Larmore-Hirschberg 1990) deferred to follow-on tick.
@@ -135,6 +143,17 @@ const A29_MAX_CODE_LEN = 15                // RFC 1951 cap
 //   30 distance codes (0..29) covering distance 1..32768.
 //   Each distance code has a base + extra-bit width (0..13 bits).
 const A29_DIST_ALPHABET = 30                // RFC 1951 distance code count
+
+// v3 length-code alphabet (RFC 1951 §3.2.5).
+//   29 length codes (0..28; raw RFC numbering 257..285) covering length 3..258.
+//   Each length code has a base + extra-bit width (0..5 bits).
+//   v3 packs token alphabet as 256 literals + 29 length codes = 285 symbols
+//   (vs v2's 256+256=512 + 2 unused = 514). Smaller alphabet → smaller code
+//   table (~29% saving on the 514×4=2056-bit literal table) AND tighter Huffman
+//   over length codes for non-uniform length distributions (text-heavy short
+//   runs cluster in codes 0..7 = lengths 3..10).
+const A29_LEN_ALPHABET_V3 = 29              // RFC 1951 length code count
+const A29_TOKEN_ALPHABET_V3 = 285           // 0..255 literals, 256..284 length
 
 // Wire base64url alphabet (canonical interop with A16/A17/A18/A23).
 const A29_B64_ALPHA = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
@@ -1382,12 +1401,550 @@ fn a29_decode_v2(stream: string) -> string {
     return parts.join("")
 }
 
-// ───────────────── PASS 4 — selftest (10 fixtures: 5 v1 + 5 v2) ─────────────────
+// ═════════════════════════════════════════════════════════════════════════════
+// V3 EXTENSION — Length-code extra-bits (RFC 1951 §3.2.5)
+// ═════════════════════════════════════════════════════════════════════════════
+//
+// v3 design (a197c555 caveat #5 resolution):
+//   v1+v2 emit one Huffman symbol per length value (256 distinct codes for
+//   length 3..258). RFC 1951 §3.2.5 specifies 29 length codes (raw RFC numbering
+//   257..285) + 0..5 extra bits per code. Mapping:
+//     code_idx 0..7   (raw 257..264)  →  length 3..10        (0 extra bits)
+//     code_idx 8..11  (raw 265..268)  →  length 11..18       (1 extra bit)
+//     code_idx 12..15 (raw 269..272)  →  length 19..34       (2 extra bits)
+//     code_idx 16..19 (raw 273..276)  →  length 35..66       (3 extra bits)
+//     code_idx 20..23 (raw 277..280)  →  length 67..130      (4 extra bits)
+//     code_idx 24..27 (raw 281..284)  →  length 131..257     (5 extra bits)
+//     code_idx 28     (raw 285)       →  length 258          (0 extra bits)
+//
+//   v3 token alphabet = 256 literals + 29 length codes = 285 symbols (was 514).
+//   Code-length table shrinks 514×4 = 2056 bits → 285×4 = 1140 bits (saves
+//   114.5 bytes header overhead). For text-heavy corpora where short matches
+//   dominate (length 3..10 = code 0..7), the 29-code alphabet has lower entropy
+//   than 256-code alphabet → tighter Huffman codes.
+//
+// v3 wire format:
+//   Header:    `# a29:s3 v=deflate-v3 n=<input_bytes> t=<n_huff_tokens>`
+//   Body:      `^a<base64url-of-bitstream>`
+//   Bitstream layout:
+//     (1) 285 × 4-bit literal/length code-length entries (was 514 in v2)
+//     (2)  30 × 4-bit distance code-length entries (same as v2)
+//     (3) Huffman-coded tokens MSB-first
+//     (4) For length tokens (256..284): length extra bits (0..5) + distance
+//         Huffman code + distance extra bits (0..13)
+//     (5) Final byte zero-padded.
+//
+// raw 142 D2 try-and-revert (a29_encode_v3):
+//   Returns shortest of {wire_v3, wire_v2, wire_v1, identity}. v3 saves
+//   ~114.5B fixed (header table) + per-match Huffman tightening; v2 still wins
+//   on corpora with very few matches where 514-table sparsity already
+//   approached 285-table cost.
+//
+// raw 137 cmix-ban: length codes derived deterministically. No fp ops.
+
+// _a29_len_extra_bits[c]: extra bits for length code c (0..28). RFC 1951.
+fn _a29_len_extra_bits(code: int) -> int {
+    if code < 8 { return 0 }
+    if code == 28 { return 0 }
+    let pair: i64 = (code - 4) / 4
+    return pair
+}
+
+// _a29_len_base[c]: base length for length code c (0..28). RFC 1951.
+//   base[0]=3; for c>=1, base[c] = base[c-1] + (1 << extra_bits[c-1]).
+//   Edge: base[28] = 258 (length 258 is special-cased in RFC 1951).
+fn _a29_len_base(code: int) -> int {
+    if code == 28 { return 258 }
+    if code == 0 { return 3 }
+    let mut base: i64 = 3
+    let mut c: i64 = 0
+    while c < code {
+        let eb: i64 = _a29_len_extra_bits(c)
+        let span: i64 = _pow2(eb)
+        base = base + span
+        c = c + 1
+    }
+    return base
+}
+
+// _a29_len_to_code: classify a length 3..258 into (code, extra_value).
+// Returns [code, extra_value]. extra_value is the raw bits emitted after code.
+fn _a29_len_to_code(length: int) -> array {
+    if length <= 3 { return [0, 0] }
+    if length >= 258 { return [28, 0] }
+    let mut c: i64 = 0
+    while c < A29_LEN_ALPHABET_V3 - 1 {
+        let base: i64 = _a29_len_base(c)
+        let eb: i64 = _a29_len_extra_bits(c)
+        let span: i64 = _pow2(eb)
+        if length >= base && length < base + span {
+            return [c, length - base]
+        }
+        c = c + 1
+    }
+    return [28, 0]
+}
+
+// _a29_len_decode: invert (code, extra_value) → length.
+fn _a29_len_decode(code: int, extra_val: int) -> int {
+    let base: i64 = _a29_len_base(code)
+    return base + extra_val
+}
+
+// _a29_freq_build_v3: count v3-alphabet (285 symbols) frequencies. Literal
+// bytes 0..255 unchanged; length-codes 256..284 are derived from token's
+// length value via _a29_len_to_code mapping.
+fn _a29_freq_build_v3(tokens: array) -> array {
+    let mut freq = []
+    let mut a: i64 = 0
+    while a < A29_TOKEN_ALPHABET_V3 { freq.push(0); a = a + 1 }
+    let n: i64 = len(tokens)
+    let mut p: i64 = 0
+    while p < n {
+        let t: i64 = tokens[p]
+        if t < 256 {
+            freq[t] = freq[t] + 1
+            p = p + 1
+        } else {
+            // Token range 256..513 represents length 3..258 (len = (t-256)+3).
+            let mlen: i64 = (t - 256) + A29_MIN_MATCH
+            let mapping = _a29_len_to_code(mlen)
+            let lc: i64 = mapping[0]
+            freq[256 + lc] = freq[256 + lc] + 1
+            p = p + 3
+        }
+    }
+    return freq
+}
+
+// _a29_build_code_lengths_v3: canonical Huffman over 285-symbol literal/length
+// alphabet. Mirrors a29_build_code_lengths shape with smaller alphabet.
+fn _a29_build_code_lengths_v3(freq: array) -> array {
+    let mut lengths = []
+    let mut a: i64 = 0
+    while a < A29_TOKEN_ALPHABET_V3 { lengths.push(0); a = a + 1 }
+
+    let mut leaves = []
+    let mut s: i64 = 0
+    while s < A29_TOKEN_ALPHABET_V3 {
+        if freq[s] > 0 { leaves.push(s) }
+        s = s + 1
+    }
+    let n_leaves: i64 = len(leaves)
+
+    if n_leaves == 0 { return lengths }
+    if n_leaves == 1 {
+        lengths[leaves[0]] = 1
+        return lengths
+    }
+
+    let mut parent = {}
+    let heap_state = [[], [0]]
+    let mut k: i64 = 0
+    while k < n_leaves {
+        let sym: i64 = leaves[k]
+        _heap_push(heap_state, freq[sym], sym)
+        k = k + 1
+    }
+    let mut next_id: i64 = A29_TOKEN_ALPHABET_V3
+
+    while _heap_size(heap_state) >= 2 {
+        let a_entry = _heap_pop(heap_state)
+        let b_entry = _heap_pop(heap_state)
+        let af: i64 = a_entry[0]
+        let an: i64 = a_entry[1]
+        let bf: i64 = b_entry[0]
+        let bn: i64 = b_entry[1]
+        let new_id: i64 = next_id
+        next_id = next_id + 1
+        parent[to_string(an)] = new_id
+        parent[to_string(bn)] = new_id
+        _heap_push(heap_state, af + bf, new_id)
+    }
+
+    let root_entry = _heap_pop(heap_state)
+    let root_id: i64 = root_entry[1]
+
+    let mut q: i64 = 0
+    while q < n_leaves {
+        let sym: i64 = leaves[q]
+        let mut depth: i64 = 0
+        let mut cur: i64 = sym
+        while cur != root_id && depth < 64 {
+            let key = to_string(cur)
+            if !map_contains_key(parent, key) { break }
+            cur = parent[key]
+            depth = depth + 1
+        }
+        if depth == 0 { depth = 1 }
+        lengths[sym] = depth
+        q = q + 1
+    }
+
+    let mut iter: i64 = 0
+    while iter < 1024 {
+        let mut max_len: i64 = 0
+        let mut max_sym: i64 = -1
+        let mut s2: i64 = 0
+        while s2 < A29_TOKEN_ALPHABET_V3 {
+            if lengths[s2] > max_len { max_len = lengths[s2]; max_sym = s2 }
+            s2 = s2 + 1
+        }
+        if max_len <= A29_MAX_CODE_LEN { break }
+        let mut min_len: i64 = 999
+        let mut min_sym: i64 = -1
+        let mut s3: i64 = 0
+        while s3 < A29_TOKEN_ALPHABET_V3 {
+            if lengths[s3] > 0 && lengths[s3] < min_len { min_len = lengths[s3]; min_sym = s3 }
+            s3 = s3 + 1
+        }
+        if min_sym < 0 || max_sym < 0 { break }
+        if min_len >= A29_MAX_CODE_LEN { break }
+        lengths[max_sym] = max_len - 1
+        lengths[min_sym] = min_len + 1
+        iter = iter + 1
+    }
+    return lengths
+}
+
+// _a29_canonical_codes_v3: canonical assignment for 285-symbol alphabet.
+fn _a29_canonical_codes_v3(lengths: array) -> array {
+    let mut codes = []
+    let mut a: i64 = 0
+    while a < A29_TOKEN_ALPHABET_V3 { codes.push(0); a = a + 1 }
+
+    let mut bl_count = []
+    let mut i: i64 = 0
+    while i <= A29_MAX_CODE_LEN { bl_count.push(0); i = i + 1 }
+    let mut s: i64 = 0
+    while s < A29_TOKEN_ALPHABET_V3 {
+        let L: i64 = lengths[s]
+        if L > 0 && L <= A29_MAX_CODE_LEN { bl_count[L] = bl_count[L] + 1 }
+        s = s + 1
+    }
+
+    let mut next_code = []
+    let mut j: i64 = 0
+    while j <= A29_MAX_CODE_LEN { next_code.push(0); j = j + 1 }
+    let mut code_val: i64 = 0
+    let mut bits: i64 = 1
+    while bits <= A29_MAX_CODE_LEN {
+        code_val = (code_val + bl_count[bits - 1]) * 2
+        next_code[bits] = code_val
+        bits = bits + 1
+    }
+
+    let mut s2: i64 = 0
+    while s2 < A29_TOKEN_ALPHABET_V3 {
+        let L: i64 = lengths[s2]
+        if L > 0 {
+            codes[s2] = next_code[L]
+            next_code[L] = next_code[L] + 1
+        }
+        s2 = s2 + 1
+    }
+    return codes
+}
+
+// _a29_encode_force_v3: v3 wire — LZ77 + canonical Huffman over literal/length
+// alphabet (285 symbols, RFC 1951 length codes) + canonical Huffman over
+// distance alphabet (30 symbols, same as v2) + length+distance extra bits.
+// Header `# a29:s3 v=deflate-v3`.
+fn _a29_encode_force_v3(text: string) -> string {
+    let n: i64 = len(text)
+    if n >= 7 && text.substring(0, 7) == "# a29:s" { return text }
+
+    let tokens = a29_lz_tokenize(text)
+    let n_arr: i64 = len(tokens)
+    let mut n_huff_tokens: i64 = 0
+    let mut np: i64 = 0
+    while np < n_arr {
+        let tt: i64 = tokens[np]
+        if tt < 256 { n_huff_tokens = n_huff_tokens + 1; np = np + 1 }
+        else { n_huff_tokens = n_huff_tokens + 1; np = np + 3 }
+    }
+
+    let lit_freq = _a29_freq_build_v3(tokens)
+    let dist_freq = _a29_dist_freq_build(tokens)
+
+    let lit_lengths = _a29_build_code_lengths_v3(lit_freq)
+    let lit_codes = _a29_canonical_codes_v3(lit_lengths)
+    let dist_lengths = _a29_dist_build_code_lengths(dist_freq)
+    let dist_codes = _a29_dist_canonical_codes(dist_lengths)
+
+    let bit_state = [[], 0, 0]
+
+    // (1) 285 × 4-bit literal/length code-length table (was 514 in v2).
+    let mut s: i64 = 0
+    while s < A29_TOKEN_ALPHABET_V3 {
+        _bits_push(bit_state, lit_lengths[s], 4)
+        s = s + 1
+    }
+    // (2) 30 × 4-bit distance code-length table.
+    let mut sd: i64 = 0
+    while sd < A29_DIST_ALPHABET {
+        _bits_push(bit_state, dist_lengths[sd], 4)
+        sd = sd + 1
+    }
+
+    // (3+4) Huffman-coded tokens with length+distance extra bits.
+    let mut p: i64 = 0
+    while p < n_arr {
+        let t: i64 = tokens[p]
+        if t < 256 {
+            let L: i64 = lit_lengths[t]
+            let C: i64 = lit_codes[t]
+            _bits_push(bit_state, C, L)
+            p = p + 1
+        } else {
+            // Map token (256..513 = length 3..258) → length code 0..28 + extra.
+            let mlen: i64 = (t - 256) + A29_MIN_MATCH
+            let len_mapping = _a29_len_to_code(mlen)
+            let lc: i64 = len_mapping[0]
+            let len_extra: i64 = len_mapping[1]
+            let lit_sym: i64 = 256 + lc
+            let L: i64 = lit_lengths[lit_sym]
+            let C: i64 = lit_codes[lit_sym]
+            _bits_push(bit_state, C, L)
+            let leb: i64 = _a29_len_extra_bits(lc)
+            if leb > 0 { _bits_push(bit_state, len_extra, leb) }
+
+            // Distance code + extra bits (same as v2).
+            let dh: i64 = if p + 1 < n_arr { tokens[p + 1] } else { 0 }
+            let dl: i64 = if p + 2 < n_arr { tokens[p + 2] } else { 0 }
+            let dist: i64 = dh * 256 + dl
+            let dist_mapping = _a29_dist_to_code(dist)
+            let dc: i64 = dist_mapping[0]
+            let dist_extra: i64 = dist_mapping[1]
+            let dL: i64 = dist_lengths[dc]
+            let dC: i64 = dist_codes[dc]
+            _bits_push(bit_state, dC, dL)
+            let deb: i64 = _a29_dist_extra_bits(dc)
+            if deb > 0 { _bits_push(bit_state, dist_extra, deb) }
+            p = p + 3
+        }
+    }
+
+    let payload_bytes = _bits_flush(bit_state)
+    let payload_b64 = _b64_enc_bytes(payload_bytes)
+    let header = "# a29:s3 v=deflate-v3 n=" + to_string(n) + " t=" + to_string(n_huff_tokens)
+    let body = "^a" + payload_b64
+    return header + "\n" + body + "\n"
+}
+
+// a29_encode_v3: try-and-revert raw 142 D2 — return shortest of
+// {wire_v3, wire_v2, wire_v1, identity}.
+fn a29_encode_v3(text: string) -> string {
+    let n: i64 = len(text)
+    if n < A29_MIN_BYTES { return text }
+    if n >= 7 && text.substring(0, 7) == "# a29:s" { return text }
+    let v3 = _a29_encode_force_v3(text)
+    let v2 = _a29_encode_force_v2(text)
+    let v1 = _a29_encode_force(text)
+    let mut best = text
+    if len(v3) < len(best) { best = v3 }
+    if len(v2) < len(best) { best = v2 }
+    if len(v1) < len(best) { best = v1 }
+    return best
+}
+
+// _a29_decode_v3_to_bytes: decode v3 wire (^a sigil, header `# a29:s3`).
+// Returns byte array. Reads 285×4-bit lit/len table + 30×4-bit dist table,
+// then Huffman tokens with length+distance extra bits.
+fn _a29_decode_v3_to_bytes(stream: string) -> array {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return [] }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a29:s" { return [] }
+    if header.index_of("v=deflate-v3") < 0 { return [] }
+    let n_pos: i64 = header.index_of(" n=")
+    let t_pos: i64 = header.index_of(" t=")
+    if n_pos < 0 || t_pos < 0 { return [] }
+    let _n_bytes: i64 = parse_int(header.substring(n_pos + 3, t_pos))
+    let n_tokens: i64 = parse_int(header.substring(t_pos + 3, len(header)))
+
+    let mut body_b64 = ""
+    let mut i = 1
+    while i < len(lines) {
+        let l = lines[i]
+        if len(l) >= 2 && l.substring(0, 2) == "^a" {
+            body_b64 = l.substring(2, len(l))
+            break
+        }
+        i = i + 1
+    }
+    if len(body_b64) == 0 { return [] }
+    let payload_bytes = _b64_dec_bytes(body_b64)
+
+    let read_state = [payload_bytes, 0, 0]
+    // Read 285 × 4-bit lit/len lengths.
+    let mut lit_lengths = []
+    let mut s: i64 = 0
+    while s < A29_TOKEN_ALPHABET_V3 {
+        let L: i64 = _bits_read(read_state, 4)
+        lit_lengths.push(L)
+        s = s + 1
+    }
+    // Read 30 × 4-bit distance lengths.
+    let mut dist_lengths = []
+    let mut sd: i64 = 0
+    while sd < A29_DIST_ALPHABET {
+        let DL: i64 = _bits_read(read_state, 4)
+        dist_lengths.push(DL)
+        sd = sd + 1
+    }
+
+    // Build lit/len decode tables.
+    let mut bl_count = []
+    let mut i2: i64 = 0
+    while i2 <= A29_MAX_CODE_LEN { bl_count.push(0); i2 = i2 + 1 }
+    let mut s2: i64 = 0
+    while s2 < A29_TOKEN_ALPHABET_V3 {
+        let L: i64 = lit_lengths[s2]
+        if L > 0 && L <= A29_MAX_CODE_LEN { bl_count[L] = bl_count[L] + 1 }
+        s2 = s2 + 1
+    }
+    let mut first_code = []
+    let mut j2: i64 = 0
+    while j2 <= A29_MAX_CODE_LEN { first_code.push(0); j2 = j2 + 1 }
+    let mut code_val: i64 = 0
+    let mut bits: i64 = 1
+    while bits <= A29_MAX_CODE_LEN {
+        code_val = (code_val + bl_count[bits - 1]) * 2
+        first_code[bits] = code_val
+        bits = bits + 1
+    }
+    let mut sym_by_idx = []
+    let mut a3: i64 = 0
+    while a3 <= A29_MAX_CODE_LEN { sym_by_idx.push([]); a3 = a3 + 1 }
+    let mut s3: i64 = 0
+    while s3 < A29_TOKEN_ALPHABET_V3 {
+        let L: i64 = lit_lengths[s3]
+        if L > 0 && L <= A29_MAX_CODE_LEN { sym_by_idx[L].push(s3) }
+        s3 = s3 + 1
+    }
+
+    // Build distance decode tables (same as v2).
+    let mut d_bl_count = []
+    let mut di2: i64 = 0
+    while di2 <= A29_MAX_CODE_LEN { d_bl_count.push(0); di2 = di2 + 1 }
+    let mut ds2: i64 = 0
+    while ds2 < A29_DIST_ALPHABET {
+        let DL: i64 = dist_lengths[ds2]
+        if DL > 0 && DL <= A29_MAX_CODE_LEN { d_bl_count[DL] = d_bl_count[DL] + 1 }
+        ds2 = ds2 + 1
+    }
+    let mut d_first_code = []
+    let mut dj2: i64 = 0
+    while dj2 <= A29_MAX_CODE_LEN { d_first_code.push(0); dj2 = dj2 + 1 }
+    let mut d_code_val: i64 = 0
+    let mut d_bits: i64 = 1
+    while d_bits <= A29_MAX_CODE_LEN {
+        d_code_val = (d_code_val + d_bl_count[d_bits - 1]) * 2
+        d_first_code[d_bits] = d_code_val
+        d_bits = d_bits + 1
+    }
+    let mut d_sym_by_idx = []
+    let mut da3: i64 = 0
+    while da3 <= A29_MAX_CODE_LEN { d_sym_by_idx.push([]); da3 = da3 + 1 }
+    let mut ds3: i64 = 0
+    while ds3 < A29_DIST_ALPHABET {
+        let DL: i64 = dist_lengths[ds3]
+        if DL > 0 && DL <= A29_MAX_CODE_LEN { d_sym_by_idx[DL].push(ds3) }
+        ds3 = ds3 + 1
+    }
+
+    let mut tokens = []
+    let mut decoded: i64 = 0
+    while decoded < n_tokens {
+        let mut acc: i64 = 0
+        let mut found_sym: i64 = -1
+        let mut L: i64 = 1
+        while L <= A29_MAX_CODE_LEN {
+            let bit: i64 = _bits_read(read_state, 1)
+            acc = acc * 2 + bit
+            if bl_count[L] > 0 {
+                let fc: i64 = first_code[L]
+                if acc >= fc && acc < fc + bl_count[L] {
+                    let idx: i64 = acc - fc
+                    found_sym = sym_by_idx[L][idx]
+                    break
+                }
+            }
+            L = L + 1
+        }
+        if found_sym < 0 { break }
+        if found_sym < 256 {
+            tokens.push(found_sym)
+        } else {
+            // Length code: read length extra bits → reconstruct length →
+            // emit (256 + len-3) length token. Then read distance code +
+            // extra bits → reconstruct dh, dl bytes.
+            let lc: i64 = found_sym - 256
+            let leb: i64 = _a29_len_extra_bits(lc)
+            let len_extra: i64 = if leb > 0 { _bits_read(read_state, leb) } else { 0 }
+            let mlen: i64 = _a29_len_decode(lc, len_extra)
+            tokens.push(256 + (mlen - A29_MIN_MATCH))
+
+            let mut d_acc: i64 = 0
+            let mut d_found: i64 = -1
+            let mut DL: i64 = 1
+            while DL <= A29_MAX_CODE_LEN {
+                let dbit: i64 = _bits_read(read_state, 1)
+                d_acc = d_acc * 2 + dbit
+                if d_bl_count[DL] > 0 {
+                    let dfc: i64 = d_first_code[DL]
+                    if d_acc >= dfc && d_acc < dfc + d_bl_count[DL] {
+                        let didx: i64 = d_acc - dfc
+                        d_found = d_sym_by_idx[DL][didx]
+                        break
+                    }
+                }
+                DL = DL + 1
+            }
+            if d_found < 0 { break }
+            let deb: i64 = _a29_dist_extra_bits(d_found)
+            let dist_extra: i64 = if deb > 0 { _bits_read(read_state, deb) } else { 0 }
+            let dist: i64 = _a29_dist_decode(d_found, dist_extra)
+            let dh: i64 = dist / 256
+            let dl: i64 = dist - dh * 256
+            tokens.push(dh)
+            tokens.push(dl)
+        }
+        decoded = decoded + 1
+    }
+    return a29_lz_detokenize(tokens)
+}
+
+// a29_decode_v3: top-level decoder routes by header to v1, v2, or v3 path.
+fn a29_decode_v3(stream: string) -> string {
+    let lines = stream.split("\n")
+    if len(lines) < 2 { return stream }
+    let header = lines[0]
+    if len(header) < 7 || header.substring(0, 7) != "# a29:s" { return stream }
+    let is_v3: bool = header.index_of("v=deflate-v3") >= 0
+    let is_v2: bool = header.index_of("v=deflate-v2") >= 0
+    let bytes = if is_v3 {
+        _a29_decode_v3_to_bytes(stream)
+    } else {
+        if is_v2 { _a29_decode_v2_to_bytes(stream) } else { _a29_decode_to_bytes(stream) }
+    }
+    if len(bytes) == 0 { return stream }
+    let mut parts = []
+    let mut i = 0
+    while i < len(bytes) {
+        parts.push(chr(bytes[i]))
+        i = i + 1
+    }
+    return parts.join("")
+}
+
+// ───────────────── PASS 4 — selftest (15 fixtures: 5 v1 + 5 v2 + 5 v3) ─────────────────
 
 fn _selftest() -> int {
     let mut pass: i64 = 0
     let mut fail: i64 = 0
-    println("# hxc_a29_deflate selftest (FIRST TICK + V2 — 10 fixtures: 5 v1 + 5 v2)")
+    println("# hxc_a29_deflate selftest (FIRST TICK + V2 + V3 — 15 fixtures: 5 v1 + 5 v2 + 5 v3)")
 
     // Fixture 1: English text (DEFLATE primary target).
     let phrase = "the quick brown fox jumps over the lazy dog "
@@ -1587,9 +2144,107 @@ fn _selftest() -> int {
         println("  FAIL: fixture-10 v2 short-input idempotency broken")
     }
 
+    // ─────── V3 fixtures (length-code extra-bits, header `# a29:s3`) ───────
+
+    // Fixture 11 (v3): English text — primary v3 win target (a197c555 caveat
+    // #5 resolution: 514→285 alphabet shrink for short-match-dominated corpora).
+    let enc11 = _a29_encode_force_v3(buf_eng)
+    let dec11 = a29_decode_v3(enc11)
+    let v2_eng_len: i64 = len(enc6)
+    let delta11_v2: i64 = v2_eng_len - len(enc11)
+    let delta11_v1: i64 = len(enc1) - len(enc11)
+    if dec11 == buf_eng {
+        let s11 = ((len(buf_eng) - len(enc11)) * 100) / len(buf_eng)
+        pass = pass + 1
+        println("  PASS: fixture-11 v3 English byte-eq " + to_string(len(buf_eng))
+                + " -> " + to_string(len(enc11)) + " (" + to_string(s11) + "% wire-saving, v2->v3 delta=" + to_string(delta11_v2) + "B, v1->v3 delta=" + to_string(delta11_v1) + "B)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-11 v3 English round-trip lost orig_len=" + to_string(len(buf_eng))
+                + " got_len=" + to_string(len(dec11)))
+    }
+
+    // Fixture 12 (v3): JSON / structured.
+    let enc12 = _a29_encode_force_v3(buf_json)
+    let dec12 = a29_decode_v3(enc12)
+    let v2_json_len: i64 = len(enc7)
+    let delta12_v2: i64 = v2_json_len - len(enc12)
+    let delta12_v1: i64 = len(enc2) - len(enc12)
+    if dec12 == buf_json {
+        let s12 = ((len(buf_json) - len(enc12)) * 100) / len(buf_json)
+        pass = pass + 1
+        println("  PASS: fixture-12 v3 JSON byte-eq " + to_string(len(buf_json))
+                + " -> " + to_string(len(enc12)) + " (" + to_string(s12) + "% wire-saving, v2->v3 delta=" + to_string(delta12_v2) + "B, v1->v3 delta=" + to_string(delta12_v1) + "B)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-12 v3 JSON round-trip lost orig_len=" + to_string(len(buf_json))
+                + " got_len=" + to_string(len(dec12)))
+    }
+
+    // Fixture 13 (v3): Korean / multibyte UTF-8.
+    let enc13 = _a29_encode_force_v3(buf_kor)
+    let dec13_bytes = _a29_decode_v3_to_bytes(enc13)
+    let mut ok13 = true
+    if len(dec13_bytes) != nk3 { ok13 = false }
+    let mut q13: i64 = 0
+    while ok13 && q13 < nk3 {
+        if dec13_bytes[q13] != ord(_byte_at(buf_kor, q13)) { ok13 = false }
+        q13 = q13 + 1
+    }
+    let v2_kor_len: i64 = len(enc8)
+    let delta13_v2: i64 = v2_kor_len - len(enc13)
+    let delta13_v1: i64 = len(enc3) - len(enc13)
+    if ok13 {
+        let s13: i64 = ((nk3 - len(enc13)) * 100) / nk3
+        pass = pass + 1
+        println("  PASS: fixture-13 v3 Korean multibyte byte-array byte-eq "
+                + to_string(nk3) + " -> " + to_string(len(enc13))
+                + " (" + to_string(s13) + "% wire-saving, v2->v3 delta=" + to_string(delta13_v2) + "B, v1->v3 delta=" + to_string(delta13_v1) + "B)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-13 v3 Korean round-trip lost orig_len=" + to_string(nk3)
+                + " got_len=" + to_string(len(dec13_bytes)))
+    }
+
+    // Fixture 14 (v3): mixed prose.
+    let enc14 = _a29_encode_force_v3(buf_prose)
+    let dec14_bytes = _a29_decode_v3_to_bytes(enc14)
+    let mut ok14 = true
+    if len(dec14_bytes) != np4 { ok14 = false }
+    let mut q14: i64 = 0
+    while ok14 && q14 < np4 {
+        if dec14_bytes[q14] != ord(_byte_at(buf_prose, q14)) { ok14 = false }
+        q14 = q14 + 1
+    }
+    let v2_prose_len: i64 = len(enc9)
+    let delta14_v2: i64 = v2_prose_len - len(enc14)
+    let delta14_v1: i64 = len(enc4) - len(enc14)
+    if ok14 {
+        let s14: i64 = ((np4 - len(enc14)) * 100) / np4
+        pass = pass + 1
+        println("  PASS: fixture-14 v3 mixed prose byte-array byte-eq " + to_string(np4)
+                + " -> " + to_string(len(enc14)) + " (" + to_string(s14) + "% wire-saving, v2->v3 delta=" + to_string(delta14_v2) + "B, v1->v3 delta=" + to_string(delta14_v1) + "B)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-14 v3 mixed prose round-trip lost orig_len=" + to_string(np4)
+                + " got_len=" + to_string(len(dec14_bytes)))
+    }
+
+    // Fixture 15 (v3): a29_encode_v3 try-and-revert raw 142 D2 — short input
+    // returns identity (below MIN_BYTES); two-stream idempotent.
+    let enc15 = a29_encode_v3(tiny)
+    let enc15b = a29_encode_v3(enc15)
+    if enc15 == tiny && enc15b == tiny {
+        pass = pass + 1
+        println("  PASS: fixture-15 v3 short-input passthrough idempotent (raw 65 + 68 + 142 D2)")
+    } else {
+        fail = fail + 1
+        println("  FAIL: fixture-15 v3 short-input idempotency broken")
+    }
+
     println("Results: " + to_string(pass) + " PASS / " + to_string(fail) + " FAIL")
     println("__HXC_A29_SELFTEST__ " + (if fail == 0 { "PASS" } else { "FAIL" })
-            + " (V2 TICK: v1 LZ77+canon-Huffman + v2 distance-Huffman 30-sym + 10 fixtures byte-eq; LIVE FIRE deferred)")
+            + " (V3 TICK: v1 LZ77+canon-Huffman + v2 distance-Huffman 30-sym + v3 length-Huffman 29-sym RFC 1951 + 15 fixtures byte-eq; LIVE FIRE deferred)")
     if fail == 0 { return 0 }
     return 1
 }
@@ -1603,6 +2258,7 @@ fn main() {
     let mut has_decode = false
     let mut has_force = false
     let mut has_v2 = false
+    let mut has_v3 = false
     let mut k = 0
     while k < len(av) {
         if av[k] == "--selftest" { has_selftest = true }
@@ -1610,6 +2266,7 @@ fn main() {
         if av[k] == "decode" { has_decode = true }
         if av[k] == "--force" { has_force = true }
         if av[k] == "--v2" { has_v2 = true }
+        if av[k] == "--v3" { has_v3 = true }
         k = k + 1
     }
     if has_selftest { exit(_selftest()) }
@@ -1629,7 +2286,7 @@ fn main() {
             q2 = q2 + 1
         }
         if len(paths) < 2 {
-            eprintln("usage: hexa hxc_a29_deflate.hexa <encode|decode> [--force] <in> <out>")
+            eprintln("usage: hexa hxc_a29_deflate.hexa <encode|decode> [--force] [--v2|--v3] <in> <out>")
             exit(3)
         }
         let in_path = paths[0]
@@ -1637,22 +2294,29 @@ fn main() {
         if has_encode {
             let txt = read_file(in_path)
             let res = if has_force {
-                if has_v2 { _a29_encode_force_v2(txt) } else { _a29_encode_force(txt) }
+                if has_v3 { _a29_encode_force_v3(txt) }
+                else { if has_v2 { _a29_encode_force_v2(txt) } else { _a29_encode_force(txt) } }
             } else {
-                if has_v2 { a29_encode_v2(txt) } else { a29_encode(txt) }
+                if has_v3 { a29_encode_v3(txt) }
+                else { if has_v2 { a29_encode_v2(txt) } else { a29_encode(txt) } }
             }
             let _w = write_file(out_path, res)
             let saving = if len(txt) > 0 { ((len(txt) - len(res)) * 100) / len(txt) } else { 0 }
-            let label = if has_v2 { "a29 encode-v2" } else { "a29 encode" }
+            let label = if has_v3 { "a29 encode-v3" } else { if has_v2 { "a29 encode-v2" } else { "a29 encode" } }
             println(label + " raw=" + to_string(len(txt))
                     + " enc=" + to_string(len(res)) + " saving=" + to_string(saving) + "%")
             exit(0)
         }
         let txt = read_file(in_path)
-        // Auto-route by header for decode (v1 vs v2).
+        // Auto-route by header for decode (v1 vs v2 vs v3).
         let header_check = if len(txt) >= 22 { txt.substring(0, 22) } else { txt }
+        let is_v3_header: bool = header_check.index_of("v=deflate-v3") >= 0
         let is_v2_header: bool = header_check.index_of("v=deflate-v2") >= 0
-        let bytes = if is_v2_header { _a29_decode_v2_to_bytes(txt) } else { _a29_decode_to_bytes(txt) }
+        let bytes = if is_v3_header {
+            _a29_decode_v3_to_bytes(txt)
+        } else {
+            if is_v2_header { _a29_decode_v2_to_bytes(txt) } else { _a29_decode_to_bytes(txt) }
+        }
         if len(bytes) == 0 {
             let _w = write_file(out_path, txt)
         } else {
@@ -1660,6 +2324,6 @@ fn main() {
         }
         exit(0)
     }
-    eprintln("usage: hexa hxc_a29_deflate.hexa [--selftest | encode [--force] <in> <out> | decode <in> <out>]")
+    eprintln("usage: hexa hxc_a29_deflate.hexa [--selftest | encode [--force] [--v2|--v3] <in> <out> | decode <in> <out>]")
     exit(3)
 }
