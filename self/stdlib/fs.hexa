@@ -1,0 +1,381 @@
+// self/stdlib/fs.hexa — Native filesystem stdlib for hexa.
+//
+// Resolves hive blocker `goal_hexa_native_fs_stdlib`: provides
+// fs primitives required by `scripts/install-extensions.mjs` (407 LoC),
+// `packages/coding-agent/scripts/gen-embedded-assets.mjs` and the rest
+// of the hive `.mjs → .hexa` axis-B port. Without this module, every
+// fs op had to be open-coded as `exec("test/ln/readlink/...")` shell
+// boilerplate (~700 LoC verbose per script).
+//
+// Design:
+//   - pure hexa (raw 9 hexa-only) — zero external libs.
+//   - delegates to runtime builtins where present (file_exists,
+//     read_file, write_file, mkdir, list_dir, dir_exists,
+//     delete_file, append_file).
+//   - wraps `exec("/bin/...")` for ops the runtime does not expose
+//     (lstat-flags, readlink, symlink, unlink-symlink).
+//   - never panics on missing files: file_exists==false on missing,
+//     read_file_safe→"" on missing, etc. — Node fs/sync semantics.
+//
+// raw 91 (no_silent_errors):
+//   shell wrappers redirect stderr to /dev/null but ALWAYS verify
+//   the post-condition (file present / absent / link points where
+//   expected) before returning success. A failed verification
+//   returns false / "" so callers can fail-loud upstream.
+//
+// raw 159 (hexa-lang-upstream-proposal-mandate):
+//   This module is the upstream-of-truth for hive's fs ops. hive ports
+//   `use "self/stdlib/fs"` and never re-implements these.
+//
+// --selftest mode:
+//   hexa run self/stdlib/fs.hexa --selftest
+//     → emits __FS_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+//
+// Naming note:
+//   The runtime already exposes a `file_exists` builtin (regular files
+//   only). We export `fs_exists` for the BROADER existsSync-equivalent
+//   (also matches dirs and live symlinks). Use `lstat_exists` if you
+//   also want broken/dangling symlinks.
+//
+// Exports:
+//   fs_exists(path) -> bool         // -e (covers files+dirs+live links)
+//   lstat_exists(path) -> bool      // -e or -L (also broken symlinks)
+//   lstat_is_dir(path) -> bool
+//   lstat_is_file(path) -> bool
+//   lstat_is_link(path) -> bool
+//   lstat_size(path) -> int         // bytes; -1 on missing
+//   read_file_safe(path) -> string  // "" on missing
+//   write_file_safe(path, content) -> bool
+//   read_dir(path) -> [string]      // [] on missing dir
+//   fs_readlink(path) -> string     // "" on non-link / missing
+//   fs_symlink(target, link_path) -> bool
+//   fs_unlink(path) -> bool         // file or symlink; idempotent
+//   mkdir_p(path) -> bool           // recursive parents
+
+use "self/stdlib/shell_escape"
+
+// ── file_exists ─────────────────────────────────────────────
+// Idempotent existence probe. Mirrors Node fs.existsSync.
+// Returns false on any error (missing, permission denied,
+// dangling symlink). For the DOES-IT-EXIST-INCLUDING-LINKS
+// query, use lstat_exists().
+fn fs_exists(path) {
+    let p = shell_escape(to_string(path))
+    let r = to_string(exec("test -e " + p + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+// ── lstat_exists ────────────────────────────────────────────
+// True if path exists as a regular entry OR a symlink (even if
+// the symlink target is missing). Mirrors POSIX `test -e -o -L`.
+fn lstat_exists(path) {
+    let p = shell_escape(to_string(path))
+    let r = to_string(exec("test -e " + p + " -o -L " + p + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+// ── lstat_is_dir ────────────────────────────────────────────
+// True if path is a directory (follows symlinks — POSIX `test -d`).
+fn lstat_is_dir(path) {
+    let p = shell_escape(to_string(path))
+    let r = to_string(exec("test -d " + p + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+// ── lstat_is_file ───────────────────────────────────────────
+// True if path is a regular file (follows symlinks).
+fn lstat_is_file(path) {
+    let p = shell_escape(to_string(path))
+    let r = to_string(exec("test -f " + p + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+// ── lstat_is_link ───────────────────────────────────────────
+// True if path is a symlink itself (does NOT follow). POSIX `test -L`.
+fn lstat_is_link(path) {
+    let p = shell_escape(to_string(path))
+    let r = to_string(exec("test -L " + p + " && echo 1 || echo 0")).trim()
+    return r == "1"
+}
+
+// ── lstat_size ──────────────────────────────────────────────
+// Byte size. -1 on missing. macOS uses `stat -f %z`, Linux uses
+// `stat -c %s`; we try both so the same module works on both.
+fn lstat_size(path) {
+    if !lstat_exists(path) {
+        return -1
+    }
+    let p = shell_escape(to_string(path))
+    let s = to_string(exec("stat -f %z " + p + " 2>/dev/null || stat -c %s " + p + " 2>/dev/null || echo 0")).trim()
+    return to_int(s)
+}
+
+// ── read_file_safe ──────────────────────────────────────────
+// Mirrors Node readFileSync(p, 'utf8') but returns "" on missing
+// instead of throwing. Use file_exists() first if the empty-vs-
+// missing distinction matters.
+fn read_file_safe(path) {
+    if !fs_exists(path) {
+        return ""
+    }
+    return read_file(to_string(path))
+}
+
+// ── write_file_safe ─────────────────────────────────────────
+// Writes content to path. Returns true on success. Caller should
+// pre-create parent dir via mkdir_p() if needed. raw 91: verifies
+// post-condition (file exists after write).
+fn write_file_safe(path, content) {
+    write_file(to_string(path), to_string(content))
+    return fs_exists(path)
+}
+
+// ── read_dir ────────────────────────────────────────────────
+// Mirrors Node readdirSync(p). Returns [] on missing dir. Output
+// is sorted ascending (POSIX `ls -1A` semantics). Hidden files
+// (.dotfiles) ARE included to match Node behavior.
+fn read_dir(path) {
+    if !lstat_is_dir(path) {
+        return []
+    }
+    let p = shell_escape(to_string(path))
+    let raw = to_string(exec("ls -1A " + p + " 2>/dev/null")).trim()
+    if raw == "" {
+        return []
+    }
+    return raw.split("\n")
+}
+
+// ── fs_readlink ─────────────────────────────────────────────
+// Returns the symlink target string, or "" if path is not a
+// symlink (or does not exist). Does NOT resolve recursively —
+// use path.resolve() for that. Prefix `fs_` avoids collision
+// with POSIX C readlink(2) at codegen time.
+fn fs_readlink(path) {
+    if !lstat_is_link(path) {
+        return ""
+    }
+    let p = shell_escape(to_string(path))
+    return to_string(exec("readlink " + p + " 2>/dev/null")).trim()
+}
+
+// ── fs_symlink ──────────────────────────────────────────────
+// Creates a symlink at link_path pointing to target. Returns
+// true on success. If link_path already exists, returns false
+// (no clobber). To replace, fs_unlink() first.
+fn fs_symlink(target, link_path) {
+    if lstat_exists(link_path) {
+        return false
+    }
+    let t = shell_escape(to_string(target))
+    let lp = shell_escape(to_string(link_path))
+    let _ = exec("ln -s " + t + " " + lp + " 2>/dev/null")
+    let actual = fs_readlink(link_path)
+    return actual == to_string(target)
+}
+
+// ── fs_unlink ───────────────────────────────────────────────
+// Removes a file or symlink (NOT a directory — use a separate
+// rm-rf wrapper for dirs). Returns true on success or if path
+// was already missing (idempotent — raw 65). For broken
+// symlinks, `rm -f` works where the `delete_file` builtin
+// sometimes does not.
+fn fs_unlink(path) {
+    if !lstat_exists(path) {
+        return true
+    }
+    let p = shell_escape(to_string(path))
+    let _ = exec("rm -f " + p + " 2>/dev/null")
+    let still = to_string(exec("test -e " + p + " -o -L " + p + " && echo 1 || echo 0")).trim()
+    return still == "0"
+}
+
+// ── mkdir_p ─────────────────────────────────────────────────
+// Recursive mkdir (Node mkdirSync(p, {recursive:true})).
+// Idempotent. Returns true if dir exists after the call.
+fn mkdir_p(path) {
+    let p = shell_escape(to_string(path))
+    let _ = exec("mkdir -p " + p + " 2>/dev/null")
+    return lstat_is_dir(path)
+}
+
+// ── --selftest ──────────────────────────────────────────────
+// Fixture-based PASS/FAIL run. Exercises every export with a tmp
+// scratch dir. Cleans up after.
+fn _fs_selftest() {
+    let pid = to_string(exec("echo $$")).trim()
+    let scratch = "/tmp/_hexa_fs_selftest_" + pid
+    let _ = exec("rm -rf " + shell_escape(scratch))
+    let mut fail = 0
+    let mut n = 0
+
+    // 1. mkdir_p creates nested dir
+    n = n + 1
+    if !mkdir_p(scratch + "/a/b/c") {
+        eprintln("FAIL 1 mkdir_p")
+        fail = fail + 1
+    }
+
+    // 2. fs_exists positive (dir — broader than builtin file_exists)
+    n = n + 1
+    if !fs_exists(scratch + "/a/b/c") {
+        eprintln("FAIL 2 fs_exists(dir)")
+        fail = fail + 1
+    }
+
+    // 3. fs_exists negative
+    n = n + 1
+    if fs_exists(scratch + "/does_not_exist_xyz") {
+        eprintln("FAIL 3 fs_exists(missing) should be false")
+        fail = fail + 1
+    }
+
+    // 4. write_file_safe + read_file_safe
+    n = n + 1
+    let file_path = scratch + "/a/hello.txt"
+    if !write_file_safe(file_path, "world") {
+        eprintln("FAIL 4 write_file_safe")
+        fail = fail + 1
+    }
+    n = n + 1
+    let content = read_file_safe(file_path)
+    if content != "world" {
+        eprintln("FAIL 5 read_file_safe got: " + content)
+        fail = fail + 1
+    }
+
+    // 5. read_file_safe on missing -> ""
+    n = n + 1
+    let empty = read_file_safe(scratch + "/missing.txt")
+    if empty != "" {
+        eprintln("FAIL 6 read_file_safe(missing) should be empty")
+        fail = fail + 1
+    }
+
+    // 6. lstat regular file
+    n = n + 1
+    if !lstat_is_file(file_path) || lstat_is_dir(file_path) || lstat_is_link(file_path) {
+        eprintln("FAIL 7 lstat(file) wrong flags")
+        fail = fail + 1
+    }
+
+    // 7. lstat directory
+    n = n + 1
+    if !lstat_is_dir(scratch + "/a/b/c") || lstat_is_file(scratch + "/a/b/c") {
+        eprintln("FAIL 8 lstat(dir) wrong flags")
+        fail = fail + 1
+    }
+
+    // 8. lstat missing
+    n = n + 1
+    if lstat_exists(scratch + "/missing") {
+        eprintln("FAIL 9 lstat(missing) should be false")
+        fail = fail + 1
+    }
+
+    // 9. symlink + readlink + lstat(link)
+    n = n + 1
+    let link_path = scratch + "/link.txt"
+    if !fs_symlink(file_path, link_path) {
+        eprintln("FAIL 10 symlink create")
+        fail = fail + 1
+    }
+    n = n + 1
+    let target_resolved = fs_readlink(link_path)
+    if target_resolved != file_path {
+        eprintln("FAIL 11 readlink got: " + target_resolved)
+        fail = fail + 1
+    }
+    n = n + 1
+    if !lstat_is_link(link_path) {
+        eprintln("FAIL 12 lstat_is_link(link) should be true")
+        fail = fail + 1
+    }
+
+    // 10. readlink on non-link -> ""
+    n = n + 1
+    let nolink = fs_readlink(file_path)
+    if nolink != "" {
+        eprintln("FAIL 13 readlink(non-link) should be empty")
+        fail = fail + 1
+    }
+
+    // 11. read_dir
+    n = n + 1
+    let entries = read_dir(scratch + "/a")
+    let mut has_b = false
+    let mut has_hello = false
+    let mut i = 0
+    while i < len(entries) {
+        if entries[i] == "b" { has_b = true }
+        if entries[i] == "hello.txt" { has_hello = true }
+        i = i + 1
+    }
+    if !has_b || !has_hello {
+        eprintln("FAIL 14 read_dir missing entries")
+        fail = fail + 1
+    }
+
+    // 12. read_dir on missing -> []
+    n = n + 1
+    let nodir = read_dir(scratch + "/no_such_dir")
+    if len(nodir) != 0 {
+        eprintln("FAIL 15 read_dir(missing) should be []")
+        fail = fail + 1
+    }
+
+    // 13. lstat_size positive
+    n = n + 1
+    let sz = lstat_size(file_path)
+    if sz != 5 {
+        eprintln("FAIL 16 lstat_size('world') should be 5 got " + to_string(sz))
+        fail = fail + 1
+    }
+
+    // 14. unlink file
+    n = n + 1
+    if !fs_unlink(file_path) {
+        eprintln("FAIL 17 fs_unlink(file)")
+        fail = fail + 1
+    }
+    n = n + 1
+    if fs_exists(file_path) {
+        eprintln("FAIL 18 file still exists after fs_unlink")
+        fail = fail + 1
+    }
+
+    // 15. fs_unlink symlink (now a dangling link — make sure fs_unlink
+    // still removes it correctly)
+    n = n + 1
+    if !fs_unlink(link_path) {
+        eprintln("FAIL 19 fs_unlink(symlink)")
+        fail = fail + 1
+    }
+
+    // 16. fs_unlink missing -> idempotent true (raw 65)
+    n = n + 1
+    if !fs_unlink(scratch + "/never_existed") {
+        eprintln("FAIL 20 unlink(missing) should be idempotent true")
+        fail = fail + 1
+    }
+
+    let _ = exec("rm -rf " + shell_escape(scratch))
+
+    if fail == 0 {
+        println("__FS_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__FS_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _fs_argv = args()
+let mut _fs_selftest_flag = false
+let mut _fs_ai = 0
+while _fs_ai < len(_fs_argv) {
+    if _fs_argv[_fs_ai] == "--selftest-fs" { _fs_selftest_flag = true }
+    if _fs_argv[_fs_ai] == "--selftest" { _fs_selftest_flag = true }
+    _fs_ai = _fs_ai + 1
+}
+if _fs_selftest_flag {
+    _fs_selftest()
+}

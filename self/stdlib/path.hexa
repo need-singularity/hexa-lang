@@ -1,0 +1,357 @@
+// self/stdlib/path.hexa — POSIX path utilities for hexa.
+//
+// Resolves part of hive blocker `goal_hexa_native_fs_stdlib`. Mirrors
+// the subset of node:path used by `scripts/install-extensions.mjs`
+// and the rest of the hive .mjs surface: join / resolve / dirname /
+// basename. Pure hexa (raw 9 hexa-only): zero exec(), zero external
+// libs — string manipulation only.
+//
+// Semantics: POSIX (forward-slash). Windows separators are NOT
+// supported — this matches the hive runtime target (Mac + Linux).
+//
+// raw 159 (hexa-lang-upstream-proposal-mandate):
+//   This module is the upstream-of-truth for hive's path ops. hive
+//   ports `use "self/stdlib/path"` and never re-implements these.
+//
+// --selftest mode:
+//   hexa run self/stdlib/path.hexa --selftest
+//     → emits __PATH_SELFTEST__ <PASS|FAIL> n=<N> fail=<M>
+//
+// Exports:
+//   path_join(parts: [string]) -> string         // node:path.join
+//   path_resolve(parts: [string]) -> string      // node:path.resolve
+//   path_dirname(p: string) -> string            // node:path.dirname
+//   path_basename(p: string) -> string           // node:path.basename
+//
+// Note on naming:
+//   We prefix exports with `path_` to avoid collisions with the
+//   POSIX C functions `dirname(3)` and `basename(3)` at codegen time
+//   (the C runtime emits direct calls when an Ident matches a libc
+//   symbol — see fs.hexa for the same pattern with readlink/symlink).
+
+// ── _last_index_of ──────────────────────────────────────────
+// Internal: rightmost index of `target` in `s`, or -1 if absent.
+fn _last_index_of(s, target) {
+    let n = len(s)
+    let m = len(target)
+    if m == 0 { return n }
+    let mut i = n - m
+    while i >= 0 {
+        if s.substring(i, i + m) == target { return i }
+        i = i - 1
+    }
+    return -1
+}
+
+// ── _strip_trailing_slashes ─────────────────────────────────
+// Remove trailing "/" but keep "/" itself if that is all we have.
+fn _strip_trailing_slashes(p) {
+    let mut n = len(p)
+    while n > 1 && p.substring(n - 1, n) == "/" {
+        n = n - 1
+    }
+    return p.substring(0, n)
+}
+
+// ── path_join ───────────────────────────────────────────────
+// Joins path segments with "/", collapsing duplicate separators.
+// Mirrors node:path.join. Empty segments are skipped (Node semantics).
+// Examples:
+//   path_join(["a", "b", "c"]) == "a/b/c"
+//   path_join(["/a/", "/b/"])  == "/a/b/"   (preserves leading + trailing)
+//   path_join([])              == "."
+fn path_join(parts) {
+    if len(parts) == 0 { return "." }
+    let mut buf = ""
+    let mut i = 0
+    while i < len(parts) {
+        let seg = to_string(parts[i])
+        if len(seg) > 0 {
+            if len(buf) == 0 {
+                buf = seg
+            } else {
+                // Strip trailing "/" from buf and leading "/" from seg.
+                if buf.substring(len(buf) - 1, len(buf)) == "/" {
+                    buf = buf.substring(0, len(buf) - 1)
+                }
+                let mut s = seg
+                while len(s) > 0 && s.substring(0, 1) == "/" {
+                    s = s.substring(1, len(s))
+                }
+                buf = buf + "/" + s
+            }
+        }
+        i = i + 1
+    }
+    if len(buf) == 0 { return "." }
+    return buf
+}
+
+// ── _split_segments ─────────────────────────────────────────
+// Split a path on "/", filtering empty segments (collapse "//"
+// and ignore leading "/" — the absolute prefix is tracked separately).
+fn _split_segments(p) {
+    let raw = p.split("/")
+    let mut out = []
+    let mut i = 0
+    while i < len(raw) {
+        if len(raw[i]) > 0 {
+            out.push(raw[i])
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── _normalize_segments ─────────────────────────────────────
+// Process . and .. segments. Returns the simplified array.
+fn _normalize_segments(segs, is_absolute) {
+    let mut out = []
+    let mut i = 0
+    while i < len(segs) {
+        let s = segs[i]
+        if s == "." {
+            // skip
+        } else {
+            if s == ".." {
+                if len(out) > 0 {
+                    let last = out[len(out) - 1]
+                    if last != ".." {
+                        // Pop
+                        let mut new_out = []
+                        let mut j = 0
+                        while j < len(out) - 1 {
+                            new_out.push(out[j])
+                            j = j + 1
+                        }
+                        out = new_out
+                    } else {
+                        out.push("..")
+                    }
+                } else {
+                    if !is_absolute {
+                        out.push("..")
+                    }
+                    // For absolute paths, .. above root is silently
+                    // discarded (POSIX behavior).
+                }
+            } else {
+                out.push(s)
+            }
+        }
+        i = i + 1
+    }
+    return out
+}
+
+// ── path_resolve ────────────────────────────────────────────
+// Mirrors node:path.resolve. Walks the parts list right-to-left;
+// the result is an absolute path. If no part is absolute, the
+// current working directory (via `pwd`) is used as the anchor.
+// `.` and `..` are normalized.
+//
+// NB: This is the ONE exec() in path.hexa — only used when no
+// absolute prefix has been found. We avoid the cost in the
+// common case of absolute inputs.
+fn path_resolve(parts) {
+    let mut anchor = ""
+    let mut tail = []
+    let mut i = len(parts) - 1
+    while i >= 0 {
+        let seg = to_string(parts[i])
+        if len(seg) > 0 {
+            if seg.substring(0, 1) == "/" {
+                anchor = seg
+                // Capture trailing parts from i+1 to end as `tail`.
+                // (Already populated by previous iterations — we just
+                // stop walking here.)
+                i = -1
+            } else {
+                // Prepend seg to tail.
+                let mut new_tail = [seg]
+                let mut j = 0
+                while j < len(tail) {
+                    new_tail.push(tail[j])
+                    j = j + 1
+                }
+                tail = new_tail
+                i = i - 1
+            }
+        } else {
+            i = i - 1
+        }
+    }
+    if len(anchor) == 0 {
+        // Use cwd. Only place we exec() in this module.
+        anchor = to_string(exec("pwd")).trim()
+        if len(anchor) == 0 { anchor = "/" }
+    }
+    // Combine: anchor + tail
+    let combined = path_join([anchor] + tail)
+    // Normalize . and ..
+    let segs = _split_segments(combined)
+    let normalized = _normalize_segments(segs, true)
+    if len(normalized) == 0 { return "/" }
+    return "/" + normalized.join("/")
+}
+
+// ── path_dirname ────────────────────────────────────────────
+// Mirrors node:path.dirname. Returns the directory portion of a
+// path. Trailing slashes are ignored. For paths without a slash,
+// returns ".". For "/", returns "/".
+fn path_dirname(p) {
+    let s = to_string(p)
+    if len(s) == 0 { return "." }
+    let stripped = _strip_trailing_slashes(s)
+    let idx = _last_index_of(stripped, "/")
+    if idx < 0 { return "." }
+    if idx == 0 { return "/" }
+    return stripped.substring(0, idx)
+}
+
+// ── path_basename ───────────────────────────────────────────
+// Mirrors node:path.basename. Returns the last portion of a path.
+// Trailing slashes are stripped first. For "/", returns "/".
+fn path_basename(p) {
+    let s = to_string(p)
+    if len(s) == 0 { return "" }
+    let stripped = _strip_trailing_slashes(s)
+    if stripped == "/" { return "/" }
+    let idx = _last_index_of(stripped, "/")
+    if idx < 0 { return stripped }
+    return stripped.substring(idx + 1, len(stripped))
+}
+
+// ── --selftest ──────────────────────────────────────────────
+fn _path_selftest() {
+    let mut fail = 0
+    let mut n = 0
+
+    // path_join
+    n = n + 1
+    if path_join(["a", "b", "c"]) != "a/b/c" {
+        eprintln("FAIL 1 join basic: " + path_join(["a", "b", "c"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_join(["/a", "b", "c"]) != "/a/b/c" {
+        eprintln("FAIL 2 join abs: " + path_join(["/a", "b", "c"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_join(["a/", "/b/", "/c"]) != "a/b/c" {
+        eprintln("FAIL 3 join slash collapse: " + path_join(["a/", "/b/", "/c"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_join([]) != "." {
+        eprintln("FAIL 4 join empty: " + path_join([]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_join(["", "a", ""]) != "a" {
+        eprintln("FAIL 5 join skip empty: " + path_join(["", "a", ""]))
+        fail = fail + 1
+    }
+
+    // path_dirname
+    n = n + 1
+    if path_dirname("/a/b/c") != "/a/b" {
+        eprintln("FAIL 6 dirname /a/b/c: " + path_dirname("/a/b/c"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_dirname("/a/b/c/") != "/a/b" {
+        eprintln("FAIL 7 dirname trailing slash: " + path_dirname("/a/b/c/"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_dirname("foo") != "." {
+        eprintln("FAIL 8 dirname no slash: " + path_dirname("foo"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_dirname("/") != "/" {
+        eprintln("FAIL 9 dirname root: " + path_dirname("/"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_dirname("/foo") != "/" {
+        eprintln("FAIL 10 dirname /foo: " + path_dirname("/foo"))
+        fail = fail + 1
+    }
+
+    // path_basename
+    n = n + 1
+    if path_basename("/a/b/c") != "c" {
+        eprintln("FAIL 11 basename /a/b/c: " + path_basename("/a/b/c"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_basename("/a/b/c/") != "c" {
+        eprintln("FAIL 12 basename trailing slash: " + path_basename("/a/b/c/"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_basename("foo") != "foo" {
+        eprintln("FAIL 13 basename no slash: " + path_basename("foo"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_basename("/") != "/" {
+        eprintln("FAIL 14 basename root: " + path_basename("/"))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_basename("") != "" {
+        eprintln("FAIL 15 basename empty: " + path_basename(""))
+        fail = fail + 1
+    }
+
+    // path_resolve
+    n = n + 1
+    if path_resolve(["/foo", "bar", "baz"]) != "/foo/bar/baz" {
+        eprintln("FAIL 16 resolve abs: " + path_resolve(["/foo", "bar", "baz"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_resolve(["/foo/bar", "..", "baz"]) != "/foo/baz" {
+        eprintln("FAIL 17 resolve dotdot: " + path_resolve(["/foo/bar", "..", "baz"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_resolve(["/foo", "/abs"]) != "/abs" {
+        eprintln("FAIL 18 resolve abs override: " + path_resolve(["/foo", "/abs"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    if path_resolve(["/", "..", "foo"]) != "/foo" {
+        eprintln("FAIL 19 resolve dotdot above root: " + path_resolve(["/", "..", "foo"]))
+        fail = fail + 1
+    }
+    n = n + 1
+    let r = path_resolve(["foo"])
+    // Result is cwd + "/foo"; just check it starts with "/" and ends with "/foo".
+    if r.substring(0, 1) != "/" || !r.ends_with("/foo") {
+        eprintln("FAIL 20 resolve relative: " + r)
+        fail = fail + 1
+    }
+
+    if fail == 0 {
+        println("__PATH_SELFTEST__ PASS n=" + to_string(n) + " fail=0")
+    } else {
+        println("__PATH_SELFTEST__ FAIL n=" + to_string(n) + " fail=" + to_string(fail))
+    }
+}
+
+let _path_argv = args()
+let mut _path_selftest_flag = false
+let mut _path_ai = 0
+while _path_ai < len(_path_argv) {
+    if _path_argv[_path_ai] == "--selftest-path" { _path_selftest_flag = true }
+    if _path_argv[_path_ai] == "--selftest" { _path_selftest_flag = true }
+    _path_ai = _path_ai + 1
+}
+if _path_selftest_flag {
+    _path_selftest()
+}
