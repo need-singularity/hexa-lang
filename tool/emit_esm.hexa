@@ -1,0 +1,251 @@
+// ═══════════════════════════════════════════════════════════
+//  tool/emit_esm.hexa — npm-consumable ESM (.mjs) shim emitter
+//
+//  WHY (2026-04-28): hive blocker `goal_hexa_native_esm_output`.
+//  npm consumers import `@scope/pkg/foo` which Node resolves via
+//  package.json `exports`. The resolver requires a .js/.mjs file
+//  on disk — pure .hexa cannot satisfy this. Until a full
+//  hexa→ESM compiler exists, this tool emits the *shim* tier:
+//  small re-export wrappers around `dist/*.js` build output, so
+//  hexa modules can replace 4-LoC `export * from "./dist/x.js"`
+//  shims that currently must be checked in as raw .js files.
+//
+//  This is **simplified-recipe** scope (alternative path in the
+//  hive blocker spec). A full hexa-codegen→ESM target is left as
+//  future work; the cross-repo blocker can be partially resolved
+//  for the common case (re-export shims) immediately.
+//
+//  USAGE:
+//      hexa run tool/emit_esm.hexa <input.hexa> <output.mjs>
+//
+//  INPUT FORMAT — directive comments in the .hexa source:
+//      // @esm-star-from "./dist/bedrock-provider.js"
+//      // @esm-export name1                                   (optional)
+//      // @esm-export name2 from "./dist/bedrock-provider.js" (optional)
+//      // @esm-default-from "./dist/foo.js"                   (optional)
+//
+//  Multiple @esm-export lines accumulate. If only @esm-star-from
+//  is given, output is a single `export * from "..."` line — the
+//  exact 4-LoC shim shape used in hive packages/ai/bedrock-provider.js.
+//
+//  Output (.mjs) is plain ESM — Node treats `.mjs` as a module
+//  regardless of the surrounding package.json `type` field.
+//
+//  EXIT CODES:
+//      0 — .mjs written successfully
+//      1 — usage error / input file missing
+//      2 — no @esm-* directives found in input
+//
+//  SELFTEST:
+//      hexa run tool/emit_esm.hexa /tmp/hello_esm.hexa /tmp/hello_esm.mjs
+//      node --input-type=module -e 'import("/tmp/hello_esm.mjs").then(m => console.log(Object.keys(m)))'
+// ═══════════════════════════════════════════════════════════
+
+use "self/stdlib/law_io"
+
+// ─── argv resolution ───
+// `./hexa run tool/emit_esm.hexa A B` → args() = [exe, exe, A, B]
+// (The interp rewrites argv[0]; the script path itself is consumed
+// before the script body sees args().) Payload starts at the first
+// arg that does NOT match argv[0]. Guard for both layouts (script
+// path passed through, or stripped) by scanning for the first arg
+// that is neither argv[0] nor the script path.
+let _argv = args()
+let _argc = len(_argv)
+let mut _payload_start = 1
+if _argc >= 2 {
+    let _a0 = to_string(_argv[0])
+    let _a1 = to_string(_argv[1])
+    // If argv[1] equals argv[0] (interp rewrite) OR ends with /emit_esm.hexa
+    // (path passthrough), the payload starts after it.
+    if _a1 == _a0 || (len(_a1) >= 14 && _a1.ends_with("/emit_esm.hexa")) {
+        _payload_start = 2
+    }
+}
+if _argc < _payload_start + 2 {
+    println("usage: hexa run tool/emit_esm.hexa <input.hexa> <output.mjs>")
+    let mut _di = 0
+    while _di < _argc {
+        println("  argv[" + to_string(_di) + "]=" + to_string(_argv[_di]))
+        _di = _di + 1
+    }
+    exit(1)
+}
+
+let INPUT = to_string(_argv[_payload_start])
+let OUTPUT = to_string(_argv[_payload_start + 1])
+
+let _input_exists = exec("test -f '" + INPUT + "' && printf yes || printf no")
+if _input_exists != "yes" {
+    println("error: input not found: " + INPUT)
+    exit(1)
+}
+
+// ─── parse directives ───
+// Scan lines for `// @esm-*` directives. Two passes: first capture
+// star-from + default-from (single-valued), then accumulate exports.
+
+let _src = read_file(INPUT)
+let _src_str = to_string(_src)
+let _lines_str = _src_str
+
+// Split on '\n' manually — keep dependency surface to law_io only.
+let mut _lines = []
+let mut _buf = ""
+let mut _ci = 0
+let _slen = len(_lines_str)
+while _ci < _slen {
+    let _ch = _lines_str[_ci]
+    if _ch == "\n" {
+        _lines = _lines + [_buf]
+        _buf = ""
+    } else {
+        _buf = _buf + _ch
+    }
+    _ci = _ci + 1
+}
+if len(_buf) > 0 { _lines = _lines + [_buf] }
+
+let mut _star_from = ""
+let mut _default_from = ""
+let mut _named_exports = []      // list of "name" or "name|from-path"
+let mut _directive_count = 0
+
+let mut _li = 0
+let _llen = len(_lines)
+while _li < _llen {
+    let _ln_raw = to_string(_lines[_li])
+    // Trim leading whitespace
+    let mut _ti = 0
+    let _tlen = len(_ln_raw)
+    while _ti < _tlen && (_ln_raw[_ti] == " " || _ln_raw[_ti] == "\t") { _ti = _ti + 1 }
+    let _ln = if _ti > 0 { _ln_raw.substring(_ti, _tlen) } else { _ln_raw }
+
+    if len(_ln) >= 17 && _ln.substring(0, 17) == "// @esm-star-from" {
+        // // @esm-star-from "path"
+        let _q1 = _esm_index_of(_ln, "\"", 0)
+        if _q1 >= 0 {
+            let _q2 = _esm_index_of(_ln, "\"", _q1 + 1)
+            if _q2 > _q1 {
+                _star_from = _ln.substring(_q1 + 1, _q2)
+                _directive_count = _directive_count + 1
+            }
+        }
+    } else if len(_ln) >= 20 && _ln.substring(0, 20) == "// @esm-default-from" {
+        let _q1 = _esm_index_of(_ln, "\"", 0)
+        if _q1 >= 0 {
+            let _q2 = _esm_index_of(_ln, "\"", _q1 + 1)
+            if _q2 > _q1 {
+                _default_from = _ln.substring(_q1 + 1, _q2)
+                _directive_count = _directive_count + 1
+            }
+        }
+    } else if len(_ln) >= 15 && _ln.substring(0, 15) == "// @esm-export " {
+        // // @esm-export name [from "path"]
+        let _rest = _ln.substring(15, len(_ln))
+        // Strip trailing whitespace
+        let mut _re = len(_rest)
+        while _re > 0 && (_rest[_re - 1] == " " || _rest[_re - 1] == "\t" || _rest[_re - 1] == "\r") { _re = _re - 1 }
+        let _rest2 = _rest.substring(0, _re)
+        // Check for ' from "path"'
+        let _from_idx = _esm_index_of(_rest2, " from ", 0)
+        let mut _entry = ""
+        if _from_idx > 0 {
+            let _name = _rest2.substring(0, _from_idx)
+            let _q1 = _esm_index_of(_rest2, "\"", _from_idx)
+            if _q1 >= 0 {
+                let _q2 = _esm_index_of(_rest2, "\"", _q1 + 1)
+                if _q2 > _q1 {
+                    let _path = _rest2.substring(_q1 + 1, _q2)
+                    _entry = _name + "|" + _path
+                }
+            }
+            if _entry == "" { _entry = _name }
+        } else {
+            _entry = _rest2
+        }
+        if len(_entry) > 0 {
+            _named_exports = _named_exports + [_entry]
+            _directive_count = _directive_count + 1
+        }
+    }
+    _li = _li + 1
+}
+
+if _directive_count == 0 {
+    println("error: no @esm-* directives found in " + INPUT)
+    println("       expected at least one of:")
+    println("         // @esm-star-from \"./path.js\"")
+    println("         // @esm-export <name>")
+    println("         // @esm-export <name> from \"./path.js\"")
+    println("         // @esm-default-from \"./path.js\"")
+    exit(2)
+}
+
+// ─── emit ───
+let mut _out = ""
+_out = _out + "// AUTO-GENERATED by hexa-lang tool/emit_esm.hexa — DO NOT EDIT.\n"
+_out = _out + "// Source: " + INPUT + "\n"
+_out = _out + "// Re-export shim — npm-consumer entry point. Equivalent to a hand-\n"
+_out = _out + "// written 4-LoC `export * from` file, but generated from a hexa\n"
+_out = _out + "// manifest so the SSOT lives in .hexa (raw 9 hexa-only).\n"
+_out = _out + "\n"
+
+if len(_star_from) > 0 {
+    _out = _out + "export * from " + "\"" + _star_from + "\"" + ";\n"
+}
+
+// Group named exports by source path
+let mut _ne_i = 0
+let _ne_len = len(_named_exports)
+while _ne_i < _ne_len {
+    let _entry = to_string(_named_exports[_ne_i])
+    let _pipe = _esm_index_of(_entry, "|", 0)
+    if _pipe > 0 {
+        let _name = _entry.substring(0, _pipe)
+        let _path = _entry.substring(_pipe + 1, len(_entry))
+        _out = _out + "export { " + _name + " } from \"" + _path + "\";\n"
+    } else {
+        // No path — expects a prior @esm-star-from to provide it
+        if len(_star_from) > 0 {
+            // Already covered by `export *`; leave a note for clarity
+            _out = _out + "// (named export `" + _entry + "` covered by `export *` above)\n"
+        } else {
+            _out = _out + "// WARN: @esm-export " + _entry + " has no source path and no @esm-star-from; skipped\n"
+        }
+    }
+    _ne_i = _ne_i + 1
+}
+
+if len(_default_from) > 0 {
+    _out = _out + "export { default } from \"" + _default_from + "\";\n"
+}
+
+let _ok = safe_write_file(OUTPUT, _out)
+if !_ok {
+    eprintln("error: write failed: " + OUTPUT)
+    exit(1)
+}
+
+println("OK: wrote " + OUTPUT + " (" + to_string(len(_out)) + " bytes, " + to_string(_directive_count) + " directives)")
+
+// ─── helper: index_of (string contains positional search) ───
+// Inlined here to avoid pulling in a heavier stdlib dep on this tool.
+fn _esm_index_of(haystack: string, needle: string, start: int) -> int {
+    let _hl = len(haystack)
+    let _nl = len(needle)
+    if _nl == 0 { return start }
+    if _hl < _nl { return -1 }
+    let mut _i = start
+    while _i + _nl <= _hl {
+        let mut _j = 0
+        let mut _match = true
+        while _j < _nl {
+            if haystack[_i + _j] != needle[_j] { _match = false; break }
+            _j = _j + 1
+        }
+        if _match { return _i }
+        _i = _i + 1
+    }
+    return -1
+}
